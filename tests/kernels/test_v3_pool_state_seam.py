@@ -626,7 +626,8 @@ class TestTablesFormMatchesTwoCalls:
     """`gdn_form="tables"` runs both passes in one call over in-kernel tables.
 
     It runs the same per-tile code over the same tables as the two-call form,
-    so outputs and every pool byte must match exactly.
+    so outputs and every pool byte, checkpoint blocks included, must match
+    exactly, with and without speculative decoding.
     """
 
     def _compare(self, pool, idx, kwargs):
@@ -706,6 +707,66 @@ class TestTablesFormMatchesTwoCalls:
             seq_lens=jnp.array([4, 8, 6, rows], dtype=jnp.int32),
         )
         self._compare(pool, idx, kwargs)
+
+    def _spec_pool(self, seed, ckpt_indices, num_mgr):
+        """Distinct states at every named checkpoint block, garbage elsewhere."""
+        n, window = ckpt_indices.shape
+        pool = _garbage_pool(seed, num_mgr)
+        keys = iter(jax.random.split(jax.random.key(seed), 2 * window))
+        for t in range(window):
+            pool = _write_states(
+                pool,
+                jax.random.normal(next(keys), (n, N_V, D_K, D_V)),
+                jax.random.normal(next(keys), (n, KERNEL_SIZE - 1, DIM)).astype(
+                    jnp.bfloat16
+                ),
+                ckpt_indices[:, t],
+            )
+        return pool
+
+    @pytest.mark.parametrize("num_spec", [1, 3])
+    def test_spec_windows_with_partial_acceptance(self, num_spec):
+        window = num_spec + 1
+        # Three verify windows of varying length resuming from the last
+        # accepted checkpoint, then a prefill resuming from a non-zero one.
+        lens = [window, max(1, window - 2), window - 1, 20]
+        reads = [num_spec, 1, 0, num_spec]
+        n = len(lens)
+        rng = np.random.default_rng(60 + num_spec)
+        ckpt_indices = jnp.asarray(
+            rng.permutation(np.arange(1, n * window + 1)).reshape(n, window),
+            dtype=jnp.int32,
+        )
+        pool = self._spec_pool(61, ckpt_indices, n * window + 1)
+        kwargs = _rand_inputs(62, 48) | dict(
+            query_start_loc=jnp.asarray(np.cumsum([0] + lens), dtype=jnp.int32),
+            distribution=jnp.array([3, 4, 4], dtype=jnp.int32),
+            seq_lens=jnp.array([9, 12, 7, 40], dtype=jnp.int32),
+            read_offsets=jnp.asarray(reads, dtype=jnp.int32),
+            ckpt_indices=ckpt_indices,
+            num_spec_tokens=num_spec,
+        )
+        self._compare(pool, ckpt_indices[:, 0], kwargs)
+
+    @pytest.mark.parametrize("rows", [256, 257], ids=["max_rows", "fallback"])
+    def test_spec_rows_at_the_in_kernel_limit(self, rows):
+        num_spec, window = 3, 4
+        # 64 full verify windows; the fallback adds a one-token prefill.
+        lens = [window] * 64 + [1] * (rows - 256)
+        n = len(lens)
+        ckpt_indices = (
+            jnp.arange(1, n * window + 1, dtype=jnp.int32).reshape(window, n).T
+        )
+        pool = self._spec_pool(63, ckpt_indices, n * window + 1)
+        kwargs = _rand_inputs(64, rows) | dict(
+            query_start_loc=jnp.asarray(np.cumsum([0] + lens), dtype=jnp.int32),
+            distribution=jnp.array([64, n, n], dtype=jnp.int32),
+            seq_lens=jnp.full((n,), 9, dtype=jnp.int32),
+            read_offsets=jnp.asarray([i % window for i in range(n)], jnp.int32),
+            ckpt_indices=ckpt_indices,
+            num_spec_tokens=num_spec,
+        )
+        self._compare(pool, ckpt_indices[:, 0], kwargs)
 
 
 class TestPooledCallerV3:

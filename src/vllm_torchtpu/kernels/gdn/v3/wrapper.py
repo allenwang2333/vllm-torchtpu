@@ -392,6 +392,7 @@ def outer_kernel_tables_in_kernel(
     state_indices_ref: jax.Array,
     read_offsets_ref: jax.Array,
     distribution_ref: jax.Array,
+    ckpt_indices_ref: jax.Array | None,
     qkv_ref: jax.Array,
     b_ref: jax.Array,
     a_ref: jax.Array,
@@ -419,6 +420,7 @@ def outer_kernel_tables_in_kernel(
         state_indices_ref,
         read_offsets_ref,
         distribution_ref,
+        ckpt_indices_ref,
         sc,
         cfg_b,
         cfg_p,
@@ -594,7 +596,7 @@ def fused_conv1d_gdn(
             per-sequence pass as two calls over XLA-built routing tables;
             "tables" runs both in one call that builds the tables in SMEM
             (`tables_in_kernel`), falling back to "two_calls" above
-            `tables_in_kernel.MAX_ROWS` rows or with speculative decoding.
+            `tables_in_kernel.MAX_ROWS` rows.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -883,8 +885,9 @@ def fused_conv1d_gdn(
         cfg_b = make_cfg(config.GDNMode.BATCHED, in_source, None)
         cfg_p = make_cfg(config.GDNMode.PER_SEQ, in_source, None)
         in_act = jnp.zeros_like(cfg_b.get_out_shape())
+        num_ckpts = 0 if ckpt_indices is None else ckpt_indices.shape[1]
         scratch = tables_in_kernel.scratch_shapes(
-            num_seqs, padded_batch_size, cfg_b.tile_size
+            num_seqs, padded_batch_size, cfg_b.tile_size, num_ckpts
         )
         scratch.update(cfg_p.get_scratch_shape_dict())
         scratch_names = tuple(scratch)
@@ -894,7 +897,9 @@ def fused_conv1d_gdn(
             state_indices.astype(jnp.int32),
             read_offsets,
             distribution.astype(jnp.int32),
+            ckpt_indices,
         )
+        num_raw = sum(x is not None for x in raw)
         return pl.pallas_call(
             functools.partial(
                 outer_kernel_tables_in_kernel,
@@ -905,7 +910,7 @@ def fused_conv1d_gdn(
             ),
             out_shape=(in_act, in_source),
             in_specs=(
-                *(smem_spec for _ in raw),
+                *(None if x is None else smem_spec for x in raw),
                 hbm_spec,
                 hbm_spec,
                 hbm_spec,
@@ -915,7 +920,7 @@ def fused_conv1d_gdn(
             ),
             out_specs=(hbm_spec, hbm_spec),
             scratch_shapes=[scratch[name] for name in scratch_names],
-            input_output_aliases={len(raw) + 3: 1, len(raw) + 4: 0},
+            input_output_aliases={num_raw + 3: 1, num_raw + 4: 0},
             compiler_params=pltpu.CompilerParams(
                 disable_bounds_checks=True,
                 vmem_limit_bytes=max(
@@ -935,7 +940,6 @@ def fused_conv1d_gdn(
         pooled
         and gdn_form == "tables"
         and not (batched_only or prefill_only)
-        and num_spec_tokens == 0
         and padded_batch_size <= tables_in_kernel.MAX_ROWS
     )
     if use_tables:

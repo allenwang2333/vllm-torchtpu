@@ -69,12 +69,14 @@ def batched_table_size(max_seqs: int, decode_tile_size: int) -> int:
 
 
 def scratch_shapes(
-    max_seqs: int, max_tokens: int, decode_tile_size: int
+    max_seqs: int, max_tokens: int, decode_tile_size: int, num_ckpts: int = 0
 ) -> dict[str, Any]:
     """SMEM scratch for both passes' tables.
 
     The batched pass has one entry per sequence; the per-sequence pass one per
-    tile, at most one per token.
+    tile, at most one per token. With `num_ckpts` checkpoint blocks per
+    sequence (speculative decoding), the per-sequence pass also keeps its
+    shifted copy of the checkpoint indices.
     """
     num_b = batched_table_size(max_seqs, decode_tile_size)
     shapes = {
@@ -88,6 +90,8 @@ def scratch_shapes(
     for name in _TABLE_NAMES:
         shapes[f"tb_{name}"] = pltpu.SMEM((num_b,), jnp.int32)
         shapes[f"tp_{name}"] = pltpu.SMEM((max_tokens,), jnp.int32)
+    if num_ckpts:
+        shapes["tp_ckpt"] = pltpu.SMEM((max_seqs * num_ckpts,), jnp.int32)
     return shapes
 
 
@@ -97,6 +101,7 @@ def fill_and_wrap(
     state_indices_ref,
     read_offsets_ref,
     distribution_ref,
+    ckpt_indices_ref,
     sc: dict[str, Any],
     cfg_b: config.GDNConfig,
     cfg_p: config.GDNConfig,
@@ -106,7 +111,9 @@ def fill_and_wrap(
 
     `sc` maps the names of `scratch_shapes` to refs. The batched pass takes
     sequences `[0, distribution[0])`, the per-sequence pass
-    `[distribution[0], distribution[2])`.
+    `[distribution[0], distribution[2])`, whose per-sequence arrays are
+    shifted to start at `distribution[0]`. `ckpt_indices_ref` is the
+    `[max_seqs, num_ckpts]` checkpoint block table, or None.
     """
     qsl = query_start_loc_ref
     end_b = distribution_ref[0]
@@ -139,6 +146,10 @@ def fill_and_wrap(
         sc["tp_has_init"][s_rel] = has_init.astype(jnp.int32)
         sc["tp_state"][s_rel] = state_indices_ref[s]
         sc["tp_read"][s_rel] = read_offsets_ref[s]
+        if ckpt_indices_ref is not None:
+            num_ckpts = ckpt_indices_ref.shape[1]
+            for t in range(num_ckpts):
+                sc["tp_ckpt"][s_rel * num_ckpts + t] = ckpt_indices_ref[s, t]
 
         def fill_tile(t, p):
             r_base = qsl[s] + t * cfg_p.chunk_size
@@ -153,7 +164,7 @@ def fill_and_wrap(
 
     sc["tp_num_tiles"][0] = lax.fori_loop(0, end_p - start_p, fill_seq, 0)
 
-    def wrap(prefix, cfg, state_indices, read_offsets):
+    def wrap(prefix, cfg, state_indices, read_offsets, ckpt_indices):
         shape = (1, cfg.seq_tile_size)
         return memory_ref.MetadataRef(
             num_tiles=_ScalarRef(sc[f"{prefix}_num_tiles"]),
@@ -165,8 +176,12 @@ def fill_and_wrap(
             s_idx_has_initial_state=_BoolRef(sc[f"{prefix}_has_init"]),
             s_idx_to_state_indices=state_indices,
             s_idx_to_read_offset=read_offsets,
+            s_idx_to_ckpt_indices=ckpt_indices,
         )
 
-    meta_b = wrap("tb", cfg_b, state_indices_ref, read_offsets_ref)
-    meta_p = wrap("tp", cfg_p, sc["tp_state"], sc["tp_read"])
+    ckpt_p = None
+    if ckpt_indices_ref is not None:
+        ckpt_p = memory_ref.SmemWrapper(sc["tp_ckpt"], ckpt_indices_ref.shape)
+    meta_b = wrap("tb", cfg_b, state_indices_ref, read_offsets_ref, ckpt_indices_ref)
+    meta_p = wrap("tp", cfg_p, sc["tp_state"], sc["tp_read"], ckpt_p)
     return meta_b, meta_p

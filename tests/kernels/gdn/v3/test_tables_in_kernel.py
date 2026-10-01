@@ -15,7 +15,8 @@
 
 Runs `tables_in_kernel.fill_and_wrap` in Pallas interpret mode and compares
 every entry the pipeline reads: each visited tile's row range and flags, and
-its sequence's initial-state flag, state slot and read offset.
+its sequence's initial-state flag, state slot, read offset and checkpoint
+blocks.
 """
 
 import functools
@@ -33,7 +34,7 @@ from vllm_torchtpu.kernels.gdn.v3 import config, metadata, tables_in_kernel
 pytestmark = pytest.mark.cpu_test
 
 # Rows per visited tile: s_idx, r_base, r_size, first, last, has_init,
-# state index, read offset.
+# state index, read offset, then one per checkpoint block.
 _NUM_FIELDS = 8
 
 
@@ -59,7 +60,7 @@ def _cfg(mode, tile_size, batch_size, window_size=1):
     )
 
 
-def _inputs(decode_lens, prefill_lens, context_lens, max_seqs, read_offsets):
+def _inputs(decode_lens, prefill_lens, context_lens, max_seqs, read_offsets, num_ckpts):
     lens = np.asarray(list(decode_lens) + list(prefill_lens), dtype=np.int32)
     n = lens.size
     query_start_loc = np.zeros((max_seqs + 1,), dtype=np.int32)
@@ -72,7 +73,14 @@ def _inputs(decode_lens, prefill_lens, context_lens, max_seqs, read_offsets):
     read = np.zeros((max_seqs,), dtype=np.int32)
     read[:n] = read_offsets
     distribution = np.array([len(decode_lens), n, n], dtype=np.int32)
-    return query_start_loc, seq_lens, state_indices, read, distribution
+    ckpt_indices = None
+    if num_ckpts:
+        # Distinct blocks per (sequence, checkpoint), not affine in either.
+        ckpt_indices = (
+            np.arange(max_seqs * num_ckpts, dtype=np.int32).reshape(max_seqs, -1) * 13
+            + 5
+        ) % 997
+    return query_start_loc, seq_lens, state_indices, read, distribution, ckpt_indices
 
 
 def _tables_kernel(
@@ -81,6 +89,7 @@ def _tables_kernel(
     state_ref,
     read_ref,
     dist_ref,
+    ckpt_ref,
     out_b_ref,
     out_p_ref,
     num_tiles_ref,
@@ -92,8 +101,18 @@ def _tables_kernel(
 ):
     sc = dict(zip(names, scratch))
     meta_b, meta_p = tables_in_kernel.fill_and_wrap(
-        qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref, sc, cfg_b, cfg_p, max_seqs
+        qsl_ref,
+        seq_lens_ref,
+        state_ref,
+        read_ref,
+        dist_ref,
+        ckpt_ref,
+        sc,
+        cfg_b,
+        cfg_p,
+        max_seqs,
     )
+    num_ckpts = 0 if ckpt_ref is None else ckpt_ref.shape[1]
 
     def dump(meta, out_ref, size, seq_tile_size):
         def body(i, carry):
@@ -108,6 +127,7 @@ def _tables_kernel(
                 meta.s_idx_has_initial_state[s].astype(jnp.int32),
                 meta.s_idx_to_state_indices[s],
                 meta.s_idx_to_read_offset[s],
+                *(meta.s_idx_to_ckpt_indices[s, t] for t in range(num_ckpts)),
             )
             for k, value in enumerate(fields):
                 out_ref[k, i] = value
@@ -127,8 +147,11 @@ def _tables_kernel(
 
 
 def _in_kernel_tables(cfg_b, cfg_p, max_seqs, raw):
+    ckpt_indices = raw[-1]
+    num_ckpts = 0 if ckpt_indices is None else ckpt_indices.shape[1]
+    num_fields = _NUM_FIELDS + num_ckpts
     scratch = tables_in_kernel.scratch_shapes(
-        max_seqs, cfg_p.batch_size, cfg_b.tile_size
+        max_seqs, cfg_p.batch_size, cfg_b.tile_size, num_ckpts
     )
     names = tuple(scratch)
     num_b = tables_in_kernel.batched_table_size(max_seqs, cfg_b.tile_size)
@@ -138,15 +161,15 @@ def _in_kernel_tables(cfg_b, cfg_p, max_seqs, raw):
             _tables_kernel, cfg_b=cfg_b, cfg_p=cfg_p, max_seqs=max_seqs, names=names
         ),
         out_shape=(
-            jax.ShapeDtypeStruct((_NUM_FIELDS, num_b), jnp.int32),
-            jax.ShapeDtypeStruct((_NUM_FIELDS, cfg_p.batch_size), jnp.int32),
+            jax.ShapeDtypeStruct((num_fields, num_b), jnp.int32),
+            jax.ShapeDtypeStruct((num_fields, cfg_p.batch_size), jnp.int32),
             jax.ShapeDtypeStruct((2,), jnp.int32),
         ),
-        in_specs=[smem] * len(raw),
+        in_specs=[None if x is None else smem for x in raw],
         out_specs=(smem, smem, smem),
         scratch_shapes=[scratch[n] for n in names],
         interpret=True,
-    )(*(jnp.asarray(x) for x in raw))
+    )(*(None if x is None else jnp.asarray(x) for x in raw))
     return np.asarray(out_b), np.asarray(out_p), np.asarray(num_tiles)
 
 
@@ -155,18 +178,19 @@ def _xla_tables(meta, size, seq_tile_size):
         return np.asarray(wrapper.data).astype(np.int32)
 
     s_idx = field(meta.p_id_to_s_idx)[:size]
-    return np.stack(
-        [
-            s_idx,
-            field(meta.p_id_to_r_base)[:size],
-            field(meta.p_id_to_r_size)[:size],
-            field(meta.p_id_is_first_tile)[:size],
-            field(meta.p_id_is_last_tile)[:size],
-            np.asarray(meta.s_idx_has_initial_state).astype(np.int32)[s_idx],
-            np.asarray(meta.s_idx_to_state_indices)[s_idx],
-            np.asarray(meta.s_idx_to_read_offset)[s_idx],
-        ]
-    )
+    rows = [
+        s_idx,
+        field(meta.p_id_to_r_base)[:size],
+        field(meta.p_id_to_r_size)[:size],
+        field(meta.p_id_is_first_tile)[:size],
+        field(meta.p_id_is_last_tile)[:size],
+        np.asarray(meta.s_idx_has_initial_state).astype(np.int32)[s_idx],
+        np.asarray(meta.s_idx_to_state_indices)[s_idx],
+        np.asarray(meta.s_idx_to_read_offset)[s_idx],
+    ]
+    if meta.s_idx_to_ckpt_indices is not None:
+        rows += list(np.asarray(meta.s_idx_to_ckpt_indices)[s_idx].T)
+    return np.stack(rows)
 
 
 def _check(
@@ -179,10 +203,18 @@ def _check(
     batch_size,
     decode_tile_size=4,
     mixed_tile_size=64,
-    window_size=1,
+    num_spec_tokens=0,
 ):
-    raw = _inputs(decode_lens, prefill_lens, context_lens, max_seqs, read_offsets)
-    query_start_loc, seq_lens, state_indices, read, distribution = raw
+    raw = _inputs(
+        decode_lens,
+        prefill_lens,
+        context_lens,
+        max_seqs,
+        read_offsets,
+        num_spec_tokens + 1 if num_spec_tokens else 0,
+    )
+    query_start_loc, seq_lens, state_indices, read, distribution, ckpt = raw
+    window_size = num_spec_tokens + 1
     cfg_b = _cfg(config.GDNMode.BATCHED, decode_tile_size, batch_size, window_size)
     cfg_p = _cfg(config.GDNMode.PER_SEQ, mixed_tile_size, batch_size)
     out_b, out_p, num_tiles = _in_kernel_tables(cfg_b, cfg_p, max_seqs, raw)
@@ -194,6 +226,7 @@ def _check(
         state_indices=jnp.asarray(state_indices),
         read_offsets=jnp.asarray(read),
         end_seq=jnp.asarray(distribution[0]),
+        ckpt_indices=None if ckpt is None else jnp.asarray(ckpt),
     )
     meta_p = metadata.compute_per_seq_metadata(
         cfg=cfg_p,
@@ -203,6 +236,7 @@ def _check(
         read_offsets=jnp.asarray(read),
         start_seq=jnp.asarray(distribution[0]),
         end_seq=jnp.asarray(distribution[2]),
+        ckpt_indices=None if ckpt is None else jnp.asarray(ckpt),
     )
     num_tiles_b, num_tiles_p = int(meta_b.num_tiles), int(meta_p.num_tiles)
     assert tuple(num_tiles) == (num_tiles_b, num_tiles_p)
@@ -255,6 +289,54 @@ def test_batched_tail_past_max_seqs():
 def test_full_rows():
     n = tables_in_kernel.MAX_ROWS
     _check([1] * n, [], [1] * n, [0] * n, max_seqs=n, batch_size=n)
+
+
+@pytest.mark.parametrize("num_spec_tokens", [1, 3])
+def test_spec_windows_with_partial_acceptance(num_spec_tokens):
+    # Verify windows of varying length (<= k + 1) resuming from the checkpoint
+    # of the last accepted token.
+    window = num_spec_tokens + 1
+    lens = [window, 1, window, max(1, window - 1), window]
+    reads = [0, num_spec_tokens, 1 % window, num_spec_tokens, 0]
+    _check(
+        lens,
+        [],
+        [9, 4, 12, 7, 30],
+        reads,
+        max_seqs=8,
+        batch_size=sum(lens),
+        num_spec_tokens=num_spec_tokens,
+    )
+
+
+@pytest.mark.parametrize("num_spec_tokens", [1, 3])
+def test_spec_windows_with_prefill(num_spec_tokens):
+    # The PER_SEQ pass reads checkpoint rows shifted by `distribution[0]`,
+    # including a prefix-cache resume from a non-zero checkpoint.
+    window = num_spec_tokens + 1
+    _check(
+        [window, 1, window],
+        [70, 5],
+        [8, 3, 11, 30, 0],
+        [num_spec_tokens, 0, 1, num_spec_tokens, 0],
+        max_seqs=6,
+        batch_size=2 * window + 1 + 75,
+        num_spec_tokens=num_spec_tokens,
+    )
+
+
+def test_spec_full_rows():
+    window = 4
+    n = tables_in_kernel.MAX_ROWS // window
+    _check(
+        [window] * n,
+        [],
+        [window] * n,
+        [i % window for i in range(n)],
+        max_seqs=n,
+        batch_size=n * window,
+        num_spec_tokens=window - 1,
+    )
 
 
 # Wrapper dispatch: which Pallas calls `fused_conv1d_gdn` emits per form.
@@ -358,8 +440,14 @@ class TestWrapperForm:
         rows = tables_in_kernel.MAX_ROWS + 1
         assert _pallas_call_names(rows, "tables") == _TWO_CALLS
 
-    def test_tables_form_falls_back_under_speculation(self):
+    def test_tables_form_serves_speculation(self):
         assert _pallas_call_names(8, "tables", num_spec_tokens=3) == [
+            "fused_conv1d_gdn_batched_w4_tables_in_kernel"
+        ]
+
+    def test_tables_form_under_speculation_falls_back_above_max_rows(self):
+        rows = tables_in_kernel.MAX_ROWS + 1
+        assert _pallas_call_names(rows, "tables", num_spec_tokens=3) == [
             "fused_conv1d_gdn_batched_w4",
             "fused_conv1d_gdn_per_seq",
         ]
