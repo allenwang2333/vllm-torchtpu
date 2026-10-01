@@ -1,0 +1,60 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Publishes the public prod image to Docker Hub from the scheduled nightly
+# builds of main and release/X.Y.Z. The internal ci/dev/prod nightlies in
+# Artifact Registry are a separate pipeline (pipeline_nightly_image.yml) and
+# are not affected.
+#
+# bootstrap.sh uploads this file on every build; the `if` below drops the step
+# everywhere except NIGHTLY=1 builds of main or release/* in vllm-torchtpu-ci,
+# so PR, post-merge, integration and dev builds never see the Docker Hub
+# secret. A release branch only publishes if vllm-torchtpu-ci has a NIGHTLY=1
+# schedule on it; publish_dockerhub_images.sh picks the tags from the branch.
+#
+# Unlike tpu-inference's nightly_releases.yml, the step waits for the nightly
+# unit tests and is skipped when any of them fails, so a red night does not
+# move a public tag. Every key below carries the same NIGHTLY == "1" condition
+# and no branch condition, so each one exists whenever this step does.
+
+steps:
+  - label: ":docker: Publish vllm-torchtpu nightly image to Docker Hub"
+    key: "publish_dockerhub_nightly"
+    if: '(build.branch == "main" || build.branch =~ /^release\//) && build.env("NIGHTLY") == "1" && pipeline.slug == "vllm-torchtpu-ci"'
+    depends_on:
+      - "build_docker"
+      - "unit_tests_cpu_nightly"
+      - "unit_tests_general_nightly"
+      - "unit_tests_multichip_nightly"
+      - "unit_tests_spec_decode_nightly"
+      - "unit_tests_spec_decode_multichip_nightly"
+    agents:
+      # The prod build pulls torch-tpu from a private registry and needs the
+      # gcloud credentials these agents carry (see docker/build_image.sh).
+      queue: cpu_64_core
+    env:
+      # TODO(docker-hub): the Docker Hub repository, e.g. vllm/vllm-torchtpu.
+      # The script stops before building while this is still a placeholder.
+      DOCKERHUB_REPO: "REPLACE_WITH_DOCKERHUB_REPO"
+    # TODO(docker-hub): the secret name configured in the Buildkite cluster.
+    secrets:
+      - DOCKERHUB_TOKEN
+    plugins:
+      - docker-login#v3.0.0:
+          # TODO(docker-hub): the Docker Hub bot account with push access to
+          # DOCKERHUB_REPO. Login fails until this is set.
+          username: "REPLACE_WITH_DOCKERHUB_USERNAME"
+          password-env: DOCKERHUB_TOKEN
+    commands:
+      - bash .buildkite/scripts/publish_dockerhub_images.sh
