@@ -97,6 +97,16 @@ class _MockLTXRuntime:
         return MagicMock(output=self.output)
 
 
+class _MockWorkerProc:
+    def __init__(self, gpu_id: int = 0):
+        self.gpu_id = gpu_id
+        self._async_output_pending = 1
+
+    def _async_output_loop(self):
+        self._async_output_pending = 0
+        return self.gpu_id
+
+
 vllm_omni_mock = MagicMock()
 vllm_omni_mock.platforms.interface.OmniPlatform = _MockOmniPlatform
 vllm_omni_mock.platforms.interface.OmniPlatformEnum = _MockOmniPlatformEnum
@@ -106,6 +116,7 @@ vllm_omni_mock.diffusion.attention.backends.registry.register_diffusion_backend 
     lambda *args, **kwargs: None
 )
 vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime.LTXRuntime = _MockLTXRuntime
+vllm_omni_mock.diffusion.worker.diffusion_worker.WorkerProc = _MockWorkerProc
 
 sys.modules["vllm_omni"] = vllm_omni_mock
 sys.modules["vllm_omni.platforms"] = vllm_omni_mock.platforms
@@ -114,6 +125,10 @@ sys.modules["vllm_omni.diffusion"] = vllm_omni_mock.diffusion
 sys.modules["vllm_omni.diffusion.ipc"] = vllm_omni_mock.diffusion.ipc
 sys.modules["vllm_omni.diffusion.diffusion_engine"] = (
     vllm_omni_mock.diffusion.diffusion_engine
+)
+sys.modules["vllm_omni.diffusion.worker"] = vllm_omni_mock.diffusion.worker
+sys.modules["vllm_omni.diffusion.worker.diffusion_worker"] = (
+    vllm_omni_mock.diffusion.worker.diffusion_worker
 )
 sys.modules["vllm_omni.diffusion.attention"] = vllm_omni_mock.diffusion.attention
 sys.modules["vllm_omni.diffusion.attention.backends"] = (

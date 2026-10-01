@@ -2,16 +2,30 @@
 """TPU platform plugin for vllm-omni."""
 
 import os
+from typing import Any
 
 import torch
 from torch_tpu._internal.utils import hardware
 from vllm.logger import init_logger
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
-from vllm_torchtpu.omni.patches import apply_omni_tpu_patches
+from vllm_torchtpu.omni.patches import (
+    apply_omni_tpu_patches,
+    apply_omni_worker_patches,
+)
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 logger = init_logger(__name__)
+
+# Attention head counts of diffusion transformers whose heads are not divisible
+# by the power-of-2 Ulysses degrees that TPU slices naturally offer (4, 8, ...).
+# Only pipelines listed here are auto-promoted to ``ulysses_mode="advanced_uaa"``
+# (see ``_maybe_promote_ulysses_mode``); every other model keeps vLLM-Omni's
+# default behaviour. Keys are ``OmniDiffusionConfig.model_class_name``.
+_ULYSSES_HEAD_COUNTS: dict[str, int] = {
+    # ZImageTransformer2DModel: dim=3840, head_dim=128 -> n_heads=30.
+    "ZImagePipeline": 30,
+}
 
 
 class OmniTpuPlatform(OmniPlatform, TpuPlatform):
@@ -78,6 +92,9 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def set_device(cls, device: torch.device) -> None:
+        # Must run before WorkerProc starts its DiffusionAsyncOutput thread;
+        # init_device() is the first thing DiffusionWorker.__init__ does.
+        apply_omni_worker_patches()
         world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
         if world_size > 1:
             cls._worker_world_size = world_size
@@ -111,6 +128,66 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
             f"localhost:{base_port + 1 + i}" for i in range(world_size)
         )
+
+    @classmethod
+    def init_diffusion_model_runner_runtime(
+        cls,
+        vllm_config: Any,
+        od_config: Any,
+        device: torch.device,
+    ) -> None:
+        """Runs in each diffusion worker right before the pipeline is built."""
+        cls._maybe_promote_ulysses_mode(od_config)
+
+    @staticmethod
+    def _maybe_promote_ulysses_mode(od_config: Any) -> None:
+        """Select ``ulysses_mode="advanced_uaa"`` for known odd-head models.
+
+        Root cause: vLLM-Omni's default ``ulysses_mode="strict"`` requires the
+        transformer's head count to be divisible by ``ulysses_degree`` and
+        raises ``ValueError`` otherwise. TPU slices come in power-of-2 sizes, so
+        a model such as Z-Image (30 heads) cannot use ``ulysses_degree`` 4 or 8
+        without the padded-head ``"advanced_uaa"`` mode. ``ulysses_mode`` is only
+        read at forward time from ``ForwardContext.omni_diffusion_config``, which
+        is this same ``od_config`` object, so mutating it here is sufficient.
+
+        Scope: only pipelines in ``_ULYSSES_HEAD_COUNTS`` are promoted, and only
+        when the user left the mode at its default. An explicit
+        ``ulysses_mode`` is never overridden.
+
+        Cost: on TPU, ``"advanced_uaa"`` currently pays a per-layer
+        ``_all_gather_int`` host sync in ``UlyssesParallelAttention`` because
+        ``ZImageTransformer2DModel._sp_plan["unified_prepare"]`` keeps
+        ``auto_pad=False``. Flipping it to ``auto_pad=True`` removes the sync but
+        queues 120+ async ``all_to_all_single`` collectives into one lazy PJRT
+        graph and deadlocks at ``ulysses_degree=8``; hence the WARNING below.
+        """
+        # TODO(go/torchtpu-diffusion-findings): Remove once either (a) vLLM-Omni
+        # selects advanced_uaa itself when n_heads % ulysses_degree != 0, or
+        # (b) torch_tpu no longer hangs on many async all_to_all_single ops in
+        # one lazy graph (the strict-mode failure this works around).
+        p_cfg = getattr(od_config, "parallel_config", None)
+        if p_cfg is None:
+            return
+        ulysses_degree = int(getattr(p_cfg, "ulysses_degree", 1) or 1)
+        ulysses_mode = getattr(p_cfg, "ulysses_mode", "strict")
+        if ulysses_degree <= 1 or ulysses_mode != "strict":
+            return
+        model_class_name = getattr(od_config, "model_class_name", None)
+        n_heads = _ULYSSES_HEAD_COUNTS.get(model_class_name or "")
+        if n_heads is None or n_heads % ulysses_degree == 0:
+            return
+        logger.warning(
+            "%s has %d attention heads, not divisible by ulysses_degree=%d; "
+            "promoting ulysses_mode from 'strict' to 'advanced_uaa'. On TPU this "
+            "mode adds a per-layer host sync; pass ulysses_mode explicitly or use "
+            "a divisor of %d to opt out.",
+            model_class_name,
+            n_heads,
+            ulysses_degree,
+            n_heads,
+        )
+        p_cfg.ulysses_mode = "advanced_uaa"
 
     @classmethod
     def get_torch_device(cls, _local_rank: int | None = None) -> torch.device:

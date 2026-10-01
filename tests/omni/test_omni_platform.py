@@ -14,8 +14,10 @@ from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
 from vllm_torchtpu.omni import register_omni_tpu_platform
 from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
 from vllm_torchtpu.omni.patches import (
+    _unwrap_tpu_patch,
     apply_omni_model_specific_patches,
     apply_omni_tpu_patches,
+    apply_omni_worker_patches,
 )
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 
@@ -194,7 +196,7 @@ def test_ltx2_safe_decode_output():
     assert res.output == (None, None)
 
 
-def test_safe_pack_tensor_if_large():
+def test_safe_pack_tensor_if_large(monkeypatch):
     from unittest.mock import MagicMock
 
     from vllm_omni.diffusion import ipc
@@ -210,7 +212,7 @@ def test_safe_pack_tensor_if_large():
             else "unknown",
         }
     )
-    ipc._pack_tensor_if_large = orig_mock
+    monkeypatch.setattr(ipc, "_pack_tensor_if_large", orig_mock)
 
     apply_omni_model_specific_patches.cache_clear()
     apply_omni_model_specific_patches()
@@ -240,3 +242,89 @@ def test_omni_tpu_patches_configuration(monkeypatch):
         os.environ.pop("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", None)
         apply_omni_tpu_patches.__wrapped__()
         assert os.environ["VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"] == "1800.0"
+
+
+def test_worker_proc_async_output_loop_zero_gpu_id():
+    from vllm_omni.diffusion.worker import diffusion_worker
+
+    apply_omni_worker_patches()
+    proc = diffusion_worker.WorkerProc(gpu_id=5)
+    seen_gpu_id = proc._async_output_loop()
+    assert seen_gpu_id == 0
+    assert proc.gpu_id == 5
+    assert proc._async_output_pending == 0
+
+
+def test_set_device_installs_worker_patches(monkeypatch):
+    # DiffusionWorker.__init__ calls init_device() -> set_device before
+    # WorkerProc starts the DiffusionAsyncOutput thread, on both the default
+    # and the custom_pipeline_args (skip_load_model) paths. set_device must
+    # therefore be the place the _async_output_loop patch is installed.
+    from vllm_omni.diffusion.worker import diffusion_worker
+
+    orig_loop = _unwrap_tpu_patch(diffusion_worker.WorkerProc._async_output_loop)
+    monkeypatch.setattr(diffusion_worker.WorkerProc, "_async_output_loop", orig_loop)
+    monkeypatch.setattr(
+        "vllm_torchtpu.omni.platform.apply_omni_worker_patches",
+        apply_omni_worker_patches.__wrapped__,
+    )
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        staticmethod(lambda world_size: None),
+    )
+    monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
+    assert not getattr(
+        diffusion_worker.WorkerProc._async_output_loop, "_is_tpu_patch_wrapper", False
+    )
+    with patch("torch.empty"), patch("torch.device"):
+        OmniTpuPlatform.set_device(None)
+    assert diffusion_worker.WorkerProc._async_output_loop._is_tpu_patch_wrapper
+    assert diffusion_worker.WorkerProc(gpu_id=3)._async_output_loop() == 0
+
+
+@pytest.mark.parametrize(
+    ("model_class_name", "ulysses_degree", "ulysses_mode", "expected"),
+    [
+        # 30 heads % 8 != 0 and user left the default -> promoted.
+        ("ZImagePipeline", 8, "strict", "advanced_uaa"),
+        ("ZImagePipeline", 4, "strict", "advanced_uaa"),
+        # Divisors of 30 stay in strict mode.
+        ("ZImagePipeline", 2, "strict", "strict"),
+        ("ZImagePipeline", 6, "strict", "strict"),
+        # No sequence parallelism -> untouched.
+        ("ZImagePipeline", 1, "strict", "strict"),
+        # An explicit user choice is never overridden.
+        ("ZImagePipeline", 8, "advanced_uaa", "advanced_uaa"),
+        # Models outside the table keep vLLM-Omni's default behaviour.
+        ("FluxPipeline", 8, "strict", "strict"),
+        (None, 8, "strict", "strict"),
+    ],
+)
+def test_init_diffusion_model_runner_runtime_ulysses_mode(
+    model_class_name, ulysses_degree, ulysses_mode, expected
+):
+    from types import SimpleNamespace
+
+    od_config = SimpleNamespace(
+        model_class_name=model_class_name,
+        parallel_config=SimpleNamespace(
+            ulysses_degree=ulysses_degree, ulysses_mode=ulysses_mode
+        ),
+    )
+    OmniTpuPlatform.init_diffusion_model_runner_runtime(
+        vllm_config=None, od_config=od_config, device=torch.device("cpu")
+    )
+    assert od_config.parallel_config.ulysses_mode == expected
+
+
+def test_init_diffusion_model_runner_runtime_without_parallel_config():
+    from types import SimpleNamespace
+
+    # Configs without a parallel_config (or with None) are left alone.
+    OmniTpuPlatform.init_diffusion_model_runner_runtime(
+        vllm_config=None,
+        od_config=SimpleNamespace(model_class_name="ZImagePipeline"),
+        device=torch.device("cpu"),
+    )
