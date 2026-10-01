@@ -276,6 +276,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Chunking cuts the replicated query-token axis, which is orthogonal to
         # the KV axis DCP shards, so the same knob applies here unchanged.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        fused_payload = envs.TPU_SC_TOPK_FUSED_PAYLOAD
 
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -318,6 +319,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_kv_pages_per_block=(2, 2, 2),
                 num_queries_per_block=(1, 128, 128),
                 chunk_tokens=chunk_tokens,
+                fused_payload=fused_payload,
             )
             return cache_kv, local_topk
 
@@ -454,12 +456,37 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
             )
 
+        if envs.TPU_INDEXER_TOPK_SINGLE_WRITE:
+            return self._write_topk_rows(hidden_states.shape[0], topk_indices)
+
         self.topk_indices_buffer[: hidden_states.shape[0]] = -1
         num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])
         # Both branches return `topk_tokens`-wide rows.
         topk = self.topk_tokens
         self.topk_indices_buffer[:num_out, :topk] = topk_indices[:num_out]
         return self.topk_indices_buffer
+
+    def _write_topk_rows(
+        self, num_tokens: int, topk_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """The rows the -1 fill plus partial write would leave, in one update.
+
+        Builds the `[num_tokens, buffer_width]` rows (top-k, then -1) up front,
+        writes them with a single full-width row update so the buffer version
+        before it is dead and XLA can update in place, and returns those rows
+        rather than the buffer, so attention reads them instead of a whole
+        `[max_num_batched_tokens, width]` buffer version. The buffer still gets
+        the same contents for the layers that reuse it.
+        """
+        buf = self.topk_indices_buffer
+        num_tokens = min(num_tokens, buf.shape[0])
+        rows = topk_indices[:num_tokens, : self.topk_tokens].to(buf.dtype)
+        pad_rows = num_tokens - rows.shape[0]
+        pad_cols = buf.shape[1] - rows.shape[1]
+        if pad_rows or pad_cols:
+            rows = torch.nn.functional.pad(rows, (0, pad_cols, 0, pad_rows), value=-1)
+        buf[:num_tokens] = rows
+        return rows
 
 
 class VllmTPUIndexerCache(DeepseekV32IndexerCache):
