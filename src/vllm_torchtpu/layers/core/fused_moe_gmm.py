@@ -556,6 +556,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "num_experts",
     ),
 )
 def fused_moe_func(
@@ -576,6 +577,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    num_experts: int | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -620,6 +622,8 @@ def fused_moe_func(
     # reduce, and `where` propagate in BF16 — some custom_routing_fn
     # callers return FP32 weights and would otherwise promote downstream.
     topk_weights = topk_weights.astype(hidden_states.dtype)
+    global_topk_ids = topk_ids
+    orig_topk_weights = topk_weights
 
     if use_ep and experts_start is not None:
         local_ids = topk_ids - experts_start
@@ -649,7 +653,6 @@ def fused_moe_func(
     if (
         envs.USE_FUSED_UNPERMUTE_GMM
         and rhs_quant_dtype is None
-        and not use_ep
         and hidden_size % 256 == 0
         and (num_tokens * topk) % 16 == 0
     ):
@@ -661,10 +664,20 @@ def fused_moe_func(
         batch_size, model_dim = hidden_states.shape
         x_blocked = hidden_states.reshape(batch_size, model_dim // 256, 2, 128)
 
-        topk_indices_flat = topk_ids.flatten()
+        if use_ep:
+            global_num_experts = 512 if num_experts is None else num_experts
+            group_offset = (
+                jnp.zeros((1,), dtype=jnp.int32)
+                if experts_start is None
+                else jnp.reshape(experts_start, (1,)).astype(jnp.int32)
+            )
+        else:
+            global_num_experts = w1.shape[0]
+            group_offset = jnp.zeros((1,), dtype=jnp.int32)
+
+        topk_indices_flat = global_topk_ids.flatten()
         topk_argsort_indices = jnp.argsort(topk_indices_flat)
-        group_sizes = jnp.bincount(topk_indices_flat, length=w1.shape[0])
-        group_offset = jnp.zeros((1,), dtype=jnp.int32)
+        group_sizes = jnp.bincount(topk_indices_flat, length=global_num_experts)
 
         inter_dim = w2.shape[1]
         target_inter_dim = -(-inter_dim // 256) * 256
@@ -730,9 +743,20 @@ def fused_moe_func(
             group_offset=group_offset,
         )
 
+        local_group_size = w1.shape[0]
+        if local_group_size < group_sizes.shape[0]:
+            weights = ragged_dma_reduce.local_pick_weights(
+                orig_topk_weights,
+                global_topk_ids,
+                group_offset[0],
+                local_group_size,
+            )
+        else:
+            weights = orig_topk_weights
+
         out = ragged_dma_reduce.ragged_dma_reduce(
             gmm2_res,
-            topk_weights,
+            weights,
         )
         if w2_bias is not None:
             out = out + w2_bias
