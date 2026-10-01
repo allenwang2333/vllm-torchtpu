@@ -13,8 +13,7 @@
 # limitations under the License.
 """Wrapper for RPA kernel to match expected interface.
 
-NOTE: all of the code in this directory is experimental and not fully tested!
-To enable usage of this kernel in a full run, pass `--attention-backend CUSTOM`
+This backend is experimental. To enable it, pass `--attention-backend CUSTOM`
 to vLLM. `TpuPlatform.pre_register_and_update` registers
 `PallasBatchedRPAAttentionBackend` under `AttentionBackendEnum.CUSTOM`.
 
@@ -25,9 +24,9 @@ Compared to the default RPA kernel, this kernel does the following:
 2. Enables triple-buffering via Pallas emit_pipeline
 
 3. Precomputes expensive metadata upfront (e.g., page locations and bounds clipping) via
-scheduler.py kernel. Kernel is calculated once and ammortized across different layers in a model.
+the schedule.py kernel. The schedule is calculated once and reused across model layers.
 
-Note: batched_rpa is build on top / derived from RPA3.
+batched_rpa derives from RPA3.
 """
 
 import jax
@@ -219,7 +218,7 @@ def calculate_block_sizes(
         bkv_bytes = bkv_array_size * kv_bytes
         bo_bytes = bo_array_size * out_bytes
 
-        # Account for multiple buffers. For output, we always use double buffer.
+        # Account for multiple buffers; output uses double buffering.
         bq_bytes *= n_buffer
         bkv_bytes *= n_buffer
         bo_bytes *= 2
@@ -269,8 +268,7 @@ def calculate_block_sizes(
             fixed_bq_sz: int | None = None) -> configs.BlockSizes:
         """Loop through different block sizes to find the most optimal one."""
 
-        # Even if we loose some potential performance, we want to avoid OOM at all
-        # costs. Therefore, we conservatively only use 80% of the VMEM budget.
+        # Limit buffers and compute scratch to 80% of VMEM.
         capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
 
         bkv_sz = bkv_stride = mxu_column_size
@@ -307,8 +305,8 @@ def calculate_block_sizes(
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
         while (calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
                < capped_vmem_limit_bytes):
-            # Unless bq is a fixed value, we want to ensure bq size is the same as bkv
-            # size. When using causal masking, if bq size is larger than bkv size,
+            # Unless bq is fixed, keep bq and bkv the same size. With causal
+            # masking, if bq is larger than bkv,
             # entire kv tile can be masked out for some query tokens. Similarly, if
             # bkv size is larger than bq size, entire query tile can be masked out for
             # some kv tokens.
@@ -361,9 +359,9 @@ def calculate_block_sizes(
             n_buffer=n_buffer,
         )
 
-    # Default to triple buffer as its almost always beneficial.
+    # Triple buffering overlaps transfers with compute.
     n_buffer = 3
-    # Fixed value based on experimental results (the decode batch is the caller's: 8 unless it asks for fewer lanes).
+    # Prefill uses two batch lanes; the caller selects the decode batch size.
     prefill_batch_size = 2
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)

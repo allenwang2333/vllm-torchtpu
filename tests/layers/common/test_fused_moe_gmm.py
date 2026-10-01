@@ -409,7 +409,7 @@ def _make_ep_inputs(num_local_experts, seed=0):
 @pytest.mark.parametrize(
     "num_local_experts,experts_start",
     [
-        (16, 0),  # rank 0: experts_start == 0 must behave like the legacy path
+        (16, 0),  # rank 0: experts_start == 0 must behave like local expert IDs
         (16, 32),  # rank 2 of 8-way EP (Qwen3-30B shape: 128 / 8 = 16 local)
         (20,
          60),  # rank 3 of 8-way EP (Qwen3-480B-FP8 shape: 160 / 8 = 20 local)
@@ -810,10 +810,8 @@ def test_counting_sort_positions_matches_stable_argsort(num_rows, spread):
     pos, counts = fused_moe_gmm._counting_sort_positions(
         jnp.asarray(keys, jnp.int32), num_buckets)
     if num_rows < num_buckets:
-        # More buckets than the block: the sort declines (main's guard against
-        # an XLA miscompile of the rank matmul there) and the caller falls
-        # back to argsort. Unreachable in serving, where a block is 128 rows
-        # or more against 65 buckets.
+        # The rank matmul requires at least as many rows as buckets.
+        # Otherwise the caller must use argsort.
         assert pos is None and counts is None
         return
     want = np.argsort(np.argsort(keys, kind="stable"), kind="stable")
@@ -965,12 +963,9 @@ def test_moe_gmm_onehot_combine_skip_padded_tokens_zeroes_nan(monkeypatch):
 
 
 def test_moe_gmm_onehot_combine_keeps_operand_dtype(monkeypatch):
-    # With production dtypes (bf16 weights, bf16 gmm output) the combine
-    # matmul must NOT request f32 output: the MXU accumulates bf16 dots in
-    # f32 either way, and a widened f32 output costs bandwidth at large row
-    # counts (#485). Assert at the jaxpr level because backends that
-    # accumulate bf16 matmuls in f32 make the widening invisible to output
-    # comparison.
+    # BF16 dot products accumulate in FP32 internally, so requesting an FP32
+    # output only widens the stored result. Check the jaxpr because output
+    # comparisons cannot distinguish that unnecessary widening.
     kwargs = _small_moe_gmm_kwargs()
     rows = kwargs["argsort_revert_indices"].size
     monkeypatch.setattr(fused_moe_gmm, "get_packing_factor",

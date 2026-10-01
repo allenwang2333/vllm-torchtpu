@@ -35,8 +35,11 @@ def _operands(seed, tokens, heads, kv_heads, dim, rot):
     return q_gate, k, q_w, k_w, cache, positions
 
 
+# (32, 2, 256, 64): the data-parallel geometry, with every model head on
+# one engine.
 @pytest.mark.parametrize("tokens", [1, 4, 8, 13, 32])
-@pytest.mark.parametrize("geometry", [(4, 1, 256, 64), (2, 2, 128, 128)])
+@pytest.mark.parametrize("geometry", [(4, 1, 256, 64), (2, 2, 128, 128),
+                                      (32, 2, 256, 64)])
 def test_parity(tokens, geometry):
     heads, kv_heads, dim, rot = geometry
     ops = _operands(tokens * 3 + heads, tokens, heads, kv_heads, dim, rot)
@@ -48,3 +51,11 @@ def test_parity(tokens, geometry):
         b = np.asarray(b, np.float32)
         assert a.shape == b.shape
         np.testing.assert_allclose(a, b, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("tokens", [2048])
+@pytest.mark.parametrize("geometry", [(32, 2, 256, 64)])
+def test_parity_dp_prompt_rows(tokens, geometry):
+    """The data-parallel geometry at a prompt-sized row count (the served DP
+    passes run whole prompts through this kernel)."""
+    test_parity(tokens, geometry)

@@ -33,8 +33,7 @@ INTERMEDIATES = ("fp8", "bf16")
 # math runs on the matmuls' float32 accumulators.
 ELEMENTWISE_DTYPES = ("float32", "bfloat16")
 ROW_SCALE_DTYPES = (jnp.float32, jnp.bfloat16)
-# Result buffer slots and the row-fetch lookahead (the defaults tuned on
-# TPU v7).
+# Result buffer slots and the row-fetch lookahead.
 RESULT_SLOTS_DEFAULT = 3
 ROW_FETCH_AHEAD_DEFAULT = 2
 # Weight buffer slots, and the experts ahead of compute a refill is issued.
@@ -142,8 +141,7 @@ class Config:
         activation block) and runs the down matmul in fp8; "bf16" keeps
         them in bfloat16, no requantization, and runs the down matmul in
         bfloat16 against a per-expert bfloat16 copy of w2 (whole-expert
-        builds with fp8 or bf16 weights). A numerics choice: the gate
-        records each form's error against the reference and its time.
+        builds with fp8 or bf16 weights).
       result_rows: "fp8" sends each expert's result rows between shards as
         fp8 with one scale per row; "bf16" sends bf16 rows, twice the
         bytes and no third rounding.
@@ -192,13 +190,10 @@ class Config:
       weight_dma_priority: the DMA queue the expert weight refills issue
         on, 1 (off the token rows' in-order queue) or 0.
       sorted_rows: how the FFN kernel fetches each expert's input rows.
-        False: one copy per row from the token buffer, the rows scattered
-        there in token order (10,240 copies a call at 8192 tokens); the
-        copies hide under the result push, which is the longer transfer.
+        False: one copy per row from the token buffer, whose rows are in
+        token order. The copies overlap the result push.
         True: a sparse-core gather sorts the routed rows into expert
-        order first (exact, exposed) and the
-        kernel fetches each tile as one copy; the form a smaller result
-        push stands on. Whole-expert builds only: a streamed build keeps
+        order first, and the kernel fetches each tile as one copy. Whole-expert builds only: a streamed build keeps
         the per-row fetch, and so does a width the gather cannot move or
         a table whose sort program is over the sparse core's program
         size. None (the default): sorted_rows_by_shape decides from the

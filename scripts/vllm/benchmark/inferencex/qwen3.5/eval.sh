@@ -30,8 +30,7 @@ if [ -z "${INFERENCEX_REPO:-}" ]; then
   fi
 fi
 
-# InferenceX defaults for the Qwen3.5 B300 SGLang quality-eval row.
-# The selected eval rows are CONC=32 and CONC=256; default to the max row.
+# Default concurrency and context lengths for Qwen3.5 quality evaluation.
 ISL="${ISL:-8192}"
 OSL="${OSL:-1024}"
 CONC="${CONC:-256}"
@@ -43,8 +42,7 @@ RESULT_DIR="${RESULT_DIR:-/tmp/qwen3.5-inferencex-eval}"
 EVAL_LIMIT="${EVAL_LIMIT:-${LIMIT:-}}"
 EVAL_CONCURRENT_REQUESTS="${EVAL_CONCURRENT_REQUESTS:-$CONC}"
 
-# InferenceX keeps its task files under infx/evals (utils/evals before
-# September 2026): a relative task name is looked up under both.
+# Look up a relative YAML path as supplied, then under infx/evals.
 if [[ "$TASK" == *.yaml && "$TASK" != /* && -f "${INFERENCEX_REPO}/$TASK" ]]; then
   EVAL_TASKS_DIR="${INFERENCEX_REPO}/$TASK"
 elif [[ "$TASK" == *.yaml && "$TASK" != /* && -f "${INFERENCEX_REPO}/infx/evals/$(basename "$TASK")" ]]; then

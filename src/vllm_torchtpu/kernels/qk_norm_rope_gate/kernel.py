@@ -14,9 +14,8 @@
 """Fused split + per-head RMS norm + partial NeoX RoPE + gate for the
 attention layers, as one Pallas call per layer for a few rows.
 
-The served path runs this as about forty small XLA ops per attention layer
-(the q|gate split, the per-head views, the two Gemma-style norms, the rope's
-cos/sin gather, chunks, rotations and casts). Here one kernel takes
+The kernel combines the q|gate split, per-head views, Gemma-style norms,
+and RoPE rotations and casts. It takes
 
   q_gate  [rows, H * 2 * D] bf16   per head: [q | gate]
   k       [rows, Hk * D]    bf16

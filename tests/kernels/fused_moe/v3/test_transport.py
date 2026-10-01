@@ -99,8 +99,8 @@ class TransportScheduleTest(parameterized.TestCase):
         self.assertEqual(transport.token_multiple(width), n_pieces // 2)
 
     def test_eight_shards_is_the_shipped_schedule(self):
-        # Four pieces per block, two rounds, six receive semaphores beyond the
-        # mate tile semaphore, as the 8-shard program had.
+        # Eight shards use four pieces per block, two rounds, and six
+        # receive semaphores in addition to the mate tile semaphore.
         self.assertEqual(transport.pieces(8), 4)
         self.assertEqual(transport.dimensions(8), 2)
         self.assertEqual(transport.receive_semaphores(8), 7)

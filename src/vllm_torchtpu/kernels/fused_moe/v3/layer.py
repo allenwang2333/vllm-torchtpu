@@ -13,27 +13,17 @@
 # limitations under the License.
 """The fused expert-parallel MoE layer.
 
-fused_ep_moe validates the operands, builds (and caches) the FFN kernel for
-the layer's shape, and runs one shard_map over the expert-parallel mesh
-axis. The per-shard body (_pallas_step) is the package's own Pallas
-programs end to end: the select kernel, the transport, the routing-tables
-kernel, the row-tables scatter, the FFN kernel, the gather and the combine.
+fused_ep_moe validates the operands, builds and caches the FFN kernel for
+the layer's shape, and runs one shard_map over a power-of-two
+expert-parallel mesh of 1 to 32 shards.
 
-  xla     any expert-parallel width. XLA all-gathers the token rows and the
-          routing message, routing_tables builds the routing tables (dense
-          passes or the single-call kernel), XLA scatters build the routed rows
-          tables, and an XLA gather and weighted sum combine the arrivals.
-  pallas  a power-of-two mesh of 1 to 32 shards. The package's own programs
-          replace every XLA
-          piece: the select kernel writes the routing message, the transport's
-          start call quantizes the rows and issues the token exchange, the
-          shard-tables kernel builds every table and hosts the transport's
-          middle step, a sparse-core program scatters the row tables, and
-          the combine is a sparse-core gather with a TensorCore sum.
-
-Both pass the FFN kernel the same operands and read back the same arrival
-routed rows and arrival scale rows. _xla_step and _pallas_step are the
-two bodies.
+The per-shard body (_pallas_step) uses Pallas programs throughout. The
+select kernel writes the routing message, the transport starts the token
+exchange, and the shard-tables kernel builds the routing tables and
+forwards the transport's middle rounds. A sparse-core scatter fills the
+row tables. The FFN kernel computes the expert outputs and pushes them
+to their destination shards, where a sparse-core gather and TensorCore
+weighted sum combine the arrivals.
 """
 import math
 import threading
@@ -849,10 +839,9 @@ def fused_ep_moe(x,
         token_block)
     if stream_block and config.token_block is None and not (form.block_scaled):
         # A streamed expert needs the blocked intermediate and nothing
-        # else: the token rows keep one scale per row (the kernel's default
-        # form), which is faster than blocked token rows on the streamed
-        # shapes. A caller's own
-        # token_block is taken as it is; block-scaled weights need the block.
+        # else: the token rows use one scale per row, allowing the up
+        # projection to use a single matmul and rescale. An explicit
+        # token_block is preserved; block-scaled weights require their block.
         token_block = 0
         weight_slots, weight_prefetch, stream_block, stream_rows = buffers(
             token_block)
@@ -1017,9 +1006,9 @@ def fused_ep_moe(x,
 
     # WRAP_IN_JIT: the layer's own callers get one compiled program per shape.
     # A caller that is already inside a jit -- the torch bridge exports the
-    # whole op as one jitted function -- sets it False: the nested jit is what
-    # XLA's SPMD partitioner trips over on the export path ("Side-effect HLO
-    # must have sharding" on the transport's program).
+    # whole op as one jitted function -- sets it False. On the export path,
+    # XLA's SPMD partitioner rejects a nested jit with "Side-effect HLO
+    # must have sharding" for the transport program.
     def build():
         sm = jax.shard_map(shard_body,
                            mesh=mesh,

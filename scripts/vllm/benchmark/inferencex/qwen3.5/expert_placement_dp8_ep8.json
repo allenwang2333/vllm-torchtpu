@@ -5,7 +5,7 @@
   "owned_per_core": 64,
   "extra_slots": 0,
   "redundant": 0,
-  "recording": "InferenceX 8192-in / 1024-out prompts at concurrency 128, eight engines DP8/EP8, every MoE layer's expert loads",
+  "recording": "Per-layer expert activation statistics.",
   "algorithm": "vllm.distributed.eplb.policy.default.DefaultEplbPolicy.rebalance_experts (global: one group, one node)",
   "rule": "vLLM EPLB placement: each slot holds one logical expert; an expert in several slots is a copy; the first slot holding it is its owner for cores that hold no copy",
   "layers": {

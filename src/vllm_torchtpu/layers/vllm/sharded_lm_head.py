@@ -186,14 +186,14 @@ def install(model, buckets) -> bool:
             "left as is", vocab, n)
         return False
     part = vocab // n
-    # Slice on the host, not on the device: a device-side slice is a lazily materialized strided view whose
-    # compiled program is cached under a key that does not carry the slice bounds, so eight engines slicing
-    # eight different windows load one another's executables (RuntimeProgramInputMismatch on the second boot).
+    # Slice on the host: a lazily materialized device slice can use a
+    # compiled-program cache key that omits the slice bounds, causing
+    # ranks with different windows to reuse incompatible executables.
     w_cpu = w.cpu()
     ws = w_cpu[idx * part:(idx + 1) * part].contiguous().to(w.device)
     head.weight_slice = torch.nn.Parameter(ws, requires_grad=False)
-    # The whole head is not needed any more on this engine: keep a one-row stand-in so the module still has
-    # a `weight` (shape checks elsewhere read it) without the 2 GB.
+    # Keep a one-row weight for module shape checks while releasing this
+    # engine's full vocabulary projection.
     head.weight = torch.nn.Parameter(w_cpu[:1].clone().to(w.device),
                                      requires_grad=False)
     del w

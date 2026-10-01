@@ -86,14 +86,10 @@ def ep_device_ids() -> tuple[int, ...] | None:
 def ep_rank_order() -> tuple[int, ...] | None:
     """EP rank at each mesh index, for a mesh in ascending device-id order.
 
-    A Mosaic kernel that addresses a peer with `DeviceIdType.MESH` resolves the
-    mesh coordinate positionally against the device list, not through the
-    device array the mesh was built with: an eight-process run whose mesh is in
-    EP-rank order (device ids `[0, 1, 4, 5, 6, 7, 2, 3]` on a tpu7x-8) sends
-    every routed row to the wrong peer and deadlocks on the first call, and so
-    does any other permuted order. Ascending device-id order is the one that
-    works, and it is also what a single-process mesh gets from `jax.devices()`,
-    which is why the kernel's own device tests never saw this.
+    A Mosaic kernel using `DeviceIdType.MESH` resolves peer coordinates against
+    the ordered device list. The mesh must use ascending device ids so that
+    routing and DMA address the same peers. A permuted mesh can send rows to
+    the wrong device and deadlock.
 
     Ordering by device id means mesh index i is no longer EP rank i, so the
     shard sitting at mesh index i owns the experts of EP rank

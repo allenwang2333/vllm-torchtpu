@@ -633,10 +633,8 @@ class FakeInt8MoEConfig:
 class TestInt8MoERequantization:
     """`MOE_REQUANTIZE_WEIGHT_DTYPE=int8` end to end through the loader.
 
-    int8 is a supported value of that env var but no recipe, CI config or other
-    test exercises it, which is how the truncating cast in `quantize_tensor`
-    survived. This runs the real `_process_fp8_moe_weights`. CPU-only, so it
-    takes no `device` fixture.
+    Exercise the real `_process_fp8_moe_weights` loader and check int8
+    rounding on CPU without a device fixture.
     """
 
     E, INTER, H, BLOCK = 2, 128, 384, 128

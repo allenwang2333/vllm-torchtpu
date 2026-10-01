@@ -37,7 +37,15 @@ class TokenPaddingState:
 
     def update(self, local_valid_tokens: int,
                local_padded_tokens: int) -> None:
-        """Write this rank's token padding mask."""
+        """Write this rank's token padding mask when its valid or padded count changes.
+
+        Consecutive decode steps often use the same counts; reusing the device
+        buffers avoids two synchronous host-to-device copies on those steps.
+        """
+        key = (int(local_valid_tokens), int(local_padded_tokens))
+        if getattr(self, "_last_update", None) == key:
+            return
+        self._last_update = key
         host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.

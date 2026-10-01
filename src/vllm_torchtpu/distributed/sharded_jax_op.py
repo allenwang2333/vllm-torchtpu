@@ -21,14 +21,11 @@ genuinely sharded therefore gets tensors sized for the global array instead of
 this rank's shard -- for an EP MoE at 2048 tokens a rank, an output claiming
 16384 rows.
 
-``pcp_streaming_rpa``'s adapter solved that by reimplementing ``__call__``, and
-that copy has since fallen behind -- stock has gained an eager wrapper-tensor
-branch and MLIR-fingerprint-based kernel caching that it does not have. So
-instead of forking the method, this derives it from the installed one and
-changes the single line that builds the output placeholders. If upstream
-reworks that line the derivation no-ops and the caller falls back to stock,
-which is wrong only in the way described above and fails loudly on a shape
-mismatch rather than silently.
+This adapter derives ``__call__`` from the installed implementation and changes
+only the output-placeholder construction. This preserves its eager wrapper
+handling and kernel-cache behavior. If the expected construction cannot be
+found, the adapter retains the stock method; a sharded output then fails with
+the shape mismatch described above.
 """
 
 import inspect
@@ -133,6 +130,7 @@ def sharded_jax_op(
     input_partition_specs: Sequence[PartitionSpec],
     output_partition_specs: Any,
     donate_argnums: Sequence[int] | None = None,
+    fake: Callable[..., object] | None = None,
 ):
     """A torch custom op for ``fn`` run as an SPMD program over ``mesh``.
 
@@ -147,6 +145,12 @@ def sharded_jax_op(
     here, but a one-tuple gives the op the schema ``-> ((Tensor))``, and torch
     ``guard_int``s every symbolic input dimension of an op with that schema, so
     a caller under ``torch.compile`` loses its dynamic batch dimension.
+
+    ``fake``: an optional fake implementation written by hand, in terms of the
+    torch operands' (possibly symbolic) shapes. Without one the fake exports
+    the JAX function at the operands' concrete shapes, which specialises a
+    dynamic dimension of the caller's trace to that value; an op whose output
+    shape follows a dynamic input dimension needs the hand-written form.
     """
     global _SHARDED_CALLABLE_CLS
     if _SHARDED_CALLABLE_CLS is None:
@@ -199,5 +203,5 @@ def sharded_jax_op(
         return lowered.out_tree.unflatten(
             _sharded_output_placeholders(lowered, mesh))
 
-    op.register_fake(fake_fn)
+    op.register_fake(fake if fake is not None else fake_fn)
     return op

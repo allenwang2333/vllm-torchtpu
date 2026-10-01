@@ -168,12 +168,10 @@ class FfnTest(parameterized.TestCase):
     def test_one_block_is_the_whole_row(self):
         """blocked_rows_dot over one block is the dot scaled by the row.
 
-        Two exact checks, because XLA's fp8 matmul path on the TPU is not
-        exact (4.2e-3 relative L2 against float64 on a 256-long
-        contraction, in every form XLA turns into a native fp8 dot;
-        studies/fp8_dot_probe2.py): the bf16 form of the helper, run
-        eagerly, against float64; and the fp8 form under jit against the
-        plain fp8 dot under the same jit, which XLA treats alike."""
+        Check the eager bf16 form against a float64 reference, and the
+        jitted fp8 form against a plain fp8 dot in the same jit. These
+        comparisons account for the different TPU lowerings of eager
+        bf16 and native fp8 matmuls."""
         op = self.operands()
         rows, q1, scales = op["rows"], op["q1"], op["scales"]
         exact = (np.asarray(rows, np.float64) @ np.asarray(

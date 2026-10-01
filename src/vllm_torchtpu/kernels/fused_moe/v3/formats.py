@@ -54,8 +54,8 @@ class WeightForm(NamedTuple):
     ("per_contraction_block": four-bit weights, fp4 or int4 with one
     scale per block of the contraction, and fp8 weights in the block-scaled
     form the DeepSeek-family checkpoints ship in), or none for unscaled
-    bf16 weights. Token rows are fp8 with one f32 scale per
-    row on every format, and so are the rows the experts return."""
+    bf16 weights. Config selects the token and result row formats and
+    token quantization block within the supported weight-format combinations."""
     name: WeightFormat
     weight_dtype: object
     scale_layout: str

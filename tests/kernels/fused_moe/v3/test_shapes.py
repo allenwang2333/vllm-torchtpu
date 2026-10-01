@@ -11,14 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The layer at real model shapes, on the device: the per-shard geometry of
-eight served models at every batch from 64 to 8192.
+"""Device tests of model shard geometries at batches from 64 to 8192.
 
-Each model keeps its true top_k, hidden, inter, weight format, activation
-and biases. The expert count is cut to a few experts per shard so the
-sweep runs in minutes: the kernels see a shard's experts one at a time and
-the tables see the count only as their width, and one full-count case per
-model covers the width.
+Each model keeps its top_k, hidden, inter, weight format, activation, and
+biases. The sweep uses fewer experts per shard to limit runtime: kernels
+process one expert at a time, and the expert count determines the table
+width. One full-count case per model covers that width.
 """
 import os
 
@@ -39,18 +37,16 @@ from . import \
 pytestmark = pytest.mark.multichip
 
 NUM_SHARDS = test_layer.NUM_SHARDS
-# Every batch, or the subset FUSED_EP_TEST_BATCHES names (the per-push
-# tier runs "64,8192", where the reference checks are; the full suite is
-# the release gate).
+# Run every batch, or the subset named by FUSED_EP_TEST_BATCHES.
+# REFERENCE_BATCHES selects the batches checked against the reference.
 BATCHES = tuple(
     int(b)
     for b in os.environ.get("FUSED_EP_TEST_BATCHES",
                             "64,128,256,512,1024,2048,4096,8192").split(","))
 TILE_ROWS = 128
-# The per-shard geometry of each served model. `experts` is the reduced
-# count the sweep runs at; `full_experts` is the model's. `activation_block`
-# is the widest block (512 is the production layer's) both of the model's
-# widths divide into, for the block-quantization run.
+# The per-shard geometry of each model. `experts` is the reduced count for
+# the sweep; `full_experts` is the model's count. `activation_block` is the
+# largest block up to 512 that divides both widths for block quantization.
 MODELS = {
     "qwen3_5_397b":
     dict(top_k=10,
@@ -179,7 +175,7 @@ REFUSED_MODELS = {
                            weight_format=WeightFormat.BF16,
                            activation="silu",
                            bias=False), "VMEM"),
-    # top-k of 1 is outside the kernel's contract.
+    # The bf16 expert matrices exceed the whole-expert VMEM budget.
     "llama4_scout": (dict(top_k=1,
                           hidden=5120,
                           inter=8192,
@@ -274,9 +270,8 @@ class ShapeSweepTest(parameterized.TestCase):
     @parameterized.parameters(*[(name, rows) for name in MODELS
                                 for rows in ("fp8", "bf16")])
     def test_activation_block_at_model_shapes(self, name, result_rows):
-        """Each shape at its activation block with either result-row form
-        (bf16 with block 512 is the production layer's rounding), 1024
-        tokens, against the reference at the same rounding."""
+        """Check each shape at 1024 tokens with its activation block and
+        either result-row form against the reference at the same rounding."""
         model = MODELS[name]
         block = model["activation_block"]
         shape = shape_of(model, 1024)

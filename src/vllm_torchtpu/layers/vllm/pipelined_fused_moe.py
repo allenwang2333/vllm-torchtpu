@@ -96,7 +96,7 @@ def _get_moe_collective_group():
 
 @torch.compiler.assume_constant_result
 def _log_active_chunk_pipeline() -> None:
-    """Emit trace-time evidence without passing symbolic values to logging."""
+    """Log trace-time configuration without passing symbolic values to logging."""
     collective_group, collective_kind = _get_moe_collective_group()
     parallel_size = (int(collective_group.world_size)
                      if collective_group is not None else 1)

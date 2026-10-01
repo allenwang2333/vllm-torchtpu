@@ -99,10 +99,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
     "VLLM_XLA_CHECK_RECOMPILATION",
     "TPU_PARALLEL_PRECOMPILE",
-    # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
-    # timeouts. Same reasoning as the Raiden group above. Every registry
-    # entry not named here joins the cache key, so omitting these would
-    # recompile the world whenever an operator retuned a port.
+    # KV-transfer wiring (ports, socket paths, staging pools, pool sizes,
+    # and timeouts) does not affect compiled graphs. Every registry entry
+    # not listed here contributes to the cache key.
     "TPU_IPC_SOCKET_DIR",
     "TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS",
     "TPU_KV_COORD_EXECUTOR_MAX_WORKERS",
@@ -305,8 +304,6 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     return hash_obj.hexdigest()[:10]
 
 
-# TODO(geyuhao): Switch this cache-key hashing to upstream vllm.ir.util.hash_source
-# once our local vLLM checkout exposes that helper.
 def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
     """Wrap a graph module to return a tuple if it returns a single tensor.
 
@@ -444,9 +441,8 @@ class TpuCompilerAdaptor(CompilerInterface):
                 signature=shape_variants.graph_signature(graph),
                 was_wrapped=was_wrapped,
             )
-            # Write-then-rename: a crash or a full disk partway through
-            # pickling a 400 MB entry would otherwise leave a truncated file
-            # that the next run reads back as a corrupt artifact.
+            # Write then rename so a crash or full disk cannot leave a truncated
+            # artifact at the cache path.
             tmp_path = f"{path}.tmp"
             with open(tmp_path, "wb") as f:
                 pickle.dump(payload, f)
@@ -487,16 +483,11 @@ class TpuCompilerAdaptor(CompilerInterface):
         elif payload.entry is None:
             reason = "no bundled entry"
         elif payload.signature != shape_variants.graph_signature(graph):
-            # Not what makes the bundled entry safe -- that comes from wrapper
-            # and executable being one object, with no lookup left to drift.
-            # This is the same check BucketExecutables.get already applies to
-            # the in-memory hand-over, extended across processes, and it earns
-            # its place because nothing else validates the entry against the
-            # graph: torch_tpu injects a synthetic cache_info and stubs out
-            # generate_guards_expression, and replaying a pickle we wrote
-            # ourselves never goes through AOTAutogradCache.try_load.
-            # Placeholders only, so a changed graph *body* still passes -- that
-            # is compute_tpu_compilation_hash's job, not this one.
+            # Validate the placeholder signature, as BucketExecutables.get does
+            # for in-memory sharing. torch_tpu supplies synthetic cache_info and
+            # stubs generate_guards_expression, while this pickle replay bypasses
+            # AOTAutogradCache.try_load. Graph-body changes are checked separately
+            # by compute_tpu_compilation_hash.
             reason = (f"graph signature changed ({payload.signature} vs "
                       f"{shape_variants.graph_signature(graph)})")
         elif payload.was_wrapped != was_wrapped:
@@ -602,18 +593,12 @@ class TpuCompilerAdaptor(CompilerInterface):
         graph_index: int,
         compile_range: Range,
     ) -> Callable[..., Any]:
-        """Rebuild a compiled runnable from the artifact `compile` saved.
+        """Rebuild a compiled runnable from the artifact saved by `compile`.
 
-        This is the warm-start path, and the reason a warm start is minutes
-        rather than tens of minutes: FX->MLIR lowering and XLA compilation are
-        both skipped. Replaying torch's bundled AOTAutograd entry restores the
-        wrapper and the executable together, so there is no point at which a
-        freshly traced wrapper could be paired with the wrong program.
-
-        Falls back to a real compile whenever the artifact is missing, stale,
-        or built from a different graph. That is never wrong, only slower --
-        and with the Tier-3 C++ cache active it is not even much slower, since
-        torch_tpu serves the PJRT binary natively.
+        Replaying the bundled AOTAutograd entry skips FX-to-MLIR lowering and
+        XLA compilation while restoring the wrapper and executable together.
+        A missing, stale, or incompatible artifact triggers compilation. The
+        Tier-3 C++ cache can supply the PJRT binary during that fallback.
         """
         assert isinstance(handle, tuple) and len(handle) == 3
         key, path, _saved_was_wrapped = handle

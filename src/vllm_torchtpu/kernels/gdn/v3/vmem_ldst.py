@@ -80,7 +80,7 @@ def load_compact_heads(vmem_ref: jax.Ref,
 def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
     """Use strided load to convert compact to large layout without transpose."""
 
-    # NOTE: Only support 32-bits for now.
+    # This layout conversion requires 32-bit elements.
     assert vmem_ref.dtype.itemsize == 4
     assert vmem_ref.shape[-2] == 1
     col_size = vmem_ref.shape[-1]

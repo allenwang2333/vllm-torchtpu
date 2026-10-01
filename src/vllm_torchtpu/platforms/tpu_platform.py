@@ -843,10 +843,19 @@ class TpuPlatform(Platform):
         # will compile for.
         if compilation_config.compile_sizes is None:
             scheduler_config = vllm_config.scheduler_config
+            budget = scheduler_config.max_num_batched_tokens
+            step = envs.TPU_TOKEN_BUCKET_STEP
+            # the longest pass one prompt can make: the model length plus
+            # the decode rows riding along, rounded up to the step
+            longest = vllm_config.model_config.max_model_len + max(
+                int(scheduler_config.max_num_seqs), 1)
             compilation_config.compile_sizes = _get_token_paddings(
                 min_token_size=16,
-                max_token_size=scheduler_config.max_num_batched_tokens,
+                max_token_size=budget,
                 extra_bucket_sizes=envs.TPU_TOKEN_BUCKET_EXTRA,
+                step=step,
+                step_from=budget // 4,
+                step_to=(-(-longest // step) * step) if step > 0 else 0,
             )
         else:
             compilation_config.compile_sizes = sorted(
@@ -1227,25 +1236,45 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     patch_engine_core_for_pp_chunks(vllm_config)
 
 
-def _get_token_paddings(
-        min_token_size: int,
-        max_token_size: int,
-        extra_bucket_sizes: list[int] | None = None) -> list[int]:
+def _stepped_token_paddings(step: int, step_from: int,
+                            step_to: int) -> list[int]:
+    """Multiples of ``step`` above ``step_from`` and up to ``step_to``."""
+    if step <= 0 or step_to <= step_from:
+        return []
+    first = (step_from // step + 1) * step
+    return list(range(first, step_to + 1, step))
+
+
+def _get_token_paddings(min_token_size: int,
+                        max_token_size: int,
+                        extra_bucket_sizes: list[int] | None = None,
+                        step: int = 0,
+                        step_from: int = 0,
+                        step_to: int = 0) -> list[int]:
     """Generate a list of padding size, starting from min_token_size,
     ending with a number that can cover max_token_size.
 
-    ``extra_bucket_sizes`` are merged into the list.
+    ``extra_bucket_sizes`` are merged into the list, and so are the
+    multiples of ``step`` between ``step_from`` (exclusive) and ``step_to``
+    (inclusive): the padding step for prompt-sized steps, whose cost is per
+    row, so that a pass is padded to the next multiple of the step rather
+    than to the next power of two.
     """
     # assert min_token_size is power of 2
     assert (min_token_size & (min_token_size - 1) == 0) and min_token_size > 0
 
     paddings = _get_exponential_token_paddings(min_token_size, max_token_size)
-    if extra_bucket_sizes:
-        paddings = sorted(
-            set(paddings)
-            | {
-                size
-                for size in extra_bucket_sizes if 0 < size <= max_token_size
-            })
+    stepped = _stepped_token_paddings(step, step_from,
+                                      min(step_to, max_token_size))
+    extra = [
+        size for size in (extra_bucket_sizes or []) if 0 < size <= max_token_size
+    ]
+    if stepped or extra:
+        paddings = sorted(set(paddings) | set(stepped) | set(extra))
+    if stepped:
+        logger.info(
+            "Token buckets every %d rows above %d up to %d (%d buckets): a "
+            "prompt-sized pass is padded to the next multiple of the step",
+            step, step_from, stepped[-1], len(stepped))
     logger.info("Using token paddings: %s", paddings)
     return paddings

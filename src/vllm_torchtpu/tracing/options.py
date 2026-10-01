@@ -2,6 +2,8 @@ import os
 import re
 from typing import Any, Dict, Tuple
 
+from vllm_torchtpu import envs
+
 _STANDARD_KEYS = frozenset({
     "host_tracer_level",
     "device_tracer_level",
@@ -93,6 +95,15 @@ def resolve_profile_dir_and_opts(
     """
     standard_opts = _DEFAULT_STANDARD_OPTS.copy()
     advanced_opts = _DEFAULT_ADVANCED_OPTS.copy()
+    # TPU_PROFILER_OPTIONS: the same "key:value;" string from the environment,
+    # for a server whose /start_profile carries no prefix (e.g.
+    # "python_tracer_level:0;" for host spans without the Python tracer's
+    # own cost).
+    env_opts = envs.TPU_PROFILER_OPTIONS
+    if env_opts:
+        env_standard, env_advanced = parse_profile_options(env_opts)
+        standard_opts.update(env_standard)
+        advanced_opts.update(env_advanced)
     profile_dir = base_dir
 
     if profile_prefix:

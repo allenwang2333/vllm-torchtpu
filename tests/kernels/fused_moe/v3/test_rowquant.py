@@ -219,8 +219,7 @@ class ResultRowFormsTest(parameterized.TestCase):
                                       np.asarray(fp4_block_rows(x, block)))
 
     def test_the_grid_forms_reach_the_reference_unchanged(self):
-        """The grid form named fp4_grid gives the reference's fp4 output
-        exactly (a shadowed expert index once made every grid form garbage)."""
+        """The fp4_grid and fp4 forms produce identical reference outputs."""
         rng = np.random.default_rng(0)
         shape = dict(tokens=64, top_k=2, experts=8, hidden=256, inter=128)
         x = jnp.asarray(

@@ -46,6 +46,89 @@ def _get_kv_connector_handshake_metadata_key(metadata=None) -> tuple[int, int]:
     return get_pp_group().rank_in_group, rank
 
 
+def _parse_cpulist(text: str) -> list[int]:
+    """"0-3,8,10-11" -> [0, 1, 2, 3, 8, 10, 11]."""
+    cpus: list[int] = []
+    for part in text.strip().split(","):
+        if not part:
+            continue
+        lo, _, hi = part.partition("-")
+        cpus.extend(range(int(lo), int(hi or lo) + 1))
+    return cpus
+
+
+def _tpu_chip_numa_node(chip_index: int) -> tuple[str | None, int | None]:
+    """The PCI address and NUMA node of TPU chip `chip_index`: the TPU
+    accelerator devices (Google's vendor id, the accelerator device class) in
+    PCI address order, matching libtpu chip numbering."""
+    import glob
+    devices: list[str] = []
+    for d in glob.glob("/sys/bus/pci/devices/*"):
+        try:
+            with open(os.path.join(d, "vendor")) as f:
+                vendor = f.read().strip()
+            with open(os.path.join(d, "class")) as f:
+                cls = f.read().strip()
+        except OSError:
+            continue
+        if vendor == "0x1ae0" and cls.startswith("0xff00"):
+            devices.append(os.path.basename(d))
+    devices.sort()
+    if chip_index >= len(devices):
+        return None, None
+    try:
+        with open(f"/sys/bus/pci/devices/{devices[chip_index]}/numa_node") as f:
+            node = int(f.read().strip())
+    except OSError:
+        return devices[chip_index], None
+    return devices[chip_index], (node if node >= 0 else None)
+
+
+def _bind_worker_to_chip_socket(chip_index: int) -> None:
+    """Bind a worker to the NUMA node attached to its TPU chip.
+
+    Runtime threads inherit the node's CPU set, and subsequent allocations
+    prefer its memory. This avoids remote-socket memory traffic and reduces
+    host launch skew between workers. Single-socket hosts need no change.
+    """
+    device, node = _tpu_chip_numa_node(chip_index)
+    if node is None:
+        logger.info(
+            "worker numa bind: chip %d (%s) has no NUMA node; placement left "
+            "to the scheduler", chip_index, device)
+        return
+    try:
+        with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
+            node_cpus = _parse_cpulist(f.read())
+        # Narrow the inherited CPU set to the socket, never widen it: a
+        # launcher's reservation (taskset, numactl, a cgroup) stays in force.
+        # If the launcher left this worker no CPU on its chip's socket, the
+        # inherited set stands and only the memory policy follows the chip.
+        inherited = os.sched_getaffinity(0)
+        cpus = set(node_cpus) & inherited
+        if not cpus:
+            logger.info(
+                "worker numa bind: chip %d (%s) -> node %d shares no cpu with "
+                "the inherited set of %d; cpu set left as inherited",
+                chip_index, device, node, len(inherited))
+            cpus = inherited
+        else:
+            os.sched_setaffinity(0, cpus)
+    except OSError as e:
+        logger.warning(
+            "worker numa bind: chip %d (%s) node %d: cpu set not applied "
+            "(%s)", chip_index, device, node, e)
+        return
+    memory = "memory preferred there"
+    try:
+        import ctypes
+        ctypes.CDLL("libnuma.so.1").numa_set_preferred(ctypes.c_int(node))
+    except (OSError, AttributeError):
+        memory = "memory policy unchanged (libnuma unavailable)"
+    logger.info("worker numa bind: chip %d (%s) -> node %d, %d cpus, %s",
+                chip_index, device, node, len(cpus), memory)
+
+
 def _debug_tpu_local_rank_offset() -> int:
     value = os.environ.get(DEBUG_TPU_LOCAL_RANK_OFFSET_ENV, "0") or "0"
     try:
@@ -175,6 +258,9 @@ class TPUWorker(WorkerBase):
         # takes these at construction time.
         self.profile_rank = binding.rank
         self.profile_world_size = binding.world_size
+        # Before the runtime comes up, so its threads and its buffers follow.
+        if envs.TPU_WORKER_NUMA_BIND:
+            _bind_worker_to_chip_socket(binding.native_local_rank)
         if dp_size > 1:
             per_engine_world = pc.world_size
             dp_rank = binding.dp_rank
@@ -628,6 +714,12 @@ class TPUWorker(WorkerBase):
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
+        # The heap created during load and compilation is static. Freeze it
+        # so per-step garbage collection does not repeatedly traverse it.
+        from vllm.utils.gc_utils import (freeze_gc_heap,
+                                         maybe_attach_gc_debug_callback)
+        freeze_gc_heap()
+        maybe_attach_gc_debug_callback()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:

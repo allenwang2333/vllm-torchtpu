@@ -26,11 +26,11 @@ def _fp8_weight(rng, shape):
 @pytest.mark.parametrize(
     "rank_source,replicas,tokens",
     [
-        # The rank reaches the kernel as a scalar-prefetch operand and must be a
-        # stored tensor: the compile flow cannot specialise one the traced forward
-        # computes, and the attempt aborts the process rather than raising. The
-        # served layer passes the expert-start buffer registered at load, which is
-        # the "experts_start" case below; "buffer" covers the same shape of input.
+        # The rank reaches the kernel inside the packed scalar table, a stored
+        # tensor built at load (the compile flow cannot specialise a scalar
+        # operand the traced forward computes). The served layer packs
+        # rank * owned, the "experts_start" case below; "buffer" packs the
+        # rank itself with owned = 1.
         ("buffer", False, 4),
         ("experts_start", False, 4),
         ("experts_start", True, 4),
@@ -95,6 +95,13 @@ def test_scores_op_compiled_matches_eager(device, rank_source, replicas,
                 "hot1h",
                 torch.tensor(np.asarray(hot_onehot(hot)).astype(np.float32),
                              dtype=torch.bfloat16))
+            from vllm_torchtpu.kernels.moe_lowtok.kernel import pack_tables
+            rank_value = rank * local if rank_source == "experts_start" else rank
+            self.register_buffer(
+                "tables",
+                torch.tensor(pack_tables(rank_value, self.gid.numpy(), hot,
+                                         hprim, hcopy, self.slot.numpy()),
+                             dtype=torch.int32))
             for name, shape, width in (
                 ("w13", (self.gid.numel(), hidden, 2 * intermediate), hidden),
                 ("w2", (self.gid.numel(), intermediate, hidden), intermediate),
@@ -106,23 +113,13 @@ def test_scores_op_compiled_matches_eager(device, rank_source, replicas,
                                      torch.tensor(scales, dtype=torch.float32))
 
         def forward(self, x, logits):
-            rank_value = self.rank_id
-            if rank_source == "computed":
-                rank_value = self.experts_start // local
-            elif rank_source == "experts_start":
-                rank_value = self.experts_start
             return scores_op.moe_lowtok_scores_op(x,
                                                   torch.softmax(logits.float(),
                                                                 dim=-1),
-                                                  rank_value,
-                                                  self.gid,
+                                                  self.tables,
                                                   self.primary,
                                                   self.copies,
-                                                  self.hot,
-                                                  self.hprim,
-                                                  self.hcopy,
                                                   self.hot1h,
-                                                  self.slot,
                                                   self.w13,
                                                   self.w13_scale,
                                                   self.w2,

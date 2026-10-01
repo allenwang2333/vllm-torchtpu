@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-token-bucket graph specialization (b/545443817).
+"""Per-token-bucket graph specialization.
 
 vLLM's real compile pipeline (``@support_torch_compile`` -> ``VllmBackend`` ->
 ``PiecewiseBackend`` -> the real ``TpuCompilerAdaptor``) drives a fake torch_tpu
@@ -56,7 +56,7 @@ WAVE = torch.ops.tpu_shape_variants_test.wave
 
 @support_torch_compile(dynamic_arg_dims={"x": 0})
 class WaveModel(nn.Module):
-    """One opaque call per 2048 tokens -- the shape of commit 2e3e9a495."""
+    """One opaque call per 2,048 tokens to vary the graph across buckets."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -413,10 +413,8 @@ def _warm_start_reuses_the_cache(cache_root):
     assert backend.compiled == [(16, 1), (2048, 1), (4096, 2)]
     assert (starts.traced, starts.loaded) == (2, 0)  # one trace per group
 
-    # Second start, same cache dir: nothing is compiled, and the ladder still
-    # splits at the same bucket -- the first graph must refuse 4096 on the load
-    # path too, or it would adopt an executable it cannot call (on TPU:
-    # "Donation requested for invalid buffer", job j-14584b09).
+        # Reloading must preserve the bucket boundary. The first graph must
+        # refuse 4096 rather than adopt an executable with incompatible buffers.
     torch._dynamo.reset()
     backend.compiled.clear()
     model = build(WaveModel, config)
@@ -495,7 +493,7 @@ def test_signature_delta_names_the_few_inputs_that_differ():
     assert "60x ('torch.int32', ())" in delta
     assert "1x ('torch.bool', (256,))" in delta
     assert "1x ('torch.int32', (8,))" in delta
-    assert "('torch.bfloat16', (4096,))" not in delta  # the agreed 1245
+    assert "('torch.bfloat16', (4096,))" not in delta  # unchanged inputs
 
 
 def test_signature_delta_when_only_the_order_differs():
@@ -510,7 +508,7 @@ def test_signature_delta_when_only_the_order_differs():
 
 
 def test_env_override_keeps_the_mega_artifact_off():
-    """It is inductor-only on the load side; see the commit for why."""
+    """Disable the mega artifact because its load path requires Inductor."""
     with patch.dict(os.environ, clear=False) as env:
         env.pop("VLLM_USE_MEGA_AOT_ARTIFACT", None)
         importlib.reload(vllm_torchtpu.env_override)

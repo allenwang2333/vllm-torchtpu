@@ -350,8 +350,7 @@ def _requantize_expert_chunks(
     """Dequantize, requantize and format ``weight`` a few experts at a time.
 
     The float32 copy of a whole expert tensor can be several times the
-    device memory left after loading (one layer of a 160-expert model with
-    no expert parallelism is 4.7 GB in FP8), so every chunk is materialized
+    device memory left after loading, so every chunk is materialized
     before the next one starts and only the quantized results are
     concatenated.
     One concatenation joins the chunks rather than slice writes into a
@@ -674,6 +673,8 @@ def _lowtok_scores_static_refusal(layer, activation_str):
         return "TPU_MOE_LOWTOK_FROM_SCORES unset"
     if not envs.TPU_MOE_LOWTOK_MAX_TOKENS:
         return "TPU_MOE_LOWTOK_MAX_TOKENS unset"
+    if moe_routing._SIMULATION_STRATEGY is not None:
+        return "routing simulation"
     if getattr(layer, "_lowtok_gid", None) is None:
         return "no holder tables"
     if activation_str != "silu":
@@ -763,13 +764,14 @@ def _lowtok_lift_tables(layer, topk_ids):
     """Reference the scores entry's holder tables on the grouped-matmul side of the row-count fork, so both traces
     of a token bucket lift the same buffers: the compile flow hands a bucket's executable between traces, and
     refuses when their lifted inputs differ. The ids pick up a zero; the compiler folds it."""
-    gid = getattr(layer, "_lowtok_gid", None)
-    if gid is None:
+    tables = getattr(layer, "_lowtok_tables", None)
+    if tables is None:
         return topk_ids
-    zero = (gid[:1] + layer._lowtok_prim[:1] + layer._lowtok_copy[:1] +
-            layer._lowtok_hot[:1] + layer._lowtok_hprim[:1] +
-            layer._lowtok_hcopy[:1] +
-            layer._lowtok_hot1h[0, :1].to(torch.int32) + layer._lowtok_slot[:1]
+    # Retain exactly the buffers passed to the few-token op: the packed
+    # scalar table, primary and copy holders, and one-hot table. Both
+    # traces must lift the same inputs to share a bucket's executable.
+    zero = (tables[:1] + layer._lowtok_prim[:1] + layer._lowtok_copy[:1] +
+            layer._lowtok_hot1h[0, :1].to(torch.int32)
             ) * 0  # int32 [1]; no sum(): it would widen to int64
     return topk_ids + zero
 
@@ -785,13 +787,11 @@ def _lowtok_scores_output(layer, x, router_logits, activation_str):
     the layer's all-reduce follows as for every other path. No logging here:
     this runs inside the compiled forward (the boot log line comes from
     weight loading)."""
-    if (x.shape[0] > envs.TPU_MOE_LOWTOK_MAX_TOKENS
+    if (x.dtype != torch.bfloat16
+            or x.shape[0] > envs.TPU_MOE_LOWTOK_MAX_TOKENS
             or router_logits.shape[-1] != 512 or _lowtok_scores_static_refusal(
                 layer, activation_str) is not None):
         return None
-    x = x.to(
-        torch.bfloat16
-    )  # the kernel's row dtype (a no-op for the served bf16 activations)
     w13_scale = getattr(layer, "w13_weight_scale_inv",
                         getattr(layer, "w13_weight_scale", None))
     w2_scale = getattr(layer, "w2_weight_scale_inv",
@@ -804,26 +804,27 @@ def _lowtok_scores_output(layer, x, router_logits, activation_str):
         # weights, no hits), as the grouped path's zeroed routing weights do
         scores = token_padding.zero_scores_for_padding(
             scores, is_local_tensor=enable_pipelined_collective_and_compute())
-    # the rank comes as the layer's experts_start buffer, untouched (the grouped path lifts the same buffer, and
-    # torch-side integer arithmetic would reach the kernel as int64); the kernel divides by the owned count
+    # the rank rides in the packed tables as the experts_start value (read at load from the grouped path's
+    # buffer: torch-side integer arithmetic would reach the kernel as int64); the kernel divides by the owned count.
+    # The grouped route lifts the experts_start buffer itself; this route reads it too (a zero the compiler folds)
+    # so both traces of a bucket lift the same buffers, which the compile flow's hand-over check requires
+    scores = scores + (layer._experts_start * 0).to(scores.dtype)
     return moe_lowtok_scores_op(x,
                                 scores,
-                                layer._experts_start,
-                                layer._lowtok_gid,
+                                layer._lowtok_tables,
                                 layer._lowtok_prim,
                                 layer._lowtok_copy,
-                                layer._lowtok_hot,
-                                layer._lowtok_hprim,
-                                layer._lowtok_hcopy,
                                 layer._lowtok_hot1h,
-                                layer._lowtok_slot,
                                 layer.w13_weight,
                                 w13_scale,
                                 layer.w2_weight,
                                 w2_scale,
                                 topk=layer.moe_config.experts_per_token,
                                 ranks=int(layer.moe_config.ep_size),
-                                owned=layer._lowtok_owned)
+                                owned=layer._lowtok_owned,
+                                has_copies=bool(
+                                    getattr(layer, "_lowtok_has_copies",
+                                            True)))
 
 
 class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
@@ -951,6 +952,11 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         For BF16 checkpoints (online quantization): quantize BF16 → FP8
         directly using the same requantization path.
         """
+        if envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS:
+            # the decode step's all-reduce kernel, built outside any traced
+            # region (the op needs the expert-parallel mesh, which exists here)
+            from vllm_torchtpu.layers.vllm import small_all_reduce_op
+            small_all_reduce_op.prebuild()
         if envs.TPU_MOE_LOWTOK_FROM_SCORES:
             # the scores entry's op, registered outside any traced region, and
             # the layer's holder tables (from the placement file when it
@@ -980,7 +986,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             hot, hprim, hcopy = (np.asarray(t)
                                  for t in hot_tables(prim, copy, order))
             layer._lowtok_owned = int(owned)
-            prebuild(layer.moe_config.experts_per_token, ranks, int(owned))
+            layer._lowtok_has_copies = bool(expert_placement.has_copies())
+            prebuild(layer.moe_config.experts_per_token, ranks, int(owned),
+                     layer._lowtok_has_copies)
             layer._lowtok_gid = torch.tensor(gid,
                                              dtype=torch.int32,
                                              device=dev)
@@ -1009,6 +1017,17 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 slot_table(gid, len(gid))),
                                               dtype=torch.int32,
                                               device=dev)
+            # the kernel's scalar tables as one packed operand (one copy into
+            # its scalar memory at every call instead of six); the rank rides
+            # as rank * owned, which the kernel divides by the owned count (the
+            # experts_start buffer the grouped path registers later holds the
+            # same quotient)
+            from vllm_torchtpu.kernels.moe_lowtok.kernel import pack_tables
+            layer._lowtok_tables = torch.tensor(pack_tables(
+                rank * int(owned), gid, hot, hprim, hcopy,
+                np.asarray(slot_table(gid, len(gid)))),
+                                                dtype=torch.int32,
+                                                device=dev)
         assert isinstance(layer, RoutedExperts)
         assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
 
@@ -1082,9 +1101,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
         if envs.TPU_MOE_LOWTOK_MAX_TOKENS:
-            # The evidence line for the grouped path's few-token entry: the
-            # hook decides inside the jitted function, so its verdict on the
-            # served layer is stated here, once.
+            # Log the grouped path's few-token eligibility once at weight loading;
+            # the hook itself runs inside the jitted function.
             ids_refusal = _lowtok_ids_static_refusal(layer, activation_str)
             logger.info_once(
                 "few-token MoE ids hook %s (cap %d rows per call, %d local "
@@ -1180,7 +1198,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         lowtok_out = _lowtok_scores_output(layer, x, router_logits,
                                            activation_str)
         if lowtok_out is not None:
-            return lowtok_out
+            # the fused-EP route above the token threshold lifts its own
+            # buffers (rank, expert order, valid tokens); this route retains
+            # them too, as the grouped route below does, or the compile flow
+            # refuses to hand a bucket's executable across the fork
+            from vllm_torchtpu.layers.vllm.fused_moe_ep_v3 import \
+                retain_fused_ep_graph_inputs
+            return retain_fused_ep_graph_inputs(lowtok_out)
 
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
@@ -1228,7 +1252,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         lowtok_out = _lowtok_scores_output(layer, x, router_logits,
                                            self._tpu_activation_str)
         if lowtok_out is not None:
-            return lowtok_out
+            # the fused-EP route above the token threshold lifts its own
+            # buffers (rank, expert order, valid tokens); this route retains
+            # them too, as the grouped route below does, or the compile flow
+            # refuses to hand a bucket's executable across the fork
+            from vllm_torchtpu.layers.vllm.fused_moe_ep_v3 import \
+                retain_fused_ep_graph_inputs
+            return retain_fused_ep_graph_inputs(lowtok_out)
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
         topk_ids = _lowtok_lift_tables(layer, topk_ids)
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
@@ -1296,6 +1326,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 # `value`: both sides of a row-count fork must lift the same
                 # buffers or the compile flow refuses the hand-over.
                 out = out + (value - value)
+            # the same for the combine kernel's buffers, which the route below
+            # the threshold passes to the kernel and this route never reads
+            from vllm_torchtpu.layers.vllm import small_all_reduce_op
+            out = small_all_reduce_op.retain_dp_combine_inputs(out)
             return token_padding.retain_padding_graph_input(out)
 
         # Below the threshold: vLLM's own dispatch and combine around the

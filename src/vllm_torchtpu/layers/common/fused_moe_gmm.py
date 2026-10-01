@@ -118,10 +118,10 @@ def requant_unpack_kmajor(w_packed: jax.Array, scale_f: jax.Array,
 
 def quantize_to_native_fp4_kmajor(w: jax.Array,
                                   block: int) -> tuple[jax.Array, jax.Array]:
-    """Quantize K-major float weight ([..., K, N]) to packed uint8 e2m1 and per-block FP32 scale.
-    Returns uint8 to safely cross the PyTorch/JAX bridge before unpacking in gmm_v2.
+    """Quantize K-major float weights ([..., K, N]) to packed uint8 e2m1.
 
-    TODO: Make a more generic version of this function; possibly combine with quantize_tensor_to_fp4
+    Return packed weights and per-block FP32 scales. The uint8 carrier
+    crosses the PyTorch/JAX bridge before gmm_v2 unpacks it.
     """
 
     size_k = w.shape[-2]
@@ -268,19 +268,17 @@ def prepare_routed_gmm_inputs(
     else:
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
-    # The keys take only `local_num_experts + 1` values, so a counting sort
-    # gives the positions and `group_sizes` without a second comparison sort
-    # (USE_MOE_COUNTING_SORT; it declines shapes whose bucket count exceeds
-    # its block). It also runs on the one-hot permute path. Speculative
-    # decoding is out of its measured scope: the positions it produces have
-    # not been checked against draft-token acceptance, so leave the flag off
-    # with multi-token prediction.
+    # The keys take only `local_num_experts + 1` values, so counting sort
+    # provides positions and `group_sizes` without a second comparison
+    # sort. USE_MOE_COUNTING_SORT also applies to the one-hot path and
+    # declines shapes whose bucket count exceeds its block. Compatibility
+    # with speculative draft acceptance requires separate validation;
+    # keep this flag off with multi-token prediction.
     argsort_revert_indices, bucket_counts = (_counting_sort_positions(
         sort_keys, local_num_experts + 1) if envs.USE_MOE_COUNTING_SORT else
                                              (None, None))
-    # The packed (key, token) sort below needs both fields inside an int32; at
-    # the served shapes it takes about 21 of the 31 bits, but a shape that does
-    # not fit takes the gather instead of silently wrapping.
+    # The packed (key, token) sort requires both fields to fit in int32.
+    # Shapes that exceed that range use the gather path to avoid overflow.
     if argsort_revert_indices is not None and (
         (local_num_experts + 1).bit_length() +
             max(1, (num_tokens_local - 1).bit_length()) >= 31):
@@ -315,9 +313,8 @@ def prepare_routed_gmm_inputs(
                                     dtype=hidden_states_local.dtype)
             x = onehot @ hidden_states_local
         else:
-            # Match uLLM/reference EP routing: materialize the valid local
-            # expert prefix through SparseCore ragged_gather. Invalid
-            # non-local rows are sorted after the valid prefix.
+            # Materialize the valid local expert prefix through SparseCore
+            # ragged_gather. Invalid non-local rows sort after the valid prefix.
             valid_count = group_sizes_local.sum(dtype=jnp.int32)
             x = ragged_gather_v2(
                 hidden_states_local,
@@ -501,8 +498,7 @@ def fused_moe_func(
     local ids with an elementwise subtract and masks non-local experts.
     ``use_ep`` is a static flag enabling EP routing (identical across ranks,
     safe to bind as a compile-time constant); ``use_sparse_core`` is a static
-    flag selecting the #193 SparseCore ragged gather/gather-reduce (vs the
-    pre-#193 plain-JAX path).
+    flag selecting SparseCore ragged gather/gather-reduce or plain JAX.
 
     For packed weights, `rhs_quant_dtype` is used to specify the logical dtype of the weights.
     Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier containers are

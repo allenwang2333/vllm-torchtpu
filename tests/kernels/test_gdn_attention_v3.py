@@ -294,6 +294,20 @@ class GDNAttentionTest(parameterized.TestCase):
             distribution=[8, 11, 11],
         ),
         dict(
+            testcase_name="mixed_prefill_decode_20_rows",
+            max_reqs=3,
+            lengths=[1, 1, 18],
+            q_loc=[0, 1, 2, 20],
+            distribution=[2, 3, 3],
+        ),
+        dict(
+            testcase_name="prefill_20_rows",
+            max_reqs=1,
+            lengths=[20],
+            q_loc=[0, 20],
+            distribution=[0, 1, 1],
+        ),
+        dict(
             testcase_name="padded_mixed_prefill",
             max_reqs=16,
             lengths=[128, 64, 32, 16, 8],
@@ -383,11 +397,9 @@ class GDNAttentionTest(parameterized.TestCase):
             static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
         )
 
-        # All sequences in this test start from a fresh slot; the existing
-        # parametrizations don't exercise prefix-cache-hit / chunked-prefill
-        # continuation. ``seq_lens == query_lens`` (context_len = 0)
-        # reproduces the prior behavior (zero initial state regardless of
-        # slot contents).
+        # All sequences start with context_len = 0 (seq_lens == query_lens),
+        # so the kernel uses zero initial state regardless of slot contents.
+        # Prefix-cache and chunked-prefill continuation have separate tests.
         seq_lens = jnp.asarray(q_loc[1:max_reqs + 1] - q_loc[:max_reqs],
                                dtype=jnp.int32)
 
@@ -420,7 +432,8 @@ class GDNAttentionTest(parameterized.TestCase):
             **common_kwargs)
 
         # Compare results
-        np.testing.assert_allclose(output_chunked,
+        # the kernel returns its own [tokens, heads, head_dim]; the reference builds flat rows
+        np.testing.assert_allclose(output_chunked.reshape(output_chunked.shape[0], -1),
                                    output_ref,
                                    rtol=2e-2,
                                    atol=2e-2)
@@ -460,7 +473,7 @@ class GDNAttentionTest(parameterized.TestCase):
         """SPEC mode: initial state comes from `base + read_offset` and one
         state checkpoint per window position lands at `base + t`, matching a
         token-by-token eager reference. Prefill sequences in the same batch
-        keep the original PER_SEQ behavior (read/write the base slot)."""
+        read and write the base slot through the PER_SEQ path."""
         kq_head_dim = 128
         v_head_dim = 128
         n_kq = 2
@@ -564,7 +577,7 @@ class GDNAttentionTest(parameterized.TestCase):
             d_v=v_head_dim,
             kernel_size=kernel_size,
         )
-        # Reference for the prefill tail: original eager reference over the
+        # Reference for the prefill tail: eager reference over the
         # same buffers (spec sequences excluded via the distribution).
         if prefill_lengths:
             spec_token_end = int(q_loc[num_spec_seqs])
@@ -591,7 +604,7 @@ class GDNAttentionTest(parameterized.TestCase):
             )
             ref_output = ref_output.at[spec_token_end:].set(prefill_output)
 
-        np.testing.assert_allclose(output, ref_output, rtol=2e-2, atol=2e-2)
+        np.testing.assert_allclose(output.reshape(output.shape[0], -1), ref_output, rtol=2e-2, atol=2e-2)
 
         # Verify every written checkpoint slot; untouched slots must keep
         # their original contents.
@@ -620,15 +633,11 @@ class GDNAttentionTest(parameterized.TestCase):
                 err_msg=f"recurrent checkpoint mismatch at slot {slot}")
 
     def test_has_initial_state_zeros_stale_slot(self):
-        """Ensure stale states are ignore by new request.
+        """Ensure a new request ignores stale slot contents.
 
-        A new prefill landing on a slot whose previous tenant left
-        non-zero state must produce the same output and final state as it
-        would on a fresh-zero slot. This exercises the production bug fixed
-        by the `has_initial_state` plumbing: vLLM's mamba pool reuses
-        freed slots without clearing them, and previously the TPU GDN
-        kernel consumed the stale state, silently corrupting the new
-        request's recurrent trajectory.
+        The mamba pool reuses freed slots without clearing them. A new
+        prefill with `has_initial_state=False` must produce the same output
+        and final state on a reused slot as on a zero-filled slot.
         """
         kq_head_dim = 128
         v_head_dim = 128
@@ -712,8 +721,8 @@ class GDNAttentionTest(parameterized.TestCase):
             **common_kwargs,
         )
         # Stale-slot run: same inputs, but the slots already contain a
-        # prior request's state. With the fix, has_initial_state=False
-        # masks that out; outputs and the writeback at the active slots
+        # prior request's state. has_initial_state=False masks that out;
+        # outputs and the writeback at the active slots
         # must match the fresh-zero run.
         (new_conv_stale, new_rec_stale), output_stale = run_jitted(
             conv_state=conv_state_stale,

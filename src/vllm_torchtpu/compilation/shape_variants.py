@@ -55,7 +55,7 @@ class ShapeSpecializationError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
-# What a trace assumed about the token count
+# Token-count guards
 # ---------------------------------------------------------------------------
 
 
@@ -215,7 +215,7 @@ def graph_signature(graph: fx.GraphModule) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Handing a bucket from the trace that cannot serve it to the one that can
+# Bucket executable sharing
 # ---------------------------------------------------------------------------
 
 

@@ -22,8 +22,8 @@ hit experts only, streams their weights through a ring of VMEM slots in
 equal-sized units (the gate|up halves and the down projection of one expert
 are three units of 4 MB at the served shape), and applies each expert to
 every token with that token's weight as the mask (zero for tokens the expert
-does not serve). Nothing is sorted, permuted or padded; the output is the
-shard's partial sum of expert outputs per token, and the combine across
+does not serve). Routing requires no sort or permutation. The output is
+the shard's partial sum of expert outputs per token, and the combine across
 shards stays the caller's all-reduce.
 
 Weights are fp8 with one scale per output channel; activations are
@@ -118,10 +118,12 @@ def _stream(gid_s,
             n_experts,
             inter,
             w13_parts,
-            choice=None):
+            choice=None,
+            gid_of=None):
     """The streaming body shared by the entries. gid_s int32[1, n_experts]
     (SMEM): the table lane of each local slot (the global expert id, or the
-    local id itself for the ids entry); hits_s int32[1, LANES] (SMEM): 1 in
+    local id itself for the ids entry), or `gid_of(e)` when given (the scores
+    entry reads its packed table); hits_s int32[1, LANES] (SMEM): 1 in
     the lanes served by this rank; wtab_ref [rows, LANES]
     f32: the routing weight of global expert g in lane g; x_ref [rows,
     hidden] bf16; s13_hbm [E, 1, 2*inter] and s2_hbm [E, 1, hidden] f32
@@ -142,6 +144,8 @@ def _stream(gid_s,
     the new count. The scores entry's holder choice runs there, under the
     first expert's fetch."""
     rows = x_ref.shape[0]
+    if gid_of is None:
+        gid_of = lambda e: gid_s[0, e]  # noqa: E731
     half = inter // w13_parts
     units = w13_parts + 1
     slots = units
@@ -149,7 +153,7 @@ def _stream(gid_s,
 
     # the hit list of this shard's experts, in expert order: a scalar loop
     def collect(e, n):
-        h = hits_s[0, gid_s[0, e]]
+        h = hits_s[0, gid_of(e)]
 
         @pl.when(h == 1)
         def _():
@@ -286,7 +290,7 @@ def _stream(gid_s,
                                     preferred_element_type=jnp.float32)
             o = o * a_s * s2_buf[slot]
             # the routing weight is the mask: zero for rows the expert does not serve
-            w = jnp.sum(jnp.where(lane == gid_s[0, expert], wtab_ref[...],
+            w = jnp.sum(jnp.where(lane == gid_of(expert), wtab_ref[...],
                                   0.0),
                         axis=1,
                         keepdims=True)  # [rows, 1]
@@ -326,16 +330,11 @@ def _kernel_ids(gid_ref, hit_ref, x_ref, wtab_ref, s13_hbm, s2_hbm, w13_hbm,
             w13_parts=w13_parts)
 
 
-def _kernel_scores(rank_ref,
-                   gid_s,
-                   hot_s,
-                   hprim_s,
-                   hcopy_s,
-                   slot_s,
+def _kernel_scores(tab_s,
                    prim_ref,
                    copy_ref,
                    hot1h_ref,
-                   x_ref,
+                   x_hbm,
                    scores_ref,
                    s13_hbm,
                    s2_hbm,
@@ -349,6 +348,8 @@ def _kernel_scores(rank_ref,
                    cmp_v,
                    cmp_s,
                    hsem,
+                   x_vmem,
+                   xsem,
                    w13_buf,
                    w2_buf,
                    s13_buf,
@@ -363,28 +364,38 @@ def _kernel_scores(rank_ref,
                    w13_parts,
                    topk,
                    ranks,
-                   owned=1):
+                   owned=1,
+                   has_copies=True,
+                   offsets):
     """The scores entry: the router's selection runs here first, then the
     assignment of every hit expert to one holder. prim_ref / copy_ref
     [1, LANES] int32 (VMEM): the rank holding each global expert's primary /
-    copy (-1: no copy); gid_s [1, n_experts] (SMEM): the global id in each
-    local slot; rank_ref [1] (SMEM): this rank; hot_s / hprim_s / hcopy_s
-    [1, NC] (SMEM): the copied experts hottest first (-1 padded) with the
-    rank of each one's primary and copy; slot_s [1, LANES] (SMEM): this
-    rank's local slot of every global expert, -1 where it holds none;
-    hot1h_ref [LANES, NC] bf16 (VMEM): one-hot, 1 at (hot[i], i). Single-holder
+    copy (-1: no copy); tab_s int32[length] (SMEM), the scalar tables packed
+    as one flat operand (see pack_tables / table_offsets; `offsets` = (gid,
+    hot, hprim, hcopy, slot) as static ints): [0] this rank (or its first
+    owned expert id, divided by `owned` here), then the global id in each
+    local slot, the copied experts hottest first (-1 padded) with the rank
+    of each one's primary and copy, and this rank's local slot of every
+    global expert (-1 where it holds none); x_hbm [rows, hidden] (HBM): the rows, copied into x_vmem under the
+    selection below; hot1h_ref [LANES, NC] bf16 (VMEM): one-hot, 1 at
+    (hot[i], i). Single-holder
     experts are fixed and their first weight units are fetched first; the copied
     experts that are hit on this call are compacted into a short list on the
     vector units (the one-hot gather on the MXU, a lane prefix sum, a one-hot
     scatter) and then assigned one after another in hot order, each to the
     home with fewer experts assigned so far (fixed plus the copies already
     placed), ties to the primary; identical on every rank."""
-    rows = x_ref.shape[0]
+    rows = x_vmem.shape[0]
+    # Copy rows into VMEM while selection and holder assignment run; wait
+    # for the copy immediately before streaming the expert weights.
+    x_copy = pltpu.make_async_copy(x_hbm, x_vmem, xsem.at[0])
+    x_copy.start()
     lane = jax.lax.broadcasted_iota(jnp.int32, (rows, LANES), 1)
     # this rank: the scalar as given, or a rank's first owned expert id divided by the owned count (the served
-    # layer's experts_start buffer, passed through untouched: integer arithmetic on the torch side reaches the
-    # kernel as int64 and the compile refuses it)
-    my_rank = rank_ref[0] // owned
+    # layer's experts_start value, packed at load: integer arithmetic on the torch side reaches the kernel as
+    # int64 and the compile refuses it)
+    o_gid, o_hot, o_hprim, o_hcopy, o_slot = offsets
+    my_rank = tab_s[0] // owned
 
     # the router's selection, in the kernel: topk passes of max-and-mask over
     # the softmax scores (ties to the lowest id, as the served router), the
@@ -417,6 +428,38 @@ def _kernel_scores(rank_ref,
     # smaller base load, ties to the primary. Identical on every rank.
     fixed = hit & jnp.logical_not(has_copy)
     lane1 = lane[:1]
+    if not has_copies:
+        # With no copies, every hit expert has one holder. Send this rank's
+        # hits to SMEM and start streaming without the holder-assignment loop.
+        hits_v[...] = jnp.where(fixed & (prim == my_rank), 1,
+                                0).astype(jnp.int32)
+        cp1 = pltpu.make_async_copy(hits_v, hits_s, hsem.at[1])
+        cp1.start()
+        cp1.wait()
+        x_copy.wait()
+        _stream(tab_s,
+                hits_s,
+                wtab_ref,
+                x_vmem,
+                s13_hbm,
+                s2_hbm,
+                w13_hbm,
+                w2_hbm,
+                out_ref,
+                ids,
+                w13_buf,
+                w2_buf,
+                s13_buf,
+                s2_buf,
+                w13_sem,
+                w2_sem,
+                h_acc,
+                acc,
+                n_experts=n_experts,
+                inter=inter,
+                w13_parts=w13_parts,
+                gid_of=lambda e: tab_s[o_gid + e])
+        return
     # the fixed load of every rank, in lane r of a lane vector, to SMEM for the scalar loop
     loads = jnp.zeros_like(lane1)
     for r in range(ranks):
@@ -467,9 +510,9 @@ def _kernel_scores(rank_ref,
 
         def assign(j, n):
             i = cmp_s[0, j]
-            e = hot_s[0, i]
-            o = hprim_s[0, i]
-            c = hcopy_s[0, i]
+            e = tab_s[o_hot + i]
+            o = tab_s[o_hprim + i]
+            c = tab_s[o_hcopy + i]
             pick = jnp.where(cmp_s[2, c] < cmp_s[2, o], c, o)
             cmp_s[2, pick] = cmp_s[2, pick] + 1
             mine = pick == my_rank
@@ -477,16 +520,17 @@ def _kernel_scores(rank_ref,
             @pl.when(mine)
             def _():
                 hits_s[0, e] = 1
-                ids[n] = slot_s[0, e]
+                ids[n] = tab_s[o_slot + e]
 
             return n + jnp.where(mine, 1, 0)
 
         return jax.lax.fori_loop(0, cmp_s[1, 0], assign, n_fixed)
 
-    _stream(gid_s,
+    x_copy.wait()
+    _stream(tab_s,
             hits_s,
             wtab_ref,
-            x_ref,
+            x_vmem,
             s13_hbm,
             s2_hbm,
             w13_hbm,
@@ -504,7 +548,8 @@ def _kernel_scores(rank_ref,
             n_experts=n_experts,
             inter=inter,
             w13_parts=w13_parts,
-            choice=choice)
+            choice=choice,
+            gid_of=lambda e: tab_s[o_gid + e])
 
 
 @functools.partial(jax.jit, static_argnames=("vmem_limit_bytes", ))
@@ -591,7 +636,7 @@ def moe_lowtok(x,
 
 @functools.partial(jax.jit,
                    static_argnames=("topk", "ranks", "owned",
-                                    "vmem_limit_bytes"))
+                                    "vmem_limit_bytes", "has_copies"))
 def moe_lowtok_scores(x,
                       scores,
                       rank,
@@ -611,9 +656,13 @@ def moe_lowtok_scores(x,
                       hprim=None,
                       hcopy=None,
                       hot1h=None,
-                      slot=None):
+                      slot=None,
+                      has_copies=None,
+                      tables=None):
     """The shard's MoE output for a few tokens, with the router's top-k and the
-    holder assignment inside. scores [tokens, LANES] f32: the softmax over
+    holder assignment inside. tables: the scalar tables packed by
+    `pack_tables` (the served layer builds them at load); when given, rank,
+    gid, hot, hprim, hcopy and slot are not read and hot1h is required. scores [tokens, LANES] f32: the softmax over
     all experts; rank: this rank (int32 scalar), or with owned > 1 the rank's
     first owned expert id (experts_start), divided in the kernel; gid [n_local] int32: the
     global expert in each local slot; prim / copy [LANES] int32: the rank
@@ -640,28 +689,53 @@ def moe_lowtok_scores(x,
     sc = jnp.pad(scores.astype(jnp.float32), ((0, rows - tokens), (0, 0)))
     s13 = s13.reshape(n_experts, 1, two_inter).astype(jnp.float32)
     s2 = s2.reshape(n_experts, 1, hidden).astype(jnp.float32)
-    rk = jnp.asarray(rank, jnp.int32).reshape(1)
-    gid = jnp.asarray(gid, jnp.int32).reshape(1, n_experts)
     prim = jnp.asarray(prim, jnp.int32).reshape(1, LANES)
     copy = jnp.asarray(copy, jnp.int32).reshape(1, LANES)
-    if hot is None:
-        hot, hprim, hcopy = hot_tables(prim.reshape(LANES),
-                                       copy.reshape(LANES))
-    hot = jnp.asarray(hot, jnp.int32).reshape(1, -1)
-    hprim = jnp.asarray(hprim, jnp.int32).reshape(1, -1)
-    hcopy = jnp.asarray(hcopy, jnp.int32).reshape(1, -1)
-    if hot.shape[1] % LANE:
+    if has_copies is None:
+        # a concrete copy table says whether any expert has a copy; a traced
+        # one cannot, and the general path stays
+        try:
+            has_copies = bool(np.any(np.asarray(copy) >= 0))
+        except Exception:
+            has_copies = True
+    has_copies = bool(has_copies)
+    if tables is None:
+        # the tables packed here, per call (tests and the reference use);
+        # the served layer packs them once at load
+        rk = jnp.asarray(rank, jnp.int32).reshape(1)
+        gid = jnp.asarray(gid, jnp.int32).reshape(1, n_experts)
+        if hot is None:
+            hot, hprim, hcopy = hot_tables(prim.reshape(LANES),
+                                           copy.reshape(LANES))
+        hot = jnp.asarray(hot, jnp.int32).reshape(1, -1)
+        hprim = jnp.asarray(hprim, jnp.int32).reshape(1, -1)
+        hcopy = jnp.asarray(hcopy, jnp.int32).reshape(1, -1)
+        nc = hot.shape[1]
+        if hot1h is None:
+            hot1h = hot_onehot(hot.reshape(-1))
+        # this rank's local slot of every global expert (-1: none), built here from the slot -> global id table
+        if slot is None:
+            slot = slot_table(gid.reshape(-1), n_experts)
+        slot = jnp.asarray(slot, jnp.int32).reshape(1, LANES)
+        o_gid, o_hot, o_hprim, o_hcopy, o_slot, length = table_offsets(n_experts, nc)
+        tab = jnp.full((length, ), -1, jnp.int32)
+        tab = tab.at[0].set(rk[0]).at[o_gid:o_gid + n_experts].set(gid[0])
+        tab = tab.at[o_hot:o_hot + nc].set(hot[0]).at[o_hprim:o_hprim + nc].set(hprim[0])
+        tab = tab.at[o_hcopy:o_hcopy + nc].set(hcopy[0]).at[o_slot:o_slot + LANES].set(slot[0])
+    else:
+        if hot1h is None:
+            raise ValueError("packed tables need the one-hot table hot1h")
+        nc = int(hot1h.shape[-1])
+        o_gid, o_hot, o_hprim, o_hcopy, o_slot, length = table_offsets(n_experts, nc)
+        tab = jnp.asarray(tables, jnp.int32)
+        if tab.shape != (length, ):
+            raise ValueError(
+                f"packed tables for {n_experts} slots and {nc} hot entries are [{length}], got {tab.shape}")
+    if nc % LANE:
         raise ValueError(
-            f"the hot table's length {hot.shape[1]} must be a multiple of the lane tile"
+            f"the hot table's length {nc} must be a multiple of the lane tile"
         )
-    if hot1h is None:
-        hot1h = hot_onehot(hot.reshape(-1))
-    hot1h = jnp.asarray(hot1h, jnp.bfloat16).reshape(LANES, hot.shape[1])
-    # this rank's local slot of every global expert (-1: none): the served layer passes it as a buffer built at
-    # load (slot_table); without one it is built here from the slot -> global id table, a scatter per call
-    if slot is None:
-        slot = slot_table(gid.reshape(-1), n_experts)
-    slot = jnp.asarray(slot, jnp.int32).reshape(1, LANES)
+    hot1h = jnp.asarray(hot1h, jnp.bfloat16).reshape(LANES, nc)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     out = pl.pallas_call(
@@ -671,20 +745,24 @@ def moe_lowtok_scores(x,
                           w13_parts=w13_parts,
                           topk=topk,
                           ranks=ranks,
-                          owned=owned),
+                          owned=owned,
+                          has_copies=has_copies,
+                          offsets=(o_gid, o_hot, o_hprim, o_hcopy, o_slot)),
         out_shape=jax.ShapeDtypeStruct((rows, hidden), x.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=6,
-            in_specs=[vmem, vmem, vmem, vmem, vmem, hbm, hbm, hbm, hbm],
+            num_scalar_prefetch=1,
+            in_specs=[vmem, vmem, vmem, hbm, vmem, hbm, hbm, hbm, hbm],
             out_specs=vmem,
             scratch_shapes=(
                 pltpu.SMEM((n_experts, ), jnp.int32),
                 pltpu.VMEM((rows, LANES), jnp.float32),
                 pltpu.VMEM((1, LANES), jnp.int32),
                 pltpu.SMEM((1, LANES), jnp.int32),
-                pltpu.VMEM((8, hot.shape[1]), jnp.int32),
-                pltpu.SMEM((8, hot.shape[1]), jnp.int32),
+                pltpu.VMEM((8, nc), jnp.int32),
+                pltpu.SMEM((8, nc), jnp.int32),
                 pltpu.SemaphoreType.DMA((3, )),
+                pltpu.VMEM((rows, hidden), x_rows.dtype),
+                pltpu.SemaphoreType.DMA((1, )),
                 pltpu.VMEM((w13_parts + 1, hidden, 2 * (inter // w13_parts)),
                            FP8),
                 pltpu.VMEM((w13_parts + 1, inter, hidden), FP8),
@@ -701,9 +779,48 @@ def moe_lowtok_scores(x,
             vmem_limit_bytes=vmem_limit_bytes or vmem_budget(
                 rows, hidden, inter, w13_parts, two_inter, n_experts)),
         name="moe_lowtok",
-    )(rk, gid, hot, hprim, hcopy, slot, prim, copy, hot1h, x_rows, sc, s13, s2,
-      w13, w2)
+    )(tab, prim, copy, hot1h, x_rows, sc, s13, s2, w13, w2)
     return out[:tokens]
+
+
+def table_offsets(n_experts, nc):
+    """The flat packed table's layout for `n_experts` local slots and `nc`
+    hot entries: (gid, hot, hprim, hcopy, slot) offsets and the padded
+    length (a multiple of the lane tile)."""
+    o_gid = 8
+    o_hot = o_gid + n_experts
+    o_hprim = o_hot + nc
+    o_hcopy = o_hprim + nc
+    o_slot = o_hcopy + nc
+    length = -(-(o_slot + LANES) // LANE) * LANE
+    return o_gid, o_hot, o_hprim, o_hcopy, o_slot, length
+
+
+def pack_tables(rank, gid, hot, hprim, hcopy, slot):
+    """The scores entry's scalar tables as one flat int32 array (see
+    table_offsets): [0] the rank (or a rank's first owned expert id, which
+    the kernel divides by the owned count), the global id of each local
+    slot, the copied experts hottest first with the rank of each one's
+    primary and copy (-1 padded), this rank's local slot of every global
+    expert (-1: none). Packing the tables uses one scalar-prefetch operand
+    for all six tables."""
+    gid = np.asarray(gid, np.int32).reshape(-1)
+    hot, hprim, hcopy = (np.asarray(t, np.int32).reshape(-1)
+                         for t in (hot, hprim, hcopy))
+    slot = np.asarray(slot, np.int32).reshape(-1)
+    if slot.size != LANES:
+        raise ValueError(f"the slot table is {LANES} lanes wide, got {slot.size}")
+    if not (hprim.size == hot.size == hcopy.size):
+        raise ValueError("hot, hprim and hcopy must be the same length")
+    o_gid, o_hot, o_hprim, o_hcopy, o_slot, length = table_offsets(gid.size, hot.size)
+    tab = np.full((length, ), -1, np.int32)
+    tab[0] = int(rank)
+    tab[o_gid:o_gid + gid.size] = gid
+    tab[o_hot:o_hot + hot.size] = hot
+    tab[o_hprim:o_hprim + hot.size] = hprim
+    tab[o_hcopy:o_hcopy + hot.size] = hcopy
+    tab[o_slot:o_slot + LANES] = slot
+    return tab
 
 
 def slot_table(gid, n_experts):

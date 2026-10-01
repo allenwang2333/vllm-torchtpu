@@ -390,8 +390,8 @@ def down_product(ctx, expert, weight_slot, rows, row_scales):
     b, scratch = ctx.b, ctx.scratch
     w1_scales, w1_bias = up_scales_and_bias(ctx, expert, weight_slot)
     # bf16 token rows against fp8 weights: the up matmul runs in bf16 on
-    # the expert's widened copy of w1, the per-channel scales applied as
-    # ever (the block-scaled forms are refused).
+    # the expert's widened copy of w1 with per-channel scales applied
+    # after the matmul (block-scaled forms are unsupported).
     w1_widened = b.rows_bf16 and b.form.has_scales and not b.form.block_scaled
     w1_up = scratch.w1_bf16[...] if w1_widened else scratch.w1[weight_slot]
     if b.form.block_scaled:

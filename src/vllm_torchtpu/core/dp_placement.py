@@ -33,11 +33,6 @@ def mode() -> str:
     return envs.DP_PLACEMENT
 
 
-def enabled() -> bool:
-    """Whether the router's release rules are on."""
-    return mode() in MODES
-
-
 def install_release(client_cls,
                     threshold: int | None = None,
                     deadline_s: float | None = None,

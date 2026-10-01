@@ -46,14 +46,11 @@ ROWS_RANK = 3
 # The sort program (gather_rows_prefix) is a static schedule over the
 # blocks of one subcore's run, so its size follows the table, and a
 # sparse-core program holds at most SORT_PROGRAM_BUNDLE_LIMIT bundles (the
-# compiler's xla_sc_tile_overlays_size). Compiled without the device across
-# widths and tables (measured offline): a row of a power of two
-# words (1024, 2048, 4096, 8192 fp8 values) moves as one copy per block, 23
-# bundles a block on 8 of prologue whatever the table (3872 for 168 blocks
-# a subcore, 2032 for 88); any other width costs about 92 bundles a block
-# and 1.25 a row (2560 wide, 16-row blocks: 8578 for 88 blocks, 16,238 for
-# 168; 32-row blocks: 5146 for 44; 1536 and 3584 wide: 18,797 for 168
-# blocks of 16). The estimate stands on the largest costs seen.
+# compiler's xla_sc_tile_overlays_size). Rows whose word count is a power
+# of two move as one copy per block. The estimate uses a fixed prologue
+# cost plus a per-block cost for these widths; other widths also carry a
+# per-row cost. test_sort_program checks the estimate against compiler
+# bundle-count fixtures.
 SORT_PROGRAM_BUNDLE_LIMIT = 8144
 SORT_BUNDLES_FIXED = 8
 SORT_BUNDLES_PER_BLOCK = 23
@@ -66,8 +63,8 @@ COMPILER_PARAMS = dict(use_tc_tiling_on_sc=True,
 
 def _jax_private():
     """jax's private core-map lowering and ref constructor. Both are bound
-    here so a jax that moved them fails with a message naming the versions
-    this was gated on, not with an AttributeError inside a kernel."""
+    here so missing APIs raise an error identifying the installed JAX
+    version and required interfaces."""
     try:
         from jax._src import core as jax_core
         from jax._src import tree_util

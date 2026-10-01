@@ -336,7 +336,7 @@ def install_model_patches() -> None:
 
     # The router rows reordered in both loaders' weight streams: vLLM's
     # default safetensors loader and the streaming loader (the gs:// path,
-    # whose per-rank iterator main's loader patches install first).
+    # whose per-rank iterator the streaming-loader patches install first).
     from vllm.model_executor.model_loader import default_loader as dl
     from vllm.model_executor.model_loader import runai_streamer_loader as rsl
     original_get_all = dl.DefaultModelLoader.get_all_weights

@@ -43,11 +43,16 @@ if TYPE_CHECKING:
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
+    TPU_PROFILER_OPTIONS: str = ""
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_SHARDED_LM_HEAD: bool = False
+    TPU_GREEDY_TOP_TOKENS: bool = False
     TPU_NORM_WEIGHT_HOIST: bool = False
     TPU_GDN_FUSED_NORM_QUANT: bool = False
+    TPU_GDN_TABLES_IN_KERNEL: bool = False
+    TPU_GDN_DECODE_TILE: int = 4
+    TPU_GATED_NORM_TILE: int = 32
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     TPU_MLA_MASKED_DENSE_ENABLED: bool = False
@@ -70,9 +75,13 @@ if TYPE_CHECKING:
     TPU_RPA_DECODE_BATCH: int = 0
     TPU_MOE_LOWTOK_FROM_SCORES: int = 0
     TPU_MOE_LOWTOK_SCORES_STRICT: int = 0
+    TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
+    TPU_SMALL_ALL_REDUCE_FORM: str = ""
+    TPU_WORKER_NUMA_BIND: bool = True
     TPU_SP_MIN_ROWS: int = 0
     TPU_SP_FP8_GATHER: int = 0
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_TOKEN_BUCKET_STEP: int = 0
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_ROPE_CACHE_TRUNCATE: bool = False
@@ -418,11 +427,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and the full payload is pulled into every destination page.
     "TPU_RAIDEN_PREFIX_AWARE_LOAD":
     env_bool("TPU_RAIDEN_PREFIX_AWARE_LOAD", False),
-    # Selects the #193 SparseCore MoE token-movement path. When 0, the EP
-    # ragged gather + gather-reduce fall back to the pre-#193 plain-JAX
-    # path (functionally equivalent; valid-mask gating unchanged). Mirrors
-    # upstream vLLM's VLLM_USE_FLASHINFER_MOE_* style of env-gated MoE kernel
-    # selection (vLLM 0.19.0 has no --moe-backend; see fused_moe.py TODO).
+    # Select SparseCore MoE token movement. When disabled, ragged gather and
+    # gather-reduce use plain JAX with the same valid-mask gating.
     "USE_MOE_SPARSE_CORE":
     lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "1")),
     # Build the MoE routing permutations with a counting sort instead of the
@@ -433,9 +439,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # count (num_tokens * topk) is <= this threshold. Unset or empty means
     # auto: fused_moe_gmm.resolve_onehot_permute_threshold derives the value
     # from SparseCore geometry (0 on hosts without SparseCore). 0 keeps every
-    # size on the SparseCore path; a positive value forces that
-    # threshold. The knob and its row-count semantics come from
-    # tpu-inference PR #2674.
+    # size on the SparseCore path; a positive value forces that threshold.
     "ONEHOT_MOE_PERMUTE_THRESHOLD":
     env_optional_int("ONEHOT_MOE_PERMUTE_THRESHOLD"),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
@@ -456,6 +460,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # this only selects which profiler consumes them.
     "USE_PHASED_PROFILER":
     env_bool("USE_PHASED_PROFILER"),
+    # Semicolon-separated profiler overrides, using key:value entries.
+    "TPU_PROFILER_OPTIONS":
+    env_str("TPU_PROFILER_OPTIONS", ""),
     # Kernel-iteration mode: split the compiled graph at the Pallas custom
     # ops, keep kernel sources out of the compile-cache key, and enable the
     # /reload_kernel endpoint so kernel edits apply to a running server
@@ -473,8 +480,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gathered, and the logits are exchanged back.
     "TPU_SHARDED_LM_HEAD":
     env_bool("TPU_SHARDED_LM_HEAD"),
-    # Run a gated-delta-net layer's output gated RMS norm and the per-token
-    # fp8 quantisation of the following projection as one kernel.
+    # Greedy steps without logprobs take the vocabulary-parallel argmax
+    # (vLLM's LogitsProcessor.get_top_tokens): each rank's head slice yields
+    # its (max, index) pair and only the pairs are exchanged, never the full
+    # logits. Off: the logits are all-gathered and argmaxed.
+    "TPU_GREEDY_TOP_TOKENS":
+    env_bool("TPU_GREEDY_TOP_TOKENS"),
+    # The pooled GDN decode entry with its routing tables built inside the
+    # kernel from the raw sequence arrays (steps of at most 256 rows, no
+    # speculation): no XLA table ops in the wrapper on decode steps.
+    "TPU_GDN_TABLES_IN_KERNEL":
+    env_bool("TPU_GDN_TABLES_IN_KERNEL"),
+    # Sequences per grid step of the batched GDN decode pass.
+    "TPU_GDN_DECODE_TILE":
+    lambda: int(os.getenv("TPU_GDN_DECODE_TILE", "4")),
+    # Maximum row tile for gated norm and quantization. The kernel selects
+    # the largest legal block at or below this limit.
+    "TPU_GATED_NORM_TILE":
+    lambda: int(os.getenv("TPU_GATED_NORM_TILE", "32")),
+    # Fuse GDN output gated RMS norm with per-token FP8 quantization.
     "TPU_GDN_FUSED_NORM_QUANT":
     env_bool("TPU_GDN_FUSED_NORM_QUANT"),
     # Keep each GemmaRMSNorm's (1 + weight) as a buffer computed once after
@@ -487,9 +511,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
-    # Opt in to GLM-5.2's measured masked-dense sparse-MLA prefill routing.
-    # Off by default until the model and hardware scope of the cost model is
-    # broadened or selected automatically from an explicit model profile.
+    # Enable the GLM-5.2 cost model for masked-dense sparse-MLA prefill routing.
+    # Disabled by default; other model geometries need their own cost model.
     "TPU_MLA_MASKED_DENSE_ENABLED":
     env_bool("TPU_MLA_MASKED_DENSE_ENABLED", default=False),
     # Longest per-sequence KV length for which an enabled sparse-MLA step runs
@@ -497,7 +520,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # cheaper masked-dense tier, which computes the causal mask in registers
     # and needs its limit at or under the indexer's topk; the other is the
     # tier that materializes the CSA bitmap on SparseCore. Unset uses the
-    # measured default; 0 disables that tier; any other value must be a
+    # configured default; 0 disables that tier; any other value must be a
     # multiple of the streamed KV block size. These controls take effect only
     # when TPU_MLA_MASKED_DENSE_ENABLED=1 and only for eligible prefill; a
     # batch containing any decode always uses sparse gather attention.
@@ -532,11 +555,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("DP_SCHED_BUFFER_IDLE_TRIGGER", default=True),
     "DP_SCHED_BUFFER_QUIET_MS":
     lambda: int(os.getenv("DP_SCHED_BUFFER_QUIET_MS") or 0),
-    # Hierarchical MoE parallelism: expert-parallel between chips,
-    # tensor-parallel between the two chiplets of a chip. Off by
-    # default; it helps only at low concurrency, where the MoE is
-    # weight-bandwidth bound and the per-device expert load is badly
-    # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
+    # Hierarchical MoE: expert parallelism between chips and tensor
+    # parallelism between the two cores of each chip. Disabled by default.
     "TPU_MOE_HIERARCHICAL_EP":
     env_bool("TPU_MOE_HIERARCHICAL_EP"),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
@@ -554,22 +574,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
     "MOE_FUSED_EP_ENABLE_W4A8":
     env_bool("MOE_FUSED_EP_ENABLE_W4A8"),
-    # Largest node-wide token count, out of the scheduler's cap, at or above
-    # which the fused kernel is armed for the whole deployment. Decided once at
-    # weight load, not per step: a per-step choice would need the token count
-    # inside the traced graph, and on Qwen3.5-397B it also measured worse than
-    # arming everything. Below the threshold the grouped-matmul path serves.
+    # Minimum node-wide scheduler token cap for enabling the fused kernel.
+    # Evaluated once at weight load. Below this cap, use grouped matmuls.
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS":
     lambda: int(os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")),
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.
     "MOE_FUSED_EP_V2_SHARDED_PLAN":
     env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
-    # Shard Kimi K3's latent-MoE down/up projections across the cores of a
-    # chip instead of replicating them. They are unquantized [7168, 3584] and
-    # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
-    # time at TP=32; halving the bytes each core reads costs two on-package
-    # all-gathers per layer. Independent of TPU_MOE_HIERARCHICAL_EP.
+    # Shard Kimi K3 latent-MoE down/up projections across each chip's cores.
+    # This halves weight reads per core and adds two on-package all-gathers
+    # per layer. Independent of TPU_MOE_HIERARCHICAL_EP.
     "TPU_LATENT_PROJ_INTRA_CHIP_TP":
     env_bool("TPU_LATENT_PROJ_INTRA_CHIP_TP"),
     # Compiled token shapes of at least this many rows per rank run the fused
@@ -599,6 +614,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # refuse to boot when the scores entry's static terms fail on the loaded layer (the term is in the error)
     "TPU_MOE_LOWTOK_SCORES_STRICT":
     lambda: int(os.getenv("TPU_MOE_LOWTOK_SCORES_STRICT", "0")),
+    # The decode step's all-reduces (the output projections' reduction, the
+    # MoE combine) as the small all-reduce kernel for blocks of at most this
+    # many rows (kernels/collectives/small_all_reduce.py); 0 keeps XLA's.
+    "TPU_SMALL_ALL_REDUCE_MAX_ROWS":
+    lambda: int(os.getenv("TPU_SMALL_ALL_REDUCE_MAX_ROWS", "0")),
+    # The kernel's form: "oneshot", "twoshot", or empty for its own
+    # choice by block size.
+    "TPU_SMALL_ALL_REDUCE_FORM":
+    lambda: os.getenv("TPU_SMALL_ALL_REDUCE_FORM", "").strip().lower(),
+    # Each worker binds itself to the socket of its own TPU chip (the node's
+    # CPU set and preferred memory node, read from the device's numa_node in
+    # sysfs) before the runtime comes up; 0 leaves placement to the scheduler.
+    "TPU_WORKER_NUMA_BIND":
+    lambda: bool(int(os.getenv("TPU_WORKER_NUMA_BIND", "1"))),
     # Sequence parallelism for the tensor-parallel prefill: steps with at
     # least this many rows reduce-scatter the attention output and run the
     # residual, norms, router and shared expert on each rank's own rows;
@@ -628,6 +657,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",")
         if v.strip()
     ],
+    # The padding step for prompt-sized steps: token buckets every STEP rows
+    # from a quarter of the token budget up to the longest pass a prompt can
+    # make (the model length plus the slot count), on top of the power-of-two
+    # ladder. A pass costs per row, so a prompt padded to the next power of
+    # two wastes up to half of it; 0 keeps the ladder alone.
+    "TPU_TOKEN_BUCKET_STEP":
+    lambda: int(os.getenv("TPU_TOKEN_BUCKET_STEP", "0")),
     # Pipeline parallelism: size prefill chunks by a per-step time budget
     # instead of a token budget (core/pp_chunks.py). 0 keeps token budgets.
     "TPU_PP_DYNAMIC_CHUNKS":
@@ -643,13 +679,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE":
     lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"),
-    # 0 = the arithmetic device-order layout (the one every disaggregated
-    # Raiden pair was verified with before #587; also the only option on a
-    # torch_tpu older than 2026-08-13, which lacks the API).
+    # Set to 0 for arithmetic device ordering, including runtimes without
+    # the topology API.
     "TPU_PCP_TOPOLOGY_AWARE_MESH":
     lambda: os.getenv("TPU_PCP_TOPOLOGY_AWARE_MESH", "1").strip().lower(
     ) not in ("0", "false", "off", "no"),
-    # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
+    # Select batched_rpa_longctx instead of batched_rpa.
     "USE_BATCHED_RPA_LONGCTX":
     env_bool("USE_BATCHED_RPA_LONGCTX"),
     # Pipelined double-buffered DMA staging in ragged_kv_cache_update and fused

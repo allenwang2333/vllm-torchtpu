@@ -54,8 +54,7 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array,
                           w_s: jax.Array) -> jax.Array:
     """FP8 dense matmul on the canonical (k, n) weight layout.
 
-    `w_q` is `[n_in, n_out]`, so this is a plain `(m, k) @ (k, n)` contraction
-    rather than the `(m, k) @ (n, k).T` the N-major layout forced. The
+    `w_q` is `[n_in, n_out]` for an `(m, k) @ (k, n)` contraction. The
     blockwise path routes through `gmm_v2` (single group), which consumes a
     K-major rhs natively; the per-channel path uses the shared
     `xla_quantized_matmul`, which takes the same (k, n) layout.

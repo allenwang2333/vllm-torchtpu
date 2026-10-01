@@ -35,13 +35,13 @@ logger = init_logger(__name__)
 
 MAX_ALLOWED_PAGE_INDICES_N = (
     128 * 1024
-)  # Based on experiments on v5e, 256x1024 results in smem oom but 128x1024 not. TODO: Adjust this based on TPU version.
+)  # Bound page-index storage to 128 * 1024 entries for v5e SMEM capacity.
 
 # Default and experimental batched RPA kernels are loaded unconditionally.
 # Selection happens per attention layer via the `use_batched_rpa` flag plumbed
 # from `PallasAttentionBackendImpl` / `PallasBatchedRPAAttentionBackendImpl`.
 
-# Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
+# Select the long-context batched RPA implementation.
 if envs.USE_BATCHED_RPA_LONGCTX:
     import vllm_torchtpu.kernels.experimental.batched_rpa_longctx.wrapper as rpa_batched
 else:
@@ -64,7 +64,7 @@ def batched_rpa_decode_overrides(num_q_rows: int,
     # the slot count the wrapper sees is vLLM's padded one (8 at 4 users), so the real batch comes from the env
     batch = envs.TPU_RPA_DECODE_BATCH or min(8, num_seqs)
     if batch > 8:
-        # the measured tile; a silent clamp would test nothing
+        # Validate the configured tile instead of silently clamping it.
         raise ValueError(
             f"TPU_RPA_DECODE_BATCH={batch}: the batched attention kernel's "
             "decode batch is capped at 8 here")
@@ -152,7 +152,6 @@ def sharded_paged_attention(
         ))
 
 
-# TODO(xiangxu): merge this with sharded_paged_attention
 @functools.partial(jax.jit, static_argnums=[0])
 def paged_attention_with_guarded_smem(
     paged_attention_kernel: Callable,
@@ -162,12 +161,10 @@ def paged_attention_with_guarded_smem(
     lengths: jax.Array,
     page_indices: jax.Array,
 ):
-    # Addresses b/336316706. Summary:
-    # Paged attention kernel stores `lengths` (batch_size * 4 bytes) and `page_indices` (batch_size * num_blocks_per_seq * 4 bytes) in SMEM.
-    # Capacity of SMEM is quite limited which is also TPU version dependent. Models with higher context length or higher batch size, can cause OOM in SMEM.
-    # There are two solutions:
-    # 1. Reduce blocks per seq by increasing page size.
-    # 2. Splitting the batch into several minibatches (Higher perf based on my benchmark).
+    # Paged attention stores `lengths` (batch_size * 4 bytes) and
+    # `page_indices` (batch_size * num_blocks_per_seq * 4 bytes) in SMEM.
+    # SMEM capacity depends on the TPU version. Larger pages reduce the
+    # block-table width; minibatching bounds the per-launch batch size.
 
     batch_size, blocks_per_seq = page_indices.shape
 
@@ -177,10 +174,8 @@ def paged_attention_with_guarded_smem(
 
     mini_batch_size = MAX_ALLOWED_PAGE_INDICES_N // blocks_per_seq
 
-    # If batch_size is not disible by mini_batch_size,
-    # we set mini_batch_size to a smaller value, i.e GCD,
-    # which will trigger more kernel launches but it's fine.
-    # TODO: Fix --decode_seqs_padding with this limitation.
+    # Use the GCD when mini_batch_size does not divide batch_size.
+    # This preserves equal minibatch shapes and may require more launches.
     mini_batch_size = math.gcd(batch_size, mini_batch_size)
 
     num_kernel_launches = batch_size // mini_batch_size
@@ -219,17 +214,10 @@ def update_cache(
     B, K, T, H = operand.shape
     K_c, L, S, H = cache.shape
     assert K == K_c
-    # NOTE: The cache updating is pretty tricky:
-    # 1. The random access updating cache is not as performant as the slice updating.
-    #    If the random access is necessary, make sure the indexing count is as small as possible.
-    # 2. The random access updating may trigger extra tranpose (memory copy) of cache,
-    #    which is a disaster because the cache is huge. This is a data formatting op inserted by
-    #    the XLA compiler and not well documented.
-    # To mitigate the issues above:
-    # For prefill:
-    # We reshape the operand so that we can update the cache in block wise, which only requires the block indices.
-    # For decode:
-    # We reshape the cache so that we can update the cache in token wise, which only requires the token indices (block_id + offset).
+    # Minimize random-access indices and avoid cache transposes inserted
+    # by XLA. Prefill reshapes the operand for blockwise cache updates
+    # using block indices. Decode reshapes the cache for tokenwise
+    # updates using each token's block ID and offset.
     if is_prefill:
         # In the case of sliding window, we should select sliding_window tokens from actual prompt, not from the padded tokens.
         if sliding_window and T > sliding_window:
@@ -237,7 +225,7 @@ def update_cache(
             start_index = jax.lax.max(0, prefill_seq_len - sliding_window)
             operand = jax.lax.dynamic_slice_in_dim(
                 operand, start_index, sliding_window,
-                axis=2)  # TODO: @pooyam Perf check this.
+                axis=2)
             T = sliding_window
 
         I = B * T // S
@@ -253,8 +241,8 @@ def update_cache(
         # indices: (B,)
         cache = cache.reshape(K, L * S, H)
         operand = jnp.swapaxes(operand, 0, 1).reshape(K, B, H)
-        # NOTE: `cache.[:, indices, :].set()` will trigger the extra tranpose of the cache.
-        # The `jnp.arange(K)[..., None]` trick is to avoid it. WTF?
+        # Indexing both K and token axes explicitly avoids the extra cache
+        # transpose generated by `cache[:, indices, :].set()`.
         cache = cache.at[jnp.arange(K)[..., None], indices, :].set(operand)
         cache = cache.reshape(K, L, S, H)
     return cache
@@ -580,7 +568,6 @@ def attention(
     # L: num_blocks
     # S: block_size
 
-    # TODO(jevinjiang, cuiq): transpose q weight offline.
     # q: (T, N, H)
     # k,v: (T, K, H)
 

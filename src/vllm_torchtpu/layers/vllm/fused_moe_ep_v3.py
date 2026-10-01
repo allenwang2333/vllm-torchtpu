@@ -38,9 +38,9 @@ over global arrays sharded on the EP axis: x [tokens, hidden], w1 [E, hidden,
 2 * inter], w2 [E, inter, hidden], the per-output-channel fp8 scales [E, N],
 the router logits [tokens, E], this rank's mesh index and the per-rank
 valid-token prefix, returning one [tokens, hidden] output sharded like x. The
-scale squeeze and the PCP width helper are reused from main's v2 dispatch;
-the rest is this kernel's own:
-- the kernel's own names: `top_k`, `tile_rows`, `activation`;
+scale squeeze and PCP width helpers come from `fused_moe_ep`. The binding
+uses the kernel's `top_k`, `tile_rows`, and `activation` arguments, with
+these export and padding constraints:
 - the rank tensor is handed to the kernel as its shard-index operand,
   because `lax.axis_index` lowers to a partition-id the export path refuses;
 - there is no valid-token operand: a padded row is routed nowhere by handing
@@ -275,10 +275,9 @@ def _build_op(mesh, topk: int, renormalize: bool, activation: str,
         input_specs = (PartitionSpec(EP_AXIS_NAME), ) * 7
 
     spec = PartitionSpec(EP_AXIS_NAME)
-    # Not stock `pallas.jax_op`: it sizes its outputs from the export's avals,
-    # where a shard_map result is recorded as replicated, so this rank's 2048
-    # rows come back claiming the mesh-wide 16384. `sharded_jax_op` is stock
-    # with only that line replaced.
+    # Use shard-local output shapes: the stock bridge sizes outputs from
+    # export avals that record shard_map results as replicated, which can
+    # assign the mesh-wide row count to each rank's output.
     op = sharded_jax_op(
         FUSED_MOE_EP_OP_NAME,
         moe,
@@ -436,19 +435,12 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     # where each rank holds its own slice of the batch; a replicated step
     # stays off the kernel (`_fused_kernel_takes` in the FP8 method), since
     # the op would do ep_size times the expert work for one batch of output.
-    # Prefill context parallelism has to be refused for a different reason,
-    # and it is the more dangerous of the two because it is silent.
-    # `do_naive_dispatch_combine` is not what runs the PCP exchange:
-    # `MoERunner._maybe_dispatch`/`_maybe_combine` bracket the layer with a
-    # PCP all-gather and reduce-scatter whenever `pcp_size > 1 and not
-    # use_all2all_kernels`, and this tree's own
-    # `_patch_moe_explicit_pcp_collectives` guarantees that condition for
-    # `use_ep and pcp_size > 1 and dp_size == 1`. At pcp>1/dp1/tp1 nothing
-    # below refuses the kernel, so it would arm, return each rank's tokens
-    # already combined over every
-    # expert, and then have that reduce-scattered against seven identical
-    # copies: every routed MoE output multiplied by pcp_size, with nothing
-    # raised and nothing logged.
+    # Prefill context parallelism retains vLLM's outer PCP all-gather and
+    # reduce-scatter when `pcp_size > 1 and not use_all2all_kernels`.
+    # `_patch_moe_explicit_pcp_collectives` enforces that condition for
+    # `use_ep and pcp_size > 1 and dp_size == 1`. The fused kernel already
+    # combines every expert contribution, so the outer reduce-scatter
+    # would multiply its result by pcp_size. Refuse this combination.
     pcp = _pcp_size(layer)
     if pcp > 1:
         logger.warning_once(
@@ -473,8 +465,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
             "Replicated-input MoE paths serve these steps.", tp, tp)
         return
     if tp > 1:
-        # with sequence parallelism each rank hands the kernel its own rows:
-        # the shape the DP8 line runs it at
+        # With sequence parallelism each rank passes its own rows to the kernel.
         logger.info_once(
             "Fused EP MoE under tensor parallelism (tp_size=%d) with sequence "
             "parallelism: each rank's own rows, prompt steps of at least "

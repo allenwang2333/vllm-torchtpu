@@ -13,9 +13,10 @@
 # limitations under the License.
 """The few-token MoE kernel's scores entry as a torch custom op: the router's
 top-k and the holder assignment run inside the kernel (kernels/moe_lowtok,
-moe_lowtok_scores). Per layer the op takes this rank's id, the slot -> global
-expert table and the primary / copy holder tables; without a copies
-placement they are the contiguous ones. The shard's partial output comes
+moe_lowtok_scores). Per layer the op takes the kernel's scalar tables packed as one
+operand at load (this rank's id, the slot -> global expert table, the copied
+experts and their holders, the slot of every global expert) and the primary /
+copy holder tables; without a copies placement they are the contiguous ones. The shard's partial output comes
 back; the layer's all-reduce follows as for every other path.
 """
 import functools
@@ -31,15 +32,10 @@ _ops: dict = {}
 
 def _jax_fn(hidden: jax.Array,
             scores: jax.Array,
-            rank: jax.Array,
-            gid: jax.Array,
+            tables: jax.Array,
             prim: jax.Array,
             copy: jax.Array,
-            hot: jax.Array,
-            hprim: jax.Array,
-            hcopy: jax.Array,
             hot1h: jax.Array,
-            slot: jax.Array,
             w13: jax.Array,
             s13: jax.Array,
             w2: jax.Array,
@@ -47,11 +43,12 @@ def _jax_fn(hidden: jax.Array,
             *,
             topk: int,
             ranks: int,
-            owned: int = 1) -> jax.Array:
+            owned: int = 1,
+            has_copies: bool = True) -> jax.Array:
     return moe_lowtok_scores(hidden,
                              scores,
-                             rank,
-                             gid,
+                             None,
+                             None,
                              prim,
                              copy,
                              w13,
@@ -61,25 +58,26 @@ def _jax_fn(hidden: jax.Array,
                              topk=topk,
                              ranks=ranks,
                              owned=owned,
-                             hot=hot,
-                             hprim=hprim,
-                             hcopy=hcopy,
                              hot1h=hot1h,
-                             slot=slot)
+                             tables=tables,
+                             has_copies=has_copies)
 
 
-def _get_op(topk: int, ranks: int, owned: int = 1):
+def _get_op(topk: int, ranks: int, owned: int = 1, has_copies: bool = True):
     """Built eagerly by prebuild() when the MoE weights are loaded; the traced forward only looks it up."""
-    key = (topk, ranks, owned)
+    key = (topk, ranks, owned, bool(has_copies))
     op = _ops.get(key)
     if op is not None:
         return op
     op = pallas.jax_op(
-        f"pallas::moe_lowtok_scores_k{topk}_r{ranks}_o{owned}",
-        functools.partial(_jax_fn, topk=topk, ranks=ranks, owned=owned))
+        f"pallas::moe_lowtok_scores_k{topk}_r{ranks}_o{owned}{'' if has_copies else '_nocopies'}",
+        functools.partial(_jax_fn,
+                          topk=topk,
+                          ranks=ranks,
+                          owned=owned,
+                          has_copies=bool(has_copies)))
 
-    def _fake(hidden, scores, rank, gid, prim, copy, hot, hprim, hcopy, hot1h,
-              slot, w13, s13, w2, s2):
+    def _fake(hidden, scores, tables, prim, copy, hot1h, w13, s13, w2, s2):
         return torch.empty_like(hidden)
 
     op.register_fake(_fake)
@@ -87,21 +85,16 @@ def _get_op(topk: int, ranks: int, owned: int = 1):
     return op
 
 
-def prebuild(topk: int, ranks: int, owned: int = 1):
-    _get_op(topk, ranks, owned)
+def prebuild(topk: int, ranks: int, owned: int = 1, has_copies: bool = True):
+    _get_op(topk, ranks, owned, has_copies)
 
 
 def moe_lowtok_scores_op(hidden,
                          scores,
-                         rank,
-                         gid,
+                         tables,
                          prim,
                          copy,
-                         hot,
-                         hprim,
-                         hcopy,
                          hot1h,
-                         slot,
                          w13,
                          s13,
                          w2,
@@ -109,7 +102,9 @@ def moe_lowtok_scores_op(hidden,
                          *,
                          topk: int,
                          ranks: int,
-                         owned: int = 1):
-    return _get_op(topk, ranks,
-                   owned)(hidden, scores, rank, gid, prim, copy, hot, hprim,
-                          hcopy, hot1h, slot, w13, s13, w2, s2)
+                         owned: int = 1,
+                         has_copies: bool = True):
+    """tables: the packed scalar tables of the kernel (moe_lowtok.pack_tables), built at load."""
+    return _get_op(topk, ranks, owned,
+                   has_copies)(hidden, scores, tables, prim, copy, hot1h, w13,
+                               s13, w2, s2)

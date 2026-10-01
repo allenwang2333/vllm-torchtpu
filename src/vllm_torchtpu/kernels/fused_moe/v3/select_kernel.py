@@ -38,7 +38,7 @@ UNROUTABLE_MAX = -1e38
 def _lane_sum_in_xla_order(values, top_k):
     """The sum of values' top_k lanes in the order XLA's lane reduction adds
     them (a halving tree over the row padded with zeros to a power of two),
-    so the renormalized weights match the layer's XLA form bit for bit."""
+    to preserve the reduction order used by the reference softmax."""
     columns = [values[:, k:k + 1] for k in range(top_k)]
     width = 1
     while width < top_k:

@@ -25,6 +25,8 @@ from jax.experimental.layout import Layout, with_layout_constraint
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.logger import init_logger
+
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import (derive_pooled_gdn_state_layout,
                                            pooled_gdn_conv_state_bytes,
@@ -35,6 +37,8 @@ from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.layers.common.utils import \
     reorder_concatenated_tensor_for_sharding
 from vllm_torchtpu.utils import get_mesh_shape_product
+
+logger = init_logger(__name__)
 
 
 def run_jax_gdn_attention(
@@ -149,16 +153,11 @@ def run_jax_gdn_attention(
         check_vma=False,
     )
 
-    # `slot_read_offsets` is the per-slot offset buffer (shape (num_blocks,)):
-    # `slot_read_offsets[base_slot]` holds `num_accepted - 1` for the request
-    # whose checkpoint group starts at `base_slot`. Index it by `state_indices`
-    # (each sequence's base slot) to get the per-sequence read offsets the
-    # kernel expects (shape (num_seqs,)); it then reads each request's initial
-    # state from `state_indices[s] + read_offsets[s]`. Both operands are
-    # replicated, so gather here, outside the shard_map. (This indexing was
-    # dropped when #115 inlined run_jax_gdn_attention_local into the shard_map
-    # body, leaving the full buffer to reach the kernel and trip its
-    # `read_offsets.shape == (num_seqs,)` assertion.)
+    # `slot_read_offsets` is indexed by physical slot. Each base slot
+    # holds `num_accepted - 1` for its request. Gather by `state_indices`
+    # to produce the kernel's required `(num_seqs,)` read offsets; it
+    # reads initial state at `state_indices[s] + read_offsets[s]`. Both
+    # operands are replicated, so the gather runs outside shard_map.
     if slot_read_offsets is not None:
         extra_args = (slot_read_offsets[state_indices], )
     else:
@@ -390,8 +389,8 @@ def _derive_pcp_ragged_exchange_descriptors(
 
 def _validate_pcp_ragged_exchange_layout_support() -> None:
     generation = pltpu.get_tpu_info().generation
-    # TODO: Validate this explicit tiled layout on TPU v4/v5e/v6 and relax
-    # this guard once compile and numerical coverage exists for those targets.
+    # This explicit tiled layout requires compilation and numerical
+    # validation before the guard can admit TPU v4, v5e, or v6.
     if generation != 7:
         raise NotImplementedError(
             "GDN PCP ragged exchange layout is only validated on TPU "
@@ -769,6 +768,24 @@ def _build_v3_pool_state_plan(
     )
 
 
+_GDN_FORM_LOGGED = False
+
+
+def _gdn_form() -> str:
+    """Resolve the pooled GDN entry from the routing-table flag.
+
+    Log the selected entry and decode tile once per process.
+    """
+    global _GDN_FORM_LOGGED
+    tables = bool(tpu_envs.TPU_GDN_TABLES_IN_KERNEL)
+    form = "tables" if tables else "two_calls"
+    if not _GDN_FORM_LOGGED:
+        logger.info("GDN pooled decode entry: form %s, decode tile %d", form,
+                    tpu_envs.TPU_GDN_DECODE_TILE)
+        _GDN_FORM_LOGGED = True
+    return form
+
+
 def run_jax_gdn_attention_pooled_local(
     mixed_qkv: jnp.ndarray,
     b: jnp.ndarray,
@@ -803,7 +820,8 @@ def run_jax_gdn_attention_pooled_local(
     kernel's state operands, so the kernel itself never sees the pool layout.
     """
 
-    conv_dim = conv_weight.shape[0]
+    # the conv weight in the layer's layout [dim, 1, kernel] or the kernel's [kernel, 1, dim] (made once after loading)
+    conv_dim = conv_weight.shape[-1] if conv_weight.shape[0] == kernel_size else conv_weight.shape[0]
     # Fused conv+GDN kernel: both state regions stream directly
     # between the pool and the kernel's double-buffered pipeline (one
     # contiguous DMA per slot per region) — no external gather/scatter
@@ -845,6 +863,8 @@ def run_jax_gdn_attention_pooled_local(
         state_source=recurrent_state,
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
+        gdn_form=_gdn_form(),
+        decode_tile_size=tpu_envs.TPU_GDN_DECODE_TILE,
     )
     return recurrent_state, output
 

@@ -18,6 +18,10 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ "${DRY_RUN:-0}" != "1" ] && [ "${CLIENT:-$SCRIPT_DIR/bench.sh}" = "$SCRIPT_DIR/bench.sh" ]; then
+  source "$SCRIPT_DIR/check_client.sh"
+  prepare_inferencex_client || exit 1
+fi
 PORT="${PORT:-8000}"
 READY_TIMEOUT="${READY_TIMEOUT:-5400}"   # 90 min (covers a cold compile)
 
@@ -27,26 +31,8 @@ read -r -a WORKLOADS <<< "${WORKLOADS:-8192:1024}"
 read -r -a CONCS <<< "${CONCS:-4 8 16 32 64 128 256 512 1024}"
 # Per-point sharding, followed by DP8 slots, global token budget and
 # release group.
-declare -A POINT_TABLE=(
-  [8192,1024,4]="TP8_EP"
-  [8192,1024,8]="TP8_EP"
-  [8192,1024,16]="TP8_EP"
-  [8192,1024,32]="TP8_EP"
-  [8192,1024,64]="DP8_EP 16 8192 8"
-  [8192,1024,128]="DP8_EP 20 8192 16"
-  [8192,1024,256]="DP8_EP 40 3072 8"
-  [8192,1024,512]="DP8_EP 80 6144 16"
-  [8192,1024,1024]="DP8_EP 144 16384 16"
-)
-
-# The attention kernel's decode batch per point (the TP8 points' placement
-# with 128 expert copies is set in start_server).
-declare -A POINT_FLAGS=(
-  [8192,1024,4]="TPU_RPA_DECODE_BATCH=4"
-  [8192,1024,8]="TPU_RPA_DECODE_BATCH=8"
-  [8192,1024,16]="TPU_RPA_DECODE_BATCH=8"
-  [8192,1024,32]="TPU_RPA_DECODE_BATCH=8"
-)
+# The points live in points.sh, shared with server.sh.
+source "${SCRIPT_DIR}/points.sh"
 
 sweep_status=0
 
@@ -93,25 +79,14 @@ stop_server() {
 }
 
 start_server() {
-  # $1 = the point's settings: the sharding, then (DP8_EP points) requests
-  # per engine, tokens per step across the engines, release group, head.
-  local sharding seqs budget group
-  read -r sharding seqs budget group <<< "$1"
-  # The point carries its own workload and concurrency rather than relying on
-  # the sweep's exports reaching the server through the environment.
-  local point_env=(SHARDING="$sharding" ISL="$ISL" OSL="$OSL" CONC="$CONC")
-  if [ -n "${seqs:-}" ]; then
-    point_env+=(MAX_NUM_SEQS="$seqs" GLOBAL_MAX_NUM_BATCHED_TOKENS="$budget"
-                DP_SCHED_BUFFER_THRESHOLD="$group")
-  fi
-  local point_flags="${POINT_FLAGS[$ISL,$OSL,$CONC]:-}"
-  local flags=()
-  read -r -a flags <<< "$point_flags"
-  point_env+=("${flags[@]}")
-  if [ "$ISL,$OSL" = "8192,1024" ] && [ "$sharding" = "TP8_EP" ]; then
-    case "$CONC" in
-      4|8|16|32) point_env+=("TPU_EXPERT_PLACEMENT=${SCRIPT_DIR}/expert_placement_dp8_ep8_copies128.json") ;;
-    esac
+  # the point's settings, except any the caller already set in the environment (an explicit override wins, and an
+  # empty TPU_EXPERT_PLACEMENT means no placement file)
+  local point_env=(ISL="$ISL" OSL="$OSL" CONC="$CONC")
+  if [ -n "${SHARDING_OVERRIDE:-}" ] || [ -n "${POINT_OVERRIDE:-}" ]; then
+    local sharding seqs budget group
+    read -r sharding seqs budget group <<< "$1"
+    point_env+=(SHARDING="$sharding")
+    [ -n "${seqs:-}" ] && point_env+=(MAX_NUM_SEQS="$seqs" GLOBAL_MAX_NUM_BATCHED_TOKENS="$budget" DP_SCHED_BUFFER_THRESHOLD="$group")
   fi
   if [ "${DRY_RUN:-0}" = "1" ]; then
     env "${point_env[@]}" bash "${SCRIPT_DIR}/server.sh"

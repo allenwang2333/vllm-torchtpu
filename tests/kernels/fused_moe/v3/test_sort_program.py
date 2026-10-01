@@ -11,11 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The sort program's size estimate against the compiler's counts
-(measured offline, compiled without the device: 8192 tokens
-of top-10 over 512 experts is an 86,016-row table, 2688 rows a subcore;
-4096 tokens 45,056 rows, 1408 a subcore; 2048 tokens 24,576 rows, 768 a
-subcore). No device needed."""
+"""CPU tests of sort-program size estimates against compiler-count fixtures.
+
+For top-10 over 512 experts, 8192 tokens produce an 86,016-row table
+with 2688 rows per subcore; 4096 tokens produce 45,056 rows with 1408
+per subcore; 2048 tokens produce 24,576 rows with 768 per subcore.
+"""
 import jax.numpy as jnp
 import pytest
 from absl.testing import absltest, parameterized
@@ -28,8 +29,8 @@ pytestmark = pytest.mark.cpu_test
 class SortProgramTest(parameterized.TestCase):
 
     @parameterized.parameters(
-        # (rows a subcore, lane blocks, rows a block, compiles, the
-        # compiler's count): every case compiled, whole and aborted.
+        # (rows per subcore, lane blocks, rows per block, compilation
+        # success, compiler bundle count).
         (2688, 8, 16, True, 3872),
         (2688, 16, 16, True, 3872),
         (2688, 32, 16, True, 3872),
@@ -53,8 +54,8 @@ class SortProgramTest(parameterized.TestCase):
             gather.sort_program_fits(rows, lane_blocks, dtype, block_rows),
             compiles)
         if counted is not None:
-            # The estimate stands on the largest costs seen, so it is never
-            # under the count and within a sixth over it.
+            # The estimate must cover the compiler count with less than
+            # one sixth of the count in excess.
             estimate = gather.sort_program_bundles(rows, lane_blocks, dtype,
                                                    block_rows)
             self.assertGreaterEqual(estimate, counted)

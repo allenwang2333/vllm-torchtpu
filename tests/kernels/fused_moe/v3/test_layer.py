@@ -32,12 +32,9 @@ from vllm_torchtpu.kernels.fused_moe.v3.rowquant import FP8
 
 pytestmark = pytest.mark.multichip
 
-# Against the plain-jnp reference. Both quantize the same rows to fp8 with
-# the same scales, but the roundings do not all land on the same side: the
-# kernel's fp8 rows and the reference's differ by one fp8 step on a share
-# of the elements, and that share sets the gap (measured 5.2e-2 at these
-# shapes. A wrong expert, a wrong scale or a dropped row reads far past
-# 1e-1).
+# Relative-L2 tolerance against the plain-jnp reference. Compiler fusion
+# can change intermediate bf16 rounding and produce different fp8 values
+# even when both paths use the same quantization scales.
 REFERENCE_REL_L2_MAX = 8e-2
 # The smallest shape: 8 shards. An expert count that is a whole number of
 # lane blocks (the tables kernel's one-hot). Hidden a multiple of 1024 (the
@@ -225,10 +222,9 @@ class LayerTest(parameterized.TestCase):
 
     # ---- against the reference ----
     def test_intermediate_bf16(self):
-        """The bf16 intermediate matches its own reference, and against the
-        exact reference (float32 rows against float32 weights between the
-        matmuls) it errs LESS than the fp8 intermediate: the numerics gate
-        of Config.intermediate. Both errors are printed for the record."""
+        """Check the bf16 intermediate against its reference and require
+        less error than fp8 against a reference that keeps the intermediate
+        rows and weights in float32."""
         out16 = self.check_reference(SHAPE, Config(intermediate="bf16"))
         out8, op = self.run_layer(SHAPE, Config())
         exact = fused_ep_moe_reference(op["x"],
@@ -409,8 +405,8 @@ class LayerTest(parameterized.TestCase):
                            Config(tables_blocks_per_step=blocks_per_step))
 
     def test_bf16_row_scales(self):
-        """A numerics option: bf16-rounded row scales move the output by
-        fp8 re-quantization noise, well past the default bound."""
+        """Check bf16-rounded row scales with a tolerance that includes
+        their effect on fp8 requantization."""
         out, op = self.run_layer(SHAPE, Config(row_scale_dtype=jnp.bfloat16))
         ref = fused_ep_moe_reference(op["x"],
                                      op["w1"],
@@ -446,8 +442,8 @@ class LayerTest(parameterized.TestCase):
     @parameterized.parameters(256, 512)
     def test_activation_block(self, block):
         """One fp8 scale per `block` values of a row, for the token rows and
-        the intermediate (the production layer's rounding at 512), carried
-        as one scale plane per block through the transport, the row tables
+        the intermediate, carried as one scale plane per block through
+        the transport, the row tables
         and the FFN kernel: at a full quantization tile and at a partial one
         (64 tokens per shard), with fp8 and with bf16 weights."""
         for tokens in (SHAPE["tokens"], 512):
@@ -471,10 +467,8 @@ class LayerTest(parameterized.TestCase):
                            weight_block=256)
 
     def test_int4_block_scaled_weights(self):
-        """int4 weights with one scale per block of the contraction (the
-        released form of Kimi K2), through the four-bit path with the
-        compiler's widening, against the reference: a whole-expert build
-        and a streamed one."""
+        """Check int4 weights with one scale per contraction block through
+        compiler widening, for whole-expert and streamed builds."""
         shape = dict(SHAPE, inter=1024)
         self.check_reference(shape,
                              Config(activation_block=256),
@@ -596,8 +590,8 @@ class LayerTest(parameterized.TestCase):
 
     def test_bf16_result_rows(self):
         """Expert outputs travel between shards as bf16 rows: against the
-        reference in that form, and with the production rounding (block 512
-        and bf16 rows) together."""
+        reference in that form, both with per-row activation scales and
+        with a 512-value activation block."""
         shape = dict(SHAPE, inter=1024)
         for config in (Config(result_rows="bf16"),
                        Config(activation_block=512, result_rows="bf16")):
@@ -631,10 +625,9 @@ class LayerTest(parameterized.TestCase):
 
     def test_streamed_expert_in_wider_blocks_and_small_groups(self):
         """Two activation blocks per stream block reassociate the f32 sum,
-        which flips the fp8 rounding of a few result values (1e-4 measured
-        against 5e-2 for a wrong rounding scheme); 128-row groups make
-        every expert several groups with a partial last one, still bit
-        for bit."""
+        which can change fp8 rounding and requires a tolerance. Groups of
+        128 rows with one activation block per stream block preserve the
+        whole-expert result bit for bit, including partial final groups."""
         shape = dict(SHAPE, tokens=8192, inter=2048)
         whole, _ = self.run_layer(shape, Config(activation_block=512))
         streamed = self.check_reference(
@@ -747,8 +740,8 @@ class LayerTest(parameterized.TestCase):
         np.testing.assert_array_equal(out, forced)
         with self.assertRaisesRegex(ValueError, "sort program .* bundles"):
             self.run_layer(shape, Config(sorted_rows=True))
-        # A smaller table of the same width sorts (2048 tokens: 4658
-        # bundles compiled), bit for bit the per-row fetch.
+        # A smaller table of the same width fits the sort program limit
+        # and produces the same output as per-row fetches.
         shape = dict(SHAPE, tokens=2048, top_k=8, hidden=2560, experts=256)
         out, sorted_ran = self.sorts(shape, Config())
         self.assertTrue(sorted_ran)

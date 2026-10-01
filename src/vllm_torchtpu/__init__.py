@@ -17,8 +17,7 @@ def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
     the gap. In particular, FA can have a cached page where Mamba has no state
     checkpoint, and resuming from the FA-only boundary corrupts generation.
 
-    This is the producer-only subset of the reconciliation merged upstream in
-    vllm-project/vllm#48425. Keep it local to the coordinator instance so
+    Keep it local to the coordinator instance so
     consumer-side divergent lookup and remote suffix transfer are unchanged.
     """
     from types import MethodType
@@ -45,7 +44,7 @@ def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
 
 
 def _patch_vllm_hybrid_producer_prefix_hits() -> None:
-    """Backport vLLM's hybrid connector hit reconciliation to 0.26.0."""
+    """Reconcile hybrid connector cache hits for vLLM 0.26.0."""
     from vllm.v1.core.sched.scheduler import Scheduler
 
     if Scheduler.__dict__.get("_tpu_hybrid_producer_prefix_hit_patch", False):
@@ -69,7 +68,7 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
     ``Scheduler._mamba_block_aligned_split``.  Under hybrid PCP, prefix hashes
     and reusable Mamba states instead advance at ``Scheduler.block_size``, the
     logical block spanning all PCP ranks.  Calling the upstream method with a
-    scheduler-local cache-config view backports the corresponding one-line fix
+    scheduler-local cache-config view supplies the logical block size
     without mutating the shared ``VllmConfig.cache_config`` or copying the
     scheduling algorithm into this plugin.
     """
@@ -184,9 +183,9 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
 def _patch_default_moe_runner_select_forward() -> None:
     """Keep DefaultMoERunner on the direct ``_moe_forward`` path under OOT.
 
-    Upstream gates this on ``is_tpu()``; under our OOT plugin that's False
-    and we'd take ``torch.ops.vllm.moe_forward``, which captures weight
-    tensors as closures and trips torch_tpu's MLIR builder.
+    Upstream gates this on ``is_tpu()``, which is False for this OOT plugin.
+    The alternate ``torch.ops.vllm.moe_forward`` path captures weight tensors
+    as closures that torch_tpu's MLIR builder cannot handle.
     """
     from vllm.model_executor.layers.fused_moe.runner import moe_runner as _dmr
 
@@ -227,13 +226,9 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
     (`Qwen3NextMLP(..., reduce_results=False)`): the same flag routes it to
     `_maybe_reduce_shared_expert_output`, which reduces it on its own.
     """
-    # Only installed where the kernel can arm. `prebuild_fused_moe_ep` returns
-    # on its first statement unless this flag is set, so with the flag off the
-    # patch provably cannot change an answer and would only leave an upstream
-    # class mutated in every other TPU deployment. The cost of the gate is that
-    # the unguarded `_fused_output_is_reduced` read below stops failing loudly
-    # on an upstream rename in runs that do not use the kernel; if arming ever
-    # grows a non-env path, this gate has to go with it.
+    # Install only when the fused kernel is enabled, matching the gate in
+    # `prebuild_fused_moe_ep`. Any additional enablement path must update
+    # both gates so reduced-output reporting follows kernel eligibility.
     if not envs.USE_MOE_FUSED_EP_KERNEL:
         return
 
@@ -447,12 +442,11 @@ def _patch_moe_explicit_pcp_collectives() -> None:
 
 
 def _patch_qwen3_next_fused_qk_norm_rope_gate() -> None:
-    """Route the Qwen3-Next attention's split + QK-RMSNorm + RoPE + gate to
-    the TPU kernel (kernels/qk_norm_rope_gate) for the small decode buckets
-    when TPU_FUSED_QK_NORM_ROPE is set. vLLM enables its fusion on CUDA only;
-    the eager path it replaces is about forty small operations per attention
-    layer at a few rows. Above the row cap (prefill) the eager path stays: the
-    kernel holds its rows whole in VMEM.
+    """Use the TPU split, QK-RMSNorm, RoPE, and gate kernel for decode buckets.
+
+    TPU_FUSED_QK_NORM_ROPE enables the fusion for Qwen3-Next attention.
+    The eager path serves rows above the cap because the kernel holds
+    its complete row block in VMEM.
     """
     from vllm_torchtpu import envs as _envs
     if not _envs.TPU_FUSED_QK_NORM_ROPE:
@@ -469,7 +463,8 @@ def _patch_qwen3_next_fused_qk_norm_rope_gate() -> None:
 
     def __init__(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
-        model_config = kwargs.get("model_config")
+        model_config = kwargs.get("model_config",
+                                  args[1] if len(args) > 1 else None)
         mm_config = getattr(model_config, "multimodal_config",
                             None) if model_config else None
         text_only = mm_config is None or getattr(mm_config,
@@ -515,7 +510,7 @@ def _patch_expert_map_host_lookup() -> None:
     expert map with ``.item()`` once per (expert, shard) tensor during MoE
     weight loading. On TPU every ``.item()`` is a blocking sync that
     flushes the deferred graph, so loading dispatches one tiny device
-    program per expert copy (~200k per worker on Qwen3.5-397B). Index a
+    program per expert copy. Index a
     cached host copy in Python instead; the cache follows reassignment
     and in-place rebalance via the tensor's version counter.
     """
@@ -649,10 +644,9 @@ def _patch_disable_sequence_parallel_moe() -> None:
 
     if envs.TPU_SP_MIN_ROWS > 0:
         # The row-gated form (layers/vllm/sequence_parallel,
-        # _patch_qwen3_next_sequence_parallel_by_rows): expert parallelism
-        # with tensor parallelism and no data parallelism, where the
-        # replicated rows make the norms, router and shared expert eight-fold
-        # redundant on the prompt steps.
+        # _patch_qwen3_next_sequence_parallel_by_rows) combines expert and
+        # tensor parallelism without data parallelism. It partitions prompt
+        # rows to avoid repeating norms, routing, and shared-expert work.
         def use_sequence_parallel_moe(self) -> bool:
             return bool(self.enable_expert_parallel
                         and self.tensor_parallel_size > 1
@@ -693,9 +687,10 @@ def _patch_qwen3_next_sequence_parallel_by_rows() -> None:
     from vllm.distributed import (get_tensor_model_parallel_rank,
                                   get_tensor_model_parallel_world_size,
                                   tensor_model_parallel_all_gather,
-                                  tensor_model_parallel_all_reduce,
                                   tensor_model_parallel_reduce_scatter)
     from vllm.model_executor.models import qwen3_next as _qn
+
+    from vllm_torchtpu.layers.vllm import small_all_reduce_op as _sar
 
     cls = _qn.Qwen3NextDecoderLayer
     if getattr(cls, "_tpu_sp_by_rows_patch", False):
@@ -763,8 +758,9 @@ def _patch_qwen3_next_sequence_parallel_by_rows() -> None:
         # differing set of lifted inputs (the residual slice below uses it
         # only in the first layer of the sequence-parallel trace). A zero
         # rides on the positions, which the compiler folds.
-        positions = positions + (self._tpu_sp_rank * 0)[0]
+        positions = positions + (self._tpu_sp_rank * 0)[0] + _sar.zero_from_rank()
 
+        prequant = None
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -772,7 +768,6 @@ def _patch_qwen3_next_sequence_parallel_by_rows() -> None:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
 
-        prequant = None
         if input_is_sequence_parallel and _sp.fp8_gather():
             # the rows reach the projections quantised: this rank quantises
             # its own rows once (the rows and scales the projections would
@@ -821,7 +816,7 @@ def _patch_qwen3_next_sequence_parallel_by_rows() -> None:
                             0, self._tpu_sp_rank).squeeze(0)
             else:
                 # the projections were built without their all-reduce
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states = _sar.all_reduce_tp(hidden_states)
 
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
@@ -1273,8 +1268,8 @@ def _patch_vllm_merge_multimodal_embeddings() -> None:
     `nonzero()` + `index_put_`, which creates dynamic coordinate shapes
     parameterized by the number of True entries. On TPU, this causes
     `tt_jit_index_put__nonzero` to recompile on every request with a different
-    image token count (~15s compilation each). We replace it with static prefix-sum
-    indexing and `torch.where`, which avoids `nonzero` and eliminates recompilation.
+    image token count. Static prefix-sum indexing and `torch.where` avoid
+    the dynamic `nonzero` shapes and the resulting recompilation.
     """
     import sys
 
@@ -1488,13 +1483,9 @@ def _patch_dflash_bypass_v2_runner_check() -> None:
     _FLAG = "use_v2_model_runner"
 
     def patched_resolve(config, layer_idx: int):
-        # Force the flag True for the duration of the upstream call only, by
-        # swapping the class attribute and restoring it. Deliberately not
-        # `unittest.mock.patch`: a test helper has no business in the load
-        # path, and — more usefully — looking the attribute up explicitly
-        # means that if upstream ever moves or renames it, this raises here
-        # instead of silently no-op'ing and letting the original V2 check
-        # reject the drafter with an unrelated-looking error.
+        # Set the flag only for the upstream call, then restore the class
+        # attribute. Explicit lookup raises immediately if the upstream
+        # attribute moves or is renamed.
         from vllm.config import get_current_vllm_config
         cfg_cls = type(get_current_vllm_config())
         if not hasattr(cfg_cls, _FLAG):
@@ -1624,17 +1615,13 @@ if "proxy" in envs.JAX_PLATFORMS:
 
 
 def _patch_vllm_block_pool_lifo_free() -> None:
-    """Restore pre-#48017 LIFO block reuse when prefix caching is off.
+    """Reuse freed blocks in LIFO order when prefix caching is disabled.
 
-    vllm a82f1b38 switched hashless freed blocks from prepend (LIFO reuse
-    of a small hot set of block ids) to append (FIFO) when prefix caching
-    is disabled. On TPU v7x the FIFO order cycles the entire KV block-id
-    space under sustained load and an indexed SparseCore-offloaded op on
-    the paged-KV path traps with E0200 RuntimeUnexpectedCoreHalt (UserFatal
-    on SC2). Bisect evidence: docs/sc2-sparsecore-halt-2026-08.md on branch
-    mhhua/sc2-sparsecore-halt-evidence, vllm-torchtpu-dev builds 136-146.
-    Behavior with prefix caching enabled is unchanged. Remove once the
-    SparseCore index handling is fixed in the TPU runtime.
+    FIFO reuse cycles through the full KV block-ID space under sustained
+    load. On TPU v7x, indexed SparseCore operations on the paged-KV path
+    can halt with E0200 RuntimeUnexpectedCoreHalt under that access pattern.
+    LIFO reuse keeps a smaller set of block IDs active. Prefix caching
+    retains its own reuse order.
     """
     from vllm.v1.core.block_pool import BlockPool
 
@@ -1657,7 +1644,7 @@ def _patch_vllm_block_pool_lifo_free() -> None:
     BlockPool.free_blocks = free_blocks
     BlockPool._tpu_lifo_free_patch = True
     logger.info(
-        "Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")
+        "Applied LIFO free-block patch to BlockPool")
 
 
 def _patch_vllm_vocab_parallel_embedding() -> None:

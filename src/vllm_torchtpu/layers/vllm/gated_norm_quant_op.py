@@ -78,10 +78,15 @@ def install(model) -> bool:
     global _NORM_OP, _MATMUL_OP
     from torch_tpu._internal.pallas import pallas  # the torch<->jax op bridge
     eps = _find_eps(model)
+    # read once here, never inside the traced function (the jit cache key
+    # cannot see an environment read)
+    tile = int(envs.TPU_GATED_NORM_TILE)
+    logger.info("gated norm-quant op: row tile %d (the largest legal block "
+                "at or below it per row count)", tile)
 
     def _norm_fn(o: jax.Array, z: jax.Array,
                  w: jax.Array) -> tuple[jax.Array, jax.Array]:
-        return gnq.gated_norm_quant(o, z, w, eps)
+        return gnq.gated_norm_quant(o, z, w, eps, tile=tile)
 
     norm = pallas.jax_op("pallas::gdn_gated_norm_quant", _norm_fn)
 

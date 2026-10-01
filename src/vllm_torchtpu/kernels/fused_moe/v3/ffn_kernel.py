@@ -86,9 +86,8 @@ class Tables:
 class Operands:
     """The HBM operands, in operand order."""
     token_of_row: object  # [routed rows / LANES, 1, LANES] i32 token each
-    # routed row computes; read per tile into a
-    # scalar-memory window (the whole table
-    # outgrows scalar memory past 8192 tokens a call)
+    # routed row computes; read per tile into a scalar-memory window
+    # to keep scalar-memory use bounded as the table grows
     tokens: object  # [tokens, lane blocks, LANES] fp8 rows
     token_scales: object  # [scale planes, scale rows, LANES] i32: f32
     # bits, one word per row per plane

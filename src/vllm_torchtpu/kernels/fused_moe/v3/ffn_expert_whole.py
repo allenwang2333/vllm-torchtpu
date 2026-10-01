@@ -62,8 +62,8 @@ def issue_tile_rows(ctx, row_base, live_blocks, slot, window_ref, sem):
     """Issues one tile's row stream and scale window into `slot`, its
     tokens read from `window_ref`, whose copy was started one tile (or
     one expert) earlier and is waited here. With sorted rows the tile is
-    one copy of consecutive rows from row_base, and the scale windows as
-    ever."""
+    one copy of consecutive rows from row_base, followed by the scale
+    window copies."""
     b = ctx.b
     if b.sorted_rows:
         rows = live_blocks * ROW_BLOCK

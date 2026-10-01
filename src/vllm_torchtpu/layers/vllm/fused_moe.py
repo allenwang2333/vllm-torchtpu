@@ -86,8 +86,7 @@ def load_kmajor_fp4(w_u8: torch.Tensor) -> torch.Tensor:
     to gmm_v2's K-major layout ONCE at load. The result is stored as a native-fp4
     Parameter, so the forward hands it straight to gmm_v2 with no per-forward
     unpack or transpose (which keeps the 480B HBM footprint bounded). Requires
-    torch_tpu's native ``torch.float4_e2m1fn_x2`` dtype
-    (google-pytorch/torch_tpu#1560).
+    torch_tpu's native ``torch.float4_e2m1fn_x2`` dtype.
     """
     global _load_kmajor_fp4_op
     if _load_kmajor_fp4_op is None:
@@ -145,16 +144,11 @@ def _build_fused_moe_custom_op(
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
 
-    # TODO: once the pod's vLLM includes --moe-backend (added upstream in
-    # vLLM PR #33807, 2026-03-01; absent in the 0.19.0 we run), register the
-    # SparseCore vs plain variants through that selector + the MoE oracle
-    # instead of this env flag -- the MoE analog of how #191 moved batched
-    # RPA onto --attention-backend CUSTOM. Note MoEBackend has no CUSTOM slot
-    # yet, so that also needs an upstream OOT-backend hook.
+    # Select SparseCore or plain-JAX token movement through the plugin's
+    # environment flag.
     use_sparse_core = envs.USE_MOE_SPARSE_CORE
 
     # Pass experts_start as a runtime tensor rather than static closure arg so every EP rank compiles an identical program.
-    # See fa8faaf5 for background on rank-uniform sharding in compiled Pallas graphs.
     wrapped_fn = functools.partial(
         fused_moe_func,
         topk=topk,

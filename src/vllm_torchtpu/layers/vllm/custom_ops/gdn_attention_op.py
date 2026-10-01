@@ -341,13 +341,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         conv_state_dtype, temporal_state_dtype = super().get_state_dtype()
         if unified_kv_layout_enabled_for_architecture(
                 self.model_config.architecture):
-            # Declare exactly what the pool physically stores. vLLM sizes the
-            # mamba page from the dtype declared HERE and asserts the padded
-            # page covers it, while the block-slot derivation budgets the page
-            # from DEFAULT_POOLED_GDN_CONV_STATE_DTYPE. Declaring anything
-            # wider is not conservative, it is a contradiction: the two
-            # disagreed once and every hybrid GDN engine failed to start on
-            # that assert.
+            # Declare the pool's physical storage dtype. vLLM sizes the Mamba
+            # page from this dtype and requires the padded page to cover it. The
+            # block-slot derivation uses DEFAULT_POOLED_GDN_CONV_STATE_DTYPE, so
+            # both declarations must agree to satisfy the page-size assertion.
             conv_state_dtype = getattr(
                 torch,
                 DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.split(".")[1])
@@ -376,6 +373,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.conv1d.weight.data = torch.empty(w.shape,
                                               dtype=w.dtype,
                                               device=w.device).copy_(w)
+
 
     def get_state_shape(self, ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         conv_state_shape, temporal_state_shape = super().get_state_shape()
@@ -506,8 +504,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             seq_lens: torch.Tensor,
             slot_read_offsets: torch.Tensor | None = None,
         ) -> torch.Tensor:
-            # The PCP prefill op keeps its original 13-arg signature. Its
-            # speculative state tail is not a rollback operand.
+            # The PCP prefill op takes 13 arguments; its speculative state tail
+            # is preserved without serving as a rollback operand.
             extra_args = (() if pcp_streaming else (slot_read_offsets, ))
             new_conv, new_rec, outputs = gdn_jax_op(
                 mixed_qkv, b, a, conv_state, recurrent_state, conv_weight,
@@ -833,8 +831,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             output = gated_norm_quant_op.output_projection(
                 core_attn_out, z, self.norm, out_proj)
             if self.tp_size > 1 and getattr(out_proj, "reduce_results", True):
-                from vllm.distributed import tensor_model_parallel_all_reduce
-                output = tensor_model_parallel_all_reduce(output)
+                from vllm_torchtpu.layers.vllm import small_all_reduce_op
+                output = small_all_reduce_op.all_reduce_tp(output)
             return output
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")

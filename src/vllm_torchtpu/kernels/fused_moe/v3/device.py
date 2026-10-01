@@ -18,9 +18,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from .layout import SUBLANES, align_up
 
-# The chip generations the package has been built, tested and timed on.
-# Everything else is read off the device record at build time, so another
-# generation would compile and run untested, so it raises an error instead.
+# Supported TPU generations. Device properties are read at build time,
+# and check_generation rejects generations outside this set.
 SUPPORTED_GENERATIONS = (7, )
 # The share of the chip's VMEM a kernel may claim.
 VMEM_FRACTION = 0.98
@@ -34,8 +33,7 @@ def chip_generation(info=None):
 
 
 def check_generation(info=None):
-    """Raises ValueError on a generation the package has not
-    been run on."""
+    """Raise ValueError for an unsupported TPU generation."""
     generation = chip_generation(info)
     if generation not in SUPPORTED_GENERATIONS:
         raise ValueError(

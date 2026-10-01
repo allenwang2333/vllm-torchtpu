@@ -11,9 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The latest fused EP kernel against the same dense reference, bands and
-rotated-expert control the v2 port is held to (test_fused_ep_moe_v2.py),
-plus the adapter's padded-row masking and the served buckets."""
+"""Fused EP kernel checks against a dense reference and rotated-expert
+control, including adapter padding and model token buckets."""
 
 import jax
 import jax.numpy as jnp
@@ -54,44 +53,33 @@ FP8 = jnp.float8_e4m3fn
 # count, hidden a whole number of 128-lane blocks, intermediate over one.
 SMALL = dict(hidden=512, inter=256, e_total=32, topk=4, tokens=256)
 
-# Qwen3.5-397B's MoE block, which is also the served geometry the kernel was
-# written for: 512 experts over 8 shards is 64 local experts a shard.
+# Qwen3.5-397B's MoE block: 512 experts over 8 shards, or 64 local
+# experts per shard.
 PROD = dict(hidden=4096, inter=1024, e_total=512, topk=10)
 
-# How far the layer may sit from the dense reference, as a batch-wide
-# relative L2 and as the worst single token's. Taken from the kernel's own
-# suite, where they are stated against an fp8 wire: the routed rows travel
-# between shards quantized to e4m3 with one scale a row, and the intermediate
-# is requantized the same way, so the band is the transport's and not the
-# expert weights'. Measured on this host, as (batch, worst token): small fp8
-# 0.0534/0.0636, T=2048 0.0540/0.0583, T=16384 0.0540/0.0615. The worst token
-# clears the batch band on the small shape, which is what the second bound is
-# for -- 256 tokens leave one unlucky row nowhere to hide.
+# Relative-L2 tolerances against the dense reference, over the batch and
+# for the worst token. The default configuration quantizes token, intermediate,
+# and result rows to fp8 with one scale per row. The separate token bound
+# checks errors that a batch-wide norm can hide.
 FP8_RELATIVE_BOUND = 0.06
 FP8_TOKEN_BOUND = 0.075
 
-# The unquantized weight format quantizes nothing -- no fp8 rows, no fp8 wire
-# -- so what is left is bf16 rounding in the matmuls and in the intermediate.
-# Measured 0.00233/0.00261 on the small shape; the band is an order of
-# magnitude under the fp8 one, which is the point of stating it separately.
+# Tolerances for comparisons without fp8 row quantization. The default
+# row formats used below require the fp8 tolerances for either weight format.
 BF16_RELATIVE_BOUND = 0.01
 BF16_TOKEN_BOUND = 0.01
 
-# How much further a reference computed over rotated experts has to sit than
-# the reference itself, so that a band this wide still means something: a
-# layer that routed to the wrong experts would not clear it. The kernel's own
-# suite uses the same control and the same factor.
+# The rotated-expert reference must be this factor farther from the output
+# than the correct reference, so the tolerance still detects misrouting.
 ROTATED_CONTROL_FACTOR = 10
 
 
 def _make_weights(mesh, seed, *, hidden, inter, e_total, weight_format):
     """(w1, w2, w1_scale, w2_scale) as global arrays sharded on the experts.
 
-    Built a shard at a time rather than on one device and handed out: the
-    served shape's f32 draw is 17GB where its fp8 form is 6.4GB, and only the
-    latter has to exist at once. fp8 scales are per output channel, taken
-    along each matmul's contraction axis, which is the layout the kernel
-    takes: w1_scale [E, 2 * inter], w2_scale [E, hidden].
+    Build one shard at a time to limit the temporary float32 allocation.
+    fp8 scales are per output channel, taken along each matmul's contraction
+    axis: w1_scale [E, 2 * inter], w2_scale [E, hidden].
     """
     (axis, ) = mesh.axis_names
     g_local = e_total // mesh.shape[axis]
@@ -146,15 +134,12 @@ def _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk):
     """The plain MoE: softmax, top-k, dense per-expert FFN, weighted sum.
 
     Every expert is applied to every token in f32 and weighted by the router
-    weight of the slots that chose it, which is zero for a token that did
-    not. Nothing is quantized: the weights are dequantized once and the whole
-    body runs in f32, so the difference from the kernel is the kernel's
-    transport rather than a second implementation of the same shortcuts.
+    weight of the slots that choose it. Unselected experts have zero weight.
+    The weights are dequantized once and the body runs in f32, providing a
+    reference for the kernel's arithmetic and quantization.
 
-    The loop is spread over the same expert axis the layer shards on -- each
-    shard applies its own experts to the whole batch and the results are
-    summed across shards -- which is a distribution of the reference, not a
-    change of it: the summands and their order are the same.
+    Each shard applies its local experts to the whole batch, and the partial
+    results are summed across the expert axis.
     """
     (axis, ) = mesh.axis_names
     g_local = w1.shape[0] // mesh.shape[axis]
@@ -299,11 +284,9 @@ def test_the_adapter_mesh_axis_is_the_one_the_kernel_reads():
     assert EP_AXIS_NAME == MESH_AXIS
 
 
-# The latest kernel's bf16 weight form still carries the token rows and the
-# result rows over the wire as fp8 with one f32 scale per row (Config defaults
-# token_rows="fp8", result_rows="fp8"), unlike the v2 port's bf16 form, which
-# quantized nothing. So the fp8 bands are the ones that apply to it in every
-# weight format; measured 0.0526 on the small bf16 shape, inside the 0.06 band.
+# Both weight formats use fp8 token and result rows with one f32 scale per
+# row by default (Config.token_rows="fp8", Config.result_rows="fp8"), so
+# both use the fp8 error bounds.
 @pytest.mark.parametrize("fmt", ["fp8", "bf16"])
 def test_small_shape_tracks_a_dense_reference(fmt):
     mesh = _mesh()
@@ -330,7 +313,7 @@ def test_small_shape_tracks_a_dense_reference(fmt):
                           fmt=fmt,
                           batch_bound=FP8_RELATIVE_BOUND,
                           token_bound=FP8_TOKEN_BOUND)
-    print(f"LATEST {fmt} small: rel_l2 {error:.4f} worst token {worst:.4f}")
+    print(f"{fmt} small: rel_l2 {error:.4f} worst token {worst:.4f}")
 
 
 def test_padded_suffix_routes_nowhere_and_valid_rows_match_reference():
@@ -413,7 +396,7 @@ def test_served_buckets_track_a_dense_reference(production_weights,
                           batch_bound=FP8_RELATIVE_BOUND,
                           token_bound=FP8_TOKEN_BOUND)
     print(
-        f"LATEST fp8 {local_tokens}x{EP}: rel_l2 {error:.4f} worst token {worst:.4f}"
+        f"fp8 {local_tokens}x{EP}: rel_l2 {error:.4f} worst token {worst:.4f}"
     )
 
 

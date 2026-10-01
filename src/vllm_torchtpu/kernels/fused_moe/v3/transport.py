@@ -29,14 +29,14 @@ links can carry. A block travels as PIECES equal pieces so a forward starts
 as soon as the piece it needs has landed; pieces on one link land in the
 order they were issued.
 
-Mates. During quantization the representative and its mate exchange their
-own rows a tile at a time. After each round the representative copies the
+Mates. During token preparation the representative and its mate exchange
+their own rows a tile at a time. After each round the representative copies the
 blocks that round brought to its mate, and the mate waits for those copies
 before its first tile.
 
 Kernels. start_transport is its own Pallas call behind the router: a
-barrier, the shard's rows quantized to fp8 a tile at a time and shared with
-the mate as they go, the routing message sent to every shard, round 1
+barrier, the shard's rows prepared a tile at a time in the configured wire
+format and shared with the mate, the routing message sent to every shard, round 1
 issued. It returns the gathered-rows buffer and its semaphores with the
 copies in flight (the DMA engine keeps moving bytes across a call boundary
 and the semaphores keep their counts). The shard-tables kernel forwards the
@@ -61,8 +61,7 @@ from .layout import (COLLECTIVE_ID_TRANSPORT, LANES, MESH_AXIS, ROW_BLOCK,
                      SUBLANES, device_coords)
 from .rowquant import FP8, quantize_rows
 
-# The widest mesh the exchange is written for. Above 8 shards the mesh
-# spans hosts.
+# The maximum supported mesh width.
 MAX_SHARDS = 32
 # The routing message travels as dense (SUBLANES, LANES) tiles of int32.
 MESSAGE_LANES = LANES
@@ -232,8 +231,8 @@ class Exchange:
         descriptor of the same rows and semaphore: the bridge's compile
         refuses a wait on a descriptor that
         carries a peer address ("Number of device ids must match the number
-        of mesh axes ... 0D mesh"). Elsewhere the remote descriptor's own
-        wait, unchanged."""
+        of mesh axes ... 0D mesh"). Other callers use the remote
+        descriptor's receive wait."""
         if layout.SHARD_INDEX_OPERAND:
             pltpu.make_async_copy(self.gathered_rows.at[rows],
                                   self.gathered_rows.at[rows], sem).wait()
@@ -477,11 +476,11 @@ def start_transport(rows,
         (Config.elementwise_dtype).
 
     Returns:
-      (gathered rows [num_shards * tokens, lane blocks, LANES] fp8 with the
+      (gathered rows [num_shards * tokens, lane blocks, LANES] token_dtype with the
       copies still landing, its send semaphore, its receive semaphores,
       routing messages [num_shards, message_rows, MESSAGE_LANES] int32).
 
-    Each tile's fp8 rows go to this shard's slot of the gathered rows and
+    Each tile's rows go to this shard's slot of the gathered rows and
     to the mate's, and its scale column becomes one routing message row.
     The routing message goes out to every peer ahead of round 1 in every
     link's queue (issued behind it, it would land behind round 1's

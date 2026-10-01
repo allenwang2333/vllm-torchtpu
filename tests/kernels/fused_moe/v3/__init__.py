@@ -1,1 +1,4 @@
-"""The sorted-rows fused EP kernel (kernels/fused_moe/v3) tests with the package imports rewritten. absltest-based; pytest collects them. Most need the TPU (run between boots): JAX_PLATFORMS=cpu skips or fails the device ones."""
+"""Tests for the fused EP v3 kernel, collected by pytest.
+
+Tests marked multichip require TPU devices; cpu_test cases run on the CPU.
+"""

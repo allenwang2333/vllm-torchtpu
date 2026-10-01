@@ -18,10 +18,8 @@ loading, but only in ``DefaultModelLoader`` (local files) and only for
 tensor names ending in ``.weight``. Neither restriction works for TPU MoE
 serving from object storage:
 
-- ``RunaiModelStreamerLoader`` (the only ``gs://`` weight path) streams the
-  FULL checkpoint into anonymous host memory on every rank. For a 1.5 TB
-  MoE checkpoint at 8 ranks/host this exceeds host RAM long before the
-  load finishes (Ray OOM kill at 95% of a 944 GB host).
+- ``RunaiModelStreamerLoader`` can stream the full checkpoint into host memory
+  on every rank, multiplying host memory use by the number of workers.
 - Compressed-tensors MXFP4 checkpoints name their expert weights
   ``.weight_packed`` / ``.weight_scale``, which the upstream filter never
   matches.
@@ -31,21 +29,11 @@ the safetensors headers and REQUEST ONLY the byte ranges of tensors this
 rank keeps: dense weights, plus the packed weights AND scales of its own
 experts. Skipped tensors are never fetched from storage at all.
 
-The DefaultModelLoader patch below fixes the matching gap in vLLM 0.27.0's
-local-files path: ``should_skip_weight`` only matches names ending in
-``.weight``, so for an MXFP4 checkpoint it keeps every expert's
-``.weight_packed`` and ``.weight_scale`` and the filter is a no-op for all
-per-expert tensors. The patch replaces the predicate with one whose suffix
-allowlist also covers ``.weight_packed`` and ``.weight_scale``.
-
-Divergence from upstream noted: upstream deliberately keeps every expert's
-scale tensors because some GPU backends reduce a global activation-scale
-max across experts. The TPU compressed-tensors MoE methods consume scales
-strictly per local expert (see ``compressed_tensors_moe/utils.py``), and at
-896 experts the scales alone are ~85 GB per rank, so they are filtered
-here like the packed weights. Per-expert activation ``.input_scale``
-tensors (ModelOpt NVFP4, needed globally by FlashInfer backends) are not
-in the allowlist and stay unfiltered.
+The DefaultModelLoader patch extends the expert-weight suffix filter to include
+``.weight_packed`` and ``.weight_scale``. TPU compressed-tensors MoE consumes
+these scales per local expert, so both can be filtered with the packed weights.
+Per-expert activation ``.input_scale`` tensors remain unfiltered: backends that
+compute a global activation-scale maximum require scales from every expert.
 """
 
 import functools
@@ -117,7 +105,7 @@ def _ep_rank() -> int:
 def _compute_local_expert_ids() -> Optional[set[int]]:
     """Local expert ids for this rank, or None when filtering is off.
 
-    Mirrors ``DefaultModelLoader._init_ep_weight_filter`` (vLLM 0.26) so the
+    Mirrors ``DefaultModelLoader._init_ep_weight_filter`` so the
     fetch-time filter and the FusedMoE expert map agree by construction.
     """
     from vllm.config import get_current_vllm_config
@@ -242,14 +230,9 @@ def _sharded_runai_weights_iterator(
                         device="cpu",
                         is_distributed=False)
 
-        # Under torch-tpu's deferred eager mode, weight_loader's device
-        # copies queue up and keep their HOST source tensors referenced
-        # until the graph flushes. Left alone, every kept tensor's host
-        # clone stays resident for the whole load (~all dense bytes per
-        # rank; the pod died at 8 ranks x ~110 GB within 2 minutes of
-        # streaming). This iterator runs on the same thread that consumes
-        # the tensors, so a periodic device sync here releases the queued
-        # copies' host sources and bounds resident memory to a window.
+        # Deferred device copies retain their host source tensors until the
+        # graph flushes. Synchronize periodically on the consuming thread
+        # to release those references and bound host-memory use.
         sync_every = int(os.getenv("TPU_SHARDED_LOAD_SYNC_EVERY", "512"))
 
         def _device_sync() -> None:
@@ -583,10 +566,8 @@ def patch_moe_expert_write_staging() -> None:
     """Load expert parameters through host stand-ins written to the device
     once each.
 
-    Every per-expert copy into a device parameter uploads its source and runs
-    as its own program that rewrites the whole parameter; a stage holding
-    whole experts (no expert parallelism) spends tens of minutes on those
-    programs and holds its expert weights twice by the end of loading.
+    Each direct per-expert copy uploads its source and rewrites the device
+    parameter. Host staging combines these writes into bounded uploads.
     A stand-in is written when its last expert lands, or at the end of
     loading if the loader never completes it, in slices of
     ``_UPLOAD_CHUNK_BYTES`` joined on the device. Only a parameter written

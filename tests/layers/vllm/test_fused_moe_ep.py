@@ -168,7 +168,7 @@ def test_refused_below_the_token_threshold():
 
 
 def test_qwen_4096_bucket_is_not_refused_by_smem():
-    """A 4K/rank DP8 bucket no longer scales the SMEM working set."""
+    """Routing-table SMEM use stays bounded at 4K rows per rank."""
     layer = _layer(experts=256)  # 512 global experts over the stub's ep=2
     assert _prebuild(layer, topk=10, node_tokens=32768) == "op"
 
@@ -347,8 +347,8 @@ def test_supports_internal_mk_tracks_both_owners():
     FP8 method owns the exchange whenever the fused EP kernel is enabled
     (USE_MOE_FUSED_EP_KERNEL): its `apply_monolithic` then runs the fused
     kernel on the shapes at or above TPU_MOE_FUSED_EP_STEP_MIN_TOKENS and the
-    few-token kernel or the grouped-matmul path below it, so ownership does not depend on an armed
-    per-layer op the way the v2 dispatch's did."""
+    few-token kernel or grouped-matmul path below it. Ownership is independent
+    of the selected per-layer op."""
     from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8MoEMethodTPU
 
     prop = VllmFp8MoEMethodTPU.supports_internal_mk
@@ -490,7 +490,7 @@ def test_nvfp4_requires_explicit_w4a8_opt_in(monkeypatch, setting, enabled):
     monkeypatch.setattr(envs, name, value)
     assert _prebuild(_fp4_layer(), weight_format="fp4",
                      rhs_qb=512) == ("op" if enabled else None)
-    # The new opt-in applies only to FP4; FP8 fused EP retains its behavior.
+    # The opt-in applies only to FP4; FP8 fused EP retains its behavior.
     assert _prebuild(_layer()) == "op"
 
 

@@ -113,10 +113,19 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         if self._replicated_sequence_parallel_step(is_sequence_parallel):
             # replicated rows, partial sums over the ranks' experts: the
             # runner skips its final all-reduce under sequence parallelism
-            return get_ep_group().all_reduce(hidden_states)
+            from vllm_torchtpu.layers.vllm import small_all_reduce_op
+            return small_all_reduce_op.all_reduce_ep(hidden_states)
         if self._sequence_parallel_step(is_sequence_parallel):
             return get_ep_group().reduce_scatter(hidden_states, dim=0)
         dp = get_dp_group()
         if dp.world_size == 1:
             return hidden_states
-        return dp.reduce_scatter(hidden_states, dim=0)
+        # the small all-reduce kernel plus this rank's slice when the block
+        # and the group allow it (small_all_reduce_op.dp_combine), else
+        # vLLM's reduce-scatter
+        from vllm_torchtpu.layers.vllm import small_all_reduce_op
+        combined = small_all_reduce_op.dp_combine(hidden_states)
+        if combined is not None:
+            return combined
+        return small_all_reduce_op.retain_dp_combine_inputs(
+            dp.reduce_scatter(hidden_states, dim=0))

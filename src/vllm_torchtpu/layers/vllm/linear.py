@@ -14,8 +14,7 @@
 
 import torch
 from torch.nn import Parameter
-from vllm.distributed import (split_tensor_along_last_dim,
-                              tensor_model_parallel_all_reduce)
+from vllm.distributed import (split_tensor_along_last_dim)
 from vllm.model_executor.layers.linear import RowParallelLinear
 
 
@@ -50,7 +49,8 @@ class TpuRowParallelLinear(RowParallelLinear):
             input_parallel = split_input[self.tp_rank].contiguous()
 
         output_parallel = self.quant_method.apply(self, input_parallel, None)
-        output = tensor_model_parallel_all_reduce(output_parallel)
+        from vllm_torchtpu.layers.vllm import small_all_reduce_op
+        output = small_all_reduce_op.all_reduce_tp(output_parallel)
         output = output + self.bias
 
         # skip_bias_add is False here, so there is no bias left to return.

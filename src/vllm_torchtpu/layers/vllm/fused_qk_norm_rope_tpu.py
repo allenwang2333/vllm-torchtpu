@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""vLLM's fused split + QK-RMSNorm + RoPE + gate for the Qwen3-Next family,
-on TPU: one Pallas call per attention layer (kernels/qk_norm_rope_gate) in
-place of the eager path's forty small operations, behind
-TPU_FUSED_QK_NORM_ROPE=1. Same signature and contract as
+"""Fused split, QK-RMSNorm, RoPE, and gate for Qwen3-Next on TPU.
+
+TPU_FUSED_QK_NORM_ROPE=1 selects one Pallas call per attention layer
+(kernels/qk_norm_rope_gate), with the signature and contract of
 vllm.model_executor.layers.fused_qk_norm_rope.fused_qk_rmsnorm_rope_gate.
 """
 import functools

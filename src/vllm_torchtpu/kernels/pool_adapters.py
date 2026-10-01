@@ -103,8 +103,7 @@ def gather_region(pool,
     blocks; ``state_indices`` are manager ids): whole-kernel-block ranges
     go through one DMA window per request; a range inside a single kernel
     block goes through the plain path at the kernel-block offset. Ranges
-    that straddle kernel blocks partially are unsupported (no current
-    region shape needs them).
+    that partially straddle kernel blocks are unsupported.
 
     Plain path (split == 1): per-request typed read of a pool token-range.
 
@@ -155,7 +154,7 @@ def gather_region(pool,
     out_rows = _out_rows(out_payload, g)
     if not payload and not same_dtype:
         # 3-D pool: the block ref is 2-D and the bitcast rescales the
-        # token/row dim itself (the old validated sublane convention).
+        # token/row dim itself.
         out_rows = _rescale_rows(g, pool.dtype, out_dtype)
     lane_split = 1
     if out_lanes is not None and out_lanes != lanes:

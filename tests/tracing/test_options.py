@@ -58,3 +58,18 @@ def test_parse_profile_options_none_or_empty():
     s, a = parse_profile_options("   ")
     assert s == {}
     assert a == {}
+
+
+def test_profiler_environment_defaults_and_request_precedence(monkeypatch):
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "TPU_PROFILER_OPTIONS",
+                        "python_tracer_level:0;tpu_trace_mode:TRACE_COMPUTE;")
+    _, standard, advanced = resolve_profile_dir_and_opts("/tmp/base", None)
+    assert standard["python_tracer_level"] == 0
+    assert advanced["tpu_trace_mode"] == "TRACE_COMPUTE"
+
+    _, standard, advanced = resolve_profile_dir_and_opts(
+        "/tmp/base", "python_tracer_level:1;tpu_trace_mode:TRACE_ALL;")
+    assert standard["python_tracer_level"] == 1
+    assert advanced["tpu_trace_mode"] == "TRACE_ALL"

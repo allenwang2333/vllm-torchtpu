@@ -22,7 +22,7 @@ rank-local token chunk per destination without head-width padding.
 
 For PCP size ``P`` and local communication chunk ``C``, one logical compute
 stage contains ``P * C`` request-major tokens and one PCP-local head shard.
-While the existing GDN v3 inner kernel consumes stage ``i``, remote DMA fills
+While the GDN v3 inner kernel consumes stage ``i``, remote DMA fills
 the other VMEM slot with stage ``i + 1``. Once GDN completes, each source rank
 pushes the ``C`` output rows belonging to every destination into that rank's
 packed token rows and the source rank's value-head columns.
@@ -137,7 +137,7 @@ def _compute_gdn_tile(
     cfg: config.GDNConfig,
     comm_chunk_size: int,
 ) -> None:
-    """Convert one received BF16 tile and run the existing GDN inner kernel."""
+    """Convert one received BF16 tile and run the GDN inner kernel."""
     p_id = pl.program_id(0)
     stage = stage_metadata_ref.tile_stage[p_id]
     recv_slot = lax.rem(stage, 2)
@@ -763,7 +763,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     )
     num_z_out_blocks = num_projection_out_blocks - num_qkv_out_blocks
     # QKV for token block zero is the only unconditional prologue work.  The
-    # remaining queue keeps the original block-major order so the quantized X
+    # remaining queue uses block-major order so the quantized X
     # tile is reused: block-zero Z, then every later block's QKV followed by Z.
     num_projection_work_tiles = lax.select(
         active_projection_token_blocks > 0,
@@ -1384,9 +1384,8 @@ def fused_qkvz_projection_pcp_gdn(
             query_start_loc=query_start_loc,
             state_indices=state_indices,
             # The non-PCP V3 wrapper sends the leading decode segment to a
-            # separate batched kernel.  This fused PCP op has no such sibling:
-            # it must cover that segment with the correctness-first PER_SEQ
-            # path as well.  Skipping ``distribution[0]`` requests makes a
+            # separate batched kernel. This fused PCP op covers that segment
+            # through PER_SEQ. Skipping ``distribution[0]`` requests makes a
             # decode-only batch produce zero active tiles.
             start_seq=jnp.zeros_like(distribution[0]),
             end_seq=distribution[-1],

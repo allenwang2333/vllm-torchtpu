@@ -26,15 +26,14 @@ def test_recipe_settings_meet(monkeypatch, threshold):
 
 
 def test_data_parallel_gap_refused(monkeypatch):
-    # the 64-user settings before the threshold: 17 to 32 rows per engine
-    # (256 gathered) above the 128-row cap and below the 48-row gate
+    # A 128-row cap and 48-row gate leave 17-32 rows per engine uncovered.
     _set(monkeypatch, 128, 48)
     with pytest.raises(ValueError, match="leave steps between"):
         fused_moe_ep_v3.check_kernel_threshold(ep=8, tp=1)
 
 
 def test_tensor_parallel_gap_refused(monkeypatch):
-    # the 8- to 32-user settings before the threshold: 33 to 1,023 rows
+    # A 32-row cap and 1,024-row SP boundary leave 33-1,023 rows uncovered.
     _set(monkeypatch, 32, 128, 1024)
     with pytest.raises(ValueError, match="leave steps between"):
         fused_moe_ep_v3.check_kernel_threshold(ep=8, tp=8)

@@ -33,21 +33,20 @@ def test_moe_lowtok_scores_fake_matches_the_call():
     with FakeTensorMode():
         x = torch.empty(4, hidden, dtype=torch.bfloat16)
         scores = torch.empty(4, 512, dtype=torch.float32)
-        rank = torch.zeros((), dtype=torch.int32)
-        tables = [torch.zeros(512, dtype=torch.int32) for _ in range(3)] + [
-            torch.full((128, ), -1, dtype=torch.int32) for _ in range(3)
-        ] + [
-            torch.zeros(512, 128, dtype=torch.bfloat16),
-            torch.full((512, ), -1, dtype=torch.int32)
-        ]
+        tables = torch.zeros(1024, dtype=torch.int32)
+        prim = torch.zeros(512, dtype=torch.int32)
+        copy = torch.full((512, ), -1, dtype=torch.int32)
+        hot1h = torch.zeros(512, 128, dtype=torch.bfloat16)
         w13 = torch.empty(local, hidden, 2 * inter, dtype=torch.float8_e4m3fn)
         s13 = torch.empty(local, 1, 1, 2 * inter)
         w2 = torch.empty(local, inter, hidden, dtype=torch.float8_e4m3fn)
         s2 = torch.empty(local, 1, 1, hidden)
         y = scores_op.moe_lowtok_scores_op(x,
                                            scores,
-                                           rank,
-                                           *tables,
+                                           tables,
+                                           prim,
+                                           copy,
+                                           hot1h,
                                            w13,
                                            s13,
                                            w2,

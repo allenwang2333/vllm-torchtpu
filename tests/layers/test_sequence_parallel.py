@@ -220,3 +220,73 @@ def test_decode_batch_flag_raises_above_the_cap(monkeypatch):
     importlib.reload(ai)
     with pytest.raises(ValueError):
         ai.batched_rpa_decode_overrides(64, 16)
+
+
+@pytest.mark.parametrize("positional", [False, True])
+@pytest.mark.parametrize("language_model_only", [None, False, True])
+def test_qk_fusion_checks_positional_multimodal_config(
+        monkeypatch, positional, language_model_only):
+    from types import SimpleNamespace
+
+    import torch
+    from vllm.model_executor.models import qwen3_next
+
+    import vllm_torchtpu
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.vllm import fused_qk_norm_rope_tpu as qk
+
+    class Attention:
+
+        def __init__(self, config, model_config=None):
+            self.attn_output_gate = True
+            self.rotary_emb = SimpleNamespace(is_neox_style=True, rotary_dim=64)
+            self.num_heads = self.num_kv_heads = 1
+            self.head_dim = 256
+            self.q_norm = SimpleNamespace(variance_epsilon=1e-6)
+
+        def _project_qkv_gate(self, qkv, positions):
+            return "original"
+
+    monkeypatch.setattr(envs, "TPU_FUSED_QK_NORM_ROPE", 1)
+    monkeypatch.setattr(qwen3_next, "Qwen3NextAttention", Attention)
+    monkeypatch.setattr(qwen3_next, "_tpu_fused_qk_norm_rope_patch", False,
+                        raising=False)
+    calls = []
+    monkeypatch.setattr(qk, "prebuild", lambda *args: calls.append(args))
+    vllm_torchtpu._patch_qwen3_next_fused_qk_norm_rope_gate()
+    mm = (None if language_model_only is None else
+          SimpleNamespace(language_model_only=language_model_only))
+    model_config = SimpleNamespace(multimodal_config=mm)
+    attention = (Attention(None, model_config) if positional else
+                 Attention(None, model_config=model_config))
+    expected = language_model_only is not False
+    assert attention._tpu_fused_qk == expected
+    assert bool(calls) == expected
+    if not expected:
+        assert attention._project_qkv_gate(
+            torch.empty(1, 1024), torch.tensor([[1], [2], [3]])) == "original"
+
+
+@pytest.mark.parametrize("gathered_rows,expected", [(8, True), (256, True),
+                                                   (512, True), (520, False),
+                                                   (131072, False)])
+def test_dp_combine_caps_output_rows_per_rank(monkeypatch, gathered_rows,
+                                              expected):
+    import torch
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.vllm import small_all_reduce_op as sar
+
+    monkeypatch.setattr(envs, "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 64)
+    monkeypatch.setattr(sar, "_CORES", 8)
+    monkeypatch.setattr(sar, "_DP_COMBINE", True)
+    monkeypatch.setattr(sar, "_RANK", None)
+    monkeypatch.setattr(sar, "_MY_RANK", None)
+    monkeypatch.setattr(sar, "_CORE_OF_RANK", None)
+    calls = []
+    monkeypatch.setattr(sar, "_RS_OP",
+                        lambda x, *args: calls.append(x.shape) or "custom")
+    block = torch.empty(gathered_rows, 4096, dtype=torch.bfloat16,
+                        device="meta")
+    assert (sar.dp_combine(block) == "custom") == expected
+    assert bool(calls) == expected

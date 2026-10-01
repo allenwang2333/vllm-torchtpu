@@ -32,10 +32,9 @@ from .rowquant import FP8, quantize_rows
 def _fp8_dot(rows, weight):
     """[m, k] fp8 against [k, n] fp8, accumulated in f32 as the kernel's
     matrix-unit dots are. Both operands are upcast to bf16 first, which is
-    exact for fp8 values: an fp8 x fp8 dot_general run eagerly on the TPU
-    (outside jit) takes a lossy path (4.2e-3 relative L2 against float64,
-    studies/fp8_dot_probe.py) while the same op under jit, and the bf16
-    dot in either mode, are exact to 1e-8."""
+    exact for fp8 values. The bf16 operands avoid the lossy eager TPU
+    lowering of fp8 dot_general and use float32 accumulation in both
+    eager and jitted execution."""
     return lax.dot_general(rows.astype(jnp.bfloat16),
                            weight.astype(jnp.bfloat16),
                            _DOT,
@@ -131,7 +130,7 @@ def float_grid_rows(rows,
     float32. Exponent code 0 is subnormal; the largest normal is
     (2 - 2**-man_bits) * 2**(2**exp_bits - 1 - bias); ties round to even.
     With exp_bits=2, man_bits=1, bias=1 this matches the native
-    float4_e2m1fn cast bit for bit (checked on the CPU and the TPU)."""
+    float4_e2m1fn format."""
     m, width = rows.shape
     if width % block:
         raise ValueError(f"a row of {width} values is not a whole number of "
@@ -210,16 +209,15 @@ def fused_ep_moe_reference(x,
     `result_scale_dtype` before use).
     token_rows: "fp8" (the token rows rounded to fp8 with one scale per
     row or per token block before the dispatch) or "bf16" (as they are).
-    combine_dtype: "float32" (the stock layer's XLA combine, expert by
-    expert in f32) or "bfloat16" (the kernel's bf16 sum: a token's rows
+    combine_dtype: "float32" (accumulation expert by expert in f32) or "bfloat16" (the kernel's bf16 sum: a token's rows
     in slot order, each row on the wire as bf16 times one bf16
     coefficient, the row's scale and the router weight multiplied in f32
     and rounded once, the terms summed in bf16; fp8 and bf16 result rows
     only).
     activation_block, result_rows and elementwise_dtype: the layer's
-    Config fields; with bfloat16 the compiler's own rounding choices keep
-    the kernel and this reference apart by an fp8 step on a few percent
-    of the values."""
+    Config fields; with bfloat16, compiler fusion can change an
+    intermediate rounding and produce fp8 differences between the kernel
+    and this reference."""
     elementwise = (jnp.float32
                    if elementwise_dtype == "float32" else jnp.bfloat16)
     form = weight_form(weight_format)

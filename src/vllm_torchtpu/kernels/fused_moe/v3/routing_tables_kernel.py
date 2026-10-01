@@ -262,7 +262,7 @@ def _shard_tables_body(*refs,
     the FFN kernel takes, emitted from the prefix step. The pair indices
     read out of the gathered routing messages. The row tables zeroed on
     the first steps. With `hosts_transport`, the transport's middle step
-    (wait round A, issue round B) on the last step."""
+    (forward rounds 2..n as their inputs land) on the last step."""
     it = iter(refs)
     # The shard's index: an SMEM operand (layout.SHARD_INDEX_OPERAND) or
     # the mesh axis.
@@ -502,9 +502,8 @@ def shard_tables_kernel(routing_messages,
     kernel's 7-tuple of shard tables, expert_rows [G], expert_base [G],
     counts, visit_order [G]), then the gathered rows when the call hosts the
     transport's middle step (`transport_refs` = (gathered rows, send sem,
-    receive
-    sems) from the start call. The gathered rows come back aliased with round B
-    issued), then one zeroed table per length in `zero_tables`. Every
+    receive sems) from the start call. The gathered rows come back aliased
+    with the middle rounds issued), then one zeroed table per length in `zero_tables`. Every
     output is placed in HBM.
     """
     n = num_shards * pairs_per_shard

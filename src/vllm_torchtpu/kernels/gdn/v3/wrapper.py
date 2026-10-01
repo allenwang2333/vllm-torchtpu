@@ -22,6 +22,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.gdn.v3 import (compute_conv1d, compute_gdn,
                                           compute_kda, config, memory_ref,
                                           metadata, vmem_ldst)
+from vllm_torchtpu.kernels.gdn.v3 import tables_in_kernel as _tik
 
 
 def inner_kernel(
@@ -44,10 +45,9 @@ def inner_kernel(
 ):
     """Orchestrates computation of Conv1D and GDN for a single tile.
 
-    This kernel acts as a facade adhering to strict separation of concerns. It
-    operates VMEM reference without knowledge on DMA logic. Furthermore, the
-    kernel invokes vmem_ldst to pre-processes data needed for compute and
-    invokes compute_conv1d and compute_gdn for actual compute.
+    This kernel operates on VMEM references while the pipeline handles DMA.
+    It uses vmem_ldst to prepare the data and invokes compute_conv1d and
+    compute_gdn for the arithmetic.
 
     Args:
         qkv_slot_ref: qkv VMEM ref that stores data loaded from HBM.
@@ -85,11 +85,9 @@ def inner_kernel(
     )
 
     # Step 1: Conv1D.
-    # NOTE: Conv1D requires performing sliding window where inputs are slided
-    # across rows. If typical 2D layout was used, multiple rows are stored in a
-    # single register which necessitate costly shuffling for every sliding.
-    # Therefore, it is extremely important to leverage compact layout that
-    # ensures 1 register only stores data from 1 row.
+    # Conv1D slides inputs across rows. Compact layout stores one row per
+    # register, avoiding the register shuffles needed when multiple rows
+    # share a register in a 2D layout.
     qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
     qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
 
@@ -145,9 +143,8 @@ def inner_kernel(
         a_log = jnp.pad(weights_ref.gdn.a_log[...], ((0, padding_size)))
         dt_bias = jnp.pad(weights_ref.gdn.dt_bias[...], ((0, padding_size)))
 
-    # NOTE: Ideally, we want to move this branching logic into gdn.py. However,
-    # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
-    # Passing refs into gdn.py breaks strict separation of concerns.
+    # Activation layout selection uses VMEM references here so compute_gdn.py
+    # receives compute values without depending on VMEM loads and stores.
     if cfg.use_recurrent:
         recurrent_fn = (compute_kda.recurrent_kda
                         if cfg.is_kda else compute_gdn.recurrent_gdn)
@@ -305,6 +302,33 @@ def outer_kernel(
     _run()
 
 
+def outer_kernel_tables_in_kernel(
+    qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref,
+    qkv_ref, b_ref, a_ref, source_ref, _in_act, weights_ref,
+    out_ref, _source_out_ref,
+    *scratch, cfg_b: config.GDNConfig, cfg_p: config.GDNConfig, max_seqs: int,
+    scratch_names: tuple[str, ...],
+):
+    """Both passes in one call, the routing tables built at entry from the raw
+    sequence arrays (tables_in_kernel.py); the per-sequence pass runs only
+    when it has tiles."""
+    sc = dict(zip(scratch_names, scratch))
+    carry_conv = sc.pop("carry_conv_scratch_ref")
+    carry_rec = sc.pop("carry_recurrent_scratch_ref")
+    meta_b, meta_p = _tik.fill_and_wrap(
+        qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref, sc, cfg_b,
+        cfg_p, max_seqs)
+    outer_kernel(meta_b, qkv_ref, b_ref, a_ref, source_ref, source_ref,
+                 None, weights_ref, out_ref, None, None, None, None,
+                 cfg=cfg_b)
+
+    @pl.when(meta_p.num_tiles[...] > 0)
+    def _():
+        outer_kernel(meta_p, qkv_ref, b_ref, a_ref, source_ref, source_ref,
+                     None, weights_ref, out_ref, None, None, carry_conv,
+                     carry_rec, cfg=cfg_p)
+
+
 @jax.jit(
     donate_argnames=("conv_state", "recurrent_state", "state_source"),
     static_argnames=(
@@ -321,6 +345,7 @@ def outer_kernel(
         "state_plan",
         "attention_mode",
         "gate_lower_bound",
+        "gdn_form",
     ),
 )
 def fused_conv1d_gdn(
@@ -352,9 +377,19 @@ def fused_conv1d_gdn(
     num_spec_tokens: int = 0,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
-    # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
-    mixed_tile_size: int = 64,
+    # Tokens per grid step for prompt sequences. None selects 128 when
+    # n_v <= 8 without speculation, and 64 otherwise. Larger tiles increase
+    # unrolled per-row work and the VMEM needed for speculative checkpoints.
+    mixed_tile_size: int | None = None,
+    # The pooled path's form, one explicit choice resolved by the caller
+    # (a static argument, so each form is its own compiled variant):
+    #   "two_calls": the batched pass and the per-sequence pass as two
+    #     Pallas calls, the routing tables as XLA ops in this wrapper;
+    #   "tables": one call with the routing tables filled inside the kernel
+    #     from the raw sequence arrays (rows <= tables_in_kernel.MAX_ROWS,
+    #     no speculation; larger steps fall back to "two_calls").
+    gdn_form: str = "two_calls",
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array,
                                                            jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
@@ -431,7 +466,6 @@ def fused_conv1d_gdn(
             source (aliased in place) instead of the state pair.
         out: Fused output tensor.
     """
-    # TODO(kyuyeunk): Support bf16
     act_out_dtype = qkv.dtype
     pooled = state_plan is not None
     if pooled:
@@ -503,8 +537,13 @@ def fused_conv1d_gdn(
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
+    if mixed_tile_size is None:
+        mixed_tile_size = 128 if (num_spec_tokens == 0 and n_v <= 8) else 64
     decode_tile_size = min(decode_tile_size, batch_size)
     mixed_tile_size = min(mixed_tile_size, batch_size)
+    # The chunked GDN solve requires complete 16-row blocks above 16 rows.
+    if mixed_tile_size > 16:
+        mixed_tile_size = (mixed_tile_size // 16) * 16
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
 
     if num_spec_tokens > 0:
@@ -544,8 +583,6 @@ def fused_conv1d_gdn(
     a = a.reshape(padded_batch_size, 1, -1)
 
     # Step 3: States and weights pre-processing.
-    # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
-    # loading stage.
     if not pooled:
         conv_state_shape = conv_state.shape
         conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
@@ -565,12 +602,7 @@ def fused_conv1d_gdn(
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
 
-    def call_kernel(
-        in_conv_state: jax.Array,
-        in_recurrent_state: jax.Array | None,
-        in_act: jax.Array | None,
-        mode: config.GDNMode,
-    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+    def _cfg_for(mode: config.GDNMode, in_conv_state, in_recurrent_state):
         # With a state source, it rides the conv-state slot and the dense
         # recurrent-state input is absent.
         if mode == config.GDNMode.PER_SEQ:
@@ -605,9 +637,11 @@ def fused_conv1d_gdn(
             ),
             state_plan=state_plan,
         )
+        return cfg
 
-        # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
-        # but will be CSEed by compiler.
+    def _metadata_for(cfg: config.GDNConfig, mode: config.GDNMode):
+        # Step 6: Metadata preprocessing. The compiler can eliminate duplicate
+        # metadata computations across calls within a layer.
         if mode != config.GDNMode.PER_SEQ:
             metadata_obj = metadata.compute_batched_seq_metadata(
                 cfg=cfg,
@@ -629,7 +663,16 @@ def fused_conv1d_gdn(
                 end_seq=distribution[-1],
                 ckpt_indices=ckpt_indices,
             )
+        return metadata_obj
 
+    def call_kernel(
+        in_conv_state: jax.Array,
+        in_recurrent_state: jax.Array | None,
+        in_act: jax.Array | None,
+        mode: config.GDNMode,
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+        cfg = _cfg_for(mode, in_conv_state, in_recurrent_state)
+        metadata_obj = _metadata_for(cfg, mode)
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
 
         # Step 7: Handle case where write needs to be done in existing out.
@@ -682,12 +725,63 @@ def fused_conv1d_gdn(
             weights,
         )
 
+    def call_kernel_tables_in_kernel(in_source: jax.Array):
+        """One call, both passes, the tables built inside from the raw
+        sequence arrays (rows <= _tik.MAX_ROWS, no speculation)."""
+        assert num_spec_tokens == 0 and ckpt_indices is None
+        assert padded_batch_size <= _tik.MAX_ROWS, padded_batch_size
+        cfg_b = _cfg_for(config.GDNMode.BATCHED, in_source, None)
+        cfg_p = _cfg_for(config.GDNMode.PER_SEQ, in_source, None)
+        out_shape = cfg_b.get_out_shape()
+        max_seqs = int(state_indices.shape[0])
+        in_act = jnp.zeros_like(out_shape)
+        scratch = dict(_tik.scratch_shapes(max_seqs, padded_batch_size))
+        scratch.update(cfg_p.get_scratch_shape_dict())
+        names = tuple(scratch)
+        n_raw = 5
+        input_output_aliases = {n_raw + 3: 1, n_raw + 4: 0}
+        return pl.pallas_call(
+            functools.partial(outer_kernel_tables_in_kernel, cfg_b=cfg_b,
+                              cfg_p=cfg_p, max_seqs=max_seqs,
+                              scratch_names=names),
+            out_shape=(in_act, in_source),
+            in_specs=(smem_spec, smem_spec, smem_spec, smem_spec, smem_spec,
+                      hbm_spec, hbm_spec, hbm_spec, hbm_spec, hbm_spec,
+                      weights_spec),
+            out_specs=(hbm_spec, hbm_spec),
+            scratch_shapes=[scratch[n] for n in names],
+            input_output_aliases=input_output_aliases,
+            compiler_params=pltpu.CompilerParams(
+                disable_bounds_checks=True,
+                vmem_limit_bytes=max(cfg_b.get_vmem_limit_bytes(),
+                                     cfg_p.get_vmem_limit_bytes()),
+            ),
+            name=cfg_b.get_kernel_name() + "_tables_in",
+            metadata=cfg_b.get_metadata(),
+        )(query_start_loc.astype(jnp.int32), seq_lens.astype(jnp.int32),
+          state_indices.astype(jnp.int32), read_offsets, distribution.astype(jnp.int32),
+          qkv, b, a, in_source, in_act, weights)
+
     if pooled:
-        out_act, out_source, _ = call_kernel(state_source, None, None,
-                                             config.GDNMode.BATCHED)
-        out_act, out_source, _ = call_kernel(out_source, None, out_act,
-                                             config.GDNMode.PER_SEQ)
-        out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
+        # the forms are static arguments (part of the jit cache key); no
+        # environment is read here -- a switch read inside the traced function
+        # would reuse a cached variant
+        if gdn_form not in ("two_calls", "tables"):
+            raise ValueError(f"gdn_form {gdn_form!r}: two_calls or tables")
+        form = gdn_form
+        if form == "tables" and not (num_spec_tokens == 0
+                                     and padded_batch_size <= _tik.MAX_ROWS):
+            form = "two_calls"
+        if form == "tables":
+            out_act, out_source = call_kernel_tables_in_kernel(state_source)
+        else:
+            out_act, out_source, _ = call_kernel(state_source, None, None,
+                                                 config.GDNMode.BATCHED)
+            out_act, out_source, _ = call_kernel(out_source, None, out_act,
+                                                 config.GDNMode.PER_SEQ)
+        # the kernel's own [batch, heads, head_dim]: the serving op declares that
+        # shape, so no re-layout to a flat row and back at the op boundary
+        out_act = out_act[:batch_size]
         return out_source, out_act
 
     # The first segment holds verify windows of up to `num_spec_tokens + 1`
@@ -697,7 +791,9 @@ def fused_conv1d_gdn(
     out_act, out_conv_state, out_recurrent_state = call_kernel(
         out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ)
 
-    out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
+    # the kernel's own [batch, heads, head_dim]: the serving op declares that
+    # shape, so no re-layout to a flat row and back at the op boundary
+    out_act = out_act[:batch_size]
     out_conv_state = out_conv_state.astype(conv_out_dtype)
     out_conv_state = out_conv_state.reshape(conv_state_shape)
     out_recurrent_state = out_recurrent_state.astype(recurrent_out_dtype)

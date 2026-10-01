@@ -5,7 +5,7 @@
   "extra_slots": 16,
   "slots_per_core": 80,
   "copies": true,
-  "recording": "a per-call routing record of a 32-user run at 8,192 input and 1,024 output tokens, every MoE call of every layer and rank",
+  "recording": "Per-layer expert activation statistics.",
   "algorithm": "the model-level balanced permutation as the primaries, then the 128 experts with the highest recorded activation each given one copy, placed on the core with the least expected load that still has a free slot",
   "rule": "the few-token decode kernel picks, for each copied expert that a step hits, whichever of its two holders has fewer active experts on that step",
   "layers": {

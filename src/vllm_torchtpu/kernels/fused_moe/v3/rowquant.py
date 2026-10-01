@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Per-row dynamic fp8 quantization. Every row that moves between shards
-is quantized by these lines, whether XLA or Mosaic lowers them."""
+"""Dynamic fp8 quantization shared by XLA and Mosaic execution."""
 import jax.numpy as jnp
 
 FP8 = jnp.float8_e4m3fn
@@ -46,10 +45,9 @@ def apply_row_scale(rows, inverse_scale, scalable, dtype=jnp.float32):
     cast (Config.elementwise_dtype). In float32 the product of two bf16
     values is exact and is rounded once, so every compilation of these
     lines agrees to the bit. In bfloat16 the vector unit runs at twice
-    the rate and the product carries a second rounding that a compiler
-    may or may not perform inside a fusion (XLA dropped it for 128-wide
-    blocks and kept it for wider ones), so two compilations can differ by
-    an fp8 step on a few percent of the values.
+    the rate and the product carries a second rounding. Compiler fusion
+    can omit that intermediate rounding, so compilations can produce
+    different fp8 values.
     """
     scaled = rows.astype(dtype) * inverse_scale.astype(dtype)
     return jnp.where(scalable, scaled, jnp.zeros_like(scaled)).astype(FP8)

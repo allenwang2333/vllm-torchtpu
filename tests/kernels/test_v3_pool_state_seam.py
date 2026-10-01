@@ -97,18 +97,17 @@ class TestV3StateSourcePlan:
 
 
 def test_v3_kernel_package_stays_pool_agnostic():
-    """The dense path must be byte-for-byte untouched by the seam: the V3
-    kernel package sees only the generic state-source plan, never the
-    pool (pool knowledge lives in pool_adapters / the pooled caller)."""
+    """The V3 kernel package uses a generic state-source plan.
+    Pool-specific addressing belongs to the adapters and pooled caller."""
     import vllm_torchtpu.kernels.gdn.v3 as v3_pkg
     for path in pathlib.Path(list(v3_pkg.__path__)[0]).glob("*.py"):
         assert "pool_adapters" not in path.read_text(), path
 
 
 # --------------------------------------------------------------------
-# TPU tests below: byte-compat and end-to-end equivalence of the seam
-# against the pre-seam round trip (gather -> dense kernel on identity
-# indices -> scatter), rebuilt here from the surviving adapters.
+# TPU tests: byte compatibility and end-to-end equivalence of direct state
+# streaming and an adapter round trip (gather -> dense kernel on identity
+# indices -> scatter).
 # --------------------------------------------------------------------
 
 
@@ -177,7 +176,7 @@ def _rand_inputs(seed, num_tokens):
 
 
 def _run_roundtrip(pool, idx, kwargs):
-    """The pre-seam pooled V3 path."""
+    """Gather state, run dense V3 on identity indices, and scatter updates."""
     ssm, conv = _read_states(pool, idx)
     identity = jnp.arange(idx.shape[0], dtype=jnp.int32)
     (new_conv, new_ssm), out = wrapper.fused_conv1d_gdn(conv_state=conv,

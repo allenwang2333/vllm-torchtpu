@@ -23,11 +23,15 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PORT="${PORT:-8000}"
-SHARDING="${SHARDING:-DP8_EP}"
 ISL="${ISL:-8192}"
 OSL="${OSL:-1024}"
 CONC="${CONC:-64}"
 MODEL="${MODEL:-Qwen/Qwen3.5-397B-A17B-FP8}"
+# The point's own settings (layout, slots, budget, release group, decode batch, placement) come from the point
+# table, for a standalone launch as for a sweep; anything already set in the environment wins.
+source "$SCRIPT_DIR/points.sh"
+apply_point_defaults "$ISL" "$OSL" "$CONC"
+SHARDING="${SHARDING:-DP8_EP}"
 SERVED_NAME="${SERVED_NAME:-Qwen/Qwen3.5-397B-A17B-FP8}"
 case "$MODEL" in
   gs://*) LOAD_FORMAT="${LOAD_FORMAT:-runai_streamer}" ;;
@@ -45,7 +49,7 @@ EP_SIZE=8
 case "$SHARDING" in
   DP8_EP)
     # Data-parallel attention across all 8 cores + expert-parallel MoE, with
-    # per-concurrency settings in sweep.sh's table.
+    # per-concurrency settings in points.sh.
     DP_SIZE=8
     # New prefills are admitted every step; the router's release rules below
     # line the engines' prompt steps up instead of a longer interval.
@@ -75,9 +79,8 @@ case "$SHARDING" in
     export DP_SCHED_BUFFER_FLUSH_MS="${DP_SCHED_BUFFER_FLUSH_MS:-5000}"
     export DP_SCHED_BUFFER_IDLE_TRIGGER="${DP_SCHED_BUFFER_IDLE_TRIGGER:-1}"
     export DP_SCHED_BUFFER_QUIET_MS="${DP_SCHED_BUFFER_QUIET_MS:-2000}"
-    # The static expert placement (vLLM's EPLB policy on a routing recording
-    # at 128 users), applied when the checkpoint is loaded. Set it to empty
-    # for the checkpoint's own order.
+    # Apply static per-layer expert placement when loading the checkpoint.
+    # Set this to empty to retain the checkpoint's expert order.
     export TPU_EXPERT_PLACEMENT="${TPU_EXPERT_PLACEMENT-$SCRIPT_DIR/expert_placement_dp8_ep8.json}"
     # Split the vocabulary projection across engines (on at every DP8 point).
     export TPU_SHARDED_LM_HEAD="${TPU_SHARDED_LM_HEAD:-1}"
@@ -98,7 +101,6 @@ case "$SHARDING" in
     export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS-$DP8_LIBTPU_INIT_ARGS}"
     # The GDN recurrent state in bf16: half the state memory, and the decode
     # step's state loads and stores through the pool's packed 16-bit view.
-    EXTRA_ARGS=(--mamba-ssm-cache-dtype "${GDN_STATE_DTYPE:-bfloat16}")
     ;;
   TP8_EP)
     # Tensor-parallel attention across all 8 cores + expert-parallel MoE.
@@ -108,7 +110,7 @@ case "$SHARDING" in
       --data-parallel-size=1
       --enable-expert-parallel
     )
-    # sweep.sh sets the attention kernel's decode batch and the expert
+    # points.sh sets the attention kernel's decode batch and the expert
     # placement with copies per point. The few-token MoE kernel on decode-sized steps,
     # the attention kernel's decode VMEM limit, the GDN output's gated norm
     # and fp8 quantisation as one pass, the fused q/k norm, rope and gate,
@@ -165,7 +167,7 @@ MAX_MODEL_LEN_BUFFER="${MAX_MODEL_LEN_BUFFER:-20}"
 MAX_MODEL_LEN=$((ISL + OSL + MAX_MODEL_LEN_BUFFER))
 
 if [ "$SHARDING" = "DP8_EP" ]; then
-  # Per point (sweep.sh's table): the tokens per engine per forward step
+  # Per point (points.sh): the tokens per engine per forward step
   # (the prompt chunk) and the requests per engine, with room for the
   # router to place a prompt on the engine with the fewest in flight. The
   # defaults are the 64-user point's.
@@ -173,15 +175,23 @@ if [ "$SHARDING" = "DP8_EP" ]; then
   MAX_NUM_BATCHED_TOKENS=$(((GLOBAL_MAX_NUM_BATCHED_TOKENS + DP_SIZE - 1) / DP_SIZE))
   MAX_NUM_SEQS="${MAX_NUM_SEQS:-$((CONC * 2 / DP_SIZE))}"
 else
-  # Global num of batched tokens == max(ISL, GLOBAL_BATCHED_TOKENS_MIN).
-  GLOBAL_BATCHED_TOKENS_MIN="${GLOBAL_BATCHED_TOKENS_MIN:-16384}"
-  GLOBAL_BATCHED_TOKEN=$(( ISL > GLOBAL_BATCHED_TOKENS_MIN ? ISL : GLOBAL_BATCHED_TOKENS_MIN ))
-
+  # Honor an explicit global prompt-token budget, including budgets below
+  # the input length. Otherwise use max(ISL, GLOBAL_BATCHED_TOKENS_MIN).
+  if [ -n "${GLOBAL_MAX_NUM_BATCHED_TOKENS:-}" ]; then
+    GLOBAL_BATCHED_TOKEN=$GLOBAL_MAX_NUM_BATCHED_TOKENS
+  else
+    GLOBAL_BATCHED_TOKENS_MIN="${GLOBAL_BATCHED_TOKENS_MIN:-16384}"
+    GLOBAL_BATCHED_TOKEN=$(( ISL > GLOBAL_BATCHED_TOKENS_MIN ? ISL : GLOBAL_BATCHED_TOKENS_MIN ))
+  fi
   MAX_NUM_BATCHED_TOKENS=$(((GLOBAL_BATCHED_TOKEN + DP_SIZE - 1) / DP_SIZE))
-
-  MAX_NUM_SEQS=$((CONC / DP_SIZE))
+  # The running slots: an explicit MAX_NUM_SEQS as given, else one per user.
+  MAX_NUM_SEQS="${MAX_NUM_SEQS:-$((CONC / DP_SIZE))}"
 fi
 [ "$MAX_NUM_SEQS" -lt 1 ] && MAX_NUM_SEQS=1
+
+# Compile at boot so initialization reserves memory through the compile path.
+# Set this to 0 to enable compile-cache reuse.
+export VLLM_DISABLE_COMPILE_CACHE="${VLLM_DISABLE_COMPILE_CACHE:-1}"
 
 # Increase API-server frontend wait time since cold init may take long.
 export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
@@ -190,7 +200,7 @@ export TPU_ACCELERATOR_TYPE=tpu7x
 export USE_MOE_SPARSE_CORE=1
 export ONEHOT_MOE_PERMUTE_THRESHOLD="${ONEHOT_MOE_PERMUTE_THRESHOLD:-32768}"
 
-# Default to v3 which is a bit faster than v2.
+# Select the SparseCore gather-reduce implementation.
 export RAGGED_GATHER_REDUCE_VERSION="${RAGGED_GATHER_REDUCE_VERSION:-v3}"
 
 # Add extra padding
@@ -205,6 +215,13 @@ export TPU_ROPE_CACHE_TRUNCATE="${TPU_ROPE_CACHE_TRUNCATE:-1}"
 
 # Skip padded tokens in the fused MoE so they activate no experts.
 export TPU_MOE_SKIP_PADDED_TOKENS=1
+# Maximum rows for the TP small all-reduce and DP reduce-scatter combine.
+# Set to 0 to disable both custom collectives.
+export TPU_SMALL_ALL_REDUCE_MAX_ROWS="${TPU_SMALL_ALL_REDUCE_MAX_ROWS:-64}"
+# BF16 halves recurrent-state storage relative to float32.
+# Set GDN_STATE_DTYPE=float32 to use FP32 recurrent state.
+GDN_STATE_DTYPE="${GDN_STATE_DTYPE:-bfloat16}"
+EXTRA_ARGS+=(--mamba-ssm-cache-dtype "$GDN_STATE_DTYPE")
 
 args=(
   "$MODEL"
@@ -236,7 +253,10 @@ if [ "${DRY_RUN:-0}" = "1" ]; then
       TPU_RPA_DECODE_BATCH TPU_RPA_DECODE_VMEM_MIB TPU_SP_FP8_GATHER \
       TPU_GDN_FUSED_NORM_QUANT TPU_FUSED_QK_NORM_ROPE TPU_SHARDED_LM_HEAD \
       GLOBAL_MAX_NUM_BATCHED_TOKENS DP_SCHED_BUFFER_THRESHOLD \
-      GDN_STATE_DTYPE LIBTPU_INIT_ARGS; do
+      GDN_STATE_DTYPE TPU_SMALL_ALL_REDUCE_MAX_ROWS TPU_SMALL_ALL_REDUCE_FORM \
+      TPU_GREEDY_TOP_TOKENS TPU_GDN_TABLES_IN_KERNEL \
+      TPU_GDN_DECODE_TILE TPU_GATED_NORM_TILE \
+      TPU_TOKEN_BUCKET_EXTRA TPU_TOKEN_BUCKET_STEP LIBTPU_INIT_ARGS; do
     printf '%s=%s\n' "$key" "${!key-}"
   done
   printf 'vllm serve'; printf ' %q' "${args[@]}"; printf '\n'

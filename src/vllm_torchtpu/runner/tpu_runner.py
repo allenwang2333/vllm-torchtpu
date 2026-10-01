@@ -18,13 +18,11 @@ from importlib import metadata as importlib_metadata
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Iterator, cast
 
-# TODO: Remove this after jax dependency is removed
 import jax
 import numpy as np
 import torch
 import torch_tpu  # noqa: F401
 import vllm.envs as vllm_envs
-# TODO: Remove this after jax dependency is removed
 from jax.sharding import Mesh
 from packaging import version
 from vllm.config import (CUDAGraphMode, VllmConfig,
@@ -207,32 +205,33 @@ def _rollback_offsets_migrate(read_offsets: torch.Tensor, src_t: torch.Tensor,
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def _substitute_placeholder_token(
-        input_ids: torch.Tensor, token_in_tpu_cur_input_indices: torch.Tensor,
-        token_in_tpu_pre_next_tokens_indices: torch.Tensor,
-        next_tokens: torch.Tensor):
+def _substitute_placeholder_token(input_ids: torch.Tensor,
+                                  substitution_indices: torch.Tensor,
+                                  next_tokens: torch.Tensor):
     """Substitute placeholder tokens from TPU for async scheduler.
 
-    Padding scheme (set up by `_apply_async_token_substitution`):
-      - `token_in_tpu_cur_input_indices`: real-slot indices followed by all
+    Padding scheme (set up by `_apply_async_token_substitution`), the two
+    index rows uploaded as one [2, N] tensor in a single host-to-device
+    transfer per step:
+      - row 0, the destination slots: real-slot indices followed by all
         other indices in ascending order; the tail entries re-target slots
         that should keep their current values.
-      - `token_in_tpu_pre_next_tokens_indices`: real `next_tokens` indices
-        followed by `-1` sentinels at the padded positions.
+      - row 1, the source slots in `next_tokens`: real indices followed by
+        `-1` sentinels at the padded positions.
     The `-1` sentinel is the mask source; the program is shape-only so it
     does not recompile when the active count changes.
 
     Args:
         input_ids: device tensor [N] where N is the bucketed input size.
-        token_in_tpu_cur_input_indices: int tensor [N], destination slots.
-        token_in_tpu_pre_next_tokens_indices: int tensor [N], source slots
-            in `next_tokens`; -1 marks a padding slot to leave unchanged.
+        substitution_indices: int tensor [2, N], the two rows above.
         next_tokens: int tensor of tokens from the previous async step.
     Return:
         input_ids with real placeholders replaced; padding slots untouched.
     """
-    assert input_ids.shape[0] == token_in_tpu_cur_input_indices.shape[
-        0] == token_in_tpu_pre_next_tokens_indices.shape[0]
+    assert substitution_indices.shape[0] == 2
+    assert input_ids.shape[0] == substitution_indices.shape[1]
+    token_in_tpu_cur_input_indices = substitution_indices[0]
+    token_in_tpu_pre_next_tokens_indices = substitution_indices[1]
     mask = token_in_tpu_pre_next_tokens_indices > -1
     # clamp_min(0) gives a safe in-range gather index for the -1 sentinel
     # slots; their gathered values are discarded by `mask` in `where`.
@@ -548,8 +547,7 @@ class TPUModelRunner(GPUModelRunner):
         #     individually by `mamba_ckpt_indices`, following vLLM's
         #     `MambaSpec.num_speculative_blocks`. Naming them keeps a block
         #     sized for a single state; holding the whole group in one block
-        #     instead would scale `block_size` with `num_spec` (Qwen3.5-397B
-        #     at TP=1, K=4: 21760 tokens rather than 4352).
+        #     instead scales `block_size` with `num_spec`.
         num_ckpts = 1
         if self.vllm_config.speculative_config is not None:
             num_ckpts = (
@@ -1169,11 +1167,9 @@ class TPUModelRunner(GPUModelRunner):
             f"Total number of cached graphs: {total_graphs}, new: {new_compiled_graphs}, case: {case_str}"
         )
 
-        # A count says four graphs appeared; it does not say which op keeps
-        # producing fresh shapes, which is the only thing that makes a runtime
-        # recompilation actionable. Note the compile seconds: an entry with a
-        # zero duration was served from a cache rather than compiled here, so
-        # it costs nothing even though it counts.
+        # Report op names and compile durations so new runtime shapes can be
+        # identified. A zero duration indicates a cached entry rather than
+        # compilation in this process.
         if fresh:
             secs = sum(map(self._xla_graph_compile_secs, fresh))
             logger.info(
@@ -1860,14 +1856,11 @@ class TPUModelRunner(GPUModelRunner):
         #   e.g. 12 sliding-window + 13 full-attn → max (1 group each)
         #   e.g. 10 full-attn      + 30 mamba     → min (1 attn + 3 mamba)
         #
-        # This duplicates the heuristic from
+        # Keep this heuristic synchronized with
         # `vllm/v1/core/kv_cache_utils.py::_get_kv_cache_groups_uniform_page_size`.
-        # We can't call it directly because vLLM's grouping needs a fully
-        # populated spec dict, while we need the group layout *before* we
-        # can finish creating the specs (padding depends on grouping,
-        # spec creation depends on padding). Keep in sync if that
-        # heuristic ever changes — it has been stable since the hybrid
-        # allocator landed.
+        # The upstream helper requires populated specs, while the padding
+        # used to create those specs depends on the group layout calculated
+        # here.
         num_attn = len(attn_modules)
         num_mamba = len(mamba_modules)
         min_count = min(num_attn, num_mamba)
@@ -1950,16 +1943,16 @@ class TPUModelRunner(GPUModelRunner):
         `cache_config.num_gpu_blocks_override` so the freed HBM grows the
         attention pool.
 
-        Tradeoff vs. the uniform num_blocks layout
-        ------------------------------------------
+        Compact layout
+        --------------
         Mamba state is recurrent: one slot per *active* request, regardless of
         context length. The uniform layout (set by
         `_maybe_set_num_blocks_override`) gives every layer the same
         `num_blocks`, leaving `num_blocks - max_num_reqs` mamba slots idle
         forever. The compact layout caps mamba at `max_num_reqs + 1` (the `+1`
-        is the null/sentinel slot), which is strictly better for any model
-        where `num_blocks > max_num_reqs` — i.e. all production hybrid configs
-        we run. Cost: the GDN op must index mamba state by per-request slot id
+        is the null/sentinel slot), saving memory whenever
+        `num_blocks > max_num_reqs`. The GDN op indexes Mamba state by
+        per-request slot ID
         (`AttentionMetadata.mamba_state_indices`) rather than by
         `block_tables[:, 0]`, since the mamba leading dim is now smaller than
         the attention pool.
@@ -2019,9 +2012,9 @@ class TPUModelRunner(GPUModelRunner):
         avail_per_tensor = avail // group_size
         mamba_per_tensor = (num_mamba_groups * mamba_num_blocks *
                             unpadded_mamba_page_size_bytes)
-        # Falling back to the uniform layout here would pad every block to the
-        # mamba page and silently shrink the pool by ~50x, which surfaces as a
-        # throughput collapse rather than a misconfiguration. Fail loudly.
+        # The uniform fallback pads every block to the Mamba page size and
+        # can sharply reduce attention capacity. Reject insufficient memory
+        # instead of silently changing the requested allocation layout.
         attn_per_tensor_avail = avail_per_tensor - mamba_per_tensor
         if attn_per_tensor_avail <= 0:
             raise ValueError(
@@ -2075,8 +2068,7 @@ class TPUModelRunner(GPUModelRunner):
         checkpoint per window position into `base + t`, and the next step
         reads its initial state from `base + (num_accepted - 1)`. Rejected
         drafts are thus rolled back by *selection*, never by copying. Without
-        spec decode the stride is 1 (one slot per request), matching the
-        original layout.
+        spec decode the stride is 1 (one slot per request).
         """
         stride = self._mamba_slot_stride
         num_groups = (mamba_num_blocks - 1) // stride
@@ -2545,8 +2537,8 @@ class TPUModelRunner(GPUModelRunner):
                 continue
 
             # Map this request's last `n_sched` input slots to its source span
-            # `[position*stride .. +n_sched-1]`. Non-spec (stride 1, n_sched 1)
-            # reduces to the original single-slot mapping.
+            # `[position*stride .. +n_sched-1]`. Non-spec uses one slot per request
+            # with stride 1 and n_sched 1.
             src_start = (self._pre_async_results.req_id_to_index_copy[req_id] *
                          stride)
             for j in range(n_sched):
@@ -2580,11 +2572,10 @@ class TPUModelRunner(GPUModelRunner):
 
         idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
 
-        # Pad according to the instructions written inside
-        # _substitute_placeholder_token: missing = the complement of
-        # cur_input_indices over [0, len(input_ids)). O(n) boolean mask instead
-        # of np.setdiff1d's O(n log n) sort; flatnonzero returns the same
-        # ascending order setdiff1d did over the (sorted, unique) full range.
+        # Pad with the complement of cur_input_indices over
+        # [0, len(input_ids)), as _substitute_placeholder_token requires.
+        # An O(n) Boolean mask and flatnonzero produce the missing indices
+        # in ascending order.
         _missing_mask = np.ones(len(input_ids), dtype=bool)
         _missing_mask[token_in_tpu_cur_input_indices] = False
         missing_values = np.flatnonzero(_missing_mask).astype(np.int32)
@@ -2596,15 +2587,14 @@ class TPUModelRunner(GPUModelRunner):
             mode='constant',
             constant_values=-1)
 
-        cur_input_indices = torch.from_numpy(
-            padded_token_in_tpu_cur_input_indices).to(self.device,
-                                                      non_blocking=True)
-        pre_next_tokens_indices = torch.from_numpy(
-            padded_token_in_tpu_pre_next_tokens_indices).to(self.device,
-                                                            non_blocking=True)
+        # both index rows in one transfer
+        substitution_indices = torch.from_numpy(
+            np.stack((padded_token_in_tpu_cur_input_indices,
+                      padded_token_in_tpu_pre_next_tokens_indices)).astype(
+                          np.int32)).to(self.device, non_blocking=True)
 
         return _substitute_placeholder_token(
-            input_ids, cur_input_indices, pre_next_tokens_indices,
+            input_ids, substitution_indices,
             self._pre_async_results.next_tokens_tpu)
 
     def _flush_disjoint_async_results(self) -> None:
@@ -3387,9 +3377,9 @@ class TPUModelRunner(GPUModelRunner):
                     is_mm_embed = torch.cat([is_mm_embed, pad])
                 is_mm_embed = is_mm_embed.to(input_ids.device)
 
-            # NOTE(woosuk): To unify token ids and soft tokens (vision
-            # embeddings), we always use embeddings (rather than token ids)
-            # as input to the multimodal model, even when the input is text.
+            # Use embeddings for both token IDs and vision inputs to give the
+            # multimodal model one input representation, including text-only
+            # requests.
             inputs_embeds = self.model.embed_input_ids(
                 input_ids,
                 multimodal_embeddings=mm_embeds,
@@ -3620,8 +3610,7 @@ class TPUModelRunner(GPUModelRunner):
         draft_chunks: list[DraftChunkInputs] = []
         is_draft_model = (self._is_async_drafter)
 
-        # NOTE: setup current batch's metadata for kv connector.
-        # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
+        # Set this batch's metadata on the KV connector.
         with set_forward_context(None, self.vllm_config):
             # Raiden overlap: block the worker main thread on the KV load only
             # in inline mode. In the default async mode the load (network pull
@@ -3779,16 +3768,26 @@ class TPUModelRunner(GPUModelRunner):
             sample_hidden_states = (
                 sequence_layout_planner.maybe_select_logits_hidden_states(
                     hidden_states, layout_plan, logits_indices))
+            greedy_top = self._greedy_top_tokens_this_step()
             if sample_hidden_states is None:
                 hidden_states = sequence_layout_planner.finalize_hidden_states(
                     hidden_states,
                     layout_plan,
                 )
-                logits = self.compute_selected_logits(hidden_states,
-                                                      logits_indices)
+                if greedy_top:
+                    # the greedy tokens themselves stand in for the logits
+                    logits = self.compute_selected_top_tokens(
+                        hidden_states, logits_indices)
+                else:
+                    logits = self.compute_selected_logits(
+                        hidden_states, logits_indices)
             else:
-                logits = self.compute_logits_from_hidden_states(
-                    sample_hidden_states)
+                if greedy_top:
+                    logits = self.compute_top_tokens_from_hidden_states(
+                        sample_hidden_states)
+                else:
+                    logits = self.compute_logits_from_hidden_states(
+                        sample_hidden_states)
 
             if self.is_pooling_model:
                 pooling_metadata = self.input_batch.get_pooling_metadata()
@@ -4266,10 +4265,17 @@ class TPUModelRunner(GPUModelRunner):
                 # read offsets so the next step resumes from the group base.
                 self._update_mamba_slot_read_offsets(mamba_indices, None,
                                                      num_reqs)
+                greedy_top = self._greedy_top_tokens_this_step()
+                if greedy_top and grammar_output is not None:
+                    raise NotImplementedError(
+                        "TPU_GREEDY_TOP_TOKENS: structured output needs the "
+                        "full logits; run without the flag for such requests")
                 if grammar_output is not None:
                     logits = self.structured_decoding_manager.mask_logits(
                         logits, grammar_output, cur_start_idx, cur_end_idx)
-                if all_greedy:
+                if greedy_top:
+                    selected_token_ids = logits  # the tokens, [rows, 1] int32
+                elif all_greedy:
                     selected_token_ids = self._greedy_sample(logits)
                 else:
                     temperatures_tpu, top_k_tpu, top_p_tpu = (
@@ -4283,10 +4289,9 @@ class TPUModelRunner(GPUModelRunner):
                         top_k_tpu,
                         top_p_tpu,
                         all_greedy=all_greedy)
-                # NOTE (NickLucche) Use the original logits (before any penalties or
-                # temperature scaling) for the top-k logprobs. We can't enforce it
-                # due to recompilations outside torch.compiled code, so just make
-                # sure `sample_from_logits` does not modify the logits in-place.
+                # Top-k logprobs use the original logits before penalties or
+                # temperature scaling. Keep sample_from_logits free of in-place
+                # logit mutations; copying outside the compiled region can recompile.
                 logprobs = (self.gather_logprobs(logits, selected_token_ids)
                             if needs_logprobs else None)
 
@@ -4602,6 +4607,29 @@ class TPUModelRunner(GPUModelRunner):
         # trims nothing around the op's exchange.
         from vllm_torchtpu.layers.vllm import sharded_lm_head
         sharded_lm_head.install_if_enabled(model, list(self.num_reqs_paddings))
+        # TPU_GREEDY_TOP_TOKENS: the module that owns the head and its logits
+        # processor (Qwen3.5's wrapper keeps them on language_model), for the
+        # vocabulary-parallel argmax of greedy steps without logprobs.
+        self._greedy_head_owner = None
+        if envs.TPU_GREEDY_TOP_TOKENS:
+            for name, mod in model.named_modules():
+                lp = getattr(mod, "logits_processor", None)
+                head = getattr(mod, "lm_head", None)
+                if (lp is not None and head is not None
+                        and hasattr(lp, "get_top_tokens")
+                        and hasattr(head, "shard_indices")):
+                    self._greedy_head_owner = mod
+                    logger.info(
+                        "TPU_GREEDY_TOP_TOKENS: greedy steps without logprobs "
+                        "take the vocabulary-parallel argmax of %s.lm_head "
+                        "(%d ranks); the full logits are neither gathered "
+                        "nor materialised on those steps", name or "model",
+                        int(getattr(head, "tp_size", 1)))
+                    break
+            if self._greedy_head_owner is None:
+                logger.warning(
+                    "TPU_GREEDY_TOP_TOKENS: no module with lm_head and a "
+                    "logits_processor.get_top_tokens found; the flag is off")
         # TPU_NORM_WEIGHT_HOIST: the norms' (1 + w) computed once after loading.
         from vllm_torchtpu.layers.vllm import norm_weight_hoist
         norm_weight_hoist.install_if_enabled(model)
@@ -5146,6 +5174,33 @@ class TPUModelRunner(GPUModelRunner):
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
 
+    def _precompile_compute_selected_top_tokens(self) -> None:
+        if getattr(self, "_greedy_head_owner", None) is None:
+            return
+        hsize = self.model_config.get_hidden_size()
+        with self._precompile_timed("compute_selected_top_tokens"):
+            for num_tokens in self.num_tokens_paddings:
+                dummy_hidden = torch.zeros((num_tokens, hsize),
+                                           device=self.device,
+                                           dtype=self._hidden_states_dtype)
+                for num_reqs in self.num_reqs_paddings:
+                    indices = torch.zeros(num_reqs,
+                                          dtype=torch.int32,
+                                          device=self.device)
+                    out = self.compute_selected_top_tokens(dummy_hidden, indices)
+                    synchronize_tensors(out)
+                    if num_reqs >= min(num_tokens, self.max_num_reqs):
+                        break
+        if (_get_sequence_layout_planner_for_runner(
+                self).uses_selected_logits_hidden_states):
+            with self._precompile_timed("compute_top_tokens_from_hidden_states"):
+                for num_reqs in self.num_reqs_paddings:
+                    dummy_hidden = torch.zeros((num_reqs, hsize),
+                                               device=self.device,
+                                               dtype=self._hidden_states_dtype)
+                    out = self.compute_top_tokens_from_hidden_states(dummy_hidden)
+                    synchronize_tensors(out)
+
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_logits_from_hidden_states"):
@@ -5246,22 +5301,19 @@ class TPUModelRunner(GPUModelRunner):
                 input_ids = torch.zeros(num_tokens,
                                         dtype=torch.int32,
                                         device=self.device)
-                cur_input_indices = torch.zeros(num_tokens,
-                                                dtype=torch.int32,
-                                                device=self.device)
+                # row 0 the destination slots, row 1 the source slots; the
                 # -1 sentinel marks every slot as padding so the precompiled
                 # program is byte-identical to the runtime JIT call.
-                pre_next_tokens_indices = torch.full((num_tokens, ),
-                                                     -1,
-                                                     dtype=torch.int32,
-                                                     device=self.device)
+                substitution_indices = torch.from_numpy(
+                    np.stack((np.zeros(num_tokens, dtype=np.int32),
+                              np.full(num_tokens, -1,
+                                      dtype=np.int32)))).to(self.device)
                 for nlen in next_lens:
                     next_tokens = torch.zeros(nlen,
                                               dtype=torch.int64,
                                               device=self.device)
                     out = _substitute_placeholder_token(
-                        input_ids, cur_input_indices, pre_next_tokens_indices,
-                        next_tokens)
+                        input_ids, substitution_indices, next_tokens)
                     synchronize_tensors(out)
                     logger.info("  -- num_tokens: %d, next_len: %d",
                                 num_tokens, nlen)
@@ -5399,6 +5451,7 @@ class TPUModelRunner(GPUModelRunner):
         if (_get_sequence_layout_planner_for_runner(
                 self).uses_selected_logits_hidden_states):
             self._precompile_compute_logits_from_hidden_states()
+        self._precompile_compute_selected_top_tokens()
         self._precompile_structured_decoding()
         self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
@@ -5647,11 +5700,10 @@ class TPUModelRunner(GPUModelRunner):
 
         Bounded + value-insensitive: only shapes matter, so token/position VALUES
         are irrelevant. Wrapped so any failure degrades to "no warmup" (the first
-        request just pays the bounded recompiles, as before) rather than breaking
-        serving.
+        request performs the bounded recompiles) while serving remains available.
         """
         if os.environ.get("SPEC_WARMUP", "1") == "0":
-            return  # escape hatch / A-B toggle
+            return  # Optional warmup control.
         if self.enforce_eager:
             return
         if not (self._is_async_drafter):
@@ -5883,16 +5935,11 @@ class TPUModelRunner(GPUModelRunner):
                     cur = d.draft_token_ids[0]
         except Exception:
             if quiet:
-                # First attempt: a SymInt from the draft forward's cold compile
-                # can leak into the dynamic=False gather wrapper. The caller
-                # retries once (forward now compiled -> concrete shapes), so log
-                # quietly and let the retry surface a genuine failure.
-                # WARNING, not DEBUG: this except catches a *rank-local*
-                # exception raised inside a *collective* region. The raising
-                # rank unwinds and retries while its peers stay blocked in
-                # the collective, so a swallowed failure here surfaces as a
-                # cluster-wide hang with no log line to explain it. Keep it
-                # visible even on the quiet first attempt.
+                # A SymInt from the draft forward's cold compile can reach the
+                # dynamic=False gather wrapper. The caller retries once with the
+                # forward compiled and returning concrete shapes. Keep the first
+                # failure visible at WARNING: a rank-local exception can unwind this
+                # rank while peers remain blocked in a collective.
                 logger.warning(
                     "spec-decode warmup P=%d first attempt failed; retrying. "
                     "Under DP/EP this can desynchronize ranks — if startup "
@@ -5943,7 +5990,7 @@ class TPUModelRunner(GPUModelRunner):
         except Exception:
             cleanup_succeeded = False
             logger.exception("spec-decode warmup drain failed")
-        # Belt-and-suspenders: drop any synthetic state defensively.
+        # Clear any remaining synthetic request state.
         for r in rids:
             try:
                 self.requests.pop(r, None)
@@ -6550,8 +6597,6 @@ class TPUModelRunner(GPUModelRunner):
 
         # DSv4's packed layout and cache overlays are handled entirely in
         # `_initialize_ds_v4_kv_cache`, so the loop below stays DSv4-free.
-        # TODO(patemotter): replace per-model flags (`_unified_kv_layout`,
-        # `_is_ds_v4`) with per-layout allocation dispatch around a shared tail.
         _is_ds_v4 = any(
             is_cache_for_ds_v4(module) for module in self.vllm_config.
             compilation_config.static_forward_context.values())
@@ -6792,11 +6837,9 @@ class TPUModelRunner(GPUModelRunner):
 
         self._add_shared_kv_cache_aliases(kv_caches)
 
-        # Mark KV cache buffers as donation candidates outside torch.compile
-        # regions to avoid Dynamo tracing through pybind calls.
-        # TODO(geyuhao): Comment out for now as TorchTPU does not support this right now
-        # for kv_cache in kv_caches.values():
-        #     pallas.set_buffer_donor_(kv_cache, True)
+        # This path leaves explicit KV-buffer donor marking disabled because
+        # TorchTPU does not support it here. Any donor marking must occur
+        # outside torch.compile to avoid tracing pybind calls.
 
         # Reset kv_caches list (tpu_bind_kv_cache expects empty list)
         self.kv_caches = []
@@ -6836,7 +6879,6 @@ class TPUModelRunner(GPUModelRunner):
             # Shard KV Cache
             for cache in self.kv_caches:
                 continue
-                # xs.mark_sharding(cache, self.mesh, (None, "x", None, None))
 
         if has_kv_transfer_group():
             kv_connector = get_kv_transfer_group()
@@ -7042,6 +7084,42 @@ class TPUModelRunner(GPUModelRunner):
             self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
 
+    def _greedy_top_tokens_this_step(self) -> bool:
+        """Whether this step's sampled tokens come from the vocabulary-parallel
+        argmax: every request greedy, no logprobs asked, no speculation, a
+        generative model, the head's owner resolved (TPU_GREEDY_TOP_TOKENS)."""
+        return (getattr(self, "_greedy_head_owner", None) is not None
+                and not self.is_pooling_model
+                and self.speculative_config is None
+                and self.input_batch.all_greedy
+                and self.input_batch.max_num_logprobs is None
+                # Grammar masks need the full logits. Inspect request state:
+                # the scheduler's structured-output flag is async-only.
+                and not any(
+                    self.requests[req_id].sampling_params.structured_outputs
+                    is not None
+                    for req_id in self.input_batch.req_ids
+                    if req_id is not None))
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_selected_top_tokens(
+            self, hidden_states: torch.Tensor,
+            indices_do_sample: torch.Tensor) -> torch.Tensor:
+        """The greedy token of each selected row: each rank's argmax over its
+        head slice, the (value, index) pairs exchanged, the winner picked."""
+        selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        owner = self._greedy_head_owner
+        tokens = owner.logits_processor.get_top_tokens(owner.lm_head, selected)
+        return tokens.to(torch.int32).view(-1, 1)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_top_tokens_from_hidden_states(
+            self, hidden_states: torch.Tensor) -> torch.Tensor:
+        owner = self._greedy_head_owner
+        tokens = owner.logits_processor.get_top_tokens(owner.lm_head,
+                                                       hidden_states)
+        return tokens.to(torch.int32).view(-1, 1)
+
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_bonus_and_target_logits(
         self, logits: torch.Tensor, bonus_logits_indices: torch.Tensor,
@@ -7082,8 +7160,6 @@ class TPUModelRunner(GPUModelRunner):
         safe_temperatures = torch.where(temperatures == 0.0, 1.0, temperatures)
         return logits / safe_temperatures
 
-    # TODO: Under SPMD mode, sample_from_logits has correctness issue.
-    #       Re-enable the torch.compile once the issue is fixed in torchxla.
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def sample_from_logits(self,
                            logits: torch.Tensor,
@@ -7171,11 +7247,10 @@ def _get_padded_num_kv_cache_update_slices(num_tokens: int, max_num_reqs: int,
                                            page_size: int) -> int:
     """Calculates the padded number of KV cache update slices to avoid
     recompilation."""
-    # NOTE(chengjiyao): let's say R_i is the token num for i-th request,
-    # so it occupies most 2 + R_i // page_size pages. The total maximum
-    # possible number of pages needed is sum(2 + R_i // page_size), which
-    # is <= 2 * max_num_reqs + sum(R_i) // page_size
-    # = 2 * max_num_reqs + num_tokens // page_size
+    # Let R_i be the token count for request i. It occupies at most
+    # 2 + R_i // page_size pages, so the total is bounded by
+    # 2 * max_num_reqs + sum(R_i) // page_size
+    # = 2 * max_num_reqs + num_tokens // page_size.
     padded_num_slices = 2 * max_num_reqs + num_tokens // page_size
     padded_num_slices = min(padded_num_slices, num_tokens)
     return padded_num_slices
@@ -7189,15 +7264,11 @@ def _prev_power_of_2(n: int) -> int:
 
 
 def _get_num_slices_per_kv_cache_update_block(page_size_bytes: int) -> int:
-    """Find the optimum number of slices to copy per Pallas program instance.
+    """Choose the number of slices copied per Pallas program instance.
 
-    Increasing the number of slices copied in one instance of the kernel program
-    will increase HBM bandwidth utilization via more in-flight DMAs.
-
-    However, it will also use more VMEM, and experimentally, we observed
-    performance regression at 128 slices on v6e, likely due to running
-    out of scalar registers. Thus this function will limit the number of
-    slices to 64.
+    More in-flight DMAs improve HBM bandwidth utilization while using
+    more VMEM and scalar registers. Cap the block at 64 slices to bound
+    that resource pressure.
     """
     # The default vmem_limit_bytes of a pallas kernel is 32MB. Here we
     # calculate num_slices_per_block based on 16MB in case any register spills.

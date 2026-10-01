@@ -93,10 +93,8 @@ def scratch_arrays(experts_per_shard,
              jnp.uint32),
         ]
         if not stream_block:
-            # The CURRENT expert's weights widened to fp8 once, when its
-            # slot becomes current, so a tile's matmul reads fp8 like the
-            # fp8 build's (widening per tile repeated the expert's whole
-            # slab for every tile: 80 times a call at 8192 tokens).
+            # Widen the current expert's weights to fp8 once when its
+            # slot becomes current. Every tile reuses these buffers.
             weights += [
                 ("w1_fp8_vmem", (hidden, w1_cols), FP8),
                 ("w2_fp8_vmem", (slot_inter, hidden), FP8),
@@ -107,10 +105,9 @@ def scratch_arrays(experts_per_shard,
             ("w2_vmem", (weight_slots, slot_inter, hidden), form.weight_dtype),
         ]
         if intermediate == "bf16":
-            # The down matmul's bf16 copy of the CURRENT expert's w2: one
-            # buffer, filled after the expert's w2 lands and consumed by its
-            # tiles (a copy per weight slot would not fit the 64 MiB VMEM
-            # beside three fp8 slots).
+            # The down matmul's bf16 copy of the current expert's w2:
+            # one buffer, filled after w2 lands and reused by every tile
+            # to limit VMEM use independently of the weight-slot count.
             weights.append(
                 ("w2_bf16_vmem", (slot_inter, hidden), jnp.bfloat16))
         if (jnp.dtype(token_dtype) == jnp.dtype(jnp.bfloat16)
@@ -188,7 +185,7 @@ def tile_body_arrays(tile_rows,
     """One tile body's live values besides the scratch, as (name, shape,
     dtype): the first accumulator, the bf16 intermediate column slices,
     their fp8
-    requantization, the second accumulator, its bf16 rows and their fp8
+    requantization, the second accumulator, its bf16 rows and their
     fp8 form, and for four-bit weights the upcast block, double-buffered.
     Counted as though all were live at once, so the estimate is an upper
     bound."""

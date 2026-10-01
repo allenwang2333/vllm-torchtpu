@@ -22,18 +22,20 @@
 #
 # Needs: python3.12, gcloud logged in with access to the Torch TPU registry
 # (README.md), and the model under HF_HOME (or MODEL=gs://... for streaming).
-# Knobs (all optional): REPO, REF, CONCS (default: every point of the
-# sweep), RESULT_DIR, VENV, HF_HOME, MODEL, INFERENCEX_REPO.
+# INFERENCEX_REPO optionally selects an existing clean checkout of the pinned client.
+# Work-directory mode also requires REF as a full release commit SHA.
+# Optional: REPO, CONCS (default: every point), RESULT_DIR, VENV, HF_HOME, MODEL.
 set -euo pipefail
 
 REPO="${REPO:-https://github.com/vllm-project/vllm-torchtpu.git}"
-REF="${REF:-qwen35-fused-ep}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 if [ -n "${1:-}" ]; then
-  # A work directory: the clone is brought to REF as it is on REPO now (a
-  # branch name follows the branch, a commit is taken as is); a clone with
-  # local changes is refused rather than measured.
+  if [[ ! "${REF:-}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: set REF to the full release commit SHA for work-directory mode" >&2
+    exit 1
+  fi
+  # A work directory: check out the exact release commit in a clean clone.
   WORK="$(mkdir -p "$1" && cd "$1" && pwd)"
   ROOT="$WORK/vllm-torchtpu"
   if [ ! -d "$ROOT/.git" ]; then
@@ -50,7 +52,24 @@ else
   VENV="${VENV:-$ROOT/.venv}"
 fi
 RECIPE="$ROOT/scripts/vllm/benchmark/inferencex/qwen3.5"
+if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
+  echo "ERROR: $ROOT has local changes; use a clean release checkout" >&2
+  exit 1
+fi
+if [ -n "${CLIENT:-}" ]; then
+  echo "ERROR: reproduce.sh uses bench.sh; unset CLIENT to reproduce the serving sweep" >&2
+  exit 1
+fi
+source "$RECIPE/check_client.sh"
+prepare_inferencex_client || exit 1
 echo "--- tree: $(git -C "$ROOT" rev-parse HEAD) ($(git -C "$ROOT" status --porcelain | wc -l) local changes) ---"
+
+RESULT_DIR="${RESULT_DIR:-$(mktemp -d /tmp/qwen3.5-inferencex-repro_XXXXXX)}"
+mkdir -p "$RESULT_DIR"
+if [ -n "$(find "$RESULT_DIR" -mindepth 1 -print -quit)" ]; then
+  echo "ERROR: RESULT_DIR must be empty so the table contains only this sweep" >&2
+  exit 1
+fi
 
 # The install as README.md describes it: vLLM built for no device on top of
 # the Torch TPU registry's wheels, with PyPI for the rest. The package is
@@ -61,14 +80,17 @@ if [ ! -x "$VENV/bin/python" ]; then
   "$VENV/bin/pip" install --quiet --upgrade pip
 fi
 echo "--- installing $ROOT into $VENV ---"
+streaming_deps=()
+if [[ "${MODEL:-}" == gs://* || "${LOAD_FORMAT:-}" == runai_streamer ]]; then
+  streaming_deps+=("runai-model-streamer[gcs]")
+fi
 PIP_INDEX_URL="https://oauth2accesstoken:$(gcloud auth print-access-token)@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
   PIP_EXTRA_INDEX_URL="https://pypi.org/simple" VLLM_TARGET_DEVICE="empty" \
-  "$VENV/bin/pip" install --quiet --pre -e "$ROOT"
+  "$VENV/bin/pip" install --quiet --pre -e "$ROOT" "${streaming_deps[@]}"
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
 echo "--- $(vllm --version 2>/dev/null | tail -1); $(pip list 2>/dev/null | grep -iE '^(torch-tpu|torch_tpu|libtpu|jax) ' | tr -s ' ' | tr '\n' ';') ---"
 
-RESULT_DIR="${RESULT_DIR:-/tmp/qwen3.5-inferencex-repro_$(date +%m%d-%H%M)}"
 export RESULT_DIR
 export CONCS="${CONCS:-4 8 16 32 64 128 256 512 1024}"
 echo "--- sweep: CONCS=\"$CONCS\" RESULT_DIR=$RESULT_DIR ---"
@@ -96,12 +118,13 @@ for c, t, ttft, tpot, itl, done, n in sorted(rows):
 table = "\n".join(lines)
 print(table)
 git = lambda *a: subprocess.run(["git", "-C", root, *a], capture_output=True, text=True).stdout.strip()
-infx = os.environ.get("INFERENCEX_REPO", "/tmp/InferenceX")
+infx = os.environ["INFERENCEX_REPO"]
 pins = subprocess.run([sys.executable, "-m", "pip", "freeze"], capture_output=True, text=True).stdout.splitlines()
 json.dump({"commit": git("rev-parse", "HEAD"), "local_changes": git("status", "--porcelain"),
            "inferencex_commit": subprocess.run(["git", "-C", infx, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip(),
-           "pins": [p for p in pins if p.split("==")[0].split(" @ ")[0].lower().replace("_", "-") in
-                    ("vllm", "torch", "jax", "jaxlib", "libtpu", "torch-tpu", "tpu-raiden-torch", "vllm-torchtpu")],
+           "inferencex_expected_commit": os.environ["INFERENCEX_COMMIT"],
+           "inferencex_local_changes": subprocess.run(["git", "-C", infx, "status", "--porcelain"], capture_output=True, text=True).stdout.strip(),
+           "pins": pins,
            "table": table}, open(os.path.join(result_dir, "run.json"), "w"), indent=1)
 open(os.path.join(result_dir, "table.md"), "w").write(table + "\n")
 PY

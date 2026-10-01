@@ -55,8 +55,7 @@ SIDE_EFFECTS = True
 # for the layer's own callers. Under torch_tpu's export bridge `axis_index`
 # lowers to a partition-id that XLA's SPMD partitioner refuses ("partitionId
 # instruction is not supported for SPMD partitioning"), so the
-# bridge's caller sets it True and hands the
-# index in as data; the kernel tree's tests set it on the module.
+# bridge's caller sets it True and supplies the index as data.
 SHARD_INDEX_OPERAND = False
 
 
@@ -69,9 +68,9 @@ def device_coords(peer, mesh_axes=(MESH_AXIS, )):
     if SHARD_INDEX_OPERAND:
         # The dict form, keyed by axis name: it names the mesh axis to Pallas
         # (a NamedAxisEffect) without an axis lookup, so the program's mesh
-        # context is built even though nothing else references the axis --
-        # with the shard's index arriving as data, the tuple form met a 0-D
-        # mesh ("Number of device ids must match the number of mesh axes").
+        # context is built even when nothing else references the axis.
+        # With the shard index supplied as data, the tuple form can leave
+        # the mesh without axes and fail device-coordinate validation.
         # Axes other than MESH_AXIS keep this core's own index.
         return {
             axis: (peer if axis == MESH_AXIS else lax.axis_index(axis))
