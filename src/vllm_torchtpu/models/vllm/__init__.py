@@ -23,3 +23,9 @@ def register_models() -> None:
     ModelRegistry.register_model("K3DSparkModel", _K3_DSPARK_MODEL)
     ModelRegistry.register_model("DSparkDraftModel", _DSV4_DSPARK_MODEL)
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
+
+    from vllm_torchtpu.models.vllm.gemma4_mm_patch import (
+        patch_gemma4_mm_model_classes,
+    )
+
+    patch_gemma4_mm_model_classes()
