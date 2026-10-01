@@ -73,6 +73,28 @@ OWNED_KINDS = ("qkv_a", "q_b", "w_uk", "o_proj", "idx_wk", "gate") + tuple(REPLI
 VIEW_KINDS = ("w_uv",)
 
 
+def make_stack_put_fn(mesh, sharded: bool):
+    """The body of _put_op: (stack, x, [row]) -> stack with row `row` = x, run per rank under
+    shard_map, so the DUS is specialised on this rank's shard ([n, k, ...] and [k, ...]) and needs
+    no collective. A plain jit body keeps the global shapes (the DUS is on [n, R * k, ...]), and
+    torch_tpu specialises the module on this rank's torch shapes: "invalid refinement ...
+    tensor<78x32768x1024xf8E4M3FN> -> tensor<78x2048x1024xf8E4M3FN>" (j-427279cb, every
+    sharded stacked kind). sharded: the kind is EP-concatenated along axis 0 (SHARDED_KINDS), so
+    the stack is P(None, ep) and x is P(ep); else both are replicated. Returns
+    (fn, input_partition_specs, output_partition_spec)."""
+    sspec, xspec = (P(None, EP_AXIS_NAME), P(EP_AXIS_NAME)) if sharded else (P(), P())
+    in_specs = (sspec, xspec, P())
+
+    def body(s_l, x_l, row):
+        return jax.lax.dynamic_update_index_in_dim(s_l, x_l, row[0], 0)
+
+    def put(stk: jax.Array, x: jax.Array, row: jax.Array) -> jax.Array:
+        return jax.shard_map(body, mesh=mesh, in_specs=in_specs, out_specs=sspec,
+                             check_vma=False)(stk, x, row)
+
+    return put, in_specs, sspec
+
+
 class Unsupported(Exception):
     pass
 
@@ -290,16 +312,10 @@ class Glm5Megakernel:
         DUS: no second copy of the stack at load or at an EPLB rebalance)."""
         op = self._put_ops.get(kind)
         if op is None:
-            sh = kind in SHARDED_KINDS
-
-            def put(stk: jax.Array, x: jax.Array, row: jax.Array) -> jax.Array:
-                return jax.lax.dynamic_update_index_in_dim(stk, x, row[0], 0)
-
+            put, in_specs, out_spec = make_stack_put_fn(self.mesh, kind in SHARDED_KINDS)
             op = sharded_jax_callable(
                 f"glm5_megakernel::stack_put_{kind}", put, mesh=self.mesh,
-                input_partition_specs=(P(None, EP_AXIS_NAME) if sh else P(),
-                                       P(EP_AXIS_NAME) if sh else P(), P()),
-                output_partition_specs=P(None, EP_AXIS_NAME) if sh else P(),
+                input_partition_specs=in_specs, output_partition_specs=out_spec,
                 donate_argnums=(0,))
             self._put_ops[kind] = op
         return op
