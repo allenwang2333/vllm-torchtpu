@@ -25,6 +25,7 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     init_distributed_environment,
 )
+from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.torch_utils import set_torch_threads_for_runtime
 from vllm.v1 import utils as vllm_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -693,6 +694,10 @@ class TPUWorker(WorkerBase):
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
+        # Freeze the heap built by load and compile so per-step GC does not
+        # rescan it, as vLLM's GPU worker does.
+        freeze_gc_heap()
+        maybe_attach_gc_debug_callback()
         set_torch_threads_for_runtime()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
