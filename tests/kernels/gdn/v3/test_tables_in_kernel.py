@@ -156,7 +156,10 @@ def _in_kernel_tables(cfg_b, cfg_p, max_seqs, raw):
     names = tuple(scratch)
     num_b = tables_in_kernel.batched_table_size(max_seqs, cfg_b.tile_size)
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
-    out_b, out_p, num_tiles = pl.pallas_call(
+    # Interpret mode is the CPU reference; on a TPU backend it reads some
+    # SMEM entries back wrong, so pin it to the host.
+    cpu = jax.devices("cpu")[0]
+    kernel = pl.pallas_call(
         functools.partial(
             _tables_kernel, cfg_b=cfg_b, cfg_p=cfg_p, max_seqs=max_seqs, names=names
         ),
@@ -169,7 +172,11 @@ def _in_kernel_tables(cfg_b, cfg_p, max_seqs, raw):
         out_specs=(smem, smem, smem),
         scratch_shapes=[scratch[n] for n in names],
         interpret=True,
-    )(*(None if x is None else jnp.asarray(x) for x in raw))
+    )
+    with jax.default_device(cpu):
+        out_b, out_p, num_tiles = kernel(
+            *(None if x is None else jnp.asarray(x) for x in raw)
+        )
     return np.asarray(out_b), np.asarray(out_p), np.asarray(num_tiles)
 
 
