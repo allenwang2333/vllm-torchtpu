@@ -145,6 +145,11 @@ class Tiles:
     # tb: top-k extraction per 128-row block over only the blocks each k chunk spans.
     topk_blk: bool = False
     topk_kc: int = 256
+    # roll: the slow top-k (mask, 16 threshold passes, extraction) as fori loops over 128-row blocks
+    # of the key buffer, so its code no longer grows with max_pages (served MAXP 258: about 11.4k
+    # bundles unrolled); the within-row prefix is written over the consumed keys instead of a
+    # (ROWS, 256) scratch. Bit-identical (integer counts; every one-hot column selects one row).
+    topk_roll: bool = False
 
     def tk(self, K, N, dtype):
         """Largest 128-multiple divisor of K whose (tk, N) tile fits one bank. tk doubles as the
@@ -452,6 +457,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         **({"tk_vt": pltpu.VMEM((ROWS, 256), BF16),
             "tk_acc": pltpu.VMEM((min(tiles.topk_kc, KT), 256), F32),
             "tk_c": pltpu.VMEM((2, 128, 128), F32)} if tiles.topk_blk else {}),
+        **({"tk_acc": pltpu.VMEM((min(tiles.topk_kc, KT), 256), F32),
+            "tk_c": pltpu.VMEM((2, 128, 128), F32)} if tiles.topk_roll else {}),
         "idx_s": pltpu.SMEM((NC, 128), I32),
         "idx_v": pltpu.VMEM((NC, 128), I32),
         "misc_sem": pltpu.SemaphoreType.DMA(()),
@@ -1012,6 +1019,15 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 # the scan wrote order-preserving keys (INT_MIN = invalid); rows past its pages hold
                 # stale keys from an earlier layer
                 keys = scr["keys"]
+                if tiles.topk_roll:
+                    assert not tiles.topk_blk
+                    T = vtopk.threshold_roll(keys, K, seq_len)
+                    vtopk.extract_roll(keys, T, K, idx_v, scr["tk_acc"], scr["tk_c"],
+                                       kc=tiles.topk_kc)
+                    cp = pltpu.make_async_copy(idx_v, idx_s, scr["misc_sem"])
+                    cp.start()
+                    cp.wait()
+                    return
                 p_ = (lax.broadcasted_iota(I32, (ROWS, 128), 0) * 128
                       + lax.broadcasted_iota(I32, (ROWS, 128), 1))
                 keys[...] = jnp.where(p_ >= seq_len, INT_MIN, keys[...])

@@ -215,3 +215,151 @@ def extract_blk(keys_ref, T, K, idx_v, vt_ref, acc_ref, cc_ref, kc=256):
         for q in range(kc // 128):
             idx_v[c0 // 128 + q:c0 // 128 + q + 1, :] = tokr[:, q * 128:(q + 1) * 128]
     return n_sel
+
+
+def _blk(ref, b):
+    return ref[pl.ds(pl.multiple_of(b * 128, 128), 128), :]
+
+
+def _cnt8(m):
+    """(128, 128) bool -> (8, 128) i32 partial counts (vreg adds only)."""
+    return jnp.sum(m.astype(I32).reshape(16, 8, 128), axis=0)
+
+
+def threshold_roll(keys_ref, K, seq_len):
+    """The kernel's slow-path key mask (positions >= seq_len -> INT_MIN, in place) and threshold()'s
+    16 2-bit radix passes, each a fori loop over 128-row blocks: same counts, code independent of
+    ROWS. Returns T (the K-th largest key)."""
+    NBK = keys_ref.shape[0] // 128
+    ri = lax.broadcasted_iota(I32, (128, 128), 0)
+    li = lax.broadcasted_iota(I32, (128, 128), 1)
+
+    def mask(b, c):
+        r0 = pl.multiple_of(b * 128, 128)
+        pos = (b * 128 + ri) * 128 + li
+        keys_ref[pl.ds(r0, 128), :] = jnp.where(pos >= seq_len, jnp.int32(INT_MIN),
+                                                keys_ref[pl.ds(r0, 128), :])
+        return c
+    lax.fori_loop(0, NBK, mask, 0)
+
+    def pass_(i, p):
+        sh = jnp.int32(30) - 2 * i
+        cs = [(p | shl(jnp.int32(k), sh)) ^ jnp.int32(INT_MIN) for k in (1, 2, 3)]
+
+        def body(b, acc):
+            kb = _blk(keys_ref, b)
+            return tuple(a + _cnt8(kb >= c) for a, c in zip(acc, cs))
+        z = jnp.zeros((8, 128), I32)
+        acc = lax.fori_loop(0, NBK, body, (z, z, z))
+        dig = jnp.int32(0)
+        for a in acc:
+            dig = dig + (jnp.sum(a) >= K).astype(I32)
+        return p | shl(dig, sh)
+    p = lax.fori_loop(0, 16, pass_, jnp.int32(0))
+    return p ^ jnp.int32(INT_MIN)
+
+
+def extract_roll(keys_ref, T, K, idx_v, acc_ref, cc_ref, kc=256):
+    """extract_blk() with every per-block loop a fori loop and no (ROWS, 256) scratch: once a
+    block's selection is known, its within-row inclusive prefix (<= 128, exact) is written over its
+    keys, and each row's (r_hi, r_lo, CE_hi, CE_lo) tail is rebuilt from cc_ref in the chunk loop.
+    The prefix and tail columns are separate matmuls (independent output columns), so the result is
+    bit-identical to extract() / extract_blk(). keys_ref is consumed (the kernel rewrites every row
+    before the next read). acc_ref (kc, 256) f32, cc_ref (2, 128, 128) f32."""
+    ROWS = keys_ref.shape[0]
+    assert ROWS % 128 == 0 and K % 128 == 0 and K <= 2 ** 15 and ROWS <= 128 * 128
+    NBK = ROWS // 128
+    kc = min(kc, K)
+    assert K % kc == 0
+    ri = lax.broadcasted_iota(I32, (128, 128), 0)
+    li = lax.broadcasted_iota(I32, (128, 128), 1)
+
+    def posb(b):
+        return (b * 128 + ri) * 128 + li
+
+    def cnt(b, c):
+        kb = _blk(keys_ref, b)
+        return c[0] + _cnt8(kb > T), c[1] + _cnt8(kb == T)
+    z = jnp.zeros((8, 128), I32)
+    cgt, ceq = lax.fori_loop(0, NBK, cnt, (z, z))
+    n_gt = jnp.sum(cgt)
+    n_eq = jnp.sum(ceq)
+    need_eq = jnp.where(T == jnp.int32(INT_MIN), 0, K - n_gt)
+    excess = n_eq > need_eq
+    PB = (ROWS * 128).bit_length()
+
+    def pbit(i, p):
+        cand = p | shl(jnp.int32(1), jnp.int32(PB - 1) - i)
+
+        def body(b, cv):
+            return cv + _cnt8((_blk(keys_ref, b) == T) & (posb(b) < cand))
+        cv = lax.fori_loop(0, NBK, body, jnp.zeros((8, 128), I32))
+        return jnp.where(jnp.sum(cv) <= need_eq, cand, p)
+    P = lax.fori_loop(0, jnp.where(excess, PB, 0), pbit, jnp.int32(0))
+    P = jnp.where(excess, P, jnp.int32(INT_MAX))
+
+    ones8 = jnp.ones((8, 128), BF16)
+    upper = (ri <= li).astype(BF16)                                          # [l', l] = l' <= l
+    cc_ref[0] = jnp.zeros((128, 128), F32)
+
+    def sel_blk(b, c):
+        r0 = pl.multiple_of(b * 128, 128)
+        kb = keys_ref[pl.ds(r0, 128), :]
+        selb = ((kb > T) | ((kb == T) & (posb(b) < P))).astype(F32).astype(BF16)
+        cc_ref[0, pl.ds(b, 1), :] = lax.dot_general(ones8, selb, NT, preferred_element_type=F32)[0:1]
+        keys_ref[pl.ds(r0, 128), :] = lax.dot_general(
+            selb, upper, NN, preferred_element_type=F32).astype(I32)             # within-row incl
+        return c
+    lax.fori_loop(0, NBK, sel_blk, 0)
+    C = cc_ref[0]                                                            # [b, j]
+    n_sel = jnp.sum(C).astype(I32)
+    W = lax.dot_general(C.astype(BF16), upper, NN, preferred_element_type=F32)
+    tot = W[:, 127:128]
+    th = jnp.floor(tot * (1.0 / 128))
+    tl = tot - 128 * th
+    Ls = (li < ri).astype(BF16)                                              # Ls[b, b'] = b' < b
+    off = (128 * lax.dot_general(Ls, jnp.broadcast_to(th, (128, 128)).astype(BF16), NN,
+                                 preferred_element_type=F32)
+           + lax.dot_general(Ls, jnp.broadcast_to(tl, (128, 128)).astype(BF16), NN,
+                             preferred_element_type=F32))
+    CI = W + off
+    CE = CI - C
+    cc_ref[0] = CE
+    cc_ref[1] = CI
+
+    valid = ri < NBK
+
+    def chunk(ci, c):                     # k chunk [c0, c0 + kc): a loop too (K // kc bodies -> 1)
+        c0 = ci * kc
+        kr = (c0 + lax.broadcasted_iota(I32, (kc, 1), 0)).astype(F32)       # (kc, 1)
+        r_first = jnp.sum(((cc_ref[1] <= c0) & valid).astype(I32))       # CI, CE re-read: not
+        r_end = jnp.sum(((cc_ref[0] < c0 + kc) & valid).astype(I32))     # live across the loop
+        b_lo = r_first // 128
+        b_hi = jnp.maximum((r_end + 127) // 128, b_lo)
+        acc_ref[...] = jnp.zeros(acc_ref.shape, F32)
+
+        def body(b, c):
+            ce_r = cc_ref[0, pl.ds(b, 1), :]                                 # (1, 128)
+            ci_r = cc_ref[1, pl.ds(b, 1), :]
+            oht = ((ce_r <= kr) & (kr < ci_r)).astype(F32).astype(BF16)      # (kc, 128)
+            r0 = pl.multiple_of(b * 128, 128)
+            pre = keys_ref[pl.ds(r0, 128), :].astype(F32).astype(BF16)
+            ce_c = jnp.transpose(jnp.broadcast_to(ce_r, (128, 128)))         # [r, *] = CE[b, r]
+            ceh = jnp.floor(ce_c * (1.0 / 128))
+            tail = jnp.where(li == 0, b.astype(F32), jnp.where(li == 1, ri.astype(F32), jnp.where(
+                li == 2, ceh, jnp.where(li == 3, ce_c - 128 * ceh, 0.0)))).astype(BF16)
+            acc_ref[:, 0:128] += lax.dot_general(oht, pre, NN, preferred_element_type=F32)
+            acc_ref[:, 128:256] += lax.dot_general(oht, tail, NN, preferred_element_type=F32)
+            return c
+        lax.fori_loop(b_lo, b_hi, body, 0)
+        RT = acc_ref[...]                                                    # (kc, 256)
+        rr = 128 * RT[:, 128:129] + RT[:, 129:130]
+        ce = 128 * RT[:, 130:131] + RT[:, 131:132]
+        lane = jnp.sum((RT[:, 0:128] <= kr - ce).astype(F32), axis=1, keepdims=True)
+        tok = jnp.where(kr < n_sel.astype(F32), rr * 128 + lane, -1.0)       # (kc, 1)
+        tokr = jnp.transpose(jnp.broadcast_to(tok, (kc, 128)))[0:1].astype(I32)   # (1, kc)
+        for q in range(kc // 128):
+            idx_v[pl.ds(ci * (kc // 128) + q, 1), :] = tokr[:, q * 128:(q + 1) * 128]
+        return c
+    lax.fori_loop(0, K // kc, chunk, 0)
+    return n_sel

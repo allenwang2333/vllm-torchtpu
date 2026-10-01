@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     GLM5_LIBTPU_EXTRA_ARGS: str = ""
     GLM5_MK_DECODE_REPLICAS: int = 0
     GLM5_MK_DECODE_REPLICAS_PROFILE: str = ""
+    GLM5_MK_TOPK_ROLL: int = 0
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -654,6 +655,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With GLM5_MK_DECODE_REPLICAS: an EPLB log npz (VLLM_TPU_EPLB_LOG_DIR format: `layers`,
     # `logical_load`) whose load places the replicas at load time and whenever EPLB has not run.
     "GLM5_MK_DECODE_REPLICAS_PROFILE": env_str("GLM5_MK_DECODE_REPLICAS_PROFILE", ""),
+    # 1: the megakernel's slow indexer top-k runs as loops over 128-row key blocks (Tiles.topk_roll)
+    # instead of statically unrolled over max_pages; bit-identical, about -9k bundles at MAXP 258.
+    "GLM5_MK_TOPK_ROLL": env_int("GLM5_MK_TOPK_ROLL", 0),
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.

@@ -755,7 +755,8 @@ class Glm5Megakernel:
         """The compiled step; `skip` (kernel.ABLATIONS) and `tag` are for GLM5_MEGAKERNEL_BISECT."""
         cfg = self.cfg
         dbg = self.layerdiff and not skip
-        call, info = K.build(cfg, nb=self.nb, max_pages=self.max_pages, tiles=K.Tiles(trace=envs.GLM5_MEGAKERNEL_TRACE),
+        call, info = K.build(cfg, nb=self.nb, max_pages=self.max_pages, tiles=K.Tiles(trace=envs.GLM5_MEGAKERNEL_TRACE,
+                                                                         topk_roll=bool(envs.GLM5_MK_TOPK_ROLL)),
                              debug=dbg, skip=skip, rope_packed=self.rope_packed,
                              # the served kinds: owned weights (_stack_knobs), and the caches
                              # the runner allocated stacked (bind_caches)
