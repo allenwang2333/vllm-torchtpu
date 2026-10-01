@@ -126,8 +126,10 @@ def kernel_main(
   # buffers, so without this it must order them conservatively. Slot rotation is
   # already synchronized by the DMA semaphores. Mirrors what our kernel does at
   # fused_unpermute_gmm/kernel.py:53. See b/519211134#comment14.
-  # To reproduce his original, replace with plain `scratch.ring_vmem`.
-  ring_vmem = pltpu.annotate(scratch.ring_vmem, no_hazard_no_deps=True)
+  if hasattr(pltpu, "annotate"):
+    ring_vmem = pltpu.annotate(scratch.ring_vmem, no_hazard_no_deps=True)
+  else:
+    ring_vmem = scratch.ring_vmem
   ring = memory_ref.RowRing(
       hbm_ref=lhs_hbm_ref if permute else out_hbm_ref,
       vmem_ref=ring_vmem,
