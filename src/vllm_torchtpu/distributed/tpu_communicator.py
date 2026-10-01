@@ -90,4 +90,6 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         dp = get_dp_group()
         if dp.world_size == 1:
             return hidden_states
-        return dp.reduce_scatter(hidden_states, dim=0)
+        return small_all_reduce_op.dp_combine_or(
+            hidden_states, lambda x: dp.reduce_scatter(x, dim=0)
+        )
