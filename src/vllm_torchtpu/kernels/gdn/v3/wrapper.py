@@ -30,6 +30,9 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     tables_in_kernel,
     vmem_ldst,
 )
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 # The chunked pass inverts its triangular matrix in blocks of this many rows
 # (compute_gdn.invert_triangular_matrix), so a longer tile must be a multiple.
@@ -596,7 +599,8 @@ def fused_conv1d_gdn(
             per-sequence pass as two calls over XLA-built routing tables;
             "tables" runs both in one call that builds the tables in SMEM
             (`tables_in_kernel`), falling back to "two_calls" above
-            `tables_in_kernel.MAX_ROWS` rows.
+            `tables_in_kernel.MAX_ROWS` rows or when the call's VMEM need
+            (`tables_in_kernel.vmem_limit_bytes`) exceeds the chip's VMEM.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -881,9 +885,10 @@ def fused_conv1d_gdn(
 
     def call_kernel_tables_in_kernel(
         in_source: jax.Array,
+        cfg_b: config.GDNConfig,
+        cfg_p: config.GDNConfig,
+        vmem_limit_bytes: int,
     ) -> tuple[jax.Array, jax.Array]:
-        cfg_b = make_cfg(config.GDNMode.BATCHED, in_source, None)
-        cfg_p = make_cfg(config.GDNMode.PER_SEQ, in_source, None)
         in_act = jnp.zeros_like(cfg_b.get_out_shape())
         num_ckpts = 0 if ckpt_indices is None else ckpt_indices.shape[1]
         scratch = tables_in_kernel.scratch_shapes(
@@ -923,9 +928,7 @@ def fused_conv1d_gdn(
             input_output_aliases={num_raw + 3: 1, num_raw + 4: 0},
             compiler_params=pltpu.CompilerParams(
                 disable_bounds_checks=True,
-                vmem_limit_bytes=max(
-                    cfg_b.get_vmem_limit_bytes(), cfg_p.get_vmem_limit_bytes()
-                ),
+                vmem_limit_bytes=vmem_limit_bytes,
             ),
             name=cfg_b.get_kernel_name() + "_tables_in_kernel",
             metadata=cfg_b.get_metadata(),
@@ -943,7 +946,22 @@ def fused_conv1d_gdn(
         and padded_batch_size <= tables_in_kernel.MAX_ROWS
     )
     if use_tables:
-        out_act, out_source = call_kernel_tables_in_kernel(state_source)
+        cfg_b = make_cfg(config.GDNMode.BATCHED, state_source, None)
+        cfg_p = make_cfg(config.GDNMode.PER_SEQ, state_source, None)
+        tables_vmem_bytes = tables_in_kernel.vmem_limit_bytes(cfg_b, cfg_p)
+        vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+        use_tables = tables_vmem_bytes <= vmem_capacity_bytes
+        if not use_tables:
+            logger.warning_once(
+                "GDN tables form needs %d B of VMEM for both passes, above the "
+                "%d B the chip has; using two calls.",
+                tables_vmem_bytes,
+                vmem_capacity_bytes,
+            )
+    if use_tables:
+        out_act, out_source = call_kernel_tables_in_kernel(
+            state_source, cfg_b, cfg_p, tables_vmem_bytes
+        )
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act
 

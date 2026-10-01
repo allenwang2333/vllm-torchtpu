@@ -19,6 +19,7 @@ its sequence's initial-state flag, state slot, read offset and checkpoint
 blocks.
 """
 
+import dataclasses
 import functools
 
 import jax
@@ -530,3 +531,125 @@ def test_mixed_tile_size_default_traces_for_any_rows(rows, num_spec_tokens, tile
     # The chunked pass only accepts tiles of at most 16 rows or a multiple of
     # 16; tracing fails otherwise.
     assert _per_seq_tile_size(8, num_spec_tokens, rows=rows) == tile_size
+
+
+# Qwen3.5-397B's GDN layer per device: 16 key and 64 value heads split eight
+# ways under TP8, whole under DP8, over the HND fp8 attention pool (2 KV heads
+# per device under DP8, 1 under TP8).
+_PROD = {
+    "TP8": dict(n_kq=2, n_v=8, payload=(2, 64, 4)),
+    "DP8": dict(n_kq=16, n_v=64, payload=(4, 64, 4)),
+}
+_PAGE = 128
+
+
+def _prod_tables_calls(monkeypatch, shard, rows, max_seqs, num_spec_tokens=0):
+    """(name, vmem_limit_bytes) of each pallas_call at production geometry."""
+    from vllm_torchtpu.kernels import pool_adapters
+    from vllm_torchtpu.kernels.gdn.v3 import wrapper
+
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+    g = _PROD[shard]
+    n_kq, n_v = g["n_kq"], g["n_v"]
+    dim = n_kq * _D_K * 2 + n_v * _D_V
+    tok_bytes = int(np.prod(g["payload"]))
+    ssm_ntok = n_v * _D_K * _D_V * 4 // tok_bytes
+    conv_ntok = 1
+    while conv_ntok * tok_bytes < (_KERNEL_SIZE - 1) * dim * 2:
+        conv_ntok *= 2
+    split = pl.cdiv(ssm_ntok + conv_ntok, _PAGE)
+    pool = jax.ShapeDtypeStruct((5 * split, *g["payload"], _PAGE), jnp.float8_e4m3fn)
+    plan = pool_adapters.v3_state_source(
+        pool,
+        split=split,
+        ssm_ntok=ssm_ntok,
+        conv_tok0=ssm_ntok,
+        conv_ntok=conv_ntok,
+        conv_dim=dim,
+        n_v=n_v,
+        d_k=_D_K,
+        d_v=_D_V,
+        kernel_size=_KERNEL_SIZE,
+    )
+    n = max_seqs
+    ckpt = jnp.zeros((n, num_spec_tokens + 1), jnp.int32) if num_spec_tokens else None
+
+    def run(source):
+        return wrapper.fused_conv1d_gdn(
+            jnp.zeros((rows, dim)),
+            jnp.zeros((rows, n_v)),
+            jnp.zeros((rows, n_v)),
+            None,
+            None,
+            jnp.zeros((dim, 1, _KERNEL_SIZE)),
+            None,
+            jnp.zeros((n_v,)),
+            jnp.zeros((n_v,)),
+            jnp.zeros((n + 1,), jnp.int32),
+            jnp.zeros((n,), jnp.int32),
+            jnp.zeros((3,), jnp.int32),
+            jnp.zeros((n,), jnp.int32),
+            jnp.zeros((n,), jnp.int32),
+            ckpt,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=_D_K,
+            d_v=_D_V,
+            kernel_size=_KERNEL_SIZE,
+            state_source=source,
+            state_plan=plan,
+            num_spec_tokens=num_spec_tokens,
+            gdn_form="tables",
+        )
+
+    return [
+        (eqn.params["name"], eqn.params["compiler_params"].vmem_limit_bytes)
+        for eqn in _pallas_eqns(jax.make_jaxpr(run)(pool))
+    ]
+
+
+def _carry_bytes(shard):
+    # f32 carry scratch of the per-sequence pass: the recurrent state, and the
+    # conv state's (kernel_size - 1, 1, dim) with each 1-row slab padded to 8
+    # sublanes.
+    g = _PROD[shard]
+    dim = g["n_kq"] * _D_K * 2 + g["n_v"] * _D_V
+    return 4 * (g["n_v"] * _D_K * _D_V + (_KERNEL_SIZE - 1) * 8 * dim)
+
+
+@pytest.mark.usefixtures("_v7x_info")
+class TestTablesFormVmem:
+    """The one call holds the per-sequence carry scratch through the batched
+    pass, so its limit is the batched pass's own plus that scratch. At DP8
+    that is above the passes' own limit (the call failed to compile at it)
+    and still within v7x's VMEM."""
+
+    @pytest.mark.parametrize(
+        ("shard", "rows", "max_seqs"),
+        [("DP8", 64, 40), ("DP8", 128, 40), ("TP8", 64, 64), ("TP8", 256, 64)],
+    )
+    def test_one_call_budgets_both_passes(self, monkeypatch, shard, rows, max_seqs):
+        capacity = pltpu.get_tpu_info().vmem_capacity_bytes
+        batched = int(config.GDNConfig.DEFAULT_VMEM_FRACTION * capacity)
+        [(name, limit)] = _prod_tables_calls(monkeypatch, shard, rows, max_seqs)
+        assert name == "fused_conv1d_gdn_batched_tables_in_kernel"
+        assert limit == batched + _carry_bytes(shard)
+        assert limit <= capacity
+
+    def test_spec_keeps_one_call(self, monkeypatch):
+        [(name, limit)] = _prod_tables_calls(monkeypatch, "DP8", 32, 8, 3)
+        assert name == "fused_conv1d_gdn_batched_w4_tables_in_kernel"
+        assert limit <= pltpu.get_tpu_info().vmem_capacity_bytes
+
+    def test_falls_back_when_both_passes_do_not_fit(self, monkeypatch):
+        # A verify window's batched pass already takes 90% of VMEM; on a chip
+        # with 48 MiB the DP8 carry scratch no longer fits beside it.
+        info = dataclasses.replace(
+            pltpu.get_tpu_info(), vmem_capacity_bytes=48 * 1024 * 1024
+        )
+        monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+        # The chip info is read at trace time, so this shape is traced nowhere
+        # else in this module.
+        calls = _prod_tables_calls(monkeypatch, "DP8", 48, 12, 3)
+        names = [name for name, _ in calls]
+        assert names == ["fused_conv1d_gdn_batched_w4", "fused_conv1d_gdn_per_seq"]

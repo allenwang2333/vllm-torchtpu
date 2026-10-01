@@ -21,6 +21,7 @@ the wrapper's XLA tables.
 """
 
 import dataclasses
+import math
 from typing import Any
 
 import jax
@@ -93,6 +94,31 @@ def scratch_shapes(
     if num_ckpts:
         shapes["tp_ckpt"] = pltpu.SMEM((max_seqs * num_ckpts,), jnp.int32)
     return shapes
+
+
+def _vmem_bytes(ref: Any, info: Any) -> int:
+    """Bytes of a VMEM scratch, its two minor dims padded to whole tiles."""
+    *major, rows, cols = ref.shape
+    sublanes = info.num_sublanes * 4 // jnp.dtype(ref.dtype).itemsize
+    rows = pl.cdiv(rows, sublanes) * sublanes
+    cols = pl.cdiv(cols, info.num_lanes) * info.num_lanes
+    return math.prod(major) * rows * cols * jnp.dtype(ref.dtype).itemsize
+
+
+def vmem_limit_bytes(cfg_b: config.GDNConfig, cfg_p: config.GDNConfig) -> int:
+    """Scoped VMEM the one-call form needs, from each pass's own limit.
+
+    Each pass's pipeline buffers are scoped to that pass, so the call peaks at
+    one pass's limit plus what of the other pass stays live across it: the
+    per-sequence carry scratch, held through the batched pass.
+    """
+    info = pltpu.get_tpu_info()
+    carry = sum(
+        _vmem_bytes(ref, info)
+        for ref in cfg_p.get_scratch_shape_dict().values()
+        if ref is not None
+    )
+    return max(cfg_b.get_vmem_limit_bytes() + carry, cfg_p.get_vmem_limit_bytes())
 
 
 def fill_and_wrap(
