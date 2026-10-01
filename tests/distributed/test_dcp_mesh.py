@@ -117,3 +117,83 @@ def test_the_plain_accessors_survive_an_uninitialized_group(monkeypatch, world_s
     monkeypatch.setattr(dcp, "get_dcp_group", lambda: group)
     assert dcp.get_dcp_rank() == world_size - 1
     assert dcp.get_dcp_world_size() == world_size
+
+
+class _FakeDevice:
+    def __init__(self, device_id):
+        self.id = device_id
+
+
+def _world_mesh_setup(monkeypatch, my_ids, all_rows, world_size):
+    """Fake one rank of a world whose DCP groups are `all_rows` (device ids)."""
+    import types
+
+    monkeypatch.setattr(dcp, "get_dcp_group", lambda: _FakeGroup(range(len(my_ids))))
+    monkeypatch.setattr(dcp, "_torch_world_size", lambda: world_size)
+    monkeypatch.setattr(
+        dcp,
+        "get_dcp_group_layout",
+        lambda: mesh_utils.CpGroupLayout(
+            ranks=tuple(range(len(my_ids))),
+            device_ids=tuple(my_ids),
+            rank_in_group=0,
+            world_size=len(my_ids),
+        ),
+    )
+
+    def _gather(out, obj, group=None):
+        for i in range(len(out)):
+            out[i] = all_rows[i // len(my_ids)]
+
+    import torch
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", _gather)
+    import vllm.distributed.parallel_state as ps
+
+    monkeypatch.setattr(
+        ps, "get_world_group", lambda: types.SimpleNamespace(cpu_group=None)
+    )
+    import jax
+
+    devices = [_FakeDevice(i) for i in range(world_size)]
+    monkeypatch.setattr(jax, "devices", lambda: devices)
+    created = {}
+
+    class _Mesh:
+        def __init__(self, devs, axis_names):
+            created["ids"] = [[d.id for d in row] for row in devs]
+            created["axis_names"] = axis_names
+
+    monkeypatch.setattr(jax.sharding, "Mesh", _Mesh)
+    dcp._WORLD_MESH_CACHE.clear()
+    return created
+
+
+def test_a_dcp_group_smaller_than_the_world_gets_a_world_wide_mesh(monkeypatch):
+    """TorchTPU compiles op-local programs over the whole world, so a mesh over
+    only the DCP group fails at compile time ("tile_assignment should have 8
+    devices but has 4"). Each row must be one DCP group, in its rank order, and
+    the DCP axis must be the minor one so P("dcp") shards within a group."""
+    rows = [(0, 1, 4, 5), (6, 7, 2, 3)]
+    created = _world_mesh_setup(monkeypatch, rows[1], rows, world_size=8)
+    dcp.get_or_create_dcp_mesh()
+    assert created["axis_names"] == (dcp.DCP_REPLICA_AXIS_NAME, dcp.DCP_AXIS_NAME)
+    assert created["ids"] == [list(r) for r in sorted(rows)]
+
+
+def test_a_dcp_group_equal_to_the_world_keeps_the_one_axis_mesh(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(dcp, "get_dcp_group", lambda: _FakeGroup(range(8)))
+    monkeypatch.setattr(dcp, "_torch_world_size", lambda: 8)
+    monkeypatch.setattr(
+        dcp, "get_or_create_cp_mesh", lambda axis_name, group: seen.setdefault("g", group)
+    )
+    dcp.get_or_create_dcp_mesh()
+    assert seen["g"].world_size == 8
+
+
+def test_dcp_groups_that_do_not_partition_the_world_are_refused(monkeypatch):
+    rows = [(0, 1, 2, 3), (0, 1, 2, 3)]
+    _world_mesh_setup(monkeypatch, rows[0], rows, world_size=8)
+    with pytest.raises(RuntimeError, match="do not partition"):
+        dcp.get_or_create_dcp_mesh()
