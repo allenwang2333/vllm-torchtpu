@@ -171,10 +171,19 @@ KV_LAYOUT_BY_VLLM_LAYOUT: dict[VllmKVCacheLayout, batched_rpa_configs.KVLayout] 
 
 
 def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
+    parallel = vllm_config.parallel_config
+    if parallel.prefill_context_parallel_size > 1:
+        # PCP streaming loads one request's page table into VMEM. The SMEM
+        # bound below applies to the non-PCP batched attention page table.
+        return 1
     max_num_page_per_req = (
         1024 * 1024 // 2 // vllm_config.scheduler_config.max_num_seqs // 4
     )
-    min_page_size = cdiv(vllm_config.model_config.max_model_len, max_num_page_per_req)
+    # DCP partitions KV pages across ranks. Keep the SMEM page-table bound
+    # using the maximum rank-local context length, rounded up for a tail.
+    dcp_size = parallel.decode_context_parallel_size
+    local_max_model_len = cdiv(vllm_config.model_config.max_model_len, dcp_size)
+    min_page_size = cdiv(local_max_model_len, max_num_page_per_req)
     min_page_size = 1 << (min_page_size - 1).bit_length()
     return min_page_size
 
@@ -983,6 +992,14 @@ class PallasAttentionBackendImpl(AttentionImpl):
             entry_kwargs = {}
             if "kv_layout" in entry_params:
                 entry_kwargs["kv_layout"] = self.kv_layout
+            elif self._pool_is_seq_along_lane:
+                raise NotImplementedError(
+                    "VLLM_KV_CACHE_LAYOUT=HND allocated SEQ_ALONG_LANE pages for this "
+                    f"layer, but its kernel {self._kernel_entry.__name__} takes no "
+                    "kv_layout and would read them as HEAD_ALONG_SUBLANE. The runner "
+                    "binds this kernel to a tp=1 speculative draft; raise the draft's "
+                    "tensor parallel size, or use VLLM_KV_CACHE_LAYOUT=NHD."
+                )
             if "decode_query_size" in entry_params:
                 entry_kwargs["decode_query_size"] = self.decode_query_size
             if block_major:
@@ -2041,6 +2058,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             request_distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
             nope_spec, rope_spec = layer.mla_kv_spec
+            # Recorded when the KV cache is allocated, which precedes tracing.
+            allow_masked_dense = getattr(layer, "allow_masked_dense", False) is True
             return sparse_mla_attention(
                 ql_nope,
                 q_pe,
@@ -2058,6 +2077,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 rope_spec,
                 sm_scale=layer.scale,
                 k_scale=k_scale,
+                allow_masked_dense=allow_masked_dense,
             )
 
         op_name = f"pallas::sparse_mla_attention_{layer.layer_name.replace('.', '_')}"
