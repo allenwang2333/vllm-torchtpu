@@ -64,7 +64,7 @@ def test_small_block_takes_the_all_reduce_kernel(armed, rows):
     assert block is x and rank is op._RANK
 
 
-@pytest.mark.parametrize("rows", [1, 16, 24])
+@pytest.mark.parametrize("rows", [1, 16, 40])
 def test_small_combine_takes_the_reduce_scatter_kernel(armed, rows):
     _, rs = armed
     x = _block(rows * CORES)
@@ -90,8 +90,8 @@ def test_large_block_falls_back_and_reads_the_rank(armed, call, rows):
     rs.assert_not_called()
 
 
-@pytest.mark.parametrize("rows_per_engine,armed_expected", [(24, True), (25, False)])
-def test_combine_cap_is_24_rows_per_engine(armed, rows_per_engine, armed_expected):
+@pytest.mark.parametrize("rows_per_engine,armed_expected", [(40, True), (41, False)])
+def test_combine_cap_is_40_rows_per_engine(armed, rows_per_engine, armed_expected):
     _, rs = armed
     op.dp_combine_or(_block(rows_per_engine * CORES), _fallback)
     assert rs.called is armed_expected

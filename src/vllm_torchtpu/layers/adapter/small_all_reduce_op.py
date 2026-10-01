@@ -51,9 +51,11 @@ logger = init_logger(__name__)
 # Largest TP all-reduce, in rows, the kernel takes: at H=4096 bf16 on 8 cores
 # two-shot beats XLA through 96 rows, loses from 128 (j-e6f25e61, j-de6349e8).
 MAX_ROWS = 96
-# Largest DP combine, in rows per engine, the reduce-scatter takes: it beats
-# XLA through 24 rows, ties at 32 and loses at 64 (j-de6349e8).
-COMBINE_MAX_ROWS = 24
+# Largest DP combine, in rows per engine, the reduce-scatter takes: measured
+# crossover between 40 and 48 (j-a8d66cde, j-e6f25e61, j-de6349e8). The win
+# relies on XLA lowering psum_scatter to a full all-reduce when rows per engine
+# is not a multiple of 16, which depends on libtpu: re-measure on a bump.
+COMBINE_MAX_ROWS = 40
 
 _AR_OP = None
 _RS_OP = None
