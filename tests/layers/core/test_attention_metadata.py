@@ -27,6 +27,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutDescriptor,
     SequenceLayoutKind,
 )
+from vllm_torchtpu.utils import CachedUpload
 
 
 class TestAttentionMetadataBuilderPlumbing:
@@ -44,8 +45,7 @@ class TestAttentionMetadataBuilderPlumbing:
         runner.most_model_len = most_model_len
         runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
         runner._block_table_stage_cpu = None
-        runner._block_table_stage_last = None
-        runner._block_table_stage_dev = None
+        runner._block_table_upload = CachedUpload()
         runner.attn_groups = []
         runner._unified_kv_layout = False
 
@@ -611,7 +611,7 @@ class TestBlockTableUploadSkip:
 
     def _stage(self, runner, num_reqs, num_reqs_padded=4):
         """Stage one step; returns its tables and whether it re-uploaded."""
-        before = runner._block_table_stage_dev
+        before = runner._block_table_upload._device
         ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=0,
@@ -621,7 +621,7 @@ class TestBlockTableUploadSkip:
             request_distribution=torch.tensor([num_reqs] * 3, dtype=torch.int32),
         )
         stage_block_table_uploads(runner, ctx, num_reqs_padded)
-        return ctx.staged_block_tables, runner._block_table_stage_dev is not before
+        return ctx.staged_block_tables, runner._block_table_upload._device is not before
 
     @staticmethod
     def _expected(table, num_reqs, num_reqs_padded=4):

@@ -141,7 +141,11 @@ from vllm_torchtpu.tracing.utils import (
     extract_kv_lens_for_tracing,
     extract_request_ids_for_tracing,
 )
-from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
+from vllm_torchtpu.utils import (
+    CachedUpload,
+    synchronize_device,
+    synchronize_tensors,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -827,9 +831,7 @@ class TPUModelRunner(GPUModelRunner):
         )
         self.seq_lens_np = self.seq_lens_cpu.numpy()
         self._block_table_stage_cpu: torch.Tensor | None = None
-        # Last staged contents and their device copy, to skip unchanged uploads.
-        self._block_table_stage_last: torch.Tensor | None = None
-        self._block_table_stage_dev: torch.Tensor | None = None
+        self._block_table_upload = CachedUpload()
         if self.supports_mm_inputs:
             self.is_mm_embed_cpu = torch.zeros(
                 self.max_num_tokens,

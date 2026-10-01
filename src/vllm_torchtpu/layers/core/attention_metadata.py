@@ -496,18 +496,10 @@ def stage_block_table_uploads(
             offset += num_reqs_padded * target_num_blocks
     # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
 
-    # Re-upload only when the staged rows change (a page boundary, requests
+    # Re-uploads only when the staged rows change (a page boundary, requests
     # joining, finishing, being preempted or reordered, spec tokens being
-    # rejected). Comparing contents covers every cause. The previous device
-    # tensor is replaced, never written, so an execution still reading it is
-    # unaffected.
-    last = runner._block_table_stage_last
-    if last is not None and last.numel() == total and torch.equal(last, flat):
-        staged_dev = runner._block_table_stage_dev
-    else:
-        staged_dev = flat.to(runner.device, non_blocking=True)
-        runner._block_table_stage_last = flat.clone()
-        runner._block_table_stage_dev = staged_dev
+    # rejected); comparing contents covers every cause.
+    staged_dev = runner._block_table_upload(flat, runner.device)
 
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices
