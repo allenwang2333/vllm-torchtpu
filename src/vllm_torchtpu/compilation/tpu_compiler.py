@@ -208,6 +208,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # `get_pallas_op_mesh` decides whether the DSv4 Pallas ops are built with
     # the wrapper mesh or with none, like `build_ep_mesh` above.
     "vllm_torchtpu/models/vllm/vllm_model_wrapper_context.py",
+    "vllm_torchtpu/models/vllm/deepseek_v41",
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
