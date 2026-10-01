@@ -88,7 +88,6 @@ if TYPE_CHECKING:
     USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
-    TPU_SPARSE_MLA_TOPK_PREFIX_WIDTH: str = "0"
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
     TPU_KV_TRANSFER_PORT: str = "9100"
@@ -375,9 +374,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel picks a wide enough width either way ("auto" from the data,
     # an explicit N by falling back), so this trades speed, never the
     # answer. Each distinct width is a separate compilation.
-    "TPU_SPARSE_MLA_TOPK_PREFIX_WIDTH": lambda: (
-        os.getenv("TPU_SPARSE_MLA_TOPK_PREFIX_WIDTH") or "0"
-    ),
     # NoPE and RoPE KV cache layouts allocated for sparse MLA.
     "TPU_SPARSE_MLA_NOPE_LAYOUT": env_with_choices(
         "TPU_SPARSE_MLA_NOPE_LAYOUT", "sparsecore", ["sparsecore", "tensorcore"]

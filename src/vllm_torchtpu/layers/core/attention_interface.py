@@ -1094,13 +1094,6 @@ def sparse_mla_attention_dcp(
             f"got {nope_spec.layout.value} and {rope_spec.layout.value}"
         )
     cache_layout = nope_spec.layout.value
-    # Opt-in: most of a DCP rank's top-k row is `-1` padding. "auto"
-    # lets the kernel size the window from the batch's own kv_lens.
-    prefix_setting = envs.TPU_SPARSE_MLA_TOPK_PREFIX_WIDTH
-    if prefix_setting == sparse_mla_kernel.AUTO_TOPK_PREFIX:
-        prefix_width = sparse_mla_kernel.AUTO_TOPK_PREFIX
-    else:
-        prefix_width = int(prefix_setting) or None
 
     def _local(
         ql_nope,
@@ -1156,7 +1149,6 @@ def sparse_mla_attention_dcp(
             return_lse=True,
             # The kernel defaults to tensorcore; the caches follow the spec.
             cache_layout=cache_layout,
-            topk_prefix_width=prefix_width,
         )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).

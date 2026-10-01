@@ -516,46 +516,6 @@ def prepare_outputs(
 # The KV entries referenced by `topk_indices` (including the current batch's
 # own tokens) must already be resident in the caches before this call;
 # per-token kv_lens derive from the "-1" padding in `topk_indices`.
-AUTO_TOPK_PREFIX = "auto"
-# Below this a gather's fixed costs dominate, so a narrower rung buys nothing.
-_PREFIX_LADDER_MIN_WIDTH = 64
-# Each rung is a separate Pallas instantiation of the whole unrolled chunk
-# loop, so this bounds compile time and executable HBM, not correctness.
-_PREFIX_LADDER_MAX_RUNGS = 4
-
-
-def _prefix_width_ladder(
-    topk: int,
-    min_width: int = _PREFIX_LADDER_MIN_WIDTH,
-    max_rungs: int = _PREFIX_LADDER_MAX_RUNGS,
-) -> tuple[int, ...]:
-    """Candidate gather widths, ascending, always ending at `topk`.
-
-    Halving from `topk` down. A rung must be a multiple of 32 for the native
-    SparseCore atom arithmetic, which also satisfies the ROPE packing multiple
-    of 4. `topk` itself is always included, so the widest rung can never
-    truncate and the ladder needs no separate overflow guard.
-    """
-    rungs = [topk]
-    width = topk
-    while len(rungs) < max_rungs:
-        width //= 2
-        if width < min_width or width % 32 != 0:
-            break
-        rungs.append(width)
-    return tuple(sorted(rungs))
-
-
-def _select_rung(ladder: tuple[int, ...], needed: jax.Array) -> jax.Array:
-    """Index of the narrowest rung that holds `needed` columns.
-
-    Clamps to the last rung, which `_prefix_width_ladder` guarantees is
-    `topk`, so an over-wide `needed` selects the full width rather than
-    truncating.
-    """
-    return jnp.sum(jnp.asarray(ladder[:-1], jnp.int32) < needed)
-
-
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -569,7 +529,6 @@ def _select_rung(ladder: tuple[int, ...], needed: jax.Array) -> jax.Array:
         "sparsecore_atoms_per_batch",
         "sparsecore_gather_wait_mode",
         "sparsecore_gather_pipelined",
-        "topk_prefix_width",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -596,7 +555,6 @@ def sparse_ragged_paged_attention(
     sparsecore_atoms_per_batch: int = 16,
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
-    topk_prefix_width: int | str | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -627,21 +585,6 @@ def sparse_ragged_paged_attention(
         overlaps ROPE work.
       sparsecore_gather_pipelined: Whether to pipeline native SparseCore gather
         serving.
-      topk_prefix_width: Gather and attend to only the leading columns of
-        `topk_indices`. Under DCP each rank owns about `topk / dcp_size` of a
-        token's global top-k, so most of every row is "-1" padding that
-        costs a gather and a full-width einsum to produce and then mask
-        away. Because the padding is a contiguous suffix, a prefix slice
-        drops exactly the padding.
-
-        `None` (default) uses the full `topk`. `"auto"` picks the width per
-        call from the data: the widest `kv_len` in the batch selects the
-        narrowest rung of `_prefix_width_ladder` that fits, via a
-        `lax.switch`. A width cannot be a traced value because it is a
-        shape -- the native SparseCore gather takes `out_size` as a static
-        argument -- so `"auto"` compiles one variant per rung and chooses
-        between them at runtime. An explicit `int` pins one width and
-        falls back to the full width for any batch that overflows it.
         Every mode returns the same answer; they differ in cost.
 
     Returns:
@@ -856,33 +799,14 @@ def sparse_ragged_paged_attention(
                 f"the sequence count ({max_num_seqs})"
             )
 
-    auto_prefix = topk_prefix_width == AUTO_TOPK_PREFIX
-    if isinstance(topk_prefix_width, str) and not auto_prefix:
-        raise ValueError(
-            f"topk_prefix_width ({topk_prefix_width!r}) must be an int, "
-            f"{AUTO_TOPK_PREFIX!r} or None"
-        )
-    if auto_prefix:
-        prefix_ladder = _prefix_width_ladder(topk)
-    else:
-        prefix_width = topk if topk_prefix_width is None else topk_prefix_width
-        if prefix_width <= 0 or prefix_width > topk:
-            raise ValueError(
-                f"topk_prefix_width ({topk_prefix_width}) must be in (0, {topk}]"
-            )
-        _validate_width(prefix_width, "topk_prefix_width")
-        prefix_ladder = (prefix_width,)
-
     kv_lens = jnp.sum(topk_indices != -1, axis=-1)
 
-    def physical_indices_for(width):
-        """Cache addresses for the first `width` columns of each row."""
-        # Safe to slice because `-1` is suffix padding: the top-k producer
-        # left-packs the real winners, so a prefix drops only padding.
-        row_indices = topk_indices[:, :width]
+    def physical_indices_for():
+        """Cache addresses for every column of each row."""
+        row_indices = topk_indices
         is_padding = row_indices == -1
-        flat_element_index = jnp.arange(q.shape[0] * width, dtype=jnp.int32).reshape(
-            q.shape[0], width
+        flat_element_index = jnp.arange(q.shape[0] * topk, dtype=jnp.int32).reshape(
+            q.shape[0], topk
         )
         if page_indices is not None:
             tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
@@ -923,11 +847,11 @@ def sparse_ragged_paged_attention(
         else None
     )
 
-    def run_all_chunks(width, q_cur, lse_cur):
-        physical_indices = physical_indices_for(width)
+    def run_all_chunks(q_cur, lse_cur):
+        physical_indices = physical_indices_for()
         # Taken before the hot-spot scatter above rewrites every `-1`
         # into a real address: by gather time the sentinels are gone.
-        live_columns = (topk_indices[:, :width] != -1).astype(jnp.int32)
+        live_columns = (topk_indices != -1).astype(jnp.int32)
         for i in range(num_chunks):
             start_pos = i * gather_and_attention_chunk_size
             end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
@@ -957,7 +881,7 @@ def sparse_ragged_paged_attention(
                 )
                 * kernel_batch_size
             )
-            num_valid_indices = jnp.maximum(0, batch_end - start_pos) * width
+            num_valid_indices = jnp.maximum(0, batch_end - start_pos) * topk
 
             # For prefilling of short sequences (or early in the sequence), there
             # are very few number of KVs in the sequence, so different qs'
@@ -976,7 +900,7 @@ def sparse_ragged_paged_attention(
                         cache_kv_nope,
                         cache_kv_rope,
                         indices,
-                        out_size=chunk_size * width,
+                        out_size=chunk_size * topk,
                         live=live,
                         atoms_per_batch=sparsecore_atoms_per_batch,
                         wait_mode=sparsecore_gather_wait_mode,
@@ -984,10 +908,10 @@ def sparse_ragged_paged_attention(
                     )
                 )
                 gathered_nope_buffer = gathered_nope_buffer.reshape(
-                    chunk_size, width, 128
+                    chunk_size, topk, 128
                 )
                 gathered_rope_buffer = gathered_rope_buffer.reshape(
-                    chunk_size, width // native_sc_gather.ROPE_PACKING, 128
+                    chunk_size, topk // native_sc_gather.ROPE_PACKING, 128
                 )
             else:
                 gathered_nope_buffer, gathered_rope_buffer = dsa_gather.dsa_gather(
@@ -998,11 +922,11 @@ def sparse_ragged_paged_attention(
                 )
                 gathered_nope_buffer = gathered_nope_buffer.reshape(
                     chunk_size,
-                    width * kv_cache_utils.WORD_BYTES,
+                    topk * kv_cache_utils.WORD_BYTES,
                     kv_cache_utils.TILE_LANE_BYTES,
                 )
                 gathered_rope_buffer = gathered_rope_buffer.reshape(
-                    chunk_size, width, -1
+                    chunk_size, topk, -1
                 )
             # We treat each query token as a one independent sequence, attend to
             # their respective gathered kv tokens in the `gathered_kv_buffer`.
@@ -1023,32 +947,7 @@ def sparse_ragged_paged_attention(
                 q_cur = result
         return q_cur, lse_cur
 
-    if prefix_ladder == (topk,):
-        q, lse = run_all_chunks(topk, q, lse)
-    else:
-        # Rows past the last scheduled token are never attended, so their
-        # kv_lens must not widen the choice.
-        token_span = lax.broadcasted_iota(jnp.int32, (q.shape[0],), 0)
-        scheduled = token_span < cu_q_lens[distribution[2]]
-        needed = jnp.max(jnp.where(scheduled, kv_lens, 0))
-        # Truncating a row with kv_len > width would silently drop real
-        # winners -- the kv_len masks inside the kernel cannot detect it --
-        # so picking a wide enough rung is correctness, not just speed.
-        if auto_prefix:
-            # Narrowest rung >= needed. The last rung is `topk` and
-            # kv_len <= topk, so this cannot select a truncating width.
-            branches = [
-                (lambda qq, ll, w=w: run_all_chunks(w, qq, ll)) for w in prefix_ladder
-            ]
-            q, lse = lax.switch(_select_rung(prefix_ladder, needed), branches, q, lse)
-        else:
-            q, lse = lax.cond(
-                needed <= prefix_width,
-                lambda qq, ll: run_all_chunks(prefix_width, qq, ll),
-                lambda qq, ll: run_all_chunks(topk, qq, ll),
-                q,
-                lse,
-            )
+    q, lse = run_all_chunks(q, lse)
 
     # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     out = prepare_outputs(q, actual_num_q_heads, actual_head_dim)
