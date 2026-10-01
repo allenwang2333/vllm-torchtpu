@@ -88,7 +88,7 @@ if TYPE_CHECKING:
     USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
-    TPU_SPARSE_MLA_TOPK_PREFIX_WIDTH: int = 0
+    TPU_SPARSE_MLA_TOPK_PREFIX_WIDTH: str = "0"
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
     TPU_KV_TRANSFER_PORT: str = "9100"
@@ -367,13 +367,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE": env_bool(
         "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", default=False
     ),
-    # Attend to only the first N columns of each sparse-MLA top-k row.
+    # "auto", or the number of leading columns of a sparse-MLA top-k row
+    # to attend to.
     # Under DCP a rank owns about topk/dcp_size of a token's global
     # top-k, so the rest of the row is `-1` padding that still costs a
     # gather, a DMA, VMEM and a full-width einsum. 0 = full width. The
-    # kernel falls back to the full width for any batch that overflows,
-    # so this trades speed only, never the answer.
-    "TPU_SPARSE_MLA_TOPK_PREFIX_WIDTH": lambda: int(
+    # kernel picks a wide enough width either way ("auto" from the data,
+    # an explicit N by falling back), so this trades speed, never the
+    # answer. Each distinct width is a separate compilation.
+    "TPU_SPARSE_MLA_TOPK_PREFIX_WIDTH": lambda: (
         os.getenv("TPU_SPARSE_MLA_TOPK_PREFIX_WIDTH") or "0"
     ),
     # NoPE and RoPE KV cache layouts allocated for sparse MLA.

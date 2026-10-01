@@ -57,7 +57,10 @@ def _build_problem(rng, kv_lens, *, k_scale=1.0, topk=TOPK):
     page_table = rng.permutation(pages).astype(np.int32)
     inverse_page_table = np.argsort(page_table)
     physical = np.stack(
-        [rng.choice(cache_tokens, size=topk, replace=False) for _ in range(query_tokens)]
+        [
+            rng.choice(cache_tokens, size=topk, replace=False)
+            for _ in range(query_tokens)
+        ]
     ).astype(np.int32)
     logical = (
         inverse_page_table[physical // page_size] * page_size + physical % page_size
@@ -163,9 +166,64 @@ class TopkPrefixWidthTest(parameterized.TestCase):
 
         np.testing.assert_allclose(narrow, wide, rtol=1e-3, atol=1e-3)
 
+    @parameterized.parameters(*LAYOUTS)
+    def test_auto_matches_wide_when_rows_are_short(self, layout):
+        """Every row fits a narrow rung, so `auto` must pick one and still agree."""
+        rng = np.random.default_rng(20260930)
+        kv_lens = rng.integers(1, 61, size=QUERY_TOKENS)
+        problem = _build_problem(rng, kv_lens)
+
+        wide = _attend(problem, layout)
+        auto = _attend(problem, layout, topk_prefix_width=sparse_mla.AUTO_TOPK_PREFIX)
+
+        np.testing.assert_allclose(auto, wide, rtol=1e-3, atol=1e-3)
+
+    @parameterized.parameters(*LAYOUTS)
+    def test_auto_matches_wide_when_a_row_needs_the_top_rung(self, layout):
+        """One long row must pull the whole batch up to a rung that holds it."""
+        rng = np.random.default_rng(20260930)
+        kv_lens = rng.integers(1, 61, size=QUERY_TOKENS)
+        kv_lens[11] = TOPK  # only the widest rung fits this
+        problem = _build_problem(rng, kv_lens)
+
+        wide = _attend(problem, layout)
+        auto = _attend(problem, layout, topk_prefix_width=sparse_mla.AUTO_TOPK_PREFIX)
+
+        np.testing.assert_allclose(auto, wide, rtol=1e-3, atol=1e-3)
+
+    def test_ladder_is_descending_halves_ending_at_topk(self):
+        # Rungs must be multiples of 32 for the native SparseCore atom math.
+        self.assertEqual(sparse_mla._prefix_width_ladder(2048), (256, 512, 1024, 2048))
+        self.assertEqual(sparse_mla._prefix_width_ladder(256), (64, 128, 256))
+        self.assertEqual(sparse_mla._prefix_width_ladder(64), (64,))
+        # 50 is not a multiple of 32, so halving stops immediately.
+        self.assertEqual(sparse_mla._prefix_width_ladder(100), (100,))
+        for topk in (64, 100, 256, 2048):
+            ladder = sparse_mla._prefix_width_ladder(topk)
+            self.assertEqual(ladder[-1], topk, "widest rung must never truncate")
+            self.assertEqual(list(ladder), sorted(ladder))
+            self.assertLessEqual(len(ladder), 4, "compile ladder must stay bounded")
+
+    def test_rung_selection_picks_the_narrowest_that_fits(self):
+        ladder = (256, 512, 1024, 2048)
+
+        def pick(n):
+            return ladder[int(sparse_mla._select_rung(ladder, jnp.int32(n)))]
+
+        self.assertEqual(pick(1), 256)
+        self.assertEqual(pick(256), 256)
+        self.assertEqual(pick(257), 512)
+        self.assertEqual(pick(1024), 1024)
+        self.assertEqual(pick(1025), 2048)
+        self.assertEqual(pick(2048), 2048)
+        # kv_len can never exceed topk, but the clamp must hold regardless.
+        self.assertEqual(pick(99999), 2048)
+
     def test_rejects_an_unusable_width(self):
         rng = np.random.default_rng(20260930)
         problem = _build_problem(rng, np.full(QUERY_TOKENS, PREFIX))
+        with self.assertRaisesRegex(ValueError, "topk_prefix_width"):
+            _attend(problem, LAYOUTS[0], topk_prefix_width="widest")
         for bad in (0, -8, TOPK + 4):
             with self.assertRaisesRegex(ValueError, "topk_prefix_width"):
                 _attend(problem, LAYOUTS[0], topk_prefix_width=bad)
