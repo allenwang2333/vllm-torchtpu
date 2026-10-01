@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
+    TPU_DCP_Q_GATHER_MODE: str = "split"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -365,6 +366,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # eval config turns it on, since a prefilled assistant turn needs it.
     "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE": env_bool(
         "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", default=False
+    ),
+    # How sparse MLA under DCP (without query replication) widens q to the
+    # DCP group's heads. "split" (default) all-gathers the W_UK-absorbed
+    # latent q [T, h, kv_lora_rank] and the rope q [T, h, rope] separately.
+    # "fused" concatenates the two and runs one all-gather (same bytes, one
+    # collective). "pre_absorb" concatenates the *unabsorbed* q_nope and q_pe
+    # [T, h, nope + rope], runs one all-gather of that (kv_lora_rank + rope)
+    # / (nope + rope) times fewer bytes, then absorbs locally against a
+    # group-wide W_UK_T built once at load (as query replication does).
+    "TPU_DCP_Q_GATHER_MODE": env_with_choices(
+        "TPU_DCP_Q_GATHER_MODE",
+        "split",
+        ["split", "fused", "pre_absorb"],
+        case_sensitive=False,
     ),
     # NoPE and RoPE KV cache layouts allocated for sparse MLA.
     "TPU_SPARSE_MLA_NOPE_LAYOUT": env_with_choices(

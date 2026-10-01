@@ -60,6 +60,28 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
     return group.all_gather(q.contiguous(), dim=1)
 
 
+def all_gather_heads_packed(*parts: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """`all_gather_heads` of several same-head-count tensors in one collective.
+
+    Concatenates `parts` on the last axis, runs a single head all-gather, and
+    splits the result back. Every element lands exactly where a separate
+    `all_gather_heads` per part would have put it -- the gather is pure data
+    movement -- but the group pays one collective launch and one
+    rank-major -> token-major relayout instead of one per part.
+
+    Args:
+      *parts: `[num_tokens, tp_local_num_heads, dim_i]`, same leading dims.
+
+    Returns:
+      One `[num_tokens, tp_local_num_heads * dcp_size, dim_i]` per part.
+    """
+    if len(parts) == 1:
+        return (all_gather_heads(parts[0]),)
+    widths = [int(p.shape[-1]) for p in parts]
+    gathered = all_gather_heads(torch.cat(parts, dim=-1))
+    return tuple(gathered.split(widths, dim=-1))
+
+
 def merge_lse_partials_scatter_heads(
     output: torch.Tensor, lse: torch.Tensor
 ) -> torch.Tensor:

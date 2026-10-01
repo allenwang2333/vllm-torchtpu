@@ -916,6 +916,178 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
     assert all(t.shape[1] == local_heads for t in gathered)
 
 
+class _LockstepDcpGroup:
+    """A DCP group simulated in one process by replaying every rank's forward.
+
+    Pass one ("record") runs each rank with every head all-gather returning
+    the rank's own block tiled `world` times, and records what each rank fed
+    each gather. No gather input depends on a gather output on the paths under
+    test (the gathers all run before the attention op), so pass two ("serve")
+    can answer each rank's k-th gather with the real rank-ordered
+    concatenation of all ranks' k-th inputs -- exactly the `dim=1` all-gather
+    of vLLM's base communicator.
+    """
+
+    def __init__(self, world, recorded):
+        self.world_size = world
+        self.rank_in_group = 0
+        self.recorded = recorded  # rank -> list of gather inputs
+        self.serve = False
+        self._calls = 0
+
+    def start(self, rank, serve):
+        self.rank_in_group, self.serve, self._calls = rank, serve, 0
+
+    def all_gather(self, tensor, dim=0):
+        assert dim == 1
+        k = self._calls
+        self._calls += 1
+        if not self.serve:
+            self.recorded.setdefault(self.rank_in_group, []).append(tensor.clone())
+            return torch.cat([tensor] * self.world_size, dim=1)
+        assert torch.equal(tensor, self.recorded[self.rank_in_group][k])
+        return torch.cat(
+            [self.recorded[r][k] for r in range(self.world_size)], dim=1
+        )
+
+
+def _run_dcp_q_modes(monkeypatch, mode, dtype=torch.bfloat16, num_tokens=5):
+    """Every rank's (op inputs, layer output) under one TPU_DCP_Q_GATHER_MODE.
+
+    GLM-5.2 per-rank head geometry (nope 192, rope 64, latent 512), 16 local
+    heads over a 4-rank DCP group. The attention op is a deterministic stand-in
+    of its q inputs, so the layer output also proves the heads arrive in the
+    order the merge's scatter assumes.
+    """
+    dcp, local_heads, nope, rope, latent = 4, 16, 192, 64, 512
+    group_heads = dcp * local_heads
+    torch.manual_seed(7)
+    w_uk_full = (torch.randn(group_heads, nope, latent) * 0.05).to(dtype)
+    w_uv_local = (torch.randn(local_heads, latent, 128) * 0.05).to(dtype)
+    q_nope_all = torch.randn(num_tokens, group_heads, nope).to(dtype)
+    q_pe_all = torch.randn(num_tokens, group_heads, rope).to(dtype)
+
+    monkeypatch.setenv("TPU_DCP_Q_GATHER_MODE", mode)
+    group = _LockstepDcpGroup(dcp, {})
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+
+    def fake_dcp_op(_cache, ql_nope, q_pe, *_rest):
+        # Partial = a function of every q element; lse all-equal.
+        partial = ql_nope.float() + q_pe.float().sum(-1, keepdim=True)
+        return partial.to(ql_nope.dtype), torch.zeros(ql_nope.shape[:2])
+
+    def own_heads(out, _lse):
+        r = group.rank_in_group
+        return out[:, r * local_heads : (r + 1) * local_heads, :]
+
+    monkeypatch.setattr(attention_adapter, "merge_lse_partials_scatter_heads", own_heads)
+
+    results = {}
+    for serve in (False, True):
+        for rank in range(dcp):
+            group.start(rank, serve)
+            impl, layer, inputs, _ = _make_impl_and_layer(num_tokens=num_tokens)
+            impl.dcp_size = dcp
+            heads = slice(rank * local_heads, (rank + 1) * local_heads)
+            layer.W_UK_T = w_uk_full[heads].clone()
+            layer.W_UV = w_uv_local
+            layer.W_UK_T_dcp_qrep = w_uk_full if mode == "pre_absorb" else None
+            layer.W_UK_T_dcp_qrep_scale = None
+            layer.sparse_mla_dcp_op = MagicMock(side_effect=fake_dcp_op)
+            inputs["q"] = (
+                q_nope_all[:, heads].clone(),
+                q_pe_all[:, heads].clone(),
+            )
+            inputs["kv_c_normed"] = inputs["kv_c_normed"].to(dtype)
+            inputs["k_pe"] = inputs["k_pe"].to(dtype)
+            inputs["kv_cache"] = tuple(
+                torch.zeros(spec.shape, dtype=spec.torch_dtype)
+                for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+                    2, 8, 576, torch.float8_e4m3fn
+                )
+            )
+            out = impl.forward(
+                layer=layer,
+                **inputs,
+                topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+            )
+            if serve:
+                _c, ql_nope, q_pe, *_ = layer.sparse_mla_dcp_op.call_args.args
+                results[rank] = dict(
+                    ql_nope=ql_nope,
+                    q_pe=q_pe,
+                    out=out,
+                    gathers=[tuple(t.shape) for t in group.recorded[rank]],
+                )
+    return results
+
+
+@pytest.mark.parametrize("mode", ["fused", "pre_absorb"])
+def test_dcp_q_gather_modes_match_split_bit_for_bit(monkeypatch, mode):
+    """Every rank hands the attention op the same q -- head for head, bit for
+    bit -- and returns the same layer output as the default two-gather path,
+    while running a single all-gather."""
+    base = _run_dcp_q_modes(monkeypatch, "split")
+    new = _run_dcp_q_modes(monkeypatch, mode)
+    for rank in base:
+        b, n = base[rank], new[rank]
+        assert n["ql_nope"].shape == b["ql_nope"].shape == (5, 64, 512)
+        assert n["q_pe"].shape == b["q_pe"].shape == (5, 64, 64)
+        assert torch.equal(n["ql_nope"], b["ql_nope"]), rank
+        assert torch.equal(n["q_pe"], b["q_pe"]), rank
+        assert torch.equal(n["out"], b["out"]), rank
+        assert b["gathers"] == [(5, 16, 512), (5, 16, 64)]
+        width = 512 + 64 if mode == "fused" else 192 + 64
+        assert n["gathers"] == [(5, 16, width)]
+
+
+def test_dcp_q_gather_split_reference_is_the_full_head_absorb(monkeypatch):
+    """Anchor the reference itself: under "split" the op's q is the full
+    64-head absorb of the replicated q, so a permuted gather in every mode at
+    once could not pass the bit-for-bit test above."""
+    torch.manual_seed(7)
+    w_uk_full = (torch.randn(64, 192, 512) * 0.05).to(torch.bfloat16)
+    _ = torch.randn(16, 512, 128)  # W_UV: keeps the draw order in step
+    q_nope_all = torch.randn(5, 64, 192).to(torch.bfloat16)
+    q_pe_all = torch.randn(5, 64, 64).to(torch.bfloat16)
+    base = _run_dcp_q_modes(monkeypatch, "split")
+    expected = torch.bmm(q_nope_all.transpose(0, 1), w_uk_full).transpose(0, 1)
+    for rank in base:
+        torch.testing.assert_close(base[rank]["ql_nope"], expected)
+        assert torch.equal(base[rank]["q_pe"], q_pe_all)
+
+
+def test_dcp_q_gather_pre_absorb_requires_the_group_weight(monkeypatch):
+    monkeypatch.setenv("TPU_DCP_Q_GATHER_MODE", "pre_absorb")
+    impl, layer, inputs, _ = _make_impl_and_layer()
+    impl.dcp_size = 2
+    layer.W_UK_T_dcp_qrep = None
+    layer.sparse_mla_dcp_op = MagicMock()
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+    with pytest.raises(AssertionError, match="W_UK_T_dcp_qrep"):
+        impl.forward(
+            layer=layer,
+            **inputs,
+            topk_indices=torch.zeros((4, 8), dtype=torch.int32),
+        )
+
+
+def test_dcp_q_gather_mode_env_defaults_off(monkeypatch):
+    getter = envs.environment_variables["TPU_DCP_Q_GATHER_MODE"]
+    monkeypatch.delenv("TPU_DCP_Q_GATHER_MODE", raising=False)
+    assert getter() == "split"
+    monkeypatch.setenv("TPU_DCP_Q_GATHER_MODE", "Fused")
+    assert getter() == "Fused"
+    monkeypatch.setenv("TPU_DCP_Q_GATHER_MODE", "both")
+    with pytest.raises(ValueError):
+        getter()
+
+
 def test_mla_forward_uses_context_without_runtime_kv_scale_state():
     attention = VllmMLAAttention.__new__(VllmMLAAttention)
     torch.nn.Module.__init__(attention)
