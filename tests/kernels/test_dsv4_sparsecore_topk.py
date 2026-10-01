@@ -387,6 +387,158 @@ def test_return_scores(b: int, n: int, k: int):
 
 
 # --------------------------------------------------------------------------- #
+# Payload (`values=`).
+# --------------------------------------------------------------------------- #
+# `values` makes the kernel emit `values[row, col]` instead of `col`, replacing
+# a `take_along_axis` after the call. The payload below is an invertible map of
+# the column, so the emitted payload decodes back to indices and the existing
+# `_mismatch` checks the selection exactly as it does for plain indices.
+
+
+def _encode(cols: np.ndarray) -> np.ndarray:
+    return (cols * 3 + 1).astype(np.int32)
+
+
+def _decode(vals: np.ndarray) -> np.ndarray:
+    return np.where(vals >= 0, (vals - 1) // 3, -1).astype(np.int32)
+
+
+def _run_values(
+    scores: np.ndarray, k: int, row_lengths: np.ndarray, **kwargs
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    b, n = scores.shape
+    values = _encode(np.broadcast_to(np.arange(n, dtype=np.int32), (b, n)))
+    out = jax.block_until_ready(
+        sparsecore_topk(
+            jnp.asarray(scores),
+            k,
+            jnp.asarray(row_lengths),
+            values=jnp.asarray(values),
+            **kwargs,
+        )
+    )
+    if isinstance(out, tuple):
+        return tuple(np.asarray(o) for o in out)
+    return np.asarray(out)
+
+
+@pytest.mark.parametrize("b,n,k,expected_p", SHAPES)
+@pytest.mark.parametrize("kind", ["strict_desc", "random", "heavy_ties"])
+def test_values_payload_is_exact(b, n, k, expected_p, kind):
+    rng = np.random.default_rng(SEED)
+    scores = _scores(kind, b, n, rng)
+    row_lengths = np.full(b, n, np.int32)
+    vals = _run_values(scores, k, row_lengths)
+    assert _mismatch(scores, _decode(vals), k, row_lengths) is None
+
+
+@pytest.mark.parametrize("b,n,k,expected_p", SHAPES)
+def test_values_payload_ragged_rows_pad_with_minus_one(b, n, k, expected_p):
+    """Short rows must pad with -1, never with a payload value."""
+    rng = np.random.default_rng(SEED)
+    scores = _scores("random", b, n, rng)
+    n_p = n // expected_p
+    edges = [0, 1, LANES, k - 1, n_p + 1, n]
+    row_lengths = np.array([min(edges[i % len(edges)], n) for i in range(b)], np.int32)
+    vals = _run_values(scores, k, row_lengths)
+    assert _mismatch(scores, _decode(vals), k, row_lengths) is None
+    # Every non-pad slot must be a value that was actually in the payload.
+    live = vals[vals >= 0]
+    assert ((live - 1) % 3 == 0).all()
+
+
+def test_values_payload_through_recursive_stage_two():
+    """1M context: stage 2 itself partitions, and the payload must survive."""
+    b, k = 64, 2048
+    rng = np.random.default_rng(SEED)
+    scores = _scores("random", b, N_1M, rng)
+    row_lengths = np.full(b, N_1M, np.int32)
+    vals = _run_values(scores, k, row_lengths)
+    assert _mismatch(scores, _decode(vals), k, row_lengths) is None
+
+
+@pytest.mark.parametrize("b,n,k", [(32, 2048, 256), (4, 8192, 256), (16, N_128K, 2048)])
+def test_values_payload_is_slot_aligned_with_scores(b, n, k):
+    rng = np.random.default_rng(SEED)
+    scores = rng.standard_normal((b, n), dtype=np.float32)
+    row_lengths = rng.integers(k, n + 1, size=(b,), dtype=np.int32)
+    vals, score_bits = _run_values(scores, k, row_lengths, return_scores=True)
+    got = np.asarray(jax.lax.bitcast_convert_type(score_bits, jnp.float32))
+    cols = _decode(vals)
+    assert _mismatch(scores, cols, k, row_lengths) is None
+    live = cols >= 0
+    np.testing.assert_array_equal(
+        got[live], np.take_along_axis(scores, np.maximum(cols, 0), axis=1)[live]
+    )
+    assert (got[~live] == -np.inf).all()
+
+
+def test_values_matches_take_along_axis_on_dcp_shape():
+    """The DCP merge shape: `[T, dcp * k]` candidates with arbitrary payloads.
+
+    Payload entries are arbitrary global positions (not a function of the
+    column), so this is the literal replacement of
+    `take_along_axis(idxs, slots)` in `streamindex_topk_dcp`.
+    """
+    t, dcp, k = 16, 2, 2048
+    n = dcp * k
+    rng = np.random.default_rng(SEED)
+    scores = rng.standard_normal((t, n), dtype=np.float32)
+    idxs = rng.permutation(10 * n)[: t * n].reshape(t, n).astype(np.int32)
+    row_lengths = np.full(t, n, np.int32)
+
+    slots, ref_bits = jax.block_until_ready(
+        sparsecore_topk(
+            jnp.asarray(scores), k, jnp.asarray(row_lengths), return_scores=True
+        )
+    )
+    merged, got_bits = jax.block_until_ready(
+        sparsecore_topk(
+            jnp.asarray(scores),
+            k,
+            jnp.asarray(row_lengths),
+            values=jnp.asarray(idxs),
+            return_scores=True,
+        )
+    )
+    slots, merged = np.asarray(slots), np.asarray(merged)
+    # Same selected score multiset per row.
+    np.testing.assert_array_equal(
+        np.sort(np.asarray(ref_bits), axis=1), np.sort(np.asarray(got_bits), axis=1)
+    )
+    # Each emitted payload is the payload of the column it stands for.
+    expected = np.where(
+        slots >= 0, np.take_along_axis(idxs, np.maximum(slots, 0), 1), -1
+    )
+    np.testing.assert_array_equal(np.sort(expected, axis=1), np.sort(merged, axis=1))
+
+
+@pytest.mark.cpu_test
+def test_payload_partition_halves_slice_when_multi_wave():
+    """A payload doubles the double-buffered input, so multi-wave calls must
+    pick slices that fit in half the usual budget; single-wave calls need not.
+    """
+    assert sc_module._payload_slice_cap(32) == MAX_SLICE_WORDS
+    assert sc_module._payload_slice_cap(33) == MAX_SLICE_WORDS // 2
+    # b=64, n=32K: one 32K slice per row without a payload, two 16K with one.
+    assert _pick_partition(64, 32768, 2048) == 1
+    assert _pick_partition(64, 32768, 2048, MAX_SLICE_WORDS // 2) == 2
+
+
+def test_two_stage_lowering_has_no_gather():
+    """Stage 2 carries global columns as its payload, so no XLA gather (which
+    lands on SparseCore as `gather_offload_*`) remains in the lowered program,
+    with or without a caller payload."""
+    b, n, k = TWO_STAGE
+    scores = jnp.zeros((b, n), jnp.float32)
+    row_lengths = jnp.full((b,), n, jnp.int32)
+    values = jnp.zeros((b, n), jnp.int32)
+    for kwargs in ({}, {"values": values}):
+        text = sparsecore_topk.lower(scores, k, row_lengths, **kwargs).as_text()
+        assert "gather" not in text, kwargs
+
+
+# --------------------------------------------------------------------------- #
 # Scheduling groups.
 # --------------------------------------------------------------------------- #
 # `scheduling_group_id` puts stage 1 in an XLA scheduling group and
@@ -415,7 +567,15 @@ def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
     """
     seen: list[int | None] = []
 
-    def _stub(scores, k_, row_lengths, *, write_empty=True, scheduling_group_id=None):
+    def _stub(
+        scores,
+        k_,
+        row_lengths,
+        *,
+        values=None,
+        write_empty=True,
+        scheduling_group_id=None,
+    ):
         seen.append(scheduling_group_id)
         out = jnp.zeros((scores.shape[0], k_), jnp.int32)
         return out, out

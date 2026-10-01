@@ -1388,14 +1388,15 @@ def streamindex_topk_dcp(
 
         # Stage 2. Full width as the row length: -inf entries (unfilled local
         # slots, padding tokens) are never selected, so they need no masking.
-        slots = sparsecore_topk(
+        # `idxs` rides along as the payload, so the merge returns global
+        # positions directly (-1 in pad slots) with no gather afterwards.
+        merged = sparsecore_topk(
             scores,
             k,
             row_lengths=jnp.full((scores.shape[0],), scores.shape[1], dtype=jnp.int32),
+            values=idxs,
             write_empty_rows=True,
         )
-        merged = jnp.take_along_axis(idxs, jnp.maximum(slots, 0), axis=1)
-        merged = jnp.where(slots >= 0, merged, -1)
 
         return _select_owned_winners(merged, dcp_size, interleave_c, dcp_rank)
 

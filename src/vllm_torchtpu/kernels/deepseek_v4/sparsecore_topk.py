@@ -28,6 +28,13 @@ Output rows are the top-k column indices in unspecified order, ``-1``
 suffix-padded, matching an exact top-k over the given scores as a set (equal
 boundary scores may be broken differently). ``-inf`` scores and positions at
 or beyond ``row_lengths`` are never selected. NaNs are unsupported.
+
+An optional i32 ``values`` payload, shaped like ``scores``, can be passed to
+return ``values[row, col]`` for each winner instead of ``col``. The kernel emits
+the payload with the same compaction as the index, so callers that would
+otherwise ``take_along_axis`` the result (an XLA gather, which is offloaded to
+SparseCore and serialises against these kernels) get it for free. The two-stage
+path uses this internally to carry global column indices through stage 2.
 """
 
 import functools
@@ -71,6 +78,7 @@ def _cdiv_dyn(x):
 def _topk_body(
     scores_hbm,  # i32[padded_b, slice_len] (fp32 score bits)
     lengths_hbm,  # i32[padded_b, LANES]
+    values_hbm,  # i32[padded_b, slice_len] payload, or None to emit indices
     out_hbm,  # i32[padded_b, k]
     keys_hbm,  # i32[padded_b, k]          (fp32 winner score bits)
     glob_vmem,  # i32[NUM_BUCKETS + LANES] (histogram, then its prefix sum)
@@ -153,7 +161,12 @@ def _topk_body(
             body
         )  # pytype: disable=bad-argument-type
 
-    def pipeline_step(scores_vmem, len_slice_vmem, out_vmem, keys_vmem):
+    def pipeline_step(*blocks):
+        if values_hbm is None:
+            scores_vmem, len_slice_vmem, out_vmem, keys_vmem = blocks
+            vals_vmem = None
+        else:
+            scores_vmem, len_slice_vmem, vals_vmem, out_vmem, keys_vmem = blocks
         w = pl.program_id(0)
         row = w * (num_sc_cores * num_subcores) + flat
         active = row < b
@@ -268,9 +281,16 @@ def _topk_body(
         emit_chunks = jnp.where(active, walk_chunks, 0)
 
         def emit(i, woff, key, sel):
+            # With a payload, emit it in place of the column index. Its tail
+            # lanes are never selected: the matching keys were poisoned to -inf.
+            payload = (
+                i * LANES + lane_iota
+                if vals_vmem is None
+                else vals_vmem[pl.ds(i * LANES, LANES)]
+            )
             plsc.store_compressed(
                 rowbuf_vmem.at[pl.ds(woff, LANES)],
-                i * LANES + lane_iota,
+                payload,
                 mask=sel,
             )
             # monotone_key is an involution, so this recovers the original
@@ -321,18 +341,23 @@ def _topk_body(
 
     cores_per_chip = num_sc_cores * num_subcores
     buf_count = 1 if num_waves == 1 else 2
+    slice_spec = pl.BlockSpec(
+        (slice_len,),
+        lambda w: (w * cores_per_chip + flat,),
+        pipeline_mode=pl.Buffered(buf_count),
+    )
     in_specs = (
-        pl.BlockSpec(
-            (slice_len,),
-            lambda w: (w * cores_per_chip + flat,),
-            pipeline_mode=pl.Buffered(buf_count),
-        ),
+        slice_spec,
         pl.BlockSpec(
             (LANES,),
             lambda w: (w * cores_per_chip + flat,),
             pipeline_mode=pl.Buffered(buf_count),
         ),
     )
+    in_refs = (scores_hbm, lengths_hbm)
+    if values_hbm is not None:
+        in_specs += (slice_spec,)
+        in_refs += (values_hbm,)
     out_specs = (
         pl.BlockSpec(
             (k,),
@@ -350,18 +375,12 @@ def _topk_body(
         grid=(num_waves,),
         in_specs=in_specs,
         out_specs=out_specs,
-    )(scores_hbm, lengths_hbm, out_hbm, keys_hbm)
+    )(*in_refs, out_hbm, keys_hbm)
 
 
 def _topk_kernel(
-    scores_hbm,
-    lengths_hbm,
-    out_hbm,
-    keys_hbm,
-    glob_vmem,
-    rowbuf_vmem,
-    keybuf_vmem,
-    *,
+    *refs,
+    has_values: bool,
     b: int,
     n: int,
     k: int,
@@ -369,10 +388,18 @@ def _topk_kernel(
     num_waves: int,
     write_empty: bool,
 ):
-    """Indices plus each winner's score."""
+    """Indices (or payload values) plus each winner's score.
+
+    ``refs`` is ``(scores, lengths[, values], out, keys, glob, rowbuf, keybuf)``.
+    """
+    num_in = 3 if has_values else 2
+    scores_hbm, lengths_hbm = refs[:2]
+    values_hbm = refs[2] if has_values else None
+    out_hbm, keys_hbm, glob_vmem, rowbuf_vmem, keybuf_vmem = refs[num_in:]
     _topk_body(
         scores_hbm,
         lengths_hbm,
+        values_hbm,
         out_hbm,
         keys_hbm,
         glob_vmem,
@@ -387,11 +414,22 @@ def _topk_kernel(
     )
 
 
+def _payload_slice_cap(rows: int) -> int:
+    """Largest slice `_sc_topk_direct` can keep resident next to a payload.
+
+    One wave (``rows <= 32``) is single-buffered, so scores plus payload take
+    the same tile memory a double-buffered score slice already does. More waves
+    double-buffer both inputs, so each has to halve to stay within budget.
+    """
+    return MAX_SLICE_WORDS if rows <= 32 else MAX_SLICE_WORDS // 2
+
+
 def _sc_topk_direct(
     scores: jax.Array,  # f32[b, n]
     k: int,
     row_lengths: jax.Array,  # i32[b]
     *,
+    values: jax.Array | None = None,  # i32[b, n]
     write_empty: bool = True,
     scheduling_group_id: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
@@ -401,7 +439,9 @@ def _sc_topk_direct(
     compares raw bits either way.
 
     Returns each winner's score as i32 bits, paired slot-for-slot with the
-    returned indices, and the bits of ``-inf`` in the pad slots.
+    returned indices, and the bits of ``-inf`` in the pad slots. If ``values``
+    is given, the first output holds ``values[row, col]`` for each winner
+    instead of ``col`` (still ``-1`` in pad slots).
     """
     b, n = scores.shape
     info = pltpu.get_tpu_info()
@@ -425,6 +465,23 @@ def _sc_topk_direct(
     lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
     lengths_2d = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1)))
 
+    inputs = (words.reshape(-1), lengths_2d.reshape(-1))
+    if values is not None:
+        if values.shape != scores.shape or values.dtype != jnp.int32:
+            raise ValueError(
+                f"values must be i32{list(scores.shape)}, got "
+                f"{values.dtype}{list(values.shape)}"
+            )
+        if slice_len > _payload_slice_cap(b):
+            raise ValueError(
+                f"{n=} exceeds the {_payload_slice_cap(b)}-word slice that fits "
+                f"alongside a payload at {b=}"
+            )
+        vals = values
+        if pad_b > 0 or pad_n > 0:
+            vals = jnp.pad(vals, ((0, pad_b), (0, pad_n)), constant_values=-1)
+        inputs += (vals.reshape(-1),)
+
     mesh = plsc.VectorSubcoreMesh(
         num_cores=sc.num_cores,
         num_subcores=sc.num_subcores,
@@ -440,9 +497,11 @@ def _sc_topk_direct(
         pltpu.VMEM((k + LANES,), jnp.int32),
     )
 
+    suffix = "_v" if values is not None else ""
     out = pl.kernel(
         functools.partial(
             _topk_kernel,
+            has_values=values is not None,
             b=b,
             n=n,
             k=k,
@@ -456,8 +515,8 @@ def _sc_topk_direct(
         ),
         scratch_types=scratch_types,
         mesh=mesh,
-        name=f"sc_topk_direct_b{b}_n{n}_k{k}",
-    )(words.reshape(-1), lengths_2d.reshape(-1))
+        name=f"sc_topk_direct_b{b}_n{n}_k{k}{suffix}",
+    )(*inputs)
     if scheduling_group_id is not None:
         out = xla_metadata.set_xla_metadata(
             out, _scheduling_group_id=scheduling_group_id
@@ -468,12 +527,14 @@ def _sc_topk_direct(
     return slots_2d, keys_2d
 
 
-def _pick_partition(b: int, n: int, k: int) -> int:
+def _pick_partition(
+    b: int, n: int, k: int, max_slice_words: int = MAX_SLICE_WORDS
+) -> int:
     """Picks the power-of-two partition factor P (1..32) per row to maximize
 
     subcore utilization across all 32 subcores while fitting in VMEM.
     """
-    p_min = _cdiv(n, MAX_SLICE_WORDS)
+    p_min = _cdiv(n, max_slice_words)
     p = 1
     while p < p_min:
         p *= 2
@@ -503,6 +564,7 @@ def sparsecore_topk(
     k: int,
     row_lengths: jax.Array | None = None,  # i32[b], defaults to n
     *,
+    values: jax.Array | None = None,  # i32[b, n]
     write_empty_rows: bool = True,
     scheduling_group_id: int | None = None,
     stage2_scheduling_group_id: int | None = None,
@@ -515,9 +577,16 @@ def sparsecore_topk(
 
     On the two-stage path, stage 1 emits each winner's score alongside its index,
     feeding directly into stage 2 without an intermediate HBM score gather.
+    Stage 2 likewise carries each candidate's global column (or payload) as its
+    own payload, so no index gather follows it either.
 
     ``scores`` may be f32 or i32 holding those f32 bits; the comparison is on
     raw bits either way.
+
+    ``values``, if given, is an i32 payload shaped like ``scores``; the result
+    then holds ``values[row, col]`` for each winning ``col`` instead of ``col``,
+    and is still ``-1`` in pad slots. It replaces a
+    ``take_along_axis(values, result, axis=1)`` after the call.
 
     ``scheduling_group_id`` and ``stage2_scheduling_group_id`` place each stage
     in an XLA scheduling group, so each can overlap a different caller's
@@ -532,6 +601,12 @@ def sparsecore_topk(
         raise ValueError(f"{n=} must be a multiple of {LANES}")
     if k % LANES != 0 or not 0 < k <= 4096:
         raise ValueError(f"{k=} must be a positive multiple of {LANES}, at most 4096")
+    if values is not None:
+        if values.shape != scores.shape:
+            raise ValueError(
+                f"values shape {values.shape} must match scores {scores.shape}"
+            )
+        values = values.astype(jnp.int32)
 
     if row_lengths is None:
         row_lengths = jnp.full((b,), n, jnp.int32)
@@ -539,6 +614,9 @@ def sparsecore_topk(
         row_lengths = row_lengths.astype(jnp.int32)
 
     p = _pick_partition(b, n, k)
+    if values is not None and _cdiv(b * p, 32) > 1:
+        # Multi-wave with a payload: both inputs are double-buffered.
+        p = _pick_partition(b, n, k, _payload_slice_cap(b * p))
 
     # Fast-path: single-stage execution when p == 1
     if p == 1:
@@ -546,6 +624,7 @@ def sparsecore_topk(
             scores,
             k,
             row_lengths,
+            values=values,
             write_empty=write_empty_rows,
             scheduling_group_id=scheduling_group_id,
         )
@@ -561,51 +640,54 @@ def sparsecore_topk(
     offsets = jnp.arange(p, dtype=jnp.int32) * n_p
     lengths_p = jnp.clip(row_lengths[:, None] - offsets[None, :], 0, n_p).reshape(b * p)
 
-    local_slots, cand_scores = _sc_topk_direct(
+    local_out, cand_scores = _sc_topk_direct(
         scores_p,
         k_p,
         lengths_p,
+        values=None if values is None else values.reshape(b * p, n_p),
         write_empty=True,
         scheduling_group_id=scheduling_group_id,
     )
-    local_indices = local_slots.reshape(b, p, k_p)
     cand_scores = cand_scores.reshape(b, p * k_p)
 
-    # Map local indices to global column indices
-    global_cand_indices = jnp.where(
-        local_indices < 0,
-        -1,
-        offsets[None, :, None] + local_indices,
-    ).reshape(b, p * k_p)
+    if values is None:
+        # Map local indices to global column indices
+        local_indices = local_out.reshape(b, p, k_p)
+        cand_payload = jnp.where(
+            local_indices < 0,
+            -1,
+            offsets[None, :, None] + local_indices,
+        ).reshape(b, p * k_p)
+    else:
+        # Stage 1 already emitted the caller's payload for each candidate.
+        cand_payload = local_out.reshape(b, p * k_p)
 
-    # Stage 2: Merge the P * k_p candidates to select the final top-k
+    # Stage 2: Merge the P * k_p candidates to select the final top-k. The
+    # candidate payload rides along, so the output needs no gather back.
     cand_lengths = jnp.where(row_lengths > 0, jnp.int32(p * k_p), jnp.int32(0))
 
-    if p * k_p > MAX_SLICE_WORDS:
+    if p * k_p > _payload_slice_cap(b):
         # Too wide for one slice; recurse so stage 2 partitions in turn. `k_p`
         # is `k` whenever `p > 1`, so `p * k_p < n` and this terminates.
-        final_cand_slots, final_cand_scores = sparsecore_topk(
+        final_out, final_cand_scores = sparsecore_topk(
             cand_scores,
             k,
             row_lengths=cand_lengths,
+            values=cand_payload,
             write_empty_rows=write_empty_rows,
             scheduling_group_id=stage2_scheduling_group_id,
             return_scores=True,
         )
     else:
-        final_cand_slots, final_cand_scores = _sc_topk_direct(
+        final_out, final_cand_scores = _sc_topk_direct(
             cand_scores,
             k,
             cand_lengths,
+            values=cand_payload,
             write_empty=write_empty_rows,
             scheduling_group_id=stage2_scheduling_group_id,
         )
 
-    # Map candidate slots back to original column indices
-    safe_slots = jnp.maximum(final_cand_slots, 0)
-    final_indices = jnp.take_along_axis(global_cand_indices, safe_slots, axis=1)
-    final_indices = jnp.where(final_cand_slots >= 0, final_indices, -1)
-
     if return_scores:
-        return final_indices, final_cand_scores
-    return final_indices
+        return final_out, final_cand_scores
+    return final_out
