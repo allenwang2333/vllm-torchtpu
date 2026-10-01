@@ -134,7 +134,7 @@ def _build_poisoned_problem(rng, *, query_tokens=128, topk=TOPK, winner_pages=4)
     }
 
 
-def _attend(problem, indices, layout, *, return_lse=False):
+def _attend(problem, indices, layout, *, return_lse=False, is_dcp_mode=False):
     """Physical-index attention over `indices`, on either cache layout."""
     sparsecore = layout == sparse_mla.SPARSECORE_CACHE_LAYOUT
     out = sparse_mla.sparse_ragged_paged_attention(
@@ -146,6 +146,7 @@ def _attend(problem, indices, layout, *, return_lse=False):
         problem["cu_q_lens"],
         problem["distribution"],
         return_lse=return_lse,
+        is_dcp_mode=is_dcp_mode,
         sm_scale=0.125,
         gather_and_attention_chunk_size=128,
         attention_kernel_batch_size=16,
@@ -218,6 +219,109 @@ class NanPaddingTailIsZeroedTest(parameterized.TestCase):
         self.assertTrue(np.isfinite(baseline).all(), "the winners are poisoned")
 
         out = np.asarray(_attend(self.problem, padded, layout), np.float32)
+        self.assertTrue(np.isfinite(out).all(), "NaN tail reached the PV einsum")
+        np.testing.assert_allclose(out, baseline, rtol=2e-2, atol=2e-2)
+
+
+class DcpModeMatchesDefaultTest(parameterized.TestCase):
+    """`is_dcp_mode=True` is an optimization, so it must not move the answer.
+
+    It skips the gather DMAs for all-padding windows and narrows both the
+    HBM->VMEM slab copy and the QK/PV loop to a rung chosen from the batch's
+    widest `kv_len`. Every rung must agree with the unoptimized path exactly.
+
+    `DCP_TOPK` is 512 so all four rungs are reachable: the eighth rung is gated
+    on `topk % 8 == 0` at the fetch and `topk // 8 % 64 == 0` at the compute,
+    and at topk=256 the second gate fails, so the ladder silently starts at a
+    quarter and the narrowest slice never gets exercised.
+    """
+
+    DCP_TOPK = 512
+
+    def setUp(self):
+        super().setUp()
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("sparse MLA attention requires a TPU")
+        self.problem = _build_problem(
+            np.random.default_rng(20261002), topk=self.DCP_TOPK
+        )
+
+    def _padded(self, kv_len):
+        return self.problem["physical_topk"].at[:, kv_len:].set(-1)
+
+    # 64 -> eighth, 128 -> quarter, 256 -> half, 512 -> full width.
+    @parameterized.product(kv_len=(64, 128, 256, 512), layout=LAYOUTS)
+    def test_each_ladder_rung_matches_the_default_path(self, kv_len, layout):
+        padded = self._padded(kv_len)
+        dcp, dcp_lse = _attend(
+            self.problem, padded, layout, return_lse=True, is_dcp_mode=True
+        )
+        ref, ref_lse = _attend(
+            self.problem, padded, layout, return_lse=True, is_dcp_mode=False
+        )
+        np.testing.assert_allclose(
+            np.asarray(dcp, np.float32),
+            np.asarray(ref, np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        np.testing.assert_allclose(
+            np.asarray(dcp_lse, np.float32),
+            np.asarray(ref_lse, np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
+    @parameterized.product(kv_len=(64, 128), layout=LAYOUTS)
+    def test_a_narrowed_rung_still_excludes_the_tail(self, kv_len, layout):
+        # Against a *narrower unpadded* row, not against itself: a rung that
+        # over-fetched and then forgot to mask would match the default path
+        # (which has the same defect-free masks) only by accident.
+        narrow = self.problem["physical_topk"][:, :kv_len]
+        np.testing.assert_allclose(
+            np.asarray(
+                _attend(self.problem, self._padded(kv_len), layout, is_dcp_mode=True),
+                np.float32,
+            ),
+            np.asarray(_attend(self.problem, narrow, layout), np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
+    @parameterized.parameters(*LAYOUTS)
+    def test_a_ragged_batch_uses_the_widest_rung_without_overreading(self, layout):
+        # The rung is picked from the batch maximum but the masks are per row,
+        # so rows narrower than the rung must still exclude their own tail.
+        indices = np.asarray(self.problem["physical_topk"]).copy()
+        kv_lens = 64 * (1 + np.arange(indices.shape[0]) % 8)
+        for row, kv_len in enumerate(kv_lens):
+            indices[row, kv_len:] = -1
+        padded = jnp.asarray(indices)
+
+        np.testing.assert_allclose(
+            np.asarray(
+                _attend(self.problem, padded, layout, is_dcp_mode=True), np.float32
+            ),
+            np.asarray(_attend(self.problem, padded, layout), np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
+    @parameterized.parameters(*LAYOUTS)
+    def test_a_nan_tail_does_not_reach_the_output(self, layout):
+        # The skipped gather windows are never written, so whatever VMEM holds
+        # is what the masks have to cover. Poison it with fp8 NaN.
+        problem = _build_poisoned_problem(
+            np.random.default_rng(20261002), topk=self.DCP_TOPK, winner_pages=8
+        )
+        kv_len = self.DCP_TOPK // 8
+        narrow = problem["physical_topk"][:, :kv_len]
+        padded = problem["physical_topk"].at[:, kv_len:].set(-1)
+
+        baseline = np.asarray(_attend(problem, narrow, layout), np.float32)
+        self.assertTrue(np.isfinite(baseline).all(), "the winners are poisoned")
+
+        out = np.asarray(_attend(problem, padded, layout, is_dcp_mode=True), np.float32)
         self.assertTrue(np.isfinite(out).all(), "NaN tail reached the PV einsum")
         np.testing.assert_allclose(out, baseline, rtol=2e-2, atol=2e-2)
 
