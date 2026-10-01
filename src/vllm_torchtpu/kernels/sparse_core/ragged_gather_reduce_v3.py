@@ -47,11 +47,46 @@ def _fallback_implementation(
     topk_weights: jax.Array,
     valid_rows_mask: jax.Array,
     reduce_group_size: int,
+    row_scales: jax.Array | None = None,
 ) -> jax.Array:
-    out = x[indices] * topk_weights[:, None].astype(jnp.float32)
+    coef = topk_weights.astype(jnp.float32)
+    if row_scales is not None:
+        coef = coef * row_scales[indices].astype(jnp.float32)
+    out = x[indices].astype(jnp.float32) * coef[:, None]
     out = jnp.where(valid_rows_mask[:, None], out, 0)
     out = out.reshape(-1, reduce_group_size, out.shape[-1])
-    return jnp.sum(out, axis=1).astype(x.dtype)
+    # FP8 rows are dequantized to BF16, like the SparseCore kernel's output.
+    out_dtype = jnp.bfloat16 if x.dtype == jnp.float8_e4m3fn else x.dtype
+    return jnp.sum(out, axis=1).astype(out_dtype)
+
+
+# FP8 e4m3fn exponent bias is 7, FP32's is 127.
+_E4M3_TO_F32_EXPONENT_SCALE = 2.0**120
+
+
+def _unpack_row_f32(value_i32: jax.Array, source_index: jax.Array, rows_per_word: int):
+    """Extract one source row from a row-packed 32-bit word as FP32.
+
+    SparseCore row-packing places row ``r`` of each group of ``rows_per_word``
+    rows in bits ``[r * w, (r + 1) * w)`` of the word, for element width ``w``.
+    """
+    if rows_per_word == 2:
+        # BF16 is the top half of an FP32.
+        shift = jnp.where(jnp.bitwise_and(source_index, 1) == 0, 16, 0)
+        shifted = jnp.bitwise_and(jnp.left_shift(value_i32, shift), jnp.int32(-65536))
+        return plsc.bitcast(shifted, jnp.float32)
+    assert rows_per_word == 4
+    # Move the FP8 byte to bits [31:24], then place its 4-bit exponent and
+    # 3-bit mantissa at FP32 bits [26:20] and rebias the exponent by 2**120.
+    # Exact for normal values (and for subnormals unless they are flushed;
+    # those are below 2**-6 of the FP8 range).  e4m3fn has no infinities.
+    shift = 24 - 8 * jnp.bitwise_and(source_index, 3)
+    shifted = jnp.left_shift(value_i32, shift)
+    bits = jnp.bitwise_or(
+        jnp.bitwise_and(shifted, jnp.int32(-(1 << 31))),
+        jnp.bitwise_and(jnp.right_shift(shifted, 4), jnp.int32(0x07F00000)),
+    )
+    return plsc.bitcast(bits, jnp.float32) * _E4M3_TO_F32_EXPONENT_SCALE
 
 
 def _calculate_num_column_partitions(
@@ -109,6 +144,7 @@ def _main_kernel(
     num_column_partitions: int,
     blocks_per_row_partition: int,
     topk: int,
+    rows_per_word: int,
 ):
     sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None
@@ -170,7 +206,7 @@ def _main_kernel(
                 lambda route_chunk: (
                     jnp.bitwise_right_shift(
                         route_indices_slice(route_chunk),
-                        1,
+                        rows_per_word.bit_length() - 1,
                     ),
                     col_partition_id,
                 ),
@@ -199,17 +235,11 @@ def _main_kernel(
                     for route_lane in range(
                         route_batch_start, route_batch_start + route_batch_size
                     ):
-                        value_i32 = gather_ref[route_lane, col_slice]
-                        shift = jnp.where(
-                            jnp.bitwise_and(source_indices[route_lane], 1) == 0,
-                            16,
-                            0,
+                        value_f32 = _unpack_row_f32(
+                            gather_ref[route_lane, col_slice],
+                            source_indices[route_lane],
+                            rows_per_word,
                         )
-                        shifted = jnp.bitwise_and(
-                            jnp.left_shift(value_i32, shift),
-                            jnp.int32(-65536),
-                        )
-                        value_f32 = plsc.bitcast(shifted, jnp.float32)
                         value_f32 *= route_weights[route_lane]
                         weighted_values.append(value_f32)
 
@@ -236,17 +266,11 @@ def _main_kernel(
                     for route_lane in range(
                         route_batch_start, route_batch_start + route_batch_size
                     ):
-                        value_i32 = gather_ref[route_lane, col_slice]
-                        shift = jnp.where(
-                            jnp.bitwise_and(source_indices[route_lane], 1) == 0,
-                            16,
-                            0,
+                        value_f32 = _unpack_row_f32(
+                            gather_ref[route_lane, col_slice],
+                            source_indices[route_lane],
+                            rows_per_word,
                         )
-                        shifted = jnp.bitwise_and(
-                            jnp.left_shift(value_i32, shift),
-                            jnp.int32(-65536),
-                        )
-                        value_f32 = plsc.bitcast(shifted, jnp.float32)
                         value_f32 *= route_weights[route_lane]
                         weighted_values.append(value_f32)
 
@@ -335,37 +359,45 @@ def ragged_gather_reduce(
     topk_weights: jax.Array,
     valid_rows_mask: jax.Array,
     reduce_group_size: int,
+    row_scales: jax.Array | None = None,
 ) -> jax.Array:
-    """Destination-major prototype for MoE output combine."""
+    """Destination-major prototype for MoE output combine.
+
+    ``x`` is BF16, or FP8 (``float8_e4m3fn``) with ``row_scales`` holding one
+    FP32 dequantization scale per source row of ``x``.  Each route's
+    coefficient is ``topk_weight * row_scales[index]``, so the scale is applied
+    during the FP32 accumulation and FP8 rows are never materialized as BF16.
+    The output is BF16.
+    """
+    if row_scales is not None and row_scales.shape != (x.shape[0],):
+        raise ValueError(f"{row_scales.shape=} must be ({x.shape[0]},)")
+    fallback = functools.partial(
+        _fallback_implementation,
+        x,
+        indices,
+        topk_weights,
+        valid_rows_mask,
+        reduce_group_size,
+        row_scales,
+    )
     sc_info = pltpu.get_tpu_info().sparse_core
     if (
         sc_info is None
-        or x.dtype != jnp.bfloat16
+        or x.dtype not in (jnp.bfloat16, jnp.float8_e4m3fn)
         or x.shape[-1] % pltpu.get_tpu_info().num_lanes != 0
     ):
-        return _fallback_implementation(
-            x,
-            indices,
-            topk_weights,
-            valid_rows_mask,
-            reduce_group_size,
-        )
+        return fallback()
     dtype_bytes = jax.dtypes.itemsize_bits(x.dtype) // 8
     if jnp.size(x) * dtype_bytes * 2 < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6:
-        return _fallback_implementation(
-            x,
-            indices,
-            topk_weights,
-            valid_rows_mask,
-            reduce_group_size,
-        )
+        return fallback()
 
     input_size = indices.size
     if input_size % reduce_group_size != 0:
         raise ValueError(f"{input_size=} must be divisible by {reduce_group_size=}")
-    # SparseCore row-packing views BF16 as pairs of rows.
-    if x.shape[0] % 2:
-        x = jnp.pad(x, ((0, 1), (0, 0)))
+    # SparseCore row-packing views BF16 as pairs of rows and FP8 as quads.
+    rows_per_word = 32 // jax.dtypes.itemsize_bits(x.dtype)
+    if x.shape[0] % rows_per_word:
+        x = jnp.pad(x, ((0, rows_per_word - x.shape[0] % rows_per_word), (0, 0)))
     num_tokens = input_size // reduce_group_size
     hidden_size = x.shape[-1]
     if x.shape[0] > 1 << _ROUTE_INDEX_BITS:
@@ -406,6 +438,10 @@ def ragged_gather_reduce(
     route_destinations = jnp.take_along_axis(destination_blocks, route_order, axis=1)
     weights_blocks = weights_2d.reshape(num_blocks, metadata_block_size)
     route_weights = jnp.take_along_axis(weights_blocks, route_order, axis=1)
+    route_weights = route_weights.astype(jnp.float32)
+    if row_scales is not None:
+        # Fuse the per-row dequantization scale into the route coefficient.
+        route_weights *= row_scales.astype(jnp.float32)[route_indices]
     route_indices = jnp.where(compact_valid, route_indices, 0).astype(jnp.int32)
     route_destinations = jnp.where(compact_valid, route_destinations, 0).astype(
         jnp.int32
@@ -454,6 +490,7 @@ def ragged_gather_reduce(
             num_column_partitions=num_column_partitions,
             blocks_per_row_partition=blocks_per_row_partition,
             topk=reduce_group_size,
+            rows_per_word=rows_per_word,
         ),
         out_type=jax.ShapeDtypeStruct((padded_num_tokens, hidden_size), jnp.bfloat16),
         compiler_params=pltpu.CompilerParams(
