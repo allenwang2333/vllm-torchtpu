@@ -35,6 +35,8 @@ steps:
       - docker push "$$WORKLOAD_IMAGE"
 
   - label: ":kubernetes: :tpu: Kube P/D Disaggregated Benchmark"
+    # Sample branch only: a manual build can run the K3 step alone.
+    if: build.env("SAMPLE_SKIP_QWEN") != "1"
     depends_on: "build_kube_disagg_image"
     # Covers queueing as well as running, so that the launcher's own limits are
     # what stop a step and not this.
