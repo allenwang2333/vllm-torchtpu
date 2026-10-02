@@ -75,6 +75,7 @@ def _kernel(
     guard_tail: bool = False,
     batch_live: bool = False,
     batch_live_hbm_ref: Any = None,
+    live_atoms_grid: bool = False,
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
     live_batches = None
@@ -166,10 +167,10 @@ def _kernel(
             lambda atom: (logical_batch * atoms_per_batch + atom, 0),
         )
 
-        def run_inner():
+        def run_inner(num_atoms=atoms_per_batch):
             pltpu.emit_pipeline(
                 body,
-                grid=(atoms_per_batch,),
+                grid=(num_atoms,),
                 in_specs=nope_specs + rope_specs,
                 out_specs=(rope_out_spec,),
                 no_pipelining=not serve_pipelined,
@@ -185,10 +186,18 @@ def _kernel(
             # from VMEM is illegal on SC, sc_lowering.py). A dead batch is
             # skipped like the guarded tail round below; it also covers that
             # tail (the caller zeroes batches past the live bound).
-            is_live = live_flag_ref[0, 0, 0, :][0] > 0
+            batch_atoms = live_flag_ref[0, 0, 0, :][0]
+            is_live = batch_atoms > 0
             if live_batches is not None and guard_tail:
                 is_live = jnp.logical_and(is_live, logical_batch < live_batches)
-            pl.when(is_live)(run_inner)
+            if live_atoms_grid:
+                # The flag counts the batch's live prefix of atoms: the inner
+                # pipeline walks only those (traced grid, pipelined).
+                pl.when(is_live)(
+                    lambda: run_inner(jnp.minimum(batch_atoms, atoms_per_batch))
+                )
+            else:
+                pl.when(is_live)(run_inner)
         elif live_batches is not None and guard_tail:
             # Owners share a uniform traced grid of cdiv(live, num_owners);
             # the ragged last round is skipped per owner.
@@ -244,6 +253,7 @@ def _kernel(
         "wait_mode",
         "serve_pipelined",
         "live_multiple",
+        "live_atoms_grid",
     ),
 )
 def dsa_gather_native_sc(
@@ -258,6 +268,7 @@ def dsa_gather_native_sc(
     num_live_indices: jax.Array | None = None,
     live_multiple: int = 1,
     batch_live: jax.Array | None = None,
+    live_atoms_grid: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
@@ -277,6 +288,10 @@ def dsa_gather_native_sc(
     atoms of the flattened indices) to gather; zero batches are skipped and
     their rows left unwritten. Composes with ``num_live_indices`` (batches past
     the live bound must be zero or are skipped by it).
+    ``live_atoms_grid`` (with ``batch_live``): each flag is instead the number
+    of live leading atoms of its batch, and the batch's inner pipeline runs
+    over only those (a traced grid), so live atoms stay pipelined while a
+    batch spans a whole ragged row.
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
@@ -375,6 +390,7 @@ def dsa_gather_native_sc(
         serve_pipelined=serve_pipelined,
         guard_tail=guard_tail,
         batch_live=batch_live is not None,
+        live_atoms_grid=live_atoms_grid and batch_live is not None,
     )
     if live and batch_live is not None:
         inner = body
@@ -420,5 +436,6 @@ def dsa_gather_native_sc(
             f"sc_native_sc_gather_a{atoms_per_batch}_{wait_mode}_"
             f"{'pipe' if serve_pipelined else 'nopipe'}{'_live' if live else ''}"
             f"{'_ragged' if batch_live is not None else ''}"
+            f"{'_grid' if live_atoms_grid and batch_live is not None else ''}"
         ),
     )(*operands)

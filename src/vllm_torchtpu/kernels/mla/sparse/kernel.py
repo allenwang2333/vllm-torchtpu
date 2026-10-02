@@ -1869,7 +1869,8 @@ def sparse_attention_chunk(
     kv_len, ragged_width)` rows of each token's window 0. `ragged_gather_atoms`
     (with `topk_cap`; divides `topk_cap // 64`): the SparseCore gather runs
     with that many 64-row atoms per logical batch and skips every batch past
-    its row's live entries. Both leave the output bit-identical.
+    its row's live entries; `topk_cap // 64` (one batch per row) instead runs
+    each batch's inner pipeline over the row's live atoms only.
     """
     return_lse = lse is not None
     if topk is None:
@@ -2193,13 +2194,20 @@ def sparse_attention_chunk(
                 jnp.arange(chunk_size)[None, :] < live_tokens, window_live, 0
             )
             row_atoms = (window_live + PACKED_ATOM_ROWS - 1) // PACKED_ATOM_ROWS
-            first_atom = (
-                jnp.arange(atoms_per_row // ragged_gather_atoms, dtype=jnp.int32)
-                * ragged_gather_atoms
-            )
-            ragged_kwargs["batch_live"] = (
-                row_atoms[..., None] > first_atom
-            ).astype(jnp.int32).reshape(-1)
+            if ragged_gather_atoms == atoms_per_row:
+                # One batch per (window, row): its inner pipeline walks only
+                # the row's live atoms (traced grid).
+                ragged_kwargs.update(
+                    batch_live=row_atoms.reshape(-1), live_atoms_grid=True
+                )
+            else:
+                first_atom = (
+                    jnp.arange(atoms_per_row // ragged_gather_atoms, dtype=jnp.int32)
+                    * ragged_gather_atoms
+                )
+                ragged_kwargs["batch_live"] = (
+                    row_atoms[..., None] > first_atom
+                ).astype(jnp.int32).reshape(-1)
         gathered_nope_buffer, gathered_rope_buffer = (
             native_sc_gather.dsa_gather_native_sc(
                 cache_kv_nope,

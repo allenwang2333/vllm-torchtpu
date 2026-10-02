@@ -130,5 +130,106 @@ class NativeScGatherTest(absltest.TestCase):
                 )
 
 
+    def test_batch_live_gather_skips_dead_batches(self):
+        """``batch_live``: live logical batches byte-exact, dead ones skipped.
+
+        The decode bucket (16 tokens x topk 2048). Before each call the same
+        sized gather is run on shifted indices and dropped, so a dead batch's
+        rows (left unwritten) hold other rows' bytes, never the expected ones:
+        the test sees a batch that should have been skipped but was gathered,
+        and a live batch that was skipped.
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("native-SC gather requires a TPU SparseCore")
+
+        pages, page_size = 64, 1024
+        cache_tokens = pages * page_size
+        query_tokens, topk = 16, 2048
+        count = query_tokens * topk
+        rng = np.random.default_rng(20261011)
+        nope_u8 = rng.integers(0, 256, (pages, page_size, 4, 128), np.uint8)
+        rope_u8 = rng.integers(0, 0x7E, (pages, page_size // 4, 4, 128), np.uint8)
+        rope_u8[..., 64:] = 0
+        nope_i32 = jnp.asarray(native_sc_cache_layout.pack_nope(nope_u8))
+        rope_i32 = jnp.asarray(native_sc_cache_layout.pack_rope_banded(rope_u8))
+        flat_nope = native_sc_cache_layout.flatten_nope_rows(
+            native_sc_cache_layout.pack_nope(nope_u8)
+        )
+        flat_rope_u8 = rope_u8.reshape(-1, 128)
+        flat_indices = rng.integers(0, cache_tokens, count, dtype=np.int32)
+        indices = jnp.asarray(flat_indices.reshape(query_tokens, topk))
+        shifted = jnp.asarray(
+            ((flat_indices + 4099) % cache_tokens).reshape(query_tokens, topk)
+        )
+        expected_rope = native_sc_cache_layout.pack_selected_rope_for_tc(
+            flat_rope_u8[flat_indices]
+        )
+
+        # (atoms per batch, live fraction, traced live count or None, grid).
+        # grid: `live_atoms_grid` -- each flag is the batch's live-atom prefix.
+        cases = [
+            (1, 0.0, None, False),
+            (1, 0.35, None, False),
+            (2, 0.35, None, False),
+            (1, 0.35, 9 * topk, False),
+            (8, 0.0, None, True),
+            (8, 1.0, None, True),
+        ]
+        for atoms, frac, num_live, grid in cases:
+            with self.subTest(atoms=atoms, frac=frac, num_live=num_live, grid=grid):
+                rows_per_batch = atoms * native_sc_gather.OCCURRENCES_PER_ATOM
+                num_batches = count // rows_per_batch
+                flags = (rng.random(num_batches) < frac).astype(np.int32)
+                if grid and frac:
+                    flags = rng.integers(0, atoms + 1, num_batches).astype(np.int32)
+                if num_live is not None:
+                    flags[num_live // rows_per_batch :] = 0
+                live_kwargs = (
+                    {}
+                    if num_live is None
+                    else dict(num_live_indices=jnp.int32(num_live), live_multiple=topk)
+                )
+                stale = native_sc_gather.dsa_gather_native_sc(
+                    nope_i32, rope_i32, shifted, out_size=count, atoms_per_batch=atoms
+                )
+                jax.block_until_ready(stale)
+                del stale
+                gathered_nope, gathered_rope = jax.block_until_ready(
+                    native_sc_gather.dsa_gather_native_sc(
+                        nope_i32,
+                        rope_i32,
+                        indices,
+                        out_size=count,
+                        atoms_per_batch=atoms,
+                        batch_live=jnp.asarray(flags),
+                        live_atoms_grid=grid,
+                        **live_kwargs,
+                    )
+                )
+                if grid:
+                    atom = np.arange(count) % rows_per_batch // 64
+                    row_live = atom < np.repeat(flags, rows_per_batch)
+                else:
+                    row_live = np.repeat(flags > 0, rows_per_batch)
+                got = np.asarray(gathered_nope)
+                np.testing.assert_array_equal(
+                    got[row_live], flat_nope[flat_indices[row_live]]
+                )
+                group_live = row_live.reshape(-1, native_sc_gather.ROPE_PACKING)[:, 0]
+                np.testing.assert_array_equal(
+                    np.asarray(gathered_rope)[group_live], expected_rope[group_live]
+                )
+                # Dead atoms were not gathered: no dead 64-row atom holds its
+                # expected rows.
+                atoms_total = count // 64
+                exp_rows = flat_nope[flat_indices].reshape(atoms_total, 64, -1)
+                got_rows = got.reshape(atoms_total, 64, -1)
+                dead = np.flatnonzero(~row_live.reshape(atoms_total, 64)[:, 0])
+                same = [
+                    a for a in dead if np.array_equal(got_rows[a], exp_rows[a])
+                ]
+                self.assertEqual(same, [], "dead atoms hold gathered rows")
+
+
 if __name__ == "__main__":
     absltest.main()

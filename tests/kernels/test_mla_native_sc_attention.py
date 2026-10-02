@@ -1102,7 +1102,9 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             {"ragged": (64, 4, 1)},  # TPU_DCP_MLA_RAGGED_WIDTH defaults
             {"ragged": (64, 1, 2)},
             {"ragged": (128, 16, 0)},
-            {"ragged": (512, 16, 8)},  # one width bucket: only the SC skips
+            # One width bucket: only the SC changes (one batch per row, its
+            # inner pipeline over the row's live atoms).
+            {"ragged": (512, 16, 8)},
         ),
         counts_mode=("mixed", "within_cap"),
     )
