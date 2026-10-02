@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# One pod of the Kimi-K3 1P1D test with data parallelism on both roles.
+# Prefill and decode each get a 2x2x4 slice, four hosts, and serve TP8 x DP4 x
+# EP32 over vLLM's own multi-node DP, one DP replica per host.
+#
+#   k3_1p1d_dp.sh prefill|decode       every pod of the role's slice
+#
+# The launch is mp_multihost_entry.sh's, which serves a config under
+# run_eval_flow.sh and so cannot front a pair: index 0 serves the API at the
+# role's --data-parallel-address, the other hosts join it --headless at their
+# start rank. The rest is k3_1p1d.sh's: both engines serve the
+# kimi-k3-tp8-dp4-ep-1p1d config, the prefill head fronts the pair with the
+# toy proxy, checks a few greedy completions through it, runs the correctness
+# stages and the MMLU-Pro eval through it, and exits; the JobSet's success
+# policy tears decode down.
+#
+# Environment, from manifests/workloads/kimi-k3-1p1d-dp.yaml: POD_IP,
+# ROLE_HOST_PREFIX and ROLE_HOST_DOMAIN (host i of this role is
+# <prefix>i.<domain>), DECODE_HOST (decode's index 0), NUM_HOSTS.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="${REPO_DIR:-/workspace/vllm-torchtpu}"
+CONFIG=kimi-k3-tp8-dp4-ep-1p1d
+PORT=8000
+PROXY_PORT=8100
+DP_RPC_PORT=29500
+# DP replicas per host.
+DP_LOCAL=1
+
+role="${1:-}"
+case "$role" in
+  prefill|decode) ;;
+  *) echo "usage: $0 prefill|decode" >&2; exit 2 ;;
+esac
+: "${POD_IP:?}" "${ROLE_HOST_PREFIX:?}" "${ROLE_HOST_DOMAIN:?}" "${DECODE_HOST:?}"
+: "${NUM_HOSTS:?}"
+INDEX="${JOB_COMPLETION_INDEX:-0}"
+cd "$REPO_DIR" || exit 2
+
+# As mp_multihost_entry.sh: the mp backend builds the slice itself from a
+# rendezvous among the DP ranks, and the slice environment GKE injects must not
+# answer the same question differently.
+export MEGASCALE_COORDINATOR_ADDRESS='' MEGASCALE_NUM_SLICES='' MEGASCALE_PORT=''
+export MEGASCALE_SLICE_ID='' TPU_PROCESS_ADDRESSES='' TPU_PROCESS_PORT=''
+export TPU_WORKER_HOSTNAMES=''
+export TPU_MULTIHOST_BACKEND=mp
+export TPU_SKIP_MDS_QUERY=1
+export VLLM_HOST_IP="$POD_IP"
+ulimit -c 0
+
+# resolve <name>: its IPv4 address, waiting for the headless service's record.
+resolve() {
+  local deadline=$((SECONDS + 1800)) ip
+  until ip=$(getent ahostsv4 "$1" | awk 'NR == 1 { print $1 }') && [[ -n "$ip" ]]; do
+    if [[ "$SECONDS" -ge "$deadline" ]]; then
+      echo "ERROR: $1 did not resolve in 30 minutes" >&2
+      return 1
+    fi
+    sleep 10
+  done
+  echo "$ip"
+}
+
+# The role's hosts in DP-rank order: host i owns DP rank i, and that rank's
+# Raiden store runs in its rank-0 worker, on host i. The connector indexes this
+# list by global DP rank, so it is the same list on every host of the role.
+hosts=()
+for ((i = 0; i < NUM_HOSTS; i++)); do
+  if [[ "$i" == "$INDEX" ]]; then
+    hosts+=("$POD_IP")
+  else
+    hosts+=("$(resolve "${ROLE_HOST_PREFIX}${i}.${ROLE_HOST_DOMAIN}")") || exit 1
+  fi
+done
+TPU_RAIDEN_ADVERTISE_HOST="$(IFS=,; echo "${hosts[*]}")"
+export TPU_RAIDEN_ADVERTISE_HOST
+DP_ADDRESS="${hosts[0]}"
+echo "--- ${role} host ${INDEX}/${NUM_HOSTS}: data-parallel address ${DP_ADDRESS}," \
+  "advertise hosts ${TPU_RAIDEN_ADVERTISE_HOST}"
+
+# Best effort, as k3_1p1d.sh: index 0's API server imports the model's remote
+# code before any worker exists; elsewhere the workers would race to write it.
+# The subshell keeps that config's variables out of this script.
+if [[ "$INDEX" != "0" ]]; then
+  # shellcheck source=/dev/null
+  uri=$(source scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh >/dev/null \
+    && echo "$MODEL_URI") \
+    && timeout 600 python3 "$HERE/warm_remote_code.py" "$uri" \
+    || echo "WARNING: could not warm the model's remote code"
+fi
+
+# The serve flags and the Raiden environment of this role, over the defaults
+# run_benchmarks.sh applies before sourcing a config.
+export K3_1P1D_ROLE="$role"
+MODEL_URI="${MODEL_URI:-}"
+ENABLE_EP=false
+QUANTIZATION=""
+ATTENTION_BACKEND="CUSTOM"
+ASYNC_SCHEDULING=true
+EXTRA_SERVE_ARGS=""
+# shellcheck source=/dev/null
+source "scripts/vllm/benchmarking/configs/${CONFIG}.sh" || exit 2
+if [[ "$((DP_LOCAL * NUM_HOSTS))" -ne "$DATA_PARALLELISM" ]]; then
+  echo "ERROR: DP_LOCAL ($DP_LOCAL) x NUM_HOSTS ($NUM_HOSTS) != DATA_PARALLELISM ($DATA_PARALLELISM)" >&2
+  exit 2
+fi
+
+extra_args=""
+[[ "$ENABLE_EP" == "true" ]] && extra_args="--enable-expert-parallel"
+[[ -n "$QUANTIZATION" ]] && extra_args="$extra_args --quantization $QUANTIZATION"
+extra_args="$extra_args --attention-backend $ATTENTION_BACKEND"
+[[ -n "$EXTRA_SERVE_ARGS" ]] && extra_args="$extra_args $EXTRA_SERVE_ARGS"
+prefix_caching_flag="--no-enable-prefix-caching"
+[[ "$ENABLE_PREFIX_CACHING" == "true" ]] && prefix_caching_flag="--enable-prefix-caching"
+async_flag="--async-scheduling"
+[[ "$ASYNC_SCHEDULING" == "false" ]] && async_flag="--no-async-scheduling"
+serve_target="$MODEL"
+if [[ -n "$MODEL_URI" ]]; then
+  serve_target="$MODEL_URI"
+  extra_args="$extra_args --load-format runai_streamer --served-model-name $MODEL"
+fi
+
+# Word-split on purpose, as run_benchmarks.sh: the config's JSON has no spaces.
+# shellcheck disable=SC2206
+SERVE_ARGS=(
+  "$serve_target"
+  --tensor-parallel-size="$TENSOR_PARALLELISM"
+  --data-parallel-size="$DATA_PARALLELISM"
+  --data-parallel-size-local="$DP_LOCAL"
+  --data-parallel-address="$DP_ADDRESS"
+  --data-parallel-rpc-port="$DP_RPC_PORT"
+  --max-model-len="$MAX_MODEL_LEN"
+  --max-num-batched-tokens="$MAX_NUM_BATCHED_TOKENS"
+  --max-num-seqs="$MAX_NUM_SEQS"
+  "$async_flag"
+  "$prefix_caching_flag"
+  --gpu-memory-utilization="$GPU_MEMORY_UTILIZATION"
+  --kv-cache-dtype="$KV_CACHE_DTYPE"
+  $extra_args
+)
+export PYTHONUNBUFFERED=1
+
+# K3_1P1D_DRY_RUN=1: print the serve command and environment and stop.
+if [[ "${K3_1P1D_DRY_RUN:-0}" == "1" ]]; then
+  printf '[cmd] vllm serve'; printf ' %q' "${SERVE_ARGS[@]}"; echo
+  env | grep -E '^(TPU_|VLLM_|K3_)' | sort
+  exit 0
+fi
+
+# Bounded, as in mp_multihost_entry.sh: a Completed pod's name keeps resolving
+# to an address that drops rather than refuses.
+head_listening() {
+  timeout 5 bash -c "exec 3<>/dev/tcp/${DP_ADDRESS}/${PORT}" 2>/dev/null
+}
+
+if [[ "$INDEX" != "0" ]]; then
+  start_rank=$((INDEX * DP_LOCAL))
+  echo "--- Starting headless ${role} host ${INDEX} at data-parallel-start-rank=${start_rank}"
+  vllm serve "${SERVE_ARGS[@]}" --headless --data-parallel-start-rank="$start_rank" &
+  serve_pid=$!
+  # --headless never returns; the head finishing ends the run.
+  deadline=$((SECONDS + SERVER_READY_WAIT_MIN * 60))
+  while [[ "$SECONDS" -lt "$deadline" ]]; do
+    head_listening && break
+    if ! kill -0 "$serve_pid" 2>/dev/null; then
+      echo "ERROR: this host's server exited before the head came up"
+      exit 1
+    fi
+    sleep 10
+  done
+  echo "host ${INDEX}: head is up; waiting for it to finish"
+  # Three misses, not one: a DNS blip looks like a closed port from here.
+  misses=0
+  while [[ "$misses" -lt 3 ]]; do
+    if head_listening; then misses=0; else misses=$((misses + 1)); fi
+    sleep 15
+  done
+  echo "host ${INDEX}: head is gone; exiting"
+  kill "$serve_pid" 2>/dev/null || true
+  exit 0
+fi
+
+run_dir="/tmp/k3_1p1d/${role}"
+mkdir -p "$run_dir"
+[[ -n "${ARTIFACTS_DIR:-}" ]] && mkdir -p "$ARTIFACTS_DIR"
+
+echo "--- Starting the ${role} head server (DP ${DP_LOCAL} of ${DATA_PARALLELISM})"
+# One API frontend for all DP ranks, head only; see run_benchmarks.sh.
+vllm serve "${SERVE_ARGS[@]}" --api-server-count=1 --host 0.0.0.0 --port "$PORT" &
+serve_pid=$!
+
+if [[ "$role" == "decode" ]]; then
+  wait "$serve_pid"
+  exit $?
+fi
+
+proxy_pid=""
+# shellcheck disable=SC2317  # invoked via the EXIT trap
+cleanup() {
+  if [[ -n "$proxy_pid" ]]; then
+    kill "$proxy_pid" 2>/dev/null || true
+  fi
+  kill "$serve_pid" 2>/dev/null || true
+  wait "$serve_pid" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# As multihost_entry.sh, which uploads for the Ray pair: these artifacts are
+# the step's only output, so a lost upload fails it.
+publish_results() {
+  [[ -n "${ARTIFACTS_DIR:-}" ]] || return 0
+  [[ -n "$(ls -A "$ARTIFACTS_DIR" 2>/dev/null)" ]] || return 0
+  if ! buildkite-agent artifact upload "$ARTIFACTS_DIR/**/*"; then
+    echo "ERROR: artifacts were produced but could not be uploaded"
+    return 1
+  fi
+}
+
+# wait_ready <url> <what> [pid]: poll until the URL answers 200, failing early
+# when the named process has died.
+wait_ready() {
+  local url="$1" what="$2" pid="${3:-}"
+  local deadline=$((SECONDS + 250 * 60))
+  echo "--- Waiting for ${what} at ${url}"
+  until [[ "$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 "$url" || true)" == "200" ]]; do
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      echo "ERROR: ${what} exited before it was ready"
+      return 1
+    fi
+    if [[ "$SECONDS" -ge "$deadline" ]]; then
+      echo "ERROR: ${what} not ready after 250 minutes"
+      return 1
+    fi
+    sleep 30
+  done
+  echo "${what} is ready"
+}
+
+wait_ready "http://127.0.0.1:${PORT}/health" "prefill engine" "$serve_pid" || exit 1
+wait_ready "http://${DECODE_HOST}:${PORT}/health" "decode engine" || exit 1
+
+# The workers log the block they settled on, on their own hosts; this is it.
+for url in "http://127.0.0.1:${PORT}" "http://${DECODE_HOST}:${PORT}"; do
+  echo "cache config at ${url}:"
+  curl -sf --max-time 30 "${url}/metrics" | grep -m1 '^vllm:cache_config_info' || true
+done
+
+echo "--- Starting the proxy on port ${PROXY_PORT}"
+python3 examples/disagg/toy_proxy_server.py \
+  --host 0.0.0.0 --port "$PROXY_PORT" \
+  --prefiller-hosts 127.0.0.1 --prefiller-ports "$PORT" \
+  --decoder-hosts "$DECODE_HOST" --decoder-ports "$PORT" \
+  >"$run_dir/proxy.log" 2>&1 &
+proxy_pid=$!
+if ! timeout 120 bash -c "until curl -sf -o /dev/null http://127.0.0.1:${PROXY_PORT}/healthcheck; do sleep 2; done"; then
+  echo "ERROR: proxy not ready"
+  tail -50 "$run_dir/proxy.log" || true
+  exit 1
+fi
+
+echo "--- Completions through the proxy"
+python3 "$HERE/check_completions.py" \
+  "http://127.0.0.1:${PROXY_PORT}/v1/completions" moonshotai/Kimi-K3 || {
+  tail -50 "$run_dir/proxy.log" || true
+  exit 1
+}
+
+# As k3_1p1d.sh: the eval runs even if a stage fails, not if none could start.
+# The token-comparing stages hold to the last DP rank, whose store is on the
+# role's last host: a cross-host handoff, which is what DP adds to the pair.
+stages_rc=0
+echo "--- Correctness stages through the proxy"
+PROXY_PORT="$PROXY_PORT" \
+PREFILL_URL="http://127.0.0.1:${PORT}" \
+DECODE_URL="http://${DECODE_HOST}:${PORT}" \
+PREFILL_CHUNK_TOKENS="$MAX_NUM_BATCHED_TOKENS" \
+K3_PD_DP_RANK="$((DATA_PARALLELISM - 1))" \
+LOG_DIR="${ARTIFACTS_DIR:-$run_dir}/k3_1p1d_correctness" \
+  bash scripts/vllm/integration/run_k3_1p1d_disagg_correctness.sh || stages_rc=$?
+if [[ "$stages_rc" -gt 1 ]]; then
+  echo "ERROR: the correctness stages did not start (exit ${stages_rc})"
+  publish_results
+  exit 1
+fi
+rc="$stages_rc"
+
+echo "--- lm_eval through the proxy"
+bash scripts/vllm/benchmarking/run_eval_flow.sh \
+  --config "$CONFIG" --baseline-config kimi-k3-tp32-ep --run-lm-eval \
+  --host 127.0.0.1 --port "$PROXY_PORT" \
+  --skip-benchmark --skip-db-upload || rc=1
+
+# A failed upload decides the step only when the work itself passed.
+if ! publish_results && [[ "$rc" -eq 0 ]]; then
+  rc=1
+fi
+exit "$rc"

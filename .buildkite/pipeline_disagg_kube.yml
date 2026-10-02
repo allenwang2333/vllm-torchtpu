@@ -74,7 +74,26 @@ steps:
   # pipeline is scheduled once a day, at 02:00 PT, ahead of the 03:00 Kimi-K3
   # step in pipeline_perf_kube.yml, which needs one of the same slices; the
   # slices also serve Kimi-K3 development, so CI keeps to that window.
-  - label: ":kubernetes: :tpu: Kimi-K3 1P1D (TPU v7x 2x2x4 x2)"
+  #
+  # Each role is TP8 x DP4 x EP32, one DP replica per host, the deployment
+  # shape; the handoff crosses hosts, one Raiden store per replica (#1271).
+  - label: ":kubernetes: :tpu: Kimi-K3 1P1D TP8xDP4 (TPU v7x 2x2x4 x2)"
+    if: build.env("K3_1P1D_TP32") != "1"
+    depends_on: "build_kube_disagg_image"
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    commands:
+      - /opt/launcher/launch --manifest .buildkite/kubernetes/manifests/workloads/kimi-k3-1p1d-dp.yaml
+
+  # The same pair as one TP32 Ray engine per role, in place of the step above
+  # when a manual build sets K3_1P1D_TP32=1: the handoff then stays within a
+  # rank's own TP group, which separates a connector fault from a DP one.
+  - label: ":kubernetes: :tpu: Kimi-K3 1P1D TP32 (TPU v7x 2x2x4 x2)"
+    if: build.env("K3_1P1D_TP32") == "1"
     depends_on: "build_kube_disagg_image"
     timeout_in_minutes: 1440
     agents:

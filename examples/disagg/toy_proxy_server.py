@@ -374,8 +374,35 @@ def get_next_client(app, service_type: str):
         raise ValueError(f"Unknown service type: {service_type}")
 
 
+# Request headers passed on to both hops. vLLM sends a request carrying
+# X-data-parallel-rank to that DP rank of the engine, so a client can hold a
+# request to one prefill replica and one decode replica.
+_FORWARDED_HEADERS = ("X-data-parallel-rank",)
+
+
+def _forwarded_headers(request: Request) -> dict:
+    return {
+        name: value
+        for name in _FORWARDED_HEADERS
+        if (value := request.headers.get(name)) is not None
+    }
+
+
+def _engine_headers(request_id: str, forwarded: dict | None = None) -> dict:
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        "X-Request-Id": request_id,
+        **(forwarded or {}),
+    }
+
+
 async def send_request_to_prefill(
-    client_info: dict, endpoint: str, req_data: dict, request_id: str
+    client_info: dict,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    forwarded: dict | None = None,
 ):
     """
     Send a request to a service using a client from the pool.
@@ -388,11 +415,7 @@ async def send_request_to_prefill(
         req_data["max_completion_tokens"] = 1
     if "stream_options" in req_data:
         del req_data["stream_options"]
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
-        "X-Request-Id": request_id,
-    }
+    headers = _engine_headers(request_id, forwarded)
 
     return await _post_with_retries(
         client_info, endpoint, req_data, headers, request_id, phase="PREFILL"
@@ -400,17 +423,17 @@ async def send_request_to_prefill(
 
 
 async def render_completion_prompt(
-    client_info: dict, endpoint: str, req_data: dict, request_id: str
+    client_info: dict,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    forwarded: dict | None = None,
 ):
     """
     Render/tokenize a completion request once so downstream P/D requests can
     use prompt token IDs instead of retokenizing raw text independently.
     """
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
-        "X-Request-Id": request_id,
-    }
+    headers = _engine_headers(request_id, forwarded)
 
     return await _post_with_retries(
         client_info, endpoint, req_data, headers, request_id, phase="RENDER"
@@ -418,16 +441,16 @@ async def render_completion_prompt(
 
 
 async def stream_from_decode(
-    client_info: dict, endpoint: str, req_data: dict, request_id: str
+    client_info: dict,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    forwarded: dict | None = None,
 ):
     """
     Asynchronously stream response from a service using a client from the pool.
     """
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
-        "X-Request-Id": request_id,
-    }
+    headers = _engine_headers(request_id, forwarded)
 
     for attempt in range(_MAX_ATTEMPTS):
         yielded_any = False
@@ -479,6 +502,7 @@ async def _handle_completions(api: str, request: Request):
         t_request_recv_perf = time.perf_counter()
         req_data = await request.json()
         request_id = str(uuid.uuid4())
+        forwarded = _forwarded_headers(request)
         print(
             f"PERF PROXY req_received req_id={request_id} ts={time.time():.6f}",
             flush=True,
@@ -489,7 +513,7 @@ async def _handle_completions(api: str, request: Request):
         render_endpoint = _render_endpoint_for_api(api)
         if render_endpoint is not None:
             render_response = await render_completion_prompt(
-                prefill_client_info, render_endpoint, req_data, request_id
+                prefill_client_info, render_endpoint, req_data, request_id, forwarded
             )
             req_data = _replace_prompt_with_rendered_token_ids(
                 req_data, render_response.json()
@@ -503,7 +527,7 @@ async def _handle_completions(api: str, request: Request):
             flush=True,
         )
         response = await send_request_to_prefill(
-            prefill_client_info, api, req_data, request_id
+            prefill_client_info, api, req_data, request_id, forwarded
         )
         t_prefill_recv = time.time()
         t_prefill_recv_perf = time.perf_counter()
@@ -543,7 +567,7 @@ async def _handle_completions(api: str, request: Request):
             )
             first = True
             async for chunk in stream_from_decode(
-                decode_client_info, api, req_data, request_id=request_id
+                decode_client_info, api, req_data, request_id, forwarded
             ):
                 if first:
                     t_first = time.time()
