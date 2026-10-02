@@ -13,9 +13,10 @@ shared expert's linears have their final FP8 per-channel layout. For an armed
 layer the runner is told it has no shared expert (the kernel owns it), and
 ``MoERunner._fused_output_is_reduced`` reports True (see the patch in
 ``vllm_torchtpu/__init__.py``), so vLLM issues neither the shared MLP nor any
-all-reduce. Token counts above ``MOE_FUSED_TP_AR_MAX_TOKENS`` keep the
-decomposed path, but still return the reduced sum, because an armed runner
-no longer reduces.
+all-reduce. Token counts above ``MOE_FUSED_TP_AR_MAX_TOKENS`` run the
+decomposed path inside the same exported program (the token count is static
+there), still returning the reduced sum because an armed runner no longer
+reduces; branching in torch instead would give buckets different graphs.
 """
 
 from typing import Any
@@ -54,15 +55,44 @@ def runner_is_armed(runner: Any) -> bool:
     return bool(getattr(runner, _RUNNER_ARMED_ATTR, False))
 
 
-def _build_op(mesh, n_ranks: int):
-    key = (id(mesh), n_ranks)
+def _build_op(mesh, n_ranks: int, topk: int):
+    # The token count is static inside the exported program, so the cap is
+    # applied HERE, not in torch: every bucket then traces the same torch op
+    # with the same inputs, which vLLM's shape-specialized warmup requires.
+    cap = envs.MOE_FUSED_TP_AR_MAX_TOKENS
+    key = (id(mesh), n_ranks, topk, cap)
     op = _OPS.get(key)
     if op is not None:
         return op
     axis = EP_AXIS_NAME
     spec = PartitionSpec(axis)
 
+    def decomposed(x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti):
+        """Above the cap: routed via fused_moe_func, XLA shared expert, psum."""
+        from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
+        from vllm_torchtpu.layers.core.fused_moe_gmm import (
+            fused_moe_func,
+            resolve_onehot_permute_threshold,
+        )
+
+        routed = fused_moe_func(
+            x, w1, w2, s1, s2, None, None, tw.astype(x.dtype), ti, jnp.zeros((), jnp.int32),
+            topk=topk, activation="silu", use_ep=False,
+            use_sparse_core=envs.USE_MOE_SPARSE_CORE,
+            onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
+            rhs_quant_dtype=None, skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS,
+        )
+        inter = w2s.shape[0]
+        gate_up = _quantized_matmul_jax(x, w1s, s1s.reshape(-1))
+        mid = (jax.nn.silu(gate_up[:, :inter]) * gate_up[:, inter:]).astype(x.dtype)
+        shared = _quantized_matmul_jax(mid, w2s, s2s.reshape(-1))
+        gate = jax.nn.sigmoid(jnp.dot(x, wg.astype(x.dtype), preferred_element_type=jnp.float32))
+        shared = (gate * shared.astype(jnp.float32)).astype(x.dtype)
+        return jax.lax.psum(shared + routed, axis)
+
     def local(rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti):
+        if x.shape[0] > cap:
+            return decomposed(x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti)
         return _kernel_body(
             rank.reshape(-1), x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti,
             n_ranks=n_ranks,
@@ -207,7 +237,11 @@ def arm_fused_tp_ar(model: torch.nn.Module) -> int:
             _RANK_BUFFER = torch.tensor(
                 [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
             )
-        setattr(runner._quant_method, FUSED_MOE_TP_AR_OP_ATTR, _build_op(mesh, n_ranks))
+        setattr(
+            runner._quant_method,
+            FUSED_MOE_TP_AR_OP_ATTR,
+            _build_op(mesh, n_ranks, layer.moe_config.experts_per_token),
+        )
         for name, tensor in zip(_SHARED_BUFFERS, shared):
             layer.register_buffer(name, tensor, persistent=False)
         runner._shared_experts = None
@@ -223,24 +257,14 @@ def arm_fused_tp_ar(model: torch.nn.Module) -> int:
     return armed
 
 
-def fused_moe_tp_ar(quant_method: Any, layer: Any, x: torch.Tensor, topk_weights, topk_ids, decomposed):
-    """Forward for an armed layer: the reduced (shared + routed) output.
+def fused_moe_tp_ar(quant_method: Any, layer: Any, x: torch.Tensor, topk_weights, topk_ids):
+    """Forward for an armed layer: the TP-reduced (shared + routed) output.
 
-    `decomposed()` computes the routed partial the usual way; it serves token
-    counts above the cap, where the shared expert and the all-reduce run here.
+    One torch op for every token count; above MOE_FUSED_TP_AR_MAX_TOKENS the
+    exported program runs the decomposed path (with its own psum) instead of
+    the fused kernel, so an armed layer always returns the reduced sum.
     """
     w1s, s1s, w2s, s2s, wg = (getattr(layer, name) for name in _SHARED_BUFFERS)
-    if x.shape[0] > envs.MOE_FUSED_TP_AR_MAX_TOKENS:
-        from vllm.distributed import tensor_model_parallel_all_reduce
-
-        from vllm_torchtpu.layers.adapter.linear_common import quantized_matmul
-
-        inter = w2s.shape[0]
-        gate_up = quantized_matmul(x, w1s, s1s.reshape(-1))
-        mid = torch.nn.functional.silu(gate_up[..., :inter]) * gate_up[..., inter:]
-        shared = quantized_matmul(mid, w2s, s2s.reshape(-1))
-        shared = torch.sigmoid(x @ wg) * shared
-        return tensor_model_parallel_all_reduce(decomposed() + shared)
     op = getattr(quant_method, FUSED_MOE_TP_AR_OP_ATTR)
     return op(
         x,

@@ -1120,9 +1120,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if fused_moe_tp_ar_supported(self):
             # Armed layer: the runner no longer runs the shared expert or the
             # all-reduce, so this returns the reduced shared + routed sum.
-            return fused_moe_tp_ar(
-                self, layer, x, topk_weights, topk_ids, lambda: fused_moe_gmm(**kwargs)
-            )
+            return fused_moe_tp_ar(self, layer, x, topk_weights, topk_ids)
 
         return fused_moe_gmm(**kwargs)
 
