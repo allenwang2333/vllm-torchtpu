@@ -1661,6 +1661,41 @@ class Eagle3Proposer:
 
         effective_num_tokens = num_tokens_padded if num_tokens_padded else num_tokens
 
+        # Reuse the target step's staged block tables for the draft's groups
+        # when they are provably the same rows at the same padding; then only
+        # the draft's own groups are built (no restaging of every group, no
+        # re-derivation of the target's mamba indices that the draft discards).
+        reused_tables = self._reusable_target_block_tables(chunk, kernel_num_reqs)
+        if reused_tables is not None:
+            saved_ctx = runner._attn_metadata_builder_ctx
+            runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+                num_reqs=num_reqs,
+                start_index=chunk.start_index,
+                use_max_model_len=use_max_model_len,
+                seq_lens=seq_lens,
+                query_start_loc=query_start_loc,
+                request_distribution=request_distribution,
+                position_ids_override=chunk_ctx.position_ids_override,
+                sequence_layout_descriptor=chunk_ctx.sequence_layout_descriptor,
+                staged_block_tables=reused_tables,
+            )
+            try:
+                assert self._draft_attn_layer_names is not None
+                result = runner.build_attention_metadata_for_layers(
+                    self._draft_attn_layer_names, kernel_num_reqs
+                )
+            finally:
+                runner._attn_metadata_builder_ctx = saved_ctx
+            missing = [n for n in self._draft_attn_layer_names if n not in result]
+            if missing:
+                raise RuntimeError(
+                    f"Draft attention layers {missing} have no attention "
+                    "metadata; they were not added to a KV cache group."
+                )
+            if cacheable:
+                self._draft_md_cache[id(chunk)] = (result, seq_lens)
+            return result
+
         mamba_state_indices = (
             runner._build_mamba_state_indices(
                 chunk.start_index, num_reqs, kernel_num_reqs
@@ -1734,6 +1769,55 @@ class Eagle3Proposer:
             self._draft_md_cache[id(chunk)] = (result, seq_lens)
 
         return result
+
+    def _reusable_target_block_tables(
+        self, chunk: DraftChunkInputs, kernel_num_reqs: int
+    ) -> dict | None:
+        """The target step's staged block tables for the draft's KV groups,
+        or None when they are not provably what a fresh staging would build.
+
+        A fresh draft build stages, per group, rows
+        `[start_index, start_index + num_reqs)` of the same CPU block table
+        at width `_block_table_geometry(ctx)`, zero-padded to
+        `kernel_num_reqs` rows. The target staged exactly that when its
+        context has the same request window and no position override, the
+        group is not a mamba group (whose width depends on the ckpt window
+        the draft context leaves at 1, and whose indices depend on
+        seq_lens), and the staged view has `kernel_num_reqs * width`
+        entries (same padding choice). No `_update_states` runs between the
+        target forward and propose, so the CPU tables are unchanged.
+        """
+        if self._draft_kv_shared or self._draft_attn_layer_names is None:
+            return None
+        runner = self.runner
+        ctx = chunk.attn_ctx
+        staged = getattr(ctx, "staged_block_tables", None)
+        if not staged or not getattr(runner, "attn_groups", None):
+            return None
+        if (
+            getattr(ctx, "position_ids_override", None) is not None
+            or getattr(ctx, "num_reqs", None) != chunk.num_reqs
+            or getattr(ctx, "start_index", None) != chunk.start_index
+        ):
+            return None
+        draft_names = self._draft_attn_layer_names
+        tables: dict = {}
+        for group_list in runner.attn_groups:
+            for group in group_list:
+                if not any(n in draft_names for n in group.layer_names):
+                    continue
+                builder = group.metadata_builders[0]
+                if builder.is_mamba_group:
+                    return None
+                gid = builder.kv_cache_group_id
+                table = staged.get(gid)
+                if table is None:
+                    return None
+                _, width = builder._block_table_geometry(ctx)
+                if table.numel() != kernel_num_reqs * width:
+                    return None
+                tables[gid] = table
+        return tables or None
 
     @staticmethod
     def _unwrap_model_out(out) -> tuple[torch.Tensor, torch.Tensor]:
