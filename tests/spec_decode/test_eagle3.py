@@ -1239,6 +1239,196 @@ def test_build_draft_attn_metadata_loop_cache(device):
     assert dc.is_dataclass(md2["draft.attn.0"])
 
 
+def _hybrid_draft_runner(device, num_reqs_padded=4):
+    """A runner with real metadata builders: one attention group holding a
+    target and the draft layer, two unified-pool mamba groups."""
+    import functools
+
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    max_blocks = 6
+    runner = mock.MagicMock()
+    runner.device = device
+    runner.most_model_len = None
+    runner.position_ids = torch.arange(8, dtype=torch.int32, device=device)
+    runner._block_table_stage_cpu = None
+    runner._has_mamba_state = False
+    runner._unified_kv_layout = True
+    runner.num_reqs_max_model_len = num_reqs_padded
+    runner.num_reqs_most_model_len = num_reqs_padded
+    runner._attn_metadata_builder_ctx = None
+    runner.empty_slot_mappings = {}
+    tables = []
+    for gid in range(3):
+        bt = mock.MagicMock()
+        bt.max_num_blocks_per_req = max_blocks
+        bt.get_cpu_tensor.return_value = (
+            torch.arange(8 * max_blocks, dtype=torch.int32).reshape(8, max_blocks)
+            + gid * 100
+        )
+        tables.append(bt)
+    runner.input_batch.block_table = tables
+    attn_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=torch.bfloat16,
+        page_size_padded=16384,
+    )
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=[(4, 128), (8, 64, 32)],
+        dtypes=[torch.bfloat16, torch.float32],
+        page_size_padded=16384,
+    )
+    groups = []
+    for gid, spec, names in (
+        (0, attn_spec, ["target.attn.3", "draft.attn.0"]),
+        (1, mamba_spec, ["target.gdn.0"]),
+        (2, mamba_spec, ["target.gdn.1"]),
+    ):
+        builder = AttentionMetadataBuilder(
+            kv_cache_spec=spec,
+            layer_names=names,
+            vllm_config=mock.MagicMock(),
+            device=device,
+            runner=runner,
+            kv_cache_group_id=gid,
+        )
+        group = mock.MagicMock()
+        group.metadata_builders = [builder]
+        group.layer_names = names
+        groups.append([group])
+    runner.attn_groups = groups
+    runner._build_attention_metadata = functools.partial(
+        TPUModelRunner._build_attention_metadata, runner
+    )
+    runner.build_attention_metadata_for_layers = functools.partial(
+        TPUModelRunner.build_attention_metadata_for_layers, runner
+    )
+    return runner
+
+
+def _target_ctx(runner, device, start_index=1, num_reqs=2, num_reqs_padded=4):
+    """The target step's context, staged exactly as `_prepare_inputs` does."""
+    from vllm_torchtpu.layers.core.attention_metadata import (
+        AttentionMetadataBuilderContext,
+        stage_block_table_uploads,
+    )
+
+    ctx = AttentionMetadataBuilderContext(
+        num_reqs=num_reqs,
+        start_index=start_index,
+        use_max_model_len=True,
+        seq_lens=torch.tensor([17, 40, 0, 0], dtype=torch.int32, device=device),
+        query_start_loc=torch.tensor([0, 4, 8, 8, 8], dtype=torch.int32).to(device),
+        request_distribution=torch.tensor([0, 0, 2], dtype=torch.int32).to(device),
+        mamba_ckpt_window=4,
+        unified_mamba_state_indices=[],
+    )
+    stage_block_table_uploads(runner, ctx, num_reqs_padded)
+    return ctx
+
+
+def _draft_chunk(ctx, start_index=1, num_reqs=2):
+    return SimpleNamespace(
+        num_reqs=num_reqs,
+        start_index=start_index,
+        query_start_loc_np=np.array([0, 4, 8], dtype=np.int32),
+        attn_ctx=ctx,
+    )
+
+
+def _draft_md_all_steps(proposer, chunk, device):
+    loop_qsl = torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32, device=device)
+    loop_rd = torch.tensor([2, 2, 2], dtype=torch.int32, device=device)
+    out = []
+    for step in range(3):
+        out.append(
+            proposer._build_draft_attn_metadata(
+                chunk,
+                step_idx=step,
+                seq_lens_delta=step,
+                num_rejected_np=np.array([1, 0], dtype=np.int32),
+                num_tokens_padded=8 if step == 0 else 4,
+                loop_query_start_loc=loop_qsl,
+                loop_request_distribution=loop_rd,
+            )
+        )
+    return out
+
+
+def test_draft_metadata_reuses_target_staged_tables_bit_identical(device):
+    """Reusing the target step's staged block tables must give the draft
+    exactly the metadata a fresh full walk gives, without restaging."""
+    import dataclasses as dc
+
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer._draft_attn_layer_names = {"draft.attn.0"}
+
+    runner = _hybrid_draft_runner(device)
+    proposer.runner = runner
+    target = _target_ctx(runner, device)
+    reads_after_target = [
+        bt.get_cpu_tensor.call_count for bt in runner.input_batch.block_table
+    ]
+    reused = _draft_md_all_steps(proposer, _draft_chunk(target), device)
+    # No group was restaged: the CPU block tables were never read again.
+    assert [
+        bt.get_cpu_tensor.call_count for bt in runner.input_batch.block_table
+    ] == reads_after_target
+
+    # Today's path: the same context without staged tables re-walks all
+    # groups and keeps the draft's entries.
+    ref_runner = _hybrid_draft_runner(device)
+    proposer.runner = ref_runner
+    ref_target = _target_ctx(ref_runner, device)
+    fresh_ctx = dc.replace(ref_target, staged_block_tables=None)
+    fresh = _draft_md_all_steps(proposer, _draft_chunk(fresh_ctx), device)
+    assert ref_runner.input_batch.block_table[1].get_cpu_tensor.call_count > 1
+
+    for got, want in zip(reused, fresh):
+        assert set(got) == set(want) == {"draft.attn.0"}
+        g, w = got["draft.attn.0"], want["draft.attn.0"]
+        assert torch.equal(g.block_tables.cpu(), w.block_tables.cpu())
+        assert g.block_tables.dtype == w.block_tables.dtype
+        assert g.block_tables.shape == w.block_tables.shape
+        assert torch.equal(g.seq_lens.cpu(), w.seq_lens.cpu())
+        assert torch.equal(g.input_positions.cpu(), w.input_positions.cpu())
+        assert torch.equal(g.query_start_loc.cpu(), w.query_start_loc.cpu())
+        assert torch.equal(g.request_distribution.cpu(), w.request_distribution.cpu())
+        assert g.mamba_state_indices is None and w.mamba_state_indices is None
+        assert g.sequence_layout_kind == w.sequence_layout_kind
+    # Rows [start_index, start_index + num_reqs) of group 0, zero-padded.
+    expect = torch.zeros(4, 6, dtype=torch.int32)
+    expect[:2] = torch.arange(48, dtype=torch.int32).reshape(8, 6)[1:3]
+    assert torch.equal(reused[0]["draft.attn.0"].block_tables.cpu(), expect.reshape(-1))
+
+
+@pytest.mark.parametrize("mismatch", ["start_index", "padding", "mamba_draft"])
+def test_draft_metadata_falls_back_when_target_tables_differ(device, mismatch):
+    """Any difference in request window, padding or a mamba draft group
+    must take the full rebuild, not the target's tables."""
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer._draft_attn_layer_names = {"draft.attn.0"}
+    runner = _hybrid_draft_runner(device)
+    proposer.runner = runner
+    target = _target_ctx(runner, device)
+    chunk = _draft_chunk(target)
+    if mismatch == "start_index":
+        chunk.start_index = 0
+    elif mismatch == "padding":
+        # The draft pads to 8 rows; the target staged 4.
+        runner.num_reqs_max_model_len = 8
+    else:
+        proposer._draft_attn_layer_names = {"draft.attn.0", "target.gdn.0"}
+    assert (
+        proposer._reusable_target_block_tables(chunk, runner.num_reqs_max_model_len)
+        is None
+    )
+
+
 def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(device):
     """Rebuilding draft metadata must preserve the target chunk's PCP
     descriptor; defaulting it to ALL selects an incompatible attention path."""
