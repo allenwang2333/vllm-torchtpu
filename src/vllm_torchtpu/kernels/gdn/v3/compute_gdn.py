@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os as _os
+
 import jax
 import jax.numpy as jnp
 
@@ -86,6 +88,37 @@ def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
     return jnp.concatenate(x_blocks, axis=1)
 
 
+def invert_unit_lower_product(t: jax.Array) -> jax.Array:
+    """EXPERIMENT: inverse of a unit lower-triangular t = I - M as
+    (I + M)(I + M^2)(I + M^4)... (M is nilpotent), all on the MXU."""
+    chunk = t.shape[-1]
+    dims = (((2,), (1,)), ((0,), (0,)))
+    iota_r = jax.lax.broadcasted_iota(jnp.int32, t.shape, 1)
+    iota_c = jax.lax.broadcasted_iota(jnp.int32, t.shape, 2)
+    eye = jnp.where(iota_r == iota_c, 1.0, 0.0).astype(jnp.float32)
+    m = eye - t.astype(jnp.float32)
+    inv = eye + m
+    p = m
+    covered = 2
+    while covered < chunk:
+        p = jax.lax.dot_general(
+            p,
+            p,
+            dims,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
+        )
+        inv = inv + jax.lax.dot_general(
+            inv,
+            p,
+            dims,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
+        )
+        covered *= 2
+    return inv.astype(t.dtype)
+
+
 def fused_transpose_broadcast(x: jax.Array, src_dim: int, dst_dim: int) -> jax.Array:
     """Perform 1D transpose where results are broadcasted along src_dim."""
     assert x.shape[dst_dim] == 1
@@ -117,12 +150,24 @@ def chunked_gdn_per_seq(
     k_repeat = jnp.repeat(k_large, cfg.v_per_kq_head, axis=0)
 
     # Compute cumulative sum of decay.
-    # [1, 1, num_v_heads]
-    g_cum_sum_list = [gating_log[:, :1]]
-    for row in range(1, cfg.chunk_size):
-        g_cum_sum_list.append(g_cum_sum_list[-1] + gating_log[:, row : row + 1])
-    # [1, chunk, num_v_heads]
-    g_cum_sum_log = jnp.concat(g_cum_sum_list, axis=1)
+    if _os.environ.get("VLLM_TPU_GDN_CUMSUM_MXU") == "1":
+        # EXPERIMENT: one lower-triangular matmul instead of the row loop.
+        tri_r = jax.lax.broadcasted_iota(jnp.int32, (cfg.chunk_size, cfg.chunk_size), 0)
+        tri_c = jax.lax.broadcasted_iota(jnp.int32, (cfg.chunk_size, cfg.chunk_size), 1)
+        tri = jnp.where(tri_r >= tri_c, 1.0, 0.0).astype(jnp.float32)
+        g_cum_sum_log = jax.lax.dot(
+            tri,
+            gating_log[0].astype(jnp.float32),
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
+        ).astype(gating_log.dtype)[None]
+    else:
+        # [1, 1, num_v_heads]
+        g_cum_sum_list = [gating_log[:, :1]]
+        for row in range(1, cfg.chunk_size):
+            g_cum_sum_list.append(g_cum_sum_list[-1] + gating_log[:, row : row + 1])
+        # [1, chunk, num_v_heads]
+        g_cum_sum_log = jnp.concat(g_cum_sum_list, axis=1)
 
     # [num_v_heads, chunk, 1]
     g_cum_sum_log = fused_transpose_broadcast(g_cum_sum_log, src_dim=2, dst_dim=0)
@@ -165,7 +210,10 @@ def chunked_gdn_per_seq(
     t = jnp.where(identity_mask, 1, gating_beta_k_k_t)
 
     # [num_v_heads, chunk, chunk]
-    t_inv = invert_triangular_matrix(t)
+    if _os.environ.get("VLLM_TPU_GDN_INV_PRODUCT") == "1":
+        t_inv = invert_unit_lower_product(t)
+    else:
+        t_inv = invert_triangular_matrix(t)
 
     # [num_v_heads, chunk, v_head_dim]
     v_beta_large = v_large * beta_large
