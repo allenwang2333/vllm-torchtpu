@@ -81,7 +81,13 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
+    TPU_INDEXER_TOPK_SINGLE_WRITE: bool = True
+    TPU_INDEXER_TOPK_NOCOPY: bool = True
+    TPU_INDEXER_TOPK_SHARED_READ: bool = True
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_STREAMIDX_DCP_QSHARD_MIN_TOKENS: int = 1024
+    VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "has"
+    DEFAULT_INDEXER_KV_CACHE_MODE: str = "has"
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -343,6 +349,9 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
         return value
 
     return _get_positive_int_or_none_env
+
+
+DEFAULT_INDEXER_KV_CACHE_MODE = "has"
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -667,12 +676,38 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PP_CHUNK_SLACK": lambda: float(os.getenv("TPU_PP_CHUNK_SLACK", "0.1")),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
+    # PR #1510 / PR #5 integrations (coalesced indexer k-writer and topk no-copy/shared-read).
+    "TPU_INDEXER_TOPK_SINGLE_WRITE": env_bool(
+        "TPU_INDEXER_TOPK_SINGLE_WRITE", default=True
+    ),
+    "TPU_INDEXER_TOPK_NOCOPY": env_bool("TPU_INDEXER_TOPK_NOCOPY", default=True),
+    "TPU_INDEXER_TOPK_SHARED_READ": env_bool(
+        "TPU_INDEXER_TOPK_SHARED_READ", default=True
+    ),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
     # Unset means unchunked: one single pass, no pipelining.
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
+    ),
+    # Smallest token bucket for which the DCP StreamIndex top-k merges by token
+    # instead of by key: an all_to_all hands each rank 1/dcp of the tokens to
+    # merge, and the winners are all-gathered back, instead of every rank
+    # gathering and merging every token's `dcp * k` candidates. Buckets are
+    # static, so this picks a path at trace time. 0 disables it.
+    "TPU_STREAMIDX_DCP_QSHARD_MIN_TOKENS": env_nonnegative_int(
+        "TPU_STREAMIDX_DCP_QSHARD_MIN_TOKENS", 1024
+    ),
+    # Indexer KV cache layout and writer mode for Deepseek-V4 / GLM-5.2 StreamIndex:
+    # - "has": HEAD_ALONG_SUBLANE layout with coalesced Pallas KV append
+    # - "sal": SEQ_ALONG_LANE layout with coalesced Pallas KV append
+    # - "xla": HEAD_ALONG_SUBLANE layout with XLA scatter
+    "VLLM_TPU_INDEXER_KV_CACHE_MODE": env_with_choices(
+        "VLLM_TPU_INDEXER_KV_CACHE_MODE",
+        DEFAULT_INDEXER_KV_CACHE_MODE,
+        ["sal", "has", "xla"],
+        case_sensitive=False,
     ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
@@ -889,4 +924,4 @@ def enable_envs_cache() -> None:
 
 
 def __dir__() -> list[str]:
-    return list(environment_variables.keys())
+    return ["DEFAULT_INDEXER_KV_CACHE_MODE"] + list(environment_variables.keys())

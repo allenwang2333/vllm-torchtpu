@@ -43,7 +43,13 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group, get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
+    KVLayout,
+    coalesced_kv_append,
+    coalesced_kv_append_dcp,
     cp_rank_as_data,
+    get_kv_cache_shape,
+    indexer_kv_layout,
+    kv_cache_append,
     streamindex_topk,
     streamindex_topk_dcp,
 )
@@ -59,7 +65,10 @@ from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
+
+logger = init_logger(__name__)
 
 # Skip indexer scoring when every sequence in the batch is shorter than
 # `index_topk`, where the top-k is the identity and the scores decide nothing.
@@ -67,6 +76,154 @@ from vllm_torchtpu.utils import synchronize_tensors
 # traffic and not at all once any request in the batch is past `index_topk`
 # tokens.
 STREAMIDX_ENABLE_EARLY_EXIT = True
+
+
+def _topk_rows_update_jax(buf: jax.Array, rows: jax.Array) -> jax.Array:
+    """`buf[:rows.shape[0]] = rows` as one row update of a donated buffer."""
+    return jax.lax.dynamic_update_slice(buf, rows.astype(buf.dtype), (0, 0))
+
+
+def _fake_topk_rows_update(buf: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+    del rows
+    return torch.empty_like(buf)
+
+
+_jax_op_fn = getattr(pallas, "jax_op", None)
+if _jax_op_fn is None and hasattr(pallas, "pallas"):
+    _jax_op_fn = getattr(pallas.pallas, "jax_op", None)
+
+if _jax_op_fn is not None:
+    _TOPK_ROWS_UPDATE_OP = _jax_op_fn(
+        "pallas::indexer_topk_rows_update", _topk_rows_update_jax, donate_argnums=(0,)
+    )
+    _TOPK_ROWS_UPDATE_OP.register_fake(_fake_topk_rows_update)
+else:
+    _TOPK_ROWS_UPDATE_OP = None
+
+_INDEXER_KV_CACHE_FALLBACK_LOGGED: set[tuple[str, str]] = set()
+_INDEXER_KV_CACHE_INFO_LOGGED: set[tuple[str, str, str, tuple[int, ...]]] = set()
+
+
+def _warn_indexer_kv_cache_fallback_once(mode: str, reason: str) -> None:
+    key = (mode, reason)
+    if key in _INDEXER_KV_CACHE_FALLBACK_LOGGED:
+        return
+    _INDEXER_KV_CACHE_FALLBACK_LOGGED.add(key)
+    logger.warning(
+        "VLLM_TPU_INDEXER_KV_CACHE_MODE=%r falling back to 'xla': %s",
+        mode,
+        reason,
+    )
+
+
+def _log_indexer_kv_cache_once(
+    mode: str,
+    writer: str,
+    kv_layout: KVLayout,
+    cache_shape: tuple[int, ...],
+) -> None:
+    layout_tag = "SAL" if kv_layout == KVLayout.SEQ_ALONG_LANE else "HAS"
+    shape_tuple = tuple(int(d) for d in cache_shape)
+    key = (mode, writer, layout_tag, shape_tuple)
+    if key in _INDEXER_KV_CACHE_INFO_LOGGED:
+        return
+    _INDEXER_KV_CACHE_INFO_LOGGED.add(key)
+    logger.info(
+        "indexer kv cache: mode=%s writer=%s layout=%s cache_shape=%s",
+        mode,
+        writer,
+        layout_tag,
+        shape_tuple,
+    )
+
+
+def _unsupported_indexer_kv_cache_reason(
+    cache_kv: jax.Array,
+    k_packed: jax.Array,
+    kv_layout: KVLayout,
+) -> str | None:
+    """Returns a human-readable reason if `cache_kv`/`k_packed` cannot use Pallas."""
+    backend = jax.default_backend()
+    if backend != "tpu":
+        return f"backend={backend!r} is not 'tpu'"
+    try:
+        kv_cache_append.check_scatter_rows_supported(cache_kv, k_packed, kv_layout)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+def _resolve_indexer_kv_cache_mode(
+    cache_kv: jax.Array,
+    k_packed: jax.Array,
+    *,
+    mode: str | None = None,
+) -> tuple[str, KVLayout]:
+    """Resolves the indexer K-cache `(writer, kv_layout)` for `cache_kv` and `k_packed`.
+
+    Layout is decided once by `indexer_kv_layout(block_size, mode=...)` and
+    validated against `get_kv_cache_shape`. `writer` is `'pallas'` for `'has'`
+    and `'sal'`, or `'xla'` for `'xla'`. XLA fallback is only permitted when
+    `kv_layout == KVLayout.HEAD_ALONG_SUBLANE`; `SEQ_ALONG_LANE` on a non-TPU
+    backend or unsupported geometry raises `ValueError`.
+    """
+    raw_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE if mode is None else mode
+    resolved = raw_mode.strip().lower()
+    if resolved not in ("xla", "has", "sal"):
+        raise ValueError(
+            f"Invalid VLLM_TPU_INDEXER_KV_CACHE_MODE={raw_mode!r}; "
+            "expected one of ('xla', 'has', 'sal')."
+        )
+    if cache_kv.ndim != 4:
+        raise ValueError(
+            f"Expected 4-D cache_kv, got {cache_kv.ndim}-D shape {cache_kv.shape}."
+        )
+    if k_packed.ndim != 2:
+        raise ValueError(
+            f"Expected 2-D k_packed, got {k_packed.ndim}-D shape {k_packed.shape}."
+        )
+
+    raw_width = int(k_packed.shape[-1])
+    actual_head_dim = (
+        raw_width - max(1, raw_width // 128) if raw_width % 64 != 0 else raw_width
+    )
+    sal_sublane_groups = ((actual_head_dim + 127) // 128) * 128 // 4 + 1
+    block_size = (
+        int(cache_kv.shape[3])
+        if int(cache_kv.shape[1]) == sal_sublane_groups
+        else int(cache_kv.shape[1]) * 4
+    )
+    kv_layout = indexer_kv_layout(block_size, mode=resolved)
+    expected_shape = get_kv_cache_shape(
+        int(cache_kv.shape[0]),
+        block_size,
+        actual_head_dim,
+        kv_layout,
+    )
+    if tuple(int(d) for d in cache_kv.shape) != expected_shape:
+        raise ValueError(
+            f"cache_kv shape {tuple(cache_kv.shape)} does not match expected "
+            f"{kv_layout.name} shape {expected_shape} for "
+            f"VLLM_TPU_INDEXER_KV_CACHE_MODE={resolved!r}."
+        )
+
+    if resolved == "xla":
+        _log_indexer_kv_cache_once(resolved, "xla", kv_layout, cache_kv.shape)
+        return "xla", kv_layout
+
+    reason = _unsupported_indexer_kv_cache_reason(cache_kv, k_packed, kv_layout)
+    if reason is not None:
+        if kv_layout == KVLayout.SEQ_ALONG_LANE:
+            raise ValueError(
+                f"VLLM_TPU_INDEXER_KV_CACHE_MODE={resolved!r} with layout "
+                f"{kv_layout.name} cannot fall back to 'xla': {reason}"
+            )
+        _warn_indexer_kv_cache_fallback_once(resolved, reason)
+        _log_indexer_kv_cache_once(resolved, "xla", kv_layout, cache_kv.shape)
+        return "xla", kv_layout
+
+    _log_indexer_kv_cache_once(resolved, "pallas", kv_layout, cache_kv.shape)
+    return "pallas", kv_layout
 
 
 def _cp_scatter_indexer_k(
@@ -80,6 +237,8 @@ def _cp_scatter_indexer_k(
     cp_size: int,
     interleave_size: int,
     axis_name: str = DCP_AXIS_NAME,
+    writer: str = "xla",
+    kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
 ) -> jax.Array:
     """Scatter this step's indexer K rows into the DCP-sharded K cache.
 
@@ -96,9 +255,28 @@ def _cp_scatter_indexer_k(
 
     `axis_name`/`cp_size` name the axis the cache is split over.
     """
+    if writer not in ("xla", "pallas"):
+        raise ValueError(f"Expected writer in ('xla', 'pallas'), got {writer!r}.")
+    if writer == "xla" and kv_layout != KVLayout.HEAD_ALONG_SUBLANE:
+        raise ValueError(
+            f"writer='xla' only supports HEAD_ALONG_SUBLANE, got {kv_layout}."
+        )
 
     def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens):
         rank = cp_rank_as_data(axis_name, cp_size)
+        if writer == "pallas":
+            return coalesced_kv_append_dcp(
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                rank,
+                dcp_size=cp_size,
+                interleave_size=interleave_size,
+                kv_layout=kv_layout,
+            )
+
         _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
         page_size = block_size_per_kv_packing * kv_packing
         # The latent cache is guarded on its own page size in
@@ -189,6 +367,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # None means unchunked. The kernel falls back to a single unpipelined
         # pass when `max_num_tokens` is not a multiple of the chunk.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        kv_cache_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -202,28 +381,45 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
             distribution: jax.Array,  # i32 [3]
         ) -> tuple[jax.Array, jax.Array]:
-            _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
-            block_size = block_size_per_kv_packing * kv_packing
-            # Cache rows are padded to the 128-lane HBM width; pad the packed
-            # fp8+scale rows to match before scattering.
-            k_packed = jnp.pad(k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
+            writer, kv_layout = _resolve_indexer_kv_cache_mode(
+                cache_kv, k_packed, mode=kv_cache_mode
+            )
+            if writer == "xla":
+                _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
+                block_size = block_size_per_kv_packing * kv_packing
+                # Cache rows are padded to the 128-lane HBM width; pad the packed
+                # fp8+scale rows to match before scattering.
+                k_packed = jnp.pad(
+                    k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1]))
+                )
 
-            # Insert this step's K rows into the KV cache.
-            tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
-            seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(
-                jnp.int32
-            )
-            q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
-            pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
-            page = jnp.where(
-                tok < cu_q_lens[-1],
-                page_indices.reshape(seq_lens.shape[0], -1)[seq_id, pos // block_size],
-                jnp.int32(2**30),
-            )
-            slot = pos % block_size
-            cache_kv = cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(
-                k_packed
-            )
+                # Insert this step's K rows into the KV cache.
+                tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
+                seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(
+                    jnp.int32
+                )
+                q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
+                pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
+                page = jnp.where(
+                    tok < cu_q_lens[-1],
+                    page_indices.reshape(seq_lens.shape[0], -1)[
+                        seq_id, pos // block_size
+                    ],
+                    jnp.int32(2**30),
+                )
+                slot = pos % block_size
+                cache_kv = cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(
+                    k_packed
+                )
+            else:
+                cache_kv = coalesced_kv_append(
+                    cache_kv,
+                    k_packed,
+                    seq_lens,
+                    page_indices,
+                    cu_q_lens,
+                    kv_layout=kv_layout,
+                )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             topk_indices = streamindex_topk(
@@ -241,6 +437,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_kv_pages_per_block=(2, 2, 2),
                 num_queries_per_block=(1, 128, 128),
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
+                kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
             )
             return cache_kv, topk_indices
@@ -276,6 +473,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Chunking cuts the replicated query-token axis, which is orthogonal to
         # the KV axis DCP shards, so the same knob applies here unchanged.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        kv_cache_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
+        qshard_min_tokens = envs.TPU_STREAMIDX_DCP_QSHARD_MIN_TOKENS
 
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -287,8 +486,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens: jax.Array,
             distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
+            writer, kv_layout = _resolve_indexer_kv_cache_mode(
+                cache_kv, k_packed, mode=kv_cache_mode
+            )
             # `_cp_scatter_indexer_k` pads the packed fp8+scale rows out to
-            # the cache's 128-lane width itself.
+            # the cache's record width itself.
             cache_kv = _cp_scatter_indexer_k(
                 cache_kv,
                 k_packed,
@@ -299,6 +501,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 cp_size=dcp_size,
                 interleave_size=interleave_size,
                 axis_name=DCP_AXIS_NAME,
+                writer=writer,
+                kv_layout=kv_layout,
             )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
@@ -317,7 +521,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 interleave_size=interleave_size,
                 num_kv_pages_per_block=(2, 2, 2),
                 num_queries_per_block=(1, 128, 128),
+                kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
+                qshard_min_tokens=qshard_min_tokens,
             )
             return cache_kv, local_topk
 
@@ -454,12 +660,74 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
             )
 
-        self.topk_indices_buffer[: hidden_states.shape[0]] = -1
-        num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])
-        # Both branches return `topk_tokens`-wide rows.
-        topk = self.topk_tokens
-        self.topk_indices_buffer[:num_out, :topk] = topk_indices[:num_out]
+        if (
+            topk_indices.shape[0] == hidden_states.shape[0]
+            and topk_indices.shape[1] == self.topk_tokens
+        ):
+            self._last_topk_indices = topk_indices
+        else:
+            self._last_topk_indices = None
+
+        if envs.TPU_INDEXER_TOPK_SINGLE_WRITE or envs.TPU_INDEXER_TOPK_NOCOPY:
+            rows = self._write_topk_rows(hidden_states.shape[0], topk_indices)
+            if envs.TPU_INDEXER_TOPK_SHARED_READ:
+                return self.topk_indices_buffer
+            return rows
+
+        _store_topk_rows(
+            self.topk_indices_buffer,
+            topk_indices,
+            hidden_states.shape[0],
+            self.topk_tokens,
+        )
         return self.topk_indices_buffer
+
+    def _write_topk_rows(
+        self, num_tokens: int, topk_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """The rows the -1 fill plus partial write would leave, in one update."""
+        buf = self.topk_indices_buffer
+        num_tokens = min(num_tokens, buf.shape[0])
+        rows = topk_indices[:num_tokens, : self.topk_tokens].to(buf.dtype)
+        pad_rows = num_tokens - rows.shape[0]
+        pad_cols = buf.shape[1] - rows.shape[1]
+        if pad_rows or pad_cols:
+            rows = torch.nn.functional.pad(rows, (0, pad_cols, 0, pad_rows), value=-1)
+        if envs.TPU_INDEXER_TOPK_NOCOPY and _TOPK_ROWS_UPDATE_OP is not None:
+            buf.copy_(_TOPK_ROWS_UPDATE_OP(buf, rows))
+        else:
+            buf[:num_tokens] = rows
+        return rows
+
+
+def _store_topk_rows(
+    buffer: torch.Tensor,
+    topk_indices: torch.Tensor,
+    num_tokens: int,
+    topk: int,
+) -> None:
+    """Write this step's top-k rows into the persistent handoff buffer.
+
+    Semantics are always those of `buffer[:num_tokens] = -1` followed by
+    `buffer[:n, :topk] = topk_indices[:n]` with `n = min(rows, buffer rows)`,
+    the general path kept below. Each in-place slice write on the persistent
+    buffer is functionalized into a full-buffer copy by XLA
+    (s32[max_num_batched_tokens, topk], 32 MiB for GLM-5.2), so when the
+    kernel output covers exactly the rows and columns the -1 fill would touch,
+    the fill is skipped and a single write is issued. The condition compares
+    static widths and the token count with itself (the kernel emits one row
+    per token), so the branch is resolved while tracing without a new guard.
+    """
+    rows, cols = topk_indices.shape
+    buf_rows, buf_cols = buffer.shape
+    if num_tokens == rows and topk == cols and cols == buf_cols:
+        n = min(rows, buf_rows)
+        buffer[:n] = topk_indices[:n]
+        return
+
+    buffer[:num_tokens] = -1
+    n = min(rows, buf_rows)
+    buffer[:n, :topk] = topk_indices[:n]
 
 
 class VllmTPUIndexerCache(DeepseekV32IndexerCache):
