@@ -14,9 +14,9 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_CAPPED_PREP: bool = False
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
     TPU_DCP_MLA_RAGGED_WIDTH: bool = False
-    TPU_DCP_MLA_RAGGED_WIDTH_SUB: int = 64
+    TPU_DCP_MLA_RAGGED_WIDTH_SUB: int = 128
     TPU_DCP_MLA_RAGGED_WIDTH_GROUP: int = 4
-    TPU_DCP_MLA_RAGGED_GATHER_ATOMS: int = 1
+    TPU_DCP_MLA_RAGGED_GATHER_ATOMS: int = 0
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -401,14 +401,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (`sparse_ragged_paged_attention(ragged_width=..., ragged_group=...,
     # ragged_gather_atoms=...)`). The attention kernel DMAs and attends
     # `_SUB * cdiv(max count, _SUB)` slots per group of `_GROUP` consecutive
-    # tokens, and the SparseCore gather skips every `_GATHER_ATOMS` x 64-slot
-    # batch past a row's live entries (0 = gather the full cap). A rank owns
-    # ~128 of 2048 per row on average, so most rows need 128-192 of the 512
-    # capped slots. Bit-identical outputs.
+    # tokens; `_GATHER_ATOMS` > 0 also bounds the SparseCore gather (skip
+    # 64-slot batches past a row's live entries; = cap/64: one batch per row,
+    # pipelined over its live atoms). Experimental, off: measured standalone
+    # (TPU v7x) the attention kernel does not get faster with a narrower tile
+    # (prefill -2%, decode -1..-4%), the per-batch gather skip is slower, and
+    # the row mode halves the gather alone but slows the whole call (+15%).
+    # Same values (bit-identical except single-token narrowed groups, <= 1/64
+    # abs).
     "TPU_DCP_MLA_RAGGED_WIDTH": env_bool("TPU_DCP_MLA_RAGGED_WIDTH", default=False),
-    "TPU_DCP_MLA_RAGGED_WIDTH_SUB": env_int("TPU_DCP_MLA_RAGGED_WIDTH_SUB", 64),
+    "TPU_DCP_MLA_RAGGED_WIDTH_SUB": env_int("TPU_DCP_MLA_RAGGED_WIDTH_SUB", 128),
     "TPU_DCP_MLA_RAGGED_WIDTH_GROUP": env_int("TPU_DCP_MLA_RAGGED_WIDTH_GROUP", 4),
-    "TPU_DCP_MLA_RAGGED_GATHER_ATOMS": env_int("TPU_DCP_MLA_RAGGED_GATHER_ATOMS", 1),
+    "TPU_DCP_MLA_RAGGED_GATHER_ATOMS": env_int("TPU_DCP_MLA_RAGGED_GATHER_ATOMS", 0),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per

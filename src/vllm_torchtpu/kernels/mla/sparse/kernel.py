@@ -1476,15 +1476,21 @@ def sparse_ragged_paged_attention(
         step, only the first `ragged_width * cdiv(max live entries,
         ragged_width)` slots of each token's capped window instead of all
         `topk_cap`; slots past a token's live entries were masked anyway, so
-        the output is bit-identical. A group holding a token over the cap
-        takes the full window (its in-kernel overflow pass is unchanged).
+        the narrowed columns are exact zeros: bit-identical output, except
+        single-token groups at a narrowed width (decode buckets), whose
+        lowering rounds a few elements differently (<= 1/64 abs, lse <= 2
+        ulp on TPU v7x). A group holding a token over the cap takes the full
+        window (its in-kernel overflow pass is unchanged). Measured on v7x:
+        no faster than the full window (the kernel is not width-bound there).
       ragged_group: Tokens sharing one width (divides the grid step; None =
         the whole step). Smaller groups follow each token's own count more
         closely at the price of more, smaller DMAs and branches.
       ragged_gather_atoms: With `topk_cap` (capped chunks only). The native
         SparseCore gather of a capped chunk runs with this many 64-row atoms
         per logical batch (must divide `topk_cap // 64`) and skips every
-        batch past its row's live entries, leaving those rows unwritten.
+        batch past its row's live entries, leaving those rows unwritten;
+        `topk_cap // 64` (one batch per row) instead runs each batch's inner
+        pipeline over the row's live atoms only. Bit-identical output.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
