@@ -79,6 +79,37 @@ def _build_problem(rng, *, k_scale, query_tokens=128, topk=256):
     }
 
 
+def _optimized_hlo(fn, *args) -> str:
+    """Post-optimization HLO text of `fn(*args)`.
+
+    `Compiled.as_text()` re-parses the module proto and trips on async ops on
+    this jaxlib (RET_CHECK "async-update ... 1 operands"), so read the
+    executable's modules directly, else the XLA dump (`--xla_dump_to`).
+    """
+    import glob
+    import os
+
+    compiled = fn.lower(*args).compile()
+    try:
+        return "\n".join(
+            m.to_string() for m in compiled.runtime_executable().hlo_modules()
+        )
+    except Exception:  # noqa: BLE001 - fall back to the dump below
+        pass
+    flags = os.environ.get("XLA_FLAGS", "")
+    dump = next(
+        (f.split("=", 1)[1] for f in flags.split() if f.startswith("--xla_dump_to=")),
+        None,
+    )
+    if dump is None:
+        raise RuntimeError("no HLO text: set XLA_FLAGS=--xla_dump_to=<dir>")
+    files = sorted(
+        glob.glob(os.path.join(dump, "*jit_layers*after_optimizations.txt")),
+        key=os.path.getmtime,
+    )
+    return open(files[-1]).read()
+
+
 class SparseMlaCacheLayoutsTest(parameterized.TestCase):
     @parameterized.product(k_scale=(0.75, 1.0), return_lse=(False, True))
     def test_sparsecore_layout_matches_tensorcore_layout(self, k_scale, return_lse):
@@ -814,7 +845,7 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             counts, outs = {}, {}
             for shared in (False, True):
                 fn = jax.jit(functools.partial(layers, shared=shared, prep=prep))
-                hlo = fn.lower(table, topk_idx, problem["q"], q2).compile().as_text()
+                hlo = _optimized_hlo(fn, table, topk_idx, problem["q"], q2)
                 counts[shared] = len(
                     re.findall(rf"%{name}(?:\.\d+)? = ", hlo)
                 )
