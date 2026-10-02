@@ -96,3 +96,117 @@ def test_extra_tensors_rejected_before_collectives(
     with pytest.raises(NotImplementedError, match="extra_tensors"):
         getattr(communicator, method)(*[torch.ones(1)] * count, extra_tensors=[])
     get_group.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "method,count", [("dispatch", 3), ("dispatch_router_logits", 2), ("combine", 1)]
+)
+@pytest.mark.parametrize("ep_size", [1, 4])
+def test_dispatch_and_combine_use_ep_group_when_sequence_parallel(
+    monkeypatch, communicator, method, count, ep_size
+):
+    dp_group = Mock(world_size=1)
+    ep_group = Mock(world_size=ep_size)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: dp_group)
+    monkeypatch.setattr(comm, "get_ep_group", lambda: ep_group)
+    # Alternate dtypes so dispatch_router_logits stays on the unpacked path.
+    dtypes = [torch.float32, torch.bfloat16, torch.float32]
+    tensors = [torch.tensor([[i, i + 1]], dtype=dtypes[i]) for i in range(count)]
+    ep_group.all_gather.side_effect = lambda x, dim: torch.cat([x, x + 10], dim=dim)
+    ep_group.reduce_scatter.return_value = torch.tensor([[11, 12]])
+    result = getattr(communicator, method)(*tensors, is_sequence_parallel=True)
+    dp_group.all_gather.assert_not_called()
+    dp_group.reduce_scatter.assert_not_called()
+    if method == "combine":
+        if ep_size == 1:
+            assert result is tensors[0]
+            ep_group.reduce_scatter.assert_not_called()
+        else:
+            ep_group.reduce_scatter.assert_called_once_with(tensors[0], dim=0)
+            assert result is ep_group.reduce_scatter.return_value
+        ep_group.all_gather.assert_not_called()
+    elif ep_size == 1:
+        assert len(result) == count
+        assert all(actual is expected for actual, expected in zip(result, tensors))
+        ep_group.all_gather.assert_not_called()
+    else:
+        assert len(result) == count
+        for actual, expected, invocation in zip(
+            result, tensors, ep_group.all_gather.call_args_list
+        ):
+            torch.testing.assert_close(actual, torch.cat([expected, expected + 10]))
+            assert invocation.args[0] is expected
+            assert invocation.kwargs == {"dim": 0}
+        assert ep_group.all_gather.call_count == count
+        ep_group.reduce_scatter.assert_not_called()
+
+
+def _sp_groups(monkeypatch, dp_size, tp_size):
+    dp_group = Mock(world_size=dp_size)
+    ep_group = Mock(world_size=dp_size * tp_size)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: dp_group)
+    monkeypatch.setattr(comm, "get_ep_group", lambda: ep_group)
+    ep_group.all_gather.side_effect = lambda x, dim: torch.cat(
+        [x + 100 * r for r in range(ep_group.world_size)], dim=dim
+    )
+    return dp_group, ep_group
+
+
+@pytest.mark.parametrize("dp_size,tp_size", [(1, 4), (2, 2)])
+def test_sequence_parallel_packs_single_gather(
+    monkeypatch, communicator, dp_size, tp_size
+):
+    """Matching dtypes: hidden_states and router_logits share one EP gather."""
+    _, ep_group = _sp_groups(monkeypatch, dp_size=dp_size, tp_size=tp_size)
+    chunk = torch.arange(3 * 4, dtype=torch.bfloat16).reshape(3, 4)
+    logits = torch.arange(3 * 2, dtype=torch.bfloat16).reshape(3, 2) + 50
+
+    out_hidden, out_logits = communicator.dispatch_router_logits(
+        chunk, logits, is_sequence_parallel=True
+    )
+
+    ep_group.all_gather.assert_called_once()
+    packed = ep_group.all_gather.call_args.args[0]
+    assert packed.shape == (3, 6)
+    expected_hidden = torch.cat([chunk + 100 * r for r in range(dp_size * tp_size)])
+    expected_logits = torch.cat([logits + 100 * r for r in range(dp_size * tp_size)])
+    torch.testing.assert_close(out_hidden, expected_hidden)
+    torch.testing.assert_close(out_logits, expected_logits)
+
+
+def test_sequence_parallel_mixed_dtype_uses_two_gathers(monkeypatch, communicator):
+    _, ep_group = _sp_groups(monkeypatch, dp_size=2, tp_size=2)
+    chunk = torch.zeros(3, 4, dtype=torch.bfloat16)
+    logits = torch.zeros(3, 2, dtype=torch.float32)
+
+    out_hidden, out_logits = communicator.dispatch_router_logits(
+        chunk, logits, is_sequence_parallel=True
+    )
+
+    assert ep_group.all_gather.call_count == 2
+    assert ep_group.all_gather.call_args_list[0].args[0] is chunk
+    assert ep_group.all_gather.call_args_list[1].args[0] is logits
+    assert out_hidden.dtype == torch.bfloat16 and out_logits.dtype == torch.float32
+    assert out_hidden.shape == (12, 4) and out_logits.shape == (12, 2)
+
+
+def test_sequence_parallel_3d_hidden_uses_two_gathers(monkeypatch, communicator):
+    """Packing needs 2-D operands; a [1, T/TP, H] hidden falls back cleanly."""
+    _, ep_group = _sp_groups(monkeypatch, dp_size=1, tp_size=2)
+    chunk = torch.zeros(1, 3, 4, dtype=torch.bfloat16)
+    logits = torch.zeros(3, 2, dtype=torch.bfloat16)
+
+    communicator.dispatch_router_logits(chunk, logits, is_sequence_parallel=True)
+
+    assert ep_group.all_gather.call_count == 2
+
+
+def test_non_sequence_parallel_dispatch_never_packs(monkeypatch, communicator):
+    """The DP-only path keeps the two separate gathers even with equal dtypes."""
+    dp_group = Mock(world_size=2)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: dp_group)
+    dp_group.all_gather.side_effect = lambda x, dim: torch.cat([x, x], dim=dim)
+
+    communicator.dispatch_router_logits(torch.zeros(4, 4), torch.zeros(4, 2))
+
+    assert dp_group.all_gather.call_count == 2

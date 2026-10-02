@@ -405,6 +405,7 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
+        "VLLM_TPU_MOE_SEQUENCE_PARALLEL",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -734,18 +735,37 @@ class TpuPlatform(Platform):
         # Set compile_sizes to match the token padding buckets used by
         # TPUModelRunner. These are the exact shapes PiecewiseBackend
         # will compile for.
+        use_sp_moe = parallel_config.use_sequence_parallel_moe
+        min_token_size = (
+            max(16, 2 * parallel_config.tensor_parallel_size) if use_sp_moe else 16
+        )
         if compilation_config.compile_sizes is None:
             scheduler_config = vllm_config.scheduler_config
             compilation_config.compile_sizes = cast(
                 list[int | str],
                 _get_token_paddings(
-                    min_token_size=16,
+                    min_token_size=min_token_size,
                     max_token_size=scheduler_config.max_num_batched_tokens,
                     extra_bucket_sizes=envs.TPU_TOKEN_BUCKET_EXTRA,
                 ),
             )
         else:
             compilation_config.compile_sizes = sorted(compilation_config.compile_sizes)
+        if use_sp_moe:
+            tp_size = parallel_config.tensor_parallel_size
+            aligned_sizes: set[int] = set()
+            for raw_size in compilation_config.compile_sizes:
+                s = max(
+                    2 * tp_size, ((int(raw_size) + tp_size - 1) // tp_size) * tp_size
+                )
+                local_s = s // tp_size
+                if local_s not in (2, 4) and local_s % 8 != 0:
+                    local_s = ((local_s + 7) // 8) * 8
+                    s = local_s * tp_size
+                aligned_sizes.add(s)
+            compilation_config.compile_sizes = cast(
+                list[int | str], sorted(aligned_sizes)
+            )
         # Clear compile_ranges_split_points — TPU always pads to exact
         # compile_sizes so catch-all ranges are never used.
         compilation_config.compile_ranges_split_points = []

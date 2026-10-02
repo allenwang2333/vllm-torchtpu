@@ -220,7 +220,11 @@ def test_manifest_preserves_lifecycle_dependencies():
     assert stages["platform_activation"] == (
         stages["worker_init"] + stages["model_load"]
     )
-    assert stages["model_load"] == ["maybe_patch_qwen2_5_vl", "maybe_patch_qwen3_vl"]
+    assert stages["model_load"] == [
+        "maybe_patch_qwen2_5_vl",
+        "maybe_patch_qwen3_vl",
+        "maybe_patch_qwen3_next",
+    ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
     for names in (stages["platform_activation"], stages["worker_init"]):
         assert names.index("_patch_vllm_force_v1_runner_tpu") < names.index(
