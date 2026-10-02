@@ -10,7 +10,7 @@ import torch
 from vllm.model_executor.models import qwen3_next, qwen3_next_mtp
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.models.vllm.qwen3_next_patch import (
+from vllm_torchtpu.models.vllm.qwen3_next_ep_sp_patch import (
     UPSTREAM_DECODER_LAYER_FORWARD,
     UPSTREAM_MODEL_FORWARD,
     UPSTREAM_MTP_FORWARD,
@@ -38,7 +38,7 @@ def test_upstream_qwen3_next_forward_unchanged():
     ).hexdigest()
     assert actual_decoder_hash == PINNED_DECODER_LAYER_HASH, (
         "Upstream Qwen3NextDecoderLayer.forward has drifted. "
-        "Re-sync src/vllm_torchtpu/models/vllm/qwen3_next_patch.py."
+        "Re-sync src/vllm_torchtpu/models/vllm/qwen3_next_ep_sp_patch.py."
     )
 
     actual_model_hash = hashlib.sha256(
@@ -46,7 +46,7 @@ def test_upstream_qwen3_next_forward_unchanged():
     ).hexdigest()
     assert actual_model_hash == PINNED_MODEL_FORWARD_HASH, (
         "Upstream Qwen3NextModel.forward has drifted. "
-        "Re-sync src/vllm_torchtpu/models/vllm/qwen3_next_patch.py."
+        "Re-sync src/vllm_torchtpu/models/vllm/qwen3_next_ep_sp_patch.py."
     )
 
     actual_mtp_hash = hashlib.sha256(
@@ -54,7 +54,7 @@ def test_upstream_qwen3_next_forward_unchanged():
     ).hexdigest()
     assert actual_mtp_hash == PINNED_MTP_FORWARD_HASH, (
         "Upstream Qwen3NextMultiTokenPredictor.forward has drifted. "
-        "Re-sync src/vllm_torchtpu/models/vllm/qwen3_next_patch.py."
+        "Re-sync src/vllm_torchtpu/models/vllm/qwen3_next_ep_sp_patch.py."
     )
 
 
@@ -103,11 +103,11 @@ def test_patched_decoder_layer_forward_mtp_entry_prechunked(monkeypatch):
     hidden_size = 64
 
     monkeypatch.setattr(
-        "vllm_torchtpu.models.vllm.qwen3_next_patch.get_tensor_model_parallel_world_size",
+        "vllm_torchtpu.models.vllm.qwen3_next_ep_sp_patch.get_tensor_model_parallel_world_size",
         lambda: tp_world_size,
     )
     monkeypatch.setattr(
-        "vllm_torchtpu.models.vllm.qwen3_next_patch.get_tensor_model_parallel_rank",
+        "vllm_torchtpu.models.vllm.qwen3_next_ep_sp_patch.get_tensor_model_parallel_rank",
         lambda: 0,
     )
 
@@ -118,11 +118,11 @@ def test_patched_decoder_layer_forward_mtp_entry_prechunked(monkeypatch):
         return x.narrow(0, 0, chunk)
 
     monkeypatch.setattr(
-        "vllm_torchtpu.models.vllm.qwen3_next_patch.tensor_model_parallel_all_gather",
+        "vllm_torchtpu.models.vllm.qwen3_next_ep_sp_patch.tensor_model_parallel_all_gather",
         fake_all_gather,
     )
     monkeypatch.setattr(
-        "vllm_torchtpu.models.vllm.qwen3_next_patch.tensor_model_parallel_reduce_scatter",
+        "vllm_torchtpu.models.vllm.qwen3_next_ep_sp_patch.tensor_model_parallel_reduce_scatter",
         fake_reduce_scatter,
     )
 

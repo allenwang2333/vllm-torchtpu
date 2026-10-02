@@ -67,7 +67,11 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_reset_compile_wrapper", _ACTIVE),
     # MoE routing and collectives.
     Patch("vllm_torchtpu:_patch_default_moe_runner_select_forward", _ACTIVE),
-    Patch("vllm_torchtpu:_patch_disable_sequence_parallel_moe", _ACTIVE),
+    Patch(
+        "vllm_torchtpu:_patch_disable_sequence_parallel_moe",
+        _ACTIVE,
+        refresh="vllm_torchtpu:_patch_disable_sequence_parallel_moe",
+    ),
     Patch("vllm_torchtpu.models.vllm.qwen3_next_attn_moe_overlap:apply_qwen3_next_attn_moe_overlap_patch", _ACTIVE),
     Patch("vllm_torchtpu:_patch_expert_map_host_lookup", _ACTIVE),
     Patch("vllm_torchtpu:_patch_moe_explicit_pcp_collectives", _ACTIVE),
@@ -143,8 +147,13 @@ PATCHES = (
         model_config=True,
     ),
     Patch(
+        "vllm_torchtpu.models.vllm.qwen3_next_ep_sp_patch:maybe_patch_qwen3_next",
+        ("platform_activation", "model_load"),
+    ),
+    Patch(
         "vllm_torchtpu.models.vllm.qwen3_next_patch:maybe_patch_qwen3_next",
         ("platform_activation", "model_load"),
+        model_config=True,
     ),
 )
 
