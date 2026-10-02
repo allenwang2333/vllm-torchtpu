@@ -540,6 +540,18 @@ def moe_gmm(
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
 
+def _local_expert_routing(
+    topk_ids, topk_weights, experts_start, num_primary_experts
+):
+    """Route only to this shard's primary interval; trailing slots may be copies."""
+    local_ids = topk_ids - experts_start
+    valid = (local_ids >= 0) & (local_ids < num_primary_experts)
+    return (
+        jnp.where(valid, local_ids, jnp.full_like(local_ids, -1)),
+        jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights)),
+    )
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -550,6 +562,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "num_primary_experts",
     ),
 )
 def fused_moe_func(
@@ -570,6 +583,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    num_primary_experts: int | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -616,10 +630,53 @@ def fused_moe_func(
     topk_weights = topk_weights.astype(hidden_states.dtype)
 
     if use_ep and experts_start is not None:
-        local_ids = topk_ids - experts_start
-        valid = (local_ids >= 0) & (local_ids < w1.shape[0])
-        topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
-        topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+        owned = (
+            w1.shape[0] if num_primary_experts is None else num_primary_experts
+        )
+        if not 0 < owned <= w1.shape[0]:
+            raise ValueError(
+                "num_primary_experts must fit the local weight slots"
+            )
+        topk_ids, topk_weights = _local_expert_routing(
+            topk_ids, topk_weights, experts_start, owned
+        )
+
+    lowtok_max = envs.TPU_MOE_LOWTOK_MAX_TOKENS
+    if (
+        use_ep
+        and experts_start is not None
+        and lowtok_max
+        and num_tokens <= lowtok_max
+        and activation == "silu"
+        and rhs_quant_dtype is None
+        and w1_bias is None
+        and w2_bias is None
+        and w1_scale is not None
+        and w2_scale is not None
+        and w1.dtype == jnp.float8_e4m3fn
+        and w2.dtype == jnp.float8_e4m3fn
+        and hidden_states.dtype == jnp.bfloat16
+        and w1_scale.ndim == 4
+        and w1_scale.shape[1] == 1
+        and w1_scale.shape[2] == 1
+        and w2_scale.ndim == 4
+        and w2_scale.shape[1] == 1
+        and w2_scale.shape[2] == 1
+        and w1.shape[1] == hidden_size
+        and w1.shape[0] <= 128
+        and w1.shape[2] % 512 == 0
+    ):
+        from vllm_torchtpu.kernels.moe_lowtok.kernel import moe_lowtok
+
+        return moe_lowtok(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+        )
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
