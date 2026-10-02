@@ -79,3 +79,108 @@ def test_apply_top_k_top_p_per_request():
     result = sampling.apply_top_k_top_p(logits, top_k, top_p)
     torch.testing.assert_close(result, expected)
     torch.testing.assert_close(logits, original)
+
+
+# The bounded (torch.topk) path must reproduce the binary-search path exactly:
+# same masked positions and same values, at the served vocab size.
+_VOCAB = 248320
+_K_BOUND = 64
+
+
+def _assert_bounded_matches(logits, top_k, top_p, k_bound=_K_BOUND):
+    expected = sampling.apply_top_k_top_p(logits, top_k, top_p)
+    result = sampling.apply_top_k_top_p(logits, top_k, top_p, k_bound)
+    assert result.dtype == expected.dtype
+    kept_expected = expected != sampling.MASKED_LOGIT_VALUE
+    kept_result = result != sampling.MASKED_LOGIT_VALUE
+    assert torch.equal(kept_result, kept_expected), (
+        kept_result.sum(-1).tolist(),
+        kept_expected.sum(-1).tolist(),
+    )
+    assert torch.equal(result, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("rows", [1, 4, 8])
+@pytest.mark.parametrize("k", [1, 20, 64])
+@pytest.mark.parametrize("p", [0.5, 0.95, 1.0])
+@pytest.mark.parametrize("scale", [1.0, 4.0])
+def test_bounded_path_matches_search(dtype, rows, k, p, scale):
+    gen = torch.Generator().manual_seed(rows * 1009 + k * 31 + int(scale))
+    # Temperature-scaled in the logits dtype, as sample_from_logits does.
+    logits = (torch.randn(rows, _VOCAB, generator=gen) * scale).to(dtype)
+    logits = logits / torch.tensor(0.6, dtype=dtype)
+    top_k = torch.full((rows, 1), k, dtype=torch.int32)
+    top_p = torch.full((rows, 1), p, dtype=torch.float32)
+    _assert_bounded_matches(logits, top_k, top_p)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_bounded_path_mixed_rows(dtype):
+    gen = torch.Generator().manual_seed(7)
+    logits = (torch.randn(8, _VOCAB, generator=gen) * 3.0).to(dtype)
+    # Mixed per-row params, plus rows that apply neither mask (top_k == 0 and
+    # top_p == 1, i.e. padding rows) and a top-p-only-off row.
+    top_k = torch.tensor([[1], [20], [64], [5], [0], [33], [0], [64]])
+    top_p = torch.tensor([[0.5], [0.95], [1.0], [0.1], [1.0], [0.99], [1.0], [0.3]])
+    assert sampling.topk_fast_path_bound(top_k, top_p, _K_BOUND) == _K_BOUND
+    _assert_bounded_matches(logits, top_k.to(torch.int32), top_p)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("k", [1, 3, 20, 64])
+@pytest.mark.parametrize("p", [0.3, 0.95, 1.0])
+def test_bounded_path_ties(dtype, k, p):
+    # Heavily quantized logits: many exact ties at and around the cutoff,
+    # including ties that continue past the k_bound window.
+    gen = torch.Generator().manual_seed(k)
+    logits = torch.randint(-20, 4, (4, _VOCAB), generator=gen).to(dtype) / 2
+    # Row 1: a block of 100 tied maxima (top-k ties all past the window).
+    logits[1, 1000:1100] = 10.0
+    # Row 2: two levels, 10 tied above 200 tied (cutoff level overflows).
+    logits[2, 5:15] = 12.0
+    logits[2, 50000:50200] = 11.0
+    # Row 3: all equal.
+    logits[3] = 0.0
+    top_k = torch.full((4, 1), k, dtype=torch.int32)
+    top_p = torch.full((4, 1), p, dtype=torch.float32)
+    _assert_bounded_matches(logits, top_k, top_p)
+
+
+def test_bounded_path_neg_inf_and_edge_p():
+    gen = torch.Generator().manual_seed(3)
+    logits = torch.randn(4, _VOCAB, generator=gen)
+    # Row 0: fewer finite logits than k (grammar-style -inf mask).
+    logits[0, 10:] = float("-inf")
+    top_k = torch.tensor([[20], [20], [20], [64]], dtype=torch.int32)
+    # Row 2: p == 0 keeps nothing in the search path; row 3: p ~ 1.
+    top_p = torch.tensor([[0.95], [0.95], [0.0], [0.999999]])
+    _assert_bounded_matches(logits, top_k, top_p)
+
+
+def test_bounded_path_greedy_rejection_scaling():
+    # Rejection sampler: f32 logits / (temperature + 1e-9); greedy rows have
+    # temperature 0, giving huge but finite logits.
+    gen = torch.Generator().manual_seed(11)
+    logits = torch.randn(4, _VOCAB, generator=gen).to(torch.bfloat16)
+    temps = torch.tensor([[0.0], [0.6], [0.0], [1.0]])
+    scaled = logits.to(torch.float32) / (temps + 1e-9)
+    top_k = torch.full((4, 1), 20, dtype=torch.int32)
+    top_p = torch.full((4, 1), 0.95)
+    _assert_bounded_matches(scaled, top_k, top_p)
+
+
+def test_topk_fast_path_bound():
+    k = torch.tensor([[20], [64], [0]])
+    p = torch.tensor([[0.95], [1.0], [1.0]])
+    assert sampling.topk_fast_path_bound(k, p, 64) == 64
+    assert sampling.topk_fast_path_bound(k, p, 0) == 0
+    # top_k above the bound, top_k == 0 with live top-p, negative top_k.
+    assert sampling.topk_fast_path_bound(k + 45, p, 64) == 0
+    assert (
+        sampling.topk_fast_path_bound(k, torch.tensor([[1.0], [1.0], [0.9]]), 64) == 0
+    )
+    assert (
+        sampling.topk_fast_path_bound(torch.tensor([[-1]]), torch.tensor([[1.0]]), 64)
+        == 0
+    )

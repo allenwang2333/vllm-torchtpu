@@ -240,8 +240,20 @@ def topp_mask(
 
 
 def apply_top_k_top_p(
-    logits: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor
+    logits: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    k_bound: int = 0,
 ) -> torch.Tensor:
+    """Top-k then top-p masking. [batch, vocab] logits, [batch, 1] params.
+
+    ``k_bound`` is a compile-time constant from ``topk_fast_path_bound``: when
+    positive, every row is promised to have ``0 < top_k <= k_bound`` or to
+    apply neither mask, and a ``torch.topk``-based path with the same output
+    replaces the two full-vocab binary searches. 0 keeps the general path.
+    """
+    if k_bound > 0:
+        return _apply_top_k_top_p_bounded(logits, top_k, top_p, k_bound)
     should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
     topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE)
     masked_logits = torch.where(should_apply_topk, topk_masked, logits)
@@ -249,3 +261,86 @@ def apply_top_k_top_p(
     should_apply_topp = (top_p < 1.0).expand(-1, masked_logits.shape[-1])
     topp_masked = topp_mask(masked_logits, top_p, MASKED_LOGIT_VALUE)
     return torch.where(should_apply_topp, topp_masked, masked_logits)
+
+
+def topk_fast_path_bound(top_k: torch.Tensor, top_p: torch.Tensor, k_bound: int) -> int:
+    """Host-side choice of the static ``k_bound`` for ``apply_top_k_top_p``.
+
+    Returns ``k_bound`` when every row either has ``0 < top_k <= k_bound``, or
+    applies neither mask (``top_k == 0`` and ``top_p >= 1``, which is how
+    padding rows and unrestricted requests arrive). Otherwise returns 0, which
+    selects the full-vocab binary-search path. Call it on CPU tensors so the
+    result is a Python int that can be passed as a compile-time constant.
+
+    Args:
+      top_k: Per-row top-k, 0 meaning "not applied". [batch..., 1] or [batch]
+      top_p: Per-row top-p, >= 1 meaning "not applied". Same shape as top_k.
+      k_bound: Largest top_k the bounded path handles; <= 0 disables it.
+    """
+    if k_bound <= 0:
+        return 0
+    bounded = (top_k > 0) & (top_k <= k_bound)
+    unmasked = (top_k == 0) & (top_p >= 1.0)
+    return k_bound if bool((bounded | unmasked).all()) else 0
+
+
+def _apply_top_k_top_p_bounded(
+    logits: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor, k_bound: int
+) -> torch.Tensor:
+    """``apply_top_k_top_p`` for rows whose top_k lies in (0, k_bound].
+
+    Same output as the binary-search path, with one ``torch.topk`` in place of
+    the 64 full-vocab reductions the two bit-pattern searches cost:
+
+    * top-k: the cutoff is the k-th largest value, read from the sorted top
+      ``k_bound`` values. It equals the value ``topk_mask``'s search converges
+      to, so ``logits >= cutoff`` keeps the same set, ties included (also ties
+      that fall outside the ``k_bound`` window).
+    * top-p: ``topp_mask``'s threshold is the probability of the first level,
+      walking down the sorted survivors, at which the kept mass reaches p.
+      Every survivor is either inside the window or a tie of the cutoff, so
+      that level is found with a cumsum over the window; the probabilities
+      themselves come from the same full-vocab softmax ``topp_mask`` uses.
+
+    Rows with ``top_k == 0`` keep their logits from the top-k stage, exactly
+    as in ``apply_top_k_top_p``; the caller only sends such rows here when
+    they also have ``top_p >= 1`` (see ``topk_fast_path_bound``).
+    """
+    width = min(k_bound, logits.shape[-1])
+    vals, idx = torch.topk(logits, width, dim=-1, largest=True, sorted=True)
+
+    # --- top-k: cutoff = k-th largest value, as float32 like the search. ---
+    k_index = (top_k.clamp(min=1, max=width) - 1).to(torch.int64)
+    cutoff = torch.gather(vals, -1, k_index).to(torch.float32)
+    # The search only returns finite values: with fewer than k finite logits
+    # it stops at -FLT_MAX, which drops -inf entries.
+    cutoff = torch.clamp(cutoff, min=torch.finfo(torch.float32).min)
+    replace_tensor = torch.full_like(logits, MASKED_LOGIT_VALUE)
+    topk_masked = torch.where(logits >= cutoff, logits, replace_tensor)
+    masked_logits = torch.where(top_k > 0, topk_masked, logits)
+
+    # --- top-p over the survivors. ---
+    probs = torch.softmax(masked_logits, dim=-1)
+    win_probs = torch.gather(probs, -1, idx)  # non-increasing along the row
+    # topp_mask sums in the probabilities' dtype; accumulate in f32 and round
+    # to match.
+    cum_mass = torch.cumsum(win_probs.to(torch.float32), dim=-1).to(probs.dtype)
+    reached = cum_mass >= top_p
+    reached_in_window = torch.any(reached, dim=-1, keepdim=True)
+    first_reached = torch.argmax(reached.to(torch.int32), dim=-1, keepdim=True)
+    threshold_in_window = torch.gather(win_probs, -1, first_reached)
+    # Not reached inside the window: the level is the lowest survivor (whose
+    # ties may continue past the window) if the whole kept mass reaches p.
+    num_window_survivors = torch.sum(
+        (vals.to(torch.float32) >= cutoff).to(torch.int32), dim=-1, keepdim=True
+    )
+    last_survivor = (num_window_survivors - 1).clamp(min=0).to(torch.int64)
+    threshold_lowest = torch.gather(win_probs, -1, last_survivor)
+    total_mass = torch.sum(probs, dim=-1, keepdim=True)
+    threshold = torch.where(reached_in_window, threshold_in_window, threshold_lowest)
+    # topp_mask keeps nothing when no threshold satisfies the mass (p > total
+    # mass, or p <= 0).
+    has_threshold = (reached_in_window | (total_mass >= top_p)) & (top_p > 0)
+    keep = (probs >= threshold) & has_threshold
+    topp_masked = torch.where(keep, masked_logits, replace_tensor)
+    return torch.where(top_p < 1.0, topp_masked, masked_logits)
