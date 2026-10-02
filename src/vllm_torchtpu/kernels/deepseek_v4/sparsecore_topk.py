@@ -85,7 +85,14 @@ def _topk_body(
     num_waves: int,
     write_empty: bool,
     pay_w: int = 0,
+    row_stride: int = 1,
 ):
+    # ``row_stride > 1``: ``scores_hbm`` holds ``b`` rows of ``row_stride *
+    # slice_len`` words and each subcore DMAs only the first ``slice_len`` of
+    # its row, in place -- the first of ``row_stride`` equal slices. Rows past
+    # ``b`` re-read row ``b - 1`` instead of an out-of-bounds block; they are
+    # inactive and emit nothing.
+    #
     # With a payload (`pay_w > 0`), out_hbm receives `payload[pos - pay_off]`
     # for each winner at row position `pos` instead of `pos` itself, and `-1`
     # when `pos` falls outside `[pay_off, pay_off + pay_w)`. `pay_off` is the
@@ -349,7 +356,15 @@ def _topk_body(
             pipeline_mode=pl.Buffered(buf_count),
         )
 
-    in_specs = (row_spec(slice_len), row_spec(2 * LANES if pay_w else LANES))
+    if row_stride == 1:
+        scores_spec = row_spec(slice_len)
+    else:
+        scores_spec = pl.BlockSpec(
+            (slice_len,),
+            lambda w: (jnp.minimum(w * cores_per_chip + flat, b - 1) * row_stride,),
+            pipeline_mode=pl.Buffered(buf_count),
+        )
+    in_specs = (scores_spec, row_spec(2 * LANES if pay_w else LANES))
     ins = (scores_hbm, lengths_hbm)
     if pay_w:
         in_specs += (row_spec(pay_w),)
@@ -372,6 +387,7 @@ def _topk_kernel(
     num_waves: int,
     write_empty: bool,
     pay_w: int = 0,
+    row_stride: int = 1,
 ):
     """Indices (or payload values) plus each winner's score."""
     if pay_w:
@@ -391,6 +407,7 @@ def _topk_kernel(
         num_waves=num_waves,
         write_empty=write_empty,
         pay_w=pay_w,
+        row_stride=row_stride,
     )
 
 
@@ -419,8 +436,13 @@ def _sc_topk_direct(
     scheduling_group_id: int | None = None,
     payload: jax.Array | None = None,  # i32[b, pay_w]
     payload_offset: jax.Array | None = None,  # i32[b], LANES-aligned
+    row_stride: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Single-stage lock-free SparseCore top-k on 32 subcores.
+
+    With ``row_stride > 1`` each row is read only over its first
+    ``n // row_stride`` columns, in place (no slice copy), and indices are
+    relative to that slice: top-k of ``scores[:, : n // row_stride]``.
 
     With ``payload``, the first output holds ``payload[r, pos - off[r]]`` for
     each winner position ``pos`` (``-1`` outside ``[off[r], off[r] + pay_w)``)
@@ -432,7 +454,10 @@ def _sc_topk_direct(
     Returns each winner's score as i32 bits, paired slot-for-slot with the
     returned indices, and the bits of ``-inf`` in the pad slots.
     """
-    b, n = scores.shape
+    b, n_full = scores.shape
+    if n_full % row_stride or (n_full // row_stride) % LANES:
+        raise ValueError(f"{n_full=} not {row_stride} slices of LANES multiples")
+    n = n_full // row_stride
     info = pltpu.get_tpu_info()
     sc = info.sparse_core
     if sc is None:
@@ -448,7 +473,7 @@ def _sc_topk_direct(
     padded_b = num_waves * 32
     pad_b = padded_b - b
     pad_n = slice_len - n
-    if pad_b > 0 or pad_n > 0:
+    if row_stride == 1 and (pad_b > 0 or pad_n > 0):
         words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
 
     lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
@@ -491,6 +516,7 @@ def _sc_topk_direct(
             num_waves=num_waves,
             write_empty=write_empty,
             pay_w=pay_w,
+            row_stride=row_stride,
         ),
         out_type=out_type,
         compiler_params=pltpu.CompilerParams(
@@ -498,7 +524,10 @@ def _sc_topk_direct(
         ),
         scratch_types=scratch_types,
         mesh=mesh,
-        name=f"sc_topk_direct{'_pay' if pay_w else ''}_b{b}_n{n}_k{k}",
+        name=(
+            f"sc_topk_direct{'_pay' if pay_w else ''}_b{b}_n{n}_k{k}"
+            + (f"_s{row_stride}" if row_stride > 1 else "")
+        ),
     )(words.reshape(-1), lengths_2d.reshape(-1), *extra_inputs)
     if scheduling_group_id is not None:
         out = xla_metadata.set_xla_metadata(
@@ -552,6 +581,7 @@ def _gather_payload(
         "stage2_scheduling_group_id",
         "return_scores",
         "fused_payload",
+        "single_slice",
     ),
 )
 def sparsecore_topk(
@@ -566,6 +596,7 @@ def sparsecore_topk(
     payload: jax.Array | None = None,  # i32[b, pay_w]
     payload_offset: jax.Array | None = None,  # i32[b], multiple of LANES
     fused_payload: bool = False,
+    single_slice: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
 
@@ -590,6 +621,16 @@ def sparsecore_topk(
     SparseCore emit wherever the payload fits in tile memory, instead of
     running it as a separate (SparseCore-offloaded) XLA gather. Both settings
     return identical arrays.
+
+    ``single_slice`` targets rows much wider than their real length (a score
+    row sized for ``max_model_len``). On the two-stage path, when every row
+    length fits the first of the P slices, the answer is stage 1's top-k of
+    that slice alone: the other slices are empty and the merge only copies it.
+    So one SparseCore call reads the first slice of each row in place and that
+    result is returned; an ``lax.cond`` falls back to the full two-stage path
+    when any row overflows the slice. Identical arrays either way. The common
+    path's call stays outside the conditional, so it keeps its scheduling
+    group.
     """
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
@@ -638,98 +679,130 @@ def sparsecore_topk(
     # Stage 1: Partition each row into P slices and find local top-k candidates
     n_p = n // p
     k_p = min(k, n_p)
-    scores_p = scores.reshape(b * p, n_p)
 
-    offsets = jnp.arange(p, dtype=jnp.int32) * n_p
-    lengths_p = jnp.clip(row_lengths[:, None] - offsets[None, :], 0, n_p).reshape(b * p)
+    def two_stage(scores, sg1=scheduling_group_id, sg2=stage2_scheduling_group_id):
+        scores_p = scores.reshape(b * p, n_p)
 
-    # A user payload rides through stage 1 when every slice's offset stays
-    # LANES-aligned; otherwise stage 1 emits positions and the payload is
-    # applied to the final selection instead.
-    fuse1 = (
-        payload is not None
-        and fused_payload
-        and n_p % LANES == 0
-        and payload_fits(b * p, n_p, k_p, pay_w)
-    )
-    local_slots, cand_scores = _sc_topk_direct(
-        scores_p,
-        k_p,
-        lengths_p,
-        write_empty=True,
-        scheduling_group_id=scheduling_group_id,
-        **(
-            dict(
-                payload=jnp.repeat(payload, p, axis=0),
-                payload_offset=(payload_offset[:, None] - offsets[None, :]).reshape(
-                    b * p
-                ),
-            )
-            if fuse1
-            else {}
-        ),
-    )
-    cand_scores = cand_scores.reshape(b, p * k_p)
-
-    if fuse1:
-        # Already the payload values (-1 padded): stage 2 just carries them.
-        global_cand_indices = local_slots.reshape(b, p * k_p)
-    else:
-        # Map local indices to global column indices
-        local_indices = local_slots.reshape(b, p, k_p)
-        global_cand_indices = jnp.where(
-            local_indices < 0,
-            -1,
-            offsets[None, :, None] + local_indices,
-        ).reshape(b, p * k_p)
-
-    # Stage 2: Merge the P * k_p candidates to select the final top-k
-    cand_lengths = jnp.where(row_lengths > 0, jnp.int32(p * k_p), jnp.int32(0))
-
-    if p * k_p > MAX_SLICE_WORDS:
-        # Too wide for one slice; recurse so stage 2 partitions in turn. `k_p`
-        # is `k` whenever `p > 1`, so `p * k_p < n` and this terminates.
-        if fused_payload:
-            final_indices, final_cand_scores = sparsecore_topk(
-                cand_scores,
-                k,
-                row_lengths=cand_lengths,
-                write_empty_rows=write_empty_rows,
-                scheduling_group_id=stage2_scheduling_group_id,
-                return_scores=True,
-                payload=global_cand_indices,
-                fused_payload=True,
-            )
-        else:
-            final_cand_slots, final_cand_scores = sparsecore_topk(
-                cand_scores,
-                k,
-                row_lengths=cand_lengths,
-                write_empty_rows=write_empty_rows,
-                scheduling_group_id=stage2_scheduling_group_id,
-                return_scores=True,
-            )
-            final_indices = None
-    else:
-        fuse2 = fused_payload and payload_fits(b, p * k_p, k, p * k_p)
-        final_cand_slots, final_cand_scores = _sc_topk_direct(
-            cand_scores,
-            k,
-            cand_lengths,
-            write_empty=write_empty_rows,
-            scheduling_group_id=stage2_scheduling_group_id,
-            **(dict(payload=global_cand_indices) if fuse2 else {}),
+        offsets = jnp.arange(p, dtype=jnp.int32) * n_p
+        lengths_p = jnp.clip(row_lengths[:, None] - offsets[None, :], 0, n_p).reshape(
+            b * p
         )
-        final_indices = final_cand_slots if fuse2 else None
 
-    if final_indices is None:
-        # Map candidate slots back to original column indices
-        safe_slots = jnp.maximum(final_cand_slots, 0)
-        final_indices = jnp.take_along_axis(global_cand_indices, safe_slots, axis=1)
-        final_indices = jnp.where(final_cand_slots >= 0, final_indices, -1)
+        # A user payload rides through stage 1 when every slice's offset stays
+        # LANES-aligned; otherwise stage 1 emits positions and the payload is
+        # applied to the final selection instead.
+        fuse1 = (
+            payload is not None
+            and fused_payload
+            and n_p % LANES == 0
+            and payload_fits(b * p, n_p, k_p, pay_w)
+        )
+        local_slots, cand_scores = _sc_topk_direct(
+            scores_p,
+            k_p,
+            lengths_p,
+            write_empty=True,
+            scheduling_group_id=sg1,
+            **(
+                dict(
+                    payload=jnp.repeat(payload, p, axis=0),
+                    payload_offset=(payload_offset[:, None] - offsets[None, :]).reshape(
+                        b * p
+                    ),
+                )
+                if fuse1
+                else {}
+            ),
+        )
+        cand_scores = cand_scores.reshape(b, p * k_p)
 
-    if payload is not None and not fuse1:
-        final_indices = _gather_payload(final_indices, payload, payload_offset)
+        if fuse1:
+            # Already the payload values (-1 padded): stage 2 just carries them.
+            global_cand_indices = local_slots.reshape(b, p * k_p)
+        else:
+            # Map local indices to global column indices
+            local_indices = local_slots.reshape(b, p, k_p)
+            global_cand_indices = jnp.where(
+                local_indices < 0,
+                -1,
+                offsets[None, :, None] + local_indices,
+            ).reshape(b, p * k_p)
+
+        # Stage 2: Merge the P * k_p candidates to select the final top-k
+        cand_lengths = jnp.where(row_lengths > 0, jnp.int32(p * k_p), jnp.int32(0))
+
+        if p * k_p > MAX_SLICE_WORDS:
+            # Too wide for one slice; recurse so stage 2 partitions in turn. `k_p`
+            # is `k` whenever `p > 1`, so `p * k_p < n` and this terminates.
+            if fused_payload:
+                final_indices, final_cand_scores = sparsecore_topk(
+                    cand_scores,
+                    k,
+                    row_lengths=cand_lengths,
+                    write_empty_rows=write_empty_rows,
+                    scheduling_group_id=sg2,
+                    return_scores=True,
+                    payload=global_cand_indices,
+                    fused_payload=True,
+                )
+            else:
+                final_cand_slots, final_cand_scores = sparsecore_topk(
+                    cand_scores,
+                    k,
+                    row_lengths=cand_lengths,
+                    write_empty_rows=write_empty_rows,
+                    scheduling_group_id=sg2,
+                    return_scores=True,
+                )
+                final_indices = None
+        else:
+            fuse2 = fused_payload and payload_fits(b, p * k_p, k, p * k_p)
+            final_cand_slots, final_cand_scores = _sc_topk_direct(
+                cand_scores,
+                k,
+                cand_lengths,
+                write_empty=write_empty_rows,
+                scheduling_group_id=sg2,
+                **(dict(payload=global_cand_indices) if fuse2 else {}),
+            )
+            final_indices = final_cand_slots if fuse2 else None
+
+        if final_indices is None:
+            # Map candidate slots back to original column indices
+            safe_slots = jnp.maximum(final_cand_slots, 0)
+            final_indices = jnp.take_along_axis(global_cand_indices, safe_slots, axis=1)
+            final_indices = jnp.where(final_cand_slots >= 0, final_indices, -1)
+
+        if payload is not None and not fuse1:
+            final_indices = _gather_payload(final_indices, payload, payload_offset)
+
+        return final_indices, final_cand_scores
+
+    if single_slice and k_p == k and n_p % LANES == 0:
+        fuse_s = (
+            payload is not None and fused_payload and payload_fits(b, n_p, k, pay_w)
+        )
+        first_slots, first_keys = _sc_topk_direct(
+            scores,
+            k,
+            row_lengths,
+            write_empty=write_empty_rows,
+            scheduling_group_id=scheduling_group_id,
+            row_stride=p,
+            **(dict(payload=payload, payload_offset=payload_offset) if fuse_s else {}),
+        )
+        if payload is not None and not fuse_s:
+            first_slots = _gather_payload(first_slots, payload, payload_offset)
+        # The overflow branch runs inside a conditional, where XLA scheduling
+        # groups cannot pair it with work outside; it drops them.
+        final_indices, final_cand_scores = lax.cond(
+            jnp.max(row_lengths) > n_p,
+            lambda s: two_stage(s, None, None),
+            lambda _: (first_slots, first_keys),
+            scores,
+        )
+    else:
+        final_indices, final_cand_scores = two_stage(scores)
 
     if return_scores:
         return final_indices, final_cand_scores

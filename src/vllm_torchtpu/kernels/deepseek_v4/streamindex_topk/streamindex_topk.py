@@ -623,6 +623,7 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "fused_payload",
+        "single_slice",
     ),
 )
 def streamindex_topk(
@@ -652,6 +653,7 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     fused_payload: bool = False,
+    single_slice: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -713,6 +715,9 @@ def streamindex_topk(
         the DCP attention kernels need an LSE output.
       fused_payload: forwarded to `sparsecore_topk`; folds the two-stage
         candidate-to-column gather into the SparseCore kernel. Same result.
+      single_slice: forwarded to `sparsecore_topk`; when every row's visible
+        length fits the first stage-1 slice, skip the stage-2 merge. Same
+        result.
 
     Returns:
       Top-K indices in this rank's local compressed space, or
@@ -1133,6 +1138,7 @@ def streamindex_topk(
                 stage2_scheduling_group_id=sc2_group,
                 return_scores=True,
                 fused_payload=fused_payload,
+                single_slice=single_slice,
             )
             topk_idxs.append(chunk_topk_idxs)
             if need_scores:
@@ -1199,6 +1205,7 @@ def streamindex_topk(
         "chunk_tokens",
         "dcp_axis_name",
         "fused_payload",
+        "single_slice",
     ),
 )
 def streamindex_topk_dcp(
@@ -1223,6 +1230,7 @@ def streamindex_topk_dcp(
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
     fused_payload: bool = False,
+    single_slice: bool = False,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1348,6 +1356,7 @@ def streamindex_topk_dcp(
             interleave_size=interleave_size,
             return_scores=True,
             fused_payload=fused_payload,
+            single_slice=single_slice,
         )
 
         # Stage 1. All-gather the scores; the indices stay home.
