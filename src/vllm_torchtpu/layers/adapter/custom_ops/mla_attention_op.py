@@ -615,6 +615,48 @@ class VllmTPUIndexer(Indexer):
         )
         return indexer
 
+    def permute_rope_to_half_split(self) -> None:
+        """TPU_INDEXER_ROPE_NEOX_PERMUTE: put each head's rope columns of
+        `wq_b`, the k rope columns of `wk_weights_proj` and the matching
+        `k_norm` affine entries in half-split order (see
+        `mla_rope_half_split_perm`); `forward` then runs the rope NeoX-style.
+
+        The rope part is the first `rope_dim` channels of each `head_dim` head
+        (q) and of k. `k_norm` is a LayerNorm over all `head_dim` k channels:
+        its mean / variance do not depend on channel order, so permuting its
+        per-channel weight and bias with the same index keeps it exact. q and
+        k are fp8-quantized per `head_dim` row (one block), whose amax is order
+        independent, and the cache stores P k consistently. Runs on the
+        processed runtime weights; idempotent.
+        """
+        if getattr(self, "_rope_neox_permuted", False):
+            return
+        rope, hd, nh = self.rope_dim, self.head_dim, self.n_head
+        permute_linear_output_channels(
+            self.wq_b, mla_rope_output_index(nh * hd, rope, hd, 0, nh)
+        )
+        kw = self.wk_weights_proj
+        flipped = getattr(kw, WEIGHT_FLIPPED_ATTR, False)
+        kw_n_out = kw.weight.shape[1 if flipped else 0]
+        assert kw_n_out == hd + nh, (kw_n_out, hd, nh)
+        permute_linear_output_channels(
+            kw, mla_rope_output_index(kw_n_out, rope, 0, 0, 1)
+        )
+        norm_index = mla_rope_output_index(hd, rope, 0, 0, 1)
+        updated = []
+        for name, param in list(self.k_norm.named_parameters(recurse=False)):
+            if param.ndim != 1 or param.shape[0] != hd:
+                raise NotImplementedError(
+                    f"indexer rope permutation: k_norm.{name} "
+                    f"{tuple(param.shape)} is not per k channel"
+                )
+            new = _index_select_bits(param.data, 0, norm_index)
+            replace_parameter(self.k_norm, name, Parameter(new, requires_grad=False))
+            updated.append(getattr(self.k_norm, name))
+        if updated and updated[0].device.type == "tpu":
+            synchronize_tensors(updated)
+        self._rope_neox_permuted = True
+
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
@@ -633,7 +675,10 @@ class VllmTPUIndexer(Indexer):
             k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
         )
 
-        q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+        if getattr(self, "_rope_neox_permuted", False):
+            q_pe, k_pe = rope_half_split(rotary_emb, positions, q_pe, k_pe.unsqueeze(1))
+        else:
+            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
         # Note: RoPE (NeoX) can introduce extra leading dimensions during
         # compilation so we need to reshape back to token-flattened shapes
         q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
@@ -1120,6 +1165,19 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 )
             hooks = self.mla_attn.__dict__.setdefault("post_load_hooks", [])
             hooks.append(self.permute_rope_to_half_split)
+        if envs.TPU_INDEXER_ROPE_NEOX_PERMUTE and self.indexer is not None:
+            if not rope_half_split_supported(
+                self.indexer_rope_emb, self.indexer.rope_dim
+            ):
+                neox = getattr(self.indexer_rope_emb, "is_neox_style", None)
+                raise NotImplementedError(
+                    "TPU_INDEXER_ROPE_NEOX_PERMUTE needs a GPT-J-style "
+                    f"RotaryEmbedding over the whole {self.indexer.rope_dim}-dim "
+                    "indexer rope head (indexer_rope_interleave); got "
+                    f"{type(self.indexer_rope_emb).__name__} is_neox_style={neox}"
+                )
+            hooks = self.mla_attn.__dict__.setdefault("post_load_hooks", [])
+            hooks.append(self.indexer.permute_rope_to_half_split)
 
     def permute_rope_to_half_split(self) -> None:
         """Put the q and k_pe rope columns in half-split order (see

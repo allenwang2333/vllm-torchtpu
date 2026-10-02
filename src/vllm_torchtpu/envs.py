@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MLA_ROPE_NEOX_PERMUTE: bool = False
+    TPU_INDEXER_ROPE_NEOX_PERMUTE: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
@@ -744,6 +745,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # NeoX-style. q.k is unchanged; the `x[..., ::2]` split and its relayout
     # copies disappear.
     "TPU_MLA_ROPE_NEOX_PERMUTE": env_bool("TPU_MLA_ROPE_NEOX_PERMUTE", default=False),
+    # The same for the sparse-attention indexer: permute each indexer head's
+    # interleaved rope columns of wq_b, the k rope columns of wk_weights_proj
+    # and the matching k_norm weight/bias entries at load, and run the indexer
+    # rope NeoX-style. Indexer scores are unchanged; independent of the MLA
+    # flag so each can be measured alone.
+    "TPU_INDEXER_ROPE_NEOX_PERMUTE": env_bool(
+        "TPU_INDEXER_ROPE_NEOX_PERMUTE", default=False
+    ),
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
