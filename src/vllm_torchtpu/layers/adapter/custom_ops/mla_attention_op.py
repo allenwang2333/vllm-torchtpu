@@ -67,6 +67,22 @@ from vllm_torchtpu.utils import synchronize_tensors
 # traffic and not at all once any request in the batch is past `index_topk`
 # tokens.
 STREAMIDX_ENABLE_EARLY_EXIT = True
+# Token buckets at or below this size take `TPU_STREAMIDX_SMALL_BUCKET_BQ`
+# as the MIXED-pass query block.
+STREAMIDX_SMALL_BUCKET_TOKENS = 16
+
+
+def _streamidx_queries_per_block(
+    num_tokens: int, small_bucket_bq: int | None
+) -> tuple[int, int, int]:
+    """Per-pass query block sizes (decode, unused, MIXED) for a token bucket.
+
+    `num_tokens` is the static padded bucket size, so this picks one kernel
+    variant per compiled shape.
+    """
+    if small_bucket_bq is not None and num_tokens <= STREAMIDX_SMALL_BUCKET_TOKENS:
+        return (1, 128, small_bucket_bq)
+    return (1, 128, 128)
 
 
 def _topk_rows_update_jax(buf: jax.Array, rows: jax.Array) -> jax.Array:
@@ -217,6 +233,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # None means unchunked. The kernel falls back to a single unpipelined
         # pass when `max_num_tokens` is not a multiple of the chunk.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        small_bucket_bq = envs.TPU_STREAMIDX_SMALL_BUCKET_BQ
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -267,7 +284,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 # The following parameters are tuned based on microbenchmark
                 # results.
                 num_kv_pages_per_block=(2, 2, 2),
-                num_queries_per_block=(1, 128, 128),
+                num_queries_per_block=_streamidx_queries_per_block(
+                    q.shape[0], small_bucket_bq
+                ),
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 chunk_tokens=chunk_tokens,
             )
@@ -305,6 +324,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # the KV axis DCP shards, so the same knob applies here unchanged.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
         fused_payload = envs.TPU_SC_TOPK_FUSED_PAYLOAD
+        small_bucket_bq = envs.TPU_STREAMIDX_SMALL_BUCKET_BQ
 
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -345,7 +365,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
                 num_kv_pages_per_block=(2, 2, 2),
-                num_queries_per_block=(1, 128, 128),
+                num_queries_per_block=_streamidx_queries_per_block(
+                    q.shape[0], small_bucket_bq
+                ),
                 chunk_tokens=chunk_tokens,
                 fused_payload=fused_payload,
             )

@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
     TPU_SC_TOPK_FUSED_PAYLOAD: bool = False
     TPU_INDEXER_TOPK_SINGLE_WRITE: bool = False
     TPU_INDEXER_TOPK_NOCOPY: bool = False
@@ -682,6 +683,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Unset means unchunked: one single pass, no pipelining.
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
+    ),
+    # Query block size for the StreamIndex top-k MIXED pass when the padded
+    # token bucket is small (<= 16 tokens). Under MTP every decode request has
+    # q_len = gamma + 1 > 1, so decode runs in the MIXED pass, whose default
+    # 128-row query block computes ~124 padding rows per real row. Unset keeps
+    # the default 128.
+    "TPU_STREAMIDX_SMALL_BUCKET_BQ": env_positive_int_or_none(
+        "TPU_STREAMIDX_SMALL_BUCKET_BQ"
     ),
     # Fold the SparseCore top-k's index gathers (the two-stage candidate map
     # and, under DCP, `resolve_owned_winners`' take_along_axis) into the top-k
