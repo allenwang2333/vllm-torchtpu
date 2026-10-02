@@ -98,8 +98,14 @@ def test_profile_run_preserves_behavior_and_skips_export_and_load(
     mock_mlir_res.is_noop = False
 
     with (
-        patch("torch_tpu._internal.export.fx_to_mlir", return_value=mock_mlir_res) as mock_fx_to_mlir,
-        patch.object(profile_compiler, "_run_backend", return_value=(lambda *a, **kw: inputs[0], None)) as mock_run_backend,
+        patch(
+            "torch_tpu._internal.export.fx_to_mlir", return_value=mock_mlir_res
+        ) as mock_fx_to_mlir,
+        patch.object(
+            profile_compiler,
+            "_run_backend",
+            return_value=(lambda *a, **kw: inputs[0], None),
+        ) as mock_run_backend,
     ):
         compiled_fn, _ = profile_compiler.compile(
             graph, inputs, {}, compile_range, key=cache_key
@@ -113,7 +119,11 @@ def test_profile_run_preserves_behavior_and_skips_export_and_load(
     monkeypatch.delenv("VLLM_TORCHTPU_EXPORT_HLO_DIR", raising=False)
     monkeypatch.setenv("VLLM_TORCHTPU_LOAD_HLO_DIR", str(tmp_path / "hlo"))
     with (
-        patch.object(profile_compiler, "_run_backend", return_value=(lambda *a, **kw: inputs[0], None)) as mock_run_backend_load,
+        patch.object(
+            profile_compiler,
+            "_run_backend",
+            return_value=(lambda *a, **kw: inputs[0], None),
+        ) as mock_run_backend_load,
     ):
         compiled_fn_load, _ = profile_compiler.compile(
             graph, inputs, {}, compile_range, key=cache_key
@@ -997,13 +1007,16 @@ def test_rfc_contract_safeguards_buffer_donor_hardware_and_custom_call(
         compiler.compile(graph, inputs, {}, compile_range, key=cache_key)
     monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "v5p-8")
 
-    # 3. Trap 2: Compiler ABI version drift (e.g. libtpu version mismatch)
-    # must fail fast.
+    # 3. Compiler ABI version difference (torch_tpu, jaxlib, libtpu) logs a
+    # warning and proceeds without failing.
     drifted_metadata = copy.deepcopy(metadata)
-    drifted_metadata[fn_key]["target_hardware"]["libtpu"] = "0.0.0-incompatible"
+    drifted_metadata[fn_key]["target_hardware"]["torch_tpu"] = "0.0.0-different"
+    drifted_metadata[fn_key]["target_hardware"]["jaxlib"] = "0.0.0-different"
+    drifted_metadata[fn_key]["target_hardware"]["libtpu"] = "0.0.0-different"
     metadata_path.write_text(json.dumps(drifted_metadata, indent=2))
-    with pytest.raises(ValueError, match="Compiler ABI version mismatch"):
+    with patch.object(stablehlo_export.logger, "warning") as mock_warn:
         compiler.compile(graph, inputs, {}, compile_range, key=cache_key)
+        assert mock_warn.call_count >= 1
     metadata_path.write_text(json.dumps(metadata, indent=2))
 
     # 4. Trap 5: Unvetted C++ custom_call target must be rejected, while

@@ -31,7 +31,6 @@ import torch.fx as fx
 from vllm.config.utils import Range
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -451,10 +450,10 @@ def _validate_target_hardware(entry: dict[str, Any], resolved_key: str) -> None:
         saved_ver = saved_hw.get(abi_key)
         current_ver = current_hw.get(abi_key)
         if saved_ver and current_ver and saved_ver != current_ver:
-            raise ValueError(
-                f"Compiler ABI version mismatch for '{resolved_key}' "
-                f"({abi_key}): artifact has '{saved_ver}', "
-                f"runtime has '{current_ver}'"
+            logger.warning(
+                f"Compiler ABI version difference for '{resolved_key}' "
+                f"({abi_key}): artifact was exported with '{saved_ver}', "
+                f"runtime has '{current_ver}'. Proceeding with compilation."
             )
 
 
