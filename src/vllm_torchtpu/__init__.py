@@ -95,6 +95,16 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
     scheduler-local cache-config view backports the corresponding one-line fix
     without mutating the shared ``VllmConfig.cache_config`` or copying the
     scheduling algorithm into this plugin.
+
+    DCP-only hybrid models with EAGLE/MTP keep the upstream physical block
+    size. DCP does not stride Mamba groups, so their reusable states still
+    advance at the physical block size. The upstream EAGLE back-off of one
+    physical block then lands where full attention's EAGLE drop lands: one
+    hash unit before the prompt's last hash boundary. If the split used the
+    DCP-scaled scheduler block instead, it would back off a whole scheduler
+    block. The next turn's hit would then fall back to the previous
+    scheduler-block boundary and recompute 1-2 scheduler blocks of every
+    multi-turn prompt.
     """
     import copy
     from functools import wraps
@@ -110,6 +120,12 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         physical_cache_config = self.cache_config
         if physical_cache_config.block_size == self.block_size:
             return original_split(self, *args, **kwargs)
+        if (
+            self.use_eagle
+            and getattr(self, "dcp_world_size", 1) > 1
+            and getattr(self, "pcp_world_size", 1) == 1
+        ):
+            return original_split(self, *args, **kwargs)
 
         scheduler_cache_config = copy.copy(physical_cache_config)
         scheduler_cache_config.block_size = self.block_size
@@ -124,6 +140,68 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
     split_with_scheduler_block_size._tpu_scheduler_block_size_patch = True
     Scheduler._mamba_block_aligned_split = split_with_scheduler_block_size
     logger.info("Applied TPU patch: align Mamba prefill splits to scheduler blocks.")
+
+
+def _patch_vllm_mamba_eagle_reachable_boundaries() -> None:
+    """Retain the EAGLE-shifted replay boundary under sparse Mamba retention.
+
+    With ``prefix_cache_retention_interval=0`` the Mamba manager keeps only
+    the states at the reachable boundaries: the replay boundary
+    ``num_prompt_tokens - 1`` and any shared-prefix junction. With EAGLE/MTP,
+    full attention drops one alignment unit from every hit, so the next turn
+    needs the Mamba state one unit before that boundary. Sparse retention
+    never kept that state. This is why vLLM forces dense retention for hybrid
+    models with EAGLE. Dense retention also hashes every decode-time and
+    chunk-end state. Those states are freed to the LRU tail and evict useful
+    prefix blocks.
+
+    This patch also retains ``aligned_boundary - alignment_tokens`` for EAGLE
+    managers. Sparse retention (set ``--prefix-cache-retention-interval 0``)
+    then keeps exactly the states that EAGLE hits land on.
+    """
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    original = MambaManager.reachable_block_mask
+    if getattr(original, "_tpu_eagle_reachable_patch", False):
+        return
+    original_func = original.__func__
+
+    def reachable_block_mask(
+        cls,
+        start_block,
+        end_block,
+        alignment_tokens,
+        kv_cache_spec,
+        use_eagle,
+        retention_interval=None,
+        reachable_boundaries=(),
+    ):
+        if use_eagle and alignment_tokens and retention_interval is not None:
+            shifted = [
+                boundary // alignment_tokens * alignment_tokens - alignment_tokens
+                for boundary in reachable_boundaries
+            ]
+            reachable_boundaries = [
+                *reachable_boundaries,
+                *(boundary for boundary in shifted if boundary > 0),
+            ]
+        return original_func(
+            cls,
+            start_block,
+            end_block,
+            alignment_tokens,
+            kv_cache_spec,
+            use_eagle,
+            retention_interval=retention_interval,
+            reachable_boundaries=reachable_boundaries,
+        )
+
+    reachable_block_mask._tpu_eagle_reachable_patch = True
+    MambaManager.reachable_block_mask = classmethod(reachable_block_mask)
+    logger.info(
+        "Applied TPU patch: retain EAGLE-shifted Mamba replay boundaries "
+        "under sparse prefix-cache retention."
+    )
 
 
 def _patch_vllm_aot_compile_cache_key() -> None:
