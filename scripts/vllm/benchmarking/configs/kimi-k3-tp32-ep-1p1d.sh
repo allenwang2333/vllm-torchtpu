@@ -1,14 +1,14 @@
 #!/bin/bash
-# shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
-# One engine of the Kimi-K3 1P1D pair: the nightly kimi-k3-tp32-ep model,
-# sharding and serve flags, with what Raiden Stage 3 and the correctness stages
-# (scripts/vllm/integration/run_k3_1p1d_disagg_correctness.sh) need on top.
+# shellcheck disable=SC2034  # Variables are sourced by k3_1p1d.sh
+# The base of the Kimi-K3 1P1D pair's config: the nightly kimi-k3-tp32-ep
+# model, sharding and serve flags, with what Raiden Stage 3 and the correctness
+# stages (scripts/vllm/integration/run_k3_1p1d_disagg_correctness.sh) need on
+# top. The pair serves kimi-k3-tp8-dp4-ep-1p1d.sh, which sources this and
+# resharpens it to TP8 x DP4.
 #
-# K3_1P1D_ROLE, prefill or decode, selects the engine. Sourced twice per
-# engine: by .buildkite/kubernetes/k3_1p1d.sh on every host before Ray starts,
-# for the environment below, and by run_benchmarks.sh on the head, for the
-# serve command. What only a running pod knows stays in k3_1p1d.sh:
-# VLLM_HOST_IP and TPU_RAIDEN_ADVERTISE_HOST.
+# K3_1P1D_ROLE, prefill or decode, selects the engine. What only a running pod
+# knows stays in .buildkite/kubernetes/k3_1p1d.sh: VLLM_HOST_IP and
+# TPU_RAIDEN_ADVERTISE_HOST.
 # shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/kimi-k3-tp32-ep.sh"
 

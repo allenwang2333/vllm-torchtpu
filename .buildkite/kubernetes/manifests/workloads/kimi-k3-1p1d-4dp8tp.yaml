@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kimi-K3 1P1D with data parallelism on both roles: prefill and decode each on
-# a 2x2x4 slice, four hosts of four chips, TP8 x DP4 x EP32 over vLLM's own
-# multi-node DP, one DP replica per host. See k3_1p1d_dp.sh. The shape is
-# kimi-k3-1p1d.yaml's; the command and the hosts a pod is told of differ.
+# Kimi-K3 1P1D: prefill and decode each on a 2x2x4 slice, four hosts of four
+# chips, TP8 x DP4 x EP32 over vLLM's own multi-node DP, one DP replica per
+# host. See k3_1p1d.sh.
 #
 # Both roles ask for the same shape, so the workload is admitted against one
 # queue for all 32 chips. A slice is one node pool, and exclusive-topology on
@@ -68,7 +67,7 @@ spec:
               containers:
                 - name: workload
                   image: ${IMAGE}
-                  command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/k3_1p1d_dp.sh", "prefill"]
+                  command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/k3_1p1d.sh", "prefill"]
                   env:
                     # Host i of this role is <prefix>i.<domain>.
                     - name: ROLE_HOST_PREFIX
@@ -137,7 +136,7 @@ spec:
               containers:
                 - name: workload
                   image: ${IMAGE}
-                  command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/k3_1p1d_dp.sh", "decode"]
+                  command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/k3_1p1d.sh", "decode"]
                   env:
                     # Host i of this role is <prefix>i.<domain>.
                     - name: ROLE_HOST_PREFIX

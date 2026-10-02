@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kimi-K3 1P1D correctness, run by .buildkite/kubernetes/k3_1p1d.sh or
-# k3_1p1d_dp.sh on the prefill head once the pair is serving. Every request goes through the proxy:
+# Kimi-K3 1P1D correctness, run by .buildkite/kubernetes/k3_1p1d.sh on the
+# prefill head once the pair is serving. Every request goes through the proxy:
 # prefill computes the prompt's KV, Raiden Stage 3 moves it, decode generates.
 # All stages run even if one fails.
 #
@@ -52,10 +52,10 @@
 #     * neither engine preempted a request (num_preemptions == 0)
 #
 # Stages 4 and 5 compare tokens, which needs a prefill chunk to be one KV block
-# (configs/kimi-k3-tp32-ep-1p1d.sh); this refuses to start otherwise. When the
-# engines run data parallelism they also hold their requests to one DP rank of
-# each (K3_PD_DP_RANK): the replicas differ slightly in greedy output. The
-# other stages and the eval spread over the replicas as the proxy sends them.
+# (configs/kimi-k3-tp32-ep-1p1d.sh); this refuses to start otherwise. They
+# also hold their requests to one DP rank of each engine (K3_PD_DP_RANK): the
+# replicas differ slightly in greedy output. The other stages and the eval
+# spread over the replicas as the proxy sends them.
 #
 # Exit status: 0 every stage passed, 1 a stage failed, anything else no stage
 # was run.

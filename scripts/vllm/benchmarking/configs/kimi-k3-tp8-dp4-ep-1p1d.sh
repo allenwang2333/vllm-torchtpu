@@ -1,14 +1,13 @@
 #!/bin/bash
-# shellcheck disable=SC2034  # Variables are sourced by k3_1p1d_dp.sh
-# One engine of the Kimi-K3 1P1D pair with data parallelism on both roles:
-# TP8 x DP4 x EP32 on each 2x2x4 slice, one DP replica per host, over vLLM's
-# own multi-node DP (the mp backend) rather than Ray. Everything else is the
-# TP32 pair's (kimi-k3-tp32-ep-1p1d.sh): the cache dtype, prefix caching, one
-# prefill chunk to a KV block, the Raiden Stage-3 environment and the per-role
-# identities and ports.
+# shellcheck disable=SC2034  # Variables are sourced by k3_1p1d.sh
+# One engine of the Kimi-K3 1P1D pair: TP8 x DP4 x EP32 on each 2x2x4 slice,
+# one DP replica per host, over vLLM's own multi-node DP (the mp backend).
+# Everything else is kimi-k3-tp32-ep-1p1d.sh's: the cache dtype, prefix
+# caching, one prefill chunk to a KV block, the Raiden Stage-3 environment and
+# the per-role identities and ports.
 #
 # K3_1P1D_ROLE, prefill or decode, selects the engine. Sourced by
-# .buildkite/kubernetes/k3_1p1d_dp.sh on every host before its `vllm serve`.
+# .buildkite/kubernetes/k3_1p1d.sh on every host before its `vllm serve`.
 # What only a running pod knows stays there: VLLM_HOST_IP, and
 # TPU_RAIDEN_ADVERTISE_HOST, which is the role's four host addresses in DP-rank
 # order - one Raiden store per DP replica, on that replica's host (PR #1271).
