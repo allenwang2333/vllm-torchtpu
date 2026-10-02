@@ -749,29 +749,39 @@ def rpa_kernel(
             ),
         )
         def _run(final_allocs, schedule_ref, dma_sem, scratches):
-            # Decode prologue: no full-window KV zeroing; schedule fetch overlapped with init.
+            # Initialize Q to zeros to prevent NaN pollution.
             #
-            # DECODE: the HBM->SMEM schedule fetch of chunk 0 is started first and waited
-            #     after the scratch/Q init, so the two overlap.
-            # DECODE (SEQ_ALONG_LANE, bq <= num_lanes): the 3 x 14 MiB KV window is
-            #     no longer zeroed. Only KV rows that compute can read without a DMA in
-            #     this call need to be finite: the size-0 cache pages of a valid lane at
-            #     the FIRST use of each window slot (steps 0..n_buffer-1). Every later use
-            #     of a slot location reads either this call's DMA'd (and stitched) data
-            #     or a location already made finite at first use. Those pages are zeroed
-            #     (K and V, 16 vst per page per slot) after the schedule lands. Empty
-            #     lanes (s_idx == -1) only occur in the final step, after the last
-            #     is_last_k lane, so their stale data reaches neither O nor a later
-            #     step and they are not zeroed. m/l/acc init and Q zeroing are kept.
-            #     Other modes (MIXED/PREFILL) keep the incumbent full-window zeroing.
+            # When a query block is partially filled, tail slots in uninitialized VMEM
+            # may contain residual NaNs. In our implementation, invalid Q rows bypass
+            # invalid row masking and produce NaNs in p_rowsum and later pollute
+            # l_scratch and acc_scratch. Once l_scratch / acc_scratch becomes NaN,
+            # subsequent iterations cannot recover (0 * NaN = NaN).
+
+            # Initialize KV cache to zeros.
+            # When perfomring p * v, we perform causal masking on lhs (p) by zeroing
+            # out columns that should not be processed for a given row. Even if we
+            # don't perform masking on rows of rhs (v), the output is still correct
+            # since reuslt of multiplication will be zero thanks zero on lhs. However,
+            # this assumption does not hold if a row of rhs has NaNs. To avoid this,
+            # we initiallize scratch memory with non-zero values. Even if the scratch
+            # memory is storing kv cache from previous step, as long as the data is
+            # not NaNs, there will be no numeric concerns.
+
+            scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
+
             num_lanes = pltpu.get_tpu_info().num_lanes
-            tail_zero = (
-                cfgs.mode == configs.RpaCase.DECODE
-                and cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
-                and cfgs.bq_sz <= num_lanes
+            q_ref_flat = (
+                final_allocs[0].window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
+            )
+            kv_ref_flat = (
+                final_allocs[1].window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
             )
 
-            def schedule_copies(start_step, num_steps):
+            # Explicitly zero out scratches and Q/KV buffers.
+            for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
+                ref[...] = jnp.zeros_like(ref)
+
+            def execute_schedule_chunk(start_step, num_steps):
                 # All reads are aligned to 128 and some extra steps are copied in the
                 # process.
                 aligned_start_step = (start_step // 128) * 128
@@ -795,96 +805,9 @@ def rpa_kernel(
                             s.at[pl.ds(0, read_size)],
                             dma_sem.at[0],
                         )
+                        copy.start()
                         dma_list.append(copy)
-                return dma_list, prefix_steps
-
-            def chunk_size(step_idx):
-                rem = actual_steps % cfgs.max_steps_ub
-                last_step_size = jnp.where(rem == 0, cfgs.max_steps_ub, rem)
-                is_last_step = step_idx == num_safe_step_iterations - 1
-                return jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
-
-            # DECODE: chunk 0's schedule fetch is in flight during the init below.
-            # Other modes keep the original order (init, then fetch): overlapping the
-            # fetch with their full-window zeroing made an empty MIXED pass 3.6 us
-            # slower (probe 03, j-a7c86ede).
-            first_copies, _ = schedule_copies(0, chunk_size(0))
-            if tail_zero:
-                for c in first_copies:
-                    c.start()
-
-            scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
-
-            q_ref_flat = (
-                final_allocs[0].window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
-            )
-            if tail_zero:
-                kv_ref_flat = None  # replaced by zero_first_use_tail_pages().
-            else:
-                kv_ref_flat = (
-                    final_allocs[1].window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
-                )
-
-            # Explicitly zero out scratches and Q/KV buffers.
-            for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
-                if ref is None:
-                    continue
-                ref[...] = jnp.zeros_like(ref)
-
-            if not tail_zero:
-                for c in first_copies:
-                    c.start()
-            for c in first_copies:
-                c.wait()
-
-            def zero_first_use_tail_pages():
-                kv_window = final_allocs[1].window_ref
-                v_len = cfgs.bkv_sz + 2 * cfgs.serve.page_size
-                lanes_per_col = v_len // num_lanes
-                n_p = cfgs.bkv_p_cache
-                first_steps = jnp.minimum(chunk_size(0), cfgs.n_buffer)
-
-                def zero_page(b, i):
-                    # Same strided column form as stitch_utils.store_new_kv_lane.
-                    for slot in range(cfgs.n_buffer):
-                        lane_u32 = kv_window.at[slot].at[b].bitcast(jnp.uint32)
-                        flat = lane_u32.reshape(-1, num_lanes)
-                        outer_dim = flat.shape[0] // lanes_per_col
-                        flat[pl.ds(i, outer_dim, lanes_per_col)] = jnp.zeros(
-                            (outer_dim, num_lanes), jnp.uint32
-                        )
-
-                for k in range(cfgs.n_buffer):
-                    for b in range(cfgs.batch_size):
-                        s_idx = schedule_ref.s_idx[k, b]
-                        _, _, last_valid = schedule_ref.get_dma_kv_cache(k, b, n_p - 1)
-                        need = (k < first_steps) & (s_idx != -1) & (last_valid == 0)
-
-                        @pl.when(need)
-                        def _(k=k, b=b):
-                            def page_body(i, carry):
-                                _, _, valid = schedule_ref.get_dma_kv_cache(k, b, i)
-
-                                @pl.when(valid == 0)
-                                def _():
-                                    zero_page(b, i)
-
-                                return carry
-
-                            lax.fori_loop(0, n_p, page_body, 0)
-
-            if tail_zero:
-                zero_first_use_tail_pages()
-
-            def execute_schedule_chunk(step_idx, start_step, num_steps):
-                dma_list, prefix_steps = schedule_copies(start_step, num_steps)
-
-                @pl.when(step_idx > 0)
-                def _():
-                    for c in dma_list:
-                        c.start()
-                    for c in dma_list:
-                        c.wait()
+                jax.tree.map(lambda x: x.wait(), dma_list)
 
                 pipeline_func = pltpu.emit_pipeline(
                     body=functools.partial(
@@ -911,7 +834,11 @@ def rpa_kernel(
             @pl.loop(0, num_safe_step_iterations)
             def loop_body(step_idx):
                 start = step_idx * cfgs.max_steps_ub
-                execute_schedule_chunk(step_idx, start, chunk_size(step_idx))
+                rem = actual_steps % cfgs.max_steps_ub
+                last_step_size = jnp.where(rem == 0, cfgs.max_steps_ub, rem)
+                is_last_step = step_idx == num_safe_step_iterations - 1
+                size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
+                execute_schedule_chunk(start, size)
 
         # An empty schedule (e.g. the MIXED pass of a decode-only batch) does no work:
         # skip scratch allocation and init, the schedule fetch and the pipeline.
