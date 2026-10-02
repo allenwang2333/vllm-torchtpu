@@ -451,9 +451,13 @@ def _validate_target_hardware(entry: dict[str, Any], resolved_key: str) -> None:
         current_ver = current_hw.get(abi_key)
         if saved_ver and current_ver and saved_ver != current_ver:
             logger.warning(
-                f"Compiler ABI version difference for '{resolved_key}' "
-                f"({abi_key}): artifact was exported with '{saved_ver}', "
-                f"runtime has '{current_ver}'. Proceeding with compilation."
+                "Compiler ABI version difference for '%s' (%s): "
+                "artifact was exported with '%s', runtime has '%s'. "
+                "Proceeding with compilation.",
+                resolved_key,
+                abi_key,
+                saved_ver,
+                current_ver,
             )
 
 

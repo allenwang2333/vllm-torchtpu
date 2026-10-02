@@ -209,6 +209,7 @@ ignore-missing-imports = [
     "packaging", "packaging.*",
     "pathwaysutils", "pathwaysutils.*",
     "portpicker", "portpicker.*",
+    "pytest", "pytest.*",
     "ray", "ray.*",
     "requests", "requests.*",
     "sympy", "sympy.*",
