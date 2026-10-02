@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
+    TPU_MLA_ROPE_NEOX_PERMUTE: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
@@ -661,6 +662,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Materialize the rotary cos_sin caches with a row-major ({1,0}) device
     # layout at load, May cost more HBM due to padding.
     "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=False),
+    # Permute each MLA head's interleaved (GPT-J) rope columns of the q and
+    # k_pe projections to half-split order at load and run the MLA rope
+    # NeoX-style. q.k is unchanged; the `x[..., ::2]` split and its relayout
+    # copies disappear.
+    "TPU_MLA_ROPE_NEOX_PERMUTE": env_bool("TPU_MLA_ROPE_NEOX_PERMUTE", default=False),
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),

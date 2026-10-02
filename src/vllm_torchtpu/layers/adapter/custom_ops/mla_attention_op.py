@@ -29,12 +29,14 @@ from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding.common import rotate_gptj, rotate_neox
 from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
     DeepseekScalingRotaryEmbedding,
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache, Indexer
+from vllm.model_executor.utils import replace_parameter
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
@@ -617,6 +619,117 @@ def _fresh(t: torch.Tensor) -> torch.Tensor:
     return torch.empty(t.shape, dtype=t.dtype, device=t.device).copy_(t)
 
 
+# --- MLA rope in half-split order (TPU_MLA_ROPE_NEOX_PERMUTE) ---------------
+#
+# GPT-J (interleaved) rope pairs channels (2i, 2i+1); NeoX rope pairs
+# (i, i + d/2). With P = [0, 2, ..., d-2, 1, 3, ..., d-1] and new[j] = old[P[j]],
+# neox(P x) = P gptj(x) elementwise-exactly, and (P q).(P k) = q.k. So permuting
+# the rope output columns of the q projection and of the k_pe projection by
+# the same P, and running the rope NeoX-style, leaves every attention score
+# unchanged while the KV cache holds P k_pe consistently. The win is layout:
+# the `x[..., ::2]` split forces a tokens-minor relayout of q on TPU.
+
+
+def mla_rope_half_split_perm(rope_dim: int) -> torch.Tensor:
+    """`P` above: the old channel each new channel reads (evens, then odds)."""
+    assert rope_dim % 2 == 0, f"rope dim {rope_dim} must be even"
+    return torch.cat([torch.arange(0, rope_dim, 2), torch.arange(1, rope_dim, 2)])
+
+
+def mla_rope_output_index(
+    n_out: int, rope_dim: int, period: int, offset: int, count: int
+) -> torch.Tensor:
+    """A gather index over `n_out` output channels that applies `P` to `count`
+    rope segments at `offset + i * period`, identity elsewhere."""
+    index = torch.arange(n_out)
+    perm = mla_rope_half_split_perm(rope_dim)
+    for i in range(count):
+        start = offset + i * period
+        assert start + rope_dim <= n_out, (start, rope_dim, n_out)
+        index[start : start + rope_dim] = start + perm
+    return index
+
+
+_SAME_WIDTH_INT = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def _index_select_bits(t: torch.Tensor, axis: int, index: torch.Tensor):
+    """`index_select` that moves raw bits, so fp8 / bf16 / fp32 are all exact
+    and no dtype-specific gather support is needed on the device."""
+    as_int = t.view(_SAME_WIDTH_INT[t.element_size()])
+    out = torch.index_select(as_int, axis, index.to(t.device))
+    return _fresh(out.view(t.dtype))
+
+
+def permute_linear_output_channels(layer: torch.nn.Module, index: torch.Tensor):
+    """Reorder a processed linear layer's output channels: `out'[j] = out[index[j]]`.
+
+    Runs after the quant method's `process_weights_after_loading`, so it reads
+    the runtime layout: `weight` is `[n_in, n_out]` when flipped
+    (`WEIGHT_FLIPPED_ATTR`) and `[n_out, n_in]` otherwise; any other parameter
+    (FP8 `weight_scale` `[1, n_blocks, 1, n_out]` / `[n_out]`, a bias) is
+    per output channel on its last axis, else on axis 0, else a per-tensor
+    scalar. Anything else is a layout this does not know and raises.
+    """
+    n_out = index.numel()
+    flipped = getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+    updated = []
+    for name, param in list(layer.named_parameters(recurse=False)):
+        t = param.data
+        if name == "weight":
+            axis = 1 if flipped else 0
+            if t.ndim != 2 or t.shape[axis] != n_out:
+                raise NotImplementedError(
+                    f"rope permutation: weight {tuple(t.shape)} (flipped="
+                    f"{flipped}) has no {n_out}-wide output axis"
+                )
+        elif t.ndim >= 1 and t.shape[-1] == n_out:
+            axis = t.ndim - 1
+        elif t.ndim >= 1 and t.shape[0] == n_out:
+            axis = 0
+        elif t.numel() == 1:
+            continue
+        else:
+            raise NotImplementedError(
+                f"rope permutation: parameter {name} {tuple(t.shape)} is not "
+                f"per output channel of a {n_out}-wide layer"
+            )
+        new = _index_select_bits(t, axis, index)
+        replace_parameter(layer, name, Parameter(new, requires_grad=False))
+        updated.append(getattr(layer, name))
+    if updated and updated[0].device.type == "tpu":
+        synchronize_tensors(updated)
+
+
+def rope_half_split(rotary_emb, positions, query, key):
+    """`rotary_emb`'s own arithmetic, NeoX-style, without touching the module
+    (`get_rope` shares one instance across every layer that asks for it)."""
+    if isinstance(rotary_emb, DeepseekScalingRotaryEmbedding):
+        return VllmDeepseekScalingRotaryEmbedding.apply_rope(
+            rotary_emb, positions, query, key, is_neox_style=True
+        )
+    return RotaryEmbedding.forward_static(
+        positions,
+        query,
+        key,
+        rotary_emb.head_size,
+        rotary_emb.rotary_dim,
+        rotary_emb._match_cos_sin_cache_dtype(query),
+        True,
+    )
+
+
+def rope_half_split_supported(rotary_emb, rope_dim: int) -> bool:
+    if rotary_emb is None or getattr(rotary_emb, "is_neox_style", True):
+        return False
+    if rotary_emb.rotary_dim != rope_dim or rotary_emb.head_size != rope_dim:
+        return False
+    return isinstance(rotary_emb, DeepseekScalingRotaryEmbedding) or (
+        isinstance(rotary_emb, RotaryEmbedding)
+        and type(rotary_emb).forward_native is RotaryEmbedding.forward_native
+    )
+
+
 class TPUDummyMLAPrefillBackend:
     def __init__(self, *args, **kwargs):
         pass
@@ -814,6 +927,12 @@ class VllmTPUMLAAttention(MLAAttention):
                 self, dcp_size, self.impl.dcp_interleave_size
             )
 
+        # Post-load work the owning wrapper registered: it holds the q / kv_a
+        # projections, but is not itself visited by the loader's attention
+        # pass, which runs after every linear has been quantized and flipped.
+        for hook in getattr(self, "post_load_hooks", ()):
+            hook()
+
     def forward(
         self,
         q: tuple[torch.Tensor, torch.Tensor],
@@ -937,6 +1056,56 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
         self.prefix = prefix
 
+        # TPU_MLA_ROPE_NEOX_PERMUTE: set once the q / k_pe projection columns
+        # are in half-split order, which is what switches `forward` to NeoX
+        # rope -- the two can never disagree.
+        self._rope_neox_permuted = False
+        if envs.TPU_MLA_ROPE_NEOX_PERMUTE:
+            if not rope_half_split_supported(self.rotary_emb, self.qk_rope_head_dim):
+                raise NotImplementedError(
+                    "TPU_MLA_ROPE_NEOX_PERMUTE needs a GPT-J-style "
+                    f"RotaryEmbedding over the whole {self.qk_rope_head_dim}-dim "
+                    f"rope head; got {type(self.rotary_emb).__name__}"
+                )
+            hooks = self.mla_attn.__dict__.setdefault("post_load_hooks", [])
+            hooks.append(self.permute_rope_to_half_split)
+
+    def permute_rope_to_half_split(self) -> None:
+        """Put the q and k_pe rope columns in half-split order (see
+        `mla_rope_half_split_perm`). Runs on the processed runtime weights."""
+        if self._rope_neox_permuted:
+            return
+        if self.kimi_preprocess is not None:
+            raise NotImplementedError(
+                "TPU_MLA_ROPE_NEOX_PERMUTE: the Kimi fused preprocess reads "
+                "fused_qkv_a_proj raw"
+            )
+        rope = self.qk_rope_head_dim
+        q_layer = self._q_proj_layer()
+        q_heads = self.num_heads * self.dcp_group_size
+        q_index = mla_rope_output_index(
+            q_heads * self.qk_head_dim,
+            rope,
+            period=self.qk_head_dim,
+            offset=self.qk_nope_head_dim,
+            count=q_heads,
+        )
+        if self.q_lora_rank is not None:
+            kv_layer, kv_offset = (
+                self.fused_qkv_a_proj,
+                self.q_lora_rank + self.kv_lora_rank,
+            )
+        else:
+            kv_layer, kv_offset = self.kv_a_proj_with_mqa, self.kv_lora_rank
+        weight = kv_layer.weight
+        kv_n_out = weight.shape[
+            1 if getattr(kv_layer, WEIGHT_FLIPPED_ATTR, False) else 0
+        ]
+        kv_index = mla_rope_output_index(kv_n_out, rope, 0, kv_offset, 1)
+        permute_linear_output_channels(q_layer, q_index)
+        permute_linear_output_channels(kv_layer, kv_index)
+        self._rope_neox_permuted = True
+
     def _q_proj_layer(self):
         """The projection that produces `q`, whichever of the two is wired."""
         return self.q_b_proj if self.q_lora_rank is not None else self.q_proj
@@ -1024,7 +1193,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if self.rotary_emb is not None:
             q_pe_dtype = q_pe.dtype
             k_pe_dtype = k_pe.dtype
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            if getattr(self, "_rope_neox_permuted", False):
+                q_pe, k_pe = rope_half_split(self.rotary_emb, positions, q_pe, k_pe)
+            else:
+                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
             # RoPE caches/frequencies can be fp32 and promote the rotated
             # tensors.  Dense MLA requires new KV values to exactly match the
             # cache dtype, and queries should remain in the activation dtype.
@@ -1089,28 +1261,42 @@ class VllmDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
         key: torch.Tensor | None = None,
         offsets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self.apply_rope(
+            self, positions, query, key, offsets, is_neox_style=self.is_neox_style
+        )
+
+    @staticmethod
+    def apply_rope(
+        rope: DeepseekScalingRotaryEmbedding,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        offsets: torch.Tensor | None = None,
+        *,
+        is_neox_style: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert key is not None
-        query_rot = query[..., : self.rotary_dim]
-        key_rot = key[..., : self.rotary_dim]
-        if self.rotary_dim < self.head_size:
-            query_pass = query[..., self.rotary_dim :]
-            key_pass = key[..., self.rotary_dim :]
+        query_rot = query[..., : rope.rotary_dim]
+        key_rot = key[..., : rope.rotary_dim]
+        if rope.rotary_dim < rope.head_size:
+            query_pass = query[..., rope.rotary_dim :]
+            key_pass = key[..., rope.rotary_dim :]
 
         pos = torch.add(positions, offsets) if offsets is not None else positions
-        cos_sin = self.cos_sin_cache.index_select(0, pos)
+        cos_sin = rope.cos_sin_cache.index_select(0, pos)
         cos, sin = cos_sin.chunk(2, dim=-1)
-        if self.is_neox_style:
+        if is_neox_style:
             cos = torch.cat((cos, cos), dim=-1).unsqueeze(-2)
             sin = torch.cat((sin, sin), dim=-1).unsqueeze(-2)
         else:
             cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
             sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
 
-        rotate_fn = rotate_neox if self.is_neox_style else rotate_gptj
+        rotate_fn = rotate_neox if is_neox_style else rotate_gptj
         query_rot = query_rot * cos + rotate_fn(query_rot) * sin
         key_rot = key_rot * cos + rotate_fn(key_rot) * sin
 
-        if self.rotary_dim < self.head_size:
+        if rope.rotary_dim < rope.head_size:
             query = torch.cat((query_rot, query_pass), dim=-1)
             key = torch.cat((key_rot, key_pass), dim=-1)
         else:
