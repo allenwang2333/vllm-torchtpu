@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import inspect
 
 import jax
 import jax.experimental.pallas as pl
@@ -329,7 +330,7 @@ def generate_mask(
     return masks
 
 
-def rpa_body(
+def _rpa_body_impl(
     # Inputs.
     q_vref: jax.Ref,
     kv_in_vref: jax.Ref,
@@ -349,6 +350,7 @@ def rpa_body(
     kv_new_lens_ref: jax.Ref,
     # Configs.
     cfgs: configs.RpaConfigs,
+    apply_mask: bool = True,
 ):
     step = pl.program_id(0)
 
@@ -479,17 +481,19 @@ def rpa_body(
         q_start = bq_start * cfgs.aligned_num_q_heads_per_kv_head
         q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
         q_slice = slice(q_start, q_end)
-        custom_mask = generate_mask(
-            shape=(
-                cfgs.batch_size,
-                cfgs.model.num_kv_heads,
-                q_end - q_start,
-                cfgs.bkv_sz,
-            ),
-            bq_start=bq_start,
-            step_meta=step_meta,
-            cfgs=cfgs,
-        )
+        custom_mask = None
+        if apply_mask:
+            custom_mask = generate_mask(
+                shape=(
+                    cfgs.batch_size,
+                    cfgs.model.num_kv_heads,
+                    q_end - q_start,
+                    cfgs.bkv_sz,
+                ),
+                bq_start=bq_start,
+                step_meta=step_meta,
+                cfgs=cfgs,
+            )
         p, alpha_list, m_next, l_next, m_carry = (
             flash_attention.flash_attention_qk_softmax(
                 step,
@@ -554,6 +558,54 @@ def rpa_body(
         lse_o_vref,
         cfgs=cfgs,
     )
+
+
+def rpa_body(*args, cfgs: configs.RpaConfigs, **kwargs):
+    """Pipeline body. A prefill/mixed step whose every lane's tile is fully
+    causally visible (causal_offset <= -(bkv - 1) for every lane; only a causal
+    mask, no sliding window or local k bounds) runs an unmasked copy of the body:
+    generating and applying the mask is ~15% of such steps. The branch is on the
+    whole body, whose only effects are writes to refs; branching on the score
+    tile itself (lax.cond on the value, or pl.when on a scratch) materializes the
+    tile and costs +30%.
+    """
+    if (
+        cfgs.mode == configs.RpaCase.DECODE
+        or cfgs.model.sliding_window is not None
+    ):
+        _rpa_body_impl(*args, cfgs=cfgs, **kwargs)
+        return
+    step = pl.program_id(0)
+    schedule_ref = inspect.signature(_rpa_body_impl).bind_partial(
+        *args, **kwargs
+    ).arguments["schedule_ref"]
+    step_meta = fetch_step_metadata(
+        step,
+        schedule_ref,
+        kwargs["cu_q_lens_ref"],
+        kwargs["q_offsets_ref"],
+        kwargs["kv_cache_lens_ref"],
+        kwargs["kv_new_lens_ref"],
+        cfgs=cfgs,
+    )
+    if step_meta.local_k_start is not None or step_meta.local_k_end is not None:
+        _rpa_body_impl(*args, cfgs=cfgs, **kwargs)
+        return
+    all_visible = functools.reduce(
+        jnp.logical_and,
+        [
+            step_meta.causal_offset[b_idx] <= -(cfgs.bkv_sz - 1)
+            for b_idx in range(cfgs.batch_size)
+        ],
+    )
+
+    @pl.when(all_visible)
+    def _():
+        _rpa_body_impl(*args, cfgs=cfgs, apply_mask=False, **kwargs)
+
+    @pl.when(jnp.logical_not(all_visible))
+    def _():
+        _rpa_body_impl(*args, cfgs=cfgs, **kwargs)
 
 
 # Define main kernel.
