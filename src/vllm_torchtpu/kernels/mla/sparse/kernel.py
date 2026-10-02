@@ -259,6 +259,11 @@ def _attention_kernel(
             cp.start()
 
     if is_dcp_mode:
+        # One rung width shared by the fetch and the compute side: a batch
+        # fetched narrow must not then be read at full width.
+        eighth_sz = bkv_sz // 8
+        use_eighth_rung = eighth_sz >= 64 and eighth_sz % 64 == 0 and bkv_sz % 8 == 0
+
         def _fetch_bkv_slice(seq_idx_start, bkv_sem_idx, slice_sz, *, wait=False):
             sem_nope = sems.at[0, bkv_sem_idx]
             sem_rope = sems.at[3, bkv_sem_idx]
@@ -306,46 +311,17 @@ def _attention_kernel(
 
         def _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, *, wait=False):
             batch_max_kv = get_batch_max_kv_len(seq_idx_start)
-            half_sz = bkv_sz // 2
-            quarter_sz = bkv_sz // 4
-            eighth_sz = bkv_sz // 8
-            if eighth_sz >= 64 and bkv_sz % 8 == 0:
+            if use_eighth_rung:
+
                 @pl.when((batch_max_kv > 0) & (batch_max_kv <= eighth_sz))
                 def _fetch_eighth():
                     _fetch_bkv_slice(seq_idx_start, bkv_sem_idx, eighth_sz, wait=wait)
 
-                @pl.when((batch_max_kv > eighth_sz) & (batch_max_kv <= quarter_sz))
-                def _fetch_quarter():
-                    _fetch_bkv_slice(seq_idx_start, bkv_sem_idx, quarter_sz, wait=wait)
-
-                @pl.when((batch_max_kv > quarter_sz) & (batch_max_kv <= half_sz))
-                def _fetch_half():
-                    _fetch_bkv_slice(seq_idx_start, bkv_sem_idx, half_sz, wait=wait)
-
-                @pl.when(batch_max_kv > half_sz)
-                def _fetch_full():
-                    _fetch_bkv_slice(seq_idx_start, bkv_sem_idx, bkv_sz, wait=wait)
-            elif quarter_sz >= 64 and bkv_sz % 4 == 0:
-                @pl.when((batch_max_kv > 0) & (batch_max_kv <= quarter_sz))
-                def _fetch_quarter():
-                    _fetch_bkv_slice(seq_idx_start, bkv_sem_idx, quarter_sz, wait=wait)
-
-                @pl.when((batch_max_kv > quarter_sz) & (batch_max_kv <= half_sz))
-                def _fetch_half():
-                    _fetch_bkv_slice(seq_idx_start, bkv_sem_idx, half_sz, wait=wait)
-
-                @pl.when(batch_max_kv > half_sz)
-                def _fetch_full():
-                    _fetch_bkv_slice(seq_idx_start, bkv_sem_idx, bkv_sz, wait=wait)
-            elif half_sz >= 64 and bkv_sz % 2 == 0:
-                @pl.when((batch_max_kv > 0) & (batch_max_kv <= half_sz))
-                def _fetch_half():
-                    _fetch_bkv_slice(seq_idx_start, bkv_sem_idx, half_sz, wait=wait)
-
-                @pl.when(batch_max_kv > half_sz)
+                @pl.when(batch_max_kv > eighth_sz)
                 def _fetch_full():
                     _fetch_bkv_slice(seq_idx_start, bkv_sem_idx, bkv_sz, wait=wait)
             else:
+
                 @pl.when(batch_max_kv > 0)
                 def _fetch_full():
                     _fetch_bkv_slice(seq_idx_start, bkv_sem_idx, bkv_sz, wait=wait)
@@ -565,90 +541,71 @@ def _attention_kernel(
                 _send_blse_batch(batch_start_seq_idx, bo_sem_idx, wait=True)
 
         if is_dcp_mode:
-            def _run_batch_loop(slice_sz: int):
-                prev_p = None
-                prev_bkv = None
-                prev_l_sum = None
-                prev_m = None
-                prev_out = None
+            # Hoisted out of the rung branches: nothing below depends on
+            # slice_sz, so it is emitted once rather than once per rung.
+            zero_out = jnp.zeros((num_q_heads, head_dim), dtype=q_dtype)
 
-                for batch_idx in range(batch_size):
+            def _store_result(batch_idx, out, m, l_sum):
+                bo_x2_ref.at[bo_sem_idx, batch_idx][...] = out
+                write_blse(batch_idx, m, l_sum)
+
+            def _run_batch_loop(slice_sz: int):
+                # Software-pipelined over the batch: step i runs QK/softmax for
+                # entry i and PV for entry i-1. Rolled into a fori_loop so each
+                # rung emits the body once instead of batch_size times.
+                def _qk_softmax(batch_idx, prev_out):
                     kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
                     bkv = load_bkv(bi_sem_idx, batch_idx, slice_sz=slice_sz)
                     bq = load_bq(bi_sem_idx, batch_idx)
-
-                    if prev_out is not None:
-                        # Artificial dependency to force MXU/VPU interleaving by limiting
-                        # LLO's QK runahead
-                        # We use jnp.where to prevent XLA from optimizing the dependency away.
-                        # prev_out won't be inf in practice.
-                        bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
-
+                    # Caps LLO's QK runahead so MXU and VPU interleave; the
+                    # where stops XLA folding it, and prev_out is never inf.
+                    bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
                     p, l_sum, m = attention_step1_qk_softmax(bq, bkv, kv_len)
+                    return p, bkv, l_sum, m
 
-                    if prev_p is not None:
-                        assert prev_bkv is not None
-                        assert prev_l_sum is not None
-                        out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
+                def _body(batch_idx, carry):
+                    prev_p, prev_bkv, prev_l_sum, prev_m, prev_out = carry
+                    # QK for i before PV for i-1, so bq_i depends on out_{i-2}
+                    # exactly as the unrolled version did.
+                    p, bkv, l_sum, m = _qk_softmax(batch_idx, prev_out)
+                    out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
+                    _store_result(batch_idx - 1, out, prev_m, prev_l_sum)
+                    return p, bkv, l_sum, m, out
 
-                        # Store output from acc to bo.
-                        bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out
-                        write_blse(batch_idx - 1, prev_m, prev_l_sum)
-                        prev_out = out
-
-                    prev_p = p
-                    prev_bkv = bkv
-                    prev_l_sum = l_sum
-                    prev_m = m
+                # zero_out seeds the dependency for i=0 and i=1, where the
+                # unrolled version had no prior output; the where is a no-op.
+                carry = _qk_softmax(0, zero_out) + (zero_out,)
+                prev_p, prev_bkv, prev_l_sum, prev_m, _ = lax.fori_loop(
+                    1, batch_size, _body, carry
+                )
 
                 # end of pipelining loop
                 out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
-                bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out
-                write_blse(batch_size - 1, prev_m, prev_l_sum)
+                _store_result(batch_size - 1, out, prev_m, prev_l_sum)
 
             batch_max_kv_len = get_batch_max_kv_len(batch_start_seq_idx)
 
             @pl.when(batch_max_kv_len == 0)
             def _zero_batch():
-                zero_out = jnp.zeros((num_q_heads, head_dim), dtype=q_dtype)
-                neg_inf_lse = jnp.full((num_q_heads, 1), -jnp.inf, dtype=jnp.float32)
-                for batch_idx in range(batch_size):
-                    bo_x2_ref.at[bo_sem_idx, batch_idx][...] = zero_out
-                    if return_lse:
-                        blse_x2_ref.at[bo_sem_idx, batch_idx][...] = neg_inf_lse
+                bo_x2_ref.at[bo_sem_idx][...] = jnp.zeros(
+                    (batch_size, num_q_heads, head_dim), dtype=q_dtype
+                )
+                if return_lse:
+                    blse_x2_ref.at[bo_sem_idx][...] = jnp.full(
+                        (batch_size, num_q_heads, 1), -jnp.inf, dtype=jnp.float32
+                    )
 
-            eighth_sz = bkv_sz // 8
-            qtr_sz = bkv_sz // 4
-            half_sz = bkv_sz // 2
-            if eighth_sz >= 64 and eighth_sz % 64 == 0:
+            if use_eighth_rung:
+
                 @pl.when((batch_max_kv_len > 0) & (batch_max_kv_len <= eighth_sz))
                 def _run_eighth():
                     _run_batch_loop(eighth_sz)
 
-                @pl.when((batch_max_kv_len > eighth_sz) & (batch_max_kv_len <= qtr_sz))
-                def _run_qtr():
-                    _run_batch_loop(qtr_sz)
-
-                @pl.when((batch_max_kv_len > qtr_sz) & (batch_max_kv_len <= half_sz))
-                def _run_half():
-                    _run_batch_loop(half_sz)
-
-                @pl.when(batch_max_kv_len > half_sz)
-                def _run_full():
-                    _run_batch_loop(bkv_sz)
-            elif qtr_sz >= 64 and qtr_sz % 64 == 0:
-                @pl.when((batch_max_kv_len > 0) & (batch_max_kv_len <= qtr_sz))
-                def _run_qtr():
-                    _run_batch_loop(qtr_sz)
-
-                @pl.when((batch_max_kv_len > qtr_sz) & (batch_max_kv_len <= half_sz))
-                def _run_half():
-                    _run_batch_loop(half_sz)
-
-                @pl.when(batch_max_kv_len > half_sz)
+                @pl.when(batch_max_kv_len > eighth_sz)
                 def _run_full():
                     _run_batch_loop(bkv_sz)
             else:
+
                 @pl.when(batch_max_kv_len > 0)
                 def _run_full():
                     _run_batch_loop(bkv_sz)

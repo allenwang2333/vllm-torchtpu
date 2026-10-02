@@ -230,10 +230,9 @@ class DcpModeMatchesDefaultTest(parameterized.TestCase):
     HBM->VMEM slab copy and the QK/PV loop to a rung chosen from the batch's
     widest `kv_len`. Every rung must agree with the unoptimized path exactly.
 
-    `DCP_TOPK` is 512 so all four rungs are reachable: the eighth rung is gated
-    on `topk % 8 == 0` at the fetch and `topk // 8 % 64 == 0` at the compute,
-    and at topk=256 the second gate fails, so the ladder silently starts at a
-    quarter and the narrowest slice never gets exercised.
+    `DCP_TOPK` is 512 so both rungs are reachable: the eighth rung is gated on
+    `topk // 8 >= 64 and topk // 8 % 64 == 0 and topk % 8 == 0`, which fails at
+    topk=256, leaving only the full rung and no narrow slice under test.
     """
 
     DCP_TOPK = 512
@@ -249,7 +248,7 @@ class DcpModeMatchesDefaultTest(parameterized.TestCase):
     def _padded(self, kv_len):
         return self.problem["physical_topk"].at[:, kv_len:].set(-1)
 
-    # 64 -> eighth, 128 -> quarter, 256 -> half, 512 -> full width.
+    # 64 -> eighth rung; 128, 256 and 512 -> full rung.
     @parameterized.product(kv_len=(64, 128, 256, 512), layout=LAYOUTS)
     def test_each_ladder_rung_matches_the_default_path(self, kv_len, layout):
         padded = self._padded(kv_len)
