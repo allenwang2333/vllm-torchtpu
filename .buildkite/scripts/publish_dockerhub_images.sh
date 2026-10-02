@@ -19,10 +19,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 
 # Run by nightly_releases.yml (main) and release_images.yml (release/*), which
-# log in to Docker Hub first. As in publish_nightly_images.sh, the branch
-# decides the tags. main pushes nightly-YYYYMMDD-<commit>-<vllm> and moves
-# nightly. release/X.Y.Z pushes YYYYMMDD-X.Y.Z and moves X.Y.Z, so a release
-# build never touches nightly.
+# log in to Docker Hub first. The branch decides the tags. main pushes
+# nightly-YYYYMMDD-<commit>-<vllm> and moves nightly. release/X.Y.Z pushes
+# X.Y.Z and moves latest, so a release build never touches nightly.
 BRANCH="${BUILDKITE_BRANCH:-$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)}"
 # TODO(test-only): for a CI dry run, act as main or as release/0.0.0-test
 # depending on which step runs. Remove before merging.
@@ -34,7 +33,7 @@ DATE="$(date +%Y%m%d)"
 VLLM_COMMIT_HASH="$(buildkite-agent meta-data get "VLLM_COMMIT_HASH")"
 case "${BRANCH}" in
   main)
-    DATE_TAG="nightly-${DATE}-${BUILDKITE_COMMIT:0:7}-${VLLM_COMMIT_HASH:0:7}"
+    TAG="nightly-${DATE}-${BUILDKITE_COMMIT:0:7}-${VLLM_COMMIT_HASH:0:7}"
     LATEST_TAG="nightly"
     ;;
   release/*)
@@ -44,8 +43,8 @@ case "${BRANCH}" in
       echo "ERROR: branch '${BRANCH}' does not name a version usable as an image tag; expected release/X.Y.Z." >&2
       exit 1
     fi
-    DATE_TAG="${DATE}-${VERSION}"
-    LATEST_TAG="${VERSION}"
+    TAG="${VERSION}"
+    LATEST_TAG="latest"
     ;;
   *)
     echo "ERROR: Docker Hub images are published from main or release/X.Y.Z, not '${BRANCH}'." >&2
@@ -56,26 +55,26 @@ esac
 echo "--- Cleaning up old Docker images and cache"
 bash "${SCRIPT_DIR}/cleanup_docker.sh"
 
-IMAGE_NAME="${DOCKERHUB_REPO:?DOCKERHUB_REPO must be set in nightly_releases.yml}" # would be vllm/vllm-torchtpu I think
-DATE_IMAGE="${IMAGE_NAME}:${DATE_TAG}"
+IMAGE_NAME="${DOCKERHUB_REPO:?DOCKERHUB_REPO must be set in nightly_releases.yml and release_images.yml}" # would be vllm/vllm-torchtpu I think
+IMAGE="${IMAGE_NAME}:${TAG}"
 LATEST_IMAGE="${IMAGE_NAME}:${LATEST_TAG}"
 
 cd "${REPO_ROOT}"
 
-echo "--- :docker: Building prod image: ${DATE_IMAGE}"
-./docker/build_image.sh --target prod -c "${VLLM_COMMIT_HASH}" -t "${DATE_IMAGE}"
+echo "--- :docker: Building prod image: ${IMAGE}"
+./docker/build_image.sh --target prod -c "${VLLM_COMMIT_HASH}" -t "${IMAGE}"
 
 echo "--- :docker: Tagging as ${LATEST_IMAGE}"
-docker tag "${DATE_IMAGE}" "${LATEST_IMAGE}"
+docker tag "${IMAGE}" "${LATEST_IMAGE}"
 
-echo "--- :docker: Pushing ${DATE_IMAGE} and ${LATEST_IMAGE} to Docker Hub"
+echo "--- :docker: Pushing ${IMAGE} and ${LATEST_IMAGE} to Docker Hub"
 # TODO(test-only): pushes disabled for a CI dry run. Restore before merging.
-# docker push "${DATE_IMAGE}"
+# docker push "${IMAGE}"
 # docker push "${LATEST_IMAGE}"
-echo "[SIMULATED] docker push ${DATE_IMAGE}"
+echo "[SIMULATED] docker push ${IMAGE}"
 echo "[SIMULATED] docker push ${LATEST_IMAGE}"
 
 echo "--- Cleaning up locally built image tags"
-docker rmi "${DATE_IMAGE}" "${LATEST_IMAGE}" || true
+docker rmi "${IMAGE}" "${LATEST_IMAGE}" || true
 
-echo "--- [SIMULATED] Successfully built and published ${DATE_IMAGE} and ${LATEST_IMAGE}"
+echo "--- [SIMULATED] Successfully built and published ${IMAGE} and ${LATEST_IMAGE}"

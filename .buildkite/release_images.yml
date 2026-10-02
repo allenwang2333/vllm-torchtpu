@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Publishes the public prod image to Docker Hub from the scheduled NIGHTLY=1
-# build of a release/X.Y.Z branch. Unlike nightly_releases.yml, it waits for
-# every build, test, integration, perf and model/feature step and is skipped
-# if any fails.
+# Publishes the public prod image to Docker Hub when a NIGHTLY=1 build of a
+# release/X.Y.Z branch is started by hand (Buildkite: New Build, env NIGHTLY=1).
+# Unlike nightly_releases.yml, it waits for every build, test, integration,
+# perf and model/feature step and is skipped if any fails.
 # Steps an `if` drops from the build (e.g. PR-only steps) do not block it.
-# A release branch only publishes if vllm-torchtpu-ci has a NIGHTLY=1
-# schedule on it.
+# Merges to a release branch do not set NIGHTLY=1 and never publish. Do not
+# add a NIGHTLY=1 schedule on a release branch: it would re-push X.Y.Z and
+# latest every night.
 
 steps:
   - label: ":docker: Publish vllm-torchtpu release image to Docker Hub"
