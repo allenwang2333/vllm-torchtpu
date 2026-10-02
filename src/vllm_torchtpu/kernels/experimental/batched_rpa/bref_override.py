@@ -16,6 +16,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -79,45 +80,122 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         sem = self.sem_recvs.at[slot]
         block_idx = jnp.maximum(grid_indices[0], 0)
 
+        if self.cfgs.mode != configs.RpaCase.DECODE:
+            # MIXED/PREFILL (RPAm) keep the incumbent issue path unchanged.
+            vmem_dst_lane = self.window_ref.at[slot]
+            for b in range(self.cfgs.batch_size):
+                for i in range(self.cfgs.bkv_p_cache):
+                    p_idx, dst_off, dma_valid = schedule_ref.get_dma_kv_cache(
+                        block_idx, b, i
+                    )
+                    hbm_p_idx = page_indices_ref[p_idx]
+                    sz = dma_valid * self.cfgs.serve.page_size
+                    num_lanes = pltpu.get_tpu_info().num_lanes
+                    dst_off = pl.multiple_of(dst_off, num_lanes)
+                    sz = pl.multiple_of(sz, num_lanes)
+                    # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing,
+                    #     packing, page_size)
+                    # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing,
+                    #     packing, page_size)
+                    pltpu.make_async_copy(
+                        kv_cache_hbm.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
+                        vmem_dst_lane.at[b, :, :, :, pl.ds(dst_off, sz)],
+                        sem,
+                    ).start()
+
+                for i in range(self.cfgs.bkv_p_new):
+                    dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
+                    src_new_off = dma_entry.fetch_hbm[...]
+                    dst_vmem_off = dma_entry.fetch_vmem[...]
+                    dma_valid = dma_entry.fetch_val
+                    sz = dma_valid * self.cfgs.serve.page_size
+                    src_new_off = pl.multiple_of(src_new_off, 128)
+                    dst_vmem_off = pl.multiple_of(dst_vmem_off, 128)
+                    sz = pl.multiple_of(sz, 128)
+                    # new_kv_hbm: (num_kv_heads * 2, kv_head_dim // packing, packing,
+                    #     total_new_tokens)
+                    # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing,
+                    #     packing, page_size)
+                    pltpu.make_async_copy(
+                        new_kv_hbm.at[:, :, :, pl.ds(src_new_off, sz)],
+                        vmem_dst_lane.at[b, :, :, :, pl.ds(dst_vmem_off, sz)],
+                        sem,
+                    ).start()
+            return
+
+        # DECODE: size-0 descriptors are not issued.
+        # The kv-in wait (wait_in) is ONE aggregate wait for total_wait_kv_in, which
+        # the schedule computes from the valid pages only (schedule.py
+        # total_wait_kv_in), so skipping 0-byte starts leaves the byte count matched.
+        # Valid cache pages of a lane are a prefix (dma_sz = clip(left - i*page)),
+        # so a lane whose LAST page is valid is full: it takes an unrolled,
+        # branch-free path with static-size descriptors. Only tail lanes (and
+        # empty lanes, which skip everything) take the per-page guarded loop.
+        page_size = self.cfgs.serve.page_size
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        n_p = self.cfgs.bkv_p_cache
         vmem_dst_lane = self.window_ref.at[slot]
+
+        def start_page(b, i, p_idx, dst_off):
+            hbm_p_idx = page_indices_ref[p_idx]
+            dst_off = pl.multiple_of(dst_off, num_lanes)
+            # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing,
+            #     packing, page_size)
+            # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing,
+            #     packing, page_size)
+            pltpu.make_async_copy(
+                kv_cache_hbm.at[hbm_p_idx, :, :, :, pl.ds(0, page_size)],
+                vmem_dst_lane.at[b, :, :, :, pl.ds(dst_off, page_size)],
+                sem,
+            ).start()
+
         for b in range(self.cfgs.batch_size):
-            for i in range(self.cfgs.bkv_p_cache):
-                p_idx, dst_off, dma_valid = schedule_ref.get_dma_kv_cache(
-                    block_idx, b, i
-                )
-                hbm_p_idx = page_indices_ref[p_idx]
-                sz = dma_valid * self.cfgs.serve.page_size
-                num_lanes = pltpu.get_tpu_info().num_lanes
-                dst_off = pl.multiple_of(dst_off, num_lanes)
-                sz = pl.multiple_of(sz, num_lanes)
-                # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing,
-                #     packing, page_size)
-                # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing,
-                #     packing, page_size)
-                pltpu.make_async_copy(
-                    kv_cache_hbm.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
-                    vmem_dst_lane.at[b, :, :, :, pl.ds(dst_off, sz)],
-                    sem,
-                ).start()
+            if n_p > 0:
+                _, _, first_valid = schedule_ref.get_dma_kv_cache(block_idx, b, 0)
+                _, _, last_valid = schedule_ref.get_dma_kv_cache(block_idx, b, n_p - 1)
+
+                @pl.when(last_valid == 1)
+                def _full(b=b):
+                    for i in range(n_p):
+                        p_idx, dst_off, _ = schedule_ref.get_dma_kv_cache(
+                            block_idx, b, i
+                        )
+                        start_page(b, i, p_idx, dst_off)
+
+                @pl.when((last_valid != 1) & (first_valid == 1))
+                def _tail(b=b):
+                    def page_body(i, carry):
+                        p_idx, dst_off, valid = schedule_ref.get_dma_kv_cache(
+                            block_idx, b, i
+                        )
+
+                        @pl.when(valid == 1)
+                        def _():
+                            start_page(b, i, p_idx, dst_off)
+
+                        return carry
+
+                    lax.fori_loop(0, n_p, page_body, 0)
 
             for i in range(self.cfgs.bkv_p_new):
                 dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
                 src_new_off = dma_entry.fetch_hbm[...]
                 dst_vmem_off = dma_entry.fetch_vmem[...]
                 dma_valid = dma_entry.fetch_val
-                sz = dma_valid * self.cfgs.serve.page_size
                 src_new_off = pl.multiple_of(src_new_off, 128)
                 dst_vmem_off = pl.multiple_of(dst_vmem_off, 128)
-                sz = pl.multiple_of(sz, 128)
-                # new_kv_hbm: (num_kv_heads * 2, kv_head_dim // packing, packing,
-                #     total_new_tokens)
-                # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing,
-                #     packing, page_size)
-                pltpu.make_async_copy(
-                    new_kv_hbm.at[:, :, :, pl.ds(src_new_off, sz)],
-                    vmem_dst_lane.at[b, :, :, :, pl.ds(dst_vmem_off, sz)],
-                    sem,
-                ).start()
+
+                @pl.when(dma_valid != 0)
+                def _(b=b, src_new_off=src_new_off, dst_vmem_off=dst_vmem_off,
+                      dma_valid=dma_valid):
+                    sz = pl.multiple_of(dma_valid * page_size, 128)
+                    # new_kv_hbm: (num_kv_heads * 2, kv_head_dim // packing, packing,
+                    #     total_new_tokens)
+                    pltpu.make_async_copy(
+                        new_kv_hbm.at[:, :, :, pl.ds(src_new_off, sz)],
+                        vmem_dst_lane.at[b, :, :, :, pl.ds(dst_vmem_off, sz)],
+                        sem,
+                    ).start()
 
     def copy_out(
         self,
@@ -141,11 +219,20 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                 sz = jnp.where(do_writeback, dma_valid * self.cfgs.serve.page_size, 0)
                 src_vmem_off = pl.multiple_of(src_vmem_off, 128)
                 sz = pl.multiple_of(sz, 128)
-                pltpu.make_async_copy(
-                    vmem_src_lane.at[b, :, :, :, pl.ds(src_vmem_off, sz)],
-                    kv_out_ref.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
-                    sem,
-                ).start()
+
+                def _wb(b=b, src_vmem_off=src_vmem_off, sz=sz, hbm_p_idx=hbm_p_idx):
+                    pltpu.make_async_copy(
+                        vmem_src_lane.at[b, :, :, :, pl.ds(src_vmem_off, sz)],
+                        kv_out_ref.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
+                        sem,
+                    ).start()
+
+                if self.cfgs.mode == configs.RpaCase.DECODE:
+                    # DECODE: skip 0-byte writebacks; wait_out is one
+                    # aggregate wait for total_wait_kv_out (valid pages only).
+                    pl.when(sz > 0)(_wb)
+                else:
+                    _wb()
 
     def wait_in(
         self,
