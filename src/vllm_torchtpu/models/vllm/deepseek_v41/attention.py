@@ -289,7 +289,17 @@ def _insert(cache, slots, values, valid):
 def _row_slots(cache, block_table, requests, logical):
     """Gather fixed-width token rows without inspecting device values on host."""
     safe = logical.clamp(min=0, max=block_table.shape[1] * cache.shape[1] - 1)
-    blocks = block_table[requests[:, None], safe // cache.shape[1]].long()
+    # Gather each token's table row, then index within it 128 columns at a
+    # time. A [tokens, width] elementwise 2-D gather is 16-40x slower on TPU.
+    rows = block_table[requests]
+    pages = (safe // cache.shape[1]).long()
+    blocks = torch.cat(
+        [
+            rows.gather(1, pages[:, start : start + 128])
+            for start in range(0, pages.shape[1], 128)
+        ],
+        dim=1,
+    ).long()
     return blocks * cache.shape[1] + safe % cache.shape[1]
 
 
