@@ -767,19 +767,27 @@ def rpa_kernel(
             # memory is storing kv cache from previous step, as long as the data is
             # not NaNs, there will be no numeric concerns.
 
-            scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
+            # An empty schedule (e.g. the MIXED pass of a decode-only batch) writes
+            # nothing, so skip the scratch and Q/KV buffer initialization entirely.
+            @pl.when(actual_steps > 0)
+            def _init_scratches():
+                scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
 
-            num_lanes = pltpu.get_tpu_info().num_lanes
-            q_ref_flat = (
-                final_allocs[0].window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
-            )
-            kv_ref_flat = (
-                final_allocs[1].window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
-            )
+                num_lanes = pltpu.get_tpu_info().num_lanes
+                q_ref_flat = (
+                    final_allocs[0]
+                    .window_ref.bitcast(jnp.uint32)
+                    .reshape(-1, num_lanes)
+                )
+                kv_ref_flat = (
+                    final_allocs[1]
+                    .window_ref.bitcast(jnp.uint32)
+                    .reshape(-1, num_lanes)
+                )
 
-            # Explicitly zero out scratches and Q/KV buffers.
-            for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
-                ref[...] = jnp.zeros_like(ref)
+                # Explicitly zero out scratches and Q/KV buffers.
+                for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
+                    ref[...] = jnp.zeros_like(ref)
 
             def execute_schedule_chunk(start_step, num_steps):
                 # All reads are aligned to 128 and some extra steps are copied in the
