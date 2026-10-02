@@ -773,13 +773,54 @@ def rpa_kernel(
             q_ref_flat = (
                 final_allocs[0].window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
             )
-            kv_ref_flat = (
-                final_allocs[1].window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
-            )
-
-            # Explicitly zero out scratches and Q/KV buffers.
-            for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
+            # Explicitly zero out scratches and Q buffers.
+            for ref in (scratches[1], scratches[2], q_ref_flat):
                 ref[...] = jnp.zeros_like(ref)
+
+            if (
+                cfgs.mode == configs.RpaCase.DECODE
+                and cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+            ):
+                # Decode only needs part of the KV window finite: all of V (p * v
+                # with p == 0 is still NaN for a NaN row of v) and the K rows of the
+                # 2-page stitch staging region, which are written back to the cache
+                # page. Stale K elsewhere only meets masked positions, where the
+                # qk mask replaces it. About half the stores of a full zeroing.
+                kv_window = final_allocs[1].window_ref
+                lanes_per_col = (cfgs.bkv_sz + 2 * cfgs.serve.page_size) // num_lanes
+                stage_cols = range(
+                    cfgs.bkv_sz // num_lanes, lanes_per_col
+                )
+                for slot in range(cfgs.n_buffer):
+                    for b in range(cfgs.batch_size):
+                        for h in range(cfgs.model.num_kv_heads):
+                            v_flat = (
+                                kv_window.at[slot]
+                                .at[b]
+                                .at[2 * h + 1]
+                                .bitcast(jnp.uint32)
+                                .reshape(-1, num_lanes)
+                            )
+                            v_flat[...] = jnp.zeros_like(v_flat)
+                            k_flat = (
+                                kv_window.at[slot]
+                                .at[b]
+                                .at[2 * h]
+                                .bitcast(jnp.uint32)
+                                .reshape(-1, num_lanes)
+                            )
+                            outer_dim = k_flat.shape[0] // lanes_per_col
+                            for col in stage_cols:
+                                k_flat[pl.ds(col, outer_dim, lanes_per_col)] = (
+                                    jnp.zeros((outer_dim, num_lanes), jnp.uint32)
+                                )
+            else:
+                kv_ref_flat = (
+                    final_allocs[1]
+                    .window_ref.bitcast(jnp.uint32)
+                    .reshape(-1, num_lanes)
+                )
+                kv_ref_flat[...] = jnp.zeros_like(kv_ref_flat)
 
             def execute_schedule_chunk(start_step, num_steps):
                 # All reads are aligned to 128 and some extra steps are copied in the
