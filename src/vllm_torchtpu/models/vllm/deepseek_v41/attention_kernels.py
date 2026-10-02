@@ -33,9 +33,9 @@ def paged_attention_jax(
         records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
 
         # Gather BF16 rows once outside; keep FP32 scratch tiled.
-        gathered = gather_cache_values(
-            pool, jnp.maximum(records, 0).reshape(-1), dim
-        ).reshape(tokens, records.shape[1], dim)
+        gathered = gather_cache_values(pool, records.reshape(-1), dim).reshape(
+            tokens, records.shape[1], dim
+        )
 
         def step(index, carry):
             maximum, denominator, numerator = carry
@@ -122,9 +122,9 @@ def paged_index_scores_jax(
         # the loop materializes [tokens, max_context / ratio, dim] even when
         # lengths restrict execution to a single tile (or no tiles).
         addresses = jax.lax.dynamic_slice_in_dim(records, index * tile, tile, axis=1)
-        keys = gather_cache_values(
-            pool, jnp.maximum(addresses, 0).reshape(-1), dim
-        ).reshape(tokens, tile, dim)
+        keys = gather_cache_values(pool, addresses.reshape(-1), dim).reshape(
+            tokens, tile, dim
+        )
         logits = jnp.einsum("thd,tcd->thc", q, keys, preferred_element_type=jnp.float32)
         # Upstream quantized MQA logits and the weighted head reduction are
         # FP32. BF16 cache storage is not a request to round the dot product.

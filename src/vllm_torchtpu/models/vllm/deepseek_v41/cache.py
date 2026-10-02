@@ -255,10 +255,19 @@ def _gather_words(cache, records, record_words):
 def gather_cache_values(
     cache: jax.Array, records: jax.Array, elements: int, fp32: bool = False
 ) -> jax.Array:
-    """Read physical records without flattening or converting the whole pool."""
+    """Read physical records without flattening or converting the whole pool.
+
+    Negative records are invalid and return arbitrary rows; callers mask them.
+    They read distinct rows: clamping them all to row 0 serializes the
+    SparseCore gather on the repeated index (padded decode, short top-k).
+    """
     import jax.numpy as jnp
 
-    words = _gather_words(cache, records, elements if fp32 else elements // 2)
+    record_words = elements if fp32 else elements // 2
+    spread = jnp.arange(records.size, dtype=records.dtype).reshape(records.shape)
+    spread %= cache.shape[0] * ROW_WORDS // record_words
+    records = jnp.where(records >= 0, records, spread)
+    words = _gather_words(cache, records, record_words)
     if fp32:
         return jax.lax.bitcast_convert_type(words, jnp.float32)
     # Keep the consumer's final shape; rank-increasing bitcasts add TPU padding.
