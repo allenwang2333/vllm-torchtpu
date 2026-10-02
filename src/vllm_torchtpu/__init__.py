@@ -83,10 +83,28 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         return
 
     @wraps(original_split)
-    def split_with_scheduler_block_size(self, *args, **kwargs):
+    def split_with_scheduler_block_size(self, request, num_new_tokens, *args,
+                                        **kwargs):
+        start = (request.num_computed_tokens +
+                 (args[0] if len(args) > 0 else kwargs.get(
+                     "num_new_local_computed_tokens", 0)) +
+                 (args[1] if len(args) > 1 else kwargs.get(
+                     "num_external_computed_tokens", 0)))
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if start < prefill_end:
+            rem = prefill_end - start
+            if (start > 0 and start + num_new_tokens >= prefill_end
+                    and not getattr(self, "use_eagle", False)
+                    and not (start < getattr(request, "shared_prefix_boundary",
+                                             0) < prefill_end)):
+                return rem
+            if num_new_tokens < rem and num_new_tokens < self.block_size:
+                return 0
+
         physical_cache_config = self.cache_config
         if physical_cache_config.block_size == self.block_size:
-            return original_split(self, *args, **kwargs)
+            return original_split(self, request, num_new_tokens, *args,
+                                  **kwargs)
 
         scheduler_cache_config = copy.copy(physical_cache_config)
         scheduler_cache_config.block_size = self.block_size
@@ -94,7 +112,8 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         # and the upstream implementation contains no callback or await point.
         self.cache_config = scheduler_cache_config
         try:
-            return original_split(self, *args, **kwargs)
+            return original_split(self, request, num_new_tokens, *args,
+                                  **kwargs)
         finally:
             self.cache_config = physical_cache_config
 

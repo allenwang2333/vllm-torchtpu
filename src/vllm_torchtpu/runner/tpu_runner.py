@@ -1962,8 +1962,6 @@ class TPUModelRunner(GPUModelRunner):
             logger.info("Compact mamba sizing skipped.")
             return
         cache_config = self.cache_config
-        if cache_config.num_gpu_blocks_override is not None:
-            return
         if group_size <= 0:
             return
 
@@ -1996,8 +1994,11 @@ class TPUModelRunner(GPUModelRunner):
                 f"per-tensor KV budget is {avail_per_tensor} B. Raise "
                 f"`gpu_memory_utilization` or lower `max_num_seqs`.")
 
-        attn_num_blocks = attn_per_tensor_avail // (num_attn_groups *
-                                                    attn_page_size_bytes)
+        if cache_config.num_gpu_blocks_override is not None:
+            attn_num_blocks = int(cache_config.num_gpu_blocks_override)
+        else:
+            attn_num_blocks = attn_per_tensor_avail // (num_attn_groups *
+                                                        attn_page_size_bytes)
         if attn_num_blocks <= 0:
             raise ValueError(
                 f"Compact-mamba KV sizing does not fit: no attention blocks "
@@ -3490,13 +3491,19 @@ class TPUModelRunner(GPUModelRunner):
 
         num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
             scheduler_output)
+        effective_total_scheduled_tokens = (
+            scheduler_output.total_num_scheduled_tokens)
+        if (envs.VLLM_TPU_PURE_DECODE_MAX_TOKENS > 0
+                and num_decode_reqs < self.input_batch.num_reqs):
+            effective_total_scheduled_tokens = max(
+                effective_total_scheduled_tokens,
+                envs.VLLM_TPU_PURE_DECODE_MAX_TOKENS + 1)
 
         # Profile the current batch composition (prefill vs decode) if phased profiling is enabled.
         if self.phase_based_profiler:
             self.batch_counter += 1
             padded_total_tokens = _get_padded_token_len(
-                self.num_tokens_paddings,
-                scheduler_output.total_num_scheduled_tokens)
+                self.num_tokens_paddings, effective_total_scheduled_tokens)
             batch_composition_stats = runner_utils.get_batch_composition_stats(
                 batch_id=self.batch_counter,
                 input_batch=self.input_batch,
@@ -3538,7 +3545,7 @@ class TPUModelRunner(GPUModelRunner):
         local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
             scheduler_output)
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
-            scheduler_output.total_num_scheduled_tokens,
+            effective_total_scheduled_tokens,
             local_num_chunks,
             # Exact per-chunk request bound on this rank; the DP-wide MAX of
             # it sizes every rank's draft forwards.
@@ -3829,7 +3836,8 @@ class TPUModelRunner(GPUModelRunner):
         step's GDN kernel resumes each request from checkpoint `offset` of
         its state block (the checkpoint of its last accepted token).
         """
-        if self.mamba_slot_read_offsets is None or not indices_per_group:
+        if (self.mamba_slot_read_offsets is None or not indices_per_group
+                or (self.speculative_config is None and next_tokens is None)):
             return
         offsets = torch.zeros(indices_per_group[0].shape[0],
                               dtype=torch.int32,

@@ -67,6 +67,16 @@ if TYPE_CHECKING:
     USE_BATCHED_RPA_LONGCTX: bool = False
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
     USE_PIPELINED_DMA_STAGING: bool = False
+    VLLM_TPU_PURE_DECODE_MAX_TOKENS: int = 16
+    VLLM_TPU_ENABLE_SHARED_PREFIX_DECODE: bool = True
+    VLLM_TPU_DECODE_BKV_SZ: int | None = None
+    VLLM_TPU_DECODE_BKV_CSZ: int | None = None
+    VLLM_TPU_PREFILL_BQ_SZ: int | None = None
+    VLLM_TPU_PREFILL_BQ_CSZ: int | None = None
+    VLLM_TPU_PREFILL_BKV_SZ: int | None = None
+    VLLM_TPU_PREFILL_BKV_CSZ: int | None = None
+    VLLM_TPU_GDN_DECODE_TILE_SIZE: int | None = None
+    VLLM_TPU_GDN_MIXED_TILE_SIZE: int | None = None
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
@@ -542,6 +552,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "USE_PIPELINED_DMA_STAGING":
     lambda: env_bool("USE_PIPELINED_DMA_STAGING")
     () or env_bool("USE_RPA_PIPELINED_DMA_STAGING")(),
+    "VLLM_TPU_PURE_DECODE_MAX_TOKENS":
+    env_int("VLLM_TPU_PURE_DECODE_MAX_TOKENS", 16),
+    "VLLM_TPU_ENABLE_SHARED_PREFIX_DECODE":
+    env_bool("VLLM_TPU_ENABLE_SHARED_PREFIX_DECODE", default=True),
+    "VLLM_TPU_DECODE_BKV_SZ":
+    env_optional_int("VLLM_TPU_DECODE_BKV_SZ"),
+    "VLLM_TPU_DECODE_BKV_CSZ":
+    env_optional_int("VLLM_TPU_DECODE_BKV_CSZ"),
+    "VLLM_TPU_PREFILL_BQ_SZ":
+    env_optional_int("VLLM_TPU_PREFILL_BQ_SZ"),
+    "VLLM_TPU_PREFILL_BQ_CSZ":
+    env_optional_int("VLLM_TPU_PREFILL_BQ_CSZ"),
+    "VLLM_TPU_PREFILL_BKV_SZ":
+    env_optional_int("VLLM_TPU_PREFILL_BKV_SZ"),
+    "VLLM_TPU_PREFILL_BKV_CSZ":
+    env_optional_int("VLLM_TPU_PREFILL_BKV_CSZ"),
+    "VLLM_TPU_GDN_DECODE_TILE_SIZE":
+    env_optional_int("VLLM_TPU_GDN_DECODE_TILE_SIZE"),
+    "VLLM_TPU_GDN_MIXED_TILE_SIZE":
+    env_optional_int("VLLM_TPU_GDN_MIXED_TILE_SIZE"),
     # Enables the block-major KV cache layout for Raiden offloading. Bundles all
     # attention layer fragments into a single contiguous array in HBM, collapsing
     # per-block transfers from F independent DMAs into a single hardware DMA.
