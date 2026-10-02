@@ -46,13 +46,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
-from vllm.model_executor.layers.rotary_embedding import (
-    MRotaryEmbedding,
-    RotaryEmbedding,
-)
-from vllm.model_executor.layers.rotary_embedding.mrope_interleaved import (
-    MRotaryEmbeddingInterleaved,
-)
+from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sequence import IntermediateTensors
@@ -1199,11 +1193,7 @@ class TPUModelRunner(GPUModelRunner):
         num_eligible = 0
         num_truncated = 0
         for name, module in self.model.named_modules():
-            if type(module) not in (
-                RotaryEmbedding,
-                MRotaryEmbedding,
-                MRotaryEmbeddingInterleaved,
-            ):
+            if not isinstance(module, RotaryEmbedding):
                 continue
             for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16"):
                 buf = getattr(module, buf_name, None)

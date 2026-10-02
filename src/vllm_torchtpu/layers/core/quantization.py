@@ -79,6 +79,8 @@ def static_per_tensor_quantize_tensor(
         dtype_info = torch.finfo(quant_dtype)
     else:
         dtype_info = torch.iinfo(quant_dtype)
+    if scale == 1.0:
+        return torch.clamp(tensor, dtype_info.min, dtype_info.max).to(quant_dtype)
     quantized = torch.clamp(
         tensor.to(torch.float32) / scale, dtype_info.min, dtype_info.max
     )

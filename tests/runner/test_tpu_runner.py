@@ -2299,3 +2299,39 @@ class TestAsyncSpecDecodeTokenAccounting:
             num_draft_per_req={1: 3},
         )
         assert runner.input_batch.num_tokens_no_spec[1] == 15
+
+
+def test_truncate_rope_caches_includes_rotary_embedding_subclasses():
+    """_truncate_rope_caches truncates RotaryEmbedding and its subclasses."""
+    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+
+    class CustomSubclassRotaryEmbedding(RotaryEmbedding):
+        def __init__(self, max_pos: int, dim: int):
+            torch.nn.Module.__init__(self)
+            self.cos_sin_cache = torch.zeros(max_pos, dim, dtype=torch.float32)
+            self.cos_sin_cache_bf16 = torch.zeros(max_pos, dim, dtype=torch.bfloat16)
+
+    base_rope = RotaryEmbedding.__new__(RotaryEmbedding)
+    torch.nn.Module.__init__(base_rope)
+    base_rope.cos_sin_cache = torch.zeros(4096, 64, dtype=torch.bfloat16)
+
+    sub_rope = CustomSubclassRotaryEmbedding(4096, 64)
+
+    model = torch.nn.Module()
+    model.base_rope = base_rope
+    model.sub_rope = sub_rope
+
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(
+            is_multimodal_model=True,
+            multimodal_config=SimpleNamespace(language_model_only=True),
+            max_model_len=1524,
+        ),
+        model=model,
+    )
+
+    TPUModelRunner._truncate_rope_caches(runner)
+
+    assert base_rope.cos_sin_cache.shape[0] == 1524
+    assert sub_rope.cos_sin_cache.shape[0] == 1524
+    assert sub_rope.cos_sin_cache_bf16.shape[0] == 1524

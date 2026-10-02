@@ -538,6 +538,50 @@ class TestFp8LinearRuntimeQuant:
         with pytest.raises(ValueError, match="divisible by block scale count"):
             _quantized_matmul_jax(x, w_q, w_scale)
 
+    def test_quantized_matmul_jax_bfloat16_per_channel(self):
+        """Per-channel FP8 matmul quantizes bf16 activations and handles zero rows."""
+        x = jnp.array(
+            [
+                [1.0, -2.0, 4.0, -8.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=jnp.bfloat16,
+        )
+        w_q = jnp.ones((4, 3), dtype=jnp.float8_e4m3fn)
+        w_scale = jnp.array([1.0, 2.0, 0.5], dtype=jnp.float32)
+
+        out = _quantized_matmul_jax(x, w_q, w_scale)
+
+        assert out.dtype == jnp.bfloat16
+        assert out.shape == (2, 3)
+        # Row 0 sum is 1 - 2 + 4 - 8 = -5; scaled by [1.0, 2.0, 0.5]
+        assert jnp.allclose(
+            out[0].astype(jnp.float32),
+            jnp.array([-5.0, -10.0, -2.5], dtype=jnp.float32),
+            rtol=0.05,
+            atol=0.1,
+        )
+        assert jnp.all(out[1] == 0)
+
+    def test_static_per_tensor_quantize_unit_scale(self, device):
+        """static_per_tensor_quantize_tensor scale=1.0 fast-path matches fp32 path."""
+        from vllm_torchtpu.layers.core.quantization import (
+            static_per_tensor_quantize_tensor,
+        )
+
+        x = torch.tensor(
+            [-600.0, -448.0, -1.5, 0.0, 2.25, 448.0, 600.0],
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        out = static_per_tensor_quantize_tensor(x, torch.float8_e4m3fn, 1.0)
+        finfo = torch.finfo(torch.float8_e4m3fn)
+        expected = torch.clamp(x.to(torch.float32) / 1.0, finfo.min, finfo.max).to(
+            torch.float8_e4m3fn
+        )
+        assert out.dtype == torch.float8_e4m3fn
+        assert torch.equal(out.float(), expected.float())
+
 
 class TestFp8WeightTranspose:
     """Tests for weight transpose in MoE processing."""
