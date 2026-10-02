@@ -75,11 +75,12 @@ def flash_attention_qk_softmax(
     if cfgs.model.soft_cap is not None:
         qk = cfgs.model.soft_cap * jnp.tanh(qk / cfgs.model.soft_cap)
 
-    qk_masked = []
-    for b_idx in range(cfgs.block.batch_size):
-        mask_b = custom_mask[b_idx]
-        qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
-    qk = jnp.stack(qk_masked, axis=0)
+    if custom_mask is not None:  # None: every (q, kv) pair is visible
+        qk_masked = []
+        for b_idx in range(cfgs.block.batch_size):
+            mask_b = custom_mask[b_idx]
+            qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
+        qk = jnp.stack(qk_masked, axis=0)
 
     m_curr = jnp.max(qk, axis=-1, keepdims=True)
 
