@@ -138,6 +138,7 @@ if TYPE_CHECKING:
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
 
 
@@ -343,6 +344,14 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
         return value
 
     return _get_positive_int_or_none_env
+
+
+# Default indexer KV cache mode. "sal" uses the SEQ_ALONG_LANE
+# (num_blocks, 33, 4, page_size) cache layout (132 B/token instead of the
+# 256 B/token HEAD_ALONG_SUBLANE layout) with the coalesced Pallas KV append
+# writer (`coalesced_kv_append_dcp`). Pages whose size is not a multiple of
+# 128 fall back to HEAD_ALONG_SUBLANE in `indexer_kv_layout`.
+DEFAULT_INDEXER_KV_CACHE_MODE = "sal"
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -673,6 +682,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Unset means unchunked: one single pass, no pipelining.
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
+    ),
+    # Indexer KV cache layout and writer mode:
+    # - "has": HEAD_ALONG_SUBLANE layout with coalesced Pallas KV append
+    # - "sal": SEQ_ALONG_LANE layout with coalesced Pallas KV append
+    # - "xla": HEAD_ALONG_SUBLANE layout with XLA scatter
+    "VLLM_TPU_INDEXER_KV_CACHE_MODE": env_with_choices(
+        "VLLM_TPU_INDEXER_KV_CACHE_MODE",
+        DEFAULT_INDEXER_KV_CACHE_MODE,
+        ["sal", "has", "xla"],
+        case_sensitive=False,
     ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.

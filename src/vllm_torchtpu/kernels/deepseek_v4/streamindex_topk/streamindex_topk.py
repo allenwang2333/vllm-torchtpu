@@ -14,6 +14,7 @@
 """TPU-Friendly StreamIndex Top-K kernel."""
 
 import functools
+import logging
 
 import jax
 import jax.numpy as jnp
@@ -33,6 +34,14 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     dcp_sc_compact,
     metadata,
 )
+
+try:
+    import vllm.logger  # noqa: F401
+    from vllm_torchtpu.logger import init_logger
+
+    logger = init_logger(__name__)
+except ImportError:
+    logger = logging.getLogger(__name__)
 
 MlaCase = config.MlaCase
 KVLayout = config.KVLayout
@@ -503,6 +512,55 @@ def prepare_outputs(out):
 # 8-bit KV data packs 4 values into every 32-bit sublane word.
 KV_PACKING = 4
 
+DEFAULT_INDEXER_KV_CACHE_MODE = "sal"
+_INDEXER_KV_LAYOUT_FALLBACK_LOGGED: set[tuple[str, int]] = set()
+
+
+def indexer_kv_layout(
+    block_size: int = 256,
+    mode: str | None = None,
+) -> KVLayout:
+    """Returns the single-source `KVLayout` for an indexer K cache of `block_size`.
+
+    `sal` requires `block_size` to be a positive multiple of 128. When
+    `block_size < 128` or `block_size % 128 != 0`, this helper selects
+    `KVLayout.HEAD_ALONG_SUBLANE` (logging a one-time warning) so cache
+    allocation and op execution always agree on the layout.
+    """
+    if isinstance(block_size, str) and mode is None:
+        mode = block_size
+        block_size = 256
+    if mode is None:
+        try:
+            from vllm_torchtpu import envs
+
+            raw_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
+        except ImportError:
+            raw_mode = DEFAULT_INDEXER_KV_CACHE_MODE
+    else:
+        raw_mode = mode
+    resolved = raw_mode.strip().lower()
+    if resolved not in ("xla", "has", "sal"):
+        raise ValueError(
+            f"Invalid VLLM_TPU_INDEXER_KV_CACHE_MODE={raw_mode!r}; "
+            "expected one of ('xla', 'has', 'sal')."
+        )
+    if resolved == "sal":
+        if block_size < 128 or block_size % 128 != 0:
+            key = (resolved, int(block_size))
+            if key not in _INDEXER_KV_LAYOUT_FALLBACK_LOGGED:
+                _INDEXER_KV_LAYOUT_FALLBACK_LOGGED.add(key)
+                logger.warning(
+                    "VLLM_TPU_INDEXER_KV_CACHE_MODE=%r requires block_size to be a "
+                    "positive multiple of 128 (got block_size=%d); falling back to "
+                    "HEAD_ALONG_SUBLANE layout with 'has' writer.",
+                    resolved,
+                    block_size,
+                )
+            return KVLayout.HEAD_ALONG_SUBLANE
+        return KVLayout.SEQ_ALONG_LANE
+    return KVLayout.HEAD_ALONG_SUBLANE
+
 
 def get_kv_cache_shape(
     total_num_pages: int,
@@ -512,6 +570,10 @@ def get_kv_cache_shape(
 ) -> tuple[int, ...]:
     """Returns the packed uint8 index KV cache shape for a given layout."""
     kv_layout = KVLayout.parse(kv_layout)
+    if actual_head_dim % 64 != 0:
+        unpacked = actual_head_dim - max(1, actual_head_dim // 128)
+        if unpacked > 0 and unpacked % 64 == 0:
+            actual_head_dim = unpacked
     head_dim = align_to(actual_head_dim, 128)
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
         if page_size % 128 != 0:
@@ -551,6 +613,10 @@ def convert_cache_to_seq_along_lane(
     migration of an existing cache; production callers should write the cache in
     the target layout directly.
     """
+    if actual_head_dim % 64 != 0:
+        unpacked = actual_head_dim - max(1, actual_head_dim // 128)
+        if unpacked > 0 and unpacked % 64 == 0:
+            actual_head_dim = unpacked
     total_num_pages, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
     page_size = page_size_per_kv_packing * kv_packing
     head_dim = align_to(actual_head_dim, 128)
@@ -569,6 +635,41 @@ def convert_cache_to_seq_along_lane(
         (head_dim + KV_PACKING) // KV_PACKING,
         KV_PACKING,
         page_size,
+    )
+
+
+def convert_cache_to_head_along_sublane(
+    cache_kv: jax.Array,  # uint8[pages, (head_dim + 4) // 4, 4, page_size]
+    actual_head_dim: int,
+) -> jax.Array:  # uint8[pages, page_size // 4, 4, record_width]
+    """Repacks a SEQ_ALONG_LANE index cache into the HEAD_ALONG_SUBLANE layout.
+
+    This is a host-side (XLA) conversion intended for tests and for one-off
+    migration of an existing cache; production callers should write the cache in
+    the target layout directly.
+    """
+    if actual_head_dim % 64 != 0:
+        unpacked = actual_head_dim - max(1, actual_head_dim // 128)
+        if unpacked > 0 and unpacked % 64 == 0:
+            actual_head_dim = unpacked
+    total_num_pages, num_sublane_groups, kv_packing, page_size = cache_kv.shape
+    head_dim = align_to(actual_head_dim, 128)
+    record_width = align_to(head_dim + head_dim // 128, 128)
+
+    # [pages, head_dim + 4, page_size] -> swap axes to [pages, page_size, head_dim + 4]
+    rows = cache_kv.reshape(total_num_pages, num_sublane_groups * kv_packing, page_size)
+    rows = rows.swapaxes(1, 2)
+    keys = rows[:, :, :head_dim]
+    scale = rows[:, :, head_dim : head_dim + 1]
+
+    flat = jnp.zeros((total_num_pages, page_size, record_width), dtype=cache_kv.dtype)
+    flat = flat.at[:, :, :head_dim].set(keys)
+    flat = flat.at[:, :, head_dim : head_dim + 1].set(scale)
+    return flat.reshape(
+        total_num_pages,
+        page_size // kv_packing,
+        kv_packing,
+        record_width,
     )
 
 
