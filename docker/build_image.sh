@@ -26,7 +26,7 @@ USAGE
 }
 
 # Default values
-IMAGE_TAG="vllm-torchtpu" # change default image name to vllm-torchtpu
+IMAGE_TAG="vllm/vllm-torchtpu" # change default image name to vllm-torchtpu
 VLLM_SOURCE=""
 VLLM_COMMIT_HASH=""
 TARGET="prod"

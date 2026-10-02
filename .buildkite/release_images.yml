@@ -48,6 +48,8 @@ steps:
       # DOCKERHUB_REPO: "REPLACE_WITH_DOCKERHUB_REPO"
       # TODO(test-only): dummy lowercase repo for a CI dry run; nothing is pushed.
       DOCKERHUB_REPO: "test/vllm-torchtpu"
+      # Makes publish_nightly_images.sh build prod only and push to Docker Hub.
+      PUBLISH_DOCKERHUB: "1"
     # TODO(test-only): secret and Docker Hub login disabled for a CI dry run.
     # Restore before merging.
     # TODO(docker-hub): the secret name configured in the Buildkite cluster.
@@ -60,4 +62,4 @@ steps:
     #       username: "REPLACE_WITH_DOCKERHUB_USERNAME"
     #       password-env: DOCKERHUB_TOKEN
     commands:
-      - bash .buildkite/scripts/publish_dockerhub_images.sh
+      - bash .buildkite/scripts/publish_nightly_images.sh
