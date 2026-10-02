@@ -353,3 +353,25 @@ def test_dcp_fused_payload_is_bit_identical(q_len, dcp_size):
     got = np.asarray(streamindex_topk_dcp(*args, **kwargs, fused_payload=True))
     np.testing.assert_array_equal(got, want)
     assert (got >= 0).any()
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 8])
+@pytest.mark.parametrize("q_len", [16, Q_LEN])
+@pytest.mark.parametrize("fused_payload", [False, True])
+@pytest.mark.parametrize("chunk_tokens", [None, 64])
+# KV_LEN // 4: every row fits the first stage-1 slice (the single-call path);
+# KV_LEN: rows overflow it (the two-stage fallback inside the conditional).
+@pytest.mark.parametrize("seq_len", [KV_LEN // 4, KV_LEN])
+def test_dcp_single_slice_is_bit_identical(
+    seq_len, chunk_tokens, fused_payload, q_len, dcp_size
+):
+    """`single_slice` skips the local stage-2 merge and changes no output."""
+    _need_devices(dcp_size)
+    _, args, kwargs = _dcp_case(dcp_size, 7, q_len=q_len)
+    args = args[:3] + (jnp.array([seq_len], jnp.int32),) + args[4:]
+    kwargs = dict(kwargs, fused_payload=fused_payload, chunk_tokens=chunk_tokens)
+    want = np.asarray(streamindex_topk_dcp(*args, **kwargs))
+    got = np.asarray(streamindex_topk_dcp(*args, **kwargs, single_slice=True))
+    np.testing.assert_array_equal(got, want)
+    assert (got >= 0).any()

@@ -305,6 +305,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # the KV axis DCP shards, so the same knob applies here unchanged.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
         fused_payload = envs.TPU_SC_TOPK_FUSED_PAYLOAD
+        single_slice = envs.TPU_SC_TOPK_SINGLE_SLICE
 
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -348,6 +349,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_queries_per_block=(1, 128, 128),
                 chunk_tokens=chunk_tokens,
                 fused_payload=fused_payload,
+                single_slice=single_slice,
             )
             return cache_kv, local_topk
 

@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SC_TOPK_FUSED_PAYLOAD: bool = False
+    TPU_SC_TOPK_SINGLE_SLICE: bool = False
     TPU_INDEXER_TOPK_SINGLE_WRITE: bool = False
     TPU_INDEXER_TOPK_NOCOPY: bool = False
     TPU_INDEXER_TOPK_SHARED_READ: bool = False
@@ -760,6 +761,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and, under DCP, `resolve_owned_winners`' take_along_axis) into the top-k
     # kernel's emit instead of separate offloaded gathers. Same indices.
     "TPU_SC_TOPK_FUSED_PAYLOAD": env_bool("TPU_SC_TOPK_FUSED_PAYLOAD", default=False),
+    # When every indexer score row's per-rank length fits the first stage-1
+    # slice (rows sized for max_model_len, mostly empty), the SparseCore top-k
+    # reads that slice in place and skips its stage-2 merge; a lax.cond keeps
+    # the two-stage path for longer rows. Same indices and scores.
+    "TPU_SC_TOPK_SINGLE_SLICE": env_bool("TPU_SC_TOPK_SINGLE_SLICE", default=False),
     # Indexer writes its top-k into the shared `topk_indices_buffer` with one
     # full-width row update and hands the fresh rows to attention, instead of
     # a -1 fill plus a partial-width write whose result attention re-reads.
