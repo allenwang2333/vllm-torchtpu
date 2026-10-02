@@ -304,6 +304,10 @@ _SHARED_EXPERT_BARRIER_OP = None
 
 def _shared_expert_barrier(t):
     """Identity on ``t`` that XLA may not fuse across (``optimization_barrier``)."""
+    return _shared_expert_barrier_op()(t)
+
+
+def _shared_expert_barrier_op():
     global _SHARED_EXPERT_BARRIER_OP
     if _SHARED_EXPERT_BARRIER_OP is None:
         import jax
@@ -316,7 +320,7 @@ def _shared_expert_barrier(t):
         op = pallas.jax_op("tpu::shared_expert_ag_window_barrier", _barrier_jax)
         op.register_fake(lambda x: torch.empty_like(x))
         _SHARED_EXPERT_BARRIER_OP = op
-    return _SHARED_EXPERT_BARRIER_OP(t)
+    return _SHARED_EXPERT_BARRIER_OP
 
 
 def _patch_moe_runner_shared_expert_ag_window() -> None:
@@ -336,6 +340,11 @@ def _patch_moe_runner_shared_expert_ag_window() -> None:
 
     if getattr(_mr.MoERunner, "_tpu_shared_expert_ag_window_patch", False):
         return
+    # Build the jax_op now, outside any trace: created lazily on its first call it
+    # would be created inside the torch.compile trace, where Dynamo graph-breaks
+    # (probe 44 saw Dynamo refuse the analogous lazy, lock-guarded
+    # linear_common._get_quantized_matmul_op on a first call under fullgraph).
+    _shared_expert_barrier_op()
     original = _mr.MoERunner._apply_quant_method
 
     def _apply_quant_method(self, *args, **kwargs):
