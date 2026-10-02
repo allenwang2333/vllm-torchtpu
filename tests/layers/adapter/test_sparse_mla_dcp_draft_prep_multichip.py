@@ -168,6 +168,15 @@ def _problem(rank, world):
     )
 
 
+_STAGE = ["init"]
+
+
+def _stage(name):
+    """Record the step about to run, so a worker failure names it."""
+    _STAGE[0] = name
+    print(f"STAGE rank{os.environ.get('RANK')} {name}", flush=True)
+
+
 def _bits(x):
     import torch
 
@@ -205,6 +214,7 @@ def _check(rank, world, group):
         kv_cache_quantized_dtype=torch.float8_e4m3fn,
     )
     cls = PallasMLAttentionBackendImpl
+    _stage("build_ops")
     prep_op = cls._build_sparse_mla_dcp_draft_prep_op(
         impl, layer, world, INTERLEAVE, NUM_STEPS
     )
@@ -216,6 +226,7 @@ def _check(rank, world, group):
     common = (dev["block_tables"], dev["qsl"], dev["rd"])
     report = {}
 
+    _stage("prep_compiled")
     # The prep, as eagle3's `_build_draft_prep` calls it (compiled region,
     # `buf[:num_tokens]` inside), and eagerly through the op.
     prep = tuple(
@@ -223,8 +234,11 @@ def _check(rank, world, group):
             dev["buf"], dev["seq_lens"], *common, NUM_TOKENS
         )
     )
+    torch.equal(_bits(prep[0]), _bits(prep[0]))
+    _stage("prep_eager")
     eager_prep = tuple(prep_op(topk, dev["seq_lens"], *common))
     want = DCP_DRAFT_PREP_SHARED + 3 * NUM_STEPS
+    _stage("prep_compare")
     report["prep_len"] = len(prep)
     report["prep_shapes"] = [list(p.shape) for p in prep]
     report["prep_compiled_eq_eager"] = len(prep) == want and all(
@@ -242,7 +256,10 @@ def _check(rank, world, group):
     sl = dev["seq_lens"]
     mismatches = []
     for step in range(NUM_STEPS):
+        _stage(f"attn_flag0_step{step}")
         r = run(ref_c, step, sl)
+        _bits(r[0])
+        _stage(f"attn_hoisted_step{step}")
         g = run(hoist_c, step, sl, tuple(DcpDraftPrep.for_step(prep, step)))
         for name, a, b in (
             ("nope", ref_c[0], hoist_c[0]),
@@ -256,6 +273,7 @@ def _check(rank, world, group):
     report["mismatches"] = mismatches
     report["out_finite"] = bool(torch.isfinite(r[0].cpu().float()).all())
 
+    _stage("control")
     # Positive control: step 0's write plan at step 1 moves the write.
     right_c, wrong_c = fresh(), fresh()
     run(right_c, 0, dev["seq_lens"])
@@ -306,6 +324,8 @@ def _run_worker(result_dir: Path) -> None:
     except BaseException as exc:  # noqa: BLE001 - reported to the parent
         traceback.print_exc()
         result["error"] = repr(exc)[:2000]
+        result["stage"] = _STAGE[0]
+        result["traceback"] = traceback.format_exc()[-4000:]
     finally:
         (result_dir / f"rank_{rank}.json").write_text(
             json.dumps(result, indent=2), encoding="utf-8"
