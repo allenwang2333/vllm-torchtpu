@@ -19,6 +19,44 @@ def test_local_suffix_update():
     assert mask.get_local_padding_mask(8).sum().item() == 0
 
 
+def test_update_skips_copy_only_when_mask_unchanged():
+    mask = torch.zeros(8, dtype=torch.bool)
+    state = TokenPaddingState(local_padding_mask=mask)
+    copies = []
+    real_copy = mask.copy_
+
+    def counting_copy(src):
+        copies.append(src.clone())
+        return real_copy(src)
+
+    mask.copy_ = counting_copy
+    state.update(3, 6)
+    state.update(3, 6)
+    assert len(copies) == 1
+    # Same mask contents, different arguments: still skipped.
+    state.update(2, 2)
+    state.update(5, 5)
+    assert len(copies) == 2
+    assert state.get_local_padding_mask(8).sum().item() == 0
+    # Clamped to the mask length: (3, 20) writes what (3, 8) writes.
+    state.update(3, 20)
+    state.update(3, 8)
+    assert len(copies) == 3
+    assert state.get_local_padding_mask(8).tolist() == [False] * 3 + [True] * 5
+    # A changed range always writes.
+    state.update(0, 4)
+    assert len(copies) == 4
+    assert state.get_local_padding_mask(8).tolist() == [True] * 4 + [False] * 4
+
+
+def test_update_rewrites_a_replaced_mask():
+    state = TokenPaddingState(local_padding_mask=torch.zeros(4, dtype=torch.bool))
+    state.update(1, 4)
+    state.local_padding_mask = torch.zeros(4, dtype=torch.bool)
+    state.update(1, 4)
+    assert state.get_local_padding_mask(4).tolist() == [False, True, True, True]
+
+
 def test_dummy_batch_is_all_padding():
     state = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
     state.update(0, 6)
