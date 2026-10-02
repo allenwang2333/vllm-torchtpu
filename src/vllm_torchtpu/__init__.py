@@ -260,7 +260,7 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
     # the unguarded `_fused_output_is_reduced` read below stops failing loudly
     # on an upstream rename in runs that do not use the kernel; if arming ever
     # grows a non-env path, this gate has to go with it.
-    if not envs.USE_MOE_FUSED_EP_KERNEL:
+    if not (envs.USE_MOE_FUSED_EP_KERNEL or envs.USE_MOE_FUSED_TP_AR):
         return
 
     from vllm.model_executor.layers.fused_moe.runner import moe_runner as _mr
@@ -276,6 +276,9 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
         # and in that mode the model reduces externally anyway, so leave it be.
         if getattr(self.moe_config, "skip_final_all_reduce", False):
             return original.fget(self)
+        # A layer armed by arm_fused_tp_ar reduces shared + routed in-kernel.
+        if getattr(self, "_fused_moe_tp_ar_armed", False):
+            return True
         try:
             from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
         except ImportError:

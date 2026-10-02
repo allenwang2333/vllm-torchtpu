@@ -4629,6 +4629,16 @@ class TPUModelRunner(GPUModelRunner):
         if self._is_async_drafter:
             self.drafter.load_model(self.model)
 
+        # After the drafter, so its MTP layer is armed too: every module has its
+        # final weight layout by now.
+        if envs.USE_MOE_FUSED_TP_AR:
+            from vllm_torchtpu.layers.adapter.fused_moe_tp_ar import arm_fused_tp_ar
+
+            arm_fused_tp_ar(self.model)
+            draft_model = getattr(getattr(self, "drafter", None), "draft_model", None) or getattr(getattr(self, "drafter", None), "model", None)
+            if isinstance(draft_model, torch.nn.Module) and draft_model is not self.model:
+                arm_fused_tp_ar(draft_model)
+
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
 

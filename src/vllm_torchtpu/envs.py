@@ -52,6 +52,8 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     USE_MOE_FUSED_TP_KERNEL: bool = False
     MOE_FUSED_TP_KERNEL_MAX_TOKENS: int = 512
+    USE_MOE_FUSED_TP_AR: bool = False
+    MOE_FUSED_TP_AR_MAX_TOKENS: int = 128
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -549,6 +551,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_TP_KERNEL_MAX_TOKENS": env_nonnegative_int(
         "MOE_FUSED_TP_KERNEL_MAX_TOKENS", 512
     ),
+    # Also fold the shared expert and the TP all-reduce into the fused TP
+    # kernel (layers/adapter/fused_moe_tp_ar.py) for eligible TP-only layers,
+    # at token counts up to MOE_FUSED_TP_AR_MAX_TOKENS. Armed once after load.
+    "USE_MOE_FUSED_TP_AR": env_bool("USE_MOE_FUSED_TP_AR"),
+    "MOE_FUSED_TP_AR_MAX_TOKENS": env_nonnegative_int("MOE_FUSED_TP_AR_MAX_TOKENS", 128),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
