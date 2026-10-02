@@ -1174,6 +1174,8 @@ def sparse_mla_attention_dcp(
             cache_layout=cache_layout,
             # Ranks own ~topk/dcp of each row: gather and attend those only.
             packed_gather=envs.TPU_DCP_MLA_PACKED_GATHER,
+            # The rest: a static top-k width with an exact in-kernel overflow.
+            topk_cap=envs.TPU_DCP_MLA_TOPK_CAP or None,
         )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).

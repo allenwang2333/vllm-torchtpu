@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_PACKED_GATHER: bool = True
+    TPU_DCP_MLA_TOPK_CAP: int = 0
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -358,6 +359,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (`sparse_ragged_paged_attention(packed_gather=True)`), instead of all
     # `topk` slots per token when a rank owns ~topk/dcp of them.
     "TPU_DCP_MLA_PACKED_GATHER": env_bool("TPU_DCP_MLA_PACKED_GATHER", default=True),
+    # DCP sparse MLA (SparseCore cache layout): gather and attend this many
+    # top-k slots per token instead of all `topk`; tokens owning more are
+    # recomputed exactly in-kernel over all their windows
+    # (`sparse_ragged_paged_attention(topk_cap=...)`). 0 = off. Chunks the
+    # packed gather takes stay packed.
+    "TPU_DCP_MLA_TOPK_CAP": env_int("TPU_DCP_MLA_TOPK_CAP", 0),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
