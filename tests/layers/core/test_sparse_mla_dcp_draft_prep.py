@@ -66,8 +66,11 @@ def _problem(rng, *, dcp, num_tokens, num_reqs, kernel_num_reqs, pages_per_seq,
     )
 
     def rand_cache(spec):
+        # Every byte a finite fp8 e4m3fn of magnitude < 2 (exponent <= 0b0111),
+        # so attention outputs are finite and a moved index shows in the bits.
         shape = (dcp * spec.shape[0],) + tuple(spec.shape[1:])
-        return rng.integers(0, 2**32, size=shape, dtype=np.uint32)
+        raw = rng.integers(0, 256, size=shape + (4,), dtype=np.uint8) & 0xBF
+        return raw.view(np.uint32).reshape(shape)
 
     # Loop-step layout: one query per request, padded to num_tokens.
     qsl = np.minimum(np.arange(kernel_num_reqs + 1), num_reqs).astype(np.int32)
@@ -203,12 +206,29 @@ class SparseMlaDcpDraftPrepTest(parameterized.TestCase):
                 np.testing.assert_array_equal(
                     g, r, err_msg=f"step {step}: {name} differs from the per-call path"
                 )
-            # Positive control: the output is attention, not the aliased q.
-            self.assertGreater(
-                np.abs(np.asarray(ref[2], np.float32)).max(), 0.0
-            )
             ref_caches, hoist_caches = ref[:2], got[:2]
             sl = sl + 1
+
+        # Positive control: a prep built from a top-k with one live entry
+        # moved changes the attention output, so the comparison above can see
+        # a wrong index prep.
+        moved = pr["topk"].copy()
+        real_rows = [r * num_tokens + t for r in range(dcp) for t in range(4)]
+        row = next(i for i in real_rows if moved[i, 1] >= 0)
+        moved[row, 0] = (moved[row, 0] + 1) % (32 * PAGE_SIZE)
+        moved = jax.device_put(moved, NamedSharding(mesh, P(DCP_AXIS_NAME, None)))
+        bad_prep = ai.sparse_mla_dcp_draft_prep(
+            moved, seq_lens, bt, qsl, rd, mesh, pr["nope_spec"],
+            num_steps=num_steps, **kw,
+        )
+        good = attend(fresh_caches(), 0, seq_lens, ai.DcpDraftPrep.for_step(prep, 0))
+        bad = attend(fresh_caches(), 0, seq_lens, ai.DcpDraftPrep.for_step(bad_prep, 0))
+        self.assertFalse(
+            np.array_equal(
+                np.asarray(good[2]).view(np.uint16), np.asarray(bad[2]).view(np.uint16)
+            ),
+            "a moved top-k entry left the attention output unchanged",
+        )
 
         # Positive control: a stale write plan (step 0's at step 1) moves the
         # write, so the comparison above can see a wrong plan.
@@ -241,14 +261,19 @@ class SparseMlaDcpDraftPrepTest(parameterized.TestCase):
             )
 
             def hlo(draft_prep):
+                # The prep goes in as arguments: closed over, it would be
+                # embedded as constants.
                 def f(*a):
+                    prep_args = a[11:]
                     return ai.sparse_mla_attention_dcp(
                         *a[:11], mesh, pr["nope_spec"], pr["rope_spec"],
-                        sm_scale=0.1, k_scale=0.75, draft_prep=draft_prep, **kw,
+                        sm_scale=0.1, k_scale=0.75,
+                        draft_prep=ai.DcpDraftPrep(*prep_args) if prep_args else None,
+                        **kw,
                     )
                 args = (s["ql_nope"], s["q_pe"], s["kv_c"], s["k_pe"], pr["nope"],
                         pr["rope"], pr["topk"], pr["seq_lens"], pr["block_tables"],
-                        pr["qsl"], pr["rd"])
+                        pr["qsl"], pr["rd"]) + tuple(draft_prep or ())
                 return jax.jit(f).lower(*args).as_text()
 
             base = hlo(None)
