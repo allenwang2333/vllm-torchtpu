@@ -33,8 +33,10 @@ ShapeEnv, vLLM drops that guard, and nothing here can see it.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable, Iterator
-from typing import TYPE_CHECKING, Any
+import operator
+from collections import Counter
+from collections.abc import Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Callable
 
 import sympy
 import torch
@@ -53,8 +55,17 @@ class ShapeSpecializationError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
-# What a trace assumed about the token count
+# Token-count guards
 # ---------------------------------------------------------------------------
+
+
+def _placeholder_nodes(graph: fx.GraphModule) -> list[fx.Node]:
+    nodes = []
+    for node in graph.graph.nodes:
+        if node.op != "placeholder":
+            break
+        nodes.append(node)
+    return nodes
 
 
 def _placeholder_values(graph: fx.GraphModule) -> list[Any]:
@@ -95,7 +106,8 @@ def _holds_at(expr: sympy.Expr, substitution: dict) -> bool | None:
             value = sympy.simplify(value)
     except Exception:  # pragma: no cover - defensive; sympy is total here
         return None
-    return bool(value) if isinstance(value, sympy.logic.boolalg.BooleanAtom) else None
+    return bool(value) if isinstance(value,
+                                     sympy.logic.boolalg.BooleanAtom) else None
 
 
 def unsupported_reason(shape_env: Any, size: int) -> str | None:
@@ -133,23 +145,63 @@ def unsupported_reason(shape_env: Any, size: int) -> str | None:
     return None
 
 
+def _meta_entry(value: Any) -> Any:
+    """Return a comparable placeholder type and shape."""
+    if value is None:
+        return None
+    if not isinstance(value, torch.Tensor):
+        return type(value).__name__
+    dims = tuple("?" if isinstance(d, torch.SymInt) else int(d)
+                 for d in value.shape)
+    return (str(value.dtype), dims)
+
+
 def _signature(graph: fx.GraphModule) -> tuple:
-    """The submodule input list a handed-over runnable has to match.
+    """The submodule input list a handed-over runnable has to match."""
+    return tuple(_meta_entry(value) for value in _placeholder_values(graph))
 
-    Symbolic dims compare as "?", so the token dimension matches across traces
-    but a structural difference -- a split graph whose subgraph takes one chunk
-    in one variant and two in another -- does not.
-    """
 
-    def shape(value: Any) -> Any:
-        if not isinstance(value, torch.Tensor):
-            return type(value).__name__
-        dims = tuple(
-            "?" if isinstance(d, torch.SymInt) else int(d) for d in value.shape
-        )
-        return (str(value.dtype), dims)
+def _handover_inputs(graph: fx.GraphModule) -> list[tuple[str, Any]]:
+    """Return placeholders in runnable argument order."""
+    return [(node.name,
+             _meta_entry(node.meta.get("example_value", node.meta.get("val"))))
+            for node in _placeholder_nodes(graph)]
 
-    return tuple(shape(value) for value in _placeholder_values(graph))
+
+def _input_permutation(old: list[tuple[str, Any]],
+                       new: list[tuple[str, Any]]) -> list[int] | None:
+    """Map reordered trace inputs to stored runnable slots."""
+    if len(old) != len(new):
+        return None
+    new_index = {name: i for i, (name, _) in enumerate(new)}
+    if len(new_index) != len(new):
+        return None
+    perm = []
+    for name, entry in old:
+        i = new_index.get(name)
+        if i is None or new[i][1] != entry:
+            return None
+        perm.append(i)
+    if len(set(perm)) != len(perm):
+        return None
+    return perm
+
+
+def _signature_delta(cached: Sequence[Any], current: Sequence[Any]) -> str:
+    """Summarize structural differences between trace inputs."""
+
+    def render(counts: Counter) -> str:
+        if not counts:
+            return "nothing"
+        by_frequency = sorted(counts.items(),
+                              key=lambda kv: (-kv[1], str(kv[0])))
+        return ", ".join(f"{count}x {item}" for item, count in by_frequency)
+
+    return (f"{len(cached)} inputs vs {len(current)}. "
+            f"Only in the earlier trace: "
+            f"{render(Counter(cached) - Counter(current))}. "
+            f"Only in this one: "
+            f"{render(Counter(current) - Counter(cached))}")
 
 
 def graph_signature(graph: fx.GraphModule) -> tuple:
@@ -163,7 +215,7 @@ def graph_signature(graph: fx.GraphModule) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Handing a bucket from the trace that cannot serve it to the one that can
+# Bucket executable sharing
 # ---------------------------------------------------------------------------
 
 
@@ -178,35 +230,52 @@ class BucketExecutables:
     """
 
     def __init__(self) -> None:
-        self._runnables: dict[tuple[str, str], tuple[Callable[..., Any], tuple]] = {}
+        self._runnables: dict[tuple[str, str], tuple[Callable[..., Any], tuple,
+                                                     list[tuple[str,
+                                                                Any]]]] = {}
         self.refused: set[int] = set()
         self.traces = 0
 
-    def get(
-        self, cache_dir: str, key: str, graph: fx.GraphModule
-    ) -> Callable[..., Any] | None:
+    def get(self, cache_dir: str, key: str,
+            graph: fx.GraphModule) -> Callable[..., Any] | None:
         found = self._runnables.get((cache_dir, key))
         if found is None:
             return None
-        runnable, signature = found
-        if signature != _signature(graph):
+        runnable, _stored_signature, inputs = found
+        new_inputs = _handover_inputs(graph)
+        if inputs == new_inputs:
+            return runnable
+        # Reorder equivalent inputs to match the stored executable.
+        perm = _input_permutation(inputs, new_inputs)
+        if perm is None:
             raise ShapeSpecializationError(
-                f"{key} was compiled by another trace of this model whose "
-                f"inputs differ ({signature} vs {_signature(graph)}). The "
-                "graph is split, so its subgraph boundaries move with the "
-                "specialization and a bucket cannot be handed between traces; "
-                "unset TPU_KERNEL_ITER_MODE to serve this model."
-            )
-        return runnable
+                f"{key} cannot be handed over: the trace that compiled it "
+                f"takes different inputs than this one, beyond a reordering "
+                f"({_signature_delta(inputs, new_inputs)}). Each trace's "
+                "executable receives its lifted buffers positionally, so "
+                "neither can stand in for the other, and the graph that "
+                "stays live needs one executable per bucket. Either give the "
+                "two sides of the branch that forked the trace the same "
+                "lifted inputs, or stop forking on the token count "
+                "(TPU_MOE_FUSED_EP_STEP_MIN_TOKENS, TPU_KERNEL_ITER_MODE).")
+        if perm == list(range(len(perm))):
+            return runnable
+        moved = sum(1 for j, i in enumerate(perm) if j != i)
+        logger.info(
+            "[shape-variants] %s handed over with %d of %d inputs reordered",
+            key, moved, len(perm))
+        # Return arguments in stored slot order.
+        getter = operator.itemgetter(*perm)
 
-    def put(
-        self,
-        cache_dir: str,
-        key: str,
-        graph: fx.GraphModule,
-        runnable: Callable[..., Any],
-    ) -> None:
-        self._runnables[(cache_dir, key)] = (runnable, _signature(graph))
+        def reordered(*args: Any) -> Any:
+            return runnable(*getter(args))
+
+        return reordered
+
+    def put(self, cache_dir: str, key: str, graph: fx.GraphModule,
+            runnable: Callable[..., Any]) -> None:
+        self._runnables[(cache_dir, key)] = (runnable, _signature(graph),
+                                             _handover_inputs(graph))
 
     def needs_retrace(self, size: int) -> bool:
         """Whether a graph refused this bucket and no trace has built it yet.
@@ -235,9 +304,10 @@ def warmup() -> Iterator[BucketExecutables]:
         _session = None
 
 
-def runnable_for(
-    cache_dir: str, key: str, graph: fx.GraphModule, size: int | None = None
-) -> Callable[..., Any] | None:
+def runnable_for(cache_dir: str,
+                 key: str,
+                 graph: fx.GraphModule,
+                 size: int | None = None) -> Callable[..., Any] | None:
     """What this compile should use instead of compiling, if anything.
 
     The load path is screened too: the cache key is (subgraph, bucket) with no
@@ -252,7 +322,8 @@ def runnable_for(
         logger.info("[shape-variants] %s handed over by an earlier trace", key)
         return ready
 
-    reason = None if size is None else unsupported_reason(trace_shape_env(graph), size)
+    reason = (None if size is None else unsupported_reason(
+        trace_shape_env(graph), size))
     if reason is None:
         return None
     if _session is None:
@@ -262,8 +333,7 @@ def runnable_for(
             "token count while tracing, so every compile_size would share the "
             "structure of the one that was traced. Only the backbone is "
             "re-traced per bucket group today (see _precompile_backbone); make "
-            "this module's structure independent of the token count."
-        )
+            "this module's structure independent of the token count.")
 
     logger.info("[shape-variants] %s left to a later trace: %s", key, reason)
     _session.refused.add(size)
@@ -271,15 +341,13 @@ def runnable_for(
     def refuse(*_args: Any, **_kwargs: Any) -> Any:
         raise ShapeSpecializationError(
             f"{key} was left to a later trace ({reason}) and never compiled; "
-            "the warmup ladder is out of step with the partition."
-        )
+            "the warmup ladder is out of step with the partition.")
 
     return refuse
 
 
-def remember(
-    cache_dir: str, key: str, graph: fx.GraphModule, runnable: Callable[..., Any]
-) -> None:
+def remember(cache_dir: str, key: str, graph: fx.GraphModule,
+             runnable: Callable[..., Any]) -> None:
     """Offer a bucket, freshly compiled or loaded, to the traces that follow."""
     if _session is not None:
         _session.put(cache_dir, key, graph, runnable)
@@ -313,10 +381,8 @@ def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
     decoder layer, and the wrappers are what hold the bytecode hooks that have
     to be dropped before they are replaced.
     """
-    from vllm.compilation.wrapper import (
-        TorchCompileWithNoGuardsWrapper,
-        reset_compile_wrapper,
-    )
+    from vllm.compilation.wrapper import (TorchCompileWithNoGuardsWrapper,
+                                          reset_compile_wrapper)
     from vllm.config import set_current_vllm_config
 
     if _session is not None:
@@ -324,13 +390,11 @@ def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
         # The refusals belong to the traces being replaced.
         _session.refused.clear()
 
-    wrappers = (
-        [model]
-        if isinstance(model, TorchCompileWithNoGuardsWrapper)
-        else [
-            m for m in model.modules() if isinstance(m, TorchCompileWithNoGuardsWrapper)
-        ]
-    )
+    wrappers = ([model]
+                if isinstance(model, TorchCompileWithNoGuardsWrapper) else [
+                    m for m in model.modules()
+                    if isinstance(m, TorchCompileWithNoGuardsWrapper)
+                ])
     for wrapper in wrappers:
         wrapper.cleanup()  # drop its bytecode hook before replacing it
 
