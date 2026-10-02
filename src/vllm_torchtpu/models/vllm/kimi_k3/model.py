@@ -828,8 +828,10 @@ class KimiK3ForConditionalGeneration(
             ),
             device=device,
         )
-        values = dict(metadata)
-        values["pixel_values"] = dummy_pixel_values
+        # As vLLM's Kimi-K2.5 model: the metadata may carry a None entry, and
+        # a capture buffer must be a tensor.
+        values: dict[str, torch.Tensor] = {"pixel_values": dummy_pixel_values}
+        values.update({k: v for k, v in metadata.items() if v is not None})
         return EncoderCudaGraphCaptureInputs(values=values)
 
     def prepare_encoder_cudagraph_replay_buffers(
