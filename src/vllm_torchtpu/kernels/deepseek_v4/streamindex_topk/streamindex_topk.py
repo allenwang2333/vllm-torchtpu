@@ -512,7 +512,7 @@ def prepare_outputs(out):
 # 8-bit KV data packs 4 values into every 32-bit sublane word.
 KV_PACKING = 4
 
-DEFAULT_INDEXER_KV_CACHE_MODE = "has"
+DEFAULT_INDEXER_KV_CACHE_MODE = "sal"
 _INDEXER_KV_LAYOUT_FALLBACK_LOGGED: set[tuple[str, int]] = set()
 
 
@@ -613,6 +613,10 @@ def convert_cache_to_seq_along_lane(
     migration of an existing cache; production callers should write the cache in
     the target layout directly.
     """
+    if actual_head_dim % 64 != 0:
+        unpacked = actual_head_dim - max(1, actual_head_dim // 128)
+        if unpacked > 0 and unpacked % 64 == 0:
+            actual_head_dim = unpacked
     total_num_pages, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
     page_size = page_size_per_kv_packing * kv_packing
     head_dim = align_to(actual_head_dim, 128)
@@ -631,6 +635,41 @@ def convert_cache_to_seq_along_lane(
         (head_dim + KV_PACKING) // KV_PACKING,
         KV_PACKING,
         page_size,
+    )
+
+
+def convert_cache_to_head_along_sublane(
+    cache_kv: jax.Array,  # uint8[pages, (head_dim + 4) // 4, 4, page_size]
+    actual_head_dim: int,
+) -> jax.Array:  # uint8[pages, page_size // 4, 4, record_width]
+    """Repacks a SEQ_ALONG_LANE index cache into the HEAD_ALONG_SUBLANE layout.
+
+    This is a host-side (XLA) conversion intended for tests and for one-off
+    migration of an existing cache; production callers should write the cache in
+    the target layout directly.
+    """
+    if actual_head_dim % 64 != 0:
+        unpacked = actual_head_dim - max(1, actual_head_dim // 128)
+        if unpacked > 0 and unpacked % 64 == 0:
+            actual_head_dim = unpacked
+    total_num_pages, num_sublane_groups, kv_packing, page_size = cache_kv.shape
+    head_dim = align_to(actual_head_dim, 128)
+    record_width = align_to(head_dim + head_dim // 128, 128)
+
+    # [pages, head_dim + 4, page_size] -> swap axes to [pages, page_size, head_dim + 4]
+    rows = cache_kv.reshape(total_num_pages, num_sublane_groups * kv_packing, page_size)
+    rows = rows.swapaxes(1, 2)
+    keys = rows[:, :, :head_dim]
+    scale = rows[:, :, head_dim : head_dim + 1]
+
+    flat = jnp.zeros((total_num_pages, page_size, record_width), dtype=cache_kv.dtype)
+    flat = flat.at[:, :, :head_dim].set(keys)
+    flat = flat.at[:, :, head_dim : head_dim + 1].set(scale)
+    return flat.reshape(
+        total_num_pages,
+        page_size // kv_packing,
+        kv_packing,
+        record_width,
     )
 
 

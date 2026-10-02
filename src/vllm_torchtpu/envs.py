@@ -168,6 +168,7 @@ if TYPE_CHECKING:
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     TPU_SMALL_ALL_REDUCE: bool = False
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
@@ -386,7 +387,12 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
     return _get_positive_int_or_none_env
 
 
-DEFAULT_INDEXER_KV_CACHE_MODE = "has"
+# Default indexer KV cache mode. "sal" uses the SEQ_ALONG_LANE
+# (num_blocks, 33, 4, page_size) cache layout (132 B/token instead of the
+# 256 B/token HEAD_ALONG_SUBLANE layout) with the coalesced Pallas KV append
+# writer (`coalesced_kv_append_dcp`). Pages whose size is not a multiple of
+# 128 fall back to HEAD_ALONG_SUBLANE in `indexer_kv_layout`.
+DEFAULT_INDEXER_KV_CACHE_MODE = "sal"
 
 
 environment_variables: dict[str, Callable[[], Any]] = {

@@ -43,6 +43,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.kv_cache_utils import (
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
     DCP_AXIS_NAME,
     DEFAULT_VMEM_LIMIT_BYTES,
+    convert_cache_to_head_along_sublane,
     convert_cache_to_seq_along_lane,
     cp_global_to_local,
     cp_local_length,
@@ -70,6 +71,7 @@ __all__ = [
     "check_scatter_rows_supported",
     "coalesced_kv_append",
     "coalesced_kv_append_dcp",
+    "convert_cache_to_head_along_sublane",
     "convert_cache_to_seq_along_lane",
     "cp_local_to_global",
     "cp_local_length",
