@@ -767,6 +767,27 @@ def rpa_kernel(
             # memory is storing kv cache from previous step, as long as the data is
             # not NaNs, there will be no numeric concerns.
 
+            decode_prefetch = cfgs.mode == configs.RpaCase.DECODE
+            if decode_prefetch:
+                rem0 = actual_steps % cfgs.max_steps_ub
+                size0 = jnp.where(
+                    num_safe_step_iterations == 1,
+                    jnp.where(rem0 == 0, cfgs.max_steps_ub, rem0),
+                    cfgs.max_steps_ub,
+                )
+            if decode_prefetch:
+                _flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
+                _flat_smem = jax.tree_util.tree_leaves(schedule_ref)
+                first_copies = []
+                for _h, _s in zip(_flat_hbm, _flat_smem):
+                    if jax.typeof(_h).memory_space == pltpu.HBM:
+                        _es = _s.shape[0] // cfgs.max_steps_ub
+                        _rs = jnp.minimum(utils.align_to(_es * size0, 1024), _s.shape[0])
+                        _c = pltpu.make_async_copy(
+                            _h.at[pl.ds(0, _rs)], _s.at[pl.ds(0, _rs)], dma_sem.at[0]
+                        )
+                        _c.start()
+                        first_copies.append(_c)
             scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
 
             num_lanes = pltpu.get_tpu_info().num_lanes
@@ -822,7 +843,7 @@ def rpa_kernel(
                 )
                 kv_ref_flat[...] = jnp.zeros_like(kv_ref_flat)
 
-            def execute_schedule_chunk(start_step, num_steps):
+            def schedule_copies(start_step, num_steps):
                 # All reads are aligned to 128 and some extra steps are copied in the
                 # process.
                 aligned_start_step = (start_step // 128) * 128
@@ -846,9 +867,18 @@ def rpa_kernel(
                             s.at[pl.ds(0, read_size)],
                             dma_sem.at[0],
                         )
-                        copy.start()
                         dma_list.append(copy)
-                jax.tree.map(lambda x: x.wait(), dma_list)
+                return dma_list, prefix_steps
+
+            def execute_schedule_chunk(step_idx, start_step, num_steps):
+                dma_list, prefix_steps = schedule_copies(start_step, num_steps)
+
+                @pl.when(jnp.logical_or(step_idx > 0, not decode_prefetch))
+                def _():
+                    for c in dma_list:
+                        c.start()
+                    for c in dma_list:
+                        c.wait()
 
                 pipeline_func = pltpu.emit_pipeline(
                     body=functools.partial(
@@ -872,6 +902,10 @@ def rpa_kernel(
                     allocations=final_allocs,
                 )
 
+            if decode_prefetch:
+                for _c in first_copies:
+                    _c.wait()
+
             @pl.loop(0, num_safe_step_iterations)
             def loop_body(step_idx):
                 start = step_idx * cfgs.max_steps_ub
@@ -879,7 +913,7 @@ def rpa_kernel(
                 last_step_size = jnp.where(rem == 0, cfgs.max_steps_ub, rem)
                 is_last_step = step_idx == num_safe_step_iterations - 1
                 size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
-                execute_schedule_chunk(start, size)
+                execute_schedule_chunk(step_idx, start, size)
 
         # An empty schedule (e.g. the MIXED pass of a decode-only batch) does no work:
         # skip scratch allocation and init, the schedule fetch and the pipeline.
