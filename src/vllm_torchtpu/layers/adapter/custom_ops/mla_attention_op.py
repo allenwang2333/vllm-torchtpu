@@ -485,7 +485,12 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             )
 
         if envs.TPU_INDEXER_TOPK_SINGLE_WRITE or envs.TPU_INDEXER_TOPK_NOCOPY:
-            return self._write_topk_rows(hidden_states.shape[0], topk_indices)
+            rows = self._write_topk_rows(hidden_states.shape[0], topk_indices)
+            if envs.TPU_INDEXER_TOPK_SHARED_READ:
+                # Read back what the skip_topk layers will read, so the
+                # attention index prep is one CSE class across them.
+                return self.topk_indices_buffer
+            return rows
 
         self.topk_indices_buffer[: hidden_states.shape[0]] = -1
         num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])

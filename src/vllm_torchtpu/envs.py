@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_PACKED_GATHER: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 512
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
+    TPU_DCP_MLA_CAPPED_PREP: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -89,6 +90,7 @@ if TYPE_CHECKING:
     TPU_SC_TOPK_FUSED_PAYLOAD: bool = False
     TPU_INDEXER_TOPK_SINGLE_WRITE: bool = False
     TPU_INDEXER_TOPK_NOCOPY: bool = False
+    TPU_INDEXER_TOPK_SHARED_READ: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -374,6 +376,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is chunk * topk rows (~335 MB at 256), of which only the live windows
     # are written.
     "TPU_DCP_MLA_TOPK_CAP_CHUNK": env_int("TPU_DCP_MLA_TOPK_CAP_CHUNK", 256),
+    # Capped path index prep (`sparse_ragged_paged_attention(
+    # capped_window_prep=True)`): translate the top-k to physical rows once
+    # per call, straight into the window-major layout the capped gather reads,
+    # and only for the windows some gridded row needs (window 0 unless a row
+    # overflows `TPU_DCP_MLA_TOPK_CAP`), instead of a full-width page
+    # translation plus a per-chunk window-major copy. Same gathered rows.
+    "TPU_DCP_MLA_CAPPED_PREP": env_bool("TPU_DCP_MLA_CAPPED_PREP", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
@@ -719,6 +728,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # by a donating op so XLA updates the table in place instead of copying the
     # whole `[max_num_batched_tokens, width]` table in every indexed layer.
     "TPU_INDEXER_TOPK_NOCOPY": env_bool("TPU_INDEXER_TOPK_NOCOPY", default=False),
+    # With TPU_INDEXER_TOPK_SINGLE_WRITE / _NOCOPY: the indexed layer's own
+    # attention reads its rows back from the updated shared table, the same
+    # `table[:num_tokens]` expression the following skip_topk layers read,
+    # instead of the fresh rows. One expression lets XLA CSE the attention's
+    # top-k-only index prep (physical rows, live counts, window metadata)
+    # across the indexed layer and its skip_topk layers; with the fresh rows
+    # the first skip_topk layer recomputes it whenever num_tokens is short of
+    # the table height (decode). Same values either way.
+    "TPU_INDEXER_TOPK_SHARED_READ": env_bool(
+        "TPU_INDEXER_TOPK_SHARED_READ", default=False
+    ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(
