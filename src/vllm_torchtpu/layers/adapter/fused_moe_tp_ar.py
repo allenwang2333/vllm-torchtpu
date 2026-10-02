@@ -91,6 +91,7 @@ def _build_op(mesh, n_ranks: int, topk: int):
         return jax.lax.psum(shared + routed, axis)
 
     def local(rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti):
+        s1s, s2s, wg = s1s.reshape(1, -1), s2s.reshape(1, -1), wg.reshape(-1, 1)
         if x.shape[0] > cap:
             return decomposed(x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti)
         return _kernel_body(
@@ -162,13 +163,11 @@ def _shared_slice(runner) -> tuple | None:
         return None
     if getattr(gate, "bias", None) is not None or wg.dim() != 2 or wg.shape[0] != 1:
         return None
-    return (
-        w1s.data,
-        s1s.data.reshape(1, -1).contiguous(),
-        w2s.data,
-        s2s.data.reshape(1, -1).contiguous(),
-        wg.data.reshape(-1, 1).contiguous(),
-    )
+    # Hand over the parameters themselves, never torch views of them: a view
+    # passed to the op is re-materialized by an eager as_strided program on
+    # every call (measured: one per layer per step, ~48 us of host dispatch
+    # each). The kernel's [1, N] / [H, 1] shapes are made inside the program.
+    return (w1s.data, s1s.data, w2s.data, s2s.data, wg.data)
 
 
 def _admit(runner, n_ranks: int) -> tuple | None:
@@ -190,6 +189,7 @@ def _admit(runner, n_ranks: int) -> tuple | None:
     if shared is None:
         return None
     w1s, s1s, w2s, s2s, wg = shared
+    s1s, s2s, wg = s1s.reshape(1, -1), s2s.reshape(1, -1), wg.reshape(-1, 1)   # shapes only
     w1, w2 = layer.w13_weight, layer.w2_weight
     s1, s2 = layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
     e, h, two_i = w1.shape
