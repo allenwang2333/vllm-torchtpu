@@ -1947,6 +1947,27 @@ class TestBuildAttentionMetadataForLayers:
         group.metadata_builders[0].build.assert_not_called()
 
 
+def test_rejected_index_tensors_reuse_only_identical_host_arrays(device):
+    """The rejected-token index H2D copies are skipped only while both host
+    arrays are byte-identical to the last uploaded ones."""
+    runner = SimpleNamespace(device=device)
+
+    def call(seq, pos):
+        return TPUModelRunner._rejected_index_tensors(
+            runner, np.array(seq, dtype=np.int32), np.array(pos, dtype=np.int32)
+        )
+
+    s0, p0 = call([0, -1, -1, -1], [0, 0, 0, 0, -1, -1, -1, -1])
+    s1, p1 = call([0, -1, -1, -1], [0, 0, 0, 0, -1, -1, -1, -1])
+    assert s1 is s0 and p1 is p0
+    # A changed value, or the same values at a new length, re-uploads.
+    s2, p2 = call([1, -1, -1, -1], [0, 0, 0, 0, -1, -1, -1, -1])
+    assert s2 is not s0 and s2.cpu().tolist() == [1, -1, -1, -1]
+    s3, p3 = call([1, -1, -1, -1], [0, 0, 0, 0, -1, -1, -1, -1, -1, -1])
+    assert p3 is not p2 and p3.shape == (10,)
+    assert s3.cpu().tolist() == [1, -1, -1, -1]
+
+
 class _FakeTpuEvent:
     instances: list["_FakeTpuEvent"] = []
 
