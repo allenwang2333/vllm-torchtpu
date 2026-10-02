@@ -184,6 +184,11 @@ def merge_lse_partials_scatter_heads(
     if group is None or int(group.world_size) == 1:
         return output
 
+    if (
+        envs.TPU_DCP_COLLECTIVE_IMPL in ("a2a", "kernel")
+        and output.numel() * output.element_size() <= _A2A_SCATTER_MAX_BYTES
+    ):
+        return _merge_at_receiver(output, lse, group)
     weighted = _weight_by_lse(output, lse, group)
     world = int(group.world_size)
     nbytes = weighted.numel() * weighted.element_size()
@@ -206,6 +211,40 @@ def merge_lse_partials_scatter_heads(
         got = _a2a(sent.view(world * t, h, d), group).view(world, t, h, d)
         return got.sum(dim=0).to(output.dtype)
     return group.reduce_scatter(weighted, dim=1).to(output.dtype)
+
+
+def _merge_at_receiver(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch.Tensor:
+    """The merge with the weighting moved to the receiving rank: ONE all-to-all, no lse gather.
+
+    Each rank sends rank j the raw partial for j's heads -- in the kernel's own dtype (bf16),
+    not the f32 weighted product -- with its f32 lse bit-packed into two extra lanes, so the
+    exchange carries half the bytes of the f32 reduce-scatter and the lse travels with the data
+    it weights. The receiver then holds every rank's (partial, lse) for its heads and computes
+    exactly what `_weight_by_lse` + the reduce-scatter compute: sum_r softmax_r(lse) * o_r in
+    f32 (only the order of the f32 sum differs).
+    """
+    world = int(group.world_size)
+    t, heads, d = output.shape
+    h = heads // world
+    lse_f32 = lse.to(torch.float32).contiguous().view(t, heads, 1)
+    lanes = lse_f32.view(output.dtype) if output.element_size() < 4 else lse_f32.to(output.dtype)
+    k = lanes.shape[-1]
+    packed = torch.cat([output, lanes], dim=-1)                      # [t, heads, d + k]
+    sent = packed.view(t, world, h, d + k).permute(1, 0, 2, 3).contiguous()
+    got = _a2a(sent.view(world, t * h * (d + k)), group).view(world, t, h, d + k)
+    part = got[..., :d].to(torch.float32)
+    tail = got[..., d:].contiguous()
+    lse_all = (tail.view(torch.float32) if output.element_size() < 4 else tail.to(torch.float32))
+    lse_all = lse_all.view(world, t, h)
+
+    finite = torch.isfinite(lse_all)
+    shift = torch.where(finite, lse_all, torch.full_like(lse_all, float("-inf"))).amax(dim=0)
+    shift = torch.where(torch.isfinite(shift), shift, torch.zeros_like(shift))
+    weights = torch.where(finite, torch.exp(lse_all - shift.unsqueeze(0)),
+                          torch.zeros_like(lse_all))
+    denom = weights.sum(dim=0)
+    weights = weights / torch.where(denom > 0, denom, torch.ones_like(denom)).unsqueeze(0)
+    return (part * weights.unsqueeze(-1)).sum(dim=0).to(output.dtype)
 
 
 def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch.Tensor:
