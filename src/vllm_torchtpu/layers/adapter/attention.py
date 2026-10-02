@@ -2344,6 +2344,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         )
 
         mesh = self._dcp_mesh
+        output_specs = sparse_mla_dcp_draft_prep_partition_specs(
+            num_steps, DCP_AXIS_NAME
+        )
+        # The op registry types the torch schema from the return annotation
+        # and rejects `tuple[jax.Array, ...]`; spell out the fixed count
+        # (shared fields + one write plan per loop step).
+        prep_outputs = tuple[(jax.Array,) * len(output_specs)]
 
         def sparse_mla_dcp_draft_prep_core(
             local_topk_indices: jax.Array,
@@ -2351,7 +2358,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             block_tables: jax.Array,
             query_start_loc: jax.Array,
             request_distribution: jax.Array,
-        ) -> tuple[jax.Array, ...]:
+        ) -> prep_outputs:  # type: ignore[valid-type]
             nope_spec, _ = layer.mla_kv_spec
             return sparse_mla_dcp_draft_prep(
                 local_topk_indices,
@@ -2379,9 +2386,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 P(),  # query_start_loc
                 P(),  # request_distribution
             ),
-            output_partition_specs=sparse_mla_dcp_draft_prep_partition_specs(
-                num_steps, DCP_AXIS_NAME
-            ),
+            output_partition_specs=output_specs,
         )
 
     def forward(
