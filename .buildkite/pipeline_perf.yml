@@ -14,6 +14,7 @@
 
 steps:
   - group: "Perf and Eval on TPU"
+    key: "perf_eval_group"
     depends_on: "build_docker"
     steps:
       - label: "Perf/Eval: General suite (TPU v7x-8)"

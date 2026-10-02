@@ -138,8 +138,12 @@ if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   upload_with_priority .buildkite/pipeline_promote.yml "$JOB_PRIORITY"
 fi
 
-# Docker Hub publish of the prod image. Uploaded on every build; the step's own
-# `if` limits it to the NIGHTLY=1 build of main in vllm-torchtpu-ci.
+# Docker Hub publish of the prod image. Uploaded on every build; each step's
+# own `if` limits it to NIGHTLY=1 builds of main (nightly) or release/* (release)
+# in vllm-torchtpu-ci.
+echo "Uploading Docker Hub Release Pipeline"
+upload_with_priority .buildkite/release_images.yml "$JOB_PRIORITY"
+
 echo "Uploading Docker Hub Nightly Release Pipeline"
 upload_with_priority .buildkite/nightly_releases.yml "$JOB_PRIORITY"
 

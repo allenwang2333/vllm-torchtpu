@@ -18,17 +18,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 
-# Run by nightly_releases.yml, which logs in to Docker Hub first. As in
-# publish_nightly_images.sh, the branch decides the tags. main pushes
-# nightly-YYYYMMDD-<commit>-<vllm> and moves nightly. release/X.Y.Z pushes
-# YYYYMMDD-X.Y.Z and moves X.Y.Z, so a release build never touches nightly.
+# Run by nightly_releases.yml (main) and release_images.yml (release/*), which
+# log in to Docker Hub first. As in publish_nightly_images.sh, the branch
+# decides the tags. main pushes nightly-YYYYMMDD-<commit>-<vllm> and moves
+# nightly. release/X.Y.Z pushes YYYYMMDD-X.Y.Z and moves X.Y.Z, so a release
+# build never touches nightly.
 BRANCH="${BUILDKITE_BRANCH:-$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)}"
+# TODO(test-only): for a CI dry run, act as main or as release/0.0.0-test
+# depending on which step runs. Remove before merging.
+if [[ "${BRANCH}" == "jefft/docker_image_ci" ]]; then
+  [[ "${BUILDKITE_STEP_KEY:-}" == "publish_dockerhub_release" ]] && BRANCH="release/0.0.0-test" || BRANCH="main"
+fi
 DATE="$(date +%Y%m%d)"
 # The vLLM the nightly tests ran against, set by bootstrap.sh.
 VLLM_COMMIT_HASH="$(buildkite-agent meta-data get "VLLM_COMMIT_HASH")"
 case "${BRANCH}" in
-  # TODO(test-only): jefft/docker_image_ci added for a CI dry run. Remove before merging.
-  main|jefft/docker_image_ci)
+  main)
     DATE_TAG="nightly-${DATE}-${BUILDKITE_COMMIT:0:7}-${VLLM_COMMIT_HASH:0:7}"
     LATEST_TAG="nightly"
     ;;

@@ -1,0 +1,59 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Publishes the public prod image to Docker Hub from the scheduled NIGHTLY=1
+# build of a release/X.Y.Z branch. Unlike nightly_releases.yml, it waits for
+# every build, test, integration and perf step and is skipped if any fails.
+# Steps an `if` drops from the build (e.g. PR-only steps) do not block it.
+# A release branch only publishes if vllm-torchtpu-ci has a NIGHTLY=1
+# schedule on it.
+
+steps:
+  - label: ":docker: Publish vllm-torchtpu release image to Docker Hub"
+    key: "publish_dockerhub_release"
+    # TODO(test-only): jefft/docker_image_ci added for a CI dry run. Remove before merging.
+    if: '(build.branch =~ /^release\// || build.branch == "jefft/docker_image_ci") && build.env("NIGHTLY") == "1" && pipeline.slug == "vllm-torchtpu-ci"'
+    depends_on:
+      - "build_docker_group"        # pipeline_build.yml
+      - "typecheck_full"            # pipeline_tests.yml
+      - "unit_tests_cpu_nightly"    # pipeline_tests.yml
+      - "unit_tests_tpu_group"      # pipeline_tests.yml
+      - "integration_tests_group"   # pipeline_integration.yml
+      - "perf_eval_group"           # pipeline_perf.yml
+      # TODO(tech-lead): the model/feature tests (v6e-group, v7x-group from
+      # nightly_verify.yml) are not gated yet; nightly_verify.yml itself
+      # allows them to fail.
+    agents:
+      # The prod build pulls torch-tpu from a private registry and needs the
+      # gcloud credentials these agents carry (see docker/build_image.sh).
+      queue: cpu_64_core
+    env:
+      # TODO(docker-hub): the Docker Hub repository, e.g. vllm/vllm-torchtpu.
+      # Docker rejects this uppercase placeholder, so the build fails at once.
+      # DOCKERHUB_REPO: "REPLACE_WITH_DOCKERHUB_REPO"
+      # TODO(test-only): dummy lowercase repo for a CI dry run; nothing is pushed.
+      DOCKERHUB_REPO: "test/vllm-torchtpu"
+    # TODO(test-only): secret and Docker Hub login disabled for a CI dry run.
+    # Restore before merging.
+    # TODO(docker-hub): the secret name configured in the Buildkite cluster.
+    # secrets:
+    #   - DOCKERHUB_TOKEN
+    # plugins:
+    #   - docker-login#v3.0.0:
+    #       # TODO(docker-hub): the Docker Hub bot account with push access to
+    #       # DOCKERHUB_REPO. Login fails until this is set.
+    #       username: "REPLACE_WITH_DOCKERHUB_USERNAME"
+    #       password-env: DOCKERHUB_TOKEN
+    commands:
+      - bash .buildkite/scripts/publish_dockerhub_images.sh

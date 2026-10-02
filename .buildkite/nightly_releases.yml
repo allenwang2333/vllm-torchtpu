@@ -12,34 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Publishes the public prod image to Docker Hub from the scheduled nightly
-# builds of main and release/X.Y.Z. The internal ci/dev/prod nightlies in
-# Artifact Registry are a separate pipeline (pipeline_nightly_image.yml) and
-# are not affected.
-#
-# bootstrap.sh uploads this file on every build; the `if` below drops the step
-# everywhere except NIGHTLY=1 builds of main or release/* in vllm-torchtpu-ci,
-# so PR, post-merge, integration and dev builds never see the Docker Hub
-# secret. A release branch only publishes if vllm-torchtpu-ci has a NIGHTLY=1
-# schedule on it; publish_dockerhub_images.sh picks the tags from the branch.
-#
-# Unlike tpu-inference's nightly_releases.yml, the step waits for the nightly
-# unit tests and is skipped when any of them fails, so a red night does not
-# move a public tag. Every key below carries the same NIGHTLY == "1" condition
-# and no branch condition, so each one exists whenever this step does.
+# Publishes the public prod image to Docker Hub as nightly from the scheduled
+# NIGHTLY=1 build of main. As in tpu-inference, it does not wait for tests.
+# Release branches publish from release_images.yml, which waits for all tests.
+# The internal GAR nightlies (pipeline_nightly_image.yml) are not affected.
 
 steps:
   - label: ":docker: Publish vllm-torchtpu nightly image to Docker Hub"
     key: "publish_dockerhub_nightly"
     # TODO(test-only): jefft/docker_image_ci added for a CI dry run. Remove before merging.
-    if: '(build.branch == "main" || build.branch =~ /^release\// || build.branch == "jefft/docker_image_ci") && build.env("NIGHTLY") == "1" && pipeline.slug == "vllm-torchtpu-ci"'
-    depends_on:
-      - "build_docker"
-      - "unit_tests_cpu_nightly"
-      - "unit_tests_general_nightly"
-      - "unit_tests_multichip_nightly"
-      - "unit_tests_spec_decode_nightly"
-      - "unit_tests_spec_decode_multichip_nightly"
+    if: '(build.branch == "main" || build.branch == "jefft/docker_image_ci") && build.env("NIGHTLY") == "1" && pipeline.slug == "vllm-torchtpu-ci"'
     agents:
       # The prod build pulls torch-tpu from a private registry and needs the
       # gcloud credentials these agents carry (see docker/build_image.sh).

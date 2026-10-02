@@ -14,6 +14,7 @@
 
 steps:
   - group: "Integration Tests on TPU"
+    key: "integration_tests_group"
     depends_on: "build_docker"
     steps:
       - label: "Integration: qwen35-pcp4-dp4-disagg-correctness"

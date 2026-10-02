@@ -71,6 +71,7 @@ steps:
           test-cmd: "pytest -sv --timeout=600 -m 'not tpu_test and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
   - group: "Unit Tests on TPU"
+    key: "unit_tests_tpu_group"
     depends_on: "build_docker"
     steps:
       # test_speculative_decoding.py gets its own PR steps, mirroring the
