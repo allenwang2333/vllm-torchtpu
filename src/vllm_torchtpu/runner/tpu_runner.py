@@ -2942,12 +2942,15 @@ class TPUModelRunner(GPUModelRunner):
                     seq_idx_np[i] = pos
                     pos_idx_np[acc : acc + n_sched] = pos
                 acc += n_sched
+            seq_idx_dev, pos_idx_dev = self._rejected_index_tensors(
+                seq_idx_np, pos_idx_np
+            )
             seq_lens, self.position_ids = subtract_num_rejected_tokens(
                 seq_lens,
                 self.position_ids,
                 self._pre_async_results.spec_decode_num_rejected_tokens,
-                torch.from_numpy(seq_idx_np).to(self.device, non_blocking=True),
-                torch.from_numpy(pos_idx_np).to(self.device, non_blocking=True),
+                seq_idx_dev,
+                pos_idx_dev,
             )
 
         # For decode-only case, cache constant device tensors to skip H2D.
@@ -6629,6 +6632,29 @@ class TPUModelRunner(GPUModelRunner):
                     )
             except (IndexError, TypeError, AttributeError, KeyError):
                 pass
+
+    def _rejected_index_tensors(
+        self, seq_idx_np: np.ndarray, pos_idx_np: np.ndarray
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Device copies of the rejected-token index arrays, reused while the
+        host arrays are unchanged.
+
+        In steady-state decode the request -> previous-position map repeats
+        step to step, so the two H2D copies carry the same bytes every step.
+        The cache is keyed on the full array contents (shape and values);
+        `subtract_num_rejected_tokens` only reads the indices.
+        """
+        cached = getattr(self, "_rejected_index_cache", None)
+        if (
+            cached is not None
+            and np.array_equal(cached[0], seq_idx_np)
+            and np.array_equal(cached[1], pos_idx_np)
+        ):
+            return cached[2], cached[3]
+        seq_idx_dev = torch.from_numpy(seq_idx_np).to(self.device, non_blocking=True)
+        pos_idx_dev = torch.from_numpy(pos_idx_np).to(self.device, non_blocking=True)
+        self._rejected_index_cache = (seq_idx_np, pos_idx_np, seq_idx_dev, pos_idx_dev)
+        return seq_idx_dev, pos_idx_dev
 
     def _token_padding_update(self, num_tokens_padded: int) -> None:
         """Record which of this step's token rows are padding."""
