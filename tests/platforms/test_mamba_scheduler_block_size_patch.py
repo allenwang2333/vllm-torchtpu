@@ -84,3 +84,47 @@ def test_mamba_split_patch_is_idempotent():
     _patch_vllm_mamba_split_scheduler_block_size()
 
     assert Scheduler._mamba_block_aligned_split is patched_split
+
+
+def _dcp_scheduler(use_eagle: bool, dcp_world_size: int, pcp_world_size: int = 1):
+    # Mirrors Qwen3.5 DCP4 on TPU: 1152-token physical blocks, a 4608-token
+    # DCP-scaled scheduler block, and fine-grained (1152) prefix hashes.
+    physical_cache_config = SimpleNamespace(block_size=1152)
+    return SimpleNamespace(
+        cache_config=physical_cache_config,
+        block_size=1152 * dcp_world_size * pcp_world_size,
+        use_eagle=use_eagle,
+        dcp_world_size=dcp_world_size,
+        pcp_world_size=pcp_world_size,
+        max_num_scheduled_tokens=16384,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        mamba_partial_cache_hit=True,
+        mamba_has_prefill_checkpoint_blocks=False,
+        hash_block_size=1152,
+    )
+
+
+def test_dcp_eagle_split_backs_off_one_physical_block():
+    _patch_vllm_mamba_split_scheduler_block_size()
+    scheduler = _dcp_scheduler(use_eagle=True, dcp_world_size=4)
+
+    split = Scheduler._mamba_block_aligned_split(
+        scheduler, _request(prompt_len=10000), num_new_tokens=10000
+    )
+
+    # Full attention's EAGLE drop lands one hash unit before the prompt's last
+    # hash boundary (9216 - 1152), so the Mamba state must be checkpointed
+    # there, not one 4608-token scheduler block back (4608).
+    assert split == 8064
+    assert scheduler.cache_config.block_size == 1152
+
+
+def test_pcp_eagle_split_still_uses_scheduler_block_size():
+    _patch_vllm_mamba_split_scheduler_block_size()
+    scheduler = _dcp_scheduler(use_eagle=True, dcp_world_size=1, pcp_world_size=4)
+
+    split = Scheduler._mamba_block_aligned_split(
+        scheduler, _request(prompt_len=10000), num_new_tokens=10000
+    )
+
+    assert split == 4608
