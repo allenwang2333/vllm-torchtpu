@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_MLA_CAPPED_PREP: bool = False
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
+    TPU_MLA_ABSORB_TOKEN_MAJOR: bool = False
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_LSE_MERGE_RS_BF16: bool = False
@@ -395,6 +396,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
     # copies through the LSE merge. Bit-identical outputs.
     "TPU_DCP_MLA_SPLIT_Q_LSE": env_bool("TPU_DCP_MLA_SPLIT_Q_LSE", default=False),
+    # MLA q absorb (`ql_nope = q_nope @ W_UK_T` per head): contract
+    # token-major, `einsum("thd,hdk->thk")`, instead of `bmm` over the
+    # head-major transpose of q followed by a transpose back. Same dot, same
+    # dtype and accumulation; the point is the layout of its result, which
+    # the attention kernel reads token-major (head-major costs a [H, T, 512]
+    # relayout that XLA offloads to the SparseCore, ahead of the KV gathers).
+    "TPU_MLA_ABSORB_TOKEN_MAJOR": env_bool("TPU_MLA_ABSORB_TOKEN_MAJOR", default=False),
     # DCP MLA log-sum-exp merge (`cp_mla_attention.merge_lse_partials_scatter_heads`)
     # for steps of at most TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS tokens: instead of
     # an lse all-gather, an f32 weight multiply of the whole [T, H, V] partial

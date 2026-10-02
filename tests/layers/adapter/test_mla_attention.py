@@ -519,6 +519,55 @@ def test_mla_forward_sparse_dispatch_and_quantization():
     torch.testing.assert_close(out, expected_out)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("with_scale", [False, True])
+@pytest.mark.parametrize("num_tokens", [4, 16])
+def test_mla_absorb_token_major_matches_head_major(
+    monkeypatch, dtype, with_scale, num_tokens
+):
+    """TPU_MLA_ABSORB_TOKEN_MAJOR: the token-major einsum absorb hands the op
+    the same ql_nope as the head-major bmm + transpose (with and without the
+    per-head W_UK_T scale), and the default stays the bmm path."""
+    impl, layer, inputs, _ = _make_impl_and_layer(num_tokens=num_tokens)
+    layer.W_UK_T = layer.W_UK_T.to(dtype)
+    if with_scale:
+        layer.W_UK_T_scale = (torch.rand(16, 1, 512) + 0.5).to(dtype)
+    q_nope, q_pe = inputs["q"]
+    inputs["q"] = (q_nope.to(dtype), q_pe.to(dtype))
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+    topk_indices = torch.zeros((num_tokens, 8), dtype=torch.int32)
+
+    def absorbed(token_major):
+        monkeypatch.setattr(envs, "TPU_MLA_ABSORB_TOKEN_MAJOR", token_major)
+        layer.sparse_mla_op.reset_mock()
+        impl.forward(layer=layer, **inputs, topk_indices=topk_indices)
+        return layer.sparse_mla_op.call_args.args[1]
+
+    head_major = absorbed(False)
+    token_major = absorbed(True)
+    q_in = inputs["q"][0]
+    expected = torch.bmm(q_in.transpose(0, 1), layer.W_UK_T)
+    if with_scale:
+        expected = expected * layer.W_UK_T_scale
+    expected = expected.transpose(0, 1).to(dtype)
+    assert token_major.shape == (num_tokens, 16, 512)
+    assert token_major.dtype == dtype
+    torch.testing.assert_close(head_major, expected, rtol=0, atol=0)
+    torch.testing.assert_close(token_major, head_major)
+    print(
+        f"ABSORB_TOKEN_MAJOR dtype={dtype} scale={with_scale} T={num_tokens} "
+        f"bit_identical={torch.equal(token_major, head_major)} "
+        f"max_abs={(token_major.float() - head_major.float()).abs().max().item():.3g}"
+    )
+    # Positive control: the comparison sees the head order.
+    assert not torch.equal(token_major, head_major.flip(1))
+
+
 def test_mla_forward_dense_dispatch_without_topk():
     """No topk_indices: the dense op is called, the sparse op is not."""
     k_scale = 2.0

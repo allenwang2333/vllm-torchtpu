@@ -2316,16 +2316,25 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
         # right before `torch.bmm`.
-        q_nope_t = q_nope.transpose(0, 1)
         w_uk_t = (
-            w_uk_t_src.to(q_nope_t.dtype)
-            if w_uk_t_src.dtype != q_nope_t.dtype
+            w_uk_t_src.to(q_nope.dtype)
+            if w_uk_t_src.dtype != q_nope.dtype
             else w_uk_t_src
         )
-        ql_nope = torch.bmm(q_nope_t, w_uk_t)
-        if w_uk_t_scale is not None:
-            ql_nope = ql_nope * w_uk_t_scale
-        ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
+        if envs.TPU_MLA_ABSORB_TOKEN_MAJOR:
+            # Token-major absorb: [T, H, d] x [H, d, K] -> [T, H, K] directly,
+            # the layout the attention kernel consumes.
+            ql_nope = torch.einsum("thd,hdk->thk", q_nope, w_uk_t)
+            if w_uk_t_scale is not None:
+                # [H, 1, K] per-head/column scale -> [1, H, K].
+                ql_nope = ql_nope * w_uk_t_scale.transpose(0, 1)
+            ql_nope = ql_nope.to(input_dtype)
+        else:
+            q_nope_t = q_nope.transpose(0, 1)
+            ql_nope = torch.bmm(q_nope_t, w_uk_t)
+            if w_uk_t_scale is not None:
+                ql_nope = ql_nope * w_uk_t_scale
+            ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
 
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
 
