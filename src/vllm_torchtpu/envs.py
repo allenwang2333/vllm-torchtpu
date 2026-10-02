@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
+    TPU_DCP_COLLECTIVE_IMPL: str = "xla"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
@@ -365,6 +366,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # eval config turns it on, since a prefilled assistant turn needs it.
     "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE": env_bool(
         "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", default=False
+    ),
+    # How DCP MLA attention issues its small head gathers and its partials
+    # reduce-scatter. "xla": all_gather / reduce_scatter. "a2a": latency-bound
+    # ones as one all-to-all (a gather sends its input to every peer; the
+    # reduce-scatter sends each peer its heads and sums locally), which XLA runs
+    # as a single all-pairs exchange instead of a multi-step schedule. See
+    # cp_mla_attention.py for the size cut-offs.
+    "TPU_DCP_COLLECTIVE_IMPL": env_with_choices(
+        "TPU_DCP_COLLECTIVE_IMPL", "xla", ["xla", "a2a"]
     ),
     # NoPE and RoPE KV cache layouts allocated for sparse MLA.
     "TPU_SPARSE_MLA_NOPE_LAYOUT": env_with_choices(

@@ -37,7 +37,38 @@ from typing import Any
 
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
+
+# TPU_DCP_COLLECTIVE_IMPL=a2a cut-offs, from the workload-microbenchmark collective component on
+# 2x2x2 (16 TensorCores, 2 hosts). XLA's all-to-all is one all-pairs exchange (~8-9 us when small),
+# its all-gather / reduce-scatter a multi-step schedule (~15-17 us small; ~48-52 us for a 2 MiB
+# 3-D reduce-scatter). A gather as an all-to-all sends `world` copies of the input, so it only
+# wins while that is small: q_pe (32 KiB) and lse (64 KiB) 17 -> 9.5 us, q_nope (256 KiB) no
+# change. The reduce-scatter as all-to-all + local sum moves the same bytes: 52 -> 30 us at 2 MiB,
+# and loses at large sizes (the mixed step's 512 MiB).
+_A2A_GATHER_MAX_BYTES = 128 * 1024
+_A2A_SCATTER_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _a2a(x: torch.Tensor, group: Any) -> torch.Tensor:
+    """all_to_all_single over dim 0: chunk j goes to rank j, chunk i of the result came from
+    rank i."""
+    import torch.distributed._functional_collectives as fc
+
+    return fc.all_to_all_single(x, None, None, group.device_group)
+
+
+def _gather_as_a2a(x: torch.Tensor, group: Any) -> torch.Tensor | None:
+    """`[world, *x.shape]`, rank i's `x` at index i, or None when the all-to-all would be
+    larger than the gather's latency floor is worth."""
+    if envs.TPU_DCP_COLLECTIVE_IMPL != "a2a":
+        return None
+    world = int(group.world_size)
+    if world * x.numel() * x.element_size() > _A2A_GATHER_MAX_BYTES:
+        return None
+    sent = x.unsqueeze(0).expand(world, *x.shape).contiguous()
+    return _a2a(sent.view(world * x.shape[0], *x.shape[1:]), group).view(world, *x.shape)
 
 
 def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
@@ -57,6 +88,11 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
     group = get_dcp_group()
     if group is None or int(group.world_size) == 1:
         return q
+    stacked = _gather_as_a2a(q.contiguous(), group)
+    if stacked is not None:
+        # [world, T, h, d] -> [T, world * h, d], rank-major heads like all_gather(dim=1)
+        t, h, d = q.shape
+        return stacked.permute(1, 0, 2, 3).reshape(t, -1, d)
     return group.all_gather(q.contiguous(), dim=1)
 
 
@@ -92,6 +128,18 @@ def merge_lse_partials_scatter_heads(
         return output
 
     weighted = _weight_by_lse(output, lse, group)
+    world = int(group.world_size)
+    if (
+        envs.TPU_DCP_COLLECTIVE_IMPL == "a2a"
+        and weighted.numel() * weighted.element_size() <= _A2A_SCATTER_MAX_BYTES
+    ):
+        # Send each rank its own heads ([T, world*h, D] -> [world, T, h, D], chunk j for rank
+        # j), then sum the world contributions locally: reduce_scatter(dim=1) as one exchange.
+        t, heads, d = weighted.shape
+        h = heads // world
+        sent = weighted.view(t, world, h, d).permute(1, 0, 2, 3).contiguous()
+        got = _a2a(sent.view(world * t, h, d), group).view(world, t, h, d)
+        return got.sum(dim=0).to(output.dtype)
     return group.reduce_scatter(weighted, dim=1).to(output.dtype)
 
 
@@ -100,7 +148,9 @@ def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch
     lse_f32 = lse.to(torch.float32).contiguous()
     # [world_size, num_tokens, num_heads]: small, and it removes the need for
     # any further reduction over the denominator.
-    gathered = group.all_gather(lse_f32.unsqueeze(0), dim=0)
+    gathered = _gather_as_a2a(lse_f32, group)
+    if gathered is None:
+        gathered = group.all_gather(lse_f32.unsqueeze(0), dim=0)
     if not isinstance(gathered, torch.Tensor):
         gathered = torch.cat(list(gathered), dim=0)
 
