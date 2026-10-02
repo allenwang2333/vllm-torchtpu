@@ -325,7 +325,11 @@ def outer_kernel(
             allocations=allocations,
         )
 
-    _run()
+    # A pure-decode step still launches the PER_SEQ pass with zero tiles; skip
+    # its scratch allocation and pipeline (1.4 us per GDN layer, served trace).
+    @pl.when(num_tiles > 0)
+    def _():
+        _run()
 
 
 @jax.jit(
