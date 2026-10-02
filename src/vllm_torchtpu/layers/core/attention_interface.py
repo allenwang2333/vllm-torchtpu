@@ -1156,6 +1156,20 @@ def sparse_mla_attention_dcp(
         topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
 
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+        # The capped path (and its chunk) applies only where the kernel takes
+        # it: SparseCore caches and a top-k wider than the cap.
+        topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
+        if not (
+            topk_cap
+            and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
+            and topk_idx.shape[-1] > topk_cap
+        ):
+            topk_cap = None
+        chunk_kwargs = (
+            {"gather_and_attention_chunk_size": envs.TPU_DCP_MLA_TOPK_CAP_CHUNK}
+            if topk_cap
+            else {}
+        )
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
         local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
@@ -1175,7 +1189,8 @@ def sparse_mla_attention_dcp(
             # Ranks own ~topk/dcp of each row: gather and attend those only.
             packed_gather=envs.TPU_DCP_MLA_PACKED_GATHER,
             # The rest: a static top-k width with an exact in-kernel overflow.
-            topk_cap=envs.TPU_DCP_MLA_TOPK_CAP or None,
+            topk_cap=topk_cap,
+            **chunk_kwargs,
         )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
