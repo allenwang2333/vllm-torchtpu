@@ -471,6 +471,68 @@ class TestFp8LinearRuntimeQuant:
         )
         assert torch.allclose(result, expected, rtol=0.01, atol=0.01)
 
+    def test_qkv_k_eq_v_deduplication(self, device):
+        """QKVParallelLinear with identical K and V shards should deduplicate V weight."""
+        from vllm.model_executor.layers.linear import QKVParallelLinear
+
+        from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+            VllmUnquantizedLinearMethod,
+        )
+
+        q_size, kv_size, in_dim = 64, 32, 128
+        out_dim = q_size + 2 * kv_size
+
+        w_q = torch.randn(q_size, in_dim, device=device, dtype=torch.bfloat16).to(
+            torch.float8_e4m3fn
+        )
+        w_kv = torch.randn(kv_size, in_dim, device=device, dtype=torch.bfloat16).to(
+            torch.float8_e4m3fn
+        )
+        weight_fp8 = torch.cat([w_q, w_kv, w_kv], dim=0)
+        scale = torch.tensor([1.5, 2.5, 2.5], device=device, dtype=torch.float32)
+
+        layer = QKVParallelLinear.__new__(QKVParallelLinear)
+        torch.nn.Module.__init__(layer)
+        layer.num_heads = 2
+        layer.num_kv_heads = 1
+        layer.head_size = 32
+        layer.v_head_size = 32
+        layer.bias = None
+        layer.logical_widths = [q_size, kv_size, kv_size]
+        layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+
+        method = VllmFp8LinearMethodTPU(FakeQuant(weight_block_size=None))
+        method.process_weights_after_loading(layer)
+
+        assert getattr(layer, "_dedup_kv_size", 0) == kv_size
+        assert layer.weight.shape == (in_dim, q_size + kv_size)
+        assert layer.weight_scale.shape == (q_size + kv_size,)
+
+        # Also verify unquantized path deduplicates and reconstructs full QKV output
+        unq_layer = QKVParallelLinear.__new__(QKVParallelLinear)
+        torch.nn.Module.__init__(unq_layer)
+        unq_layer.num_heads = 2
+        unq_layer.num_kv_heads = 1
+        unq_layer.head_size = 32
+        unq_layer.v_head_size = 32
+        unq_layer.bias = None
+        w_q_bf16 = torch.randn(q_size, in_dim, device=device, dtype=torch.bfloat16)
+        w_kv_bf16 = torch.randn(kv_size, in_dim, device=device, dtype=torch.bfloat16)
+        full_w_bf16 = torch.cat([w_q_bf16, w_kv_bf16, w_kv_bf16], dim=0)
+        unq_layer.weight = torch.nn.Parameter(full_w_bf16.clone(), requires_grad=False)
+
+        unq_method = VllmUnquantizedLinearMethod()
+        unq_method.process_weights_after_loading(unq_layer)
+        assert getattr(unq_layer, "_dedup_kv_size", 0) == kv_size
+        assert unq_layer.weight.shape == (in_dim, q_size + kv_size)
+
+        x = torch.randn(4, in_dim, device=device, dtype=torch.bfloat16)
+        out = unq_method.apply(unq_layer, x)
+        ref = torch.matmul(x, full_w_bf16.transpose(0, 1))
+        assert out.shape == (4, out_dim)
+        assert torch.equal(out, ref)
+
     def test_blockwise_runtime_scale_shape(self, device, monkeypatch):
         """ullm blockwise env gate changes dense-linear runtime scale layout."""
         monkeypatch.setenv("ENABLE_QUANTIZED_MATMUL_KERNEL", "1")

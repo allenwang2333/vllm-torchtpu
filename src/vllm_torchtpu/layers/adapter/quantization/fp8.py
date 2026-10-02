@@ -47,6 +47,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
 from vllm.model_executor.layers.linear import (
     LinearBase,
+    QKVParallelLinear,
     UnquantizedLinearMethod,
     register_weight_loader_v2_supported_method,
 )
@@ -1331,6 +1332,30 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if getattr(layer, WEIGHT_FLIPPED_ATTR, False):
             return  # already flipped; reload paths re-enter this hook
         keep_vllm_layout = getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+        if (
+            not keep_vllm_layout
+            and isinstance(layer, QKVParallelLinear)
+            and getattr(layer, "bias", None) is None
+        ):
+            q_size = layer.num_heads * layer.head_size
+            k_size = layer.num_kv_heads * layer.head_size
+            v_size = layer.num_kv_heads * getattr(layer, "v_head_size", layer.head_size)
+            if (
+                k_size == v_size > 0
+                and q_size + 2 * k_size == ckpt_n_out
+                and weight_scale.shape[-1] == ckpt_n_out
+            ):
+                w_cpu = weight.cpu().view(torch.uint8)
+                s_cpu = weight_scale.cpu()
+                if torch.equal(
+                    w_cpu[q_size : q_size + k_size], w_cpu[q_size + k_size :]
+                ) and torch.equal(
+                    s_cpu[..., q_size : q_size + k_size], s_cpu[..., q_size + k_size :]
+                ):
+                    weight = weight[: q_size + k_size]
+                    weight_scale = weight_scale[..., : q_size + k_size]
+                    ckpt_n_out = q_size + k_size
+                    setattr(layer, "_dedup_kv_size", k_size)
         if not keep_vllm_layout:
             weight = weight.transpose(0, 1)
 
@@ -1399,6 +1424,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # takes the canonical (k, n), so flip the view for the contraction.
             weight = weight.transpose(0, 1)
         out = quantized_matmul(x, weight, layer.weight_scale)
+        if dedup_kv_size := getattr(layer, "_dedup_kv_size", 0):
+            out = torch.cat([out, out[..., -dedup_kv_size:]], dim=-1)
         if bias is not None:
             out = out + bias
         return out

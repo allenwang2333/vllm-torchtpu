@@ -43,7 +43,11 @@ from vllm.model_executor.layers.fused_moe import (
     UnquantizedFusedMoEMethod,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
-from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    QKVParallelLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -103,6 +107,17 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         if weight.dim() != 2:
             # Not a plain dense weight; leave the stock behaviour alone.
             return
+        if isinstance(layer, QKVParallelLinear) and getattr(layer, "bias", None) is None:
+            q_size = layer.num_heads * layer.head_size
+            k_size = layer.num_kv_heads * layer.head_size
+            v_size = layer.num_kv_heads * getattr(layer, "v_head_size", layer.head_size)
+            if k_size == v_size > 0 and q_size + 2 * k_size == weight.shape[0]:
+                w_cpu = weight.cpu().view(torch.uint8)
+                if torch.equal(
+                    w_cpu[q_size : q_size + k_size], w_cpu[q_size + k_size :]
+                ):
+                    weight = weight[: q_size + k_size]
+                    setattr(layer, "_dedup_kv_size", k_size)
         weight = weight.transpose(0, 1).contiguous()
         replace_parameter(
             layer, "weight", torch.nn.Parameter(weight, requires_grad=False)
@@ -124,7 +139,10 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         # against axis 0 with no transpose.
         weight = layer.weight
         if bias is None:
-            return torch.matmul(x, weight)
+            out = torch.matmul(x, weight)
+            if dedup_kv_size := getattr(layer, "_dedup_kv_size", 0):
+                out = torch.cat([out, out[..., -dedup_kv_size:]], dim=-1)
+            return out
         # Fuse the bias via addmm rather than `matmul(...) + bias`: the latter
         # rounds the product to the activation dtype before adding, which
         # diverges from F.linear's single rounding and would silently change
