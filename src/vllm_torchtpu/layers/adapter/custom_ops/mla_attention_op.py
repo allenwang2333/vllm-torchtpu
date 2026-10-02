@@ -751,6 +751,11 @@ class VllmTPUMLAAttention(MLAAttention):
             self.sparse_mla_dcp_op = self.impl._build_sparse_mla_dcp_op(
                 self, dcp_size, self.impl.dcp_interleave_size
             )
+            from vllm_torchtpu.layers.adapter.cp_mla_attention import (
+                prepare_dcp_collectives,
+            )
+
+            prepare_dcp_collectives()
 
     def forward(
         self,

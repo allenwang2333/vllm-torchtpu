@@ -49,6 +49,37 @@ from vllm_torchtpu.distributed.dcp import get_dcp_group
 # and loses at large sizes (the mixed step's 512 MiB).
 _A2A_GATHER_MAX_BYTES = 128 * 1024
 _A2A_SCATTER_MAX_BYTES = 4 * 1024 * 1024
+# TPU_DCP_COLLECTIVE_IMPL=kernel: the one-shot Pallas collectives (kernels/collectives/oneshot.py)
+# where they win on the same 2x2x2 sweep -- every rank DMAs straight into every peer after one
+# barrier, ~6 us flat: gather 15-17 -> 6 us up to 512 KiB of output, reduce-scatter 12-48 ->
+# 6-17 us up to 1 MiB of input. Above that the kernel sends n x the bytes of a ring and loses; the
+# reduce-scatter then takes the all-to-all path (2 MiB partials: kernel 32 us, a2a 30 us).
+_KERNEL_GATHER_MAX_BYTES = 512 * 1024
+_KERNEL_SCATTER_MAX_BYTES = 1024 * 1024
+_KERNEL_OPS: dict[str, Any] = {}
+
+
+def prepare_dcp_collectives() -> None:
+    """Build the one-shot kernel ops for the DCP group, once, outside any trace (building the
+    mesh runs a CPU collective). A no-op unless TPU_DCP_COLLECTIVE_IMPL=kernel."""
+    if envs.TPU_DCP_COLLECTIVE_IMPL != "kernel" or _KERNEL_OPS:
+        return
+    group = get_dcp_group()
+    if group is None or int(group.world_size) == 1:
+        return
+    from vllm_torchtpu.kernels.collectives import oneshot
+
+    for op in ("all_gather", "reduce_scatter"):
+        _KERNEL_OPS[op] = oneshot.torch_op(op, group, "dcp")
+
+
+def _gather_as_kernel(x: torch.Tensor, group: Any) -> torch.Tensor | None:
+    """`[world, *x.shape]` through the one-shot all-gather, or None outside its range."""
+    world = int(group.world_size)
+    op = _KERNEL_OPS.get("all_gather")
+    if op is None or world * x.numel() * x.element_size() > _KERNEL_GATHER_MAX_BYTES:
+        return None
+    return op(x.reshape(x.shape[0], -1)).view(world, *x.shape)
 
 
 def _a2a(x: torch.Tensor, group: Any) -> torch.Tensor:
@@ -62,7 +93,11 @@ def _a2a(x: torch.Tensor, group: Any) -> torch.Tensor:
 def _gather_as_a2a(x: torch.Tensor, group: Any) -> torch.Tensor | None:
     """`[world, *x.shape]`, rank i's `x` at index i, or None when the all-to-all would be
     larger than the gather's latency floor is worth."""
-    if envs.TPU_DCP_COLLECTIVE_IMPL != "a2a":
+    if envs.TPU_DCP_COLLECTIVE_IMPL == "kernel":
+        stacked = _gather_as_kernel(x, group)
+        if stacked is not None:
+            return stacked
+    if envs.TPU_DCP_COLLECTIVE_IMPL not in ("a2a", "kernel"):
         return None
     world = int(group.world_size)
     if world * x.numel() * x.element_size() > _A2A_GATHER_MAX_BYTES:
@@ -129,9 +164,17 @@ def merge_lse_partials_scatter_heads(
 
     weighted = _weight_by_lse(output, lse, group)
     world = int(group.world_size)
+    nbytes = weighted.numel() * weighted.element_size()
+    op = _KERNEL_OPS.get("reduce_scatter")
+    if op is not None and nbytes <= _KERNEL_SCATTER_MAX_BYTES:
+        t, heads, d = weighted.shape
+        h = heads // world
+        sent = weighted.view(t, world, h, d).permute(1, 0, 2, 3).contiguous()
+        got = op(sent.view(world * t, h * d))           # this rank's [t, h * d]
+        return got.view(t, h, d).to(output.dtype)
     if (
-        envs.TPU_DCP_COLLECTIVE_IMPL == "a2a"
-        and weighted.numel() * weighted.element_size() <= _A2A_SCATTER_MAX_BYTES
+        envs.TPU_DCP_COLLECTIVE_IMPL in ("a2a", "kernel")
+        and nbytes <= _A2A_SCATTER_MAX_BYTES
     ):
         # Send each rank its own heads ([T, world*h, D] -> [world, T, h, D], chunk j for rank
         # j), then sum the world contributions locally: reduce_scatter(dim=1) as one exchange.

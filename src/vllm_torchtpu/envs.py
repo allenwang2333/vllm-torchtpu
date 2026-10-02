@@ -372,9 +372,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ones as one all-to-all (a gather sends its input to every peer; the
     # reduce-scatter sends each peer its heads and sums locally), which XLA runs
     # as a single all-pairs exchange instead of a multi-step schedule. See
-    # cp_mla_attention.py for the size cut-offs.
+    # cp_mla_attention.py for the size cut-offs. "kernel": the one-shot Pallas
+    # collectives (kernels/collectives/oneshot.py) where they win, else as "a2a".
     "TPU_DCP_COLLECTIVE_IMPL": env_with_choices(
-        "TPU_DCP_COLLECTIVE_IMPL", "xla", ["xla", "a2a"]
+        "TPU_DCP_COLLECTIVE_IMPL", "xla", ["xla", "a2a", "kernel"]
     ),
     # NoPE and RoPE KV cache layouts allocated for sparse MLA.
     "TPU_SPARSE_MLA_NOPE_LAYOUT": env_with_choices(
