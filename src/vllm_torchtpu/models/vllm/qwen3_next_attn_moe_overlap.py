@@ -90,10 +90,14 @@ def _configure_decoder_layer(self: Any, prefix: str = "") -> None:
         return
     self._tpu_attn_moe_overlap_configured = True
 
+    # A sequence-parallel layer (VLLM_TPU_MOE_SEQUENCE_PARALLEL) already
+    # reduce-scatters its attention output and keeps the residual chunked;
+    # qwen3_next_patch owns its collectives, so the overlap stays out of it.
     if (
         "mtp" in prefix
         or not isinstance(getattr(self, "mlp", None), Qwen3NextSparseMoeBlock)
         or get_tensor_model_parallel_world_size() <= 1
+        or getattr(self, "use_attn_reduce_scatter_for_moe", False)
     ):
         self._tpu_attn_moe_overlap = False
         return

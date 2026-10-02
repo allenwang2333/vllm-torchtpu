@@ -6,7 +6,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Union, cast
 
 import portpicker
 import torch
@@ -392,6 +392,7 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
+        "VLLM_TPU_MOE_SEQUENCE_PARALLEL",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -705,6 +706,10 @@ class TpuPlatform(Platform):
         # Set compile_sizes to match the token padding buckets used by
         # TPUModelRunner. These are the exact shapes PiecewiseBackend
         # will compile for.
+        use_sp_moe = parallel_config.use_sequence_parallel_moe
+        min_token_size = (
+            max(16, 2 * parallel_config.tensor_parallel_size) if use_sp_moe else 16
+        )
         if compilation_config.compile_sizes is None:
             scheduler_config = vllm_config.scheduler_config
             budget = scheduler_config.max_num_batched_tokens
@@ -716,7 +721,7 @@ class TpuPlatform(Platform):
                     + scheduler_config.max_num_seqs,
                 )
             compilation_config.compile_sizes = _get_token_paddings(
-                min_token_size=16,
+                min_token_size=min_token_size,
                 max_token_size=budget,
                 extra_bucket_sizes=extra_bucket_sizes,
             )
@@ -726,14 +731,14 @@ class TpuPlatform(Platform):
         # Sequence-parallel MoE splits each bucket over TP. Keep buckets that
         # split evenly into >= 2 rows per rank: a 1-row shard lets Dynamo
         # specialize the size and refuse the remaining buckets.
-        parallel_config = vllm_config.parallel_config
-        if parallel_config.use_sequence_parallel_moe:
+        if use_sp_moe:
             archs = vllm_config.model_config.architectures or []
             if not any(a.startswith(("Qwen3Next", "Qwen3_5Moe")) for a in archs):
                 raise ValueError(
-                    "TPU_MOE_SEQUENCE_PARALLEL=1 is validated only for Qwen3Next "
+                    "Sequence-parallel MoE is validated only for Qwen3Next "
                     f"and Qwen3.5 MoE, got {archs}."
                 )
+        if use_sp_moe and envs.TPU_MOE_SEQUENCE_PARALLEL:
             if not envs.USE_MOE_FUSED_EP_KERNEL:
                 logger.warning(
                     "TPU_MOE_SEQUENCE_PARALLEL=1 without USE_MOE_FUSED_EP_KERNEL=1 "
@@ -745,6 +750,23 @@ class TpuPlatform(Platform):
                 for s in compilation_config.compile_sizes
                 if s >= 2 * tp and s % tp == 0
             ]
+        elif use_sp_moe:
+            # VLLM_TPU_MOE_SEQUENCE_PARALLEL: round each bucket up so it splits
+            # into 2, 4 or a multiple of 8 rows per TP rank.
+            tp_size = parallel_config.tensor_parallel_size
+            aligned_sizes: set[int] = set()
+            for raw_size in compilation_config.compile_sizes:
+                s = max(
+                    2 * tp_size, ((int(raw_size) + tp_size - 1) // tp_size) * tp_size
+                )
+                local_s = s // tp_size
+                if local_s not in (2, 4) and local_s % 8 != 0:
+                    local_s = ((local_s + 7) // 8) * 8
+                    s = local_s * tp_size
+                aligned_sizes.add(s)
+            compilation_config.compile_sizes = cast(
+                list[int | str], sorted(aligned_sizes)
+            )
 
         # Clear compile_ranges_split_points — TPU always pads to exact
         # compile_sizes so catch-all ranges are never used.

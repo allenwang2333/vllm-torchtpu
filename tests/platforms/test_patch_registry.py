@@ -222,7 +222,8 @@ def test_manifest_preserves_lifecycle_dependencies():
     assert stages["model_load"] == [
         "maybe_patch_qwen2_5_vl",
         "maybe_patch_qwen3_vl",
-        "maybe_patch_qwen3_next",
+        "maybe_patch_qwen3_next",  # qwen3_next_ep_sp_patch (TPU_MOE_SEQUENCE_PARALLEL)
+        "maybe_patch_qwen3_next",  # qwen3_next_patch (VLLM_TPU_MOE_SEQUENCE_PARALLEL)
     ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
     for names in (stages["platform_activation"], stages["worker_init"]):

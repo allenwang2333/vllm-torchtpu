@@ -156,6 +156,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
+    VLLM_TPU_MOE_SEQUENCE_PARALLEL: str = "off"
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     TPU_SMALL_ALL_REDUCE: bool = False
 
@@ -234,6 +235,34 @@ def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
         )
 
     return _get_bool_env
+
+
+def env_moe_sequence_parallel_mode(env_name: str) -> Callable[[], str]:
+    """Parse the sequence-parallel MoE mode into "off", "auto" or "force".
+
+    Unset/empty and the env_bool false spellings mean "off"; the true
+    spellings and "auto" mean "auto" (upstream's gate: only when DP > 1);
+    "force" also enables it on DP == 1. Anything else raises, for the same
+    reason env_bool does.
+    """
+
+    def _get_mode() -> str:
+        value = os.getenv(env_name)
+        if value is None or value.strip() == "":
+            return "off"
+        value_lower = value.strip().lower()
+        if value_lower in _FALSE_STRINGS:
+            return "off"
+        if value_lower in _TRUE_STRINGS or value_lower == "auto":
+            return "auto"
+        if value_lower == "force":
+            return "force"
+        raise ValueError(
+            f"Invalid value '{value}' for {env_name}. Valid options: "
+            f"{_TRUE_STRINGS + _FALSE_STRINGS + ('auto', 'force')} (any case)."
+        )
+
+    return _get_mode
 
 
 def env_int(env_name: str, default: int) -> Callable[[], int]:
@@ -927,6 +956,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # active request has 1 <= top_k <= value // 2 and no grammar mask applies.
     "TPU_SAMPLER_TOPK_CANDIDATES": env_nonnegative_int(
         "TPU_SAMPLER_TOPK_CANDIDATES", 0
+    ),
+    # Sequence-parallel MoE (TP -> TP+SP across MoE gate, shared experts, and
+    # EP dispatch/combine; needs EP and TP > 1). Off by default.
+    #   1/true/auto: upstream vLLM's gate -- only when DP > 1, where SP removes
+    #     the TP-replicated tokens from EP dispatch. Skipped (logged) on DP == 1.
+    #   force: also on DP == 1, replacing attention/MoE TP all-reduces with
+    #     reduce-scatter + all-gather and dispatching over EP.
+    "VLLM_TPU_MOE_SEQUENCE_PARALLEL": env_moe_sequence_parallel_mode(
+        "VLLM_TPU_MOE_SEQUENCE_PARALLEL"
     ),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
