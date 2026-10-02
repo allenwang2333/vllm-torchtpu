@@ -456,6 +456,80 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                 atol=2e-2,
             )
 
+    @parameterized.product(
+        (
+            {"query_tokens": 16, "real_tokens": 13},
+            {"query_tokens": 128, "real_tokens": 100},
+        ),
+        packed_bkv=(128, 256),
+    )
+    def test_packed_gather_matches_unpacked(
+        self, query_tokens, real_tokens, packed_bkv
+    ):
+        """`packed_gather` against the unpacked SparseCore path, per real row.
+
+        Rows hold prefix-packed live counts from 1 to topk then `-1`, so the
+        packed stream has tail atoms, empty-tail neighbours, and rows longer
+        than `packed_bkv` that take the multi-tile online-softmax fix-up.
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        topk = 2048
+        rng = np.random.default_rng(20261002)
+        problem = _build_problem(
+            rng, k_scale=0.75, query_tokens=query_tokens, topk=topk
+        )
+        counts = np.resize(
+            np.array([1, 63, 64, 65, 127, 129, 255, 256, 257, 511, 700, 2048, 130]),
+            query_tokens,
+        )
+        rng.shuffle(counts)
+        live = np.arange(topk)[None, :] < counts[:, None]
+        topk_idx = jnp.where(jnp.asarray(live), problem["topk"], -1)
+        cu_q_lens = jnp.array([0, real_tokens], jnp.int32)
+        distribution = jnp.array([0, 1, 1], jnp.int32)
+
+        def run(**extra):
+            return sparse_mla.sparse_ragged_paged_attention(
+                problem["q"],
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_idx,
+                problem["page_table"],
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=64,
+                attention_kernel_batch_size=16,
+                **extra,
+            )
+
+        (ref, ref_lse), (out, lse) = jax.block_until_ready(
+            (
+                run(),
+                # 64: pack the 64-token chunks too (the default packs <= 16).
+                run(packed_gather=True, packed_bkv=packed_bkv, packed_chunk_tokens=64),
+            )
+        )
+        real = np.asarray(out, np.float32)[:real_tokens]
+        np.testing.assert_allclose(
+            real, np.asarray(ref, np.float32)[:real_tokens], rtol=2e-2, atol=2e-2
+        )
+        np.testing.assert_allclose(
+            np.asarray(lse)[:real_tokens],
+            np.asarray(ref_lse)[:real_tokens],
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        # Positive control: the comparison must be able to fail.
+        self.assertGreater(
+            np.abs(real - np.asarray(problem["q"], np.float32)[:real_tokens]).max(),
+            2e-2,
+        )
+
     def test_sparsecore_layout_validation(self):
         q = jnp.zeros((128, 8, HEAD_DIM), jnp.bfloat16)
         nope = jnp.zeros((16, 256, 128), jnp.uint32)
