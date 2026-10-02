@@ -960,7 +960,11 @@ class TPUModelRunner(GPUModelRunner):
         self._token_padding_state: token_padding.TokenPaddingState | None = None
 
         self._init_phased_profiling()
-        self._stage_timing = RunnerStageTiming(profiler_rank)
+        self._stage_timing = RunnerStageTiming(
+            profiler_rank,
+            enabled=self.vllm_config.kv_transfer_config is not None,
+        )
+
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -2195,7 +2199,8 @@ class TPUModelRunner(GPUModelRunner):
             # Bypasses the _substitute_placeholder_token kernel entirely when unpadded
             n_subst = len(token_in_tpu_cur_input_indices)
             if (
-                n_subst == len(input_ids)
+                self.device.type != "tpu"
+                and n_subst == len(input_ids)
                 and np.array_equal(
                     token_in_tpu_cur_input_indices,
                     np.arange(len(input_ids), dtype=np.int32),
@@ -2386,9 +2391,11 @@ class TPUModelRunner(GPUModelRunner):
         # Disable vLLM's native GPU async spec-decode num_computed_tokens
         # correction. The TPU runner does its own async rejection correction,
         # so letting the base also correct would double-count.
-        for req_state in self.requests.values():
-            req_state.prev_num_draft_len = 0
-        self._install_spec_token_room_guard()
+        if self.speculative_config is not None:
+            for req_state in self.requests.values():
+                req_state.prev_num_draft_len = 0
+            self._install_spec_token_room_guard()
+
         copies = scheduler_output.kv_cache_block_copies
         use_page_local_copy = bool(copies and self.is_unified_pool_used())
         # Per-layer (non-pooled) attention caches, e.g. DCP fine-grained

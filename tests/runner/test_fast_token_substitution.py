@@ -15,7 +15,7 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 def test_env_flag_parsing(monkeypatch):
     monkeypatch.delenv("VLLM_TPU_FAST_TOKEN_SUBSTITUTION", raising=False)
-    assert envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION is False
+    assert envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION is True
 
     monkeypatch.setenv("VLLM_TPU_FAST_TOKEN_SUBSTITUTION", "1")
     assert envs.environment_variables["VLLM_TPU_FAST_TOKEN_SUBSTITUTION"]() is True
@@ -76,3 +76,54 @@ def test_substitution_enabled_fast_path():
         # Direct slice returns next_tokens_tpu[:4] without calling kernel
         assert not mock_kernel.called
         assert torch.equal(out, torch.tensor([201, 202, 203, 204], dtype=torch.int32))
+
+
+def test_stage_timing_disabled_skips_tpu_events():
+    from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
+
+    with patch("vllm_torchtpu.runner.stage_timing.TpuEvent") as mock_event:
+        timing = RunnerStageTiming(rank=0, enabled=False)
+        with timing.stage("main_forward"):
+            pass
+        with timing.host_stage("prep"):
+            pass
+        assert timing.take_samples() == ([], [])
+        assert not mock_event.called
+
+
+def test_tpu_logits_processor_pre_gather_soft_cap():
+    from vllm_torchtpu.layers.adapter.custom_ops.logits_processor import (
+        TpuLogitsProcessor,
+    )
+
+    proc = object.__new__(TpuLogitsProcessor)
+    proc.logits_as_input = False
+    proc.soft_cap = 30.0
+    proc.scale = 1.0
+    proc.org_vocab_size = 6
+
+    shard_0 = torch.tensor([[15.0, -30.0, 45.0, 0.0]], dtype=torch.bfloat16)
+    shard_1 = torch.tensor([[-15.0, 30.0, -45.0, 10.0]], dtype=torch.bfloat16)
+    lm_head = SimpleNamespace(tp_size=2)
+
+    events = []
+
+    def fake_apply_head(head, hidden_states, embedding_bias):
+        events.append(("apply_head", tuple(shard_0.shape)))
+        return shard_0.clone()
+
+    def fake_gather(local_logits):
+        events.append(("gather", tuple(local_logits.shape)))
+        other = shard_1.clone()
+        other = torch.tanh(other / 30.0) * 30.0
+        return torch.cat([local_logits, other], dim=-1)
+
+    proc._apply_head = fake_apply_head
+    proc._gather_logits = fake_gather
+
+    out = proc.forward(lm_head, torch.zeros((1, 4), dtype=torch.bfloat16))
+    full_raw = torch.cat([shard_0, shard_1], dim=-1)
+    expected = (torch.tanh(full_raw / 30.0) * 30.0)[..., :6]
+    assert events == [("apply_head", (1, 4)), ("gather", (1, 4))]
+    assert torch.equal(out, expected)
+
