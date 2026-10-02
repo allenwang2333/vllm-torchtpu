@@ -53,3 +53,17 @@ def test_oneshot_matches_numpy(op, monkeypatch):
     xs = jax.device_put(jnp.asarray(x), NamedSharding(mesh, P(oneshot.AXIS, None)))
     got = np.asarray(jax.jit(oneshot.jax_fn(op, mesh, out_sharded=True))(xs))
     np.testing.assert_array_equal(got, _expected(op, x.reshape(n, rows, 128), n, rows))
+
+
+def test_twoshot_all_reduce_matches_numpy(monkeypatch):
+    if len(jax.devices()) < 8 or jax.devices()[0].platform != "cpu":
+        pytest.skip("needs 8 emulated CPU devices (JAX_PLATFORMS=cpu)")
+    n = len(jax.devices())
+    mesh = Mesh(np.array(jax.devices()), (oneshot.AXIS,))
+    monkeypatch.setattr(oneshot, "INTERPRET", pltpu.InterpretParams(detect_races=True))
+    x = np.random.default_rng(1).integers(0, 5, size=(n * n, 128)).astype(np.float32)
+    xs = jax.device_put(jnp.asarray(x), NamedSharding(mesh, P(oneshot.AXIS, None)))
+    fn = oneshot.jax_fn("all_reduce", mesh, out_sharded=True, variant="twoshot")
+    got = np.asarray(jax.jit(fn)(xs))
+    parts = x.reshape(n, n, 128)
+    np.testing.assert_array_equal(got, np.concatenate([parts.sum(0)] * n))

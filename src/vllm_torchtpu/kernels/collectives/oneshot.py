@@ -95,6 +95,63 @@ def _reduce_kernel(x_ref, o_ref, slots, send_sem, recv_sem, local_sem, *, n, sca
 INTERPRET = None      # tests set pltpu.InterpretParams(...) to run on emulated CPU devices
 
 
+def _twoshot_ar_kernel(x_ref, o_ref, slots, mine, s1, r1, l1, s2, r2, l2, *, n):
+    """AR = one-shot reduce-scatter (slice p -> peer p's slots[me], sum) then one-shot gather of
+    this rank's reduced slice into every peer's out[me]: 2 exchanges, 2x the bytes of a ring
+    instead of n x. x / out are [n, L]."""
+    me = lax.axis_index(AXIS)
+    _barrier(me, n)
+    _exchange(me, n, lambda p: x_ref.at[p], slots, s1, r1, l1)
+    mine[...] = jnp.sum(slots[...].astype(jnp.float32), axis=0).astype(mine.dtype)
+    _exchange(me, n, lambda p: mine, o_ref, s2, r2, l2)
+
+
+def _barrier_kernel(x_ref, o_ref, sem, *, n):
+    """Floor probe: one all-peer barrier, then a local copy (output = input)."""
+    me = lax.axis_index(AXIS)
+    _barrier(me, n)
+    c = pltpu.make_async_copy(x_ref, o_ref, sem)
+    c.start()
+    c.wait()
+
+
+def _ping_kernel(x_ref, o_ref, s, r, *, n):
+    """Floor probe: barrier, then ONE remote DMA to the ring neighbour (out = left neighbour's x)."""
+    me = lax.axis_index(AXIS)
+    _barrier(me, n)
+    c = pltpu.make_async_remote_copy(x_ref, o_ref, s, r, device_id=(lax.rem(me + 1, n),),
+                                     device_id_type=MESH)
+    c.start()
+    c.wait_send()
+    c.wait_recv()
+
+
+def _variant(variant: str, op: str, n: int, part):
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    dma = pltpu.SemaphoreType.DMA
+    cp = pltpu.CompilerParams(collective_id=COLLECTIVE_ID["all_reduce"] + 10,
+                              vmem_limit_bytes=min(100 << 20, 4 * part.nbytes + (16 << 20)))
+    if variant == "twoshot":
+        r, c = part.shape
+        flat = r * c // n
+        lanes = 128 if flat % 128 == 0 else flat      # leading dim untiled: .at[p] stays aligned
+        x = part.reshape(n, flat // lanes, lanes)
+        out = pl.pallas_call(functools.partial(_twoshot_ar_kernel, n=n),
+                             out_shape=jax.ShapeDtypeStruct(x.shape, part.dtype),
+                             in_specs=[hbm], out_specs=hbm,
+                             scratch_shapes=[pltpu.VMEM(x.shape, part.dtype),
+                                             pltpu.VMEM(x.shape[1:], part.dtype)] + [dma] * 6,
+                             compiler_params=cp, name="oneshot_twoshot_ar",
+                             interpret=INTERPRET)(x)
+        return out.reshape(r, c)
+    kern, sems = ((_barrier_kernel, [dma]) if variant == "barrier" else (_ping_kernel, [dma, dma]))
+    return pl.pallas_call(functools.partial(kern, n=n),
+                          out_shape=jax.ShapeDtypeStruct(part.shape, part.dtype),
+                          in_specs=[hbm], out_specs=hbm, scratch_shapes=sems,
+                          compiler_params=cp, name=f"oneshot_{variant}",
+                          interpret=INTERPRET)(part)
+
+
 def _local(op: str, n: int, part):
     sems = [pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA, pltpu.SemaphoreType.DMA]
     cp = pltpu.CompilerParams(collective_id=COLLECTIVE_ID[op],
@@ -130,7 +187,7 @@ def _local(op: str, n: int, part):
                           interpret=INTERPRET)(x)
 
 
-def jax_fn(op: str, mesh, out_sharded: bool = False):
+def jax_fn(op: str, mesh, out_sharded: bool = False, variant: str | None = None):
     """The global-array fn for sharded_jax_op: input dim 0 sharded over the 1-axis mesh.
 
     The output is declared replicated (P()) so its global shape IS each rank's buffer: the
@@ -141,14 +198,16 @@ def jax_fn(op: str, mesh, out_sharded: bool = False):
     n = mesh.size
 
     def fn(x: jax.Array) -> jax.Array:
-        return jax.shard_map(functools.partial(_local, op, n), mesh=mesh,
+        body = (functools.partial(_variant, variant, op, n) if variant
+                else functools.partial(_local, op, n))
+        return jax.shard_map(body, mesh=mesh,
                              in_specs=P(AXIS, None),
                              out_specs=P(AXIS, None) if out_sharded else P(),
                              check_vma=False)(x)
     return fn
 
 
-def torch_op(op: str, group, key: str):
+def torch_op(op: str, group, key: str, variant: str | None = None):
     """A torch custom op running the one-shot kernel over a vLLM GroupCoordinator's ranks.
     Call once per (op, group) outside tracing: building the mesh runs a cpu collective."""
     from vllm_torchtpu.distributed.mesh_utils import get_or_create_cp_mesh
@@ -156,12 +215,14 @@ def torch_op(op: str, group, key: str):
     import torch
     mesh = get_or_create_cp_mesh(AXIS, group)
     n = mesh.size
-    top = sharded_jax_op(f"pallas::oneshot_{op}_{key}", jax_fn(op, mesh), mesh=mesh,
+    top = sharded_jax_op(f"pallas::oneshot_{variant or op}_{key}", jax_fn(op, mesh, variant=variant),
+                         mesh=mesh,
                          input_partition_specs=(P(AXIS, None),),
                          output_partition_specs=P())
 
     def fake(x):         # this rank's shard, as the Kimi ring ops register it
-        rows = {"all_gather": x.shape[0] * n, "reduce_scatter": x.shape[0] // n}.get(op, x.shape[0])
+        rows = x.shape[0] if variant else {"all_gather": x.shape[0] * n,
+                                           "reduce_scatter": x.shape[0] // n}.get(op, x.shape[0])
         return torch.empty((rows, x.shape[1]), dtype=x.dtype, device=x.device)
     top.register_fake(fake)
     return top

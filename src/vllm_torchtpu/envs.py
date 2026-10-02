@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_DCP_COLLECTIVE_IMPL: str = "xla"
+    TPU_TP_ALLREDUCE_IMPL: str = "xla"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
@@ -386,6 +387,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # [T, h, nope + rope], runs one all-gather of that (kv_lora_rank + rope)
     # / (nope + rope) times fewer bytes, then absorbs locally against a
     # group-wide W_UK_T built once at load (as query replication does).
+    # TP all-reduce in TpuDeviceCommunicator. "xla": dist.all_reduce. "twoshot": the
+    # Pallas one-shot reduce-scatter + one-shot gather (kernels/collectives/
+    # oneshot.py) for latency-bound sizes; larger ones stay on XLA.
+    "TPU_TP_ALLREDUCE_IMPL": env_with_choices(
+        "TPU_TP_ALLREDUCE_IMPL", "xla", ["xla", "twoshot"]
+    ),
     "TPU_DCP_Q_GATHER_MODE": env_with_choices(
         "TPU_DCP_Q_GATHER_MODE",
         "split",

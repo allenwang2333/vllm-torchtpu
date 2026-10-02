@@ -694,6 +694,12 @@ class TPUWorker(WorkerBase):
 
         patch_registry.apply("model_load", model_config=self.model_config)
         self.model_runner.load_model()
+        # collective kernels whose mesh must be built outside any trace
+        from vllm.distributed.parallel_state import get_tp_group
+
+        comm = getattr(get_tp_group(), "device_communicator", None)
+        if hasattr(comm, "prepare_all_reduce_kernel"):
+            comm.prepare_all_reduce_kernel()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
