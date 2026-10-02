@@ -530,6 +530,98 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             2e-2,
         )
 
+    @parameterized.product(
+        (
+            {"query_tokens": 16, "real_tokens": 13, "chunk": 64},
+            {"query_tokens": 128, "real_tokens": 100, "chunk": 64},
+            {"query_tokens": 128, "real_tokens": 128, "chunk": 128},
+        ),
+        topk_cap=(256, 512),
+        packed=(False, True),
+    )
+    def test_topk_cap_matches_uncapped(
+        self, query_tokens, real_tokens, chunk, topk_cap, packed
+    ):
+        """`topk_cap` against the uncapped SparseCore path, per real row.
+
+        Counts span 1 to topk, so chunks hold rows within the cap, rows one
+        past it, and rows reaching every window (2048), i.e. the in-kernel
+        multi-window fix-up and the window-major live bound. With `packed`,
+        decode-sized chunks take the packed path and the rest the cap.
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        topk = 2048
+        rng = np.random.default_rng(20261003)
+        problem = _build_problem(
+            rng, k_scale=0.75, query_tokens=query_tokens, topk=topk
+        )
+        counts = np.resize(
+            np.array([1, 63, 255, 256, 257, 511, 512, 513, 700, 1024, 1025, 2048, 130]),
+            query_tokens,
+        )
+        rng.shuffle(counts)
+        live = np.arange(topk)[None, :] < counts[:, None]
+        topk_idx = jnp.where(jnp.asarray(live), problem["topk"], -1)
+        cu_q_lens = jnp.array([0, real_tokens], jnp.int32)
+        distribution = jnp.array([0, 1, 1], jnp.int32)
+
+        def run(**extra):
+            return sparse_mla.sparse_ragged_paged_attention(
+                problem["q"],
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_idx,
+                problem["page_table"],
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=chunk,
+                attention_kernel_batch_size=16,
+                **extra,
+            )
+
+        (ref, ref_lse), (out, lse) = jax.block_until_ready(
+            (run(), run(topk_cap=topk_cap, packed_gather=packed))
+        )
+        real = np.asarray(out, np.float32)[:real_tokens]
+        np.testing.assert_allclose(
+            real, np.asarray(ref, np.float32)[:real_tokens], rtol=2e-2, atol=2e-2
+        )
+        np.testing.assert_allclose(
+            np.asarray(lse)[:real_tokens],
+            np.asarray(ref_lse)[:real_tokens],
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        # Positive control: the comparison must be able to fail.
+        self.assertGreater(
+            np.abs(real - np.asarray(problem["q"], np.float32)[:real_tokens]).max(),
+            2e-2,
+        )
+
+    def test_topk_cap_validation(self):
+        q = jnp.zeros((16, 8, HEAD_DIM), jnp.bfloat16)
+        nope = jnp.zeros((16, 256, 128), jnp.uint32)
+        rope = jnp.zeros((16, 64, 128), jnp.uint32)
+        topk_idx = jnp.zeros((16, 256), jnp.int32)
+        for bad_cap in (96, 192):
+            with self.assertRaisesRegex(ValueError, "topk_cap"):
+                sparse_mla.sparse_ragged_paged_attention(
+                    q,
+                    nope,
+                    rope,
+                    topk_idx,
+                    jnp.arange(16, dtype=jnp.int32),
+                    jnp.array([0, 16], jnp.int32),
+                    jnp.array([0, 1, 1], jnp.int32),
+                    cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                    topk_cap=bad_cap,
+                )
+
     def test_sparsecore_layout_validation(self):
         q = jnp.zeros((128, 8, HEAD_DIM), jnp.bfloat16)
         nope = jnp.zeros((16, 256, 128), jnp.uint32)

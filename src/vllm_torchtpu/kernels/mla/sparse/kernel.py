@@ -152,6 +152,7 @@ def _attention_kernel(
     sparsecore_layout: bool = False,
     packed_bkv: int | None = None,
     tok_off_ref=None,
+    capped_windows: int | None = None,
 ):
     # Packed mode (`packed_bkv` set, SparseCore layout only): the gathered
     # buffers are one flat stream of 64-row atoms per chunk, token t's live
@@ -159,9 +160,18 @@ def _attention_kernel(
     # tile at that offset, and tokens with more live rows are recomputed by
     # an online-softmax fix-up over all their tiles. Four scratch refs and a
     # semaphore pair for the fix-up trail the usual scratch.
+    #
+    # Capped mode (`capped_windows` = W set, SparseCore layout only): the
+    # gathered buffers hold W windows of `bkv_sz` rows per token, window-major
+    # (`[W * chunk, bkv_sz, ...]`), and the pipelined body attends window 0
+    # exactly like the uncapped path. Tokens with more than `bkv_sz` live rows
+    # are recomputed over all their windows by an online-softmax fix-up with
+    # double-buffered window DMAs (two-slot scratch trails the usual scratch).
     fix_refs = None
-    if packed_bkv is not None:
-        assert sparsecore_layout and tok_off_ref is not None
+    if packed_bkv is not None or capped_windows is not None:
+        assert sparsecore_layout
+        assert packed_bkv is None or tok_off_ref is not None
+        assert packed_bkv is None or capped_windows is None
         fix_refs = refs[-6:]
         refs = refs[:-6]
     if return_lse:
@@ -555,6 +565,116 @@ def _attention_kernel(
 
         lax.fori_loop(0, batch_size, fix_token, 0)
 
+    def fixup_capped_overflow(bi_sem_idx, bo_sem_idx):
+        """Recompute tokens with more than `bkv_sz` live rows (capped mode).
+
+        The pipelined body attended only window 0 of such a token. This pass
+        redoes it over windows `0 .. cdiv(kv_len, bkv_sz) - 1` with an online
+        softmax: window 0 from the VMEM slot the body just read (the next
+        batch prefetches into the other slot), window j >= 1 from gathered row
+        `j * chunk + (seq - start)` into a two-slot scratch, the DMA of window
+        j + 1 started before window j is computed. Overwrites the token's `bo`
+        and `blse` entries before they are sent. Tokens within `bkv_sz` skip it.
+        """
+        fix_nope_ref, fix_rope_ref, fix_m_ref, fix_l_ref, fix_acc_ref, fix_sems = (
+            fix_refs
+        )
+        f32_min = jnp.finfo(jnp.float32).min
+        chunk_rows = cache_kv_nope_hbm_ref.shape[0] // capped_windows
+
+        def window_copies(local_idx, j, slot):
+            row = j * chunk_rows + local_idx
+            return (
+                pltpu.make_async_copy(
+                    cache_kv_nope_hbm_ref.at[row],
+                    fix_nope_ref.at[slot],
+                    fix_sems.at[0, slot],
+                ),
+                pltpu.make_async_copy(
+                    cache_kv_rope_hbm_ref.at[row],
+                    fix_rope_ref.at[slot],
+                    fix_sems.at[1, slot],
+                ),
+            )
+
+        def accumulate(q, kv, rem):
+            s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
+            s *= sm_scale
+            if k_scale != 1.0:
+                s *= k_scale
+            kv_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
+            s = jnp.where(kv_span < rem, s, f32_min)
+            m_prev = fix_m_ref[...]
+            m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
+            p = jnp.exp(s - m_new)
+            alpha = jnp.exp(m_prev - m_new)
+            fix_l_ref[...] = alpha * fix_l_ref[...] + jnp.sum(p, axis=1, keepdims=True)
+            fix_acc_ref[...] = alpha * fix_acc_ref[...] + jnp.einsum(
+                "nm,md->nd", p, kv, preferred_element_type=jnp.float32
+            )
+            fix_m_ref[...] = m_new
+
+        def fix_token(batch_idx, carry):
+            seq_idx = batch_start_seq_idx + batch_idx
+            kv_len = kv_lens_ref[seq_idx]
+
+            @pl.when(kv_len > bkv_sz)
+            def _fix():
+                local_idx = seq_idx - start_seq_idx
+                num_windows = cdiv(kv_len, bkv_sz)
+                for cp in window_copies(local_idx, 1, 1):
+                    cp.start()
+                q = bq_x2_ref.at[bi_sem_idx, batch_idx][...]
+                fix_m_ref[...] = jnp.full(fix_m_ref.shape, f32_min, jnp.float32)
+                fix_l_ref[...] = jnp.zeros(fix_l_ref.shape, jnp.float32)
+                fix_acc_ref[...] = jnp.zeros(fix_acc_ref.shape, jnp.float32)
+                accumulate(
+                    q,
+                    unpack_bkv(
+                        bkv_nope_x2_ref.at[bi_sem_idx, batch_idx],
+                        bkv_rope_x2_ref.at[bi_sem_idx, batch_idx],
+                        lambda: kv_len,
+                    ),
+                    kv_len,
+                )
+
+                def window(j, window_carry):
+                    slot = lax.rem(j, 2)
+
+                    @pl.when(j + 1 < num_windows)
+                    def _prefetch_next():
+                        for cp in window_copies(local_idx, j + 1, 1 - slot):
+                            cp.start()
+
+                    for cp in window_copies(local_idx, j, slot):
+                        cp.wait()
+                    rem = kv_len - j * bkv_sz
+                    kv = unpack_bkv(
+                        fix_nope_ref.at[slot], fix_rope_ref.at[slot], lambda: rem
+                    )
+                    accumulate(q, kv, rem)
+                    return window_carry
+
+                lax.fori_loop(1, num_windows, window, 0)
+                l_sum = fix_l_ref[...]
+                pv = fix_acc_ref[...]
+                if k_scale != 1.0:
+                    pv *= k_scale
+                out = (
+                    lax.div(pv, l_sum)
+                    if q_dtype == jnp.float32
+                    else (pv * pl.reciprocal(l_sum, approx=True)).astype(q_dtype)
+                )
+                bo_x2_ref.at[bo_sem_idx, batch_idx][...] = out
+                if return_lse:
+                    blse_x2_ref.at[bo_sem_idx, batch_idx][...] = fix_m_ref[
+                        ...
+                    ] + jnp.log(l_sum)
+
+            return carry
+
+        lax.fori_loop(0, batch_size, fix_token, 0)
+
     def process():
         def get_next_seq_ids(seq_idx, bi_sem_idx):
             next_seq_idx = seq_idx + batch_size
@@ -641,6 +761,8 @@ def _attention_kernel(
         write_blse(batch_size - 1, prev_m, prev_l_sum)
         if packed_bkv is not None:
             fixup_overflow_tokens(bi_sem_idx, bo_sem_idx)
+        if capped_windows is not None:
+            fixup_capped_overflow(bi_sem_idx, bo_sem_idx)
         start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
         if return_lse:
             _send_blse_batch(batch_start_seq_idx, bo_sem_idx)
@@ -853,6 +975,7 @@ def prepare_outputs(
         "packed_bkv",
         "packed_gather_atoms",
         "packed_chunk_tokens",
+        "topk_cap",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -888,6 +1011,7 @@ def sparse_ragged_paged_attention(
     packed_bkv: int = DEFAULT_PACKED_BKV,
     packed_gather_atoms: int = DEFAULT_PACKED_GATHER_ATOMS,
     packed_chunk_tokens: int = DEFAULT_PACKED_CHUNK_TOKENS,
+    topk_cap: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -947,6 +1071,16 @@ def sparse_ragged_paged_attention(
         many tokens; larger chunks take the unpacked path. The default (16,
         the decode bucket) keeps 64-token prefill chunks unpacked: there the
         XLA gather that builds the atom stream costs more than packing saves.
+      topk_cap: SparseCore layout only (ignored otherwise; None disables).
+        Gather and attend `topk_cap` top-k slots per token instead of `topk`,
+        exactly: rows are prefix-packed, so a token with at most `topk_cap`
+        live entries holds them all in its first window, and a token with more
+        is recomputed in-kernel over all its `topk_cap`-slot windows (online
+        softmax). The native gather is bounded to the chunk's live windows, so
+        a chunk with no such token gathers `topk_cap` slots per row only. Must
+        be a multiple of 64 dividing `topk`. Chunks the packed mode takes stay
+        packed. Pays off when rows hold far fewer than `topk` live entries
+        (DCP).
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -1025,6 +1159,13 @@ def sparse_ragged_paged_attention(
         raise ValueError(
             f"topk ({topk}) must be a multiple of "
             f"{native_sc_gather.ROPE_PACKING} for sparsecore ROPE packing"
+        )
+    if not sparsecore_layout or (topk_cap is not None and topk_cap >= topk):
+        topk_cap = None
+    if topk_cap is not None and (topk_cap % PACKED_ATOM_ROWS or topk % topk_cap):
+        raise ValueError(
+            f"topk_cap ({topk_cap}) must be a multiple of {PACKED_ATOM_ROWS} "
+            f"dividing topk ({topk})"
         )
 
     kv_lens, physical_indices = prepare_gather_indices(
@@ -1105,6 +1246,7 @@ def sparse_ragged_paged_attention(
             packed=packed_chunks[i],
             packed_bkv=packed_bkv,
             packed_gather_atoms=packed_gather_atoms,
+            topk_cap=topk_cap if packed_chunks[i] is None else None,
         )
         if return_lse:
             q, lse = result
@@ -1202,6 +1344,7 @@ def sparse_attention_chunk(
     packed: "PackedChunk | None" = None,
     packed_bkv: int = DEFAULT_PACKED_BKV,
     packed_gather_atoms: int = DEFAULT_PACKED_GATHER_ATOMS,
+    topk_cap: int | None = None,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1216,16 +1359,31 @@ def sparse_attention_chunk(
     `packed_bkv`-row tiles at its atom offset, instead of `topk` rows per
     token. `packed_gather_atoms` is the gather's `atoms_per_batch` for chunks
     larger than `small_chunk_tokens`.
+
+    `topk_cap` (SparseCore layout only; a multiple of 64 dividing topk) gathers
+    the chunk's top-k window-major in `topk_cap`-slot windows, bounded to the
+    windows its live rows reach, and attends window 0 per token with an
+    in-kernel fix-up over all windows for tokens holding more live entries.
     """
     return_lse = lse is not None
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
     if packed is not None and not sparsecore_layout:
         raise ValueError("packed gather requires the sparsecore cache layout")
+    if topk_cap is not None and (packed is not None or not sparsecore_layout):
+        raise ValueError("topk_cap requires the unpacked sparsecore cache layout")
+    if topk_cap is not None and (
+        topk_cap % PACKED_ATOM_ROWS or physical_indices.shape[-1] % topk_cap
+    ):
+        raise ValueError(
+            f"topk_cap ({topk_cap}) must be a multiple of {PACKED_ATOM_ROWS} "
+            f"dividing topk ({physical_indices.shape[-1]})"
+        )
     if preserve_suffix and (return_lse or sparsecore_layout):
         raise ValueError("Prefix stores require TensorCore caches without LSE")
     _, num_q_heads, head_dim = q.shape
     topk = physical_indices.shape[-1]
     chunk_size = end_pos - start_pos
+    capped_windows = None if topk_cap is None else topk // topk_cap
 
     def run_mla_kernel(
         q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
@@ -1295,6 +1453,17 @@ def sparse_attention_chunk(
         # Semaphores for double buffering of bkv_nope, bq, bo, bkv_rope
         # (+ blse when the log-sum-exp is exported).
         scratch_shapes.append(pltpu.SemaphoreType.DMA((5 if return_lse else 4, 2)))
+        if capped_windows is not None:
+            # Overflow fix-up: two window slots per cache, running max / sum /
+            # accumulator, and a semaphore per (cache, slot).
+            scratch_shapes += [
+                pltpu.VMEM((2, *nope_tile), cache_kv_nope.dtype),
+                pltpu.VMEM((2, *rope_tile), cache_kv_rope.dtype),
+                pltpu.VMEM((num_q_heads, 1), jnp.float32),
+                pltpu.VMEM((num_q_heads, 1), jnp.float32),
+                pltpu.VMEM((num_q_heads, head_dim), jnp.float32),
+                pltpu.SemaphoreType.DMA((2, 2)),
+            ]
         if packed is not None:
             # Overflow fix-up: one tile per cache, running max / sum /
             # accumulator, and a semaphore per cache.
@@ -1324,6 +1493,7 @@ def sparse_attention_chunk(
             preserve_suffix=preserve_suffix,
             return_lse=return_lse,
             sparsecore_layout=sparsecore_layout,
+            capped_windows=capped_windows,
         )
         if packed is not None:
             # Fourth scalar prefetch: per-token atom offset into the stream.
@@ -1342,6 +1512,8 @@ def sparse_attention_chunk(
                 f"MLA-{cache_layout}-p_{cache_kv_rope.shape[1]}-"
                 f"bz_{batch_size}-gcz_{cache_kv_nope.shape[0]}"
             )
+            if capped_windows is not None:
+                scope_name += f"-capw_{capped_windows}"
         num_prefetch = len(scalar_prefetches)
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
@@ -1429,6 +1601,49 @@ def sparse_attention_chunk(
                 num_live_indices=packed.live_rows,
                 live_multiple=PACKED_ATOM_ROWS,
             )
+        )
+    elif topk_cap is not None:
+        # Window-major: window w of the chunk's top-k is rows [w*C, (w+1)*C)
+        # of a [W*C, topk_cap] index array; window 0 is the plain `topk_cap`
+        # slice. The live bound reaches the last window any gridded row needs
+        # (always window 0's live rows, so a chunk without overflow gathers
+        # exactly `(batch_end - start) * topk_cap` rows).
+        gather_atoms = sparsecore_atoms_per_batch
+        if small_chunk and small_chunk_live_gather:
+            gather_atoms = small_chunk_gather_atoms
+        live_tokens = batch_end - start_pos
+        token_windows = jnp.where(
+            jnp.arange(chunk_size) < live_tokens,
+            (jnp.maximum(kv_lens[start_pos:end_pos], 1) + topk_cap - 1) // topk_cap,
+            1,
+        )
+        live_windows = jnp.clip(jnp.max(token_windows), 1, capped_windows)
+        num_live_capped = (live_windows - 1) * chunk_size * topk_cap + jnp.maximum(
+            0, live_tokens
+        ) * topk_cap
+        window_indices = (
+            indices.reshape(chunk_size, capped_windows, topk_cap)
+            .transpose(1, 0, 2)
+            .reshape(capped_windows * chunk_size, topk_cap)
+        )
+        gathered_nope_buffer, gathered_rope_buffer = (
+            native_sc_gather.dsa_gather_native_sc(
+                cache_kv_nope,
+                cache_kv_rope,
+                window_indices,
+                out_size=chunk_size * topk,
+                atoms_per_batch=gather_atoms,
+                wait_mode=sparsecore_gather_wait_mode,
+                serve_pipelined=sparsecore_gather_pipelined,
+                num_live_indices=num_live_capped,
+                live_multiple=kernel_batch_size * topk_cap,
+            )
+        )
+        gathered_nope_buffer = gathered_nope_buffer.reshape(
+            capped_windows * chunk_size, topk_cap, 128
+        )
+        gathered_rope_buffer = gathered_rope_buffer.reshape(
+            capped_windows * chunk_size, topk_cap // native_sc_gather.ROPE_PACKING, 128
         )
     elif sparsecore_layout:
         live_kwargs = {}
