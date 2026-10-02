@@ -18,6 +18,7 @@ the traced step converts and adds every norm's weight on every call. After the
 weights are loaded the sum is a constant, so it is computed once here, kept
 as a buffer on the module, and the forward uses the buffer. Numerics are
 unchanged (the same f32 sum, done once)."""
+
 import torch
 
 from vllm_torchtpu import envs
@@ -27,23 +28,24 @@ logger = init_logger(__name__)
 _BUFFER = "_tpu_weight_plus_one"
 
 
-def _hoisted_forward_native(self,
-                            x: torch.Tensor,
-                            residual: torch.Tensor | None = None):
+def _hoisted_forward_native(
+    self, x: torch.Tensor, residual: torch.Tensor | None = None
+):
     from vllm import ir
+
     weight = getattr(self, _BUFFER, None)
     if weight is None:
         weight = self.weight.float() + 1.0
     if residual is None:
         return ir.ops.rms_norm(x, weight, self.variance_epsilon)
-    return ir.ops.fused_add_rms_norm(x, residual, weight,
-                                     self.variance_epsilon)
+    return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
 
 
 def install(model: torch.nn.Module) -> int:
     """Gives every GemmaRMSNorm in ``model`` its (1 + w) f32 buffer and routes the class's native forward
     through it. Returns the number of norms hoisted. Call after the weights are loaded."""
     from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+
     n = 0
     for module in model.modules():
         if isinstance(module, GemmaRMSNorm):
@@ -71,5 +73,6 @@ def install_if_enabled(model: torch.nn.Module) -> int:
     n = install(model)
     logger.info(
         "TPU_NORM_WEIGHT_HOIST: %d norms carry (1 + w) in f32 as a buffer; the per-step convert and add are gone",
-        n)
+        n,
+    )
     return n

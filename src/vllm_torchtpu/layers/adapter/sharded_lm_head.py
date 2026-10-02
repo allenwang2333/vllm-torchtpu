@@ -36,8 +36,7 @@ import torch
 from jax.sharding import PartitionSpec as P
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.distributed.ep_mesh import (EP_AXIS_NAME, build_ep_mesh,
-                                               ep_mesh_index)
+from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_mesh_index
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.logger import init_logger
 
@@ -52,9 +51,12 @@ def find_head(model):
     wrapper holds it at language_model.lm_head). A head that is the token embedding itself (tied
     weights) is left alone: patching it would also change the embedding lookup."""
     modules = list(model.named_modules(remove_duplicate=False))
-    heads = [(name, mod) for name, mod in modules
-             if name.split(".")[-1] == "lm_head"
-             and isinstance(getattr(mod, "weight", None), torch.Tensor)]
+    heads = [
+        (name, mod)
+        for name, mod in modules
+        if name.split(".")[-1] == "lm_head"
+        and isinstance(getattr(mod, "weight", None), torch.Tensor)
+    ]
     if not heads:
         return None
     name, head = heads[0]
@@ -62,7 +64,9 @@ def find_head(model):
     if tied:
         logger.warning(
             "sharded LM head: %s shares its module with the token embedding; "
-            "left as is", name)
+            "left as is",
+            name,
+        )
         return None
     logger.info("sharded LM head: found %s", name)
     return head
@@ -75,21 +79,21 @@ def head_fn(mesh):
         xs, ws
     ):  # this engine's rows [rows, hidden] and vocabulary slice [vocab / n, hidden]
         xa = jax.lax.all_gather(xs, EP_AXIS_NAME, axis=0, tiled=True)
-        lg = jnp.dot(xa, ws.T,
-                     preferred_element_type=jnp.float32).astype(xs.dtype)
-        return jax.lax.all_to_all(lg,
-                                  EP_AXIS_NAME,
-                                  split_axis=0,
-                                  concat_axis=1,
-                                  tiled=True)
+        lg = jnp.dot(xa, ws.T, preferred_element_type=jnp.float32).astype(xs.dtype)
+        return jax.lax.all_to_all(
+            lg, EP_AXIS_NAME, split_axis=0, concat_axis=1, tiled=True
+        )
 
-    def fn(x: jax.Array,
-           w: jax.Array) -> jax.Array:  # the op wrapper reads the annotations
-        return jax.shard_map(one,
-                             mesh=mesh,
-                             in_specs=(P(EP_AXIS_NAME), P(EP_AXIS_NAME)),
-                             out_specs=P(EP_AXIS_NAME),
-                             check_vma=False)(x, w)
+    def fn(
+        x: jax.Array, w: jax.Array
+    ) -> jax.Array:  # the op wrapper reads the annotations
+        return jax.shard_map(
+            one,
+            mesh=mesh,
+            in_specs=(P(EP_AXIS_NAME), P(EP_AXIS_NAME)),
+            out_specs=P(EP_AXIS_NAME),
+            check_vma=False,
+        )(x, w)
 
     return fn
 
@@ -97,12 +101,13 @@ def head_fn(mesh):
 def build_op(mesh):
     """The sharded projection op on the expert-parallel mesh."""
     n = mesh.shape[EP_AXIS_NAME]
-    op = sharded_jax_op(OP_NAME,
-                        head_fn(mesh),
-                        mesh=mesh,
-                        input_partition_specs=(P(EP_AXIS_NAME),
-                                               P(EP_AXIS_NAME)),
-                        output_partition_specs=P(EP_AXIS_NAME))
+    op = sharded_jax_op(
+        OP_NAME,
+        head_fn(mesh),
+        mesh=mesh,
+        input_partition_specs=(P(EP_AXIS_NAME), P(EP_AXIS_NAME)),
+        output_partition_specs=P(EP_AXIS_NAME),
+    )
 
     def _fake(x, w):
         return x.new_empty((x.shape[0], w.shape[0] * n))
@@ -117,15 +122,13 @@ class ShardedHeadMethod:
     def __init__(self, rows: int):
         self.rows = rows
 
-    def apply(self,
-              layer,
-              x: torch.Tensor,
-              bias: torch.Tensor | None = None) -> torch.Tensor:
+    def apply(
+        self, layer, x: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Project x (at most the fixed row count) through the sharded head."""
         r = x.shape[0]
         if r > self.rows:
-            raise ValueError(
-                f"sharded LM head: {r} rows exceed the fixed {self.rows}")
+            raise ValueError(f"sharded LM head: {r} rows exceed the fixed {self.rows}")
         if r < self.rows:
             x = torch.nn.functional.pad(x, (0, 0, 0, self.rows - r))
         out = _OP(x, layer.weight_slice)[:r]
@@ -136,7 +139,8 @@ class ShardedHeadMethod:
     def embedding(self, layer, ids):
         """Not supported: the sharded head is the projection only."""
         raise NotImplementedError(
-            "the sharded head is the projection only, never the embedding")
+            "the sharded head is the projection only, never the embedding"
+        )
 
 
 def unsupported_reason(buckets) -> str | None:
@@ -144,10 +148,12 @@ def unsupported_reason(buckets) -> str | None:
     runner has to run one bucket, the head's fixed row count."""
     if len(buckets) == 1:
         return None
-    return (f"request buckets {list(buckets)}: the head takes one fixed row "
-            "count, and a smaller bucket makes the compiled graph pad and "
-            "trim rows around its exchange, which reads the wrong vocabulary "
-            "positions")
+    return (
+        f"request buckets {list(buckets)}: the head takes one fixed row "
+        "count, and a smaller bucket makes the compiled graph pad and "
+        "trim rows around its exchange, which reads the wrong vocabulary "
+        "positions"
+    )
 
 
 def install(model, buckets) -> bool:
@@ -169,7 +175,9 @@ def install(model, buckets) -> bool:
         # below would take the slice for the whole of it.
         logger.warning(
             "sharded LM head: the head is split across %d tensor-parallel "
-            "ranks; left as is", tp)
+            "ranks; left as is",
+            tp,
+        )
         return False
     rows = int(buckets[0])
     mesh = build_ep_mesh()
@@ -182,27 +190,37 @@ def install(model, buckets) -> bool:
     vocab, hidden = w.shape
     if vocab % n:
         logger.warning(
-            "sharded LM head: vocabulary %d does not split over %d engines; "
-            "left as is", vocab, n)
+            "sharded LM head: vocabulary %d does not split over %d engines; left as is",
+            vocab,
+            n,
+        )
         return False
     part = vocab // n
     # Slice on the host: a lazily materialized device slice can use a
     # compiled-program cache key that omits the slice bounds, causing
     # ranks with different windows to reuse incompatible executables.
     w_cpu = w.cpu()
-    ws = w_cpu[idx * part:(idx + 1) * part].contiguous().to(w.device)
+    ws = w_cpu[idx * part : (idx + 1) * part].contiguous().to(w.device)
     head.weight_slice = torch.nn.Parameter(ws, requires_grad=False)
     # Keep a one-row weight for module shape checks while releasing this
     # engine's full vocabulary projection.
-    head.weight = torch.nn.Parameter(w_cpu[:1].clone().to(w.device),
-                                     requires_grad=False)
+    head.weight = torch.nn.Parameter(
+        w_cpu[:1].clone().to(w.device), requires_grad=False
+    )
     del w
     _OP = build_op(mesh)
     head.quant_method = ShardedHeadMethod(rows)
     logger.info(
         "sharded LM head: %d x %d split %d ways (this engine: mesh index %d, rows %d to %d), "
-        "rows padded to %d per call", vocab, hidden, n, idx, idx * part,
-        (idx + 1) * part, rows)
+        "rows padded to %d per call",
+        vocab,
+        hidden,
+        n,
+        idx,
+        idx * part,
+        (idx + 1) * part,
+        rows,
+    )
     del w_cpu
     return True
 

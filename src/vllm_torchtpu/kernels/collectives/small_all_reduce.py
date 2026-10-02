@@ -35,6 +35,7 @@ The waits go on local descriptors of the same bytes, since the bridge refuses
 a wait on a descriptor that carries a peer address. These addressing and
 wait conventions also apply to the fused EP transport.
 """
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -54,8 +55,7 @@ MESH = pl.DeviceIdType.MESH
 
 def form_for(rows, hidden, itemsize):
     """The form for a block of rows x hidden elements of itemsize bytes."""
-    return ("oneshot"
-            if rows * hidden * itemsize <= ONE_SHOT_MAX_BYTES else "twoshot")
+    return "oneshot" if rows * hidden * itemsize <= ONE_SHOT_MAX_BYTES else "twoshot"
 
 
 def reference(blocks):
@@ -65,7 +65,7 @@ def reference(blocks):
 
 
 def _peer(j, axis, dict_ids):
-    return {axis: jnp.int32(j)} if dict_ids else (jnp.int32(j), )
+    return {axis: jnp.int32(j)} if dict_ids else (jnp.int32(j),)
 
 
 def _barrier(num_cores, axis, dict_ids):
@@ -82,10 +82,9 @@ def _barrier(num_cores, axis, dict_ids):
     still waits at the barrier of call k."""
     barrier = pltpu.get_barrier_semaphore()
     for j in range(num_cores):
-        pl.semaphore_signal(barrier,
-                            1,
-                            device_id=_peer(j, axis, dict_ids),
-                            device_id_type=MESH)
+        pl.semaphore_signal(
+            barrier, 1, device_id=_peer(j, axis, dict_ids), device_id_type=MESH
+        )
     pl.semaphore_wait(barrier, num_cores)
 
 
@@ -96,12 +95,14 @@ def _wait_bytes_of(ref_slice, sem):
 
 
 def _push(src, dst, send_sem, recv_sem, j, axis, dict_ids):
-    pltpu.make_async_remote_copy(src_ref=src,
-                                 dst_ref=dst,
-                                 send_sem=send_sem,
-                                 recv_sem=recv_sem,
-                                 device_id=_peer(j, axis, dict_ids),
-                                 device_id_type=MESH).start()
+    pltpu.make_async_remote_copy(
+        src_ref=src,
+        dst_ref=dst,
+        send_sem=send_sem,
+        recv_sem=recv_sem,
+        device_id=_peer(j, axis, dict_ids),
+        device_id_type=MESH,
+    ).start()
 
 
 def _split(refs, rank_operand, axis):
@@ -113,17 +114,16 @@ def _split(refs, rank_operand, axis):
 
 
 def _oneshot(x, rows, hidden, n, axis, rank, dict_ids, collective_id):
-
     def kernel(*refs):
         me, (x_ref, o_ref, arrivals, send_sem, recv_sem) = _split(
-            refs, rank is not None, axis)
+            refs, rank is not None, axis
+        )
         _barrier(n, axis, dict_ids)
         for j in range(n):  # my block into slot `me` of every other core
 
             @pl.when(jnp.int32(j) != me)
             def _(j=j):
-                _push(x_ref, arrivals.at[me], send_sem, recv_sem, j, axis,
-                      dict_ids)
+                _push(x_ref, arrivals.at[me], send_sem, recv_sem, j, axis, dict_ids)
 
         arrivals[pl.ds(me, 1)] = x_ref[...][None]
         _wait_bytes_of(arrivals.at[pl.ds(0, n - 1)], recv_sem)
@@ -133,19 +133,40 @@ def _oneshot(x, rows, hidden, n, axis, rank, dict_ids, collective_id):
         o_ref[...] = acc.astype(o_ref.dtype)
         _wait_bytes_of(arrivals.at[pl.ds(0, n - 1)], send_sem)
 
-    return _call(kernel, x, rows, hidden, rank, [
-        pltpu.VMEM((n, rows, hidden), x.dtype),
-        pltpu.SemaphoreType.DMA,
-        pltpu.SemaphoreType.DMA,
-    ], collective_id, f"small_all_reduce_oneshot_r{rows}")
+    return _call(
+        kernel,
+        x,
+        rows,
+        hidden,
+        rank,
+        [
+            pltpu.VMEM((n, rows, hidden), x.dtype),
+            pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.DMA,
+        ],
+        collective_id,
+        f"small_all_reduce_oneshot_r{rows}",
+    )
 
 
 def _twoshot(x, rows, hidden, n, axis, rank, dict_ids, collective_id):
     own = hidden // n
 
     def kernel(*refs):
-        me, (x_ref, o_ref, mine, slices, gathered, send_sem, recv_sem,
-             send2_sem, recv2_sem) = _split(refs, rank is not None, axis)
+        (
+            me,
+            (
+                x_ref,
+                o_ref,
+                mine,
+                slices,
+                gathered,
+                send_sem,
+                recv_sem,
+                send2_sem,
+                recv2_sem,
+            ),
+        ) = _split(refs, rank is not None, axis)
         _barrier(n, axis, dict_ids)
         # my block by owner: slot j holds the columns core j owns
         for j in range(n):
@@ -155,8 +176,7 @@ def _twoshot(x, rows, hidden, n, axis, rank, dict_ids, collective_id):
 
             @pl.when(jnp.int32(j) != me)
             def _(j=j):
-                _push(mine.at[j], slices.at[me], send_sem, recv_sem, j,
-                      axis, dict_ids)
+                _push(mine.at[j], slices.at[me], send_sem, recv_sem, j, axis, dict_ids)
 
         slices[pl.ds(me, 1)] = mine[pl.ds(me, 1)]
         _wait_bytes_of(slices.at[pl.ds(0, n - 1)], recv_sem)
@@ -169,8 +189,15 @@ def _twoshot(x, rows, hidden, n, axis, rank, dict_ids, collective_id):
 
             @pl.when(jnp.int32(j) != me)
             def _(j=j):
-                _push(gathered.at[me], gathered.at[me], send2_sem, recv2_sem,
-                      j, axis, dict_ids)
+                _push(
+                    gathered.at[me],
+                    gathered.at[me],
+                    send2_sem,
+                    recv2_sem,
+                    j,
+                    axis,
+                    dict_ids,
+                )
 
         _wait_bytes_of(gathered.at[pl.ds(0, n - 1)], recv2_sem)
         for j in range(n):
@@ -178,38 +205,49 @@ def _twoshot(x, rows, hidden, n, axis, rank, dict_ids, collective_id):
         _wait_bytes_of(slices.at[pl.ds(0, n - 1)], send_sem)
         _wait_bytes_of(gathered.at[pl.ds(0, n - 1)], send2_sem)
 
-    return _call(kernel, x, rows, hidden, rank, [
-        pltpu.VMEM((n, rows, own), x.dtype),
-        pltpu.VMEM((n, rows, own), x.dtype),
-        pltpu.VMEM((n, rows, own), x.dtype),
-        pltpu.SemaphoreType.DMA,
-        pltpu.SemaphoreType.DMA,
-        pltpu.SemaphoreType.DMA,
-        pltpu.SemaphoreType.DMA,
-    ], collective_id, f"small_all_reduce_twoshot_r{rows}")
+    return _call(
+        kernel,
+        x,
+        rows,
+        hidden,
+        rank,
+        [
+            pltpu.VMEM((n, rows, own), x.dtype),
+            pltpu.VMEM((n, rows, own), x.dtype),
+            pltpu.VMEM((n, rows, own), x.dtype),
+            pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.DMA,
+        ],
+        collective_id,
+        f"small_all_reduce_twoshot_r{rows}",
+    )
 
 
 def _call(kernel, x, rows, hidden, rank, scratch, collective_id, name):
-    rank_specs = ([pl.BlockSpec(memory_space=pltpu.SMEM)]
-                  if rank is not None else [])
-    args = (() if rank is None else (rank.astype(jnp.int32), )) + (x, )
+    rank_specs = [pl.BlockSpec(memory_space=pltpu.SMEM)] if rank is not None else []
+    args = (() if rank is None else (rank.astype(jnp.int32),)) + (x,)
     return pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((rows, hidden), x.dtype),
         in_specs=rank_specs + [pl.BlockSpec()],
         scratch_shapes=scratch,
         compiler_params=pltpu.CompilerParams(collective_id=collective_id),
-        name=name)(*args)
+        name=name,
+    )(*args)
 
 
-def small_all_reduce(x,
-                     *,
-                     num_cores,
-                     axis="d",
-                     rank=None,
-                     dict_ids=None,
-                     form=None,
-                     collective_id=COLLECTIVE_ID):
+def small_all_reduce(
+    x,
+    *,
+    num_cores,
+    axis="d",
+    rank=None,
+    dict_ids=None,
+    form=None,
+    collective_id=COLLECTIVE_ID,
+):
     """The sum of `x` over the `num_cores` cores of mesh axis `axis`, inside a
     shard_map over that axis.
 
@@ -224,8 +262,9 @@ def small_all_reduce(x,
     """
     rows, hidden = x.shape
     if hidden % (num_cores * LANES):
-        raise ValueError(f"hidden {hidden} is not a multiple of "
-                         f"{num_cores} cores x {LANES} lanes")
+        raise ValueError(
+            f"hidden {hidden} is not a multiple of {num_cores} cores x {LANES} lanes"
+        )
     if dict_ids is None:
         dict_ids = rank is not None
     form = form or form_for(rows, hidden, jnp.dtype(x.dtype).itemsize)
@@ -233,5 +272,4 @@ def small_all_reduce(x,
         "oneshot": _oneshot,
         "twoshot": _twoshot,
     }[form]
-    return build(x, rows, hidden, num_cores, axis, rank, dict_ids,
-                 collective_id)
+    return build(x, rows, hidden, num_cores, axis, rank, dict_ids, collective_id)

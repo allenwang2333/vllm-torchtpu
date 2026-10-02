@@ -38,6 +38,7 @@ Numerics: each token selects the same experts with the same weights and
 runs the same expert weights; only the order the k expert contributions are
 summed in the combine can differ (rounding level).
 """
+
 import functools
 import json
 import re
@@ -51,8 +52,7 @@ _DATA: dict | None = None
 _DATA_PATH = ""
 _LOGGED: set[str] = set()
 _LAYER_RE = re.compile(r"layers\.(\d+)\.")
-_ROUTER_RE = re.compile(
-    r"\.mlp\.gate\.(weight|bias)$|e_score_correction_bias$")
+_ROUTER_RE = re.compile(r"\.mlp\.gate\.(weight|bias)$|e_score_correction_bias$")
 
 
 def _path() -> str:
@@ -78,7 +78,7 @@ def data() -> dict:
     primary permutation and optional copies."""
     global _DATA, _DATA_PATH
     path = _path()
-    if _DATA is None or _DATA_PATH != path:
+    if _DATA is None or path != _DATA_PATH:
         with open(path) as f:
             table = json.load(f)
         experts = int(table["experts"])
@@ -87,33 +87,35 @@ def data() -> dict:
         # a copies table: the first owned_per_core slots of every rank are a
         # permutation of the experts, the slots after them hold copies
         copies = bool(table.get("copies", False))
-        owned_n = int(table.get("owned_per_core",
-                                per_rank)) if copies else per_rank
+        owned_n = int(table.get("owned_per_core", per_rank)) if copies else per_rank
         if ranks * owned_n != experts or owned_n > per_rank:
             raise ValueError(
                 f"expert placement {path}: {ranks} ranks x {owned_n} owned slots "
-                f"must equal {experts} experts (slots per rank {per_rank})")
+                f"must equal {experts} experts (slots per rank {per_rank})"
+            )
         for n, layer in table["layers"].items():
             cores = layer["cores"]
             if len(cores) != ranks or any(len(c) != per_rank for c in cores):
                 raise ValueError(
                     f"expert placement {path}: layer {n} must list {ranks} "
-                    f"ranks x {per_rank} slots")
-            if sorted(e for c in cores
-                      for e in c[:owned_n]) != list(range(experts)):
+                    f"ranks x {per_rank} slots"
+                )
+            if sorted(e for c in cores for e in c[:owned_n]) != list(range(experts)):
                 raise ValueError(
                     f"expert placement {path}: layer {n} must hold every "
-                    "expert exactly once among the owned slots")
-            if copies and any(e in c[:owned_n] for c in cores
-                              for e in c[owned_n:]):
+                    "expert exactly once among the owned slots"
+                )
+            if copies and any(e in c[:owned_n] for c in cores for e in c[owned_n:]):
                 raise ValueError(
                     f"expert placement {path}: layer {n} holds an expert as a "
-                    "copy on the rank that owns it")
+                    "copy on the rank that owns it"
+                )
             if copies:
                 copy_slots = [e for c in cores for e in c[owned_n:]]
                 if any(e < 0 or e >= experts for e in copy_slots):
                     raise ValueError(
-                        f"expert placement: layer {n} has an invalid copy id")
+                        f"expert placement: layer {n} has an invalid copy id"
+                    )
                 if len(copy_slots) != len(set(copy_slots)):
                     raise ValueError(
                         f"expert placement: layer {n} allows at most one extra copy per expert"
@@ -121,9 +123,7 @@ def data() -> dict:
                 declared = layer.get("copies")
                 if isinstance(declared, dict):
                     actual = {
-                        str(e): r
-                        for r, c in enumerate(cores)
-                        for e in c[owned_n:]
+                        str(e): r for r, c in enumerate(cores) for e in c[owned_n:]
                     }
                     if declared != actual:
                         raise ValueError(
@@ -159,7 +159,7 @@ def cores(layer: int) -> list[list[int]]:
     return data()["layers"][str(layer)]["cores"]
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _local_ids(path: str, layer: int, rank: int) -> frozenset[int]:
     del path  # part of the key: a new table gives new sets
     return frozenset(cores(layer)[rank])
@@ -249,13 +249,18 @@ def permute_router_rows(name: str, tensor):
     if tensor.shape[0] != global_count():
         raise ValueError(
             f"expert placement: {name} has {tensor.shape[0]} rows, the table "
-            f"{global_count()} experts")
+            f"{global_count()} experts"
+        )
     import torch
+
     _log_once(
-        "router", "[expert placement] router rows reordered into the virtual "
-        f"order at load: {name} {tuple(tensor.shape)}")
-    return tensor[torch.tensor(order, dtype=torch.long,
-                               device=tensor.device)].contiguous()
+        "router",
+        "[expert placement] router rows reordered into the virtual "
+        f"order at load: {name} {tuple(tensor.shape)}",
+    )
+    return tensor[
+        torch.tensor(order, dtype=torch.long, device=tensor.device)
+    ].contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +284,7 @@ def install_model_patches() -> None:
     from vllm.model_executor.layers import fused_moe as fused_pkg
     from vllm.model_executor.layers.fused_moe import expert_map_manager as emm
     from vllm.model_executor.layers.fused_moe import layer as fused_layer
+
     if getattr(fused_layer, "_tpu_placement_patch", False):
         return
     original_factory = fused_layer.FusedMoEFactory
@@ -303,26 +309,31 @@ def install_model_patches() -> None:
             raise RuntimeError(
                 "expert placement: an expert map is computed outside the "
                 "layer factory (no layer prefix), so the placement cannot "
-                "be applied")
+                "be applied"
+            )
         if str(n) not in data()["layers"]:
             raise RuntimeError(
                 f"expert placement: the table has no layer {n} (prefix "
-                f"{_CURRENT_PREFIX})")
+                f"{_CURRENT_PREFIX})"
+            )
         if shards() != int(self.ep_size) or global_count() != int(
-                self.global_num_experts):
+            self.global_num_experts
+        ):
             raise ValueError(
                 f"expert placement: the table is for {shards()} ranks x "
                 f"{global_count()} experts; this layer has {self.ep_size} "
-                f"ranks x {self.global_num_experts}")
+                f"ranks x {self.global_num_experts}"
+            )
         rank = int(self.ep_rank)
         self._local_num_experts = slots() + self.num_fused_shared_experts
         self._expert_map = torch.tensor(expert_map(n, rank), dtype=torch.int32)
         if self._expert_mask is not None:
-            self._expert_mask = (self._expert_map
-                                 >= 0).to(self._expert_mask.dtype)
+            self._expert_mask = (self._expert_map >= 0).to(self._expert_mask.dtype)
         _log_once(
-            "map", f"[expert placement] {_path()}: layer {n} rank {rank} "
-            f"holds {slots()} slots; first slots {cores(n)[rank][:4]}")
+            "map",
+            f"[expert placement] {_path()}: layer {n} rank {rank} "
+            f"holds {slots()} slots; first slots {cores(n)[rank][:4]}",
+        )
 
     # the factory by every name it is already bound to (the package export
     # and any model module that imported it)
@@ -339,6 +350,7 @@ def install_model_patches() -> None:
     # whose per-rank iterator the streaming-loader patches install first).
     from vllm.model_executor.model_loader import default_loader as dl
     from vllm.model_executor.model_loader import runai_streamer_loader as rsl
+
     original_get_all = dl.DefaultModelLoader.get_all_weights
 
     def get_all_weights(self, model_config, model):

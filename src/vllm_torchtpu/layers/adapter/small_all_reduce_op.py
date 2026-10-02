@@ -22,6 +22,7 @@ rows whose width splits into whole lane tiles per core, and vLLM's all-reduce
 otherwise. The decision reads the tensor's shape, so the compile flow forks
 its traces by token bucket and every call of one trace takes the same form.
 """
+
 from typing import Any
 
 import jax
@@ -29,8 +30,12 @@ import torch
 from jax.sharding import PartitionSpec
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.ep_mesh import (EP_AXIS_NAME, build_ep_mesh,
-                                               ep_mesh_index, ep_rank_order)
+from vllm_torchtpu.distributed.ep_mesh import (
+    EP_AXIS_NAME,
+    build_ep_mesh,
+    ep_mesh_index,
+    ep_rank_order,
+)
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.collectives import small_all_reduce as sar
 from vllm_torchtpu.kernels.collectives import small_gather_scatter as sgs
@@ -64,25 +69,23 @@ def _build(mesh, form=None):
     spec = PartitionSpec(EP_AXIS_NAME)
 
     def body(block, rank):
-        return sar.small_all_reduce(block,
-                                    num_cores=n,
-                                    axis=EP_AXIS_NAME,
-                                    rank=rank,
-                                    form=form)
+        return sar.small_all_reduce(
+            block, num_cores=n, axis=EP_AXIS_NAME, rank=rank, form=form
+        )
 
     def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
         # x is the mesh-wide [n * rows, hidden]; each core's block is its shard
-        return jax.shard_map(body,
-                             mesh=mesh,
-                             in_specs=(spec, spec),
-                             out_specs=spec,
-                             check_vma=False)(x, rank)
+        return jax.shard_map(
+            body, mesh=mesh, in_specs=(spec, spec), out_specs=spec, check_vma=False
+        )(x, rank)
 
-    op = sharded_jax_op(OP_NAME,
-                        fn,
-                        mesh=mesh,
-                        input_partition_specs=(spec, spec),
-                        output_partition_specs=spec)
+    op = sharded_jax_op(
+        OP_NAME,
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec, spec),
+        output_partition_specs=spec,
+    )
 
     def _fake(x, rank):
         return torch.empty_like(x)
@@ -100,34 +103,42 @@ def _build_reduce_scatter(mesh):
     spec = PartitionSpec(EP_AXIS_NAME)
 
     def body(block, rank, my_rank, core_of_rank):
-        return sgs.small_reduce_scatter(block,
-                                        num_cores=n,
-                                        axis=EP_AXIS_NAME,
-                                        rank=rank,
-                                        my_rank=my_rank,
-                                        core_of_rank=core_of_rank)
+        return sgs.small_reduce_scatter(
+            block,
+            num_cores=n,
+            axis=EP_AXIS_NAME,
+            rank=rank,
+            my_rank=my_rank,
+            core_of_rank=core_of_rank,
+        )
 
-    def fn(x: jax.Array, rank: jax.Array, my_rank: jax.Array,
-           core_of_rank: jax.Array) -> jax.Array:
-        return jax.shard_map(body,
-                             mesh=mesh,
-                             in_specs=(spec, spec, spec, spec),
-                             out_specs=spec,
-                             check_vma=False)(x, rank, my_rank, core_of_rank)
+    def fn(
+        x: jax.Array, rank: jax.Array, my_rank: jax.Array, core_of_rank: jax.Array
+    ) -> jax.Array:
+        return jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(spec, spec, spec, spec),
+            out_specs=spec,
+            check_vma=False,
+        )(x, rank, my_rank, core_of_rank)
 
     def fake(x, rank, my_rank, core_of_rank):
         # in terms of the operands' shapes, symbolic or not: the caller's
         # batch dimension stays dynamic through the op
-        return torch.empty((x.shape[0] // n, x.shape[1]),
-                           dtype=x.dtype,
-                           device=x.device)
+        return torch.empty(
+            (x.shape[0] // n, x.shape[1]), dtype=x.dtype, device=x.device
+        )
 
-    return sharded_jax_op(OP_NAME + "_dp_reduce_scatter",
-                          fn,
-                          mesh=mesh,
-                          input_partition_specs=(spec, spec, spec, spec),
-                          output_partition_specs=spec,
-                          fake=fake)
+    op = sharded_jax_op(
+        OP_NAME + "_dp_reduce_scatter",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec, spec, spec, spec),
+        output_partition_specs=spec,
+    )
+    op.register_fake(fake)
+    return op
 
 
 def prebuild() -> bool:
@@ -144,14 +155,14 @@ def prebuild() -> bool:
         logger.info("small all-reduce refused: no expert-parallel group")
         return False
     n = mesh.shape[EP_AXIS_NAME]
-    _RANK = torch.tensor([ep_mesh_index()],
-                         dtype=torch.int32,
-                         device=torch.device("tpu"))
+    _RANK = torch.tensor(
+        [ep_mesh_index()], dtype=torch.int32, device=torch.device("tpu")
+    )
     form = envs.TPU_SMALL_ALL_REDUCE_FORM or None
     _OP = _build(mesh, form)
     _CORES = n
-    from vllm.distributed.parallel_state import (get_dp_group, get_ep_group,
-                                                 get_tp_group)
+    from vllm.distributed.parallel_state import get_dp_group, get_ep_group, get_tp_group
+
     _TP_IS_MESH = tuple(get_tp_group().ranks) == tuple(get_ep_group().ranks)
     # the data-parallel combine's reduce-scatter: this rank and the mesh
     # core of every rank (ep_rank_order gives the rank at each mesh index)
@@ -159,42 +170,60 @@ def prebuild() -> bool:
     order = ep_rank_order()
     rank_of_core = list(order) if order is not None else list(range(n))
     core_of_rank = [rank_of_core.index(r) for r in range(n)]
-    _MY_RANK = torch.tensor([int(get_dp_group().rank_in_group)],
-                            dtype=torch.int32,
-                            device=torch.device("tpu"))
-    _CORE_OF_RANK = torch.tensor(core_of_rank,
-                                 dtype=torch.int32,
-                                 device=torch.device("tpu"))
+    _MY_RANK = torch.tensor(
+        [int(get_dp_group().rank_in_group)],
+        dtype=torch.int32,
+        device=torch.device("tpu"),
+    )
+    _CORE_OF_RANK = torch.tensor(
+        core_of_rank, dtype=torch.int32, device=torch.device("tpu")
+    )
     _RS_OP = _build_reduce_scatter(mesh)
     from vllm.distributed.parallel_state import get_ep_group
-    _DP_COMBINE = (int(get_dp_group().world_size) == n
-                   and tuple(get_dp_group().ranks) == tuple(get_ep_group().ranks))
+
+    _DP_COMBINE = int(get_dp_group().world_size) == n and tuple(
+        get_dp_group().ranks
+    ) == tuple(get_ep_group().ranks)
     logger.info(
         "small all-reduce armed (cap %d rows, %d cores, mesh index %d, "
-        "tensor-parallel group is the mesh: %s): form %s", cap, n,
-        int(_RANK[0]), _TP_IS_MESH, form or
-        "by block size (one-shot up to %d bytes per core, two-shot above)" %
-        sar.ONE_SHOT_MAX_BYTES)
+        "tensor-parallel group is the mesh: %s): form %s",
+        cap,
+        n,
+        int(_RANK[0]),
+        _TP_IS_MESH,
+        form
+        or "by block size (one-shot up to %d bytes per core, two-shot above)"
+        % sar.ONE_SHOT_MAX_BYTES,
+    )
     logger.info(
         "data-parallel combine reduce-scatter %s (this rank %d, "
         "mesh core of each rank %s)",
         "armed" if _DP_COMBINE else "built, not this deployment's combine",
-        int(_MY_RANK[0]), core_of_rank)
+        int(_MY_RANK[0]),
+        core_of_rank,
+    )
     return True
 
 
 def eligible(x: torch.Tensor, group_size: int) -> bool:
-    return (_OP is not None and group_size == _CORES and x.dim() == 2
-            and x.shape[0] <= envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS
-            and x.shape[1] % (_CORES * sar.LANES) == 0
-            and x.dtype == torch.bfloat16)
+    return (
+        _OP is not None
+        and group_size == _CORES
+        and x.dim() == 2
+        and x.shape[0] <= envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS
+        and x.shape[1] % (_CORES * sar.LANES) == 0
+        and x.dtype == torch.bfloat16
+    )
 
 
 def all_reduce_tp(x: torch.Tensor) -> torch.Tensor:
     """The tensor-parallel all-reduce of x: the kernel for a small block when
     the tensor-parallel group is the mesh, vLLM's all-reduce otherwise."""
-    from vllm.distributed import (get_tensor_model_parallel_world_size,
-                                  tensor_model_parallel_all_reduce)
+    from vllm.distributed import (
+        get_tensor_model_parallel_world_size,
+        tensor_model_parallel_all_reduce,
+    )
+
     if _TP_IS_MESH and eligible(x, get_tensor_model_parallel_world_size()):
         return _OP(x, _RANK)
     return tensor_model_parallel_all_reduce(x)
@@ -203,6 +232,7 @@ def all_reduce_tp(x: torch.Tensor) -> torch.Tensor:
 def all_reduce_ep(x: torch.Tensor) -> torch.Tensor:
     """The expert-parallel group's all-reduce of x (the MoE combine)."""
     from vllm.distributed.parallel_state import get_ep_group
+
     group = get_ep_group()
     if eligible(x, int(group.world_size)):
         return _OP(x, _RANK)
@@ -219,10 +249,14 @@ def dp_combine(x: torch.Tensor):
     # Keep this compiled-forward path free of logging and global writes.
     # The cap counts output rows per rank. The gathered input has
     # _CORES times as many rows, all held in the kernel's VMEM scratch.
-    if (_RS_OP is None or not _DP_COMBINE or x.dim() != 2
-            or x.dtype != torch.bfloat16
-            or x.shape[1] % (_CORES * sar.LANES)
-            or x.shape[0] > _CORES * envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS):
+    if (
+        _RS_OP is None
+        or not _DP_COMBINE
+        or x.dim() != 2
+        or x.dtype != torch.bfloat16
+        or x.shape[1] % (_CORES * sar.LANES)
+        or x.shape[0] > _CORES * envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS
+    ):
         return None
     return _RS_OP(x, _RANK, _MY_RANK, _CORE_OF_RANK)
 
