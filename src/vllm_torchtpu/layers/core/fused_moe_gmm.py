@@ -655,6 +655,7 @@ def fused_moe_func(
         and rhs_quant_dtype is None
         and hidden_size % 256 == 0
         and (num_tokens * topk) % 16 == 0
+        and num_tokens >= 256
     ):
         logger.info_once("Selected fused permute + unpermute GMM MoE")
         if padded_hidden_size != hidden_size:
