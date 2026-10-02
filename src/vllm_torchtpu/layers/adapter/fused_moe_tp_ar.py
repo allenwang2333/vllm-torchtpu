@@ -34,8 +34,11 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 FUSED_MOE_TP_AR_OP_ATTR = "_fused_moe_tp_ar_op"
-_SHARED_ATTR = "_fused_moe_tp_ar_shared"
 _RUNNER_ARMED_ATTR = "_fused_moe_tp_ar_armed"
+# The shared expert's tensors become non-persistent buffers of the routed layer,
+# so they stay module state Dynamo traces like any weight (a tensor reached
+# through a plain attribute makes traces of the same graph disagree on inputs).
+_SHARED_BUFFERS = ("_ftp_ar_w1s", "_ftp_ar_s1s", "_ftp_ar_w2s", "_ftp_ar_s2s", "_ftp_ar_wg")
 
 # One exported program per distinct closure; the mesh never enters a traced
 # frame (ops are built at arming time and only looked up in forward).
@@ -130,12 +133,11 @@ def _shared_slice(runner) -> tuple | None:
     if getattr(gate, "bias", None) is not None or wg.dim() != 2 or wg.shape[0] != 1:
         return None
     return (
-        w1s,
-        s1s.reshape(1, -1).contiguous(),
-        w2s,
-        s2s.reshape(1, -1).contiguous(),
-        wg.reshape(-1, 1).contiguous(),
-        mlp,
+        w1s.data,
+        s1s.data.reshape(1, -1).contiguous(),
+        w2s.data,
+        s2s.data.reshape(1, -1).contiguous(),
+        wg.data.reshape(-1, 1).contiguous(),
     )
 
 
@@ -157,7 +159,7 @@ def _admit(runner, n_ranks: int) -> tuple | None:
     shared = _shared_slice(runner)
     if shared is None:
         return None
-    w1s, s1s, w2s, s2s, wg, _ = shared
+    w1s, s1s, w2s, s2s, wg = shared
     w1, w2 = layer.w13_weight, layer.w2_weight
     s1, s2 = layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
     e, h, two_i = w1.shape
@@ -206,9 +208,8 @@ def arm_fused_tp_ar(model: torch.nn.Module) -> int:
                 [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
             )
         setattr(runner._quant_method, FUSED_MOE_TP_AR_OP_ATTR, _build_op(mesh, n_ranks))
-        # A plain attribute, not a submodule: the shared MLP keeps its place in
-        # the module tree only through this reference once the runner drops it.
-        object.__setattr__(layer, _SHARED_ATTR, shared)
+        for name, tensor in zip(_SHARED_BUFFERS, shared):
+            layer.register_buffer(name, tensor, persistent=False)
         runner._shared_experts = None
         runner._forward_entry = runner._select_forward()
         object.__setattr__(runner, _RUNNER_ARMED_ATTR, True)
@@ -228,11 +229,18 @@ def fused_moe_tp_ar(quant_method: Any, layer: Any, x: torch.Tensor, topk_weights
     `decomposed()` computes the routed partial the usual way; it serves token
     counts above the cap, where the shared expert and the all-reduce run here.
     """
-    w1s, s1s, w2s, s2s, wg, mlp = getattr(layer, _SHARED_ATTR)
+    w1s, s1s, w2s, s2s, wg = (getattr(layer, name) for name in _SHARED_BUFFERS)
     if x.shape[0] > envs.MOE_FUSED_TP_AR_MAX_TOKENS:
         from vllm.distributed import tensor_model_parallel_all_reduce
 
-        return tensor_model_parallel_all_reduce(decomposed() + mlp(x))
+        from vllm_torchtpu.layers.adapter.linear_common import quantized_matmul
+
+        inter = w2s.shape[0]
+        gate_up = quantized_matmul(x, w1s, s1s.reshape(-1))
+        mid = torch.nn.functional.silu(gate_up[..., :inter]) * gate_up[..., inter:]
+        shared = quantized_matmul(mid, w2s, s2s.reshape(-1))
+        shared = torch.sigmoid(x @ wg) * shared
+        return tensor_model_parallel_all_reduce(decomposed() + shared)
     op = getattr(quant_method, FUSED_MOE_TP_AR_OP_ATTR)
     return op(
         x,

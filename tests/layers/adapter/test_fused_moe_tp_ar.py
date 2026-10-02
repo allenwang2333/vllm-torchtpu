@@ -70,7 +70,7 @@ def test_shared_slice_rejects_blockwise_and_biased_layouts():
         return SimpleNamespace(_shared_experts=SimpleNamespace(_layer=mlp))
 
     ok = bridge._shared_slice(runner())
-    assert ok is not None and tuple(ok[1].shape) == (1, 256) and tuple(ok[4].shape) == (1024, 1)
+    assert ok is not None and len(ok) == 5 and tuple(ok[1].shape) == (1, 256) and tuple(ok[4].shape) == (1024, 1)
     assert bridge._shared_slice(runner(scale_dim=4)) is None
     assert bridge._shared_slice(runner(gate_bias=torch.zeros(1))) is None
     assert bridge._shared_slice(SimpleNamespace(_shared_experts=None)) is None
