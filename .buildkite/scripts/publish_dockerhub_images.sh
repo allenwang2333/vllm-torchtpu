@@ -27,7 +27,8 @@ DATE="$(date +%Y%m%d)"
 # The vLLM the nightly tests ran against, set by bootstrap.sh.
 VLLM_COMMIT_HASH="$(buildkite-agent meta-data get "VLLM_COMMIT_HASH")"
 case "${BRANCH}" in
-  main)
+  # TODO(test-only): jefft/docker_image_ci added for a CI dry run. Remove before merging.
+  main|jefft/docker_image_ci)
     DATE_TAG="nightly-${DATE}-${BUILDKITE_COMMIT:0:7}-${VLLM_COMMIT_HASH:0:7}"
     LATEST_TAG="nightly"
     ;;
@@ -50,7 +51,7 @@ esac
 echo "--- Cleaning up old Docker images and cache"
 bash "${SCRIPT_DIR}/cleanup_docker.sh"
 
-IMAGE_NAME="${DOCKERHUB_REPO:?DOCKERHUB_REPO must be set in nightly_releases.yml}"
+IMAGE_NAME="${DOCKERHUB_REPO:?DOCKERHUB_REPO must be set in nightly_releases.yml}" # would be vllm/vllm-torchtpu I think
 DATE_IMAGE="${IMAGE_NAME}:${DATE_TAG}"
 LATEST_IMAGE="${IMAGE_NAME}:${LATEST_TAG}"
 
@@ -63,10 +64,13 @@ echo "--- :docker: Tagging as ${LATEST_IMAGE}"
 docker tag "${DATE_IMAGE}" "${LATEST_IMAGE}"
 
 echo "--- :docker: Pushing ${DATE_IMAGE} and ${LATEST_IMAGE} to Docker Hub"
-docker push "${DATE_IMAGE}"
-docker push "${LATEST_IMAGE}"
+# TODO(test-only): pushes disabled for a CI dry run. Restore before merging.
+# docker push "${DATE_IMAGE}"
+# docker push "${LATEST_IMAGE}"
+echo "[SIMULATED] docker push ${DATE_IMAGE}"
+echo "[SIMULATED] docker push ${LATEST_IMAGE}"
 
 echo "--- Cleaning up locally built image tags"
 docker rmi "${DATE_IMAGE}" "${LATEST_IMAGE}" || true
 
-echo "--- Successfully built and published ${DATE_IMAGE} and ${LATEST_IMAGE}"
+echo "--- [SIMULATED] Successfully built and published ${DATE_IMAGE} and ${LATEST_IMAGE}"
