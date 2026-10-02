@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_TOPK_CAP: int = 512
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_MLA_CAPPED_PREP: bool = False
+    TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -383,6 +384,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # overflows `TPU_DCP_MLA_TOPK_CAP`), instead of a full-width page
     # translation plus a per-chunk window-major copy. Same gathered rows.
     "TPU_DCP_MLA_CAPPED_PREP": env_bool("TPU_DCP_MLA_CAPPED_PREP", default=False),
+    # DCP sparse MLA kernel I/O (`sparse_ragged_paged_attention(q_pe=...,
+    # lse_lane_dense=True)`): hand q_nope and q_pe to the kernel as separate
+    # operands (it joins them in VMEM; the output aliases q_nope, 512 wide)
+    # instead of materialising a padded [T, H, 640] concat, and export the
+    # log-sum-exp as a lane-dense f32[T, H] instead of f32[T, H, 1], whose
+    # lane-padded tiles cost a broadcast init, a relayout copy and padded
+    # copies through the LSE merge. Bit-identical outputs.
+    "TPU_DCP_MLA_SPLIT_Q_LSE": env_bool("TPU_DCP_MLA_SPLIT_Q_LSE", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per

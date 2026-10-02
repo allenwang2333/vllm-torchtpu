@@ -357,7 +357,19 @@ def _attention_kernel(
     packed_bkv: int | None = None,
     tok_off_ref=None,
     capped_windows: int | None = None,
+    split_q: bool = False,
+    lse_lane_dense: bool = False,
 ):
+    # Split-q mode (`split_q`): `q_hbm_ref` holds q_nope only and the rope
+    # part arrives as a separate input `q_pe_hbm_ref` (first of `refs`), with
+    # its own VMEM double buffer (last scratch ref). The two are joined and
+    # zero-padded in VMEM, so the scores see exactly the operand the caller's
+    # concat used to build. The output is q_nope's width and aliases it.
+    #
+    # Lane-dense lse (`lse_lane_dense`): `lse_hbm_ref` is f32[tokens, heads]
+    # and the blse buffer f32[2, bsz, heads]; each token's [heads, 1] column
+    # is moved to a row exactly (a masked max) before it is stored.
+    #
     # Packed mode (`packed_bkv` set, SparseCore layout only): the gathered
     # buffers are one flat stream of 64-row atoms per chunk, token t's live
     # rows starting at `tok_off_ref[t]`; each token reads one `packed_bkv`-row
@@ -371,6 +383,12 @@ def _attention_kernel(
     # exactly like the uncapped path. Tokens with more than `bkv_sz` live rows
     # are recomputed over all their windows by an online-softmax fix-up with
     # double-buffered window DMAs (two-slot scratch trails the usual scratch).
+    q_pe_hbm_ref = None
+    bq_pe_x2_ref = None
+    if split_q:
+        q_pe_hbm_ref = refs[0]  # [max_num_tokens, num_q_heads, rope_dim]
+        bq_pe_x2_ref = refs[-1]  # [2, bsz, num_q_heads, rope_dim]
+        refs = refs[1:-1]
     fix_refs = None
     if packed_bkv is not None or capped_windows is not None:
         assert sparsecore_layout
@@ -405,6 +423,10 @@ def _attention_kernel(
     assert q_hbm_ref.shape == o_hbm_ref.shape
 
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
+    # Width of the stored output (q_nope's in split-q mode, else head_dim).
+    o_dim = head_dim
+    if split_q:
+        head_dim = align_to(head_dim + q_pe_hbm_ref.shape[-1], 128)
     nope_dim = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     assert kv_lens_ref.shape[0] == num_tokens
     if packed_bkv is not None:
@@ -569,8 +591,21 @@ def _attention_kernel(
                 sem,
                 wait,
             )
+            if split_q:
+                # Same semaphore; the waits below mirror both starts.
+                _async_copy(
+                    q_pe_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
+                    bq_pe_x2_ref.at[bq_sem_idx, :],
+                    sem,
+                    wait,
+                )
         else:
             _async_copy(src=bq_vmem_ref, dst=bq_vmem_ref, sem=sem, wait=True)
+            if split_q:
+                bq_pe_vmem_ref = bq_pe_x2_ref.at[bq_sem_idx, :]
+                _async_copy(
+                    src=bq_pe_vmem_ref, dst=bq_pe_vmem_ref, sem=sem, wait=True
+                )
 
     def _send_bo_batch(seq_idx_start, bo_sem_idx, *, wait=False):
         sem = sems.at[2, bo_sem_idx]
@@ -632,7 +667,35 @@ def _attention_kernel(
 
     def load_bq(bq_sem_idx, batch_idx):
         q = bq_x2_ref.at[bq_sem_idx, batch_idx][...]
+        if split_q:
+            # The caller's concat + zero pad, rebuilt in VMEM.
+            q = jnp.concatenate([q, bq_pe_x2_ref.at[bq_sem_idx, batch_idx][...]], -1)
+            if q.shape[-1] < head_dim:
+                q = jnp.pad(q, ((0, 0), (0, head_dim - q.shape[-1])))
         return q
+
+    def store_blse(bo_sem_idx, batch_idx, lse_col):
+        """Stores one token's f32[num_q_heads, 1] log-sum-exp column."""
+        if not lse_lane_dense:
+            blse_x2_ref.at[bo_sem_idx, batch_idx][...] = lse_col
+            return
+        # Heads from sublanes to lanes, exactly: each column of the masked
+        # [heads, heads] tile holds one live entry, the rest -inf.
+        eye_shape = (num_q_heads, num_q_heads)
+        eye = lax.broadcasted_iota(jnp.int32, eye_shape, 0) == (
+            lax.broadcasted_iota(jnp.int32, eye_shape, 1)
+        )
+        row = jnp.max(
+            jnp.where(eye, jnp.broadcast_to(lse_col, eye_shape), -jnp.inf),
+            axis=0,
+            keepdims=True,
+        )
+        tile_ref = blse_x2_ref.at[bo_sem_idx]  # [bsz, num_q_heads]
+        if isinstance(batch_idx, int):
+            tile_ref[pl.ds(batch_idx, 1), :] = row
+        else:
+            pick = lax.broadcasted_iota(jnp.int32, tile_ref.shape, 0) == batch_idx
+            tile_ref[...] = jnp.where(pick, row, tile_ref[...])
 
     def load_bkv(bkv_sem_idx, batch_idx):
         return unpack_bkv(
@@ -695,7 +758,7 @@ def _attention_kernel(
             @pl.when(kv_len > bkv_sz)
             def _fix():
                 off = tok_off_ref[seq_idx]
-                q = bq_x2_ref.at[bi_sem_idx, batch_idx][...]
+                q = load_bq(bi_sem_idx, batch_idx)
                 fix_m_ref[...] = jnp.full(fix_m_ref.shape, f32_min, jnp.float32)
                 fix_l_ref[...] = jnp.zeros(fix_l_ref.shape, jnp.float32)
                 fix_acc_ref[...] = jnp.zeros(fix_acc_ref.shape, jnp.float32)
@@ -759,11 +822,11 @@ def _attention_kernel(
                     if q_dtype == jnp.float32
                     else (pv * pl.reciprocal(l_sum, approx=True)).astype(q_dtype)
                 )
-                bo_x2_ref.at[bo_sem_idx, batch_idx][...] = out
+                bo_x2_ref.at[bo_sem_idx, batch_idx][...] = out[:, :o_dim]
                 if return_lse:
-                    blse_x2_ref.at[bo_sem_idx, batch_idx][...] = fix_m_ref[
-                        ...
-                    ] + jnp.log(l_sum)
+                    store_blse(
+                        bo_sem_idx, batch_idx, fix_m_ref[...] + jnp.log(l_sum)
+                    )
 
             return carry
 
@@ -828,7 +891,7 @@ def _attention_kernel(
                 num_windows = cdiv(kv_len, bkv_sz)
                 for cp in window_copies(local_idx, 1, 1):
                     cp.start()
-                q = bq_x2_ref.at[bi_sem_idx, batch_idx][...]
+                q = load_bq(bi_sem_idx, batch_idx)
                 fix_m_ref[...] = jnp.full(fix_m_ref.shape, f32_min, jnp.float32)
                 fix_l_ref[...] = jnp.zeros(fix_l_ref.shape, jnp.float32)
                 fix_acc_ref[...] = jnp.zeros(fix_acc_ref.shape, jnp.float32)
@@ -869,11 +932,11 @@ def _attention_kernel(
                     if q_dtype == jnp.float32
                     else (pv * pl.reciprocal(l_sum, approx=True)).astype(q_dtype)
                 )
-                bo_x2_ref.at[bo_sem_idx, batch_idx][...] = out
+                bo_x2_ref.at[bo_sem_idx, batch_idx][...] = out[:, :o_dim]
                 if return_lse:
-                    blse_x2_ref.at[bo_sem_idx, batch_idx][...] = fix_m_ref[
-                        ...
-                    ] + jnp.log(l_sum)
+                    store_blse(
+                        bo_sem_idx, batch_idx, fix_m_ref[...] + jnp.log(l_sum)
+                    )
 
             return carry
 
@@ -912,7 +975,7 @@ def _attention_kernel(
             # o = sum_r softmax(lse_r) * o_r without knowing our max.
             if not return_lse:
                 return
-            blse_x2_ref.at[bo_sem_idx, batch_idx][...] = m + jnp.log(l_sum)
+            store_blse(bo_sem_idx, batch_idx, m + jnp.log(l_sum))
 
         # Wait for cur blocks if not ready yet
         wait_fetch_bq_batch(batch_start_seq_idx, bi_sem_idx)
@@ -950,7 +1013,7 @@ def _attention_kernel(
                 out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
 
                 # Store output from acc to bo.
-                bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out
+                bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out[:, :o_dim]
                 write_blse(batch_idx - 1, prev_m, prev_l_sum)
                 prev_out = out
 
@@ -961,7 +1024,7 @@ def _attention_kernel(
 
         # end of pipelining loop
         out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
-        bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out
+        bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out[:, :o_dim]
         write_blse(batch_size - 1, prev_m, prev_l_sum)
         if packed_bkv is not None:
             fixup_overflow_tokens(bi_sem_idx, bo_sem_idx)
@@ -1181,6 +1244,7 @@ def prepare_outputs(
         "packed_chunk_tokens",
         "topk_cap",
         "capped_window_prep",
+        "lse_lane_dense",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -1218,6 +1282,8 @@ def sparse_ragged_paged_attention(
     packed_chunk_tokens: int = DEFAULT_PACKED_CHUNK_TOKENS,
     topk_cap: int | None = None,
     capped_window_prep: bool = False,
+    q_pe: jax.Array | None = None,
+    lse_lane_dense: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1294,6 +1360,16 @@ def sparse_ragged_paged_attention(
         chunk's live windows` only (`prepare_capped_window_indices`), instead
         of a full-width `prepare_gather_indices` plus a per-chunk transpose.
         The gathered rows are identical; otherwise ignored.
+      q_pe: Split-q mode. `q` is then q_nope only, `[max_num_tokens,
+        num_q_heads, nope]` with `nope` a multiple of 128 and `num_q_heads` a
+        multiple of the dtype packing, and `q_pe` `[max_num_tokens,
+        num_q_heads, rope]` its rope part. The kernel joins them in VMEM
+        instead of the caller materialising a padded concat; the output
+        aliases q_nope and is `nope` wide (the value part only). Same scores
+        and output values.
+      lse_lane_dense: With `return_lse`, carry the log-sum-exp as f32[tokens,
+        heads] through the kernel instead of f32[tokens, heads, 1] (lane-padded
+        tiles). Same values.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -1354,7 +1430,19 @@ def sparse_ragged_paged_attention(
 
     _, actual_num_q_heads, actual_head_dim = q.shape
 
-    q = prepare_q_inputs(q)  # [max_num_tokens, num_q_heads, head_dim]
+    if q_pe is not None:
+        if q_pe.shape[:2] != q.shape[:2] or q_pe.dtype != q.dtype:
+            raise ValueError(
+                f"q_pe {q_pe.shape}/{q_pe.dtype} must match q_nope "
+                f"{q.shape}/{q.dtype} in tokens, heads and dtype"
+            )
+        if actual_head_dim % 128 or actual_num_q_heads % get_dtype_packing(q.dtype):
+            raise ValueError(
+                "split q needs a 128-multiple nope dim and packed heads, got "
+                f"{q.shape}"
+            )
+    else:
+        q = prepare_q_inputs(q)  # [max_num_tokens, num_q_heads, head_dim]
 
     page_size = cache_kv_nope.shape[1]
 
@@ -1434,7 +1522,11 @@ def sparse_ragged_paged_attention(
     # instead of tripping on uninitialised memory.
     lse = (
         jnp.full(
-            (q.shape[0], num_q_heads, 1), jnp.finfo(jnp.float32).min, dtype=jnp.float32
+            (q.shape[0], num_q_heads)
+            if lse_lane_dense
+            else (q.shape[0], num_q_heads, 1),
+            jnp.finfo(jnp.float32).min,
+            dtype=jnp.float32,
         )
         if return_lse
         else None
@@ -1510,6 +1602,8 @@ def sparse_ragged_paged_attention(
                 ]
             ),
             topk=topk,
+            q_pe=q_pe,
+            lse_lane_dense=lse_lane_dense,
         )
         if return_lse:
             q, lse = result
@@ -1519,6 +1613,8 @@ def sparse_ragged_paged_attention(
     # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     out = prepare_outputs(q, actual_num_q_heads, actual_head_dim)
     if return_lse:
+        if lse_lane_dense:
+            return out, lse[:, :actual_num_q_heads]
         return out, lse[:, :actual_num_q_heads, 0]
     return out
 
@@ -1610,6 +1706,8 @@ def sparse_attention_chunk(
     topk_cap: int | None = None,
     window_indices: jax.Array | None = None,
     topk: int | None = None,
+    q_pe: jax.Array | None = None,
+    lse_lane_dense: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1632,6 +1730,11 @@ def sparse_attention_chunk(
     `window_indices` (with `topk_cap`; from `prepare_capped_window_indices`)
     is that window-major index array prebuilt for this chunk, in which case
     `physical_indices` may be None and `topk` must be given.
+
+    `q_pe` (split-q): `q` is q_nope `[max_num_tokens, num_q_heads, nope]`
+    (unpadded, nope a multiple of 128) and `q_pe` its rope part; the kernel
+    joins them in VMEM and the output (aliasing `q`) is `nope` wide.
+    `lse_lane_dense`: `lse` is f32[max_num_tokens, num_q_heads].
     """
     return_lse = lse is not None
     if topk is None:
@@ -1651,6 +1754,9 @@ def sparse_attention_chunk(
     if preserve_suffix and (return_lse or sparsecore_layout):
         raise ValueError("Prefix stores require TensorCore caches without LSE")
     _, num_q_heads, head_dim = q.shape
+    split_q = q_pe is not None
+    if split_q:
+        head_dim = align_to(head_dim + q_pe.shape[-1], 128)
     chunk_size = end_pos - start_pos
     capped_windows = None if topk_cap is None else topk // topk_cap
 
@@ -1673,6 +1779,8 @@ def sparse_attention_chunk(
             pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_nope
             pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_rope
         ]
+        if split_q:
+            in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # q_pe
 
         out_specs = pl.BlockSpec(memory_space=pltpu.HBM)  # o
         # Each chunk writes only its own token rows, so -- exactly like `q` --
@@ -1703,7 +1811,7 @@ def sparse_attention_chunk(
         )
 
         bq_double_buf = pltpu.VMEM(
-            (2, batch_size, num_q_heads, head_dim),
+            (2, batch_size, num_q_heads, q.shape[-1]),
             q.dtype,
         )
 
@@ -1717,7 +1825,12 @@ def sparse_attention_chunk(
         ]
         if return_lse:
             scratch_shapes.append(
-                pltpu.VMEM((2, batch_size, num_q_heads, 1), jnp.float32)
+                pltpu.VMEM(
+                    (2, batch_size, num_q_heads)
+                    if lse_lane_dense
+                    else (2, batch_size, num_q_heads, 1),
+                    jnp.float32,
+                )
             )
         # Semaphores for double buffering of bkv_nope, bq, bo, bkv_rope
         # (+ blse when the log-sum-exp is exported).
@@ -1744,6 +1857,11 @@ def sparse_attention_chunk(
                 pltpu.VMEM((num_q_heads, head_dim), jnp.float32),
                 pltpu.SemaphoreType.DMA((2,)),
             ]
+        if split_q:
+            # q_pe double buffer; always the last scratch ref.
+            scratch_shapes.append(
+                pltpu.VMEM((2, batch_size, num_q_heads, q_pe.shape[-1]), q_pe.dtype)
+            )
 
         bounds = [start_seq_idx, end_seq_idx]
         if preserve_suffix:
@@ -1763,6 +1881,8 @@ def sparse_attention_chunk(
             return_lse=return_lse,
             sparsecore_layout=sparsecore_layout,
             capped_windows=capped_windows,
+            split_q=split_q,
+            lse_lane_dense=lse_lane_dense,
         )
         if packed is not None:
             # Fourth scalar prefetch: per-token atom offset into the stream.
@@ -1810,7 +1930,7 @@ def sparse_attention_chunk(
                 input_output_aliases=(
                     {
                         num_prefetch: 0,
-                        num_prefetch + 3: 1,
+                        num_prefetch + 3 + int(split_q): 1,
                     }
                     if return_lse
                     else {
@@ -1823,6 +1943,8 @@ def sparse_attention_chunk(
             )
         )
         operands = [q, cache_kv_nope, cache_kv_rope]
+        if split_q:
+            operands.append(q_pe)
         if return_lse:
             operands.append(lse)
         return kernel(*scalar_prefetches, *operands)
