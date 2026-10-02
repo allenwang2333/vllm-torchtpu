@@ -1002,19 +1002,20 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
     @parameterized.product(
         (
             # MTP decode buckets: q=4 per request, 1-4 requests.
-            {"query_tokens": 16, "seq_q": (4,)},
-            {"query_tokens": 16, "seq_q": (4, 4)},
-            {"query_tokens": 16, "seq_q": (4, 4, 4, 4)},
+            {"query_tokens": 16, "seq_q": (4,), "prep": True},
+            {"query_tokens": 16, "seq_q": (4, 4), "prep": True},
+            {"query_tokens": 16, "seq_q": (4, 4, 4, 4), "prep": True},
             # Drafter passes: one token per request.
-            {"query_tokens": 16, "seq_q": (1,)},
-            {"query_tokens": 16, "seq_q": (1, 1)},
-            # A bucket the cap does not divide (largest divisor <= cap).
-            {"query_tokens": 12, "seq_q": (4, 4, 1)},
+            {"query_tokens": 16, "seq_q": (1,), "prep": True},
+            {"query_tokens": 16, "seq_q": (1, 1), "prep": True},
+            # A bucket the cap does not divide (largest divisor <= cap). The
+            # window-major prep kernel needs 8-row blocks, so per-chunk prep.
+            {"query_tokens": 12, "seq_q": (4, 4, 1), "prep": False},
         ),
         small_chunk_batch_size=(2, 4, 8, 16),
     )
     def test_small_chunk_batch_size_matches_one_token_steps(
-        self, query_tokens, seq_q, small_chunk_batch_size
+        self, query_tokens, seq_q, prep, small_chunk_batch_size
     ):
         """TPU_DCP_MLA_SMALL_CHUNK_BATCH against the 1-token grid step.
 
@@ -1048,7 +1049,7 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                 cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
                 gather_and_attention_chunk_size=256,
                 topk_cap=512,
-                capped_window_prep=True,
+                capped_window_prep=prep,
                 lse_lane_dense=True,
                 q_pe=q_pe,
                 small_chunk_batch_size=batch,
