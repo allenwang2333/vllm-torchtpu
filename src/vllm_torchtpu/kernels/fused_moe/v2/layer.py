@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -36,6 +37,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     build_routing_tables,
     build_routing_tables_sharded,
     expert_visit_list,
+    gather_clamp_bounds,
     local_slab_rows,
     pair_block_hist,
     pow2_shift,
@@ -230,6 +232,27 @@ def _dead_rows(gating):
 # lose ~90 us of cover to buy a ~129 us hoist and only the largest shape's
 # plan is long enough to pay for it.
 AGQ_MIN_LOCAL_TOKENS = 1024
+
+_SCATTER_1D = lax.ScatterDimensionNumbers(
+    update_window_dims=(), inserted_window_dims=(0,), scatter_dims_to_operand_dims=(0,)
+)
+
+
+def _scatter_add_nonneg(n, rows, updates):
+    """zeros(n).at[rows].add(updates, mode="drop") for rows known to be >= 0.
+
+    XLA's scatter skips out-of-range updates natively, so this is the same
+    result without the negative-index normalisation jnp emits.
+    """
+    return lax.scatter_add(
+        jnp.zeros((n,), jnp.int32),
+        rows[:, None],
+        updates,
+        _SCATTER_1D,
+        indices_are_sorted=False,
+        unique_indices=False,
+        mode=lax.GatherScatterMode.FILL_OR_DROP,
+    )
 
 # Per-config cache of the shard_map'd MoE callable; a fresh shard_map
 # body would re-trace the whole kernel for every hidden layer.
@@ -606,9 +629,24 @@ def fused_ep_moe_v2(
         # either way; only the queue moves.
         if t_local >= AGQ_MIN_LOCAL_TOKENS:
             slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
-        token_gather = shard_token_gather(
-            routing, me, shard_stride=ragged_stride, rows=slab_row
-        )
+        # The slab rows are never negative (local_slab_rows), so the scatters
+        # may skip jnp's negative-index normalisation, which otherwise sits
+        # behind the barrier above, after the token all-gather completes.
+        scatter_nonneg = envs.MOE_FUSED_EP_V2_SCATTER_NONNEG
+        if scatter_nonneg:
+            token_of_pair = jnp.broadcast_to(
+                jnp.arange(T, dtype=jnp.int32)[:, None], (T, topk)
+            ).reshape(-1)
+            gather_lo, gather_hi = gather_clamp_bounds(T)
+            token_gather = jnp.clip(
+                _scatter_add_nonneg(ragged_stride, slab_row, token_of_pair),
+                jnp.int32(gather_lo),
+                jnp.int32(gather_hi),
+            )
+        else:
+            token_gather = shard_token_gather(
+                routing, me, shard_stride=ragged_stride, rows=slab_row
+            )
         # The kernel DMA-aligns each logical expert window down by as much as
         # 127 int32 rows and always copies a full fixed window. Pad after the
         # scatter (rather than enlarging its destination) so the off-shard
@@ -632,12 +670,19 @@ def fused_ep_moe_v2(
         if form.quantized_activations:
             scale_bits = jnp.repeat(scale_bits_g, topk)
             scale_rows = act_scale_slab_rows(ragged_stride)
-            scale_slab = lax.bitcast_convert_type(
-                jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
-                .at[slab_row]
-                .add(scale_bits, mode="drop"),
-                jnp.float32,
-            ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
+            if scatter_nonneg:
+                scale_flat = _scatter_add_nonneg(
+                    scale_rows * HIDDEN_LANE_BLOCK, slab_row, scale_bits
+                )
+            else:
+                scale_flat = (
+                    jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
+                    .at[slab_row]
+                    .add(scale_bits, mode="drop")
+                )
+            scale_slab = lax.bitcast_convert_type(scale_flat, jnp.float32).reshape(
+                scale_rows, HIDDEN_LANE_BLOCK
+            )
         else:
             scale_slab = None
         expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)

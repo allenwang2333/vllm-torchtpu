@@ -299,6 +299,164 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
     logger.info("Applied TPU patch: the fused EP MoE output is pre-reduced.")
 
 
+_SHARED_EXPERT_BARRIER_OP = None
+
+
+def _shared_expert_barrier(t):
+    """Identity on ``t`` that XLA may not fuse across (``optimization_barrier``)."""
+    return _shared_expert_barrier_op()(t)
+
+
+def _shared_expert_barrier_op():
+    global _SHARED_EXPERT_BARRIER_OP
+    if _SHARED_EXPERT_BARRIER_OP is None:
+        import jax
+        import torch
+        from torch_tpu._internal import pallas
+
+        def _barrier_jax(x: jax.Array) -> jax.Array:
+            return jax.lax.optimization_barrier(x)
+
+        op = pallas.jax_op("tpu::shared_expert_ag_window_barrier", _barrier_jax)
+        op.register_fake(lambda x: torch.empty_like(x))
+        _SHARED_EXPERT_BARRIER_OP = op
+    return _SHARED_EXPERT_BARRIER_OP
+
+
+def _patch_moe_runner_shared_expert_ag_window() -> None:
+    """Fence the shared-expert output of an armed fused-EP layer (probes 43/44).
+
+    Without a fence XLA output-fuses the shared down-proj into the add +
+    RMSnorm after the routed combine, so it runs after the fused EP kernel.
+    Behind ``optimization_barrier`` it is a standalone dot that the
+    latency-hiding scheduler places under the token all-gather (verified in
+    the 2x2x2 and 2x2x1 compiled schedules).
+
+    MOE_SHARED_EXPERT_AG_WINDOW=1 (C1) fences the shared output: same sum,
+    only the fusion boundary moves. =2 (C1b) also moves the residual add under
+    the all-gather: the armed DeepseekV2 decoder layer returns
+    ``(routed, barrier(shared + residual))`` as its ``(hidden, residual)``
+    pair, so the next layer's fused add + RMSnorm computes ``routed + (shared
+    + residual)`` and reads one tensor fewer (reassociated bf16 sum). Default
+    0: nothing is installed.
+    """
+    mode = envs.MOE_SHARED_EXPERT_AG_WINDOW
+    if not (envs.USE_MOE_FUSED_EP_KERNEL and mode):
+        return
+
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as _mr
+
+    if getattr(_mr.MoERunner, "_tpu_shared_expert_ag_window_patch", False):
+        return
+    # Build the jax_op now, outside any trace: created lazily on its first call it
+    # would be created inside the torch.compile trace, where Dynamo graph-breaks
+    # (probe 44 saw Dynamo refuse the analogous lazy, lock-guarded
+    # linear_common._get_quantized_matmul_op on a first call under fullgraph).
+    _shared_expert_barrier_op()
+    original = _mr.MoERunner._apply_quant_method
+    original_init = _mr.MoERunner.__init__
+
+    def __init__(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        # [parts, requested]: the C1b decoder layer asks for the (shared, routed)
+        # pair through this slot. List mutation, as upstream SharedExperts does,
+        # so the hand-off traces under torch.compile.
+        self._tpu_c1b_slot = [None, False]
+
+    def _apply_quant_method(self, *args, **kwargs):
+        shared_out, fused_out = original(self, *args, **kwargs)
+        if shared_out is None:
+            return shared_out, fused_out
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+
+        if not fused_moe_ep_supported(getattr(self, "_quant_method", None)):
+            return shared_out, fused_out
+        slot = getattr(self, "_tpu_c1b_slot", None)
+        if mode == 2 and slot is not None and slot[1]:
+            # The decoder layer fences (shared + residual) itself.
+            slot[0] = (shared_out, fused_out[..., : shared_out.shape[-1]])
+            return shared_out, fused_out
+        return _shared_expert_barrier(shared_out), fused_out
+
+    _mr.MoERunner.__init__ = __init__
+    _mr.MoERunner._apply_quant_method = _apply_quant_method
+    _mr.MoERunner._tpu_shared_expert_ag_window_patch = True
+    if mode == 2:
+        _patch_deepseek_v2_decoder_c1b(_mr)
+    logger.info(
+        "Applied TPU patch: shared-expert output fenced into the token AG window "
+        "(mode %d).",
+        mode,
+    )
+
+
+def _c1b_runner(layer, hidden_states):
+    """The layer's MoERunner if C1b can take this layer, else None.
+
+    C1b hands back the runner's (shared, routed) pair before the runner's own
+    post-processing, so it is taken only where that post-processing is the
+    identity: bf16, no sequence-parallel MoE, TP world 1 (fused EP refuses
+    TP > 1 anyway), no routed output transform, no zero-expert router.
+    """
+    mlp = getattr(layer, "mlp", None)
+    runner = getattr(mlp, "experts", None)
+    if runner is None or getattr(runner, "_tpu_c1b_slot", None) is None:
+        return None
+    if getattr(runner, "shared_experts", None) is None:
+        return None
+    import torch
+
+    if hidden_states.dtype != torch.bfloat16:
+        return None
+    if getattr(layer, "use_sequence_parallel_moe", False):
+        return None
+    if getattr(runner, "routed_output_transform", None) is not None:
+        return None
+    if type(getattr(runner, "router", None)).__name__ == "ZeroExpertRouter":
+        return None
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    if get_tensor_model_parallel_world_size() != 1:
+        return None
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+
+    if not fused_moe_ep_supported(getattr(runner, "_quant_method", None)):
+        return None
+    return runner
+
+
+def _patch_deepseek_v2_decoder_c1b(_mr) -> None:
+    from vllm.model_executor.models import deepseek_v2 as _ds
+
+    cls = _ds.DeepseekV2DecoderLayer
+    if getattr(cls, "_tpu_c1b_patch", False):
+        return
+    original = cls.forward
+
+    def forward(self, positions, hidden_states, residual, llama_4_scaling=None):
+        runner = _c1b_runner(self, hidden_states)
+        if runner is None:
+            return original(self, positions, hidden_states, residual, llama_4_scaling)
+        slot = runner._tpu_c1b_slot
+        slot[1] = True
+        _unused_sum, residual_out = original(
+            self, positions, hidden_states, residual, llama_4_scaling
+        )
+        parts = slot[0]
+        slot[0] = None
+        slot[1] = False
+        if parts is None:  # the runner did not take the split (not armed)
+            return _unused_sum, residual_out
+        shared, routed = parts
+        # (hidden, residual) = (routed, shared + residual): the next layer's
+        # fused add + RMSnorm forms routed + (shared + residual). The runner's
+        # own shared + routed sum is dead and leaves the program.
+        return routed, _shared_expert_barrier(shared + residual_out)
+
+    cls.forward = forward
+    cls._tpu_c1b_patch = True
+
+
 def _patch_moe_explicit_pcp_collectives() -> None:
     """Give each PCP MoE implementation exactly one collective owner.
 

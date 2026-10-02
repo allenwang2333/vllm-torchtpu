@@ -64,6 +64,7 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_expert_map_host_lookup", _ACTIVE),
     Patch("vllm_torchtpu:_patch_moe_explicit_pcp_collectives", _ACTIVE),
     Patch("vllm_torchtpu:_patch_moe_runner_fused_output_is_reduced", _ACTIVE),
+    Patch("vllm_torchtpu:_patch_moe_runner_shared_expert_ag_window", _ACTIVE),
     # KV cache, scheduling, and offloading.
     Patch(
         "vllm_torchtpu:_patch_vllm_hybrid_pcp_block_sizes",

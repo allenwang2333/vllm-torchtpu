@@ -78,6 +78,8 @@ if TYPE_CHECKING:
     VLLM_TPU_EPLB: bool = False
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    MOE_SHARED_EXPERT_AG_WINDOW: int = 0
+    MOE_FUSED_EP_V2_SCATTER_NONNEG: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -202,6 +204,17 @@ def env_with_choices(
 
 _TRUE_STRINGS = ("true", "1", "yes", "on")
 _FALSE_STRINGS = ("false", "0", "no", "off")
+
+
+def _shared_expert_ag_window_mode() -> int:
+    raw = (os.getenv("MOE_SHARED_EXPERT_AG_WINDOW", "0") or "0").strip().lower()
+    if raw in ("0", "false", "off", "no"):
+        return 0
+    if raw in ("1", "true", "on", "yes"):
+        return 1
+    if raw == "2":
+        return 2
+    raise ValueError(f"MOE_SHARED_EXPERT_AG_WINDOW must be 0, 1 or 2, got {raw!r}")
 
 
 def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
@@ -684,6 +697,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE": lambda: int(
         os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0
     ),
+    # Experiment (probe 43, default off): pass the shared-expert output of a
+    # fused-EP MoE layer through an optimization_barrier. Without it XLA
+    # output-fuses the shared down-proj into the post-combine add + RMSnorm,
+    # so it runs after the routed kernel; behind the barrier it is a
+    # standalone dot the scheduler places under the token all-gather.
+    # 1 (C1): fence the shared output only. 2 (C1b, probe 44): additionally
+    # the armed DeepseekV2 decoder layer returns (routed, barrier(shared +
+    # residual)) as its (hidden, residual) pair, so the residual add rides the
+    # in-window down-proj fusion and the next layer's fused add + RMSnorm
+    # reads one tensor fewer. C1b reassociates the bf16 sum.
+    "MOE_SHARED_EXPERT_AG_WINDOW": lambda: _shared_expert_ag_window_mode(),
+    # Experiment (probe 43, default off): issue fused EP MoE v2's two slab
+    # scatters as lax.scatter_add on the (never negative) slab rows, so the
+    # negative-index normalisation jnp's .at[].add inserts -- which lands
+    # behind the token all-gather barrier -- is not emitted. Same bits.
+    "MOE_FUSED_EP_V2_SCATTER_NONNEG": env_bool("MOE_FUSED_EP_V2_SCATTER_NONNEG"),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
