@@ -8,8 +8,9 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
-    TPU_DCP_MLA_PACKED_GATHER: bool = True
-    TPU_DCP_MLA_TOPK_CAP: int = 0
+    TPU_DCP_MLA_PACKED_GATHER: bool = False
+    TPU_DCP_MLA_TOPK_CAP: int = 512
+    TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -357,14 +358,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DCP sparse MLA (SparseCore cache layout): gather only each token's live
     # top-k rows as packed 64-row atoms and attend 256-row tiles of them
     # (`sparse_ragged_paged_attention(packed_gather=True)`), instead of all
-    # `topk` slots per token when a rank owns ~topk/dcp of them.
-    "TPU_DCP_MLA_PACKED_GATHER": env_bool("TPU_DCP_MLA_PACKED_GATHER", default=True),
+    # `topk` slots per token when a rank owns ~topk/dcp of them. Takes the
+    # decode buckets ahead of TPU_DCP_MLA_TOPK_CAP when both are on; off by
+    # default (the capped path is as fast or faster at 1-2 decode requests).
+    "TPU_DCP_MLA_PACKED_GATHER": env_bool("TPU_DCP_MLA_PACKED_GATHER", default=False),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many
     # top-k slots per token instead of all `topk`; tokens owning more are
     # recomputed exactly in-kernel over all their windows
     # (`sparse_ragged_paged_attention(topk_cap=...)`). 0 = off. Chunks the
-    # packed gather takes stay packed.
-    "TPU_DCP_MLA_TOPK_CAP": env_int("TPU_DCP_MLA_TOPK_CAP", 0),
+    # packed gather takes stay packed. A rank owns ~topk/dcp = 128 of 2048 on
+    # average, so 512 covers every row but a rare skewed one.
+    "TPU_DCP_MLA_TOPK_CAP": env_int("TPU_DCP_MLA_TOPK_CAP", 512),
+    # Gather/attention chunk (query tokens) of the capped path: fewer, larger
+    # chunks amortise the per-chunk calls; each chunk's static gather buffer
+    # is chunk * topk rows (~335 MB at 256), of which only the live windows
+    # are written.
+    "TPU_DCP_MLA_TOPK_CAP_CHUNK": env_int("TPU_DCP_MLA_TOPK_CAP_CHUNK", 256),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
