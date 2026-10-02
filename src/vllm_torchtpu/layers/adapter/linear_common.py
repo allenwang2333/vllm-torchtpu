@@ -91,24 +91,6 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
             maybe_quantize_lhs=True,
             zero_initialize=True,
         )
-    if jnp.issubdtype(w_q.dtype, jnp.floating):
-        finfo = jnp.finfo(w_q.dtype)
-        dtype_max = float(finfo.max)
-        dtype_min = float(finfo.min)
-        abs_max = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
-        x_scale = abs_max.astype(jnp.float32) / dtype_max
-        x_scale = jnp.where(x_scale == 0, 1.0, x_scale)
-        scale_x = x_scale.astype(x.dtype)
-        scale_x = jnp.where(scale_x == 0, jnp.ones_like(scale_x), scale_x)
-        x_q = (x / scale_x).clip(dtype_min, dtype_max).astype(w_q.dtype)
-        out = jax.lax.dot_general(
-            x_q,
-            w_q,
-            dimension_numbers=(((1,), (0,)), ((), ())),
-            preferred_element_type=jnp.float32,
-        )
-        out = (out * x_scale) * jnp.expand_dims(w_s, 0)
-        return out.astype(x.dtype)
     return xla_quantized_matmul(x, w_q, w_s)
 
 

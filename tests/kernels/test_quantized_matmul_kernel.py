@@ -402,3 +402,17 @@ def test_quantized_matmul_blockwise_int4_fp8(
         block_size=512,
         x_q_dtype=jnp.float8_e4m3fn,
     )
+
+
+def test_quantize_block_preserves_input_dtype_for_fp8() -> None:
+    x = jax.random.normal(jax.random.key(0), (64, 512), dtype=jnp.bfloat16)
+    lowered = jax.jit(
+        lambda a: util.quantize_block(a, axis=1, target_dtype=jnp.float8_e4m3fn)
+    ).lower(x)
+    hlo_text = lowered.as_text("hlo")
+    assert "bf16[64,512]{1,0} divide(" in hlo_text
+    assert "f32[64,512]{1,0} divide(" not in hlo_text
+
+    x_q, x_s = util.quantize_block(x, axis=1, target_dtype=jnp.float8_e4m3fn)
+    assert x_q.dtype == jnp.float8_e4m3fn
+    assert x_s.dtype == jnp.float32
