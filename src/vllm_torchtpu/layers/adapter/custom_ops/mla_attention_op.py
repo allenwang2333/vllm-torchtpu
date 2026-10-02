@@ -1463,8 +1463,11 @@ class VllmDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
             sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
 
         rotate_fn = rotate_neox if is_neox_style else rotate_gptj
-        query_rot = query_rot * cos + rotate_fn(query_rot) * sin
-        key_rot = key_rot * cos + rotate_fn(key_rot) * sin
+        # Round the rotated halves back to their input dtypes right here, so a
+        # fp32 cos/sin cache never promotes q/k (and the pass-through halves
+        # they are concatenated with) to fp32 for the caller to downcast.
+        query_rot = (query_rot * cos + rotate_fn(query_rot) * sin).to(query.dtype)
+        key_rot = (key_rot * cos + rotate_fn(key_rot) * sin).to(key.dtype)
 
         if rope.rotary_dim < rope.head_size:
             query = torch.cat((query_rot, query_pass), dim=-1)
