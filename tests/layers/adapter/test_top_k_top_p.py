@@ -88,8 +88,20 @@ _K_BOUND = 64
 
 
 def _assert_bounded_matches(logits, top_k, top_p, device, k_bound=_K_BOUND):
+    # The search path's top-p sums bf16 probabilities with torch.sum. On CPU
+    # that accumulates in f32; on TPU the accumulation precision depends on
+    # the fusion and can under-count the mass (all-equal row: 248,320 x 4e-6
+    # sums below 0.95). The bounded path accumulates in f32 on every device,
+    # so bf16 on an accelerator is checked against the CPU search path.
+    reference_device = device
+    if logits.dtype == torch.bfloat16 and torch.device(device).type != "cpu":
+        reference_device = torch.device("cpu")
+    expected = sampling.apply_top_k_top_p(
+        logits.to(reference_device),
+        top_k.to(reference_device),
+        top_p.to(reference_device),
+    )
     logits, top_k, top_p = logits.to(device), top_k.to(device), top_p.to(device)
-    expected = sampling.apply_top_k_top_p(logits, top_k, top_p)
     result = sampling.apply_top_k_top_p(logits, top_k, top_p, k_bound)
     assert result.dtype == expected.dtype
     kept_expected = expected != sampling.MASKED_LOGIT_VALUE
