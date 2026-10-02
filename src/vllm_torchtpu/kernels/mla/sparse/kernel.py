@@ -361,7 +361,18 @@ def _attention_kernel(
     lse_lane_dense: bool = False,
     ragged_width: int | None = None,
     ragged_group: int | None = None,
+    capped_tile: int | None = None,
+    capped_tile_narrow_dma: bool = False,
 ):
+    # Capped tile (`capped_tile` = T, capped mode only): the pipelined body
+    # attends a static T-row tile (rows [0, T) of window 0) for every token,
+    # and tokens with more than T live rows are redone after the batch by an
+    # online softmax over T-row sub-windows (window 0's from the VMEM slot,
+    # later windows streamed from HBM). With `capped_tile_narrow_dma` the
+    # main DMA moves only T rows per token and rows [T, bkv_sz) of the
+    # tokens that need them are prefetched with the batch into a side
+    # buffer (three scratch refs after the fix-up's).
+    #
     # Ragged width (`ragged_width` = S, capped mode only): each group of
     # `ragged_group` consecutive tokens of a grid step DMAs and attends only
     # the first `S * cdiv(max kv_len of the group, S)` rows of its window-0
@@ -400,6 +411,11 @@ def _attention_kernel(
         q_pe_hbm_ref = refs[0]  # [max_num_tokens, num_q_heads, rope_dim]
         bq_pe_x2_ref = refs[-1]  # [2, bsz, num_q_heads, rope_dim]
         refs = refs[1:-1]
+    ovf_refs = None
+    if capped_tile_narrow_dma:
+        assert capped_tile is not None
+        ovf_refs = refs[-3:]  # nope [2, bsz, cap - T, 128], rope, sems (2, 2)
+        refs = refs[:-3]
     fix_refs = None
     if packed_bkv is not None or capped_windows is not None:
         assert sparsecore_layout
@@ -449,6 +465,25 @@ def _attention_kernel(
             else cache_kv_nope_hbm_ref.shape[1] // kv_cache_utils.WORD_BYTES
         )
 
+    if capped_tile is not None:
+        assert capped_windows is not None and sparsecore_layout
+        assert ragged_width is None and capped_tile % 32 == 0
+        # Window rows (the gathered buffer's second dim) vs the tile: a tile
+        # inside one window is split into sub-windows of the tile; a tile of
+        # k whole windows is k window-sized sub-windows.
+        win_rows = cache_kv_nope_hbm_ref.shape[1]
+        if capped_tile <= win_rows:
+            assert win_rows % capped_tile == 0
+            sub_rows = capped_tile
+            vmem_subs = win_rows // capped_tile  # window 0 sits in the slot
+            hbm_first_window = 1
+        else:
+            assert capped_tile % win_rows == 0 and not capped_tile_narrow_dma
+            sub_rows = win_rows
+            vmem_subs = capped_tile // win_rows  # windows 0..k-1 in the slot
+            hbm_first_window = vmem_subs
+        hbm_subs = win_rows // sub_rows
+        tile_subs = vmem_subs
     if ragged_width is not None:
         assert capped_windows is not None and sparsecore_layout
         assert bkv_sz % ragged_width == 0 and ragged_width % 32 == 0
@@ -588,6 +623,79 @@ def _attention_kernel(
         # The index into cache_kv_hbm_ref should be relative to the current
         # chunk.
         page_idx_start = seq_idx_start - start_seq_idx
+        if capped_tile is not None and capped_tile > cache_kv_nope_hbm_ref.shape[1]:
+            # The tile spans windows 0..k-1: one DMA pair per window (each
+            # window's rows of the batch are contiguous in the window-major
+            # gathered buffer).
+            rp = native_sc_gather.ROPE_PACKING
+            w = cache_kv_nope_hbm_ref.shape[1]
+            chunk_rows = cache_kv_nope_hbm_ref.shape[0] // capped_windows
+            for j in range(capped_tile // w):
+                dst_nope = bkv_nope_x2_ref.at[bkv_sem_idx, :, pl.ds(j * w, w)]
+                dst_rope = bkv_rope_x2_ref.at[
+                    bkv_sem_idx, :, pl.ds(j * w // rp, w // rp)
+                ]
+                if wait:
+                    _async_copy(dst_nope, dst_nope, sem_nope, True)
+                    _async_copy(dst_rope, dst_rope, sem_rope, True)
+                else:
+                    rows = pl.ds(j * chunk_rows + page_idx_start, batch_size)
+                    src_nope = cache_kv_nope_hbm_ref.at[rows]
+                    src_rope = cache_kv_rope_hbm_ref.at[rows]
+                    _async_copy(src_nope, dst_nope, sem_nope, False)
+                    _async_copy(src_rope, dst_rope, sem_rope, False)
+            return
+        if capped_tile_narrow_dma:
+            rp = native_sc_gather.ROPE_PACKING
+            ovf_nope_ref, ovf_rope_ref, ovf_sems = ovf_refs
+            t = capped_tile
+            dst_nope = bkv_nope_x2_ref.at[bkv_sem_idx, :, pl.ds(0, t)]
+            dst_rope = bkv_rope_x2_ref.at[bkv_sem_idx, :, pl.ds(0, t // rp)]
+            rows = pl.ds(page_idx_start, batch_size)
+            if wait:
+                _async_copy(dst_nope, dst_nope, sem_nope, True)
+                _async_copy(dst_rope, dst_rope, sem_rope, True)
+            else:
+                src_nope = cache_kv_nope_hbm_ref.at[rows, pl.ds(0, t)]
+                _async_copy(src_nope, dst_nope, sem_nope, False)
+                _async_copy(
+                    cache_kv_rope_hbm_ref.at[rows, pl.ds(0, t // rp)],
+                    dst_rope,
+                    sem_rope,
+                    False,
+                )
+            # Rows [t, bkv_sz) for the tokens whose live rows reach them; the
+            # wait re-derives the same predicate from kv_lens.
+            for b in range(batch_size):
+
+                @pl.when(kv_lens_ref[seq_idx_start + b] > t)
+                def _ovf(b=b):
+                    o_nope = ovf_nope_ref.at[bkv_sem_idx, b]
+                    o_rope = ovf_rope_ref.at[bkv_sem_idx, b]
+                    sn = ovf_sems.at[0, bkv_sem_idx]
+                    sr = ovf_sems.at[1, bkv_sem_idx]
+                    if wait:
+                        _async_copy(o_nope, o_nope, sn, True)
+                        _async_copy(o_rope, o_rope, sr, True)
+                    else:
+                        _async_copy(
+                            cache_kv_nope_hbm_ref.at[
+                                page_idx_start + b, pl.ds(t, bkv_sz - t)
+                            ],
+                            o_nope,
+                            sn,
+                            False,
+                        )
+                        _async_copy(
+                            cache_kv_rope_hbm_ref.at[
+                                page_idx_start + b, pl.ds(t // rp, (bkv_sz - t) // rp)
+                            ],
+                            o_rope,
+                            sr,
+                            False,
+                        )
+
+            return
         if ragged_width is not None:
             # One DMA pair per width group, of the group's static width; the
             # wait re-derives the same width from kv_lens (same branch, same
@@ -1022,6 +1130,148 @@ def _attention_kernel(
 
         lax.fori_loop(0, batch_size, fix_token, 0)
 
+    def fixup_tile_overflow(bi_sem_idx, bo_sem_idx):
+        """Redo tokens with more than `capped_tile` live rows (capped tile).
+
+        The body attended rows [0, T) only. This pass runs an online softmax
+        over T-row sub-windows: window 0's from the VMEM slot the body just
+        read (with the narrow DMA, sub-windows >= 1 from the side buffer
+        prefetched with the batch), window j >= 1 streamed from gathered row
+        `j * chunk + (seq - start)` (double-buffered, as the capped fix-up).
+        Overwrites the token's `bo` and `blse`. Tokens within T skip it.
+        """
+        fix_nope_ref, fix_rope_ref, fix_m_ref, fix_l_ref, fix_acc_ref, fix_sems = (
+            fix_refs
+        )
+        f32_min = jnp.finfo(jnp.float32).min
+        chunk_rows = cache_kv_nope_hbm_ref.shape[0] // capped_windows
+        rp = native_sc_gather.ROPE_PACKING
+        t = capped_tile
+        u = sub_rows
+
+        def tile_rows(sub):
+            return pl.ds(sub * u, u)
+
+        def tile_rope_rows(sub):
+            return pl.ds(sub * u // rp, u // rp)
+
+        def window_copies(local_idx, j, slot):
+            row = j * chunk_rows + local_idx
+            return (
+                pltpu.make_async_copy(
+                    cache_kv_nope_hbm_ref.at[row],
+                    fix_nope_ref.at[slot],
+                    fix_sems.at[0, slot],
+                ),
+                pltpu.make_async_copy(
+                    cache_kv_rope_hbm_ref.at[row],
+                    fix_rope_ref.at[slot],
+                    fix_sems.at[1, slot],
+                ),
+            )
+
+        def accumulate(q, nope_ref, rope_ref, rem):
+            kv = unpack_bkv(nope_ref, rope_ref, lambda: rem, width=u)
+            s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
+            s *= sm_scale
+            if k_scale != 1.0:
+                s *= k_scale
+            kv_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
+            s = jnp.where(kv_span < rem, s, f32_min)
+            m_prev = fix_m_ref[...]
+            m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
+            p = jnp.exp(s - m_new)
+            alpha = jnp.exp(m_prev - m_new)
+            fix_l_ref[...] = alpha * fix_l_ref[...] + jnp.sum(p, axis=1, keepdims=True)
+            fix_acc_ref[...] = alpha * fix_acc_ref[...] + jnp.einsum(
+                "nm,md->nd", p, kv, preferred_element_type=jnp.float32
+            )
+            fix_m_ref[...] = m_new
+
+        def window0_sub(batch_idx, sub):
+            if capped_tile_narrow_dma and sub >= 1:
+                ovf_nope_ref, ovf_rope_ref, _ = ovf_refs
+                return (
+                    ovf_nope_ref.at[bi_sem_idx, batch_idx, tile_rows(sub - 1)],
+                    ovf_rope_ref.at[bi_sem_idx, batch_idx, tile_rope_rows(sub - 1)],
+                )
+            return (
+                bkv_nope_x2_ref.at[bi_sem_idx, batch_idx, tile_rows(sub)],
+                bkv_rope_x2_ref.at[bi_sem_idx, batch_idx, tile_rope_rows(sub)],
+            )
+
+        def fix_token(batch_idx, carry):
+            seq_idx = batch_start_seq_idx + batch_idx
+            kv_len = kv_lens_ref[seq_idx]
+
+            @pl.when(kv_len > t)
+            def _fix():
+                local_idx = seq_idx - start_seq_idx
+                num_windows = cdiv(kv_len, win_rows)
+
+                @pl.when(num_windows > hbm_first_window)
+                def _first():
+                    for cp in window_copies(
+                        local_idx, hbm_first_window, hbm_first_window % 2
+                    ):
+                        cp.start()
+
+                q = load_bq(bi_sem_idx, batch_idx)
+                fix_m_ref[...] = jnp.full(fix_m_ref.shape, f32_min, jnp.float32)
+                fix_l_ref[...] = jnp.zeros(fix_l_ref.shape, jnp.float32)
+                fix_acc_ref[...] = jnp.zeros(fix_acc_ref.shape, jnp.float32)
+                accumulate(q, *window0_sub(batch_idx, 0), kv_len)
+                for sub in range(1, tile_subs):
+                    rem = kv_len - sub * u
+                    pl.when(rem > 0)(
+                        functools.partial(
+                            accumulate, q, *window0_sub(batch_idx, sub), rem
+                        )
+                    )
+
+                def window(j, window_carry):
+                    slot = lax.rem(j, 2)
+
+                    @pl.when(j + 1 < num_windows)
+                    def _prefetch_next():
+                        for cp in window_copies(local_idx, j + 1, 1 - slot):
+                            cp.start()
+
+                    for cp in window_copies(local_idx, j, slot):
+                        cp.wait()
+                    for sub in range(hbm_subs):
+                        rem = kv_len - j * win_rows - sub * u
+                        pl.when(rem > 0)(
+                            functools.partial(
+                                accumulate,
+                                q,
+                                fix_nope_ref.at[slot, tile_rows(sub)],
+                                fix_rope_ref.at[slot, tile_rope_rows(sub)],
+                                rem,
+                            )
+                        )
+                    return window_carry
+
+                lax.fori_loop(hbm_first_window, num_windows, window, 0)
+                l_sum = fix_l_ref[...]
+                pv = fix_acc_ref[...]
+                if k_scale != 1.0:
+                    pv *= k_scale
+                out = (
+                    lax.div(pv, l_sum)
+                    if q_dtype == jnp.float32
+                    else (pv * pl.reciprocal(l_sum, approx=True)).astype(q_dtype)
+                )
+                bo_x2_ref.at[bo_sem_idx, batch_idx][...] = out[:, :o_dim]
+                if return_lse:
+                    store_blse(
+                        bo_sem_idx, batch_idx, fix_m_ref[...] + jnp.log(l_sum)
+                    )
+
+            return carry
+
+        lax.fori_loop(0, batch_size, fix_token, 0)
+
     def process():
         def get_next_seq_ids(seq_idx, bi_sem_idx):
             next_seq_idx = seq_idx + batch_size
@@ -1108,7 +1358,9 @@ def _attention_kernel(
             bo_x2_ref.at[bo_sem_idx, last - 1][...] = out[:, :o_dim]
             write_blse(last - 1, prev_m, prev_l_sum)
 
-        if ragged_width is None:
+        if capped_tile is not None:
+            attend_tokens(0, batch_size, capped_tile)
+        elif ragged_width is None:
             attend_tokens(0, batch_size)
         else:
             # Each width group at its own static width (one branch per width).
@@ -1122,7 +1374,9 @@ def _attention_kernel(
                     )
         if packed_bkv is not None:
             fixup_overflow_tokens(bi_sem_idx, bo_sem_idx)
-        if capped_windows is not None:
+        if capped_tile is not None:
+            fixup_tile_overflow(bi_sem_idx, bo_sem_idx)
+        elif capped_windows is not None:
             fixup_capped_overflow(bi_sem_idx, bo_sem_idx)
         start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
         if return_lse:
@@ -1342,6 +1596,8 @@ def prepare_outputs(
         "ragged_width",
         "ragged_group",
         "ragged_gather_atoms",
+        "capped_tile",
+        "capped_tile_narrow_dma",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -1384,6 +1640,8 @@ def sparse_ragged_paged_attention(
     ragged_width: int | None = None,
     ragged_group: int | None = None,
     ragged_gather_atoms: int | None = None,
+    capped_tile: int | None = None,
+    capped_tile_narrow_dma: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1482,6 +1740,15 @@ def sparse_ragged_paged_attention(
         ulp on TPU v7x). A group holding a token over the cap takes the full
         window (its in-kernel overflow pass is unchanged). Measured on v7x:
         no faster than the full window (the kernel is not width-bound there).
+      capped_tile: With `topk_cap` (capped chunks only; a multiple of 64
+        dividing `topk_cap`; None or >= topk_cap = off). The attention kernel
+        attends a static `capped_tile`-row tile of each token's capped window
+        (the gather is unchanged), and tokens with more live entries are
+        redone exactly in-kernel by an online softmax over `capped_tile`-row
+        sub-windows (window 0's straight from VMEM). Pays when most rows hold
+        at most `capped_tile` live entries (DCP: ~128 of a 512 cap).
+      capped_tile_narrow_dma: With `capped_tile`: DMA only the tile per token
+        and prefetch the rest of window 0 for the tokens that need it.
       ragged_group: Tokens sharing one width (divides the grid step; None =
         the whole step). Smaller groups follow each token's own count more
         closely at the price of more, smaller DMAs and branches.
@@ -1730,6 +1997,8 @@ def sparse_ragged_paged_attention(
                     ragged_width=ragged_width,
                     ragged_group=ragged_group,
                     ragged_gather_atoms=ragged_gather_atoms,
+                    capped_tile=capped_tile,
+                    capped_tile_narrow_dma=capped_tile_narrow_dma,
                 )
                 if topk_cap is not None and packed_chunks[i] is None
                 else {}
@@ -1841,6 +2110,8 @@ def sparse_attention_chunk(
     ragged_width: int | None = None,
     ragged_group: int | None = None,
     ragged_gather_atoms: int | None = None,
+    capped_tile: int | None = None,
+    capped_tile_narrow_dma: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1908,7 +2179,31 @@ def sparse_attention_chunk(
             f"ragged_width ({ragged_width}) must be a multiple of "
             f"{PACKED_ATOM_ROWS} dividing topk_cap ({topk_cap})"
         )
-    if ragged_gather_atoms and (topk_cap // PACKED_ATOM_ROWS) % ragged_gather_atoms:
+    if capped_tile is not None and capped_tile == (topk_cap or 0):
+        capped_tile = None  # the tile is the whole window: today's path
+    if capped_tile is not None:
+        if topk_cap is None or ragged_width:
+            raise ValueError("capped_tile requires topk_cap and no ragged_width")
+        if capped_tile % PACKED_ATOM_ROWS or (
+            topk_cap % capped_tile
+            if capped_tile < topk_cap
+            else (capped_tile % topk_cap or capped_tile > topk)
+        ):
+            raise ValueError(
+                f"capped_tile ({capped_tile}) must be a multiple of "
+                f"{PACKED_ATOM_ROWS} dividing topk_cap ({topk_cap}), or a "
+                f"multiple of topk_cap up to topk"
+            )
+        if capped_tile > topk_cap:
+            capped_tile_narrow_dma = False
+    if capped_tile is None:
+        capped_tile_narrow_dma = False
+    _apr = (topk_cap or PACKED_ATOM_ROWS) // PACKED_ATOM_ROWS
+    if ragged_gather_atoms and (
+        _apr % ragged_gather_atoms
+        if ragged_gather_atoms <= _apr
+        else ragged_gather_atoms % _apr or chunk_size % (ragged_gather_atoms // _apr)
+    ):
         raise ValueError(
             f"ragged_gather_atoms ({ragged_gather_atoms}) must divide "
             f"topk_cap // {PACKED_ATOM_ROWS} ({topk_cap // PACKED_ATOM_ROWS})"
@@ -1955,6 +2250,14 @@ def sparse_attention_chunk(
         else:
             nope_tile = cache_kv_nope.shape[1:]
             rope_tile = cache_kv_rope.shape[1:]
+        win_nope_tile, win_rope_tile = nope_tile, rope_tile
+        if capped_tile is not None and capped_tile > nope_tile[0]:
+            # The slot holds the k windows the tile spans.
+            nope_tile = (capped_tile, *nope_tile[1:])
+            rope_tile = (
+                capped_tile // native_sc_gather.ROPE_PACKING,
+                *rope_tile[1:],
+            )
         bkv_nope_double_buf = pltpu.VMEM(
             (2, batch_size, *nope_tile),
             cache_kv_nope.dtype,
@@ -1993,8 +2296,8 @@ def sparse_attention_chunk(
             # Overflow fix-up: two window slots per cache, running max / sum /
             # accumulator, and a semaphore per (cache, slot).
             scratch_shapes += [
-                pltpu.VMEM((2, *nope_tile), cache_kv_nope.dtype),
-                pltpu.VMEM((2, *rope_tile), cache_kv_rope.dtype),
+                pltpu.VMEM((2, *win_nope_tile), cache_kv_nope.dtype),
+                pltpu.VMEM((2, *win_rope_tile), cache_kv_rope.dtype),
                 pltpu.VMEM((num_q_heads, 1), jnp.float32),
                 pltpu.VMEM((num_q_heads, 1), jnp.float32),
                 pltpu.VMEM((num_q_heads, head_dim), jnp.float32),
@@ -2010,6 +2313,24 @@ def sparse_attention_chunk(
                 pltpu.VMEM((num_q_heads, 1), jnp.float32),
                 pltpu.VMEM((num_q_heads, head_dim), jnp.float32),
                 pltpu.SemaphoreType.DMA((2,)),
+            ]
+        if capped_tile_narrow_dma:
+            # Side buffer for rows [tile, cap) of the tokens that need them.
+            scratch_shapes += [
+                pltpu.VMEM(
+                    (2, batch_size, nope_tile[0] - capped_tile, *nope_tile[1:]),
+                    cache_kv_nope.dtype,
+                ),
+                pltpu.VMEM(
+                    (
+                        2,
+                        batch_size,
+                        rope_tile[0] - capped_tile // native_sc_gather.ROPE_PACKING,
+                        *rope_tile[1:],
+                    ),
+                    cache_kv_rope.dtype,
+                ),
+                pltpu.SemaphoreType.DMA((2, 2)),
             ]
         if split_q:
             # q_pe double buffer; always the last scratch ref.
@@ -2038,6 +2359,12 @@ def sparse_attention_chunk(
             split_q=split_q,
             lse_lane_dense=lse_lane_dense,
         )
+        if capped_tile is not None:
+            kernel_body = functools.partial(
+                kernel_body,
+                capped_tile=capped_tile,
+                capped_tile_narrow_dma=capped_tile_narrow_dma,
+            )
         if ragged_width:
             kernel_body = functools.partial(
                 kernel_body,
@@ -2067,6 +2394,9 @@ def sparse_attention_chunk(
                 scope_name += f"-capw_{capped_windows}"
             if ragged_width:
                 scope_name += f"-rw_{ragged_width}"
+            if capped_tile is not None:
+                scope_name += f"-tile_{capped_tile}"
+                scope_name += "n" if capped_tile_narrow_dma else ""
         num_prefetch = len(scalar_prefetches)
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
@@ -2166,7 +2496,7 @@ def sparse_attention_chunk(
         gather_atoms = sparsecore_atoms_per_batch
         if small_chunk and small_chunk_live_gather:
             gather_atoms = small_chunk_gather_atoms
-        if ragged_gather_atoms:
+        if ragged_gather_atoms and not small_chunk:
             gather_atoms = ragged_gather_atoms
         live_tokens = batch_end - start_pos
         token_windows = jnp.where(
@@ -2185,7 +2515,7 @@ def sparse_attention_chunk(
                 .reshape(capped_windows * chunk_size, topk_cap)
             )
         ragged_kwargs = {}
-        if ragged_gather_atoms:
+        if ragged_gather_atoms and not small_chunk:
             # Live flag per logical batch of the window-major index rows:
             # batch k of (window w, row r) is live iff the row's live entries
             # in that window reach its first atom. Rows past the grid: none.
@@ -2200,7 +2530,17 @@ def sparse_attention_chunk(
                 jnp.arange(chunk_size)[None, :] < live_tokens, window_live, 0
             )
             row_atoms = (window_live + PACKED_ATOM_ROWS - 1) // PACKED_ATOM_ROWS
-            if ragged_gather_atoms == atoms_per_row:
+            if ragged_gather_atoms > atoms_per_row:
+                # A batch spans several whole rows of one window: gathered
+                # whole iff any of its rows has live entries in that window.
+                rows_per_batch = ragged_gather_atoms // atoms_per_row
+                ragged_kwargs["batch_live"] = (
+                    jnp.max(
+                        row_atoms.reshape(capped_windows, -1, rows_per_batch), axis=-1
+                    )
+                    > 0
+                ).astype(jnp.int32).reshape(-1)
+            elif ragged_gather_atoms == atoms_per_row:
                 # One batch per (window, row): its inner pipeline walks only
                 # the row's live atoms (traced grid).
                 ragged_kwargs.update(

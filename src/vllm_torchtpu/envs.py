@@ -17,6 +17,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_RAGGED_WIDTH_SUB: int = 128
     TPU_DCP_MLA_RAGGED_WIDTH_GROUP: int = 4
     TPU_DCP_MLA_RAGGED_GATHER_ATOMS: int = 0
+    TPU_DCP_MLA_CAPPED_TILE: int = 0
+    TPU_DCP_MLA_CAPPED_TILE_NARROW_DMA: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -413,6 +415,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_RAGGED_WIDTH_SUB": env_int("TPU_DCP_MLA_RAGGED_WIDTH_SUB", 128),
     "TPU_DCP_MLA_RAGGED_WIDTH_GROUP": env_int("TPU_DCP_MLA_RAGGED_WIDTH_GROUP", 4),
     "TPU_DCP_MLA_RAGGED_GATHER_ATOMS": env_int("TPU_DCP_MLA_RAGGED_GATHER_ATOMS", 0),
+    # DCP sparse MLA, capped path: the attention kernel attends a static tile
+    # of this many slots of each token's capped window (0 = the whole cap),
+    # and redoes tokens with more live entries in-kernel over tile-sized
+    # sub-windows (`sparse_ragged_paged_attention(capped_tile=...)`); the
+    # SparseCore gather is unchanged. A rank owns ~128 of a row's 2048, so a
+    # 256 tile covers ~96% of rows. `_NARROW_DMA` also narrows the per-token
+    # DMA to the tile (the rest prefetched only where needed).
+    "TPU_DCP_MLA_CAPPED_TILE": env_int("TPU_DCP_MLA_CAPPED_TILE", 0),
+    "TPU_DCP_MLA_CAPPED_TILE_NARROW_DMA": env_bool(
+        "TPU_DCP_MLA_CAPPED_TILE_NARROW_DMA", default=False
+    ),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per

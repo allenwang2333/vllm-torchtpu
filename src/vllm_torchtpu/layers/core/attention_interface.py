@@ -1178,6 +1178,11 @@ def sparse_mla_attention_dcp(
         )
         # Ragged width (experimental, off): bound the capped path's attention
         # (and optionally gather) by each token's live count.
+        if topk_cap and envs.TPU_DCP_MLA_CAPPED_TILE:
+            chunk_kwargs.update(
+                capped_tile=envs.TPU_DCP_MLA_CAPPED_TILE,
+                capped_tile_narrow_dma=envs.TPU_DCP_MLA_CAPPED_TILE_NARROW_DMA,
+            )
         if topk_cap and envs.TPU_DCP_MLA_RAGGED_WIDTH:
             chunk_kwargs.update(
                 ragged_width=envs.TPU_DCP_MLA_RAGGED_WIDTH_SUB,
