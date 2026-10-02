@@ -14,7 +14,8 @@
 
 # Publishes the public prod image to Docker Hub from the scheduled NIGHTLY=1
 # build of a release/X.Y.Z branch. Unlike nightly_releases.yml, it waits for
-# every build, test, integration and perf step and is skipped if any fails.
+# every build, test, integration, perf and model/feature step and is skipped
+# if any fails.
 # Steps an `if` drops from the build (e.g. PR-only steps) do not block it.
 # A release branch only publishes if vllm-torchtpu-ci has a NIGHTLY=1
 # schedule on it.
@@ -31,9 +32,11 @@ steps:
       - "unit_tests_tpu_group"      # pipeline_tests.yml
       - "integration_tests_group"   # pipeline_integration.yml
       - "perf_eval_group"           # pipeline_perf.yml
-      # TODO(tech-lead): the model/feature tests (v6e-group, v7x-group from
-      # nightly_verify.yml) are not gated yet; nightly_verify.yml itself
-      # allows them to fail.
+      # nightly_verify.yml. Runs after the v6e/v7x model and feature groups
+      # finish and fails if any of their tests failed. Those groups are uploaded
+      # at runtime and their test steps soft_fail, so they are gated here
+      # rather than by key.
+      - "notify_test_results"
     agents:
       # The prod build pulls torch-tpu from a private registry and needs the
       # gcloud credentials these agents carry (see docker/build_image.sh).
