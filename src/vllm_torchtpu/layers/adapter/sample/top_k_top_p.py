@@ -322,8 +322,9 @@ def _apply_top_k_top_p_bounded(
     # --- top-p over the survivors. ---
     probs = torch.softmax(masked_logits, dim=-1)
     win_probs = torch.gather(probs, -1, idx)  # non-increasing along the row
-    # topp_mask sums in the probabilities' dtype; accumulate in f32 and round
-    # to match.
+    # topp_mask's masses are torch.sum results in the probabilities' dtype,
+    # which on CPU accumulate in f32 then round. Do the same explicitly: on
+    # TPU a bf16 torch.sum can accumulate below f32 precision.
     cum_mass = torch.cumsum(win_probs.to(torch.float32), dim=-1).to(probs.dtype)
     reached = cum_mass >= top_p
     reached_in_window = torch.any(reached, dim=-1, keepdim=True)
@@ -336,7 +337,9 @@ def _apply_top_k_top_p_bounded(
     )
     last_survivor = (num_window_survivors - 1).clamp(min=0).to(torch.int64)
     threshold_lowest = torch.gather(win_probs, -1, last_survivor)
-    total_mass = torch.sum(probs, dim=-1, keepdim=True)
+    total_mass = torch.sum(probs.to(torch.float32), dim=-1, keepdim=True).to(
+        probs.dtype
+    )
     threshold = torch.where(reached_in_window, threshold_in_window, threshold_lowest)
     # topp_mask keeps nothing when no threshold satisfies the mass (p > total
     # mass, or p <= 0).
