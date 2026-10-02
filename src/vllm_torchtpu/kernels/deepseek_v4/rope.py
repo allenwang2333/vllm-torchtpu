@@ -132,6 +132,7 @@ def _cos_sin_lanes(
         cos       1 ...  1 | c0  c0  c1  c1       <- np.repeat(cos, 2)
         sin       0 ...  0 | s0  s0  s1  s1
     """
+    cos_sin = cos_sin.astype(jnp.float32)
     half = rotary_dim // 2
     channel = jnp.arange(LANE) - (LANE - rotary_dim)  # < 0 on the NoPE lanes
     is_rot = channel >= 0
