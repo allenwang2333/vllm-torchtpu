@@ -438,9 +438,9 @@ def calculate_block_sizes(
         # workloads where query lengths are large; applying it to decode causes
         # redundant KV cache iterations and softmax carry state save/restores.
         # Therefore, decode mode directly keeps bq_c_sz = bq_sz.
-        if fixed_bq_sz is not None:
-            last_valid_bq_c_sz = bq_sz
-        else:
+        last_valid_bq_c_sz = bq_c_sz = bq_sz
+
+        if fixed_bq_sz is None:
             # Threshold value based on hardware generation and precision.
             tpu_info = pltpu.get_tpu_info()
             is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1
@@ -460,7 +460,6 @@ def calculate_block_sizes(
                 threshold *= flops_ratio
 
             num_bq_c = 1
-            last_valid_bq_c_sz = bq_c_sz = bq_sz
             bq_c_rem = 0
 
             while (
