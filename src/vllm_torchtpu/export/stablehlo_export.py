@@ -677,7 +677,7 @@ def export_stablehlo(
     example_inputs: list[Any],
     compile_range: Range,
     key: str | None,
-) -> tuple[Callable[..., Any], None]:
+) -> None:
     """Export traced FX subgraph to StableHLO (.mlir) and metadata.json."""
     from torch_tpu._internal import export as torch_tpu_export
 
