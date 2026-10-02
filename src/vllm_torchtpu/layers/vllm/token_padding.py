@@ -23,21 +23,28 @@ _padding_state: "TokenPaddingState | None" = None
 class TokenPaddingState:
     """Track token padding."""
     local_padding_mask: torch.Tensor
+    last_padding_range: tuple[int, int] = (0, 0)
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
         local_padding_mask = torch.zeros(max_local_tokens,
                                          dtype=torch.bool,
                                          device=device)
-        return cls(local_padding_mask=local_padding_mask)
+        return cls(local_padding_mask=local_padding_mask,
+                   last_padding_range=(0, 0))
 
     def update(self, local_valid_tokens: int,
                local_padded_tokens: int) -> None:
         """Write this rank's token padding mask."""
+        cur_range = ((local_valid_tokens, local_padded_tokens)
+                     if local_valid_tokens < local_padded_tokens else (0, 0))
+        if cur_range == self.last_padding_range:
+            return
+        self.last_padding_range = cur_range
         host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
-        host[local_valid_tokens:local_padded_tokens] = True
-        # Synchronous copy since the host tensor is temporary.
-        self.local_padding_mask.copy_(host)
+        if cur_range != (0, 0):
+            host[local_valid_tokens:local_padded_tokens] = True
+        self.local_padding_mask.copy_(host, non_blocking=True)
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]

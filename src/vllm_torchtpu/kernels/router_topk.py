@@ -32,7 +32,7 @@ NEG = -3.0e38
 
 # Rows per grid step, measured fastest at 512 experts. The grid rounds up, so
 # this does not have to divide the row count.
-MAX_BLOCK_ROWS = 512
+MAX_BLOCK_ROWS = 1024
 
 
 def _select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
@@ -63,6 +63,14 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
     w_ref[...] = jnp.where(w_ref[:, :1] <= NEG, jnp.nan, w_ref[...])
 
 
+def _pick_block_rows(rows: int) -> int:
+    if rows % 2304 == 0 and rows <= 6912:
+        return 2304
+    if rows % 1152 == 0:
+        return 1152
+    return min(MAX_BLOCK_ROWS, rows)
+
+
 def select(scores: jax.Array,
            topk: int,
            interpret: bool = False) -> tuple[jax.Array, jax.Array]:
@@ -78,7 +86,7 @@ def select(scores: jax.Array,
     one.
     """
     rows, n = scores.shape
-    block = min(MAX_BLOCK_ROWS, rows)
+    block = _pick_block_rows(rows)
     return pl.pallas_call(
         functools.partial(_select_kernel, topk=topk, n=n),
         grid=(pl.cdiv(rows, block), ),
@@ -98,3 +106,52 @@ def select(scores: jax.Array,
 def router_topk(scores: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:
     """``select`` with a jax_op-compatible signature (arrays, then statics)."""
     return select(scores, topk)
+
+
+def _select_softmax_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int,
+                           out_dtype):
+    """Fused VMEM cast + top-k selection + top-k softmax normalization."""
+    x_in = x_ref[...].astype(jnp.float32)
+    x = jnp.where(x_in > NEG, x_in, NEG)
+    masked = jnp.finfo(jnp.float32).min
+    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
+    m_list = []
+    idx_list = []
+    for j in range(topk):
+        m = jnp.max(x, axis=1, keepdims=True)
+        idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=1, keepdims=True)
+        m_list.append(m)
+        idx_list.append(idx.astype(jnp.int32))
+        if j < topk - 1:
+            x = jnp.where(iota == idx, masked, x)
+    w = jnp.concatenate(m_list, axis=1)
+    i_out = jnp.concatenate(idx_list, axis=1)
+    exp_w = jnp.exp(w - m_list[0])
+    w_norm = exp_w / jnp.maximum(jnp.sum(exp_w, axis=1, keepdims=True), 1e-20)
+    w_norm = jnp.where(m_list[0] <= NEG, jnp.nan, w_norm)
+    w_ref[...] = w_norm.astype(out_dtype)
+    i_ref[...] = i_out
+
+
+def router_topk_softmax(logits: jax.Array,
+                        topk: int) -> tuple[jax.Array, jax.Array]:
+    """Fused top-k + softmax over raw router logits (bfloat16 or float32)."""
+    rows, n = logits.shape
+    block = _pick_block_rows(rows)
+    out_dtype = logits.dtype
+    return pl.pallas_call(
+        functools.partial(_select_softmax_kernel,
+                          topk=topk,
+                          n=n,
+                          out_dtype=out_dtype),
+        grid=(pl.cdiv(rows, block), ),
+        in_specs=[pl.BlockSpec((block, n), lambda i: (i, 0))],
+        out_specs=[
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((rows, topk), out_dtype),
+            jax.ShapeDtypeStruct((rows, topk), jnp.int32),
+        ],
+    )(logits)

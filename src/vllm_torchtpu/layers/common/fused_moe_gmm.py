@@ -201,8 +201,6 @@ def prepare_routed_gmm_inputs(
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
     topk_weights_flat = topk_weights_local.flatten()
-    token_indices_flat = jnp.arange(num_tokens_local,
-                                    dtype=jnp.int32).repeat(topk)
 
     if skip_padded_tokens:
         # Padded tokens keep their selected expert ids, but carry zero
@@ -212,15 +210,55 @@ def prepare_routed_gmm_inputs(
     else:
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
-    sorted_indices = jnp.argsort(sort_keys)
-    argsort_revert_indices = jnp.argsort(sorted_indices)
-
-    token_indices_sorted = token_indices_flat[sorted_indices]
-    topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
-    group_sizes_local = (jax.nn.one_hot(
-        topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
-                         valid_mask[:, None].astype(jnp.int32))
-    group_sizes_local = group_sizes_local.sum(axis=0)
+    route_iota = jax.lax.broadcasted_iota(jnp.int32, sort_keys.shape, 0)
+    if (use_ep and use_sparse_core
+            and sort_keys.size <= onehot_moe_permute_threshold):
+        sorted_indices = (jax.lax.sort(
+            (sort_keys << 9) | route_iota, is_stable=False)
+                          & 0x1FF)
+        token_indices_sorted = sorted_indices // topk
+        argsort_revert_indices = token_indices_sorted
+        expert_assignments = (jax.nn.one_hot(
+            topk_indices_flat, local_num_experts, dtype=jnp.int32) *
+                              valid_mask[:, None])
+        group_sizes_local = jnp.sum(expert_assignments, axis=0)
+    else:
+        if sort_keys.size < (1 << 20):
+            shift = 16 if sort_keys.size <= (1 << 16) else 20
+            s_packed = jax.lax.sort((sort_keys << shift) | route_iota,
+                                    is_stable=False)
+            sorted_keys = s_packed >> shift
+            sorted_indices = s_packed & ((1 << shift) - 1)
+        else:
+            sorted_keys, sorted_indices = jax.lax.sort_key_val(sort_keys,
+                                                               route_iota,
+                                                               is_stable=False)
+        if sort_keys.size <= (1 << 16):
+            s_rev = jax.lax.sort(
+                (sorted_indices.astype(jnp.uint32) << jnp.uint32(16))
+                | route_iota.astype(jnp.uint32),
+                is_stable=False,
+            )
+            argsort_revert_indices = (s_rev
+                                      & jnp.uint32(0xFFFF)).astype(jnp.int32)
+        else:
+            _, argsort_revert_indices = jax.lax.sort_key_val(sorted_indices,
+                                                             route_iota,
+                                                             is_stable=False)
+        token_indices_sorted = sorted_indices // topk
+        expert_bounds = jnp.searchsorted(
+            sorted_keys,
+            jnp.arange(local_num_experts + 1, dtype=sorted_keys.dtype),
+            side="left",
+        )
+        if sort_keys.size <= 1024:
+            expert_assignments = (jax.nn.one_hot(
+                topk_indices_flat, local_num_experts, dtype=jnp.int32) *
+                                  valid_mask[:, None])
+            group_sizes_local = jnp.sum(expert_assignments, axis=0)
+        else:
+            group_sizes_local = (expert_bounds[1:] -
+                                 expert_bounds[:-1]).astype(jnp.int32)
 
     if use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
@@ -234,12 +272,13 @@ def prepare_routed_gmm_inputs(
             # Match uLLM/reference EP routing: materialize the valid local
             # expert prefix through SparseCore ragged_gather. Invalid
             # non-local rows are sorted after the valid prefix.
-            valid_count = group_sizes_local.sum(dtype=jnp.int32)
+            valid_count = expert_bounds[local_num_experts:local_num_experts +
+                                        1].astype(jnp.int32)
             x = ragged_gather_v2(
                 hidden_states_local,
                 token_indices_sorted,
                 jnp.array([0], dtype=jnp.int32),
-                valid_count[None],
+                valid_count,
             )
     else:
         x = hidden_states_local[token_indices_sorted]
@@ -330,21 +369,17 @@ def moe_gmm(
                     valid_count,
                     num_tokens=num_tokens,
                 ).astype(x.dtype)
+            computed = jnp.arange(
+                gmm2_res.shape[0],
+                dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
             if skip_padded_tokens:
-                # Zero out the GMM output rows of padded tokens that
-                # skipped the GMM computation, otherwise those
-                # uninitialized values can be NaN and the one-hot matmul
-                # would spread them to every token in the batch.
-                computed = jnp.arange(
-                    gmm2_res.shape[0],
-                    dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
                 gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
-            revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
-            onehot = jax.nn.one_hot(revert_indices,
-                                    argsort_revert_indices.size,
-                                    dtype=gmm2_res.dtype)
-            combine = (onehot * topk_weights[..., None] *
-                       valid_mask[..., None]).sum(axis=1)
+            w_sorted = jnp.where(computed, topk_weights_sorted,
+                                 0).astype(gmm2_res.dtype)
+            onehot_t = jax.nn.one_hot(token_indices_sorted,
+                                      num_tokens,
+                                      dtype=gmm2_res.dtype).T
+            combine = onehot_t * w_sorted[None, :]
             return (combine @ gmm2_res).astype(x.dtype)
         return ragged_gather_reduce(
             gmm2_res,

@@ -669,7 +669,7 @@ def inner_kernel(
     for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
         branches.append(
             functools.partial(run_matmul_step, bucket_idx=bucket_idx))
-    bucket_idx = m_end_local // cfgs.tiles.bucket_base
+    bucket_idx = (jnp.maximum(m_end_local, 1) - 1) // cfgs.tiles.bucket_base
     lax.switch(bucket_idx, branches)
 
 
@@ -965,9 +965,10 @@ def calculate_tiling(
     # safe to use for most scenarios. But if lower bitwidth is used, we need
     # to tweak tile_m to account for using faster hardware unit.
     # TODO(kyuyeunk): Account for different TPU hardware specs.
-    bf16_bf16_tile_m = 128
+    bf16_bf16_tile_m = (dims.size_lhs_sublane if dims.size_m <= 1024 else
+                        (256 if dims.size_m > 100000 else 128))
     rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
-    tile_m = bf16_bf16_tile_m // rhs_mod
+    tile_m = max(dims.size_lhs_sublane, bf16_bf16_tile_m // rhs_mod)
     if lhs_cfgs.should_quantize:
         tile_m *= 2
     tile_m = min(tile_m, dims.size_m)
@@ -1064,7 +1065,8 @@ def calculate_tiling(
 
     # TODO(alynie, kyuyeunk): max number of bucket was choosen empiirically.
     # Revisit the value to be based on number of instruction memory size.
-    max_num_buckets = 4
+    max_num_buckets = (2 if dims.size_m <= 1024 else
+                       (6 if dims.size_m > 200000 else 4))
     bucket_base = tile_m
     for _ in range(1, max_num_buckets):
         new_tile_m = tile_m + bucket_base
