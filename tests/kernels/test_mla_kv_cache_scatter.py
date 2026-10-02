@@ -404,11 +404,20 @@ class SparseMLAScatterTest(parameterized.TestCase):
             want = kv_cache_utils.update_sparse_mla_kv_cache_dcp_jax(
                 *args, jnp.int32(rank), **kwargs
             )
-            for name, g, w in zip(("nope", "rope"), got, want):
+            # TPU_DCP_MLA_LEAN_GLUE: pad the values, not the packed rows.
+            lean = kv_cache_utils.update_sparse_mla_kv_cache_dcp(
+                *args, jnp.int32(rank), **kwargs, pad_before_pack=True
+            )
+            for name, g, w, g2 in zip(("nope", "rope"), got, want, lean):
                 np.testing.assert_array_equal(
                     np.asarray(g),
                     np.asarray(w),
                     err_msg=f"rank {rank}: {name} cache differs from the jnp writer",
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(g2),
+                    np.asarray(w),
+                    err_msg=f"rank {rank}: {name} pad_before_pack differs",
                 )
             rows = _decode_rows(got[0], specs["nope_spec"])
             written += int(rows.any(axis=1).sum())

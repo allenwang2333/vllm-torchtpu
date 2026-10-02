@@ -1181,6 +1181,117 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         self.assertNotIn(padded_lse, hlo[True])
         self.assertEqual(q_copy.findall(hlo[True]), [])
 
+    @parameterized.product(
+        (
+            {"query_tokens": 16, "seq_q": (4,)},
+            {"query_tokens": 16, "seq_q": (4, 4)},
+            # Two capped chunks: the lse buffer stays, topk_lens still applies.
+            {"query_tokens": 512, "seq_q": (4, 4, 492)},
+        ),
+        (
+            # bz: the decode grid step (TPU_DCP_MLA_SMALL_CHUNK_BATCH).
+            {"topk_cap": 512, "capped_window_prep": True, "dense": True, "bz": 4},
+            {"topk_cap": 512, "capped_window_prep": True, "dense": True, "bz": 1},
+            {"topk_cap": 512, "capped_window_prep": True, "dense": False, "bz": 1},
+            {"topk_cap": 512, "capped_window_prep": False, "dense": True, "bz": 4},
+            {"topk_cap": None, "capped_window_prep": False, "dense": True, "bz": 1},
+        ),
+    )
+    def test_lean_glue_bit_identical(
+        self, query_tokens, seq_q, topk_cap, capped_window_prep, dense, bz
+    ):
+        """TPU_DCP_MLA_LEAN_GLUE's kernel side against the incumbent glue.
+
+        Lean: lse is a fresh kernel output (single chunk) with the sentinel
+        selected in, and `owns` / the kernel's `kv_len` come from one count
+        passed as `topk_lens`. Every row must match bit for bit, padding rows
+        included (sentinel where owned, -inf where not).
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        rng = np.random.default_rng(20261002)
+        problem, glued, owns, counts, page_table, cu_q_lens, distribution = (
+            self._split_q_lse_case(query_tokens, seq_q, rng)
+        )
+        # Undo the dummy key: the rank-local top-k as `streamindex_topk_dcp`
+        # hands it over (`-1` padded, all `-1` where the rank owns nothing).
+        raw = glued.at[:, 0].set(jnp.where(owns, glued[:, 0], -1))
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+        real_tokens = int(sum(seq_q))
+
+        @functools.partial(jax.jit, static_argnames="lean")
+        def run(raw, *, lean):
+            topk_lens = None
+            if lean:
+                n = jnp.sum(raw != -1, axis=-1)
+                owns_ = n > 0
+                topk_lens = jnp.maximum(n, 1)
+            else:
+                owns_ = jnp.any(raw >= 0, axis=-1)
+            topk = raw.at[:, 0].set(jnp.where(owns_, raw[:, 0], jnp.int32(0)))
+            out, lse = sparse_mla.sparse_ragged_paged_attention(
+                q_nope if dense else problem["q"],
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk,
+                page_table,
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                topk_cap=topk_cap,
+                capped_window_prep=capped_window_prep,
+                lse_lane_dense=dense,
+                lse_fresh_output=lean,
+                topk_lens=topk_lens,
+                small_chunk_batch_size=bz,
+                **({"q_pe": q_pe} if dense else {}),
+            )
+            return out[..., :NOPE_DIM], jnp.where(owns_[:, None], lse, -jnp.inf)
+
+        (ref, ref_lse), (out, lse) = jax.block_until_ready(
+            (run(raw, lean=False), run(raw, lean=True))
+        )
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(out, jnp.uint16)),
+            np.asarray(jax.lax.bitcast_convert_type(ref, jnp.uint16)),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(lse).view(np.uint32), np.asarray(ref_lse).view(np.uint32)
+        )
+        lse_np, owns_np = np.asarray(lse), np.asarray(owns)
+        # The DCP contract on real rows: empty rows -inf, owned rows finite.
+        self.assertTrue((~owns_np[:real_tokens]).any())
+        self.assertTrue(np.all(lse_np[:real_tokens][~owns_np[:real_tokens]] == -np.inf))
+        self.assertTrue(np.isfinite(lse_np[:real_tokens][owns_np[:real_tokens]]).all())
+        if query_tokens == 16:
+            # Owned padding rows past the grid carry the sentinel, so the
+            # comparison above saw the fresh-output select, not an alias.
+            pad = owns_np.copy()
+            pad[:real_tokens] = False
+            self.assertTrue(pad.any())
+            self.assertTrue(np.all(lse_np[pad] == np.finfo(np.float32).min))
+        # Positive control: a kv_len one short on an overflow row moves it.
+        row = int(np.argmax(counts[:real_tokens]))
+        n = jnp.maximum(jnp.sum(raw != -1, axis=-1), 1)
+        topk = raw.at[:, 0].set(jnp.where(owns, raw[:, 0], jnp.int32(0)))
+        _, bad_lse = sparse_mla.sparse_ragged_paged_attention(
+            q_nope, problem["sparsecore_nope"], problem["sparsecore_rope"], topk,
+            page_table, cu_q_lens, distribution, sm_scale=0.125, k_scale=0.75,
+            return_lse=True, cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+            gather_and_attention_chunk_size=256, topk_cap=topk_cap,
+            capped_window_prep=capped_window_prep, lse_lane_dense=True,
+            q_pe=q_pe, lse_fresh_output=True, topk_lens=n.at[row].add(-1),
+            small_chunk_batch_size=bz,
+        )
+        self.assertFalse(
+            np.array_equal(np.asarray(bad_lse)[row], np.asarray(ref_lse)[row])
+        )
+
     def test_split_q_validation(self):
         nope = jnp.zeros((16, 256, 128), jnp.uint32)
         rope = jnp.zeros((16, 64, 128), jnp.uint32)
@@ -1270,6 +1381,258 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                 distribution,
                 cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
             )
+
+
+
+def _hlo_computations(hlo: str) -> tuple[dict[str, list[str]], set[str]]:
+    """(computation name -> instruction lines, names called by a fusion or as
+    a reducer) of an HLO module's text."""
+    import re
+
+    comps, cur = {}, None
+    for line in hlo.splitlines():
+        m = re.match(r"^(?:ENTRY )?%?([\w.\-]+) .*\{\s*$", line)
+        if m and not line.startswith(" "):
+            cur = m.group(1)
+            comps[cur] = []
+        elif line.startswith("}"):
+            cur = None
+        elif cur is not None:
+            comps[cur].append(line.strip())
+    fused = set()
+    for lines in comps.values():
+        for line in lines:
+            if " fusion(" in line:
+                fused.update(re.findall(r"calls=%?([\w.\-]+)", line))
+            fused.update(re.findall(r"to_apply=%?([\w.\-]+)", line))
+    return comps, fused
+
+
+def _top_level_shapes(hlo: str) -> dict[str, list[str]]:
+    """Output shape -> top-level instructions (not inside a fusion) of `hlo`,
+    so each entry is one op the TPU executes."""
+    import re
+
+    comps, fused = _hlo_computations(hlo)
+    out: dict[str, list[str]] = {}
+    for name, lines in comps.items():
+        if name in fused:
+            continue
+        for line in lines:
+            m = re.match(r"^(?:ROOT )?%?[\w.\-]+ = ([a-z0-9]+\[[0-9,]*\])", line)
+            if m and " get-tuple-element(" not in line and " bitcast(" not in line:
+                out.setdefault(m.group(1), []).append(line[:160])
+    return out
+
+
+def _fusions_reducing(hlo: str, operand: str) -> list[str]:
+    """Fused computations that contain a reduce and an `operand`-shaped value."""
+    comps, fused = _hlo_computations(hlo)
+    return sorted(
+        name
+        for name in fused
+        if name in comps
+        and any(" reduce(" in line for line in comps[name])
+        and any(operand in line for line in comps[name])
+    )
+
+
+class DcpLeanGlueTest(parameterized.TestCase):
+    """`sparse_mla_attention_dcp` end to end with TPU_DCP_MLA_LEAN_GLUE 0 / 1.
+
+    Two DCP ranks on two local devices, the real KV scatter, glue, capped
+    kernel and `owns` mask: the updated caches, the partial output and the
+    lse must match bit for bit between the flag's two settings.
+    """
+
+    DCP = 2
+    HEADS = 64
+    TOPK = 2048
+
+    def _mesh(self):
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        devices = jax.local_devices()
+        if len(devices) < self.DCP:
+            self.skipTest(f"needs {self.DCP} local devices")
+        from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
+
+        return jax.sharding.Mesh(
+            np.array(devices[: self.DCP]), (streamindex_topk.DCP_AXIS_NAME,)
+        )
+
+    def _case(self, query_tokens, seq_q, rng):
+        from vllm_torchtpu.kernels.mla.kv_cache_utils import (
+            KVCacheLayout,
+            KVCacheType,
+            SparseMLAKVCacheSpec,
+        )
+
+        problems = [
+            _build_problem(rng, k_scale=0.75, query_tokens=query_tokens,
+                           topk=self.TOPK, num_heads=self.HEADS)
+            for _ in range(self.DCP)
+        ]
+        pages, page_size = problems[0]["sparsecore_nope"].shape[:2]
+        packing = sparse_mla.get_dtype_packing(jnp.float8_e4m3fn)
+        specs = {
+            name: SparseMLAKVCacheSpec.create(
+                kind, KVCacheLayout.SPARSECORE, pages, page_size, dim, packing
+            )
+            for name, kind, dim in (
+                ("nope_spec", KVCacheType.NOPE, NOPE_DIM),
+                ("rope_spec", KVCacheType.ROPE, ROPE_DIM),
+            )
+        }
+        nope = jnp.concatenate([p["sparsecore_nope"] for p in problems])
+        rope = jnp.concatenate([p["sparsecore_rope"] for p in problems])
+        self.assertEqual(problems[0]["sparsecore_nope"].shape, specs["nope_spec"].shape)
+        self.assertEqual(problems[0]["sparsecore_rope"].shape, specs["rope_spec"].shape)
+        # Per rank: -1 padded rank-local top-k, incl. empty and overflow rows.
+        pool = np.array([0, 1, 63, 64, 127, 128, 129, 255, 511, 512, 513, 700,
+                         1024, 1025, 2048, 0, 130])
+        topk_rows = []
+        for p in problems:
+            counts = np.resize(pool, query_tokens)
+            rng.shuffle(counts)
+            counts[0], counts[1] = 0, 1025
+            live = np.arange(self.TOPK)[None, :] < counts[:, None]
+            topk_rows.append(jnp.where(jnp.asarray(live), p["topk"], -1))
+        topk = jnp.concatenate(topk_rows).astype(jnp.int32)
+        num_seqs = len(seq_q)
+        block_tables = jnp.concatenate(
+            [jnp.asarray(rng.permutation(pages), jnp.int32) for _ in range(num_seqs)]
+        )
+        seq_lens = jnp.asarray(
+            [3000 + 517 * i + n for i, n in enumerate(seq_q)], jnp.int32
+        )
+        qsl = jnp.asarray(np.concatenate([[0], np.cumsum(seq_q)]), jnp.int32)
+        num_decode = sum(1 for n in seq_q if n == 4)
+        dist = jnp.array([num_decode, num_decode, num_seqs], jnp.int32)
+
+        def fp8(shape):
+            x = rng.standard_normal(shape).astype(np.float32)
+            return jnp.asarray(x).astype(jnp.float8_e4m3fn)
+
+        q = problems[0]["q"]
+        args = (
+            q[..., :NOPE_DIM], q[..., NOPE_DIM:],
+            fp8((query_tokens, NOPE_DIM)), fp8((query_tokens, ROPE_DIM)),
+            nope, rope, topk, seq_lens, block_tables, qsl, dist,
+        )
+        return args, specs
+
+    def _call(self, args, specs, mesh, env):
+        import os
+        from unittest import mock
+
+        from vllm_torchtpu.layers.core import attention_interface
+
+        env = {k: str(v) for k, v in env.items()}
+        with mock.patch.dict(os.environ, env):
+            fn = jax.jit(
+                lambda *a: attention_interface.sparse_mla_attention_dcp(
+                    *a, mesh, specs["nope_spec"], specs["rope_spec"],
+                    sm_scale=0.125, k_scale=0.75, dcp_size=self.DCP,
+                    interleave_size=64,
+                )
+            )
+            return jax.block_until_ready(fn(*args)), fn
+
+    @parameterized.product(
+        (
+            {"query_tokens": 16, "seq_q": (4,)},
+            {"query_tokens": 16, "seq_q": (4, 4)},
+            {"query_tokens": 512, "seq_q": (4, 4, 492)},
+        ),
+        (
+            {"split": 1, "prep": 1},  # production
+            {"split": 0, "prep": 1},
+            {"split": 1, "prep": 0},
+        ),
+    )
+    def test_lean_glue_bit_identical_end_to_end(self, query_tokens, seq_q, split, prep):
+        mesh = self._mesh()
+        rng = np.random.default_rng(20261003)
+        args, specs = self._case(query_tokens, seq_q, rng)
+        base = {"TPU_DCP_MLA_SPLIT_Q_LSE": split, "TPU_DCP_MLA_CAPPED_PREP": prep,
+                "TPU_DCP_MLA_TOPK_CAP": 512, "TPU_DCP_MLA_TOPK_CAP_CHUNK": 256}
+        ref, _ = self._call(args, specs, mesh, {**base, "TPU_DCP_MLA_LEAN_GLUE": 0})
+        got, _ = self._call(args, specs, mesh, {**base, "TPU_DCP_MLA_LEAN_GLUE": 1})
+        for name, r, g in zip(("nope", "rope", "out", "lse"), ref, got):
+            self.assertEqual(r.shape, g.shape, name)
+            self.assertEqual(r.dtype, g.dtype, name)
+            u = jnp.uint32 if r.dtype.itemsize == 4 else jnp.uint16
+            np.testing.assert_array_equal(
+                np.asarray(jax.lax.bitcast_convert_type(g, u)),
+                np.asarray(jax.lax.bitcast_convert_type(r, u)),
+                err_msg=name,
+            )
+        # Positive controls: the step wrote cache rows, and the lse holds
+        # real values, -inf (owns nothing) and, at 16 tokens, the sentinel.
+        self.assertFalse(np.array_equal(np.asarray(got[0]), np.asarray(args[4])))
+        self.assertFalse(np.array_equal(np.asarray(got[1]), np.asarray(args[5])))
+        lse = np.asarray(got[3])
+        self.assertTrue(np.isfinite(lse).any())
+        self.assertTrue((lse == -np.inf).any())
+        if query_tokens == 16:
+            self.assertTrue((lse == np.finfo(np.float32).min).any())
+
+    def test_lean_glue_hlo_drops_targeted_ops(self):
+        """At a decode bucket (16 tokens, production flags) the lean program
+        has no lse `jnp.full` buffer, no pad of the packed u32 rows (the
+        pack writes the padded rows itself) and one fewer top-k reduction.
+        Prints the counted instructions of both programs.
+        """
+        mesh = self._mesh()
+        rng = np.random.default_rng(20261004)
+        args, specs = self._case(16, (4, 4), rng)
+        base = {"TPU_DCP_MLA_SPLIT_Q_LSE": 1, "TPU_DCP_MLA_CAPPED_PREP": 1,
+                "TPU_DCP_MLA_TOPK_CAP": 512, "TPU_DCP_MLA_TOPK_CAP_CHUNK": 256}
+        hlo, shapes = {}, {}
+        import os
+        from unittest import mock
+
+        from vllm_torchtpu.layers.core import attention_interface
+
+        for lean in (0, 1):
+            env = {k: str(v) for k, v in {**base, "TPU_DCP_MLA_LEAN_GLUE": lean}.items()}
+            with mock.patch.dict(os.environ, env):
+
+                def layers(*a):
+                    return attention_interface.sparse_mla_attention_dcp(
+                        *a, mesh, specs["nope_spec"], specs["rope_spec"],
+                        sm_scale=0.125, k_scale=0.75, dcp_size=self.DCP,
+                        interleave_size=64,
+                    )
+
+                hlo[lean] = _optimized_hlo(jax.jit(layers), *args)
+            shapes[lean] = _top_level_shapes(hlo[lean])
+            dump = os.environ.get("LEAN_GLUE_HLO_DIR")
+            if dump:
+                os.makedirs(dump, exist_ok=True)
+                with open(os.path.join(dump, f"lean{lean}.hlo.txt"), "w") as f:
+                    f.write(hlo[lean])
+
+        def reduce_fusions(text):
+            return _fusions_reducing(text, "s32[16,2048]")
+
+        for lean in (0, 1):
+            print(f"LEAN_GLUE={lean}")
+            for shape in ("f32[16,64]", "u32[16,128]", "u32[32,128]", "pred[16]", "s32[16]"):
+                for line in shapes[lean].get(shape, []):
+                    print(f"  {shape}: {line}")
+            print(f"  s32[16,2048] reduce fusions: {reduce_fusions(hlo[lean])}")
+        f32 = {k: len(v.get("f32[16,64]", [])) for k, v in shapes.items()}
+        u32 = {k: len(v.get("u32[16,128]", [])) for k, v in shapes.items()}
+        red = {k: len(reduce_fusions(hlo[k])) for k in (0, 1)}
+        print(f"COUNTS f32[16,64]={f32} u32[16,128]={u32} topk_reduce_fusions={red}")
+        # The incumbent has the lse buffer and the packed-row pad (positive
+        # controls); lean has one f32[16,64] op fewer and no unpadded pack.
+        self.assertEqual(f32[1], f32[0] - 1)
+        self.assertGreater(u32[0], 0)
+        self.assertEqual(u32[1], 0)
+        self.assertLess(red[1], red[0])
 
 
 if __name__ == "__main__":
