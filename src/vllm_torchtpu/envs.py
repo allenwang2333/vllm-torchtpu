@@ -858,6 +858,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
         "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
     ),
+    # Qwen3.5 & InferenceX benchmark environment variables
+    "TPU_EXPERT_PLACEMENT": env_str("TPU_EXPERT_PLACEMENT", default=""),
+    "TPU_GDN_FUSED_NORM_QUANT": env_bool("TPU_GDN_FUSED_NORM_QUANT", default=False),
+    "TPU_NORM_WEIGHT_HOIST": env_bool("TPU_NORM_WEIGHT_HOIST", default=False),
+    "TPU_FUSED_QK_NORM_ROPE": env_int("TPU_FUSED_QK_NORM_ROPE", default=0),
+    "TPU_MOE_LOWTOK_FROM_SCORES": env_int("TPU_MOE_LOWTOK_FROM_SCORES", default=0),
+    "TPU_MOE_LOWTOK_SCORES_STRICT": env_int("TPU_MOE_LOWTOK_SCORES_STRICT", default=0),
+    "TPU_MOE_LOWTOK_MAX_TOKENS": env_int("TPU_MOE_LOWTOK_MAX_TOKENS", default=0),
+    "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": env_int("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", default=0),
+    "USE_MOE_COUNTING_SORT": env_bool("USE_MOE_COUNTING_SORT", default=False),
+    "TPU_SP_MIN_ROWS": env_int("TPU_SP_MIN_ROWS", default=0),
+    "TPU_SP_FP8_GATHER": env_int("TPU_SP_FP8_GATHER", default=0),
+    "TPU_RPA_DECODE_VMEM_MIB": env_int("TPU_RPA_DECODE_VMEM_MIB", default=0),
+    "TPU_RPA_DECODE_BATCH": env_int("TPU_RPA_DECODE_BATCH", default=0),
+    "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_int("TPU_SMALL_ALL_REDUCE_MAX_ROWS", default=0),
+    "TPU_SMALL_ALL_REDUCE_FORM": env_str("TPU_SMALL_ALL_REDUCE_FORM", default=""),
+    "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS", default=False),
+    "TPU_GDN_TABLES_IN_KERNEL": env_bool("TPU_GDN_TABLES_IN_KERNEL", default=False),
+    "TPU_GDN_DECODE_TILE": env_int("TPU_GDN_DECODE_TILE", default=4),
+    "TPU_GATED_NORM_TILE": env_int("TPU_GATED_NORM_TILE", default=32),
+    "TPU_TOKEN_BUCKET_STEP": env_int("TPU_TOKEN_BUCKET_STEP", default=0),
+    "DP_PLACEMENT": env_str("DP_PLACEMENT", default=""),
+    "DP_SCHED_BUFFER_THRESHOLD": env_int("DP_SCHED_BUFFER_THRESHOLD", default=0),
+    "DP_SCHED_BUFFER_FLUSH_MS": env_int("DP_SCHED_BUFFER_FLUSH_MS", default=5000),
+    "DP_SCHED_BUFFER_IDLE_TRIGGER": env_bool("DP_SCHED_BUFFER_IDLE_TRIGGER", default=True),
+    "DP_SCHED_BUFFER_QUIET_MS": env_int("DP_SCHED_BUFFER_QUIET_MS", default=0),
+    "TPU_SHARDED_LM_HEAD": env_bool("TPU_SHARDED_LM_HEAD", default=False),
+    "USE_BATCHED_RPA_LONGCTX": env_bool("USE_BATCHED_RPA_LONGCTX", default=False),
+    "GDN_STATE_DTYPE": env_str("GDN_STATE_DTYPE", default="bfloat16"),
 }
 
 

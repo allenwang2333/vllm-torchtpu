@@ -583,12 +583,13 @@ class TpuCompilerAdaptor(CompilerInterface):
         is_profile = bool(self.cache_dir and "profile_cache" in self.cache_dir)
 
         if envs.VLLM_TORCHTPU_LOAD_HLO_DIR and not is_profile:
-            return (
-                stablehlo_export.load_and_compile_stablehlo(
-                    self, graph, example_inputs, compile_range, key
-                ),
-                None,
+            compiled_fn = stablehlo_export.load_and_compile_stablehlo(
+                self, graph, example_inputs, compile_range, key
             )
+            size = _single_size(compile_range)
+            if size is not None:
+                shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
+            return compiled_fn, None
 
         if envs.VLLM_TORCHTPU_EXPORT_HLO_DIR and not is_profile:
             stablehlo_export.export_stablehlo(

@@ -59,7 +59,6 @@ class StateRegion:
     128-lane split); the leading ``rows_used`` typed rows carry the
     state, the rest is zero padding.
     """
-
     kb0: int
     nblocks: int
     row0: int
@@ -86,7 +85,6 @@ class StateSourcePlan:
     decoding every checkpoint is an independent source block named by
     ``MetadataRef.s_idx_to_ckpt_indices`` and reuses this same geometry,
     so nothing here varies with the verify window."""
-
     stride: int
     conv: StateRegion
     recurrent: StateRegion
@@ -167,20 +165,12 @@ class GDNConfig:
         moves work from MXU to XLU. More value heads already means more
         XLU work, hence the smaller blocks there.
         """
-        # Within-block forward substitution issues head_groups * B / 2 broadcasts
-        # per token. At 1 head group (<= 8 heads), B = 16 is optimal.
-        # - GDN issues O(1 / B) between-block solver matmuls per token, so scale
-        #   B inversely with head_groups (head_groups * B <= 16).
-        # - KDA also tiles Aqk and L into O(1 / B^2) sub-block matmuls per token,
-        #   so scale B^2 inversely with head_groups (head_groups * B**2 <= 16**2).
-        head_groups = pl.cdiv(self.num_v_heads, 8)
-        if self.is_kda:
-            for b in (16, 8, 4):
-                if head_groups * b * b <= 256:
-                    return b
+        # TODO(alynie): create a better heuristic to tune this value.
+        if self.num_v_heads == 64:
             return 2
-        # GDN: between-block updates scale as 1 / B.
-        return max(2, min(16, 16 // head_groups))
+        if self.num_v_heads == 32:
+            return 8
+        return 16
 
     @property
     def use_recurrent(self) -> bool:
@@ -215,7 +205,8 @@ class GDNConfig:
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
-        return f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}{suffix}"
+        return (f"fused_conv1d_{self.attention_mode.value}"
+                f"_{self.mode.value}{suffix}")
 
     def get_metadata(self) -> dict[str, str | int | float]:
         cfgs_dict = dataclasses.asdict(self)
@@ -242,15 +233,13 @@ class GDNConfig:
 
     def get_vmem_limit_bytes(self) -> int:
         tpu_info = pltpu.get_tpu_info()
-        fraction = (
-            self.WINDOWED_VMEM_FRACTION
-            if self.window_size > 1
-            else self.DEFAULT_VMEM_FRACTION
-        )
+        fraction = (self.WINDOWED_VMEM_FRACTION
+                    if self.window_size > 1 else self.DEFAULT_VMEM_FRACTION)
         return int(fraction * tpu_info.vmem_capacity_bytes)
 
     def get_scratch_shape_dict(self) -> dict[str, Any]:
-        conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1, self.dim_size)
+        conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1,
+                      self.dim_size)
         recurrent_shape = (
             self.seq_tile_size,
             self.num_v_heads,

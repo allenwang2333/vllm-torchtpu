@@ -1014,7 +1014,21 @@ def test_rfc_contract_safeguards_buffer_donor_hardware_and_custom_call(
     drifted_metadata[fn_key]["target_hardware"]["jaxlib"] = "0.0.0-different"
     drifted_metadata[fn_key]["target_hardware"]["libtpu"] = "0.0.0-different"
     metadata_path.write_text(json.dumps(drifted_metadata, indent=2))
-    with patch.object(stablehlo_export.logger, "warning") as mock_warn:
+    with (
+        patch.object(stablehlo_export.logger, "warning") as mock_warn,
+        patch(
+            "torch_tpu._internal.compile.tpu_torch_compile.parse_mlir_text",
+            return_value=MagicMock(name="ContextedModule"),
+        ),
+        patch(
+            "torch_tpu._internal.compile.tpu_torch_compile.compile_mlir",
+            return_value=MagicMock(name="PjRtLoadedExecutable"),
+        ),
+        patch(
+            "torch_tpu._internal.compile.tpu_torch_compile.execute",
+            return_value=[torch.ones((16, 64), dtype=torch.bfloat16)],
+        ),
+    ):
         compiler.compile(graph, inputs, {}, compile_range, key=cache_key)
         assert mock_warn.call_count >= 1
     metadata_path.write_text(json.dumps(metadata, indent=2))
