@@ -176,6 +176,11 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # export is chosen from their source, so an edit here has to invalidate
     # the compiled executables like any other kernel change.
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
+    "vllm_torchtpu/layers/adapter/fused_moe_ep_v3.py",
+    "vllm_torchtpu/layers/adapter/fused_qk_norm_rope_tpu.py",
+    "vllm_torchtpu/layers/adapter/gated_norm_quant_op.py",
+    "vllm_torchtpu/layers/adapter/moe_lowtok_scores_op.py",
+    "vllm_torchtpu/layers/adapter/small_all_reduce_op.py",
     # Still listed: on this base `pp_shift.py` is a second caller, so the
     # module stays even though the fused EP op no longer needs it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",
