@@ -533,6 +533,14 @@ def fused_conv1d_gdn(
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
+    # EXPERIMENT (close-gaps gap 3 G4): env overrides for a twin sweep; not for merge.
+    import os as _os
+
+    if _os.environ.get("VLLM_TPU_GDN_MIXED_TILE"):
+        mixed_tile_size = int(_os.environ["VLLM_TPU_GDN_MIXED_TILE"])
+    if _os.environ.get("VLLM_TPU_GDN_COMPUTE_BF16") == "1":
+        compute_precision = jnp.bfloat16.dtype
+
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
