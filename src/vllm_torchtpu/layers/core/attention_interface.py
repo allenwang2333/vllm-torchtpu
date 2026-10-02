@@ -1132,6 +1132,7 @@ def sparse_mla_attention_dcp(
         request_distribution_,
     ):
         dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
+        lean_glue = envs.TPU_DCP_MLA_LEAN_GLUE
         kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
             kv_cache_nope,
             kv_cache_rope,
@@ -1145,6 +1146,7 @@ def sparse_mla_attention_dcp(
             rope_spec=rope_spec,
             dcp_size=dcp_size,
             interleave_size=interleave_size,
+            pad_before_pack=lean_glue,
         )
 
         # A rank owning none of a token's top-k still has to be handed one
@@ -1206,6 +1208,8 @@ def sparse_mla_attention_dcp(
             capped_window_prep=envs.TPU_DCP_MLA_CAPPED_PREP,
             # Decode chunks: tokens per grid step (1 = kernel default).
             small_chunk_batch_size=small_chunk_batch,
+            # Single-chunk lse straight from the kernel, no `jnp.full` buffer.
+            lse_fresh_output=lean_glue,
             **chunk_kwargs,
             **split_kwargs,
         )

@@ -14,6 +14,7 @@
 """SparseCore Pallas scatter of MLA latents into the paged KV cache."""
 
 import jax
+import jax.numpy as jnp
 
 from vllm_torchtpu.kernels.mla import kv_cache_utils, scatter_utils
 
@@ -26,6 +27,7 @@ def scatter(
     block_tables: jax.Array | None = None,
     query_start_loc: jax.Array | None = None,
     dst_rows: jax.Array | None = None,
+    pad_before_pack: bool = False,
 ) -> jax.Array:
     """Packs `values` for `spec`'s layout and scatters one row per token.
 
@@ -39,6 +41,9 @@ def scatter(
       query_start_loc: cumulative new-token counts, [num_seqs + 1].
       dst_rows: precomputed destination row per token; derived from the three
         arrays above when None.
+      pad_before_pack: pad `values` (and `dst_rows`) to the writer's token
+        grid before packing, so the pad fuses into the pack instead of being a
+        separate copy of the packed rows. Same rows written.
 
     Returns:
       The updated cache, same shape and dtype as `cache`.
@@ -60,6 +65,14 @@ def scatter(
             query_start_loc=query_start_loc,
             page_size=spec.page_size,
         )
+    if pad_before_pack:
+        pad_tokens = scatter_utils.padded_num_tokens(values.shape[0]) - values.shape[0]
+        if pad_tokens > 0:
+            # Zero fp8 bytes pack to zero words: the rows `scatter_rows` pads.
+            values = jnp.pad(values, ((0, pad_tokens), (0, 0)))
+            dst_rows = jnp.pad(
+                dst_rows, (0, pad_tokens), constant_values=kv_cache_utils.SKIP_ROW
+            )
     if spec.layout is kv_cache_utils.KVCacheLayout.TENSORCORE:
         src = kv_cache_utils.as_token_bytes(values, spec.token_bytes)
     else:

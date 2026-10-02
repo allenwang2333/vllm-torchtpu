@@ -359,6 +359,7 @@ def _attention_kernel(
     capped_windows: int | None = None,
     split_q: bool = False,
     lse_lane_dense: bool = False,
+    lse_aliased: bool = True,
 ):
     # Split-q mode (`split_q`): `q_hbm_ref` holds q_nope only and the rope
     # part arrives as a separate input `q_pe_hbm_ref` (first of `refs`), with
@@ -396,9 +397,12 @@ def _attention_kernel(
         assert packed_bkv is None or capped_windows is None
         fix_refs = refs[-6:]
         refs = refs[:-6]
+    if return_lse and not lse_aliased:
+        # Fresh lse output (no aliased input buffer): same refs minus the input.
+        refs = (None, *refs)
     if return_lse:
         (
-            _lse_in_hbm_ref,  # aliased with lse_hbm_ref; never read
+            _lse_in_hbm_ref,  # aliased with lse_hbm_ref (or None); never read
             o_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
             lse_hbm_ref,  # f32[max_num_tokens, num_q_heads, 1]
             bkv_nope_x2_ref,  # [2, bsz, topk * WORD_BYTES, TILE_LANE_BYTES]
@@ -1245,6 +1249,7 @@ def prepare_outputs(
         "topk_cap",
         "capped_window_prep",
         "lse_lane_dense",
+        "lse_fresh_output",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -1284,6 +1289,7 @@ def sparse_ragged_paged_attention(
     capped_window_prep: bool = False,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    lse_fresh_output: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1370,6 +1376,13 @@ def sparse_ragged_paged_attention(
       lse_lane_dense: With `return_lse`, carry the log-sum-exp as f32[tokens,
         heads] through the kernel instead of f32[tokens, heads, 1] (lane-padded
         tiles). Same values.
+      lse_fresh_output: With `return_lse` and a single gather/attention chunk,
+        the kernel writes lse to a fresh (un-aliased) output and rows the grid
+        never reaches get the sentinel from a select on that output -- which
+        XLA fuses into the caller's elementwise consumer -- instead of a
+        `jnp.full` buffer materialised for the kernel to overwrite. Same
+        values; multi-chunk calls keep the buffer, which carries rows across
+        chunks.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -1520,6 +1533,7 @@ def sparse_ragged_paged_attention(
     # Rows the grid never reaches (padding past `batch_end`) keep this
     # sentinel, so a downstream merge weights them at exp(min - max) == 0
     # instead of tripping on uninitialised memory.
+    fresh_lse = return_lse and lse_fresh_output and num_chunks == 1
     lse = (
         jnp.full(
             (q.shape[0], num_q_heads)
@@ -1528,7 +1542,7 @@ def sparse_ragged_paged_attention(
             jnp.finfo(jnp.float32).min,
             dtype=jnp.float32,
         )
-        if return_lse
+        if return_lse and not fresh_lse
         else None
     )
 
@@ -1604,6 +1618,7 @@ def sparse_ragged_paged_attention(
             topk=topk,
             q_pe=q_pe,
             lse_lane_dense=lse_lane_dense,
+            fresh_lse=fresh_lse,
         )
         if return_lse:
             q, lse = result
@@ -1708,6 +1723,7 @@ def sparse_attention_chunk(
     topk: int | None = None,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    fresh_lse: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1735,8 +1751,13 @@ def sparse_attention_chunk(
     (unpadded, nope a multiple of 128) and `q_pe` its rope part; the kernel
     joins them in VMEM and the output (aliasing `q`) is `nope` wide.
     `lse_lane_dense`: `lse` is f32[max_num_tokens, num_q_heads].
+    `fresh_lse` (with `lse` None): return lse from a fresh kernel output, rows
+    at or past the grid's end set to the `jnp.finfo(f32).min` sentinel -- the
+    values an aliased buffer from `sparse_ragged_paged_attention` would hold.
     """
-    return_lse = lse is not None
+    if fresh_lse and lse is not None:
+        raise ValueError("fresh_lse takes no lse buffer")
+    return_lse = lse is not None or fresh_lse
     if topk is None:
         topk = physical_indices.shape[-1]
     if window_indices is not None and topk_cap is None:
@@ -1787,7 +1808,8 @@ def sparse_attention_chunk(
         # the lse buffer is threaded through as an aliased in/out to carry
         # earlier chunks' rows forward.
         if return_lse:
-            in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # lse (in)
+            if not fresh_lse:
+                in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # lse (in)
             out_specs = [out_specs, pl.BlockSpec(memory_space=pltpu.HBM)]
 
         # One batch entry's worth of gathered top-k rows, per cache.
@@ -1823,6 +1845,11 @@ def sparse_attention_chunk(
             bq_double_buf,
             bo_double_buf,  # Double buffering for output block.
         ]
+        lse_shape = (
+            (q.shape[0], num_q_heads)
+            if lse_lane_dense
+            else (q.shape[0], num_q_heads, 1)
+        )
         if return_lse:
             scratch_shapes.append(
                 pltpu.VMEM(
@@ -1883,6 +1910,7 @@ def sparse_attention_chunk(
             capped_windows=capped_windows,
             split_q=split_q,
             lse_lane_dense=lse_lane_dense,
+            lse_aliased=not fresh_lse,
         )
         if packed is not None:
             # Fourth scalar prefetch: per-token atom offset into the stream.
@@ -1922,7 +1950,7 @@ def sparse_attention_chunk(
                 out_shape=(
                     [
                         jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-                        jax.ShapeDtypeStruct(shape=lse.shape, dtype=lse.dtype),
+                        jax.ShapeDtypeStruct(shape=lse_shape, dtype=jnp.float32),
                     ]
                     if return_lse
                     else jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
@@ -1932,7 +1960,7 @@ def sparse_attention_chunk(
                         num_prefetch: 0,
                         num_prefetch + 3 + int(split_q): 1,
                     }
-                    if return_lse
+                    if return_lse and not fresh_lse
                     else {
                         # 3 = q; operand indices count the scalar prefetches
                         # (DSV4's "4" also counted attention_sinks).
@@ -1945,9 +1973,21 @@ def sparse_attention_chunk(
         operands = [q, cache_kv_nope, cache_kv_rope]
         if split_q:
             operands.append(q_pe)
-        if return_lse:
+        if return_lse and not fresh_lse:
             operands.append(lse)
-        return kernel(*scalar_prefetches, *operands)
+        result = kernel(*scalar_prefetches, *operands)
+        if not fresh_lse:
+            return result
+        # Rows past the grid were never written; give them the sentinel the
+        # aliased buffer would have carried (a select XLA fuses downstream).
+        out, lse_out = result
+        rows = jax.lax.broadcasted_iota(jnp.int32, lse_shape, 0)
+        lse_out = jnp.where(
+            (rows >= start_seq_idx) & (rows < end_seq_idx),
+            lse_out,
+            jnp.finfo(jnp.float32).min,
+        )
+        return out, lse_out
 
     indices = None if physical_indices is None else physical_indices[start_pos:end_pos]
 

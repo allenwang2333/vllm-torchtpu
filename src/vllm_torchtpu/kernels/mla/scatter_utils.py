@@ -142,6 +142,14 @@ def _scatter_kernel(
     )(dst_hbm_ref, src_words)
 
 
+def padded_num_tokens(num_tokens: int) -> int:
+    """Tokens `scatter_rows` pads a `num_tokens` step to (its grid's cover)."""
+    sc_info = pltpu.get_tpu_info().sparse_core
+    assert sc_info is not None, "SparseCore info is missing."
+    num_cores = sc_info.num_cores * sc_info.num_subcores
+    return split_plan(num_tokens, sc_info.num_lanes, num_cores).total_tokens
+
+
 def scatter_rows(
     cache: jax.Array,
     src: jax.Array,

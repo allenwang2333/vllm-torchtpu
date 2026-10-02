@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_CAPPED_PREP: bool = False
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 1
+    TPU_DCP_MLA_LEAN_GLUE: bool = False
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_LSE_MERGE_RS_BF16: bool = False
@@ -404,6 +405,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # grids `cdiv(real tokens, step)` steps, so up to N-1 padding rows are
     # attended (outputs don't-care). 1 = the kernel default (unchanged).
     "TPU_DCP_MLA_SMALL_CHUNK_BATCH": env_int("TPU_DCP_MLA_SMALL_CHUNK_BATCH", 1),
+    # DCP sparse MLA per-call glue: a single-chunk call (every decode step)
+    # takes the kernel's lse as a fresh output, its unreached-row sentinel
+    # folded into the `owns` select, instead of overwriting a `jnp.full`
+    # buffer it aliases; and the KV-latent scatter pads the fp8 values before
+    # packing them instead of the packed rows. Bit-identical outputs.
+    "TPU_DCP_MLA_LEAN_GLUE": env_bool("TPU_DCP_MLA_LEAN_GLUE", default=False),
     # DCP MLA log-sum-exp merge (`cp_mla_attention.merge_lse_partials_scatter_heads`)
     # for steps of at most TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS tokens: instead of
     # an lse all-gather, an f32 weight multiply of the whole [T, H, V] partial

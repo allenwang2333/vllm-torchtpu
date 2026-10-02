@@ -393,6 +393,7 @@ def _scatter_caches(
     slot: jax.Array,
     nope_spec: SparseMLAKVCacheSpec,
     rope_spec: SparseMLAKVCacheSpec,
+    pad_before_pack: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Write both caches at (`page`, `slot`), with Pallas wherever it can.
 
@@ -406,11 +407,19 @@ def _scatter_caches(
 
     dst_rows = _dst_rows(page, slot, nope_spec.page_size)
     kv_cache_nope = scatter.scatter(
-        kv_cache_nope, kv_c_normed, nope_spec, dst_rows=dst_rows
+        kv_cache_nope,
+        kv_c_normed,
+        nope_spec,
+        dst_rows=dst_rows,
+        pad_before_pack=pad_before_pack,
     )
     if rope_spec.layout is KVCacheLayout.SPARSECORE:
         kv_cache_rope = scatter.scatter(
-            kv_cache_rope, k_pe, rope_spec, dst_rows=dst_rows
+            kv_cache_rope,
+            k_pe,
+            rope_spec,
+            dst_rows=dst_rows,
+            pad_before_pack=pad_before_pack,
         )
     else:
         kv_cache_rope = _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot)
@@ -463,6 +472,7 @@ def update_sparse_mla_kv_cache_dcp(
     rope_spec: SparseMLAKVCacheSpec,
     dcp_size: int,
     interleave_size: int,
+    pad_before_pack: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Scatter this step's MLA latents into a DCP position-sharded cache.
 
@@ -503,6 +513,7 @@ def update_sparse_mla_kv_cache_dcp(
       dcp_rank: i32 scalar, this shard's DCP index.
       nope_spec, rope_spec: layout descriptors the shards were allocated from.
       dcp_size, interleave_size: the shard layout.
+      pad_before_pack: see `scatter.scatter`; same rows written.
 
     Returns:
       The updated (nope, rope) shards, same shapes/dtypes as the inputs.
@@ -527,6 +538,7 @@ def update_sparse_mla_kv_cache_dcp(
         slot,
         nope_spec,
         rope_spec,
+        pad_before_pack=pad_before_pack,
     )
 
 
