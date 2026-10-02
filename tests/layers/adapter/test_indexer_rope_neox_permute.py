@@ -224,7 +224,8 @@ def test_flag_on_matches_flag_off(layout, num_tokens):
     # weights_proj columns untouched; q per-head fp8 rows exactly P of the old
     # (same dot products, NeoX(Px) == P GPT-J(x), order-free amax).
     assert torch.equal(w1, w0)
-    assert torch.equal(q1.view(torch.uint8), q0[..., hp].view(torch.uint8))
+    # (value compare: the full-head rope may turn a -0 into +0)
+    assert torch.equal(q1.float(), q0[..., hp].float())
     # k: LayerNorm over permuted channels reassociates its mean/var sums.
     assert _relmax(k1, k0[..., hp]) < 2e-2, _relmax(k1, k0[..., hp])
     # Scores on a key set of the step's own tokens (cap the s axis for 4096).
@@ -280,17 +281,58 @@ def test_permutation_is_idempotent_and_moves_scales():
     assert torch.equal(ind.k_norm.weight, before_n[_head_perm()])
 
 
-def test_rope_receives_half_split_style():
-    """Flag on calls NeoX arithmetic on the module's own cos/sin cache."""
+def test_rope_takes_the_full_head_path():
+    """Flag on with a plain RotaryEmbedding: q and k are roped whole (no
+    split/cat), on the module's own cos/sin cache; the GPT-J forward is not
+    called."""
     rope = _rope()
     ind = _indexer()
     ind.permute_rope_to_half_split()
     hidden, qr, positions = _inputs(4)
-    with patch.object(
-        mla_op, "rope_half_split", wraps=mla_op.rope_half_split
-    ) as spy, patch.object(rope, "forward_native", side_effect=AssertionError):
+    with (
+        patch.object(
+            mla_op, "rope_half_split_leading", wraps=mla_op.rope_half_split_leading
+        ) as spy,
+        patch.object(rope, "forward_native", side_effect=AssertionError),
+    ):
         _triple(ind, rope, hidden, qr, positions)
-    assert spy.call_count == 1
+    assert spy.call_count == 2
+
+
+@pytest.mark.parametrize("shape", [(16, 32, 128), (4096, 32, 128), (16, 1, 64)])
+def test_full_head_rope_equals_split_neox_bitwise(shape):
+    """`rope_half_split_leading` == vLLM NeoX on the leading 64 channels +
+    pass-through, bit for bit (up to the sign of zero) in bf16."""
+    rope = _rope()
+    gen = torch.Generator().manual_seed(3)
+    x = torch.randn(*shape, generator=gen).bfloat16()
+    positions = torch.randint(0, MAX_POS, (shape[0],), generator=gen)
+    got = mla_op.rope_half_split_leading(rope, positions, x, ROPE)
+    pe, rest = x[..., :ROPE], x[..., ROPE:]
+    ref_pe, _ = mla_op.rope_half_split(rope, positions, pe.clone(), pe[:, :1].clone())
+    ref = torch.cat([ref_pe.reshape(pe.shape), rest], dim=-1)
+    assert torch.equal(got.float(), ref.float())
+
+
+def test_deepseek_scaling_rope_falls_back_to_split_path():
+    cfg = CompilationConfig(mode=CompilationMode.NONE, custom_ops=["none"])
+    with patch.object(custom_op_mod, "get_cached_compilation_config", lambda: cfg):
+        rope = mla_op.VllmDeepseekScalingRotaryEmbedding(
+            head_size=ROPE,
+            rotary_dim=ROPE,
+            max_position_embeddings=MAX_POS,
+            base=10000.0,
+            is_neox_style=False,
+            scaling_factor=4.0,
+            dtype=torch.bfloat16,
+        )
+    assert not mla_op.rope_half_split_leading_supported(rope)
+    off, on = _indexer(), _indexer()
+    on.permute_rope_to_half_split()
+    hidden, qr, positions = _inputs(DECODE_TOKENS)
+    s0 = _scores(*_triple(off, rope, hidden, qr, positions))
+    s1 = _scores(*_triple(on, rope, hidden, qr, positions))
+    assert _relmax(s1, s0) < 1e-2, _relmax(s1, s0)
 
 
 class _Attn(torch.nn.Module):

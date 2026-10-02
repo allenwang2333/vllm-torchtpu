@@ -662,33 +662,40 @@ class VllmTPUIndexer(Indexer):
     ) -> torch.Tensor:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
         # Fused wk + weights_proj: one GEMM, then split
         kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
         weights = kw[:, self.head_dim :]
 
         k = self.k_norm(k)
-        k_pe, k_nope = torch.split(
-            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
-
-        if getattr(self, "_rope_neox_permuted", False):
-            q_pe, k_pe = rope_half_split(rotary_emb, positions, q_pe, k_pe.unsqueeze(1))
+        permuted = getattr(self, "_rope_neox_permuted", False)
+        if permuted and rope_half_split_leading_supported(rotary_emb):
+            # Half-split columns: rope the whole head in place, no split/cat.
+            q = rope_half_split_leading(rotary_emb, positions, q, self.rope_dim)
+            k = rope_half_split_leading(rotary_emb, positions, k, self.rope_dim)
         else:
-            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
-        # Note: RoPE (NeoX) can introduce extra leading dimensions during
-        # compilation so we need to reshape back to token-flattened shapes
-        q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
-        k_pe = k_pe.reshape(-1, 1, self.rope_dim)
+            q_pe, q_nope = torch.split(
+                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            )
+            k_pe, k_nope = torch.split(
+                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            )
+            if permuted:
+                q_pe, k_pe = rope_half_split(
+                    rotary_emb, positions, q_pe, k_pe.unsqueeze(1)
+                )
+            else:
+                q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+            # Note: RoPE (NeoX) can introduce extra leading dimensions during
+            # compilation so we need to reshape back to token-flattened shapes
+            q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
+            k_pe = k_pe.reshape(-1, 1, self.rope_dim)
 
-        # `rotary_emb` is shape-preserving; `q_pe` is already
-        # [num_tokens, n_head, rope_dim].
-        q = torch.cat([q_pe, q_nope], dim=-1)
-        # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
-        k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
+            # `rotary_emb` is shape-preserving; `q_pe` is already
+            # [num_tokens, n_head, rope_dim].
+            q = torch.cat([q_pe, q_nope], dim=-1)
+            # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
+            k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
 
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)
@@ -812,6 +819,42 @@ def rope_half_split(rotary_emb, positions, query, key):
         rotary_emb.rotary_dim,
         rotary_emb._match_cos_sin_cache_dtype(query),
         True,
+    )
+
+
+def rope_half_split_leading(
+    rotary_emb, positions: torch.Tensor, x: torch.Tensor, rope_dim: int
+) -> torch.Tensor:
+    """NeoX rope on the leading `rope_dim` channels of `x` `[T, ..., D]`, the
+    other `D - rope_dim` channels passed through, as ONE full-width
+    elementwise expression: `x * C + rot(x) * S` with
+    `C = [cos, cos, 1...]`, `S = [-sin, sin, 0...]` and
+    `rot(x) = [x[h:2h], x[:h], x[2h:]]` (h = rope_dim / 2).
+
+    Same products and the same add per channel as `rope_half_split`
+    (`x1 * cos - x2 * sin == x1 * cos + x2 * (-sin)`, pass-through is
+    `x * 1 + y * 0`), but no split / cat of the head: XLA sees a single
+    D-wide fusion instead of half-width rope pieces it has to lay out and
+    copy back. Only for a plain `RotaryEmbedding` (cache in `x`'s dtype)."""
+    t, d, h = x.shape[0], x.shape[-1], rope_dim // 2
+    cos_sin = rotary_emb._match_cos_sin_cache_dtype(x).index_select(
+        0, positions.flatten()
+    )
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    parts_c, parts_s = [cos, cos], [-sin, sin]
+    if d > rope_dim:
+        parts_c.append(cos.new_ones(t, d - rope_dim))
+        parts_s.append(sin.new_zeros(t, d - rope_dim))
+    bcast = (t,) + (1,) * (x.ndim - 2) + (d,)
+    c = torch.cat(parts_c, dim=-1).view(bcast)
+    s_ = torch.cat(parts_s, dim=-1).view(bcast)
+    rot = torch.cat([x[..., h:rope_dim], x[..., :h], x[..., rope_dim:]], dim=-1)
+    return x * c + rot * s_
+
+
+def rope_half_split_leading_supported(rotary_emb) -> bool:
+    return not isinstance(rotary_emb, DeepseekScalingRotaryEmbedding) and isinstance(
+        rotary_emb, RotaryEmbedding
     )
 
 
