@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SC_TOPK_FUSED_PAYLOAD: bool = False
     TPU_INDEXER_TOPK_SINGLE_WRITE: bool = False
+    TPU_INDEXER_TOPK_NOCOPY: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -686,6 +687,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_INDEXER_TOPK_SINGLE_WRITE": env_bool(
         "TPU_INDEXER_TOPK_SINGLE_WRITE", default=False
     ),
+    # As TPU_INDEXER_TOPK_SINGLE_WRITE (implies it), with the row update done
+    # by a donating op so XLA updates the table in place instead of copying the
+    # whole `[max_num_batched_tokens, width]` table in every indexed layer.
+    "TPU_INDEXER_TOPK_NOCOPY": env_bool("TPU_INDEXER_TOPK_NOCOPY", default=False),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(
