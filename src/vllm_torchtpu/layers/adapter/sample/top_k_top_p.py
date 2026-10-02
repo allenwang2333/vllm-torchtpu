@@ -284,6 +284,51 @@ def topk_fast_path_bound(top_k: torch.Tensor, top_p: torch.Tensor, k_bound: int)
     return k_bound if bool((bounded | unmasked).all()) else 0
 
 
+_TOPK_CHUNK = 128
+
+
+def _chunked_topk(
+    logits: torch.Tensor, width: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sorted top-``width`` values of each row, and indices holding them.
+
+    XLA's TopK on TPU costs ~35 us per 248,320-wide row (j-b68bd068), so the
+    full-vocab TopK is replaced by: per-chunk maxima over 128-wide chunks, the
+    ``width`` chunks with the largest maxima, and one TopK over just those
+    ``width * 128`` candidates. The values are exactly the full TopK's: if
+    m is the width-th largest chunk maximum, at least ``width`` elements are
+    >= m, so the width-th largest value v >= m; every element > m sits in a
+    chunk whose maximum is > m, and fewer than ``width`` chunks have one, so
+    all are candidates, and the candidates hold >= ``width`` elements >= m.
+    Only which of several tied elements an index points at can differ, and
+    tied elements have equal logits.
+    """
+    batch, vocab = logits.shape
+    num_chunks = -(-vocab // _TOPK_CHUNK)
+    if num_chunks <= width:
+        return torch.topk(logits, width, dim=-1, largest=True, sorted=True)
+    padded = num_chunks * _TOPK_CHUNK
+    if padded != vocab:
+        logits = torch.nn.functional.pad(
+            logits, (0, padded - vocab), value=float("-inf")
+        )
+    chunks = logits.view(batch, num_chunks, _TOPK_CHUNK)
+    chunk_max = torch.amax(chunks, dim=-1)
+    _, top_chunks = torch.topk(chunk_max, width, dim=-1, largest=True, sorted=False)
+    candidates = torch.gather(
+        chunks,
+        1,
+        top_chunks.unsqueeze(-1).expand(batch, width, _TOPK_CHUNK),
+    ).reshape(batch, width * _TOPK_CHUNK)
+    vals, cand_idx = torch.topk(candidates, width, dim=-1, largest=True, sorted=True)
+    chunk_of = torch.gather(top_chunks, 1, cand_idx // _TOPK_CHUNK)
+    idx = chunk_of * _TOPK_CHUNK + cand_idx % _TOPK_CHUNK
+    # A padded (-inf) slot only enters the window when a row has fewer than
+    # ``width`` finite logits; it is never a survivor, so any in-range index
+    # will do.
+    return vals, idx.clamp(max=vocab - 1)
+
+
 def _apply_top_k_top_p_bounded(
     logits: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor, k_bound: int
 ) -> torch.Tensor:
@@ -307,7 +352,7 @@ def _apply_top_k_top_p_bounded(
     they also have ``top_p >= 1`` (see ``topk_fast_path_bound``).
     """
     width = min(k_bound, logits.shape[-1])
-    vals, idx = torch.topk(logits, width, dim=-1, largest=True, sorted=True)
+    vals, idx = _chunked_topk(logits, width)
 
     # --- top-k: cutoff = k-th largest value, as float32 like the search. ---
     k_index = (top_k.clamp(min=1, max=width) - 1).to(torch.int64)
@@ -321,7 +366,12 @@ def _apply_top_k_top_p_bounded(
 
     # --- top-p over the survivors. ---
     probs = torch.softmax(masked_logits, dim=-1)
-    win_probs = torch.gather(probs, -1, idx)  # non-increasing along the row
+    # Non-survivors in the window have probability 0 (their logit is masked);
+    # zero them explicitly so a tie-broken index can never pick up mass.
+    window_survives = vals.to(torch.float32) >= cutoff
+    win_probs = torch.where(
+        window_survives, torch.gather(probs, -1, idx), torch.zeros_like(vals)
+    ).to(probs.dtype)  # non-increasing along the row
     # topp_mask's masses are torch.sum results in the probabilities' dtype,
     # which on CPU accumulate in f32 then round. Do the same explicitly: on
     # TPU a bf16 torch.sum can accumulate below f32 precision.
@@ -333,7 +383,7 @@ def _apply_top_k_top_p_bounded(
     # Not reached inside the window: the level is the lowest survivor (whose
     # ties may continue past the window) if the whole kept mass reaches p.
     num_window_survivors = torch.sum(
-        (vals.to(torch.float32) >= cutoff).to(torch.int32), dim=-1, keepdim=True
+        window_survives.to(torch.int32), dim=-1, keepdim=True
     )
     last_survivor = (num_window_survivors - 1).clamp(min=0).to(torch.int64)
     threshold_lowest = torch.gather(win_probs, -1, last_survivor)

@@ -197,3 +197,27 @@ def test_topk_fast_path_bound():
         sampling.topk_fast_path_bound(torch.tensor([[-1]]), torch.tensor([[1.0]]), 64)
         == 0
     )
+
+
+@pytest.mark.parametrize("vocab", [_VOCAB, 151_936 + 77, 4_000])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_chunked_topk_values_match_topk(vocab, dtype):
+    gen = torch.Generator().manual_seed(vocab)
+    logits = (torch.randn(6, vocab, generator=gen) * 3).to(dtype)
+    logits[1] = torch.randint(-3, 3, (vocab,), generator=gen).to(dtype)  # ties
+    logits[2, :] = float("-inf")
+    logits[2, :10] = 1.0  # fewer finite logits than the width
+    vals, idx = sampling._chunked_topk(logits, _K_BOUND)
+    ref_vals, _ = torch.topk(logits, _K_BOUND, dim=-1)
+    assert torch.equal(vals, ref_vals)
+    assert int(idx.max()) < vocab
+    finite = torch.isfinite(vals)
+    assert torch.equal(torch.gather(logits, -1, idx)[finite], vals[finite])
+
+
+def test_bounded_path_odd_vocab(device):
+    gen = torch.Generator().manual_seed(5)
+    logits = torch.randn(3, 151_936 + 77, generator=gen) * 4
+    top_k = torch.tensor([[20], [64], [1]], dtype=torch.int32)
+    top_p = torch.tensor([[0.95], [0.5], [1.0]])
+    _assert_bounded_matches(logits, top_k, top_p, device)
