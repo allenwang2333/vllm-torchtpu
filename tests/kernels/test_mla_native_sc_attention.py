@@ -1089,6 +1089,132 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         self.assertNotIn(padded_lse, hlo[True])
         self.assertEqual(q_copy.findall(hlo[True]), [])
 
+    @parameterized.product(
+        (
+            # Decode buckets (MTP 3: q=4 per request), 1 and 2 requests.
+            {"query_tokens": 16, "seq_q": (4,)},
+            {"query_tokens": 16, "seq_q": (4, 4)},
+            # Mixed: 2 decode requests + a prefill chunk, two capped chunks.
+            {"query_tokens": 512, "seq_q": (4, 4, 492)},
+        ),
+        (
+            # (TC sub-width, width group, SC atoms per batch; 0 = SC full).
+            {"ragged": (64, 4, 1)},  # TPU_DCP_MLA_RAGGED_WIDTH defaults
+            {"ragged": (64, 1, 2)},
+            {"ragged": (128, 16, 0)},
+            {"ragged": (512, 16, 8)},  # one width bucket: only the SC skips
+        ),
+        counts_mode=("mixed", "within_cap"),
+    )
+    def test_ragged_width_bit_identical(self, query_tokens, seq_q, ragged, counts_mode):
+        """Ragged width (TPU_DCP_MLA_RAGGED_WIDTH) against the capped path.
+
+        Production DCP config (cap 512, chunk 256, split q, lane-dense lse,
+        capped_window_prep). `mixed` counts span 0..2048 (empty rows, rows
+        reaching every window: the overflow fix-up must still find window 0
+        whole); `within_cap` clips them to the cap so every width bucket and
+        SC batch skip occurs without the fix-up. Output and lse must match bit
+        for bit on every row; padding rows included.
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        rng = np.random.default_rng(20261010)
+        problem, topk_idx, owns, counts, page_table, cu_q_lens, distribution = (
+            self._split_q_lse_case(query_tokens, seq_q, rng)
+        )
+        if counts_mode == "within_cap":
+            counts = np.minimum(counts, 512)
+            topk_idx = jnp.where(
+                jnp.arange(2048)[None, :] < jnp.asarray(np.maximum(counts, 1))[:, None],
+                topk_idx,
+                -1,
+            )
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+        real_tokens = int(sum(seq_q))
+        width, group, gather_atoms = ragged
+
+        def run(topk_in, **extra):
+            out, lse = sparse_mla.sparse_ragged_paged_attention(
+                q_nope,
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_in,
+                page_table,
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                topk_cap=512,
+                capped_window_prep=True,
+                q_pe=q_pe,
+                lse_lane_dense=True,
+                **extra,
+            )
+            return out, jnp.where(owns[:, None], lse, -jnp.inf)
+
+        def bits(x):
+            return np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16))
+
+        rw = dict(
+            ragged_width=width,
+            ragged_group=group,
+            ragged_gather_atoms=gather_atoms or None,
+        )
+        (ref, ref_lse), (out, lse) = jax.block_until_ready(
+            (run(topk_idx), run(topk_idx, **rw))
+        )
+        np.testing.assert_array_equal(bits(out), bits(ref))
+        np.testing.assert_array_equal(
+            np.asarray(lse).view(np.uint32), np.asarray(ref_lse).view(np.uint32)
+        )
+        # Positive controls. The output is attention, not the aliased q_nope.
+        self.assertGreater(
+            np.abs(
+                np.asarray(out, np.float32)[:real_tokens]
+                - np.asarray(q_nope, np.float32)[:real_tokens]
+            ).max(),
+            2e-2,
+        )
+        # A row's LAST live entry is attended: dropping it (the tail sub-tile
+        # / tail atom a wrong width would miss) moves that row.
+        real_counts = counts[:real_tokens]
+        tail_rows = np.flatnonzero((real_counts % 64 == 1) & (real_counts > 1))
+        row = int(tail_rows[0]) if tail_rows.size else int(np.argmax(real_counts))
+        last = int(max(counts[row], 1)) - 1
+        dropped = topk_idx.at[row, last].set(-1)
+        bad, bad_lse = jax.block_until_ready(run(dropped, **rw))
+        self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
+        self.assertFalse(
+            np.array_equal(np.asarray(bad_lse)[row], np.asarray(ref_lse)[row])
+        )
+
+    def test_ragged_width_validation(self):
+        q = jnp.zeros((16, 8, HEAD_DIM), jnp.bfloat16)
+        nope = jnp.zeros((16, 256, 128), jnp.uint32)
+        rope = jnp.zeros((16, 64, 128), jnp.uint32)
+        topk_idx = jnp.zeros((16, 2048), jnp.int32)
+        args = (
+            q,
+            nope,
+            rope,
+            topk_idx,
+            jnp.arange(16, dtype=jnp.int32),
+            jnp.array([0, 16], jnp.int32),
+            jnp.array([0, 1, 1], jnp.int32),
+        )
+        kw = dict(cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT, topk_cap=512)
+        for bad in (dict(ragged_width=96), dict(ragged_width=1024)):
+            with self.assertRaisesRegex(ValueError, "ragged_width"):
+                sparse_mla.sparse_ragged_paged_attention(*args, **kw, **bad)
+        with self.assertRaisesRegex(ValueError, "ragged_gather_atoms"):
+            sparse_mla.sparse_ragged_paged_attention(
+                *args, **kw, ragged_gather_atoms=3
+            )
+
     def test_split_q_validation(self):
         nope = jnp.zeros((16, 256, 128), jnp.uint32)
         rope = jnp.zeros((16, 64, 128), jnp.uint32)

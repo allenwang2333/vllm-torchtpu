@@ -17,6 +17,11 @@ An optional traced live-row count (``num_live_indices``) bounds the outer
 emit_pipeline grid so only the logical batches holding live rows are gathered;
 rows beyond are left unwritten (the attention grid never reads them). Without
 it every row is gathered.
+
+An optional per-logical-batch live flag (``batch_live``) skips whole logical
+batches inside that bound (no indirect DMAs, no ROPE transpose); their rows
+are left unwritten too. A caller whose rows hold a ragged live prefix uses it
+to gather only the batches covering each row's live entries.
 """
 
 from __future__ import annotations
@@ -68,6 +73,8 @@ def _kernel(
     serve_pipelined: bool,
     live_hbm_ref: Any = None,
     guard_tail: bool = False,
+    batch_live: bool = False,
+    batch_live_hbm_ref: Any = None,
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
     live_batches = None
@@ -84,7 +91,7 @@ def _kernel(
         # the per-owner trip count; only lane 0 of a vector is ever extracted.
         live_batches = live_vmem_ref[pl.ds(0, NUM_LANES)][0]
 
-    def serve_batch(indices_ref):
+    def serve_batch(indices_ref, live_flag_ref=None):
         owner_batch = pl.program_id(0)
         logical_batch = owner + owner_batch * num_owners
         occurrence_base = logical_batch * atoms_per_batch * OCCURRENCES_PER_ATOM
@@ -172,7 +179,17 @@ def _kernel(
                 rope_out_hbm_ref,
             )
 
-        if live_batches is not None and guard_tail:
+        if live_flag_ref is not None:
+            # Per-batch live flag, streamed beside the index block as a
+            # broadcast i32[NUM_LANES] row; lane 0 extracted (a scalar load
+            # from VMEM is illegal on SC, sc_lowering.py). A dead batch is
+            # skipped like the guarded tail round below; it also covers that
+            # tail (the caller zeroes batches past the live bound).
+            is_live = live_flag_ref[0, 0, 0, :][0] > 0
+            if live_batches is not None and guard_tail:
+                is_live = jnp.logical_and(is_live, logical_batch < live_batches)
+            pl.when(is_live)(run_inner)
+        elif live_batches is not None and guard_tail:
             # Owners share a uniform traced grid of cdiv(live, num_owners);
             # the ragged last round is skipped per owner.
             pl.when(logical_batch < live_batches)(run_inner)
@@ -183,12 +200,22 @@ def _kernel(
         (1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
         lambda batch: (owner + batch * num_owners, 0, 0, 0),
     )
+    in_specs = (indices_spec,)
+    in_refs = (indices_hbm_ref,)
+    if batch_live:
+        in_specs += (
+            pl.BlockSpec(
+                (1, 1, 1, NUM_LANES),
+                lambda batch: (owner + batch * num_owners, 0, 0, 0),
+            ),
+        )
+        in_refs += (batch_live_hbm_ref,)
     if live_batches is None:
         pltpu.emit_pipeline(
             serve_batch,
             grid=(batches_per_owner,),
-            in_specs=(indices_spec,),
-        )(indices_hbm_ref)
+            in_specs=in_specs,
+        )(*in_refs)
     else:
         # Traced grid length for emit_pipeline on a VectorSubcoreMesh, and
         # pl.when around it for the zero-trip case -- both lower on v7x SC.
@@ -205,8 +232,8 @@ def _kernel(
             pltpu.emit_pipeline(
                 serve_batch,
                 grid=(owner_batches,),
-                in_specs=(indices_spec,),
-            )(indices_hbm_ref)
+                in_specs=in_specs,
+            )(*in_refs)
 
 
 @functools.partial(
@@ -230,6 +257,7 @@ def dsa_gather_native_sc(
     serve_pipelined: bool = True,
     num_live_indices: jax.Array | None = None,
     live_multiple: int = 1,
+    batch_live: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
@@ -243,6 +271,12 @@ def dsa_gather_native_sc(
     unwritten. ``live_multiple`` is a static promise that ``num_live_indices``
     is a multiple of it; when that multiple covers whole owner rounds the
     per-owner tail guard is dropped.
+
+    ``batch_live`` (traced, optional): i32[out_size // (atoms_per_batch * 64)],
+    nonzero for the logical batches (``atoms_per_batch`` consecutive 64-row
+    atoms of the flattened indices) to gather; zero batches are skipped and
+    their rows left unwritten. Composes with ``num_live_indices`` (batches past
+    the live bound must be zero or are skipped by it).
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
@@ -312,6 +346,18 @@ def dsa_gather_native_sc(
         # multiple of num_owners * occurrences_per_batch (at topk=2048,
         # atoms=1: 32 * 64 = 2048 = one token, so decode needs no guard).
         guard_tail = live_multiple % owner_batch_size != 0
+    if batch_live is not None:
+        if batch_live.shape != (num_batches,):
+            raise ValueError(
+                f"batch_live must be i32[{num_batches}] (one flag per logical "
+                f"batch of {occurrences_per_batch} rows), got {batch_live.shape}"
+            )
+        operands.append(
+            jnp.broadcast_to(
+                batch_live.astype(jnp.int32).reshape(num_batches, 1, 1, 1),
+                (num_batches, 1, 1, NUM_LANES),
+            )
+        )
     mesh = plsc.VectorSubcoreMesh(
         num_cores=num_cores,
         num_subcores=num_subcores,
@@ -328,12 +374,34 @@ def dsa_gather_native_sc(
         wait_mode=wait_mode,
         serve_pipelined=serve_pipelined,
         guard_tail=guard_tail,
+        batch_live=batch_live is not None,
     )
-    if live:
+    if live and batch_live is not None:
+        inner = body
+
+        def body(nope, rope, idx, live_hbm, flags_hbm, nope_o, rope_o, **scr):
+            return inner(
+                nope,
+                rope,
+                idx,
+                nope_o,
+                rope_o,
+                live_hbm_ref=live_hbm,
+                batch_live_hbm_ref=flags_hbm,
+                **scr,
+            )
+    elif live:
         inner = body
 
         def body(nope, rope, idx, live_hbm, nope_o, rope_o, **scr):
             return inner(nope, rope, idx, nope_o, rope_o, live_hbm_ref=live_hbm, **scr)
+    elif batch_live is not None:
+        inner = body
+
+        def body(nope, rope, idx, flags_hbm, nope_o, rope_o, **scr):
+            return inner(
+                nope, rope, idx, nope_o, rope_o, batch_live_hbm_ref=flags_hbm, **scr
+            )
 
     return core_map_helper.kernel(
         body,
@@ -351,5 +419,6 @@ def dsa_gather_native_sc(
         name=(
             f"sc_native_sc_gather_a{atoms_per_batch}_{wait_mode}_"
             f"{'pipe' if serve_pipelined else 'nopipe'}{'_live' if live else ''}"
+            f"{'_ragged' if batch_live is not None else ''}"
         ),
     )(*operands)

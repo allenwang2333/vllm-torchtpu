@@ -1176,6 +1176,14 @@ def sparse_mla_attention_dcp(
             if topk_cap
             else {}
         )
+        # Ragged width: bound the capped path's gather and attention by each
+        # token's live count (bit-identical).
+        if topk_cap and envs.TPU_DCP_MLA_RAGGED_WIDTH:
+            chunk_kwargs.update(
+                ragged_width=envs.TPU_DCP_MLA_RAGGED_WIDTH_SUB,
+                ragged_group=envs.TPU_DCP_MLA_RAGGED_WIDTH_GROUP,
+                ragged_gather_atoms=envs.TPU_DCP_MLA_RAGGED_GATHER_ATOMS or None,
+            )
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
         local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
