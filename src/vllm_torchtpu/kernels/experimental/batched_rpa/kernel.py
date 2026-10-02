@@ -840,7 +840,11 @@ def rpa_kernel(
                 size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
                 execute_schedule_chunk(start, size)
 
-        _run()
+        # An empty schedule (e.g. the MIXED pass of a decode-only batch) does no work:
+        # skip scratch allocation and init, the schedule fetch and the pipeline.
+        @pl.when(actual_steps > 0)
+        def _():
+            _run()
 
     scalar_prefetches = (
         cu_q_lens,
