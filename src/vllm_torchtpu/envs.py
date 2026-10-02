@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_CAPPED_PREP: bool = False
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 1
+    TPU_DRAFT_HOIST_ATTN_META: bool = False
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_LSE_MERGE_RS_BF16: bool = False
@@ -404,6 +405,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # grids `cdiv(real tokens, step)` steps, so up to N-1 padding rows are
     # attended (outputs don't-care). 1 = the kernel default (unchanged).
     "TPU_DCP_MLA_SMALL_CHUNK_BATCH": env_int("TPU_DCP_MLA_SMALL_CHUNK_BATCH", 1),
+    # MTP IndexShare draft loop steps 1..K-1 on DCP sparse MLA: build the
+    # attention's index prep (owns, kv_lens, capped window rows, token_end)
+    # and every loop step's KV-write (page, slot, dst row) once per propose
+    # in one small program, and hand them to the loop-step program through
+    # the attention metadata, instead of re-deriving them inside every loop
+    # step from the metadata and the shared top-k rows. Between loop steps
+    # only seq_lens moves (+1), so each step gets its own write plan; the top-k
+    # rows IndexShare reuses are the same in every step. Same integers in,
+    # bit-identical attention out. 0 = off (unchanged).
+    "TPU_DRAFT_HOIST_ATTN_META": env_bool("TPU_DRAFT_HOIST_ATTN_META", default=False),
     # DCP MLA log-sum-exp merge (`cp_mla_attention.merge_lse_partials_scatter_heads`)
     # for steps of at most TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS tokens: instead of
     # an lse all-gather, an f32 weight multiply of the whole [T, H, V] partial

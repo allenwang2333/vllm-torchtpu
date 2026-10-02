@@ -1239,6 +1239,111 @@ def test_build_draft_attn_metadata_loop_cache(device):
     assert dc.is_dataclass(md2["draft.attn.0"])
 
 
+def test_build_draft_attn_metadata_hoists_dcp_prep(device):
+    """TPU_DRAFT_HOIST_ATTN_META: the loop-step prep is built once, from step
+    1's seq_lens and the layer's first num_tokens top-k rows, and each loop
+    step's metadata entry for a hoisted layer carries that step's slice of it
+    (shared index prep + its own write plan). Step 0 and other layers carry
+    none; a step past the prep's range rebuilds it."""
+    from vllm_torchtpu.layers.core.attention_interface import (
+        DCP_DRAFT_PREP_SHARED,
+    )
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 3  # 2 loop steps
+    proposer._draft_attn_layer_names = {"draft.attn.0", "draft.idx.0"}
+    topk_buf = torch.arange(32 * 4, dtype=torch.int32, device=device).view(32, 4)
+    proposer._draft_hoist_layers = {
+        "draft.attn.0": SimpleNamespace(topk_indices_buffer=topk_buf)
+    }
+    prep_calls = []
+
+    def fake_prep(buf, seq_lens, bt, qsl, rd, num_tokens):
+        prep_calls.append((buf, seq_lens.clone(), num_tokens))
+        shared = tuple(torch.full((1,), 100 + i) for i in range(DCP_DRAFT_PREP_SHARED))
+        plans = tuple(torch.full((1,), 10 * s + j) for s in range(2) for j in range(3))
+        return shared + plans
+
+    proposer._draft_prep_fns = {"draft.attn.0": fake_prep}
+    runner = SimpleNamespace(
+        _has_mamba_state=False,
+        _unified_kv_layout=False,
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=8,
+        device=device,
+        _attn_metadata_builder_ctx=None,
+        empty_slot_mappings={},
+    )
+    proposer.runner = runner
+    base_seq_lens = torch.tensor([5, 9, 0, 0, 0, 0, 0, 0], dtype=torch.int32)
+    chunk = SimpleNamespace(
+        num_reqs=2,
+        start_index=0,
+        query_start_loc_np=np.array([0, 1, 2], dtype=np.int32),
+        attn_ctx=SimpleNamespace(
+            use_max_model_len=True,
+            seq_lens=base_seq_lens.to(device),
+            query_start_loc=torch.zeros(3, dtype=torch.int32),
+            request_distribution=torch.zeros(3, dtype=torch.int32),
+            position_ids_override=None,
+            sequence_layout_descriptor=SequenceLayoutDescriptor(),
+        ),
+    )
+
+    def fake_build_attention_metadata(**kw):
+        ctx = runner._attn_metadata_builder_ctx
+        md = AttentionMetadata(
+            input_positions=torch.zeros(1, device=device),
+            block_tables=torch.zeros(1, dtype=torch.int32, device=device),
+            seq_lens=ctx.seq_lens,
+            query_start_loc=ctx.query_start_loc,
+            request_distribution=ctx.request_distribution,
+        )
+        return {"draft.attn.0": md, "draft.idx.0": md}, None
+
+    runner._build_attention_metadata = fake_build_attention_metadata
+    loop_qsl = torch.arange(9, dtype=torch.int32, device=device)
+    loop_rd = torch.tensor([2, 2, 2], dtype=torch.int32, device=device)
+
+    def build(step):
+        return proposer._build_draft_attn_metadata(
+            chunk,
+            step_idx=step,
+            seq_lens_delta=step,
+            num_rejected_np=np.array([1, 0], dtype=np.int32),
+            num_tokens_padded=16,
+            loop_query_start_loc=loop_qsl,
+            loop_request_distribution=loop_rd,
+        )
+
+    def vals(md):
+        return [int(t.item()) for t in md.draft_index_prep]
+
+    md0 = build(0)
+    assert md0["draft.attn.0"].draft_index_prep is None
+    assert prep_calls == []
+    md1, md2 = build(1), build(2)
+    assert len(prep_calls) == 1
+    buf, sl, n = prep_calls[0]
+    assert buf is topk_buf and n == 16
+    assert torch.equal(sl.cpu(), base_seq_lens + 1 - torch.tensor([1, 0, 0, 0, 0, 0, 0, 0], dtype=torch.int32))
+    assert vals(md1["draft.attn.0"]) == [100, 101, 102, 103, 0, 1, 2]
+    assert vals(md2["draft.attn.0"]) == [100, 101, 102, 103, 10, 11, 12]
+    # Only the hoisted layer's entry carries it.
+    assert md1["draft.idx.0"].draft_index_prep is None
+    assert md2["draft.idx.0"].draft_index_prep is None
+    # Step 2 still swaps seq_lens as before.
+    assert torch.equal(
+        md2["draft.attn.0"].seq_lens.cpu(), md1["draft.attn.0"].seq_lens.cpu() + 1
+    )
+    # Past the prep's two steps: a full rebuild with its own prep.
+    md3 = build(3)
+    assert len(prep_calls) == 2
+    assert vals(md3["draft.attn.0"]) == [100, 101, 102, 103, 0, 1, 2]
+    assert torch.equal(prep_calls[1][1].cpu(), md3["draft.attn.0"].seq_lens.cpu())
+
+
 def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(device):
     """Rebuilding draft metadata must preserve the target chunk's PCP
     descriptor; defaulting it to ALL selects an incompatible attention path."""

@@ -19,6 +19,7 @@ NOTE: Currently designed for 8-bit / FP8 KV caches (1 byte per element). We use
 
 import dataclasses
 import enum
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -393,18 +394,21 @@ def _scatter_caches(
     slot: jax.Array,
     nope_spec: SparseMLAKVCacheSpec,
     rope_spec: SparseMLAKVCacheSpec,
+    dst_rows: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Write both caches at (`page`, `slot`), with Pallas wherever it can.
 
     Both nope layouts and rope/SPARSECORE go through the SparseCore Pallas
     writer; rope/TENSORCORE falls back to the XLA scatter. Shared by the
     unsharded and DCP writers, which differ only in how they derive
-    (`page`, `slot`).
+    (`page`, `slot`). `dst_rows`, if given, is `_dst_rows(page, slot)`
+    computed by the caller.
     """
     # Imported here, not at module scope: `scatter` imports this module back.
     from vllm_torchtpu.kernels.mla import scatter
 
-    dst_rows = _dst_rows(page, slot, nope_spec.page_size)
+    if dst_rows is None:
+        dst_rows = _dst_rows(page, slot, nope_spec.page_size)
     kv_cache_nope = scatter.scatter(
         kv_cache_nope, kv_c_normed, nope_spec, dst_rows=dst_rows
     )
@@ -463,6 +467,7 @@ def update_sparse_mla_kv_cache_dcp(
     rope_spec: SparseMLAKVCacheSpec,
     dcp_size: int,
     interleave_size: int,
+    write_plan: "DcpWritePlan | None" = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Scatter this step's MLA latents into a DCP position-sharded cache.
 
@@ -503,21 +508,31 @@ def update_sparse_mla_kv_cache_dcp(
       dcp_rank: i32 scalar, this shard's DCP index.
       nope_spec, rope_spec: layout descriptors the shards were allocated from.
       dcp_size, interleave_size: the shard layout.
+      write_plan: this rank's `dcp_write_plan` for exactly these arguments,
+        computed by the caller (e.g. once ahead of several steps). The
+        sequence coordinates and `dcp_rank` are then unused.
 
     Returns:
       The updated (nope, rope) shards, same shapes/dtypes as the inputs.
     """
     _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec, rope_spec)
-    page, slot = _get_dcp_page_and_slot(
-        kv_c_normed.shape[0],
-        seq_lens,
-        block_tables,
-        query_start_loc,
-        dcp_rank,
-        nope_spec=nope_spec,
-        dcp_size=dcp_size,
-        interleave_size=interleave_size,
-    )
+    if write_plan is None:
+        write_plan = dcp_write_plan(
+            kv_c_normed.shape[0],
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            dcp_rank,
+            nope_spec=nope_spec,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
+    elif write_plan.page.shape != (kv_c_normed.shape[0],):
+        raise ValueError(
+            f"write_plan covers {write_plan.page.shape} rows, but there are "
+            f"{kv_c_normed.shape[0]} tokens"
+        )
+    page, slot, dst_rows = write_plan
     return _scatter_caches(
         kv_cache_nope,
         kv_cache_rope,
@@ -527,6 +542,7 @@ def update_sparse_mla_kv_cache_dcp(
         slot,
         nope_spec,
         rope_spec,
+        dst_rows=dst_rows,
     )
 
 
@@ -566,6 +582,41 @@ def update_sparse_mla_kv_cache_dcp_jax(
         _scatter_rows(kv_cache_nope, nope_spec, kv_c_normed, page, slot),
         _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot),
     )
+
+
+class DcpWritePlan(NamedTuple):
+    """Where this rank writes each token of a DCP step (`dcp_write_plan`)."""
+
+    page: jax.Array  # i32[num_tokens], `OOB_PAGE` for rows this rank skips
+    slot: jax.Array  # i32[num_tokens]
+    dst_rows: jax.Array  # i32[num_tokens], `_dst_rows(page, slot)`
+
+
+def dcp_write_plan(
+    num_tokens: int,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    dcp_rank: jax.Array,
+    *,
+    nope_spec: SparseMLAKVCacheSpec,
+    dcp_size: int,
+    interleave_size: int,
+) -> DcpWritePlan:
+    """This rank's (page, slot, dst row) per token, as
+    `update_sparse_mla_kv_cache_dcp` derives them. A function of the sequence
+    coordinates and `dcp_rank` only, so it can be built ahead of the write."""
+    page, slot = _get_dcp_page_and_slot(
+        num_tokens,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        dcp_rank,
+        nope_spec=nope_spec,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+    return DcpWritePlan(page, slot, _dst_rows(page, slot, nope_spec.page_size))
 
 
 def _get_dcp_page_and_slot(

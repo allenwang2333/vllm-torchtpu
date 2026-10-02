@@ -2225,6 +2225,69 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         sparse_mla_jax_op.register_fake(_fake_sparse_mla_dcp)
 
+        # TPU_DRAFT_HOIST_ATTN_META: a second op over the same attention that
+        # also takes one step's prebuilt `DcpDraftPrep` (seven more tensors).
+        # Built only with the flag, so nothing changes without it.
+        sparse_mla_hoisted_jax_op = None
+        if envs.TPU_DRAFT_HOIST_ATTN_META:
+            from vllm_torchtpu.layers.core.attention_interface import DcpDraftPrep
+
+            def sparse_mla_attention_core_tpu_dcp_hoisted(
+                kv_cache_nope: jax.Array,
+                kv_cache_rope: jax.Array,
+                ql_nope: jax.Array,
+                q_pe: jax.Array,
+                kv_c_normed: jax.Array,
+                k_pe: jax.Array,
+                local_topk_indices: jax.Array,
+                seq_lens: jax.Array,
+                block_tables: jax.Array,
+                query_start_loc: jax.Array,
+                request_distribution: jax.Array,
+                owns: jax.Array,
+                kv_lens: jax.Array,
+                gather_indices: jax.Array,
+                token_end: jax.Array,
+                page: jax.Array,
+                slot: jax.Array,
+                dst_rows: jax.Array,
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+                nope_spec, rope_spec = layer.mla_kv_spec
+                return sparse_mla_attention_dcp(
+                    ql_nope,
+                    q_pe,
+                    kv_c_normed,
+                    k_pe,
+                    kv_cache_nope,
+                    kv_cache_rope,
+                    local_topk_indices,
+                    seq_lens,
+                    block_tables,
+                    query_start_loc,
+                    request_distribution,
+                    mesh,
+                    nope_spec,
+                    rope_spec,
+                    sm_scale=layer.scale,
+                    k_scale=k_scale,
+                    dcp_size=dcp_size,
+                    interleave_size=interleave_size,
+                    draft_prep=DcpDraftPrep(
+                        owns, kv_lens, gather_indices, token_end, page, slot, dst_rows
+                    ),
+                )
+
+            sparse_mla_hoisted_jax_op = pcp_streaming_jax_op(
+                f"{op_name}_draft_hoisted",
+                sparse_mla_attention_core_tpu_dcp_hoisted,
+                donate_argnums=(0, 1),
+                mesh=mesh,
+                input_partition_specs=_SPARSE_MLA_DCP_INPUT_PARTITION_SPECS
+                + DcpDraftPrep.partition_specs(DCP_AXIS_NAME),
+                output_partition_specs=_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS,
+            )
+            sparse_mla_hoisted_jax_op.register_fake(_fake_sparse_mla_dcp)
+
         def sparse_mla_dcp_impl(
             kv_cache: tuple[torch.Tensor, torch.Tensor],
             ql_nope: torch.Tensor,
@@ -2236,9 +2299,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             block_tables: torch.Tensor,
             query_start_loc: torch.Tensor,
             request_distribution: torch.Tensor,
+            draft_index_prep: tuple[torch.Tensor, ...] | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             nope_cache, rope_cache = kv_cache
-            new_nope, new_rope, outputs, lse = sparse_mla_jax_op(
+            args = (
                 nope_cache,
                 rope_cache,
                 ql_nope,
@@ -2251,11 +2315,74 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 query_start_loc,
                 request_distribution,
             )
+            if draft_index_prep is None:
+                new_nope, new_rope, outputs, lse = sparse_mla_jax_op(*args)
+            else:
+                assert sparse_mla_hoisted_jax_op is not None, (
+                    "draft_index_prep was handed to a DCP sparse MLA op built "
+                    "without TPU_DRAFT_HOIST_ATTN_META"
+                )
+                new_nope, new_rope, outputs, lse = sparse_mla_hoisted_jax_op(
+                    *args, *draft_index_prep
+                )
             nope_cache.copy_(new_nope)
             rope_cache.copy_(new_rope)
             return outputs, lse
 
         return sparse_mla_dcp_impl
+
+    def _build_sparse_mla_dcp_draft_prep_op(
+        self, layer: Any, dcp_size: int, interleave_size: int, num_steps: int
+    ):
+        """`sparse_mla_dcp_draft_prep` for this layer as a torch op:
+        `(local_topk_indices, seq_lens, block_tables, query_start_loc,
+        request_distribution)` -> the flat prep tuple of `num_steps` loop
+        steps (TPU_DRAFT_HOIST_ATTN_META)."""
+        from vllm_torchtpu.layers.core.attention_interface import (
+            sparse_mla_dcp_draft_prep,
+            sparse_mla_dcp_draft_prep_partition_specs,
+        )
+
+        mesh = self._dcp_mesh
+
+        def sparse_mla_dcp_draft_prep_core(
+            local_topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> tuple[jax.Array, ...]:
+            nope_spec, _ = layer.mla_kv_spec
+            return sparse_mla_dcp_draft_prep(
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                mesh,
+                nope_spec,
+                dcp_size=dcp_size,
+                interleave_size=interleave_size,
+                num_steps=num_steps,
+            )
+
+        return pcp_streaming_jax_op(
+            f"pallas::sparse_mla_dcp_draft_prep_k{num_steps}_"
+            f"{layer.layer_name.replace('.', '_')}",
+            sparse_mla_dcp_draft_prep_core,
+            donate_argnums=(),
+            mesh=mesh,
+            input_partition_specs=(
+                P(DCP_AXIS_NAME),  # local_topk_indices
+                P(),  # seq_lens
+                P(),  # block_tables
+                P(),  # query_start_loc
+                P(),  # request_distribution
+            ),
+            output_partition_specs=sparse_mla_dcp_draft_prep_partition_specs(
+                num_steps, DCP_AXIS_NAME
+            ),
+        )
 
     def forward(
         self,
@@ -2376,6 +2503,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     attn_metadata.block_tables,
                     attn_metadata.query_start_loc,
                     attn_metadata.request_distribution,
+                    # MTP draft loop steps under TPU_DRAFT_HOIST_ATTN_META:
+                    # this step's index prep and KV-write plan, built once
+                    # per propose (Eagle3Proposer). None everywhere else.
+                    draft_index_prep=getattr(
+                        attn_metadata, "draft_index_prep", None
+                    ),
                 )
                 # The scatter undoes the head all-gather above. Only the
                 # backbone is re-traced per token bucket (`shape_variants`); the

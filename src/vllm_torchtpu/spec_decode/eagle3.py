@@ -105,6 +105,19 @@ def _maybe_pad_dim1(t: torch.Tensor, target_len: int) -> torch.Tensor:
     return torch.nn.functional.pad(t, (0, target_len - n))
 
 
+def _compiled_draft_prep(op):
+    """`op` (a `sparse_mla_dcp_draft_prep` torch op) behind one compiled
+    region with the top-k row slice, keyed on shapes, so torch-tpu's eager
+    DEFER_AND_FUSE cannot fold it into its neighbours (TPU_DRAFT_HOIST_ATTN_META).
+    """
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def prep(buf, seq_lens, block_tables, qsl, rd, num_tokens: int):
+        return op(buf[:num_tokens], seq_lens, block_tables, qsl, rd)
+
+    return _static_shape_args(prep)
+
+
 if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -207,6 +220,15 @@ class Eagle3Proposer:
         # >= 2 swap the seq_lens field on the cached objects instead of paying
         # the full upstream builder walk per iteration.
         self._draft_md_cache: dict[int, tuple[dict, torch.Tensor]] = {}
+        # TPU_DRAFT_HOIST_ATTN_META: per-propose cache of each chunk's loop-step
+        # DCP sparse MLA prep, keyed by id(chunk) -> (first step it was built
+        # for, {layer name: flat `sparse_mla_dcp_draft_prep` tuple}). Resolved
+        # in load_model: the draft's DCP sparse MLA layers by name (empty when
+        # the flag is off or nothing qualifies), and one compiled prep region
+        # per layer, built on first use.
+        self._draft_prep_cache: dict[int, tuple[int, dict[str, tuple]]] = {}
+        self._draft_hoist_layers: dict[str, object] = {}
+        self._draft_prep_fns: dict[str, object] = {}
         # DSA MTP IndexShare (GLM-5.2 / DeepSeek-V3.2). Resolved in load_model.
         self._share_mtp_indices = False
         # The distinct topk_indices_buffer tensors of the draft's MTP layers.
@@ -290,6 +312,7 @@ class Eagle3Proposer:
         if self._share_mtp_indices:
             self._build_mtp_loop_model()
         self._build_mtp_fused_loop()
+        self._init_draft_attn_meta_hoist(all_attn_layers)
 
         # IndexShare assumes the draft owns its KV cache and advances
         # positions once per step; cross-model KV sharing freezes them and
@@ -590,6 +613,7 @@ class Eagle3Proposer:
             return None
         (seq_lens,) = seq_lens_set.values()
         self._draft_md_cache.pop(id(chunk), None)
+        self._draft_prep_cache.pop(id(chunk), None)
 
         num_tokens = input_ids.shape[0]
         with (
@@ -1073,6 +1097,7 @@ class Eagle3Proposer:
         """
         runner = self.runner
         self._draft_md_cache.clear()
+        self._draft_prep_cache.clear()
         num_reqs = runner.input_batch.num_reqs
         if num_reqs == 0:
             return []
@@ -1577,9 +1602,15 @@ class Eagle3Proposer:
             and not runner._unified_kv_layout
             and chunk_ctx.position_ids_override is None
         )
+        hoist = step_idx >= 1 and bool(self._draft_hoist_layers)
         if cacheable and step_idx >= 2:
             cached = self._draft_md_cache.get(id(chunk))
-            if cached is not None:
+            cached_prep = self._draft_prep_cache.get(id(chunk)) if hoist else None
+            prep_ok = not hoist or (
+                cached_prep is not None
+                and self._draft_prep_has_step(cached_prep, step_idx)
+            )
+            if cached is not None and prep_ok:
                 md_dict, prev_seq_lens = cached
                 # base + (s-1) - rejected, advanced by 1 == base + s - rejected:
                 # value-identical to the full rebuild below.
@@ -1592,6 +1623,9 @@ class Eagle3Proposer:
                             md, seq_lens=new_seq_lens
                         )
                     new_md[lname] = replaced[id(md)]
+                if hoist:
+                    # This step's write plan; the index prep is shared.
+                    self._attach_draft_prep(new_md, cached_prep, step_idx)
                 self._draft_md_cache[id(chunk)] = (new_md, new_seq_lens)
                 return new_md
 
@@ -1730,10 +1764,137 @@ class Eagle3Proposer:
                 if name in self._draft_attn_layer_names
             }
 
+        if hoist:
+            # Built from this step's seq_lens, for this step and the ones after
+            # it. The loop-step program must see a prep on every call, so a
+            # step whose metadata is rebuilt reuses one only where the rebuild
+            # is known to differ by seq_lens alone: a cacheable chunk, or the
+            # EP-DP dummy chunk (fixed positions, zeroed block tables, seq_lens
+            # 1 + step). Anything else builds its own.
+            prep_reusable = cacheable or (
+                chunk_ctx.position_ids_override is not None
+                and not runner._has_mamba_state
+                and not runner._unified_kv_layout
+            )
+            prep_entry = (
+                self._draft_prep_cache.get(id(chunk)) if prep_reusable else None
+            )
+            if prep_entry is None or not self._draft_prep_has_step(
+                prep_entry, step_idx
+            ):
+                prep_entry = self._build_draft_prep(
+                    result, seq_lens, step_idx, effective_num_tokens
+                )
+                if prep_reusable:
+                    self._draft_prep_cache[id(chunk)] = prep_entry
+            self._attach_draft_prep(result, prep_entry, step_idx)
+
         if cacheable:
             self._draft_md_cache[id(chunk)] = (result, seq_lens)
 
         return result
+
+    def _init_draft_attn_meta_hoist(self, all_attn_layers: dict) -> None:
+        """Pick the draft layers whose loop-step attention prep is hoisted
+        (`TPU_DRAFT_HOIST_ATTN_META`).
+
+        Only an IndexShare draft qualifies: its loop steps run their own
+        program with the indexer off, so every loop step reads the same top-k
+        rows, and between steps only seq_lens moves. Of its attention layers,
+        only DCP sparse MLA ones have the prep to hoist.
+        """
+        self._draft_hoist_layers = {}
+        self._draft_prep_fns = {}
+        if not envs.TPU_DRAFT_HOIST_ATTN_META:
+            return
+        if (
+            not self._share_mtp_indices
+            or self._mtp_loop_model is None
+            or self.speculative_config.num_speculative_tokens < 2
+        ):
+            logger.info(
+                "TPU_DRAFT_HOIST_ATTN_META is set but the draft is not an "
+                "IndexShare MTP draft with loop steps; nothing to hoist."
+            )
+            return
+        assert self._draft_attn_layer_names is not None
+        for name in sorted(self._draft_attn_layer_names):
+            layer = all_attn_layers[name]
+            # A DCP sparse MLA layer: it states its top-k through the shared
+            # buffer, and its impl runs position-sharded attention.
+            if (
+                getattr(layer, "topk_indices_buffer", None) is not None
+                and getattr(getattr(layer, "impl", None), "dcp_size", 1) > 1
+            ):
+                self._draft_hoist_layers[name] = layer
+        logger.info(
+            "TPU_DRAFT_HOIST_ATTN_META: draft loop steps 1..%d read a prebuilt "
+            "DCP sparse MLA prep for %s.",
+            self.speculative_config.num_speculative_tokens - 1,
+            sorted(self._draft_hoist_layers) or "no layer",
+        )
+
+    @staticmethod
+    def _draft_prep_has_step(prep_entry: tuple[int, dict[str, tuple]], step_idx: int) -> bool:
+        from vllm_torchtpu.layers.core.attention_interface import (
+            DCP_DRAFT_PREP_SHARED,
+        )
+
+        first_step, preps = prep_entry
+        num_steps = (len(next(iter(preps.values()))) - DCP_DRAFT_PREP_SHARED) // 3
+        return 0 <= step_idx - first_step < num_steps
+
+    def _build_draft_prep(
+        self,
+        md_dict: dict,
+        seq_lens: torch.Tensor,
+        step_idx: int,
+        num_tokens: int,
+    ) -> tuple[int, dict[str, tuple]]:
+        """Each hoisted layer's prep for loop steps `step_idx..K-1`, from
+        `step_idx`'s metadata. Reads the layer's top-k rows as its forward
+        will: the first `num_tokens` rows of its shared buffer, which no loop
+        step writes (IndexShare restores a chunk's rows before its step)."""
+        K = self.speculative_config.num_speculative_tokens
+        preps = {}
+        for name, layer in self._draft_hoist_layers.items():
+            md = md_dict[name]
+            fn = self._draft_prep_fns.get(name)
+            if fn is None:
+                impl = layer.impl
+                fn = _compiled_draft_prep(
+                    impl._build_sparse_mla_dcp_draft_prep_op(
+                        layer, impl.dcp_size, impl.dcp_interleave_size, K - 1
+                    )
+                )
+                self._draft_prep_fns[name] = fn
+            preps[name] = tuple(
+                fn(
+                    layer.topk_indices_buffer,
+                    seq_lens,
+                    md.block_tables,
+                    md.query_start_loc,
+                    md.request_distribution,
+                    num_tokens,
+                )
+            )
+        return step_idx, preps
+
+    def _attach_draft_prep(
+        self, md_dict: dict, prep_entry: tuple[int, dict[str, tuple]], step_idx: int
+    ) -> None:
+        """Point each hoisted layer's metadata entry at step `step_idx`'s
+        prep, in place in `md_dict` (other layers keep the shared entry)."""
+        from vllm_torchtpu.layers.core.attention_interface import DcpDraftPrep
+
+        first_step, preps = prep_entry
+        for name, prep in preps.items():
+            md_dict[name] = dataclasses.replace(
+                md_dict[name],
+                draft_index_prep=tuple(
+                    DcpDraftPrep.for_step(prep, step_idx - first_step)
+                ),
+            )
 
     @staticmethod
     def _unwrap_model_out(out) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2021,6 +2182,7 @@ class Eagle3Proposer:
         if not self._dp_lockstep_sharded():
             return
         self._draft_md_cache.clear()
+        self._draft_prep_cache.clear()
         runner = self.runner
         K = self.speculative_config.num_speculative_tokens
         if num_chunks * K == 0:
@@ -2122,6 +2284,9 @@ class Eagle3Proposer:
                 device=runner.device,
             )
         for _ in range(num_chunks):
+            # Each padding chunk's first pass rewrites the top-k rows its loop
+            # steps read, so its hoisted loop prep must not carry over.
+            self._draft_prep_cache.clear()
             # Mirror the real first pass: combine -> forward @bucket -> lm head.
             if uses_aux or combines_plain:
                 with set_model_tag("eagle_head"):

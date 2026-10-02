@@ -1216,6 +1216,184 @@ def prepare_outputs(
     return out[:, :actual_num_q_heads, :actual_head_dim]
 
 
+
+class SparseIndexInputs(NamedTuple):
+    """What `sparse_ragged_paged_attention` derives from its top-k and page
+    table before the chunk loop. Depends only on the top-k rows, the page
+    table, `cu_q_lens` / `distribution` and static options, so calls sharing
+    those can share it."""
+
+    kv_lens: jax.Array  # i32[num_tokens] live top-k entries per token
+    # Capped window prep: i32[num_chunks * W * chunk, topk_cap] window-major
+    # rows (`prepare_capped_window_indices`); else i32[num_tokens, topk]
+    # physical rows (`prepare_gather_indices`).
+    gather_indices: jax.Array
+    token_end: jax.Array  # i32[]: cu_q_lens[distribution[2]]
+
+
+def _resolve_topk_cap(
+    topk: int, topk_cap: int | None, cache_layout: str
+) -> int | None:
+    """The cap the kernel applies: SparseCore layout and narrower than topk."""
+    if cache_layout != SPARSECORE_CACHE_LAYOUT or (
+        topk_cap is not None and topk_cap >= topk
+    ):
+        return None
+    return topk_cap
+
+
+def _uses_capped_window_prep(
+    num_tokens: int,
+    has_page_indices: bool,
+    *,
+    gather_and_attention_chunk_size: int,
+    packed_gather: bool,
+    packed_chunk_tokens: int,
+    topk_cap: int | None,
+    capped_window_prep: bool,
+) -> bool:
+    """The capped window-major prep applies when every chunk takes the capped
+    path with one static chunk size. `topk_cap` is the resolved cap."""
+    uniform_chunk = min(gather_and_attention_chunk_size, num_tokens)
+    return (
+        capped_window_prep
+        and topk_cap is not None
+        and has_page_indices
+        and num_tokens % uniform_chunk == 0
+        and not (packed_gather and uniform_chunk <= packed_chunk_tokens)
+    )
+
+
+def _prepare_sparse_index_inputs(
+    topk_indices: jax.Array,
+    page_indices: jax.Array | None,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    page_size: int,
+    total_num_pages: int,
+    window_prep: bool,
+    uniform_chunk: int,
+    attention_kernel_batch_size: int,
+    small_chunk_tokens: int,
+    small_chunk_batch_size: int | None,
+    topk_cap: int | None,
+) -> SparseIndexInputs:
+    token_end = cu_q_lens[distribution[2]]
+    if window_prep:
+        topk = topk_indices.shape[-1]
+        kv_lens = jnp.sum(topk_indices != -1, axis=-1)
+        _, prep_batch = _chunk_kernel_batch_size(
+            uniform_chunk,
+            attention_kernel_batch_size,
+            small_chunk_tokens,
+            small_chunk_batch_size,
+        )
+        live_windows = capped_live_windows(
+            kv_lens,
+            token_end,
+            chunk_size=uniform_chunk,
+            kernel_batch_size=prep_batch,
+            topk_cap=topk_cap,
+            num_windows=topk // topk_cap,
+        )
+        gather_indices = prepare_capped_window_indices(
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            live_windows,
+            chunk_size=uniform_chunk,
+            topk_cap=topk_cap,
+            page_size=page_size,
+            total_num_pages=total_num_pages,
+        )
+    else:
+        kv_lens, gather_indices = prepare_gather_indices(
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            page_size=page_size,
+            total_num_pages=total_num_pages,
+        )
+    return SparseIndexInputs(kv_lens, gather_indices, token_end)
+
+
+def _check_sparse_index_inputs(
+    index_inputs: SparseIndexInputs,
+    *,
+    num_tokens: int,
+    topk: int,
+    window_prep: bool,
+    uniform_chunk: int,
+    topk_cap: int | None,
+) -> None:
+    """Shape check of a precomputed prep against this call's options."""
+    if window_prep:
+        want = (num_tokens // uniform_chunk * (topk // topk_cap) * uniform_chunk,
+                topk_cap)
+    else:
+        want = (num_tokens, topk)
+    got = tuple(index_inputs.gather_indices.shape)
+    if got != want or tuple(index_inputs.kv_lens.shape) != (num_tokens,):
+        raise ValueError(
+            f"index_inputs were prepared for other options: gather_indices "
+            f"{got}, kv_lens {tuple(index_inputs.kv_lens.shape)}; this call "
+            f"needs {want} and ({num_tokens},) "
+            f"({'capped window' if window_prep else 'physical'} prep)"
+        )
+
+
+def prepare_sparse_index_inputs(
+    topk_indices: jax.Array,  # i32[num_tokens, topk]
+    page_indices: jax.Array | None,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]
+    *,
+    page_size: int,
+    total_num_pages: int,
+    cache_layout: str = TENSORCORE_CACHE_LAYOUT,
+    gather_and_attention_chunk_size: int = DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
+    attention_kernel_batch_size: int = DEFAULT_ATTENTION_KERNEL_BATCH_SIZE,
+    small_chunk_tokens: int = 16,
+    small_chunk_batch_size: int | None = 1,
+    packed_gather: bool = False,
+    packed_chunk_tokens: int = DEFAULT_PACKED_CHUNK_TOKENS,
+    topk_cap: int | None = None,
+    capped_window_prep: bool = False,
+) -> SparseIndexInputs:
+    """The index prep `sparse_ragged_paged_attention` does with these options.
+
+    Pass the options of the attention call it is for, with the same defaults;
+    the result goes to that call's `index_inputs`. `page_size` and
+    `total_num_pages` are the NOPE cache's `shape[1]` and `shape[0]`.
+    """
+    num_tokens, topk = topk_indices.shape
+    topk_cap = _resolve_topk_cap(topk, topk_cap, cache_layout)
+    window_prep = _uses_capped_window_prep(
+        num_tokens,
+        page_indices is not None,
+        gather_and_attention_chunk_size=gather_and_attention_chunk_size,
+        packed_gather=packed_gather,
+        packed_chunk_tokens=packed_chunk_tokens,
+        topk_cap=topk_cap,
+        capped_window_prep=capped_window_prep,
+    )
+    return _prepare_sparse_index_inputs(
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        page_size=page_size,
+        total_num_pages=total_num_pages,
+        window_prep=window_prep,
+        uniform_chunk=min(gather_and_attention_chunk_size, num_tokens),
+        attention_kernel_batch_size=attention_kernel_batch_size,
+        small_chunk_tokens=small_chunk_tokens,
+        small_chunk_batch_size=small_chunk_batch_size,
+        topk_cap=topk_cap,
+    )
+
+
 # Main attention kernel for GLM-5.2 DSA (top-k gather and attention).
 # The KV entries referenced by `topk_indices` (including the current batch's
 # own tokens) must already be resident in the caches before this call;
@@ -1284,6 +1462,7 @@ def sparse_ragged_paged_attention(
     capped_window_prep: bool = False,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    index_inputs: "SparseIndexInputs | None" = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1370,6 +1549,11 @@ def sparse_ragged_paged_attention(
       lse_lane_dense: With `return_lse`, carry the log-sum-exp as f32[tokens,
         heads] through the kernel instead of f32[tokens, heads, 1] (lane-padded
         tiles). Same values.
+      index_inputs: The per-call index prep (`prepare_sparse_index_inputs`
+        with this call's options), computed elsewhere -- e.g. once for
+        several calls that share the top-k, page table and query layout.
+        `topk_indices` then only supplies the top-k width. None computes it
+        here. Same values either way, so the same output.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -1461,8 +1645,7 @@ def sparse_ragged_paged_attention(
             f"topk ({topk}) must be a multiple of "
             f"{native_sc_gather.ROPE_PACKING} for sparsecore ROPE packing"
         )
-    if not sparsecore_layout or (topk_cap is not None and topk_cap >= topk):
-        topk_cap = None
+    topk_cap = _resolve_topk_cap(topk, topk_cap, cache_layout)
     if topk_cap is not None and (topk_cap % PACKED_ATOM_ROWS or topk % topk_cap):
         raise ValueError(
             f"topk_cap ({topk_cap}) must be a multiple of {PACKED_ATOM_ROWS} "
@@ -1470,52 +1653,44 @@ def sparse_ragged_paged_attention(
         )
 
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
-    # The capped window-major prep applies when every chunk takes the capped
-    # path with one static chunk size.
     uniform_chunk = min(gather_and_attention_chunk_size, q.shape[0])
-    window_prep = (
-        capped_window_prep
-        and topk_cap is not None
-        and page_indices is not None
-        and q.shape[0] % uniform_chunk == 0
-        and not (packed_gather and uniform_chunk <= packed_chunk_tokens)
+    window_prep = _uses_capped_window_prep(
+        q.shape[0],
+        page_indices is not None,
+        gather_and_attention_chunk_size=gather_and_attention_chunk_size,
+        packed_gather=packed_gather,
+        packed_chunk_tokens=packed_chunk_tokens,
+        topk_cap=topk_cap,
+        capped_window_prep=capped_window_prep,
     )
-    window_indices_all = None
-    if window_prep:
-        kv_lens = jnp.sum(topk_indices != -1, axis=-1)
-        physical_indices = None
-        _, prep_batch = _chunk_kernel_batch_size(
-            uniform_chunk,
-            attention_kernel_batch_size,
-            small_chunk_tokens,
-            small_chunk_batch_size,
-        )
-        live_windows = capped_live_windows(
-            kv_lens,
-            cu_q_lens[distribution[2]],
-            chunk_size=uniform_chunk,
-            kernel_batch_size=prep_batch,
-            topk_cap=topk_cap,
-            num_windows=topk // topk_cap,
-        )
-        window_indices_all = prepare_capped_window_indices(
+    if index_inputs is None:
+        index_inputs = _prepare_sparse_index_inputs(
             topk_indices,
             page_indices,
             cu_q_lens,
-            live_windows,
-            chunk_size=uniform_chunk,
-            topk_cap=topk_cap,
+            distribution,
             page_size=page_size,
             total_num_pages=cache_kv_nope.shape[0],
+            window_prep=window_prep,
+            uniform_chunk=uniform_chunk,
+            attention_kernel_batch_size=attention_kernel_batch_size,
+            small_chunk_tokens=small_chunk_tokens,
+            small_chunk_batch_size=small_chunk_batch_size,
+            topk_cap=topk_cap,
         )
     else:
-        kv_lens, physical_indices = prepare_gather_indices(
-            topk_indices,
-            page_indices,
-            cu_q_lens,
-            page_size=page_size,
-            total_num_pages=cache_kv_nope.shape[0],
+        _check_sparse_index_inputs(
+            index_inputs,
+            num_tokens=q.shape[0],
+            topk=topk,
+            window_prep=window_prep,
+            uniform_chunk=uniform_chunk,
+            topk_cap=topk_cap,
         )
+    kv_lens = index_inputs.kv_lens
+    token_end = index_inputs.token_end
+    window_indices_all = index_inputs.gather_indices if window_prep else None
+    physical_indices = None if window_prep else index_inputs.gather_indices
 
     # Rows the grid never reaches (padding past `batch_end`) keep this
     # sentinel, so a downstream merge weights them at exp(min - max) == 0
@@ -1553,7 +1728,7 @@ def sparse_ragged_paged_attention(
             packed = prepare_packed_gather(
                 kv_lens,
                 physical_indices,
-                cu_q_lens[distribution[2]],
+                token_end,
                 chunks=tuple(chunk_plan),
                 bkv=packed_bkv,
                 num_owners=_sc_num_owners(),
@@ -1573,7 +1748,7 @@ def sparse_ragged_paged_attention(
             lse,
             start_pos=start_pos,
             end_pos=end_pos,
-            token_end=cu_q_lens[distribution[2]],
+            token_end=token_end,
             sm_scale=sm_scale,
             k_scale=k_scale,
             attention_kernel_batch_size=attention_kernel_batch_size,

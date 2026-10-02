@@ -34,6 +34,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
         "mamba_slot_read_offsets",
         "mamba_ckpt_indices",
         "mamba_request_distribution",
+        "draft_index_prep",
     ],
     meta_fields=[
         "sequence_layout_kind",
@@ -85,6 +86,12 @@ class AttentionMetadata:
     # the first two groups. None unless the model has mamba layers and spec
     # decoding is enabled.
     mamba_request_distribution: jax.Array | None = None
+    # Prebuilt per-call inputs of the DCP sparse MLA op for one MTP draft
+    # loop step (`TPU_DRAFT_HOIST_ATTN_META`): the flat
+    # `attention_interface.DcpDraftPrep` of this step, built once per propose
+    # by `sparse_mla_dcp_draft_prep`. Set only on the draft's DCP sparse MLA
+    # layers' entries; None everywhere else.
+    draft_index_prep: tuple | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1

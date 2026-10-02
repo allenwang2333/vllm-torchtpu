@@ -1,7 +1,7 @@
 import functools
 import math
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -1030,6 +1030,7 @@ def sparse_mla_attention_dcp(
     dcp_size: int,
     interleave_size: int,
     dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+    draft_prep: "DcpDraftPrep | None" = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1046,6 +1047,11 @@ def sparse_mla_attention_dcp(
         sequence coordinates, replicated. `block_tables` holds virtual page
         ordinals, resolved per rank exactly as on the indexer side.
       dcp_size, interleave_size: the shard layout.
+      draft_prep: one step of `sparse_mla_dcp_draft_prep` for exactly these
+        arguments (`DcpDraftPrep.for_step`), built ahead of the call. The
+        per-call index prep and KV-write plan are then read from it instead
+        of being derived here; `local_topk_indices` only supplies its shape and
+        the sequence coordinates are unused. Same values, same outputs.
 
     Returns:
       `(kv_cache_nope, kv_cache_rope, output, lse)`. `output` is
@@ -1117,6 +1123,7 @@ def sparse_mla_attention_dcp(
             f"got {nope_spec.layout.value} and {rope_spec.layout.value}"
         )
     cache_layout = nope_spec.layout.value
+    options = _dcp_sparse_mla_index_options(local_topk_indices.shape[-1], cache_layout)
 
     def _local(
         ql_nope,
@@ -1130,8 +1137,31 @@ def sparse_mla_attention_dcp(
         block_tables_,
         query_start_loc_,
         request_distribution_,
+        *prep_leaves,
     ):
-        dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
+        if prep_leaves:
+            # Built ahead of this call (`sparse_mla_dcp_draft_prep`): no rank
+            # id, no sequence-coordinate math, no top-k reduction here.
+            prep = DcpDraftPrep(*prep_leaves)
+            if (kv_cache_nope.shape[0], kv_cache_nope.shape[1]) != _nope_pages(
+                nope_spec
+            ):
+                raise ValueError(
+                    f"NOPE shard {kv_cache_nope.shape} disagrees with the spec "
+                    f"the draft prep was built from {_nope_pages(nope_spec)}"
+                )
+            write_plan = kv_cache_utils.DcpWritePlan(
+                prep.page, prep.slot, prep.dst_rows
+            )
+            dcp_rank = None
+            owns = prep.owns
+            index_inputs = sparse_mla_kernel.SparseIndexInputs(
+                prep.kv_lens, prep.gather_indices, prep.token_end
+            )
+        else:
+            write_plan = None
+            dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
+            index_inputs = None
         kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
             kv_cache_nope,
             kv_cache_rope,
@@ -1145,15 +1175,11 @@ def sparse_mla_attention_dcp(
             rope_spec=rope_spec,
             dcp_size=dcp_size,
             interleave_size=interleave_size,
+            write_plan=write_plan,
         )
 
-        # A rank owning none of a token's top-k still has to be handed one
-        # valid entry: the kernel derives `kv_len` from the `-1` tail and
-        # requires `kv_len >= 1`. Position 0 always exists, so it is the
-        # cheapest dummy; the softmax it produces is real but meaningless, and
-        # `owns` below is what keeps it out of the merge.
-        owns = jnp.any(topk_idx >= 0, axis=-1)
-        topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
+        if index_inputs is None:
+            owns, topk_idx = _dcp_owns_and_dummy_entry(topk_idx)
 
         # Split q / lane-dense lse: the kernel joins q_nope and q_pe in VMEM
         # (no padded [T, H, 640] concat) and exports f32[T, H] lse directly.
@@ -1162,29 +1188,10 @@ def sparse_mla_attention_dcp(
             q, split_kwargs = ql_nope, {"q_pe": q_pe, "lse_lane_dense": True}
         else:
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
-        # The capped path (and its chunk) applies only where the kernel takes
-        # it: SparseCore caches and a top-k wider than the cap.
-        topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
-        if not (
-            topk_cap
-            and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
-            and topk_idx.shape[-1] > topk_cap
-        ):
-            topk_cap = None
-        chunk_kwargs = (
-            {"gather_and_attention_chunk_size": envs.TPU_DCP_MLA_TOPK_CAP_CHUNK}
-            if topk_cap
-            else {}
-        )
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
+        # (Unused, and so dropped, when the prep was built ahead.)
         local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
-        # Decode-sized chunks: query tokens per attention grid step.
-        small_chunk_batch = envs.TPU_DCP_MLA_SMALL_CHUNK_BATCH
-        if small_chunk_batch < 1:
-            raise ValueError(
-                f"TPU_DCP_MLA_SMALL_CHUNK_BATCH must be >= 1, got {small_chunk_batch}"
-            )
         output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -1198,26 +1205,15 @@ def sparse_mla_attention_dcp(
             return_lse=True,
             # The kernel defaults to tensorcore; the caches follow the spec.
             cache_layout=cache_layout,
-            # Ranks own ~topk/dcp of each row: gather and attend those only.
-            packed_gather=envs.TPU_DCP_MLA_PACKED_GATHER,
-            # The rest: a static top-k width with an exact in-kernel overflow.
-            topk_cap=topk_cap,
-            # Capped path: window-major physical rows once, live windows only.
-            capped_window_prep=envs.TPU_DCP_MLA_CAPPED_PREP,
-            # Decode chunks: tokens per grid step (1 = kernel default).
-            small_chunk_batch_size=small_chunk_batch,
-            **chunk_kwargs,
+            **options,
             **split_kwargs,
+            index_inputs=index_inputs,
         )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
         return (kv_cache_nope, kv_cache_rope, output[..., : ql_nope.shape[-1]], lse)
 
-    return jax.jit(
-        shard_map.shard_map(
-            _local, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
-        )
-    )(
+    args = (
         ql_nope,
         q_pe,
         kv_c_normed,
@@ -1230,3 +1226,195 @@ def sparse_mla_attention_dcp(
         query_start_loc,
         request_distribution,
     )
+    if draft_prep is not None:
+        in_specs = in_specs + DcpDraftPrep.partition_specs(dcp_axis_name)
+        args = args + tuple(draft_prep)
+    return jax.jit(
+        shard_map.shard_map(
+            _local, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
+        )
+    )(*args)
+
+
+def _dcp_sparse_mla_index_options(topk_width: int, cache_layout: str) -> dict:
+    """The `sparse_ragged_paged_attention` options of the DCP sparse MLA call
+    that shape its index prep -- one place, so `sparse_mla_attention_dcp` and
+    `sparse_mla_dcp_draft_prep` cannot drift apart."""
+    # The capped path (and its chunk) applies only where the kernel takes
+    # it: SparseCore caches and a top-k wider than the cap.
+    topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
+    if not (
+        topk_cap
+        and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
+        and topk_width > topk_cap
+    ):
+        topk_cap = None
+    chunk_kwargs = (
+        {"gather_and_attention_chunk_size": envs.TPU_DCP_MLA_TOPK_CAP_CHUNK}
+        if topk_cap
+        else {}
+    )
+    # Decode-sized chunks: query tokens per attention grid step.
+    small_chunk_batch = envs.TPU_DCP_MLA_SMALL_CHUNK_BATCH
+    if small_chunk_batch < 1:
+        raise ValueError(
+            f"TPU_DCP_MLA_SMALL_CHUNK_BATCH must be >= 1, got {small_chunk_batch}"
+        )
+    return dict(
+        # Ranks own ~topk/dcp of each row: gather and attend those only.
+        packed_gather=envs.TPU_DCP_MLA_PACKED_GATHER,
+        # The rest: a static top-k width with an exact in-kernel overflow.
+        topk_cap=topk_cap,
+        # Capped path: window-major physical rows once, live windows only.
+        capped_window_prep=envs.TPU_DCP_MLA_CAPPED_PREP,
+        # Decode chunks: tokens per grid step (1 = kernel default).
+        small_chunk_batch_size=small_chunk_batch,
+        **chunk_kwargs,
+    )
+
+
+def _dcp_owns_and_dummy_entry(topk_idx: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Whether this rank owns any of each token's top-k, and the top-k with a
+    valid dummy entry for the tokens where it owns none.
+
+    A rank owning none of a token's top-k still has to be handed one valid
+    entry: the kernel derives `kv_len` from the `-1` tail and requires
+    `kv_len >= 1`. Position 0 always exists, so it is the cheapest dummy; the
+    softmax it produces is real but meaningless, and `owns` is what keeps it
+    out of the merge.
+    """
+    owns = jnp.any(topk_idx >= 0, axis=-1)
+    topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
+    return owns, topk_idx
+
+
+def _nope_pages(nope_spec: SparseMLAKVCacheSpec) -> tuple[int, int]:
+    """(pages, rows per page) of a rank's NOPE shard: the kernel's
+    `total_num_pages` and `page_size`."""
+    shape = nope_spec.shape
+    return shape[0], shape[1]
+
+
+class DcpDraftPrep(NamedTuple):
+    """One step's prebuilt inputs of `sparse_mla_attention_dcp(draft_prep=)`.
+
+    Every field is per rank (sharded over the DCP axis) except `token_end`,
+    which is replicated.
+    """
+
+    owns: jax.Array  # bool[T]: this rank owns some of the token's top-k
+    kv_lens: jax.Array  # i32[T]   } `SparseIndexInputs` of the call,
+    gather_indices: jax.Array  # i32[N, w] } built from the owns-fixed top-k
+    token_end: jax.Array  # i32[]       }
+    page: jax.Array  # i32[T]   } this step's `DcpWritePlan`
+    slot: jax.Array  # i32[T]   }
+    dst_rows: jax.Array  # i32[T] }
+
+    @staticmethod
+    def partition_specs(dcp_axis_name: str) -> tuple:
+        return (
+            P(dcp_axis_name),  # owns
+            P(dcp_axis_name),  # kv_lens
+            P(dcp_axis_name, None),  # gather_indices
+            P(),  # token_end
+            P(dcp_axis_name),  # page
+            P(dcp_axis_name),  # slot
+            P(dcp_axis_name),  # dst_rows
+        )
+
+    @classmethod
+    def for_step(cls, prep: tuple, step: int) -> "DcpDraftPrep":
+        """Step `step` (0-based) of a `sparse_mla_dcp_draft_prep` result."""
+        shared, plans = prep[:DCP_DRAFT_PREP_SHARED], prep[DCP_DRAFT_PREP_SHARED:]
+        return cls(*shared, *plans[3 * step : 3 * step + 3])
+
+
+# Leading `sparse_mla_dcp_draft_prep` outputs shared by every step: owns,
+# kv_lens, gather_indices, token_end. Each step then adds page, slot, dst_rows.
+DCP_DRAFT_PREP_SHARED = 4
+
+
+def sparse_mla_dcp_draft_prep_partition_specs(
+    num_steps: int, dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME
+) -> tuple:
+    """Output specs of `sparse_mla_dcp_draft_prep`, in its output order."""
+    specs = DcpDraftPrep.partition_specs(dcp_axis_name)
+    return specs[:DCP_DRAFT_PREP_SHARED] + specs[DCP_DRAFT_PREP_SHARED:] * num_steps
+
+
+def sparse_mla_dcp_draft_prep(
+    local_topk_indices: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    mesh: Mesh,
+    nope_spec: SparseMLAKVCacheSpec,
+    *,
+    dcp_size: int,
+    interleave_size: int,
+    num_steps: int,
+    dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+) -> tuple[jax.Array, ...]:
+    """`sparse_mla_attention_dcp`'s per-call prep for `num_steps` calls that
+    differ only by seq_lens advancing one per call -- an MTP draft's loop
+    steps, which share the top-k rows (IndexShare), the block tables and the
+    query layout.
+
+    `seq_lens` is the first call's. The arguments are those of the calls
+    (`local_topk_indices` sharded, the rest replicated). Returns the flat
+    `(owns, kv_lens, gather_indices, token_end, page_0, slot_0, dst_rows_0,
+    ..., page_{n-1}, slot_{n-1}, dst_rows_{n-1})`, sharded as
+    `sparse_mla_dcp_draft_prep_partition_specs`; `DcpDraftPrep.for_step`
+    picks one call's inputs out of it. Uses the same env options as the
+    attention call, so read both under one environment.
+    """
+    if num_steps < 1:
+        raise ValueError(f"num_steps must be >= 1, got {num_steps}")
+    num_tokens = local_topk_indices.shape[0] // dcp_size
+    if local_topk_indices.shape[0] != dcp_size * num_tokens:
+        raise ValueError(
+            f"local_topk_indices has {local_topk_indices.shape[0]} rows, not "
+            f"a multiple of dcp_size={dcp_size}"
+        )
+    cache_layout = nope_spec.layout.value
+    options = _dcp_sparse_mla_index_options(local_topk_indices.shape[-1], cache_layout)
+    total_num_pages, page_size = _nope_pages(nope_spec)
+
+    def _local(topk_idx, seq_lens_, block_tables_, query_start_loc_, rd_):
+        dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
+        owns, topk_idx = _dcp_owns_and_dummy_entry(topk_idx)
+        local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
+        index_inputs = sparse_mla_kernel.prepare_sparse_index_inputs(
+            topk_idx,
+            local_block_tables,
+            query_start_loc_,
+            rd_,
+            page_size=page_size,
+            total_num_pages=total_num_pages,
+            cache_layout=cache_layout,
+            **options,
+        )
+        plans = []
+        for step in range(num_steps):
+            plans.extend(
+                kv_cache_utils.dcp_write_plan(
+                    num_tokens,
+                    seq_lens_ + step if step else seq_lens_,
+                    block_tables_,
+                    query_start_loc_,
+                    dcp_rank,
+                    nope_spec=nope_spec,
+                    dcp_size=dcp_size,
+                    interleave_size=interleave_size,
+                )
+            )
+        return (owns, *index_inputs, *plans)
+
+    in_specs = (P(dcp_axis_name, None), P(None), P(None), P(None), P(None))
+    out_specs = sparse_mla_dcp_draft_prep_partition_specs(num_steps, dcp_axis_name)
+    return jax.jit(
+        shard_map.shard_map(
+            _local, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
+        )
+    )(local_topk_indices, seq_lens, block_tables, query_start_loc, request_distribution)
