@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Sequence parallelism for the tensor-parallel prefill, gated by row count."""
+
 from vllm_torchtpu import envs
 
 _ACTIVE = False

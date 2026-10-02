@@ -17,6 +17,7 @@ steps and the kernel's dots, fp8 rows against fp8 weights accumulated in
 f32 on the matrix unit with the scales applied after, so the two agree to
 the order of f32 additions. Small shapes only: every token is
 contracted against every expert."""
+
 import functools
 
 import jax
@@ -35,10 +36,12 @@ def _fp8_dot(rows, weight):
     exact for fp8 values. The bf16 operands avoid the lossy eager TPU
     lowering of fp8 dot_general and use float32 accumulation in both
     eager and jitted execution."""
-    return lax.dot_general(rows.astype(jnp.bfloat16),
-                           weight.astype(jnp.bfloat16),
-                           _DOT,
-                           preferred_element_type=jnp.float32)
+    return lax.dot_general(
+        rows.astype(jnp.bfloat16),
+        weight.astype(jnp.bfloat16),
+        _DOT,
+        preferred_element_type=jnp.float32,
+    )
 
 
 def scaled_dot(rows, weight, scales, *, block_scaled, block):
@@ -49,45 +52,50 @@ def scaled_dot(rows, weight, scales, *, block_scaled, block):
     weight, each block upcast to fp8 and contracted on its own, as the
     kernel does)."""
     if scales is None:
-        return lax.dot_general(rows.astype(jnp.bfloat16),
-                               weight,
-                               _DOT,
-                               preferred_element_type=jnp.float32)
+        return lax.dot_general(
+            rows.astype(jnp.bfloat16), weight, _DOT, preferred_element_type=jnp.float32
+        )
     if not block_scaled:
         return _fp8_dot(rows, weight) * scales[None, :]
     acc = None
     for b in range(scales.shape[0]):
-        part = _fp8_dot(rows[:, b * block:(b + 1) * block],
-                        weight[b * block:(b + 1) * block].astype(FP8))
+        part = _fp8_dot(
+            rows[:, b * block : (b + 1) * block],
+            weight[b * block : (b + 1) * block].astype(FP8),
+        )
         part = part * scales[b][None, :]
         acc = part if acc is None else acc + part
     return acc
 
 
-def activation_dot(rows, row_scales, weight, scales, *, block_scaled, block,
-                   activation_block):
+def activation_dot(
+    rows, row_scales, weight, scales, *, block_scaled, block, activation_block
+):
     """scaled_dot with the activation's row scales applied: after the whole
     contraction (one scale per row), or per activation block of the
     contraction (row_scales [m, k // activation_block]), each block's
     product scaled by its own row scale before the sum, as the kernel's
     blocked contraction does."""
     if not activation_block:
-        return scaled_dot(
-            rows, weight, scales, block_scaled=block_scaled,
-            block=block) * row_scales
+        return (
+            scaled_dot(rows, weight, scales, block_scaled=block_scaled, block=block)
+            * row_scales
+        )
     acc = None
     for b in range(row_scales.shape[1]):
         lo, hi = b * activation_block, (b + 1) * activation_block
         if scales is None or not block_scaled:
             block_scales = scales
         else:
-            block_scales = scales[lo // block:hi // block]
-        part = scaled_dot(rows[:, lo:hi],
-                          weight[lo:hi],
-                          block_scales,
-                          block_scaled=block_scaled,
-                          block=block)
-        part = part * row_scales[:, b:b + 1]
+            block_scales = scales[lo // block : hi // block]
+        part = scaled_dot(
+            rows[:, lo:hi],
+            weight[lo:hi],
+            block_scales,
+            block_scaled=block_scaled,
+            block=block,
+        )
+        part = part * row_scales[:, b : b + 1]
         acc = part if acc is None else acc + part
     return acc
 
@@ -102,8 +110,9 @@ def fp4_block_rows(rows, block, scale_dtype=jnp.float32):
     four-bit result row would carry to the token's home core."""
     m, width = rows.shape
     if width % block:
-        raise ValueError(f"a row of {width} values is not a whole number of "
-                         f"{block}-value blocks")
+        raise ValueError(
+            f"a row of {width} values is not a whole number of {block}-value blocks"
+        )
     blocks = rows.astype(jnp.float32).reshape(m, width // block, block)
     amax = jnp.max(jnp.abs(blocks), axis=-1, keepdims=True)
     scale = (amax / FP4_MAX).astype(scale_dtype).astype(jnp.float32)
@@ -113,16 +122,10 @@ def fp4_block_rows(rows, block, scale_dtype=jnp.float32):
     return (q.astype(jnp.float32) * scale).reshape(m, width)
 
 
-@functools.partial(jax.jit,
-                   static_argnames=("block", "exp_bits", "man_bits", "bias",
-                                    "scale_dtype"))
-def float_grid_rows(rows,
-                    block,
-                    *,
-                    exp_bits,
-                    man_bits,
-                    bias,
-                    scale_dtype=jnp.float32):
+@functools.partial(
+    jax.jit, static_argnames=("block", "exp_bits", "man_bits", "bias", "scale_dtype")
+)
+def float_grid_rows(rows, block, *, exp_bits, man_bits, bias, scale_dtype=jnp.float32):
     """The result rows rounded through a small float format with no
     infinities or NaNs (the OCP MX element formats: E2M1, E2M3, E3M2), one
     scale per `block` values (the block's absolute maximum over the
@@ -133,11 +136,12 @@ def float_grid_rows(rows,
     float4_e2m1fn format."""
     m, width = rows.shape
     if width % block:
-        raise ValueError(f"a row of {width} values is not a whole number of "
-                         f"{block}-value blocks")
-    min_normal = 2.0**(1 - bias)
+        raise ValueError(
+            f"a row of {width} values is not a whole number of {block}-value blocks"
+        )
+    min_normal = 2.0 ** (1 - bias)
     # No infinity or NaN codes: the all-ones exponent is a normal.
-    largest = (2.0 - 2.0**-man_bits) * 2.0**(2**exp_bits - 1 - bias)
+    largest = (2.0 - 2.0**-man_bits) * 2.0 ** (2**exp_bits - 1 - bias)
     blocks = rows.astype(jnp.float32).reshape(m, width // block, block)
     amax = jnp.max(jnp.abs(blocks), axis=-1, keepdims=True)
     scale = (amax / largest).astype(scale_dtype).astype(jnp.float32)
@@ -146,15 +150,15 @@ def float_grid_rows(rows,
     v = jnp.where(scalable, blocks * inverse, 0.0)
     a = jnp.minimum(jnp.abs(v), largest)
     exponent = jnp.floor(jnp.log2(jnp.maximum(a, min_normal)))
-    step = jnp.where(a >= min_normal, 2.0**(exponent - man_bits),
-                     min_normal * 2.0**-man_bits)
+    step = jnp.where(
+        a >= min_normal, 2.0 ** (exponent - man_bits), min_normal * 2.0**-man_bits
+    )
     q = jnp.minimum(jnp.round(a / step) * step, largest)
     return (jnp.sign(v) * q * scale).reshape(m, width)
 
 
 FLOAT_GRIDS = {  # result_rows name -> (exponent bits, mantissa bits, bias)
-    "fp4_grid":
-    (2, 1, 1),  # e2m1 by the same arithmetic, a check on fp4_block_rows
+    "fp4_grid": (2, 1, 1),  # e2m1 by the same arithmetic, a check on fp4_block_rows
 }
 
 
@@ -166,39 +170,39 @@ def select(router_logits, *, top_k, renormalize):
     if renormalize:
         weights = jax.nn.softmax(top, axis=-1)
     else:
-        weights = jnp.take_along_axis(jax.nn.softmax(logits, axis=-1),
-                                      indices,
-                                      axis=-1)
+        weights = jnp.take_along_axis(jax.nn.softmax(logits, axis=-1), indices, axis=-1)
     routes = jnp.any(jnp.isfinite(logits), axis=-1, keepdims=True)
     return jnp.where(routes, weights, 0.0), indices.astype(jnp.int32)
 
 
-def fused_ep_moe_reference(x,
-                           w1,
-                           w2,
-                           w1_scales,
-                           w2_scales,
-                           router_logits,
-                           w1_bias=None,
-                           w2_bias=None,
-                           *,
-                           top_k,
-                           renormalize,
-                           weight_format,
-                           weight_block=None,
-                           activation="silu",
-                           swiglu_limit=ffn.SWIGLU_LIMIT_DEFAULT,
-                           routing=None,
-                           no_gate=False,
-                           activation_block=0,
-                           result_rows="fp8",
-                           elementwise_dtype="float32",
-                           token_block=None,
-                           intermediate="fp8",
-                           result_block=32,
-                           result_scale_dtype=jnp.float32,
-                           combine_dtype="float32",
-                           token_rows="fp8"):
+def fused_ep_moe_reference(
+    x,
+    w1,
+    w2,
+    w1_scales,
+    w2_scales,
+    router_logits,
+    w1_bias=None,
+    w2_bias=None,
+    *,
+    top_k,
+    renormalize,
+    weight_format,
+    weight_block=None,
+    activation="silu",
+    swiglu_limit=ffn.SWIGLU_LIMIT_DEFAULT,
+    routing=None,
+    no_gate=False,
+    activation_block=0,
+    result_rows="fp8",
+    elementwise_dtype="float32",
+    token_block=None,
+    intermediate="fp8",
+    result_block=32,
+    result_scale_dtype=jnp.float32,
+    combine_dtype="float32",
+    token_rows="fp8",
+):
     """fused_ep_moe's output, [tokens, hidden] in x's dtype. token_block:
     the token rows' rounding block (None: activation_block).
     result_rows: "fp8" (one scale per row), "fp8_block" (fp8 with one
@@ -218,8 +222,7 @@ def fused_ep_moe_reference(x,
     Config fields; with bfloat16, compiler fusion can change an
     intermediate rounding and produce fp8 differences between the kernel
     and this reference."""
-    elementwise = (jnp.float32
-                   if elementwise_dtype == "float32" else jnp.bfloat16)
+    elementwise = jnp.float32 if elementwise_dtype == "float32" else jnp.bfloat16
     form = weight_form(weight_format)
     block = WEIGHT_BLOCK_DEFAULT if weight_block is None else weight_block
     num_experts = w1.shape[0]
@@ -229,12 +232,12 @@ def fused_ep_moe_reference(x,
         # The token rows as they are, no rounding: unit scales.
         rows = x.astype(jnp.bfloat16)
         row_scales = jnp.ones(
-            (x.shape[0], x.shape[1] // token_block if token_block else 1),
-            jnp.float32)
+            (x.shape[0], x.shape[1] // token_block if token_block else 1), jnp.float32
+        )
     else:
-        rows, row_scales = quantize_rows(x.astype(jnp.bfloat16),
-                                         block=token_block,
-                                         dtype=elementwise)
+        rows, row_scales = quantize_rows(
+            x.astype(jnp.bfloat16), block=token_block, dtype=elementwise
+        )
     if routing is not None:
         indices, weights = routing
         indices = indices.astype(jnp.int32)
@@ -242,56 +245,64 @@ def fused_ep_moe_reference(x,
         indices = jnp.where(routes, indices, 0)
         weights = jnp.where(routes, weights.astype(jnp.float32), 0.0)
     else:
-        weights, indices = select(router_logits,
-                                  top_k=top_k,
-                                  renormalize=renormalize)
+        weights, indices = select(router_logits, top_k=top_k, renormalize=renormalize)
     out = jnp.zeros((x.shape[0], x.shape[1]), jnp.float32)
     if combine_dtype != "float32":
         if combine_dtype != "bfloat16" or result_rows not in ("fp8", "bf16"):
-            raise ValueError(f"combine_dtype {combine_dtype!r} with "
-                             f"{result_rows!r} result rows: the bf16 sum "
-                             "is defined for fp8 and bf16 rows")
+            raise ValueError(
+                f"combine_dtype {combine_dtype!r} with "
+                f"{result_rows!r} result rows: the bf16 sum "
+                "is defined for fp8 and bf16 rows"
+            )
         # A token's rows as they cross the wire, slot by slot, and their
         # scales (fp8 rows), gathered over the expert loop.
         slot_rows = [jnp.zeros(out.shape, jnp.bfloat16)] * top_k
-        slot_scales = ([jnp.zeros(out.shape[0], jnp.float32)] *
-                       top_k if result_rows == "fp8" else None)
+        slot_scales = (
+            [jnp.zeros(out.shape[0], jnp.float32)] * top_k
+            if result_rows == "fp8"
+            else None
+        )
     for e in range(num_experts):
-        acc1 = activation_dot(rows,
-                              row_scales,
-                              w1[e],
-                              None if w1_scales is None else w1_scales[e],
-                              block_scaled=form.block_scaled,
-                              block=block,
-                              activation_block=token_block)
+        acc1 = activation_dot(
+            rows,
+            row_scales,
+            w1[e],
+            None if w1_scales is None else w1_scales[e],
+            block_scaled=form.block_scaled,
+            block=block,
+            activation_block=token_block,
+        )
         if w1_bias is not None:
             acc1 = acc1 + w1_bias[e].reshape(1, -1)
         if no_gate:
             mid = ffn.apply_activation_no_gate(acc1, activation)
         else:
-            mid = ffn.apply_activation(acc1[:, :inter],
-                                       acc1[:, inter:],
-                                       activation,
-                                       swiglu_limit=swiglu_limit)
+            mid = ffn.apply_activation(
+                acc1[:, :inter], acc1[:, inter:], activation, swiglu_limit=swiglu_limit
+            )
         if intermediate == "fp8":
-            mid, mid_scales = quantize_rows(mid.astype(jnp.bfloat16),
-                                            block=activation_block,
-                                            dtype=elementwise)
-            acc2 = activation_dot(mid,
-                                  mid_scales,
-                                  w2[e],
-                                  None if w2_scales is None else w2_scales[e],
-                                  block_scaled=form.block_scaled,
-                                  block=block,
-                                  activation_block=activation_block)
+            mid, mid_scales = quantize_rows(
+                mid.astype(jnp.bfloat16), block=activation_block, dtype=elementwise
+            )
+            acc2 = activation_dot(
+                mid,
+                mid_scales,
+                w2[e],
+                None if w2_scales is None else w2_scales[e],
+                block_scaled=form.block_scaled,
+                block=block,
+                activation_block=activation_block,
+            )
         else:
             # "bf16": the kernel's bf16 intermediate against w2 upcast to
             # bf16; "exact": float32 rows against float32 weights, the
             # yardstick both forms are measured against.
             mid_dtype = jnp.bfloat16 if intermediate == "bf16" else jnp.float32
-            acc2 = jnp.dot(mid.astype(mid_dtype),
-                           w2[e].astype(mid_dtype),
-                           preferred_element_type=jnp.float32)
+            acc2 = jnp.dot(
+                mid.astype(mid_dtype),
+                w2[e].astype(mid_dtype),
+                preferred_element_type=jnp.float32,
+            )
             if w2_scales is not None:
                 acc2 = acc2 * w2_scales[e].astype(jnp.float32)[None, :]
         if w2_bias is not None:
@@ -303,49 +314,48 @@ def fused_ep_moe_reference(x,
             elif result_rows == "f32":
                 rounded = acc2
             elif result_rows == "fp4":
-                rounded = fp4_block_rows(acc2.astype(jnp.bfloat16),
-                                         result_block, result_scale_dtype)
+                rounded = fp4_block_rows(
+                    acc2.astype(jnp.bfloat16), result_block, result_scale_dtype
+                )
             elif result_rows in FLOAT_GRIDS:
                 exp_bits, man_bits, bias = FLOAT_GRIDS[result_rows]
-                rounded = float_grid_rows(acc2.astype(jnp.bfloat16),
-                                          result_block,
-                                          exp_bits=exp_bits,
-                                          man_bits=man_bits,
-                                          bias=bias,
-                                          scale_dtype=result_scale_dtype)
+                rounded = float_grid_rows(
+                    acc2.astype(jnp.bfloat16),
+                    result_block,
+                    exp_bits=exp_bits,
+                    man_bits=man_bits,
+                    bias=bias,
+                    scale_dtype=result_scale_dtype,
+                )
             elif result_rows == "fp8_block":
-                result, result_scales = quantize_rows(acc2.astype(
-                    jnp.bfloat16),
-                                                      block=result_block,
-                                                      dtype=elementwise)
-                blocks = result.reshape(-1, x.shape[1] // result_block,
-                                        result_block)
-                rounded = (blocks.astype(jnp.float32) *
-                           result_scales[:, :, None]).reshape(result.shape)
+                result, result_scales = quantize_rows(
+                    acc2.astype(jnp.bfloat16), block=result_block, dtype=elementwise
+                )
+                blocks = result.reshape(-1, x.shape[1] // result_block, result_block)
+                rounded = (
+                    blocks.astype(jnp.float32) * result_scales[:, :, None]
+                ).reshape(result.shape)
             else:
-                result, result_scales = quantize_rows(acc2.astype(
-                    jnp.bfloat16),
-                                                      dtype=elementwise)
+                result, result_scales = quantize_rows(
+                    acc2.astype(jnp.bfloat16), dtype=elementwise
+                )
                 rounded = result.astype(jnp.float32) * result_scales
             return rounded
 
-        weight_e = jnp.sum(jnp.where(indices == e, weights, 0.0),
-                           axis=1,
-                           keepdims=True)
+        weight_e = jnp.sum(jnp.where(indices == e, weights, 0.0), axis=1, keepdims=True)
         if combine_dtype != "float32":
             if result_rows == "fp8":
-                wire, wire_scales = quantize_rows(acc2.astype(jnp.bfloat16),
-                                                  dtype=elementwise)
-                wire, wire_scales = (wire.astype(jnp.bfloat16),
-                                     wire_scales.reshape(-1))
+                wire, wire_scales = quantize_rows(
+                    acc2.astype(jnp.bfloat16), dtype=elementwise
+                )
+                wire, wire_scales = (wire.astype(jnp.bfloat16), wire_scales.reshape(-1))
             else:
                 wire, wire_scales = acc2.astype(jnp.bfloat16), None
             for k in range(top_k):
                 hit = indices[:, k] == e
                 slot_rows[k] = jnp.where(hit[:, None], wire, slot_rows[k])
                 if wire_scales is not None:
-                    slot_scales[k] = jnp.where(hit, wire_scales,
-                                               slot_scales[k])
+                    slot_scales[k] = jnp.where(hit, wire_scales, slot_scales[k])
         else:
             out = out + weight_e * round_rows(acc2)
     if combine_dtype != "float32":

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The chip this package runs on, and the jax releases behind it."""
+
 import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
@@ -20,7 +21,7 @@ from .layout import SUBLANES, align_up
 
 # Supported TPU generations. Device properties are read at build time,
 # and check_generation rejects generations outside this set.
-SUPPORTED_GENERATIONS = (7, )
+SUPPORTED_GENERATIONS = (7,)
 # The share of the chip's VMEM a kernel may claim.
 VMEM_FRACTION = 0.98
 
@@ -38,13 +39,16 @@ def check_generation(info=None):
     if generation not in SUPPORTED_GENERATIONS:
         raise ValueError(
             f"this chip is TPU generation {generation}. The package has been "
-            f"built and tested on generations {SUPPORTED_GENERATIONS} only")
+            f"built and tested on generations {SUPPORTED_GENERATIONS} only"
+        )
 
 
 def supported_on(device):
     """Whether the package runs on `device` (a jax.Device)."""
-    return (device.platform == "tpu"
-            and pltpu.get_tpu_info().generation in SUPPORTED_GENERATIONS)
+    return (
+        device.platform == "tpu"
+        and pltpu.get_tpu_info().generation in SUPPORTED_GENERATIONS
+    )
 
 
 def vmem_limit(fraction=VMEM_FRACTION):
@@ -78,7 +82,8 @@ def check_u32_sublane_tile(info=None):
     if queried != SUBLANES:
         raise ValueError(
             f"this chip tiles 32-bit words to {queried} sublanes. The packed "
-            f"four-bit weight layout is written for {SUBLANES}")
+            f"four-bit weight layout is written for {SUBLANES}"
+        )
 
 
 def jax_version():

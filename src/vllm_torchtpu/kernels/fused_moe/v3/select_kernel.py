@@ -19,6 +19,7 @@ message it carries the index one past the last expert, which the tables
 kernel allocates no routed row; as plain indices it carries expert zero,
 and the layer's weights zero it.
 """
+
 import functools
 
 import jax
@@ -39,7 +40,7 @@ def _lane_sum_in_xla_order(values, top_k):
     """The sum of values' top_k lanes in the order XLA's lane reduction adds
     them (a halving tree over the row padded with zeros to a power of two),
     to preserve the reduction order used by the reference softmax."""
-    columns = [values[:, k:k + 1] for k in range(top_k)]
+    columns = [values[:, k : k + 1] for k in range(top_k)]
     width = 1
     while width < top_k:
         width *= 2
@@ -48,14 +49,24 @@ def _lane_sum_in_xla_order(values, top_k):
         width //= 2
         columns = [
             a if b is None else b if a is None else a + b
-            for a, b in zip(columns[:width], columns[width:2 * width])
+            for a, b in zip(columns[:width], columns[width : 2 * width])
         ]
     return columns[0]
 
 
-def _select_body(logits_ref, weights_ref, indices_ref, *scratch, top_k,
-                 num_experts, num_rows, renormalize, drop_nan_rows,
-                 message_rows, pair_rows):
+def _select_body(
+    logits_ref,
+    weights_ref,
+    indices_ref,
+    *scratch,
+    top_k,
+    num_experts,
+    num_rows,
+    renormalize,
+    drop_nan_rows,
+    message_rows,
+    pair_rows,
+):
     """One block of rows: the top_k by repeated max-and-mask.
 
     With `renormalize` the weights are the top_k-wide softmax of the
@@ -66,13 +77,11 @@ def _select_body(logits_ref, weights_ref, indices_ref, *scratch, top_k,
     at a time, and each slot's lane rows stored at their sublanes. The rows
     behind the indices are zeroed on the first step.
     """
-    logits = jnp.where(jnp.isnan(logits_ref[...]), UNROUTABLE_LOGIT,
-                       logits_ref[...])
+    logits = jnp.where(jnp.isnan(logits_ref[...]), UNROUTABLE_LOGIT, logits_ref[...])
     expert_iota = jax.lax.broadcasted_iota(jnp.int32, logits.shape, 1)
     index_out = scratch[0] if message_rows else indices_ref
     if renormalize:
-        selected = jnp.full((logits.shape[0], top_k), UNROUTABLE_LOGIT,
-                            jnp.float32)
+        selected = jnp.full((logits.shape[0], top_k), UNROUTABLE_LOGIT, jnp.float32)
         slot_iota = jax.lax.broadcasted_iota(jnp.int32, selected.shape, 1)
     routes = None
     for k in range(top_k):
@@ -82,34 +91,31 @@ def _select_body(logits_ref, weights_ref, indices_ref, *scratch, top_k,
         is_max = logits == row_max
         # The lowest matching column. A non-matching column reads as the
         # last expert, so every index returned is a real expert.
-        index = jnp.min(jnp.where(is_max, expert_iota, num_experts - 1),
-                        axis=1)
+        index = jnp.min(jnp.where(is_max, expert_iota, num_experts - 1), axis=1)
         if renormalize:
             selected = jnp.where(slot_iota == k, row_max, selected)
         else:
             weights_ref[:, k] = row_max[:, 0]
         index_out[:, k] = index.astype(jnp.int32)
-        logits = jnp.where(expert_iota == index[:, None], UNROUTABLE_LOGIT,
-                           logits)
+        logits = jnp.where(expert_iota == index[:, None], UNROUTABLE_LOGIT, logits)
     if renormalize:
         if drop_nan_rows:
             routes = jnp.logical_and(
                 jnp.logical_not(
-                    jnp.any(jnp.isnan(logits_ref[...]), axis=1,
-                            keepdims=True)), routes)
+                    jnp.any(jnp.isnan(logits_ref[...]), axis=1, keepdims=True)
+                ),
+                routes,
+            )
         peak = jnp.max(selected, axis=1, keepdims=True)
-        exponentials = jnp.exp(selected -
-                               jnp.where(routes, peak, jnp.float32(0.0)))
+        exponentials = jnp.exp(selected - jnp.where(routes, peak, jnp.float32(0.0)))
         denominator = _lane_sum_in_xla_order(exponentials, top_k)
-        weights = exponentials / jnp.where(routes, denominator,
-                                           jnp.float32(1.0))
+        weights = exponentials / jnp.where(routes, denominator, jnp.float32(1.0))
         weights_ref[...] = jnp.where(routes, weights, jnp.float32(0.0))
     if message_rows:
         # A row that routes nowhere carries the index one past the last
         # expert on every slot: the tables allocate it no routed row and
         # the combine gives it weight zero. Padded rows arrive this way.
-        index_out[...] = jnp.where(routes, index_out[...],
-                                   jnp.int32(num_experts))
+        index_out[...] = jnp.where(routes, index_out[...], jnp.int32(num_experts))
         step = pl.program_id(0)
         block_rows, lanes = index_out.shape
         rows_per_slot = num_rows // lanes
@@ -123,29 +129,29 @@ def _select_body(logits_ref, weights_ref, indices_ref, *scratch, top_k,
             def _():
                 if pair_rows > index_rows:
                     indices_ref[index_rows:pair_rows, :] = jnp.full(
-                        (pair_rows - index_rows, lanes), num_experts,
-                        jnp.int32)
+                        (pair_rows - index_rows, lanes), num_experts, jnp.int32
+                    )
                 if message_rows > pair_rows:
                     indices_ref[pair_rows:, :] = jnp.zeros(
-                        (message_rows - pair_rows, lanes), jnp.int32)
+                        (message_rows - pair_rows, lanes), jnp.int32
+                    )
 
-        tiles = [
-            index_out[h * lanes:(h + 1) * lanes, :].T for h in range(halves)
-        ]
+        tiles = [index_out[h * lanes : (h + 1) * lanes, :].T for h in range(halves)]
         for k in range(top_k):
-            rows = jnp.concatenate([t[k:k + 1, :] for t in tiles], axis=0)
-            indices_ref[pl.ds(k * rows_per_slot +
-                              step * halves, halves), :] = rows
+            rows = jnp.concatenate([t[k : k + 1, :] for t in tiles], axis=0)
+            indices_ref[pl.ds(k * rows_per_slot + step * halves, halves), :] = rows
 
 
-def select_top_k(logits,
-                 *,
-                 top_k,
-                 block_rows,
-                 renormalize=False,
-                 drop_nan_rows=False,
-                 message_rows=None,
-                 pair_rows=None):
+def select_top_k(
+    logits,
+    *,
+    top_k,
+    block_rows,
+    renormalize=False,
+    drop_nan_rows=False,
+    message_rows=None,
+    pair_rows=None,
+):
     """Top-k over [rows, experts] scores.
 
     Returns (weights f32 [rows, top_k], indices int32 [rows, top_k]). With
@@ -159,8 +165,9 @@ def select_top_k(logits,
     if pair_rows is None:
         pair_rows = -(-num_rows * top_k // LANES)
     if num_rows % block_rows:
-        raise ValueError(f"{num_rows} rows is not a whole number of "
-                         f"{block_rows}-row blocks")
+        raise ValueError(
+            f"{num_rows} rows is not a whole number of {block_rows}-row blocks"
+        )
     hbm = pltpu.MemorySpace.HBM
     lanes = LANES
     if message_rows:
@@ -168,11 +175,14 @@ def select_top_k(logits,
             raise ValueError(
                 f"the routing message takes whole {lanes}-lane rows: "
                 f"a block of {block_rows} rows and {num_rows} x "
-                f"{top_k} selections have to be multiples of it")
+                f"{top_k} selections have to be multiples of it"
+            )
         if pair_rows * lanes < num_rows * top_k or message_rows < pair_rows:
-            raise ValueError(f"a routing message of {message_rows} rows with "
-                             f"{pair_rows} pair rows holds fewer than the "
-                             f"{num_rows * top_k} selections")
+            raise ValueError(
+                f"a routing message of {message_rows} rows with "
+                f"{pair_rows} pair rows holds fewer than the "
+                f"{num_rows * top_k} selections"
+            )
         index_shape = hbm((message_rows, lanes), jnp.int32)
         index_spec = pl.BlockSpec((message_rows, lanes), lambda i: (0, 0))
         scratch = [pltpu.VMEM((block_rows, lanes), jnp.int32)]
@@ -181,19 +191,19 @@ def select_top_k(logits,
         index_spec = pl.BlockSpec((block_rows, top_k), lambda i: (i, 0))
         scratch = []
     return pl.pallas_call(
-        functools.partial(_select_body,
-                          top_k=top_k,
-                          num_experts=num_experts,
-                          num_rows=num_rows,
-                          renormalize=renormalize,
-                          drop_nan_rows=drop_nan_rows,
-                          message_rows=message_rows,
-                          pair_rows=pair_rows),
-        grid=(num_rows // block_rows, ),
+        functools.partial(
+            _select_body,
+            top_k=top_k,
+            num_experts=num_experts,
+            num_rows=num_rows,
+            renormalize=renormalize,
+            drop_nan_rows=drop_nan_rows,
+            message_rows=message_rows,
+            pair_rows=pair_rows,
+        ),
+        grid=(num_rows // block_rows,),
         in_specs=[pl.BlockSpec((block_rows, num_experts), lambda i: (i, 0))],
-        out_specs=[
-            pl.BlockSpec((block_rows, top_k), lambda i: (i, 0)), index_spec
-        ],
+        out_specs=[pl.BlockSpec((block_rows, top_k), lambda i: (i, 0)), index_spec],
         out_shape=[hbm((num_rows, top_k), jnp.float32), index_shape],
         scratch_shapes=scratch,
         name=f"fused_ep_select_{'renormalized' if renormalize else 'raw'}",

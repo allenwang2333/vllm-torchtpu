@@ -25,6 +25,7 @@ out-projection would have quantised itself.
 Semantics (vLLM RMSNormGated, norm_before_gate=True, activation swish): per head h of a token,
 ``y = x_h * rsqrt(mean(x_h^2) + eps) * w * silu(z_h)``; then ``scale = max|y| / 448`` per token (1 where the row
 is all zero) and ``q = clip(y / scale, -448, 448)`` in float8_e4m3fn."""
+
 import functools
 
 import jax
@@ -44,7 +45,8 @@ def _kernel(o_ref, z_ref, w_ref, q_ref, s_ref, *, eps: float):
     y = o * jax.lax.rsqrt(var + eps) * w[None, None, :]
     y = y * (z * jax.nn.sigmoid(z))
     y = y.astype(jnp.bfloat16).astype(
-        jnp.float32)  # the norm's bf16 output, as the two-step path rounds it
+        jnp.float32
+    )  # the norm's bf16 output, as the two-step path rounds it
     amax = jnp.max(jnp.abs(y), axis=(1, 2), keepdims=True)  # [tile, 1, 1]
     scale = jnp.where(amax == 0.0, 1.0, amax / FP8_MAX)
     q_ref[...] = jnp.clip(y / scale, -FP8_MAX, FP8_MAX).astype(FP8)
@@ -61,66 +63,70 @@ def legal_tile(rows: int, cap: int) -> int:
     return rows
 
 
-def gated_norm_quant(o: jax.Array,
-                     z: jax.Array,
-                     w: jax.Array,
-                     eps: float,
-                     *,
-                     tile: int = 32,
-                     interpret: bool = False) -> tuple[jax.Array, jax.Array]:
+def gated_norm_quant(
+    o: jax.Array,
+    z: jax.Array,
+    w: jax.Array,
+    eps: float,
+    *,
+    tile: int = 32,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array]:
     """o, z: [tokens, heads, dim] (bf16); w: [dim]. Returns (q fp8 [tokens, heads, dim], scale f32 [tokens, 1])."""
     tokens, heads, dim = o.shape
-    assert z.shape == o.shape and w.shape == (dim, ), (o.shape, z.shape,
-                                                       w.shape)
+    assert z.shape == o.shape and w.shape == (dim,), (o.shape, z.shape, w.shape)
     # The token buckets are 4, 8, 12, 16, 32, 48, 64, 80, ...: the tile is the largest divisor of the row count at
     # or below the requested one that Pallas accepts as a block: a multiple of 8, or the whole row count (48 rows run
     # in tiles of 16, 80 in tiles of 16, 12 in one tile of 12; 20 for 80 rows is a divisor but not a legal block).
     tile = legal_tile(tokens, tile)
-    grid = (tokens // tile, )
+    grid = (tokens // tile,)
     spec = pl.BlockSpec((tile, heads, dim), lambda i: (i, 0, 0))
     return pl.pallas_call(
         functools.partial(_kernel, eps=float(eps)),
         grid=grid,
-        in_specs=[spec, spec,
-                  pl.BlockSpec((dim, ), lambda i: (0, ))],
+        in_specs=[spec, spec, pl.BlockSpec((dim,), lambda i: (0,))],
         out_specs=[spec, pl.BlockSpec((tile, 1), lambda i: (i, 0))],
         out_shape=[
             jax.ShapeDtypeStruct((tokens, heads, dim), FP8),
-            jax.ShapeDtypeStruct((tokens, 1), jnp.float32)
+            jax.ShapeDtypeStruct((tokens, 1), jnp.float32),
         ],
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", )),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         interpret=interpret,
     )(o, z, w)
 
 
-def reference(o: jax.Array, z: jax.Array, w: jax.Array,
-              eps: float) -> tuple[jax.Array, jax.Array]:
+def reference(
+    o: jax.Array, z: jax.Array, w: jax.Array, eps: float
+) -> tuple[jax.Array, jax.Array]:
     """The two-step path in plain jnp: RMSNormGated then the out-projection's per-token quantisation."""
     x = o.astype(jnp.float32)
     zz = z.astype(jnp.float32)
     var = jnp.mean(x * x, axis=-1, keepdims=True)
-    y = (x * jax.lax.rsqrt(var + eps) *
-         w.astype(jnp.float32)[None, None, :]) * (zz * jax.nn.sigmoid(zz))
+    y = (x * jax.lax.rsqrt(var + eps) * w.astype(jnp.float32)[None, None, :]) * (
+        zz * jax.nn.sigmoid(zz)
+    )
     y = y.astype(jnp.bfloat16)
     flat = y.reshape(y.shape[0], -1)
     amax = jnp.max(jnp.abs(flat), axis=-1, keepdims=True).astype(jnp.float32)
     scale = jnp.where(amax == 0, 1.0, amax / FP8_MAX)
-    q = jnp.clip(flat.astype(jnp.float32) / scale, -FP8_MAX,
-                 FP8_MAX).astype(FP8)
+    q = jnp.clip(flat.astype(jnp.float32) / scale, -FP8_MAX, FP8_MAX).astype(FP8)
     return q.reshape(o.shape), scale
 
 
-def prequant_matmul_in_out(x_q: jax.Array,
-                           x_scale: jax.Array,
-                           w_q: jax.Array,
-                           w_s: jax.Array,
-                           out_dtype=jnp.bfloat16) -> jax.Array:
+def prequant_matmul_in_out(
+    x_q: jax.Array,
+    x_scale: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    out_dtype=jnp.bfloat16,
+) -> jax.Array:
     """The per-channel fp8 matmul with the weight stored [n_in, n_out], on a pre-quantised activation:
     the same arithmetic as util.xla_quantized_matmul after its own quantize_tensor."""
-    out = jax.lax.dot_general(x_q,
-                              w_q,
-                              dimension_numbers=(((1, ), (0, )), ((), ())),
-                              preferred_element_type=jnp.float32)
+    out = jax.lax.dot_general(
+        x_q,
+        w_q,
+        dimension_numbers=(((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
     out = out * x_scale * jnp.expand_dims(w_s, 0)
     return out.astype(out_dtype)

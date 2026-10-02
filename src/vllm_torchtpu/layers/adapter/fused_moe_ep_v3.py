@@ -57,15 +57,22 @@ import torch
 from jax.sharding import PartitionSpec
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.distributed.ep_mesh import (EP_AXIS_NAME, build_ep_mesh,
-                                               ep_mesh_index, ep_rank_order)
+from vllm_torchtpu.distributed.ep_mesh import (
+    EP_AXIS_NAME,
+    build_ep_mesh,
+    ep_mesh_index,
+    ep_rank_order,
+)
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
 from vllm_torchtpu.kernels.fused_moe.v3 import layer as _latest_layer
 from vllm_torchtpu.kernels.fused_moe.v3 import layout as _latest_layout
 from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-    _pcp_size, _squeeze_channel_scale, _squeeze_channel_scale_checked,
-    _unsupported_routing_reason)
+    _pcp_size,
+    _squeeze_channel_scale,
+    _squeeze_channel_scale_checked,
+    _unsupported_routing_reason,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -87,11 +94,9 @@ def mask_local_rows(x: jax.Array, gating: jax.Array, valid_tokens: jax.Array):
     return x, gating
 
 
-def mask_padded_rows(x: jax.Array,
-                     gating: jax.Array,
-                     valid_tokens: jax.Array,
-                     ep: int,
-                     mesh=None):
+def mask_padded_rows(
+    x: jax.Array, gating: jax.Array, valid_tokens: jax.Array, ep: int, mesh=None
+):
     """Rows past each rank's valid prefix route nowhere and carry nothing.
 
     `x` and `gating` are the global arrays, `ep * t_local` rows in rank
@@ -108,10 +113,12 @@ def mask_padded_rows(x: jax.Array,
     """
     if mesh is not None:
         spec = PartitionSpec(MESH_AXIS)
-        return jax.shard_map(mask_local_rows,
-                             mesh=mesh,
-                             in_specs=(spec, spec, spec),
-                             out_specs=(spec, spec))(x, gating, valid_tokens)
+        return jax.shard_map(
+            mask_local_rows,
+            mesh=mesh,
+            in_specs=(spec, spec, spec),
+            out_specs=(spec, spec),
+        )(x, gating, valid_tokens)
     tokens = x.shape[0]
     t_local = tokens // ep
     local = jnp.arange(tokens, dtype=jnp.int32) % t_local
@@ -122,32 +129,55 @@ def mask_padded_rows(x: jax.Array,
     return x, gating
 
 
-def served_config(*, hidden: int, inter: int, experts_per_shard: int,
-                  top_k: int) -> Config:
+def served_config(
+    *, hidden: int, inter: int, experts_per_shard: int, top_k: int
+) -> Config:
     """The kernel's own settings for this shape (Config.for_shape), logged
     once so every precision and structural choice is on record."""
-    config = Config.for_shape(hidden=hidden,
-                              inter=inter,
-                              experts_per_shard=experts_per_shard,
-                              top_k=top_k)
+    config = Config.for_shape(
+        hidden=hidden, inter=inter, experts_per_shard=experts_per_shard, top_k=top_k
+    )
     logger.info_once(
         "Fused EP MoE (latest kernel) settings for hidden=%d inter=%d "
         "experts_per_shard=%d top_k=%d: tile_rows=%d weight_format=%s "
         "token_rows=%s intermediate=%s result_rows=%s elementwise=%s "
         "combine=%s row_scale_dtype=%s sorted_rows=%s "
         "stream_block=%s token_block=%s weight_slots=%d weight_prefetch=%d "
-        "result_slots=%d row_fetch_ahead=%d vmem_fraction=%s", hidden, inter,
-        experts_per_shard, top_k, TILE_ROWS, WEIGHT_FORMAT, config.token_rows,
-        config.intermediate, config.result_rows, config.elementwise_dtype,
-        config.combine_dtype, config.row_scale_dtype, config.sorted_rows,
-        config.stream_block, config.token_block, config.weight_slots,
-        config.weight_prefetch, config.result_slots, config.row_fetch_ahead,
-        config.vmem_fraction)
+        "result_slots=%d row_fetch_ahead=%d vmem_fraction=%s",
+        hidden,
+        inter,
+        experts_per_shard,
+        top_k,
+        TILE_ROWS,
+        WEIGHT_FORMAT,
+        config.token_rows,
+        config.intermediate,
+        config.result_rows,
+        config.elementwise_dtype,
+        config.combine_dtype,
+        config.row_scale_dtype,
+        config.sorted_rows,
+        config.stream_block,
+        config.token_block,
+        config.weight_slots,
+        config.weight_prefetch,
+        config.result_slots,
+        config.row_fetch_ahead,
+        config.vmem_fraction,
+    )
     return config
 
 
-def run_moe_v3(mesh, topk: int, renormalize: bool, activation: str, *,
-               hidden: int, inter: int, experts_per_shard: int):
+def run_moe_v3(
+    mesh,
+    topk: int,
+    renormalize: bool,
+    activation: str,
+    *,
+    hidden: int,
+    inter: int,
+    experts_per_shard: int,
+):
     """The `run_moe` the adapter's op wraps, on the latest kernel."""
     # The torch bridge exports the whole op as one jitted function; the
     # layer's own inner jit is what the export path's SPMD partitioner
@@ -162,12 +192,12 @@ def run_moe_v3(mesh, topk: int, renormalize: bool, activation: str, *,
     if MESH_AXIS not in mesh.axis_names:
         raise ValueError(
             f"the latest kernel splits the experts over the mesh axis named "
-            f"{MESH_AXIS!r}; the adapter's mesh has {mesh.axis_names}")
+            f"{MESH_AXIS!r}; the adapter's mesh has {mesh.axis_names}"
+        )
     ep = mesh.shape[MESH_AXIS]
-    config = served_config(hidden=hidden,
-                           inter=inter,
-                           experts_per_shard=experts_per_shard,
-                           top_k=topk)
+    config = served_config(
+        hidden=hidden, inter=inter, experts_per_shard=experts_per_shard, top_k=topk
+    )
 
     def run_moe(x, w1, w2, w1_scale, w2_scale, gating, rank, valid_tokens):
         # rank: int32 [ep, 1], each shard's mesh index, the adapter's device
@@ -175,27 +205,25 @@ def run_moe_v3(mesh, topk: int, renormalize: bool, activation: str, *,
         gating = gating.astype(jnp.float32)
         drop_nan_rows = valid_tokens is not None
         if drop_nan_rows:
-            x, gating = mask_padded_rows(x,
-                                         gating,
-                                         valid_tokens,
-                                         ep,
-                                         mesh=mesh)
-        return fused_ep_moe(x,
-                            w1,
-                            w2,
-                            w1_scale,
-                            w2_scale,
-                            gating,
-                            top_k=topk,
-                            renormalize=renormalize,
-                            mesh=mesh,
-                            tile_rows=TILE_ROWS,
-                            weight_format=WEIGHT_FORMAT,
-                            activation=activation,
-                            drop_nan_rows=drop_nan_rows,
-                            config=config,
-                            shard_index=rank,
-                            experts_per_shard=experts_per_shard)
+            x, gating = mask_padded_rows(x, gating, valid_tokens, ep, mesh=mesh)
+        return fused_ep_moe(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            top_k=topk,
+            renormalize=renormalize,
+            mesh=mesh,
+            tile_rows=TILE_ROWS,
+            weight_format=WEIGHT_FORMAT,
+            activation=activation,
+            drop_nan_rows=drop_nan_rows,
+            config=config,
+            shard_index=rank,
+            experts_per_shard=experts_per_shard,
+        )
 
     return run_moe
 
@@ -244,35 +272,57 @@ def fused_moe_ep_supported(owner: Any = None) -> bool:
     return bool(getattr(owner, "_tpu_fused_ep_eligible", False))
 
 
-def _build_op(mesh, topk: int, renormalize: bool, activation: str,
-              skip_padded_tokens: bool, *, hidden: int, inter: int,
-              local_experts: int):
-    run_moe = run_moe_v3(mesh,
-                         topk,
-                         renormalize,
-                         activation,
-                         hidden=hidden,
-                         inter=inter,
-                         experts_per_shard=local_experts)
+def _build_op(
+    mesh,
+    topk: int,
+    renormalize: bool,
+    activation: str,
+    skip_padded_tokens: bool,
+    *,
+    hidden: int,
+    inter: int,
+    local_experts: int,
+):
+    run_moe = run_moe_v3(
+        mesh,
+        topk,
+        renormalize,
+        activation,
+        hidden=hidden,
+        inter=inter,
+        experts_per_shard=local_experts,
+    )
 
     # Add the valid-prefix operand only when padding is skipped.
     if skip_padded_tokens:
 
-        def moe(x: jax.Array, w1: jax.Array, w2: jax.Array,
-                w1_scale: jax.Array, w2_scale: jax.Array, gating: jax.Array,
-                valid_tokens: jax.Array, rank: jax.Array) -> jax.Array:
-            return run_moe(x, w1, w2, w1_scale, w2_scale, gating, rank,
-                           valid_tokens)
+        def moe(
+            x: jax.Array,
+            w1: jax.Array,
+            w2: jax.Array,
+            w1_scale: jax.Array,
+            w2_scale: jax.Array,
+            gating: jax.Array,
+            valid_tokens: jax.Array,
+            rank: jax.Array,
+        ) -> jax.Array:
+            return run_moe(x, w1, w2, w1_scale, w2_scale, gating, rank, valid_tokens)
 
-        input_specs = (PartitionSpec(EP_AXIS_NAME), ) * 8
+        input_specs = (PartitionSpec(EP_AXIS_NAME),) * 8
     else:
 
-        def moe(x: jax.Array, w1: jax.Array, w2: jax.Array,
-                w1_scale: jax.Array, w2_scale: jax.Array, gating: jax.Array,
-                rank: jax.Array) -> jax.Array:
+        def moe(
+            x: jax.Array,
+            w1: jax.Array,
+            w2: jax.Array,
+            w1_scale: jax.Array,
+            w2_scale: jax.Array,
+            gating: jax.Array,
+            rank: jax.Array,
+        ) -> jax.Array:
             return run_moe(x, w1, w2, w1_scale, w2_scale, gating, rank, None)
 
-        input_specs = (PartitionSpec(EP_AXIS_NAME), ) * 7
+        input_specs = (PartitionSpec(EP_AXIS_NAME),) * 7
 
     spec = PartitionSpec(EP_AXIS_NAME)
     # Use shard-local output shapes: the stock bridge sizes outputs from
@@ -313,15 +363,23 @@ def fused_moe_ep(
     all-gather the input or reduce-scatter the output. Only call it when
     `fused_moe_ep_supported` said yes.
     """
-    args = (hidden_states, w1, w2, _squeeze_channel_scale_checked(w1_scale),
-            _squeeze_channel_scale_checked(w2_scale),
-            _to_mesh_expert_order(router_logits))
+    args = (
+        hidden_states,
+        w1,
+        w2,
+        _squeeze_channel_scale_checked(w1_scale),
+        _squeeze_channel_scale_checked(w2_scale),
+        _to_mesh_expert_order(router_logits),
+    )
     if _SKIP_PADDED_TOKENS:
         from vllm_torchtpu.layers.adapter import token_padding
+
         valid_tokens = token_padding.get_local_valid_tokens()
         if valid_tokens is None:
-            raise RuntimeError("fused EP padding skipping is enabled but the "
-                               "runner did not install padding state")
+            raise RuntimeError(
+                "fused EP padding skipping is enabled but the "
+                "runner did not install padding state"
+            )
         return _OP(*args, valid_tokens, _RANK_BUFFER)
     return _OP(*args, _RANK_BUFFER)
 
@@ -331,10 +389,13 @@ def retain_fused_ep_graph_inputs(output: torch.Tensor) -> torch.Tensor:
     graph_inputs = [_RANK_BUFFER, _EXPERT_ORDER]
     if _SKIP_PADDED_TOKENS:
         from vllm_torchtpu.layers.adapter import token_padding
+
         valid_tokens = token_padding.get_local_valid_tokens()
         if valid_tokens is None:
-            raise RuntimeError("fused EP padding skipping is enabled but the "
-                               "runner did not install padding state")
+            raise RuntimeError(
+                "fused EP padding skipping is enabled but the "
+                "runner did not install padding state"
+            )
         graph_inputs.append(valid_tokens)
 
     marker = None
@@ -375,12 +436,13 @@ def _expert_block_permutation(ep: int, device) -> torch.Tensor | None:
     if order is None or tuple(order) == tuple(range(ep)):
         return None
     if sorted(order) != list(range(ep)):
-        raise ValueError(f"EP rank order {order} is not a permutation of "
-                         f"range({ep})")
+        raise ValueError(f"EP rank order {order} is not a permutation of range({ep})")
     # A tuple, not a list: `info_once` keys its cache on the arguments.
     logger.info_once(
         "Fused EP MoE: EP ranks are not in device-id order, so the expert "
-        "axis is reindexed to mesh order | ep_rank_at_mesh_index=%s", order)
+        "axis is reindexed to mesh order | ep_rank_at_mesh_index=%s",
+        order,
+    )
     return torch.tensor(order, dtype=torch.int32, device=device)
 
 
@@ -397,28 +459,33 @@ def check_kernel_threshold(ep: int, tp: int) -> None:
     gate = int(envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS or 0)
     if tp > 1:
         from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+
         start = _sp.min_rows()
         # below the sequence-parallel start every rank holds the step's rows;
         # from it each rank holds at least ceil(start / tp) of them
         meets = cap >= start - 1 and gate <= -(-start // tp)
-        rule = (f"the few-token kernel up to {cap} rows, sequence parallelism "
-                f"and the fused EP kernel from {start} rows ({gate} per rank)")
+        rule = (
+            f"the few-token kernel up to {cap} rows, sequence parallelism "
+            f"and the fused EP kernel from {start} rows ({gate} per rank)"
+        )
     else:
         # an engine's rows below the gate are gathered from all ep engines
         meets = cap >= ep * max(gate - 1, 0)
-        rule = (f"the few-token kernel up to {cap} rows across the node, the "
-                f"fused EP kernel from {gate} rows per engine "
-                f"({ep * gate} across the node)")
+        rule = (
+            f"the few-token kernel up to {cap} rows across the node, the "
+            f"fused EP kernel from {gate} rows per engine "
+            f"({ep * gate} across the node)"
+        )
     if not meets:
         raise ValueError(
             "The MoE kernel settings leave steps between the two kernels ("
             f"{rule}). Set them from one threshold, as the Qwen3.5 recipe's "
-            "MOE_KERNEL_THRESHOLD does.")
+            "MOE_KERNEL_THRESHOLD does."
+        )
     logger.info_once("MoE kernels: %s.", rule)
 
 
-def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
-                          activation: str) -> None:
+def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) -> None:
     """Resolve the mesh and register the fused-EP op, once per process.
 
     Called once per layer from `process_weights_after_loading`. Everything here
@@ -447,7 +514,10 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
             "Fused EP MoE not engaged: prefill context parallelism "
             "(pcp_size=%d) keeps vLLM's own all-gather/reduce-scatter around "
             "the layer, and this kernel already combines over every expert, "
-            "so arming both would multiply the MoE output by %d.", pcp, pcp)
+            "so arming both would multiply the MoE output by %d.",
+            pcp,
+            pcp,
+        )
         return
 
     tp = _tensor_parallel_size()
@@ -457,24 +527,32 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     global _TP_SIZE
     _TP_SIZE = tp
     from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+
     if tp > 1 and not _sp.enabled():
         logger.warning_once(
             "Fused EP MoE not engaged: under tensor parallelism (tp_size=%d) "
             "without sequence parallelism the batch is replicated on every "
             "rank, so the kernel would do %dx the expert work per batch. "
-            "Replicated-input MoE paths serve these steps.", tp, tp)
+            "Replicated-input MoE paths serve these steps.",
+            tp,
+            tp,
+        )
         return
     if tp > 1:
         # With sequence parallelism each rank passes its own rows to the kernel.
         logger.info_once(
             "Fused EP MoE under tensor parallelism (tp_size=%d) with sequence "
             "parallelism: each rank's own rows, prompt steps of at least "
-            "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS rows.", tp)
+            "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS rows.",
+            tp,
+        )
 
     mesh = build_ep_mesh()
     if mesh is None:
-        logger.info_once("Fused EP MoE requested but there is no EP group; "
-                         "the grouped-matmul path serves every step.")
+        logger.info_once(
+            "Fused EP MoE requested but there is no EP group; "
+            "the grouped-matmul path serves every step."
+        )
         return
     ep = mesh.shape[EP_AXIS_NAME]
     _EP_SIZE = ep
@@ -486,13 +564,15 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     # under a copies placement the rank's tensors carry copy slots after its primaries; the prompt path routes
     # to primaries only and streams them alone (the forward passes the same views)
     from vllm_torchtpu import expert_placement as _placement
+
     if _placement.has_copies() and int(_placement.owned()) < int(w1.shape[0]):
         n_prim = int(_placement.owned())
-        w1, w2, w1_scale, w2_scale = w1[:
-                                        n_prim], w2[:
-                                                    n_prim], w1_scale[:
-                                                                      n_prim], w2_scale[:
-                                                                                        n_prim]
+        w1, w2, w1_scale, w2_scale = (
+            w1[:n_prim],
+            w2[:n_prim],
+            w1_scale[:n_prim],
+            w2_scale[:n_prim],
+        )
     local_experts, hidden = w1.shape[0], w1.shape[1]
     inter = w1.shape[2] // 2
 
@@ -502,13 +582,18 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
         logger.info_once(
             "Fused EP MoE not engaged: the largest node-wide batch is %d "
             "tokens, below MOE_FUSED_EP_KERNEL_MIN_TOKENS=%d.",
-            max_node_tokens, envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS)
+            max_node_tokens,
+            envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS,
+        )
         return
 
-    reason = (_unsupported_layer_reason(layer, local_experts, ep)
-              or _unsupported_routing_reason(layer)
-              or _unsupported_reason(w1, w2, w1_scale, w2_scale, local_experts,
-                                     hidden, inter, activation))
+    reason = (
+        _unsupported_layer_reason(layer, local_experts, ep)
+        or _unsupported_routing_reason(layer)
+        or _unsupported_reason(
+            w1, w2, w1_scale, w2_scale, local_experts, hidden, inter, activation
+        )
+    )
     if reason is not None:
         logger.warning_once("Fused EP MoE not engaged: %s", reason)
         return
@@ -516,60 +601,92 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     global _RANK_BUFFER, _EXPERT_ORDER
     # The kernel's index is this rank's position in the mesh, which is ordered
     # by device id, not its EP rank.
-    _RANK_BUFFER = torch.tensor([[ep_mesh_index()]],
-                                dtype=torch.int32,
-                                device=layer.w13_weight.device)
+    _RANK_BUFFER = torch.tensor(
+        [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
+    )
     _EXPERT_ORDER = _expert_block_permutation(ep, layer.w13_weight.device)
-    contract = (topk, bool(renormalize), activation, hidden, inter,
-                local_experts, bool(envs.TPU_MOE_SKIP_PADDED_TOKENS))
+    contract = (
+        topk,
+        bool(renormalize),
+        activation,
+        hidden,
+        inter,
+        local_experts,
+        bool(envs.TPU_MOE_SKIP_PADDED_TOKENS),
+    )
     if _OP is None:  # built once, from the first eligible layer
-        _build_op(mesh,
-                  topk,
-                  renormalize,
-                  activation,
-                  envs.TPU_MOE_SKIP_PADDED_TOKENS,
-                  hidden=hidden,
-                  inter=inter,
-                  local_experts=local_experts)
+        _build_op(
+            mesh,
+            topk,
+            renormalize,
+            activation,
+            envs.TPU_MOE_SKIP_PADDED_TOKENS,
+            hidden=hidden,
+            inter=inter,
+            local_experts=local_experts,
+        )
         _OP_CONTRACT = contract
     elif contract != _OP_CONTRACT:
         logger.warning_once(
             "Fused EP MoE not engaged for a layer whose shape or routing %s "
             "differs from the operation's %s; that layer takes the "
-            "grouped-matmul path.", contract, _OP_CONTRACT)
+            "grouped-matmul path.",
+            contract,
+            _OP_CONTRACT,
+        )
         return
     layer._tpu_fused_ep_eligible = True
     logger.info_once(
         "Fused EP MoE armed | kernel=%s hidden=%d inter=%d local_experts=%d "
-        "ep=%d topk=%d capacity=%d skip_padded_tokens=%s", "v3", hidden, inter,
-        local_experts, ep, topk, TILE_ROWS, envs.TPU_MOE_SKIP_PADDED_TOKENS)
+        "ep=%d topk=%d capacity=%d skip_padded_tokens=%s",
+        "v3",
+        hidden,
+        inter,
+        local_experts,
+        ep,
+        topk,
+        TILE_ROWS,
+        envs.TPU_MOE_SKIP_PADDED_TOKENS,
+    )
 
 
-def _unsupported_layer_reason(layer, local_experts: int,
-                              ep: int) -> str | None:
+def _unsupported_layer_reason(layer, local_experts: int, ep: int) -> str | None:
     """Why this layer's parallel layout or biases cannot go through the
     kernel, or None."""
     if not layer.moe_config.moe_parallel_config.use_ep:
-        return ("the experts are replicated, not expert-parallel; the kernel "
-                "addresses experts by shard")
+        return (
+            "the experts are replicated, not expert-parallel; the kernel "
+            "addresses experts by shard"
+        )
     if layer.global_num_experts != local_experts * ep:
-        return (f"{layer.global_num_experts} experts do not split evenly "
-                f"over {ep} shards of {local_experts}")
-    if (getattr(layer, "w13_bias", None) is not None
-            or getattr(layer, "w2_bias", None) is not None):
+        return (
+            f"{layer.global_num_experts} experts do not split evenly "
+            f"over {ep} shards of {local_experts}"
+        )
+    if (
+        getattr(layer, "w13_bias", None) is not None
+        or getattr(layer, "w2_bias", None) is not None
+    ):
         return "the bridge passes no expert biases"
     return None
 
 
-def _unsupported_reason(w1, w2, w1_scale, w2_scale, local_experts, hidden,
-                        inter, activation) -> str | None:
+def _unsupported_reason(
+    w1, w2, w1_scale, w2_scale, local_experts, hidden, inter, activation
+) -> str | None:
     """Why this layer cannot use the fused kernel, or None if it can."""
-    if w1.ndim != 3 or w2.ndim != 3 or w2.shape[0] < local_experts or w1.shape[
-            0] != w2.shape[0]:
+    if (
+        w1.ndim != 3
+        or w2.ndim != 3
+        or w2.shape[0] < local_experts
+        or w1.shape[0] != w2.shape[0]
+    ):
         return f"weight rank/expert mismatch {tuple(w1.shape)} {tuple(w2.shape)}"
     if w1.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
-        return (f"the kernel's fp8 form takes float8_e4m3fn expert weights, "
-                f"got {w1.dtype} / {w2.dtype}")
+        return (
+            f"the kernel's fp8 form takes float8_e4m3fn expert weights, "
+            f"got {w1.dtype} / {w2.dtype}"
+        )
     if w2.shape[1] != inter or w2.shape[2] != hidden:
         return f"w2 {tuple(w2.shape)} is not [E, {inter}, {hidden}]"
     if activation != "silu":
@@ -577,7 +694,8 @@ def _unsupported_reason(w1, w2, w1_scale, w2_scale, local_experts, hidden,
     if _squeeze_channel_scale(w1_scale, local_experts, 2 * inter) is None:
         return (
             "w1_scale is not the per-output-channel form the kernel takes; "
-            "a block-scaled weight is a different kernel format")
+            "a block-scaled weight is a different kernel format"
+        )
     if _squeeze_channel_scale(w2_scale, local_experts, hidden) is None:
         return "w2_scale is not the per-output-channel form the kernel takes"
     return None
@@ -600,8 +718,8 @@ def _tensor_parallel_size() -> int:
     """
     try:
         from vllm.config import get_current_vllm_config
-        return int(
-            get_current_vllm_config().parallel_config.tensor_parallel_size)
+
+        return int(get_current_vllm_config().parallel_config.tensor_parallel_size)
     except Exception:  # noqa: BLE001 - no config outside a served model
         return 1
 

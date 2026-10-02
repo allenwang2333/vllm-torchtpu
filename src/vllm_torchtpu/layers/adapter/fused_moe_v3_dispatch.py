@@ -17,13 +17,13 @@ Provides zero-drift layer forward routing that preserves the upstream standard
 1615-tensor graph signature while leveraging hardware-accelerated Mosaic/Pallas
 kernels when requested via environment configuration.
 """
-from typing import Any, Optional
+
+from typing import Any
 
 import torch
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter import fused_moe_ep_v3
-from vllm_torchtpu.layers.adapter import moe_lowtok_scores_op
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)

@@ -19,6 +19,7 @@ experts and their holders, the slot of every global expert) and the primary /
 copy holder tables; without a copies placement they are the contiguous ones. The shard's partial output comes
 back; the layer's all-reduce follows as for every other path.
 """
+
 import functools
 
 import jax
@@ -30,37 +31,41 @@ from vllm_torchtpu.kernels.moe_lowtok import moe_lowtok_scores
 _ops: dict = {}
 
 
-def _jax_fn(hidden: jax.Array,
-            scores: jax.Array,
-            tables: jax.Array,
-            prim: jax.Array,
-            copy: jax.Array,
-            hot1h: jax.Array,
-            w13: jax.Array,
-            s13: jax.Array,
-            w2: jax.Array,
-            s2: jax.Array,
-            *,
-            topk: int,
-            ranks: int,
-            owned: int = 1,
-            has_copies: bool = True) -> jax.Array:
-    return moe_lowtok_scores(hidden,
-                             scores,
-                             None,
-                             None,
-                             prim,
-                             copy,
-                             w13,
-                             s13,
-                             w2,
-                             s2,
-                             topk=topk,
-                             ranks=ranks,
-                             owned=owned,
-                             hot1h=hot1h,
-                             tables=tables,
-                             has_copies=has_copies)
+def _jax_fn(
+    hidden: jax.Array,
+    scores: jax.Array,
+    tables: jax.Array,
+    prim: jax.Array,
+    copy: jax.Array,
+    hot1h: jax.Array,
+    w13: jax.Array,
+    s13: jax.Array,
+    w2: jax.Array,
+    s2: jax.Array,
+    *,
+    topk: int,
+    ranks: int,
+    owned: int = 1,
+    has_copies: bool = True,
+) -> jax.Array:
+    return moe_lowtok_scores(
+        hidden,
+        scores,
+        None,
+        None,
+        prim,
+        copy,
+        w13,
+        s13,
+        w2,
+        s2,
+        topk=topk,
+        ranks=ranks,
+        owned=owned,
+        hot1h=hot1h,
+        tables=tables,
+        has_copies=has_copies,
+    )
 
 
 def _get_op(topk: int, ranks: int, owned: int = 1, has_copies: bool = True):
@@ -71,11 +76,10 @@ def _get_op(topk: int, ranks: int, owned: int = 1, has_copies: bool = True):
         return op
     op = pallas.jax_op(
         f"pallas::moe_lowtok_scores_k{topk}_r{ranks}_o{owned}{'' if has_copies else '_nocopies'}",
-        functools.partial(_jax_fn,
-                          topk=topk,
-                          ranks=ranks,
-                          owned=owned,
-                          has_copies=bool(has_copies)))
+        functools.partial(
+            _jax_fn, topk=topk, ranks=ranks, owned=owned, has_copies=bool(has_copies)
+        ),
+    )
 
     def _fake(hidden, scores, tables, prim, copy, hot1h, w13, s13, w2, s2):
         return torch.empty_like(hidden)
@@ -89,22 +93,24 @@ def prebuild(topk: int, ranks: int, owned: int = 1, has_copies: bool = True):
     _get_op(topk, ranks, owned, has_copies)
 
 
-def moe_lowtok_scores_op(hidden,
-                         scores,
-                         tables,
-                         prim,
-                         copy,
-                         hot1h,
-                         w13,
-                         s13,
-                         w2,
-                         s2,
-                         *,
-                         topk: int,
-                         ranks: int,
-                         owned: int = 1,
-                         has_copies: bool = True):
+def moe_lowtok_scores_op(
+    hidden,
+    scores,
+    tables,
+    prim,
+    copy,
+    hot1h,
+    w13,
+    s13,
+    w2,
+    s2,
+    *,
+    topk: int,
+    ranks: int,
+    owned: int = 1,
+    has_copies: bool = True,
+):
     """tables: the packed scalar tables of the kernel (moe_lowtok.pack_tables), built at load."""
-    return _get_op(topk, ranks, owned,
-                   has_copies)(hidden, scores, tables, prim, copy, hot1h, w13,
-                               s13, w2, s2)
+    return _get_op(topk, ranks, owned, has_copies)(
+        hidden, scores, tables, prim, copy, hot1h, w13, s13, w2, s2
+    )

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The torch ops for the fused gated norm and quantisation of the GDN output (TPU_GDN_FUSED_NORM_QUANT)."""
+
 import jax
 import torch
 
@@ -24,8 +25,9 @@ _NORM_OP = None
 _MATMUL_OP = None
 
 
-def _matmul_fn(x_q: jax.Array, x_scale: jax.Array, w_q: jax.Array,
-               w_s: jax.Array) -> jax.Array:
+def _matmul_fn(
+    x_q: jax.Array, x_scale: jax.Array, w_q: jax.Array, w_s: jax.Array
+) -> jax.Array:
     return gnq.prequant_matmul_in_out(x_q, x_scale, w_q, w_s)
 
 
@@ -33,13 +35,14 @@ def _find_eps(model) -> float:
     """The GDN layers' gated norm epsilon: one value for the model, every
     gated norm checked for the semantics the kernel assumes."""
     from vllm.model_executor.layers.layernorm import RMSNormGated
+
     found = set()
     for module in model.modules():
         if not isinstance(module, RMSNormGated):
             continue
         eps = getattr(module, "eps", None)
         if eps is None:
-            eps = getattr(module, "variance_epsilon")
+            eps = module.variance_epsilon
         if not getattr(module, "norm_before_gate", True):
             raise ValueError(
                 "TPU_GDN_FUSED_NORM_QUANT: the kernel normalises before the gate; this norm gates first"
@@ -47,20 +50,21 @@ def _find_eps(model) -> float:
         if getattr(module, "activation", "swish") not in ("swish", "silu"):
             raise ValueError(
                 "TPU_GDN_FUSED_NORM_QUANT: the kernel gates with silu; this norm uses "
-                f"{module.activation}")
-        if getattr(module, "group_size",
-                   None) not in (None, module.weight.shape[0]):
+                f"{module.activation}"
+            )
+        if getattr(module, "group_size", None) not in (None, module.weight.shape[0]):
             raise ValueError(
                 "TPU_GDN_FUSED_NORM_QUANT: the kernel normalises per head; this norm groups by "
-                f"{module.group_size}")
+                f"{module.group_size}"
+            )
         found.add(float(eps))
     if not found:
-        raise ValueError(
-            "TPU_GDN_FUSED_NORM_QUANT: no RMSNormGated on the model")
+        raise ValueError("TPU_GDN_FUSED_NORM_QUANT: no RMSNormGated on the model")
     if len(found) > 1:
         raise ValueError(
             "TPU_GDN_FUSED_NORM_QUANT: the gated norms use different epsilons "
-            f"{sorted(found)}; the fused op takes one value for the model")
+            f"{sorted(found)}; the fused op takes one value for the model"
+        )
     return found.pop()
 
 
@@ -68,33 +72,39 @@ def install(model) -> bool:
     """Register the fused norm-and-quantise ops with the model's eps."""
     global _NORM_OP, _MATMUL_OP
     from torch_tpu._internal.pallas import pallas
+
     eps = _find_eps(model)
     tile = int(getattr(envs, "TPU_GATED_NORM_TILE", 64))
-    logger.info("gated norm-quant op: row tile %d (the largest legal block "
-                "at or below it per row count)", tile)
+    logger.info(
+        "gated norm-quant op: row tile %d (the largest legal block "
+        "at or below it per row count)",
+        tile,
+    )
 
-    def _norm_fn(o: jax.Array, z: jax.Array,
-                 w: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def _norm_fn(
+        o: jax.Array, z: jax.Array, w: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
         return gnq.gated_norm_quant(o, z, w, eps, tile=tile)
 
     norm = pallas.jax_op("pallas::gdn_gated_norm_quant", _norm_fn)
 
     def _fake_norm(o, z, w):
         return o.new_empty(o.shape, dtype=torch.float8_e4m3fn), o.new_empty(
-            (o.shape[0], 1), dtype=torch.float32)
+            (o.shape[0], 1), dtype=torch.float32
+        )
 
     norm.register_fake(_fake_norm)
     matmul = pallas.jax_op("pallas::gdn_prequant_matmul_in_out", _matmul_fn)
 
     def _fake_matmul(x_q, x_scale, w_q, w_s):
-        return x_q.new_empty((x_q.shape[0], w_q.shape[1]),
-                             dtype=torch.bfloat16)
+        return x_q.new_empty((x_q.shape[0], w_q.shape[1]), dtype=torch.bfloat16)
 
     matmul.register_fake(_fake_matmul)
     _NORM_OP, _MATMUL_OP = norm, matmul
     logger.info(
         "TPU_GDN_FUSED_NORM_QUANT: the GDN output's gated norm and fp8 quantisation run as one pass (eps %g)",
-        eps)
+        eps,
+    )
     return True
 
 
@@ -107,13 +117,15 @@ def install_if_enabled(model) -> bool:
 
 def enabled() -> bool:
     """Whether the fused ops are on and installed."""
-    return bool(getattr(envs, "TPU_GDN_FUSED_NORM_QUANT", False)) and _NORM_OP is not None
+    return (
+        bool(getattr(envs, "TPU_GDN_FUSED_NORM_QUANT", False)) and _NORM_OP is not None
+    )
 
 
-def output_projection(core_attn_out: torch.Tensor, z: torch.Tensor, norm,
-                      out_proj) -> torch.Tensor:
+def output_projection(
+    core_attn_out: torch.Tensor, z: torch.Tensor, norm, out_proj
+) -> torch.Tensor:
     """core_attn_out, z: [tokens, heads, head_dim]; norm: the RMSNormGated; out_proj: the fp8 [in, out] linear."""
     tokens = core_attn_out.shape[0]
     q, s = _NORM_OP(core_attn_out, z.reshape(core_attn_out.shape), norm.weight)
-    return _MATMUL_OP(q.reshape(tokens, -1), s, out_proj.weight,
-                      out_proj.weight_scale)
+    return _MATMUL_OP(q.reshape(tokens, -1), s, out_proj.weight, out_proj.weight_scale)
