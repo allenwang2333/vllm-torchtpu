@@ -408,8 +408,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DCP sparse MLA per-call glue: a single-chunk call (every decode step)
     # takes the kernel's lse as a fresh output, its unreached-row sentinel
     # folded into the `owns` select, instead of overwriting a `jnp.full`
-    # buffer it aliases; and the KV-latent scatter pads the fp8 values before
-    # packing them instead of the packed rows. Bit-identical outputs.
+    # buffer it aliases; the KV-latent scatter pads the fp8 values before
+    # packing them instead of the packed rows; and one top-k count gives both
+    # `owns` and the kernel's `kv_len` instead of two reductions.
+    # Bit-identical outputs.
     "TPU_DCP_MLA_LEAN_GLUE": env_bool("TPU_DCP_MLA_LEAN_GLUE", default=False),
     # DCP MLA log-sum-exp merge (`cp_mla_attention.merge_lse_partials_scatter_heads`)
     # for steps of at most TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS tokens: instead of

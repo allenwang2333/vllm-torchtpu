@@ -1290,6 +1290,7 @@ def sparse_ragged_paged_attention(
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
     lse_fresh_output: bool = False,
+    topk_lens: jax.Array | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1383,6 +1384,9 @@ def sparse_ragged_paged_attention(
         `jnp.full` buffer materialised for the kernel to overwrite. Same
         values; multi-chunk calls keep the buffer, which carries rows across
         chunks.
+      topk_lens: i32[max_num_tokens], the caller's
+        `jnp.sum(topk_indices != -1, axis=-1)` when it already has it, so the
+        count is reduced once; computed here when None.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -1495,7 +1499,9 @@ def sparse_ragged_paged_attention(
     )
     window_indices_all = None
     if window_prep:
-        kv_lens = jnp.sum(topk_indices != -1, axis=-1)
+        kv_lens = (
+            jnp.sum(topk_indices != -1, axis=-1) if topk_lens is None else topk_lens
+        )
         physical_indices = None
         _, prep_batch = _chunk_kernel_batch_size(
             uniform_chunk,
@@ -1529,6 +1535,8 @@ def sparse_ragged_paged_attention(
             page_size=page_size,
             total_num_pages=cache_kv_nope.shape[0],
         )
+        if topk_lens is not None:
+            kv_lens = topk_lens
 
     # Rows the grid never reaches (padding past `batch_end`) keep this
     # sentinel, so a downstream merge weights them at exp(min - max) == 0

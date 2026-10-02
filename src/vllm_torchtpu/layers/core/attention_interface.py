@@ -1154,7 +1154,16 @@ def sparse_mla_attention_dcp(
         # requires `kv_len >= 1`. Position 0 always exists, so it is the
         # cheapest dummy; the softmax it produces is real but meaningless, and
         # `owns` below is what keeps it out of the merge.
-        owns = jnp.any(topk_idx >= 0, axis=-1)
+        # Lean glue: one count gives both `owns` and the kernel's `kv_len`
+        # (`-1` is the only padding value, so "any >= 0" == "count > 0"; the
+        # dummy below makes an empty row's count exactly 1).
+        topk_lens = None
+        if lean_glue:
+            counts = jnp.sum(topk_idx != -1, axis=-1)
+            owns = counts > 0
+            topk_lens = jnp.maximum(counts, 1)
+        else:
+            owns = jnp.any(topk_idx >= 0, axis=-1)
         topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
 
         # Split q / lane-dense lse: the kernel joins q_nope and q_pe in VMEM
@@ -1210,6 +1219,7 @@ def sparse_mla_attention_dcp(
             small_chunk_batch_size=small_chunk_batch,
             # Single-chunk lse straight from the kernel, no `jnp.full` buffer.
             lse_fresh_output=lean_glue,
+            topk_lens=topk_lens,
             **chunk_kwargs,
             **split_kwargs,
         )
