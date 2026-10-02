@@ -87,17 +87,18 @@ _VOCAB = 248320
 _K_BOUND = 64
 
 
-def _assert_bounded_matches(logits, top_k, top_p, k_bound=_K_BOUND):
+def _assert_bounded_matches(logits, top_k, top_p, device, k_bound=_K_BOUND):
+    logits, top_k, top_p = logits.to(device), top_k.to(device), top_p.to(device)
     expected = sampling.apply_top_k_top_p(logits, top_k, top_p)
     result = sampling.apply_top_k_top_p(logits, top_k, top_p, k_bound)
     assert result.dtype == expected.dtype
     kept_expected = expected != sampling.MASKED_LOGIT_VALUE
     kept_result = result != sampling.MASKED_LOGIT_VALUE
-    assert torch.equal(kept_result, kept_expected), (
+    assert torch.equal(kept_result.cpu(), kept_expected.cpu()), (
         kept_result.sum(-1).tolist(),
         kept_expected.sum(-1).tolist(),
     )
-    assert torch.equal(result, expected)
+    assert torch.equal(result.cpu(), expected.cpu())
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -105,18 +106,18 @@ def _assert_bounded_matches(logits, top_k, top_p, k_bound=_K_BOUND):
 @pytest.mark.parametrize("k", [1, 20, 64])
 @pytest.mark.parametrize("p", [0.5, 0.95, 1.0])
 @pytest.mark.parametrize("scale", [1.0, 4.0])
-def test_bounded_path_matches_search(dtype, rows, k, p, scale):
+def test_bounded_path_matches_search(dtype, rows, k, p, scale, device):
     gen = torch.Generator().manual_seed(rows * 1009 + k * 31 + int(scale))
     # Temperature-scaled in the logits dtype, as sample_from_logits does.
     logits = (torch.randn(rows, _VOCAB, generator=gen) * scale).to(dtype)
     logits = logits / torch.tensor(0.6, dtype=dtype)
     top_k = torch.full((rows, 1), k, dtype=torch.int32)
     top_p = torch.full((rows, 1), p, dtype=torch.float32)
-    _assert_bounded_matches(logits, top_k, top_p)
+    _assert_bounded_matches(logits, top_k, top_p, device)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_bounded_path_mixed_rows(dtype):
+def test_bounded_path_mixed_rows(dtype, device):
     gen = torch.Generator().manual_seed(7)
     logits = (torch.randn(8, _VOCAB, generator=gen) * 3.0).to(dtype)
     # Mixed per-row params, plus rows that apply neither mask (top_k == 0 and
@@ -124,13 +125,13 @@ def test_bounded_path_mixed_rows(dtype):
     top_k = torch.tensor([[1], [20], [64], [5], [0], [33], [0], [64]])
     top_p = torch.tensor([[0.5], [0.95], [1.0], [0.1], [1.0], [0.99], [1.0], [0.3]])
     assert sampling.topk_fast_path_bound(top_k, top_p, _K_BOUND) == _K_BOUND
-    _assert_bounded_matches(logits, top_k.to(torch.int32), top_p)
+    _assert_bounded_matches(logits, top_k.to(torch.int32), top_p, device)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("k", [1, 3, 20, 64])
 @pytest.mark.parametrize("p", [0.3, 0.95, 1.0])
-def test_bounded_path_ties(dtype, k, p):
+def test_bounded_path_ties(dtype, k, p, device):
     # Heavily quantized logits: many exact ties at and around the cutoff,
     # including ties that continue past the k_bound window.
     gen = torch.Generator().manual_seed(k)
@@ -144,10 +145,10 @@ def test_bounded_path_ties(dtype, k, p):
     logits[3] = 0.0
     top_k = torch.full((4, 1), k, dtype=torch.int32)
     top_p = torch.full((4, 1), p, dtype=torch.float32)
-    _assert_bounded_matches(logits, top_k, top_p)
+    _assert_bounded_matches(logits, top_k, top_p, device)
 
 
-def test_bounded_path_neg_inf_and_edge_p():
+def test_bounded_path_neg_inf_and_edge_p(device):
     gen = torch.Generator().manual_seed(3)
     logits = torch.randn(4, _VOCAB, generator=gen)
     # Row 0: fewer finite logits than k (grammar-style -inf mask).
@@ -155,10 +156,10 @@ def test_bounded_path_neg_inf_and_edge_p():
     top_k = torch.tensor([[20], [20], [20], [64]], dtype=torch.int32)
     # Row 2: p == 0 keeps nothing in the search path; row 3: p ~ 1.
     top_p = torch.tensor([[0.95], [0.95], [0.0], [0.999999]])
-    _assert_bounded_matches(logits, top_k, top_p)
+    _assert_bounded_matches(logits, top_k, top_p, device)
 
 
-def test_bounded_path_greedy_rejection_scaling():
+def test_bounded_path_greedy_rejection_scaling(device):
     # Rejection sampler: f32 logits / (temperature + 1e-9); greedy rows have
     # temperature 0, giving huge but finite logits.
     gen = torch.Generator().manual_seed(11)
@@ -167,7 +168,7 @@ def test_bounded_path_greedy_rejection_scaling():
     scaled = logits.to(torch.float32) / (temps + 1e-9)
     top_k = torch.full((4, 1), 20, dtype=torch.int32)
     top_p = torch.full((4, 1), 0.95)
-    _assert_bounded_matches(scaled, top_k, top_p)
+    _assert_bounded_matches(scaled, top_k, top_p, device)
 
 
 def test_topk_fast_path_bound():

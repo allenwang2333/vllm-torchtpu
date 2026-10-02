@@ -661,7 +661,8 @@ def test_rejection_sampler_synthetic_mixed_batch_recovers_greedy_argmax(device):
     assert torch.equal(output, expected)
 
 
-def test_rejection_sampler_random_top_k_forces_recovery(device):
+@pytest.mark.parametrize("k_bound", [0, 64])
+def test_rejection_sampler_random_top_k_forces_recovery(device, k_bound):
     sampler = RejectionSampler()
     draft_token_ids = torch.tensor([1], dtype=torch.int32, device=device)
     num_draft_tokens = torch.tensor([1], dtype=torch.int32, device=device)
@@ -691,13 +692,15 @@ def test_rejection_sampler_random_top_k_forces_recovery(device):
         accept_u=accept_u,
         recover_u=recover_u,
         do_sampling=True,
+        k_bound=k_bound,
     )
 
     expected = torch.tensor([[3, -1]], dtype=torch.int32, device=device)
     assert torch.equal(output, expected)
 
 
-def test_rejection_sampler_random_greedy_row_accepts_argmax(device):
+@pytest.mark.parametrize("k_bound", [0, 64])
+def test_rejection_sampler_random_greedy_row_accepts_argmax(device, k_bound):
     # A temperature-0 (greedy) request routed through the random path must
     # accept the draft token deterministically iff it equals the target argmax,
     # even when the raw softmax over the target logits is far from one-hot.
@@ -733,6 +736,7 @@ def test_rejection_sampler_random_greedy_row_accepts_argmax(device):
         accept_u=accept_u,
         recover_u=recover_u,
         do_sampling=True,
+        k_bound=k_bound,
     )
 
     expected = torch.tensor([[0, 3, 7]], dtype=torch.int32, device=device)
