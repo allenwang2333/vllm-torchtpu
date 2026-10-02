@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -24,23 +25,44 @@ class TokenPaddingState:
     """Track token padding."""
 
     local_padding_mask: torch.Tensor
+    # The valid prefix, kept once for all MoE layers.
+    local_valid_tokens: torch.Tensor
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
         local_padding_mask = torch.zeros(
             max_local_tokens, dtype=torch.bool, device=device
         )
-        return cls(local_padding_mask=local_padding_mask)
+        local_valid_tokens = torch.zeros(1, dtype=torch.int32, device=device)
+        return cls(
+            local_padding_mask=local_padding_mask,
+            local_valid_tokens=local_valid_tokens,
+        )
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
-        """Write this rank's token padding mask."""
+        """Write this rank's token padding mask when its valid or padded count changes.
+
+        Consecutive decode steps often use the same counts; reusing the device
+        buffers avoids two synchronous host-to-device copies on those steps.
+        """
+        key = (int(local_valid_tokens), int(local_padded_tokens))
+        if getattr(self, "_last_update", None) == key:
+            return
+        self._last_update = key
         host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.
         self.local_padding_mask.copy_(host)
+        self.local_valid_tokens.copy_(
+            torch.tensor([local_valid_tokens], dtype=torch.int32)
+        )
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]
+
+    def get_local_valid_tokens(self) -> torch.Tensor:
+        """This engine's valid-token count for the step."""
+        return self.local_valid_tokens
 
 
 def set_padding_state(state: "TokenPaddingState | None") -> None:
@@ -48,8 +70,61 @@ def set_padding_state(state: "TokenPaddingState | None") -> None:
     _padding_state = state
 
 
+def get_local_valid_tokens() -> torch.Tensor | None:
+    """Return this rank's persistent valid-prefix length, when configured."""
+    if _padding_state is None:
+        return None
+    return _padding_state.get_local_valid_tokens()
+
+
+def retain_padding_graph_input(output: torch.Tensor) -> torch.Tensor:
+    """Keep the padding-state buffer in every shape-specialized MoE graph."""
+    if _padding_state is None:
+        return output
+    value = _padding_state.local_padding_mask.reshape(-1)[0].to(output.dtype)
+    return output + (value - value)
+
+
+def padding_mask_for(
+    num_tokens: int, is_local_tensor: bool = False
+) -> torch.Tensor | None:
+    """The padded-row mask for a [num_tokens, ...] tensor, or None when no padding state is set; gathered
+    across the DP ranks unless the tensor is local."""
+    if _padding_state is None:
+        return None
+    if is_local_tensor:
+        return _padding_state.get_local_padding_mask(num_tokens)
+    from vllm.distributed.parallel_state import get_dp_group
+
+    dp_group = get_dp_group()
+    dp_size = dp_group.world_size
+    if dp_size > 1:
+        local_padding = _padding_state.get_local_padding_mask(
+            num_tokens // dp_size
+        )
+        # TPU collectives may not support bool, so encode the mask as int8.
+        gathered_padding = dp_group.all_gather(
+            local_padding.to(torch.int8), dim=0
+        )
+        return gathered_padding.ne(0)
+    return _padding_state.get_local_padding_mask(num_tokens)
+
+
+def zero_scores_for_padding(
+    scores: torch.Tensor, is_local_tensor: bool = False
+) -> torch.Tensor:
+    """Zero the router scores of padded tokens: a row of zeros selects no expert in the few-token kernel's
+    in-kernel router (its weights renormalise to zero and count no hits)."""
+    is_padding = padding_mask_for(scores.shape[0], is_local_tensor)
+    if is_padding is None:
+        return scores
+    return torch.where(is_padding[:, None], torch.zeros_like(scores), scores)
+
+
 def zero_routing_weights_for_padding(
-    topk_ids: torch.Tensor, topk_weights: torch.Tensor, is_local_tensor: bool = False
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    is_local_tensor: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Set routing weights to 0 for padded tokens.
 
@@ -77,9 +152,13 @@ def zero_routing_weights_for_padding(
         dp_group = get_dp_group()
         dp_size = dp_group.world_size
         if dp_size > 1:
-            local_padding = _padding_state.get_local_padding_mask(num_tokens // dp_size)
+            local_padding = _padding_state.get_local_padding_mask(
+                num_tokens // dp_size
+            )
             # TPU collectives may not support bool, so encode the mask as int8.
-            gathered_padding = dp_group.all_gather(local_padding.to(torch.int8), dim=0)
+            gathered_padding = dp_group.all_gather(
+                local_padding.to(torch.int8), dim=0
+            )
             is_padding = gathered_padding.ne(0)
         else:
             is_padding = _padding_state.get_local_padding_mask(num_tokens)

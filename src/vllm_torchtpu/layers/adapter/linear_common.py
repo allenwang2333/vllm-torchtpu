@@ -363,3 +363,99 @@ def get_model_matmul_fusion_assignment(
 ):
     key = (model_name, batch_size, tp_size, layer_name)
     return MODEL_MATMUL_FUSION_TRUTH_TABLE.get(key, True)
+
+
+# ---- the pre-quantised activation path (sequence parallelism's fp8 all-gather) ----
+_quantize_rows_op: Callable | None = None
+_prequant_matmul_op: Callable | None = None
+
+
+def _quantize_rows_jax(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Per-row fp8 quantisation of the activation."""
+    from vllm_torchtpu.kernels.quantized_matmul.util import quantize_tensor
+
+    x_q, x_s = quantize_tensor(x, jnp.float8_e4m3fn)
+    return x_q, x_s.astype(jnp.float32)
+
+
+def _prequant_matmul_jax(
+    x_q: jax.Array, x_s: jax.Array, w_q: jax.Array, w_s: jax.Array
+) -> jax.Array:
+    """xla_quantized_matmul's per-channel path with the activation already
+    quantised: (m, k) fp8 rows with their (m, 1) scales against the canonical
+    (k, n) fp8 weight and its (n,) scale, bf16 out."""
+    out = jax.lax.dot_general(
+        x_q,
+        w_q,
+        dimension_numbers=(((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    out = out * x_s * jnp.expand_dims(w_s, 0)
+    return out.astype(jnp.bfloat16)
+
+
+def prebuild_prequant_ops() -> None:
+    """Build the two custom ops before any trace."""
+    global _quantize_rows_op, _prequant_matmul_op
+    if _quantize_rows_op is None:
+        op = pallas.jax_op("pallas::quantize_rows_fp8", _quantize_rows_jax)
+
+        def _fake_quantize_rows(x: torch.Tensor):
+            return (
+                torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device),
+                torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device),
+            )
+
+        op.register_fake(_fake_quantize_rows)
+        _quantize_rows_op = op
+    if _prequant_matmul_op is None:
+        op = pallas.jax_op("pallas::prequant_matmul_fp8", _prequant_matmul_jax)
+
+        def _fake_prequant_matmul(
+            x_q: torch.Tensor,
+            x_s: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+        ):
+            del x_s, w_s
+            return torch.empty(
+                x_q.shape[0],
+                w_q.shape[-1],
+                dtype=torch.bfloat16,
+                device=x_q.device,
+            )
+
+        op.register_fake(_fake_prequant_matmul)
+        _prequant_matmul_op = op
+
+
+def quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The activation's rows as fp8 with their float32 scales, [rows, 1]."""
+    assert (
+        _quantize_rows_op is not None
+    ), "prebuild_prequant_ops() must run before the trace"
+    return _quantize_rows_op(x.reshape(-1, x.shape[-1]))
+
+
+def quantized_matmul_prequant(
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+) -> torch.Tensor:
+    """quantized_matmul with the activation already quantised per row;
+    per-channel weight scales only."""
+    assert (
+        _prequant_matmul_op is not None
+    ), "prebuild_prequant_ops() must run before the trace"
+    if w_s.ndim != 1:
+        raise ValueError(
+            "the pre-quantised path takes per-channel weight "
+            f"scales, got {tuple(w_s.shape)}"
+        )
+    if x_q.shape[-1] != w_q.shape[0]:
+        raise ValueError(
+            f"Input hidden dim {x_q.shape[-1]} must match weight hidden dim "
+            f"{w_q.shape[0]}."
+        )
+    return _prequant_matmul_op(x_q, x_s, w_q, w_s)
