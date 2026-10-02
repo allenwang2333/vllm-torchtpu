@@ -93,6 +93,8 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
+    TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
+    TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = False
     TPU_SC_TOPK_FUSED_PAYLOAD: bool = False
     TPU_SC_TOPK_SINGLE_SLICE: bool = False
     TPU_INDEXER_TOPK_SINGLE_WRITE: bool = False
@@ -762,9 +764,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # token bucket is small (<= 16 tokens). Under MTP every decode request has
     # q_len = gamma + 1 > 1, so decode runs in the MIXED pass, whose default
     # 128-row query block computes ~124 padding rows per real row. Unset keeps
-    # the default 128.
+    # the default 128. 4 (one MTP request per block) measured fastest.
     "TPU_STREAMIDX_SMALL_BUCKET_BQ": env_positive_int_or_none(
         "TPU_STREAMIDX_SMALL_BUCKET_BQ"
+    ),
+    # KV pages per block for that same small-bucket MIXED pass. Read only when
+    # `TPU_STREAMIDX_SMALL_BUCKET_BQ` is set; unset then takes
+    # `STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP` (mla_attention_op.py), the value
+    # the decode-shape sweep picked.
+    "TPU_STREAMIDX_SMALL_BUCKET_BKVP": env_positive_int_or_none(
+        "TPU_STREAMIDX_SMALL_BUCKET_BKVP"
+    ),
+    # Branch at runtime around StreamIndex top-k's two DECODE (q_len 1)
+    # passes when the batch has no q_len-1 sequence -- every step under MTP,
+    # where they launch over an empty range. Unchunked calls only. Exact.
+    "TPU_STREAMIDX_SKIP_EMPTY_DECODE": env_bool(
+        "TPU_STREAMIDX_SKIP_EMPTY_DECODE", default=False
     ),
     # Fold the SparseCore top-k's index gathers (the two-stage candidate map
     # and, under DCP, `resolve_owned_winners`' take_along_axis) into the top-k
