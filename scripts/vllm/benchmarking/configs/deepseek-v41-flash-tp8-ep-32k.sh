@@ -31,7 +31,7 @@ export VLLM_USE_BREAKABLE_CUDAGRAPH=0
 export VLLM_USE_AOT_COMPILE=0
 # 256 MiB held ~44k tokens in the 4096-len smoke run; 640 MiB leaves margin for
 # 2 x 33792 = 67,584 tokens.
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--no-async-scheduling --no-enable-prefix-caching --enable-ep-weight-filter --safetensors-load-strategy=prefetch --safetensors-prefetch-num-threads=8 --block-size=16 --kv-cache-memory-bytes=671088640 --compilation-config={\\\"compile_sizes\\\":[2,128]}"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--no-async-scheduling --no-enable-prefix-caching --enable-ep-weight-filter --safetensors-load-strategy=prefetch --safetensors-prefetch-num-threads=8 --block-size=16 --kv-cache-memory-bytes=671088640 --compilation-config={\"compile_sizes\":[2,128]}"
 
 # Keep the v7x Engram gather on the runtime default path.
 if [[ "${LIBTPU_INIT_ARGS:-}" != *"--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"* ]]; then
