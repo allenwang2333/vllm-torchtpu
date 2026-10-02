@@ -1179,6 +1179,25 @@ def sparse_mla_attention_dcp(
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
         local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
+
+        if getattr(envs, "TPU_DCP_MLA_6RUNG", False):
+            output, lse = sparse_mla_kernel.dispatch_sparse_mla_6rung(
+                ql_nope,
+                kv_cache_nope,
+                kv_cache_rope,
+                topk_idx,
+                local_block_tables,
+                query_start_loc_,
+                request_distribution_,
+                sm_scale=sm_scale or 1.0,
+                k_scale=dequant_scale,
+                cache_layout=cache_layout,
+                q_pe=q_pe,
+                lse_lane_dense=True,
+            )
+            lse = jnp.where(owns[:, None], lse, -jnp.inf)
+            return (kv_cache_nope, kv_cache_rope, output, lse)
+
         # Decode-sized chunks: query tokens per attention grid step.
         small_chunk_batch = envs.TPU_DCP_MLA_SMALL_CHUNK_BATCH
         if small_chunk_batch < 1:
