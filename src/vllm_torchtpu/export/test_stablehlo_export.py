@@ -115,7 +115,8 @@ def test_profile_run_preserves_behavior_and_skips_export_and_load(
         mock_run_backend.assert_called_once()
     assert not (tmp_path / "hlo").exists()
 
-    # 2. Load mode: cache_dir contains "profile_cache" -> skips load (falls through to normal compile)
+    # 2. Load mode: cache_dir contains "profile_cache" -> skips load
+    # (falls through to normal compile)
     monkeypatch.delenv("VLLM_TORCHTPU_EXPORT_HLO_DIR", raising=False)
     monkeypatch.setenv("VLLM_TORCHTPU_LOAD_HLO_DIR", str(tmp_path / "hlo"))
     with (
@@ -477,6 +478,7 @@ def test_export_stablehlo_explicit_dir_and_aot_round_trip(
             graph, inputs, {}, compile_range, key=cache_key
         )
         assert handle is None
+        assert compiled_fn is not None
         assert torch.equal(compiled_fn(inputs[0]), inputs[0] * 2)
 
     metadata_file = explicit_export_dir / "metadata.json"
@@ -532,6 +534,7 @@ def test_export_stablehlo_explicit_dir_and_aot_round_trip(
             graph, inputs, {}, compile_range, key=cache_key
         )
         assert handle is None
+        assert reloaded_fn is not None
         mock_parse.assert_called_once_with(modified_mlir_text)
         mock_compile_mlir.assert_called_once_with(mock_parsed_mod, False, [[1, 0]])
         assert torch.equal(reloaded_fn(inputs[0]), inputs[0] * 2)
@@ -908,6 +911,7 @@ def test_load_stablehlo_disables_async_compile_and_preserves_tuple_outputs(
         loaded_fn, _ = compiler.compile(
             tuple_graph, [inp], {}, compile_range, key=cache_key
         )
+        assert loaded_fn is not None
         res = loaded_fn(inp)
         assert isinstance(res, tuple)
         assert len(res) == 2
