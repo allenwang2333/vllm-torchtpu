@@ -35,8 +35,8 @@ from __future__ import annotations
 import contextlib
 import operator
 from collections import Counter
-from collections.abc import Iterator, Sequence
-from typing import TYPE_CHECKING, Any, Callable
+from collections.abc import Callable, Iterator, Sequence
+from typing import TYPE_CHECKING, Any
 
 import sympy
 import torch
@@ -106,8 +106,7 @@ def _holds_at(expr: sympy.Expr, substitution: dict) -> bool | None:
             value = sympy.simplify(value)
     except Exception:  # pragma: no cover - defensive; sympy is total here
         return None
-    return bool(value) if isinstance(value,
-                                     sympy.logic.boolalg.BooleanAtom) else None
+    return bool(value) if isinstance(value, sympy.logic.boolalg.BooleanAtom) else None
 
 
 def unsupported_reason(shape_env: Any, size: int) -> str | None:
@@ -151,8 +150,7 @@ def _meta_entry(value: Any) -> Any:
         return None
     if not isinstance(value, torch.Tensor):
         return type(value).__name__
-    dims = tuple("?" if isinstance(d, torch.SymInt) else int(d)
-                 for d in value.shape)
+    dims = tuple("?" if isinstance(d, torch.SymInt) else int(d) for d in value.shape)
     return (str(value.dtype), dims)
 
 
@@ -163,13 +161,15 @@ def _signature(graph: fx.GraphModule) -> tuple:
 
 def _handover_inputs(graph: fx.GraphModule) -> list[tuple[str, Any]]:
     """Return placeholders in runnable argument order."""
-    return [(node.name,
-             _meta_entry(node.meta.get("example_value", node.meta.get("val"))))
-            for node in _placeholder_nodes(graph)]
+    return [
+        (node.name, _meta_entry(node.meta.get("example_value", node.meta.get("val"))))
+        for node in _placeholder_nodes(graph)
+    ]
 
 
-def _input_permutation(old: list[tuple[str, Any]],
-                       new: list[tuple[str, Any]]) -> list[int] | None:
+def _input_permutation(
+    old: list[tuple[str, Any]], new: list[tuple[str, Any]]
+) -> list[int] | None:
     """Map reordered trace inputs to stored runnable slots."""
     if len(old) != len(new):
         return None
@@ -193,15 +193,16 @@ def _signature_delta(cached: Sequence[Any], current: Sequence[Any]) -> str:
     def render(counts: Counter) -> str:
         if not counts:
             return "nothing"
-        by_frequency = sorted(counts.items(),
-                              key=lambda kv: (-kv[1], str(kv[0])))
+        by_frequency = sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))
         return ", ".join(f"{count}x {item}" for item, count in by_frequency)
 
-    return (f"{len(cached)} inputs vs {len(current)}. "
-            f"Only in the earlier trace: "
-            f"{render(Counter(cached) - Counter(current))}. "
-            f"Only in this one: "
-            f"{render(Counter(current) - Counter(cached))}")
+    return (
+        f"{len(cached)} inputs vs {len(current)}. "
+        f"Only in the earlier trace: "
+        f"{render(Counter(cached) - Counter(current))}. "
+        f"Only in this one: "
+        f"{render(Counter(current) - Counter(cached))}"
+    )
 
 
 def graph_signature(graph: fx.GraphModule) -> tuple:
@@ -230,14 +231,15 @@ class BucketExecutables:
     """
 
     def __init__(self) -> None:
-        self._runnables: dict[tuple[str, str], tuple[Callable[..., Any], tuple,
-                                                     list[tuple[str,
-                                                                Any]]]] = {}
+        self._runnables: dict[
+            tuple[str, str], tuple[Callable[..., Any], tuple, list[tuple[str, Any]]]
+        ] = {}
         self.refused: set[int] = set()
         self.traces = 0
 
-    def get(self, cache_dir: str, key: str,
-            graph: fx.GraphModule) -> Callable[..., Any] | None:
+    def get(
+        self, cache_dir: str, key: str, graph: fx.GraphModule
+    ) -> Callable[..., Any] | None:
         found = self._runnables.get((cache_dir, key))
         if found is None:
             return None
@@ -257,13 +259,17 @@ class BucketExecutables:
                 "stays live needs one executable per bucket. Either give the "
                 "two sides of the branch that forked the trace the same "
                 "lifted inputs, or stop forking on the token count "
-                "(TPU_MOE_FUSED_EP_STEP_MIN_TOKENS, TPU_KERNEL_ITER_MODE).")
+                "(TPU_MOE_FUSED_EP_STEP_MIN_TOKENS, TPU_KERNEL_ITER_MODE)."
+            )
         if perm == list(range(len(perm))):
             return runnable
         moved = sum(1 for j, i in enumerate(perm) if j != i)
         logger.info(
             "[shape-variants] %s handed over with %d of %d inputs reordered",
-            key, moved, len(perm))
+            key,
+            moved,
+            len(perm),
+        )
         # Return arguments in stored slot order.
         getter = operator.itemgetter(*perm)
 
@@ -272,10 +278,18 @@ class BucketExecutables:
 
         return reordered
 
-    def put(self, cache_dir: str, key: str, graph: fx.GraphModule,
-            runnable: Callable[..., Any]) -> None:
-        self._runnables[(cache_dir, key)] = (runnable, _signature(graph),
-                                             _handover_inputs(graph))
+    def put(
+        self,
+        cache_dir: str,
+        key: str,
+        graph: fx.GraphModule,
+        runnable: Callable[..., Any],
+    ) -> None:
+        self._runnables[(cache_dir, key)] = (
+            runnable,
+            _signature(graph),
+            _handover_inputs(graph),
+        )
 
     def needs_retrace(self, size: int) -> bool:
         """Whether a graph refused this bucket and no trace has built it yet.
@@ -304,10 +318,9 @@ def warmup() -> Iterator[BucketExecutables]:
         _session = None
 
 
-def runnable_for(cache_dir: str,
-                 key: str,
-                 graph: fx.GraphModule,
-                 size: int | None = None) -> Callable[..., Any] | None:
+def runnable_for(
+    cache_dir: str, key: str, graph: fx.GraphModule, size: int | None = None
+) -> Callable[..., Any] | None:
     """What this compile should use instead of compiling, if anything.
 
     The load path is screened too: the cache key is (subgraph, bucket) with no
@@ -322,8 +335,7 @@ def runnable_for(cache_dir: str,
         logger.info("[shape-variants] %s handed over by an earlier trace", key)
         return ready
 
-    reason = (None if size is None else unsupported_reason(
-        trace_shape_env(graph), size))
+    reason = None if size is None else unsupported_reason(trace_shape_env(graph), size)
     if reason is None:
         return None
     if _session is None:
@@ -333,7 +345,8 @@ def runnable_for(cache_dir: str,
             "token count while tracing, so every compile_size would share the "
             "structure of the one that was traced. Only the backbone is "
             "re-traced per bucket group today (see _precompile_backbone); make "
-            "this module's structure independent of the token count.")
+            "this module's structure independent of the token count."
+        )
 
     logger.info("[shape-variants] %s left to a later trace: %s", key, reason)
     _session.refused.add(size)
@@ -341,13 +354,15 @@ def runnable_for(cache_dir: str,
     def refuse(*_args: Any, **_kwargs: Any) -> Any:
         raise ShapeSpecializationError(
             f"{key} was left to a later trace ({reason}) and never compiled; "
-            "the warmup ladder is out of step with the partition.")
+            "the warmup ladder is out of step with the partition."
+        )
 
     return refuse
 
 
-def remember(cache_dir: str, key: str, graph: fx.GraphModule,
-             runnable: Callable[..., Any]) -> None:
+def remember(
+    cache_dir: str, key: str, graph: fx.GraphModule, runnable: Callable[..., Any]
+) -> None:
     """Offer a bucket, freshly compiled or loaded, to the traces that follow."""
     if _session is not None:
         _session.put(cache_dir, key, graph, runnable)
@@ -381,8 +396,10 @@ def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
     decoder layer, and the wrappers are what hold the bytecode hooks that have
     to be dropped before they are replaced.
     """
-    from vllm.compilation.wrapper import (TorchCompileWithNoGuardsWrapper,
-                                          reset_compile_wrapper)
+    from vllm.compilation.wrapper import (
+        TorchCompileWithNoGuardsWrapper,
+        reset_compile_wrapper,
+    )
     from vllm.config import set_current_vllm_config
 
     if _session is not None:
@@ -390,11 +407,13 @@ def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
         # The refusals belong to the traces being replaced.
         _session.refused.clear()
 
-    wrappers = ([model]
-                if isinstance(model, TorchCompileWithNoGuardsWrapper) else [
-                    m for m in model.modules()
-                    if isinstance(m, TorchCompileWithNoGuardsWrapper)
-                ])
+    wrappers = (
+        [model]
+        if isinstance(model, TorchCompileWithNoGuardsWrapper)
+        else [
+            m for m in model.modules() if isinstance(m, TorchCompileWithNoGuardsWrapper)
+        ]
+    )
     for wrapper in wrappers:
         wrapper.cleanup()  # drop its bytecode hook before replacing it
 

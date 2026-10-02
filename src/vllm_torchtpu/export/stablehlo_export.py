@@ -637,14 +637,14 @@ def _run_aot_with_fx_to_mlir_hook(
     torch_tpu_export.fx_to_mlir = hook
     StaticCompiler._async_compile = False
     try:
-        compiled_fn, _ = adaptor._run_backend(export_graph, example_inputs)
+        compiled_fn, entry = adaptor._run_backend(export_graph, example_inputs)
     finally:
         torch_tpu_export.fx_to_mlir = orig_fx_to_mlir
         StaticCompiler._async_compile = orig_async
 
     if was_wrapped:
         compiled_fn = adaptor._unwrap_compiled_fn(compiled_fn)
-    return compiled_fn, None
+    return compiled_fn, entry, was_wrapped
 
 
 def _export_fx_module_to_disk(
@@ -681,7 +681,7 @@ def export_stablehlo(
     example_inputs: list[Any],
     compile_range: Range,
     key: str | None,
-) -> None:
+) -> tuple[Callable[..., Any] | None, Any | None, bool]:
     """Export traced FX subgraph to StableHLO (.mlir) and metadata.json."""
     from torch_tpu._internal import export as torch_tpu_export
 
@@ -718,10 +718,9 @@ def export_stablehlo(
                 )
             return exported_mlir
 
-        _run_aot_with_fx_to_mlir_hook(
+        return _run_aot_with_fx_to_mlir_hook(
             adaptor, graph, example_inputs, _export_fx_to_mlir_hook
         )
-        return
 
     export_graph, _ = _ensure_tuple_output(copy.deepcopy(graph))
     exported_mlir = torch_tpu_export.fx_to_mlir(
@@ -738,6 +737,7 @@ def export_stablehlo(
         key=key,
         subgraph_idx=subgraph_idx,
     )
+    return None, None, False
 
 
 def _wrap_direct_executable(
@@ -837,7 +837,7 @@ def load_and_compile_stablehlo(
                 elif hasattr(tpu_torch_compile, "traverse_and_compile"):
                     delattr(tpu_torch_compile, "traverse_and_compile")
 
-        compiled_fn, _ = _run_aot_with_fx_to_mlir_hook(
+        compiled_fn, *_ = _run_aot_with_fx_to_mlir_hook(
             adaptor, graph, example_inputs, _load_fx_to_mlir_hook
         )
         return compiled_fn

@@ -941,7 +941,7 @@ def test_load_stablehlo_disables_async_compile_and_preserves_tuple_outputs(
     with patch.object(compiler, "_run_backend", side_effect=_inspect_async_backend):
         compiler.compile(aot_graph, [inp], {}, compile_range, key=cache_key)
 
-    assert observed_async_flags == [False, True]
+    assert observed_async_flags == [False]
     assert StaticCompiler._async_compile is True
 
 

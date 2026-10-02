@@ -597,9 +597,31 @@ class TpuCompilerAdaptor(CompilerInterface):
             return compiled_fn, None
 
         if envs.VLLM_TORCHTPU_EXPORT_HLO_DIR and not is_profile:
-            stablehlo_export.export_stablehlo(
+            compiled_fn, entry, was_wrapped = stablehlo_export.export_stablehlo(
                 self, graph, example_inputs, compile_range, key
             )
+            if compiled_fn is not None:
+                handle = None
+                caching = (
+                    key is not None
+                    and self.cache_dir is not None
+                    and not self._disable_cache
+                )
+                if caching and entry is not None:
+                    save_path = os.path.join(self.cache_dir, key)
+                    if self._save_handle(key, save_path, entry, graph, was_wrapped):
+                        handle = (key, save_path, was_wrapped)
+                elif caching:
+                    logger.info(
+                        "[TpuCompilerAdaptor] No serializable artifact for range %s; "
+                        "it will be recompiled on the next start",
+                        compile_range,
+                    )
+
+                size = _single_size(compile_range)
+                if key is not None and size is not None:
+                    shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
+                return compiled_fn, handle
 
         logger.info(
             "[TpuCompilerAdaptor] Compiling FX graph for range %s",
