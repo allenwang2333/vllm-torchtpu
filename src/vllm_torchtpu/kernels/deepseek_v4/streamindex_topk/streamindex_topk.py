@@ -624,6 +624,7 @@ def _effective_row_lengths(
         "return_scores",
         "fused_payload",
         "single_slice",
+        "skip_empty_decode",
     ),
 )
 def streamindex_topk(
@@ -654,6 +655,7 @@ def streamindex_topk(
     return_scores: bool = False,
     fused_payload: bool = False,
     single_slice: bool = False,
+    skip_empty_decode: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -718,6 +720,12 @@ def streamindex_topk(
       single_slice: forwarded to `sparsecore_topk`; when every row's visible
         length fits the first stage-1 slice, skip the stage-2 merge. Same
         result.
+      skip_empty_decode: when the batch has no decode (q_len 1) sequence --
+        every step under speculative decoding, whose decode rows have q_len
+        gamma + 1 and go to the MIXED pass -- branch at runtime around the two
+        DECODE passes, which would launch over an empty range. Unchunked calls
+        only. The MIXED pass writes the same rows either way, so the result is
+        identical.
 
     Returns:
       Top-K indices in this rank's local compressed space, or
@@ -1113,14 +1121,25 @@ def streamindex_topk(
             sc2_group = None if m >= num_chunks - 2 else group_base + m + 1
 
             start = m * chunk_len
-            scores = _scores_for_chunk(
-                passes,
-                m,
-                chunk_starts[m],
-                chunk_len,
-                out_dtype,
-                tc_group,
+            scores_for = functools.partial(
+                _scores_for_chunk,
+                chunk_idx=m,
+                chunk_token_start=chunk_starts[m],
+                chunk_tokens=chunk_len,
+                out_dtype=out_dtype,
+                scheduling_group_id=tc_group,
             )
+            if skip_empty_decode and num_chunks == 1:
+                # Both DECODE passes cover [0, distribution[1]); with it empty,
+                # the MIXED pass alone allocates the buffer and writes every row
+                # it would have written behind them.
+                scores = jax.lax.cond(
+                    distribution[1] > 0,
+                    lambda: scores_for(passes),
+                    lambda: scores_for(passes[2:]),
+                )
+            else:
+                scores = scores_for(passes)
             scores = scores.reshape(chunk_len, -1)
             if scores.shape[1] < k:
                 scores = jnp.pad(
@@ -1206,6 +1225,7 @@ def streamindex_topk(
         "dcp_axis_name",
         "fused_payload",
         "single_slice",
+        "skip_empty_decode",
     ),
 )
 def streamindex_topk_dcp(
@@ -1231,6 +1251,7 @@ def streamindex_topk_dcp(
     dcp_axis_name: str = DCP_AXIS_NAME,
     fused_payload: bool = False,
     single_slice: bool = False,
+    skip_empty_decode: bool = False,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1293,6 +1314,7 @@ def streamindex_topk_dcp(
         `dcp_rank * k`) instead of a separate `take_along_axis`, and fold the
         two-stage candidate maps of both top-ks in the same way. Bit-identical
         output; removes three SparseCore gathers per call at decode shapes.
+      skip_empty_decode: forwarded to `streamindex_topk`; see there.
 
     Returns:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1357,6 +1379,7 @@ def streamindex_topk_dcp(
             return_scores=True,
             fused_payload=fused_payload,
             single_slice=single_slice,
+            skip_empty_decode=skip_empty_decode,
         )
 
         # Stage 1. All-gather the scores; the indices stay home.
