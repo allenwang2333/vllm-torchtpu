@@ -143,3 +143,24 @@ def test_admission_rejects_ep_shapes():
     assert not kernel.can_use_fused_tp(
         x, w1, w2, s1, s2, None, None, activation="silu", rhs_quant_dtype=None
     )
+
+
+def test_padded_rows_with_nonfinite_hidden_stay_zero(tensors):
+    """Bucket padding rows carry real (possibly non-finite) hidden states and zero weight."""
+    rng, w1, w2, s1, s2 = tensors
+    m = 32
+    x = np.asarray(rng.normal(size=(m, H)), np.float32)
+    weights, ids = _routing(rng, m, "padded")
+    clean = np.asarray(
+        kernel.fused_moe_tp(jnp.asarray(x, jnp.bfloat16), w1, w2, s1, s2,
+                            jnp.asarray(weights, jnp.bfloat16), jnp.asarray(ids))
+    )
+    x[m - 5 :] = rng.normal(size=(5, H)) * 1e3
+    x[m - 2, :7] = np.nan
+    x[m - 1, 3] = np.inf
+    dirty = np.asarray(
+        kernel.fused_moe_tp(jnp.asarray(x, jnp.bfloat16), w1, w2, s1, s2,
+                            jnp.asarray(weights, jnp.bfloat16), jnp.asarray(ids))
+    )
+    assert np.array_equal(dirty[: m - 5], clean[: m - 5])
+    assert not dirty[m - 5 :].astype(np.float32).any()

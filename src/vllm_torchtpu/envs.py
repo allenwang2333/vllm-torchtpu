@@ -543,7 +543,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Serve tensor-parallel (non-EP) MoE with the fused TP kernel
     # (kernels/experimental/moe_fused_tp.py) when the token count is at most
     # MOE_FUSED_TP_KERNEL_MAX_TOKENS. Larger shapes and unsupported layouts use
-    # the GMM path. Decided at trace time from the static token count.
+    # the GMM path. Both are read once at import of fused_moe_gmm; the cap is
+    # compared with each call's static token count when it is traced.
     "USE_MOE_FUSED_TP_KERNEL": env_bool("USE_MOE_FUSED_TP_KERNEL"),
     "MOE_FUSED_TP_KERNEL_MAX_TOKENS": env_nonnegative_int(
         "MOE_FUSED_TP_KERNEL_MAX_TOKENS", 512

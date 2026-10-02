@@ -121,7 +121,9 @@ def _kernel(
         e = ids_ref[step]
         coeff = jnp.sum(jnp.where(cols == e, coeff_ref[...], 0.0), axis=1, keepdims=True)
         acc1 = acc1 * xs_ref[...] * s1_ref[slot]
-        mid = jax.nn.silu(acc1[:, :i]) * acc1[:, i:] * coeff
+        # Mask, not multiply: a padded row with non-finite hidden would give
+        # NaN * 0 = NaN. Rows this expert does not own contribute exactly 0.
+        mid = jnp.where(coeff != 0, jax.nn.silu(acc1[:, :i]) * acc1[:, i:] * coeff, 0.0)
         ms = jnp.max(jnp.abs(mid), axis=1, keepdims=True) / _F8_MAX
         mq = (mid * jnp.where(ms == 0, 0.0, 1.0 / ms)).astype(_F8)
         for n in range(0, h, _N_CHUNK):
