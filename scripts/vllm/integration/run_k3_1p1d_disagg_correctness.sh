@@ -52,7 +52,7 @@
 #     * neither engine preempted a request (num_preemptions == 0)
 #
 # Stages 4 and 5 compare tokens, which needs a prefill chunk to be one KV block
-# (configs/kimi-k3-tp32-ep-1p1d.sh); this refuses to start otherwise. They
+# (configs/kimi-k3-tp8-dp4-ep-1p1d.sh); this refuses to start otherwise. They
 # also hold their requests to one DP rank of each engine (K3_PD_DP_RANK): the
 # replicas differ slightly in greedy output. The other stages and the eval
 # spread over the replicas as the proxy sends them.
