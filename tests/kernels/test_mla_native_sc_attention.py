@@ -999,6 +999,97 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
         self.assertFalse(np.array_equal(np.asarray(bad_lse)[row], np.asarray(ref_lse)[row]))
 
+    @parameterized.product(
+        (
+            # MTP decode buckets: q=4 per request, 1-4 requests.
+            {"query_tokens": 16, "seq_q": (4,)},
+            {"query_tokens": 16, "seq_q": (4, 4)},
+            {"query_tokens": 16, "seq_q": (4, 4, 4, 4)},
+            # Drafter passes: one token per request.
+            {"query_tokens": 16, "seq_q": (1,)},
+            {"query_tokens": 16, "seq_q": (1, 1)},
+            # A bucket the cap does not divide (largest divisor <= cap).
+            {"query_tokens": 12, "seq_q": (4, 4, 1)},
+        ),
+        small_chunk_batch_size=(2, 4, 8, 16),
+    )
+    def test_small_chunk_batch_size_matches_one_token_steps(
+        self, query_tokens, seq_q, small_chunk_batch_size
+    ):
+        """TPU_DCP_MLA_SMALL_CHUNK_BATCH against the 1-token grid step.
+
+        Production DCP config (cap 512, chunk 256, capped window prep, split
+        q, lane-dense lse). A wider grid step attends padding rows up to the
+        step boundary; every real row must match the 1-token step, and the
+        DCP empty-row contract must hold.
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        rng = np.random.default_rng(20261012)
+        problem, topk_idx, owns, counts, page_table, cu_q_lens, distribution = (
+            self._split_q_lse_case(query_tokens, seq_q, rng)
+        )
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+        real_tokens = int(sum(seq_q))
+
+        def run(topk_in, batch):
+            out, lse = sparse_mla.sparse_ragged_paged_attention(
+                q_nope,
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_in,
+                page_table,
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                topk_cap=512,
+                capped_window_prep=True,
+                lse_lane_dense=True,
+                q_pe=q_pe,
+                small_chunk_batch_size=batch,
+            )
+            lse = jnp.where(owns[:, None], lse, -jnp.inf)
+            return out, lse
+
+        def bits(x):
+            return np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16))
+
+        (ref, ref_lse), (out, lse) = jax.block_until_ready(
+            (run(topk_idx, 1), run(topk_idx, small_chunk_batch_size))
+        )
+        real_out = np.asarray(out, np.float32)[:real_tokens]
+        np.testing.assert_allclose(
+            real_out, np.asarray(ref, np.float32)[:real_tokens], rtol=2e-2, atol=2e-2
+        )
+        np.testing.assert_allclose(
+            np.asarray(lse)[:real_tokens],
+            np.asarray(ref_lse)[:real_tokens],
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        print(
+            f"SMALL_CHUNK_BATCH bz={small_chunk_batch_size} T={query_tokens} "
+            f"seq_q={seq_q} bit_identical_out="
+            f"{np.array_equal(bits(out)[:real_tokens], bits(ref)[:real_tokens])} "
+            f"bit_identical_lse="
+            f"{np.array_equal(np.asarray(lse)[:real_tokens], np.asarray(ref_lse)[:real_tokens])}"
+        )
+        empty = ~np.asarray(owns)[:real_tokens]
+        self.assertTrue(np.all(np.asarray(lse)[:real_tokens][empty] == -np.inf))
+        self.assertTrue(np.isfinite(real_out).all())
+        # Positive control: one moved live entry of the fullest real row moves
+        # that row (the comparison can fail).
+        row = int(np.argmax(counts[:real_tokens]))
+        if counts[row] > 0:
+            moved = topk_idx.at[row, 0].set((topk_idx[row, 0] + 1) % 8192)
+            bad, _ = jax.block_until_ready(run(moved, small_chunk_batch_size))
+            self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
+
     @parameterized.parameters((16, (4, 4)), (512, (4, 4, 492)))
     def test_split_q_lse_bit_identical_tensorcore(self, query_tokens, seq_q):
         """The same flag on the TensorCore cache layout (dsa_gather path)."""

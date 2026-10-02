@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_MLA_CAPPED_PREP: bool = False
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
+    TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 1
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_LSE_MERGE_RS_BF16: bool = False
@@ -395,6 +396,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
     # copies through the LSE merge. Bit-identical outputs.
     "TPU_DCP_MLA_SPLIT_Q_LSE": env_bool("TPU_DCP_MLA_SPLIT_Q_LSE", default=False),
+    # DCP sparse MLA attention grid step for decode-sized chunks
+    # (`sparse_ragged_paged_attention(small_chunk_batch_size=...)`): attend
+    # this many query tokens per kernel grid step instead of one, so the
+    # fixed per-step cost is paid once per N tokens (MTP decode has q=4 per
+    # request). The kernel uses the largest divisor of the chunk <= N and
+    # grids `cdiv(real tokens, step)` steps, so up to N-1 padding rows are
+    # attended (outputs don't-care). 1 = the kernel default (unchanged).
+    "TPU_DCP_MLA_SMALL_CHUNK_BATCH": env_int("TPU_DCP_MLA_SMALL_CHUNK_BATCH", 1),
     # DCP MLA log-sum-exp merge (`cp_mla_attention.merge_lse_partials_scatter_heads`)
     # for steps of at most TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS tokens: instead of
     # an lse all-gather, an f32 weight multiply of the whole [T, H, V] partial
