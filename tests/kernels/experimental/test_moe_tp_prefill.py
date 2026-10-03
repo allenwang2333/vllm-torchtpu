@@ -238,3 +238,18 @@ def test_rowquant_rows_matches_v2():
     np.testing.assert_array_equal(np.asarray(q.reshape(40, 256).astype(jnp.float32)),
                                   np.asarray(q2.astype(jnp.float32)))
     np.testing.assert_array_equal(np.asarray(s), np.asarray(s2.reshape(-1)))
+
+
+@pytest.mark.parametrize("lookahead", [2, 3])
+@pytest.mark.parametrize("T,n_valid", [(300, None), (256, 131), (129, None)])
+def test_gather_lookahead(lookahead, T, n_valid):
+    c = make_case(T, 16, 256, 128, 4, skew=True)
+    y = np.asarray(run_kernel(c, n_valid=n_valid, lookahead=lookahead).astype(jnp.float32))
+    nv = T if n_valid is None else n_valid
+    assert row_err(y[:nv], same_math(c, n_valid)[:nv]) < 1e-2
+
+
+def test_row_write_mode_identical():
+    c = make_case(300, 16, 256, 128, 4, skew=True)
+    y = np.asarray(run_kernel(c, write_mode="rows").astype(jnp.float32))
+    assert row_err(y, same_math(c)) < 1e-2
