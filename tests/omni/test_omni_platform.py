@@ -143,6 +143,134 @@ def test_tpu_sdpa_attention_backend():
     assert res_gqa.shape == (1, 16, 8, 16)
 
 
+@pytest.mark.parametrize(
+    "seq_len, expected",
+    [
+        (4224, (1408, 4224, 1408)),  # Z-Image 1024^2: 4096 image + 128 caption
+        (4096, (2048, 4096, 1024)),  # Z-Image noise refiner
+        (1024, (1024, 1024, 1024)),
+        (16384, (2048, 4096, 1024)),  # longer than the resident-KV cap: chunked
+        (4160, None),  # 65 x 64: no lane-aligned q block divides it
+        (100, None),
+    ],
+)
+def test_splash_block_sizes(seq_len, expected):
+    from vllm_torchtpu.omni.attention import splash_block_sizes
+
+    assert splash_block_sizes(seq_len) == expected
+
+
+@pytest.mark.parametrize(
+    "seq_len, expected",
+    [
+        (4128, (4224, (1408, 4224, 384))),  # Z-Image 1024^2 + 32-token caption
+        (4224, (4224, (1408, 4224, 1408))),  # already aligned: no padding, no mask
+        (4096, (4096, (2048, 4096, 1024))),
+        (4160, (4224, (1408, 4224, 384))),  # 65 x 64 -> next bucket
+        (8320, (8448, (1408, 1408, 1408))),  # 65 x 128 only admits q=128: use 66 x 128
+        (1024, (1024, (1024, 1024, 1024))),
+        (1056, (1408, (1408, 1408, 1408))),  # 512^2 warm-up shape
+    ],
+)
+def test_splash_plan(seq_len, expected):
+    from vllm_torchtpu.omni.attention import _SPLASH_MIN_BLOCK_Q, splash_plan
+
+    plan = splash_plan(seq_len)
+    assert plan == expected
+    padded, (block_q, block_kv, block_kv_compute) = plan
+    assert padded >= seq_len and padded % 128 == 0
+    assert padded % block_q == 0 and block_kv % block_kv_compute == 0
+    assert block_q >= _SPLASH_MIN_BLOCK_Q
+
+
+def test_padding_segment_ids():
+    pytest.importorskip("jax.experimental.pallas.ops.tpu.splash_attention")
+    import jax.numpy as jnp
+    import numpy as np
+
+    from vllm_torchtpu.omni.attention import _padding_segment_ids
+
+    heads, padded, valid, dim = 2, 256, 200, 128
+    q = jnp.full((heads, padded, dim), 3.5, dtype=jnp.bfloat16)
+    k = jnp.full((heads, padded, dim), -7.25, dtype=jnp.bfloat16)
+    ids = _padding_segment_ids(q, k, valid)
+    assert ids.q.shape == (padded,) and ids.kv.shape == (padded,)
+    assert ids.q.dtype == jnp.int32 and ids.kv.dtype == jnp.int32
+    # Queries are one segment; keys are segment 0 if valid, 1 if padding.
+    np.testing.assert_array_equal(np.asarray(ids.q), np.zeros(padded, np.int32))
+    np.testing.assert_array_equal(
+        np.asarray(ids.kv),
+        np.r_[np.zeros(valid, np.int32), np.ones(padded - valid, np.int32)],
+    )
+    # Resulting mask: every query sees exactly the valid keys (no empty rows).
+    allowed = np.asarray(ids.q)[:, None] == np.asarray(ids.kv)[None, :]
+    assert allowed[:, :valid].all() and not allowed[:, valid:].any()
+    assert allowed.sum(axis=1).tolist() == [valid] * padded
+
+
+def _fake_tpu_tensor(shape, dtype=torch.bfloat16):
+    t = MagicMock(spec=torch.Tensor)
+    t.device = MagicMock()
+    t.device.type = "tpu"
+    t.dtype = dtype
+    t.shape = torch.Size(shape)
+    t.dim.return_value = len(shape)
+    return t
+
+
+def test_can_use_splash_attention():
+    from vllm_torchtpu.omni.attention import can_use_splash_attention
+
+    q = _fake_tpu_tensor((1, 4224, 30, 128))
+    assert can_use_splash_attention(q, q, q, None, causal=False) is True
+    # Unaligned lengths are padded inside the kernel path.
+    q_unaligned = _fake_tpu_tensor((1, 4128, 30, 128))
+    assert can_use_splash_attention(q_unaligned, q_unaligned, q_unaligned, None, False)
+    # Metadata without a mask is fine; a mask is not.
+    assert can_use_splash_attention(q, q, q, MagicMock(attn_mask=None), False)
+    assert not can_use_splash_attention(
+        q, q, q, MagicMock(attn_mask=torch.ones(1)), False
+    )
+    assert not can_use_splash_attention(q, q, q, None, causal=True)
+    # GQA / mismatched shapes, small sequences, odd head dims, other dtypes.
+    assert not can_use_splash_attention(
+        q, _fake_tpu_tensor((1, 4224, 6, 128)), q, None, False
+    )
+    assert not can_use_splash_attention(
+        *(_fake_tpu_tensor((1, 128, 30, 128)),) * 3, None, False
+    )
+    assert not can_use_splash_attention(
+        *(_fake_tpu_tensor((1, 4224, 30, 64)),) * 3, None, False
+    )
+    qf = _fake_tpu_tensor((1, 4224, 30, 128), dtype=torch.float32)
+    assert not can_use_splash_attention(qf, qf, qf, None, False)
+    # CPU tensors never take the kernel path.
+    cpu = torch.zeros(1, 4224, 30, 128, dtype=torch.bfloat16)
+    assert not can_use_splash_attention(cpu, cpu, cpu, None, False)
+
+
+def test_tpu_sdpa_impl_routes_to_splash(monkeypatch):
+    from vllm_torchtpu.omni import attention as omni_attention
+
+    impl = TpuSDPAImpl(num_heads=30, head_size=128, softmax_scale=0.125)
+    calls = []
+    monkeypatch.setattr(
+        impl, "_forward_splash", lambda q, k, v: calls.append("splash") or q
+    )
+    monkeypatch.setattr(
+        omni_attention,
+        "can_use_splash_attention",
+        lambda *a, **k: a[0].device.type == "tpu",
+    )
+    tpu_q = _fake_tpu_tensor((1, 4224, 30, 128))
+    assert impl.forward(tpu_q, tpu_q, tpu_q) is tpu_q
+    assert calls == ["splash"]
+
+    cpu_q = torch.randn(1, 64, 2, 16)
+    assert impl.forward(cpu_q, cpu_q, cpu_q).shape == cpu_q.shape
+    assert calls == ["splash"]
+
+
 def test_vllm_omni_is_mocked():
     assert sys.modules["vllm_omni"] is vllm_omni_mock
     assert not hasattr(vllm_omni, "__file__") or vllm_omni.__file__ is None

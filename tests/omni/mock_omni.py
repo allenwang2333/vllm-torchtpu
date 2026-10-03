@@ -59,10 +59,20 @@ class _MockSDPABackend:
 
 
 class _MockSDPAImpl:
-    def __init__(self, num_heads, head_size, scale=None, num_kv_heads=None, **kwargs):
+    def __init__(
+        self,
+        num_heads,
+        head_size,
+        softmax_scale=None,
+        causal=False,
+        num_kv_heads=None,
+        **kwargs,
+    ):
+        # Mirrors vllm_omni.diffusion.attention.backends.sdpa.SDPAImpl.__init__.
         self.num_heads = num_heads
         self.head_size = head_size
-        self.scale = scale
+        self.softmax_scale = softmax_scale
+        self.causal = causal
         self.num_kv_heads = num_kv_heads or num_heads
 
     def _forward_impl(
@@ -76,7 +86,7 @@ class _MockSDPAImpl:
         k = key.transpose(1, 2)
         v = value.transpose(1, 2)
         out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, scale=self.scale
+            q, k, v, is_causal=self.causal, scale=self.softmax_scale
         )
         return out.transpose(1, 2)
 
