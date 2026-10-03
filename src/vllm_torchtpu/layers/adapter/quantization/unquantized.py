@@ -45,7 +45,6 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.linear import (
     LinearBase,
-    QKVParallelLinear,
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import register_quantization_config
@@ -64,6 +63,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    is_k_eq_v_qkv_layer,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -107,17 +107,13 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         if weight.dim() != 2:
             # Not a plain dense weight; leave the stock behaviour alone.
             return
-        if isinstance(layer, QKVParallelLinear) and getattr(layer, "bias", None) is None:
+        if is_k_eq_v_qkv_layer(layer):
             q_size = layer.num_heads * layer.head_size
             k_size = layer.num_kv_heads * layer.head_size
             v_size = layer.num_kv_heads * getattr(layer, "v_head_size", layer.head_size)
             if k_size == v_size > 0 and q_size + 2 * k_size == weight.shape[0]:
-                w_cpu = weight.cpu().view(torch.uint8)
-                if torch.equal(
-                    w_cpu[q_size : q_size + k_size], w_cpu[q_size + k_size :]
-                ):
-                    weight = weight[: q_size + k_size]
-                    setattr(layer, "_dedup_kv_size", k_size)
+                weight = weight[: q_size + k_size]
+                setattr(layer, "_dedup_kv_size", k_size)
         weight = weight.transpose(0, 1).contiguous()
         replace_parameter(
             layer, "weight", torch.nn.Parameter(weight, requires_grad=False)

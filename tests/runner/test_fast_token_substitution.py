@@ -55,7 +55,7 @@ def test_substitution_disabled_by_default():
 
 
 def test_substitution_enabled_fast_path():
-    """When _fast_token_substitution is True, direct slicing bypasses kernel."""
+    """When _fast_token_substitution is True, device index tensors are cached and reused."""
     runner = SimpleNamespace(
         _fast_token_substitution=True,
         device=torch.device("cpu"),
@@ -70,12 +70,23 @@ def test_substitution_enabled_fast_path():
     with patch(
         "vllm_torchtpu.runner.tpu_runner._substitute_placeholder_token"
     ) as mock_kernel:
-        out = TPUModelRunner._apply_async_token_substitution(
+        mock_kernel.return_value = torch.tensor([201, 202, 203, 204], dtype=torch.int32)
+        out1 = TPUModelRunner._apply_async_token_substitution(
             runner, input_ids, cur_indices, pre_indices
         )
-        # Direct slice returns next_tokens_tpu[:4] without calling kernel
-        assert not mock_kernel.called
-        assert torch.equal(out, torch.tensor([201, 202, 203, 204], dtype=torch.int32))
+        assert mock_kernel.call_count == 1
+        assert torch.equal(out1, torch.tensor([201, 202, 203, 204], dtype=torch.int32))
+        cached_cur = runner._cached_cur_input_indices
+        cached_pre = runner._cached_pre_next_tokens_indices
+
+        # Second call with identical indices reuses cached device index tensors
+        out2 = TPUModelRunner._apply_async_token_substitution(
+            runner, input_ids, cur_indices, pre_indices
+        )
+        assert mock_kernel.call_count == 2
+        assert mock_kernel.call_args.args[1] is cached_cur
+        assert mock_kernel.call_args.args[2] is cached_pre
+        assert torch.equal(out2, torch.tensor([201, 202, 203, 204], dtype=torch.int32))
 
 
 def test_stage_timing_disabled_skips_tpu_events():

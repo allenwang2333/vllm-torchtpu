@@ -37,6 +37,39 @@ KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
 
 
+def is_k_eq_v_qkv_layer(layer: torch.nn.Module) -> bool:
+    """Return True if ``layer`` is a QKVParallelLinear configured with K == V."""
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.model_executor.layers.linear import QKVParallelLinear
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    if not isinstance(layer, QKVParallelLinear) or getattr(layer, "bias", None) is not None:
+        return False
+    if getattr(layer, "attention_k_eq_v", False):
+        return True
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None or vllm_config.model_config is None:
+        return False
+    text_config = vllm_config.model_config.hf_text_config
+    prefix = getattr(layer, "prefix", "")
+    if ".layers." not in prefix:
+        return False
+    layer_idx = extract_layer_index(prefix)
+    if getattr(text_config, "is_heterogeneous", False):
+        per_layer = getattr(text_config, "per_layer_config", None)
+        if per_layer is not None and 0 <= layer_idx < len(per_layer):
+            return bool(getattr(per_layer[layer_idx], "attention_k_eq_v", False))
+        return False
+    if not getattr(text_config, "attention_k_eq_v", False):
+        return False
+    layer_types = getattr(text_config, "layer_types", None)
+    return bool(
+        layer_types is not None
+        and 0 <= layer_idx < len(layer_types)
+        and layer_types[layer_idx] == "full_attention"
+    )
+
+
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
     """Return the activation quant dtype paired with a given weight dtype.
 

@@ -46,7 +46,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
-from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding import (
+    MRotaryEmbedding,
+    MRotaryEmbeddingInterleaved,
+    RotaryEmbedding,
+)
+from vllm.model_executor.layers.rotary_embedding.gemma4_rope import (
+    Gemma4RotaryEmbedding,
+)
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sequence import IntermediateTensors
@@ -1197,7 +1204,12 @@ class TPUModelRunner(GPUModelRunner):
         num_eligible = 0
         num_truncated = 0
         for name, module in self.model.named_modules():
-            if not isinstance(module, RotaryEmbedding):
+            if type(module) not in (
+                RotaryEmbedding,
+                MRotaryEmbedding,
+                MRotaryEmbeddingInterleaved,
+                Gemma4RotaryEmbedding,
+            ):
                 continue
             for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16"):
                 buf = getattr(module, buf_name, None)
@@ -2195,31 +2207,8 @@ class TPUModelRunner(GPUModelRunner):
             return input_ids
 
         if getattr(self, "_fast_token_substitution", False):
-            # Fast path 1: Direct device token slicing for 1:1 steady-state decode
-            # Bypasses the _substitute_placeholder_token kernel entirely when unpadded
-            n_subst = len(token_in_tpu_cur_input_indices)
-            if (
-                self.device.type != "tpu"
-                and n_subst == len(input_ids)
-                and np.array_equal(
-                    token_in_tpu_cur_input_indices,
-                    np.arange(len(input_ids), dtype=np.int32),
-                )
-                and np.array_equal(
-                    token_in_tpu_pre_next_tokens_indices,
-                    np.arange(len(input_ids), dtype=np.int32),
-                )
-            ):
-                next_tpu = self._pre_async_results.next_tokens_tpu.flatten().to(
-                    input_ids.dtype
-                )
-                if len(next_tpu) >= len(input_ids):
-                    return next_tpu[: len(input_ids)]
-
-            # Fast path 2: Cache persistent device indices to eliminate per-step
-            # H2D uploads
-            # Avoids Eager XLA overhead by relying on the compiled kernel + cached
-            # index tensors
+            # Cache persistent device indices to eliminate per-step H2D uploads
+            # and rely on the compiled _substitute_placeholder_token kernel.
             subst_key = (
                 len(input_ids),
                 tuple(token_in_tpu_cur_input_indices),

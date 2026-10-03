@@ -2302,24 +2302,32 @@ class TestAsyncSpecDecodeTokenAccounting:
 
 
 def test_truncate_rope_caches_includes_rotary_embedding_subclasses():
-    """_truncate_rope_caches truncates RotaryEmbedding and its subclasses."""
+    """_truncate_rope_caches truncates allowlisted RoPE classes (including Gemma4RotaryEmbedding) and skips unknown subclasses."""
     from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+    from vllm.model_executor.layers.rotary_embedding.gemma4_rope import (
+        Gemma4RotaryEmbedding,
+    )
 
-    class CustomSubclassRotaryEmbedding(RotaryEmbedding):
+    class CustomScalingRotaryEmbedding(RotaryEmbedding):
         def __init__(self, max_pos: int, dim: int):
             torch.nn.Module.__init__(self)
             self.cos_sin_cache = torch.zeros(max_pos, dim, dtype=torch.float32)
-            self.cos_sin_cache_bf16 = torch.zeros(max_pos, dim, dtype=torch.bfloat16)
 
     base_rope = RotaryEmbedding.__new__(RotaryEmbedding)
     torch.nn.Module.__init__(base_rope)
     base_rope.cos_sin_cache = torch.zeros(4096, 64, dtype=torch.bfloat16)
 
-    sub_rope = CustomSubclassRotaryEmbedding(4096, 64)
+    gemma4_rope = Gemma4RotaryEmbedding.__new__(Gemma4RotaryEmbedding)
+    torch.nn.Module.__init__(gemma4_rope)
+    gemma4_rope.cos_sin_cache = torch.zeros(4096, 64, dtype=torch.float32)
+    gemma4_rope.cos_sin_cache_bf16 = torch.zeros(4096, 64, dtype=torch.bfloat16)
+
+    custom_rope = CustomScalingRotaryEmbedding(8192, 64)
 
     model = torch.nn.Module()
     model.base_rope = base_rope
-    model.sub_rope = sub_rope
+    model.gemma4_rope = gemma4_rope
+    model.custom_rope = custom_rope
 
     runner = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -2333,5 +2341,7 @@ def test_truncate_rope_caches_includes_rotary_embedding_subclasses():
     TPUModelRunner._truncate_rope_caches(runner)
 
     assert base_rope.cos_sin_cache.shape[0] == 1524
-    assert sub_rope.cos_sin_cache.shape[0] == 1524
-    assert sub_rope.cos_sin_cache_bf16.shape[0] == 1524
+    assert gemma4_rope.cos_sin_cache.shape[0] == 1524
+    assert gemma4_rope.cos_sin_cache_bf16.shape[0] == 1524
+    assert custom_rope.cos_sin_cache.shape[0] == 8192
+
