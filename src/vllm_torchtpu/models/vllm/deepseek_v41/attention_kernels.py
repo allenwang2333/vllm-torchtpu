@@ -221,6 +221,9 @@ def paged_index_scores_jax(
     shares one paged gather of the key tile instead of reading it again.
     """
     tokens, dim = q.shape[0], q.shape[-1]
+    if requests is not None and tokens <= records.shape[0]:
+        # Decode: request rows are padded, so sharing gathers only adds reads.
+        records, requests = jnp.take(records, requests, axis=0), None
     width = records.shape[1]
     # Keep about 16K keys per iteration: small (decode) batches otherwise run
     # many latency-bound tiny gathers. Prefill batches stay at 128.

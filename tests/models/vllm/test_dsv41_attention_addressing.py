@@ -103,7 +103,8 @@ def _request_inputs(rng, requests_count, tokens, width, heads=4, dim=128):
 
 
 @pytest.mark.parametrize(
-    "requests_count,tokens,width", [(1, 1, 300), (8, 8, 2560), (2, 64, 640)]
+    "requests_count,tokens,width",
+    [(1, 1, 300), (8, 8, 2560), (8, 2, 2560), (2, 64, 640)],
 )
 def test_paged_index_scores_shared_tiles_match_per_token(requests_count, tokens, width):
     rng = np.random.default_rng(tokens)
