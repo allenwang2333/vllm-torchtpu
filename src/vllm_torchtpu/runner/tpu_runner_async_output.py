@@ -11,6 +11,11 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 
+# One compiled program per helper (static shapes per bucket / request count)
+# instead of a chain of tiny eager programs, each a separate dispatch on the
+# serving thread.
+_tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+
 INVALID_TOKEN_ID = -1
 
 
@@ -209,6 +214,7 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         return self._model_runner_output
 
 
+@_tpu_compile
 def assemble_spec_next_tokens(
     next_tokens: torch.Tensor, drafts: torch.Tensor, num_reqs: int
 ) -> torch.Tensor:
@@ -236,6 +242,7 @@ def assemble_spec_next_tokens(
     return src.reshape(-1)  # [num_reqs * (1 + K)]
 
 
+@_tpu_compile
 def subtract_num_rejected_tokens(
     seq_lens: torch.Tensor,
     positions: torch.Tensor,
@@ -290,6 +297,7 @@ def extract_draft_token_ids(
     return input_ids[logits_indices[target_logits_indices + 1]]
 
 
+@_tpu_compile
 def compute_num_rejected(
     next_tokens: torch.Tensor, num_draft: torch.Tensor
 ) -> torch.Tensor:
