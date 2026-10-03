@@ -43,6 +43,11 @@ _KV_COMPUTE_BLOCKS = (1536, 1408, 1024, 512, 384, 256, 128)
 # fits tpu7x's 64 MiB VMEM with the kernel's double buffering; block_q = S
 # (4096/4224) with 1024-1408 compute blocks ran out of VMEM.
 _MAX_SCORE_TILE_ELEMS = 2048 * 1024
+# Cap on block_q * block_kv (the K/V block resident in VMEM against one q
+# block). 2048 x 4096 (S=4096 noise refiner) and 1408 x 4224 compile and run
+# at 0.74 / 1.07 ms on tpu7x; 2048 x 8192 made Mosaic spill a 54.7 MiB
+# register file and fail to compile (VMEM is 64 MiB).
+_MAX_RESIDENT_SCORE_ELEMS = 2048 * 4096
 
 
 def _first_divisor(candidates: tuple[int, ...], n: int) -> int | None:
@@ -69,16 +74,32 @@ def splash_block_sizes(
     streaming K/V in <=1536 chunks 12-17%. Returns ``None`` when no
     lane-aligned block divides ``seq_len`` (the caller then uses SDPA).
     ``masked`` selects the chunk preference for kernels with a padding mask.
+
+    The resident ``block_q x block_kv`` score footprint is capped at
+    ``_MAX_RESIDENT_SCORE_ELEMS``: beyond it the Mosaic register allocator
+    spills the whole tile (S=8192 with block_q=2048 needed 67.7 MiB of
+    tpu7x's 64 MiB VMEM and failed to compile), so longer sequences stream
+    K/V in smaller blocks or, if no block_q >= 1024 fits, use SDPA.
     """
-    block_q = _first_divisor(_Q_BLOCKS, seq_len)
-    if block_q is None:
+    block_q = block_kv = None
+    for cand_q in _Q_BLOCKS:
+        if cand_q > seq_len or seq_len % cand_q:
+            continue
+        if (
+            seq_len <= SPLASH_MAX_RESIDENT_KV
+            and cand_q * seq_len <= _MAX_RESIDENT_SCORE_ELEMS
+        ):
+            block_q, block_kv = cand_q, seq_len
+            break
+        cand_kv = _first_divisor(
+            tuple(k for k in _KV_BLOCKS if cand_q * k <= _MAX_RESIDENT_SCORE_ELEMS),
+            seq_len,
+        )
+        if cand_kv is not None:
+            block_q, block_kv = cand_q, cand_kv
+            break
+    if block_q is None or block_kv is None:
         return None
-    if seq_len <= SPLASH_MAX_RESIDENT_KV:
-        block_kv = seq_len
-    else:
-        block_kv = _first_divisor(_KV_BLOCKS, seq_len)
-        if block_kv is None:
-            return None
     max_compute = _MAX_SCORE_TILE_ELEMS // block_q
     compute_candidates = tuple(c for c in _KV_COMPUTE_BLOCKS if c <= max_compute)
     if masked:

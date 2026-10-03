@@ -149,6 +149,10 @@ def test_tpu_sdpa_attention_backend():
         (4224, (1408, 4224, 1408)),  # Z-Image 1024^2: 4096 image + 128 caption
         (4096, (2048, 4096, 1024)),  # Z-Image noise refiner
         (1024, (1024, 1024, 1024)),
+        (
+            8192,
+            (2048, 4096, 1024),
+        ),  # sp=2 shape: resident (2048, 8192) failed to compile
         (16384, (2048, 4096, 1024)),  # longer than the resident-KV cap: chunked
         (4160, None),  # 65 x 64: no lane-aligned q block divides it
         (100, None),
