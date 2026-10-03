@@ -103,7 +103,75 @@ def merge_lse_partials_scatter_heads(
     ):
         return merge_lse_partials_all_to_all(output, lse, group)
 
-    weighted = _weight_by_lse(output, lse, group)
+    chunks = _merge_chunks(output.shape[0]) if per_bucket else 1
+    if chunks > 1:
+        return _merge_chunked(output, lse, group, chunks)
+    return _reduce_weighted(output, _lse_weights(lse, group), group)
+
+
+def _merge_chunks(num_tokens: int) -> int:
+    """How many token chunks `TPU_DCP_MERGE_CHUNKED` splits this bucket's
+    merge into: 1 (unsplit) unless the bucket reaches
+    `TPU_DCP_MERGE_CHUNKED_MIN_TOKENS` and splits into equal chunks whose
+    length is a multiple of 8 (the f32 sublane tile)."""
+    chunks = envs.TPU_DCP_MERGE_CHUNKED
+    if (
+        chunks <= 1
+        or num_tokens < envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS
+        or num_tokens % (8 * chunks)
+    ):
+        return 1
+    return chunks
+
+
+def _merge_chunked(
+    output: torch.Tensor, lse: torch.Tensor, group: Any, chunks: int
+) -> torch.Tensor:
+    """The reduce-scatter merge over `chunks` independent token chunks.
+
+    Every token's merge depends on its own row alone, so splitting the token
+    axis changes no per-row arithmetic: each chunk gathers its own rows' lse
+    (or slices one whole-step gather, `TPU_DCP_MERGE_CHUNKED_LSE_ONCE`), weights
+    them and reduce-scatters them exactly as the unsplit merge does. What
+    changes is the schedule. The f32 reduce-scatter is a SparseCore-offloaded
+    async collective while the lse gather and the weight multiply are
+    TensorCore work, so chunk `k`'s reduce-scatter can run under chunk
+    `k + 1`'s gather and multiply instead of after all of them.
+    """
+    step = output.shape[0] // chunks
+    mine = _lse_weights(lse, group) if envs.TPU_DCP_MERGE_CHUNKED_LSE_ONCE else None
+    pieces = []
+    for c in range(chunks):
+        rows = slice(c * step, (c + 1) * step)
+        weights = mine[rows] if mine is not None else _lse_weights(lse[rows], group)
+        pieces.append(_reduce_weighted(output[rows], weights, group))
+    return torch.cat(pieces, dim=0)
+
+
+def _reduce_weighted(
+    output: torch.Tensor, mine: torch.Tensor, group: Any
+) -> torch.Tensor:
+    """Weight this rank's partial by its `[T, H]` f32 merge weights and
+    reduce-scatter the heads: `[T, H, V]` -> this rank's `[T, H / D, V]`."""
+    if envs.TPU_DCP_MERGE_HEAD_MAJOR:
+        # The reduce-scatter scatters its leading axis, so a `[T, H, V]` term
+        # is transposed to `[H, T, V]` before it (an f32 relayout of the whole
+        # term, offloaded to SparseCore on the mixed step). Weighting the
+        # transposed partial instead writes the term head-major in the
+        # multiply itself; the elementwise products are the same.
+        weighted = (
+            output.transpose(0, 1).to(torch.float32)
+            * mine.transpose(0, 1).unsqueeze(-1)
+        ).contiguous()
+        if envs.TPU_DCP_LSE_MERGE_RS_BF16:
+            weighted = weighted.to(output.dtype)
+        return (
+            group.reduce_scatter(weighted, dim=0)
+            .to(output.dtype)
+            .transpose(0, 1)
+            .contiguous()
+        )
+    weighted = (output.to(torch.float32) * mine.unsqueeze(-1)).contiguous()
     if envs.TPU_DCP_LSE_MERGE_RS_BF16:
         weighted = weighted.to(output.dtype)
     return group.reduce_scatter(weighted, dim=1).to(output.dtype)
@@ -111,6 +179,12 @@ def merge_lse_partials_scatter_heads(
 
 def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch.Tensor:
     """This rank's `softmax_r(lse) * o_r` term, in f32."""
+    mine = _lse_weights(lse, group)
+    return (output.to(torch.float32) * mine.unsqueeze(-1)).contiguous()
+
+
+def _lse_weights(lse: torch.Tensor, group: Any) -> torch.Tensor:
+    """This rank's `[T, H]` f32 merge weights `softmax_r(lse)`."""
     lse_f32 = lse.to(torch.float32).contiguous()
     # [world_size, num_tokens, num_heads]: small, and it removes the need for
     # any further reduction over the denominator.
@@ -136,7 +210,7 @@ def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch
     # This rank's row of `gathered` is `lse_f32` itself. Weighting from the
     # local copy instead of indexing by rank keeps the rank out of the traced
     # program, so every DCP rank compiles the same executable.
-    mine = (
+    return (
         torch.where(
             torch.isfinite(lse_f32),
             torch.exp(lse_f32 - shift),
@@ -144,7 +218,6 @@ def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch
         )
         / safe_denom
     )
-    return (output.to(torch.float32) * mine.unsqueeze(-1)).contiguous()
 
 
 _BITS_OF_WIDTH = {2: torch.int16, 4: torch.int32}

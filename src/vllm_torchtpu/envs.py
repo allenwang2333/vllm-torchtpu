@@ -17,6 +17,10 @@ if TYPE_CHECKING:
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_LSE_MERGE_RS_BF16: bool = False
+    TPU_DCP_MERGE_CHUNKED: int = 0
+    TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
+    TPU_DCP_MERGE_CHUNKED_LSE_ONCE: bool = False
+    TPU_DCP_MERGE_HEAD_MAJOR: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -444,6 +448,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sum in bf16 at every stage; a quarter to a third of outputs move by more
     # than one bf16 ulp (dcp=8/16), which fails the merge's accuracy bar.
     "TPU_DCP_LSE_MERGE_RS_BF16": env_bool("TPU_DCP_LSE_MERGE_RS_BF16", default=False),
+    # The reduce-scatter merge of a backbone bucket of at least
+    # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens, split into this many equal token
+    # chunks (0/1 = unsplit; a bucket that does not split into multiples of 8
+    # rows stays unsplit). Per-row arithmetic is unchanged; chunk k's
+    # SparseCore reduce-scatter can overlap chunk k+1's TensorCore lse gather
+    # and weight multiply. TPU_DCP_MERGE_CHUNKED_LSE_ONCE gathers the whole
+    # step's lse once and chunks only the multiply and the reduce-scatter.
+    "TPU_DCP_MERGE_CHUNKED": env_int("TPU_DCP_MERGE_CHUNKED", 0),
+    "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": env_int(
+        "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS", 1024
+    ),
+    "TPU_DCP_MERGE_CHUNKED_LSE_ONCE": env_bool(
+        "TPU_DCP_MERGE_CHUNKED_LSE_ONCE", default=False
+    ),
+    # Weight the transposed `[H, T, V]` partial, so the f32 term reaches the
+    # head reduce-scatter already head-major instead of through a separate
+    # whole-term relayout. Same products, same reduce-scatter.
+    "TPU_DCP_MERGE_HEAD_MAJOR": env_bool("TPU_DCP_MERGE_HEAD_MAJOR", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
