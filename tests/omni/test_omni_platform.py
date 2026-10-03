@@ -441,6 +441,45 @@ def test_tpu_group_norm_matches_reference(shape, affine):
     torch.testing.assert_close(out_b.float(), ref, rtol=2e-2, atol=2e-2)
 
 
+def _reference_rotary(x, cos, sin, interleaved):
+    # Mirrors vllm_omni.diffusion.layers.rope.apply_rotary_emb_torch for
+    # rotary_dim == head_dim with half-dim cos/sin of shape [seq, head_dim/2].
+    if interleaved:
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        rot = torch.stack((-x2, x1), dim=-1).flatten(-2)
+        cos_full = cos.repeat_interleave(2, dim=-1)
+        sin_full = sin.repeat_interleave(2, dim=-1)
+    else:
+        x1, x2 = x.chunk(2, dim=-1)
+        rot = torch.cat((-x2, x1), dim=-1)
+        cos_full = torch.cat((cos, cos), dim=-1)
+        sin_full = torch.cat((sin, sin), dim=-1)
+    return x * cos_full.unsqueeze(-2) + rot * sin_full.unsqueeze(-2)
+
+
+@pytest.mark.parametrize("interleaved", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_tpu_apply_rotary_matches_reference(interleaved, dtype):
+    """The matmul-based rotate_half is exact (0/+-1 matrix entries)."""
+    from vllm_torchtpu.omni.patches import _rope_matrices, _tpu_apply_rotary
+
+    g = torch.Generator().manual_seed(0)
+    seq, heads, dim = 16, 4, 32
+    x = torch.randn(1, seq, heads, dim, generator=g).to(dtype)
+    ang = torch.rand(seq, dim // 2, generator=g) * 6.28
+    cos, sin = ang.cos().to(dtype), ang.sin().to(dtype)
+
+    r, e = _rope_matrices(dim, interleaved, dtype, x.device)
+    assert r.shape == (dim, dim) and e.shape == (dim // 2, dim)
+    assert (r.abs().sum(0) == 1).all() and (r.abs().sum(1) == 1).all()  # permutation
+    assert (e.sum(0) == 1).all() and (e.sum(1) == 2).all()
+
+    out = _tpu_apply_rotary(x, cos, sin, interleaved)
+    ref = _reference_rotary(x, cos, sin, interleaved)
+    assert out.dtype == dtype
+    torch.testing.assert_close(out.float(), ref.float(), rtol=0, atol=0)
+
+
 def test_group_norm_patch_dispatches_on_tpu_only(monkeypatch):
     from vllm_torchtpu.omni import patches as omni_patches
 

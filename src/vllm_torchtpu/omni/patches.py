@@ -101,6 +101,107 @@ def apply_omni_tpu_patches() -> None:
 
     _patch_flow_match_scheduler_step_flush()
     _patch_group_norm_tpu()
+    _patch_rotary_embedding_tpu()
+
+
+@functools.cache
+def _rope_matrices(
+    head_dim: int, interleaved: bool, dtype: torch.dtype, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Constant matrices for ``rotate_half`` and the cos/sin half-dim expansion.
+
+    ``R`` is a signed permutation with ``x @ R == rotate_half(x)``; ``E`` maps
+    ``cos`` of shape ``[.., D/2]`` to the per-element ``[.., D]`` factor
+    (``repeat(cos, "d -> (d 2)")`` for the interleaved/GPT-J layout,
+    ``cat(cos, cos)`` for the NeoX layout). Entries are 0/+-1 so the products
+    are exact in any float dtype.
+    """
+    half = head_dim // 2
+    r = torch.zeros(head_dim, head_dim)
+    e = torch.zeros(half, head_dim)
+    idx = torch.arange(half)
+    if interleaved:
+        # out[2i] = -x[2i+1], out[2i+1] = x[2i]
+        r[2 * idx + 1, 2 * idx] = -1.0
+        r[2 * idx, 2 * idx + 1] = 1.0
+        e[idx, 2 * idx] = 1.0
+        e[idx, 2 * idx + 1] = 1.0
+    else:
+        # out[:half] = -x[half:], out[half:] = x[:half]
+        r[idx + half, idx] = -1.0
+        r[idx, idx + half] = 1.0
+        e[idx, idx] = 1.0
+        e[idx, idx + half] = 1.0
+    return r.to(dtype=dtype, device=device), e.to(dtype=dtype, device=device)
+
+
+def _tpu_apply_rotary(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool
+) -> torch.Tensor:
+    """``x * cos + rotate_half(x) * sin`` without strided slices or concats.
+
+    ``x``: ``[..., seq, heads, head_dim]``; ``cos``/``sin``: ``[seq, head_dim/2]``
+    (already in ``x.dtype``). The rotation is a ``[head_dim, head_dim]`` signed
+    permutation applied on the MXU (exact), so the whole op lowers to one
+    matmul with a fused elementwise epilogue.
+    """
+    head_dim = x.shape[-1]
+    r, e = _rope_matrices(head_dim, interleaved, x.dtype, x.device)
+    cos_full = (cos @ e).unsqueeze(-2)  # [seq, 1, head_dim], broadcast over heads
+    sin_full = (sin @ e).unsqueeze(-2)
+    return x * cos_full + (x @ r) * sin_full
+
+
+def _patch_rotary_embedding_tpu() -> None:
+    # -------------------------------------------------------------------------
+    # Root cause (XLA:TPU layout of the generic rotary implementation):
+    # vLLM-Omni's ``RotaryEmbedding.forward_native`` builds ``rotate_half`` from
+    # ``x[..., ::2]`` / ``x[..., 1::2]`` strided slices, ``stack``, ``rearrange``
+    # and ``cat`` on the minor (lane) dimension. On TPU every one of those is a
+    # relayout: per DiT layer (q and k) XLA emits ~8 copy/reshape/as_strided ops
+    # over ``[4128, 30, 128]`` bf16, ~36 ms of a 158 ms Z-Image-Turbo denoise
+    # step on tpu7x (23%) for an op whose HBM roofline is <2 ms.
+    #
+    # Fix: express rotate_half as ``x @ R`` with a constant signed-permutation
+    # matrix (exact), and the half-dim cos/sin expansion as ``cos @ E``; XLA
+    # then emits one small matmul with the multiply-add fused as its epilogue.
+    # Numerics are identical to the reference formula (same bf16 products).
+    #
+    # REMOVAL CONDITION: vLLM-Omni grows a TPU/XLA-friendly rotary path (or
+    # ``forward_native`` stops slicing the minor dim), or torch_tpu fuses
+    # strided minor-dim slices without materialising them.
+    # -------------------------------------------------------------------------
+    try:
+        rope_mod = importlib.import_module("vllm_omni.diffusion.layers.rope")
+        rotary_cls = rope_mod.RotaryEmbedding
+    except Exception:  # noqa: BLE001 - vllm_omni is an omni extra
+        logger.warning("vllm_omni rope module not importable; rotary patch skipped.")
+        return
+
+    orig_forward_native = _unwrap_tpu_patch(rotary_cls.forward_native)
+
+    def _forward_native(
+        self: Any, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        if x.device.type != "tpu" or x.dim() < 3:
+            return orig_forward_native(self, x, cos, sin)
+        cos_h, sin_h = self._prepare_half_head_dim_cos_sin(cos, sin)
+        if (
+            cos_h.dim() != 2
+            or cos_h.shape[-1] * 2 != x.shape[-1]
+            or cos_h.shape != sin_h.shape
+        ):
+            # Partial rotary dims or per-batch cos/sin: keep the generic path.
+            return orig_forward_native(self, x, cos, sin)
+        return _tpu_apply_rotary(
+            x, cos_h.to(x.dtype), sin_h.to(x.dtype), bool(self.interleaved)
+        )
+
+    rotary_cls.forward_native = _mark_tpu_patch(_forward_native, orig_forward_native)
+    logger.info(
+        "Applied TPU patch: matmul-based rotate_half in RotaryEmbedding.forward_native "
+        "(avoids minor-dim strided-slice relayouts)."
+    )
 
 
 def _tpu_group_norm(
