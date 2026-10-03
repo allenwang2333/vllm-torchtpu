@@ -5,7 +5,10 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_torchtpu.models.vllm.deepseek_v41.attention import _row_slots
+from vllm_torchtpu.models.vllm.deepseek_v41.attention import (
+    _request_row_slots,
+    _row_slots,
+)
 from vllm_torchtpu.models.vllm.deepseek_v41.attention_kernels import (
     paged_index_scores_jax,
 )
@@ -28,6 +31,19 @@ def test_row_slots_matches_elementwise_gather(width):
         + safe % rows_per_page
     )
     torch.testing.assert_close(_row_slots(cache, table, requests, logical), expected)
+
+
+@pytest.mark.parametrize("width", [7, 300, 2560, 4000])
+def test_request_row_slots_matches_token_row_slots(width):
+    rows_per_page = 32
+    generator = torch.Generator().manual_seed(width)
+    table = torch.randint(0, 1000, (4, 90), generator=generator, dtype=torch.int32)
+    requests = torch.randint(0, 4, (17,), generator=generator)
+    cache = torch.empty((1, rows_per_page))
+    logical = torch.arange(width)[None, :].expand(requests.shape[0], -1)
+    expected = _row_slots(cache, table, requests, logical)
+    got = _request_row_slots(cache, table, width).index_select(0, requests)
+    torch.testing.assert_close(got, expected)
 
 
 @pytest.mark.parametrize("elements,fp32", [(512, False), (128, False), (64, True)])

@@ -306,6 +306,34 @@ def _row_slots(cache, block_table, requests, logical):
     return blocks * cache.shape[1] + safe % cache.shape[1]
 
 
+def _request_row_slots(cache, block_table, width):
+    """Slots of logical rows ``0..width-1`` for every request: ``[requests, width]``.
+
+    Every token of a request scans the same capacity-wide rows, so address
+    them once per request instead of once per token.
+    """
+    rows_per_page = cache.shape[1]
+    # Logical row r lives in table column r // rows_per_page, so repeating each
+    # column rows_per_page times lines blocks up with rows 0..width-1 without
+    # a full-width gather (16-40x slower on TPU, see _row_slots).
+    blocks = (
+        block_table[:, :, None]
+        .expand(-1, -1, rows_per_page)
+        .reshape(block_table.shape[0], -1)
+        .long()
+    )
+    offsets = (
+        torch.arange(width, device=block_table.device).clamp(max=blocks.shape[1] - 1)
+        % rows_per_page
+    )
+    if width > blocks.shape[1]:
+        # Match _row_slots' clamp to the table's last row.
+        blocks = torch.cat(
+            (blocks, blocks[:, -1:].expand(-1, width - blocks.shape[1])), dim=1
+        )
+    return blocks[:, :width] * rows_per_page + offsets
+
+
 def _read_rows(cache, block_table, requests, logical):
     slots = _row_slots(cache, block_table, requests, logical)
     return cache[slots // cache.shape[1], slots % cache.shape[1]]
@@ -538,16 +566,17 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     keys_meta = metadata[indexer.k_cache.prefix]
                     index_cache = indexer.k_cache.kv_cache
                     if tiled:
-                        slots = _row_slots(
-                            index_cache,
-                            _block_table(keys_meta),
-                            requests,
-                            logical_compressed,
-                        )
+                        # Rows are row_indices of _row_slots(..., logical_compressed),
+                        # computed per request: [requests, capacity] -> [T, capacity].
+                        index_records = index_cache.row_indices(
+                            _request_row_slots(
+                                index_cache, _block_table(keys_meta), capacity
+                            )
+                        ).index_select(0, requests)
                         selected = self._select_paged_indices(
                             index_q,
                             index_cache,
-                            index_cache.row_indices(slots),
+                            index_records,
                             weights,
                             lengths,
                             swa_slots,
