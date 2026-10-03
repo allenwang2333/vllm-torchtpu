@@ -1,5 +1,6 @@
 """TPU MLA and compressor adapters with upstream cache ownership."""
 
+import dataclasses
 from collections.abc import Callable
 from typing import cast
 
@@ -11,7 +12,7 @@ from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
-from .attention_kernels import paged_attention, paged_indexer
+from .attention_kernels import paged_attention, paged_indexer, sparse_fp8_attention
 from .cache import NativeCacheView, PagedCacheRows, write_cache
 from .ops import device_hooks, rms_norm, rotary, round_fp8_activation
 
@@ -259,6 +260,8 @@ class AttentionBackend(compressor_upstream.CompressorBackend):
 class SWACache(NativeCacheView, DeepseekV4SWACache):
     def __init__(self, *args, **kwargs):
         kwargs["block_size"] = kwargs["cache_config"].block_size
+        # FP8 applies to the compressed main KV only; SWA rows stay BF16.
+        kwargs["dtype"] = torch.bfloat16
         kwargs["backend_cls"] = AttentionBackend
         super().__init__(*args, **kwargs)
 
@@ -331,11 +334,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             device_hooks(torch.cuda, Event=lambda: None),
         ):
             super().__init__(vllm_config, *args, **kwargs)
-        if self.kv_cache_torch_dtype != torch.bfloat16:
+        if self.kv_cache_torch_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
             raise NotImplementedError(
-                "TPU V4.1 currently supports BF16 KV cache; use "
-                "--kv-cache-dtype auto or bfloat16"
+                "TPU V4.1 supports --kv-cache-dtype auto, bfloat16 or fp8"
             )
+        # FP8 main KV uses DSV4's packed record (448 e4m3 + 64 e8m0 bytes)
+        # plus a BF16 RoPE companion; see cache.encode_fp8_kv.
+        self._fp8_kv = self.kv_cache_torch_dtype == torch.float8_e4m3fn
         self.register_buffer(
             "_tpu_rope_cache", self.rotary_emb.cos_sin_cache, persistent=False
         )
@@ -343,6 +348,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         self._max_model_len = vllm_config.model_config.max_model_len
         object.__setattr__(self, "mla_attn", self)
         self._prepare_and_attn_fn = self._prepare_tpu
+
+    def get_kv_cache_spec(self, vllm_config):
+        spec = super().get_kv_cache_spec(vllm_config)
+        if spec is None or not self._fp8_kv:
+            return spec
+        return dataclasses.replace(spec, dtype=torch.uint8, page_size_padded=None)
 
     def _run_parallel_input_projections(self, hidden_states):
         qr_kv = self._fused_wqa_wkv_gemm(hidden_states)
@@ -599,7 +610,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if tiled:
             slots = _row_slots(swa_cache, swa_table, requests, logical)
             records = swa_cache.row_indices(slots).masked_fill(~valid_window, -1)
-            result = paged_attention(
+            attend = (
+                sparse_fp8_attention
+                if self._fp8_kv and self.compress_ratio
+                else paged_attention
+            )
+            result = attend(
                 q,
                 swa_cache,
                 main_cache,
@@ -610,6 +626,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             )
             output.copy_(result.masked_fill((swa_slots < 0)[:, None, None], 0))
             return
+        if self._fp8_kv and self.compress_ratio:
+            raise NotImplementedError("FP8 V4.1 KV cache requires the tiled path")
         rows = cast(torch.Tensor, rows)
         indices = (
             torch.arange(rows.shape[1], device=rows.device)[None, :]

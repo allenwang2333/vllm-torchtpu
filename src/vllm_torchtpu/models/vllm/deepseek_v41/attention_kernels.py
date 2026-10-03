@@ -1,5 +1,7 @@
 """Paged attention, exact index selection and index-cache publication."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import torch
@@ -7,6 +9,60 @@ import torch
 from .cache import gather_cache_values, scatter_cache_values
 
 _attention_op = None
+_fp8_attention_op = None
+
+
+def _attention_state(q):
+    tokens, heads, _ = q.shape
+    return (
+        jnp.full((tokens, heads), -1e30, jnp.float32),
+        jnp.zeros((tokens, heads), jnp.float32),
+        jnp.zeros(q.shape, jnp.float32),
+    )
+
+
+def _attend(q, pool, records, state, scale, tile=64):
+    """Online-softmax accumulate one record set into (max, denominator, numerator)."""
+    tokens, _, dim = q.shape
+    width = records.shape[1]
+    if not width:
+        return state
+    records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
+
+    # Gather BF16 rows once outside; keep FP32 scratch tiled.
+    gathered = gather_cache_values(pool, records.reshape(-1), dim).reshape(
+        tokens, records.shape[1], dim
+    )
+
+    def step(index, carry):
+        maximum, denominator, numerator = carry
+        addresses = jax.lax.dynamic_slice_in_dim(records, index * tile, tile, axis=1)
+        valid = addresses >= 0
+        kv = jax.lax.dynamic_slice_in_dim(gathered, index * tile, tile, axis=1)
+        kv = jnp.where(valid[..., None], kv, 0)
+        scores = (
+            jnp.einsum(
+                "thd,tkd->thk",
+                q.astype(jnp.float32),
+                kv.astype(jnp.float32),
+                preferred_element_type=jnp.float32,
+            )
+            * scale
+        )
+        scores = jnp.where(valid[:, None], scores, -jnp.inf)
+        new_max = jnp.maximum(maximum, scores.max(-1))
+        correction = jnp.exp(maximum - new_max)
+        exponentials = jnp.exp(scores - new_max[..., None])
+        denominator = denominator * correction + exponentials.sum(-1)
+        numerator = numerator * correction[..., None] + jnp.einsum(
+            "thk,tkd->thd",
+            exponentials.astype(jnp.bfloat16),
+            kv,
+            preferred_element_type=jnp.float32,
+        )
+        return new_max, denominator, numerator
+
+    return jax.lax.fori_loop(0, records.shape[1] // tile, step, state)
 
 
 def paged_attention_jax(
@@ -18,68 +74,70 @@ def paged_attention_jax(
     sink: jax.Array,
     scale: float,
 ) -> jax.Array:
-    tokens, heads, dim = q.shape
-    tile = 64
-    state = (
-        jnp.full((tokens, heads), -1e30, jnp.float32),
-        jnp.zeros((tokens, heads), jnp.float32),
-        jnp.zeros(q.shape, jnp.float32),
-    )
-
-    def attend(pool, records, state):
-        width = records.shape[1]
-        if not width:
-            return state
-        records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
-
-        # Gather BF16 rows once outside; keep FP32 scratch tiled.
-        gathered = gather_cache_values(pool, records.reshape(-1), dim).reshape(
-            tokens, records.shape[1], dim
-        )
-
-        def step(index, carry):
-            maximum, denominator, numerator = carry
-            addresses = jax.lax.dynamic_slice_in_dim(
-                records, index * tile, tile, axis=1
-            )
-            valid = addresses >= 0
-            kv = jax.lax.dynamic_slice_in_dim(gathered, index * tile, tile, axis=1)
-            kv = jnp.where(valid[..., None], kv, 0)
-            scores = (
-                jnp.einsum(
-                    "thd,tkd->thk",
-                    q.astype(jnp.float32),
-                    kv.astype(jnp.float32),
-                    preferred_element_type=jnp.float32,
-                )
-                * scale
-            )
-            scores = jnp.where(valid[:, None], scores, -jnp.inf)
-            new_max = jnp.maximum(maximum, scores.max(-1))
-            correction = jnp.exp(maximum - new_max)
-            exponentials = jnp.exp(scores - new_max[..., None])
-            denominator = denominator * correction + exponentials.sum(-1)
-            numerator = numerator * correction[..., None] + jnp.einsum(
-                "thk,tkd->thd",
-                exponentials.astype(jnp.bfloat16),
-                kv,
-                preferred_element_type=jnp.float32,
-            )
-            return new_max, denominator, numerator
-
-        return jax.lax.fori_loop(0, records.shape[1] // tile, step, state)
-
     # SWA widths in the released model are multiples of 64, preserving the
     # reference's accumulation boundaries when compressed rows follow.
-    maximum, denominator, numerator = attend(
-        main_pool, main_records, attend(swa_pool, swa_records, state)
+    maximum, denominator, numerator = _attend(
+        q,
+        main_pool,
+        main_records,
+        _attend(q, swa_pool, swa_records, _attention_state(q), scale),
+        scale,
     )
     denominator += jnp.exp(sink.astype(jnp.float32)[None] - maximum)
     return (numerator / denominator[..., None]).astype(q.dtype)
 
 
+def compact_records(records: jax.Array) -> jax.Array:
+    """Pad to 128 columns and move -1 to the tail: sparse_mla's valid prefix."""
+    width = records.shape[1]
+    padded = max(128, -(-width // 128) * 128)
+    records = jnp.pad(records, ((0, 0), (0, padded - width)), constant_values=-1)
+    limit = jnp.iinfo(jnp.int32).max
+    records = jnp.sort(jnp.where(records >= 0, records, limit), axis=-1)
+    return jnp.where(records == limit, -1, records)
+
+
+def sparse_fp8_attention_jax(
+    q: jax.Array,
+    swa_pool: jax.Array,
+    main_pool: jax.Array,
+    rope_pool: jax.Array,
+    swa_records: jax.Array,
+    main_records: jax.Array,
+    sink: jax.Array,
+    scale: float,
+) -> jax.Array:
+    """BF16 SWA partial merged into V4's sparse MLA over FP8 NoPE + RoPE rows.
+
+    Records are physical pool rows, so the whole pool is passed as one page
+    (identity page table); the RoPE companion holds row r's 32 words at r.
+    """
+    from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import (
+        sparse_ragged_paged_attention,
+    )
+
+    maximum, denominator, numerator = _attend(
+        q, swa_pool, swa_records, _attention_state(q), scale
+    )
+    rows = main_pool.shape[0]
+    return sparse_ragged_paged_attention(
+        q,
+        main_pool.reshape(1, rows, main_pool.shape[1]),
+        rope_pool.reshape(1, *rope_pool.shape),
+        compact_records(main_records),
+        jnp.zeros((1,), jnp.int32),
+        jnp.array([0, q.shape[0]], jnp.int32),
+        jnp.array([0, 0, 1], jnp.int32),
+        sink.astype(jnp.float32),
+        numerator.astype(q.dtype),
+        denominator,
+        maximum,
+        sm_scale=scale,
+    )
+
+
 def initialize_paged_attention():
-    global _attention_op
+    global _attention_op, _fp8_attention_op
     if _attention_op is not None:
         return
     from jax.sharding import PartitionSpec as P
@@ -96,12 +154,55 @@ def initialize_paged_attention():
         input_partition_specs=(P(), P(), P(), P(), P(), P(), None),
     )
     _attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
+    mesh = get_vllm_model_wrapper_context().mesh
+
+    def fp8_attention(
+        q: jax.Array,
+        swa_pool: jax.Array,
+        main_pool: jax.Array,
+        rope_pool: jax.Array,
+        swa_records: jax.Array,
+        main_records: jax.Array,
+        sink: jax.Array,
+        scale: float,
+    ) -> jax.Array:
+        # Mosaic calls require explicit manual partitioning on a multi-device
+        # mesh; each device attends over its own replicated cache.
+        return jax.shard_map(
+            functools.partial(sparse_fp8_attention_jax, scale=scale),
+            mesh=mesh,
+            in_specs=(P(),) * 7,
+            out_specs=P(),
+            check_vma=False,
+        )(q, swa_pool, main_pool, rope_pool, swa_records, main_records, sink)
+
+    _fp8_attention_op = pallas.jax_op(
+        "pallas::deepseek_v41_sparse_fp8_attention",
+        fp8_attention,
+        mesh=mesh,
+        input_partition_specs=(P(), P(), P(), P(), P(), P(), P(), None),
+    )
+    _fp8_attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
 
 def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
     assert _attention_op is not None
     return _attention_op(
         q, swa.raw, main.raw, swa_records.int(), main_records.int(), sink, scale
+    )
+
+
+def sparse_fp8_attention(q, swa, main, swa_records, main_records, sink, scale):
+    assert _fp8_attention_op is not None and main.rope is not None
+    return _fp8_attention_op(
+        q,
+        swa.raw,
+        main.raw,
+        main.rope,
+        swa_records.int(),
+        main_records.int(),
+        sink,
+        scale,
     )
 
 
