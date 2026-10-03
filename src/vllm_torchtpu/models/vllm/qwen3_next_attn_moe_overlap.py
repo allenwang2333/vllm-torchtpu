@@ -213,6 +213,10 @@ def apply_qwen3_next_attn_moe_overlap_patch() -> None:
     global _PATCH_APPLIED
     if _PATCH_APPLIED:
         return
+    # Registered as always-active: with the overlap off, leave the decoder
+    # layers (and the fused-EP / SP MoE paths it cannot serve) alone.
+    if not envs.TPU_ATTN_MOE_OVERLAP:
+        return
 
     tpu_moe_sp = getattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", False) or (
         os.environ.get("TPU_MOE_SEQUENCE_PARALLEL", "0").strip().lower()
