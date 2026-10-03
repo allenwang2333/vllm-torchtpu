@@ -57,7 +57,7 @@ def reference(blocks):
     return jnp.sum(blocks.astype(jnp.float32), axis=0).astype(blocks.dtype)
 
 
-def _oneshot(x, n, axis, rank, collective_id):
+def _oneshot(x, n, axis, rank, collective_id, cost_bytes=0):
     rows, hidden = x.shape
     dict_ids = rank is not None
 
@@ -90,10 +90,11 @@ def _oneshot(x, n, axis, rank, collective_id):
         scratch,
         collective_id,
         f"small_all_reduce_oneshot_r{rows}",
+        cost_bytes,
     )
 
 
-def _twoshot(x, n, axis, rank, collective_id):
+def _twoshot(x, n, axis, rank, collective_id, cost_bytes=0):
     rows, hidden = x.shape
     own = hidden // n
     dict_ids = rank is not None
@@ -141,11 +142,19 @@ def _twoshot(x, n, axis, rank, collective_id):
         scratch,
         collective_id,
         f"small_all_reduce_twoshot_r{rows}",
+        cost_bytes,
     )
 
 
 def small_all_reduce(
-    x, *, num_cores, axis, rank=None, form=None, collective_id=COLLECTIVE_ID
+    x,
+    *,
+    num_cores,
+    axis,
+    rank=None,
+    form=None,
+    collective_id=COLLECTIVE_ID,
+    cost_bytes=0,
 ):
     """The sum of ``x`` over the ``num_cores`` cores of mesh axis ``axis``,
     inside a shard_map over that axis.
@@ -156,6 +165,8 @@ def small_all_reduce(
       rank: int32 [1], this core's index on the axis as data (the torch
         bridge), or None to read it from the axis.
       form: "oneshot" or "twoshot"; by default ``form_for`` the block.
+      cost_bytes: if > 0, the HBM bytes XLA's cost model charges the call (a
+        scheduling hint; see ``common.call``).
     """
     rows, hidden = x.shape
     if hidden % (num_cores * LANES):
@@ -164,4 +175,4 @@ def small_all_reduce(
         )
     form = form or form_for(rows, hidden, jnp.dtype(x.dtype).itemsize)
     build = {"oneshot": _oneshot, "twoshot": _twoshot}[form]
-    return build(x, num_cores, axis, rank, collective_id)
+    return build(x, num_cores, axis, rank, collective_id, cost_bytes)

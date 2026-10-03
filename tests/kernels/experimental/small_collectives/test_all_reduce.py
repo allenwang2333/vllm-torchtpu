@@ -36,10 +36,17 @@ from .oracle import (
 pytestmark = pytest.mark.multichip
 
 
-def _all_reduce(mesh, per_core, ranks, *, rank_operand=True, form=None):
+def _all_reduce(
+    mesh, per_core, ranks, *, rank_operand=True, form=None, cost_bytes=0
+):
     def body(x, r):
         return ar.small_all_reduce(
-            x, num_cores=N, axis=AXIS, rank=r if rank_operand else None, form=form
+            x,
+            num_cores=N,
+            axis=AXIS,
+            rank=r if rank_operand else None,
+            form=form,
+            cost_bytes=cost_bytes,
         )
 
     return run_sharded(mesh, body, per_core, ranks)
@@ -95,6 +102,35 @@ def test_a_wrong_rank_order_fails_the_oracle(mesh):
     want, tolerance = exact_sum(per_core), sum_tolerance(per_core)
     for core in (0, 1):
         assert not within(got[core], want, tolerance).all()
+
+
+@pytest.mark.parametrize("form", ["oneshot", "twoshot"])
+def test_a_cost_estimate_leaves_the_sum_alone(mesh, form):
+    """TPU_SMALL_ALL_REDUCE_COST_BYTES is a scheduling hint only."""
+    per_core = blocks((N, 16, 6144), seed=21)
+    got = _all_reduce(mesh, per_core, range(N), form=form, cost_bytes=40_000_000)
+    _check(got, per_core)
+
+
+def test_a_cost_estimate_reaches_the_custom_call():
+    """The hint is in the lowered kernel's backend config, and absent at 0."""
+
+    def lowered(cost_bytes):
+        mesh = jax.sharding.AbstractMesh((N,), (AXIS,))
+        fn = jax.shard_map(
+            lambda x: ar.small_all_reduce(
+                x, num_cores=N, axis=AXIS, cost_bytes=cost_bytes
+            ),
+            mesh=mesh,
+            in_specs=jax.sharding.PartitionSpec(AXIS),
+            out_specs=jax.sharding.PartitionSpec(AXIS),
+            check_vma=False,
+        )
+        x = jax.ShapeDtypeStruct((N * 16, 6144), jnp.bfloat16)
+        return jax.jit(fn).trace(x).lower(lowering_platforms=("tpu",)).as_text()
+
+    assert "40000000" in lowered(40_000_000)
+    assert "bytes_accessed" not in lowered(0)
 
 
 def test_refuses_a_width_that_does_not_split():

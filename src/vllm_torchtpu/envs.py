@@ -164,6 +164,7 @@ if TYPE_CHECKING:
     TPU_SMALL_ALL_REDUCE: bool = False
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
     TPU_SMALL_ALL_REDUCE_DRAFT: bool = False
+    TPU_SMALL_ALL_REDUCE_COST_BYTES: int = 0
     TPU_FP8_LINEAR_PALLAS: bool = False
     TPU_SAMPLER_VOCAB_PARALLEL: bool = False
     TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
@@ -1046,6 +1047,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and loop-step programs. The row choice is taken per compiled bucket inside
     # the JAX op (XLA's all-reduce above the cap), so no trace forks.
     "TPU_SMALL_ALL_REDUCE_DRAFT": env_bool("TPU_SMALL_ALL_REDUCE_DRAFT"),
+    # HBM bytes XLA's cost model charges each small all-reduce kernel; 0 (the
+    # default) attaches no estimate, which XLA costs at zero. A nonzero value
+    # gives memory-space assignment time to hide a weight prefetch behind the
+    # all-reduce: the next layer's fused q_a+kv_a fp8 weight (16 MB) is
+    # otherwise read whole from HBM in every MoE layer, since the grouped
+    # GEMMs before it hold ~60 MB of scoped VMEM.
+    "TPU_SMALL_ALL_REDUCE_COST_BYTES": env_nonnegative_int(
+        "TPU_SMALL_ALL_REDUCE_COST_BYTES", 0
+    ),
     # Per-channel FP8 dense linears whose decode weight XLA reads from HBM: route
     # M <= 16 through the weight-streaming Pallas kernel
     # (kernels/quantized_matmul/fp8_skinny.py), XLA otherwise. Outputs differ from

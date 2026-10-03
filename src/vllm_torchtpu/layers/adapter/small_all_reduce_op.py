@@ -94,7 +94,11 @@ def _build_all_reduce(mesh, psum_above: int | None = None):
         if psum_above is not None and block.shape[0] > psum_above:
             return jax.lax.psum(block, EP_AXIS_NAME)
         return all_reduce.small_all_reduce(
-            block, num_cores=n, axis=EP_AXIS_NAME, rank=rank
+            block,
+            num_cores=n,
+            axis=EP_AXIS_NAME,
+            rank=rank,
+            cost_bytes=envs.TPU_SMALL_ALL_REDUCE_COST_BYTES,
         )
 
     def fn(x: jax.Array, rank: jax.Array) -> jax.Array:

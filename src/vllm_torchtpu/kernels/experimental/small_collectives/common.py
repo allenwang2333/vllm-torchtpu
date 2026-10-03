@@ -82,7 +82,14 @@ def sum_slots(slots, n):
     return acc
 
 
-def call(kernel, x, out_rows, rank, scratch, collective_id, name):
+def call(kernel, x, out_rows, rank, scratch, collective_id, name, cost_bytes=0):
+    """``cost_bytes`` > 0 attaches a cost estimate of that many HBM bytes.
+
+    It is a scheduling hint, not the kernel's traffic: without an estimate XLA
+    costs the custom call at zero, so memory-space assignment sees no time to
+    hide a weight prefetch behind it, although the call itself takes ~11 us
+    and usually also waits for the slowest peer.
+    """
     rank_specs = [pl.BlockSpec(memory_space=pltpu.SMEM)] if rank is not None else []
     args = (() if rank is None else (rank.astype(jnp.int32),)) + (x,)
     return pl.pallas_call(
@@ -91,5 +98,10 @@ def call(kernel, x, out_rows, rank, scratch, collective_id, name):
         in_specs=[*rank_specs, pl.BlockSpec()],
         scratch_shapes=scratch,
         compiler_params=pltpu.CompilerParams(collective_id=collective_id),
+        cost_estimate=(
+            pl.CostEstimate(flops=0, transcendentals=0, bytes_accessed=cost_bytes)
+            if cost_bytes
+            else None
+        ),
         name=name,
     )(*args)
