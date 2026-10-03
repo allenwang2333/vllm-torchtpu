@@ -1361,6 +1361,7 @@ class KVCacheManager:
         kv_caches: dict[str, torch.Tensor] = {}
         native_raw_cache = None
         native_cache_layouts = None
+        native_rope_pools = None
         if use_upstream_allocator:
             from vllm_torchtpu.models.vllm.deepseek_v41.cache import (
                 materialize_upstream_kv_cache,
@@ -1386,6 +1387,7 @@ class KVCacheManager:
             )
             native_raw_cache = materialized.native_raw_cache
             native_cache_layouts = materialized.native_cache_layouts
+            native_rope_pools = materialized.rope_pools
         # Actual leading-dim block count used for mamba state arrays, captured
         # at allocation time so the slot pool below is sized to exactly what
         # was allocated (compact `_mamba_num_blocks`, or uniform `num_blocks`).
@@ -1730,6 +1732,7 @@ class KVCacheManager:
             self.runner.kv_caches,
             native_raw_cache=native_raw_cache,
             native_cache_layouts=native_cache_layouts,
+            native_rope_pools=native_rope_pools,
         )
 
         # Pre-build and cache bundled RPA kernels across all attention layers before

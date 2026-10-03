@@ -467,6 +467,10 @@ class TPUWorker(WorkerBase):
         vllm_utils.report_usage_stats(self.vllm_config)
 
     def determine_available_memory(self) -> int:
+        from vllm_torchtpu.models.vllm.deepseek_v41.cache import (
+            reserve_rope_companion,
+        )
+
         # To determine a reasonable kv_cache_memory_bytes for a specific vllm
         # setup, users can run vllm without this flag, and collect the
         # total_hbm_avail_gb value logged later in this function.
@@ -482,7 +486,7 @@ class TPUWorker(WorkerBase):
                 "correspondingly."
             )
             logger.info(msg)
-            return kv_cache_memory_bytes
+            return reserve_rope_companion(self.vllm_config, kv_cache_memory_bytes)
 
         # VLLM directive of the percentage of HBM memory the model executor can use
         self.model_runner.profile_run(self.model_runner.max_num_tokens)
@@ -528,7 +532,7 @@ class TPUWorker(WorkerBase):
                 f"increasing --gpu-memory-utilization from "
                 f"{gpu_memory_utilization} to a larger value."
             )
-        return available
+        return reserve_rope_companion(self.vllm_config, available)
 
     def execute_model(self, scheduler_output):
         return self.model_runner.execute_model(scheduler_output)
