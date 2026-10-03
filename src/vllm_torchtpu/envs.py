@@ -142,6 +142,8 @@ if TYPE_CHECKING:
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     VLLM_TPU_MOE_SEQUENCE_PARALLEL: str = "off"
     VLLM_TPU_MOE_SP_GATE_AFTER_GATHER: bool = True
+    VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER: bool = False
+    VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS: int = 257
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
 
 
@@ -902,6 +904,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tensor. Removes one collective launch per MoE layer; set to 0 for A/B.
     "VLLM_TPU_MOE_SP_GATE_AFTER_GATHER": env_bool(
         "VLLM_TPU_MOE_SP_GATE_AFTER_GATHER", True
+    ),
+    # Quantize sequence-parallel [T/TP, H] rows to FP8 before the pre-attention
+    # TP all-gather and pass the gathered (x_q, x_s) directly into per-channel
+    # FP8 attention input projections. Halves pre-attention all-gather bytes
+    # and shrinks activation quantization compute by 1/TP.
+    "VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER": lambda: (
+        env_bool("VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER")()
+        or env_bool("TPU_SEQUENCE_PARALLEL_FP8_GATHER")()
+    ),
+    # Minimum step token count at which sequence-parallel pre-attention FP8
+    # gather is active. 0 (default) auto-selects 16 * tp_size**2 + 1 (257 on
+    # TP=4, 1025 on TP=8) so small decode/mixed steps keep a single
+    # latency-bound BF16 all-gather launch.
+    "VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS", 0
     ),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
