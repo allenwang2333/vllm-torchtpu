@@ -25,7 +25,7 @@ USE_MOE_FUSED_EP_KERNEL=1):
 """
 
 from itertools import islice
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.distributed import (
@@ -45,6 +45,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+linear_common: Any = None
+
+UPSTREAM_ATTENTION_FORWARD = qwen3_next.Qwen3NextAttention.forward
 UPSTREAM_DECODER_LAYER_FORWARD = qwen3_next.Qwen3NextDecoderLayer.forward
 UPSTREAM_MODEL_FORWARD = qwen3_next.Qwen3NextModel.forward
 _QWEN3_NEXT_MOE_MODEL_TYPES = frozenset(
@@ -52,10 +55,38 @@ _QWEN3_NEXT_MOE_MODEL_TYPES = frozenset(
 )
 
 
+def _get_linear_common() -> Any:
+    global linear_common
+    if linear_common is None:
+        from vllm_torchtpu.layers.adapter import linear_common as _lc
+
+        linear_common = _lc
+    return linear_common
+
+
 def _check_tokens_divide_by_tp(num_tokens: int) -> None:
     tp_size = get_tensor_model_parallel_world_size()
     if tp_size > 1:
         torch._check(num_tokens % tp_size == 0)
+
+
+def patched_attention_forward(
+    self,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    if prequant is None:
+        return UPSTREAM_ATTENTION_FORWARD(
+            self, positions=positions, hidden_states=hidden_states
+        )
+    qkv = _get_linear_common().project_prequant(self.qkv_proj, hidden_states, prequant)
+    q, k, v, gate = self._project_qkv_gate(qkv, positions)
+    attn_output = self.attn(q, k, v)
+    if gate is not None:
+        attn_output = attn_output * torch.sigmoid(gate)
+    output, _ = self.o_proj(attn_output)
+    return output
 
 
 def patched_decoder_layer_forward(
@@ -73,16 +104,31 @@ def patched_decoder_layer_forward(
     else:
         hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+    attn_kwargs: dict[str, object] = {}
     if self.use_attn_reduce_scatter_for_moe:
-        hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-        hidden_states = hidden_states.narrow(0, 0, full_num_tokens)
+        min_fp8_tokens = envs.VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS or (
+            16 * get_tensor_model_parallel_world_size() ** 2 + 1
+        )
+        if (
+            envs.VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER
+            and full_num_tokens >= min_fp8_tokens
+        ):
+            x_q, x_s = _get_linear_common().quantize_rows(hidden_states)
+            x_q = tensor_model_parallel_all_gather(x_q, 0).narrow(0, 0, full_num_tokens)
+            x_s = tensor_model_parallel_all_gather(x_s, 0).narrow(0, 0, full_num_tokens)
+            attn_kwargs["prequant"] = (x_q, x_s)
+            hidden_states = x_q
+        else:
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+            hidden_states = hidden_states.narrow(0, 0, full_num_tokens)
 
     if self.layer_type == "linear_attention":
-        hidden_states = self.linear_attn(hidden_states=hidden_states)
+        hidden_states = self.linear_attn(hidden_states=hidden_states, **attn_kwargs)
     elif self.layer_type == "full_attention":
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             positions=positions,
+            **attn_kwargs,
         )
     else:
         raise ValueError("Invalid layer_type")
@@ -194,7 +240,17 @@ def maybe_patch_qwen3_next(model_config: "ModelConfig | None" = None) -> bool | 
         or model_config.hf_config.model_type not in _QWEN3_NEXT_MOE_MODEL_TYPES
     ):
         return False
+    if envs.VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER:
+        lc = _get_linear_common()
+        lc._get_quantize_rows_op()
+        lc._get_prequant_matmul_op()
+        qwen3_next.Qwen3NextAttention.forward = patched_attention_forward
     qwen3_next.Qwen3NextDecoderLayer.forward = patched_decoder_layer_forward
     qwen3_next.Qwen3NextModel.forward = patched_model_forward
-    logger.info("Applied TPU patch: Qwen3Next trace-stable sequence-parallel forward.")
+    logger.info(
+        "Applied TPU patch: Qwen3Next trace-stable sequence-parallel forward "
+        "(fp8_gather=%s, min_tokens=%d).",
+        envs.VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER,
+        envs.VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS,
+    )
     return None
