@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import torch
 from torch.nn import Parameter
 from torch_tpu._internal import pallas
+from vllm.compilation import backends as vllm_compilation_backends
 from vllm.config import CacheConfig, get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import mla_attention
@@ -57,8 +58,14 @@ from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     VllmTPUDeepseekV32IndexerBackend,
 )
-from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.layers.adapter.cp_mla_attention import dcp_q_hybrid_gathers
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+    quantized_matmul,
+)
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.utils import synchronize_tensors
@@ -1262,6 +1269,49 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         """The projection that produces `q`, whichever of the two is wired."""
         return self.q_b_proj if self.q_lora_rank is not None else self.q_proj
 
+    def _q_proj(self, x: torch.Tensor, local: bool) -> torch.Tensor:
+        """Run the q projection; `local` keeps only this rank's heads.
+
+        Under query replication the projection's weight spans the whole DCP
+        group's heads. `local` (the `TPU_DCP_Q_HYBRID` small-bucket path)
+        contracts against this rank's column slice of that same weight -- a
+        view, so no second, head-sharded copy is held -- and returns
+        `[T, num_heads * qk_head_dim]`. Head `h` of the group is columns
+        `[h * qk_head_dim, (h + 1) * qk_head_dim)`, so rank `r`'s heads are one
+        contiguous column block, the same heads `_local_view` picks.
+        """
+        layer = self._q_proj_layer()
+        if not local:
+            return layer(x)[0]
+        group = self.dcp_group_size
+        weight = getattr(layer, "weight", None)
+        scale = getattr(layer, "weight_scale", None)
+        keep = getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+        if (
+            isinstance(getattr(layer, "quant_method", None), VllmFp8LinearMethodTPU)
+            and getattr(layer, "bias", None) is None
+            and weight is not None
+            and scale is not None
+            and weight.dim() == 2
+            and (keep or getattr(layer, WEIGHT_FLIPPED_ATTR, False))
+        ):
+            n_total = weight.shape[0] if keep else weight.shape[1]
+            if n_total % group == 0 and scale.shape[-1] == n_total:
+                n = n_total // group
+                start = int(layer.rank_in_group) * n
+                w = (
+                    weight[start : start + n].transpose(0, 1)
+                    if keep
+                    else weight[:, start : start + n]
+                )
+                return quantized_matmul(x, w, scale[..., start : start + n])
+        # Any other linear method: project every group head and keep ours.
+        # Correct, and still skips the full-head absorb; only the q_b read
+        # stays group-wide.
+        full = layer(x)[0]
+        heads = full.view(-1, self.num_heads * group, self.qk_head_dim)
+        return layer._local_view(heads).reshape(full.shape[0], -1)
+
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if hasattr(super(), "process_weights_after_loading"):
             super().process_weights_after_loading(act_dtype)
@@ -1280,6 +1330,18 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         kv_lora = None
         output_gate = None
 
+        # `TPU_DCP_Q_HYBRID`: small backbone buckets (and every draft step)
+        # leave query replication for the local-heads + fused-gather path.
+        q_local = (
+            self.dcp_q_replicate
+            and self.is_sparse
+            and dcp_q_hybrid_gathers(
+                hidden_states.shape[0],
+                per_bucket=vllm_compilation_backends.model_tag == "backbone",
+            )
+        )
+        q_group_size = 1 if q_local else self.dcp_group_size
+
         if self.kimi_preprocess is not None:
             q_c, kv_c_normed, k_pe, output_gate = self.kimi_preprocess(
                 hidden_states,
@@ -1289,7 +1351,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 self.kv_a_layernorm.weight,
                 prefill_group is not None,
             )
-            q = self.q_b_proj(q_c)[0]
+            q = self._q_proj(q_c, q_local)
         elif self.q_lora_rank is not None:
             assert self.fused_qkv_a_proj is not None, (
                 "fused_qkv_a_proj is required when q_lora_rank is not None"
@@ -1317,7 +1379,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     dim=-1,
                 )
             q_c = self.q_a_layernorm(q_c)
-            q = self.q_b_proj(q_c)[0]
+            q = self._q_proj(q_c, q_local)
         else:
             assert self.kv_a_proj_with_mqa is not None, (
                 "kv_a_proj_with_mqa is required when q_lora_rank is None"
@@ -1326,7 +1388,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 "q_proj is required when q_lora_rank is None"
             )
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
-            q = self.q_proj(hidden_states)[0]
+            q = self._q_proj(hidden_states, q_local)
 
         if self.kimi_preprocess is None:
             kv_c, k_pe = kv_lora.split(
@@ -1336,7 +1398,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
         # `dcp_group_size` is 1 unless query replication is on, in which case
         # the projection already returned the whole DCP group's heads.
-        q = q.view(-1, self.num_heads * self.dcp_group_size, self.qk_head_dim)
+        q = q.view(-1, self.num_heads * q_group_size, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         # Add head dim of 1 to k_pe
@@ -1375,7 +1437,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # Hand the group-wide q to the sparse DCP path, which would otherwise
         # all-gather the heads itself; everything else takes this rank's shard.
         q_dcp_replicated = None
-        if self.dcp_q_replicate:
+        if self.dcp_q_replicate and not q_local:
             if self.is_sparse:
                 q_dcp_replicated = (q_nope, q_pe)
             local_view = self._q_proj_layer()._local_view

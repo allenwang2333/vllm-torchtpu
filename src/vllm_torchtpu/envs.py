@@ -17,6 +17,9 @@ if TYPE_CHECKING:
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_LSE_MERGE_RS_BF16: bool = False
+    TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = False
+    TPU_DCP_Q_HYBRID: bool = False
+    TPU_DCP_Q_HYBRID_MAX_TOKENS: int = 64
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -431,6 +434,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sum in bf16 at every stage; a quarter to a third of outputs move by more
     # than one bf16 ulp (dcp=8/16), which fails the merge's accuracy bar.
     "TPU_DCP_LSE_MERGE_RS_BF16": env_bool("TPU_DCP_LSE_MERGE_RS_BF16", default=False),
+    # DCP sparse MLA without query replication: one head-major `dim=0`
+    # all-gather of the concatenated `(ql_nope, q_pe)` instead of two `dim=1`
+    # gathers (from vllm-torchtpu PR #1507). Same values, one collective, no
+    # post-gather relayout.
+    "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
+        "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", default=False
+    ),
+    # Per-bucket hybrid of VLLM_DCP_Q_REPLICATE and the fused q gather. Only
+    # acts when query replication is active (sparse MLA, dcp > 1). Backbone
+    # buckets of at most TPU_DCP_Q_HYBRID_MAX_TOKENS tokens project only this
+    # rank's heads -- a column slice (a view, no second copy) of the
+    # replicated q_b weight -- absorb with the local W_UK_T and take the fused
+    # `(ql_nope, q_pe)` all-gather; larger buckets keep replication (full-head
+    # q_b and the replicated W_UK_T, no gather). The spec-decode draft, traced
+    # once for every bucket, cannot branch on the token count and takes the
+    # small-bucket (gather) path at every size, as TPU_DCP_LSE_MERGE_A2A does.
+    "TPU_DCP_Q_HYBRID": env_bool("TPU_DCP_Q_HYBRID", default=False),
+    "TPU_DCP_Q_HYBRID_MAX_TOKENS": env_int("TPU_DCP_Q_HYBRID_MAX_TOKENS", 64),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per

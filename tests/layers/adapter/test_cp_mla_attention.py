@@ -190,6 +190,94 @@ def test_head_gather_puts_this_ranks_heads_in_its_own_block(rank, monkeypatch):
     )
 
 
+class _HeadMajorGatherGroup:
+    """Serves `all_gather(dim=0)` of head-major `[H_local, T, D]` slices."""
+
+    def __init__(self, per_rank_hm, rank):
+        self.world_size = len(per_rank_hm)
+        self.rank_in_group = rank
+        self._per_rank_hm = per_rank_hm
+
+    def all_gather(self, tensor, dim=0):
+        assert dim == 0
+        assert tensor.shape == self._per_rank_hm[self.rank_in_group].shape
+        torch.testing.assert_close(tensor, self._per_rank_hm[self.rank_in_group])
+        return torch.cat(list(self._per_rank_hm), dim=0)
+
+
+def _fused_gather_inputs(world, tokens=5, local=3, lkv=8, rope=4, seed=41):
+    rng = np.random.default_rng(seed)
+    nope = torch.from_numpy(
+        rng.standard_normal((world, tokens, local, lkv)).astype(np.float32)
+    )
+    pe = torch.from_numpy(
+        rng.standard_normal((world, tokens, local, rope)).astype(np.float32)
+    )
+    # What each rank would contribute to the fused gather, head-major.
+    per_rank_hm = torch.cat([nope, pe], dim=-1).transpose(1, 2).contiguous()
+    return nope, pe, per_rank_hm
+
+
+@pytest.mark.parametrize("rank", [0, 1, 3])
+def test_fused_q_gather_matches_two_head_gathers(rank, monkeypatch):
+    """One `(ql_nope, q_pe)` gather must hand back exactly what two
+    `all_gather_heads` calls do: the same values, the same rank-major head
+    order, so the merge's scatter returns rank `r` its own heads."""
+    world, lkv = 4, 8
+    nope, pe, per_rank_hm = _fused_gather_inputs(world, lkv=lkv)
+    monkeypatch.setattr(
+        cp_mla, "get_dcp_group", lambda: _HeadMajorGatherGroup(per_rank_hm, rank)
+    )
+    got_nope, got_pe = cp_mla.all_gather_q_nope_pe_heads(nope[rank], pe[rank], lkv)
+    want_nope = torch.cat(list(nope), dim=1)
+    want_pe = torch.cat(list(pe), dim=1)
+    assert got_nope.shape == want_nope.shape and got_pe.shape == want_pe.shape
+    np.testing.assert_array_equal(got_nope.numpy(), want_nope.numpy())
+    np.testing.assert_array_equal(got_pe.numpy(), want_pe.numpy())
+    assert got_nope.is_contiguous() and got_pe.is_contiguous()
+
+
+def test_fused_q_gather_positive_control_wrong_split_is_caught(monkeypatch):
+    """Splitting the gathered buffer at the wrong offset must not pass."""
+    world, lkv = 4, 8
+    nope, pe, per_rank_hm = _fused_gather_inputs(world, lkv=lkv)
+    monkeypatch.setattr(
+        cp_mla, "get_dcp_group", lambda: _HeadMajorGatherGroup(per_rank_hm, 0)
+    )
+    got_nope, _ = cp_mla.all_gather_q_nope_pe_heads(nope[0], pe[0], lkv - 1)
+    want_nope = torch.cat(list(nope), dim=1)
+    assert got_nope.shape != want_nope.shape or not torch.equal(got_nope, want_nope)
+
+
+def test_fused_q_gather_is_a_noop_without_a_group(monkeypatch):
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: None)
+    a, b = torch.ones(2, 3, 4), torch.ones(2, 3, 2)
+    got = cp_mla.all_gather_q_nope_pe_heads(a, b, 4)
+    assert got[0] is a and got[1] is b
+
+
+@pytest.mark.parametrize(
+    "enabled,tokens,per_bucket,expect_gather",
+    [
+        (False, 16, True, False),
+        (False, 16, False, False),
+        (True, 16, True, True),
+        (True, 64, True, True),
+        (True, 65, True, False),
+        (True, 4096, True, False),
+        # The spec-decode draft is traced once for every bucket: it takes the
+        # small-bucket path at every size.
+        (True, 4096, False, True),
+    ],
+)
+def test_q_hybrid_picks_the_gather_per_bucket(
+    enabled, tokens, per_bucket, expect_gather, monkeypatch
+):
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_Q_HYBRID", enabled, raising=False)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_Q_HYBRID_MAX_TOKENS", 64, raising=False)
+    assert cp_mla.dcp_q_hybrid_gathers(tokens, per_bucket) is expect_gather
+
+
 def test_head_gather_is_a_noop_without_a_group(monkeypatch):
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: None)
     q = torch.ones(2, 3, 4)

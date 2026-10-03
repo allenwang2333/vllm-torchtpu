@@ -67,6 +67,7 @@ from vllm_torchtpu.layers.adapter.cp_attention import (
 )
 from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_heads,
+    all_gather_q_nope_pe_heads,
     merge_lse_partials_scatter_heads,
 )
 from vllm_torchtpu.layers.core.attention_interface import (
@@ -2358,10 +2359,20 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # KV shard, and the head axis is scattered back after the
                 # merge. Under qrep the group's heads are already local, so
                 # the gather is the identity and is skipped outright.
-                ql_nope_dcp = (
-                    ql_nope_flat if use_qrep else all_gather_heads(ql_nope_flat)
-                )
-                q_pe_dcp = q_pe_flat if use_qrep else all_gather_heads(q_pe_flat)
+                # The fused gather (one collective for both operands) is taken
+                # whenever asked for, and always by the `TPU_DCP_Q_HYBRID`
+                # small-bucket path, which reaches here with qrep off.
+                if use_qrep:
+                    ql_nope_dcp, q_pe_dcp = ql_nope_flat, q_pe_flat
+                elif (
+                    envs.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER or envs.TPU_DCP_Q_HYBRID
+                ) and ql_nope_flat.dtype == q_pe_flat.dtype:
+                    ql_nope_dcp, q_pe_dcp = all_gather_q_nope_pe_heads(
+                        ql_nope_flat, q_pe_flat, layer.kv_lora_rank
+                    )
+                else:
+                    ql_nope_dcp = all_gather_heads(ql_nope_flat)
+                    q_pe_dcp = all_gather_heads(q_pe_flat)
                 # `topk_indices` here is not global positions: the DCP indexer
                 # already resolved each token's global top-k into this rank's
                 # own local cache indices, `-1` where it owns nothing.

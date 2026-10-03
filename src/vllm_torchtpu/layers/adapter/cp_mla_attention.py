@@ -61,6 +61,45 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
     return group.all_gather(q.contiguous(), dim=1)
 
 
+def all_gather_q_nope_pe_heads(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_lora_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`all_gather_heads` of `(ql_nope, q_pe)` as one collective (PR #1507).
+
+    Concatenates the two in head-major `[H_local, T, kv_lora_rank + rope]`
+    and gathers along `dim=0`, so the gathered buffer is already rank-major
+    over heads (the same head order as a `dim=1` gather) and needs no
+    post-collective `movedim`; one transpose per operand restores `[T, H, D]`.
+
+    Returns:
+      `([T, H_local * dcp, kv_lora_rank], [T, H_local * dcp, rope])`.
+    """
+    group = get_dcp_group()
+    if group is None or int(group.world_size) == 1:
+        return ql_nope, q_pe
+    q_cat_hm = torch.cat([ql_nope.transpose(0, 1), q_pe.transpose(0, 1)], dim=-1)
+    q_dcp_hm = group.all_gather(q_cat_hm.contiguous(), dim=0)
+    ql_nope_dcp = q_dcp_hm[..., :kv_lora_rank].transpose(0, 1).contiguous()
+    q_pe_dcp = q_dcp_hm[..., kv_lora_rank:].transpose(0, 1).contiguous()
+    return ql_nope_dcp, q_pe_dcp
+
+
+def dcp_q_hybrid_gathers(num_tokens: Any, per_bucket: bool) -> bool:
+    """Whether a query-replicated layer takes the gather path for this step.
+
+    True under `TPU_DCP_Q_HYBRID` for backbone buckets of at most
+    `TPU_DCP_Q_HYBRID_MAX_TOKENS` tokens, and for every step of a caller
+    traced once across buckets (`per_bucket=False`, the spec-decode draft),
+    which must not branch on the token count -- the same rule as the
+    `TPU_DCP_LSE_MERGE_A2A` cap in `merge_lse_partials_scatter_heads`.
+    """
+    if not envs.TPU_DCP_Q_HYBRID:
+        return False
+    return not per_bucket or num_tokens <= envs.TPU_DCP_Q_HYBRID_MAX_TOKENS
+
+
 def merge_lse_partials_scatter_heads(
     output: torch.Tensor, lse: torch.Tensor, per_bucket: bool = True
 ) -> torch.Tensor:
