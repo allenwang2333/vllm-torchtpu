@@ -198,3 +198,117 @@ def test_patched_decoder_layer_forward_uses_narrow_and_reduce_scatter(monkeypatc
     assert mlp_calls == [(torch.Size([2, 3]), True)]
     assert out.shape == (2, 3)
     assert res.shape == (2, 3)
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "num_tokens", "expect_fp8_gather"),
+    [
+        (4, 256, False),
+        (4, 260, True),
+        (8, 1024, False),
+        (8, 1032, True),
+    ],
+)
+def test_patched_decoder_layer_fp8_gather_auto_min_tokens(
+    monkeypatch, tp_size, num_tokens, expect_fp8_gather
+):
+    monkeypatch.setattr(envs, "VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER", True)
+    monkeypatch.setattr(envs, "VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS", 0)
+    monkeypatch.setattr(
+        qwen3_next_patch, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    gather_dtypes: list[torch.dtype] = []
+
+    def fake_all_gather(x, dim):
+        gather_dtypes.append(x.dtype)
+        return x.repeat(tp_size, *([1] * (x.ndim - 1)))
+
+    monkeypatch.setattr(
+        qwen3_next_patch, "tensor_model_parallel_all_gather", fake_all_gather
+    )
+    monkeypatch.setattr(
+        qwen3_next_patch,
+        "tensor_model_parallel_reduce_scatter",
+        lambda x, dim: x[: x.shape[0] // tp_size],
+    )
+    monkeypatch.setattr(
+        qwen3_next_patch,
+        "linear_common",
+        SimpleNamespace(
+            quantize_rows=lambda x: (
+                x.to(torch.float8_e4m3fn),
+                torch.ones(x.shape[0], 1, dtype=torch.float32),
+            )
+        ),
+    )
+
+    attn_seen: dict[str, object] = {}
+
+    def linear_attn(hidden_states, **kwargs):
+        attn_seen["hidden_states"] = hidden_states
+        attn_seen["kwargs"] = kwargs
+        return torch.zeros(hidden_states.shape[0], 3, dtype=torch.bfloat16)
+
+    layer = SimpleNamespace(
+        input_layernorm=lambda h, r=None: (h, r) if r is not None else h,
+        post_attention_layernorm=lambda h, r: (h + r, r),
+        use_attn_reduce_scatter_for_moe=True,
+        layer_type="linear_attention",
+        linear_attn=linear_attn,
+        layer_scale=False,
+        mlp=lambda x, already_sequence_parallel=False: x,
+    )
+    chunk = torch.ones(num_tokens // tp_size, 3, dtype=torch.bfloat16)
+    positions = torch.arange(num_tokens)
+
+    qwen3_next_patch.patched_decoder_layer_forward(layer, chunk, None, positions)
+
+    if expect_fp8_gather:
+        assert gather_dtypes == [torch.float8_e4m3fn, torch.float32]
+        prequant = attn_seen["kwargs"]["prequant"]
+        assert prequant[0].shape == (num_tokens, 3)
+        assert prequant[1].shape == (num_tokens, 1)
+    else:
+        assert gather_dtypes == [torch.bfloat16]
+        assert "prequant" not in attn_seen["kwargs"]
+
+
+def test_project_prequant_uses_prequant_matmul_for_per_channel_fp8(monkeypatch):
+    import sys
+    import types
+    from pathlib import Path
+
+    if "vllm_torchtpu.layers" not in sys.modules:
+        pkg = types.ModuleType("vllm_torchtpu.layers")
+        pkg.__path__ = [
+            str(Path(__file__).resolve().parents[2] / "src/vllm_torchtpu/layers")
+        ]
+        monkeypatch.setitem(sys.modules, "vllm_torchtpu.layers", pkg)
+
+    from vllm_torchtpu.layers.adapter import linear_common
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+
+    calls: list[tuple[torch.Size, torch.Size, torch.Size, torch.Size]] = []
+
+    def fake_prequant_matmul(x_q, x_s, w_q, w_s):
+        calls.append((x_q.shape, x_s.shape, w_q.shape, w_s.shape))
+        return torch.ones(x_q.shape[0], w_q.shape[1], dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        linear_common, "quantized_matmul_prequant", fake_prequant_matmul
+    )
+    layer = SimpleNamespace(
+        quant_method=VllmFp8LinearMethodTPU.__new__(VllmFp8LinearMethodTPU),
+        bias=torch.full((5,), 2.0, dtype=torch.bfloat16),
+        weight=torch.zeros(4, 5, dtype=torch.float8_e4m3fn),
+        weight_scale=torch.ones(5, dtype=torch.float32),
+    )
+    x_q = torch.zeros(6, 4, dtype=torch.float8_e4m3fn)
+    x_s = torch.ones(6, 1, dtype=torch.float32)
+
+    out = linear_common.project_prequant(layer, x_q, (x_q, x_s))
+
+    assert calls == [
+        (torch.Size([6, 4]), torch.Size([6, 1]), torch.Size([4, 5]), torch.Size([5]))
+    ]
+    torch.testing.assert_close(out, torch.full((6, 5), 3.0, dtype=torch.bfloat16))
