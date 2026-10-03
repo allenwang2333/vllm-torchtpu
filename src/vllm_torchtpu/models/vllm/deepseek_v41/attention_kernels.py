@@ -212,14 +212,22 @@ def paged_index_scores_jax(
     records: jax.Array,
     weights: jax.Array,
     lengths: jax.Array,
+    requests: jax.Array | None = None,
 ) -> jax.Array:
-    tokens, width = records.shape
+    """Index scores ``[tokens, width]``.
+
+    ``records`` is ``[tokens, width]``, or ``[requests, width]`` when
+    ``requests`` maps each token to its row: every token of a request then
+    shares one paged gather of the key tile instead of reading it again.
+    """
+    tokens, dim = q.shape[0], q.shape[-1]
+    width = records.shape[1]
     # Keep about 16K keys per iteration: small (decode) batches otherwise run
     # many latency-bound tiny gathers. Prefill batches stay at 128.
     budget = max(128, min(2048, 16384 // max(tokens, 1), -(-width // 128) * 128))
-    dim, tile = q.shape[-1], 1 << (budget.bit_length() - 1)
+    tile = 1 << (budget.bit_length() - 1)
     records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
-    scores = jnp.full(records.shape, -jnp.inf, jnp.float32)
+    scores = jnp.full((tokens, records.shape[1]), -jnp.inf, jnp.float32)
 
     def step(index, result):
         # Read only the tile consumed by this iteration. Gathering before
@@ -227,8 +235,10 @@ def paged_index_scores_jax(
         # lengths restrict execution to a single tile (or no tiles).
         addresses = jax.lax.dynamic_slice_in_dim(records, index * tile, tile, axis=1)
         keys = gather_cache_values(pool, addresses.reshape(-1), dim).reshape(
-            tokens, tile, dim
+            records.shape[0], tile, dim
         )
+        if requests is not None:
+            keys = jnp.take(keys, requests, axis=0)
         logits = jnp.einsum("thd,tcd->thc", q, keys, preferred_element_type=jnp.float32)
         # Upstream quantized MQA logits and the weighted head reduction are
         # FP32. BF16 cache storage is not a request to round the dot product.
@@ -319,14 +329,17 @@ def paged_indexer_jax(
     weights: jax.Array,
     lengths: jax.Array,
     candidates: jax.Array,
+    requests: jax.Array,
     topk: int,
     block_size: int,
     candidate_write: bool,
     candidate_filter: bool,
 ) -> tuple[jax.Array, jax.Array]:
+    """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows."""
+
     def full_context(_):
-        scores = paged_index_scores_jax(q, pool, records, weights, lengths)
-        scores = jnp.where(records >= 0, scores, -jnp.inf)
+        scores = paged_index_scores_jax(q, pool, records, weights, lengths, requests)
+        scores = jnp.where(jnp.take(records >= 0, requests, axis=0), scores, -jnp.inf)
         return select_indices_jax(
             scores,
             lengths,
@@ -342,6 +355,8 @@ def paged_indexer_jax(
         return full_context(None)
 
     def candidate_context(_):
+        # Candidates differ per token, so this path reads per-token records.
+        token_records = jnp.take(records, requests, axis=0)
         # Sort before expanding so equal-score ties retain the full-context
         # top_k's logical ordering. Duplicate and invalid blocks cannot select
         # the same key twice or read outside this request's causal history.
@@ -355,11 +370,13 @@ def paged_indexer_jax(
             axis=-1,
         )
         logical = (ids[..., None] * block_size + jnp.arange(block_size)).reshape(
-            records.shape[0], -1
+            q.shape[0], -1
         )
         valid = logical < jnp.minimum(lengths[:, None], width)
         valid &= jnp.repeat(unique & (ids < blocks), block_size, axis=-1)
-        compact = jnp.take_along_axis(records, jnp.minimum(logical, width - 1), axis=1)
+        compact = jnp.take_along_axis(
+            token_records, jnp.minimum(logical, width - 1), axis=1
+        )
         compact = jnp.where(valid, compact, -1)
         # This bounds both key reads and QK work by the candidate pool size.
         compact_lengths = jnp.full_like(lengths, compact.shape[1])
@@ -376,13 +393,11 @@ def paged_indexer_jax(
         # -inf positions, then sorts all positions before masking them. Preserve
         # those padding locations too: moving padding across a 64-key attention
         # tile changes BF16 accumulation boundaries.
-        occupied = jnp.zeros((records.shape[0], output_width + 1), jnp.bool_)
+        occupied = jnp.zeros((q.shape[0], output_width + 1), jnp.bool_)
         occupied_ids = jnp.where(
             selected_valid & (selected < output_width), selected, output_width
         )
-        occupied = occupied.at[jnp.arange(records.shape[0])[:, None], occupied_ids].set(
-            True
-        )
+        occupied = occupied.at[jnp.arange(q.shape[0])[:, None], occupied_ids].set(True)
         fillers = jnp.sort(
             jnp.where(~occupied[:, :output_width], jnp.arange(output_width), width),
             axis=-1,
@@ -423,6 +438,7 @@ def update_and_select_jax(
     candidates: jax.Array,
     write_records: jax.Array,
     keys: jax.Array,
+    requests: jax.Array,
     topk: int,
     block_size: int,
     candidate_write: bool,
@@ -436,6 +452,7 @@ def update_and_select_jax(
         weights,
         lengths,
         candidates,
+        requests,
         topk,
         block_size,
         candidate_write,
@@ -460,7 +477,7 @@ def initialize_indexer():
         update_and_select_jax,
         donate_argnums=(1,),
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 8 + (None,) * 4,
+        input_partition_specs=(P(),) * 9 + (None,) * 4,
     )
 
     def fake(
@@ -472,6 +489,7 @@ def initialize_indexer():
         candidates,
         write_records,
         keys,
+        requests,
         topk,
         block_size,
         candidate_write,
@@ -497,12 +515,14 @@ def paged_indexer(
     candidates,
     write_records,
     keys,
+    requests,
     *,
     topk,
     block_size,
     candidate_write,
     candidate_filter,
 ):
+    """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows."""
     assert _indexer_op is not None
     return _indexer_op(
         q,
@@ -513,6 +533,7 @@ def paged_indexer(
         candidates.int(),
         write_records.int(),
         keys,
+        requests.int(),
         topk,
         block_size,
         candidate_write,

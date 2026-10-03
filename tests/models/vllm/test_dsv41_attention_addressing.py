@@ -11,6 +11,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.attention import (
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.attention_kernels import (
     paged_index_scores_jax,
+    paged_indexer_jax,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.cache import gather_cache_values
 
@@ -83,3 +84,74 @@ def test_paged_index_scores_matches_dense(tokens, width):
     dense = np.asarray((jnp.maximum(logits, 0) * weights[:, :, None]).sum(1))
     valid = (records >= 0) & (np.arange(width)[None] < lengths[:, None])
     np.testing.assert_allclose(got[valid], dense[valid], rtol=1e-5, atol=1e-3)
+
+
+def _request_inputs(rng, requests_count, tokens, width, heads=4, dim=128):
+    pool = jnp.asarray(rng.integers(-(2**31), 2**31, (256, 128)), dtype=jnp.int32)
+    pool = pool & jnp.int32(0x3FFF3FFF)  # finite BF16 keys
+    records = rng.integers(0, 256 * 2, (requests_count, width)).astype(np.int32)
+    records[:, width - 5 :] = -1
+    requests = np.sort(rng.integers(0, requests_count, tokens)).astype(np.int32)
+    lengths = rng.integers(1, width + 1, tokens).astype(np.int32)
+    q = jnp.asarray(rng.standard_normal((tokens, heads, dim)), jnp.bfloat16)
+    weights = jnp.asarray(rng.standard_normal((tokens, heads)), jnp.float32)
+    return pool, records, requests, lengths, q, weights
+
+
+@pytest.mark.parametrize(
+    "requests_count,tokens,width", [(1, 1, 300), (8, 8, 2560), (2, 64, 640)]
+)
+def test_paged_index_scores_shared_tiles_match_per_token(requests_count, tokens, width):
+    rng = np.random.default_rng(tokens)
+    pool, records, requests, lengths, q, weights = _request_inputs(
+        rng, requests_count, tokens, width
+    )
+    expected = paged_index_scores_jax(
+        q, pool, jnp.asarray(records[requests]), weights, lengths
+    )
+    got = paged_index_scores_jax(
+        q, pool, jnp.asarray(records), weights, lengths, jnp.asarray(requests)
+    )
+    # Scores at -1 records are undefined (callers mask them); others are exact.
+    valid = records[requests] >= 0
+    np.testing.assert_array_equal(np.asarray(got)[valid], np.asarray(expected)[valid])
+
+
+@pytest.mark.parametrize(
+    "candidate_write,candidate_filter",
+    [(False, False), (True, False), (False, True)],
+)
+def test_paged_indexer_request_records_match_per_token(
+    candidate_write, candidate_filter
+):
+    rng = np.random.default_rng(7)
+    width, topk, block_size = 640, 64, 16
+    pool, records, requests, lengths, q, weights = _request_inputs(rng, 3, 24, width)
+    lengths = np.maximum(lengths, topk + 1)  # long enough for candidate_context
+    candidates = jnp.asarray(
+        rng.integers(-1, width // block_size, (24, 8)), dtype=jnp.int32
+    )
+    args = (topk, block_size, candidate_write, candidate_filter)
+    tokens = jnp.arange(24, dtype=jnp.int32)
+    expected = paged_indexer_jax(
+        q,
+        pool,
+        jnp.asarray(records[requests]),
+        weights,
+        jnp.asarray(lengths),
+        candidates,
+        tokens,
+        *args,
+    )
+    got = paged_indexer_jax(
+        q,
+        pool,
+        jnp.asarray(records),
+        weights,
+        jnp.asarray(lengths),
+        candidates,
+        jnp.asarray(requests),
+        *args,
+    )
+    for a, b in zip(got, expected):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))

@@ -567,16 +567,18 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     index_cache = indexer.k_cache.kv_cache
                     if tiled:
                         # Rows are row_indices of _row_slots(..., logical_compressed),
-                        # computed per request: [requests, capacity] -> [T, capacity].
+                        # computed per request: [requests, capacity]. The indexer
+                        # shares each request's key tiles across its tokens.
                         index_records = index_cache.row_indices(
                             _request_row_slots(
                                 index_cache, _block_table(keys_meta), capacity
                             )
-                        ).index_select(0, requests)
+                        )
                         selected = self._select_paged_indices(
                             index_q,
                             index_cache,
                             index_records,
+                            requests,
                             weights,
                             lengths,
                             swa_slots,
@@ -674,6 +676,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         index_q,
         index_cache,
         records,
+        requests,
         weights,
         lengths,
         swa_slots,
@@ -710,6 +713,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             candidates,
             write_records,
             write_keys,
+            requests,
             topk=self._config["index_topk"],
             block_size=max(1, self.candidate_block_size),
             candidate_write=candidate_write,
