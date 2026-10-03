@@ -98,6 +98,9 @@ def _build_op(mesh, n_ranks: int, topk: int):
             moe_tp_prefill,
         )
 
+        # Trace-time, once per token bucket: the evidence that the prefill
+        # kernel, not the GMM branch, serves this shape.
+        logger.info("Fused TP MoE prefill kernel traced for %d tokens", x.shape[0])
         return moe_tp_prefill(
             x, w1, w2, s1, s2, w1s, w2s, s1s, s2s, wg.astype(x.dtype), tw, ti,
             combine_chunks=default_combine_chunks(x.shape[0]),
@@ -267,8 +270,9 @@ def arm_fused_tp_ar(model: torch.nn.Module) -> int:
     if armed:
         logger.info(
             "Armed fused TP MoE + shared expert + all-reduce on %d of %d MoE layers "
-            "(tp=%d, max tokens %d)",
+            "(tp=%d, max tokens %d, above it: %s)",
             armed, len(runners), n_ranks, envs.MOE_FUSED_TP_AR_MAX_TOKENS,
+            "fused TP prefill kernel" if envs.USE_MOE_FUSED_TP_PREFILL else "GMM",
         )
     return armed
 
