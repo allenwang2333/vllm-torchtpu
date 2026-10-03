@@ -641,42 +641,6 @@ def fused_moe_func(
             topk_ids, topk_weights, experts_start, owned
         )
 
-    lowtok_max = envs.TPU_MOE_LOWTOK_MAX_TOKENS
-    if (
-        use_ep
-        and experts_start is not None
-        and lowtok_max
-        and num_tokens <= lowtok_max
-        and activation == "silu"
-        and rhs_quant_dtype is None
-        and w1_bias is None
-        and w2_bias is None
-        and w1_scale is not None
-        and w2_scale is not None
-        and w1.dtype == jnp.float8_e4m3fn
-        and w2.dtype == jnp.float8_e4m3fn
-        and hidden_states.dtype == jnp.bfloat16
-        and w1_scale.ndim == 4
-        and w1_scale.shape[1] == 1
-        and w1_scale.shape[2] == 1
-        and w2_scale.ndim == 4
-        and w2_scale.shape[1] == 1
-        and w2_scale.shape[2] == 1
-        and w1.shape[1] == hidden_size
-        and w1.shape[0] <= 128
-        and w1.shape[2] % 512 == 0
-    ):
-        from vllm_torchtpu.kernels.moe_lowtok.kernel import moe_lowtok
-
-        return moe_lowtok(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            w1,
-            w1_scale,
-            w2,
-            w2_scale,
-        )
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
