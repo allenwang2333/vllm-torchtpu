@@ -469,6 +469,41 @@ def write_cache(cache, slots, values, valid):
         cache.copy_(_write_op(cache, slots.int(), values))
 
 
+def merge_sub_rows(
+    cache: jax.Array, records: jax.Array, words: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+    """Turn unique sub-row records into full word-row writes.
+
+    Each valid record yields its row: the current row with every segment
+    written in this batch replaced. Records sharing a row yield identical
+    rows, so writing them in any order is equivalent to the lane scatter.
+    Returns ``(row records, int32 [n, ROW_WORDS])``; invalid records stay -1.
+    """
+    import jax.numpy as jnp
+
+    width = words.shape[1]
+    per_row = ROW_WORDS // width
+    valid = (records >= 0) & (records < cache.shape[0] * per_row)
+    rows = jnp.where(valid, records // per_row, -1)
+    segments = records % per_row
+    merged = cache[jnp.maximum(rows, 0)]
+    # [n, n]: which batch records land in each record's row. Batches are a
+    # step's tokens (<= max_num_batched_tokens), so this stays small.
+    same_row = (rows[:, None] == rows[None, :]) & valid[:, None] & valid[None, :]
+    pieces = []
+    for segment in range(per_row):
+        writers = same_row & (segments[None, :] == segment)
+        source = jnp.take(words, jnp.argmax(writers, axis=1), axis=0)
+        pieces.append(
+            jnp.where(
+                writers.any(axis=1)[:, None],
+                source,
+                merged[:, segment * width : (segment + 1) * width],
+            )
+        )
+    return rows, jnp.concatenate(pieces, axis=1)
+
+
 def scatter_cache_values(
     cache: jax.Array, records: jax.Array, values: jax.Array
 ) -> jax.Array:
@@ -495,6 +530,11 @@ def scatter_cache_values(
         )
     )
     width = words.shape[1]
+    if width < ROW_WORDS and jax.default_backend() == "tpu":
+        # An elementwise (row, lane) scatter is slow on TPU. Rebuild whole word
+        # rows instead and reuse the full-row DMA below.
+        records, words = merge_sub_rows(cache, records, words)
+        width = ROW_WORDS
     if width < ROW_WORDS or jax.default_backend() != "tpu":
         columns = jnp.arange(width)[None]
         if width < ROW_WORDS:

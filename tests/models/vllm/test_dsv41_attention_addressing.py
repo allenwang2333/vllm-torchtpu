@@ -13,7 +13,11 @@ from vllm_torchtpu.models.vllm.deepseek_v41.attention_kernels import (
     paged_index_scores_jax,
     paged_indexer_jax,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41.cache import gather_cache_values
+from vllm_torchtpu.models.vllm.deepseek_v41.cache import (
+    gather_cache_values,
+    merge_sub_rows,
+    scatter_cache_values,
+)
 
 
 @pytest.mark.parametrize("width", [7, 128, 300, 2560])
@@ -155,3 +159,18 @@ def test_paged_indexer_request_records_match_per_token(
     )
     for a, b in zip(got, expected):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+@pytest.mark.parametrize("width,count", [(64, 40), (32, 40), (64, 1), (32, 7)])
+def test_merge_sub_rows_matches_lane_scatter(width, count):
+    rng = np.random.default_rng(width + count)
+    per_row = 128 // width
+    cache = jnp.asarray(rng.integers(-(2**31), 2**31, (32, 128)), dtype=jnp.int32)
+    # Unique records, dense enough that rows hold several batch records.
+    records = rng.permutation(32 * per_row)[:count].astype(np.int32)
+    records[::5] = -1
+    words = jnp.asarray(rng.integers(-(2**31), 2**31, (count, width)), jnp.int32)
+    expected = scatter_cache_values(cache, jnp.asarray(records), words)
+    rows, full = merge_sub_rows(cache, jnp.asarray(records), words)
+    got = cache.at[jnp.where(rows >= 0, rows, cache.shape[0])].set(full, mode="drop")
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
