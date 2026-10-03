@@ -111,8 +111,11 @@ if TYPE_CHECKING:
     TPU_INDEXER_TOPK_NOCOPY: bool = True
     TPU_INDEXER_TOPK_SHARED_READ: bool = True
     TPU_STREAMIDX_DCP_QSHARD_MIN_TOKENS: int = 1024
-    VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "has"
-    DEFAULT_INDEXER_KV_CACHE_MODE: str = "has" 
+    VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
+    DEFAULT_INDEXER_KV_CACHE_MODE: str = "sal"
+    TPU_SPARSE_MLA_DCP_A2A_MERGE: bool = False
+    TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS: int = 64
+    TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -396,6 +399,25 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 # writer (`coalesced_kv_append_dcp`). Pages whose size is not a multiple of
 # 128 fall back to HEAD_ALONG_SUBLANE in `indexer_kv_layout`.
 DEFAULT_INDEXER_KV_CACHE_MODE = "sal"
+
+
+def _get_dcp_a2a_merge_max_tokens() -> int:
+    val_str = os.getenv("TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS")
+    if val_str is None or val_str.strip() == "":
+        val_str = os.getenv("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS")
+    if val_str is None or val_str.strip() == "":
+        return 64
+    try:
+        val = int(val_str)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid value '{val_str}' for TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS: must be an integer."
+        ) from exc
+    if val < 0:
+        raise ValueError(
+            f"Invalid value '{val}' for TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS: must be >= 0."
+        )
+    return val
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -932,6 +954,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ["sal", "has", "xla"],
         case_sensitive=False,
     ),
+    "TPU_SPARSE_MLA_DCP_A2A_MERGE": env_bool("TPU_SPARSE_MLA_DCP_A2A_MERGE", False),
+    "TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS": _get_dcp_a2a_merge_max_tokens,
+    "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": _get_dcp_a2a_merge_max_tokens,
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(
