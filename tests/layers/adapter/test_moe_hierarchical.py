@@ -426,7 +426,9 @@ def test_ep_tp_patch_rewrites_every_make(monkeypatch) -> None:
     monkeypatch.setattr(
         FusedMoEParallelConfig, "make", staticmethod(lambda *a, **k: flat)
     )
-    monkeypatch.setattr(FusedMoEParallelConfig, "_tpu_ep_tp_split_patch", False)
+    monkeypatch.setattr(
+        FusedMoEParallelConfig, "_tpu_ep_tp_split_patch", False, raising=False
+    )
     monkeypatch.setattr(moe_hierarchical, "_filter_patched", False)
     monkeypatch.setattr(
         default_loader,
@@ -466,7 +468,9 @@ def test_ep_tp_patch_leaves_a_flat_world_flat(monkeypatch) -> None:
     monkeypatch.setattr(
         FusedMoEParallelConfig, "make", staticmethod(lambda *a, **k: flat)
     )
-    monkeypatch.setattr(FusedMoEParallelConfig, "_tpu_ep_tp_split_patch", False)
+    monkeypatch.setattr(
+        FusedMoEParallelConfig, "_tpu_ep_tp_split_patch", False, raising=False
+    )
     monkeypatch.setattr(moe_hierarchical, "_filter_patched", True)
     monkeypatch.setattr(moe_hierarchical, "hierarchical_split_or_none", lambda: None)
     moe_hierarchical.install_ep_tp_split_patch()
@@ -519,7 +523,9 @@ def test_ep_tp_patch_refuses_where_partials_would_not_meet(
     monkeypatch.setattr(
         FusedMoEParallelConfig, "make", staticmethod(lambda *a, **k: bad)
     )
-    monkeypatch.setattr(FusedMoEParallelConfig, "_tpu_ep_tp_split_patch", False)
+    monkeypatch.setattr(
+        FusedMoEParallelConfig, "_tpu_ep_tp_split_patch", False, raising=False
+    )
     monkeypatch.setattr(moe_hierarchical, "_filter_patched", True)
     monkeypatch.setattr(
         moe_hierarchical, "hierarchical_split_or_none", lambda: (4, 1, 4, 2)
