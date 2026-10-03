@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     MOE_FUSED_TP_KERNEL_MAX_TOKENS: int = 512
     USE_MOE_FUSED_TP_AR: bool = False
     MOE_FUSED_TP_AR_MAX_TOKENS: int = 128
+    USE_MOE_FUSED_TP_PREFILL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -556,6 +557,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # at token counts up to MOE_FUSED_TP_AR_MAX_TOKENS. Armed once after load.
     "USE_MOE_FUSED_TP_AR": env_bool("USE_MOE_FUSED_TP_AR"),
     "MOE_FUSED_TP_AR_MAX_TOKENS": env_nonnegative_int("MOE_FUSED_TP_AR_MAX_TOKENS", 128),
+    # With USE_MOE_FUSED_TP_AR armed, serve token counts above
+    # MOE_FUSED_TP_AR_MAX_TOKENS with the fused TP prefill kernel
+    # (kernels/experimental/moe_tp_prefill.py: expert kernel + combine +
+    # chunked psum) instead of GMM + XLA shared expert + psum.
+    "USE_MOE_FUSED_TP_PREFILL": env_bool("USE_MOE_FUSED_TP_PREFILL"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

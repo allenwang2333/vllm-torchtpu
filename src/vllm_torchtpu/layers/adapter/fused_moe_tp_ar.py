@@ -60,7 +60,8 @@ def _build_op(mesh, n_ranks: int, topk: int):
     # applied HERE, not in torch: every bucket then traces the same torch op
     # with the same inputs, which vLLM's shape-specialized warmup requires.
     cap = envs.MOE_FUSED_TP_AR_MAX_TOKENS
-    key = (id(mesh), n_ranks, topk, cap)
+    use_prefill = envs.USE_MOE_FUSED_TP_PREFILL
+    key = (id(mesh), n_ranks, topk, cap, use_prefill)
     op = _OPS.get(key)
     if op is not None:
         return op
@@ -90,9 +91,24 @@ def _build_op(mesh, n_ranks: int, topk: int):
         shared = (gate * shared.astype(jnp.float32)).astype(x.dtype)
         return jax.lax.psum(shared + routed, axis)
 
+    def prefill(x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti):
+        """Above the cap: v2-style expert kernel + combine + chunked psum."""
+        from vllm_torchtpu.kernels.experimental.moe_tp_prefill import (
+            default_combine_chunks,
+            moe_tp_prefill,
+        )
+
+        return moe_tp_prefill(
+            x, w1, w2, s1, s2, w1s, w2s, s1s, s2s, wg.astype(x.dtype), tw, ti,
+            combine_chunks=default_combine_chunks(x.shape[0]),
+            reduce_fn=lambda y: jax.lax.psum(y, axis),
+        )
+
     def local(rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti):
         s1s, s2s, wg = s1s.reshape(1, -1), s2s.reshape(1, -1), wg.reshape(-1, 1)
         if x.shape[0] > cap:
+            if use_prefill:
+                return prefill(x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti)
             return decomposed(x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti)
         return _kernel_body(
             rank.reshape(-1), x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti,
