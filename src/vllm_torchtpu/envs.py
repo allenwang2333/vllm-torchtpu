@@ -161,6 +161,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     TPU_SMALL_ALL_REDUCE: bool = False
+    TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
 
 
 def env_with_choices(
@@ -1017,6 +1018,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run small decode-step TP all-reduces and DP MoE combines as Pallas
     # kernels (kernels/experimental/small_collectives) instead of XLA's.
     "TPU_SMALL_ALL_REDUCE": env_bool("TPU_SMALL_ALL_REDUCE"),
+    # Largest TP all-reduce, in rows, that TPU_SMALL_ALL_REDUCE hands to the
+    # kernel; 0 keeps small_all_reduce_op.MAX_ROWS. The crossover moves with
+    # the core count and hidden size, so a slice other than the one MAX_ROWS
+    # was measured on sets its own; mixed-step blocks stay on XLA's above it.
+    "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
+        "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 0
+    ),
 }
 
 
