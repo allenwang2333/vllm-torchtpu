@@ -14,6 +14,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.attention_kernels import (
     paged_indexer_jax,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.cache import (
+    gather_cache_halves,
     gather_cache_values,
     merge_halves,
     merge_sub_rows,
@@ -70,19 +71,35 @@ def test_gather_cache_values_negative_records(elements, fp32):
 
 @pytest.mark.parametrize("elements", [512, 128])
 def test_gather_cache_values_split_order(elements):
+    # Finite, normal BF16 values (permutations are matmuls; subnormals
+    # flush); signs are kept.
     pool = jnp.asarray(
         np.random.default_rng(1).integers(-(2**31), 2**31, (64, 128)), jnp.int32
-    )
+    ) & jnp.int32(-0x40004001) | jnp.int32(0x00800080)  # 0xBFFFBFFF
     records = jnp.asarray([5, 0, 17, 2], dtype=jnp.int32)
     natural = gather_cache_values(pool, records, elements)
     split = gather_cache_values(pool, records, elements, split=True)
     np.testing.assert_array_equal(
-        np.asarray(split).view(np.uint16),
-        np.asarray(split_halves(natural)).view(np.uint16),
+        np.asarray(split, np.float32), np.asarray(split_halves(natural), np.float32)
     )
     np.testing.assert_array_equal(
-        np.asarray(merge_halves(split)).view(np.uint16),
-        np.asarray(natural).view(np.uint16),
+        np.asarray(merge_halves(split), np.float32), np.asarray(natural, np.float32)
+    )
+    np.testing.assert_array_equal(
+        np.concatenate(
+            [
+                np.asarray(h, np.float32)
+                for h in gather_cache_halves(pool, records, elements)
+            ],
+            axis=1,
+        ),
+        np.asarray(split, np.float32),
+    )
+    numerator = jnp.asarray(
+        np.random.default_rng(2).standard_normal((3, elements)), jnp.float32
+    )
+    np.testing.assert_array_equal(
+        np.asarray(merge_halves(split_halves(numerator))), np.asarray(numerator)
     )
 
 

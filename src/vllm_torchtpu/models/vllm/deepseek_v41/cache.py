@@ -343,11 +343,29 @@ def _gather_words(cache, records, record_words):
     return selected
 
 
+def _permute(x: jax.Array, source: jax.Array) -> jax.Array:
+    """``x[..., source]`` as an exact 0/1 matmul (finite ``x``; subnormals flush).
+
+    Lane-stride slices and lane gathers are slow on TPU; the MXU is not.
+    """
+    import jax.numpy as jnp
+
+    permutation = (jnp.arange(x.shape[-1])[:, None] == source[None]).astype(x.dtype)
+    return jnp.einsum(
+        "...d,de->...e",
+        x,
+        permutation,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    ).astype(x.dtype)
+
+
 def split_halves(x: jax.Array) -> jax.Array:
     """Reorder the last axis as ``[0, 2, 4, ..., 1, 3, ...]`` (``split`` reads)."""
     import jax.numpy as jnp
 
-    return jnp.concatenate([x[..., 0::2], x[..., 1::2]], axis=-1)
+    dim = x.shape[-1]
+    return _permute(x, jnp.concatenate([jnp.arange(0, dim, 2), jnp.arange(1, dim, 2)]))
 
 
 def merge_halves(x: jax.Array) -> jax.Array:
@@ -356,7 +374,32 @@ def merge_halves(x: jax.Array) -> jax.Array:
 
     half = x.shape[-1] // 2
     order = jnp.arange(x.shape[-1])
-    return jnp.take(x, order // 2 + (order % 2) * half, axis=-1)
+    return _permute(x, order // 2 + (order % 2) * half)
+
+
+def _gather_records(cache, records, record_words):
+    import jax.numpy as jnp
+
+    spread = jnp.arange(records.size, dtype=records.dtype).reshape(records.shape)
+    spread %= cache.shape[0] * ROW_WORDS // record_words
+    records = jnp.where(records >= 0, records, spread)
+    return _gather_words(cache, records, record_words)
+
+
+def _split_words(words: jax.Array) -> tuple[jax.Array, jax.Array]:
+    import jax.numpy as jnp
+
+    def bf16(bits):
+        return jax.lax.bitcast_convert_type(bits, jnp.float32).astype(jnp.bfloat16)
+
+    return bf16(words << 16), bf16(words & jnp.int32(-65536))
+
+
+def gather_cache_halves(
+    cache: jax.Array, records: jax.Array, elements: int
+) -> tuple[jax.Array, jax.Array]:
+    """BF16 records as (even elements, odd elements); see `gather_cache_values`."""
+    return _split_words(_gather_records(cache, records, elements // 2))
 
 
 def gather_cache_values(
@@ -377,17 +420,11 @@ def gather_cache_values(
     import jax.numpy as jnp
 
     record_words = elements if fp32 else elements // 2
-    spread = jnp.arange(records.size, dtype=records.dtype).reshape(records.shape)
-    spread %= cache.shape[0] * ROW_WORDS // record_words
-    records = jnp.where(records >= 0, records, spread)
-    words = _gather_words(cache, records, record_words)
+    words = _gather_records(cache, records, record_words)
     if fp32:
         return jax.lax.bitcast_convert_type(words, jnp.float32)
     if split:
-        halves = (words << 16, words & jnp.int32(-65536))
-        return jnp.concatenate(
-            [jax.lax.bitcast_convert_type(h, jnp.float32) for h in halves], axis=1
-        ).astype(jnp.bfloat16)
+        return jnp.concatenate(_split_words(words), axis=1)
     # Keep the consumer's final shape; rank-increasing bitcasts add TPU padding.
     columns = jnp.arange(elements)[None]
     selected = jnp.take_along_axis(words, columns // 2, axis=1)
