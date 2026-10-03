@@ -161,6 +161,11 @@ case "$SHARDING" in
   *) echo "ERROR: unknown SHARDING='$SHARDING' (DP8_EP, TP8_EP, DP4TP2_EP are wired up)" >&2; exit 1 ;;
 esac
 
+TPU_DVFS_P_STATE="${TPU_DVFS_P_STATE-7}"
+if [ -n "${TPU_DVFS_P_STATE}" ]; then
+  export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:+$LIBTPU_INIT_ARGS }--xla_tpu_dvfs_p_state=${TPU_DVFS_P_STATE}"
+fi
+
 # Headroom over ISL+OSL (matches InferenceX qwen3.5: ISL+OSL+20; the DP8_EP
 # case set its own above)
 MAX_MODEL_LEN_BUFFER="${MAX_MODEL_LEN_BUFFER:-20}"
