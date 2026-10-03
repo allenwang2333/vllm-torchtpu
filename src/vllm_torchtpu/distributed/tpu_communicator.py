@@ -58,10 +58,14 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         op = getattr(self, "_twoshot_ar", None)
+        # The size cut-off is a Python branch: on a symbolic dim (the MTP drafter compiles once
+        # with a symbolic token count) it would specialize the graph and force a second compile,
+        # which vLLM's backend refuses. Such traces keep XLA's all-reduce.
+        if op is None or any(type(d) is not int for d in input_.shape):
+            return super().all_reduce(input_)
         nbytes = input_.numel() * input_.element_size()
         if (
-            op is not None
-            and nbytes <= _TWOSHOT_MAX_BYTES
+            nbytes <= _TWOSHOT_MAX_BYTES
             and input_.numel() % self.world_size == 0
             and input_.dim() >= 1
         ):

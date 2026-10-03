@@ -82,6 +82,14 @@ def _gather_as_kernel(x: torch.Tensor, group: Any) -> torch.Tensor | None:
     return op(x.reshape(x.shape[0], -1)).view(world, *x.shape)
 
 
+def _static(*xs: torch.Tensor) -> bool:
+    """Whether every dim is a concrete int. The size cut-offs below are Python branches: on a
+    symbolic dim (the MTP drafter compiles once with a symbolic token count) a branch would
+    specialize the graph and force a second compile, which vLLM's backend refuses
+    (`configure_post_pass` asserts). Such traces keep the stock collectives."""
+    return all(type(d) is int for x in xs for d in x.shape)
+
+
 def _a2a(x: torch.Tensor, group: Any) -> torch.Tensor:
     """all_to_all_single over dim 0: chunk j goes to rank j, chunk i of the result came from
     rank i."""
@@ -93,12 +101,12 @@ def _a2a(x: torch.Tensor, group: Any) -> torch.Tensor:
 def _gather_as_a2a(x: torch.Tensor, group: Any) -> torch.Tensor | None:
     """`[world, *x.shape]`, rank i's `x` at index i, or None when the all-to-all would be
     larger than the gather's latency floor is worth."""
+    if envs.TPU_DCP_COLLECTIVE_IMPL not in ("a2a", "kernel") or not _static(x):
+        return None
     if envs.TPU_DCP_COLLECTIVE_IMPL == "kernel":
         stacked = _gather_as_kernel(x, group)
         if stacked is not None:
             return stacked
-    if envs.TPU_DCP_COLLECTIVE_IMPL not in ("a2a", "kernel"):
-        return None
     world = int(group.world_size)
     if world * x.numel() * x.element_size() > _A2A_GATHER_MAX_BYTES:
         return None
@@ -186,11 +194,14 @@ def merge_lse_partials_scatter_heads(
 
     if (
         envs.TPU_DCP_COLLECTIVE_IMPL in ("a2a", "kernel")
+        and _static(output, lse)
         and output.numel() * output.element_size() <= _A2A_SCATTER_MAX_BYTES
     ):
         return _merge_at_receiver(output, lse, group)
     weighted = _weight_by_lse(output, lse, group)
     world = int(group.world_size)
+    if not _static(weighted):
+        return group.reduce_scatter(weighted, dim=1).to(output.dtype)
     nbytes = weighted.numel() * weighted.element_size()
     op = _KERNEL_OPS.get("reduce_scatter")
     if op is not None and nbytes <= _KERNEL_SCATTER_MAX_BYTES:
