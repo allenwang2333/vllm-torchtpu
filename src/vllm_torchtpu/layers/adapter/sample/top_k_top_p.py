@@ -21,9 +21,6 @@ from collections.abc import Callable, Sequence
 
 import torch
 
-# Registers the fast top-p op at import (not lazily inside a traced graph).
-from vllm_torchtpu.layers.adapter.sample import fast_top_p_op
-
 MASKED_LOGIT_VALUE = -1e12
 
 
@@ -32,6 +29,7 @@ def _int32_bsearch(
     predicate: Callable[[torch.Tensor], torch.Tensor],
     device: torch.device,
     radix_bits: int = 1,
+    skip_bits: int = 0,
 ) -> torch.Tensor:
     """Batched binary search over int32 values.
 
@@ -53,6 +51,8 @@ def _int32_bsearch(
         digit is the number of candidates that return False. Monotonicity makes
         that the same digit the 1-bit search picks, in 1/radix_bits the rounds
         (each round is one pass over the predicate's input).
+      skip_bits: mask of bits 30..0 the caller has proven the 1-bit search
+        never sets (radix_bits == 1 only); their rounds are not run.
 
     Returns:
       For each element of the batch, the largest int32 for which the predicate
@@ -89,6 +89,8 @@ def _int32_bsearch(
 
     for i in range(31):
         bit = 1 << (30 - i)
+        if skip_bits & bit:
+            continue
         bit_t = torch.full_like(current_bits, bit)
         midpoint = current_bits | bit
         current_bits = current_bits | torch.where(predicate(midpoint), zero, bit_t)
@@ -146,6 +148,7 @@ def _float32_bsearch(
     predicate: Callable[[torch.Tensor], torch.Tensor],
     device: torch.device,
     radix_bits: int = 1,
+    skip_bits: int = 0,
 ) -> torch.Tensor:
     """Binary search on finite float32 numbers.
 
@@ -184,7 +187,7 @@ def _float32_bsearch(
 
     # We search over bit patterns, which requires bit shifting and ordering of
     # bit patterns. This is natively supported on int32 but not on float32.
-    result = _int32_bsearch(batch_shape, int32_predicate, device, radix_bits)
+    result = _int32_bsearch(batch_shape, int32_predicate, device, radix_bits, skip_bits)
     return _monotonic_int32_to_float32(result)
 
 
@@ -229,38 +232,32 @@ def topk_mask(
     return torch.where(logits >= cutoff, logits, replace_tensor)
 
 
-def _parse_fast_top_p(spec: str) -> tuple[int, str, str, int]:
-    """ "K[,method[,mass_accum[,window]]]" -> (K, method, mass_accum, window)."""
-    parts = [x.strip() for x in spec.split(",")] + [""] * 3
-    return (
-        int(parts[0]),
-        parts[1] or FAST_TOP_P_METHOD,
-        parts[2] or FAST_TOP_P_MASS_ACCUM,
-        int(parts[3] or FAST_TOP_P_WINDOW),
-    )
+def _topp_bisect_threshold(
+    probs: torch.Tensor, p: torch.Tensor, radix_bits: int, fast: bool = False
+):
+    """The top-p threshold bisection; ``fast`` skips the provably idle steps.
 
+    The predicate depends on a threshold t only through the set
+    {probs >= t}, and is monotonic, so the search returns the largest value
+    of probs at which it is False (``_float32_bsearch`` sets a bit iff the
+    predicate at ``current | bit`` is False). With ``fast``:
 
-# Defaults of a fast_top_p spec (kernels/top_p.py). "native": torch_tpu sums a
-# bf16 tensor like a bf16 stablehlo reduce -- bit for bit on tpu7x
-# (test_fast_top_p_matches_bisection); "f32" does not match it.
-FAST_TOP_P_K = 1024
-FAST_TOP_P_METHOD = "topk"
-FAST_TOP_P_MASS_ACCUM = "native"
-FAST_TOP_P_WINDOW = 2
+    * bit 30 is never set: its midpoint is 2.0 (or below -2.0 on the
+      all-True sign branch), where mass(probs >= 2.0) = 0 < p since softmax
+      probs <= 1 and top_p > 0 (and below -2.0 the set is that of 0.0, True on
+      that branch). So that step is skipped.
+    * for bf16 probs on the positive branch, bits 15..0 are never set: the
+      answer is a bf16 value v (low 16 bits zero), and every midpoint v | bit
+      lies strictly between v and the next bf16 value, where {probs >= t} is
+      the set at that next value, at which the predicate is True. 16 steps
+      skipped. On the sign branch (predicate True at 0.0, so at every finite
+      t <= 0) the full search walks to the last nonfinite pattern, -inf; the
+      shortened one stops inside the negative NaNs, so NaN is mapped to -inf
+      (the positive branch only ever yields finite values in [0, 1]).
 
-
-def fast_topp_threshold(
-    probs: torch.Tensor, p: torch.Tensor, spec: str
-) -> torch.Tensor:
-    """The bisection's top-p threshold [B, 1] f32, via kernels/top_p.py on TPU.
-
-    Off TPU it is the bisection itself (the JAX op only runs on TPU)."""
-    if probs.device.type != "tpu":
-        return _topp_bisect_threshold(probs, p.squeeze(-1), 1).unsqueeze(-1)
-    return fast_top_p_op.top_p_threshold(probs, p.float(), *_parse_fast_top_p(spec))
-
-
-def _topp_bisect_threshold(probs: torch.Tensor, p: torch.Tensor, radix_bits: int):
+    Same predicate evaluations at every step that runs, so the same threshold
+    bit for bit: bf16 rows 15 evaluations instead of 32, f32 rows 31.
+    """
     zero_val = torch.zeros_like(probs)
 
     def predicate(threshold: torch.Tensor) -> torch.Tensor:
@@ -271,6 +268,17 @@ def _topp_bisect_threshold(probs: torch.Tensor, p: torch.Tensor, radix_bits: int
         )
         return probability_mass < p
 
+    if fast and radix_bits == 1:
+        lattice = probs.dtype == torch.bfloat16
+        skip = (1 << 30) | ((1 << 16) - 1 if lattice else 0)
+        result = _float32_bsearch(
+            probs.shape[:-1], predicate, probs.device, 1, skip_bits=skip
+        )
+        if lattice:
+            result = torch.where(
+                torch.isnan(result), torch.full_like(result, -torch.inf), result
+            )
+        return result
     return _float32_bsearch(probs.shape[:-1], predicate, probs.device, radix_bits)
 
 
@@ -279,7 +287,7 @@ def topp_mask(
     p: torch.Tensor,
     replace_val: float = MASKED_LOGIT_VALUE,
     radix_bits: int = 1,
-    fast_top_p: str = "",
+    fast_top_p: bool = False,
 ) -> torch.Tensor:
     """Applies top-p masking to logits.
 
@@ -301,22 +309,19 @@ def topp_mask(
       logits: Logits before masking. [batch..., vocab_size]
       p: Minimum probability mass requested. [batch..., 1]
       replace_val: For the masked values of logits, what to overwrite them with.
-      fast_top_p: "" for the bisection, else a "K[,method[,mass_accum]]" spec:
-        the same threshold from a K-candidate prefilter proven by one vocab
-        pass, falling back to the bisection when the proof fails
-        (kernels/top_p.py). [batch, vocab_size] inputs only.
+      fast_top_p: skip the bisection steps proven idle for softmax probs
+        (bit 30; bits 15..0 for bf16) -- same threshold bit for bit, see
+        _topp_bisect_threshold. Needs top_p > 0.
 
     Returns:
       masked version of logits. [batch..., vocab_size]
     """
     probs = torch.softmax(logits, dim=-1)
     replace_tensor = torch.full_like(logits, replace_val)
-    if fast_top_p:
-        threshold = fast_topp_threshold(probs, p, fast_top_p)
-    else:
-        threshold = _topp_bisect_threshold(probs, p.squeeze(-1), radix_bits).unsqueeze(
-            -1
-        )
+    threshold = _topp_bisect_threshold(
+        probs, p.squeeze(-1), radix_bits, fast_top_p
+    ).unsqueeze(-1)
+
     return torch.where(probs >= threshold, logits, replace_tensor)
 
 
@@ -327,7 +332,7 @@ def apply_top_k_top_p(
     need_top_k: bool = True,
     need_top_p: bool = True,
     radix_bits: int = 1,
-    fast_top_p: str = "",
+    fast_top_p: bool = False,
 ) -> torch.Tensor:
     """Top-k then top-p masking, per row.
 
@@ -335,8 +340,8 @@ def apply_top_k_top_p(
     that some row has top_k > 0 / top_p < 1. When False, every row's
     torch.where below would select the unmasked input, so the mask is skipped
     whole: bit-identical output, minus 32-33 full-vocab reduction passes.
-    fast_top_p (static, see topp_mask) computes the same top-p threshold in
-    one proven vocab pass instead of 33.
+    fast_top_p (static, see topp_mask) runs the same top-p bisection minus
+    its provably idle steps: 15 vocab passes instead of 32 on bf16 rows.
     """
     masked_logits = logits
     if need_top_k:

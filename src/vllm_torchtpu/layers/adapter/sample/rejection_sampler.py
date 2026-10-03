@@ -72,7 +72,7 @@ class RejectionSampler:
         need_top_k: bool = True,
         need_top_p: bool = True,
         radix_bits: int = 1,
-        fast_top_p: str = "",
+        fast_top_p: bool = False,
     ) -> torch.Tensor:
         return self.forward(
             draft_token_ids=draft_token_ids,
@@ -112,7 +112,7 @@ class RejectionSampler:
         need_top_k: bool = True,
         need_top_p: bool = True,
         radix_bits: int = 1,
-        fast_top_p: str = "",
+        fast_top_p: bool = False,
     ) -> torch.Tensor:
         """Performs rejection sampling for speculative decoding.
 
@@ -138,8 +138,8 @@ class RejectionSampler:
             top_k > 0 / top_p < 1 (do_sampling only); False skips that mask,
             which would be the identity on every row.
           radix_bits: bits per pass of the top-k/top-p threshold bisection.
-          fast_top_p: static top-p threshold spec (see top_k_top_p.topp_mask);
-            "" bisects.
+          fast_top_p: static; skip the top-p bisection's provably idle steps
+            (same threshold, see top_k_top_p.topp_mask).
 
         Returns:
           A tensor of shape [batch_size, max_draft_tokens + 1] containing the
@@ -378,7 +378,7 @@ def _random_rejection_sample_with_segment_impl(
     need_top_k: bool = True,
     need_top_p: bool = True,
     radix_bits: int = 1,
-    fast_top_p: str = "",
+    fast_top_p: bool = False,
 ) -> torch.Tensor:
     """Vectorized non-greedy speculative decoding validation in Torch."""
     total_tokens = draft_token_ids.shape[0]

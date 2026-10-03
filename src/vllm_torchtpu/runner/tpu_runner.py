@@ -104,10 +104,7 @@ from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     RejectionSampler,
     _random_rejection_sample_with_segment_impl,
 )
-from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
-    FAST_TOP_P_K,
-    apply_top_k_top_p,
-)
+from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilderContext,
@@ -422,7 +419,7 @@ def _sample_from_logits_impl(
     need_top_k: bool = True,
     need_top_p: bool = True,
     radix_bits: int = 1,
-    fast_top_p: str = "",
+    fast_top_p: bool = False,
 ) -> torch.Tensor:
     """Non-greedy body of TPUModelRunner.sample_from_logits (traced inline)."""
     is_greedy = temperatures <= SAMPLING_EPS
@@ -916,12 +913,8 @@ class TPUModelRunner(GPUModelRunner):
         )
         self._sampler_need_top_k = True
         self._sampler_need_top_p = True
-        # TPU_SAMPLER_FAST_TOP_P: static top-p threshold spec ("" = bisect).
-        self._sampler_fast_top_p = (
-            (envs.TPU_SAMPLER_FAST_TOP_P_SPEC or str(FAST_TOP_P_K))
-            if envs.TPU_SAMPLER_FAST_TOP_P
-            else ""
-        )
+        # TPU_SAMPLER_FAST_TOP_P: top-p bisection minus its idle steps.
+        self._sampler_fast_top_p = bool(envs.TPU_SAMPLER_FAST_TOP_P)
         # TPU_SAMPLER_FUSED_CHAIN: one compiled non-greedy verify program.
         self._sampler_fused_chain = bool(envs.TPU_SAMPLER_FUSED_CHAIN)
 
@@ -5566,9 +5559,7 @@ class TPUModelRunner(GPUModelRunner):
     def _sampler_light_variants(self) -> list[dict[str, Any]]:
         """Every static-kwarg variant _sampler_kwargs() can return at runtime
         (none with the flag off)."""
-        fast = (
-            {"fast_top_p": self._sampler_fast_top_p} if self._sampler_fast_top_p else {}
-        )
+        fast = {"fast_top_p": True} if self._sampler_fast_top_p else {}
         if not self._sampler_light:
             return [fast] if fast else []
         return [
@@ -6942,7 +6933,7 @@ class TPUModelRunner(GPUModelRunner):
                 "radix_bits": self._sampler_radix_bits,
             }
         if self._sampler_fast_top_p:
-            kwargs["fast_top_p"] = self._sampler_fast_top_p
+            kwargs["fast_top_p"] = True
         return kwargs
 
     def _apply_temperature(
@@ -6965,7 +6956,7 @@ class TPUModelRunner(GPUModelRunner):
         need_top_k: bool = True,
         need_top_p: bool = True,
         radix_bits: int = 1,
-        fast_top_p: str = "",
+        fast_top_p: bool = False,
     ) -> torch.Tensor:
         """
         Sample with xla-friendly function. This function is to be traced
@@ -7005,7 +6996,7 @@ class TPUModelRunner(GPUModelRunner):
         need_top_k: bool = True,
         need_top_p: bool = True,
         radix_bits: int = 1,
-        fast_top_p: str = "",
+        fast_top_p: bool = False,
     ) -> torch.Tensor:
         """TPU_SAMPLER_FUSED_CHAIN: the non-greedy, grammar-free branch of
         _sample_spec_verify_chunk as one program -- the logits gathers, bonus

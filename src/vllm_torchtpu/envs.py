@@ -168,7 +168,6 @@ if TYPE_CHECKING:
     TPU_SAMPLER_VOCAB_PARALLEL: bool = False
     TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
     TPU_SAMPLER_FAST_TOP_P: bool = False
-    TPU_SAMPLER_FAST_TOP_P_SPEC: str = ""
     TPU_SAMPLER_FUSED_CHAIN: bool = False
     TPU_FP8_LINEAR_PALLAS_SITES: str = (
         "fused_qkv_a_proj,q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
@@ -1077,14 +1076,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SAMPLER_BSEARCH_RADIX_BITS": env_nonnegative_int(
         "TPU_SAMPLER_BSEARCH_RADIX_BITS", 0
     ),
-    # Non-greedy sampler + verify: compute the top-p threshold from a top-K
-    # candidate prefilter proven exact by one vocab pass (lax.cond falls back
-    # to the bisection when the proof fails), instead of the 33-pass
-    # bisection. Same kept set bit for bit (kernels/top_p.py).
+    # Non-greedy sampler + verify: run the top-p threshold bisection without
+    # the steps proven never to set a bit for softmax probs (bit 30; bits 15..0
+    # on the bf16 bonus rows): 15 vocab passes instead of 32 there, 31 on f32
+    # verify rows. Same threshold bit for bit (top_k_top_p.topp_mask). A top-K
+    # candidate prefilter was measured 10x slower (lax.top_k sorts the vocab).
     "TPU_SAMPLER_FAST_TOP_P": env_bool("TPU_SAMPLER_FAST_TOP_P"),
-    # "K[,method[,mass_accum]]" override of the fast top-p defaults in
-    # layers/adapter/sample/top_k_top_p.py. "" = defaults.
-    "TPU_SAMPLER_FAST_TOP_P_SPEC": env_str("TPU_SAMPLER_FAST_TOP_P_SPEC", ""),
     # Non-greedy spec verify: logits gathers, bonus sampling, the per-token
     # param gathers and the rejection sampler as ONE compiled program (the
     # three uniform draws stay eager: same generator, shapes and order).

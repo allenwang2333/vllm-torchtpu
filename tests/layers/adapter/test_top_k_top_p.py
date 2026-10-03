@@ -167,18 +167,45 @@ def _fast_top_p_cases(rows, vocab, seed):
     yield "mass_on_p", x
 
 
-@pytest.mark.parametrize(
-    "spec", ["1024", "8", "1024,topk,native,0", "4096,topk,native,1", "512,approx"]
-)
-def test_fast_top_p_matches_bisection(device, spec, monkeypatch):
-    """On TPU: the fast threshold op keeps exactly the bisection's set.
+_FAST_P = [0.95, 0.9, 0.5, 0.99, 0.1, 1.0, 0.95, 0.7, 1e-6, 0.999999] * 2
 
-    Both sides compiled like the sampler graphs; f32 rows like the verify
-    program and bf16 rows like the bonus program. spec "8" forces the
-    lax.cond fallback on every wide row.
-    """
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fast_top_p_is_bit_identical(dtype):
+    """fast_top_p skips only bisection steps proven idle: same masked logits."""
+    rows, vocab = 20, 4096
+    top_p = torch.tensor(_FAST_P).view(-1, 1)
+    for name, x in _fast_top_p_cases(rows, vocab, seed=5):
+        logits = x.to(dtype)
+        want = sampling.topp_mask(logits, top_p)
+        got = sampling.topp_mask(logits, top_p, fast_top_p=True)
+        assert torch.equal(got, want), (str(dtype), name)
+        k = torch.zeros((rows, 1), dtype=torch.int32)
+        want = sampling.apply_top_k_top_p(logits, k, top_p, False, True)
+        got = sampling.apply_top_k_top_p(logits, k, top_p, False, True, 1, True)
+        assert torch.equal(got, want), (str(dtype), name)
+
+
+def test_skip_bits_matches_full_search_when_idle():
+    # A threshold whose skipped bits are zero is found in fewer rounds.
+    thresholds = torch.tensor([0, 1 << 16, 7 << 20, (1 << 30) - (1 << 16)])
+    full = sampling._int32_bsearch(
+        thresholds.shape, lambda x: x > thresholds, thresholds.device
+    )
+    fast = sampling._int32_bsearch(
+        thresholds.shape,
+        lambda x: x > thresholds,
+        thresholds.device,
+        skip_bits=(1 << 30) | 0xFFFF,
+    )
+    torch.testing.assert_close(fast, full)
+
+
+def test_fast_top_p_matches_bisection(device, monkeypatch):
+    """On TPU, compiled like the sampler graphs: f32 rows like the verify
+    program and bf16 rows like the bonus program."""
     if device.type != "tpu":
-        pytest.skip("the fast top-p op runs on TPU only")
+        pytest.skip("compiled TPU check")
     monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 64)
     monkeypatch.setattr(torch._dynamo.config, "cache_size_limit", 64)
 
@@ -186,14 +213,12 @@ def test_fast_top_p_matches_bisection(device, spec, monkeypatch):
     def mask(logits, top_k, top_p, fast):
         return sampling.apply_top_k_top_p(logits, top_k, top_p, False, True, 1, fast)
 
-    rows, vocab = 16, 154880
+    rows, vocab = 20, 154880
     top_k = torch.zeros((rows, 1), dtype=torch.int32, device=device)
-    top_p = torch.tensor(
-        [0.95, 0.9, 0.5, 0.99, 0.1, 1.0, 0.95, 0.7] * 2, device=device
-    ).view(-1, 1)
+    top_p = torch.tensor(_FAST_P, device=device).view(-1, 1)
     for dtype in (torch.float32, torch.bfloat16):
         for name, x in _fast_top_p_cases(rows, vocab, seed=3):
             logits = x.to(dtype).to(device)
-            want = mask(logits, top_k, top_p, "").cpu()
-            got = mask(logits, top_k, top_p, spec).cpu()
-            assert torch.equal(got, want), (spec, str(dtype), name)
+            want = mask(logits, top_k, top_p, False).cpu()
+            got = mask(logits, top_k, top_p, True).cpu()
+            assert torch.equal(got, want), (str(dtype), name)
