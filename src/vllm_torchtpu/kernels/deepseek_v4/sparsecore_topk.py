@@ -539,15 +539,26 @@ def _sc_topk_direct(
     return slots_2d, keys_2d
 
 
-def _pick_partition(b: int, n: int, k: int) -> int:
+def _pick_partition(b: int, n: int, k: int, override: int | None = None) -> int:
     """Picks the power-of-two partition factor P (1..32) per row to maximize
 
     subcore utilization across all 32 subcores while fitting in VMEM.
+
+    ``override`` forces P instead (a power of two dividing ``n`` into slices of
+    at least ``LANES`` words); it is raised to the smallest P whose slice fits
+    tile memory. P may exceed ``32 // b``: stage 1 then runs in several waves.
     """
     p_min = _cdiv(n, MAX_SLICE_WORDS)
     p = 1
     while p < p_min:
         p *= 2
+    if override is not None:
+        if override < 1 or override & (override - 1):
+            raise ValueError(f"partition {override=} must be a power of two")
+        q = max(override, p)
+        if n % q or n // q < LANES:
+            raise ValueError(f"partition {q} does not divide {n=} into slices")
+        return q
 
     max_p = 32 // b if b < 32 else 1
     while p * 2 <= max_p:
@@ -557,6 +568,37 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         else:
             break
     return p
+
+
+# What `TPU_SC_TOPK_PARTITION_OVERRIDE=1` means: the indexer's cross-rank merge
+# (b = 16 decode rows over 16 x 2048 gathered candidates) as one call at P = 1
+# instead of the utilisation pick's P = 2 stage 1 + stage-2 merge. One
+# SparseCore launch and the stage-1/2 relayout fewer outweigh half the subcores
+# idling; the local top-k keeps its heuristic.
+DEFAULT_PARTITION_OVERRIDE = "global:1"
+
+
+def parse_partition_override(spec: str) -> tuple[int | None, int | None]:
+    """``"local:P,global:P"`` (either part optional) -> ``(local, global)``.
+
+    Empty / ``0`` / ``off`` means no override; ``1`` / ``on`` /
+    ``true`` means `DEFAULT_PARTITION_OVERRIDE`.
+    """
+    spec = (spec or "").strip().lower()
+    if spec in ("", "0", "off", "false", "no"):
+        return None, None
+    if spec in ("1", "on", "true", "yes"):
+        spec = DEFAULT_PARTITION_OVERRIDE
+    out = {"local": None, "global": None}
+    for part in spec.split(","):
+        key, sep, val = part.strip().partition(":")
+        if not sep or key not in out:
+            raise ValueError(f"bad partition override {spec!r}: want local:P,global:P")
+        p = int(val)
+        if p < 1 or p & (p - 1):
+            raise ValueError(f"bad partition override {spec!r}: P must be 2**i")
+        out[key] = p
+    return out["local"], out["global"]
 
 
 def _gather_payload(
@@ -582,6 +624,7 @@ def _gather_payload(
         "return_scores",
         "fused_payload",
         "single_slice",
+        "partition",
     ),
 )
 def sparsecore_topk(
@@ -597,6 +640,7 @@ def sparsecore_topk(
     payload_offset: jax.Array | None = None,  # i32[b], multiple of LANES
     fused_payload: bool = False,
     single_slice: bool = False,
+    partition: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
 
@@ -631,6 +675,12 @@ def sparsecore_topk(
     when any row overflows the slice. Identical arrays either way. The common
     path's call stays outside the conditional, so it keeps its scheduling
     group.
+
+    ``partition`` forces the subcore partition factor P (see `_pick_partition`)
+    instead of the utilisation heuristic. ``partition=1`` on rows that fit one
+    slice is a single call with no stage-2 merge, trading subcore utilisation
+    for one SparseCore launch fewer. With ``single_slice`` it also sets the
+    in-place read window to ``n // P``. The returned arrays do not change.
     """
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
@@ -657,7 +707,7 @@ def sparsecore_topk(
             payload_offset = jnp.zeros((b,), jnp.int32)
         payload_offset = payload_offset.astype(jnp.int32)
 
-    p = _pick_partition(b, n, k)
+    p = _pick_partition(b, n, k, partition)
 
     # Fast-path: single-stage execution when p == 1
     if p == 1:
