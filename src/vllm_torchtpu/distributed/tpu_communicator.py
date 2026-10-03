@@ -58,10 +58,12 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         op = getattr(self, "_twoshot_ar", None)
-        # The size cut-off is a Python branch: on a symbolic dim (the MTP drafter compiles once
-        # with a symbolic token count) it would specialize the graph and force a second compile,
-        # which vLLM's backend refuses. Such traces keep XLA's all-reduce.
-        if op is None or any(type(d) is not int for d in input_.shape):
+        # The size cut-off is a Python branch on the token count: only the backbone warmup gives
+        # each side of such a branch its own trace (shape_variants). The MTP drafter is traced
+        # once for all buckets and would freeze the branch, so it keeps XLA's all-reduce.
+        from vllm_torchtpu.compilation import shape_variants
+
+        if op is None or not shape_variants.in_warmup():
             return super().all_reduce(input_)
         nbytes = input_.numel() * input_.element_size()
         if (

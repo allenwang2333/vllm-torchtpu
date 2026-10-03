@@ -82,12 +82,16 @@ def _gather_as_kernel(x: torch.Tensor, group: Any) -> torch.Tensor | None:
     return op(x.reshape(x.shape[0], -1)).view(world, *x.shape)
 
 
-def _static(*xs: torch.Tensor) -> bool:
-    """Whether every dim is a concrete int. The size cut-offs below are Python branches: on a
-    symbolic dim (the MTP drafter compiles once with a symbolic token count) a branch would
-    specialize the graph and force a second compile, which vLLM's backend refuses
-    (`configure_post_pass` asserts). Such traces keep the stock collectives."""
-    return all(type(d) is int for x in xs for d in x.shape)
+def _static(*_xs: torch.Tensor) -> bool:
+    """Whether the size cut-offs below may run. They are Python branches on the token count, so
+    they are only taken inside the backbone warmup (`shape_variants.in_warmup`), which gives
+    each side of a token-count branch its own trace. Every other trace -- the MTP drafter is
+    traced once with a symbolic token count and compiled for all buckets -- would freeze the
+    branch at its first bucket (ShapeSpecializationError for the rest), so it keeps the stock
+    collectives."""
+    from vllm_torchtpu.compilation import shape_variants
+
+    return shape_variants.in_warmup()
 
 
 def _a2a(x: torch.Tensor, group: Any) -> torch.Tensor:
