@@ -418,22 +418,25 @@ def _split_words(words: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 def gather_cache_pieces(
     cache: jax.Array, records: jax.Array, elements: int
-) -> list[jax.Array]:
-    """BF16 records as element pieces in `piece_order`; see `gather_cache_values`.
+) -> jax.Array:
+    """BF16 records as stacked ``[pieces, n, width]`` in `piece_order`.
 
-    Records spanning several word rows gather each row separately: one
-    interleaved gather would need a costly ``[2n, 128] -> [n, 256]`` relayout.
+    See `gather_cache_values`. Records spanning several word rows are read
+    word-row-major in one gather (``[rows, n, 128]`` needs no relayout, unlike
+    an interleaved ``[2n, 128] -> [n, 256]``; one gather stays on SparseCore).
     """
+    import jax.numpy as jnp
+
     record_words = elements // 2
     if record_words <= ROW_WORDS:
-        return list(_split_words(_gather_records(cache, records, record_words)))
+        return jnp.stack(_split_words(_gather_records(cache, records, record_words)))
     chunks = record_words // ROW_WORDS
     records = _valid_records(cache, records, record_words) * chunks
-    return [
-        piece
-        for chunk in range(chunks)
-        for piece in _split_words(cache[records + chunk])
-    ]
+    rows = (records[None] + jnp.arange(chunks, dtype=records.dtype)[:, None]).reshape(
+        -1
+    )
+    even, odd = _split_words(cache[rows].reshape(chunks, records.size, ROW_WORDS))
+    return jnp.stack([even, odd], axis=1).reshape(2 * chunks, records.size, ROW_WORDS)
 
 
 def gather_cache_values(
@@ -454,7 +457,12 @@ def gather_cache_values(
     import jax.numpy as jnp
 
     if split:
-        return jnp.concatenate(gather_cache_pieces(cache, records, elements), axis=1)
+        if elements // 2 <= ROW_WORDS:
+            words = _gather_records(cache, records, elements // 2)
+            return jnp.concatenate(_split_words(words), axis=1)
+        return jnp.concatenate(
+            list(gather_cache_pieces(cache, records, elements)), axis=1
+        )
     record_words = elements if fp32 else elements // 2
     words = _gather_records(cache, records, record_words)
     if fp32:

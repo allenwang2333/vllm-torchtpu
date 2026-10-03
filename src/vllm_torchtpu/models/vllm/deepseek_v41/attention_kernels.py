@@ -36,20 +36,17 @@ def _attend(q, pool, records, state, scale, tile=64):
     records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
 
     # Gather BF16 rows once outside; keep FP32 scratch tiled. Rows and q use
-    # the split element order (no per-element unpack gather), kept as
-    # separate pieces; attention is invariant to a shared permutation of the
-    # head dimension.
-    gathered = tuple(
-        values.reshape(tokens, records.shape[1], -1)
-        for values in gather_cache_pieces(pool, records.reshape(-1), dim)
-    )
-    piece = dim // len(gathered)
+    # the split element order (no per-element unpack gather), as stacked
+    # pieces contracted in one dot; attention is invariant to a shared
+    # permutation of the head dimension.
+    gathered = gather_cache_pieces(pool, records.reshape(-1), dim)
+    count = gathered.shape[0]
+    gathered = gathered.reshape(count, tokens, records.shape[1], -1)
 
     def pieces(x):
-        x = split_halves(x)
-        return tuple(x[..., i * piece : (i + 1) * piece] for i in range(len(gathered)))
+        return split_halves(x).reshape(*x.shape[:-1], count, -1)
 
-    q = pieces(q)
+    q = pieces(q).astype(jnp.float32)
     maximum, denominator, numerator = state
     state = maximum, denominator, pieces(numerator)
 
@@ -57,23 +54,17 @@ def _attend(q, pool, records, state, scale, tile=64):
         maximum, denominator, numerator = carry
         addresses = jax.lax.dynamic_slice_in_dim(records, index * tile, tile, axis=1)
         valid = addresses >= 0
-        kv = tuple(
-            jnp.where(
-                valid[..., None],
-                jax.lax.dynamic_slice_in_dim(values, index * tile, tile, axis=1),
-                0,
-            )
-            for values in gathered
+        kv = jnp.where(
+            valid[None, ..., None],
+            jax.lax.dynamic_slice_in_dim(gathered, index * tile, tile, axis=2),
+            0,
         )
         scores = (
-            sum(
-                jnp.einsum(
-                    "thd,tkd->thk",
-                    q_half.astype(jnp.float32),
-                    kv_half.astype(jnp.float32),
-                    preferred_element_type=jnp.float32,
-                )
-                for q_half, kv_half in zip(q, kv)
+            jnp.einsum(
+                "thpd,ptkd->thk",
+                q,
+                kv.astype(jnp.float32),
+                preferred_element_type=jnp.float32,
             )
             * scale
         )
@@ -82,22 +73,18 @@ def _attend(q, pool, records, state, scale, tile=64):
         correction = jnp.exp(maximum - new_max)
         exponentials = jnp.exp(scores - new_max[..., None])
         denominator = denominator * correction + exponentials.sum(-1)
-        numerator = tuple(
-            numerator_half * correction[..., None]
-            + jnp.einsum(
-                "thk,tkd->thd",
-                exponentials.astype(jnp.bfloat16),
-                kv_half,
-                preferred_element_type=jnp.float32,
-            )
-            for numerator_half, kv_half in zip(numerator, kv)
+        numerator = numerator * correction[..., None, None] + jnp.einsum(
+            "thk,ptkd->thpd",
+            exponentials.astype(jnp.bfloat16),
+            kv,
+            preferred_element_type=jnp.float32,
         )
         return new_max, denominator, numerator
 
     maximum, denominator, numerator = jax.lax.fori_loop(
         0, records.shape[1] // tile, step, state
     )
-    return maximum, denominator, merge_halves(jnp.concatenate(numerator, axis=-1))
+    return maximum, denominator, merge_halves(numerator.reshape(*q.shape[:2], dim))
 
 
 def paged_attention_jax(
