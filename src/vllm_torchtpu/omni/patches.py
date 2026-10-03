@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """TPU runtime patches for vLLM-Omni diffusion models."""
 
+import dataclasses
 import functools
 import importlib
 from functools import cache as run_once
@@ -102,6 +103,7 @@ def apply_omni_tpu_patches() -> None:
     _patch_flow_match_scheduler_step_flush()
     _patch_group_norm_tpu()
     _patch_rotary_embedding_tpu()
+    _patch_z_image_transformer_block_flush()
 
 
 @functools.cache
@@ -183,7 +185,14 @@ def _patch_rotary_embedding_tpu() -> None:
     def _forward_native(
         self: Any, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     ) -> torch.Tensor:
-        if x.device.type != "tpu" or x.dim() < 3:
+        # On TPU, default matmul rounds fp32 inputs to bf16 on the MXU; only
+        # route low-precision activations (bf16/fp16, where the 0/+-1 MXU
+        # matmul is bit-exact) and preserve full fp32 precision when x is fp32.
+        if (
+            x.device.type != "tpu"
+            or x.dtype not in (torch.bfloat16, torch.float16)
+            or x.dim() < 3
+        ):
             return orig_forward_native(self, x, cos, sin)
         cos_h, sin_h = self._prepare_half_head_dim_cos_sin(cos, sin)
         if (
@@ -272,13 +281,14 @@ def _patch_group_norm_tpu() -> None:
     )
 
 
-def _tpu_materialize_async(tensor: torch.Tensor) -> bool:
+def _tpu_materialize_async(tensor: torch.Tensor | None = None) -> bool:
     """Dispatch the pending lazy graph that produces ``tensor`` without waiting.
 
     torch_tpu's ``DEFER_AND_FUSE`` eager mode queues ops until something reads a
     result; ``synchronize(t, wait=False)`` compiles + launches that graph and
     returns immediately, so the host can keep tracing the next step while the
-    device runs this one. Returns ``False`` when the API is unavailable.
+    device runs this one. Passing ``None`` flushes all pending tensors on the
+    current stream. Returns ``False`` when the API is unavailable.
     """
     try:
         from torch_tpu._internal.sync import synchronize as _tpu_synchronize
@@ -286,6 +296,128 @@ def _tpu_materialize_async(tensor: torch.Tensor) -> bool:
         return False
     _tpu_synchronize(tensor, wait=False)
     return True
+
+
+def _patch_z_image_transformer_block_flush() -> None:
+    # -------------------------------------------------------------------------
+    # Root cause (torch_tpu repeated-op heuristic mid-layer kSplitTraversal):
+    # After _patch_rotary_embedding_tpu reduces ZImageTransformerBlock to ~65
+    # aten ops, two consecutive blocks fit inside torch_tpu's 128-op repetition
+    # lookback window (RecordDeferredOpAndDetectRepetition, default mode
+    # TORCH_TPU_INTERNAL_DETECT_REPEATED_OPS="safe"). The heuristic triggers
+    # mid-layer at ``gate_msa * self.attention_norm2(attn_out)`` while 9
+    # intermediate tensors (adaLN gates/scales, residual x, attention_norm2,
+    # bf16 cos/sin casts) are simultaneously live on the Python stack, and
+    # MaterializeCurrentStream(kSplitTraversal) shatters each DiT block into 9
+    # separate XLA modules (~270 modules/step, ~15 ms/step of extra HBM
+    # traffic and launch overhead on tpu7x).
+    #
+    # Fix: flush asynchronously at the clean ZImageTransformerBlock boundary
+    # (before layer_id == 0 so pre-loop embeddings/refiners/unified inputs are
+    # already materialized, and after each block where only the output hidden
+    # state ``x`` is live). Every block in a stack then compiles to a single
+    # shared XLA module with one live output tensor, and the stream never
+    # accumulates two unmaterialized blocks.
+    # In addition, because every block now flushes its 4 Ulysses
+    # ``all_to_all_single`` collectives as a separate XLA module instead of
+    # accumulating 120+ collectives across all 30 blocks, we can mark
+    # ``ZImageTransformer2DModel._sp_plan["unified_prepare"]`` with
+    # ``auto_pad=True`` (Z-Image already pads sequences to ``SEQ_MULTI_OF=32``)
+    # so ``UlyssesParallelAttention`` skips the 240 per-layer ``_all_gather_int``
+    # host syncs in ``advanced_uaa`` mode (sp=4 / sp=8).
+    #
+    # REMOVAL CONDITION: torch_tpu's repeated-op detector aligns splits to
+    # module boundaries (or avoids materializing dead stack temporaries), or
+    # vLLM-Omni compiles ZImageTransformer2DModel with torch.compile.
+    # -------------------------------------------------------------------------
+    try:
+        z_img_mod = importlib.import_module(
+            "vllm_omni.diffusion.models.z_image.z_image_transformer"
+        )
+        block_cls = z_img_mod.ZImageTransformerBlock
+    except Exception:  # noqa: BLE001 - vllm_omni is an omni extra
+        logger.warning(
+            "vllm_omni z_image_transformer module not importable; "
+            "block flush patch skipped."
+        )
+        return
+
+    model_cls = getattr(z_img_mod, "ZImageTransformer2DModel", None)
+    sp_plan = getattr(model_cls, "_sp_plan", None)
+    if isinstance(sp_plan, dict):
+        unified_plan = sp_plan.get("unified_prepare")
+        if isinstance(unified_plan, dict):
+            sp_plan["unified_prepare"] = {
+                k: dataclasses.replace(v, auto_pad=True)
+                if dataclasses.is_dataclass(v) and hasattr(v, "auto_pad")
+                else v
+                for k, v in unified_plan.items()
+            }
+
+    # vLLM-Omni's registry sets ``ctx.sp_plan_hooks_applied = True`` on the
+    # temporary ForwardContext active during ``load_model()``, but every
+    # inference step constructs a fresh ``ForwardContext`` where
+    # ``sp_plan_hooks_applied`` resets to ``False``. Without restoring it on
+    # the step's ``ForwardContext``, ``ctx.sp_active`` ignores
+    # ``_sp_shard_depth == 0`` before ``unified_prepare`` and runs
+    # ``UlyssesParallelAttention`` on unsharded ``noise_refiner`` (S=4096) and
+    # ``context_refiner`` (S=32), all-to-all gathering ``4096 * sp`` tokens
+    # per rank (S=8192/16384/32768 at sp=2/4/8).
+    try:
+        fc_mod = importlib.import_module("vllm_omni.diffusion.forward_context")
+        is_fc_available = fc_mod.is_forward_context_available
+        get_fc = fc_mod.get_forward_context
+    except Exception:  # noqa: BLE001
+        is_fc_available = None
+        get_fc = None
+
+    def _has_sp_plan_hooks(module: Any) -> bool:
+        registry = getattr(module, "_hook_registry", None)
+        if registry is None:
+            return False
+        hooks = getattr(registry, "_hooks", getattr(registry, "hooks", None))
+        return bool(hooks) if isinstance(hooks, dict) else True
+
+    if (
+        model_cls is not None
+        and hasattr(model_cls, "forward")
+        and is_fc_available is not None
+        and get_fc is not None
+    ):
+        orig_model_forward = _unwrap_tpu_patch(model_cls.forward)
+
+        def _model_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+            if (
+                _has_sp_plan_hooks(getattr(self, "unified_prepare", None))
+                and is_fc_available()
+            ):
+                get_fc().sp_plan_hooks_applied = True
+            return orig_model_forward(self, *args, **kwargs)
+
+        model_cls.forward = _mark_tpu_patch(_model_forward, orig_model_forward)
+
+    orig_forward = _unwrap_tpu_patch(block_cls.forward)
+
+    def _forward_and_flush(self: Any, *args: Any, **kwargs: Any) -> Any:
+        x = args[0] if args else kwargs.get("x")
+        on_tpu = (
+            isinstance(x, torch.Tensor)
+            and getattr(getattr(x, "device", None), "type", None) == "tpu"
+        )
+        # noise_refiner[0] has layer_id == 1000; context_refiner[0] and
+        # layers[0] have layer_id == 0.
+        if on_tpu and getattr(self, "layer_id", None) in (0, 1000):
+            _tpu_materialize_async(None)
+        out = orig_forward(self, *args, **kwargs)
+        if on_tpu and isinstance(out, torch.Tensor):
+            _tpu_materialize_async(out)
+        return out
+
+    block_cls.forward = _mark_tpu_patch(_forward_and_flush, orig_forward)
+    logger.info(
+        "Applied TPU patch: async per-block graph flush around "
+        "ZImageTransformerBlock.forward."
+    )
 
 
 def _patch_flow_match_scheduler_step_flush() -> None:
@@ -315,7 +447,31 @@ def _patch_flow_match_scheduler_step_flush() -> None:
 
     orig_step = _unwrap_tpu_patch(scheduler_cls.step)
 
+    # The first ``step`` after ``set_timesteps`` resolves its sigma index with
+    # ``(self.timesteps == timestep).nonzero()``: on TPU that is a blocking
+    # device->host readback which also forces the whole deferred step-0 graph
+    # to run *synchronously*, so the host cannot trace step 1 while step 0
+    # executes (~64 ms exposed per image on tpu7x). Pipelines that start
+    # mid-schedule (image-to-image) call ``set_begin_index`` beforehand (the
+    # diffusers convention, which vLLM-Omni's ``get_timesteps`` follows); when
+    # they have not, the first call corresponds to ``timesteps[0]``.
+    def _resolve_first_step_index(self: Any, timestep: Any) -> None:
+        if getattr(self, "_step_index", None) is not None:
+            return
+        if getattr(self, "_begin_index", None) is not None:
+            return  # orig_step picks it up without a readback
+        if not (isinstance(timestep, torch.Tensor) and timestep.device.type == "tpu"):
+            return
+        timesteps: torch.Tensor | None = getattr(self, "timesteps", None)
+        if timesteps is None or not isinstance(timesteps, torch.Tensor):
+            return
+        if int(timesteps.numel()) == 0:
+            return
+        self._step_index = 0
+
     def _step_and_flush(self: Any, *args: Any, **kwargs: Any) -> Any:
+        timestep = args[1] if len(args) > 1 else kwargs.get("timestep")
+        _resolve_first_step_index(self, timestep)
         out = orig_step(self, *args, **kwargs)
         sample = out[0] if isinstance(out, tuple) else getattr(out, "prev_sample", None)
         device = getattr(sample, "device", None)
@@ -396,6 +552,9 @@ def apply_omni_model_specific_patches() -> None:
 
     ltx_cls._decode_output = _mark_tpu_patch(_safe_decode_output, orig_decode_output)
     logger.info("Applied TPU patch: safe LTX-2 CPU decode output.")
+
+    _patch_rotary_embedding_tpu()
+    _patch_z_image_transformer_block_flush()
 
 
 @run_once

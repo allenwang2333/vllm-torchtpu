@@ -413,6 +413,127 @@ def test_flow_match_scheduler_step_flush(monkeypatch):
     assert _Scheduler().step(None, None, cpu_sample, return_dict=False) == (cpu_sample,)
     assert calls == [tpu_sample]
 
+    # First-step index resolution avoids the blocking (timesteps == timestep).nonzero()
+    # D2H readback when _step_index and _begin_index are unset on TPU.
+    sched = _Scheduler()
+    sched._step_index = None
+    sched._begin_index = None
+    sched.timesteps = torch.tensor([1000.0, 500.0])
+    tpu_ts = MagicMock(spec=torch.Tensor)
+    tpu_ts.device = MagicMock()
+    tpu_ts.device.type = "tpu"
+    sched.step(None, tpu_ts, tpu_sample, return_dict=False)
+    assert sched._step_index == 0
+
+    # Explicit _begin_index (e.g. img2img) is left untouched.
+    sched2 = _Scheduler()
+    sched2._step_index = None
+    sched2._begin_index = 3
+    sched2.timesteps = torch.tensor([1000.0, 500.0])
+    sched2.step(None, tpu_ts, tpu_sample, return_dict=False)
+    assert sched2._step_index is None
+
+
+def test_z_image_transformer_block_flush(monkeypatch):
+    """ZImageTransformerBlock.forward flushes setup on 0/1000 and output per block."""
+    import dataclasses
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.omni import patches as omni_patches
+
+    events = []
+
+    @dataclasses.dataclass(frozen=True)
+    class _SPInput:
+        split_dim: int = 1
+        auto_pad: bool = False
+
+    class _Model:
+        _sp_plan = {"unified_prepare": {0: _SPInput(1, False), 1: _SPInput(1, False)}}
+
+        def __init__(self, hooks=None):
+            self.unified_prepare = SimpleNamespace(
+                _hook_registry=SimpleNamespace(_hooks=hooks)
+                if hooks is not None
+                else None
+            )
+
+        def forward(self, x):
+            return x
+
+    class _Block:
+        def __init__(self, layer_id: int):
+            self.layer_id = layer_id
+
+        def forward(self, x, *args, **kwargs):
+            events.append(("forward", self.layer_id))
+            return x
+
+    fake_ctx = SimpleNamespace(sp_plan_hooks_applied=False)
+    fake_fc = SimpleNamespace(
+        is_forward_context_available=lambda: True,
+        get_forward_context=lambda: fake_ctx,
+    )
+    fake_z_img = MagicMock()
+    fake_z_img.ZImageTransformerBlock = _Block
+    fake_z_img.ZImageTransformer2DModel = _Model
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.diffusion.models.z_image.z_image_transformer",
+        fake_z_img,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.diffusion.forward_context",
+        fake_fc,
+    )
+    monkeypatch.setattr(
+        omni_patches,
+        "_tpu_materialize_async",
+        lambda t=None: events.append(("flush", t)) or True,
+    )
+
+    orig_forward = _Block.forward
+    orig_model_forward = _Model.forward
+    omni_patches._patch_z_image_transformer_block_flush()
+    omni_patches._patch_z_image_transformer_block_flush()  # idempotent
+    assert _unwrap_tpu_patch(_Block.forward) is orig_forward
+    assert _unwrap_tpu_patch(_Model.forward) is orig_model_forward
+    assert all(v.auto_pad for v in _Model._sp_plan["unified_prepare"].values())
+
+    # Without SP hooks on unified_prepare (or after remove_sequence_parallel),
+    # sp_plan_hooks_applied is left untouched.
+    _Model(hooks=None).forward("x")
+    assert fake_ctx.sp_plan_hooks_applied is False
+    _Model(hooks={}).forward("x")
+    assert fake_ctx.sp_plan_hooks_applied is False
+
+    # With SP hooks registered on unified_prepare, forward restores
+    # sp_plan_hooks_applied = True on the step's ForwardContext.
+    _Model(hooks={"_sp_input_hook_unified_prepare": object()}).forward("x")
+    assert fake_ctx.sp_plan_hooks_applied is True
+
+    tpu_x = MagicMock(spec=torch.Tensor)
+    tpu_x.device = MagicMock()
+    tpu_x.device.type = "tpu"
+    cpu_x = torch.zeros(1)
+
+    assert _Block(1000).forward(tpu_x) is tpu_x
+    assert _Block(0).forward(tpu_x) is tpu_x
+    assert _Block(1).forward(tpu_x) is tpu_x
+    assert _Block(0).forward(cpu_x) is cpu_x
+    assert events == [
+        ("flush", None),
+        ("forward", 1000),
+        ("flush", tpu_x),
+        ("flush", None),
+        ("forward", 0),
+        ("flush", tpu_x),
+        ("forward", 1),
+        ("flush", tpu_x),
+        ("forward", 0),
+    ]
+
 
 @pytest.mark.parametrize(
     "shape, affine",

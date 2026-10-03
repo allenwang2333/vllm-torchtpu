@@ -155,17 +155,15 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         when the user left the mode at its default. An explicit
         ``ulysses_mode`` is never overridden.
 
-        Cost: on TPU, ``"advanced_uaa"`` currently pays a per-layer
-        ``_all_gather_int`` host sync in ``UlyssesParallelAttention`` because
-        ``ZImageTransformer2DModel._sp_plan["unified_prepare"]`` keeps
-        ``auto_pad=False``. Flipping it to ``auto_pad=True`` removes the sync but
-        queues 120+ async ``all_to_all_single`` collectives into one lazy PJRT
-        graph and deadlocks at ``ulysses_degree=8``; hence the WARNING below.
+        Note: ``_patch_z_image_transformer_block_flush`` also flips
+        ``ZImageTransformer2DModel._sp_plan["unified_prepare"]`` to
+        ``auto_pad=True`` now that per-block async graph flushes bound each
+        XLA module to a single block's 4 ``all_to_all_single`` collectives,
+        eliminating the per-layer ``_all_gather_int`` host sync in
+        ``UlyssesParallelAttention`` without deadlocking at ``ulysses_degree=8``.
         """
-        # TODO(go/torchtpu-diffusion-findings): Remove once either (a) vLLM-Omni
-        # selects advanced_uaa itself when n_heads % ulysses_degree != 0, or
-        # (b) torch_tpu no longer hangs on many async all_to_all_single ops in
-        # one lazy graph (the strict-mode failure this works around).
+        # TODO(go/torchtpu-diffusion-findings): Remove once vLLM-Omni selects
+        # advanced_uaa itself when n_heads % ulysses_degree != 0.
         p_cfg = getattr(od_config, "parallel_config", None)
         if p_cfg is None:
             return

@@ -144,27 +144,30 @@ class TestZImageComponentsOnTpu:
         _assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
 
     def test_z_image_unified_prepare_auto_pad_canary(self):
-        """Canary: upstream must keep ``auto_pad=False`` on ``unified_prepare``.
+        """Canary: TPU patch enables ``auto_pad=True`` on ``unified_prepare``.
 
         ``patchify_and_embed`` already pads image and caption sequences to
-        ``SEQ_MULTI_OF=32``, so ``auto_pad`` is a no-op numerically. It is not a
-        no-op for scheduling: ``auto_pad=True`` marks local sequence lengths as
-        equal, ``UlyssesParallelAttention`` then skips its per-layer sync, and
-        the resulting run of async ``all_to_all_single`` collectives in one lazy
-        PJRT graph deadlocks at ``ulysses_degree=8`` on TPU. If upstream flips
-        this flag, the multi-chip path needs re-validation before bumping the pin.
+        ``SEQ_MULTI_OF=32``, and ``_patch_z_image_transformer_block_flush``
+        flushes each ``ZImageTransformerBlock`` so a single XLA module only
+        contains that block's 4 ``all_to_all_single`` collectives instead of
+        accumulating 120+ across all 30 blocks. Marking ``unified_prepare``
+        with ``auto_pad=True`` lets ``UlyssesParallelAttention`` skip its 240
+        per-layer ``_all_gather_int`` host syncs in ``advanced_uaa`` mode
+        (``ulysses_degree=4`` and ``ulysses_degree=8``).
         """
         from vllm_omni.diffusion.models.z_image.z_image_transformer import (
             ZImageTransformer2DModel,
         )
 
+        from vllm_torchtpu.omni.patches import _patch_z_image_transformer_block_flush
+
+        _patch_z_image_transformer_block_flush()
         unified_prepare_plan = ZImageTransformer2DModel._sp_plan["unified_prepare"]
         assert isinstance(unified_prepare_plan, dict)
         assert unified_prepare_plan, "unified_prepare SP plan unexpectedly empty"
         for idx, sp_input in unified_prepare_plan.items():
-            assert sp_input.auto_pad is False, (
-                f"_sp_plan['unified_prepare'][{idx}].auto_pad changed upstream; "
-                "re-validate Z-Image ulysses_degree=8 on TPU before accepting."
+            assert sp_input.auto_pad is True, (
+                f"_sp_plan['unified_prepare'][{idx}].auto_pad was not promoted to True"
             )
 
     @pytest.mark.parametrize(
