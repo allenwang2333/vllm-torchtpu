@@ -165,17 +165,16 @@ def save_compress_norm(
             slot_mapping.clamp(min=0) // capacity * capacity
             + (positions - 1) % capacity
         )
+        stored = cache[previous_slots // capacity, previous_slots % capacity]
         previous = torch.where(
-            (rows > starts)[:, None],
-            kv_score[(rows - 1).clamp(min=0)].float(),
-            cache[previous_slots // capacity, previous_slots % capacity],
+            (rows > starts)[:, None], kv_score[(rows - 1).clamp(min=0)].float(), stored
         )
         scores = torch.stack((previous[:, dim:], kv_score[:, dim:].float()), 1)
         pair = torch.stack((previous[:, :dim], values), 1)
         values = (pair * scores.softmax(1)).sum(1)
         # All reads above refer to the old ring. Keep unique physical writes.
         publish = valid & (rows >= ends - capacity)
-        write_cache(cache, slot_mapping, kv_score.float(), publish)
+        write_cache(cache, slot_mapping, kv_score.float(), publish, after=stored)
         valid = valid & (positions % 2 == 1)
     elif ratio != 1:
         raise ValueError(f"V4.1 compression ratio must be 1 or 2, got {ratio}")

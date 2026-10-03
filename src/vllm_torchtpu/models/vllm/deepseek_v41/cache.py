@@ -144,6 +144,7 @@ def materialize_upstream_kv_cache(
 _read_values_op = None
 _write_op = None
 _write_values_op = None
+_write_values_after_op = None
 _encode_fp8_op = None
 
 
@@ -234,7 +235,8 @@ class PagedCacheRows:
         )
         return gathered.reshape(*records.shape, *self.shape[2:])
 
-    def write(self, slots, values):
+    def write(self, slots, values, after=None):
+        """``after`` (optional) must be computed before the in-place write."""
         records = self.row_indices(slots.clamp(min=0)).masked_fill(slots < 0, -1)
         if self.dtype == torch.uint8:
             self._write_fp8(records, values)
@@ -247,6 +249,11 @@ class PagedCacheRows:
             valid = slots >= 0
             pool.index_copy_(
                 0, records[valid].long(), values[valid].contiguous().view(torch.int8)
+            )
+        elif after is not None:
+            assert _write_values_after_op is not None
+            self.raw.copy_(
+                _write_values_after_op(self.raw, records.int(), values, after)
             )
         else:
             assert _write_values_op is not None
@@ -467,6 +474,7 @@ def encode_fp8_kv(latent: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 def initialize_cache_ops():
     global _read_values_op, _write_op, _write_values_op, _encode_fp8_op
+    global _write_values_after_op
     if _write_op is not None:
         return
     from jax.sharding import PartitionSpec as P
@@ -514,6 +522,25 @@ def initialize_cache_ops():
     _write_values_op.register_fake(
         lambda cache, records, values: torch.empty_like(cache)
     )
+
+    def write_values_after(
+        cache: jax.Array, records: jax.Array, values: jax.Array, after: jax.Array
+    ) -> jax.Array:
+        # An in-place write that may overlap an async gather of the old pool
+        # makes XLA copy the whole pool first; finish the gather instead.
+        cache, _ = jax.lax.optimization_barrier((cache, after))
+        return write_values(cache, records, values)
+
+    _write_values_after_op = pallas.jax_op(
+        "pallas::deepseek_v41_cache_write_values_after",
+        write_values_after,
+        donate_argnums=(0,),
+        mesh=mesh,
+        input_partition_specs=(P(), P(), P(), P()),
+    )
+    _write_values_after_op.register_fake(
+        lambda cache, records, values, after: torch.empty_like(cache)
+    )
     _encode_fp8_op = pallas.jax_op(
         "pallas::deepseek_v41_encode_fp8_kv",
         encode_fp8_kv,
@@ -528,13 +555,16 @@ def initialize_cache_ops():
     )
 
 
-def write_cache(cache, slots, values, valid):
-    """Valid destinations must be unique; invalid rows have no side effects."""
+def write_cache(cache, slots, values, valid, after=None):
+    """Valid destinations must be unique; invalid rows have no side effects.
+
+    ``after``: a value (e.g. rows read from ``cache``) to finish first.
+    """
     count = values.shape[0]
     slots, valid = slots[:count], valid[:count]
     slots = slots.masked_fill(~valid, -1).long()
     if isinstance(cache, PagedCacheRows):
-        cache.write(slots, values)
+        cache.write(slots, values, after)
         return
     if cache.device.type == "cpu":
         selected = slots[valid]
