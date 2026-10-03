@@ -209,8 +209,10 @@ def _rollback_offsets_migrate_impl(
 
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 # Bits per bisection pass of top-k/top-p masking under TPU_SAMPLER_VOCAB_PARALLEL
-# when TPU_SAMPLER_BSEARCH_RADIX_BITS is unset.
-_SAMPLER_LIGHT_DEFAULT_RADIX_BITS = 2
+# when TPU_SAMPLER_BSEARCH_RADIX_BITS is unset. 1: on tpu7x at [8|16, 154880]
+# the multi-candidate passes cost more than the passes they save (top-p-only
+# verify + bonus: 204 us at 1 bit, 257 at 2, 288 at 3, 464 at 4).
+_SAMPLER_LIGHT_DEFAULT_RADIX_BITS = 1
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)

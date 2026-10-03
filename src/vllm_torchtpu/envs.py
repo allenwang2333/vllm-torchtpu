@@ -1058,12 +1058,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 32-pass top-k bisection when no active request sets top_k, and the
     # 33-pass top-p bisection when none sets top_p < 1 (both decided on the
     # host per step; a skipped mask is the identity, so tokens are exact). The
-    # bisections that remain run TPU_SAMPLER_BSEARCH_RADIX_BITS bits per pass.
+    # greedy draft argmax all-gathers a (max, id) pair per row instead of the
+    # full logits (spec_decode/utils.vocab_parallel_argmax).
     "TPU_SAMPLER_VOCAB_PARALLEL": env_bool("TPU_SAMPLER_VOCAB_PARALLEL"),
     # Bits of the float32 threshold bisection resolved per vocab pass in
     # top-k/top-p masking (2**bits - 1 candidate thresholds per pass, same
-    # result as 1 bit/pass since the predicate is monotonic). 0 = the
-    # TPU_SAMPLER_VOCAB_PARALLEL default (1 when the flag is off).
+    # result as 1 bit/pass since the predicate is monotonic). 0 = 1. Measured
+    # slower than 1 on tpu7x at decode shapes; kept for other vocab/row counts.
     "TPU_SAMPLER_BSEARCH_RADIX_BITS": env_nonnegative_int(
         "TPU_SAMPLER_BSEARCH_RADIX_BITS", 0
     ),
