@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
+    TPU_ADAPTIVE_MOE_MIN_STEP_TOKENS: int = 0
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
@@ -665,6 +666,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # arming everything. Below the threshold the grouped-matmul path serves.
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS": lambda: int(
         os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")
+    ),
+    # With MOE_FUSED_EP_KERNEL_IMPL=adaptive, steps with fewer tokens than
+    # this run the grouped-matmul MoE path instead of the fused kernel; the
+    # choice is per compiled token bucket. 0 uses the fused kernel always.
+    "TPU_ADAPTIVE_MOE_MIN_STEP_TOKENS": env_nonnegative_int(
+        "TPU_ADAPTIVE_MOE_MIN_STEP_TOKENS", 0
     ),
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.
