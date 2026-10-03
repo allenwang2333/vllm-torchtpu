@@ -495,3 +495,37 @@ def test_experts_start_follows_the_group_block() -> None:
             ),
         )
         assert get_experts_start(layer) == 64 * (rank // 4)
+
+
+@pytest.mark.parametrize(
+    "field, value, match",
+    [
+        ("dp_size", 2, "DP=1"),
+        ("pcp_size", 2, "PCP=1"),
+        ("enable_eplb", True, "EPLB"),
+        ("ep_size", 8, "flat EP config"),
+    ],
+)
+def test_ep_tp_patch_refuses_where_partials_would_not_meet(
+    monkeypatch, field, value, match
+) -> None:
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    bad = dataclasses.replace(_flat_ep_config(16, 6), **{field: value})
+    monkeypatch.setattr(envs, "TPU_MOE_EP_TP_SIZE", 4)
+    monkeypatch.setattr(
+        FusedMoEParallelConfig, "make", staticmethod(lambda *a, **k: bad)
+    )
+    monkeypatch.setattr(FusedMoEParallelConfig, "_tpu_ep_tp_split_patch", False)
+    monkeypatch.setattr(moe_hierarchical, "_filter_patched", True)
+    monkeypatch.setattr(
+        moe_hierarchical, "hierarchical_split_or_none", lambda: (4, 1, 4, 2)
+    )
+    moe_hierarchical.install_ep_tp_split_patch()
+    with pytest.raises(ValueError, match=match):
+        FusedMoEParallelConfig.make(
+            tp_size_=16, pcp_size_=1, dp_size_=1, sp_size_=1, vllm_parallel_config=None
+        )
