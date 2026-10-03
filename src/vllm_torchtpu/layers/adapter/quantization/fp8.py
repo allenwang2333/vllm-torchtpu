@@ -988,6 +988,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 renormalize=layer.renormalize,
                 activation=activation_str,
             )
+            if envs.TPU_ADAPTIVE_MOE_MIN_STEP_TOKENS > 0:
+                # Steps below the threshold take the grouped-matmul path.
+                prebuild_fused_moe_kernel(
+                    topk=layer.moe_config.experts_per_token,
+                    activation=activation_str,
+                    use_ep=layer.moe_config.moe_parallel_config.use_ep,
+                )
             return
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
@@ -1041,7 +1048,16 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # rank's own tokens: it routes, exchanges, computes and combines inside
         # one program. Keyed on the same predicate `supports_internal_mk` uses,
         # so ownership and the path that exercises it cannot disagree.
-        if self._use_adaptive_fused_moe:
+        # TPU_ADAPTIVE_MOE_MIN_STEP_TOKENS > 0 picks the path per compiled
+        # step (the token count is static per bucket): the fused kernel for
+        # steps of at least that many tokens, the grouped-matmul path below
+        # for smaller ones, whose routed output vLLM then all-reduces as
+        # usual (see `step_output_is_reduced`).
+        use_adaptive = self._use_adaptive_fused_moe and (
+            x.shape[0] >= envs.TPU_ADAPTIVE_MOE_MIN_STEP_TOKENS
+        )
+        self._step_output_is_reduced = use_adaptive
+        if use_adaptive:
             return adaptive_moe.run_adaptive_fused_moe(
                 self,
                 x,

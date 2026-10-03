@@ -288,11 +288,13 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
         )
 
         owner = getattr(self, "_quant_method", None)
-        return (
-            fused_moe_ep_supported(owner)
-            or adaptive_fused_moe_supported(owner)
-            or original.fget(self)
+        # An adaptive layer may serve small steps on the grouped-matmul path
+        # (TPU_ADAPTIVE_MOE_MIN_STEP_TOKENS); its apply records which one the
+        # step being traced took, and only the fused kernel pre-reduces.
+        adaptive = adaptive_fused_moe_supported(owner) and getattr(
+            owner, "_step_output_is_reduced", True
         )
+        return fused_moe_ep_supported(owner) or adaptive or original.fget(self)
 
     _mr.MoERunner._fused_output_is_reduced = patched
     _mr.MoERunner._tpu_fused_output_reduced_patch = True
