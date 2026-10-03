@@ -1051,16 +1051,12 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # TPU_ADAPTIVE_MOE_MIN_STEP_TOKENS > 0 picks the path per compiled
         # step (the token count is static per bucket): the fused kernel for
         # steps of at least that many tokens, the grouped-matmul path below
-        # for smaller ones, whose routed output vLLM then all-reduces as
-        # usual (see `step_output_is_reduced`).
-        # bool(): the token count is symbolic under vLLM's dynamic-batch
-        # trace; branching specializes it, and the recorded flag must be a
-        # plain Python bool rather than a SymBool graph output.
+        # for smaller ones, whose routed output vLLM then all-reduces (the
+        # runner's reduce points decide from the same token count).
         use_adaptive = bool(
             self._use_adaptive_fused_moe
             and x.shape[0] >= envs.TPU_ADAPTIVE_MOE_MIN_STEP_TOKENS
         )
-        self._step_output_is_reduced = use_adaptive
         if use_adaptive:
             return adaptive_moe.run_adaptive_fused_moe(
                 self,

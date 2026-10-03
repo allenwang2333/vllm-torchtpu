@@ -288,15 +288,51 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
         )
 
         owner = getattr(self, "_quant_method", None)
-        # An adaptive layer may serve small steps on the grouped-matmul path
-        # (TPU_ADAPTIVE_MOE_MIN_STEP_TOKENS); its apply records which one the
-        # step being traced took, and only the fused kernel pre-reduces.
-        adaptive = adaptive_fused_moe_supported(owner) and getattr(
-            owner, "_step_output_is_reduced", True
+        return (
+            fused_moe_ep_supported(owner)
+            or adaptive_fused_moe_supported(owner)
+            or original.fget(self)
         )
-        return fused_moe_ep_supported(owner) or adaptive or original.fget(self)
 
     _mr.MoERunner._fused_output_is_reduced = patched
+
+    # An adaptive layer serves steps below TPU_ADAPTIVE_MOE_MIN_STEP_TOKENS on
+    # the grouped-matmul path, whose routed output is NOT pre-reduced. The two
+    # reduce points receive the step's tensors, so decide from their token
+    # count -- the same static value the method's apply branches on -- rather
+    # than from state recorded during the trace.
+    def _step_reduced(runner, tensor, flag):
+        if not flag or envs.TPU_ADAPTIVE_MOE_MIN_STEP_TOKENS <= 0:
+            return flag
+        from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
+            adaptive_fused_moe_supported,
+        )
+
+        owner = getattr(runner, "_quant_method", None)
+        if not adaptive_fused_moe_supported(owner):
+            return flag
+        return bool(tensor.shape[0] >= envs.TPU_ADAPTIVE_MOE_MIN_STEP_TOKENS)
+
+    orig_shared = _mr.MoERunner._maybe_reduce_shared_expert_output
+    orig_final = _mr.MoERunner._maybe_reduce_final_output
+
+    def reduce_shared(self, shared_output, fused_output_is_reduced=None):
+        if fused_output_is_reduced is None:
+            fused_output_is_reduced = self._fused_output_is_reduced
+        if shared_output is not None:
+            fused_output_is_reduced = _step_reduced(
+                self, shared_output, fused_output_is_reduced
+            )
+        return orig_shared(self, shared_output, fused_output_is_reduced)
+
+    def reduce_final(self, states, trunc_size, output_is_reduced=None):
+        if output_is_reduced is None:
+            output_is_reduced = self._fused_output_is_reduced
+        output_is_reduced = _step_reduced(self, states, output_is_reduced)
+        return orig_final(self, states, trunc_size, output_is_reduced)
+
+    _mr.MoERunner._maybe_reduce_shared_expert_output = reduce_shared
+    _mr.MoERunner._maybe_reduce_final_output = reduce_final
     _mr.MoERunner._tpu_fused_output_reduced_patch = True
     logger.info("Applied TPU patch: the fused EP MoE output is pre-reduced.")
 
