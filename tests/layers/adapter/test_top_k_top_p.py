@@ -121,7 +121,9 @@ def _random_rows(rows=6, vocab=4099, seed=0):
 def test_apply_top_k_top_p_radix_is_bit_identical(radix_bits):
     logits, top_k, top_p = _random_rows()
     expected = sampling.apply_top_k_top_p(logits, top_k, top_p)
-    result = sampling.apply_top_k_top_p(logits, top_k, top_p, radix_bits=radix_bits)
+    result = sampling.apply_top_k_top_p(
+        logits, top_k, top_p, radix_bits=radix_bits
+    )
     assert torch.equal(result, expected)
 
 

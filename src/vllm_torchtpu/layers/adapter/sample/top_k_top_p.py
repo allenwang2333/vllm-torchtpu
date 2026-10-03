@@ -76,7 +76,8 @@ def _int32_bsearch(
             shift = hi - width
             num_cand = (1 << width) - 1
             cand = (
-                torch.arange(1, num_cand + 1, dtype=torch.int32, device=device) << shift
+                torch.arange(1, num_cand + 1, dtype=torch.int32, device=device)
+                << shift
             ).view((num_cand,) + (1,) * len(batch_shape))
             candidates = current_bits.unsqueeze(0) | cand
             # False for candidates 1..digit, True above (monotonic predicate).
@@ -226,7 +227,9 @@ def topk_mask(
         count_gt = torch.sum((logits > neg_threshold).to(torch.int32), dim=-1)
         return count_gt >= k
 
-    cutoff = -_float32_bsearch(logits.shape[:-1], predicate, logits.device, radix_bits)
+    cutoff = -_float32_bsearch(
+        logits.shape[:-1], predicate, logits.device, radix_bits
+    )
     cutoff = cutoff.unsqueeze(-1)
     replace_tensor = torch.full_like(logits, replace_val)
     return torch.where(logits >= cutoff, logits, replace_tensor)
