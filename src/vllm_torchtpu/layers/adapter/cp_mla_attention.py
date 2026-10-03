@@ -69,7 +69,7 @@ def prepare_dcp_collectives() -> None:
         return
     from vllm_torchtpu.kernels.collectives import oneshot
 
-    for op in ("all_gather", "reduce_scatter"):
+    for op in ("all_gather", "reduce_scatter", "all_to_all"):
         _KERNEL_OPS[op] = oneshot.torch_op(op, group, "dcp")
 
 
@@ -214,27 +214,27 @@ def merge_lse_partials_scatter_heads(
 
 
 def _merge_at_receiver(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch.Tensor:
-    """The merge with the weighting moved to the receiving rank: ONE all-to-all, no lse gather.
+    """The merge with the weighting moved to the receiving rank: no lse all-gather, no f32
+    weighted product on the wire.
 
-    Each rank sends rank j the raw partial for j's heads -- in the kernel's own dtype (bf16),
-    not the f32 weighted product -- with its f32 lse bit-packed into two extra lanes, so the
-    exchange carries half the bytes of the f32 reduce-scatter and the lse travels with the data
-    it weights. The receiver then holds every rank's (partial, lse) for its heads and computes
-    exactly what `_weight_by_lse` + the reduce-scatter compute: sum_r softmax_r(lse) * o_r in
-    f32 (only the order of the f32 sum differs).
+    Each rank sends rank j the raw partial for j's heads in the kernel's own dtype (bf16) --
+    half the bytes of the f32 weighted reduce-scatter -- laid out [world * T, h, D] so the
+    exchange keeps the partial's lane-aligned layout, and, in a second tiny all-to-all, the
+    matching f32 lse. (Packing the lse into two extra lanes of the partial made rows 514 wide:
+    the receive side then paid relayouts and a strided reduce, +35 us a layer on 2x2x2.) The
+    receiver holds every rank's (partial, lse) for its heads and computes exactly what
+    `_weight_by_lse` + the reduce-scatter compute: sum_r softmax_r(lse) * o_r in f32 (only the
+    order of the f32 sum differs).
     """
     world = int(group.world_size)
     t, heads, d = output.shape
     h = heads // world
-    lse_f32 = lse.to(torch.float32).contiguous().view(t, heads, 1)
-    lanes = lse_f32.view(output.dtype) if output.element_size() < 4 else lse_f32.to(output.dtype)
-    k = lanes.shape[-1]
-    packed = torch.cat([output, lanes], dim=-1)                      # [t, heads, d + k]
-    sent = packed.view(t, world, h, d + k).permute(1, 0, 2, 3).contiguous()
-    got = _a2a(sent.view(world, t * h * (d + k)), group).view(world, t, h, d + k)
-    part = got[..., :d].to(torch.float32)
-    tail = got[..., d:].contiguous()
-    lse_all = (tail.view(torch.float32) if output.element_size() < 4 else tail.to(torch.float32))
+    sent = output.view(t, world, h, d).permute(1, 0, 2, 3).contiguous()
+    part = _a2a(sent.view(world * t, h, d), group).view(world, t, h, d).to(torch.float32)
+    lse_sent = lse.to(torch.float32).view(t, world, h).permute(1, 0, 2).contiguous()
+    lse_sent = lse_sent.view(world, t * h)
+    op = _KERNEL_OPS.get("all_to_all")
+    lse_all = op(lse_sent) if op is not None else _a2a(lse_sent, group)
     lse_all = lse_all.view(world, t, h)
 
     finite = torch.isfinite(lse_all)
