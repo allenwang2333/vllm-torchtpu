@@ -250,9 +250,10 @@ def test_route_hash_table_scales_by_the_layer_factor():
     torch.testing.assert_close(weights, torch.full((2, 2), 0.5))
 
 
-def test_router_topk_bias_env_defaults_off():
+def test_router_topk_bias_env_defaults_off(monkeypatch):
     import vllm_torchtpu.envs as envs
 
+    monkeypatch.delenv("TPU_MOE_ROUTER_TOPK_BIAS", raising=False)
     assert envs.environment_variables["TPU_MOE_ROUTER_TOPK_BIAS"]() is False
 
 
