@@ -232,6 +232,31 @@ def resolve_draft_logits_processor(draft_model: torch.nn.Module):
     return lp
 
 
+def draft_greedy_token_ids(
+    draft_model: torch.nn.Module, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """argmax of ``draft_model.compute_logits(hidden_states)``, int32.
+
+    With a vocab-parallel head the full-vocab logits are all-gathered only to
+    be argmax'd; ``LogitsProcessor.get_top_tokens`` takes each shard's
+    (max, index) and gathers just those pairs. Ties resolve to the lowest
+    vocab id either way. Falls back to the full logits when the draft does
+    not expose a plain ``logits_processor(lm_head, hidden)`` head.
+    """
+    lp = getattr(draft_model, "logits_processor", None)
+    lm_head = getattr(draft_model, "lm_head", None)
+    if (
+        lp is None
+        or lm_head is None
+        or not hasattr(lp, "get_top_tokens")
+        or getattr(lp, "logits_as_input", False)
+        or not hasattr(lm_head, "shard_indices")
+        or (lp.scale <= 0.0 and lp.scale != 1.0)
+    ):
+        return draft_model.compute_logits(hidden_states).argmax(dim=-1).to(torch.int32)
+    return lp.get_top_tokens(lm_head, hidden_states).to(torch.int32)
+
+
 def populate_draft_lm_head_from_target(
     draft_model: torch.nn.Module, target_lm_head: torch.nn.Module
 ) -> None:
