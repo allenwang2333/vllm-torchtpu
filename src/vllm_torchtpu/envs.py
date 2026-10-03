@@ -165,6 +165,8 @@ if TYPE_CHECKING:
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
     TPU_SMALL_ALL_REDUCE_DRAFT: bool = False
     TPU_FP8_LINEAR_PALLAS: bool = False
+    TPU_SAMPLER_VOCAB_PARALLEL: bool = False
+    TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
     TPU_FP8_LINEAR_PALLAS_SITES: str = (
         "fused_qkv_a_proj,q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     )
@@ -1051,6 +1053,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A selected layer whose width is not a multiple of 128 (q_a + kv_a, 2624) also
     # keeps a zero-padded copy of its weight for the kernel: +16.5 MB per layer on
     # GLM-5.2-FP8, i.e. about 1.3 GB per rank over 79 layers.
+    # --- Sampler ---
+    # Lighter non-greedy sampler / spec-verify (rejection) programs. Skips the
+    # 32-pass top-k bisection when no active request sets top_k, and the
+    # 33-pass top-p bisection when none sets top_p < 1 (both decided on the
+    # host per step; a skipped mask is the identity, so tokens are exact). The
+    # bisections that remain run TPU_SAMPLER_BSEARCH_RADIX_BITS bits per pass.
+    "TPU_SAMPLER_VOCAB_PARALLEL": env_bool("TPU_SAMPLER_VOCAB_PARALLEL"),
+    # Bits of the float32 threshold bisection resolved per vocab pass in
+    # top-k/top-p masking (2**bits - 1 candidate thresholds per pass, same
+    # result as 1 bit/pass since the predicate is monotonic). 0 = the
+    # TPU_SAMPLER_VOCAB_PARALLEL default (1 when the flag is off).
+    "TPU_SAMPLER_BSEARCH_RADIX_BITS": env_nonnegative_int(
+        "TPU_SAMPLER_BSEARCH_RADIX_BITS", 0
+    ),
     "TPU_FP8_LINEAR_PALLAS": env_bool("TPU_FP8_LINEAR_PALLAS"),
     # Comma-separated layer-prefix suffixes that take that path, matched on a "."
     # boundary. The defaults are the sites XLA does not prefetch on GLM-5.2-FP8

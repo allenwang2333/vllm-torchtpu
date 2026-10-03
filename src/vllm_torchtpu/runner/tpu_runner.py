@@ -208,6 +208,9 @@ def _rollback_offsets_migrate_impl(
 
 
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+# Bits per bisection pass of top-k/top-p masking under TPU_SAMPLER_VOCAB_PARALLEL
+# when TPU_SAMPLER_BSEARCH_RADIX_BITS is unset.
+_SAMPLER_LIGHT_DEFAULT_RADIX_BITS = 2
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
@@ -869,6 +872,15 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         self.sample_from_logits_func = self.sample_from_logits
+        # TPU_SAMPLER_VOCAB_PARALLEL: per-step static top-k/top-p skips and a
+        # radix threshold bisection in the non-greedy sampler + verify graphs.
+        # Off, _sampler_kwargs() is {} and every compiled call is unchanged.
+        self._sampler_light = bool(envs.TPU_SAMPLER_VOCAB_PARALLEL)
+        self._sampler_radix_bits = envs.TPU_SAMPLER_BSEARCH_RADIX_BITS or (
+            _SAMPLER_LIGHT_DEFAULT_RADIX_BITS if self._sampler_light else 1
+        )
+        self._sampler_need_top_k = True
+        self._sampler_need_top_p = True
 
         # TPU async-scheduling state (passed between execute_model and
         # sample_tokens, mirroring vLLM's async path).
@@ -4035,6 +4047,7 @@ class TPUModelRunner(GPUModelRunner):
                     req_top_k,
                     req_top_p,
                     all_greedy=False,
+                    **self._sampler_kwargs(),
                 ).view(-1)
         accept_u = None
         assert self.rejection_sampler is not None
@@ -4078,6 +4091,7 @@ class TPUModelRunner(GPUModelRunner):
             accept_u=accept_u,
             recover_u=recover_u,
             do_sampling=True,
+            **self._sampler_kwargs(),
         )
 
     def sample_tokens(
@@ -4214,6 +4228,7 @@ class TPUModelRunner(GPUModelRunner):
                                 top_k_tpu,
                                 top_p_tpu,
                                 all_greedy=False,
+                                **self._sampler_kwargs(),
                             )
                     assert self.speculative_config is not None
                     padded = torch.full(
@@ -4275,6 +4290,7 @@ class TPUModelRunner(GPUModelRunner):
                             top_k_tpu,
                             top_p_tpu,
                             all_greedy=all_greedy,
+                            **self._sampler_kwargs(),
                         )
                 # NOTE (NickLucche) Use the original logits (before any penalties or
                 # temperature scaling) for the top-k logprobs. We can't enforce it
@@ -5440,7 +5456,29 @@ class TPUModelRunner(GPUModelRunner):
                         all_greedy=all_greedy,
                     )
                     synchronize_tensors(out)
+                for light_kwargs in self._sampler_light_variants():
+                    out = self.sample_from_logits_func(
+                        dummy_logits,
+                        dummy_temperatures,
+                        dummy_u,
+                        dummy_top_k,
+                        dummy_top_p,
+                        all_greedy=False,
+                        **light_kwargs,
+                    )
+                    synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
+
+    def _sampler_light_variants(self) -> list[dict[str, Any]]:
+        """Every static-kwarg variant _sampler_kwargs() can return at runtime
+        (none with the flag off)."""
+        if not self._sampler_light:
+            return []
+        return [
+            {"need_top_k": k, "need_top_p": p, "radix_bits": self._sampler_radix_bits}
+            for k in (False, True)
+            for p in (False, True)
+        ]
 
     def _precompile_gather_logprobs(self) -> None:
         with self._precompile_timed("gather_logprobs"):
@@ -5636,22 +5674,24 @@ class TPUModelRunner(GPUModelRunner):
                         (num_tokens, self.vocab_size),
                         dtype=torch.float32,
                     ).to(self.device)
-                    out = self.rejection_sampler(
-                        draft_token_ids=draft_token_ids,
-                        num_draft_tokens=draft_lengths,
-                        target_logits=target_logits_ng,
-                        bonus_token_ids=bonus_token_ids,
-                        segment_ids=segment_ids,
-                        group_indices=group_indices,
-                        max_draft_tokens=k,
-                        temperatures=warm_temps,
-                        top_k=warm_top_k,
-                        top_p=warm_top_p,
-                        accept_u=warm_accept_u,
-                        recover_u=warm_recover_u,
-                        do_sampling=True,
-                    )
-                    synchronize_tensors(out)
+                    for light_kwargs in [{}, *self._sampler_light_variants()]:
+                        out = self.rejection_sampler(
+                            draft_token_ids=draft_token_ids,
+                            num_draft_tokens=draft_lengths,
+                            target_logits=target_logits_ng,
+                            bonus_token_ids=bonus_token_ids,
+                            segment_ids=segment_ids,
+                            group_indices=group_indices,
+                            max_draft_tokens=k,
+                            temperatures=warm_temps,
+                            top_k=warm_top_k,
+                            top_p=warm_top_p,
+                            accept_u=warm_accept_u,
+                            recover_u=warm_recover_u,
+                            do_sampling=True,
+                            **light_kwargs,
+                        )
+                        synchronize_tensors(out)
                     logger.info(
                         "  -- padded_logits_length: %d, num_seqs: %d",
                         num_tokens,
@@ -6659,6 +6699,11 @@ class TPUModelRunner(GPUModelRunner):
         top_p_cpu[:num_active_reqs].copy_(
             self.input_batch.top_p_cpu_tensor[cur_start_idx:cur_end_idx]
         )
+        if self._sampler_light:
+            # Padding rows are neutral (top_k 0, top_p 1), so the active rows
+            # decide whether either mask can change any row.
+            self._sampler_need_top_k = bool((top_k_cpu > 0).any())
+            self._sampler_need_top_p = bool((top_p_cpu < 1.0).any())
 
         return (
             temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
@@ -6720,6 +6765,17 @@ class TPUModelRunner(GPUModelRunner):
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_logits, target_logits
 
+    def _sampler_kwargs(self) -> dict[str, Any]:
+        """Static kwargs of the non-greedy sampler / verify graphs for the
+        sampling params last staged by _build_padded_sampling_params."""
+        if not self._sampler_light:
+            return {}
+        return {
+            "need_top_k": self._sampler_need_top_k,
+            "need_top_p": self._sampler_need_top_p,
+            "radix_bits": self._sampler_radix_bits,
+        }
+
     def _apply_temperature(
         self, logits: torch.Tensor, temperatures: torch.Tensor
     ) -> torch.Tensor:
@@ -6737,6 +6793,9 @@ class TPUModelRunner(GPUModelRunner):
         top_k: torch.Tensor,
         top_p: torch.Tensor,
         all_greedy: bool = False,
+        need_top_k: bool = True,
+        need_top_p: bool = True,
+        radix_bits: int = 1,
     ) -> torch.Tensor:
         """
         Sample with xla-friendly function. This function is to be traced
@@ -6746,7 +6805,9 @@ class TPUModelRunner(GPUModelRunner):
             return torch.argmax(logits, dim=-1, keepdim=True)
         is_greedy = temperatures <= SAMPLING_EPS
         scaled_logits = self._apply_temperature(logits, temperatures)
-        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
+        masked_logits = apply_top_k_top_p(
+            scaled_logits, top_k, top_p, need_top_k, need_top_p, radix_bits
+        )
         u_clamped = torch.clamp(
             u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
         )
