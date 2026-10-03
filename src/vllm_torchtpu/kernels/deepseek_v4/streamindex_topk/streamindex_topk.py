@@ -625,6 +625,7 @@ def _effective_row_lengths(
         "fused_payload",
         "single_slice",
         "skip_empty_decode",
+        "topk_partition",
     ),
 )
 def streamindex_topk(
@@ -656,6 +657,7 @@ def streamindex_topk(
     fused_payload: bool = False,
     single_slice: bool = False,
     skip_empty_decode: bool = False,
+    topk_partition: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -720,6 +722,8 @@ def streamindex_topk(
       single_slice: forwarded to `sparsecore_topk`; when every row's visible
         length fits the first stage-1 slice, skip the stage-2 merge. Same
         result.
+      topk_partition: forwarded to `sparsecore_topk` as ``partition``; forces
+        its subcore partition factor. Same result.
       skip_empty_decode: when the batch has no decode (q_len 1) sequence --
         every step under speculative decoding, whose decode rows have q_len
         gamma + 1 and go to the MIXED pass -- branch at runtime around the two
@@ -1158,6 +1162,7 @@ def streamindex_topk(
                 return_scores=True,
                 fused_payload=fused_payload,
                 single_slice=single_slice,
+                partition=topk_partition,
             )
             topk_idxs.append(chunk_topk_idxs)
             if need_scores:
@@ -1226,6 +1231,8 @@ def streamindex_topk(
         "fused_payload",
         "single_slice",
         "skip_empty_decode",
+        "local_topk_partition",
+        "global_topk_partition",
     ),
 )
 def streamindex_topk_dcp(
@@ -1252,6 +1259,8 @@ def streamindex_topk_dcp(
     fused_payload: bool = False,
     single_slice: bool = False,
     skip_empty_decode: bool = False,
+    local_topk_partition: int | None = None,
+    global_topk_partition: int | None = None,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1315,6 +1324,9 @@ def streamindex_topk_dcp(
         two-stage candidate maps of both top-ks in the same way. Bit-identical
         output; removes three SparseCore gathers per call at decode shapes.
       skip_empty_decode: forwarded to `streamindex_topk`; see there.
+      local_topk_partition / global_topk_partition: the ``partition`` of the
+        per-rank and the cross-rank merge `sparsecore_topk` calls (None = its
+        heuristic). Same result.
 
     Returns:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1380,6 +1392,7 @@ def streamindex_topk_dcp(
             fused_payload=fused_payload,
             single_slice=single_slice,
             skip_empty_decode=skip_empty_decode,
+            topk_partition=local_topk_partition,
         )
 
         # Stage 1. All-gather the scores; the indices stay home.
@@ -1404,6 +1417,7 @@ def streamindex_topk_dcp(
                     (scores.shape[0],), dcp_rank * k, dtype=jnp.int32
                 ),
                 fused_payload=True,
+                partition=global_topk_partition,
             )
             return dcp_sc_compact.pack_nonnegative(owned)
         slots = sparsecore_topk(
@@ -1411,6 +1425,7 @@ def streamindex_topk_dcp(
             k,
             row_lengths=full_rows,
             write_empty_rows=True,
+            partition=global_topk_partition,
         )
         return dcp_sc_compact.resolve_owned_winners(idxs, slots, k, dcp_rank)
 

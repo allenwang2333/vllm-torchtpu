@@ -375,3 +375,24 @@ def test_dcp_single_slice_is_bit_identical(
     got = np.asarray(streamindex_topk_dcp(*args, **kwargs, single_slice=True))
     np.testing.assert_array_equal(got, want)
     assert (got >= 0).any()
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 8])
+@pytest.mark.parametrize("q_len", [16, Q_LEN])
+@pytest.mark.parametrize("fused_payload", [False, True])
+@pytest.mark.parametrize("partition", [(None, 1), (4, 1), (2, 4)])
+def test_dcp_topk_partition_is_bit_identical(partition, fused_payload, q_len, dcp_size):
+    """Forced local / merge partition factors change no output."""
+    _need_devices(dcp_size)
+    _, args, kwargs = _dcp_case(dcp_size, 9, q_len=q_len)
+    kwargs = dict(kwargs, fused_payload=fused_payload, single_slice=True)
+    want = np.asarray(streamindex_topk_dcp(*args, **kwargs))
+    local, merge = partition
+    got = np.asarray(
+        streamindex_topk_dcp(
+            *args, **kwargs, local_topk_partition=local, global_topk_partition=merge
+        )
+    )
+    np.testing.assert_array_equal(got, want)
+    assert (got >= 0).any()

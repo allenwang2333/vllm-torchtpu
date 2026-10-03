@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = False
     TPU_SC_TOPK_FUSED_PAYLOAD: bool = False
     TPU_SC_TOPK_SINGLE_SLICE: bool = False
+    TPU_SC_TOPK_PARTITION_OVERRIDE: str = ""
     TPU_INDEXER_TOPK_SINGLE_WRITE: bool = False
     TPU_INDEXER_TOPK_NOCOPY: bool = False
     TPU_INDEXER_TOPK_SHARED_READ: bool = False
@@ -811,6 +812,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # reads that slice in place and skips its stage-2 merge; a lax.cond keeps
     # the two-stage path for longer rows. Same indices and scores.
     "TPU_SC_TOPK_SINGLE_SLICE": env_bool("TPU_SC_TOPK_SINGLE_SLICE", default=False),
+    # Force the SparseCore top-k's subcore partition factor P under DCP:
+    # "local:P,global:P" (either part optional) for the per-rank top-k and the
+    # cross-rank merge. "1" / "on" = "global:1": the decode merge as one call
+    # instead of stage 1 + stage-2 merge. Empty = the utilisation heuristic.
+    # Same indices and scores.
+    "TPU_SC_TOPK_PARTITION_OVERRIDE": env_str(
+        "TPU_SC_TOPK_PARTITION_OVERRIDE", default=""
+    ),
     # Indexer writes its top-k into the shared `topk_indices_buffer` with one
     # full-width row update and hands the fresh rows to attention, instead of
     # a -1 fill plus a partial-width write whose result attention re-reads.

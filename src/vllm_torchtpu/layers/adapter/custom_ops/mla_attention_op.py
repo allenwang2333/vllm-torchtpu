@@ -43,6 +43,7 @@ from vllm.v1.attention.backends.mla.prefill import selector
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group, get_or_create_dcp_mesh
+from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import parse_partition_override
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
     cp_rank_as_data,
@@ -345,6 +346,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
         fused_payload = envs.TPU_SC_TOPK_FUSED_PAYLOAD
         single_slice = envs.TPU_SC_TOPK_SINGLE_SLICE
+        local_topk_partition, global_topk_partition = parse_partition_override(
+            envs.TPU_SC_TOPK_PARTITION_OVERRIDE
+        )
         small_bucket_bq = envs.TPU_STREAMIDX_SMALL_BUCKET_BQ
         small_bucket_bkvp = envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
@@ -396,6 +400,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 chunk_tokens=chunk_tokens,
                 fused_payload=fused_payload,
                 single_slice=single_slice,
+                local_topk_partition=local_topk_partition,
+                global_topk_partition=global_topk_partition,
             )
             return cache_kv, local_topk
 
