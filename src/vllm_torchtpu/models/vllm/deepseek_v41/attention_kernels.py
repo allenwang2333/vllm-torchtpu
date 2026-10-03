@@ -259,8 +259,9 @@ def paged_index_scores_jax(
         records, requests = jnp.take(records, requests, axis=0), None
     width = records.shape[1]
     # Keep about 16K keys per iteration: small (decode) batches otherwise run
-    # many latency-bound tiny gathers. Prefill batches stay at 128.
-    budget = max(128, min(2048, 16384 // max(tokens, 1), -(-width // 128) * 128))
+    # many latency-bound tiny gathers. Prefill batches use 512: with 128 the
+    # loop is iteration-latency bound (2.3x slower at T=512 over 16.9K rows).
+    budget = min(max(512, min(2048, 16384 // max(tokens, 1))), -(-width // 128) * 128)
     tile = 1 << (budget.bit_length() - 1)
     records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
     scores = jnp.full((tokens, records.shape[1]), -jnp.inf, jnp.float32)
