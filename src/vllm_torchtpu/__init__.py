@@ -360,19 +360,60 @@ def _patch_vllm_disable_compile_ranges() -> None:
 
 
 def _patch_vllm_compile_all_ranges() -> None:
-    """Patch vllm compile all ranges to support compilation rotation.
+    """Patch vllm compile all ranges so the ranks of a host split the ranges.
 
-    Compilation rotation allows vllm to compile multiple sizes at the same time,
-    which greatly reduce the vllm startup time.
+    Each range is compiled by one rank of the host, its owner; every other rank
+    replays the artifact the owner saves to vLLM's compile cache instead of
+    tracing and compiling the range again (see TpuCompilerAdaptor.compile).
+    Startup then takes about as long as the slowest single range instead of
+    the sum over ranges.
     """
     import os
-    from collections import deque
 
     from vllm.compilation.piecewise_backend import (
         PiecewiseBackend,
         create_concrete_args,
         get_fake_args_from_graph,
     )
+
+    def ranks_per_host() -> int | None:
+        """How many ranks share this host, or None if that is unknown."""
+        try:
+            from vllm.distributed.parallel_state import (
+                get_node_count,
+                get_world_group,
+            )
+
+            world_size = get_world_group().world_size
+            nodes = get_node_count()
+        except Exception:
+            return None
+        if nodes <= 0 or world_size % nodes:
+            return None
+        return world_size // nodes
+
+    def compile_entry(self, range_entry) -> None:
+        self._log_compile_start(range_entry.compile_range)
+
+        if range_entry.compile_range.is_single_size():
+            args_list = create_concrete_args(
+                self.graph, range_entry.compile_range.start
+            )
+        else:
+            args_list = get_fake_args_from_graph(self.graph)
+
+        range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+            self.graph,
+            args_list,
+            self.vllm_backend.inductor_config,
+            self.compilation_config,
+            compile_range=range_entry.compile_range,
+            graph_index=self.piecewise_compile_index,
+            num_graphs=self.total_piecewise_compiles,
+            is_encoder=self.vllm_backend.is_encoder,
+        )
+
+        range_entry.compiled = True
 
     def compile_all_ranges(self) -> None:
         """Compile all range entries for this piecewise subgraph up front."""
@@ -381,54 +422,41 @@ def _patch_vllm_compile_all_ranges() -> None:
             "When loading from cache/AOT artifacts, "
             "compile_all_ranges should not be called."
         )
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            PEER_WAIT_S,
+            wait_for_peer_artifact,
+        )
 
         local_rank = int(os.environ["LOCAL_RANK"])
-        # Biggest first: local rank 0 starts on the biggest range, which takes
-        # far longer than the others and so bounds startup, instead of
-        # reaching it only after the smallest one.
-        range_entry_list = sorted(
-            self.range_entries.values(),
+        ranks = ranks_per_host()
+        # Unknown: assume a full host, but do not wait on owners that may not
+        # exist; a range nobody saved yet is then compiled here.
+        wait_s = PEER_WAIT_S if ranks is not None and local_rank < ranks else 0.0
+        ranks = ranks or 8
+
+        # Biggest first, dealt out in a snake: local rank 0 starts on the
+        # biggest range, which takes far longer than the others and so bounds
+        # startup, and a rank whose first range is small gets the next one.
+        entries = sorted(
+            (e for e in self.range_entries.values() if not e.compiled),
             key=lambda e: e.compile_range.end,
             reverse=True,
         )
-
-        range_entry_len = len(range_entry_list)
-
-        expanded_indexes = list(range((range_entry_len + 7) // 8 * 8))
-        d = deque(sorted(expanded_indexes, key=lambda x: (x % 8, x)))
-        d.rotate(-local_rank * (len(d) // 8))
-        indexes = list(d)
-
-        for i in indexes:
-            if i >= len(range_entry_list):
-                continue
-
-            range_entry = range_entry_list[i]
-
-            if range_entry.compiled:
-                continue
-
-            self._log_compile_start(range_entry.compile_range)
-
-            if range_entry.compile_range.is_single_size():
-                args_list = create_concrete_args(
-                    self.graph, range_entry.compile_range.start
-                )
+        mine, others = [], []
+        for i, range_entry in enumerate(entries):
+            turn, slot = divmod(i, ranks)
+            owner = slot if turn % 2 == 0 else ranks - 1 - slot
+            if owner == local_rank:
+                mine.append(range_entry)
             else:
-                args_list = get_fake_args_from_graph(self.graph)
+                # In the order the owners finish them: by turn, small first.
+                others.append((turn, range_entry.compile_range.end, range_entry))
 
-            range_entry.runnable = self.vllm_backend.compiler_manager.compile(
-                self.graph,
-                args_list,
-                self.vllm_backend.inductor_config,
-                self.compilation_config,
-                compile_range=range_entry.compile_range,
-                graph_index=self.piecewise_compile_index,
-                num_graphs=self.total_piecewise_compiles,
-                is_encoder=self.vllm_backend.is_encoder,
-            )
-
-            range_entry.compiled = True
+        for range_entry in mine:
+            compile_entry(self, range_entry)
+        with wait_for_peer_artifact(wait_s):
+            for _, _, range_entry in sorted(others, key=lambda o: o[:2]):
+                compile_entry(self, range_entry)
 
     if envs.TPU_PARALLEL_PRECOMPILE:
         PiecewiseBackend.compile_all_ranges = compile_all_ranges

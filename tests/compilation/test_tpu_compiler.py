@@ -467,3 +467,148 @@ class TestTpuCompilerCache:
         compiler._run_backend(None, [])
         compiler._run_backend(None, [])
         assert firsts == [1, 1]
+
+    @staticmethod
+    def _peer_compilers(tmp_path, monkeypatch, n=2):
+        """Compilers for local ranks 0..n-1 of one host, with a fake backend
+        that records which ranks really compiled."""
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        compiled, replayed = [], []
+
+        class Compiled:
+            def __init__(self, rank):
+                self.rank = rank
+
+            def __call__(self, *args):
+                return (self.rank,)
+
+            def serialize(self):
+                return f"entry-from-rank-{self.rank}"
+
+        def compilers():
+            for rank in range(n):
+                compiler = TpuCompilerAdaptor()
+                compiler.initialize_cache(
+                    cache_dir=str(tmp_path / "hash" / f"rank_{rank}_0" / "backbone")
+                )
+                compiler.rank = rank
+                yield compiler
+
+        current = {}
+
+        def fake_backend(graph, example_inputs):
+            compiled.append(current["rank"])
+            return Compiled(current["rank"])
+
+        def fake_deserialize(entry):
+            replayed.append(entry)
+            return lambda *args: (entry,)
+
+        monkeypatch.setattr(tpu_compiler, "_tpu_backend", fake_backend)
+        monkeypatch.setattr(tpu_compiler, "_deserialize_entry", fake_deserialize)
+        monkeypatch.setattr(tpu_compiler, "_PEER_POLL_S", 0.01)
+
+        def compile(compiler, graph=None):
+            current["rank"] = compiler.rank
+            if graph is None:
+                graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+            return compiler.compile(
+                graph, [], {}, Range(start=1, end=4096), key="artifact_bucket"
+            )
+
+        return list(compilers()), compile, compiled, replayed
+
+    def test_a_peer_artifact_is_replayed_instead_of_compiled(
+        self, tmp_path, monkeypatch
+    ):
+        """The second rank of a host replays what the first one saved, and its
+        own cache entry is the same file, not a copy."""
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        compile(a)
+        fn, handle = compile(b)
+
+        assert compiled == [0]
+        assert replayed == ["entry-from-rank-0"]
+        assert fn() == "entry-from-rank-0"
+        key, path, _ = handle
+        assert path == os.path.join(b.cache_dir, key)
+        assert os.path.samefile(path, os.path.join(a.cache_dir, key))
+        assert sorted(os.listdir(tmp_path / "hash")) == ["rank_0_0", "rank_1_0"]
+        assert os.listdir(b.cache_dir) == [key]
+
+    def test_a_peer_artifact_of_another_graph_is_not_replayed(
+        self, tmp_path, monkeypatch
+    ):
+        """vLLM's key names a bucket, not a graph: a rank that traced
+        something else, e.g. with its rank baked in, compiles its own."""
+        import torch
+
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        compile(a, torch.fx.symbolic_trace(lambda x: x * 2 + 1))
+        compile(b, torch.fx.symbolic_trace(lambda x: x * 2 + 2))
+
+        assert compiled == [0, 1]
+        assert replayed == []
+        assert not os.path.samefile(
+            os.path.join(a.cache_dir, "artifact_bucket"),
+            os.path.join(b.cache_dir, "artifact_bucket"),
+        )
+
+    def test_a_rank_waits_for_the_peer_that_compiles_a_bucket(
+        self, tmp_path, monkeypatch
+    ):
+        import threading
+
+        from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
+
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        result = {}
+
+        def waiter():
+            with wait_for_peer_artifact(30.0):
+                result["fn"], _ = compile(b)
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        thread.join(0.2)
+        assert thread.is_alive()
+        compile(a)
+        thread.join(30.0)
+
+        assert not thread.is_alive()
+        assert compiled == [0]
+        assert result["fn"]() == "entry-from-rank-0"
+
+    def test_a_rank_compiles_itself_when_no_peer_saves_in_time(
+        self, tmp_path, monkeypatch
+    ):
+        from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
+
+        (_, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        with wait_for_peer_artifact(0.05):
+            compile(b)
+        assert compiled == [1]
+        assert replayed == []
+
+    def test_no_peer_replay_outside_a_rank_cache_dir(self, tmp_path, monkeypatch):
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        a.initialize_cache(cache_dir=str(tmp_path / "x" / "backbone"))
+        b.initialize_cache(cache_dir=str(tmp_path / "y" / "backbone"))
+        compile(a)
+        compile(b)
+        assert compiled == [0, 1]
