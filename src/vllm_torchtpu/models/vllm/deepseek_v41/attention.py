@@ -547,6 +547,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         valid_rows = valid_window
         main_cache = swa_cache
         main_records = positions.new_empty((count, 0))
+        pages = starts = None
         if self.compress_ratio:
             source = self._static_forward_context[self.compressed_cache_prefix]
             source_meta = metadata[self.compressed_cache_prefix]
@@ -623,12 +624,23 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 (selected >= 0) & (selected < lengths) & (swa_slots[:, None] >= 0)
             )
             if tiled:
-                slots = _row_slots(
-                    main_cache, _block_table(source_meta), requests, selected.long()
+                pages = (
+                    main_cache.pages(_block_table(source_meta))
+                    if self._fp8_kv
+                    else None
                 )
-                main_records = main_cache.row_indices(slots).masked_fill(
-                    ~valid_compressed, -1
-                )
+                if pages is not None:
+                    # SparseMLA resolves pages itself (Pallas), avoiding a
+                    # [tokens, topk] XLA gather of the block table here.
+                    main_records = selected.masked_fill(~valid_compressed, -1)
+                    starts = source_meta.query_start_loc
+                else:
+                    slots = _row_slots(
+                        main_cache, _block_table(source_meta), requests, selected.long()
+                    )
+                    main_records = main_cache.row_indices(slots).masked_fill(
+                        ~valid_compressed, -1
+                    )
             else:
                 compressed_rows = _read_rows(
                     source.kv_cache,
@@ -641,20 +653,28 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if tiled:
             slots = _row_slots(swa_cache, swa_table, requests, logical)
             records = swa_cache.row_indices(slots).masked_fill(~valid_window, -1)
-            attend = (
-                sparse_fp8_attention
-                if self._fp8_kv and self.compress_ratio
-                else paged_attention
-            )
-            result = attend(
-                q,
-                swa_cache,
-                main_cache,
-                records,
-                main_records,
-                self.attn_sink,
-                self.scale,
-            )
+            if self._fp8_kv and self.compress_ratio:
+                result = sparse_fp8_attention(
+                    q,
+                    swa_cache,
+                    main_cache,
+                    records,
+                    main_records,
+                    self.attn_sink,
+                    self.scale,
+                    pages,
+                    starts,
+                )
+            else:
+                result = paged_attention(
+                    q,
+                    swa_cache,
+                    main_cache,
+                    records,
+                    main_records,
+                    self.attn_sink,
+                    self.scale,
+                )
             output.copy_(result.masked_fill((swa_slots < 0)[:, None, None], 0))
             return
         if self._fp8_kv and self.compress_ratio:

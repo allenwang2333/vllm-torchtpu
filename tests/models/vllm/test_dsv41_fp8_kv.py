@@ -108,6 +108,25 @@ def test_paged_cache_rows_fp8_cpu_write():
     assert not rope.view(-1, 32)[untouched].any()
 
 
+def test_paged_cache_rows_pages_match_row_indices():
+    pages, block = 3, 4
+    raw = torch.zeros((pages * block * 2, 128), dtype=torch.int32)
+    rope = torch.zeros((raw.shape[0] // 4, 128), dtype=torch.int32)
+    layout = ((pages, block, 512), torch.uint8, 2 * block * 512, block * 512)
+    cache = PagedCacheRows(raw, layout, rope)
+    table = torch.tensor([[2, 0], [1, 2]])
+    physical = cache.pages(table)
+    for request in range(2):
+        for logical in range(2 * block):
+            block_id = table[request, logical // block]
+            expected = cache.row_indices(block_id * block + logical % block)
+            got = physical[request, logical // block] * block + logical % block
+            assert int(got) == int(expected)
+    # A layer offset that is not a whole page cannot be expressed as pages.
+    odd = ((pages, block, 512), torch.uint8, 2 * block * 512, 2 * 512)
+    assert PagedCacheRows(raw, odd, rope).pages(table) is None
+
+
 def test_compact_records_moves_invalid_to_tail():
     records = jnp.asarray([[-1, 7, -1, 3, 9], [-1, -1, -1, -1, -1]], jnp.int32)
     got = np.asarray(compact_records(records))

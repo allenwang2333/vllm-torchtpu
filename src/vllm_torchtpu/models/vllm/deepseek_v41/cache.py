@@ -198,6 +198,22 @@ class PagedCacheRows:
             + slots % self.shape[1]
         )
 
+    def pages(self, block_table):
+        """``block_table`` as pages of ``shape[1]`` raw rows, or None if unaligned.
+
+        Page ``p`` is raw rows ``[p * shape[1], (p + 1) * shape[1])``, and its
+        RoPE companion rows ``[p * shape[1] / 4, ...)``.
+        """
+        rows = self.shape[1]
+        if (
+            rows % 4
+            or self.row_offset % rows
+            or self.page_stride % rows
+            or self.raw.shape[0] % rows
+        ):
+            return None
+        return block_table * (self.page_stride // rows) + self.row_offset // rows
+
     def __getitem__(self, indices):
         blocks, rows = indices
         records = self.row_indices(blocks * self.shape[1] + rows)

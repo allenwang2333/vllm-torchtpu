@@ -104,13 +104,19 @@ def sparse_fp8_attention_jax(
     rope_pool: jax.Array,
     swa_records: jax.Array,
     main_records: jax.Array,
+    pages: jax.Array,
+    query_start_loc: jax.Array,
     sink: jax.Array,
     scale: float,
+    page_size: int,
 ) -> jax.Array:
     """BF16 SWA partial merged into V4's sparse MLA over FP8 NoPE + RoPE rows.
 
-    Records are physical pool rows, so the whole pool is passed as one page
-    (identity page table); the RoPE companion holds row r's 32 words at r.
+    ``main_records`` index rows through ``pages`` ``[requests, pages_per_seq]``:
+    row ``r`` of request ``s`` is raw row ``pages[s, r // page_size] *
+    page_size + r % page_size``; the RoPE companion holds raw row i's 32 words
+    at i. With one request, one page of every row and ``query_start_loc``
+    ``[0, tokens]``, records are raw rows.
     """
     from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import (
         sparse_ragged_paged_attention,
@@ -119,15 +125,15 @@ def sparse_fp8_attention_jax(
     maximum, denominator, numerator = _attend(
         q, swa_pool, swa_records, _attention_state(q), scale
     )
-    rows = main_pool.shape[0]
+    count = main_pool.shape[0] // page_size
     return sparse_ragged_paged_attention(
         q,
-        main_pool.reshape(1, rows, main_pool.shape[1]),
-        rope_pool.reshape(1, *rope_pool.shape),
+        main_pool.reshape(count, page_size, main_pool.shape[1]),
+        rope_pool.reshape(count, page_size // 4, rope_pool.shape[1]),
         compact_records(main_records),
-        jnp.zeros((1,), jnp.int32),
-        jnp.array([0, q.shape[0]], jnp.int32),
-        jnp.array([0, 0, 1], jnp.int32),
+        pages.reshape(-1),
+        query_start_loc,
+        jnp.array([0, 0, pages.shape[0]], jnp.int32),
         sink.astype(jnp.float32),
         numerator.astype(q.dtype),
         denominator,
@@ -163,24 +169,39 @@ def initialize_paged_attention():
         rope_pool: jax.Array,
         swa_records: jax.Array,
         main_records: jax.Array,
+        pages: jax.Array,
+        query_start_loc: jax.Array,
         sink: jax.Array,
         scale: float,
+        page_size: int,
     ) -> jax.Array:
         # Mosaic calls require explicit manual partitioning on a multi-device
         # mesh; each device attends over its own replicated cache.
         return jax.shard_map(
-            functools.partial(sparse_fp8_attention_jax, scale=scale),
+            functools.partial(
+                sparse_fp8_attention_jax, scale=scale, page_size=page_size
+            ),
             mesh=mesh,
-            in_specs=(P(),) * 7,
+            in_specs=(P(),) * 9,
             out_specs=P(),
             check_vma=False,
-        )(q, swa_pool, main_pool, rope_pool, swa_records, main_records, sink)
+        )(
+            q,
+            swa_pool,
+            main_pool,
+            rope_pool,
+            swa_records,
+            main_records,
+            pages,
+            query_start_loc,
+            sink,
+        )
 
     _fp8_attention_op = pallas.jax_op(
         "pallas::deepseek_v41_sparse_fp8_attention",
         fp8_attention,
         mesh=mesh,
-        input_partition_specs=(P(), P(), P(), P(), P(), P(), P(), None),
+        input_partition_specs=(P(),) * 9 + (None, None),
     )
     _fp8_attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -192,8 +213,17 @@ def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
     )
 
 
-def sparse_fp8_attention(q, swa, main, swa_records, main_records, sink, scale):
+def sparse_fp8_attention(
+    q, swa, main, swa_records, main_records, sink, scale, pages=None, starts=None
+):
+    """``main_records`` are raw rows, or rows paged by ``pages`` (main.pages)."""
     assert _fp8_attention_op is not None and main.rope is not None
+    page_size = main.shape[1]
+    if pages is None:
+        # Identity table: one request whose single page is the whole pool.
+        page_size = main.raw.shape[0]
+        pages = main_records.new_zeros((1, 1))
+        starts = main_records.new_tensor([0, q.shape[0]])
     return _fp8_attention_op(
         q,
         swa.raw,
@@ -201,8 +231,11 @@ def sparse_fp8_attention(q, swa, main, swa_records, main_records, sink, scale):
         main.rope,
         swa_records.int(),
         main_records.int(),
+        pages.int(),
+        starts.int(),
         sink,
         scale,
+        page_size,
     )
 
 
