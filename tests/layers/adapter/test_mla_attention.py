@@ -884,6 +884,85 @@ def test_mla_wrapper_qrep_reshapes_group_heads_and_passes_both_views():
     torch.testing.assert_close(q_pe, rep_pe[:, start : start + local_heads])
 
 
+@pytest.mark.parametrize(
+    "tag,max_tokens,expect_local",
+    [
+        # A decode-sized backbone bucket leaves replication for local heads.
+        ("backbone", 64, True),
+        # A backbone bucket over the cap keeps replication.
+        ("backbone", 2, False),
+        # The draft (one trace for every bucket) gathers at every size.
+        ("eagle_head", 2, True),
+    ],
+)
+def test_mla_wrapper_q_hybrid_hands_local_heads_and_no_replica(
+    tag, max_tokens, expect_local, monkeypatch
+):
+    """`TPU_DCP_Q_HYBRID`: on the gather path the wrapper projects only this
+    rank's heads (the same block `_local_view` picks) and hands no replicated
+    q, so the attention takes the local `W_UK_T` and the fused gather."""
+    from vllm.compilation import backends as compilation_backends
+
+    monkeypatch.setattr(envs, "TPU_DCP_Q_HYBRID", True, raising=False)
+    monkeypatch.setattr(envs, "TPU_DCP_Q_HYBRID_MAX_TOKENS", max_tokens, raising=False)
+    monkeypatch.setattr(compilation_backends, "model_tag", tag, raising=False)
+    group_size, local_heads, num_tokens, rank = 4, 2, 3, 2
+    wrapper = VllmMultiHeadLatentAttentionWrapper.__new__(
+        VllmMultiHeadLatentAttentionWrapper
+    )
+    torch.nn.Module.__init__(wrapper)
+    wrapper.kimi_preprocess = None
+    wrapper.q_lora_rank = None
+    wrapper.kv_lora_rank = 4
+    wrapper.qk_nope_head_dim = 3
+    wrapper.qk_rope_head_dim = 2
+    wrapper.qk_head_dim = 5
+    wrapper.num_heads = local_heads
+    wrapper.v_head_dim = 2
+    wrapper.dcp_q_replicate = True
+    wrapper.dcp_group_size = group_size
+    wrapper.is_sparse = True
+    wrapper.indexer = None
+    wrapper.skip_topk = True
+    wrapper.topk_indices_buffer = torch.zeros((num_tokens, 8), dtype=torch.int32)
+    group_width = local_heads * group_size * wrapper.qk_head_dim
+    wrapper.kv_a_proj_with_mqa = lambda hidden: (
+        torch.ones((hidden.shape[0], 6), dtype=hidden.dtype),
+        None,
+    )
+    q_values = torch.arange(num_tokens * group_width, dtype=torch.bfloat16).view(
+        num_tokens, group_width
+    )
+    wrapper.q_proj = _FakeQProj(group_size, rank_in_group=rank, out=q_values)
+    wrapper.kv_a_layernorm = lambda value: value
+    wrapper.rotary_emb = None
+    wrapper.g_proj = None
+    wrapper.gate_is_fused = False
+    wrapper.mla_attn = MagicMock(
+        return_value=torch.ones((num_tokens, 4), dtype=torch.bfloat16)
+    )
+    wrapper.o_proj = lambda value: (value, None)
+
+    VllmMultiHeadLatentAttentionWrapper.forward(
+        wrapper,
+        positions=torch.arange(num_tokens),
+        hidden_states=torch.ones((num_tokens, 8), dtype=torch.bfloat16),
+    )
+
+    (q_nope, q_pe) = wrapper.mla_attn.call_args.args[0]
+    replicated = wrapper.mla_attn.call_args.kwargs["q_dcp_replicated"]
+    group = q_values.view(num_tokens, local_heads * group_size, 5)
+    mine = group[:, rank * local_heads : (rank + 1) * local_heads]
+    assert q_nope.shape == (num_tokens, local_heads, 3)
+    torch.testing.assert_close(q_nope, mine[..., :3])
+    torch.testing.assert_close(q_pe, mine[..., 3:])
+    if expect_local:
+        assert replicated is None
+    else:
+        assert replicated is not None
+        assert replicated[0].shape == (num_tokens, local_heads * group_size, 3)
+
+
 def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):
     """On the sparse DCP path a replicated q is consumed directly, against the
     group-wide `W_UK_T`, and the per-step head all-gather is not run."""

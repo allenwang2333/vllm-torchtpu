@@ -117,43 +117,72 @@ def _inputs(world, tokens, seed=20261003):
     return q_c, w_q, w_s.to(torch.float32), w_uk_t, w_uv, kv_c, k_pe
 
 
-class _FakeQB:
-    """The replicated q_b projection as `VllmFp8LinearMethodTPU` leaves it."""
+def _fake_qb(weight, scale, rank_in_group, group_size, neox):
+    """The replicated q_b projection as `VllmFp8LinearMethodTPU` leaves it,
+    optionally with its rope columns put in half-split order by the production
+    post-load permutation (`TPU_MLA_ROPE_NEOX_PERMUTE`)."""
+    import torch
 
-    def __init__(self, weight, scale, rank_in_group, group_size, num_heads):
-        from vllm_torchtpu.layers.adapter.linear_common import (
-            WEIGHT_FLIPPED_ATTR,
-            quantized_matmul,
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        mla_rope_output_index,
+        permute_linear_output_channels,
+    )
+
+    class _FakeQB(torch.nn.Module):
+        pass
+
+    _FakeQB.__init__ = _fake_init
+    _FakeQB.forward = _fake_call
+    _FakeQB._local_view = _fake_local_view
+    layer = _FakeQB(weight, scale, rank_in_group, group_size)
+    if neox:
+        heads = weight.shape[1] // (NOPE + ROPE)
+        index = mla_rope_output_index(
+            weight.shape[1], ROPE, period=NOPE + ROPE, offset=NOPE, count=heads
         )
-        from vllm_torchtpu.layers.adapter.quantization.fp8 import (
-            VllmFp8LinearMethodTPU,
-        )
+        permute_linear_output_channels(layer, index)
+    return layer
 
-        self.weight = weight  # (k, n) = [Q_LORA, group heads * qk_head_dim]
-        self.weight_scale = scale  # [n]
-        self.bias = None
-        self.rank_in_group = rank_in_group
-        self.group_size = group_size
-        self.quant_method = VllmFp8LinearMethodTPU.__new__(VllmFp8LinearMethodTPU)
-        setattr(self, WEIGHT_FLIPPED_ATTR, True)
-        self._mm = quantized_matmul
-        self._num_heads = num_heads
 
-    def __call__(self, x):
-        return self._mm(x, self.weight, self.weight_scale), None
+def _fake_init(self, weight, scale, rank_in_group, group_size):
+    import torch
 
-    def _local_view(self, out):
-        n = out.shape[-2] // self.group_size
-        start = self.rank_in_group * n
-        return out[..., start : start + n, :].contiguous()
+    from vllm_torchtpu.layers.adapter.linear_common import (
+        WEIGHT_FLIPPED_ATTR,
+        quantized_matmul,
+    )
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+        VllmFp8LinearMethodTPU,
+    )
+
+    torch.nn.Module.__init__(self)
+    # (k, n) = [Q_LORA, group heads * qk_head_dim], and its [n] scale.
+    self.weight = torch.nn.Parameter(weight, requires_grad=False)
+    self.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+    self.bias = None
+    self.rank_in_group = rank_in_group
+    self.group_size = group_size
+    self.quant_method = VllmFp8LinearMethodTPU.__new__(VllmFp8LinearMethodTPU)
+    setattr(self, WEIGHT_FLIPPED_ATTR, True)
+    self._mm = quantized_matmul
+
+
+def _fake_call(self, x):
+    return self._mm(x, self.weight, self.weight_scale), None
+
+
+def _fake_local_view(self, out):
+    n = out.shape[-2] // self.group_size
+    start = self.rank_in_group * n
+    return out[..., start : start + n, :].contiguous()
 
 
 def _paths(rank, world, cp_mla, wrapper_cls):
     """(qrep, hybrid) functions of q_c -> dict of intermediate tensors."""
     import torch
 
-    def build(q_c, w_q, w_s, w_uk_t, w_uv, kv_c, k_pe, slice_rank):
-        layer = _FakeQB(w_q, w_s, slice_rank, world, LOCAL_HEADS)
+    def build(q_c, w_q, w_s, w_uk_t, w_uv, kv_c, k_pe, slice_rank, neox):
+        layer = _fake_qb(w_q, w_s, slice_rank, world, neox)
         me = SimpleNamespace(
             q_lora_rank=Q_LORA,
             q_b_proj=layer,
@@ -250,12 +279,17 @@ def _check(rank, world, cp_mla, wrapper_cls):
         host = _inputs(world, tokens)
         q_c, w_q, w_s, w_uk_t, w_uv, kv_c, k_pe = (t.to("tpu") for t in host)
         kv_c, k_pe = kv_c[rank], k_pe[rank]
+        arms = (
+            ("hybrid", rank, False),
+            ("hybrid_neox", rank, True),
+            ("control_wrong_slice", (rank + 1) % world, False),
+        )
         for how in ("eager", "compiled"):
-            for arm, slice_rank in (("hybrid", rank), ("control_wrong_slice", (rank + 1) % world)):
+            for arm, slice_rank, neox in arms:
                 key = f"T{tokens}/{how}/{arm}"
                 try:
                     qrep, hybrid = build(
-                        q_c, w_q, w_s, w_uk_t, w_uv, kv_c, k_pe, slice_rank
+                        q_c, w_q, w_s, w_uk_t, w_uv, kv_c, k_pe, slice_rank, neox
                     )
                     if how == "compiled":
                         qrep, hybrid = _compile(qrep), _compile(hybrid)
@@ -369,10 +403,11 @@ def assert_hybrid_results(results: list[dict]) -> None:
         check = r["check"]
         for tokens in TOKENS:
             for how in ("eager", "compiled"):
-                c = check[f"T{tokens}/{how}/hybrid"]
-                assert "error" not in c, (r["rank"], tokens, how, c)
-                for k in ("q_local", "ql_dcp", "pe_dcp", "out"):
-                    assert c[k]["pass"], (r["rank"], tokens, how, k, c[k])
+                for arm in ("hybrid", "hybrid_neox"):
+                    c = check[f"T{tokens}/{how}/{arm}"]
+                    assert "error" not in c, (r["rank"], tokens, how, arm, c)
+                    for k in ("q_local", "ql_dcp", "pe_dcp", "out"):
+                        assert c[k]["pass"], (r["rank"], tokens, how, arm, k, c[k])
                 ctl = check[f"T{tokens}/{how}/control_wrong_slice"]
                 assert "error" not in ctl, (r["rank"], tokens, how, ctl)
                 assert not ctl["out"]["pass"], (
