@@ -567,34 +567,51 @@ def scatter_cache_values(
     from jax.experimental.pallas import tpu as pltpu
 
     chunks = width // ROW_WORDS
+    # Records per grid step whose row DMAs are in flight together. A serial
+    # start/wait per 512 B row is DMA-latency bound.
+    block = 64
+    count = records.shape[0]
+    records = jnp.pad(records, (0, -count % block), constant_values=-1)
 
-    def kernel(record_ref, values_ref, _input_ref, output_ref, row_ref, sem):
-        token, chunk = pl.program_id(0), pl.program_id(1)
-        record = record_ref[token]
-        row = record * chunks + chunk
-
-        @pl.when((record >= 0) & (record < cache.shape[0] // chunks))
-        def write():
-            source = values_ref.at[
-                pl.ds((token * chunks + chunk) * ROW_WORDS, ROW_WORDS)
+    def kernel(record_ref, values_ref, _input_ref, output_ref, sem):
+        def copies(index):
+            token = pl.program_id(0) * block + index
+            record = record_ref[token]
+            return (record >= 0) & (record < cache.shape[0] // chunks), [
+                pltpu.make_async_copy(
+                    values_ref.at[
+                        pl.ds((token * chunks + chunk) * ROW_WORDS, ROW_WORDS)
+                    ],
+                    output_ref.at[record * chunks + chunk, :],
+                    sem,
+                )
+                for chunk in range(chunks)
             ]
-            destination = output_ref.at[row, :]
-            pltpu.make_async_copy(source, row_ref, sem).start()
-            pltpu.make_async_copy(source, row_ref, sem).wait()
-            pltpu.make_async_copy(row_ref, destination, sem).start()
-            pltpu.make_async_copy(row_ref, destination, sem).wait()
+
+        def run(method):
+            def body(index, carry):
+                valid, row_copies = copies(index)
+
+                @pl.when(valid)
+                def _():
+                    for copy in row_copies:
+                        getattr(copy, method)()
+
+                return carry
+
+            jax.lax.fori_loop(0, block, body, 0)
+
+        run("start")
+        run("wait")
 
     return pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            grid=(records.shape[0], chunks),
+            grid=(records.shape[0] // block,),
             in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 2,
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-            scratch_shapes=[
-                pltpu.VMEM((ROW_WORDS,), jnp.int32),
-                pltpu.SemaphoreType.DMA,
-            ],
+            scratch_shapes=[pltpu.SemaphoreType.DMA],
         ),
         out_shape=jax.ShapeDtypeStruct(cache.shape, cache.dtype),
         input_output_aliases={2: 0},
