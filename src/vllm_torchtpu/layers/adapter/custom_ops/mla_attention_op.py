@@ -58,7 +58,11 @@ from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     VllmTPUDeepseekV32IndexerBackend,
 )
-from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.layers.adapter.linear_common import (
+    FP8_PALLAS_SCALE,
+    FP8_PALLAS_WEIGHT,
+    WEIGHT_FLIPPED_ATTR,
+)
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
@@ -785,6 +789,14 @@ def permute_linear_output_channels(layer: torch.nn.Module, index: torch.Tensor):
     updated = []
     for name, param in list(layer.named_parameters(recurse=False)):
         t = param.data
+        if name in (FP8_PALLAS_WEIGHT, FP8_PALLAS_SCALE):
+            # TPU_FP8_LINEAR_PALLAS's zero-padded [.., n_pad] kernel copy: permute
+            # the real channels, leave the pad channels where they are.
+            pad = torch.arange(n_out, t.shape[-1], dtype=index.dtype)
+            new = _index_select_bits(t, t.ndim - 1, torch.cat([index, pad]))
+            replace_parameter(layer, name, Parameter(new, requires_grad=False))
+            updated.append(getattr(layer, name))
+            continue
         if name == "weight":
             axis = 1 if flipped else 0
             if t.ndim != 2 or t.shape[axis] != n_out:
