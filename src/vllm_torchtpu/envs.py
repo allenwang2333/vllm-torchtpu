@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     TPU_MOE_ONEHOT_SORTFREE: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
+    TPU_MOE_ROUTER_TOPK_BIAS: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -692,6 +693,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
         "TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]
     ),
+    # With the rowmax router and a score-correction bias, add the bias inside
+    # the top-k kernel and return the unbiased scores at the chosen ids, so
+    # the separate scores.gather (one gather fusion per MoE layer) goes away.
+    # Ids and weights are bit-identical to the gather path.
+    "TPU_MOE_ROUTER_TOPK_BIAS": env_bool("TPU_MOE_ROUTER_TOPK_BIAS"),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's
