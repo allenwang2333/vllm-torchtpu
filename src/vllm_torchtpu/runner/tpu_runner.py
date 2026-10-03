@@ -975,7 +975,11 @@ class TPUModelRunner(GPUModelRunner):
         self._token_padding_state: token_padding.TokenPaddingState | None = None
 
         self._init_phased_profiling()
-        self._stage_timing = RunnerStageTiming(profiler_rank)
+        # The samples only reach a metrics sink through the KV connector's
+        # stats (get_finished_kv_transfers); without one, skip the timings.
+        self._stage_timing = RunnerStageTiming(
+            profiler_rank, enabled=has_kv_transfer_group
+        )
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.

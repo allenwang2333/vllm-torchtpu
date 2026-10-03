@@ -7,7 +7,7 @@ import contextlib
 import queue
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
 from torch_tpu._internal.stream.streams import TpuEvent
@@ -24,8 +24,13 @@ class _PendingTiming:
 class RunnerStageTiming:
     MAX_IN_FLIGHT_DEVICE_TIMINGS = 1024
 
-    def __init__(self, rank: int):
+    def __init__(self, rank: int, enabled: Callable[[], bool] = lambda: True):
+        """``enabled`` is checked per stage: with no consumer for the samples
+        (no KV connector stats sink) the timings are skipped, since each
+        device timing records two TpuEvents, and every record flushes the
+        pending eager ops on the serving thread."""
         self._rank = str(rank)
+        self._enabled = enabled
         self._cpu_samples: list[tuple[str, str, float]] = []
         self._device_samples: list[tuple[str, str, float]] = []
         # Check Event support before serving; synchronization stays off the
@@ -53,12 +58,18 @@ class RunnerStageTiming:
 
     @contextlib.contextmanager
     def host_stage(self, stage: str) -> Iterator[None]:
+        if not self._enabled():
+            yield
+            return
         cpu_start = time.perf_counter()
         yield
         self._cpu_samples.append((self._rank, stage, time.perf_counter() - cpu_start))
 
     @contextlib.contextmanager
     def stage(self, stage: str) -> Iterator[None]:
+        if not self._enabled():
+            yield
+            return
         if not self._slots.acquire(blocking=False):
             with self.host_stage(stage):
                 yield
