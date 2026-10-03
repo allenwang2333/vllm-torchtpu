@@ -82,6 +82,12 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_STREAMIDX_DCP_SINGLE_TOPK_MAX_KV: int = 16384
+    TPU_SC_TOPK_FUSED_PAYLOAD: bool = False
+    TPU_INDEXER_TOPK_SINGLE_WRITE: bool = False
+    TPU_INDEXER_TOPK_NOCOPY: bool = False
+    TPU_SPARSE_MLA_DCP_A2A_MERGE: bool = False
+    TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS: int = 256
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -675,6 +681,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Unset means unchunked: one single pass, no pipelining.
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
+    ),
+    "TPU_STREAMIDX_DCP_SINGLE_TOPK_MAX_KV": env_nonnegative_int(
+        "TPU_STREAMIDX_DCP_SINGLE_TOPK_MAX_KV", 16384
+    ),
+    "TPU_SC_TOPK_FUSED_PAYLOAD": env_bool("TPU_SC_TOPK_FUSED_PAYLOAD", default=False),
+    "TPU_INDEXER_TOPK_SINGLE_WRITE": env_bool(
+        "TPU_INDEXER_TOPK_SINGLE_WRITE", default=False
+    ),
+    "TPU_INDEXER_TOPK_NOCOPY": env_bool("TPU_INDEXER_TOPK_NOCOPY", default=False),
+    "TPU_SPARSE_MLA_DCP_A2A_MERGE": env_bool("TPU_SPARSE_MLA_DCP_A2A_MERGE", False),
+    "TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS": env_nonnegative_int(
+        "TPU_SPARSE_MLA_DCP_A2A_MERGE_MAX_TOKENS", 256
     ),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
