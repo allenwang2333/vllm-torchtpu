@@ -14,6 +14,7 @@
 """Out-of-tree (OOT) custom operator layers and wrappers for
 Multi-Head Latent Attention (MLA)."""
 
+import os
 from typing import Any
 
 import jax
