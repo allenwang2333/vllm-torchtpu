@@ -579,6 +579,21 @@ class TpuPlatform(Platform):
         return "vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor"
 
     @classmethod
+    def get_default_ir_op_priority(
+        cls, vllm_config: "VllmConfig | None" = None
+    ):
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        return IrOpPriorityConfig(
+            rms_norm=["tpu"],
+            fused_add_rms_norm=["tpu"],
+        )
+
+    @classmethod
+    def import_ir_kernels(cls) -> None:
+        import vllm_torchtpu.kernels  # noqa: F401
+
+    @classmethod
     def set_additional_forward_context(cls, *args, **kwargs) -> dict:
         """Move DP metadata onto the TPU for DP+EP.
 
