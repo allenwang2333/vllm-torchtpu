@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_ONEHOT_SORTFREE: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_MOE_EP_TP_SIZE: int = 1
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_ROUTER_TOPK_BIAS: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
@@ -722,6 +723,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weight-bandwidth bound and the per-device expert load is badly
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP": env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # Tensor-parallel degree of the routed experts inside each expert-parallel
+    # group: with --enable-expert-parallel on W ranks, the experts split into
+    # W/N groups of N consecutive ranks, and each rank holds 1/N of the
+    # intermediate width of every expert in its group (EP W/N x TP N) instead
+    # of whole experts (EP W). Same weight bytes per rank and the same final
+    # all-reduce over TP. At decode the MoE is weight-bandwidth bound and the
+    # step waits for the rank with the most active experts; splitting each
+    # expert N ways evens that out. 0 or 1 = off (vLLM's flat EP).
+    "TPU_MOE_EP_TP_SIZE": env_nonnegative_int("TPU_MOE_EP_TP_SIZE", 1),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
