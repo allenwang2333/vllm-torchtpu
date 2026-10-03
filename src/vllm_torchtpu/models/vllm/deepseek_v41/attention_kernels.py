@@ -321,15 +321,68 @@ def paged_index_scores_jax(
 _indexer_op = None
 
 
-def _visible_top_k(
-    scores: jax.Array, k: int, bound: jax.Array
-) -> tuple[jax.Array, jax.Array]:
-    """``jax.lax.top_k(scores, k)`` when columns ``>= bound`` are ``-inf``.
+def _prefix_count(mask: jax.Array, block: int = 128) -> jax.Array:
+    """Inclusive ``cumsum(mask, -1)`` as exact blockwise 0/1 matmuls.
 
-    Sorts only a static power-of-two bucket of columns covering ``bound``
-    (the full width is sorted otherwise). Exact: buckets hold at least ``k``
-    columns, so ``-inf`` ties still resolve to the lowest indices.
+    A full-width cumsum is ~0.5 ms at ``[512, 16896]`` on TPU; the MXU is not.
     """
+    rows, width = mask.shape
+    blocks = -(-width // block)
+    x = jnp.pad(mask, ((0, 0), (0, blocks * block - width))).astype(jnp.bfloat16)
+    x = x.reshape(rows, blocks, block)
+    upper = jnp.triu(jnp.ones((block, block), jnp.bfloat16))
+    inner = jnp.einsum("nbi,ij->nbj", x, upper, preferred_element_type=jnp.float32)
+    totals = inner[..., -1].astype(jnp.bfloat16)  # at most `block`: exact
+    strict = jnp.triu(jnp.ones((blocks, blocks), jnp.bfloat16), 1)
+    before = jnp.einsum("nb,bc->nc", totals, strict, preferred_element_type=jnp.float32)
+    return (inner + before[..., None]).reshape(rows, -1)[:, :width].astype(jnp.int32)
+
+
+def _threshold_top_k(scores: jax.Array, k: int) -> jax.Array:
+    """Ascending indices of ``jax.lax.top_k(scores, k)``, no sort.
+
+    Finds the k-th largest value by bisecting an order-preserving integer key,
+    breaks ties at it by lowest index (as top_k does), then compacts.
+    """
+    rows = scores.shape[0]
+    scores = jnp.where(scores == 0, 0.0, scores)  # top_k ties -0.0 with +0.0
+    bits = jax.lax.bitcast_convert_type(scores, jnp.int32)
+    key = jnp.where(bits < 0, bits ^ jnp.int32(0x7FFFFFFF), bits) ^ jnp.int32(-(2**31))
+    key = jax.lax.bitcast_convert_type(key, jnp.uint32)
+
+    def bisect(bit, threshold):
+        candidate = threshold | (jnp.uint32(1) << (31 - bit).astype(jnp.uint32))
+        enough = (key >= candidate[:, None]).sum(-1) >= k
+        return jnp.where(enough, candidate, threshold)
+
+    threshold = jax.lax.fori_loop(0, 32, bisect, jnp.zeros((rows,), jnp.uint32))
+    above = key > threshold[:, None]
+    tied = key == threshold[:, None]
+    remaining = k - above.sum(-1)
+    chosen = above | (tied & (_prefix_count(tied) <= remaining[:, None]))
+    ranks = _prefix_count(chosen)
+    targets = jnp.broadcast_to(jnp.arange(1, k + 1, dtype=jnp.int32), (rows, k))
+    return jax.vmap(functools.partial(jnp.searchsorted, side="left"))(
+        ranks, targets
+    ).astype(jnp.int32)
+
+
+def _visible_top_k(scores: jax.Array, k: int, bound: jax.Array) -> jax.Array:
+    """Ascending ``jax.lax.top_k(scores, k)`` indices when columns ``>= bound``
+    are ``-inf``.
+
+    Selects only within a static power-of-two bucket of columns covering
+    ``bound`` (the full width otherwise). Exact: buckets hold at least ``k``
+    columns, so ``-inf`` ties still resolve to the lowest indices. Large
+    selections use `_threshold_top_k`; small ones (decode) sort.
+    """
+
+    def select(columns, scores):
+        scores = scores[:, :columns]
+        if scores.shape[0] >= 16 and columns >= 4096:
+            return _threshold_top_k(scores, k)
+        return jnp.sort(jax.lax.top_k(scores, k)[1], axis=-1)
+
     width = scores.shape[1]
     buckets = []
     bucket = max(k, 1024)
@@ -338,15 +391,10 @@ def _visible_top_k(
         bucket *= 2
     buckets.append(width)
     if len(buckets) == 1:
-        return jax.lax.top_k(scores, k)
+        return select(width, scores)
     branch = jnp.searchsorted(jnp.asarray(buckets[:-1]), bound, side="left")
     return jax.lax.switch(
-        branch,
-        [
-            functools.partial(lambda b, s: jax.lax.top_k(s[:, :b], k), b)
-            for b in buckets
-        ],
-        scores,
+        branch, [functools.partial(select, b) for b in buckets], scores
     )
 
 
@@ -404,9 +452,8 @@ def select_indices_jax(
             allowed = jnp.take_along_axis(membership, logical // block_size, axis=1)
             # Match the upstream batch-wide short-context bypass.
             scores = jnp.where(allowed | (lengths.max() <= topk), scores, -jnp.inf)
-    values, indices = _visible_top_k(scores, min(topk, width), lengths.max())
-    # Preserve V4.1's logical order and therefore attention accumulation order.
-    indices = jnp.sort(indices, axis=-1)
+    # Ascending: preserves V4.1's logical, hence attention accumulation, order.
+    indices = _visible_top_k(scores, min(topk, width), lengths.max())
     values = jnp.take_along_axis(scores, indices, axis=1)
     return jnp.where(values > -jnp.inf, indices, -1).astype(jnp.int32), published
 

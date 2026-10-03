@@ -242,15 +242,19 @@ def test_merge_sub_rows_matches_lane_scatter(width, count):
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 
 
+@pytest.mark.parametrize("rows", [3, 16])
 @pytest.mark.parametrize("bound", [0, 7, 512, 1024, 1025, 3000, 5000])
-def test_visible_top_k_matches_full(bound):
+def test_visible_top_k_matches_full(bound, rows):
     rng = np.random.default_rng(bound)
     width, k = 5000, 512
-    # Coarse values create ties; columns >= bound are invisible.
-    scores = np.round(rng.standard_normal((3, width)), 1).astype(np.float32)
+    # Coarse values create ties (incl. -0.0 vs +0.0); columns >= bound and a
+    # filtered gap are invisible.
+    scores = np.round(rng.standard_normal((rows, width)), 1).astype(np.float32)
+    zeros = np.where(rng.random(width) < 0.5, -0.0, 0.0).astype(np.float32)
+    scores[::2] = np.where(np.abs(scores[::2]) < 0.3, zeros, scores[::2])
+    scores[1, 100:900] = -np.inf
     scores[:, bound:] = -np.inf
     scores = jnp.asarray(scores)
     got = _visible_top_k(scores, k, jnp.int32(bound))
-    expected = jax.lax.top_k(scores, k)
-    for a, b in zip(got, expected):
-        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    expected = jnp.sort(jax.lax.top_k(scores, k)[1], axis=-1)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
