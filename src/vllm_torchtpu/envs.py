@@ -136,7 +136,9 @@ if TYPE_CHECKING:
     DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
-    VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = True
+    VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
+    VLLM_TPU_NATIVE_RMS_NORM: bool = False
+    VLLM_TPU_FP8_FAST_BF16_ACT_QUANT: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
 
@@ -840,7 +842,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enables persistent device index caching in
     # TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool(
-        "VLLM_TPU_FAST_TOKEN_SUBSTITUTION", True
+        "VLLM_TPU_FAST_TOKEN_SUBSTITUTION", False
+    ),
+    # Enables TPU-native rms_norm and fused_add_rms_norm IR op priority.
+    "VLLM_TPU_NATIVE_RMS_NORM": env_bool("VLLM_TPU_NATIVE_RMS_NORM", False),
+    # Enables bfloat16 activation division in quantize_block for FP8 matmuls.
+    "VLLM_TPU_FP8_FAST_BF16_ACT_QUANT": env_bool(
+        "VLLM_TPU_FP8_FAST_BF16_ACT_QUANT", False
     ),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.

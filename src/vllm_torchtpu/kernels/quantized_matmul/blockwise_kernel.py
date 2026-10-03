@@ -6,6 +6,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.quantized_matmul import util
 from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import (
     TunedValue,
@@ -191,8 +192,10 @@ def quantized_matmul_kernel(
             for i in range(steps_k):
                 k_start, k_end = i * block_size, (i + 1) * block_size
                 lhs_sub = lhs_ref[:, k_start:k_end]
-                if lhs_sub.dtype != jnp.bfloat16 or not jnp.issubdtype(
-                    x_q_dtype, jnp.floating
+                if (
+                    not envs.VLLM_TPU_FP8_FAST_BF16_ACT_QUANT
+                    or lhs_sub.dtype != jnp.bfloat16
+                    or not jnp.issubdtype(x_q_dtype, jnp.floating)
                 ):
                     lhs_sub = lhs_sub.astype(jnp.float32)
                 lhs_q, lhs_scale = util.quantize_block(lhs_sub, 1, x_q_dtype)

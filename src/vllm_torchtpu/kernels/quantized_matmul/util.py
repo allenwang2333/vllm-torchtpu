@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 from jax._src import dtypes
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import TunedValue
 
 
@@ -300,7 +301,7 @@ def quantize_block(data, axis, target_dtype):
     scale = jnp.where(scale == 0, 1.0, scale)
 
     if jnp.issubdtype(target_dtype, jnp.floating):
-        if data.dtype == jnp.bfloat16:
+        if data.dtype == jnp.bfloat16 and envs.VLLM_TPU_FP8_FAST_BF16_ACT_QUANT:
             # bf16 shares f32's exponent range; return the exact divisor used.
             scale = scale.astype(jnp.bfloat16)
             scale = jnp.where(scale == 0, jnp.ones_like(scale), scale)

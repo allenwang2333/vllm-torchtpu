@@ -404,8 +404,18 @@ def test_quantized_matmul_blockwise_int4_fp8(
     )
 
 
-def test_quantize_block_preserves_input_dtype_for_fp8() -> None:
+def test_quantize_block_preserves_input_dtype_for_fp8(monkeypatch) -> None:
     x = jax.random.normal(jax.random.key(0), (64, 512), dtype=jnp.bfloat16)
+
+    # Default (off): uses fp32 division
+    monkeypatch.delenv("VLLM_TPU_FP8_FAST_BF16_ACT_QUANT", raising=False)
+    lowered_default = jax.jit(
+        lambda a: util.quantize_block(a, axis=1, target_dtype=jnp.float8_e4m3fn)
+    ).lower(x)
+    assert "f32[64,512]{1,0} divide(" in lowered_default.as_text("hlo")
+
+    # Opt-in (on): uses bf16 division
+    monkeypatch.setenv("VLLM_TPU_FP8_FAST_BF16_ACT_QUANT", "1")
     lowered = jax.jit(
         lambda a: util.quantize_block(a, axis=1, target_dtype=jnp.float8_e4m3fn)
     ).lower(x)

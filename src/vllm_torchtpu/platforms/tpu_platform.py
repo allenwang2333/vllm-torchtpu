@@ -584,11 +584,13 @@ class TpuPlatform(Platform):
     ):
         from vllm.config.kernel import IrOpPriorityConfig
 
-        return IrOpPriorityConfig.with_default(
-            ["native"],
-            rms_norm=["tpu", "native"],
-            fused_add_rms_norm=["tpu", "native"],
-        )
+        if envs.VLLM_TPU_NATIVE_RMS_NORM:
+            return IrOpPriorityConfig.with_default(
+                ["native"],
+                rms_norm=["tpu", "native"],
+                fused_add_rms_norm=["tpu", "native"],
+            )
+        return IrOpPriorityConfig.with_default(["native"])
 
     @classmethod
     def import_ir_kernels(cls) -> None:

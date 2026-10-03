@@ -15,7 +15,7 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 def test_env_flag_parsing(monkeypatch):
     monkeypatch.delenv("VLLM_TPU_FAST_TOKEN_SUBSTITUTION", raising=False)
-    assert envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION is True
+    assert envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION is False
 
     monkeypatch.setenv("VLLM_TPU_FAST_TOKEN_SUBSTITUTION", "1")
     assert envs.environment_variables["VLLM_TPU_FAST_TOKEN_SUBSTITUTION"]() is True

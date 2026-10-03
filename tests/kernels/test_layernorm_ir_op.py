@@ -59,18 +59,27 @@ def test_fused_add_rms_norm_tpu_matches_native(variance_size, has_weight):
     torch.testing.assert_close(out_tpu, out_ref, atol=2e-2, rtol=1e-2)
 
 
-def test_tpu_ir_op_registration():
+def test_tpu_ir_op_registration(monkeypatch):
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
     TpuPlatform.import_ir_kernels()
+    assert "tpu" in ops.rms_norm.impls
+    assert "tpu" in ops.fused_add_rms_norm.impls
+
+    # Default (off): all ops default to ["native"]
+    monkeypatch.delenv("VLLM_TPU_NATIVE_RMS_NORM", raising=False)
+    prio_default = TpuPlatform.get_default_ir_op_priority()
+    assert prio_default.rms_norm == ["native"]
+    assert prio_default.fused_add_rms_norm == ["native"]
+
+    # Opt-in (on): rms_norm and fused_add_rms_norm prioritize ["tpu", "native"]
+    monkeypatch.setenv("VLLM_TPU_NATIVE_RMS_NORM", "1")
     prio = TpuPlatform.get_default_ir_op_priority()
     assert prio.rms_norm == ["tpu", "native"]
     assert prio.fused_add_rms_norm == ["tpu", "native"]
     for name, val in vars(prio).items():
         if name not in ("rms_norm", "fused_add_rms_norm"):
             assert val == ["native"]
-    assert "tpu" in ops.rms_norm.impls
-    assert "tpu" in ops.fused_add_rms_norm.impls
 
 
 def test_tpu_ir_op_dispatch_and_fallbacks():
