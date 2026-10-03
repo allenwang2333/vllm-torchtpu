@@ -21,6 +21,9 @@ from collections.abc import Callable, Sequence
 
 import torch
 
+# Registers the fast top-p op at import (not lazily inside a traced graph).
+from vllm_torchtpu.layers.adapter.sample import fast_top_p_op
+
 MASKED_LOGIT_VALUE = -1e12
 
 
@@ -73,8 +76,7 @@ def _int32_bsearch(
             shift = hi - width
             num_cand = (1 << width) - 1
             cand = (
-                torch.arange(1, num_cand + 1, dtype=torch.int32, device=device)
-                << shift
+                torch.arange(1, num_cand + 1, dtype=torch.int32, device=device) << shift
             ).view((num_cand,) + (1,) * len(batch_shape))
             candidates = current_bits.unsqueeze(0) | cand
             # False for candidates 1..digit, True above (monotonic predicate).
@@ -221,12 +223,53 @@ def topk_mask(
         count_gt = torch.sum((logits > neg_threshold).to(torch.int32), dim=-1)
         return count_gt >= k
 
-    cutoff = -_float32_bsearch(
-        logits.shape[:-1], predicate, logits.device, radix_bits
-    )
+    cutoff = -_float32_bsearch(logits.shape[:-1], predicate, logits.device, radix_bits)
     cutoff = cutoff.unsqueeze(-1)
     replace_tensor = torch.full_like(logits, replace_val)
     return torch.where(logits >= cutoff, logits, replace_tensor)
+
+
+def _parse_fast_top_p(spec: str) -> tuple[int, str, str]:
+    """ "K[,method[,mass_accum]]" -> (K, method, mass_accum)."""
+    parts = [x.strip() for x in spec.split(",")]
+    k = int(parts[0])
+    method = parts[1] if len(parts) > 1 and parts[1] else FAST_TOP_P_METHOD
+    accum = parts[2] if len(parts) > 2 and parts[2] else FAST_TOP_P_MASS_ACCUM
+    return k, method, accum
+
+
+# Defaults of a fast_top_p spec (see kernels/top_p.py). "f32": torch_tpu's
+# torch.sum of a bf16 tensor accumulates in f32 and rounds once -- checked
+# bit for bit against the bisection on TPU (test_fast_top_p_matches_bisection).
+FAST_TOP_P_K = 1024
+FAST_TOP_P_METHOD = "topk"
+FAST_TOP_P_MASS_ACCUM = "f32"
+
+
+def fast_topp_threshold(
+    probs: torch.Tensor, p: torch.Tensor, spec: str
+) -> torch.Tensor:
+    """The bisection's top-p threshold [B, 1] f32, via kernels/top_p.py on TPU.
+
+    Off TPU it is the bisection itself (the JAX op only runs on TPU)."""
+    if probs.device.type != "tpu":
+        return _topp_bisect_threshold(probs, p.squeeze(-1), 1).unsqueeze(-1)
+    k, method, accum = _parse_fast_top_p(spec)
+    return fast_top_p_op.top_p_threshold(probs, p.float(), k, method, accum)
+
+
+def _topp_bisect_threshold(probs: torch.Tensor, p: torch.Tensor, radix_bits: int):
+    zero_val = torch.zeros_like(probs)
+
+    def predicate(threshold: torch.Tensor) -> torch.Tensor:
+        threshold = threshold.unsqueeze(-1)
+        probability_mass = torch.sum(
+            torch.where(probs >= threshold, probs, zero_val),
+            dim=-1,
+        )
+        return probability_mass < p
+
+    return _float32_bsearch(probs.shape[:-1], predicate, probs.device, radix_bits)
 
 
 def topp_mask(
@@ -234,6 +277,7 @@ def topp_mask(
     p: torch.Tensor,
     replace_val: float = MASKED_LOGIT_VALUE,
     radix_bits: int = 1,
+    fast_top_p: str = "",
 ) -> torch.Tensor:
     """Applies top-p masking to logits.
 
@@ -255,27 +299,22 @@ def topp_mask(
       logits: Logits before masking. [batch..., vocab_size]
       p: Minimum probability mass requested. [batch..., 1]
       replace_val: For the masked values of logits, what to overwrite them with.
+      fast_top_p: "" for the bisection, else a "K[,method[,mass_accum]]" spec:
+        the same threshold from a K-candidate prefilter proven by one vocab
+        pass, falling back to the bisection when the proof fails
+        (kernels/top_p.py). [batch, vocab_size] inputs only.
 
     Returns:
       masked version of logits. [batch..., vocab_size]
     """
-    p = p.squeeze(-1)
     probs = torch.softmax(logits, dim=-1)
-    zero_val = torch.zeros_like(probs)
     replace_tensor = torch.full_like(logits, replace_val)
-
-    def predicate(threshold: torch.Tensor) -> torch.Tensor:
-        threshold = threshold.unsqueeze(-1)
-        probability_mass = torch.sum(
-            torch.where(probs >= threshold, probs, zero_val),
-            dim=-1,
+    if fast_top_p:
+        threshold = fast_topp_threshold(probs, p, fast_top_p)
+    else:
+        threshold = _topp_bisect_threshold(probs, p.squeeze(-1), radix_bits).unsqueeze(
+            -1
         )
-        return probability_mass < p
-
-    threshold = _float32_bsearch(
-        logits.shape[:-1], predicate, logits.device, radix_bits
-    )
-    threshold = threshold.unsqueeze(-1)
     return torch.where(probs >= threshold, logits, replace_tensor)
 
 
@@ -286,6 +325,7 @@ def apply_top_k_top_p(
     need_top_k: bool = True,
     need_top_p: bool = True,
     radix_bits: int = 1,
+    fast_top_p: str = "",
 ) -> torch.Tensor:
     """Top-k then top-p masking, per row.
 
@@ -293,6 +333,8 @@ def apply_top_k_top_p(
     that some row has top_k > 0 / top_p < 1. When False, every row's
     torch.where below would select the unmasked input, so the mask is skipped
     whole: bit-identical output, minus 32-33 full-vocab reduction passes.
+    fast_top_p (static, see topp_mask) computes the same top-p threshold in
+    one proven vocab pass instead of 33.
     """
     masked_logits = logits
     if need_top_k:
@@ -303,5 +345,7 @@ def apply_top_k_top_p(
     if not need_top_p:
         return masked_logits
     should_apply_topp = (top_p < 1.0).expand(-1, masked_logits.shape[-1])
-    topp_masked = topp_mask(masked_logits, top_p, MASKED_LOGIT_VALUE, radix_bits)
+    topp_masked = topp_mask(
+        masked_logits, top_p, MASKED_LOGIT_VALUE, radix_bits, fast_top_p
+    )
     return torch.where(should_apply_topp, topp_masked, masked_logits)
