@@ -503,14 +503,20 @@ class TestFp8LinearRuntimeQuant:
                 hf_text_config=SimpleNamespace(
                     is_heterogeneous=False,
                     attention_k_eq_v=True,
-                    layer_types=["sliding_attention", "full_attention"],
+                    num_hidden_layers=3,
+                    num_kv_shared_layers=1,
+                    layer_types=[
+                        "sliding_attention",
+                        "full_attention",
+                        "full_attention",
+                    ],
                 )
             ),
             compilation_config=SimpleNamespace(custom_ops=[]),
             kernel_config=SimpleNamespace(linear_backend="auto"),
         )
 
-        def make_fp8_qkv(prefix, *, bias=None, keep_layout=False):
+        def make_fp8_qkv(prefix, *, bias=None, keep_layout=False, w_override=None):
             lyr = QKVParallelLinear.__new__(QKVParallelLinear)
             torch.nn.Module.__init__(lyr)
             lyr.prefix = prefix
@@ -520,7 +526,8 @@ class TestFp8LinearRuntimeQuant:
             lyr.v_head_size = 32
             lyr.bias = bias
             lyr.logical_widths = [q_size, kv_size, kv_size]
-            lyr.weight = torch.nn.Parameter(weight_fp8.clone(), requires_grad=False)
+            w_src = weight_fp8 if w_override is None else w_override
+            lyr.weight = torch.nn.Parameter(w_src.clone(), requires_grad=False)
             lyr.weight_scale = torch.nn.Parameter(scale.clone(), requires_grad=False)
             if keep_layout:
                 setattr(lyr, KEEP_VLLM_LAYOUT_ATTR, True)
@@ -535,7 +542,17 @@ class TestFp8LinearRuntimeQuant:
             assert getattr(swa_layer, K_EQ_V_ATTR, 0) == 0
             assert swa_layer.weight.shape == (in_dim, out_dim)
 
-            # 2. Layer 1 with bias != None must NOT deduplicate
+            # 2. Layer 2 (KV-shared layer: idx >= num_hidden_layers - num_kv_shared_layers)
+            # and non-decoder multi-index prefixes must NOT deduplicate or assert
+            shared_layer = make_fp8_qkv("model.layers.2.self_attn.qkv_proj")
+            method.process_weights_after_loading(shared_layer)
+            assert getattr(shared_layer, K_EQ_V_ATTR, 0) == 0
+
+            tower_layer = make_fp8_qkv("vision_tower.blocks.0.layers.1.attn.qkv_proj")
+            method.process_weights_after_loading(tower_layer)
+            assert getattr(tower_layer, K_EQ_V_ATTR, 0) == 0
+
+            # 3. Layer 1 with bias != None or KEEP_VLLM_LAYOUT_ATTR must NOT deduplicate
             biased_layer = make_fp8_qkv(
                 "model.layers.1.self_attn.qkv_proj",
                 bias=torch.zeros(out_dim, device=device, dtype=torch.bfloat16),
@@ -544,7 +561,6 @@ class TestFp8LinearRuntimeQuant:
             assert getattr(biased_layer, K_EQ_V_ATTR, 0) == 0
             assert biased_layer.weight.shape == (in_dim, out_dim)
 
-            # 3. Layer 1 with KEEP_VLLM_LAYOUT_ATTR must NOT deduplicate
             raw_layer = make_fp8_qkv(
                 "model.layers.1.self_attn.qkv_proj", keep_layout=True
             )
@@ -552,7 +568,15 @@ class TestFp8LinearRuntimeQuant:
             assert getattr(raw_layer, K_EQ_V_ATTR, 0) == 0
             assert raw_layer.weight.shape == (out_dim, in_dim)
 
-            # 4. Layer 1 (full_attention) MUST deduplicate V weight and be idempotent on reload
+            # 4. Mismatched K and V shards on a flagged full_attention layer must raise RuntimeError
+            w_bad = torch.cat([w_q, w_kv, -w_kv.float().to(torch.float8_e4m3fn)], dim=0)
+            bad_fp8_layer = make_fp8_qkv(
+                "model.layers.1.self_attn.qkv_proj", w_override=w_bad
+            )
+            with pytest.raises(RuntimeError, match="K and V shards differ"):
+                method.process_weights_after_loading(bad_fp8_layer)
+
+            # 5. Layer 1 (full_attention) MUST deduplicate V weight and be idempotent on reload
             layer = make_fp8_qkv("model.layers.1.self_attn.qkv_proj")
             method.process_weights_after_loading(layer)
             method.process_weights_after_loading(layer)  # idempotence check
@@ -568,7 +592,7 @@ class TestFp8LinearRuntimeQuant:
                 assert out_fp8.shape == (4, out_dim)
                 assert torch.equal(out_fp8, out_swa_ref)
 
-            # 5. Unquantized path deduplicates, is idempotent, and reconstructs full QKV output
+            # 6. Unquantized path deduplicates, is idempotent, and reconstructs full QKV output
             unq_layer = QKVParallelLinear.__new__(QKVParallelLinear)
             torch.nn.Module.__init__(unq_layer)
             unq_layer.prefix = "model.layers.1.self_attn.qkv_proj"
@@ -595,6 +619,21 @@ class TestFp8LinearRuntimeQuant:
             ref = torch.matmul(x, full_w_bf16.transpose(0, 1))
             assert out.shape == (4, out_dim)
             assert torch.equal(out, ref)
+
+            # Unquantized path raises RuntimeError when K != V on a flagged layer
+            bad_unq = QKVParallelLinear.__new__(QKVParallelLinear)
+            torch.nn.Module.__init__(bad_unq)
+            bad_unq.prefix = "model.layers.1.self_attn.qkv_proj"
+            bad_unq.num_heads = 2
+            bad_unq.num_kv_heads = 1
+            bad_unq.head_size = 32
+            bad_unq.v_head_size = 32
+            bad_unq.bias = None
+            bad_unq.weight = torch.nn.Parameter(
+                torch.cat([w_q_bf16, w_kv_bf16, -w_kv_bf16], dim=0), requires_grad=False
+            )
+            with pytest.raises(RuntimeError, match="K and V shards differ"):
+                unq_method.process_weights_after_loading(bad_unq)
 
     def test_blockwise_runtime_scale_shape(self, device, monkeypatch):
         """ullm blockwise env gate changes dense-linear runtime scale layout."""

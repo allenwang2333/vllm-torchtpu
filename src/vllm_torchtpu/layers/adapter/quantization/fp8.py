@@ -1342,6 +1342,19 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                 and q_size + 2 * k_size == ckpt_n_out
                 and weight_scale.shape[-1] == ckpt_n_out
             ):
+                k_w = weight[q_size : q_size + k_size]
+                v_w = weight[q_size + k_size :]
+                k_s = weight_scale[..., q_size : q_size + k_size]
+                v_s = weight_scale[..., q_size + k_size :]
+                if not (
+                    torch.equal(k_w.view(torch.uint8), v_w.view(torch.uint8))
+                    and torch.equal(k_s, v_s)
+                ):
+                    raise RuntimeError(
+                        f"{layer.prefix}: config says attention_k_eq_v but K and V shards "
+                        "differ; refusing to drop V."
+                    )
+                logger.info_once("TPU K=V QKV dedup enabled (V matmul columns dropped).")
                 weight = weight[: q_size + k_size]
                 weight_scale = weight_scale[..., : q_size + k_size]
                 ckpt_n_out = q_size + k_size

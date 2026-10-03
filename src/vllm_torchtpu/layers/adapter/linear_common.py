@@ -1,4 +1,5 @@
 from collections.abc import Callable
+import re
 from threading import Lock
 
 import jax
@@ -37,37 +38,39 @@ KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
 K_EQ_V_ATTR = "_tpu_k_eq_v_kv_size"
 
+# Matches only decoder self-attention QKV, e.g.
+# "model.layers.7.self_attn.qkv_proj" / "model.language_model.layers.7.self_attn.qkv_proj".
+_DECODER_QKV_PREFIX_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.self_attn\.qkv_proj$")
+
 
 def is_k_eq_v_qkv_layer(layer: torch.nn.Module) -> bool:
-    """Return True if ``layer`` is a QKVParallelLinear configured with K == V."""
+    """True if the loader filled this layer's V shard with K.
+
+    Mirrors vllm/model_executor/models/gemma4.py::_gemma4_layer_weights_mapper,
+    the single source of truth for which layers ship k_proj only.
+    """
     from vllm.config import get_current_vllm_config_or_none
     from vllm.model_executor.layers.linear import QKVParallelLinear
-    from vllm.model_executor.models.utils import extract_layer_index
 
     if not isinstance(layer, QKVParallelLinear) or getattr(layer, "bias", None) is not None:
         return False
-    if getattr(layer, "attention_k_eq_v", False):
-        return True
     vllm_config = get_current_vllm_config_or_none()
     if vllm_config is None or vllm_config.model_config is None:
         return False
     text_config = vllm_config.model_config.hf_text_config
-    prefix = getattr(layer, "prefix", "")
-    if ".layers." not in prefix:
-        return False
-    layer_idx = extract_layer_index(prefix)
-    if getattr(text_config, "is_heterogeneous", False):
-        per_layer = getattr(text_config, "per_layer_config", None)
-        if per_layer is not None and 0 <= layer_idx < len(per_layer):
-            return bool(getattr(per_layer[layer_idx], "attention_k_eq_v", False))
-        return False
+    # Model-level gate first: nothing below runs for non-K=V models.
     if not getattr(text_config, "attention_k_eq_v", False):
         return False
-    layer_types = getattr(text_config, "layer_types", None)
-    return bool(
-        layer_types is not None
-        and 0 <= layer_idx < len(layer_types)
-        and layer_types[layer_idx] == "full_attention"
+    match = _DECODER_QKV_PREFIX_RE.search(getattr(layer, "prefix", ""))
+    if match is None:
+        return False
+    idx = int(match.group(1))
+    layer_types = getattr(text_config, "layer_types", None) or ()
+    first_kv_shared = text_config.num_hidden_layers - getattr(
+        text_config, "num_kv_shared_layers", 0
+    )
+    return idx < min(len(layer_types), first_kv_shared) and (
+        layer_types[idx] == "full_attention"
     )
 
 

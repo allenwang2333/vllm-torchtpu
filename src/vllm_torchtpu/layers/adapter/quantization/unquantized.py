@@ -113,6 +113,12 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
             k_size = layer.num_kv_heads * layer.head_size
             v_size = layer.num_kv_heads * getattr(layer, "v_head_size", layer.head_size)
             if k_size == v_size > 0 and q_size + 2 * k_size == weight.shape[0]:
+                if not torch.equal(
+                    weight[q_size : q_size + k_size], weight[q_size + k_size :]
+                ):
+                    raise RuntimeError(
+                        f"{layer.prefix}: config says attention_k_eq_v but K and V shards differ."
+                    )
                 weight = weight[: q_size + k_size]
                 setattr(layer, K_EQ_V_ATTR, k_size)
         weight = weight.transpose(0, 1).contiguous()
