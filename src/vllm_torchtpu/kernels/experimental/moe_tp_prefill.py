@@ -30,6 +30,10 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.fused_moe.v2 import host as v2_host
 from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
+    COMBINE_CHUNK,
+    COMBINE_GROUP,
+    COMBINE_LEAD,
+    COMBINE_PARITIES,
     _tile_row_scales,
     build_combine_kernel,
     combine_step_tokens,
@@ -90,7 +94,7 @@ def _build_expert_kernel(
     slab_rows = n_routes + n_tok + TILE_M
     scale_rows = _cdiv(slab_rows, LANES) + 1
     tok_rows = _align(n_routes, LANES) + window
-    x_rows = _align(n_tok, TILE_M) + TILE_M
+    x_rows = n_tok
 
     def kernel(
         # scalar prefetch
@@ -175,6 +179,13 @@ def _build_expert_kernel(
         def is_shared(v):
             return visit_e_sm[v] == shared
 
+        def contiguous_rows(v, t):
+            """First token and row count of a contiguous (shared-expert) tile;
+            x is not padded, so the last tile moves only the rows it has."""
+            if "gather" in ablate:  # timing arm: any in-bounds rows
+                return jnp.minimum(t * TILE_M, max(x_rows - TILE_M, 0)), min(TILE_M, x_rows)
+            return t * TILE_M, tile_live(v, t)
+
         # ---- token-index windows (routed tiles only) ----
         def win_copy(base, slot):
             aligned = pl.multiple_of(base - lax.rem(base, LANES), LANES)
@@ -207,9 +218,9 @@ def _build_expert_kernel(
 
             @pl.when(contiguous)
             def _():
-                tok0 = jnp.minimum(t * TILE_M, x_rows - TILE_M)
+                tok0, n = contiguous_rows(v, t)
                 pltpu.make_async_copy(
-                    x_hbm.at[pl.ds(tok0, TILE_M)], lhs_vm.at[slot], lhs_sems.at[slot]
+                    x_hbm.at[pl.ds(tok0, n)], lhs_vm.at[slot, pl.ds(0, n)], lhs_sems.at[slot]
                 ).start()
 
             @pl.when(jnp.logical_not(contiguous))
@@ -233,7 +244,9 @@ def _build_expert_kernel(
 
         def wait_tile(v, t, slot):
             contiguous = is_shared(v) if "gather" not in ablate else jnp.bool_(True)
-            n = jnp.where(contiguous, TILE_M, _cdiv_t(tile_live(v, t), unroll) * unroll)
+            n = jnp.where(
+                contiguous, contiguous_rows(v, t)[1], _cdiv_t(tile_live(v, t), unroll) * unroll
+            )
             pltpu.make_async_copy(
                 lhs_vm.at[slot, pl.ds(0, n)], lhs_vm.at[slot, pl.ds(0, n)], lhs_sems.at[slot]
             ).wait()
@@ -518,6 +531,8 @@ def moe_tp_prefill(
     tile_m=None,
     n_rungs=4,
     relayout=frozenset({"out_f32"}),
+    combine_impl="v2",
+    ar_order="chain",
 ):
     """One rank's routed + shared MoE output for T > the decode cap.
 
@@ -555,8 +570,7 @@ def moe_tp_prefill(
     )
 
     # ---- prep ----
-    x_q, x_s = rowquant_fp8(x)  # [T,H] fp8, [T,1] f32
-    x_s = x_s.reshape(-1)
+    x_q, x_s = _rowquant_rows(x)  # [T, H/128, 128] fp8 (the gather's layout), [T] f32
     # Padded bucket rows keep their expert ids but carry zero routing weight
     # (TPU_MOE_SKIP_PADDED_TOKENS); their routes are not computed.
     route_valid = (topk_weights != 0) if skip_zero_weight_routes else None
@@ -569,8 +583,7 @@ def moe_tp_prefill(
     visit_rows = visit_rows.at[n_rv].set(n_tok)
     n_visit = (n_rv + 1).reshape(1)
 
-    x_pad = jnp.pad(x_q, ((0, dims["x_rows"] - n_tok), (0, 0)))
-    x_pad = x_pad.reshape(dims["x_rows"], lane_blocks, LANES)
+    x_pad = x_q
     ls = jnp.concatenate([s_sorted, x_s])
     ls = jnp.pad(ls, (0, dims["scale_rows"] * LANES - ls.shape[0]))
     ls = ls.reshape(dims["scale_rows"], LANES)
@@ -621,10 +634,32 @@ def moe_tp_prefill(
     pos = jnp.where(dead, shared_pos, pos)
     pos_all = jnp.concatenate([pos, shared_pos], 1)
     coef_all = jnp.concatenate([coef, gate], 1)
-    return combine(part, pos_all, coef_all, n_tok, hidden, combine_chunks, reduce_fn, interpret)
+    return combine(
+        part,
+        pos_all,
+        coef_all,
+        n_tok,
+        hidden,
+        combine_chunks,
+        reduce_fn,
+        interpret,
+        combine_impl,
+        ar_order,
+    )
 
 
-def combine(part, pos, coef, n_tok, hidden, n_chunks, reduce_fn, interpret=False):
+def combine(
+    part,
+    pos,
+    coef,
+    n_tok,
+    hidden,
+    n_chunks,
+    reduce_fn,
+    interpret=False,
+    combine_impl="v2",
+    ar_order="free",
+):
     k = pos.shape[1]
     lane_blocks = hidden // LANES
     if n_tok % n_chunks:
@@ -633,30 +668,44 @@ def combine(part, pos, coef, n_tok, hidden, n_chunks, reduce_fn, interpret=False
     outs = []
     for c in range(n_chunks):
         sl = slice(c * tc, (c + 1) * tc)
-        if combine_step_tokens(tc) and not interpret:
-            fn = build_combine_kernel(
-                t_local=tc,
-                topk=k,
-                hidden=hidden,
-                lane_blocks=lane_blocks,
-                wire_dtype=jnp.bfloat16,
-                out_dtype=jnp.bfloat16,
-            )
+        if combine_step_tokens(tc) and (not interpret or combine_impl == "tp_f32"):
+            if combine_impl == "v2":
+                fn = build_combine_kernel(
+                    t_local=tc,
+                    topk=k,
+                    hidden=hidden,
+                    lane_blocks=lane_blocks,
+                    wire_dtype=jnp.bfloat16,
+                    out_dtype=jnp.bfloat16,
+                )
+            else:
+                fn = build_tp_combine(
+                    t_local=tc, topk=k, hidden=hidden, retile_f32=True, interpret=interpret
+                )
             y = fn(part, coef[sl], pos[sl])
         else:
             rows = part.reshape(part.shape[0], hidden)[pos[sl]].astype(jnp.float32)
             y = jnp.sum(rows * coef[sl][..., None], axis=1).astype(jnp.bfloat16)
         if reduce_fn is not None:
+            if outs and ar_order == "chain":
+                # Tie chunk c's input to chunk c-1's reduced output: XLA can
+                # no longer merge the two all-reduces into one, and c-1's runs
+                # under c's combine.
+                y, _ = lax.optimization_barrier((y, outs[-1]))
+            elif outs and ar_order == "dep":
+                y = y + (outs[-1][:1, :1] * 0).astype(y.dtype)
             y = reduce_fn(y)
         outs.append(y)
     return outs[0] if len(outs) == 1 else jnp.concatenate(outs, 0)
 
 
-def default_combine_chunks(n_tok, max_chunk_tokens=4096):
+def default_combine_chunks(n_tok, max_chunk_tokens=2048):
     """Fewest equal combine chunks of at most max_chunk_tokens tokens.
 
     The combine's position and coefficient tables live in SMEM (1 MiB): a
-    16384-token call with 11 slots per token does not fit in one chunk.
+    16384-token call with 11 slots per token does not fit in one chunk. More
+    chunks let each chunk's all-reduce run under the next chunk's combine
+    (ar_order="chain" keeps XLA from merging them back into one).
     """
     for n in range(1, n_tok + 1):
         if n_tok % n == 0 and n_tok // n <= max_chunk_tokens:
@@ -673,3 +722,123 @@ def default_tile_m(n_tok):
     for 512 experts at top-10, in kernel_work/moe-tp-prefill (probe 04).
     """
     return 256 if n_tok >= 8192 else 128
+
+
+@functools.lru_cache(maxsize=None)
+def build_tp_combine(*, t_local, topk, hidden, retile_f32, interpret=False):
+    """fused_moe/v2's destination combine for bf16 partial rows.
+
+    out[i] = sum_k coef[i, k] * part[pos[i, k]], f32 accumulate, bf16 out.
+    With retile_f32 the per-token sums stay f32 until the [tokens, H/128,
+    128] -> [tokens, H] retile, which then runs on 8x8 sublane blocks, and
+    the cast to bf16 follows it.
+    """
+    tb = combine_step_tokens(t_local)
+    steps = t_local // tb
+    lanes = LANES
+    lane_blocks = hidden // lanes
+    acc_dtype = jnp.float32 if retile_f32 else jnp.bfloat16
+    gt = 8 if retile_f32 else COMBINE_GROUP
+    groups = tb // gt
+
+    def kernel(pos_sm, coef_sm, arr_hbm, out_hbm, rows_vm, tile_vm, out_vm, row_sems, out_sems):
+        def start_row(base, parity, i, k):
+            pltpu.make_async_copy(
+                arr_hbm.at[pos_sm[(base + i) * topk + k]],
+                rows_vm.at[parity, k * tb + i],
+                row_sems.at[parity],
+            ).start(priority=k % 2)
+
+        def reduce_token(base, parity, i):
+            acc = None
+            for k in range(topk):
+                term = rows_vm[parity, k * tb + i].astype(jnp.float32) * coef_sm[(base + i) * topk + k]
+                acc = term if acc is None else acc + term
+            tile_vm[i] = acc.astype(acc_dtype)
+
+        def one_step(step, parity):
+            nxt = jnp.minimum(step + COMBINE_LEAD, steps - 1) * tb
+            base = step * tb
+            npar = (parity + COMBINE_LEAD) % COMBINE_PARITIES
+            pltpu.make_async_copy(rows_vm.at[parity], rows_vm.at[parity], row_sems.at[parity]).wait()
+
+            @pl.when(step >= COMBINE_PARITIES)
+            def _():
+                pltpu.make_async_copy(out_vm.at[parity], out_vm.at[parity], out_sems.at[parity]).wait()
+
+            def one_chunk(chunk, carry):
+                for u in range(COMBINE_CHUNK):
+                    i = chunk * COMBINE_CHUNK + u
+                    for k in range(topk):
+                        start_row(nxt, npar, i, k)
+                    reduce_token(base, parity, i)
+                return carry
+
+            lax.fori_loop(0, tb // COMBINE_CHUNK, one_chunk, jnp.int32(0))
+            for g in range(groups):
+                out_vm[parity, pl.ds(g * gt, gt)] = (
+                    tile_vm[pl.ds(g * gt, gt)].reshape(gt, hidden).astype(jnp.bfloat16)
+                )
+            pltpu.make_async_copy(
+                out_vm.at[parity], out_hbm.at[pl.ds(step * tb, tb)], out_sems.at[parity]
+            ).start()
+
+        def step_group(pair, carry):
+            for parity in range(COMBINE_PARITIES):
+                one_step(pair * COMBINE_PARITIES + parity, parity)
+            return carry
+
+        for p in range(COMBINE_LEAD):
+            for i in range(tb):
+                for k in range(topk):
+                    start_row(p * tb, p, i, k)
+        lax.fori_loop(0, steps // COMBINE_PARITIES, step_group, jnp.int32(0))
+        for p in range(COMBINE_LEAD):
+            pltpu.make_async_copy(rows_vm.at[p], rows_vm.at[p], row_sems.at[p]).wait()
+        for p in range(COMBINE_PARITIES):
+            pltpu.make_async_copy(out_vm.at[p], out_vm.at[p], out_sems.at[p]).wait()
+
+    hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    call = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            in_specs=[hbm],
+            out_specs=hbm,
+            scratch_shapes=(
+                pltpu.VMEM((COMBINE_PARITIES, topk * tb, lane_blocks, lanes), jnp.bfloat16),
+                pltpu.VMEM((tb, lane_blocks, lanes), acc_dtype),
+                pltpu.VMEM((COMBINE_PARITIES, tb, hidden), jnp.bfloat16),
+                pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
+                pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
+            ),
+            grid=(),
+        ),
+        out_shape=jax.ShapeDtypeStruct((t_local, hidden), jnp.bfloat16),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=None if interpret else v2_host.vmem_limit(),
+            disable_bounds_checks=True,
+        ),
+        interpret=pltpu.InterpretParams() if interpret else False,
+        name=f"moe_tp_combine_t{t_local}_k{topk}_b{tb}" + ("_f32" if retile_f32 else ""),
+    )
+
+    def fn(part, coef, pos):
+        return call(pos.astype(jnp.int32).reshape(-1), coef.reshape(-1), part)
+
+    return fn
+
+
+def _rowquant_rows(x):
+    """Per-row fp8 quant written straight into the [T, H/128, 128] layout the
+    expert kernel gathers rows from (one XLA fusion, no separate retile/pad).
+    Same arithmetic as fused_moe/v2's rowquant_fp8."""
+    n_tok, hidden = x.shape
+    x3 = x.reshape(n_tok, hidden // LANES, LANES)
+    amax = jnp.max(jnp.abs(x3), axis=(1, 2), keepdims=True)
+    scale = amax.astype(jnp.float32) / v2_host.FP8_MAX
+    usable = jnp.isfinite(scale) & (scale > 0)
+    scale = jnp.where(usable, scale, 0.0)
+    sinv = jnp.where(usable, 1.0 / jnp.where(usable, scale, 1.0), 0.0)
+    q = jnp.where(usable, x3 * sinv.astype(x.dtype), jnp.zeros_like(x3)).astype(FP8)
+    return q, scale.reshape(-1)

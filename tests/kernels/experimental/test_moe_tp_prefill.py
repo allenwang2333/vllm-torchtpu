@@ -198,10 +198,10 @@ def test_zero_weight_routes_are_skipped():
 
 
 def test_default_combine_chunks():
-    assert mtp.default_combine_chunks(16384) == 4
-    assert mtp.default_combine_chunks(3072) == 1
-    assert mtp.default_combine_chunks(4096) == 1
-    assert mtp.default_combine_chunks(8192) == 2
+    assert mtp.default_combine_chunks(16384) == 8
+    assert mtp.default_combine_chunks(3072) == 2
+    assert mtp.default_combine_chunks(4096) == 2
+    assert mtp.default_combine_chunks(512) == 1
 
 
 @pytest.mark.parametrize("tile_m,n_rungs", [(128, 4), (256, 1), (256, 4)])
@@ -216,3 +216,25 @@ def test_relayout_variants_bit_identical(relayout):
     c = make_case(300, 16, 256, 128, 4, skew=True)
     y = np.asarray(run_kernel(c, relayout=frozenset(relayout)).astype(jnp.float32))
     assert row_err(y, same_math(c)) < 1e-2
+
+
+def test_tp_combine_f32_matches_reference():
+    rng = np.random.default_rng(1)
+    T, H, K, n_rows = 256, 256, 3, 900
+    part = jnp.asarray(rng.standard_normal((n_rows, H // 128, 128)), jnp.bfloat16)
+    pos = jnp.asarray(rng.integers(0, n_rows, (T, K)), jnp.int32)
+    coef = jnp.asarray(rng.random((T, K)), jnp.float32)
+    y = np.asarray(mtp.combine(part, pos, coef, T, H, 1, None, not _on_tpu(), "tp_f32").astype(jnp.float32))
+    ref = np.einsum("tk,tkh->th", np.asarray(coef, np.float64),
+                    np.asarray(part.astype(jnp.float32), np.float64).reshape(n_rows, H)[np.asarray(pos)])
+    np.testing.assert_allclose(y, ref, rtol=1e-2, atol=1e-2)
+
+
+def test_rowquant_rows_matches_v2():
+    x = jax.random.normal(jax.random.key(3), (40, 256), jnp.float32).astype(jnp.bfloat16)
+    x = x.at[5].set(0)
+    q, s = mtp._rowquant_rows(x)
+    q2, s2 = rowquant_fp8(x)
+    np.testing.assert_array_equal(np.asarray(q.reshape(40, 256).astype(jnp.float32)),
+                                  np.asarray(q2.astype(jnp.float32)))
+    np.testing.assert_array_equal(np.asarray(s), np.asarray(s2.reshape(-1)))
