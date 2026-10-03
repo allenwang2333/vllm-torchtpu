@@ -385,7 +385,7 @@ def fused_conv1d_gdn(
     compute_precision: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
-    mixed_tile_size: int = 64,
+    mixed_tile_size: int | None = None,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -546,6 +546,11 @@ def fused_conv1d_gdn(
         decode_tile_size = max(
             1, min(decode_tile_size, batch_size // (num_spec_tokens + 1))
         )
+    if mixed_tile_size is None:
+        # 128-token chunks amortize the per-tile pipeline and solve better
+        # than 64 on the per-sequence pass; keep 64 where 128 does not
+        # divide the token count.
+        mixed_tile_size = 128 if batch_size % 128 == 0 else 64
     mixed_tile_size = min(mixed_tile_size, batch_size)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
 

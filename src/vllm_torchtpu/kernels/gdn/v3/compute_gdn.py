@@ -44,18 +44,17 @@ def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
     num_blocks = chunk // block_size
 
     def local_forward_sub(t_mat, b_mat):
-        x_list = []
-        for i in range(block_size):
-            b_i = b_mat[:, i, :]
-            if i == 0:
-                x_i = b_i
-            else:
-                stacked_x = jnp.stack(x_list, axis=1)
-                all_prev_t = t_mat[:, i, :i]
-                prev_sum = jnp.sum(all_prev_t[..., None] * stacked_x, axis=1)
-                x_i = b_i - prev_sum
-            x_list.append(x_i)
-        return jnp.stack(x_list, axis=1)
+        # Right-looking: once row i of the solution is final, eliminate it
+        # from every later row with one rank-1 update. This avoids the
+        # per-row lane->sublane broadcasts and sublane reduction trees of
+        # the left-looking form (the VPU/XLU-bound part of the inverse).
+        rows = jax.lax.broadcasted_iota(jnp.int32, (t_mat.shape[0], block_size, 1), 1)
+        x = b_mat
+        for i in range(block_size - 1):
+            x_i = x[:, i : i + 1, :]
+            col = jnp.where(rows > i, t_mat[:, :, i : i + 1], 0.0)
+            x = x - col * x_i
+        return x
 
     x_blocks = []
     iota_r = jax.lax.broadcasted_iota(jnp.int32, t.shape, 1)
