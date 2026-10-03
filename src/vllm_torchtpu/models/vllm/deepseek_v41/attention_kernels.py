@@ -288,6 +288,11 @@ def paged_index_scores_jax(
     records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
     scores = jnp.full((tokens, records.shape[1]), -jnp.inf, jnp.float32)
     q = split_halves(q)  # keys are read in the split element order
+    if requests is not None:
+        # Zero q outside each token's request row: one [T*H, R*D] x [R*D, C]
+        # matmul over the shared key tile, with no per-token key copy.
+        rows = requests[:, None] == jnp.arange(records.shape[0])
+        q = jnp.where(rows[:, None, :, None], q[:, :, None, :], 0).astype(q.dtype)
 
     def step(index, result):
         # Read only the tile consumed by this iteration. Gathering before
@@ -298,8 +303,16 @@ def paged_index_scores_jax(
             pool, addresses.reshape(-1), dim, split=True
         ).reshape(records.shape[0], tile, dim)
         if requests is not None:
-            keys = jnp.take(keys, requests, axis=0)
-        logits = jnp.einsum("thd,tcd->thc", q, keys, preferred_element_type=jnp.float32)
+            # Invalid addresses read arbitrary rows; other requests' rows
+            # are multiplied by zero, which must not meet NaN/inf.
+            keys = jnp.where((addresses >= 0)[..., None] & jnp.isfinite(keys), keys, 0)
+            logits = jnp.einsum(
+                "thrd,rcd->thc", q, keys, preferred_element_type=jnp.float32
+            )
+        else:
+            logits = jnp.einsum(
+                "thd,tcd->thc", q, keys, preferred_element_type=jnp.float32
+            )
         # Upstream quantized MQA logits and the weighted head reduction are
         # FP32. BF16 cache storage is not a request to round the dot product.
         logits = jnp.maximum(logits, 0)
