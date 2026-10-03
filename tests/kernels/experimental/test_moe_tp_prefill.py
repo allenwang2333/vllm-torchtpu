@@ -137,12 +137,19 @@ def test_fault_dropped_expert_is_caught():
 
 
 def test_combine_chunks_equal():
-    c = make_case(256, 8, 256, 128, 3)
-    a = np.asarray(run_kernel(c, combine_chunks=1).astype(jnp.float32))
-    b = np.asarray(run_kernel(c, combine_chunks=4).astype(jnp.float32))
-    # One chunk of 256 takes the Pallas combine, chunks of 64 the XLA fallback:
-    # same sum, different f32 order, so allow one bf16 ulp.
-    np.testing.assert_allclose(a, b, rtol=1e-2, atol=1e-3)
+    """Chunking the combine changes nothing but the f32 summation grouping."""
+    rng = np.random.default_rng(0)
+    T, H, K, n_rows = 256, 256, 4, 1500
+    part = jnp.asarray(rng.standard_normal((n_rows, H // 128, 128)), jnp.bfloat16)
+    pos = jnp.asarray(rng.integers(0, n_rows, (T, K)), jnp.int32)
+    coef = jnp.asarray(rng.random((T, K)), jnp.float32)
+    on_tpu = _on_tpu()
+    a = np.asarray(mtp.combine(part, pos, coef, T, H, 1, None, not on_tpu).astype(jnp.float32))
+    b = np.asarray(mtp.combine(part, pos, coef, T, H, 4, None, not on_tpu).astype(jnp.float32))
+    ref = np.einsum("tk,tkh->th", np.asarray(coef, np.float64),
+                    np.asarray(part.astype(jnp.float32), np.float64).reshape(n_rows, H)[np.asarray(pos)])
+    np.testing.assert_allclose(a, b, rtol=1e-2, atol=1e-2)
+    np.testing.assert_allclose(a, ref, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize("ablate", [("gather",), ("compute",), ("write",), ("weights",),
@@ -193,3 +200,10 @@ def test_default_combine_chunks():
     assert mtp.default_combine_chunks(3072) == 1
     assert mtp.default_combine_chunks(4096) == 1
     assert mtp.default_combine_chunks(8192) == 2
+
+
+@pytest.mark.parametrize("tile_m,n_rungs", [(128, 4), (256, 1), (256, 4)])
+def test_tile_height_and_rungs(tile_m, n_rungs):
+    c = make_case(300, 16, 256, 128, 4, skew=True)
+    y = np.asarray(run_kernel(c, tile_m=tile_m, n_rungs=n_rungs).astype(jnp.float32))
+    assert row_err(y, same_math(c)) < 1e-2

@@ -59,19 +59,36 @@ def _cdiv_t(a, b):
 
 
 def _build_expert_kernel(
-    *, n_experts, hidden, inter, n_tok, n_routes, nbuf, interpret, ablate=frozenset(), unroll=1
+    *,
+    n_experts,
+    hidden,
+    inter,
+    n_tok,
+    n_routes,
+    nbuf,
+    interpret,
+    ablate=frozenset(),
+    unroll=1,
+    tile_m=TILE_M,
+    n_rungs=1,
 ):
     """The per-rank expert kernel for a fixed token count and route count.
 
     Slab layout (rows): [0, n_routes) routed rows expert-major, then the
-    shared expert's n_tok rows at n_routes, then TILE_M rows of slack that the
-    last tile's dead rows may land in.
+    shared expert's n_tok rows at n_routes, then tile_m rows of slack.
+
+    Each tile computes on the smallest of n_rungs heights covering its live
+    rows and writes exactly its live rows (the DMA extent is traced).
     """
+    TILE_M = tile_m  # noqa: N806  (shadows the module default)
+    window = tile_m + LANES
+    scale_win = tile_m // LANES + 1
+    rungs = [tile_m * (i + 1) // n_rungs for i in range(n_rungs)]
     lane_blocks = hidden // LANES
     shared = n_experts  # visit-table id of the shared expert
     slab_rows = n_routes + n_tok + TILE_M
     scale_rows = _cdiv(slab_rows, LANES) + 1
-    tok_rows = _align(n_routes, LANES) + WINDOW
+    tok_rows = _align(n_routes, LANES) + window
     x_rows = _align(n_tok, TILE_M) + TILE_M
 
     def kernel(
@@ -160,7 +177,7 @@ def _build_expert_kernel(
         def win_copy(base, slot):
             aligned = pl.multiple_of(base - lax.rem(base, LANES), LANES)
             return pltpu.make_async_copy(
-                tok_hbm.at[pl.ds(aligned, WINDOW)], win_sm.at[slot], win_sems.at[slot]
+                tok_hbm.at[pl.ds(aligned, window)], win_sm.at[slot], win_sems.at[slot]
             )
 
         def start_window(v, t, slot):
@@ -176,7 +193,7 @@ def _build_expert_kernel(
         # ---- activation rows ----
         def scale_copy(base, slot):
             return pltpu.make_async_copy(
-                ls_hbm.at[pl.ds(base // LANES, 2)], ls_vm.at[slot], lhs_sems.at[slot]
+                ls_hbm.at[pl.ds(base // LANES, scale_win)], ls_vm.at[slot], lhs_sems.at[slot]
             )
 
         def issue_tile(v, t, slot):
@@ -220,10 +237,16 @@ def _build_expert_kernel(
             ).wait()
             scale_copy(tile_base(v, t), slot).wait()
 
-        def out_copy(base, parity):
+        def out_copy(base, parity, n):
             return pltpu.make_async_copy(
-                out_vm.at[parity], part_hbm.at[pl.ds(base, TILE_M)], out_sems.at[parity]
+                out_vm.at[parity, pl.ds(0, n)], part_hbm.at[pl.ds(base, n)], out_sems.at[parity]
             )
+
+        def out_wait(parity, n):
+            # Semaphores count bytes: the wait only needs the extent.
+            pltpu.make_async_copy(
+                out_vm.at[parity, pl.ds(0, n)], out_vm.at[parity, pl.ds(0, n)], out_sems.at[parity]
+            ).wait()
 
         # ---- prologue ----
         for k in range(nbuf - 1):
@@ -241,7 +264,7 @@ def _build_expert_kernel(
 
         # ---- main loop over tiles ----
         def tile_body(carry):
-            v, t, g, prev_base = carry
+            v, t, g, n_out0, n_out1 = carry
             p = lax.rem(g, 2)
             q = 1 - p
             e_first = t == 0
@@ -267,42 +290,60 @@ def _build_expert_kernel(
 
             slot = lax.rem(v, nbuf)
             base = tile_base(v, t)
-            act = lhs_vm[p].reshape(TILE_M, hidden)
-            act_s = _tile_row_scales(ls_vm[p], base, TILE_M)
-            if "compute" in ablate:
-                rows = jnp.zeros((TILE_M, hidden), jnp.bfloat16) + act_s[0, 0].astype(jnp.bfloat16)
+            live = tile_live(v, t)
+
+            # out_vm[p] was last written two tiles ago; free it.
+            if "write" not in ablate:
+                n_prev = jnp.where(p == 0, n_out0, n_out1)
+
+                @pl.when(n_prev > 0)
+                def _():
+                    out_wait(p, n_prev)
+
+            def compute(h):
+                act = lhs_vm[p, pl.ds(0, h)].reshape(h, hidden)
+                act_s = _tile_row_scales(ls_vm[p], base, h)
+                if "compute" in ablate:
+                    rows = jnp.zeros((h, hidden), jnp.bfloat16) + act_s[0, 0].astype(jnp.bfloat16)
+                else:
+                    acc2, mid_s = expert_ffn_fp8(act, act_s, w1_vm[slot], w2_vm[slot], s1_vm[slot])
+                    rows = (acc2 * mid_s * s2_vm[slot]).astype(jnp.bfloat16)
+                rows = rows.reshape(h, lane_blocks, LANES)
+                for par in range(2):
+
+                    @pl.when(p == par)
+                    def _(par=par):
+                        out_vm[par, pl.ds(0, h)] = rows
+
+            for i, h in enumerate(rungs):
+                below = rungs[i - 1] if i else 0
+                if len(rungs) == 1:
+                    compute(h)
+                else:
+
+                    @pl.when(jnp.logical_and(live > below, live <= h))
+                    def _(h=h):
+                        compute(h)
+
+            if "write" not in ablate:
+                out_copy(base, p, live).start()
+                n_written = live
             else:
-                acc2, mid_s = expert_ffn_fp8(act, act_s, w1_vm[slot], w2_vm[slot], s1_vm[slot])
-                rows = (acc2 * mid_s * s2_vm[slot]).astype(jnp.bfloat16)
-            rows = rows.reshape(TILE_M, lane_blocks, LANES)
-
-            # Dead rows past the tile's live rows land on the next visit's
-            # rows (or the slack); writes are serialized in slab order, so
-            # that visit's own write lands later and wins.
-            @pl.when(jnp.logical_and(g > 0, "write" not in ablate))
-            def _():
-                out_copy(prev_base, q).wait()
-
-            for par in range(2):
-
-                @pl.when(p == par)
-                def _(par=par):
-                    out_vm[par] = rows
-                    if "write" not in ablate:
-                        out_copy(base, par).start()
-
-            return vn, tn, g + 1, base
+                n_written = jnp.int32(0)
+            n_out0 = jnp.where(p == 0, n_written, n_out0)
+            n_out1 = jnp.where(p == 1, n_written, n_out1)
+            return vn, tn, g + 1, n_out0, n_out1
 
         def cond(carry):
             return carry[0] < n_visit
 
-        _, _, g_end, last_base = lax.while_loop(
-            cond, tile_body, (z, z, z, jnp.int32(0))
-        )
+        _, _, _, n_out0, n_out1 = lax.while_loop(cond, tile_body, (z, z, z, z, z))
 
-        @pl.when(jnp.logical_and(g_end > 0, "write" not in ablate))
-        def _():
-            out_copy(last_base, lax.rem(g_end - 1, 2)).wait()
+        for par, n in ((0, n_out0), (1, n_out1)):
+
+            @pl.when(n > 0)
+            def _(par=par, n=n):
+                out_wait(par, n)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     call = pl.pallas_call(
@@ -313,13 +354,13 @@ def _build_expert_kernel(
             out_specs=hbm,
             scratch_shapes=(
                 pltpu.VMEM((2, TILE_M, lane_blocks, LANES), FP8),
-                pltpu.VMEM((2, 2, LANES), jnp.float32),
+                pltpu.VMEM((2, scale_win, LANES), jnp.float32),
                 pltpu.VMEM((2, TILE_M, lane_blocks, LANES), jnp.bfloat16),
                 pltpu.VMEM((nbuf, hidden, 2 * inter), FP8),
                 pltpu.VMEM((nbuf, inter, hidden), FP8),
                 pltpu.VMEM((nbuf, 1, 2 * inter), jnp.float32),
                 pltpu.VMEM((nbuf, 1, hidden), jnp.float32),
-                pltpu.SMEM((2, WINDOW), jnp.int32),
+                pltpu.SMEM((2, window), jnp.int32),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
@@ -334,7 +375,7 @@ def _build_expert_kernel(
         ),
         interpret=pltpu.InterpretParams() if interpret else False,
         name=f"moe_tp_prefill_t{n_tok}_e{n_experts}_i{inter}_nb{nbuf}"
-        + f"_u{unroll}"
+        + f"_u{unroll}_m{tile_m}r{n_rungs}"
         + "".join(f"_no{a}" for a in sorted(ablate)),
     )
     return call, dict(slab_rows=slab_rows, scale_rows=scale_rows, tok_rows=tok_rows, x_rows=x_rows)
@@ -427,6 +468,8 @@ def moe_tp_prefill(
     plan="sort2",
     gather_unroll=8,
     skip_zero_weight_routes=True,
+    tile_m=None,
+    n_rungs=4,
 ):
     """One rank's routed + shared MoE output for T > the decode cap.
 
@@ -440,6 +483,8 @@ def moe_tp_prefill(
     the per-rank partial is returned.
     """
     n_tok, hidden = x.shape
+    if tile_m is None:
+        tile_m = default_tile_m(n_tok)
     n_experts, _, two_i = w1.shape
     inter = two_i // 2
     k = topk_ids.shape[1]
@@ -456,6 +501,8 @@ def moe_tp_prefill(
         interpret=interpret,
         ablate=frozenset(ablate),
         unroll=gather_unroll,
+        tile_m=tile_m,
+        n_rungs=n_rungs,
     )
 
     # ---- prep ----
@@ -566,3 +613,14 @@ def default_combine_chunks(n_tok, max_chunk_tokens=4096):
         if n_tok % n == 0 and n_tok // n <= max_chunk_tokens:
             return n
     return 1
+
+
+def default_tile_m(n_tok):
+    """Tile height for a token count.
+
+    Every tile pays a fixed cost (index window, scale window, waits), so tall
+    tiles win once experts hold a few hundred rows each; below that a tall
+    tile mostly computes and stages dead rows. The switch point is measured,
+    for 512 experts at top-10, in kernel_work/moe-tp-prefill (probe 04).
+    """
+    return 256 if n_tok >= 8192 else 128
