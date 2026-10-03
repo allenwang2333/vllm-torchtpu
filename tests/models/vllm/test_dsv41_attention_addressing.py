@@ -15,8 +15,10 @@ from vllm_torchtpu.models.vllm.deepseek_v41.attention_kernels import (
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.cache import (
     gather_cache_values,
+    merge_halves,
     merge_sub_rows,
     scatter_cache_values,
+    split_halves,
 )
 
 
@@ -64,6 +66,24 @@ def test_gather_cache_values_negative_records(elements, fp32):
     expected = gather_cache_values(pool, jnp.where(valid, records, 0), elements, fp32)
     np.testing.assert_array_equal(np.asarray(got)[valid], np.asarray(expected)[valid])
     assert got.shape == (records.size, elements)
+
+
+@pytest.mark.parametrize("elements", [512, 128])
+def test_gather_cache_values_split_order(elements):
+    pool = jnp.asarray(
+        np.random.default_rng(1).integers(-(2**31), 2**31, (64, 128)), jnp.int32
+    )
+    records = jnp.asarray([5, 0, 17, 2], dtype=jnp.int32)
+    natural = gather_cache_values(pool, records, elements)
+    split = gather_cache_values(pool, records, elements, split=True)
+    np.testing.assert_array_equal(
+        np.asarray(split).view(np.uint16),
+        np.asarray(split_halves(natural)).view(np.uint16),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(merge_halves(split)).view(np.uint16),
+        np.asarray(natural).view(np.uint16),
+    )
 
 
 @pytest.mark.parametrize("tokens,width", [(1, 300), (8, 2560), (64, 640)])

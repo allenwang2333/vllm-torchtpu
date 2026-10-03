@@ -6,7 +6,12 @@ import jax
 import jax.numpy as jnp
 import torch
 
-from .cache import gather_cache_values, scatter_cache_values
+from .cache import (
+    gather_cache_values,
+    merge_halves,
+    scatter_cache_values,
+    split_halves,
+)
 
 _attention_op = None
 _fp8_attention_op = None
@@ -29,10 +34,15 @@ def _attend(q, pool, records, state, scale, tile=64):
         return state
     records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
 
-    # Gather BF16 rows once outside; keep FP32 scratch tiled.
-    gathered = gather_cache_values(pool, records.reshape(-1), dim).reshape(
+    # Gather BF16 rows once outside; keep FP32 scratch tiled. Rows and q use
+    # the split element order (no per-element unpack gather); attention is
+    # invariant to a shared permutation of the head dimension.
+    gathered = gather_cache_values(pool, records.reshape(-1), dim, split=True).reshape(
         tokens, records.shape[1], dim
     )
+    q = split_halves(q)
+    maximum, denominator, numerator = state
+    state = maximum, denominator, split_halves(numerator)
 
     def step(index, carry):
         maximum, denominator, numerator = carry
@@ -62,7 +72,10 @@ def _attend(q, pool, records, state, scale, tile=64):
         )
         return new_max, denominator, numerator
 
-    return jax.lax.fori_loop(0, records.shape[1] // tile, step, state)
+    maximum, denominator, numerator = jax.lax.fori_loop(
+        0, records.shape[1] // tile, step, state
+    )
+    return maximum, denominator, merge_halves(numerator)
 
 
 def paged_attention_jax(
@@ -265,15 +278,16 @@ def paged_index_scores_jax(
     tile = 1 << (budget.bit_length() - 1)
     records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
     scores = jnp.full((tokens, records.shape[1]), -jnp.inf, jnp.float32)
+    q = split_halves(q)  # keys are read in the split element order
 
     def step(index, result):
         # Read only the tile consumed by this iteration. Gathering before
         # the loop materializes [tokens, max_context / ratio, dim] even when
         # lengths restrict execution to a single tile (or no tiles).
         addresses = jax.lax.dynamic_slice_in_dim(records, index * tile, tile, axis=1)
-        keys = gather_cache_values(pool, addresses.reshape(-1), dim).reshape(
-            records.shape[0], tile, dim
-        )
+        keys = gather_cache_values(
+            pool, addresses.reshape(-1), dim, split=True
+        ).reshape(records.shape[0], tile, dim)
         if requests is not None:
             keys = jnp.take(keys, requests, axis=0)
         logits = jnp.einsum("thd,tcd->thc", q, keys, preferred_element_type=jnp.float32)

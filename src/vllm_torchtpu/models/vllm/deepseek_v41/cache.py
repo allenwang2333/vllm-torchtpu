@@ -343,14 +343,36 @@ def _gather_words(cache, records, record_words):
     return selected
 
 
+def split_halves(x: jax.Array) -> jax.Array:
+    """Reorder the last axis as ``[0, 2, 4, ..., 1, 3, ...]`` (``split`` reads)."""
+    import jax.numpy as jnp
+
+    return jnp.concatenate([x[..., 0::2], x[..., 1::2]], axis=-1)
+
+
+def merge_halves(x: jax.Array) -> jax.Array:
+    """Inverse of `split_halves`."""
+    import jax.numpy as jnp
+
+    half = x.shape[-1] // 2
+    order = jnp.arange(x.shape[-1])
+    return jnp.take(x, order // 2 + (order % 2) * half, axis=-1)
+
+
 def gather_cache_values(
-    cache: jax.Array, records: jax.Array, elements: int, fp32: bool = False
+    cache: jax.Array,
+    records: jax.Array,
+    elements: int,
+    fp32: bool = False,
+    split: bool = False,
 ) -> jax.Array:
     """Read physical records without flattening or converting the whole pool.
 
     Negative records are invalid and return arbitrary rows; callers mask them.
     They read distinct rows: clamping them all to row 0 serializes the
     SparseCore gather on the repeated index (padded decode, short top-k).
+    ``split`` returns BF16 elements reordered as ``[0, 2, 4, ..., 1, 3, ...]``
+    (see `split_halves`), which needs no lane gather.
     """
     import jax.numpy as jnp
 
@@ -361,6 +383,11 @@ def gather_cache_values(
     words = _gather_words(cache, records, record_words)
     if fp32:
         return jax.lax.bitcast_convert_type(words, jnp.float32)
+    if split:
+        halves = (words << 16, words & jnp.int32(-65536))
+        return jnp.concatenate(
+            [jax.lax.bitcast_convert_type(h, jnp.float32) for h in halves], axis=1
+        ).astype(jnp.bfloat16)
     # Keep the consumer's final shape; rank-increasing bitcasts add TPU padding.
     columns = jnp.arange(elements)[None]
     selected = jnp.take_along_axis(words, columns // 2, axis=1)
