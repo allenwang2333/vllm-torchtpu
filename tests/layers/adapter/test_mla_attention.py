@@ -794,9 +794,11 @@ class _FakeHeadGatherGroup:
         self._per_rank = per_rank
 
     def all_gather(self, tensor, dim=0):
-        assert dim == 1
-        torch.testing.assert_close(tensor, self._per_rank[self.rank_in_group])
-        return torch.cat(self._per_rank, dim=1)
+        assert dim == 0
+        torch.testing.assert_close(
+            tensor, self._per_rank[self.rank_in_group].transpose(0, 1)
+        )
+        return torch.cat([part.transpose(0, 1) for part in self._per_rank], dim=0)
 
 
 def test_qrep_local_view_matches_the_head_all_gather_order(monkeypatch):
@@ -810,7 +812,7 @@ def test_qrep_local_view_matches_the_head_all_gather_order(monkeypatch):
 
     for rank in range(group_size):
         group = _FakeHeadGatherGroup(per_rank, rank)
-        monkeypatch.setattr(cp_mla, "get_dcp_group", lambda g=group: g)
+        monkeypatch.setattr(attention_adapter, "_get_dcp_group", lambda g=group: g)
         torch.testing.assert_close(cp_mla.all_gather_heads(per_rank[rank]), grouped)
         torch.testing.assert_close(
             _FakeQProj(group_size, rank)._local_view(grouped), per_rank[rank]
@@ -933,7 +935,8 @@ def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):
     torch.testing.assert_close(q_pe, q_pe_rep)
 
 
-def test_mla_forward_without_qrep_still_gathers(monkeypatch):
+@pytest.mark.parametrize("fused_gather", [False, True])
+def test_mla_forward_without_qrep_still_gathers(monkeypatch, fused_gather):
     """The gather is only skipped when a replicated q actually arrives; the
     unreplicated DCP path is untouched."""
     dcp_size, local_heads, num_tokens = 2, 16, 4
@@ -950,12 +953,20 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
         )
     )
 
+    monkeypatch.setattr(envs, "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", fused_gather)
     gathered = []
-    monkeypatch.setattr(
-        attention_adapter,
-        "all_gather_heads",
-        lambda t: (gathered.append(t), t.repeat(1, dcp_size, 1))[1],
+    gather_heads = MagicMock(
+        side_effect=lambda t: (gathered.append(t), t.repeat(1, dcp_size, 1))[1]
     )
+
+    def gather_pair(q_nope, q_pe, kv_lora_rank):
+        assert kv_lora_rank == q_nope.shape[-1]
+        gathered.extend((q_nope, q_pe))
+        return q_nope.repeat(1, dcp_size, 1), q_pe.repeat(1, dcp_size, 1)
+
+    gather_q_pair = MagicMock(side_effect=gather_pair)
+    monkeypatch.setattr(attention_adapter, "all_gather_heads", gather_heads)
+    monkeypatch.setattr(attention_adapter, "all_gather_q_nope_pe_heads", gather_q_pair)
     monkeypatch.setattr(
         attention_adapter,
         "merge_lse_partials_scatter_heads",
@@ -970,6 +981,9 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
 
     assert len(gathered) == 2
     assert all(t.shape[1] == local_heads for t in gathered)
+    assert (gather_heads.call_count, gather_q_pair.call_count) == (
+        (0, 1) if fused_gather else (2, 0)
+    )
 
 
 def test_mla_forward_uses_context_without_runtime_kv_scale_state():
