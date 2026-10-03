@@ -334,6 +334,35 @@ def paged_index_scores_jax(
 _indexer_op = None
 
 
+def _visible_top_k(
+    scores: jax.Array, k: int, bound: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+    """``jax.lax.top_k(scores, k)`` when columns ``>= bound`` are ``-inf``.
+
+    Sorts only a static power-of-two bucket of columns covering ``bound``
+    (the full width is sorted otherwise). Exact: buckets hold at least ``k``
+    columns, so ``-inf`` ties still resolve to the lowest indices.
+    """
+    width = scores.shape[1]
+    buckets = []
+    bucket = max(k, 1024)
+    while bucket < width:
+        buckets.append(bucket)
+        bucket *= 2
+    buckets.append(width)
+    if len(buckets) == 1:
+        return jax.lax.top_k(scores, k)
+    branch = jnp.searchsorted(jnp.asarray(buckets[:-1]), bound, side="left")
+    return jax.lax.switch(
+        branch,
+        [
+            functools.partial(lambda b, s: jax.lax.top_k(s[:, :b], k), b)
+            for b in buckets
+        ],
+        scores,
+    )
+
+
 def select_indices_jax(
     scores: jax.Array,
     lengths: jax.Array,
@@ -388,7 +417,7 @@ def select_indices_jax(
             allowed = jnp.take_along_axis(membership, logical // block_size, axis=1)
             # Match the upstream batch-wide short-context bypass.
             scores = jnp.where(allowed | (lengths.max() <= topk), scores, -jnp.inf)
-    values, indices = jax.lax.top_k(scores, min(topk, width))
+    values, indices = _visible_top_k(scores, min(topk, width), lengths.max())
     # Preserve V4.1's logical order and therefore attention accumulation order.
     indices = jnp.sort(indices, axis=-1)
     values = jnp.take_along_axis(scores, indices, axis=1)

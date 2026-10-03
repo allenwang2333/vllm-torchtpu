@@ -1,5 +1,6 @@
 """CPU checks for DeepSeek V4.1 cache addressing and gather paths."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -10,6 +11,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.attention import (
     _row_slots,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.attention_kernels import (
+    _visible_top_k,
     paged_attention_jax,
     paged_index_scores_jax,
     paged_indexer_jax,
@@ -238,3 +240,17 @@ def test_merge_sub_rows_matches_lane_scatter(width, count):
     rows, full = merge_sub_rows(cache, jnp.asarray(records), words)
     got = cache.at[jnp.where(rows >= 0, rows, cache.shape[0])].set(full, mode="drop")
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
+
+
+@pytest.mark.parametrize("bound", [0, 7, 512, 1024, 1025, 3000, 5000])
+def test_visible_top_k_matches_full(bound):
+    rng = np.random.default_rng(bound)
+    width, k = 5000, 512
+    # Coarse values create ties; columns >= bound are invisible.
+    scores = np.round(rng.standard_normal((3, width)), 1).astype(np.float32)
+    scores[:, bound:] = -np.inf
+    scores = jnp.asarray(scores)
+    got = _visible_top_k(scores, k, jnp.int32(bound))
+    expected = jax.lax.top_k(scores, k)
+    for a, b in zip(got, expected):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
