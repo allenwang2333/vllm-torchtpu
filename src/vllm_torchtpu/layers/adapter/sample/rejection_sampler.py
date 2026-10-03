@@ -72,6 +72,7 @@ class RejectionSampler:
         need_top_k: bool = True,
         need_top_p: bool = True,
         radix_bits: int = 1,
+        fast_top_p: str = "",
     ) -> torch.Tensor:
         return self.forward(
             draft_token_ids=draft_token_ids,
@@ -90,6 +91,7 @@ class RejectionSampler:
             need_top_k=need_top_k,
             need_top_p=need_top_p,
             radix_bits=radix_bits,
+            fast_top_p=fast_top_p,
         )
 
     def forward(
@@ -110,6 +112,7 @@ class RejectionSampler:
         need_top_k: bool = True,
         need_top_p: bool = True,
         radix_bits: int = 1,
+        fast_top_p: str = "",
     ) -> torch.Tensor:
         """Performs rejection sampling for speculative decoding.
 
@@ -135,6 +138,8 @@ class RejectionSampler:
             top_k > 0 / top_p < 1 (do_sampling only); False skips that mask,
             which would be the identity on every row.
           radix_bits: bits per pass of the top-k/top-p threshold bisection.
+          fast_top_p: static top-p threshold spec (see top_k_top_p.topp_mask);
+            "" bisects.
 
         Returns:
           A tensor of shape [batch_size, max_draft_tokens + 1] containing the
@@ -170,6 +175,7 @@ class RejectionSampler:
                 need_top_k,
                 need_top_p,
                 radix_bits,
+                fast_top_p,
             )
         if self.synthetic_mode and accept_u is None:
             raise ValueError("Synthetic rejection sampling requires accept_u.")
@@ -354,8 +360,7 @@ def _greedy_rejection_sample_with_segment(
     return selected_tokens[:batch_size]
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def _random_rejection_sample_with_segment(
+def _random_rejection_sample_with_segment_impl(
     draft_token_ids: torch.Tensor,
     target_logits: torch.Tensor,
     num_draft_tokens: torch.Tensor,
@@ -373,6 +378,7 @@ def _random_rejection_sample_with_segment(
     need_top_k: bool = True,
     need_top_p: bool = True,
     radix_bits: int = 1,
+    fast_top_p: str = "",
 ) -> torch.Tensor:
     """Vectorized non-greedy speculative decoding validation in Torch."""
     total_tokens = draft_token_ids.shape[0]
@@ -391,7 +397,7 @@ def _random_rejection_sample_with_segment(
         temperatures.to(torch.float32) + TEMPERATURE_EPS
     )
     masked_logits = apply_top_k_top_p(
-        scaled_logits, top_k, top_p, need_top_k, need_top_p, radix_bits
+        scaled_logits, top_k, top_p, need_top_k, need_top_p, radix_bits, fast_top_p
     )
     target_probs = torch.softmax(masked_logits, dim=-1)
 
@@ -539,3 +545,13 @@ def _random_rejection_sample_with_segment(
     selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
 
     return selected_tokens[:batch_size]
+
+
+# Compiled on its own here; the impl is also traced inline by the runner's
+# fused spec-verify chain (TPU_SAMPLER_FUSED_CHAIN).
+_random_rejection_sample_with_segment = torch.compile(
+    _random_rejection_sample_with_segment_impl,
+    backend="tpu",
+    fullgraph=True,
+    dynamic=False,
+)

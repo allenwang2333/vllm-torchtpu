@@ -145,3 +145,57 @@ def test_apply_top_k_top_p_skips_are_identity(radix_bits):
             logits, k, p, need_k, need_p, radix_bits
         )
         assert torch.equal(result, expected)
+
+
+def _fast_top_p_cases(rows, vocab, seed):
+    """Random and adversarial [rows, vocab] logits for the fast top-p gate."""
+    g = torch.Generator().manual_seed(seed)
+    yield "randn2", torch.randn(rows, vocab, generator=g) * 2.0
+    yield "randn6", torch.randn(rows, vocab, generator=g) * 6.0
+    hot = torch.randn(rows, vocab, generator=g) * 2.0
+    idx = torch.randint(0, vocab, (rows, 8), generator=g)
+    yield "spiky", hot.scatter_add(1, idx, torch.rand(rows, 8, generator=g) * 12.0)
+    x = torch.full((rows, vocab), -5.0)
+    x[:, :10] = 5.0
+    yield "ties10", x
+    x = torch.full((rows, vocab), -5.0)
+    x[:, :2000] = 3.0
+    yield "wide_ties", x
+    yield "flat", torch.zeros(rows, vocab)
+    yield "rounded", torch.round(torch.randn(rows, vocab, generator=g) * 4.0)
+    # Top-n mass landing on p: n leaders at logit a over a flat tail.
+    n = torch.arange(1, rows + 1).view(-1, 1)
+    a = torch.log(0.95 / 0.05 * (vocab - n) / n)
+    x = torch.zeros(rows, vocab)
+    x[:, : rows + 1] = torch.where(torch.arange(rows + 1) < n, a, 0.0)
+    yield "mass_on_p", x
+
+
+@pytest.mark.parametrize("spec", ["1024", "8", "1024,topk,native", "512,approx"])
+def test_fast_top_p_matches_bisection(device, spec):
+    """On TPU: the fast threshold op keeps exactly the bisection's set.
+
+    Both sides compiled like the sampler graphs; f32 rows like the verify
+    program and bf16 rows like the bonus program. spec "8" forces the
+    lax.cond fallback on every wide row.
+    """
+    if device.type != "tpu":
+        pytest.skip("the fast top-p op runs on TPU only")
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def mask(logits, top_k, top_p, fast):
+        return sampling.apply_top_k_top_p(
+            logits, top_k, top_p, False, True, 1, fast
+        )
+
+    rows, vocab = 16, 154880
+    top_k = torch.zeros((rows, 1), dtype=torch.int32, device=device)
+    top_p = torch.tensor(
+        [0.95, 0.9, 0.5, 0.99, 0.1, 1.0, 0.95, 0.7] * 2, device=device
+    ).view(-1, 1)
+    for dtype in (torch.float32, torch.bfloat16):
+        for name, x in _fast_top_p_cases(rows, vocab, seed=3):
+            logits = x.to(dtype).to(device)
+            want = mask(logits, top_k, top_p, "").cpu()
+            got = mask(logits, top_k, top_p, spec).cpu()
+            assert torch.equal(got, want), (spec, str(dtype), name)
