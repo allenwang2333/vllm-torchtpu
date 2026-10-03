@@ -41,9 +41,9 @@ The predicate here must reduce exactly like the torch one in ``topp_mask``
 (``torch.sum`` of ``where(probs >= t, probs, 0)`` in ``probs.dtype``, compared
 in float32). ``mass_accum`` chooses how a bf16 sum is spelled: "native" reduces
 in bf16 (stablehlo reduce in the input dtype), "f32" accumulates in f32 then
-rounds once to bf16. Which one matches torch_tpu's lowering is decided by
-``tests/layers/adapter/test_top_k_top_p.py`` on TPU; float32 inputs are
-unaffected.
+rounds once to bf16. On tpu7x torch_tpu's lowering matches "native" bit for
+bit and not "f32" (``test_fast_top_p_matches_bisection``, job
+j-236a74b0-6bab-4d0d-9387); float32 inputs are unaffected.
 """
 
 import functools
@@ -123,8 +123,15 @@ def fast_threshold(
     method: str = "topk",
     mass_accum: str = "native",
     with_stats: bool = False,
+    window: int = 0,
 ):
     """Bisection-exact top-p threshold. probs [B, V] (bf16|f32), p [B] f32.
+
+    ``window`` widens the proof from the guessed tie group and the one above it
+    to ``window + 1`` groups above and ``window`` below (2 * window + 2 more
+    predicates in the same vocab pass), so a guess a few groups off -- the
+    cumsum rounds differently from the device's sum, most of all in bf16 --
+    is still proven instead of falling back.
 
     Returns f32 [B] (and, with_stats, an int32 [B] per-row proof flag and the
     scalar "fell back" flag).
@@ -150,26 +157,56 @@ def fast_threshold(
     # Round like the predicate's sum does before it is compared.
     mass_ge = mass_ge.astype(probs.dtype).astype(jnp.float32)
 
+    def at(x, pos):
+        return jnp.take_along_axis(x, pos[:, None], axis=1)[:, 0]
+
     # Guess: the first candidate whose tie-inclusive mass reaches p.
     j = jnp.sum((mass_ge < p[:, None]).astype(jnp.int32), axis=1)
     found = j < k
-    j = jnp.minimum(j, k - 1)
-    t_lo = jnp.take_along_axis(vals, j[:, None], axis=1)[:, 0]
-    g0 = jnp.take_along_axis(first, j[:, None], axis=1)[:, 0]
-    has_hi = g0 > 0
-    t_hi = jnp.take_along_axis(vals, jnp.maximum(g0 - 1, 0)[:, None], axis=1)[:, 0]
+    g0 = at(first, jnp.minimum(j, k - 1))
 
-    # Proof: one pass over the vocabulary, three row reductions.
-    pred_lo = _pred(probs, t_lo, p, mass_accum)
-    pred_hi = jnp.where(has_hi, _pred(probs, t_hi, p, mass_accum), True)
-    above = jnp.sum((pf > t_lo[:, None]).astype(jnp.int32), axis=1)
-    proven = found & ~pred_lo & pred_hi & (above == g0) & (t_lo > 0)
+    # Window of group starts, descending value: up_{W+1} .. up_1, g0, down_1
+    # .. down_W. An up slot past the top is a sentinel whose predicate is True
+    # (mass(probs >= +inf) = 0 < p); a down slot past the candidates is void.
+    ups, pos, top = [], g0, jnp.zeros_like(found)
+    for _ in range(window + 1):
+        top = top | (pos <= 0)
+        pos = at(first, jnp.maximum(pos - 1, 0))
+        ups.append((pos, top))
+    downs, pos, void = [], g0, ~found
+    for _ in range(window):
+        nxt = at(last, pos) + 1
+        void = void | (nxt >= k)
+        pos = jnp.minimum(nxt, k - 1)
+        downs.append((pos, void))
+    slots = [(p_, t_, jnp.zeros_like(t_)) for p_, t_ in reversed(ups)]
+    slots.append((g0, jnp.zeros_like(found), ~found))
+    slots += [(p_, jnp.zeros_like(v_), v_) for p_, v_ in downs]
+
+    # Proof: one pass over the vocabulary -- a predicate per slot and one
+    # count at the lowest real slot (every element above it is a candidate,
+    # so the slots are adjacent values of probs).
+    is_false = []
+    low_pos, low_val = g0, at(vals, g0)
+    for pos, sentinel, void in slots:
+        val = at(vals, pos)
+        pred = _pred(probs, val, p, mass_accum)
+        is_false.append(~sentinel & ~void & ~pred)
+        real = ~sentinel & ~void
+        low_pos = jnp.where(real, pos, low_pos)
+        low_val = jnp.where(real, val, low_val)
+    is_false = jnp.stack(is_false, axis=1)
+    i = jnp.argmax(is_false, axis=1).astype(jnp.int32)
+    slot_pos = jnp.stack([s_[0] for s_ in slots], axis=1)
+    ans = at(vals, at(slot_pos, i))
+    above = jnp.sum((pf > low_val[:, None]).astype(jnp.int32), axis=1)
+    proven = jnp.any(is_false, axis=1) & (i >= 1) & (above == low_pos) & (ans > 0)
     ok = proven | (p >= 1.0)
     fell_back = ~jnp.all(ok)
     thr = lax.cond(
         fell_back,
         lambda: bisect_threshold(probs, p, mass_accum),
-        lambda: t_lo,
+        lambda: ans,
     )
     if with_stats:
         return thr, proven.astype(jnp.int32), fell_back
@@ -182,11 +219,31 @@ def top_p_threshold(
     k: int,
     method: str,
     mass_accum: str,
+    window: int,
 ) -> jax.Array:
     """``fast_threshold`` with a jax_op-compatible signature; p is [B, 1]."""
-    return fast_threshold(probs, p.reshape(-1), k, method, mass_accum)[:, None]
+    return fast_threshold(probs, p.reshape(-1), k, method, mass_accum, False, window)[
+        :, None
+    ]
 
 
-@functools.partial(jax.jit, static_argnums=(2, 3, 4, 5))
-def fast_threshold_jit(probs, p, k, method="topk", mass_accum="native", stats=False):
-    return fast_threshold(probs, p, k, method, mass_accum, stats)
+def top_p_threshold_stats(
+    probs: jax.Array,
+    p: jax.Array,
+    k: int,
+    method: str,
+    mass_accum: str,
+    window: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``top_p_threshold`` plus per-row proof flags and the fell-back flag."""
+    thr, proven, fell_back = fast_threshold(
+        probs, p.reshape(-1), k, method, mass_accum, True, window
+    )
+    return thr[:, None], proven, fell_back.astype(jnp.int32).reshape(1)
+
+
+@functools.partial(jax.jit, static_argnums=(2, 3, 4, 5, 6))
+def fast_threshold_jit(
+    probs, p, k, method="topk", mass_accum="native", stats=False, window=0
+):
+    return fast_threshold(probs, p, k, method, mass_accum, stats, window)

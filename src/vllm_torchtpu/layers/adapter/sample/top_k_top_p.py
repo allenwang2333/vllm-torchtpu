@@ -229,21 +229,24 @@ def topk_mask(
     return torch.where(logits >= cutoff, logits, replace_tensor)
 
 
-def _parse_fast_top_p(spec: str) -> tuple[int, str, str]:
-    """ "K[,method[,mass_accum]]" -> (K, method, mass_accum)."""
-    parts = [x.strip() for x in spec.split(",")]
-    k = int(parts[0])
-    method = parts[1] if len(parts) > 1 and parts[1] else FAST_TOP_P_METHOD
-    accum = parts[2] if len(parts) > 2 and parts[2] else FAST_TOP_P_MASS_ACCUM
-    return k, method, accum
+def _parse_fast_top_p(spec: str) -> tuple[int, str, str, int]:
+    """ "K[,method[,mass_accum[,window]]]" -> (K, method, mass_accum, window)."""
+    parts = [x.strip() for x in spec.split(",")] + [""] * 3
+    return (
+        int(parts[0]),
+        parts[1] or FAST_TOP_P_METHOD,
+        parts[2] or FAST_TOP_P_MASS_ACCUM,
+        int(parts[3] or FAST_TOP_P_WINDOW),
+    )
 
 
-# Defaults of a fast_top_p spec (see kernels/top_p.py). "f32": torch_tpu's
-# torch.sum of a bf16 tensor accumulates in f32 and rounds once -- checked
-# bit for bit against the bisection on TPU (test_fast_top_p_matches_bisection).
+# Defaults of a fast_top_p spec (kernels/top_p.py). "native": torch_tpu sums a
+# bf16 tensor like a bf16 stablehlo reduce -- bit for bit on tpu7x
+# (test_fast_top_p_matches_bisection); "f32" does not match it.
 FAST_TOP_P_K = 1024
 FAST_TOP_P_METHOD = "topk"
-FAST_TOP_P_MASS_ACCUM = "f32"
+FAST_TOP_P_MASS_ACCUM = "native"
+FAST_TOP_P_WINDOW = 2
 
 
 def fast_topp_threshold(
@@ -254,8 +257,7 @@ def fast_topp_threshold(
     Off TPU it is the bisection itself (the JAX op only runs on TPU)."""
     if probs.device.type != "tpu":
         return _topp_bisect_threshold(probs, p.squeeze(-1), 1).unsqueeze(-1)
-    k, method, accum = _parse_fast_top_p(spec)
-    return fast_top_p_op.top_p_threshold(probs, p.float(), k, method, accum)
+    return fast_top_p_op.top_p_threshold(probs, p.float(), *_parse_fast_top_p(spec))
 
 
 def _topp_bisect_threshold(probs: torch.Tensor, p: torch.Tensor, radix_bits: int):

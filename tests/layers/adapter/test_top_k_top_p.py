@@ -121,9 +121,7 @@ def _random_rows(rows=6, vocab=4099, seed=0):
 def test_apply_top_k_top_p_radix_is_bit_identical(radix_bits):
     logits, top_k, top_p = _random_rows()
     expected = sampling.apply_top_k_top_p(logits, top_k, top_p)
-    result = sampling.apply_top_k_top_p(
-        logits, top_k, top_p, radix_bits=radix_bits
-    )
+    result = sampling.apply_top_k_top_p(logits, top_k, top_p, radix_bits=radix_bits)
     assert torch.equal(result, expected)
 
 
@@ -141,9 +139,7 @@ def test_apply_top_k_top_p_skips_are_identity(radix_bits):
         (no_k, no_p, False, False),
     ]:
         expected = sampling.apply_top_k_top_p(logits, k, p)
-        result = sampling.apply_top_k_top_p(
-            logits, k, p, need_k, need_p, radix_bits
-        )
+        result = sampling.apply_top_k_top_p(logits, k, p, need_k, need_p, radix_bits)
         assert torch.equal(result, expected)
 
 
@@ -171,8 +167,10 @@ def _fast_top_p_cases(rows, vocab, seed):
     yield "mass_on_p", x
 
 
-@pytest.mark.parametrize("spec", ["1024", "8", "1024,topk,native", "512,approx"])
-def test_fast_top_p_matches_bisection(device, spec):
+@pytest.mark.parametrize(
+    "spec", ["1024", "8", "1024,topk,native,0", "4096,topk,native,1", "512,approx"]
+)
+def test_fast_top_p_matches_bisection(device, spec, monkeypatch):
     """On TPU: the fast threshold op keeps exactly the bisection's set.
 
     Both sides compiled like the sampler graphs; f32 rows like the verify
@@ -181,12 +179,12 @@ def test_fast_top_p_matches_bisection(device, spec):
     """
     if device.type != "tpu":
         pytest.skip("the fast top-p op runs on TPU only")
+    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 64)
+    monkeypatch.setattr(torch._dynamo.config, "cache_size_limit", 64)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def mask(logits, top_k, top_p, fast):
-        return sampling.apply_top_k_top_p(
-            logits, top_k, top_p, False, True, 1, fast
-        )
+        return sampling.apply_top_k_top_p(logits, top_k, top_p, False, True, 1, fast)
 
     rows, vocab = 16, 154880
     top_k = torch.zeros((rows, 1), dtype=torch.int32, device=device)

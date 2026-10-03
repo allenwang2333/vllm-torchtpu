@@ -1085,9 +1085,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "K[,method[,mass_accum]]" override of the fast top-p defaults in
     # layers/adapter/sample/top_k_top_p.py. "" = defaults.
     "TPU_SAMPLER_FAST_TOP_P_SPEC": env_str("TPU_SAMPLER_FAST_TOP_P_SPEC", ""),
-    # Non-greedy spec verify: logits gather, the three uniform draws, bonus
-    # sampling and the rejection sampler as ONE compiled program instead of
-    # ~6 (same draws from the same generator, same tokens).
+    # Non-greedy spec verify: logits gathers, bonus sampling, the per-token
+    # param gathers and the rejection sampler as ONE compiled program (the
+    # three uniform draws stay eager: same generator, shapes and order).
     "TPU_SAMPLER_FUSED_CHAIN": env_bool("TPU_SAMPLER_FUSED_CHAIN"),
     "TPU_FP8_LINEAR_PALLAS": env_bool("TPU_FP8_LINEAR_PALLAS"),
     # Comma-separated layer-prefix suffixes that take that path, matched on a "."
