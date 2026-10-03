@@ -71,6 +71,7 @@ def _build_expert_kernel(
     unroll=1,
     tile_m=TILE_M,
     n_rungs=1,
+    relayout=frozenset(),
 ):
     """The per-rank expert kernel for a fixed token count and route count.
 
@@ -124,6 +125,7 @@ def _build_expert_kernel(
         win_sems,  # DMA[2]
         out_sems,  # DMA[2]
         w_sems,  # DMA[nbuf]
+        *extra,  # timing-only 2D scratch for the relayout ablations
     ):
         n_visit = n_visit_sm[0]
 
@@ -301,13 +303,46 @@ def _build_expert_kernel(
                     out_wait(p, n_prev)
 
             def compute(h):
-                act = lhs_vm[p, pl.ds(0, h)].reshape(h, hidden)
+                if "relayout_in" in ablate:  # timing only: a 2D-layout lhs, no relayout
+                    act = extra[0][pl.ds(0, h)]
+                elif "in_strided" in relayout:
+                    # One strided load per lane block, placed side by side on lanes.
+                    act = jnp.concatenate(
+                        [lhs_vm[p, pl.ds(0, h), j, :] for j in range(lane_blocks)], axis=-1
+                    )
+                elif "in_f32" in relayout:
+                    # Unpack, retile at 32 bits (8x8 sublane blocks), repack.
+                    act = (
+                        lhs_vm[p, pl.ds(0, h)].astype(jnp.float32).reshape(h, hidden).astype(FP8)
+                    )
+                else:
+                    act = lhs_vm[p, pl.ds(0, h)].reshape(h, hidden)
                 act_s = _tile_row_scales(ls_vm[p], base, h)
                 if "compute" in ablate:
                     rows = jnp.zeros((h, hidden), jnp.bfloat16) + act_s[0, 0].astype(jnp.bfloat16)
                 else:
                     acc2, mid_s = expert_ffn_fp8(act, act_s, w1_vm[slot], w2_vm[slot], s1_vm[slot])
-                    rows = (acc2 * mid_s * s2_vm[slot]).astype(jnp.bfloat16)
+                    rows = acc2 * mid_s * s2_vm[slot]
+                    if "out_f32" in relayout and "relayout_out" not in ablate:
+                        # Retile at 32 bits, then pack: the per-row layout
+                        # costs an 8x8 sublane transpose instead of a packed
+                        # 16x16 one.
+                        rows = rows.reshape(h, lane_blocks, LANES)
+                    rows = rows.astype(jnp.bfloat16)
+                if "relayout_out" in ablate:  # timing only: store in the value's own layout
+                    extra[-1][pl.ds(0, h)] = rows
+                    return
+                if "out_strided" in relayout:
+                    # One strided store per lane block: row r's block j lands
+                    # in sublane j of row r's tiles, with no in-register retile.
+                    for par in range(2):
+
+                        @pl.when(p == par)
+                        def _(par=par):
+                            for j in range(lane_blocks):
+                                out_vm[par, pl.ds(0, h), j, :] = rows[:, j * LANES : (j + 1) * LANES]
+
+                    return
                 rows = rows.reshape(h, lane_blocks, LANES)
                 for par in range(2):
 
@@ -365,7 +400,9 @@ def _build_expert_kernel(
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((nbuf,)),
-            ),
+            )
+            + ((pltpu.VMEM((tile_m, hidden), FP8),) if "relayout_in" in ablate else ())
+            + ((pltpu.VMEM((tile_m, hidden), jnp.bfloat16),) if "relayout_out" in ablate else ()),
             grid=(),
         ),
         out_shape=jax.ShapeDtypeStruct((slab_rows, lane_blocks, LANES), jnp.bfloat16),
@@ -376,6 +413,7 @@ def _build_expert_kernel(
         interpret=pltpu.InterpretParams() if interpret else False,
         name=f"moe_tp_prefill_t{n_tok}_e{n_experts}_i{inter}_nb{nbuf}"
         + f"_u{unroll}_m{tile_m}r{n_rungs}"
+        + "".join(f"_{r}" for r in sorted(relayout))
         + "".join(f"_no{a}" for a in sorted(ablate)),
     )
     return call, dict(slab_rows=slab_rows, scale_rows=scale_rows, tok_rows=tok_rows, x_rows=x_rows)
@@ -419,15 +457,24 @@ def routing_plan(
             s_sorted = row_scale[order // k]
     else:
         if row_scale is None:
-            _, order = lax.sort((e_flat, iota), num_keys=1, is_stable=True)
+            e_sorted, order = lax.sort((e_flat, iota), num_keys=1, is_stable=True)
         else:
             s_rep = jnp.broadcast_to(row_scale[:, None], (n_tok, k)).reshape(-1)
-            _, order, s_sorted = lax.sort((e_flat, iota, s_rep), num_keys=1, is_stable=True)
+            e_sorted, order, s_sorted = lax.sort((e_flat, iota, s_rep), num_keys=1, is_stable=True)
         _, pos = lax.sort((order, iota), num_keys=1, is_stable=False)
-        counts = jnp.sum(
-            (e_flat[None, :] == jnp.arange(n_experts, dtype=jnp.int32)[:, None]).astype(jnp.int32),
-            axis=1,
-        )
+        if plan == "sort2_cmp":
+            counts = jnp.sum(
+                (e_flat[None, :] == jnp.arange(n_experts, dtype=jnp.int32)[:, None]).astype(
+                    jnp.int32
+                ),
+                axis=1,
+            )
+        else:
+            # Group boundaries by binary search on the sorted keys.
+            edges = jnp.searchsorted(
+                e_sorted, jnp.arange(n_experts + 1, dtype=jnp.int32), side="left"
+            ).astype(jnp.int32)
+            counts = edges[1:] - edges[:-1]
     tok = order // k
     pos = pos.reshape(n_tok, k)
     base = jnp.cumsum(counts) - counts
@@ -465,11 +512,12 @@ def moe_tp_prefill(
     interpret=False,
     ablate=frozenset(),
     stop_after=None,
-    plan="sort2",
+    plan="sort2_cmp",
     gather_unroll=8,
     skip_zero_weight_routes=True,
     tile_m=None,
     n_rungs=4,
+    relayout=frozenset({"out_f32"}),
 ):
     """One rank's routed + shared MoE output for T > the decode cap.
 
@@ -503,6 +551,7 @@ def moe_tp_prefill(
         unroll=gather_unroll,
         tile_m=tile_m,
         n_rungs=n_rungs,
+        relayout=frozenset(relayout),
     )
 
     # ---- prep ----

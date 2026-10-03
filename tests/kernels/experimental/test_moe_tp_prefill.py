@@ -153,6 +153,7 @@ def test_combine_chunks_equal():
 
 
 @pytest.mark.parametrize("ablate", [("gather",), ("compute",), ("write",), ("weights",),
+                                    ("relayout_in",), ("relayout_out",),
                                     ("gather", "compute", "write", "weights")])
 def test_ablation_arms_build_and_run(ablate):
     """Timing-only arms: they must build and terminate (values are wrong by design)."""
@@ -172,9 +173,10 @@ def test_routing_plans_agree(n_valid):
     c = make_case(256, 8, 256, 128, 3, skew=True)
     xs = jnp.abs(c["x"][:, 0].astype(jnp.float32)) + 1.0
     a = mtp.routing_plan(c["ti"], 8, n_valid, row_scale=xs, plan="scatter")
-    b = mtp.routing_plan(c["ti"], 8, n_valid, row_scale=xs, plan="sort2")
-    for u, v in zip(a, b):
-        np.testing.assert_array_equal(np.asarray(u), np.asarray(v))
+    for plan in ("sort2", "sort2_cmp"):
+        b = mtp.routing_plan(c["ti"], 8, n_valid, row_scale=xs, plan=plan)
+        for u, v in zip(a, b):
+            np.testing.assert_array_equal(np.asarray(u), np.asarray(v))
 
 
 @pytest.mark.parametrize("unroll", [1, 2, 8])
@@ -206,4 +208,11 @@ def test_default_combine_chunks():
 def test_tile_height_and_rungs(tile_m, n_rungs):
     c = make_case(300, 16, 256, 128, 4, skew=True)
     y = np.asarray(run_kernel(c, tile_m=tile_m, n_rungs=n_rungs).astype(jnp.float32))
+    assert row_err(y, same_math(c)) < 1e-2
+
+
+@pytest.mark.parametrize("relayout", [("out_f32",), ("in_f32",), ("out_strided",), ("in_strided",)])
+def test_relayout_variants_bit_identical(relayout):
+    c = make_case(300, 16, 256, 128, 4, skew=True)
+    y = np.asarray(run_kernel(c, relayout=frozenset(relayout)).astype(jnp.float32))
     assert row_err(y, same_math(c)) < 1e-2
