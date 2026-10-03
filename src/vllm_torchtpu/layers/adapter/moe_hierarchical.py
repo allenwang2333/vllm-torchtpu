@@ -162,6 +162,30 @@ def hierarchical_moe_parallel_config():
         FusedMoEParallelConfig.make = original_make
 
 
+def check_ep_tp_config(config, split) -> None:
+    """Refuse a deployment where the EP x TP partial sums would not meet.
+
+    The split is computed over the TP group, and the only reduction of the
+    routed output is the all-reduce over that group. With DP, PCP or
+    sequence-parallel MoE the flat EP group spans ranks that all-reduce does
+    not; with EPLB the expert map is not the linear block the split assumes.
+    """
+    if config.dp_size != 1 or config.pcp_size != 1 or config.is_sequence_parallel:
+        raise ValueError(
+            "TPU_MOE_EP_TP_SIZE supports DP=1, PCP=1 and no sequence-parallel "
+            f"MoE only; got dp={config.dp_size}, pcp={config.pcp_size}, "
+            f"sp={config.sp_size}."
+        )
+    if config.enable_eplb:
+        raise ValueError("TPU_MOE_EP_TP_SIZE does not support EPLB.")
+    if config.tp_size != 1 or config.ep_size != split[0] * split[2]:
+        raise ValueError(
+            "TPU_MOE_EP_TP_SIZE expects vLLM's flat EP config over the whole TP "
+            f"group (tp_size=1, ep_size={split[0] * split[2]}); got "
+            f"tp_size={config.tp_size}, ep_size={config.ep_size}."
+        )
+
+
 def install_ep_tp_split_patch() -> None:
     """Apply ``TPU_MOE_EP_TP_SIZE`` to every ``FusedMoE`` this process builds.
 
@@ -183,6 +207,9 @@ def install_ep_tp_split_patch() -> None:
         split = hierarchical_split_or_none()
         if split is None:
             return config
+        if not config.use_ep:
+            return _split_parallel_config(config, split)  # warns, stays flat
+        check_ep_tp_config(config, split)
         logger.info_once(
             "MoE experts split EP %d x TP %d (TPU_MOE_EP_TP_SIZE): this rank is "
             "ep_rank=%d, tp_rank=%d.",
