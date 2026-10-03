@@ -37,6 +37,18 @@ from vllm_torchtpu.layers.common.utils import \
 from vllm_torchtpu.utils import get_mesh_shape_product
 
 
+def _resolve_gdn_v3_kwargs(num_tokens: int) -> dict[str, int | bool]:
+    kwargs: dict[str, int | bool] = {
+        "decode_only": num_tokens <= tpu_envs.VLLM_TPU_PURE_DECODE_MAX_TOKENS,
+    }
+    if tpu_envs.VLLM_TPU_GDN_DECODE_TILE_SIZE is not None:
+        kwargs["decode_tile_size"] = tpu_envs.VLLM_TPU_GDN_DECODE_TILE_SIZE
+    if tpu_envs.VLLM_TPU_GDN_MIXED_TILE_SIZE is not None:
+        kwargs["mixed_tile_size"] = (tpu_envs.VLLM_TPU_GDN_MIXED_TILE_SIZE
+                                     if num_tokens >= 1024 else 64)
+    return kwargs
+
+
 def run_jax_gdn_attention(
     j_mixed_qkv: jnp.ndarray,
     j_b: jnp.ndarray,
@@ -139,6 +151,7 @@ def run_jax_gdn_attention(
         d_v=d_v,
         kernel_size=kernel_size,
         num_spec_tokens=num_spec_tokens,
+        **_resolve_gdn_v3_kwargs(j_mixed_qkv.shape[0]),
     )
 
     mapped_fn = jax.shard_map(
@@ -845,6 +858,7 @@ def run_jax_gdn_attention_pooled_local(
         state_source=recurrent_state,
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
+        **_resolve_gdn_v3_kwargs(mixed_qkv.shape[0]),
     )
     return recurrent_state, output
 

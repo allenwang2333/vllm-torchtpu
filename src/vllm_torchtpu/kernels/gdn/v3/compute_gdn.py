@@ -19,9 +19,8 @@ from vllm_torchtpu.kernels.gdn.v3 import config
 
 
 def l2_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
-    norm = jnp.sqrt(
+    return x * jax.lax.rsqrt(
         jnp.sum(x * x, axis=-1, keepdims=True, dtype=x.dtype) + eps)
-    return x / norm
 
 
 def get_mask_dtype(dtype: jnp.dtype) -> jnp.dtype:
@@ -36,11 +35,63 @@ def get_mask_dtype(dtype: jnp.dtype) -> jnp.dtype:
 
 # NOTE: Fork of recurrent_scan_v2.py but applied various optimizations.
 def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
-    """Compute invert matrix of a given triauglar matrix."""
+    """Compute the inverse of a batch of unit lower-triangular matrices.
+
+    For power-of-2 chunk sizes (16, 32, 64, 128), replaces sequential scalar
+    forward substitution with recursive block-triangular inversion on the MXU:
+      [ T_00   0   ]^-1   [         T_00^-1            0    ]
+      [ T_10  T_11 ]    = [ -T_11^-1 @ T_10 @ T_00^-1  T_11^-1 ]
+    where both diagonal blocks (T_00, T_11) are inverted in a single batched
+    recursive call down to the 16x16 base case (solved via 4-step power-of-2
+    block doubling on the MXU).
+    """
 
     # NOTE: if chunk_size=1, compiler will perform DCE.
     out_dtype = t.dtype
     chunk = t.shape[-1]
+
+    def bmm(lhs, rhs):
+        return jax.lax.dot(
+            lhs,
+            rhs,
+            dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
+            preferred_element_type=jnp.float32,
+        )
+
+    if chunk > block_size and chunk % 2 == 0:
+        half = chunk // 2
+        num_heads = t.shape[0]
+        # Batch both (half x half) diagonal blocks along axis 0 for a single recursive solve.
+        t_diag = jnp.concatenate([t[:, :half, :half], t[:, half:, half:]],
+                                 axis=0)
+        inv_diag = invert_triangular_matrix(t_diag, block_size=block_size)
+        inv_top, inv_bot = inv_diag[:num_heads], inv_diag[num_heads:]
+        inv_bl = -bmm(inv_bot, bmm(t[:, half:, :half], inv_top))
+        z_half = jnp.zeros_like(inv_top)
+        return jnp.concatenate(
+            [
+                jnp.concatenate([inv_top, z_half], axis=2),
+                jnp.concatenate([inv_bl, inv_bot], axis=2),
+            ],
+            axis=1,
+        ).astype(out_dtype)
+
+    if chunk > 1 and (chunk & (chunk - 1)) == 0 and chunk <= block_size:
+        iota = jax.lax.broadcasted_iota(jnp.int32, (1, chunk, chunk), 1)
+        jota = jax.lax.broadcasted_iota(jnp.int32, (1, chunk, chunk), 2)
+        a_mat = -t.astype(jnp.float32)
+        inv = jnp.where(
+            iota == jota, 1.0,
+            jnp.where((iota > jota) & ((iota >> 1) == (jota >> 1)), a_mat,
+                      0.0))
+        step = 2
+        while step < chunk:
+            mask = ((iota // (2 * step)) == (jota // (2 * step))) & (
+                (iota // step) > (jota // step))
+            inv = inv + bmm(inv, bmm(jnp.where(mask, a_mat, 0.0), inv))
+            step *= 2
+        return inv.astype(out_dtype)
+
     block_size = min(block_size, chunk)
     num_blocks = chunk // block_size
 
@@ -118,21 +169,26 @@ def chunked_gdn_per_seq(
     q_repeat = jnp.repeat(q_large, cfg.v_per_kq_head, axis=0)
     k_repeat = jnp.repeat(k_large, cfg.v_per_kq_head, axis=0)
 
-    # Compute cumulative sum of decay.
-    # [1, 1, num_v_heads]
-    g_cum_sum_list = [gating_log[:, :1]]
-    for row in range(1, cfg.chunk_size):
-        g_cum_sum_list.append(g_cum_sum_list[-1] + gating_log[:, row:row + 1])
+    # Compute cumulative sum of decay via O(log2(chunk)) parallel prefix sum.
     # [1, chunk, num_v_heads]
-    g_cum_sum_log = jnp.concat(g_cum_sum_list, axis=1)
+    g_cum_sum_log = gating_log
+    step = 1
+    while step < cfg.chunk_size:
+        g_cum_sum_log = jnp.concat(
+            [
+                g_cum_sum_log[:, :step],
+                g_cum_sum_log[:, step:] + g_cum_sum_log[:, :-step]
+            ],
+            axis=1,
+        )
+        step *= 2
 
     # [num_v_heads, chunk, 1]
     g_cum_sum_log = fused_transpose_broadcast(g_cum_sum_log,
                                               src_dim=2,
-                                              dst_dim=0)
-    g_cum_sum_log = g_cum_sum_log[:cfg.num_v_heads]
-    beta = fused_transpose_broadcast(beta, src_dim=2, dst_dim=0)
-    beta_large = beta[:cfg.num_v_heads]
+                                              dst_dim=0)[:cfg.num_v_heads]
+    beta_large = fused_transpose_broadcast(beta, src_dim=2,
+                                           dst_dim=0)[:cfg.num_v_heads]
 
     # [num_v_heads, 1, chunk]
     g_cum_sum_log_t = fused_transpose_broadcast(g_cum_sum_log,
@@ -140,11 +196,11 @@ def chunked_gdn_per_seq(
                                                 dst_dim=2)
     # [num_v_heads, chunk, chunk]
     g_cum_sum_diff_log = g_cum_sum_log - g_cum_sum_log_t
-    gating_map = jnp.exp(g_cum_sum_diff_log)
+    gating_map = jax.lax.exp2(jnp.minimum(g_cum_sum_diff_log, 0.0))
     # [num_v_heads, chunk, 1]
-    gating_backward = jnp.exp(-g_cum_sum_diff_log[..., -1:])
+    gating_backward = jax.lax.exp2(-g_cum_sum_diff_log[..., -1:])
     # [num_v_heads, chunk, 1]
-    gating_forward = jnp.exp(g_cum_sum_log)
+    gating_forward = jax.lax.exp2(g_cum_sum_log)
     # [num_v_heads, 1, 1]
     gating_last = gating_forward[:, -1:]
 
@@ -235,11 +291,11 @@ def chunked_gdn_per_seq(
         dimension_numbers=(((2, ), (2, )), ((0, ), (0, ))),
         preferred_element_type=jnp.float32,
     ).astype(cfg.dtypes.compute)
+    out_qk = jnp.where(lower_mask[:cfg.num_kq_heads], out_qk, 0)
     # NOTE: must perform repeat after matmul to reduce required compute.
     # [num_v_heads, chunk, chunk]
     out_qk = jnp.repeat(out_qk, cfg.v_per_kq_head, axis=0)
     out_qk *= gating_map
-    out_qk = jnp.where(lower_mask, out_qk, 0)
 
     # [num_v_heads, chunk, v_head_dim]
     out_new = jax.lax.dot(
@@ -300,7 +356,8 @@ def chunked_gdn(
 
     # [seqs, 1, chunk, num_v_heads]
     beta = jax.nn.sigmoid(b_large)
-    gating_log = -jnp.exp(a_log) * jax.nn.softplus(a_large + dt_bias)
+    gating_log = (-1.4426950408889634 *
+                  jnp.exp(a_log)) * jax.nn.softplus(a_large + dt_bias)
 
     beta = jnp.where(mask, beta, 0)
     # NOTE: Masked gating_log will evaluate to jnp.exp(0)=1. gating (decay) must

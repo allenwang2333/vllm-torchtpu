@@ -135,15 +135,8 @@ def inner_kernel(
     # Step 2: GDN.
 
     # Prepare gdn weights.
-    if cfg.is_kda:
-        # KDA reshapes these per (head, channel) rather than padding out to
-        # a lane multiple over heads.
-        a_log = weights_ref.gdn.a_log[...]
-        dt_bias = weights_ref.gdn.dt_bias[...]
-    else:
-        padding_size = cfg.aligned_num_v_heads - cfg.num_v_heads
-        a_log = jnp.pad(weights_ref.gdn.a_log[...], ((0, padding_size)))
-        dt_bias = jnp.pad(weights_ref.gdn.dt_bias[...], ((0, padding_size)))
+    a_log = weights_ref.gdn.a_log[...]
+    dt_bias = weights_ref.gdn.dt_bias[...]
 
     # NOTE: Ideally, we want to move this branching logic into gdn.py. However,
     # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
@@ -317,6 +310,7 @@ def outer_kernel(
         "decode_tile_size",
         "mixed_tile_size",
         "zero_initialize_out",
+        "decode_only",
         "compute_precision",
         "state_plan",
         "attention_mode",
@@ -350,7 +344,8 @@ def fused_conv1d_gdn(
     state_source: jax.Array | None = None,
     state_plan: config.StateSourcePlan | None = None,
     num_spec_tokens: int = 0,
-    zero_initialize_out: bool = True,
+    zero_initialize_out: bool = False,
+    decode_only: bool = False,
     compute_precision: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
@@ -503,7 +498,11 @@ def fused_conv1d_gdn(
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
+    if batch_size >= 32 and decode_tile_size == 4:
+        decode_tile_size = 8
     decode_tile_size = min(decode_tile_size, batch_size)
+    if batch_size >= 1024 and mixed_tile_size == 64:
+        mixed_tile_size = 128
     mixed_tile_size = min(mixed_tile_size, batch_size)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
 
@@ -535,7 +534,8 @@ def fused_conv1d_gdn(
     # lane multiple of n_v * d_k rather than of n_v.
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
-    qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
+    if batch_padding_size > 0:
+        qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
@@ -552,6 +552,9 @@ def fused_conv1d_gdn(
     conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(
         jnp.float32) if conv_bias is not None else None
+    if not is_kda and num_v_padding_size > 0:
+        a_log = jnp.pad(a_log, ((0, num_v_padding_size), ))
+        dt_bias = jnp.pad(dt_bias, ((0, num_v_padding_size), ))
 
     # Step 4: Wrap inputs for the kernel.
     conv_weights = memory_ref.ConvWeightsRef(weight=conv_weight,
@@ -642,7 +645,7 @@ def fused_conv1d_gdn(
             input_output_aliases[len(metadata_obj) + 4] = 2
         out_shape = cfg.get_out_shape()
 
-        if in_act is None and zero_initialize_out:
+        if in_act is None and (zero_initialize_out or decode_only):
             in_act = jnp.zeros_like(out_shape)
         if in_act is not None:
             out_shape = in_act
@@ -685,8 +688,9 @@ def fused_conv1d_gdn(
     if pooled:
         out_act, out_source, _ = call_kernel(state_source, None, None,
                                              config.GDNMode.BATCHED)
-        out_act, out_source, _ = call_kernel(out_source, None, out_act,
-                                             config.GDNMode.PER_SEQ)
+        if not decode_only:
+            out_act, out_source, _ = call_kernel(out_source, None, out_act,
+                                                 config.GDNMode.PER_SEQ)
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act
 
@@ -694,8 +698,10 @@ def fused_conv1d_gdn(
     # tokens, or plain 1-token decodes without speculative decoding.
     out_act, out_conv_state, out_recurrent_state = call_kernel(
         conv_state, recurrent_state, None, config.GDNMode.BATCHED)
-    out_act, out_conv_state, out_recurrent_state = call_kernel(
-        out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ)
+    if not decode_only:
+        out_act, out_conv_state, out_recurrent_state = call_kernel(
+            out_conv_state, out_recurrent_state, out_act,
+            config.GDNMode.PER_SEQ)
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
     out_conv_state = out_conv_state.astype(conv_out_dtype)

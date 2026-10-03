@@ -35,21 +35,14 @@ def causal_conv1d(
 
     assert lhs.ndim == 4
 
-    out_list = []
+    out = jnp.zeros((cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size),
+                    jnp.float32)
+    for k in range(cfg.kernel_size):
+        w_k = conv_weight[k:k + 1].reshape(1, 1, 1, cfg.dim_size)
+        out = out + lhs[:, k:k + cfg.chunk_size] * w_k
 
-    for c_idx in range(cfg.chunk_size):
-        out = jnp.zeros((cfg.seq_tile_size, 1, cfg.dim_size), jnp.float32)
-
-        end_idx = c_idx + cfg.prev_kernel_size
-        start_idx = 1 + end_idx - cfg.kernel_size
-        for k in range(cfg.kernel_size):
-            lhs_curr = lhs[:, start_idx + k]
-            out += lhs_curr * conv_weight[k:k + 1]
-
-        if conv_bias is not None:
-            out += conv_bias.reshape(1, 1, -1)
-
-        out_list.append(out)
+    if conv_bias is not None:
+        out = out + conv_bias.reshape(1, 1, 1, cfg.dim_size)
 
     # Last prev_kernel_size elements needs to be returned as conv_state. However,
     # real_sizes may be smaller than chunk_size. Therefore, slicing last
@@ -74,4 +67,4 @@ def causal_conv1d(
             )
         state_list.append(new_conv_state)
 
-    return jnp.stack(out_list, axis=1), jnp.stack(state_list, axis=1)
+    return out, jnp.stack(state_list, axis=1)
