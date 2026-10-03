@@ -238,10 +238,109 @@ def test_omni_tpu_patches_configuration(monkeypatch):
     # restore the process-global state it edits (env var, F.interpolate).
     orig_interpolate = torch.nn.functional.interpolate
     monkeypatch.setattr(torch.nn.functional, "interpolate", orig_interpolate)
+    monkeypatch.setattr(
+        torch.nn.functional, "group_norm", torch.nn.functional.group_norm
+    )
     with patch.dict(os.environ):
         os.environ.pop("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", None)
         apply_omni_tpu_patches.__wrapped__()
         assert os.environ["VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"] == "1800.0"
+
+
+def test_flow_match_scheduler_step_flush(monkeypatch):
+    """Scheduler.step launches the pending TPU graph asynchronously per step."""
+    from vllm_torchtpu.omni import patches as omni_patches
+
+    calls = []
+
+    class _Scheduler:
+        def step(self, model_output, timestep, sample, return_dict=True):
+            return (sample,)
+
+    fake_schedulers = MagicMock()
+    fake_schedulers.FlowMatchEulerDiscreteScheduler = _Scheduler
+    fake_diffusers = MagicMock()
+    fake_diffusers.schedulers = fake_schedulers
+    monkeypatch.setitem(sys.modules, "diffusers", fake_diffusers)
+    monkeypatch.setitem(sys.modules, "diffusers.schedulers", fake_schedulers)
+    monkeypatch.setattr(
+        omni_patches, "_tpu_materialize_async", lambda t: calls.append(t) or True
+    )
+
+    orig_step = _Scheduler.step
+    omni_patches._patch_flow_match_scheduler_step_flush()
+    omni_patches._patch_flow_match_scheduler_step_flush()  # idempotent
+    assert _unwrap_tpu_patch(_Scheduler.step) is orig_step
+
+    tpu_sample = MagicMock(spec=torch.Tensor)
+    tpu_sample.device = MagicMock()
+    tpu_sample.device.type = "tpu"
+    cpu_sample = torch.zeros(1)
+
+    assert _Scheduler().step(None, None, tpu_sample, return_dict=False) == (tpu_sample,)
+    assert _Scheduler().step(None, None, cpu_sample, return_dict=False) == (cpu_sample,)
+    assert calls == [tpu_sample]
+
+
+@pytest.mark.parametrize(
+    "shape, affine",
+    [
+        ((2, 64, 8, 8), True),
+        ((2, 64, 8, 8), False),
+        ((1, 32, 17), True),
+        ((4, 128), True),
+    ],
+)
+def test_tpu_group_norm_matches_reference(shape, affine):
+    """The fused-reduce GroupNorm matches F.group_norm (fp32 and bf16)."""
+    from vllm_torchtpu.omni.patches import _tpu_group_norm
+
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(*shape, generator=g) * 2 + 0.5
+    c = shape[1]
+    weight = torch.rand(c, generator=g) + 0.5 if affine else None
+    bias = torch.rand(c, generator=g) - 0.5 if affine else None
+
+    ref = torch.nn.functional.group_norm(x, 32, weight, bias, 1e-6)
+    out = _tpu_group_norm(x, 32, weight, bias, 1e-6)
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+
+    xb = x.to(torch.bfloat16)
+    wb = weight.to(torch.bfloat16) if affine else None
+    bb = bias.to(torch.bfloat16) if affine else None
+    out_b = _tpu_group_norm(xb, 32, wb, bb, 1e-6)
+    assert out_b.dtype == torch.bfloat16
+    torch.testing.assert_close(out_b.float(), ref, rtol=2e-2, atol=2e-2)
+
+
+def test_group_norm_patch_dispatches_on_tpu_only(monkeypatch):
+    from vllm_torchtpu.omni import patches as omni_patches
+
+    orig_group_norm = _unwrap_tpu_patch(torch.nn.functional.group_norm)
+    monkeypatch.setattr(torch.nn.functional, "group_norm", orig_group_norm)
+    calls = []
+    monkeypatch.setattr(
+        omni_patches,
+        "_tpu_group_norm",
+        lambda *a: calls.append(a) or torch.zeros(1),
+    )
+
+    omni_patches._patch_group_norm_tpu()
+    omni_patches._patch_group_norm_tpu()  # idempotent
+    assert _unwrap_tpu_patch(torch.nn.functional.group_norm) is orig_group_norm
+
+    x = torch.randn(2, 64, 4, 4)
+    torch.testing.assert_close(
+        torch.nn.functional.group_norm(x, 32), orig_group_norm(x, 32)
+    )
+    assert calls == []
+
+    tpu_x = MagicMock(spec=torch.Tensor)
+    tpu_x.device = MagicMock()
+    tpu_x.device.type = "tpu"
+    tpu_x.dim.return_value = 4
+    torch.nn.functional.group_norm(tpu_x, 32, eps=1e-6)
+    assert calls == [(tpu_x, 32, None, None, 1e-6)]
 
 
 def test_worker_proc_async_output_loop_zero_gpu_id():

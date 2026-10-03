@@ -2,6 +2,7 @@
 """TPU runtime patches for vLLM-Omni diffusion models."""
 
 import functools
+import importlib
 from functools import cache as run_once
 from typing import Any
 
@@ -96,6 +97,135 @@ def apply_omni_tpu_patches() -> None:
     )
     logger.info(
         "Applied TPU patch: safe torch.nn.functional.interpolate for 1D linear TPU ops."
+    )
+
+    _patch_flow_match_scheduler_step_flush()
+    _patch_group_norm_tpu()
+
+
+def _tpu_group_norm(
+    input: torch.Tensor,
+    num_groups: int,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    eps: float,
+) -> torch.Tensor:
+    """GroupNorm with statistics reduced over a ``[N, G, C/G, *spatial]`` view.
+
+    Statistics are accumulated in fp32 (as ``native_group_norm`` does) and the
+    result is cast back to the input dtype.
+    """
+    n, c = input.shape[0], input.shape[1]
+    spatial = tuple(input.shape[2:])
+    x = input.reshape(n, num_groups, c // num_groups, *spatial).float()
+    reduce_dims = tuple(range(2, x.dim()))
+    mean = x.mean(reduce_dims, keepdim=True)
+    xc = x - mean
+    var = (xc * xc).mean(reduce_dims, keepdim=True)
+    y = (xc * torch.rsqrt(var + eps)).reshape(input.shape)
+    affine_shape = (1, c) + (1,) * len(spatial)
+    if weight is not None:
+        y = y * weight.reshape(affine_shape).float()
+    if bias is not None:
+        y = y + bias.reshape(affine_shape).float()
+    return y.to(input.dtype)
+
+
+def _patch_group_norm_tpu() -> None:
+    # -------------------------------------------------------------------------
+    # Upstream torch_tpu Root Cause Tracking:
+    # torch_tpu lowers ``aten::native_group_norm`` by flattening each group to
+    # ``[N, G, C/G*H*W]`` and reducing over that single huge minor dimension.
+    # For VAE-decoder activations (e.g. ``[1, 128, 1024, 1024]`` -> 4M-wide
+    # minor dim) XLA:TPU emits a serial ``while`` loop of ``dynamic-slice`` /
+    # ``dynamic-update-slice`` instead of a fused reduce: ~35 ms per GroupNorm
+    # on tpu7x against a ~0.4 ms HBM roofline, i.e. ~390 ms of a 2.1 s
+    # Z-Image-Turbo 1024x1024 generate call. Any formulation that merges H*W
+    # into the reduced minor dim (``reshape(N, G, -1)``, ``var_mean``,
+    # ``layer_norm`` over the flattened group) hits the same lowering.
+    #
+    # Fix: reduce over a ``[N, G, C/G, H, W]`` view (dims 2..) in fp32, which
+    # XLA fuses into ordinary reduces: ~3.3 ms for the same shape (~10x).
+    #
+    # REMOVAL CONDITION: torch_tpu's ``native_group_norm`` lowering keeps the
+    # spatial dims separate (or XLA:TPU stops serialising wide minor-dim
+    # reductions), at which point the override is a no-op in cost.
+    # -------------------------------------------------------------------------
+    orig_group_norm = _unwrap_tpu_patch(torch.nn.functional.group_norm)
+
+    def _group_norm(
+        input: torch.Tensor,
+        num_groups: int,
+        weight: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
+        eps: float = 1e-5,
+    ) -> torch.Tensor:
+        if input.device.type == "tpu" and input.dim() >= 2:
+            return _tpu_group_norm(input, num_groups, weight, bias, eps)
+        return orig_group_norm(input, num_groups, weight, bias, eps)
+
+    torch.nn.functional.group_norm = _mark_tpu_patch(_group_norm, orig_group_norm)
+    logger.info(
+        "Applied TPU patch: fused-reduce torch.nn.functional.group_norm "
+        "(avoids serial while-loop lowering of native_group_norm)."
+    )
+
+
+def _tpu_materialize_async(tensor: torch.Tensor) -> bool:
+    """Dispatch the pending lazy graph that produces ``tensor`` without waiting.
+
+    torch_tpu's ``DEFER_AND_FUSE`` eager mode queues ops until something reads a
+    result; ``synchronize(t, wait=False)`` compiles + launches that graph and
+    returns immediately, so the host can keep tracing the next step while the
+    device runs this one. Returns ``False`` when the API is unavailable.
+    """
+    try:
+        from torch_tpu._internal.sync import synchronize as _tpu_synchronize
+    except Exception:  # noqa: BLE001 - older/newer torch_tpu without the helper
+        return False
+    _tpu_synchronize(tensor, wait=False)
+    return True
+
+
+def _patch_flow_match_scheduler_step_flush() -> None:
+    # -------------------------------------------------------------------------
+    # Root cause (torch_tpu lazy execution + vLLM-Omni's single pipeline call):
+    # In DEFER_AND_FUSE mode nothing inside the diffusion pipeline forces the
+    # deferred graph to run, so the host traces *all* denoise steps and the VAE
+    # decode (tens of thousands of aten ops) while the TPU sits idle, and only
+    # the final ``.cpu()`` of the image launches the work. On Z-Image-Turbo /
+    # tpu7x that is ~415 ms of exposed host time per image (~17% of E2E).
+    #
+    # Fix: after every ``FlowMatchEulerDiscreteScheduler.step`` launch the graph
+    # that produces the new latents *asynchronously*. Per-step host tracing
+    # (~45 ms) is then hidden behind the device's step time, and each step
+    # becomes an identical, cache-hit program instead of one giant graph.
+    #
+    # REMOVAL CONDITION: vLLM-Omni compiles the denoise loop on TPU
+    # (``supports_torch_inductor``-equivalent path with ``backend="tpu"``) or
+    # torch_tpu flushes deferred graphs on its own size/time heuristics.
+    # -------------------------------------------------------------------------
+    try:
+        schedulers_mod = importlib.import_module("diffusers.schedulers")
+        scheduler_cls = schedulers_mod.FlowMatchEulerDiscreteScheduler
+    except Exception:  # noqa: BLE001 - diffusers is an omni extra
+        logger.warning("diffusers not importable; scheduler step flush patch skipped.")
+        return
+
+    orig_step = _unwrap_tpu_patch(scheduler_cls.step)
+
+    def _step_and_flush(self: Any, *args: Any, **kwargs: Any) -> Any:
+        out = orig_step(self, *args, **kwargs)
+        sample = out[0] if isinstance(out, tuple) else getattr(out, "prev_sample", None)
+        device = getattr(sample, "device", None)
+        if isinstance(sample, torch.Tensor) and getattr(device, "type", None) == "tpu":
+            _tpu_materialize_async(sample)
+        return out
+
+    scheduler_cls.step = _mark_tpu_patch(_step_and_flush, orig_step)
+    logger.info(
+        "Applied TPU patch: async per-step graph flush after "
+        "FlowMatchEulerDiscreteScheduler.step."
     )
 
 
