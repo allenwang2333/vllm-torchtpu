@@ -58,7 +58,8 @@ def _cases():
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("accum", ["native", "f32"])
 @pytest.mark.parametrize("method,k", [("topk", 1024), ("topk", 16), ("approx", 512)])
-def test_fast_threshold_is_bisection(dtype, accum, method, k):
+@pytest.mark.parametrize("window", [0, 2])
+def test_fast_threshold_is_bisection(dtype, accum, method, k, window):
     active = P < 1.0
     proven_any = False
     for name, x in _cases():
@@ -66,7 +67,7 @@ def test_fast_threshold_is_bisection(dtype, accum, method, k):
         p = jnp.asarray(P)
         want = np.asarray(top_p.bisect_threshold(probs, p, accum))
         got, proven, fell_back = top_p.fast_threshold_jit(
-            probs, p, k, method, accum, True
+            probs, p, k, method, accum, True, window
         )
         got = np.asarray(got)
         np.testing.assert_array_equal(got[active], want[active], err_msg=name)

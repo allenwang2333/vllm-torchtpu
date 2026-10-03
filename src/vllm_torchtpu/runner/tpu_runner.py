@@ -4067,6 +4067,26 @@ class TPUModelRunner(GPUModelRunner):
                 padded_num_reqs=md.bonus_logits_indices.shape[0],
             )
             assert self.speculative_config is not None
+            # The unfused path's draws: rand_like(bonus_logits), then accept_u,
+            # then rand_like(target_logits, f32) -- same shapes, dtypes, order.
+            bonus_u = torch.rand(
+                (md.bonus_logits_indices.shape[0], logits.shape[-1]),
+                dtype=logits.dtype,
+                device=logits.device,
+                generator=sampling_generator,
+            )
+            accept_u = torch.rand(
+                md.draft_token_ids.shape,
+                dtype=torch.float32,
+                device=logits.device,
+                generator=sampling_generator,
+            )
+            recover_u = torch.rand(
+                (md.target_logits_indices.shape[0], logits.shape[-1]),
+                dtype=torch.float32,
+                device=logits.device,
+                generator=sampling_generator,
+            )
             return self.spec_sample_verify_fused(
                 logits,
                 md.bonus_logits_indices,
@@ -4078,7 +4098,9 @@ class TPUModelRunner(GPUModelRunner):
                 md.draft_lengths,
                 md.segment_ids,
                 md.group_indices,
-                sampling_generator,
+                bonus_u,
+                accept_u,
+                recover_u,
                 self.speculative_config.num_speculative_tokens,
                 **self._sampler_kwargs(),
             )
@@ -5656,16 +5678,24 @@ class TPUModelRunner(GPUModelRunner):
         k: int,
     ) -> None:
         """Warm TPU_SAMPLER_FUSED_CHAIN's program at one verify bucket for
-        every static-kwarg variant, with the real sampling generator (the
-        graph is keyed on it) and its state restored afterwards."""
+        every static-kwarg variant."""
         num_reqs = bonus_logits_indices.shape[0]
+        num_tokens = target_logits_indices.shape[0]
         temps = torch.ones((num_reqs, 1), dtype=self._hidden_states_dtype).to(
             self.device
         )
         top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(self.device)
         top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
-        gen = self._get_sampling_generator()
-        state = gen.get_state()
+        vocab = dummy_logits.shape[-1]
+        bonus_u = torch.zeros((num_reqs, vocab), dtype=dummy_logits.dtype).to(
+            self.device
+        )
+        accept_u = torch.zeros(draft_token_ids.shape, dtype=torch.float32).to(
+            self.device
+        )
+        recover_u = torch.zeros((num_tokens, vocab), dtype=torch.float32).to(
+            self.device
+        )
         for light_kwargs in self._sampler_light_variants() or [{}]:
             out = self.spec_sample_verify_fused(
                 dummy_logits,
@@ -5678,12 +5708,13 @@ class TPUModelRunner(GPUModelRunner):
                 draft_lengths,
                 segment_ids,
                 group_indices,
-                gen,
+                bonus_u,
+                accept_u,
+                recover_u,
                 k,
                 **light_kwargs,
             )
             synchronize_tensors(out)
-        gen.set_state(state)
 
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
@@ -6967,7 +6998,9 @@ class TPUModelRunner(GPUModelRunner):
         draft_lengths: torch.Tensor,
         segment_ids: torch.Tensor,
         group_indices: torch.Tensor,
-        sampling_generator: torch.Generator | None,
+        bonus_u: torch.Tensor,
+        accept_u: torch.Tensor,
+        recover_u: torch.Tensor,
         max_draft_tokens: int,
         need_top_k: bool = True,
         need_top_p: bool = True,
@@ -6975,13 +7008,13 @@ class TPUModelRunner(GPUModelRunner):
         fast_top_p: str = "",
     ) -> torch.Tensor:
         """TPU_SAMPLER_FUSED_CHAIN: the non-greedy, grammar-free branch of
-        _sample_spec_verify_chunk as one program -- the logits gathers, the
-        bonus / accept / recover uniform draws (same order, same generator),
-        bonus sampling and the rejection sampler."""
+        _sample_spec_verify_chunk as one program -- the logits gathers, bonus
+        sampling, the per-token param gathers and the rejection sampler. The
+        uniforms come in drawn by the caller (Dynamo cannot take a
+        torch.Generator into the graph), same shapes and order as unfused."""
         assert self.rejection_sampler is not None
         bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
         target_logits = torch.index_select(logits, 0, target_logits_indices)
-        bonus_u = torch.rand_like(bonus_logits, generator=sampling_generator)
         bonus_token_ids = _sample_from_logits_impl(
             bonus_logits,
             req_temperatures,
@@ -6993,15 +7026,6 @@ class TPUModelRunner(GPUModelRunner):
             radix_bits,
             fast_top_p,
         ).view(-1)
-        accept_u = torch.rand(
-            draft_token_ids.shape,
-            dtype=torch.float32,
-            device=target_logits.device,
-            generator=sampling_generator,
-        )
-        recover_u = torch.rand_like(
-            target_logits, dtype=torch.float32, generator=sampling_generator
-        )
         return _random_rejection_sample_with_segment_impl(
             draft_token_ids,
             target_logits,
