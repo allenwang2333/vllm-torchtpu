@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import torch
 
 from .cache import (
-    gather_cache_halves,
+    gather_cache_pieces,
     gather_cache_values,
     merge_halves,
     scatter_cache_values,
@@ -37,18 +37,21 @@ def _attend(q, pool, records, state, scale, tile=64):
 
     # Gather BF16 rows once outside; keep FP32 scratch tiled. Rows and q use
     # the split element order (no per-element unpack gather), kept as
-    # separate even/odd halves; attention is invariant to a shared
-    # permutation of the head dimension.
-    half = dim // 2
+    # separate pieces; attention is invariant to a shared permutation of the
+    # head dimension.
     gathered = tuple(
-        values.reshape(tokens, records.shape[1], half)
-        for values in gather_cache_halves(pool, records.reshape(-1), dim)
+        values.reshape(tokens, records.shape[1], -1)
+        for values in gather_cache_pieces(pool, records.reshape(-1), dim)
     )
-    q = split_halves(q)
-    q = q[..., :half], q[..., half:]
+    piece = dim // len(gathered)
+
+    def pieces(x):
+        x = split_halves(x)
+        return tuple(x[..., i * piece : (i + 1) * piece] for i in range(len(gathered)))
+
+    q = pieces(q)
     maximum, denominator, numerator = state
-    numerator = split_halves(numerator)
-    state = maximum, denominator, (numerator[..., :half], numerator[..., half:])
+    state = maximum, denominator, pieces(numerator)
 
     def step(index, carry):
         maximum, denominator, numerator = carry

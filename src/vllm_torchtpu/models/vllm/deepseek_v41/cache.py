@@ -367,30 +367,44 @@ def _permute(x: jax.Array, source: jax.Array) -> jax.Array:
     ).astype(x.dtype)
 
 
-def split_halves(x: jax.Array) -> jax.Array:
-    """Reorder the last axis as ``[0, 2, 4, ..., 1, 3, ...]`` (``split`` reads)."""
+def piece_order(elements: int) -> jax.Array:
+    """Element order of `gather_cache_pieces`: per word row, even then odd."""
     import jax.numpy as jnp
 
-    dim = x.shape[-1]
-    return _permute(x, jnp.concatenate([jnp.arange(0, dim, 2), jnp.arange(1, dim, 2)]))
+    width = min(elements // 2, ROW_WORDS)
+    return jnp.concatenate(
+        [
+            start + 2 * jnp.arange(width) + parity
+            for start in range(0, elements, 2 * width)
+            for parity in (0, 1)
+        ]
+    )
+
+
+def split_halves(x: jax.Array) -> jax.Array:
+    """Reorder the last axis as `piece_order` (``split`` reads)."""
+    return _permute(x, piece_order(x.shape[-1]))
 
 
 def merge_halves(x: jax.Array) -> jax.Array:
     """Inverse of `split_halves`."""
     import jax.numpy as jnp
 
-    half = x.shape[-1] // 2
-    order = jnp.arange(x.shape[-1])
-    return _permute(x, order // 2 + (order % 2) * half)
+    return _permute(x, jnp.argsort(piece_order(x.shape[-1])))
 
 
-def _gather_records(cache, records, record_words):
+def _valid_records(cache, records, record_words):
     import jax.numpy as jnp
 
     spread = jnp.arange(records.size, dtype=records.dtype).reshape(records.shape)
     spread %= cache.shape[0] * ROW_WORDS // record_words
-    records = jnp.where(records >= 0, records, spread)
-    return _gather_words(cache, records, record_words)
+    return jnp.where(records >= 0, records, spread)
+
+
+def _gather_records(cache, records, record_words):
+    return _gather_words(
+        cache, _valid_records(cache, records, record_words), record_words
+    )
 
 
 def _split_words(words: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -402,11 +416,24 @@ def _split_words(words: jax.Array) -> tuple[jax.Array, jax.Array]:
     return bf16(words << 16), bf16(words & jnp.int32(-65536))
 
 
-def gather_cache_halves(
+def gather_cache_pieces(
     cache: jax.Array, records: jax.Array, elements: int
-) -> tuple[jax.Array, jax.Array]:
-    """BF16 records as (even elements, odd elements); see `gather_cache_values`."""
-    return _split_words(_gather_records(cache, records, elements // 2))
+) -> list[jax.Array]:
+    """BF16 records as element pieces in `piece_order`; see `gather_cache_values`.
+
+    Records spanning several word rows gather each row separately: one
+    interleaved gather would need a costly ``[2n, 128] -> [n, 256]`` relayout.
+    """
+    record_words = elements // 2
+    if record_words <= ROW_WORDS:
+        return list(_split_words(_gather_records(cache, records, record_words)))
+    chunks = record_words // ROW_WORDS
+    records = _valid_records(cache, records, record_words) * chunks
+    return [
+        piece
+        for chunk in range(chunks)
+        for piece in _split_words(cache[records + chunk])
+    ]
 
 
 def gather_cache_values(
@@ -421,17 +448,17 @@ def gather_cache_values(
     Negative records are invalid and return arbitrary rows; callers mask them.
     They read distinct rows: clamping them all to row 0 serializes the
     SparseCore gather on the repeated index (padded decode, short top-k).
-    ``split`` returns BF16 elements reordered as ``[0, 2, 4, ..., 1, 3, ...]``
-    (see `split_halves`), which needs no lane gather.
+    ``split`` returns BF16 elements reordered as `piece_order` (see
+    `split_halves`), which needs no lane gather.
     """
     import jax.numpy as jnp
 
+    if split:
+        return jnp.concatenate(gather_cache_pieces(cache, records, elements), axis=1)
     record_words = elements if fp32 else elements // 2
     words = _gather_records(cache, records, record_words)
     if fp32:
         return jax.lax.bitcast_convert_type(words, jnp.float32)
-    if split:
-        return jnp.concatenate(_split_words(words), axis=1)
     # Keep the consumer's final shape; rank-increasing bitcasts add TPU padding.
     columns = jnp.arange(elements)[None]
     selected = jnp.take_along_axis(words, columns // 2, axis=1)

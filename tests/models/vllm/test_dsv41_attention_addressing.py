@@ -10,11 +10,12 @@ from vllm_torchtpu.models.vllm.deepseek_v41.attention import (
     _row_slots,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.attention_kernels import (
+    paged_attention_jax,
     paged_index_scores_jax,
     paged_indexer_jax,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.cache import (
-    gather_cache_halves,
+    gather_cache_pieces,
     gather_cache_values,
     merge_halves,
     merge_sub_rows,
@@ -89,7 +90,7 @@ def test_gather_cache_values_split_order(elements):
         np.concatenate(
             [
                 np.asarray(h, np.float32)
-                for h in gather_cache_halves(pool, records, elements)
+                for h in gather_cache_pieces(pool, records, elements)
             ],
             axis=1,
         ),
@@ -101,6 +102,31 @@ def test_gather_cache_values_split_order(elements):
     np.testing.assert_array_equal(
         np.asarray(merge_halves(split_halves(numerator))), np.asarray(numerator)
     )
+
+
+@pytest.mark.parametrize("width", [64, 200])
+def test_paged_attention_matches_dense(width):
+    rng = np.random.default_rng(width)
+    tokens, heads, dim = 4, 2, 512
+    pool = jnp.asarray(rng.integers(0, 2**31, (512, 128)), jnp.int32) & jnp.int32(
+        0x3EFF3EFF
+    )  # finite, moderate BF16 values
+    records = rng.integers(0, 256, (tokens, width)).astype(np.int32)
+    records[:, :3] = -1
+    q = jnp.asarray(rng.standard_normal((tokens, heads, dim)), jnp.bfloat16)
+    sink = jnp.asarray(rng.standard_normal(heads), jnp.float32)
+    empty = jnp.zeros((tokens, 0), jnp.int32)
+    scale = dim**-0.5
+    got = paged_attention_jax(q, pool, pool, jnp.asarray(records), empty, sink, scale)
+    kv = gather_cache_values(pool, jnp.asarray(np.maximum(records, 0)).reshape(-1), dim)
+    kv = np.asarray(kv, np.float32).reshape(tokens, width, dim)
+    s = np.einsum("thd,tkd->thk", np.asarray(q, np.float32), kv) * scale
+    s = np.where((records >= 0)[:, None], s, -np.inf)
+    m = np.maximum(s.max(-1), np.asarray(sink)[None])
+    p = np.exp(s - m[..., None])
+    den = p.sum(-1) + np.exp(np.asarray(sink)[None] - m)
+    ref = np.einsum("thk,tkd->thd", p, kv) / den[..., None]
+    np.testing.assert_allclose(np.asarray(got, np.float32), ref, atol=2e-3)
 
 
 @pytest.mark.parametrize("tokens,width", [(1, 300), (8, 2560), (64, 640)])
