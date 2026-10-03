@@ -219,6 +219,29 @@ def _rollback_offsets_migrate_impl(
 
 
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+
+# EXPERIMENT (close-gaps EW positive control; not for merge): busy-spin the
+# serving thread for VLLM_DEBUG_SPIN_US at the site named by
+# VLLM_DEBUG_SPIN_SITE, to find which host segment is on the critical path.
+_DEBUG_SPIN_SITE = os.environ.get("VLLM_DEBUG_SPIN_SITE", "")
+_DEBUG_SPIN_S = int(os.environ.get("VLLM_DEBUG_SPIN_US", "500")) * 1e-6
+_debug_spin_logged = False
+
+
+def _debug_spin(site: str) -> None:
+    global _debug_spin_logged
+    if site != _DEBUG_SPIN_SITE:
+        return
+    if not _debug_spin_logged:
+        _debug_spin_logged = True
+        logger.warning(
+            "DEBUG_SPIN active at site %s: %.0f us", site, _DEBUG_SPIN_S * 1e6
+        )
+    end = time.perf_counter() + _DEBUG_SPIN_S
+    while time.perf_counter() < end:
+        pass
+
+
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
@@ -2707,7 +2730,9 @@ class TPUModelRunner(GPUModelRunner):
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
         assert start_index < num_reqs
+        _debug_spin("c")
         self._wait_input_staging_fence()
+        _debug_spin("a")
 
         # Get the number of scheduled tokens for each request.
         use_max_model_len = self.most_model_len is None
@@ -4574,6 +4599,7 @@ class TPUModelRunner(GPUModelRunner):
                 ) = self._assemble_async_spec_substitution(
                     eagle3_drafts, next_tokens_per_chunk, state
                 )
+                _debug_spin("b")
             elif self._is_async_drafter and next_tokens_tpu_chunks:
                 # Prefill / pure-non-spec eagle3 bootstrap: the non-spec sampling
                 # branch parked a stride-1 source (sampled token only). Rebuild
