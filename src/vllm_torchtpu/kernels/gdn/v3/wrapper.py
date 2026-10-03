@@ -481,9 +481,8 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
-    qkv = qkv.astype(jnp.float32)
-    b = b.astype(jnp.float32)
-    a = a.astype(jnp.float32)
+    # The kernel converts activations to the compute dtype after the DMA;
+    # casting here would be a separate full-size HBM pass per call.
 
     # Step 1: Validate inputs.
     is_kda = attention_mode == config.AttentionMode.KDA
