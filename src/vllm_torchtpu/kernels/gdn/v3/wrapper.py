@@ -552,9 +552,12 @@ def fused_conv1d_gdn(
         )
     if mixed_tile_size is None:
         # 128-token chunks amortize the per-tile pipeline and solve better
-        # than 64 on the per-sequence pass; keep 64 where 128 does not
-        # divide the token count.
-        mixed_tile_size = 128 if batch_size % 128 == 0 else 64
+        # than 64 on the per-sequence pass (Qwen3.5 TP8, 8 value heads). The
+        # per-tile [heads, chunk, chunk] working set grows with both, and at
+        # 32+ value heads a 128 chunk exceeds scoped VMEM; keep 64 there and
+        # where 128 does not divide the token count.
+        use_128 = batch_size % 128 == 0 and n_v <= 16
+        mixed_tile_size = 128 if use_128 else 64
     mixed_tile_size = min(mixed_tile_size, batch_size)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
 
