@@ -26,6 +26,8 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.sequence import IntermediateTensors
 
+from vllm_torchtpu.spec_decode.utils import draft_greedy_token_ids
+
 
 class MtpDraftModel(Protocol):
     """What the loop calls on the MTP draft. The draft is an nn.Module, but
@@ -83,9 +85,7 @@ class _MtpFusedLoop(nn.Module):
                 last_hidden, hidden_states = out
             else:
                 last_hidden = hidden_states = out
-            input_ids = (
-                self.mtp.compute_logits(last_hidden).argmax(dim=-1).to(torch.int32)
-            )
+            input_ids = draft_greedy_token_ids(self.mtp, last_hidden)
             tokens.append(input_ids)
         return tuple(tokens)
 
