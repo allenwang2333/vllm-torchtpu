@@ -140,6 +140,9 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
+    VLLM_TORCHTPU_EXPORT_HLO_DIR: bool | str = False
+    VLLM_TORCHTPU_LOAD_HLO_DIR: str = ""
+    VLLM_TORCHTPU_EXPORT_EARLY_EXIT: bool = False
 
 
 def env_with_choices(
@@ -347,6 +350,11 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_TORCHTPU_EXPORT_HLO_DIR": env_str("VLLM_TORCHTPU_EXPORT_HLO_DIR", default=""),
+    "VLLM_TORCHTPU_LOAD_HLO_DIR": env_str("VLLM_TORCHTPU_LOAD_HLO_DIR", default=""),
+    "VLLM_TORCHTPU_EXPORT_EARLY_EXIT": env_bool(
+        "VLLM_TORCHTPU_EXPORT_EARLY_EXIT", default=False
+    ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
