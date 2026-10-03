@@ -404,3 +404,46 @@ def test_quantized_matmul_blockwise_int4_fp8(
         block_size=512,
         x_q_dtype=jnp.float8_e4m3fn,
     )
+
+
+def test_quantize_block_preserves_input_dtype_for_fp8(monkeypatch) -> None:
+    x = jax.random.normal(jax.random.key(0), (64, 512), dtype=jnp.bfloat16)
+
+    # Default (off): uses fp32 division
+    monkeypatch.delenv("VLLM_TPU_FP8_FAST_BF16_ACT_QUANT", raising=False)
+    lowered_default = jax.jit(
+        lambda a: util.quantize_block(a, axis=1, target_dtype=jnp.float8_e4m3fn)
+    ).lower(x)
+    assert "f32[64,512]{1,0} divide(" in lowered_default.as_text("hlo")
+
+    # Opt-in (on): uses bf16 division
+    monkeypatch.setenv("VLLM_TPU_FP8_FAST_BF16_ACT_QUANT", "1")
+    lowered = jax.jit(
+        lambda a: util.quantize_block(a, axis=1, target_dtype=jnp.float8_e4m3fn)
+    ).lower(x)
+    hlo_text = lowered.as_text("hlo")
+    assert "bf16[64,512]{1,0} divide(" in hlo_text
+    assert "f32[64,512]{1,0} divide(" not in hlo_text
+
+    x_q, x_s = util.quantize_block(x, axis=1, target_dtype=jnp.float8_e4m3fn)
+    assert x_q.dtype == jnp.float8_e4m3fn
+    assert x_s.dtype == jnp.float32
+    # Returned scale must equal the exact bf16 divisor cast to f32
+    assert jnp.array_equal(x_s, x_s.astype(jnp.bfloat16).astype(jnp.float32))
+    # Numerical roundtrip check against fp32 input
+    x_deq = x_q.astype(jnp.float32) * x_s
+    rel_err = jnp.mean(jnp.abs(x.astype(jnp.float32) - x_deq)) / jnp.mean(
+        jnp.abs(x.astype(jnp.float32))
+    )
+    assert float(rel_err) < 0.05
+
+    # fp16 small-magnitude rows (1e-4 / 448 would underflow in fp16) must use fp32 division
+    x_fp16_small = (
+        jax.random.uniform(jax.random.key(1), (8, 128), minval=0.5, maxval=1.0) * 1e-4
+    ).astype(jnp.float16)
+    q_fp16, s_fp16 = util.quantize_block(
+        x_fp16_small, axis=1, target_dtype=jnp.float8_e4m3fn
+    )
+    deq_fp16 = q_fp16.astype(jnp.float32) * s_fp16
+    assert not jnp.isnan(deq_fp16).any()
+    assert jnp.allclose(deq_fp16, x_fp16_small.astype(jnp.float32), rtol=0.1, atol=1e-5)

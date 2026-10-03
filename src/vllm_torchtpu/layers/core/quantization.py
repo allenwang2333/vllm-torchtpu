@@ -73,12 +73,14 @@ def static_per_tensor_quantize_tensor(
     scale: float,
 ) -> torch.Tensor:
     """Quantize tensor with a fixed scalar scale and clamp to dtype range."""
-    if scale == 0.0:
+    if isinstance(scale, (int, float)) and scale == 0.0:
         raise ValueError("Quantization scale must be non-zero.")
     if is_floating_dtype(quant_dtype):
         dtype_info = torch.finfo(quant_dtype)
     else:
         dtype_info = torch.iinfo(quant_dtype)
+    if isinstance(scale, (int, float)) and scale == 1.0:
+        return torch.clamp(tensor, dtype_info.min, dtype_info.max).to(quant_dtype)
     quantized = torch.clamp(
         tensor.to(torch.float32) / scale, dtype_info.min, dtype_info.max
     )
