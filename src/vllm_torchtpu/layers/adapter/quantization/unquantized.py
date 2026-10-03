@@ -61,6 +61,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
+    K_EQ_V_ATTR,
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
     is_k_eq_v_qkv_layer,
@@ -113,7 +114,7 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
             v_size = layer.num_kv_heads * getattr(layer, "v_head_size", layer.head_size)
             if k_size == v_size > 0 and q_size + 2 * k_size == weight.shape[0]:
                 weight = weight[: q_size + k_size]
-                setattr(layer, "_dedup_kv_size", k_size)
+                setattr(layer, K_EQ_V_ATTR, k_size)
         weight = weight.transpose(0, 1).contiguous()
         replace_parameter(
             layer, "weight", torch.nn.Parameter(weight, requires_grad=False)
@@ -136,7 +137,7 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         weight = layer.weight
         if bias is None:
             out = torch.matmul(x, weight)
-            if dedup_kv_size := getattr(layer, "_dedup_kv_size", 0):
+            if dedup_kv_size := getattr(layer, K_EQ_V_ATTR, 0):
                 out = torch.cat([out, out[..., -dedup_kv_size:]], dim=-1)
             return out
         # Fuse the bias via addmm rather than `matmul(...) + bias`: the latter

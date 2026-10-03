@@ -478,6 +478,10 @@ class TestFp8LinearRuntimeQuant:
         from vllm.config import set_current_vllm_config
         from vllm.model_executor.layers.linear import QKVParallelLinear
 
+        from vllm_torchtpu.layers.adapter.linear_common import (
+            K_EQ_V_ATTR,
+            KEEP_VLLM_LAYOUT_ATTR,
+        )
         from vllm_torchtpu.layers.adapter.quantization.unquantized import (
             VllmUnquantizedLinearMethod,
         )
@@ -506,49 +510,65 @@ class TestFp8LinearRuntimeQuant:
             kernel_config=SimpleNamespace(linear_backend="auto"),
         )
 
-        with set_current_vllm_config(fake_vllm_config):
-            # Layer 0 (sliding_attention) must NOT deduplicate even if weights match
-            swa_layer = QKVParallelLinear.__new__(QKVParallelLinear)
-            torch.nn.Module.__init__(swa_layer)
-            swa_layer.prefix = "model.layers.0.self_attn.qkv_proj"
-            swa_layer.num_heads = 2
-            swa_layer.num_kv_heads = 1
-            swa_layer.head_size = 32
-            swa_layer.v_head_size = 32
-            swa_layer.bias = None
-            swa_layer.logical_widths = [q_size, kv_size, kv_size]
-            swa_layer.weight = torch.nn.Parameter(
-                weight_fp8.clone(), requires_grad=False
-            )
-            swa_layer.weight_scale = torch.nn.Parameter(
-                scale.clone(), requires_grad=False
-            )
+        def make_fp8_qkv(prefix, *, bias=None, keep_layout=False):
+            lyr = QKVParallelLinear.__new__(QKVParallelLinear)
+            torch.nn.Module.__init__(lyr)
+            lyr.prefix = prefix
+            lyr.num_heads = 2
+            lyr.num_kv_heads = 1
+            lyr.head_size = 32
+            lyr.v_head_size = 32
+            lyr.bias = bias
+            lyr.logical_widths = [q_size, kv_size, kv_size]
+            lyr.weight = torch.nn.Parameter(weight_fp8.clone(), requires_grad=False)
+            lyr.weight_scale = torch.nn.Parameter(scale.clone(), requires_grad=False)
+            if keep_layout:
+                setattr(lyr, KEEP_VLLM_LAYOUT_ATTR, True)
+            return lyr
 
+        with set_current_vllm_config(fake_vllm_config):
             method = VllmFp8LinearMethodTPU(FakeQuant(weight_block_size=None))
+
+            # 1. Layer 0 (sliding_attention) must NOT deduplicate even if weights match
+            swa_layer = make_fp8_qkv("model.layers.0.self_attn.qkv_proj")
             method.process_weights_after_loading(swa_layer)
-            assert getattr(swa_layer, "_dedup_kv_size", 0) == 0
+            assert getattr(swa_layer, K_EQ_V_ATTR, 0) == 0
             assert swa_layer.weight.shape == (in_dim, out_dim)
 
-            # Layer 1 (full_attention) MUST deduplicate V weight
-            layer = QKVParallelLinear.__new__(QKVParallelLinear)
-            torch.nn.Module.__init__(layer)
-            layer.prefix = "model.layers.1.self_attn.qkv_proj"
-            layer.num_heads = 2
-            layer.num_kv_heads = 1
-            layer.head_size = 32
-            layer.v_head_size = 32
-            layer.bias = None
-            layer.logical_widths = [q_size, kv_size, kv_size]
-            layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
-            layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+            # 2. Layer 1 with bias != None must NOT deduplicate
+            biased_layer = make_fp8_qkv(
+                "model.layers.1.self_attn.qkv_proj",
+                bias=torch.zeros(out_dim, device=device, dtype=torch.bfloat16),
+            )
+            method.process_weights_after_loading(biased_layer)
+            assert getattr(biased_layer, K_EQ_V_ATTR, 0) == 0
+            assert biased_layer.weight.shape == (in_dim, out_dim)
 
+            # 3. Layer 1 with KEEP_VLLM_LAYOUT_ATTR must NOT deduplicate
+            raw_layer = make_fp8_qkv(
+                "model.layers.1.self_attn.qkv_proj", keep_layout=True
+            )
+            method.process_weights_after_loading(raw_layer)
+            assert getattr(raw_layer, K_EQ_V_ATTR, 0) == 0
+            assert raw_layer.weight.shape == (out_dim, in_dim)
+
+            # 4. Layer 1 (full_attention) MUST deduplicate V weight and be idempotent on reload
+            layer = make_fp8_qkv("model.layers.1.self_attn.qkv_proj")
             method.process_weights_after_loading(layer)
+            method.process_weights_after_loading(layer)  # idempotence check
 
-            assert getattr(layer, "_dedup_kv_size", 0) == kv_size
+            assert getattr(layer, K_EQ_V_ATTR, 0) == kv_size
             assert layer.weight.shape == (in_dim, q_size + kv_size)
             assert layer.weight_scale.shape == (q_size + kv_size,)
 
-            # Also verify unquantized path deduplicates and reconstructs full QKV output
+            if device.type == "tpu":
+                x_tpu = torch.randn(4, in_dim, device=device, dtype=torch.bfloat16)
+                out_fp8 = method.apply(layer, x_tpu)
+                out_swa_ref = method.apply(swa_layer, x_tpu)
+                assert out_fp8.shape == (4, out_dim)
+                assert torch.equal(out_fp8, out_swa_ref)
+
+            # 5. Unquantized path deduplicates, is idempotent, and reconstructs full QKV output
             unq_layer = QKVParallelLinear.__new__(QKVParallelLinear)
             torch.nn.Module.__init__(unq_layer)
             unq_layer.prefix = "model.layers.1.self_attn.qkv_proj"
@@ -566,7 +586,8 @@ class TestFp8LinearRuntimeQuant:
 
             unq_method = VllmUnquantizedLinearMethod()
             unq_method.process_weights_after_loading(unq_layer)
-            assert getattr(unq_layer, "_dedup_kv_size", 0) == kv_size
+            unq_method.process_weights_after_loading(unq_layer)  # idempotence check
+            assert getattr(unq_layer, K_EQ_V_ATTR, 0) == kv_size
             assert unq_layer.weight.shape == (in_dim, q_size + kv_size)
 
             x = torch.randn(4, in_dim, device=device, dtype=torch.bfloat16)

@@ -97,4 +97,3 @@ class RunnerStageTiming:
         with self._samples_lock:
             device, self._device_samples = self._device_samples, []
         return cpu, device
-

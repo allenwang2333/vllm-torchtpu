@@ -35,6 +35,7 @@ KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
 # (`dummy_loader`, `reload/layerwise`), where a second flip would transpose
 # back and silently corrupt the values.
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
+K_EQ_V_ATTR = "_tpu_k_eq_v_kv_size"
 
 
 def is_k_eq_v_qkv_layer(layer: torch.nn.Module) -> bool:

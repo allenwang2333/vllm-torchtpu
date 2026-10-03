@@ -972,7 +972,6 @@ class TPUModelRunner(GPUModelRunner):
             enabled=self.vllm_config.kv_transfer_config is not None,
         )
 
-
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
 
@@ -2211,8 +2210,8 @@ class TPUModelRunner(GPUModelRunner):
             # and rely on the compiled _substitute_placeholder_token kernel.
             subst_key = (
                 len(input_ids),
-                tuple(token_in_tpu_cur_input_indices),
-                tuple(token_in_tpu_pre_next_tokens_indices),
+                token_in_tpu_cur_input_indices.tobytes(),
+                token_in_tpu_pre_next_tokens_indices.tobytes(),
             )
             if (
                 getattr(self, "_cached_subst_key", None) == subst_key

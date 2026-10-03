@@ -300,14 +300,13 @@ def quantize_block(data, axis, target_dtype):
     scale = jnp.where(scale == 0, 1.0, scale)
 
     if jnp.issubdtype(target_dtype, jnp.floating):
-        scale_data = scale.astype(data.dtype)
-        scale_data = jnp.where(scale_data == 0, jnp.ones_like(scale_data), scale_data)
-        data_q = (
-            (data / scale_data)
-            .clip(float(dtype_min), float(dtype_max))
-            .astype(target_dtype)
-        )
-    else:
-        data_q = jnp.round(data / scale).astype(target_dtype)
+        if data.dtype == jnp.bfloat16:
+            # bf16 shares f32's exponent range; return the exact divisor used.
+            scale = scale.astype(jnp.bfloat16)
+            scale = jnp.where(scale == 0, jnp.ones_like(scale), scale)
+            data_q = (data / scale).clip(float(dtype_min), float(dtype_max))
+            return data_q.astype(target_dtype), scale.astype(jnp.float32)
+        data_q = (data.astype(jnp.float32) / scale).clip(dtype_min, dtype_max)
+        return data_q.astype(target_dtype), scale
+    data_q = jnp.round(data / scale).astype(target_dtype)
     return data_q, scale
-

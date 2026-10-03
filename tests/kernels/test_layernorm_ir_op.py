@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -64,7 +64,60 @@ def test_tpu_ir_op_registration():
 
     TpuPlatform.import_ir_kernels()
     prio = TpuPlatform.get_default_ir_op_priority()
-    assert prio.rms_norm == ["tpu"]
-    assert prio.fused_add_rms_norm == ["tpu"]
+    assert prio.rms_norm == ["tpu", "native"]
+    assert prio.fused_add_rms_norm == ["tpu", "native"]
+    for name, val in vars(prio).items():
+        if name not in ("rms_norm", "fused_add_rms_norm"):
+            assert val == ["native"]
     assert "tpu" in ops.rms_norm.impls
     assert "tpu" in ops.fused_add_rms_norm.impls
+
+
+def test_tpu_ir_op_dispatch_and_fallbacks():
+    """Verify supports_args dispatches bf16 to tpu and falls back to native for fp32 weights, mixed residuals, and fp16."""
+    torch.manual_seed(7)
+    x_bf16 = torch.randn(8, 128, dtype=torch.bfloat16)
+    w_bf16 = torch.randn(128, dtype=torch.bfloat16)
+    # GemmaRMSNorm passes weight = self.weight.float() + 1.0 (fp32)
+    w_fp32 = w_bf16.float() + 1.0
+
+    with (
+        ops.rms_norm.set_priority(["tpu", "native"]),
+        ops.fused_add_rms_norm.set_priority(["tpu", "native"]),
+    ):
+        # 1. bf16 x + bf16 weight dispatches to "tpu"
+        out_bf16 = ops.rms_norm(x_bf16, w_bf16, 1e-6)
+        expected_tpu = ops.rms_norm.impls["tpu"].impl_fn(x_bf16, w_bf16, 1e-6)
+        assert torch.equal(out_bf16, expected_tpu)
+
+        # 2. GemmaRMSNorm-style fp32 weight falls back to "native" bit-for-bit
+        out_gemma = ops.rms_norm(x_bf16, w_fp32, 1e-6)
+        expected_native = ops.rms_norm.impls["native"].impl_fn(x_bf16, w_fp32, 1e-6)
+        assert out_gemma.dtype == torch.bfloat16
+        assert torch.equal(out_gemma, expected_native)
+
+        res_bf16 = torch.randn(8, 128, dtype=torch.bfloat16)
+        out_add_gemma, res_add_gemma = ops.fused_add_rms_norm(
+            x_bf16.clone(), res_bf16.clone(), w_fp32, 1e-6
+        )
+        ref_add_gemma, ref_res_gemma = ops.fused_add_rms_norm.impls["native"].impl_fn(
+            x_bf16.clone(), res_bf16.clone(), w_fp32, 1e-6
+        )
+        assert torch.equal(out_add_gemma, ref_add_gemma)
+        assert torch.equal(res_add_gemma, ref_res_gemma)
+
+        # 3. Mixed residual dtype (x=bf16, x_residual=fp32) falls back to "native" and preserves orig_dtype
+        res_fp32 = torch.randn(8, 128, dtype=torch.float32)
+        out_mixed, res_mixed = ops.fused_add_rms_norm(
+            x_bf16.clone(), res_fp32.clone(), w_bf16, 1e-6
+        )
+        assert out_mixed.dtype == torch.bfloat16
+        assert res_mixed.dtype == torch.bfloat16
+
+        # 4. fp16 zero rows with tiny eps=1e-12 fall back to "native" without NaN overflow
+        x_fp16_zero = torch.zeros(4, 128, dtype=torch.float16)
+        w_fp16 = torch.ones(128, dtype=torch.float16)
+        out_fp16 = ops.rms_norm(x_fp16_zero, w_fp16, 1e-12)
+        assert out_fp16.dtype == torch.float16
+        assert not torch.isnan(out_fp16).any()
+        assert torch.all(out_fp16 == 0)

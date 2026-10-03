@@ -73,6 +73,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
+    K_EQ_V_ATTR,
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
     is_k_eq_v_qkv_layer,
@@ -1344,7 +1345,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                 weight = weight[: q_size + k_size]
                 weight_scale = weight_scale[..., : q_size + k_size]
                 ckpt_n_out = q_size + k_size
-                setattr(layer, "_dedup_kv_size", k_size)
+                setattr(layer, K_EQ_V_ATTR, k_size)
         if not keep_vllm_layout:
             weight = weight.transpose(0, 1)
 
@@ -1413,7 +1414,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # takes the canonical (k, n), so flip the view for the contraction.
             weight = weight.transpose(0, 1)
         out = quantized_matmul(x, weight, layer.weight_scale)
-        if dedup_kv_size := getattr(layer, "_dedup_kv_size", 0):
+        if dedup_kv_size := getattr(layer, K_EQ_V_ATTR, 0):
             out = torch.cat([out, out[..., -dedup_kv_size:]], dim=-1)
         if bias is not None:
             out = out + bias

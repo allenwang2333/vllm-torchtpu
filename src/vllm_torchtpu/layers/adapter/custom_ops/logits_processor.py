@@ -26,9 +26,9 @@ class TpuLogitsProcessor(LogitsProcessor):
     Upstream applies soft_cap and scale after _gather_logits(), which duplicates
     the elementwise tanh/division/multiplication across all TP ranks over the full
     vocabulary [B, V]. Applying soft_cap and scale on the local shard [B, V // TP]
-    before all-gather is bit-for-bit identical, reduces VPU work by tp_size, and
-    allows XLA to fuse the elementwise epilogue directly into the lm_head GEMM
-    before the collective.
+    before all-gather is mathematically equivalent (up to XLA fusion rounding),
+    reduces VPU work by tp_size, and allows XLA to fuse the elementwise epilogue
+    directly into the lm_head GEMM before the collective.
     """
 
     def _apply_soft_cap_and_scale(self, logits: torch.Tensor) -> torch.Tensor:
@@ -47,22 +47,20 @@ class TpuLogitsProcessor(LogitsProcessor):
         embedding_bias: torch.Tensor | None = None,
         skip_gather: bool = False,
     ) -> torch.Tensor | None:
-        if self.logits_as_input:
-            logits = hidden_states
-            if logits is not None:
-                logits = self._apply_soft_cap_and_scale(logits)
-            return logits
-
+        # LogitsProcessorWithLoRA calls this unbound with itself as `self`; its
+        # _get_logits adds the LoRA delta post-gather, so keep upstream ordering
+        # for wrapped or non-gathering calls.
+        if (
+            not isinstance(self, TpuLogitsProcessor)
+            or self.logits_as_input
+            or skip_gather
+            or lm_head.tp_size == 1
+        ):
+            return LogitsProcessor.forward(
+                self, lm_head, hidden_states, embedding_bias, skip_gather
+            )
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
         if logits is not None:
             logits = self._apply_soft_cap_and_scale(logits)
-
-        if skip_gather:
-            return logits
-
-        if lm_head.tp_size > 1:
-            logits = self._gather_logits(logits)
-
-        if logits is not None:
-            logits = logits[..., : self.org_vocab_size]
-        return logits
+        logits = self._gather_logits(logits)
+        return None if logits is None else logits[..., : self.org_vocab_size]

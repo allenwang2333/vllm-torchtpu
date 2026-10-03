@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,7 +18,30 @@ from torch import Tensor
 from vllm.ir import ops
 
 
-@ops.rms_norm.register_impl("tpu")
+def _tpu_rms_ok(
+    x: Tensor,
+    weight: Tensor | None,
+    epsilon: float,
+    variance_size: int | None = None,
+) -> bool:
+    return x.dtype == torch.bfloat16 and (weight is None or weight.dtype == x.dtype)
+
+
+def _tpu_add_rms_ok(
+    x: Tensor,
+    x_residual: Tensor,
+    weight: Tensor | None,
+    epsilon: float,
+    variance_size: int | None = None,
+) -> bool:
+    return (
+        x.dtype == torch.bfloat16
+        and x_residual.dtype == x.dtype
+        and (weight is None or weight.dtype == x.dtype)
+    )
+
+
+@ops.rms_norm.register_impl("tpu", supports_args=_tpu_rms_ok)
 def rms_norm_tpu(
     x: Tensor,
     weight: Tensor | None,
@@ -37,7 +60,7 @@ def rms_norm_tpu(
     return out
 
 
-@ops.fused_add_rms_norm.register_impl("tpu")
+@ops.fused_add_rms_norm.register_impl("tpu", supports_args=_tpu_add_rms_ok)
 def fused_add_rms_norm_tpu(
     x: Tensor,
     x_residual: Tensor,
