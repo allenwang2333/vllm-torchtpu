@@ -48,10 +48,15 @@ if TYPE_CHECKING:
     TPU_RAIDEN_PREFIX_AWARE_LOAD: bool = False
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
+    TPU_ATTN_MOE_OVERLAP: bool = False
+    TPU_ATTN_MOE_OVERLAP_MIN_TOKENS: int = 8192
+    TPU_MOE_SEQUENCE_PARALLEL: bool = False
+    TPU_TP_HIERARCHICAL_ALL_REDUCE_MIN_TOKENS: int = 0
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_SAMPLING_TOPK_BOUND: int = 64
     TPU_SPARSE_SPEC_SAMPLING: bool = True
+    TPU_MOE_SINGLE_SORT: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -531,6 +536,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # threshold. The knob and its row-count semantics come from
     # tpu-inference PR #2674.
     "ONEHOT_MOE_PERMUTE_THRESHOLD": env_optional_int("ONEHOT_MOE_PERMUTE_THRESHOLD"),
+    "TPU_ATTN_MOE_OVERLAP": env_bool("TPU_ATTN_MOE_OVERLAP", default=False),
+    "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS": env_nonnegative_int(
+        "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS", 8192
+    ),
+    # Shard tokens over TP between attention and MoE: attention reduce-scatters
+    # instead of all-reducing, the router, shared expert, and experts run on
+    # T/tp tokens, and the next layer all-gathers. Qwen3Next/Qwen3.5 MoE with
+    # EP and TP > 1 only. Use with USE_MOE_FUSED_EP_KERNEL=1 at >= 32 concurrent
+    # sequences; it regresses decode below 16.
+    "TPU_MOE_SEQUENCE_PARALLEL": env_bool("TPU_MOE_SEQUENCE_PARALLEL", default=False),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes
@@ -556,6 +571,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # top-k, instead of on the full-vocab logits. Same distributions; the
     # random stream differs.
     "TPU_SPARSE_SPEC_SAMPLING": env_bool("TPU_SPARSE_SPEC_SAMPLING", True),
+    # Build the MoE permutation, its inverse, and the sorted token ids from
+    # one packed sort instead of three. The ragged (counting sort) path ignores it.
+    "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

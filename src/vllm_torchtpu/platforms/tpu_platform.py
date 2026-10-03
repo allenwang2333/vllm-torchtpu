@@ -726,6 +726,30 @@ class TpuPlatform(Platform):
             )
         else:
             compilation_config.compile_sizes = sorted(compilation_config.compile_sizes)
+
+        # Sequence-parallel MoE splits each bucket over TP. Keep buckets that
+        # split evenly into >= 2 rows per rank: a 1-row shard lets Dynamo
+        # specialize the size and refuse the remaining buckets.
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.use_sequence_parallel_moe:
+            archs = vllm_config.model_config.architectures or []
+            if not any(a.startswith(("Qwen3Next", "Qwen3_5Moe")) for a in archs):
+                raise ValueError(
+                    "TPU_MOE_SEQUENCE_PARALLEL=1 is validated only for Qwen3Next "
+                    f"and Qwen3.5 MoE, got {archs}."
+                )
+            if not envs.USE_MOE_FUSED_EP_KERNEL:
+                logger.warning(
+                    "TPU_MOE_SEQUENCE_PARALLEL=1 without USE_MOE_FUSED_EP_KERNEL=1 "
+                    "moves the same collective bytes as the default path."
+                )
+            tp = parallel_config.tensor_parallel_size
+            compilation_config.compile_sizes = [
+                s
+                for s in compilation_config.compile_sizes
+                if s >= 2 * tp and s % tp == 0
+            ]
+
         # Clear compile_ranges_split_points — TPU always pads to exact
         # compile_sizes so catch-all ranges are never used.
         compilation_config.compile_ranges_split_points = []
