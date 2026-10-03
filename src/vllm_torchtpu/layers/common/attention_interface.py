@@ -363,38 +363,110 @@ def sharded_ragged_paged_attention(
         in_specs += (P("model"), )
         args += (attention_sink, )
 
-    # Speculative decoding draft-only VMEM relief: cap the KV-fetch block on the local path.
-    block_kwargs: dict[str, Any] = {}
-    if not shard and kv_block_cap is not None and not use_hd64:
-        page_size = kv_cache.shape[page_size_axis]
-        max_num_seqs = kv_lens.shape[0]
-        pages_per_seq = page_indices.shape[0] // max_num_seqs
-        cap_tokens = max(page_size, (kv_block_cap // page_size) * page_size)
+    def _resolve_rpa_v3_kwargs(
+        local_q: jax.Array,
+        local_k: jax.Array,
+        local_kv_cache: jax.Array,
+        local_kv_lens: jax.Array,
+        local_page_indices: jax.Array,
+        *,
+        cache_page_axis: int = 1,
+        cap_kv_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        max_num_tokens = local_q.shape[0]
+        is_decode_only = max_num_tokens <= envs.VLLM_TPU_PURE_DECODE_MAX_TOKENS
+        kwargs: dict[str, Any] = {
+            "decode_only":
+            is_decode_only,
+            "share_decode_prefix":
+            (is_decode_only and envs.VLLM_TPU_ENABLE_SHARED_PREFIX_DECODE),
+        }
+        has_decode_env = (envs.VLLM_TPU_DECODE_BKV_SZ is not None
+                          or envs.VLLM_TPU_DECODE_BKV_CSZ is not None)
+        has_prefill_env = (envs.VLLM_TPU_PREFILL_BQ_SZ is not None
+                           or envs.VLLM_TPU_PREFILL_BQ_CSZ is not None
+                           or envs.VLLM_TPU_PREFILL_BKV_SZ is not None
+                           or envs.VLLM_TPU_PREFILL_BKV_CSZ is not None)
+        if cap_kv_tokens is None and not has_decode_env and not has_prefill_env:
+            return kwargs
 
-        def _capped(case):
+        page_size = local_kv_cache.shape[cache_page_axis]
+        max_num_seqs = local_kv_lens.shape[0]
+        pages_per_seq = local_page_indices.shape[0] // max_num_seqs
+        max_q = rpa_default.next_power_of_2(max_num_tokens)
+        max_kv = pages_per_seq * page_size
+        cap_tokens = (max(page_size, (cap_kv_tokens // page_size) *
+                          page_size) if cap_kv_tokens is not None else None)
+
+        def _block_sizes_for(
+                case: rpa_default.RpaCase) -> tuple[int, int, int, int]:
             bs = rpa_default.get_default_block_sizes(
-                q.dtype,
-                kv_cache.dtype,
-                q.shape[1],  # actual_num_q_heads
-                k.shape[1],  # actual_num_kv_heads
-                q.shape[2],  # head_dim
+                local_q.dtype,
+                local_kv_cache.dtype,
+                local_q.shape[1],
+                local_k.shape[1],
+                local_q.shape[2],
                 page_size,
-                q.shape[0],  # max_num_tokens
+                max_num_tokens,
                 max_num_seqs,
                 pages_per_seq,
                 case=case,
             )
-            bkv = min(bs["bkv_sz"], cap_tokens)
-            bkv_csz = min(bs["bkv_csz"], bkv)
-            return (bs["bq_sz"], bkv, bs["bq_csz"], bkv_csz)
+            bq_sz, bkv_sz, bq_csz, bkv_csz = (
+                bs["bq_sz"],
+                bs["bkv_sz"],
+                bs["bq_csz"],
+                bs["bkv_csz"],
+            )
+            if case == rpa_default.RpaCase.DECODE:
+                if envs.VLLM_TPU_DECODE_BKV_SZ is not None:
+                    bkv_sz = min(envs.VLLM_TPU_DECODE_BKV_SZ, max_kv)
+                if envs.VLLM_TPU_DECODE_BKV_CSZ is not None:
+                    bkv_csz = min(envs.VLLM_TPU_DECODE_BKV_CSZ, bkv_sz)
+                bkv_csz = rpa_default.align_to(bkv_csz, page_size)
+                bkv_sz = rpa_default.align_to(bkv_sz, bkv_csz)
+            else:
+                if envs.VLLM_TPU_PREFILL_BQ_SZ is not None:
+                    bq_sz = min(envs.VLLM_TPU_PREFILL_BQ_SZ, max_q)
+                if envs.VLLM_TPU_PREFILL_BQ_CSZ is not None:
+                    bq_csz = min(envs.VLLM_TPU_PREFILL_BQ_CSZ, max_q)
+                if envs.VLLM_TPU_PREFILL_BKV_SZ is not None:
+                    bkv_sz = min(envs.VLLM_TPU_PREFILL_BKV_SZ, max_kv)
+                if envs.VLLM_TPU_PREFILL_BKV_CSZ is not None:
+                    bkv_csz = min(envs.VLLM_TPU_PREFILL_BKV_CSZ,
+                                  rpa_default.align_to(max_kv // 2, page_size))
+                bkv_csz = rpa_default.align_to(bkv_csz, min(page_size, 128))
+                bkv_sz = rpa_default.align_to(bkv_sz, page_size)
+                if bkv_sz % bkv_csz != 0:
+                    bkv_sz = rpa_default.align_to(bkv_sz, bkv_csz)
+            if cap_tokens is not None:
+                bkv_sz = min(bkv_sz, cap_tokens)
+                bkv_csz = min(bkv_csz, bkv_sz)
+            bq_csz = max(1, min(bq_csz, bq_sz))
+            bq_sz = max(1, rpa_default.align_to(bq_sz, bq_csz))
+            return (bq_sz, bkv_sz, bq_csz, bkv_csz)
 
-        block_kwargs["d_block_sizes"] = _capped(rpa_default.RpaCase.DECODE)
-        block_kwargs["m_block_sizes"] = _capped(rpa_default.RpaCase.MIXED)
-        if attention_chunk_size is not None:
-            block_kwargs["p_block_sizes"] = _capped(
-                rpa_default.RpaCase.PREFILL)
+        if cap_tokens is not None or has_decode_env:
+            kwargs["d_block_sizes"] = _block_sizes_for(
+                rpa_default.RpaCase.DECODE)
+        if cap_tokens is not None or has_prefill_env:
+            kwargs["m_block_sizes"] = _block_sizes_for(
+                rpa_default.RpaCase.MIXED)
+            if attention_chunk_size is not None:
+                kwargs["p_block_sizes"] = _block_sizes_for(
+                    rpa_default.RpaCase.PREFILL)
+        return kwargs
 
     def _ragged_paged_attention(*args):
+        block_kwargs = (_resolve_rpa_v3_kwargs(
+            args[0],
+            args[1],
+            args[3],
+            args[4],
+            args[5],
+            cache_page_axis=page_size_axis,
+            cap_kv_tokens=kv_block_cap if not shard else None,
+        ) if func is ragged_paged_attention else {})
         return func(
             *args,
             sm_scale=sm_scale,
@@ -473,6 +545,7 @@ def attention_bundled(
 
     def _run(q, k, v, kv_cache_bundle, layer_idx, seq_lens, block_tables,
              query_start_loc, request_distribution):
+        is_decode_only = q.shape[0] <= envs.VLLM_TPU_PURE_DECODE_MAX_TOKENS
         output, new_bundle = ragged_paged_attention_bundled(
             q,
             k,
@@ -489,7 +562,10 @@ def attention_bundled(
             use_causal_mask=use_causal_mask,
             q_scale=q_scale,
             k_scale=k_scale,
-            v_scale=v_scale)
+            v_scale=v_scale,
+            decode_only=is_decode_only,
+            share_decode_prefix=(is_decode_only and
+                                 envs.VLLM_TPU_ENABLE_SHARED_PREFIX_DECODE))
         return new_bundle, output
 
     # Shard across KV heads along the TPU "model" axis (Tensor Parallelism):
