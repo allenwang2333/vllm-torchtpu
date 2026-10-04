@@ -13,6 +13,11 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+# Run ZImageTransformerBlock.forward through torch.compile(backend="tpu")
+# (one compiled function shared by all blocks). Falls back to eager if the
+# compiled path raises.
+_ZIMAGE_BLOCK_COMPILE = True
+
 
 def _unwrap_tpu_patch(fn: Any) -> Any:
     """Return the underlying unpatched callable if ``fn`` was wrapped by TPU patches."""
@@ -138,6 +143,16 @@ def _rope_matrices(
     return r.to(dtype=dtype, device=device), e.to(dtype=dtype, device=device)
 
 
+def _rope_matrices_const(
+    head_dim: int, interleaved: bool, dtype: torch.dtype, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``_rope_matrices`` resolved eagerly while dynamo traces (trace-time constant)."""
+    return _rope_matrices(head_dim, interleaved, dtype, device)
+
+
+_rope_matrices_const = torch._dynamo.assume_constant_result(_rope_matrices_const)
+
+
 def _tpu_apply_rotary(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool
 ) -> torch.Tensor:
@@ -149,7 +164,7 @@ def _tpu_apply_rotary(
     matmul with a fused elementwise epilogue.
     """
     head_dim = x.shape[-1]
-    r, e = _rope_matrices(head_dim, interleaved, x.dtype, x.device)
+    r, e = _rope_matrices_const(head_dim, interleaved, x.dtype, x.device)
     cos_full = (cos @ e).unsqueeze(-2)  # [seq, 1, head_dim], broadcast over heads
     sin_full = (sin @ e).unsqueeze(-2)
     return x * cos_full + (x @ r) * sin_full
@@ -330,6 +345,23 @@ def _patch_z_image_transformer_block_flush() -> None:
     # REMOVAL CONDITION: torch_tpu's repeated-op detector aligns splits to
     # module boundaries (or avoids materializing dead stack temporaries), or
     # vLLM-Omni compiles ZImageTransformer2DModel with torch.compile.
+    #
+    # Regional torch.compile (second part of this patch): even with one XLA
+    # module per block, the eager DEFER_AND_FUSE path still *traces* ~65 aten
+    # ops per block on the host each step. At sp>=2 the device finishes a
+    # block faster than the host can trace the next one, so the step time
+    # (~87 ms at sp=2/4) is the host-tracing floor and does not improve with
+    # more chips. vLLM-Omni's own ``regionally_compile`` is skipped on TPU
+    # (``supports_torch_inductor()`` is False, and its default
+    # ``dynamic=True`` is wrong for XLA), so the block forward is compiled
+    # here with ``torch.compile(backend="tpu", dynamic=False)``: one compiled
+    # function shared by all blocks, one static graph per distinct block
+    # input shape (noise_refiner S=4096, context_refiner S=32, sharded layers,
+    # plus warmup shapes), replayed per step with ~zero host tracing. The
+    # Ulysses ``all_to_all_single`` collectives compile inside the graph.
+    # Any failure of the compiled path logs once and falls back to eager.
+    # REMOVAL CONDITION: vLLM-Omni's diffusion_model_runner compiles blocks on
+    # TPU itself (with dynamic=False).
     # -------------------------------------------------------------------------
     try:
         z_img_mod = importlib.import_module(
@@ -398,6 +430,26 @@ def _patch_z_image_transformer_block_flush() -> None:
         model_cls.forward = _mark_tpu_patch(_model_forward, orig_model_forward)
 
     orig_forward = _unwrap_tpu_patch(block_cls.forward)
+    compile_state: dict[str, Any] = {"enabled": _ZIMAGE_BLOCK_COMPILE, "fn": None}
+
+    def _compiled_forward() -> Any:
+        if compile_state["fn"] is None:
+            # dynamic=False gives one static graph per distinct block input
+            # shape: vLLM-Omni's warmup shapes, noise_refiner (S=4096),
+            # context_refiner (S=32) and the (SP-sharded) layers. That exceeds
+            # dynamo's default limit of 8 recompiles per code object, after
+            # which new shapes silently run eagerly.
+            cfg = torch._dynamo.config
+            for attr in ("recompile_limit", "cache_size_limit"):
+                if (
+                    isinstance(getattr(cfg, attr, None), int)
+                    and getattr(cfg, attr) < 64
+                ):
+                    setattr(cfg, attr, 64)
+            compile_state["fn"] = torch.compile(
+                orig_forward, backend="tpu", dynamic=False
+            )
+        return compile_state["fn"]
 
     def _forward_and_flush(self: Any, *args: Any, **kwargs: Any) -> Any:
         x = args[0] if args else kwargs.get("x")
@@ -409,7 +461,20 @@ def _patch_z_image_transformer_block_flush() -> None:
         # layers[0] have layer_id == 0.
         if on_tpu and getattr(self, "layer_id", None) in (0, 1000):
             _tpu_materialize_async(None)
-        out = orig_forward(self, *args, **kwargs)
+        if on_tpu and compile_state["enabled"]:
+            try:
+                out = _compiled_forward()(self, *args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 - keep the model usable
+                logger.warning(
+                    "torch.compile(backend='tpu') of ZImageTransformerBlock failed "
+                    "(%s); running the block eagerly from now on.",
+                    type(exc).__name__,
+                    exc_info=True,
+                )
+                compile_state["enabled"] = False
+                out = orig_forward(self, *args, **kwargs)
+        else:
+            out = orig_forward(self, *args, **kwargs)
         if on_tpu and isinstance(out, torch.Tensor):
             _tpu_materialize_async(out)
         return out
@@ -417,7 +482,8 @@ def _patch_z_image_transformer_block_flush() -> None:
     block_cls.forward = _mark_tpu_patch(_forward_and_flush, orig_forward)
     logger.info(
         "Applied TPU patch: async per-block graph flush around "
-        "ZImageTransformerBlock.forward."
+        "ZImageTransformerBlock.forward (torch.compile(backend='tpu'): %s).",
+        "on" if compile_state["enabled"] else "off",
     )
 
 

@@ -143,6 +143,45 @@ class TestZImageComponentsOnTpu:
         assert tpu_out.shape == (batch_size, seq_len, num_heads, head_size)
         _assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
 
+    def test_z_image_splash_attention_compiles_without_graph_breaks(self):
+        """Splash path traces into one graph under torch.compile(backend="tpu").
+
+        The DiT blocks are compiled regionally; the splash custom op must be
+        reachable by dynamo (op name as a trace-time constant resolved through
+        ``torch.ops.pallas``) or every block would graph-break / fall back to
+        eager. Uses the main-block geometry (S=4128 padded to 4224).
+        """
+        from vllm_torchtpu.omni.attention import can_use_splash_attention
+
+        torch.manual_seed(0)
+        num_heads, head_size, seq_len = 30, 128, 4128
+        impl = TpuSDPAImpl(
+            num_heads=num_heads,
+            head_size=head_size,
+            softmax_scale=1.0 / math.sqrt(head_size),
+        )
+        q, k, v = (
+            torch.randn(1, seq_len, num_heads, head_size, dtype=torch.bfloat16).to(
+                "tpu"
+            )
+            for _ in range(3)
+        )
+        assert can_use_splash_attention(q, k, v, None, False)
+
+        eager_out = impl.forward(q, k, v)
+        torch._dynamo.reset()
+        explanation = torch._dynamo.explain(impl.forward)(q, k, v)
+        assert explanation.graph_break_count == 0, explanation.break_reasons
+        assert explanation.graph_count == 1
+
+        torch._dynamo.reset()
+        compiled = torch.compile(impl.forward, backend="tpu", dynamic=False)
+        compiled_out = compiled(q, k, v)
+        assert compiled_out.shape == eager_out.shape
+        torch.testing.assert_close(
+            compiled_out.float().cpu(), eager_out.float().cpu(), atol=0.0, rtol=0.0
+        )
+
     def test_z_image_unified_prepare_auto_pad_canary(self):
         """Canary: TPU patch enables ``auto_pad=True`` on ``unified_prepare``.
 

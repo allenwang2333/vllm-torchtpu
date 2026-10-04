@@ -189,6 +189,21 @@ def _padding_segment_ids(q: Any, k: Any, valid_len: int) -> Any:
     return splash_kernel.SegmentIds(q=zero_q, kv=zero_k + is_pad.astype(jnp.int32))
 
 
+def _splash_op_name(
+    num_heads: int,
+    seq_len: int,
+    valid_len: int,
+    block_q: int,
+    block_kv: int,
+    block_kv_compute: int,
+) -> str:
+    """Name of the splash custom op inside the ``pallas`` namespace."""
+    return (
+        f"omni_splash_attention_h{num_heads}_s{seq_len}_v{valid_len}"
+        f"_q{block_q}_kv{block_kv}_c{block_kv_compute}"
+    )
+
+
 @functools.cache
 def _splash_attention_op(
     num_heads: int,
@@ -241,9 +256,8 @@ def _splash_attention_op(
     def _splash_core(q: jax.Array, k: jax.Array, v: jax.Array) -> jax.Array:
         return jax.vmap(_one_batch)(q, k, v)
 
-    name = (
-        f"pallas::omni_splash_attention_h{num_heads}_s{seq_len}_v{valid_len}"
-        f"_q{block_q}_kv{block_kv}_c{block_kv_compute}"
+    name = "pallas::" + _splash_op_name(
+        num_heads, seq_len, valid_len, block_q, block_kv, block_kv_compute
     )
     op = pallas.jax_op(name, _splash_core)
     op.register_fake(lambda q, k, v: torch.empty_like(q))
@@ -257,6 +271,37 @@ def _splash_attention_op(
         block_kv_compute,
     )
     return op
+
+
+def _splash_attention_op_name(
+    num_heads: int,
+    seq_len: int,
+    valid_len: int,
+    block_q: int,
+    block_kv: int,
+    block_kv_compute: int,
+) -> str:
+    """Ensure the splash op for this shape is registered and return its name.
+
+    Marked ``assume_constant_result`` so that under ``torch.compile`` dynamo
+    runs the (cached) JAX kernel builder eagerly at trace time and only sees a
+    string constant; the op itself is then resolved through
+    ``torch.ops.pallas.<name>``, which dynamo traces natively. Returning the
+    ``CustomOpDef`` (or its ``OpOverload``) as the constant does not work:
+    dynamo wants a guard on the callable and ``ConstantSource.make_guard``
+    raises ``NotImplementedError``.
+    """
+    _splash_attention_op(
+        num_heads, seq_len, valid_len, block_q, block_kv, block_kv_compute
+    )
+    return _splash_op_name(
+        num_heads, seq_len, valid_len, block_q, block_kv, block_kv_compute
+    )
+
+
+_splash_attention_op_name = torch._dynamo.assume_constant_result(
+    _splash_attention_op_name
+)
 
 
 class TpuSDPAImpl(SDPAImpl):
@@ -282,8 +327,11 @@ class TpuSDPAImpl(SDPAImpl):
         plan = splash_plan(seq_len)
         assert plan is not None  # guaranteed by can_use_splash_attention
         padded_len, (block_q, block_kv, block_kv_compute) = plan
-        op = _splash_attention_op(
-            num_heads, padded_len, seq_len, block_q, block_kv, block_kv_compute
+        op = getattr(
+            torch.ops.pallas,
+            _splash_attention_op_name(
+                num_heads, padded_len, seq_len, block_q, block_kv, block_kv_compute
+            ),
         )
         # [b, s, h, d] -> [b, h, s, d]; fold the softmax scale into q so one
         # op serves every layer regardless of scale.

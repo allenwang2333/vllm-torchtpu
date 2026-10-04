@@ -434,14 +434,12 @@ def test_flow_match_scheduler_step_flush(monkeypatch):
     assert sched2._step_index is None
 
 
-def test_z_image_transformer_block_flush(monkeypatch):
-    """ZImageTransformerBlock.forward flushes setup on 0/1000 and output per block."""
+def _install_fake_z_image(monkeypatch, events):
+    """Fake ``z_image_transformer`` + ``forward_context`` modules for patch tests."""
     import dataclasses
     from types import SimpleNamespace
 
     from vllm_torchtpu.omni import patches as omni_patches
-
-    events = []
 
     @dataclasses.dataclass(frozen=True)
     class _SPInput:
@@ -492,6 +490,23 @@ def test_z_image_transformer_block_flush(monkeypatch):
         "_tpu_materialize_async",
         lambda t=None: events.append(("flush", t)) or True,
     )
+    return _Block, _Model, fake_ctx
+
+
+def _fake_tpu_block_input():
+    tpu_x = MagicMock(spec=torch.Tensor)
+    tpu_x.device = MagicMock()
+    tpu_x.device.type = "tpu"
+    return tpu_x
+
+
+def test_z_image_transformer_block_flush(monkeypatch):
+    """ZImageTransformerBlock.forward flushes setup on 0/1000 and output per block."""
+    from vllm_torchtpu.omni import patches as omni_patches
+
+    events = []
+    _Block, _Model, fake_ctx = _install_fake_z_image(monkeypatch, events)
+    monkeypatch.setattr(omni_patches, "_ZIMAGE_BLOCK_COMPILE", False)
 
     orig_forward = _Block.forward
     orig_model_forward = _Model.forward
@@ -513,9 +528,7 @@ def test_z_image_transformer_block_flush(monkeypatch):
     _Model(hooks={"_sp_input_hook_unified_prepare": object()}).forward("x")
     assert fake_ctx.sp_plan_hooks_applied is True
 
-    tpu_x = MagicMock(spec=torch.Tensor)
-    tpu_x.device = MagicMock()
-    tpu_x.device.type = "tpu"
+    tpu_x = _fake_tpu_block_input()
     cpu_x = torch.zeros(1)
 
     assert _Block(1000).forward(tpu_x) is tpu_x
@@ -532,6 +545,88 @@ def test_z_image_transformer_block_flush(monkeypatch):
         ("forward", 1),
         ("flush", tpu_x),
         ("forward", 0),
+    ]
+
+
+def test_z_image_transformer_block_compile(monkeypatch):
+    """TPU blocks run through one shared torch.compile(backend="tpu") function.
+
+    CPU inputs bypass it, and a failing compiled call falls back to eager for
+    the rest of the process (the block is never compiled again).
+    """
+    from vllm_torchtpu.omni import patches as omni_patches
+
+    events = []
+    _Block, _, _ = _install_fake_z_image(monkeypatch, events)
+    monkeypatch.setattr(omni_patches, "_ZIMAGE_BLOCK_COMPILE", True)
+
+    compile_calls = []
+
+    def fake_compile(fn, *, backend, dynamic):
+        compile_calls.append((fn, backend, dynamic))
+
+        def compiled(*args, **kwargs):
+            events.append(("compiled",))
+            return fn(*args, **kwargs)
+
+        return compiled
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    dynamo_cfg = torch._dynamo.config
+    limit_attr = next(
+        (a for a in ("recompile_limit", "cache_size_limit") if hasattr(dynamo_cfg, a)),
+        None,
+    )
+    if limit_attr is not None:
+        monkeypatch.setattr(dynamo_cfg, limit_attr, 8)
+
+    orig_forward = _Block.forward
+    omni_patches._patch_z_image_transformer_block_flush()
+    tpu_x = _fake_tpu_block_input()
+    cpu_x = torch.zeros(1)
+
+    assert _Block(1000).forward(tpu_x) is tpu_x
+    assert _Block(1).forward(tpu_x) is tpu_x
+    assert _Block(0).forward(cpu_x) is cpu_x
+    # One compiled function (dynamic=False, tpu backend) shared by all blocks.
+    assert [(f is orig_forward, b, d) for f, b, d in compile_calls] == [
+        (True, "tpu", False)
+    ]
+    if limit_attr is not None:
+        assert getattr(dynamo_cfg, limit_attr) >= 64
+    assert events == [
+        ("flush", None),
+        ("compiled",),
+        ("forward", 1000),
+        ("flush", tpu_x),
+        ("compiled",),
+        ("forward", 1),
+        ("flush", tpu_x),
+        ("forward", 0),
+    ]
+
+    # A failing compiled call falls back to eager and disables compilation.
+    events.clear()
+    compile_calls.clear()
+
+    def failing_compile(fn, *, backend, dynamic):
+        compile_calls.append((fn, backend, dynamic))
+
+        def compiled(*args, **kwargs):
+            raise RuntimeError("backend exploded")
+
+        return compiled
+
+    monkeypatch.setattr(torch, "compile", failing_compile)
+    omni_patches._patch_z_image_transformer_block_flush()  # fresh compile_state
+    assert _Block(1).forward(tpu_x) is tpu_x
+    assert _Block(2).forward(tpu_x) is tpu_x
+    assert len(compile_calls) == 1
+    assert events == [
+        ("forward", 1),
+        ("flush", tpu_x),
+        ("forward", 2),
+        ("flush", tpu_x),
     ]
 
 
