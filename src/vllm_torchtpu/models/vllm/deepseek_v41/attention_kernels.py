@@ -490,7 +490,8 @@ def _threshold_top_k(scores: jax.Array, k: int) -> jax.Array:
     breaks ties at it by lowest index (as top_k does), then compacts.
     """
     rows = scores.shape[0]
-    scores = jnp.where(scores == 0, 0.0, scores)  # top_k ties -0.0 with +0.0
+    # No -0.0 -> +0.0 folding: top_k ranks +0.0 above -0.0 (TPU and CPU), as
+    # does the order-preserving key below.
     bits = jax.lax.bitcast_convert_type(scores, jnp.int32)
     key = jnp.where(bits < 0, bits ^ jnp.int32(0x7FFFFFFF), bits) ^ jnp.int32(-(2**31))
     key = jax.lax.bitcast_convert_type(key, jnp.uint32)
