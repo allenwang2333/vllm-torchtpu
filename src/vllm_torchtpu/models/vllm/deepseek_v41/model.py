@@ -524,13 +524,12 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
             or vllm_config.parallel_config.data_parallel_size != 1
         ):
             raise NotImplementedError("V4.1 TPU currently requires PP1 and DP1")
-        if (
-            vllm_config.speculative_config is not None
-            or vllm_config.scheduler_config.async_scheduling
-        ):
-            raise NotImplementedError(
-                "V4.1 TPU currently requires synchronous scheduling without speculation"
-            )
+        if vllm_config.speculative_config is not None:
+            raise NotImplementedError("V4.1 TPU currently requires no speculation")
+        if vllm_config.scheduler_config.async_scheduling:
+            from .async_fence import install_lookback_fence
+
+            install_lookback_fence()
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         # TPU's existing FP8 linear adapter registers weight_scale_inv; the
         # NVIDIA MXFP8 adapter selected by upstream uses weight_scale instead.
