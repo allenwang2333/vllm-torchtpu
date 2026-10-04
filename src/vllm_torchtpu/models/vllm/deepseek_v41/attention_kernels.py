@@ -276,8 +276,13 @@ def sparse_fp8_attention_jax(
         sparse_ragged_paged_attention,
     )
 
-    maximum, denominator, numerator = _attend_window(
-        q, swa_pool, swa_records, _attention_state(q), scale
+    state = _attend_window(q, swa_pool, swa_records, _attention_state(q), scale)
+    # The SWA conditional holds SparseCore gathers, and XLA completes every
+    # in-flight `sc_csa_gather` before such a conditional: the TensorCore then
+    # idles through the whole gather chain (sc_gather_diag.md). Launch the CSA
+    # gathers after SWA instead so they pipeline with the SparseMLA chunks.
+    (maximum, denominator, numerator), main_pool, rope_pool = (
+        jax.lax.optimization_barrier((state, main_pool, rope_pool))
     )
     count = main_pool.shape[0] // page_size
     return sparse_ragged_paged_attention(
