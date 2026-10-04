@@ -373,7 +373,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )
         self._config = vllm_config.model_config.hf_config.to_dict()
         self._max_model_len = vllm_config.model_config.max_model_len
-        self._max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        # Branch-free SWA patch (`_attend_window`) only while its static
+        # capacity, 63 tokens per extra request, stays small. Measured
+        # (tpu7x-2): max_num_seqs 1 +4.6%, 4 +1.6%, 8 -4.3% prefill.
+        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        self._swa_max_requests = max_num_seqs if max_num_seqs <= 4 else None
         object.__setattr__(self, "mla_attn", self)
         self._prepare_and_attn_fn = self._prepare_tpu
 
@@ -664,7 +668,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     self.scale,
                     pages,
                     starts,
-                    self._max_num_seqs,
+                    self._swa_max_requests,
                 )
             else:
                 result = paged_attention(
