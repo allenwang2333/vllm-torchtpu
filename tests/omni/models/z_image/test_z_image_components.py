@@ -170,6 +170,81 @@ class TestZImageComponentsOnTpu:
                 f"_sp_plan['unified_prepare'][{idx}].auto_pad was not promoted to True"
             )
 
+    def test_z_image_encode_prompt_canary(self):
+        """Canary: upstream ``_encode_prompt`` still matches the TPU mirror.
+
+        ``_patch_z_image_prompt_encoder_tpu`` re-implements the tokenization of
+        ``ZImagePipeline._encode_prompt`` and replaces its text-encoder call by a
+        compiled program that yields ``hidden_states[-2]``. If upstream changes
+        any of the mirrored details, this test fails so the patch is revisited.
+        """
+        import inspect
+
+        from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
+
+        from vllm_torchtpu.omni.patches import _unwrap_tpu_patch
+
+        src = inspect.getsource(_unwrap_tpu_patch(ZImagePipeline._encode_prompt))
+        # Whitespace-insensitive view for the multi-line chat-message literal.
+        src_flat = " ".join(src.split())
+        assert '[{"role": "user", "content": prompt_item}]' in src_flat.replace(
+            "[ {", "[{"
+        ).replace("}, ]", "}]"), (
+            "upstream ZImagePipeline._encode_prompt changed (chat message literal); "
+            "update _patch_z_image_prompt_encoder_tpu"
+        )
+        for needle in (
+            "add_generation_prompt=True",
+            "enable_thinking=True",
+            'padding="max_length"',
+            "max_length=max_sequence_length",
+            "truncation=True",
+            "output_hidden_states=True",
+            ".hidden_states[-2]",
+            "prompt_embeds[i][prompt_masks[i]]",
+        ):
+            assert needle in src, (
+                f"upstream ZImagePipeline._encode_prompt changed ({needle!r} missing); "
+                "update _patch_z_image_prompt_encoder_tpu"
+            )
+
+    def test_compiled_prompt_encoder_matches_hf_hidden_states(self):
+        """``_TpuCompiledPromptEncoder`` == HF ``hidden_states[-2]`` on TPU."""
+        pytest.importorskip("transformers")
+        from transformers import Qwen3Config, Qwen3ForCausalLM
+
+        from vllm_torchtpu.omni.patches import _TpuCompiledPromptEncoder
+
+        torch.manual_seed(0)
+        config = Qwen3Config(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=96,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=64,
+            attn_implementation="sdpa",
+        )
+        model = Qwen3ForCausalLM(config).to(torch.float32).to("tpu").eval()
+        input_ids = torch.randint(0, 128, (2, 16)).to("tpu")
+        attention_mask = torch.tensor([[1] * 10 + [0] * 6, [1] * 16], dtype=torch.long)
+
+        with torch.no_grad():
+            ref = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask.to("tpu").bool(),
+                output_hidden_states=True,
+            ).hidden_states[-2]
+        out = _TpuCompiledPromptEncoder(model)(input_ids, attention_mask)
+
+        assert out.shape == ref.shape == (2, 16, 64)
+        torch.testing.assert_close(
+            out[0, :10].cpu(), ref[0, :10].cpu(), atol=1e-4, rtol=1e-4
+        )
+        torch.testing.assert_close(out[1].cpu(), ref[1].cpu(), atol=1e-4, rtol=1e-4)
+
     @pytest.mark.parametrize(
         ("ulysses_degree", "expected_mode"),
         [(8, "advanced_uaa"), (4, "advanced_uaa"), (2, "strict"), (1, "strict")],

@@ -104,6 +104,7 @@ def apply_omni_tpu_patches() -> None:
     _patch_group_norm_tpu()
     _patch_rotary_embedding_tpu()
     _patch_z_image_transformer_block_flush()
+    _patch_z_image_prompt_encoder_tpu()
 
 
 @functools.cache
@@ -486,6 +487,189 @@ def _patch_flow_match_scheduler_step_flush() -> None:
     )
 
 
+class _TpuCompiledPromptEncoder:
+    """``hidden_states[-2]`` of a HF decoder-only LM as one compiled TPU program.
+
+    Z-Image conditions on the penultimate hidden state of its Qwen3 text
+    encoder, so the last decoder layer, the final norm and ``lm_head`` never
+    reach the output and are skipped. Positions are ``arange`` and the mask is
+    causal & key-padding, which is exactly what ``Qwen3Model.forward`` derives
+    for a padded ``attention_mask`` when no ``position_ids`` are given.
+    """
+
+    def __init__(self, text_encoder: Any) -> None:
+        get_decoder = getattr(text_encoder, "get_decoder", None)
+        decoder = get_decoder() if callable(get_decoder) else text_encoder.model
+        self._embed_tokens = decoder.embed_tokens
+        self._rotary_emb = decoder.rotary_emb
+        self._layers = list(decoder.layers)[:-1]
+        self._compiled = torch.compile(self._forward, backend="tpu", dynamic=False)
+
+    def _forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden = self._embed_tokens(input_ids)
+        position_embeddings = self._rotary_emb(hidden, position_ids)
+        for layer in self._layers:
+            hidden = layer(
+                hidden,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )
+            if isinstance(hidden, tuple):
+                hidden = hidden[0]
+        return hidden
+
+    @staticmethod
+    def build_mask(attention_mask: torch.Tensor) -> torch.Tensor:
+        """``[B, 1, S, S]`` bool mask: causal & key padding, diagonal always kept.
+
+        Keeping the diagonal means padded query rows are never fully masked
+        (no NaN rows); their outputs are sliced away by the caller anyway.
+        """
+        seq = attention_mask.shape[-1]
+        eye = torch.eye(seq, dtype=torch.bool, device=attention_mask.device)
+        causal = torch.ones_like(eye).tril()
+        return (causal & attention_mask.bool()[:, None, None, :]) | eye
+
+    def __call__(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        bsz, seq = input_ids.shape
+        device = input_ids.device
+        mask = self.build_mask(attention_mask).to(device)
+        position_ids = torch.arange(seq).unsqueeze(0).expand(bsz, seq).to(device)
+        with torch.no_grad():
+            return self._compiled(input_ids, mask, position_ids)
+
+
+def _patch_z_image_prompt_encoder_tpu() -> None:
+    # -------------------------------------------------------------------------
+    # Root cause (torch_tpu op-by-op lazy tracing of a 36-layer HF model):
+    # ``ZImagePipeline._encode_prompt`` runs the Qwen3-4B text encoder eagerly.
+    # Each image pays ~55 ms of host time while the 36 decoder layers are traced
+    # into ~250 small XLA modules (device busy for only ~10 ms of it), then
+    # ``prompt_embeds[i][prompt_masks[i]]`` performs a data-dependent boolean
+    # index that forces a device->host readback before the denoise loop can be
+    # traced. The encoder input is already a static ``[B, max_sequence_length]``
+    # (``padding="max_length"``), so the whole encoder compiles once per shape.
+    #
+    # Fix: on TPU, compute ``hidden_states[-2]`` with one
+    # ``torch.compile(backend="tpu", dynamic=False)`` program over the first
+    # ``num_layers - 1`` decoder layers (the last layer, final norm and lm_head
+    # do not contribute to that output) and slice the valid tokens with the
+    # host-side ``attention_mask`` (no readback). The tokenization mirrors
+    # upstream line for line; ``test_z_image_components.py`` carries a canary
+    # that fails if upstream's ``_encode_prompt`` changes.
+    #
+    # REMOVAL CONDITION: vLLM-Omni compiles its diffusion text encoders through
+    # the platform compile hook (``supports_torch_inductor`` equivalent for the
+    # ``"tpu"`` backend) or drops the boolean-mask gather.
+    # -------------------------------------------------------------------------
+    try:
+        pipe_mod = importlib.import_module(
+            "vllm_omni.diffusion.models.z_image.pipeline_z_image"
+        )
+        pipe_cls = pipe_mod.ZImagePipeline
+    except Exception:  # noqa: BLE001 - vllm_omni is an omni extra
+        logger.warning(
+            "vllm_omni pipeline_z_image module not importable; "
+            "prompt encoder patch skipped."
+        )
+        return
+
+    orig_encode_prompt = _unwrap_tpu_patch(pipe_cls._encode_prompt)
+
+    def _get_encoder(pipe: Any) -> _TpuCompiledPromptEncoder | None:
+        encoder = getattr(pipe, "_tpu_prompt_encoder", None)
+        if encoder is None:
+            try:
+                encoder = _TpuCompiledPromptEncoder(pipe.text_encoder)
+            except Exception as exc:  # noqa: BLE001 - unexpected encoder layout
+                logger.warning(
+                    "Z-Image text encoder %s not supported by the compiled TPU "
+                    "prompt encoder (%s); using the eager path.",
+                    type(pipe.text_encoder).__name__,
+                    exc,
+                )
+                encoder = False
+            pipe._tpu_prompt_encoder = encoder
+        return encoder or None
+
+    def _encode_prompt(
+        self: Any,
+        prompt: Any,
+        device: torch.device | None = None,
+        prompt_embeds: Any = None,
+        max_sequence_length: int = 512,
+    ) -> Any:
+        device = device or self._execution_device
+        encoder = None
+        if prompt_embeds is None and getattr(device, "type", None) == "tpu":
+            encoder = _get_encoder(self)
+        if encoder is None:
+            return orig_encode_prompt(
+                self,
+                prompt,
+                device=device,
+                prompt_embeds=prompt_embeds,
+                max_sequence_length=max_sequence_length,
+            )
+
+        prompts = [prompt] if isinstance(prompt, str) else list(prompt)
+        prompts = [
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt_item}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+            for prompt_item in prompts
+        ]
+        text_inputs = self.tokenizer(
+            prompts,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        attention_mask = text_inputs.attention_mask
+        try:
+            hidden = encoder(text_inputs.input_ids.to(device), attention_mask)
+            embeddings_list = []
+            for i in range(hidden.shape[0]):
+                valid = attention_mask[i].nonzero().flatten()
+                start = int(valid[0]) if valid.numel() else 0
+                stop = int(valid[-1]) + 1 if valid.numel() else 0
+                if stop - start == valid.numel():
+                    # Contiguous padding: a static slice, no device->host readback.
+                    embeddings_list.append(hidden[i, start:stop])
+                else:
+                    embeddings_list.append(hidden[i][attention_mask[i].bool()])
+        except Exception as exc:  # noqa: BLE001 - keep the pipeline usable
+            logger.warning(
+                "Compiled Z-Image prompt encoder failed (%s); falling back to "
+                "the eager text encoder.",
+                exc,
+            )
+            self._tpu_prompt_encoder = False
+            return orig_encode_prompt(
+                self,
+                prompt,
+                device=device,
+                prompt_embeds=prompt_embeds,
+                max_sequence_length=max_sequence_length,
+            )
+        return embeddings_list
+
+    pipe_cls._encode_prompt = _mark_tpu_patch(_encode_prompt, orig_encode_prompt)
+    logger.info("Applied TPU patch: compiled Qwen3 prompt encoder for ZImagePipeline.")
+
+
 @run_once
 def apply_omni_model_specific_patches() -> None:
     """Apply model-specific runtime patches."""
@@ -555,6 +739,7 @@ def apply_omni_model_specific_patches() -> None:
 
     _patch_rotary_embedding_tpu()
     _patch_z_image_transformer_block_flush()
+    _patch_z_image_prompt_encoder_tpu()
 
 
 @run_once

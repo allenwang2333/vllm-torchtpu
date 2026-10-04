@@ -535,6 +535,133 @@ def test_z_image_transformer_block_flush(monkeypatch):
     ]
 
 
+def test_tpu_prompt_encoder_build_mask():
+    from vllm_torchtpu.omni.patches import _TpuCompiledPromptEncoder
+
+    mask = _TpuCompiledPromptEncoder.build_mask(
+        torch.tensor([[1, 1, 0, 0], [0, 1, 1, 1]])
+    )
+    assert mask.shape == (2, 1, 4, 4) and mask.dtype == torch.bool
+    causal = torch.ones(4, 4, dtype=torch.bool).tril()
+    # Right padding: causal & key padding; padded query rows keep the diagonal.
+    assert torch.equal(
+        mask[0, 0],
+        causal & torch.tensor([True, True, False, False])
+        | torch.eye(4, dtype=torch.bool),
+    )
+    # Left padding: the first (padded) row is not fully masked.
+    assert mask[1, 0, 0].tolist() == [True, False, False, False]
+    assert torch.equal(
+        mask[1, 0, 1:], causal[1:] & torch.tensor([False, True, True, True])
+    )
+
+
+def test_z_image_prompt_encoder_patch(monkeypatch):
+    """ZImagePipeline._encode_prompt uses the compiled encoder on TPU only."""
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.omni import patches as omni_patches
+
+    calls = []
+    hidden = torch.arange(2 * 5 * 3, dtype=torch.float32).view(2, 5, 3)
+
+    class _Tokenizer:
+        def __init__(self, masks):
+            self._masks = masks
+
+        def apply_chat_template(self, messages, **kwargs):
+            calls.append(("template", messages[0]["content"], kwargs))
+            return "<chat>" + messages[0]["content"]
+
+        def __call__(self, prompts, **kwargs):
+            calls.append(("tokenize", list(prompts), kwargs))
+            ids = MagicMock()
+            ids.to.return_value = "ids_on_tpu"
+            return SimpleNamespace(input_ids=ids, attention_mask=self._masks)
+
+    class _Pipeline:
+        def __init__(self, masks):
+            self.tokenizer = _Tokenizer(masks)
+            self.text_encoder = object()
+            self._execution_device = SimpleNamespace(type="tpu")
+
+        def _encode_prompt(
+            self, prompt, device=None, prompt_embeds=None, max_sequence_length=512
+        ):
+            calls.append(("orig", prompt, device, prompt_embeds, max_sequence_length))
+            return "orig_result"
+
+    class _Encoder:
+        fail = False
+
+        def __init__(self, text_encoder):
+            calls.append(("build", text_encoder))
+
+        def __call__(self, input_ids, attention_mask):
+            calls.append(("encode", input_ids, attention_mask))
+            if _Encoder.fail:
+                raise RuntimeError("boom")
+            return hidden
+
+    fake_mod = MagicMock()
+    fake_mod.ZImagePipeline = _Pipeline
+    monkeypatch.setitem(
+        sys.modules, "vllm_omni.diffusion.models.z_image.pipeline_z_image", fake_mod
+    )
+    monkeypatch.setattr(omni_patches, "_TpuCompiledPromptEncoder", _Encoder)
+
+    orig = _Pipeline._encode_prompt
+    omni_patches._patch_z_image_prompt_encoder_tpu()
+    omni_patches._patch_z_image_prompt_encoder_tpu()  # idempotent
+    assert _unwrap_tpu_patch(_Pipeline._encode_prompt) is orig
+
+    masks = torch.tensor([[1, 1, 1, 0, 0], [1, 0, 1, 0, 0]])
+    pipe = _Pipeline(masks)
+    out = pipe._encode_prompt(["a dog", "a cat"], max_sequence_length=5)
+    assert len(out) == 2
+    assert torch.equal(out[0], hidden[0, :3])  # contiguous mask -> static slice
+    assert torch.equal(out[1], hidden[1][[0, 2]])  # gaps -> boolean index
+    assert calls[0] == ("build", pipe.text_encoder)
+    assert calls[1][:2] == ("template", "a dog") and calls[1][2] == {
+        "tokenize": False,
+        "add_generation_prompt": True,
+        "enable_thinking": True,
+    }
+    assert calls[3] == (
+        "tokenize",
+        ["<chat>a dog", "<chat>a cat"],
+        {
+            "padding": "max_length",
+            "max_length": 5,
+            "truncation": True,
+            "return_tensors": "pt",
+        },
+    )
+    assert calls[4] == ("encode", "ids_on_tpu", masks)
+    assert not any(c[0] == "orig" for c in calls)
+    # The encoder is built once per pipeline.
+    pipe._encode_prompt("again", max_sequence_length=5)
+    assert sum(c[0] == "build" for c in calls) == 1
+
+    # Non-TPU devices and precomputed embeddings go straight to upstream.
+    calls.clear()
+    assert pipe._encode_prompt("x", device=torch.device("cpu")) == "orig_result"
+    assert pipe._encode_prompt("x", prompt_embeds=["e"]) == "orig_result"
+    assert [c[0] for c in calls] == ["orig", "orig"]
+
+    # A failing compiled encoder falls back to upstream and stays disabled.
+    calls.clear()
+    _Encoder.fail = True
+    try:
+        assert pipe._encode_prompt("y", max_sequence_length=5) == "orig_result"
+        assert pipe._tpu_prompt_encoder is False
+        assert calls[-1][0] == "orig"
+        assert pipe._encode_prompt("z", max_sequence_length=5) == "orig_result"
+        assert sum(c[0] == "encode" for c in calls) == 1
+    finally:
+        _Encoder.fail = False
+
+
 @pytest.mark.parametrize(
     "shape, affine",
     [
