@@ -21,7 +21,8 @@ GMMV2_SCORE_RECORD_DIR and GMMV2_SCORE_ARM_ROOT set it appends JSON lines to
   module  every Python source file imported from the arm's tree, with the
           sha256 of its bytes: what the process loaded.
   mosaic  every Mosaic kernel lowered into a compiled program, with the sha256
-          of its serialized backend config: what the process put on the device.
+          of its serialized backend config and the LIBTPU_INIT_ARGS in force:
+          what the process put on the device.
 
 It then runs the sitecustomize it shadows, so the image's own start-up hook
 still applies.
@@ -78,6 +79,7 @@ def _record_mosaic(module) -> None:
             {
                 "name": kernel_name or "",
                 "sha256": hashlib.sha256(config.to_json()).hexdigest(),
+                "libtpu_init_args": os.environ.get("LIBTPU_INIT_ARGS", ""),
             },
         )
         return lowering(ctx, *in_nodes, config=config, kernel_name=kernel_name, **kw)

@@ -41,8 +41,9 @@ Per arm and config:
   worst_error  fraction of known-answer probes answered wrongly.
   checksum     sha256 of every probe's greedy reply.
   dispatched   digest of every Mosaic kernel the arm's server lowered (name and
-               serialized config) and of every XLA executable it compiled
-               at boot (the compiler's own fingerprints, read from the server log).
+               serialized config, which carries the kernel's lowered IR) and of
+               the LIBTPU_INIT_ARGS it was lowered under. A candidate that leaves
+               both unchanged has not changed what runs on the device.
   declined     the arm's server could not be measured at all; latency_us is 0.
 Per arm:
   tree         git tree hash of the arm's whole tree as deployed in the pod.
@@ -76,7 +77,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 HOOK = HERE / "hook" / "sitecustomize.py"
 #: The hook is part of this fitness function; `run` refuses any other bytes.
-HOOK_SHA256 = "b97a1e4adeefabbb81e878f9c45dac3a501ddbd7b9740d6e449e23d2ec6081bd"
+HOOK_SHA256 = "8609bb60f808d65269ad3e32e26dfbb61a53b4f16cdb57071f10305663cf3ccb"
 
 KERNEL_REL = "src/vllm_torchtpu/kernels/megablox"
 MARKER = "GMMV2_MARKER"
@@ -211,9 +212,6 @@ SERVER_DIRS = ("CACHE_DIR", "TMPDIR", "TRITON_CACHE_DIR", "VLLM_CACHE_ROOT",
 #: Printed in their millions under TPU_VMODULE; kept out of the saved log.
 LOG_NOISE = re.compile(
     rb"tpu_pjrt_client\.cc|pjrt_stream_executor|tpu_pjrt_compiler_utils|GET /metrics"
-)
-EXEC_FINGERPRINT = re.compile(
-    r"\(HLO module (\S+)\): Executable fingerprint \(including data segments\):([0-9a-f]+)"
 )
 
 READY_TIMEOUT_S = 3000
@@ -494,10 +492,6 @@ class Server:
         self.log_path = work / "server.log"
         self.markers: list[str] = []
         self.n_markers = 0
-        # Only programs compiled before the server answers: boot compiles every bucket
-        # the same way each time, while later compiles depend on request timing.
-        self.fingerprints: set[tuple[str, str]] = set()
-        self.ready = False
         self.strays: list[str] = []
         self.proc = subprocess.Popen(SERVE_CMD, cwd="/root", env=server_env(rec_dir),
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -516,9 +510,6 @@ class Server:
                     self.n_markers += 1
                     if len(self.markers) < 60:
                         self.markers.append(line.rstrip())
-                m = None if self.ready else EXEC_FINGERPRINT.search(line)
-                if m:
-                    self.fingerprints.add((m.group(1), m.group(2)))
 
     def wait_ready(self) -> float:
         t0 = time.time()
@@ -529,7 +520,6 @@ class Server:
                 )
             try:
                 if http_get("/health", timeout=5)[0] == 200:
-                    self.ready = True
                     return time.time() - t0
             except OSError:
                 pass
@@ -727,7 +717,7 @@ def capture_profiles(prompts: Prompts, arm_out: Path) -> dict:
 
 
 def read_records(rec_dir: Path) -> dict:
-    modules, mosaic, chained = set(), set(), set()
+    modules, mosaic, chained, libtpu_args = set(), set(), set(), set()
     for f in sorted(rec_dir.glob("*.jsonl")):
         for line in f.read_text().splitlines():
             r = json.loads(line)
@@ -736,6 +726,7 @@ def read_records(rec_dir: Path) -> dict:
                 modules.add((r["path"], r["sha256"]))
             elif kind == "mosaic":
                 mosaic.add((r["name"], r["sha256"]))
+                libtpu_args.add(r["libtpu_init_args"])
             elif kind == "chained":
                 chained.add(r["path"])
     by_path: dict[str, set] = {}
@@ -744,7 +735,12 @@ def read_records(rec_dir: Path) -> dict:
     torn = sorted(p for p, d in by_path.items() if len(d) > 1)
     if torn:
         raise RuntimeError(f"processes imported different bytes for {torn[:5]}")
+    if len(libtpu_args) > 1:
+        raise RuntimeError(
+            f"processes lowered under different LIBTPU_INIT_ARGS: {libtpu_args}"
+        )
     return {
+        "libtpu_init_args": next(iter(libtpu_args), ""),
         "modules": sorted(modules),
         "mosaic": sorted(mosaic),
         "chained": sorted(chained),
@@ -825,9 +821,6 @@ def run_arm(spec: dict, stage: Path, out: Path, prompts: Prompts) -> dict:
     except RuntimeError as e:
         arm["error"] = f"{arm.get('error', '')} records: {e}"
         return arm  # imported bytes disagree across processes: no number is printed
-    fingerprints = sorted(
-        f"{m} {h}" for m, h in (server.fingerprints if server else ())
-    )
     mosaic = [f"{n} {h}" for n, h in rec["mosaic"]]
     arm["binary_hash"] = (
         digest_lines("py:", (f"{p} {h}" for p, h in rec["modules"]))
@@ -840,15 +833,18 @@ def run_arm(spec: dict, stage: Path, out: Path, prompts: Prompts) -> dict:
         "n_mosaic": len(mosaic),
         "gmm_v2_kernels": [m for m in mosaic if m.startswith("gmm_v2")],
         "mosaic_digest": digest_lines("mosaic:", mosaic),
-        "n_executables": len(fingerprints),
-        "executables_digest": digest_lines("exe:", fingerprints),
+        "libtpu_init_args": rec["libtpu_init_args"],
         "chained_sitecustomize": rec["chained"],
     }  # fmt: skip
     if load is None:
         arm["configs"] = unmeasured_configs()
         return arm
     dispatched = (
-        digest_lines("mosaic+exe:", mosaic + ["--"] + fingerprints) if mosaic else ""
+        digest_lines(
+            "mosaic:", [*mosaic, f"LIBTPU_INIT_ARGS={rec['libtpu_init_args']}"]
+        )
+        if mosaic
+        else ""
     )
     arm["probes"] = probes
     arm["configs"] = {
