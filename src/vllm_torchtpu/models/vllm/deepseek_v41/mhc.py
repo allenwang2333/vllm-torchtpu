@@ -91,6 +91,120 @@ def delayed_pre_jax(
     return post[..., None], comb, value.astype(residual.dtype), new_pre
 
 
+def _truncate_bf16(values: jax.Array) -> jax.Array:
+    # A mask, not an f32->bf16->f32 round trip: XLA's excess-precision
+    # rewrite may drop the round trip and zero the residual parts.
+    bits = jax.lax.bitcast_convert_type(values, jnp.uint32) & jnp.uint32(0xFFFF0000)
+    return jax.lax.bitcast_convert_type(bits, jnp.float32)
+
+
+def _pack_mix_weight(fn: jax.Array) -> jax.Array:
+    """FP32 ``fn [n, K]`` as BF16 ``[K, 128]`` columns ``hi | mid | lo | 0``.
+
+    ``hi + mid + lo == fn`` exactly, so one BF16 matmul against BF16 inputs
+    matches the FP32 projection up to accumulation order.
+    """
+    high = _truncate_bf16(fn)
+    middle = _truncate_bf16(fn - high)
+    low = fn - high - middle
+    parts = jnp.concatenate([high, middle, low]).astype(jnp.bfloat16)
+    return jnp.pad(parts.T, ((0, 0), (0, 128 - parts.shape[0])))
+
+
+def _flat_pre_sums(flat, weight, previous_pre, mixes, tile):
+    """One pass over ``flat [T, M*D]``: mix logits, square sums, collapse."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    tokens, width = flat.shape
+    mult = previous_pre.shape[1]
+    dim = width // mult
+
+    def kernel(x_ref, w_ref, pre_ref, mix_ref, square_ref, value_ref):
+        pre = pre_ref[...]
+        value = square = None
+        for m in range(mult):
+            x = x_ref[:, m * dim : (m + 1) * dim].astype(jnp.float32)
+            term = pre[:, m : m + 1] * x
+            sums = jnp.sum(x * x, axis=1, keepdims=True)
+            value = term if value is None else value + term
+            square = sums if square is None else square + sums
+        value_ref[...] = value.astype(value_ref.dtype)
+        square_ref[...] = square
+        parts = jnp.dot(x_ref[...], w_ref[...], preferred_element_type=jnp.float32)
+        mix_ref[...] = (
+            parts[:, :mixes]
+            + parts[:, mixes : 2 * mixes]
+            + parts[:, 2 * mixes : 3 * mixes]
+        )
+
+    def row(i):
+        return i, 0
+
+    return pl.pallas_call(
+        kernel,
+        grid=(tokens // tile,),
+        in_specs=[
+            pl.BlockSpec((tile, width), row),
+            pl.BlockSpec(weight.shape, lambda i: (0, 0)),
+            pl.BlockSpec((tile, mult), row),
+        ],
+        out_specs=[
+            pl.BlockSpec((tile, mixes), row),
+            pl.BlockSpec((tile, 1), row),
+            pl.BlockSpec((tile, dim), row),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((tokens, mixes), jnp.float32),
+            jax.ShapeDtypeStruct((tokens, 1), jnp.float32),
+            jax.ShapeDtypeStruct((tokens, dim), flat.dtype),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",), vmem_limit_bytes=48 * 1024 * 1024
+        ),
+    )(flat, weight, previous_pre)
+
+
+def delayed_pre_flat_jax(
+    flat: jax.Array,
+    fn: jax.Array,
+    scale: jax.Array,
+    base: jax.Array,
+    previous_pre: jax.Array,
+    rms_eps: float,
+    pre_eps: float,
+    sinkhorn_eps: float,
+    post_multiplier: float,
+    repeats: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """`delayed_pre_jax` with ``x = residual = flat [T, M*D]``.
+
+    Prefill-sized batches use one Pallas pass; viewing the flat residual as
+    ``[T, M, D]`` costs XLA a relayout copy plus an FP32 copy for the
+    projection. Small (decode) batches keep the XLA path.
+    """
+    tokens, width = flat.shape
+    mult = previous_pre.shape[1]
+    dim = width // mult
+    constants = (rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats)
+    if tokens < 64 or tokens % 64 or 3 * fn.shape[0] > 128:
+        return delayed_pre_jax(
+            flat.reshape(tokens, mult, dim),
+            flat,
+            fn,
+            scale,
+            base,
+            previous_pre,
+            *constants,
+        )
+    tile = 128 if tokens % 128 == 0 else 64
+    mixes, square, value = _flat_pre_sums(
+        flat, _pack_mix_weight(fn), previous_pre, fn.shape[0], tile
+    )
+    new_pre, post, comb = _pre_gates(mixes, square, mult, dim, scale, base, *constants)
+    return post[..., None], comb, value, new_pre
+
+
 def initialize_delayed_mhc():
     global _pre_op
     if _pre_op is not None:
@@ -132,9 +246,35 @@ def initialize_delayed_mhc():
 
     _pre_op.register_fake(fake)
 
+    global _pre_flat_op
+    _pre_flat_op = pallas.jax_op(
+        "pallas::deepseek_v41_delayed_mhc_pre_flat",
+        delayed_pre_flat_jax,
+        mesh=get_vllm_model_wrapper_context().mesh,
+        input_partition_specs=(P(),) * 5 + (None,) * 5,
+    )
+
+    def fake_flat(flat, fn, scale, base, previous_pre, *args):
+        tokens, mult = previous_pre.shape
+        return (
+            fn.new_empty((tokens, mult, 1)),
+            fn.new_empty((tokens, mult, mult)),
+            flat.new_empty((tokens, flat.shape[1] // mult)),
+            fn.new_empty((tokens, mult)),
+        )
+
+    _pre_flat_op.register_fake(fake_flat)
+
+
+_pre_flat_op = None
+
 
 def delayed_pre(residual, x, fn, scale, base, previous_pre, *constants):
-    assert _pre_op is not None
+    assert _pre_op is not None and _pre_flat_op is not None
+    if x is None:
+        return _pre_flat_op(
+            residual.flatten(1), fn, scale, base, previous_pre, *constants
+        )
     return _pre_op(residual, x, fn, scale, base, previous_pre, *constants)
 
 
@@ -177,8 +317,6 @@ def pre(
     norm_eps=1e-6,
 ):
     if residual.device.type == "tpu":
-        if x is None:
-            x = residual.flatten(1)
         if pre_mix is None:
             # First layer uses residual[:, 0], not the newly computed gate.
             pre_mix = residual.new_zeros(residual.shape[:2], dtype=fn.dtype)
