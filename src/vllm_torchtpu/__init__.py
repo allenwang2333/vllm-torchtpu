@@ -303,6 +303,21 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
         )
 
     _mr.MoERunner._fused_output_is_reduced = patched
+
+    # A layer armed by fused_moe_tp_ar owns its token exchange too: on a
+    # sequence-parallel layer (VLLM_TPU_MOE_SEQUENCE_PARALLEL) its SP program
+    # gathers [T/TP] rows and reduce-scatters back inside the kernel, and below
+    # the SP bucket gate its input is replicated, so vLLM's naive EP
+    # all-gather / reduce-scatter pair around it would be wrong either way.
+    original_naive = _mr.MoERunner.do_naive_dispatch_combine
+
+    @property
+    def patched_naive(self):
+        if getattr(self, "_fused_moe_tp_ar_armed", False):
+            return False
+        return original_naive.fget(self)
+
+    _mr.MoERunner.do_naive_dispatch_combine = patched_naive
     _mr.MoERunner._tpu_fused_output_reduced_patch = True
     logger.info("Applied TPU patch: the fused EP MoE output is pre-reduced.")
 

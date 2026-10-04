@@ -751,11 +751,22 @@ class TpuPlatform(Platform):
                 if s >= 2 * tp and s % tp == 0
             ]
         elif use_sp_moe:
-            # VLLM_TPU_MOE_SEQUENCE_PARALLEL: round each bucket up so it splits
-            # into 2, 4 or a multiple of 8 rows per TP rank.
+            # VLLM_TPU_MOE_SEQUENCE_PARALLEL: round each bucket that runs
+            # sequence-parallel up so it splits into 2, 4 or a multiple of 8
+            # rows per TP rank. Buckets under the SP gate run replicated and
+            # keep their size (e.g. the 4/8/48 decode buckets).
+            # Same value as qwen3_next_patch.resolve_sp_min_tokens (129 =
+            # fused_moe_tp_ar.MAX_DECODE_TOKENS + 1), without importing the
+            # model or kernel modules at config time.
+            sp_min_tokens = envs.VLLM_TPU_SP_MIN_TOKENS or (
+                129 if envs.USE_MOE_FUSED_TP_AR else 0
+            )
             tp_size = parallel_config.tensor_parallel_size
             aligned_sizes: set[int] = set()
             for raw_size in compilation_config.compile_sizes:
+                if sp_min_tokens > 2 and int(raw_size) < sp_min_tokens:
+                    aligned_sizes.add(int(raw_size))
+                    continue
                 s = max(
                     2 * tp_size, ((int(raw_size) + tp_size - 1) // tp_size) * tp_size
                 )

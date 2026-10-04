@@ -475,6 +475,9 @@ def moe_tp_prefill(
     gather_unroll=8,
     lookahead=2,
     interpret=False,
+    x_quantized=None,
+    shared_gate=None,
+    scatter_ranks=1,
 ):
     """One rank's routed + shared MoE output for prefill-sized token counts.
 
@@ -488,10 +491,14 @@ def moe_tp_prefill(
     so XLA keeps the all-reduces separate and each runs under the next chunk's
     combine. Without reduce_fn the per-rank partial is returned.
     """
-    n_tok, hidden = x.shape
+    n_experts, hidden, two_i = w1.shape
+    if x_quantized is not None:
+        x_q, x_s = x_quantized
+        n_tok = x_q.shape[0]
+    else:
+        n_tok, hidden = x.shape
     if tile_m is None:
         tile_m = default_tile_m(n_tok)
-    n_experts, _, two_i = w1.shape
     inter = two_i // 2
     n_routes = n_tok * topk_ids.shape[1]
 
@@ -510,7 +517,8 @@ def moe_tp_prefill(
     )
 
     # ---- prep ----
-    x_q, x_s = rowquant_rows(x)
+    if x_quantized is None:
+        x_q, x_s = rowquant_rows(x)
     # Padded bucket rows keep their expert ids but carry zero routing weight
     # (TPU_MOE_SKIP_PADDED_TOKENS); their routes are not computed.
     route_valid = (topk_weights != 0) if skip_zero_weight_routes else None
@@ -544,9 +552,12 @@ def moe_tp_prefill(
     )
 
     # ---- combine: topk routed rows + the gated shared row per token ----
-    gate = jax.nn.sigmoid(
-        jnp.dot(x, wg_sh, preferred_element_type=jnp.float32)
-    )  # [T,1]
+    if shared_gate is not None:
+        gate = shared_gate
+    else:
+        gate = jax.nn.sigmoid(
+            jnp.dot(x, wg_sh, preferred_element_type=jnp.float32)
+        )  # [T,1]
     coef = topk_weights.astype(jnp.float32)
     shared_pos = n_routes + jnp.arange(n_tok, dtype=jnp.int32)[:, None]
     # Unvisited slab rows are never written; point dead routes at a written
@@ -570,16 +581,42 @@ def moe_tp_prefill(
         combine_chunks,
         reduce_fn,
         interpret,
+        scatter_ranks=scatter_ranks,
     )
 
 
-def combine(part, pos, coef, n_tok, hidden, n_chunks, reduce_fn, interpret=False):
+def combine(
+    part,
+    pos,
+    coef,
+    n_tok,
+    hidden,
+    n_chunks,
+    reduce_fn,
+    interpret=False,
+    scatter_ranks=1,
+):
     """out[t] = sum_k coef[t, k] * part[pos[t, k]] in n_chunks token chunks,
     each followed by reduce_fn when given."""
     k = pos.shape[1]
-    if n_tok % n_chunks:
+    if n_tok % n_chunks or (n_tok // n_chunks) % scatter_ranks:
         n_chunks = 1
     tc = n_tok // n_chunks
+    if n_chunks > 1 and scatter_ranks > 1:
+        # Reorder rows from [scatter_ranks, n_chunks, tc_local, k] into
+        # [n_chunks, scatter_ranks, tc_local, k] so each chunk c's psum_scatter
+        # scatters rank r's c-th contiguous local token slice.
+        tc_local = tc // scatter_ranks
+        pos = (
+            pos.reshape(scatter_ranks, n_chunks, tc_local, k)
+            .swapaxes(0, 1)
+            .reshape(n_tok, k)
+        )
+        coef = (
+            coef.reshape(scatter_ranks, n_chunks, tc_local, k)
+            .swapaxes(0, 1)
+            .reshape(n_tok, k)
+        )
     outs = []
     for c in range(n_chunks):
         sl = slice(c * tc, (c + 1) * tc)

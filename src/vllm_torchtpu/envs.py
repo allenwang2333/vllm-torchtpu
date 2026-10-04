@@ -159,6 +159,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOE_SEQUENCE_PARALLEL: str = "off"
     VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER: bool = False
     VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS: int = 257
+    VLLM_TPU_SP_MIN_TOKENS: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     TPU_SMALL_ALL_REDUCE: bool = False
 
@@ -983,6 +984,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS", 0
     ),
+    # Minimum step token count at which sequence-parallel sharding (T/TP) is
+    # active in Qwen3Next/Qwen3.5-MoE layers. Below this threshold, tokens stay
+    # replicated [T, H] across TP ranks so latency-bound decode steps avoid
+    # per-layer AllGather/ReduceScatter pairs and run the fused TP decode MoE
+    # kernel directly. 0 (default) keeps SP active on all buckets unless
+    # USE_MOE_FUSED_TP_AR=1, which defaults to MAX_DECODE_TOKENS + 1 (129).
+    "VLLM_TPU_SP_MIN_TOKENS": env_nonnegative_int("VLLM_TPU_SP_MIN_TOKENS", 0),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).
