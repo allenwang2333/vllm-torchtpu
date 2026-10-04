@@ -87,6 +87,138 @@ def _attend(q, pool, records, state, scale, tile=64):
     return maximum, denominator, merge_halves(numerator.reshape(*q.shape[:2], dim))
 
 
+def _window_union(records, tile):
+    """Per token tile, one record list covering its tokens' sliding windows.
+
+    Window column j of token t is position ``p_t - W + 1 + j``, so a request's
+    consecutive tokens ``a..b`` need ``records[a, :b - a]`` followed by
+    ``records[b]``. ``b`` is the tile's last valid token and ``a`` the first
+    token whose own row (column W - 1) lies in b's window, i.e. the same
+    request. Returns ``(union [n, tile + W], mask [n, tile, tile + W],
+    uncovered [n, tile])``: ``mask`` marks the union columns in each token's
+    own records, ``uncovered`` tokens have a valid record outside the union.
+    """
+    tokens, width = records.shape
+    count = tokens // tile
+    rows = records.reshape(count, tile, width)
+    own = rows[..., -1]
+    live = own >= 0
+    last = tile - 1 - jnp.argmax(live[:, ::-1], axis=1)
+    last_rows = jnp.take_along_axis(rows, last[:, None, None], axis=1)[:, 0]
+    same = live & (own[..., None] == last_rows[:, None, :]).any(-1)
+    first = jnp.argmax(same, axis=1)
+    first_rows = jnp.take_along_axis(rows, first[:, None, None], axis=1)[:, 0]
+    head = jnp.where(
+        jnp.arange(tile)[None] < (last - first)[:, None], first_rows[:, :tile], -1
+    )
+    union = jnp.concatenate([head, last_rows], axis=1)
+    # Token u of the block maps window column j to union column
+    # u - a + j (head) while that is below b - a, else tile + j - (b - u).
+    u = jnp.arange(tile)[None, :, None]
+    j = jnp.arange(width)[None, None, :]
+    a = first[:, None, None]
+    b = last[:, None, None]
+    columns = jnp.where(j < b - u, u - a + j, tile + j - (b - u))
+    in_block = (u[..., 0] >= first[:, None]) & (u[..., 0] <= last[:, None])
+    columns = jnp.where(in_block[..., None], columns, 0)
+    mapped = jnp.take_along_axis(
+        jnp.broadcast_to(union[:, None], (count, tile, union.shape[1])),
+        jnp.clip(columns, 0, union.shape[1] - 1),
+        axis=2,
+    )
+    # Verify instead of trusting contiguity: every own record must land on
+    # the same physical row.
+    covered = in_block & (mapped == rows).all(-1)
+    c = jnp.arange(union.shape[1])[None, None, :]
+    band = ((c >= u - a) & (c < b - a)) | (
+        (c >= tile) & (c <= tile + width - 1 - (b - u))
+    )
+    mask = covered[..., None] & band & (union[:, None, :] >= 0)
+    uncovered = (rows >= 0).any(-1) & ~covered
+    return union, mask, uncovered
+
+
+def _attend_window(q, pool, records, state, scale, tile=64, fallback=64):
+    """`_attend` for sliding-window records, gathering per token tile.
+
+    Prefill tokens of one request share most of their window, so the per
+    token ``[tokens, W]`` gather reads each row up to W times. Here each
+    64-token tile gathers one ``tile + W`` union and attends with a
+    membership mask. Up to ``fallback`` uncovered tokens (other requests in
+    the tile: decode tokens, a previous chunk's tail) are recomputed with
+    `_attend`; if more are uncovered, the whole batch uses `_attend`.
+    """
+    tokens, heads, dim = q.shape
+    width = records.shape[1]
+    if tokens % tile or tokens < 2 * tile or width % 64:
+        return _attend(q, pool, records, state, scale)
+    union, mask, uncovered = _window_union(records, tile)
+    count = union.shape[0]
+
+    def fast(_):
+        gathered = gather_cache_pieces(pool, union.reshape(-1), dim)
+        pieces = gathered.shape[0]
+        kv = gathered.reshape(pieces, count, union.shape[1], -1)
+        kv = jnp.where((union >= 0)[None, ..., None], kv, 0)
+
+        def split(x):
+            return split_halves(x).reshape(count, tile, heads, pieces, -1)
+
+        maximum, denominator, numerator = state
+        shape = (count, tile, heads)
+        maximum = maximum.reshape(shape)
+        denominator = denominator.reshape(shape)
+        numerator = split(numerator)
+        scores = (
+            jnp.einsum(
+                "nthpd,pnkd->nthk",
+                split(q).astype(jnp.float32),
+                kv.astype(jnp.float32),
+                preferred_element_type=jnp.float32,
+            )
+            * scale
+        )
+        scores = jnp.where(mask[:, :, None], scores, -jnp.inf)
+        new_max = jnp.maximum(maximum, scores.max(-1))
+        correction = jnp.exp(maximum - new_max)
+        exponentials = jnp.exp(scores - new_max[..., None])
+        denominator = denominator * correction + exponentials.sum(-1)
+        numerator = numerator * correction[..., None, None] + jnp.einsum(
+            "nthk,pnkd->nthpd",
+            exponentials.astype(jnp.bfloat16),
+            kv,
+            preferred_element_type=jnp.float32,
+        )
+        result = (
+            new_max.reshape(tokens, heads),
+            denominator.reshape(tokens, heads),
+            merge_halves(numerator.reshape(tokens, heads, dim)),
+        )
+
+        # Recompute uncovered tokens from their own records.
+        def patch(result):
+            index = jnp.nonzero(
+                uncovered.reshape(-1), size=fallback, fill_value=tokens
+            )[0]
+            source = jnp.minimum(index, tokens - 1)
+            sub_records = jnp.where((index < tokens)[:, None], records[source], -1)
+            sub = _attend(
+                q[source], pool, sub_records, tuple(s[source] for s in state), scale
+            )
+            return tuple(
+                full.at[index].set(part, mode="drop") for full, part in zip(result, sub)
+            )
+
+        return jax.lax.cond(uncovered.any(), patch, lambda result: result, result)
+
+    return jax.lax.cond(
+        uncovered.sum() > fallback,
+        lambda _: _attend(q, pool, records, state, scale),
+        fast,
+        None,
+    )
+
+
 def paged_attention_jax(
     q: jax.Array,
     swa_pool: jax.Array,
@@ -102,7 +234,7 @@ def paged_attention_jax(
         q,
         main_pool,
         main_records,
-        _attend(q, swa_pool, swa_records, _attention_state(q), scale),
+        _attend_window(q, swa_pool, swa_records, _attention_state(q), scale),
         scale,
     )
     denominator += jnp.exp(sink.astype(jnp.float32)[None] - maximum)
@@ -144,7 +276,7 @@ def sparse_fp8_attention_jax(
         sparse_ragged_paged_attention,
     )
 
-    maximum, denominator, numerator = _attend(
+    maximum, denominator, numerator = _attend_window(
         q, swa_pool, swa_records, _attention_state(q), scale
     )
     count = main_pool.shape[0] // page_size
