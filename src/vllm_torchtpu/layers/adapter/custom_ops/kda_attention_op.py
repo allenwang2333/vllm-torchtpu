@@ -557,6 +557,9 @@ def _pooled_kda_core(
             )
         # Manager blocks need not be contiguous. Keep every checkpoint in a
         # contiguous scratch window, including untouched ragged/prefill tails.
+        # TODO: follow #889's is_shared=True path and access the unified pool
+        # directly via ckpt_indices[s, offset], avoiding per-step gather/scatter
+        # and dense checkpoint temporaries.
         num_reqs *= window
         dense_offsets = jnp.zeros(num_reqs + 1, dtype=jnp.int32)
         dense_offsets = dense_offsets.at[identity].set(slot_read_offsets[state_indices])
