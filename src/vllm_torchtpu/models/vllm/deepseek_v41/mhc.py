@@ -2,6 +2,7 @@
 
 import jax
 import jax.numpy as jnp
+import torch
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.kernels.mhc.torch import mhc_post_torch, mhc_pre_delayed_torch
 
@@ -69,8 +70,14 @@ def delayed_pre_jax(
     repeats: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     mult, dim = residual.shape[-2:]
+    if fn.dtype == jnp.bfloat16:
+        # Load-time packed weight (see `pack_mix_weight`).
+        mixes = _packed_mixes(x, fn, mult * (mult + 2))
+    else:
+        mixes = jnp.matmul(
+            x.astype(jnp.float32), fn.T, precision=jax.lax.Precision.HIGHEST
+        )
     x = x.astype(jnp.float32)
-    mixes = jnp.matmul(x, fn.T, precision=jax.lax.Precision.HIGHEST)
     # Upstream's first-layer broadcast optimization folds x/fn to hidden_size.
     # Gate normalization must still use the actual projection input width.
     squares = jnp.mean(jnp.square(x), -1, keepdims=True) * (mult * dim)
@@ -109,6 +116,29 @@ def _pack_mix_weight(fn: jax.Array) -> jax.Array:
     low = fn - high - middle
     parts = jnp.concatenate([high, middle, low]).astype(jnp.bfloat16)
     return jnp.pad(parts.T, ((0, 0), (0, 128 - parts.shape[0])))
+
+
+def pack_mix_weight(fn: torch.Tensor) -> torch.Tensor:
+    """Torch twin of `_pack_mix_weight`, applied once after weight loading."""
+    weight = fn.detach().cpu().float()
+
+    def truncate(values):
+        return (values.view(torch.int32) & -65536).view(torch.float32)
+
+    high = truncate(weight)
+    middle = truncate(weight - high)
+    low = weight - high - middle
+    parts = torch.cat([high, middle, low]).to(torch.bfloat16)
+    packed = torch.nn.functional.pad(parts.T, (0, 128 - parts.shape[0]))
+    return packed.contiguous().to(fn.device)
+
+
+def _packed_mixes(x: jax.Array, weight: jax.Array, mixes: int) -> jax.Array:
+    """Mix logits from a packed weight, summed in `_flat_pre_sums` order."""
+    parts = jnp.dot(x, weight, preferred_element_type=jnp.float32)
+    return (
+        parts[:, :mixes] + parts[:, mixes : 2 * mixes] + parts[:, 2 * mixes : 3 * mixes]
+    )
 
 
 def _flat_pre_sums(flat, weight, previous_pre, mixes, tile):
@@ -187,7 +217,8 @@ def delayed_pre_flat_jax(
     mult = previous_pre.shape[1]
     dim = width // mult
     constants = (rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats)
-    if tokens < 64 or tokens % 64 or 3 * fn.shape[0] > 128:
+    mixes = mult * (mult + 2)
+    if tokens < 64 or tokens % 64 or 3 * mixes > 128:
         return delayed_pre_jax(
             flat.reshape(tokens, mult, dim),
             flat,
@@ -198,9 +229,8 @@ def delayed_pre_flat_jax(
             *constants,
         )
     tile = 128 if tokens % 128 == 0 else 64
-    mixes, square, value = _flat_pre_sums(
-        flat, _pack_mix_weight(fn), previous_pre, fn.shape[0], tile
-    )
+    weight = fn if fn.dtype == jnp.bfloat16 else _pack_mix_weight(fn)
+    mixes, square, value = _flat_pre_sums(flat, weight, previous_pre, mixes, tile)
     new_pre, post, comb = _pre_gates(mixes, square, mult, dim, scale, base, *constants)
     return post[..., None], comb, value, new_pre
 
@@ -257,10 +287,10 @@ def initialize_delayed_mhc():
     def fake_flat(flat, fn, scale, base, previous_pre, *args):
         tokens, mult = previous_pre.shape
         return (
-            fn.new_empty((tokens, mult, 1)),
-            fn.new_empty((tokens, mult, mult)),
+            scale.new_empty((tokens, mult, 1)),
+            scale.new_empty((tokens, mult, mult)),
             flat.new_empty((tokens, flat.shape[1] // mult)),
-            fn.new_empty((tokens, mult)),
+            scale.new_empty((tokens, mult)),
         )
 
     _pre_flat_op.register_fake(fake_flat)
@@ -319,7 +349,7 @@ def pre(
     if residual.device.type == "tpu":
         if pre_mix is None:
             # First layer uses residual[:, 0], not the newly computed gate.
-            pre_mix = residual.new_zeros(residual.shape[:2], dtype=fn.dtype)
+            pre_mix = residual.new_zeros(residual.shape[:2], dtype=hc_scale.dtype)
             pre_mix[:, 0] = 1
         post, comb, value, next_pre = delayed_pre(
             residual,

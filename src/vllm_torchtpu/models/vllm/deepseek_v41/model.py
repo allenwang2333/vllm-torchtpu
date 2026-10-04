@@ -24,6 +24,7 @@ from .mhc import (
     collapse,
     initialize_delayed_mhc,
     initialize_mhc_post,
+    pack_mix_weight,
     post,
     pre,
     shifted_post_pre,
@@ -410,6 +411,22 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    def finalize_mhc_broadcast_weights(self) -> None:
+        layers = list(islice(self.layers, self.start_layer, self.end_layer))
+        if layers and layers[0].hc_attn_fn.dtype != torch.float32:
+            return  # Already packed.
+        super().finalize_mhc_broadcast_weights()
+        # The upstream broadcast weight above reads FP32 hc_attn_fn; pack the
+        # per-layer mix weights afterwards so mHC pre skips per-step packing.
+        for layer in layers:
+            for name in ("hc_attn_fn", "hc_ffn_fn"):
+                fn = getattr(layer, name)
+                if fn.device.type == "tpu":
+                    packed = torch.nn.Parameter(
+                        pack_mix_weight(fn), requires_grad=False
+                    )
+                    setattr(layer, name, packed)
 
     def __init__(self, *, vllm_config, prefix=""):
         self.prefix = prefix
