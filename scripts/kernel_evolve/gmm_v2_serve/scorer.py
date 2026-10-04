@@ -35,8 +35,9 @@ In the pod (the recipe runs this):
 Per arm and config:
   latency_us   wall-clock microseconds per output token over one repetition of
                the config's fixed requests, median of REPS.
-  correct      every known-answer probe right, every load request exactly
-               OUTPUT_TOKENS long.
+  correct      every known-answer probe right (short questions and needles in
+               long uncached contexts), every load request exactly as long as
+               the config asks.
   worst_error  fraction of known-answer probes answered wrongly.
   checksum     sha256 of every probe's greedy reply.
   dispatched   digest of every Mosaic kernel the arm's server lowered (name and
@@ -226,19 +227,21 @@ REQUEST_TIMEOUT_S = 900
 # intervals' generated tokens, 2 in 30%, 3-4 in 35% and 5-8 in 15%. The load
 # reproduces that regime with fixed greedy closed-loop work: every request shares
 # one long cached prefix, adds an uncached suffix no other request uses, and
-# decodes OUTPUT_TOKENS with EOS ignored. A config is one concurrency level; its
-# weight in the win rule is that level's share of generated tokens.
+# decodes a fixed number of tokens with EOS ignored. A decode config is one
+# concurrency level; its weight in the win rule is that level's share of
+# generated tokens. `p16k` is the prefill column: requests whose uncached part
+# fills the 16384-token chunk, so the large-M kernel buckets are timed too.
 
 PREFIX_CHARS = 300_000
-SUFFIX_CHARS = 7_500
-OUTPUT_TOKENS = 256
 REPS = 5
 CONFIGS = {
-    "c1": {"concurrency": 1, "requests_per_stream": 16},
-    "c2": {"concurrency": 2, "requests_per_stream": 12},
-    "c4": {"concurrency": 4, "requests_per_stream": 8},
-    "c8": {"concurrency": 8, "requests_per_stream": 6},
-}
+    "c1": {"concurrency": 1, "requests_per_stream": 16, "suffix_chars": 7_500, "output_tokens": 256},
+    "c2": {"concurrency": 2, "requests_per_stream": 12, "suffix_chars": 7_500, "output_tokens": 256},
+    "c4": {"concurrency": 4, "requests_per_stream": 8, "suffix_chars": 7_500, "output_tokens": 256},
+    "c8": {"concurrency": 8, "requests_per_stream": 6, "suffix_chars": 7_500, "output_tokens": 256},
+    "p16k": {"concurrency": 1, "requests_per_stream": 3, "suffix_chars": 64_000, "output_tokens": 16},
+}  # fmt: skip
+MAX_SUFFIX_CHARS = max(c["suffix_chars"] for c in CONFIGS.values())
 
 #: (question, a string the greedy reply must contain). Asked one at a time.
 KNOWN_ANSWER_PROBES = [
@@ -260,6 +263,9 @@ KNOWN_ANSWER_PROBES = [
     ("What is the opposite of 'hot'? Reply with one word.", "cold"),
 ]
 KNOWN_ANSWER_MAX_TOKENS = 16
+#: (secret, characters of uncached context around it): the answer sits in the middle
+#: of text no other request uses, so the reply depends on a full 16384-token chunk.
+NEEDLE_PROBES = [("7341", 70_000), ("2958", 70_000)]
 #: Greedy open-ended replies: checksummed, not graded.
 OPEN_PROBES = [
     "Write a Python function that returns the n-th Fibonacci number.",
@@ -415,17 +421,28 @@ class Prompts:
     def __init__(self):
         files = sorted(glob.glob(os.path.join(sysconfig.get_paths()["stdlib"], "*.py")))
         self.corpus = "".join(Path(f).read_text(errors="replace") for f in files)
-        if len(self.corpus) < PREFIX_CHARS + 50 * SUFFIX_CHARS:
+        if len(self.corpus) < PREFIX_CHARS + 20 * MAX_SUFFIX_CHARS:
             raise RuntimeError(f"corpus too small: {len(self.corpus)} chars")
         self.sha256 = hashlib.sha256(self.corpus.encode()).hexdigest()
         self.prefix = self.corpus[:PREFIX_CHARS]
-        self.span = len(self.corpus) - PREFIX_CHARS - SUFFIX_CHARS
+        self.span = len(self.corpus) - PREFIX_CHARS - MAX_SUFFIX_CHARS
 
-    def get(self, index: int) -> str:
-        """The index-th request: the shared prefix plus a suffix only it uses."""
+    def excerpt(self, index: int, chars: int) -> str:
         start = PREFIX_CHARS + (index * 104_729) % self.span
-        suffix = self.corpus[start : start + SUFFIX_CHARS]
+        return self.corpus[start : start + chars]
+
+    def get(self, index: int, suffix_chars: int) -> str:
+        """The index-th request: the shared prefix plus a suffix only it uses."""
+        suffix = self.excerpt(index, suffix_chars)
         return f"{self.prefix}\n\n# ---- excerpt {index} ----\n{suffix}\n# Continue this file:\n"
+
+    def needle(self, index: int, secret: str, chars: int) -> str:
+        text = self.excerpt(index, chars)
+        half = len(text) // 2
+        return (
+            f"{text[:half]}\n# The secret code is {secret}.\n{text[half:]}\n\n"
+            "What is the secret code mentioned in the text above? Reply with only the number."
+        )
 
 
 def server_env(rec_dir: Path | None = None) -> dict:
@@ -558,7 +575,7 @@ def package_origin() -> str:
     return out.stdout.strip().splitlines()[-1]
 
 
-def run_probes() -> dict:
+def run_probes(prompts: Prompts) -> dict:
     def ask(question: str, max_tokens: int) -> str:
         r = http_post_json("/v1/chat/completions", {
             "model": MODEL, "messages": [{"role": "user", "content": question}],
@@ -569,9 +586,13 @@ def run_probes() -> dict:
         )
 
     graded = []
-    for question, want in KNOWN_ANSWER_PROBES:
+    questions = list(KNOWN_ANSWER_PROBES) + [
+        (prompts.needle(500_000 + i, secret, chars), secret)
+        for i, (secret, chars) in enumerate(NEEDLE_PROBES)
+    ]
+    for question, want in questions:
         got = ask(question, KNOWN_ANSWER_MAX_TOKENS)
-        graded.append({"q": question, "want": want, "got": got,
+        graded.append({"q": question[-160:], "want": want, "got": got,
                        "ok": want.lower() in got.lower()})  # fmt: skip
     open_replies = [ask(p, OPEN_MAX_TOKENS) for p in OPEN_PROBES]
     texts = [g["got"] for g in graded] + open_replies
@@ -584,18 +605,18 @@ def run_probes() -> dict:
     }
 
 
-def run_rep(prompts: Prompts, concurrency: int, per_stream: int, base: int) -> dict:
+def run_rep(prompts: Prompts, cfg: dict, base: int) -> dict:
     """One closed-loop repetition: `concurrency` streams issuing their requests in turn."""
     results: list[dict] = []
     errors: list[str] = []
     lock = threading.Lock()
+    per_stream, want = cfg["requests_per_stream"], cfg["output_tokens"]
 
     def stream(s: int) -> None:
         for j in range(per_stream):
             try:
-                r = stream_completion(
-                    prompts.get(base + s * per_stream + j), OUTPUT_TOKENS
-                )
+                prompt = prompts.get(base + s * per_stream + j, cfg["suffix_chars"])
+                r = stream_completion(prompt, want)
             except Exception as e:  # collected and raised below: the rep is void
                 with lock:
                     errors.append(f"stream {s} request {j}: {e!r}")
@@ -604,7 +625,9 @@ def run_rep(prompts: Prompts, concurrency: int, per_stream: int, base: int) -> d
                 results.append(r)
 
     t0 = time.perf_counter()
-    threads = [threading.Thread(target=stream, args=(s,)) for s in range(concurrency)]
+    threads = [
+        threading.Thread(target=stream, args=(s,)) for s in range(cfg["concurrency"])
+    ]
     for t in threads:
         t.start()
     for t in threads:
@@ -616,7 +639,7 @@ def run_rep(prompts: Prompts, concurrency: int, per_stream: int, base: int) -> d
     return {
         "us_per_token": wall * 1e6 / tokens,
         "requests": len(results),
-        "exact_lengths": all(r["tokens"] == OUTPUT_TOKENS for r in results),
+        "exact_lengths": all(r["tokens"] == want for r in results),
         "prompt_tokens": [r["prompt_tokens"] for r in results],
         "ttft_s": [r["ttft_s"] for r in results],
         "tpot_s": [r["tpot_s"] for r in results],
@@ -631,7 +654,7 @@ def run_load(prompts: Prompts) -> dict:
     for rep in range(REPS):
         for name, cfg in CONFIGS.items():
             before = scrape_counters()
-            r = run_rep(prompts, cfg["concurrency"], cfg["requests_per_stream"], index)
+            r = run_rep(prompts, cfg, index)
             after = scrape_counters()
             index += cfg["concurrency"] * cfg["requests_per_stream"]
             reps[name].append(r)
@@ -675,8 +698,7 @@ def capture_profiles(prompts: Prompts, arm_out: Path) -> dict:
     for name, cfg in CONFIGS.items():
         shutil.rmtree("/dev/shm/xprof", ignore_errors=True)
         Path("/dev/shm/xprof").mkdir(parents=True)
-        rep = threading.Thread(target=run_rep, args=(prompts, cfg["concurrency"],
-                                                     cfg["requests_per_stream"], 900_000))  # fmt: skip
+        rep = threading.Thread(target=run_rep, args=(prompts, cfg, 900_000))
         rep.start()
         time.sleep(PROFILE_LEAD_S)
         http_post_json("/start_profile")
@@ -762,11 +784,12 @@ def run_arm(spec: dict, stage: Path, out: Path, prompts: Prompts) -> dict:
         server = Server(work, rec_dir)
         arm["boot_s"] = server.wait_ready()
         say(f"arm {name}: ready after {arm['boot_s']:.0f}s")
-        arm["prefix_prompt_tokens"] = stream_completion(prompts.get(0), 32)[
+        arm["prefix_prompt_tokens"] = stream_completion(prompts.get(0, 0), 32)[
             "prompt_tokens"
         ]
-        run_rep(prompts, 8, 1, 1)  # untimed: touches every decode bucket the load uses
-        probes = run_probes()
+        # Untimed: one request per stream at the widest concurrency touches every bucket.
+        run_rep(prompts, {**CONFIGS["c8"], "requests_per_stream": 1}, 1)
+        probes = run_probes(prompts)
         say(f"arm {name}: probes worst_error={probes['worst_error']:.3f}")
         load = run_load(prompts)
         if spec.get("profile"):
