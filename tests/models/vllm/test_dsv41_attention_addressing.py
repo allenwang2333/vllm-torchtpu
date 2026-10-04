@@ -183,7 +183,8 @@ def test_paged_index_scores_shared_tiles_match_per_token(requests_count, tokens,
         q, pool, jnp.asarray(records), weights, lengths, jnp.asarray(requests)
     )
     # Scores at -1 records are undefined (callers mask them). The shared path
-    # contracts a request one-hot q in one matmul: equal up to FP32 rounding.
+    # contracts each request row's key tile in one matmul for all tokens:
+    # equal up to FP32 rounding.
     valid = records[requests] >= 0
     np.testing.assert_allclose(
         np.asarray(got)[valid], np.asarray(expected)[valid], rtol=1e-5, atol=1e-5

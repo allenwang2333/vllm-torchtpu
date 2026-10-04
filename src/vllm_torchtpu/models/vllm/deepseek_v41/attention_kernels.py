@@ -425,11 +425,53 @@ def paged_index_scores_jax(
     records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
     scores = jnp.full((tokens, records.shape[1]), -jnp.inf, jnp.float32)
     q = split_halves(q)  # keys are read in the split element order
+    weights = weights.astype(jnp.float32)[:, :, None]
+
+    def head_sum(logits):
+        # Upstream quantized MQA logits and the weighted head reduction are
+        # FP32. BF16 cache storage is not a request to round the dot product.
+        return (jnp.maximum(logits, 0) * weights).sum(1)
+
     if requests is not None:
-        # Zero q outside each token's request row: one [T*H, R*D] x [R*D, C]
-        # matmul over the shared key tile, with no per-token key copy.
-        rows = requests[:, None] == jnp.arange(records.shape[0])
-        q = jnp.where(rows[:, None, :, None], q[:, :, None, :], 0).astype(q.dtype)
+        # One request row at a time, each bounded by its own longest token:
+        # all tokens score the row's shared key tile, and only that row's
+        # tokens keep the result. Rows without tokens (padding) run no tiles,
+        # so work scales with active requests, not the padded row count.
+        row_lengths = (
+            jnp.zeros((records.shape[0],), jnp.int32)
+            .at[requests]
+            .max(jnp.maximum(lengths, 0))
+        )
+
+        def row_step(row, result):
+            mine = (requests == row)[:, None]
+
+            def step(index, result):
+                addresses = jax.lax.dynamic_slice(
+                    records, (row, index * tile), (1, tile)
+                ).reshape(-1)
+                keys = gather_cache_values(pool, addresses, dim, split=True)
+                values = head_sum(
+                    jnp.einsum(
+                        "thd,cd->thc",
+                        q,
+                        keys.reshape(tile, dim),
+                        preferred_element_type=jnp.float32,
+                    )
+                )
+                current = jax.lax.dynamic_slice_in_dim(
+                    result, index * tile, tile, axis=1
+                )
+                return jax.lax.dynamic_update_slice_in_dim(
+                    result, jnp.where(mine, values, current), index * tile, axis=1
+                )
+
+            trips = jnp.minimum(
+                (row_lengths[row] + tile - 1) // tile, records.shape[1] // tile
+            )
+            return jax.lax.fori_loop(0, trips, step, result)
+
+        return jax.lax.fori_loop(0, records.shape[0], row_step, scores)[:, :width]
 
     def step(index, result):
         # Read only the tile consumed by this iteration. Gathering before
@@ -439,23 +481,9 @@ def paged_index_scores_jax(
         keys = gather_cache_values(
             pool, addresses.reshape(-1), dim, split=True
         ).reshape(records.shape[0], tile, dim)
-        if requests is not None:
-            # Invalid addresses read arbitrary rows; other requests' rows
-            # are multiplied by zero, which must not meet NaN/inf.
-            keys = jnp.where((addresses >= 0)[..., None] & jnp.isfinite(keys), keys, 0)
-            logits = jnp.einsum(
-                "thrd,rcd->thc", q, keys, preferred_element_type=jnp.float32
-            )
-        else:
-            logits = jnp.einsum(
-                "thd,tcd->thc", q, keys, preferred_element_type=jnp.float32
-            )
-        # Upstream quantized MQA logits and the weighted head reduction are
-        # FP32. BF16 cache storage is not a request to round the dot product.
-        logits = jnp.maximum(logits, 0)
-        values = (logits * weights.astype(jnp.float32)[:, :, None]).sum(1)
+        logits = jnp.einsum("thd,tcd->thc", q, keys, preferred_element_type=jnp.float32)
         return jax.lax.dynamic_update_slice_in_dim(
-            result, values.astype(jnp.float32), index * tile, axis=1
+            result, head_sum(logits), index * tile, axis=1
         )
 
     return jax.lax.fori_loop(
