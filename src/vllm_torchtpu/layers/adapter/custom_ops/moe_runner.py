@@ -34,6 +34,9 @@ from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 # _fused_output_is_reduced).
 _upstream_fused_output_is_reduced = MoERunner._fused_output_is_reduced.fget
 assert _upstream_fused_output_is_reduced is not None
+_HAS_SYNC_SHARED_EXPERTS_STREAM = hasattr(
+    MoERunner, "_maybe_sync_shared_experts_stream"
+)
 
 
 @MoERunner.register_oot
@@ -116,7 +119,10 @@ class VllmMoERunner(MoERunner):
             )
 
         self.routed_experts._ensure_moe_quant_config_init()
-        self._maybe_sync_shared_experts_stream(shared_experts_input)
+        if _HAS_SYNC_SHARED_EXPERTS_STREAM:
+            self._maybe_sync_shared_experts_stream(shared_experts_input)
+        elif self._shared_experts is not None:
+            self._shared_experts.maybe_forward_async(shared_experts_input)
 
         ep_group = parallel_state.get_ep_group()
         if ep_group.world_size > 1:

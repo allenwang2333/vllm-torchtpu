@@ -458,13 +458,13 @@ def _patch_disable_sequence_parallel_moe() -> None:
                 sizes.append(int(env_dp))
             return max(sizes)
 
-        logged_decisions: set[tuple[str, int, bool]] = set()
+        logged_decisions: set[tuple[str, int, bool, bool]] = set()
 
         def _use_sequence_parallel_moe(self: ParallelConfig) -> bool:
             mode = envs.VLLM_TPU_MOE_SEQUENCE_PARALLEL
             if not (
                 mode != "off"
-                and self.enable_expert_parallel
+                and (self.enable_expert_parallel or mode == "force")
                 and self.tensor_parallel_size > 1
                 and self.prefill_context_parallel_size == 1
             ):
@@ -475,16 +475,17 @@ def _patch_disable_sequence_parallel_moe() -> None:
             # it swaps the all-reduces for RS + AG launches, so it is opt-in.
             dp_size = _effective_dp_size(self)
             enabled = mode == "force" or dp_size > 1
-            decision = (mode, dp_size, enabled)
+            decision = (mode, dp_size, self.enable_expert_parallel, enabled)
             if decision not in logged_decisions:
                 logged_decisions.add(decision)
                 logger.info(
                     "Sequence-parallel MoE %s "
-                    "(VLLM_TPU_MOE_SEQUENCE_PARALLEL=%s, dp_size=%d, tp_size=%d)%s.",
+                    "(VLLM_TPU_MOE_SEQUENCE_PARALLEL=%s, dp_size=%d, tp_size=%d, ep=%s)%s.",
                     "enabled" if enabled else "skipped",
                     mode,
                     dp_size,
                     self.tensor_parallel_size,
+                    self.enable_expert_parallel,
                     ""
                     if enabled
                     else "; upstream gate needs DP > 1, use 'force' on DP == 1",
@@ -512,13 +513,18 @@ def _patch_disable_sequence_parallel_moe() -> None:
                 else:
                     y = x
             reshaped = y.reshape(tp_size, -1, *x.shape[1:])
-            key = (x.device, tp_rank)
-            rank_tensor = tp_rank_tensors.get(key)
-            if rank_tensor is None:
+            if torch.compiler.is_compiling():
                 rank_tensor = torch.tensor(
                     [tp_rank], dtype=torch.int64, device=x.device
                 )
-                tp_rank_tensors[key] = rank_tensor
+            else:
+                key = (x.device, tp_rank)
+                rank_tensor = tp_rank_tensors.get(key)
+                if rank_tensor is None:
+                    rank_tensor = torch.tensor(
+                        [tp_rank], dtype=torch.int64, device=x.device
+                    )
+                    tp_rank_tensors[key] = rank_tensor
             return torch.index_select(reshaped, 0, rank_tensor).reshape(
                 -1, *x.shape[1:]
             )

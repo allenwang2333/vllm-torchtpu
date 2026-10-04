@@ -97,11 +97,13 @@ def _sp_moe_enabled(
         # group or TORCH_TPU_DP_SIZE still reveal the real DP width.
         (dict(mode="auto", dp=1, live_dp=4), True),
         (dict(mode="auto", dp=1, env_dp=4), True),
-        # "force" also enables DP == 1 (TP-only + EP).
+        # "force" also enables DP == 1 (TP-only + EP) and EP == False (TP + SP).
         (dict(mode="force", dp=1), True),
-        # Structural requirements hold in every mode.
+        (dict(mode="force", dp=1, ep=False), True),
+        (dict(mode="force", dp=2, ep=False), True),
+        # Structural requirements hold in every mode; "auto" still requires EP.
         (dict(mode="force", dp=1, tp=1), False),
-        (dict(mode="force", dp=2, ep=False), False),
+        (dict(mode="auto", dp=2, ep=False), False),
     ],
 )
 def test_use_sequence_parallel_moe_gate(monkeypatch, kwargs, expected):
