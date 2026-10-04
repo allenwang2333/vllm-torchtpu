@@ -806,7 +806,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 "Pooled KDA requires mamba_state_indices in the attention metadata"
             )
         # AttentionMetadata also describes the JAX-side representation. The
-        # builder supplies Torch tensors here, before the pallas.jax_op bridge.
+        # builder supplies Torch tensors here, before the Torch-to-JAX bridge.
         window_distribution = cast(
             torch.Tensor | None, metadata.mamba_request_distribution
         )
