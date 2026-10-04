@@ -11,6 +11,8 @@ from vllm_torchtpu.models.vllm.deepseek_v41.attention import (
     _row_slots,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.attention_kernels import (
+    _attend_window,
+    _attention_state,
     _visible_top_k,
     paged_attention_jax,
     paged_index_scores_jax,
@@ -262,3 +264,35 @@ def test_visible_top_k_matches_full(bound, rows):
     got = _visible_top_k(scores, k, jnp.int32(bound))
     expected = jnp.sort(jax.lax.top_k(scores, k)[1], axis=-1)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
+
+
+@pytest.mark.parametrize("lengths", [(256,), (100, 3, 1, 152), (37, 90, 129)])
+def test_attend_window_branch_free_matches_conditional(lengths):
+    # Contiguous requests (chunk tails, decode tokens) packed into one batch,
+    # padded to 256 tokens; W = 128 window records per token.
+    rng = np.random.default_rng(sum(lengths))
+    tokens, heads, dim, window = 256, 2, 512, 128
+    pool = jnp.asarray(rng.integers(0, 2**31, (4096, 128)), jnp.int32) & jnp.int32(
+        0x3EFF3EFF
+    )
+    records = np.full((tokens, window), -1, np.int32)
+    start = 0
+    for request, length in enumerate(lengths):
+        base = 1000 * request + int(rng.integers(0, 300))
+        for t in range(length):
+            position = base + t
+            logical = position - window + 1 + np.arange(window)
+            records[start + t] = np.where(logical >= 0, logical, -1)
+        start += length
+    q = jnp.asarray(rng.standard_normal((tokens, heads, dim)), jnp.bfloat16)
+    state = _attention_state(q)
+    # fallback=tokens: the conditional version patches instead of redoing
+    # the whole batch with `_attend`.
+    expected = _attend_window(
+        q, pool, jnp.asarray(records), state, dim**-0.5, fallback=tokens
+    )
+    got = _attend_window(
+        q, pool, jnp.asarray(records), state, dim**-0.5, max_requests=len(lengths)
+    )
+    for e, g in zip(expected, got):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(e))

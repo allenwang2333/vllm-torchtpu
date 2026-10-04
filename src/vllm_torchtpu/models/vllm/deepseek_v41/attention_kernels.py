@@ -138,7 +138,9 @@ def _window_union(records, tile):
     return union, mask, uncovered
 
 
-def _attend_window(q, pool, records, state, scale, tile=64, fallback=64):
+def _attend_window(
+    q, pool, records, state, scale, tile=64, fallback=64, max_requests=None
+):
     """`_attend` for sliding-window records, gathering per token tile.
 
     Prefill tokens of one request share most of their window, so the per
@@ -147,6 +149,14 @@ def _attend_window(q, pool, records, state, scale, tile=64, fallback=64):
     membership mask. Up to ``fallback`` uncovered tokens (other requests in
     the tile: decode tokens, a previous chunk's tail) are recomputed with
     `_attend`; if more are uncovered, the whole batch uses `_attend`.
+
+    ``max_requests`` (static bound on requests per batch) removes both
+    conditionals: only tokens of a request other than their tile's last one
+    are uncovered, at most ``tile - 1`` per request boundary, so a patch of
+    that static capacity always runs. XLA completes in-flight SparseCore
+    gathers before a conditional holding SparseCore ops; without one, the
+    CSA gathers can overlap SWA. Tokens beyond the bound (impossible for
+    contiguous request tokens) come out NaN rather than silently wrong.
     """
     tokens, heads, dim = q.shape
     width = records.shape[1]
@@ -154,6 +164,8 @@ def _attend_window(q, pool, records, state, scale, tile=64, fallback=64):
         return _attend(q, pool, records, state, scale)
     union, mask, uncovered = _window_union(records, tile)
     count = union.shape[0]
+    if max_requests is not None:
+        fallback = min(tokens, -(-(tile - 1) * (max_requests - 1) // 8) * 8)
 
     def fast(_):
         gathered = gather_cache_pieces(pool, union.reshape(-1), dim)
@@ -209,8 +221,19 @@ def _attend_window(q, pool, records, state, scale, tile=64, fallback=64):
                 full.at[index].set(part, mode="drop") for full, part in zip(result, sub)
             )
 
-        return jax.lax.cond(uncovered.any(), patch, lambda result: result, result)
+        if max_requests is None:
+            return jax.lax.cond(uncovered.any(), patch, lambda result: result, result)
+        if fallback:
+            result = patch(result)
+        flat = uncovered.reshape(-1)
+        overflow = flat & (jnp.cumsum(flat) > fallback)
+        return tuple(
+            jnp.where(overflow.reshape(-1, *([1] * (r.ndim - 1))), jnp.nan, r)
+            for r in result
+        )
 
+    if max_requests is not None:
+        return fast(None)
     return jax.lax.cond(
         uncovered.sum() > fallback,
         lambda _: _attend(q, pool, records, state, scale),
@@ -263,6 +286,7 @@ def sparse_fp8_attention_jax(
     sink: jax.Array,
     scale: float,
     page_size: int,
+    max_requests: int | None = None,
 ) -> jax.Array:
     """BF16 SWA partial merged into V4's sparse MLA over FP8 NoPE + RoPE rows.
 
@@ -271,16 +295,27 @@ def sparse_fp8_attention_jax(
     page_size + r % page_size``; the RoPE companion holds raw row i's 32 words
     at i. With one request, one page of every row and ``query_start_loc``
     ``[0, tokens]``, records are raw rows.
+
+    ``max_requests`` bounds requests per batch (see `_attend_window`).
     """
     from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import (
         sparse_ragged_paged_attention,
     )
 
-    state = _attend_window(q, swa_pool, swa_records, _attention_state(q), scale)
+    state = _attend_window(
+        q,
+        swa_pool,
+        swa_records,
+        _attention_state(q),
+        scale,
+        max_requests=max_requests,
+    )
     # The SWA conditional holds SparseCore gathers, and XLA completes every
     # in-flight `sc_csa_gather` before such a conditional: the TensorCore then
     # idles through the whole gather chain (sc_gather_diag.md). Launch the CSA
     # gathers after SWA instead so they pipeline with the SparseMLA chunks.
+    # Without the conditional (``max_requests``) this ordering still measured
+    # faster at 100k (16.0K vs 15.7K tok/s).
     (maximum, denominator, numerator), main_pool, rope_pool = (
         jax.lax.optimization_barrier((state, main_pool, rope_pool))
     )
@@ -333,12 +368,16 @@ def initialize_paged_attention():
         sink: jax.Array,
         scale: float,
         page_size: int,
+        max_requests: int | None,
     ) -> jax.Array:
         # Mosaic calls require explicit manual partitioning on a multi-device
         # mesh; each device attends over its own replicated cache.
         return jax.shard_map(
             functools.partial(
-                sparse_fp8_attention_jax, scale=scale, page_size=page_size
+                sparse_fp8_attention_jax,
+                scale=scale,
+                page_size=page_size,
+                max_requests=max_requests,
             ),
             mesh=mesh,
             in_specs=(P(),) * 9,
@@ -360,7 +399,7 @@ def initialize_paged_attention():
         "pallas::deepseek_v41_sparse_fp8_attention",
         fp8_attention,
         mesh=mesh,
-        input_partition_specs=(P(),) * 9 + (None, None),
+        input_partition_specs=(P(),) * 9 + (None, None, None),
     )
     _fp8_attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -373,7 +412,16 @@ def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
 
 
 def sparse_fp8_attention(
-    q, swa, main, swa_records, main_records, sink, scale, pages=None, starts=None
+    q,
+    swa,
+    main,
+    swa_records,
+    main_records,
+    sink,
+    scale,
+    pages=None,
+    starts=None,
+    max_requests=None,
 ):
     """``main_records`` are raw rows, or rows paged by ``pages`` (main.pages)."""
     assert _fp8_attention_op is not None and main.rope is not None
@@ -395,6 +443,7 @@ def sparse_fp8_attention(
         sink,
         scale,
         page_size,
+        max_requests,
     )
 
 
