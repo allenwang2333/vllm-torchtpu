@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 from torch import nn
 from vllm.config import VllmConfig
@@ -803,6 +805,13 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             raise RuntimeError(
                 "Pooled KDA requires mamba_state_indices in the attention metadata"
             )
+        # AttentionMetadata also describes the JAX-side representation. The
+        # builder supplies Torch tensors here, before the pallas.jax_op bridge.
+        window_distribution = cast(
+            torch.Tensor | None, metadata.mamba_request_distribution
+        )
+        slot_read_offsets = cast(torch.Tensor | None, metadata.mamba_slot_read_offsets)
+        ckpt_indices = cast(torch.Tensor | None, metadata.mamba_ckpt_indices)
         return self.pooled_kda_op(
             mixed_qkv,
             raw_gate,
@@ -817,7 +826,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             state_indices,
             metadata.seq_lens,
             metadata.request_distribution,
-            metadata.mamba_request_distribution,
-            metadata.mamba_slot_read_offsets,
-            metadata.mamba_ckpt_indices,
+            window_distribution,
+            slot_read_offsets,
+            ckpt_indices,
         )
