@@ -630,6 +630,112 @@ def test_z_image_transformer_block_compile(monkeypatch):
     ]
 
 
+def test_z_image_noise_refiner_sp_sharding(monkeypatch):
+    """noise_refiner runs sequence-sharded under SP with sp_active raised.
+
+    The refiner inputs (x, attn_mask, cos, sin) are sharded on dim 1 before
+    noise_refiner[0], ``_sp_shard_depth`` is 1 only inside the refiner, the
+    output of noise_refiner[-1] is gathered back, hooks are installed once per
+    model, and sequences that do not divide by the SP size stay unsharded.
+    """
+    from types import SimpleNamespace
+
+    import torch.nn as nn
+
+    from vllm_torchtpu.omni import patches as omni_patches
+
+    events = []
+    _, _, fake_ctx = _install_fake_z_image(monkeypatch, events)
+    monkeypatch.setattr(omni_patches, "_ZIMAGE_BLOCK_COMPILE", False)
+    fake_ctx._sp_shard_depth = 0
+    fake_ctx._sp_equal_pad_stack = []
+    world = {"size": 2}
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.diffusion.distributed.sp_sharding",
+        SimpleNamespace(
+            get_sequence_parallel_world_size=lambda: world["size"],
+            sp_shard=lambda t, dim, validate=True: t.chunk(world["size"], dim)[0],
+            sp_gather=lambda t, dim, validate=True: torch.cat([t] * world["size"], dim),
+        ),
+    )
+
+    seen = []
+
+    class _Refiner(nn.Module):
+        def forward(self, x, attn_mask, cos, sin, adaln_input=None):
+            seen.append(
+                (
+                    tuple(x.shape),
+                    tuple(attn_mask.shape),
+                    tuple(cos.shape),
+                    tuple(sin.shape),
+                    tuple(adaln_input.shape),
+                    fake_ctx._sp_shard_depth,
+                    list(fake_ctx._sp_equal_pad_stack),
+                )
+            )
+            return x + 1
+
+    class _Model:
+        _sp_plan = {}
+
+        def __init__(self):
+            self.unified_prepare = SimpleNamespace(
+                _hook_registry=SimpleNamespace(_hooks={"sp": object()})
+            )
+            self.noise_refiner = nn.ModuleList([_Refiner(), _Refiner()])
+
+        def forward(self, x, attn_mask, cos, sin, adaln):
+            for layer in self.noise_refiner:
+                x = layer(x, attn_mask, cos, sin, adaln)
+            return x
+
+    z_img_mod = sys.modules["vllm_omni.diffusion.models.z_image.z_image_transformer"]
+    z_img_mod.ZImageTransformer2DModel = _Model
+    omni_patches._patch_z_image_transformer_block_flush()
+
+    model = _Model()
+    x = torch.zeros(1, 16, 4)
+    mask = torch.ones(1, 16, dtype=torch.bool)
+    cos, sin = torch.ones(1, 16, 2), torch.ones(1, 16, 2)
+    adaln = torch.ones(1, 4)
+    out = model.forward(x, mask, cos, sin, adaln)
+    assert fake_ctx.sp_plan_hooks_applied is True
+    assert tuple(out.shape) == (1, 16, 4) and torch.all(out == 2)
+    assert seen == [
+        ((1, 8, 4), (1, 8), (1, 8, 2), (1, 8, 2), (1, 4), 1, [True]),
+        ((1, 8, 4), (1, 8), (1, 8, 2), (1, 8, 2), (1, 4), 1, [True]),
+    ]
+    assert fake_ctx._sp_shard_depth == 0 and fake_ctx._sp_equal_pad_stack == []
+    # Sharded refiner blocks are flagged to bypass the compiled block path.
+    assert [b._tpu_block_eager for b in model.noise_refiner] == [True, True]
+
+    # Hooks are installed once per model instance.
+    model.forward(x, mask, cos, sin, adaln)
+    assert len(model.noise_refiner[0]._forward_pre_hooks) == 1
+    assert len(model.noise_refiner[1]._forward_hooks) == 1
+
+    # A sequence that does not divide by the SP size stays unsharded.
+    seen.clear()
+    out = model.forward(
+        torch.zeros(1, 15, 4), mask[:, :15], cos[:, :15], sin[:, :15], adaln
+    )
+    assert tuple(out.shape) == (1, 15, 4)
+    assert [s[0] for s in seen] == [(1, 15, 4), (1, 15, 4)]
+    assert [s[5] for s in seen] == [0, 0]
+    assert [b._tpu_block_eager for b in model.noise_refiner] == [False, False]
+
+    # SP size 1: no sharding, no depth change, compiled path kept.
+    seen.clear()
+    world["size"] = 1
+    model = _Model()
+    out = model.forward(x, mask, cos, sin, adaln)
+    assert tuple(out.shape) == (1, 16, 4)
+    assert [s[5] for s in seen] == [0, 0]
+    assert [b._tpu_block_eager for b in model.noise_refiner] == [False, False]
+
+
 def test_tpu_prompt_encoder_build_mask():
     from vllm_torchtpu.omni.patches import _TpuCompiledPromptEncoder
 

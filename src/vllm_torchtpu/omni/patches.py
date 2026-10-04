@@ -4,6 +4,7 @@
 import dataclasses
 import functools
 import importlib
+from collections.abc import Callable
 from functools import cache as run_once
 from typing import Any
 
@@ -411,6 +412,129 @@ def _patch_z_image_transformer_block_flush() -> None:
         hooks = getattr(registry, "_hooks", getattr(registry, "hooks", None))
         return bool(hooks) if isinstance(hooks, dict) else True
 
+    # Shard ``noise_refiner`` under SP as well. Upstream's ``_sp_plan`` only
+    # shards from ``unified_prepare`` on, so at sp=N every rank runs both
+    # noise_refiner blocks on the full image sequence (S=4096, ~3 ms each per
+    # step on tpu7x) while the main layers run S=4128/N. The refiner blocks are
+    # ordinary ``ZImageTransformerBlock``s, so the same Ulysses attention that
+    # serves the sharded main layers serves them: shard ``x``/``attn_mask``/
+    # ``cos``/``sin`` along the sequence before ``noise_refiner[0]`` and
+    # all-gather the output after ``noise_refiner[-1]``. ``_sp_shard_depth`` is
+    # raised for the duration (vLLM-Omni only raises it for ``split_output``
+    # plan entries) so ``ctx.sp_active`` turns the collectives on, and an
+    # equal-length boundary is pushed so the attention layer skips its runtime
+    # length all-gather. Sequences that do not divide evenly stay unsharded.
+    # REMOVAL CONDITION: upstream ``ZImageTransformer2DModel._sp_plan`` covers
+    # ``noise_refiner`` (and the split hook raises ``_sp_shard_depth`` for
+    # input splits).
+    def _install_noise_refiner_sp(
+        model: Any, fc_available: Callable[[], bool], fc_get: Callable[[], Any]
+    ) -> None:
+        if getattr(model, "_tpu_noise_refiner_sp", False):
+            return
+        model._tpu_noise_refiner_sp = True
+        refiner = getattr(model, "noise_refiner", None)
+        if refiner is None or len(refiner) == 0:
+            return
+        try:
+            sp_mod = importlib.import_module(
+                "vllm_omni.diffusion.distributed.sp_sharding"
+            )
+            sp_shard, sp_gather = sp_mod.sp_shard, sp_mod.sp_gather
+            sp_world_size = sp_mod.get_sequence_parallel_world_size
+        except Exception:  # noqa: BLE001 - keep the unsharded refiner
+            logger.warning(
+                "vllm_omni sp_sharding unavailable; noise_refiner stays unsharded."
+            )
+            return
+        state = {"sharded": False}
+        arg_names = ("x", "attn_mask", "cos", "sin")
+
+        def _make_pre(first: bool) -> Any:
+            # ``forward`` re-passes the full-length attn_mask/cos/sin to every
+            # refiner block, so each block shards those; ``x`` is sharded once.
+            def _pre(
+                module: Any, args: tuple, kwargs: dict
+            ) -> tuple[tuple, dict] | None:
+                module._tpu_block_eager = False
+                if first:
+                    state["sharded"] = False
+                elif not state["sharded"]:
+                    return None
+                x = args[0] if args else kwargs.get("x")
+                if x is None or not isinstance(x, torch.Tensor):
+                    return None
+                if x.dim() != 3 or not fc_available():
+                    return None
+                world = sp_world_size()
+                if first:
+                    full_len = x.shape[1]
+                    if world <= 1 or full_len % world or full_len < world:
+                        return None
+                else:
+                    full_len = x.shape[1] * world
+                args_list = list(args)
+                for i, name in enumerate(arg_names):
+                    if i == 0 and not first:
+                        continue
+                    if i < len(args_list):
+                        t = args_list[i]
+                    elif name in kwargs:
+                        t = kwargs[name]
+                    else:
+                        continue
+                    if not (
+                        isinstance(t, torch.Tensor)
+                        and t.dim() >= 2
+                        and t.shape[1] == full_len
+                    ):
+                        continue
+                    t = sp_shard(t, 1, validate=False)
+                    if i < len(args_list):
+                        args_list[i] = t
+                    else:
+                        kwargs[name] = t
+                if first:
+                    ctx = fc_get()
+                    ctx._sp_shard_depth += 1
+                    ctx._sp_equal_pad_stack.append(True)
+                    state["sharded"] = True
+                # The *sharded* refiner runs through the eager (lazy-traced)
+                # block path, not the shared torch.compile'd one: compiled, the
+                # sharded refiner yields NaN latents at sp=8 and a ~10 dB PSNR
+                # loss at sp=4 (correct at sp=2), while the same compiled
+                # function is correct for the unsharded refiner and for every
+                # sharded main layer. Root cause not yet isolated (candidates:
+                # buffer aliasing between the AOT executable's shard inputs and
+                # the full ``x_cos``/``x_sin`` reused by ``unified_prepare``).
+                # Eager costs ~1 ms/step at sp=8 and keeps the sharding gain.
+                module._tpu_block_eager = True
+                return tuple(args_list), kwargs
+
+            return _pre
+
+        def _post(module: Any, args: tuple, output: Any) -> Any:
+            if not state["sharded"]:
+                return None
+            state["sharded"] = False
+            gathered = output
+            if isinstance(output, torch.Tensor):
+                gathered = sp_gather(output, 1, validate=False)
+            ctx = fc_get()
+            ctx._sp_shard_depth = max(0, ctx._sp_shard_depth - 1)
+            if ctx._sp_equal_pad_stack:
+                ctx._sp_equal_pad_stack.pop()
+            return gathered
+
+        for i, block in enumerate(refiner):
+            block.register_forward_pre_hook(_make_pre(i == 0), with_kwargs=True)
+        refiner[-1].register_forward_hook(_post)
+        logger.info(
+            "Applied TPU patch: noise_refiner (%d blocks) runs sequence-sharded "
+            "under SP.",
+            len(refiner),
+        )
+
     if (
         model_cls is not None
         and hasattr(model_cls, "forward")
@@ -425,6 +549,7 @@ def _patch_z_image_transformer_block_flush() -> None:
                 and is_fc_available()
             ):
                 get_fc().sp_plan_hooks_applied = True
+                _install_noise_refiner_sp(self, is_fc_available, get_fc)
             return orig_model_forward(self, *args, **kwargs)
 
         model_cls.forward = _mark_tpu_patch(_model_forward, orig_model_forward)
@@ -461,7 +586,12 @@ def _patch_z_image_transformer_block_flush() -> None:
         # layers[0] have layer_id == 0.
         if on_tpu and getattr(self, "layer_id", None) in (0, 1000):
             _tpu_materialize_async(None)
-        if on_tpu and compile_state["enabled"]:
+        use_compiled = (
+            on_tpu
+            and compile_state["enabled"]
+            and not getattr(self, "_tpu_block_eager", False)
+        )
+        if use_compiled:
             try:
                 out = _compiled_forward()(self, *args, **kwargs)
             except Exception as exc:  # noqa: BLE001 - keep the model usable
