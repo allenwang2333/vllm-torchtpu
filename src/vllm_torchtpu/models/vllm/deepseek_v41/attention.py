@@ -737,6 +737,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             block_size=max(1, self.candidate_block_size),
             candidate_write=candidate_write,
             candidate_filter=has_candidates and not candidate_write,
+            # FP8 attention re-sorts the selection (compact_records).
+            unordered=self._fp8_kv,
         )
         index_cache.raw.copy_(updated_cache)
         if candidate_write:

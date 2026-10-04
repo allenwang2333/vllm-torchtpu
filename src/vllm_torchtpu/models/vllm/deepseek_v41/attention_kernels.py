@@ -518,7 +518,42 @@ def _threshold_top_k(scores: jax.Array, k: int) -> jax.Array:
     ).astype(jnp.int32)
 
 
-def _visible_top_k(scores: jax.Array, k: int, bound: jax.Array) -> jax.Array:
+def _sparsecore_top_k(scores: jax.Array, k: int, lengths: jax.Array) -> jax.Array:
+    """V4's SparseCore top-k (`kernels/deepseek_v4/sparsecore_topk.py`).
+
+    Same set as ``jax.lax.top_k`` over the finite scores (ties at the k-th
+    value by lowest index), unordered, ``-1`` suffix-padded; ``-inf`` and
+    columns ``>= lengths`` are never selected.
+    """
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        get_vllm_model_wrapper_context,
+    )
+
+    select = functools.partial(sparsecore_topk, k=k)
+    try:
+        mesh = get_vllm_model_wrapper_context().mesh
+    except Exception:  # Standalone (tests): one device, no mesh.
+        return select(scores, row_lengths=lengths)
+    # Mosaic calls need manual partitioning; every device selects locally.
+    return jax.shard_map(
+        lambda s, n: select(s, row_lengths=n),
+        mesh=mesh,
+        in_specs=(P(), P()),
+        out_specs=P(),
+        check_vma=False,
+    )(scores, lengths)
+
+
+def _visible_top_k(
+    scores: jax.Array,
+    k: int,
+    bound: jax.Array,
+    lengths: jax.Array | None = None,
+    unordered: bool = False,
+) -> jax.Array:
     """Ascending ``jax.lax.top_k(scores, k)`` indices when columns ``>= bound``
     are ``-inf``.
 
@@ -526,7 +561,22 @@ def _visible_top_k(scores: jax.Array, k: int, bound: jax.Array) -> jax.Array:
     ``bound`` (the full width otherwise). Exact: buckets hold at least ``k``
     columns, so ``-inf`` ties still resolve to the lowest indices. Large
     selections use `_threshold_top_k`; small ones (decode) sort.
+
+    ``unordered`` callers (which re-sort and drop ``-1``) accept the finite
+    top-k set in any order, ``-1`` padded instead of ``-inf`` columns; large
+    selections then run on SparseCore over the full width, bounded by
+    ``lengths`` instead of buckets (no SparseCore op inside `lax.switch`).
     """
+    width = scores.shape[1]
+    if (
+        unordered
+        and lengths is not None
+        and scores.shape[0] >= 16
+        and width >= 2048
+        and width % 16 == 0
+        and k % 16 == 0
+    ):
+        return _sparsecore_top_k(scores, k, jnp.minimum(lengths, width))
 
     def select(columns, scores):
         scores = scores[:, :columns]
@@ -534,7 +584,6 @@ def _visible_top_k(scores: jax.Array, k: int, bound: jax.Array) -> jax.Array:
             return _threshold_top_k(scores, k)
         return jnp.sort(jax.lax.top_k(scores, k)[1], axis=-1)
 
-    width = scores.shape[1]
     buckets = []
     bucket = max(k, 1024)
     while bucket < width:
@@ -557,8 +606,13 @@ def select_indices_jax(
     block_size: int,
     candidate_write: bool,
     candidate_filter: bool,
+    unordered: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """Source publishes candidates without filtering its own selection."""
+    """Source publishes candidates without filtering its own selection.
+
+    ``unordered``: see `_visible_top_k` (the selection may come back in any
+    order with ``-1`` anywhere; FP8 attention re-sorts via `compact_records`).
+    """
     count, width = scores.shape
     if topk < 1 or width < 1 or block_size < 1:
         raise ValueError("Positive top-k, score width and block size required")
@@ -604,9 +658,12 @@ def select_indices_jax(
             # Match the upstream batch-wide short-context bypass.
             scores = jnp.where(allowed | (lengths.max() <= topk), scores, -jnp.inf)
     # Ascending: preserves V4.1's logical, hence attention accumulation, order.
-    indices = _visible_top_k(scores, min(topk, width), lengths.max())
-    values = jnp.take_along_axis(scores, indices, axis=1)
-    return jnp.where(values > -jnp.inf, indices, -1).astype(jnp.int32), published
+    indices = _visible_top_k(
+        scores, min(topk, width), lengths.max(), lengths, unordered
+    )
+    values = jnp.take_along_axis(scores, jnp.maximum(indices, 0), axis=1)
+    valid = (indices >= 0) & (values > -jnp.inf)
+    return jnp.where(valid, indices, -1).astype(jnp.int32), published
 
 
 def paged_indexer_jax(
@@ -621,6 +678,7 @@ def paged_indexer_jax(
     block_size: int,
     candidate_write: bool,
     candidate_filter: bool,
+    unordered: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows."""
 
@@ -635,6 +693,7 @@ def paged_indexer_jax(
             block_size,
             candidate_write,
             candidate_filter,
+            unordered,
         )
 
     width = records.shape[1]
@@ -730,6 +789,7 @@ def update_and_select_jax(
     block_size: int,
     candidate_write: bool,
     candidate_filter: bool,
+    unordered: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     updated = write_index_keys(pool, write_records, keys)
     selected, published = paged_indexer_jax(
@@ -744,6 +804,7 @@ def update_and_select_jax(
         block_size,
         candidate_write,
         candidate_filter,
+        unordered,
     )
     return updated, selected, published
 
@@ -764,7 +825,7 @@ def initialize_indexer():
         update_and_select_jax,
         donate_argnums=(1,),
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 9 + (None,) * 4,
+        input_partition_specs=(P(),) * 9 + (None,) * 5,
     )
 
     def fake(
@@ -781,6 +842,7 @@ def initialize_indexer():
         block_size,
         candidate_write,
         candidate_filter,
+        unordered,
     ):
         return (
             torch.empty_like(pool),
@@ -808,6 +870,7 @@ def paged_indexer(
     block_size,
     candidate_write,
     candidate_filter,
+    unordered=False,
 ):
     """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows."""
     assert _indexer_op is not None
@@ -825,4 +888,5 @@ def paged_indexer(
         block_size,
         candidate_write,
         candidate_filter,
+        unordered,
     )
