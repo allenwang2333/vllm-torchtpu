@@ -37,9 +37,15 @@ Per arm and config:
                the config's fixed requests, median of REPS.
   correct      every known-answer probe right (short questions and needles in
                long uncached contexts), every load request exactly as long as
-               the config asks.
-  worst_error  fraction of known-answer probes answered wrongly.
-  checksum     sha256 of every probe's greedy reply.
+               the config asks. The logprob tolerance is the campaign's, applied
+               to worst_error by the harness.
+  worst_error  the worst prompt's next-token logprob error against the control
+               arm of the same job: for each reference prompt whose length puts
+               the forward pass in this config's token bucket, the largest
+               |logprob| difference over the control's top-5 tokens (the
+               control itself reports 0).
+  checksum     sha256 of every probe's greedy reply and every reference
+               prompt's top token.
   dispatched   digest of every Mosaic kernel the arm's server lowered (name and
                serialized config, which carries the kernel's lowered IR) and of
                the LIBTPU_INIT_ARGS it was lowered under. A candidate that leaves
@@ -275,6 +281,15 @@ OPEN_PROBES = [
     "Describe the water cycle in two sentences.",
 ]
 OPEN_MAX_TOKENS = 64
+
+#: Reference prompts for worst_error, per config: (prompts, max tokens, min tokens). A
+#: prompt of n tokens runs its whole forward pass, MoE included, in the smallest token
+#: bucket >= n, which for the decode configs is the bucket their decode steps use. The
+#: logprobs are the prefill step's: with speculative decoding on, this stack returns
+#: logprobs only on a step that verifies no drafts.
+REFERENCE = {"c1": (12, 4, 1), "c2": (12, 8, 5), "c4": (12, 16, 9), "c8": (12, 32, 17),
+             "p16k": (3, 32_768, 16_385)}  # fmt: skip
+REFERENCE_TOPK = 5
 
 #: Profiled windows per config, when an arm asks for them (untimed, after the reps).
 PROFILE_LEAD_S = 4
@@ -604,6 +619,63 @@ def run_probes(prompts: Prompts) -> dict:
     }
 
 
+def count_tokens(text: str) -> int:
+    return int(http_post_json("/tokenize", {"model": MODEL, "prompt": text})["count"])
+
+
+def reference_prompts(prompts: Prompts) -> list[tuple[str, str]]:
+    """(config, prompt) pairs, chosen by the server's own tokenizer, the same in every arm."""
+    chosen = []
+    for k, (cfg, (want, hi, lo)) in enumerate(REFERENCE.items()):
+        found, index = 0, 600_000 + 10_000 * k
+        while found < want:
+            index += 1
+            if index > 600_000 + 10_000 * k + 2_000:
+                raise RuntimeError(f"no {lo}-{hi} token prompts found for {cfg}")
+            for chars in (max(hi // 2, 2), hi, 2 * hi, 3 * hi, 4 * hi):
+                text = prompts.excerpt(index, chars)
+                n = count_tokens(text)
+                if lo <= n <= hi:
+                    chosen.append((cfg, text))
+                    found += 1
+                    break
+                if n > hi:
+                    break
+    return chosen
+
+
+def next_token_logprobs(refs: list[tuple[str, str]]) -> list[dict]:
+    out = []
+    for cfg, text in refs:
+        r = http_post_json("/v1/completions", {
+            "model": MODEL, "prompt": text, "max_tokens": 1, "temperature": 0.0,
+            "logprobs": REFERENCE_TOPK})  # fmt: skip
+        top = r["choices"][0]["logprobs"]["top_logprobs"][0]
+        out.append({"config": cfg, "sha": hashlib.sha256(text.encode()).hexdigest()[:16],
+                    "tokens": r["usage"]["prompt_tokens"], "top": top})  # fmt: skip
+    return out
+
+
+def logprob_error(ref: dict, got: dict) -> float:
+    """Largest |logprob| gap over the reference's top tokens; a token missing from `got`
+    is charged at least its distance above got's lowest listed logprob."""
+    floor = min(got.values())
+    return max(
+        abs(got[t] - lp) if t in got else max(lp - floor, 0.0) for t, lp in ref.items()
+    )
+
+
+def reference_errors(mine: list[dict], control: list[dict]) -> dict[str, float]:
+    by_sha = {r["sha"]: r for r in control}
+    if [r["sha"] for r in mine] != [r["sha"] for r in control]:
+        raise RuntimeError("reference prompts differ from the control arm's")
+    worst = dict.fromkeys(REFERENCE, 0.0)
+    for r in mine:
+        err = logprob_error(by_sha[r["sha"]]["top"], r["top"])
+        worst[r["config"]] = max(worst[r["config"]], err)
+    return worst
+
+
 def run_rep(prompts: Prompts, cfg: dict, base: int) -> dict:
     """One closed-loop repetition: `concurrency` streams issuing their requests in turn."""
     results: list[dict] = []
@@ -757,7 +829,9 @@ def unmeasured_configs() -> dict:
                    "dispatched": "", "declined": True} for name in CONFIGS}  # fmt: skip
 
 
-def run_arm(spec: dict, stage: Path, out: Path, prompts: Prompts) -> dict:
+def run_arm(
+    spec: dict, stage: Path, out: Path, prompts: Prompts, control_ref: list[dict] | None
+) -> dict:
     name = spec["name"]
     arm_out = out / "arms" / name
     arm_out.mkdir(parents=True, exist_ok=True)
@@ -798,11 +872,13 @@ def run_arm(spec: dict, stage: Path, out: Path, prompts: Prompts) -> dict:
         probes = run_probes(prompts)
         say(f"arm {name}: probes worst_error={probes['worst_error']:.3f}")
         load = run_load(prompts)
+        arm["reference"] = next_token_logprobs(reference_prompts(prompts))
         if spec.get("profile"):
             arm["profiles"] = capture_profiles(prompts, arm_out)
         arm["arm_wall_s"] = time.time() - t0
     except Exception as e:  # reported as an unmeasured arm, never as a number
         arm["error"] = repr(e)
+        arm["load_before_failure"] = load  # for diagnosis only; no config is printed
         say(f"arm {name}: FAILED {e!r}")
         load = None
     finally:
@@ -847,12 +923,28 @@ def run_arm(spec: dict, stage: Path, out: Path, prompts: Prompts) -> dict:
         else ""
     )
     arm["probes"] = probes
+    reference = arm["reference"]
+    if control_ref is None and not spec["control"]:
+        arm["error"] = "the control arm left no reference to compare against"
+        return arm  # nothing to vouch for: no number is printed
+    try:
+        errors = reference_errors(
+            reference, reference if spec["control"] else control_ref
+        )
+    except RuntimeError as e:
+        arm["error"] = repr(e)
+        return arm
+    top1 = [max(r["top"], key=r["top"].get) for r in reference]
+    checksum = (
+        "sha256:"
+        + hashlib.sha256(json.dumps([probes["checksum"], top1]).encode()).hexdigest()
+    )
     arm["configs"] = {
         cfg: {
             "latency_us": r["latency_us"],
             "correct": probes["worst_error"] == 0.0 and r["exact_lengths"],
-            "worst_error": probes["worst_error"],
-            "checksum": probes["checksum"],
+            "worst_error": errors[cfg],
+            "checksum": checksum,
             "dispatched": dispatched,
             "declined": False,
             "metrics": r["metrics"],
@@ -902,8 +994,16 @@ def cmd_run(args) -> int:
     job["checkpoint_s"] = fetch_checkpoint()
     say(f"checkpoint in place after {job['checkpoint_s']:.0f}s")
     arms = []
+    if not manifest["arms"][0]["control"]:
+        say(
+            "the control arm must be measured first: the others are compared against it"
+        )
+        return 1
+    control_ref = None
     for spec in manifest["arms"]:
-        arm = run_arm(spec, stage, out, prompts)
+        arm = run_arm(spec, stage, out, prompts, control_ref)
+        if spec["control"]:
+            control_ref = arm.get("reference")
         (out / "arms" / spec["name"] / "arm.json").write_text(json.dumps(arm, indent=1))
         arms.append(arm)
     payload = {"scorer_hash": "sha256:" + file_sha256(Path(__file__)), "job_id": job["job_id"],
@@ -1117,7 +1217,7 @@ def register_recipe(name: str, k8s_file: str) -> None:
 
 
 def cmd_submit(args) -> int:
-    arms = [parse_arm(a) for a in args.arm]
+    arms = sorted((parse_arm(a) for a in args.arm), key=lambda a: not a["control"])
     if sum(a["control"] for a in arms) != 1 or len({a["name"] for a in arms}) != len(
         arms
     ):
