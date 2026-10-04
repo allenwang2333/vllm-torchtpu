@@ -97,13 +97,18 @@ def _raw(pool):
 
 
 def _pack_pool(
-    conv_init, ssm_init, block_ids, conv_shard_heads=None, num_blocks=NUM_BLOCKS,
-    pool_dtype=jnp.bfloat16
+    conv_init,
+    ssm_init,
+    block_ids,
+    conv_shard_heads=None,
+    pool_dtype=jnp.bfloat16,
+    num_blocks=NUM_BLOCKS,
 ):
     """Write the given states into the pool's state regions; the rest of the
     pool (including block 0 and the attention rows of every block) keeps its
     sentinel bytes."""
     rng = np.random.default_rng(99)
+    # Keep the byte capacity fixed; typed scatter packs BF16/FP32 state.
     pool = jnp.asarray(
         rng.standard_normal(
             (num_blocks, BLOCK_SIZE, _pool_pack(pool_dtype), LANES)
@@ -475,7 +480,10 @@ def test_pooled_kda_multistep_state_evolution():
 
 @pytest.mark.parametrize("split", [1, BLOCK_SIZE])
 @pytest.mark.parametrize("seed", [0, 17])
-def test_pooled_kda_speculative_checkpoints(split, seed):
+@pytest.mark.parametrize(
+    "pool_dtype", [jnp.bfloat16, jnp.float8_e4m3fn], ids=["bf16", "fp8"]
+)
+def test_pooled_kda_speculative_checkpoints(split, seed, pool_dtype):
     """Noncontiguous blocks, ragged windows, rollback and padded requests.
 
     The dense window is the oracle; compare every checkpoint, not just the
@@ -491,9 +499,16 @@ def test_pooled_kda_speculative_checkpoints(split, seed):
     conv, ssm = _initial_states(rng, live_states + 1)
     conv = conv.at[-1].set(0)
     ssm = ssm.at[-1].set(0)
-    pool = _pack_pool(conv, ssm, [*physical.reshape(-1), 0], num_blocks=num_blocks)
-    sentinel = np.asarray(pool[-1].view(jnp.uint16)).copy()
-    pool = pool.reshape(num_blocks * split, BLOCK_SIZE // split, PACK, LANES)
+    pool = _pack_pool(
+        conv,
+        ssm,
+        [*physical.reshape(-1), 0],
+        num_blocks=num_blocks,
+        pool_dtype=pool_dtype,
+    )
+    pack = pool.shape[2]
+    sentinel = np.asarray(pool[-1].view(jnp.uint8)).copy()
+    pool = pool.reshape(num_blocks * split, BLOCK_SIZE // split, pack, LANES)
     conv_buf = jnp.concatenate(
         [conv[-1:], conv[:-1], jnp.repeat(conv[-1:], window, axis=0)]
     )
@@ -559,7 +574,7 @@ def test_pooled_kda_speculative_checkpoints(split, seed):
             ckpts,
             lower_bound=-5.0,
             eps=EPS,
-            pool_block_tokens=BLOCK_SIZE * PACK,
+            pool_block_tokens=BLOCK_SIZE * pack,
             num_spec_tokens=window - 1,
         )
         np.testing.assert_allclose(
@@ -585,7 +600,7 @@ def test_pooled_kda_speculative_checkpoints(split, seed):
             rtol=1e-2,
             atol=5e-4,
         )
-        restored = pool.reshape(num_blocks, BLOCK_SIZE, PACK, LANES)
+        restored = pool.reshape(num_blocks, BLOCK_SIZE, pack, LANES)
         np.testing.assert_array_equal(
-            np.asarray(restored[-1].view(jnp.uint16)), sentinel
+            np.asarray(restored[-1].view(jnp.uint8)), sentinel
         )
