@@ -10,6 +10,8 @@ import pytest
 from vllm_torchtpu.kernels.experimental import moe_fused_tp as kernel
 from vllm_torchtpu.layers.core import fused_moe_gmm as wrapper
 
+pytestmark = pytest.mark.tpu_test
+
 M_TOKENS, H, INTER, E, TOPK = 32, 512, 128, 64, 10
 
 

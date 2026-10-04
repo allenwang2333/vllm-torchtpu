@@ -11,6 +11,8 @@ import pytest
 from vllm_torchtpu.kernels.experimental import moe_tp_prefill as mtp
 from vllm_torchtpu.kernels.fused_moe.v2.kernel import rowquant_fp8
 
+pytestmark = pytest.mark.tpu_test
+
 F8 = jnp.float8_e4m3fn
 
 

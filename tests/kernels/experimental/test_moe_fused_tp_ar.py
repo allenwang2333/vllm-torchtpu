@@ -11,6 +11,8 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.experimental import moe_fused_tp as kernel
 
+pytestmark = pytest.mark.tpu_test
+
 N, H, INTER, E, TOPK = 8, 1024, 128, 64, 10
 F8 = jnp.float8_e4m3fn
 
