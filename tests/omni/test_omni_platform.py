@@ -966,6 +966,94 @@ def test_group_norm_patch_dispatches_on_tpu_only(monkeypatch):
     assert calls == [(tpu_x, 32, None, None, 1e-6)]
 
 
+def test_vae_image_processor_pil_output_patch(monkeypatch):
+    """The torch-native PIL tail is byte-identical to diffusers' numpy/PIL path."""
+    import numpy as np
+    from PIL import Image
+
+    from vllm_torchtpu.omni import patches as omni_patches
+
+    class _Config:
+        do_normalize = True
+
+    class _VaeImageProcessor:
+        # diffusers 0.40 ``VaeImageProcessor.postprocess`` minus validation.
+        config = _Config()
+
+        @staticmethod
+        def denormalize(images):
+            return (images * 0.5 + 0.5).clamp(0, 1)
+
+        def postprocess(self, image, output_type="pil", do_denormalize=None):
+            if do_denormalize is None:
+                do_denormalize = [self.config.do_normalize] * image.shape[0]
+            image = torch.stack(
+                [
+                    self.denormalize(image[i]) if do_denormalize[i] else image[i]
+                    for i in range(image.shape[0])
+                ]
+            )
+            if output_type == "pt":
+                return image
+            image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+            if output_type == "np":
+                return image
+            image = (image * 255).round().astype("uint8")
+            if image.shape[-1] == 1:
+                return [Image.fromarray(im.squeeze(), mode="L") for im in image]
+            return [Image.fromarray(im) for im in image]
+
+    fake_mod = MagicMock()
+    fake_mod.VaeImageProcessor = _VaeImageProcessor
+    monkeypatch.setitem(sys.modules, "diffusers.image_processor", fake_mod)
+
+    orig_postprocess = _VaeImageProcessor.postprocess
+    torch.manual_seed(0)
+    inputs = [
+        (torch.rand(2, 3, 16, 24) * 2.4 - 1.2).to(torch.bfloat16),
+        torch.rand(1, 3, 8, 8) * 2.4 - 1.2,  # float32
+        torch.rand(1, 4, 8, 8) * 2 - 1,  # RGBA
+        torch.rand(2, 1, 8, 8) * 2 - 1,  # grayscale
+    ]
+    refs = [orig_postprocess(_VaeImageProcessor(), x) for x in inputs]
+    ref_np = orig_postprocess(_VaeImageProcessor(), inputs[0], output_type="np")
+
+    omni_patches._patch_vae_image_processor_pil_output()
+    omni_patches._patch_vae_image_processor_pil_output()  # idempotent
+    assert _unwrap_tpu_patch(_VaeImageProcessor.postprocess) is orig_postprocess
+
+    proc = _VaeImageProcessor()
+    for x, ref in zip(inputs, refs):
+        x_before = x.clone()
+        out = proc.postprocess(x)
+        assert torch.equal(x, x_before)  # input is not modified in place
+        assert len(out) == len(ref)
+        for pil_out, pil_ref in zip(out, ref):
+            assert isinstance(pil_out, Image.Image)
+            assert pil_out.mode == pil_ref.mode
+            assert pil_out.size == pil_ref.size
+            assert np.array_equal(np.asarray(pil_out), np.asarray(pil_ref))
+
+    # Partial denormalization is forwarded to the original.
+    out = proc.postprocess(inputs[0], do_denormalize=[True, False])
+    ref = orig_postprocess(proc, inputs[0], do_denormalize=[True, False])
+    assert all(np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(out, ref))
+
+    # Non-PIL outputs and non-4D inputs go through the original unchanged.
+    assert np.array_equal(proc.postprocess(inputs[0], output_type="np"), ref_np)
+    assert torch.equal(
+        proc.postprocess(inputs[1], output_type="pt"),
+        orig_postprocess(proc, inputs[1], output_type="pt"),
+    )
+    sentinel = object()
+    monkeypatch.setattr(
+        _VaeImageProcessor, "postprocess", lambda self, *a, **k: sentinel
+    )
+    omni_patches._patch_vae_image_processor_pil_output()
+    assert proc.postprocess(torch.zeros(3, 8, 8)) is sentinel
+    assert proc.postprocess("not a tensor") is sentinel
+
+
 def test_worker_proc_async_output_loop_zero_gpu_id():
     from vllm_omni.diffusion.worker import diffusion_worker
 

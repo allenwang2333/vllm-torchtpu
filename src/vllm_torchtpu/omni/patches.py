@@ -111,6 +111,9 @@ def apply_omni_tpu_patches() -> None:
     _patch_rotary_embedding_tpu()
     _patch_z_image_transformer_block_flush()
     _patch_z_image_prompt_encoder_tpu()
+    # Engine-host (CPU) output path; OmniTpuPlatform is instantiated in the
+    # engine process too, so this reaches DiffusionEngine.postprocess_output.
+    _patch_vae_image_processor_pil_output()
 
 
 @functools.cache
@@ -867,6 +870,84 @@ def _patch_z_image_prompt_encoder_tpu() -> None:
 
     pipe_cls._encode_prompt = _mark_tpu_patch(_encode_prompt, orig_encode_prompt)
     logger.info("Applied TPU patch: compiled Qwen3 prompt encoder for ZImagePipeline.")
+
+
+def _pt_images_to_pil(images: torch.Tensor) -> list[Any]:
+    """diffusers' ``numpy_to_pil(pt_to_numpy(images))`` computed in torch.
+
+    ``images`` is the denormalized ``[B, C, H, W]`` tensor (values in ``[0, 1]``).
+    Upstream converts it with ``images.cpu().permute(0, 2, 3, 1).float().numpy()``
+    and then runs ``(x * 255).round().astype("uint8")`` and ``PIL.Image.fromarray``
+    on that *non-C-contiguous* NHWC view: every numpy inner loop is the
+    3-element channel axis and PIL falls back to a per-element ``tobytes()``
+    copy. The same arithmetic in torch (float32 multiply, round-half-to-even,
+    uint8 cast, one parallel NHWC transpose) produces identical bytes.
+    """
+    # Dynamic import: PIL is a diffusers dependency, not a vllm-torchtpu one.
+    Image = importlib.import_module("PIL.Image")
+
+    u8 = images.detach().cpu().to(torch.float32, copy=True).mul_(255).round_()
+    u8 = u8.to(torch.uint8).permute(0, 2, 3, 1).contiguous().numpy()
+    if u8.shape[-1] == 1:
+        # Grayscale special case, as in ``numpy_to_pil``.
+        return [Image.fromarray(im.squeeze(), mode="L") for im in u8]
+    return [Image.fromarray(im) for im in u8]
+
+
+def _patch_vae_image_processor_pil_output() -> None:
+    # -------------------------------------------------------------------------
+    # Root cause (diffusers ``VaeImageProcessor.postprocess``; runs on the
+    # *engine* host in ``DiffusionEngine.postprocess_output`` after every
+    # generated image, i.e. on the request's critical path):
+    # ``pt_to_numpy`` returns a channels-last *view* of the NCHW tensor, so the
+    # numpy ``* 255 / round / astype`` chain iterates over the 3-element
+    # channel axis and ``PIL.Image.fromarray`` copies the strided array
+    # element by element. For a 1024x1024 image that is 15-23 ms per image on
+    # the engine host — ~2 ms/step of an 8-step Z-Image-Turbo request at every
+    # SP degree (6 % of E2E at sp=8), and it grows with the host thread count.
+    # Doing the identical arithmetic in torch and transposing once (parallel,
+    # C-contiguous) takes ~1-2 ms and yields bit-identical PIL images.
+    #
+    # REMOVAL CONDITION: diffusers' ``pt_to_numpy`` returns a C-contiguous
+    # array (or ``numpy_to_pil`` converts in torch), or vLLM-Omni's image
+    # pipelines return uint8 images decoded on the device.
+    # -------------------------------------------------------------------------
+    try:
+        ip_mod = importlib.import_module("diffusers.image_processor")
+        ip_cls = ip_mod.VaeImageProcessor
+    except Exception:  # noqa: BLE001 - diffusers is an omni extra
+        logger.warning(
+            "diffusers not importable; VaeImageProcessor PIL output patch skipped."
+        )
+        return
+
+    orig_postprocess = _unwrap_tpu_patch(ip_cls.postprocess)
+
+    def _postprocess(
+        self: Any,
+        image: Any,
+        output_type: str = "pil",
+        do_denormalize: Any = None,
+    ) -> Any:
+        if (
+            output_type != "pil"
+            or not isinstance(image, torch.Tensor)
+            or image.dim() != 4
+        ):
+            return orig_postprocess(
+                self, image, output_type=output_type, do_denormalize=do_denormalize
+            )
+        # Upstream validation and (conditional) denormalization, then the
+        # numpy/PIL tail in torch.
+        image = orig_postprocess(
+            self, image, output_type="pt", do_denormalize=do_denormalize
+        )
+        return _pt_images_to_pil(image)
+
+    ip_cls.postprocess = _mark_tpu_patch(_postprocess, orig_postprocess)
+    logger.info(
+        "Applied TPU patch: torch-native PIL output in VaeImageProcessor.postprocess."
+    )
 
 
 @run_once
