@@ -342,6 +342,8 @@ def test_safe_pack_tensor_if_large(monkeypatch):
             "device": getattr(tensor, "device", None).type
             if hasattr(tensor, "device")
             else "unknown",
+            "dtype": getattr(tensor, "dtype", None),
+            "d2h_stream": d2h_stream,
         }
     )
     monkeypatch.setattr(ipc, "_pack_tensor_if_large", orig_mock)
@@ -350,19 +352,34 @@ def test_safe_pack_tensor_if_large(monkeypatch):
     apply_omni_model_specific_patches()
 
     class MockDeviceTensor:
-        def __init__(self, device_type="tpu"):
+        def __init__(self, device_type="tpu", dtype=torch.float32):
             self.device = MagicMock()
             self.device.type = device_type
+            self.dtype = dtype
             self.cpu_called = False
+            self.cast = None
+
+        def to(self, dtype):  # would be a device-side cast; must stay unused
+            self.cast = MockDeviceTensor(self.device.type, dtype)
+            return self.cast
 
         def cpu(self):
             self.cpu_called = True
-            return torch.empty(1, device="cpu")
+            return torch.empty(1, dtype=self.dtype, device="cpu")
 
     t = MockDeviceTensor("tpu")
+    res = ipc._pack_tensor_if_large(t, d2h_stream=object())
+    assert t.cpu_called is True and t.cast is None
+    assert res["device"] == "cpu" and res["dtype"] == torch.float32
+    # Already on the host: no pinned-buffer staging through a D2H stream.
+    assert res["d2h_stream"] is None
+
+    # dtype is left to upstream's numpy shim (bf16 -> f32 inside _tensor_to_shm).
+    t = MockDeviceTensor("tpu", torch.bfloat16)
     res = ipc._pack_tensor_if_large(t)
-    assert t.cpu_called is True
-    assert res["device"] == "cpu"
+    assert t.cpu_called is True and t.cast is None
+    assert res["device"] == "cpu" and res["dtype"] == torch.bfloat16
+    assert res["d2h_stream"] is None
 
 
 def test_omni_tpu_patches_configuration(monkeypatch):

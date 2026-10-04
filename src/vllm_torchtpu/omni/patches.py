@@ -979,7 +979,12 @@ def apply_omni_model_specific_patches() -> None:
         val: torch.Tensor,
         d2h_stream: Any = None,
     ) -> Any:
-        return orig_pack_tensor(val.cpu(), d2h_stream=d2h_stream)
+        # The tensor is moved to the host first (see above), so upstream's
+        # ``d2h_stream`` path (allocate a pinned buffer, ``copy_`` into it,
+        # synchronize the stream) would only add a 12 MB pinned allocation
+        # and one more copy per 1024x1024 image before the shared-memory
+        # write. The bfloat16 -> float32 shim for numpy stays upstream's.
+        return orig_pack_tensor(val.cpu(), d2h_stream=None)
 
     ipc._pack_tensor_if_large = _mark_tpu_patch(
         _safe_pack_tensor_if_large, orig_pack_tensor
