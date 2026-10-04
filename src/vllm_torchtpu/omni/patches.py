@@ -456,7 +456,6 @@ def _patch_z_image_transformer_block_flush() -> None:
             def _pre(
                 module: Any, args: tuple, kwargs: dict
             ) -> tuple[tuple, dict] | None:
-                module._tpu_block_eager = False
                 if first:
                     state["sharded"] = False
                 elif not state["sharded"]:
@@ -490,6 +489,25 @@ def _patch_z_image_transformer_block_flush() -> None:
                     ):
                         continue
                     t = sp_shard(t, 1, validate=False)
+                    if i == 0:
+                        # ``sp_shard`` hands ``noise_refiner[0]`` the view
+                        # ``x[:, lo:hi]`` of the full sequence (storage offset
+                        # ``rank * S_local * D``, batch stride of the *full*
+                        # tensor; ``.contiguous()`` is a no-op at batch 1).
+                        # Through the shared ``torch.compile(backend="tpu")``
+                        # block function that view is the one input the
+                        # compiled graph gets wrong: NaN from the second step
+                        # at sp=8 and a ~10 dB PSNR loss at sp=4, verified
+                        # in-process against the eager block on identical
+                        # inputs, while the same compiled function is exact
+                        # (<= 1 bf16 ulp) on the fresh tensors every later
+                        # block receives and on every main layer. A fresh copy
+                        # of the shard (S_local x 3840 bf16, a few microseconds
+                        # on the device) restores exactness; the sharded mask /
+                        # cos / sin views are unaffected.
+                        # REMOVAL CONDITION: torch_tpu's compiled path handles
+                        # strided-view inputs with a storage offset correctly.
+                        t = t.clone(memory_format=torch.contiguous_format)
                     if i < len(args_list):
                         args_list[i] = t
                     else:
@@ -499,16 +517,6 @@ def _patch_z_image_transformer_block_flush() -> None:
                     ctx._sp_shard_depth += 1
                     ctx._sp_equal_pad_stack.append(True)
                     state["sharded"] = True
-                # The *sharded* refiner runs through the eager (lazy-traced)
-                # block path, not the shared torch.compile'd one: compiled, the
-                # sharded refiner yields NaN latents at sp=8 and a ~10 dB PSNR
-                # loss at sp=4 (correct at sp=2), while the same compiled
-                # function is correct for the unsharded refiner and for every
-                # sharded main layer. Root cause not yet isolated (candidates:
-                # buffer aliasing between the AOT executable's shard inputs and
-                # the full ``x_cos``/``x_sin`` reused by ``unified_prepare``).
-                # Eager costs ~1 ms/step at sp=8 and keeps the sharding gain.
-                module._tpu_block_eager = True
                 return tuple(args_list), kwargs
 
             return _pre
@@ -586,12 +594,7 @@ def _patch_z_image_transformer_block_flush() -> None:
         # layers[0] have layer_id == 0.
         if on_tpu and getattr(self, "layer_id", None) in (0, 1000):
             _tpu_materialize_async(None)
-        use_compiled = (
-            on_tpu
-            and compile_state["enabled"]
-            and not getattr(self, "_tpu_block_eager", False)
-        )
-        if use_compiled:
+        if on_tpu and compile_state["enabled"]:
             try:
                 out = _compiled_forward()(self, *args, **kwargs)
             except Exception as exc:  # noqa: BLE001 - keep the model usable

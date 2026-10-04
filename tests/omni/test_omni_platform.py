@@ -655,15 +655,17 @@ def test_z_image_noise_refiner_sp_sharding(monkeypatch):
         "vllm_omni.diffusion.distributed.sp_sharding",
         SimpleNamespace(
             get_sequence_parallel_world_size=lambda: world["size"],
-            sp_shard=lambda t, dim, validate=True: t.chunk(world["size"], dim)[0],
+            sp_shard=lambda t, dim, validate=True: t.chunk(world["size"], dim)[-1],
             sp_gather=lambda t, dim, validate=True: torch.cat([t] * world["size"], dim),
         ),
     )
 
     seen = []
+    x_views = []
 
     class _Refiner(nn.Module):
         def forward(self, x, attn_mask, cos, sin, adaln_input=None):
+            x_views.append(x._base is not None or x.storage_offset() != 0)
             seen.append(
                 (
                     tuple(x.shape),
@@ -708,8 +710,11 @@ def test_z_image_noise_refiner_sp_sharding(monkeypatch):
         ((1, 8, 4), (1, 8), (1, 8, 2), (1, 8, 2), (1, 4), 1, [True]),
     ]
     assert fake_ctx._sp_shard_depth == 0 and fake_ctx._sp_equal_pad_stack == []
-    # Sharded refiner blocks are flagged to bypass the compiled block path.
-    assert [b._tpu_block_eager for b in model.noise_refiner] == [True, True]
+    # noise_refiner[0] gets a fresh copy of its x shard, never the
+    # ``x[:, lo:hi]`` view of the full sequence (the sharded attn_mask /
+    # cos / sin stay views).
+    assert x_views == [False, False]
+    assert [s[1] for s in seen] == [(1, 8), (1, 8)]
 
     # Hooks are installed once per model instance.
     model.forward(x, mask, cos, sin, adaln)
@@ -724,16 +729,14 @@ def test_z_image_noise_refiner_sp_sharding(monkeypatch):
     assert tuple(out.shape) == (1, 15, 4)
     assert [s[0] for s in seen] == [(1, 15, 4), (1, 15, 4)]
     assert [s[5] for s in seen] == [0, 0]
-    assert [b._tpu_block_eager for b in model.noise_refiner] == [False, False]
 
-    # SP size 1: no sharding, no depth change, compiled path kept.
+    # SP size 1: no sharding, no depth change.
     seen.clear()
     world["size"] = 1
     model = _Model()
     out = model.forward(x, mask, cos, sin, adaln)
     assert tuple(out.shape) == (1, 16, 4)
     assert [s[5] for s in seen] == [0, 0]
-    assert [b._tpu_block_eager for b in model.noise_refiner] == [False, False]
 
 
 def test_tpu_prompt_encoder_build_mask():
