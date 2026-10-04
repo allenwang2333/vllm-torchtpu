@@ -524,7 +524,7 @@ def _visible_top_k(scores: jax.Array, k: int, bound: jax.Array) -> jax.Array:
 
     def select(columns, scores):
         scores = scores[:, :columns]
-        if scores.shape[0] >= 16 and columns >= 4096:
+        if scores.shape[0] >= 16 and columns >= 2048:
             return _threshold_top_k(scores, k)
         return jnp.sort(jax.lax.top_k(scores, k)[1], axis=-1)
 
