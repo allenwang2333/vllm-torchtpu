@@ -124,8 +124,8 @@ TENSOR_PARALLELISM=1
 DATA_PARALLELISM=1
 ENABLE_EP=false
 QUANTIZATION=""
-ISL_OSL_CONFIGS="512:512"
-CONCURRENCY_OPTIONS="1"
+ISL_OSL_CONFIGS="${ISL_OSL_CONFIGS:-512:512}"
+CONCURRENCY_OPTIONS="${CONCURRENCY_OPTIONS:-1}"
 # Benchmark prompts: "random" (default) sizes them from ISL_OSL_CONFIGS; any
 # other vllm bench serve --dataset-name (e.g. sharegpt with DATASET_PATH)
 # takes prompts from the dataset. For sharegpt the OSL still sets the output
@@ -133,7 +133,7 @@ CONCURRENCY_OPTIONS="1"
 DATASET_NAME="${DATASET_NAME:-random}"
 DATASET_PATH="${DATASET_PATH:-}"
 RANDOM_RANGE_RATIO=""
-NUM_PROMPTS=""
+NUM_PROMPTS="${NUM_PROMPTS:-}"
 # How RANDOM_RANGE_RATIO is interpreted:
 #   symmetric - vllm bench serve native: sample lengths in [(1-r)*len, (1+r)*len]
 #   min       - benchmark_serving.py / inferenceX client style: sample in
