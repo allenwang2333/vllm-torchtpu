@@ -595,6 +595,28 @@ def _threshold_top_k(scores: jax.Array, k: int) -> jax.Array:
     ).astype(jnp.int32)
 
 
+def _query_parallel(count: int):
+    """Sharding that splits ``count`` indexer queries over the mesh, if any.
+
+    Requires at least 16 queries per device (SparseCore top-k row tiles).
+    """
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        get_vllm_model_wrapper_context,
+    )
+
+    try:
+        mesh = get_vllm_model_wrapper_context().mesh
+    except Exception:  # Standalone (tests): one device, no mesh.
+        return None
+    devices = mesh.devices.size
+    if devices < 2 or count % (16 * devices):
+        return None
+    return NamedSharding(mesh, P(mesh.axis_names))
+
+
 def _sparsecore_top_k(scores: jax.Array, k: int, lengths: jax.Array) -> jax.Array:
     """V4's SparseCore top-k (`kernels/deepseek_v4/sparsecore_topk.py`).
 
@@ -614,12 +636,15 @@ def _sparsecore_top_k(scores: jax.Array, k: int, lengths: jax.Array) -> jax.Arra
         mesh = get_vllm_model_wrapper_context().mesh
     except Exception:  # Standalone (tests): one device, no mesh.
         return select(scores, row_lengths=lengths)
-    # Mosaic calls need manual partitioning; every device selects locally.
+    # Mosaic calls need manual partitioning: each device selects its rows
+    # (all rows when they cannot be split).
+    split = _query_parallel(scores.shape[0])
+    rows = P() if split is None else split.spec
     return jax.shard_map(
         lambda s, n: select(s, row_lengths=n),
         mesh=mesh,
-        in_specs=(P(), P()),
-        out_specs=P(),
+        in_specs=(rows, rows),
+        out_specs=rows,
         check_vma=False,
     )(scores, lengths)
 
@@ -869,6 +894,14 @@ def update_and_select_jax(
     unordered: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     updated = write_index_keys(pool, write_records, keys)
+    # Scoring and selection are independent per query; batch-wide terms
+    # (length maxima, the short-context bypass) stay global under GSPMD.
+    split = _query_parallel(q.shape[0])
+    if split is not None:
+        q, weights, lengths, candidates, requests = (
+            jax.lax.with_sharding_constraint(x, split)
+            for x in (q, weights, lengths, candidates, requests)
+        )
     selected, published = paged_indexer_jax(
         q,
         updated,
@@ -883,6 +916,14 @@ def update_and_select_jax(
         candidate_filter,
         unordered,
     )
+    if split is not None:
+        replicated = jax.sharding.NamedSharding(
+            split.mesh, jax.sharding.PartitionSpec()
+        )
+        selected, published = (
+            jax.lax.with_sharding_constraint(x, replicated)
+            for x in (selected, published)
+        )
     return updated, selected, published
 
 
