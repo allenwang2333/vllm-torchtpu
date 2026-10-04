@@ -133,3 +133,31 @@ def test_fault_dropped_expert_is_caught():
     y = np.asarray(run_kernel(c).astype(jnp.float32))
     broken = dict(c, w2=c["w2"].at[3].set(jnp.zeros_like(c["w2"][3])))
     assert row_err(y, oracle(broken)) > 8e-2
+
+
+def test_prequant_and_chunked_scatter_ranks():
+    """Pre-quantized x + pre-computed shared_gate + chunked scatter_ranks reorder
+    must match the standard moe_tp_prefill output row-for-row across all ranks."""
+    T, n_ranks, n_chunks = 256, 4, 2
+    c = make_case(T, 8, 256, 128, 3)
+    ref = np.asarray(run_kernel(c, combine_chunks=1).astype(jnp.float32))
+
+    x_q, x_s = mtp.rowquant_rows(c["x"])
+    gate = jax.nn.sigmoid(
+        jnp.dot(c["x"], c["wg"], preferred_element_type=jnp.float32)
+    )
+    rank_outs = []
+    for r in range(n_ranks):
+        tc = T // n_chunks
+        tc_local = tc // n_ranks
+        out_r = run_kernel(
+            c,
+            combine_chunks=n_chunks,
+            reduce_fn=lambda y, r=r: y[r * tc_local : (r + 1) * tc_local],
+            x_quantized=(x_q, x_s),
+            shared_gate=gate,
+            scatter_ranks=n_ranks,
+        )
+        rank_outs.append(np.asarray(out_r.astype(jnp.float32)))
+    got = np.concatenate(rank_outs, axis=0)
+    assert np.array_equal(got, ref)
