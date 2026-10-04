@@ -233,7 +233,10 @@ REQUEST_TIMEOUT_S = 900
 # fills the 16384-token chunk, so the large-M kernel buckets are timed too.
 
 PREFIX_CHARS = 300_000
-REPS = 5
+REPS = 7
+#: Untimed passes over every config before the timed ones: the server compiles small
+#: host-side programs the first time it meets a batch shape, for minutes after boot.
+WARMUP_PASSES = 2
 CONFIGS = {
     "c1": {"concurrency": 1, "requests_per_stream": 16, "suffix_chars": 7_500, "output_tokens": 256},
     "c2": {"concurrency": 2, "requests_per_stream": 12, "suffix_chars": 7_500, "output_tokens": 256},
@@ -458,7 +461,7 @@ def server_env(rec_dir: Path | None = None) -> dict:
 
 
 def kill_strays() -> list[str]:
-    """SIGKILL every python/vllm process but this one and its parents."""
+    """SIGKILL every python/vllm process but this one, its parents and the pod's shell."""
     keep = {1, os.getpid(), os.getppid()}
     killed = []
     for d in Path("/proc").iterdir():
@@ -472,6 +475,8 @@ def kill_strays() -> list[str]:
                 .decode(errors="replace")
             )
         except OSError:
+            continue
+        if cmd.startswith("/bin/bash") or "scorer.py" in cmd:
             continue
         if "python" in cmd or "vllm" in cmd:
             try:
@@ -787,8 +792,9 @@ def run_arm(spec: dict, stage: Path, out: Path, prompts: Prompts) -> dict:
         arm["prefix_prompt_tokens"] = stream_completion(prompts.get(0, 0), 32)[
             "prompt_tokens"
         ]
-        # Untimed: one request per stream at the widest concurrency touches every bucket.
-        run_rep(prompts, {**CONFIGS["c8"], "requests_per_stream": 1}, 1)
+        for warm in range(WARMUP_PASSES):
+            for cfg in CONFIGS.values():
+                run_rep(prompts, cfg, 700_000 + 1_000 * warm)
         probes = run_probes(prompts)
         say(f"arm {name}: probes worst_error={probes['worst_error']:.3f}")
         load = run_load(prompts)
