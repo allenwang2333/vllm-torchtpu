@@ -478,6 +478,7 @@ def test_pooled_kda_multistep_state_evolution():
     )
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("split", [1, BLOCK_SIZE])
 @pytest.mark.parametrize("seed", [0, 17])
 @pytest.mark.parametrize(
