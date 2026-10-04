@@ -233,6 +233,51 @@ def test_paged_indexer_request_records_match_per_token(
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
 
+@pytest.mark.parametrize(
+    "candidate_write,candidate_filter",
+    [(False, False), (True, False), (False, True)],
+)
+def test_paged_indexer_query_split_matches_whole_batch(
+    candidate_write, candidate_filter
+):
+    rng = np.random.default_rng(11)
+    width, topk, block_size, tokens = 640, 64, 16, 32
+    pool, records, requests, lengths, q, weights = _request_inputs(
+        rng, 3, tokens, width
+    )
+    # Short first half, long second half: per-part maxima straddle topk.
+    lengths[: tokens // 2] = np.minimum(lengths[: tokens // 2], topk)
+    lengths[tokens // 2 :] = np.maximum(lengths[tokens // 2 :], topk + 1)
+    candidates = jnp.asarray(
+        rng.integers(-1, width // block_size, (tokens, 8)), dtype=jnp.int32
+    )
+    args = (topk, block_size, candidate_write, candidate_filter)
+    lengths = jnp.asarray(lengths)
+    requests = jnp.asarray(requests)
+    records = jnp.asarray(records)
+    whole = paged_indexer_jax(
+        q, pool, records, weights, lengths, candidates, requests, *args
+    )
+    half = tokens // 2
+    parts = [
+        paged_indexer_jax(
+            q[part],
+            pool,
+            records,
+            weights[part],
+            lengths[part],
+            candidates[part],
+            requests[part],
+            *args,
+            batch_max=lengths.max()[None],
+        )
+        for part in (slice(0, half), slice(half, tokens))
+    ]
+    for index, expected in enumerate(whole):
+        got = np.concatenate([np.asarray(part[index]) for part in parts])
+        np.testing.assert_array_equal(got, np.asarray(expected))
+
+
 @pytest.mark.parametrize("width,count", [(64, 40), (32, 40), (64, 1), (32, 7)])
 def test_merge_sub_rows_matches_lane_scatter(width, count):
     rng = np.random.default_rng(width + count)

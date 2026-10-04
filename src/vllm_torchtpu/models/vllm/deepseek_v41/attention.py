@@ -7,6 +7,11 @@ from typing import cast
 import torch
 import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
@@ -288,6 +293,16 @@ def _insert(cache, slots, values, valid):
     write_cache(cache, slots, values, valid)
 
 
+def _gather_query_rows(rows):
+    """All-gather per-rank query rows (dim 0), padded to 128 lanes."""
+    width = rows.shape[-1]
+    padding = (-width) % 128
+    if padding:
+        rows = F.pad(rows, (0, padding))
+    rows = tensor_model_parallel_all_gather(rows.contiguous(), dim=0)
+    return rows[:, :width].contiguous() if padding else rows
+
+
 def _row_slots(cache, block_table, requests, logical):
     """Gather fixed-width token rows without inspecting device values on host."""
     safe = logical.clamp(min=0, max=block_table.shape[1] * cache.shape[1] - 1)
@@ -370,6 +385,18 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         self._fp8_kv = self.kv_cache_torch_dtype == torch.float8_e4m3fn
         self.register_buffer(
             "_tpu_rope_cache", self.rotary_emb.cos_sin_cache, persistent=False
+        )
+        # The TP rank as data, not a Python constant: every rank must compile
+        # the same program, or XLA may order its collectives differently per
+        # rank and deadlock (see `_select_paged_indices`).
+        self.register_buffer(
+            "_tp_rank",
+            torch.tensor(
+                get_tensor_model_parallel_rank(),
+                dtype=torch.int32,
+                device=self.rotary_emb.cos_sin_cache.device,
+            ),
+            persistent=False,
         )
         self._config = vllm_config.model_config.hf_config.to_dict()
         self._max_model_len = vllm_config.model_config.max_model_len
@@ -729,23 +756,54 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 index_q.new_empty((0, index_q.shape[-1])),
             )
         )
+        # Scoring and selection are independent per query, but every TP rank
+        # holds the whole batch: split the queries over ranks and gather the
+        # selections. Every rank still writes all index keys (replicated cache).
+        # Pad the queries to 16 rows per rank (SparseCore top-k row tiles)
+        # rather than branching on the token count, which would freeze the
+        # traced bucket's choice (compilation/shape_variants.py). Padding rows
+        # have zero length and select nothing. Always pad at least one row: a
+        # zero-size pad guards on the count (torch.cat skips empty inputs).
+        ranks = get_tensor_model_parallel_world_size()
+        split = ranks > 1
+        queries = (index_q, weights, active_lengths, candidates, requests)
+        if split:
+            rows = 16 * ranks
+            padding = (count // rows + 1) * rows - count
+            part = (count + padding) // ranks
+            mine = self._tp_rank * part + torch.arange(
+                part, dtype=torch.int32, device=index_q.device
+            )
+            fills = (0, 0, 0, -1, 0)
+            queries = tuple(
+                torch.cat((x, x.new_full((padding, *x.shape[1:]), fill))).index_select(
+                    0, mine
+                )
+                for x, fill in zip(queries, fills)
+            )
+        q_part, weights_part, lengths_part, candidates_part, requests_part = queries
         updated_cache, selected, published = paged_indexer(
-            index_q,
+            q_part,
             index_cache,
             records,
-            weights,
-            active_lengths,
-            candidates,
+            weights_part,
+            lengths_part,
+            candidates_part,
             write_records,
             write_keys,
-            requests,
+            requests_part,
             topk=self._config["index_topk"],
             block_size=max(1, self.candidate_block_size),
             candidate_write=candidate_write,
             candidate_filter=has_candidates and not candidate_write,
             # FP8 attention re-sorts the selection (compact_records).
             unordered=self._fp8_kv,
+            batch_max=active_lengths.max(),
         )
+        if split:
+            selected = _gather_query_rows(selected)[:count]
+            if candidate_write:
+                published = _gather_query_rows(published)[:count]
         index_cache.raw.copy_(updated_cache)
         if candidate_write:
             self.candidate_block_buffer.copy_(

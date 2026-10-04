@@ -595,28 +595,6 @@ def _threshold_top_k(scores: jax.Array, k: int) -> jax.Array:
     ).astype(jnp.int32)
 
 
-def _query_parallel(count: int):
-    """Sharding that splits ``count`` indexer queries over the mesh, if any.
-
-    Requires at least 16 queries per device (SparseCore top-k row tiles).
-    """
-    from jax.sharding import NamedSharding
-    from jax.sharding import PartitionSpec as P
-
-    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-        get_vllm_model_wrapper_context,
-    )
-
-    try:
-        mesh = get_vllm_model_wrapper_context().mesh
-    except Exception:  # Standalone (tests): one device, no mesh.
-        return None
-    devices = mesh.devices.size
-    if devices < 2 or count % (16 * devices):
-        return None
-    return NamedSharding(mesh, P(mesh.axis_names))
-
-
 def _sparsecore_top_k(scores: jax.Array, k: int, lengths: jax.Array) -> jax.Array:
     """V4's SparseCore top-k (`kernels/deepseek_v4/sparsecore_topk.py`).
 
@@ -636,15 +614,12 @@ def _sparsecore_top_k(scores: jax.Array, k: int, lengths: jax.Array) -> jax.Arra
         mesh = get_vllm_model_wrapper_context().mesh
     except Exception:  # Standalone (tests): one device, no mesh.
         return select(scores, row_lengths=lengths)
-    # Mosaic calls need manual partitioning: each device selects its rows
-    # (all rows when they cannot be split).
-    split = _query_parallel(scores.shape[0])
-    rows = P() if split is None else split.spec
+    # Mosaic calls need manual partitioning; every device selects locally.
     return jax.shard_map(
         lambda s, n: select(s, row_lengths=n),
         mesh=mesh,
-        in_specs=(rows, rows),
-        out_specs=rows,
+        in_specs=(P(), P()),
+        out_specs=P(),
         check_vma=False,
     )(scores, lengths)
 
@@ -709,11 +684,14 @@ def select_indices_jax(
     candidate_write: bool,
     candidate_filter: bool,
     unordered: bool = False,
+    batch_max: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Source publishes candidates without filtering its own selection.
 
     ``unordered``: see `_visible_top_k` (the selection may come back in any
     order with ``-1`` anywhere; FP8 attention re-sorts via `compact_records`).
+    ``batch_max``: the whole batch's longest length when ``scores`` holds only
+    part of the batch's queries (defaults to ``lengths.max()``).
     """
     count, width = scores.shape
     if topk < 1 or width < 1 or block_size < 1:
@@ -723,6 +701,9 @@ def select_indices_jax(
     if candidates.ndim != 2 or candidates.shape[0] != count:
         raise ValueError("Candidate rows must match query rows")
     lengths = jnp.clip(lengths.reshape(count), 0, width)
+    batch_max = (
+        lengths.max() if batch_max is None else jnp.clip(batch_max.max(), 0, width)
+    )
     logical = jnp.arange(width)[None, :]
     visible = logical < lengths[:, None]
     scores = jnp.where(visible, scores, -jnp.inf)
@@ -758,7 +739,7 @@ def select_indices_jax(
             membership = membership.at[jnp.arange(count)[:, None], ids].set(True)
             allowed = jnp.take_along_axis(membership, logical // block_size, axis=1)
             # Match the upstream batch-wide short-context bypass.
-            scores = jnp.where(allowed | (lengths.max() <= topk), scores, -jnp.inf)
+            scores = jnp.where(allowed | (batch_max <= topk), scores, -jnp.inf)
     # Ascending: preserves V4.1's logical, hence attention accumulation, order.
     indices = _visible_top_k(
         scores, min(topk, width), lengths.max(), lengths, unordered
@@ -781,8 +762,12 @@ def paged_indexer_jax(
     candidate_write: bool,
     candidate_filter: bool,
     unordered: bool = False,
+    batch_max: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows."""
+    """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows.
+
+    ``batch_max``: see `select_indices_jax`.
+    """
 
     def full_context(_):
         scores = paged_index_scores_jax(q, pool, records, weights, lengths, requests)
@@ -796,6 +781,7 @@ def paged_indexer_jax(
             candidate_write,
             candidate_filter,
             unordered,
+            batch_max,
         )
 
     width = records.shape[1]
@@ -863,7 +849,8 @@ def paged_indexer_jax(
 
     # Preserve the reference's batch-wide short-context bypass. That branch
     # scans at most topk keys; long contexts never enter the full-history path.
-    return jax.lax.cond(lengths.max() <= topk, full_context, candidate_context, None)
+    longest = lengths.max() if batch_max is None else batch_max.max()
+    return jax.lax.cond(longest <= topk, full_context, candidate_context, None)
 
 
 def write_index_keys(
@@ -887,6 +874,7 @@ def update_and_select_jax(
     write_records: jax.Array,
     keys: jax.Array,
     requests: jax.Array,
+    batch_max: jax.Array,
     topk: int,
     block_size: int,
     candidate_write: bool,
@@ -894,14 +882,6 @@ def update_and_select_jax(
     unordered: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     updated = write_index_keys(pool, write_records, keys)
-    # Scoring and selection are independent per query; batch-wide terms
-    # (length maxima, the short-context bypass) stay global under GSPMD.
-    split = _query_parallel(q.shape[0])
-    if split is not None:
-        q, weights, lengths, candidates, requests = (
-            jax.lax.with_sharding_constraint(x, split)
-            for x in (q, weights, lengths, candidates, requests)
-        )
     selected, published = paged_indexer_jax(
         q,
         updated,
@@ -915,15 +895,8 @@ def update_and_select_jax(
         candidate_write,
         candidate_filter,
         unordered,
+        batch_max,
     )
-    if split is not None:
-        replicated = jax.sharding.NamedSharding(
-            split.mesh, jax.sharding.PartitionSpec()
-        )
-        selected, published = (
-            jax.lax.with_sharding_constraint(x, replicated)
-            for x in (selected, published)
-        )
     return updated, selected, published
 
 
@@ -943,7 +916,7 @@ def initialize_indexer():
         update_and_select_jax,
         donate_argnums=(1,),
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 9 + (None,) * 5,
+        input_partition_specs=(P(),) * 10 + (None,) * 5,
     )
 
     def fake(
@@ -956,6 +929,7 @@ def initialize_indexer():
         write_records,
         keys,
         requests,
+        batch_max,
         topk,
         block_size,
         candidate_write,
@@ -989,9 +963,16 @@ def paged_indexer(
     candidate_write,
     candidate_filter,
     unordered=False,
+    batch_max=None,
 ):
-    """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows."""
+    """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows.
+
+    ``batch_max`` (default ``lengths.max()``) is the longest length of the
+    whole batch when the queries are only part of it.
+    """
     assert _indexer_op is not None
+    if batch_max is None:
+        batch_max = lengths.max()
     return _indexer_op(
         q,
         cache.raw,
@@ -1002,6 +983,7 @@ def paged_indexer(
         write_records.int(),
         keys,
         requests.int(),
+        batch_max.reshape(1).int(),
         topk,
         block_size,
         candidate_write,
