@@ -42,7 +42,7 @@ Per arm and config:
   checksum     sha256 of every probe's greedy reply.
   dispatched   digest of every Mosaic kernel the arm's server lowered (name and
                serialized config) and of every XLA executable it compiled
-               (the compiler's own fingerprints, read from the server log).
+               at boot (the compiler's own fingerprints, read from the server log).
   declined     the arm's server could not be measured at all; latency_us is 0.
 Per arm:
   tree         git tree hash of the arm's whole tree as deployed in the pod.
@@ -494,7 +494,10 @@ class Server:
         self.log_path = work / "server.log"
         self.markers: list[str] = []
         self.n_markers = 0
+        # Only programs compiled before the server answers: boot compiles every bucket
+        # the same way each time, while later compiles depend on request timing.
         self.fingerprints: set[tuple[str, str]] = set()
+        self.ready = False
         self.strays: list[str] = []
         self.proc = subprocess.Popen(SERVE_CMD, cwd="/root", env=server_env(rec_dir),
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -513,7 +516,7 @@ class Server:
                     self.n_markers += 1
                     if len(self.markers) < 60:
                         self.markers.append(line.rstrip())
-                m = EXEC_FINGERPRINT.search(line)
+                m = None if self.ready else EXEC_FINGERPRINT.search(line)
                 if m:
                     self.fingerprints.add((m.group(1), m.group(2)))
 
@@ -526,6 +529,7 @@ class Server:
                 )
             try:
                 if http_get("/health", timeout=5)[0] == 200:
+                    self.ready = True
                     return time.time() - t0
             except OSError:
                 pass
