@@ -101,6 +101,11 @@ class VllmMoERunner(MoERunner):
         # Not super()._fused_output_is_reduced: under torch.compile dynamo
         # reads that as truthy, and the routed output then skips its TP
         # all-reduce.
+        # A layer armed by fused_moe_tp_ar reduces shared + routed in-kernel.
+        if getattr(self, "_fused_moe_tp_ar_armed", False) and not getattr(
+            self.moe_config, "skip_final_all_reduce", False
+        ):
+            return True
         if not envs.USE_MOE_FUSED_EP_KERNEL or getattr(
             self.moe_config, "skip_final_all_reduce", False
         ):
