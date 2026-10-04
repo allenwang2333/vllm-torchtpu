@@ -117,6 +117,15 @@ class _MockWorkerProc:
         return self.gpu_id
 
 
+class _MockDiffusionWorker:
+    def __init__(self):
+        self.load_calls: list[tuple[str, str | None]] = []
+
+    def load_model(self, load_format="default", custom_pipeline_name=None, **kwargs):
+        self.load_calls.append((load_format, custom_pipeline_name))
+        return "loaded"
+
+
 vllm_omni_mock = MagicMock()
 vllm_omni_mock.platforms.interface.OmniPlatform = _MockOmniPlatform
 vllm_omni_mock.platforms.interface.OmniPlatformEnum = _MockOmniPlatformEnum
@@ -127,6 +136,7 @@ vllm_omni_mock.diffusion.attention.backends.registry.register_diffusion_backend 
 )
 vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime.LTXRuntime = _MockLTXRuntime
 vllm_omni_mock.diffusion.worker.diffusion_worker.WorkerProc = _MockWorkerProc
+vllm_omni_mock.diffusion.worker.diffusion_worker.DiffusionWorker = _MockDiffusionWorker
 
 sys.modules["vllm_omni"] = vllm_omni_mock
 sys.modules["vllm_omni.platforms"] = vllm_omni_mock.platforms

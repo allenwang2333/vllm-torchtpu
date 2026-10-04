@@ -880,3 +880,62 @@ def apply_omni_worker_patches() -> None:
     logger.info(
         "Applied TPU patch: local device index 0 for WorkerProc._async_output_loop."
     )
+
+    _patch_diffusion_worker_runtime_threads(diffusion_worker)
+
+
+def _patch_diffusion_worker_runtime_threads(diffusion_worker: Any) -> None:
+    # -------------------------------------------------------------------------
+    # Root cause (vLLM-Omni multiproc executor x torch intra-op thread pool):
+    # ``DiffusionMultiprocExecutor`` calls vLLM's
+    # ``set_multiprocessing_worker_envs()`` with its default
+    # ``local_world_size=1`` before spawning the diffusion workers, so every
+    # worker starts with ``OMP_NUM_THREADS = <all host CPUs>`` (224 on a
+    # tpu7x-8 host) instead of its share. With N workers that is N-fold CPU
+    # oversubscription: each small CPU op on the per-image path (tokenizer
+    # tensors, the prompt-encoder mask, latents ``randn``, scheduler maths)
+    # fans out over a full-host thread pool whose workers then spin-wait,
+    # starving every other rank's serial dispatch code. The slowest rank gates
+    # all ranks in the first Ulysses ``all_to_all_single`` of each image, which
+    # is why the cost grew ~quadratically with the SP degree (≈10 ms/image at
+    # sp=2, ≈40 at sp=4, ≈150 at sp=8 for Z-Image-Turbo) and looked like a
+    # "compiled text encoder stall" in host timers.
+    #
+    # Fix: once the worker has loaded its model (weight loading is the only
+    # phase that benefits from CPU parallelism) apply vLLM's steady-state
+    # policy ``set_torch_threads_for_runtime()`` -- the same call this repo's
+    # ``TPUWorker.compile_or_warm_up_model`` makes for LLM workers. It drops
+    # torch's intra-op threads to 1 unless the user set OMP_NUM_THREADS
+    # explicitly (vLLM marks its own default with
+    # ``VLLM_OMP_NUM_THREADS_SET_BY_VLLM``). Measured on tpu7x-8 (Z-Image-Turbo,
+    # 1024², 8 steps): sp=8 64.3 -> 39.5 ms/step, sp=4 66.0 -> 59.8, sp=2 and
+    # sp=1 within noise.
+    #
+    # REMOVAL CONDITION: vLLM-Omni passes ``local_world_size=num_gpus`` to
+    # ``set_multiprocessing_worker_envs`` and/or calls
+    # ``set_torch_threads_for_runtime()`` in ``DiffusionWorker`` after
+    # ``load_model``.
+    # -------------------------------------------------------------------------
+    try:
+        from vllm.utils.torch_utils import set_torch_threads_for_runtime
+    except ImportError:
+        # vLLM < 0.29 has no steady-state policy helper, but its
+        # set_multiprocessing_worker_envs already defaults OMP_NUM_THREADS=1.
+        logger.debug("vLLM has no set_torch_threads_for_runtime; thread patch skipped.")
+        return
+
+    worker_cls = diffusion_worker.DiffusionWorker
+    orig_load_model = _unwrap_tpu_patch(worker_cls.load_model)
+
+    def _load_model_then_trim_threads(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = orig_load_model(self, *args, **kwargs)
+        set_torch_threads_for_runtime()
+        return result
+
+    worker_cls.load_model = _mark_tpu_patch(
+        _load_model_then_trim_threads, orig_load_model
+    )
+    logger.info(
+        "Applied TPU patch: steady-state torch CPU threads "
+        "(set_torch_threads_for_runtime) after DiffusionWorker.load_model."
+    )

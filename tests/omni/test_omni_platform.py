@@ -868,6 +868,38 @@ def test_worker_proc_async_output_loop_zero_gpu_id():
     assert proc._async_output_pending == 0
 
 
+def test_diffusion_worker_load_model_trims_torch_threads(monkeypatch):
+    # vllm_omni spawns diffusion workers with OMP_NUM_THREADS=<all cores>
+    # (set_multiprocessing_worker_envs() default local_world_size=1). After
+    # load_model the worker must apply vLLM's steady-state thread policy,
+    # exactly like TPUWorker.compile_or_warm_up_model does for LLM workers.
+    from vllm_omni.diffusion.worker import diffusion_worker
+
+    from vllm_torchtpu.omni import patches as omni_patches
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        "vllm.utils.torch_utils.set_torch_threads_for_runtime",
+        lambda: events.append("trim"),
+        raising=False,  # local vLLM may predate the 0.29 helper
+    )
+    worker_cls = diffusion_worker.DiffusionWorker
+    orig_load = _unwrap_tpu_patch(worker_cls.load_model)
+    monkeypatch.setattr(worker_cls, "load_model", orig_load)
+
+    omni_patches._patch_diffusion_worker_runtime_threads(diffusion_worker)
+    omni_patches._patch_diffusion_worker_runtime_threads(diffusion_worker)
+    assert _unwrap_tpu_patch(worker_cls.load_model) is orig_load
+
+    worker = worker_cls()
+    assert worker.load_model(load_format="safetensors") == "loaded"
+    assert worker.load_calls == [("safetensors", None)]
+    assert events == ["trim"]
+    worker.load_model(custom_pipeline_name="custom")
+    assert worker.load_calls[-1] == ("default", "custom")
+    assert events == ["trim", "trim"]
+
+
 def test_set_device_installs_worker_patches(monkeypatch):
     # DiffusionWorker.__init__ calls init_device() -> set_device before
     # WorkerProc starts the DiffusionAsyncOutput thread, on both the default
