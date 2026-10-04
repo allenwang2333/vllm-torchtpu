@@ -21,6 +21,13 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.distributed.parallel_state import get_dp_group
 
+from vllm_torchtpu import envs
+
+# TPU_TP_ALLREDUCE_IMPL=twoshot range. Set from the workload-microbenchmark collective component
+# on 2x2x2 (16 TensorCores, 2 hosts): decode bf16[16, 6144] 19.8 -> 11.6 us, bf16[32, 6144]
+# 21.1 -> 16.0 us, 512 KiB 24.1 -> 18.9 us; XLA wins from ~1 MiB.
+_TWOSHOT_MAX_BYTES = 512 * 1024
+
 
 class TpuNullAll2AllManager(All2AllManagerBase):
     """Probe-only stub; TPU EP dispatch/combine never goes through it."""
@@ -35,6 +42,36 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         # (support_fault_tolerance=False); it is never used for compute.
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
+
+    def prepare_all_reduce_kernel(self) -> None:
+        """Build the two-shot all-reduce op for this group, once, outside any trace (building
+        its mesh runs a CPU collective). A no-op unless TPU_TP_ALLREDUCE_IMPL=twoshot."""
+        if envs.TPU_TP_ALLREDUCE_IMPL != "twoshot" or self.world_size < 2:
+            return
+        if getattr(self, "_twoshot_ar", None) is not None:
+            return
+        from vllm_torchtpu.kernels.collectives import oneshot
+
+        self._twoshot_ar = oneshot.torch_op(
+            "all_reduce", self, self.unique_name.replace(":", "_"), variant="twoshot"
+        )
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        # The size cut-off is a Python branch on the token count: only the backbone warmup gives
+        # each side of such a branch its own trace (shape_variants). The MTP drafter is traced
+        # once for all buckets and would freeze the branch, so it keeps XLA's all-reduce.
+        from vllm_torchtpu.compilation import shape_variants
+
+        op = getattr(self, "_twoshot_ar", None)
+        if op is None or not shape_variants.in_warmup():
+            return super().all_reduce(input_)
+        if (
+            input_.numel() * input_.element_size() <= _TWOSHOT_MAX_BYTES
+            and input_.numel() % self.world_size == 0
+            and input_.dim() >= 1
+        ):
+            return op(input_.reshape(input_.shape[0], -1)).view(input_.shape)
+        return super().all_reduce(input_)
 
     def _dp_gather(self, x: torch.Tensor) -> torch.Tensor:
         return get_dp_group().all_gather(x, dim=0)
