@@ -101,6 +101,12 @@ PREFILL_OFFLOAD_CONTROLLER_PORT="${PREFILL_OFFLOAD_CONTROLLER_PORT:-47800}"
 DECODE_OFFLOAD_CONTROLLER_PORT="${DECODE_OFFLOAD_CONTROLLER_PORT:-48800}"
 PREFILL_CPU_BYTES_TO_USE="${PREFILL_CPU_BYTES_TO_USE:-68719476736}"
 DECODE_CPU_BYTES_TO_USE="${DECODE_CPU_BYTES_TO_USE:-8589934592}"
+# Decode's KV connector. multi (default): Raiden transfer plus a host offload
+# pool. raiden: the Raiden transfer alone. vLLM's MultiConnector lets a hybrid
+# model reuse decode-local prefix pages only if every child supports restoring
+# the recurrent state, and the offload child does not, so prefix-aware Stage-3
+# loads (TPU_RAIDEN_PREFIX_AWARE_LOAD) only take effect for Qwen3.5 with raiden.
+DECODE_KV_CONNECTOR="${DECODE_KV_CONNECTOR:-multi}"
 PREFILL_SB_PORT_BASE="${PREFILL_SB_PORT_BASE:-29500}"
 DECODE_SB_PORT_BASE="${DECODE_SB_PORT_BASE:-29510}"
 DECODE_DP_MASTER_PORT="${DECODE_DP_MASTER_PORT:-29520}"
@@ -310,6 +316,16 @@ fi
 
 p_kv='{"kv_connector":"TPUMultiConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector","kv_role":"kv_producer","kv_connector_extra_config":{"connectors":[{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":'"${KV_PORT}"'},{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":'"${PREFILL_CPU_BYTES_TO_USE}"',"raiden_controller_port":'"${PREFILL_OFFLOAD_CONTROLLER_PORT}"'}}]}}'
 d_kv='{"kv_connector":"TPUMultiConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector","kv_role":"kv_consumer","kv_connector_extra_config":{"connectors":[{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":'"${KV_PORT}"'},{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":'"${DECODE_CPU_BYTES_TO_USE}"',"raiden_controller_port":'"${DECODE_OFFLOAD_CONTROLLER_PORT}"'}}]}}'
+case "${DECODE_KV_CONNECTOR}" in
+  multi) ;;
+  raiden)
+    d_kv='{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":'"${KV_PORT}"'}'
+    ;;
+  *)
+    echo "ERROR: DECODE_KV_CONNECTOR must be multi or raiden, got ${DECODE_KV_CONNECTOR}" >&2
+    exit 2
+    ;;
+esac
 
 prefill_namespace="prefill_p4d2_baseline_$(date +%Y%m%d_%H%M%S)"
 decode_namespace="decode_p4d2_baseline_$(date +%Y%m%d_%H%M%S)"
@@ -359,6 +375,7 @@ PREFILL_OFFLOAD_CONTROLLER_PORT=${PREFILL_OFFLOAD_CONTROLLER_PORT}
 DECODE_OFFLOAD_CONTROLLER_PORT=${DECODE_OFFLOAD_CONTROLLER_PORT}
 PREFILL_CPU_BYTES_TO_USE=${PREFILL_CPU_BYTES_TO_USE}
 DECODE_CPU_BYTES_TO_USE=${DECODE_CPU_BYTES_TO_USE}
+DECODE_KV_CONNECTOR=${DECODE_KV_CONNECTOR}
 TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL}
 ATTENTION_BACKEND=${ATTENTION_BACKEND}
 EOF

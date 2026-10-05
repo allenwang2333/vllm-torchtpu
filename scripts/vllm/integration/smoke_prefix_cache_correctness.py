@@ -71,6 +71,10 @@ CHAT_TEMPLATE_KWARGS: dict = {"enable_thinking": False}
 # spend, so main() can raise every suite's budget from --min-max-tokens.
 MIN_MAX_TOKENS = 0
 
+# Sent with every request. main() adds vLLM's X-data-parallel-rank from
+# --data-parallel-rank.
+EXTRA_HEADERS: dict = {}
+
 
 def env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, str(default))
@@ -95,7 +99,7 @@ def post_json(url: str, payload: dict, timeout: int) -> tuple[int, dict, float]:
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **EXTRA_HEADERS},
         method="POST",
     )
     start = time.time()
@@ -708,6 +712,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=env_int("P4D2_CONCURRENT_REQUESTS", 0),
     )
+    parser.add_argument(
+        "--data-parallel-rank",
+        type=int,
+        help="Hold every request to this DP rank of the engine, with vLLM's "
+        "X-data-parallel-rank header; through a P/D proxy, of both engines. "
+        "Repeated prefixes then reach the replica that cached them.",
+    )
     return parser.parse_args()
 
 
@@ -718,6 +729,8 @@ def main() -> int:
         CHAT_TEMPLATE_KWARGS.update(args.chat_template_kwargs)
     global MIN_MAX_TOKENS
     MIN_MAX_TOKENS = args.min_max_tokens
+    if args.data_parallel_rank is not None:
+        EXTRA_HEADERS["X-data-parallel-rank"] = str(args.data_parallel_rank)
     url = f"http://{args.host}:{args.port}/v1/chat/completions"
     if args.quick_probe_only:
         return run_quick_probe(url, args.model, args.timeout)

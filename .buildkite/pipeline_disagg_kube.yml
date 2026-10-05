@@ -81,3 +81,22 @@ steps:
           podTemplate: tpu-launcher
     commands:
       - /opt/launcher/launch --manifest .buildkite/kubernetes/manifests/workloads/kimi-k3-1p1d-4dp8tp.yaml
+
+  # Qwen3.5 p4d2 prefix-aware Stage-3 loads (#487): prefill PCP4 and decode DP4
+  # on one 2x2x1 host, so the built-in one-pod Job runs it. Decode must reuse
+  # its cached pages and pull only the rest from prefill.
+  - label: ":kubernetes: :tpu: Qwen3.5 p4d2 prefix-aware load (TPU v7x 2x2x1)"
+    depends_on: "build_kube_disagg_image"
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    env:
+      SHAPE: "tpu7x-standard-4t/2x2x1"
+      TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+      ARTIFACTS_DIR: "perf_eval_results"
+      RUN_ROOT: "perf_eval_results/qwen35_p4d2_prefix_aware_ci"
+    commands:
+      - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_p4d2_prefix_aware_load.sh
