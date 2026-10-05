@@ -154,6 +154,7 @@ if TYPE_CHECKING:
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_LAZY_REASONING_COUNT: bool = True
     VLLM_TPU_TOKENIZE_PREFIX_CACHE: bool = False
+    TPU_SMALL_ALL_REDUCE: bool = False
 
 
 def env_with_choices(
@@ -931,6 +932,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # boundaries, reusing the ids of recent prompts that share a prefix
     # (frontend/tokenize_prefix_cache.py). Token ids are unchanged.
     "VLLM_TPU_TOKENIZE_PREFIX_CACHE": env_bool("VLLM_TPU_TOKENIZE_PREFIX_CACHE"),
+    # --- Small collectives ---
+    # Run small decode-step TP all-reduces and DP MoE combines as Pallas
+    # kernels (kernels/experimental/small_collectives) instead of XLA's.
+    "TPU_SMALL_ALL_REDUCE": env_bool("TPU_SMALL_ALL_REDUCE"),
 }
 
 
