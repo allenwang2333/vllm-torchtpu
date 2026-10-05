@@ -1,6 +1,8 @@
 # Copyright 2026 Google LLC
 # SPDX-License-Identifier: Apache-2.0
-"""8-device parity for the fused TP MoE + shared expert + in-kernel all-reduce."""
+"""8-device parity for the fused MoE + shared expert + in-kernel all-reduce,
+with the experts TP-sliced (every rank holds all E) or EP-sharded (rank r holds
+global experts [r*E, (r+1)*E)); the shared expert is always a TP slice."""
 
 import functools
 
@@ -13,7 +15,7 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.experimental import moe_fused_tp as kernel
 
-N, H, INTER, E, TOPK = 8, 1024, 128, 64, 10
+N, H, INTER, INTER_S, E, TOPK = 8, 1024, 256, 128, 64, 10
 F8 = jnp.float8_e4m3fn
 
 
@@ -34,8 +36,8 @@ def setup():
 
         w1, s1 = q(jax.random.normal(ks[0], (E, H, 2 * INTER)) * 0.02, 1)
         w2, s2 = q(jax.random.normal(ks[1], (E, INTER, H)) * 0.02, 1)
-        w1s, s1s = q(jax.random.normal(ks[2], (H, 2 * INTER)) * 0.02, 0)
-        w2s, s2s = q(jax.random.normal(ks[3], (INTER, H)) * 0.02, 0)
+        w1s, s1s = q(jax.random.normal(ks[2], (H, 2 * INTER_S)) * 0.02, 0)
+        w2s, s2s = q(jax.random.normal(ks[3], (INTER_S, H)) * 0.02, 0)
         return w1, w2, s1[:, :, None, :], s2[:, :, None, :], w1s, s1s, w2s, s2s
 
     weights = jax.jit(
@@ -51,10 +53,9 @@ def setup():
 
 
 def _ffn(x, w1, s1, w2, s2):
+    i = w2.shape[0]
     gu = jnp.dot(x, w1.astype(jnp.float32) * s1)
-    return jnp.dot(
-        jax.nn.silu(gu[:, :INTER]) * gu[:, INTER:], w2.astype(jnp.float32) * s2
-    )
+    return jnp.dot(jax.nn.silu(gu[:, :i]) * gu[:, i:], w2.astype(jnp.float32) * s2)
 
 
 def _routed(x, w1, w2, s1, s2, tw, ti, *, skip_expert=None):
@@ -69,9 +70,11 @@ def _routed(x, w1, w2, s1, s2, tw, ti, *, skip_expert=None):
 
 
 def _reference(
-    rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, skip_expert=None
+    rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, skip_expert=None, ep=False
 ):
     """The decomposed layer in f32: routed experts + gated shared expert + psum."""
+    if ep:
+        ti = ti - rank.reshape(()) * E
     xf = x.astype(jnp.float32)
     shared = _ffn(xf, w1s, s1s, w2s, s2s)
     shared = jax.nn.sigmoid(jnp.dot(x, wg, preferred_element_type=jnp.float32)) * shared
@@ -79,21 +82,37 @@ def _reference(
     return jax.lax.psum(routed + shared, "d").astype(x.dtype)
 
 
-def _fused(rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti):
+def _fused(rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, ep=False):
     return kernel.fused_moe_tp_ar(
-        rank.reshape(-1), x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, n_ranks=N
+        rank.reshape(-1),
+        x,
+        w1,
+        w2,
+        s1,
+        s2,
+        w1s,
+        s1s,
+        w2s,
+        s2s,
+        wg,
+        tw,
+        ti,
+        n_ranks=N,
+        expert_start=rank.reshape(()) * E if ep else None,
     )
 
 
 @pytest.mark.parametrize("m", [8, 32])
 @pytest.mark.parametrize("padded", [False, True])
-def test_matches_decomposed_layer(setup, m, padded):
+@pytest.mark.parametrize("ep", [False, True])
+def test_matches_decomposed_layer(setup, m, padded, ep):
     mesh, sh, rank, weights, wg = setup
     rng = np.random.default_rng(m)
     x = rng.normal(size=(m, H)).astype(np.float32)
-    ids = np.stack([rng.choice(E, TOPK, replace=False) for _ in range(m)]).astype(
-        np.int32
-    )
+    n_global = N * E if ep else E
+    ids = np.stack(
+        [rng.choice(n_global, TOPK, replace=False) for _ in range(m)]
+    ).astype(np.int32)
     tw = rng.dirichlet(np.ones(TOPK), size=m).astype(np.float32)
     if padded:
         tw[m - 3 :] = 0
@@ -121,11 +140,13 @@ def test_matches_decomposed_layer(setup, m, padded):
             / np.maximum(np.linalg.norm(ref, axis=1), 1e-30)
         ).max()
 
-    got, ref = run(_fused), run(_reference)
+    got = run(functools.partial(_fused, ep=ep))
+    ref = run(functools.partial(_reference, ep=ep))
     assert all(np.array_equal(got[0], got[r]) for r in range(N)), "ranks disagree"
     assert np.isfinite(got).all()
     # FP8 activations and a BF16 all-reduce against f32 math: a few percent per row.
     assert max_rel(got[0], ref[0]) < 0.08
     # Positive control: a reference missing one routed expert must fail the bound.
-    broken = run(functools.partial(_reference, skip_expert=int(ids[0, 0])))
+    # In EP mode the local id of expert ids[0, 0] is only that on its owner rank.
+    broken = run(functools.partial(_reference, skip_expert=int(ids[0, 0]) % E, ep=ep))
     assert max_rel(got[0], broken[0]) > 0.08

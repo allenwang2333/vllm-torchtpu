@@ -3,7 +3,9 @@
 """Serve a TP-only MoE layer, its shared expert and its TP all-reduce in one kernel.
 
 Under MoE tensor parallelism vLLM computes the shared expert separately, adds
-it to the routed output and all-reduces the sum. With
+it to the routed output and all-reduces the sum. Expert parallelism with TP
+attention (DP 1) ends the same way, so its layers are served too, each rank
+with its own expert range. With
 ``USE_MOE_FUSED_TP_AR=1`` an eligible layer instead runs
 ``moe_fused_tp.fused_moe_tp_ar`` under shard_map over the TP mesh: shared +
 routed experts and the all-reduce in one Pallas call per rank.
@@ -52,7 +54,11 @@ _SHARED_BUFFERS = (
 # One exported program per distinct closure; the mesh never enters a traced
 # frame (ops are built at arming time and only looked up in forward).
 _OPS: dict[tuple, Any] = {}
+# Per rank [[mesh index, first global expert]]: the kernel addresses peers by
+# mesh index, and the expert range follows vLLM's EP placement, which is not
+# tied to mesh order.
 _RANK_BUFFER: Any = None
+_RANK_BUFFER_START = 0
 # Largest token count served by the decode kernel; above it, the prefill kernel.
 MAX_DECODE_TOKENS = 128
 
@@ -61,18 +67,18 @@ def fused_moe_tp_ar_supported(quant_method: Any) -> bool:
     return getattr(quant_method, FUSED_MOE_TP_AR_OP_ATTR, None) is not None
 
 
-def _build_op(mesh, n_ranks: int, topk: int):
+def _build_op(mesh, n_ranks: int, topk: int, expert_parallel: bool):
     # The token count is static inside the exported program, so the cap is
     # applied HERE, not in torch: every bucket then traces the same torch op
     # with the same inputs, which vLLM's shape-specialized warmup requires.
-    key = (id(mesh), n_ranks, topk)
+    key = (id(mesh), n_ranks, topk, expert_parallel)
     op = _OPS.get(key)
     if op is not None:
         return op
     axis = EP_AXIS_NAME
     spec = PartitionSpec(axis)
 
-    def prefill(x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti):
+    def prefill(x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, start):
         """Above MAX_DECODE_TOKENS: expert kernel + combine + chunked psum."""
         from vllm_torchtpu.kernels.experimental.moe_tp_prefill import (
             default_combine_chunks,
@@ -97,14 +103,16 @@ def _build_op(mesh, n_ranks: int, topk: int):
             ti,
             combine_chunks=default_combine_chunks(x.shape[0]),
             reduce_fn=lambda y: jax.lax.psum(y, axis),
+            expert_start=start,
         )
 
     def local(rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti):
         s1s, s2s, wg = s1s.reshape(1, -1), s2s.reshape(1, -1), wg.reshape(-1, 1)
+        start = rank[0, 1] if expert_parallel else None
         if x.shape[0] > MAX_DECODE_TOKENS:
-            return prefill(x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti)
+            return prefill(x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, start)
         return _kernel_body(
-            rank.reshape(-1),
+            rank[0, :1],
             x,
             w1,
             w2,
@@ -118,6 +126,7 @@ def _build_op(mesh, n_ranks: int, topk: int):
             tw,
             ti,
             n_ranks=n_ranks,
+            expert_start=start,
         )
 
     # torch_tpu infers static arguments from annotations: every operand is a
@@ -193,14 +202,20 @@ def _shared_slice(runner) -> tuple | None:
     return (w1s.data, s1s.data, w2s.data, s2s.data, wg.data)
 
 
-def _admit(runner, n_ranks: int) -> tuple | None:
+def _admit(runner, n_ranks: int) -> tuple[tuple, bool] | None:
+    """(shared-expert slice, expert_parallel) for an eligible layer, else None."""
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
     cfg = runner.moe_config
     par = cfg.moe_parallel_config
     qm = runner._quant_method
     layer = runner.routed_experts
-    if not isinstance(qm, VllmFp8MoEMethodTPU) or par.use_ep or par.tp_size != n_ranks:
+    expert_parallel = bool(par.use_ep)
+    if expert_parallel:
+        sharded_ok = par.ep_size == n_ranks and par.dp_size == 1
+    else:
+        sharded_ok = par.tp_size == n_ranks
+    if not isinstance(qm, VllmFp8MoEMethodTPU) or not sharded_ok:
         return None
     if getattr(cfg, "is_sequence_parallel", False) or getattr(
         cfg, "skip_final_all_reduce", False
@@ -229,6 +244,7 @@ def _admit(runner, n_ranks: int) -> tuple | None:
     s1, s2 = layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
     e, h, two_i = w1.shape
     i = two_i // 2
+    i_s = w2s.shape[0]  # the shared expert is a TP slice, even under EP
     if (
         w1.dtype != torch.float8_e4m3fn
         or tuple(w2.shape) != (e, i, h)
@@ -236,12 +252,13 @@ def _admit(runner, n_ranks: int) -> tuple | None:
         or tuple(s2.shape) != (e, 1, 1, h)
         or i % 128
         or h % (n_ranks * 128)
-        or tuple(w1s.shape) != (h, two_i)
-        or tuple(w2s.shape) != (i, h)
+        or i_s % 128
+        or i_s > i
+        or tuple(w1s.shape) != (h, 2 * i_s)
         or tuple(wg.shape) != (h, 1)
     ):
         return None
-    return shared
+    return shared, expert_parallel
 
 
 def arm_fused_tp_ar(model: torch.nn.Module) -> int:
@@ -261,21 +278,36 @@ def arm_fused_tp_ar(model: torch.nn.Module) -> int:
     if mesh is None:
         return 0
     n_ranks = mesh.shape[EP_AXIS_NAME]
-    global _RANK_BUFFER
+    global _RANK_BUFFER, _RANK_BUFFER_START
+    from vllm_torchtpu.layers.adapter.moe_routing import get_experts_start
+
     armed = 0
     for runner in runners:
-        shared = _admit(runner, n_ranks)
-        if shared is None:
+        admitted = _admit(runner, n_ranks)
+        if admitted is None:
             continue
+        shared, expert_parallel = admitted
         layer = runner.routed_experts
+        start = get_experts_start(layer) or 0
         if _RANK_BUFFER is None:
             _RANK_BUFFER = torch.tensor(
-                [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
+                [[ep_mesh_index(), start]],
+                dtype=torch.int32,
+                device=layer.w13_weight.device,
+            )
+            _RANK_BUFFER_START = start
+        elif start != _RANK_BUFFER_START:
+            # A collective kernel must arm on every rank or none.
+            raise RuntimeError(
+                "fused TP MoE: layers on this rank start at different experts "
+                f"({_RANK_BUFFER_START} vs {start})"
             )
         setattr(
             runner._quant_method,
             FUSED_MOE_TP_AR_OP_ATTR,
-            _build_op(mesh, n_ranks, layer.moe_config.experts_per_token),
+            _build_op(
+                mesh, n_ranks, layer.moe_config.experts_per_token, expert_parallel
+            ),
         )
         for name, tensor in zip(_SHARED_BUFFERS, shared):
             layer.register_buffer(name, tensor, persistent=False)
@@ -286,7 +318,7 @@ def arm_fused_tp_ar(model: torch.nn.Module) -> int:
     if armed:
         logger.info(
             "Armed fused TP MoE + shared expert + all-reduce on %d of %d MoE layers "
-            "(tp=%d, decode kernel up to %d tokens, prefill kernel above)",
+            "(%d ranks, decode kernel up to %d tokens, prefill kernel above)",
             armed,
             len(runners),
             n_ranks,
