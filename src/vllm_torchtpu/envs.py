@@ -166,6 +166,7 @@ if TYPE_CHECKING:
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     TPU_MTP_STEP0_POST_ATTN_GATHER: bool = True
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
+<<<<<<< HEAD
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     TPU_SCHED_SRPF_RUNNING: bool = True
@@ -175,6 +176,9 @@ if TYPE_CHECKING:
     TPU_SCHED_STEP_TOTAL_CAP: int = 4096
     TPU_SCHED_WARM_STREAK: int = 0
     TPU_SCHED_WARM_MIN_DECODERS: int = 24
+=======
+    TPU_SMALL_ALL_REDUCE: bool = False
+>>>>>>> d0b9b7457 ([#1469] [Collectives] Pallas all-reduce and reduce-scatter for small blocks)
 
 
 def env_with_choices(
@@ -1076,6 +1080,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_HYBRID_RETENTION_MAX_CONVS": env_nonnegative_int(
         "TPU_HYBRID_RETENTION_MAX_CONVS", 64
     ),
+    # --- Small collectives ---
+    # Run small decode-step TP all-reduces and DP MoE combines as Pallas
+    # kernels (kernels/experimental/small_collectives) instead of XLA's.
+    "TPU_SMALL_ALL_REDUCE": env_bool("TPU_SMALL_ALL_REDUCE"),
 }
 
 

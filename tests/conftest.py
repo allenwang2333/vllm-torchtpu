@@ -37,6 +37,8 @@ import torch
 # nothing but these runs with JAX pinned to the CPU.
 HOST_ONLY_TEST_FILES: tuple[str, ...] = (
     "tests/kernels/experimental/test_gated_norm_quant.py",
+    "tests/distributed/test_sharded_jax_op.py",
+    "tests/layers/adapter/test_small_all_reduce_op.py",
 )
 
 
