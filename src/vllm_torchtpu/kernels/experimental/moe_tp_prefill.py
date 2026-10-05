@@ -53,6 +53,7 @@ def _build_expert_kernel(
     n_experts,
     hidden,
     inter,
+    inter_sh,
     n_tok,
     n_routes,
     nbuf,
@@ -114,42 +115,55 @@ def _build_expert_kernel(
         win_sems,  # DMA[2]
         out_sems,  # DMA[2]
         w_sems,  # DMA[nbuf]
+        w1sh_vm,  # [H, 2Is]  the shared expert, loaded once
+        w2sh_vm,  # [Is, H]
+        s1sh_vm,  # [1, 2Is]
+        s2sh_vm,  # [1, H]
+        sh_sem,  # DMA[]
     ):
         n_visit = n_visit_sm[0]
 
-        # ---- weights: a ring of nbuf slots, nbuf-1 visits ahead ----
-        def w_copies(e_src, slot, use_shared):
-            if use_shared:
-                srcs = (w1sh_hbm.at[0], w2sh_hbm.at[0], s1sh_hbm.at[0], s2sh_hbm.at[0])
-            else:
-                srcs = (
-                    w1_hbm.at[e_src],
-                    w2_hbm.at[e_src],
-                    s1_hbm.at[e_src],
-                    s2_hbm.at[e_src],
-                )
+        # ---- weights: routed experts through a ring of nbuf slots, nbuf-1
+        # visits ahead; the shared expert (its own intermediate size) has its
+        # own buffers, loaded once at entry ----
+        def w_copies(e_src, slot):
+            srcs = (
+                w1_hbm.at[e_src],
+                w2_hbm.at[e_src],
+                s1_hbm.at[e_src],
+                s2_hbm.at[e_src],
+            )
             dsts = (w1_vm.at[slot], w2_vm.at[slot], s1_vm.at[slot], s2_vm.at[slot])
             return [
                 pltpu.make_async_copy(s, d, w_sems.at[slot]) for s, d in zip(srcs, dsts)
             ]
 
+        shared_copies = [
+            pltpu.make_async_copy(s, d, sh_sem)
+            for s, d in zip(
+                (w1sh_hbm.at[0], w2sh_hbm.at[0], s1sh_hbm.at[0], s2sh_hbm.at[0]),
+                (w1sh_vm, w2sh_vm, s1sh_vm, s2sh_vm),
+            )
+        ]
+
         def start_weights(v):
             e = visit_e_sm[v]
-            slot = lax.rem(v, nbuf)
-
-            @pl.when(e == shared)
-            def _():
-                for c in w_copies(0, slot, True):
-                    c.start(priority=WEIGHT_DMA_PRIORITY)
 
             @pl.when(e != shared)
             def _():
-                for c in w_copies(e, slot, False):
+                for c in w_copies(e, lax.rem(v, nbuf)):
                     c.start(priority=WEIGHT_DMA_PRIORITY)
 
         def wait_weights(v):
-            for c in w_copies(0, lax.rem(v, nbuf), False):
-                c.wait()
+            @pl.when(jnp.logical_not(is_shared(v)))
+            def _():
+                for c in w_copies(0, lax.rem(v, nbuf)):
+                    c.wait()
+
+            @pl.when(is_shared(v))
+            def _():
+                for c in shared_copies:
+                    c.wait()
 
         # ---- tile coordinates: (visit, tile within visit) -> next ----
         def next_tile(v, t):
@@ -252,6 +266,8 @@ def _build_expert_kernel(
             ).wait()
 
         # ---- prologue ----
+        for c in shared_copies:
+            c.start(priority=WEIGHT_DMA_PRIORITY)
         for k in range(nbuf - 1):
 
             @pl.when(k < n_visit)
@@ -316,16 +332,14 @@ def _build_expert_kernel(
             def _():
                 out_wait(p, n_prev)
 
-            def compute(h):
+            def compute(h, w1, w2, s1, s2):
                 act = lhs_vm[lslot, pl.ds(0, h)].reshape(h, hidden)
                 act_s = _tile_row_scales(ls_vm[lslot], base, h)
-                acc2, mid_s = expert_ffn_fp8(
-                    act, act_s, w1_vm[slot], w2_vm[slot], s1_vm[slot]
-                )
+                acc2, mid_s = expert_ffn_fp8(act, act_s, w1, w2, s1)
                 # Retile into the per-row slab layout while still f32 (8x8
                 # sublane blocks), then pack to bf16: cheaper than retiling the
                 # packed bf16 value.
-                rows = (acc2 * mid_s * s2_vm[slot]).reshape(h, lane_blocks, LANES)
+                rows = (acc2 * mid_s * s2).reshape(h, lane_blocks, LANES)
                 rows = rows.astype(jnp.bfloat16)
                 for par in range(2):
 
@@ -333,15 +347,24 @@ def _build_expert_kernel(
                     def _(par=par):
                         out_vm[par, pl.ds(0, h)] = rows
 
+            def compute_visit(h):
+                @pl.when(is_shared(v))
+                def _():
+                    compute(h, w1sh_vm[...], w2sh_vm[...], s1sh_vm[...], s2sh_vm[...])
+
+                @pl.when(jnp.logical_not(is_shared(v)))
+                def _():
+                    compute(h, w1_vm[slot], w2_vm[slot], s1_vm[slot], s2_vm[slot])
+
             for i, h in enumerate(rungs):
                 below = rungs[i - 1] if i else 0
                 if len(rungs) == 1:
-                    compute(h)
+                    compute_visit(h)
                 else:
 
                     @pl.when(jnp.logical_and(live > below, live <= h))
                     def _(h=h):
-                        compute(h)
+                        compute_visit(h)
 
             out_copy(base, p, live).start()
             n_out0 = jnp.where(p == 0, live, n_out0)
@@ -381,6 +404,11 @@ def _build_expert_kernel(
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((nbuf,)),
+                pltpu.VMEM((hidden, 2 * inter_sh), FP8),
+                pltpu.VMEM((inter_sh, hidden), FP8),
+                pltpu.VMEM((1, 2 * inter_sh), jnp.float32),
+                pltpu.VMEM((1, hidden), jnp.float32),
+                pltpu.SemaphoreType.DMA(()),
             ),
             grid=(),
         ),
@@ -391,7 +419,7 @@ def _build_expert_kernel(
         ),
         interpret=pltpu.InterpretParams() if interpret else False,
         name=(
-            f"moe_tp_prefill_t{n_tok}_e{n_experts}_i{inter}_nb{nbuf}"
+            f"moe_tp_prefill_t{n_tok}_e{n_experts}_i{inter}_is{inter_sh}_nb{nbuf}"
             f"_u{unroll}_m{tile_m}r{n_rungs}_la{lookahead}"
         ),
     )
@@ -474,6 +502,7 @@ def moe_tp_prefill(
     n_rungs=4,
     gather_unroll=8,
     lookahead=2,
+    expert_start=None,
     interpret=False,
 ):
     """One rank's routed + shared MoE output for prefill-sized token counts.
@@ -482,6 +511,11 @@ def moe_tp_prefill(
     s1 [E, 2I]-shaped per-channel f32 (any of [E,2I], [E,1,2I], [E,1,1,2I]),
     s2 likewise [E, H]; shared w1_sh [H, 2I], w2_sh [I, H], s1_sh [2I],
     s2_sh [H], gate wg_sh [H, 1]. topk_weights / topk_ids [T, K].
+
+    With expert parallelism the rank holds experts [expert_start,
+    expert_start + E) of the global routing (topk_ids are global); routes to
+    other ranks' experts are not computed here. The shared expert's
+    intermediate size (w2_sh.shape[0]) may differ from the routed one.
 
     reduce_fn (e.g. ``lambda y: lax.psum(y, axis)``) is applied per combine
     chunk; each chunk's input is tied to the previous chunk's reduced output,
@@ -493,12 +527,14 @@ def moe_tp_prefill(
         tile_m = default_tile_m(n_tok)
     n_experts, _, two_i = w1.shape
     inter = two_i // 2
+    inter_sh = w2_sh.shape[0]
     n_routes = n_tok * topk_ids.shape[1]
 
     call, dims = build_expert_kernel(
         n_experts=n_experts,
         hidden=hidden,
         inter=inter,
+        inter_sh=inter_sh,
         n_tok=n_tok,
         n_routes=n_routes,
         nbuf=nbuf,
@@ -514,6 +550,11 @@ def moe_tp_prefill(
     # Padded bucket rows keep their expert ids but carry zero routing weight
     # (TPU_MOE_SKIP_PADDED_TOKENS); their routes are not computed.
     route_valid = (topk_weights != 0) if skip_zero_weight_routes else None
+    if expert_start is not None:
+        topk_ids = topk_ids - expert_start
+        local = (topk_ids >= 0) & (topk_ids < n_experts)
+        route_valid = local if route_valid is None else route_valid & local
+        topk_ids = jnp.where(local, topk_ids, 0)
     tok, pos, s_sorted, visit_e, visit_base, visit_rows, n_rv = routing_plan(
         topk_ids, n_experts, x_s, route_valid=route_valid, n_valid=n_valid
     )
@@ -537,9 +578,9 @@ def moe_tp_prefill(
         w2,
         s1.reshape(n_experts, 1, two_i).astype(jnp.float32),
         s2.reshape(n_experts, 1, hidden).astype(jnp.float32),
-        w1_sh.reshape(1, hidden, two_i),
-        w2_sh.reshape(1, inter, hidden),
-        s1_sh.reshape(1, 1, two_i).astype(jnp.float32),
+        w1_sh.reshape(1, hidden, 2 * inter_sh),
+        w2_sh.reshape(1, inter_sh, hidden),
+        s1_sh.reshape(1, 1, 2 * inter_sh).astype(jnp.float32),
         s2_sh.reshape(1, 1, hidden).astype(jnp.float32),
     )
 
