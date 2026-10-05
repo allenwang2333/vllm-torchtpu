@@ -15,7 +15,8 @@
 
 import hashlib
 import inspect
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -27,9 +28,11 @@ from vllm_torchtpu.models.vllm import qwen3_next_patch as patch_mod
 from vllm_torchtpu.models.vllm.qwen3_next_patch import (
     UPSTREAM_DECODER_LAYER_FORWARD,
     UPSTREAM_MODEL_FORWARD,
+    UPSTREAM_MTP_FORWARD,
     _check_tokens_divide_by_tp,
     maybe_patch_qwen3_next,
     patched_decoder_layer_forward,
+    patched_mtp_forward,
 )
 
 # The patched copies track vLLM v0.29.0 (pyproject.toml pin).
@@ -39,6 +42,10 @@ PINNED_DECODER_LAYER_HASH = (
 )
 PINNED_MODEL_FORWARD_HASH = (
     "a9c1265f14e88e54138394b9038db621813bb6357a9077ad50d1691db0ac4398"
+)
+
+PINNED_MTP_FORWARD_HASH = (
+    "54034d76e48fccf2cd98bcf05b831207580ad9e8886e6e387193e1bd70e9e472"
 )
 requires_pinned_vllm = pytest.mark.skipif(
     vllm.__version__ != PINNED_VLLM_VERSION,
@@ -62,6 +69,13 @@ def test_upstream_qwen3_next_forward_unchanged():
     ).hexdigest()
     assert actual_model_hash == PINNED_MODEL_FORWARD_HASH, (
         "Upstream Qwen3NextModel.forward has drifted. "
+        "Re-sync src/vllm_torchtpu/models/vllm/qwen3_next_patch.py."
+    )
+    actual_mtp_hash = hashlib.sha256(
+        inspect.getsource(UPSTREAM_MTP_FORWARD).encode("utf-8")
+    ).hexdigest()
+    assert actual_mtp_hash == PINNED_MTP_FORWARD_HASH, (
+        "Upstream Qwen3NextMultiTokenPredictor.forward has drifted. "
         "Re-sync src/vllm_torchtpu/models/vllm/qwen3_next_patch.py."
     )
 
@@ -220,3 +234,74 @@ def test_forward_patch_applied(monkeypatch):
         qwen3_next.Qwen3NextDecoderLayer.forward is not UPSTREAM_DECODER_LAYER_FORWARD
     )
     assert qwen3_next.Qwen3NextModel.forward is not UPSTREAM_MODEL_FORWARD
+
+
+def test_patched_mtp_forward_sp_chunk_and_gather():
+    """Verify patched_mtp_forward chunks [T, H] -> [T/TP, H] and all-gathers back."""
+    tp_size = 2
+    full_tokens = 8
+    hidden_size = 16
+
+    mock_layer = MagicMock()
+    mock_layer.use_attn_reduce_scatter_for_moe = True
+
+    def layer_call(positions, hidden_states, residual):
+        assert hidden_states.shape == (full_tokens // tp_size, hidden_size)
+        assert residual is None
+        return hidden_states, residual
+
+    mock_layer.side_effect = layer_call
+
+    predictor = SimpleNamespace(
+        num_mtp_layers=1,
+        layers=[mock_layer],
+        pre_fc_norm_embedding=lambda x: x,
+        pre_fc_norm_hidden=lambda x: x,
+        fc=lambda x: x[:, :hidden_size],
+        norm=lambda h, r: (h, None),
+    )
+
+    with (
+        patch(
+            "vllm_torchtpu.models.vllm.qwen3_next_patch.get_tensor_model_parallel_world_size",
+            return_value=tp_size,
+        ),
+        patch(
+            "vllm_torchtpu.models.vllm.qwen3_next_patch.tensor_model_parallel_all_gather",
+            side_effect=lambda x, dim: torch.cat([x] * tp_size, dim=dim),
+        ),
+        patch(
+            "vllm.model_executor.models.qwen3_next.sequence_parallel_chunk",
+            side_effect=lambda x: x.chunk(tp_size, dim=0)[0],
+        ),
+    ):
+        out = patched_mtp_forward(
+            predictor,
+            input_ids=torch.zeros(full_tokens, dtype=torch.int64),
+            positions=torch.arange(full_tokens),
+            hidden_states=torch.randn(full_tokens, hidden_size),
+            inputs_embeds=torch.randn(full_tokens, hidden_size),
+        )
+
+    assert out.shape == (full_tokens, hidden_size)
+
+
+def test_patched_mtp_forward_delegates_to_upstream_without_sp():
+    """Without SP the patched forward hands every argument to the upstream forward."""
+    mock_layer = MagicMock()
+    mock_layer.use_attn_reduce_scatter_for_moe = False
+    predictor = SimpleNamespace(num_mtp_layers=1, layers=[mock_layer])
+    args = (
+        torch.zeros(4, dtype=torch.int64),
+        torch.arange(4),
+        torch.randn(4, 16),
+        None,
+        None,
+        0,
+    )
+    with patch(
+        "vllm_torchtpu.models.vllm.qwen3_next_patch.UPSTREAM_MTP_FORWARD"
+    ) as upstream:
+        out = patched_mtp_forward(predictor, *args)
+    upstream.assert_called_once_with(predictor, *args)
+    assert out is upstream.return_value

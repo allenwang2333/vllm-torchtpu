@@ -34,7 +34,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
-from vllm.model_executor.models import qwen3_next
+from vllm.model_executor.models import qwen3_next, qwen3_next_mtp
 from vllm.sequence import IntermediateTensors
 
 import vllm_torchtpu.envs as envs
@@ -44,6 +44,7 @@ logger = init_logger(__name__)
 
 UPSTREAM_DECODER_LAYER_FORWARD = qwen3_next.Qwen3NextDecoderLayer.forward
 UPSTREAM_MODEL_FORWARD = qwen3_next.Qwen3NextModel.forward
+UPSTREAM_MTP_FORWARD = qwen3_next_mtp.Qwen3NextMultiTokenPredictor.forward
 
 
 def _check_tokens_divide_by_tp(num_tokens: int) -> None:
@@ -186,12 +187,65 @@ def patched_model_forward(
     return hidden_states
 
 
+def patched_mtp_forward(
+    self: qwen3_next_mtp.Qwen3NextMultiTokenPredictor,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    intermediate_tensors: IntermediateTensors | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+    spec_step_idx: int = 0,
+) -> torch.Tensor:
+    mtp_layer = self.layers[spec_step_idx % self.num_mtp_layers]
+    if not mtp_layer.use_attn_reduce_scatter_for_moe:
+        return UPSTREAM_MTP_FORWARD(
+            self,
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx,
+        )
+    # Upstream enables use_attn_reduce_scatter_for_moe only when
+    # pipeline_parallel_size == 1, so this rank is both first and last.
+    if inputs_embeds is None:
+        inputs_embeds = self.embed_input_ids(input_ids)
+    if hidden_states.shape[-1] != inputs_embeds.shape[-1]:
+        raise RuntimeError(
+            f"hidden_states and inputs_embeds dimension mismatch: "
+            f"{hidden_states.shape[-1]} vs {inputs_embeds.shape[-1]}"
+        )
+    hidden_states = self.fc(
+        torch.cat(
+            [
+                self.pre_fc_norm_embedding(inputs_embeds),
+                self.pre_fc_norm_hidden(hidden_states),
+            ],
+            dim=-1,
+        )
+    )
+    full_num_tokens = positions.shape[-1]
+    _check_tokens_divide_by_tp(full_num_tokens)
+    hidden_states = qwen3_next.sequence_parallel_chunk(hidden_states)
+    hidden_states, residual = mtp_layer(
+        positions=positions,
+        hidden_states=hidden_states,
+        residual=None,
+    )
+    hidden_states, _ = self.norm(hidden_states, residual)
+    return tensor_model_parallel_all_gather(hidden_states, 0).narrow(
+        0, 0, full_num_tokens
+    )
+
+
 def maybe_patch_qwen3_next(*args: object, **kwargs: object) -> None:
     """Install trace-stable forwards when TPU_MOE_SEQUENCE_PARALLEL=1."""
     if not envs.TPU_MOE_SEQUENCE_PARALLEL:
         return None
     qwen3_next.Qwen3NextDecoderLayer.forward = patched_decoder_layer_forward
     qwen3_next.Qwen3NextModel.forward = patched_model_forward
+    qwen3_next_mtp.Qwen3NextMultiTokenPredictor.forward = patched_mtp_forward
     logger.info(
         "Applied TPU patch: Qwen3.5 MoE trace-stable sequence-parallel forward."
     )
