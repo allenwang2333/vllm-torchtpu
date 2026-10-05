@@ -19,7 +19,11 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.megablox.gmm_v2_ffn import gmm_v2_ffn, make_ffn_configs
+from vllm_torchtpu.kernels.megablox.gmm_v2_ffn import (
+    gmm_v2_ffn,
+    gmm_v2_ffn_routed,
+    make_ffn_configs,
+)
 
 NUM_GROUPS, SIZE_K, SIZE_I, SIZE_N = 8, 512, 256, 512
 
@@ -154,4 +158,96 @@ def test_make_ffn_configs_declines_unmatched_widths():
             rhs_quant_dtype=None,
         )
         is None
+    )
+
+
+def _onehot_routed_reference(
+    hidden, w1, w2, w1_scale, w2_scale, topk_ids, topk_weights
+):
+    """fused_moe_gmm's EP decode path: one-hot permute, gmm_v2_ffn, one-hot combine."""
+    num_tokens, topk = topk_ids.shape
+    ids, weights = topk_ids.reshape(-1), topk_weights.reshape(-1)
+    valid = ids >= 0
+    keys = jnp.where(valid, ids, NUM_GROUPS)
+    revert = jnp.argsort(jnp.argsort(keys))
+    token_indices_sorted = jnp.arange(num_tokens, dtype=jnp.int32).repeat(topk)[
+        jnp.argsort(keys)
+    ]
+    group_sizes = (
+        jnp.zeros(NUM_GROUPS, jnp.int32)
+        .at[jnp.where(valid, ids, 0)]
+        .add(valid.astype(jnp.int32))
+    )
+    x = jax.nn.one_hot(token_indices_sorted, num_tokens, dtype=hidden.dtype) @ hidden
+    y = gmm_v2_ffn(
+        x,
+        w1,
+        w2,
+        group_sizes,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        fuse_act="silu",
+        preferred_element_type=hidden.dtype,
+    )
+    computed = jnp.arange(y.shape[0]) < group_sizes.sum()
+    y = jnp.where(computed[:, None], y, 0)
+    onehot = jax.nn.one_hot(
+        revert.reshape(num_tokens, topk), revert.size, dtype=y.dtype
+    )
+    combine = (onehot * (weights * valid).reshape(num_tokens, topk, 1)).sum(axis=1)
+    return combine @ y, group_sizes, token_indices_sorted
+
+
+@pytest.mark.parametrize("num_tokens", [4, 16, 48])
+@pytest.mark.parametrize("seed", [0, 1])
+def test_gmm_v2_ffn_routed_matches_onehot_permute_and_combine(num_tokens, seed):
+    _require_tpu()
+    topk, num_global = 10, 8 * NUM_GROUPS
+    rng = np.random.default_rng(seed)
+    hidden = jnp.asarray(rng.standard_normal((num_tokens, SIZE_K)), jnp.bfloat16)
+    w1 = jnp.asarray(
+        rng.standard_normal((NUM_GROUPS, SIZE_K, 2 * SIZE_I)) * 0.5, jnp.float8_e4m3fn
+    )
+    w2 = jnp.asarray(
+        rng.standard_normal((NUM_GROUPS, SIZE_I, SIZE_K)) * 0.5, jnp.float8_e4m3fn
+    )
+    w1_scale = jnp.asarray(
+        rng.uniform(0.02, 0.2, (NUM_GROUPS, 1, 1, 2 * SIZE_I)), jnp.float32
+    )
+    w2_scale = jnp.asarray(
+        rng.uniform(0.01, 0.1, (NUM_GROUPS, 1, 1, SIZE_K)), jnp.float32
+    )
+    # Global top-k over 8 EP ranks; this rank owns the first NUM_GROUPS experts.
+    global_ids = np.stack(
+        [rng.choice(num_global, topk, replace=False) for _ in range(num_tokens)]
+    )
+    topk_ids = jnp.asarray(np.where(global_ids < NUM_GROUPS, global_ids, -1), jnp.int32)
+    weights = rng.random((num_tokens, topk))
+    topk_weights = jnp.asarray(weights / weights.sum(1, keepdims=True), jnp.bfloat16)
+    topk_weights = jnp.where(topk_ids >= 0, topk_weights, 0)
+
+    expected, group_sizes, token_indices_sorted = _onehot_routed_reference(
+        hidden, w1, w2, w1_scale, w2_scale, topk_ids, topk_weights
+    )
+    actual = gmm_v2_ffn_routed(
+        hidden,
+        w1,
+        w2,
+        group_sizes,
+        token_indices_sorted,
+        topk_ids,
+        topk_weights,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        fuse_act="silu",
+    )
+
+    assert actual.shape == expected.shape
+    # The combine sums a token's routes in f32 in expert order, as the one-hot
+    # matmul does; only its accumulation order may differ.
+    np.testing.assert_allclose(
+        np.asarray(actual, np.float32),
+        np.asarray(expected, np.float32),
+        rtol=2**-7,
+        atol=2**-7 * float(jnp.abs(expected.astype(jnp.float32)).max()),
     )

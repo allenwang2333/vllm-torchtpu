@@ -403,3 +403,356 @@ def gmm_v2_ffn(
         WeightsRef(weight=w1, scale=w1_scale, bias=w1_bias),
         WeightsRef(weight=w2, scale=w2_scale, bias=w2_bias),
     )[:size_m, : down.out_size_n]
+
+
+def _routed_vmem_estimate(up: GmmConfigs, down: GmmConfigs, num_tokens: int) -> int:
+    """`_ffn_vmem_estimate` with the pipelined row blocks swapped for the staging."""
+
+    def nbytes(dtype) -> int:
+        return jnp.dtype(dtype).itemsize
+
+    tm, size_k, size_n = up.tiles.tile_m, up.dims.size_k, down.out_size_n
+    row_blocks = 2 * tm * up.tiles.tile_k * nbytes(up.lhs_cfgs.dtype)
+    row_blocks += 2 * tm * down.tiles.tile_n * nbytes(down.out_dtype)
+    staging = tm * max(size_k, size_n) * 4
+    staging += num_tokens * size_k * (nbytes(up.lhs_cfgs.dtype) + 4)
+    staging += num_tokens * size_n * (4 + nbytes(down.out_dtype))
+    return _ffn_vmem_estimate(up, down) - row_blocks + staging
+
+
+def make_routed_ffn_configs(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w1_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2: jax.Array,
+    w2_scale: jax.Array | None,
+    w2_bias: jax.Array | None,
+    group_sizes: jax.Array,
+    *,
+    topk: int,
+    fuse_act: str,
+    maybe_quantize_lhs: bool,
+    rhs_quant_dtype: jnp.dtype | None,
+    vmem_limit_bytes: int | None = None,
+) -> tuple[GmmConfigs, GmmConfigs] | None:
+    """`make_ffn_configs` for `gmm_v2_ffn_routed`, or None if it cannot run them.
+
+    The routed kernel reads token rows straight from `hidden_states` and writes
+    token rows, so both legs must keep the hidden width unpadded.
+    """
+    if vmem_limit_bytes is None:
+        vmem_limit_bytes = _default_vmem_limit()
+    num_tokens, hidden_size = hidden_states.shape
+    routes = jax.ShapeDtypeStruct((num_tokens * topk, hidden_size), hidden_states.dtype)
+    cfgs = make_ffn_configs(
+        routes,
+        w1,
+        w1_scale,
+        w1_bias,
+        w2,
+        w2_scale,
+        w2_bias,
+        group_sizes,
+        fuse_act=fuse_act,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        rhs_quant_dtype=rhs_quant_dtype,
+        out_dtype=hidden_states.dtype,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+    if cfgs is None:
+        return None
+    up, down = cfgs
+    if up.dims.size_k != hidden_size or down.out_size_n != hidden_size:
+        return None
+    if _routed_vmem_estimate(up, down, num_tokens) > vmem_limit_bytes:
+        return None
+    return cfgs
+
+
+def routed_inner_kernel(
+    # In
+    w13_ref: FusedWeightsRef,  # gate, up: [k, i]
+    w2_ref: WeightsRef,  # [i, n]
+    # Scratch
+    rows_ref: jax.Array,  # f32[tile_m, max(k, n)]
+    hidden_f32_ref: jax.Array,  # f32[num_tokens, k]
+    acc_ref: jax.Array,  # f32[num_tokens, n]
+    metadata_ref: MetadataRef,
+    *,
+    token_ref: jax.Array,  # int32[size_m]: token of each sorted route
+    expert_ref: jax.Array,  # int32[num_tokens * topk]: local expert per route
+    weight_ref: jax.Array,  # f32[num_tokens * topk]
+    group_offset_ref: jax.Array,  # int32[1]
+    hidden_ref: jax.Array,  # [num_tokens, k]
+    topk: int,
+    up: GmmConfigs,
+    down: GmmConfigs,
+):
+    """Gathers one gm tile's token rows, runs `ffn_inner_kernel`'s arithmetic on
+    them and adds each row, scaled by its routing weight, to its token's sum.
+
+    Rows go through f32 VMEM because a single bf16 row is not addressable at a
+    dynamic offset; bf16 -> f32 -> bf16 is exact.
+    """
+    gm_id = pl.program_id(1)
+    size_k, size_n = up.dims.size_k, down.out_size_n
+
+    # Runs while the pipeline's next weight copies are in flight.
+    @pl.when(gm_id == 0)
+    def _():
+        hidden_f32_ref[...] = hidden_ref[...].astype(jnp.float32)
+        acc_ref[...] = jnp.zeros_like(acc_ref)
+
+    m_start = metadata_ref.gm_id_to_m_offset[gm_id]
+    m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
+    m_offset = m_start - m_start % up.dims.size_lhs_sublane
+    m_start_local = m_start - m_offset
+    m_end_local = m_end - m_offset
+
+    def gather_row(i, carry):
+        token = token_ref[m_offset + i]
+        rows_ref[pl.ds(i, 1), :size_k] = hidden_f32_ref[pl.ds(token, 1), :]
+        return carry
+
+    jax.lax.fori_loop(m_start_local, m_end_local, gather_row, 0)
+
+    def run_tile(bucket_m: int):
+        # Rows outside this group hold stale or unset values. Every op below is
+        # row-local and the combine reads only this group's rows, so they never
+        # reach the output.
+        tiled_lhs = rows_ref[:bucket_m, :size_k].astype(hidden_ref.dtype)
+        acc = tile_matmul(
+            tiled_lhs, w13_ref, cfgs=up, bucket_m=bucket_m, is_last_k_step=True
+        )
+        if up.rhs_cfgs.has_bias:
+            acc += w13_ref.get_bias().astype(acc.dtype)
+        hidden = apply_act_fn(acc, up.fuse_act).astype(up.out_dtype)
+
+        acc = tile_matmul(
+            hidden, w2_ref, cfgs=down, bucket_m=bucket_m, is_last_k_step=True
+        )
+        if down.rhs_cfgs.has_bias:
+            acc += w2_ref.get_bias().astype(acc.dtype)
+        # The per-route output is rounded where the unfused path stores it.
+        out = acc.astype(down.out_dtype).astype(jnp.float32)
+        rows_ref[:bucket_m, :size_n] = out
+
+    branches = []
+    for bucket_idx in range(up.tiles.tile_m // up.tiles.bucket_base):
+        bucket_m = up.tiles.bucket_base * (bucket_idx + 1)
+        branches.append(
+            jax.named_scope(f"bm{bucket_m}")(functools.partial(run_tile, bucket_m))
+        )
+    jax.lax.switch(m_end_local // up.tiles.bucket_base, branches)
+
+    expert = metadata_ref.gm_id_to_group_id[gm_id] + group_offset_ref[0]
+
+    def combine_row(i, carry):
+        token = token_ref[m_offset + i]
+        # Top-k experts are distinct, so exactly one of the token's routes is
+        # this expert.
+        weight = jnp.float32(0)
+        for slot in range(topk):
+            route = token * topk + slot
+            weight = jnp.where(expert_ref[route] == expert, weight_ref[route], weight)
+        acc_ref[pl.ds(token, 1), :] += weight * rows_ref[pl.ds(i, 1), :size_n]
+        return carry
+
+    jax.lax.fori_loop(m_start_local, m_end_local, combine_row, 0)
+
+
+def routed_kernel_main(
+    # Scalar prefetch
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
+    group_offset_ref: jax.Array,  # int32[1]
+    token_ref: jax.Array,  # int32[size_m]
+    expert_ref: jax.Array,  # int32[num_tokens * topk]
+    weight_ref: jax.Array,  # f32[num_tokens * topk]
+    # In
+    hidden_ref: jax.Array,  # [num_tokens, k]
+    w13_ref: WeightsRef,  # [size_group, k, 2 * i]
+    w2_ref: WeightsRef,  # [size_group, i, n]
+    # Out
+    out_ref: jax.Array,  # [num_tokens, n]
+    # Scratch
+    rows_ref: jax.Array,
+    hidden_f32_ref: jax.Array,
+    acc_ref: jax.Array,
+    metadata_ref: MetadataRef,
+    *,
+    topk: int,
+    up: GmmConfigs,
+    down: GmmConfigs,
+):
+    """`ffn_kernel_main` with the permute before it and the combine after it inside."""
+    w13_ref = _unpack(w13_ref, up)
+    w2_ref = _unpack(w2_ref, down)
+
+    num_gm = fill_metadata(lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=up)
+
+    (_, w13_spec), _ = generate_block_specs(metadata_ref, up)
+    (_, w2_spec), _ = generate_block_specs(metadata_ref, down)
+    w13_up_ref = jax.tree.map(lambda x: x.at[..., up.out_size_n :], w13_ref)
+    w13_ref = FusedWeightsRef(gate=w13_ref, up=w13_up_ref)
+    w13_spec = FusedWeightsRef(gate=w13_spec, up=w13_spec)
+
+    pipeline_fn = pltpu.emit_pipeline(
+        functools.partial(
+            routed_inner_kernel,
+            token_ref=token_ref,
+            expert_ref=expert_ref,
+            weight_ref=weight_ref,
+            group_offset_ref=group_offset_ref,
+            hidden_ref=hidden_ref,
+            topk=topk,
+            up=up,
+            down=down,
+        ),
+        grid=(1, num_gm, 1),
+        in_specs=(w13_spec, w2_spec),
+    )
+    pipeline_fn(
+        w13_ref,
+        w2_ref,
+        scratches=[rows_ref, hidden_f32_ref, acc_ref, metadata_ref],
+    )
+
+    # No local route: the first grid step, which zeroes the sums, never ran.
+    @pl.when(num_gm == 0)
+    def _():
+        acc_ref[...] = jnp.zeros_like(acc_ref)
+
+    out_ref[...] = acc_ref[...].astype(out_ref.dtype)
+
+
+@jax.jit(
+    static_argnames=[
+        "fuse_act",
+        "maybe_quantize_lhs",
+        "rhs_quant_dtype",
+        "vmem_limit_bytes",
+    ]
+)
+def gmm_v2_ffn_routed(
+    hidden_states: jax.Array,  # [num_tokens, k]
+    w1: jax.Array,  # [size_group, k, 2 * i]: gate then up along the last dim
+    w2: jax.Array,  # [size_group, i, n]
+    group_sizes: jax.Array,  # int32[size_group]
+    token_indices_sorted: jax.Array,  # int32[num_tokens * topk]
+    topk_ids: jax.Array,  # int32[num_tokens, topk]: local expert, < 0 if not local
+    topk_weights: jax.Array,  # [num_tokens, topk]
+    w1_scale: jax.Array | None = None,  # [size_group, num_blocks, 1, 2 * i]
+    w1_bias: jax.Array | None = None,  # [size_group, 1, 2 * i]
+    w2_scale: jax.Array | None = None,  # [size_group, num_blocks, 1, n]
+    w2_bias: jax.Array | None = None,  # [size_group, 1, n]
+    group_offset: jax.Array | None = None,  # int32[1]
+    *,
+    fuse_act: str,
+    maybe_quantize_lhs: bool = True,
+    rhs_quant_dtype: jnp.dtype | None = None,
+    vmem_limit_bytes: int | None = None,
+) -> jax.Array:
+    """Routed expert FFN with the permute and the weighted combine in one kernel.
+
+    `token_indices_sorted` and `group_sizes` are the expert-sorted routing the
+    one-hot permute consumes. Returns, per token, the sum over its local routes
+    of `topk_weight * gmm_v2_ffn(hidden_states[token])`: what the one-hot
+    permute, `gmm_v2_ffn` and the one-hot combine compute, without the
+    [routes, hidden] arrays between them. Only for shapes
+    `make_routed_ffn_configs` accepts.
+    """
+    if vmem_limit_bytes is None:
+        vmem_limit_bytes = _default_vmem_limit()
+    num_tokens, topk = topk_ids.shape
+    cfgs = make_routed_ffn_configs(
+        hidden_states,
+        w1,
+        w1_scale,
+        w1_bias,
+        w2,
+        w2_scale,
+        w2_bias,
+        group_sizes,
+        topk=topk,
+        fuse_act=fuse_act,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        rhs_quant_dtype=rhs_quant_dtype,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+    if cfgs is None:
+        raise ValueError(
+            f"gmm_v2_ffn_routed cannot run {hidden_states.shape=} {w1.shape=} "
+            f"{w2.shape=}; check make_routed_ffn_configs before calling it."
+        )
+    up, down = cfgs
+    if group_offset is None:
+        group_offset = jnp.zeros((1,), jnp.int32)
+
+    w1_scale, w1_scale_spec = _hbm_f32(w1_scale)
+    w1_bias, w1_bias_spec = _hbm_f32(w1_bias)
+    w2_scale, w2_scale_spec = _hbm_f32(w2_scale)
+    w2_bias, w2_bias_spec = _hbm_f32(w2_bias)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+
+    size_m = up.dims.size_m
+    size_k, size_n = up.dims.size_k, down.out_size_n
+    max_num_gm = up.dims.size_group + pl.cdiv(size_m, up.tiles.tile_m) - 1
+    scratch_shapes = [
+        pltpu.VMEM((up.tiles.tile_m, max(size_k, size_n)), jnp.float32),
+        pltpu.VMEM((num_tokens, size_k), jnp.float32),
+        pltpu.VMEM((num_tokens, size_n), jnp.float32),
+        MetadataRef(
+            gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),
+            gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
+        ),
+    ]
+    up_cost, down_cost = get_cost_estimate(up), get_cost_estimate(down)
+    name = (
+        f"gmm_v2_ffn_routed-g_{up.dims.size_group}-m_{size_m}-k_{size_k}"
+        f"-i_{up.out_size_n}-n_{size_n}-act_{fuse_act}-tm_{up.tiles.tile_m}"
+    )
+    metadata = {f"up.{k}": v for k, v in get_metadata(up).items()}
+    metadata |= {f"down.{k}": v for k, v in get_metadata(down).items()}
+    row_bytes = jnp.dtype(hidden_states.dtype).itemsize
+
+    return pl.pallas_call(
+        functools.partial(routed_kernel_main, topk=topk, up=up, down=down),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, size_n), down.out_dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=5,
+            in_specs=[
+                vmem,
+                WeightsRef(weight=hbm, scale=w1_scale_spec, bias=w1_bias_spec),
+                WeightsRef(weight=hbm, scale=w2_scale_spec, bias=w2_bias_spec),
+            ],
+            out_specs=vmem,
+            scratch_shapes=scratch_shapes,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=vmem_limit_bytes,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+        cost_estimate=pl.CostEstimate(
+            flops=up_cost.flops + down_cost.flops,
+            # Token rows replace the [routes, hidden] rows both legs would move.
+            bytes_accessed=up_cost.bytes_accessed
+            + down_cost.bytes_accessed
+            - 2 * size_m * up.out_size_n * jnp.dtype(up.out_dtype).itemsize
+            - size_m * (size_k + size_n) * row_bytes
+            + num_tokens * (size_k + size_n) * row_bytes,
+            transcendentals=0,
+        ),
+        metadata=metadata,
+    )(
+        group_sizes,
+        group_offset,
+        token_indices_sorted.astype(jnp.int32),
+        topk_ids.reshape(-1).astype(jnp.int32),
+        topk_weights.reshape(-1).astype(jnp.float32),
+        hidden_states,
+        WeightsRef(weight=w1, scale=w1_scale, bias=w1_bias),
+        WeightsRef(weight=w2, scale=w2_scale, bias=w2_bias),
+    )
