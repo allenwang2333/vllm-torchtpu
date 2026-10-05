@@ -97,6 +97,7 @@ if TYPE_CHECKING:
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
+    TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
     USE_PIPELINED_DMA_STAGING: bool = False
@@ -765,6 +766,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # only takes effect on the grouped-matmul MoE path (the fused EP kernel
     # already carries fp8 on its own wire).
     "TPU_MOE_FP8_ALL_GATHER": env_bool("TPU_MOE_FP8_ALL_GATHER"),
+    # Send the TPU_ATTN_MOE_OVERLAP all-gather as fp8 rows with one fp32 scale
+    # per 512 channels.
+    "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER": env_bool(
+        "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER", default=False
+    ),
     # 0 = the arithmetic device-order layout (the one every disaggregated
     # Raiden pair was verified with before #587; also the only option on a
     # torch_tpu older than 2026-08-13, which lacks the API).
