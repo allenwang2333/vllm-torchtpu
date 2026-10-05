@@ -235,7 +235,6 @@ def quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """The activation's rows as fp8 with their float32 scales, [rows, 1]."""
     return _get_quantize_rows_op()(x.reshape(-1, x.shape[-1]))
 
-
 def quantized_matmul_prequant(
     x_q: torch.Tensor, x_s: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
 ) -> torch.Tensor:

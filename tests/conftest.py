@@ -33,6 +33,15 @@ os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
 import pytest
 import torch
 
+# Test files that need no chip, by path from the repo root. A session of
+# nothing but these runs with JAX pinned to the CPU.
+HOST_ONLY_TEST_FILES: tuple[str, ...] = (
+    "tests/kernels/experimental/test_gated_norm_quant.py",
+)
+
+
+def _needs_no_chip(item):
+    return str(item.path).endswith(HOST_ONLY_TEST_FILES)
 
 def pytest_collection_modifyitems(items):
     """Run whole-slice worker-spawning tests before in-process TPU tests.
