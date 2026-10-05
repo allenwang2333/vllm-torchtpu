@@ -148,6 +148,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
+    VLLM_TPU_LAZY_REASONING_COUNT: bool = True
 
 
 def env_with_choices(
@@ -900,6 +901,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-chunk outputs. 0 disables (encode the whole video in one batch).
     "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
         "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
+    ),
+    # API server: in chat streaming, recount reasoning tokens only when the
+    # count is observable (frontend/lazy_reasoning_count.py). Kill switch;
+    # 0 restores vLLM's recount after every delta.
+    "VLLM_TPU_LAZY_REASONING_COUNT": env_bool(
+        "VLLM_TPU_LAZY_REASONING_COUNT", default=True
     ),
 }
 
