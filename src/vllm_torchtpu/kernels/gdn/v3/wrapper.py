@@ -541,15 +541,6 @@ def fused_conv1d_gdn(
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
-    if num_spec_tokens > 0:
-        # Every slot of a decode tile runs the full verify-window delta rule,
-        # valid or padded, so a 4-slot tile at a 4-token bucket computes 3
-        # padded sequences. A bucket of T tokens holds at most T // window full
-        # windows; size the tile to that (still correct for shorter windows:
-        # the grid just runs more tiles). Large buckets keep the full tile.
-        decode_tile_size = max(
-            1, min(decode_tile_size, batch_size // (num_spec_tokens + 1))
-        )
     if mixed_tile_size is None:
         # 128-token chunks amortize the per-tile pipeline and solve better
         # than 64 on the per-sequence pass (Qwen3.5 TP8, 8 value heads). The
@@ -599,6 +590,17 @@ def fused_conv1d_gdn(
             window_size,
             decode_tile_size,
             mixed_tile_size,
+        )
+
+    if num_spec_tokens > 0:
+        # Every slot of a decode tile runs the full verify-window delta rule,
+        # valid or padded, so a 4-slot tile at a 4-token bucket computes 3
+        # padded sequences. A bucket of T tokens holds at most T // window full
+        # windows; size the tile to that (still correct for shorter windows:
+        # the grid just runs more tiles). Large buckets keep the full tile.
+        # After dynamic tiling, which sizes T from the request count alone.
+        decode_tile_size = max(
+            1, min(decode_tile_size, batch_size // (num_spec_tokens + 1))
         )
 
     if num_spec_tokens > 0:
