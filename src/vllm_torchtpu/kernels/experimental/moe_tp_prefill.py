@@ -407,11 +407,12 @@ def routing_plan(topk_ids, n_experts, row_scale, route_valid=None, n_valid=None)
     """Expert-major slab order for the routed rows (XLA), with no scatter or
     gather over the routes.
 
-    One key/value sort orders the routes by expert, carrying each route's id
-    and its token's activation scale; a second sort of that permutation gives
-    its inverse (each route's slab row). Routes of tokens at or past n_valid,
-    and routes where route_valid [T, K] is False, get the sentinel expert E,
-    sort last and are never visited.
+    A single packed uint32 sort on ``(expert << 20) | route_idx`` orders the
+    routes stably by expert; ``searchsorted`` on the sorted expert ids extracts
+    ``base`` and ``counts`` in O(E log R) without materializing an [E, R]
+    comparison matrix; a second sort of ``order`` inverts the permutation.
+    Routes of tokens at or past n_valid, and routes where route_valid [T, K] is
+    False, get the sentinel expert E, sort last and are never visited.
 
     Returns tok [R] (token of each slab row), pos [T, K] (slab row of each
     route), s_sorted [R] (scale of each slab row) and the visit tables.
@@ -419,34 +420,50 @@ def routing_plan(topk_ids, n_experts, row_scale, route_valid=None, n_valid=None)
     n_tok, k = topk_ids.shape
     n_routes = n_tok * k
     e_flat = topk_ids.reshape(-1).astype(jnp.int32)
+    e_flat = jnp.where((e_flat >= 0) & (e_flat < n_experts), e_flat, n_experts)
     iota = jnp.arange(n_routes, dtype=jnp.int32)
     if n_valid is not None:
         e_flat = jnp.where(iota // k < n_valid, e_flat, n_experts)
     if route_valid is not None:
         e_flat = jnp.where(route_valid.reshape(-1), e_flat, n_experts)
-    s_rep = jnp.broadcast_to(row_scale[:, None], (n_tok, k)).reshape(-1)
-    _, order, s_sorted = lax.sort((e_flat, iota, s_rep), num_keys=1, is_stable=True)
-    _, pos = lax.sort((order, iota), num_keys=1, is_stable=False)
-    counts = jnp.sum(
-        (e_flat[None, :] == jnp.arange(n_experts, dtype=jnp.int32)[:, None]).astype(
-            jnp.int32
-        ),
-        axis=1,
+    if n_routes < (1 << 20) and n_experts < (1 << 11):
+        packed = lax.sort(
+            (e_flat.astype(jnp.uint32) << 20) | iota.astype(jnp.uint32),
+            is_stable=False,
+        )
+        e_sorted = (packed >> 20).astype(jnp.int32)
+        order = (packed & jnp.uint32((1 << 20) - 1)).astype(jnp.int32)
+    else:
+        e_sorted, order = lax.sort((e_flat, iota), num_keys=1, is_stable=True)
+    if n_routes <= (1 << 16):
+        inv_packed = lax.sort(
+            (order.astype(jnp.uint32) << 16) | iota.astype(jnp.uint32),
+            is_stable=False,
+        )
+        pos = (inv_packed & jnp.uint32(0xFFFF)).astype(jnp.int32)
+    else:
+        _, pos = lax.sort((order, iota), num_keys=1, is_stable=False)
+    tok = order // k
+    s_sorted = row_scale[tok]
+    edges = jnp.searchsorted(
+        e_sorted, jnp.arange(n_experts + 1, dtype=jnp.int32), side="left"
     )
-    base = jnp.cumsum(counts) - counts
+    base = edges[:-1]
+    counts = edges[1:] - edges[:-1]
     active = counts > 0
     (visit_e,) = jnp.nonzero(active, size=n_experts + VISIT_SLACK, fill_value=n_experts)
     visit_e = visit_e.astype(jnp.int32)
     n_routed_visits = jnp.sum(active).astype(jnp.int32)
-    counts_x = jnp.concatenate([counts, jnp.zeros((1,), jnp.int32)])
-    base_x = jnp.concatenate([base, jnp.zeros((1,), jnp.int32)])
+    valid_visit = visit_e < n_experts
+    visit_base = jnp.where(valid_visit, base[visit_e], 0)
+    visit_counts = jnp.where(valid_visit, counts[visit_e], 0)
     return (
-        order // k,
+        tok,
         pos.reshape(n_tok, k),
         s_sorted,
         visit_e,
-        base_x[visit_e],
-        counts_x[visit_e],
+        visit_base,
+        visit_counts,
         n_routed_visits,
     )
 
@@ -486,11 +503,11 @@ def moe_tp_prefill(
     s2 likewise [E, H]; shared w1_sh [H, 2I], w2_sh [I, H], s1_sh [2I],
     s2_sh [H], gate wg_sh [H, 1]. topk_weights / topk_ids [T, K].
 
-    reduce_fn (e.g. ``lambda y: lax.psum(y, axis)``) is applied per combine
-    chunk; each chunk's input is tied to the previous chunk's reduced output,
-    so XLA keeps the all-reduces separate and each runs under the next chunk's
-    combine. Without reduce_fn the per-rank partial is returned.
+    reduce_fn (e.g. ``lambda y: lax.psum(y, axis)`` or ``psum_scatter``) is
+    applied once to the combined [T, H] partial output. Without reduce_fn the
+    per-rank partial is returned.
     """
+    del scatter_ranks
     n_experts, hidden, two_i = w1.shape
     if x_quantized is not None:
         x_q, x_s = x_quantized
@@ -581,7 +598,6 @@ def moe_tp_prefill(
         combine_chunks,
         reduce_fn,
         interpret,
-        scatter_ranks=scatter_ranks,
     )
 
 
@@ -597,26 +613,12 @@ def combine(
     scatter_ranks=1,
 ):
     """out[t] = sum_k coef[t, k] * part[pos[t, k]] in n_chunks token chunks,
-    each followed by reduce_fn when given."""
+    followed by a single reduce_fn over the combined [n_tok, hidden] output."""
+    del scatter_ranks
     k = pos.shape[1]
-    if n_tok % n_chunks or (n_tok // n_chunks) % scatter_ranks:
+    if n_tok % n_chunks:
         n_chunks = 1
     tc = n_tok // n_chunks
-    if n_chunks > 1 and scatter_ranks > 1:
-        # Reorder rows from [scatter_ranks, n_chunks, tc_local, k] into
-        # [n_chunks, scatter_ranks, tc_local, k] so each chunk c's psum_scatter
-        # scatters rank r's c-th contiguous local token slice.
-        tc_local = tc // scatter_ranks
-        pos = (
-            pos.reshape(scatter_ranks, n_chunks, tc_local, k)
-            .swapaxes(0, 1)
-            .reshape(n_tok, k)
-        )
-        coef = (
-            coef.reshape(scatter_ranks, n_chunks, tc_local, k)
-            .swapaxes(0, 1)
-            .reshape(n_tok, k)
-        )
     outs = []
     for c in range(n_chunks):
         sl = slice(c * tc, (c + 1) * tc)
@@ -633,22 +635,19 @@ def combine(
         else:
             rows = part.reshape(part.shape[0], hidden)[pos[sl]].astype(jnp.float32)
             y = jnp.sum(rows * coef[sl][..., None], axis=1).astype(jnp.bfloat16)
-        if reduce_fn is not None:
-            if outs:
-                # Tie chunk c's input to chunk c-1's reduced output: XLA can
-                # no longer merge the two all-reduces into one.
-                y, _ = lax.optimization_barrier((y, outs[-1]))
-            y = reduce_fn(y)
         outs.append(y)
-    return outs[0] if len(outs) == 1 else jnp.concatenate(outs, 0)
+    out = outs[0] if len(outs) == 1 else jnp.concatenate(outs, 0)
+    if reduce_fn is not None:
+        out = reduce_fn(out)
+    return out
 
 
-def default_combine_chunks(n_tok, max_chunk_tokens=2048):
+def default_combine_chunks(n_tok, max_chunk_tokens=4096):
     """Fewest equal combine chunks of at most max_chunk_tokens tokens.
 
     The combine's position and coefficient tables live in SMEM (1 MiB): a
-    16384-token call with 11 slots per token does not fit in one chunk. More
-    chunks let each chunk's all-reduce run under the next chunk's combine.
+    16384-token call with 11 slots per token does not fit in one chunk, while
+    4096 tokens (~352 KiB) fits comfortably with ample SMEM headroom.
     """
     for n in range(1, n_tok + 1):
         if n_tok % n == 0 and n_tok // n <= max_chunk_tokens:

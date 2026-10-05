@@ -480,7 +480,8 @@ def _patch_disable_sequence_parallel_moe() -> None:
                 logged_decisions.add(decision)
                 logger.info(
                     "Sequence-parallel MoE %s "
-                    "(VLLM_TPU_MOE_SEQUENCE_PARALLEL=%s, dp_size=%d, tp_size=%d, ep=%s)%s.",
+                    "(VLLM_TPU_MOE_SEQUENCE_PARALLEL=%s, dp_size=%d, "
+                    "tp_size=%d, ep=%s)%s.",
                     "enabled" if enabled else "skipped",
                     mode,
                     dp_size,

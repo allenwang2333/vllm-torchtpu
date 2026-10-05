@@ -129,7 +129,6 @@ def patched_mlp_init(
     UPSTREAM_MLP_INIT(self, *args, **kwargs)
 
 
-
 def patched_attention_forward(
     self,
     positions: torch.Tensor,
@@ -195,8 +194,9 @@ def patched_decoder_layer_forward(
                 tensor_model_parallel_all_gather(x_q, 0), full_num_tokens
             )
             x_s = _narrow_to_tokens(
-                tensor_model_parallel_all_gather(x_s, 0), full_num_tokens
-            )
+                tensor_model_parallel_all_gather(x_s.squeeze(-1), 0),
+                full_num_tokens,
+            ).unsqueeze(-1)
             attn_kwargs["prequant"] = (x_q, x_s)
             hidden_states = x_q
         else:
