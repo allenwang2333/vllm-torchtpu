@@ -108,6 +108,7 @@ def apply_omni_tpu_patches() -> None:
 
     _patch_flow_match_scheduler_step_flush()
     _patch_group_norm_tpu()
+    _patch_vae_decoder_conv_out_tpu()
     _patch_rotary_embedding_tpu()
     _patch_z_image_transformer_block_flush()
     _patch_z_image_prompt_encoder_tpu()
@@ -298,6 +299,78 @@ def _patch_group_norm_tpu() -> None:
     logger.info(
         "Applied TPU patch: fused-reduce torch.nn.functional.group_norm "
         "(avoids serial while-loop lowering of native_group_norm)."
+    )
+
+
+# Output-channel count a VAE ``conv_out`` is zero-padded to on TPU (one lane tile).
+_TPU_CONV_OUT_LANES = 128
+# Convs with at most this many output channels take the padded path.
+_TPU_CONV_OUT_MAX_CHANNELS = 16
+
+
+def _tpu_lane_padded_conv2d(conv: torch.nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
+    """``conv(x)`` computed with the output channels zero-padded to 128 lanes.
+
+    The extra channels have all-zero weights and bias, so they are exactly zero
+    and are sliced away; the real channels see the same per-element dot
+    products (the only possible difference is MXU summation order).
+    """
+    w, b = conv.weight, conv.bias
+    c_out = w.shape[0]
+    extra = _TPU_CONV_OUT_LANES - c_out
+    w_p = torch.cat([w, w.new_zeros((extra, *w.shape[1:]))], dim=0)
+    b_p = torch.cat([b, b.new_zeros(extra)], dim=0) if b is not None else None
+    y = torch.nn.functional.conv2d(
+        x, w_p, b_p, conv.stride, conv.padding, conv.dilation, conv.groups
+    )
+    return y[:, :c_out]
+
+
+def _tpu_conv_out_forward(self: torch.nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
+    if x.device.type == "tpu" and x.dim() == 4:
+        return _tpu_lane_padded_conv2d(self, x)
+    return torch.nn.Conv2d.forward(self, x)
+
+
+def _patch_vae_decoder_conv_out_tpu() -> None:
+    # -------------------------------------------------------------------------
+    # Root cause (XLA:TPU convolution layout, Z-Image / Flux ``AutoencoderKL``
+    # decoder ``conv_out = Conv2d(128, 3, 3, padding=1)`` at 1024x1024):
+    # XLA assigns the conv output a channel-minor tiled layout
+    # (``bf16[1024,8,129,3]{1,3,2,0:T(4,128)}``), so each 128-lane vector
+    # holds 3 valid values and the result is stored through masked partial
+    # writes. XProf: ``fusion.337`` 6.7 ms at 39 GiB/s and 1.3 TFLOP/s — 25 %
+    # of the 26.6 ms VAE decode (0.8 ms/step of an 8-step request, at every
+    # SP degree because every rank decodes). Zero-padding the weights to 128
+    # output channels turns it into an ordinary dense conv (~0.5 ms incl. the
+    # channel slice) with identical values in the 3 real channels.
+    #
+    # REMOVAL CONDITION: XLA:TPU picks a spatial-minor layout (or packs lanes)
+    # for convolutions with a handful of output channels.
+    # -------------------------------------------------------------------------
+    try:
+        vae_mod = importlib.import_module("diffusers.models.autoencoders.vae")
+        decoder_cls = vae_mod.Decoder
+    except Exception:  # noqa: BLE001 - diffusers is an omni extra
+        logger.warning("diffusers not importable; VAE conv_out TPU patch skipped.")
+        return
+
+    orig_init = _unwrap_tpu_patch(decoder_cls.__init__)
+
+    def _init(self: Any, *args: Any, **kwargs: Any) -> None:
+        orig_init(self, *args, **kwargs)
+        conv: Any = getattr(self, "conv_out", None)
+        if not isinstance(conv, torch.nn.Conv2d):
+            return
+        if conv.groups == 1 and 0 < conv.out_channels <= _TPU_CONV_OUT_MAX_CHANNELS:
+            # Instance-level override: parameters and state_dict keys are
+            # untouched, nn.Module.__call__ picks up the bound attribute.
+            conv.forward = _tpu_conv_out_forward.__get__(conv, type(conv))
+
+    decoder_cls.__init__ = _mark_tpu_patch(_init, orig_init)
+    logger.info(
+        "Applied TPU patch: lane-padded VAE decoder conv_out "
+        "(avoids channel-minor partial stores for 3-channel outputs)."
     )
 
 

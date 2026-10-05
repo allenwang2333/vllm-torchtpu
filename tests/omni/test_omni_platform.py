@@ -1071,6 +1071,42 @@ def test_vae_image_processor_pil_output_patch(monkeypatch):
     assert proc.postprocess("not a tensor") is sentinel
 
 
+@pytest.mark.parametrize("use_bias", [True, False])
+def test_vae_decoder_conv_out_patch(monkeypatch, use_bias):
+    """Zero-padded conv_out matches standard conv2d and only dispatches on TPU."""
+    from vllm_torchtpu.omni import patches as omni_patches
+
+    class _Decoder(torch.nn.Module):
+        def __init__(self, out_channels: int = 3, groups: int = 1):
+            super().__init__()
+            self.conv_out = torch.nn.Conv2d(
+                16, out_channels, 3, padding=1, groups=groups, bias=use_bias
+            )
+
+    fake_mod = MagicMock()
+    fake_mod.Decoder = _Decoder
+    monkeypatch.setitem(sys.modules, "diffusers.models.autoencoders.vae", fake_mod)
+
+    orig_init = _Decoder.__init__
+    omni_patches._patch_vae_decoder_conv_out_tpu()
+    omni_patches._patch_vae_decoder_conv_out_tpu()  # idempotent
+    assert _unwrap_tpu_patch(_Decoder.__init__) is orig_init
+
+    dec = _Decoder(out_channels=3)
+    assert "forward" in dec.conv_out.__dict__
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(1, 16, 8, 8, generator=g)
+    ref = torch.nn.Conv2d.forward(dec.conv_out, x)
+    padded = omni_patches._tpu_lane_padded_conv2d(dec.conv_out, x)
+    torch.testing.assert_close(padded, ref, rtol=1e-5, atol=1e-5)
+    # CPU tensor goes through the standard Conv2d.forward path.
+    torch.testing.assert_close(dec.conv_out(x), ref, rtol=0, atol=0)
+
+    # Wide or grouped conv_out is left untouched.
+    assert "forward" not in _Decoder(out_channels=32).conv_out.__dict__
+    assert "forward" not in _Decoder(out_channels=4, groups=4).conv_out.__dict__
+
+
 def test_worker_proc_async_output_loop_zero_gpu_id():
     from vllm_omni.diffusion.worker import diffusion_worker
 
