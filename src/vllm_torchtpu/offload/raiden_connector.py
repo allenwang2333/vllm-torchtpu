@@ -46,9 +46,7 @@ Core mechanisms:
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import VllmConfig
@@ -92,9 +90,6 @@ from vllm_torchtpu.offload.raiden_store import (
     RaidenOffloadingManager,
     TPURaidenStoreOffloadingSpec,
 )
-
-if TYPE_CHECKING:
-    from vllm.distributed.kv_events import KVCacheEvent
 
 logger = init_logger(__name__)
 
@@ -384,6 +379,25 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             # In-flight fence events awaiting device retirement before acknowledging
             # store jobs, recorded as pairs of (fence_job_ids, event).
             self._pending_fences: list[tuple[set[int], torch.Event]] = []
+            # QX_OFFLOAD_FENCE_AFTER_DRAFT=1: the runner calls get_finished()
+            # after the target forward but BEFORE the speculative (MTP/eagle)
+            # draft propose, which writes the draft layer's KV into the same
+            # pool blocks. A fence recorded there does not cover those writes,
+            # so a store DMA can snapshot stale draft-layer KV. Deferring the
+            # fence for a step's store jobs to the next get_finished() call
+            # (the next forward step, or a no-forward connector step, which the
+            # scheduler keeps issuing while store jobs are pending) orders it
+            # after every KV write of that step, draft included.
+            self._fence_after_draft: bool = (
+                os.environ.get("QX_OFFLOAD_FENCE_AFTER_DRAFT", "0") == "1"
+            )
+            self._deferred_fence_ids: set[int] = set()
+            if self._fence_after_draft:
+                logger.info(
+                    "TPURaidenOffloadingConnector: QX_OFFLOAD_FENCE_AFTER_DRAFT=1: "
+                    "store fences are recorded one get_finished() call later so "
+                    "they order after the step's draft (MTP) KV writes"
+                )
 
     # -- scheduler-side hooks ----------------------------------------------
     def reset_cache(self) -> bool | None:
@@ -395,11 +409,6 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             "supported by the Raiden offload store; reporting failure."
         )
         return False
-
-    def take_events(self) -> Iterable[KVCacheEvent]:
-        if self.connector_scheduler is not None:
-            return self.connector_scheduler.take_events()
-        return []
 
     # -- worker-side hooks -------------------------------------------------
     def register_kv_caches(
@@ -467,7 +476,17 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         meta = self._get_connector_metadata()
         assert isinstance(meta, RaidenOffloadingConnectorMetadata)
 
-        if meta.fence_job_ids:
+        fence_job_ids = set(meta.fence_job_ids)
+        if getattr(self, "_fence_after_draft", False):
+            # Fence the jobs parked by the PREVIOUS call now (their step's draft
+            # writes were dispatched after that call returned); park this
+            # call's jobs until the next one.
+            fence_job_ids, self._deferred_fence_ids = (
+                self._deferred_fence_ids,
+                fence_job_ids,
+            )
+
+        if fence_job_ids:
             # Establish an asynchronous device fence before acknowledging store jobs:
             # 1. Dispatch any deferred pool writes so they precede the fence event.
             # 2. Record a stream event to track completion without host-side blocking.
@@ -475,9 +494,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 "KV pool tensors must be registered before the save fence"
             )
             _enqueue_pool_writes(self._pool_sync_tensors)
-            self._pending_fences.append(
-                (set(meta.fence_job_ids), _record_fence_event())
-            )
+            self._pending_fences.append((fence_job_ids, _record_fence_event()))
 
         if self._pending_fences:
             # Non-blockingly drain retired events and acknowledge completed fences.

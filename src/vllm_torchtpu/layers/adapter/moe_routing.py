@@ -13,6 +13,8 @@
 # limitations under the License.
 """Routing helpers for TPU local MoE kernels."""
 
+import os
+
 import torch
 import vllm.envs as vllm_envs
 
@@ -25,6 +27,12 @@ logger = init_logger(__name__)
 # Resolved once, at import, so the compiled forward never reads the
 # environment.
 _ROUTER_TOPK = envs.TPU_MOE_ROUTER_TOPK
+_QX_ROUTE_LOCAL = os.environ.get("QX_MOE_ROUTE_LOCAL", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
 def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -150,6 +158,18 @@ def route(
     hook -- and any future routing-path change -- lives in exactly one place.
     """
     topk = layer.moe_config.experts_per_token
+    # QX prefill experiment: the overlap patch routed on the T/tp local rows
+    # and gathered packed f32[T, 2*topk] (weights | ids). Real logits are
+    # [T, num_experts] (512 here), so the shape test is unambiguous.
+    if (
+        _QX_ROUTE_LOCAL
+        and router_logits.dtype == torch.float32
+        and router_logits.shape[-1] == 2 * topk
+    ):
+        return (
+            router_logits[..., :topk].to(hidden_states.dtype),
+            router_logits[..., topk:].to(torch.int32),
+        )
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:
         return simulated
