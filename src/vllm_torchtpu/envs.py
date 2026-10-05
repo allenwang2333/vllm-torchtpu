@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_MOE_SINGLE_SORT: bool = False
+    TPU_MOE_LOWTOK: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -567,6 +568,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT"),
+    # Experimental small-batch MoE (kernels/experimental/moe_lowtok) for EP
+    # calls of at most MOE_LOWTOK_MAX_TOKENS rows; the FP8 method also moves
+    # a plain softmax top-k router into it. Exclusive with dense expert MoE.
+    "TPU_MOE_LOWTOK": env_bool("TPU_MOE_LOWTOK"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
