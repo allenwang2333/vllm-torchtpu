@@ -427,4 +427,3 @@ def test_patched_mlp_init_keeps_shared_expert_tp_sharded(monkeypatch):
     assert recorded_kwargs[0]["hidden_size"] == 4096
     assert recorded_kwargs[0]["is_sequence_parallel"] is False
     assert recorded_kwargs[0]["disable_tp"] is False
-
