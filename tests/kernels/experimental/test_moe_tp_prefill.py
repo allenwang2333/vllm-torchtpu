@@ -133,3 +133,31 @@ def test_fault_dropped_expert_is_caught():
     y = np.asarray(run_kernel(c).astype(jnp.float32))
     broken = dict(c, w2=c["w2"].at[3].set(jnp.zeros_like(c["w2"][3])))
     assert row_err(y, oracle(broken)) > 8e-2
+
+
+def test_expert_parallel_ranks_sum_to_oracle():
+    """Each rank holds half the experts whole and half the shared expert's
+    intermediate; the per-rank partials must sum to the full layer."""
+    T, E, H, INTER, K, ranks = 200, 8, 256, 256, 3, 2
+    c = make_case(T, E, H, INTER, K)
+    e_loc, i_sh = E // ranks, INTER // ranks
+    total = 0
+    for r in range(ranks):
+        ex, sh = slice(r * e_loc, (r + 1) * e_loc), slice(r * i_sh, (r + 1) * i_sh)
+        gate_up = jnp.concatenate(
+            [c["w1s"][:, :INTER][:, sh], c["w1s"][:, INTER:][:, sh]], axis=1
+        )
+        scale_up = jnp.concatenate([c["s1s"][:INTER][sh], c["s1s"][INTER:][sh]])
+        rank_case = dict(
+            c,
+            w1=c["w1"][ex],
+            w2=c["w2"][ex],
+            s1=c["s1"][ex],
+            s2=c["s2"][ex],
+            w1s=gate_up,
+            s1s=scale_up,
+            w2s=c["w2s"][sh],
+        )
+        y = run_kernel(rank_case, expert_start=r * e_loc)
+        total = total + np.asarray(y.astype(jnp.float32))
+    assert row_err(total, oracle(c)) < 8e-2

@@ -171,8 +171,11 @@ def _ar_kernel(
         ]
 
     def accumulate(acc1, coeff, s1, w2, s2):
-        acc1 = acc1 * xs_ref[...] * s1
-        mid = jnp.where(coeff != 0, jax.nn.silu(acc1[:, :i]) * acc1[:, i:] * coeff, 0.0)
+        width = acc1.shape[1] // 2  # the routed or the shared intermediate size
+        acc1 = acc1 * xs_ref[:, : 2 * width] * s1
+        mid = jnp.where(
+            coeff != 0, jax.nn.silu(acc1[:, :width]) * acc1[:, width:] * coeff, 0.0
+        )
         ms = jnp.max(jnp.abs(mid), axis=1, keepdims=True) / _F8_MAX
         mq = (mid * jnp.where(ms == 0, 0.0, 1.0 / ms)).astype(_F8)
         for n in range(0, h, _N_CHUNK):
@@ -282,6 +285,14 @@ def _ar_kernel(
         copy.wait_send()
 
 
+def _weight_ring_depth(h, i):
+    """Deepest weight ring (at most _NUM_BUFFERS slots, at least 3) whose slots
+    fit in half of VMEM; one slot holds an expert's w13 and w2 in FP8."""
+    slot = 3 * h * i * jnp.dtype(_F8).itemsize
+    fit = pltpu.get_tpu_info().vmem_capacity_bytes // 2 // slot
+    return max(3, min(_NUM_BUFFERS, fit))
+
+
 def can_use_fused_tp_ar(hidden, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, *, n_ranks):
     """Layout support for the shared-expert + all-reduce variant."""
     if not can_use_fused_tp(
@@ -290,12 +301,15 @@ def can_use_fused_tp_ar(hidden, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, *, n_ran
         return False
     _, h = hidden.shape
     _, i, _ = w2.shape
+    i_s = w2s.shape[0]
     return (
         n_ranks > 1
         and h % (n_ranks * 128) == 0
-        and w1s.shape == (h, 2 * i)
-        and w2s.shape == (i, h)
-        and s1s.shape == (1, 2 * i)
+        and i_s % 128 == 0
+        and i_s <= i
+        and w1s.shape == (h, 2 * i_s)
+        and w2s.shape == (i_s, h)
+        and s1s.shape == (1, 2 * i_s)
         and s2s.shape == (1, h)
         and w1s.dtype == _F8
         and w2s.dtype == _F8
@@ -321,7 +335,8 @@ def fused_moe_tp_ar(
     topk_ids,
     *,
     n_ranks,
-    num_buffers=_NUM_BUFFERS,
+    num_buffers=None,
+    expert_start=None,
 ):
     """Per-rank body; call inside shard_map over the TP mesh.
 
@@ -331,6 +346,11 @@ def fused_moe_tp_ar(
     torch_tpu). w1s [H, 2i] / w2s [i, H] FP8 with s1s [1, 2i] / s2s [1, H]
     FP32 are this rank's shared-expert slice; wg [H, 1] is the replicated
     shared_expert_gate.
+
+    With expert parallelism the rank holds experts [expert_start,
+    expert_start + E) of the global routing (topk_ids are global); routes to
+    other ranks' experts contribute nothing here and are summed in by the
+    all-reduce. num_buffers defaults to the deepest weight ring that fits.
     """
     tokens, h = hidden.shape
     experts, i, _ = w2.shape
@@ -340,6 +360,8 @@ def fused_moe_tp_ar(
         topk_weights = jnp.pad(topk_weights, ((0, pad), (0, 0)))
         topk_ids = jnp.pad(topk_ids, ((0, pad), (0, 0)))
     m = tokens + pad
+    if expert_start is not None:
+        topk_ids = topk_ids - expert_start
     expert_ids = jnp.arange(experts, dtype=jnp.int32)[None, :]
     weights = topk_weights.astype(hidden.dtype).astype(jnp.float32)
     coeff = jnp.zeros((m, experts), jnp.float32)
@@ -352,7 +374,8 @@ def fused_moe_tp_ar(
         jnp.dot(hidden, wg.astype(hidden.dtype), preferred_element_type=jnp.float32)
     )
     shared_gate = jnp.broadcast_to(shared_gate, (m, 128))
-    nb = num_buffers
+    i_s = w2s.shape[0]
+    nb = num_buffers or _weight_ring_depth(h, i)
     chunk = h // n_ranks
     out = pl.pallas_call(
         functools.partial(
@@ -369,9 +392,9 @@ def fused_moe_tp_ar(
                 pltpu.VMEM((nb, i, h), _F8),
                 pltpu.VMEM((nb, 1, 2 * i), jnp.float32),
                 pltpu.VMEM((nb, 1, h), jnp.float32),
-                pltpu.VMEM((h, 2 * i), _F8),
-                pltpu.VMEM((1, 2 * i), jnp.float32),
-                pltpu.VMEM((i, h), _F8),
+                pltpu.VMEM((h, 2 * i_s), _F8),
+                pltpu.VMEM((1, 2 * i_s), jnp.float32),
+                pltpu.VMEM((i_s, h), _F8),
                 pltpu.VMEM((1, h), jnp.float32),
                 pltpu.VMEM((m, h), _F8),
                 pltpu.VMEM((m, 2 * i), jnp.float32),
@@ -392,7 +415,7 @@ def fused_moe_tp_ar(
             collective_id=0,
             vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
         ),
-        name=f"fused_moe_tp_ar-e_{experts}-m_{m}-h_{h}-i_{i}-n_{n_ranks}-buffers_{nb}",
+        name=f"fused_moe_tp_ar-e_{experts}-m_{m}-h_{h}-i_{i}-is_{i_s}-n_{n_ranks}-buffers_{nb}",
     )(
         active,
         rank.reshape(1).astype(jnp.int32),
