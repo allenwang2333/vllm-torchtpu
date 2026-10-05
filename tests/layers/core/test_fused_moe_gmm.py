@@ -77,6 +77,12 @@ def test_owner_output_mode_rejects_invalid_value(monkeypatch):
         getter()
 
 
+def _stub_gmm_wrapper(monkeypatch, fake_gmm) -> None:
+    """Stub both grouped matmuls; moe_gmm then takes its two-call path."""
+    monkeypatch.setattr(fused_moe_gmm, "make_ffn_configs", lambda *a, **k: None)
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", fake_gmm)
+
+
 @pytest.mark.parametrize("configured_version", ["v1", "v2", "v3"])
 @pytest.mark.parametrize(
     "use_ep,use_sparse_core,threshold,dtype,hidden,topk,num_tokens,source_rows,sc_lanes,expected_path",
@@ -227,9 +233,7 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(
 
     def run(source):
         gmm_outputs = iter([jnp.ones((routes, 4), dtype=dtype), source])
-        monkeypatch.setattr(
-            fused_moe_gmm, "gmm_wrapper", lambda *args, **kwargs: next(gmm_outputs)
-        )
+        _stub_gmm_wrapper(monkeypatch, lambda *args, **kwargs: next(gmm_outputs))
         return fused_moe_gmm.moe_gmm(
             x=jnp.ones((routes, 4), dtype=dtype),
             w1=jnp.ones((1, 4, 4), dtype=dtype),
@@ -340,9 +344,7 @@ def test_moe_gmm_non_ep_prefill_ragged_combine_matches_reference(
     expected = weighted.reshape(num_tokens, topk, hidden).sum(axis=1)
 
     gmm_outputs = iter([jnp.zeros((num_routes, 1), jnp.bfloat16), source])
-    monkeypatch.setattr(
-        fused_moe_gmm, "gmm_wrapper", lambda *args, **kwargs: next(gmm_outputs)
-    )
+    _stub_gmm_wrapper(monkeypatch, lambda *args, **kwargs: next(gmm_outputs))
     monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *args, **kwargs: 1)
     calls = []
 
@@ -487,6 +489,7 @@ def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
             "TPU_MOE_OWNER_OUTPUT_MODE",
             mode,
         ),
+        patch.object(fused_moe_gmm, "make_ffn_configs", return_value=None),
         patch.object(
             fused_moe_gmm,
             "gmm_wrapper",
@@ -1025,9 +1028,7 @@ def test_moe_gmm_onehot_combine_matches_plain_reduce(monkeypatch):
 
     def run(**overrides):
         outputs = iter([gmm1, gmm2])
-        monkeypatch.setattr(
-            fused_moe_gmm, "gmm_wrapper", lambda *args, **kwargs: next(outputs)
-        )
+        _stub_gmm_wrapper(monkeypatch, lambda *args, **kwargs: next(outputs))
         kwargs = dict(
             x=jnp.ones((rows, hidden), dtype=jnp.bfloat16),
             w1=jnp.ones((1, hidden, hidden), dtype=jnp.bfloat16),
@@ -1107,7 +1108,7 @@ def test_moe_gmm_onehot_combine_keeps_operand_dtype(monkeypatch):
     monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *args, **kwargs: 1)
     # Identity gmm keeps the combine matmul a function of the traced input,
     # so it cannot constant-fold out of the jaxpr.
-    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", lambda lhs, *args, **kwargs: lhs)
+    _stub_gmm_wrapper(monkeypatch, lambda lhs, *args, **kwargs: lhs)
 
     def run(x):
         return fused_moe_gmm.moe_gmm(
@@ -1132,9 +1133,7 @@ def test_moe_gmm_onehot_combine_zeroes_uncomputed_rows(monkeypatch):
     gmm2 = jnp.ones((rows, 8), dtype=jnp.bfloat16)
     gmm2 = gmm2.at[valid_rows:].set(jnp.nan)
     outputs = iter([jnp.ones((rows, 8), dtype=jnp.bfloat16), gmm2])
-    monkeypatch.setattr(
-        fused_moe_gmm, "gmm_wrapper", lambda *args, **kwargs: next(outputs)
-    )
+    _stub_gmm_wrapper(monkeypatch, lambda *args, **kwargs: next(outputs))
     # Mark the slots whose routed rows fall in the NaN tail as invalid, as
     # prepare_routed_gmm_inputs does for padded tokens.
     revert = kwargs["argsort_revert_indices"]
