@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
     USE_PIPELINED_DMA_STAGING: bool = False
@@ -703,6 +704,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(
         os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"
+    ),
+    # Send the TPU_ATTN_MOE_OVERLAP all-gather as fp8 rows with one fp32 scale
+    # per 512 channels.
+    "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER": env_bool(
+        "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER", default=False
     ),
     # 0 = the arithmetic device-order layout (the one every disaggregated
     # Raiden pair was verified with before #587; also the only option on a
