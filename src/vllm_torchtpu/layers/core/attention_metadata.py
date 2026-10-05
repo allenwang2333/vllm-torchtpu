@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import jax
+import numpy as np
 import torch
 from vllm.distributed import get_pcp_group
 from vllm.utils.math_utils import cdiv
@@ -25,6 +26,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutDescriptor,
     SequenceLayoutKind,
 )
+from vllm_torchtpu.logger import init_logger
 
 
 def attention_block_table_width(
@@ -469,6 +471,83 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         )
 
 
+_qx_logger = init_logger(__name__)
+
+
+def _qx_staged_products_key(
+    runner: Any,
+    ctx: AttentionMetadataBuilderContext,
+    gids: set[int] | None,
+    num_reqs_padded: int,
+    table_geom: list,
+    mamba_geom: list,
+) -> tuple | None:
+    """QX_STAGED_PRODUCTS_CACHE: key under which the staged-walk products
+    are reusable, or None if this walk must run the program.
+
+    The products depend on the staged upload (compared by identity: the
+    CachedUpload returns the same tensor iff contents are unchanged) and,
+    for unified-pool mamba groups, on the device seq_lens through
+    `clamp((seq_lens - 1) // bs, 0, t - 1)` and `seq_lens > 0` only. The
+    device seq_lens equal the host values minus a per-row rejection count in
+    [0, kmax] on rows the async path corrects (0 elsewhere). Both functions
+    are monotone, so equal values at both ends of that range make them
+    exact without knowing the device count. Only the target walk of
+    `_prepare_inputs` (hint ctx identity), full walks, real batches and
+    non-lockstep deployments qualify; every rank sees the same host data
+    and so takes the same decision.
+
+    Ported from Nan Wei's qx-lean-oct3img-20261004 tree (not in a PR).
+    """
+    hint = getattr(runner, "_qx_stage_hint", None)
+    if (
+        hint is None
+        or hint[0] is not ctx
+        or gids is not None
+        or ctx.position_ids_override is not None
+        or runner._dp_lockstep_enabled()
+    ):
+        return None
+    _, seq_np, sub_mask, kmax = hint
+    if seq_np.shape[0] != num_reqs_padded:
+        return None
+    per: list[bytes] = []
+    if mamba_geom:
+        hi = seq_np.astype(np.int64)
+        if sub_mask is not None:
+            if sub_mask.shape[0] != hi.shape[0]:
+                return None
+            lo = np.where(sub_mask, hi - kmax, hi)
+        else:
+            lo = hi
+        active = hi > 0
+        if not np.array_equal(active, lo > 0):
+            return None
+        for _ti, t, bs in mamba_geom:
+            so_hi = np.clip((hi - 1) // bs, 0, t - 1)
+            if not np.array_equal(so_hi, np.clip((lo - 1) // bs, 0, t - 1)):
+                return None
+            per.append(so_hi.tobytes())
+        per.append(active.tobytes())
+    return (
+        tuple(table_geom),
+        tuple(mamba_geom),
+        int(ctx.mamba_ckpt_window),
+        tuple(per),
+    )
+
+
+def _qx_note_staged_products(runner: Any, hit: bool) -> None:
+    stats = runner._qx_stage_stats
+    stats[0 if hit else 1] += 1
+    if hit and stats[0] == 1:
+        _qx_logger.info("QX_STAGED_PRODUCTS_CACHE: first staged-products reuse")
+    if (stats[0] + stats[1]) % 5000 == 0:
+        _qx_logger.info(
+            "QX_STAGED_PRODUCTS_CACHE: hits=%d misses=%d", stats[0], stats[1]
+        )
+
+
 def stage_block_table_uploads(
     runner: Any,
     ctx: AttentionMetadataBuilderContext,
@@ -564,7 +643,19 @@ def stage_block_table_uploads(
         ctx.staged_block_tables = {gid: staged_dev[:length]}
         return
 
-    if staged_dev.device.type == "tpu":
+    qx_on = getattr(runner, "_qx_stage_cache", False)
+    qx_key = (
+        _qx_staged_products_key(
+            runner, ctx, gids, num_reqs_padded, table_geom, mamba_geom
+        )
+        if qx_on
+        else None
+    )
+    qx_cached = runner._qx_stage_products if qx_key is not None else None
+    if qx_cached is not None and qx_cached[0] is staged_dev and qx_cached[1] == qx_key:
+        products = qx_cached[2]
+        _qx_note_staged_products(runner, hit=True)
+    elif staged_dev.device.type == "tpu":
         products = _staged_walk_products_compiled(
             staged_dev,
             ctx.seq_lens,
@@ -572,6 +663,12 @@ def stage_block_table_uploads(
             tuple(mamba_geom),
             ctx.mamba_ckpt_window,
         )
+        if qx_on and qx_key is not None:
+            # Non-qualifying walks (drafter subsets, dummy runs) leave the
+            # entry alone: its validity is fully keyed by (staged tensor
+            # identity, key), and the entry holds that tensor alive.
+            runner._qx_stage_products = (staged_dev, qx_key, products)
+            _qx_note_staged_products(runner, hit=False)
     else:
         products = _staged_walk_products(
             staged_dev,

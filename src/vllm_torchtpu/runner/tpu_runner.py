@@ -701,6 +701,25 @@ class TPUModelRunner(GPUModelRunner):
             tuple[int, str],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
+        # QX_STAGED_PRODUCTS_CACHE=1: reuse the previous step's
+        # `_staged_walk_products_compiled` outputs (per-group block tables +
+        # unified-pool mamba state/ckpt indices) when the staged block-table
+        # upload is unchanged and every row's mamba state block is provably
+        # the same for any rejection count the device may still subtract.
+        # Host-side saving (~0.5 ms/step of compiled-call dispatch); see
+        # `attention_metadata._qx_staged_products_key`. Unset -> unchanged.
+        # Ported from Nan Wei's qx-lean-oct3img-20261004 tree (not in a PR).
+        self._qx_stage_cache: bool = (
+            os.environ.get("QX_STAGED_PRODUCTS_CACHE", "0") == "1"
+        )
+        self._qx_stage_hint = None
+        self._qx_stage_products = None
+        self._qx_stage_stats: list[int] = [0, 0]  # [hits, misses]
+        if self._qx_stage_cache:
+            logger.info(
+                "QX_STAGED_PRODUCTS_CACHE=1: steady-decode block-table/mamba "
+                "index products are reused when provably unchanged"
+            )
         # DecodeBench fills local state instead of transferring manager blocks,
         # so it can retain the compact request-indexed Mamba layout.
         transfer_config = self.vllm_config.kv_transfer_config
@@ -2890,6 +2909,7 @@ class TPUModelRunner(GPUModelRunner):
             )
             target_num_reqs = self.num_reqs_most_model_len
 
+        qx_sub_mask = None
         # Async spec: seq_lens/positions were advanced optimistically (every
         # draft from the previous step assumed accepted). Subtract the real
         # per-request rejected count on-device, keyed by req position.
@@ -2925,6 +2945,8 @@ class TPUModelRunner(GPUModelRunner):
                     "rejected_pos_idx", torch.from_numpy(pos_idx_np)
                 ),
             )
+            if self._qx_stage_cache:
+                qx_sub_mask = seq_idx_np >= 0
 
         # For decode-only case, cache constant device tensors to skip H2D.
         # query_start_loc, logits_indices, and request_distribution don't
@@ -3099,6 +3121,19 @@ class TPUModelRunner(GPUModelRunner):
             sequence_layout_descriptor=layout_plan.descriptor,
         )
         slot_mappings = self.empty_slot_mappings
+        if self._qx_stage_cache:
+            # Host copy of the seq_lens just uploaded (before the on-device
+            # rejection subtraction) + which rows get that subtraction.
+            self._qx_stage_hint = (
+                self._attn_metadata_builder_ctx,
+                self.seq_lens_np[:target_num_reqs].copy(),
+                qx_sub_mask,
+                (
+                    int(self.speculative_config.num_speculative_tokens) + 1
+                    if self.speculative_config
+                    else 0
+                ),
+            )
         per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = (
             self._build_attention_metadata(
                 num_tokens=local_total_num_scheduled_tokens,
@@ -3109,6 +3144,8 @@ class TPUModelRunner(GPUModelRunner):
                 slot_mappings=slot_mappings,
             )
         )
+        if self._qx_stage_cache:
+            self._qx_stage_hint = None
 
         if self.lora_config is not None:
             # We need to respect padding when activating LoRA adapters
