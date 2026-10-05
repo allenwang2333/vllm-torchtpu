@@ -4801,6 +4801,11 @@ class TPUModelRunner(GPUModelRunner):
             )
             token_padding.set_padding_state(self._token_padding_state)
 
+        if envs.TPU_MICROBATCH_FACTOR > 1:
+            from vllm_torchtpu.models.microbatch import \
+                maybe_install_microbatch
+            maybe_install_microbatch(self.model, self.vllm_config)
+
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()
