@@ -327,8 +327,6 @@ class MMEncoderManager(EncoderCudaGraphManager):
         images_per_rank: list[int],
         max_tokens: int,
     ) -> list[torch.Tensor]:
-        if max_tokens == 0 or len(tokens) == 0:
-            return []
         from vllm.distributed.parallel_state import get_tp_group
 
         padded = torch.zeros(

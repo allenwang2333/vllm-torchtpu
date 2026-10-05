@@ -638,8 +638,8 @@ class TestTpuPlatform:
 
         assert vllm_config.model_config.multimodal_config.mm_encoder_tp_mode == "data"
 
-        # Verify additional_config = None does not raise AttributeError
-        vllm_config.additional_config = None
+        # Verify additional_config without mm-encoder-tp-mode does not raise error
+        vllm_config.additional_config = {}
         TpuPlatform.check_and_update_config(vllm_config)
 
     def test_get_tpu_multihost_topology(self, monkeypatch):
