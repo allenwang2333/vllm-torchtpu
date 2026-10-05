@@ -19,6 +19,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.gdn.v3 import (
     compute_conv1d,
     compute_gdn,
@@ -26,8 +27,12 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     config,
     memory_ref,
     metadata,
+    tiling,
     vmem_ldst,
 )
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def inner_kernel(
@@ -535,6 +540,45 @@ def fused_conv1d_gdn(
     decode_tile_size = min(decode_tile_size, batch_size)
     mixed_tile_size = min(mixed_tile_size, batch_size)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
+
+    if envs.TPU_ENABLE_GDN_DYNAMIC_TILING and not is_kda:
+        # Size against the fraction the pallas_call compiles with (cfg is
+        # built later at the same fraction); the spec clamp below still runs.
+        window_size = num_spec_tokens + 1
+        vmem_limit_bytes = int(
+            (
+                config.GDNConfig.WINDOWED_VMEM_FRACTION
+                if window_size > 1
+                else config.GDNConfig.DEFAULT_VMEM_FRACTION
+            )
+            * pltpu.get_tpu_info().vmem_capacity_bytes
+        )
+        decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
+            batch_size=batch_size,
+            num_seqs=num_seqs,
+            padded_batch_size=padded_batch_size,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            conv_state_dim_size=dim if conv_state is None else conv_state.shape[-1],
+            act_out_dtype=act_out_dtype,
+            recurrent_state_dtype=(
+                jnp.float32 if recurrent_state is None else recurrent_state.dtype
+            ),
+            num_lanes=num_lanes,
+            vmem_limit_bytes=vmem_limit_bytes,
+            window_size=window_size,
+        )
+        logger.info_once(
+            "GDN dynamic tiling: num_seqs=%d batch=%d window=%d -> T=%d C=%d",
+            num_seqs,
+            batch_size,
+            window_size,
+            decode_tile_size,
+            mixed_tile_size,
+        )
 
     if num_spec_tokens > 0:
         # A verify window holds one state checkpoint per window position per
