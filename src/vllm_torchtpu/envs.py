@@ -7,6 +7,8 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    TPU_ATTN_MOE_OVERLAP: bool = False
+    TPU_ATTN_MOE_OVERLAP_MIN_TOKENS: int | None = None
     TPU_K3_SP_PREFILL: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
@@ -351,6 +353,13 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Qwen3.5 MoE at TP > 1: reduce-scatter the attention output, run the
+    # post-attention norm and router gate on the token shard, and fold the
+    # attention partial sum into the MoE all-reduce. Default MoE path only.
+    "TPU_ATTN_MOE_OVERLAP": env_bool("TPU_ATTN_MOE_OVERLAP"),
+    "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS": env_positive_int_or_none(
+        "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS"
+    ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
