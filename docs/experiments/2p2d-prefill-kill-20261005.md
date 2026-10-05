@@ -13,7 +13,7 @@
 
 ## 测试依据与范围
 
-参考[《abort测试内容》](https://alidocs.dingtalk.com/i/nodes/jb9Y4gmKWrx9eo4dCeQzjerrJGXn6lpz)中“kill Prefill worker 后检查 Decode 是否持续约 300 秒不接流量”的现象，以及仓库已有的 [R13 2P2D 记录](https://github.com/aios-tpu-infra/tpu-misc/blob/1cbde180d6ef29a669fb63af3421104b89f67f00/dashllm/docs/r13-2p2d-abort-test-20260929.md)和[单机 PCP4 到 DP2TP2 记录](https://github.com/aios-tpu-infra/tpu-misc/blob/a9933d52e859b877417141ff978330fb87e8addf/dashllm/docs/local-pcp4-dp2tp2-prefill-abort-20260930.md)。
+本轮检查的故障现象是：kill Prefill worker 后，Decode 是否持续约 300 秒不接流量。
 
 用户最初要求 PCP2→TP2。本机现有源码在 PCP2/TP1 Producer 启动时拒绝该拓扑，P0/P1 于 10:28:43 启动失败，未进入 kill 实验，见[首次启动证据包](evidence/2p2d-prefill-kill-20261005/run01-evidence.tar.gz)。用户随后明确改为 TP2→TP2，因此本记录的故障结果均来自 TP2→TP2。
 
@@ -148,6 +148,6 @@ nohup env LD_LIBRARY_PATH=/ssd/1/wister.zwz/nan-guard/miniforge/lib \
 
 本分支从 `alibaba/release-0.0.1` 的 `78c6e0d215c5ea8551c0e619e7bf587101cdb442` 创建，仅用于保存实验记录与原始证据。该基线不是本次实测源码的 commit；实测源码无 Git 历史，其身份仍以文中的 SHA256 与证据包为准。
 
-文档与复现材料复制自 `aios-tpu-infra/tpu-misc` 的 `dashllm/docs/local-tp2-tp2-2p2d-prefill-kill-20261005.md` 和相邻 `evidence/local-pcp2-tp2-2p2d-prefill-kill-20261005` 目录。迁移只调整文档链接并增加脚本归档入口，两个原始证据包保持原始字节，展示用 JSON 可补全文件末尾换行但不改变数据。当前分支没有实现故障修复。
+复现材料按实测版本归档，两个原始证据包保持原始字节，展示用 JSON 可补全文件末尾换行但不改变数据。当前分支没有实现故障修复。
 
 归档校验已核对原始证据包 SHA256、脚本语法、脚本归档与实际执行版本的字节一致性、提取 JSON 与原始 JSON 的数据一致性，以及文档本地链接。本次新增材料的 pre-commit 检查通过。全量检查中的 `pyrefly` 在干净基线 `78c6e0d215c5ea8551c0e619e7bf587101cdb442` 上也报相同的 12 处源码错误；本次没有改变 `src/` 或类型检查基线，新增材料检查单独跳过这一已有失败项。迁移阶段没有重跑 TPU 实验，测试结果来自前述实测记录。
