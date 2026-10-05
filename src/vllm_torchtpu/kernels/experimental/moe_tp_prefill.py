@@ -407,12 +407,12 @@ def routing_plan(topk_ids, n_experts, row_scale, route_valid=None, n_valid=None)
     """Expert-major slab order for the routed rows (XLA), with no scatter or
     gather over the routes.
 
-    A single packed uint32 sort on ``(expert << 20) | route_idx`` orders the
-    routes stably by expert; ``searchsorted`` on the sorted expert ids extracts
-    ``base`` and ``counts`` in O(E log R) without materializing an [E, R]
-    comparison matrix; a second sort of ``order`` inverts the permutation.
-    Routes of tokens at or past n_valid, and routes where route_valid [T, K] is
-    False, get the sentinel expert E, sort last and are never visited.
+    A packed uint32 sort on ``(expert << 20) | route_idx`` orders the routes
+    stably by expert while permuting ``s_rep`` in lockstep (avoiding a separate
+    dynamic VMEM gather ``row_scale[tok]``); a second sort of ``order`` inverts
+    the permutation. Routes of tokens at or past n_valid, and routes where
+    route_valid [T, K] is False, get the sentinel expert E, sort last and are
+    never visited.
 
     Returns tok [R] (token of each slab row), pos [T, K] (slab row of each
     route), s_sorted [R] (scale of each slab row) and the visit tables.
@@ -426,15 +426,17 @@ def routing_plan(topk_ids, n_experts, row_scale, route_valid=None, n_valid=None)
         e_flat = jnp.where(iota // k < n_valid, e_flat, n_experts)
     if route_valid is not None:
         e_flat = jnp.where(route_valid.reshape(-1), e_flat, n_experts)
+    s_rep = jnp.repeat(row_scale, k)
     if n_routes < (1 << 20) and n_experts < (1 << 11):
-        packed = lax.sort(
-            (e_flat.astype(jnp.uint32) << 20) | iota.astype(jnp.uint32),
-            is_stable=False,
+        key1 = (e_flat.astype(jnp.uint32) << 20) | iota.astype(jnp.uint32)
+        key1_sorted, s_sorted = lax.sort(
+            (key1, s_rep), dimension=0, num_keys=1, is_stable=False
         )
-        e_sorted = (packed >> 20).astype(jnp.int32)
-        order = (packed & jnp.uint32((1 << 20) - 1)).astype(jnp.int32)
+        order = (key1_sorted & jnp.uint32((1 << 20) - 1)).astype(jnp.int32)
     else:
-        e_sorted, order = lax.sort((e_flat, iota), num_keys=1, is_stable=True)
+        _, order, s_sorted = lax.sort(
+            (e_flat, iota, s_rep), dimension=0, num_keys=1, is_stable=True
+        )
     if n_routes <= (1 << 16):
         inv_packed = lax.sort(
             (order.astype(jnp.uint32) << 16) | iota.astype(jnp.uint32),
@@ -442,21 +444,20 @@ def routing_plan(topk_ids, n_experts, row_scale, route_valid=None, n_valid=None)
         )
         pos = (inv_packed & jnp.uint32(0xFFFF)).astype(jnp.int32)
     else:
-        _, pos = lax.sort((order, iota), num_keys=1, is_stable=False)
+        _, pos = lax.sort((order, iota), dimension=0, num_keys=1, is_stable=False)
     tok = order // k
-    s_sorted = row_scale[tok]
-    edges = jnp.searchsorted(
-        e_sorted, jnp.arange(n_experts + 1, dtype=jnp.int32), side="left"
+    counts = (e_flat[None, :] == jnp.arange(n_experts, dtype=jnp.int32)[:, None]).sum(
+        axis=1, dtype=jnp.int32
     )
-    base = edges[:-1]
-    counts = edges[1:] - edges[:-1]
+    base = jnp.cumsum(counts, dtype=jnp.int32) - counts
     active = counts > 0
     (visit_e,) = jnp.nonzero(active, size=n_experts + VISIT_SLACK, fill_value=n_experts)
     visit_e = visit_e.astype(jnp.int32)
     n_routed_visits = jnp.sum(active).astype(jnp.int32)
     valid_visit = visit_e < n_experts
-    visit_base = jnp.where(valid_visit, base[visit_e], 0)
-    visit_counts = jnp.where(valid_visit, counts[visit_e], 0)
+    safe_e = jnp.where(valid_visit, visit_e, 0)
+    visit_base = jnp.where(valid_visit, base[safe_e], 0)
+    visit_counts = jnp.where(valid_visit, counts[safe_e], 0)
     return (
         tok,
         pos.reshape(n_tok, k),
