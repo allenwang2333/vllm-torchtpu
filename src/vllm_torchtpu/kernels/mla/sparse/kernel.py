@@ -1452,9 +1452,16 @@ def sparse_attention_chunk(
     tc_num_row_subchunks = 32
     dcp_gather_atoms = sparsecore_atoms_per_batch
     gather_step = native_sc_gather.OCCURRENCES_PER_ATOM
-    if is_dcp_mode and topk >= gather_step and topk % gather_step == 0:
+    if (
+        is_dcp_mode
+        and capped_windows is None
+        and topk >= gather_step
+        and topk % gather_step == 0
+    ):
         # Point whole dead gather windows at SKIP_INDEX so the gather drops
-        # them instead of reading the scattered pad rows.
+        # them instead of reading the scattered pad rows. Capped mode packs
+        # rows window-major and bounds the gather with `num_live_capped`
+        # instead, so this rewrite would contradict it.
         tc_steps_per_window = _largest_divisor(topk // gather_step, 4)
         tc_num_row_subchunks = tc_steps_per_window * 4
         dcp_gather_atoms = _largest_divisor(
