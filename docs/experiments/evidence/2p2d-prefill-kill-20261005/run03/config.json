@@ -1,0 +1,82 @@
+{
+  "host": "avtdhasm-qqg7.us-west8-a.c.ali-gcp-tpu.internal",
+  "versions": {
+    "vllm": "0.29.0+empty",
+    "vllm-torchtpu": "0.1.0+nancheck",
+    "torch": "2.13.0",
+    "torch-tpu": "0.1.1+release.2026.9.22.20261001190350",
+    "tpu-sync-torch": "0.0.1.dev20261001082953",
+    "libtpu": "0.0.47"
+  },
+  "native_sha256": "67f9763570dfdf6aefd55b502de33f687d77838ffbf385565c41ed8dd3b84d96",
+  "connector_sha256": "c545d5d4d132eae4d8151c20060ca17f5a604b5a88e190c9b1446d4cbf17d6b4",
+  "shim_sha256": "03a133078b89f6da496e8f4acd6a8a3cdf8d2338904356460a7bf11410075875",
+  "source_snapshot": "/ssd/1/yanzecheng_yzc/pcp2-tp2-2p2d-kill-20261005/run03/runtime",
+  "model_path": "/ssd/1/wister.zwz/nan-guard/models/Qwen3.5-35B-A3B-FP8",
+  "roles": {
+    "p0": [
+      0,
+      1
+    ],
+    "p1": [
+      6,
+      7
+    ],
+    "d0": [
+      2,
+      3
+    ],
+    "d1": [
+      4,
+      5
+    ]
+  },
+  "ports": {
+    "p0": 18400,
+    "p1": 18410,
+    "d0": 19400,
+    "d1": 19410
+  },
+  "controllers": {
+    "p0": 27000,
+    "p1": 27400,
+    "d0": 28000,
+    "d1": 28400
+  },
+  "process_owner": 1426540,
+  "environment": {
+    "TPU_SKIP_MDS_QUERY": "true",
+    "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS": "false",
+    "VLLM_DO_NOT_TRACK": "1",
+    "LIBTPU_INIT_ARGS": "--vbar_control_service_url=127.0.0.1:8353 --xla_tpu_enable_latency_hiding_scheduler=false --xla_tpu_scoped_vmem_limit_kib=65536",
+    "TPU_BACKEND_TYPE": "jax",
+    "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
+    "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "1",
+    "TPU_USE_RAIDEN_KV_CACHE_MANAGER": "1",
+    "TPU_RAIDEN_QWEN35_ADMISSION": "1",
+    "TPU_KV_RESHARD_TRANSPORT": "raiden",
+    "TPU_RAIDEN_TRANSFER_PARALLELISM": "2",
+    "TPU_RAIDEN_DST_SHARDS": "2",
+    "TPU_RAIDEN_PREFIX_AWARE_LOAD": "1",
+    "TPU_P2P_WAIT_PULL_TIMEOUT": "120",
+    "TPU_PREMAPPED_BUFFER_SIZE": "8589934592",
+    "TPU_PARALLEL_PRECOMPILE": "1",
+    "TPU_KV_SHM_POOL_GB": "8",
+    "TPU_MAX_HOST_KV_BUFFER_SIZE": "64",
+    "TPU_ENABLE_D2H_TRANSFER": "1",
+    "TPU_HMA_D2H_COPY_IMPL": "device_put",
+    "TPU_HMA_MIN_DONE_RECVING_BATCH": "1",
+    "TPU_HMA_MAX_DONE_RECVING_BATCH": "1",
+    "TPU_HMA_MAX_INFLIGHT_D2H_SENDS": "1",
+    "TPU_HMA_MAX_INFLIGHT_PULLS": "8",
+    "TPU_RAGGED_GATHER_REDUCE_IMPL": "fallback",
+    "TPU_RAGGED_GATHER_IMPL": "fallback",
+    "VLLM_SERVER_DEV_MODE": "1",
+    "VLLM_LOG_STATS_INTERVAL": "1",
+    "VLLM_KV_CACHE_LAYOUT": "HND",
+    "TPU_LIBRARY_PATH": "/ssd/1/wister.zwz/nan-guard/venv/lib64/python3.12/site-packages/libtpu/libtpu.so",
+    "TORCH_TPU_XPROF_SESSION_ID": "1791167678457186293",
+    "TORCH_TPU_SLICEBUILDER_ADDRESSES": "localhost:36447,localhost:38923,localhost:42727,localhost:38631,localhost:43755,localhost:44837,localhost:45767,localhost:45121",
+    "TORCH_TPU_TOPOLOGY": "2,2,1,2"
+  }
+}

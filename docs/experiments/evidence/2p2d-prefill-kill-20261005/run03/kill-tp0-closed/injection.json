@@ -1,0 +1,14 @@
+{
+  "ts": 1791168211.1756375,
+  "target": {
+    "pid": 1429249,
+    "state": "R",
+    "ppid": 1429165,
+    "start_ticks": 23588657,
+    "uid": 1426540,
+    "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python",
+    "worker_rank": 0,
+    "worker_kind": "TP"
+  },
+  "signal": "SIGKILL"
+}

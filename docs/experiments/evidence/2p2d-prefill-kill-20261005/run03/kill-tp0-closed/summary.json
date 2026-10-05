@@ -1,0 +1,443 @@
+{
+  "kill_ts": 1791168211.1756375,
+  "observation_seconds": 360,
+  "target_rank": 0,
+  "wait_closed": true,
+  "lanes": {
+    "baseline-p0-d0": {
+      "count": 3,
+      "model_successes": 3,
+      "codes": {
+        "200": 3
+      },
+      "avg": 0.11499627431233723,
+      "min": 0.09807348251342773,
+      "max": 0.14523839950561523,
+      "stddev": 0.02143495323488778,
+      "p90": 0.13652610778808594,
+      "p99": 0.14436717033386232
+    },
+    "baseline-p0-d1": {
+      "count": 3,
+      "model_successes": 3,
+      "codes": {
+        "200": 3
+      },
+      "avg": 0.1051323413848877,
+      "min": 0.08883500099182129,
+      "max": 0.11460113525390625,
+      "stddev": 0.011574258923037265,
+      "p90": 0.11407308578491211,
+      "p99": 0.11454833030700684
+    },
+    "baseline-p1-d0": {
+      "count": 3,
+      "model_successes": 3,
+      "codes": {
+        "200": 3
+      },
+      "avg": 0.09911767641703288,
+      "min": 0.08906912803649902,
+      "max": 0.11502909660339355,
+      "stddev": 0.011380097871787903,
+      "p90": 0.11067423820495606,
+      "p99": 0.1145936107635498
+    },
+    "baseline-p1-d1": {
+      "count": 3,
+      "model_successes": 3,
+      "codes": {
+        "200": 3
+      },
+      "avg": 0.1050269603729248,
+      "min": 0.09021162986755371,
+      "max": 0.1133425235748291,
+      "stddev": 0.01050221539085064,
+      "p90": 0.1129793643951416,
+      "p99": 0.11330620765686035
+    },
+    "baseline0-d0-prefill": {
+      "count": 2,
+      "model_successes": 2,
+      "codes": {
+        "200": 2
+      },
+      "avg": 0.08327686786651611,
+      "min": 0.0827178955078125,
+      "max": 0.08383584022521973,
+      "stddev": 0.0005589723587036133,
+      "p90": 0.083724045753479,
+      "p99": 0.08382466077804565
+    },
+    "baseline0-d1-prefill": {
+      "count": 2,
+      "model_successes": 2,
+      "codes": {
+        "200": 2
+      },
+      "avg": 0.06023526191711426,
+      "min": 0.059951066970825195,
+      "max": 0.06051945686340332,
+      "stddev": 0.0002841949462890625,
+      "p90": 0.06046261787414551,
+      "p99": 0.06051377296447754
+    },
+    "baseline1-d0-prefill": {
+      "count": 2,
+      "model_successes": 2,
+      "codes": {
+        "200": 2
+      },
+      "avg": 0.06257462501525879,
+      "min": 0.059511423110961914,
+      "max": 0.06563782691955566,
+      "stddev": 0.003063201904296875,
+      "p90": 0.0650251865386963,
+      "p99": 0.06557656288146972
+    },
+    "baseline1-d1-prefill": {
+      "count": 2,
+      "model_successes": 2,
+      "codes": {
+        "200": 2
+      },
+      "avg": 0.05871117115020752,
+      "min": 0.05849742889404297,
+      "max": 0.05892491340637207,
+      "stddev": 0.00021374225616455078,
+      "p90": 0.05888216495513916,
+      "p99": 0.05892063856124878
+    },
+    "baseline2-d0-prefill": {
+      "count": 2,
+      "model_successes": 2,
+      "codes": {
+        "200": 2
+      },
+      "avg": 0.0592503547668457,
+      "min": 0.05906081199645996,
+      "max": 0.059439897537231445,
+      "stddev": 0.0001895427703857422,
+      "p90": 0.0594019889831543,
+      "p99": 0.05943610668182373
+    },
+    "baseline2-d1-prefill": {
+      "count": 2,
+      "model_successes": 2,
+      "codes": {
+        "200": 2
+      },
+      "avg": 0.058557987213134766,
+      "min": 0.057588815689086914,
+      "max": 0.05952715873718262,
+      "stddev": 0.0009691715240478516,
+      "p90": 0.05933332443237305,
+      "p99": 0.05950777530670166
+    },
+    "direct-d0": {
+      "count": 174,
+      "model_successes": 174,
+      "codes": {
+        "200": 174
+      },
+      "avg": 0.0768374190933403,
+      "min": 0.07103347778320312,
+      "max": 0.6706609725952148,
+      "stddev": 0.04524117479309878,
+      "p90": 0.07552402019500733,
+      "p99": 0.08787203311920169
+    },
+    "direct-d1": {
+      "count": 174,
+      "model_successes": 174,
+      "codes": {
+        "200": 174
+      },
+      "avg": 0.07609179239163454,
+      "min": 0.07103276252746582,
+      "max": 0.607452392578125,
+      "stddev": 0.04047169251949936,
+      "p90": 0.07441713809967042,
+      "p99": 0.08398959636688257
+    },
+    "fault-d0": {
+      "count": 1,
+      "model_successes": 0,
+      "codes": {
+        "None": 1
+      },
+      "avg": 350.1083490848541,
+      "min": 350.1083490848541,
+      "max": 350.1083490848541,
+      "stddev": 0.0,
+      "p90": 350.1083490848541,
+      "p99": 350.1083490848541
+    },
+    "fault-d0-prefill": {
+      "count": 1,
+      "model_successes": 1,
+      "codes": {
+        "200": 1
+      },
+      "avg": 0.0604093074798584,
+      "min": 0.0604093074798584,
+      "max": 0.0604093074798584,
+      "stddev": 0.0,
+      "p90": 0.0604093074798584,
+      "p99": 0.0604093074798584
+    },
+    "fault-d1": {
+      "count": 1,
+      "model_successes": 0,
+      "codes": {
+        "None": 1
+      },
+      "avg": 350.10763907432556,
+      "min": 350.10763907432556,
+      "max": 350.10763907432556,
+      "stddev": 0.0,
+      "p90": 350.10763907432556,
+      "p99": 350.10763907432556
+    },
+    "fault-d1-prefill": {
+      "count": 1,
+      "model_successes": 1,
+      "codes": {
+        "200": 1
+      },
+      "avg": 0.05878281593322754,
+      "min": 0.05878281593322754,
+      "max": 0.05878281593322754,
+      "stddev": 0.0,
+      "p90": 0.05878281593322754,
+      "p99": 0.05878281593322754
+    },
+    "healthy-d0-prefill": {
+      "count": 28,
+      "model_successes": 28,
+      "codes": {
+        "200": 28
+      },
+      "avg": 0.06378721339362008,
+      "min": 0.058396100997924805,
+      "max": 0.13050103187561035,
+      "stddev": 0.013673061009310738,
+      "p90": 0.06894166469573974,
+      "p99": 0.11693287372589113
+    },
+    "healthy-d1-prefill": {
+      "count": 28,
+      "model_successes": 28,
+      "codes": {
+        "200": 28
+      },
+      "avg": 0.06364012616021293,
+      "min": 0.05924081802368164,
+      "max": 0.11552071571350098,
+      "stddev": 0.010626510384904884,
+      "p90": 0.06820845603942871,
+      "p99": 0.10504497289657594
+    },
+    "healthy-p1-d0": {
+      "count": 28,
+      "model_successes": 27,
+      "codes": {
+        "200": 27,
+        "500": 1
+      },
+      "avg": 10.825076307569232,
+      "min": 0.08763432502746582,
+      "max": 299.950688123703,
+      "stddev": 55.64237594264743,
+      "p90": 0.11776728630065919,
+      "p99": 219.16100809335722
+    },
+    "healthy-p1-d1": {
+      "count": 28,
+      "model_successes": 27,
+      "codes": {
+        "200": 27,
+        "500": 1
+      },
+      "avg": 10.820229998656682,
+      "min": 0.0879220962524414,
+      "max": 299.89830255508423,
+      "stddev": 55.633195290517115,
+      "p90": 0.11398048400878906,
+      "p99": 219.0996791172029
+    }
+  },
+  "final_health": {
+    "p0": "URLError(ConnectionRefusedError(111, 'Connection refused'))",
+    "p1": 200,
+    "d0": 200,
+    "d1": 200
+  },
+  "final_processes": {
+    "p0": {
+      "error": "FileNotFoundError(2, 'No such file or directory')"
+    },
+    "p1": [
+      {
+        "pid": 1428797,
+        "state": "S",
+        "ppid": 1,
+        "start_ticks": 23583707,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1428802,
+        "state": "S",
+        "ppid": 1428797,
+        "start_ticks": 23583716,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429193,
+        "state": "S",
+        "ppid": 1428802,
+        "start_ticks": 23587630,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429194,
+        "state": "S",
+        "ppid": 1428802,
+        "start_ticks": 23587630,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429278,
+        "state": "S",
+        "ppid": 1429194,
+        "start_ticks": 23588847,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python",
+        "worker_rank": 0,
+        "worker_kind": "TP"
+      },
+      {
+        "pid": 1429279,
+        "state": "S",
+        "ppid": 1429194,
+        "start_ticks": 23588847,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python",
+        "worker_rank": 1,
+        "worker_kind": "TP"
+      }
+    ],
+    "d0": [
+      {
+        "pid": 1428798,
+        "state": "S",
+        "ppid": 1,
+        "start_ticks": 23583707,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1428801,
+        "state": "S",
+        "ppid": 1428798,
+        "start_ticks": 23583716,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429185,
+        "state": "S",
+        "ppid": 1428801,
+        "start_ticks": 23587582,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429186,
+        "state": "S",
+        "ppid": 1428801,
+        "start_ticks": 23587582,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429272,
+        "state": "S",
+        "ppid": 1429186,
+        "start_ticks": 23588812,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python",
+        "worker_rank": 0,
+        "worker_kind": "TP"
+      },
+      {
+        "pid": 1429273,
+        "state": "R",
+        "ppid": 1429186,
+        "start_ticks": 23588812,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python",
+        "worker_rank": 1,
+        "worker_kind": "TP"
+      }
+    ],
+    "d1": [
+      {
+        "pid": 1428799,
+        "state": "S",
+        "ppid": 1,
+        "start_ticks": 23583707,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1428803,
+        "state": "S",
+        "ppid": 1428799,
+        "start_ticks": 23583716,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429178,
+        "state": "S",
+        "ppid": 1428803,
+        "start_ticks": 23587574,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429179,
+        "state": "S",
+        "ppid": 1428803,
+        "start_ticks": 23587574,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429268,
+        "state": "R",
+        "ppid": 1429179,
+        "start_ticks": 23588805,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python",
+        "worker_rank": 0,
+        "worker_kind": "TP"
+      },
+      {
+        "pid": 1429269,
+        "state": "R",
+        "ppid": 1429179,
+        "start_ticks": 23588805,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python",
+        "worker_rank": 1,
+        "worker_kind": "TP"
+      }
+    ]
+  }
+}

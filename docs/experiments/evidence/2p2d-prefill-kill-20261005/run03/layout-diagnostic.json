@@ -1,0 +1,6 @@
+{
+  "before": "c545d5d4d132eae4d8151c20060ca17f5a604b5a88e190c9b1446d4cbf17d6b4",
+  "after": "1b6c94726ca9325809c75ce7dbbb1a2ffdbaf2f8dea6e83469ab006b1fc2b5d5",
+  "old": "    return vllm_envs.VLLM_KV_CACHE_LAYOUT == \"HND\"",
+  "new": "    logger.warning(\"EXPERIMENT_LAYOUT cached=%r environ=%r\", vllm_envs.VLLM_KV_CACHE_LAYOUT, __import__(\"os\").environ.get(\"VLLM_KV_CACHE_LAYOUT\"))\n    return vllm_envs.VLLM_KV_CACHE_LAYOUT == \"HND\""
+}

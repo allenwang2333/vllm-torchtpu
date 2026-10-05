@@ -1,0 +1,164 @@
+{
+  "ts": 1791168638.4551826,
+  "owned_trees": {
+    "p0": {
+      "error": "FileNotFoundError(2, 'No such file or directory')"
+    },
+    "p1": [
+      {
+        "pid": 1428797,
+        "state": "S",
+        "ppid": 1,
+        "start_ticks": 23583707,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1428802,
+        "state": "S",
+        "ppid": 1428797,
+        "start_ticks": 23583716,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429193,
+        "state": "S",
+        "ppid": 1428802,
+        "start_ticks": 23587630,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429194,
+        "state": "S",
+        "ppid": 1428802,
+        "start_ticks": 23587630,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429278,
+        "state": "S",
+        "ppid": 1429194,
+        "start_ticks": 23588847,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429279,
+        "state": "S",
+        "ppid": 1429194,
+        "start_ticks": 23588847,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      }
+    ],
+    "d0": [
+      {
+        "pid": 1428798,
+        "state": "S",
+        "ppid": 1,
+        "start_ticks": 23583707,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1428801,
+        "state": "S",
+        "ppid": 1428798,
+        "start_ticks": 23583716,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429185,
+        "state": "S",
+        "ppid": 1428801,
+        "start_ticks": 23587582,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429186,
+        "state": "R",
+        "ppid": 1428801,
+        "start_ticks": 23587582,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429272,
+        "state": "R",
+        "ppid": 1429186,
+        "start_ticks": 23588812,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429273,
+        "state": "R",
+        "ppid": 1429186,
+        "start_ticks": 23588812,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      }
+    ],
+    "d1": [
+      {
+        "pid": 1428799,
+        "state": "S",
+        "ppid": 1,
+        "start_ticks": 23583707,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1428803,
+        "state": "S",
+        "ppid": 1428799,
+        "start_ticks": 23583716,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429178,
+        "state": "S",
+        "ppid": 1428803,
+        "start_ticks": 23587574,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429179,
+        "state": "R",
+        "ppid": 1428803,
+        "start_ticks": 23587574,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429268,
+        "state": "S",
+        "ppid": 1429179,
+        "start_ticks": 23588805,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      },
+      {
+        "pid": 1429269,
+        "state": "R",
+        "ppid": 1429179,
+        "start_ticks": 23588805,
+        "uid": 1426540,
+        "name": "/ssd/1/wister.zwz/nan-guard/venv/bin/python"
+      }
+    ]
+  },
+  "final_health": {
+    "p0": "URLError(ConnectionRefusedError(111, 'Connection refused'))",
+    "p1": "URLError(ConnectionRefusedError(111, 'Connection refused'))",
+    "d0": "URLError(ConnectionRefusedError(111, 'Connection refused'))",
+    "d1": "URLError(ConnectionRefusedError(111, 'Connection refused'))"
+  }
+}
