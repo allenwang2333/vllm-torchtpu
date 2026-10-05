@@ -15,17 +15,23 @@
 # Publishes the public prod image to Docker Hub when a NIGHTLY=1 build of a
 # release/X.Y.Z branch is started by hand (Buildkite: New Build, env NIGHTLY=1).
 # Unlike nightly_releases.yml, it waits for every build, test, integration,
-# perf and model/feature step and is skipped if any fails.
+# perf and model/feature step, then for a person to click Unblock on the
+# approval step; nothing is pushed if a test fails or nobody approves.
 # Steps an `if` drops from the build (e.g. PR-only steps) do not block it.
 # Merges to a release branch do not set NIGHTLY=1 and never publish. Do not
 # add a NIGHTLY=1 schedule on a release branch: it would re-push X.Y.Z and
 # latest every night.
 
 steps:
-  - label: ":docker: Publish vllm-torchtpu release image to Docker Hub"
-    key: "publish_dockerhub_release"
+  # Manual approval. It becomes clickable only after every step below passes;
+  # then someone clicks Unblock in the Buildkite UI to start the publish step.
+  - block: ":rotating_light: Approve vllm-torchtpu release to Docker Hub"
+    key: "approve_dockerhub_release"
     # TODO(test-only): jefft/docker_image_ci added for a CI dry run. Remove before merging.
     if: '(build.branch =~ /^release\// || build.branch == "jefft/docker_image_ci") && build.env("NIGHTLY") == "1" && pipeline.slug == "vllm-torchtpu-ci"'
+    prompt: "All tests passed. Publish this release to Docker Hub (X.Y.Z and latest)?"
+    # TODO(release-approvers): limit who can unblock to a Buildkite team, e.g.
+    # allowed_teams: ["<team-slug>"]
     depends_on:
       - "build_docker_group"        # pipeline_build.yml
       - "typecheck_full"            # pipeline_tests.yml
@@ -33,11 +39,17 @@ steps:
       - "unit_tests_tpu_group"      # pipeline_tests.yml
       - "integration_tests_group"   # pipeline_integration.yml
       - "perf_eval_group"           # pipeline_perf.yml
-      # nightly_verify.yml. Runs after the v6e/v7x model and feature groups
+      # pipeline_verify.yml. Runs after the v6e/v7x model and feature groups
       # finish and fails if any of their tests failed. Those groups are uploaded
       # at runtime and their test steps soft_fail, so they are gated here
       # rather than by key.
       - "notify_test_results"
+
+  - label: ":docker: Publish vllm-torchtpu release image to Docker Hub"
+    key: "publish_dockerhub_release"
+    # TODO(test-only): jefft/docker_image_ci added for a CI dry run. Remove before merging.
+    if: '(build.branch =~ /^release\// || build.branch == "jefft/docker_image_ci") && build.env("NIGHTLY") == "1" && pipeline.slug == "vllm-torchtpu-ci"'
+    depends_on: "approve_dockerhub_release"
     agents:
       # The prod build pulls torch-tpu from a private registry and needs the
       # gcloud credentials these agents carry (see docker/build_image.sh).
