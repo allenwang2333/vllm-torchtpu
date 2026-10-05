@@ -1333,6 +1333,7 @@ def _build_fused_ep_moe_kernel(
             lays its waves out by that position.
             """
             if sparse:
+                assert visit_i is not None
                 last = lax.div(visit_i, jnp.int32(experts_per_wave))
                 if stream_bounds:
                     # The streamed expert is the last visit: its first tile
