@@ -72,10 +72,12 @@ def test_other_widths(mesh, hidden):
     _check(_all_reduce(mesh, per_core, range(N)), per_core)
 
 
-def test_agrees_with_psum_within_its_rounding(mesh):
+@pytest.mark.parametrize("rows", [8, 16, 24, 32, 40, 48])
+def test_agrees_with_psum_within_its_rounding(mesh, rows):
     """XLA's bf16 psum may round every partial sum, (n - 1) roundings of at
-    most half a step at the sum of magnitudes; the kernel rounds once."""
-    per_core = blocks((N, 16, 4096), seed=7)
+    most half a step at the sum of magnitudes; the kernel rounds once. Rows
+    span the decode all-reduces of a TP8 MoE step (8-48 tokens)."""
+    per_core = blocks((N, rows, 4096), seed=7 + rows)
     psum = run_sharded(
         mesh, lambda x, r: jax.lax.psum(x, AXIS), per_core, range(N)
     ).astype(np.float64)

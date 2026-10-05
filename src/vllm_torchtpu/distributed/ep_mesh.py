@@ -224,3 +224,56 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
     )
     _MESH_CACHE[cache_key] = mesh
     return mesh
+
+
+def _tp_ranks() -> tuple[int, ...]:
+    return tuple(int(r) for r in parallel_state.get_tp_group().ranks)
+
+
+def tp_mesh_index() -> int | None:
+    """This rank's index into the mesh `build_tp_mesh` builds, or None at TP 1."""
+    ranks = _tp_ranks()
+    if len(ranks) <= 1:
+        return None
+    return ranks.index(_get_current_global_rank())
+
+
+def build_tp_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
+    """A one-axis JAX mesh over the TP group, or None at TP 1.
+
+    For an op that needs a mesh where vLLM built no EP group (a dense model).
+    vLLM builds one for every MoE model whether or not expert parallelism is
+    on, so an MoE model keeps `build_ep_mesh` either way.
+
+    ``get_pallas_mesh`` spans the whole torch.distributed world in rank order,
+    so the TP group has to be that world in that order: mesh index i is then
+    TP rank i and global rank i, the group XLA's TP all-reduce runs over.
+    Built before any traced region, like `build_ep_mesh`.
+    """
+    ranks = _tp_ranks()
+    if len(ranks) <= 1:
+        return None
+    cache_key = (f"tp:{axis_name}", ranks)
+    cached = _MESH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    import torch.distributed as dist
+
+    world_size = int(dist.get_world_size())
+    if ranks != tuple(range(world_size)):
+        raise NotImplementedError(
+            f"The TP group {ranks} is not the torch.distributed world of "
+            f"{world_size} in rank order. get_pallas_mesh builds a mesh over the "
+            "whole world, so a TP mesh alongside another parallelism axis needs "
+            "a mesh_shape factorisation that has not been worked out."
+        )
+
+    from torch_tpu._internal.pallas import get_pallas_mesh
+
+    mesh = get_pallas_mesh(axis_names=(axis_name,))
+    logger.info(
+        "Built TP mesh | axis=%s | size=%d | rank-ordered", axis_name, world_size
+    )
+    _MESH_CACHE[cache_key] = mesh
+    return mesh

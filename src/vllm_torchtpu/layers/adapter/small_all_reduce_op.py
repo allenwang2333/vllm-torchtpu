@@ -14,7 +14,8 @@
 """Small TP all-reduces and DP MoE combines through the Pallas kernels in
 ``kernels/experimental/small_collectives``.
 
-``prebuild`` builds both ops over the expert-parallel mesh at model load. The
+``prebuild`` builds both ops at model load over the expert-parallel mesh, or
+the TP mesh where vLLM built no EP group (a dense model). The
 device communicator then hands a 2-D bf16 block of at most ``MAX_ROWS`` rows
 (an all-reduce) or ``COMBINE_MAX_ROWS`` rows per engine (a DP combine) to a
 kernel and anything else to vLLM's collective.
@@ -35,8 +36,10 @@ from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
+    build_tp_mesh,
     ep_mesh_index,
     get_ep_group,
+    tp_mesh_index,
 )
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.experimental.small_collectives import (
@@ -122,27 +125,50 @@ def _build_reduce_scatter(mesh):
     )
 
 
+def _mesh_group():
+    """``(mesh, ranks, index)`` the kernels run over, or None.
+
+    The EP group's mesh whenever vLLM built an EP group -- for every MoE model,
+    ``--enable-expert-parallel`` or not, so under TP-only MoE the EP group is
+    the TP group. Otherwise (a dense model) the TP group's. Both meshes are
+    rank-ordered over the world, so ``index`` is this core's position in
+    ``ranks`` and its partition in the mesh."""
+    ep = get_ep_group()
+    if ep is not None:
+        mesh = build_ep_mesh()
+        if mesh is None:
+            return None
+        return mesh, tuple(int(r) for r in ep.ranks), ep_mesh_index()
+    from vllm.distributed.parallel_state import get_tp_group
+
+    mesh = build_tp_mesh()
+    if mesh is None:
+        return None
+    return mesh, tuple(int(r) for r in get_tp_group().ranks), tp_mesh_index()
+
+
 def prebuild() -> None:
     """Build the ops and this core's rank tensor, outside any traced region:
     the mesh comes from a collective. A no-op unless TPU_SMALL_ALL_REDUCE."""
     global _AR_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE
     if not envs.TPU_SMALL_ALL_REDUCE or _AR_OP is not None:
         return
-    mesh = build_ep_mesh()
-    if mesh is None:
+    group = _mesh_group()
+    if group is None:
         raise NotImplementedError(
             "TPU_SMALL_ALL_REDUCE=1 builds its kernels over the expert-parallel "
-            "mesh, and this deployment has no expert-parallel group (a dense "
-            "model or one core). Unset TPU_SMALL_ALL_REDUCE."
+            "or the tensor-parallel mesh, and this deployment has neither "
+            "(one core). Unset TPU_SMALL_ALL_REDUCE."
         )
+    mesh, mesh_ranks, index = group
     from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 
     _CORES = mesh.shape[EP_AXIS_NAME]
-    _MESH_RANKS = tuple(int(r) for r in get_ep_group().ranks)
-    _RANK = torch.tensor([ep_mesh_index()], dtype=torch.int32, device="tpu")
+    _MESH_RANKS = mesh_ranks
+    _RANK = torch.tensor([index], dtype=torch.int32, device="tpu")
     _AR_OP = _build_all_reduce(mesh)
     _RS_OP = _build_reduce_scatter(mesh)
-    # The mesh is rank-ordered (ep_mesh.build_ep_mesh), so when the DP group
+    # The mesh is rank-ordered (ep_mesh.build_*_mesh), so when the DP group
     # is the mesh, DP rank r's rows go to mesh core r.
     _DP_COMBINE = tuple(int(r) for r in get_dp_group().ranks) == _MESH_RANKS
     tp_all_reduce = tuple(int(r) for r in get_tp_group().ranks) == _MESH_RANKS

@@ -176,12 +176,93 @@ def test_prebuild_is_a_no_op_with_the_flag_off(monkeypatch):
     assert op._AR_OP is None
 
 
-def test_prebuild_refuses_a_deployment_without_an_ep_group(monkeypatch):
+def test_prebuild_refuses_a_deployment_without_a_mesh(monkeypatch):
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE", True)
-    monkeypatch.setattr(op, "build_ep_mesh", lambda: None)
+    monkeypatch.setattr(op, "_mesh_group", lambda: None)
     monkeypatch.setattr(op, "_AR_OP", None)
     with pytest.raises(NotImplementedError, match="TPU_SMALL_ALL_REDUCE"):
         op.prebuild()
+
+
+@pytest.fixture
+def groups(monkeypatch):
+    """vLLM's TP group (ranks 0..7, this worker rank 3) and the two meshes."""
+    from types import SimpleNamespace
+
+    from vllm.distributed import parallel_state
+
+    tp = SimpleNamespace(ranks=list(MESH), world_size=CORES)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp)
+    ep_mesh, tp_mesh = Mock(name="ep_mesh"), Mock(name="tp_mesh")
+    build_ep, build_tp = Mock(return_value=ep_mesh), Mock(return_value=tp_mesh)
+    monkeypatch.setattr(op, "build_ep_mesh", build_ep)
+    monkeypatch.setattr(op, "build_tp_mesh", build_tp)
+    monkeypatch.setattr(op, "ep_mesh_index", lambda: 3)
+    monkeypatch.setattr(op, "tp_mesh_index", lambda: 3)
+    return SimpleNamespace(
+        tp=tp, ep_mesh=ep_mesh, tp_mesh=tp_mesh, build_ep=build_ep, build_tp=build_tp
+    )
+
+
+def test_an_ep_group_keeps_the_ep_mesh(monkeypatch, groups):
+    """vLLM builds an EP group for every MoE model, expert parallelism on or
+    off; whenever it exists the kernels run over its mesh, as before."""
+    from types import SimpleNamespace
+
+    ep = SimpleNamespace(ranks=list(MESH), world_size=CORES)
+    monkeypatch.setattr(op, "get_ep_group", lambda: ep)
+    assert op._mesh_group() == (groups.ep_mesh, MESH, 3)
+    groups.build_tp.assert_not_called()
+
+
+def test_no_ep_group_takes_the_tp_mesh(monkeypatch, groups):
+    """A dense model has no EP group: the all-reduce is still over the TP
+    group, so the kernels run over a mesh of the TP group."""
+    monkeypatch.setattr(op, "get_ep_group", lambda: None)
+    assert op._mesh_group() == (groups.tp_mesh, MESH, 3)
+    groups.build_ep.assert_not_called()
+
+
+def test_one_core_has_no_mesh(monkeypatch, groups):
+    monkeypatch.setattr(op, "get_ep_group", lambda: None)
+    groups.build_tp.return_value = None
+    assert op._mesh_group() is None
+
+
+@pytest.mark.parametrize("ep_on", [True, False], ids=["ep_group", "tp_only"])
+def test_prebuild_arms_the_tp_all_reduce_over_the_group(monkeypatch, groups, ep_on):
+    """Either mesh arms the TP all-reduce: its ranks are the TP group's, so
+    `all_reduce_or` hands the TP communicator's small blocks to the kernel."""
+    from types import SimpleNamespace
+
+    from vllm.distributed import parallel_state
+
+    ep = SimpleNamespace(ranks=list(MESH), world_size=CORES) if ep_on else None
+    monkeypatch.setattr(op, "get_ep_group", lambda: ep)
+    monkeypatch.setattr(
+        parallel_state, "get_dp_group", lambda: SimpleNamespace(ranks=[3])
+    )
+    mesh = groups.ep_mesh if ep_on else groups.tp_mesh
+    mesh.shape = {op.EP_AXIS_NAME: CORES}
+    built = []
+    monkeypatch.setattr(op, "_build_all_reduce", lambda m: built.append(m) or "ar")
+    monkeypatch.setattr(op, "_build_reduce_scatter", lambda m: built.append(m) or "rs")
+    real_tensor = torch.tensor
+    monkeypatch.setattr(
+        torch, "tensor", lambda data, **kw: real_tensor(data, dtype=kw.get("dtype"))
+    )
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE", True)
+    for name in ("_AR_OP", "_RS_OP", "_RANK"):
+        monkeypatch.setattr(op, name, None)
+    monkeypatch.setattr(op, "_CORES", 0)
+    monkeypatch.setattr(op, "_MESH_RANKS", ())
+    monkeypatch.setattr(op, "_DP_COMBINE", False)
+    op.prebuild()
+    assert built == [mesh, mesh]
+    assert (op._AR_OP, op._RS_OP, op._CORES) == ("ar", "rs", CORES)
+    assert op._MESH_RANKS == tuple(groups.tp.ranks)
+    assert op._RANK.tolist() == [3]
+    assert op._DP_COMBINE is False
 
 
 def test_retain_is_the_identity_when_unarmed_or_outside_the_warmup(monkeypatch):

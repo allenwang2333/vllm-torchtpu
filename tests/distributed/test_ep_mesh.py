@@ -199,3 +199,47 @@ def test_token_groups_reject_inconsistent_membership(monkeypatch, group, reports
     monkeypatch.setattr(ep.torch.distributed, "all_gather_object", gather)
     with pytest.raises(RuntimeError, match="replica"):
         ep.ep_token_replica_groups()
+
+
+@pytest.fixture
+def tp_group(monkeypatch):
+    group = SimpleNamespace(world_size=4, ranks=[0, 1, 2, 3])
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
+    monkeypatch.setattr(ep, "_get_current_global_rank", lambda: 2)
+    return group
+
+
+def test_tp_mesh_spans_the_world_in_rank_order(monkeypatch, tp_group):
+    """The TP mesh is the same get_pallas_mesh call as the EP mesh: a dense
+    model's TP group is the world, so partition i is TP rank i."""
+    import torch.distributed as dist
+    from torch_tpu._internal import pallas as pallas_module
+
+    monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 4)
+    made = Mock(side_effect=lambda **kwargs: object())
+    monkeypatch.setattr(pallas_module, "get_pallas_mesh", made)
+    first = ep.build_tp_mesh()
+    assert made.call_args.kwargs == {"axis_names": ("d",)}
+    assert ep.build_tp_mesh() is first
+    assert made.call_count == 1
+    assert ep.tp_mesh_index() == 2
+
+
+def test_tp_mesh_is_none_at_tp_1(monkeypatch, tp_group):
+    tp_group.ranks = [0]
+    assert ep.build_tp_mesh() is None
+    assert ep.tp_mesh_index() is None
+
+
+@pytest.mark.parametrize("ranks", [[0, 1], [3, 2, 1, 0]], ids=["subgroup", "permuted"])
+def test_tp_mesh_rejects_a_group_that_is_not_the_world(monkeypatch, tp_group, ranks):
+    import torch.distributed as dist
+    from torch_tpu._internal import pallas as pallas_module
+
+    tp_group.ranks = ranks
+    monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 4)
+    made = Mock()
+    monkeypatch.setattr(pallas_module, "get_pallas_mesh", made)
+    with pytest.raises(NotImplementedError, match="not the torch.distributed world"):
+        ep.build_tp_mesh()
+    made.assert_not_called()
