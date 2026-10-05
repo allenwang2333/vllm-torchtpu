@@ -39,14 +39,20 @@ DUMMY_VERSION="0.0.${BUILDKITE_BUILD_NUMBER:-1}.dev$(date +%s)"
 WorkDir="$(mktemp -d)"
 cleanup() {
   rm -rf "${WorkDir}"
+  echo "rm ${WorkDir}"
 }
 trap cleanup EXIT
 
-echo "--- :python: Setting up isolated virtualenv"
-python3 -m venv "${WorkDir}/venv"
+echo "--- :python: Setting up isolated virtualenv via uv"
+if ! command -v uv >/dev/null 2>&1; then
+  curl -LsSf https://astral.sh/uv/install.sh | \
+    env UV_INSTALL_DIR="${WorkDir}/bin" INSTALLER_NO_MODIFY_PATH=1 sh
+  export PATH="${WorkDir}/bin:${PATH}"
+fi
+uv venv "${WorkDir}/venv"
 # shellcheck source=/dev/null
 source "${WorkDir}/venv/bin/activate"
-python -m pip install --quiet --upgrade pip id build twine
+uv pip install --quiet id build twine setuptools wheel
 
 echo "--- :key: Step 1: Querying OIDC audience from ${PYPI_BASE_URL}"
 audience_resp="$(curl -fsSL "${PYPI_BASE_URL}/_/oidc/audience")"
@@ -103,7 +109,7 @@ cat <<EOF > "${pkg_dir}/${PKG_MODULE_NAME}/__init__.py"
 __version__ = "${DUMMY_VERSION}"
 EOF
 
-python -m build --wheel --outdir "${pkg_dir}/dist" "${pkg_dir}"
+python -m build --wheel --no-isolation --outdir "${pkg_dir}/dist" "${pkg_dir}"
 ls -lh "${pkg_dir}/dist/"
 
 echo "--- :lock: Step 4: Exchanging GCP OIDC token for short-lived PyPI API token"
