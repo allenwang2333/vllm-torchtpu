@@ -20,7 +20,12 @@ from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
-from vllm_torchtpu.kernels.megablox.gmm_v2_ffn import gmm_v2_ffn, make_ffn_configs
+from vllm_torchtpu.kernels.megablox.gmm_v2_ffn import (
+    gmm_v2_ffn,
+    gmm_v2_ffn_routed,
+    make_ffn_configs,
+    make_routed_ffn_configs,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -671,6 +676,52 @@ def fused_moe_func(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
     )
+    # Under the one-hot permute and combine, one kernel gathers each local
+    # route's token row, runs both projections and adds the weighted result to
+    # its token: the [routes, hidden] arrays around the GEMM, and the argsorts
+    # that only the one-hot combine reads, drop out of the program.
+    quantize_lhs = _quantize_lhs_for(w1)
+    routed_ffn = (
+        use_ep
+        and use_sparse_core
+        and num_tokens * topk <= onehot_moe_permute_threshold
+        and envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() != "on"
+        and padded_hidden_size == hidden_size
+        and quantize_lhs == _quantize_lhs_for(w2)
+        and make_routed_ffn_configs(
+            hidden_states,
+            w1,
+            w1_scale,
+            w1_bias,
+            w2,
+            w2_scale,
+            w2_bias,
+            group_sizes,
+            topk=topk,
+            fuse_act=activation,
+            maybe_quantize_lhs=quantize_lhs,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+        is not None
+    )
+    if routed_ffn:
+        return gmm_v2_ffn_routed(
+            hidden_states,
+            w1,
+            w2,
+            group_sizes,
+            token_indices_sorted,
+            topk_ids,
+            topk_weights,
+            w1_scale=w1_scale,
+            w1_bias=w1_bias,
+            w2_scale=w2_scale,
+            w2_bias=w2_bias,
+            group_offset=jnp.array([0], dtype=jnp.int32),
+            fuse_act=activation,
+            maybe_quantize_lhs=quantize_lhs,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
         x,
