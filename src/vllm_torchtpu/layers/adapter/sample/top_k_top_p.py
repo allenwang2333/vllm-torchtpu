@@ -293,3 +293,48 @@ def apply_top_k_top_p_candidates(
         logits >= cutoff, logits, torch.full_like(logits, MASKED_LOGIT_VALUE)
     )
     return torch.where(top_k > 0, masked, logits)
+
+
+_TOPK_CHUNK = CANDIDATE_BLOCK
+
+
+def _chunked_topk(
+    logits: torch.Tensor, width: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sorted top-``width`` values of each row, and indices holding them.
+
+    XLA's TopK on TPU costs ~35 us per 248,320-wide row (j-b68bd068), so the
+    full-vocab TopK is replaced by: per-chunk maxima over 128-wide chunks, the
+    ``width`` chunks with the largest maxima, and one TopK over just those
+    ``width * 128`` candidates. The values are exactly the full TopK's: if
+    m is the width-th largest chunk maximum, at least ``width`` elements are
+    >= m, so the width-th largest value v >= m; every element > m sits in a
+    chunk whose maximum is > m, and fewer than ``width`` chunks have one, so
+    all are candidates, and the candidates hold >= ``width`` elements >= m.
+    Only which of several tied elements an index points at can differ, and
+    tied elements have equal logits.
+    """
+    batch, vocab = logits.shape
+    num_chunks = -(-vocab // _TOPK_CHUNK)
+    if num_chunks <= width:
+        return torch.topk(logits, width, dim=-1, largest=True, sorted=True)
+    padded = num_chunks * _TOPK_CHUNK
+    if padded != vocab:
+        logits = torch.nn.functional.pad(
+            logits, (0, padded - vocab), value=float("-inf")
+        )
+    chunks = logits.view(batch, num_chunks, _TOPK_CHUNK)
+    chunk_max = torch.amax(chunks, dim=-1)
+    _, top_chunks = torch.topk(chunk_max, width, dim=-1, largest=True, sorted=False)
+    candidates = torch.gather(
+        chunks,
+        1,
+        top_chunks.unsqueeze(-1).expand(batch, width, _TOPK_CHUNK),
+    ).reshape(batch, width * _TOPK_CHUNK)
+    vals, cand_idx = torch.topk(candidates, width, dim=-1, largest=True, sorted=True)
+    chunk_of = torch.gather(top_chunks, 1, cand_idx // _TOPK_CHUNK)
+    idx = chunk_of * _TOPK_CHUNK + cand_idx % _TOPK_CHUNK
+    # A padded (-inf) slot only enters the window when a row has fewer than
+    # ``width`` finite logits; it is never a survivor, so any in-range index
+    # will do.
+    return vals, idx.clamp(max=vocab - 1)
