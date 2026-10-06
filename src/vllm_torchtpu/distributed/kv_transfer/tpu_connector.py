@@ -75,6 +75,9 @@ from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     SendMeta,
     TPUConnectorMetadata,
 )
+from vllm_torchtpu.distributed.kv_transfer.raiden_load_failures import (
+    RaidenLoadFailures,
+)
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics,
     TpuKVConnectorStats,
@@ -1009,6 +1012,14 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         scheduler = self.connector_scheduler
         if scheduler is not None and hasattr(scheduler, "update_connector_output"):
             scheduler.update_connector_output(connector_output)
+
+    def build_connector_worker_meta(self) -> RaidenLoadFailures | None:
+        if not self.use_raiden:
+            return None
+        assert isinstance(self.connector_worker, TPURaidenConnectorWorker), (
+            "Raiden request failure metadata requires the Raiden worker role"
+        )
+        return self.connector_worker.take_pd_load_failures()
 
 
 class TPURaidenConnector(TPUConnector):
@@ -2335,6 +2346,9 @@ class TPURaidenConnectorWorker:
         self.config = vllm_config.kv_transfer_config
         self.is_producer = self.config.is_kv_producer
         self._stage3_kimi = _is_kimi(vllm_config)
+        # Report RPC outcomes independently of load policy: MultiConnector
+        # child configs do not inherit the scheduler's outer failure policy.
+        self._pd_load_failures = RaidenLoadFailures()
         self.runner: TPUModelRunner | None = None
         self.node_id = dist_utils.get_node_id()
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -5563,14 +5577,15 @@ class TPURaidenConnectorWorker:
                 )
                 return
             # Generic RPC rejection can occur after receiver arming.
-            # Keep the request blocked and accept native terminal
-            # records; only surface recompute after manager failure or
-            # a full post-RPC manager timeout.
+            # Report request errors independently of cleanup and policy.
+            # Receive buffers and recompute still wait for the native terminal
+            # or the existing post-RPC manager timeout.
             self._stage3_controller_accepted.add(destination_req_id)
             deadline = time.perf_counter() + float(
                 dist_utils.get_p2p_wait_pull_timeout()
             )
             self._stage3_pending_controller_failures[destination_req_id] = deadline
+            self._pd_load_failures.failed_req_ids.add(destination_req_id)
             logger.error(
                 "Stage-3 controller transfer outcome uncertain; "
                 "waiting for native terminal state req_id=%s "
@@ -5669,6 +5684,7 @@ class TPURaidenConnectorWorker:
                         time.perf_counter()
                         + float(dist_utils.get_p2p_wait_pull_timeout())
                     )
+                    self._pd_load_failures.failed_req_ids.add(req_id)
 
     def _drain_stage3_pending_submits(self, finished_req_ids: set[str] | None) -> None:
         """Re-attempts parked Stage-3 loads once per scheduler step, paced
@@ -6256,6 +6272,13 @@ class TPURaidenConnectorWorker:
         failed = self._failed_block_ids
         self._failed_block_ids = set()
         return failed
+
+    def take_pd_load_failures(self) -> RaidenLoadFailures | None:
+        results = self._pd_load_failures
+        if not results.failed_req_ids:
+            return None
+        self._pd_load_failures = RaidenLoadFailures()
+        return results
 
     def _wait_for_recving(self, req_ids: set[str]) -> None:
         if not req_ids:

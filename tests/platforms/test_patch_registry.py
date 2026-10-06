@@ -218,6 +218,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_mamba_split_scheduler_block_size",
         "_patch_vllm_offloading_config_build",
         "_patch_vllm_hybrid_kv_load_failure_recovery",
+        "patch_scheduler_init",
         "_patch_vllm_same_step_prefix_hits",
         "patch_disable_eagle_block_drop",
         "_patch_vllm_merge_multimodal_embeddings",
