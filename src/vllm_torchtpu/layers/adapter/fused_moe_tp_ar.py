@@ -224,21 +224,21 @@ def _build_sp_op(mesh, n_ranks: int, topk: int):
             jnp.dot(x, wg.astype(x.dtype), preferred_element_type=jnp.float32)
         )
         k = tw.shape[1]
+        # The expert ids travel as their own int32 array. Packed into the f32
+        # metadata as bit patterns, ids 1..511 are f32 denormals, and XLA lowered
+        # the concatenate to a max fusion that flushed them to 0: every route
+        # landed on expert 0 (every expert-kernel tile full on the Qwen3.5-397B
+        # TP8 twin, 101/101 at 16384 tokens vs 555 mixed tiles with real ids).
         meta_local = jnp.concatenate(
-            [
-                x_s_local[:, None],
-                gate_local,
-                tw.astype(jnp.float32),
-                jax.lax.bitcast_convert_type(ti.astype(jnp.int32), jnp.float32),
-            ],
+            [x_s_local[:, None], gate_local, tw.astype(jnp.float32)],
             axis=1,
         )
         x_q = jax.lax.all_gather(x_q_local, axis, axis=0, tiled=True)
         meta = jax.lax.all_gather(meta_local, axis, axis=0, tiled=True)
+        ti_full = jax.lax.all_gather(ti.astype(jnp.int32), axis, axis=0, tiled=True)
         x_s = meta[:, 0]
         gate = meta[:, 1:2]
         tw_full = meta[:, 2 : 2 + k]
-        ti_full = jax.lax.bitcast_convert_type(meta[:, 2 + k :], jnp.int32)
         n_tok = x_q.shape[0]
         logger.info("Fused TP+SP MoE prefill kernel traced for %d tokens", n_tok)
         return moe_tp_prefill(
