@@ -400,24 +400,22 @@ def recurrent_gdn_per_seq(
     return jnp.stack(out_list, axis=0), jnp.stack(state_list, axis=0)
 
 
-def recurrent_gdn(
+def prepare_recurrent_gdn(
     real_sizes: jax.Array,
     q_compact: jax.Array,
     k_compact: jax.Array,
     v_compact: jax.Array,
     b_compact: jax.Array,
     a_compact: jax.Array,
-    state_prev: jax.Array,
     a_log: jax.Array,
     dt_bias: jax.Array,
     cfg: config.GDNConfig,
-) -> tuple[jax.Array, jax.Array]:
-    """Perform recurrent GDN over input [seq, num_heads, chunk, 1, head_dim].
+) -> tuple[jax.Array, ...]:
+    """Tile-wide preprocessing for `recurrent_gdn_per_seq`.
 
-    The returned state has one checkpoint per window position: [seq,
-    window_size, num_v_heads, kq_head_dim, v_head_dim]. Positions >=
-    real_sizes repeat the last valid state; they are never written back to
-    HBM.
+    Returns (q, k, k_t, v, gating, beta), each with a leading seq_tile_size
+    dimension; slot `idx` of each is the matching argument of
+    `recurrent_gdn_per_seq`.
     """
 
     mask_dtype = get_mask_dtype(cfg.dtypes.compute)
@@ -460,17 +458,47 @@ def recurrent_gdn(
     gating_log = fused_transpose_broadcast(gating_log, src_dim=4, dst_dim=1)
     gating_log = gating_log[:, : cfg.num_v_heads]
 
+    return q_compact, k_compact, k_compact_t, v_compact, gating_log, beta
+
+
+def recurrent_gdn(
+    real_sizes: jax.Array,
+    q_compact: jax.Array,
+    k_compact: jax.Array,
+    v_compact: jax.Array,
+    b_compact: jax.Array,
+    a_compact: jax.Array,
+    state_prev: jax.Array,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    cfg: config.GDNConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """Perform recurrent GDN over input [seq, num_heads, chunk, 1, head_dim].
+
+    The returned state has one checkpoint per window position: [seq,
+    window_size, num_v_heads, kq_head_dim, v_head_dim]. Positions >=
+    real_sizes repeat the last valid state; they are never written back to
+    HBM.
+    """
+
+    per_seq_args = prepare_recurrent_gdn(
+        real_sizes=real_sizes,
+        q_compact=q_compact,
+        k_compact=k_compact,
+        v_compact=v_compact,
+        b_compact=b_compact,
+        a_compact=a_compact,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        cfg=cfg,
+    )
+
     out_list = []
     new_state_list = []
 
     for idx in range(cfg.seq_tile_size):
         out, state = recurrent_gdn_per_seq(
-            q_compact[idx],
-            k_compact[idx],
-            k_compact_t[idx],
-            v_compact[idx],
-            gating_log[idx],
-            beta[idx],
+            *(arg[idx] for arg in per_seq_args),
             state_prev[idx],
             cfg,
         )
