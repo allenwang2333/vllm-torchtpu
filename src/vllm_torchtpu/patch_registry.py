@@ -64,6 +64,7 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_config_hash_ignore_diagnostics", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_disable_compile_ranges", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_piecewise_backend", _ACTIVE),
+    Patch("vllm_torchtpu:_patch_vllm_split_graph_symint", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_reset_compile_wrapper", _ACTIVE),
     # MoE routing and collectives.
     Patch("vllm_torchtpu:_patch_default_moe_runner_select_forward", _ACTIVE),
