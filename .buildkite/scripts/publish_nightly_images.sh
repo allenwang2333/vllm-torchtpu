@@ -25,8 +25,9 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 # change needs only a new schedule, not a code change.
 #
 # With PUBLISH_DOCKERHUB=1 (set by nightly_releases.yml and release_images.yml
-# in vllm-torchtpu-ci, which log in to Docker Hub first) it builds only prod
-# and pushes it to DOCKERHUB_REPO instead: main pushes
+# in vllm-torchtpu-ci, which log in to Docker Hub first) it builds only the
+# DOCKERHUB_TARGET image the yml names (dev for nightly, prod for release) and
+# pushes it to DOCKERHUB_REPO instead: main pushes
 # nightly-YYYYMMDD-<commit>-<vllm> and moves nightly; release/X.Y.Z pushes
 # X.Y.Z and moves latest.
 BRANCH="${BUILDKITE_BRANCH:-$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)}"
@@ -77,7 +78,7 @@ if [[ "${PUBLISH_DOCKERHUB}" == "1" ]]; then
   DOCKERHUB_REPO="${DOCKERHUB_REPO:?DOCKERHUB_REPO must be set when PUBLISH_DOCKERHUB=1}"
   DATE_TAG="${DOCKERHUB_TAG}"
   LATEST_TAG="${DOCKERHUB_LATEST_TAG}"
-  TARGETS=("prod")
+  TARGETS=("${DOCKERHUB_TARGET:?DOCKERHUB_TARGET must be set when PUBLISH_DOCKERHUB=1}")
 else
   # Build and push variants in order of dependency (ci -> dev, prod) so BuildKit layer cache is reused
   TARGETS=("ci" "dev" "prod")

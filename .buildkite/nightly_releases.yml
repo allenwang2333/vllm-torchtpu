@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Publishes the public prod image to Docker Hub as nightly from the scheduled
-# NIGHTLY=1 build of main. As in tpu-inference, it does not wait for tests.
-# Release branches publish from release_images.yml, which waits for all tests.
+# Publishes the dev image to Docker Hub as nightly from the scheduled NIGHTLY=1
+# build of main. As in tpu-inference, it does not wait for tests.
+# Release branches publish the prod image from release_images.yml, which waits
+# for all tests and a manual approval.
 # The internal GAR nightlies (pipeline_nightly_image.yml) are not affected.
 
 steps:
@@ -32,8 +33,10 @@ steps:
       # DOCKERHUB_REPO: "REPLACE_WITH_DOCKERHUB_REPO"
       # TODO(test-only): dummy lowercase repo for a CI dry run; nothing is pushed.
       DOCKERHUB_REPO: "test/vllm-torchtpu"
-      # Makes publish_nightly_images.sh build prod only and push to Docker Hub.
+      # Makes publish_nightly_images.sh build one image and push it to Docker Hub.
       PUBLISH_DOCKERHUB: "1"
+      # Nightly publishes the dev image (the Dockerfile target CI tests run on).
+      DOCKERHUB_TARGET: "dev"
     # TODO(test-only): secret and Docker Hub login disabled for a CI dry run.
     # Restore before merging.
     # TODO(docker-hub): the secret name configured in the Buildkite cluster.
