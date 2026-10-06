@@ -34,7 +34,6 @@ steps:
 
   - label: ":work: Finished - 2"
     key: "finished2"
-    depends_on: finished1
     agents:
       queue: cpu
     commands:
