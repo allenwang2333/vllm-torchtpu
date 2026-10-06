@@ -179,8 +179,7 @@ def _pallas_operand_shapes(jaxpr, found=None):
         found = []
     for eqn in jaxpr.eqns:
         if eqn.primitive.name == "pallas_call":
-            name = str(eqn.params.get("name_and_src_info", ""))
-            found.append((name, [tuple(x.aval.shape) for x in eqn.invars]))
+            found.append([tuple(x.aval.shape) for x in eqn.invars])
             continue
         for param in eqn.params.values():
             for sub in param if isinstance(param, tuple | list) else (param,):
@@ -205,13 +204,14 @@ def test_only_schedule_takes_the_page_table():
     )
     calls = _pallas_operand_shapes(jax.make_jaxpr(_rpa)(*args).jaxpr)
     pt_shape = (MAX_SEQS * PAGES_PER_SEQ,)
-    sched = [c for c in calls if "rpa_metadata_schedule" in c[0]]
-    rpa = [c for c in calls if "rpa_metadata_schedule" not in c[0]]
+    # The schedule is the only pallas_call that reads `distribution` (s32[3]).
+    sched = [c for c in calls if (3,) in c]
+    rpa = [c for c in calls if (3,) not in c]
     assert len(sched) == 2 and len(rpa) == 2, calls
-    for name, shapes in sched:
-        assert pt_shape in shapes, (name, shapes)
-    for name, shapes in rpa:
-        assert pt_shape not in shapes, (name, shapes)
+    for shapes in sched:
+        assert pt_shape in shapes, shapes
+    for shapes in rpa:
+        assert pt_shape not in shapes, shapes
 
 
 @pytest.mark.parametrize("case", list(CASES))
