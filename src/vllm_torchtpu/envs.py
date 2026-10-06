@@ -56,6 +56,8 @@ if TYPE_CHECKING:
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     USE_MOE_FUSED_TP_AR: bool = False
+    MOE_TP_PREFILL_CHUNK_T: int = 0
+    MOE_TP_PREFILL_PREFETCH_DEPTH: int = 3
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -604,6 +606,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # cover the routed experts, the shared expert and the TP all-reduce
     # (layers/adapter/fused_moe_tp_ar.py). Armed once after load.
     "USE_MOE_FUSED_TP_AR": env_bool("USE_MOE_FUSED_TP_AR"),
+    # Token chunk size for overlapping combine with reduce-scatter in
+    # fused_moe_tp_sp (0 disables chunked overlap).
+    "MOE_TP_PREFILL_CHUNK_T": env_nonnegative_int("MOE_TP_PREFILL_CHUNK_T", 0),
+    # Expert weight prefetch depth for expert_mlp in moe_tp_prefill (default 3).
+    "MOE_TP_PREFILL_PREFETCH_DEPTH": env_nonnegative_int(
+        "MOE_TP_PREFILL_PREFETCH_DEPTH", 3
+    ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

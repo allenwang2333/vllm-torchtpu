@@ -30,10 +30,14 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.fused_moe.v2 import host as v2_host
 from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
+    COMBINE_CHUNK,
+    COMBINE_GROUP,
+    COMBINE_LEAD,
+    COMBINE_PARITIES,
     _tile_row_scales,
-    build_combine_kernel,
     combine_step_tokens,
     expert_ffn_fp8,
+    wire_row_and_scale,
 )
 
 FP8 = jnp.float8_e4m3fn
@@ -65,7 +69,9 @@ def _build_expert_kernel(
     """The per-rank expert kernel for a fixed token count and route count.
 
     Slab layout (rows): [0, n_routes) routed rows expert-major, then the
-    shared expert's n_tok rows at n_routes, then tile_m rows of slack.
+    shared expert's n_tok rows at shared_base = cdiv(n_routes, 128) * 128,
+    then tile_m rows of slack. Each row is quantized to FP8 along with its
+    f32 scale at the matching index in pscl_hbm [scale_rows, 128].
 
     Each tile computes on the smallest of n_rungs heights covering its live
     rows and writes exactly its live rows (the DMA extent is traced).
@@ -77,9 +83,10 @@ def _build_expert_kernel(
     rungs = [tile_m * (i + 1) // n_rungs for i in range(n_rungs)]
     lane_blocks = hidden // LANES
     shared = n_experts  # visit-table id of the shared expert
-    slab_rows = n_routes + n_tok + tile_m
+    shared_base = _cdiv(n_routes, LANES) * LANES
+    slab_rows = shared_base + n_tok + tile_m
     scale_rows = _cdiv(slab_rows, LANES) + 1
-    tok_rows = _cdiv(n_routes, LANES) * LANES + window
+    tok_rows = shared_base + window
 
     def kernel(
         # scalar prefetch
@@ -99,12 +106,15 @@ def _build_expert_kernel(
         w2sh_hbm,  # [1, I, H]
         s1sh_hbm,  # [1, 1, 2I]
         s2sh_hbm,  # [1, 1, H]
-        # HBM output
-        part_hbm,  # [slab_rows, lane_blocks, 128] bf16
+        # HBM outputs
+        part_hbm,  # [slab_rows, lane_blocks, 128] fp8
+        pscl_hbm,  # [scale_rows, 128] f32  one output row scale per slab row
         # scratch
         lhs_vm,  # [n_lhs, tile_m, lane_blocks, 128] fp8
         ls_vm,  # [n_lhs, scale_win, 128] f32
-        out_vm,  # [2, tile_m, lane_blocks, 128] bf16
+        out_vm,  # [2, tile_m, lane_blocks, 128] fp8
+        oscl_vm,  # [2, scale_win, 128] f32
+        partial_scl_vm,  # [1, 128] f32
         w1_vm,  # [nbuf, H, 2I]
         w2_vm,  # [nbuf, I, H]
         s1_vm,  # [nbuf, 1, 2I]
@@ -113,6 +123,7 @@ def _build_expert_kernel(
         lhs_sems,  # DMA[n_lhs]
         win_sems,  # DMA[2]
         out_sems,  # DMA[2]
+        oscl_sems,  # DMA[2]
         w_sems,  # DMA[nbuf]
     ):
         n_visit = n_visit_sm[0]
@@ -251,6 +262,20 @@ def _build_expert_kernel(
                 out_sems.at[parity],
             ).wait()
 
+        def oscl_copy(sub_lo, parity, n_sub):
+            return pltpu.make_async_copy(
+                oscl_vm.at[parity, pl.ds(0, n_sub)],
+                pscl_hbm.at[pl.ds(sub_lo, n_sub)],
+                oscl_sems.at[parity],
+            )
+
+        def oscl_wait(parity, n_sub):
+            pltpu.make_async_copy(
+                oscl_vm.at[parity, pl.ds(0, n_sub)],
+                oscl_vm.at[parity, pl.ds(0, n_sub)],
+                oscl_sems.at[parity],
+            ).wait()
+
         # ---- prologue ----
         for k in range(nbuf - 1):
 
@@ -277,7 +302,7 @@ def _build_expert_kernel(
 
         # ---- main loop over tiles ----
         def tile_body(carry):
-            v, t, g, n_out0, n_out1, vi, ti = carry
+            v, t, g, n_out0, n_out1, n_scl0, n_scl1, vi, ti = carry
             p = lax.rem(g, 2)  # out_vm parity
             lslot = lax.rem(g, n_lhs)
 
@@ -309,12 +334,19 @@ def _build_expert_kernel(
             base = tile_base(v, t)
             live = tile_live(v, t)
 
-            # out_vm[p] was last written two tiles ago; free it.
+            # out_vm[p] and oscl_vm[p] were last written two tiles ago; free them.
             n_prev = jnp.where(p == 0, n_out0, n_out1)
+            n_scl_prev = jnp.where(p == 0, n_scl0, n_scl1)
 
             @pl.when(n_prev > 0)
             def _():
                 out_wait(p, n_prev)
+
+            @pl.when(n_scl_prev > 0)
+            def _():
+                oscl_wait(p, n_scl_prev)
+
+            resid = lax.rem(base, jnp.int32(LANES))
 
             def compute(h):
                 act = lhs_vm[lslot, pl.ds(0, h)].reshape(h, hidden)
@@ -322,16 +354,32 @@ def _build_expert_kernel(
                 acc2, mid_s = expert_ffn_fp8(
                     act, act_s, w1_vm[slot], w2_vm[slot], s1_vm[slot]
                 )
-                # Retile into the per-row slab layout while still f32 (8x8
-                # sublane blocks), then pack to bf16: cheaper than retiling the
-                # packed bf16 value.
-                rows = (acc2 * mid_s * s2_vm[slot]).reshape(h, lane_blocks, LANES)
-                rows = rows.astype(jnp.bfloat16)
+                wire_rows, wire_scales = wire_row_and_scale(
+                    acc2,
+                    mid_s,
+                    w2s=s2_vm[slot],
+                    wire_dtype=FP8,
+                    tile_m=h,
+                )
+                rows = wire_rows.reshape(h, lane_blocks, LANES)
+                ws_win = jnp.pad(
+                    wire_scales.reshape(-1), (0, scale_win * LANES - h)
+                ).reshape(scale_win, LANES)
+                rot = pltpu.roll(ws_win, resid, 1)
+                prev_rows = jnp.concatenate([partial_scl_vm[:], rot[:-1]], axis=0)
+                lane = lax.broadcasted_iota(jnp.int32, rot.shape, 1)
+                merged = jnp.where(lane < resid, prev_rows, rot)
+                adv = (resid + live) // LANES
+                nxt_partial = merged[0:1]
+                for s in range(1, scale_win):
+                    nxt_partial = jnp.where(adv == s, merged[s : s + 1], nxt_partial)
+                partial_scl_vm[:] = nxt_partial
                 for par in range(2):
 
                     @pl.when(p == par)
                     def _(par=par):
                         out_vm[par, pl.ds(0, h)] = rows
+                        oscl_vm[par] = merged
 
             for i, h in enumerate(rungs):
                 below = rungs[i - 1] if i else 0
@@ -344,22 +392,42 @@ def _build_expert_kernel(
                         compute(h)
 
             out_copy(base, p, live).start()
+            sub_lo = base // LANES
+            flush_tail = (vn >= n_visit) | (
+                is_shared(vn) & jnp.logical_not(is_shared(v))
+            )
+            n_flush = jnp.where(
+                flush_tail,
+                _cdiv(resid + live, LANES),
+                (resid + live) // LANES,
+            )
+
+            @pl.when(n_flush > 0)
+            def _():
+                oscl_copy(sub_lo, p, n_flush).start()
+
             n_out0 = jnp.where(p == 0, live, n_out0)
             n_out1 = jnp.where(p == 1, live, n_out1)
-            return vn, tn, g + 1, n_out0, n_out1, vi_n, ti_n
+            n_scl0 = jnp.where(p == 0, n_flush, n_scl0)
+            n_scl1 = jnp.where(p == 1, n_flush, n_scl1)
+            return vn, tn, g + 1, n_out0, n_out1, n_scl0, n_scl1, vi_n, ti_n
 
         def cond(carry):
             return carry[0] < n_visit
 
-        _, _, _, n_out0, n_out1, _, _ = lax.while_loop(
-            cond, tile_body, (z, z, z, z, z, vi, ti)
+        _, _, _, n_out0, n_out1, n_scl0, n_scl1, _, _ = lax.while_loop(
+            cond, tile_body, (z, z, z, z, z, z, z, vi, ti)
         )
 
-        for par, n in ((0, n_out0), (1, n_out1)):
+        for par, n, ns in ((0, n_out0, n_scl0), (1, n_out1, n_scl1)):
 
             @pl.when(n > 0)
             def _(par=par, n=n):
                 out_wait(par, n)
+
+            @pl.when(ns > 0)
+            def _(par=par, ns=ns):
+                oscl_wait(par, ns)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     call = pl.pallas_call(
@@ -367,11 +435,13 @@ def _build_expert_kernel(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=4,
             in_specs=[hbm] * 11,
-            out_specs=hbm,
+            out_specs=[hbm, hbm],
             scratch_shapes=(
                 pltpu.VMEM((n_lhs, tile_m, lane_blocks, LANES), FP8),
                 pltpu.VMEM((n_lhs, scale_win, LANES), jnp.float32),
-                pltpu.VMEM((2, tile_m, lane_blocks, LANES), jnp.bfloat16),
+                pltpu.VMEM((2, tile_m, lane_blocks, LANES), FP8),
+                pltpu.VMEM((2, scale_win, LANES), jnp.float32),
+                pltpu.VMEM((1, LANES), jnp.float32),
                 pltpu.VMEM((nbuf, hidden, 2 * inter), FP8),
                 pltpu.VMEM((nbuf, inter, hidden), FP8),
                 pltpu.VMEM((nbuf, 1, 2 * inter), jnp.float32),
@@ -380,11 +450,15 @@ def _build_expert_kernel(
                 pltpu.SemaphoreType.DMA((n_lhs,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((nbuf,)),
             ),
             grid=(),
         ),
-        out_shape=jax.ShapeDtypeStruct((slab_rows, lane_blocks, LANES), jnp.bfloat16),
+        out_shape=[
+            jax.ShapeDtypeStruct((slab_rows, lane_blocks, LANES), FP8),
+            jax.ShapeDtypeStruct((scale_rows, LANES), jnp.float32),
+        ],
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=None if interpret else v2_host.vmem_limit(),
             disable_bounds_checks=True,
@@ -395,7 +469,12 @@ def _build_expert_kernel(
             f"_u{unroll}_m{tile_m}r{n_rungs}_la{lookahead}"
         ),
     )
-    return call, dict(slab_rows=slab_rows, scale_rows=scale_rows, tok_rows=tok_rows)
+    return call, dict(
+        shared_base=shared_base,
+        slab_rows=slab_rows,
+        scale_rows=scale_rows,
+        tok_rows=tok_rows,
+    )
 
 
 @functools.cache
@@ -407,11 +486,12 @@ def routing_plan(topk_ids, n_experts, row_scale, route_valid=None, n_valid=None)
     """Expert-major slab order for the routed rows (XLA), with no scatter or
     gather over the routes.
 
-    One key/value sort orders the routes by expert, carrying each route's id
-    and its token's activation scale; a second sort of that permutation gives
-    its inverse (each route's slab row). Routes of tokens at or past n_valid,
-    and routes where route_valid [T, K] is False, get the sentinel expert E,
-    sort last and are never visited.
+    A packed uint32 sort on ``(expert << 20) | route_idx`` orders the routes
+    stably by expert while permuting ``s_rep`` in lockstep (avoiding a separate
+    dynamic VMEM gather ``row_scale[tok]``); a second sort of ``order`` inverts
+    the permutation. Routes of tokens at or past n_valid, and routes where
+    route_valid [T, K] is False, get the sentinel expert E, sort last and are
+    never visited.
 
     Returns tok [R] (token of each slab row), pos [T, K] (slab row of each
     route), s_sorted [R] (scale of each slab row) and the visit tables.
@@ -419,34 +499,51 @@ def routing_plan(topk_ids, n_experts, row_scale, route_valid=None, n_valid=None)
     n_tok, k = topk_ids.shape
     n_routes = n_tok * k
     e_flat = topk_ids.reshape(-1).astype(jnp.int32)
+    e_flat = jnp.where((e_flat >= 0) & (e_flat < n_experts), e_flat, n_experts)
     iota = jnp.arange(n_routes, dtype=jnp.int32)
     if n_valid is not None:
         e_flat = jnp.where(iota // k < n_valid, e_flat, n_experts)
     if route_valid is not None:
         e_flat = jnp.where(route_valid.reshape(-1), e_flat, n_experts)
-    s_rep = jnp.broadcast_to(row_scale[:, None], (n_tok, k)).reshape(-1)
-    _, order, s_sorted = lax.sort((e_flat, iota, s_rep), num_keys=1, is_stable=True)
-    _, pos = lax.sort((order, iota), num_keys=1, is_stable=False)
-    counts = jnp.sum(
-        (e_flat[None, :] == jnp.arange(n_experts, dtype=jnp.int32)[:, None]).astype(
-            jnp.int32
-        ),
-        axis=1,
+    s_rep = jnp.repeat(row_scale, k)
+    if n_routes < (1 << 20) and n_experts < (1 << 11):
+        key1 = (e_flat.astype(jnp.uint32) << 20) | iota.astype(jnp.uint32)
+        key1_sorted, s_sorted = lax.sort(
+            (key1, s_rep), dimension=0, num_keys=1, is_stable=False
+        )
+        order = (key1_sorted & jnp.uint32((1 << 20) - 1)).astype(jnp.int32)
+    else:
+        _, order, s_sorted = lax.sort(
+            (e_flat, iota, s_rep), dimension=0, num_keys=1, is_stable=True
+        )
+    if n_routes <= (1 << 16):
+        inv_packed = lax.sort(
+            (order.astype(jnp.uint32) << 16) | iota.astype(jnp.uint32),
+            is_stable=False,
+        )
+        pos = (inv_packed & jnp.uint32(0xFFFF)).astype(jnp.int32)
+    else:
+        _, pos = lax.sort((order, iota), dimension=0, num_keys=1, is_stable=False)
+    tok = order // k
+    counts = (e_flat[None, :] == jnp.arange(n_experts, dtype=jnp.int32)[:, None]).sum(
+        axis=1, dtype=jnp.int32
     )
-    base = jnp.cumsum(counts) - counts
+    base = jnp.cumsum(counts, dtype=jnp.int32) - counts
     active = counts > 0
     (visit_e,) = jnp.nonzero(active, size=n_experts + VISIT_SLACK, fill_value=n_experts)
     visit_e = visit_e.astype(jnp.int32)
     n_routed_visits = jnp.sum(active).astype(jnp.int32)
-    counts_x = jnp.concatenate([counts, jnp.zeros((1,), jnp.int32)])
-    base_x = jnp.concatenate([base, jnp.zeros((1,), jnp.int32)])
+    valid_visit = visit_e < n_experts
+    safe_e = jnp.where(valid_visit, visit_e, 0)
+    visit_base = jnp.where(valid_visit, base[safe_e], 0)
+    visit_counts = jnp.where(valid_visit, counts[safe_e], 0)
     return (
-        order // k,
+        tok,
         pos.reshape(n_tok, k),
         s_sorted,
         visit_e,
-        base_x[visit_e],
-        counts_x[visit_e],
+        visit_base,
+        visit_counts,
         n_routed_visits,
     )
 
@@ -469,12 +566,15 @@ def moe_tp_prefill(
     combine_chunks=1,
     reduce_fn=None,
     skip_zero_weight_routes=True,
-    nbuf=3,
+    nbuf=4,
     tile_m=None,
     n_rungs=4,
     gather_unroll=8,
-    lookahead=2,
+    lookahead=3,
     interpret=False,
+    x_quantized=None,
+    shared_gate=None,
+    scatter_ranks=1,
 ):
     """One rank's routed + shared MoE output for prefill-sized token counts.
 
@@ -483,15 +583,19 @@ def moe_tp_prefill(
     s2 likewise [E, H]; shared w1_sh [H, 2I], w2_sh [I, H], s1_sh [2I],
     s2_sh [H], gate wg_sh [H, 1]. topk_weights / topk_ids [T, K].
 
-    reduce_fn (e.g. ``lambda y: lax.psum(y, axis)``) is applied per combine
-    chunk; each chunk's input is tied to the previous chunk's reduced output,
-    so XLA keeps the all-reduces separate and each runs under the next chunk's
-    combine. Without reduce_fn the per-rank partial is returned.
+    reduce_fn (e.g. ``lambda y: lax.psum(y, axis)`` or ``psum_scatter``) is
+    applied per combine chunk; each chunk's input is tied to the previous
+    chunk's reduced output so XLA overlaps each chunk's collective with the
+    next chunk's combine. Without reduce_fn the per-rank partial is returned.
     """
-    n_tok, hidden = x.shape
+    n_experts, hidden, two_i = w1.shape
+    if x_quantized is not None:
+        x_q, x_s = x_quantized
+        n_tok = x_q.shape[0]
+    else:
+        n_tok, hidden = x.shape
     if tile_m is None:
         tile_m = default_tile_m(n_tok)
-    n_experts, _, two_i = w1.shape
     inter = two_i // 2
     n_routes = n_tok * topk_ids.shape[1]
 
@@ -510,22 +614,25 @@ def moe_tp_prefill(
     )
 
     # ---- prep ----
-    x_q, x_s = rowquant_rows(x)
+    x_q, x_s = rowquant_rows(x) if x_quantized is None else x_quantized
     # Padded bucket rows keep their expert ids but carry zero routing weight
     # (TPU_MOE_SKIP_PADDED_TOKENS); their routes are not computed.
     route_valid = (topk_weights != 0) if skip_zero_weight_routes else None
     tok, pos, s_sorted, visit_e, visit_base, visit_rows, n_rv = routing_plan(
         topk_ids, n_experts, x_s, route_valid=route_valid, n_valid=n_valid
     )
-    # The shared expert is one more visit over every token.
+    # The shared expert is one more visit over every token, starting at the
+    # 128-aligned shared_base so its scale sublanes are disjoint from routed.
+    shared_base = dims["shared_base"]
     visit_e = visit_e.at[n_rv].set(n_experts)
-    visit_base = visit_base.at[n_rv].set(n_routes)
+    visit_base = visit_base.at[n_rv].set(shared_base)
     visit_rows = visit_rows.at[n_rv].set(n_tok)
-    ls = jnp.concatenate([s_sorted, x_s])
+    s_sorted_pad = jnp.pad(s_sorted, (0, shared_base - n_routes))
+    ls = jnp.concatenate([s_sorted_pad, x_s])
     ls = jnp.pad(ls, (0, dims["scale_rows"] * LANES - ls.shape[0])).reshape(-1, LANES)
     tok_pad = jnp.pad(tok, (0, dims["tok_rows"] - n_routes))
 
-    part = call(
+    part, pscl = call(
         visit_e,
         visit_base,
         visit_rows,
@@ -544,11 +651,14 @@ def moe_tp_prefill(
     )
 
     # ---- combine: topk routed rows + the gated shared row per token ----
-    gate = jax.nn.sigmoid(
-        jnp.dot(x, wg_sh, preferred_element_type=jnp.float32)
-    )  # [T,1]
+    if shared_gate is not None:
+        gate = shared_gate
+    else:
+        gate = jax.nn.sigmoid(
+            jnp.dot(x, wg_sh, preferred_element_type=jnp.float32)
+        )  # [T,1]
     coef = topk_weights.astype(jnp.float32)
-    shared_pos = n_routes + jnp.arange(n_tok, dtype=jnp.int32)[:, None]
+    shared_pos = shared_base + jnp.arange(n_tok, dtype=jnp.int32)[:, None]
     # Unvisited slab rows are never written; point dead routes at a written
     # row so coef 0 never meets uninitialized memory.
     dead = jnp.zeros(pos.shape, jnp.bool_)
@@ -563,6 +673,7 @@ def moe_tp_prefill(
     pos = jnp.where(dead, shared_pos, pos)
     return combine(
         part,
+        pscl,
         jnp.concatenate([pos, shared_pos], 1),
         jnp.concatenate([coef, gate], 1),
         n_tok,
@@ -570,49 +681,224 @@ def moe_tp_prefill(
         combine_chunks,
         reduce_fn,
         interpret,
+        scatter_ranks=scatter_ranks,
     )
 
 
-def combine(part, pos, coef, n_tok, hidden, n_chunks, reduce_fn, interpret=False):
-    """out[t] = sum_k coef[t, k] * part[pos[t, k]] in n_chunks token chunks,
-    each followed by reduce_fn when given."""
+def _build_tp_combine_kernel(
+    *,
+    t_local,
+    topk,
+    hidden,
+    lane_blocks,
+    scale_len,
+    wire_dtype,
+    out_dtype,
+    interpret=False,
+):
+    """out[i] = sum_k (coef[i, k] * pscl[pos[i, k]]) * part[pos[i, k]].
+
+    Specializes v2's destination combine so the slab row scale table `pscl`
+    rides SMEM alongside `pos` and `coef`, avoiding an XLA dynamic VMEM gather
+    `pscl[pos]` over `t_local * topk` routes before the combine kernel.
+    """
+    del scale_len
+    tb = combine_step_tokens(t_local)
+    steps = t_local // tb
+    gt = COMBINE_GROUP
+    groups = tb // gt
+    lanes = LANES
+
+    def kernel(
+        pos_sm,
+        coef_sm,
+        pscl_sm,
+        arr_hbm,
+        out_hbm,
+        rows_vm,
+        tile_vm,
+        out_vm,
+        row_sems,
+        out_sems,
+    ):
+        def start_row(base, parity, i, k):
+            pltpu.make_async_copy(
+                arr_hbm.at[pos_sm[(base + i) * topk + k]],
+                rows_vm.at[parity, k * tb + i],
+                row_sems.at[parity],
+            ).start(priority=k % 2)
+
+        def reduce_token(base, parity, i):
+            """One token's weighted sum, in the arrival rows' own layout."""
+            acc = None
+            for k in range(topk):
+                idx = (base + i) * topk + k
+                w = coef_sm[idx] * pscl_sm[pos_sm[idx]]
+                term = rows_vm[parity, k * tb + i].astype(jnp.float32) * w
+                acc = term if acc is None else acc + term
+            assert acc is not None
+            tile_vm[i] = acc.astype(out_dtype)
+
+        def one_step(step, parity):
+            nxt = jnp.minimum(step + COMBINE_LEAD, steps - 1) * tb
+            base = step * tb
+            npar = (parity + COMBINE_LEAD) % COMBINE_PARITIES
+            pltpu.make_async_copy(
+                rows_vm.at[parity], rows_vm.at[parity], row_sems.at[parity]
+            ).wait()
+
+            @pl.when(step >= COMBINE_PARITIES)
+            def _():
+                pltpu.make_async_copy(
+                    out_vm.at[parity], out_vm.at[parity], out_sems.at[parity]
+                ).wait()
+
+            def one_chunk(chunk, carry):
+                for u in range(COMBINE_CHUNK):
+                    i = chunk * COMBINE_CHUNK + u
+                    for k in range(topk):
+                        start_row(nxt, npar, i, k)
+                    reduce_token(base, parity, i)
+                return carry
+
+            lax.fori_loop(0, tb // COMBINE_CHUNK, one_chunk, jnp.int32(0))
+            for g in range(groups):
+                out_vm[parity, pl.ds(g * gt, gt)] = tile_vm[pl.ds(g * gt, gt)].reshape(
+                    gt, hidden
+                )
+            pltpu.make_async_copy(
+                out_vm.at[parity],
+                out_hbm.at[pl.ds(step * tb, tb)],
+                out_sems.at[parity],
+            ).start()
+
+        def step_pair(pair, carry):
+            for parity in range(COMBINE_PARITIES):
+                one_step(pair * COMBINE_PARITIES + parity, parity)
+            return carry
+
+        for p in range(COMBINE_LEAD):
+            for i in range(tb):
+                for k in range(topk):
+                    start_row(p * tb, p, i, k)
+        lax.fori_loop(0, steps // COMBINE_PARITIES, step_pair, jnp.int32(0))
+        for p in range(COMBINE_LEAD):
+            pltpu.make_async_copy(rows_vm.at[p], rows_vm.at[p], row_sems.at[p]).wait()
+        for p in range(COMBINE_PARITIES):
+            pltpu.make_async_copy(out_vm.at[p], out_vm.at[p], out_sems.at[p]).wait()
+
+    hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    call = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            in_specs=[hbm],
+            out_specs=hbm,
+            scratch_shapes=(
+                pltpu.VMEM(
+                    (COMBINE_PARITIES, topk * tb, lane_blocks, lanes), wire_dtype
+                ),
+                pltpu.VMEM((tb, lane_blocks, lanes), out_dtype),
+                pltpu.VMEM((COMBINE_PARITIES, tb, hidden), out_dtype),
+                pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
+                pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
+            ),
+            grid=(),
+        ),
+        out_shape=jax.ShapeDtypeStruct((t_local, hidden), out_dtype),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=None if interpret else v2_host.vmem_limit(),
+            disable_bounds_checks=True,
+        ),
+        interpret=pltpu.InterpretParams() if interpret else False,
+        name=f"moe_tp_combine_t{t_local}_k{topk}_b{tb}",
+    )
+
+    def fn(arrivals, pscl, coef, pos):
+        return call(
+            pos.astype(jnp.int32).reshape(-1),
+            coef.reshape(-1),
+            pscl.reshape(-1),
+            arrivals,
+        )
+
+    return fn
+
+
+@functools.cache
+def build_tp_combine_kernel(**kw):
+    return _build_tp_combine_kernel(**kw)
+
+
+def combine(
+    part,
+    pscl,
+    pos,
+    coef,
+    n_tok,
+    hidden,
+    n_chunks,
+    reduce_fn,
+    interpret=False,
+    scatter_ranks=1,
+):
+    """out[t] = sum_k (coef[t, k] * pscl[pos[t, k]]) * part[pos[t, k]] in
+    n_chunks token chunks, each followed by reduce_fn so XLA overlaps each
+    chunk's collective with the next chunk's combine."""
     k = pos.shape[1]
-    if n_tok % n_chunks:
+    if n_tok % n_chunks or (n_tok // n_chunks) % scatter_ranks:
         n_chunks = 1
     tc = n_tok // n_chunks
+    pscl_flat = pscl.reshape(-1)
+    pos_4d = coef_4d = None
+    if n_chunks > 1 and scatter_ranks > 1:
+        tc_local = tc // scatter_ranks
+        pos_4d = pos.reshape(scatter_ranks, n_chunks, tc_local, k)
+        coef_4d = coef.reshape(scatter_ranks, n_chunks, tc_local, k)
     outs = []
     for c in range(n_chunks):
-        sl = slice(c * tc, (c + 1) * tc)
+        if pos_4d is not None and coef_4d is not None:
+            pos_c = pos_4d[:, c, :, :].reshape(tc, k)
+            coef_c = coef_4d[:, c, :, :].reshape(tc, k)
+        else:
+            sl = slice(c * tc, (c + 1) * tc)
+            pos_c = pos[sl]
+            coef_c = coef[sl]
         if combine_step_tokens(tc) and not interpret:
-            fn = build_combine_kernel(
+            fn = build_tp_combine_kernel(
                 t_local=tc,
                 topk=k,
                 hidden=hidden,
                 lane_blocks=hidden // LANES,
-                wire_dtype=jnp.bfloat16,
+                scale_len=pscl_flat.shape[0],
+                wire_dtype=FP8,
                 out_dtype=jnp.bfloat16,
             )
-            y = fn(part, coef[sl], pos[sl])
+            y = fn(part, pscl_flat, coef_c, pos_c)
         else:
-            rows = part.reshape(part.shape[0], hidden)[pos[sl]].astype(jnp.float32)
-            y = jnp.sum(rows * coef[sl][..., None], axis=1).astype(jnp.bfloat16)
+            rows = part.reshape(part.shape[0], hidden)[pos_c].astype(jnp.float32)
+            w = coef_c * pscl_flat[pos_c]
+            y = jnp.sum(rows * w[..., None], axis=1).astype(jnp.bfloat16)
         if reduce_fn is not None:
             if outs:
                 # Tie chunk c's input to chunk c-1's reduced output: XLA can
-                # no longer merge the two all-reduces into one.
+                # no longer merge the per-chunk collectives into one and
+                # overlaps chunk c-1's collective with chunk c's combine.
                 y, _ = lax.optimization_barrier((y, outs[-1]))
             y = reduce_fn(y)
         outs.append(y)
     return outs[0] if len(outs) == 1 else jnp.concatenate(outs, 0)
 
 
-def default_combine_chunks(n_tok, max_chunk_tokens=2048):
+def default_combine_chunks(n_tok, max_chunk_tokens=None):
     """Fewest equal combine chunks of at most max_chunk_tokens tokens.
 
-    The combine's position and coefficient tables live in SMEM (1 MiB): a
-    16384-token call with 11 slots per token does not fit in one chunk. More
-    chunks let each chunk's all-reduce run under the next chunk's combine.
+    The combine's position, coefficient, and scale tables live in SMEM (1 MiB),
+    and splitting >=2048 tokens into >=2 chunks lets each chunk's all-reduce /
+    reduce-scatter overlap under the next chunk's combine.
     """
+    if max_chunk_tokens is None:
+        max_chunk_tokens = 1024 if n_tok <= 3072 else 2048
     for n in range(1, n_tok + 1):
         if n_tok % n == 0 and n_tok // n <= max_chunk_tokens:
             return n
