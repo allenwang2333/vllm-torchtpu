@@ -95,6 +95,7 @@ def _fake_runner(method, is_async, verify, propose):
         ),
         scheduler_config=SimpleNamespace(async_scheduling=is_async),
         _is_async_drafter=method == "mtp",
+        _is_dspark_pd_producer=False,
         is_pooling_model=False,
         drafter=SimpleNamespace(),
         spec_decode_manager=SimpleNamespace(propose_draft_token_ids=propose),

@@ -3444,14 +3444,22 @@ class TestTPURaidenConnectorWorker:
             uuid=765,
             local_block_ids=[12],
             num_tokens=1,
-            expiration_time=time.perf_counter() - 1.0,
+            expiration_time=-1.0,  # Scheduler clock is not the worker clock.
         )
 
         with (
             patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True),
+            patch(f"{_MOD}.time.perf_counter", return_value=100.0) as clock,
+            patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=10.0),
         ):
             worker.process_send_load(meta)
+            assert (
+                worker._stage3_registered_sends["unconsumed"].expiration_time == 110.0
+            )
+            assert worker.get_finished() == (set(), set())
+            assert facade.cancel_request_blocks_calls == []
+            clock.return_value = 111.0
             assert worker.get_finished() == ({"unconsumed"}, set())
 
         assert facade.cancel_request_blocks_calls == [
@@ -3486,14 +3494,18 @@ class TestTPURaidenConnectorWorker:
             uuid=766,
             local_block_ids=[13],
             num_tokens=1,
-            expiration_time=time.perf_counter() - 1.0,
+            expiration_time=-1.0,  # Scheduler clock is not the worker clock.
         )
 
         with (
             patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True),
+            patch(f"{_MOD}.time.perf_counter", return_value=100.0) as clock,
+            patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=10.0),
         ):
             worker.process_send_load(meta)
+            assert worker._stage3_registered_sends["claimed"].expiration_time == 110.0
+            clock.return_value = 111.0
             assert worker.get_finished() == (set(), set())
 
         assert facade.cancel_request_blocks_calls == [

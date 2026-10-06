@@ -3454,6 +3454,7 @@ class TPUModelRunner(GPUModelRunner):
         spec = self.speculative_config
         if num_chunks > 0 and spec is not None and spec.use_eagle():
             if self._is_dspark_pd_producer:
+                assert isinstance(self.drafter, DFlashProposer)
                 # Busy producers only project context KV; pairing a draft
                 # forward here would emit collectives with no busy-rank peer.
                 self.drafter.run_dp_dummy_context(num_chunks)
@@ -4622,6 +4623,7 @@ class TPUModelRunner(GPUModelRunner):
                     )
 
         if self._is_dspark_pd_producer:
+            assert isinstance(self.drafter, DFlashProposer)
             self.drafter.prepare_prefill_handoff()
             # Context projections are deferred TPU graphs. A hardware-only
             # barrier does not materialize their writes before Raiden reads.
