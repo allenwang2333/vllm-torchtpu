@@ -169,6 +169,56 @@ def inner_kernel(
     # NOTE: Ideally, we want to move this branching logic into gdn.py. However,
     # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
     # Passing refs into gdn.py breaks strict separation of concerns.
+    if cfg.use_recurrent and not cfg.is_kda and carry_recurrent_scratch_ref is None:
+        # Decode / verify-window tiles: the per-slot delta rule dominates the
+        # tile and a padded slot (r_size 0) would run it in full only for its
+        # result to be dropped (its copy_out DMAs are zero-sized). Guard each
+        # slot's compute and stores on its own validity.
+        q_compact, k_compact, v_compact, b_compact, a_compact = (
+            vmem_ldst.load_activation_as_compact(
+                qkv_vreg=qkv_out_compact,
+                qkv_vmem_ref=qkv_slot_ref,
+                b_vmem_ref=b_slot_ref,
+                a_vmem_ref=a_slot_ref,
+                cfgs=cfg,
+            )
+        )
+        per_seq_args = compute_gdn.prepare_recurrent_gdn(
+            real_sizes=real_sizes,
+            q_compact=q_compact,
+            k_compact=k_compact,
+            v_compact=v_compact,
+            b_compact=b_compact,
+            a_compact=a_compact,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            cfg=cfg,
+        )
+
+        for idx in range(cfg.seq_tile_size):
+            # pl.when traces the body here, so `idx` is this iteration's.
+            @pl.when(metadata_ref.p_id_to_r_size[p_id, idx] > 0)
+            def _():
+                slot_out, slot_state = compute_gdn.recurrent_gdn_per_seq(
+                    *(arg[idx] for arg in per_seq_args),
+                    prev_recurrent[idx],
+                    cfg,
+                )
+                out_slot_ref[idx] = slot_out.astype(out_slot_ref.dtype)
+                if cfg.state_plan is None:
+                    recurrent_slot_ref[idx] = slot_state.astype(
+                        recurrent_slot_ref.dtype
+                    )
+                else:
+                    for t in range(cfg.window_size):
+                        vmem_ldst.store_state_region(
+                            recurrent_slot_ref.at[idx, t],
+                            cfg.state_plan.recurrent,
+                            slot_state[t],
+                        )
+
+        return
+
     if cfg.use_recurrent:
         recurrent_fn = (
             compute_kda.recurrent_kda if cfg.is_kda else compute_gdn.recurrent_gdn
