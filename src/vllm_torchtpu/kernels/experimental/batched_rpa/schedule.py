@@ -203,7 +203,10 @@ class RpaSchedule:
     is_last_k: SmemWrapper  # [steps, batch]
     do_writeback: SmemWrapper  # [steps, batch]
     dma_q: SmemWrapper  # [steps, batch, 2]
-    dma_kv_cache: SmemWrapper  # [steps, batch, bkv_p_cache, 3]
+    # [steps, batch, bkv_p_cache, 3]: (HBM page id, dst VMEM offset, size). The
+    # page id is resolved from `page_indices` here, so the RPA kernel does not
+    # need the page table at all.
+    dma_kv_cache: SmemWrapper
     dma_kv_new: SmemArrayOfStructs  # [steps, batch, bkv_p_new]
     total_wait_kv_in: SmemWrapper  # [steps]
     total_wait_kv_out: SmemWrapper  # [steps]
@@ -265,7 +268,7 @@ class RpaSchedule:
         batch_idx: jax.typing.ArrayLike,
         page_idx: jax.typing.ArrayLike,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        # 0: src_hbm, 1: dst_vmem, 2: size
+        # 0: src HBM page id (resolved), 1: dst_vmem, 2: size
         src_off = self.dma_kv_cache[step, batch_idx, page_idx, 0]
         dst_off = self.dma_kv_cache[step, batch_idx, page_idx, 1]
         sz = self.dma_kv_cache[step, batch_idx, page_idx, 2]
@@ -565,6 +568,7 @@ class BaseMetadataComputer:
         *,
         cfgs: configs.RpaConfigs,
         extra_refs: Sequence[jax.Ref] = (),
+        page_indices_ref: jax.Ref | None = None,
         **kwargs,
     ):
         self.schedule = schedule
@@ -572,6 +576,18 @@ class BaseMetadataComputer:
         self.dma_sem = dma_sem
         self.cfgs = cfgs
         self.extra_refs = extra_refs
+        self.page_indices_ref = page_indices_ref
+
+    def page(self, flat_idx: jax.typing.ArrayLike) -> jax.Array:
+        """HBM page id of flat page-table slot `seq * pages_per_seq + page`.
+
+        Descriptors carry resolved page ids rather than page-table slots, so the
+        page table is read once per step here instead of being scalar-prefetched
+        whole into SMEM by every RPA launch. Every slot written is in
+        `[0, num_page_indices)`: callers clamp the page to `pages_per_seq - 1`
+        and `s_idx < num_seqs`.
+        """
+        return self.page_indices_ref[flat_idx]
 
     @jax.named_scope("k_loop")
     def k_loop(
@@ -617,7 +633,9 @@ class BaseMetadataComputer:
             dma_sz = kv_left_frm_cache - dst_vmem
             dma_sz = jnp.clip(dma_sz, 0, cfgs.serve.page_size)
 
-            src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
+            src_hbm = self.page(
+                jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
+            )
 
             if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
                 dma_valid = jnp.where(dma_sz > 0, 1, 0)
@@ -667,7 +685,7 @@ class BaseMetadataComputer:
                     (kv_len_start + slot_start) >> cfgs.serve.page_size_log2,
                     cfgs.serve.pages_per_seq - 1,
                 )
-                dst_hbm = s_idx * cfgs.serve.pages_per_seq + p_idx
+                dst_hbm = self.page(s_idx * cfgs.serve.pages_per_seq + p_idx)
                 wb_val = jnp.where(dma_sz > 0, 1, 0)
 
                 dma_entry.fetch_hbm[...] = new_page_start
@@ -682,7 +700,7 @@ class BaseMetadataComputer:
                 )
                 p_off = (kv_len_start + dst_vmem) & cfgs.serve.page_size_mask
                 dst_hbm = (
-                    (s_idx * cfgs.serve.pages_per_seq + p_idx)
+                    self.page(s_idx * cfgs.serve.pages_per_seq + p_idx)
                     << cfgs.serve.page_size_log2
                 ) | p_off
 
@@ -841,6 +859,7 @@ def rpa_metadata_schedule_kernel(
     kv_cache_lens_ref: jax.Ref,
     kv_new_lens_ref: jax.Ref,
     distribution_ref: jax.Ref,
+    page_indices_ref: jax.Ref,
     extra_scalars_ref: Sequence[jax.Ref],
     # Outputs.
     schedule_hbm_ref: RpaSchedule,
@@ -875,6 +894,9 @@ def rpa_metadata_schedule_kernel(
         kv_new_lens_ref: [max_num_seqs]. New kv length of each sequence.
         distribution_ref: [3]. Cumulative sum of number of decode, prefill, and
             mixed
+        page_indices_ref: [max_num_seqs * pages_per_seq]. kv cache page table.
+            Descriptors store the page ids read from it, so the RPA kernel that
+            consumes the schedule needs no page table of its own.
         extra_scalars_ref: Additional scalar refs for custom metadata computers.
         schedule_hbm_ref: HBM memory that will store output of the kernel.
         schedule_ref: Scratch memory where schedule results gets written.
@@ -890,6 +912,7 @@ def rpa_metadata_schedule_kernel(
         dma_sem=dma_sem,
         cfgs=cfgs,
         extra_refs=extra_scalars_ref,
+        page_indices_ref=page_indices_ref,
     )
     loop_carry = computer.compute(
         cu_q_lens_ref=cu_q_lens_ref,
@@ -919,6 +942,7 @@ def generate_rpa_metadata(
     kv_cache_lens: jax.Array,
     kv_new_lens: jax.Array,
     distribution: jax.Array,
+    page_indices: jax.Array,
     cfgs: configs.RpaConfigs,
     *,
     computer_cls: type[BaseMetadataComputer] = BaseMetadataComputer,
@@ -938,7 +962,7 @@ def generate_rpa_metadata(
         ),
         out_shape=schedule_hbm.out_shapes(),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=6,
+            num_scalar_prefetch=7,
             in_specs=[],
             out_specs=schedule_hbm.out_specs(),
             scratch_shapes=[
@@ -954,5 +978,6 @@ def generate_rpa_metadata(
         kv_cache_lens,
         kv_new_lens,
         distribution,
+        page_indices,
         extra_scalars,
     )

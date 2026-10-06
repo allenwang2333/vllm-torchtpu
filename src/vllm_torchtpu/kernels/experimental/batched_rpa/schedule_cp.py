@@ -148,16 +148,16 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                         1,
                         0,
                     )
-                    sched.dma_kv_cache[step, target_lane, i, 0] = src_hbm_cp
+                    sched.dma_kv_cache[step, target_lane, i, 0] = self.page(src_hbm_cp)
                 else:  # CACHE_ONLY
                     src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
                     dma_valid = jnp.where(dma_sz > 0, 1, 0)
-                    sched.dma_kv_cache[step, target_lane, i, 0] = src_hbm
+                    sched.dma_kv_cache[step, target_lane, i, 0] = self.page(src_hbm)
                 sched.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
                 sched.dma_kv_cache[step, target_lane, i, 2] = dma_valid
             else:
                 src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
-                sched.dma_kv_cache[step, target_lane, i, 0] = src_hbm
+                sched.dma_kv_cache[step, target_lane, i, 0] = self.page(src_hbm)
                 sched.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
                 if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
                     sched.dma_kv_cache[step, target_lane, i, 2] = 0
@@ -194,7 +194,7 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                     cfgs.serve.pages_per_seq * cp_group_size - 1,
                 )
                 local_slot = p_idx // cp_group_size
-                dst_hbm = s_idx * cfgs.serve.pages_per_seq + local_slot
+                dst_hbm = self.page(s_idx * cfgs.serve.pages_per_seq + local_slot)
                 wb_val = jnp.where(
                     (dma_sz > 0) & (p_idx % cp_group_size == self.rank), 1, 0
                 )
@@ -212,7 +212,7 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                 p_off = tok_idx & cfgs.serve.page_size_mask
                 local_slot = p_idx // cp_group_size
                 dst_hbm = (
-                    (s_idx * cfgs.serve.pages_per_seq + local_slot)
+                    self.page(s_idx * cfgs.serve.pages_per_seq + local_slot)
                     << cfgs.serve.page_size_log2
                 ) | p_off
                 wb_val = jnp.where(
