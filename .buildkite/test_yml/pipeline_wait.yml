@@ -21,12 +21,9 @@ steps:
     commands:
       - sleep 10
 
-  - label: ":block: "
+  - block: ":block: "
     key: "block"
-    agents:
-      queue: cpu
-    commands: |
-      echo "waiting for approval"
+    prompt: "All tests passed. continue?"
 
   - label: ":work: Finished"
     key: "finished"
