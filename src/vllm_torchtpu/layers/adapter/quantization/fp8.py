@@ -1403,7 +1403,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             f"scale={list(layer.weight_scale.shape)}, "
             f"requant_block_size={scale_desc}"
         )
-        _maybe_enable_rowquant(layer, self.prefix)
+        _maybe_enable_rowquant(layer, getattr(layer, "prefix", "") or self.prefix)
 
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None

@@ -29,7 +29,10 @@ import jax.numpy as jnp
 import pytest
 import torch
 
-from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    _quantized_matmul_jax,
+)
 from vllm_torchtpu.layers.adapter.quantization.fp8 import (
     VllmFp8Config,
     VllmFp8LinearMethodTPU,
@@ -470,6 +473,47 @@ class TestFp8LinearRuntimeQuant:
             (batch, out_dim), float(in_dim), device=device, dtype=torch.bfloat16
         )
         assert torch.allclose(result, expected, rtol=0.01, atol=0.01)
+
+    @pytest.mark.parametrize("keep_layout", [False, True])
+    @pytest.mark.parametrize("rows", [8, 48, 96])
+    def test_rowquant_apply_matches_xla_path(
+        self, device, monkeypatch, keep_layout, rows
+    ):
+        """TPU_FP8_ROWQUANT_LAYERS routes apply() through rowquant_matmul on
+        <= TPU_FP8_ROWQUANT_MAX_ROWS rows, bit-exact with the XLA path."""
+        if device.type != "tpu":
+            pytest.skip("Pallas quantized matmul bridge requires TPU.")
+        from vllm_torchtpu.layers.adapter.linear_common import ROWQUANT_ATTR
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+            _maybe_enable_rowquant,
+        )
+
+        n_in, n_out = 1024, 512
+        torch.manual_seed(0)
+        w = (torch.randn(n_in, n_out) * 100).clamp(-448, 448).to(torch.float8_e4m3fn)
+        if keep_layout:
+            w = w.t().contiguous()  # [n_out, n_in], as kept for a raw consumer
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(w.to(device), requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(
+            (torch.rand(n_out) * 1e-3).to(device), requires_grad=False
+        )
+        if keep_layout:
+            setattr(layer, KEEP_VLLM_LAYOUT_ATTR, True)
+        x = (torch.randn(rows, n_in) * 3).to(torch.bfloat16)
+        x[1] = 0
+        x = x.to(device)
+        method = VllmFp8LinearMethodTPU(FakeQuant(weight_block_size=[128, 128]))
+        ref = method.apply(layer, x).cpu()
+
+        monkeypatch.setenv("TPU_FP8_ROWQUANT_LAYERS", "proj_a,proj_b")
+        monkeypatch.setenv("TPU_FP8_ROWQUANT_MAX_ROWS", "64")
+        _maybe_enable_rowquant(layer, "model.layers.0.proj_c")
+        assert getattr(layer, ROWQUANT_ATTR, None) is None
+        _maybe_enable_rowquant(layer, "model.layers.0.proj_b")
+        assert getattr(layer, ROWQUANT_ATTR) == ("nk" if keep_layout else "kn")
+        out = method.apply(layer, x).cpu()
+        assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
 
     def test_blockwise_runtime_scale_shape(self, device, monkeypatch):
         """ullm blockwise env gate changes dense-linear runtime scale layout."""

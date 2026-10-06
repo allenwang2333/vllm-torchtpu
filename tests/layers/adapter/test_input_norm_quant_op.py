@@ -1,0 +1,88 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""TPU_INPUT_NORM_QUANT against the served path on TPU: GemmaRMSNorm (torch,
+lowered by XLA), then the fp8 linear's own activation quant and matmul
+(`quantized_matmul`). Run with --use-tpu."""
+
+import pytest
+import torch
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+
+from vllm_torchtpu.layers.adapter import input_norm_quant_op as inq
+from vllm_torchtpu.layers.adapter import linear_common
+
+K, N, EPS = 4096, 2560, 1e-6
+
+
+def _setup(device, rows, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    x = (torch.randn(rows, K, generator=g) * 3).to(torch.bfloat16)
+    r = torch.randn(rows, K, generator=g).to(torch.bfloat16)
+    if rows > 2:
+        x[1] = 0
+        r[1] = 0  # an all-zero row: scale 1, q 0
+    norm = GemmaRMSNorm(K, eps=EPS)
+    norm.weight.data = (torch.randn(K, generator=g) * 0.1).to(torch.bfloat16)
+    w = (torch.randn(K, N, generator=g) * 100).clamp(-448, 448).to(torch.float8_e4m3fn)
+    ws = torch.rand(N, generator=g) * 1e-3
+    return (x.to(device), r.to(device), norm.to(device), w.to(device), ws.to(device))
+
+
+def _same(a, b):
+    a, b = a.cpu(), b.cpu()
+    if a.dtype == torch.float8_e4m3fn:
+        a, b = a.view(torch.uint8), b.view(torch.uint8)
+    elif a.dtype == torch.bfloat16:
+        a, b = a.view(torch.int16), b.view(torch.int16)
+    return torch.equal(a, b)
+
+
+@pytest.mark.parametrize("emit_y", [True, False])
+@pytest.mark.parametrize("with_residual", [True, False])
+@pytest.mark.parametrize("rows", [4, 8, 48, 1024])
+def test_matches_norm_then_fp8_linear(device, rows, with_residual, emit_y):
+    if device.type != "tpu":
+        pytest.skip("Pallas kernel on TPU.")
+    x, r, norm, w, ws = _setup(device, rows)
+    if with_residual:
+        y_ref, r_ref = norm(x, r)
+        out = inq._build_op(EPS, True, emit_y)(x, r, norm.weight)
+    else:
+        y_ref, r_ref = norm(x), x
+        out = inq._build_op(EPS, False, emit_y)(x, norm.weight)
+    out = list(out)
+    y = out.pop(0) if emit_y else None
+    ro = out.pop(0) if with_residual else x
+    q, s = out
+    if emit_y:
+        assert _same(y, y_ref)
+    assert _same(ro, r_ref)
+    # The site end to end: pre-quantized matmul vs the fp8 linear on y_ref.
+    ref = linear_common.quantized_matmul(y_ref, w, ws)
+    got = linear_common.quantized_matmul_prequant(q, s, w, ws)
+    assert _same(got, ref)
+
+
+def test_positive_control(device):
+    """The end-to-end comparison above fails when one channel of the norm
+    weight is perturbed by ~1%."""
+    if device.type != "tpu":
+        pytest.skip("Pallas kernel on TPU.")
+    x, r, norm, w, ws = _setup(device, 8)
+    ref = linear_common.quantized_matmul(norm(x, r)[0], w, ws)
+    bad_w = norm.weight.detach().clone()
+    bad_w[17] = bad_w[17] * 1.01 + 0.01
+    _, _, q, s = inq._build_op(EPS, True, True)(x, r, bad_w)
+    got = linear_common.quantized_matmul_prequant(q, s, w, ws)
+    assert not _same(got, ref)

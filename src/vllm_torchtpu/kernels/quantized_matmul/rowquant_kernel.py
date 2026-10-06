@@ -59,7 +59,7 @@ def _kernel(x_ref, w_ref, ws_ref, o_ref, xq_ref, xs_ref, *, w_kn: bool):
         xq_ref[...], w_ref[...], dims, preferred_element_type=jnp.float32
     )
     acc = acc * xs_ref[...]
-    acc = acc * ws_ref[...]
+    acc = acc * ws_ref[...][None, :]
     o_ref[...] = acc.astype(o_ref.dtype)
 
 
@@ -75,19 +75,25 @@ def default_tiles(m: int, k: int, n: int, w_kn: bool) -> tuple[int, int]:
         tm = _round_up(m, 32)
     else:
         tm = next((t for t in (512, 256, 128) if m % t == 0), 256)
-    align = 128 if w_kn else 32
-    want = max(align, _TARGET_W_TILE_BYTES // k // align * align)
+    # Output tiles: legal for the 1-D scale block (the whole n, a multiple of
+    # 1024, or a power of two >= 128) and dividing n, near the target bytes.
+    want = max(128, _TARGET_W_TILE_BYTES // k)
     tn = n
     if n > want:
         tn = next(
-            (t for t in range(want, align - 1, -align) if n % t == 0),
+            (
+                t
+                for t in range(want // 128 * 128, 127, -128)
+                if n % t == 0 and (t % 1024 == 0 or (t & (t - 1)) == 0)
+            ),
             n,
         )
     return tm, tn
 
 
 @functools.partial(
-    jax.jit, static_argnames=("w_kn", "tm", "tn", "out_dtype", "interpret")
+    jax.jit,
+    static_argnames=("w_kn", "tm", "tn", "out_dtype", "w_hbm", "interpret"),
 )
 def rowquant_matmul(
     x: jax.Array,
@@ -98,9 +104,15 @@ def rowquant_matmul(
     tm: int | None = None,
     tn: int | None = None,
     out_dtype=None,
+    w_hbm: bool = False,
     interpret: bool = False,
 ) -> jax.Array:
-    """x [m, k] bf16; w_q fp8 [k, n] (``w_kn``) or [n, k]; w_s [n] -> [m, n]."""
+    """x [m, k] bf16; w_q fp8 [k, n] (``w_kn``) or [n, k]; w_s [n] -> [m, n].
+
+    ``w_hbm`` pins the weight operand to HBM, so XLA does not stage the whole
+    weight into VMEM with a copy before the call; the kernel pipeline streams
+    it from HBM instead.
+    """
     m, k = x.shape
     if w_kn:
         kw, n = w_q.shape
@@ -116,7 +128,9 @@ def rowquant_matmul(
     tn = dtn if tn is None else tn
     if n % tn:
         raise ValueError(f"output tile {tn} must divide n={n}")
-    ws = w_s.astype(jnp.float32).reshape(1, n)
+    ws = w_s.astype(jnp.float32)
+    if w_hbm and not interpret:
+        w_q = pltpu.with_memory_space_constraint(w_q, pltpu.HBM)
     grid = (pl.cdiv(m, tm), n // tn)
     if w_kn:
         w_spec = pl.BlockSpec((k, tn), lambda i, j: (0, j))
@@ -133,7 +147,7 @@ def rowquant_matmul(
         in_specs=[
             pl.BlockSpec((tm, k), lambda i, j: (i, 0)),
             w_spec,
-            pl.BlockSpec((1, tn), lambda i, j: (0, j)),
+            pl.BlockSpec((tn,), lambda i, j: (j,)),
         ],
         out_specs=pl.BlockSpec((tm, tn), lambda i, j: (i, j)),
         out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),

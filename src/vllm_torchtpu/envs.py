@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     TPU_FP8_ROWQUANT_LAYERS: str = ""
     TPU_FP8_ROWQUANT_MAX_ROWS: int = 64
     TPU_GDN_IN_PROJ_KN: bool = False
+    TPU_INPUT_NORM_QUANT: bool = False
     TPU_FUSED_QK_NORM_ROPE: bool = False
     TPU_RPA_DECODE_BATCHED: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -721,6 +722,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Store the GDN in_proj_qkvz weight in the canonical (k, n) layout when PCP
     # streaming does not read it raw (it validates [n_out, n_in]).
     "TPU_GDN_IN_PROJ_KN": env_bool("TPU_GDN_IN_PROJ_KN"),
+    # Run a Qwen3-Next / Qwen3.5 decoder layer's input (residual add +) RMS norm
+    # and its fp8 input projection's activation quantization as one kernel
+    # (layers/adapter/input_norm_quant_op.py). Needs TPU_ATTN_MOE_OVERLAP.
+    "TPU_INPUT_NORM_QUANT": env_bool("TPU_INPUT_NORM_QUANT"),
     # Run the gated q split, q/k RMS norms and NeoX rope of Qwen3NextAttention
     # as one kernel on token buckets of up to 64 rows.
     "TPU_FUSED_QK_NORM_ROPE": env_bool("TPU_FUSED_QK_NORM_ROPE"),
