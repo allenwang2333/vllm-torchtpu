@@ -123,6 +123,7 @@ _TPU_DUAL_DEVICE_GENERATIONS = ("v7", "tpu7x")
 
 # TPU v8i / TPU8i generations.
 _TPU_8I_GENERATIONS = ("v8i", "tpu8i")
+_DS_V4_ARCHS = ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM")
 
 
 def get_tpu_multihost_topology(
@@ -392,6 +393,7 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
+        "VLLM_DSV41_CED",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -644,9 +646,8 @@ class TpuPlatform(Platform):
             else PallasAttentionBackend
         )
         supported = [layout.name for layout in backend.supported_kv_cache_layouts()]
-        if (
-            vllm_config.model_config is not None
-            and "DeepseekV4ForCausalLM" in vllm_config.model_config.architectures
+        if vllm_config.model_config is not None and any(
+            a in _DS_V4_ARCHS for a in vllm_config.model_config.architectures
         ):
             supported = ["BLHNC"]
         layout = resolve_kv_cache_layout(vllm_config, [supported])
@@ -736,15 +737,18 @@ class TpuPlatform(Platform):
         from vllm.config.compilation import DynamicShapesType
 
         dynamic_shapes_config = compilation_config.dynamic_shapes_config
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
         if (
-            1 in compilation_config.compile_sizes
+            any(s <= tp_size for s in compilation_config.compile_sizes)
             and dynamic_shapes_config.type == DynamicShapesType.BACKED
         ):
             dynamic_shapes_config.type = DynamicShapesType.BACKED_SIZE_OBLIVIOUS
             logger.info(
-                "compile_sizes contains 1, which backed dynamic shapes "
-                "cannot compile (0/1 specialization); switching to "
-                "backed_size_oblivious dynamic shapes."
+                "compile_sizes contains size <= tp_size (%d), which backed "
+                "dynamic shapes cannot compile (0/1 specialization on "
+                "token-sharded dims); switching to backed_size_oblivious "
+                "dynamic shapes.",
+                tp_size,
             )
 
         model_config = vllm_config.model_config
@@ -1005,7 +1009,7 @@ class TpuPlatform(Platform):
                 )
                 or []
             )
-            is_ds_v4 = any("DeepseekV4ForCausalLM" in a for a in architectures)
+            is_ds_v4 = any(name in a for a in architectures for name in _DS_V4_ARCHS)
 
             if is_ds_v4 and not cache_config.user_specified_block_size:
                 # DSv4 pages hold compressed rows. Its backend's
@@ -1029,7 +1033,7 @@ class TpuPlatform(Platform):
                 update_tpu_block_size_and_slot_config(vllm_config, backend_cls)
 
             min_page_size = backend_cls.get_min_page_size(vllm_config)
-            if min_page_size > cache_config.block_size:
+            if not is_ds_v4 and min_page_size > cache_config.block_size:
                 logger.warning(
                     "Increase the page size from %s to %s to make sure there's"
                     "no SMEM OOM",

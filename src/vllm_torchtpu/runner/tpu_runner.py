@@ -814,6 +814,10 @@ class TPUModelRunner(GPUModelRunner):
         )
         self.seq_lens_np = self.seq_lens_cpu.numpy()
         self._block_table_stage_cpu: torch.Tensor | None = None
+        self._block_tables_dirty: bool = True
+        self._cached_bt_key: tuple[Any, ...] | None = None
+        self._cached_staged_block_tables: dict[int, torch.Tensor] | None = None
+        self._cached_staged_mamba_products: dict[int, Any] | None = None
         if self.supports_mm_inputs:
             self.is_mm_embed_cpu = torch.zeros(
                 self.max_num_tokens,
@@ -1415,6 +1419,7 @@ class TPUModelRunner(GPUModelRunner):
                     j -= 1
                 else:
                     self.input_batch.swap_states(i, j)
+                    self._block_tables_dirty = True
                     i += 1
                     j -= 1
             if i == j and segment(self.input_batch.req_ids[i]) <= bound:
@@ -1519,6 +1524,9 @@ class TPUModelRunner(GPUModelRunner):
             return self.kv_cache_manager.get_kv_cache_spec()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        self._block_tables_dirty = True
+        self._cached_bt_key = None
+        self._cached_staged_block_tables = None
         with set_current_vllm_config(self.vllm_config):
             self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
 
@@ -1737,6 +1745,7 @@ class TPUModelRunner(GPUModelRunner):
                 crossings.append((row, prev, curr))
         if not crossings:
             return
+        self._block_tables_dirty = True
 
         # Speculative decoding: the checkpoint group slides with the state
         # column. vLLM's MambaManager appends one block and never shifts, so
@@ -2384,7 +2393,22 @@ class TPUModelRunner(GPUModelRunner):
             if use_page_local_copy or use_dense_copy
             else scheduler_output
         )
+        prev_num_reqs = len(self.input_batch.req_id_to_index)
+        has_new_blocks = any(
+            nb is not None and any(b for b in nb)
+            for nb in scheduler_output.scheduled_cached_reqs.new_block_ids
+        )
+        if (
+            invalidated_req_ids
+            or scheduler_output.scheduled_new_reqs
+            or len(scheduler_output.num_scheduled_tokens) != prev_num_reqs
+            or has_new_blocks
+            or copies
+        ):
+            self._block_tables_dirty = True
         result = super()._update_states(base_output)
+        if len(self.input_batch.req_id_to_index) != prev_num_reqs:
+            self._block_tables_dirty = True
         # Copy after the base zeroes new blocks (the CoW dst is one of them).
         if use_page_local_copy:
             self._apply_kv_cache_block_copies(copies)
@@ -2651,6 +2675,28 @@ class TPUModelRunner(GPUModelRunner):
             num_draft_per_req,
         )
 
+    def _maybe_prefetch_engram(
+        self, layout_plan, req_indices: np.ndarray, positions_np: np.ndarray
+    ) -> None:
+        fn = self.__dict__.get("_engram_prefetch_fn", False)
+        if fn is False:
+            fn = getattr(
+                getattr(self.model, "model", None), "prefetch_engram_prefill", None
+            )
+            self._engram_prefetch_fn = fn
+        if fn is None:
+            return
+        known = positions_np < self.input_batch.num_prompt_tokens[req_indices]
+        if layout_plan.kind is not SequenceLayoutKind.ALL:
+            known[:] = False
+        fn(
+            self.input_batch.token_ids_cpu,
+            req_indices,
+            positions_np,
+            known,
+            layout_plan.global_padded_num_tokens,
+        )
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2828,6 +2874,7 @@ class TPUModelRunner(GPUModelRunner):
             target_num_reqs=target_num_reqs,
             padded_num_reqs=padded_num_reqs,
         )
+        self._maybe_prefetch_engram(layout_plan, req_indices, positions_np)
         self._last_sequence_layout_plan = layout_plan
         padded_total_num_scheduled_tokens = layout_plan.global_padded_num_tokens
         request_major_input_ids = None
@@ -3046,6 +3093,8 @@ class TPUModelRunner(GPUModelRunner):
             request_distribution = combined_device[0:3]
             mamba_request_distribution = combined_device[3:6]
 
+        is_all_layout = layout_plan.kind is SequenceLayoutKind.ALL
+        pad_reqs = target_num_reqs - num_reqs
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=start_index,
@@ -3053,6 +3102,26 @@ class TPUModelRunner(GPUModelRunner):
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
+            query_start_loc_cpu=(
+                tuple(self.query_start_loc_np[: target_num_reqs + 1].tolist())
+                if is_all_layout
+                else None
+            ),
+            seq_lens_cpu=(
+                tuple(self.seq_lens_np[:num_reqs].tolist()) + (0,) * pad_reqs
+                if is_all_layout
+                else None
+            ),
+            prompt_lens_cpu=(
+                tuple(
+                    self.input_batch.num_prompt_tokens[
+                        start_index : start_index + num_reqs
+                    ].tolist()
+                )
+                + (0,) * pad_reqs
+                if is_all_layout
+                else None
+            ),
             mamba_state_indices=mamba_state_indices,
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
             mamba_ckpt_window=self._mamba_ckpt_window,
@@ -3247,11 +3316,40 @@ class TPUModelRunner(GPUModelRunner):
             num_chunks += 1
         return num_chunks, max_chunk_reqs
 
+    def _count_ced_decoder_tokens(self, scheduler_output: "SchedulerOutput") -> int:
+        if scheduler_output.total_num_scheduled_tokens == 0:
+            return 0
+        inner = getattr(self.model, "model", None)
+        if not getattr(inner, "_ced_enabled", False):
+            return int(scheduler_output.total_num_scheduled_tokens)
+        window = int(getattr(inner, "_ced_window", 128))
+        num_reqs = self.input_batch.num_reqs
+        kept = 0
+        for i in range(num_reqs):
+            req_id = self.input_batch.req_ids[i]
+            assert req_id is not None
+            count = int(scheduler_output.num_scheduled_tokens[req_id])
+            computed = int(self.input_batch.num_computed_tokens_cpu[i])
+            length = computed + count
+            prompt = int(self.input_batch.num_prompt_tokens[i])
+            replay_start = max(0, prompt - window)
+            skip = min(count, max(0, replay_start - (length - count)))
+            kept += count - skip
+        return kept
+
     def _dp_coordinated_step(
-        self, local_num_tokens: int, local_num_chunks: int, local_num_reqs: int = 0
+        self,
+        local_num_tokens: int,
+        local_num_chunks: int,
+        local_num_reqs: int = 0,
+        local_ced_tokens: int = 0,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
+        inner = getattr(self.model, "model", None)
         if not self._dp_lockstep_enabled():
+            self._dp_ced_decoder_bucket = None
+            if inner is not None:
+                inner._dp_ced_decoder_bucket = None
             return None, local_num_chunks
         from vllm.distributed.parallel_state import get_dp_group
 
@@ -3260,7 +3358,12 @@ class TPUModelRunner(GPUModelRunner):
         # num_tokens_across_dp, so set_forward_context does not run a second
         # DP synchronization.
         t = torch.tensor(
-            [int(local_num_tokens), int(local_num_chunks), int(local_num_reqs)],
+            [
+                int(local_num_tokens),
+                int(local_num_chunks),
+                int(local_num_reqs),
+                int(local_ced_tokens),
+            ],
             dtype=torch.int64,
             device="cpu",
         )
@@ -3268,12 +3371,25 @@ class TPUModelRunner(GPUModelRunner):
             t, op=torch.distributed.ReduceOp.MAX, group=get_dp_group().cpu_group
         )
         bucket = _get_padded_token_len(self.num_tokens_paddings, int(t[0].item()))
+        num_chunks = int(t[1].item())
         # Spec-decode draft forwards size themselves off the step's DP-wide
         # max per-chunk request count (see DFlashProposer), riding this same
         # all-reduce instead of paying the theoretical max bucket or a
         # second collective.
         self._dp_step_max_reqs = int(t[2].item())
-        return bucket, int(t[1].item())
+        ced_raw = int(t[3].item())
+        if num_chunks > 1:
+            self._dp_ced_decoder_bucket = bucket
+        elif ced_raw <= 0:
+            self._dp_ced_decoder_bucket = 0
+        else:
+            self._dp_ced_decoder_bucket = min(
+                bucket,
+                _get_padded_token_len(self.num_tokens_paddings, ced_raw),
+            )
+        if inner is not None:
+            inner._dp_ced_decoder_bucket = self._dp_ced_decoder_bucket
+        return bucket, num_chunks
 
     def _run_dp_dummy_chunk(self, bucket: int) -> None:
         self._dummy_run(
@@ -3293,14 +3409,19 @@ class TPUModelRunner(GPUModelRunner):
         # run_dp_dummy_draft read _dp_target_bucket for the coordinated,
         # equal-token shape.
         self._dp_target_bucket = bucket
-        # Phase 1: all TARGET dummy forwards.
-        for _ in range(num_chunks):
-            self._run_dp_dummy_chunk(bucket)
-        # Phase 2: all DRAFT dummy forwards (num_chunks * K).
-        # use_eagle() covers every hidden-state drafter, dflash included.
-        spec = self.speculative_config
-        if num_chunks > 0 and spec is not None and spec.use_eagle():
-            self.drafter.run_dp_dummy_draft(num_chunks)
+        try:
+            # Phase 1: all TARGET dummy forwards.
+            for _ in range(num_chunks):
+                self._run_dp_dummy_chunk(bucket)
+            # Phase 2: all DRAFT dummy forwards (num_chunks * K).
+            # use_eagle() covers every hidden-state drafter, dflash included.
+            spec = self.speculative_config
+            if num_chunks > 0 and spec is not None and spec.use_eagle():
+                self.drafter.run_dp_dummy_draft(num_chunks)
+        finally:
+            inner = getattr(self.model, "model", None)
+            if inner is not None:
+                inner._dp_ced_decoder_bucket = None
 
     def _dp_num_tokens_across_dp(self, num_tokens: int) -> torch.Tensor | None:
         if not self._dp_lockstep_enabled():
@@ -3421,12 +3542,14 @@ class TPUModelRunner(GPUModelRunner):
         local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
             scheduler_output
         )
+        local_ced_tokens = self._count_ced_decoder_tokens(scheduler_output)
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
             scheduler_output.total_num_scheduled_tokens,
             local_num_chunks,
             # Exact per-chunk request bound on this rank; the DP-wide MAX of
             # it sizes every rank's draft forwards.
             local_num_reqs=local_max_chunk_reqs,
+            local_ced_tokens=local_ced_tokens,
         )
         # Retained for the spec-decode propose phase (sample_tokens): under
         # EP-DP locksteps every rank must run the same number of draft forwards per
@@ -3674,21 +3797,41 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 pooler_output_list.append(pooler_output)
             else:
-                sample_hidden_states = (
-                    sequence_layout_planner.maybe_select_logits_hidden_states(
-                        hidden_states, layout_plan, logits_indices
+                all_partial_prefill = (
+                    spec_decode_metadata is None
+                    and num_reqs > 0
+                    and all(
+                        (req := self.requests.get(req_id)) is not None
+                        and (
+                            req.num_computed_tokens
+                            + scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                            < req.num_tokens
+                        )
+                        for req_id in self.input_batch.req_ids[
+                            start_index : start_index + num_reqs
+                        ]
                     )
                 )
-                if sample_hidden_states is None:
-                    hidden_states = sequence_layout_planner.finalize_hidden_states(
-                        hidden_states,
-                        layout_plan,
-                    )
-                    logits = self.compute_selected_logits(hidden_states, logits_indices)
+                if all_partial_prefill:
+                    logits = None
                 else:
-                    logits = self.compute_logits_from_hidden_states(
-                        sample_hidden_states
+                    sample_hidden_states = (
+                        sequence_layout_planner.maybe_select_logits_hidden_states(
+                            hidden_states, layout_plan, logits_indices
+                        )
                     )
+                    if sample_hidden_states is None:
+                        hidden_states = sequence_layout_planner.finalize_hidden_states(
+                            hidden_states,
+                            layout_plan,
+                        )
+                        logits = self.compute_selected_logits(
+                            hidden_states, logits_indices
+                        )
+                    else:
+                        logits = self.compute_logits_from_hidden_states(
+                            sample_hidden_states
+                        )
 
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
@@ -3734,6 +3877,9 @@ class TPUModelRunner(GPUModelRunner):
             start_index = end_index
             chunk_index += 1
 
+        inner = getattr(self.model, "model", None)
+        if inner is not None:
+            inner._dp_ced_decoder_bucket = None
         if not self._pp_is_last:
             self._pp_pending_scheduler_output = scheduler_output
             return None
@@ -4208,6 +4354,9 @@ class TPUModelRunner(GPUModelRunner):
                 # Non-spec step (prefill / plain decode): reset the mamba
                 # read offsets so the next step resumes from the group base.
                 self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
+                if logits is None:
+                    cur_start_idx = cur_end_idx
+                    continue
                 if grammar_output is not None:
                     logits = self.structured_decoding_manager.mask_logits(
                         logits, grammar_output, cur_start_idx, cur_end_idx
@@ -5636,6 +5785,12 @@ class TPUModelRunner(GPUModelRunner):
         with self.maybe_setup_dummy_loras(self.lora_config):
             with self._precompile_timed("model backbone"):
                 self._precompile_backbone()
+            inner_model = getattr(self.model, "model", None)
+            if hasattr(inner_model, "precompile_ced_helpers"):
+                with self._precompile_timed("CED gather/scatter helpers"):
+                    inner_model.precompile_ced_helpers(
+                        self.num_tokens_paddings, self.device
+                    )
 
             self._precompile_sampling_subgraphs()
             self._precompile_mamba_rollback_helpers()
@@ -6387,6 +6542,9 @@ class TPUModelRunner(GPUModelRunner):
         allocations perfectly match the new underlying `BlockTable` capacity.
         """
         super().may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+        self._block_tables_dirty = True
+        self._cached_bt_key = None
+        self._cached_staged_block_tables = None
         if (
             hasattr(self, "input_batch")
             and self.input_batch is not None

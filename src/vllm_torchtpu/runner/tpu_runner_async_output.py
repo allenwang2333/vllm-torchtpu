@@ -176,7 +176,9 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
 
     def get_output(self) -> ModelRunnerOutput:
         if self.copy_state is None:
-            self._model_runner_output.sampled_token_ids = []
+            self._model_runner_output.sampled_token_ids = [
+                [] for _ in range(len(self._model_runner_output.req_ids))
+            ]
             return self._model_runner_output
 
         self.copy_state.wait()

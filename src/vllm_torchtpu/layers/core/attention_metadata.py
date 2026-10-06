@@ -40,7 +40,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
         "sequence_layout_protocol",
         "sequence_layout_version",
     ],
-    drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
+    drop_fields=["query_start_loc_cpu", "seq_lens_cpu", "prompt_lens_cpu"],
 )
 @dataclass
 class AttentionMetadata:
@@ -89,8 +89,11 @@ class AttentionMetadata:
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
 
-    query_start_loc_cpu: Any = field(init=False)
-    seq_lens_cpu: Any = field(init=False)
+    # Immutable host scheduling snapshots for model-side input planning. They
+    # never participate in device graphs and require no device-to-host reads.
+    query_start_loc_cpu: tuple[int, ...] | None = field(default=None, init=False)
+    seq_lens_cpu: tuple[int, ...] | None = field(default=None, init=False)
+    prompt_lens_cpu: tuple[int, ...] | None = field(default=None, init=False)
 
 
 @dataclass
@@ -112,6 +115,9 @@ class AttentionMetadataBuilderContext:
     query_start_loc: torch.Tensor
     request_distribution: torch.Tensor
     position_ids_override: torch.Tensor | None = None
+    query_start_loc_cpu: tuple[int, ...] | None = None
+    seq_lens_cpu: tuple[int, ...] | None = None
+    prompt_lens_cpu: tuple[int, ...] | None = None
     # Compact-mamba per-request recurrent-slot ids (device int32, length =
     # target_num_reqs). Only the mamba group's builder reads it; None when the
     # model has no mamba layers. See AttentionMetadata.mamba_state_indices.
@@ -420,7 +426,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets = None
             mamba_request_distribution = None
 
-        return AttentionMetadata(
+        metadata = AttentionMetadata(
             input_positions=input_positions,
             block_tables=block_tables_dev,
             seq_lens=ctx.seq_lens,
@@ -434,6 +440,10 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,
         )
+        metadata.query_start_loc_cpu = ctx.query_start_loc_cpu
+        metadata.seq_lens_cpu = ctx.seq_lens_cpu
+        metadata.prompt_lens_cpu = ctx.prompt_lens_cpu
+        return metadata
 
 
 def stage_block_table_uploads(
@@ -473,6 +483,31 @@ def stage_block_table_uploads(
     if not entries:
         return
 
+    unified_mamba = ctx.mamba_state_indices is None and runner._unified_kv_layout
+    if ctx.start_index > 0:
+        runner._block_tables_dirty = True
+    bt_cache_key = (
+        ctx.start_index,
+        ctx.num_reqs,
+        num_reqs_padded,
+        ctx.use_max_model_len,
+        tuple((gid, tnb) for gid, _, tnb in entries),
+    )
+    if (
+        ctx.position_ids_override is None
+        and ctx.mamba_ckpt_window <= 1
+        and gids is None
+        and ctx.start_index == 0
+        and not getattr(runner, "_block_tables_dirty", True)
+        and getattr(runner, "_cached_bt_key", None) == bt_cache_key
+        and getattr(runner, "_cached_staged_block_tables", None) is not None
+    ):
+        ctx.staged_block_tables = runner._cached_staged_block_tables
+        ctx.staged_mamba_products = getattr(
+            runner, "_cached_staged_mamba_products", None
+        )
+        return
+
     total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
     scratch = runner._block_table_stage_cpu
     if scratch is None or scratch.numel() < total:
@@ -510,7 +545,6 @@ def stage_block_table_uploads(
     # Mirror of build()'s branch order: the compact path
     # (ctx.mamba_state_indices) wins, otherwise the unified layout derives
     # per-group indices — which is what this precompute batches.
-    unified_mamba = ctx.mamba_state_indices is None and runner._unified_kv_layout
     mamba_geom: list[tuple[int, int, int]] = []
     mamba_entry_indices: list[int] = []
     if unified_mamba:
@@ -526,6 +560,11 @@ def stage_block_table_uploads(
         gid, _, target_num_blocks = entries[0]
         length = num_reqs_padded * target_num_blocks
         ctx.staged_block_tables = {gid: staged_dev[:length]}
+        if ctx.position_ids_override is None and gids is None and ctx.start_index == 0:
+            runner._cached_bt_key = bt_cache_key
+            runner._cached_staged_block_tables = ctx.staged_block_tables
+            runner._cached_staged_mamba_products = None
+            runner._block_tables_dirty = False
         return
 
     if staged_dev.device.type == "tpu":
@@ -558,3 +597,13 @@ def stage_block_table_uploads(
             entries[ei][0]: (states[j], ckpts[j] if has_ckpt else None)
             for j, ei in enumerate(mamba_entry_indices)
         }
+    if (
+        ctx.position_ids_override is None
+        and ctx.mamba_ckpt_window <= 1
+        and gids is None
+        and ctx.start_index == 0
+    ):
+        runner._cached_bt_key = bt_cache_key
+        runner._cached_staged_block_tables = ctx.staged_block_tables
+        runner._cached_staged_mamba_products = ctx.staged_mamba_products
+        runner._block_tables_dirty = False
