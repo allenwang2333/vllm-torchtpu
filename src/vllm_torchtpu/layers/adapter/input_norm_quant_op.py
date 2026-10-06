@@ -47,17 +47,32 @@ def _build_op(eps: float, has_res: bool, emit_y: bool) -> Callable:
     if key in _ops:
         return _ops[key]
 
-    if has_res:
+    A = jax.Array
+    # pallas.jax_op reads the return annotation, so each variant spells its
+    # outputs out.
+    if has_res and emit_y:
 
-        def fn(x: jax.Array, r: jax.Array, w: jax.Array):
-            y, ro, q, s = rnq.rms_norm_quant(x, r, w, eps, emit_y=emit_y)
-            return (y, ro, q, s) if emit_y else (ro, q, s)
+        def fn(x: A, r: A, w: A) -> tuple[A, A, A, A]:
+            y, ro, q, s = rnq.rms_norm_quant(x, r, w, eps, emit_y=True)
+            return y, ro, q, s
+
+    elif has_res:
+
+        def fn(x: A, r: A, w: A) -> tuple[A, A, A]:
+            _, ro, q, s = rnq.rms_norm_quant(x, r, w, eps, emit_y=False)
+            return ro, q, s
+
+    elif emit_y:
+
+        def fn(x: A, w: A) -> tuple[A, A, A]:
+            y, _, q, s = rnq.rms_norm_quant(x, None, w, eps, emit_y=True)
+            return y, q, s
 
     else:
 
-        def fn(x: jax.Array, w: jax.Array):
-            y, _, q, s = rnq.rms_norm_quant(x, None, w, eps, emit_y=emit_y)
-            return (y, q, s) if emit_y else (q, s)
+        def fn(x: A, w: A) -> tuple[A, A]:
+            _, _, q, s = rnq.rms_norm_quant(x, None, w, eps, emit_y=False)
+            return q, s
 
     op = pallas.jax_op(f"pallas::input_norm_quant_{len(_ops)}", fn)
 

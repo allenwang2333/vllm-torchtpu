@@ -17,12 +17,19 @@ lowered by XLA), then the fp8 linear's own activation quant and matmul
 
 import pytest
 import torch
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 
 from vllm_torchtpu.layers.adapter import input_norm_quant_op as inq
 from vllm_torchtpu.layers.adapter import linear_common
 
 K, N, EPS = 4096, 2560, 1e-6
+
+
+@pytest.fixture(autouse=True)
+def _vllm_config():
+    with set_current_vllm_config(VllmConfig()):
+        yield
 
 
 def _setup(device, rows, seed=0):
@@ -51,7 +58,9 @@ def _same(a, b):
 @pytest.mark.parametrize("emit_y", [True, False])
 @pytest.mark.parametrize("with_residual", [True, False])
 @pytest.mark.parametrize("rows", [4, 8, 48, 1024])
-def test_matches_norm_then_fp8_linear(device, rows, with_residual, emit_y):
+def test_matches_norm_then_fp8_linear(
+    device, rows, with_residual, emit_y
+):
     if device.type != "tpu":
         pytest.skip("Pallas kernel on TPU.")
     x, r, norm, w, ws = _setup(device, rows)

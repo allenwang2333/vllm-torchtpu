@@ -1438,6 +1438,11 @@ def _maybe_enable_rowquant(layer: torch.nn.Module, prefix: str) -> None:
         return
     if "all" not in names and not any(t in prefix for t in names):
         return
+    # The row fork in `apply` leaves a shape guard; only the backbone is
+    # re-traced per bucket group, the MTP draft compiles every bucket from one
+    # trace (see fused_qk_norm_rope._unsupported_graph_reason).
+    if "mtp" in prefix.split("."):
+        return
     weight, scale = layer.weight, layer.weight_scale
     n = weight.shape[0] if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False) else (
         weight.shape[1]
