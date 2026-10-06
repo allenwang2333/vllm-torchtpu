@@ -92,6 +92,9 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_FUSED_NORM_QUANT: bool = False
+    TPU_FP8_ROWQUANT_LAYERS: str = ""
+    TPU_FP8_ROWQUANT_MAX_ROWS: int = 64
+    TPU_GDN_IN_PROJ_KN: bool = False
     TPU_FUSED_QK_NORM_ROPE: bool = False
     TPU_RPA_DECODE_BATCHED: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -709,6 +712,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # quantization as one kernel. Needs per-channel fp8 out_proj weights.
     "TPU_ENABLE_GDN_DYNAMIC_TILING": env_bool("TPU_ENABLE_GDN_DYNAMIC_TILING", default=False),
     "TPU_GDN_FUSED_NORM_QUANT": env_bool("TPU_GDN_FUSED_NORM_QUANT"),
+    # Per-channel fp8 linears whose prefix contains one of these comma-separated
+    # substrings ("all": every one) quantize their activation inside the matmul
+    # kernel (kernels/quantized_matmul/rowquant_kernel.py) instead of in
+    # separate XLA fusions, on token buckets of up to TPU_FP8_ROWQUANT_MAX_ROWS.
+    "TPU_FP8_ROWQUANT_LAYERS": env_str("TPU_FP8_ROWQUANT_LAYERS", ""),
+    "TPU_FP8_ROWQUANT_MAX_ROWS": env_int("TPU_FP8_ROWQUANT_MAX_ROWS", 64),
+    # Store the GDN in_proj_qkvz weight in the canonical (k, n) layout when PCP
+    # streaming does not read it raw (it validates [n_out, n_in]).
+    "TPU_GDN_IN_PROJ_KN": env_bool("TPU_GDN_IN_PROJ_KN"),
     # Run the gated q split, q/k RMS norms and NeoX rope of Qwen3NextAttention
     # as one kernel on token buckets of up to 64 rows.
     "TPU_FUSED_QK_NORM_ROPE": env_bool("TPU_FUSED_QK_NORM_ROPE"),

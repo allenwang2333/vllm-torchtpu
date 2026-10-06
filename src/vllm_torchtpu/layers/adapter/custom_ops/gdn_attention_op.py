@@ -45,6 +45,7 @@ from vllm_torchtpu.distributed.pcp import (
     get_pcp_rank,
     get_pcp_world_size,
 )
+from vllm_torchtpu import envs
 from vllm_torchtpu.gdn_pool_layout import (
     DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
     unified_kv_layout_enabled_for_architecture,
@@ -361,7 +362,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self._create_conv1d()
         # `_require_pcp_projection_parameters` hands this weight straight to
         # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in].
-        if hasattr(self, "in_proj_qkvz"):
+        # TPU_GDN_IN_PROJ_KN: without PCP nothing reads it raw, so it can take
+        # the canonical (k, n) layout like every other linear.
+        if hasattr(self, "in_proj_qkvz") and not (
+            envs.TPU_GDN_IN_PROJ_KN and not self._pcp_streaming_enabled()
+        ):
             setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).

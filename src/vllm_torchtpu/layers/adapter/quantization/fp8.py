@@ -74,8 +74,11 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
+    ROWQUANT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    get_rowquant_matmul_op,
     quantized_matmul,
+    quantized_matmul_rowquant,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -1400,11 +1403,23 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             f"scale={list(layer.weight_scale.shape)}, "
             f"requant_block_size={scale_desc}"
         )
+        _maybe_enable_rowquant(layer, self.prefix)
 
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
         weight = layer.weight
+        rowquant = getattr(layer, ROWQUANT_ATTR, None)
+        if (
+            rowquant is not None
+            and x.numel() // x.shape[-1] <= envs.TPU_FP8_ROWQUANT_MAX_ROWS
+        ):
+            out = quantized_matmul_rowquant(
+                x, weight, layer.weight_scale, w_kn=rowquant == "kn"
+            )
+            if bias is not None:
+                out = out + bias
+            return out
         if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
             # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
             # takes the canonical (k, n), so flip the view for the contraction.
@@ -1413,6 +1428,35 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if bias is not None:
             out = out + bias
         return out
+
+
+def _maybe_enable_rowquant(layer: torch.nn.Module, prefix: str) -> None:
+    """Route ``layer`` through `rowquant_matmul` if TPU_FP8_ROWQUANT_LAYERS
+    names it and its weight is per-channel fp8."""
+    names = [t.strip() for t in envs.TPU_FP8_ROWQUANT_LAYERS.split(",") if t.strip()]
+    if not names:
+        return
+    if "all" not in names and not any(t in prefix for t in names):
+        return
+    weight, scale = layer.weight, layer.weight_scale
+    n = weight.shape[0] if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False) else (
+        weight.shape[1]
+    )
+    if weight.dtype != torch.float8_e4m3fn or tuple(scale.shape) != (n,):
+        logger.info_once(
+            f"TPU_FP8_ROWQUANT_LAYERS: {prefix} is not per-channel fp8 "
+            f"({weight.dtype}, scale {list(scale.shape)}); keeping the XLA path"
+        )
+        return
+    w_kn = not getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+    setattr(layer, ROWQUANT_ATTR, "kn" if w_kn else "nk")
+    get_rowquant_matmul_op(w_kn)
+    logger.info(
+        "TPU_FP8_ROWQUANT_LAYERS: %s quantizes its activation in the matmul "
+        "kernel (weight %s %s, <= %d rows)",
+        prefix, list(weight.shape), "kn" if w_kn else "nk",
+        envs.TPU_FP8_ROWQUANT_MAX_ROWS,
+    )
 
 
 def resolve_online_fp8(
