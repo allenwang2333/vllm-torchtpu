@@ -673,6 +673,48 @@ def _place_rejection_tokens(
     return selected_tokens[:batch_size]
 
 
+def _take(x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+    """``x[row, pos[row]]`` ([rows, width] by [rows, 1]) as a masked max, a
+    reduce fusion where torch.gather lowers to a ~0.6 us gather per call on
+    TPU. An out-of-range position gives the dtype's lowest value."""
+    iota = torch.arange(x.shape[-1], device=x.device, dtype=pos.dtype)
+    if x.dtype.is_floating_point:
+        fill = torch.tensor(float("-inf"), dtype=x.dtype, device=x.device)
+    else:
+        fill = torch.tensor(torch.iinfo(x.dtype).min, dtype=x.dtype, device=x.device)
+    return torch.amax(torch.where(iota == pos, x, fill), dim=-1, keepdim=True)
+
+
+def _first_argmax(x: torch.Tensor) -> torch.Tensor:
+    """``torch.argmax(x, dim=-1, keepdim=True)`` (the first maximum) as a max
+    and a min-index reduce, cheaper on TPU than the variadic argmax reduce.
+    NaN-free inputs only."""
+    width = x.shape[-1]
+    iota = torch.arange(width, device=x.device, dtype=torch.int32)
+    top = torch.amax(x, dim=-1, keepdim=True)
+    return torch.amin(
+        torch.where(x == top, iota, torch.full_like(iota, width)), dim=-1, keepdim=True
+    )
+
+
+def _row_param(param: torch.Tensor, row_req: torch.Tensor) -> torch.Tensor:
+    """``param[row_req]`` for a per-request [num_reqs, 1] parameter as a
+    one-hot masked max ([rows, 1]); ``row_req`` is in range."""
+    num_reqs = param.shape[0]
+    one_hot = row_req.unsqueeze(-1) == torch.arange(
+        num_reqs, device=param.device, dtype=row_req.dtype
+    )
+    return _take_rows(param.view(1, num_reqs).expand(row_req.shape[0], num_reqs), one_hot)
+
+
+def _take_rows(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    if x.dtype.is_floating_point:
+        fill = torch.tensor(float("-inf"), dtype=x.dtype, device=x.device)
+    else:
+        fill = torch.tensor(torch.iinfo(x.dtype).min, dtype=x.dtype, device=x.device)
+    return torch.amax(torch.where(mask, x, fill), dim=-1, keepdim=True)
+
+
 def sparse_window_logits(
     vals: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor
 ) -> torch.Tensor:
@@ -688,21 +730,25 @@ def sparse_window_logits(
     path keeps and this one drops.
     """
     width = vals.shape[-1]
-    k_index = (top_k.clamp(min=1, max=width) - 1).to(torch.int64)
-    cutoff = torch.gather(vals, -1, k_index)
+    k_index = (top_k.clamp(min=1, max=width) - 1).to(torch.int32)
+    cutoff = _take(vals, k_index)
     survives = vals >= cutoff
     neg_inf = torch.tensor(float("-inf"), dtype=vals.dtype, device=vals.device)
     masked = torch.where(survives, vals, neg_inf)
     probs = torch.softmax(masked, dim=-1)  # non-increasing along the row
     cum_mass = torch.cumsum(probs, dim=-1)
     reached = cum_mass >= top_p
-    reached_in_window = torch.any(reached, dim=-1, keepdim=True)
-    first_reached = torch.argmax(reached.to(torch.int32), dim=-1, keepdim=True)
-    threshold_in_window = torch.gather(probs, -1, first_reached)
-    # The survivors' mass is 1 up to rounding; if the cumsum rounds below p,
-    # keep every survivor.
+    iota = torch.arange(width, device=vals.device, dtype=torch.int32)
+    # First position whose cumulative mass reaches p; ``width`` if none.
+    first_reached = torch.amin(
+        torch.where(reached, iota, torch.full_like(iota, width)), dim=-1, keepdim=True
+    )
+    # The survivors' mass is 1 up to rounding; if the cumsum rounds below p
+    # (no position reached), keep every survivor.
     threshold = torch.where(
-        reached_in_window, threshold_in_window, torch.zeros_like(threshold_in_window)
+        first_reached < width,
+        _take(probs, first_reached),
+        torch.zeros_like(cutoff),
     )
     keep = survives & ((probs >= threshold) | (top_p >= 1.0))
     return torch.where(keep, masked, neg_inf)
@@ -734,8 +780,7 @@ def sparse_window_sample(
         u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
     )
     gumbel_noise = -torch.log(-torch.log(u_clamped))
-    pos = torch.argmax(window_logits + gumbel_noise, dim=-1, keepdim=True)
-    sampled = torch.gather(idx, -1, pos)
+    sampled = _take(idx, _first_argmax(window_logits + gumbel_noise))
     # Greedy rows: the lowest id holding the row maximum, as torch.argmax
     # over the full logits picks it (the window's tie order is unspecified).
     no_id = torch.full_like(idx, torch.iinfo(idx.dtype).max)
@@ -743,6 +788,68 @@ def sparse_window_sample(
         torch.where(vals == vals[..., :1], idx, no_id), dim=-1, keepdim=True
     )
     return torch.where(is_greedy, lowest_max, sampled).view(-1)
+
+
+def _place_rejection_tokens_dense(
+    draft_token_ids: torch.Tensor,
+    accepted: torch.Tensor,
+    recovered_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+) -> torch.Tensor:
+    """``_place_rejection_tokens`` with masked reductions over a
+    [num_reqs, max_draft_tokens + 1, rows] one-hot in place of its gathers
+    and scatters (each a ~0.6-0.8 us op on TPU for a few dozen elements).
+    Same output."""
+    total_tokens = draft_token_ids.shape[0]
+    batch_size = num_draft_tokens.shape[0]
+    device = draft_token_ids.device
+    seg = segment_ids.to(torch.int32)
+    grp = group_indices.to(torch.int32)
+    num_draft = num_draft_tokens.to(torch.int32)
+    large = torch.tensor(total_tokens, dtype=torch.int32, device=device)
+    placeholder = torch.tensor(PLACEHOLDER_TOKEN_ID, dtype=torch.int32, device=device)
+    match = seg.unsqueeze(0) == torch.arange(
+        batch_size, device=device, dtype=torch.int32
+    ).unsqueeze(1)  # [batch, rows]
+    valid = torch.any(match & (grp.unsqueeze(0) < num_draft.unsqueeze(1)), dim=0)
+    rejection = torch.where(valid & ~accepted, grp, large)
+    first_rejection = torch.amin(
+        torch.where(match, rejection.unsqueeze(0), large), dim=1
+    )  # [batch]
+    first_rejection_row = torch.amin(
+        torch.where(match, first_rejection.unsqueeze(1), large), dim=0
+    )  # [rows]
+    main = torch.where(
+        valid & (grp < first_rejection_row),
+        draft_token_ids.to(torch.int32),
+        torch.where(
+            valid & (grp == first_rejection_row),
+            recovered_token_ids.to(torch.int32),
+            placeholder,
+        ),
+    )
+    slots = torch.arange(max_draft_tokens + 1, device=device, dtype=torch.int32)
+    at_slot = (
+        match.unsqueeze(1)
+        & valid.view(1, 1, total_tokens)
+        & (grp.view(1, 1, total_tokens) == slots.view(1, -1, 1))
+    )  # [batch, slots, rows]
+    placed = torch.amax(
+        torch.where(at_slot, main.view(1, 1, total_tokens), placeholder), dim=-1
+    )  # [batch, slots]
+    all_accepted = first_rejection == large
+    should_get_bonus = all_accepted | (num_draft == 0)
+    accepted_count = torch.where(all_accepted, num_draft, first_rejection)
+    return torch.where(
+        (slots.unsqueeze(0) == accepted_count.unsqueeze(1))
+        & should_get_bonus.unsqueeze(1),
+        bonus_token_ids.to(torch.int32).unsqueeze(1),
+        placed,
+    )
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -771,26 +878,33 @@ def _random_rejection_sample_sparse(
     is then zero outside the window, so p(draft) is read from the window
     (0 when the draft is not in it) and the recovery distribution
     max(0, p - q) lives in the window too. ``recover_u`` is [rows, width].
+    Gathers, argmaxes and scatters are written as masked reductions and the
+    indices stay int32 (int64 is emulated on TPU): ~0.6 us per such op
+    across ~60 of them (twin j-820faf14).
     """
-    draft_token_ids = draft_token_ids.to(torch.int64)
-    valid_draft_token_ids = draft_token_ids >= 0
-    row_req = segment_ids.to(torch.int64).clamp(min=0, max=temperatures.shape[0] - 1)
-    temperatures = temperatures[row_req]
-    top_k = top_k[row_req]
-    top_p = top_p[row_req]
+    draft = draft_token_ids.to(torch.int32)
+    valid_draft_token_ids = draft >= 0
+    row_req = segment_ids.to(torch.int32).clamp(min=0, max=temperatures.shape[0] - 1)
+    temperatures = _row_param(temperatures, row_req)
+    top_k = _row_param(top_k, row_req)
+    top_p = _row_param(top_p, row_req)
 
     scaled = target_vals.to(torch.float32) / (
         temperatures.to(torch.float32) + TEMPERATURE_EPS
     )
     target_probs = torch.softmax(sparse_window_logits(scaled, top_k, top_p), dim=-1)
-    is_draft = (target_idx.to(torch.int64) == draft_token_ids.unsqueeze(-1)) & (
+    is_draft = (target_idx.to(torch.int32) == draft.unsqueeze(-1)) & (
         valid_draft_token_ids.unsqueeze(-1)
     )
     zero = torch.tensor(0.0, dtype=target_probs.dtype, device=target_probs.device)
     target_token_probs = torch.sum(torch.where(is_draft, target_probs, zero), dim=-1)
     if synthetic_mode:
         assert synthetic_conditional_rates is not None
-        conditional_rates = synthetic_conditional_rates[group_indices.to(torch.int64)]
+        num_groups = synthetic_conditional_rates.shape[0]
+        conditional_rates = _row_param(
+            synthetic_conditional_rates.view(num_groups, 1),
+            group_indices.to(torch.int32).clamp(min=0, max=num_groups - 1),
+        ).squeeze(-1)
         accepted = accept_u < conditional_rates
     else:
         accepted = target_token_probs >= accept_u
@@ -803,22 +917,16 @@ def _random_rejection_sample_sparse(
         max=1.0 - torch.finfo(target_probs.dtype).eps,
     )
     exp_noise = -torch.log(recover_u)
-    recovered_pos = torch.argmax(
-        recovered_dist / (exp_noise + torch.finfo(target_probs.dtype).tiny),
-        dim=-1,
-        keepdim=True,
+    recovered_pos = _first_argmax(
+        recovered_dist / (exp_noise + torch.finfo(target_probs.dtype).tiny)
     )
     has_recovery_mass = torch.any(recovered_dist > 0, dim=-1, keepdim=True)
     recovered_pos = torch.where(
-        has_recovery_mass,
-        recovered_pos,
-        torch.argmax(target_probs, dim=-1, keepdim=True),
+        has_recovery_mass, recovered_pos, _first_argmax(target_probs)
     )
-    recovered_token_ids = (
-        torch.gather(target_idx, -1, recovered_pos).squeeze(-1).to(torch.int32)
-    )
-    return _place_rejection_tokens(
-        draft_token_ids,
+    recovered_token_ids = _take(target_idx.to(torch.int32), recovered_pos).squeeze(-1)
+    return _place_rejection_tokens_dense(
+        draft,
         accepted,
         recovered_token_ids,
         num_draft_tokens,
