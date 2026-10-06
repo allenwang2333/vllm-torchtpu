@@ -19,11 +19,13 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.models.utils import extract_layer_index
 
+from vllm_torchtpu.distributed.tp_collectives import tp_reduce_scatter
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
 
 
@@ -34,6 +36,7 @@ class DeepseekV4MoE(nn.Module):
         self,
         vllm_config: VllmConfig,
         prefix: str = "",
+        reduce_results: bool = True,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -110,6 +113,7 @@ class DeepseekV4MoE(nn.Module):
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
             apply_routed_scale_to_output=True,
+            reduce_results=reduce_results,
         )
 
         # The monolithic TPU MoE path never consults the router: MoERunner
@@ -138,7 +142,10 @@ class DeepseekV4MoE(nn.Module):
         return self.experts.do_naive_dispatch_combine
 
     def forward(
-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        return_token_sharded: bool = False,
     ) -> torch.Tensor:
         """Forward pass executing router gate and fused expert computation."""
         if self.gate.tid2eid is not None and input_ids is None:
@@ -151,5 +158,10 @@ class DeepseekV4MoE(nn.Module):
             router_logits=hidden_states,
             input_ids=input_ids,
         )
+        if self.experts.moe_config.skip_final_all_reduce and self.tp_size > 1:
+            if return_token_sharded:
+                final_hidden_states = tp_reduce_scatter(final_hidden_states, dim=0)
+                return final_hidden_states.view(-1, *org_shape[1:])
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
-        return final_hidden_states.view(org_shape)
+        return final_hidden_states.view(-1, *org_shape[1:])

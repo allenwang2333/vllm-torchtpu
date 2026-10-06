@@ -1403,15 +1403,20 @@ def _patch_vllm_piecewise_backend() -> None:
             self.compile_sizes and len(self.compile_sizes) > 1
         ):
             # Dynamic token count from tensor dimension 0
-            first_tensor = next((x for x in args if isinstance(x, torch.Tensor)), None)
-            if first_tensor is not None:
-                runtime_shape = first_tensor.shape[0]
-                range_entry = self._find_range_for_shape(runtime_shape)
+            range_entry = None
+            runtime_shape = None
+            for x in args:
+                if isinstance(x, torch.Tensor) and x.ndim >= 1:
+                    runtime_shape = x.shape[0]
+                    range_entry = self._find_range_for_shape(runtime_shape)
+                    if range_entry is not None:
+                        break
+            if range_entry is None and runtime_shape is not None:
                 assert range_entry is not None, (
                     f"Shape: {runtime_shape} out of considered ranges: "
                     f"{self.compile_ranges}"
                 )
-            else:
+            elif range_entry is None:
                 compiled_entries = [
                     re for re in self.range_entries.values() if re.compiled
                 ]
@@ -1438,6 +1443,172 @@ def _patch_vllm_piecewise_backend() -> None:
     patched_call._tpu_piecewise_backend_patch = True
     PiecewiseBackend.__call__ = patched_call
     logger.info("Applied TPU patch: PiecewiseBackend tensor-dim-0 bucket dispatch.")
+
+
+def _patch_vllm_split_graph_symint() -> None:
+    """Recompute derived SymInt nodes (e.g. s72 // tp) inside each subgraph.
+
+    fx_to_mlir rejects SymInt subgraph outputs, so split_graph must not pass them.
+    """
+    import torch
+    import torch.fx as fx
+    import vllm.compilation.backends as backends_mod
+
+    if getattr(backends_mod, "_tpu_split_graph_symint_patch", False):
+        return
+    orig_merge = backends_mod._merge_empty_only_subgraphs
+
+    def _is_sym_scalar(node: fx.Node) -> bool:
+        return isinstance(
+            node.meta.get("example_value"),
+            (torch.SymInt, torch.SymFloat, torch.SymBool),
+        )
+
+    def _is_pure_sym_tree(node: fx.Node, memo: dict[fx.Node, bool]) -> bool:
+        if node in memo:
+            return memo[node]
+        if node.op == "placeholder":
+            res = _is_sym_scalar(node)
+        elif node.op == "call_function" and _is_sym_scalar(node):
+            res = all(_is_pure_sym_tree(inp, memo) for inp in node.all_input_nodes)
+        else:
+            res = False
+        memo[node] = res
+        return res
+
+    def _localize_cross_subgraph_symints(
+        node_to_subgraph_id: dict[fx.Node, int],
+    ) -> None:
+        if not node_to_subgraph_id:
+            return
+        fx_graph = next(iter(node_to_subgraph_id)).graph
+
+        root_sym_placeholders: dict[object, fx.Node] = {}
+        pure_sym_by_expr: dict[object, fx.Node] = {}
+        first_node_in_sg: dict[int, fx.Node] = {}
+        pure_memo: dict[fx.Node, bool] = {}
+
+        for node in fx_graph.nodes:
+            if node.op == "placeholder" and _is_sym_scalar(node):
+                expr = node.meta["example_value"].node.expr
+                root_sym_placeholders.setdefault(expr, node)
+                continue
+            sg = node_to_subgraph_id.get(node)
+            if sg is not None and sg not in first_node_in_sg:
+                first_node_in_sg[sg] = node
+            if _is_pure_sym_tree(node, pure_memo):
+                expr = node.meta["example_value"].node.expr
+                pure_sym_by_expr.setdefault(expr, node)
+
+        clone_memo: dict[tuple[fx.Node, int], fx.Node] = {}
+
+        def localize_for_sg(sym_node: fx.Node, dst_sg: int) -> fx.Node:
+            if sym_node.op == "placeholder":
+                return sym_node
+            expr = sym_node.meta["example_value"].node.expr
+            if expr in root_sym_placeholders:
+                return root_sym_placeholders[expr]
+            source_node = sym_node
+            if not _is_pure_sym_tree(sym_node, pure_memo):
+                source_node = pure_sym_by_expr.get(expr, sym_node)
+            if node_to_subgraph_id.get(source_node) == dst_sg:
+                return source_node
+            key = (source_node, dst_sg)
+            if key in clone_memo:
+                return clone_memo[key]
+
+            def _remap(arg):
+                if isinstance(arg, fx.Node) and _is_sym_scalar(arg):
+                    return localize_for_sg(arg, dst_sg)
+                return arg
+
+            new_args = fx.graph.map_arg(source_node.args, _remap)
+            new_kwargs = fx.graph.map_arg(source_node.kwargs, _remap)
+            anchor = first_node_in_sg[dst_sg]
+            with fx_graph.inserting_before(anchor):
+                cloned = fx_graph.create_node(
+                    op=source_node.op,
+                    target=source_node.target,
+                    args=new_args,
+                    kwargs=new_kwargs,
+                    type_expr=source_node.type,
+                )
+            cloned.meta = source_node.meta.copy()
+            node_to_subgraph_id[cloned] = dst_sg
+            clone_memo[key] = cloned
+            return cloned
+
+        for node in list(fx_graph.nodes):
+            if node.op in ("placeholder", "output") or not _is_sym_scalar(node):
+                continue
+            src_sg = node_to_subgraph_id.get(node)
+            for user in list(node.users):
+                if user.op == "output":
+                    continue
+                user_sg = node_to_subgraph_id.get(user)
+                if user_sg is not None and user_sg != src_sg:
+                    local_sym = localize_for_sg(node, user_sg)
+                    if local_sym is not node:
+                        user.args = fx.graph.map_arg(
+                            user.args,
+                            lambda n, old=node, new=local_sym: new if n is old else n,
+                        )
+                        user.kwargs = fx.graph.map_arg(
+                            user.kwargs,
+                            lambda n, old=node, new=local_sym: new if n is old else n,
+                        )
+
+        for node in reversed(list(fx_graph.nodes)):
+            if (
+                node.op not in ("placeholder", "output")
+                and _is_sym_scalar(node)
+                and len(node.users) == 0
+            ):
+                node_to_subgraph_id.pop(node, None)
+                fx_graph.erase_node(node)
+
+    def patched_merge_empty_only_subgraphs(
+        node_to_subgraph_id: dict[fx.Node, int],
+        split_op_graphs: list[int],
+    ) -> None:
+        orig_merge(node_to_subgraph_id, split_op_graphs)
+        _localize_cross_subgraph_symints(node_to_subgraph_id)
+
+    orig_split_graph = backends_mod.split_graph
+
+    def patched_split_graph(graph: fx.GraphModule, splitting_ops: list[str]):
+        split_gm, outputs = orig_split_graph(graph, splitting_ops)
+        recompiled_root = False
+        for item in outputs:
+            submod = item.graph
+            placeholders = [n for n in submod.graph.nodes if n.op == "placeholder"]
+            dead_indices = [
+                idx
+                for idx, n in enumerate(placeholders)
+                if _is_sym_scalar(n) and len(n.users) == 0
+            ]
+            if not dead_indices:
+                continue
+            dead_set = set(dead_indices)
+            for idx in reversed(dead_indices):
+                submod.graph.erase_node(placeholders[idx])
+            submod.recompile()
+            for node in split_gm.graph.nodes:
+                if node.op == "call_module" and node.target == item.submod_name:
+                    node.args = tuple(
+                        arg for idx, arg in enumerate(node.args) if idx not in dead_set
+                    )
+                    recompiled_root = True
+        if recompiled_root:
+            split_gm.recompile()
+        return split_gm, outputs
+
+    backends_mod._merge_empty_only_subgraphs = patched_merge_empty_only_subgraphs
+    backends_mod.split_graph = patched_split_graph
+    backends_mod._tpu_split_graph_symint_patch = True
+    logger.info(
+        "Applied TPU patch: localize cross-subgraph SymInt nodes in split_graph."
+    )
 
 
 def _patch_vllm_compile_prefix_isolation() -> None:
@@ -1674,7 +1845,9 @@ def _patch_vllm_block_pool_lifo_free() -> None:
     """
     from vllm.v1.core.block_pool import BlockPool
 
-    if BlockPool.__dict__.get("_tpu_lifo_free_patch", False):
+    if BlockPool.__dict__.get("_tpu_lifo_free_patch", False) or hasattr(
+        BlockPool, "_queue_for_partition"
+    ):
         return
 
     def free_blocks(self, ordered_blocks) -> None:

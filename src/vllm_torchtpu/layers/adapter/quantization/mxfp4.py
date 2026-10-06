@@ -492,8 +492,12 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         orig_hidden_size = w2_weight.shape[2]
         orig_intermediate_size = w2_weight.shape[1]
         w13_block_size = REQUANTIZED_BLOCK_SIZE
+        w2_pad_align = min(
+            REQUANTIZED_BLOCK_SIZE,
+            max(128, -(-orig_intermediate_size // 128) * 128),
+        )
 
-        intermediate_padded = -(-orig_intermediate_size // 128) * 128
+        intermediate_padded = -(-orig_intermediate_size // w2_pad_align) * w2_pad_align
         hidden_padded = -(-orig_hidden_size // w13_block_size) * w13_block_size
 
         w1_weight = w13_weight[:, :, :orig_intermediate_size]
@@ -553,8 +557,9 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         which is what the fused EP kernel reads; the GMM path wants the uint8
         packing its `should_unpack` step undoes. Same values either way.
         """
+        del orig_intermediate_size
         w13_block_size = REQUANTIZED_BLOCK_SIZE
-        w2_block_size = min(REQUANTIZED_BLOCK_SIZE, orig_intermediate_size)
+        w2_block_size = min(REQUANTIZED_BLOCK_SIZE, w2_weight_padded.shape[1])
 
         w13_weight_processed, w13_weight_scale = quantize_native_fp4_kmajor(
             w13_weight_padded.to(device), block=w13_block_size, pack=pack
@@ -597,6 +602,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             w2_bias_padded,
             orig_intermediate,
         ) = self._dequantize_and_pad(layer)
+        self._release_source_weights(layer)
         # Decided before the quantization, not after: the two paths differ
         # only in whether the fp4 pairs cross the bridge packed, and that is
         # an argument to the quantizer.
@@ -619,7 +625,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             device,
             pack=op is None,
         )
-        self._release_source_weights(layer)
 
         layer.w13_weight = torch.nn.Parameter(w13_weight_processed, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight_processed, requires_grad=False)
@@ -635,12 +640,21 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 w2_bias_padded.to(device), requires_grad=False
             )
 
-        to_sync = [layer.w13_weight, layer.w2_weight]
+        del w13_weight_padded, w2_weight_padded, w13_bias_padded, w2_bias_padded
+        to_sync = [
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+        ]
         if hasattr(layer, "w13_bias") and layer.w13_bias is not None:
             to_sync.append(layer.w13_bias)
         if hasattr(layer, "w2_bias") and layer.w2_bias is not None:
             to_sync.append(layer.w2_bias)
         synchronize_tensors(to_sync)
+        import gc
+
+        gc.collect()
 
         logger.info(
             "DeepSeek-V4 MXFP4 weights processed and stored as native FP4 "
