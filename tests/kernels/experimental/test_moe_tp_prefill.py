@@ -204,3 +204,31 @@ def test_routing_plan_matches_reference(T, E, K, n_valid):
     )
     for g, r in zip(got, ref):
         assert np.array_equal(np.asarray(g), np.asarray(r))
+
+
+def test_tp_combine_kernel_matches_reference():
+    """build_tp_combine_kernel folds pscl[pos] in SMEM identically to XLA gather."""
+    k1, k2, k3, k4 = jax.random.split(jax.random.key(7), 4)
+    tc, topk, hidden = 256, 4, 256
+    slab = 1024
+    part = jax.random.normal(k1, (slab, hidden // mtp.LANES, mtp.LANES)).astype(mtp.FP8)
+    pscl = jax.random.uniform(k2, (slab,), dtype=jnp.float32)
+    coef = jax.random.uniform(k3, (tc, topk), dtype=jnp.float32)
+    pos = jax.random.randint(k4, (tc, topk), 0, slab, dtype=jnp.int32)
+    fn = mtp.build_tp_combine_kernel(
+        t_local=tc,
+        topk=topk,
+        hidden=hidden,
+        lane_blocks=hidden // mtp.LANES,
+        scale_len=slab,
+        wire_dtype=mtp.FP8,
+        out_dtype=jnp.bfloat16,
+        interpret=not _on_tpu(),
+    )
+    got = np.asarray(fn(part, pscl, coef, pos).astype(jnp.float32))
+    rows = part.reshape(slab, hidden)[pos].astype(jnp.float32)
+    w = coef * pscl[pos]
+    ref = np.asarray(
+        jnp.sum(rows * w[..., None], axis=1).astype(jnp.bfloat16).astype(jnp.float32)
+    )
+    assert np.array_equal(got, ref)
