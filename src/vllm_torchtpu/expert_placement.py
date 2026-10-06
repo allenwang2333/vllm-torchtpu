@@ -29,6 +29,7 @@ numbers restart at 0), keep vLLM's linear placement.
 
 import dataclasses
 import functools
+import hashlib
 import json
 import re
 import subprocess
@@ -141,6 +142,17 @@ def _read(uri: str) -> str:
         ).stdout
     with open(uri) as f:
         return f.read()
+
+
+@functools.cache
+def _digest(uri: str) -> str:
+    return hashlib.sha256(_read(uri).encode()).hexdigest()
+
+
+def content_hash() -> str | None:
+    """The placement file's content digest for the compile cache key."""
+    uri = envs.TPU_EXPERT_PLACEMENT
+    return _digest(uri) if uri else None
 
 
 @functools.cache
