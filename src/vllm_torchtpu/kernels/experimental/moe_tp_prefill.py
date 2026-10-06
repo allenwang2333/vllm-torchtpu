@@ -65,6 +65,7 @@ def _build_expert_kernel(
     unroll,
     lookahead,
     interpret,
+    weight_dma_priority=WEIGHT_DMA_PRIORITY,
 ):
     """The per-rank expert kernel for a fixed token count and route count.
 
@@ -151,12 +152,12 @@ def _build_expert_kernel(
             @pl.when(e == shared)
             def _():
                 for c in w_copies(0, slot, True):
-                    c.start(priority=WEIGHT_DMA_PRIORITY)
+                    c.start(priority=weight_dma_priority)
 
             @pl.when(e != shared)
             def _():
                 for c in w_copies(e, slot, False):
-                    c.start(priority=WEIGHT_DMA_PRIORITY)
+                    c.start(priority=weight_dma_priority)
 
         def wait_weights(v):
             for c in w_copies(0, lax.rem(v, nbuf), False):
@@ -566,11 +567,11 @@ def moe_tp_prefill(
     combine_chunks=1,
     reduce_fn=None,
     skip_zero_weight_routes=True,
-    nbuf=4,
+    nbuf=None,
     tile_m=None,
-    n_rungs=4,
-    gather_unroll=8,
-    lookahead=3,
+    n_rungs=None,
+    gather_unroll=None,
+    lookahead=None,
     interpret=False,
     x_quantized=None,
     shared_gate=None,
@@ -594,8 +595,12 @@ def moe_tp_prefill(
         n_tok = x_q.shape[0]
     else:
         n_tok, hidden = x.shape
-    if tile_m is None:
-        tile_m = default_tile_m(n_tok)
+    launch = default_launch(n_tok)
+    nbuf = launch["nbuf"] if nbuf is None else nbuf
+    tile_m = launch["tile_m"] if tile_m is None else tile_m
+    n_rungs = launch["n_rungs"] if n_rungs is None else n_rungs
+    gather_unroll = launch["gather_unroll"] if gather_unroll is None else gather_unroll
+    lookahead = launch["lookahead"] if lookahead is None else lookahead
     inter = two_i // 2
     n_routes = n_tok * topk_ids.shape[1]
 
@@ -611,6 +616,7 @@ def moe_tp_prefill(
         unroll=gather_unroll,
         lookahead=lookahead,
         interpret=interpret,
+        weight_dma_priority=launch["weight_dma_priority"],
     )
 
     # ---- prep ----
@@ -912,6 +918,23 @@ def default_tile_m(n_tok):
     tile mostly computes and stages dead rows.
     """
     return 256 if n_tok >= 8192 else 128
+
+
+def default_launch(n_tok):
+    """Expert-kernel launch parameters for a token count.
+
+    At >= 8192 tokens the kernel is bound by row-gather descriptor issue (about
+    3 us per tile and 17 ns per row), not weight streaming: taller tiles with
+    six rungs, a 32-deep gather unroll and weight DMAs at the low priority
+    (so row gathers issue first) cut the 16384-token Qwen3.5-397B TP8 call
+    from 3310 to 2807 us, bit-identical (microbenchmark, 8 ranks, uniform
+    top-10 of 512). Below that nothing in the same sweep beat these defaults.
+    """
+    if n_tok >= 8192:
+        return dict(nbuf=3, tile_m=384, n_rungs=6, gather_unroll=32, lookahead=4,
+                    weight_dma_priority=0)
+    return dict(nbuf=4, tile_m=default_tile_m(n_tok), n_rungs=4, gather_unroll=8,
+                lookahead=3, weight_dma_priority=WEIGHT_DMA_PRIORITY)
 
 
 def rowquant_rows(x):
