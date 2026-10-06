@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_FUSED_NORM_QUANT: bool = False
     TPU_GDN_DECODE_ONLY_MAX_TOKENS: int = 0
+    TPU_GDN_DECODE_ONLY_KEEP_LAUNCH: bool = False
     TPU_FUSED_QK_NORM_ROPE: bool = False
     TPU_RPA_DECODE_BATCHED: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -718,6 +719,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GDN_DECODE_ONLY_MAX_TOKENS": env_nonnegative_int(
         "TPU_GDN_DECODE_ONLY_MAX_TOKENS", 0
     ),
+    # With TPU_GDN_DECODE_ONLY_MAX_TOKENS: keep launching the (empty) PER_SEQ
+    # kernel in decode-only buckets, with constant metadata, instead of
+    # dropping it -- XLA hides the MoE router-weight prefetch behind it.
+    "TPU_GDN_DECODE_ONLY_KEEP_LAUNCH": env_bool("TPU_GDN_DECODE_ONLY_KEEP_LAUNCH"),
     # Run the gated q split, q/k RMS norms and NeoX rope of Qwen3NextAttention
     # as one kernel on token buckets of up to 64 rows.
     "TPU_FUSED_QK_NORM_ROPE": env_bool("TPU_FUSED_QK_NORM_ROPE"),

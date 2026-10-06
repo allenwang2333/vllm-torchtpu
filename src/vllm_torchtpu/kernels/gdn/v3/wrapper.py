@@ -409,6 +409,7 @@ def _select_state_buffers(
         "batched_only",
         "prefill_only",
         "per_seq_cond",
+        "per_seq_empty",
         "zero_initialize_out",
         "compute_precision",
         "state_plan",
@@ -446,6 +447,7 @@ def fused_conv1d_gdn(
     batched_only: bool = False,
     prefill_only: bool = False,
     per_seq_cond: bool = False,
+    per_seq_empty: bool = False,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
     decode_tile_size: int = 4,
@@ -518,6 +520,10 @@ def fused_conv1d_gdn(
         per_seq_cond: Launch the PER_SEQ pass under a device-side
             `lax.cond` on `distribution[0] < distribution[-1]`, so a step
             with no prefill/mixed sequence skips its launch. Experimental.
+        per_seq_empty: The caller guarantees the step has no prefill/mixed
+            sequence: PER_SEQ is still launched (XLA uses the launch as a
+            slot for async prefetches) but with constant zero-tile metadata,
+            so none of its per-sequence metadata is computed.
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
@@ -794,6 +800,25 @@ def fused_conv1d_gdn(
                 read_offsets=read_offsets,
                 end_seq=distribution[0],
                 ckpt_indices=ckpt_indices,
+            )
+        elif per_seq_empty:
+            # Zero tiles: the kernel's `pl.when(num_tiles > 0)` skips the
+            # body, so the per-tile arrays are never read; only their shapes
+            # (those of compute_per_seq_metadata) matter.
+            p_ids = jnp.zeros((cfg.batch_size,), jnp.int32)
+            p_flags = jnp.zeros((cfg.batch_size,), jnp.bool_)
+            metadata_obj = memory_ref.MetadataRef.create(
+                cfgs=cfg,
+                num_tiles=jnp.zeros((), jnp.int32),
+                p_id_to_s_idx=p_ids,
+                p_id_to_r_base=p_ids,
+                p_id_to_r_size=p_ids,
+                p_id_is_first_tile=p_flags,
+                p_id_is_last_tile=p_flags,
+                s_idx_has_initial_state=jnp.zeros(seq_lens.shape, jnp.bool_),
+                s_idx_to_state_indices=state_indices,
+                s_idx_to_read_offset=read_offsets,
+                s_idx_to_ckpt_indices=ckpt_indices,
             )
         else:
             metadata_obj = metadata.compute_per_seq_metadata(
