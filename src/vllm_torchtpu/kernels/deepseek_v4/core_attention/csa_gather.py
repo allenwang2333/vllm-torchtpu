@@ -265,7 +265,7 @@ def csa_gather(
     # `num_streams` independent `pl.Indirect` gathers are issued per
     # pipeline step to keep multiple gather DMAs in flight.
     # See `outer_pipeline` for details.
-    num_streams = 4
+    num_streams = min(4, max(1, (top_k // 2) // row_subchunk_size))
     assert out_size % top_k == 0
     num_row_subchunks = top_k // row_subchunk_size
     row_chunk_size = row_subchunk_size * num_row_subchunks

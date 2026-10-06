@@ -1,0 +1,244 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""DeepSeek-V4.1 SWA-only and CSA attention ops, kept apart from the V4 ops."""
+
+import jax
+import jax.numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla_swa import (
+    mla_sliding_window_ragged_paged_attention,
+)
+from vllm_torchtpu.kernels.deepseek_v41.sparse_mla import (
+    sparse_ragged_paged_attention,
+)
+from vllm_torchtpu.utils import align_to
+
+
+def _prepare_swa_metadata(
+    swa_kv_lens: jax.Array,
+    swa_page_indices: jax.Array,
+    swa_cu_q_lens: jax.Array,
+    *,
+    num_tokens: int,
+    sw_cache_num_pages: int,
+    sliding_window: int,
+    logical_page_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    max_num_seqs = swa_kv_lens.shape[0]
+    pages_per_seq = swa_page_indices.size // max_num_seqs
+    # The kernel prefetches the page table into SMEM beside its other scalar
+    # inputs, so a large table is cut to the pages the window can reach.
+    if swa_page_indices.nbytes > pltpu.get_tpu_info().smem_capacity_bytes * 3 // 4:
+        window_pages = min(
+            pages_per_seq,
+            align_to(
+                (num_tokens + sliding_window) // logical_page_size + 8,
+                64,
+            ),
+        )
+        q_lens = swa_cu_q_lens[1:] - swa_cu_q_lens[:-1]
+        base_pages = (
+            jnp.maximum(0, swa_kv_lens - q_lens - sliding_window) // logical_page_size
+        )
+        swa_kv_lens = jnp.maximum(0, swa_kv_lens - base_pages * logical_page_size)
+        page_table_2d = swa_page_indices.reshape(max_num_seqs, pages_per_seq)
+        col_idx = jnp.minimum(
+            base_pages[:, None] + jnp.arange(window_pages, dtype=jnp.int32)[None, :],
+            pages_per_seq - 1,
+        )
+        pad_seqs = align_to(max_num_seqs, 8) - max_num_seqs
+        if pad_seqs > 0:
+            page_table_2d = jnp.pad(page_table_2d, ((0, pad_seqs), (0, 0)))
+            col_idx = jnp.pad(col_idx, ((0, pad_seqs), (0, 0)))
+        gathered = jnp.take_along_axis(page_table_2d, col_idx, axis=1)
+        if pad_seqs > 0:
+            gathered = gathered[:max_num_seqs]
+        swa_page_indices = gathered.reshape(-1)
+    if sw_cache_num_pages > 1:
+        swa_page_indices = jnp.where(
+            swa_page_indices > 0,
+            ((swa_page_indices - 1) % (sw_cache_num_pages - 1)) + 1,
+            0,
+        )
+    return swa_kv_lens, swa_page_indices
+
+
+def _run_swa(
+    q: jax.Array,
+    new_kv: jax.Array,
+    sw_cache: jax.Array,
+    swa_kv_lens: jax.Array,
+    swa_page_indices: jax.Array,
+    swa_cu_q_lens: jax.Array,
+    swa_distribution: jax.Array,
+    attention_sinks: jax.Array,
+    *,
+    sm_scale: float,
+    sliding_window: int,
+    logical_page_size: int,
+    swa_only: bool,
+    ced_decoder: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """SWA pass; output stays unnormalized when CSA follows (folds swa_l/swa_m)."""
+    if sw_cache.shape[0] == 0:
+        # Profiling-shape trace: no cache to attend over.
+        return (
+            jnp.zeros_like(q),
+            sw_cache,
+            jnp.zeros((q.shape[0], q.shape[1]), dtype=jnp.float32),
+            jnp.full((q.shape[0], q.shape[1]), -1e9, dtype=jnp.float32),
+        )
+    max_num_seqs = swa_kv_lens.shape[0]
+    eff_max_seqs = min(max_num_seqs, max(8, align_to(q.shape[0], 8)))
+    if eff_max_seqs < max_num_seqs:
+        pages_per_seq = swa_page_indices.size // max_num_seqs
+        swa_kv_lens = swa_kv_lens[:eff_max_seqs]
+        swa_page_indices = swa_page_indices[: eff_max_seqs * pages_per_seq]
+        swa_cu_q_lens = swa_cu_q_lens[: eff_max_seqs + 1]
+        swa_distribution = jnp.minimum(swa_distribution, eff_max_seqs)
+    swa_kv_lens, swa_page_indices = _prepare_swa_metadata(
+        swa_kv_lens,
+        swa_page_indices,
+        swa_cu_q_lens,
+        num_tokens=q.shape[0],
+        sw_cache_num_pages=sw_cache.shape[0],
+        sliding_window=sliding_window,
+        logical_page_size=logical_page_size,
+    )
+    return mla_sliding_window_ragged_paged_attention(
+        q=q,
+        new_kv=new_kv,
+        cache_kv=sw_cache,
+        kv_lens=swa_kv_lens,
+        page_indices=swa_page_indices,
+        cu_q_lens=swa_cu_q_lens,
+        distribution=swa_distribution,
+        attention_sinks=attention_sinks,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        logical_page_size=logical_page_size,
+        # The following parameters are tuned based on microbenchmark results.
+        num_kv_pages_per_block=(1, 1, 1) if sliding_window == 1 else (2, 2, 2),
+        num_queries_per_block=(1, 32, 8 if q.shape[0] <= 384 else 32),
+        q_compute_block_size=4,
+        unnormalized_output=not swa_only or sliding_window == 1,
+        ced_decoder=ced_decoder,
+    )
+
+
+# Module-level so pallas.jax_op can trace and register it as a torch op.
+def _attention_swa(
+    q: jax.Array,
+    new_kv: jax.Array,
+    sw_cache: jax.Array,
+    swa_kv_lens: jax.Array,
+    swa_page_indices: jax.Array,
+    swa_cu_q_lens: jax.Array,
+    swa_distribution: jax.Array,
+    main_cache_kv: jax.Array,
+    main_kv_lens: jax.Array,
+    extra: jax.Array,
+    main_page_indices: jax.Array,
+    main_cu_q_lens: jax.Array,
+    main_distribution: jax.Array,
+    attention_sinks: jax.Array,
+    *,
+    sm_scale: float,
+    sliding_window: int,
+    logical_page_size: int,
+    ced_decoder: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """SWA-only layers; the main-cache inputs keep the CSA op's signature."""
+    output, updated_sw_cache, _, _ = _run_swa(
+        q=q,
+        new_kv=new_kv,
+        sw_cache=sw_cache,
+        swa_kv_lens=swa_kv_lens,
+        swa_page_indices=swa_page_indices.flatten(),
+        swa_cu_q_lens=swa_cu_q_lens,
+        swa_distribution=swa_distribution,
+        attention_sinks=attention_sinks,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        logical_page_size=logical_page_size,
+        swa_only=True,
+        ced_decoder=ced_decoder,
+    )
+    return output, updated_sw_cache
+
+
+def _attention_csa(
+    q: jax.Array,
+    new_kv: jax.Array,
+    sw_cache: jax.Array,
+    swa_kv_lens: jax.Array,
+    swa_page_indices: jax.Array,
+    swa_cu_q_lens: jax.Array,
+    swa_distribution: jax.Array,
+    main_cache_kv: jax.Array,
+    main_kv_lens: jax.Array,
+    extra: jax.Array,  # encode_csa_gather_indices output from the indexer
+    main_page_indices: jax.Array,
+    main_cu_q_lens: jax.Array,
+    main_distribution: jax.Array,
+    attention_sinks: jax.Array,
+    main_cache_rope: jax.Array,
+    *,
+    sm_scale: float,
+    sliding_window: int,
+    logical_page_size: int,
+    two_caches_same_buffer: bool,
+    ced_decoder: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """CSA: SWA pass, then sparse attention over the indexer's top-k rows."""
+    if main_cache_kv.shape[0] == 0 or main_cache_rope.shape[0] == 0:
+        return jnp.zeros(q.shape, dtype=q.dtype), sw_cache
+
+    swa_output, updated_sw_cache, swa_l, swa_m = _run_swa(
+        q=q,
+        new_kv=new_kv,
+        sw_cache=sw_cache,
+        swa_kv_lens=swa_kv_lens,
+        swa_page_indices=swa_page_indices.flatten(),
+        swa_cu_q_lens=swa_cu_q_lens,
+        swa_distribution=swa_distribution,
+        attention_sinks=attention_sinks,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        logical_page_size=logical_page_size,
+        swa_only=False,
+        ced_decoder=ced_decoder,
+    )
+
+    # When both caches are one buffer, the CSA read must see the SWA kernel's
+    # write from this pass, not the pre-write snapshot.
+    if two_caches_same_buffer:
+        main_cache_kv = updated_sw_cache
+
+    output = sparse_ragged_paged_attention(
+        q=q,
+        cache_kv_nope=main_cache_kv,
+        cache_kv_rope=main_cache_rope,
+        topk_indices=extra,
+        cu_q_lens=main_cu_q_lens,
+        distribution=main_distribution,
+        attention_sinks=attention_sinks,
+        swa_accumution=swa_output,
+        swa_l=swa_l,
+        swa_m=swa_m,
+        sm_scale=sm_scale,
+        gather_and_attention_chunk_size=384 if q.shape[0] == 384 else 256,
+    )
+    return output, updated_sw_cache

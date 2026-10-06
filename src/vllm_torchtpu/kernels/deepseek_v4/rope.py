@@ -593,3 +593,163 @@ def rope_quant(
         quant_dtype=quant_dtype,
         name=name,
     )
+
+
+def _rmsnorm_rope_body(
+    x_ref: jax.Ref,
+    w_ref: jax.Ref,
+    cos_sin_ref: jax.Ref,
+    out_ref: jax.Ref,
+    *,
+    rotary_dim: int,
+    eps: float,
+    inverse: bool,
+    out_dtype: jnp.dtype,
+) -> None:
+    """Process one ``(tile_n, head_dim)`` chunk: weighted RMSNorm + RoPE."""
+    x = x_ref[...].astype(jnp.float32)
+    rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
+    normed = (x * rms).astype(out_dtype) * w_ref[...]
+
+    tail = normed[..., -LANE:].astype(jnp.float32)
+    cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
+    if tail.ndim == 3:
+        cos = cos[:, None, :]
+        sin = sin[:, None, :]
+    roped = (tail * cos + _rotate_gptj(tail) * sin).astype(out_dtype)
+
+    out_ref[...] = jnp.concatenate([normed[..., :-LANE], roped], axis=-1)
+
+
+def _rmsnorm_rope_kernel(
+    positions_ref: jax.Ref,
+    x_hbm_ref: jax.Ref,
+    w_hbm_ref: jax.Ref,
+    cos_sin_cache_hbm_ref: jax.Ref,
+    out_hbm_ref: jax.Ref,
+    *,
+    num_tiles: int,
+    tile_n: int,
+    x_block_shape: tuple[int, ...],
+    rotary_dim: int,
+    eps: float,
+    inverse: bool,
+    in_dtype: jnp.dtype,
+    cos_sin_dtype: jnp.dtype,
+) -> None:
+    x_spec = pl.BlockSpec(
+        block_shape=x_block_shape,
+        memory_space=pltpu.VMEM,
+        index_map=(lambda i: (i, 0, 0))
+        if len(x_block_shape) == 3
+        else (lambda i: (i, 0)),
+    )
+    w_block_shape = (1,) * (len(x_block_shape) - 1) + (x_block_shape[-1],)
+    w_spec = pl.BlockSpec(
+        block_shape=w_block_shape,
+        memory_space=pltpu.VMEM,
+        index_map=(
+            (lambda i: (0, 0, 0)) if len(x_block_shape) == 3 else (lambda i: (0, 0))
+        ),
+    )
+    cos_sin_spec = pl.BlockSpec(
+        block_shape=(tile_n, rotary_dim),
+        memory_space=pltpu.VMEM,
+        index_map=lambda i: (i, 0),
+    )
+    cos_sin_alloc = CosSinRef.create(
+        spec=cos_sin_spec, dtype=cos_sin_dtype, buffer_count=2, tile_n=tile_n
+    )
+
+    pipeline = pltpu.emit_pipeline(
+        functools.partial(
+            _rmsnorm_rope_body,
+            rotary_dim=rotary_dim,
+            eps=eps,
+            inverse=inverse,
+            out_dtype=in_dtype,
+        ),
+        grid=(num_tiles,),
+        in_specs=[x_spec, w_spec, cos_sin_spec],
+        out_specs=[x_spec],
+    )
+    allocations = (
+        pltpu.BufferedRef.input(x_spec, in_dtype, buffer_count=2),
+        pltpu.BufferedRef.input(w_spec, in_dtype, buffer_count=1),
+        cos_sin_alloc,
+        pltpu.BufferedRef.output(x_spec, in_dtype, buffer_count=2),
+    )
+
+    @pl.with_scoped(allocations=allocations)
+    def _run(allocations):
+        pipeline(
+            x_hbm_ref,
+            w_hbm_ref,
+            (cos_sin_cache_hbm_ref, positions_ref),
+            out_hbm_ref,
+            allocations=allocations,
+        )
+
+    _run()
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("eps", "inverse", "name"),
+)
+def rmsnorm_rope(
+    x: jax.Array,  # [num_tokens, head_dim]
+    weight: jax.Array,  # [head_dim]
+    positions: jax.Array,  # [num_tokens] int
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    *,
+    eps: float = 1e-6,
+    inverse: bool = False,
+    name: str = "rmsnorm_rope",
+) -> jax.Array:
+    """Weighted RMSNorm fused with DeepSeek-V4 RoPE in a single Pallas kernel."""
+    assert x.ndim in (2, 3)
+    assert positions.ndim == 1 and positions.shape[0] == x.shape[0]
+    assert cos_sin_cache.ndim == 2
+
+    num_tokens = x.shape[0]
+    head_dim = x.shape[-1]
+    rotary_dim = cos_sin_cache.shape[1]
+    assert head_dim % LANE == 0
+    assert rotary_dim % 2 == 0 and rotary_dim <= LANE
+    tile_n = largest_divisor(num_tokens, cap=64)
+
+    x_block_shape = (tile_n, *x.shape[1:])
+    w_reshaped = weight.astype(x.dtype).reshape((1,) * (x.ndim - 1) + (head_dim,))
+    kernel = functools.partial(
+        _rmsnorm_rope_kernel,
+        num_tiles=num_tokens // tile_n,
+        tile_n=tile_n,
+        x_block_shape=x_block_shape,
+        rotary_dim=rotary_dim,
+        eps=eps,
+        inverse=inverse,
+        in_dtype=x.dtype,
+        cos_sin_dtype=cos_sin_cache.dtype,
+    )
+
+    grid_spec = pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=1,
+        in_specs=(
+            pl.BlockSpec(memory_space=pltpu.HBM),  # x
+            pl.BlockSpec(memory_space=pltpu.HBM),  # w_reshaped
+            pl.BlockSpec(memory_space=pltpu.HBM),  # cos_sin_cache
+        ),
+        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+    )
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        grid_spec=grid_spec,
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+    )(positions, x, w_reshaped, cos_sin_cache)

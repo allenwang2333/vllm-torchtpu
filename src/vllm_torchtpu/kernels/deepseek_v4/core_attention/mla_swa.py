@@ -113,6 +113,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     q_compute_block_size: int | None,
     bkv_p,
     bq_sz,
+    ced_decoder: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert sliding_window > 0
@@ -276,13 +277,12 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         #   q_pos_min = kv_len - q_len + bq_idx * bq_sz
         # and attends to keys k with 0 <= q_pos_min - k < sliding_window, so the
         # first key it can ever need is q_pos_min - sliding_window + 1.
+        kv_len_s = _get_kv_len(seq_idx)
+        q_len_s = _get_q_len(seq_idx)
+        min_start = jnp.where(q_len_s > 1, kv_len_s - q_len_s, 0) if ced_decoder else 0
         return jnp.maximum(
-            _get_kv_len(seq_idx)
-            - _get_q_len(seq_idx)
-            + bq_idx * bq_sz
-            - sliding_window
-            + 1,
-            0,
+            kv_len_s - q_len_s + bq_idx * bq_sz - sliding_window + 1,
+            min_start,
         )
 
     def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, start_offset, *, wait=False):
@@ -1410,6 +1410,7 @@ def run_mla_batched_decode_kernel(
         "unnormalized_output",
         "non_causal_block",
         "q_compute_block_size",
+        "ced_decoder",
     ),
     donate_argnames=("cache_kv",),
 )
@@ -1441,6 +1442,7 @@ def mla_sliding_window_ragged_paged_attention(
     # context keys). Requires q_len <= sliding_window.
     non_causal_block: bool = False,
     decode_seq_batch_size: int = 32,
+    ced_decoder: bool = False,
 ) -> tuple[
     jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     jax.Array,  # [total_num_pages, physical_page_size_per_kv_packing, 4, 128] uint8
@@ -1642,6 +1644,7 @@ def mla_sliding_window_ragged_paged_attention(
         scope_name = (
             f"SWA-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}"
             f"{'-ncb' if non_causal_block else ''}"
+            f"{'-ced' if ced_decoder else ''}"
         )
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
@@ -1656,6 +1659,7 @@ def mla_sliding_window_ragged_paged_attention(
                     unnormalized_output=unnormalized_output,
                     non_causal_block=non_causal_block,
                     q_compute_block_size=q_compute_block_size,
+                    ced_decoder=ced_decoder,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
