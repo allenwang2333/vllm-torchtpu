@@ -108,3 +108,11 @@ def test_second_chunk_of_windows_only(limit):
 
 def test_large_prefill_unchanged(limit):
     assert _bucket(700, limit + 1) == 1024
+
+
+def test_kwargs_drop_or_keep_launch(limit, monkeypatch):
+    assert gdn_attention.gdn_decode_only_kwargs(128) == {}
+    assert gdn_attention.gdn_decode_only_kwargs(16) == {"batched_only": True}
+    monkeypatch.setenv("TPU_GDN_DECODE_ONLY_KEEP_LAUNCH", "1")
+    assert gdn_attention.gdn_decode_only_kwargs(16) == {"per_seq_empty": True}
+    assert gdn_attention.gdn_decode_only_kwargs(128) == {}
