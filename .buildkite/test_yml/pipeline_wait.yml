@@ -25,11 +25,19 @@ steps:
     key: "block"
     prompt: "All tests passed. continue?"
 
-  - label: ":work: Finished"
-    key: "finished"
+  - label: ":work: Finished - 1"
+    key: "finished1"
     agents:
       queue: cpu
     commands:
-      - echo "Finished"
+      - echo "Finished 1"
+
+  - label: ":work: Finished - 2"
+    key: "finished2"
+    depends_on: finished1
+    agents:
+      queue: cpu
+    commands:
+      - echo "Finished 2"
 
 
