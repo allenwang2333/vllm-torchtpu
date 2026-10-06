@@ -97,6 +97,7 @@ from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_confi
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     RejectionSampler,
+    _random_rejection_sample_sparse,
     sparse_window_sample,
 )
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
@@ -120,7 +121,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
-from vllm_torchtpu.runner import greedy_top_tokens
+from vllm_torchtpu.runner import greedy_top_tokens, topk_window
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import maybe_create_mm_encoder_manager
@@ -1031,6 +1032,10 @@ class TPUModelRunner(GPUModelRunner):
         self._token_padding_state: token_padding.TokenPaddingState | None = None
         # Set at load when TPU_GREEDY_TOP_TOKENS is on.
         self._greedy_head_owner: torch.nn.Module | None = None
+        # Set at load when TPU_SAMPLER_VOCAB_PARALLEL_TOPK is on (with the
+        # sparse spec sampler): the module whose vocab-parallel LM head
+        # builds verify windows without the full-logits gather.
+        self._topk_window_owner: torch.nn.Module | None = None
 
         self._init_phased_profiling()
 
@@ -3701,7 +3706,25 @@ class TPUModelRunner(GPUModelRunner):
                         hidden_states, layout_plan, logits_indices
                     )
                 )
-                if sample_hidden_states is None:
+                window_width = self._topk_window_width(
+                    spec_decode_metadata,
+                    start_index,
+                    end_index,
+                    self.input_batch.all_greedy,
+                )
+                if window_width and sample_hidden_states is None:
+                    hidden_states = sequence_layout_planner.finalize_hidden_states(
+                        hidden_states,
+                        layout_plan,
+                    )
+                    logits = self.compute_selected_topk_window(
+                        hidden_states, logits_indices, window_width
+                    )
+                elif window_width:
+                    logits = self.compute_topk_window_from_hidden_states(
+                        sample_hidden_states, window_width
+                    )
+                elif sample_hidden_states is None:
                     hidden_states = sequence_layout_planner.finalize_hidden_states(
                         hidden_states,
                         layout_plan,
@@ -4001,8 +4024,14 @@ class TPUModelRunner(GPUModelRunner):
 
         Returns the rejection sampler's [num_reqs, 1 + num_spec_tokens]
         selected tokens for the chunk. With ``top_tokens``, ``logits`` holds
-        each row's greedy token instead.
+        each row's greedy token instead; when ``_topk_window_width`` took the
+        chunk, it holds each row's top-k window ``(values, ids)``.
         """
+        if isinstance(logits, tuple):
+            assert grammar_output is None and not all_greedy
+            return self._sample_spec_verify_chunk_sparse(
+                None, md, cur_start_idx, cur_end_idx, sampling_generator, logits
+            )
         if top_tokens:
             bonus_token_ids, target_argmax = self.spec_bonus_and_target_tokens(
                 logits, md.bonus_logits_indices, md.target_logits_indices
@@ -4704,6 +4733,20 @@ class TPUModelRunner(GPUModelRunner):
             self._greedy_head_owner = greedy_top_tokens.resolve_head_owner(
                 self.model, self._dp_lockstep_enabled()
             )
+        if (
+            envs.TPU_SAMPLER_VOCAB_PARALLEL_TOPK
+            and self._sampling_topk_bound > 0
+            and self._pp_is_last
+            and not self.is_pooling_model
+        ):
+            try:
+                self._topk_window_owner = greedy_top_tokens.resolve_head_owner(
+                    self.model, self._dp_lockstep_enabled()
+                )
+            except NotImplementedError as e:
+                logger.warning(
+                    "TPU_SAMPLER_VOCAB_PARALLEL_TOPK is off for this model: %s", e
+                )
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
@@ -5357,6 +5400,40 @@ class TPUModelRunner(GPUModelRunner):
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
 
+    def _precompile_topk_window(self) -> None:
+        """The vocab-parallel window programs at the shapes the full-logits
+        programs are warmed at."""
+        if self._topk_window_owner is None:
+            return
+        width = self._sampling_topk_bound
+        hsize = self.model_config.get_hidden_size()
+        with self._precompile_timed("compute_selected_topk_window"):
+            for num_tokens in self.num_tokens_paddings:
+                dummy_hidden = torch.zeros(
+                    (num_tokens, hsize),
+                    dtype=self._hidden_states_dtype,
+                ).to(self.device)
+                for num_reqs in self.num_reqs_paddings:
+                    indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
+                    out = self.compute_selected_topk_window(
+                        dummy_hidden, indices, width
+                    )
+                    synchronize_tensors(out)
+                    if num_reqs >= min(num_tokens, self.max_num_reqs):
+                        break
+        if not _get_sequence_layout_planner_for_runner(
+            self
+        ).uses_selected_logits_hidden_states:
+            return
+        with self._precompile_timed("compute_topk_window_from_hidden_states"):
+            for num_reqs in self.num_reqs_paddings:
+                dummy_hidden = torch.zeros(
+                    (num_reqs, hsize),
+                    dtype=self._hidden_states_dtype,
+                ).to(self.device)
+                out = self.compute_topk_window_from_hidden_states(dummy_hidden, width)
+                synchronize_tensors(out)
+
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_logits_from_hidden_states"):
@@ -5766,6 +5843,36 @@ class TPUModelRunner(GPUModelRunner):
         temps = torch.ones((num_reqs, 1), dtype=torch.float32).to(device)
         top_k = torch.ones((num_reqs, 1), dtype=torch.int32).to(device)
         top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(device)
+        if envs.TPU_SPARSE_SPEC_FUSED_VERIFY:
+            num_rows = target_logits_indices.shape[0]
+            u = torch.rand(
+                (num_reqs * width + num_rows * (width + 1),),
+                dtype=torch.float32,
+                device=device,
+            )
+            args = (
+                bonus_logits_indices,
+                target_logits_indices,
+                draft_token_ids,
+                draft_lengths,
+                segment_ids,
+                group_indices,
+                temps,
+                top_k,
+                top_p,
+                u,
+                self.rejection_sampler.synthetic_conditional_rates,
+                self.speculative_config.num_speculative_tokens,
+            )
+            synchronize_tensors(self.spec_sparse_verify_from_logits(logits, width, *args))
+            if self._topk_window_owner is not None:
+                rows = logits.shape[0]
+                win_vals = torch.zeros((rows, width), dtype=torch.float32, device=device)
+                win_idx = torch.zeros((rows, width), dtype=torch.int32, device=device)
+                synchronize_tensors(
+                    self.spec_sparse_verify_from_window(win_vals, win_idx, *args)
+                )
+            return
         bonus_u = torch.rand((num_reqs, width), dtype=torch.float32, device=device)
         bonus_token_ids, target_vals, target_idx = self.spec_sparse_topk_and_bonus(
             logits,
@@ -5777,6 +5884,25 @@ class TPUModelRunner(GPUModelRunner):
             bonus_u,
             width,
         )
+        if self._topk_window_owner is not None:
+            win_vals = torch.zeros(
+                (logits.shape[0], width), dtype=torch.float32, device=device
+            )
+            win_idx = torch.zeros(
+                (logits.shape[0], width), dtype=torch.int32, device=device
+            )
+            synchronize_tensors(
+                self.spec_window_bonus(
+                    win_vals,
+                    win_idx,
+                    bonus_logits_indices,
+                    target_logits_indices,
+                    temps,
+                    top_k,
+                    top_p,
+                    bonus_u,
+                )
+            )
         accept_u = torch.rand(draft_token_ids.shape, dtype=torch.float32, device=device)
         recover_u = torch.rand(
             (target_vals.shape[0], width), dtype=torch.float32, device=device
@@ -5810,6 +5936,7 @@ class TPUModelRunner(GPUModelRunner):
         ).uses_selected_logits_hidden_states:
             self._precompile_compute_logits_from_hidden_states()
         self._precompile_compute_top_tokens()
+        self._precompile_topk_window()
         self._precompile_structured_decoding()
         self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
@@ -6743,50 +6870,94 @@ class TPUModelRunner(GPUModelRunner):
         cur_start_idx: int,
         cur_end_idx: int,
         sampling_generator: torch.Generator | None,
+        window: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """``_sample_spec_verify_chunk`` for a chunk that passes
-        ``_sparse_spec_sampling_ok``: one top-k over the logits rows, then the
-        bonus sample and the rejection sampler on the [rows, bound] windows,
-        so no full-vocab pass follows the top-k."""
+        ``_sparse_spec_sampling_ok``: one top-k over the logits rows (or the
+        rows' precomputed top-k ``window``), then the bonus sample and the
+        rejection sampler on the [rows, bound] windows, so no full-vocab pass
+        follows the top-k."""
         width = self._sampling_topk_bound
         padded_num_reqs = md.bonus_logits_indices.shape[0]
+        device = md.draft_token_ids.device
         temps, top_k, top_p = self._build_padded_sampling_params(
             cur_start_idx,
             cur_end_idx,
-            logits,
+            logits if window is None else window[0],
             padded_num_reqs=padded_num_reqs,
             dtype=torch.float32,
         )
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
+        if envs.TPU_SPARSE_SPEC_FUSED_VERIFY:
+            # One uniform draw for the bonus noise, the accept test and the
+            # recovery noise, sliced inside one compiled verify program.
+            num_rows = md.target_logits_indices.shape[0]
+            u = torch.rand(
+                (padded_num_reqs * width + num_rows * (width + 1),),
+                dtype=torch.float32,
+                device=device,
+                generator=sampling_generator,
+            )
+            args = (
+                md.bonus_logits_indices,
+                md.target_logits_indices,
+                md.draft_token_ids,
+                md.draft_lengths,
+                md.segment_ids,
+                md.group_indices,
+                temps,
+                top_k,
+                top_p,
+                u,
+                self.rejection_sampler.synthetic_conditional_rates,
+                self.speculative_config.num_speculative_tokens,
+            )
+            if window is None:
+                return self.spec_sparse_verify_from_logits(logits, width, *args)
+            return self.spec_sparse_verify_from_window(window[0], window[1], *args)
         bonus_u = torch.rand(
             (padded_num_reqs, width),
             dtype=torch.float32,
-            device=logits.device,
+            device=device,
             generator=sampling_generator,
         )
-        bonus_token_ids, target_vals, target_idx = self.spec_sparse_topk_and_bonus(
-            logits,
-            md.bonus_logits_indices,
-            md.target_logits_indices,
-            temps,
-            top_k,
-            top_p,
-            bonus_u,
-            width,
-        )
+        if window is None:
+            bonus_token_ids, target_vals, target_idx = (
+                self.spec_sparse_topk_and_bonus(
+                    logits,
+                    md.bonus_logits_indices,
+                    md.target_logits_indices,
+                    temps,
+                    top_k,
+                    top_p,
+                    bonus_u,
+                    width,
+                )
+            )
+        else:
+            bonus_token_ids, target_vals, target_idx = self.spec_window_bonus(
+                window[0],
+                window[1],
+                md.bonus_logits_indices,
+                md.target_logits_indices,
+                temps,
+                top_k,
+                top_p,
+                bonus_u,
+            )
         accept_u = torch.rand(
             md.draft_token_ids.shape,
             dtype=torch.float32,
-            device=logits.device,
+            device=device,
             generator=sampling_generator,
         )
         recover_u = torch.rand(
             (target_vals.shape[0], width),
             dtype=torch.float32,
-            device=logits.device,
+            device=device,
             generator=sampling_generator,
         )
-        assert self.rejection_sampler is not None
-        assert self.speculative_config is not None
         return self.rejection_sampler.forward_sparse(
             draft_token_ids=md.draft_token_ids,
             num_draft_tokens=md.draft_lengths,
@@ -6801,6 +6972,80 @@ class TPUModelRunner(GPUModelRunner):
             top_p=top_p,
             accept_u=accept_u,
             recover_u=recover_u,
+        )
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def spec_sparse_verify_from_logits(
+        self,
+        logits: torch.Tensor,
+        width: int,
+        *args,
+    ) -> torch.Tensor:
+        """``spec_sparse_verify_from_window`` on the top-``width`` windows
+        of the full logits rows."""
+        vals, idx = _chunked_topk(logits, width)
+        return self._sparse_verify(vals, idx, *args)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def spec_sparse_verify_from_window(
+        self, vals: torch.Tensor, idx: torch.Tensor, *args
+    ) -> torch.Tensor:
+        """The sparse verify (bonus sample + rejection sampler on the
+        windows) as one program; see ``_sparse_verify``."""
+        return self._sparse_verify(vals, idx, *args)
+
+    @staticmethod
+    def _sparse_verify(
+        vals: torch.Tensor,
+        idx: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        u: torch.Tensor,
+        synthetic_conditional_rates: torch.Tensor | None,
+        max_draft_tokens: int,
+    ) -> torch.Tensor:
+        """``spec_window_bonus`` + ``RejectionSampler.forward_sparse`` with
+        their three uniform draws taken from one flat ``u``: [num_reqs, width]
+        bonus noise, then [rows] accept uniforms, then [rows, width] recovery
+        noise."""
+        width = vals.shape[-1]
+        num_reqs = bonus_logits_indices.shape[0]
+        num_rows = target_logits_indices.shape[0]
+        bonus_end = num_reqs * width
+        accept_end = bonus_end + num_rows
+        bonus_token_ids, target_vals, target_idx = TPUModelRunner._window_bonus(
+            vals,
+            idx,
+            bonus_logits_indices,
+            target_logits_indices,
+            temperatures,
+            top_k,
+            top_p,
+            u[:bonus_end].view(num_reqs, width),
+        )
+        return _random_rejection_sample_sparse(
+            draft_token_ids,
+            target_vals,
+            target_idx,
+            draft_lengths,
+            bonus_token_ids,
+            segment_ids,
+            group_indices,
+            max_draft_tokens,
+            temperatures,
+            top_k,
+            top_p,
+            u[bonus_end:accept_end].view(draft_token_ids.shape),
+            u[accept_end:].view(num_rows, width),
+            synthetic_conditional_rates,
+            synthetic_conditional_rates is not None,
         )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -6819,6 +7064,52 @@ class TPUModelRunner(GPUModelRunner):
         from its row's window (Gumbel-max, as ``sample_from_logits``), and the
         draft rows' windows for ``RejectionSampler.forward_sparse``."""
         vals, idx = _chunked_topk(logits, width)
+        return self._window_bonus(
+            vals,
+            idx,
+            bonus_logits_indices,
+            target_logits_indices,
+            temperatures,
+            top_k,
+            top_p,
+            bonus_u,
+        )
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def spec_window_bonus(
+        self,
+        vals: torch.Tensor,
+        idx: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        bonus_u: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``spec_sparse_topk_and_bonus`` on precomputed windows."""
+        return self._window_bonus(
+            vals,
+            idx,
+            bonus_logits_indices,
+            target_logits_indices,
+            temperatures,
+            top_k,
+            top_p,
+            bonus_u,
+        )
+
+    @staticmethod
+    def _window_bonus(
+        vals: torch.Tensor,
+        idx: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        bonus_u: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bonus_vals = torch.index_select(vals, 0, bonus_logits_indices)
         bonus_idx = torch.index_select(idx, 0, bonus_logits_indices)
         target_vals = torch.index_select(vals, 0, target_logits_indices)
@@ -6942,6 +7233,53 @@ class TPUModelRunner(GPUModelRunner):
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         return greedy_top_tokens.top_tokens(self._greedy_head_owner, hidden_states)
+
+    def _topk_window_width(
+        self,
+        md: SpecDecodeMetadata | None,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        all_greedy: bool,
+    ) -> int:
+        """The window width when this chunk's logits can be just its rows'
+        vocab-parallel top-k windows (``TPU_SAMPLER_VOCAB_PARALLEL_TOPK``),
+        else 0: a non-greedy verify chunk that ``_sample_spec_verify_chunk``
+        sends to the sparse sampler, in a step that asks for no logprobs and
+        holds no structured-output request (whose grammar mask, known only in
+        ``sample_tokens``, needs the full logits)."""
+        if (
+            self._topk_window_owner is None
+            or md is None
+            or all_greedy
+            or self.input_batch.max_num_logprobs is not None
+            or not self._sparse_spec_sampling_ok(cur_start_idx, cur_end_idx)
+        ):
+            return 0
+        for req_id in self.input_batch.req_ids[: self.input_batch.num_reqs]:
+            if req_id is None:
+                continue
+            req = self.requests.get(req_id)
+            params = req.sampling_params if req is not None else None
+            if params is not None and params.structured_outputs is not None:
+                return 0
+        return self._sampling_topk_bound
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_selected_topk_window(
+        self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor, width: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        return topk_window.window_from_hidden_states(
+            self._topk_window_owner, selected, width
+        )
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_topk_window_from_hidden_states(
+        self, hidden_states: torch.Tensor, width: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return topk_window.window_from_hidden_states(
+            self._topk_window_owner, hidden_states, width
+        )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_bonus_and_target_logits(

@@ -735,8 +735,14 @@ def sparse_window_sample(
     )
     gumbel_noise = -torch.log(-torch.log(u_clamped))
     pos = torch.argmax(window_logits + gumbel_noise, dim=-1, keepdim=True)
-    pos = torch.where(is_greedy, torch.zeros_like(pos), pos)
-    return torch.gather(idx, -1, pos).view(-1)
+    sampled = torch.gather(idx, -1, pos)
+    # Greedy rows: the lowest id holding the row maximum, as torch.argmax
+    # over the full logits picks it (the window's tie order is unspecified).
+    no_id = torch.full_like(idx, torch.iinfo(idx.dtype).max)
+    lowest_max = torch.amin(
+        torch.where(vals == vals[..., :1], idx, no_id), dim=-1, keepdim=True
+    )
+    return torch.where(is_greedy, lowest_max, sampled).view(-1)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)

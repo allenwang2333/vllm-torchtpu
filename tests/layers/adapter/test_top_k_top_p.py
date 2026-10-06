@@ -134,3 +134,24 @@ def test_chunked_topk_values_match_topk(vocab, dtype):
     assert int(idx.max()) < vocab
     finite = torch.isfinite(vals)
     assert torch.equal(torch.gather(logits, -1, idx)[finite], vals[finite])
+
+
+@pytest.mark.parametrize("vocab", [31_040, 9_024, 30_001])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_shard_topk_values_match_topk(device, vocab, dtype):
+    # 31040 = the Qwen3.5 TP8 slice (one-hot fetch in bf16, gather in f32);
+    # 30001 does not tile into 64-wide chunks (_chunked_topk).
+    width = 64
+    gen = torch.Generator().manual_seed(vocab)
+    logits = (torch.randn(8, vocab, generator=gen) * 3).to(dtype)
+    logits[1] = torch.randint(-3, 3, (vocab,), generator=gen).to(dtype)  # ties
+    logits[2] = 0.0  # all tied
+    logits[3, -100:] = float("-inf")  # a padded slice tail
+    logits[4, 640:704] += 40.0  # the whole window inside one chunk
+    vals, idx = sampling.shard_topk(logits.to(device), width)
+    vals, idx = vals.cpu(), idx.cpu()
+    ref_vals, _ = torch.topk(logits.float(), width, dim=-1)
+    assert idx.dtype == torch.int32
+    assert torch.equal(vals.float(), ref_vals)
+    assert torch.equal(torch.gather(logits, -1, idx.long()), vals)
+    assert all(len(set(row.tolist())) == width for row in idx)

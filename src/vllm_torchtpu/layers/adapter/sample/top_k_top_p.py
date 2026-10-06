@@ -338,3 +338,48 @@ def _chunked_topk(
     # ``width`` finite logits; it is never a survivor, so any in-range index
     # will do.
     return vals, idx.clamp(max=vocab - 1)
+
+
+_SHARD_CHUNK = 64
+
+
+def shard_topk(logits: torch.Tensor, width: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sorted top-``width`` values of each row of one vocabulary slice and
+    the (slice-local, int32) indices holding them.
+
+    ``_chunked_topk`` with 64-wide chunks that tile the slice exactly (the
+    Qwen3.5 TP8 slice is 31040 = 485 x 64, so no padded copy), and for bf16
+    the ``width`` chosen chunks are fetched with a one-hot matmul instead of
+    a gather: each output is one logit times 1 plus zeros, exact in the
+    matmul's f32 accumulation, and the MXU does it in a few microseconds
+    where the gather offload costs tens (j-1be54ac4: 52 vs 105 us for
+    [48, 31040]). Infinities are clamped to the dtype's finite range first,
+    since 0 x inf would poison a row; the order of values is unchanged.
+    The values are exactly the slice's top-``width`` (see ``_chunked_topk``
+    for the argument); which of several tied indices is named can differ.
+    """
+    rows, n = logits.shape
+    num_chunks = n // _SHARD_CHUNK
+    if n % _SHARD_CHUNK or num_chunks <= width:
+        vals, idx = _chunked_topk(logits, width)
+        return vals, idx.to(torch.int32)
+    chunks = logits.view(rows, num_chunks, _SHARD_CHUNK)
+    chunk_max = torch.amax(chunks, dim=-1)
+    _, top_chunks = torch.topk(chunk_max, width, dim=-1, largest=True, sorted=False)
+    if logits.dtype == torch.bfloat16:
+        info = torch.finfo(logits.dtype)
+        finite = torch.clamp(chunks, min=info.min, max=info.max)
+        one_hot = (
+            top_chunks.unsqueeze(-1)
+            == torch.arange(num_chunks, device=logits.device, dtype=top_chunks.dtype)
+        ).to(logits.dtype)
+        candidates = torch.bmm(one_hot, finite)
+    else:
+        candidates = torch.gather(
+            chunks, 1, top_chunks.unsqueeze(-1).expand(rows, width, _SHARD_CHUNK)
+        )
+    candidates = candidates.reshape(rows, width * _SHARD_CHUNK)
+    vals, pos = torch.topk(candidates, width, dim=-1, largest=True, sorted=True)
+    chunk_of = torch.gather(top_chunks, 1, pos // _SHARD_CHUNK)
+    idx = chunk_of * _SHARD_CHUNK + pos % _SHARD_CHUNK
+    return vals, idx.to(torch.int32)
