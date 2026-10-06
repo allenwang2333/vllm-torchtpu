@@ -302,6 +302,26 @@ class RpaSchedule:
 
         return jax.tree.map(wrapper, self)
 
+    def out_shapes(self):
+        """Returns a Pytree of output shapes pinned to HBM.
+
+        out_specs alone does not constrain where XLA places a pallas_call result:
+        the custom call's output memory space comes from the out_shape aval. A plain
+        ShapeDtypeStruct leaves it unconstrained, so memory-space assignment put the
+        large schedule arrays in S(1) (VMEM) and then inserted one serialized
+        S(1)->HBM copy-start/copy-done (~0.6us each) per array before the RPA kernel
+        that reads them from HBM. Pinning them to HBM emits
+        output_memory_space_colors=0 and removes those copies. Size-1 leaves
+        (actual_steps) are read as SMEM by the consumer and stay unconstrained.
+        """
+
+        def wrapper(x):
+            if x.size == 1:
+                return x
+            return pltpu.HBM(x.shape, x.dtype)
+
+        return jax.tree.map(wrapper, self)
+
     def out_specs(self):
         """Returns a Pytree of output BlockSpecs."""
 
@@ -916,7 +936,7 @@ def generate_rpa_metadata(
             cfgs=cfgs,
             computer_cls=computer_cls,
         ),
-        out_shape=schedule_hbm,
+        out_shape=schedule_hbm.out_shapes(),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=6,
             in_specs=[],
