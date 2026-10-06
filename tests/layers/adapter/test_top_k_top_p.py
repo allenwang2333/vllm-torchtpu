@@ -117,3 +117,20 @@ def test_candidate_blocks_leave_rows_without_top_k_unmasked():
     result = sampling.apply_top_k_top_p_candidates(logits, top_k, top_p, 16)
     torch.testing.assert_close(result[:2], logits[:2], rtol=0, atol=0)
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("vocab", [248_320, 151_936 + 77, 4_000])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_chunked_topk_values_match_topk(vocab, dtype):
+    width = 64
+    gen = torch.Generator().manual_seed(vocab)
+    logits = (torch.randn(6, vocab, generator=gen) * 3).to(dtype)
+    logits[1] = torch.randint(-3, 3, (vocab,), generator=gen).to(dtype)  # ties
+    logits[2, :] = float("-inf")
+    logits[2, :10] = 1.0  # fewer finite logits than the width
+    vals, idx = sampling._chunked_topk(logits, width)
+    ref_vals, _ = torch.topk(logits, width, dim=-1)
+    assert torch.equal(vals, ref_vals)
+    assert int(idx.max()) < vocab
+    finite = torch.isfinite(vals)
+    assert torch.equal(torch.gather(logits, -1, idx)[finite], vals[finite])
