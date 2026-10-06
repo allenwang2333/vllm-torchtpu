@@ -62,7 +62,6 @@ def _build_expert_kernel(
     unroll,
     lookahead,
     interpret,
-    gather_queues=1,
 ):
     """The per-rank expert kernel for a fixed token count and route count.
 
@@ -229,11 +228,9 @@ def _build_expert_kernel(
                     for u in range(unroll):
                         r = i * unroll + u
                         tok = win_sm[wslot, off + r]
-                        # gather_queues=2 spreads the per-row descriptors over
-                        # both DMA queues (the weight refills use priority 1).
                         pltpu.make_async_copy(
                             x_hbm.at[tok], lhs_vm.at[slot, r], lhs_sems.at[slot]
-                        ).start(priority=u % gather_queues)
+                        ).start()
                     return c
 
                 # Whole blocks of `unroll` rows: up to unroll-1 dead rows ride
@@ -423,7 +420,7 @@ def _build_expert_kernel(
         interpret=pltpu.InterpretParams() if interpret else False,
         name=(
             f"moe_tp_prefill_t{n_tok}_e{n_experts}_i{inter}_is{inter_sh}_nb{nbuf}"
-            f"_u{unroll}_m{tile_m}r{n_rungs}_la{lookahead}_q{gather_queues}"
+            f"_u{unroll}_m{tile_m}r{n_rungs}_la{lookahead}"
         ),
     )
     return call, dict(slab_rows=slab_rows, scale_rows=scale_rows, tok_rows=tok_rows)
@@ -513,7 +510,6 @@ def moe_tp_prefill(
     n_rungs=4,
     gather_unroll=8,
     lookahead=2,
-    gather_queues=1,
     expert_start=None,
     interpret=False,
 ):
@@ -555,7 +551,6 @@ def moe_tp_prefill(
         unroll=gather_unroll,
         lookahead=lookahead,
         interpret=interpret,
-        gather_queues=gather_queues,
     )
 
     # ---- prep ----
