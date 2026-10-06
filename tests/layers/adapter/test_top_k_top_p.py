@@ -79,3 +79,41 @@ def test_apply_top_k_top_p_per_request():
     result = sampling.apply_top_k_top_p(logits, top_k, top_p)
     torch.testing.assert_close(result, expected)
     torch.testing.assert_close(logits, original)
+
+
+def test_candidate_blocks_match_full_vocab_for_agentx_sampling():
+    gen = torch.Generator().manual_seed(0)
+    logits = (torch.randn(6, 128 * 400, generator=gen) * 3).bfloat16().float() / 0.6
+    top_k = torch.full((6, 1), 20, dtype=torch.int32)
+    top_p = torch.full((6, 1), 0.95)
+    expected = sampling.apply_top_k_top_p(logits, top_k, top_p)
+    result = sampling.apply_top_k_top_p_candidates(logits, top_k, top_p, 64)
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+def test_candidate_blocks_keep_ties_within_the_documented_bound():
+    # 19 distinct large logits plus 13 ties at the 20th value, one per block:
+    # 32 logits >= the 20th largest, exactly num_blocks.
+    num_blocks, k = 32, 20
+    logits = torch.full((1, 128 * 100), -5.0)
+    for i in range(k - 1):
+        logits[0, 128 * i] = 10.0 + i
+    for j in range(num_blocks - k + 1):
+        logits[0, 128 * (k - 1 + j) + 7] = 9.0
+    top_k = torch.tensor([[k]], dtype=torch.int32)
+    for p in (1.0, 0.9):
+        top_p = torch.tensor([[p]])
+        expected = sampling.apply_top_k_top_p(logits, top_k, top_p)
+        result = sampling.apply_top_k_top_p_candidates(logits, top_k, top_p, num_blocks)
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+def test_candidate_blocks_leave_rows_without_top_k_unmasked():
+    gen = torch.Generator().manual_seed(1)
+    logits = torch.randn(3, 128 * 50, generator=gen)
+    top_k = torch.tensor([[0], [-1], [5]], dtype=torch.int32)
+    top_p = torch.tensor([[1.0], [1.0], [0.9]])
+    expected = sampling.apply_top_k_top_p(logits, top_k, top_p)
+    result = sampling.apply_top_k_top_p_candidates(logits, top_k, top_p, 16)
+    torch.testing.assert_close(result[:2], logits[:2], rtol=0, atol=0)
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)

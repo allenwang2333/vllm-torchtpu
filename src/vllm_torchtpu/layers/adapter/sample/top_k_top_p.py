@@ -249,3 +249,47 @@ def apply_top_k_top_p(
     should_apply_topp = (top_p < 1.0).expand(-1, masked_logits.shape[-1])
     topp_masked = topp_mask(masked_logits, top_p, MASKED_LOGIT_VALUE)
     return torch.where(should_apply_topp, topp_masked, masked_logits)
+
+
+CANDIDATE_BLOCK = 128
+
+
+def apply_top_k_top_p_candidates(
+    logits: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    num_blocks: int,
+) -> torch.Tensor:
+    """Applies top-k then top-p using only the blocks with the largest maxima.
+
+    Splits the vocab into blocks of CANDIDATE_BLOCK logits, runs
+    `apply_top_k_top_p` on the `num_blocks` blocks with the largest maxima,
+    and masks the full row below the smallest kept logit. Matches
+    `apply_top_k_top_p` unless more than `num_blocks - k + 1` logits tie at
+    the k-th largest value; float32 sums run in a different order, so a top-p
+    boundary within rounding can flip. Rows with top_k <= 0 are returned
+    unmasked, so callers must not pass such rows with top_p < 1.
+
+    Args:
+      logits: [batch, vocab_size], vocab_size a multiple of CANDIDATE_BLOCK.
+      top_k: [batch, 1] integer.
+      top_p: [batch, 1] float.
+      num_blocks: Candidate blocks, at most vocab_size // CANDIDATE_BLOCK.
+
+    Returns:
+      Masked logits. [batch, vocab_size]
+    """
+    rows, vocab_size = logits.shape
+    blocks = logits.reshape(rows, vocab_size // CANDIDATE_BLOCK, CANDIDATE_BLOCK)
+    block_max = blocks.amax(dim=-1)
+    block_ids = torch.topk(block_max, num_blocks, dim=-1, sorted=False).indices
+    candidates = torch.gather(
+        blocks, 1, block_ids.unsqueeze(-1).expand(-1, -1, CANDIDATE_BLOCK)
+    ).reshape(rows, num_blocks * CANDIDATE_BLOCK)
+    kept = apply_top_k_top_p(candidates, top_k, top_p) > MASKED_LOGIT_VALUE
+    inf = torch.full_like(candidates, float("inf"))
+    cutoff = torch.where(kept, candidates, inf).amin(dim=-1, keepdim=True)
+    masked = torch.where(
+        logits >= cutoff, logits, torch.full_like(logits, MASKED_LOGIT_VALUE)
+    )
+    return torch.where(top_k > 0, masked, logits)

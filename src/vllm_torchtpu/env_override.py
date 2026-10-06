@@ -190,7 +190,18 @@ if _sc_offload_bytes is not None:
         "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
     ):
         if not _user_has_flag(_flag_name):
-            _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
+            _effective_bytes = _sc_offload_bytes
+            _sc_ag_flag = (
+                "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"
+            )
+            if (
+                _flag_name == _sc_ag_flag
+                and os.environ.get("TPU_ATTN_MOE_OVERLAP", "0").strip().lower()
+                in ("1", "true", "yes", "on")
+                and (_sc_offload_bytes == 67108864)
+            ):
+                _effective_bytes = 33554432
+            _libtpu_extra_args.append(f"{_flag_name}={_effective_bytes}")
 
 if _libtpu_extra_args:
     _assembled = " ".join(_libtpu_extra_args)
