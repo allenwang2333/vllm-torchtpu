@@ -21,7 +21,12 @@ steps:
     commands:
       - sleep 10
 
-  - wait
+  - label: ":block: "
+    key: "block"
+    agents:
+      queue: cpu
+    commands: |
+      echo "waiting for approval"
 
   - label: ":work: Finished"
     key: "finished"
@@ -29,4 +34,5 @@ steps:
       queue: cpu
     commands:
       - echo "Finished"
+
 
