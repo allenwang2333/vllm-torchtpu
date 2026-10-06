@@ -42,6 +42,23 @@ _N_CHUNK = 512
 # Weight ring depth. One slot holds the expert whose first matmul is in
 # flight, so num_buffers - 2 transfers run ahead of compute.
 _NUM_BUFFERS = 6
+_VMEM_FRACTION = 0.75
+_VMEM_MARGIN = 1.25  # over declared scratch and operands, for compiler tiles
+
+
+def _vmem_limit(*arrays):
+    """Bytes of the declared VMEM scratch and operands plus a compiler margin, capped.
+
+    Claiming the whole VMEM leaves neighbouring ops nowhere to prefetch: on the
+    Qwen3.5-397B TP8 twin the next attention QKV projection lost its prefetched
+    weight (1.5 -> 5.5 us) and the RoPE/norm buffers spilled to HBM.
+    """
+    need = sum(
+        int(a.dtype.itemsize) * int(functools.reduce(lambda x, y: x * y, a.shape, 1))
+        for a in arrays
+    )
+    capacity = int(pltpu.get_tpu_info().vmem_capacity_bytes * _VMEM_FRACTION)
+    return min(int(need * _VMEM_MARGIN), capacity)
 
 
 def can_use_fused_tp(hidden, w1, w2, s1, s2, b1, b2, *, activation, rhs_quant_dtype):
@@ -229,7 +246,18 @@ def fused_moe_tp(
             ],
         ),
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes
+            vmem_limit_bytes=_vmem_limit(
+                jax.ShapeDtypeStruct((nb, h, 2 * i), _F8),
+                jax.ShapeDtypeStruct((nb, i, h), _F8),
+                jax.ShapeDtypeStruct((nb, 1, 2 * i), jnp.float32),
+                jax.ShapeDtypeStruct((nb, 1, h), jnp.float32),
+                jax.ShapeDtypeStruct((m, h), _F8),
+                jax.ShapeDtypeStruct((m, 2 * i), jnp.float32),
+                jax.ShapeDtypeStruct((m, h), jnp.float32),
+                hidden,
+                coeff,
+                jax.ShapeDtypeStruct((m, h), hidden.dtype),
+            )
         ),
         name=f"fused_moe_tp-e_{experts}-m_{m}-h_{h}-i_{i}-buffers_{nb}",
     )(active, hidden, coeff, w1, w2, s1, s2)
@@ -558,7 +586,26 @@ def fused_moe_tp_ar(
         ),
         compiler_params=pltpu.CompilerParams(
             collective_id=0,
-            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
+            vmem_limit_bytes=_vmem_limit(
+                jax.ShapeDtypeStruct((nb, h, 2 * i), _F8),
+                jax.ShapeDtypeStruct((nb, i, h), _F8),
+                jax.ShapeDtypeStruct((nb, 1, 2 * i), jnp.float32),
+                jax.ShapeDtypeStruct((nb, 1, h), jnp.float32),
+                jax.ShapeDtypeStruct((h, 2 * i), _F8),
+                jax.ShapeDtypeStruct((1, 2 * i), jnp.float32),
+                jax.ShapeDtypeStruct((i, h), _F8),
+                jax.ShapeDtypeStruct((1, h), jnp.float32),
+                jax.ShapeDtypeStruct((m, h), _F8),
+                jax.ShapeDtypeStruct((m, 2 * i), jnp.float32),
+                jax.ShapeDtypeStruct((m, h), jnp.float32),
+                jax.ShapeDtypeStruct((m, h), hidden.dtype),
+                jax.ShapeDtypeStruct((n_ranks, m, chunk), hidden.dtype),
+                jax.ShapeDtypeStruct((m, chunk), hidden.dtype),
+                hidden,
+                coeff,
+                shared_gate,
+                jax.ShapeDtypeStruct((m, h), hidden.dtype),
+            ),
         ),
         name=f"fused_moe_tp_ar-e_{experts}-m_{m}-h_{h}-i_{i}-n_{n_ranks}-buffers_{nb}",
     )(
