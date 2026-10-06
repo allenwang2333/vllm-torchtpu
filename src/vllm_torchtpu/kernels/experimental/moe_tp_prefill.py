@@ -566,11 +566,11 @@ def moe_tp_prefill(
     combine_chunks=1,
     reduce_fn=None,
     skip_zero_weight_routes=True,
-    nbuf=3,
+    nbuf=4,
     tile_m=None,
     n_rungs=4,
     gather_unroll=8,
-    lookahead=2,
+    lookahead=3,
     interpret=False,
     x_quantized=None,
     shared_gate=None,
@@ -584,10 +584,10 @@ def moe_tp_prefill(
     s2_sh [H], gate wg_sh [H, 1]. topk_weights / topk_ids [T, K].
 
     reduce_fn (e.g. ``lambda y: lax.psum(y, axis)`` or ``psum_scatter``) is
-    applied once to the combined [T, H] partial output. Without reduce_fn the
-    per-rank partial is returned.
+    applied per combine chunk; each chunk's input is tied to the previous
+    chunk's reduced output so XLA overlaps each chunk's collective with the
+    next chunk's combine. Without reduce_fn the per-rank partial is returned.
     """
-    del scatter_ranks
     n_experts, hidden, two_i = w1.shape
     if x_quantized is not None:
         x_q, x_s = x_quantized
@@ -682,6 +682,7 @@ def moe_tp_prefill(
         combine_chunks,
         reduce_fn,
         interpret,
+        scatter_ranks=scatter_ranks,
     )
 
 
@@ -842,16 +843,26 @@ def combine(
     scatter_ranks=1,
 ):
     """out[t] = sum_k (coef[t, k] * pscl[pos[t, k]]) * part[pos[t, k]] in
-    n_chunks token chunks, followed by a single reduce_fn over [n_tok, hidden]."""
-    del scatter_ranks
+    n_chunks token chunks, each followed by reduce_fn so XLA overlaps each
+    chunk's collective with the next chunk's combine."""
     k = pos.shape[1]
-    if n_tok % n_chunks:
+    if n_tok % n_chunks or (n_tok // n_chunks) % scatter_ranks:
         n_chunks = 1
     tc = n_tok // n_chunks
     pscl_flat = pscl.reshape(-1)
+    if n_chunks > 1 and scatter_ranks > 1:
+        tc_local = tc // scatter_ranks
+        pos_4d = pos.reshape(scatter_ranks, n_chunks, tc_local, k)
+        coef_4d = coef.reshape(scatter_ranks, n_chunks, tc_local, k)
     outs = []
     for c in range(n_chunks):
-        sl = slice(c * tc, (c + 1) * tc)
+        if n_chunks > 1 and scatter_ranks > 1:
+            pos_c = pos_4d[:, c, :, :].reshape(tc, k)
+            coef_c = coef_4d[:, c, :, :].reshape(tc, k)
+        else:
+            sl = slice(c * tc, (c + 1) * tc)
+            pos_c = pos[sl]
+            coef_c = coef[sl]
         if combine_step_tokens(tc) and not interpret:
             fn = build_tp_combine_kernel(
                 t_local=tc,
@@ -862,28 +873,31 @@ def combine(
                 wire_dtype=FP8,
                 out_dtype=jnp.bfloat16,
             )
-            y = fn(part, pscl_flat, coef[sl], pos[sl])
+            y = fn(part, pscl_flat, coef_c, pos_c)
         else:
-            p = pos[sl]
-            rows = part.reshape(part.shape[0], hidden)[p].astype(jnp.float32)
-            w = coef[sl] * pscl_flat[p]
+            rows = part.reshape(part.shape[0], hidden)[pos_c].astype(jnp.float32)
+            w = coef_c * pscl_flat[pos_c]
             y = jnp.sum(rows * w[..., None], axis=1).astype(jnp.bfloat16)
+        if reduce_fn is not None:
+            if outs:
+                # Tie chunk c's input to chunk c-1's reduced output: XLA can
+                # no longer merge the per-chunk collectives into one and
+                # overlaps chunk c-1's collective with chunk c's combine.
+                y, _ = lax.optimization_barrier((y, outs[-1]))
+            y = reduce_fn(y)
         outs.append(y)
-    out = outs[0] if len(outs) == 1 else jnp.concatenate(outs, 0)
-    if reduce_fn is not None:
-        out = reduce_fn(out)
-    return out
+    return outs[0] if len(outs) == 1 else jnp.concatenate(outs, 0)
 
 
 def default_combine_chunks(n_tok, max_chunk_tokens=None):
     """Fewest equal combine chunks of at most max_chunk_tokens tokens.
 
-    The combine's position, coefficient, and scale tables live in SMEM (1 MiB):
-    4096 tokens fits comfortably up to 8192 total tokens (~706 KiB at 8192),
-    while 16384 total tokens uses 2048-token chunks (~882 KiB).
+    The combine's position, coefficient, and scale tables live in SMEM (1 MiB),
+    and splitting >=2048 tokens into >=2 chunks lets each chunk's all-reduce /
+    reduce-scatter overlap under the next chunk's combine.
     """
     if max_chunk_tokens is None:
-        max_chunk_tokens = 2048 if n_tok >= 16384 else 4096
+        max_chunk_tokens = 1024 if n_tok <= 3072 else 2048
     for n in range(1, n_tok + 1):
         if n_tok % n == 0 and n_tok // n <= max_chunk_tokens:
             return n
