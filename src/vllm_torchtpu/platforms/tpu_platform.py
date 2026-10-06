@@ -119,6 +119,36 @@ _TPU_2D_TORUS_GENERATIONS = ("v5e", "v6e")
 # 3D Torus generations that expose two devices per chip. The device name
 # surfaces as "TPU v7" from get_tpu_device_name() and as "TPU7x" from the
 # device-kind path, so both spellings have to match.
+# Device copies of DPMetadata.num_tokens_across_dp_cpu, keyed by value.
+# set_forward_context runs ~3 times per served decode step (target forward,
+# drafter step 0, fused draft loop) and, whenever DPMetadata is built (DP > 1
+# or sequence-parallel MoE, which is on even at DP == 1 under "force"), each
+# call used to issue a blocking s32[N] host->device copy (~115 us measured,
+# TpuMallocAndMemcpyHtoD 7 -> 10 per draft pass). The counts take only a few
+# distinct values (one per padded token bucket), and nothing downstream
+# mutates the tensor in place (consumers only read it or derive new tensors:
+# DPMetadata.sp_local_sizes / cu_tokens_across_sp, .sum(), .max()), so
+# sharing one device tensor per distinct value is safe.
+_DP_TOKEN_COUNTS_CACHE_MAX = 256
+_dp_token_counts_on_tpu_cache: dict[tuple, torch.Tensor] = {}
+
+
+def _copy_dp_token_counts_to_tpu(t: torch.Tensor) -> torch.Tensor:
+    return t.to("tpu")
+
+
+def _dp_token_counts_on_tpu(t: torch.Tensor) -> torch.Tensor:
+    """Return a cached device copy of the CPU token-count tensor ``t``."""
+    key = (t.dtype, tuple(t.shape), tuple(t.tolist()))
+    tpu_t = _dp_token_counts_on_tpu_cache.get(key)
+    if tpu_t is None:
+        if len(_dp_token_counts_on_tpu_cache) >= _DP_TOKEN_COUNTS_CACHE_MAX:
+            _dp_token_counts_on_tpu_cache.clear()
+        tpu_t = _copy_dp_token_counts_to_tpu(t)
+        _dp_token_counts_on_tpu_cache[key] = tpu_t
+    return tpu_t
+
+
 _TPU_DUAL_DEVICE_GENERATIONS = ("v7", "tpu7x")
 
 # TPU v8i / TPU8i generations.
@@ -590,7 +620,7 @@ class TpuPlatform(Platform):
         if dp_metadata is not None:
             t = dp_metadata.num_tokens_across_dp_cpu
             if t.device.type == "cpu":
-                tpu_t = t.to("tpu")
+                tpu_t = _dp_token_counts_on_tpu(t)
                 try:
                     dp_metadata.num_tokens_across_dp_cpu = tpu_t
                 except Exception:

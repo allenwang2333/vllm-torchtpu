@@ -634,7 +634,42 @@ def _patch_disable_sequence_parallel_moe() -> None:
 
         logged_decisions: set[tuple[str, int, bool, bool]] = set()
 
+        # set_forward_context evaluates use_sequence_parallel_moe twice per call
+        # (~3 calls per served decode step); each uncached evaluation reads
+        # os.environ ~3 times (~28 us measured under the host tracer). Once the
+        # DP group exists the inputs are fixed, so memoize per config object.
+        # The key holds every input that can change in-process: the config
+        # fields, the live DP group (by identity), and any module-level
+        # override of the two envs (tests monkeypatch them); real os.environ
+        # changes after DP init are not supported, as for the rest of envs.
+        sp_moe_memo: dict[int, tuple[object, tuple, bool]] = {}
+        sp_moe_memo_max = 64
+
         def _use_sequence_parallel_moe(self: ParallelConfig) -> bool:
+            dp_group = parallel_state._DP
+            if dp_group is None:
+                return _use_sequence_parallel_moe_uncached(self)
+            env_overrides = vars(envs)
+            key = (
+                dp_group,
+                env_overrides.get("TPU_MOE_SEQUENCE_PARALLEL"),
+                env_overrides.get("VLLM_TPU_MOE_SEQUENCE_PARALLEL"),
+                self.enable_expert_parallel,
+                self.tensor_parallel_size,
+                self.prefill_context_parallel_size,
+                self.data_parallel_size,
+            )
+            entry = sp_moe_memo.get(id(self))
+            if entry is not None and entry[0] is self and entry[1] == key:
+                return entry[2]
+            enabled = _use_sequence_parallel_moe_uncached(self)
+            if len(sp_moe_memo) >= sp_moe_memo_max:
+                sp_moe_memo.clear()
+            # Holding ``self`` keeps id(self) from being reused while cached.
+            sp_moe_memo[id(self)] = (self, key, enabled)
+            return enabled
+
+        def _use_sequence_parallel_moe_uncached(self: ParallelConfig) -> bool:
             if envs.TPU_MOE_SEQUENCE_PARALLEL:
                 # EP is required on this path: without it the row-parallel
                 # expert sum is never reduced.
