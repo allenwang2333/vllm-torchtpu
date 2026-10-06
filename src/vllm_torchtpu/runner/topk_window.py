@@ -19,7 +19,11 @@ from __future__ import annotations
 import torch
 from vllm.distributed import tensor_model_parallel_all_gather
 
-from vllm_torchtpu.layers.adapter.sample.top_k_top_p import shard_topk
+from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
+    shard_topk,
+    shard_topk_keys,
+    unpack_value_index,
+)
 
 
 def window_from_hidden_states(
@@ -44,10 +48,23 @@ def window_from_hidden_states(
             logits,
             torch.full_like(logits, float("-inf")),
         )
+    tp_size = head.tp_size
+    n = logits.shape[-1]
+    if tp_size > 1 and getattr(head.shard_indices, "num_added_elements", 0) == 0:
+        keys = shard_topk_keys(logits, width)
+        if keys is not None:
+            # [rows, width] int32 keys per rank, one collective; rank r owns
+            # ids [r * n, (r + 1) * n) (a rank past the vocabulary holds
+            # only masked padding, which never reaches a window). Equal keys
+            # keep the earlier, lower rank: ties resolve to the lowest id.
+            gathered = tensor_model_parallel_all_gather(keys, dim=-1)
+            keys, pos = torch.topk(gathered, width, dim=-1, largest=True, sorted=True)
+            vals, local = unpack_value_index(keys)
+            idx = (pos // width).to(torch.int32) * n + local
+            return vals.to(torch.float32), idx
     vals, idx = shard_topk(logits, width)
     idx = idx.to(torch.int32) + head.shard_indices.org_vocab_start_index
     vals = vals.to(torch.float32)
-    tp_size = head.tp_size
     if tp_size == 1:
         return vals, idx
     rows = hidden_states.shape[0]

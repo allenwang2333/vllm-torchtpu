@@ -18,7 +18,11 @@ from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     RejectionSampler,
     sparse_window_sample,
 )
-from vllm_torchtpu.layers.adapter.sample.top_k_top_p import _chunked_topk
+from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
+    _chunked_topk,
+    pack_value_index,
+    unpack_value_index,
+)
 from vllm_torchtpu.runner import topk_window
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -232,12 +236,23 @@ def _offset_bug(owner, hidden_states, width):
         owner.lm_head.shard_indices.org_vocab_start_index = start
 
 
-@pytest.mark.parametrize("bug", ["offset", "short_shard"])
+@pytest.mark.parametrize("bug", ["offset", "short_shard", "short_shard_keys"])
 def test_window_check_catches_a_broken_window(monkeypatch, bug):
     # Positive control: the comparison above must fail on a wrong window.
-    weight, hidden_states = _case("one_shard", 4, 72190, 16, 7, torch.float32)
+    dtype = torch.bfloat16 if bug == "short_shard_keys" else torch.float32
+    weight, hidden_states = _case("one_shard", 4, 72190, 16, 7, dtype)
     logits = hidden_states @ weight.T
-    if bug == "offset":
+    if bug == "short_shard_keys":
+        real_keys = topk_window.shard_topk_keys
+
+        def short_keys(x, w):
+            # the packed path with one candidate too few per rank
+            keys = real_keys(x, w)
+            return torch.cat([keys[:, : w - 1], torch.full_like(keys[:, :1], -(2**31))], -1)
+
+        monkeypatch.setattr(topk_window, "shard_topk_keys", short_keys)
+        vals, idx = _vp_window(weight, hidden_states, 8, monkeypatch)
+    elif bug == "offset":
         vals, idx = _vp_window(weight, hidden_states, 8, monkeypatch, fn=_offset_bug)
     else:
         real = topk_window.shard_topk
@@ -456,3 +471,19 @@ def test_fused_verify_from_window_equals_from_logits(monkeypatch):
         )
 
     assert torch.equal(vp, full)
+
+
+def test_packed_keys_round_trip_and_order():
+    vals = torch.tensor(
+        [[3.5, -2.0, float("-inf"), 0.0, 1e-3, -1e-3, 3.5, -3e38, 3e38]]
+    ).to(torch.bfloat16)
+    idx = torch.tensor([[0, 1, 2, 3, 4, 5, 32767, 7, 8]], dtype=torch.int32)
+
+    keys = pack_value_index(vals, idx)
+    back_vals, back_idx = unpack_value_index(keys)
+
+    assert torch.equal(back_vals.view(torch.int16), vals.view(torch.int16))
+    assert torch.equal(back_idx, idx)
+    order = torch.argsort(keys[0], descending=True, stable=True)
+    ref = sorted(range(9), key=lambda i: (-float(vals[0, i]), int(idx[0, i])))
+    assert order.tolist() == ref
