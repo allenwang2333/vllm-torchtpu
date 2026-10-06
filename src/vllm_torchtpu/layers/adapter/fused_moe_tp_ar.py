@@ -81,7 +81,9 @@ def _build_op(mesh, n_ranks: int, topk: int):
         """Above MAX_DECODE_TOKENS: expert kernel + combine + chunked psum."""
         from vllm_torchtpu.kernels.experimental.moe_tp_prefill import (
             default_combine_chunks,
-            moe_tp_prefill,
+        )
+        from vllm_torchtpu.kernels.experimental.moe_tp_prefill_c import (
+            moe_tp_prefill_c as moe_tp_prefill,
         )
 
         # Trace-time, once per token bucket: the evidence that the prefill
@@ -189,8 +191,10 @@ def _build_sp_op(mesh, n_ranks: int, topk: int):
     def local_sp(rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti):
         from vllm_torchtpu.kernels.experimental.moe_tp_prefill import (
             default_combine_chunks,
-            moe_tp_prefill,
             rowquant_rows,
+        )
+        from vllm_torchtpu.kernels.experimental.moe_tp_prefill_c import (
+            moe_tp_prefill_c as moe_tp_prefill,
         )
 
         s1s, s2s, wg = s1s.reshape(1, -1), s2s.reshape(1, -1), wg.reshape(-1, 1)
