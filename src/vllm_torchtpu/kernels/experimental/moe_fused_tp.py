@@ -123,6 +123,7 @@ def _ar_kernel(
     experts,
     nb,
     n_ranks,
+    rows=None,
 ):
     me = rank_ref[0]
     chunk = h // n_ranks
@@ -242,6 +243,39 @@ def _ar_kernel(
             jnp.matmul(xq_ref[...], w1_ref[0], preferred_element_type=jnp.float32),
         )
 
+    if rows is not None:
+        # Reduce-scatter over token rows only (DP attention): rank d receives
+        # every rank's partial of tokens [d * rows, (d + 1) * rows), sums them
+        # and keeps that slice; no all-gather. own_bf / recv are
+        # [n_ranks, rows_padded, h] so each peer's slab is a whole leading
+        # index (tile aligned for any rows).
+        for d in range(n_ranks):
+            own_bf[d, :rows, :] = owner_ref[d * rows : (d + 1) * rows, :].astype(
+                own_bf.dtype
+            )
+        pl.semaphore_wait(barrier, n_ranks)
+        scatter = [
+            pltpu.make_async_remote_copy(
+                own_bf.at[d],
+                recv.at[me],
+                rs_send.at[d],
+                rs_recv,
+                device_id=(jnp.int32(d),),
+                device_id_type=_MESH,
+            )
+            for d in range(n_ranks)
+        ]
+        for copy in scatter:
+            copy.start()
+        pltpu.make_async_copy(recv, recv, rs_recv).wait()
+        acc = recv[0].astype(jnp.float32)
+        for s in range(1, n_ranks):
+            acc = acc + recv[s].astype(jnp.float32)
+        out_ref[...] = acc.astype(out_ref.dtype)
+        for copy in scatter:
+            copy.wait_send()
+        return
+
     # All-reduce: reduce-scatter column chunks, sum, all-gather.
     own_bf[...] = owner_ref[...].astype(own_bf.dtype)
     # Every peer has entered this call, so its receive buffer is live.
@@ -339,6 +373,7 @@ def fused_moe_tp_ar(
     n_ranks,
     num_buffers=None,
     expert_start=None,
+    scatter_rows=False,
 ):
     """Per-rank body; call inside shard_map over the TP mesh.
 
@@ -353,8 +388,18 @@ def fused_moe_tp_ar(
     expert_start + E) of the global routing (topk_ids are global); routes to
     other ranks' experts contribute nothing here and are summed in by the
     all-reduce. num_buffers defaults to the deepest weight ring that fits.
+
+    scatter_rows=True (DP attention: the caller all-gathered every rank's
+    tokens, rank-major) replaces the all-reduce with a reduce-scatter over
+    token rows: rank r returns only its own rows [r * tokens / n_ranks,
+    (r + 1) * tokens / n_ranks) of the reduced output, [tokens / n_ranks,
+    hidden], and no all-gather runs. The wire is BF16 when the per-rank row
+    count is a multiple of 16, else FP32.
     """
     tokens, h = hidden.shape
+    if scatter_rows and tokens % n_ranks:
+        raise ValueError(f"scatter_rows needs tokens % n_ranks == 0; got {tokens}")
+    rows = tokens // n_ranks if scatter_rows else None
     experts, i, _ = w2.shape
     pad = (-tokens) % 16
     if pad:
@@ -379,11 +424,26 @@ def fused_moe_tp_ar(
     i_s = w2s.shape[0]
     nb = num_buffers or _weight_ring_depth(h, i)
     chunk = h // n_ranks
+    if rows is None:
+        out_rows, wire = m, hidden.dtype
+        own_shape, recv_shape, red_shape = (m, h), (n_ranks, m, chunk), (m, chunk)
+    else:
+        wire = hidden.dtype if rows % 16 == 0 else jnp.float32
+        out_rows = -(-rows // 16) * 16 if rows % 16 == 0 else -(-rows // 8) * 8
+        own_shape = recv_shape = (n_ranks, out_rows, h)
+        red_shape = (8, 128)  # unused
     out = pl.pallas_call(
         functools.partial(
-            _ar_kernel, m=m, h=h, i=i, experts=experts, nb=nb, n_ranks=n_ranks
+            _ar_kernel,
+            m=m,
+            h=h,
+            i=i,
+            experts=experts,
+            nb=nb,
+            n_ranks=n_ranks,
+            rows=rows,
         ),
-        out_shape=jax.ShapeDtypeStruct((m, h), hidden.dtype),
+        out_shape=jax.ShapeDtypeStruct((out_rows, h), wire),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 3
@@ -401,9 +461,9 @@ def fused_moe_tp_ar(
                 pltpu.VMEM((m, h), _F8),
                 pltpu.VMEM((m, 2 * i), jnp.float32),
                 pltpu.VMEM((m, h), jnp.float32),
-                pltpu.VMEM((m, h), hidden.dtype),
-                pltpu.VMEM((n_ranks, m, chunk), hidden.dtype),
-                pltpu.VMEM((m, chunk), hidden.dtype),
+                pltpu.VMEM(own_shape, wire),
+                pltpu.VMEM(recv_shape, wire),
+                pltpu.VMEM(red_shape, wire),
                 pltpu.SMEM((experts,), jnp.int32),
                 pltpu.SemaphoreType.DMA((nb, 4)),
                 pltpu.SemaphoreType.DMA((4,)),
@@ -417,7 +477,8 @@ def fused_moe_tp_ar(
             collective_id=0,
             vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
         ),
-        name=f"fused_moe_tp_ar-e_{experts}-m_{m}-h_{h}-i_{i}-is_{i_s}-n_{n_ranks}-buffers_{nb}",
+        name=f"fused_moe_tp_{'rs' if rows else 'ar'}-e_{experts}-m_{m}-h_{h}-i_{i}"
+        f"-is_{i_s}-n_{n_ranks}-buffers_{nb}",
     )(
         active,
         rank.reshape(1).astype(jnp.int32),
@@ -433,4 +494,6 @@ def fused_moe_tp_ar(
         w2s,
         s2s,
     )
+    if rows is not None:
+        return out[:rows].astype(hidden.dtype)
     return out[:tokens] if pad else out

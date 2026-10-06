@@ -150,3 +150,59 @@ def test_matches_decomposed_layer(setup, m, padded, ep):
     # In EP mode the local id of expert ids[0, 0] is only that on its owner rank.
     broken = run(functools.partial(_reference, skip_expert=int(ids[0, 0]) % E, ep=ep))
     assert max_rel(got[0], broken[0]) > 0.08
+
+
+@pytest.mark.parametrize("m", [8, 32, 128])
+@pytest.mark.parametrize("ep", [False, True])
+def test_scatter_rows_is_own_slice_of_all_reduce(setup, m, ep):
+    """scatter_rows=True (DP attention: reduce-scatter only, no all-gather)
+    returns on rank r exactly rows [r*m/N, (r+1)*m/N) of the all-reduce mode's
+    output. BF16 wire (m/N % 16 == 0) is bit-identical; the FP32 wire used for
+    small row counts differs only by the all-reduce's BF16 rounding."""
+    mesh, sh, rank, weights, wg = setup
+    rng = np.random.default_rng(100 + m)
+    x = rng.normal(size=(m, H)).astype(np.float32)
+    n_global = N * E if ep else E
+    ids = np.stack(
+        [rng.choice(n_global, TOPK, replace=False) for _ in range(m)]
+    ).astype(np.int32)
+    tw = rng.dirichlet(np.ones(TOPK), size=m).astype(np.float32)
+    args = (
+        rank,
+        jax.device_put(jnp.tile(jnp.asarray(x, jnp.bfloat16), (N, 1)), sh),
+        *weights,
+        wg,
+        jax.device_put(jnp.tile(jnp.asarray(tw, jnp.bfloat16), (N, 1)), sh),
+        jax.device_put(jnp.tile(jnp.asarray(ids), (N, 1)), sh),
+    )
+    specs = (P("d"),) * 10 + (P(), P("d"), P("d"))
+
+    def call(rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, rows):
+        return kernel.fused_moe_tp_ar(
+            rank.reshape(-1), x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti,
+            n_ranks=N, expert_start=rank.reshape(()) * E if ep else None,
+            scatter_rows=rows,
+        )
+
+    def run(rows):
+        out = jax.jit(
+            jax.shard_map(
+                functools.partial(call, rows=rows),
+                mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False,
+            )
+        )(*args)
+        return np.asarray(out.astype(jnp.float32))
+
+    full = run(False).reshape(N, m, H)[0]
+    own = run(True)
+    assert own.shape == (m, H)
+    assert np.isfinite(own).all()
+    if (m // N) % 16 == 0:
+        np.testing.assert_array_equal(own, full)
+    else:
+        rel = np.linalg.norm(own - full, axis=1) / np.maximum(
+            np.linalg.norm(full, axis=1), 1e-30
+        )
+        assert rel.max() < 1e-2
+    # Positive control: a one-row shift of the slices must not match.
+    assert not np.allclose(np.roll(own, 1, axis=0), full, rtol=1e-2, atol=1e-3)
