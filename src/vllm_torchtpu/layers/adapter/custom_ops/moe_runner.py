@@ -23,6 +23,7 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
 from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import fused_moe_ep_v3_supported
 
 # Taken once at import, outside any trace: the MoE forward is traced by
 # torch.compile, and reading the upstream property from inside the trace does
@@ -112,6 +113,7 @@ class VllmMoERunner(MoERunner):
         return (
             fused_moe_ep_supported(owner)
             or adaptive_fused_moe_supported(owner)
+            or fused_moe_ep_v3_supported(owner)
             or _upstream_fused_output_is_reduced(self)
         )
 
