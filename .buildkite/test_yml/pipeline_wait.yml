@@ -14,19 +14,30 @@
 
 steps:
 
-  - label: ":work: Wait 10s"
-    key: "w10s"
+  - label: ":pipeline: Upload tests"
+    key: "upload-tests"
     agents:
       queue: cpu
     commands:
-      - sleep 10
+      - source .buildkite/scripts/configs/pipeline_config.sh
+      - upload_with_priority .buildkite/test_yml/pipeline_start_1.yml "$$JOB_PRIORITY"
+      - upload_with_priority .buildkite/test_yml/pipeline_start_2.yml "$$JOB_PRIORITY"
+
+  # - label: ":work: Wait 10s"
+  #   key: "w10s"
+  #   agents:
+  #     queue: cpu
+  #   commands:
+  #     - sleep 10
 
   - block: ":block: "
     key: "block"
     prompt: "All tests passed. continue?"
+    depends_on: upload-tests
 
   - label: ":work: Finished - 1"
     key: "finished1"
+    depends_on: block
     agents:
       queue: cpu
     commands:
@@ -34,6 +45,7 @@ steps:
 
   - label: ":work: Finished - 2"
     key: "finished2"
+    depends_on: finished1
     agents:
       queue: cpu
     commands:
