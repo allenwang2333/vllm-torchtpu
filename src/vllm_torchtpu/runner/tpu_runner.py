@@ -95,10 +95,14 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
-from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
-from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
+from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+    RejectionSampler,
+    sparse_window_sample,
+)
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
+    _chunked_topk,
+    apply_top_k_top_p,
     apply_top_k_top_p_candidates,
 )
 from vllm_torchtpu.layers.core.attention_metadata import (
@@ -929,6 +933,12 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         self.sample_from_logits_func = self.sample_from_logits
+        # Window width of the sparse spec-verify sampler; 0 = off. It takes
+        # precedence over TPU_SAMPLER_TOPK_CANDIDATES for the verify chunks
+        # _sparse_spec_sampling_ok accepts; the rest keep the existing path.
+        self._sampling_topk_bound = (
+            envs.TPU_SAMPLING_TOPK_BOUND if envs.TPU_SPARSE_SPEC_SAMPLING else 0
+        )
 
         # TPU async-scheduling state (passed between execute_model and
         # sample_tokens, mirroring vLLM's async path).
@@ -4017,6 +4027,14 @@ class TPUModelRunner(GPUModelRunner):
                 ),
                 target_argmax=target_argmax,
             )
+        if (
+            not all_greedy
+            and grammar_output is None
+            and self._sparse_spec_sampling_ok(cur_start_idx, cur_end_idx)
+        ):
+            return self._sample_spec_verify_chunk_sparse(
+                logits, md, cur_start_idx, cur_end_idx, sampling_generator
+            )
         if all_greedy and grammar_output is None:
             bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
                 logits, md.bonus_logits_indices, md.target_logits_indices
@@ -5680,6 +5698,17 @@ class TPUModelRunner(GPUModelRunner):
                             topk_candidates=self._topk_candidate_blocks(),
                         )
                         synchronize_tensors(out)
+                    # --- sparse non-greedy verify path ---
+                    if self._sampling_topk_bound > 0:
+                        self._warm_sparse_spec_sampling(
+                            dummy_logits,
+                            bonus_logits_indices,
+                            target_logits_indices,
+                            draft_token_ids,
+                            draft_lengths,
+                            segment_ids,
+                            group_indices,
+                        )
                     logger.info(
                         "  -- padded_logits_length: %d, num_seqs: %d",
                         num_tokens,
@@ -5714,6 +5743,58 @@ class TPUModelRunner(GPUModelRunner):
             max_draft_tokens=self.speculative_config.num_speculative_tokens,
             accept_u=warm_accept_u if self.rejection_sampler.synthetic_mode else None,
             target_argmax=target_argmax,
+        )
+        synchronize_tensors(out)
+
+    def _warm_sparse_spec_sampling(
+        self,
+        logits: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+    ) -> None:
+        """Compile ``_sample_spec_verify_chunk_sparse``'s programs (the eager
+        RNG calls included) at one verify bucket."""
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
+        width = self._sampling_topk_bound
+        num_reqs = bonus_logits_indices.shape[0]
+        device = logits.device
+        temps = torch.ones((num_reqs, 1), dtype=torch.float32).to(device)
+        top_k = torch.ones((num_reqs, 1), dtype=torch.int32).to(device)
+        top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(device)
+        bonus_u = torch.rand((num_reqs, width), dtype=torch.float32, device=device)
+        bonus_token_ids, target_vals, target_idx = self.spec_sparse_topk_and_bonus(
+            logits,
+            bonus_logits_indices,
+            target_logits_indices,
+            temps,
+            top_k,
+            top_p,
+            bonus_u,
+            width,
+        )
+        accept_u = torch.rand(draft_token_ids.shape, dtype=torch.float32, device=device)
+        recover_u = torch.rand(
+            (target_vals.shape[0], width), dtype=torch.float32, device=device
+        )
+        out = self.rejection_sampler.forward_sparse(
+            draft_token_ids=draft_token_ids,
+            num_draft_tokens=draft_lengths,
+            target_vals=target_vals,
+            target_idx=target_idx,
+            bonus_token_ids=bonus_token_ids,
+            segment_ids=segment_ids,
+            group_indices=group_indices,
+            max_draft_tokens=self.speculative_config.num_speculative_tokens,
+            temperatures=temps,
+            top_k=top_k,
+            top_p=top_p,
+            accept_u=accept_u,
+            recover_u=recover_u,
         )
         synchronize_tensors(out)
 
@@ -6643,17 +6724,133 @@ class TPUModelRunner(GPUModelRunner):
         )
         return output
 
+    def _sparse_spec_sampling_ok(self, cur_start_idx: int, cur_end_idx: int) -> bool:
+        """Whether every request of the chunk samples from its top
+        ``TPU_SAMPLING_TOPK_BOUND`` window: ``0 < top_k <= bound``, or greedy
+        (whose argmax is the window's first entry)."""
+        bound = self._sampling_topk_bound
+        if bound <= 0:
+            return False
+        top_k = self.input_batch.top_k_cpu_tensor[cur_start_idx:cur_end_idx]
+        temps = self.input_batch.temperature_cpu_tensor[cur_start_idx:cur_end_idx]
+        bounded = (top_k > 0) & (top_k <= bound) & (top_k < self.vocab_size)
+        return bool((bounded | (temps <= SAMPLING_EPS)).all())
+
+    def _sample_spec_verify_chunk_sparse(
+        self,
+        logits: torch.Tensor,
+        md: SpecDecodeMetadata,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        sampling_generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        """``_sample_spec_verify_chunk`` for a chunk that passes
+        ``_sparse_spec_sampling_ok``: one top-k over the logits rows, then the
+        bonus sample and the rejection sampler on the [rows, bound] windows,
+        so no full-vocab pass follows the top-k."""
+        width = self._sampling_topk_bound
+        padded_num_reqs = md.bonus_logits_indices.shape[0]
+        temps, top_k, top_p = self._build_padded_sampling_params(
+            cur_start_idx,
+            cur_end_idx,
+            logits,
+            padded_num_reqs=padded_num_reqs,
+            dtype=torch.float32,
+        )
+        bonus_u = torch.rand(
+            (padded_num_reqs, width),
+            dtype=torch.float32,
+            device=logits.device,
+            generator=sampling_generator,
+        )
+        bonus_token_ids, target_vals, target_idx = self.spec_sparse_topk_and_bonus(
+            logits,
+            md.bonus_logits_indices,
+            md.target_logits_indices,
+            temps,
+            top_k,
+            top_p,
+            bonus_u,
+            width,
+        )
+        accept_u = torch.rand(
+            md.draft_token_ids.shape,
+            dtype=torch.float32,
+            device=logits.device,
+            generator=sampling_generator,
+        )
+        recover_u = torch.rand(
+            (target_vals.shape[0], width),
+            dtype=torch.float32,
+            device=logits.device,
+            generator=sampling_generator,
+        )
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
+        return self.rejection_sampler.forward_sparse(
+            draft_token_ids=md.draft_token_ids,
+            num_draft_tokens=md.draft_lengths,
+            target_vals=target_vals,
+            target_idx=target_idx,
+            bonus_token_ids=bonus_token_ids,
+            segment_ids=md.segment_ids,
+            group_indices=md.group_indices,
+            max_draft_tokens=self.speculative_config.num_speculative_tokens,
+            temperatures=temps,
+            top_k=top_k,
+            top_p=top_p,
+            accept_u=accept_u,
+            recover_u=recover_u,
+        )
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def spec_sparse_topk_and_bonus(
+        self,
+        logits: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        bonus_u: torch.Tensor,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Top-``width`` window of every logits row, the bonus token sampled
+        from its row's window (Gumbel-max, as ``sample_from_logits``), and the
+        draft rows' windows for ``RejectionSampler.forward_sparse``."""
+        vals, idx = _chunked_topk(logits, width)
+        bonus_vals = torch.index_select(vals, 0, bonus_logits_indices)
+        bonus_idx = torch.index_select(idx, 0, bonus_logits_indices)
+        target_vals = torch.index_select(vals, 0, target_logits_indices)
+        target_idx = torch.index_select(idx, 0, target_logits_indices)
+
+        bonus_token_ids = sparse_window_sample(
+            bonus_vals,
+            bonus_idx,
+            temperatures,
+            top_k,
+            top_p,
+            bonus_u,
+            greedy_eps=SAMPLING_EPS,
+        )
+        return bonus_token_ids, target_vals, target_idx
+
     def _build_padded_sampling_params(
         self,
         cur_start_idx: int,
         cur_end_idx: int,
         logits: torch.Tensor,
+        padded_num_reqs: int | None = None,
+        dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Padded per-request sampling tensors on device. ``padded_num_reqs``
+        and the temperature ``dtype`` default to ``logits``' rows and dtype."""
         # Stage [padded_num_reqs] on CPU with neutral padding, then use one
         # fixed-shape H2D copy per tensor to keep decode shape-stable.
-        padded_num_reqs = logits.shape[0]
+        if padded_num_reqs is None:
+            padded_num_reqs = logits.shape[0]
         num_active_reqs = cur_end_idx - cur_start_idx
-        temps_cpu = torch.ones(padded_num_reqs, dtype=logits.dtype)
+        temps_cpu = torch.ones(padded_num_reqs, dtype=dtype or logits.dtype)
         top_k_cpu = torch.zeros(padded_num_reqs, dtype=torch.int32)
         top_p_cpu = torch.ones(padded_num_reqs, dtype=torch.float32)
 
