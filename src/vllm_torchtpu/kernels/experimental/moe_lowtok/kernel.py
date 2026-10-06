@@ -18,7 +18,8 @@ the shard's hit experts, streams their weights through a ring of VMEM slots in
 units (the gate|up halves and the down projection of one expert), and applies
 each expert to every row with that row's routing weight as the mask. The
 output is the shard's partial sum; the combine across shards stays the
-caller's. Activations are quantized per row to FP8 before each matmul (W8A8).
+caller's. Activations are quantized to FP8 before each matmul (W8A8), one
+scale per row and 512-column block as in gmm_v2.
 
 The routing arrives either as a table built from the caller's local top-k ids
 (`routing_table`) or as the router's softmax scores, with the top-k selection
@@ -46,6 +47,7 @@ _VMEM_FRACTION = 0.75
 _VMEM_MARGIN = 1.25  # over declared scratch and operands, for compiler tiles
 _FP8 = jnp.float8_e4m3fn
 _FP8_MAX = 448.0
+_QUANT_BLOCK = 512  # activation scale block along K, as gmm_v2
 
 
 def can_use_moe_lowtok(hidden, w1, w2, s1, s2, b1, b2, *, activation, rhs_quant_dtype):
@@ -60,7 +62,7 @@ def can_use_moe_lowtok(hidden, w1, w2, s1, s2, b1, b2, *, activation, rhs_quant_
     e, i, out = w2.shape
     if not 0 < e <= _MAX_LOCAL_EXPERTS or out != h or w1.shape != (e, h, 2 * i):
         return False
-    if (2 * i) % 512:
+    if (2 * i) % 512 or h % _quant_block(h) or i % _quant_block(i):
         return False
     if (
         hidden.dtype != jnp.bfloat16
@@ -90,11 +92,42 @@ def _vmem_budget(rows, hidden, inter, w13_parts, lanes):
     return min(need, capacity)
 
 
-def _quantize_rows(v):
-    """Per-row FP8 quantization of an f32 block: values and restoring scale."""
-    amax = jnp.max(jnp.abs(v), axis=1, keepdims=True)
-    scale = jnp.maximum(amax, 1e-12) / _FP8_MAX
-    return (v / scale).astype(_FP8), scale
+def _quant_block(k):
+    """Activation scale block along a contraction of width k."""
+    return min(k, _QUANT_BLOCK)
+
+
+def _quantize_blocks(v):
+    """FP8 quantization of an f32 block per row and K block, as gmm_v2.
+
+    Returns (values, restoring scale [rows, 1]) per block.
+    """
+    block = _quant_block(v.shape[1])
+    blocks = []
+    for k in range(0, v.shape[1], block):
+        b = v[:, k : k + block]
+        scale = jnp.max(jnp.abs(b), axis=1, keepdims=True) / _FP8_MAX
+        inv = jnp.where(scale == 0, 0, 1 / scale)
+        blocks.append(((b * inv).astype(_FP8), scale))
+    return blocks
+
+
+def _blocked_dot(blocks, w_ref, slot):
+    """Sum over K blocks of each FP8 block's matmul with w_ref[slot], rescaled."""
+    out = None
+    k = 0
+    for q, scale in blocks:
+        n = q.shape[1]
+        part = jax.lax.dot_general(
+            q,
+            w_ref[slot, pl.ds(k, n), :],
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        part = part * scale
+        out = part if out is None else out + part
+        k += n
+    return out
 
 
 def _stream(
@@ -211,7 +244,7 @@ def _stream(
                 c.wait()
 
     acc[...] = jnp.zeros_like(acc)
-    x_q, x_s = _quantize_rows(x_ref[...].astype(jnp.float32))
+    x_blocks = _quantize_blocks(x_ref[...].astype(jnp.float32))
 
     for ahead in range(slots - 1):
 
@@ -235,17 +268,12 @@ def _stream(
 
             @pl.when(part == p)
             def _gate_up_half(p=p):
-                h = jax.lax.dot_general(
-                    x_q,
-                    w13_buf[slot],
-                    (((1,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
+                h = _blocked_dot(x_blocks, w13_buf, slot)
                 scales = s13_buf[slot]
                 col = p * half
-                h_acc[:, col : col + half] = h[:, :half] * x_s * scales[:, :half]
+                h_acc[:, col : col + half] = h[:, :half] * scales[:, :half]
                 h_acc[:, inter + col : inter + col + half] = (
-                    h[:, half:] * x_s * scales[:, half:]
+                    h[:, half:] * scales[:, half:]
                 )
 
         @pl.when(part == w13_parts)
@@ -253,14 +281,8 @@ def _stream(
             gate = h_acc[:, pl.ds(0, inter)]
             up = h_acc[:, pl.ds(inter, inter)]
             a = gate * jax.nn.sigmoid(gate) * up
-            a_q, a_s = _quantize_rows(a)
-            o = jax.lax.dot_general(
-                a_q,
-                w2_buf[slot],
-                (((1,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
-            o = o * a_s * s2_buf[slot]
+            o = _blocked_dot(_quantize_blocks(a), w2_buf, slot)
+            o = o * s2_buf[slot]
             # Zero weight masks the rows this expert does not serve.
             w = jnp.sum(
                 jnp.where(lane == gid_s[0, expert], wtab_ref[...], 0.0),

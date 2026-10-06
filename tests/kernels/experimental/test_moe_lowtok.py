@@ -43,28 +43,34 @@ def interpret(monkeypatch):
     kernel.moe_lowtok.clear_cache()
 
 
-def _quantize_rows(v):
-    amax = jnp.max(jnp.abs(v), axis=1, keepdims=True)
-    scale = jnp.maximum(amax, 1e-12) / 448.0
-    return (v / scale).astype(FP8), scale
+def _quantized_dot(v, w):
+    """FP8 activations scaled per row and 512-column block, times w."""
+    block = min(v.shape[1], 512)
+    out = 0
+    for k in range(0, v.shape[1], block):
+        b = v[:, k : k + block]
+        scale = jnp.max(jnp.abs(b), axis=1, keepdims=True) / 448.0
+        q = (b * jnp.where(scale == 0, 0, 1 / scale)).astype(FP8)
+        out = out + scale * jnp.dot(
+            q, w[k : k + block], preferred_element_type=jnp.float32
+        )
+    return out
 
 
 def _reference(x, ids, weights, w13, s13, w2, s2):
-    """Plain JAX with the kernel's arithmetic: per-row FP8 activations."""
+    """Plain JAX with the kernel's arithmetic: blockwise FP8 activations."""
     e, _, two_inter = w13.shape
     inter = two_inter // 2
-    x_q, x_s = _quantize_rows(x.astype(jnp.float32))
+    x = x.astype(jnp.float32)
     s13 = s13.reshape(e, two_inter)
     s2 = s2.reshape(e, -1)
     out = jnp.zeros((x.shape[0], x.shape[1]), jnp.float32)
     for expert in range(e):
         w = jnp.sum(jnp.where(ids == expert, weights, 0).astype(jnp.float32), axis=1)
-        h = jnp.dot(x_q, w13[expert], preferred_element_type=jnp.float32)
-        h = h * x_s * s13[expert][None, :]
+        h = _quantized_dot(x, w13[expert]) * s13[expert][None, :]
         a = jax.nn.silu(h[:, :inter]) * h[:, inter:]
-        a_q, a_s = _quantize_rows(a)
-        o = jnp.dot(a_q, w2[expert], preferred_element_type=jnp.float32)
-        out = out + w[:, None] * (o * a_s * s2[expert][None, :])
+        o = _quantized_dot(a, w2[expert])
+        out = out + w[:, None] * (o * s2[expert][None, :])
     return out.astype(x.dtype)
 
 
@@ -206,6 +212,19 @@ def test_interpreted_scores_entry_matches_router_then_reference(interpret, n_glo
     local = jnp.where((ids >= start) & (ids < start + experts), ids - start, -1)
     local = local.at[2].set(-1)
     _assert_close(got, _reference(x, local, w, *weights), 2.5e-2)
+
+
+def test_interpreted_activation_scales_are_blockwise(interpret):
+    # A 1e6 outlier in the first 512 columns, on weight rows that are zero.
+    # One scale per row would flush the second block's values (~1) below
+    # FP8's smallest subnormal and zero the output; 512-column scales keep it.
+    x, ids, weights, w13, s13, w2, s2 = _ids_operands(11, 8, 8, 1024, 256, 4)
+    x = x.at[:, 0].set(1e6)
+    w13 = w13.at[:, :512].set(0)
+    ops = (x, ids, weights, w13, s13, w2, s2)
+    want = _oracle(x, ids, weights, w13, s13, w2, s2, 0)
+    assert np.linalg.norm(want) > 0
+    assert _rel_l2(_ids_call(*ops), want) < 0.06
 
 
 def _shapes(m, h, i, e):
@@ -361,7 +380,7 @@ def test_fused_moe_func_selects_kernel_and_matches_oracle(monkeypatch, m):
         wrapper.fused_moe_func.clear_cache()
     # An E4M3 operand has rel-L2 error ~2^-3 / sqrt(12 * 7/3) = 0.024; x's enters
     # both silu(h1) and h3, then `a` is requantized: ~sqrt(3) * 0.024 = 0.041,
-    # bounded at 1.5x. GMM's 512-column blocks and lowtok's whole rows round
-    # differently, so each is compared with the oracle, not with the other.
+    # bounded at 1.5x. GMM and lowtok both scale per 512-column block but
+    # round and accumulate differently, so each is compared with the oracle.
     assert err < 0.06, (err, gmm_err)
     assert err < gmm_err + 0.005, (err, gmm_err)
