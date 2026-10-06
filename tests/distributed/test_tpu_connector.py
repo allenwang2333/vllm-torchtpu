@@ -3444,7 +3444,7 @@ class TestTPURaidenConnectorWorker:
             uuid=765,
             local_block_ids=[12],
             num_tokens=1,
-            expiration_time=-1.0,  # Scheduler clock is not the worker clock.
+            expiration_time=1.0,  # Valid metadata in a different clock domain.
         )
 
         with (
@@ -3494,7 +3494,7 @@ class TestTPURaidenConnectorWorker:
             uuid=766,
             local_block_ids=[13],
             num_tokens=1,
-            expiration_time=-1.0,  # Scheduler clock is not the worker clock.
+            expiration_time=1.0,  # Valid metadata in a different clock domain.
         )
 
         with (
