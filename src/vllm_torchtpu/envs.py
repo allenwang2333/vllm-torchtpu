@@ -155,6 +155,8 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
+    TPU_SPARSE_SPEC_SAMPLING: bool = False
+    TPU_SAMPLING_TOPK_BOUND: int = 64
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     TPU_SMALL_ALL_REDUCE: bool = False
 
@@ -923,6 +925,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SAMPLER_TOPK_CANDIDATES": env_nonnegative_int(
         "TPU_SAMPLER_TOPK_CANDIDATES", 0
     ),
+    # Spec-decode verify sampling on each row's top-k window: when a non-greedy
+    # verify chunk has no grammar mask and every request has
+    # 0 < top_k <= TPU_SAMPLING_TOPK_BOUND (or is greedy), run one chunked
+    # top-k over the logits rows, then the bonus sample and the rejection
+    # sampler on the [rows, bound] windows instead of the full-vocab logits.
+    # Same distributions; the random stream differs. Takes precedence over
+    # TPU_SAMPLER_TOPK_CANDIDATES for the verify chunks it accepts; every
+    # other chunk (and plain, non-spec sampling) keeps the existing path,
+    # TPU_SAMPLER_TOPK_CANDIDATES included.
+    "TPU_SPARSE_SPEC_SAMPLING": env_bool("TPU_SPARSE_SPEC_SAMPLING", False),
+    # Window width of TPU_SPARSE_SPEC_SAMPLING (the largest top_k it takes).
+    # 0 disables the sparse path.
+    "TPU_SAMPLING_TOPK_BOUND": env_nonnegative_int("TPU_SAMPLING_TOPK_BOUND", 64),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).
