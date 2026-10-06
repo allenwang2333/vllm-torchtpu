@@ -41,7 +41,7 @@ def _kernel(o_ref, z_ref, w_ref, q_ref, s_ref, *, eps: float):
     amax = jnp.max(jnp.abs(y), axis=(1, 2), keepdims=True)
     scale = jnp.where(amax == 0.0, 1.0, amax / FP8_MAX)
     q_ref[...] = jnp.clip(y / scale, -FP8_MAX, FP8_MAX).astype(FP8)
-    s_ref[...] = scale.reshape(scale.shape[0], 1)
+    s_ref[...] = scale.reshape(s_ref.shape)
 
 
 def legal_tile(rows: int, cap: int) -> int:
@@ -79,18 +79,27 @@ def gated_norm_quant(
     assert z.shape == o.shape and w.shape == (dim,), (o.shape, z.shape, w.shape)
     tile = legal_tile(tokens, tile)
     spec = pl.BlockSpec((tile, heads, dim), lambda i: (i, 0, 0))
-    return pl.pallas_call(
+    # Write the scales lane-dense, as [tokens], when the block allows it: a
+    # [tokens, 1] f32 array is laid out one row per sublane, and the matmul
+    # that consumes the scales relayouts it back to [tokens] (2.3 us at 16384
+    # tokens, 0.12 us at 8).
+    if tile == tokens or tile % 128 == 0:
+        s_shape, s_spec = (tokens,), pl.BlockSpec((tile,), lambda i: (i,))
+    else:
+        s_shape, s_spec = (tokens, 1), pl.BlockSpec((tile, 1), lambda i: (i, 0))
+    q, s = pl.pallas_call(
         functools.partial(_kernel, eps=float(eps)),
         grid=(tokens // tile,),
         in_specs=[spec, spec, pl.BlockSpec((dim,), lambda i: (0,))],
-        out_specs=[spec, pl.BlockSpec((tile, 1), lambda i: (i, 0))],
+        out_specs=[spec, s_spec],
         out_shape=[
             jax.ShapeDtypeStruct((tokens, heads, dim), FP8),
-            jax.ShapeDtypeStruct((tokens, 1), jnp.float32),
+            jax.ShapeDtypeStruct(s_shape, jnp.float32),
         ],
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         interpret=interpret,
     )(o, z, w)
+    return q, s.reshape(tokens, 1)
 
 
 def reference(
