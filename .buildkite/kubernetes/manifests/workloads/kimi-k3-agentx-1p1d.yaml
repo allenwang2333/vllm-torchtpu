@@ -76,7 +76,7 @@ spec:
                       value: "4"
                     # Both roles and the client read this one config.
                     - name: K3_PD_CONFIG
-                      value: kimi-k3-tp8-dp4-ep-agentx
+                      value: kimi-k3-tp8-dp4-ep-agentx-smoke
                     # Serve only; the client pod drives the run.
                     - name: K3_PD_EXTERNAL_CLIENT
                       value: "1"
@@ -146,7 +146,7 @@ spec:
                       value: "4"
                     # Both roles and the client read this one config.
                     - name: K3_PD_CONFIG
-                      value: kimi-k3-tp8-dp4-ep-agentx
+                      value: kimi-k3-tp8-dp4-ep-agentx-smoke
                     # Serve only; the client pod drives the run.
                     - name: K3_PD_EXTERNAL_CLIENT
                       value: "1"
@@ -213,12 +213,22 @@ spec:
                       value: ${WORKLOAD_NAME}
                     # The same config the engines booted; read here for the cases.
                     - name: K3_PD_CONFIG
-                      value: kimi-k3-tp8-dp4-ep-agentx
+                      value: kimi-k3-tp8-dp4-ep-agentx-smoke
                     # Physical chips the pair holds: 4 hosts x google.com/tpu 4
                     # per slice, twice. The divisor for the per-chip figure, and
                     # what is billed per chip-hour - not the 64 ranks on them.
                     - name: AGENTX_CHIPS
                       value: "32"
+                    # TEMPORARY bring-up knobs: a 180 s window with one warmup
+                    # request per lane, which aiperf flags submission_valid=false.
+                    - name: AGENTX_DURATION
+                      value: "180"
+                    - name: AGENTX_WARMUP_REQUESTS
+                      value: "1"
+                    - name: AGENTX_UNSAFE_OVERRIDE
+                      value: "true"
+                    - name: AGENTX_GSM8K_LIMIT
+                      value: "20"
                     # This pod's results are the step's only output.
                     - name: ARTIFACTS_DIR
                       value: perf_eval_results

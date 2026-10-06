@@ -1,0 +1,45 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# TEMPORARY, for hardware bring-up of the AgentX 1P1D lane. Not for merge.
+#
+# The image build plus the one step, so a run takes the pair's two 2x2x4 slices
+# and nothing else. The step is the nightly's, verbatim: same command, same
+# plugin, through run_multihost.sh so common.sh resolves the image from the
+# CI_IMAGE_TAG metadata the build step sets, exactly as in pipeline_perf_kube.yml.
+#
+# Trigger on vllm-torchtpu-dev with
+#   DEV_PIPELINE_FILE=.buildkite/pipeline_k3_agentx_bringup.yml
+
+x-kube-plugin: &kube_plugin
+  kubernetes:
+    podTemplate: tpu-launcher
+
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":kubernetes: :tpu: Kimi-K3 AgentX 1P1D bring-up (TPU v7x 2x2x4 x2)"
+    depends_on: build_docker
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    plugins:
+      - *kube_plugin
+    commands:
+      - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-agentx-1p1d.yaml
