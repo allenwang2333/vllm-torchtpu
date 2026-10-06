@@ -62,12 +62,18 @@ def gated_norm_quant(
     w: jax.Array,
     eps: float,
     *,
-    tile: int = 32,
+    tile: int = 512,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """o, z: [tokens, heads, dim] bf16; w: [dim].
 
     Returns the fp8 rows [tokens, heads, dim] and their f32 scales [tokens, 1].
+
+    ``tile`` caps the rows per grid step. Each step costs about 0.6 us of fixed
+    overhead whatever its size, so small tiles make large token counts
+    step-bound: at 16384 tokens (v7x, 8 heads x 128) tile 32 takes 315 us and
+    tile 512 takes 76 us, where the kernel is VALU-bound; 256 and 1024 are
+    within 1-12% of 512 from 1024 tokens up. Up to 512 tokens it is one step.
     """
     tokens, heads, dim = o.shape
     assert z.shape == o.shape and w.shape == (dim,), (o.shape, z.shape, w.shape)
