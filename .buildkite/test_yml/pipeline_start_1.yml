@@ -20,3 +20,11 @@ steps:
     commands:
       - sleep 30
 
+  - label: ":work: Wait 45s"
+    key: "w45s"
+    depends_on: w30s
+    agents:
+      queue: cpu
+    commands:
+      - sleep 45
+
