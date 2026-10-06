@@ -925,11 +925,8 @@ class TPUModelRunner(GPUModelRunner):
                 raise ValueError(
                     "DSpark PD producer currently requires sync scheduling."
                 )
-            if (
-                self.parallel_config.data_parallel_size != 1
-                or self.parallel_config.pipeline_parallel_size != 1
-            ):
-                raise ValueError("DSpark PD producer currently requires DP=PP=1.")
+            if self.parallel_config.pipeline_parallel_size != 1:
+                raise ValueError("DSpark PD producer currently requires PP=1.")
         # Maximum query length to be considered a decode.
         self.reorder_batch_threshold = 1
         self.spec_decode_manager = SpeculativeDecodingManager(self)
@@ -3456,7 +3453,13 @@ class TPUModelRunner(GPUModelRunner):
         # use_eagle() covers every hidden-state drafter, dflash included.
         spec = self.speculative_config
         if num_chunks > 0 and spec is not None and spec.use_eagle():
-            self._async_drafter.run_dp_dummy_draft(num_chunks)
+            if self._is_dspark_pd_producer:
+                # Busy producers only project context KV; pairing a draft
+                # forward here would emit collectives with no busy-rank peer.
+                self.drafter.run_dp_dummy_context(num_chunks)
+                synchronize_tensors()
+            else:
+                self._async_drafter.run_dp_dummy_draft(num_chunks)
 
     def _dp_num_tokens_across_dp(self, num_tokens: int) -> torch.Tensor | None:
         if not self._dp_lockstep_enabled():

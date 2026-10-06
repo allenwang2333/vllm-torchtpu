@@ -862,6 +862,16 @@ class DFlashProposer:
         return self._draft_has_moe_cache
 
     @torch.no_grad()
+    def run_dp_dummy_context(self, num_chunks: int) -> None:
+        """Pair context-only producer updates without proposing draft tokens."""
+        if num_chunks <= 0 or self.draft_model is None:
+            return
+        if not self._dp_lockstep_sharded():
+            return
+        for _ in range(num_chunks):
+            self._dp_dummy_kv_update()
+
+    @torch.no_grad()
     def run_dp_dummy_draft(self, num_chunks: int) -> None:
         """Replay a busy rank's draft collectives on an idle/padding rank
         for `num_chunks` padding chunks (EP-DP lockstep)."""
@@ -872,8 +882,7 @@ class DFlashProposer:
         # Collectives pair across ranks by emission order, and propose()
         # emits ALL KV-updates before ALL draft forwards, so the replay
         # keeps that phase structure -- never interleaved per chunk.
-        for _ in range(num_chunks):
-            self._dp_dummy_kv_update()
+        self.run_dp_dummy_context(num_chunks)
         for _ in range(num_chunks):
             self._dp_dummy_forward()
 
