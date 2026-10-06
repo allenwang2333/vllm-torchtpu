@@ -350,7 +350,6 @@ def outer_kernel(
         "mixed_tile_size",
         "batched_only",
         "prefill_only",
-        "per_seq_cond",
         "per_seq_empty",
         "zero_initialize_out",
         "compute_precision",
@@ -388,7 +387,6 @@ def fused_conv1d_gdn(
     num_spec_tokens: int = 0,
     batched_only: bool = False,
     prefill_only: bool = False,
-    per_seq_cond: bool = False,
     per_seq_empty: bool = False,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
@@ -459,9 +457,6 @@ def fused_conv1d_gdn(
         batched_only: Run only the leading decode/verify segment.
         prefill_only: Run only PER_SEQ, leaving decode/verify checkpoints
             untouched. Mutually exclusive with batched_only.
-        per_seq_cond: Launch the PER_SEQ pass under a device-side
-            `lax.cond` on `distribution[0] < distribution[-1]`, so a step
-            with no prefill/mixed sequence skips its launch. Experimental.
         per_seq_empty: The caller guarantees the step has no prefill/mixed
             sequence: PER_SEQ is still launched (XLA uses the launch as a
             slot for async prefetches) but with constant zero-tile metadata,
@@ -831,22 +826,7 @@ def fused_conv1d_gdn(
             out_act, out_source, _ = call_kernel(
                 state_source, None, None, config.GDNMode.BATCHED
             )
-        if not batched_only and per_seq_cond and out_act is not None:
-
-            def _per_seq(act, source):
-                act, source, _ = call_kernel(
-                    source, None, act, config.GDNMode.PER_SEQ
-                )
-                return act, source
-
-            out_act, out_source = jax.lax.cond(
-                distribution[0] < distribution[-1],
-                _per_seq,
-                lambda act, source: (act, source),
-                out_act,
-                out_source,
-            )
-        elif not batched_only:
+        if not batched_only:
             out_act, out_source, _ = call_kernel(
                 out_source, None, out_act, config.GDNMode.PER_SEQ
             )
