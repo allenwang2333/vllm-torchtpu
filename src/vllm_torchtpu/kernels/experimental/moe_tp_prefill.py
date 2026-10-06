@@ -452,8 +452,16 @@ def routing_plan(topk_ids, n_experts, row_scale, route_valid=None, n_valid=None)
         e_flat = jnp.where(iota // k < n_valid, e_flat, n_experts)
     if route_valid is not None:
         e_flat = jnp.where(route_valid.reshape(-1), e_flat, n_experts)
-    s_rep = jnp.broadcast_to(row_scale[:, None], (n_tok, k)).reshape(-1)
-    _, order, s_sorted = lax.sort((e_flat, iota, s_rep), num_keys=1, is_stable=True)
+    shift = max(1, (n_routes - 1).bit_length())
+    if (n_experts + 1) << shift < 2**31:
+        # One single-operand sort of (expert, route) packed into int32: the
+        # route id breaks ties, so this is the stable expert order, at a
+        # fraction of the cost of a stable multi-operand sort.
+        order = lax.sort(e_flat * (1 << shift) + iota) & ((1 << shift) - 1)
+        s_sorted = row_scale[order // k]
+    else:
+        s_rep = jnp.broadcast_to(row_scale[:, None], (n_tok, k)).reshape(-1)
+        _, order, s_sorted = lax.sort((e_flat, iota, s_rep), num_keys=1, is_stable=True)
     _, pos = lax.sort((order, iota), num_keys=1, is_stable=False)
     counts = jnp.sum(
         (e_flat[None, :] == jnp.arange(n_experts, dtype=jnp.int32)[:, None]).astype(
