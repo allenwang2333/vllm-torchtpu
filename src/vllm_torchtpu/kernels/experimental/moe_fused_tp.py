@@ -123,6 +123,8 @@ def _ar_kernel(
     experts,
     nb,
     n_ranks,
+    gate_in_kernel=False,
+    ar_mode="rs_ag",
 ):
     me = rank_ref[0]
     chunk = h // n_ranks
@@ -196,7 +198,14 @@ def _ar_kernel(
     # Shared expert first; its slabs were issued at entry with the routed primes.
     for copy in shared_copies:
         copy.wait()
-    shared_coeff = jnp.max(sgate_ref[...], axis=1, keepdims=True)
+    if gate_in_kernel:
+        # sgate_ref is the gate weight as a [1, H] row: sigmoid(x . w_g) on the VPU.
+        wg_row = sgate_ref[...].astype(jnp.float32)
+        shared_coeff = jax.nn.sigmoid(
+            jnp.sum(x_ref[...].astype(jnp.float32) * wg_row, axis=1, keepdims=True)
+        )
+    else:
+        shared_coeff = jnp.max(sgate_ref[...], axis=1, keepdims=True)
     accumulate(
         jnp.matmul(xq_ref[...], w1s_v[...], preferred_element_type=jnp.float32),
         shared_coeff,
@@ -242,10 +251,33 @@ def _ar_kernel(
             jnp.matmul(xq_ref[...], w1_ref[0], preferred_element_type=jnp.float32),
         )
 
-    # All-reduce: reduce-scatter column chunks, sum, all-gather.
     own_bf[...] = owner_ref[...].astype(own_bf.dtype)
     # Every peer has entered this call, so its receive buffer is live.
     pl.semaphore_wait(barrier, n_ranks)
+    if ar_mode == "oneshot":
+        # One hop: push the whole partial to every peer, sum the n_ranks arrivals.
+        push = [
+            pltpu.make_async_remote_copy(
+                own_bf,
+                recv.at[me],
+                rs_send.at[d],
+                rs_recv,
+                device_id=(jnp.int32(d),),
+                device_id_type=_MESH,
+            )
+            for d in range(n_ranks)
+        ]
+        for copy in push:
+            copy.start()
+        pltpu.make_async_copy(recv, recv, rs_recv).wait()
+        acc = recv[0].astype(jnp.float32)
+        for s in range(1, n_ranks):
+            acc = acc + recv[s].astype(jnp.float32)
+        out_ref[...] = acc.astype(out_ref.dtype)
+        for copy in push:
+            copy.wait_send()
+        return
+    # All-reduce: reduce-scatter column chunks, sum, all-gather.
     scatter = [
         pltpu.make_async_remote_copy(
             own_bf.at[:, pl.ds(d * chunk, chunk)],
@@ -337,6 +369,8 @@ def fused_moe_tp_ar(
     n_ranks,
     num_buffers=None,
     expert_start=None,
+    gate_in_kernel=False,
+    ar_mode="rs_ag",
 ):
     """Per-rank body; call inside shard_map over the TP mesh.
 
@@ -370,16 +404,27 @@ def fused_moe_tp_ar(
         coeff = coeff + selected.astype(jnp.float32) * weights[:, route : route + 1]
     active = jnp.any(coeff != 0, axis=0).astype(jnp.int32)
     coeff = jnp.pad(coeff, ((0, 0), (0, (-experts) % 128)))
-    shared_gate = jax.nn.sigmoid(
-        jnp.dot(hidden, wg.astype(hidden.dtype), preferred_element_type=jnp.float32)
-    )
-    shared_gate = jnp.broadcast_to(shared_gate, (m, 128))
+    if gate_in_kernel:
+        shared_gate = wg.astype(hidden.dtype).reshape(1, h)
+    else:
+        shared_gate = jax.nn.sigmoid(
+            jnp.dot(hidden, wg.astype(hidden.dtype), preferred_element_type=jnp.float32)
+        )
+        shared_gate = jnp.broadcast_to(shared_gate, (m, 128))
     i_s = w2s.shape[0]
     nb = num_buffers or _weight_ring_depth(h, i)
     chunk = h // n_ranks
     out = pl.pallas_call(
         functools.partial(
-            _ar_kernel, m=m, h=h, i=i, experts=experts, nb=nb, n_ranks=n_ranks
+            _ar_kernel,
+            m=m,
+            h=h,
+            i=i,
+            experts=experts,
+            nb=nb,
+            n_ranks=n_ranks,
+            gate_in_kernel=gate_in_kernel,
+            ar_mode=ar_mode,
         ),
         out_shape=jax.ShapeDtypeStruct((m, h), hidden.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -400,7 +445,9 @@ def fused_moe_tp_ar(
                 pltpu.VMEM((m, 2 * i), jnp.float32),
                 pltpu.VMEM((m, h), jnp.float32),
                 pltpu.VMEM((m, h), hidden.dtype),
-                pltpu.VMEM((n_ranks, m, chunk), hidden.dtype),
+                pltpu.VMEM(
+                    (n_ranks, m, h if ar_mode == "oneshot" else chunk), hidden.dtype
+                ),
                 pltpu.VMEM((m, chunk), hidden.dtype),
                 pltpu.SMEM((experts,), jnp.int32),
                 pltpu.SemaphoreType.DMA((nb, 4)),
@@ -415,7 +462,9 @@ def fused_moe_tp_ar(
             collective_id=0,
             vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
         ),
-        name=f"fused_moe_tp_ar-e_{experts}-m_{m}-h_{h}-i_{i}-is_{i_s}-n_{n_ranks}-buffers_{nb}",
+        name=f"fused_moe_tp_ar-e_{experts}-m_{m}-h_{h}-i_{i}-is_{i_s}-n_{n_ranks}-buffers_{nb}"
+        + ("-g" if gate_in_kernel else "")
+        + ("-1s" if ar_mode == "oneshot" else ""),
     )(
         active,
         rank.reshape(1).astype(jnp.int32),
