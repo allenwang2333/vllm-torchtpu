@@ -63,9 +63,9 @@ fi
 
 upload_with_priority .buildkite/test_yml/pipeline_wait.yml "$JOB_PRIORITY"
 
-upload_with_priority .buildkite/test_yml/pipeline_start_2.yml "$JOB_PRIORITY"
+# upload_with_priority .buildkite/test_yml/pipeline_start_2.yml "$JOB_PRIORITY"
 
-upload_with_priority .buildkite/test_yml/pipeline_start_1.yml "$JOB_PRIORITY"
+# upload_with_priority .buildkite/test_yml/pipeline_start_1.yml "$JOB_PRIORITY"
 
 # # --- Check for explicit skip-ci or non-code/documentation-only changes ---
 # echo "--- :git: Checking if CI build should be skipped"
