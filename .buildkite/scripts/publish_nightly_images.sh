@@ -100,16 +100,31 @@ for TARGET in "${TARGETS[@]}"; do
   echo "--- :docker: Tagging as ${LATEST_IMAGE}"
   docker tag "${DATE_IMAGE}" "${LATEST_IMAGE}"
 
-  echo "--- :docker: Pushing ${DATE_IMAGE} and ${LATEST_IMAGE}"
-  # TODO(test-only): Docker Hub pushes disabled for a CI dry run. Restore
-  # before merging (the GAR path is unchanged).
   if [[ "${PUBLISH_DOCKERHUB}" == "1" ]]; then
+    echo "--- :docker: Pushing ${DATE_IMAGE} and ${LATEST_IMAGE} to Docker Hub"
+    # TODO(test-only): Docker Hub pushes disabled for a CI dry run. Restore
+    # before merging.
     echo "[SIMULATED] docker push ${DATE_IMAGE}"
     echo "[SIMULATED] docker push ${LATEST_IMAGE}"
-  else
-    docker push "${DATE_IMAGE}"
-    docker push "${LATEST_IMAGE}"
+
+    echo "--- Cleaning up locally built image tags for ${TARGET}"
+    docker rmi "${DATE_IMAGE}" "${LATEST_IMAGE}" || true
+    continue
   fi
+
+  # Step 1: Tag and push extra legacy torchtpu-vllm images for backward compatibility
+  # so existing consumers continue working smoothly until migration is finalized.
+  EXTRA_IMAGE_NAME="${REGISTRY}/torchtpu-vllm-${TARGET}"
+  EXTRA_DATE_IMAGE="${EXTRA_IMAGE_NAME}:${DATE_TAG}"
+  EXTRA_LATEST_IMAGE="${EXTRA_IMAGE_NAME}:${LATEST_TAG}"
+
+  echo "--- :docker: Tagging extra legacy images for backward compatibility (${EXTRA_DATE_IMAGE}, ${EXTRA_LATEST_IMAGE})"
+  docker tag "${DATE_IMAGE}" "${EXTRA_DATE_IMAGE}"
+  docker tag "${DATE_IMAGE}" "${EXTRA_LATEST_IMAGE}"
+
+  echo "--- :docker: Pushing ${DATE_IMAGE} and ${LATEST_IMAGE} to Artifact Registry"
+  docker push "${DATE_IMAGE}"
+  docker push "${LATEST_IMAGE}"
 
   echo "--- :docker: Pushing extra images ${EXTRA_DATE_IMAGE} and ${EXTRA_LATEST_IMAGE} to Artifact Registry"
   docker push "${EXTRA_DATE_IMAGE}"
