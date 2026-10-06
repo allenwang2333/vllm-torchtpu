@@ -55,6 +55,20 @@ def _gdn_pcp_tp_state_axis(pcp_axis: str, tp_axis: str | None) -> str | tuple[st
     return (tp_axis, pcp_axis)
 
 
+def gdn_decode_only_program(num_tokens: int) -> bool:
+    """Whether a token bucket of ``num_tokens`` rows runs the BATCHED pass only.
+
+    Under ``TPU_GDN_DECODE_ONLY_MAX_TOKENS`` the runner never places a chunk
+    with a prefill/mixed request in such a bucket (see
+    ``TPUModelRunner._gdn_mixed_min_tokens``), so its PER_SEQ pass always has
+    zero tiles and is not compiled at all. Decided from the static token
+    count: the compiled program is per bucket, and guards on any other python
+    value are dropped by the compile wrapper.
+    """
+    max_tokens = tpu_envs.TPU_GDN_DECODE_ONLY_MAX_TOKENS
+    return max_tokens > 0 and num_tokens <= max_tokens
+
+
 def run_jax_gdn_attention(
     j_mixed_qkv: jnp.ndarray,
     j_b: jnp.ndarray,
@@ -157,6 +171,7 @@ def run_jax_gdn_attention(
         d_v=d_v,
         kernel_size=kernel_size,
         num_spec_tokens=num_spec_tokens,
+        batched_only=gdn_decode_only_program(j_mixed_qkv.shape[0]),
     )
 
     mapped_fn = jax.shard_map(
@@ -869,6 +884,8 @@ def run_jax_gdn_attention_pooled_local(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    batched_only: bool = False,
+    per_seq_cond: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
@@ -921,6 +938,8 @@ def run_jax_gdn_attention_pooled_local(
         state_source=recurrent_state,
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
+        batched_only=batched_only,
+        per_seq_cond=per_seq_cond,
     )
     return recurrent_state, output
 
@@ -1033,6 +1052,7 @@ def run_jax_gdn_attention_pooled(
         pool_block_tokens=pool_block_tokens,
         num_spec_tokens=num_spec_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
+        batched_only=gdn_decode_only_program(j_mixed_qkv.shape[0]),
     )
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,

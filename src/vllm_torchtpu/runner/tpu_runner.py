@@ -553,6 +553,12 @@ class TPUModelRunner(GPUModelRunner):
         self._profiler_world_size = profiler_world_size
         pcp_config = PcpStaticSupportValidator.from_vllm_config(vllm_config)
         self._pcp_enabled = pcp_config.enabled
+        if self._pcp_enabled and envs.TPU_GDN_DECODE_ONLY_MAX_TOKENS > 0:
+            # The PCP layout planner picks buckets without the prefill floor.
+            raise ValueError(
+                "TPU_GDN_DECODE_ONLY_MAX_TOKENS is not supported with prefill "
+                "context parallelism."
+            )
         self._mtp_enabled = pcp_config.speculative_method == "mtp"
         sequence_layout_planner = create_sequence_layout_planner(vllm_config)
         if sequence_layout_planner.requires_backend_preinit:
@@ -1445,6 +1451,23 @@ class TPUModelRunner(GPUModelRunner):
                 )
 
         self.num_xla_graphs += new_compiled_graphs
+
+    def _gdn_mixed_min_tokens(
+        self, start_index: int, num_reqs: int, num_windowed_reqs: int
+    ) -> int:
+        """The smallest bucket a chunk may take under TPU_GDN_DECODE_ONLY_MAX_TOKENS.
+
+        Buckets of at most that many rows compile the GDN kernel's BATCHED
+        (decode/verify) pass only (`gdn_attention.gdn_decode_only_program`).
+        A chunk holding any request past the windowed segment -- a prefill or
+        mixed request, which the PER_SEQ pass computes -- is moved to the
+        first bucket above the limit. Returns 0 when no floor applies.
+        """
+        max_tokens = envs.TPU_GDN_DECODE_ONLY_MAX_TOKENS
+        if max_tokens <= 0:
+            return 0
+        chunk_num_windowed = max(0, min(num_windowed_reqs - start_index, num_reqs))
+        return max_tokens + 1 if chunk_num_windowed < num_reqs else 0
 
     def _reorder_batch_for_rpa(
         self, scheduler_output: "SchedulerOutput"
@@ -2716,6 +2739,10 @@ class TPUModelRunner(GPUModelRunner):
         assert max_num_scheduled_tokens_all_reqs > 0
 
         num_reqs = len(num_scheduled_tokens_per_req)
+        # Read by the sequence layout planner when it picks this chunk's bucket.
+        self._gdn_chunk_min_tokens = self._gdn_mixed_min_tokens(
+            start_index, num_reqs, num_windowed_reqs
+        )
 
         sequence_layout_planner = _get_sequence_layout_planner_for_runner(self)
         sequence_layout_planner.reserve_host_token_capacity(
@@ -3444,7 +3471,13 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output
         )
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
-            scheduler_output.total_num_scheduled_tokens,
+            max(
+                scheduler_output.total_num_scheduled_tokens,
+                # Every DP rank must run the bucket a prefill chunk is moved to.
+                self._gdn_mixed_min_tokens(
+                    0, self.input_batch.num_reqs, num_windowed_reqs
+                ),
+            ),
             local_num_chunks,
             # Exact per-chunk request bound on this rank; the DP-wide MAX of
             # it sizes every rank's draft forwards.

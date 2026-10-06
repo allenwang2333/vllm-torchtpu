@@ -300,8 +300,12 @@ class AllSequenceLayoutPlanner:
             target_num_reqs,
             padded_num_reqs,
         )
+        # A chunk with a prefill request skips the GDN decode-only buckets
+        # (TPU_GDN_DECODE_ONLY_MAX_TOKENS; TPUModelRunner._gdn_mixed_min_tokens).
+        min_tokens = int(getattr(runner, "_gdn_chunk_min_tokens", 0) or 0)
         padded_num_tokens = _first_ge(
-            runner.num_tokens_paddings, int(total_num_scheduled_tokens)
+            runner.num_tokens_paddings,
+            max(int(total_num_scheduled_tokens), min_tokens),
         )
         dp_target_bucket = runner._dp_target_bucket
         if dp_target_bucket is not None and dp_target_bucket > padded_num_tokens:
