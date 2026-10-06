@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_FUSED_NORM_QUANT: bool = False
+    TPU_GDN_DECODE_ONLY_MAX_TOKENS: int = 0
     TPU_FUSED_QK_NORM_ROPE: bool = False
     TPU_RPA_DECODE_BATCHED: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -709,6 +710,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # quantization as one kernel. Needs per-channel fp8 out_proj weights.
     "TPU_ENABLE_GDN_DYNAMIC_TILING": env_bool("TPU_ENABLE_GDN_DYNAMIC_TILING", default=False),
     "TPU_GDN_FUSED_NORM_QUANT": env_bool("TPU_GDN_FUSED_NORM_QUANT"),
+    # Token buckets of at most this many rows compile the GDN kernel's
+    # decode/verify (BATCHED) pass only, dropping the per-sequence pass, its
+    # launch and its output copy. The runner moves any chunk that carries a
+    # prefill/mixed request to a larger bucket, so such a bucket only ever
+    # runs decode and verify rows. 0 (default) keeps both passes everywhere.
+    "TPU_GDN_DECODE_ONLY_MAX_TOKENS": env_nonnegative_int(
+        "TPU_GDN_DECODE_ONLY_MAX_TOKENS", 0
+    ),
     # Run the gated q split, q/k RMS norms and NeoX rope of Qwen3NextAttention
     # as one kernel on token buckets of up to 64 rows.
     "TPU_FUSED_QK_NORM_ROPE": env_bool("TPU_FUSED_QK_NORM_ROPE"),
