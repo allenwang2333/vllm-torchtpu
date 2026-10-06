@@ -151,6 +151,11 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
+    VLLM_TPU_MOE_SEQUENCE_PARALLEL: str = "off"
+    VLLM_TPU_MOE_SP_GATE_AFTER_GATHER: bool = True
+    VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER: bool = False
+    VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS: int = 0
+    VLLM_TPU_SP_MIN_TOKENS: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
 
 
@@ -228,6 +233,28 @@ def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
         )
 
     return _get_bool_env
+
+
+def env_moe_sequence_parallel_mode(env_name: str) -> Callable[[], str]:
+    """Parse the sequence-parallel MoE mode into "off", "auto" or "force"."""
+
+    def _get_mode() -> str:
+        value = os.getenv(env_name)
+        if value is None or value.strip() == "":
+            return "off"
+        value_lower = value.strip().lower()
+        if value_lower in _FALSE_STRINGS:
+            return "off"
+        if value_lower in _TRUE_STRINGS or value_lower == "auto":
+            return "auto"
+        if value_lower == "force":
+            return "force"
+        raise ValueError(
+            f"Invalid value '{value}' for {env_name}. Valid options: "
+            f"{_TRUE_STRINGS + _FALSE_STRINGS + ('auto', 'force')} (any case)."
+        )
+
+    return _get_mode
 
 
 def env_int(env_name: str, default: int) -> Callable[[], int]:
@@ -926,6 +953,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SAMPLER_TOPK_CANDIDATES": env_nonnegative_int(
         "TPU_SAMPLER_TOPK_CANDIDATES", 0
     ),
+    "VLLM_TPU_MOE_SEQUENCE_PARALLEL": env_moe_sequence_parallel_mode(
+        "VLLM_TPU_MOE_SEQUENCE_PARALLEL"
+    ),
+    "VLLM_TPU_MOE_SP_GATE_AFTER_GATHER": env_bool(
+        "VLLM_TPU_MOE_SP_GATE_AFTER_GATHER", True
+    ),
+    "VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER": lambda: (
+        env_bool("VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER")()
+        or env_bool("TPU_SEQUENCE_PARALLEL_FP8_GATHER")()
+    ),
+    "VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS", 0
+    ),
+    "VLLM_TPU_SP_MIN_TOKENS": env_nonnegative_int("VLLM_TPU_SP_MIN_TOKENS", 0),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).

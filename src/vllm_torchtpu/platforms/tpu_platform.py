@@ -405,6 +405,7 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
+        "VLLM_TPU_MOE_SEQUENCE_PARALLEL",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -747,7 +748,10 @@ class TpuPlatform(Platform):
         else:
             compilation_config.compile_sizes = sorted(compilation_config.compile_sizes)
 
-        if envs.TPU_MOE_SEQUENCE_PARALLEL:
+        if (
+            envs.TPU_MOE_SEQUENCE_PARALLEL
+            or envs.VLLM_TPU_MOE_SEQUENCE_PARALLEL != "off"
+        ):
             _configure_sequence_parallel_moe(vllm_config)
 
         # Clear compile_ranges_split_points — TPU always pads to exact
@@ -1203,6 +1207,8 @@ def _get_token_paddings(
 
 
 def _is_sequence_parallel_bucket(size: int, tp: int) -> bool:
+    if envs.VLLM_TPU_SP_MIN_TOKENS > 2 and size < envs.VLLM_TPU_SP_MIN_TOKENS:
+        return True
     # Each rank receives size // tp rows; require 8-token alignment or
     # validated power-of-two decode sizes (2, 4) with at least 2 rows per rank
     # to avoid single-token shape specialization in Dynamo.

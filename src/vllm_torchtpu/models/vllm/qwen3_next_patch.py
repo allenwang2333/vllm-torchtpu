@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Trace-stable sequence-parallel forwards for Qwen3.5 MoE.
+"""Trace-stable sequence-parallel forwards for Qwen3-Next and Qwen3.5 MoE.
 
 vLLM's Qwen3.5 decoder layer and model inherit these forwards from the
 Qwen3Next classes, so the patch replaces them there.
 
 Copies of the upstream vLLM forwards with three changes, so torch.compile
-serves every bucket under TPU_MOE_SEQUENCE_PARALLEL=1:
+serves every bucket under TPU_MOE_SEQUENCE_PARALLEL=1 / VLLM_TPU_MOE_SEQUENCE_PARALLEL:
 - torch._check(num_tokens % tp == 0) states that buckets divide by TP.
 - narrow(0, 0, num_tokens) replaces [:num_tokens] after each all-gather to
   preserve exact symbolic output dimensions across TorchDynamo traces.
@@ -26,12 +26,14 @@ serves every bucket under TPU_MOE_SEQUENCE_PARALLEL=1:
 """
 
 from itertools import islice
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.models import qwen3_next, qwen3_next_mtp
@@ -40,17 +42,71 @@ from vllm.sequence import IntermediateTensors
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.logger import init_logger
 
+if TYPE_CHECKING:
+    from vllm.config import ModelConfig
+
 logger = init_logger(__name__)
 
+linear_common: Any = None
+
+UPSTREAM_ATTENTION_FORWARD = qwen3_next.Qwen3NextAttention.forward
 UPSTREAM_DECODER_LAYER_FORWARD = qwen3_next.Qwen3NextDecoderLayer.forward
 UPSTREAM_MODEL_FORWARD = qwen3_next.Qwen3NextModel.forward
 UPSTREAM_MTP_FORWARD = qwen3_next_mtp.Qwen3NextMultiTokenPredictor.forward
+
+_QWEN3_NEXT_MOE_MODEL_TYPES = frozenset(
+    {"qwen3_next", "qwen3_5_moe", "qwen3_5_moe_text"}
+)
+
+
+def _get_linear_common() -> Any:
+    global linear_common
+    if linear_common is None:
+        from vllm_torchtpu.layers.adapter import linear_common as _lc
+
+        linear_common = _lc
+    return linear_common
 
 
 def _check_tokens_divide_by_tp(num_tokens: int) -> None:
     tp_size = get_tensor_model_parallel_world_size()
     if tp_size > 1:
         torch._check(num_tokens % tp_size == 0)
+
+
+def _should_use_sp(
+    full_num_tokens: int | torch.SymInt, *, is_mtp: bool = False
+) -> bool:
+    """Whether this step should shard activations [T/TP, H] across TP ranks."""
+    min_sp_tokens = envs.VLLM_TPU_SP_MIN_TOKENS
+    if min_sp_tokens <= 2:
+        return True
+    from vllm_torchtpu.compilation import shape_variants
+
+    # Submodules compiled outside shape_variants.warmup (such as the 1-layer
+    # MTP drafter) keep a single token-independent graph without SP collectives.
+    if is_mtp or (torch.compiler.is_compiling() and shape_variants._session is None):
+        return False
+    return bool(full_num_tokens >= min_sp_tokens)
+
+
+def patched_attention_forward(
+    self,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    if prequant is None:
+        return UPSTREAM_ATTENTION_FORWARD(
+            self, positions=positions, hidden_states=hidden_states
+        )
+    qkv = _get_linear_common().project_prequant(self.qkv_proj, hidden_states, prequant)
+    q, k, v, gate = self._project_qkv_gate(qkv, positions)
+    attn_output = self.attn(q, k, v)
+    if gate is not None:
+        attn_output = attn_output * torch.sigmoid(gate)
+    output, _ = self.o_proj(attn_output)
+    return output
 
 
 def patched_decoder_layer_forward(
@@ -68,16 +124,46 @@ def patched_decoder_layer_forward(
     else:
         hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-    if self.use_attn_reduce_scatter_for_moe:
-        hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-        hidden_states = hidden_states.narrow(0, 0, full_num_tokens)
+    attn_kwargs: dict[str, object] = {}
+    use_sp = self.use_attn_reduce_scatter_for_moe and _should_use_sp(
+        full_num_tokens, is_mtp=getattr(self, "_is_mtp_layer", False)
+    )
+    if use_sp:
+        from vllm_torchtpu.compilation import shape_variants
+
+        min_fp8_tokens = envs.VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS or (
+            16 * get_tensor_model_parallel_world_size() ** 2 + 1
+        )
+        can_specialize_on_tokens = (
+            min_fp8_tokens <= 2
+            or not torch.compiler.is_compiling()
+            or shape_variants._session is not None
+        )
+        if (
+            envs.VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER
+            and can_specialize_on_tokens
+            and full_num_tokens >= min_fp8_tokens
+        ):
+            x_q, x_s = _get_linear_common().quantize_rows(hidden_states)
+            x_q = tensor_model_parallel_all_gather(x_q, 0).narrow(0, 0, full_num_tokens)
+            x_s = (
+                tensor_model_parallel_all_gather(x_s.squeeze(-1), 0)
+                .narrow(0, 0, full_num_tokens)
+                .unsqueeze(-1)
+            )
+            attn_kwargs["prequant"] = (x_q, x_s)
+            hidden_states = x_q
+        else:
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+            hidden_states = hidden_states.narrow(0, 0, full_num_tokens)
 
     if self.layer_type == "linear_attention":
-        hidden_states = self.linear_attn(hidden_states=hidden_states)
+        hidden_states = self.linear_attn(hidden_states=hidden_states, **attn_kwargs)
     elif self.layer_type == "full_attention":
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             positions=positions,
+            **attn_kwargs,
         )
     else:
         raise ValueError("Invalid layer_type")
@@ -93,12 +179,15 @@ def patched_decoder_layer_forward(
             )
 
     if self.use_attn_reduce_scatter_for_moe:
-        _check_tokens_divide_by_tp(full_num_tokens)
-        hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
+        if use_sp:
+            _check_tokens_divide_by_tp(full_num_tokens)
+            hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
+        else:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
     # Fully Connected
     hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-    if self.use_attn_reduce_scatter_for_moe:
+    if use_sp:
         hidden_states = self.mlp(
             hidden_states,
             already_sequence_parallel=True,
@@ -147,8 +236,11 @@ def patched_model_forward(
         residual = intermediate_tensors["residual"]
 
     assert isinstance(hidden_states, torch.Tensor)
-    full_num_tokens = positions.shape[-1]
-    if self.use_sequence_parallel:
+    full_num_tokens = hidden_states.shape[0]
+    if torch.compiler.is_compiling():
+        positions = positions.reshape(*positions.shape[:-1], full_num_tokens)
+    use_sp = self.use_sequence_parallel and _should_use_sp(full_num_tokens)
+    if use_sp:
         _check_tokens_divide_by_tp(full_num_tokens)
         hidden_states = qwen3_next.sequence_parallel_chunk(hidden_states)
 
@@ -172,7 +264,7 @@ def patched_model_forward(
             {"hidden_states": hidden_states, "residual": residual}
         )
     hidden_states, _ = self.norm(hidden_states, residual)
-    if self.use_sequence_parallel:
+    if use_sp:
         if aux_hidden_states:
             hidden_size = hidden_states.shape[-1]
             hidden_states = torch.cat([hidden_states, *aux_hidden_states], dim=-1)
@@ -225,28 +317,60 @@ def patched_mtp_forward(
             dim=-1,
         )
     )
-    full_num_tokens = positions.shape[-1]
-    _check_tokens_divide_by_tp(full_num_tokens)
-    hidden_states = qwen3_next.sequence_parallel_chunk(hidden_states)
+    full_num_tokens = hidden_states.shape[0]
+    if torch.compiler.is_compiling():
+        positions = positions.reshape(*positions.shape[:-1], full_num_tokens)
+    mtp_layer._is_mtp_layer = True
+    use_sp = _should_use_sp(full_num_tokens, is_mtp=True)
+    if use_sp:
+        _check_tokens_divide_by_tp(full_num_tokens)
+        hidden_states = qwen3_next.sequence_parallel_chunk(hidden_states)
     hidden_states, residual = mtp_layer(
         positions=positions,
         hidden_states=hidden_states,
         residual=None,
     )
     hidden_states, _ = self.norm(hidden_states, residual)
-    return tensor_model_parallel_all_gather(hidden_states, 0).narrow(
-        0, 0, full_num_tokens
-    )
+    if use_sp:
+        hidden_states = tensor_model_parallel_all_gather(hidden_states, 0).narrow(
+            0, 0, full_num_tokens
+        )
+    return hidden_states
 
 
-def maybe_patch_qwen3_next(*args: object, **kwargs: object) -> None:
-    """Install trace-stable forwards when TPU_MOE_SEQUENCE_PARALLEL=1."""
-    if not envs.TPU_MOE_SEQUENCE_PARALLEL:
-        return None
+def maybe_patch_qwen3_next(
+    model_config: "ModelConfig | None" = None,
+    *args: object,
+    **kwargs: object,
+) -> bool | None:
+    """Install trace-stable forwards when sequence-parallel MoE is active."""
+    mode = envs.VLLM_TPU_MOE_SEQUENCE_PARALLEL
+    if mode == "off" and not envs.TPU_MOE_SEQUENCE_PARALLEL:
+        return False if model_config is not None else None
+    if model_config is not None:
+        if (
+            getattr(getattr(model_config, "hf_config", None), "model_type", None)
+            not in _QWEN3_NEXT_MOE_MODEL_TYPES
+        ):
+            return False
+    elif mode != "off" and not envs.TPU_MOE_SEQUENCE_PARALLEL:
+        return False
+    from vllm.model_executor.models import qwen3_5_mtp
+
+    if envs.VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER:
+        lc = _get_linear_common()
+        lc._get_quantize_rows_op()
+        lc._get_prequant_matmul_op()
+        qwen3_next.Qwen3NextAttention.forward = patched_attention_forward
     qwen3_next.Qwen3NextDecoderLayer.forward = patched_decoder_layer_forward
     qwen3_next.Qwen3NextModel.forward = patched_model_forward
+    qwen3_5_mtp.Qwen3_5MultiTokenPredictor.forward = patched_mtp_forward
     qwen3_next_mtp.Qwen3NextMultiTokenPredictor.forward = patched_mtp_forward
     logger.info(
-        "Applied TPU patch: Qwen3.5 MoE trace-stable sequence-parallel forward."
+        "Applied TPU patch: Qwen3.5 MoE trace-stable sequence-parallel forward "
+        "(fp8_gather=%s, fp8_min_tokens=%d, sp_min_tokens=%d).",
+        envs.VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER,
+        envs.VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS,
+        envs.VLLM_TPU_SP_MIN_TOKENS,
     )
     return None
