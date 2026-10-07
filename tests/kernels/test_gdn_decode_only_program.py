@@ -151,3 +151,27 @@ def test_conv_weight_pretransposed_at_load(monkeypatch):
     assert kernel_layout.shape == (4, 1, 1536)
     assert kernel_layout.dtype == torch.float32
     assert torch.equal(kernel_layout, weight.permute(2, 1, 0).to(torch.float32))
+
+
+@pytest.mark.parametrize("tokens", [8, 16, 44])
+def test_gated_norm_zsrc_matches_sliced_z(tokens):
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    from vllm_torchtpu.kernels.experimental import gated_norm_quant as gnq
+
+    with jax.default_device(jax.devices("cpu")[0]):
+        k = jax.random.split(jax.random.PRNGKey(tokens), 3)
+        heads, dim, col0, cols = 8, 128, 1536, 2560
+        o = (jax.random.normal(k[0], (tokens, heads, dim)) * 3).astype(jnp.bfloat16)
+        src = jax.random.normal(k[1], (tokens, cols)).astype(jnp.bfloat16)
+        w = (1.0 + 0.1 * jax.random.normal(k[2], (dim,))).astype(jnp.bfloat16)
+        z = src[:, col0 : col0 + heads * dim].reshape(tokens, heads, dim)
+        q_ref, s_ref = gnq.gated_norm_quant(o, z, w, 1e-6, interpret=True)
+        q, s = gnq.gated_norm_quant_zsrc(o, src, w, 1e-6, z_col0=col0, interpret=True)
+        np.testing.assert_array_equal(np.asarray(s), np.asarray(s_ref))
+        np.testing.assert_array_equal(
+            np.asarray(q, np.float32),
+            np.asarray(q_ref.reshape(tokens, -1), np.float32),
+        )

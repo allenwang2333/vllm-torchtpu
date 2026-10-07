@@ -62,6 +62,34 @@ def _build_ops(eps: float) -> None:
     linear_common._get_prequant_matmul_op()
 
 
+_zsrc_norm_ops: dict[tuple[float, int], Callable] = {}
+
+
+def _zsrc_norm_op(eps: float, z_col0: int) -> Callable:
+    """The norm reading z straight out of the qkvz projection rows."""
+    key = (eps, z_col0)
+    if key not in _zsrc_norm_ops:
+
+        def norm(
+            o: jax.Array, zsrc: jax.Array, w: jax.Array
+        ) -> tuple[jax.Array, jax.Array]:
+            return gnq.gated_norm_quant_zsrc(o, zsrc, w, eps, z_col0=z_col0)
+
+        op = pallas.jax_op(
+            f"pallas::gdn_gated_norm_quant_zsrc_{len(_zsrc_norm_ops)}", norm
+        )
+
+        def fake_norm(o, zsrc, w):
+            return (
+                o.new_empty((o.shape[0], o.shape[1] * o.shape[2]), dtype=torch.float8_e4m3fn),
+                o.new_empty((o.shape[0], 1), dtype=torch.float32),
+            )
+
+        op.register_fake(fake_norm)
+        _zsrc_norm_ops[key] = op
+    return _zsrc_norm_ops[key]
+
+
 def unsupported_reason(layer: QwenGatedDeltaNetAttention) -> str | None:
     """Why the fused path cannot serve ``layer``, or None."""
     norm, out_proj = layer.norm, layer.out_proj
@@ -123,14 +151,25 @@ def install(model: torch.nn.Module) -> int:
 
 
 def output_projection(
-    layer: QwenGatedDeltaNetAttention, core_attn_out: torch.Tensor, z: torch.Tensor
+    layer: QwenGatedDeltaNetAttention,
+    core_attn_out: torch.Tensor,
+    z: torch.Tensor,
+    zsrc: tuple[torch.Tensor, int] | None = None,
 ) -> torch.Tensor:
     """core_attn_out, z: [tokens, local v heads, head_v_dim]."""
     tokens = core_attn_out.shape[0]
     out_proj = layer.out_proj
-    q, s = _norm_ops[float(layer.norm.eps)](
-        core_attn_out, z.reshape(core_attn_out.shape), layer.norm.weight
-    )
+    if zsrc is not None:
+        # z read by the kernel from the projection rows: no XLA slice /
+        # relayout of z (TPU_GDN_NORM_Z_FROM_QKVZ).
+        src, z_col0 = zsrc
+        q, s = _zsrc_norm_op(float(layer.norm.eps), int(z_col0))(
+            core_attn_out, src, layer.norm.weight
+        )
+    else:
+        q, s = _norm_ops[float(layer.norm.eps)](
+            core_attn_out, z.reshape(core_attn_out.shape), layer.norm.weight
+        )
     output = linear_common.quantized_matmul_prequant(
         q.reshape(tokens, -1), s, out_proj.weight, out_proj.weight_scale
     )

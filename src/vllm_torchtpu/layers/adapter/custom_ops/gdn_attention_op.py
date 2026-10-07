@@ -1060,14 +1060,20 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
 
     def _apply_output_projection(
-        self, core_attn_out: torch.Tensor, z: torch.Tensor, num_tokens: int
+        self,
+        core_attn_out: torch.Tensor,
+        z: torch.Tensor,
+        num_tokens: int,
+        zsrc: tuple[torch.Tensor, int] | None = None,
     ) -> torch.Tensor:
         local_num_v_heads = self.num_v_heads // self.tp_size
         core_attn_out = core_attn_out.view(
             num_tokens, local_num_v_heads, self.head_v_dim
         )
         if self.fused_norm_quant:
-            return gated_norm_quant_op.output_projection(self, core_attn_out, z)
+            return gated_norm_quant_op.output_projection(
+                self, core_attn_out, z, zsrc=zsrc
+            )
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output, _ = self.out_proj(core_attn_out)
@@ -1132,6 +1138,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
+        zsrc = None
         if hasattr(self, "in_proj_qkv"):
             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)
@@ -1151,6 +1158,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             z_size = self.value_dim // self.tp_size
             mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
+            if envs.TPU_GDN_NORM_Z_FROM_QKVZ and self.fused_norm_quant:
+                zsrc = (mixed_qkvz, qkv_size)
+            elif envs.TPU_GDN_Z_CONTIGUOUS:
+                z = z.contiguous()
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()
             a = a.contiguous()
@@ -1311,4 +1322,4 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        return self._apply_output_projection(core_attn_out, z, num_tokens)
+        return self._apply_output_projection(core_attn_out, z, num_tokens, zsrc=zsrc)

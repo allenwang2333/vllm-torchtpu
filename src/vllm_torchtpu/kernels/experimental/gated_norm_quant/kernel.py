@@ -87,6 +87,75 @@ def gated_norm_quant(
     )(o, z, w)
 
 
+def _kernel_zsrc(o_ref, zs_ref, w_ref, q_ref, s_ref, *, eps: float, z_col0: int):
+    """As `_kernel`, with z read per head straight out of the projection rows
+    (`zs_ref[:, z_col0 + h * dim]`) and q written as [tile, heads * dim]."""
+    heads, dim = o_ref.shape[1], o_ref.shape[2]
+    w = w_ref[...].astype(jnp.float32)
+    ys = []
+    amax = None
+    for h in range(heads):
+        o = o_ref[:, h, :].astype(jnp.float32)  # [tile, dim]
+        z = zs_ref[:, z_col0 + h * dim : z_col0 + (h + 1) * dim].astype(jnp.float32)
+        var = jnp.mean(o * o, axis=-1, keepdims=True)
+        y = o * jax.lax.rsqrt(var + eps) * w[None, :]
+        y = y * (z * jax.nn.sigmoid(z))
+        y = y.astype(jnp.bfloat16).astype(jnp.float32)
+        m = jnp.max(jnp.abs(y), axis=-1, keepdims=True)
+        amax = m if amax is None else jnp.maximum(amax, m)
+        ys.append(y)
+    scale = jnp.where(amax == 0.0, 1.0, amax / FP8_MAX)
+    for h, y in enumerate(ys):
+        q_ref[:, h * dim : (h + 1) * dim] = jnp.clip(
+            y / scale, -FP8_MAX, FP8_MAX
+        ).astype(FP8)
+    s_ref[...] = scale
+
+
+def gated_norm_quant_zsrc(
+    o: jax.Array,
+    zsrc: jax.Array,
+    w: jax.Array,
+    eps: float,
+    *,
+    z_col0: int,
+    tile: int = 32,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """`gated_norm_quant` with z = zsrc[:, z_col0 : z_col0 + heads * dim].
+
+    o: [tokens, heads, dim]; zsrc: [tokens, C] (e.g. the fused qkvz
+    projection rows), read by the kernel's own DMA, so no XLA slice / relayout
+    of z is materialized. Returns q as [tokens, heads * dim] (the layout the
+    fp8 linear consumes) and the scales [tokens, 1].
+    """
+    tokens, heads, dim = o.shape
+    cols = zsrc.shape[1]
+    assert zsrc.shape[0] == tokens and z_col0 + heads * dim <= cols, (
+        o.shape, zsrc.shape, z_col0)
+    assert w.shape == (dim,) and z_col0 % 128 == 0 and dim % 128 == 0
+    tile = legal_tile(tokens, tile)
+    return pl.pallas_call(
+        functools.partial(_kernel_zsrc, eps=float(eps), z_col0=z_col0),
+        grid=(tokens // tile,),
+        in_specs=[
+            pl.BlockSpec((tile, heads, dim), lambda i: (i, 0, 0)),
+            pl.BlockSpec((tile, cols), lambda i: (i, 0)),
+            pl.BlockSpec((dim,), lambda i: (0,)),
+        ],
+        out_specs=[
+            pl.BlockSpec((tile, heads * dim), lambda i: (i, 0)),
+            pl.BlockSpec((tile, 1), lambda i: (i, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((tokens, heads * dim), FP8),
+            jax.ShapeDtypeStruct((tokens, 1), jnp.float32),
+        ],
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        interpret=interpret,
+    )(o, zsrc, w)
+
+
 def reference(
     o: jax.Array, z: jax.Array, w: jax.Array, eps: float
 ) -> tuple[jax.Array, jax.Array]:

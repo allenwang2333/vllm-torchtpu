@@ -15,7 +15,8 @@
 
 from vllm_torchtpu.kernels.experimental.gated_norm_quant.kernel import (
     gated_norm_quant,
+    gated_norm_quant_zsrc,
     reference,
 )
 
-__all__ = ["gated_norm_quant", "reference"]
+__all__ = ["gated_norm_quant", "gated_norm_quant_zsrc", "reference"]

@@ -97,6 +97,8 @@ if TYPE_CHECKING:
     TPU_GDN_DECODE_ONLY_NOALIAS: bool = False
     TPU_GDN_CONV_WEIGHT_PRETRANSPOSED: bool = False
     TPU_GDN_DECODE_TILE2_BUCKETS: list[int] = []
+    TPU_GDN_NORM_Z_FROM_QKVZ: bool = False
+    TPU_GDN_Z_CONTIGUOUS: bool = False
     TPU_FUSED_QK_NORM_ROPE: bool = False
     TPU_RPA_DECODE_BATCHED: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -734,6 +736,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GDN_CONV_WEIGHT_PRETRANSPOSED": env_bool("TPU_GDN_CONV_WEIGHT_PRETRANSPOSED"),
     # Token buckets whose GDN verify-window (BATCHED) pass uses 2 sequences
     # per tile instead of the default (e.g. "16,32").
+    # Fused GDN gated norm: read z straight out of the qkvz projection rows
+    # inside the kernel instead of an XLA slice + relayout of z.
+    "TPU_GDN_NORM_Z_FROM_QKVZ": env_bool("TPU_GDN_NORM_Z_FROM_QKVZ"),
+    # Materialize the GDN output gate z contiguously right after the split.
+    "TPU_GDN_Z_CONTIGUOUS": env_bool("TPU_GDN_Z_CONTIGUOUS"),
     "TPU_GDN_DECODE_TILE2_BUCKETS": lambda: [
         int(v)
         for v in os.getenv("TPU_GDN_DECODE_TILE2_BUCKETS", "").split(",")
