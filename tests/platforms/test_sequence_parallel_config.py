@@ -42,6 +42,15 @@ def configure_sp_moe():
         yield _configure_sequence_parallel_moe
 
 
+@pytest.fixture(autouse=True)
+def split_every_bucket(monkeypatch):
+    """Most tests split every bucket; test_small_buckets_stay_replicated
+    restores the row threshold."""
+    import vllm_torchtpu.envs as envs
+
+    monkeypatch.setattr(envs, "TPU_SP_MIN_ROWS", 1)
+
+
 @pytest.mark.parametrize(
     "tp,original,expected",
     [
@@ -179,3 +188,33 @@ def test_sequence_parallel_rejects_pipeline_parallel(configure_sp_moe):
         match="does not support pipeline parallelism",
     ):
         configure_sp_moe(vllm_config)
+
+
+def test_small_buckets_stay_replicated(configure_sp_moe, monkeypatch):
+    """Below TPU_SP_MIN_ROWS a step runs replicated, so its bucket need not
+    split over TP; only the larger buckets are filtered."""
+    import vllm_torchtpu.envs as envs
+
+    monkeypatch.setattr(envs, "TPU_SP_MIN_ROWS", 512)
+    parallel_config = SimpleNamespace(
+        use_sequence_parallel_moe=True,
+        tensor_parallel_size=8,
+        pipeline_parallel_size=1,
+    )
+    model_config = SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"])
+    compilation_config = SimpleNamespace(
+        compile_sizes=[8, 24, 48, 256, 512, 768, 1024]
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=parallel_config,
+        model_config=model_config,
+        compilation_config=compilation_config,
+        speculative_config=None,
+    )
+    configure_sp_moe(vllm_config)
+    # 768 // 8 = 96 rows per rank: a multiple of 8, kept.
+    assert compilation_config.compile_sizes == [8, 24, 48, 256, 512, 768, 1024]
+    compilation_config.compile_sizes = [8, 24, 512, 520, 1024]
+    configure_sp_moe(vllm_config)
+    # 520 // 8 = 65 rows per rank: dropped; the small buckets stay.
+    assert compilation_config.compile_sizes == [8, 24, 512, 1024]

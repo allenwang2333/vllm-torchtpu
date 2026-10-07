@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
+    TPU_EXPERT_PLACEMENT: str = ""
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
     USE_PIPELINED_DMA_STAGING: bool = False
@@ -566,9 +567,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ONEHOT_MOE_PERMUTE_THRESHOLD": env_optional_int("ONEHOT_MOE_PERMUTE_THRESHOLD"),
     # Shard tokens over TP between attention and MoE: attention reduce-scatters
     # instead of all-reducing, the router, shared expert, and experts run on
-    # T/tp tokens, and the next layer all-gathers. Qwen3.5 MoE with
-    # EP and TP > 1 only.
-    "TPU_MOE_SEQUENCE_PARALLEL": env_bool("TPU_MOE_SEQUENCE_PARALLEL", default=False),
+    # T/tp tokens, and the next layer all-gathers. Qwen3Next/Qwen3.5 MoE with
+    # EP and TP > 1 only. Gated by row count >= TPU_SP_MIN_ROWS (default 512).
+    "TPU_MOE_SEQUENCE_PARALLEL": env_bool("TPU_MOE_SEQUENCE_PARALLEL", default=True),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes
@@ -659,15 +660,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # program, instead of bracketing the per-rank compute with vLLM's
     # all-gather and reduce-scatter. The transport then overlaps the matmuls;
     # the reduce-scatter it replaces is otherwise fully exposed.
-    "USE_MOE_FUSED_EP_KERNEL": lambda: (
-        environment_variables["MOE_FUSED_EP_KERNEL_IMPL"]() is not None
-        or env_bool("USE_MOE_FUSED_EP_KERNEL")()
-    ),
-    # Explicit implementation selection also enables fused EP. When unset,
-    # preserve the legacy enable flag and v2 behavior. Adaptive owns its
-    # admission, automatically supports FP4 and never falls back to GMM.
+    "USE_MOE_FUSED_EP_KERNEL": env_bool("USE_MOE_FUSED_EP_KERNEL", default=True),
+    # Fused EP kernel implementation. Default "v3" pairs with
+    # TPU_SP_MIN_ROWS=512 so steps >= 512 run SP=1 + Fused EP v3.
     "MOE_FUSED_EP_KERNEL_IMPL": env_with_choices(
-        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive"]
+        "MOE_FUSED_EP_KERNEL_IMPL", "v3", ["v2", "adaptive", "v3"]
     ),
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
@@ -758,6 +755,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # only takes effect on the grouped-matmul MoE path (the fused EP kernel
     # already carries fp8 on its own wire).
     "TPU_MOE_FP8_ALL_GATHER": env_bool("TPU_MOE_FP8_ALL_GATHER"),
+    # A JSON table giving, per backbone MoE layer, the global experts each
+    # expert-parallel rank holds (expert_placement.py); empty keeps the
+    # checkpoint's contiguous placement.
+    "TPU_EXPERT_PLACEMENT": lambda: os.getenv(
+        "TPU_EXPERT_PLACEMENT",
+        os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "scripts",
+                "vllm",
+                "benchmark",
+                "inferencex",
+                "qwen3.5",
+                "expert_placement_dp8_ep8_opt_copies128.json",
+            )
+        ),
+    ),
     # 0 = the arithmetic device-order layout (the one every disaggregated
     # Raiden pair was verified with before #587; also the only option on a
     # torch_tpu older than 2026-08-13, which lacks the API).
@@ -985,6 +1001,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # deterministic cap from the scheduler config, 0 disables the cap (all
     # post-profile HBM goes to KV), N > 0 caps KV at N tokens.
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS": env_int("VLLM_TPU_POOLING_KV_CACHE_TOKENS", -1),
+    "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": env_int(
+        "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 64
+    ),
+    "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "512")),
+    "TPU_SP_FP8_GATHER": env_bool("TPU_SP_FP8_GATHER", default=True),
 }
 
 

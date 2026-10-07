@@ -800,6 +800,11 @@ class Eagle3Proposer:
             _force_draft_tp1() if self._draft_replicated else contextlib.nullcontext()
         )
         self.draft_vllm_config = copy.copy(self.vllm_config)
+        # The draft opts out of vLLM's sequence-parallel MoE: it runs every
+        # row replicated (see _forward_draft), whatever the row count.
+        draft_parallel_config = copy.copy(self.vllm_config.parallel_config)
+        draft_parallel_config._tpu_disable_sp_moe = True
+        self.draft_vllm_config.parallel_config = draft_parallel_config
         draft_model_config = copy.copy(self.speculative_config.draft_model_config)
         draft_model_config.runner_type = "draft"
         draft_compilation_config = copy.copy(self.vllm_config.compilation_config)
@@ -1875,6 +1880,20 @@ class Eagle3Proposer:
             last_hidden = hidden = out
         return last_hidden, hidden
 
+    @staticmethod
+    def _draft_valid_tokens(
+        chunk: DraftChunkInputs, step_idx: int, num_tokens_padded: int
+    ) -> int:
+        num_reqs = getattr(chunk, "num_reqs", 0) or 0
+        query_start_loc_np = getattr(chunk, "query_start_loc_np", None)
+        if step_idx > 0:
+            valid = int(num_reqs)
+        elif query_start_loc_np is not None and num_reqs > 0:
+            valid = int(query_start_loc_np[num_reqs])
+        else:
+            valid = 0
+        return max(0, min(valid, int(num_tokens_padded)))
+
     def _forward_draft(
         self,
         chunk: DraftChunkInputs,
@@ -1901,6 +1920,10 @@ class Eagle3Proposer:
         )
 
         num_tokens = input_ids.shape[0]
+        from vllm_torchtpu.layers.adapter import sequence_parallel
+
+        sequence_parallel.set_active(False)
+        num_valid_tokens = self._draft_valid_tokens(chunk, step_idx, num_tokens)
 
         kwargs: dict[str, torch.Tensor | int] = {
             "input_ids": input_ids,
@@ -1911,6 +1934,15 @@ class Eagle3Proposer:
             kwargs["spec_step_idx"] = step_idx
 
         model = self._draft_model_for_step(step_idx)
+        if hasattr(self.runner, "_token_padding_update"):
+            # set_active(False) above: every TP rank holds all num_tokens
+            # rows, so the mask must cover all of them, not the per-rank
+            # slice the row count would pick.
+            self.runner._token_padding_update(
+                num_tokens,
+                num_valid_tokens=num_valid_tokens,
+                rows_sliced=False,
+            )
         with (
             set_model_tag("eagle_head"),
             set_forward_context(

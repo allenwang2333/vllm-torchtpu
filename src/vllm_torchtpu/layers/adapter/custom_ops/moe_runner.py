@@ -23,6 +23,9 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
 from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+    fused_moe_ep_supported as fused_moe_ep_v3_supported,
+)
 
 # Taken once at import, outside any trace: the MoE forward is traced by
 # torch.compile, and reading the upstream property from inside the trace does
@@ -111,6 +114,7 @@ class VllmMoERunner(MoERunner):
         owner = self._quant_method
         return (
             fused_moe_ep_supported(owner)
+            or fused_moe_ep_v3_supported(owner)
             or adaptive_fused_moe_supported(owner)
             or _upstream_fused_output_is_reduced(self)
         )
@@ -124,7 +128,11 @@ class VllmMoERunner(MoERunner):
         if self.moe_config.pcp_size <= 1:
             return False
         owner = self._quant_method
-        return fused_moe_ep_supported(owner) or adaptive_fused_moe_supported(owner)
+        return (
+            fused_moe_ep_supported(owner)
+            or fused_moe_ep_v3_supported(owner)
+            or adaptive_fused_moe_supported(owner)
+        )
 
     def _maybe_dispatch(self, hidden_states, router_logits):
         if self._fused_ep_owns_pcp_collectives():

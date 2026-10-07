@@ -124,6 +124,8 @@ def test_dispatch_and_combine_with_sequence_parallel(
 ):
     ep_group = Mock(world_size=8)
     monkeypatch.setattr(comm, "get_ep_group", lambda: ep_group)
+    # A step at or above TPU_SP_MIN_ROWS: each rank holds its slice of the rows.
+    monkeypatch.setattr(comm.sequence_parallel, "_ACTIVE", True)
     tensors = [torch.tensor([[i, i + 1]]) for i in range(count)]
     ep_group.all_gather.side_effect = lambda x, dim: torch.cat([x, x + 10], dim=dim)
     ep_group.reduce_scatter.return_value = torch.tensor([[11, 12]])
@@ -143,3 +145,24 @@ def test_dispatch_and_combine_with_sequence_parallel(
             assert invocation.kwargs == {"dim": 0}
         assert ep_group.all_gather.call_count == count
         ep_group.reduce_scatter.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "method,count", [("dispatch", 3), ("dispatch_router_logits", 2), ("combine", 1)]
+)
+def test_dispatch_and_combine_replicated_below_sp_rows(
+    monkeypatch, communicator, method, count
+):
+    # Below TPU_SP_MIN_ROWS every rank holds all rows: dispatch is a no-op and
+    # combine sums the partials over the EP group.
+    ep_group = Mock(world_size=8)
+    monkeypatch.setattr(comm, "get_ep_group", lambda: ep_group)
+    monkeypatch.setattr(comm.sequence_parallel, "_ACTIVE", False)
+    tensors = [torch.tensor([[i, i + 1]]) for i in range(count)]
+    result = getattr(communicator, method)(*tensors, is_sequence_parallel=True)
+    if method == "combine":
+        ep_group.all_reduce.assert_called_once_with(tensors[0])
+        assert result is ep_group.all_reduce.return_value
+    else:
+        assert all(actual is expected for actual, expected in zip(result, tensors))
+        ep_group.all_gather.assert_not_called()

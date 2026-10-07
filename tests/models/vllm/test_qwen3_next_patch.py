@@ -15,21 +15,22 @@
 
 import hashlib
 import inspect
-from unittest.mock import patch
 
 import pytest
 import torch
 import vllm
-from vllm.model_executor.models import qwen3_5, qwen3_5_mtp, qwen3_next
+from vllm.model_executor.models import qwen3_5, qwen3_5_mtp, qwen3_next, qwen3_next_mtp
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.models.vllm import qwen3_next_patch as patch_mod
 from vllm_torchtpu.models.vllm.qwen3_next_patch import (
+    UPSTREAM_ATTN_FORWARD,
     UPSTREAM_DECODER_LAYER_FORWARD,
     UPSTREAM_MODEL_FORWARD,
-    _check_tokens_divide_by_tp,
+    UPSTREAM_MTP_FORWARD,
     maybe_patch_qwen3_next,
     patched_decoder_layer_forward,
+    patched_qwen3_next_attn_forward,
 )
 
 # The patched copies track vLLM v0.29.0 (pyproject.toml pin).
@@ -40,8 +41,8 @@ PINNED_DECODER_LAYER_HASH = (
 PINNED_MODEL_FORWARD_HASH = (
     "a9c1265f14e88e54138394b9038db621813bb6357a9077ad50d1691db0ac4398"
 )
-# tpu_platform admits MTP under SP because this upstream drafter forward
-# chunks before the MTP layer and all-gathers after the final norm.
+# The SP patch replaces this drafter forward with a row-gated copy
+# (patched_mtp_forward), so it tracks upstream like the two above.
 PINNED_QWEN3_5_MTP_FORWARD_HASH = (
     "54034d76e48fccf2cd98bcf05b831207580ad9e8886e6e387193e1bd70e9e472"
 )
@@ -73,13 +74,12 @@ def test_upstream_qwen3_next_forward_unchanged():
 
 @requires_pinned_vllm
 def test_upstream_qwen3_5_mtp_forward_unchanged():
-    """Pin the Qwen3.5 drafter forward that the SP admission gate relies on."""
-    source = inspect.getsource(qwen3_5_mtp.Qwen3_5MultiTokenPredictor.forward)
+    """Pin the Qwen3.5 drafter forward that patched_mtp_forward copies."""
+    source = inspect.getsource(UPSTREAM_MTP_FORWARD)
     actual_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
     assert actual_hash == PINNED_QWEN3_5_MTP_FORWARD_HASH, (
-        "Upstream Qwen3_5MultiTokenPredictor.forward has drifted. Re-check that "
-        "it still chunks and all-gathers under SP before admitting MTP in "
-        "tpu_platform.py."
+        "Upstream Qwen3NextMultiTokenPredictor.forward has drifted. "
+        "Re-sync patched_mtp_forward in qwen3_next_patch.py."
     )
 
 
@@ -112,7 +112,7 @@ def test_patched_decoder_layer_forward_parity():
                 return x * 1.05
             return x * 1.05, residual + x * 0.05
 
-        def linear_attn(self, hidden_states):
+        def linear_attn(self, hidden_states, prequant=None):
             return hidden_states + 1.0
 
         def post_attention_layernorm(self, x, residual):
@@ -137,9 +137,12 @@ def test_patched_decoder_layer_forward_parity():
 
 
 def test_patched_decoder_layer_forward_sequence_parallel(monkeypatch):
-    """Verify the SP branch runs all-gather, narrow, reduce-scatter, and SP MLP."""
+    """Verify the SP branch runs all-gather, reduce-scatter, and SP MLP."""
 
     tp = 2
+    # A step at or above TPU_SP_MIN_ROWS, gathering bf16 rows.
+    monkeypatch.setattr(envs, "TPU_SP_MIN_ROWS", 1)
+    monkeypatch.setattr(envs, "TPU_SP_FP8_GATHER", False)
     monkeypatch.setattr(
         patch_mod,
         "tensor_model_parallel_all_gather",
@@ -166,7 +169,7 @@ def test_patched_decoder_layer_forward_sequence_parallel(monkeypatch):
         def input_layernorm(self, x, residual=None):
             return x * 1.05 if residual is None else (x * 1.05, residual + x * 0.05)
 
-        def linear_attn(self, hidden_states):
+        def linear_attn(self, hidden_states, prequant=None):
             return hidden_states + 1.0
 
         def post_attention_layernorm(self, x, residual):
@@ -199,24 +202,11 @@ def test_patched_decoder_layer_forward_sequence_parallel(monkeypatch):
     assert mlp_kwargs == [{"already_sequence_parallel": True}]
 
 
-def test_check_tokens_divide_by_tp():
-    """Divisibility check passes when divisible, raises RuntimeError when not."""
-    patch_target = (
-        "vllm_torchtpu.models.vllm.qwen3_next_patch."
-        "get_tensor_model_parallel_world_size"
-    )
-    with patch(patch_target, return_value=8):
-        _check_tokens_divide_by_tp(16)
-        _check_tokens_divide_by_tp(8)
-        with pytest.raises(RuntimeError):
-            _check_tokens_divide_by_tp(7)
-
-
 def test_forward_patch_skipped_with_flag_off(monkeypatch):
     """When TPU_MOE_SEQUENCE_PARALLEL=0, methods remain the upstream objects."""
     monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", False)
     result = maybe_patch_qwen3_next()
-    assert result is None
+    assert result is False
     assert qwen3_next.Qwen3NextDecoderLayer.forward is UPSTREAM_DECODER_LAYER_FORWARD
     assert qwen3_next.Qwen3NextModel.forward is UPSTREAM_MODEL_FORWARD
 
@@ -230,6 +220,19 @@ def test_forward_patch_applied(monkeypatch):
         UPSTREAM_DECODER_LAYER_FORWARD,
     )
     monkeypatch.setattr(qwen3_next.Qwen3NextModel, "forward", UPSTREAM_MODEL_FORWARD)
+    # Restored after the test: the patch also replaces these.
+    monkeypatch.setattr(qwen3_next.Qwen3NextAttention, "forward", UPSTREAM_ATTN_FORWARD)
+    monkeypatch.setattr(
+        qwen3_next_mtp.Qwen3NextMultiTokenPredictor, "forward", UPSTREAM_MTP_FORWARD
+    )
+    monkeypatch.setattr(
+        qwen3_5_mtp.Qwen3_5MultiTokenPredictor,
+        "forward",
+        qwen3_5_mtp.Qwen3_5MultiTokenPredictor.forward,
+    )
+    for layer_cls in (qwen3_next.Qwen3NextDecoderLayer, qwen3_5.Qwen3_5DecoderLayer):
+        if "__init__" in vars(layer_cls):
+            monkeypatch.setattr(layer_cls, "__init__", layer_cls.__init__)
 
     result = maybe_patch_qwen3_next()
     assert result is None
@@ -237,3 +240,4 @@ def test_forward_patch_applied(monkeypatch):
         qwen3_next.Qwen3NextDecoderLayer.forward is not UPSTREAM_DECODER_LAYER_FORWARD
     )
     assert qwen3_next.Qwen3NextModel.forward is not UPSTREAM_MODEL_FORWARD
+    assert qwen3_next.Qwen3NextAttention.forward is patched_qwen3_next_attn_forward

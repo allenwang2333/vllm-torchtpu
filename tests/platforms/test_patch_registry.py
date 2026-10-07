@@ -353,7 +353,10 @@ def test_sequence_parallel_moe_admission(monkeypatch):
         del ParallelConfig._tpu_no_sp_moe_patch
     _patch_sequence_parallel_moe_admission()
     cfg = Mock(
-        enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=1
+        enable_expert_parallel=True,
+        tensor_parallel_size=8,
+        data_parallel_size=1,
+        _tpu_disable_sp_moe=False,
     )
     assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg)
 
@@ -365,24 +368,45 @@ def test_sequence_parallel_moe_admission(monkeypatch):
 
     # EP=False, TP=8, DP=1 -> False
     cfg_no_ep = Mock(
-        enable_expert_parallel=False, tensor_parallel_size=8, data_parallel_size=1
+        enable_expert_parallel=False,
+        tensor_parallel_size=8,
+        data_parallel_size=1,
+        _tpu_disable_sp_moe=False,
     )
     assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_no_ep)
 
     # EP=True, TP=1, DP=1 -> False
     cfg_tp1 = Mock(
-        enable_expert_parallel=True, tensor_parallel_size=1, data_parallel_size=1
+        enable_expert_parallel=True,
+        tensor_parallel_size=1,
+        data_parallel_size=1,
+        _tpu_disable_sp_moe=False,
     )
     assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_tp1)
 
     # EP=True, TP=8, DP=2 -> False
     cfg_dp2 = Mock(
-        enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=2
+        enable_expert_parallel=True,
+        tensor_parallel_size=8,
+        data_parallel_size=2,
+        _tpu_disable_sp_moe=False,
     )
     assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_dp2)
 
     # EP=True, TP=8, DP=1 -> True
     cfg_sp = Mock(
-        enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=1
+        enable_expert_parallel=True,
+        tensor_parallel_size=8,
+        data_parallel_size=1,
+        _tpu_disable_sp_moe=False,
     )
     assert ParallelConfig.use_sequence_parallel_moe.fget(cfg_sp)
+
+    # A draft model that opted out (eagle3._load_draft_model) -> False
+    cfg_draft = Mock(
+        enable_expert_parallel=True,
+        tensor_parallel_size=8,
+        data_parallel_size=1,
+        _tpu_disable_sp_moe=True,
+    )
+    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_draft)

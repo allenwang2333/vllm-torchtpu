@@ -679,7 +679,9 @@ def fill_metadata(
     """
 
     group_offset = group_offset_ref[0]
-    max_num_group = group_offset + cfgs.dims.size_group
+    max_num_group = jnp.minimum(
+        group_offset + cfgs.dims.size_group, cfgs.dims.size_lhs_group
+    )
     metadata_ref.gm_id_to_m_offset[0] = 0
 
     @jax.named_scope("inner_tm_loop")
@@ -1066,18 +1068,18 @@ def validate_inputs(
     """Validates the inputs for the GMM kernel."""
 
     size_m = lhs.shape[0]
-    size_group, size_k, size_n = rhs.shape
+    rhs_groups, size_k, size_n = rhs.shape
     size_k *= packing_factor
     size_lhs_group = group_sizes.shape[0]
+    size_group = min(rhs_groups, size_lhs_group)
 
-    assert size_group <= size_lhs_group
     assert lhs.shape == (size_m, size_k)
-    assert rhs.shape == (size_group, size_k // packing_factor, size_n)
+    assert rhs.shape == (rhs_groups, size_k // packing_factor, size_n)
     if rhs_bias is not None:
-        assert rhs_bias.shape == (size_group, 1, size_n)
+        assert rhs_bias.shape == (rhs_groups, 1, size_n)
     if rhs_scale is not None:
         num_quant_blocks = rhs_scale.shape[1]
-        assert rhs_scale.shape == (size_group, num_quant_blocks, 1, size_n)
+        assert rhs_scale.shape == (rhs_groups, num_quant_blocks, 1, size_n)
         assert size_k % num_quant_blocks == 0
 
     assert group_offset.shape == (1,)
