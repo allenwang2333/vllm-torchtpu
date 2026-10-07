@@ -1616,7 +1616,67 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
                 persistent=False,
             )
 
+    original_weight_loader = vpe.VocabParallelEmbedding.weight_loader
+
+    def patched_weight_loader(self, param, loaded_weight):
+        original_weight_loader(self, param, loaded_weight)
+        # TPU_REPLICATED_EMBED: keep the whole (unpadded) table on every rank as well, so the
+        # lookup needs no all-reduce. Input embeddings only: the LM head subclass stays sharded.
+        if (
+            envs.TPU_REPLICATED_EMBED
+            and type(self) is vpe.VocabParallelEmbedding
+            and self.tp_size > 1
+            and self.num_added_embeddings == 0
+            and getattr(param, "output_dim", None) == 0
+            and getattr(param, "packed_dim", None) is None
+            and loaded_weight.dim() == 2
+            and loaded_weight.shape[0] == self.org_vocab_size
+        ):
+            full = loaded_weight.to(device=param.device, dtype=param.dtype).contiguous()
+            self.register_buffer("_tpu_full_weight", full, persistent=False)
+            logger.info(
+                "TPU_REPLICATED_EMBED: replicated input embedding %s on this rank "
+                "(%.2f GB); its lookup takes no all-reduce",
+                tuple(full.shape),
+                full.numel() * full.element_size() / 1e9,
+            )
+
+    original_pwal = vpe.UnquantizedEmbeddingMethod.process_weights_after_loading
+
+    def patched_pwal(self_method, layer):
+        original_pwal(self_method, layer)
+        if (
+            envs.TPU_REPLICATED_EMBED
+            and type(layer) is vpe.VocabParallelEmbedding
+            and layer.tp_size > 1
+            and layer.num_added_embeddings == 0
+            and getattr(layer, "_tpu_full_weight", None) is None
+        ):
+            from vllm.config import get_current_vllm_config
+
+            load_format = str(get_current_vllm_config().load_config.load_format)
+            if "dummy" not in load_format:
+                raise RuntimeError(
+                    "TPU_REPLICATED_EMBED: no full embedding table was captured while "
+                    f"loading ({load_format}); refusing to serve a wrong table"
+                )
+            # Dummy weights (the workload twin): no checkpoint rows exist, so tile the
+            # shard to the full shape. Same shapes and cost; values are timing-only.
+            w = layer.weight.data
+            reps = -(-layer.org_vocab_size // w.shape[0])
+            full = w.repeat(reps, 1)[: layer.org_vocab_size].contiguous()
+            layer.register_buffer("_tpu_full_weight", full, persistent=False)
+            logger.info(
+                "TPU_REPLICATED_EMBED: dummy load, replicated table %s tiled from the shard",
+                tuple(full.shape),
+            )
+
     def patched_forward(self, input_):
+        full = getattr(self, "_tpu_full_weight", None)
+        if full is not None:
+            # Same rows the sharded lookup + all-reduce returns: every other rank
+            # contributes exact zeros, so the sum is the row itself, bit for bit.
+            return torch.nn.functional.embedding(input_.long(), full)
         if self.tp_size > 1:
             masked_input, input_mask = vpe.get_masked_input_and_mask(
                 input_,
@@ -1687,6 +1747,8 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
     vpe.get_masked_input_and_mask = patched_get_masked_input_and_mask
     vpe.VocabParallelEmbedding.__init__ = patched_init
     vpe.VocabParallelEmbedding.forward = patched_forward
+    vpe.VocabParallelEmbedding.weight_loader = patched_weight_loader
+    vpe.UnquantizedEmbeddingMethod.process_weights_after_loading = patched_pwal
     vpe.VocabParallelEmbedding._tpu_vocab_parallel_embedding_patch = True
     logger.info(
         "Applied TPU patch: register shard index bounds as buffers in "

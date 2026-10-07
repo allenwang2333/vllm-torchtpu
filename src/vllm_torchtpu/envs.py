@@ -166,6 +166,7 @@ if TYPE_CHECKING:
     TPU_SMALL_ALL_REDUCE: bool = False
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
     TPU_SMALL_ALL_REDUCE_DRAFT: bool = False
+    TPU_REPLICATED_EMBED: bool = False
 
 
 def env_with_choices(
@@ -992,6 +993,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and loop-step programs. The row choice is taken per compiled bucket inside
     # the JAX op (XLA's all-reduce above the cap), so no trace forks.
     "TPU_SMALL_ALL_REDUCE_DRAFT": env_bool("TPU_SMALL_ALL_REDUCE_DRAFT"),
+    # Keep the whole input-embedding table on every TP rank (as well as its shard) so the
+    # token lookup needs no TP all-reduce (one per backbone step, one per MTP drafter
+    # pass, which shares the table). Costs vocab x hidden x 2 B per rank (Qwen3.5-397B:
+    # 2.03 GB). The LM head stays vocab-sharded. Outputs are bit-identical.
+    "TPU_REPLICATED_EMBED": env_bool("TPU_REPLICATED_EMBED"),
 }
 
 
