@@ -112,7 +112,7 @@ error.
 | Task | What it runs |
 |---|---|
 | `perf` | `vllm bench serve` (or InferenceX's `benchmark_serving`) per ISL/OSL x concurrency cell |
-| `eval` | `lm_eval` per task, optionally once per concurrency |
+| `eval` | `lm_eval` per task, optionally once per concurrency; or InferenceX's eval client, eval-only and alone on a fresh server, gated by InferenceX's score floor |
 | `agentx` | InferenceX AgentX replay (`infx.bench agentic`) at one concurrency against a fresh server; a ladder is a sweep |
 | `custom` | any command, given the server URLs and a results directory |
 
