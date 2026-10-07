@@ -13,10 +13,19 @@
 # limitations under the License.
 
 steps:
-  - label: ":work: Wait 1 min"
-    key: "w1m"
+  - label: ":work: Wait 40s"
+    key: "w40s"
     agents:
       queue: cpu
     commands:
-      - sleep 60
+      - sleep 40
+
+  
+  - label: ":err: Err"
+    key: "err"
+    depends_on: "w40s"
+    agents:
+      queue: cpu
+    commands:
+      - exit 1
 

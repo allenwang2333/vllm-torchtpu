@@ -23,12 +23,12 @@ steps:
   #     - upload_with_priority .buildkite/test_yml/pipeline_start_1.yml "$$JOB_PRIORITY"
   #     - upload_with_priority .buildkite/test_yml/pipeline_start_2.yml "$$JOB_PRIORITY"
 
-  - label: ":work: Wait 10s"
-    key: "w10s"
+  - label: ":work: Wait 5s"
+    key: "w5s"
     agents:
       queue: cpu
     commands:
-      - sleep 10
+      - sleep 5
 
   - block: ":block: "
     key: "block"
