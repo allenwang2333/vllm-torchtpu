@@ -120,6 +120,7 @@ def _stream(
     n_experts,
     inter,
     w13_parts,
+    unroll,
 ):
     """Stream the hit experts of this shard and accumulate their outputs.
 
@@ -142,7 +143,7 @@ def _stream(
 
         return n + h
 
-    n_hit = jax.lax.fori_loop(0, n_experts, collect, jnp.int32(0))
+    n_hit = jax.lax.fori_loop(0, n_experts, collect, jnp.int32(0), unroll=unroll)
     n_units = n_hit * units
 
     def unit_copies(e_idx, part):
@@ -297,6 +298,37 @@ def _select_topk(scores, topk):
     return wt.astype(jnp.bfloat16).astype(jnp.float32)
 
 
+def _select_topk_fast(scores, topk):
+    """`_select_topk` with one cross-lane reduction per pass instead of two.
+
+    Each pass takes every element equal to the row max, so the argmin-lane
+    reduction goes. Without ties that is the same element, the same `wsum`
+    order and the same division -- bit-identical. A scoring row (max > 0)
+    where some pass took more than one element (a tie, or zero scores inside
+    the top-k) is flagged; the caller then recomputes the table with
+    `_select_topk`. Returns (table, flag [1, 1] int32).
+    """
+    x = jnp.where(scores > _NEG, scores, _NEG)
+    masked = jnp.finfo(jnp.float32).min
+    taken = jnp.zeros_like(x)
+    wsum = jnp.zeros((x.shape[0], 1), jnp.float32)
+    first = None
+    for _ in range(topk):
+        m = jnp.max(x, axis=1, keepdims=True)
+        first = m if first is None else first
+        eq = x == m
+        taken = jnp.where(eq, 1.0, taken)
+        wsum = wsum + m
+        x = jnp.where(eq, masked, x)
+    picked = jnp.where(scores > _NEG, scores, _NEG)
+    sel = jnp.where(taken > 0, picked, 0.0)
+    wt = jnp.where(wsum > 0, sel / wsum, 0.0)
+    count = jnp.sum(taken, axis=1, keepdims=True)
+    bad = jnp.where((count != topk) & (first > 0), 1, 0).astype(jnp.int32)
+    flag = jnp.max(bad, axis=0, keepdims=True)
+    return wt.astype(jnp.bfloat16).astype(jnp.float32), flag
+
+
 def _kernel(
     gid_s,
     x_ref,
@@ -315,18 +347,38 @@ def _kernel(
     inter,
     w13_parts,
     topk,
+    fast,
 ):
+    lanes = route_ref.shape[1]
+
+    def send_hits(flag=None):
+        # Lanes some row routes to; `collect` keeps the ones in this shard's
+        # gid. The fast router's tie flag rides in the lane tile after them.
+        hit = jnp.any(wtab_ref[...] != 0, axis=0, keepdims=True)
+        hits_v[:, :lanes] = jnp.where(hit, 1, 0).astype(jnp.int32)
+        if flag is not None:
+            hits_v[:, lanes:] = jnp.broadcast_to(flag, (1, hits_v.shape[1] - lanes))
+        copy = pltpu.make_async_copy(hits_v, hits_s, hsem.at[0])
+        copy.start()
+        copy.wait()
+
     if topk is None:
         wtab_ref = route_ref
-    else:
+        send_hits()
+    elif not fast:
         wtab_ref, *scratch = scratch
         wtab_ref[...] = _select_topk(route_ref[...], topk)
-    # Lanes some row routes to; `collect` keeps the ones in this shard's gid.
-    hit = jnp.any(wtab_ref[...] != 0, axis=0, keepdims=True)
-    hits_v[...] = jnp.where(hit, 1, 0).astype(jnp.int32)
-    copy = pltpu.make_async_copy(hits_v, hits_s, hsem.at[0])
-    copy.start()
-    copy.wait()
+        send_hits()
+    else:
+        wtab_ref, *scratch = scratch
+        wtab_ref[...], flag = _select_topk_fast(route_ref[...], topk)
+        send_hits(flag)
+
+        @pl.when(hits_s[0, lanes] != 0)
+        def _tie():
+            wtab_ref[...] = _select_topk(route_ref[...], topk)
+            send_hits()
+
     _stream(
         gid_s,
         hits_s,
@@ -342,6 +394,7 @@ def _kernel(
         n_experts=n_experts,
         inter=inter,
         w13_parts=w13_parts,
+        unroll=8 if fast else 1,
     )
 
 
@@ -383,8 +436,10 @@ def routing_table(topk_ids_local, topk_weights, n_experts):
     return jnp.einsum("tke,tk->te", onehot, weights)
 
 
-@functools.partial(jax.jit, static_argnames=("topk",))
-def moe_lowtok(x, route, w13, s13, w2, s2, experts_start=0, *, topk=None):
+@functools.partial(jax.jit, static_argnames=("topk", "fast_prologue"))
+def moe_lowtok(
+    x, route, w13, s13, w2, s2, experts_start=0, *, topk=None, fast_prologue=False
+):
     """This shard's MoE output for a few tokens.
 
     With `topk` None, `route` is the routing table over local experts (see
@@ -392,7 +447,9 @@ def moe_lowtok(x, route, w13, s13, w2, s2, experts_start=0, *, topk=None):
     all experts, the top-k runs in the kernel, and this shard holds
     experts [experts_start, experts_start + E); a zero score row (a padded
     token) selects nothing. Scales use [E, 1, 1, N]. Callers must first check
-    can_use_moe_lowtok.
+    can_use_moe_lowtok. `fast_prologue` (bit-identical): the top-k takes one
+    cross-lane reduction per pass, falling back to the exact two-reduction
+    passes on a tie, and the hit-collect loop is unrolled.
     """
     tokens, hidden = x.shape
     n_experts, inter, w13_parts, rows = _layout(x, w13)
@@ -406,6 +463,8 @@ def moe_lowtok(x, route, w13, s13, w2, s2, experts_start=0, *, topk=None):
     s2 = s2.reshape(n_experts, 1, hidden).astype(jnp.float32)
     gid = (experts_start + jnp.arange(n_experts, dtype=jnp.int32)).reshape(1, n_experts)
     wtab = () if topk is None else (pltpu.VMEM((rows, lanes), jnp.float32),)
+    fast_prologue = bool(fast_prologue)
+    hit_lanes = lanes + (_LANE if fast_prologue and topk is not None else 0)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     out = pl.pallas_call(
@@ -415,6 +474,7 @@ def moe_lowtok(x, route, w13, s13, w2, s2, experts_start=0, *, topk=None):
             inter=inter,
             w13_parts=w13_parts,
             topk=topk,
+            fast=fast_prologue,
         ),
         out_shape=jax.ShapeDtypeStruct((rows, hidden), x.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -423,8 +483,8 @@ def moe_lowtok(x, route, w13, s13, w2, s2, experts_start=0, *, topk=None):
             out_specs=vmem,
             scratch_shapes=(
                 pltpu.SMEM((n_experts,), jnp.int32),
-                pltpu.VMEM((1, lanes), jnp.int32),
-                pltpu.SMEM((1, lanes), jnp.int32),
+                pltpu.VMEM((1, hit_lanes), jnp.int32),
+                pltpu.SMEM((1, hit_lanes), jnp.int32),
                 pltpu.SemaphoreType.DMA((1,)),
                 *wtab,
                 *_stream_scratch(rows, hidden, inter, w13_parts),

@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_MOE_SINGLE_SORT: bool = False
     TPU_MOE_LOWTOK: bool = False
+    TPU_MOE_LOWTOK_FAST_PROLOGUE: bool = False
     USE_MOE_FUSED_TP_KERNEL: bool = False
     MOE_FUSED_TP_KERNEL_MAX_TOKENS: int = 512
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -580,6 +581,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # calls of at most MOE_LOWTOK_MAX_TOKENS rows; the FP8 method also moves
     # a plain softmax top-k router into it. Exclusive with dense expert MoE.
     "TPU_MOE_LOWTOK": env_bool("TPU_MOE_LOWTOK"),
+    # moe_lowtok prologue, bit-identical: one cross-lane reduction per in-kernel
+    # top-k pass (exact two-reduction passes on a tie) and an unrolled
+    # hit-collect loop. About 2 us less per call at 8-64 rows (j-32f78a01).
+    "TPU_MOE_LOWTOK_FAST_PROLOGUE": env_bool("TPU_MOE_LOWTOK_FAST_PROLOGUE"),
     # Serve tensor-parallel (non-EP) MoE with the fused TP kernel
     # (kernels/experimental/moe_fused_tp.py) when the token count is at most
     # MOE_FUSED_TP_KERNEL_MAX_TOKENS. Larger shapes and unsupported layouts use

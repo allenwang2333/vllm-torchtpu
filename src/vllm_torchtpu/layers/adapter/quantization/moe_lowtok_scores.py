@@ -50,7 +50,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
 
 logger = init_logger(__name__)
-_OPS: dict[int, torch.library.CustomOpDef] = {}
+_OPS: dict[tuple[int, bool], torch.library.CustomOpDef] = {}
 
 
 class _Verdict(NamedTuple):
@@ -152,7 +152,8 @@ def _graph_unsupported_reason() -> str | None:
 
 
 def _build_op(topk: int) -> torch.library.CustomOpDef:
-    op = _OPS.get(topk)
+    fast = envs.TPU_MOE_LOWTOK_FAST_PROLOGUE
+    op = _OPS.get((topk, fast))
     if op is not None:
         return op
 
@@ -168,16 +169,24 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
         experts_start: jax.Array,
     ) -> jax.Array:
         return moe_lowtok(
-            x, scores, w13, w13_scale, w2, w2_scale, experts_start, topk=topk
+            x,
+            scores,
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+            experts_start,
+            topk=topk,
+            fast_prologue=fast,
         )
 
-    op = jax_op(f"pallas::moe_lowtok_scores_k{topk}", moe)
+    op = jax_op(f"pallas::moe_lowtok_scores_k{topk}{'_fast' if fast else ''}", moe)
 
     def _fake(x, *_args):
         return torch.empty_like(x)
 
     op.register_fake(_fake)
-    _OPS[topk] = op
+    _OPS[(topk, fast)] = op
     return op
 
 
