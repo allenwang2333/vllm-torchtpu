@@ -128,3 +128,26 @@ def test_kwargs_noalias(limit, monkeypatch):
         "per_seq_empty": True,
         "per_seq_noalias": True,
     }
+
+
+def test_conv_weight_pretransposed_at_load(monkeypatch):
+    import torch
+
+    from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
+        VllmGatedDeltaNetAttention,
+    )
+
+    monkeypatch.setenv("TPU_GDN_CONV_WEIGHT_PRETRANSPOSED", "1")
+    layer = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+    torch.nn.Module.__init__(layer)
+    weight = torch.randn(1536, 1, 4, dtype=torch.bfloat16)
+    layer.conv1d = torch.nn.Module()
+    layer.conv1d.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
+    monkeypatch.setattr(
+        VllmGatedDeltaNetAttention, "_pcp_streaming_enabled", staticmethod(lambda: False)
+    )
+    layer.process_weights_after_loading(torch.bfloat16)
+    kernel_layout = layer.conv_weight_kernel_layout
+    assert kernel_layout.shape == (4, 1, 1536)
+    assert kernel_layout.dtype == torch.float32
+    assert torch.equal(kernel_layout, weight.permute(2, 1, 0).to(torch.float32))
