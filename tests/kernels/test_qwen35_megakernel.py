@@ -23,6 +23,7 @@ import torch
 
 from vllm_torchtpu.kernels.qwen35_megakernel import megakernel as K
 from vllm_torchtpu.kernels.qwen35_megakernel.vllm_adapter import (
+    MKABCalibrator,
     Qwen35Megakernel,
     pack_att_in_layer,
     pack_att_out_layer,
@@ -32,6 +33,7 @@ from vllm_torchtpu.kernels.qwen35_megakernel.vllm_adapter import (
     pack_router_and_shared_layer,
     pack_smalls_layer,
     pack_weights,
+    parse_mk_ab_enabled,
     parse_mk_buckets,
     parse_mk_verify_buckets,
     prepare_step_metadata,
@@ -304,6 +306,8 @@ def test_buckets_parsing():
     assert select_bucket(28, (16, 32, 48, 64)) == 32
     assert select_bucket(44, (16, 32, 48, 64)) == 48
     assert select_bucket(60, (16, 32, 48, 64)) == 64
+    assert parse_mk_ab_enabled("1") is True
+    assert parse_mk_ab_enabled("0") is False
 
 
 def test_pack_weights_ecopy_placement(monkeypatch):
@@ -343,3 +347,42 @@ def test_pack_weights_ecopy_placement(monkeypatch):
     assert len(ec0) == 512
     assert sum(1 for x in ec0 if x > 0) == 64
 
+
+def test_mk_ab_calibrator():
+    cal = MKABCalibrator(enabled=True, period_s=10.0, cap=4)
+    # Deterministic per-key alternation: even -> MK, odd -> stock
+    assert cal.choose("mk_t4_b16", True) == (True, "mk_t4_b16", "mk")
+    assert cal.last_decision == ("mk_t4_b16", "mk")
+    cal.record(10.0, padded_tokens=16, now=cal._t0 + 1.0)
+
+    assert cal.choose("mk_t4_b16", True) == (False, "ab_stock_t4_b16", "stock")
+    assert cal.last_decision == ("mk_t4_b16", "stock")
+    cal.record(14.0, padded_tokens=16, now=cal._t0 + 2.0)
+
+    # Independent counter per key
+    assert cal.choose("mk_t4_b8", True) == (True, "mk_t4_b8", "mk")
+    cal.record(8.0, padded_tokens=16, now=cal._t0 + 3.0)
+
+    # Non-eligible step always takes stock
+    assert cal.choose("stock_t4_n13", False) == (False, "stock_t4_n13", "stock")
+    cal.record(19.5, padded_tokens=64, now=cal._t0 + 4.0)
+
+    # Trigger period flush
+    assert cal.choose("mk_t4_b16", True) == (True, "mk_t4_b16", "mk")
+    res = cal.record(12.0, padded_tokens=16, now=cal._t0 + 11.0)
+    assert res is not None
+    elapsed, win_json, cum_json = res
+    assert elapsed >= 10.0
+    cum = cal.summary_dict(window=False)
+    assert cum["mk_t4_b16"]["mk"] == [2, 11.0, 10.2, 11.0, 11.8]
+    assert cum["mk_t4_b16"]["stock"] == [1, 14.0, 14.0, 14.0, 14.0]
+    assert cum["mk_t4_b16"]["stock_p16"] == [1, 14.0, 14.0, 14.0, 14.0]
+    assert cum["stock_t4_n13"]["stock"] == [1, 19.5, 19.5, 19.5, 19.5]
+    assert cum["stock_t4_n13"]["stock_p64"] == [1, 19.5, 19.5, 19.5, 19.5]
+    # Window was cleared on flush, cumulative preserved
+    assert cal.summary_dict(window=True) == {}
+
+    # Reset clears everything
+    cal.reset()
+    assert cal.counts == {}
+    assert cal.summary_dict(window=False) == {}

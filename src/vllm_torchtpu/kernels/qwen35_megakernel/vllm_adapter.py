@@ -30,6 +30,7 @@ Pallas megakernel (`megakernel.py` + `pool_io.py`):
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import time
 from collections.abc import Sequence
@@ -163,6 +164,172 @@ def select_bucket(num_tokens: int, buckets: Sequence[int] = _DEFAULT_BUCKETS) ->
         if b >= num_tokens:
             return b
     raise ValueError(f"num_tokens={num_tokens} exceeds max bucket in {buckets}")
+
+
+def parse_mk_ab_enabled(env_val: str | None = None) -> bool:
+    """Return True if per-bucket MK vs stock A/B latency calibration is enabled."""
+    raw = (
+        env_val
+        if env_val is not None
+        else os.environ.get("VLLM_TPU_QWEN35_MK_AB")
+    )
+    if raw is not None:
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return os.path.exists(
+        os.path.join(os.path.dirname(__file__), ".mk_ab_enabled")
+    )
+
+
+def _percentile(sorted_vals: list[float], q: float) -> float:
+    if not sorted_vals:
+        return 0.0
+    n = len(sorted_vals)
+    if n == 1:
+        return sorted_vals[0]
+    pos = q * (n - 1)
+    lo = int(pos)
+    hi = min(lo + 1, n - 1)
+    frac = pos - lo
+    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+
+
+class _LatencySeries:
+    """Bounded-memory sample accumulator keeping exact count/mean and up to `cap` samples for quantiles."""
+
+    __slots__ = ("cap", "count", "sum_ms", "samples")
+
+    def __init__(self, cap: int = 4000) -> None:
+        self.cap = int(cap)
+        self.count = 0
+        self.sum_ms = 0.0
+        self.samples: list[float] = []
+
+    def add(self, dt_ms: float) -> None:
+        v = float(dt_ms)
+        idx = self.count
+        self.count = idx + 1
+        self.sum_ms += v
+        if len(self.samples) < self.cap:
+            self.samples.append(v)
+        else:
+            self.samples[idx % self.cap] = v
+
+    def summary(self) -> list[int | float]:
+        if self.count == 0:
+            return [0, 0.0, 0.0, 0.0, 0.0]
+        s = sorted(self.samples)
+        mean_ms = self.sum_ms / self.count
+        return [
+            self.count,
+            round(mean_ms, 3),
+            round(_percentile(s, 0.10), 3),
+            round(_percentile(s, 0.50), 3),
+            round(_percentile(s, 0.90), 3),
+        ]
+
+
+class MKABCalibrator:
+    """Deterministic per-key MK vs stock alternation and latency accumulator."""
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        period_s: float = 60.0,
+        cap: int = 4000,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.period_s = float(period_s)
+        self.cap = int(cap)
+        self.counts: dict[str, int] = {}
+        self.last_decision: tuple[str, str] = ("stock_early", "stock")
+        self._window: dict[str, dict[str, _LatencySeries]] = {}
+        self._cumulative: dict[str, dict[str, _LatencySeries]] = {}
+        self._t0 = time.monotonic()
+
+    def reset(self) -> None:
+        """Clear alternation counters and latency samples (e.g. after warmup)."""
+        self.counts.clear()
+        self.last_decision = ("stock_early", "stock")
+        self._window.clear()
+        self._cumulative.clear()
+        self._t0 = time.monotonic()
+
+    def choose(self, key: str, eligible: bool) -> tuple[bool, str, str]:
+        """Return `(actual_run_mk, mix_key, path)` and record `(key, path)` in `last_decision`.
+
+        For MK-eligible steps (`eligible=True`, e.g. `key="mk_t4_b16"`), alternates
+        deterministically per `key`: even counter -> `(True, "mk_t4_b16", "mk")`,
+        odd counter -> `(False, "ab_stock_t4_b16", "stock")`.
+        """
+        if not eligible:
+            self.last_decision = (key, "stock")
+            return False, key, "stock"
+        if not self.enabled:
+            self.last_decision = (key, "mk")
+            return True, key, "mk"
+        cnt = self.counts.get(key, 0)
+        self.counts[key] = cnt + 1
+        if (cnt & 1) == 0:
+            self.last_decision = (key, "mk")
+            return True, key, "mk"
+        suffix = key[3:] if key.startswith("mk_") else key
+        mix_key = f"ab_stock_{suffix}"
+        self.last_decision = (key, "stock")
+        return False, mix_key, "stock"
+
+    def _add_to(
+        self,
+        table: dict[str, dict[str, _LatencySeries]],
+        key: str,
+        subkey: str,
+        dt_ms: float,
+    ) -> None:
+        bucket_map = table.get(key)
+        if bucket_map is None:
+            bucket_map = {}
+            table[key] = bucket_map
+        series = bucket_map.get(subkey)
+        if series is None:
+            series = _LatencySeries(self.cap)
+            bucket_map[subkey] = series
+        series.add(dt_ms)
+
+    def record(
+        self,
+        dt_ms: float,
+        padded_tokens: int | None = None,
+        now: float | None = None,
+    ) -> tuple[float, str, str] | None:
+        """Record `dt_ms` for `last_decision`; return `(elapsed_s, window_json, cumulative_json)` when period elapses."""
+        if not self.enabled:
+            return None
+        key, path = self.last_decision
+        for tbl in (self._window, self._cumulative):
+            self._add_to(tbl, key, path, dt_ms)
+            if path == "stock" and padded_tokens is not None:
+                self._add_to(tbl, key, f"stock_p{int(padded_tokens)}", dt_ms)
+        ts = time.monotonic() if now is None else float(now)
+        elapsed = ts - self._t0
+        if elapsed >= self.period_s:
+            win_json = self.format_json(window=True)
+            cum_json = self.format_json(window=False)
+            self._window.clear()
+            self._t0 = ts
+            return elapsed, win_json, cum_json
+        return None
+
+    def summary_dict(
+        self, window: bool = False
+    ) -> dict[str, dict[str, list[int | float]]]:
+        src = self._window if window else self._cumulative
+        out: dict[str, dict[str, list[int | float]]] = {}
+        for k in sorted(src.keys()):
+            sub = src[k]
+            out[k] = {sk: sub[sk].summary() for sk in sorted(sub.keys())}
+        return out
+
+    def format_json(self, window: bool = False) -> str:
+        return json.dumps(self.summary_dict(window=window), sort_keys=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1430,14 +1597,20 @@ class Qwen35Megakernel:
         self._step_mix_period_s = float(
             os.environ.get("VLLM_TPU_QWEN35_MK_STATS_PERIOD_S", "60")
         )
+        self.ab_enabled = parse_mk_ab_enabled()
+        self.ab_calibrator = MKABCalibrator(
+            enabled=self.ab_enabled,
+            period_s=self._step_mix_period_s,
+        )
 
         logger.info(
             "Qwen3.5 megakernel initialized: mode=%s, e_slots=%d, decode_buckets=%s, "
-            "verify_buckets=%s, %d weight tensors (tp_rank=%d/%d)",
+            "verify_buckets=%s, ab_enabled=%s, %d weight tensors (tp_rank=%d/%d)",
             self.mode,
             self.base_cfg.EW,
             self.buckets,
             self.verify_buckets,
+            self.ab_enabled,
             len(self.w_flat),
             self.tp_rank,
             self.tp_size,
@@ -1757,8 +1930,15 @@ class Qwen35Megakernel:
 
         return torch.compile(step, backend="tpu", fullgraph=True, dynamic=False)
 
+    def reset_stats(self) -> None:
+        """Reset step-mix counters and A/B latency accumulators (e.g. after warmup)."""
+        self._step_mix.clear()
+        self._step_mix_t0 = time.monotonic()
+        self.ab_calibrator.reset()
+
     def promote_fast_callables(self) -> int:
         """Replace `_qx_fastcall` wrappers in `_bucket_steps` with direct AOT callables when `QX_AOT_SKIP_GUARD_CHECK=1`."""
+        self.reset_stats()
         if os.environ.get("QX_AOT_SKIP_GUARD_CHECK", "1") != "1":
             return 0
         promoted = 0
@@ -2077,6 +2257,7 @@ class Qwen35Megakernel:
         """Return True iff the current forward step is a pure decode or MTP-verify step within compiled buckets."""
         _ = (positions, num_tokens)
         self._prepared_step = None
+        self.ab_calibrator.last_decision = ("stock_early", "stock")
         if not self._bound:
             return False
         if (
@@ -2159,7 +2340,8 @@ class Qwen35Megakernel:
 
     def _note_step(self, key: str, run: bool) -> bool:
         """Count a forward-step decision; log the MK/stock mix periodically."""
-        self._step_mix[key] = self._step_mix.get(key, 0) + 1
+        actual_run, mix_key, _ = self.ab_calibrator.choose(key, run)
+        self._step_mix[mix_key] = self._step_mix.get(mix_key, 0) + 1
         now = time.monotonic()
         if now - self._step_mix_t0 >= self._step_mix_period_s:
             if self.tp_rank == 0:
@@ -2175,7 +2357,24 @@ class Qwen35Megakernel:
                 )
             self._step_mix = {}
             self._step_mix_t0 = now
-        return run
+        return actual_run
+
+    def record_ab_step(
+        self, dt_ms: float, padded_tokens: int | None = None
+    ) -> None:
+        """Record a timed `forward_model` step and periodically log window + cumulative A/B latency JSON on rank 0."""
+        res = self.ab_calibrator.record(dt_ms, padded_tokens=padded_tokens)
+        if res is not None and self.tp_rank == 0:
+            elapsed, win_json, cum_json = res
+            logger.info(
+                "Qwen3.5 megakernel AB latency (window %.0fs): %s",
+                elapsed,
+                win_json,
+            )
+            logger.info(
+                "Qwen3.5 megakernel AB latency (cumulative): %s",
+                cum_json,
+            )
 
     @torch.no_grad()
     def __call__(
