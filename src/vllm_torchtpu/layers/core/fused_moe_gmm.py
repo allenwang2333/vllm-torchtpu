@@ -285,6 +285,33 @@ def _single_sort_permutation(
     return sorted_indices, revert, sorted_indices // topk
 
 
+def _pairwise_sort_positions(
+    sort_keys: jax.Array, token_indices: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+    """Stable sort of a short key vector without a comparison sort.
+
+    Returns `(pos, token_indices_sorted)`: `pos[i]` is row i's position in the
+    stable ascending order of `sort_keys` -- exactly
+    `jnp.argsort(jnp.argsort(sort_keys))` -- and `token_indices_sorted` is
+    `token_indices` permuted into that order. A row's position is the number
+    of rows that sort before it, read off an M x M integer comparison, and the
+    permuted tokens come from the matching M x M position one-hot. For the
+    one-hot permute path (M at most `_ONEHOT_AUTO_CAP`) that VPU work replaces
+    the two argsorts and the packed sort, each a serial op on the decode path.
+    """
+    m = sort_keys.shape[0]
+    row = jnp.arange(m, dtype=jnp.int32)
+    key_i = sort_keys[:, None]
+    key_j = sort_keys[None, :]
+    before = (key_j < key_i) | ((key_j == key_i) & (row[None, :] < row[:, None]))
+    pos = before.sum(axis=1, dtype=jnp.int32)
+    at_pos = pos[:, None] == row[None, :]
+    token_indices_sorted = jnp.where(at_pos, token_indices[:, None], 0).sum(
+        axis=0, dtype=jnp.int32
+    )
+    return pos, token_indices_sorted
+
+
 def prepare_routed_gmm_inputs(
     hidden_states_local: jax.Array,
     topk_indices_local: jax.Array,
@@ -327,28 +354,46 @@ def prepare_routed_gmm_inputs(
         and use_sparse_core
         and token_indices_flat.shape[0] > onehot_moe_permute_threshold
     )
-    argsort_revert_indices, bucket_counts = (
-        _counting_sort_positions(sort_keys, local_num_experts + 1)
-        if ragged_permute
-        else (None, None)
+    # The one-hot permute path is the small-M decode path. There a pairwise
+    # rank gives the same stable order and permuted tokens as the comparison
+    # sorts below, without any of them.
+    pairwise_sort = (
+        use_ep
+        and use_sparse_core
+        and not ragged_permute
+        and token_indices_flat.shape[0] <= _ONEHOT_AUTO_CAP
     )
+    token_indices_sorted: jax.Array | None = None
+    bucket_counts = None
+    if pairwise_sort:
+        argsort_revert_indices, token_indices_sorted = _pairwise_sort_positions(
+            sort_keys, token_indices_flat
+        )
+    elif ragged_permute:
+        argsort_revert_indices, bucket_counts = _counting_sort_positions(
+            sort_keys, local_num_experts + 1
+        )
+    else:
+        argsort_revert_indices = None
     token_bits = max(1, (num_tokens_local - 1).bit_length())
     packable = (local_num_experts + 1).bit_length() + token_bits < 31
     flat_bits = max(1, (token_indices_flat.shape[0] - 1).bit_length())
     single_sort = (
         _SINGLE_SORT
         and not ragged_permute
+        and not pairwise_sort
         and token_indices_flat.shape[0] <= _SINGLE_SORT_MAX_ROWS
         and (local_num_experts + 1).bit_length() + flat_bits < 31
     )
     sorted_indices = (
         jnp.argsort(sort_keys)
-        if not single_sort and (argsort_revert_indices is None or not packable)
+        if not single_sort
+        and token_indices_sorted is None
+        and (argsort_revert_indices is None or not packable)
         else None
     )
-    token_indices_sorted: jax.Array | None = None
 
-    if argsort_revert_indices is not None:
+    if bucket_counts is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
     else:
         if single_sort:
@@ -356,7 +401,7 @@ def prepare_routed_gmm_inputs(
             sorted_indices, argsort_revert_indices, token_indices_sorted = (
                 _single_sort_permutation(sort_keys, topk, flat_bits)
             )
-        else:
+        elif argsort_revert_indices is None:
             argsort_revert_indices = jnp.argsort(sorted_indices)
         topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
         group_sizes_local = jax.nn.one_hot(
@@ -682,7 +727,15 @@ def fused_moe_func(
     ):
         logger.info_once("Selected experimental dense-expert decode MoE")
         return dense_expert_moe(
-            hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
         )
 
     (

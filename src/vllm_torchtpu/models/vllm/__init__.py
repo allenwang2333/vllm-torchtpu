@@ -22,6 +22,9 @@ _DSV4_DSPARK_MODEL = (
 )
 _QWEN35_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MTP"
 _QWEN35_MOE_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MoeMTP"
+_DSV41_DSPARK_MODEL = (
+    "vllm_torchtpu.models.vllm.deepseek_v41.v2.dspark:DSparkDeepseekV41ForCausalLM"
+)
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -47,4 +50,5 @@ def register_models() -> None:
     # The Qwen3.5 MTP drafts, so a pipeline-parallel producer can load them.
     ModelRegistry.register_model("Qwen3_5MTP", _QWEN35_MTP_MODEL)
     ModelRegistry.register_model("Qwen3_5MoeMTP", _QWEN35_MOE_MTP_MODEL)
+    ModelRegistry.register_model("DSparkV41DraftModel", _DSV41_DSPARK_MODEL)
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config

@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_IMPL: str = "v1"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_SP: bool = False
+    TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
@@ -19,6 +20,8 @@ if TYPE_CHECKING:
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_RS_OUT_PRECISION: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = False
+    TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
+    TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -398,6 +401,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", default=False
     ),
+    # Under V4.1 SP token-parallel FP8 attention, project q only for this
+    # rank's token shard with an all-gathered wq_b and run wo_a for every
+    # o_group on that shard, shrinking both attention all_to_alls.
+    # Costs replicated wq_b/wo_a HBM per rank.
+    "TPU_DEEPSEEK_V41_LOCAL_Q": env_bool("TPU_DEEPSEEK_V41_LOCAL_Q", default=False),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many
@@ -428,6 +436,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
     # copies through the LSE merge. Bit-identical outputs.
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
+    # Keep the staged block tables on device between steps and upload only
+    # the entries that changed (`layers/core/block_table_delta.py`). Off
+    # restores one full block-table H2D per metadata walk.
+    "TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD": env_bool(
+        "TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", default=True
+    ),
+    # Debug: on every incremental step, rebuild the full packed table on the
+    # host and check it against the device-resident copy (raises on mismatch).
+    "TPU_VERIFY_INCREMENTAL_BLOCK_TABLE": env_bool(
+        "TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", default=False
+    ),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
