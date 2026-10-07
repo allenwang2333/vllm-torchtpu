@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 from dataclasses import dataclass
 
 import torch
@@ -96,6 +97,18 @@ def padding_mask_for(
         gathered_padding = dp_group.all_gather(local_padding.to(torch.int8), dim=0)
         return gathered_padding.ne(0)
     return _padding_state.get_local_padding_mask(num_tokens)
+
+
+@contextlib.contextmanager
+def use_padding_state(state: "TokenPaddingState | None"):
+    """Temporarily bind `_padding_state` for a separately compiled loop graph."""
+    global _padding_state
+    prev = _padding_state
+    _padding_state = state
+    try:
+        yield
+    finally:
+        _padding_state = prev
 
 
 def zero_routing_weights_for_padding(

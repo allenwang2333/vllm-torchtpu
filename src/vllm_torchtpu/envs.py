@@ -159,8 +159,9 @@ if TYPE_CHECKING:
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
-    VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    VLLM_TPU_FUSED_DRAFT_LOOP: bool = True
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
+    TPU_MTP_STEP0_POST_ATTN_GATHER: bool = True
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
@@ -992,14 +993,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
-    # Run an MTP draft's loop steps 1..K-1 as one compiled program
-    # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
-    # TODO: support the two cases that still take the per-step loop:
+    # Run an MTP draft's step-0 token proposal and loop steps 1..K-1 as one
+    # compiled program (spec_decode/mtp_fused_loop.py); off, one program per
+    # step. TODO: support the two cases that still take the per-step loop:
     #   - GLM-5.2 / Gemma-4 MTP: IndexShare's per-chunk top-k restore, and a
     #     KV-sharing draft's fixed positions and seq_lens.
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
-    "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP", default=True),
+    # Gather last-token rows immediately after self_attn.attn(q, k, v) on MTP
+    # draft step 0 so gate, o_proj, post-attention norm, MoE, and final RMSNorm
+    # execute on p = pad(num_reqs) rows instead of all T verify rows.
+    "TPU_MTP_STEP0_POST_ATTN_GATHER": env_bool(
+        "TPU_MTP_STEP0_POST_ATTN_GATHER", default=True
+    ),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).
     # 0 searches the full vocab. Used only when every active request has

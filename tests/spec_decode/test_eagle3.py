@@ -2487,3 +2487,77 @@ def test_static_shape_args_passes_non_tensors_through():
 
     t, step_idx, flag = region(torch.zeros(2), 3, flag=None)
     assert step_idx == 3 and flag is None and t.shape == (2,)
+
+
+@pytest.mark.parametrize("advance_pos", [True, False])
+def test_draft_post_step0_fused_matches_unfused_carries_and_step1_inputs(advance_pos):
+    """_draft_post_step0_fused must produce identical hidden_carry, pos_step1,
+    and seq_lens_step1 to the unfused sequence, and _MtpFusedLoop must propose
+    tok0 from hidden_carry."""
+    from vllm_torchtpu.spec_decode.mtp_fused_loop import _MtpFusedLoop
+
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer._draft_kv_shared = not advance_pos
+    proposer.draft_model = SimpleNamespace(
+        draft_id_to_target_id=None,
+        compute_logits=lambda h: h,
+    )
+
+    hidden = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    positions = torch.tensor([10, 11, 12, 20, 21, 0, 0, 0], dtype=torch.int32)
+    idx = torch.tensor([2, 4, 0, 0], dtype=torch.int64)
+    base_seq_lens = torch.tensor([13, 22, 0, 0], dtype=torch.int32)
+    rejected = torch.tensor([1, 0, 0, 0], dtype=torch.int32)
+
+    h_ref, p_ref, lh_ref = (
+        Eagle3Proposer._draft_gather_carries.__wrapped__.__wrapped__(
+            proposer, hidden, positions, hidden, idx
+        )
+    )
+    tok0_ref = Eagle3Proposer._draft_propose_token.__wrapped__.__wrapped__(
+        proposer, lh_ref
+    )
+    # The unfused loop advances positions and seq_lens on the host-built step-1
+    # metadata: pos + 1 and base + 1 - rejected (no advance under KV sharing).
+    delta = 1 if advance_pos else 0
+    pos1_ref = p_ref + delta
+    seq1_ref = base_seq_lens + delta - rejected
+
+    h_f, pos1_f, seq1_f = (
+        Eagle3Proposer._draft_post_step0_fused.__wrapped__.__wrapped__(
+            proposer,
+            hidden,
+            positions,
+            idx,
+            base_seq_lens,
+            rejected,
+        )
+    )
+    assert torch.equal(h_f, h_ref)
+    assert torch.equal(pos1_f, pos1_ref)
+    assert torch.equal(seq1_f, seq1_ref)
+
+    class _DummyMtp(torch.nn.Module):
+        def forward(
+            self,
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors=None,
+            inputs_embeds=None,
+            spec_step_idx=0,
+        ):
+            return hidden_states + 1.0
+
+        def compute_logits(self, h):
+            return h
+
+    loop_mod = _MtpFusedLoop(
+        vllm_config=SimpleNamespace(),
+        prefix="mtp_fused_loop_k3",
+        mtp=_DummyMtp(),
+        num_steps=2,
+    )
+    stacked = loop_mod(pos1_f.clone(), h_f.clone(), seq1_f.clone())
+    assert stacked.shape == (4, 3)
+    assert torch.equal(stacked[:, 0], tok0_ref)

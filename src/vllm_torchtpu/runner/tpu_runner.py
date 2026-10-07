@@ -6494,14 +6494,31 @@ class TPUModelRunner(GPUModelRunner):
                         # concrete-shaped tensors (this attempt logs loudly if it
                         # also fails).
                         self._warmup_one_spec_request(int(P), idx=i, greedy=greedy)
-            # (2) The propose+verify+sampling fusions are also keyed on the
-            # decode batch size (num_reqs). Only relevant when serving actually
-            # batches (>1 concurrent request); sweep real multi-request batches
-            # so nr>1 serving steps are cached too -- both greedy and non-greedy.
+            # (2) The propose+verify+sampling fusions AND the fused MTP loop
+            # program (_mtp_fused_loop) are keyed on both the decode token
+            # bucket T = pad(R * (1 + K)) and the draft loop carry bucket
+            # p = _loop_bucket(R). Sweep every reachable R across
+            # num_reqs_paddings, exact decode bucket divisors T // (1+K), and
+            # intermediate loop token buckets <= max_num_reqs.
             if self.scheduler_config.max_num_seqs > 1:
                 P_small = int(self.num_tokens_paddings[0])
-                for R in self.num_reqs_paddings:
-                    if int(R) > 1:
+                K_spec = self.speculative_config.num_speculative_tokens
+                warmup_R_sizes = sorted(
+                    set(self.num_reqs_paddings)
+                    | {
+                        int(t) // (1 + K_spec)
+                        for t in self.num_tokens_paddings
+                        if 1 < int(t) // (1 + K_spec) <= self.max_num_reqs
+                        and (int(t) // (1 + K_spec)) * (1 + K_spec) == int(t)
+                    }
+                    | {
+                        int(t)
+                        for t in self.num_tokens_paddings
+                        if 1 < int(t) <= self.max_num_reqs
+                    }
+                )
+                for R in warmup_R_sizes:
+                    if int(R) > 1 and int(R) * (1 + K_spec) <= self.max_num_tokens:
                         self._warmup_spec_batch(int(R), P_small, greedy=True)
                         self._warmup_spec_batch(int(R), P_small, greedy=False)
         logger.info("spec-decode warmup compiled %d graphs", self.num_xla_graphs - n0)

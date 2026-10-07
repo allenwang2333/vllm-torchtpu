@@ -17,8 +17,13 @@ With `TPU_MOE_SEQUENCE_PARALLEL=1`, steps of at least `TPU_SP_MIN_ROWS` rows
 shard the tokens over TP between attention and MoE: attention reduce-scatters
 instead of all-reducing, the router, shared expert and experts run on T/tp
 rows, and the next layer all-gathers (as fp8 rows under `TPU_SP_FP8_GATHER`).
+
+MTP draft step 0 can gather the last-token rows right after attention
+(`TPU_MTP_STEP0_POST_ATTN_GATHER`), so the gate, o_proj, post-attention norm,
+MoE and final norm run on one row per request instead of every verify row.
 """
 
+import contextlib
 import functools
 from itertools import islice
 from typing import Any
@@ -45,6 +50,36 @@ UPSTREAM_MODEL_FORWARD = qwen3_next.Qwen3NextModel.forward
 UPSTREAM_MTP_FORWARD = qwen3_next_mtp.Qwen3NextMultiTokenPredictor.forward
 UPSTREAM_ATTN_FORWARD = qwen3_next.Qwen3NextAttention.forward
 
+_step0_gather_indices: torch.Tensor | None = None
+
+
+@contextlib.contextmanager
+def step0_post_attn_gather_context(indices: torch.Tensor | None):
+    """Gather last-token rows immediately after self_attn.attn(q, k, v) on MTP step 0."""
+    global _step0_gather_indices
+    prev = _step0_gather_indices
+    _step0_gather_indices = indices
+    try:
+        yield
+    finally:
+        _step0_gather_indices = prev
+
+
+def is_step0_post_attn_gather_installed(draft_model: Any) -> bool:
+    """Return True if `draft_model` executes the step-0 post-attn gather path."""
+    if draft_model is None:
+        return False
+    inner = getattr(draft_model, "model", draft_model)
+    if getattr(inner, "_supports_step0_post_attn_gather", False) or getattr(
+        draft_model, "_supports_step0_post_attn_gather", False
+    ):
+        return True
+    return (
+        qwen3_next.Qwen3NextAttention.forward is patched_qwen3_next_attn_forward
+        and qwen3_next.Qwen3NextDecoderLayer.forward is patched_decoder_layer_forward
+        and getattr(type(inner), "forward", None) is patched_mtp_forward
+    )
+
 
 def _forward_qwen3_next_attn_from_qkv(
     attn_layer: Any,
@@ -53,6 +88,11 @@ def _forward_qwen3_next_attn_from_qkv(
 ) -> torch.Tensor:
     q, k, v, gate = attn_layer._project_qkv_gate(qkv, positions)
     attn_output = attn_layer.attn(q, k, v)
+    gather_idx = _step0_gather_indices
+    if gather_idx is not None:
+        attn_output = torch.index_select(attn_output, 0, gather_idx)
+        if gate is not None:
+            gate = torch.index_select(gate, 0, gather_idx)
     if gate is not None:
         attn_output = attn_output * torch.sigmoid(gate)
     output, _ = attn_layer.o_proj(attn_output)
@@ -145,6 +185,10 @@ def patched_decoder_layer_forward(
             positions=positions,
             prequant=prequant,
         )
+        gather_idx = _step0_gather_indices
+        if gather_idx is not None:
+            residual = torch.index_select(residual, 0, gather_idx)
+            sp = False
     else:
         raise ValueError("Invalid layer_type")
 
@@ -302,6 +346,7 @@ def patched_mtp_forward(
 
     sp = (
         mtp_layer.use_attn_reduce_scatter_for_moe
+        and _step0_gather_indices is None
         and positions.shape[-1] >= _sp.min_rows()
     )
 

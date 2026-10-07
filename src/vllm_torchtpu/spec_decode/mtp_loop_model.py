@@ -71,3 +71,22 @@ class MtpLoopStepModel(nn.Module):
             inputs_embeds,
             spec_step_idx,
         )
+
+
+def build_mtp_loop_step_model(
+    *,
+    vllm_config: VllmConfig,
+    prefix: str,
+    mtp: nn.Module,
+    dynamic_arg_dims: dict,
+) -> nn.Module:
+    """Compile a separate loop-step program with the draft's own dynamic dims
+    (e.g. Qwen3.5 marks `positions` dim -1 for MRoPE, DeepSeek marks dim 0)."""
+    cls = support_torch_compile(dynamic_arg_dims=dict(dynamic_arg_dims))(
+        type("MtpLoopStepModel", (MtpLoopStepModel,), {})
+    )
+    return cls(
+        vllm_config=vllm_config,
+        prefix=prefix,
+        mtp=mtp,
+    )
