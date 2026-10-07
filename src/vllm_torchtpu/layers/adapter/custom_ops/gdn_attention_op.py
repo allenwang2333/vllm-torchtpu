@@ -46,7 +46,6 @@ from vllm_torchtpu.distributed.pcp import (
     get_pcp_rank,
     get_pcp_world_size,
 )
-from vllm_torchtpu import envs
 from vllm_torchtpu.gdn_pool_layout import (
     DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
     unified_kv_layout_enabled_for_architecture,
