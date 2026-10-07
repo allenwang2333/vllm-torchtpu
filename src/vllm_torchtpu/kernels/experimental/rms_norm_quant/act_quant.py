@@ -35,6 +35,7 @@ from vllm_torchtpu.kernels.experimental.rms_norm_quant.kernel import (
     FP8_MAX,
     VMEM_OUT_MAX_ROWS,
     _tile,
+    lane_dense,
 )
 
 
@@ -63,7 +64,7 @@ def _kernel(*refs, kind, round_mid):
     sc = amax / FP8_MAX
     sc = jnp.where(sc == 0.0, 1.0, sc)
     q_ref[...] = jnp.clip(y.astype(jnp.float32) / sc, -FP8_MAX, FP8_MAX).astype(FP8)
-    s_ref[...] = sc
+    s_ref[...] = sc.reshape(s_ref.shape)
 
 
 @functools.partial(
@@ -89,17 +90,21 @@ def act_quant(
     if kind == "sigmoid_gate":
         in_specs.append(pl.BlockSpec((t, n), lambda i: (i, 0)))
         args.append(gate)
-    return tuple(
+    dense = lane_dense(t, m)
+    q, s = (
         pl.pallas_call(
             functools.partial(_kernel, kind=kind, round_mid=round_mid),
             grid=(m // t,),
             in_specs=in_specs,
             out_specs=[
                 pl.BlockSpec((t, n), lambda i: (i, 0)),
-                pl.BlockSpec((t, 1), lambda i: (i, 0)),
+                pl.BlockSpec((t,), lambda i: (i,))
+                if dense
+                else pl.BlockSpec((t, 1), lambda i: (i, 0)),
             ],
-            out_shape=[sds((m, n), FP8), sds((m, 1), jnp.float32)],
+            out_shape=[sds((m, n), FP8), sds((m,) if dense else (m, 1), jnp.float32)],
             compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
             interpret=interpret,
         )(*args)
     )
+    return q, s.reshape(m, 1)

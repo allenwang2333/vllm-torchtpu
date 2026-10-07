@@ -53,7 +53,7 @@ def _kernel(*refs, eps, has_res, emit_y, has_rstd, gamma, has_ba):
     x_ref = refs.pop(0)
     r_ref = refs.pop(0) if has_res else None
     w_ref = refs.pop(0) if gamma != "none" else None
-    rstd = refs.pop(0)[...] if has_rstd else None
+    rstd = refs.pop(0)[...].reshape(-1, 1) if has_rstd else None
     wba_ref = refs.pop(0) if has_ba else None
     y_ref = refs.pop(0) if emit_y else None
     ba_ref = refs.pop(0) if has_ba else None
@@ -90,7 +90,17 @@ def _kernel(*refs, eps, has_res, emit_y, has_rstd, gamma, has_ba):
     if emit_y:
         y_ref[...] = y
     q_ref[...] = q
-    s_ref[...] = sc
+    s_ref[...] = sc.reshape(s_ref.shape)
+
+
+def lane_dense(t: int, m: int) -> bool:
+    """Whether a per-row f32 vector can be a rank-1 [m] block of t rows.
+
+    A [m, 1] f32 array is laid out one row per sublane, and its XLA consumer
+    (the prequant matmul's epilogue) relayouts it to [m] with a separate
+    reduce op; a lane-dense [m] avoids that (cf. gated_norm_quant e488da327).
+    """
+    return t == m or t % 1024 == 0 or (t >= 128 and t & (t - 1) == 0)
 
 
 def _tile(rows: int, cap: int) -> int:
@@ -150,8 +160,11 @@ def rms_norm_quant(
         scratch = [pltpu.VMEM((k,), w.dtype), pltpu.SemaphoreType.DMA(())]
     else:
         assert gamma == "none", gamma
+    dense = lane_dense(t, m)
+    vspec = pl.BlockSpec((t,), lambda i: (i,)) if dense else pl.BlockSpec((t, 1), lambda i: (i, 0))
     if has_rstd:
-        in_specs.append(pl.BlockSpec((t, 1), lambda i: (i, 0)))
+        in_specs.append(vspec)
+        rstd = rstd.reshape(m) if dense else rstd.reshape(m, 1)
     has_ba = wba is not None
     if has_ba:  # wba: [n_ba, k], lane-dense (a [k, 16] operand gets relaid out per call)
         nba = wba.shape[0]
@@ -166,8 +179,8 @@ def rms_norm_quant(
     if has_res:
         out_specs.append(row)
         out_shape.append(sds((m, k), residual.dtype))
-    out_specs += [row, pl.BlockSpec((t, 1), lambda i: (i, 0))]
-    out_shape += [sds((m, k), FP8), sds((m, 1), jnp.float32)]
+    out_specs += [row, vspec]
+    out_shape += [sds((m, k), FP8), sds((m,) if dense else (m, 1), jnp.float32)]
     outs = list(
         pl.pallas_call(
             functools.partial(
@@ -192,6 +205,7 @@ def rms_norm_quant(
     ba = outs.pop(0) if has_ba else None
     ro = outs.pop(0) if has_res else None
     q, sc = outs
+    sc = sc.reshape(m, 1)
     if has_ba:
         return y, ro, q, sc, ba
     return y, ro, q, sc

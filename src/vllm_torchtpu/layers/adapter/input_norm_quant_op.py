@@ -235,7 +235,7 @@ def norm_quant(layer: torch.nn.Module, hidden_states, residual):
         s = hidden_states.to(torch.float32)
         if residual is not None:
             s = s + residual.to(torch.float32)
-        extra = (torch.rsqrt(s.pow(2).mean(dim=-1, keepdim=True) + eps),)
+        extra = (torch.rsqrt(s.pow(2).mean(dim=-1, keepdim=False) + eps),)
     if fold:
         wba = layer.linear_attn._tpu_in_proj_ba_t
         if envs.TPU_INPUT_NORM_QUANT_FOLD_BA == 2:
