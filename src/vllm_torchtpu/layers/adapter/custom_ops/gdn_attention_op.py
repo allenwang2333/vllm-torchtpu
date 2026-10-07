@@ -34,6 +34,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
     flat_manager_ids,
@@ -516,6 +517,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.conv1d.weight.data = torch.empty(
             w.shape, dtype=w.dtype, device=w.device
         ).copy_(w)
+        # The unified-pool GDN kernel wants the weight as f32 [kernel_size,
+        # 1, dim]; doing that per call is one XLA copy per layer per step.
+        self.conv_weight_kernel_layout = None
+        if envs.TPU_GDN_CONV_WEIGHT_PRETRANSPOSED and not self._pcp_streaming_enabled():
+            self.conv_weight_kernel_layout = (
+                self.conv1d.weight.data.permute(2, 1, 0).to(torch.float32).contiguous()
+            )
 
     def get_state_shape(
         self,
@@ -1192,12 +1200,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         "mamba_slot_read_offsets in the attention metadata."
                     )
                 ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices", None)
+                conv_weight = getattr(self, "conv_weight_kernel_layout", None)
                 core_attn_out = self.gdn_pooled_op(
                     mixed_qkv,
                     b,
                     a,
                     recurrent_state,
-                    self.conv1d.weight,
+                    self.conv1d.weight if conv_weight is None else conv_weight,
                     self.conv1d.bias,
                     self.A_log,
                     self.dt_bias,

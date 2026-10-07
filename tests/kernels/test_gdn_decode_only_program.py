@@ -114,5 +114,17 @@ def test_kwargs_drop_or_keep_launch(limit, monkeypatch):
     assert gdn_attention.gdn_decode_only_kwargs(128) == {}
     assert gdn_attention.gdn_decode_only_kwargs(16) == {"batched_only": True}
     monkeypatch.setenv("TPU_GDN_DECODE_ONLY_KEEP_LAUNCH", "1")
-    assert gdn_attention.gdn_decode_only_kwargs(16) == {"per_seq_empty": True}
+    assert gdn_attention.gdn_decode_only_kwargs(16) == {
+        "per_seq_empty": True,
+        "per_seq_noalias": False,
+    }
     assert gdn_attention.gdn_decode_only_kwargs(128) == {}
+
+
+def test_kwargs_noalias(limit, monkeypatch):
+    monkeypatch.setenv("TPU_GDN_DECODE_ONLY_KEEP_LAUNCH", "1")
+    monkeypatch.setenv("TPU_GDN_DECODE_ONLY_NOALIAS", "1")
+    assert gdn_attention.gdn_decode_only_kwargs(16) == {
+        "per_seq_empty": True,
+        "per_seq_noalias": True,
+    }

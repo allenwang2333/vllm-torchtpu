@@ -94,6 +94,8 @@ if TYPE_CHECKING:
     TPU_GDN_FUSED_NORM_QUANT: bool = False
     TPU_GDN_DECODE_ONLY_MAX_TOKENS: int = 0
     TPU_GDN_DECODE_ONLY_KEEP_LAUNCH: bool = False
+    TPU_GDN_DECODE_ONLY_NOALIAS: bool = False
+    TPU_GDN_CONV_WEIGHT_PRETRANSPOSED: bool = False
     TPU_FUSED_QK_NORM_ROPE: bool = False
     TPU_RPA_DECODE_BATCHED: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -723,6 +725,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel in decode-only buckets, with constant metadata, instead of
     # dropping it -- XLA hides the MoE router-weight prefetch behind it.
     "TPU_GDN_DECODE_ONLY_KEEP_LAUNCH": env_bool("TPU_GDN_DECODE_ONLY_KEEP_LAUNCH"),
+    # With KEEP_LAUNCH: return the BATCHED output directly instead of aliasing
+    # it through the empty PER_SEQ launch.
+    "TPU_GDN_DECODE_ONLY_NOALIAS": env_bool("TPU_GDN_DECODE_ONLY_NOALIAS"),
+    # Unified-pool GDN: transpose + cast the conv1d weight to the kernel's
+    # f32 [kernel_size, 1, dim] layout once at load instead of every call.
+    "TPU_GDN_CONV_WEIGHT_PRETRANSPOSED": env_bool("TPU_GDN_CONV_WEIGHT_PRETRANSPOSED"),
     # Run the gated q split, q/k RMS norms and NeoX rope of Qwen3NextAttention
     # as one kernel on token buckets of up to 64 rows.
     "TPU_FUSED_QK_NORM_ROPE": env_bool("TPU_FUSED_QK_NORM_ROPE"),
