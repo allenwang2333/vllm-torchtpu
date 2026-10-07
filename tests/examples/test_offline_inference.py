@@ -1,16 +1,5 @@
-# Copyright 2026 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for the chat-template default in examples/offline_inference.py."""
 
 import importlib.util
@@ -37,18 +26,24 @@ offline_inference = _load_offline_inference()
 class _FakeTokenizer:
     """The tokenizer attributes that the BOS check reads."""
 
-    def __init__(self, *, bos_token, raw_token_ids, rendered_chat_prompt):
+    def __init__(
+        self, *, bos_token, raw_token_ids, rendered_chat_prompt, bos_token_id=2
+    ):
         self.bos_token = bos_token
-        self.bos_token_id = 2
+        self.bos_token_id = bos_token_id
         self.chat_template = None if rendered_chat_prompt is None else "<template>"
         self._raw_token_ids = raw_token_ids
         self._rendered_chat_prompt = rendered_chat_prompt
+        self.chat_template_calls = []
 
     def encode(self, text):
         return self._raw_token_ids
 
     def apply_chat_template(self, messages, **kwargs):
         assert kwargs["tokenize"] is False
+        self.chat_template_calls.append(kwargs)
+        if isinstance(self._rendered_chat_prompt, Exception):
+            raise self._rendered_chat_prompt
         return self._rendered_chat_prompt
 
 
@@ -76,6 +71,19 @@ NO_CHAT_TEMPLATE_TOKENIZER = _FakeTokenizer(
 TEMPLATE_WITHOUT_BOS_TOKENIZER = _FakeTokenizer(
     bos_token="<s>", raw_token_ids=[1234], rendered_chat_prompt="<|im_start|>user\nx"
 )
+# A BOS string without a BOS id (not a real special token).
+NO_BOS_ID_TOKENIZER = _FakeTokenizer(
+    bos_token="<bos>",
+    raw_token_ids=[1234],
+    rendered_chat_prompt="<bos>x",
+    bos_token_id=None,
+)
+# A chat template that fails to render, e.g. because it needs extra kwargs.
+RAISING_TEMPLATE_TOKENIZER = _FakeTokenizer(
+    bos_token="<bos>",
+    raw_token_ids=[1234],
+    rendered_chat_prompt=ValueError("template needs tools"),
+)
 
 
 def _fake_llm(tokenizer):
@@ -90,11 +98,47 @@ def _fake_llm(tokenizer):
         (QWEN3_TOKENIZER, False),
         (NO_CHAT_TEMPLATE_TOKENIZER, False),
         (TEMPLATE_WITHOUT_BOS_TOKENIZER, False),
+        (NO_BOS_ID_TOKENIZER, False),
+        (RAISING_TEMPLATE_TOKENIZER, False),
     ],
-    ids=["gemma4-it", "llama3", "qwen3", "no-chat-template", "template-without-bos"],
+    ids=[
+        "gemma4-it",
+        "llama3",
+        "qwen3",
+        "no-chat-template",
+        "template-without-bos",
+        "no-bos-id",
+        "template-raises",
+    ],
 )
 def test_chat_template_adds_missing_bos(tokenizer, expected):
-    assert offline_inference._chat_template_adds_missing_bos(tokenizer) is expected
+    assert offline_inference._chat_template_adds_missing_bos(tokenizer, {}) is expected
+
+
+def test_probe_renders_with_the_chat_template_kwargs():
+    tokenizer = _FakeTokenizer(
+        bos_token="<bos>", raw_token_ids=[1234], rendered_chat_prompt="<bos>x"
+    )
+    kwargs = {"enable_thinking": False}
+
+    assert offline_inference._chat_template_adds_missing_bos(tokenizer, kwargs)
+
+    assert tokenizer.chat_template_calls == [
+        {"tokenize": False, "add_generation_prompt": True, "enable_thinking": False}
+    ]
+
+
+def test_probe_failure_falls_back_to_raw_prompts(monkeypatch):
+    logger = MagicMock()
+    monkeypatch.setattr(offline_inference, "logger", logger)
+
+    resolved = offline_inference._resolve_use_chat_template(
+        None, _fake_llm(RAISING_TEMPLATE_TOKENIZER), {}
+    )
+
+    assert resolved is False
+    logger.warning.assert_called_once()
+    logger.info.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -116,7 +160,7 @@ def test_chat_template_adds_missing_bos(tokenizer, expected):
 )
 def test_resolve_use_chat_template(use_chat_template, tokenizer, expected):
     resolved = offline_inference._resolve_use_chat_template(
-        use_chat_template, _fake_llm(tokenizer)
+        use_chat_template, _fake_llm(tokenizer), {}
     )
     assert resolved is expected
 
@@ -125,7 +169,9 @@ def test_resolve_warns_when_raw_prompts_would_miss_bos(monkeypatch):
     logger = MagicMock()
     monkeypatch.setattr(offline_inference, "logger", logger)
 
-    offline_inference._resolve_use_chat_template(False, _fake_llm(GEMMA4_IT_TOKENIZER))
+    offline_inference._resolve_use_chat_template(
+        False, _fake_llm(GEMMA4_IT_TOKENIZER), {}
+    )
 
     logger.warning.assert_called_once()
 
@@ -135,7 +181,7 @@ def test_resolve_does_not_load_tokenizer_when_chat_template_requested():
         raise AssertionError("the tokenizer should not be needed")
 
     llm = SimpleNamespace(get_tokenizer=get_tokenizer)
-    assert offline_inference._resolve_use_chat_template(True, llm) is True
+    assert offline_inference._resolve_use_chat_template(True, llm, {}) is True
 
 
 @pytest.mark.parametrize(

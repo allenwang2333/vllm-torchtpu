@@ -61,29 +61,46 @@ def create_parser():
     return parser
 
 
-def _chat_template_adds_missing_bos(tokenizer: TokenizerLike) -> bool:
+def _chat_template_adds_missing_bos(
+    tokenizer: TokenizerLike, chat_template_kwargs: dict
+) -> bool:
     """Return whether the chat template adds a BOS token that raw text misses."""
     # bos_token and chat_template are HF tokenizer attributes, not part of
     # vLLM's TokenizerLike protocol, so custom tokenizers may lack them.
     bos_token = getattr(tokenizer, "bos_token", None)
-    if not bos_token or not getattr(tokenizer, "chat_template", None):
+    bos_token_id = getattr(tokenizer, "bos_token_id", None)
+    if not bos_token or bos_token_id is None:
         return False
-    if tokenizer.encode("x")[:1] == [tokenizer.bos_token_id]:
+    if not getattr(tokenizer, "chat_template", None):
+        return False
+    if tokenizer.encode("x")[:1] == [bos_token_id]:
         # Raw text already starts with BOS (e.g. Llama-3).
         return False
-    rendered_prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": "x"}],
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    try:
+        # Render with the same kwargs LLM.chat will use.
+        rendered_prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "x"}],
+            tokenize=False,
+            add_generation_prompt=True,
+            **chat_template_kwargs,
+        )
+    except Exception as e:
+        # This is only a probe for the default; it must not stop the example.
+        logger.warning(
+            "Could not render the chat template to check for a BOS token: %s", e
+        )
+        return False
     return isinstance(rendered_prompt, str) and rendered_prompt.startswith(bos_token)
 
 
-def _resolve_use_chat_template(use_chat_template: bool | None, llm: LLM) -> bool:
+def _resolve_use_chat_template(
+    use_chat_template: bool | None, llm: LLM, chat_template_kwargs: dict
+) -> bool:
     """Resolve --[no-]use-chat-template, applying the default when unset."""
     if use_chat_template:
         return True
-    if not _chat_template_adds_missing_bos(llm.get_tokenizer()):
+    tokenizer = llm.get_tokenizer()
+    if not _chat_template_adds_missing_bos(tokenizer, chat_template_kwargs):
         return False
     if use_chat_template is None:
         logger.info(
@@ -115,7 +132,9 @@ def main(args: dict):
 
     # Create an LLM
     llm = LLM(**args)
-    use_chat_template = _resolve_use_chat_template(use_chat_template, llm)
+    use_chat_template = _resolve_use_chat_template(
+        use_chat_template, llm, chat_template_kwargs
+    )
 
     # Create a sampling params object
     sampling_params = llm.get_default_sampling_params()
