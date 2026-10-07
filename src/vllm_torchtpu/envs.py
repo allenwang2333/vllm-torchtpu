@@ -740,6 +740,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_INPUT_NORM_QUANT_MIN_ROWS": env_int("TPU_INPUT_NORM_QUANT_MIN_ROWS", 0),
     # How the norm weight reaches the kernel: "vmem" (a VMEM block XLA stages),
     # "hbm" (pinned to HBM, DMA'd inside the kernel under the residual add),
+    # "xla" (an XLA fusion forms the f32 w + 1 each step, read from VMEM),
     # "none" (timing-only removal arm: gamma = 1; wrong numerics).
     "TPU_INPUT_NORM_QUANT_GAMMA": env_str("TPU_INPUT_NORM_QUANT_GAMMA", "vmem"),
     # GDN layers also run their bf16 in_proj_ba inside the norm kernel.

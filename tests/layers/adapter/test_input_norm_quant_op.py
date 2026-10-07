@@ -60,10 +60,13 @@ def _run(x, r, norm, with_residual, emit_y, exact):
     if exact:
         s = x.float() + (r.float() if with_residual else 0)
         extra = (torch.rsqrt(s.pow(2).mean(dim=-1, keepdim=True) + EPS),)
+    gw = norm.weight
+    if inq.envs.TPU_INPUT_NORM_QUANT_GAMMA == "xla":
+        gw = norm.weight.float() + 1.0
     if with_residual:
-        out = inq._build_op(EPS, True, emit_y, exact)(x, r, norm.weight, *extra)
+        out = inq._build_op(EPS, True, emit_y, exact)(x, r, gw, *extra)
     else:
-        out = inq._build_op(EPS, False, emit_y, exact)(x, norm.weight, *extra)
+        out = inq._build_op(EPS, False, emit_y, exact)(x, gw, *extra)
     out = list(out)
     y = out.pop(0) if emit_y else None
     ro = out.pop(0) if with_residual else x
@@ -75,7 +78,7 @@ def _ulps(a, b):
     return (a.cpu().view(torch.int16).int() - b.cpu().view(torch.int16).int()).abs()
 
 
-@pytest.mark.parametrize("gamma", ["vmem", "hbm"])
+@pytest.mark.parametrize("gamma", ["vmem", "hbm", "xla"])
 @pytest.mark.parametrize("emit_y", [True, False])
 @pytest.mark.parametrize("with_residual", [True, False])
 @pytest.mark.parametrize("rows", [4, 8, 48, 1024])
@@ -99,7 +102,7 @@ def test_exact_mode_matches_norm_then_fp8_linear(
     assert _same(got, ref)
 
 
-@pytest.mark.parametrize("gamma", ["vmem", "hbm"])
+@pytest.mark.parametrize("gamma", ["vmem", "hbm", "xla"])
 @pytest.mark.parametrize("with_residual", [True, False])
 @pytest.mark.parametrize("rows", [8, 48, 1024])
 def test_kernel_stats_mode_is_within_one_ulp(

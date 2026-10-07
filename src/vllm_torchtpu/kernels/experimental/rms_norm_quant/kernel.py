@@ -36,10 +36,11 @@ FP8 = jnp.float8_e4m3fn
 FP8_MAX = float(jnp.finfo(FP8).max)
 
 
-def _norm_quant(s, w, eps, rstd=None):
+def _norm_quant(s, w, eps, rstd=None, plus_one=True):
     if rstd is None:
         rstd = jax.lax.rsqrt(jnp.mean(s * s, axis=-1, keepdims=True) + eps)
-    y = (s * rstd * (w + 1.0)).astype(jnp.bfloat16)
+    g = w + 1.0 if plus_one else w
+    y = (s * rstd * g).astype(jnp.bfloat16)
     amax = jnp.max(jnp.abs(y), axis=-1, keepdims=True).astype(jnp.float32)
     sc = amax / FP8_MAX
     sc = jnp.where(sc == 0.0, 1.0, sc)
@@ -77,7 +78,8 @@ def _kernel(*refs, eps, has_res, emit_y, has_rstd, gamma, has_ba):
         w = w_vmem[...].astype(jnp.float32)[None, :]
     else:
         w = w_ref[...].astype(jnp.float32)[None, :]
-    y, q, sc = _norm_quant(s, w, eps, rstd)
+    # gamma == "xla": the caller passes the f32 (w + 1) an XLA fusion just made.
+    y, q, sc = _norm_quant(s, w, eps, rstd, plus_one=gamma != "xla")
     if has_ba:
         # The layer's bf16 consumer of the normed rows (GDN in_proj_ba), so the
         # rows need not leave the kernel.
@@ -139,7 +141,7 @@ def rms_norm_quant(
     in_specs = [row] + ([row] if has_res else [])
     args = [x] + ([residual] if has_res else [])
     scratch = []
-    if gamma == "vmem":
+    if gamma in ("vmem", "xla"):
         in_specs.append(pl.BlockSpec((k,), lambda i: (0,)))
         args.append(w)
     elif gamma == "hbm":

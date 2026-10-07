@@ -239,14 +239,19 @@ def norm_quant(layer: torch.nn.Module, hidden_states, residual):
     if fold:
         extra = extra + (layer.linear_attn._tpu_in_proj_ba_t,)
     emit_y = is_gdn and not fold
+    gw = norm.weight
+    if envs.TPU_INPUT_NORM_QUANT_GAMMA == "xla":
+        # (w + 1) in f32 exactly as GemmaRMSNorm forms it; an XLA fusion output,
+        # so the kernel reads it from VMEM instead of a staged parameter.
+        gw = norm.weight.float() + 1.0
     if residual is None:
         out = _build_op(eps, False, emit_y, exact, fold)(
-            hidden_states, norm.weight, *extra
+            hidden_states, gw, *extra
         )
         new_res = hidden_states
     else:
         out = _build_op(eps, True, emit_y, exact, fold)(
-            hidden_states, residual, norm.weight, *extra
+            hidden_states, residual, gw, *extra
         )
     out = list(out)
     y = out.pop(0) if emit_y else None
