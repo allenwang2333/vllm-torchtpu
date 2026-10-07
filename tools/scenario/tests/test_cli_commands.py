@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""show: output snapshots and exit codes.
+"""validate, show and run --dry-run: output snapshots and exit codes.
 
 Set SCENARIO_UPDATE_SNAPSHOTS=1 to rewrite the snapshots after an intended
 change, and review the diff.
@@ -19,6 +19,7 @@ change, and review the diff.
 
 import os
 import pathlib
+import shutil
 
 import pytest
 from click.testing import CliRunner, Result
@@ -62,6 +63,60 @@ def assert_snapshot(name: str, text: str) -> None:
 def in_repo(monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
     monkeypatch.chdir(REPO)
     return REPO
+
+
+@pytest.fixture
+def scratch(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
+    """A writable copy of the fixture repo, as the current directory."""
+    root = tmp_path / "repo"
+    shutil.copytree(REPO, root)
+    monkeypatch.chdir(root)
+    return root
+
+
+def test_validate_everything(in_repo: pathlib.Path) -> None:
+    result = invoke("validate")
+    assert result.exit_code == 0, result.output
+    assert_snapshot("validate", result.stdout)
+
+
+def test_validate_from_a_subdirectory(
+    in_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(REPO / "scenarios" / "kimi-k3")
+    result = invoke("validate")
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[-1] == "7 scenarios, 0 errors"
+
+
+def test_validate_files_and_set(in_repo: pathlib.Path) -> None:
+    result = invoke("validate", GLM, K3_PD, "--set", "server.args.max-num-seqs=4")
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[-1] == "2 scenarios, 0 errors"
+
+
+def test_validate_reports_every_problem(scratch: pathlib.Path) -> None:
+    glm = scratch / GLM
+    glm.write_text(
+        glm.read_text()
+        .replace("chips_per_host: 4", "chips_per_host: 2")
+        .replace("multihost: ray", "multihostt: ray")
+    )
+    copy = scratch / "scenarios" / "glm-5.2" / "copy.yaml"
+    copy.write_text((scratch / GLM_MP).read_text())
+    result = invoke("validate")
+    assert result.exit_code == 1
+    assert_snapshot("validate_errors", result.stdout)
+
+
+def test_validate_usage(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    result = invoke("validate")
+    assert result.exit_code == 2
+    assert "no scenarios/defaults.yaml" in result.stderr
+    assert invoke("validate", "nope.yaml").exit_code == 2
 
 
 def test_show_resolved(in_repo: pathlib.Path) -> None:
@@ -188,3 +243,51 @@ def test_show_usage(in_repo: pathlib.Path) -> None:
     assert broken.stderr.startswith(
         "--set[0] server.argz.x=1: server.argz: unknown key"
     )
+
+
+def test_run_dry_run_one_host(in_repo: pathlib.Path) -> None:
+    result = invoke("run", K3_PD, "--dry-run", "--role", "decode", "--host-index", "1")
+    assert result.exit_code == 0, result.output
+    assert "role prefill" not in result.stdout and "driver:" not in result.stdout
+    assert_snapshot("run_k3_pd_decode_1", result.stdout)
+
+
+def test_run_dry_run_every_host(in_repo: pathlib.Path) -> None:
+    result = invoke("run", K3_PD, "--dry-run")
+    assert result.exit_code == 0, result.output
+    assert result.stdout == invoke("show", K3_PD, "--plan").stdout
+    driver = invoke("run", K3_PD, "--dry-run", "--role", "prefill", "--host-index", "0")
+    assert "driver: prefill host 0" in driver.stdout
+    assert "role decode" not in driver.stdout
+    client = invoke("run", QWEN_PD, "--dry-run", "--role", "client")
+    assert client.stdout.count("role ") == 0 and "driver: a chipless" in client.stdout
+    one_role = invoke("run", GLM, "--dry-run", "--host-index", "1")
+    assert "host 1" in one_role.stdout and "host 0" not in one_role.stdout
+
+
+def test_run_dry_run_only(in_repo: pathlib.Path) -> None:
+    result = invoke("run", K3_PD, "--dry-run", "--only", "eval")
+    assert result.exit_code == 0, result.output
+    assert "custom correctness" not in result.stdout and "only: eval" in result.stdout
+    unknown = invoke("run", K3_PD, "--dry-run", "--only", "perf")
+    assert unknown.exit_code == 2
+    assert "tasks: correctness, eval" in unknown.stderr
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        ((K3_PD,), "pass --dry-run"),
+        (
+            (K3_PD, "--dry-run", "--role", "nope"),
+            "no role nope; roles: prefill, decode",
+        ),
+        ((K3_PD, "--dry-run", "--host-index", "1"), "--host-index needs --role"),
+        ((K3_PD, "--dry-run", "--role", "decode", "--host-index", "4"), "hosts 0..3"),
+        ((AGENTX, "--dry-run"), "pick one with --point"),
+    ],
+)
+def test_run_usage(in_repo: pathlib.Path, args: tuple[str, ...], message: str) -> None:
+    result = invoke("run", *args)
+    assert result.exit_code == 2
+    assert message in result.stderr
