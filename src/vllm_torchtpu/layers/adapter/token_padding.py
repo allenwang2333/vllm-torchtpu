@@ -77,6 +77,27 @@ def retain_padding_graph_input(output: torch.Tensor) -> torch.Tensor:
     return output + (value - value)
 
 
+def padding_mask_for(
+    num_tokens: int, is_local_tensor: bool = False
+) -> torch.Tensor | None:
+    """The padded-row mask for a [num_tokens, ...] tensor, or None when no padding state is set; gathered
+    across the DP ranks unless the tensor is local."""
+    if _padding_state is None:
+        return None
+    if is_local_tensor:
+        return _padding_state.get_local_padding_mask(num_tokens)
+    from vllm.distributed.parallel_state import get_dp_group
+
+    dp_group = get_dp_group()
+    dp_size = dp_group.world_size
+    if dp_size > 1:
+        local_padding = _padding_state.get_local_padding_mask(num_tokens // dp_size)
+        # TPU collectives may not support bool, so encode the mask as int8.
+        gathered_padding = dp_group.all_gather(local_padding.to(torch.int8), dim=0)
+        return gathered_padding.ne(0)
+    return _padding_state.get_local_padding_mask(num_tokens)
+
+
 def zero_routing_weights_for_padding(
     topk_ids: torch.Tensor, topk_weights: torch.Tensor, is_local_tensor: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:

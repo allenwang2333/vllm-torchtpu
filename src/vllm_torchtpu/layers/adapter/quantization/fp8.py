@@ -90,6 +90,7 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
+from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
 from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
     VllmQuantLinearConfig,
@@ -770,6 +771,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
 
     _use_adaptive_fused_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
+    _moe_lowtok_scores_op: torch.library.CustomOpDef | None = None
 
     def __init__(self, quant_config: Fp8Config, moe_config):
         FusedMoEMethodBase.__init__(self, moe_config)
@@ -1063,6 +1065,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
+        self._moe_lowtok_scores_op = moe_lowtok_scores.prebuild(
+            self, layer, activation_str
+        )
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = adaptive_moe.prebuild_adaptive_fused_moe(
                 layer,
@@ -1211,6 +1216,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                     x.shape[0], envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS
                 ),
             )
+        if moe_lowtok_scores.serves(self._moe_lowtok_scores_op, x):
+            op = self._moe_lowtok_scores_op
+            return moe_lowtok_scores.apply(op, layer, x, router_logits)
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
@@ -1278,6 +1286,16 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer.w13_weight_scale_inv,
                 layer.w2_weight_scale_inv,
             )
+            if getattr(layer, "_lowtok_has_copies", False) and getattr(
+                layer, "_lowtok_tables", None
+            ) is not None:
+                zero = (
+                    layer._lowtok_tables[:1]
+                    + layer._lowtok_prim[:1]
+                    + layer._lowtok_copy[:1]
+                    + layer._lowtok_hot1h[0, :1].to(torch.int32)
+                ) * 0
+                router_logits = router_logits + zero.to(router_logits.dtype)
             out = fused_moe_ep(x, w13, w2, s13, s2, router_logits)
             experts_start = layer._experts_start
             if experts_start is not None:
@@ -1310,7 +1328,21 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
             retain_fused_ep_graph_inputs,
         )
+        if moe_lowtok_scores.serves(self._moe_lowtok_scores_op, x):
+            op = self._moe_lowtok_scores_op
+            out = moe_lowtok_scores.apply(op, layer, x, router_logits)
+            return retain_fused_ep_graph_inputs(out)
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        if getattr(layer, "_lowtok_has_copies", False) and getattr(
+            layer, "_lowtok_tables", None
+        ) is not None:
+            zero = (
+                layer._lowtok_tables[:1]
+                + layer._lowtok_prim[:1]
+                + layer._lowtok_copy[:1]
+                + layer._lowtok_hot1h[0, :1].to(torch.int32)
+            ) * 0
+            topk_ids = topk_ids + zero
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                 topk_ids, topk_weights

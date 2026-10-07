@@ -3,7 +3,8 @@ synthetic tables and on the shipped Qwen3.5 tables: the table checks, the slot
 maps, the router-row permutation, the identity without a table, the backbone
 anchoring that leaves the MTP drafter's layer on the checkpoint's contiguous
 placement, the loader's expert filter, the expert-map patch on vLLM's manager,
-and the primary-interval bound of the grouped and dense ids paths.
+the primary-interval bound of the grouped / dense / few-token ids paths, and
+the moe_lowtok_scores entry behavior with and without copies.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import torch
 from vllm_torchtpu import envs
 from vllm_torchtpu import expert_placement as ep
 from vllm_torchtpu import model_loader_patches as mlp
+from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores as lowtok_scores
 from vllm_torchtpu.layers.core import fused_moe_gmm as gmm
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -362,8 +364,15 @@ def _fp8_operands(tokens, experts, hidden=512, inter=256, topk=4):
     return x, w1, w2, s1, s2, w, ids
 
 
-def _ids_seen_by(monkeypatch, *, slots, primaries, dense):
+def _ids_seen_by(monkeypatch, *, slots, primaries, cap, dense):
     seen = {}
+
+    def route_probe(topk_ids, topk_weights, num_local_experts):
+        seen["lowtok"] = (topk_ids, topk_weights)
+        return jnp.zeros((topk_ids.shape[0], num_local_experts), topk_weights.dtype)
+
+    def lowtok_probe(x, route, *a, **k):
+        return x
 
     def dense_probe(x, w1, w2, s1, s2, w, ids):
         seen["dense"] = (ids, w)
@@ -381,7 +390,12 @@ def _ids_seen_by(monkeypatch, *, slots, primaries, dense):
             jnp.zeros((rows,), jnp.int32),
         )
 
+    monkeypatch.setattr(gmm, "_MOE_LOWTOK", cap > 0)
+    monkeypatch.setattr(gmm, "_MOE_LOWTOK_IDS", cap > 0)
+    monkeypatch.setattr(gmm, "_MOE_LOWTOK_MAX_TOKENS", cap)
     monkeypatch.setattr(gmm, "_DENSE_EXPERT_THRESHOLD", dense)
+    monkeypatch.setattr(gmm, "moe_lowtok_routing_table", route_probe)
+    monkeypatch.setattr(gmm, "moe_lowtok", lowtok_probe)
     monkeypatch.setattr(gmm, "can_use_dense_expert", lambda *a, **k: True)
     monkeypatch.setattr(gmm, "dense_expert_moe", dense_probe)
     monkeypatch.setattr(gmm, "prepare_routed_gmm_inputs", grouped_probe)
@@ -414,17 +428,25 @@ def _ids_seen_by(monkeypatch, *, slots, primaries, dense):
     return path, np.asarray(local_ids)[0].tolist(), np.asarray(weights)[0].tolist()
 
 
-@pytest.mark.parametrize("dense, path", [(64, "dense"), (0, "grouped")])
-def test_every_routed_path_sees_only_the_primary_interval(monkeypatch, dense, path):
-    taken, ids, w = _ids_seen_by(monkeypatch, slots=12, primaries=8, dense=dense)
+@pytest.mark.parametrize(
+    "cap, dense, path", [(256, 64, "lowtok"), (0, 64, "dense"), (0, 0, "grouped")]
+)
+def test_every_routed_path_sees_only_the_primary_interval(
+    monkeypatch, cap, dense, path
+):
+    taken, ids, w = _ids_seen_by(
+        monkeypatch, slots=12, primaries=8, cap=cap, dense=dense
+    )
     assert taken == path
     assert ids == [-1] * 8 + list(range(8)) + [-1] * 8
     assert w == [0.0] * 8 + [1.0] * 8 + [0.0] * 8
 
 
-@pytest.mark.parametrize("dense, path", [(64, "dense")])
-def test_without_a_primary_count_every_slot_is_local(monkeypatch, dense, path):
-    taken, ids, w = _ids_seen_by(monkeypatch, slots=8, primaries=None, dense=dense)
+@pytest.mark.parametrize("cap, dense, path", [(256, 64, "lowtok"), (0, 64, "dense")])
+def test_without_a_primary_count_every_slot_is_local(monkeypatch, cap, dense, path):
+    taken, ids, w = _ids_seen_by(
+        monkeypatch, slots=8, primaries=None, cap=cap, dense=dense
+    )
     assert taken == path
     assert ids == [-1] * 8 + list(range(8)) + [-1] * 8
 
@@ -455,6 +477,7 @@ def _stub_grouped_path(monkeypatch):
 @pytest.mark.parametrize("primaries", [8, None])
 def test_fused_moe_func_traces_under_jit_with_a_primary_count(monkeypatch, primaries):
     _stub_grouped_path(monkeypatch)
+    monkeypatch.setattr(gmm, "_MOE_LOWTOK", False)
     monkeypatch.setattr(gmm, "_DENSE_EXPERT_THRESHOLD", 0)
     x, w1, w2, s1, s2, w, ids = _fp8_operands(16, 12)
     kwargs = dict(
@@ -482,7 +505,7 @@ def test_fused_moe_func_traces_under_jit_with_a_primary_count(monkeypatch, prima
 
 def test_a_primary_count_outside_the_slots_is_refused(monkeypatch):
     with pytest.raises(ValueError, match="num_primary_experts"):
-        _ids_seen_by(monkeypatch, slots=8, primaries=9, dense=0)
+        _ids_seen_by(monkeypatch, slots=8, primaries=9, cap=0, dense=0)
 
 
 def test_the_custom_op_cache_refuses_copies_without_a_primary_count(
@@ -510,3 +533,66 @@ def test_the_custom_op_cache_key_without_a_placement_is_the_same_op(monkeypatch)
         topk=4, activation="silu", use_ep=True, num_primary_experts=None
     )
     assert a is b
+
+
+def test_moe_lowtok_scores_arms_under_plain_placement_and_declines_copies(monkeypatch):
+    from vllm.compilation import backends
+
+    monkeypatch.setenv("TPU_MOE_LOWTOK", "1")
+    monkeypatch.setattr(backends, "model_tag", "backbone")
+    monkeypatch.setattr(lowtok_scores, "_LAYERS", [])
+
+    def make_layer(slots):
+        return SimpleNamespace(
+            renormalize=True,
+            scoring_func="softmax",
+            custom_routing_function=None,
+            use_grouped_topk=False,
+            e_score_correction_bias=None,
+            routed_scaling_factor=1.0,
+            apply_router_weight_on_input=False,
+            w13_bias=None,
+            w2_bias=None,
+            layer_name=BACKBONE_PREFIX.format(n=0),
+            global_num_experts=512,
+            moe_config=SimpleNamespace(
+                experts_per_token=10,
+                ep_size=8,
+                ep_rank=0,
+                in_dtype=torch.bfloat16,
+                moe_parallel_config=SimpleNamespace(use_ep=True),
+            ),
+            hidden_size=4096,
+            w13_weight=torch.empty(slots, 4096, 2048, dtype=torch.float8_e4m3fn),
+            w2_weight=torch.empty(slots, 1024, 4096, dtype=torch.float8_e4m3fn),
+            w13_weight_scale_inv=torch.empty(slots, 1, 1, 2048),
+            w2_weight_scale_inv=torch.empty(slots, 1, 1, 4096),
+        )
+
+    method = SimpleNamespace(_use_adaptive_fused_moe=False)
+    op_plain = lowtok_scores.prebuild(method, make_layer(64), "silu")
+    assert op_plain is not None
+    op_copies = lowtok_scores.prebuild(method, make_layer(80), "silu")
+    assert op_copies is None
+    assert lowtok_scores._LAYERS[-1].entry == "ids"
+    assert "copy slots" in lowtok_scores._LAYERS[-1].reason
+
+
+def test_auto_table_rule_and_files_exist():
+    """The Qwen3.5 auto-default (tpu_platform) picks the copy count by serving
+    shape; every table it can pick ships and validates."""
+    from vllm_torchtpu import expert_placement
+
+    pick = expert_placement.auto_table
+    assert pick(1, 8).endswith("_opt_copies128.json")
+    assert pick(4, 32).endswith("_opt_copies32.json")
+    assert pick(2, 16).endswith("_opt_copies32.json")
+    assert pick(1, 12).endswith("_opt_copies64.json")
+    assert pick(1, 16).endswith("_opt_copies64.json")
+    assert pick(1, 24).endswith("_opt_copies32.json")
+    for args in ((1, 8), (1, 16), (1, 24), (4, 32)):
+        path = pick(*args)
+        with open(path) as f:
+            table = json.load(f)
+        assert table["slots_per_core"] == 64 + table["extra_slots"]
+        assert len(table["layers"]) == 60

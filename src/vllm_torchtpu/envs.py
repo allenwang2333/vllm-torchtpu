@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_MOE_SINGLE_SORT: bool = True
+    TPU_MOE_LOWTOK: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -586,6 +587,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
+    # Experimental small-batch MoE (kernels/experimental/moe_lowtok) for EP
+    # calls of at most TPU_MOE_LOWTOK_MAX_TOKENS rows; the FP8 method also moves
+    # a plain softmax top-k router into it. Can be tiered with dense expert MoE
+    # when TPU_MOE_DENSE_EXPERT_THRESHOLD > TPU_MOE_LOWTOK_MAX_TOKENS.
+    "TPU_MOE_LOWTOK": env_bool("TPU_MOE_LOWTOK", default=True),
+    "TPU_MOE_LOWTOK_FROM_SCORES": env_bool("TPU_MOE_LOWTOK_FROM_SCORES", default=True),
+    "TPU_MOE_LOWTOK_IDS": env_bool("TPU_MOE_LOWTOK_IDS", default=True),
+    "TPU_MOE_LOWTOK_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MOE_LOWTOK_MAX_TOKENS", 256
+    ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
@@ -661,8 +672,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-gather and reduce-scatter. The transport then overlaps the matmuls;
     # the reduce-scatter it replaces is otherwise fully exposed.
     "USE_MOE_FUSED_EP_KERNEL": env_bool("USE_MOE_FUSED_EP_KERNEL", default=True),
-    # Fused EP kernel implementation. Default "v3" pairs with
-    # TPU_SP_MIN_ROWS=512 so steps >= 512 run SP=1 + Fused EP v3.
+    # Fused EP kernel implementation. Default "v3"
+    # pairs with TPU_MOE_LOWTOK_MAX_TOKENS=256 and TPU_SP_MIN_ROWS=512 so
+    # steps <= 256 run moe_lowtok and steps >= 512 run SP=1 + Fused EP v3.
     "MOE_FUSED_EP_KERNEL_IMPL": env_with_choices(
         "MOE_FUSED_EP_KERNEL_IMPL", "v3", ["v2", "adaptive", "v3"]
     ),

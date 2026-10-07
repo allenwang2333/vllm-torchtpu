@@ -409,6 +409,57 @@ def _expert_block_permutation(ep: int, device) -> torch.Tensor | None:
     return torch.tensor(order, dtype=torch.int32, device=device)
 
 
+def check_kernel_threshold(ep: int, tp: int) -> None:
+    """The fused EP kernel and the few-token kernel meet at one row count, so
+    no step falls to the grouped-matmul path between them. Row counts are per
+    MoE call across the node: the few-token cap is in those units already (a
+    step's rows replicated under tensor parallelism, an engine's rows gathered
+    from every engine under data parallelism). With the few-token kernel off,
+    the grouped-matmul path is the kernel below the fused one by choice."""
+    if not envs.TPU_MOE_LOWTOK:
+        return
+    cap = int(envs.TPU_MOE_LOWTOK_MAX_TOKENS or 0)
+    if cap <= 0:
+        return
+    gate = int(envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS or 0)
+    if tp > 1:
+        from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+        start = _sp.min_rows()
+        # below the sequence-parallel start every rank holds the step's rows;
+        # from it each rank holds at least ceil(start / tp) of them.
+        # Token buckets double at power-of-2 boundaries (e.g. 256 -> 512 where
+        # first_sp_bucket = 1 << (start - 1).bit_length() = 512 -> 64/rank).
+        # When cap < start // 2 (e.g. cap=64 for N<=64 MTP draft steps while
+        # N=96..128 target steps intentionally run fused_moe_gmm + SINGLE_SORT
+        # before SP + fused_moe_ep kicks in at first_sp_bucket), allow the
+        # 3-tier split as long as first_sp_bucket // tp >= gate.
+        first_sp_bucket = 1 << (max(start, 1) - 1).bit_length()
+        meets = gate <= -(-first_sp_bucket // tp)
+        if cap * 2 >= start:
+            rule = (
+                f"the few-token kernel up to {cap} rows, sequence parallelism "
+                f"and the fused EP kernel from {start} rows ({gate} per rank)"
+            )
+        else:
+            rule = (
+                f"the few-token kernel up to {cap} rows, routed grouped-matmul "
+                f"in ({cap}, {start}), and sequence parallelism + fused EP "
+                f"from {start} rows ({gate} per rank)"
+            )
+    else:
+        # an engine's rows below the gate are gathered from all ep engines
+        meets = cap >= ep * max(gate - 1, 0)
+        rule = (f"the few-token kernel up to {cap} rows across the node, the "
+                f"fused EP kernel from {gate} rows per engine "
+                f"({ep * gate} across the node)")
+    if not meets:
+        raise ValueError(
+            "The MoE kernel settings leave steps between the two kernels ("
+            f"{rule}). Set them from one threshold, as the Qwen3.5 recipe's "
+            "MOE_KERNEL_THRESHOLD does.")
+    logger.info_once("MoE kernels: %s.", rule)
+
+
 def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
                           activation: str) -> None:
     """Resolve the mesh and register the fused-EP op, once per process.
@@ -477,6 +528,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
         return
     ep = mesh.shape[EP_AXIS_NAME]
     _EP_SIZE = ep
+    check_kernel_threshold(ep, tp)
 
     w1, w2 = layer.w13_weight, layer.w2_weight
     w1_scale = layer.w13_weight_scale_inv
