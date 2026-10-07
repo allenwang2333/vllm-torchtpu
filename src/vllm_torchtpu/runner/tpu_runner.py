@@ -3724,6 +3724,12 @@ class TPUModelRunner(GPUModelRunner):
                     logits = self.compute_topk_window_from_hidden_states(
                         sample_hidden_states, window_width
                     )
+                if window_width:
+                    logger.info_once(
+                        "TPU_SAMPLER_VOCAB_PARALLEL_TOPK: a verify chunk took "
+                        "the vocab-parallel top-%d windows",
+                        window_width,
+                    )
                 elif sample_hidden_states is None:
                     hidden_states = sequence_layout_planner.finalize_hidden_states(
                         hidden_states,
@@ -6259,10 +6265,11 @@ class TPUModelRunner(GPUModelRunner):
                 if int(P) > self.max_model_len:
                     continue
                 # Greedy and non-greedy (do_sampling=True) verify+sample are
-                # DISTINCT fused programs, so sweep both at every prompt bucket.
-                for greedy in (True, False):
+                # DISTINCT fused programs, so sweep both at every prompt bucket
+                # (and the sparse sampler's top-k-bounded one when it is on).
+                for greedy, top_k in self._spec_warmup_modes():
                     if not self._warmup_one_spec_request(
-                        int(P), idx=i, quiet=True, greedy=greedy
+                        int(P), idx=i, quiet=True, greedy=greedy, top_k=top_k
                     ):
                         # First attempt cold-compiles the draft forward; a
                         # SymInt from that cold compile can leak into the
@@ -6270,7 +6277,9 @@ class TPUModelRunner(GPUModelRunner):
                         # once now that the forward is compiled and returns
                         # concrete-shaped tensors (this attempt logs loudly if it
                         # also fails).
-                        self._warmup_one_spec_request(int(P), idx=i, greedy=greedy)
+                        self._warmup_one_spec_request(
+                            int(P), idx=i, greedy=greedy, top_k=top_k
+                        )
             # (2) The propose+verify+sampling fusions are also keyed on the
             # decode batch size (num_reqs). Only relevant when serving actually
             # batches (>1 concurrent request); sweep real multi-request batches
@@ -6279,11 +6288,25 @@ class TPUModelRunner(GPUModelRunner):
                 P_small = int(self.num_tokens_paddings[0])
                 for R in self.num_reqs_paddings:
                     if int(R) > 1:
-                        self._warmup_spec_batch(int(R), P_small, greedy=True)
-                        self._warmup_spec_batch(int(R), P_small, greedy=False)
+                        for greedy, top_k in self._spec_warmup_modes():
+                            self._warmup_spec_batch(
+                                int(R), P_small, greedy=greedy, top_k=top_k
+                            )
         logger.info("spec-decode warmup compiled %d graphs", self.num_xla_graphs - n0)
 
-    def _warmup_spec_batch(self, R: int, P: int, greedy: bool = True) -> None:
+    def _spec_warmup_modes(self) -> list[tuple[bool, int]]:
+        """(greedy, top_k) of the synthetic spec-warmup requests: greedy and
+        non-greedy, plus non-greedy with top_k = TPU_SAMPLING_TOPK_BOUND when
+        the sparse spec sampler is on, whose verify programs (and the
+        vocab-parallel windows) only such requests reach."""
+        modes = [(True, 0), (False, 0)]
+        if self._sampling_topk_bound > 0:
+            modes.append((False, self._sampling_topk_bound))
+        return modes
+
+    def _warmup_spec_batch(
+        self, R: int, P: int, greedy: bool = True, top_k: int = 0
+    ) -> None:
         """Warm an nr=R decode batch: prefill R synthetic requests then decode
         them together so the multi-request fused programs are compiled.
 
@@ -6313,7 +6336,9 @@ class TPUModelRunner(GPUModelRunner):
             logger.warning("skip spec-decode warmup R=%d: not enough kv blocks", R)
             return
         rids = [f"__spec_warmup_b{R}_{j}__" for j in range(R)]
-        sp = SamplingParams(temperature=0.0 if greedy else 1.0)
+        sp = SamplingParams(
+            temperature=0.0 if greedy else 1.0, **({"top_k": top_k} if top_k else {})
+        )
         logger.info("spec-decode warmup batch: R=%d P=%d greedy=%s", R, P, greedy)
         try:
             # Match the low-block working set used by the LIFO BlockPool
@@ -6380,7 +6405,12 @@ class TPUModelRunner(GPUModelRunner):
             self._warmup_spec_decode_cleanup(rids)
 
     def _warmup_one_spec_request(
-        self, P: int, idx: int, quiet: bool = False, greedy: bool = True
+        self,
+        P: int,
+        idx: int,
+        quiet: bool = False,
+        greedy: bool = True,
+        top_k: int = 0,
     ) -> bool:
         """Run one synthetic spec-decode request (prefill P + decodes).
 
@@ -6426,7 +6456,9 @@ class TPUModelRunner(GPUModelRunner):
             logger.warning("skip spec-decode warmup P=%d: not enough kv blocks", P)
             return
         block_ids = tuple(block_ids_per_group)
-        sp = SamplingParams(temperature=0.0 if greedy else 1.0)
+        sp = SamplingParams(
+            temperature=0.0 if greedy else 1.0, **({"top_k": top_k} if top_k else {})
+        )
         try:
             # ---- prefill ----
             new_req = NewRequestData(
