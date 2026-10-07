@@ -63,7 +63,10 @@ fi
 
 upload_with_priority .buildkite/test_yml/pipeline_wait.yml "$JOB_PRIORITY"
 
-upload_with_priority .buildkite/test_yml/pipeline_start_2.yml "$JOB_PRIORITY"
+# L5: only a level 2 step (uploaded by an uploaded step) fails. pipeline_start_2.yml
+# is left out because its directly uploaded "err" step would fail the block on its own.
+# upload_with_priority .buildkite/test_yml/pipeline_start_2.yml "$JOB_PRIORITY"
+upload_with_priority .buildkite/test_yml/pipeline_nested_upload.yml "$JOB_PRIORITY"
 
 upload_with_priority .buildkite/test_yml/pipeline_start_1.yml "$JOB_PRIORITY"
 
