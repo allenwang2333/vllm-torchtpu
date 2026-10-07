@@ -37,12 +37,20 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-_F8 = jnp.float8_e4m3fn
-_F8_MAX = 448.0
-# Output columns per second-matmul chunk; bounds the live f32 result.
+# Output columns per second-matmul step. Each step computes an f32 block of
+# [tokens, _N_CHUNK] and adds it into the accumulator, so this bounds the live
+# f32 result. It is a compile-time constant: keep it a multiple of 128 (the
+# lane width) that divides the hidden size. Smaller lowers register and VMEM
+# pressure at large token counts and issues more, shorter matmuls.
 _N_CHUNK = 512
-# Weight ring depth. One slot holds the expert whose first matmul is in
-# flight, so depth - 2 transfers run ahead of compute.
+# Upper bound on the weight ring depth. The depth one call uses is picked by
+# _weight_ring_depth: the most slots, at most this and at least 3, whose expert
+# weights fit in half of VMEM. One slot holds the expert whose first matmul is
+# in flight, so depth - 2 weight transfers run ahead of compute. For
+# Qwen3.5-397B at 8 ranks this bound sets the depth with TP experts (6 slots of
+# 1.5 MiB); with EP experts (12 MiB per slot) VMEM caps it at 3. A deeper ring
+# hides more DMA latency when experts are small, but the VMEM it takes lowers
+# the token cap vmem_bytes allows.
 _NUM_BUFFERS = 6
 
 
@@ -53,41 +61,39 @@ _NUM_BUFFERS = 6
 # before the reduce-scatter, so the expert loop hides it. bf16 on the wire,
 # FP32 sum of the slots.
 
-_MESH = pl.DeviceIdType.MESH
-
 
 def _kernel(
     active_ref,
     rank_ref,
     x_ref,
     coeff_ref,
-    sgate_ref,
+    shared_gate_ref,
     w1_hbm,
     w2_hbm,
-    s1_hbm,
-    s2_hbm,
-    w1s_hbm,
-    s1s_hbm,
-    w2s_hbm,
-    s2s_hbm,
+    w1_scale_hbm,
+    w2_scale_hbm,
+    shared_w1_hbm,
+    shared_w1_scale_hbm,
+    shared_w2_hbm,
+    shared_w2_scale_hbm,
     out_ref,
-    w1_ref,
-    w2_ref,
-    s1_ref,
-    s2_ref,
-    w1s_v,
-    s1s_v,
-    w2s_v,
-    s2s_v,
+    w1_ring,
+    w2_ring,
+    w1_scale_ring,
+    w2_scale_ring,
+    shared_w1_vmem,
+    shared_w1_scale_vmem,
+    shared_w2_vmem,
+    shared_w2_scale_vmem,
     xq_ref,
     xs_ref,
-    owner_ref,
-    own_bf,
+    acc_ref,
+    acc_bf16,
     recv,
     red,
     ids_ref,
     sem_ref,
-    ssem,
+    shared_sem,
     rs_send,
     rs_recv,
     ag_send,
@@ -99,28 +105,73 @@ def _kernel(
     experts,
     nb,
     n_ranks,
+    weight_dtype,
 ):
+    """One rank's MoE block. Shapes use m tokens (padded to 16), h hidden, i
+    and i_s the routed and shared intermediate sizes of this rank's slice, E
+    local experts, nb ring slots, n ranks and c = h // n.
+
+    Scalar prefetch (SMEM):
+      active_ref [E] int32: 1 where at least one token routes to local expert e.
+      rank_ref [1] int32: this rank's mesh index.
+    Inputs in VMEM:
+      x_ref [m, h] bf16: hidden states.
+      coeff_ref [m, E padded to 128] f32: route weight of token t for local
+        expert e, 0 where t does not route to e.
+      shared_gate_ref [m, 128] f32: sigmoid(x . w_g) per token, repeated over lanes.
+    Inputs in HBM (weights in `weight_dtype`, scales f32 per output channel):
+      w1_hbm [E, h, 2 i] and w1_scale_hbm [E, 1, 1, 2 i]: gate and up projections.
+      w2_hbm [E, i, h] and w2_scale_hbm [E, 1, 1, h]: down projection.
+      shared_w1_hbm [h, 2 i_s], shared_w1_scale_hbm [1, 2 i_s],
+      shared_w2_hbm [i_s, h], shared_w2_scale_hbm [1, h]: the shared expert.
+    Output:
+      out_ref [m, h] bf16: shared + routed output summed over the n ranks.
+    Scratch:
+      w1_ring [nb, h, 2 i], w2_ring [nb, i, h], w1_scale_ring [nb, 1, 2 i],
+        w2_scale_ring [nb, 1, h]: weight ring, one expert per slot.
+      shared_w1_vmem, shared_w1_scale_vmem, shared_w2_vmem,
+        shared_w2_scale_vmem: the shared expert, loaded once.
+      xq_ref [m, h] weight_dtype: hidden states quantized per row.
+      xs_ref [m, 2 i] f32: their row scales, repeated over columns.
+      acc_ref [m, h] f32: this rank's partial sum.
+      acc_bf16 [m, h] bf16: the same, as the all-reduce source.
+      recv [n, m, c] bf16: reduce-scatter slots, one per sending rank.
+      red [m, c] bf16: this rank's reduced column chunk.
+      ids_ref [E] int32 (SMEM): active expert ids, compacted.
+      sem_ref DMA [nb, 4]: ring slot transfers (w1, w2, w1 scale, w2 scale).
+      shared_sem DMA [4]: shared expert transfers.
+      rs_send DMA [n], rs_recv DMA: reduce-scatter.
+      ag_send DMA [n], ag_recv DMA: all-gather.
+    """
     me = rank_ref[0]
+    qmax = float(jnp.finfo(weight_dtype).max)
     chunk = h // n_ranks
     barrier = pltpu.get_barrier_semaphore()
     for d in range(n_ranks):
         pl.semaphore_signal(
-            barrier, inc=1, device_id=(jnp.int32(d),), device_id_type=_MESH
+            barrier,
+            inc=1,
+            device_id=(jnp.int32(d),),
+            device_id_type=pl.DeviceIdType.MESH,
         )
 
     shared_copies = [
-        pltpu.make_async_copy(w1s_hbm, w1s_v, ssem.at[0]),
-        pltpu.make_async_copy(w2s_hbm, w2s_v, ssem.at[1]),
-        pltpu.make_async_copy(s1s_hbm, s1s_v, ssem.at[2]),
-        pltpu.make_async_copy(s2s_hbm, s2s_v, ssem.at[3]),
+        pltpu.make_async_copy(shared_w1_hbm, shared_w1_vmem, shared_sem.at[0]),
+        pltpu.make_async_copy(shared_w2_hbm, shared_w2_vmem, shared_sem.at[1]),
+        pltpu.make_async_copy(
+            shared_w1_scale_hbm, shared_w1_scale_vmem, shared_sem.at[2]
+        ),
+        pltpu.make_async_copy(
+            shared_w2_scale_hbm, shared_w2_scale_vmem, shared_sem.at[3]
+        ),
     ]
     for copy in shared_copies:
         copy.start()
 
-    owner_ref[...] = jnp.zeros((m, h), jnp.float32)
+    acc_ref[...] = jnp.zeros((m, h), jnp.float32)
     x = x_ref[...].astype(jnp.float32)
-    xsc = jnp.max(jnp.abs(x), axis=1, keepdims=True) / _F8_MAX
-    xq_ref[...] = (x * jnp.where(xsc == 0, 0.0, 1.0 / xsc)).astype(_F8)
+    xsc = jnp.max(jnp.abs(x), axis=1, keepdims=True) / qmax
+    xq_ref[...] = (x * jnp.where(xsc == 0, 0.0, 1.0 / xsc)).astype(weight_dtype)
     xs_ref[...] = jnp.broadcast_to(xsc, (m, 2 * i))
     cols = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
 
@@ -136,30 +187,37 @@ def _kernel(
     def transfers(step):
         e, slot = ids_ref[step], step % nb
         return [
-            pltpu.make_async_copy(w1_hbm.at[e], w1_ref.at[slot], sem_ref.at[slot, 0]),
-            pltpu.make_async_copy(w2_hbm.at[e], w2_ref.at[slot], sem_ref.at[slot, 1]),
+            pltpu.make_async_copy(w1_hbm.at[e], w1_ring.at[slot], sem_ref.at[slot, 0]),
+            pltpu.make_async_copy(w2_hbm.at[e], w2_ring.at[slot], sem_ref.at[slot, 1]),
             pltpu.make_async_copy(
-                s1_hbm.at[e, 0], s1_ref.at[slot], sem_ref.at[slot, 2]
+                w1_scale_hbm.at[e, 0], w1_scale_ring.at[slot], sem_ref.at[slot, 2]
             ),
             pltpu.make_async_copy(
-                s2_hbm.at[e, 0], s2_ref.at[slot], sem_ref.at[slot, 3]
+                w2_scale_hbm.at[e, 0], w2_scale_ring.at[slot], sem_ref.at[slot, 3]
             ),
         ]
 
-    def accumulate(acc1, coeff, s1, w2, s2):
+    def accumulate(acc1, coeff, w1_scale, w2, w2_scale):
+        """Finish one expert from its first-matmul result acc1 [m, 2 width]:
+        dequantize, SiLU(gate) * up weighted by coeff [m, 1], quantize per row,
+        and add the second matmul with w2 [width, h] into acc_ref."""
         width = acc1.shape[1] // 2  # the routed or the shared intermediate size
-        acc1 = acc1 * xs_ref[:, : 2 * width] * s1
+        acc1 = acc1 * xs_ref[:, : 2 * width] * w1_scale
         mid = jnp.where(
             coeff != 0, jax.nn.silu(acc1[:, :width]) * acc1[:, width:] * coeff, 0.0
         )
-        ms = jnp.max(jnp.abs(mid), axis=1, keepdims=True) / _F8_MAX
-        mq = (mid * jnp.where(ms == 0, 0.0, 1.0 / ms)).astype(_F8)
+        ms = jnp.max(jnp.abs(mid), axis=1, keepdims=True) / qmax
+        mq = (mid * jnp.where(ms == 0, 0.0, 1.0 / ms)).astype(weight_dtype)
         for n in range(0, h, _N_CHUNK):
             acc2 = jnp.matmul(
                 mq, w2[:, n : n + _N_CHUNK], preferred_element_type=jnp.float32
             )
-            owner_ref[:, n : n + _N_CHUNK] += acc2 * s2[:, n : n + _N_CHUNK] * ms
+            acc_ref[:, n : n + _N_CHUNK] += acc2 * w2_scale[:, n : n + _N_CHUNK] * ms
 
+    # Prime the weight ring: start the weight transfers of the first
+    # min(count, nb) active experts into slots 0 .. nb - 1 now, so they stream
+    # from HBM while the shared expert below computes. The expert loop then
+    # waits on slot step % nb and refills it with expert step + nb.
     @pl.when(count > 0)
     def prime_routed():
         for initial in range(nb):
@@ -172,13 +230,15 @@ def _kernel(
     # Shared expert first; its slabs were issued at entry with the routed primes.
     for copy in shared_copies:
         copy.wait()
-    shared_coeff = jnp.max(sgate_ref[...], axis=1, keepdims=True)
+    shared_coeff = jnp.max(shared_gate_ref[...], axis=1, keepdims=True)
     accumulate(
-        jnp.matmul(xq_ref[...], w1s_v[...], preferred_element_type=jnp.float32),
+        jnp.matmul(
+            xq_ref[...], shared_w1_vmem[...], preferred_element_type=jnp.float32
+        ),
         shared_coeff,
-        s1s_v[...],
-        w2s_v,
-        s2s_v[...],
+        shared_w1_scale_vmem[...],
+        shared_w2_vmem,
+        shared_w2_scale_vmem[...],
     )
 
     @pl.when(count > 0)
@@ -195,14 +255,16 @@ def _kernel(
                     copy.wait()
 
             acc1_next = jnp.matmul(
-                xq_ref[...], w1_ref[nxt % nb], preferred_element_type=jnp.float32
+                xq_ref[...], w1_ring[nxt % nb], preferred_element_type=jnp.float32
             )
             slot = step % nb
             e = ids_ref[step]
             coeff = jnp.sum(
                 jnp.where(cols == e, coeff_ref[...], 0.0), axis=1, keepdims=True
             )
-            accumulate(acc1, coeff, s1_ref[slot], w2_ref.at[slot], s2_ref[slot])
+            accumulate(
+                acc1, coeff, w1_scale_ring[slot], w2_ring.at[slot], w2_scale_ring[slot]
+            )
 
             @pl.when(step + nb < count)
             def refill():
@@ -215,21 +277,21 @@ def _kernel(
             0,
             count,
             expert_body,
-            jnp.matmul(xq_ref[...], w1_ref[0], preferred_element_type=jnp.float32),
+            jnp.matmul(xq_ref[...], w1_ring[0], preferred_element_type=jnp.float32),
         )
 
     # All-reduce: reduce-scatter column chunks, sum, all-gather.
-    own_bf[...] = owner_ref[...].astype(own_bf.dtype)
+    acc_bf16[...] = acc_ref[...].astype(acc_bf16.dtype)
     # Every peer has entered this call, so its receive buffer is live.
     pl.semaphore_wait(barrier, n_ranks)
     scatter = [
         pltpu.make_async_remote_copy(
-            own_bf.at[:, pl.ds(d * chunk, chunk)],
+            acc_bf16.at[:, pl.ds(d * chunk, chunk)],
             recv.at[me],
             rs_send.at[d],
             rs_recv,
             device_id=(jnp.int32(d),),
-            device_id_type=_MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
         for d in range(n_ranks)
     ]
@@ -250,7 +312,7 @@ def _kernel(
             ag_send.at[d],
             ag_recv,
             device_id=(jnp.int32(d),),
-            device_id_type=_MESH,
+            device_id_type=pl.DeviceIdType.MESH,
         )
         for d in range(n_ranks)
     ]
@@ -261,28 +323,28 @@ def _kernel(
         copy.wait_send()
 
 
-def _weight_ring_depth(h, i):
+def _weight_ring_depth(h, i, weight_dtype):
     """Deepest weight ring (at most _NUM_BUFFERS slots, at least 3) whose slots
-    fit in half of VMEM; one slot holds an expert's w13 and w2 in FP8."""
-    slot = 3 * h * i * jnp.dtype(_F8).itemsize
+    fit in half of VMEM; one slot holds an expert's w1 and w2."""
+    slot = 3 * h * i * jnp.dtype(weight_dtype).itemsize
     fit = pltpu.get_tpu_info().vmem_capacity_bytes // 2 // slot
     return max(3, min(_NUM_BUFFERS, fit))
 
 
-def vmem_bytes(tokens, h, i, i_s, experts, n_ranks):
+def vmem_bytes(tokens, h, i, i_s, experts, n_ranks, weight_dtype):
     """VMEM the call declares for `tokens` rows: its VMEM operands, output and
     scratch (compiler temporaries excluded). The weight ring takes about half
     of VMEM, so the token-proportional buffers bound the rows one call takes."""
     m = tokens + (-tokens) % 16
-    f8, f32, bf16 = 1, 4, 2
-    ring = _weight_ring_depth(h, i) * (3 * h * i * f8 + (2 * i + h) * f32)
-    shared = 3 * h * i_s * f8 + (2 * i_s + h) * f32
+    wt, f32, bf16 = jnp.dtype(weight_dtype).itemsize, 4, 2
+    ring = _weight_ring_depth(h, i, weight_dtype) * (3 * h * i * wt + (2 * i + h) * f32)
+    shared = 3 * h * i_s * wt + (2 * i_s + h) * f32
     rows = m * (
         h * bf16  # hidden
         + (experts + (-experts) % 128) * f32  # coeff
         + 128 * f32  # shared gate
         + h * bf16  # output
-        + h * f8  # quantized hidden
+        + h * wt  # quantized hidden
         + 2 * i * f32  # row scales, broadcast
         + h * f32  # accumulator
         + h * bf16  # accumulator in bf16, the all-reduce source
@@ -297,13 +359,13 @@ def fused_moe_decode(
     hidden,
     w1,
     w2,
-    s1,
-    s2,
-    w1s,
-    s1s,
-    w2s,
-    s2s,
-    wg,
+    w1_scale,
+    w2_scale,
+    shared_w1,
+    shared_w1_scale,
+    shared_w2,
+    shared_w2_scale,
+    shared_gate_weight,
     topk_weights,
     topk_ids,
     *,
@@ -313,16 +375,34 @@ def fused_moe_decode(
     """Per-rank body; call inside shard_map over the TP mesh.
 
     Returns the TP-all-reduced (shared + routed) MoE output, BF16 [tokens,
-    hidden], identical on every rank. `rank` is this rank's mesh index as an
-    int32 array of one element (partition-id cannot be exported through
-    torch_tpu). w1s [H, 2 i_s] / w2s [i_s, H] FP8 with s1s [1, 2 i_s] / s2s
-    [1, H] FP32 are this rank's shared-expert slice (i_s <= i); wg [H, 1] is
-    the replicated shared_expert_gate.
+    hidden], identical on every rank.
 
-    With expert parallelism the rank holds experts [expert_start,
-    expert_start + E) of the global routing (topk_ids are global); routes to
-    other ranks' experts contribute nothing here and are summed in by the
-    all-reduce.
+    Args:
+      rank: this rank's mesh index, an int32 array of one element
+        (partition-id cannot be exported through torch_tpu).
+      hidden: [tokens, H] BF16 hidden states, the same on every rank.
+      w1: [E, H, 2 i] this rank's gate and up projections of its E experts,
+        concatenated on the last axis; i is the rank's intermediate slice.
+      w2: [E, i, H] the down projections.
+      w1_scale: [E, 1, 1, 2 i] FP32 per-output-channel scales of w1.
+      w2_scale: [E, 1, 1, H] FP32 per-output-channel scales of w2.
+      shared_w1: [H, 2 i_s] the shared expert's gate and up slice (i_s <= i).
+      shared_w1_scale: [1, 2 i_s] FP32 scales of shared_w1.
+      shared_w2: [i_s, H] the shared expert's down slice.
+      shared_w2_scale: [1, H] FP32 scales of shared_w2.
+      shared_gate_weight: [H, 1] the replicated shared_expert_gate; the shared
+        expert's output is scaled by sigmoid(hidden @ shared_gate_weight).
+      topk_weights: [tokens, k] route weights from the caller's router.
+      topk_ids: [tokens, k] int32 expert ids of those routes.
+      n_ranks: ranks in the mesh, the all-reduce width.
+      expert_start: with expert parallelism, the global id of this rank's
+        first expert; the rank holds experts [expert_start, expert_start + E)
+        and topk_ids are global. Routes to other ranks' experts contribute
+        nothing here and are summed in by the all-reduce. None for TP experts.
+
+    The weights' dtype (FP8 in production) is also the dtype the kernel
+    quantizes the hidden states and the activated intermediate to, so both
+    matmuls run in it with FP32 accumulation.
     """
     tokens, h = hidden.shape
     experts, i, _ = w2.shape
@@ -343,15 +423,27 @@ def fused_moe_decode(
     active = jnp.any(coeff != 0, axis=0).astype(jnp.int32)
     coeff = jnp.pad(coeff, ((0, 0), (0, (-experts) % 128)))
     shared_gate = jax.nn.sigmoid(
-        jnp.dot(hidden, wg.astype(hidden.dtype), preferred_element_type=jnp.float32)
+        jnp.dot(
+            hidden,
+            shared_gate_weight.astype(hidden.dtype),
+            preferred_element_type=jnp.float32,
+        )
     )
     shared_gate = jnp.broadcast_to(shared_gate, (m, 128))
-    i_s = w2s.shape[0]
-    nb = _weight_ring_depth(h, i)
+    i_s = shared_w2.shape[0]
+    weight_dtype = w1.dtype
+    nb = _weight_ring_depth(h, i, weight_dtype)
     chunk = h // n_ranks
     out = pl.pallas_call(
         functools.partial(
-            _kernel, m=m, h=h, i=i, experts=experts, nb=nb, n_ranks=n_ranks
+            _kernel,
+            m=m,
+            h=h,
+            i=i,
+            experts=experts,
+            nb=nb,
+            n_ranks=n_ranks,
+            weight_dtype=weight_dtype,
         ),
         out_shape=jax.ShapeDtypeStruct((m, h), hidden.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -360,15 +452,15 @@ def fused_moe_decode(
             + [pl.BlockSpec(memory_space=pltpu.HBM)] * 8,
             out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
             scratch_shapes=[
-                pltpu.VMEM((nb, h, 2 * i), _F8),
-                pltpu.VMEM((nb, i, h), _F8),
+                pltpu.VMEM((nb, h, 2 * i), weight_dtype),
+                pltpu.VMEM((nb, i, h), weight_dtype),
                 pltpu.VMEM((nb, 1, 2 * i), jnp.float32),
                 pltpu.VMEM((nb, 1, h), jnp.float32),
-                pltpu.VMEM((h, 2 * i_s), _F8),
+                pltpu.VMEM((h, 2 * i_s), weight_dtype),
                 pltpu.VMEM((1, 2 * i_s), jnp.float32),
-                pltpu.VMEM((i_s, h), _F8),
+                pltpu.VMEM((i_s, h), weight_dtype),
                 pltpu.VMEM((1, h), jnp.float32),
-                pltpu.VMEM((m, h), _F8),
+                pltpu.VMEM((m, h), weight_dtype),
                 pltpu.VMEM((m, 2 * i), jnp.float32),
                 pltpu.VMEM((m, h), jnp.float32),
                 pltpu.VMEM((m, h), hidden.dtype),
@@ -396,11 +488,11 @@ def fused_moe_decode(
         shared_gate,
         w1,
         w2,
-        s1,
-        s2,
-        w1s,
-        s1s,
-        w2s,
-        s2s,
+        w1_scale,
+        w2_scale,
+        shared_w1,
+        shared_w1_scale,
+        shared_w2,
+        shared_w2_scale,
     )
     return out[:tokens] if pad else out

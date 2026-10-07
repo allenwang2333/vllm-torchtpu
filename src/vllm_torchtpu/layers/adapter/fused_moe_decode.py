@@ -75,15 +75,31 @@ def fused_moe_decode_supported(quant_method: Any) -> bool:
     return getattr(quant_method, FUSED_MOE_DECODE_OP_ATTR, None) is not None
 
 
-def _gmm_layer(x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, start, *, topk):
+def _gmm_layer(
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    shared_w1,
+    shared_w1_scale,
+    shared_w2,
+    shared_w2_scale,
+    shared_gate_weight,
+    tw,
+    ti,
+    start,
+    *,
+    topk,
+):
     """Above the cap: the layer as the runner computes it with the kernel off,
     shared expert + routed GMM MoE, all-reduced. Per rank, inside shard_map."""
     routed = fused_moe_func(
         x,
         w1,
         w2,
-        s1,
-        s2,
+        w1_scale,
+        w2_scale,
         None,
         None,
         tw,
@@ -99,12 +115,17 @@ def _gmm_layer(x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, start, *, topk
     )
     # Qwen2MoeMLP.forward: FP8 gate_up / down linears, SiluAndMul, and the
     # sigmoid of the replicated expert_gate linear.
-    i_s = w2s.shape[0]
-    gate_up = _quantized_matmul_jax(x, w1s, s1s.reshape(-1))
+    i_s = shared_w2.shape[0]
+    gate_up = _quantized_matmul_jax(x, shared_w1, shared_w1_scale.reshape(-1))
     shared = _quantized_matmul_jax(
-        jax.nn.silu(gate_up[:, :i_s]) * gate_up[:, i_s:], w2s, s2s.reshape(-1)
+        jax.nn.silu(gate_up[:, :i_s]) * gate_up[:, i_s:],
+        shared_w2,
+        shared_w2_scale.reshape(-1),
     )
-    shared = jax.nn.sigmoid(jnp.dot(x, wg.reshape(-1, 1).astype(x.dtype))) * shared
+    shared = (
+        jax.nn.sigmoid(jnp.dot(x, shared_gate_weight.reshape(-1, 1).astype(x.dtype)))
+        * shared
+    )
     return jax.lax.psum(shared + routed, EP_AXIS_NAME)
 
 
@@ -113,13 +134,13 @@ def _layer(
     x,
     w1,
     w2,
-    s1,
-    s2,
-    w1s,
-    s1s,
-    w2s,
-    s2s,
-    wg,
+    w1_scale,
+    w2_scale,
+    shared_w1,
+    shared_w1_scale,
+    shared_w2,
+    shared_w2_scale,
+    shared_gate_weight,
     tw,
     ti,
     *,
@@ -132,7 +153,20 @@ def _layer(
     start = rank[0, 1] if expert_parallel else None
     if x.shape[0] > max_tokens:
         return _gmm_layer(
-            x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, start, topk=topk
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            shared_w1,
+            shared_w1_scale,
+            shared_w2,
+            shared_w2_scale,
+            shared_gate_weight,
+            tw,
+            ti,
+            start,
+            topk=topk,
         )
     # Trace-time, once per token bucket: the evidence that the kernel serves
     # this shape.
@@ -142,13 +176,13 @@ def _layer(
         x,
         w1,
         w2,
-        s1,
-        s2,
-        w1s,
-        s1s.reshape(1, -1),
-        w2s,
-        s2s.reshape(1, -1),
-        wg.reshape(-1, 1),
+        w1_scale,
+        w2_scale,
+        shared_w1,
+        shared_w1_scale.reshape(1, -1),
+        shared_w2,
+        shared_w2_scale.reshape(1, -1),
+        shared_gate_weight.reshape(-1, 1),
         tw,
         ti,
         n_ranks=n_ranks,
@@ -176,13 +210,13 @@ def _build_op(mesh, n_ranks: int, topk: int, expert_parallel: bool, max_tokens: 
         x: jax.Array,
         w1: jax.Array,
         w2: jax.Array,
-        s1: jax.Array,
-        s2: jax.Array,
-        w1s: jax.Array,
-        s1s: jax.Array,
-        w2s: jax.Array,
-        s2s: jax.Array,
-        wg: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        shared_w1: jax.Array,
+        shared_w1_scale: jax.Array,
+        shared_w2: jax.Array,
+        shared_w2_scale: jax.Array,
+        shared_gate_weight: jax.Array,
         tw: jax.Array,
         ti: jax.Array,
         rank: jax.Array,
@@ -195,7 +229,19 @@ def _build_op(mesh, n_ranks: int, topk: int, expert_parallel: bool, max_tokens: 
             check_vma=False,
         )
         return body(
-            x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti.astype(jnp.int32), rank
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            shared_w1,
+            shared_w1_scale,
+            shared_w2,
+            shared_w2_scale,
+            shared_gate_weight,
+            tw,
+            ti.astype(jnp.int32),
+            rank,
         )
 
     name = "pallas::fused_moe_decode" + (f"_{len(_OPS)}" if _OPS else "")
@@ -226,21 +272,47 @@ def _shared_slice(runner) -> tuple | None:
     gate = getattr(mlp, "expert_gate", None)
     if gate_up is None or down is None or gate is None:
         return None
-    w1s, s1s = getattr(gate_up, "weight", None), getattr(gate_up, "weight_scale", None)
-    w2s, s2s = getattr(down, "weight", None), getattr(down, "weight_scale", None)
-    wg = getattr(gate, "weight", None)
-    if w1s is None or s1s is None or w2s is None or s2s is None or wg is None:
+    shared_w1, shared_w1_scale = (
+        getattr(gate_up, "weight", None),
+        getattr(gate_up, "weight_scale", None),
+    )
+    shared_w2, shared_w2_scale = (
+        getattr(down, "weight", None),
+        getattr(down, "weight_scale", None),
+    )
+    shared_gate_weight = getattr(gate, "weight", None)
+    if (
+        shared_w1 is None
+        or shared_w1_scale is None
+        or shared_w2 is None
+        or shared_w2_scale is None
+        or shared_gate_weight is None
+    ):
         return None
     # Per-channel FP8 linears are stored K-major ([in, out]) with a 1-D scale.
-    if s1s.dim() != 1 or s2s.dim() != 1 or w1s.dtype != torch.float8_e4m3fn:
+    if (
+        shared_w1_scale.dim() != 1
+        or shared_w2_scale.dim() != 1
+        or shared_w1.dtype != torch.float8_e4m3fn
+    ):
         return None
-    if getattr(gate, "bias", None) is not None or wg.dim() != 2 or wg.shape[0] != 1:
+    if (
+        getattr(gate, "bias", None) is not None
+        or shared_gate_weight.dim() != 2
+        or shared_gate_weight.shape[0] != 1
+    ):
         return None
     # Hand over the parameters themselves, never torch views of them: a view
     # passed to the op is re-materialized by an eager as_strided program on
     # every call (measured: one per layer per step, ~48 us of host dispatch
     # each). The kernel's [1, N] / [H, 1] shapes are made inside the program.
-    return (w1s.data, s1s.data, w2s.data, s2s.data, wg.data)
+    return (
+        shared_w1.data,
+        shared_w1_scale.data,
+        shared_w2.data,
+        shared_w2_scale.data,
+        shared_gate_weight.data,
+    )
 
 
 def _admit(runner, n_ranks: int) -> tuple[tuple, bool] | None:
@@ -281,23 +353,23 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool] | None:
     shared = _shared_slice(runner)
     if shared is None:
         return None
-    w1s, _, w2s, _, wg = shared
+    shared_w1, _, shared_w2, _, shared_gate_weight = shared
     w1, w2 = layer.w13_weight, layer.w2_weight
-    s1, s2 = layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
+    w1_scale, w2_scale = layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
     e, h, two_i = w1.shape
     i = two_i // 2
-    i_s = w2s.shape[0]  # the shared expert is a TP slice, even under EP
+    i_s = shared_w2.shape[0]  # the shared expert is a TP slice, even under EP
     if (
         w1.dtype != torch.float8_e4m3fn
         or tuple(w2.shape) != (e, i, h)
-        or tuple(s1.shape) != (e, 1, 1, two_i)
-        or tuple(s2.shape) != (e, 1, 1, h)
+        or tuple(w1_scale.shape) != (e, 1, 1, two_i)
+        or tuple(w2_scale.shape) != (e, 1, 1, h)
         or i % 128
         or h % (n_ranks * 128)
         or i_s % 128
         or i_s > i
-        or tuple(w1s.shape) != (h, 2 * i_s)
-        or wg.numel() != h
+        or tuple(shared_w1.shape) != (h, 2 * i_s)
+        or shared_gate_weight.numel() != h
     ):
         return None
     return shared, expert_parallel
@@ -307,7 +379,8 @@ def _check_vmem(max_tokens: int, layer, i_s: int, n_ranks: int) -> None:
     """Refuse a token cap the kernel cannot be built for, at arming rather than
     as a Mosaic VMEM error when the first bucket above it compiles."""
     e, h, two_i = layer.w13_weight.shape
-    need = vmem_bytes(max_tokens, h, two_i // 2, i_s, e, n_ranks)
+    weight_dtype = jnp.dtype(str(layer.w13_weight.dtype).removeprefix("torch."))
+    need = vmem_bytes(max_tokens, h, two_i // 2, i_s, e, n_ranks, weight_dtype)
     have = pltpu.get_tpu_info().vmem_capacity_bytes
     if need > have:
         raise ValueError(
@@ -403,7 +476,9 @@ def fused_moe_decode(
     runs the GMM MoE path (with its own all-reduce), so an armed layer always
     returns the reduced sum.
     """
-    w1s, s1s, w2s, s2s, wg = (getattr(layer, name) for name in _SHARED_BUFFERS)
+    shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_gate_weight = (
+        getattr(layer, name) for name in _SHARED_BUFFERS
+    )
     op = getattr(quant_method, FUSED_MOE_DECODE_OP_ATTR)
     return op(
         x,
@@ -411,11 +486,11 @@ def fused_moe_decode(
         layer.w2_weight,
         layer.w13_weight_scale_inv,
         layer.w2_weight_scale_inv,
-        w1s,
-        s1s,
-        w2s,
-        s2s,
-        wg,
+        shared_w1,
+        shared_w1_scale,
+        shared_w2,
+        shared_w2_scale,
+        shared_gate_weight,
         topk_weights,
         topk_ids,
         _RANK_BUFFER,

@@ -39,67 +39,114 @@ def setup():
             s = jnp.max(jnp.abs(w), axis=axis, keepdims=True) / 448.0
             return (w / s).astype(F8), s
 
-        w1, s1 = q(jax.random.normal(ks[0], (E, H, 2 * INTER)) * 0.02, 1)
-        w2, s2 = q(jax.random.normal(ks[1], (E, INTER, H)) * 0.02, 1)
-        w1s, s1s = q(jax.random.normal(ks[2], (H, 2 * INTER_S)) * 0.02, 0)
-        w2s, s2s = q(jax.random.normal(ks[3], (INTER_S, H)) * 0.02, 0)
-        return w1, w2, s1[:, :, None, :], s2[:, :, None, :], w1s, s1s, w2s, s2s
+        w1, w1_scale = q(jax.random.normal(ks[0], (E, H, 2 * INTER)) * 0.02, 1)
+        w2, w2_scale = q(jax.random.normal(ks[1], (E, INTER, H)) * 0.02, 1)
+        shared_w1, shared_w1_scale = q(
+            jax.random.normal(ks[2], (H, 2 * INTER_S)) * 0.02, 0
+        )
+        shared_w2, shared_w2_scale = q(jax.random.normal(ks[3], (INTER_S, H)) * 0.02, 0)
+        return (
+            w1,
+            w2,
+            w1_scale[:, :, None, :],
+            w2_scale[:, :, None, :],
+            shared_w1,
+            shared_w1_scale,
+            shared_w2,
+            shared_w2_scale,
+        )
 
     weights = jax.jit(
         jax.shard_map(
             gen, mesh=mesh, in_specs=P("d"), out_specs=P("d"), check_vma=False
         )
     )(rank)
-    wg = jax.device_put(
+    shared_gate_weight = jax.device_put(
         jnp.asarray(np.random.default_rng(1).normal(size=(H, 1)) * 0.02, jnp.bfloat16),
         NamedSharding(mesh, P()),
     )
-    return mesh, sh, rank, weights, wg
+    return mesh, sh, rank, weights, shared_gate_weight
 
 
-def _ffn(x, w1, s1, w2, s2):
+def _ffn(x, w1, w1_scale, w2, w2_scale):
     i = w2.shape[0]
-    gu = jnp.dot(x, w1.astype(jnp.float32) * s1)
-    return jnp.dot(jax.nn.silu(gu[:, :i]) * gu[:, i:], w2.astype(jnp.float32) * s2)
+    gu = jnp.dot(x, w1.astype(jnp.float32) * w1_scale)
+    return jnp.dot(
+        jax.nn.silu(gu[:, :i]) * gu[:, i:], w2.astype(jnp.float32) * w2_scale
+    )
 
 
-def _routed(x, w1, w2, s1, s2, tw, ti, *, skip_expert=None):
+def _routed(x, w1, w2, w1_scale, w2_scale, tw, ti, *, skip_expert=None):
     out = jnp.zeros((x.shape[0], H), jnp.float32)
     for e in range(E):
         coeff = jnp.sum(
             jnp.where(ti == e, tw.astype(jnp.float32), 0.0), 1, keepdims=True
         )
         if e != skip_expert:
-            out = out + coeff * _ffn(x, w1[e], s1[e, 0], w2[e], s2[e, 0])
+            out = out + coeff * _ffn(x, w1[e], w1_scale[e, 0], w2[e], w2_scale[e, 0])
     return out
 
 
 def _reference(
-    rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, skip_expert=None, ep=False
+    rank,
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    shared_w1,
+    shared_w1_scale,
+    shared_w2,
+    shared_w2_scale,
+    shared_gate_weight,
+    tw,
+    ti,
+    skip_expert=None,
+    ep=False,
 ):
     """The decomposed layer in f32: routed experts + gated shared expert + psum."""
     if ep:
         ti = ti - rank.reshape(()) * E
     xf = x.astype(jnp.float32)
-    shared = _ffn(xf, w1s, s1s, w2s, s2s)
-    shared = jax.nn.sigmoid(jnp.dot(x, wg, preferred_element_type=jnp.float32)) * shared
-    routed = _routed(xf, w1, w2, s1, s2, tw, ti, skip_expert=skip_expert)
+    shared = _ffn(xf, shared_w1, shared_w1_scale, shared_w2, shared_w2_scale)
+    shared = (
+        jax.nn.sigmoid(
+            jnp.dot(x, shared_gate_weight, preferred_element_type=jnp.float32)
+        )
+        * shared
+    )
+    routed = _routed(xf, w1, w2, w1_scale, w2_scale, tw, ti, skip_expert=skip_expert)
     return jax.lax.psum(routed + shared, "d").astype(x.dtype)
 
 
-def _fused(rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, ep=False):
+def _fused(
+    rank,
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    shared_w1,
+    shared_w1_scale,
+    shared_w2,
+    shared_w2_scale,
+    shared_gate_weight,
+    tw,
+    ti,
+    ep=False,
+):
     return fused_moe_decode(
         rank.reshape(-1),
         x,
         w1,
         w2,
-        s1,
-        s2,
-        w1s,
-        s1s,
-        w2s,
-        s2s,
-        wg,
+        w1_scale,
+        w2_scale,
+        shared_w1,
+        shared_w1_scale,
+        shared_w2,
+        shared_w2_scale,
+        shared_gate_weight,
         tw,
         ti,
         n_ranks=N,
@@ -107,7 +154,22 @@ def _fused(rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, ep=False):
     )
 
 
-def _fallback(rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, ep=False):
+def _fallback(
+    rank,
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    shared_w1,
+    shared_w1_scale,
+    shared_w2,
+    shared_w2_scale,
+    shared_gate_weight,
+    tw,
+    ti,
+    ep=False,
+):
     """The adapter's per-rank body with every token count above its cap: the GMM
     MoE + shared expert + psum path that replaces the kernel above it."""
     return adapter._layer(
@@ -115,13 +177,13 @@ def _fallback(rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, ep=False)
         x,
         w1,
         w2,
-        s1,
-        s2,
-        w1s,
-        s1s,
-        w2s,
-        s2s,
-        wg,
+        w1_scale,
+        w2_scale,
+        shared_w1,
+        shared_w1_scale,
+        shared_w2,
+        shared_w2_scale,
+        shared_gate_weight,
         tw,
         ti,
         n_ranks=N,
@@ -138,7 +200,7 @@ def _fallback(rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, ep=False)
 def test_matches_decomposed_layer(setup, m, padded, ep, path):
     if path == "gmm_fallback" and (m != 32 or padded):
         pytest.skip("one fallback case per mode")
-    mesh, sh, rank, weights, wg = setup
+    mesh, sh, rank, weights, shared_gate_weight = setup
     rng = np.random.default_rng(m)
     x = rng.normal(size=(m, H)).astype(np.float32)
     n_global = N * E if ep else E
@@ -152,7 +214,7 @@ def test_matches_decomposed_layer(setup, m, padded, ep, path):
         rank,
         jax.device_put(jnp.tile(jnp.asarray(x, jnp.bfloat16), (N, 1)), sh),
         *weights,
-        wg,
+        shared_gate_weight,
         jax.device_put(jnp.tile(jnp.asarray(tw, jnp.bfloat16), (N, 1)), sh),
         jax.device_put(jnp.tile(jnp.asarray(ids), (N, 1)), sh),
     )
@@ -193,7 +255,7 @@ def test_vmem_bound_matches_build_limits():
     from jax.experimental.pallas import tpu as pltpu
 
     have = pltpu.get_tpu_info().vmem_capacity_bytes
-    assert vmem_bytes(512, 4096, 128, 128, 512, 8) <= have
-    assert vmem_bytes(1024, 4096, 128, 128, 512, 8) > have
-    assert vmem_bytes(256, 4096, 1024, 128, 64, 8) <= have
-    assert vmem_bytes(512, 4096, 1024, 128, 64, 8) > have
+    assert vmem_bytes(512, 4096, 128, 128, 512, 8, jnp.float8_e4m3fn) <= have
+    assert vmem_bytes(1024, 4096, 128, 128, 512, 8, jnp.float8_e4m3fn) > have
+    assert vmem_bytes(256, 4096, 1024, 128, 64, 8, jnp.float8_e4m3fn) <= have
+    assert vmem_bytes(512, 4096, 1024, 128, 64, 8, jnp.float8_e4m3fn) > have
