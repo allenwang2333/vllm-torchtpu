@@ -51,8 +51,8 @@ Use it when all of these hold:
 - Decode or other small batches: up to a few hundred tokens per step. Above
   that, prefill-style kernels win.
 - Attention is TP. Every rank sees every token, and the MoE output is
-  all-reduced.
-- The MoE is TP-sharded, or EP with `ep_size == mesh size` and DP 1.
+  all-reduced. (DP attention: see below.)
+- The MoE is TP-sharded, or EP with `ep_size == mesh size`.
 - Weights are FP8 with per-channel scales, the activation is SiLU, and there
   are no expert biases.
 - The shared expert has a sigmoid gate, `routed_scaling_factor` is 1, and there
@@ -63,12 +63,21 @@ Use it when all of these hold:
 
 Do not use it for:
 
-- DP attention, where each rank owns different tokens.
 - Experts too large to hold whole in a VMEM slot. GLM-5.2 EP is one example.
 - Prefill-sized steps.
 
 The adapter declines a layer that fails these checks, and that layer keeps the
 GMM path.
+
+### DP attention
+
+The kernel can serve DP attention, where each rank owns different tokens. The
+caller all-gathers the tokens and their routing before the call, so the kernel
+sees the global batch, and keeps only its own rows of the output. The token cap
+then counts global tokens, not tokens per rank.
+
+The serving adapter does not support DP attention yet; that is TBD. Today it
+arms only with TP attention (DP 1).
 
 ## Design
 
