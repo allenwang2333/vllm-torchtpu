@@ -19,6 +19,12 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.experimental.fused_unpermute_gmm import (
+    ragged_dma_reduce,
+)
+from vllm_torchtpu.kernels.experimental.fused_unpermute_gmm import (
+    wrapper as fused_permute,
+)
 from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
@@ -51,12 +57,6 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
     token_block_alignment,
-)
-from vllm_torchtpu.kernels.experimental.fused_unpermute_gmm import (
-    ragged_dma_reduce,
-)
-from vllm_torchtpu.kernels.experimental.fused_unpermute_gmm import (
-    wrapper as fused_permute,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 from vllm_torchtpu.logger import init_logger
