@@ -61,7 +61,27 @@ def apply(case: Case, data: Data) -> Data:
     return data
 
 
+def _second_custom(data: Data) -> None:
+    data["tasks"]["custom"].append(dict(data["tasks"]["custom"][0]))
+
+
+def _agentx_with_custom(data: Data) -> None:
+    data["tasks"]["custom"] = [{"name": "probe", "command": ["true"], "timeout": 60}]
+
+
+MNS = "server.args.max-num-seqs"
+MML = "server.args.max-model-len"
+CAP = "tasks.agentx.env.AIPERF_MAX_CONTEXT_LENGTH"
+IDENTITY = {
+    "model_prefix": "glm",
+    "precision": "fp8",
+    "framework": "vllm",
+    "spec_decoding": "none",
+    "kv_offloading": "none",
+}
 LM = "tasks.eval.lm_eval"
+IX = "tasks.eval"
+CELLS = "tasks.perf.cells"
 CUSTOM_ENV = "tasks.custom[0].env"
 
 CASES = [
@@ -200,6 +220,14 @@ CASES = [
         "CONC is set by the tool from tasks.agentx.concurrency; remove it",
     ),
     Case(
+        "V-11",
+        "ix_eval",
+        {f"{IX}.env.EVAL_FRAMEWORK": "kimi-vendor"},
+        f"{IX}.env.EVAL_FRAMEWORK",
+        "EVAL_FRAMEWORK is set by the tool from tasks.eval.framework, which it "
+        "would override; remove it",
+    ),
+    Case(
         "V-12",
         "single",
         {"server.env.VLLM_ENGINE_READY_TIMEOUT_S": "1800"},
@@ -271,6 +299,389 @@ CASES = [
         "server.args.data-parallel-size",
         "multihost mp needs data-parallel-size divisible by 2 hosts; got 15",
     ),
+    Case(
+        "V-18",
+        "single",
+        {CELLS: [{"isl": 1, "osl": 1, "concurrency": 1}]},
+        CELLS,
+        "tasks.perf sets cells and isl_osl/concurrency; use one",
+    ),
+    Case(
+        "V-18",
+        "single",
+        {"tasks.perf.concurrency": DROP},
+        "tasks.perf",
+        "needs isl_osl and concurrency together, or cells",
+    ),
+    Case(
+        "V-19",
+        "single",
+        {"tasks.perf.isl_osl": [[8192, 2048]]},
+        "tasks.perf.isl_osl[0]",
+        "cell isl8192_osl2048_c1024 needs 10240 tokens; max-model-len is 9216",
+    ),
+    Case(
+        "V-19",
+        "pd",
+        {"server.roles.decode.args.max-model-len": 66000},
+        f"{CELLS}[4]",
+        "cell pd_disagg_decode_daily_round1_c256_i65536_o1024 needs 66560 tokens; "
+        "max-model-len is 66000 for role decode",
+    ),
+    Case(
+        "V-20",
+        "pd",
+        {f"{CELLS}[1].label": "x_c{conc}"},
+        f"{CELLS}[1].label",
+        "uses {conc}; it may use {isl}, {osl}, {concurrency}, {repeat}",
+    ),
+    Case(
+        "V-20",
+        "pd",
+        {f"{CELLS}[3].label": "fixed"},
+        f"{CELLS}[3].label",
+        "cells repeat 3 times but label has no {repeat}",
+    ),
+    Case(
+        "V-20",
+        "pd",
+        {f"{CELLS}[0].label": "pd_disagg_prefill_c8_i8192_o1"},
+        f"{CELLS}[1]",
+        "cell pd_disagg_prefill_c8_i8192_o1 appears more than once",
+    ),
+    Case(
+        "V-20",
+        "pd",
+        {f"{CELLS}[0].label": "a/b"},
+        f"{CELLS}[0]",
+        "cell key 'a/b' is not filename-safe",
+    ),
+    Case(
+        "V-21",
+        "single",
+        {"tasks.perf.concurrency": [512]},
+        "tasks.perf.baseline",
+        "has no entry for isl8192_osl1024_c512 and an extra entry "
+        "isl8192_osl1024_c1024",
+        hint="its keys are the cell keys: isl8192_osl1024_c512",
+    ),
+    Case(
+        "V-21",
+        "single",
+        {f"{LM}.tasks": ["mmlu_pro", "gsm8k"]},
+        "tasks.eval.baseline",
+        "has no entry for gsm8k",
+    ),
+    Case(
+        "V-21",
+        "single",
+        {
+            f"{LM}.concurrency": [1, 2],
+            f"{LM}.model_args": {"timeout": 7200},
+            "tasks.eval.baseline": {"mmlu_pro_c4": {"exact_match,none": 0.5}},
+        },
+        "tasks.eval.baseline",
+        "has an extra entry mmlu_pro_c4",
+        hint="its keys are among the run keys: mmlu_pro_c1, mmlu_pro_c2",
+    ),
+    Case(
+        "V-22",
+        "pd",
+        {"tasks.custom[0].name": "eval"},
+        "tasks.custom[0].name",
+        "eval names a built-in task",
+    ),
+    Case(
+        "V-22",
+        "pd",
+        {},
+        "tasks.custom[1].name",
+        "another custom task is named correctness",
+        extra=_second_custom,
+    ),
+    Case(
+        "V-22",
+        "pd",
+        {f"{CUSTOM_ENV}.LOG_DIR": "${RESULTS}/x"},
+        f"{CUSTOM_ENV}.LOG_DIR",
+        "uses ${RESULTS}; known: DECODE_URL, PREFILL_URL, PROXY_URL, "
+        "SCENARIO_API_PORT, SCENARIO_HOST_DECODE, SCENARIO_HOST_PREFILL, "
+        "SCENARIO_RESULTS_DIR, SCENARIO_ROUTER_PORT, SCENARIO_SERVED_MODEL",
+    ),
+    Case(
+        "V-22",
+        "pd",
+        {f"{CUSTOM_ENV}.COST": "$5"},
+        f"{CUSTOM_ENV}.COST",
+        "has a lone $; write $$ for a literal $, or ${NAME}",
+    ),
+    Case(
+        "V-27",
+        "single",
+        {f"{LM}.model_args.base_url": "http://x"},
+        f"{LM}.model_args.base_url",
+        "is set by the tool (the server or router URL); remove it",
+    ),
+    Case(
+        "V-28",
+        "single",
+        {"tasks.perf.random_range_ratio": DROP},
+        "tasks.perf.random_range_ratio",
+        "is required with dataset random",
+    ),
+    Case(
+        "V-28",
+        "single",
+        {
+            "tasks.perf.dataset": {"name": "sharegpt"},
+            "tasks.perf.range_ratio_style": "min",
+        },
+        "tasks.perf.range_ratio_style",
+        "min applies to the random dataset only",
+    ),
+    Case(
+        "V-32",
+        "agentx",
+        {"tasks.agentx.concurrency": 32, "sweep": DROP},
+        "server.args.max-num-seqs",
+        "max-num-seqs 16 x DP 1 = 16, under tasks.agentx.concurrency 32; the "
+        "server would cap the measured concurrency",
+    ),
+    Case(
+        "V-32",
+        "agentx",
+        {"tasks.agentx.concurrency": 12, "sweep": DROP},
+        "server.args.max-num-seqs",
+        "max-num-seqs 16 x DP 1 = 16, under twice tasks.agentx.concurrency (24)",
+        severity="warning",
+    ),
+    Case(
+        "V-34",
+        "agentx",
+        {"sweep": DROP},
+        "tasks.agentx",
+        "must be the only task, but tasks.custom is set too: AgentX needs a fresh "
+        "server, and an earlier task would warm it",
+        extra=_agentx_with_custom,
+    ),
+    Case(
+        "V-35",
+        "single",
+        {"tasks.perf.client": "inferencex"},
+        "tasks.perf.range_ratio_style",
+        "applies to vllm-bench only; inferencex reads random_range_ratio as written",
+    ),
+    Case(
+        "V-35",
+        "single",
+        {"tasks.perf.range_ratio_style": DROP},
+        "tasks.perf.range_ratio_style",
+        "is required with client vllm-bench and dataset random: symmetric or min",
+    ),
+    Case(
+        "V-36",
+        "single",
+        {f"{LM}.tasks": ["mmlu_pro", {"name": "mmlu_pro"}]},
+        f"{LM}.tasks[1]",
+        "mmlu_pro is listed twice",
+    ),
+    Case(
+        "V-36",
+        "single",
+        {f"{LM}.concurrency": [1, 2]},
+        f"{LM}.model_args.num_concurrent",
+        "is set per run from tasks.eval.lm_eval.concurrency; remove it",
+    ),
+    Case(
+        "V-36",
+        "single",
+        {f"{LM}.concurrency": [1, 1], f"{LM}.model_args.num_concurrent": DROP},
+        f"{LM}.concurrency",
+        "has repeated values",
+    ),
+    Case(
+        "V-36",
+        "single",
+        {f"{LM}.tasks": [{"name": "gsm8k", "limit_per_concurrency": 2}]},
+        f"{LM}.tasks[0].limit_per_concurrency",
+        "needs tasks.eval.lm_eval.concurrency",
+    ),
+    Case(
+        "V-36",
+        "single",
+        {
+            f"{LM}.concurrency": [1, 2],
+            f"{LM}.model_args.num_concurrent": DROP,
+            f"{LM}.tasks": [
+                {"name": "gsm8k", "limit": "all", "limit_per_concurrency": 2}
+            ],
+        },
+        f"{LM}.tasks[0].limit_per_concurrency",
+        "raises a limit, but this task runs the full set; set limit",
+    ),
+    Case(
+        "V-36",
+        "single",
+        {f"{LM}.tasks": [{"name": "mmlu_pro", "subtasks": 14}]},
+        f"{LM}.tasks[0].subtasks",
+        "only divides limit_per_concurrency",
+    ),
+    Case(
+        "V-43",
+        "ix_eval",
+        {"tasks.custom": [{"name": "probe", "command": ["true"], "timeout": 60}]},
+        f"{IX}.client",
+        "inferencex must be the only task, but tasks.custom is set too: "
+        "InferenceX evaluates a fresh deployment",
+        hint="move the other tasks to their own sweep point or scenario",
+    ),
+    Case(
+        "V-44",
+        "ix_eval",
+        {f"{IX}.framework": "kimi-vendor"},
+        f"{IX}.framework",
+        "kimi-vendor needs tasks.eval.suite; without one InferenceX runs the "
+        "framework's smoke suite",
+        hint="e.g. suite: kimi_tool_call_schema_full",
+    ),
+    Case(
+        "V-44",
+        "ix_eval",
+        {f"{IX}.suite": "gsm8k"},
+        f"{IX}.suite",
+        "is for the vendor frameworks (kimi-vendor, minimax-vendor and bfcl); "
+        "lm-eval runs GSM8K, and InferenceX rejects EVAL_SUITE with it",
+    ),
+    Case(
+        "V-46",
+        "ix_eval",
+        {f"{IX}.tolerance": 0.02},
+        f"{IX}.tolerance",
+        "is for client lm_eval; client inferencex runs InferenceX's eval client, "
+        "gated by InferenceX's own score floor with no baseline",
+    ),
+    Case(
+        "V-46",
+        "ix_eval",
+        {f"{IX}.concurrency": DROP, f"{IX}.timeout": DROP},
+        IX,
+        "client inferencex needs concurrency and timeout",
+    ),
+    Case(
+        "V-46",
+        "single",
+        {f"{IX}.framework": "lm-eval"},
+        f"{IX}.framework",
+        "is for client inferencex, InferenceX's eval client",
+        hint="set tasks.eval.client: inferencex, or remove it",
+    ),
+    Case(
+        "V-46",
+        "single",
+        {f"{IX}.tolerance": DROP},
+        IX,
+        "client lm_eval needs tolerance",
+    ),
+    Case(
+        "V-37",
+        "agentx",
+        {"tasks.agentx.timeout": "1h"},
+        "tasks.agentx.timeout",
+        "must be longer than duration (1h), to cover warmup and drain",
+    ),
+    Case(
+        "V-41",
+        "agentx",
+        {"tasks.agentx.fast": True},
+        "tasks.agentx.duration",
+        "is 1h, but fast mode fixes the window at 20m and ignores duration",
+        hint="set duration: 20m, or fast: false",
+    ),
+    Case(
+        "V-47",
+        "agentx",
+        {"tasks.inferencex": DROP},
+        "tasks",
+        "tasks.agentx needs tasks.inferencex, the identity InferenceX files the "
+        "results under",
+        hint="set tasks.inferencex.model_prefix and precision",
+    ),
+    Case(
+        "V-47",
+        "single",
+        {"tasks.inferencex": IDENTITY},
+        "tasks.inferencex",
+        "is set, but no AgentX task or InferenceX eval reads it",
+        severity="warning",
+    ),
+    Case(
+        "V-48",
+        "agentx",
+        {"tasks.inferencex.kv_offloading": "dram"},
+        "tasks.inferencex.kv_offloading",
+        "is dram, so set kv_offload_backend and total_cpu_dram_gb too",
+    ),
+    Case(
+        "V-48",
+        "agentx",
+        {"tasks.inferencex.kv_offload_backend": {"name": "mooncake"}},
+        "tasks.inferencex.kv_offload_backend",
+        "is set, but kv_offloading is none",
+    ),
+    Case(
+        "V-49",
+        "agentx",
+        {"tasks.agentx.duration": "30m"},
+        "tasks.agentx.duration",
+        "is 30m; InferenceX publishes 1h windows only",
+        severity="warning",
+    ),
+    Case(
+        "V-49",
+        "agentx",
+        {"tasks.agentx.duration": "10m"},
+        "tasks.agentx.duration",
+        "is 10m, under 15m: aiperf runs it with --unsafe-override",
+        severity="warning",
+    ),
+    Case(
+        "V-50",
+        "agentx",
+        {MML: 131072},
+        MML,
+        "is 131072, under the AgentX corpus's longest traces (1048576 tokens)",
+        hint="serve the native context; for a 262144-token server, set "
+        "tasks.agentx.env.WEKA_LOADER_OVERRIDE: "
+        "semianalysis_cc_traces_weka_062126_256k; or set AIPERF_MAX_CONTEXT_LENGTH "
+        "to drop longer traces (not canonical)",
+    ),
+    Case(
+        "V-50",
+        "agentx",
+        {MML: 131072, CAP: "131072"},
+        CAP,
+        "is 131072, under the corpus's longest traces (1048576 tokens): the client "
+        "drops every longer trace",
+        severity="warning",
+    ),
+    Case(
+        "V-50",
+        "agentx",
+        {MML: 300000, CAP: "300000"},
+        CAP,
+        "is 300000, under the corpus's longest traces (1048576 tokens)",
+        hint="for a server of 262144 or more, pin the capped corpus instead: "
+        "WEKA_LOADER_OVERRIDE: semianalysis_cc_traces_weka_062126_256k",
+        severity="warning",
+    ),
+    Case(
+        "V-50",
+        "agentx",
+        {MML: 524288, CAP: "1048576"},
+        MML,
+        "is 524288, under tasks.agentx.env.AIPERF_MAX_CONTEXT_LENGTH (1048576): "
+        "the server would reject the traces between them",
+    ),
 ]
 
 
@@ -304,9 +715,49 @@ def test_every_scenario_rule_has_a_case() -> None:
 def test_rule_table_is_complete_and_ordered() -> None:
     ids = [rule.id for rule in rule_table()]
     # V-16 is unused: whether TP x PP x PCP x DP fits a role would need the
-    # devices per chip, which the tool does not know.
-    assert ids == [*(f"V-{n:02d}" for n in range(1, 18) if n != 16), "V-42"]
+    # devices per chip, which the tool does not know. V-25 is unused; V-24, V-33
+    # and V-38..V-40 are the sweep rules.
+    skipped = (16, 24, 25, 33, 38, 39, 40)
+    assert ids == [f"V-{n:02d}" for n in range(1, 51) if n not in skipped]
     assert all(rule.summary for rule in rule_table())
+
+
+def test_all_problems_reported_together(single: Data) -> None:
+    put(single, "server.multihost", "mp")
+    put(single, "server.args.data-parallel-size", 15)
+    put(single, "server.env.TPU_TOPOLOGY", "x")
+    put(single, "tasks.perf.concurrency", [512])
+    rules = [issue.rule for issue in issues_for(single)]
+    assert rules == ["V-11", "V-17", "V-21"]
+
+
+def test_provided_names_pass(pd: Data) -> None:
+    put(pd, f"{CUSTOM_ENV}.URLS", "${PREFILL_URL},${DECODE_URL},${PROXY_URL}")
+    put(pd, f"{CUSTOM_ENV}.HOSTS", "${SCENARIO_HOST_PREFILL}")
+    assert issues_for(pd) == []
+
+
+def test_role_driver_gets_server_log(pd: Data) -> None:
+    put(pd, "tasks.driver", "prefill")
+    put(pd, f"{CUSTOM_ENV}.LOG", "${SCENARIO_SERVER_LOG}")
+    put(pd, f"{CUSTOM_ENV}.VLLM_PLUGINS", "")
+    assert issues_for(pd) == []
+
+
+def test_agentx_capacity_skips_the_producer(pd: Data) -> None:
+    pd["tasks"] = {
+        "driver": "client",
+        "inferencex": IDENTITY,
+        "agentx": {"concurrency": 64, "duration": "1h", "timeout": "2h"},
+    }
+    assert [issue for issue in issues_for(pd) if issue.rule == "V-32"] == []
+
+
+def test_eval_sweep_baseline_may_name_some_runs(single: Data) -> None:
+    put(single, f"{LM}.concurrency", [1, 2])
+    put(single, f"{LM}.model_args", {"timeout": 7200})
+    put(single, "tasks.eval.baseline", {"mmlu_pro_c2": {"exact_match,none": 0.5}})
+    assert issues_for(single) == []
 
 
 @pytest.mark.parametrize(
@@ -320,6 +771,13 @@ def test_agentx_env_names_the_tool_sets(agentx: Data, name: str) -> None:
     assert issue.path == ("tasks", "agentx", "env", name)
 
 
+@pytest.mark.parametrize("duration", ["20m", 1200])
+def test_agentx_fast_with_its_window(agentx: Data, duration: object) -> None:
+    put(agentx, "tasks.agentx.fast", True)
+    put(agentx, "tasks.agentx.duration", duration)
+    assert issues_for(agentx) == []
+
+
 @pytest.mark.parametrize("name", ["MODEL", "TP", "CONC", "RESULT_DIR"])
 def test_agentx_names_are_free_outside_agentx(
     single: Data, pd: Data, name: str
@@ -331,7 +789,7 @@ def test_agentx_names_are_free_outside_agentx(
     assert issues_for(single) == []
     put(pd, f"server.roles.decode.env.{name}", "x")
     put(pd, f"{CUSTOM_ENV}.{name}", "x")
-    assert [issue for issue in issues_for(pd) if issue.rule == "V-32"] == []
+    assert issues_for(pd) == []
 
 
 def test_inferencex_perf_env_keeps_the_import_path(single: Data) -> None:
@@ -341,3 +799,25 @@ def test_inferencex_perf_env_keeps_the_import_path(single: Data) -> None:
     (issue,) = issues_for(single)
     assert issue.rule == "V-11"
     assert "inferencex client" in issue.message
+
+
+def test_inferencex_eval_with_a_vendor_suite(ix_eval: Data) -> None:
+    put(ix_eval, f"{IX}.framework", "minimax-vendor")
+    put(ix_eval, f"{IX}.suite", "minimax_m3_full")
+    assert issues_for(ix_eval) == []
+
+
+def test_inferencex_eval_beside_agentx(ix_eval: Data, agentx: Data) -> None:
+    """Both rules name the other task: each runs alone on a fresh deployment."""
+    ix_eval["tasks"]["agentx"] = agentx["tasks"]["agentx"]
+    rules = {issue.rule: issue.message for issue in issues_for(ix_eval)}
+    assert "tasks.eval is set too" in rules["V-34"]
+    assert "tasks.agentx is set too" in rules["V-43"]
+
+
+@pytest.mark.parametrize("name", ["MODEL", "PREFILL_TP", "EVAL_ONLY", "OPENAI_API_KEY"])
+def test_inferencex_eval_env_names_the_tool_sets(ix_eval: Data, name: str) -> None:
+    put(ix_eval, f"{IX}.env.{name}", "x")
+    (issue,) = issues_for(ix_eval)
+    assert issue.rule == "V-11"
+    assert issue.path == ("tasks", "eval", "env", name)

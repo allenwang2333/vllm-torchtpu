@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Validation rules V-01..V-17 and V-42.
+"""Validation rules V-01..V-50.
 
 Field types enforce the rules about one value. The rules here need several
 fields of one validated scenario (a scenario without a sweep, or one point
@@ -21,15 +21,27 @@ declared here too, so the reference lists every rule in one table.
 """
 
 import math
+import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Literal
 
 from scenario.errors import Issue
+from scenario.model.baseline import EvalBaseline, PerfBaseline
 from scenario.model.common import format_duration
 from scenario.model.scenario import Scenario
 from scenario.model.server import HARDWARE_FIELDS, RoleView
-from scenario.model.tasks import LmEvalTask
+from scenario.model.tasks import (
+    BUILTIN_TASKS,
+    FAST_WINDOW_S,
+    INFERENCEX_CLIENT_FIELDS,
+    LABEL_FIELDS,
+    LABEL_PLACEHOLDER,
+    LM_EVAL_CLIENT_FIELDS,
+    VENDOR_SUITES,
+    LmEvalTask,
+    PerfCell,
+)
 from scenario.paths import KeyPath
 from scenario.reserved import (
     AGENTX_CLIENT_ENV,
@@ -37,11 +49,13 @@ from scenario.reserved import (
     DP_HOST_ARGS,
     INFERENCEX_EVAL_ENV,
     INFERENCEX_PERF_ENV,
+    LM_EVAL_MODEL_ARGS,
     PERF_CLIENT_ARGS,
     RAY_ENV,
     READY_TIMEOUT_ENV,
     ROUTER_ARGS,
     SERVE_ARGS,
+    custom_task_env,
     tool_env_owner,
 )
 
@@ -383,6 +397,597 @@ def _mp_split(s: Scenario) -> Iterator[Issue]:
                 f"multihost mp needs data-parallel-size divisible by {hosts} "
                 f"hosts; got {dp}",
             )
+
+
+@_rule("V-18", "tasks.perf sets isl_osl and concurrency, or cells")
+def _perf_cells(s: Scenario) -> Iterator[Issue]:
+    perf = s.tasks.perf
+    if perf is None:
+        return
+    product = perf.isl_osl is not None or perf.concurrency is not None
+    if perf.cells is not None and product:
+        yield Issue(
+            ("tasks", "perf", "cells"),
+            "tasks.perf sets cells and isl_osl/concurrency; use one",
+        )
+    elif perf.cells is None and (perf.isl_osl is None or perf.concurrency is None):
+        yield Issue(
+            ("tasks", "perf"), "needs isl_osl and concurrency together, or cells"
+        )
+
+
+@_rule("V-19", "ISL + OSL of every perf cell fits max-model-len of every role")
+def _cell_lengths(s: Scenario) -> Iterator[Issue]:
+    perf = s.tasks.perf
+    if perf is None:
+        return
+    longest: dict[KeyPath, PerfCell] = {}
+    for cell in perf.cell_list():
+        known = longest.get(cell.path)
+        if known is None or cell.isl + cell.osl > known.isl + known.osl:
+            longest[cell.path] = cell
+    for role in s.server.role_views():
+        limit = role.args.get("max-model-len")
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            continue
+        scope = f" for role {role.name}" if s.server.roles else ""
+        for cell in longest.values():
+            needed = cell.isl + cell.osl
+            if needed > limit:
+                yield Issue(
+                    cell.path,
+                    f"cell {cell.key} needs {needed} tokens; max-model-len is "
+                    f"{limit}{scope}",
+                )
+
+
+CELL_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+@_rule("V-20", "perf cell keys are unique and filename-safe")
+def _cell_keys(s: Scenario) -> Iterator[Issue]:
+    perf = s.tasks.perf
+    if perf is None:
+        return
+    allowed = ", ".join(f"{{{name}}}" for name in LABEL_FIELDS)
+    broken: set[KeyPath] = set()
+    for index, group in enumerate(perf.cells or ()):
+        path = ("tasks", "perf", "cells", index)
+        label = group.label
+        unknown = [
+            name
+            for name in LABEL_PLACEHOLDER.findall(label or "")
+            if name not in LABEL_FIELDS
+        ]
+        if unknown:
+            broken.add(path)
+            yield Issue(
+                (*path, "label"), f"uses {{{unknown[0]}}}; it may use {allowed}"
+            )
+        elif group.repeat > 1 and (label is None or "{repeat}" not in label):
+            broken.add(path)
+            yield Issue(
+                (*path, "label") if label is not None else path,
+                f"cells repeat {group.repeat} times but label has no {{repeat}}",
+            )
+    seen: set[str] = set()
+    for cell in perf.cell_list():
+        if cell.path in broken:
+            continue
+        if not CELL_KEY.fullmatch(cell.key):
+            yield Issue(
+                cell.path,
+                f"cell key {cell.key!r} is not filename-safe; use letters, digits, "
+                "'.', '_' and '-'",
+            )
+        elif cell.key in seen:
+            yield Issue(cell.path, f"cell {cell.key} appears more than once")
+        seen.add(cell.key)
+
+
+def baseline_keys(s: Scenario, task: str) -> tuple[tuple[str, ...], bool] | None:
+    """The keys a task's baseline may hold, and whether a subset of them is enough.
+
+    An eval sweep runs every task at every concurrency, and the gate checks
+    only the runs a baseline names, so its baseline may name some of them.
+    """
+    if task == "perf" and s.tasks.perf is not None:
+        return tuple(cell.key for cell in s.tasks.perf.cell_list()), False
+    if task == "eval" and s.tasks.eval is not None and s.tasks.eval.lm_eval:
+        lm_eval = s.tasks.eval.lm_eval
+        return lm_eval.run_keys(), lm_eval.concurrency is not None
+    return None
+
+
+def baseline_key_problem(
+    have: set[str], want: tuple[str, ...], subset: bool
+) -> str | None:
+    missing = [] if subset else [key for key in want if key not in have]
+    extra = sorted(have - set(want))
+    parts = []
+    if missing:
+        parts.append(f"no entry for {', '.join(missing)}")
+    if extra:
+        parts.append(f"an extra entry {', '.join(extra)}")
+    return f"has {' and '.join(parts)}" if parts else None
+
+
+@_rule("V-21", "inline baseline keys are the task's cell or run keys")
+def _baseline_keys(s: Scenario) -> Iterator[Issue]:
+    for task, kind in (("perf", "cell"), ("eval", "run")):
+        block = getattr(s.tasks, task)
+        rule = baseline_keys(s, task)
+        if rule is None or not isinstance(block.baseline, PerfBaseline | EvalBaseline):
+            continue
+        want, subset = rule
+        problem = baseline_key_problem(
+            set(block.baseline.model_extra or {}), want, subset
+        )
+        if problem is not None:
+            among = "among the" if subset else "the"
+            yield Issue(
+                ("tasks", task, "baseline"),
+                problem,
+                hint=f"its keys are {among} {kind} keys: {', '.join(want)}",
+            )
+
+
+def _interpolation_problems(value: str, provided: frozenset[str]) -> Iterator[str]:
+    i = 0
+    while (i := value.find("$", i)) != -1:
+        rest = value[i + 1 :]
+        if rest.startswith("$"):
+            i += 2
+            continue
+        match = re.match(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", rest)
+        if match is None:
+            yield "has a lone $; write $$ for a literal $, or ${NAME}"
+            i += 1
+            continue
+        if match.group(1) not in provided:
+            yield f"uses ${{{match.group(1)}}}; known: {', '.join(sorted(provided))}"
+        i += 1 + match.end()
+
+
+@_rule("V-22", "custom tasks have unique names and use only provided ${NAME}s")
+def _custom(s: Scenario) -> Iterator[Issue]:
+    roles = s.server.role_views()
+    provided = custom_task_env(
+        roles=[role.name for role in roles],
+        kv_roles={role.name: role.kv.role for role in roles if role.kv},
+        router=s.server.router is not None,
+        driver_on_role=not (s.server.roles and s.tasks.driver == "client"),
+    )
+    seen: set[str] = set()
+    for index, task in enumerate(s.tasks.custom):
+        path = ("tasks", "custom", index)
+        if task.name in BUILTIN_TASKS:
+            yield Issue((*path, "name"), f"{task.name} names a built-in task")
+        elif task.name in seen:
+            yield Issue((*path, "name"), f"another custom task is named {task.name}")
+        seen.add(task.name)
+        for name, value in task.env.items():
+            for problem in _interpolation_problems(value, provided):
+                yield Issue((*path, "env", name), problem)
+
+
+_declare("V-23", "a baseline's from: names a scenario with matching keys", "resolve")
+
+
+_declare("V-26", "name is unique across scenarios/", "validate")
+_declare("V-29", "extends: the parent exists, no cycle, depth <= 5", "resolve")
+_declare(
+    "V-30", "--set paths start with server. or tasks. and avoid baselines", "resolve"
+)
+
+
+@_rule("V-27", "lm_eval model_args do not set what the tool sets")
+def _model_args(s: Scenario) -> Iterator[Issue]:
+    if s.tasks.eval is None or s.tasks.eval.lm_eval is None:
+        return
+    for key in s.tasks.eval.lm_eval.model_args:
+        if key in LM_EVAL_MODEL_ARGS:
+            path = ("tasks", "eval", "lm_eval", "model_args", key)
+            yield Issue(path, f"is set by {LM_EVAL_MODEL_ARGS[key]}; remove it")
+
+
+@_rule("V-28", "the random dataset has random_range_ratio")
+def _random_dataset(s: Scenario) -> Iterator[Issue]:
+    perf = s.tasks.perf
+    if perf is None:
+        return
+    if perf.dataset.name == "random" and perf.random_range_ratio is None:
+        yield Issue(
+            ("tasks", "perf", "random_range_ratio"), "is required with dataset random"
+        )
+    if perf.range_ratio_style == "min" and perf.dataset.name != "random":
+        yield Issue(
+            ("tasks", "perf", "range_ratio_style"),
+            "min applies to the random dataset only",
+        )
+
+
+_declare(
+    "V-31", "tasks.agentx.concurrency and tasks.eval.concurrency are one value", "field"
+)
+
+
+@_rule("V-32", "max-num-seqs x DP covers tasks.agentx.concurrency, twice over")
+def _agentx_capacity(s: Scenario) -> Iterator[Issue]:
+    agentx = s.tasks.agentx
+    if agentx is None:
+        return
+    want = agentx.concurrency
+    for role in s.server.role_views():
+        if role.kv is not None and role.kv.role == "producer":
+            continue
+        seqs = role.args.get("max-num-seqs")
+        dp = _int_arg(role, "data-parallel-size")
+        if not isinstance(seqs, int) or isinstance(seqs, bool) or dp is None:
+            continue
+        capacity = seqs * dp
+        sizes = f"max-num-seqs {seqs} x DP {dp} = {capacity}"
+        if capacity < want:
+            yield Issue(
+                role.arg_path("max-num-seqs"),
+                f"{sizes}, under tasks.agentx.concurrency {want}; the server "
+                "would cap the measured concurrency",
+            )
+        elif capacity < 2 * want:
+            yield Issue(
+                role.arg_path("max-num-seqs"),
+                f"{sizes}, under twice tasks.agentx.concurrency ({2 * want}); "
+                "AgentX sessions spawn subagents, so the server may cap them",
+                severity="warning",
+            )
+
+
+@_rule("V-34", "tasks.agentx is the only task")
+def _agentx_alone(s: Scenario) -> Iterator[Issue]:
+    tasks = s.tasks
+    if tasks.agentx is None:
+        return
+    others = [name for name in ("perf", "custom", "eval") if getattr(tasks, name)]
+    if others:
+        yield Issue(
+            ("tasks", "agentx"),
+            f"must be the only task, but tasks.{others[0]} is set too: AgentX "
+            "needs a fresh server, and an earlier task would warm it",
+            hint="move the other tasks to their own scenario",
+        )
+
+
+@_rule("V-35", "perf fields match the perf client")
+def _perf_client(s: Scenario) -> Iterator[Issue]:
+    perf = s.tasks.perf
+    if perf is None:
+        return
+    path = ("tasks", "perf", "range_ratio_style")
+    if perf.client == "inferencex" and perf.range_ratio_style is not None:
+        yield Issue(
+            path,
+            "applies to vllm-bench only; inferencex reads random_range_ratio as "
+            "written",
+        )
+    elif (
+        perf.client == "vllm-bench"
+        and perf.dataset.name == "random"
+        and perf.range_ratio_style is None
+    ):
+        yield Issue(
+            path,
+            "is required with client vllm-bench and dataset random: symmetric or min",
+            hint="scenarios/defaults.yaml normally sets it",
+        )
+
+
+@_rule("V-36", "lm_eval tasks, concurrency and per-concurrency limits agree")
+def _lm_eval(s: Scenario) -> Iterator[Issue]:
+    if s.tasks.eval is None or s.tasks.eval.lm_eval is None:
+        return
+    lm_eval = s.tasks.eval.lm_eval
+    base = ("tasks", "eval", "lm_eval")
+    seen: set[str] = set()
+    for index, item in enumerate(lm_eval.task_items()):
+        if item.name in seen:
+            yield Issue((*base, "tasks", index), f"{item.name} is listed twice")
+        seen.add(item.name)
+    if lm_eval.concurrency is not None:
+        if len(set(lm_eval.concurrency)) != len(lm_eval.concurrency):
+            yield Issue((*base, "concurrency"), "has repeated values")
+        if "num_concurrent" in lm_eval.model_args:
+            yield Issue(
+                (*base, "model_args", "num_concurrent"),
+                "is set per run from tasks.eval.lm_eval.concurrency; remove it",
+            )
+    for index, item in enumerate(lm_eval.tasks):
+        if not isinstance(item, LmEvalTask):
+            continue
+        path = (*base, "tasks", index)
+        if item.limit_per_concurrency is not None:
+            limit = item.limit if item.limit is not None else lm_eval.limit
+            if lm_eval.concurrency is None:
+                yield Issue(
+                    (*path, "limit_per_concurrency"),
+                    "needs tasks.eval.lm_eval.concurrency",
+                )
+            elif limit is None or limit == "all":
+                yield Issue(
+                    (*path, "limit_per_concurrency"),
+                    "raises a limit, but this task runs the full set; set limit",
+                )
+        elif item.subtasks is not None:
+            yield Issue(
+                (*path, "subtasks"),
+                "only divides limit_per_concurrency; set that or remove subtasks",
+            )
+
+
+@_rule("V-43", "tasks.eval with client inferencex is the only task")
+def _inferencex_eval_alone(s: Scenario) -> Iterator[Issue]:
+    tasks = s.tasks
+    if tasks.eval is None or tasks.eval.client != "inferencex":
+        return
+    others = [name for name in ("perf", "agentx", "custom") if getattr(tasks, name)]
+    if others:
+        yield Issue(
+            ("tasks", "eval", "client"),
+            f"inferencex must be the only task, but tasks.{others[0]} is set too: "
+            "InferenceX evaluates a fresh deployment, and its eval client "
+            "installs its harness into the pod at run time",
+            hint="move the other tasks to their own sweep point or scenario",
+        )
+
+
+@_rule("V-44", "tasks.eval.suite is set for the vendor frameworks, and only for them")
+def _inferencex_eval_suite(s: Scenario) -> Iterator[Issue]:
+    evals = s.tasks.eval
+    if evals is None or evals.client != "inferencex":
+        return
+    framework = evals.framework or "lm-eval"
+    if framework in VENDOR_SUITES and evals.suite is None:
+        yield Issue(
+            ("tasks", "eval", "framework"),
+            f"{framework} needs tasks.eval.suite; without one InferenceX runs "
+            "the framework's smoke suite",
+            hint=f"e.g. suite: {VENDOR_SUITES[framework]}",
+        )
+    elif framework not in VENDOR_SUITES and evals.suite is not None:
+        yield Issue(
+            ("tasks", "eval", "suite"),
+            f"is for the vendor frameworks ({_and(list(VENDOR_SUITES))}); "
+            f"{framework} runs GSM8K, and InferenceX rejects EVAL_SUITE with it",
+        )
+
+
+_declare(
+    "V-45",
+    "an InferenceX eval runs at the highest agentx concurrency of its "
+    "scenario's points; a warning",
+    "resolve",
+)
+
+
+def eval_concurrency_issue(s: Scenario, agentx: Sequence[int]) -> Issue | None:
+    """V-45 for one point, given the agentx concurrencies of every point.
+
+    InferenceX evaluates an AgentX deployment at its highest concurrency, and
+    joins the eval to the row of that concurrency.
+    """
+    evals = s.tasks.eval
+    if evals is None or evals.client != "inferencex" or not agentx:
+        return None
+    top = max(agentx)
+    if evals.concurrency in (None, top):
+        return None
+    return Issue(
+        ("tasks", "eval", "concurrency"),
+        f"is {evals.concurrency}, but the highest agentx concurrency among this "
+        f"scenario's points is {top}; InferenceX evaluates an AgentX deployment "
+        "at its highest concurrency",
+        hint=f"set concurrency: {top}",
+        severity="warning",
+        rule="V-45",
+    )
+
+
+@_rule("V-46", "tasks.eval fields match tasks.eval.client")
+def _eval_client(s: Scenario) -> Iterator[Issue]:
+    evals = s.tasks.eval
+    if evals is None:
+        return
+    base = ("tasks", "eval")
+    if evals.client == "inferencex":
+        for name in LM_EVAL_CLIENT_FIELDS:
+            if getattr(evals, name) is not None:
+                yield Issue(
+                    (*base, name),
+                    "is for client lm_eval; client inferencex runs InferenceX's "
+                    "eval client, gated by InferenceX's own score floor with no "
+                    "baseline",
+                    hint="remove it, or move the lm_eval runs to another point",
+                )
+        needed = ("concurrency", "timeout")
+    else:
+        for name in INFERENCEX_CLIENT_FIELDS:
+            if getattr(evals, name):
+                yield Issue(
+                    (*base, name),
+                    "is for client inferencex, InferenceX's eval client",
+                    hint="set tasks.eval.client: inferencex, or remove it",
+                )
+        needed = ("lm_eval", "tolerance")
+    missing = [name for name in needed if getattr(evals, name) is None]
+    if missing:
+        yield Issue(base, f"client {evals.client} needs {_and(missing)}")
+
+
+@_rule("V-37", "tasks.agentx.timeout is longer than its duration")
+def _agentx_timeout(s: Scenario) -> Iterator[Issue]:
+    agentx = s.tasks.agentx
+    if agentx is not None and agentx.timeout <= agentx.duration:
+        yield Issue(
+            ("tasks", "agentx", "timeout"),
+            f"must be longer than duration ({format_duration(agentx.duration)}), "
+            "to cover warmup and drain",
+        )
+
+
+@_rule("V-41", "tasks.agentx.fast runs a 20m window, so duration is 20m")
+def _agentx_fast(s: Scenario) -> Iterator[Issue]:
+    agentx = s.tasks.agentx
+    if agentx is not None and agentx.fast and agentx.duration != FAST_WINDOW_S:
+        window = format_duration(FAST_WINDOW_S)
+        yield Issue(
+            ("tasks", "agentx", "duration"),
+            f"is {format_duration(agentx.duration)}, but fast mode fixes the "
+            f"window at {window} and ignores duration",
+            hint=f"set duration: {window}, or fast: false",
+        )
+
+
+@_rule(
+    "V-47", "tasks.inferencex is set exactly where AgentX or an InferenceX eval runs"
+)
+def _inferencex_identity(s: Scenario) -> Iterator[Issue]:
+    tasks = s.tasks
+    users = []
+    if tasks.agentx is not None:
+        users.append("tasks.agentx")
+    if tasks.eval is not None and tasks.eval.client == "inferencex":
+        users.append("tasks.eval with client inferencex")
+    if users and tasks.inferencex is None:
+        yield Issue(
+            ("tasks",),
+            f"{_and(users)} needs tasks.inferencex, the identity InferenceX files "
+            "the results under",
+            hint="set tasks.inferencex.model_prefix and precision",
+        )
+    elif not users and tasks.inferencex is not None:
+        yield Issue(
+            ("tasks", "inferencex"),
+            "is set, but no AgentX task or InferenceX eval reads it",
+            severity="warning",
+        )
+
+
+@_rule("V-48", "kv_offloading dram states its backend and DRAM; none states neither")
+def _kv_offloading(s: Scenario) -> Iterator[Issue]:
+    identity = s.tasks.inferencex
+    if identity is None:
+        return
+    base = ("tasks", "inferencex")
+    if identity.kv_offloading == "dram":
+        missing = [
+            name
+            for name in ("kv_offload_backend", "total_cpu_dram_gb")
+            if getattr(identity, name) is None
+        ]
+        if missing:
+            yield Issue(
+                (*base, "kv_offloading"),
+                f"is dram, so set {_and(missing)} too; InferenceX records both "
+                "with the row",
+            )
+    elif identity.kv_offload_backend is not None:
+        yield Issue(
+            (*base, "kv_offload_backend"),
+            "is set, but kv_offloading is none; InferenceX rejects a backend "
+            "without offloading",
+        )
+
+
+# The AgentX window InferenceX publishes, and the shortest aiperf accepts
+# without --unsafe-override, which marks the run invalid.
+CANONICAL_WINDOW_S = 3600
+MIN_WINDOW_S = 900
+
+
+@_rule("V-49", "tasks.agentx runs InferenceX's 1h window; a warning")
+def _agentx_window(s: Scenario) -> Iterator[Issue]:
+    agentx = s.tasks.agentx
+    if agentx is None or agentx.fast:
+        return
+    if agentx.duration < MIN_WINDOW_S:
+        yield Issue(
+            ("tasks", "agentx", "duration"),
+            f"is {format_duration(agentx.duration)}, under "
+            f"{format_duration(MIN_WINDOW_S)}: aiperf runs it with "
+            "--unsafe-override and marks the run invalid",
+            severity="warning",
+        )
+    elif agentx.duration != CANONICAL_WINDOW_S:
+        yield Issue(
+            ("tasks", "agentx", "duration"),
+            f"is {format_duration(agentx.duration)}; InferenceX publishes "
+            f"{format_duration(CANONICAL_WINDOW_S)} windows only",
+            severity="warning",
+        )
+
+
+# InferenceX's AgentX corpora (infx/bench/agentic/traces.py): the uncapped one
+# holds traces up to about 1M tokens, the capped one up to 256k.
+CAPPED_CORPUS = "semianalysis_cc_traces_weka_062126_256k"
+CAPPED_CONTEXT = 262144
+UNCAPPED_CONTEXT = 1048576
+
+
+def _positive_int(text: str | None) -> int | None:
+    return int(text) if text is not None and text.isdigit() and int(text) else None
+
+
+@_rule(
+    "V-50",
+    "the AgentX corpus fits max-model-len; a client cap below it is a warning "
+    "unless fast",
+)
+def _agentx_context(s: Scenario) -> Iterator[Issue]:
+    agentx = s.tasks.agentx
+    if agentx is None:
+        return
+    lengths = [
+        (role, value)
+        for role in s.server.role_views()
+        if isinstance(value := role.args.get("max-model-len"), int)
+        and not isinstance(value, bool)
+    ]
+    capped = agentx.env.get("WEKA_LOADER_OVERRIDE") == CAPPED_CORPUS
+    corpus = CAPPED_CONTEXT if capped else UNCAPPED_CONTEXT
+    cap = _positive_int(agentx.env.get("AIPERF_MAX_CONTEXT_LENGTH"))
+    if cap is not None:
+        under = [(role, value) for role, value in lengths if value < cap]
+        if under:
+            role, value = under[0]
+            yield Issue(
+                role.arg_path("max-model-len"),
+                f"is {value}, under tasks.agentx.env.AIPERF_MAX_CONTEXT_LENGTH "
+                f"({cap}): the server would reject the traces between them",
+            )
+        # A fast run is bring-up already; the cap needs no second warning.
+        if cap < corpus and not agentx.fast:
+            yield Issue(
+                ("tasks", "agentx", "env", "AIPERF_MAX_CONTEXT_LENGTH"),
+                f"is {cap}, under the corpus's longest traces ({corpus} tokens): "
+                "the client drops every longer trace, so the result is not "
+                "InferenceX's",
+                hint=None
+                if capped or cap < CAPPED_CONTEXT
+                else f"for a server of {CAPPED_CONTEXT} or more, pin the capped "
+                f"corpus instead: WEKA_LOADER_OVERRIDE: {CAPPED_CORPUS}",
+                severity="warning",
+            )
+        return
+    short = [(role, value) for role, value in lengths if value < corpus]
+    if short:
+        role, value = short[0]
+        yield Issue(
+            role.arg_path("max-model-len"),
+            f"is {value}, under the AgentX corpus's longest traces ({corpus} "
+            "tokens), which the server would reject",
+            hint=f"serve the native context; for a {CAPPED_CONTEXT}-token server, "
+            f"set tasks.agentx.env.WEKA_LOADER_OVERRIDE: {CAPPED_CORPUS}; or set "
+            "AIPERF_MAX_CONTEXT_LENGTH to drop longer traces (not canonical)",
+        )
 
 
 def rule_table() -> list[Rule]:
