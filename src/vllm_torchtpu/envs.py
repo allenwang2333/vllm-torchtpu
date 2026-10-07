@@ -164,6 +164,13 @@ if TYPE_CHECKING:
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
+    TPU_SCHED_SRPF_RUNNING: bool = True
+    TPU_SCHED_COLD_CHUNK_CAP: int = 2048
+    TPU_SCHED_COLD_THRESHOLD: int = 8192
+    TPU_SCHED_COLD_MIN_DECODERS: int = 12
+    TPU_SCHED_STEP_TOTAL_CAP: int = 4096
+    TPU_SCHED_WARM_STREAK: int = 0
+    TPU_SCHED_WARM_MIN_DECODERS: int = 24
 
 
 def env_with_choices(
@@ -1019,6 +1026,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "512")),
     "TPU_SP_FP8_GATHER": env_bool("TPU_SP_FP8_GATHER", default=True),
+    # --- PrefixAwareScheduler SRPF & cold-prefill chunk capping ---
+    # Sort prefilling requests in `running` by fewest remaining prompt tokens.
+    "TPU_SCHED_SRPF_RUNNING": env_bool("TPU_SCHED_SRPF_RUNNING", default=True),
+    # Max prefill tokens per step for a cold prefill (remaining > threshold)
+    # when num_decoding >= TPU_SCHED_COLD_MIN_DECODERS or (in `running`) when
+    # `waiting` is non-empty. 0 disables capping.
+    "TPU_SCHED_COLD_CHUNK_CAP": env_nonnegative_int(
+        "TPU_SCHED_COLD_CHUNK_CAP", 2048
+    ),
+    # Remaining uncached prompt tokens threshold defining a cold prefill.
+    "TPU_SCHED_COLD_THRESHOLD": env_nonnegative_int(
+        "TPU_SCHED_COLD_THRESHOLD", 8192
+    ),
+    # Minimum active decoding requests before cold-prefill chunk capping
+    # activates when `waiting` is empty.
+    "TPU_SCHED_COLD_MIN_DECODERS": env_nonnegative_int(
+        "TPU_SCHED_COLD_MIN_DECODERS", 12
+    ),
+    "TPU_SCHED_STEP_TOTAL_CAP": env_nonnegative_int(
+        "TPU_SCHED_STEP_TOTAL_CAP", 4096
+    ),
+    "TPU_SCHED_WARM_STREAK": env_nonnegative_int(
+        "TPU_SCHED_WARM_STREAK", 0
+    ),
+    "TPU_SCHED_WARM_MIN_DECODERS": env_nonnegative_int(
+        "TPU_SCHED_WARM_MIN_DECODERS", 24
+    ),
     "TPU_HYBRID_RETENTION_MAX_CONVS": env_nonnegative_int(
         "TPU_HYBRID_RETENTION_MAX_CONVS", 64
     ),

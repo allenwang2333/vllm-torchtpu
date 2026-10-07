@@ -166,6 +166,14 @@ _TPU_COMPILE_ENV_IGNORED = {
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
+    # Host-side PrefixAwareScheduler SRPF and cold-prefill chunk capping knobs.
+    "TPU_SCHED_COLD_CHUNK_CAP",
+    "TPU_SCHED_COLD_MIN_DECODERS",
+    "TPU_SCHED_COLD_THRESHOLD",
+    "TPU_SCHED_SRPF_RUNNING",
+    "TPU_SCHED_STEP_TOTAL_CAP",
+    "TPU_SCHED_WARM_MIN_DECODERS",
+    "TPU_SCHED_WARM_STREAK",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (

@@ -221,6 +221,10 @@ class TestTpuCompilerCache:
             "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
             "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
             "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+            "TPU_SCHED_COLD_CHUNK_CAP",
+            "TPU_SCHED_COLD_MIN_DECODERS",
+            "TPU_SCHED_COLD_THRESHOLD",
+            "TPU_SCHED_SRPF_RUNNING",
         }
 
         assert serving_only <= _TPU_COMPILE_ENV_IGNORED

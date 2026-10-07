@@ -868,6 +868,13 @@ class TpuPlatform(Platform):
             and os.environ.get("TPU_QWEN35_AUTO_DEFAULTS", "1").strip().lower()
             in ("1", "true", "yes", "on")
         ):
+            paw_cls = "vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler"
+            if scheduler_config.scheduler_cls in (
+                None,
+                "vllm.v1.core.sched.scheduler.Scheduler",
+            ):
+                scheduler_config.scheduler_cls = paw_cls
+                logger.info("Auto-enabled PrefixAwareScheduler for Qwen3.5-397B.")
             # The regime hybrid-state retention and the Raiden partial-tail
             # offload are built for: sparse retention, 128-token match unit.
             if hasattr(cache_config, "prefix_cache_retention_interval"):

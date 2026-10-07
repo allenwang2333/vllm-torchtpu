@@ -1614,6 +1614,8 @@ def _patch_vllm_same_step_prefix_hits() -> None:
         return
 
     original_insert_block_hash = BlockPool._insert_block_hash
+    original_remove_cached_block_hashes = BlockPool._remove_cached_block_hashes
+    original_reset_prefix_cache = BlockPool.reset_prefix_cache
     original_get_cached_block = BlockPool.get_cached_block
     original_schedule = Scheduler.schedule
 
@@ -1625,7 +1627,28 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     @functools.wraps(original_insert_block_hash)
     def _insert_block_hash(self, block_hash_with_group_id, block, num_tokens):
         original_insert_block_hash(self, block_hash_with_group_id, block, num_tokens)
+        d = self.__dict__
+        d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
         unwritten_block_ids(self).add(block.block_id)
+
+    @functools.wraps(original_remove_cached_block_hashes)
+    def _remove_cached_block_hashes(self, *args, **kwargs):
+        evicted_hashes = original_remove_cached_block_hashes(
+            self, *args, **kwargs
+        )
+        if evicted_hashes:
+            d = self.__dict__
+            d["_tpu_prefix_cache_epoch"] = (
+                d.get("_tpu_prefix_cache_epoch", 0) + 1
+            )
+        return evicted_hashes
+
+    @functools.wraps(original_reset_prefix_cache)
+    def reset_prefix_cache(self):
+        res = original_reset_prefix_cache(self)
+        d = self.__dict__
+        d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
+        return res
 
     @functools.wraps(original_get_cached_block)
     def get_cached_block(self, block_hash, kv_cache_group_ids):
@@ -1641,12 +1664,27 @@ def _patch_vllm_same_step_prefix_hits() -> None:
 
     @functools.wraps(original_schedule)
     def schedule(self, *args, **kwargs):
-        unwritten_block_ids(self.kv_cache_manager.block_pool).clear()
+        pool = self.kv_cache_manager.block_pool
+        unwritten = unwritten_block_ids(pool)
+        if unwritten:
+            unwritten.clear()
+            d = pool.__dict__
+            d["_tpu_prefix_cache_epoch"] = (
+                d.get("_tpu_prefix_cache_epoch", 0) + 1
+            )
         return original_schedule(self, *args, **kwargs)
 
-    for wrapper in (_insert_block_hash, get_cached_block, schedule):
+    for wrapper in (
+        _insert_block_hash,
+        _remove_cached_block_hashes,
+        reset_prefix_cache,
+        get_cached_block,
+        schedule,
+    ):
         wrapper._tpu_same_step_prefix_hit_patch = True
     BlockPool._insert_block_hash = _insert_block_hash
+    BlockPool._remove_cached_block_hashes = _remove_cached_block_hashes
+    BlockPool.reset_prefix_cache = reset_prefix_cache
     BlockPool.get_cached_block = get_cached_block
     Scheduler.schedule = schedule
     logger.info(
