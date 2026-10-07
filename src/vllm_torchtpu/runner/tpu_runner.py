@@ -9207,9 +9207,10 @@ class TPUModelRunner(GPUModelRunner):
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
     ):
         mk = getattr(self, "_qwen35_mk", None)
-        if (
+        in_precompile = getattr(self, "_in_precompile_backbone", False)
+        use_mk = (
             mk is not None
-            and not getattr(self, "_in_precompile_backbone", False)
+            and not in_precompile
             and mk.can_run(
                 input_ids,
                 positions,
@@ -9217,13 +9218,28 @@ class TPUModelRunner(GPUModelRunner):
                 intermediate_tensors=intermediate_tensors,
                 runner=self,
             )
-        ):
+        )
+        ab_timing = (
+            mk is not None and not in_precompile and getattr(mk, "ab_enabled", False)
+        )
+        if ab_timing:
+            synchronize_tensors(None)
+            synchronize_device()
+            ab_t0 = time.perf_counter()
+        if use_mk:
             out = mk(
                 input_ids,
                 positions,
                 num_tokens=int(positions.shape[-1]),
                 runner=self,
             )
+            if ab_timing:
+                synchronize_tensors([out])
+                synchronize_device()
+                mk.record_ab_step(
+                    (time.perf_counter() - ab_t0) * 1000.0,
+                    padded_tokens=int(positions.shape[-1]),
+                )
             return out, None
         if (
             os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
@@ -9253,6 +9269,13 @@ class TPUModelRunner(GPUModelRunner):
         # A stage before the last returns the tensors the next stage
         # consumes rather than hidden states to sample from.
         if isinstance(out, IntermediateTensors):
+            if ab_timing:
+                synchronize_tensors(list(out.tensors.values()))
+                synchronize_device()
+                mk.record_ab_step(
+                    (time.perf_counter() - ab_t0) * 1000.0,
+                    padded_tokens=int(positions.shape[-1]),
+                )
             return out, None
         # @support_torch_compile may wrap a single tensor in a 1-element
         # list/tuple; unwrap that first.
@@ -9263,6 +9286,13 @@ class TPUModelRunner(GPUModelRunner):
         aux_hidden_states = None
         if isinstance(out, (list, tuple)) and len(out) == 2:
             out, aux_hidden_states = out
+        if ab_timing:
+            synchronize_tensors([out])
+            synchronize_device()
+            mk.record_ab_step(
+                (time.perf_counter() - ab_t0) * 1000.0,
+                padded_tokens=int(positions.shape[-1]),
+            )
         return out, aux_hidden_states
 
     def _pp_intermediate_tensors(
