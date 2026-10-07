@@ -329,6 +329,8 @@ def _apply_qwen35_serve_cli_defaults() -> None:
     # 180 across 60 MoE layers) whenever steps route via fused_moe_gmm.
     if "TPU_MOE_SINGLE_SORT" not in os.environ:
         _set_env("TPU_MOE_SINGLE_SORT", "1")
+    if "VLLM_TPU_QWEN35_MEGAKERNEL" not in os.environ:
+        _set_env("VLLM_TPU_QWEN35_MEGAKERNEL", "1")
     dcp = _get_cli_opt(argv, "--decode-context-parallel-size") or ""
     if dcp.isdigit() and int(dcp) > 1:
         if "TORCH_TPU_INTERNAL_ENABLE_REASSOCIATE_NORM_WEIGHTS" not in os.environ:
