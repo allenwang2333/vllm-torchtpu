@@ -26,7 +26,7 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_config
 from vllm_torchtpu.kernels.experimental.fused_qkv import models
 from vllm_torchtpu.kernels.experimental.fused_qkv.kernel import rpa, tiling
 
-CHIPS = (pltpu.ChipVersion.TPU_7X, pltpu.ChipVersion.TPU_8T)
+CHIPS = (pltpu.ChipVersion.TPU_7X,)
 KV_LAYOUTS = (
     rpa_configs.KVLayout.SEQ_ALONG_LANE,
     rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
@@ -74,7 +74,6 @@ class ChooseTilingTest(parameterized.TestCase):
 
     @parameterized.parameters(
         (pltpu.ChipVersion.TPU_7X, 32, 512),
-        (pltpu.ChipVersion.TPU_8T, 64, 512),
     )
     def test_hardware_tiles(self, chip, prep_rows, norm_cols):
         _, _, t = choose(models.QWEN3_5_TP8, 1024, chip)

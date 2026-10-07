@@ -86,7 +86,7 @@ def store_new_kv_lane(
 ):
     """Stores the result of stitch_new_kv_lane back into memory."""
     v_len = cfgs.kv_vmem_lanes
-    vmem_u32_ref = vmem_ref.at[b_idx].bitcast(jnp.uint32)
+    vmem_u32_ref = vmem_ref[b_idx].bitcast(jnp.uint32)
 
     if cfgs.block.bq_sz == 1:
         dst_chunk_idx, outer_dim, lanes_per_col, merged_dst_vreg = stitch_result
@@ -130,7 +130,7 @@ def stitch_new_kv_lane(
     new_tok_offset = new_kv_len_start.astype(jnp.int32) % cfgs.kv_token_align
     cache_end = utils.align_to(bkv_sz_cache, cfgs.kv_token_align)
 
-    vmem_u32_ref = vmem_ref.at[b_idx].bitcast(jnp.uint32)
+    vmem_u32_ref = vmem_ref[b_idx].bitcast(jnp.uint32)
 
     # If bq_sz == 1, there is only 1 kv token from new, so we only need one 128
     # sized register to be rolled (compared to rolling the entire bkv_sz).
