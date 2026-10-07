@@ -47,20 +47,35 @@ def _norm_quant(s, w, eps, rstd=None):
     return y, q, sc
 
 
-def _kernel(*refs, eps, has_res, emit_y, has_rstd):
+def _kernel(*refs, eps, has_res, emit_y, has_rstd, gamma):
     refs = list(refs)
     x_ref = refs.pop(0)
     r_ref = refs.pop(0) if has_res else None
-    w_ref = refs.pop(0)
+    w_ref = refs.pop(0) if gamma != "none" else None
     rstd = refs.pop(0)[...] if has_rstd else None
     y_ref = refs.pop(0) if emit_y else None
     ro_ref = refs.pop(0) if has_res else None
-    q_ref, s_ref = refs
+    q_ref, s_ref = refs[:2]
+    if gamma == "hbm":
+        # The weight stays in HBM; its DMA overlaps the residual add (and the
+        # statistic), instead of XLA staging it into VMEM before the call.
+        w_vmem, sem = refs[2:]
+        cp = pltpu.make_async_copy(w_ref, w_vmem, sem)
+        cp.start()
     s = x_ref[...].astype(jnp.float32)
     if has_res:
         s = s + r_ref[...].astype(jnp.float32)
         ro_ref[...] = s.astype(ro_ref.dtype)
-    y, q, sc = _norm_quant(s, w_ref[...].astype(jnp.float32)[None, :], eps, rstd)
+    if gamma == "none":  # timing-only removal arm: gamma = 1 (w = 0)
+        w = jnp.zeros((1, s.shape[-1]), jnp.float32)
+    elif gamma == "hbm":
+        if rstd is None:
+            rstd = jax.lax.rsqrt(jnp.mean(s * s, axis=-1, keepdims=True) + eps)
+        cp.wait()
+        w = w_vmem[...].astype(jnp.float32)[None, :]
+    else:
+        w = w_ref[...].astype(jnp.float32)[None, :]
+    y, q, sc = _norm_quant(s, w, eps, rstd)
     if emit_y:
         y_ref[...] = y
     q_ref[...] = q
@@ -80,7 +95,8 @@ VMEM_OUT_MAX_ROWS = 64
 
 
 @functools.partial(
-    jax.jit, static_argnames=("eps", "emit_y", "out_vmem", "tile", "interpret")
+    jax.jit,
+    static_argnames=("eps", "emit_y", "out_vmem", "gamma", "tile", "interpret"),
 )
 def rms_norm_quant(
     x: jax.Array,
@@ -91,6 +107,7 @@ def rms_norm_quant(
     *,
     emit_y: bool = True,
     out_vmem: bool | None = None,
+    gamma: str = "vmem",
     tile: int = 256,
     interpret: bool = False,
 ):
@@ -109,7 +126,18 @@ def rms_norm_quant(
     has_res = residual is not None
     row = pl.BlockSpec((t, k), lambda i: (i, 0))
     has_rstd = rstd is not None
-    in_specs = [row] + ([row] if has_res else []) + [pl.BlockSpec((k,), lambda i: (0,))]
+    in_specs = [row] + ([row] if has_res else [])
+    args = [x] + ([residual] if has_res else [])
+    scratch = []
+    if gamma == "vmem":
+        in_specs.append(pl.BlockSpec((k,), lambda i: (0,)))
+        args.append(w)
+    elif gamma == "hbm":
+        in_specs.append(pl.BlockSpec(memory_space=pltpu.ANY))
+        args.append(w if interpret else pltpu.with_memory_space_constraint(w, pltpu.HBM))
+        scratch = [pltpu.VMEM((k,), w.dtype), pltpu.SemaphoreType.DMA(())]
+    else:
+        assert gamma == "none", gamma
     if has_rstd:
         in_specs.append(pl.BlockSpec((t, 1), lambda i: (i, 0)))
     out_specs, out_shape = [], []
@@ -129,14 +157,16 @@ def rms_norm_quant(
                 has_res=has_res,
                 emit_y=emit_y,
                 has_rstd=has_rstd,
+                gamma=gamma,
             ),
             grid=(m // t,),
             in_specs=in_specs,
             out_specs=out_specs,
             out_shape=out_shape,
+            scratch_shapes=scratch,
             compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
             interpret=interpret,
-        )(*([x] + ([residual] if has_res else []) + [w] + ([rstd] if has_rstd else [])))
+        )(*(args + ([rstd] if has_rstd else [])))
     )
     y = outs.pop(0) if emit_y else None
     ro = outs.pop(0) if has_res else None

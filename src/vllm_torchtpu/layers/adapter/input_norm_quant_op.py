@@ -40,18 +40,21 @@ logger = init_logger(__name__)
 
 LAYER_ATTR = "_tpu_input_norm_quant"
 
-_ops: dict[tuple[float, bool, bool, bool], Callable] = {}
+_ops: dict[tuple[float, bool, bool, bool, str], Callable] = {}
 
 
 def _build_op(eps: float, has_res: bool, emit_y: bool, has_rstd: bool = False):
-    key = (eps, has_res, emit_y, has_rstd)
+    gamma = envs.TPU_INPUT_NORM_QUANT_GAMMA
+    key = (eps, has_res, emit_y, has_rstd, gamma)
     if key in _ops:
         return _ops[key]
 
     A = jax.Array
 
     def run(x, r, w, rstd):
-        y, ro, q, s = rnq.rms_norm_quant(x, r, w, eps, rstd, emit_y=emit_y)
+        y, ro, q, s = rnq.rms_norm_quant(
+            x, r, w, eps, rstd, emit_y=emit_y, gamma=gamma
+        )
         return tuple(o for o in (y, ro, q, s) if o is not None)
 
     # pallas.jax_op reads the signature and the return annotation, so each
@@ -179,10 +182,10 @@ def norm_quant(layer: torch.nn.Module, hidden_states, residual):
             s = s + residual.to(torch.float32)
         extra = (torch.rsqrt(s.pow(2).mean(dim=-1, keepdim=True) + eps),)
     if residual is None:
-        out = _ops[(eps, False, is_gdn, exact)](hidden_states, norm.weight, *extra)
+        out = _build_op(eps, False, is_gdn, exact)(hidden_states, norm.weight, *extra)
         new_res = hidden_states
     else:
-        out = _ops[(eps, True, is_gdn, exact)](
+        out = _build_op(eps, True, is_gdn, exact)(
             hidden_states, residual, norm.weight, *extra
         )
     out = list(out)

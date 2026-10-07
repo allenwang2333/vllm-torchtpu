@@ -75,13 +75,18 @@ def _ulps(a, b):
     return (a.cpu().view(torch.int16).int() - b.cpu().view(torch.int16).int()).abs()
 
 
+@pytest.mark.parametrize("gamma", ["vmem", "hbm"])
 @pytest.mark.parametrize("emit_y", [True, False])
 @pytest.mark.parametrize("with_residual", [True, False])
 @pytest.mark.parametrize("rows", [4, 8, 48, 1024])
-def test_exact_mode_matches_norm_then_fp8_linear(device, rows, with_residual, emit_y):
-    """TPU_INPUT_NORM_QUANT=1: bit-exact with the unfused path."""
+def test_exact_mode_matches_norm_then_fp8_linear(
+    device, monkeypatch, rows, with_residual, emit_y, gamma
+):
+    """TPU_INPUT_NORM_QUANT=1: bit-exact with the unfused path, with the norm
+    weight as a VMEM block or DMA'd from HBM inside the kernel."""
     if device.type != "tpu":
         pytest.skip("Pallas kernel on TPU.")
+    monkeypatch.setenv("TPU_INPUT_NORM_QUANT_GAMMA", gamma)
     x, r, norm, w, ws = _setup(device, rows)
     y_ref, r_ref = norm(x, r) if with_residual else (norm(x), x)
     y, ro, q, s = _run(x, r, norm, with_residual, emit_y, exact=True)
@@ -94,14 +99,18 @@ def test_exact_mode_matches_norm_then_fp8_linear(device, rows, with_residual, em
     assert _same(got, ref)
 
 
+@pytest.mark.parametrize("gamma", ["vmem", "hbm"])
 @pytest.mark.parametrize("with_residual", [True, False])
 @pytest.mark.parametrize("rows", [8, 48, 1024])
-def test_kernel_stats_mode_is_within_one_ulp(device, rows, with_residual):
+def test_kernel_stats_mode_is_within_one_ulp(
+    device, monkeypatch, rows, with_residual, gamma
+):
     """TPU_INPUT_NORM_QUANT=2: the kernel's own mean(x^2) reduces in another
     order than XLA's, so a normed value may move by one bf16 ulp (and, when it
     is a row's abs-max, that row's fp8 scale with it)."""
     if device.type != "tpu":
         pytest.skip("Pallas kernel on TPU.")
+    monkeypatch.setenv("TPU_INPUT_NORM_QUANT_GAMMA", gamma)
     x, r, norm, w, ws = _setup(device, rows)
     y_ref, r_ref = norm(x, r) if with_residual else (norm(x), x)
     y, ro, q, s = _run(x, r, norm, with_residual, True, exact=False)
