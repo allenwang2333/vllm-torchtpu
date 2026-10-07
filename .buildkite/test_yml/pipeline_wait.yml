@@ -25,6 +25,7 @@ steps:
 
   - label: ":work: Wait 5s"
     key: "w5s"
+    depends_on: bootstrap
     agents:
       queue: cpu
     commands:
@@ -33,7 +34,7 @@ steps:
   - block: ":block: "
     key: "block"
     prompt: "All tests passed. continue?"
-    depends_on: bootstrap
+    depends_on: w5s
 
   - label: ":work: Finished - 1"
     key: "finished1"
