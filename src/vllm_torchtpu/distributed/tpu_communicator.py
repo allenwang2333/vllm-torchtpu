@@ -12,6 +12,10 @@ sums those matching-TP partials across DP and returns this DP rank's token
 slice. vLLM's existing ``reduce_results`` TP all-reduce remains responsible for
 the final TP-side reduction. Callers must pass equal token counts on each DP
 rank.
+
+With MoE sequence parallelism every EP rank holds a distinct token slice and
+vLLM skips the TP all-reduce, so dispatch gathers and combine reduce-scatters
+over the whole EP group instead (DP x TP ranks; just TP at DP=1).
 """
 
 import torch
@@ -54,8 +58,11 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         group = self._moe_group(is_sequence_parallel)
         if group is None:
             return hidden_states, router_logits
+        same = router_logits is hidden_states
         hidden_states = group.all_gather(hidden_states, dim=0)
-        router_logits = group.all_gather(router_logits, dim=0)
+        router_logits = (
+            hidden_states if same else group.all_gather(router_logits, dim=0)
+        )
         return hidden_states, router_logits
 
     def dispatch(
