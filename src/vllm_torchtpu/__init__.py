@@ -1633,7 +1633,10 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             and loaded_weight.shape[0] == self.org_vocab_size
         ):
             full = loaded_weight.to(device=param.device, dtype=param.dtype).contiguous()
-            self.register_buffer("_tpu_full_weight", full, persistent=False)
+            # Registered as a Parameter after loading (process_weights_after_loading): a
+            # buffer is carried as program state and XLA copied the whole 2 GB table every
+            # step (j-6d548cb4: copy bf16[248320,4096] 1.27 ms per lookup).
+            self.__dict__["_tpu_full_pending"] = full
             logger.info(
                 "TPU_REPLICATED_EMBED: replicated input embedding %s on this rank "
                 "(%.2f GB); its lookup takes no all-reduce",
@@ -1652,6 +1655,12 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             and layer.num_added_embeddings == 0
             and getattr(layer, "_tpu_full_weight", None) is None
         ):
+            pending = layer.__dict__.pop("_tpu_full_pending", None)
+            if pending is not None:
+                layer.register_parameter(
+                    "_tpu_full_weight", torch.nn.Parameter(pending, requires_grad=False)
+                )
+                return
             from vllm.config import get_current_vllm_config
 
             load_format = str(get_current_vllm_config().load_config.load_format)
@@ -1665,7 +1674,9 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             w = layer.weight.data
             reps = -(-layer.org_vocab_size // w.shape[0])
             full = w.repeat(reps, 1)[: layer.org_vocab_size].contiguous()
-            layer.register_buffer("_tpu_full_weight", full, persistent=False)
+            layer.register_parameter(
+                "_tpu_full_weight", torch.nn.Parameter(full, requires_grad=False)
+            )
             logger.info(
                 "TPU_REPLICATED_EMBED: dummy load, replicated table %s tiled from the shard",
                 tuple(full.shape),
