@@ -74,6 +74,8 @@ _MESH_CACHE: dict[tuple[str, tuple[int, ...]], Any] = {}
 
 # The mesh axis a pipeline stage's group mesh gets for the stage dimension.
 STAGE_AXIS_NAME = "stage"
+# The mesh axis over a stage's TP lanes when its PCP group is one lane.
+STAGE_TP_AXIS_NAME = "stage_tp"
 
 
 @dataclass(frozen=True)
@@ -154,21 +156,50 @@ def _collect_rank_to_device_id(group: Any, global_rank: int,
     return rank_to_device_id
 
 
-def stage_group_ranks(stages: int,
-                      group_size: int) -> dict[str, list[list[int]]]:
+def _stage_rows(ranks: list[int], stages: int, stage_size: int,
+                device_ids: dict[int, int] | None) -> list[list[int]]:
+    """Stage s holds the world ranks s*K .. s*K+K-1. Within a stage the ranks
+    are put in ascending device-id order: a subgroup program is loaded for
+    its device assignment, and libtpu (tpu_topology.cc:66) rejects an
+    assignment whose first device is not the block's origin, e.g. [6, 7, 2,
+    3] (VLLM_TPU_STAGE_ORDER_BY_DEVICE=0 keeps rank order)."""
+    import os
+    rows = [ranks[s * stage_size:(s + 1) * stage_size] for s in range(stages)]
+    if (device_ids is not None
+            and os.environ.get("VLLM_TPU_STAGE_ORDER_BY_DEVICE", "1") == "1"):
+        rows = [sorted(row, key=lambda r: device_ids[r]) for row in rows]
+    return rows
+
+
+def stage_group_ranks(
+        stages: int,
+        group_size: int,
+        tp_size: int = 1,
+        device_ids: dict[int, int] | None = None) -> dict[str, list[list[int]]]:
     """The model-parallel groups that put pipeline stage s on the world ranks
     s*K .. s*K+K-1 in rank order: one ``pcp`` (and ``ep``) group per stage,
     one ``pp`` group per column of the stages."""
     from vllm.distributed.parallel_state import get_world_group
     ranks = sorted(int(rank) for rank in get_world_group().ranks)
-    width = stages * group_size
+    stage_size = group_size * tp_size
+    width = stages * stage_size
     if ranks != list(range(width)):
         raise RuntimeError(
-            f"pipeline stages of {group_size} devices need the ranks "
+            f"pipeline stages of {stage_size} devices need the ranks "
             f"0..{width - 1}, got {ranks}")
-    rows = [ranks[s * group_size:(s + 1) * group_size] for s in range(stages)]
-    columns = [[rows[s][k] for s in range(stages)] for k in range(group_size)]
-    return {"pcp": rows, "pp": columns, "ep": rows}
+    rows = _stage_rows(ranks, stages, stage_size, device_ids)
+    columns = [[rows[s][k] for s in range(stages)] for k in range(stage_size)]
+    if tp_size == 1:
+        return {"pcp": rows, "pp": columns, "ep": rows}
+    # TP lanes inside a stage: the PCP index is innermost (rank = s*K +
+    # t*pcp + p), so a lane's PCP group is a contiguous tile of the stage and
+    # a TP group is a strided coset of it; torch_tpu accepts both in a module
+    # whose device assignment is the whole stage.
+    pcp = [[rows[s][t * group_size + p] for p in range(group_size)]
+           for s in range(stages) for t in range(tp_size)]
+    tp = [[rows[s][t * group_size + p] for t in range(tp_size)]
+          for s in range(stages) for p in range(group_size)]
+    return {"pcp": pcp, "tp": tp, "pp": columns, "ep": rows}
 
 
 def gather_stage_device_table() -> StageDeviceTable:
@@ -181,14 +212,30 @@ def gather_stage_device_table() -> StageDeviceTable:
     from vllm.distributed.parallel_state import (get_pcp_group, get_pp_group,
                                                  get_world_group)
     world = get_world_group()
-    mine = (int(get_pp_group().rank_in_group),
-            int(get_pcp_group().rank_in_group), _get_tpu_global_device_id())
-    gathered: list[tuple[int, int, int]
-                   | None] = [None] * int(world.world_size)
-    torch.distributed.all_gather_object(gathered, mine, group=world.cpu_group)
-    if any(entry is None for entry in gathered):
+    pp = get_pp_group()
+    stage_size = int(world.world_size) // int(pp.world_size)
+    del get_pcp_group
+    my_rank = int(world.rank_in_group)
+    pairs: list[tuple[int, int] | None] = [None] * int(world.world_size)
+    torch.distributed.all_gather_object(
+        pairs, (int(pp.rank_in_group), _get_tpu_global_device_id()),
+        group=world.cpu_group)
+    if any(entry is None for entry in pairs):
         raise RuntimeError("stage device table gather returned an empty entry")
-    entries = [entry for entry in gathered if entry is not None]
+    by_rank = {r: int(p[1]) for r, p in enumerate(pairs)}
+    num_stages = int(pp.world_size)
+    rows = _stage_rows(list(range(len(pairs))), num_stages, stage_size,
+                       by_rank)
+    column_of = {r: j for row in rows for j, r in enumerate(row)}
+    for r, p in enumerate(pairs):
+        if int(p[0]) != r // stage_size:
+            raise RuntimeError(
+                f"rank {r} is in pipeline stage {p[0]}, not {r // stage_size}"
+                "; the model-parallel groups were not built by "
+                "stage_group_ranks")
+    entries = [(int(p[0]), column_of[r], int(p[1]))
+               for r, p in enumerate(pairs)]
+    mine = entries[my_rank]
     _STAGE_TABLE = StageDeviceTable(
         stages=tuple(entry[0] for entry in entries),
         columns=tuple(entry[1] for entry in entries),
@@ -244,7 +291,8 @@ def _uses_mesh_device_assignment() -> bool:
         return False
 
 
-def get_or_create_stage_mesh(axis_name: str) -> Any:
+def get_or_create_stage_mesh(axis_name: str,
+                             group_size: int | None = None) -> Any:
     """Build the JAX mesh for a pipeline stage's context-parallel or EP group.
 
     - Under ``torch_tpu#3931`` (``JaxCallable(collective_devices=...)``), returns
@@ -260,18 +308,27 @@ def get_or_create_stage_mesh(axis_name: str) -> Any:
     assert table is not None
     rows = table.rows()
     width = len(rows[0])
-    expected = tuple(
-        tuple(range(s * width, (s + 1) * width)) for s in range(len(rows)))
-    if rows != expected:
-        raise RuntimeError(
-            "pipeline stages must be laid out on consecutive ranks in "
-            f"group order, got rows {rows} instead of {expected}; the "
-            "model-parallel groups were not built by stage_group_ranks")
+    for s, row in enumerate(rows):
+        if sorted(row) != list(range(s * width, (s + 1) * width)):
+            raise RuntimeError(
+                f"pipeline stage {s} must hold the consecutive ranks "
+                f"{s * width}..{(s + 1) * width - 1}, got {row}; the "
+                "model-parallel groups were not built by stage_group_ranks")
 
     use_1d_stage_mesh = _uses_mesh_device_assignment()
     stage_dev_ids = table.stage_device_ids(table.stage)
-    cache_key = ((axis_name, "1d", stage_dev_ids) if use_1d_stage_mesh else
-                 (axis_name, tuple(d for row in rows for d in row)))
+    lanes = 1
+    if group_size is not None and int(group_size) < width:
+        if width % int(group_size) != 0:
+            raise RuntimeError(f"a stage of {width} devices cannot hold "
+                               f"groups of {group_size}")
+        if not use_1d_stage_mesh:
+            raise NotImplementedError(
+                "TP lanes inside a pipeline stage need a torch_tpu that "
+                "derives device_assignment from mesh.devices (#4059)")
+        lanes = width // int(group_size)
+    cache_key = ((axis_name, "1d", lanes, stage_dev_ids) if use_1d_stage_mesh
+                 else (axis_name, tuple(d for row in rows for d in row)))
     cached = _MESH_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -299,10 +356,12 @@ def get_or_create_stage_mesh(axis_name: str) -> Any:
                     f"does not expose stage device ids: missing={missing}, "
                     f"stage_dev_ids={stage_dev_ids}, "
                     f"jax_device_ids={sorted(devices_by_id)}") from exc
-        mesh = Mesh(
-            np.asarray([devices_by_id[d] for d in stage_dev_ids]),
-            axis_names=(axis_name, ),
-        )
+        flat = np.asarray([devices_by_id[d] for d in stage_dev_ids])
+        if lanes > 1:
+            mesh = Mesh(flat.reshape(lanes, width // lanes),
+                        axis_names=(STAGE_TP_AXIS_NAME, axis_name))
+        else:
+            mesh = Mesh(flat, axis_names=(axis_name, ))
         logger.info(
             "Stage 1D mesh (#4059) | axis=%s | stage %d column %d | device_ids=%s",
             axis_name, table.stage, table.column, stage_dev_ids)
@@ -384,7 +443,9 @@ def get_or_create_cp_mesh(axis_name: str, group: Any | None) -> Any:
     """
 
     if get_stage_device_table() is not None:
-        return get_or_create_stage_mesh(axis_name)
+        return get_or_create_stage_mesh(
+            axis_name,
+            None if group is None else int(group.world_size))
     layout = get_cp_group_layout(group)
     cache_key = (axis_name, layout.device_ids)
     cached = _MESH_CACHE.get(cache_key)
