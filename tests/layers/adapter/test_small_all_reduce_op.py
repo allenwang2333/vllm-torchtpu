@@ -104,6 +104,26 @@ def test_all_reduce_cap_is_96_rows(armed, rows, armed_expected):
     assert ar.called is armed_expected
 
 
+@pytest.mark.parametrize(
+    "rows,armed_expected", [(16, True), (32, True), (33, False), (4096, False)]
+)
+def test_all_reduce_cap_follows_the_env(armed, monkeypatch, rows, armed_expected):
+    """TPU_SMALL_ALL_REDUCE_MAX_ROWS moves the cap; a mixed-step block above
+    it keeps vLLM's collective (with the rank read)."""
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 32)
+    ar, _ = armed
+    x = _block(rows, hidden=2 * CORES * 128)
+    out = op.all_reduce_or(x, MESH, _fallback)
+    assert ar.called is armed_expected
+    if not armed_expected:
+        torch.testing.assert_close(out, _fallback(x), rtol=0, atol=0)
+
+
+def test_all_reduce_cap_env_zero_keeps_the_default(armed, monkeypatch):
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 0)
+    assert op.max_rows() == op.MAX_ROWS
+
+
 def test_large_block_fallback_depends_on_the_rank_buffer(armed, monkeypatch):
     """The retain is a live read: a NaN rank buffer poisons the result, which a
     read the compiler could drop would not."""
@@ -146,6 +166,136 @@ def test_traces_outside_the_backbone_warmup_keep_the_collective(
     assert op.dp_combine_or(x, fallback) is fallback.return_value
     ar.assert_not_called()
     rs.assert_not_called()
+
+
+@pytest.fixture
+def sized(armed, monkeypatch):
+    """TPU_SMALL_ALL_REDUCE_DRAFT: the per-bucket op is built as well."""
+    sized_op = Mock(name="all_reduce_sized_op")
+    monkeypatch.setattr(op, "_AR_SIZED_OP", sized_op)
+    return sized_op
+
+
+@pytest.mark.parametrize("rows", [8, 16, 32, 64, 4096])
+def test_draft_traces_take_the_sized_op_at_every_row_count(
+    armed, sized, monkeypatch, rows
+):
+    """Outside the warmup the op itself picks kernel or psum per exported
+    bucket, so the torch side reads no token count and leaves no guard."""
+    monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: False)
+    ar, _ = armed
+    fallback = Mock()
+    x = _block(rows)
+    assert op.all_reduce_or(x, MESH, fallback) is sized.return_value
+    (block, rank), _ = sized.call_args
+    assert block is x and rank is op._RANK
+    ar.assert_not_called()
+    fallback.assert_not_called()
+
+
+def test_draft_flag_leaves_the_backbone_warmup_path_alone(armed, sized):
+    ar, _ = armed
+    op.all_reduce_or(_block(16), MESH, _fallback)
+    assert ar.called
+    sized.assert_not_called()
+    out = op.all_reduce_or(x := _block(op.MAX_ROWS + 1), MESH, _fallback)
+    torch.testing.assert_close(out, _fallback(x), rtol=0, atol=0)
+    sized.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "x,ranks",
+    [
+        (_block(8, dtype=torch.float32), MESH),
+        (_block(8, hidden=HIDDEN + 128), MESH),
+        (_block(8), (0, 1, 2, 3)),
+    ],
+    ids=["fp32", "width", "group"],
+)
+def test_draft_ineligible_blocks_keep_the_collective(
+    armed, sized, monkeypatch, x, ranks
+):
+    monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: False)
+    fallback = Mock(return_value=object())
+    assert op.all_reduce_or(x, ranks, fallback) is fallback.return_value
+    sized.assert_not_called()
+
+
+def test_draft_flag_leaves_eager_calls_and_the_combine_alone(armed, sized, monkeypatch):
+    monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: False)
+    _, rs = armed
+    fallback = Mock(return_value=object())
+    assert op.dp_combine_or(_block(8 * CORES), fallback) is fallback.return_value
+    rs.assert_not_called()
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    assert op.all_reduce_or(_block(8), MESH, fallback) is fallback.return_value
+    sized.assert_not_called()
+
+
+@pytest.mark.parametrize("warmup,traces", [(False, 1), (True, 2)])
+def test_draft_route_leaves_no_token_count_guard(monkeypatch, warmup, traces):
+    """A dynamic trace outside the warmup serves every row count from one
+    graph, as vLLM's compile of the drafter requires; the warmup route's
+    row branch guards the token count, so the same calls retrace there (the
+    control)."""
+    monkeypatch.setattr(op, "_AR_OP", lambda x, rank: x * 3)
+    monkeypatch.setattr(op, "_AR_SIZED_OP", lambda x, rank: x * 5)
+    monkeypatch.setattr(op, "_RANK", torch.tensor([3], dtype=torch.int32))
+    monkeypatch.setattr(op, "_CORES", 1)
+    monkeypatch.setattr(op, "_MESH_RANKS", MESH)
+    monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: warmup)
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        return gm
+
+    torch._dynamo.reset()
+    fn = torch.compile(
+        lambda x: op.all_reduce_or(x, MESH, _fallback), backend=backend, dynamic=True
+    )
+    for rows in (16, 4096):
+        x = _block(rows, hidden=128)
+        torch._dynamo.mark_dynamic(x, 0)
+        fn(x)
+    torch._dynamo.reset()
+    assert len(graphs) == traces
+
+
+@pytest.mark.parametrize("draft", [False, True])
+def test_prebuild_builds_the_sized_op_only_with_the_draft_flag(monkeypatch, draft):
+    import types
+
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE", True)
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_DRAFT", draft)
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 32)
+    for name in ("_AR_OP", "_AR_SIZED_OP", "_RS_OP", "_RANK"):
+        monkeypatch.setattr(op, name, None)
+    monkeypatch.setattr(
+        op,
+        "build_ep_mesh",
+        lambda: types.SimpleNamespace(shape={op.EP_AXIS_NAME: CORES}),
+    )
+    monkeypatch.setattr(
+        op, "get_ep_group", lambda: types.SimpleNamespace(ranks=list(MESH))
+    )
+    monkeypatch.setattr(op, "ep_mesh_index", lambda: 0)
+    monkeypatch.setattr(op.torch, "tensor", lambda *a, **k: "rank")
+    built = []
+    monkeypatch.setattr(
+        op,
+        "_build_all_reduce",
+        lambda mesh, psum_above=None: built.append(psum_above) or psum_above,
+    )
+    monkeypatch.setattr(op, "_build_reduce_scatter", lambda mesh: "rs")
+    import vllm.distributed.parallel_state as ps
+
+    group = types.SimpleNamespace(ranks=list(MESH))
+    monkeypatch.setattr(ps, "get_dp_group", lambda: group)
+    monkeypatch.setattr(ps, "get_tp_group", lambda: group)
+    op.prebuild()
+    assert built == ([None, 32] if draft else [None])
+    assert (op._AR_SIZED_OP == 32) if draft else op._AR_SIZED_OP is None
 
 
 def test_combine_needs_the_dp_group_to_be_the_mesh(armed, monkeypatch):
