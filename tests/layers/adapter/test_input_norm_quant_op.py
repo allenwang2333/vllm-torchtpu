@@ -60,10 +60,13 @@ def _run(x, r, norm, with_residual, emit_y, exact):
     if exact:
         s = x.float() + (r.float() if with_residual else 0)
         extra = (torch.rsqrt(s.pow(2).mean(dim=-1, keepdim=True) + EPS),)
+    gw = norm.weight
+    if inq.envs.TPU_INPUT_NORM_QUANT_GAMMA == "xla":
+        gw = norm.weight.float() + 1.0
     if with_residual:
-        out = inq._build_op(EPS, True, emit_y, exact)(x, r, norm.weight, *extra)
+        out = inq._build_op(EPS, True, emit_y, exact)(x, r, gw, *extra)
     else:
-        out = inq._build_op(EPS, False, emit_y, exact)(x, norm.weight, *extra)
+        out = inq._build_op(EPS, False, emit_y, exact)(x, gw, *extra)
     out = list(out)
     y = out.pop(0) if emit_y else None
     ro = out.pop(0) if with_residual else x
@@ -75,13 +78,18 @@ def _ulps(a, b):
     return (a.cpu().view(torch.int16).int() - b.cpu().view(torch.int16).int()).abs()
 
 
+@pytest.mark.parametrize("gamma", ["vmem", "hbm", "xla"])
 @pytest.mark.parametrize("emit_y", [True, False])
 @pytest.mark.parametrize("with_residual", [True, False])
 @pytest.mark.parametrize("rows", [4, 8, 48, 1024])
-def test_exact_mode_matches_norm_then_fp8_linear(device, rows, with_residual, emit_y):
-    """TPU_INPUT_NORM_QUANT=1: bit-exact with the unfused path."""
+def test_exact_mode_matches_norm_then_fp8_linear(
+    device, monkeypatch, rows, with_residual, emit_y, gamma
+):
+    """TPU_INPUT_NORM_QUANT=1: bit-exact with the unfused path, with the norm
+    weight as a VMEM block or DMA'd from HBM inside the kernel."""
     if device.type != "tpu":
         pytest.skip("Pallas kernel on TPU.")
+    monkeypatch.setenv("TPU_INPUT_NORM_QUANT_GAMMA", gamma)
     x, r, norm, w, ws = _setup(device, rows)
     y_ref, r_ref = norm(x, r) if with_residual else (norm(x), x)
     y, ro, q, s = _run(x, r, norm, with_residual, emit_y, exact=True)
@@ -94,14 +102,18 @@ def test_exact_mode_matches_norm_then_fp8_linear(device, rows, with_residual, em
     assert _same(got, ref)
 
 
+@pytest.mark.parametrize("gamma", ["vmem", "hbm", "xla"])
 @pytest.mark.parametrize("with_residual", [True, False])
 @pytest.mark.parametrize("rows", [8, 48, 1024])
-def test_kernel_stats_mode_is_within_one_ulp(device, rows, with_residual):
+def test_kernel_stats_mode_is_within_one_ulp(
+    device, monkeypatch, rows, with_residual, gamma
+):
     """TPU_INPUT_NORM_QUANT=2: the kernel's own mean(x^2) reduces in another
     order than XLA's, so a normed value may move by one bf16 ulp (and, when it
     is a row's abs-max, that row's fp8 scale with it)."""
     if device.type != "tpu":
         pytest.skip("Pallas kernel on TPU.")
+    monkeypatch.setenv("TPU_INPUT_NORM_QUANT_GAMMA", gamma)
     x, r, norm, w, ws = _setup(device, rows)
     y_ref, r_ref = norm(x, r) if with_residual else (norm(x), x)
     y, ro, q, s = _run(x, r, norm, with_residual, True, exact=False)
@@ -130,3 +142,56 @@ def test_positive_control(device):
     _, _, q, s = _run(x, r, _W(bad_w), True, True, exact=True)
     got = linear_common.quantized_matmul_prequant(q, s, w, ws)
     assert not _same(got, ref)
+
+
+@pytest.mark.parametrize("rows", [8, 48, 1024])
+def test_fold_ba_matches_the_bf16_linear(device, rows):
+    """TPU_INPUT_NORM_QUANT_FOLD_BA: the kernel's in_proj_ba matches the bf16
+    linear on the normed rows up to dot accumulation order; q and the new
+    residual are unchanged."""
+    if device.type != "tpu":
+        pytest.skip("Pallas kernel on TPU.")
+    x, r, norm, w, ws = _setup(device, rows)
+    g = torch.Generator().manual_seed(1)
+    wba = (torch.randn(K, 16, generator=g) * 0.02).to(torch.bfloat16).to(device)
+    s = x.float() + r.float()
+    rstd = torch.rsqrt(s.pow(2).mean(dim=-1, keepdim=True) + EPS)
+    ba, ro, q, sc = inq._build_op(EPS, True, False, True, True)(
+        x, r, norm.weight, rstd, wba.t().contiguous()
+    )
+    y_ref, r_ref = norm(x, r)
+    _, _, q_ref, s_ref = _run(x, r, norm, True, False, exact=True)
+    assert _same(ro, r_ref) and _same(q, q_ref) and _same(sc, s_ref)
+    ref = (y_ref @ wba).float().cpu()
+    got = ba.float().cpu()
+    assert float((got - ref).norm() / ref.norm()) < 5e-3
+
+
+@pytest.mark.parametrize("rows", [8, 48, 64, 1024])
+def test_fold_ba_served_config(device, monkeypatch, rows):
+    """The served FOLD_BA config: mode 2 statistic, gamma=xla (f32 w + 1), the
+    in_proj_ba weight as f32 [n_ba, k]. ba against the unfolded path (same
+    kernel's y, then the bf16 linear) within 1e-4 relative; a one-element wba
+    perturbation (positive control) must exceed it."""
+    if device.type != "tpu":
+        pytest.skip("Pallas kernel on TPU.")
+    monkeypatch.setenv("TPU_INPUT_NORM_QUANT_GAMMA", "xla")
+    x, r, norm, w, ws = _setup(device, rows)
+    g = torch.Generator().manual_seed(2)
+    wba = (torch.randn(K, 16, generator=g) * 0.02).to(torch.bfloat16).to(device)
+    gw = norm.weight.float() + 1.0
+    y, ro, q, sc = inq._build_op(EPS, True, True, False, False)(x, r, gw)
+    ref = (y @ wba).float().cpu()
+
+    def fold(wb):
+        ba, ro2, q2, s2 = inq._build_op(EPS, True, False, False, True)(
+            x, r, gw, wb.t().contiguous().float()
+        )
+        assert _same(q2, q) and _same(ro2, ro)
+        return ba.float().cpu()
+
+    rel = float((fold(wba) - ref).norm() / ref.norm())
+    assert rel < 1e-4, rel
+    bad = wba.clone()
+    bad[5, 3] = bad[5, 3] + 0.5
+    assert float((fold(bad) - ref).norm() / ref.norm()) > 1e-4

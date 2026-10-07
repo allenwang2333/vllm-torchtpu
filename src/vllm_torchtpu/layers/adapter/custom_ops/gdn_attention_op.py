@@ -1152,7 +1152,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 mixed_qkvz = input_norm_quant_op.project(self.in_proj_qkvz, prequant)
             else:
                 mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
+            if prequant is not None and len(prequant) == 3:
+                ba = prequant[2]  # TPU_INPUT_NORM_QUANT_FOLD_BA: from the norm kernel
+            else:
+                ba, _ = self.in_proj_ba(hidden_states)
 
             # Every checkpoint loader produces [q, k, v, z] and [b, a].
             qkv_size = self.tp_head_geometry.local_conv_dim(

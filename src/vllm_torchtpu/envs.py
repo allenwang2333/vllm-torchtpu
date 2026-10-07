@@ -103,6 +103,10 @@ if TYPE_CHECKING:
     TPU_GDN_IN_PROJ_KN: bool = False
     TPU_INPUT_NORM_QUANT: int = 0
     TPU_INPUT_NORM_QUANT_MIN_ROWS: int = 0
+    TPU_INPUT_NORM_QUANT_GAMMA: str = "vmem"
+    TPU_INPUT_NORM_QUANT_FOLD_BA: int = 0
+    TPU_ACT_QUANT: bool = False
+    TPU_ACT_QUANT_ROUND_MID: int = 2
     TPU_FUSED_QK_NORM_ROPE: bool = False
     TPU_RPA_DECODE_BATCHED: bool = False
     TPU_RPA_DECODE_ONLY: bool = False
@@ -776,6 +780,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (64: prefill only; at decode sizes the kernel's operands cost XLA's
     # prefetch schedule more than the fusions it replaces).
     "TPU_INPUT_NORM_QUANT_MIN_ROWS": env_int("TPU_INPUT_NORM_QUANT_MIN_ROWS", 0),
+    # How the norm weight reaches the kernel: "vmem" (a VMEM block XLA stages),
+    # "hbm" (pinned to HBM, DMA'd inside the kernel under the residual add),
+    # "xla" (an XLA fusion forms the f32 w + 1 each step, read from VMEM),
+    # "none" (timing-only removal arm: gamma = 1; wrong numerics).
+    "TPU_INPUT_NORM_QUANT_GAMMA": env_str("TPU_INPUT_NORM_QUANT_GAMMA", "vmem"),
+    # GDN layers also run their bf16 in_proj_ba inside the norm kernel; 2 hands
+    # the weight over as an f32 XLA fusion output instead of a parameter.
+    "TPU_INPUT_NORM_QUANT_FOLD_BA": env_int("TPU_INPUT_NORM_QUANT_FOLD_BA", 0),
+    # The shared expert's SwiGLU and (with TPU_INPUT_NORM_QUANT) the attention
+    # output gate run with their fp8 linear's activation quant in one kernel
+    # (layers/adapter/act_quant_op.py). ROUND_MID picks the activation's bf16
+    # rounding; 2 (bf16 sigmoid, bf16 silu, bf16 product) is bit-exact with the
+    # unfused SiluAndMul / sigmoid gate on v7x, 0/1/3 are not.
+    "TPU_ACT_QUANT": env_bool("TPU_ACT_QUANT"),
+    "TPU_ACT_QUANT_ROUND_MID": env_int("TPU_ACT_QUANT_ROUND_MID", 2),
     # Run the gated q split, q/k RMS norms and NeoX rope of Qwen3NextAttention
     # as one kernel on token buckets of up to 64 rows.
     "TPU_FUSED_QK_NORM_ROPE": env_bool("TPU_FUSED_QK_NORM_ROPE"),
