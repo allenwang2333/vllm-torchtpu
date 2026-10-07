@@ -33,6 +33,7 @@ steps:
     # TODO(release-approvers): limit who can unblock to a Buildkite team, e.g.
     # allowed_teams: ["<team-slug>"]
     depends_on:
+      - "bootstrap"
       #- "build_docker_group"        # pipeline_build.yml
       #- "typecheck_full"            # pipeline_tests.yml
       #- "unit_tests_cpu_nightly"    # pipeline_tests.yml
@@ -43,7 +44,7 @@ steps:
       # finish and fails if any of their tests failed. Those groups are uploaded
       # at runtime and their test steps soft_fail, so they are gated here
       # rather than by key.
-      - "bootstrap"
+      #- "notify_test_results"
 
   - label: ":docker: Publish vllm-torchtpu release image to Docker Hub"
     #key: "publish_dockerhub_release"
