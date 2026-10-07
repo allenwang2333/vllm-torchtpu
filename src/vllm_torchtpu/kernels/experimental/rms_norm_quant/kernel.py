@@ -74,8 +74,13 @@ def _tile(rows: int, cap: int) -> int:
     return rows
 
 
+# Row counts up to this keep the outputs in VMEM (decode buckets), where the
+# next ops read them without an HBM round trip.
+VMEM_OUT_MAX_ROWS = 64
+
+
 @functools.partial(
-    jax.jit, static_argnames=("eps", "emit_y", "tile", "interpret")
+    jax.jit, static_argnames=("eps", "emit_y", "out_vmem", "tile", "interpret")
 )
 def rms_norm_quant(
     x: jax.Array,
@@ -85,6 +90,7 @@ def rms_norm_quant(
     rstd: jax.Array | None = None,
     *,
     emit_y: bool = True,
+    out_vmem: bool | None = None,
     tile: int = 256,
     interpret: bool = False,
 ):
@@ -97,6 +103,9 @@ def rms_norm_quant(
     kernel then only applies it and quantizes."""
     m, k = x.shape
     t = _tile(m, tile)
+    if out_vmem is None:
+        out_vmem = m <= VMEM_OUT_MAX_ROWS and not interpret
+    sds = pltpu.VMEM if out_vmem else jax.ShapeDtypeStruct
     has_res = residual is not None
     row = pl.BlockSpec((t, k), lambda i: (i, 0))
     has_rstd = rstd is not None
@@ -106,15 +115,12 @@ def rms_norm_quant(
     out_specs, out_shape = [], []
     if emit_y:
         out_specs.append(row)
-        out_shape.append(jax.ShapeDtypeStruct((m, k), jnp.bfloat16))
+        out_shape.append(sds((m, k), jnp.bfloat16))
     if has_res:
         out_specs.append(row)
-        out_shape.append(jax.ShapeDtypeStruct((m, k), residual.dtype))
+        out_shape.append(sds((m, k), residual.dtype))
     out_specs += [row, pl.BlockSpec((t, 1), lambda i: (i, 0))]
-    out_shape += [
-        jax.ShapeDtypeStruct((m, k), FP8),
-        jax.ShapeDtypeStruct((m, 1), jnp.float32),
-    ]
+    out_shape += [sds((m, k), FP8), sds((m, 1), jnp.float32)]
     outs = list(
         pl.pallas_call(
             functools.partial(
