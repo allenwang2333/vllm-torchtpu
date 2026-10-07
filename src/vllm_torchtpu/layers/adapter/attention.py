@@ -472,6 +472,19 @@ def _pallas_rpa_kernel_default_bundled(
     return new_bundle, outputs
 
 
+def rpa_decode_only_program(num_tokens: int) -> bool:
+    """Whether a token bucket of ``num_tokens`` rows runs batched RPA's DECODE pass only.
+
+    TPU_RPA_DECODE_ONLY reuses TPU_GDN_DECODE_ONLY_MAX_TOKENS: the runner moves
+    any chunk holding a request past RPA's decode segment to the first bucket
+    above that limit (``TPUModelRunner._gdn_mixed_min_tokens``), so the MIXED
+    pass of such a bucket is always empty and is not compiled. Decided from
+    the static token count; the compiled program is per bucket.
+    """
+    max_tokens = envs.TPU_GDN_DECODE_ONLY_MAX_TOKENS
+    return envs.TPU_RPA_DECODE_ONLY and 0 < num_tokens <= max_tokens
+
+
 def _pallas_rpa_kernel_batched(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -502,6 +515,10 @@ def _pallas_rpa_kernel_batched(
     kernel_kwargs = batched_rpa_decode.kernel_kwargs(decode_tuning, query.shape[0])
     if decode_query_size > 1:
         kernel_kwargs["decode_query_size"] = decode_query_size
+    if rpa_decode_only_program(query.shape[0]):
+        kernel_kwargs["decode_only"] = True
+    if envs.TPU_RPA_SCHEDULE_FAST:
+        kernel_kwargs["schedule_fast"] = True
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,

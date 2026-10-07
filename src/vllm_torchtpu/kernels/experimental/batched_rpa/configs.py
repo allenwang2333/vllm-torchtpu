@@ -106,6 +106,8 @@ class ServingConfigs:
     attention_scope: AttentionScope = AttentionScope.FULL
     return_lse: bool = False
     skip_kv_update: bool = False
+    # Metadata schedule fast path (schedule.py, TPU_RPA_SCHEDULE_FAST).
+    schedule_fast: bool = False
 
     @property
     def max_decode_bkv_p_new(self) -> int:
