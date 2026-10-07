@@ -22,6 +22,7 @@ from vllm.model_executor.models.qwen3_next import (
 )
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter import input_norm_quant_op
 
 logger = logging.getLogger(__name__)
 
@@ -219,19 +220,40 @@ def _patched_decoder_forward(
         )
 
     full_num_tokens = positions.shape[-1]
-    if residual is None:
+    prequant = None
+    if (
+        getattr(self, input_norm_quant_op.LAYER_ATTR, False)
+        and full_num_tokens > envs.TPU_INPUT_NORM_QUANT_MIN_ROWS
+    ):
+        # TPU_INPUT_NORM_QUANT: the norm also emits the fp8 rows of its output
+        # for the input projection (normed rows only where a bf16 consumer
+        # needs them: GDN's in_proj_ba).
+        hidden_states, residual, prequant = input_norm_quant_op.norm_quant(
+            self, hidden_states, residual
+        )
+    elif residual is None:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
     else:
         hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
     if self.layer_type == "linear_attention":
-        hidden_states = self.linear_attn(hidden_states=hidden_states)
+        if prequant is None:
+            hidden_states = self.linear_attn(hidden_states=hidden_states)
+        else:
+            hidden_states = self.linear_attn(
+                hidden_states=hidden_states, prequant=prequant
+            )
     elif self.layer_type == "full_attention":
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            positions=positions,
-        )
+        if prequant is None:
+            hidden_states = self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+            )
+        else:
+            hidden_states = input_norm_quant_op.attention_forward(
+                self.self_attn, positions, prequant
+            )
     else:
         raise ValueError(f"Invalid layer_type: {self.layer_type}")
 

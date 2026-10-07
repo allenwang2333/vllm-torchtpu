@@ -46,6 +46,7 @@ from vllm_torchtpu.distributed.pcp import (
     get_pcp_rank,
     get_pcp_world_size,
 )
+from vllm_torchtpu import envs
 from vllm_torchtpu.gdn_pool_layout import (
     DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
     unified_kv_layout_enabled_for_architecture,
@@ -54,7 +55,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
 )
-from vllm_torchtpu.layers.adapter import gated_norm_quant_op
+from vllm_torchtpu.layers.adapter import gated_norm_quant_op, input_norm_quant_op
 from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
     GdnInterleavedColumnParallelLinear,
@@ -362,7 +363,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self._create_conv1d()
         # `_require_pcp_projection_parameters` hands this weight straight to
         # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in].
-        if hasattr(self, "in_proj_qkvz"):
+        # TPU_GDN_IN_PROJ_KN: without PCP nothing reads it raw, so it can take
+        # the canonical (k, n) layout like every other linear.
+        if hasattr(self, "in_proj_qkvz") and not (
+            envs.TPU_GDN_IN_PROJ_KN and not self._pcp_streaming_enabled()
+        ):
             setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
@@ -1118,7 +1123,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        """``prequant``: the fp8 rows and per-row scales of ``hidden_states``
+        (TPU_INPUT_NORM_QUANT), for in_proj_qkvz."""
         num_tokens = hidden_states.size(0)
         kv_cache = self.kv_cache
         if self._has_active_pooled_pcp_state(kv_cache):
@@ -1141,7 +1149,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             b = b.contiguous()
             a = a.contiguous()
         else:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            if prequant is not None:
+                mixed_qkvz = input_norm_quant_op.project(self.in_proj_qkvz, prequant)
+            else:
+                mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)
 
             # Every checkpoint loader produces [q, k, v, z] and [b, a].

@@ -97,6 +97,11 @@ if TYPE_CHECKING:
     TPU_GDN_DECODE_ONLY_NOALIAS: bool = False
     TPU_GDN_CONV_WEIGHT_PRETRANSPOSED: bool = False
     TPU_GDN_DECODE_TILE2_BUCKETS: list[int] = []
+    TPU_FP8_ROWQUANT_LAYERS: str = ""
+    TPU_FP8_ROWQUANT_MAX_ROWS: int = 64
+    TPU_GDN_IN_PROJ_KN: bool = False
+    TPU_INPUT_NORM_QUANT: int = 0
+    TPU_INPUT_NORM_QUANT_MIN_ROWS: int = 0
     TPU_FUSED_QK_NORM_ROPE: bool = False
     TPU_RPA_DECODE_BATCHED: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -741,6 +746,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
         for v in os.getenv("TPU_GDN_DECODE_TILE2_BUCKETS", "").split(",")
         if v.strip()
     ],
+    # Per-channel fp8 linears whose prefix contains one of these comma-separated
+    # substrings ("all": every one) quantize their activation inside the matmul
+    # kernel (kernels/quantized_matmul/rowquant_kernel.py) instead of in
+    # separate XLA fusions, on token buckets of up to TPU_FP8_ROWQUANT_MAX_ROWS.
+    "TPU_FP8_ROWQUANT_LAYERS": env_str("TPU_FP8_ROWQUANT_LAYERS", ""),
+    "TPU_FP8_ROWQUANT_MAX_ROWS": env_int("TPU_FP8_ROWQUANT_MAX_ROWS", 64),
+    # Store the GDN in_proj_qkvz weight in the canonical (k, n) layout when PCP
+    # streaming does not read it raw (it validates [n_out, n_in]).
+    "TPU_GDN_IN_PROJ_KN": env_bool("TPU_GDN_IN_PROJ_KN"),
+    # Run a Qwen3-Next / Qwen3.5 decoder layer's input (residual add +) RMS norm
+    # and its fp8 input projection's activation quantization as one kernel
+    # (layers/adapter/input_norm_quant_op.py). Needs TPU_ATTN_MOE_OVERLAP.
+    # 1: XLA computes the norm's rsqrt(mean(x^2) + eps) and the kernel applies
+    # it and quantizes (bit-exact with the unfused path). 2: the kernel also
+    # computes the statistic (one op fewer; its reduction order differs from
+    # XLA's, so a normed value can move by one bf16 ulp). 3: 1 on decode
+    # buckets (<= 64 rows), 2 above.
+    "TPU_INPUT_NORM_QUANT": env_int("TPU_INPUT_NORM_QUANT", 0),
+    # Only token buckets of more than this many rows take TPU_INPUT_NORM_QUANT
+    # (64: prefill only; at decode sizes the kernel's operands cost XLA's
+    # prefetch schedule more than the fusions it replaces).
+    "TPU_INPUT_NORM_QUANT_MIN_ROWS": env_int("TPU_INPUT_NORM_QUANT_MIN_ROWS", 0),
     # Run the gated q split, q/k RMS norms and NeoX rope of Qwen3NextAttention
     # as one kernel on token buckets of up to 64 rows.
     "TPU_FUSED_QK_NORM_ROPE": env_bool("TPU_FUSED_QK_NORM_ROPE"),

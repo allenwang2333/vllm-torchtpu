@@ -10,6 +10,7 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+from vllm_torchtpu.kernels.quantized_matmul.rowquant_kernel import rowquant_matmul
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 # Some layers have their `.weight` read raw -- bypassing the linear method's
@@ -210,6 +211,61 @@ def quantized_matmul_prequant(
             f"{w_q.shape[0]}."
         )
     return _get_prequant_matmul_op()(x_q, x_s, w_q, w_s)
+
+
+# Set by the fp8 linear method on a layer whose matmul runs `rowquant_matmul`
+# (TPU_FP8_ROWQUANT_LAYERS): "kn" for the canonical (k, n) weight, "nk" for a
+# layer that keeps vLLM's [n_out, n_in] for a raw consumer.
+ROWQUANT_ATTR = "_tpu_fp8_rowquant"
+
+_rowquant_ops: dict[bool, Callable] = {}
+_rowquant_ops_lock = Lock()
+
+
+def get_rowquant_matmul_op(w_kn: bool) -> Callable:
+    """The torch op for `rowquant_matmul`; build it before the trace."""
+    op = _rowquant_ops.get(w_kn)
+    if op is not None:
+        return op
+    with _rowquant_ops_lock:
+        op = _rowquant_ops.get(w_kn)
+        if op is not None:
+            return op
+
+        def fn(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.Array:
+            return rowquant_matmul(x, w_q, w_s, w_kn=w_kn)
+
+        op = pallas.jax_op(
+            f"pallas::fp8_rowquant_matmul_{'kn' if w_kn else 'nk'}", fn
+        )
+
+        def fake(x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor):
+            del w_q
+            return torch.empty(
+                x.shape[0], w_s.shape[0], dtype=x.dtype, device=x.device
+            )
+
+        op.register_fake(fake)
+        _rowquant_ops[w_kn] = op
+        return op
+
+
+def quantized_matmul_rowquant(
+    x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor, *, w_kn: bool
+) -> torch.Tensor:
+    """`quantized_matmul`'s per-channel path with the activation quantized in
+    the matmul kernel. Same arithmetic as `xla_quantized_matmul`.
+
+    `w_q` is the stored weight: (k, n) when `w_kn`, else [n, k]; `w_s` [n].
+    """
+    k = w_q.shape[0] if w_kn else w_q.shape[1]
+    if x.shape[-1] != k:
+        raise ValueError(
+            f"Input hidden dim {x.shape[-1]} must match weight hidden dim {k}."
+        )
+    orig_out_shape = (*x.shape[:-1], w_s.shape[0])
+    out_2d = get_rowquant_matmul_op(w_kn)(x.reshape(-1, k), w_q, w_s)
+    return out_2d.reshape(orig_out_shape)
 
 
 def _quantized_matmul_fp4_jax(
