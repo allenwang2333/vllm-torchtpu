@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Resolution: layers, extends, defaults, --set, baselines, provenance."""
+"""Resolution: layers, extends, defaults, sweeps, --set, baselines, provenance."""
 
 import pathlib
 import textwrap
@@ -85,6 +85,71 @@ tasks:
       mmlu_pro: {"exact_match,custom-extract": 0.76}
 """
 
+AGENTX = """\
+schema: 1
+name: k3-agentx
+server:
+  model: {name: moonshotai/Kimi-K3}
+  accelerator: tpu7x
+  topology: 2x2x4
+  hosts: 4
+  chips_per_host: 4
+  multihost: ray
+  args:
+    tensor-parallel-size: 32
+    max-model-len: null
+    max-num-seqs: 16
+tasks:
+  inferencex: {model_prefix: kimik3, precision: fp4}
+  agentx:
+    concurrency: 1
+    env: {AGENTIC_WARMUP_GRACE_PERIOD: "3600"}
+sweep:
+  name: c{tasks.agentx.concurrency}
+  zip:
+    tasks.agentx.concurrency: [1, 2, 4, 8]
+    server.args.max-num-seqs: [16, 16, 16, 32]
+"""
+
+
+PD = """\
+schema: 1
+name: pd
+server:
+  model: {name: m}
+  args: {max-model-len: 4096}
+  roles:
+    prefill:
+      accelerator: tpu7x
+      topology: 2x2x1
+      hosts: 1
+      chips_per_host: 4
+      kv: {connector: TPURaidenConnector, role: producer}
+    decode:
+      accelerator: tpu7x
+      topology: 2x2x1
+      hosts: 1
+      chips_per_host: 4
+      kv: {connector: TPURaidenConnector, role: consumer}
+    spare:
+      accelerator: tpu7x
+      topology: 2x2x1
+      hosts: 1
+      chips_per_host: 4
+  router: {type: toy-proxy, command: [python3, proxy.py]}
+tasks:
+  driver: client
+  custom:
+    - {name: probe, command: ["true"], timeout: 1m}
+sweep:
+  points:
+    - name: base
+    - name: slim
+      server:
+        roles:
+          spare: null
+"""
+
 
 class Repo:
     def __init__(self, root: pathlib.Path) -> None:
@@ -98,16 +163,18 @@ class Repo:
         path.write_text(textwrap.dedent(text))
         return path
 
-    def resolve(self, ref: str, *sets: str) -> tuple[Resolved, ...]:
-        return resolve(self.root / "scenarios" / f"{ref}.yaml", sets)
+    def resolve(
+        self, ref: str, *sets: str, point: str | None = None
+    ) -> tuple[Resolved, ...]:
+        return resolve(self.root / "scenarios" / f"{ref}.yaml", sets, point=point)
 
     def one(self, ref: str, *sets: str) -> Resolved:
         (resolved,) = self.resolve(ref, *sets)
         return resolved
 
-    def errors(self, ref: str, *sets: str) -> list[str]:
+    def errors(self, ref: str, *sets: str, point: str | None = None) -> list[str]:
         with pytest.raises(DiagnosticError) as info:
-            self.resolve(ref, *sets)
+            self.resolve(ref, *sets, point=point)
         return [d.render() for d in info.value.diagnostics]
 
 
@@ -119,6 +186,7 @@ def repo(tmp_path: pathlib.Path) -> Repo:
 def test_base_resolves_with_defaults(repo: Repo) -> None:
     resolved = repo.one("glm/base")
     assert resolved.ref == "glm/base"
+    assert resolved.point is None
     assert not resolved.experiment
     server = resolved.model.server
     assert server.image == "us-docker.pkg.dev/test/images/vllm:test"
@@ -139,6 +207,59 @@ def test_base_resolves_with_defaults(repo: Repo) -> None:
         Origin("defaults", "scenarios/defaults.yaml", 9)
     ]
     assert prov.origin(("tasks", "perf", "client")) == TOOL
+
+
+def test_one_key_at_every_layer(repo: Repo) -> None:
+    repo.write(
+        "chain/gp",
+        """\
+        schema: 1
+        name: gp
+        server:
+          model: {name: m}
+          accelerator: tpu7x
+          topology: 2x2x1
+          hosts: 1
+          chips_per_host: 4
+          args: {max-num-seqs: 100}
+        """,
+    )
+    repo.write(
+        "chain/p",
+        "schema: 1\nname: p\nextends: chain/gp\nserver: {args: {max-num-seqs: 200}}\n",
+    )
+    repo.write(
+        "chain/s",
+        """\
+        schema: 1
+        name: s
+        extends: ./p.yaml
+        server: {args: {max-num-seqs: 300}}
+        sweep:
+          points:
+            - name: a
+              server: {args: {max-num-seqs: 400}}
+        """,
+    )
+    (resolved,) = repo.resolve("chain/s", "server.args.max-num-seqs=500")
+    assert resolved.point == "a"
+    assert resolved.model.server.args["max-num-seqs"] == 500
+    path = ("server", "args", "max-num-seqs")
+    assert resolved.provenance.origin(path) == Origin(
+        "set:0", "--set[0] server.args.max-num-seqs=500"
+    )
+    assert resolved.provenance.superseded[path] == [
+        Origin("defaults", "scenarios/defaults.yaml", 9),
+        Origin("extends:chain/gp", "scenarios/chain/gp.yaml", 9),
+        Origin("extends:chain/p", "scenarios/chain/p.yaml", 4),
+        Origin("scenario", "scenarios/chain/s.yaml", 4),
+        Origin("sweep:a", "scenarios/chain/s.yaml", 8),
+    ]
+    assert resolved.experiment
+    assert resolved.overrides == ("server.args.max-num-seqs=500",)
+    assert resolved.data["extends"] == "chain/p"
+    assert resolved.model.name == "s"
+    assert "sweep" not in resolved.data
 
 
 def test_defaults_only_for_declared_tasks(repo: Repo) -> None:
@@ -328,6 +449,28 @@ def test_inferencex_perf_gets_no_vllm_bench_defaults(repo: Repo) -> None:
     assert perf.num_warmups.per_concurrency == 2
 
 
+def test_agentx_and_identity_defaults_merge(repo: Repo) -> None:
+    repo.write("k3-agentx", AGENTX)
+    points = repo.resolve("k3-agentx")
+    assert [p.point for p in points] == ["c1", "c2", "c4", "c8"]
+    tasks = points[0].model.tasks
+    assert tasks.inferencex is not None
+    assert tasks.inferencex.model_dump(exclude_none=True) == {
+        "model_prefix": "kimik3",
+        "precision": "fp4",
+        "framework": "vllm",
+        "spec_decoding": "none",
+        "kv_offloading": "none",
+    }
+    agentx = tasks.agentx
+    assert (agentx.duration, agentx.timeout, agentx.fast) == (3600, 10800, False)
+
+
+def test_identity_defaults_need_tasks_inferencex(repo: Repo) -> None:
+    """tasks.inferencex defaults apply only where a layer declares it."""
+    assert repo.one("glm/base").model.tasks.inferencex is None
+
+
 def test_extends_merges_and_strips(repo: Repo) -> None:
     repo.write(
         "glm/child",
@@ -364,6 +507,14 @@ sweep:
       perf:
         isl8192_osl1024_c1024: {completed: 2048}
 """
+
+
+def test_point_baselines_are_not_inherited(repo: Repo) -> None:
+    repo.write("glm/sweep", SWEPT)
+    repo.write("glm/child", "schema: 1\nname: glm-child\nextends: glm/sweep\n")
+    points = repo.resolve("glm/child")
+    assert all(p.model.tasks.perf.baseline is None for p in points)
+    assert repo.resolve("glm/sweep")[0].model.tasks.perf.baseline is not None
 
 
 def test_extends_problems(repo: Repo) -> None:
@@ -491,6 +642,177 @@ def test_set_values_and_lists(repo: Repo) -> None:
     ]
 
 
+def test_sweep_points_resolve_one_by_one(repo: Repo) -> None:
+    repo.write("k3-agentx", AGENTX)
+    points = repo.resolve("k3-agentx")
+    assert [p.model.tasks.agentx.concurrency for p in points] == [1, 2, 4, 8]
+    assert [p.model.server.args["max-num-seqs"] for p in points] == [16, 16, 16, 32]
+    assert all("sweep" not in p.data for p in points)
+    prov = points[3].provenance
+    assert prov.origin(("tasks", "agentx", "concurrency")) == Origin(
+        "sweep:c8", "scenarios/k3-agentx.yaml", 22
+    )
+    repo.write("glm/sweep", SWEPT)
+    swept = repo.resolve("glm/sweep")
+    assert swept[0].provenance.origin(
+        ("tasks", "perf", "baseline", "isl8192_osl1024_c1024", "completed")
+    ) == Origin("sweep:s64", "scenarios/glm/sweep.yaml", 11)
+    assert (
+        swept[1].provenance.origin(
+            ("tasks", "perf", "baseline", "isl8192_osl1024_c1024", "completed")
+        )
+        == TOOL
+    )
+    (only,) = repo.resolve("k3-agentx", point="c4")
+    assert only.point == "c4"
+
+
+def test_each_point_is_validated(repo: Repo) -> None:
+    repo.write(
+        "k3-agentx",
+        AGENTX.replace("[16, 16, 16, 32]", "[16, 16, 16, 4]"),
+    )
+    assert repo.errors("k3-agentx") == [
+        "scenarios/k3-agentx.yaml:23: server.args.max-num-seqs: max-num-seqs 4 x DP "
+        "1 = 4, under tasks.agentx.concurrency 8; the server would cap the measured "
+        "concurrency",
+    ]
+
+
+def test_named_points(repo: Repo) -> None:
+    repo.write(
+        "named",
+        """\
+        schema: 1
+        name: named
+        extends: glm/base
+        tasks:
+          eval: null
+          perf:
+            concurrency: [64]
+        sweep:
+          points:
+            - name: tp8
+              server: {args: {tensor-parallel-size: 8, data-parallel-size: 2}}
+              tasks:
+                perf:
+                  baseline:
+                    isl8192_osl1024_c64: {completed: 640}
+            - name: dp16
+        """,
+    )
+    tp8, dp16 = repo.resolve("named")
+    assert tp8.model.server.args["tensor-parallel-size"] == 8
+    assert tp8.provenance.origin(("server", "args", "tensor-parallel-size")) == Origin(
+        "sweep:tp8", "scenarios/named.yaml", 11
+    )
+    assert tp8.model.tasks.perf.baseline is not None
+    assert dp16.model.server.args["tensor-parallel-size"] == 1
+    assert dp16.model.tasks.perf.baseline is None
+
+
+def test_sweep_problems(repo: Repo) -> None:
+    repo.write("k3-agentx", AGENTX)
+    assert repo.errors("k3-agentx", "tasks.agentx.concurrency=16") == [
+        "--set[0] tasks.agentx.concurrency=16: tasks.agentx.concurrency is the sweep "
+        "axis tasks.agentx.concurrency; change the axis in the scenario, or run one "
+        "point with --point"
+    ]
+    assert repo.errors("k3-agentx", point="c3") == [
+        "scenarios/k3-agentx.yaml: no sweep point c3; points: c1, c2, c4, c8"
+    ]
+    assert repo.errors("glm/base", point="c1") == [
+        "scenarios/glm/base.yaml: has no sweep; drop --point c1"
+    ]
+    repo.write(
+        "axes",
+        AGENTX.replace(
+            "server.args.max-num-seqs:", "server.args.max-num-batched-tokens:"
+        ),
+    )
+    assert repo.errors("axes") == [
+        "scenarios/axes.yaml:23: sweep.zip[server.args.max-num-batched-tokens]: "
+        "server.args.max-num-batched-tokens is not set in the scenario; an axis "
+        "replaces a value the scenario has"
+    ]
+    repo.write(
+        "axes",
+        AGENTX + "  baselines:\n    c1:\n      perf: {isl1_osl1_c1: {completed: 1}}\n",
+    )
+    assert repo.errors("axes") == [
+        "scenarios/axes.yaml:26: sweep.baselines.c1.perf: point c1 has no perf task"
+    ]
+    repo.write(
+        "top",
+        SWEPT.replace("name: glm-sweep", "name: top").replace(
+            "sweep:\n",
+            "tasks:\n  perf:\n    baseline: {isl8192_osl1024_c1024: {completed: 1}}\n"
+            "sweep:\n",
+        ),
+    )
+    assert repo.errors("top")[0] == (
+        "scenarios/top.yaml:6: tasks.perf.baseline: is not allowed with a sweep; "
+        "put it under sweep.baselines.<point>.<task>"
+    )
+
+
+EVAL_POINT = """\
+schema: 1
+name: k3-pair
+server:
+  model: {name: moonshotai/Kimi-K3}
+  accelerator: tpu7x
+  topology: 2x2x4
+  hosts: 4
+  chips_per_host: 4
+  multihost: ray
+  args:
+    tensor-parallel-size: 32
+    max-model-len: null
+    max-num-seqs: 16
+tasks:
+  inferencex: {model_prefix: kimik3, precision: fp4}
+  agentx: {timeout: 3h}
+sweep:
+  points:
+    - name: c1
+      tasks: {agentx: {concurrency: 1}}
+    - name: c4
+      tasks: {agentx: {concurrency: 4}}
+    - name: gsm8k
+      tasks:
+        agentx: null
+        eval:
+          client: inferencex
+          concurrency: CONC
+          timeout: 8h
+"""
+
+
+def test_inferencex_eval_runs_at_the_top_agentx_concurrency(repo: Repo) -> None:
+    """V-45 compares a point with every other point, --point or not."""
+    repo.write("k3-pair", EVAL_POINT.replace("CONC", "4"))
+    points = repo.resolve("k3-pair")
+    assert [p.point for p in points] == ["c1", "c4", "gsm8k"]
+    assert points[2].model.tasks.agentx is None
+    assert all(p.warnings == () for p in points)
+    repo.write("k3-pair", EVAL_POINT.replace("CONC", "2"))
+    for found in (repo.resolve("k3-pair"), repo.resolve("k3-pair", point="gsm8k")):
+        (warning,) = found[-1].warnings
+        assert (warning.rule, warning.severity) == ("V-45", "warning")
+        assert warning.render().startswith(
+            "scenarios/k3-pair.yaml:28: warning: tasks.eval.concurrency: is 2, but "
+            "the highest agentx concurrency among this scenario's points is 4"
+        )
+
+
+def test_points_may_change_the_pods(repo: Repo) -> None:
+    repo.write("pd", PD)
+    base, slim = repo.resolve("pd")
+    assert list(base.model.server.roles) == ["prefill", "decode", "spare"]
+    assert list(slim.model.server.roles) == ["prefill", "decode"]
+
+
 def test_from_baselines(repo: Repo) -> None:
     repo.write(
         "glm/mp",
@@ -567,6 +889,22 @@ def test_from_baseline_of_an_eval_sweep(repo: Repo) -> None:
     )
     repo.write("ev/b", sweep.format(name="b", baseline="{from: ev/a}"))
     assert set(repo.one("ev/b").ref_baselines["eval"].baseline) == {"gsm8k_c2"}
+
+
+def test_warnings_do_not_fail(repo: Repo) -> None:
+    repo.write("k3-agentx", AGENTX)
+    points = repo.resolve("k3-agentx", point="c8")
+    assert points[0].warnings == ()
+    repo.write(
+        "k3-warn",
+        AGENTX.replace("[16, 16, 16, 32]", "[16, 16, 16, 12]").replace(
+            "name: k3-agentx", "name: k3-warn"
+        ),
+    )
+    (warned,) = repo.resolve("k3-warn", point="c8")
+    (warning,) = warned.warnings
+    assert warning.severity == "warning"
+    assert warning.rule == "V-32"
 
 
 def test_root_discovery(repo: Repo, tmp_path_factory: pytest.TempPathFactory) -> None:

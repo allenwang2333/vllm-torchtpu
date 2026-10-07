@@ -11,18 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""From a scenario file to a resolved, validated scenario.
+"""From a scenario file to resolved, validated points.
 
 Layers, later wins:
 
     tool (model defaults) < scenarios/defaults.yaml < extends chain, root
-    parent first < the scenario < --set, in order
+    parent first < the scenario < sweep point < --set, in order
 
 Defaults for a task apply only when a later layer declares that task, and
 perf defaults that only mean something for vllm bench serve stay out of an
-inferencex perf task. `name`, `extends` and baselines are not inherited.
-Resolution reads only the files and its arguments: no environment, clock,
-network or subprocess.
+inferencex perf task. `name`, `extends` and baselines are not inherited. A
+sweep becomes one resolved scenario per point. Resolution reads only the
+files and its arguments: no environment, clock, network or subprocess.
 """
 
 import copy
@@ -53,15 +53,23 @@ from scenario.merge import (
     merge_into,
 )
 from scenario.model.baseline import BaselineRef
-from scenario.model.rules import baseline_key_problem, baseline_keys, check_scenario
+from scenario.model.rules import (
+    baseline_key_problem,
+    baseline_keys,
+    check_scenario,
+    check_sweep,
+    eval_concurrency_issue,
+    sweep_baseline_message,
+)
 from scenario.model.scenario import SCHEMA_VERSION, Defaults, Scenario
+from scenario.model.sweep import ExpandedPoint, Sweep, expand
 from scenario.model.tasks import (
     BUILTIN_TASKS,
     GATED_TASKS,
     VLLM_BENCH_ONLY_DEFAULTS,
 )
 from scenario.overrides import Override, OverrideError, parse_override, sparse_layer
-from scenario.paths import KeyPath, format_path
+from scenario.paths import KeyPath, format_path, is_prefix, parse_path
 
 SCENARIOS_DIR = "scenarios"
 DEFAULTS_FILE = "defaults.yaml"
@@ -78,10 +86,11 @@ class RefBaseline:
 
 @dataclass(frozen=True)
 class Resolved:
-    """A resolved, validated scenario."""
+    """One point of a scenario (the whole scenario when it has no sweep)."""
 
     ref: str
     file: pathlib.Path
+    point: str | None
     data: Mapping[str, Any]
     model: Scenario
     provenance: Provenance
@@ -89,7 +98,7 @@ class Resolved:
     ref_baselines: Mapping[str, RefBaseline]
     warnings: tuple[Diagnostic, ...] = ()
     # Layer names, lowest first: tool, defaults, extends:<ref>..., scenario,
-    # set:<i>...
+    # sweep:<point>, set:<i>...
     layers: tuple[str, ...] = ()
 
     @property
@@ -128,14 +137,15 @@ def resolve(
     *,
     root: pathlib.Path | None = None,
     cwd: pathlib.Path | None = None,
+    point: str | None = None,
 ) -> tuple[Resolved, ...]:
-    """Resolve and validate a scenario file.
+    """Resolve and validate every point of a scenario file (or one, `point`).
 
     Raises:
-        DiagnosticError: every problem found, in every file.
+        DiagnosticError: every problem found, in every file and point.
     """
     resolver = Resolver(find_root(file, root, cwd))
-    return resolver.resolve(file.resolve(), tuple(sets))
+    return resolver.resolve(file.resolve(), tuple(sets), point)
 
 
 @dataclass(frozen=True)
@@ -146,11 +156,11 @@ class _FileLayer:
     loaded: LoadedFile
     data: dict[str, Any]
 
-    def origin_of(self) -> OriginOf:
-        """Origins of this file's data."""
-        name = self.layer
+    def origin_of(self, layer: str | None = None, base: KeyPath = ()) -> OriginOf:
+        """Origins of this file's data, or of the overlay at `base` in it."""
+        name = layer or self.layer
         loaded = self.loaded
-        return lambda path: Origin(name, loaded.source, loaded.line(path))
+        return lambda path: Origin(name, loaded.source, loaded.line((*base, *path)))
 
     def origin(self, path: KeyPath) -> Origin:
         return self.origin_of()(path)
@@ -166,7 +176,7 @@ class _Merge:
 
 @dataclass(frozen=True)
 class _Assign:
-    """A step that sets one path, for a --set."""
+    """A step that sets one path (a --set or a sweep axis)."""
 
     path: KeyPath
     value: Any
@@ -206,7 +216,10 @@ class _Report:
 
     @property
     def failed(self) -> bool:
-        return any(d.severity == "error" for d in self.diagnostics)
+        return self.failed_since(0)
+
+    def failed_since(self, mark: int) -> bool:
+        return any(d.severity == "error" for d in self.diagnostics[mark:])
 
 
 def _get(data: Any, path: KeyPath) -> Any:
@@ -218,6 +231,14 @@ def _get(data: Any, path: KeyPath) -> Any:
             return None
         node = node[key]
     return node
+
+
+def _has(data: Any, path: KeyPath) -> bool:
+    *parents, last = path
+    node = _get(data, tuple(parents))
+    if isinstance(node, dict):
+        return last in node
+    return isinstance(node, list) and isinstance(last, int) and last < len(node)
 
 
 def _without(data: Any, paths: Sequence[KeyPath]) -> Any:
@@ -245,6 +266,17 @@ def _strip_inherited(data: dict[str, Any]) -> dict[str, Any]:
     data = {k: v for k, v in data.items() if k not in ("name", "extends")}
     if "tasks" in data:
         data["tasks"] = _drop_baseline(data["tasks"])
+    sweep = data.get("sweep")
+    if isinstance(sweep, dict):
+        sweep = {k: v for k, v in sweep.items() if k != "baselines"}
+        if isinstance(sweep.get("points"), list):
+            sweep["points"] = [
+                {**point, "tasks": _drop_baseline(point["tasks"])}
+                if isinstance(point, dict) and "tasks" in point
+                else point
+                for point in sweep["points"]
+            ]
+        data["sweep"] = sweep
     return data
 
 
@@ -293,6 +325,15 @@ def _schema_issues(data: dict[str, Any]) -> list[Issue]:
         )
         return [Issue(("schema",), message, rule="V-01")]
     return []
+
+
+@dataclass(frozen=True)
+class _Point:
+    """One point's layer: steps that may declare tasks, then its baselines."""
+
+    name: str | None
+    steps: list[_Step]
+    baselines: dict[str, tuple[_Step, KeyPath]]
 
 
 class Resolver:
@@ -428,11 +469,12 @@ class Resolver:
         self,
         file: pathlib.Path,
         sets: tuple[str, ...] = (),
+        point: str | None = None,
         follow_refs: bool = True,
     ) -> tuple[Resolved, ...]:
-        """Resolve `file`; see `resolve()`."""
+        """Resolve every point of `file`; see `resolve()`."""
         report = _Report()
-        results = self._resolve(file, sets, follow_refs, report)
+        results = self._resolve(file, sets, point, follow_refs, report)
         diagnostics = sort_diagnostics(dict.fromkeys(report.diagnostics))
         if report.failed:
             raise DiagnosticError(diagnostics)
@@ -443,6 +485,7 @@ class Resolver:
         self,
         file: pathlib.Path,
         sets: tuple[str, ...],
+        point: str | None,
         follow_refs: bool,
         report: _Report,
     ) -> list[Resolved]:
@@ -469,26 +512,84 @@ class Resolver:
             for layer in reversed(parents)
         ]
         file_steps.append(_Merge(own, scenario.origin_of()))
+        upper, upper_prov = self._apply(file_steps, report)
+        plain_steps: list[_Step] = [
+            _Merge({k: v for k, v in step.data.items() if k != "sweep"}, step.origin_of)
+            for step in file_steps
+            if isinstance(step, _Merge)
+        ]
+
+        if "sweep" not in upper:
+            if point is not None:
+                report.plain(
+                    scenario.loaded.source, f"has no sweep; drop --point {point}"
+                )
+                return []
+            points = [_Point(None, [], {})]
+        else:
+            found = self._points(
+                upper,
+                upper_prov,
+                defaults,
+                plain_steps,
+                chain,
+                overrides,
+                report,
+            )
+            if found is None:
+                return []
+            points = found
 
         set_steps: list[_Step] = [
             _Assign(o.path, o.value, Origin(f"set:{o.index}", o.source))
             for o in overrides
         ]
+        agentx = self._agentx_concurrencies(points, plain_steps, set_steps)
+        if point is not None:
+            names = [str(current.name) for current in points]
+            if point not in names:
+                source = scenario.loaded.source
+                report.plain(
+                    source, f"no sweep point {point}; points: {', '.join(names)}"
+                )
+                return []
+            points = [current for current in points if current.name == point]
         results = []
-        declared, _ = self._apply([*file_steps, *set_steps], _Report())
-        scoped = _scoped_defaults(defaults.data, declared)
-        steps = [_Merge(scoped, defaults.origin_of()), *file_steps, *set_steps]
-        data, prov = self._apply(steps, report)
-        resolved = self._validate(scenario, data, prov, overrides, follow_refs, report)
-        if resolved is not None:
-            layers = (
-                "tool",
-                "defaults",
-                *(f"extends:{layer.ref}" for layer in reversed(parents)),
-                "scenario",
-                *(f"set:{o.index}" for o in overrides),
+        for current in points:
+            declared, _ = self._apply(
+                [*plain_steps, *current.steps, *set_steps], _Report()
             )
-            results.append(dataclasses.replace(resolved, layers=layers))
+            baseline_steps = []
+            for task, (step, where) in current.baselines.items():
+                if _get(declared, ("tasks", task)) is None:
+                    message = f"point {current.name} has no {task} task"
+                    report.located(upper_prov, [Issue(where, message, rule="V-38")])
+                else:
+                    baseline_steps.append(step)
+            scoped = _scoped_defaults(defaults.data, declared)
+            steps = [
+                _Merge(scoped, defaults.origin_of()),
+                *plain_steps,
+                *current.steps,
+                *baseline_steps,
+                *set_steps,
+            ]
+            data, prov = self._apply(steps, report)
+            resolved = self._validate(
+                scenario, current.name, data, prov, overrides, follow_refs, report
+            )
+            if resolved is not None:
+                issue = eval_concurrency_issue(resolved.model, agentx)
+                report.located(prov, [issue] if issue is not None else [])
+                layers = (
+                    "tool",
+                    "defaults",
+                    *(f"extends:{layer.ref}" for layer in reversed(parents)),
+                    "scenario",
+                    *([f"sweep:{current.name}"] if current.name is not None else []),
+                    *(f"set:{o.index}" for o in overrides),
+                )
+                results.append(dataclasses.replace(resolved, layers=layers))
         return results
 
     def _overrides(self, sets: tuple[str, ...], report: _Report) -> list[Override]:
@@ -523,9 +624,121 @@ class Resolver:
                 report.at(step.origin, Issue(step.path, str(error)))
         return data, prov
 
+    def _points(
+        self,
+        upper: dict[str, Any],
+        prov: Provenance,
+        defaults: _FileLayer,
+        plain_steps: list[_Step],
+        chain: list[_FileLayer],
+        overrides: list[Override],
+        report: _Report,
+    ) -> list[_Point] | None:
+        """Validate the sweep and turn each point into a layer."""
+        mark = len(report.diagnostics)
+        sweep_data = upper["sweep"]
+        try:
+            sweep = Sweep.model_validate(sweep_data)
+        except ValidationError as error:
+            issues = issues_from_validation_error(error, sweep_data, ("sweep",))
+            report.located(prov, issues)
+            return None
+        issues = check_sweep(sweep)
+        for task in GATED_TASKS:
+            if _get(upper, ("tasks", task, "baseline")) is not None:
+                message = sweep_baseline_message(sweep)
+                issues.append(Issue(("tasks", task, "baseline"), message, rule="V-24"))
+        if sweep.points is None:
+            issues += self._axis_issues(sweep, defaults, plain_steps)
+        report.located(prov, issues)
+        for override in overrides:
+            for text in sweep.axes:
+                axis = parse_path(text)
+                if is_prefix(axis, override.path) or is_prefix(override.path, axis):
+                    report.plain(
+                        override.source,
+                        f"{format_path(override.path)} is the sweep axis {text}; "
+                        "change the axis in the scenario, or run one point with "
+                        "--point",
+                        rule="V-40",
+                    )
+        if report.failed_since(mark):
+            return None
+        holders = {layer.loaded.source: layer for layer in chain}
+        return [self._point(sweep, p, upper, prov, holders) for p in expand(sweep)]
+
+    def _agentx_concurrencies(
+        self, points: Sequence[_Point], plain_steps: list[_Step], set_steps: list[_Step]
+    ) -> list[int]:
+        """The agentx concurrency of every point that runs agentx (for V-45)."""
+        found = []
+        for current in points:
+            declared, _ = self._apply(
+                [*plain_steps, *current.steps, *set_steps], _Report()
+            )
+            concurrency = _get(declared, ("tasks", "agentx", "concurrency"))
+            if isinstance(concurrency, int) and not isinstance(concurrency, bool):
+                found.append(concurrency)
+        return found
+
+    def _axis_issues(
+        self, sweep: Sweep, defaults: _FileLayer, plain_steps: list[_Step]
+    ) -> list[Issue]:
+        """Every axis replaces a value the scenario has (V-39)."""
+        base, _ = self._apply(plain_steps, _Report())
+        scoped = _scoped_defaults(defaults.data, base)
+        full, _ = self._apply(
+            [_Merge(scoped, defaults.origin_of()), *plain_steps], _Report()
+        )
+        form = "zip" if sweep.zip is not None else "product"
+        return [
+            Issue(
+                ("sweep", form, text),
+                f"{text} is not set in the scenario; an axis replaces a value "
+                "the scenario has",
+                rule="V-39",
+            )
+            for text in sweep.axes
+            if not _has(full, parse_path(text))
+        ]
+
+    def _point(
+        self,
+        sweep: Sweep,
+        point: ExpandedPoint,
+        upper: dict[str, Any],
+        prov: Provenance,
+        holders: dict[str | None, _FileLayer],
+    ) -> _Point:
+        layer = f"sweep:{point.name}"
+        if sweep.points is not None:
+            overlay = upper["sweep"]["points"][point.index]
+            holder = holders[prov.origin(("sweep", "points")).source]
+            origin_of = holder.origin_of(layer, ("sweep", "points", point.index))
+            data = {k: overlay[k] for k in ("server", "tasks") if overlay.get(k)}
+            return _Point(point.name, [_Merge(copy.deepcopy(data), origin_of)], {})
+        form = "zip" if sweep.zip is not None else "product"
+        steps: list[_Step] = []
+        for (path, value), text in zip(point.assignments, sweep.axes, strict=True):
+            axis = prov.locate(("sweep", form, text))
+            steps.append(_Assign(path, value, Origin(layer, axis.source, axis.line)))
+        baselines: dict[str, tuple[_Step, KeyPath]] = {}
+        blocks = (upper["sweep"].get("baselines") or {}).get(point.name) or {}
+        for task, block in blocks.items():
+            if block is None:
+                continue
+            where = ("sweep", "baselines", point.name, task)
+            origin_of = _relocated(prov, layer, where, ("tasks", task, "baseline"))
+            step = _Merge(
+                {"tasks": {task: {"baseline": copy.deepcopy(block)}}}, origin_of
+            )
+            baselines[task] = (step, where)
+        return _Point(point.name, steps, baselines)
+
     def _validate(
         self,
         scenario: _FileLayer,
+        point: str | None,
         data: dict[str, Any],
         prov: Provenance,
         overrides: list[Override],
@@ -540,13 +753,14 @@ class Resolver:
         issues = check_scenario(model)
         ref_baselines: dict[str, RefBaseline] = {}
         if follow_refs:
-            issues += self._ref_baselines(model, ref_baselines)
+            issues += self._ref_baselines(model, point, ref_baselines)
         report.located(prov, issues)
         if any(issue.severity == "error" for issue in issues):
             return None
         return Resolved(
             ref=scenario.ref,
             file=scenario.path,
+            point=point,
             data=data,
             model=model,
             provenance=prov,
@@ -565,7 +779,7 @@ class Resolver:
         return self._refs[ref]
 
     def _ref_baselines(
-        self, model: Scenario, found: dict[str, RefBaseline]
+        self, model: Scenario, point: str | None, found: dict[str, RefBaseline]
     ) -> list[Issue]:
         """Copy `from:` baselines in, after checking them (V-23)."""
         issues = []
@@ -574,7 +788,7 @@ class Resolver:
             if block is None or not isinstance(block.baseline, BaselineRef):
                 continue
             ref = block.baseline.from_
-            copied, problem, hint = self._ref_baseline(model, task, ref)
+            copied, problem, hint = self._ref_baseline(model, task, ref, point)
             if copied is not None:
                 found[task] = copied
             else:
@@ -583,14 +797,17 @@ class Resolver:
         return issues
 
     def _ref_baseline(
-        self, model: Scenario, task: str, ref: str
+        self, model: Scenario, task: str, ref: str, point: str | None
     ) -> tuple[RefBaseline | None, str, str | None]:
         if not self.file_of(ref).is_file():
             return None, f"no scenario {ref}{self._near(ref)}", None
         targets = self._resolve_ref(ref)
         if isinstance(targets, DiagnosticError):
             return None, f"{ref} does not resolve", targets.diagnostics[0].render()
-        (target,) = targets
+        target = next((t for t in targets if t.point == point), None)
+        if target is None:
+            where = f"a point named {point}" if point else "a single point"
+            return None, f"{ref} is a sweep without {where}", None
         other = getattr(target.model.tasks, task)
         if other is None or other.baseline is None:
             return None, f"{ref} has no inline tasks.{task} baseline", None
@@ -614,3 +831,13 @@ class Resolver:
             )
         dumped = other.baseline.model_dump(by_alias=True, exclude_none=True)
         return RefBaseline(source=ref, baseline=dumped), "", None
+
+
+def _relocated(prov: Provenance, layer: str, where: KeyPath, at: KeyPath) -> OriginOf:
+    """Origins for data moved from `where` in the file to `at` in the scenario."""
+
+    def origin_of(path: KeyPath) -> Origin:
+        found = prov.locate((*where, *path[len(at) :]))
+        return Origin(layer, found.source, found.line)
+
+    return origin_of
