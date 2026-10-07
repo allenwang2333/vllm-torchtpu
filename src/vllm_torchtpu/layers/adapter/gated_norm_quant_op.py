@@ -31,6 +31,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental import gated_norm_quant as gnq
 from vllm_torchtpu.layers.adapter import linear_common
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
@@ -141,6 +142,11 @@ def install(model: torch.nn.Module) -> int:
             )
     for layer in layers:
         _build_ops(float(layer.norm.eps))
+        if envs.TPU_GDN_NORM_Z_FROM_QKVZ and hasattr(layer, "in_proj_qkvz"):
+            _zsrc_norm_op(
+                float(layer.norm.eps),
+                int(layer.tp_head_geometry.local_conv_dim(layer.head_k_dim, layer.head_v_dim)),
+            )
         layer.fused_norm_quant = True
     logger.info(
         "[GDN] TPU_GDN_FUSED_NORM_QUANT: %d layers run the gated norm and "
@@ -163,7 +169,8 @@ def output_projection(
         # z read by the kernel from the projection rows: no XLA slice /
         # relayout of z (TPU_GDN_NORM_Z_FROM_QKVZ).
         src, z_col0 = zsrc
-        q, s = _zsrc_norm_op(float(layer.norm.eps), int(z_col0))(
+        # Built at install(): creating a jax_op while tracing breaks Dynamo.
+        q, s = _zsrc_norm_ops[(float(layer.norm.eps), int(z_col0))](
             core_attn_out, src, layer.norm.weight
         )
     else:
