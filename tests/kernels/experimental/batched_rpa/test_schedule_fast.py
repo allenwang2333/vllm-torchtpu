@@ -167,12 +167,12 @@ def test_schedule_fast_table_end_clamp(layout):
 
 
 def test_schedule_fast_multi_flush():
-    # bkv = 128 tokens (1 page) -> one task per page: 8 x 5000 tokens = 320 tasks
-    # = 160 steps > max_steps_ub (128): the schedule flushes twice.
-    num_seqs, pps = 8, 64
+    # bkv = 128 tokens (1 page) -> one task per page: 8 x 594 pages = 4752 tasks
+    # = 2376 steps > max_steps_ub (2304 on tpu7x at this size): two flushes.
+    num_seqs, pps = 8, 600
     table = _table(num_seqs, pps)
     block = configs.BlockSizes(bq_sz=DQS, bq_c_sz=DQS, bkv_sz=128, batch_size=2, n_buffer=3)
-    q, kv, dist = (4,) * 8, (5000,) * 8, (8, 8, 8)
+    q, kv, dist = (4,) * 8, (76000,) * 8, (8, 8, 8)
     ca = _cfgs(configs.RpaCase.DECODE, SEQ, num_seqs, pps, False, block)
     cb = _cfgs(configs.RpaCase.DECODE, SEQ, num_seqs, pps, True, block)
     a = _used_rows(_schedule(ca, q, kv, dist, table), ca)
