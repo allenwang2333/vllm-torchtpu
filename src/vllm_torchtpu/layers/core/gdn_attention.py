@@ -81,7 +81,10 @@ def gdn_decode_only_kwargs(num_tokens: int) -> dict[str, bool]:
     if not gdn_decode_only_program(num_tokens):
         return {}
     if tpu_envs.TPU_GDN_DECODE_ONLY_KEEP_LAUNCH:
-        return {"per_seq_empty": True}
+        return {
+            "per_seq_empty": True,
+            "per_seq_noalias": tpu_envs.TPU_GDN_DECODE_ONLY_NOALIAS,
+        }
     return {"batched_only": True}
 
 
@@ -902,6 +905,7 @@ def run_jax_gdn_attention_pooled_local(
     num_spec_tokens: int = 0,
     batched_only: bool = False,
     per_seq_empty: bool = False,
+    per_seq_noalias: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
@@ -956,6 +960,7 @@ def run_jax_gdn_attention_pooled_local(
         num_spec_tokens=num_spec_tokens,
         batched_only=batched_only,
         per_seq_empty=per_seq_empty,
+        per_seq_noalias=per_seq_noalias,
     )
     return recurrent_state, output
 
@@ -1029,7 +1034,11 @@ def run_jax_gdn_attention_pooled(
         P(None, "model"),  # j_b
         P(None, "model"),  # j_a
         pool_spec,  # recurrent_state (attention-shaped pool)
-        P("model", None, None),  # j_conv_weight
+        (
+            P(None, None, "model")  # pre-transposed [kernel_size, 1, dim]
+            if j_conv_weight.shape[0] == kernel_size
+            else P("model", None, None)
+        ),  # j_conv_weight
         P("model") if j_conv_bias is not None else None,  # j_conv_bias
         P("model"),  # j_A_log
         P("model"),  # j_dt_bias

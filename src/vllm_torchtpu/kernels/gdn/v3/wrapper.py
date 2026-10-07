@@ -409,6 +409,7 @@ def _select_state_buffers(
         "batched_only",
         "prefill_only",
         "per_seq_empty",
+        "per_seq_noalias",
         "zero_initialize_out",
         "compute_precision",
         "state_plan",
@@ -446,6 +447,7 @@ def fused_conv1d_gdn(
     batched_only: bool = False,
     prefill_only: bool = False,
     per_seq_empty: bool = False,
+    per_seq_noalias: bool = False,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
     decode_tile_size: int = 4,
@@ -519,6 +521,8 @@ def fused_conv1d_gdn(
             sequence: PER_SEQ is still launched (XLA uses the launch as a
             slot for async prefetches) but with constant zero-tile metadata,
             so none of its per-sequence metadata is computed.
+        per_seq_noalias: With per_seq_empty (pooled only), return BATCHED's
+            output directly instead of aliasing it through the empty PER_SEQ.
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
@@ -574,7 +578,13 @@ def fused_conv1d_gdn(
 
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape
-    assert conv_weight.shape == (dim, 1, kernel_size)
+    # [kernel_size, 1, dim] f32 = already in the kernel's layout (transposed
+    # and cast once at load, TPU_GDN_CONV_WEIGHT_PRETRANSPOSED).
+    conv_weight_pretransposed = conv_weight.shape == (kernel_size, 1, dim)
+    if conv_weight_pretransposed:
+        assert conv_weight.dtype == jnp.float32, conv_weight.dtype
+    else:
+        assert conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
         assert conv_bias.shape == (dim,)
     assert query_start_loc.shape == (num_seqs + 1,)
@@ -728,7 +738,8 @@ def fused_conv1d_gdn(
     if not pooled:
         conv_state_shape = conv_state.shape
         conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
-    conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
+    if not conv_weight_pretransposed:
+        conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(jnp.float32) if conv_bias is not None else None
 
     # Step 4: Wrap inputs for the kernel.
@@ -747,6 +758,7 @@ def fused_conv1d_gdn(
         in_recurrent_state: jax.Array | None,
         in_act: jax.Array | None,
         mode: config.GDNMode,
+        zero_init: bool = True,
     ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
         # With a state source, it rides the conv-state slot and the dense
         # recurrent-state input is absent.
@@ -839,7 +851,7 @@ def fused_conv1d_gdn(
             input_output_aliases[len(metadata_obj) + 4] = 2
         out_shape = cfg.get_out_shape()
 
-        if in_act is None and zero_initialize_out:
+        if in_act is None and zero_initialize_out and zero_init:
             in_act = jnp.zeros_like(out_shape)
         if in_act is not None:
             out_shape = in_act
@@ -888,7 +900,13 @@ def fused_conv1d_gdn(
             out_act, out_source, _ = call_kernel(
                 state_source, None, None, config.GDNMode.BATCHED
             )
-        if not batched_only:
+        if not batched_only and per_seq_empty and per_seq_noalias and out_act is not None:
+            # Zero tiles write no output row: keep BATCHED's output instead of
+            # aliasing it through PER_SEQ (the launch stays for the pool).
+            _, out_source, _ = call_kernel(
+                out_source, None, None, config.GDNMode.PER_SEQ, zero_init=False
+            )
+        elif not batched_only:
             out_act, out_source, _ = call_kernel(
                 out_source, None, out_act, config.GDNMode.PER_SEQ
             )
