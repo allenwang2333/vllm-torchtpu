@@ -221,7 +221,10 @@ def _patched_decoder_forward(
 
     full_num_tokens = positions.shape[-1]
     prequant = None
-    if getattr(self, input_norm_quant_op.LAYER_ATTR, False):
+    if (
+        getattr(self, input_norm_quant_op.LAYER_ATTR, False)
+        and full_num_tokens > envs.TPU_INPUT_NORM_QUANT_MIN_ROWS
+    ):
         # TPU_INPUT_NORM_QUANT: the norm also emits the fp8 rows of its output
         # for the input projection (normed rows only where a bf16 consumer
         # needs them: GDN's in_proj_ba).

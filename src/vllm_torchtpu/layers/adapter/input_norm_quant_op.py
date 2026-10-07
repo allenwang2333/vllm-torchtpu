@@ -137,7 +137,8 @@ def install(model: torch.nn.Module) -> int:
         eps = float(module.input_layernorm.variance_epsilon)
         _, is_gdn = _projection(module)
         for has_res in (False, True):
-            _build_op(eps, has_res, emit_y=is_gdn, has_rstd=_exact())
+            for has_rstd in {_exact(), _exact(EXACT_MAX_ROWS + 1)}:
+                _build_op(eps, has_res, emit_y=is_gdn, has_rstd=has_rstd)
         linear_common._get_prequant_matmul_op()
         setattr(module, LAYER_ATTR, True)
         count += 1
@@ -149,8 +150,18 @@ def install(model: torch.nn.Module) -> int:
     return count
 
 
-def _exact() -> bool:
-    return envs.TPU_INPUT_NORM_QUANT != 2
+# Mode 3's row fork, the same bucket boundary TPU_FUSED_QK_NORM_ROPE forks at
+# (the backbone is re-traced per bucket group, so the fork is legal there).
+EXACT_MAX_ROWS = 64
+
+
+def _exact(rows: int | None = None) -> bool:
+    """Mode 1: always exact; 2: never; 3: exact on decode buckets (<= 64 rows),
+    the kernel's own statistic above (one HBM pass fewer in prefill)."""
+    mode = envs.TPU_INPUT_NORM_QUANT
+    if mode == 3:
+        return rows is None or rows <= EXACT_MAX_ROWS
+    return mode != 2
 
 
 def norm_quant(layer: torch.nn.Module, hidden_states, residual):
@@ -159,7 +170,7 @@ def norm_quant(layer: torch.nn.Module, hidden_states, residual):
     norm = layer.input_layernorm
     eps = float(norm.variance_epsilon)
     _, is_gdn = _projection(layer)
-    exact = _exact()
+    exact = _exact(hidden_states.shape[0])
     extra = ()
     if exact:
         # The statistic exactly as ir.ops.(fused_add_)rms_norm computes it.

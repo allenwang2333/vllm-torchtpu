@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     TPU_FP8_ROWQUANT_MAX_ROWS: int = 64
     TPU_GDN_IN_PROJ_KN: bool = False
     TPU_INPUT_NORM_QUANT: int = 0
+    TPU_INPUT_NORM_QUANT_MIN_ROWS: int = 0
     TPU_FUSED_QK_NORM_ROPE: bool = False
     TPU_RPA_DECODE_BATCHED: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -728,8 +729,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 1: XLA computes the norm's rsqrt(mean(x^2) + eps) and the kernel applies
     # it and quantizes (bit-exact with the unfused path). 2: the kernel also
     # computes the statistic (one op fewer; its reduction order differs from
-    # XLA's, so a normed value can move by one bf16 ulp).
+    # XLA's, so a normed value can move by one bf16 ulp). 3: 1 on decode
+    # buckets (<= 64 rows), 2 above.
     "TPU_INPUT_NORM_QUANT": env_int("TPU_INPUT_NORM_QUANT", 0),
+    # Only token buckets of more than this many rows take TPU_INPUT_NORM_QUANT
+    # (64: prefill only; at decode sizes the kernel's operands cost XLA's
+    # prefetch schedule more than the fusions it replaces).
+    "TPU_INPUT_NORM_QUANT_MIN_ROWS": env_int("TPU_INPUT_NORM_QUANT_MIN_ROWS", 0),
     # Run the gated q split, q/k RMS norms and NeoX rope of Qwen3NextAttention
     # as one kernel on token buckets of up to 64 rows.
     "TPU_FUSED_QK_NORM_ROPE": env_bool("TPU_FUSED_QK_NORM_ROPE"),
