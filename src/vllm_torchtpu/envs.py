@@ -104,6 +104,8 @@ if TYPE_CHECKING:
     TPU_INPUT_NORM_QUANT_MIN_ROWS: int = 0
     TPU_FUSED_QK_NORM_ROPE: bool = False
     TPU_RPA_DECODE_BATCHED: bool = False
+    TPU_RPA_DECODE_ONLY: bool = False
+    TPU_RPA_SCHEDULE_FAST: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_WORKER_NUMA_BIND: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
@@ -774,6 +776,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run batched RPA in token buckets of up to 64 rows with half the chip's
     # VMEM and a decode batch of min(8, max_num_seqs), at max_model_len <= 12k.
     "TPU_RPA_DECODE_BATCHED": env_bool("TPU_RPA_DECODE_BATCHED"),
+    # With TPU_GDN_DECODE_ONLY_MAX_TOKENS: token buckets of at most that many
+    # rows run batched RPA's DECODE pass only -- no MIXED metadata schedule and
+    # no (empty) MIXED kernel launch. The runner's prefill floor keeps every
+    # chunk that has an RPA mixed-segment request out of those buckets.
+    "TPU_RPA_DECODE_ONLY": env_bool("TPU_RPA_DECODE_ONLY"),
+    # Batched RPA metadata schedule: write only the steps it produced to HBM
+    # (not the whole SMEM schedule), take a branch-free descriptor path for
+    # full KV blocks, and count the cache-page wait per task instead of
+    # re-reading every descriptor. Same schedule contents in the used steps.
+    "TPU_RPA_SCHEDULE_FAST": env_bool("TPU_RPA_SCHEDULE_FAST"),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()

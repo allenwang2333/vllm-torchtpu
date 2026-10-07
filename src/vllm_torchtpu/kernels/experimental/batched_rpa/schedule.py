@@ -338,8 +338,11 @@ def _mask_out_steps(
     step: jax.typing.ArrayLike,
     schedule_smem: RpaSchedule,
     b_idx: jax.typing.ArrayLike,
+    kv_in_ref: jax.Ref | None = None,
 ):
     """Mask out unvisited metadata schedule entries at (step, b_idx)."""
+    if kv_in_ref is not None:
+        kv_in_ref[step * schedule_smem.cfgs.batch_size + b_idx] = 0
     schedule_smem.s_idx[step, b_idx] = -1
     schedule_smem.q_idx[step, b_idx] = 0
     schedule_smem.k_idx[step, b_idx] = 0
@@ -385,6 +388,42 @@ def _write_schedule_to_hbm(
     )  # pytype: disable=bad-argument-type
     flat_hbm = jax.tree_util.tree_leaves(schedule_hbm)
     flat_smem = jax.tree_util.tree_leaves(schedule_smem)
+    if cfgs.serve.schedule_fast and not isinstance(num_steps, int):
+        # Write the `num_steps` produced steps, not the whole SMEM schedule: the
+        # consumer reads steps < actual_steps only. Same rounding as below.
+        big, small = [], []
+        for h, s in zip(flat_hbm, flat_smem):
+            element_size = s.shape[0] // cfgs.max_steps_ub
+            if h.shape[0] > 1:
+                write_size = utils.align_to(num_steps * element_size, 128)
+                big.append(
+                    pltpu.make_async_copy(
+                        s.at[pl.ds(0, write_size)],
+                        h.at[pl.ds(hbm_offset_aligned * element_size, write_size)],
+                        dma_sem.at[0],
+                    )
+                )
+            else:
+                small.append(
+                    pltpu.make_async_copy(
+                        s.at[pl.ds(0, h.shape[0])],
+                        h.at[pl.ds(0, h.shape[0])],
+                        dma_sem.at[0],
+                    )
+                )
+
+        @pl.when(num_steps > 0)
+        def _():
+            for c in big:
+                c.start()
+            for c in big:
+                c.wait()
+
+        for c in small:
+            c.start()
+        for c in small:
+            c.wait()
+        return
     dma_list = []
     for h, s in zip(flat_hbm, flat_smem):
         element_size = s.shape[0] // cfgs.max_steps_ub
@@ -413,6 +452,7 @@ def _compute_waits(
     end_step: jax.typing.ArrayLike,
     *,
     cfgs: configs.RpaConfigs,
+    kv_in_ref: jax.Ref | None = None,
 ):
     """Computes total wait row/lane counts for a range of steps."""
 
@@ -430,7 +470,24 @@ def _compute_waits(
         # KV IN
         kv_in_tokens = 0
         for b in range(cfgs.batch_size):
-            if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            if kv_in_ref is not None:
+                # Cache-page tokens of this task, counted once in k_loop.
+                kv_in_tokens += kv_in_ref[step * cfgs.batch_size + b]
+            if kv_in_ref is not None and (
+                cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+            ):
+                for i in range(cfgs.bkv_p_new):
+                    dma_entry = schedule.dma_kv_new[step, b, i]
+                    kv_in_tokens += jnp.where(
+                        dma_entry.fetch_val > 0, cfgs.serve.page_size, 0
+                    )
+            elif kv_in_ref is not None:
+                total_new_sz = 0
+                for i in range(cfgs.bkv_p_new):
+                    dma_entry = schedule.dma_kv_new[step, b, i]
+                    total_new_sz += dma_entry.fetch_val
+                kv_in_tokens += total_new_sz
+            elif cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
                 for i in range(cfgs.bkv_p_cache):
                     _, _, dma_valid = schedule.get_dma_kv_cache(step, b, i)
                     kv_in_tokens += dma_valid * cfgs.serve.page_size
@@ -512,6 +569,7 @@ def flush_to_hbm(
     dma_sem: jax.Ref,
     *,
     cfgs: configs.RpaConfigs,
+    kv_in_ref: jax.Ref | None = None,
 ):
     last_step = utils.align_to(count, cfgs.batch_size)
 
@@ -519,14 +577,20 @@ def flush_to_hbm(
     @jax.named_scope("mask_out_steps")
     def body(idx):
         step, b_idx = divmod(idx, cfgs.batch_size)
-        _mask_out_steps(step, b_idx=b_idx, schedule_smem=schedule)
+        _mask_out_steps(step, b_idx=b_idx, schedule_smem=schedule, kv_in_ref=kv_in_ref)
 
-    _compute_waits(schedule, 0, last_step // cfgs.batch_size, cfgs=cfgs)
+    _compute_waits(
+        schedule, 0, last_step // cfgs.batch_size, cfgs=cfgs, kv_in_ref=kv_in_ref
+    )
     _write_schedule_to_hbm(
         schedule,
         schedule_hbm_ref,
         hbm_offset,
-        cfgs.max_steps_ub,
+        (
+            last_step // cfgs.batch_size
+            if cfgs.serve.schedule_fast
+            else cfgs.max_steps_ub
+        ),
         dma_sem,
         cfgs=cfgs,
     )
@@ -577,6 +641,13 @@ class BaseMetadataComputer:
         self.cfgs = cfgs
         self.extra_refs = extra_refs
         self.page_indices_ref = page_indices_ref
+        # TPU_RPA_SCHEDULE_FAST: [max_steps_ub * batch] cache-page tokens per task,
+        # written by this class's k_loop (subclasses that override k_loop get None).
+        self.kv_in_ref = (
+            kwargs.get("kv_in_ref")
+            if type(self).k_loop is BaseMetadataComputer.k_loop
+            else None
+        )
 
     def page(self, flat_idx: jax.typing.ArrayLike) -> jax.Array:
         """HBM page id of flat page-table slot `seq * pages_per_seq + page`.
@@ -628,24 +699,64 @@ class BaseMetadataComputer:
         else:
             kv_left_frm_cache = jnp.maximum(kv_cache_len - kv_len_start, 0)
         p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
-        for i in range(cfgs.bkv_p_cache):
-            dst_vmem = i << cfgs.serve.page_size_log2
-            dma_sz = kv_left_frm_cache - dst_vmem
-            dma_sz = jnp.clip(dma_sz, 0, cfgs.serve.page_size)
 
-            src_hbm = self.page(
-                jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
+        def kv_cache_descriptors():
+            for i in range(cfgs.bkv_p_cache):
+                dst_vmem = i << cfgs.serve.page_size_log2
+                dma_sz = kv_left_frm_cache - dst_vmem
+                dma_sz = jnp.clip(dma_sz, 0, cfgs.serve.page_size)
+
+                src_hbm = self.page(
+                    jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
+                )
+
+                if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+                    dma_valid = jnp.where(dma_sz > 0, 1, 0)
+                    schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
+                    schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
+                    schedule.dma_kv_cache[step, target_lane, i, 2] = dma_valid
+                else:
+                    schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
+                    schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
+                    schedule.dma_kv_cache[step, target_lane, i, 2] = dma_sz
+
+        if self.kv_in_ref is None or cfgs.bkv_p_cache == 0:
+            kv_cache_descriptors()
+        else:
+            # Fast path: a task whose cache part fills the whole block and whose
+            # page slots are all inside the table has every descriptor valid and
+            # full-size, so the per-page clip, clamp and select go. Same values.
+            block_tokens = cfgs.bkv_p_cache << cfgs.serve.page_size_log2
+            left = jnp.maximum(kv_left_frm_cache, 0)
+            full = (left >= block_tokens) & (
+                p_offset + cfgs.bkv_p_cache <= cfgs.serve.num_page_indices
             )
-
             if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-                dma_valid = jnp.where(dma_sz > 0, 1, 0)
-                schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
-                schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
-                schedule.dma_kv_cache[step, target_lane, i, 2] = dma_valid
+                full_sz = 1
+                n_valid = jnp.minimum(
+                    (left + cfgs.serve.page_size - 1) >> cfgs.serve.page_size_log2,
+                    cfgs.bkv_p_cache,
+                )
+                kv_in_tokens = n_valid << cfgs.serve.page_size_log2
             else:
-                schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
-                schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
-                schedule.dma_kv_cache[step, target_lane, i, 2] = dma_sz
+                full_sz = cfgs.serve.page_size
+                kv_in_tokens = jnp.minimum(left, block_tokens)
+            self.kv_in_ref[count] = kv_in_tokens
+
+            @pl.when(full)
+            def _():
+                for i in range(cfgs.bkv_p_cache):
+                    schedule.dma_kv_cache[step, target_lane, i, 0] = self.page(
+                        p_offset + i
+                    )
+                    schedule.dma_kv_cache[step, target_lane, i, 1] = (
+                        i << cfgs.serve.page_size_log2
+                    )
+                    schedule.dma_kv_cache[step, target_lane, i, 2] = full_sz
+
+            @pl.when(jnp.logical_not(full))
+            def _():
+                kv_cache_descriptors()
 
         kv_left_frm_new = kv_left - kv_left_frm_cache
         bkv_sz_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)
@@ -751,6 +862,7 @@ class BaseMetadataComputer:
             carry.hbm_offset,
             self.dma_sem,
             cfgs=self.cfgs,
+            kv_in_ref=self.kv_in_ref,
         )
         return LoopCarry(new_hbm_offset, 0)
 
@@ -866,7 +978,7 @@ def rpa_metadata_schedule_kernel(
     # Scratch.
     schedule_ref: RpaSchedule,
     dma_sem: jax.Ref,
-    *,
+    *maybe_kv_in_ref: jax.Ref,
     cfgs: configs.RpaConfigs,
     computer_cls: type[BaseMetadataComputer] = BaseMetadataComputer,
 ):
@@ -913,6 +1025,7 @@ def rpa_metadata_schedule_kernel(
         cfgs=cfgs,
         extra_refs=extra_scalars_ref,
         page_indices_ref=page_indices_ref,
+        kv_in_ref=maybe_kv_in_ref[0] if maybe_kv_in_ref else None,
     )
     loop_carry = computer.compute(
         cu_q_lens_ref=cu_q_lens_ref,
@@ -933,6 +1046,7 @@ def rpa_metadata_schedule_kernel(
         hbm_offset,
         dma_sem,
         cfgs=cfgs,
+        kv_in_ref=computer.kv_in_ref,
     )
 
 
@@ -968,7 +1082,12 @@ def generate_rpa_metadata(
             scratch_shapes=[
                 schedule_shaped_dtype.scratch_shapes(),
                 pltpu.SemaphoreType.DMA((1,)),
-            ],
+            ]
+            + (
+                [pltpu.SMEM((cfgs.max_steps_ub * cfgs.batch_size,), jnp.int32)]
+                if cfgs.serve.schedule_fast
+                else []
+            ),
         ),
         interpret=interpret,
         name="rpa_metadata_schedule",

@@ -1458,7 +1458,11 @@ class TPUModelRunner(GPUModelRunner):
         self.num_xla_graphs += new_compiled_graphs
 
     def _gdn_mixed_min_tokens(
-        self, start_index: int, num_reqs: int, num_windowed_reqs: int
+        self,
+        start_index: int,
+        num_reqs: int,
+        num_windowed_reqs: int,
+        num_rpa_decode_reqs: int | None = None,
     ) -> int:
         """The smallest bucket a chunk may take under TPU_GDN_DECODE_ONLY_MAX_TOKENS.
 
@@ -1471,6 +1475,11 @@ class TPUModelRunner(GPUModelRunner):
         max_tokens = envs.TPU_GDN_DECODE_ONLY_MAX_TOKENS
         if max_tokens <= 0:
             return 0
+        if envs.TPU_RPA_DECODE_ONLY and num_rpa_decode_reqs is not None:
+            # TPU_RPA_DECODE_ONLY: those buckets also drop batched RPA's MIXED
+            # pass, whose segment starts after RPA's decode segment (which
+            # excludes verify windows when reorder_batch_threshold is 1).
+            num_windowed_reqs = min(num_windowed_reqs, num_rpa_decode_reqs)
         chunk_num_windowed = max(0, min(num_windowed_reqs - start_index, num_reqs))
         return max_tokens + 1 if chunk_num_windowed < num_reqs else 0
 
@@ -2746,7 +2755,7 @@ class TPUModelRunner(GPUModelRunner):
         num_reqs = len(num_scheduled_tokens_per_req)
         # Read by the sequence layout planner when it picks this chunk's bucket.
         self._gdn_chunk_min_tokens = self._gdn_mixed_min_tokens(
-            start_index, num_reqs, num_windowed_reqs
+            start_index, num_reqs, num_windowed_reqs, rpa_num_decode_reqs
         )
 
         sequence_layout_planner = _get_sequence_layout_planner_for_runner(self)
@@ -3480,7 +3489,14 @@ class TPUModelRunner(GPUModelRunner):
                 scheduler_output.total_num_scheduled_tokens,
                 # Every DP rank must run the bucket a prefill chunk is moved to.
                 self._gdn_mixed_min_tokens(
-                    0, self.input_batch.num_reqs, num_windowed_reqs
+                    0,
+                    self.input_batch.num_reqs,
+                    num_windowed_reqs,
+                    (
+                        num_windowed_reqs
+                        if self.reorder_batch_threshold > 1
+                        else num_decode_reqs
+                    ),
                 ),
             ),
             local_num_chunks,
