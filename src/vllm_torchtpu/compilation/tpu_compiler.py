@@ -157,6 +157,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
     # Scheduler prefix-cache hit length only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
+    # Scheduler prefix-cache hit length / retention only.
+    "TPU_HYBRID_RETENTION_MAX_CONVS",
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
@@ -392,6 +394,14 @@ class TpuCompilerAdaptor(CompilerInterface):
     def __init__(self):
         self.cache_dir: str | None = None
         self._disable_cache = False
+        try:
+            from vllm_torchtpu.offload.offload_eagle_groups import (
+                patch_offload_without_eagle_groups,
+            )
+
+            patch_offload_without_eagle_groups()
+        except Exception:
+            pass
 
     def initialize_cache(
         self, cache_dir: str, disable_cache: bool = False, prefix: str = ""

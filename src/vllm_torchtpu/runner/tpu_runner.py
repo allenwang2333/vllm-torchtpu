@@ -1105,7 +1105,9 @@ class TPUModelRunner(GPUModelRunner):
         )
         invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
         invalid_block_group_index = (
-            kv_connector.get_block_ids_with_load_errors_group_index()
+            getattr(
+                kv_connector, "get_block_ids_with_load_errors_group_index", lambda: None
+            )()
             if invalid_block_ids
             else None
         )

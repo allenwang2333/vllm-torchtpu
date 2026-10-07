@@ -868,6 +868,14 @@ class TpuPlatform(Platform):
             and os.environ.get("TPU_QWEN35_AUTO_DEFAULTS", "1").strip().lower()
             in ("1", "true", "yes", "on")
         ):
+            # The regime hybrid-state retention and the Raiden partial-tail
+            # offload are built for: sparse retention, 128-token match unit.
+            if hasattr(cache_config, "prefix_cache_retention_interval"):
+                cache_config.prefix_cache_retention_interval = 0
+            if hasattr(cache_config, "prefix_match_unit") and getattr(
+                cache_config, "prefix_match_unit", None
+            ) in (None, 0, 1):
+                cache_config.prefix_match_unit = 128
             dcp_size = int(
                 getattr(parallel_config, "decode_context_parallel_size", 1) or 1
             )

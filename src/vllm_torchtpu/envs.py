@@ -149,6 +149,7 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
+    TPU_HYBRID_RETENTION_MAX_CONVS: int = 64
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -1018,6 +1019,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "512")),
     "TPU_SP_FP8_GATHER": env_bool("TPU_SP_FP8_GATHER", default=True),
+    "TPU_HYBRID_RETENTION_MAX_CONVS": env_nonnegative_int(
+        "TPU_HYBRID_RETENTION_MAX_CONVS", 64
+    ),
 }
 
 
