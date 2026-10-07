@@ -27,13 +27,23 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
 
 
-class FieldOffset:
-    """A Python descriptor that generates the `[pos + offset]` lazy lookup.
+@dataclasses.dataclass(frozen=True)
+class _FieldRef:
+    data: Any
+    idx: Any
 
-    This is necessary because JAX does not support dynamically slicing a
-    range (e.g. `data[pos:pos+4]`) using traced indices inside a loop,
-    but it natively supports retrieving/updating single dynamically-indexed
-    elements (e.g. `data[pos+1]`).
+    def __getitem__(self, item):
+        return self.data[self.idx]
+
+    def __setitem__(self, item, value):
+        self.data[self.idx] = value
+
+
+class FieldOffset:
+    """A Python descriptor that generates the lazy field reference.
+
+    Returns a `_FieldRef` supporting both reading via `ref[...]` and in-place
+    writing via `ref[...] = value` on underlying SMEM buffers.
     """
 
     def __init__(self, offset: int | None = None, is_abstract: bool = False):
@@ -44,7 +54,7 @@ class FieldOffset:
         self.__isabstractmethod__ = is_abstract
 
     def __get__(self, obj, objtype=None):
-        return obj.data[obj.pos + self.offset]
+        return _FieldRef(obj.data, obj.pos + self.offset)
 
 
 @dataclasses.dataclass(frozen=True)
