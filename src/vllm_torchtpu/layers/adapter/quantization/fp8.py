@@ -1161,6 +1161,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                     router_logits,
                     score_bias_operand(layer),
                 )
+                if not _moe_shape_selection_enabled():
+                    return out
+                # Shape selection splits buckets between this graph and the
+                # GMM one; keep their lifted inputs identical for handover.
                 experts_start = layer._experts_start
                 if experts_start is not None:
                     value = experts_start.to(out.dtype)
@@ -1292,6 +1296,14 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             activation=activation_str,
         )
         return retain_fused_ep_graph_inputs(ep.combine(out, False))
+
+
+def _moe_shape_selection_enabled() -> bool:
+    """Whether some compiled token buckets leave the fused EP graph."""
+    return (
+        envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS > 0
+        or envs.TPU_MOE_GATHER_THEN_ROUTE_MAX_TOKENS > 0
+    )
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):

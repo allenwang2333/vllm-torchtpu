@@ -16,6 +16,8 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm_torchtpu import envs
+
 _padding_state: "TokenPaddingState | None" = None
 
 
@@ -32,7 +34,12 @@ class TokenPaddingState:
         local_padding_mask = torch.zeros(
             max_local_tokens, dtype=torch.bool, device=device
         )
-        local_valid_tokens = torch.zeros(1, dtype=torch.int32, device=device)
+        # Only fused EP's padded-row skip reads the valid-prefix length.
+        local_valid_tokens = (
+            torch.zeros(1, dtype=torch.int32, device=device)
+            if envs.MOE_FUSED_EP_V2_SKIP_PADDED_ROWS
+            else None
+        )
         return cls(
             local_padding_mask=local_padding_mask,
             local_valid_tokens=local_valid_tokens,

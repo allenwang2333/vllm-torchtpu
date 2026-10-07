@@ -736,7 +736,11 @@ def prebuild_fused_moe_ep(
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
     # The runner's padding state describes a valid prefix of this rank's own
     # rows. Under PCP a rank's rows are not such a prefix, so padding stays.
-    skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS and pcp == 1
+    skip_padded_tokens = (
+        envs.TPU_MOE_SKIP_PADDED_TOKENS
+        and envs.MOE_FUSED_EP_V2_SKIP_PADDED_ROWS
+        and pcp == 1
+    )
     op = _build_op(
         mesh,
         topk,

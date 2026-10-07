@@ -25,6 +25,8 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
+
 FP8_MAX = 448.0
 FP8 = jnp.float8_e4m3fn
 # Storage only: there is no four-bit MXU, so each block is widened to e4m3.
@@ -85,9 +87,10 @@ MAX_NBUF = nbuf_for(MAX_WEIGHT_PREFETCH_DISTANCE)
 # transport moves that no token asked for -- half the arrival buffer at the
 # decode bucket is this padding. It has to stay a power of two (ROWBLK_SHIFT)
 # and small enough for the routing tables' alignment slot field (the check in
-# refuse_bad_plan_args, which is an upper bound only). Single-row blocks avoid
-# per-expert padding on small batches.
-ROWBLK = 1
+# refuse_bad_plan_args, which is an upper bound only). Set by
+# MOE_FUSED_EP_V2_ROWBLK; single-row blocks avoid per-expert padding on small
+# batches.
+ROWBLK = envs.MOE_FUSED_EP_V2_ROWBLK
 # A token row is a whole number of 128-lane blocks: the lane count of the
 # vector unit this kernel is built for.
 HIDDEN_LANE_BLOCK = 128

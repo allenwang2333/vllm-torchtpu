@@ -85,6 +85,8 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    MOE_FUSED_EP_V2_ROWBLK: int = 2
+    MOE_FUSED_EP_V2_SKIP_PADDED_ROWS: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_TOKEN_BUCKET_LINEAR: bool = False
@@ -714,6 +716,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE": lambda: int(
         os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0
     ),
+    # Rows per fused EP MoE v2 transport block, which is also the padding each
+    # (expert, destination) run rounds up to. A power of two. Read once, when
+    # the kernel module is imported.
+    "MOE_FUSED_EP_V2_ROWBLK": lambda: int(os.getenv("MOE_FUSED_EP_V2_ROWBLK", "2")),
+    # With TPU_MOE_SKIP_PADDED_TOKENS, also hand fused EP MoE v2 each rank's
+    # valid-prefix length so padded rows skip routing, transport and expert
+    # work. Off keeps the kernel's operands unchanged.
+    "MOE_FUSED_EP_V2_SKIP_PADDED_ROWS": env_bool("MOE_FUSED_EP_V2_SKIP_PADDED_ROWS"),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
