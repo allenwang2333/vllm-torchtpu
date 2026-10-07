@@ -217,7 +217,7 @@ def _fold_ba(layer: torch.nn.Module) -> bool:
         and ba.weight.dtype == torch.bfloat16
         and getattr(ba, "bias", None) is None
         and getattr(ba, "_tpu_weight_flipped", False)
-        and not attn._pcp_streaming_enabled()
+        and not getattr(attn, "_pcp_streaming_configured", False)
     )
 
 
