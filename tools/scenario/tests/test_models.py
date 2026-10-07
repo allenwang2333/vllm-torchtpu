@@ -20,7 +20,8 @@ from typing import Any
 
 import pytest
 from pydantic import BaseModel, ValidationError
-from scenario.model import baseline, server, tasks
+from scenario.model import baseline, server, sweep, tasks
+from scenario.model import scenario as top
 from scenario.model.common import Model
 
 MINIMAL: dict[type[Model], dict[str, Any]] = {
@@ -79,6 +80,28 @@ MINIMAL: dict[type[Model], dict[str, Any]] = {
     baseline.EvalBaseline: {},
     baseline.BaselineRef: {"from": "a/b"},
     baseline.PointBaselines: {},
+    sweep.SweepPoint: {"name": "p"},
+    sweep.Sweep: {},
+    top.Scenario: {
+        "schema": 1,
+        "name": "n",
+        "server": {
+            "model": {"name": "m"},
+            "accelerator": "tpu7x",
+            "topology": "2x2x1",
+            "hosts": 1,
+            "chips_per_host": 4,
+            "startup_timeout": 60,
+        },
+    },
+    top.DefaultsServer: {},
+    top.DefaultsPerf: {},
+    top.DefaultsInferencex: {},
+    top.DefaultsAgentx: {},
+    top.DefaultsLmEval: {},
+    top.DefaultsEval: {},
+    top.DefaultsTasks: {},
+    top.Defaults: {"schema": 1},
 }
 
 # Keyed baselines take any key as an entry, so a stray key is a bad entry.
@@ -129,10 +152,102 @@ def test_models_are_frozen() -> None:
         spec.name = "x"  # pyrefly: ignore
 
 
+def test_json_schemas_generate() -> None:
+    for model in (top.Scenario, top.Defaults):
+        schema = model.model_json_schema(by_alias=True)
+        assert "schema" in schema["properties"]
+
+
+def test_only_yaml_spellings() -> None:
+    data = {**MINIMAL[top.Scenario]}
+    data["schema_version"] = data.pop("schema")
+    with pytest.raises(ValidationError):
+        top.Scenario.model_validate(data)
+    ref = baseline.BaselineRef.model_validate({"from": "a/b"})
+    assert ref.model_dump() == {"from": "a/b"}
+
+
 def test_strict_values() -> None:
     perf = {**MINIMAL[tasks.PerfTask], "num_prompts": "8"}
     with pytest.raises(ValidationError):
         tasks.PerfTask.model_validate(perf)
+
+
+def test_durations_and_sizes_are_stored_as_numbers(single: dict[str, Any]) -> None:
+    single["server"]["scratch"] = "64Gi"
+    model = top.Scenario.model_validate(single)
+    assert model.server.startup_timeout == 7200
+    assert model.server.scratch == 64 * 2**30
+
+
+def test_role_views_combine_server_and_role(pd: dict[str, Any]) -> None:
+    pd["server"]["args"]["compilation-config"] = {"a": 1, "b": 2}
+    pd["server"]["roles"]["decode"]["args"]["compilation-config"] = {"b": None}
+    pd["server"]["roles"]["decode"]["args"]["enable-expert-parallel"] = None
+    pd["server"]["roles"]["decode"]["env"] = {"TPU_KV_SHM_POOL_GB": None}
+    prefill, decode = top.Scenario.model_validate(pd).server.role_views()
+    assert prefill.args["compilation-config"] == {"a": 1, "b": 2}
+    assert decode.args["compilation-config"] == {"a": 1}
+    assert "enable-expert-parallel" not in decode.args
+    assert decode.args["data-parallel-size"] == 8
+    assert decode.env == {"JAX_PLATFORMS": "tpu,cpu"}
+    assert prefill.env["TPU_KV_SHM_POOL_GB"] == "8"
+    assert decode.arg_path("data-parallel-size") == (
+        "server",
+        "roles",
+        "decode",
+        "args",
+        "data-parallel-size",
+    )
+    assert decode.arg_path("max-model-len") == ("server", "args", "max-model-len")
+    assert decode.hardware == server.Hardware("tpu7x", "2x2x1", 1, 4)
+    assert decode.hardware.chips == 4
+
+
+def test_single_role_view(single: dict[str, Any]) -> None:
+    (role,) = top.Scenario.model_validate(single).server.role_views()
+    assert role.name == "server"
+    assert role.path == ("server",)
+    assert (role.hardware.hosts, role.hardware.chips) == (2, 8)
+
+
+def test_pd_cells_expand_in_order(pd: dict[str, Any]) -> None:
+    perf = top.Scenario.model_validate(pd).tasks.perf
+    assert perf is not None
+    keys = [cell.key for cell in perf.cell_list()]
+    assert len(keys) == 17
+    assert keys[:3] == [
+        "pd_disagg_decode_smoke_c8_i8192_o32",
+        "pd_disagg_prefill_c8_i8192_o1",
+        "pd_disagg_prefill_c16_i8192_o1",
+    ]
+    assert keys[-3:] == [
+        f"pd_disagg_decode_daily_round{r}_c256_i65536_o1024" for r in (1, 2, 3)
+    ]
+    first = perf.cell_list()[0]
+    assert (first.isl, first.osl, first.concurrency, first.num_prompts) == (
+        8192,
+        32,
+        8,
+        8,
+    )
+
+
+def test_product_cells(single: dict[str, Any]) -> None:
+    single["tasks"]["perf"]["isl_osl"] = [[1024, 128], [2048, 256]]
+    single["tasks"]["perf"]["concurrency"] = [1, 8]
+    single["tasks"]["perf"]["num_prompts"] = {"per_concurrency": 10}
+    perf = top.Scenario.model_validate(single).tasks.perf
+    assert perf is not None
+    cells = perf.cell_list()
+    assert [cell.key for cell in cells] == [
+        "isl1024_osl128_c1",
+        "isl1024_osl128_c8",
+        "isl2048_osl256_c1",
+        "isl2048_osl256_c8",
+    ]
+    assert tasks.count_for(cells[1].num_prompts, cells[1].concurrency) == 80
+    assert cells[2].path == ("tasks", "perf", "isl_osl", 1)
 
 
 def test_lm_eval_items_and_run_keys() -> None:
@@ -239,3 +354,103 @@ def test_agentx_concurrency_is_one_value() -> None:
     (error,) = info.value.errors()
     assert error["type"] == "V-31"
     assert "one concurrency per fresh server" in error["msg"]
+
+
+def test_schema_version() -> None:
+    for version in (2, "1", True):
+        data = {**MINIMAL[top.Scenario], "schema": version}
+        with pytest.raises(ValidationError) as info:
+            top.Scenario.model_validate(data)
+        (error,) = info.value.errors()
+        assert error["type"] == "V-01"
+        assert "this tool reads schema 1" in error["msg"]
+
+
+def test_defaults_file_shape() -> None:
+    defaults = top.Defaults.model_validate(
+        {
+            "schema": 1,
+            "server": {
+                "startup_timeout": "2h",
+                "args": {"max-model-len": 16384, "api-server-count": 1},
+            },
+            "tasks": {
+                "perf": {
+                    "dataset": {"name": "random"},
+                    "num_prompts": 320,
+                    "range_ratio_style": "symmetric",
+                    "warmup_runs": 0,
+                    "percentile_metrics": ["ttft", "tpot", "itl", "e2el"],
+                    "tolerance": 0.05,
+                    "client_args": {"backend": "vllm", "seed": 42},
+                },
+                "inferencex": {"framework": "vllm", "spec_decoding": "none"},
+                "agentx": {"duration": "1h", "fast": False},
+                "eval": {
+                    "lm_eval": {
+                        "model": "local-chat-completions",
+                        "model_args": {"num_concurrent": 128},
+                        "seed": "0,1234,None,1234",
+                        "limit": 100,
+                    }
+                },
+            },
+        }
+    )
+    assert defaults.server is not None
+    assert defaults.server.startup_timeout == 7200
+    for misplaced in (
+        {"server": {"model": {"name": "m"}}},
+        {"server": {"topology": "2x2x1"}},
+        {"tasks": {"perf": {"baseline": {}}}},
+        {"tasks": {"perf": {"isl_osl": [[1, 1]]}}},
+        {"name": "x"},
+        {"sweep": {}},
+    ):
+        with pytest.raises(ValidationError):
+            top.Defaults.model_validate({"schema": 1, **misplaced})
+
+
+def test_defaults_fields_share_descriptions() -> None:
+    assert (
+        top.DefaultsServer.model_fields["startup_timeout"].description
+        == server.Server.model_fields["startup_timeout"].description
+    )
+
+
+def test_sweep_expansion(agentx: dict[str, Any]) -> None:
+    model = sweep.Sweep.model_validate(agentx["sweep"])
+    points = sweep.expand(model)
+    assert [point.name for point in points] == ["c1", "c2", "c4", "c8"]
+    assert points[3].assignments == (
+        (("tasks", "agentx", "concurrency"), 8),
+        (("server", "args", "max-num-seqs"), 32),
+    )
+    product = sweep.Sweep.model_validate(
+        {
+            "name": "tp{server.args.tensor-parallel-size}-c{tasks.perf.concurrency[0]}",
+            "product": {
+                "server.args.tensor-parallel-size": [4, 8],
+                "tasks.perf.concurrency[0]": [1, 2],
+            },
+        }
+    )
+    assert [point.name for point in sweep.expand(product)] == [
+        "tp4-c1",
+        "tp4-c2",
+        "tp8-c1",
+        "tp8-c2",
+    ]
+    named = sweep.Sweep.model_validate({"points": [{"name": "a"}, {"name": "b"}]})
+    assert [(point.name, point.index) for point in sweep.expand(named)] == [
+        ("a", 0),
+        ("b", 1),
+    ]
+
+
+def test_point_name_errors() -> None:
+    with pytest.raises(ValueError, match="is not one of the axes"):
+        sweep.point_name("c{tasks.x}", {("tasks", "y"): 1})
+    with pytest.raises(ValueError, match="cannot go into a point name"):
+        sweep.point_name("c{tasks.y}", {("tasks", "y"): [1]})
+    assert sweep.point_name("x{tasks.y}", {("tasks", "y"): True}) == "xtrue"
