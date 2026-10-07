@@ -20,6 +20,8 @@ name, and waits go on local descriptors of the same bytes, since the bridge
 refuses a wait on a descriptor that carries a peer address.
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -82,6 +84,22 @@ def sum_slots(slots, n):
     return acc
 
 
+def _cost_estimate(x):
+    """Scheduling hint for XLA (row 13, close-gaps j-8228ff78).
+
+    Without a CostEstimate a Pallas call is costed as ~free by XLA, so memory-space
+    assignment sees no time in the 8-15 us an attention-exit all-reduce really takes
+    and declines to prefetch the MoE router weight across it (the router then reads
+    its 4 MiB weight from HBM, 3.5-4.0 us instead of 1.3-1.5 us).
+    TPU_SMALL_COLLECTIVE_COST_BYTES=N (default 0 = no estimate) costs the call as N
+    HBM bytes; it changes only XLA's schedule/prefetch decisions, never the math.
+    """
+    n = int(os.environ.get("TPU_SMALL_COLLECTIVE_COST_BYTES", "0") or "0")
+    if n <= 0:
+        return None
+    return pl.CostEstimate(flops=0, transcendentals=0, bytes_accessed=n)
+
+
 def call(kernel, x, out_rows, rank, scratch, collective_id, name):
     rank_specs = [pl.BlockSpec(memory_space=pltpu.SMEM)] if rank is not None else []
     args = (() if rank is None else (rank.astype(jnp.int32),)) + (x,)
@@ -92,4 +110,5 @@ def call(kernel, x, out_rows, rank, scratch, collective_id, name):
         scratch_shapes=scratch,
         compiler_params=pltpu.CompilerParams(collective_id=collective_id),
         name=name,
+        cost_estimate=_cost_estimate(x),
     )(*args)
