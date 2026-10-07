@@ -15,6 +15,11 @@ from types import SimpleNamespace
 
 import torch
 
+try:
+    import vllm  # noqa: F401
+except ImportError:
+    import tests.test_m3_raiden_dspark_ep32 as _m3_test_bootstrap  # noqa: F401
+
 from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
 
 NUM_BLOCKS = 4
@@ -104,6 +109,6 @@ def test_register_kv_caches_ds_v4_alias_groups():
 
     canonical = captured[0]
 
-    # Aliases collapse: four layer entries, three distinct arrays.
+    # Aliases collapse: four layer entries, three distinct arrays sorted descending by page_size_bytes.
     assert len(canonical.tensors) == 3
-    assert [t.page_size_bytes for t in canonical.tensors] == [256, 64, 128]
+    assert [t.page_size_bytes for t in canonical.tensors] == [256, 128, 64]
