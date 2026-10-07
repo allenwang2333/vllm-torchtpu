@@ -919,12 +919,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # full-width row update and hands the fresh rows to attention, instead of
     # a -1 fill plus a partial-width write whose result attention re-reads.
     "TPU_INDEXER_TOPK_SINGLE_WRITE": env_bool(
-        "TPU_INDEXER_TOPK_SINGLE_WRITE", default=False
+        "TPU_INDEXER_TOPK_SINGLE_WRITE", default=True
     ),
     # As TPU_INDEXER_TOPK_SINGLE_WRITE (implies it), with the row update done
     # by a donating op so XLA updates the table in place instead of copying the
     # whole `[max_num_batched_tokens, width]` table in every indexed layer.
-    "TPU_INDEXER_TOPK_NOCOPY": env_bool("TPU_INDEXER_TOPK_NOCOPY", default=False),
+    "TPU_INDEXER_TOPK_NOCOPY": env_bool("TPU_INDEXER_TOPK_NOCOPY", default=True),
     # With TPU_INDEXER_TOPK_SINGLE_WRITE / _NOCOPY: the indexed layer's own
     # attention reads its rows back from the updated shared table, the same
     # `table[:num_tokens]` expression the following skip_topk layers read,
@@ -934,7 +934,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the first skip_topk layer recomputes it whenever num_tokens is short of
     # the table height (decode). Same values either way.
     "TPU_INDEXER_TOPK_SHARED_READ": env_bool(
-        "TPU_INDEXER_TOPK_SHARED_READ", default=False
+        "TPU_INDEXER_TOPK_SHARED_READ", default=True
     ),
     # Smallest token bucket for which the DCP StreamIndex top-k merges by token
     # instead of by key: an all_to_all hands each rank 1/dcp of the tokens to

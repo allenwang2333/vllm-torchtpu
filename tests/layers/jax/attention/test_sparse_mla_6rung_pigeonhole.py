@@ -327,7 +327,8 @@ class TestSparseMLA6RungPigeonhole(unittest.TestCase):
         with open(f_ai, "r") as f:
             ai_src = f.read()
 
-        self.assertIn("if envs.TPU_DCP_MLA_SPLIT_Q_LSE:", ai_src)
+        self.assertIn("envs.TPU_DCP_MLA_SPLIT_Q_LSE", ai_src)
+        self.assertIn("if split_q_lse:", ai_src)
         self.assertIn("sparse_mla_kernel.dispatch_sparse_mla_6rung(", ai_src)
         self.assertIn("lse_lane_dense=True", ai_src)
         self.assertIn("q_pe=q_pe", ai_src)

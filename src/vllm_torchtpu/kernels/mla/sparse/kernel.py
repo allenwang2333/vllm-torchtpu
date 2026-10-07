@@ -2095,7 +2095,23 @@ def sparse_attention_chunk(
     )
 
 
-_RAGGED_K_RUNGS = (64, 128, 256, 512, 1024, 2048)
+_RAGGED_K_RUNGS: tuple[int, ...] = (64, 128, 256, 512, 1024, 2048)
+
+
+def get_dcp_kv_slice_rungs(max_k: int = 2048) -> tuple[int, ...]:
+    """Returns the subset of KV slice rungs up to max_k."""
+    return tuple(r for r in _RAGGED_K_RUNGS if r <= max_k)
+
+
+def select_dcp_kv_slice_size(max_capacity: int, active_k: int) -> int:
+    """Selects the smallest KV slice rung >= active_k, clamped to max_capacity."""
+    if active_k <= 0:
+        return 0
+    for rung in _RAGGED_K_RUNGS:
+        if active_k <= rung and rung <= max_capacity:
+            return rung
+    return min(max_capacity, _RAGGED_K_RUNGS[-1])
+
 
 
 def dispatch_sparse_mla_6rung(

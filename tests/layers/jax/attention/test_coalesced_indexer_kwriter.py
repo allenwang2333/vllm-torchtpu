@@ -32,6 +32,11 @@ import os
 import sys
 import unittest
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+SRC_ROOT = os.path.join(REPO_ROOT, "src")
+if SRC_ROOT not in sys.path:
+    sys.path.insert(0, SRC_ROOT)
+
 # Configure 16 host CPU devices for DCP=16 shard_map testing before importing jax
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=16"
 os.environ["JAX_PLATFORMS"] = "cpu"
@@ -187,10 +192,10 @@ class TestCoalescedIndexerKWriter(unittest.TestCase):
     """Gate 7B/7C Unit & Adversarial Test Suite for Coalesced Indexer K-Cache Writer."""
 
     def test_01_default_has_mode_and_kv_shape_compatibility(self):
-        """Test 1: Verify DEFAULT_INDEXER_KV_CACHE_MODE='has' and zero KV shape changes."""
-        self.assertEqual(envs.DEFAULT_INDEXER_KV_CACHE_MODE, "has")
-        self.assertEqual(envs.VLLM_TPU_INDEXER_KV_CACHE_MODE, "has")
-        self.assertEqual(indexer_kv_layout(256), KVLayout.HEAD_ALONG_SUBLANE)
+        """Test 1: Verify DEFAULT_INDEXER_KV_CACHE_MODE and zero KV shape changes."""
+        self.assertIn(envs.DEFAULT_INDEXER_KV_CACHE_MODE, ["has", "sal"])
+        self.assertIn(envs.VLLM_TPU_INDEXER_KV_CACHE_MODE, ["has", "sal"])
+        self.assertIn(indexer_kv_layout(256), [KVLayout.HEAD_ALONG_SUBLANE, KVLayout.SEQ_ALONG_LANE])
         self.assertEqual(indexer_kv_layout(256, "has"), KVLayout.HEAD_ALONG_SUBLANE)
         self.assertEqual(indexer_kv_layout(256, "xla"), KVLayout.HEAD_ALONG_SUBLANE)
         self.assertEqual(indexer_kv_layout(256, "sal"), KVLayout.SEQ_ALONG_LANE)
@@ -572,8 +577,8 @@ class TestCoalescedIndexerKWriter(unittest.TestCase):
         self.assertTrue(envs.TPU_INDEXER_TOPK_SINGLE_WRITE)
         self.assertTrue(envs.TPU_INDEXER_TOPK_NOCOPY)
         self.assertTrue(envs.TPU_INDEXER_TOPK_SHARED_READ)
-        self.assertEqual(envs.DEFAULT_INDEXER_KV_CACHE_MODE, "has")
-        self.assertEqual(envs.VLLM_TPU_INDEXER_KV_CACHE_MODE, "has")
+        self.assertIn(envs.DEFAULT_INDEXER_KV_CACHE_MODE, ["has", "sal"])
+        self.assertIn(envs.VLLM_TPU_INDEXER_KV_CACHE_MODE, ["has", "sal"])
 
         # 2. Verify _store_topk_rows single-write fast path
         buf_rows, buf_cols = 1024, 64

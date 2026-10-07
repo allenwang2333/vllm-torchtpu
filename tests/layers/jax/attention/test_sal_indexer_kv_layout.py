@@ -34,6 +34,11 @@ import os
 import sys
 import unittest
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+SRC_ROOT = os.path.join(REPO_ROOT, "src")
+if SRC_ROOT not in sys.path:
+    sys.path.insert(0, SRC_ROOT)
+
 # Configure 16 host CPU devices for DCP=16 shard_map testing before importing jax
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=16"
 os.environ["JAX_PLATFORMS"] = "cpu"
