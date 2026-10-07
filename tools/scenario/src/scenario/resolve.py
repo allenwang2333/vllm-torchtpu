@@ -16,7 +16,7 @@
 Layers, later wins:
 
     tool (model defaults) < scenarios/defaults.yaml < extends chain, root
-    parent first < the scenario
+    parent first < the scenario < --set, in order
 
 Defaults for a task apply only when a later layer declares that task, and
 perf defaults that only mean something for vllm bench serve stay out of an
@@ -44,19 +44,36 @@ from scenario.errors import (
 )
 from scenario.keycheck import check_keys
 from scenario.load import LoadedFile, load_file
-from scenario.merge import Origin, OriginOf, Provenance, merge_into
-from scenario.model.rules import check_scenario
+from scenario.merge import (
+    AssignError,
+    Origin,
+    OriginOf,
+    Provenance,
+    assign,
+    merge_into,
+)
+from scenario.model.baseline import BaselineRef
+from scenario.model.rules import baseline_key_problem, baseline_keys, check_scenario
 from scenario.model.scenario import SCHEMA_VERSION, Defaults, Scenario
 from scenario.model.tasks import (
     BUILTIN_TASKS,
     GATED_TASKS,
     VLLM_BENCH_ONLY_DEFAULTS,
 )
+from scenario.overrides import Override, OverrideError, parse_override, sparse_layer
 from scenario.paths import KeyPath, format_path
 
 SCENARIOS_DIR = "scenarios"
 DEFAULTS_FILE = "defaults.yaml"
 MAX_EXTENDS_DEPTH = 5
+
+
+@dataclass(frozen=True)
+class RefBaseline:
+    """An inline baseline copied from another scenario by `from:`."""
+
+    source: str
+    baseline: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -68,9 +85,17 @@ class Resolved:
     data: Mapping[str, Any]
     model: Scenario
     provenance: Provenance
+    overrides: tuple[str, ...]
+    ref_baselines: Mapping[str, RefBaseline]
     warnings: tuple[Diagnostic, ...] = ()
-    # Layer names, lowest first: tool, defaults, extends:<ref>..., scenario.
+    # Layer names, lowest first: tool, defaults, extends:<ref>..., scenario,
+    # set:<i>...
     layers: tuple[str, ...] = ()
+
+    @property
+    def experiment(self) -> bool:
+        """A run with --set overrides skips its gates and is tagged."""
+        return bool(self.overrides)
 
 
 def find_root(
@@ -99,6 +124,7 @@ def find_root(
 
 def resolve(
     file: pathlib.Path,
+    sets: Sequence[str] = (),
     *,
     root: pathlib.Path | None = None,
     cwd: pathlib.Path | None = None,
@@ -109,7 +135,7 @@ def resolve(
         DiagnosticError: every problem found, in every file.
     """
     resolver = Resolver(find_root(file, root, cwd))
-    return resolver.resolve(file.resolve())
+    return resolver.resolve(file.resolve(), tuple(sets))
 
 
 @dataclass(frozen=True)
@@ -138,6 +164,18 @@ class _Merge:
     origin_of: OriginOf
 
 
+@dataclass(frozen=True)
+class _Assign:
+    """A step that sets one path, for a --set."""
+
+    path: KeyPath
+    value: Any
+    origin: Origin
+
+
+_Step = _Merge | _Assign
+
+
 @dataclass
 class _Report:
     diagnostics: list[Diagnostic] = field(default_factory=list)
@@ -162,6 +200,9 @@ class _Report:
     def located(self, prov: Provenance, issues: Sequence[Issue]) -> None:
         for issue in issues:
             self.at(prov.locate(issue.path), issue)
+
+    def plain(self, source: str, message: str, rule: str | None = None) -> None:
+        self.diagnostics.append(Diagnostic(source, None, "", message, rule=rule))
 
     @property
     def failed(self) -> bool:
@@ -261,6 +302,7 @@ class Resolver:
         self.root = root
         self.scenarios = root / SCENARIOS_DIR
         self._files: dict[pathlib.Path, LoadedFile | DiagnosticError] = {}
+        self._refs: dict[str, tuple[Resolved, ...] | DiagnosticError] = {}
 
     # Files and reference ids ---------------------------------------------
 
@@ -382,17 +424,29 @@ class Resolver:
 
     # Resolution -----------------------------------------------------------
 
-    def resolve(self, file: pathlib.Path) -> tuple[Resolved, ...]:
+    def resolve(
+        self,
+        file: pathlib.Path,
+        sets: tuple[str, ...] = (),
+        follow_refs: bool = True,
+    ) -> tuple[Resolved, ...]:
         """Resolve `file`; see `resolve()`."""
         report = _Report()
-        results = self._resolve(file, report)
+        results = self._resolve(file, sets, follow_refs, report)
         diagnostics = sort_diagnostics(dict.fromkeys(report.diagnostics))
         if report.failed:
             raise DiagnosticError(diagnostics)
         warnings = tuple(d for d in diagnostics if d.severity == "warning")
         return tuple(dataclasses.replace(r, warnings=warnings) for r in results)
 
-    def _resolve(self, file: pathlib.Path, report: _Report) -> list[Resolved]:
+    def _resolve(
+        self,
+        file: pathlib.Path,
+        sets: tuple[str, ...],
+        follow_refs: bool,
+        report: _Report,
+    ) -> list[Resolved]:
+        overrides = self._overrides(sets, report)
         defaults = self._layer(
             self.scenarios / DEFAULTS_FILE, "defaults", Defaults, report
         )
@@ -410,32 +464,63 @@ class Resolver:
             own["extends"] = parents[0].ref
         else:
             own.pop("extends", None)
-        file_steps = [
+        file_steps: list[_Step] = [
             _Merge(_strip_inherited(layer.data), layer.origin_of())
             for layer in reversed(parents)
         ]
         file_steps.append(_Merge(own, scenario.origin_of()))
 
+        set_steps: list[_Step] = [
+            _Assign(o.path, o.value, Origin(f"set:{o.index}", o.source))
+            for o in overrides
+        ]
         results = []
-        declared, _ = self._apply(file_steps)
+        declared, _ = self._apply([*file_steps, *set_steps], _Report())
         scoped = _scoped_defaults(defaults.data, declared)
-        data, prov = self._apply([_Merge(scoped, defaults.origin_of()), *file_steps])
-        resolved = self._validate(scenario, data, prov, report)
+        steps = [_Merge(scoped, defaults.origin_of()), *file_steps, *set_steps]
+        data, prov = self._apply(steps, report)
+        resolved = self._validate(scenario, data, prov, overrides, follow_refs, report)
         if resolved is not None:
             layers = (
                 "tool",
                 "defaults",
                 *(f"extends:{layer.ref}" for layer in reversed(parents)),
                 "scenario",
+                *(f"set:{o.index}" for o in overrides),
             )
             results.append(dataclasses.replace(resolved, layers=layers))
         return results
 
-    def _apply(self, steps: Sequence[_Merge]) -> tuple[dict, Provenance]:
+    def _overrides(self, sets: tuple[str, ...], report: _Report) -> list[Override]:
+        """Parse and key-check every --set (V-30)."""
+        overrides = []
+        for index, text in enumerate(sets):
+            source = f"--set[{index}] {text}"
+            try:
+                override = parse_override(text, index)
+            except OverrideError as error:
+                report.plain(source, str(error), rule="V-30")
+                continue
+            unknown = check_keys(sparse_layer(override.path, override.value), Scenario)
+            for issue in unknown:
+                report.at(Origin(f"set:{index}", source), issue)
+            if not unknown:
+                overrides.append(override)
+        return overrides
+
+    def _apply(
+        self, steps: Sequence[_Step], report: _Report
+    ) -> tuple[dict, Provenance]:
         data: dict[str, Any] = {}
         prov = Provenance()
         for step in steps:
-            merge_into(data, prov, step.data, step.origin_of)
+            if isinstance(step, _Merge):
+                merge_into(data, prov, step.data, step.origin_of)
+                continue
+            try:
+                assign(data, prov, step.path, step.value, step.origin)
+            except AssignError as error:
+                report.at(step.origin, Issue(step.path, str(error)))
         return data, prov
 
     def _validate(
@@ -443,6 +528,8 @@ class Resolver:
         scenario: _FileLayer,
         data: dict[str, Any],
         prov: Provenance,
+        overrides: list[Override],
+        follow_refs: bool,
         report: _Report,
     ) -> Resolved | None:
         try:
@@ -451,6 +538,9 @@ class Resolver:
             report.located(prov, issues_from_validation_error(error, data))
             return None
         issues = check_scenario(model)
+        ref_baselines: dict[str, RefBaseline] = {}
+        if follow_refs:
+            issues += self._ref_baselines(model, ref_baselines)
         report.located(prov, issues)
         if any(issue.severity == "error" for issue in issues):
             return None
@@ -460,4 +550,67 @@ class Resolver:
             data=data,
             model=model,
             provenance=prov,
+            overrides=tuple(o.text for o in overrides),
+            ref_baselines=ref_baselines,
         )
+
+    # Baselines by reference -----------------------------------------------
+
+    def _resolve_ref(self, ref: str) -> tuple[Resolved, ...] | DiagnosticError:
+        if ref not in self._refs:
+            try:
+                self._refs[ref] = self.resolve(self.file_of(ref), follow_refs=False)
+            except DiagnosticError as error:
+                self._refs[ref] = error
+        return self._refs[ref]
+
+    def _ref_baselines(
+        self, model: Scenario, found: dict[str, RefBaseline]
+    ) -> list[Issue]:
+        """Copy `from:` baselines in, after checking them (V-23)."""
+        issues = []
+        for task in GATED_TASKS:
+            block = getattr(model.tasks, task)
+            if block is None or not isinstance(block.baseline, BaselineRef):
+                continue
+            ref = block.baseline.from_
+            copied, problem, hint = self._ref_baseline(model, task, ref)
+            if copied is not None:
+                found[task] = copied
+            else:
+                path = ("tasks", task, "baseline", "from")
+                issues.append(Issue(path, problem, hint=hint, rule="V-23"))
+        return issues
+
+    def _ref_baseline(
+        self, model: Scenario, task: str, ref: str
+    ) -> tuple[RefBaseline | None, str, str | None]:
+        if not self.file_of(ref).is_file():
+            return None, f"no scenario {ref}{self._near(ref)}", None
+        targets = self._resolve_ref(ref)
+        if isinstance(targets, DiagnosticError):
+            return None, f"{ref} does not resolve", targets.diagnostics[0].render()
+        (target,) = targets
+        other = getattr(target.model.tasks, task)
+        if other is None or other.baseline is None:
+            return None, f"{ref} has no inline tasks.{task} baseline", None
+        if isinstance(other.baseline, BaselineRef):
+            return (
+                None,
+                f"{ref} takes its {task} baseline from {other.baseline.from_}; refer "
+                "to that scenario directly",
+                None,
+            )
+        rule = baseline_keys(model, task)
+        have = tuple(other.baseline.model_extra or {})
+        if rule is not None and baseline_key_problem(set(have), *rule) is not None:
+            want, subset = rule
+            among = "are among" if subset else "are"
+            return (
+                None,
+                f"{ref} has {task} baseline keys {', '.join(have)}, but this task's "
+                f"keys {among} {', '.join(want)}",
+                None,
+            )
+        dumped = other.baseline.model_dump(by_alias=True, exclude_none=True)
+        return RefBaseline(source=ref, baseline=dumped), "", None

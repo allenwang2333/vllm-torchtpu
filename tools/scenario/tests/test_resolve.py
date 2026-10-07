@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Resolution: layers, extends, defaults and provenance."""
+"""Resolution: layers, extends, defaults, --set, baselines, provenance."""
 
 import pathlib
 import textwrap
@@ -98,16 +98,16 @@ class Repo:
         path.write_text(textwrap.dedent(text))
         return path
 
-    def resolve(self, ref: str) -> tuple[Resolved, ...]:
-        return resolve(self.root / "scenarios" / f"{ref}.yaml")
+    def resolve(self, ref: str, *sets: str) -> tuple[Resolved, ...]:
+        return resolve(self.root / "scenarios" / f"{ref}.yaml", sets)
 
-    def one(self, ref: str) -> Resolved:
-        (resolved,) = self.resolve(ref)
+    def one(self, ref: str, *sets: str) -> Resolved:
+        (resolved,) = self.resolve(ref, *sets)
         return resolved
 
-    def errors(self, ref: str) -> list[str]:
+    def errors(self, ref: str, *sets: str) -> list[str]:
         with pytest.raises(DiagnosticError) as info:
-            self.resolve(ref)
+            self.resolve(ref, *sets)
         return [d.render() for d in info.value.diagnostics]
 
 
@@ -119,6 +119,7 @@ def repo(tmp_path: pathlib.Path) -> Repo:
 def test_base_resolves_with_defaults(repo: Repo) -> None:
     resolved = repo.one("glm/base")
     assert resolved.ref == "glm/base"
+    assert not resolved.experiment
     server = resolved.model.server
     assert server.image == "us-docker.pkg.dev/test/images/vllm:test"
     assert server.startup_timeout == 7200
@@ -253,6 +254,51 @@ def test_lm_eval_defaults_need_lm_eval(repo: Repo) -> None:
     ]
 
 
+def test_gen_kwargs_replaces_the_lower_layer(repo: Repo) -> None:
+    repo.write(
+        "evals",
+        """\
+        schema: 1
+        name: evals
+        server:
+          model: {name: m}
+          accelerator: tpu7x
+          topology: 2x2x1
+          hosts: 1
+          chips_per_host: 4
+        tasks:
+          eval:
+            tolerance: 0.02
+            lm_eval:
+              tasks: [gsm8k]
+              gen_kwargs: {chat_template_kwargs: {thinking: false}, max_gen_toks: 64}
+        """,
+    )
+    repo.write(
+        "evals-child",
+        """\
+        schema: 1
+        name: evals-child
+        extends: evals
+        tasks:
+          eval:
+            lm_eval:
+              gen_kwargs: {chat_template_kwargs: {enable_thinking: false}}
+        """,
+    )
+    resolved = repo.one("evals-child", "tasks.eval.lm_eval.gen_kwargs.until=x")
+    assert resolved.model.tasks.eval.lm_eval.gen_kwargs == {
+        "chat_template_kwargs": {"enable_thinking": False},
+        "until": "x",
+    }
+    path = ("tasks", "eval", "lm_eval", "gen_kwargs")
+    assert resolved.provenance.origin(path).layer == "set:0"
+    assert [o.layer for o in resolved.provenance.superseded[path]] == [
+        "extends:evals",
+        "scenario",
+    ]
+
+
 def test_inferencex_perf_gets_no_vllm_bench_defaults(repo: Repo) -> None:
     repo.write(
         "ix",
@@ -367,6 +413,34 @@ def test_typos_are_reported_where_they_are(repo: Repo) -> None:
     ]
 
 
+def test_every_problem_in_one_run(repo: Repo) -> None:
+    repo.write(
+        "bad",
+        """\
+        schema: 1
+        name: bad
+        server:
+          model: {name: m}
+          accelerator: tpu7x
+          topology: 2x2x1
+          hosts: 1
+          chips_per_host: 2
+          multihostt: mp
+          env: {TPU_TOPOLOGY: 2x2x1}
+        """,
+    )
+    assert repo.errors("bad", "server.argz.x=1", "name=x") == [
+        "--set[0] server.argz.x=1: server.argz: unknown key; did you mean server.args?",
+        "--set[1] name=x: --set changes server.* or tasks.* only",
+        "scenarios/bad.yaml:6: server.topology: topology 2x2x1 has 4 chips, but "
+        "hosts 1 x chips_per_host 2 = 2",
+        "scenarios/bad.yaml:9: server.multihostt: unknown key; did you mean "
+        "server.multihost?",
+        "scenarios/bad.yaml:10: server.env.TPU_TOPOLOGY: TPU_TOPOLOGY is set by the "
+        "tool (multi-host and backend wiring); remove it",
+    ]
+
+
 def test_missing_field_points_at_its_parent(repo: Repo) -> None:
     repo.write("nomodel", "schema: 1\nname: n\nserver:\n  hosts: 1\n")
     assert repo.errors("nomodel") == [
@@ -382,6 +456,119 @@ def test_every_file_states_its_schema(repo: Repo) -> None:
     ]
 
 
+def test_set_values_and_lists(repo: Repo) -> None:
+    repo.write(
+        "custom",
+        """\
+        schema: 1
+        name: custom
+        server:
+          model: {name: m}
+          accelerator: tpu7x
+          topology: 2x2x1
+          hosts: 1
+          chips_per_host: 4
+        tasks:
+          custom:
+            - {name: probe, command: ["true"], timeout: 1m}
+        """,
+    )
+    resolved = repo.one(
+        "custom",
+        "tasks.custom[0].timeout=2h",
+        "server.args.enable-expert-parallel=true",
+        "server.env.X=1",
+        "server.args.api-server-count=null",
+    )
+    assert resolved.model.tasks.custom[0].timeout == 7200
+    assert resolved.model.server.args["enable-expert-parallel"] is True
+    assert resolved.model.server.env == {"X": "1"}
+    assert "api-server-count" not in resolved.model.server.args
+    assert resolved.provenance.origin(("tasks", "custom")).layer == "set:0"
+    assert repo.errors("custom", "tasks.custom[3].timeout=1h") == [
+        "--set[0] tasks.custom[3].timeout=1h: tasks.custom[3].timeout: tasks.custom "
+        "has no item [3]"
+    ]
+
+
+def test_from_baselines(repo: Repo) -> None:
+    repo.write(
+        "glm/mp",
+        """\
+        schema: 1
+        name: glm-mp
+        extends: glm/base
+        server: {multihost: mp}
+        tasks:
+          perf:
+            baseline: {from: glm/base}
+          eval:
+            baseline: {from: glm/base}
+        """,
+    )
+    resolved = repo.one("glm/mp")
+    assert resolved.ref_baselines["perf"].source == "glm/base"
+    assert dict(resolved.ref_baselines["perf"].baseline) == {
+        "isl8192_osl1024_c1024": {"completed": 2048}
+    }
+    assert dict(resolved.ref_baselines["eval"].baseline) == {
+        "mmlu_pro": {"exact_match,custom-extract": 0.76}
+    }
+    repo.write(
+        "glm/mp2",
+        """\
+        schema: 1
+        name: glm-mp2
+        extends: glm/base
+        tasks:
+          perf:
+            concurrency: [512]
+            baseline: {from: glm/base}
+          eval:
+            baseline: {from: glm/mp}
+        """,
+    )
+    assert repo.errors("glm/mp2") == [
+        "scenarios/glm/mp2.yaml:7: tasks.perf.baseline.from: glm/base has perf "
+        "baseline keys isl8192_osl1024_c1024, but this task's keys are "
+        "isl8192_osl1024_c512",
+        "scenarios/glm/mp2.yaml:9: tasks.eval.baseline.from: glm/mp takes its eval "
+        "baseline from glm/base; refer to that scenario directly",
+    ]
+    repo.write(
+        "glm/mp3",
+        "schema: 1\nname: m3\nextends: glm/base\n"
+        "tasks: {eval: {baseline: {from: glm/bas}}}\n",
+    )
+    assert repo.errors("glm/mp3") == [
+        "scenarios/glm/mp3.yaml:4: tasks.eval.baseline.from: no scenario glm/bas "
+        "(did you mean glm/base, glm/mp, glm/mp3?)"
+    ]
+
+
+def test_from_baseline_of_an_eval_sweep(repo: Repo) -> None:
+    sweep = """\
+        schema: 1
+        name: {name}
+        server:
+          model: {{name: m}}
+          accelerator: tpu7x
+          topology: 2x2x1
+          hosts: 1
+          chips_per_host: 4
+        tasks:
+          eval:
+            tolerance: 0.02
+            lm_eval: {{tasks: [gsm8k], concurrency: [1, 2]}}
+            baseline: {baseline}
+        """
+    repo.write(
+        "ev/a", sweep.format(name="a", baseline='{gsm8k_c2: {"exact_match,none": 0.9}}')
+    )
+    repo.write("ev/b", sweep.format(name="b", baseline="{from: ev/a}"))
+    assert set(repo.one("ev/b").ref_baselines["eval"].baseline) == {"gsm8k_c2"}
+
+
 def test_root_discovery(repo: Repo, tmp_path_factory: pytest.TempPathFactory) -> None:
     nested = repo.root / "scenarios" / "glm" / "base.yaml"
     assert find_root(nested) == repo.root
@@ -394,3 +581,126 @@ def test_root_discovery(repo: Repo, tmp_path_factory: pytest.TempPathFactory) ->
     (resolved,) = resolve(scratch, root=repo.root)
     assert resolved.ref == f"@{scratch.resolve()}"
     assert resolved.model.name == "exp"
+
+
+K3_TP32 = """\
+schema: 1
+name: kimi-k3-tp32-ep
+server:
+  model:
+    name: moonshotai/Kimi-K3
+    path: gs://tpu-commons-ci/moonshootai/kimi/k3
+  accelerator: tpu7x
+  topology: 2x2x4
+  hosts: 4
+  chips_per_host: 4
+  multihost: ray
+  startup_timeout: 4h
+  args:
+    load-format: runai_streamer
+    tensor-parallel-size: 32
+    enable-expert-parallel: true
+    max-model-len: 10240
+    max-num-seqs: 8
+    trust-remote-code: true
+    limit-mm-per-prompt: {image: 0, video: 0}
+    block-size: 256
+    compilation-config: {compile_sizes: [1, 8, 8192]}
+tasks:
+  perf:
+    isl_osl: [[8192, 1024]]
+    concurrency: [1]
+    num_prompts: 64
+    random_range_ratio: 0.0
+    temperature: 0
+    baseline:
+      _source:
+        description: Values from a nightly build.
+        previous_values: {median_tpot_ms: 18.95}
+      isl8192_osl1024_c1:
+        completed: 64
+        num_prompts: 64
+        median_tpot_ms: 19.2
+  eval:
+    lm_eval:
+      tasks: [mmlu_pro]
+      model_args: {num_concurrent: 16}
+      fewshot_as_multiturn: false
+      gen_kwargs: {chat_template_kwargs: {thinking: false}}
+    tolerance: 0.025
+    baseline:
+      mmlu_pro: {"exact_match,custom-extract": 0.834}
+"""
+
+K3_1P1D = """\
+schema: 1
+name: kimi-k3-tp8-dp4-ep-1p1d
+extends: kimi-k3/tp32-ep
+server:
+  accelerator: null
+  topology: null
+  hosts: null
+  chips_per_host: null
+  multihost: mp
+  scratch: 64Gi
+  args:
+    tensor-parallel-size: 8
+    data-parallel-size: 4
+    max-num-batched-tokens: 1296
+    compilation-config: {compile_sizes: [1, 8, 1296]}
+    distributed-executor-backend: mp
+  env:
+    TPU_RAIDEN_DST_SHARDS: "8"
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "10800"
+  roles:
+    prefill:
+      accelerator: tpu7x
+      topology: 2x2x4
+      hosts: 4
+      chips_per_host: 4
+      kv: {connector: TPURaidenConnector, role: producer}
+    decode:
+      accelerator: tpu7x
+      topology: 2x2x4
+      hosts: 4
+      chips_per_host: 4
+      kv: {connector: TPURaidenConnector, role: consumer}
+  router:
+    type: toy-proxy
+    command: [python3, examples/disagg/toy_proxy_server.py]
+tasks:
+  driver: prefill
+  perf: null
+  custom:
+    - name: correctness
+      command: [bash, scripts/vllm/integration/run_k3_1p1d_disagg_correctness.sh]
+      env:
+        PREFILL_CHUNK_TOKENS: "1296"
+        LOG_DIR: "${SCENARIO_RESULTS_DIR}/k3_1p1d_correctness"
+      timeout: 4h
+      skip_rest_if_exit_ge: 2
+  eval:
+    baseline: {from: kimi-k3/tp32-ep}
+"""
+
+
+def test_drafts_from_the_plan(repo: Repo) -> None:
+    repo.write("kimi-k3/tp32-ep", K3_TP32)
+    repo.write("kimi-k3/tp8-dp4-ep-1p1d", K3_1P1D)
+    tp32 = repo.one("kimi-k3/tp32-ep")
+    assert tp32.model.tasks.perf.baseline.source["description"].startswith("Values")
+    pd = repo.one("kimi-k3/tp8-dp4-ep-1p1d")
+    server = pd.model.server
+    assert (server.accelerator, server.topology, server.hosts) == (None,) * 3
+    assert server.chips_per_host is None
+    assert list(server.roles) == ["prefill", "decode"]
+    assert server.args["compilation-config"] == {"compile_sizes": [1, 8, 1296]}
+    assert server.startup_timeout == 4 * 3600
+    assert pd.model.tasks.perf is None
+    assert pd.model.tasks.eval.lm_eval.model_args == {"num_concurrent": 16}
+    assert pd.ref_baselines["eval"].source == "kimi-k3/tp32-ep"
+    prefill, decode = server.role_views()
+    assert (prefill.hardware.hosts, prefill.args["data-parallel-size"]) == (4, 4)
+    assert pd.provenance.deleted[("server", "hosts")] == Origin(
+        "scenario", "scenarios/kimi-k3/tp8-dp4-ep-1p1d.yaml", 7
+    )
