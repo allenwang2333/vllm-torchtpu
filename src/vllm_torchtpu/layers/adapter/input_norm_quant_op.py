@@ -280,6 +280,10 @@ def attention_forward(attn: torch.nn.Module, positions, prequant) -> torch.Tenso
     qkv = project(attn.qkv_proj, prequant)
     q, k, v, gate = attn._project_qkv_gate(qkv, positions)
     attn_output = attn.attn(q, k, v)
+    if gate is not None and getattr(attn, "_tpu_oproj_act_quant", False):
+        from vllm_torchtpu.layers.adapter import act_quant_op
+
+        return act_quant_op.o_proj_gated(attn, attn_output, gate)
     if gate is not None:
         attn_output = attn_output * torch.sigmoid(gate)
     output, _ = attn.o_proj(attn_output)

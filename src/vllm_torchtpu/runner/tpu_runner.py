@@ -4685,6 +4685,11 @@ class TPUModelRunner(GPUModelRunner):
             from vllm_torchtpu.layers.adapter import input_norm_quant_op
 
             input_norm_quant_op.install(model)
+        if envs.TPU_ACT_QUANT:
+            from vllm_torchtpu.layers.adapter import act_quant_op
+
+            act_quant_op.apply_patch()
+            act_quant_op.install(model)
         if self.parallel_config.pipeline_parallel_size > 1:
             # A sparse model's layers share one top-k index table, and under a
             # pipeline the layer that writes it and the layers that reuse it
