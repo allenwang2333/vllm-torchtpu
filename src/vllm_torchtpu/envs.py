@@ -50,6 +50,8 @@ if TYPE_CHECKING:
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
+    FUSED_MOE_DECODE_KERNEL: bool = False
+    FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -538,6 +540,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the original GMM path. This counts tokens, not tokens * topk.
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
         "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
+    ),
+    # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
+    # fused MoE decode kernel: routed experts, shared expert and all-reduce in
+    # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after
+    # load. Steps above FUSED_MOE_DECODE_KERNEL_MAX_TOKENS tokens run the GMM
+    # MoE path; arming refuses a cap whose buffers do not fit in VMEM.
+    "FUSED_MOE_DECODE_KERNEL": env_bool("FUSED_MOE_DECODE_KERNEL"),
+    "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS": env_int(
+        "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256
     ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
