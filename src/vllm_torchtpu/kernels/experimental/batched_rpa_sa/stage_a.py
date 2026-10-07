@@ -30,6 +30,23 @@ dataflow; the probe builds one package copy per arm with this file rewritten.
       chunks inside a group stay software-pipelined.
   A4  DECODE: a step whose every lane has at most NARROW_KV live KV columns
       runs a narrower copy of the body (window [:NARROW_KV]).
+
+Probe 02 (WHITEBOARD.v2) adds, A2 being the base of every v2 arm:
+  A5  DECODE ramped first KV block. The launch's first sequence (if it has more
+      than RAMP tokens) is split into batch_size ramp blocks of RAMP =
+      bkv_sz // A5_DIV tokens, then full bkv_sz blocks; so grid step 0 fetches
+      batch_size * RAMP tokens instead of batch_size * bkv_sz. The schedule
+      encodes every task of the ramped sequence in k_idx as (token start |
+      RAMP_EXPLICIT_BIT [| RAMP_BIT]); other tasks keep the plain k_idx. A step whose lanes all have <= RAMP live
+      columns runs a narrow body (window[:RAMP]); a ramp block is only ever
+      computed by it (its columns past RAMP belong to the next block).
+      Not bit-exact for the ramped sequence (online-softmax block boundaries).
+  A6  DECODE: only block 0's KV descriptors are issued before the first DMA
+      wait; the lookahead fills 1..n_buffer-1 of each pipeline are deferred to
+      the start of grid step 0 (body_prologue, after wait_in(0)).
+  A3' MIXED per-step body select: the grouped (A3) body when the step has at
+      least A3P_MIN_DEAD fully dead q-chunk groups, else the ungrouped
+      (incumbent) body.
 """
 
 import jax
@@ -42,6 +59,11 @@ A1 = True
 A2 = True
 A3 = True
 A4 = True
+A5 = False
+A5_DIV = 8
+A6 = False
+A3P = False
+A3P_MIN_DEAD = 1
 
 GROUP = 4  # q-row chunks per A3 group
 NARROW_KV = 8192  # A4 window (64 pages of 128)
@@ -129,6 +151,61 @@ def a3_enabled(cfgs) -> bool:
     n_chunks = pl.cdiv(cfgs.bq_sz, cfgs.bq_c_sz)
     return (
         A3
+        and cfgs.mode != configs.RpaCase.DECODE
+        and not cfgs.fuse_accum
+        and not cfgs.serve.return_lse
+        and n_chunks > GROUP
+        and cfgs.bq_sz % cfgs.bq_c_sz == 0
+        and cfgs.model.num_kv_heads == 1
+    )
+
+
+# A5 k_idx encoding for the tasks of a ramped sequence: token start |
+# RAMP_EXPLICIT_BIT (| RAMP_BIT for a ramp-length block). Other tasks: plain k_idx.
+RAMP_BIT = 1 << 29
+RAMP_EXPLICIT_BIT = 1 << 30
+RAMP_START_MASK = RAMP_BIT - 1
+
+
+def a5_enabled(cfgs) -> bool:
+    from vllm_torchtpu.kernels.experimental.batched_rpa_sa import configs
+
+    return (
+        A5
+        and cfgs.mode == configs.RpaCase.DECODE
+        and cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+        and not cfgs.serve.per_token_scale
+        and cfgs.serve.dtype_kv != jnp.uint8
+        and cfgs.model.sliding_window is None
+        and cfgs.serve.attention_scope == configs.AttentionScope.FULL
+        and cfgs.bq_sz == cfgs.bq_c_sz
+        and cfgs.bkv_sz % (A5_DIV * cfgs.serve.page_size) == 0
+        and A5_DIV > 1
+    )
+
+
+def ramp_sz(cfgs) -> int:
+    return cfgs.bkv_sz // A5_DIV
+
+
+def a6_enabled(cfgs) -> bool:
+    from vllm_torchtpu.kernels.experimental.batched_rpa_sa import configs
+
+    return (
+        A6
+        and cfgs.mode == configs.RpaCase.DECODE
+        and cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+        and cfgs.n_buffer > 1
+    )
+
+
+def a3p_enabled(cfgs) -> bool:
+    from vllm_torchtpu.kernels.experimental.batched_rpa_sa import configs
+
+    n_chunks = pl.cdiv(cfgs.bq_sz, cfgs.bq_c_sz)
+    return (
+        A3P
+        and not A3
         and cfgs.mode != configs.RpaCase.DECODE
         and not cfgs.fuse_accum
         and not cfgs.serve.return_lse

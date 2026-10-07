@@ -24,7 +24,7 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.batched_rpa_sa import configs, utils
+from vllm_torchtpu.kernels.experimental.batched_rpa_sa import configs, stage_a, utils
 
 
 class FieldOffset:
@@ -603,6 +603,7 @@ class BaseMetadataComputer:
         kv_cache_len,
         kv_new_len,
         end_k_idx,
+        n_ramp=None,
     ) -> LoopCarry:
         cfgs = self.cfgs
         schedule = self.schedule
@@ -611,7 +612,30 @@ class BaseMetadataComputer:
 
         schedule.s_idx[step, target_lane] = s_idx
         schedule.q_idx[step, target_lane] = q_idx
-        schedule.k_idx[step, target_lane] = k_idx
+        if n_ramp is None:
+            schedule.k_idx[step, target_lane] = k_idx
+            kv_len_start = k_idx * cfgs.bkv_sz
+            kv_p_start = k_idx * cfgs.bkv_p
+            blk_len = cfgs.bkv_sz
+        else:
+            # Stage A (A5): the first n_ramp blocks of a ramped sequence are
+            # ramp_sz tokens long. Every task of a ramped sequence carries its
+            # token start explicitly (EXPLICIT bit) and, for a ramp block, the
+            # RAMP bit; tasks of other sequences keep the plain block index.
+            r_sz = stage_a.ramp_sz(cfgs)
+            is_ramp = k_idx < n_ramp
+            kv_len_start = jnp.where(
+                is_ramp, k_idx * r_sz, n_ramp * r_sz + (k_idx - n_ramp) * cfgs.bkv_sz
+            )
+            kv_p_start = kv_len_start >> cfgs.serve.page_size_log2
+            blk_len = jnp.where(is_ramp, r_sz, cfgs.bkv_sz)
+            schedule.k_idx[step, target_lane] = jnp.where(
+                n_ramp > 0,
+                kv_len_start
+                | stage_a.RAMP_EXPLICIT_BIT
+                | jnp.where(is_ramp, stage_a.RAMP_BIT, 0),
+                k_idx,
+            )
 
         is_last_k = jnp.where(k_idx == end_k_idx - 1, 1, 0)
         schedule.is_last_k[step, target_lane] = is_last_k
@@ -619,8 +643,6 @@ class BaseMetadataComputer:
         schedule.dma_q[step, target_lane, 0] = q_src
         schedule.dma_q[step, target_lane, 1] = q_sz_task
 
-        kv_len_start = k_idx * cfgs.bkv_sz
-        kv_p_start = k_idx * cfgs.bkv_p
         k_len = kv_cache_len + kv_new_len
         kv_left = k_len - kv_len_start
         if cfgs.serve.skip_kv_update:
@@ -628,9 +650,15 @@ class BaseMetadataComputer:
         else:
             kv_left_frm_cache = jnp.maximum(kv_cache_len - kv_len_start, 0)
         p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
+        if n_ramp is None:
+            kv_left_frm_cache_blk = kv_left_frm_cache
+        else:
+            # A5: cap at the block length (a no-op for full blocks, whose
+            # bkv_p_cache pages already cap the copy at bkv_sz).
+            kv_left_frm_cache_blk = jnp.minimum(kv_left_frm_cache, blk_len)
         for i in range(cfgs.bkv_p_cache):
             dst_vmem = i << cfgs.serve.page_size_log2
-            dma_sz = kv_left_frm_cache - dst_vmem
+            dma_sz = kv_left_frm_cache_blk - dst_vmem
             dma_sz = jnp.clip(dma_sz, 0, cfgs.serve.page_size)
 
             src_hbm = self.page(
@@ -648,8 +676,8 @@ class BaseMetadataComputer:
                 schedule.dma_kv_cache[step, target_lane, i, 2] = dma_sz
 
         kv_left_frm_new = kv_left - kv_left_frm_cache
-        bkv_sz_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)
-        new_sz = jnp.minimum(cfgs.bkv_sz - bkv_sz_cache, kv_left_frm_new)
+        bkv_sz_cache = jnp.minimum(kv_left_frm_cache, blk_len)
+        new_sz = jnp.minimum(blk_len - bkv_sz_cache, kv_left_frm_new)
 
         # Writeback logic: each new k block is written back by the first q block
         # that attends to it.
@@ -767,6 +795,7 @@ class BaseMetadataComputer:
         kv_cache_len,
         kv_new_len,
         num_k,
+        n_ramp=None,
     ) -> LoopCarry:
         cfgs = self.cfgs
         q_src = q_start + q_idx * cfgs.bq_sz
@@ -777,9 +806,23 @@ class BaseMetadataComputer:
             sw_start_idx = q_offset + q_idx * cfgs.bq_sz - sliding_window + 1
             start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
 
-        end_k_idx_causal = (
-            q_offset + q_idx * cfgs.bq_sz + q_sz_task - 1
-        ) // cfgs.bkv_sz + 1
+        if n_ramp is None:
+            end_k_idx_causal = (
+                q_offset + q_idx * cfgs.bq_sz + q_sz_task - 1
+            ) // cfgs.bkv_sz + 1
+        else:
+            # A5: block of the task's last q position under the ramped split.
+            r_sz = stage_a.ramp_sz(cfgs)
+            last_pos = q_offset + q_idx * cfgs.bq_sz + q_sz_task - 1
+            ramp_end = n_ramp * r_sz
+            end_k_idx_causal = (
+                jnp.where(
+                    last_pos < ramp_end,
+                    last_pos // r_sz,
+                    n_ramp + (last_pos - ramp_end) // cfgs.bkv_sz,
+                )
+                + 1
+            )
         end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
         if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
             start_k_idx = jnp.maximum(start_k_idx, kv_cache_len // cfgs.bkv_sz)
@@ -793,6 +836,7 @@ class BaseMetadataComputer:
             kv_cache_len=kv_cache_len,
             kv_new_len=kv_new_len,
             end_k_idx=end_k_idx,
+            n_ramp=n_ramp,
         )
         return jax.lax.fori_loop(start_k_idx, end_k_idx, k_loop_fn, carry)
 
@@ -806,6 +850,7 @@ class BaseMetadataComputer:
         q_offsets_ref,
         kv_cache_lens_ref,
         kv_new_lens_ref,
+        first_seq_idx=None,
     ) -> LoopCarry:
         q_start = cu_q_lens_ref[s_idx]
         q_end = cu_q_lens_ref[s_idx + 1]
@@ -815,7 +860,20 @@ class BaseMetadataComputer:
         kv_new_len = kv_new_lens_ref[s_idx]
         k_len = kv_cache_len + kv_new_len
         num_q = pl.cdiv(q_len, self.cfgs.bq_sz)
-        num_k = pl.cdiv(k_len, self.cfgs.bkv_sz)
+        if stage_a.a5_enabled(self.cfgs):
+            # A5: the launch's first sequence, if it fills at least batch_size
+            # ramp blocks' worth of more than (batch_size - 1) ramp blocks, is
+            # split into batch_size ramp blocks, then full blocks. Grid step 0
+            # then holds exactly its ramp blocks.
+            r_sz = stage_a.ramp_sz(self.cfgs)
+            n_r = self.cfgs.batch_size
+            ramped = jnp.logical_and(s_idx == first_seq_idx, k_len > (n_r - 1) * r_sz)
+            n_ramp = jnp.where(ramped, n_r, 0)
+            rest = jnp.maximum(k_len - n_ramp * r_sz, 0)
+            num_k = n_ramp + pl.cdiv(rest, self.cfgs.bkv_sz)
+        else:
+            n_ramp = None
+            num_k = pl.cdiv(k_len, self.cfgs.bkv_sz)
         q_loop_fn = functools.partial(
             self.q_loop,
             s_idx=s_idx,
@@ -825,6 +883,7 @@ class BaseMetadataComputer:
             kv_cache_len=kv_cache_len,
             kv_new_len=kv_new_len,
             num_k=num_k,
+            n_ramp=n_ramp,
         )
 
         return jax.lax.fori_loop(0, num_q, q_loop_fn, carry)
@@ -838,16 +897,17 @@ class BaseMetadataComputer:
         distribution_ref: jax.Ref,
     ) -> LoopCarry:
         """Generates the metadata schedule across all sequences."""
+        start_seq_idx, end_seq_idx = self.cfgs.mode.get_range(
+            distribution_ref
+        )  # pytype: disable=bad-argument-type
         seq_loop_fn = functools.partial(
             self.seq_loop,
             cu_q_lens_ref=cu_q_lens_ref,
             q_offsets_ref=q_offsets_ref,
             kv_cache_lens_ref=kv_cache_lens_ref,
             kv_new_lens_ref=kv_new_lens_ref,
+            first_seq_idx=start_seq_idx,
         )
-        start_seq_idx, end_seq_idx = self.cfgs.mode.get_range(
-            distribution_ref
-        )  # pytype: disable=bad-argument-type
         init_carry = LoopCarry(0, 0)
         return jax.lax.fori_loop(start_seq_idx, end_seq_idx, seq_loop_fn, init_carry)
 

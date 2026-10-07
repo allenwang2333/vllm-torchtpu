@@ -40,6 +40,9 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
     """Handles fetching/updating KV cache using SEQ_ALONG_LANE memory layout."""
 
     cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
+    # Stage A (A6): True on the copy kernel.py issues at grid step 0 for a fill
+    # that copy_in deferred; such a copy is always issued.
+    a6_issue: bool = dataclasses.field(default=False, metadata=dict(static=True))
 
     @classmethod
     def create(
@@ -142,6 +145,20 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
             def _zero_first_fill():
                 stage_a.zero_decode_slot(self.window_ref, slot, self.cfgs)
 
+        if stage_a.a6_enabled(self.cfgs) and not self.a6_issue:
+            # Stage A (A6): fills 1..n_buffer-1 are the lookahead copies the
+            # pipeline issues before its first wait; defer them to grid step 0
+            # (kernel.py body_prologue). Fill 0 and fills >= n_buffer as before.
+            n_fill = self.cumulative_copy_in
+            defer = (n_fill >= 1) & (n_fill < self.cfgs.n_buffer)
+            pl.when(jnp.logical_not(defer))(
+                lambda: self._issue_decode(kv_cache_hbm, new_kv_hbm, schedule_ref,
+                                           slot, sem, block_idx)
+            )
+            return
+        self._issue_decode(kv_cache_hbm, new_kv_hbm, schedule_ref, slot, sem, block_idx)
+
+    def _issue_decode(self, kv_cache_hbm, new_kv_hbm, schedule_ref, slot, sem, block_idx):
         page_size = self.cfgs.serve.page_size
         num_lanes = pltpu.get_tpu_info().num_lanes
         n_p = self.cfgs.bkv_p_cache

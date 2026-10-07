@@ -248,7 +248,20 @@ def fetch_step_metadata(
         is_valid = s_idx != -1
         q_idx = schedule_ref.q_idx[step, b_idx]
         k_idx = schedule_ref.k_idx[step, b_idx]
-        k_id = jnp.where(is_valid, k_idx * cfgs.bkv_sz, 0)
+        if stage_a.a5_enabled(cfgs):
+            # Stage A (A5): tasks of a ramped sequence carry their token start
+            # (and, for a ramp block, its shorter length) in k_idx.
+            explicit = (k_idx & stage_a.RAMP_EXPLICIT_BIT) != 0
+            k_tok = jnp.where(
+                explicit, k_idx & stage_a.RAMP_START_MASK, k_idx * cfgs.bkv_sz
+            )
+            blk_len = jnp.where(
+                (k_idx & stage_a.RAMP_BIT) != 0, stage_a.ramp_sz(cfgs), cfgs.bkv_sz
+            )
+            k_id = jnp.where(is_valid, k_tok, 0)
+        else:
+            blk_len = cfgs.bkv_sz
+            k_id = jnp.where(is_valid, k_idx * cfgs.bkv_sz, 0)
         kv_cache_len_val = jnp.where(is_valid, kv_cache_lens_ref[s_idx], 0)
         kv_new_len_val = jnp.where(is_valid, kv_new_lens_ref[s_idx], 0)
         q_offset = jnp.where(is_valid, q_offsets_ref[s_idx], 0)
@@ -279,10 +292,10 @@ def fetch_step_metadata(
         else:
             kv_left_frm_cache = jnp.maximum(kv_cache_len_val - k_id, 0)
         kv_left_frm_new = jnp.maximum(kv_left - kv_left_frm_cache, 0)
-        bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)
+        bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, blk_len)
         new_kv_len_start = q_end - kv_left_frm_new
         bkv_sz_frm_cache_list.append(bkv_sz_frm_cache)
-        bkv_sz_frm_new_list.append(jnp.minimum(kv_left, cfgs.bkv_sz) - bkv_sz_frm_cache)
+        bkv_sz_frm_new_list.append(jnp.minimum(kv_left, blk_len) - bkv_sz_frm_cache)
         new_kv_len_start_list.append(new_kv_len_start)
     return StepMetadata(
         causal_offset=causal_offset_list,
@@ -353,6 +366,7 @@ def _rpa_body_impl(
     cfgs: configs.RpaConfigs,
     apply_mask: bool = True,
     kv_width: int | None = None,
+    groups: bool | None = None,
 ):
     # kv_width (stage A, A4): compute over window[:kv_width] only. None = the
     # full static window (cfgs.bkv_sz), the incumbent.
@@ -476,7 +490,8 @@ def _rpa_body_impl(
     # refs inside each (possibly skipped) group; the values are the same ones
     # the incumbent reads up front, since a chunk's rows are written only after
     # they are read.
-    use_groups = stage_a.a3_enabled(cfgs)
+    # A3' passes groups explicitly (per-step body select); None = A3's static flag.
+    use_groups = stage_a.a3_enabled(cfgs) if groups is None else groups
     if use_groups:
         m_val = l_val = acc_val = None
     else:
@@ -716,6 +731,44 @@ def rpa_body(*args, cfgs: configs.RpaConfigs, **kwargs):
             _rpa_body_impl(*args, cfgs=cfgs, **kwargs)
 
         return
+    if stage_a.a5_enabled(cfgs):
+        # Stage A (A5): a step whose lanes all have <= ramp_sz live KV columns
+        # (every step holding a ramp block, plus any short step) computes over
+        # window[:ramp_sz] only. A ramp block's columns past ramp_sz are never
+        # computed (they are not masked: they belong to the next block).
+        step = pl.program_id(0)
+        schedule_ref = inspect.signature(_rpa_body_impl).bind_partial(
+            *args, **kwargs
+        ).arguments["schedule_ref"]
+        step_meta = fetch_step_metadata(
+            step,
+            schedule_ref,
+            kwargs["cu_q_lens_ref"],
+            kwargs["q_offsets_ref"],
+            kwargs["kv_cache_lens_ref"],
+            kwargs["kv_new_lens_ref"],
+            cfgs=cfgs,
+        )
+        live_kv = functools.reduce(
+            jnp.maximum,
+            [
+                step_meta.bkv_sz_frm_cache[b_idx] + step_meta.bkv_sz_frm_new[b_idx]
+                for b_idx in range(cfgs.batch_size)
+            ],
+        )
+        narrow = live_kv <= stage_a.ramp_sz(cfgs)
+
+        @pl.when(narrow)
+        def _():
+            _rpa_body_impl(
+                *args, cfgs=cfgs, kv_width=stage_a.ramp_sz(cfgs), **kwargs
+            )
+
+        @pl.when(jnp.logical_not(narrow))
+        def _():
+            _rpa_body_impl(*args, cfgs=cfgs, **kwargs)
+
+        return
     if (
         cfgs.mode == configs.RpaCase.DECODE
         or cfgs.model.sliding_window is not None
@@ -745,6 +798,27 @@ def rpa_body(*args, cfgs: configs.RpaConfigs, **kwargs):
             for b_idx in range(cfgs.batch_size)
         ],
     )
+
+    if stage_a.a3p_enabled(cfgs):
+        # Stage A (A3'): the grouped (A3) body only on steps with at least
+        # A3P_MIN_DEAD fully dead groups of GROUP q chunks (live rows = max
+        # over lanes of the q tile size); otherwise the ungrouped incumbent body.
+        live_rows = functools.reduce(
+            jnp.maximum,
+            [schedule_ref.get_dma_q(step, b)[1] for b in range(cfgs.batch_size)],
+        )
+        n_groups = pl.cdiv(pl.cdiv(cfgs.bq_sz, cfgs.bq_c_sz), stage_a.GROUP)
+        live_groups = pl.cdiv(pl.cdiv(live_rows, cfgs.bq_c_sz), stage_a.GROUP)
+        grouped = (n_groups - live_groups) >= stage_a.A3P_MIN_DEAD
+        for vis, body_kw in ((all_visible, dict(apply_mask=False)),
+                             (jnp.logical_not(all_visible), {})):
+            for sel, g in ((grouped, True), (jnp.logical_not(grouped), False)):
+
+                @pl.when(jnp.logical_and(vis, sel))
+                def _(body_kw=body_kw, g=g):
+                    _rpa_body_impl(*args, cfgs=cfgs, groups=g, **body_kw, **kwargs)
+
+        return
 
     @pl.when(all_visible)
     def _():
@@ -1059,6 +1133,34 @@ def rpa_kernel(
                     for c in dma_list:
                         c.wait()
 
+                body_prologue = None
+                if stage_a.a6_enabled(cfgs):
+                    # Stage A (A6): the KV copy_in deferred the pipeline's
+                    # lookahead fills 1..n_buffer-1 (issued before the first
+                    # wait in the incumbent); issue them here, at grid step 0
+                    # after wait_in(0), into slots 1..n_buffer-1.
+                    n_grid = num_steps + prefix_steps
+                    kv_alloc = final_allocs[1]
+
+                    def body_prologue():
+                        @pl.when(pl.program_id(0) == 0)
+                        def _():
+                            with jax.named_scope("a6_issue"):
+                                # One rolled copy of the issue code (code size).
+                                def issue(k, c):
+                                    bref = dataclasses.replace(
+                                        kv_alloc, a6_issue=True
+                                    ).with_slot_index(copy_in_slot=k.astype(jnp.uint32))
+                                    bref.copy_in(
+                                        (kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
+                                        (k,),
+                                    )
+                                    return c
+
+                                lax.fori_loop(
+                                    1, jnp.minimum(cfgs.n_buffer, n_grid), issue, 0
+                                )
+
                 pipeline_func = pltpu.emit_pipeline(
                     body=functools.partial(
                         rpa_body,
@@ -1079,6 +1181,7 @@ def rpa_kernel(
                     (lse_hbm_ref, schedule_ref) if return_lse else None,
                     scratches=(schedule_ref,) + scratches,
                     allocations=final_allocs,
+                    body_prologue=body_prologue,
                 )
 
             if decode_prefetch:
