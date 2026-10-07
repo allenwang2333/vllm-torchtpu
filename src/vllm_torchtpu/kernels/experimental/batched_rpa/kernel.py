@@ -49,7 +49,7 @@ def strided_load_bkv(
 ) -> list[tuple[jax.Array, jax.Array]]:
     assert start % cfgs.serve.packing_kv == 0
     start //= cfgs.serve.packing_kv
-    kv_u32_ref = kv_in_vref.at[b_idx].bitcast(jnp.uint32)
+    kv_u32_ref = kv_in_vref[b_idx].bitcast(jnp.uint32)
     kv_ref = kv_u32_ref.reshape(-1, cfgs.aligned_kv_head_dim)
 
     # kv_ref must be annotated with no_hazard_no_deps so XLA knows not to add a
@@ -107,7 +107,7 @@ def calculate_and_store_out(
             result = batch_acc * pl.reciprocal(batch_l, approx=True)
         out = result.astype(cfgs.serve.dtype_out)
 
-        o_u32_vref = o_vref.at[b_idx].bitcast(jnp.uint32)
+        o_u32_vref = o_vref[b_idx].bitcast(jnp.uint32)
         out_ref = o_u32_vref.reshape(-1, cfgs.aligned_q_head_dim)
         pad_width = [[0, 0] for _ in range(out.ndim)]
         pad_width[-1][-1] = cfgs.aligned_q_head_dim - cfgs.compute_kv_head_dim
@@ -117,7 +117,7 @@ def calculate_and_store_out(
 
     def _stage_lse(b_idx: int, batch_m: jax.Array, batch_l: jax.Array):
         lse_val = batch_m + jnp.log(jnp.maximum(batch_l, 1e-9))
-        lse_u32 = lse_o_vref.at[b_idx].bitcast(jnp.uint32)
+        lse_u32 = lse_o_vref[b_idx].bitcast(jnp.uint32)
         lse_ref = lse_u32.reshape(-1, lse_o_vref.shape[-1])
         lse_val = pltpu.bitcast(
             lse_val.astype(cfgs.serve.dtype_out), jnp.uint32
@@ -503,8 +503,8 @@ def rpa_body(
             ks = []
             vs = []
             for kv_head in range(cfgs.model.num_kv_heads):
-                k_slice = kv_in_vref.at[b_idx, kv_head * 2].bitcast(jnp.uint32)
-                v_slice = kv_in_vref.at[b_idx, kv_head * 2 + 1].bitcast(jnp.uint32)
+                k_slice = kv_in_vref[b_idx, kv_head * 2].bitcast(jnp.uint32)
+                v_slice = kv_in_vref[b_idx, kv_head * 2 + 1].bitcast(jnp.uint32)
 
                 target_shape = (-1, cfgs.kv_vmem_lanes)
                 k_head_ref = k_slice.reshape(target_shape)
@@ -860,14 +860,14 @@ def rpa_prefetch_start(
         # Step 1: SMEM metadata and the first schedule chunk.
         copies = []
         for src, dst in zip(metadata_hbm_refs, metadata_smem_refs):
-            copies.append(pltpu.make_async_copy(src, dst, smem_sem.at[0]))
+            copies.append(pltpu.make_async_copy(src, dst, smem_sem[0]))
         for src, dst in zip(hbm_leaves, chunk_smem_refs):
             size = schedule.schedule_chunk_read_size(
                 dst.shape[0], cfgs.max_steps_ub, actual_steps
             )
             copies.append(
                 pltpu.make_async_copy(
-                    src.at[pl.ds(0, size)], dst.at[pl.ds(0, size)], smem_sem.at[0]
+                    src[pl.ds(0, size)], dst[pl.ds(0, size)], smem_sem[0]
                 )
             )
         for c in copies:
@@ -1151,10 +1151,10 @@ def rpa_kernel(
                     rpa_body(
                         step,
                         slot,
-                        q_alloc.window_ref.at[slot],
-                        kv_cache_alloc.window_ref.at[slot],
-                        o_alloc.window_ref.at[out_slot],
-                        lse_alloc.window_ref.at[out_slot] if return_lse else None,
+                        q_alloc.window_ref[slot],
+                        kv_cache_alloc.window_ref[slot],
+                        o_alloc.window_ref[out_slot],
+                        lse_alloc.window_ref[out_slot] if return_lse else None,
                         schedule_view,
                         scratches[0],
                         scratches[1],
@@ -1208,9 +1208,9 @@ def rpa_kernel(
                     src_off = pl.multiple_of(src_off, 128)
 
                     copy = pltpu.make_async_copy(
-                        h.at[pl.ds(src_off, read_size)],
-                        s.at[pl.ds(0, read_size)],
-                        dma_sem.at[0],
+                        h[pl.ds(src_off, read_size)],
+                        s[pl.ds(0, read_size)],
+                        dma_sem[0],
                     )
                     copy.start()
                     dma_list.append(copy)

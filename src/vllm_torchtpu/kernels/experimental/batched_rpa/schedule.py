@@ -28,12 +28,12 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
 
 
 class FieldOffset:
-    """A Python descriptor that generates the `.at[pos + offset]` lazy lookup.
+    """A Python descriptor that generates the `[pos + offset]` lazy lookup.
 
     This is necessary because JAX does not support dynamically slicing a
-    range (e.g. `data.at[pos:pos+4]`) using traced indices inside a loop,
+    range (e.g. `data[pos:pos+4]`) using traced indices inside a loop,
     but it natively supports retrieving/updating single dynamically-indexed
-    elements (e.g. `data.at[pos+1]`).
+    elements (e.g. `data[pos+1]`).
     """
 
     def __init__(self, offset: int | None = None, is_abstract: bool = False):
@@ -44,7 +44,7 @@ class FieldOffset:
         self.__isabstractmethod__ = is_abstract
 
     def __get__(self, obj, objtype=None):
-        return obj.data.at[obj.pos + self.offset]
+        return obj.data[obj.pos + self.offset]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -380,9 +380,9 @@ def _write_schedule_to_hbm(
             output_offset = 0
 
         copy = pltpu.make_async_copy(
-            s.at[pl.ds(0, write_size)],
-            h.at[pl.ds(output_offset, write_size)],
-            dma_sem.at[0],
+            s[pl.ds(0, write_size)],
+            h[pl.ds(output_offset, write_size)],
+            dma_sem[0],
         )
         dma_list.append(copy)
 
