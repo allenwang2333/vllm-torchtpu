@@ -69,7 +69,7 @@ def test_warmup_sweeps_every_mode_per_prompt_bucket_and_batch(bound):
     modes = TPUModelRunner._spec_warmup_modes(r)
     assert one == [(P, g, k) for P in (16, 64) for g, k in modes]
     assert batch == [(4, 16, g, k) for g, k in modes]
-    assert ((False, bound) in modes) == bool(bound)
+    assert len(modes) == (3 if bound else 2)
 
 
 def _capture_sampling_params(r):
