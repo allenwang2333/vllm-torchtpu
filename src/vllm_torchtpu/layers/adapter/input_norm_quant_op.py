@@ -30,6 +30,7 @@ import jax
 import torch
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental import rms_norm_quant as rnq
 from vllm_torchtpu.layers.adapter import linear_common
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
@@ -39,40 +40,43 @@ logger = init_logger(__name__)
 
 LAYER_ATTR = "_tpu_input_norm_quant"
 
-_ops: dict[tuple[float, bool, bool], Callable] = {}
+_ops: dict[tuple[float, bool, bool, bool], Callable] = {}
 
 
-def _build_op(eps: float, has_res: bool, emit_y: bool) -> Callable:
-    key = (eps, has_res, emit_y)
+def _build_op(eps: float, has_res: bool, emit_y: bool, has_rstd: bool = False):
+    key = (eps, has_res, emit_y, has_rstd)
     if key in _ops:
         return _ops[key]
 
     A = jax.Array
-    # pallas.jax_op reads the return annotation, so each variant spells its
-    # outputs out.
-    if has_res and emit_y:
 
-        def fn(x: A, r: A, w: A) -> tuple[A, A, A, A]:
-            y, ro, q, s = rnq.rms_norm_quant(x, r, w, eps, emit_y=True)
-            return y, ro, q, s
+    def run(x, r, w, rstd):
+        y, ro, q, s = rnq.rms_norm_quant(x, r, w, eps, rstd, emit_y=emit_y)
+        return tuple(o for o in (y, ro, q, s) if o is not None)
+
+    # pallas.jax_op reads the signature and the return annotation, so each
+    # variant spells its inputs and outputs out.
+    n_out = 2 + int(emit_y) + int(has_res)
+    ret = tuple[(A,) * n_out]
+    if has_res and has_rstd:
+
+        def fn(x: A, r: A, w: A, rstd: A) -> ret:
+            return run(x, r, w, rstd)
 
     elif has_res:
 
-        def fn(x: A, r: A, w: A) -> tuple[A, A, A]:
-            _, ro, q, s = rnq.rms_norm_quant(x, r, w, eps, emit_y=False)
-            return ro, q, s
+        def fn(x: A, r: A, w: A) -> ret:
+            return run(x, r, w, None)
 
-    elif emit_y:
+    elif has_rstd:
 
-        def fn(x: A, w: A) -> tuple[A, A, A]:
-            y, _, q, s = rnq.rms_norm_quant(x, None, w, eps, emit_y=True)
-            return y, q, s
+        def fn(x: A, w: A, rstd: A) -> ret:
+            return run(x, None, w, rstd)
 
     else:
 
-        def fn(x: A, w: A) -> tuple[A, A]:
-            _, _, q, s = rnq.rms_norm_quant(x, None, w, eps, emit_y=False)
-            return q, s
+        def fn(x: A, w: A) -> ret:
+            return run(x, None, w, None)
 
     op = pallas.jax_op(f"pallas::input_norm_quant_{len(_ops)}", fn)
 
@@ -133,7 +137,7 @@ def install(model: torch.nn.Module) -> int:
         eps = float(module.input_layernorm.variance_epsilon)
         _, is_gdn = _projection(module)
         for has_res in (False, True):
-            _build_op(eps, has_res, emit_y=is_gdn)
+            _build_op(eps, has_res, emit_y=is_gdn, has_rstd=_exact())
         linear_common._get_prequant_matmul_op()
         setattr(module, LAYER_ATTR, True)
         count += 1
@@ -145,17 +149,31 @@ def install(model: torch.nn.Module) -> int:
     return count
 
 
+def _exact() -> bool:
+    return envs.TPU_INPUT_NORM_QUANT != 2
+
+
 def norm_quant(layer: torch.nn.Module, hidden_states, residual):
     """``layer.input_layernorm(hidden_states, residual)`` plus the fp8 rows of
     its output. Returns (normed or None, residual, (q, scale))."""
     norm = layer.input_layernorm
     eps = float(norm.variance_epsilon)
     _, is_gdn = _projection(layer)
+    exact = _exact()
+    extra = ()
+    if exact:
+        # The statistic exactly as ir.ops.(fused_add_)rms_norm computes it.
+        s = hidden_states.to(torch.float32)
+        if residual is not None:
+            s = s + residual.to(torch.float32)
+        extra = (torch.rsqrt(s.pow(2).mean(dim=-1, keepdim=True) + eps),)
     if residual is None:
-        out = _ops[(eps, False, is_gdn)](hidden_states, norm.weight)
+        out = _ops[(eps, False, is_gdn, exact)](hidden_states, norm.weight, *extra)
         new_res = hidden_states
     else:
-        out = _ops[(eps, True, is_gdn)](hidden_states, residual, norm.weight)
+        out = _ops[(eps, True, is_gdn, exact)](
+            hidden_states, residual, norm.weight, *extra
+        )
     out = list(out)
     y = out.pop(0) if is_gdn else None
     if residual is not None:

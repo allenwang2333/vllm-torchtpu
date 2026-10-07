@@ -55,25 +55,36 @@ def _same(a, b):
     return torch.equal(a, b)
 
 
-@pytest.mark.parametrize("emit_y", [True, False])
-@pytest.mark.parametrize("with_residual", [True, False])
-@pytest.mark.parametrize("rows", [4, 8, 48, 1024])
-def test_matches_norm_then_fp8_linear(
-    device, rows, with_residual, emit_y
-):
-    if device.type != "tpu":
-        pytest.skip("Pallas kernel on TPU.")
-    x, r, norm, w, ws = _setup(device, rows)
+def _run(x, r, norm, with_residual, emit_y, exact):
+    extra = ()
+    if exact:
+        s = x.float() + (r.float() if with_residual else 0)
+        extra = (torch.rsqrt(s.pow(2).mean(dim=-1, keepdim=True) + EPS),)
     if with_residual:
-        y_ref, r_ref = norm(x, r)
-        out = inq._build_op(EPS, True, emit_y)(x, r, norm.weight)
+        out = inq._build_op(EPS, True, emit_y, exact)(x, r, norm.weight, *extra)
     else:
-        y_ref, r_ref = norm(x), x
-        out = inq._build_op(EPS, False, emit_y)(x, norm.weight)
+        out = inq._build_op(EPS, False, emit_y, exact)(x, norm.weight, *extra)
     out = list(out)
     y = out.pop(0) if emit_y else None
     ro = out.pop(0) if with_residual else x
     q, s = out
+    return y, ro, q, s
+
+
+def _ulps(a, b):
+    return (a.cpu().view(torch.int16).int() - b.cpu().view(torch.int16).int()).abs()
+
+
+@pytest.mark.parametrize("emit_y", [True, False])
+@pytest.mark.parametrize("with_residual", [True, False])
+@pytest.mark.parametrize("rows", [4, 8, 48, 1024])
+def test_exact_mode_matches_norm_then_fp8_linear(device, rows, with_residual, emit_y):
+    """TPU_INPUT_NORM_QUANT=1: bit-exact with the unfused path."""
+    if device.type != "tpu":
+        pytest.skip("Pallas kernel on TPU.")
+    x, r, norm, w, ws = _setup(device, rows)
+    y_ref, r_ref = norm(x, r) if with_residual else (norm(x), x)
+    y, ro, q, s = _run(x, r, norm, with_residual, emit_y, exact=True)
     if emit_y:
         assert _same(y, y_ref)
     assert _same(ro, r_ref)
@@ -81,6 +92,30 @@ def test_matches_norm_then_fp8_linear(
     ref = linear_common.quantized_matmul(y_ref, w, ws)
     got = linear_common.quantized_matmul_prequant(q, s, w, ws)
     assert _same(got, ref)
+
+
+@pytest.mark.parametrize("with_residual", [True, False])
+@pytest.mark.parametrize("rows", [8, 48, 1024])
+def test_kernel_stats_mode_is_within_one_ulp(device, rows, with_residual):
+    """TPU_INPUT_NORM_QUANT=2: the kernel's own mean(x^2) reduces in another
+    order than XLA's, so a normed value may move by one bf16 ulp (and, when it
+    is a row's abs-max, that row's fp8 scale with it)."""
+    if device.type != "tpu":
+        pytest.skip("Pallas kernel on TPU.")
+    x, r, norm, w, ws = _setup(device, rows)
+    y_ref, r_ref = norm(x, r) if with_residual else (norm(x), x)
+    y, ro, q, s = _run(x, r, norm, with_residual, True, exact=False)
+    assert _same(ro, r_ref)
+    d = _ulps(y, y_ref)
+    assert d.max() <= 1 and (d > 0).float().mean() < 1e-4
+    ref = linear_common.quantized_matmul(y_ref, w, ws).float()
+    got = linear_common.quantized_matmul_prequant(q, s, w, ws).float()
+    assert float((got - ref).norm() / ref.norm()) < 1e-3
+
+
+class _W:
+    def __init__(self, w):
+        self.weight = w
 
 
 def test_positive_control(device):
@@ -92,6 +127,6 @@ def test_positive_control(device):
     ref = linear_common.quantized_matmul(norm(x, r)[0], w, ws)
     bad_w = norm.weight.detach().clone()
     bad_w[17] = bad_w[17] * 1.01 + 0.01
-    _, _, q, s = inq._build_op(EPS, True, True)(x, r, bad_w)
+    _, _, q, s = _run(x, r, _W(bad_w), True, True, exact=True)
     got = linear_common.quantized_matmul_prequant(q, s, w, ws)
     assert not _same(got, ref)

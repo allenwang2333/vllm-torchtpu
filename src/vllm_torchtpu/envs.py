@@ -95,7 +95,7 @@ if TYPE_CHECKING:
     TPU_FP8_ROWQUANT_LAYERS: str = ""
     TPU_FP8_ROWQUANT_MAX_ROWS: int = 64
     TPU_GDN_IN_PROJ_KN: bool = False
-    TPU_INPUT_NORM_QUANT: bool = False
+    TPU_INPUT_NORM_QUANT: int = 0
     TPU_FUSED_QK_NORM_ROPE: bool = False
     TPU_RPA_DECODE_BATCHED: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -725,7 +725,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run a Qwen3-Next / Qwen3.5 decoder layer's input (residual add +) RMS norm
     # and its fp8 input projection's activation quantization as one kernel
     # (layers/adapter/input_norm_quant_op.py). Needs TPU_ATTN_MOE_OVERLAP.
-    "TPU_INPUT_NORM_QUANT": env_bool("TPU_INPUT_NORM_QUANT"),
+    # 1: XLA computes the norm's rsqrt(mean(x^2) + eps) and the kernel applies
+    # it and quantizes (bit-exact with the unfused path). 2: the kernel also
+    # computes the statistic (one op fewer; its reduction order differs from
+    # XLA's, so a normed value can move by one bf16 ulp).
+    "TPU_INPUT_NORM_QUANT": env_int("TPU_INPUT_NORM_QUANT", 0),
     # Run the gated q split, q/k RMS norms and NeoX rope of Qwen3NextAttention
     # as one kernel on token buckets of up to 64 rows.
     "TPU_FUSED_QK_NORM_ROPE": env_bool("TPU_FUSED_QK_NORM_ROPE"),

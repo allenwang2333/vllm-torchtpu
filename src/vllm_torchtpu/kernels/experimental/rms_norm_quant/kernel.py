@@ -36,9 +36,10 @@ FP8 = jnp.float8_e4m3fn
 FP8_MAX = float(jnp.finfo(FP8).max)
 
 
-def _norm_quant(s, w, eps):
-    var = jnp.mean(s * s, axis=-1, keepdims=True)
-    y = (s * jax.lax.rsqrt(var + eps) * (w + 1.0)).astype(jnp.bfloat16)
+def _norm_quant(s, w, eps, rstd=None):
+    if rstd is None:
+        rstd = jax.lax.rsqrt(jnp.mean(s * s, axis=-1, keepdims=True) + eps)
+    y = (s * rstd * (w + 1.0)).astype(jnp.bfloat16)
     amax = jnp.max(jnp.abs(y), axis=-1, keepdims=True).astype(jnp.float32)
     sc = amax / FP8_MAX
     sc = jnp.where(sc == 0.0, 1.0, sc)
@@ -46,11 +47,12 @@ def _norm_quant(s, w, eps):
     return y, q, sc
 
 
-def _kernel(*refs, eps, has_res, emit_y):
+def _kernel(*refs, eps, has_res, emit_y, has_rstd):
     refs = list(refs)
     x_ref = refs.pop(0)
     r_ref = refs.pop(0) if has_res else None
     w_ref = refs.pop(0)
+    rstd = refs.pop(0)[...] if has_rstd else None
     y_ref = refs.pop(0) if emit_y else None
     ro_ref = refs.pop(0) if has_res else None
     q_ref, s_ref = refs
@@ -58,7 +60,7 @@ def _kernel(*refs, eps, has_res, emit_y):
     if has_res:
         s = s + r_ref[...].astype(jnp.float32)
         ro_ref[...] = s.astype(ro_ref.dtype)
-    y, q, sc = _norm_quant(s, w_ref[...].astype(jnp.float32)[None, :], eps)
+    y, q, sc = _norm_quant(s, w_ref[...].astype(jnp.float32)[None, :], eps, rstd)
     if emit_y:
         y_ref[...] = y
     q_ref[...] = q
@@ -80,6 +82,7 @@ def rms_norm_quant(
     residual: jax.Array | None,
     w: jax.Array,
     eps: float,
+    rstd: jax.Array | None = None,
     *,
     emit_y: bool = True,
     tile: int = 256,
@@ -87,12 +90,19 @@ def rms_norm_quant(
 ):
     """x, residual: [m, k] bf16 (residual may be None); w: [k] (the raw Gemma
     weight; the kernel adds 1). Returns (y or None, new_residual or None, q,
-    scale)."""
+    scale).
+
+    ``rstd`` [m, 1] f32, if given, is ``rsqrt(mean(s^2) + eps)`` computed by
+    the caller (XLA), so the normed rows match the XLA norm bit for bit; the
+    kernel then only applies it and quantizes."""
     m, k = x.shape
     t = _tile(m, tile)
     has_res = residual is not None
     row = pl.BlockSpec((t, k), lambda i: (i, 0))
+    has_rstd = rstd is not None
     in_specs = [row] + ([row] if has_res else []) + [pl.BlockSpec((k,), lambda i: (0,))]
+    if has_rstd:
+        in_specs.append(pl.BlockSpec((t, 1), lambda i: (i, 0)))
     out_specs, out_shape = [], []
     if emit_y:
         out_specs.append(row)
@@ -107,14 +117,20 @@ def rms_norm_quant(
     ]
     outs = list(
         pl.pallas_call(
-            functools.partial(_kernel, eps=float(eps), has_res=has_res, emit_y=emit_y),
+            functools.partial(
+                _kernel,
+                eps=float(eps),
+                has_res=has_res,
+                emit_y=emit_y,
+                has_rstd=has_rstd,
+            ),
             grid=(m // t,),
             in_specs=in_specs,
             out_specs=out_specs,
             out_shape=out_shape,
             compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
             interpret=interpret,
-        )(*([x] + ([residual] if has_res else []) + [w]))
+        )(*([x] + ([residual] if has_res else []) + [w] + ([rstd] if has_rstd else [])))
     )
     y = outs.pop(0) if emit_y else None
     ro = outs.pop(0) if has_res else None
