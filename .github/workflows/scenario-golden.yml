@@ -3,7 +3,9 @@
 # golden/ and today's kube scripts.
 #
 # Path filter: the tool, the CI scenarios, the checks over them and this file,
-# as in scenario.yml, so other pull requests neither run it nor fail on it.
+# as in scenario.yml, so other pull requests neither run it nor fail on it. An
+# edit to one of today's scripts can still break the check, so a weekday
+# schedule runs it against main and reports that drift.
 name: scenario-golden
 
 on:
@@ -20,6 +22,9 @@ on:
       - ".buildkite/kubernetes/scenarios/**"
       - ".buildkite/kubernetes/scenario/**"
       - ".github/workflows/scenario-golden.yml"
+  schedule:
+    - cron: "17 13 * * 1-5"
+  workflow_dispatch:
 
 permissions:
   contents: read
