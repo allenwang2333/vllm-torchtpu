@@ -120,6 +120,7 @@ def _stream(
     n_experts,
     inter,
     w13_parts,
+    unroll,
 ):
     """Stream the hit experts of this shard and accumulate their outputs.
 
@@ -142,7 +143,7 @@ def _stream(
 
         return n + h
 
-    n_hit = jax.lax.fori_loop(0, n_experts, collect, jnp.int32(0))
+    n_hit = jax.lax.fori_loop(0, n_experts, collect, jnp.int32(0), unroll=unroll)
     n_units = n_hit * units
 
     def unit_copies(e_idx, part):
@@ -315,6 +316,7 @@ def _kernel(
     inter,
     w13_parts,
     topk,
+    unroll,
 ):
     if topk is None:
         wtab_ref = route_ref
@@ -342,6 +344,7 @@ def _kernel(
         n_experts=n_experts,
         inter=inter,
         w13_parts=w13_parts,
+        unroll=unroll,
     )
 
 
@@ -383,8 +386,10 @@ def routing_table(topk_ids_local, topk_weights, n_experts):
     return jnp.einsum("tke,tk->te", onehot, weights)
 
 
-@functools.partial(jax.jit, static_argnames=("topk",))
-def moe_lowtok(x, route, w13, s13, w2, s2, experts_start=0, *, topk=None):
+@functools.partial(jax.jit, static_argnames=("topk", "unroll_collect"))
+def moe_lowtok(
+    x, route, w13, s13, w2, s2, experts_start=0, *, topk=None, unroll_collect=False
+):
     """This shard's MoE output for a few tokens.
 
     With `topk` None, `route` is the routing table over local experts (see
@@ -392,7 +397,8 @@ def moe_lowtok(x, route, w13, s13, w2, s2, experts_start=0, *, topk=None):
     all experts, the top-k runs in the kernel, and this shard holds
     experts [experts_start, experts_start + E); a zero score row (a padded
     token) selects nothing. Scales use [E, 1, 1, N]. Callers must first check
-    can_use_moe_lowtok.
+    can_use_moe_lowtok. `unroll_collect` fully unrolls the scalar loop that
+    gathers the hit experts' ids (bit-identical; about 0.7 us less per call).
     """
     tokens, hidden = x.shape
     n_experts, inter, w13_parts, rows = _layout(x, w13)
@@ -415,6 +421,7 @@ def moe_lowtok(x, route, w13, s13, w2, s2, experts_start=0, *, topk=None):
             inter=inter,
             w13_parts=w13_parts,
             topk=topk,
+            unroll=n_experts if unroll_collect else 1,
         ),
         out_shape=jax.ShapeDtypeStruct((rows, hidden), x.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(

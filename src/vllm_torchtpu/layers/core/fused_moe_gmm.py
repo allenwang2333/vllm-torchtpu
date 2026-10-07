@@ -692,7 +692,15 @@ def fused_moe_func(
     ):
         logger.info_once("Selected experimental small-batch MoE")
         route = moe_lowtok_routing_table(topk_ids, topk_weights, w1.shape[0])
-        return moe_lowtok(hidden_states, route, w1, w1_scale, w2, w2_scale)
+        return moe_lowtok(
+            hidden_states,
+            route,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            unroll_collect=envs.TPU_MOE_LOWTOK_UNROLL_COLLECT,
+        )
 
     # Tensor-parallel experts at decode-sized token counts: one fused kernel
     # with no token permutation. Prefill buckets above the cap keep routed GMM.
