@@ -45,7 +45,7 @@ def _kernel(*refs, kind, round_mid):
         x = x_ref[...].astype(jnp.float32)
         d = x.shape[-1] // 2
         g, u = x[:, :d], x[:, d:]
-        if round_mid == 2:  # bf16 sigmoid, bf16 silu
+        if round_mid in (2, 4):  # bf16 sigmoid, bf16 silu
             sig = jax.nn.sigmoid(g).astype(jnp.bfloat16).astype(jnp.float32)
             act = g * sig
         elif round_mid == 3:  # silu as g / (1 + exp(-g))
@@ -57,7 +57,9 @@ def _kernel(*refs, kind, round_mid):
         a_ref, g_ref, q_ref, s_ref = refs
         act = jax.nn.sigmoid(g_ref[...].astype(jnp.float32))
         other = a_ref[...].astype(jnp.float32)
-    if round_mid:  # 1, 2, 3: the activation is rounded to bf16 before the product
+    # 1, 2, 3: the activation is rounded to bf16 before the product; 4 (a fault
+    # control for tests) does so for SiLU only, leaving the gate's sigmoid f32.
+    if round_mid and not (round_mid == 4 and kind != "silu_mul"):
         act = act.astype(jnp.bfloat16).astype(jnp.float32)
     y = (act * other).astype(jnp.bfloat16)
     amax = jnp.max(jnp.abs(y), axis=-1, keepdims=True).astype(jnp.float32)

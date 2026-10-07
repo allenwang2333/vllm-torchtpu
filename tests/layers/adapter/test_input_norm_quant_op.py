@@ -165,3 +165,33 @@ def test_fold_ba_matches_the_bf16_linear(device, rows):
     ref = (y_ref @ wba).float().cpu()
     got = ba.float().cpu()
     assert float((got - ref).norm() / ref.norm()) < 5e-3
+
+
+@pytest.mark.parametrize("rows", [8, 48, 64, 1024])
+def test_fold_ba_served_config(device, monkeypatch, rows):
+    """The served FOLD_BA config: mode 2 statistic, gamma=xla (f32 w + 1), the
+    in_proj_ba weight as f32 [n_ba, k]. ba against the unfolded path (same
+    kernel's y, then the bf16 linear) within 1e-4 relative; a one-element wba
+    perturbation (positive control) must exceed it."""
+    if device.type != "tpu":
+        pytest.skip("Pallas kernel on TPU.")
+    monkeypatch.setenv("TPU_INPUT_NORM_QUANT_GAMMA", "xla")
+    x, r, norm, w, ws = _setup(device, rows)
+    g = torch.Generator().manual_seed(2)
+    wba = (torch.randn(K, 16, generator=g) * 0.02).to(torch.bfloat16).to(device)
+    gw = norm.weight.float() + 1.0
+    y, ro, q, sc = inq._build_op(EPS, True, True, False, False)(x, r, gw)
+    ref = (y @ wba).float().cpu()
+
+    def fold(wb):
+        ba, ro2, q2, s2 = inq._build_op(EPS, True, False, False, True)(
+            x, r, gw, wb.t().contiguous().float()
+        )
+        assert _same(q2, q) and _same(ro2, ro)
+        return ba.float().cpu()
+
+    rel = float((fold(wba) - ref).norm() / ref.norm())
+    assert rel < 1e-4, rel
+    bad = wba.clone()
+    bad[5, 3] = bad[5, 3] + 0.5
+    assert float((fold(bad) - ref).norm() / ref.norm()) > 1e-4

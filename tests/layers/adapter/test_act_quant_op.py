@@ -76,3 +76,17 @@ def test_positive_control(device, monkeypatch):
     ref = linear_common.quantized_matmul(SiluAndMul()(x), w, ws)
     q, s = aqo._build("silu_mul")(x)
     assert not _same(linear_common.quantized_matmul_prequant(q, s, w, ws), ref)
+
+
+def test_gate_positive_control(device, monkeypatch):
+    """An f32 (unrounded) gate sigmoid (round_mid=4) is caught."""
+    if device.type != "tpu":
+        pytest.skip("Pallas kernel on TPU.")
+    monkeypatch.setenv("TPU_ACT_QUANT_ROUND_MID", "4")
+    g = torch.Generator().manual_seed(9)
+    a = torch.randn(8, 1024, generator=g).to(torch.bfloat16).to(device)
+    gate = (torch.randn(8, 1024, generator=g) * 2).to(torch.bfloat16).to(device)
+    w, ws = _w(1024, 4096, g, device)
+    ref = linear_common.quantized_matmul(a * torch.sigmoid(gate), w, ws)
+    q, s = aqo._build("sigmoid_gate")(a, gate)
+    assert not _same(linear_common.quantized_matmul_prequant(q, s, w, ws), ref)
