@@ -1375,6 +1375,8 @@ class TPUModelRunner(GPUModelRunner):
         # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
         self.batch_counter = 0
+        self._qwen35_mk: Any = None
+        self._in_precompile_backbone: bool = False
 
         # Pipeline parallelism: this worker runs one stage's layer slice.
         # Stages before the last hand their hidden states to the next stage
@@ -4918,11 +4920,17 @@ class TPUModelRunner(GPUModelRunner):
             sizing_input = input_ids if input_ids is not None else inputs_embeds
             assert sizing_input is not None
             num_tokens_padded = sizing_input.shape[0]
-            self._token_padding_update(num_tokens_padded)
             intermediate_tensors = None
             if self._pp_wave is not None:
                 intermediate_tensors = self._pp_wave.start_forward(num_tokens_padded)
                 self._pp_take_topk_indices(intermediate_tensors, num_tokens_padded)
+            mk = getattr(self, "_qwen35_mk", None)
+            if not (
+                os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
+                and mk is not None
+                and not getattr(self, "_in_precompile_backbone", False)
+            ):
+                self._token_padding_update(num_tokens_padded)
 
             trace_kwargs: dict[str, Any] = {}
             if TraceAnnotation.is_enabled():
@@ -6074,7 +6082,15 @@ class TPUModelRunner(GPUModelRunner):
                     spec_logprobs=spec_logprobs_chunks,
                 )
 
-        if self.scheduler_config.async_scheduling:
+        is_async = bool(self.scheduler_config.async_scheduling)
+        defer_modify_prev = (
+            is_async
+            and os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
+            and self._is_async_drafter
+            and bool(combined_selected_tokens)
+            and not discard_sampled_tokens_req_indices
+        )
+        if is_async and not defer_modify_prev:
             self._modify_prev_results()
 
         # Unified eagle3 draft propose -- ONE call serving both sync and async
@@ -6088,7 +6104,6 @@ class TPUModelRunner(GPUModelRunner):
         # manager for take_draft_token_ids(). ngram has no device path and
         # keeps proposing from the host-materialized output in the sync block
         # below.
-        is_async = bool(self.scheduler_config.async_scheduling)
         eagle3_drafts = None
         if self._is_async_drafter and combined_selected_tokens:
             if is_spec_step:
@@ -6146,6 +6161,9 @@ class TPUModelRunner(GPUModelRunner):
                         return_device=is_async,
                         device_seed=device_seed,
                     )
+
+        if defer_modify_prev:
+            self._modify_prev_results()
 
         # Save, poll and clear the KV connector only after the drafter. Its
         # forward above writes the draft layers' KV into the blocks the target
@@ -6486,6 +6504,11 @@ class TPUModelRunner(GPUModelRunner):
 
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
+
+        if os.environ.get("VLLM_TPU_QWEN35_MEGAKERNEL", "0") == "1":
+            from vllm_torchtpu.kernels.qwen35_megakernel import Qwen35Megakernel
+
+            self._qwen35_mk = Qwen35Megakernel.maybe_create(self)
 
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
@@ -8066,6 +8089,11 @@ class TPUModelRunner(GPUModelRunner):
                 self.device, self.max_num_tokens, self._pp_intermediate_template
             )
             self._pp_wave.warmup()
+        if getattr(self, "_qwen35_mk", None) is not None:
+            with self._precompile_timed("Qwen3.5 megakernel"):
+                self._qwen35_mk.bind_caches(self)
+                if not self.enforce_eager:
+                    self._qwen35_mk.warmup(self)
         if self.enforce_eager:
             return
         with self.maybe_setup_dummy_loras(self.lora_config):
@@ -8131,6 +8159,9 @@ class TPUModelRunner(GPUModelRunner):
                     seen.add(id(aot))
                     aot.disable_guard_check = True
                     n += 1
+        mk = getattr(self, "_qwen35_mk", None)
+        if mk is not None and hasattr(mk, "promote_fast_callables"):
+            n += int(mk.promote_fast_callables())
         logger.info("QX_AOT_SKIP_GUARD_CHECK: disabled guard check on %d AOT fns", n)
 
     def _warmup_pcp_mtp_prefill(self) -> None:
@@ -8237,35 +8268,40 @@ class TPUModelRunner(GPUModelRunner):
         one executable per bucket either way (see
         vllm_torchtpu.compilation.shape_variants).
         """
-        with shape_variants.warmup() as buckets:
-            for num_tokens in self.num_tokens_paddings:
-                logger.info("  -- num_tokens: %d", num_tokens)
-                if buckets.needs_retrace(num_tokens):
-                    shape_variants.retrace(self.model, self.vllm_config)
-                self._dummy_run(
-                    num_tokens,
-                    self.num_reqs_max_model_len,
-                    self.max_num_blocks_per_req,
-                    use_max_model_len=True,
-                )
-                if self.most_model_len is not None:
-                    assert self.num_reqs_most_model_len is not None
-                    assert self.num_blocks_per_most_len_req is not None
+        self._in_precompile_backbone = True
+        try:
+            with shape_variants.warmup() as buckets:
+                for num_tokens in self.num_tokens_paddings:
+                    logger.info("  -- num_tokens: %d", num_tokens)
+                    if buckets.needs_retrace(num_tokens):
+                        shape_variants.retrace(self.model, self.vllm_config)
                     self._dummy_run(
                         num_tokens,
-                        self.num_reqs_most_model_len,
-                        self.num_blocks_per_most_len_req,
-                        use_max_model_len=False,
+                        self.num_reqs_max_model_len,
+                        self.max_num_blocks_per_req,
+                        use_max_model_len=True,
                     )
-            if buckets.refused:
-                # A refusal that no trace picked up leaves a raising closure in
-                # the live graph, which would surface as a failed request. Fail
-                # the start instead, where it can be read.
-                raise shape_variants.ShapeSpecializationError(
-                    f"warmup left token buckets uncompiled: {sorted(buckets.refused)}"
-                )
-        if self._pp_wave is not None:
-            self._warmup_handoff_forwards()
+                    if self.most_model_len is not None:
+                        assert self.num_reqs_most_model_len is not None
+                        assert self.num_blocks_per_most_len_req is not None
+                        self._dummy_run(
+                            num_tokens,
+                            self.num_reqs_most_model_len,
+                            self.num_blocks_per_most_len_req,
+                            use_max_model_len=False,
+                        )
+                if buckets.refused:
+                    # A refusal that no trace picked up leaves a raising closure in
+                    # the live graph, which would surface as a failed request. Fail
+                    # the start instead, where it can be read.
+                    raise shape_variants.ShapeSpecializationError(
+                        "warmup left token buckets uncompiled: "
+                        f"{sorted(buckets.refused)}"
+                    )
+            if self._pp_wave is not None:
+                self._warmup_handoff_forwards()
+        finally:
+            self._in_precompile_backbone = False
 
     def _warmup_handoff_forwards(self) -> None:
         """Run every token bucket once through the pipeline hand-off.
@@ -9128,7 +9164,13 @@ class TPUModelRunner(GPUModelRunner):
                 valid_tokens = num_tokens_padded
         tp_size = self.parallel_config.tensor_parallel_size
         if rows_sliced is None:
-            rows_sliced = sequence_parallel.step_is_sequence_parallel(num_tokens_padded)
+            mk = getattr(self, "_qwen35_mk", None)
+            if mk is not None and getattr(mk, "mode", None) == "tp":
+                rows_sliced = False
+            else:
+                rows_sliced = sequence_parallel.step_is_sequence_parallel(
+                    num_tokens_padded
+                )
         if rows_sliced and tp_size > 1:
             from vllm.distributed import get_tensor_model_parallel_rank
 
@@ -9142,12 +9184,42 @@ class TPUModelRunner(GPUModelRunner):
     def forward_model(
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
     ):
+        mk = getattr(self, "_qwen35_mk", None)
+        if (
+            mk is not None
+            and not getattr(self, "_in_precompile_backbone", False)
+            and mk.can_run(
+                input_ids,
+                positions,
+                inputs_embeds=inputs_embeds,
+                intermediate_tensors=intermediate_tensors,
+                runner=self,
+            )
+        ):
+            out = mk(
+                input_ids,
+                positions,
+                num_tokens=int(positions.shape[-1]),
+                runner=self,
+            )
+            return out, None
+        if (
+            os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
+            and mk is not None
+            and not getattr(self, "_in_precompile_backbone", False)
+        ):
+            self._token_padding_update(
+                (input_ids if input_ids is not None else inputs_embeds).shape[0]
+            )
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
         kwargs = {}
-        sequence_parallel.set_active(
-            sequence_parallel.step_is_sequence_parallel(positions.shape[-1])
-        )
+        if mk is not None and getattr(mk, "mode", None) == "tp":
+            sequence_parallel.set_active(False)
+        else:
+            sequence_parallel.set_active(
+                sequence_parallel.step_is_sequence_parallel(positions.shape[-1])
+            )
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
         out = self.model(

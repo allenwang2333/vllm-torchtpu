@@ -184,6 +184,44 @@ def sharded_jax_op(
     caller's trace. An op whose output shape follows a dynamic input dimension
     passes one written in terms of the torch operands' shapes.
     """
+    wrapped_fn = sharded_jax_callable(
+        name,
+        fn,
+        mesh=mesh,
+        input_partition_specs=input_partition_specs,
+        output_partition_specs=output_partition_specs,
+        donate_argnums=donate_argnums,
+    )
+    input_partition_specs = tuple(input_partition_specs)
+    op = torch.library.custom_op(name, wrapped_fn, mutates_args=())
+
+    def fake_fn(*args, **kwargs):
+        jax_args = pallas_impl.jax_placeholders(
+            args, mesh=mesh, partition_specs=input_partition_specs
+        )
+        with jax._src.config.export_ignore_forward_compatibility(True):
+            lowered = wrapped_fn.exported(*jax_args, **kwargs)
+        return lowered.out_tree.unflatten(_sharded_output_placeholders(lowered, mesh))
+
+    op.register_fake(fake if fake is not None else fake_fn)
+    return op
+
+
+def sharded_jax_callable(
+    name: str,
+    fn: Callable[..., object],
+    *,
+    mesh: jax.sharding.Mesh,
+    input_partition_specs: Sequence[PartitionSpec],
+    output_partition_specs: Any,
+    donate_argnums: Sequence[int] | None = None,
+):
+    """The callable behind ``sharded_jax_op``, not registered as a torch op.
+
+    Call it with this rank's torch tensors, positionally. For a caller whose
+    operand count exceeds the dispatcher's 64-argument schema limit, which
+    wraps it in its own custom op taking ``list[Tensor]`` arguments.
+    """
     if "::" not in name or len(name.split("::")) != 2:
         raise ValueError(f"Op name {name} must be 'namespace::op', with one '::'.")
 
@@ -228,16 +266,5 @@ def sharded_jax_op(
         donate_argnums=donate_argnums,
         **callable_kwargs,
     )
+    return wrapped_fn
 
-    op = torch.library.custom_op(name, wrapped_fn, mutates_args=())
-
-    def fake_fn(*args, **kwargs):
-        jax_args = pallas_impl.jax_placeholders(
-            args, mesh=mesh, partition_specs=input_partition_specs
-        )
-        with jax._src.config.export_ignore_forward_compatibility(True):
-            lowered = wrapped_fn.exported(*jax_args, **kwargs)
-        return lowered.out_tree.unflatten(_sharded_output_placeholders(lowered, mesh))
-
-    op.register_fake(fake if fake is not None else fake_fn)
-    return op
