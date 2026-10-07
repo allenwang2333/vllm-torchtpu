@@ -162,6 +162,8 @@ if TYPE_CHECKING:
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     TPU_SPARSE_SPEC_SAMPLING: bool = False
     TPU_SAMPLING_TOPK_BOUND: int = 64
+    TPU_SAMPLER_VOCAB_PARALLEL_TOPK: bool = False
+    TPU_SPARSE_SPEC_FUSED_VERIFY: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     TPU_SMALL_ALL_REDUCE: bool = False
 
@@ -968,6 +970,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Window width of TPU_SPARSE_SPEC_SAMPLING (the largest top_k it takes).
     # 0 disables the sparse path.
     "TPU_SAMPLING_TOPK_BOUND": env_nonnegative_int("TPU_SAMPLING_TOPK_BOUND", 64),
+    # With TPU_SPARSE_SPEC_SAMPLING: build the verify chunks' top-k windows
+    # from the vocabulary-parallel LM head (each rank's top-k of its slice,
+    # then a gather of the TP x bound candidates) instead of all-gathering
+    # the full logits. Same window values; steps with logprobs or structured
+    # output, and every chunk the sparse sampler does not take, keep the
+    # full logits.
+    "TPU_SAMPLER_VOCAB_PARALLEL_TOPK": env_bool(
+        "TPU_SAMPLER_VOCAB_PARALLEL_TOPK", False
+    ),
+    # With TPU_SPARSE_SPEC_SAMPLING: run the sparse verify (bonus sample and
+    # rejection sampler on the windows) as one compiled program fed by one
+    # uniform draw instead of two programs and three eager draws (each draw
+    # is ~12 us of generator custom calls on TPU). Same distributions; the
+    # random stream differs.
+    "TPU_SPARSE_SPEC_FUSED_VERIFY": env_bool("TPU_SPARSE_SPEC_FUSED_VERIFY", False),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).
