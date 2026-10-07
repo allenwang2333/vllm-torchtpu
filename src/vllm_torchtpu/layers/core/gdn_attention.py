@@ -916,7 +916,8 @@ def run_jax_gdn_attention_pooled_local(
     kernel's state operands, so the kernel itself never sees the pool layout.
     """
 
-    conv_dim = conv_weight.shape[0]
+    # [dim, 1, kernel_size], or [kernel_size, 1, dim] when pre-transposed.
+    conv_dim = conv_weight.shape[-1 if conv_weight.shape[0] == kernel_size else 0]
     # Fused conv+GDN kernel: both state regions stream directly
     # between the pool and the kernel's double-buffered pipeline (one
     # contiguous DMA per slot per region) — no external gather/scatter
