@@ -178,6 +178,7 @@ def a5_enabled(cfgs) -> bool:
         and cfgs.serve.dtype_kv != jnp.uint8
         and cfgs.model.sliding_window is None
         and cfgs.serve.attention_scope == configs.AttentionScope.FULL
+        and cfgs.serve.cp_group_size is None  # the ramp is built by the base computer only
         and cfgs.bq_sz == cfgs.bq_c_sz
         and cfgs.bkv_sz % (A5_DIV * cfgs.serve.page_size) == 0
         and A5_DIV > 1

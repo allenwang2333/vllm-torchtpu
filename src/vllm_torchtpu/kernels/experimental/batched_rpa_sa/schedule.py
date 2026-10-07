@@ -836,7 +836,8 @@ class BaseMetadataComputer:
             kv_cache_len=kv_cache_len,
             kv_new_len=kv_new_len,
             end_k_idx=end_k_idx,
-            n_ramp=n_ramp,
+            # A5 only: subclasses (CPMetadataComputer) keep the base k_loop signature.
+            **({} if n_ramp is None else dict(n_ramp=n_ramp)),
         )
         return jax.lax.fori_loop(start_k_idx, end_k_idx, k_loop_fn, carry)
 
