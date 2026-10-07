@@ -47,13 +47,15 @@ def _norm_quant(s, w, eps, rstd=None):
     return y, q, sc
 
 
-def _kernel(*refs, eps, has_res, emit_y, has_rstd, gamma):
+def _kernel(*refs, eps, has_res, emit_y, has_rstd, gamma, has_ba):
     refs = list(refs)
     x_ref = refs.pop(0)
     r_ref = refs.pop(0) if has_res else None
     w_ref = refs.pop(0) if gamma != "none" else None
     rstd = refs.pop(0)[...] if has_rstd else None
+    wba_ref = refs.pop(0) if has_ba else None
     y_ref = refs.pop(0) if emit_y else None
+    ba_ref = refs.pop(0) if has_ba else None
     ro_ref = refs.pop(0) if has_res else None
     q_ref, s_ref = refs[:2]
     if gamma == "hbm":
@@ -76,6 +78,13 @@ def _kernel(*refs, eps, has_res, emit_y, has_rstd, gamma):
     else:
         w = w_ref[...].astype(jnp.float32)[None, :]
     y, q, sc = _norm_quant(s, w, eps, rstd)
+    if has_ba:
+        # The layer's bf16 consumer of the normed rows (GDN in_proj_ba), so the
+        # rows need not leave the kernel.
+        ba_ref[...] = jax.lax.dot_general(
+            y, wba_ref[...], (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        ).astype(ba_ref.dtype)
     if emit_y:
         y_ref[...] = y
     q_ref[...] = q
@@ -108,6 +117,7 @@ def rms_norm_quant(
     emit_y: bool = True,
     out_vmem: bool | None = None,
     gamma: str = "vmem",
+    wba: jax.Array | None = None,
     tile: int = 256,
     interpret: bool = False,
 ):
@@ -133,17 +143,24 @@ def rms_norm_quant(
         in_specs.append(pl.BlockSpec((k,), lambda i: (0,)))
         args.append(w)
     elif gamma == "hbm":
-        in_specs.append(pl.BlockSpec(memory_space=pltpu.ANY))
+        in_specs.append(pl.BlockSpec(memory_space=pl.ANY))
         args.append(w if interpret else pltpu.with_memory_space_constraint(w, pltpu.HBM))
         scratch = [pltpu.VMEM((k,), w.dtype), pltpu.SemaphoreType.DMA(())]
     else:
         assert gamma == "none", gamma
     if has_rstd:
         in_specs.append(pl.BlockSpec((t, 1), lambda i: (i, 0)))
+    has_ba = wba is not None
+    if has_ba:
+        nba = wba.shape[1]
+        in_specs.append(pl.BlockSpec((k, nba), lambda i: (0, 0)))
     out_specs, out_shape = [], []
     if emit_y:
         out_specs.append(row)
         out_shape.append(sds((m, k), jnp.bfloat16))
+    if has_ba:
+        out_specs.append(pl.BlockSpec((t, nba), lambda i: (i, 0)))
+        out_shape.append(sds((m, nba), wba.dtype))
     if has_res:
         out_specs.append(row)
         out_shape.append(sds((m, k), residual.dtype))
@@ -158,6 +175,7 @@ def rms_norm_quant(
                 emit_y=emit_y,
                 has_rstd=has_rstd,
                 gamma=gamma,
+                has_ba=has_ba,
             ),
             grid=(m // t,),
             in_specs=in_specs,
@@ -166,11 +184,14 @@ def rms_norm_quant(
             scratch_shapes=scratch,
             compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
             interpret=interpret,
-        )(*(args + ([rstd] if has_rstd else [])))
+        )(*(args + ([rstd] if has_rstd else []) + ([wba] if has_ba else [])))
     )
     y = outs.pop(0) if emit_y else None
+    ba = outs.pop(0) if has_ba else None
     ro = outs.pop(0) if has_res else None
     q, sc = outs
+    if has_ba:
+        return y, ro, q, sc, ba
     return y, ro, q, sc
 
 
