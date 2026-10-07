@@ -718,6 +718,16 @@ def fused_conv1d_gdn(
             # repeated rollback and slot reuse on v7, independent of TP size.
             decode_tile_size = 1
 
+    if (
+        num_spec_tokens > 0
+        and not is_kda
+        and batch_size in envs.TPU_GDN_DECODE_TILE2_BUCKETS
+    ):
+        # Two verify windows per tile beat four at these buckets on the
+        # race-fixed kernel (Qwen3.5 TP8 standalone: -1.28 us/call at 16,
+        # -2.43 at 32 tokens); outputs are bit-identical across tile sizes.
+        decode_tile_size = min(decode_tile_size, 2)
+
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v
     # KDA's gate carries d_k channels per value head, so it pads out to a
