@@ -38,7 +38,7 @@ logger = init_logger(__name__)
 
 FFO_ATTR = "_tpu_ffo_act_quant"
 OPROJ_ATTR = "_tpu_oproj_act_quant"
-_ops: dict[tuple[str, bool], Callable] = {}
+_ops: dict[tuple[str, int], Callable] = {}
 
 
 def _build(kind: str) -> Callable:

@@ -100,7 +100,7 @@ if TYPE_CHECKING:
     TPU_INPUT_NORM_QUANT_GAMMA: str = "vmem"
     TPU_INPUT_NORM_QUANT_FOLD_BA: bool = False
     TPU_ACT_QUANT: bool = False
-    TPU_ACT_QUANT_ROUND_MID: bool = False
+    TPU_ACT_QUANT_ROUND_MID: int = 1
     TPU_FUSED_QK_NORM_ROPE: bool = False
     TPU_RPA_DECODE_BATCHED: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -752,7 +752,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (layers/adapter/act_quant_op.py). ROUND_MID rounds the activation to bf16
     # before the product (eager torch) instead of keeping f32 (XLA fusion).
     "TPU_ACT_QUANT": env_bool("TPU_ACT_QUANT"),
-    "TPU_ACT_QUANT_ROUND_MID": env_bool("TPU_ACT_QUANT_ROUND_MID"),
+    "TPU_ACT_QUANT_ROUND_MID": env_int("TPU_ACT_QUANT_ROUND_MID", 1),
     # Run the gated q split, q/k RMS norms and NeoX rope of Qwen3NextAttention
     # as one kernel on token buckets of up to 64 rows.
     "TPU_FUSED_QK_NORM_ROPE": env_bool("TPU_FUSED_QK_NORM_ROPE"),
