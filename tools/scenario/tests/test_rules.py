@@ -19,9 +19,10 @@ from typing import Any
 
 import pytest
 from scenario.errors import Issue
-from scenario.model.rules import RULES, check_scenario, rule_table
+from scenario.model.rules import RULES, check_scenario, check_sweep, rule_table
 from scenario.model.scenario import Scenario
 from scenario.model.server import HARDWARE_FIELDS
+from scenario.model.sweep import Sweep
 from scenario.paths import parse_path
 
 Data = dict[str, Any]
@@ -69,6 +70,7 @@ def _agentx_with_custom(data: Data) -> None:
     data["tasks"]["custom"] = [{"name": "probe", "command": ["true"], "timeout": 60}]
 
 
+AGENTX_ZIP = "sweep.zip"
 MNS = "server.args.max-num-seqs"
 MML = "server.args.max-model-len"
 CAP = "tasks.agentx.env.AIPERF_MAX_CONTEXT_LENGTH"
@@ -416,6 +418,30 @@ CASES = [
         "has a lone $; write $$ for a literal $, or ${NAME}",
     ),
     Case(
+        "V-24",
+        "single",
+        {
+            "sweep": {"name": "m{server.args.max-num-seqs}", "zip": {MNS: [64, 128]}},
+            "tasks.eval.baseline": DROP,
+        },
+        "tasks.perf.baseline",
+        "is not allowed with a sweep; put it under sweep.baselines.<point>.<task>",
+    ),
+    Case(
+        "V-24",
+        "agentx",
+        {f"{AGENTX_ZIP}[tasks.agentx.baseline.x]": [1, 2, 3, 4]},
+        "sweep.zip[tasks.agentx.baseline.x]",
+        "point baselines go under sweep.baselines",
+    ),
+    Case(
+        "V-38",
+        "agentx",
+        {f"{AGENTX_ZIP}.name": ["a", "b", "c", "d"]},
+        "sweep.zip.name",
+        "axes override server.* or tasks.* only",
+    ),
+    Case(
         "V-27",
         "single",
         {f"{LM}.model_args.base_url": "http://x"},
@@ -454,6 +480,14 @@ CASES = [
         "server.args.max-num-seqs",
         "max-num-seqs 16 x DP 1 = 16, under twice tasks.agentx.concurrency (24)",
         severity="warning",
+    ),
+    Case(
+        "V-33",
+        "agentx",
+        {f"{AGENTX_ZIP}[server.args.max-num-seqs]": [16, 16, 32]},
+        AGENTX_ZIP,
+        "axes need equal lengths; tasks.agentx.concurrency has 4, "
+        "server.args.max-num-seqs has 3",
     ),
     Case(
         "V-34",
@@ -682,6 +716,76 @@ CASES = [
         "is 524288, under tasks.agentx.env.AIPERF_MAX_CONTEXT_LENGTH (1048576): "
         "the server would reject the traces between them",
     ),
+    Case(
+        "V-38",
+        "agentx",
+        {"sweep": {"name": "x"}},
+        "sweep",
+        "set exactly one of points, zip and product",
+    ),
+    Case(
+        "V-38",
+        "agentx",
+        {"sweep.product": {"server.args.max-num-seqs": [16]}},
+        "sweep",
+        "set exactly one of points, zip and product; found zip, product",
+    ),
+    Case(
+        "V-38",
+        "agentx",
+        {"sweep.name": DROP},
+        "sweep",
+        "name is required with zip, e.g. name: x{tasks.agentx.concurrency}",
+    ),
+    Case(
+        "V-38",
+        "agentx",
+        {"sweep": {"name": "x", "points": [{"name": "a"}]}},
+        "sweep.name",
+        "is for zip and product; named points carry their own names",
+    ),
+    Case(
+        "V-38",
+        "agentx",
+        {"sweep": {"points": [{"name": "a"}], "baselines": {"a": {}}}},
+        "sweep.baselines",
+        "is for zip and product",
+    ),
+    Case(
+        "V-38",
+        "agentx",
+        {"sweep": {"points": [{"name": "a"}, {"name": "a"}]}},
+        "sweep.points[1].name",
+        "another point is named a",
+    ),
+    Case(
+        "V-38",
+        "agentx",
+        {"sweep.name": "C{tasks.agentx.concurrency}"},
+        "sweep.name",
+        "gives the point name 'C1'; point names are lowercase letters",
+    ),
+    Case(
+        "V-38",
+        "agentx",
+        {"sweep.name": "mns{server.args.max-num-seqs}"},
+        "sweep.name",
+        "gives mns16 to 3 points; use every axis that varies",
+    ),
+    Case(
+        "V-38",
+        "agentx",
+        {"sweep.baselines.c3": {}},
+        "sweep.baselines.c3",
+        "no point is named c3; points: c1, c2, c4, c8",
+    ),
+    Case(
+        "V-38",
+        "agentx",
+        {"sweep.name": "c{tasks.agentx.conc}"},
+        "sweep.name",
+        "{tasks.agentx.conc} is not one of the axes",
+    ),
 ]
 
 
@@ -715,10 +819,9 @@ def test_every_scenario_rule_has_a_case() -> None:
 def test_rule_table_is_complete_and_ordered() -> None:
     ids = [rule.id for rule in rule_table()]
     # V-16 is unused: whether TP x PP x PCP x DP fits a role would need the
-    # devices per chip, which the tool does not know. V-25 is unused; V-24, V-33
-    # and V-38..V-40 are the sweep rules.
-    skipped = (16, 24, 25, 33, 38, 39, 40)
-    assert ids == [f"V-{n:02d}" for n in range(1, 51) if n not in skipped]
+    # devices per chip, which the tool does not know. V-25 is unused: each sweep
+    # point is its own workload and may change shape.
+    assert ids == [f"V-{n:02d}" for n in range(1, 51) if n not in (16, 25)]
     assert all(rule.summary for rule in rule_table())
 
 
@@ -751,6 +854,18 @@ def test_agentx_capacity_skips_the_producer(pd: Data) -> None:
         "agentx": {"concurrency": 64, "duration": "1h", "timeout": "2h"},
     }
     assert [issue for issue in issues_for(pd) if issue.rule == "V-32"] == []
+
+
+def test_check_sweep_on_its_own() -> None:
+    sweep = Sweep.model_validate(
+        {
+            "name": "c{tasks.perf.concurrency[0]}",
+            "product": {"tasks.perf.concurrency[0]": [1, 2]},
+        }
+    )
+    assert check_sweep(sweep) == []
+    bad = Sweep.model_validate({"zip": {"tasks.x": [1], "tasks.y": [1, 2]}})
+    assert [issue.rule for issue in check_sweep(bad)] == ["V-33", "V-38"]
 
 
 def test_eval_sweep_baseline_may_name_some_runs(single: Data) -> None:

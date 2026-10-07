@@ -31,9 +31,11 @@ from scenario.model.baseline import EvalBaseline, PerfBaseline
 from scenario.model.common import format_duration
 from scenario.model.scenario import Scenario
 from scenario.model.server import HARDWARE_FIELDS, RoleView
+from scenario.model.sweep import POINT_NAME, Sweep, expand
 from scenario.model.tasks import (
     BUILTIN_TASKS,
     FAST_WINDOW_S,
+    GATED_TASKS,
     INFERENCEX_CLIENT_FIELDS,
     LABEL_FIELDS,
     LABEL_PLACEHOLDER,
@@ -42,7 +44,7 @@ from scenario.model.tasks import (
     LmEvalTask,
     PerfCell,
 )
-from scenario.paths import KeyPath
+from scenario.paths import KeyPath, parse_path
 from scenario.reserved import (
     AGENTX_CLIENT_ENV,
     CHIPLESS_DRIVER_ENV,
@@ -574,6 +576,25 @@ def _custom(s: Scenario) -> Iterator[Issue]:
 _declare("V-23", "a baseline's from: names a scenario with matching keys", "resolve")
 
 
+@_rule("V-24", "with a sweep, baselines sit with their point")
+def _sweep_baselines(s: Scenario) -> Iterator[Issue]:
+    if s.sweep is None:
+        return
+    for task in GATED_TASKS:
+        block = getattr(s.tasks, task)
+        if block is not None and block.baseline is not None:
+            yield Issue(("tasks", task, "baseline"), sweep_baseline_message(s.sweep))
+
+
+def sweep_baseline_message(sweep: Sweep) -> str:
+    where = (
+        "under the point it gates"
+        if sweep.points is not None
+        else "under sweep.baselines.<point>.<task>"
+    )
+    return f"is not allowed with a sweep; put it {where}"
+
+
 _declare("V-26", "name is unique across scenarios/", "validate")
 _declare("V-29", "extends: the parent exists, no cycle, depth <= 5", "resolve")
 _declare(
@@ -988,6 +1009,134 @@ def _agentx_context(s: Scenario) -> Iterator[Issue]:
             f"set tasks.agentx.env.WEKA_LOADER_OVERRIDE: {CAPPED_CORPUS}; or set "
             "AIPERF_MAX_CONTEXT_LENGTH to drop longer traces (not canonical)",
         )
+
+
+@_rule("V-38", "a sweep has one form, axes under server.* or tasks.*, unique names")
+def _sweep(s: Scenario) -> Iterator[Issue]:
+    if s.sweep is not None:
+        yield from check_sweep(s.sweep)
+
+
+_declare("V-33", "zip axes have equal lengths", "scenario")
+_declare("V-39", "sweep axis paths exist in the resolved scenario", "resolve")
+_declare("V-40", "--set does not touch a sweep axis", "resolve")
+
+
+def check_sweep(sweep: Sweep, base: KeyPath = ("sweep",)) -> list[Issue]:
+    """Problems of a sweep block on its own (V-24, V-33, V-38).
+
+    Each point is its own workload, so a point may change any server or task
+    field, the hardware included.
+    """
+    issues: list[Issue] = []
+    forms = [form for form in ("points", "zip", "product") if getattr(sweep, form)]
+    if len(forms) != 1:
+        found = f"; found {', '.join(forms)}" if forms else ""
+        issues.append(
+            Issue(
+                base, f"set exactly one of points, zip and product{found}", rule="V-38"
+            )
+        )
+        return issues
+    (form,) = forms
+    if sweep.points is not None:
+        if sweep.name is not None:
+            issues.append(
+                Issue(
+                    (*base, "name"),
+                    "is for zip and product; named points carry their own names",
+                    rule="V-38",
+                )
+            )
+        if sweep.baselines is not None:
+            issues.append(
+                Issue(
+                    (*base, "baselines"),
+                    "is for zip and product; a named point carries its baselines "
+                    "in its own tasks",
+                    rule="V-38",
+                )
+            )
+        seen: set[str] = set()
+        for index, point in enumerate(sweep.points):
+            path = (*base, "points", index)
+            if point.name in seen:
+                issues.append(
+                    Issue(
+                        (*path, "name"),
+                        f"another point is named {point.name}",
+                        rule="V-38",
+                    )
+                )
+            seen.add(point.name)
+        return issues
+
+    axes = sweep.axes
+    for text in axes:
+        path = parse_path(text)
+        where = (*base, form, text)
+        if len(path) < 2 or path[0] not in ("server", "tasks"):
+            issues.append(
+                Issue(where, "axes override server.* or tasks.* only", rule="V-38")
+            )
+        elif "baseline" in path:
+            issues.append(
+                Issue(where, "point baselines go under sweep.baselines", rule="V-24")
+            )
+    if sweep.zip is not None:
+        lengths = {text: len(values) for text, values in sweep.zip.items()}
+        if len(set(lengths.values())) > 1:
+            listed = ", ".join(f"{text} has {n}" for text, n in lengths.items())
+            issues.append(
+                Issue((*base, "zip"), f"axes need equal lengths; {listed}", rule="V-33")
+            )
+    if sweep.name is None:
+        example = next(iter(axes))
+        issues.append(
+            Issue(
+                base,
+                f"name is required with {form}, e.g. name: x{{{example}}}",
+                rule="V-38",
+            )
+        )
+    if issues:
+        return issues
+
+    try:
+        names = [point.name for point in expand(sweep)]
+    except ValueError as error:
+        return [Issue((*base, "name"), str(error), rule="V-38")]
+    invalid = [name for name in names if not POINT_NAME.fullmatch(name)]
+    if invalid:
+        issues.append(
+            Issue(
+                (*base, "name"),
+                f"gives the point name {invalid[0]!r}; point names are lowercase "
+                "letters, digits and '-', start with a letter, and are at most "
+                "63 characters",
+                rule="V-38",
+            )
+        )
+    for name in sorted(set(names)):
+        if names.count(name) > 1:
+            issues.append(
+                Issue(
+                    (*base, "name"),
+                    f"gives {name} to {names.count(name)} points; use every axis "
+                    "that varies",
+                    rule="V-38",
+                )
+            )
+    for name in sweep.baselines or {}:
+        if name not in names:
+            issues.append(
+                Issue(
+                    (*base, "baselines", name),
+                    f"no point is named {name}; points: {', '.join(names)}",
+                    rule="V-38",
+                )
+            )
+    return issues
 
 
 def rule_table() -> list[Rule]:
