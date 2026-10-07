@@ -74,7 +74,7 @@ def test_native_v1_validation_uses_tpu_capabilities(device, method, pcp, reason)
     "feature,reason",
     [
         ("adaptive", "adaptive draft verification"),
-        ("dflash2", "dflash2 drafts"),
+        ("dflash2", "DFlash candidate-head drafts"),
         ("diffusion", "diffusion models"),
         ("batch_sharded", "batch-sharded sampling"),
     ],

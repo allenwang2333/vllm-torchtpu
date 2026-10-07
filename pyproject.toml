@@ -28,9 +28,10 @@ dependencies = [
     "portpicker",
     "pathwaysutils",
     # Note: we **intentionally** build vllm from source, see README.
-    # V4.1 development baseline: upstream model/control contracts, 2026-09-23.
+    # V4.1 development baseline: upstream v0.31.1rc0 (2026-10-06), which carries
+    # DSv4.1 SWA bounded replay and its prefix-cache contract.
     # Keep vllm_test_utils on the identical commit below.
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.30.0",
+    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.31.1rc0",
     "torch==2.13.0",
     # Some multimodal checkpoints dynamically invoke torchvision at class-definition
     # time in their HF processors. torchvision's pre-compiled ops (nms and friends)
@@ -49,12 +50,12 @@ dependencies = [
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
     # declared here rather than leaned on as a vLLM transitive.
     #
-    # Capped below 5.15. vLLM 0.29.0 sets a floor (>=5.10.4), and vllm-omni 0.29.0rc1
-    # requires transformers>=5.13.0,<5.15. The previous <5.11 ceiling was added
-    # defensively after floating to 5.17.0 produced an argmax tie-break divergence in
-    # test_structured_output_spec_decode_correctness_greedy. Widening to <5.15 allows
-    # vllm-torchtpu[omni] to resolve (to 5.14.x) while remaining bounded below 5.15+.
-    "transformers>=5.10.4,<5.15",
+    # Follows vLLM v0.31.1rc0's range (>=5.16.1,<5.19.0). This leaves the
+    # `omni` extra unresolvable: vllm-omni 0.29.0rc1 requires
+    # transformers<5.15. The earlier <5.11 ceiling was added after 5.17.0 produced
+    # an argmax tie-break divergence in
+    # test_structured_output_spec_decode_correctness_greedy; recheck that test.
+    "transformers>=5.16.1,<5.19",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
@@ -85,7 +86,7 @@ test = [
     "pytest-timeout",
     "pytest-cov",
     "parameterized",
-    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.30.0#subdirectory=tests/vllm_test_utils",
+    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.31.1rc0#subdirectory=tests/vllm_test_utils",
 ]
 
 # These are required for running any benchmarking
