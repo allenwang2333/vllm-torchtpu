@@ -84,7 +84,7 @@ def _kernel(*refs, eps, has_res, emit_y, has_rstd, gamma, has_ba):
         # The layer's bf16 consumer of the normed rows (GDN in_proj_ba), so the
         # rows need not leave the kernel.
         ba_ref[...] = jax.lax.dot_general(
-            y, wba_ref[...], (((1,), (1,)), ((), ())),
+            y, wba_ref[...].astype(y.dtype), (((1,), (1,)), ((), ())),
             preferred_element_type=jnp.float32,
         ).astype(ba_ref.dtype)
     if emit_y:
@@ -162,7 +162,7 @@ def rms_norm_quant(
         out_shape.append(sds((m, k), jnp.bfloat16))
     if has_ba:
         out_specs.append(pl.BlockSpec((t, nba), lambda i: (i, 0)))
-        out_shape.append(sds((m, nba), wba.dtype))
+        out_shape.append(sds((m, nba), jnp.bfloat16))
     if has_res:
         out_specs.append(row)
         out_shape.append(sds((m, k), residual.dtype))

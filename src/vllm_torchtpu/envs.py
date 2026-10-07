@@ -98,7 +98,7 @@ if TYPE_CHECKING:
     TPU_INPUT_NORM_QUANT: int = 0
     TPU_INPUT_NORM_QUANT_MIN_ROWS: int = 0
     TPU_INPUT_NORM_QUANT_GAMMA: str = "vmem"
-    TPU_INPUT_NORM_QUANT_FOLD_BA: bool = False
+    TPU_INPUT_NORM_QUANT_FOLD_BA: int = 0
     TPU_ACT_QUANT: bool = False
     TPU_ACT_QUANT_ROUND_MID: int = 2
     TPU_FUSED_QK_NORM_ROPE: bool = False
@@ -745,8 +745,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "xla" (an XLA fusion forms the f32 w + 1 each step, read from VMEM),
     # "none" (timing-only removal arm: gamma = 1; wrong numerics).
     "TPU_INPUT_NORM_QUANT_GAMMA": env_str("TPU_INPUT_NORM_QUANT_GAMMA", "vmem"),
-    # GDN layers also run their bf16 in_proj_ba inside the norm kernel.
-    "TPU_INPUT_NORM_QUANT_FOLD_BA": env_bool("TPU_INPUT_NORM_QUANT_FOLD_BA"),
+    # GDN layers also run their bf16 in_proj_ba inside the norm kernel; 2 hands
+    # the weight over as an f32 XLA fusion output instead of a parameter.
+    "TPU_INPUT_NORM_QUANT_FOLD_BA": env_int("TPU_INPUT_NORM_QUANT_FOLD_BA", 0),
     # The shared expert's SwiGLU and (with TPU_INPUT_NORM_QUANT) the attention
     # output gate run with their fp8 linear's activation quant in one kernel
     # (layers/adapter/act_quant_op.py). ROUND_MID picks the activation's bf16

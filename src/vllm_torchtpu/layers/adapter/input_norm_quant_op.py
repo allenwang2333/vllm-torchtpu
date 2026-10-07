@@ -237,7 +237,12 @@ def norm_quant(layer: torch.nn.Module, hidden_states, residual):
             s = s + residual.to(torch.float32)
         extra = (torch.rsqrt(s.pow(2).mean(dim=-1, keepdim=True) + eps),)
     if fold:
-        extra = extra + (layer.linear_attn._tpu_in_proj_ba_t,)
+        wba = layer.linear_attn._tpu_in_proj_ba_t
+        if envs.TPU_INPUT_NORM_QUANT_FOLD_BA == 2:
+            # An XLA fusion output (exact f32 copy): read from VMEM, where a
+            # staged parameter costs an exposed copy at decode sizes.
+            wba = wba.float()
+        extra = extra + (wba,)
     emit_y = is_gdn and not fold
     gw = norm.weight
     if envs.TPU_INPUT_NORM_QUANT_GAMMA == "xla":
