@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     TPU_MOE_LOWTOK: bool = False
     USE_MOE_FUSED_TP_KERNEL: bool = False
     MOE_FUSED_TP_KERNEL_MAX_TOKENS: int = 512
+    USE_MOE_FUSED_TP_AR: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -157,6 +158,10 @@ if TYPE_CHECKING:
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     TPU_SPARSE_SPEC_SAMPLING: bool = False
     TPU_SAMPLING_TOPK_BOUND: int = 64
+    VLLM_TPU_MOE_SEQUENCE_PARALLEL: str = "off"
+    VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER: bool = False
+    VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS: int = 257
+    VLLM_TPU_SP_MIN_TOKENS: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     TPU_SMALL_ALL_REDUCE: bool = False
 
@@ -235,6 +240,34 @@ def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
         )
 
     return _get_bool_env
+
+
+def env_moe_sequence_parallel_mode(env_name: str) -> Callable[[], str]:
+    """Parse the sequence-parallel MoE mode into "off", "auto" or "force".
+
+    Unset/empty and the env_bool false spellings mean "off"; the true
+    spellings and "auto" mean "auto" (upstream's gate: only when DP > 1);
+    "force" also enables it on DP == 1. Anything else raises, for the same
+    reason env_bool does.
+    """
+
+    def _get_mode() -> str:
+        value = os.getenv(env_name)
+        if value is None or value.strip() == "":
+            return "off"
+        value_lower = value.strip().lower()
+        if value_lower in _FALSE_STRINGS:
+            return "off"
+        if value_lower in _TRUE_STRINGS or value_lower == "auto":
+            return "auto"
+        if value_lower == "force":
+            return "force"
+        raise ValueError(
+            f"Invalid value '{value}' for {env_name}. Valid options: "
+            f"{_TRUE_STRINGS + _FALSE_STRINGS + ('auto', 'force')} (any case)."
+        )
+
+    return _get_mode
 
 
 def env_int(env_name: str, default: int) -> Callable[[], int]:
@@ -584,6 +617,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_TP_KERNEL_MAX_TOKENS": env_nonnegative_int(
         "MOE_FUSED_TP_KERNEL_MAX_TOKENS", 512
     ),
+    # Serve eligible tensor-parallel MoE layers with fused Pallas kernels that
+    # cover the routed experts, the shared expert and the TP all-reduce
+    # (layers/adapter/fused_moe_tp_ar.py). Armed once after load.
+    "USE_MOE_FUSED_TP_AR": env_bool("USE_MOE_FUSED_TP_AR"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
@@ -938,6 +975,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Window width of TPU_SPARSE_SPEC_SAMPLING (the largest top_k it takes).
     # 0 disables the sparse path.
     "TPU_SAMPLING_TOPK_BOUND": env_nonnegative_int("TPU_SAMPLING_TOPK_BOUND", 64),
+    # Sequence-parallel MoE (TP -> TP+SP across MoE gate, shared experts, and
+    # EP dispatch/combine; needs EP and TP > 1). Off by default.
+    #   1/true/auto: upstream vLLM's gate -- only when DP > 1, where SP removes
+    #     the TP-replicated tokens from EP dispatch. Skipped (logged) on DP == 1.
+    #   force: also on DP == 1, replacing attention/MoE TP all-reduces with
+    #     reduce-scatter + all-gather and dispatching over EP.
+    "VLLM_TPU_MOE_SEQUENCE_PARALLEL": env_moe_sequence_parallel_mode(
+        "VLLM_TPU_MOE_SEQUENCE_PARALLEL"
+    ),
+    # Quantize sequence-parallel [T/TP, H] rows to FP8 before the pre-attention
+    # TP all-gather and pass the gathered (x_q, x_s) directly into per-channel
+    # FP8 attention input projections. Halves pre-attention all-gather bytes
+    # and shrinks activation quantization compute by 1/TP.
+    "VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER": lambda: (
+        env_bool("VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER")()
+        or env_bool("TPU_SEQUENCE_PARALLEL_FP8_GATHER")()
+    ),
+    # Minimum step token count at which sequence-parallel pre-attention FP8
+    # gather is active. 0 (default) auto-selects 16 * tp_size**2 + 1 (257 on
+    # TP=4, 1025 on TP=8) so small decode/mixed steps keep a single
+    # latency-bound BF16 all-gather launch.
+    "VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS", 0
+    ),
+    # Minimum step token count at which sequence-parallel sharding (T/TP) is
+    # active in Qwen3Next/Qwen3.5-MoE layers. Below this threshold, tokens stay
+    # replicated [T, H] across TP ranks so latency-bound decode steps avoid
+    # per-layer AllGather/ReduceScatter pairs and run the fused TP decode MoE
+    # kernel directly. 0 (default) keeps SP active on all buckets unless
+    # USE_MOE_FUSED_TP_AR=1, which defaults to MAX_DECODE_TOKENS + 1 (129).
+    "VLLM_TPU_SP_MIN_TOKENS": env_nonnegative_int("VLLM_TPU_SP_MIN_TOKENS", 0),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).

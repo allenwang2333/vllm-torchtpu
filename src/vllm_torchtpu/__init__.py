@@ -260,7 +260,10 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
     # the unguarded `_fused_output_is_reduced` read below stops failing loudly
     # on an upstream rename in runs that do not use the kernel; if arming ever
     # grows a non-env path, this gate has to go with it.
-    if not envs.USE_MOE_FUSED_EP_KERNEL:
+    #
+    # USE_MOE_FUSED_TP_AR arms TP layers (layers/adapter/fused_moe_tp_ar.py)
+    # whose kernel reduces shared + routed in-kernel, so it needs the patch too.
+    if not (envs.USE_MOE_FUSED_EP_KERNEL or envs.USE_MOE_FUSED_TP_AR):
         return
 
     from vllm.model_executor.layers.fused_moe.runner import moe_runner as _mr
@@ -275,6 +278,11 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
         # `skip_final_all_reduce` asserts the fused output is NOT pre-reduced,
         # and in that mode the model reduces externally anyway, so leave it be.
         if getattr(self.moe_config, "skip_final_all_reduce", False):
+            return original.fget(self)
+        # A layer armed by fused_moe_tp_ar reduces shared + routed in-kernel.
+        if getattr(self, "_fused_moe_tp_ar_armed", False):
+            return True
+        if not envs.USE_MOE_FUSED_EP_KERNEL:
             return original.fget(self)
         try:
             from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
@@ -295,6 +303,21 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
         )
 
     _mr.MoERunner._fused_output_is_reduced = patched
+
+    # A layer armed by fused_moe_tp_ar owns its token exchange too: on a
+    # sequence-parallel layer (VLLM_TPU_MOE_SEQUENCE_PARALLEL) its SP program
+    # gathers [T/TP] rows and reduce-scatters back inside the kernel, and below
+    # the SP bucket gate its input is replicated, so vLLM's naive EP
+    # all-gather / reduce-scatter pair around it would be wrong either way.
+    original_naive = _mr.MoERunner.do_naive_dispatch_combine
+
+    @property
+    def patched_naive(self):
+        if getattr(self, "_fused_moe_tp_ar_armed", False):
+            return False
+        return original_naive.fget(self)
+
+    _mr.MoERunner.do_naive_dispatch_combine = patched_naive
     _mr.MoERunner._tpu_fused_output_reduced_patch = True
     logger.info("Applied TPU patch: the fused EP MoE output is pre-reduced.")
 
@@ -566,29 +589,179 @@ def _patch_vllm_compile_all_ranges() -> None:
 
 
 def _patch_disable_sequence_parallel_moe() -> None:
-    """Gate vLLM's sequence-parallel MoE on TPU.
+    """Configure vLLM's sequence-parallel MoE on TPU.
 
-    Off by default. With TPU_MOE_SEQUENCE_PARALLEL=1, admit it at any DP size
-    when EP is on and TP > 1. The GPU all2all-backend and DP > 1 conjuncts do
-    not apply on TPU. EP is required: without it the row-parallel expert sum
-    is never reduced.
+    Two independent knobs, never both:
+    - TPU_MOE_SEQUENCE_PARALLEL=1 (the overlay's EP path): admit SP at any DP
+      size when EP is on and TP > 1, served by qwen3_next_ep_sp_patch.
+    - VLLM_TPU_MOE_SEQUENCE_PARALLEL=auto|force: the TP+SP path served by
+      qwen3_next_patch (see envs.py for the modes).
+    With neither set, sequence-parallel MoE stays disabled.
     """
+    import os
+    import sys
+
+    import torch
+    import torch.nn.functional as F
     from vllm.config.parallel import ParallelConfig
-
-    if getattr(ParallelConfig, "_tpu_no_sp_moe_patch", False):
-        return
-
-    if envs.TPU_MOE_SEQUENCE_PARALLEL:
-        ParallelConfig.use_sequence_parallel_moe = property(
-            lambda self: self.enable_expert_parallel and self.tensor_parallel_size > 1
-        )
-    else:
-        ParallelConfig.use_sequence_parallel_moe = property(lambda self: False)
-    ParallelConfig._tpu_no_sp_moe_patch = True
-    logger.info(
-        "Applied TPU patch: sequence-parallel MoE %s.",
-        "admitted" if envs.TPU_MOE_SEQUENCE_PARALLEL else "disabled",
+    from vllm.distributed import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+        parallel_state,
     )
+    from vllm.model_executor.models import utils as model_utils
+
+    if envs.TPU_MOE_SEQUENCE_PARALLEL and envs.VLLM_TPU_MOE_SEQUENCE_PARALLEL != "off":
+        raise ValueError(
+            "TPU_MOE_SEQUENCE_PARALLEL=1 and VLLM_TPU_MOE_SEQUENCE_PARALLEL select "
+            "two different sequence-parallel MoE paths; set only one."
+        )
+
+    if not getattr(ParallelConfig, "_tpu_no_sp_moe_patch", False):
+
+        def _effective_dp_size(self: ParallelConfig) -> int:
+            # The real DP width. TorchTPU's single-host DP bootstrap can hand an
+            # engine a config with data_parallel_size collapsed to 1 (see
+            # TpuPlatform: TORCH_TPU_DP_SIZE), so also consult the live DP group
+            # and that env; a collapsed config must not silently disable SP.
+            sizes = [self.data_parallel_size]
+            if parallel_state._DP is not None:
+                sizes.append(parallel_state._DP.world_size)
+            env_dp = os.environ.get("TORCH_TPU_DP_SIZE", "")
+            if env_dp.strip().isdigit():
+                sizes.append(int(env_dp))
+            return max(sizes)
+
+        logged_decisions: set[tuple[str, int, bool, bool]] = set()
+
+        # set_forward_context evaluates use_sequence_parallel_moe twice per call
+        # (~3 calls per served decode step); each uncached evaluation reads
+        # os.environ ~3 times (~28 us measured under the host tracer). Once the
+        # DP group exists the inputs are fixed, so memoize per config object.
+        # The key holds every input that can change in-process: the config
+        # fields, the live DP group (by identity), and any module-level
+        # override of the two envs (tests monkeypatch them); real os.environ
+        # changes after DP init are not supported, as for the rest of envs.
+        sp_moe_memo: dict[int, tuple[object, tuple, bool]] = {}
+        sp_moe_memo_max = 64
+
+        def _use_sequence_parallel_moe(self: ParallelConfig) -> bool:
+            dp_group = parallel_state._DP
+            if dp_group is None:
+                return _use_sequence_parallel_moe_uncached(self)
+            env_overrides = vars(envs)
+            key = (
+                dp_group,
+                env_overrides.get("TPU_MOE_SEQUENCE_PARALLEL"),
+                env_overrides.get("VLLM_TPU_MOE_SEQUENCE_PARALLEL"),
+                self.enable_expert_parallel,
+                self.tensor_parallel_size,
+                self.prefill_context_parallel_size,
+                self.data_parallel_size,
+            )
+            entry = sp_moe_memo.get(id(self))
+            if entry is not None and entry[0] is self and entry[1] == key:
+                return entry[2]
+            enabled = _use_sequence_parallel_moe_uncached(self)
+            if len(sp_moe_memo) >= sp_moe_memo_max:
+                sp_moe_memo.clear()
+            # Holding ``self`` keeps id(self) from being reused while cached.
+            sp_moe_memo[id(self)] = (self, key, enabled)
+            return enabled
+
+        def _use_sequence_parallel_moe_uncached(self: ParallelConfig) -> bool:
+            if envs.TPU_MOE_SEQUENCE_PARALLEL:
+                # EP is required on this path: without it the row-parallel
+                # expert sum is never reduced.
+                return self.enable_expert_parallel and self.tensor_parallel_size > 1
+            mode = envs.VLLM_TPU_MOE_SEQUENCE_PARALLEL
+            if not (
+                mode != "off"
+                and (self.enable_expert_parallel or mode == "force")
+                and self.tensor_parallel_size > 1
+                and self.prefill_context_parallel_size == 1
+            ):
+                return False
+            # "auto" mirrors upstream ParallelConfig.use_sequence_parallel_moe:
+            # SP only pays when DP > 1, where it de-duplicates the TP-replicated
+            # tokens that EP dispatch would otherwise send TP times. On DP == 1
+            # it swaps the all-reduces for RS + AG launches, so it is opt-in.
+            dp_size = _effective_dp_size(self)
+            enabled = mode == "force" or dp_size > 1
+            decision = (mode, dp_size, self.enable_expert_parallel, enabled)
+            if decision not in logged_decisions:
+                logged_decisions.add(decision)
+                logger.info(
+                    "Sequence-parallel MoE %s "
+                    "(VLLM_TPU_MOE_SEQUENCE_PARALLEL=%s, dp_size=%d, "
+                    "tp_size=%d, ep=%s)%s.",
+                    "enabled" if enabled else "skipped",
+                    mode,
+                    dp_size,
+                    self.tensor_parallel_size,
+                    self.enable_expert_parallel,
+                    ""
+                    if enabled
+                    else "; upstream gate needs DP > 1, use 'force' on DP == 1",
+                )
+            return enabled
+
+        tp_rank_tensors: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+        def _tpu_sequence_parallel_chunk(x: torch.Tensor) -> torch.Tensor:
+            tp_size = get_tensor_model_parallel_world_size()
+            if tp_size <= 1:
+                return x
+            tp_rank = get_tensor_model_parallel_rank()
+            seq_len = x.shape[0]
+            if isinstance(seq_len, torch.SymInt):
+                torch._check(seq_len % tp_size == 0)
+                y = x
+            else:
+                remainder = seq_len % tp_size
+                if remainder != 0:
+                    pad_len = tp_size - remainder
+                    pad_dims = [0] * (2 * x.ndim)
+                    pad_dims[-1] = pad_len
+                    y = F.pad(x, tuple(pad_dims))
+                else:
+                    y = x
+            reshaped = y.reshape(tp_size, -1, *x.shape[1:])
+            if torch.compiler.is_compiling():
+                rank_tensor = torch.tensor(
+                    [tp_rank], dtype=torch.int64, device=x.device
+                )
+            else:
+                key = (x.device, tp_rank)
+                rank_tensor = tp_rank_tensors.get(key)
+                if rank_tensor is None:
+                    rank_tensor = torch.tensor(
+                        [tp_rank], dtype=torch.int64, device=x.device
+                    )
+                    tp_rank_tensors[key] = rank_tensor
+            return torch.index_select(reshaped, 0, rank_tensor).reshape(
+                -1, *x.shape[1:]
+            )
+
+        model_utils._original_sequence_parallel_chunk = (
+            model_utils.sequence_parallel_chunk
+        )
+        model_utils.sequence_parallel_chunk = _tpu_sequence_parallel_chunk
+        ParallelConfig.use_sequence_parallel_moe = property(_use_sequence_parallel_moe)
+        ParallelConfig._tpu_no_sp_moe_patch = True
+        logger.info(
+            "Applied TPU patch: configure sequence-parallel MoE "
+            "(TPU_MOE_SEQUENCE_PARALLEL=%s, VLLM_TPU_MOE_SEQUENCE_PARALLEL=%s).",
+            envs.TPU_MOE_SEQUENCE_PARALLEL,
+            envs.VLLM_TPU_MOE_SEQUENCE_PARALLEL,
+        )
+
+    patched_chunk = model_utils.sequence_parallel_chunk
+    orig_chunk = model_utils._original_sequence_parallel_chunk
+    attr = "sequence_parallel_chunk"
+    for mod in list(sys.modules.values()):
+        if getattr(mod, attr, None) is orig_chunk:
+            setattr(mod, attr, patched_chunk)
 
 
 def _patch_multiproc_worker_global_rank_env() -> None:

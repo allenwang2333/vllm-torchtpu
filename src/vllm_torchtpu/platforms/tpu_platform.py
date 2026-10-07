@@ -6,7 +6,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Union, cast
 
 import portpicker
 import torch
@@ -119,6 +119,36 @@ _TPU_2D_TORUS_GENERATIONS = ("v5e", "v6e")
 # 3D Torus generations that expose two devices per chip. The device name
 # surfaces as "TPU v7" from get_tpu_device_name() and as "TPU7x" from the
 # device-kind path, so both spellings have to match.
+# Device copies of DPMetadata.num_tokens_across_dp_cpu, keyed by value.
+# set_forward_context runs ~3 times per served decode step (target forward,
+# drafter step 0, fused draft loop) and, whenever DPMetadata is built (DP > 1
+# or sequence-parallel MoE, which is on even at DP == 1 under "force"), each
+# call used to issue a blocking s32[N] host->device copy (~115 us measured,
+# TpuMallocAndMemcpyHtoD 7 -> 10 per draft pass). The counts take only a few
+# distinct values (one per padded token bucket), and nothing downstream
+# mutates the tensor in place (consumers only read it or derive new tensors:
+# DPMetadata.sp_local_sizes / cu_tokens_across_sp, .sum(), .max()), so
+# sharing one device tensor per distinct value is safe.
+_DP_TOKEN_COUNTS_CACHE_MAX = 256
+_dp_token_counts_on_tpu_cache: dict[tuple, torch.Tensor] = {}
+
+
+def _copy_dp_token_counts_to_tpu(t: torch.Tensor) -> torch.Tensor:
+    return t.to("tpu")
+
+
+def _dp_token_counts_on_tpu(t: torch.Tensor) -> torch.Tensor:
+    """Return a cached device copy of the CPU token-count tensor ``t``."""
+    key = (t.dtype, tuple(t.shape), tuple(t.tolist()))
+    tpu_t = _dp_token_counts_on_tpu_cache.get(key)
+    if tpu_t is None:
+        if len(_dp_token_counts_on_tpu_cache) >= _DP_TOKEN_COUNTS_CACHE_MAX:
+            _dp_token_counts_on_tpu_cache.clear()
+        tpu_t = _copy_dp_token_counts_to_tpu(t)
+        _dp_token_counts_on_tpu_cache[key] = tpu_t
+    return tpu_t
+
+
 _TPU_DUAL_DEVICE_GENERATIONS = ("v7", "tpu7x")
 
 # TPU v8i / TPU8i generations.
@@ -392,6 +422,7 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
+        "VLLM_TPU_MOE_SEQUENCE_PARALLEL",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -589,7 +620,7 @@ class TpuPlatform(Platform):
         if dp_metadata is not None:
             t = dp_metadata.num_tokens_across_dp_cpu
             if t.device.type == "cpu":
-                tpu_t = t.to("tpu")
+                tpu_t = _dp_token_counts_on_tpu(t)
                 try:
                     dp_metadata.num_tokens_across_dp_cpu = tpu_t
                 except Exception:
@@ -705,6 +736,10 @@ class TpuPlatform(Platform):
         # Set compile_sizes to match the token padding buckets used by
         # TPUModelRunner. These are the exact shapes PiecewiseBackend
         # will compile for.
+        use_sp_moe = parallel_config.use_sequence_parallel_moe
+        min_token_size = (
+            max(16, 2 * parallel_config.tensor_parallel_size) if use_sp_moe else 16
+        )
         if compilation_config.compile_sizes is None:
             scheduler_config = vllm_config.scheduler_config
             budget = scheduler_config.max_num_batched_tokens
@@ -716,7 +751,7 @@ class TpuPlatform(Platform):
                     + scheduler_config.max_num_seqs,
                 )
             compilation_config.compile_sizes = _get_token_paddings(
-                min_token_size=16,
+                min_token_size=min_token_size,
                 max_token_size=budget,
                 extra_bucket_sizes=extra_bucket_sizes,
             )
@@ -726,14 +761,14 @@ class TpuPlatform(Platform):
         # Sequence-parallel MoE splits each bucket over TP. Keep buckets that
         # split evenly into >= 2 rows per rank: a 1-row shard lets Dynamo
         # specialize the size and refuse the remaining buckets.
-        parallel_config = vllm_config.parallel_config
-        if parallel_config.use_sequence_parallel_moe:
+        if use_sp_moe:
             archs = vllm_config.model_config.architectures or []
             if not any(a.startswith(("Qwen3Next", "Qwen3_5Moe")) for a in archs):
                 raise ValueError(
-                    "TPU_MOE_SEQUENCE_PARALLEL=1 is validated only for Qwen3Next "
+                    "Sequence-parallel MoE is validated only for Qwen3Next "
                     f"and Qwen3.5 MoE, got {archs}."
                 )
+        if use_sp_moe and envs.TPU_MOE_SEQUENCE_PARALLEL:
             if not envs.USE_MOE_FUSED_EP_KERNEL:
                 logger.warning(
                     "TPU_MOE_SEQUENCE_PARALLEL=1 without USE_MOE_FUSED_EP_KERNEL=1 "
@@ -745,6 +780,34 @@ class TpuPlatform(Platform):
                 for s in compilation_config.compile_sizes
                 if s >= 2 * tp and s % tp == 0
             ]
+        elif use_sp_moe:
+            # VLLM_TPU_MOE_SEQUENCE_PARALLEL: round each bucket that runs
+            # sequence-parallel up so it splits into 2, 4 or a multiple of 8
+            # rows per TP rank. Buckets under the SP gate run replicated and
+            # keep their size (e.g. the 4/8/48 decode buckets).
+            # Same value as qwen3_next_patch.resolve_sp_min_tokens (129 =
+            # fused_moe_tp_ar.MAX_DECODE_TOKENS + 1), without importing the
+            # model or kernel modules at config time.
+            sp_min_tokens = envs.VLLM_TPU_SP_MIN_TOKENS or (
+                129 if envs.USE_MOE_FUSED_TP_AR else 0
+            )
+            tp_size = parallel_config.tensor_parallel_size
+            aligned_sizes: set[int] = set()
+            for raw_size in compilation_config.compile_sizes:
+                if sp_min_tokens > 2 and int(raw_size) < sp_min_tokens:
+                    aligned_sizes.add(int(raw_size))
+                    continue
+                s = max(
+                    2 * tp_size, ((int(raw_size) + tp_size - 1) // tp_size) * tp_size
+                )
+                local_s = s // tp_size
+                if local_s not in (2, 4) and local_s % 8 != 0:
+                    local_s = ((local_s + 7) // 8) * 8
+                    s = local_s * tp_size
+                aligned_sizes.add(s)
+            compilation_config.compile_sizes = cast(
+                list[int | str], sorted(aligned_sizes)
+            )
 
         # Clear compile_ranges_split_points — TPU always pads to exact
         # compile_sizes so catch-all ranges are never used.

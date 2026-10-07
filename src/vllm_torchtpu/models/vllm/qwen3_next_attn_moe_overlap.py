@@ -90,10 +90,14 @@ def _configure_decoder_layer(self: Any, prefix: str = "") -> None:
         return
     self._tpu_attn_moe_overlap_configured = True
 
+    # A sequence-parallel layer (VLLM_TPU_MOE_SEQUENCE_PARALLEL) already
+    # reduce-scatters its attention output and keeps the residual chunked;
+    # qwen3_next_patch owns its collectives, so the overlap stays out of it.
     if (
         "mtp" in prefix
         or not isinstance(getattr(self, "mlp", None), Qwen3NextSparseMoeBlock)
         or get_tensor_model_parallel_world_size() <= 1
+        or getattr(self, "use_attn_reduce_scatter_for_moe", False)
     ):
         self._tpu_attn_moe_overlap = False
         return
@@ -111,6 +115,9 @@ def _configure_decoder_layer(self: Any, prefix: str = "") -> None:
     self.mlp.experts.gate = None
     self.mlp.experts.moe_config.skip_final_all_reduce = True
     assert self.mlp.experts.moe_config.skip_final_all_reduce is True
+    # Lets fused_moe_tp_ar arm this layer despite skip_final_all_reduce: the
+    # forwards below skip their own MoE all-reduce for an armed layer.
+    self.mlp.experts._tpu_attn_moe_overlap_owner = True
 
     if not hasattr(self.mlp.experts, "maybe_all_reduce_tensor_model_parallel"):
         self.mlp.experts.maybe_all_reduce_tensor_model_parallel = lambda x: (
@@ -157,6 +164,14 @@ def _patched_qwen3_5_decoder_init(
     _qx_set_routing_cfg(self, vllm_config)
 
 
+def _fused_tp_ar_armed(moe_block: Any) -> bool:
+    """True once fused_moe_tp_ar armed this block's runner: its output is
+    then shared + routed, already TP-reduced in-kernel."""
+    return getattr(
+        getattr(moe_block, "experts", None), "_fused_moe_tp_ar_armed", False
+    )
+
+
 def _patched_moe_forward(
     self: Qwen3NextSparseMoeBlock,
     hidden_states: torch.Tensor,
@@ -192,7 +207,7 @@ def _patched_moe_forward(
         final_hidden_states = final_hidden_states * ffn_scale
     if fold_rows is not None:
         final_hidden_states = final_hidden_states + fold_rows
-    if self.tp_size > 1:
+    if self.tp_size > 1 and not _fused_tp_ar_armed(self):
         if hasattr(self.experts, "maybe_all_reduce_tensor_model_parallel"):
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
                 final_hidden_states
@@ -236,7 +251,9 @@ def _patched_decoder_forward(
         raise ValueError(f"Invalid layer_type: {self.layer_type}")
 
     min_tokens = max(envs.TPU_ATTN_MOE_OVERLAP_MIN_TOKENS, 16)
-    if full_num_tokens < min_tokens:
+    # An armed layer's MoE output is already reduced, so the attention partial
+    # cannot be folded into the MoE all-reduce: reduce it on its own.
+    if full_num_tokens < min_tokens or _fused_tp_ar_armed(self.mlp):
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         if self.layer_scale:
             hidden_states = hidden_states * (
