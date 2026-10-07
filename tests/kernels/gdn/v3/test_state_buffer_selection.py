@@ -29,6 +29,9 @@ _D_K, _D_V, _KERNEL_SIZE = 128, 128, 4
 def _v7x_info(monkeypatch):
     info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    # The table pins the default decode tile; dynamic tiling picks its own
+    # (T=8 at 64 sequences, 8 v-heads), so keep it off here.
+    monkeypatch.setenv("TPU_ENABLE_GDN_DYNAMIC_TILING", "0")
 
 
 def _pallas_eqns(closed_jaxpr):
