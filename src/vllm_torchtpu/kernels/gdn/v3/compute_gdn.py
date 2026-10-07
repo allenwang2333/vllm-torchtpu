@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import jax
 import jax.numpy as jnp
 
@@ -339,7 +340,9 @@ def recurrent_gdn_per_seq(
     kq_head_dim, v_head_dim]); with `window_size == 1` that is just the final
     state.
     """
+    import os
 
+    use_fused_1dot = os.environ.get("TPU_GDN_FUSED_1DOT", "0") == "1"
     out_list = []
     state_list = []
     for c_idx in range(cfgs.chunk_size):
@@ -360,35 +363,63 @@ def recurrent_gdn_per_seq(
         beta_curr = beta[:, c_idx]
         gating_curr = gating_log[:, c_idx]
 
-        # [num_v_heads, kq_head_dim, v_head_dim]
-        state_updated = state * gating_curr
+        if use_fused_1dot:
+            iota_in = jax.lax.broadcasted_iota(
+                jnp.int32, (cfgs.num_v_heads, 8, cfgs.kq_head_dim), 1
+            )
+            kq_curr = jnp.where(
+                iota_in == 0, k_curr, jnp.where(iota_in == 1, q_curr, 0.0)
+            )
+            kq_dot = jax.lax.dot(
+                kq_curr,
+                state,
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            ).astype(cfgs.dtypes.compute)
+            iota_out = jax.lax.broadcasted_iota(jnp.int32, kq_dot.shape, 1)
+            k_state = jnp.where(iota_out == 0, kq_dot, 0.0).sum(
+                axis=1, keepdims=True
+            )
+            q_state = jnp.where(iota_out == 1, kq_dot, 0.0).sum(
+                axis=1, keepdims=True
+            )
+            v_updated = k_state * gating_curr
+            v_diff = v_curr - v_updated
+            v_new = beta_curr * v_diff
+            state_new = k_curr_t * v_new
+            state = state * gating_curr + state_new
+            qk_dot = jnp.sum(q_curr * k_curr, axis=2, keepdims=True)
+            out = (q_state * gating_curr + qk_dot * v_new).astype(cfgs.dtypes.compute)
+        else:
+            # [num_v_heads, kq_head_dim, v_head_dim]
+            state_updated = state * gating_curr
 
-        # [num_v_heads, 1, v_head_dim]
-        v_updated = jax.lax.dot(
-            k_curr,
-            state_updated,
-            dimension_numbers=(((2,), (1,)), ((0,), (0,))),
-            preferred_element_type=jnp.float32,
-        ).astype(cfgs.dtypes.compute)
+            # [num_v_heads, 1, v_head_dim]
+            v_updated = jax.lax.dot(
+                k_curr,
+                state_updated,
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            ).astype(cfgs.dtypes.compute)
 
-        # [num_v_heads, 1, v_head_dim]
-        v_diff = v_curr - v_updated
-        v_new = beta_curr * v_diff
+            # [num_v_heads, 1, v_head_dim]
+            v_diff = v_curr - v_updated
+            v_new = beta_curr * v_diff
 
-        # [num_v_heads, kq_head_dim, v_head_dim]
-        # NOTE: Multiplication with k_curr_t needs to be deferred as much as
-        # possible as it expands the dimension size by kq_head_dim.
-        state_new = k_curr_t * v_new
-        # [num_v_heads, kq_head_dim, v_head_dim]
-        state = state_updated + state_new
+            # [num_v_heads, kq_head_dim, v_head_dim]
+            # NOTE: Multiplication with k_curr_t needs to be deferred as much as
+            # possible as it expands the dimension size by kq_head_dim.
+            state_new = k_curr_t * v_new
+            # [num_v_heads, kq_head_dim, v_head_dim]
+            state = state_updated + state_new
 
-        # [num_v_heads, 1, v_head_dim]
-        out = jax.lax.dot(
-            q_curr,
-            state,
-            dimension_numbers=(((2,), (1,)), ((0,), (0,))),
-            preferred_element_type=jnp.float32,
-        ).astype(cfgs.dtypes.compute)
+            # [num_v_heads, 1, v_head_dim]
+            out = jax.lax.dot(
+                q_curr,
+                state,
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            ).astype(cfgs.dtypes.compute)
 
         out_list.append(out[:, 0, :])
         # NOTE: Rows past real_sizes are masked out by the caller, so the state
@@ -420,7 +451,6 @@ def recurrent_gdn(
     real_sizes repeat the last valid state; they are never written back to
     HBM.
     """
-
     mask_dtype = get_mask_dtype(cfg.dtypes.compute)
     iota = jax.lax.broadcasted_iota(
         mask_dtype, (cfg.seq_tile_size, 1, cfg.chunk_size, 1, 1), 2

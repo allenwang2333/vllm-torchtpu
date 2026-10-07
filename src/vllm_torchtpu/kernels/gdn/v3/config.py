@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration dataclasses and hardware tiling constants for Gated DeltaNet (GDN) v3.
+"""
+
 import dataclasses
 import enum
 from typing import Any
@@ -74,6 +77,18 @@ class StateRegion:
     # where full-width states interleave Q and K row-pairs per tap so that
     # one whole pool token holds one head-pair's Q and K rows.
     rows_perm: tuple[int, ...] | None = None
+    pack: int = 1
+    block_row0: int = 0
+
+    def __post_init__(self):
+        if self.pack not in (1, 2, 4, 8):
+            raise ValueError(f"unsupported state pack factor: {self.pack}")
+        if self.pack != 1 and self.rows_perm is not None:
+            raise ValueError(
+                "a packed region's rows_perm would permute packed rows, not state rows"
+            )
+        if self.block_row0 and self.nblocks != 1:
+            raise ValueError("a co-located region spans one block")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,6 +106,7 @@ class StateSourcePlan:
     conv: StateRegion
     recurrent: StateRegion
     whole_block_dma: bool = False
+    scale: StateRegion | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -167,12 +183,20 @@ class GDNConfig:
         moves work from MXU to XLU. More value heads already means more
         XLU work, hence the smaller blocks there.
         """
-        # TODO(alynie): create a better heuristic to tune this value.
-        if self.num_v_heads == 64:
+        # Within-block forward substitution issues head_groups * B / 2 broadcasts
+        # per token. At 1 head group (<= 8 heads), B = 16 is optimal.
+        # - GDN issues O(1 / B) between-block solver matmuls per token, so scale
+        #   B inversely with head_groups (head_groups * B <= 16).
+        # - KDA also tiles Aqk and L into O(1 / B^2) sub-block matmuls per token,
+        #   so scale B^2 inversely with head_groups (head_groups * B**2 <= 16**2).
+        head_groups = pl.cdiv(self.num_v_heads, 8)
+        if self.is_kda:
+            for b in (16, 8, 4):
+                if head_groups * b * b <= 256:
+                    return b
             return 2
-        if self.num_v_heads == 32:
-            return 8
-        return 16
+        # GDN: between-block updates scale as 1 / B.
+        return max(2, min(16, 16 // head_groups))
 
     @property
     def use_recurrent(self) -> bool:

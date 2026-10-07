@@ -11,9 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Bridge the torch gdn_attention_core op for gated deltanet attention TPU impl
-
+"""Core layer implementation for Qwen3.5 Gated DeltaNet (GDN) linear attention on TPU.
 """
 
 import functools
@@ -28,6 +26,7 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import (
     derive_pooled_gdn_state_layout,
+    pooled_gdn_conv_and_scale_state_bytes,
     pooled_gdn_conv_state_bytes,
     pooled_gdn_ssm_state_bytes,
 )
@@ -818,8 +817,10 @@ def _build_v3_pool_state_plan(
             head_v_dim=d_v,
             dtype=jnp.dtype(recurrent_state_dtype),
         ),
-        conv_bytes=pooled_gdn_conv_state_bytes(
-            kernel_size=kernel_size, conv_dim=conv_dim
+        conv_bytes=pooled_gdn_conv_and_scale_state_bytes(
+            kernel_size=kernel_size,
+            conv_dim=conv_dim,
+            ssm_dtype=jnp.dtype(recurrent_state_dtype),
         ),
         token_bytes=tok_bytes,
     )

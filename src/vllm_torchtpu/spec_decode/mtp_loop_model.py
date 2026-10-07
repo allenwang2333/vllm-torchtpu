@@ -1,18 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A second compiled program for an MTP draft's IndexShare loop steps.
-
-vLLM compiles a model once and then drops the guards that would recompile it
-(``TorchCompileWithNoGuardsWrapper``), so anything the forward decides from a
-plain Python value is fixed by the first trace. A DSA MTP layer's attention
-decides from ``skip_topk`` whether to run its indexer or reuse the top-k table,
-and IndexShare needs both: the indexer at draft step 0, the table at steps 1+.
-One compiled program cannot do both, so steps 1+ run this one: the same draft
-forward over the same weights, KV caches and top-k table, first traced while
-``skip_topk`` is True.
-
-This lives outside eagle3.py because that module uses postponed annotations,
-which ``support_torch_compile`` cannot read. The dims are spelled out below
-anyway, so nothing here depends on annotation style.
+"""Multi-step MTP draft model wrapper for compiled single-graph speculative decoding.
 """
 
 import torch
@@ -71,3 +58,23 @@ class MtpLoopStepModel(nn.Module):
             inputs_embeds,
             spec_step_idx,
         )
+
+
+def build_mtp_loop_step_model(
+    *,
+    vllm_config: VllmConfig,
+    prefix: str,
+    mtp: nn.Module,
+    dynamic_arg_dims: dict,
+) -> nn.Module:
+    """Compile a separate loop-step program with the draft's own dynamic dims
+    (e.g. Qwen3.5 marks `positions` dim -1 for MRoPE, DeepSeek marks dim 0)."""
+    cls = support_torch_compile(dynamic_arg_dims=dict(dynamic_arg_dims))(
+        type("MtpLoopStepModel", (MtpLoopStepModel,), {})
+    )
+    return cls(
+        vllm_config=vllm_config,
+        prefix=prefix,
+        mtp=mtp,
+    )
+

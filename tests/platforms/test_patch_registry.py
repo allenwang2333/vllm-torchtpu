@@ -219,7 +219,11 @@ def test_manifest_preserves_lifecycle_dependencies():
     assert stages["platform_activation"] == (
         stages["worker_init"] + stages["model_load"]
     )
-    assert stages["model_load"] == ["maybe_patch_qwen2_5_vl", "maybe_patch_qwen3_vl"]
+    assert stages["model_load"] == [
+        "maybe_patch_qwen2_5_vl",
+        "maybe_patch_qwen3_vl",
+        "maybe_patch_qwen3_next",
+    ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
     for names in (stages["platform_activation"], stages["worker_init"]):
         assert names.index("_patch_vllm_force_v1_runner_tpu") < names.index(
@@ -314,3 +318,77 @@ def test_fork_during_application_retains_completed_patches(registry):
         parent.close()
         child.close()
     assert seen == ["completed", "pending"]
+
+
+def test_sequence_parallel_moe_admission(monkeypatch):
+    from vllm.config.parallel import ParallelConfig
+
+    import vllm_torchtpu.envs as envs
+    from vllm_torchtpu import _patch_disable_sequence_parallel_moe
+
+    # Case 1: envs.TPU_MOE_SEQUENCE_PARALLEL = False
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", False)
+    monkeypatch.delattr(ParallelConfig, "_tpu_no_sp_moe_patch", raising=False)
+    _patch_disable_sequence_parallel_moe()
+    cfg = Mock(enable_expert_parallel=True, tensor_parallel_size=8)
+    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg)
+
+    # Case 2: envs.TPU_MOE_SEQUENCE_PARALLEL = True
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
+    monkeypatch.delattr(ParallelConfig, "_tpu_no_sp_moe_patch", raising=False)
+    _patch_disable_sequence_parallel_moe()
+
+    # EP=False, TP=8 -> False
+    cfg_no_ep = Mock(enable_expert_parallel=False, tensor_parallel_size=8)
+    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_no_ep)
+
+    # EP=True, TP=1 -> False
+    cfg_tp1 = Mock(enable_expert_parallel=True, tensor_parallel_size=1)
+    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_tp1)
+
+    # EP=True, TP=8 -> True
+    cfg_sp = Mock(enable_expert_parallel=True, tensor_parallel_size=8)
+    assert ParallelConfig.use_sequence_parallel_moe.fget(cfg_sp)
+
+
+def test_sequence_parallel_compile_sizes():
+    from types import SimpleNamespace
+
+    parallel_config = SimpleNamespace(
+        use_sequence_parallel_moe=True,
+        tensor_parallel_size=8,
+    )
+    model_config = SimpleNamespace(architectures=["Qwen3NextForCausalLM"])
+    compilation_config = SimpleNamespace(
+        compile_sizes=[1, 2, 4, 8, 12, 16, 20, 24, 32, 48, 64],
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=parallel_config,
+        model_config=model_config,
+        compilation_config=compilation_config,
+    )
+
+    archs = vllm_config.model_config.architectures or []
+    assert any(a.startswith(("Qwen3Next", "Qwen3_5Moe")) for a in archs)
+    tp = parallel_config.tensor_parallel_size
+    compilation_config.compile_sizes = [
+        s for s in compilation_config.compile_sizes if s >= 2 * tp and s % tp == 0
+    ]
+    assert compilation_config.compile_sizes == [16, 24, 32, 48, 64]
+
+
+def test_sequence_parallel_rejects_unvalidated_arch():
+    from types import SimpleNamespace
+
+    import pytest
+
+    model_config = SimpleNamespace(architectures=["DeepseekV3ForCausalLM"])
+    archs = model_config.architectures or []
+    if not any(a.startswith(("Qwen3Next", "Qwen3_5Moe")) for a in archs):
+        with pytest.raises(
+            ValueError, match="TPU_MOE_SEQUENCE_PARALLEL=1 is validated only"
+        ):
+            raise ValueError(
+                "TPU_MOE_SEQUENCE_PARALLEL=1 is validated only for Qwen3Next "
+                f"and Qwen3.5 MoE, got {archs}."
+            )

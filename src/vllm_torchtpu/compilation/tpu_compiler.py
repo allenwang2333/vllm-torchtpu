@@ -145,13 +145,24 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TORCH_TPU_MP_RENDEZVOUS_PORT",
     "TPU_LOCAL_RANK_OFFSET",
     "TPU_SHARDED_LOAD_SYNC_EVERY",
+    "TPU_WORKER_NUMA_BIND",
     "VLLM_TORCHTPU_IPC_KEY",
     "VLLM_TPU_DEBUG_PCP_LAYOUT",
     "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
+    # Scheduler prefix-cache hit length / retention only.
+    "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
+    "TPU_HYBRID_RETENTION_MAX_CONVS",
+    "TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS",
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
+    # Host-side PrefixAwareScheduler SRPF and cold-prefill chunk capping knobs.
+    "TPU_SCHED_COLD_CHUNK_CAP",
+    "TPU_SCHED_COLD_MIN_DECODERS",
+    "TPU_SCHED_COLD_THRESHOLD",
+    "TPU_SCHED_SRPF_RUNNING",
+    "TPU_MTP_STEP0_POST_ATTN_GATHER",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -170,6 +181,12 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/cp_attention.py",
     "vllm_torchtpu/layers/adapter/custom_ops",
     "vllm_torchtpu/layers/adapter/fused_moe.py",
+    # Small fused-kernel bridges and the batched RPA decode settings, behind
+    # torch custom-op boundaries.
+    "vllm_torchtpu/layers/adapter/batched_rpa_decode.py",
+    "vllm_torchtpu/layers/adapter/fused_qk_norm_rope.py",
+    "vllm_torchtpu/layers/adapter/gated_norm_quant_op.py",
+    "vllm_torchtpu/layers/adapter/small_all_reduce_op.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
     # torch custom-op boundary Dynamo cannot see through, and the kernel they
     # export is chosen from their source, so an edit here has to invalidate
@@ -193,6 +210,11 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+    "vllm_torchtpu/models/vllm/qwen3_next_patch.py",
+    # Registers the pallas::*_fused_max jax ops (behind a torch custom-op
+    # boundary) that get_top_tokens runs inside the AOT-cached fused MTP
+    # draft loop (spec_decode/mtp_fused_loop.py).
+    "vllm_torchtpu/runner/greedy_top_tokens.py",
 )
 
 
@@ -376,6 +398,14 @@ class TpuCompilerAdaptor(CompilerInterface):
     def __init__(self):
         self.cache_dir: str | None = None
         self._disable_cache = False
+        try:
+            from vllm_torchtpu.core.eagle_block_drop import (
+                patch_offload_without_eagle_groups,
+            )
+
+            patch_offload_without_eagle_groups()
+        except Exception:
+            pass
 
     def initialize_cache(
         self, cache_dir: str, disable_cache: bool = False, prefix: str = ""

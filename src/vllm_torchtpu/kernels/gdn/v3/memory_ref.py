@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Typed HBM and VMEM memory reference descriptors for GDN v3 Pallas kernels.
+"""
+
 import dataclasses
 import functools
+import os
 from typing import Any
 
 import jax
@@ -22,6 +26,15 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.v3 import config
+
+
+def _exact_state_wait() -> bool:
+    return os.environ.get("TPU_GDN_EXACT_STATE_WAIT", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
 
 @jax.tree_util.register_dataclass
@@ -315,6 +328,18 @@ class StateBufferedRef(BaseBufferedRef):
         vmem_ref = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
+        if _exact_state_wait():
+            for idx in range(self.cfg.seq_tile_size):
+                is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
+                s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
+                has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
+                should_read = jnp.logical_and(is_first_tile, has_initial_state)
+                ref = vmem_ref.at[
+                    idx, pl.ds(0, jnp.where(should_read, self._unit(), 0))
+                ]
+                pltpu.make_async_copy(ref, ref, sem).wait()
+            return
+
         dma_size = 0
         for idx in range(self.cfg.seq_tile_size):
             is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
@@ -362,6 +387,16 @@ class StateBufferedRef(BaseBufferedRef):
         sem = self.sem_sends.at[slot]
         vmem_ref = self.window_ref.at[slot]
         p_id = grid_indices[0]
+
+        if _exact_state_wait():
+            for idx in range(self.cfg.seq_tile_size):
+                is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
+                r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+                num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
+                n = jnp.where(is_last_tile, num_ckpts * self._unit(), 0)
+                ref = vmem_ref.at[idx, pl.ds(0, n)]
+                pltpu.make_async_copy(ref, ref, sem).wait()
+            return
 
         dma_size = 0
         for idx in range(self.cfg.seq_tile_size):
@@ -530,6 +565,18 @@ class ExternalStateBufferedRef(StateBufferedRef):
         vmem_ref = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
+        if _exact_state_wait():
+            # One wait per issued copy, mirroring copy_in's descriptors.
+            for idx in range(self.cfg.seq_tile_size):
+                is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
+                s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
+                has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
+                should_read = jnp.logical_and(is_first_tile, has_initial_state)
+                nblocks = jnp.where(should_read, self.region.nblocks, 0)
+                ref = vmem_ref.at[idx, 0, pl.ds(0, nblocks)]
+                pltpu.make_async_copy(ref, ref, sem).wait()
+            return
+
         dma_size = 0
         for idx in range(self.cfg.seq_tile_size):
             is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
@@ -553,6 +600,29 @@ class ExternalStateBufferedRef(StateBufferedRef):
         sem = self.sem_sends.at[slot]
         vmem_ref = self.window_ref.at[slot]
         p_id = grid_indices[0]
+
+        if _exact_state_wait():
+            # One wait per issued copy, mirroring copy_out's descriptors. The
+            # aggregate wait below covers up to seq_tile_size * window_size
+            # regions with a single descriptor sliced past the window row; a
+            # W=4 verify window at T>=2 slices past axis 1 (window_size=4) and
+            # leaves nondeterministic checkpoints on reused double-buffered
+            # tiles.
+            for idx in range(self.cfg.seq_tile_size):
+                is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
+                r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+                num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
+                if self.compact_output_ref is not None:
+                    n = jnp.where(is_last_tile, num_ckpts * self._unit(), 0)
+                    ref = vmem_ref.at[idx, 0, pl.ds(0, n)]
+                    pltpu.make_async_copy(ref, ref, sem).wait()
+                    continue
+                for t in range(self.cfg.window_size):
+                    should_write = jnp.logical_and(is_last_tile, t < num_ckpts)
+                    nblocks = jnp.where(should_write, self.region.nblocks, 0)
+                    ref = vmem_ref.at[idx, t, pl.ds(0, nblocks)]
+                    pltpu.make_async_copy(ref, ref, sem).wait()
+            return
 
         dma_size = 0
         for idx in range(self.cfg.seq_tile_size):

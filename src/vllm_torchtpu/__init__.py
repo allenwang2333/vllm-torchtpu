@@ -7,6 +7,15 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+import os as _qx_os  # noqa: E402
+
+_qx_fast = _qx_os.environ.get("QX_FAST_COMPILED_CALL", "1") == "1"
+_qx_drop_gs = _qx_os.environ.get("QX_TPU_DROP_GLOBAL_STATE_GUARD", "1") == "1"
+if _qx_fast or _qx_drop_gs:
+    from vllm_torchtpu._qx_fastcall import install as _qx_install_fastcall
+
+    _qx_install_fastcall(fast=_qx_fast, drop_global_state=_qx_drop_gs)
+
 
 def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
     """Backport hybrid KV cache load failure recovery from vLLM #50388.
@@ -278,6 +287,9 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
             return original.fget(self)
         try:
             from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+            from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+                fused_moe_ep_supported as fused_moe_ep_v3_supported,
+            )
         except ImportError:
             return original.fget(self)
         # Asked of the layer's own quant method, because arming is per layer:
@@ -290,6 +302,7 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
         owner = getattr(self, "_quant_method", None)
         return (
             fused_moe_ep_supported(owner)
+            or fused_moe_ep_v3_supported(owner)
             or adaptive_fused_moe_supported(owner)
             or original.fget(self)
         )
@@ -353,9 +366,16 @@ def _patch_moe_explicit_pcp_collectives() -> None:
                 adaptive_fused_moe_supported,
             )
             from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+            from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+                fused_moe_ep_supported as fused_moe_ep_v3_supported,
+            )
 
             owner = getattr(self, "_quant_method", None)
-            return fused_moe_ep_supported(owner) or adaptive_fused_moe_supported(owner)
+            return (
+                fused_moe_ep_supported(owner)
+                or fused_moe_ep_v3_supported(owner)
+                or adaptive_fused_moe_supported(owner)
+            )
 
         def maybe_dispatch(self, hidden_states, router_logits):
             if fused_ep_owns_pcp_collectives(self):
@@ -566,19 +586,30 @@ def _patch_vllm_compile_all_ranges() -> None:
 
 
 def _patch_disable_sequence_parallel_moe() -> None:
-    """Disable vLLM's sequence-parallel MoE on TPU.
-
-    The sequence-parallel path is tied to vLLM all2all MoE backends. The TPU
-    communicator handles EP with unsplit token buffers.
-    """
+    """Gate vLLM's sequence-parallel MoE on TPU."""
     from vllm.config.parallel import ParallelConfig
 
     if getattr(ParallelConfig, "_tpu_no_sp_moe_patch", False):
         return
 
-    ParallelConfig.use_sequence_parallel_moe = property(lambda self: False)
+    if envs.TPU_MOE_SEQUENCE_PARALLEL or envs.TPU_SP_MIN_ROWS > 0:
+        ParallelConfig.use_sequence_parallel_moe = property(
+            lambda self: bool(
+                not getattr(self, "_tpu_disable_sp_moe", False)
+                and self.enable_expert_parallel
+                and self.tensor_parallel_size > 1
+                and self.data_parallel_size == 1
+            )
+        )
+    else:
+        ParallelConfig.use_sequence_parallel_moe = property(lambda self: False)
     ParallelConfig._tpu_no_sp_moe_patch = True
-    logger.info("Applied TPU patch: disable sequence-parallel MoE.")
+    logger.info(
+        "Applied TPU patch: sequence-parallel MoE %s.",
+        f"admitted (min_rows={envs.TPU_SP_MIN_ROWS})"
+        if (envs.TPU_MOE_SEQUENCE_PARALLEL or envs.TPU_SP_MIN_ROWS > 0)
+        else "disabled",
+    )
 
 
 def _patch_multiproc_worker_global_rank_env() -> None:
@@ -870,14 +901,14 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         pcp = parallel_config.prefill_context_parallel_size
         groups = kv_cache_config.kv_cache_groups
 
-        if len(groups) <= 1 or dcp != 1 or pcp == 1:
+        if len(groups) <= 1 or (dcp == 1 and pcp == 1):
             return original_resolve(kv_cache_config, vllm_config)
 
         if not _is_attention_mamba_hybrid(groups):
             return original_resolve(kv_cache_config, vllm_config)
 
         group_block_sizes = [
-            _effective_block_size(group.kv_cache_spec, pcp) for group in groups
+            _effective_block_size(group.kv_cache_spec, pcp, dcp) for group in groups
         ]
         scheduler_block_size = math.lcm(*group_block_sizes)
 
@@ -891,16 +922,17 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             if any(bs % hash_block_size != 0 for bs in group_block_sizes):
                 raise ValueError(
                     f"Invalid prefix_match_unit={hash_block_size}; all logical "
-                    "PCP KV cache group block sizes must be divisible by "
+                    "PCP/DCP KV cache group block sizes must be divisible by "
                     "prefix_match_unit. Got "
                     f"block sizes={group_block_sizes}."
                 )
 
         logger.info(
-            "Applied TPU PCP hybrid KV cache block-size resolution: "
-            "pcp=%d group_effective_block_sizes=%s scheduler_block_size=%d "
+            "Applied TPU PCP/DCP hybrid KV cache block-size resolution: "
+            "pcp=%d dcp=%d group_effective_block_sizes=%s scheduler_block_size=%d "
             "hash_block_size=%d",
             pcp,
+            dcp,
             group_block_sizes,
             scheduler_block_size,
             hash_block_size,
@@ -1511,8 +1543,14 @@ def _patch_vllm_same_step_prefix_hits() -> None:
         return
 
     original_insert_block_hash = BlockPool._insert_block_hash
+    original_remove_cached_block_hashes = BlockPool._remove_cached_block_hashes
+    original_reset_prefix_cache = BlockPool.reset_prefix_cache
     original_get_cached_block = BlockPool.get_cached_block
     original_schedule = Scheduler.schedule
+
+    _GROUP_ID_SUFFIX = tuple(
+        i.to_bytes(4, "big", signed=False) for i in range(64)
+    )
 
     def unwritten_block_ids(pool) -> set[int]:
         return pool.__dict__.setdefault("_tpu_unwritten_block_ids", set())
@@ -1522,10 +1560,72 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     @functools.wraps(original_insert_block_hash)
     def _insert_block_hash(self, block_hash_with_group_id, block, num_tokens):
         original_insert_block_hash(self, block_hash_with_group_id, block, num_tokens)
+        d = self.__dict__
+        d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
         unwritten_block_ids(self).add(block.block_id)
+
+    @functools.wraps(original_remove_cached_block_hashes)
+    def _remove_cached_block_hashes(self, *args, **kwargs):
+        evicted_hashes = original_remove_cached_block_hashes(
+            self, *args, **kwargs
+        )
+        if evicted_hashes:
+            d = self.__dict__
+            d["_tpu_prefix_cache_epoch"] = (
+                d.get("_tpu_prefix_cache_epoch", 0) + 1
+            )
+        return evicted_hashes
+
+    @functools.wraps(original_reset_prefix_cache)
+    def reset_prefix_cache(self):
+        res = original_reset_prefix_cache(self)
+        d = self.__dict__
+        d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
+        return res
 
     @functools.wraps(original_get_cached_block)
     def get_cached_block(self, block_hash, kv_cache_group_ids):
+        raw_cache = getattr(self.cached_block_hash_to_block, "_cache", None)
+        if isinstance(raw_cache, dict):
+            unwritten = self.__dict__.get("_tpu_unwritten_block_ids")
+            if len(kv_cache_group_ids) == 1:
+                gid = kv_cache_group_ids[0]
+                key = block_hash + (
+                    _GROUP_ID_SUFFIX[gid]
+                    if 0 <= gid < 64
+                    else gid.to_bytes(4, "big", signed=False)
+                )
+                group_blocks = raw_cache.get(key)
+                if group_blocks is None:
+                    return None
+                first_block = (
+                    next(iter(group_blocks.values()))
+                    if isinstance(group_blocks, dict)
+                    else group_blocks
+                )
+                if unwritten and first_block.block_id in unwritten:
+                    return None
+                return [first_block]
+            cached_blocks = []
+            for gid in kv_cache_group_ids:
+                key = block_hash + (
+                    _GROUP_ID_SUFFIX[gid]
+                    if 0 <= gid < 64
+                    else gid.to_bytes(4, "big", signed=False)
+                )
+                group_blocks = raw_cache.get(key)
+                if group_blocks is None:
+                    return None
+                first_block = (
+                    next(iter(group_blocks.values()))
+                    if isinstance(group_blocks, dict)
+                    else group_blocks
+                )
+                if unwritten and first_block.block_id in unwritten:
+                    return None
+                cached_blocks.append(first_block)
+            return cached_blocks
+
         blocks = original_get_cached_block(self, block_hash, kv_cache_group_ids)
         unwritten = self.__dict__.get("_tpu_unwritten_block_ids")
         if (
@@ -1538,12 +1638,27 @@ def _patch_vllm_same_step_prefix_hits() -> None:
 
     @functools.wraps(original_schedule)
     def schedule(self, *args, **kwargs):
-        unwritten_block_ids(self.kv_cache_manager.block_pool).clear()
+        pool = self.kv_cache_manager.block_pool
+        unwritten = unwritten_block_ids(pool)
+        if unwritten:
+            unwritten.clear()
+            d = pool.__dict__
+            d["_tpu_prefix_cache_epoch"] = (
+                d.get("_tpu_prefix_cache_epoch", 0) + 1
+            )
         return original_schedule(self, *args, **kwargs)
 
-    for wrapper in (_insert_block_hash, get_cached_block, schedule):
+    for wrapper in (
+        _insert_block_hash,
+        _remove_cached_block_hashes,
+        reset_prefix_cache,
+        get_cached_block,
+        schedule,
+    ):
         wrapper._tpu_same_step_prefix_hit_patch = True
     BlockPool._insert_block_hash = _insert_block_hash
+    BlockPool._remove_cached_block_hashes = _remove_cached_block_hashes
+    BlockPool.reset_prefix_cache = reset_prefix_cache
     BlockPool.get_cached_block = get_cached_block
     Scheduler.schedule = schedule
     logger.info(

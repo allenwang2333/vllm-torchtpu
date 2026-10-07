@@ -82,6 +82,10 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
+    Patch(
+        "vllm_torchtpu.core.eagle_block_drop:patch_disable_eagle_block_drop",
+        _ENGINE,
+    ),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
@@ -102,6 +106,7 @@ PATCHES = (
         _ACTIVE,
     ),
     Patch("vllm_torchtpu.model_loader_patches:patch_moe_expert_write_staging", _ACTIVE),
+    Patch("vllm_torchtpu.expert_placement:install_model_patches", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_vocab_parallel_embedding", _ACTIVE),
     Patch(
         "vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
@@ -109,6 +114,11 @@ PATCHES = (
         refresh="vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
     ),
     Patch("vllm_torchtpu.layers.adapter.vision_attention", _ACTIVE),
+    # Attention layers.
+    Patch(
+        "vllm_torchtpu.layers.adapter.fused_qk_norm_rope:install_qk_norm_rope_patch",
+        _ACTIVE,
+    ),
     # Platform runtime configuration.
     Patch(
         "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode", _ACTIVE
@@ -131,6 +141,10 @@ PATCHES = (
         "vllm_torchtpu.models.vllm.qwen3_vl_patch:maybe_patch_qwen3_vl",
         ("platform_activation", "model_load"),
         model_config=True,
+    ),
+    Patch(
+        "vllm_torchtpu.models.vllm.qwen3_next_patch:maybe_patch_qwen3_next",
+        ("platform_activation", "model_load"),
     ),
 )
 

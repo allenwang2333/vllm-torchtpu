@@ -80,6 +80,7 @@ def _make_self(
     ns = SimpleNamespace(
         _mamba_copy_plan=plan,
         _mamba_state_pos=dict(state_pos or {}),
+        _mamba_offset_seeded=set(state_pos or ()),
         _mamba_state_block_size=state_block_size,
         _pool_block_split=split,
         # Merged block-major pool layout (`None` for per-region pools); row seed
@@ -517,6 +518,29 @@ def test_spec_crossing_offset_past_the_row_falls_back_to_the_state_block():
     fake, _ = _spec_self(2, window=3, row=(10, 11))
     _collect(fake, _sched({"a": 1}))
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(10, 11)]
+
+
+def test_spec_crossing_uniform_candidates_skips_device_gather_and_resets_offset():
+    # Prefix-cache resume (no prior state_pos) with ckpt_window=3 builds
+    # uniform candidate rows [src, src, src]; the CPU fast path must skip
+    # _spec_seed_sources while still resetting the destination read offset.
+    read_offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    read_offsets[11] = 2
+    fake, _ = _make_self(
+        ["a"],
+        [2 * BLOCK_SIZE],
+        [[[9, 10, 11, 12]]],
+        state_pos={},
+        ckpt_window=3,
+        read_offsets=read_offsets,
+    )
+    called = []
+    fake._spec_seed_sources = lambda *a, **k: called.append(a)
+    _collect(fake, _sched({"a": BLOCK_SIZE}))
+    assert called == []
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(10, 11)]
+    assert int(fake.mamba_slot_read_offsets[11]) == 0
+
 
 
 @pytest.mark.skipif(

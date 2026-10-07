@@ -11,54 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Controller-driven KV cache offloading via Raiden `KVCacheStore`.
-
-This module provides the scheduler-side offloading manager and worker
-integration for Raiden-backed KV cache offloading. All directory tracking
-(hash -> host slot), LRU eviction, pinning, and DMA transfers are managed
-by Raiden's C++ `KVCacheStore`.
-
-Workers register device KV buffers once with the controller (`KVCacheManager`)
-and act as passive DMA endpoints for `save`/`load` operations initiated by
-the scheduler.
-
-Key components and mechanisms:
-
-- Block granularity and coalescing: One store entry per physical kernel block.
-  A logical device block maps to `device_block_size_factor` store entries with derived
-  sub-hashes `OffloadKey ‖ sub_idx`. Contiguous device kernel blocks are fused
-  by Raiden into single hardware DMAs.
-
-- Model and parallelism support: Supports dense full-attention (single KV group)
-  and hybrid attention+Mamba models on the TPU unified block pool. Supports
-  Prefill Context Parallelism (PCP) across ranks and Data Parallelism (DP)
-  with independent per-engine controller ports and job names.
-
-- Two-phase admission: `insert` atomically pins the whole batch, then a
-  post-admission `lookup` (stable under the job's own pins) picks out the
-  entries this admission inserted, and issues a DMA save for exactly those.
-
-- Pin lifecycle: the store hands out a pin with the answer — `lookup` pins what
-  it found, `insert` pins what it admitted — and a successful `save` or local
-  `load` spends that pin. Only the pins no transfer consumed are given back by
-  hand, which is what a job's terminal cleanup does. Bytes read from a peer are
-  never pinned here and never released.
-
-- Directory as the single source of truth: `prepare_store` probes Raiden per
-  key to decide what to offer, so a key displaced from the LRU is re-offered
-  on its next appearance. The connector emits no eviction events, and
-  configurations that expect KV cache events are refused at startup.
-
-- Fault tolerance and recovery: Failed saves retry once. Timed-out drains
-  poison in-flight jobs to prevent committing torn bytes from reused blocks.
-
-- Cross-instance KV sharing: Saved blocks are published to the global registry
-  for cluster-wide reuse. Lookups resolve `REMOTE` hits and issue `read_remote`
-  straight into HBM. A peer read borrows nothing from the local store: it
-  reserves no capacity, keeps no host copy, and leaves no directory entry, so
-  the same key is fetched again on every miss until a local store admits it.
-
-See `raiden_connector.py` for connector wiring, device fencing, and echo channels.
+"""Host DRAM block store and asynchronous DMA worker pool for KV/hybrid state offloading.
 """
 
 from __future__ import annotations
@@ -135,6 +88,35 @@ def has_multi_shapes_kv_caches(vllm_config: VllmConfig) -> bool:
         "DeepseekV4ForCausalLM",
         "GlmMoeDsaForCausalLM",
     )
+
+
+def _default_worker_registration_timeout() -> int:
+    """Give workers as long to register with the Raiden controller as vLLM
+    gives the engine to come up.
+
+    Workers register only after their model load and graph precompile, which
+    takes far longer than Raiden's 120 s default on a cold or partially warm
+    compile cache (new offload graph variants): the controller then fails with
+    "timed out waiting for workers: expected 8 within 120s". An explicit
+    RAIDEN_EXPECTED_WORKERS_TIMEOUT_S is kept; otherwise it is set to
+    VLLM_ENGINE_READY_TIMEOUT_S (recipes set 7200), else 3600 s. The C++
+    controller reads it with getenv at Init, after this runs.
+    """
+    current = os.environ.get("RAIDEN_EXPECTED_WORKERS_TIMEOUT_S", "").strip()
+    if current:
+        return int(float(current))
+    ready = os.environ.get("VLLM_ENGINE_READY_TIMEOUT_S", "").strip()
+    try:
+        timeout = max(int(float(ready)), 3600) if ready else 3600
+    except ValueError:
+        timeout = 3600
+    os.environ["RAIDEN_EXPECTED_WORKERS_TIMEOUT_S"] = str(timeout)
+    logger.info(
+        "TPURaidenOffloadingConnector: RAIDEN_EXPECTED_WORKERS_TIMEOUT_S=%d "
+        "(workers register after model load and precompile).",
+        timeout,
+    )
+    return timeout
 
 
 class RaidenLoadStoreSpec(LoadStoreSpec):
@@ -278,6 +260,7 @@ class RaidenOffloadingManager(OffloadingManager):
         if store is None:
             from tpu_sync.api.torch.kv_cache_manager import _torch_impl
 
+            _default_worker_registration_timeout()
             store_types = _torch_impl()
             logger.info(
                 "TPURaidenOffloadingConnector: blocking KVCacheStore construction "
@@ -299,7 +282,8 @@ class RaidenOffloadingManager(OffloadingManager):
                 kv_pool_group=kv_pool_group,
                 # Construction blocks in RaidenController::Init() until every
                 # rank registers, and raises on timeout
-                # (RAIDEN_EXPECTED_WORKERS_TIMEOUT_S, default 120s).
+                # (RAIDEN_EXPECTED_WORKERS_TIMEOUT_S; raised from Raiden's 120 s
+                # by _default_worker_registration_timeout).
                 expected_worker_count=world_size,
             )
             logger.info(

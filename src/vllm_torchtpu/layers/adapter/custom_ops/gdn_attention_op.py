@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""PyTorch custom operator registration and state management for Qwen3.5 GDN layers.
+
+Coordinates conv1d and recurrent state pool updates, speculative token state
+gathering, and dispatch to the GDN v3 Pallas kernel suite.
+"""
+
 import dataclasses
 import functools
 import itertools
@@ -47,12 +53,14 @@ from vllm_torchtpu.distributed.pcp import (
 )
 from vllm_torchtpu.gdn_pool_layout import (
     DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
+    DEFAULT_POOLED_GDN_SSM_STATE_DTYPE,
     unified_kv_layout_enabled_for_architecture,
 )
 from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
 )
+from vllm_torchtpu.layers.adapter import gated_norm_quant_op
 from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
     GdnInterleavedColumnParallelLinear,
@@ -81,9 +89,11 @@ def _to_jax_ssm_state_dtype(dtype: torch.dtype) -> jnp.dtype:
         return jnp.dtype(jnp.float32)
     if dtype == torch.bfloat16:
         return jnp.dtype(jnp.bfloat16)
+    if dtype == torch.float8_e4m3fn:
+        return jnp.dtype(jnp.float8_e4m3fn)
     raise ValueError(
         f"Unsupported mamba_ssm_cache_dtype for TPU GDN: "
-        f"{dtype}; expected float32 or bfloat16"
+        f"{dtype}; expected float32, bfloat16, or float8_e4m3fn"
     )
 
 
@@ -352,6 +362,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # Class-level defaults support test/mock instances constructed without `__init__`.
     _bm_kernel: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
+    # Set by `gated_norm_quant_op.install` under TPU_GDN_FUSED_NORM_QUANT.
+    fused_norm_quant: bool = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -488,6 +500,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             conv_state_dtype = getattr(
                 torch, DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.split(".")[1]
             )
+            if getattr(
+                self.cache_config, "mamba_ssm_cache_dtype", "auto"
+            ) in ("auto", "float32", "fp8", "float8_e4m3fn"):
+                temporal_state_dtype = getattr(
+                    torch, DEFAULT_POOLED_GDN_SSM_STATE_DTYPE.split(".")[1]
+                )
         else:
             # TODO: Support bf16 conv state.
             # Per-layer cache: unlike the pool, the declared dtype IS the
@@ -1055,6 +1073,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         core_attn_out = core_attn_out.view(
             num_tokens, local_num_v_heads, self.head_v_dim
         )
+        if self.fused_norm_quant:
+            return gated_norm_quant_op.output_projection(self, core_attn_out, z)
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output, _ = self.out_proj(core_attn_out)
@@ -1075,8 +1095,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         qkvz_weight, qkvz_weight_scale = self._require_pcp_projection_parameters()
         ba, _ = self.in_proj_ba(hidden_states)
         b, a = ba.chunk(2, dim=-1)
-        b = b.contiguous()
-        a = a.contiguous()
 
         state_indices = attn_metadata.mamba_state_indices
         assert state_indices is not None
@@ -1105,6 +1123,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
         kv_cache = self.kv_cache
@@ -1116,20 +1135,37 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 attn_metadata,
             )
 
+        def _project(layer, x, pq):
+            if pq is None:
+                out, _ = layer(x)
+                return out
+            apply_pq = getattr(layer.quant_method, "apply_prequant", None)
+            bias = (
+                None
+                if getattr(layer, "skip_bias_add", False)
+                else getattr(layer, "bias", None)
+            )
+            if apply_pq is None:
+                if bias is None:
+                    out, _ = layer(pq[0].to(torch.bfloat16))
+                    return (out.to(torch.float32) * pq[1]).to(out.dtype)
+                rows = (pq[0].to(torch.float32) * pq[1]).to(torch.bfloat16)
+                out, _ = layer(rows)
+                return out
+            return apply_pq(layer, pq[0], pq[1], bias)
+
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
         if hasattr(self, "in_proj_qkv"):
-            mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
-            z, _ = self.in_proj_z(hidden_states)
+            mixed_qkv = _project(self.in_proj_qkv, hidden_states, prequant)
+            ba = _project(self.in_proj_ba, hidden_states, prequant)
+            z = _project(self.in_proj_z, hidden_states, prequant)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
-            b = b.contiguous()
-            a = a.contiguous()
         else:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
+            mixed_qkvz = _project(self.in_proj_qkvz, hidden_states, prequant)
+            ba = _project(self.in_proj_ba, hidden_states, prequant)
 
             # Every checkpoint loader produces [q, k, v, z] and [b, a].
             qkv_size = self.tp_head_geometry.local_conv_dim(
@@ -1139,8 +1175,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
-            b = b.contiguous()
-            a = a.contiguous()
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)

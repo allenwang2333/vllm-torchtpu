@@ -324,3 +324,31 @@ def test_spec_decode_metadata_cache_miss_on_changed_inputs(device):
             f"{f} differs from uncached build"
         )
     assert np.array_equal(m2.draft_lengths_cpu, nd2)
+
+
+def test_spec_decode_metadata_skip_draft_token_ids_and_lru_cache(device):
+    input_ids = torch.arange(1, 21, dtype=torch.int32)
+    manager = _fresh_metadata_manager(device, input_ids)
+    nd1 = np.array([3, 2], dtype=np.int32)
+    cu1 = np.array([4, 7], dtype=np.int32)
+    nd2 = np.array([2, 2], dtype=np.int32)
+    cu2 = np.array([3, 6], dtype=np.int32)
+
+    m1 = manager.get_spec_decode_metadata(nd1, cu1, 4)
+    m2 = manager.get_spec_decode_metadata(nd2, cu2, 4)
+
+    # Alternating back to (nd1, cu1) with skip_draft_token_ids=True hits
+    # _meta_lru_cache and reuses all 8 device tensors (including draft_token_ids).
+    m1_cached = manager.get_spec_decode_metadata(
+        nd1, cu1, 4, skip_draft_token_ids=True
+    )
+    for f in (
+        "draft_token_ids",
+        "draft_lengths",
+        "target_logits_indices",
+        "bonus_logits_indices",
+        "final_logits_indices",
+        "segment_ids",
+        "group_indices",
+    ):
+        assert getattr(m1_cached, f) is getattr(m1, f), f"{f} not reused from LRU"

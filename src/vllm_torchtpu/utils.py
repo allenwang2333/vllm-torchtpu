@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import ctypes
 import importlib
 import os
 import time
@@ -21,6 +22,102 @@ TPU_SECOND_LAST_MINOR = 8
 
 _megacore = False
 logger = init_logger(__name__)
+
+try:
+    _libc = ctypes.CDLL(None)
+    _memcmp = _libc.memcmp
+    _memcmp.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t)
+    _memcmp.restype = ctypes.c_int
+except Exception:
+    _memcmp = None
+
+
+def _fast_cpu_tensor_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Fast bitwise equality check for contiguous CPU tensors via libc.memcmp.
+
+    `torch.equal` on a [64, 1024] int32 CPU block table takes ~115 us per call
+    due to elementwise dispatcher overhead, whereas `libc.memcmp` takes ~9 us.
+    """
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    if (
+        _memcmp is not None
+        and a.device.type == "cpu"
+        and b.device.type == "cpu"
+        and not a.is_floating_point()
+        and not a.is_complex()
+        and a.is_contiguous()
+        and b.is_contiguous()
+    ):
+        nbytes = a.numel() * a.element_size()
+        if nbytes == 0:
+            return True
+        return _memcmp(a.data_ptr(), b.data_ptr(), nbytes) == 0
+    return torch.equal(a, b)
+
+
+class CachedUpload:
+    """Device copy of a host tensor, re-uploaded only when its contents change.
+
+    A changed upload replaces the device tensor rather than writing into it,
+    so an execution still reading the previous one is unaffected.
+    """
+
+    def __init__(self) -> None:
+        self._host: torch.Tensor | None = None
+        self._device: torch.Tensor | None = None
+
+    def __call__(self, host: torch.Tensor, device: Any) -> torch.Tensor:
+        if (
+            self._device is None
+            or self._host is None
+            or not _fast_cpu_tensor_equal(self._host, host)
+        ):
+            self._device = host.to(device, non_blocking=True)
+            self._host = host.clone()
+        return self._device
+
+
+def _static_shape_args(fn):
+    """Strip dynamo dynamic-dim marks from a compiled region's tensor args.
+
+    vLLM's `@support_torch_compile` marks the model's `input_ids`/`positions`
+    dynamic on every forward (`vllm/compilation/decorators.py:585`), and
+    `torch._dynamo.mark_dynamic` records that by stamping a
+    `_dynamo_dynamic_indices` attribute onto the tensor *object*. The stamp
+    outlives the forward that applied it, and it has strictly higher precedence
+    than `dynamic=False` -- `mark_static` is documented as the lower-precedence
+    of the pair, so it cannot undo it. Hand such a tensor to one of the draft's
+    static regions and dynamo lifts a SymInt into the graph, which torch-tpu
+    rejects outright (`torch_tpu/_internal/compile/_backend.py:_raise_on_symint`
+    -> "TPU backend: does not support dynamic shape").
+
+    A view is a distinct Python object and carries no stamp, so aliasing is
+    enough; it copies nothing. Tensors that were never marked are passed through
+    untouched.
+    """
+
+    def _unmark(a):
+        if isinstance(a, torch.Tensor) and getattr(
+            a, "_dynamo_dynamic_indices", None
+        ):
+            return a[:]
+        return a
+
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if any(
+            isinstance(a, torch.Tensor)
+            and getattr(a, "_dynamo_dynamic_indices", None)
+            for a in args
+        ):
+            args = tuple(_unmark(a) for a in args)
+        if kwargs:
+            kwargs = {k: _unmark(v) for k, v in kwargs.items()}
+            return fn(*args, **kwargs)
+        return fn(*args)
+
+    return wrapper
 
 
 def align_to(unpadded_dim, pad_multiple):
