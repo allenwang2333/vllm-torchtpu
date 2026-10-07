@@ -22,8 +22,18 @@ all-reduce of their sum. The token count is static there, so the branch costs
 nothing at run time; branching in torch instead gives the two sides different
 graph inputs, which vLLM's per-bucket specialization of one traced graph
 refuses (``compilation.shape_variants``).
+
+TEST (``FUSED_MOE_DECODE_PREFILL_IMPL=v3``, EP only): above the cap the
+exported program instead runs fused EP MoE v3 sequence parallel. Each rank
+takes its own T/8 rows of the replicated tokens (padded to a multiple of 8),
+v3 routes, exchanges and combines them over the EP mesh, the TP-sliced shared
+expert is reduce-scattered onto the same rows, and one tiled all-gather
+rebuilds the replicated [T, H] output: one reduce-scatter + one all-gather in
+place of the GMM path's all-reduce. Decode buckets are untouched (replicated
+tokens, in-kernel all-reduce), and the switch is on the static bucket size.
 """
 
+import dataclasses
 import functools
 from typing import Any
 
@@ -113,8 +123,19 @@ def _gmm_layer(
         rhs_quant_dtype=None,
         skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS,
     )
-    # Qwen2MoeMLP.forward: FP8 gate_up / down linears, SiluAndMul, and the
-    # sigmoid of the replicated expert_gate linear.
+    shared = _shared_expert(
+        x, shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_gate_weight
+    )
+    return jax.lax.psum(shared + routed, EP_AXIS_NAME)
+
+
+def _shared_expert(
+    x, shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_gate_weight
+):
+    """This rank's TP slice of the gated shared expert (unreduced).
+
+    Qwen2MoeMLP.forward: FP8 gate_up / down linears, SiluAndMul, and the
+    sigmoid of the replicated expert_gate linear."""
     i_s = shared_w2.shape[0]
     gate_up = _quantized_matmul_jax(x, shared_w1, shared_w1_scale.reshape(-1))
     shared = _quantized_matmul_jax(
@@ -122,11 +143,132 @@ def _gmm_layer(
         shared_w2,
         shared_w2_scale.reshape(-1),
     )
-    shared = (
+    return (
         jax.nn.sigmoid(jnp.dot(x, shared_gate_weight.reshape(-1, 1).astype(x.dtype)))
         * shared
     )
-    return jax.lax.psum(shared + routed, EP_AXIS_NAME)
+
+
+@dataclasses.dataclass(frozen=True)
+class V3Prefill:
+    """Static closure of the v3 sequence-parallel prefill path (hashable)."""
+
+    rank_order: tuple[int, ...]  # ep_rank_order(): EP rank at each mesh index
+    local_experts: int
+    hidden: int
+    inter: int
+    renormalize: bool
+
+
+def _v3_prefill(
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    shared_w1,
+    shared_w1_scale,
+    shared_w2,
+    shared_w2_scale,
+    shared_gate_weight,
+    router_logits,
+    rank,
+    *,
+    mesh,
+    n_ranks,
+    topk,
+    v3: V3Prefill,
+):
+    """Global (outside shard_map) program for one bucket above the cap.
+
+    Operands are the jax_op's global views: x / router_logits are the ranks'
+    replicated [T, ...] rows stacked to [n*T, ...] and sharded on the EP axis;
+    rank is [n, 2] = [[mesh index, first expert]] per rank. Returns [n*T, H]
+    sharded the same way, each rank holding the full reduced [T, H].
+    """
+    from vllm_torchtpu.kernels.fused_moe.v3 import Config, fused_ep_moe
+
+    spec = PartitionSpec(EP_AXIS_NAME)
+    t = x.shape[0] // n_ranks
+    tpad = -(-t // n_ranks) * n_ranks
+    rows = tpad // n_ranks
+    ep, local = len(v3.rank_order), v3.local_experts
+
+    def take(x, logits, rank):
+        # This rank's own rows of the replicated tokens: the mesh index comes
+        # in as data (the torch bridge refuses lax.axis_index).
+        logits = logits.astype(jnp.float32)
+        if tpad != t:
+            x = jnp.pad(x, ((0, tpad - t), (0, 0)))
+            logits = jnp.pad(logits, ((0, tpad - t), (0, 0)))
+        start = rank[0, 0] * rows
+        return (
+            jax.lax.dynamic_slice_in_dim(x, start, rows, 0),
+            jax.lax.dynamic_slice_in_dim(logits, start, rows, 0),
+        )
+
+    xs, gating = jax.shard_map(
+        take,
+        mesh=mesh,
+        in_specs=(spec, spec, spec),
+        out_specs=(spec, spec),
+        check_vma=False,
+    )(x, router_logits, rank)
+    if v3.rank_order != tuple(range(ep)):
+        # The kernel reads expert i*local+j as mesh index i's j-th expert;
+        # vLLM's router columns are in EP-rank order (as fused_moe_ep_v3).
+        gating = gating.reshape(tpad, ep, local)[:, list(v3.rank_order)]
+        gating = gating.reshape(tpad, ep * local)
+    n_experts = w1.shape[0]
+    logger.info("Fused EP MoE v3 (sequence parallel) traced for %d tokens", t)
+    routed = fused_ep_moe(
+        xs,
+        w1,
+        w2,
+        w1_scale.reshape(n_experts, -1),
+        w2_scale.reshape(n_experts, -1),
+        gating,
+        top_k=topk,
+        renormalize=v3.renormalize,
+        mesh=mesh,
+        tile_rows=128,
+        weight_format="fp8",
+        activation="silu",
+        config=Config.for_shape(
+            hidden=v3.hidden, inter=v3.inter, experts_per_shard=local, top_k=topk
+        ),
+        experts_per_shard=local,
+        shard_index=rank[:, :1],
+        jit=False,
+        side_effects=False,
+    )
+
+    def tail(x, routed, s_w1, s_w1s, s_w2, s_w2s, s_g):
+        shared = _shared_expert(x, s_w1, s_w1s, s_w2, s_w2s, s_g)
+        if tpad != t:
+            shared = jnp.pad(shared, ((0, tpad - t), (0, 0)))
+        # Row block i of the reduce-scatter lands on mesh index i: the rows
+        # v3 returned on this rank.
+        mine = jax.lax.psum_scatter(
+            shared, EP_AXIS_NAME, scatter_dimension=0, tiled=True
+        ) + routed.astype(shared.dtype)
+        return jax.lax.all_gather(mine, EP_AXIS_NAME, axis=0, tiled=True)[:t]
+
+    return jax.shard_map(
+        tail,
+        mesh=mesh,
+        in_specs=(spec,) * 6 + (PartitionSpec(),),
+        out_specs=spec,
+        check_vma=False,
+    )(
+        x,
+        routed,
+        shared_w1,
+        shared_w1_scale,
+        shared_w2,
+        shared_w2_scale,
+        shared_gate_weight,
+    )
 
 
 def _layer(
@@ -190,11 +332,49 @@ def _layer(
     )
 
 
-def _build_op(mesh, n_ranks: int, topk: int, expert_parallel: bool, max_tokens: int):
-    key = (id(mesh), n_ranks, topk, expert_parallel, max_tokens)
-    op = _OPS.get(key)
-    if op is not None:
-        return op
+def _program(
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    shared_w1,
+    shared_w1_scale,
+    shared_w2,
+    shared_w2_scale,
+    shared_gate_weight,
+    tw,
+    ti,
+    router_logits,
+    rank,
+    *,
+    mesh,
+    n_ranks: int,
+    topk: int,
+    expert_parallel: bool,
+    max_tokens: int,
+    v3: V3Prefill | None = None,
+):
+    """The op's global program; the bucket size decides the path statically."""
+    if v3 is not None and x.shape[0] // n_ranks > max_tokens:
+        return _v3_prefill(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            shared_w1,
+            shared_w1_scale,
+            shared_w2,
+            shared_w2_scale,
+            shared_gate_weight,
+            router_logits,
+            rank,
+            mesh=mesh,
+            n_ranks=n_ranks,
+            topk=topk,
+            v3=v3,
+        )
     spec = PartitionSpec(EP_AXIS_NAME)
     local = functools.partial(
         _layer,
@@ -202,6 +382,52 @@ def _build_op(mesh, n_ranks: int, topk: int, expert_parallel: bool, max_tokens: 
         topk=topk,
         expert_parallel=expert_parallel,
         max_tokens=max_tokens,
+    )
+    body = jax.shard_map(
+        lambda *a: local(a[-1], *a[:-1]),
+        mesh=mesh,
+        in_specs=(spec,) * 9 + (PartitionSpec(), spec, spec, spec),
+        out_specs=spec,
+        check_vma=False,
+    )
+    return body(
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        shared_w1,
+        shared_w1_scale,
+        shared_w2,
+        shared_w2_scale,
+        shared_gate_weight,
+        tw,
+        ti.astype(jnp.int32),
+        rank,
+    )
+
+
+def _build_op(
+    mesh,
+    n_ranks: int,
+    topk: int,
+    expert_parallel: bool,
+    max_tokens: int,
+    v3: V3Prefill | None = None,
+):
+    key = (id(mesh), n_ranks, topk, expert_parallel, max_tokens, v3)
+    op = _OPS.get(key)
+    if op is not None:
+        return op
+    spec = PartitionSpec(EP_AXIS_NAME)
+    program = functools.partial(
+        _program,
+        mesh=mesh,
+        n_ranks=n_ranks,
+        topk=topk,
+        expert_parallel=expert_parallel,
+        max_tokens=max_tokens,
+        v3=v3,
     )
 
     # torch_tpu infers static arguments from annotations: every operand is a
@@ -219,16 +445,10 @@ def _build_op(mesh, n_ranks: int, topk: int, expert_parallel: bool, max_tokens: 
         shared_gate_weight: jax.Array,
         tw: jax.Array,
         ti: jax.Array,
+        router_logits: jax.Array,
         rank: jax.Array,
     ) -> jax.Array:
-        body = jax.shard_map(
-            lambda *a: local(a[-1], *a[:-1]),
-            mesh=mesh,
-            in_specs=(spec,) * 9 + (PartitionSpec(), spec, spec, spec),
-            out_specs=spec,
-            check_vma=False,
-        )
-        return body(
+        return program(
             x,
             w1,
             w2,
@@ -240,7 +460,8 @@ def _build_op(mesh, n_ranks: int, topk: int, expert_parallel: bool, max_tokens: 
             shared_w2_scale,
             shared_gate_weight,
             tw,
-            ti.astype(jnp.int32),
+            ti,
+            router_logits,
             rank,
         )
 
@@ -249,7 +470,7 @@ def _build_op(mesh, n_ranks: int, topk: int, expert_parallel: bool, max_tokens: 
         name,
         fn,
         mesh=mesh,
-        input_partition_specs=(spec,) * 9 + (PartitionSpec(), spec, spec, spec),
+        input_partition_specs=(spec,) * 9 + (PartitionSpec(),) + (spec,) * 4,
         output_partition_specs=spec,
     )
 
@@ -391,6 +612,39 @@ def _check_vmem(max_tokens: int, layer, i_s: int, n_ranks: int) -> None:
         )
 
 
+def _v3_prefill_config(layer, n_ranks: int) -> V3Prefill | None:
+    """The v3 closure for this layer, or None to keep GMM above the cap.
+
+    Every rank sees the same layer shapes and routing, so the decision is the
+    same on all ranks (a rank-local decline of a collective halts SparseCore).
+    """
+    from vllm_torchtpu.distributed.ep_mesh import ep_rank_order
+    from vllm_torchtpu.layers.adapter import fused_moe_ep_v3 as v3_adapter
+
+    w1 = layer.w13_weight
+    local_experts, hidden, inter = w1.shape[0], w1.shape[1], w1.shape[2] // 2
+    reason = (
+        v3_adapter._unsupported_layer_reason(layer, local_experts, n_ranks)
+        or v3_adapter._unsupported_routing_reason(layer)
+        or v3_adapter._unsupported_weights_reason(
+            layer, local_experts, hidden, inter, "silu"
+        )
+    )
+    order = ep_rank_order()
+    if reason is None and (order is None or len(order) != n_ranks):
+        reason = f"EP rank order {order} does not cover {n_ranks} ranks"
+    if reason is not None:
+        logger.warning("Fused MoE decode: v3 prefill declined a layer: %s", reason)
+        return None
+    return V3Prefill(
+        rank_order=tuple(order),
+        local_experts=local_experts,
+        hidden=hidden,
+        inter=inter,
+        renormalize=bool(layer.renormalize),
+    )
+
+
 def arm_fused_moe_decode(model: torch.nn.Module) -> int:
     """Arm every eligible MoE layer of `model`; returns how many were armed."""
     if not envs.FUSED_MOE_DECODE_KERNEL:
@@ -416,7 +670,8 @@ def arm_fused_moe_decode(model: torch.nn.Module) -> int:
         raise ValueError(
             f"FUSED_MOE_DECODE_KERNEL_MAX_TOKENS={max_tokens}: must be >= 1."
         )
-    armed = 0
+    want_v3 = envs.FUSED_MOE_DECODE_PREFILL_IMPL == "v3"
+    armed = armed_v3 = 0
     for runner in runners:
         admitted = _admit(runner, n_ranks)
         if admitted is None:
@@ -438,6 +693,8 @@ def arm_fused_moe_decode(model: torch.nn.Module) -> int:
                 "fused MoE decode kernel: layers on this rank start at different "
                 f"experts ({_RANK_BUFFER_START} vs {start})"
             )
+        v3 = _v3_prefill_config(layer, n_ranks) if want_v3 and expert_parallel else None
+        armed_v3 += v3 is not None
         setattr(
             runner._quant_method,
             FUSED_MOE_DECODE_OP_ATTR,
@@ -447,6 +704,7 @@ def arm_fused_moe_decode(model: torch.nn.Module) -> int:
                 layer.moe_config.experts_per_token,
                 expert_parallel,
                 max_tokens,
+                v3,
             ),
         )
         for name, tensor in zip(_SHARED_BUFFERS, shared):
@@ -456,19 +714,29 @@ def arm_fused_moe_decode(model: torch.nn.Module) -> int:
         object.__setattr__(runner, _RUNNER_ARMED_ATTR, True)
         armed += 1
     if armed:
-        logger.info(
+        # logger.warning, not info: every rank prints it, so arming can be
+        # checked per rank in the job logs.
+        logger.warning(
             "Armed the fused MoE decode kernel on %d of %d MoE layers "
-            "(%d ranks, up to %d tokens; GMM MoE above)",
+            "(%d ranks, mesh index %s, up to %d tokens; above: v3 sequence "
+            "parallel on %d layers, GMM MoE on the rest)",
             armed,
             len(runners),
             n_ranks,
+            ep_mesh_index(),
             max_tokens,
+            armed_v3,
         )
     return armed
 
 
 def fused_moe_decode(
-    quant_method: Any, layer: Any, x: torch.Tensor, topk_weights, topk_ids
+    quant_method: Any,
+    layer: Any,
+    x: torch.Tensor,
+    topk_weights,
+    topk_ids,
+    router_logits: torch.Tensor,
 ) -> torch.Tensor:
     """Forward for an armed layer: the all-reduced (shared + routed) output.
 
@@ -493,6 +761,7 @@ def fused_moe_decode(
         shared_gate_weight,
         topk_weights,
         topk_ids,
+        router_logits,
         _RANK_BUFFER,
     )
 
