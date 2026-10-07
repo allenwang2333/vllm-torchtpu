@@ -1149,3 +1149,121 @@ def test_moe_gmm_onehot_combine_zeroes_uncomputed_rows(monkeypatch):
     )
 
     assert bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))
+
+
+def test_use_fused_unpermute_gmm_env_flag(monkeypatch):
+    monkeypatch.delenv("USE_FUSED_UNPERMUTE_GMM", raising=False)
+    assert envs.environment_variables["USE_FUSED_UNPERMUTE_GMM"]() is False
+
+    monkeypatch.setenv("USE_FUSED_UNPERMUTE_GMM", "1")
+    assert envs.environment_variables["USE_FUSED_UNPERMUTE_GMM"]() is True
+
+    monkeypatch.setenv("USE_FUSED_UNPERMUTE_GMM", "true")
+    assert envs.environment_variables["USE_FUSED_UNPERMUTE_GMM"]() is True
+
+    monkeypatch.setenv("USE_FUSED_UNPERMUTE_GMM", "0")
+    assert envs.environment_variables["USE_FUSED_UNPERMUTE_GMM"]() is False
+
+
+def test_fused_moe_func_selects_fused_unpermute_gmm(monkeypatch):
+    # Verify that when USE_FUSED_UNPERMUTE_GMM is enabled and conditions match
+    # (num_tokens >= 256, hidden_size % 256 == 0), fused_moe_func routes to the
+    # fused permute + unpermute kernels from CL 991077540.
+    calls = []
+
+    def mock_permute(x, w1, w1_scale, gs, idx, fuse_act, group_offset):
+        calls.append("permute")
+        return jnp.zeros((x.shape[0] * 8, 512), dtype=jnp.bfloat16)
+
+    def mock_unpermute(x, w2, w2_scale, gs, idx, group_offset):
+        calls.append("unpermute")
+        return jnp.zeros((x.shape[0], 256), dtype=jnp.bfloat16)
+
+    def mock_reduce(res, weights):
+        calls.append("reduce")
+        return jnp.zeros((256, 256), dtype=jnp.bfloat16)
+
+    monkeypatch.setattr(fused_moe_gmm.fused_permute, "fused_permute_gmm", mock_permute)
+    monkeypatch.setattr(
+        fused_moe_gmm.fused_permute, "fused_unpermute_gmm", mock_unpermute
+    )
+    monkeypatch.setattr(
+        fused_moe_gmm.ragged_dma_reduce, "ragged_dma_reduce", mock_reduce
+    )
+    monkeypatch.setattr(envs, "USE_FUSED_UNPERMUTE_GMM", True)
+
+    num_tokens = 256
+    hidden_size = 256
+    num_experts = 8
+    topk = 8
+
+    hidden_states = jnp.ones((num_tokens, hidden_size), dtype=jnp.bfloat16)
+    w1 = jnp.ones((num_experts, hidden_size, 512), dtype=jnp.bfloat16)
+    w2 = jnp.ones((num_experts, 512, hidden_size), dtype=jnp.bfloat16)
+    topk_weights = jnp.ones((num_tokens, topk), dtype=jnp.float32) / topk
+    topk_ids = jnp.zeros((num_tokens, topk), dtype=jnp.int32)
+
+    out = fused_moe_func(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        w1_scale=None,
+        w2_scale=None,
+        w1_bias=None,
+        w2_bias=None,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        topk=topk,
+        activation="silu",
+        use_ep=False,
+    )
+
+    assert calls == ["permute", "unpermute", "reduce"]
+    assert out.shape == (num_tokens, hidden_size)
+
+
+def test_fused_moe_func_skips_fused_unpermute_gmm_when_small_tokens(monkeypatch):
+    # For num_tokens < 256 (decode buckets), fused_moe_func should NOT select
+    # fused permute + unpermute GMM even if USE_FUSED_UNPERMUTE_GMM is True.
+    calls = []
+
+    def mock_permute(*args, **kwargs):
+        calls.append("permute")
+
+    monkeypatch.setattr(fused_moe_gmm.fused_permute, "fused_permute_gmm", mock_permute)
+    monkeypatch.setattr(envs, "USE_FUSED_UNPERMUTE_GMM", True)
+    # Mock standard moe_gmm to catch fallback
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "moe_gmm",
+        lambda *args, **kwargs: jnp.zeros((128, 256), dtype=jnp.bfloat16),
+    )
+
+    num_tokens = 128
+    hidden_size = 256
+    num_experts = 8
+    topk = 8
+
+    hidden_states = jnp.ones((num_tokens, hidden_size), dtype=jnp.bfloat16)
+    w1 = jnp.ones((num_experts, hidden_size, 512), dtype=jnp.bfloat16)
+    w2 = jnp.ones((num_experts, 512, hidden_size), dtype=jnp.bfloat16)
+    topk_weights = jnp.ones((num_tokens, topk), dtype=jnp.float32) / topk
+    topk_ids = jnp.zeros((num_tokens, topk), dtype=jnp.int32)
+
+    out = fused_moe_func(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        w1_scale=None,
+        w2_scale=None,
+        w1_bias=None,
+        w2_bias=None,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        topk=topk,
+        activation="silu",
+        use_ep=False,
+    )
+
+    assert "permute" not in calls
+    assert out.shape == (num_tokens, hidden_size)
