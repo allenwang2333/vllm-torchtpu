@@ -139,3 +139,26 @@ def test_positive_control(device):
     _, _, q, s = _run(x, r, _W(bad_w), True, True, exact=True)
     got = linear_common.quantized_matmul_prequant(q, s, w, ws)
     assert not _same(got, ref)
+
+
+@pytest.mark.parametrize("rows", [8, 48, 1024])
+def test_fold_ba_matches_the_bf16_linear(device, rows):
+    """TPU_INPUT_NORM_QUANT_FOLD_BA: the kernel's in_proj_ba matches the bf16
+    linear on the normed rows up to dot accumulation order; q and the new
+    residual are unchanged."""
+    if device.type != "tpu":
+        pytest.skip("Pallas kernel on TPU.")
+    x, r, norm, w, ws = _setup(device, rows)
+    g = torch.Generator().manual_seed(1)
+    wba = (torch.randn(K, 16, generator=g) * 0.02).to(torch.bfloat16).to(device)
+    s = x.float() + r.float()
+    rstd = torch.rsqrt(s.pow(2).mean(dim=-1, keepdim=True) + EPS)
+    ba, ro, q, sc = inq._build_op(EPS, True, False, True, True)(
+        x, r, norm.weight, rstd, wba.t().contiguous()
+    )
+    y_ref, r_ref = norm(x, r)
+    _, _, q_ref, s_ref = _run(x, r, norm, True, False, exact=True)
+    assert _same(ro, r_ref) and _same(q, q_ref) and _same(sc, s_ref)
+    ref = (y_ref @ wba).float().cpu()
+    got = ba.float().cpu()
+    assert float((got - ref).norm() / ref.norm()) < 5e-3
