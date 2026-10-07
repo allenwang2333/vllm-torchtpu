@@ -18,8 +18,35 @@ import gzip
 import json
 
 import pytest
+from plan_fixtures import VARIANTS, Data, build
 from scenario.plan import codec
 from scenario.plan.types import Concat, Ref
+
+
+@pytest.mark.parametrize("name", sorted(VARIANTS))
+def test_round_trip(name: str, variants: dict[str, Data]) -> None:
+    plan = build(variants[name])
+    assert codec.decode(codec.encode(plan)) == plan
+    assert codec.from_json(codec.to_json(plan)) == plan
+
+
+@pytest.mark.parametrize("name", sorted(VARIANTS))
+def test_deterministic_and_small(name: str, variants: dict[str, Data]) -> None:
+    plan = build(variants[name])
+    again = build(variants[name])
+    encoded = codec.encode(plan)
+    assert encoded == codec.encode(again) == codec.encode(codec.decode(encoded))
+    assert "$" not in encoded
+    assert len(encoded) <= codec.MAX_ENCODED_BYTES
+    resolved = codec.encode_data({"point": None, "scenario": variants[name]})
+    assert len(resolved) <= codec.MAX_ENCODED_BYTES
+    assert len(codec.digest(plan)) == 12 and codec.digest(plan) == codec.digest(again)
+
+
+def test_json_is_canonical(variants: dict[str, Data]) -> None:
+    text = codec.to_json(build(variants["pd"]))
+    assert text == json.dumps(json.loads(text), sort_keys=True, separators=(",", ":"))
+    assert '"$5"' in text and text.isascii()
 
 
 def test_refs_are_tagged() -> None:
@@ -36,6 +63,17 @@ def test_refs_are_tagged() -> None:
 def _encode_raw(data: object) -> str:
     raw = json.dumps(data).encode()
     return base64.b64encode(gzip.compress(raw, mtime=0)).decode()
+
+
+def test_other_format_is_refused(variants: dict[str, Data]) -> None:
+    data = codec.to_data(build(variants["single"]))
+    data["format"] = 2
+    with pytest.raises(codec.PlanFormatError) as info:
+        codec.decode(_encode_raw(data))
+    assert str(info.value) == (
+        "plan format 2, this tool reads 1: the pod image and the submitting "
+        "checkout differ"
+    )
 
 
 @pytest.mark.parametrize(
