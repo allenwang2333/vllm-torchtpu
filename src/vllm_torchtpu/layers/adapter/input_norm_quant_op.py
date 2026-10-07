@@ -266,8 +266,8 @@ def norm_quant(layer: torch.nn.Module, hidden_states, residual):
 
 
 def project(proj: torch.nn.Module, prequant) -> torch.Tensor:
-    """The fp8 linear ``proj`` on pre-quantized rows (q, scale)."""
-    q, s = prequant
+    """The fp8 linear ``proj`` on pre-quantized rows (q, scale[, ba])."""
+    q, s = prequant[0], prequant[1]
     w = proj.weight
     if getattr(proj, KEEP_VLLM_LAYOUT_ATTR, False):
         w = w.transpose(0, 1)
