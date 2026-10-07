@@ -23,6 +23,7 @@ from pydantic import BaseModel, ValidationError
 from scenario.model import baseline, server, sweep, tasks
 from scenario.model import scenario as top
 from scenario.model.common import Model
+from scenario.model.rules import check_scenario
 
 MINIMAL: dict[type[Model], dict[str, Any]] = {
     server.ModelSpec: {"name": "m"},
@@ -171,6 +172,12 @@ def test_strict_values() -> None:
     perf = {**MINIMAL[tasks.PerfTask], "num_prompts": "8"}
     with pytest.raises(ValidationError):
         tasks.PerfTask.model_validate(perf)
+
+
+@pytest.mark.parametrize("fixture", ["single", "pd", "agentx", "ix_eval"])
+def test_fixtures_are_valid(fixture: str, request: pytest.FixtureRequest) -> None:
+    model = top.Scenario.model_validate(request.getfixturevalue(fixture))
+    assert check_scenario(model) == []
 
 
 def test_durations_and_sizes_are_stored_as_numbers(single: dict[str, Any]) -> None:
