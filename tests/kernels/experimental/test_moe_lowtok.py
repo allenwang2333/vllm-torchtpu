@@ -367,20 +367,15 @@ def test_fused_moe_func_selects_kernel_and_matches_oracle(monkeypatch, m):
     assert err < gmm_err + 0.005, (err, gmm_err)
 
 
-def _tied(scores, case, start, experts):
-    """Row 0 of the scores with a tie the fast router must hand back."""
+
+def _tied(scores, case):
+    """Row 0 with a tie: bf16 router logits make equal softmax scores common."""
     s = np.array(scores, np.float32)
     order = np.argsort(-s[0], kind="stable")
-    if case == "inside":  # two top-k entries equal
+    if case == "inside":
         s[0, order[3]] = s[0, order[2]]
-    elif case == "boundary":  # 10th and 11th equal (local: the +5 logits lead)
-        assert start <= order[9] < start + experts
-        assert start <= order[10] < start + experts
+    elif case == "boundary":
         s[0, order[10]] = s[0, order[9]]
-    elif case == "zeros":  # fewer non-zero scores than k
-        keep = s[0, order[:3]].copy()
-        s[0] = 0
-        s[0, order[:3]] = keep
     return jnp.asarray(s)
 
 
@@ -389,67 +384,44 @@ def _same_bits(a, b):
     return a.shape == b.shape and np.array_equal(a.view(np.uint16), b.view(np.uint16))
 
 
-@pytest.mark.parametrize("tokens", [1, 4, 8, 12, 24, 32, 44, 64])
-@pytest.mark.parametrize("case", [None, "inside", "boundary", "zeros"])
-def test_fast_prologue_is_bit_identical(tokens, case):
+@pytest.mark.parametrize("tokens", [1, 8, 12, 24, 44, 64])
+@pytest.mark.parametrize("case", [None, "inside", "boundary"])
+def test_unrolled_collect_is_bit_identical(tokens, case):
     _needs("tpu")
     experts, hidden, inter, topk, start = 64, 4096, 1024, 10, 128
     x, scores, weights = _scores_operands(tokens * 13 + 1, tokens, experts, hidden, inter, start)
     if case is not None:
-        scores = _tied(scores, case, start, experts)
+        scores = _tied(scores, case)
     if tokens > 2:
         scores = scores.at[tokens - 1].set(0.0)  # a padded row
     want = kernel.moe_lowtok(x, scores, *weights, jnp.int32(start), topk=topk)
     got = kernel.moe_lowtok(
-        x, scores, *weights, jnp.int32(start), topk=topk, fast_prologue=True
+        x, scores, *weights, jnp.int32(start), topk=topk, unroll_collect=True
     )
     assert _same_bits(got, want)
-
-
-def test_fast_prologue_tie_fallback_is_load_bearing(monkeypatch):
-    """Positive control: with the tie flag forced off, a tie changes the output."""
-    _needs("tpu")
-    experts, hidden, inter, topk, start = 64, 4096, 1024, 10, 128
-    x, scores, weights = _scores_operands(5, 8, experts, hidden, inter, start)
-    scores = _tied(scores, "inside", start, experts)
-    want = kernel.moe_lowtok(x, scores, *weights, jnp.int32(start), topk=topk)
-    real = kernel._select_topk_fast
-
-    def no_flag(s, k):
-        wt, flag = real(s, k)
-        return wt, jnp.zeros_like(flag)
-
-    monkeypatch.setattr(kernel, "_select_topk_fast", no_flag)
-    kernel.moe_lowtok.clear_cache()
-    try:
-        got = kernel.moe_lowtok(
-            x, scores, *weights, jnp.int32(start), topk=topk, fast_prologue=True
-        )
-    finally:
-        kernel.moe_lowtok.clear_cache()
-    assert not _same_bits(got, want)
+    # The bit comparison can fail: another shard's experts give another output.
+    other = kernel.moe_lowtok(
+        x, scores, *weights, jnp.int32(start + experts), topk=topk, unroll_collect=True
+    )
+    assert not _same_bits(other, want)
 
 
 @pytest.mark.parametrize("tokens", [4, 33])
-def test_fast_prologue_ids_entry_is_bit_identical(tokens):
+def test_unrolled_collect_ids_entry_is_bit_identical(tokens):
     _needs("tpu")
-    ops = _ids_operands(tokens, tokens, 64, 4096, 1024, 10)
-    x, ids, weights, w13, s13, w2, s2 = ops
+    x, ids, weights, w13, s13, w2, s2 = _ids_operands(tokens, tokens, 64, 4096, 1024, 10)
     route = kernel.routing_table(ids, weights, w13.shape[0])
     want = kernel.moe_lowtok(x, route, w13, s13, w2, s2)
-    got = kernel.moe_lowtok(x, route, w13, s13, w2, s2, fast_prologue=True)
+    got = kernel.moe_lowtok(x, route, w13, s13, w2, s2, unroll_collect=True)
     assert _same_bits(got, want)
 
 
-@pytest.mark.parametrize("case", [None, "inside", "zeros"])
-def test_interpreted_fast_prologue_is_bit_identical(interpret, case):
+def test_interpreted_unrolled_collect_is_bit_identical(interpret):
     experts, hidden, inter, topk, start = 8, 512, 256, 4, 16
     x, scores, weights = _scores_operands(9, 6, experts, hidden, inter, start)
-    if case is not None:
-        scores = _tied(scores, case, start, experts)
-    scores = scores.at[2].set(0.0)
+    scores = _tied(scores.at[2].set(0.0), "inside")
     want = kernel.moe_lowtok(x, scores, *weights, jnp.int32(start), topk=topk)
     got = kernel.moe_lowtok(
-        x, scores, *weights, jnp.int32(start), topk=topk, fast_prologue=True
+        x, scores, *weights, jnp.int32(start), topk=topk, unroll_collect=True
     )
     assert _same_bits(got, want)

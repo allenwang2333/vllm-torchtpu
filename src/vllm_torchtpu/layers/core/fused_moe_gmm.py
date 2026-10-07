@@ -699,7 +699,7 @@ def fused_moe_func(
             w1_scale,
             w2,
             w2_scale,
-            fast_prologue=envs.TPU_MOE_LOWTOK_FAST_PROLOGUE,
+            unroll_collect=envs.TPU_MOE_LOWTOK_UNROLL_COLLECT,
         )
 
     # Tensor-parallel experts at decode-sized token counts: one fused kernel

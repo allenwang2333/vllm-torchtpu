@@ -152,7 +152,7 @@ def _graph_unsupported_reason() -> str | None:
 
 
 def _build_op(topk: int) -> torch.library.CustomOpDef:
-    fast = envs.TPU_MOE_LOWTOK_FAST_PROLOGUE
+    fast = envs.TPU_MOE_LOWTOK_UNROLL_COLLECT
     op = _OPS.get((topk, fast))
     if op is not None:
         return op
@@ -177,10 +177,10 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
             w2_scale,
             experts_start,
             topk=topk,
-            fast_prologue=fast,
+            unroll_collect=fast,
         )
 
-    op = jax_op(f"pallas::moe_lowtok_scores_k{topk}{'_fast' if fast else ''}", moe)
+    op = jax_op(f"pallas::moe_lowtok_scores_k{topk}{'_unroll' if fast else ''}", moe)
 
     def _fake(x, *_args):
         return torch.empty_like(x)
