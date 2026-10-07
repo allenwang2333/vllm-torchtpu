@@ -33,7 +33,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 BRANCH="${BUILDKITE_BRANCH:-$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)}"
 # TODO(test-only): for a CI dry run, act as main or as release/0.0.0-test
 # depending on which step runs. Remove before merging.
-if [[ "${BRANCH}" == "jefft/docker_image_ci" ]]; then
+if [[ "${BRANCH}" == "jefft/test_bk_dep" ]]; then
   [[ "${BUILDKITE_STEP_KEY:-}" == "publish_dockerhub_release" ]] && BRANCH="release/0.0.0-test" || BRANCH="main"
 fi
 DATE="$(date +%Y%m%d)"

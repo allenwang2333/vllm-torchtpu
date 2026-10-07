@@ -22,7 +22,7 @@ steps:
   - label: ":docker: Publish vllm-torchtpu nightly image to Docker Hub"
     key: "publish_dockerhub_nightly"
     # TODO(test-only): jefft/docker_image_ci added for a CI dry run. Remove before merging.
-    if: '(build.branch == "main" || build.branch == "jefft/docker_image_ci") && build.env("NIGHTLY") == "1" && pipeline.slug == "vllm-torchtpu-ci"'
+    if: '(build.branch == "main" || build.branch == "jefft/test_bk_dep") && build.env("NIGHTLY") == "1" && pipeline.slug == "vllm-torchtpu-ci"'
     agents:
       # The prod build pulls torch-tpu from a private registry and needs the
       # gcloud credentials these agents carry (see docker/build_image.sh).
