@@ -852,18 +852,22 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # Scoring and selection are independent per query, but every TP rank
         # holds the whole batch: split the queries over ranks and gather the
         # selections. Every rank still writes all index keys (replicated cache).
-        # Pad the queries to 16 rows per rank (SparseCore top-k row tiles)
-        # rather than branching on the token count, which would freeze the
-        # traced bucket's choice (compilation/shape_variants.py). Padding rows
-        # have zero length and select nothing. Always pad at least one row: a
-        # zero-size pad guards on the count (torch.cat skips empty inputs).
+        # Each rank takes a contiguous block of 8-row multiples rather than at
+        # least 16 rows: per-rank cost follows its row count, and a decode
+        # batch no longer lands entirely on rank 0. (With 3 rows per rank,
+        # decode output was corrupted once a rank held two real queries;
+        # cause unknown, so keep multiples of 8.) The row count is
+        # arithmetic on the token count rather than a branch, which would
+        # freeze the traced bucket's choice (compilation/shape_variants.py).
+        # Padding rows have zero length and select nothing. Always pad at
+        # least one row: a zero-size pad guards on the count (torch.cat skips
+        # empty inputs).
         ranks = get_tensor_model_parallel_world_size()
         split = ranks > 1
         queries = (qr, positions, weights, active_lengths, candidates, requests)
         if split:
-            rows = 16 * ranks
-            padding = (count // rows + 1) * rows - count
-            part = (count + padding) // ranks
+            part = (count // ranks // 8 + 1) * 8
+            padding = part * ranks - count
             mine = self._tp_rank * part + torch.arange(
                 part, dtype=torch.int32, device=qr.device
             )
