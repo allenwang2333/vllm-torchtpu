@@ -1633,9 +1633,8 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             and loaded_weight.shape[0] == self.org_vocab_size
         ):
             full = loaded_weight.to(device=param.device, dtype=param.dtype).contiguous()
-            # Registered as a Parameter after loading (process_weights_after_loading): a
-            # buffer is carried as program state and XLA copied the whole 2 GB table every
-            # step (j-6d548cb4: copy bf16[248320,4096] 1.27 ms per lookup).
+            # Registered as a frozen Parameter after loading (process_weights_after_loading),
+            # past the loader's unloaded-weight check.
             self.__dict__["_tpu_full_pending"] = full
             logger.info(
                 "TPU_REPLICATED_EMBED: replicated input embedding %s on this rank "
@@ -1673,7 +1672,11 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             # shard to the full shape. Same shapes and cost; values are timing-only.
             w = layer.weight.data
             reps = -(-layer.org_vocab_size // w.shape[0])
-            full = w.repeat(reps, 1)[: layer.org_vocab_size].contiguous()
+            # Into a fresh buffer: torch_tpu re-materializes a view-backed argument (the
+            # sliced repeat) as a full 2 GB copy before every call (j-55b93681).
+            full = torch.empty(
+                (layer.org_vocab_size, w.shape[1]), dtype=w.dtype, device=w.device
+            ).copy_(w.repeat(reps, 1)[: layer.org_vocab_size])
             layer.register_parameter(
                 "_tpu_full_weight", torch.nn.Parameter(full, requires_grad=False)
             )
