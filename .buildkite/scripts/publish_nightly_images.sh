@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 
 # The branch decides the tags. main pushes nightly-YYYYMMDD and moves latest.
-# release/X.Y.Z pushes YYYYMMDD-X.Y.Z and moves X.Y.Z, so a release nightly
+# releases/X.Y.Z pushes YYYYMMDD-X.Y.Z and moves X.Y.Z, so a release nightly
 # never touches latest. The Buildkite pipeline runs this script from whichever
 # branch its schedule names, so a release branch cut from main after this
 # change needs only a new schedule, not a code change.
@@ -27,7 +27,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 # With PUBLISH_DOCKERHUB=1 (set by pipeline_nightly_image.yml, which logs in to
 # Docker Hub) it also pushes one of the images it built to DOCKERHUB_REPO: main
 # pushes dev as nightly-YYYYMMDD-<commit>-<vllm> and moves nightly;
-# release/X.Y.Z pushes prod as X.Y.Z. A release build runs only after the
+# releases/X.Y.Z pushes prod as X.Y.Z. A release build runs only after the
 # approval step, where the approver chooses whether to move latest and whether
 # an X.Y.Z already on Docker Hub may be overwritten.
 BRANCH="${BUILDKITE_BRANCH:-$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)}"
@@ -38,11 +38,11 @@ case "${BRANCH}" in
     DATE_TAG="nightly-${DATE}"
     LATEST_TAG="latest"
     ;;
-  release/*)
-    VERSION="${BRANCH#release/}"
+  releases/*)
+    VERSION="${BRANCH#releases/}"
     # Starting with a digit keeps it from colliding with latest or nightly-*.
     if [[ ! "${VERSION}" =~ ^[0-9][A-Za-z0-9_.-]*$ ]]; then
-      echo "ERROR: branch '${BRANCH}' does not name a version usable as an image tag; expected release/X.Y.Z." >&2
+      echo "ERROR: branch '${BRANCH}' does not name a version usable as an image tag; expected releases/X.Y.Z." >&2
       exit 1
     fi
     DATE_TAG="${DATE}-${VERSION}"
@@ -57,7 +57,7 @@ esac
 if [[ "${PUBLISH_DOCKERHUB}" == "1" ]]; then
   DOCKERHUB_REPO="${DOCKERHUB_REPO:?DOCKERHUB_REPO must be set when PUBLISH_DOCKERHUB=1}"
   MOVE_LATEST="yes"
-  if [[ "${BRANCH}" == release/* ]]; then
+  if [[ "${BRANCH}" == releases/* ]]; then
     DOCKERHUB_TARGET="prod"
     DOCKERHUB_TAG="${VERSION}"
     DOCKERHUB_LATEST_TAG="latest"
@@ -131,8 +131,7 @@ for TARGET in "${TARGETS[@]}"; do
     for DOCKERHUB_IMAGE in "${DOCKERHUB_IMAGES[@]}"; do
       echo "--- :docker: Pushing ${DOCKERHUB_IMAGE} to Docker Hub"
       docker tag "${DATE_IMAGE}" "${DOCKERHUB_IMAGE}"
-      # TODO(docker-hub): pushes are simulated until the Docker Hub repo is
-      # decided. Replace the echo with docker push then.
+      # TODO(docker-hub): pushes are simulated until the Docker Hub repo is decided. Replace the echo with docker push then.
       echo "[SIMULATED] docker push ${DOCKERHUB_IMAGE}"
       docker rmi "${DOCKERHUB_IMAGE}" || true
     done
