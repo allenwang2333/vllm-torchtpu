@@ -152,6 +152,34 @@ def split_kv_stack(merged: jax.Array, stacked_shape: tuple[int, ...]) -> jax.Arr
     return merged.reshape(stacked_shape)
 
 
+# SparseCore DMA addresses at most this many bytes of one tensor: a cache an SC
+# kernel (the sparse-MLA writer and gather, the indexer append) takes whole must
+# not be larger. A merged GLM5_MKD_STACK_C stack is such a tensor.
+SPARSECORE_MAX_TENSOR_BYTES = 16 * 2**30
+
+
+def glm5_stack_group_sizes(
+    n_layers: int, per_layer_bytes: int, max_group_bytes: int | None = None
+) -> list[int]:
+    """GLM5_MKD_STACK_C: how many layers go in each stacked tensor of one kind.
+
+    The fewest groups whose tensors each fit `max_group_bytes` (default: the
+    SparseCore per-tensor limit, since the DCP ops hand the merged stack to SC
+    kernels), as equal as possible, earlier groups taking the remainder. One
+    group (the whole stack) when it fits.
+    """
+    limit = max_group_bytes or SPARSECORE_MAX_TENSOR_BYTES
+    if per_layer_bytes > limit:
+        raise ValueError(
+            f"GLM5_MKD_STACK_C: one layer's cache ({per_layer_bytes} B) exceeds the "
+            f"{limit} B stacked-tensor limit"
+        )
+    per_group = limit // per_layer_bytes
+    n_groups = -(-n_layers // per_group)
+    base, extra = divmod(n_layers, n_groups)
+    return [base + (g < extra) for g in range(n_groups)]
+
+
 def stack_page_table_dcp(page_table: jax.Array, kv_stack: tuple[int, int]) -> jax.Array:
     """GLM5_MKD_STACK_C: a DCP page table rewritten into the merged stack's pages.
 
