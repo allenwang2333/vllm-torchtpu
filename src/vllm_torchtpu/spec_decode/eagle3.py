@@ -139,6 +139,7 @@ def _maybe_pad_dim1(t: torch.Tensor, target_len: int) -> torch.Tensor:
 
 
 if TYPE_CHECKING:
+    from vllm_torchtpu.kernels.qwen35_megakernel import Qwen35MtpMegakernel
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 logger = init_logger(__name__)
@@ -274,6 +275,14 @@ class Eagle3Proposer:
         # load_model; None means the per-step loop.
         self._mtp_fused_loop: torch.nn.Module | None = None
         self._mtp_fused_loop_warm = False
+        # The megakernel running the MTP layer (VLLM_TPU_QWEN35_MTP_MK=1) and
+        # the step-0 and fused-loop programs traced with it, each with its
+        # warm flag. Set by attach_mtp_megakernel; None keeps the XLA layer.
+        self._mtp_mk: Qwen35MtpMegakernel | None = None
+        self._mtp_mk_step0: torch.nn.Module | None = None
+        self._mtp_mk_step0_warm = False
+        self._mtp_fused_loop_mk: torch.nn.Module | None = None
+        self._mtp_fused_loop_mk_warm = False
         # Greedy draft head for TPU_GREEDY_TOP_TOKENS: the draft's head owner,
         # or a _DraftHeadOwnerProxy over a quantized lm-head proxy
         # (TPU_DRAFT_LM_HEAD_QUANT). None: compute_logits + argmax.
@@ -826,6 +835,120 @@ class Eagle3Proposer:
         self._mtp_fused_loop_warm = False
         logger.info("MTP draft loop steps 1..%d run as one compiled program.", K - 1)
 
+    def attach_mtp_megakernel(self, mk: Qwen35MtpMegakernel) -> bool:
+        """Run the MTP layer on `mk` in draft step 0 and the fused loop.
+
+        Each gets a second program, traced inside `mtp_megakernel_context`
+        and compiled only for the token buckets `mk` serves; steps that don't
+        fit keep the XLA programs. Step 0 needs its post-attention gather
+        (`TPU_MTP_STEP0_POST_ATTN_GATHER=1`). Returns whether either program
+        was built.
+        """
+        from vllm_torchtpu.spec_decode.mtp_fused_loop import build_mtp_fused_loop
+        from vllm_torchtpu.spec_decode.mtp_loop_model import (
+            build_mtp_loop_step_model,
+        )
+
+        draft_dims = getattr(self.draft_model, "_dynamic_arg_dims", None)
+        if draft_dims is None:
+            return False
+        K = self.speculative_config.num_speculative_tokens
+
+        def build(
+            buckets: tuple[int, ...], builder, **kwargs
+        ) -> torch.nn.Module | None:
+            config = self._mtp_mk_vllm_config(buckets)
+            if config is None:
+                return None
+            with (
+                set_model_tag("eagle_head"),
+                set_vllm_model_wrapper_context(
+                    mesh=self.runner.mesh, vllm_config=config
+                ),
+                set_current_vllm_config(config),
+            ):
+                return builder(
+                    vllm_config=config,
+                    mtp=self.draft_model,
+                    dynamic_arg_dims=draft_dims,
+                    megakernel=True,
+                    **kwargs,
+                )
+
+        try:
+            if self._mtp_fused_loop is not None:
+                self._mtp_fused_loop_mk = build(
+                    mk.loop_buckets,
+                    build_mtp_fused_loop,
+                    prefix=f"mtp_fused_loop_k{K}_mk",
+                    num_steps=K - 1,
+                    greedy_head_owner=self._draft_greedy_head_owner,
+                    propose_step0=True,
+                )
+            if envs.TPU_MTP_STEP0_POST_ATTN_GATHER:
+                self._mtp_mk_step0 = build(
+                    mk.verify_buckets,
+                    build_mtp_loop_step_model,
+                    prefix="mtp_mk_step0",
+                )
+        except Exception:
+            logger.warning(
+                "Could not build the MTP megakernel draft programs; the MTP "
+                "layer stays on XLA.",
+                exc_info=True,
+            )
+            self._mtp_fused_loop_mk = self._mtp_mk_step0 = None
+            return False
+        if self._mtp_fused_loop_mk is None and self._mtp_mk_step0 is None:
+            return False
+        self._mtp_mk = mk
+        logger.info(
+            "MTP megakernel draft programs: step 0 %s, fused loop %s.",
+            "on" if self._mtp_mk_step0 is not None else "off",
+            "on" if self._mtp_fused_loop_mk is not None else "off",
+        )
+        return True
+
+    def check_mtp_megakernel_warm(self) -> None:
+        """Raise if the spec-decode warmup left a megakernel draft program
+        cold. The warmup survives a failing step, but serving would then
+        trace the program on its first real step and fail there."""
+        if self._mtp_mk is None or not self._mtp_mk.bound:
+            return
+        cold = [
+            name
+            for name, program, warm in (
+                ("step 0", self._mtp_mk_step0, self._mtp_mk_step0_warm),
+                ("fused loop", self._mtp_fused_loop_mk, self._mtp_fused_loop_mk_warm),
+            )
+            if program is not None and not warm
+        ]
+        if cold:
+            raise RuntimeError(
+                "Qwen3.5 MTP megakernel draft program(s) not compiled by the "
+                f"spec-decode warmup: {', '.join(cold)}. See the warmup errors "
+                "above, or set VLLM_TPU_QWEN35_MTP_MK=0 to keep the MTP layer "
+                "on XLA."
+            )
+
+    def _mtp_mk_vllm_config(self, buckets: tuple[int, ...]) -> VllmConfig | None:
+        """`draft_vllm_config` compiling only its token buckets up to the
+        largest of `buckets` (None if there are none): a program compiles
+        every `compile_sizes` bucket on its first call, and the megakernel
+        serves no larger step."""
+        cc = getattr(self.draft_vllm_config, "compilation_config", None)
+        if not buckets or cc is None or not cc.compile_sizes:
+            return None
+        sizes = [
+            s for s in cc.compile_sizes if isinstance(s, int) and s <= max(buckets)
+        ]
+        if not sizes:
+            return None
+        config = copy.copy(self.draft_vllm_config)
+        config.compilation_config = copy.copy(cc)
+        config.compilation_config.compile_sizes = sizes
+        return config
+
     def _run_mtp_fused_loop(
         self,
         chunk: DraftChunkInputs,
@@ -881,6 +1004,21 @@ class Eagle3Proposer:
                 )
             )
         max_loop_bucket = self._loop_bucket(self.runner.max_num_reqs)
+        program, warm_attr = self._mtp_fused_loop, "_mtp_fused_loop_warm"
+        mk = self._mtp_mk
+        mk_ctx: contextlib.AbstractContextManager = contextlib.nullcontext()
+        if (
+            mk is not None
+            and self._mtp_fused_loop_mk is not None
+            and chunk.attn_ctx.position_ids_override is None
+            and mk.use_for_step(attn_metadata, num_tokens, step0=False)
+        ):
+            from vllm_torchtpu.models.vllm.qwen3_next_patch import (
+                mtp_megakernel_context,
+            )
+
+            program, warm_attr = self._mtp_fused_loop_mk, "_mtp_fused_loop_mk_warm"
+            mk_ctx = mtp_megakernel_context(mk)
         with (
             set_model_tag("eagle_head"),
             token_padding.use_padding_state(loop_padding_state),
@@ -898,17 +1036,18 @@ class Eagle3Proposer:
             set_vllm_model_wrapper_context(
                 mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
             ),
+            mk_ctx,
         ):
-            if not self._mtp_fused_loop_warm:
+            if not getattr(self, warm_attr):
                 # The first call traces and compiles; like the loop-step
                 # program's, its outputs can carry symbolic sizes, so run it
                 # again compiled. The repeat rewrites the same KV entries;
                 # seq_lens is put back first because the program advanced it.
                 seq_lens_step1 = seq_lens.clone()
-                self._mtp_fused_loop(None, positions, hidden_states, seq_lens)
+                program(None, positions, hidden_states, seq_lens)
                 seq_lens.copy_(seq_lens_step1)
-                self._mtp_fused_loop_warm = True
-            return self._mtp_fused_loop(None, positions, hidden_states, seq_lens)
+                setattr(self, warm_attr, True)
+            return program(None, positions, hidden_states, seq_lens)
 
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
         """The compiled program draft step `step_idx` runs.
@@ -2667,6 +2806,18 @@ class Eagle3Proposer:
             kwargs["spec_step_idx"] = step_idx
 
         model = self._draft_model_for_step(step_idx)
+        mk_ctx: contextlib.AbstractContextManager = contextlib.nullcontext()
+        if (
+            step0_gather_indices is not None
+            and model is self.draft_model
+            and self._use_mtp_mk_step0(chunk, attn_metadata, num_tokens)
+        ):
+            from vllm_torchtpu.models.vllm.qwen3_next_patch import (
+                mtp_megakernel_context,
+            )
+
+            model = self._mtp_mk_step0
+            mk_ctx = mtp_megakernel_context(self._mtp_mk)
         if model is self._mtp_loop_model:
             loop_padding_state = self._get_loop_token_padding_state()
             if loop_padding_state is not None:
@@ -2735,6 +2886,7 @@ class Eagle3Proposer:
             set_vllm_model_wrapper_context(
                 mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
             ),
+            mk_ctx,
         ):
             if model is self._mtp_loop_model and not self._mtp_loop_model_warm:
                 # This call traces and compiles the loop-step program. Like
@@ -2746,9 +2898,35 @@ class Eagle3Proposer:
                 # only reads the top-k table.
                 model(**kwargs)
                 self._mtp_loop_model_warm = True
+            elif model is self._mtp_mk_step0 and not self._mtp_mk_step0_warm:
+                # Likewise for the megakernel step-0 program.
+                model(**kwargs)
+                self._mtp_mk_step0_warm = True
             out = model(**kwargs)
 
         return self._unwrap_model_out(out)
+
+    def _use_mtp_mk_step0(
+        self, chunk: DraftChunkInputs, attn_metadata: dict, num_tokens: int
+    ) -> bool:
+        """Whether draft step 0 runs the MTP layer on the megakernel: every
+        request verifies K + 1 tokens and the step fits its buckets."""
+        mk = self._mtp_mk
+        if mk is None or self._mtp_mk_step0 is None:
+            return False
+        num_reqs = int(getattr(chunk, "num_reqs", 0) or 0)
+        qsl = getattr(chunk, "query_start_loc_np", None)
+        K = self.speculative_config.num_speculative_tokens
+        if (
+            num_reqs == 0
+            or qsl is None
+            or len(qsl) <= num_reqs
+            or qsl[0] != 0
+            or chunk.attn_ctx.position_ids_override is not None
+            or not np.all(np.diff(qsl[: num_reqs + 1]) == K + 1)
+        ):
+            return mk.note_step("s0_mixed", False)
+        return mk.use_for_step(attn_metadata, num_tokens, step0=True)
 
     def precompile(self) -> None:
         """Precompile the draft-side @torch.compile wrapper subgraphs.

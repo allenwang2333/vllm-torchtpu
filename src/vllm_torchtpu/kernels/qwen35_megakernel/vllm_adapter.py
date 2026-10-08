@@ -936,9 +936,18 @@ def pack_weights(
     e13_out: Any = _stack(e13_list) if stack_e else tuple(e13_list)
     e2_out: Any = _stack(e2_list) if stack_e else tuple(e2_list)
 
+    def _stack_gdn(xs: list[torch.Tensor], kind: str) -> torch.Tensor:
+        if xs:
+            return _stack(xs)
+        # An attention-only stack (the MTP draft layer) keeps one unread
+        # GatedDeltaNet operand of the tiled shape (`K.weight_shapes`).
+        shape, dt = K.weight_shapes(c, tiles)[kind]
+        _need(jnp.dtype(dt) == jnp.dtype(jnp.float8_e4m3fn), f"{kind} dtype {dt}")
+        return torch.zeros(shape, dtype=torch.float8_e4m3fn, device=final_norm_w.device)
+
     weights: dict[str, Any] = {
-        "lin_in": _stack(lin_in_list),
-        "lin_out": _stack(lin_out_list),
+        "lin_in": _stack_gdn(lin_in_list, "lin_in"),
+        "lin_out": _stack_gdn(lin_out_list, "lin_out"),
         "att_in": _stack(att_in_list),
         "att_out": _stack(att_out_list),
         "router": _stack(router_list),
