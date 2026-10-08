@@ -1461,15 +1461,16 @@ class TPUModelRunner(GPUModelRunner):
             return 0, 0
 
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
-
-        def segment(req_id: str) -> int:
-            # 0: 1-token decode, 1: speculative verify window,
-            # 2: prefill/mixed.
-            if scheduler_output.num_scheduled_tokens[req_id] == 1:
-                return 0
-            if req_id in spec_decode_tokens:
-                return 1
-            return 2
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        req_ids = self.input_batch.req_ids
+        # 0: 1-token decode, 1: speculative verify window, 2: prefill/mixed.
+        segments = [
+            0
+            if num_scheduled_tokens[req_id] == 1
+            else (1 if req_id in spec_decode_tokens else 2)
+            for req_id in req_ids[:num_reqs]
+            if req_id is not None
+        ]
 
         def partition(start: int, end: int, bound: int) -> int:
             """Two-pointer partition of [start, end]: requests with
@@ -1477,19 +1478,16 @@ class TPUModelRunner(GPUModelRunner):
             second part."""
             i, j = start, end
             while i < j:
-                i_req_id = self.input_batch.req_ids[i]
-                j_req_id = self.input_batch.req_ids[j]
-                assert i_req_id is not None
-                assert j_req_id is not None
-                if segment(i_req_id) <= bound:
+                if segments[i] <= bound:
                     i += 1
-                elif segment(j_req_id) > bound:
+                elif segments[j] > bound:
                     j -= 1
                 else:
                     self.input_batch.swap_states(i, j)
+                    segments[i], segments[j] = segments[j], segments[i]
                     i += 1
                     j -= 1
-            if i == j and segment(self.input_batch.req_ids[i]) <= bound:
+            if i == j and segments[i] <= bound:
                 i += 1
             return i
 
@@ -2186,6 +2184,9 @@ class TPUModelRunner(GPUModelRunner):
         token_in_tpu_pre_next_tokens_indices_list = []
         acc_cur_len = 0
         layout_plan = self._last_sequence_layout_plan
+        is_all_layout = (
+            layout_plan is None or layout_plan.kind is SequenceLayoutKind.ALL
+        )
 
         # 1+K for spec — `[bonus, draft_1..K]`), so a request's source span
         # starts at `position * stride`.
@@ -2196,16 +2197,20 @@ class TPUModelRunner(GPUModelRunner):
         ):
             stride = 1 + self.speculative_config.num_speculative_tokens
 
-        if layout_plan is None and num_reqs > 0:
-            req_id_to_index = self._pre_async_results.req_id_to_index_copy
-            req_ids = self.input_batch.req_ids
-            pos_arr = np.array(
-                [
-                    req_id_to_index.get(req_ids[start_index + i], -1)
-                    for i in range(num_reqs)
-                ],
-                dtype=np.int32,
-            )
+        if is_all_layout and num_reqs > 0:
+            cached_prefix = getattr(self, "_last_async_seq_idx_prefix", None)
+            if cached_prefix is not None and len(cached_prefix) == num_reqs:
+                pos_arr = cached_prefix
+            else:
+                req_id_to_index = self._pre_async_results.req_id_to_index_copy
+                req_ids = self.input_batch.req_ids
+                pos_arr = np.array(
+                    [
+                        req_id_to_index.get(req_ids[start_index + i], -1)
+                        for i in range(num_reqs)
+                    ],
+                    dtype=np.int32,
+                )
             valid_reqs = pos_arr >= 0
             if not valid_reqs.any():
                 return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
@@ -2248,9 +2253,10 @@ class TPUModelRunner(GPUModelRunner):
             src_start = self._pre_async_results.req_id_to_index_copy[req_id] * stride
             for j in range(n_sched):
                 request_major_index = acc_cur_len - n_sched + j
-                if layout_plan is None:
+                if is_all_layout:
                     cur_input_index = request_major_index
                 else:
+                    assert layout_plan is not None
                     cur_input_index = layout_plan.local_index_for_request_major_token(
                         request_major_index
                     )
@@ -2431,7 +2437,21 @@ class TPUModelRunner(GPUModelRunner):
             return None
 
         input_batch.update_req_spec_token_ids = guarded
+        block_table = getattr(input_batch, "block_table", None)
+        tables = getattr(block_table, "block_tables", None)
+        if isinstance(tables, (list, tuple)):
+            assert block_table is not None
+
+            def fast_append_row(block_ids, row_idx):
+                for bt, bids in zip(tables, block_ids):
+                    if bids:
+                        bt.append_row(bids, row_idx)
+
+            block_table.append_row = fast_append_row
         input_batch._tpu_spec_room_guard = True
+
+    def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
+        return
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
         invalidated_req_ids = (
@@ -3015,6 +3035,7 @@ class TPUModelRunner(GPUModelRunner):
         # Async spec: seq_lens/positions were advanced optimistically (every
         # draft from the previous step assumed accepted). Subtract the real
         # per-request rejected count on-device, keyed by req position.
+        self._last_async_seq_idx_prefix = None
         if (
             self.scheduler_config.async_scheduling
             and self.speculative_config
@@ -3034,6 +3055,7 @@ class TPUModelRunner(GPUModelRunner):
                 ],
                 dtype=np.int32,
             )
+            self._last_async_seq_idx_prefix = seq_idx_prefix
             reject_subtract_key = (
                 target_num_reqs,
                 padded_total_num_scheduled_tokens,
@@ -3074,15 +3096,17 @@ class TPUModelRunner(GPUModelRunner):
                 pos_idx_dev,
             )
 
-        # For decode-only case, cache constant device tensors to skip H2D.
-        # query_start_loc, logits_indices, and request_distribution don't
-        # change between decode steps for a given (num_reqs, padded_num_reqs).
-        is_decode_only = max_num_scheduled_tokens_all_reqs == 1
-        decode_cache_key = (
-            num_reqs,
-            padded_num_reqs,
-            use_max_model_len,
-            layout_plan.descriptor.cache_key,
+        # Prepare token substitution indices before spec_decode_metadata so
+        # get_spec_decode_metadata can skip redundant host draft_token_ids H2D
+        # transfers on cache hit when async token substitution will overwrite
+        # draft_token_ids on-device in execute_model.
+        cur_input_indices, pre_next_tokens_indices = (
+            self._prepare_async_token_substitution_indices(
+                start_index, num_reqs, num_scheduled_tokens_per_req
+            )
+        )
+        skip_host_draft_tokens = bool(
+            self.scheduler_config.async_scheduling and len(cur_input_indices) > 0
         )
 
         # Speculative decoding metadata.
@@ -3103,8 +3127,25 @@ class TPUModelRunner(GPUModelRunner):
                         num_draft_tokens,
                         self.query_start_loc_np[1 : num_reqs + 1],
                         padded_num_reqs,
+                        skip_host_draft_tokens=skip_host_draft_tokens,
                     )
                 )
+
+        # For decode-only and steady-state spec-verify steps, cache constant
+        # device tensors to skip H2D. query_start_loc, logits_indices, and
+        # request_distribution don't change between steps for a given bucket
+        # and scheduled-token layout.
+        is_decode_only = max_num_scheduled_tokens_all_reqs == 1
+        chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
+        decode_cache_key = (
+            num_reqs,
+            padded_num_reqs,
+            use_max_model_len,
+            layout_plan.descriptor.cache_key,
+            None
+            if spec_decode_metadata is None
+            else (chunk_num_decode, num_scheduled_tokens_per_req.tobytes()),
+        )
 
         # Default decode layouts keep logits_indices stable for a fixed
         # (num_reqs, padded_num_reqs) bucket. PCP streaming layouts provide
@@ -3112,18 +3153,20 @@ class TPUModelRunner(GPUModelRunner):
         # an interleave/rank boundary, so they must not reuse a stale cached
         # logits_indices tensor.
         can_cache_decode_metadata = (
-            is_decode_only
-            and spec_decode_metadata is None
-            and layout_plan.logits_indices_cpu is None
-        )
+            is_decode_only or spec_decode_metadata is not None
+        ) and layout_plan.logits_indices_cpu is None
 
         if (
             can_cache_decode_metadata
             and decode_cache_key == self._decode_device_cache_key
         ):
-            # Reuse cached device tensors — skip 3 H2D copies.
+            # Reuse cached device tensors — skip H2D copies.
             query_start_loc = self._cached_query_start_loc
-            logits_indices = self._cached_logits_indices
+            logits_indices = (
+                spec_decode_metadata.final_logits_indices
+                if spec_decode_metadata is not None
+                else self._cached_logits_indices
+            )
             request_distribution = self._cached_request_distribution
             assert query_start_loc is not None
             assert logits_indices is not None
@@ -3157,7 +3200,6 @@ class TPUModelRunner(GPUModelRunner):
             # [decode_end, prefill_end, mixed_end]. We put decode requests first,
             # no dedicated prefill-only bucket, and all remaining requests in
             # mixed mode.
-            chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
             self._request_distribution_cpu[0] = chunk_num_decode
             self._request_distribution_cpu[1] = chunk_num_decode
             self._request_distribution_cpu[2] = num_reqs
@@ -3189,7 +3231,6 @@ class TPUModelRunner(GPUModelRunner):
         mamba_request_distribution = None
         if self.mamba_slot_read_offsets is not None:
             chunk_num_windowed = max(0, min(num_windowed_reqs - start_index, num_reqs))
-            chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
             # One H2D copy, two views (see the staging tensor's comment for
             # why these must not be independent device tensors). Overrides
             # the RPA tensor built above so both fields always come from the
@@ -3223,13 +3264,13 @@ class TPUModelRunner(GPUModelRunner):
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
             query_start_loc_cpu=(
-                tuple(int(v) for v in self.query_start_loc_np[: target_num_reqs + 1])
+                tuple(self.query_start_loc_np[: target_num_reqs + 1].tolist())
                 if layout_plan.kind is SequenceLayoutKind.ALL
                 else None
             ),
             seq_lens_cpu=(
                 (
-                    tuple(int(v) for v in self.seq_lens_np[:num_reqs])
+                    tuple(self.seq_lens_np[:num_reqs].tolist())
                     + (0,) * (target_num_reqs - num_reqs)
                 )
                 if layout_plan.kind is SequenceLayoutKind.ALL
@@ -3238,10 +3279,9 @@ class TPUModelRunner(GPUModelRunner):
             prompt_lens_cpu=(
                 (
                     tuple(
-                        int(v)
-                        for v in self.input_batch.num_prompt_tokens[
+                        self.input_batch.num_prompt_tokens[
                             start_index : start_index + num_reqs
-                        ]
+                        ].tolist()
                     )
                     + (0,) * (target_num_reqs - num_reqs)
                 )
@@ -3284,13 +3324,6 @@ class TPUModelRunner(GPUModelRunner):
             )
 
             self.set_active_loras(self.input_batch, padded_num_scheduled_tokens_per_req)
-
-        # Prepare token substitution indices
-        cur_input_indices, pre_next_tokens_indices = (
-            self._prepare_async_token_substitution_indices(
-                start_index, num_reqs, num_scheduled_tokens_per_req
-            )
-        )
 
         self._collect_mamba_state_seed_copies(scheduler_output, start_index, num_reqs)
 
@@ -3928,6 +3961,7 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 pooler_output_list.append(pooler_output)
             else:
+                use_top_tokens = self._can_use_greedy_top_tokens(scheduler_output)
                 sample_hidden_states = (
                     sequence_layout_planner.maybe_select_logits_hidden_states(
                         hidden_states, layout_plan, logits_indices
@@ -3938,11 +3972,23 @@ class TPUModelRunner(GPUModelRunner):
                         hidden_states,
                         layout_plan,
                     )
-                    logits = self.compute_selected_logits(hidden_states, logits_indices)
+                    if use_top_tokens:
+                        logits = self.compute_selected_top_tokens(
+                            hidden_states, logits_indices
+                        )
+                    else:
+                        logits = self.compute_selected_logits(
+                            hidden_states, logits_indices
+                        )
                 else:
-                    logits = self.compute_logits_from_hidden_states(
-                        sample_hidden_states
-                    )
+                    if use_top_tokens:
+                        logits = self.compute_top_tokens_from_hidden_states(
+                            sample_hidden_states
+                        )
+                    else:
+                        logits = self.compute_logits_from_hidden_states(
+                            sample_hidden_states
+                        )
 
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
@@ -4188,6 +4234,8 @@ class TPUModelRunner(GPUModelRunner):
 
     def _greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
         """argmax logits, only used when `all_greedy` is True."""
+        if logits.ndim == 1:
+            return logits.unsqueeze(-1)
         dummy = torch.empty((1, 1), dtype=logits.dtype, device=logits.device)
         return self.sample_from_logits_func(
             logits,
@@ -5584,6 +5632,7 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_compute_selected_logits(self) -> None:
         hsize = self.model_config.get_hidden_size()
+        supports_top_tokens = self._model_supports_top_tokens()
         with self._precompile_timed("compute_selected_logits"):
             for num_tokens in self.num_tokens_paddings:
                 dummy_hidden = torch.zeros(
@@ -5594,6 +5643,11 @@ class TPUModelRunner(GPUModelRunner):
                     indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
                     out = self.compute_selected_logits(dummy_hidden, indices)
                     synchronize_tensors(out)
+                    if supports_top_tokens:
+                        out_top = self.compute_selected_top_tokens(
+                            dummy_hidden, indices
+                        )
+                        synchronize_tensors(out_top)
                     logger.info(
                         "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs
                     )
@@ -5602,6 +5656,7 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
+        supports_top_tokens = self._model_supports_top_tokens()
         with self._precompile_timed("compute_logits_from_hidden_states"):
             for num_reqs in self.num_reqs_paddings:
                 dummy_hidden = torch.zeros(
@@ -5610,6 +5665,9 @@ class TPUModelRunner(GPUModelRunner):
                 ).to(self.device)
                 out = self.compute_logits_from_hidden_states(dummy_hidden)
                 synchronize_tensors(out)
+                if supports_top_tokens:
+                    out_top = self.compute_top_tokens_from_hidden_states(dummy_hidden)
+                    synchronize_tensors(out_top)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
     def _precompile_structured_decoding(self) -> None:
@@ -5793,6 +5851,8 @@ class TPUModelRunner(GPUModelRunner):
         assert self.speculative_config is not None
         assert self.rejection_sampler is not None
         k = self.speculative_config.num_speculative_tokens
+        supports_top_tokens = self._model_supports_top_tokens()
+        hsize = self.model_config.get_hidden_size() if supports_top_tokens else 0
         # The verify chunk samples at most num_reqs*(K+1) positions; bound the
         # padded_logits_length sweep to the bucket that covers the full batch.
         # Use min here because num_reqs*(K+1) can exceed max_num_batched_tokens
@@ -5822,6 +5882,16 @@ class TPUModelRunner(GPUModelRunner):
                 group_indices = torch.zeros(num_tokens, dtype=torch.int32).to(
                     self.device
                 )
+                dummy_top_tokens = None
+                if supports_top_tokens:
+                    dummy_hidden = torch.zeros(
+                        (num_tokens, hsize),
+                        dtype=self._hidden_states_dtype,
+                    ).to(self.device)
+                    dummy_top_tokens = self.compute_selected_top_tokens(
+                        dummy_hidden, target_logits_indices
+                    )
+                    synchronize_tensors(dummy_top_tokens)
                 for num_reqs in self.num_reqs_paddings:
                     if not self._spec_verify_bucket_reachable(num_tokens, num_reqs):
                         continue
@@ -5836,6 +5906,13 @@ class TPUModelRunner(GPUModelRunner):
                         self.device
                     )
                     # --- greedy verify path (do_sampling=False) ---
+                    if dummy_top_tokens is not None:
+                        bonus_top, target_top = self.spec_bonus_and_target_logits(
+                            dummy_top_tokens,
+                            bonus_logits_indices,
+                            target_logits_indices,
+                        )
+                        synchronize_tensors([bonus_top, target_top])
                     bonus_token_ids, target_logits_warm = (
                         self.spec_bonus_and_target_logits(
                             dummy_logits, bonus_logits_indices, target_logits_indices
@@ -6904,6 +6981,55 @@ class TPUModelRunner(GPUModelRunner):
             top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
         )
 
+    def _model_supports_top_tokens(self) -> bool:
+        if getattr(self, "is_pooling_model", False):
+            return False
+        if getattr(self, "_dsv41_smoke_logits_hooked", False) or getattr(
+            type(self), "_dsv41_smoke_logits_hooked", False
+        ):
+            return False
+        if (
+            "compute_selected_logits" in self.__dict__
+            or "compute_logits_from_hidden_states" in self.__dict__
+        ):
+            return False
+        model = getattr(self, "model", None)
+        if model is None or "compute_logits" in getattr(model, "__dict__", {}):
+            return False
+        logits_processor = getattr(model, "logits_processor", None)
+        lm_head = getattr(model, "lm_head", None)
+        if logits_processor is None or lm_head is None:
+            return False
+        if getattr(logits_processor, "logits_as_input", None) is not False:
+            return False
+        scale = getattr(logits_processor, "scale", 1.0)
+        if (
+            isinstance(scale, bool)
+            or not isinstance(scale, (int, float))
+            or (scale <= 0.0 and scale != 1.0)
+        ):
+            return False
+        tp_size = getattr(lm_head, "tp_size", None)
+        shard_indices = getattr(lm_head, "shard_indices", None)
+        return (
+            type(tp_size) is int
+            and tp_size >= 1
+            and shard_indices is not None
+            and type(getattr(shard_indices, "num_org_vocab_padding", None)) is int
+            and callable(getattr(logits_processor, "get_top_tokens", None))
+        )
+
+    def _can_use_greedy_top_tokens(self, scheduler_output: "SchedulerOutput") -> bool:
+        return (
+            bool(self.input_batch.all_greedy)
+            and self.input_batch.max_num_logprobs is None
+            and not bool(
+                getattr(scheduler_output, "has_structured_output_requests", False)
+            )
+            and not self._dp_lockstep_enabled()
+            and self._model_supports_top_tokens()
+        )
+
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_logits(
         self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
@@ -6914,10 +7040,25 @@ class TPUModelRunner(GPUModelRunner):
         return self.model.compute_logits(selected)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_selected_top_tokens(
+        self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
+    ) -> torch.Tensor:
+        selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        return self.model.logits_processor.get_top_tokens(self.model.lm_head, selected)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_logits_from_hidden_states(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_top_tokens_from_hidden_states(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        return self.model.logits_processor.get_top_tokens(
+            self.model.lm_head, hidden_states
+        )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_bonus_and_target_logits(
@@ -6926,11 +7067,11 @@ class TPUModelRunner(GPUModelRunner):
         bonus_logits_indices: torch.Tensor,
         target_logits_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Spec-decode greedy verify prelude: compute argmax over all verify rows
-        # once and gather 1D bonus_token_ids and target_token_ids in ONE compiled
-        # region keyed on [num_tokens, num_reqs] shapes, avoiding materializing
-        # and re-reading the 2D [num_tokens, vocab_size] target_logits tensor.
-        token_ids = torch.argmax(logits, dim=-1)
+        # Spec-decode greedy verify prelude: accept either 1D pre-argmax'd
+        # token IDs (from compute_selected_top_tokens) or 2D [num_tokens,
+        # vocab_size] logits, and gather 1D bonus_token_ids and target_token_ids
+        # in ONE compiled region keyed on [num_tokens, num_reqs] shapes.
+        token_ids = logits if logits.ndim == 1 else torch.argmax(logits, dim=-1)
         bonus_token_ids = torch.index_select(token_ids, 0, bonus_logits_indices)
         target_token_ids = torch.index_select(token_ids, 0, target_logits_indices).to(
             torch.int32
@@ -6979,6 +7120,8 @@ class TPUModelRunner(GPUModelRunner):
         separately from `forward` for lighter compilation overhead.
         """
         if all_greedy:
+            if logits.ndim == 1:
+                return logits.unsqueeze(-1)
             return torch.argmax(logits, dim=-1, keepdim=True)
         is_greedy = temperatures <= SAMPLING_EPS
         scaled_logits = self._apply_temperature(logits, temperatures)
