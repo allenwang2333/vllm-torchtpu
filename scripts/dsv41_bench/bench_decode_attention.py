@@ -20,11 +20,18 @@ attending its full 128-row sliding window plus ``index_topk = 512`` sorted
 ``[C, kv_len / page_size]`` page table.
 
 Modes:
-  - ``head_parallel``: the serving path for ``tokens < 128 * tp`` today; each
-    rank attends all ``C`` tokens with its ``64 / tp`` heads.
+  - ``head_parallel``: the serving path when ``tokens < 6 * tp`` or
+    ``tokens % tp``; each rank attends all ``C`` tokens with its ``64 / tp``
+    heads.
   - ``token_parallel``: ``all_to_all`` q to ``[C / tp, 64, 512]``, attend this
     rank's ``C / tp`` requests with all 64 heads, ``all_to_all`` back
-    (`fp8_attention._token_parallel_body` without its ``tokens >= 1024`` gate).
+    (`fp8_attention._token_parallel_body` without its ``tokens >= 6 * tp``
+    gate).
+
+``--kv-shard owner`` (``token_parallel`` only) replaces the replicated pools
+with request-affine ones: rank ``r`` keeps only the main / RoPE / window rows
+of its owner-major requests ``[r * C / tp, (r + 1) * C / tp)``, addressed by
+remapped page tables and window records (`kv_shard.owner_shard`).
 
 Subops (``token_parallel`` subops other than ``all`` time this rank's local
 ``C / tp`` tokens with no collective; ``a2a_only`` times the two collectives):
@@ -32,7 +39,9 @@ Subops (``token_parallel`` subops other than ``all`` time this rank's local
 
 Each timed call runs ``--reps`` dependent repetitions inside one compiled
 ``fori_loop`` so host dispatch is amortized; reported samples are per rep.
-``--verify`` checks ``token_parallel`` vs ``head_parallel`` ``all`` outputs.
+``--verify`` checks ``token_parallel`` vs ``head_parallel`` ``all`` outputs
+(both on replicated pools unless ``--kv-shard owner``, which also compares
+against ``token_parallel`` on replicated pools).
 """
 
 import argparse
@@ -45,6 +54,7 @@ from typing import Any
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import common  # noqa: E402
+import kv_shard  # noqa: E402
 from bench_sparse_mla_swa import (  # noqa: E402
     FUSED_SWA_MATCH,
     _mla_tc_only_jax,
@@ -54,6 +64,7 @@ from bench_sparse_mla_swa import (  # noqa: E402
 
 SUBOPS = ("all", "swa_only", "sc_gather_only", "mla_tc_only", "a2a_only")
 MODES = ("head_parallel", "token_parallel")
+KV_SHARDS = ("replicated", "owner")
 ROPE_ROW_BYTES = 128
 NOPE_ROW_BYTES = 512
 SWA_ROW_BYTES = 1024
@@ -182,6 +193,9 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
     reps = args.reps
     if args.mode == "token_parallel" and seqs % tp:
         raise ValueError(f"token_parallel needs --num-seqs % tp == 0, got {seqs}")
+    kv_owner = getattr(args, "kv_shard", "replicated") == "owner"
+    if kv_owner and args.mode != "token_parallel":
+        raise ValueError("--kv-shard owner needs --mode token_parallel")
     tp_group = get_tp_group().device_group
     tp_rank = get_tp_group().rank_in_group
     tp_mesh = pallas.get_pallas_mesh(axis_names=("tp",), process_group=tp_group)
@@ -197,9 +211,15 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
         head_dim=head_dim,
         seed=args.seed,
     )
+    # Owner mode: this rank's request-affine pools, page table and records.
+    layout = dict(cpu)
+    if kv_owner:
+        layout.update(
+            kv_shard.owner_shard(cpu, rank=tp_rank, tp=tp, page_size=page_size)
+        )
     t_local = seqs // tp if seqs % tp == 0 else seqs
     t_start = tp_rank * t_local
-    dev = {k: v.to("tpu") for k, v in cpu.items()}
+    dev = {k: v.to("tpu") for k, v in layout.items()}
     q_hp = (
         cpu["q"][:, tp_rank * heads_local : (tp_rank + 1) * heads_local]
         .contiguous()
@@ -214,7 +234,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
     # Rank-local token slices for token_parallel subops without collectives.
     loc = {
         "q": cpu["q"][t_start : t_start + t_local].contiguous().to("tpu"),
-        "swa_records": cpu["swa_records"][t_start : t_start + t_local]
+        "swa_records": layout["swa_records"][t_start : t_start + t_local]
         .contiguous()
         .to("tpu"),
         "main_records": cpu["main_records"][t_start : t_start + t_local]
@@ -435,17 +455,32 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
         if args.verify and args.subop == "all" and seqs % tp == 0:
             hp1 = _op("verify_hp", looped_all(hp_once, 1), 10)
             tp1 = _op("verify_tp", looped_all(tp_once, 1), 10)
-            hp_args = full_args[:8] + (sink_hp, tp_rank_t)
+            # Replicated-pool args (owner mode copies them in only now).
+            rep = (
+                {k: cpu[k].to("tpu") for k in kv_shard.LOCAL_KEYS} if kv_owner else dev
+            )
+            rep_args = (
+                q_hp,
+                rep["swa_pool"],
+                rep["main_pool"],
+                rep["rope_pool"],
+                rep["swa_records"],
+                dev["main_records"],
+                rep["pages"],
+                dev["query_start_loc"],
+            )
+            hp_args = rep_args + (sink_hp, tp_rank_t)
             tp_args = full_args[:8] + (dev["sink"], tp_rank_t)
             out_hp = hp1(*hp_args)
             out_tp = tp1(*tp_args)
             common.synchronize((out_hp, out_tp))
             hp_cpu = out_hp.cpu()
+            tp_cpu = out_tp.cpu()
             verify_report["finite_head_parallel"] = bool(
                 torch.isfinite(hp_cpu.float()).all().item()
             )
             verify_report["token_parallel_vs_head_parallel"] = common.verify_outputs(
-                {"out": out_tp.cpu()},
+                {"out": tp_cpu},
                 {"out": hp_cpu},
                 common.LOSSLESS,
                 label="decode token_parallel vs head_parallel",
@@ -464,6 +499,22 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                     FUSED_SWA_MATCH,
                     label=f"decode {args.mode} fused_swa vs baseline",
                 )
+            if kv_owner:
+                out_rep = tp1(*rep_args, dev["sink"], tp_rank_t)
+                common.synchronize(out_rep)
+                rep_cpu = out_rep.cpu()
+                verify_report["owner_vs_replicated_token_parallel"] = (
+                    common.verify_outputs(
+                        {"out": tp_cpu},
+                        {"out": rep_cpu},
+                        common.LOSSLESS,
+                        label="decode owner vs replicated token_parallel",
+                    )
+                )
+                # Monotonic remaps keep gather order: expect bitwise equality.
+                verify_report["owner_vs_replicated_exact"] = common.compare_tensors(
+                    tp_cpu, rep_cpu, common.EXACT
+                )
 
     per_rep = [s / reps for s in loop_samples]
     bytes_hp = decode_bytes_per_rank(seqs, topk, window)
@@ -473,6 +524,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
         "subop": args.subop,
         "mode": args.mode,
         "fused_swa": fused_swa,
+        "kv_shard": "owner" if kv_owner else "replicated",
         "num_seqs": seqs,
         "kv_len": args.kv_len,
         "page_size": page_size,
@@ -482,6 +534,8 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
         "per_rep_median_ms": statistics.median(per_rep),
         "loop_median_ms": statistics.median(loop_samples),
         "gather_bytes_per_rank": bytes_tp if tp_mode else bytes_hp,
+        "kv_pool_bytes_per_rank": kv_shard.pool_bytes(layout),
+        "kv_pool_bytes_replicated": kv_shard.pool_bytes(cpu),
         "hbm_before": hbm_before,
         "hbm_after": hbm_after,
         "profile_dir": profile_dir,
@@ -494,6 +548,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     common.add_common_args(parser, SUBOPS)
     parser.add_argument("--mode", choices=list(MODES), default="head_parallel")
+    parser.add_argument(
+        "--kv-shard",
+        choices=list(KV_SHARDS),
+        default="replicated",
+        help="owner: request-affine pools per rank (token_parallel only)",
+    )
     parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--reps", type=int, default=20)
     parser.add_argument(

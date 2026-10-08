@@ -521,6 +521,86 @@ class TestBenchDecodeAttention:
                 ):
                     bda.worker(ctx, args)
 
+    def test_worker_kv_shard_owner_needs_token_parallel(self, tmp_path):
+        ctx = common.WorkerContext(0, 8, 8, None, tmp_path)
+        args = argparse.Namespace(
+            mode="head_parallel",
+            kv_shard="owner",
+            num_seqs=8,
+            kv_len=512,
+            page_size=16,
+            swa_max_requests=None,
+            reps=1,
+            seed=42,
+            subop="all",
+            warmup=0,
+            iters=1,
+            verify=False,
+        )
+        with pytest.raises(ValueError, match="--kv-shard owner needs --mode"):
+            bda.worker(ctx, args)
+
+    def test_worker_kv_shard_owner_verify(self, tmp_path):
+        ctx = common.WorkerContext(0, 8, 8, None, tmp_path)
+        calls: dict[str, list[tuple]] = {}
+
+        def recording_op(name, fn, *args, **kwargs):
+            def call(*xs):
+                calls.setdefault(name, []).append(xs)
+                return torch.full((8, 8, 512), 0.5, dtype=torch.bfloat16)
+
+            return call
+
+        args = argparse.Namespace(
+            mode="token_parallel",
+            kv_shard="owner",
+            num_seqs=8,
+            kv_len=512,
+            page_size=16,
+            swa_max_requests=None,
+            reps=2,
+            seed=42,
+            subop="all",
+            warmup=0,
+            iters=1,
+            verify=True,
+        )
+        with (
+            _TpuToCpuContext(),
+            patch("vllm.distributed.get_tp_group") as mock_tp,
+            patch("torch_tpu._internal.pallas.get_pallas_mesh"),
+            patch("torch_tpu._internal.pallas.jax_op", side_effect=recording_op),
+            patch.object(common, "model_wrapper_context"),
+            patch.object(common, "synchronize"),
+            patch.object(common, "hbm_stats", return_value={"hbm": 1024}),
+            patch.object(
+                common,
+                "time_steps",
+                side_effect=lambda c, step_fn, **kw: ([10.0], step_fn()),
+            ),
+            patch.object(common, "profile_steps", return_value=None),
+        ):
+            mock_tp.return_value.device_group = None
+            mock_tp.return_value.rank_in_group = 3
+            res = bda.worker(ctx, args)
+
+        assert res["kv_shard"] == "owner"
+        assert 0 < res["kv_pool_bytes_per_rank"] < res["kv_pool_bytes_replicated"]
+        verify = res["verify"]
+        assert verify["token_parallel_vs_head_parallel"]["out"]["ok"]
+        assert verify["owner_vs_replicated_token_parallel"]["out"]["ok"]
+        assert verify["owner_vs_replicated_exact"]["ok"]
+        # Arg 2 is main_pool: owner-local for the timed and verified owner runs,
+        # replicated for both references.
+        prefix = "pallas::dsv41_bench_decode_"
+        timed = calls[prefix + "all_token_parallel"][0]
+        head_ref = calls[prefix + "verify_hp"][0]
+        owner_run, replicated_run = calls[prefix + "verify_tp"]
+        assert timed[2].shape[0] < head_ref[2].shape[0]
+        assert owner_run[2].shape == timed[2].shape
+        assert replicated_run[2].shape == head_ref[2].shape
+        assert not torch.equal(owner_run[6], replicated_run[6])
+
     def test_bda_main_and_entrypoint(self, monkeypatch):
         mock_run = MagicMock()
         with patch.object(common, "run_main", mock_run):
