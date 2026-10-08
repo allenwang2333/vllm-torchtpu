@@ -325,7 +325,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     ROWSL = rup(max(1, cfg.n_local(max_pages * pg * R, 0)) // 128 + 1, 128)   # local key rows
     ROWSL = max(ROWSL, 128)
     assert ROWSL <= 128 * 1024
-    NC_ = KT // 128                                      # attention chunks per row (max)
+    UR_ = TMAX * KR_ + BMAX                              # flat union rows (sum of ceil(nu/128))
     lay, S = smalls_layout(cfg)
     wk = weight_kinds(cfg)
     ck = cache_kinds(cfg, nb)
@@ -420,15 +420,19 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         "own_s": pltpu.SMEM((TMAX * KR_, 128), I32), "own_v": pltpu.VMEM((TMAX, KR_, 128), I32),
         "nown_s": pltpu.SMEM((TMAX,), I32),
         # per-request union of the rows' owned winners (+ per-row membership over it)
-        "own_u": pltpu.SMEM((BMAX * KR_, 128), I32), "own_uv": pltpu.VMEM((BMAX, KR_, 128), I32),
-        "mem_s": pltpu.SMEM((TMAX * KR_, 128), I32), "mem_v": pltpu.VMEM((TMAX, KR_, 128), I32),
-        "nu_s": pltpu.SMEM((BMAX,), I32),
+        "own_u": pltpu.SMEM((UR_, 128), I32), "own_uv": pltpu.VMEM((UR_, 128), I32),
+        "memb": pltpu.SMEM((UR_, 128), I32), "memb_v": pltpu.VMEM((UR_, 128), I32),
+        "nu_s": pltpu.SMEM((BMAX,), I32), "uo_s": pltpu.SMEM((BMAX,), I32),
         "misc_sem": pltpu.SemaphoreType.DMA(()),
         # attention
         "g_nope": pltpu.VMEM((2, KT, 128), U32), "g_rope": pltpu.VMEM((2, KT, 128), U32),
         "g_sem": pltpu.SemaphoreType.DMA((2, 2)),
         "kvb": pltpu.VMEM((KT, KL), BF16),
-        "s_all": pltpu.VMEM((NC_, NH, 128), F32),
+        # a request's rows stacked on M: q (nope, rope by segment), online-softmax state
+        "qb": pltpu.VMEM((cfg.QMAX * NH, KL), BF16),
+        "q0b": pltpu.VMEM((4, cfg.QMAX * NH, 128), BF16), "q1b": pltpu.VMEM((4, cfg.QMAX * NH, 128), BF16),
+        "att_acc": pltpu.VMEM((cfg.QMAX * NH, KL), F32),
+        "m_s": pltpu.VMEM((cfg.QMAX * NH, 1), F32), "l_s": pltpu.VMEM((cfg.QMAX * NH, 1), F32),
         "osend": pltpu.VMEM((R, TMAX, OW), U32), "orecv": pltpu.VMEM((R, TMAX, OW), U32),
         "orow": pltpu.VMEM((M, KRO), F32),
         # reduce-scatter
@@ -931,12 +935,20 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             ph.mark("L_kvw")
             stage_rows(l)
 
+            @pl.when(jnp.logical_not(full_idx))
+            def _():
+                attn_first(l)
+
             # 7: indexer (fresh top-k layers)
             ph.mark("L_index")
 
             @pl.when(jnp.logical_and(full_idx, "index" not in skip))
             def _():
                 indexer(l, slot)
+
+            @pl.when(full_idx)
+            def _():
+                attn_first(l)
 
             # 9: per row: gather + attention -> partial + lse
             ph.mark("L_attn")
@@ -1085,12 +1097,15 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 return c
             lax.fori_loop(0, T, per_row, 0)
 
-            def per_req_u(b, c):
-                @pl.when(qmeta[b, 3] > 0)
-                def _():
-                    build_union(b)
-                return c
-            lax.fori_loop(0, B, per_req_u, 0)
+            def per_req_u(b, off):
+                return lax.cond(qmeta[b, 3] > 0, lambda: build_union(b, off), lambda: off)
+            lax.fori_loop(0, B, per_req_u, jnp.int32(0))
+            cpu = [pltpu.make_async_copy(scr["own_u"], scr["own_uv"], scr["misc_sem"]),
+                   pltpu.make_async_copy(scr["memb"], scr["memb_v"], scr["misc_sem"])]
+            for c_ in cpu:
+                c_.start()
+            for c_ in cpu:
+                c_.wait()
             pltpu.make_async_copy(scr["rec_v"], irec_out.at[l], scr["kvw_sem"].at[2]).wait()
             pi.end()
 
@@ -1184,10 +1199,11 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                     cp.start()
                     cp.wait()
 
-        def build_union(b):
-            """Request b's rows' owned winner lists (ascending local indices) -> their sorted union
-            own_u[b] (+ own_uv[b], nu_s[b]) and, per row, its membership mask over the union
-            positions mem_v[t] (0/1): attention gathers and decodes the union once per request."""
+        def build_union(b, off):
+            """Request b's rows' owned winner lists (ascending local indices) -> their merged union at
+            flat rows [off, off + ceil(nu/128)) of own_u, with memb = the bitmask of the request's rows
+            (bit qq) holding each entry; nu_s[b], uo_s[b] = (nu, off). Returns the next free row.
+            Sum over requests of ceil(nu/128) <= T*KR_ + B: the flat arrays never overflow."""
             t0 = qmeta[b, 0]
             nq = qmeta[b, 1]
             QM = cfg.QMAX
@@ -1212,30 +1228,23 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 m = hs[0]
                 for h in hs[1:]:
                     m = jnp.minimum(m, h)
-                scr["own_u"][b * KR_ + (k >> 7), k & 127] = m
+                bits = jnp.int32(0)
                 new_ps = []
-                took = jnp.int32(0)
                 for qq in range(QM):
-                    hit = hs[qq] == m
-                    t_ = jnp.minimum(t0 + qq, TMAX - 1)
-                    scr["mem_s"][t_ * KR_ + (k >> 7), k & 127] = hit.astype(I32)
-                    new_ps.append(ps[qq] + hit.astype(I32))
-                    took = took + hit.astype(I32)
+                    hit = (hs[qq] == m).astype(I32)
+                    bits = bits | (hit << qq)
+                    new_ps.append(ps[qq] + hit)
+                p = off * 128 + k
+                scr["own_u"][p >> 7, p & 127] = m
+                scr["memb"][p >> 7, p & 127] = bits
+                took = bits & 1
+                for qq in range(1, QM):
+                    took = took + ((bits >> qq) & 1)
                 return (consumed + took, k + 1, *new_ps)
             res = lax.while_loop(cond, body, (jnp.int32(0), jnp.int32(0)) + (jnp.int32(0),) * QM)
             scr["nu_s"][b] = res[1]
-            cp = pltpu.make_async_copy(scr["own_u"].at[pl.ds(b * KR_, KR_)], scr["own_uv"].at[b],
-                                       scr["misc_sem"])
-            cp.start()
-            cp.wait()
-            for qq in range(QM):
-                @pl.when(qq < nq)
-                def _(qq=qq):
-                    t_ = t0 + qq
-                    c2 = pltpu.make_async_copy(scr["mem_s"].at[pl.ds(t_ * KR_, KR_)], scr["mem_v"].at[t_],
-                                               scr["misc_sem"])
-                    c2.start()
-                    c2.wait()
+            scr["uo_s"][b] = off
+            return off + (res[1] + 127) // 128
 
         def global_row(t_):
             """Row t_'s global top-KT over all ranks' candidates -> own_s / own_v / nown_s."""
@@ -1270,55 +1279,70 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             cp.wait()
 
         # ---------------- attention ----------------
+        QN = cfg.QMAX * NH                                   # a request's rows x heads (MXU M dim)
+
+        def nu_of(b):
+            b_c = jnp.minimum(b, BMAX - 1)
+            return jnp.where(jnp.logical_and(b < B, qmeta[b_c, 3] > 0), scr["nu_s"][b_c], 0)
+
+        def tile_n(b, j):
+            return jnp.clip(nu_of(b) - j * KT, 0, KT)
+
+        def attn_issue(l, b, buf, j):
+            """Start the gather of tile j (union entries j*KT ..) of request b into buffer buf: HBM
+            rows, or this step's own new rows from the VMEM staging (not in HBM yet)."""
+            b_c = jnp.minimum(b, BMAX - 1)
+            n = tile_n(b, j)
+            base = scr["uo_s"][b_c] * 128 + j * KT
+            t0r, nqr, p0r, noldr = req_new(b_c)
+
+            def go(rn, rr):
+                def gbody(k, c2):
+                    p = base + k
+                    lo = scr["own_u"][p >> 7, p & 127]
+                    new = lo >= noldr
+
+                    @pl.when(jnp.logical_not(new))
+                    def _():
+                        page = bt[b_c, lo >> lg_pg]
+                        sl = lo & (pg - 1)
+                        pltpu.make_async_copy(rn.at[page, pl.ds(sl, 1)], scr["g_nope"].at[buf, pl.ds(k, 1)],
+                                              scr["g_sem"].at[buf, 0]).start()
+                        pltpu.make_async_copy(rr.at[page, pl.ds(sl >> 2, 1)],
+                                              scr["g_rope"].at[buf, pl.ds(k, 1)], scr["g_sem"].at[buf, 1]).start()
+
+                    @pl.when(new)
+                    def _():
+                        g = (lo // ILV) * G_ + me * ILV + lo % ILV
+                        t2 = jnp.clip(t0r + (g - p0r), 0, TMAX - 1)
+                        pltpu.make_async_copy(scr["wrow"].at[pl.ds(t2, 1)], scr["g_nope"].at[buf, pl.ds(k, 1)],
+                                              scr["g_sem"].at[buf, 0]).start()
+                        pltpu.make_async_copy(scr["rwrow"].at[pl.ds(t2, 1)], scr["g_rope"].at[buf, pl.ds(k, 1)],
+                                              scr["g_sem"].at[buf, 1]).start()
+                    return c2
+                lax.fori_loop(0, n, gbody, 0)
+            if "gather" not in skip:
+                csel(("nope", "rope"), l, go)
+
+        def attn_first(l):
+            """Request 0's first tile: issued as early as its inputs allow (after the indexer on
+            fresh top-k layers, after the staging otherwise) so it flies under the q all-gather."""
+            @pl.when(B > 0)
+            def _():
+                attn_issue(l, jnp.int32(0), 0, jnp.int32(0))
+
         def attention(l):
-            """Per request: gather the union of its rows' owned winners once (this step's own new
-            rows come from the VMEM staging: they are not in HBM yet), decode its nope bands once;
-            per row of the request: attention over all NH heads restricted to the row's own winners
-            (membership mask over the union) -> osend[d, t]: the bf16 normalized partial of heads
-            d*HR.. packed in u32 pairs | lse (f32 bits) in the tail lanes (lse = m + ln l; -inf if
-            this rank owns none of the row's winners)."""
+            """Per request: its rows' q stacked on the MXU M axis ([QMAX*NH, .]); over tiles of the
+            union of its rows' owned winners (gathered + nope-decoded once per request), online
+            softmax with each row restricted to its own winners (membership bits) -> per row
+            osend[d, t]: the bf16 normalized partial of heads d*HR.. packed in u32 pairs | lse (f32
+            bits) in the tail lanes (lse = m + ln l; -inf if this rank owns none of the row's winners)."""
             lane_h = lax.broadcasted_iota(I32, (NH, 128), 1)
+            row_q = lax.broadcasted_iota(I32, (QN, 1), 0) // NH
             NEG = jnp.finfo(F32).min
 
-            def nu_of(b):
-                b_c = jnp.minimum(b, BMAX - 1)
-                return jnp.where(jnp.logical_and(b < B, qmeta[b_c, 3] > 0), scr["nu_s"][b_c], 0)
-
-            def issue(b, buf):
-                """Start request b's union gather into buffer buf."""
-                b_c = jnp.minimum(b, BMAX - 1)
-                n = nu_of(b)
-                t0r, nqr, p0r, noldr = req_new(b_c)
-
-                def go(rn, rr):
-                    def gbody(k, c2):
-                        lo = scr["own_u"][b_c * KR_ + (k >> 7), k & 127]
-                        new = lo >= noldr
-
-                        @pl.when(jnp.logical_not(new))
-                        def _():
-                            page = bt[b_c, lo >> lg_pg]
-                            sl = lo & (pg - 1)
-                            pltpu.make_async_copy(rn.at[page, pl.ds(sl, 1)], scr["g_nope"].at[buf, pl.ds(k, 1)],
-                                                  scr["g_sem"].at[buf, 0]).start()
-                            pltpu.make_async_copy(rr.at[page, pl.ds(sl >> 2, 1)],
-                                                  scr["g_rope"].at[buf, pl.ds(k, 1)], scr["g_sem"].at[buf, 1]).start()
-
-                        @pl.when(new)
-                        def _():
-                            g = (lo // ILV) * G_ + me * ILV + lo % ILV
-                            t2 = jnp.clip(t0r + (g - p0r), 0, TMAX - 1)
-                            pltpu.make_async_copy(scr["wrow"].at[pl.ds(t2, 1)], scr["g_nope"].at[buf, pl.ds(k, 1)],
-                                                  scr["g_sem"].at[buf, 0]).start()
-                            pltpu.make_async_copy(scr["rwrow"].at[pl.ds(t2, 1)], scr["g_rope"].at[buf, pl.ds(k, 1)],
-                                                  scr["g_sem"].at[buf, 1]).start()
-                        return c2
-                    lax.fori_loop(0, n, gbody, 0)
-                if "gather" not in skip:
-                    csel(("nope", "rope"), l, go)
-
-            def wait(b, buf):
-                n = nu_of(b)
+            def wait(b, buf, j):
+                n = tile_n(b, j)
                 ref0 = C["nope"][next(iter(C["nope"]))]
                 rref0 = C["rope"][next(iter(C["rope"]))]
 
@@ -1331,18 +1355,30 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 if "gather" not in skip:
                     lax.fori_loop(0, n, wbody, 0)
 
-            def request(b, c):
-                pa = Phases(tiles.trace)
-                pa.mark("A_gather")
-                buf = b % 2
-                nu = nu_of(b)
-                wait(b, buf)
+            def qload(t0):
+                """q of the request's QMAX rows (rows past nq: whatever is there; masked later)."""
+                for qq in range(cfg.QMAX):
+                    t_ = jnp.minimum(t0 + qq, TMAX - 1)
+                    heads = []
+                    for s_ in range(R):
+                        u = scr["qall"][s_, pl.ds(t_, 1), :]                 # [1, QH] u32
+                        full = jnp.concatenate([unpack_lo(u), unpack_hi(u)], axis=1)
+                        heads += [full[:, hh * QA:(hh + 1) * QA] for hh in range(HR)]
+                    Q = jnp.concatenate(heads, axis=0)                       # [NH, QA] f32
+                    r0 = qq * NH
+                    scr["qb"][r0:r0 + NH, :] = Q[:, 0:KL].astype(BF16)
+                    xr = Q[:, KL:QA]                                         # rope dims in lanes 0..DR-1
+                    q0 = jnp.where(lane_h < 32, xr, 0.0)                      # dims 0..31
+                    q1 = jnp.where(lane_h < 32, pltpu.roll(xr, 96, 1), 0.0)   # dims 32..63
+                    for sg in range(4):
+                        scr["q0b"][sg, r0:r0 + NH, :] = (pltpu.roll(q0, 32 * sg, 1) if sg else q0).astype(BF16)
+                        scr["q1b"][sg, r0:r0 + NH, :] = (pltpu.roll(q1, 32 * sg, 1) if sg else q1).astype(BF16)
 
-                @pl.when(b + 1 < B)
-                def _():
-                    issue(b + 1, 1 - buf)                # flies under this request's compute
+            def tile(b, buf, j, nu, pa):
                 gn, gr = scr["g_nope"].at[buf], scr["g_rope"].at[buf]
-                nc = jnp.where("attn" in skip, 0, (nu + 127) // 128)
+                base = j * KT
+                nc = jnp.where("attn" in skip, 0, (tile_n(b, j) + 127) // 128)
+                urow = scr["uo_s"][jnp.minimum(b, BMAX - 1)] + base // 128
                 pa.mark("A_decode")
 
                 def d_body(ci, c2):                      # nope bands, once per request
@@ -1352,75 +1388,47 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                         scr["kvb"][pl.ds(r0, 128), b_ * 128:(b_ + 1) * 128] = fp8_decode_hw(shr(w, 8 * b_) & 0xFF)
                     return c2
                 lax.fori_loop(0, nc, d_body, 0)
-                t0 = qmeta[jnp.minimum(b, BMAX - 1), 0]
-                nq = qmeta[jnp.minimum(b, BMAX - 1), 1]
-
-                for qq in range(cfg.QMAX):
-                    @pl.when(qq < nq)
-                    def _(qq=qq):
-                        row(t0 + qq, gr, nc, nu, pa)
-                pa.end()
-                return c
-
-            def row(t_, gr, nc, nu, pa):
-                pa.mark("A_qasm")
-                n = jnp.where(rmeta[t_, 0] > 0, scr["nown_s"][t_], 0)
-                req = rmeta[t_, 2]
-                # q of all NH heads of row t_: R sources x HR heads, unpacked from u32 pairs
-                heads = []
-                for s_ in range(R):
-                    u = scr["qall"][s_, pl.ds(t_, 1), :]                     # [1, QH] u32
-                    full = jnp.concatenate([unpack_lo(u), unpack_hi(u)], axis=1)   # [1, HR*QA]
-                    heads += [full[:, hh * QA:(hh + 1) * QA] for hh in range(HR)]
-                Q = jnp.concatenate(heads, axis=0)                           # [NH, QA] f32
-                qn = Q[:, 0:KL].astype(BF16)
-                xr = Q[:, KL:QA]                                             # rope dims in lanes 0..DR-1
-                q0 = jnp.where(lane_h < 32, xr, 0.0)                          # dims 0..31
-                q1 = jnp.where(lane_h < 32, pltpu.roll(xr, 96, 1), 0.0)       # dims 32..63
-                q0s = [q0.astype(BF16)] + [pltpu.roll(q0, 32 * sg, 1).astype(BF16) for sg in (1, 2, 3)]
-                q1s = [q1.astype(BF16)] + [pltpu.roll(q1, 32 * sg, 1).astype(BF16) for sg in (1, 2, 3)]
                 pa.mark("A_score")
 
-                def s_body(ci, c2):
+                def c_body(ci, c2):
                     r0 = pl.multiple_of(ci * 128, 128)
-                    s = jnp.zeros((NH, 128), F32)
+                    s = jnp.zeros((QN, 128), F32)
                     for b_ in range(4):
-                        s = s + lax.dot_general(qn[:, b_ * 128:(b_ + 1) * 128],
+                        s = s + lax.dot_general(scr["qb"][:, b_ * 128:(b_ + 1) * 128],
                                                 scr["kvb"][pl.ds(r0, 128), b_ * 128:(b_ + 1) * 128], NT,
                                                 preferred_element_type=F32)
                     rw_ = lax.bitcast_convert_type(gr[pl.ds(r0, 128), :], I32)
                     B0 = fp8_decode_hw(rw_ & 0xFF)
                     B1 = fp8_decode_hw(shr(rw_, 8) & 0xFF)
-                    iv = scr["own_uv"][req, pl.ds(ci, 1), :]                 # [1, 128] local idx
+                    iv = scr["own_uv"][pl.ds(urow + ci, 1), :]               # [1, 128] local idx
                     seg = iv & 3
                     for sg in range(4):
-                        ss = (lax.dot_general(q0s[sg], B0, NT, preferred_element_type=F32)
-                              + lax.dot_general(q1s[sg], B1, NT, preferred_element_type=F32))
+                        ss = (lax.dot_general(scr["q0b"][sg], B0, NT, preferred_element_type=F32)
+                              + lax.dot_general(scr["q1b"][sg], B1, NT, preferred_element_type=F32))
                         s = s + jnp.where(seg == sg, ss, 0.0)
                     s = s * sm_scale
-                    mem = scr["mem_v"][t_, pl.ds(ci, 1), :]                  # [1, 128] 0/1
-                    kk = ci * 128 + lax.broadcasted_iota(I32, (1, 128), 1)
-                    s = jnp.where(jnp.logical_and(kk < nu, mem == 1), s, NEG)
-                    scr["s_all"][ci] = s
-                    return c2
-                lax.fori_loop(0, nc, s_body, 0)
-
-                pa.mark("A_pv")
-
-                def m_body(ci, m):
-                    return jnp.maximum(m, jnp.max(scr["s_all"][ci], axis=1, keepdims=True))
-                mx = lax.fori_loop(0, nc, m_body, jnp.full((NH, 1), NEG, F32))
-
-                def pv_body(ci, carry2):
-                    lsum, pv = carry2
-                    p = jnp.exp(scr["s_all"][ci] - mx)
-                    r0 = pl.multiple_of(ci * 128, 128)
+                    bits = scr["memb_v"][pl.ds(urow + ci, 1), :]             # [1, 128] row bits
+                    kk = base + ci * 128 + lax.broadcasted_iota(I32, (1, 128), 1)
+                    mask = jnp.logical_and(((bits >> row_q) & 1) == 1, kk < nu)   # [QN, 128]
+                    s = jnp.where(mask, s, NEG)
+                    m_old = scr["m_s"][...]
+                    m_new = jnp.maximum(m_old, jnp.max(s, axis=1, keepdims=True))
+                    alpha = jnp.exp(m_old - m_new)
+                    p = jnp.where(mask, jnp.exp(s - m_new), 0.0)
                     kv = scr["kvb"][pl.ds(r0, 128), :].astype(F32)
-                    return (lsum + jnp.sum(p, axis=1, keepdims=True),
-                            pv + lax.dot_general(p, kv, NN, preferred_element_type=F32))
-                lsum, pv = lax.fori_loop(0, nc, pv_body, (jnp.zeros((NH, 1), F32),
-                                                         jnp.zeros((NH, KL), F32)))
-                pa.mark("A_send")
+                    scr["l_s"][...] = alpha * scr["l_s"][...] + jnp.sum(p, axis=1, keepdims=True)
+                    scr["att_acc"][...] = alpha * scr["att_acc"][...] + lax.dot_general(p, kv, NN,
+                                                                                preferred_element_type=F32)
+                    scr["m_s"][...] = m_new
+                    return c2
+                lax.fori_loop(0, nc, c_body, 0)
+
+            def emit(t_, qq):
+                n = jnp.where(rmeta[t_, 0] > 0, scr["nown_s"][t_], 0)
+                r0 = qq * NH
+                lsum = scr["l_s"][r0:r0 + NH, :]
+                mx = scr["m_s"][r0:r0 + NH, :]
+                pv = scr["att_acc"][r0:r0 + NH, :]
                 has = n > 0
                 out = jnp.where(has, bf(pv * pl.reciprocal(jnp.maximum(lsum, 1e-30), approx=True)), 0.0)
                 lse = jnp.where(has, mx + jnp.log(jnp.maximum(lsum, 1e-30)), -jnp.inf)    # [NH, 1]
@@ -1437,9 +1445,41 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                     scr["osend"][d, pl.ds(t_, 1), :] = jnp.concatenate(
                         [pack2(od[:, :OH], od[:, OH:]), lax.bitcast_convert_type(lrow, U32)], axis=1)
 
-            @pl.when(B > 0)
-            def _():
-                issue(jnp.int32(0), 0)
+            def request(b, c):
+                pa = Phases(tiles.trace)
+                buf = b % 2
+                nu = nu_of(b)
+                b_c = jnp.minimum(b, BMAX - 1)
+                t0 = qmeta[b_c, 0]
+                nq = qmeta[b_c, 1]
+                pa.mark("A_qasm")
+                qload(t0)                                # under the in-flight gather
+                scr["m_s"][...] = jnp.full((QN, 1), NEG, F32)
+                scr["l_s"][...] = jnp.zeros((QN, 1), F32)
+                scr["att_acc"][...] = jnp.zeros((QN, KL), F32)
+                pa.mark("A_gather")
+                wait(b, buf, 0)
+
+                @pl.when(b + 1 < B)
+                def _():
+                    attn_issue(l, b + 1, 1 - buf, jnp.int32(0))   # flies under this request's compute
+                tile(b, buf, jnp.int32(0), nu, pa)
+
+                def more(j, c2):                         # union > KT (top-k skewed onto this rank)
+                    pa.mark("A_gather")
+                    attn_issue(l, b, buf, j)
+                    wait(b, buf, j)
+                    tile(b, buf, j, nu, pa)
+                    return c2
+                lax.fori_loop(1, (nu + KT - 1) // KT, more, 0)
+                pa.mark("A_send")
+                for qq in range(cfg.QMAX):
+                    @pl.when(qq < nq)
+                    def _(qq=qq):
+                        emit(t0 + qq, qq)
+                pa.end()
+                return c
+
             lax.fori_loop(0, B, request, 0)
 
         def merge():
@@ -1671,7 +1711,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         scr["osend"][...] = jnp.zeros(scr["osend"].shape, U32)
         scr["own_v"][...] = jnp.full(scr["own_v"].shape, -1, I32)
         scr["own_uv"][...] = jnp.full(scr["own_uv"].shape, -1, I32)
-        scr["mem_v"][...] = jnp.zeros(scr["mem_v"].shape, I32)
+        scr["memb_v"][...] = jnp.zeros(scr["memb_v"].shape, I32)
 
         def zn(t_, c):
             scr["nown_s"][t_] = jnp.int32(0)
@@ -1680,6 +1720,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
         def zb(b_, c):
             scr["nu_s"][b_] = jnp.int32(0)
+            scr["uo_s"][b_] = jnp.int32(0)
             return c
         lax.fori_loop(0, BMAX, zb, 0)
         if "weights" in skip:
