@@ -366,6 +366,18 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.compute_logits(hidden_states)
 
+    def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's vocab shard of U_k, without the TP all-gather.
+
+        Columns index ``lm_head``'s padded local vocab partition; the
+        proposer's TP-sharded Markov sampler scores each shard locally and
+        reduces only the per-request (max, token id) pair across ranks.
+        """
+        assert self.lm_head is not None
+        return self.logits_processor(
+            self.lm_head, self.model.norm(hidden_states), skip_gather=True
+        )
+
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids
 

@@ -711,6 +711,8 @@ def test_dspark_deepseek_v41_for_causal_lm_forward_and_hooks(
     # Logits, Markov head, and Confidence head
     logits = draft_lm.compute_draft_logits(out_from_ids)
     assert logits.shape == (4, 32)
+    # Without TP the skip-gather shard is the whole (unpadded) vocab.
+    assert torch.equal(draft_lm.compute_draft_logits_local(out_from_ids), logits)
     assert torch.equal(draft_lm.map_draft_to_target(input_ids), input_ids)
 
     m_embed = draft_lm.markov_embed(input_ids)

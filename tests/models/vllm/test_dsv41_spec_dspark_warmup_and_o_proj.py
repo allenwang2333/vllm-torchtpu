@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import os
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -376,15 +376,19 @@ class TestDSparkProposerFull:
             ):
                 proposer.load_model(target_model)
 
-        # All attributes present
+        # All attributes present. The MagicMock lm_head is not a TP-sharded
+        # ParallelLMHead, so the sharded Markov sampler stays disabled.
         mock_draft = MagicMock()
         for a in attrs:
             setattr(mock_draft, a, MagicMock())
         proposer.draft_model = mock_draft
+        proposer._draft_replicated = False
         with patch.object(
             DSparkProposer.__bases__[0], "load_model", lambda self, tm: None
         ):
             proposer.load_model(target_model)
+        assert proposer._sharded_markov_tp == 1
+        assert proposer._markov_w2_local is None
 
     def test_dflash_forward_and_sample_wrapped_execution(self):
         # Test unwrapped method body across both sample_from_anchor=True
@@ -393,6 +397,12 @@ class TestDSparkProposerFull:
 
         proposer = MagicMock()
         proposer.sample_from_anchor = True
+        # Replicated lm_head: the full-vocab Markov chain runs, via the real
+        # helper bound to the mock proposer.
+        proposer._sharded_markov_tp = 1
+        proposer._sample_markov_replicated = MethodType(
+            DSparkProposer._sample_markov_replicated, proposer
+        )
 
         # Set up mock draft model
         hidden_dim = 64
