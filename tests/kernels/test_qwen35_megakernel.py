@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from vllm_torchtpu.kernels.qwen35_megakernel import megakernel as K
+from vllm_torchtpu.kernels.qwen35_megakernel import pool_io
 from vllm_torchtpu.kernels.qwen35_megakernel.vllm_adapter import (
     MKABCalibrator,
     Qwen35Megakernel,
@@ -35,6 +36,7 @@ from vllm_torchtpu.kernels.qwen35_megakernel.vllm_adapter import (
     pack_weights,
     parse_mk_ab_enabled,
     parse_mk_buckets,
+    parse_mk_fused_pool_io,
     parse_mk_verify_buckets,
     prepare_step_metadata,
     reshard_layer_experts_ep_to_tp,
@@ -386,3 +388,165 @@ def test_mk_ab_calibrator():
     cal.reset()
     assert cal.counts == {}
     assert cal.summary_dict(window=False) == {}
+
+
+def test_fused_pool_io_parsing_and_hlo_guard():
+    assert parse_mk_fused_pool_io(None) is True
+    assert parse_mk_fused_pool_io("1") is True
+    assert parse_mk_fused_pool_io("true") is True
+    assert parse_mk_fused_pool_io("0") is False
+    assert parse_mk_fused_pool_io("false") is False
+    assert parse_mk_fused_pool_io("off") is False
+
+    good_hlo = """
+    HloModule fused_mk
+    ENTRY main {
+      %p0 = f8e4m3fn[4096,2,64,4,128]{4,3,2,1,0:T(8,128)} parameter(0)
+      %call = bf16[16,4096]{1,0:T(8,128)S(1)} custom-call(%p0), custom_call_target="tpu_custom_call"
+      ROOT %tup = (bf16[16,4096]{1,0:T(8,128)}, f8e4m3fn[4096,2,64,4,128]{4,3,2,1,0:T(8,128)}) tuple(%call, %p0)
+    }
+    """
+    ok, reason = pool_io.check_fused_pool_hlo(good_hlo, page_size=128)
+    assert ok is True
+    assert reason == "ok"
+
+    bad_vmem_hlo = """
+    HloModule bad_mk
+    ENTRY main {
+      %p0 = f8e4m3fn[64,2,64,4,128]{4,3,2,1,0:T(8,128)} parameter(0)
+      %cs = (f8e4m3fn[64,2,64,4,128]{4,3,2,1,0:T(8,128)S(1)}, f8e4m3fn[64,2,64,4,128]{4,3,2,1,0:T(8,128)}, u32[]{:S(2)}) copy-start(%p0)
+      %cd = f8e4m3fn[64,2,64,4,128]{4,3,2,1,0:T(8,128)S(1)} copy-done(%cs)
+      %call = bf16[16,4096]{1,0:T(8,128)S(1)} custom-call(%cd), custom_call_target="tpu_custom_call"
+      ROOT %tup = (bf16[16,4096]{1,0:T(8,128)}, f8e4m3fn[64,2,64,4,128]{4,3,2,1,0:T(8,128)}) tuple(%call, %p0)
+    }
+    """
+    ok_bad, reason_bad = pool_io.check_fused_pool_hlo(bad_vmem_hlo, page_size=128)
+    assert ok_bad is False
+    assert "copy-start" in reason_bad or "S(1)" in reason_bad
+
+
+def test_amask_default_and_nan_kv_padding_guard():
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import Mesh
+
+    assert K.Tiles().amask == 1
+    assert K.DEFAULT_TILES.amask == 1
+    assert K.VERIFY_TILES.amask == 1
+    assert K.WIDE_TILES.amask == 1
+    assert K.TINY_TILES.amask == 1
+    assert K.default_tiles(K.FULL_EP).amask == 1
+
+    # Single-rank TINY config with paged_kv=True to test 0x7f (FP8 NaN) in KV slots
+    c = dataclasses.replace(
+        K.TINY_EP,
+        R=1,
+        B=4,
+        T=2,
+        L=4,
+        att_every=4,
+        NH=1,
+        NKV=1,
+        KH=1,
+        VH=2,
+        I=128,
+        IS=128,
+        E=128,
+        TOPK=2,
+        e_slots=128,
+        paged_kv=True,
+        num_pages=128,
+        page_size=128,
+        max_pages_per_seq=8,
+        ctx=1024,
+    )
+    tiles_am1 = dataclasses.replace(
+        K.TINY_TILES,
+        amask=1,
+        hier=0,
+        pack=0,
+        mb8=0,
+        kv_blk=256,
+        nkv=2,
+    )
+    tiles_am4 = dataclasses.replace(tiles_am1, amask=4)
+
+    mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
+    pt, ckpt, roff, _ = pool_io.default_pool_layout(c)
+    starts = [10, 20]
+    pos = jnp.asarray(
+        [s0 + t for s0 in starts for t in range(c.T)], dtype=jnp.int32
+    )
+    hid = jax.random.normal(jax.random.PRNGKey(0), (c.M, c.H), jnp.float32)
+    hid = jnp.where(jnp.arange(c.M)[:, None] < c.B, hid, 0.0).astype(
+        jnp.bfloat16
+    )
+
+    backbone = _make_tiny_backbone(c, e_slots=c.EW)
+    packed = pack_weights(backbone, c, tp_rank=0, tiles=tiles_am1)
+    w_flat = [
+        jnp.asarray(packed[k].view(torch.uint8).numpy()).view(
+            K.FP8
+            if packed[k].dtype == torch.float8_e4m3fn
+            else (
+                jnp.bfloat16
+                if packed[k].dtype == torch.bfloat16
+                else jnp.float32
+            )
+        )
+        for k in K.W_NAMES
+    ]
+
+    # Clean zero pool vs 0x7f-contaminated pool (unwritten col >= rem is 0x7f = FP8 NaN)
+    clean_u8 = np.zeros((c.num_pages, 2, 64, 4, c.page_size), dtype=np.uint8)
+    nan_u8 = np.full((c.num_pages, 2, 64, 4, c.page_size), 0x7F, dtype=np.uint8)
+    for s, s0 in enumerate(starts):
+        kp = int(pt[s, 0])
+        clean_u8[kp, :, :, :, :s0] = 0x38  # 0.5 in f8e4m3fn
+        nan_u8[kp, :, :, :, :s0] = 0x38
+    for g_sub in range(ckpt.shape[0]):
+        for s in range(len(starts)):
+            blk_id = int(ckpt[g_sub, s, 0])
+            if blk_id > 0:
+                p0 = blk_id * 5
+                clean_u8[p0 : p0 + 5] = 0x00
+                nan_u8[p0 : p0 + 5] = 0x00
+
+    raw_clean = [
+        jax.lax.bitcast_convert_type(jnp.asarray(clean_u8), K.FP8)
+        for _ in range(c.NATT)
+    ]
+    raw_nan_am1 = [
+        jax.lax.bitcast_convert_type(jnp.asarray(nan_u8), K.FP8)
+        for _ in range(c.NATT)
+    ]
+    raw_nan_am4 = [
+        jax.lax.bitcast_convert_type(jnp.asarray(nan_u8), K.FP8)
+        for _ in range(c.NATT)
+    ]
+
+    skip_exp = frozenset({"experts"})
+    fn_clean, _, _, _ = pool_io.make_flat_pooled_step(
+        mesh, c, tiles_am1, skip=skip_exp, fused_pool_io=True, interpret=True
+    )
+    fn_am1, _, _, _ = pool_io.make_flat_pooled_step(
+        mesh, c, tiles_am1, skip=skip_exp, fused_pool_io=True, interpret=True
+    )
+    fn_am4, _, _, _ = pool_io.make_flat_pooled_step(
+        mesh, c, tiles_am4, skip=skip_exp, fused_pool_io=True, interpret=True
+    )
+
+    out_clean = fn_clean(pos, hid, *w_flat, *raw_clean, pt, ckpt, roff)[0]
+    out_am1 = fn_am1(pos, hid, *w_flat, *raw_nan_am1, pt, ckpt, roff)[0]
+    out_am4 = fn_am4(pos, hid, *w_flat, *raw_nan_am4, pt, ckpt, roff)[0]
+
+    assert int(jnp.isnan(out_am1[: c.B]).sum()) == 0
+    diff_am1 = jnp.abs(
+        out_clean[: c.B].astype(jnp.float32)
+        - out_am1[: c.B].astype(jnp.float32)
+    )
+    assert float(jnp.max(diff_am1)) == 0.0
+    assert int(jnp.isnan(out_am4[: c.B]).sum()) > 0
+
+

@@ -180,6 +180,17 @@ def parse_mk_ab_enabled(env_val: str | None = None) -> bool:
     )
 
 
+def parse_mk_fused_pool_io(env_val: str | None = None) -> bool:
+    """Return True if fused P1+P2 pool I/O inside the megakernel is enabled (default True)."""
+    raw = (
+        env_val
+        if env_val is not None
+        else os.environ.get("VLLM_TPU_QWEN35_MK_FUSED_POOL_IO", "1")
+    )
+    return raw.strip().lower() not in ("0", "false", "no", "off", "none")
+
+
+
 def _percentile(sorted_vals: list[float], q: float) -> float:
     if not sorted_vals:
         return 0.0
@@ -1485,6 +1496,7 @@ class Qwen35Megakernel:
         buckets: Sequence[int] = _DEFAULT_BUCKETS,
         verify_buckets: Sequence[int] = (),
         mesh: jax.sharding.Mesh | None = None,
+        fused_pool_io: bool | None = None,
     ) -> None:
         _need(mode in ("ep", "tp"), f"unsupported VLLM_TPU_QWEN35_MK_MODE={mode!r}")
         self.mode = mode
@@ -1492,6 +1504,12 @@ class Qwen35Megakernel:
         self.verify_buckets = tuple(sorted(verify_buckets))
         self.max_bucket = max(self.buckets) if self.buckets else 0
         self.max_verify_bucket = max(self.verify_buckets) if self.verify_buckets else 0
+        self.fused_pool_io = (
+            parse_mk_fused_pool_io()
+            if fused_pool_io is None
+            else bool(fused_pool_io)
+        )
+        self._hlo_checked = False
         self.backbone = _find_backbone(runner.model)
         self.embed_tokens = self.backbone.embed_tokens
 
@@ -1552,6 +1570,7 @@ class Qwen35Megakernel:
                     stack_e=False,
                     e_slots=0,
                     paged_kv=True,
+                    fused_pool_io=self.fused_pool_io,
                 )
             else:
                 e_slots = int(
@@ -1564,6 +1583,7 @@ class Qwen35Megakernel:
                     stack_e=False,
                     e_slots=e_slots,
                     paged_kv=True,
+                    fused_pool_io=self.fused_pool_io,
                 )
 
             packed = pack_weights(
@@ -1605,11 +1625,12 @@ class Qwen35Megakernel:
 
         logger.info(
             "Qwen3.5 megakernel initialized: mode=%s, e_slots=%d, decode_buckets=%s, "
-            "verify_buckets=%s, ab_enabled=%s, %d weight tensors (tp_rank=%d/%d)",
+            "verify_buckets=%s, fused_pool_io=%s, ab_enabled=%s, %d weight tensors (tp_rank=%d/%d)",
             self.mode,
             self.base_cfg.EW,
             self.buckets,
             self.verify_buckets,
+            self.fused_pool_io,
             self.ab_enabled,
             len(self.w_flat),
             self.tp_rank,
@@ -1702,9 +1723,38 @@ class Qwen35Megakernel:
                     return p
             return m_rows
 
+        self._runner_token_paddings = runner_token_paddings
+        self._build_all_buckets()
+
+        self._bound = True
+        logger.info(
+            "Qwen3.5 megakernel bound to %d unified pools (num_pages=%d, "
+            "page_size=%d, max_pages_per_seq=%d, decode_buckets=%s, verify_buckets=%s, fused_pool_io=%s)",
+            len(self.raw_pools),
+            self.num_pages,
+            self.page_size,
+            self.max_pages_per_seq,
+            self.buckets,
+            self.verify_buckets,
+            self.fused_pool_io,
+        )
+
+    def _runner_out_rows(self, b: int, m_rows: int) -> int:
+        # The runner pads a b-row step to its first token bucket >= b and
+        # takes back exactly that many hidden rows, which may be fewer
+        # than the kernel's 16-row-aligned m_rows (e.g. 24 vs 32).
+        for p in getattr(self, "_runner_token_paddings", ()):
+            if p >= b:
+                return p
+        return m_rows
+
+    def _build_all_buckets(self) -> None:
+        self._bucket_steps.clear()
+        self._bucket_ops.clear()
+        self._bucket_out_rows.clear()
         for b in self.buckets:
             m_rows = max(16, K.rup(b, 16))
-            out_rows = _runner_out_rows(b, m_rows)
+            out_rows = self._runner_out_rows(b, m_rows)
             step_1 = self._build_bucket_op(
                 b, tokens_per_seq=1, out_pad_rows=out_rows
             )
@@ -1713,23 +1763,75 @@ class Qwen35Megakernel:
             self._bucket_out_rows[(1, b)] = out_rows
         for b in self.verify_buckets:
             m_rows = max(16, K.rup(b, 16))
-            out_rows = _runner_out_rows(b, m_rows)
+            out_rows = self._runner_out_rows(b, m_rows)
             self._bucket_steps[(4, b)] = self._build_bucket_op(
                 b, tokens_per_seq=4, out_pad_rows=out_rows
             )
             self._bucket_out_rows[(4, b)] = out_rows
 
-        self._bound = True
-        logger.info(
-            "Qwen3.5 megakernel bound to %d unified pools (num_pages=%d, "
-            "page_size=%d, max_pages_per_seq=%d, decode_buckets=%s, verify_buckets=%s)",
-            len(self.raw_pools),
-            self.num_pages,
-            self.page_size,
-            self.max_pages_per_seq,
-            self.buckets,
-            self.verify_buckets,
-        )
+    def _verify_fused_pool_hlo(
+        self,
+        step_fn: Any,
+        in_specs: Sequence[P],
+        out_specs: Sequence[P],
+        donate_argnums: Sequence[int],
+        c: K.MKConfig,
+    ) -> tuple[bool, str]:
+        """Verify at lower/compile time that fused pool I/O feeds raw pools directly to tpu_custom_call without S(1) copies."""
+        try:
+            from jax.sharding import NamedSharding
+
+            T = int(c.T)
+            B = int(c.B)
+            nseq = B // T
+            r_cnt = int(c.R)
+            m_rows = int(c.M)
+            max_pages = int(self.max_pages_per_seq)
+            in_sh = tuple(NamedSharding(self.mesh, s) for s in in_specs)
+            out_sh = tuple(NamedSharding(self.mesh, s) for s in out_specs)
+
+            def _global_sds(t: torch.Tensor) -> jax.ShapeDtypeStruct:
+                dt = (
+                    jnp.float8_e4m3fn
+                    if t.dtype == torch.float8_e4m3fn
+                    else jnp.bfloat16
+                    if t.dtype == torch.bfloat16
+                    else jnp.int32
+                    if t.dtype == torch.int32
+                    else jnp.float32
+                )
+                return jax.ShapeDtypeStruct(
+                    (r_cnt * int(t.shape[0]),) + tuple(t.shape[1:]), dt
+                )
+
+            avals = [
+                jax.ShapeDtypeStruct((r_cnt * B,), jnp.int32),
+                jax.ShapeDtypeStruct((r_cnt * m_rows, int(c.H)), jnp.bfloat16),
+                *(_global_sds(w) for w in self.w_flat),
+                *(_global_sds(p) for p in self.raw_pools),
+                jax.ShapeDtypeStruct((r_cnt * nseq, max_pages), jnp.int32),
+                jax.ShapeDtypeStruct((r_cnt * 3, nseq, T), jnp.int32),
+                jax.ShapeDtypeStruct((r_cnt * 3, nseq), jnp.int32),
+            ]
+            j_fn = jax.jit(
+                step_fn,
+                in_shardings=in_sh,
+                out_shardings=out_sh,
+                donate_argnums=donate_argnums,
+                keep_unused=True,
+            )
+            lowered = j_fn.lower(*avals)
+            if os.environ.get("VLLM_TPU_QWEN35_MK_COMPILE_HLO_CHECK", "0") == "1":
+                hlo_text = lowered.compile().as_text()
+            else:
+                hlo_text = lowered.as_text("hlo")
+            return pool_io.check_fused_pool_hlo(
+                hlo_text,
+                num_pools=len(self.raw_pools),
+                page_size=self.page_size,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, f"HLO check exception: {exc}"
 
     def _build_bucket_op(
         self,
@@ -1738,13 +1840,47 @@ class Qwen35Megakernel:
         out_pad_rows: int | None = None,
     ) -> Any:
         """Build the `sharded_jax_callable` custom op and fused `torch.compile` step for `(tokens_per_seq, bucket_t)`."""
-        c = dataclasses.replace(self.base_cfg, B=bucket_t, T=tokens_per_seq)
+        bucket_fused = bool(self.fused_pool_io and bucket_t <= 32)
+        c = dataclasses.replace(
+            self.base_cfg,
+            B=bucket_t,
+            T=tokens_per_seq,
+            fused_pool_io=bucket_fused,
+        )
         tiles = K.default_tiles(c)
 
         if hasattr(pool_io, "make_flat_pooled_step"):
             step_fn, in_specs, out_specs, donate_argnums = (
-                pool_io.make_flat_pooled_step(self.mesh, c, tiles)
+                pool_io.make_flat_pooled_step(
+                    self.mesh, c, tiles, fused_pool_io=bucket_fused
+                )
             )
+            if bucket_fused and not self._hlo_checked:
+                self._hlo_checked = True
+                ok_hlo, reason_hlo = self._verify_fused_pool_hlo(
+                    step_fn, in_specs, out_specs, donate_argnums, c
+                )
+                if not ok_hlo:
+                    logger.warning(
+                        "Qwen3.5 megakernel: fused_pool_io HLO check failed (%s); "
+                        "falling back to 3-stage pool I/O",
+                        reason_hlo,
+                    )
+                    self.fused_pool_io = False
+                    self.base_cfg = dataclasses.replace(
+                        self.base_cfg, fused_pool_io=False
+                    )
+                    c = dataclasses.replace(c, fused_pool_io=False)
+                    step_fn, in_specs, out_specs, donate_argnums = (
+                        pool_io.make_flat_pooled_step(
+                            self.mesh, c, tiles, fused_pool_io=False
+                        )
+                    )
+                else:
+                    logger.info(
+                        "Qwen3.5 megakernel: fused_pool_io HLO check passed (%s)",
+                        reason_hlo,
+                    )
         else:
             built = pool_io.make_pooled_step(self.mesh, c, tiles)
             if isinstance(built, tuple) and len(built) == 4:
@@ -1761,7 +1897,8 @@ class Qwen35Megakernel:
         n_in = len(in_specs)
         args = [f"x{i}" for i in range(n_in)]
         ret = "tuple[" + ", ".join(["jax.Array"] * len(out_specs)) + "]"
-        fn_name = f"qwen35_mk_step_t{tokens_per_seq}_b{bucket_t}_{self.mode}"
+        io_tag = "" if self.fused_pool_io else "_3stage"
+        fn_name = f"qwen35_mk_step_t{tokens_per_seq}_b{bucket_t}_{self.mode}{io_tag}"
         src = (
             f"def {fn_name}({', '.join(a + ': jax.Array' for a in args)}) -> {ret}:\n"
             f"    return _step_fn({', '.join(args)})\n"
@@ -1769,7 +1906,9 @@ class Qwen35Megakernel:
         ns: dict[str, Any] = {"jax": jax, "_step_fn": step_fn}
         exec(compile(src, f"<{fn_name}>", "exec"), ns)  # noqa: S102
 
-        op_name = f"qwen35_megakernel::step_t{tokens_per_seq}_b{bucket_t}_{self.mode}"
+        op_name = (
+            f"qwen35_megakernel::step_t{tokens_per_seq}_b{bucket_t}_{self.mode}{io_tag}"
+        )
         flat_callable = sharded_jax_callable(
             op_name,
             ns[fn_name],
@@ -1968,10 +2107,18 @@ class Qwen35Megakernel:
             return
         dev = self.raw_pools[0].device
         all_keys = [(1, b) for b in self.buckets] + [(4, b) for b in self.verify_buckets]
+        if not all_keys:
+            return
         logger.info("Qwen3.5 megakernel: warming up (T, B) buckets %s ...", all_keys)
-        # Save null manager block 0 (kernel pages 0..4) so warmup leaves pool contents untouched.
-        saved_block0 = (
-            [p[:5].clone() for p in self.raw_pools] if dev.type != "tpu" else None
+        max_t = max(T for T, _ in all_keys)
+        n_save = min(self.num_pages, max(5, 5 * (max_t + 1)))
+        # Never slice-clone or slice-write raw_pools on TPU (PyTorch/XLA lowers
+        # slice writes on a 2.30 GiB pool to as_strided_copy_inverse, allocating
+        # a full 2.30 GiB temporary buffer per pool).
+        saved_pages = (
+            [p[:n_save].clone() for p in self.raw_pools]
+            if dev.type != "tpu"
+            else None
         )
         try:
             with torch.no_grad():
@@ -2000,124 +2147,271 @@ class Qwen35Megakernel:
                 )
                 ckpt_cols = max(1, k_spec + 1)
                 uses_mrope = bool(getattr(runner, "uses_mrope", False))
-                for T, b in all_keys:
-                    step_fn = (
-                        self._bucket_steps.get((T, b))
-                        or self._bucket_steps.get(b)
-                    )
-                    if dev.type == "tpu" and runner_tok_pads and runner_req_pads:
-                        tok_pad = next(
-                            (p for p in runner_tok_pads if p >= b),
-                            runner_tok_pads[-1],
+                sentinel_checked = False
+
+                while True:
+                    fallback_needed = False
+                    for T, b in all_keys:
+                        step_fn = (
+                            self._bucket_steps.get((T, b))
+                            or self._bucket_steps.get(b)
                         )
-                        pos_shape = (3, tok_pad) if uses_mrope else (tok_pad,)
-                        for req_pad in runner_req_pads:
-                            ids_raw = torch.zeros(
-                                (tok_pad,), dtype=torch.int32, device=dev
+                        do_sentinel = (
+                            self.fused_pool_io
+                            and not sentinel_checked
+                            and self.num_pages >= 5 * (T + 1)
+                        )
+                        if dev.type == "tpu" and runner_tok_pads and runner_req_pads:
+                            tok_pad = next(
+                                (p for p in runner_tok_pads if p >= b),
+                                runner_tok_pads[-1],
                             )
-                            pos_raw = torch.zeros(
-                                pos_shape, dtype=torch.int32, device=dev
-                            )
-                            bt_raw_1d = torch.zeros(
-                                (req_pad * self.max_pages_per_seq,),
+                            pos_shape = (3, tok_pad) if uses_mrope else (tok_pad,)
+                            for req_pad in runner_req_pads:
+                                ids_raw = torch.zeros(
+                                    (tok_pad,), dtype=torch.int32, device=dev
+                                )
+                                pos_raw = torch.zeros(
+                                    pos_shape, dtype=torch.int32, device=dev
+                                )
+                                bt_raw_1d = torch.zeros(
+                                    (req_pad * self.max_pages_per_seq,),
+                                    dtype=torch.int32,
+                                    device=dev,
+                                )
+                                s0_raw = torch.zeros(
+                                    (req_pad,), dtype=torch.int32, device=dev
+                                )
+                                s1_raw = torch.zeros(
+                                    (req_pad,), dtype=torch.int32, device=dev
+                                )
+                                s2_raw = torch.zeros(
+                                    (req_pad,), dtype=torch.int32, device=dev
+                                )
+                                if ckpt_cols > 1:
+                                    c0_raw = torch.zeros(
+                                        (req_pad, ckpt_cols),
+                                        dtype=torch.int32,
+                                        device=dev,
+                                    )
+                                    c1_raw = torch.zeros(
+                                        (req_pad, ckpt_cols),
+                                        dtype=torch.int32,
+                                        device=dev,
+                                    )
+                                    c2_raw = torch.zeros(
+                                        (req_pad, ckpt_cols),
+                                        dtype=torch.int32,
+                                        device=dev,
+                                    )
+                                else:
+                                    c0_raw, c1_raw, c2_raw = s0_raw, s1_raw, s2_raw
+
+                                r_call = r_raw
+                                if do_sentinel:
+                                    sent_kv = (
+                                        self.raw_pools[0][0]
+                                        .view(torch.uint8)
+                                        .cpu()
+                                        .clone()
+                                    )
+                                    sent_gdn = (
+                                        self.raw_pools[0][5:9]
+                                        .view(torch.uint8)
+                                        .cpu()
+                                        .clone()
+                                    )
+                                    ids_raw[0] = 1
+                                    s0_raw[0] = 1
+                                    s1_raw[0] = 1
+                                    s2_raw[0] = 1
+                                    if ckpt_cols > 1:
+                                        blk_ids = torch.arange(
+                                            1,
+                                            1 + min(T, ckpt_cols),
+                                            dtype=torch.int32,
+                                            device=dev,
+                                        )
+                                        c0_raw[0, : blk_ids.numel()] = blk_ids
+                                        c1_raw[0, : blk_ids.numel()] = blk_ids
+                                        c2_raw[0, : blk_ids.numel()] = blk_ids
+                                    if r_raw.numel() > 1:
+                                        r_call = torch.full_like(r_raw, -1)
+
+                                out_b = step_fn(
+                                    ids_raw,
+                                    pos_raw,
+                                    bt_raw_1d,
+                                    s0_raw,
+                                    c0_raw,
+                                    s1_raw,
+                                    c1_raw,
+                                    s2_raw,
+                                    c2_raw,
+                                    r_call,
+                                    self.w_flat,
+                                    self.raw_pools,
+                                )
+                                from vllm_torchtpu.utils import synchronize_tensors
+
+                                synchronize_tensors([out_b, *self.raw_pools])
+                                if do_sentinel:
+                                    do_sentinel = False
+                                    sentinel_checked = True
+                                    kv_ok = not torch.equal(
+                                        self.raw_pools[0][0]
+                                        .view(torch.uint8)
+                                        .cpu(),
+                                        sent_kv,
+                                    )
+                                    gdn_ok = not torch.equal(
+                                        self.raw_pools[0][5:9]
+                                        .view(torch.uint8)
+                                        .cpu(),
+                                        sent_gdn,
+                                    )
+                                    if not (kv_ok and gdn_ok):
+                                        logger.warning(
+                                            "Qwen3.5 megakernel: fused_pool_io "
+                                            "warmup sentinel check failed "
+                                            "(kv_ok=%s, gdn_ok=%s); "
+                                            "falling back to 3-stage pool I/O",
+                                            kv_ok,
+                                            gdn_ok,
+                                        )
+                                        fallback_needed = True
+                                        break
+                                    logger.info(
+                                        "Qwen3.5 megakernel: fused_pool_io "
+                                        "warmup sentinel check passed "
+                                        "(kv_ok=%s, gdn_ok=%s)",
+                                        kv_ok,
+                                        gdn_ok,
+                                    )
+                        else:
+                            nseq = b // T
+                            ids_b = torch.zeros((b,), dtype=torch.int32, device=dev)
+                            pos_b = torch.zeros((b,), dtype=torch.int32, device=dev)
+                            bt_b = torch.zeros(
+                                (nseq * self.max_pages_per_seq,),
                                 dtype=torch.int32,
                                 device=dev,
                             )
-                            s0_raw = torch.zeros(
-                                (req_pad,), dtype=torch.int32, device=dev
-                            )
-                            s1_raw = torch.zeros(
-                                (req_pad,), dtype=torch.int32, device=dev
-                            )
-                            s2_raw = torch.zeros(
-                                (req_pad,), dtype=torch.int32, device=dev
-                            )
+                            s0_b = torch.zeros((nseq,), dtype=torch.int32, device=dev)
+                            s1_b = torch.zeros((nseq,), dtype=torch.int32, device=dev)
+                            s2_b = torch.zeros((nseq,), dtype=torch.int32, device=dev)
                             if ckpt_cols > 1:
-                                c0_raw = torch.zeros(
-                                    (req_pad, ckpt_cols),
-                                    dtype=torch.int32,
-                                    device=dev,
+                                c0_b = torch.zeros(
+                                    (nseq, ckpt_cols), dtype=torch.int32, device=dev
                                 )
-                                c1_raw = torch.zeros(
-                                    (req_pad, ckpt_cols),
-                                    dtype=torch.int32,
-                                    device=dev,
+                                c1_b = torch.zeros(
+                                    (nseq, ckpt_cols), dtype=torch.int32, device=dev
                                 )
-                                c2_raw = torch.zeros(
-                                    (req_pad, ckpt_cols),
-                                    dtype=torch.int32,
-                                    device=dev,
+                                c2_b = torch.zeros(
+                                    (nseq, ckpt_cols), dtype=torch.int32, device=dev
                                 )
                             else:
-                                c0_raw, c1_raw, c2_raw = s0_raw, s1_raw, s2_raw
+                                c0_b, c1_b, c2_b = s0_b, s1_b, s2_b
+                            r_call = r_raw
+                            if do_sentinel:
+                                if dev.type != "tpu":
+                                    self.raw_pools[0][0].view(torch.uint8).fill_(0x5A)
+                                    self.raw_pools[0][5:9].view(torch.uint8).fill_(0x5A)
+                                sent_kv = (
+                                    self.raw_pools[0][0]
+                                    .view(torch.uint8)
+                                    .cpu()
+                                    .clone()
+                                )
+                                sent_gdn = (
+                                    self.raw_pools[0][5:9]
+                                    .view(torch.uint8)
+                                    .cpu()
+                                    .clone()
+                                )
+                                ids_b[0] = 1
+                                s0_b[0] = 1
+                                s1_b[0] = 1
+                                s2_b[0] = 1
+                                if ckpt_cols > 1:
+                                    blk_ids = torch.arange(
+                                        1,
+                                        1 + min(T, ckpt_cols),
+                                        dtype=torch.int32,
+                                        device=dev,
+                                    )
+                                    c0_b[0, : blk_ids.numel()] = blk_ids
+                                    c1_b[0, : blk_ids.numel()] = blk_ids
+                                    c2_b[0, : blk_ids.numel()] = blk_ids
+                                if r_raw.numel() > 1:
+                                    r_call = torch.full_like(r_raw, -1)
                             out_b = step_fn(
-                                ids_raw,
-                                pos_raw,
-                                bt_raw_1d,
-                                s0_raw,
-                                c0_raw,
-                                s1_raw,
-                                c1_raw,
-                                s2_raw,
-                                c2_raw,
-                                r_raw,
+                                ids_b,
+                                pos_b,
+                                bt_b,
+                                s0_b,
+                                c0_b,
+                                s1_b,
+                                c1_b,
+                                s2_b,
+                                c2_b,
+                                r_call,
                                 self.w_flat,
                                 self.raw_pools,
                             )
-                            from vllm_torchtpu.utils import synchronize_tensors
+                            if dev.type == "tpu":
+                                from vllm_torchtpu.utils import synchronize_tensors
 
-                            synchronize_tensors([out_b, *self.raw_pools])
-                    else:
-                        nseq = b // T
-                        ids_b = torch.zeros((b,), dtype=torch.int32, device=dev)
-                        pos_b = torch.zeros((b,), dtype=torch.int32, device=dev)
-                        bt_b = torch.zeros(
-                            (nseq * self.max_pages_per_seq,),
-                            dtype=torch.int32,
-                            device=dev,
+                                synchronize_tensors([out_b, *self.raw_pools])
+                            if do_sentinel:
+                                sentinel_checked = True
+                                kv_ok = not torch.equal(
+                                    self.raw_pools[0][0].view(torch.uint8).cpu(),
+                                    sent_kv,
+                                )
+                                gdn_ok = not torch.equal(
+                                    self.raw_pools[0][5:9].view(torch.uint8).cpu(),
+                                    sent_gdn,
+                                )
+                                if saved_pages is not None:
+                                    for p, sv in zip(self.raw_pools, saved_pages):
+                                        p[:n_save].copy_(sv)
+                                if not (kv_ok and gdn_ok):
+                                    logger.warning(
+                                        "Qwen3.5 megakernel: fused_pool_io warmup "
+                                        "sentinel check failed (kv_ok=%s, gdn_ok=%s); "
+                                        "falling back to 3-stage pool I/O",
+                                        kv_ok,
+                                        gdn_ok,
+                                    )
+                                    fallback_needed = True
+                                else:
+                                    logger.info(
+                                        "Qwen3.5 megakernel: fused_pool_io warmup "
+                                        "sentinel check passed (kv_ok=%s, gdn_ok=%s)",
+                                        kv_ok,
+                                        gdn_ok,
+                                    )
+                        if fallback_needed:
+                            break
+                        logger.info(
+                            "Qwen3.5 megakernel: warmed up bucket (T=%d, B=%d)", T, b
                         )
-                        s0_b = torch.zeros((nseq,), dtype=torch.int32, device=dev)
-                        s1_b = torch.zeros((nseq,), dtype=torch.int32, device=dev)
-                        s2_b = torch.zeros((nseq,), dtype=torch.int32, device=dev)
-                        if ckpt_cols > 1:
-                            c0_b = torch.zeros(
-                                (nseq, ckpt_cols), dtype=torch.int32, device=dev
-                            )
-                            c1_b = torch.zeros(
-                                (nseq, ckpt_cols), dtype=torch.int32, device=dev
-                            )
-                            c2_b = torch.zeros(
-                                (nseq, ckpt_cols), dtype=torch.int32, device=dev
-                            )
-                        else:
-                            c0_b, c1_b, c2_b = s0_b, s1_b, s2_b
-                        out_b = step_fn(
-                            ids_b,
-                            pos_b,
-                            bt_b,
-                            s0_b,
-                            c0_b,
-                            s1_b,
-                            c1_b,
-                            s2_b,
-                            c2_b,
-                            r_raw,
-                            self.w_flat,
-                            self.raw_pools,
+                    if fallback_needed:
+                        self.fused_pool_io = False
+                        self.base_cfg = dataclasses.replace(
+                            self.base_cfg, fused_pool_io=False
                         )
-                        if dev.type == "tpu":
-                            from vllm_torchtpu.utils import synchronize_tensors
-
-                            synchronize_tensors([out_b, *self.raw_pools])
-                    logger.info(
-                        "Qwen3.5 megakernel: warmed up bucket (T=%d, B=%d)", T, b
-                    )
+                        self._build_all_buckets()
+                        continue
+                    break
                 self.promote_fast_callables()
         finally:
-            if saved_block0 is not None:
+            if saved_pages is not None:
                 with torch.no_grad():
-                    for p, blk0 in zip(self.raw_pools, saved_block0):
-                        p[:5].copy_(blk0)
+                    for p, sv in zip(self.raw_pools, saved_pages):
+                        p[:n_save].copy_(sv)
+
 
     def _inspect_step_detail(
         self,

@@ -1268,6 +1268,30 @@ class _PooledStepFn:
         yield self.info
 
 
+def check_fused_pool_hlo(
+    hlo_text: str, page_size: int = 128, num_pools: int | None = None
+) -> tuple[bool, str]:
+    """Verify that compiled HLO for fused pool I/O does not copy pool tensors into VMEM S(1)
+    or duplicate full pool buffers in HBM.
+
+    Returns:
+      `(ok, reason)` where `ok` is `True` if safe for zero-copy in-place pool DMA writes.
+    """
+    if "tpu_custom_call" not in hlo_text and "qwen3_5_decode_megakernel" not in hlo_text:
+        return False, "missing megakernel custom-call in HLO"
+    if "gather_gdn_states" in hlo_text or "scatter_pool_states" in hlo_text:
+        return False, "unexpected gather/scatter custom-call in fused HLO"
+    pool_suffix = f",2,64,4,{page_size}]"
+    for line in hlo_text.splitlines():
+        if pool_suffix in line and (
+            "copy-start(" in line or ("= f8e4m3fn[" in line and "copy(" in line)
+        ):
+            if "S(1)" in line:
+                return False, f"pool operand copied to VMEM S(1): {line.strip()}"
+            return False, f"unexpected full-pool copy in HLO: {line.strip()}"
+    return True, "ok"
+
+
 def make_flat_pooled_step(
     mesh,
     c: MKConfig,
@@ -1276,6 +1300,7 @@ def make_flat_pooled_step(
     interpret=False,
     skip=frozenset(),
     scopes=False,
+    fused_pool_io: bool | None = None,
 ):
     """Build a flat positional `shard_map` pooled step for `sharded_jax_callable` in `vllm_torchtpu`.
 
@@ -1287,7 +1312,19 @@ def make_flat_pooled_step(
     Returns:
       `(flat_step_fn, in_specs, out_specs, donate_argnums)`
     """
-    c_paged = dataclasses.replace(c, paged_kv=True)
+    use_fused = bool(c.fused_pool_io) if fused_pool_io is None else bool(fused_pool_io)
+    if use_fused:
+        c_paged = dataclasses.replace(
+            c,
+            paged_kv=True,
+            fused_pool_io=True,
+            act_mode="from_ckpt",
+            ckpt_2d=False,
+            roff_1d=False,
+            ckpt_k=c.T,
+        )
+    else:
+        c_paged = dataclasses.replace(c, paged_kv=True, fused_pool_io=False)
     call, info = build(
         c_paged,
         tiles,
@@ -1331,6 +1368,22 @@ def make_flat_pooled_step(
             else:
                 w_grouped.append(w_leaves[idx])
                 idx += 1
+
+        if use_fused:
+            out = call(
+                pos,
+                hidden,
+                *w_grouped,
+                raw_pools,
+                page_table,
+                ckpt_indices,
+                read_offsets,
+            )
+            if bool(interpret):
+                hid, raw_out = out
+                return (hid, *raw_out)
+            hid = out[0] if isinstance(out, (tuple, list)) else out
+            return (hid, *raw_pools)
 
         conv, rec = gather_gdn_states(
             c_paged,
@@ -1385,7 +1438,7 @@ def make_flat_attn_step(
       `(flat_step_fn, in_specs, out_specs, donate_argnums)`
     """
     assert c.att_every == 1, c.att_every
-    c_paged = dataclasses.replace(c, paged_kv=True)
+    c_paged = dataclasses.replace(c, paged_kv=True, fused_pool_io=False)
     call, info = build(
         c_paged,
         tiles,
@@ -1464,8 +1517,9 @@ def make_pooled_step(
     forced_routing=False,
     skip=frozenset(),
     scopes=False,
+    fused_pool_io: bool | None = None,
 ):
-    """Build the 3-stage `shard_map` decode/verify step over unified block pools `raw[0..14]`.
+    """Build the `shard_map` decode/verify step over unified block pools `raw[0..14]`.
 
     Supports two calling conventions:
       1. Positional:
@@ -1478,7 +1532,8 @@ def make_pooled_step(
 
     Also supports both `step = make_pooled_step(...)` and `step, info = make_pooled_step(...)`.
     """
-    c_paged = dataclasses.replace(c, paged_kv=True)
+    use_fused = bool(c.fused_pool_io) if fused_pool_io is None else bool(fused_pool_io)
+    c_paged = dataclasses.replace(c, paged_kv=True, fused_pool_io=use_fused)
     call, info = build(
         c_paged,
         tiles,
@@ -1490,6 +1545,30 @@ def make_pooled_step(
     tk = plan(c_paged, tiles or default_tiles(c_paged))["tk"]
     e13_shape_4d = (c_paged.EW, c_paged.H // tk["e13"], tk["e13"], 2 * c_paged.IR)
     e2_shape_4d = (c_paged.EW, c_paged.IR // tk["e2"], tk["e2"], c_paged.H)
+    _fused_cache = {
+        (c_paged.act_mode, c_paged.ckpt_2d, c_paged.roff_1d, c_paged.ckpt_k or c_paged.T): call
+    }
+
+    def _get_fused_call(act_mode, ckpt_2d, roff_1d, ckpt_k):
+        key = (act_mode, ckpt_2d, roff_1d, ckpt_k)
+        if key not in _fused_cache:
+            c_var = dataclasses.replace(
+                c_paged,
+                fused_pool_io=True,
+                act_mode=act_mode,
+                ckpt_2d=ckpt_2d,
+                roff_1d=roff_1d,
+                ckpt_k=ckpt_k,
+            )
+            _fused_cache[key], _ = build(
+                c_var,
+                tiles,
+                interpret=interpret,
+                forced_routing=forced_routing,
+                skip=skip,
+                scopes=scopes,
+            )
+        return _fused_cache[key]
 
     def _run_local(pos, hidden, weights, raw_pools, page_table, ckpt_indices, read_offsets,
                    rb_tuple, active_seqs):
@@ -1504,9 +1583,6 @@ def make_pooled_step(
         if active_seqs is not None and active_seqs.ndim == 2:
             active_seqs = active_seqs.squeeze(0)
 
-        conv, rec = gather_gdn_states(
-            c_paged, raw_in, ckpt_indices, read_offsets, active_seqs, interpret=interpret
-        )
         w = []
         for k in W_NAMES:
             if isinstance(weights[k], tuple):
@@ -1519,6 +1595,31 @@ def make_pooled_step(
                 )
             else:
                 w.append(weights[k][0])
+
+        if use_fused:
+            act_mode = "ref" if active_seqs is not None else c_paged.act_mode
+            ckpt_2d = ckpt_indices.ndim == 2
+            roff_1d = read_offsets.ndim == 1
+            ckpt_k = int(ckpt_indices.shape[-1])
+            call_f = _get_fused_call(act_mode, ckpt_2d, roff_1d, ckpt_k)
+            st_args = (
+                (raw_in, page_table, ckpt_indices, read_offsets, active_seqs.astype(I32))
+                if act_mode == "ref"
+                else (raw_in, page_table, ckpt_indices, read_offsets)
+            )
+            out = call_f(pos, hidden, *w, *st_args, *rb_tuple)
+            if bool(interpret):
+                hid, raw_out = out
+            else:
+                hid = out[0] if isinstance(out, (tuple, list)) else out
+                raw_out = raw_in
+            if raw_6d:
+                raw_out = tuple(jnp.expand_dims(r, 0) for r in raw_out)
+            return hid, raw_out
+
+        conv, rec = gather_gdn_states(
+            c_paged, raw_in, ckpt_indices, read_offsets, active_seqs, interpret=interpret
+        )
         hid, conv_out, rec_out, knew, vnew = call(
             pos, hidden, *w, conv, rec, raw_in, page_table, *rb_tuple
         )
@@ -1558,8 +1659,12 @@ def make_pooled_step(
 
             raw_spec = tuple(P("tp") for _ in raw_pools)
             pt_spec = _meta_spec(page_table, c.NS)
-            ck_spec = _meta_spec(ckpt_indices, c.NS if ckpt_indices.ndim == 2 else max(1, c.att_every - 1))
-            ro_spec = _meta_spec(read_offsets, c.NS if read_offsets.ndim == 1 else max(1, c.att_every - 1))
+            ck_spec = _meta_spec(
+                ckpt_indices, c.NS if ckpt_indices.ndim == 2 else max(1, c.att_every - 1)
+            )
+            ro_spec = _meta_spec(
+                read_offsets, c.NS if read_offsets.ndim == 1 else max(1, c.att_every - 1)
+            )
             rb_specs = (P("tp"),) if forced_routing else ()
 
             if active_seqs is None:
@@ -1608,8 +1713,12 @@ def make_pooled_step(
 
         raw_spec = tuple(P("tp") for _ in raw_pools)
         pt_spec = _meta_spec(page_table, c.NS)
-        ck_spec = _meta_spec(ckpt_indices, c.NS if ckpt_indices.ndim == 2 else max(1, c.att_every - 1))
-        ro_spec = _meta_spec(read_offsets, c.NS if read_offsets.ndim == 1 else max(1, c.att_every - 1))
+        ck_spec = _meta_spec(
+            ckpt_indices, c.NS if ckpt_indices.ndim == 2 else max(1, c.att_every - 1)
+        )
+        ro_spec = _meta_spec(
+            read_offsets, c.NS if read_offsets.ndim == 1 else max(1, c.att_every - 1)
+        )
         rb_specs = (P("tp"),) if forced_routing else ()
 
         if active_seqs is None:
