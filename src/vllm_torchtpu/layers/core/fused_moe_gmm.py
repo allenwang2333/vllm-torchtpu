@@ -65,7 +65,7 @@ def _select_ragged_gather_reduce(version: str):
 # The non-EP combine in moe_gmm selects that kernel directly.
 ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
 
-_ONEHOT_AUTO_CAP = 2048
+_ONEHOT_AUTO_CAP = 4096
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 
@@ -75,7 +75,7 @@ def resolve_onehot_permute_threshold() -> int:
     one-hot matmuls instead of the SparseCore gather/reduce kernels.
 
     Auto (env unset/empty/negative) resolves to ``min(mult * SC block rows - 1,
-    _ONEHOT_AUTO_CAP)`` on SparseCore TPUs (with ``mult = 4`` for 512-row v7x
+    _ONEHOT_AUTO_CAP)`` on SparseCore TPUs (with ``mult = 8`` for 512-row v7x
     blocks and ``2`` for smaller blocks) and 0 elsewhere. An explicit
     ``ONEHOT_MOE_PERMUTE_THRESHOLD`` wins: 0 disables the one-hot path, a
     positive value forces that threshold.
@@ -91,7 +91,7 @@ def resolve_onehot_permute_threshold() -> int:
     if sc_info is None:
         return 0
     block_rows = sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores
-    mult = 4 if block_rows >= 512 else 2
+    mult = 8 if block_rows >= 512 else 2
     threshold = min(mult * block_rows - 1, _ONEHOT_AUTO_CAP)
 
     return threshold
@@ -192,7 +192,7 @@ def _moe_gmm_tiling(
     tiles = calculate_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
     if (
         dims.size_group > 1
-        and 32 <= dims.size_m <= dims.size_group * 40
+        and 32 <= dims.size_m <= dims.size_group * 80
         and 32 % dims.size_lhs_sublane == 0
     ):
         return TileSizes(

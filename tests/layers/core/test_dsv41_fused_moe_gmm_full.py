@@ -23,6 +23,7 @@ if str(_REPO_ROOT) not in sys.path:
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("TPU_SKIP_MDS_QUERY", "true")
 
+import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
@@ -95,7 +96,7 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
         # min(2 * (16 * 4 * 2) - 1, 2048) = min(255, 2048) = 255
         assert fused_moe_gmm.resolve_onehot_permute_threshold() == 255
 
-    # 6. Env unset, device info has sparse_core with block_rows >= 512 (mult = 4)
+    # 6. Env unset, device info has sparse_core with block_rows >= 512 (mult = 8)
     mock_sc_512 = MagicMock()
     mock_sc_512.num_lanes = 16
     mock_sc_512.num_cores = 4
@@ -106,10 +107,10 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
         "jax.experimental.pallas.tpu.get_tpu_info",
         return_value=mock_info_sc_512,
     ):
-        # min(4 * 512 - 1, 2048) = min(2047, 2048) = 2047
-        assert fused_moe_gmm.resolve_onehot_permute_threshold() == 2047
+        # min(8 * 512 - 1, 4096) = min(4095, 4096) = 4095
+        assert fused_moe_gmm.resolve_onehot_permute_threshold() == 4095
 
-    # 7. Env unset, oversized block rows capped at _ONEHOT_AUTO_CAP (2048)
+    # 7. Env unset, oversized block rows capped at _ONEHOT_AUTO_CAP (4096)
     mock_sc_1024 = MagicMock()
     mock_sc_1024.num_lanes = 16
     mock_sc_1024.num_cores = 8
@@ -120,8 +121,8 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
         "jax.experimental.pallas.tpu.get_tpu_info",
         return_value=mock_info_sc_1024,
     ):
-        # min(4 * 1024 - 1, 2048) = min(4095, 2048) = 2048
-        assert fused_moe_gmm.resolve_onehot_permute_threshold() == 2048
+        # min(8 * 1024 - 1, 4096) = min(8191, 4096) = 4096
+        assert fused_moe_gmm.resolve_onehot_permute_threshold() == 4096
 
 
 def test_moe_gmm_tiling(monkeypatch):
@@ -133,11 +134,14 @@ def test_moe_gmm_tiling(monkeypatch):
         fused_moe_gmm, "calculate_tiling", lambda *args, **kwargs: base_tiles
     )
     # 1. Matching decode dims:
-    # size_group > 1 and 32 <= size_m <= size_group * 40 and 32 % sublane == 0
-    match_dims = types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=8)
-    assert fused_moe_gmm._moe_gmm_tiling(
-        match_dims, None, None, 64 << 20, "silu"
-    ) == fused_moe_gmm.TileSizes(tile_m=32, tile_k=512, tile_n=512, bucket_base=32)
+    # size_group > 1 and 32 <= size_m <= size_group * 80 and 32 % sublane == 0
+    for size_m in (576, 2304, 3456):
+        match_dims = types.SimpleNamespace(
+            size_group=48, size_m=size_m, size_lhs_sublane=8
+        )
+        assert fused_moe_gmm._moe_gmm_tiling(
+            match_dims, None, None, 64 << 20, "silu"
+        ) == fused_moe_gmm.TileSizes(tile_m=32, tile_k=512, tile_n=512, bucket_base=32)
 
     # 2. Non-matching branches
     for non_match in (
@@ -145,8 +149,8 @@ def test_moe_gmm_tiling(monkeypatch):
         types.SimpleNamespace(size_group=1, size_m=576, size_lhs_sublane=8),
         # size_m < 32
         types.SimpleNamespace(size_group=48, size_m=16, size_lhs_sublane=8),
-        # size_m > size_group * 40
-        types.SimpleNamespace(size_group=48, size_m=48 * 40 + 1, size_lhs_sublane=8),
+        # size_m > size_group * 80
+        types.SimpleNamespace(size_group=48, size_m=48 * 80 + 1, size_lhs_sublane=8),
         # 32 % sublane != 0
         types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=12),
     ):
@@ -286,14 +290,19 @@ def test_prepare_routed_gmm_inputs():
 
     # 3. non-EP, non-SC, not packable (large local_num_experts)
     big_experts = 1 << 30
-    out2b = fused_moe_gmm.prepare_routed_gmm_inputs(
+    out2b = jax.eval_shape(
+        lambda h, ti, tw: fused_moe_gmm.prepare_routed_gmm_inputs(
+            h,
+            ti,
+            tw,
+            local_num_experts=big_experts,
+            topk=2,
+            use_ep=False,
+            use_sparse_core=False,
+        ),
         hidden,
         topk_ids,
         topk_weights,
-        local_num_experts=big_experts,
-        topk=2,
-        use_ep=False,
-        use_sparse_core=False,
     )
     assert out2b[0].shape == (8, 16)
 
@@ -328,15 +337,20 @@ def test_prepare_routed_gmm_inputs():
         assert out4a[0].shape == (8, 16)
 
         # 6. use_ep=True, use_sparse_core=True, tokens > threshold, not packable
-        out4b = fused_moe_gmm.prepare_routed_gmm_inputs(
+        out4b = jax.eval_shape(
+            lambda h, ti, tw: fused_moe_gmm.prepare_routed_gmm_inputs(
+                h,
+                ti,
+                tw,
+                local_num_experts=big_experts,
+                topk=2,
+                use_ep=True,
+                use_sparse_core=True,
+                onehot_moe_permute_threshold=0,
+            ),
             hidden,
             topk_ids,
             topk_weights,
-            local_num_experts=big_experts,
-            topk=2,
-            use_ep=True,
-            use_sparse_core=True,
-            onehot_moe_permute_threshold=0,
         )
         assert out4b[0].shape == (8, 16)
 

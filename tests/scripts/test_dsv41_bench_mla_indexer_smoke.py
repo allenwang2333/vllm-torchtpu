@@ -1822,3 +1822,40 @@ class TestBenchmarkingConfigs:
             assert (
                 "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes" in content
             )
+
+    def test_deepseek_v41_flash_100k_decode_dspark_configs(self):
+        dspark_script = "deepseek-v41-flash-tp8-ep-100k-decode-dspark.sh"
+
+        # 1. Default C<=16 DSpark K=5 config
+        cfg_default = self._source_config(dspark_script)
+        assert cfg_default["MAX_NUM_SEQS"] == "16"
+        assert cfg_default["CONCURRENCY_OPTIONS"] == "4 8 16"
+        assert "--kv-cache-memory-bytes=21474836480" in cfg_default["EXTRA_SERVE_ARGS"]
+        assert (
+            '--compilation-config={"compile_sizes":[4,8,16,24,48,96,2048]}'
+            in cfg_default["EXTRA_SERVE_ARGS"]
+        )
+        assert (
+            '--speculative-config={"method":"dspark","num_speculative_tokens":5}'
+            in cfg_default["EXTRA_SERVE_ARGS"]
+        )
+
+        # 2. High-batch OFFLOAD=1 DSpark K=5 config (C=64, 96 / B_verify=384, 576)
+        cfg_offload = self._source_config(
+            dspark_script,
+            env_overrides={
+                "OFFLOAD": "1",
+                "MODEL_URI": "gs://dummy-bucket/dsv41",
+            },
+        )
+        assert cfg_offload["MAX_NUM_SEQS"] == "96"
+        assert cfg_offload["CONCURRENCY_OPTIONS"] == "16 24 32 48 64 96"
+        assert "--kv-cache-memory-bytes=42949672960" in cfg_offload["EXTRA_SERVE_ARGS"]
+        assert (
+            '--compilation-config={"compile_sizes":[4,8,16,24,32,48,64,96,144,192,288,384,576,2048]}'
+            in cfg_offload["EXTRA_SERVE_ARGS"]
+        )
+        assert (
+            '--speculative-config={"method":"dspark","num_speculative_tokens":5,"model":"gs://dummy-bucket/dsv41"}'
+            in cfg_offload["EXTRA_SERVE_ARGS"]
+        )

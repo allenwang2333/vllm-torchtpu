@@ -426,6 +426,145 @@ class TestCaptureHostEngramInputs:
         assert res.can_hash_on_host is True
         assert res.all_prompt is True
 
+    def test_async_spec_decode_resolution_and_branches(self):
+        # 1. prefer_next_tokens_tpu=True with tensor and fallback when None
+        pre_pref = SimpleNamespace(
+            wait_for_copy=lambda: torch.tensor([[1, 2]], dtype=torch.int32),
+            copy_state=None,
+            next_tokens_tpu=torch.tensor([90, 91, 92], dtype=torch.int32),
+        )
+        out_pref = _async_source_tokens_cpu(pre_pref, prefer_next_tokens_tpu=True)
+        assert out_pref is not None and out_pref.tolist() == [90, 91, 92]
+
+        pre_pref_fallback = SimpleNamespace(
+            wait_for_copy=lambda: torch.tensor([[1, 2]], dtype=torch.int32),
+            copy_state=None,
+            next_tokens_tpu=None,
+        )
+        out_pref_fb = _async_source_tokens_cpu(
+            pre_pref_fallback, prefer_next_tokens_tpu=True
+        )
+        assert out_pref_fb is not None and out_pref_fb.tolist() == [1, 2]
+
+        # 2. Async speculative step (K=5, stride=6):
+        # req-0: 3 accepted drafts [15, 16, 17] + bonus 18 (2 rejected out of 5)
+        # req-1: 0 accepted drafts + bonus 35 (5 rejected out of 5)
+        # req-2: discarded request (n_draft=0, rejected=0, sampled=[])
+        runner = _mock_runner([16, 16, 16], [4, 4, 4])
+        runner.speculative_config = SimpleNamespace(num_speculative_tokens=5)
+        runner.input_batch.num_computed_tokens_cpu = np.array(
+            [10, 10, 4], dtype=np.int64
+        )
+        runner.input_batch.num_tokens_no_spec = np.array([11, 11, 5], dtype=np.int64)
+        token_ids_cpu = np.zeros((3, 24), dtype=np.int32)
+        token_ids_cpu[0, :5] = [10, 11, 12, 13, 14]
+        token_ids_cpu[1, :5] = [30, 31, 32, 33, 34]
+        token_ids_cpu[2, :4] = [50, 51, 52, 53]
+        runner.input_batch.token_ids_cpu = token_ids_cpu
+        runner.input_batch.req_ids = ["req-0", "req-1", "req-2"]
+        runner.query_start_loc_cpu = torch.tensor([0, 6, 12, 18], dtype=torch.int32)
+        runner.input_ids_cpu = torch.zeros(18, dtype=torch.int32)
+        runner.positions_cpu = torch.tensor(
+            list(range(10, 16)) + list(range(10, 16)) + list(range(4, 10)),
+            dtype=torch.int64,
+        )
+        runner.lookback_token_ids = SimpleNamespace(
+            cpu=torch.full((3, 2), -1, dtype=torch.int32)
+        )
+        sampled_2d = torch.tensor(
+            [
+                [15, 16, 17, 18, -1, -1],
+                [35, -1, -1, -1, -1, -1],
+                [54, -1, -1, -1, -1, -1],
+            ],
+            dtype=torch.int32,
+        )
+        next_tokens_tpu = torch.tensor(
+            [
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                35,
+                36,
+                37,
+                38,
+                39,
+                40,
+                54,
+                55,
+                56,
+                57,
+                58,
+                59,
+            ],
+            dtype=torch.int32,
+        )
+        runner._pre_async_results = SimpleNamespace(
+            req_id_to_index_copy={"req-0": 0, "req-1": 1, "req-2": 2},
+            wait_for_copy=lambda: sampled_2d,
+            copy_state=None,
+            next_tokens_tpu=next_tokens_tpu,
+            spec_decode_num_rejected_tokens=torch.tensor([2, 5, 0], dtype=torch.int32),
+            num_draft_per_req={0: 5, 1: 5, 2: 0},
+            discard_sampled_tokens_req_indices=[2],
+        )
+        res = capture_host_engram_inputs(runner, 3)
+        assert res is not None
+        assert res.host_ready is True
+        assert res.can_hash_on_host is True
+        assert res.input_ids.tolist() == next_tokens_tpu.tolist()
+        # req-0 positions: [10..15] - 2 = [8..13]
+        # req-1 positions: [10..15] - 5 = [5..10]
+        # req-2 positions: [4..9] - 0 = [4..9]
+        assert res.positions.tolist() == (
+            list(range(8, 14)) + list(range(5, 11)) + list(range(4, 10))
+        )
+        # req-0 lookback at pos [7, 6]: overlaid from sampled [15, 16, 17, 18]
+        # at write_start=5 -> [17, 16]
+        # req-1 lookback at pos [4, 3]: from token_ids_cpu[1, [4, 3]] -> [34, 33]
+        # req-2 lookback at pos [3, 2]: from token_ids_cpu[2, [3, 2]] -> [53, 52]
+        assert res.lookback_token_ids[0].tolist() == [17, 16]
+        assert res.lookback_token_ids[1].tolist() == [34, 33]
+        assert res.lookback_token_ids[2].tolist() == [53, 52]
+
+        # 3. Fallback when num_tokens_no_spec is None, 1D sampled_cpu, and
+        # spec_decode_num_rejected_tokens is None
+        runner.input_batch.num_tokens_no_spec = None
+        runner._pre_async_results = SimpleNamespace(
+            req_id_to_index_copy={"req-0": 0},
+            wait_for_copy=lambda: torch.tensor([18], dtype=torch.int32),
+            copy_state=None,
+            next_tokens_tpu=torch.arange(100, 106, dtype=torch.int32),
+            spec_decode_num_rejected_tokens=None,
+            num_draft_per_req={0: 0},
+            discard_sampled_tokens_req_indices=[],
+        )
+        res_1d = capture_host_engram_inputs(runner, 1)
+        assert res_1d is not None and res_1d.host_ready is True
+
+        # 4. Out-of-bounds pre_idx or short flat_src -> host_ready=False
+        runner._pre_async_results.req_id_to_index_copy = {"req-0": 5}
+        res_oob = capture_host_engram_inputs(runner, 1)
+        assert res_oob is not None and res_oob.host_ready is False
+
+        runner._pre_async_results.req_id_to_index_copy = {"req-0": 0}
+        runner._pre_async_results.next_tokens_tpu = torch.tensor(
+            [1, 2], dtype=torch.int32
+        )
+        runner._pre_async_results.wait_for_copy = lambda: torch.tensor(
+            [18], dtype=torch.int32
+        )
+        res_short = capture_host_engram_inputs(runner, 1)
+        assert res_short is not None and res_short.host_ready is False
+
+        # 5. Missing sampled_cpu in _resolve_async_spec_state -> host_ready=False
+        runner._pre_async_results.wait_for_copy = None
+        res_no_sampled = capture_host_engram_inputs(runner, 1)
+        assert res_no_sampled is not None and res_no_sampled.host_ready is False
+
 
 # ==============================================================================
 # 5. gather_host_engram_hashes Tests
