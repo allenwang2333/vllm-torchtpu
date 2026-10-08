@@ -1,5 +1,3 @@
-import ctypes
-import gc
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -139,16 +137,6 @@ def get_cpu_weight_loader_hook(
         return False
 
     return _cpu_weight_loader_hook
-
-
-def release_memory_to_os() -> None:
-    """Forces Python GC and instructs the C allocator to return free memory
-    to the OS."""
-    gc.collect()
-    try:  # noqa: SIM105 (malloc_trim exists only on glibc)
-        ctypes.CDLL(None).malloc_trim(0)
-    except Exception:  # noqa: S110
-        pass
 
 
 def quantize_to_fp4_e2m1_nibbles(tensor_scaled: torch.Tensor) -> torch.Tensor:

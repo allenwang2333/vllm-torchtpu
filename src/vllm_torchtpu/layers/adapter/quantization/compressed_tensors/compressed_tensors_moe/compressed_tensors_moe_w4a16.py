@@ -46,10 +46,10 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
 )
 from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (  # noqa: E501
     get_cpu_weight_loader_hook,
-    release_memory_to_os,
     requantize_int4_to_fp4_weights,
     requantize_int4_weights,
 )
+from vllm_torchtpu.utils import release_memory_to_os
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (  # noqa: E501

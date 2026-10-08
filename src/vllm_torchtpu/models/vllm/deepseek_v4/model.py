@@ -61,6 +61,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import mhc_collapse_head
 from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
+from vllm_torchtpu.utils import host_rss_gib, release_memory_to_os
 
 logger = init_logger(__name__)
 
@@ -267,6 +268,19 @@ class _HostStagedParams:
         )
         for name in list(self._staged):
             self._flush(name)
+        # The staging is tens of GiB per worker, eight workers a host, and
+        # dropping the last reference does not by itself shrink the process:
+        # glibc keeps the mid-sized chunks for reuse. The serving pod's host
+        # budget is tight enough that holding them OOM-killed a server at the
+        # end of startup, so hand them back now and log what came back.
+        rss_before = host_rss_gib()
+        release_memory_to_os()
+        logger.info(
+            "Released host memory after writing staged parameters: RSS "
+            "%.1f GiB -> %.1f GiB.",
+            rss_before,
+            host_rss_gib(),
+        )
 
 
 @support_torch_compile(
