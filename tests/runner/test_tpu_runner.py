@@ -2887,6 +2887,24 @@ def test_modify_prev_results_uses_cached_copy_state_and_handles_discard_or_remov
     assert runner.input_batch.num_tokens_no_spec[0] == 13
     assert runner.input_batch.token_ids_cpu[0, 12] == 20
 
+    # 3) copy_state is None -> falls back to wait_for_copy()
+    #    plus parse_sampled_token_ids_cpu
+    req_fallback = SimpleNamespace(req_id="req-fb", output_token_ids=[0, 0])
+    runner._pre_async_results = SimpleNamespace(
+        req_ids=["req-fb"],
+        request_seq_lens=[(0, req_fallback, 15, "req-fb")],
+        discard_sampled_tokens_req_indices=[],
+        num_draft_per_req={0: 1},
+        copy_state=None,
+        wait_for_copy=lambda: torch.tensor([[42, INVALID_TOKEN_ID]], dtype=torch.int32),
+    )
+    runner.input_batch.req_id_to_index = {"req-fb": 0}
+    runner.input_batch.num_tokens_no_spec = [17]
+    TPUModelRunner._modify_prev_results(runner)
+    assert req_fallback.output_token_ids == [42]
+    assert runner.input_batch.num_tokens_no_spec[0] == 16
+    assert runner.input_batch.token_ids_cpu[0, 15] == 42
+
 
 def test_assemble_async_spec_substitution_padded_single_chunk_and_prefill_bootstrap():
     runner = object.__new__(TPUModelRunner)
@@ -2911,6 +2929,17 @@ def test_assemble_async_spec_substitution_padded_single_chunk_and_prefill_bootst
     assert idx_map == {0: 0, 1: 1}
     assert num_rejected.tolist() == [1, 2, 0, 0]
     assert num_draft == {0: 2, 1: 2}
+
+    # md=None in spec_decode_metadata_list skips num_draft_per_req
+    state_none_md = SimpleNamespace(
+        num_reqs_list=[2],
+        spec_decode_metadata_list=[None],
+    )
+    chunks_no_md, _, _, num_draft_no_md = runner._assemble_async_spec_substitution(
+        drafts, [nt_chunk0], state_none_md
+    )
+    assert len(chunks_no_md) == 1
+    assert num_draft_no_md == {}
 
     # Empty chunk list returns spec_num_rejected = None
     empty_state = SimpleNamespace(num_reqs_list=[], spec_decode_metadata_list=[])

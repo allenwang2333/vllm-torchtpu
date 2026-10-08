@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 import torch
 from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 
@@ -35,6 +36,16 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     spec_logprobs_lists,
     subtract_num_rejected_tokens,
 )
+
+
+@pytest.fixture
+def device():
+    try:
+        import torch_tpu  # noqa: F401
+
+        return torch.device("tpu")
+    except Exception:
+        return torch.device("cpu")
 
 
 def test_assemble_spec_next_tokens(device):
