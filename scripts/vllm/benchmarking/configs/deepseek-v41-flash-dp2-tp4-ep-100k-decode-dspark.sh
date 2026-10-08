@@ -6,9 +6,11 @@
 # supports up to ~172 concurrent 100k requests (~344 total across DP=2),
 # unlocking C_total=128..224 (C_local=64..112 per DP replica).
 CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ "${OFFLOAD:-0}" == "1" ]]; then
+if [[ "${HOST_DMA:-0}" == "1" ]]; then
+  export TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA="${TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA:-1}"
+fi
+if [[ "${OFFLOAD:-0}" == "1" || "${TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA:-0}" == "1" ]]; then
   export TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD="${TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:-1}"
-  export TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA="${HOST_DMA:-1}"
 fi
 if [[ "${TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:-0}" == "1" ]]; then
   MAX_NUM_SEQS="${MAX_NUM_SEQS:-96}"

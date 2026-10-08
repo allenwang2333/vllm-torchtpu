@@ -539,7 +539,7 @@ class TestCaptureHostEngramInputs:
             copy_state=None,
             next_tokens_tpu=torch.arange(100, 106, dtype=torch.int32),
             spec_decode_num_rejected_tokens=None,
-            num_draft_per_req={0: 0},
+            num_draft_per_req={},
             discard_sampled_tokens_req_indices=[],
         )
         res_1d = capture_host_engram_inputs(runner, 1)
@@ -564,6 +564,58 @@ class TestCaptureHostEngramInputs:
         runner._pre_async_results.wait_for_copy = None
         res_no_sampled = capture_host_engram_inputs(runner, 1)
         assert res_no_sampled is not None and res_no_sampled.host_ready is False
+
+    def test_capture_dummy_run_position_ids_override(self):
+        runner = SimpleNamespace(
+            _last_sequence_layout_plan=None,
+            max_num_tokens=16,
+            max_num_reqs=4,
+            input_ids_cpu=torch.tensor([999], dtype=torch.int32),
+            positions_cpu=torch.tensor([999], dtype=torch.int64),
+            query_start_loc_cpu=torch.tensor([0, 999], dtype=torch.int32),
+            lookback_token_ids=SimpleNamespace(
+                cpu=torch.zeros((4, 3), dtype=torch.int32)
+            ),
+        )
+        # Non-ALL layout descriptor in dummy run -> returns None
+        runner._attn_metadata_builder_ctx = SimpleNamespace(
+            position_ids_override=torch.zeros(8, dtype=torch.int32),
+            sequence_layout_descriptor=SimpleNamespace(kind="other"),
+        )
+        assert capture_host_engram_inputs(runner, 0) is None
+
+        # ALL layout in dummy run -> returns cached CPU zeros
+        runner._attn_metadata_builder_ctx = SimpleNamespace(
+            position_ids_override=torch.zeros(8, dtype=torch.int32),
+            query_start_loc=None,
+            num_reqs=2,
+            sequence_layout_descriptor=SimpleNamespace(kind=SequenceLayoutKind.ALL),
+        )
+        dummy1 = capture_host_engram_inputs(runner, 0)
+        assert dummy1 is not None and dummy1.can_hash_on_host is True
+        assert dummy1.input_ids.shape == (16,)
+        assert dummy1.positions.shape == (16,)
+        assert dummy1.query_start_loc.shape == (5,)
+        assert dummy1.lookback_token_ids.shape == (4, 3)
+        assert torch.all(dummy1.input_ids == 0)
+        assert torch.all(dummy1.lookback_token_ids == -1)
+
+        # Cache hit on identical shapes
+        dummy2 = capture_host_engram_inputs(runner, 0)
+        assert dummy2 is dummy1
+
+        # Cache miss when query_start_loc is provided with larger shape
+        runner._attn_metadata_builder_ctx = SimpleNamespace(
+            position_ids_override=torch.zeros(24, dtype=torch.int32),
+            query_start_loc=torch.zeros(9, dtype=torch.int32),
+            num_reqs=8,
+            sequence_layout_descriptor=None,
+        )
+        dummy3 = capture_host_engram_inputs(runner, 0)
+        assert dummy3 is not None and dummy3 is not dummy1
+        assert dummy3.input_ids.shape == (24,)
+        assert dummy3.query_start_loc.shape == (9,)
+        assert dummy3.lookback_token_ids.shape == (8, 3)
 
 
 # ==============================================================================
@@ -734,6 +786,47 @@ class TestGatherHostEngramHashes:
             )
             assert out_dev_dummy == "device_dummy_gather"
 
+        # Under OFFLOAD=1 (CPU_OFFLOAD=True, HOST_DMA=False, not compiling),
+        # a non-CPU tensor is moved to CPU so all DP ranks pair on cpu_group.
+        cpu_hashes = torch.tensor([[[7, 8]]], dtype=torch.int32)
+        fake_tpu_hashes = SimpleNamespace(
+            device=SimpleNamespace(type="tpu"),
+            shape=cpu_hashes.shape,
+            to=lambda dev: cpu_hashes if dev == "cpu" else None,
+        )
+
+        def fake_all_gather(out_tensor, in_tensor, group=None):
+            out_tensor.copy_(torch.cat([in_tensor, in_tensor], dim=0))
+
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.get_engram_dp_group",
+                return_value=fake_dp_dev,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.is_forward_context_available",
+                return_value=False,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD",
+                True,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA",
+                False,
+            ),
+            patch(
+                "torch.distributed.all_gather_into_tensor",
+                side_effect=fake_all_gather,
+            ),
+        ):
+            out_offload_fallback = gather_host_engram_hashes(
+                fake_tpu_hashes,  # type: ignore[arg-type]
+                dp_shared_memory=False,
+            )
+            assert out_offload_fallback.device.type == "cpu"
+            assert out_offload_fallback.shape == (2, 1, 2)
+
 
 # ==============================================================================
 # 6. install_host_engram_inputs Tests
@@ -741,6 +834,65 @@ class TestGatherHostEngramHashes:
 
 
 class TestInstallHostEngramInputs:
+    def test_dp2_tp4_benchmark_configs_offload_and_host_dma(self):
+        import os
+        import subprocess
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parents[3]
+        cfg_dir = repo_root / "scripts" / "vllm" / "benchmarking" / "configs"
+        for script_name in (
+            "deepseek-v41-flash-dp2-tp4-ep-100k-decode.sh",
+            "deepseek-v41-flash-dp2-tp4-ep-100k-decode-dspark.sh",
+        ):
+            script_path = cfg_dir / script_name
+            # 1. OFFLOAD=1 (default HOST_DMA=0): CPU_OFFLOAD=1, HOST_DMA unset
+            out_offload = subprocess.check_output(
+                [
+                    "bash",
+                    "-c",
+                    f'source "{script_path}" && printf "%s|%s|%s|%s" '
+                    '"${TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:-}" '
+                    '"${TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA:-}" '
+                    '"${MAX_NUM_SEQS}" "${KV_CACHE_MEMORY_BYTES}"',
+                ],
+                env={
+                    k: v
+                    for k, v in os.environ.items()
+                    if not k.startswith("TPU_DEEPSEEK_V41_")
+                    and k
+                    not in (
+                        "OFFLOAD",
+                        "HOST_DMA",
+                        "MAX_NUM_SEQS",
+                        "KV_CACHE_MEMORY_BYTES",
+                    )
+                }
+                | {"OFFLOAD": "1"},
+                text=True,
+            )
+            assert out_offload == "1||96|42949672960"
+
+            # 2. HOST_DMA=1: both HOST_DMA=1 and CPU_OFFLOAD=1
+            out_dma = subprocess.check_output(
+                [
+                    "bash",
+                    "-c",
+                    f'source "{script_path}" && printf "%s|%s" '
+                    '"${TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:-}" '
+                    '"${TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA:-}"',
+                ],
+                env={
+                    k: v
+                    for k, v in os.environ.items()
+                    if not k.startswith("TPU_DEEPSEEK_V41_")
+                    and k not in ("OFFLOAD", "HOST_DMA")
+                }
+                | {"HOST_DMA": "1"},
+                text=True,
+            )
+            assert out_dma == "1|1"
+
     def test_install_idempotency_and_prepare_execution(self):
         # Save original method
         orig_method = TPUModelRunner._prepare_lookback_token_ids

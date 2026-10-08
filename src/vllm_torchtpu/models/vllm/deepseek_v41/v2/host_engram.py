@@ -24,6 +24,8 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.models.deepseek_v41.common.engram import DEAD_ID
 from vllm.models.deepseek_v41.nvidia.engram import engram_gathered_num_tokens
 
+from vllm_torchtpu import envs
+
 HOST_ENGRAM_KEY = "deepseek_v41_host_engram"
 
 
@@ -221,6 +223,36 @@ def _unresolved_host_inputs(runner, all_prompt: bool) -> HostEngramInputs:
     )
 
 
+def _dummy_host_inputs(runner, ctx) -> HostEngramInputs:
+    pos_override = ctx.position_ids_override
+    num_tokens = max(
+        int(pos_override.shape[-1]),
+        int(getattr(runner, "max_num_tokens", 0) or 0),
+    )
+    qsl = getattr(ctx, "query_start_loc", None)
+    qsl_len = max(
+        int(qsl.shape[0]) if qsl is not None else int(getattr(ctx, "num_reqs", 0)) + 1,
+        int(getattr(runner, "max_num_reqs", 0) or 0) + 1,
+    )
+    lb_cpu = runner.lookback_token_ids.cpu
+    lb_rows = max(int(lb_cpu.shape[0]), int(getattr(ctx, "num_reqs", 0)))
+    depth = int(lb_cpu.shape[1])
+    key = (num_tokens, qsl_len, lb_rows, depth)
+    cached = getattr(runner, "_dummy_host_engram_inputs", None)
+    if cached is None or cached[0] != key:
+        inputs = HostEngramInputs(
+            input_ids=torch.zeros(num_tokens, dtype=torch.int32),
+            positions=torch.zeros(num_tokens, dtype=torch.int64),
+            query_start_loc=torch.zeros(qsl_len, dtype=torch.int32),
+            lookback_token_ids=torch.full((lb_rows, depth), -1, dtype=torch.int32),
+            all_prompt=True,
+            host_ready=True,
+        )
+        runner._dummy_host_engram_inputs = (key, inputs)
+        return inputs
+    return cached[1]
+
+
 def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None:
     """Snapshot the runner's host hash inputs, or None if they do not apply.
 
@@ -231,10 +263,15 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
     """
     from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 
+    ctx = getattr(runner, "_attn_metadata_builder_ctx", None)
+    if getattr(ctx, "position_ids_override", None) is not None:
+        desc = getattr(ctx, "sequence_layout_descriptor", None)
+        if getattr(desc, "kind", SequenceLayoutKind.ALL) is not SequenceLayoutKind.ALL:
+            return None
+        return _dummy_host_inputs(runner, ctx)
     plan = getattr(runner, "_last_sequence_layout_plan", None)
     if plan is None or plan.kind is not SequenceLayoutKind.ALL:
         return None
-    ctx = getattr(runner, "_attn_metadata_builder_ctx", None)
     start_index = int(getattr(ctx, "start_index", getattr(plan, "start_index", 0)))
     chunk_num_reqs = min(
         num_reqs,
@@ -377,11 +414,16 @@ def gather_host_engram_hashes(
             )
             raw_slot = engram_gathered_num_tokens() if dp_metadata is not None else 0
             slot = raw_slot if raw_slot > 0 else int(engram_hashes.shape[0])
-            cpu_group = (
-                getattr(dp_group, "cpu_group", None)
-                if engram_hashes.device.type == "cpu"
-                else None
-            )
+            dp_cpu_group = getattr(dp_group, "cpu_group", None)
+            if (
+                dp_cpu_group is not None
+                and engram_hashes.device.type != "cpu"
+                and envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD
+                and not envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA
+                and not torch.compiler.is_compiling()
+            ):
+                engram_hashes = engram_hashes.to("cpu")
+            cpu_group = dp_cpu_group if engram_hashes.device.type == "cpu" else None
             if cpu_group is not None:
                 if engram_hashes.shape[0] > slot:
                     raise ValueError("Engram token count exceeds the DP token slot")
