@@ -76,9 +76,27 @@ def render(baseline: dict, source_commit: str, model_uri: str) -> dict:
     )
     if command.count(marker) != 1:
         raise ValueError("Baseline launch marker changed")
+    runai_patch = """python - <<'PATCH_RUNAI_GCS'
+import ast
+import importlib
+import importlib.metadata as metadata
+from pathlib import Path
+
+assert metadata.version("runai-model-streamer-gcs") == "0.16.1"
+module = importlib.import_module("runai_model_streamer_gcs.files.files")
+path = Path(module.__file__)
+before = path.read_text()
+needle = "gcs.get_bucket(bucket_name)"
+assert before.count(needle) == 2
+after = before.replace(needle, "gcs.bucket(bucket_name)")
+ast.parse(after)
+path.write_text(after)
+print("RUNAI_GCS_PATCH_VERIFIED", path, flush=True)
+PATCH_RUNAI_GCS
+"""
     command = command.replace(
         marker,
-        f"export TPU_DSV41_STATIC_MOE_DIR={MODEL_MOUNT}\n{marker}",
+        f"{runai_patch}export TPU_DSV41_STATIC_MOE_DIR={MODEL_MOUNT}\n{marker}",
     )
     task["command"] = command
     return {
