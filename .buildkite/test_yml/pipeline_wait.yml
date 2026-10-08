@@ -34,7 +34,7 @@ steps:
   - block: ":block: "
     key: "block"
     prompt: "All tests passed. continue?"
-    depends_on: w5s
+    depends_on: bootstrap1
 
   - label: ":work: Finished - 1"
     key: "finished1"
