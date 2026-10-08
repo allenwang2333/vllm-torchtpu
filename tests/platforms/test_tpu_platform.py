@@ -292,10 +292,14 @@ class TestTpuPlatform:
         vllm_config.compilation_config.compile_sizes = [16, 32]
         vllm_config.scheduler_config = MagicMock()
         vllm_config.scheduler_config.max_num_batched_tokens = 2048
+        vllm_config.scheduler_config.max_num_seqs = 16
+        vllm_config.scheduler_config.max_num_scheduled_tokens = None
+        vllm_config.scheduler_config.enable_chunked_prefill = True
         vllm_config.scheduler_config.is_multimodal_model = False
         vllm_config.scheduler_config.async_scheduling = False
         vllm_config.speculative_config = None
         vllm_config.parallel_config = MagicMock()
+        vllm_config.parallel_config.prefill_context_parallel_size = 1
         vllm_config.parallel_config.nnodes = 1
         vllm_config.parallel_config.node_rank = 0
         vllm_config.parallel_config.world_size = 1

@@ -810,6 +810,8 @@ class TpuPlatform(Platform):
 
         if envs.TPU_MOE_SEQUENCE_PARALLEL:
             _configure_sequence_parallel_moe(vllm_config)
+        # After the sequence-parallel filter, which can drop the largest size.
+        _cap_scheduled_tokens_to_compile_sizes(vllm_config)
 
         # Clear compile_ranges_split_points — TPU always pads to exact
         # compile_sizes so catch-all ranges are never used.
@@ -1385,3 +1387,65 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
             tp,
         )
     cc.compile_sizes = cast(list[int | str], kept)
+
+
+def _cap_scheduled_tokens_to_compile_sizes(vllm_config: VllmConfig) -> None:
+    """Keep the scheduler token budget within the largest compile size.
+
+    The runner asserts that every step fits a compile size. A decode server
+    launched with compile_sizes [256] and max_num_batched_tokens 16384
+    crashes as soon as a preempted request is resumed and its full prompt is
+    recomputed locally. With chunked prefill on, capping the scheduled-token
+    budget makes the scheduler split that recompute into fitting steps, and
+    running requests that do not fit a step wait for the next one.
+    Under prefill context parallelism a compile size counts rows per rank,
+    so a step may hold pcp times as many tokens.
+    """
+    cc = vllm_config.compilation_config
+    sc = vllm_config.scheduler_config
+    if not cc.compile_sizes or any(isinstance(s, str) for s in cc.compile_sizes):
+        return
+    pcp = max(1, int(vllm_config.parallel_config.prefill_context_parallel_size))
+    largest = max(int(s) for s in cc.compile_sizes)
+    limit = largest * pcp
+    budget = sc.max_num_scheduled_tokens or sc.max_num_batched_tokens
+    if budget <= limit:
+        return
+    if not sc.enable_chunked_prefill:
+        # The scheduler cannot split a prompt, so a cap would leave longer
+        # prompts unschedulable; warn instead.
+        logger.warning(
+            "compile_sizes max %d (x%d prefill context parallel ranks = %d "
+            "tokens) is below the scheduler token budget %d and chunked "
+            "prefill is off; steps above %d tokens will fail.",
+            largest,
+            pcp,
+            limit,
+            budget,
+            limit,
+        )
+        return
+    logger.warning(
+        "compile_sizes max %d (x%d prefill context parallel ranks = %d tokens) "
+        "is below the scheduler token budget %d; capping scheduled tokens per "
+        "step to %d.",
+        largest,
+        pcp,
+        limit,
+        budget,
+        limit,
+    )
+    sc.max_num_scheduled_tokens = limit
+    spec = vllm_config.speculative_config
+    k = (getattr(spec, "num_speculative_tokens", 0) or 0) if spec is not None else 0
+    full_decode_step = sc.max_num_seqs * (1 + k)
+    if limit < full_decode_step:
+        logger.warning(
+            "The scheduled-token cap %d is below a full decode step (%d seqs "
+            "x %d tokens = %d); some requests will wait a step or get shorter "
+            "drafts.",
+            limit,
+            sc.max_num_seqs,
+            1 + k,
+            full_decode_step,
+        )

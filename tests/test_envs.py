@@ -36,6 +36,9 @@ def vllm_config():
     config.model_config.is_hybrid = False
     config.cache_config = CacheConfig(enable_prefix_caching=False)
     config.compilation_config.compile_sizes = [16, 32]
+    # Budget within the largest compile size, so the scheduled-token cap is a no-op.
+    config.scheduler_config.max_num_scheduled_tokens = None
+    config.scheduler_config.max_num_batched_tokens = 32
     config.speculative_config = None
     config.parallel_config.nnodes = 1
     config.parallel_config.data_parallel_size = 1
