@@ -68,7 +68,7 @@ def render(conversion: dict, source_commit: str) -> dict:
         f"--source {MODEL_PATH} "
         f"--prepared {CONVERTED_PATH}/prepared-weights "
         f"--previous {PREVIOUS_PATH}/prepared-weights "
-        '--output "$ARTIFACT_LOCAL_DIR/model"\n'
+        '--output "$ARTIFACT_LOCAL_DIR/model" --copy-workers 8\n'
         'test -f "$ARTIFACT_LOCAL_DIR/model/STATIC_MOE_READY.json"\n'
         "PACK_STATIC_MOE\n"
     )
@@ -83,6 +83,7 @@ def render(conversion: dict, source_commit: str) -> dict:
                 "conversion_artifact_uri": conversion["artifact_uri"],
                 "source_commit": source_commit,
                 "model_output": "model/",
+                "copy_workers": 8,
             }
         ),
         "role_to_task_spec": spec,

@@ -14,6 +14,7 @@ import json
 import shutil
 import struct
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 MOE_KINDS = {"moe_fp4", "moe_scale"}
@@ -102,7 +103,37 @@ def write_original_shard(
     )
 
 
-def assemble(source: Path, prepared: Path, previous: Path, output: Path) -> None:
+def copy_prepared_shard(
+    item: dict, prepared: Path, previous: Path, static_dir: Path
+) -> dict:
+    filename = item["file"]
+    source_file = (previous if item.get("external") else prepared) / filename
+    target_name = Path(filename).with_suffix(".fp4").name
+    target = static_dir / target_name
+    if target.exists():
+        if target.stat().st_size != source_file.stat().st_size:
+            raise ValueError(f"Copied shard size differs: {target}")
+    else:
+        with source_file.open("rb") as src, target.open("xb") as dst:
+            copy_exact(src, dst, source_file.stat().st_size)
+        print(
+            json.dumps(
+                {
+                    "event": "moe_shard_copied",
+                    "file": target_name,
+                    "bytes": target.stat().st_size,
+                }
+            ),
+            flush=True,
+        )
+    return {"file": f"prepared-weights/{target_name}", "bytes": target.stat().st_size}
+
+
+def assemble(
+    source: Path, prepared: Path, previous: Path, output: Path, workers: int = 8
+) -> None:
+    if workers < 1:
+        raise ValueError("--copy-workers must be positive")
     complete = json.loads((prepared / "CONVERSION_COMPLETE.json").read_text())
     if not complete["cpu_conversion_complete"]:
         raise ValueError("Converter did not complete")
@@ -130,45 +161,38 @@ def assemble(source: Path, prepared: Path, previous: Path, output: Path) -> None
     output.mkdir(parents=True, exist_ok=True)
     static_dir = output / "prepared-weights"
     static_dir.mkdir(exist_ok=True)
-    static_files = []
-    for item in converted["files"]:
-        filename = item["file"]
-        if filename not in used_files:
-            continue
-        source_file = (previous if item.get("external") else prepared) / filename
-        target_name = Path(filename).with_suffix(".fp4").name
-        target = static_dir / target_name
-        if target.exists():
-            if target.stat().st_size != source_file.stat().st_size:
-                raise ValueError(f"Copied shard size differs: {target}")
-        else:
-            with source_file.open("rb") as src, target.open("xb") as dst:
-                copy_exact(src, dst, source_file.stat().st_size)
-            print(
-                json.dumps(
-                    {
-                        "event": "moe_shard_copied",
-                        "file": target_name,
-                        "bytes": target.stat().st_size,
-                    }
-                ),
-                flush=True,
+    needed_files = [item for item in converted["files"] if item["file"] in used_files]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        static_files = list(
+            pool.map(
+                lambda item: copy_prepared_shard(item, prepared, previous, static_dir),
+                needed_files,
             )
-        static_files.append(
-            {"file": f"prepared-weights/{target_name}", "bytes": target.stat().st_size}
         )
     if {Path(e["file"]).stem + ".safetensors" for e in static_files} != used_files:
         raise ValueError("MoE shard file missing from converter manifest")
 
     weight_map = {}
     total_bytes = 0
+    original_shards = []
     for ordinal, (filename, entries) in enumerate(checkpoint_headers(source).items()):
-        kept = [e for e in entries if e["name"] not in sources]
-        if not kept:
-            continue
+        kept = [entry for entry in entries if entry["name"] not in sources]
+        if kept:
+            original_shards.append((ordinal, filename, kept))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(
+            pool.map(
+                lambda shard: write_original_shard(
+                    source / shard[1],
+                    output / f"model-{shard[0]:05d}.safetensors",
+                    shard[2],
+                    output / f"model-{shard[0]:05d}.json",
+                ),
+                original_shards,
+            )
+        )
+    for ordinal, _, kept in original_shards:
         target = output / f"model-{ordinal:05d}.safetensors"
-        journal = output / f"model-{ordinal:05d}.json"
-        write_original_shard(source / filename, target, kept, journal)
         for entry in kept:
             if entry["name"] in weight_map:
                 raise ValueError(f"Duplicate source tensor: {entry['name']}")
@@ -243,8 +267,9 @@ def main() -> None:
     parser.add_argument("--prepared", type=Path, required=True)
     parser.add_argument("--previous", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--copy-workers", type=int, default=8)
     args = parser.parse_args()
-    assemble(args.source, args.prepared, args.previous, args.output)
+    assemble(args.source, args.prepared, args.previous, args.output, args.copy_workers)
 
 
 if __name__ == "__main__":
