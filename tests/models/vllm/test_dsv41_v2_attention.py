@@ -298,6 +298,7 @@ def test_prepare_tpu_indexer_all_indices_fit_masking(monkeypatch):
         token_parallel,
         full_sink,
         tp_rank,
+        fused_swa: bool = False,
     ):
         sparse_fp8_called.append(
             {
@@ -437,6 +438,7 @@ def test_prepare_tpu_non_source_layer_buffer_reuse(monkeypatch):
         token_parallel,
         full_sink,
         tp_rank,
+        fused_swa: bool = False,
     ):
         captured_records.append(main_records)
         return torch.zeros(
