@@ -317,7 +317,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     assert cfg.QMAX <= QB8
     pg = cfg.page
     lg_pg = int(math.log2(pg))
-    assert 1 << lg_pg == pg and pg % 128 == 0
+    assert 1 << lg_pg == pg and pg % 128 == 0 and pg <= 256      # gather source packs page << 8 | slot
     NPR = pg // 128                                      # key rows per page
     KT = cfg.KT
     KR_ = KT // 128                                      # candidate rows
@@ -422,7 +422,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         # per-request union of the rows' owned winners (+ per-row membership over it)
         "own_u": pltpu.SMEM((UR_, 128), I32), "own_uv": pltpu.VMEM((UR_, 128), I32),
         "memb": pltpu.SMEM((UR_, 128), I32), "memb_v": pltpu.VMEM((UR_, 128), I32),
-        "nu_s": pltpu.SMEM((BMAX,), I32), "uo_s": pltpu.SMEM((BMAX,), I32),
+        "nu_s": pltpu.SMEM((BMAX,), I32), "uo_s": pltpu.SMEM((BMAX,), I32), "nuo_s": pltpu.SMEM((BMAX,), I32),
         "misc_sem": pltpu.SemaphoreType.DMA(()),
         # attention
         "g_nope": pltpu.VMEM((2, KT, 128), U32), "g_rope": pltpu.VMEM((2, KT, 128), U32),
@@ -1208,6 +1208,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             nq = qmeta[b, 1]
             QM = cfg.QMAX
             BIG = jnp.int32(2 ** 30)
+            t0r, _, p0r, noldr = req_new(b)
             ns = [jnp.where(qq < nq, scr["nown_s"][jnp.minimum(t0 + qq, TMAX - 1)], 0) for qq in range(QM)]
             tot = ns[0]
             for x in ns[1:]:
@@ -1223,7 +1224,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
             def body(c):
                 consumed, k = c[0], c[1]
-                ps = list(c[2:])
+                ps = list(c[3:])
                 hs = [head(qq, ps[qq]) for qq in range(QM)]
                 m = hs[0]
                 for h in hs[1:]:
@@ -1234,16 +1235,25 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                     hit = (hs[qq] == m).astype(I32)
                     bits = bits | (hit << qq)
                     new_ps.append(ps[qq] + hit)
+                # the entry's gather source, resolved once per fresh top-k (reuse layers share it):
+                # in HBM -> page << 8 | slot; this step's own new row (sorted last) -> staging row << 2
+                # | seg. Both keep the rope segment (local index & 3) in the low bits.
+                old_ = m < noldr
+                g = (m // ILV) * G_ + me * ILV + m % ILV
+                t2 = jnp.clip(t0r + (g - p0r), 0, TMAX - 1)
+                src = jnp.where(old_, (bt[b, jnp.where(old_, m, 0) >> lg_pg] << 8) | (m & (pg - 1)),
+                                (t2 << 2) | (m & 3))
                 p = off * 128 + k
-                scr["own_u"][p >> 7, p & 127] = m
+                scr["own_u"][p >> 7, p & 127] = src
                 scr["memb"][p >> 7, p & 127] = bits
                 took = bits & 1
                 for qq in range(1, QM):
                     took = took + ((bits >> qq) & 1)
-                return (consumed + took, k + 1, *new_ps)
-            res = lax.while_loop(cond, body, (jnp.int32(0), jnp.int32(0)) + (jnp.int32(0),) * QM)
+                return (consumed + took, k + 1, c[2] + old_.astype(I32), *new_ps)
+            res = lax.while_loop(cond, body, (jnp.int32(0),) * 3 + (jnp.int32(0),) * QM)
             scr["nu_s"][b] = res[1]
             scr["uo_s"][b] = off
+            scr["nuo_s"][b] = res[2]
             return off + (res[1] + 127) // 128
 
         def global_row(t_):
@@ -1290,37 +1300,34 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
         def attn_issue(l, b, buf, j):
             """Start the gather of tile j (union entries j*KT ..) of request b into buffer buf: HBM
-            rows, or this step's own new rows from the VMEM staging (not in HBM yet)."""
+            rows (page, slot resolved by build_union), then this step's own new rows from the VMEM
+            staging (not in HBM yet; they sort last)."""
             b_c = jnp.minimum(b, BMAX - 1)
             n = tile_n(b, j)
             base = scr["uo_s"][b_c] * 128 + j * KT
-            t0r, nqr, p0r, noldr = req_new(b_c)
+            n_old = jnp.clip(jnp.where(b < B, scr["nuo_s"][b_c], 0) - j * KT, 0, n)
 
             def go(rn, rr):
-                def gbody(k, c2):
+                def obody(k, c2):
                     p = base + k
-                    lo = scr["own_u"][p >> 7, p & 127]
-                    new = lo >= noldr
-
-                    @pl.when(jnp.logical_not(new))
-                    def _():
-                        page = bt[b_c, lo >> lg_pg]
-                        sl = lo & (pg - 1)
-                        pltpu.make_async_copy(rn.at[page, pl.ds(sl, 1)], scr["g_nope"].at[buf, pl.ds(k, 1)],
-                                              scr["g_sem"].at[buf, 0]).start()
-                        pltpu.make_async_copy(rr.at[page, pl.ds(sl >> 2, 1)],
-                                              scr["g_rope"].at[buf, pl.ds(k, 1)], scr["g_sem"].at[buf, 1]).start()
-
-                    @pl.when(new)
-                    def _():
-                        g = (lo // ILV) * G_ + me * ILV + lo % ILV
-                        t2 = jnp.clip(t0r + (g - p0r), 0, TMAX - 1)
-                        pltpu.make_async_copy(scr["wrow"].at[pl.ds(t2, 1)], scr["g_nope"].at[buf, pl.ds(k, 1)],
-                                              scr["g_sem"].at[buf, 0]).start()
-                        pltpu.make_async_copy(scr["rwrow"].at[pl.ds(t2, 1)], scr["g_rope"].at[buf, pl.ds(k, 1)],
-                                              scr["g_sem"].at[buf, 1]).start()
+                    v = scr["own_u"][p >> 7, p & 127]
+                    page, sl = v >> 8, v & 255
+                    pltpu.make_async_copy(rn.at[page, pl.ds(sl, 1)], scr["g_nope"].at[buf, pl.ds(k, 1)],
+                                          scr["g_sem"].at[buf, 0]).start()
+                    pltpu.make_async_copy(rr.at[page, pl.ds(sl >> 2, 1)],
+                                          scr["g_rope"].at[buf, pl.ds(k, 1)], scr["g_sem"].at[buf, 1]).start()
                     return c2
-                lax.fori_loop(0, n, gbody, 0)
+                lax.fori_loop(0, n_old, obody, 0)
+
+                def nbody(k, c2):
+                    p = base + k
+                    t2 = scr["own_u"][p >> 7, p & 127] >> 2
+                    pltpu.make_async_copy(scr["wrow"].at[pl.ds(t2, 1)], scr["g_nope"].at[buf, pl.ds(k, 1)],
+                                          scr["g_sem"].at[buf, 0]).start()
+                    pltpu.make_async_copy(scr["rwrow"].at[pl.ds(t2, 1)], scr["g_rope"].at[buf, pl.ds(k, 1)],
+                                          scr["g_sem"].at[buf, 1]).start()
+                    return c2
+                lax.fori_loop(n_old, n, nbody, 0)
             if "gather" not in skip:
                 csel(("nope", "rope"), l, go)
 
@@ -1721,6 +1728,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         def zb(b_, c):
             scr["nu_s"][b_] = jnp.int32(0)
             scr["uo_s"][b_] = jnp.int32(0)
+            scr["nuo_s"][b_] = jnp.int32(0)
             return c
         lax.fori_loop(0, BMAX, zb, 0)
         if "weights" in skip:
