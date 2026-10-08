@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import bisect
 import contextlib
 import copy
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -24,6 +25,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+from vllm_torchtpu.runner.utils import MIN_NUM_SEQS
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
@@ -91,6 +93,13 @@ class DFlashProposer:
         self.draft_model = None
         self._draft_has_moe_cache: bool | None = None
         self._draft_attn_layer_names: set[str] | None = None
+        self._draft_layer_names_frozen_cache: (
+            tuple[tuple[int, int], frozenset[str]] | None
+        ) = None
+        self._draft_group_builders_cache: tuple[Any, tuple[Any, ...]] | None = None
+        self._draft_kv_layer_names_cache: (
+            tuple[tuple[int, int, int], tuple[str | None, ...]] | None
+        ) = None
         self.draft_chunks: list[DraftChunkInputs] | None = None
         self._static_attn_tensors_cache: dict[
             int, tuple[torch.Tensor, torch.Tensor]
@@ -99,6 +108,11 @@ class DFlashProposer:
         # shape, see `_dummy_kv_update_inputs`.
         self._dummy_kv_input_cache: dict[
             tuple, tuple[list[torch.Tensor], AttentionMetadata]
+        ] = {}
+        # Keyed by (num_tokens, block_size); cached dummy inputs for
+        # `_dummy_draft_forward` (used in both precompile and DP lockstep).
+        self._dummy_draft_forward_cache: dict[
+            tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
         # Keyed by the chunk's padded request count; the all-zero
         # `draft_lengths` a chunk without spec metadata routes on.
@@ -264,10 +278,44 @@ class DFlashProposer:
         return draft
 
     def _get_padded_len(self, target_len: int) -> int:
-        for p in self._draft_tokens_paddings():
-            if p >= target_len:
-                return p
-        return target_len
+        paddings = self._draft_tokens_paddings()
+        idx = bisect.bisect_left(paddings, target_len)
+        return paddings[idx] if idx < len(paddings) else target_len
+
+    def _get_frozen_draft_attn_layer_names(self) -> frozenset[str]:
+        names = self._draft_attn_layer_names
+        assert names is not None, (
+            "load_model() must run before draft attention metadata is built"
+        )
+        key = (id(names), len(names))
+        cached = self._draft_layer_names_frozen_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        frozen = frozenset(names)
+        hash(frozen)
+        self._draft_layer_names_frozen_cache = (key, frozen)
+        return frozen
+
+    def _get_draft_group_builders(self, attn_groups) -> tuple[Any, ...]:
+        frozen_names = self._get_frozen_draft_attn_layer_names()
+        key = (
+            id(attn_groups),
+            len(attn_groups),
+            tuple(id(gl) for gl in attn_groups),
+            tuple(len(gl) for gl in attn_groups),
+            frozen_names,
+        )
+        cached = self._draft_group_builders_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        builders = tuple(
+            group.metadata_builders[0]
+            for group_list in attn_groups
+            for group in group_list
+            if any(name in frozen_names for name in group.layer_names)
+        )
+        self._draft_group_builders_cache = (key, builders)
+        return builders
 
     def _can_reuse_staged_block_tables(
         self,
@@ -287,26 +335,29 @@ class DFlashProposer:
             or not self._draft_attn_layer_names
         ):
             return None
-        matched = False
-        for group_list in attn_groups:
-            for group in group_list:
-                if not any(
-                    name in self._draft_attn_layer_names for name in group.layer_names
-                ):
-                    continue
-                matched = True
-                builder = group.metadata_builders[0]
-                staged = staged_tables.get(builder.kv_cache_group_id)
-                if staged is None:
-                    return None
-                _, tnb = builder._block_table_geometry(draft_ctx)
-                if staged.numel() != padded_num_reqs * tnb:
-                    return None
+        builders = self._get_draft_group_builders(attn_groups)
+        if not builders:
+            return None
+        checked_geom: tuple[int, int, bool] | None = None
+        for builder in builders:
+            staged = staged_tables.get(builder.kv_cache_group_id)
+            if staged is None:
+                return None
+            _, tnb = builder._block_table_geometry(draft_ctx)
+            if staged.numel() != padded_num_reqs * tnb:
+                return None
+            geom = (
+                getattr(builder, "target_block_size", id(builder)),
+                tnb,
+                getattr(builder, "is_mamba_group", False),
+            )
+            if geom != checked_geom:
                 if builder._active_block_table_columns(
                     draft_ctx, tnb
                 ) > builder._active_block_table_columns(chunk_ctx, tnb):
                     return None
-        return staged_tables if matched else None
+                checked_geom = geom
+        return staged_tables
 
     def _build_attn_metadata_for_draft(
         self,
@@ -327,9 +378,7 @@ class DFlashProposer:
         the dummies share this so they dispatch the identical programs.
         No mamba fields: DFlash drafters are attention-only."""
         runner = self.runner
-        assert self._draft_attn_layer_names is not None, (
-            "load_model() must run before draft attention metadata is built"
-        )
+        frozen_layer_names = self._get_frozen_draft_attn_layer_names()
         saved_ctx = runner._attn_metadata_builder_ctx
         draft_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
@@ -351,7 +400,7 @@ class DFlashProposer:
             # every group in the deployment and we would discard all but
             # these — see `build_attention_metadata_for_layers`.
             return runner.build_attention_metadata_for_layers(
-                self._draft_attn_layer_names, padded_num_reqs
+                frozen_layer_names, padded_num_reqs
             )
         finally:
             runner._attn_metadata_builder_ctx = saved_ctx
@@ -490,12 +539,11 @@ class DFlashProposer:
     def _zero_draft_lengths(self, num_reqs: int) -> torch.Tensor:
         """Cached all-zero `draft_lengths` for a chunk without spec
         metadata, padded like the real tensor so both share one program."""
-        from vllm_torchtpu.runner.tpu_runner import (
-            _get_padded_num_reqs_with_upper_limit,
-        )
-
-        padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
-            num_reqs, self.runner.max_num_reqs
+        padded_num_reqs = min(
+            MIN_NUM_SEQS
+            if num_reqs <= MIN_NUM_SEQS
+            else 1 << (num_reqs - 1).bit_length(),
+            self.runner.max_num_reqs,
         )
         zeros = self._zero_draft_lengths_cache.get(padded_num_reqs)
         if zeros is None:
@@ -504,6 +552,29 @@ class DFlashProposer:
             )
             self._zero_draft_lengths_cache[padded_num_reqs] = zeros
         return zeros
+
+    def _get_draft_kv_cache_layer_names(self) -> tuple[str | None, ...]:
+        """Cached draft KV-cache layer names in layer order."""
+        draft_model = self.draft_model
+        if hasattr(draft_model, "get_draft_kv_cache_layer_names"):
+            cache_key = (id(draft_model), 0, -1)
+            cached = self._draft_kv_layer_names_cache
+            if cached is not None and cached[0] == cache_key:
+                return cached[1]
+            names = tuple(draft_model.get_draft_kv_cache_layer_names())
+            self._draft_kv_layer_names_cache = (cache_key, names)
+            return names
+        assert draft_model is not None
+        layers = draft_model.model.layers
+        cache_key = (id(draft_model), id(layers), len(layers))
+        cached = self._draft_kv_layer_names_cache
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+        names = tuple(
+            getattr(layer.self_attn.attn, "layer_name", None) for layer in layers
+        )
+        self._draft_kv_layer_names_cache = (cache_key, names)
+        return names
 
     def _build_draft_layer_metadata(
         self,
@@ -518,14 +589,7 @@ class DFlashProposer:
         the draft's KV through it would corrupt the cache silently instead of
         failing.
         """
-        if hasattr(self.draft_model, "get_draft_kv_cache_layer_names"):
-            layer_names = self.draft_model.get_draft_kv_cache_layer_names()
-        else:
-            assert self.draft_model is not None
-            layer_names = [
-                getattr(layer.self_attn.attn, "layer_name", None)
-                for layer in self.draft_model.model.layers
-            ]
+        layer_names = self._get_draft_kv_cache_layer_names()
         draft_md_list = []
         for layer_name in layer_names:
             md = attn_metadata.get(layer_name) if layer_name else None
@@ -560,7 +624,8 @@ class DFlashProposer:
         positions = chunk.position_ids
         if positions.dim() > 1:
             positions = positions[0]
-        positions = positions[:num_tokens]
+        if positions.shape[0] != num_tokens:
+            positions = positions[:num_tokens]
         draft_md_tuple = self._build_draft_layer_metadata(chunk.attn_metadata)
 
         with set_vllm_model_wrapper_context(
@@ -624,9 +689,15 @@ class DFlashProposer:
             )
             # Slice seed tokens for this chunk's requests.
             chunk_seed = (
-                device_seed[chunk.start_index : chunk.start_index + chunk.num_reqs]
-                if device_seed is not None
-                else None
+                device_seed
+                if (
+                    device_seed is None
+                    or (
+                        chunk.start_index == 0
+                        and device_seed.shape[0] == chunk.num_reqs
+                    )
+                )
+                else device_seed[chunk.start_index : chunk.start_index + chunk.num_reqs]
             )
             input_ids, positions, seq_lens = self._prepare_dflash_inputs(
                 chunk, next_tokens_device=next_tokens_device, device_seed=chunk_seed
@@ -661,7 +732,9 @@ class DFlashProposer:
         # 3. Extract K tokens from logits
         if return_device:
             if len(draft_logits_per_chunk) == 1:
-                return draft_logits_per_chunk[0][: chunks[0].num_reqs]
+                logits0 = draft_logits_per_chunk[0]
+                reqs0 = chunks[0].num_reqs
+                return logits0 if logits0.shape[0] == reqs0 else logits0[:reqs0]
             sliced_chunks = [
                 logits
                 if logits.shape[0] == chunk.num_reqs
@@ -672,11 +745,10 @@ class DFlashProposer:
 
         # Single synchronization and transfer to the host (return_device=False)
         # We transfer the ENTIRE padded tensor to CPU to avoid
-        # dynamic-shape recompilations
+        # dynamic-shape recompilations, then slice on CPU before .tolist().
         draft_tokens_list = []
         for logits, chunk in zip(draft_logits_per_chunk, chunks):
-            logits_host = logits.cpu().tolist()
-            draft_tokens_list.extend(logits_host[: chunk.num_reqs])
+            draft_tokens_list.extend(logits.cpu()[: chunk.num_reqs].tolist())
 
         return draft_tokens_list
 
@@ -811,9 +883,28 @@ class DFlashProposer:
             out = self._tpu_precompute_and_update_kv_cache(
                 dummy_hidden,
                 dummy_positions,
-                tuple([dummy_attn_metadata] * len(self.draft_model.model.layers)),
+                (dummy_attn_metadata,) * len(self.draft_model.model.layers),
             )
             synchronize_tensors(out, wait=sync)
+
+    def _dummy_draft_forward_inputs(
+        self, num_tokens: int, block_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Cached `(input_ids, positions, seq_lens)` for one draft-forward bucket."""
+        key = (num_tokens, block_size)
+        entry = self._dummy_draft_forward_cache.get(key)
+        if entry is not None:
+            return entry
+        device = self.runner.device
+        actual_num_reqs = num_tokens // block_size
+        input_ids = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+        positions = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+        seq_lens = torch.full(
+            (actual_num_reqs,), block_size, dtype=torch.int32, device=device
+        )
+        entry = (input_ids, positions, seq_lens)
+        self._dummy_draft_forward_cache[key] = entry
+        return entry
 
     def _dummy_draft_forward(
         self,
@@ -832,9 +923,6 @@ class DFlashProposer:
                 f"its query block size {block_size}"
             )
 
-        input_ids = torch.zeros((num_tokens), dtype=torch.int32).to(runner.device)
-        positions = torch.zeros(num_tokens, dtype=torch.int32).to(runner.device)
-
         # Lay the dummies out exactly like the real draft forward
         # (_get_static_attn_tensors): request r owns rows
         # [r * block_size, (r + 1) * block_size) and tail rows are padding.
@@ -842,12 +930,12 @@ class DFlashProposer:
         # non-causal block straddle two requests, which the shared-window
         # attention (block > 1) can turn into NaN rows; under EP-DP lockstep
         # this forward also runs while serving. The guard above makes it >= 1.
-        actual_num_reqs = num_tokens // block_size
+        input_ids, positions, seq_lens = self._dummy_draft_forward_inputs(
+            num_tokens, block_size
+        )
+        actual_num_reqs = seq_lens.shape[0]
         query_start_loc, request_distribution = self._get_static_attn_tensors(
             actual_num_reqs
-        )
-        seq_lens = torch.full(
-            (actual_num_reqs,), block_size, dtype=torch.int32, device=runner.device
         )
 
         per_layer_attn_metadata = self._build_attn_metadata_for_draft(

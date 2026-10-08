@@ -1036,7 +1036,9 @@ class TestModelForward:
             query_start_loc=None,
             seq_lens=torch.tensor([2, 2]),
         )
-        mock_ctx = _FakeForwardCtx(attn_metadata={"layer_0": meta_entry})
+        mock_ctx = _FakeForwardCtx(
+            attn_metadata={"layer_0": meta_entry, "layer_1": meta_entry}
+        )
         with (
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",

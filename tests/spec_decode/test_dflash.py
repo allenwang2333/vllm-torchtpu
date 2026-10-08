@@ -811,3 +811,460 @@ def test_build_draft_attn_metadata_reuses_target_staged_block_tables():
         chunk, num_tokens_padded=10, seq_lens=torch.tensor([105, 105], device=device)
     )
     assert captured_ctxs[-1].staged_block_tables is None
+
+    # 6. Two draft groups with identical (target_block_size, tnb, is_mamba_group)
+    # geometry skip duplicate _active_block_table_columns checks (354->342 branch).
+    b1 = _FakeBuilder(1, 64)
+    b1.target_block_size = 16
+    b1.is_mamba_group = False
+    b2 = _FakeBuilder(2, 64)
+    b2.target_block_size = 16
+    b2.is_mamba_group = False
+    proposer._draft_attn_layer_names = {"draft_layer_1", "draft_layer_2"}
+    g1 = SimpleNamespace(layer_names=["draft_layer_1"], metadata_builders=[b1])
+    g2 = SimpleNamespace(layer_names=["draft_layer_2"], metadata_builders=[b2])
+    proposer.runner.attn_groups = [[g1, g2]]
+    staged_multi = {
+        1: torch.ones(128, dtype=torch.int32),
+        2: torch.ones(128, dtype=torch.int32),
+    }
+    chunk.attn_ctx.staged_block_tables = staged_multi
+    proposer._build_draft_attn_metadata(
+        chunk, num_tokens_padded=10, seq_lens=torch.tensor([105, 105], device=device)
+    )
+    assert captured_ctxs[-1].staged_block_tables is staged_multi
+
+
+def test_init_and_load_model_all_branches(monkeypatch):
+    # 1. draft_tp is None defaults to target_tp (lines 73-74)
+    p_none = _make_proposer(draft_tp=None, target_tp=4)
+    assert p_none.speculative_config.draft_tensor_parallel_size == 4
+    assert not p_none._draft_replicated
+    assert p_none._draft_tp_matches_target
+
+    # 2. Unsupported draft_tp raises ValueError (line 78)
+    with pytest.raises(ValueError, match="unsupported"):
+        _make_proposer(draft_tp=2, target_tp=4)
+
+    # 3. _load_draft_model with replicated=True and replicated=False (lines 232-246)
+    fake_loader = SimpleNamespace(
+        load_model=mock.MagicMock(return_value="loaded_draft")
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.spec_decode.dflash.get_model_loader", lambda _cfg: fake_loader
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.spec_decode.dflash.set_model_tag",
+        lambda _tag: mock.MagicMock(
+            __enter__=lambda s: None, __exit__=lambda s, *a: False
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.spec_decode.dflash.set_vllm_model_wrapper_context",
+        lambda **_kw: mock.MagicMock(
+            __enter__=lambda s: None, __exit__=lambda s, *a: False
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.spec_decode.dflash.set_current_vllm_config",
+        lambda _cfg: mock.MagicMock(
+            __enter__=lambda s: None, __exit__=lambda s, *a: False
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.spec_decode.dflash._force_draft_tp1",
+        lambda: mock.MagicMock(__enter__=lambda s: None, __exit__=lambda s, *a: False),
+    )
+    p_rep = _make_proposer(draft_tp=1, target_tp=4)
+    p_rep.vllm_config.load_config = "load_cfg"
+    p_rep._load_draft_model()
+    assert p_rep.draft_model == "loaded_draft"
+
+    p_sharded = _make_proposer(draft_tp=4, target_tp=4)
+    p_sharded.vllm_config.load_config = "load_cfg"
+    p_sharded._load_draft_model()
+    assert p_sharded.draft_model == "loaded_draft"
+
+    # 4. load_model target aux hidden states fallback and error (lines 163-168)
+    p_err = _make_proposer(draft_tp=1, target_tp=1)
+    with pytest.raises(
+        RuntimeError, match="does not support _set_aux_hidden_state_layers"
+    ):
+        p_err.load_model(SimpleNamespace())
+
+    # 5. load_model with target.model._set_aux_hidden_state_layers,
+    # draft.model.get_draft_attn_causal, and PallasAttentionBackendImpl layers (210-229)
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+
+    pallas_impl = PallasAttentionBackendImpl.__new__(PallasAttentionBackendImpl)
+    pallas_impl.initialize_kernel = mock.MagicMock()
+    layer_no_attn = SimpleNamespace(self_attn=None)
+    layer_other_impl = SimpleNamespace(
+        self_attn=SimpleNamespace(attn=SimpleNamespace(impl=SimpleNamespace()))
+    )
+    layer_pallas = SimpleNamespace(
+        self_attn=SimpleNamespace(attn=SimpleNamespace(impl=pallas_impl))
+    )
+
+    draft, target = _make_vocab_models()
+    del target.set_aux_hidden_state_layers
+    aux_called = []
+    target.model._set_aux_hidden_state_layers = lambda layers: aux_called.append(layers)
+    del draft.get_draft_attn_causal
+    draft.model.get_draft_attn_causal = lambda: [False, True, False]
+    draft.model.layers = [layer_no_attn, layer_other_impl, layer_pallas]
+
+    p_load = _make_proposer(draft_tp=1, target_tp=1)
+    p_load._load_draft_model = lambda: setattr(p_load, "draft_model", draft)
+    with mock.patch(
+        "vllm_torchtpu.spec_decode.dflash.get_layers_from_vllm_config", return_value={}
+    ):
+        p_load.load_model(target)
+    assert aux_called == [(2, 3)]
+    assert pallas_impl.layer_idx == 2
+    assert pallas_impl.use_causal_mask is False
+    pallas_impl.initialize_kernel.assert_called_once_with(layer_pallas.self_attn.attn)
+
+    # 6. load_model without get_draft_attn_causal raises RuntimeError (line 213)
+    del draft.model.get_draft_attn_causal
+    with (
+        mock.patch(
+            "vllm_torchtpu.spec_decode.dflash.get_layers_from_vllm_config",
+            return_value={},
+        ),
+        pytest.raises(RuntimeError, match="get_draft_attn_causal"),
+    ):
+        p_load.load_model(target)
+
+
+def test_prepare_inputs_and_propose_remaining_branches(device, monkeypatch):
+    proposer = _make_proposer(draft_tp=1)
+    K = 3
+    proposer.speculative_config.num_speculative_tokens = K
+    proposer._draft_attn_layer_names = {"dummy_layer"}
+    proposer.runner = SimpleNamespace(
+        device=device,
+        num_tokens_paddings=[8, 16, 32, 64, 128],
+        max_num_reqs=64,
+        input_batch=SimpleNamespace(num_reqs=2),
+        _attn_metadata_builder_ctx=None,
+        build_attention_metadata_for_layers=lambda names, n: {"dummy_layer": "md"},
+        mesh=None,
+        _dp_lockstep_enabled=lambda: False,
+        _dp_num_tokens_across_dp=lambda n: None,
+        _dp_step_num_chunks=0,
+    )
+
+    # 1. _zero_draft_lengths cache hit and num_reqs > MIN_NUM_SEQS (lines 542-555)
+    z1 = proposer._zero_draft_lengths(20)
+    z2 = proposer._zero_draft_lengths(20)
+    assert z1 is z2 and z1.shape == (32,)
+
+    # 2. _get_draft_kv_cache_layer_names with get_draft_kv_cache_layer_names method
+    # (cache miss + cache hit, lines 559-566) and layer_name fallback cache hit (572)
+    draft_with_hook = SimpleNamespace(
+        get_draft_kv_cache_layer_names=lambda: ["dummy_layer"]
+    )
+    proposer.draft_model = draft_with_hook
+    assert proposer._get_draft_kv_cache_layer_names() == ("dummy_layer",)
+    assert proposer._get_draft_kv_cache_layer_names() == ("dummy_layer",)
+
+    layer_named = SimpleNamespace(
+        self_attn=SimpleNamespace(attn=SimpleNamespace(layer_name="dummy_layer"))
+    )
+    proposer.draft_model = SimpleNamespace(model=SimpleNamespace(layers=[layer_named]))
+    assert proposer._get_draft_kv_cache_layer_names() == ("dummy_layer",)
+    assert proposer._get_draft_kv_cache_layer_names() == ("dummy_layer",)
+
+    # 3. _prepare_dflash_inputs with 2D position_ids, explicit draft_lengths,
+    # device_seed path (_tpu_build_dflash_inputs_seed lines 521-530, 1366-1379),
+    # and missing inputs RuntimeError (line 532)
+    chunk = _make_chunk(
+        num_reqs=2,
+        start_index=0,
+        device=device,
+        query_start_loc_np=np.array([0, 2, 4], dtype=np.int32),
+        position_ids=torch.tensor(
+            [[10, 11, 20, 21, 0, 0]], dtype=torch.int32, device=device
+        ),
+    )
+    chunk.draft_lengths = torch.tensor([1, 1], dtype=torch.int32, device=device)
+    next_tokens = torch.tensor([[101, -1], [201, -1]], dtype=torch.int32, device=device)
+    ids_nt, pos_nt, _ = proposer._prepare_dflash_inputs(
+        chunk, next_tokens_device=next_tokens
+    )
+    assert ids_nt.shape == (8,) and pos_nt.shape == (8,)
+
+    seed = torch.tensor([77, 88], dtype=torch.int32, device=device)
+    ids_sd, pos_sd, sl_sd = proposer._prepare_dflash_inputs(chunk, device_seed=seed)
+    assert ids_sd.tolist() == [77, 0, 0, 0, 88, 0, 0, 0]
+    assert pos_sd.tolist() == [12, 13, 14, 15, 22, 23, 24, 25]
+    assert sl_sd.tolist() == [16, 26]
+
+    with pytest.raises(RuntimeError, match="without next_tokens_device or device_seed"):
+        proposer._prepare_dflash_inputs(chunk)
+
+    # 4. _update_draft_kv_cache_from_target with aux_hidden_states=None (line 614),
+    # tuple aux_hidden_states, 2D position_ids (626), positions.shape[0] > num_tokens
+    proposer._tpu_precompute_and_update_kv_cache = mock.MagicMock()
+    chunk_none = _make_chunk(
+        num_reqs=1,
+        start_index=0,
+        device=device,
+        query_start_loc_np=np.array([0, 2], dtype=np.int32),
+        position_ids=torch.zeros((1, 4), dtype=torch.int32, device=device),
+        aux_hidden_states=None,
+    )
+    proposer._update_draft_kv_cache_from_target(chunk_none)
+    proposer._tpu_precompute_and_update_kv_cache.assert_not_called()
+
+    chunk_tuple = _make_chunk(
+        num_reqs=1,
+        start_index=0,
+        device=device,
+        query_start_loc_np=np.array([0, 2], dtype=np.int32),
+        position_ids=torch.zeros((1, 4), dtype=torch.int32, device=device),
+        aux_hidden_states=(torch.zeros((2, 8), device=device),),
+    )
+    proposer._update_draft_kv_cache_from_target(chunk_tuple)
+    proposer._tpu_precompute_and_update_kv_cache.assert_called_once()
+    assert proposer._tpu_precompute_and_update_kv_cache.call_args.args[1].shape == (2,)
+
+    # 5. propose error when draft_chunks is empty (line 665)
+    proposer.draft_chunks = []
+    with pytest.raises(RuntimeError, match="no draft chunks captured"):
+        proposer.propose([], [], None, None)
+
+    # 6. propose with extra_chunks > 0, device_seed slicing, and return_device=True
+    # across single-chunk (exact & padded) and multi-chunk (exact & padded)
+    proposer._dp_lockstep_sharded = lambda: True
+    proposer.runner._dp_step_num_chunks = 2
+    proposer._dp_dummy_kv_update = mock.MagicMock()
+    proposer._dp_dummy_forward = mock.MagicMock()
+    proposer._prepare_dflash_inputs = mock.MagicMock(
+        return_value=(
+            torch.zeros(8, dtype=torch.int32, device=device),
+            torch.zeros(8, dtype=torch.int32, device=device),
+            torch.zeros(2, dtype=torch.int32, device=device),
+        )
+    )
+    # Single chunk with exact shape [2, 3] and device_seed matching chunk
+    proposer.draft_chunks = [chunk]
+    proposer._dflash_forward_and_sample = mock.MagicMock(
+        return_value=(
+            torch.ones((2, 3), dtype=torch.int32, device=device),
+            torch.zeros((8, 8), device=device),
+        )
+    )
+    out_dev_exact = proposer.propose(
+        [], [], None, None, return_device=True, device_seed=seed
+    )
+    assert out_dev_exact.shape == (2, 3)
+    proposer._dp_dummy_kv_update.assert_called_once()
+    proposer._dp_dummy_forward.assert_called_once()
+
+    # Single chunk with padded shape [4, 3] -> slices [:2]
+    proposer._dflash_forward_and_sample = mock.MagicMock(
+        return_value=(
+            torch.ones((4, 3), dtype=torch.int32, device=device),
+            torch.zeros((8, 8), device=device),
+        )
+    )
+    out_dev_padded = proposer.propose(
+        [], [], None, None, return_device=True, device_seed=seed
+    )
+    assert out_dev_padded.shape == (2, 3)
+
+    # Multi-chunk with one exact [2, 3] and one padded [4, 3] and seed slice
+    chunk2 = _make_chunk(
+        num_reqs=2,
+        start_index=2,
+        device=device,
+        query_start_loc_np=np.array([0, 2, 4], dtype=np.int32),
+        position_ids=torch.zeros(4, dtype=torch.int32, device=device),
+    )
+    proposer.draft_chunks = [chunk, chunk2]
+    proposer._dflash_forward_and_sample = mock.MagicMock(
+        side_effect=[
+            (torch.ones((2, 3), dtype=torch.int32, device=device), None),
+            (torch.ones((4, 3), dtype=torch.int32, device=device), None),
+        ]
+    )
+    seed4 = torch.tensor([1, 2, 3, 4], dtype=torch.int32, device=device)
+    out_multi = proposer.propose(
+        [], [], None, None, return_device=True, device_seed=seed4
+    )
+    assert out_multi.shape == (4, 3)
+
+
+def test_precompile_dummies_and_dp_lockstep_helpers(device, monkeypatch):
+    proposer = _make_proposer(draft_tp=1, target_tp=4)
+    proposer.speculative_config.num_speculative_tokens = 3
+
+    # 1. precompile with draft_model is None returns early (line 761)
+    proposer.draft_model = None
+    proposer.precompile()
+
+    # 2. _dp_lockstep_sharded when draft_model is None (1008) vs MoE model (1006-1012)
+    proposer.runner = SimpleNamespace(
+        device=device,
+        mesh=None,
+        num_reqs_max_model_len=4,
+        num_reqs_most_model_len=2,
+        most_model_len=1024,
+        max_num_blocks_per_req=4,
+        num_blocks_per_most_len_req=2,
+        num_tokens_paddings=[4, 8],
+        _dp_lockstep_enabled=lambda: True,
+        _dp_target_bucket=8,
+        _dp_step_max_reqs=2,
+        _dp_num_tokens_across_dp=lambda n: None,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+    )
+    import contextlib
+
+    assert proposer._dp_lockstep_sharded() is False
+    # run_dp_dummy_draft returns early when num_chunks <= 0 or draft_model is None
+    proposer.run_dp_dummy_draft(0)
+    proposer.run_dp_dummy_draft(1)
+
+    layer = SimpleNamespace()
+    proposer.draft_model = SimpleNamespace(
+        model=SimpleNamespace(
+            embed_tokens=SimpleNamespace(
+                weight=torch.zeros((2, 2), dtype=torch.float32)
+            ),
+            layers=[layer],
+        )
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.interfaces.is_mixture_of_experts",
+        lambda _m: False,
+    )
+    # First call populates _draft_has_moe_cache=False; second call hits cache
+    assert proposer._dp_lockstep_sharded() is False
+    assert proposer._dp_lockstep_sharded() is False
+    # run_dp_dummy_draft returns early when not _dp_lockstep_sharded() (line 1021)
+    proposer.run_dp_dummy_draft(1)
+
+    # 3. _dummy_kv_update_inputs cache miss & hit + _dummy_precompute (819-888)
+    proposer.vllm_config.model_config.get_hidden_size = lambda: 8
+    proposer._tpu_precompute_and_update_kv_cache = mock.MagicMock(
+        return_value=torch.zeros(1)
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.spec_decode.dflash.synchronize_tensors",
+        lambda *_a, **_kw: None,
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.spec_decode.dflash.set_vllm_model_wrapper_context",
+        lambda **_kw: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.spec_decode.dflash.set_forward_context",
+        lambda *_a, **_kw: contextlib.nullcontext(),
+    )
+    proposer._build_attn_metadata_for_draft = mock.MagicMock(return_value={})
+    proposer._dflash_forward_and_sample = mock.MagicMock(
+        return_value=(torch.zeros(1), None)
+    )
+
+    # Precompile with most_model_len != None (lines 787-789, 806)
+    proposer.precompile()
+    # Second call hits _dummy_kv_input_cache (822) and _dummy_draft_forward_cache (897)
+    proposer.precompile()
+
+    # 4. _dummy_draft_forward raises ValueError when num_tokens < block_size (line 921)
+    with pytest.raises(ValueError, match="smaller than its query block size"):
+        proposer._dummy_draft_forward(num_tokens=2, use_max_model_len=True, sync=False)
+
+    # 5. _dp_dummy_kv_update and _dp_dummy_forward direct execution (lines 979-994)
+    proposer._dp_dummy_kv_update()
+    proposer._dp_dummy_forward()
+
+
+def test_tpu_precompute_and_forward_sample_remaining_branches(device):
+    proposer = _make_proposer(draft_tp=1)
+    fn_precompute = torch._dynamo.disable(
+        DFlashProposer._tpu_precompute_and_update_kv_cache
+    )
+    fn_sample = torch._dynamo.disable(DFlashProposer._dflash_forward_and_sample)
+
+    # 1. owns_context_kv class attr on draft_model + list hidden_states (1048, 1064)
+    class _OwnsKvDraft:
+        owns_context_kv = True
+
+        def __init__(self):
+            self.model = SimpleNamespace()
+            self.called_with = None
+
+        def precompute_and_store_context_kv(self, hidden, pos, md):
+            self.called_with = (hidden, pos, md)
+            return "owned_kv"
+
+    proposer.draft_model = _OwnsKvDraft()
+    h1 = torch.ones((2, 4), device=device)
+    h2 = torch.ones((2, 4), device=device)
+    pos = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    # Single-element list and two-element list in hidden_states
+    assert fn_precompute(proposer, [h1], pos, ()) == "owned_kv"
+    assert proposer.draft_model.called_with[0].shape == (2, 4)
+    assert fn_precompute(proposer, [h1, h2], pos, ()) == "owned_kv"
+    assert proposer.draft_model.called_with[0].shape == (2, 8)
+
+    # 2. combine_hidden_states, fc (returning tuple and tensor), hidden_norm, k_norm
+    # (lines 1073, 1075-1077, 1080, 1101-1105)
+    L, nkv, hd = 1, 2, 4
+    layer = SimpleNamespace(
+        self_attn=SimpleNamespace(
+            head_dim=hd,
+            num_kv_heads=nkv,
+            num_heads=nkv,
+            k_norm=SimpleNamespace(
+                weight=torch.ones(hd, device=device),
+                variance_epsilon=1e-6,
+            ),
+            rotary_emb=lambda p, q, k: (q, k),
+            attn=SimpleNamespace(
+                kv_cache=None,
+                impl=SimpleNamespace(forward=lambda **_kw: None),
+            ),
+        )
+    )
+    self_model = SimpleNamespace(
+        layers=[layer],
+        _fused_kv_weight=torch.ones((L * 2 * nkv * hd, 4), device=device),
+        _fused_kv_bias=None,
+        fc=lambda x: (x, "aux"),
+        hidden_norm=lambda x: x * 2.0,
+    )
+    # 2a. With combine_hidden_states on draft_model
+    proposer.draft_model = SimpleNamespace(
+        model=self_model,
+        combine_hidden_states=lambda x: x,
+    )
+    fn_precompute(proposer, h1, pos, (SimpleNamespace(),))
+
+    # 2b. Without combine_hidden_states -> uses self_model.fc (tuple then tensor)
+    proposer.draft_model = SimpleNamespace(model=self_model)
+    fn_precompute(proposer, h1, pos, (SimpleNamespace(),))
+    self_model.fc = lambda x: x
+    fn_precompute(proposer, h1, pos, (SimpleNamespace(),))
+
+    # 3. _dflash_forward_and_sample (lines 1157-1179)
+    proposer.draft_model = SimpleNamespace(
+        model=lambda input_ids, positions: torch.ones(
+            (input_ids.shape[0], 8), dtype=torch.float32, device=device
+        ),
+        compute_logits=lambda draft_hidden: torch.arange(
+            draft_hidden.shape[0] * 10, dtype=torch.float32, device=device
+        ).view(draft_hidden.shape[0], 10),
+    )
+    tokens, hidden_out = fn_sample(
+        proposer,
+        torch.zeros(8, dtype=torch.int32, device=device),
+        torch.zeros(8, dtype=torch.int32, device=device),
+        block_size=4,
+    )
+    assert tokens.shape == (2, 3)
+    assert hidden_out.shape == (8, 8)
