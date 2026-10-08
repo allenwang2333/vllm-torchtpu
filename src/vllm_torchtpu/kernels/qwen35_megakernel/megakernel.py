@@ -531,8 +531,8 @@ ABLATIONS = ("experts", "ar", "attn", "gdn", "dense", "kv")
 
 
 def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_routing=False,
-          skip=frozenset(), scopes=False):
-    """Returns the per-rank kernel call (pos, hidden, *weights, *states, [rbias]) ->
+          skip=frozenset(), scopes=False, row_mask=False):
+    """Returns the per-rank kernel call (pos, hidden, *weights, *states, [rbias], [moe_rows]) ->
     (hidden_out, conv, rec, knew, vnew), plus an info dict. Wrap in shard_map over a ("tp",) mesh
     of R devices (see make_step, which also scatters knew / vnew into the caches).
 
@@ -540,6 +540,9 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
     hidden [M, H] bf16: the new tokens' embeddings in rows 0..B-1 (rows >= B zero).
     rbias [L, M, E] f32 (forced_routing): routing selects the TOPK largest rbias entries per row
     instead of the TOPK largest router probabilities (benchmarks with synthetic weights).
+    moe_rows [B] int32 (row_mask): rows with moe_rows[b] == 0 add no routed experts to the
+    layer's hit list (rows whose outputs are discarded: padding, or MTP verify rows whose draft
+    is not used). Their outputs only carry the experts that the other rows hit.
     c.T > 1 (MTP verify): row b = s * T + t is token t of sequence s and pos[b] must be
     pos[s * T] + t (pos[s * T]: tokens in sequence s's cache). Token t attends to the cache and
     to new tokens 0..t; the GatedDeltaNet runs the T-step recurrence from the sequence's state
@@ -711,6 +714,7 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
         scratch["knew_o"] = pltpu.VMEM((MR, HD), FP8)
         scratch["vnew_o"] = pltpu.VMEM((MR, HD), FP8)
     ECOPY = not c.moe_tp and c.e_slots > ER
+    assert not (row_mask and ECOPY), "row_mask: identity expert placement only"
     EXTRA = c.EW - ER
     if ECOPY:
         nb_picks = rup(B * c.TOPK)
@@ -793,6 +797,10 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
         rb_hbm = None
         if forced_routing:
             rb_hbm = refs[k_]
+            k_ += 1
+        mr_ref = None
+        if row_mask:
+            mr_ref = refs[k_]
             k_ += 1
         O = dict(zip(O_NAMES, refs[k_:k_ + len(O_NAMES)]))
         out_ref = O["hidden"]
@@ -1865,10 +1873,16 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
                     # again without advancing n
                     e = scr["hits"][b, k]
                     hi, lo = lax.shift_right_logical(e, 7), lax.bitwise_and(e, 127)
-                    new = scr["seen"][hi, lo] != stamp
+                    seen = scr["seen"][hi, lo]
+                    new = seen != stamp
                     if not c.moe_tp:
                         new = jnp.logical_and(new, lax.div(e, ER) == me)
-                    scr["seen"][hi, lo] = stamp
+                    if row_mask:  # a masked row's pick neither counts nor stamps
+                        on = mr_ref[b] != 0
+                        new = jnp.logical_and(new, on)
+                        scr["seen"][hi, lo] = jnp.where(on, stamp, seen)
+                    else:
+                        scr["seen"][hi, lo] = stamp
                     scr["elist"][n] = e
                     return n + jnp.where(new, 1, 0).astype(I32)
 
@@ -2135,6 +2149,7 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
         + w_specs
         + s_specs
         + ([pl.BlockSpec(memory_space=pltpu.HBM)] if forced_routing else [])
+        + ([pl.BlockSpec(memory_space=pltpu.SMEM)] if row_mask else [])
     )
     n_w_leaves = sum(c.L if (not c.stack_e and k in ("e13", "e2")) else 1 for k in W_NAMES)
     out_shape = [jax.ShapeDtypeStruct(*oshapes[k]) for k in O_NAMES]
