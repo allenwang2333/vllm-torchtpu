@@ -1924,12 +1924,7 @@ def paged_index_scores_jax(
     # over 16.9K rows).
     eff_tokens = (
         tokens // 6
-        if (
-            tokens <= records.shape[0]
-            and tokens <= 96
-            and tokens >= 6
-            and tokens % 6 == 0
-        )
+        if (tokens // 6 <= records.shape[0] and 6 <= tokens <= 192 and tokens % 6 == 0)
         else tokens
     )
     budget = min(
@@ -1953,7 +1948,7 @@ def paged_index_scores_jax(
         and (page_records * dim // 2) % ROW_WORDS == 0
     )
 
-    if requests is not None and tokens > records.shape[0]:
+    if requests is not None and eff_tokens > records.shape[0]:
         # One request row at a time, each bounded by its own longest token:
         # all tokens score the row's shared key tile, and only that row's
         # tokens keep the result. Rows without tokens (padding) run no tiles,

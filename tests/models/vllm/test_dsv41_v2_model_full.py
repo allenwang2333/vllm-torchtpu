@@ -366,6 +366,17 @@ class TestUseSequenceParallel:
         ):
             assert _use_sequence_parallel(cfg) is True
 
+        # DP > 1 ignores upstream SP and TPU_DEEPSEEK_V41_SP (gated on DP1)
+        cfg_dp2 = _mock_vllm_config(dp_size=2, tp_size=4, ep_enabled=True)
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._upstream_use_sequence_parallel",
+                return_value=True,
+            ),
+            patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_SP", True),
+        ):
+            assert _use_sequence_parallel(cfg_dp2) is False
+
     @pytest.mark.parametrize(
         (
             "upstream_sp",
@@ -1868,10 +1879,27 @@ class TestDeepseekV41ForCausalLM:
         with pytest.raises(NotImplementedError, match="requires PP1 and DP1"):
             DeepseekV41ForCausalLM(vllm_config=cfg_pp)
 
-        # DP > 1
-        cfg_dp = _mock_vllm_config(dp_size=2)
+        # DP > 1 without EP
+        cfg_dp = _mock_vllm_config(dp_size=2, ep_enabled=False)
         with pytest.raises(NotImplementedError, match="requires PP1 and DP1"):
             DeepseekV41ForCausalLM(vllm_config=cfg_dp)
+
+        # DP > 1 with EP (EXT-1B: DP=2 x TP=4 + EP=8) succeeds
+        cfg_dp_ep = _mock_vllm_config(dp_size=2, tp_size=4, ep_enabled=True)
+        with (
+            patch(
+                "vllm.models.deepseek_v41.nvidia.model.DeepseekV41LLMForCausalLM.__init__",
+                return_value=None,
+            ),
+            patch(
+                "vllm.models.deepseek_v41.nvidia.model._make_deepseek_v4_weights_mapper",
+                return_value="dp_ep_mapper",
+            ),
+        ):
+            model_dp_ep = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
+            model_dp_ep.config = SimpleNamespace(expert_dtype="fp4")
+            model_dp_ep.__init__(vllm_config=cfg_dp_ep)
+            assert model_dp_ep.hf_to_vllm_mapper == "dp_ep_mapper"
 
         # Speculation not None
         cfg_spec = _mock_vllm_config(speculative_config=object())

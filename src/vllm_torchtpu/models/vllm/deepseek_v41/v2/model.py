@@ -115,11 +115,14 @@ _upstream_use_sequence_parallel = upstream._use_sequence_parallel
 
 def _use_sequence_parallel(vllm_config) -> bool:
     """Upstream gate, plus an opt-in TP+EP sequence-parallel path at DP1."""
-    if _upstream_use_sequence_parallel(vllm_config):
-        return True
     parallel = vllm_config.parallel_config
+    if getattr(parallel, "data_parallel_size", 1) == 1 and (
+        _upstream_use_sequence_parallel(vllm_config)
+    ):
+        return True
     return bool(
         envs.TPU_DEEPSEEK_V41_SP
+        and getattr(parallel, "data_parallel_size", 1) == 1
         and parallel.pipeline_parallel_size == 1
         and parallel.enable_expert_parallel
         and parallel.tensor_parallel_size > 1
@@ -927,11 +930,14 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
 
     def __init__(self, *, vllm_config, prefix=""):
         # Keep capability guards until their device paths are validated.
-        if (
-            vllm_config.parallel_config.pipeline_parallel_size != 1
-            or vllm_config.parallel_config.data_parallel_size != 1
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.pipeline_parallel_size != 1 or (
+            parallel_config.data_parallel_size != 1
+            and not getattr(parallel_config, "enable_expert_parallel", False)
         ):
-            raise NotImplementedError("V4.1 TPU currently requires PP1 and DP1")
+            raise NotImplementedError(
+                "V4.1 TPU currently requires PP1 and DP1 (or DP with EP)"
+            )
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         if spec_cfg is not None and getattr(spec_cfg, "method", None) not in (
             "dspark",

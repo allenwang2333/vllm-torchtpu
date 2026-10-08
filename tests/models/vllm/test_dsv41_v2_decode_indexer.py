@@ -363,7 +363,27 @@ class TestAttentionKernelsDecodeIndexer:
         )
         assert res_dec_7.shape == (7, 256)
 
-        # Branch 2: requests is not None and tokens > records.shape[0]
+        # Branch 1c: TP=4 DSpark K=5 decode where tokens = 24 > records.shape[0] = 16
+        # but eff_tokens = tokens // 6 = 4 <= records.shape[0] = 16 (uses fast
+        # _score_word_rows path instead of prefill row_step loop).
+        q_tp4 = jnp.zeros((24, heads, dim), dtype=jnp.bfloat16)
+        records_tp4 = jnp.full((16, 256), -1, dtype=jnp.int32)
+        weights_tp4 = jnp.zeros((24, heads), dtype=jnp.float32)
+        lengths_tp4 = jnp.full((24,), 10, dtype=jnp.int32)
+        requests_tp4 = jnp.repeat(jnp.arange(4, dtype=jnp.int32), 6)
+
+        res_tp4 = paged_index_scores_jax(
+            q_tp4,
+            pool,
+            records_tp4,
+            weights_tp4,
+            lengths_tp4,
+            requests=requests_tp4,
+            page_records=16,
+        )
+        assert res_tp4.shape == (24, 256)
+
+        # Branch 2: requests is not None and eff_tokens > records.shape[0]
         # (prefill row_step loop)
         q_pref = jnp.zeros((4, heads, dim), dtype=jnp.bfloat16)
         records_pref = jnp.full((2, 256), -1, dtype=jnp.int32)
