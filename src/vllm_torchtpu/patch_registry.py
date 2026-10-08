@@ -110,6 +110,7 @@ PATCHES = (
         _ACTIVE,
     ),
     Patch("vllm_torchtpu.model_loader_patches:patch_moe_expert_write_staging", _ACTIVE),
+    Patch("vllm_torchtpu.expert_placement:install_model_patches", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_vocab_parallel_embedding", _ACTIVE),
     Patch(
         "vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
@@ -117,6 +118,11 @@ PATCHES = (
         refresh="vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
     ),
     Patch("vllm_torchtpu.layers.adapter.vision_attention", _ACTIVE),
+    # Attention layers.
+    Patch(
+        "vllm_torchtpu.layers.adapter.fused_qk_norm_rope:install_qk_norm_rope_patch",
+        _ACTIVE,
+    ),
     # Platform runtime configuration.
     Patch(
         "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode", _ACTIVE
