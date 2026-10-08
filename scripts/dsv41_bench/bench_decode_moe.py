@@ -554,12 +554,14 @@ def _run_moe_sweep(
                     rank_buf,
                 )
 
-            out_v2_sp = _v2_w4a8_sp()
             out_dense_sp = _dense_exp_sp()
-            common.synchronize((out_v2_sp, out_dense_sp))
+            common.synchronize(out_dense_sp)
             row["gmm_sc1_onehot_sp_ms"] = _bench_ms(ctx, _gmm_sc1_sp)
             row["dense_expert_sp_ms"] = _bench_ms(ctx, _dense_exp_sp)
-            row["fused_ep_v2_w4a8_sp_ms"] = _bench_ms(ctx, _v2_w4a8_sp)
+            if t_local <= 8 or t_local % 8 == 0:
+                out_v2_sp = _v2_w4a8_sp()
+                common.synchronize(out_v2_sp)
+                row["fused_ep_v2_w4a8_sp_ms"] = _bench_ms(ctx, _v2_w4a8_sp)
 
         moe_results[f"T={t_full}"] = row
     return moe_results
