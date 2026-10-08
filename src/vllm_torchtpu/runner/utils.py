@@ -13,7 +13,7 @@ from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
-from vllm_torchtpu import profiler_trace
+from vllm_torchtpu import envs, profiler_trace
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -510,6 +510,17 @@ def relayout_hash_tables(model: torch.nn.Module):
     if num_changed:
         _install_entry_layout_pin()
     logger.info("Row-major relayouted %d hash tables", num_changed)
+
+
+def entry_layout_pins_supported() -> bool:
+    """Whether load-time row-major relayouts can rely on entry-layout pins.
+
+    TorchTPU compiles an executable with a pinned_host parameter (Engram host
+    DMA, ``TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA``) with default parameter layouts
+    whatever ``argument_layouts`` says, so a relaid-out ``{1,0}`` buffer then
+    fails at launch with RuntimeProgramInputMismatch.
+    """
+    return not envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA
 
 
 def _install_entry_layout_pin() -> None:

@@ -118,17 +118,23 @@ def select_rows(tiles: jax.Array, slot: jax.Array, row_bytes: int) -> jax.Array:
     return jnp.take_along_axis(sub_rows, slot[:, None, None], axis=1)[:, 0]
 
 
-def gather_rows_jax(rows: jax.Array, *chunks: jax.Array, row_bytes: int) -> jax.Array:
+def gather_rows_jax(
+    rows: jax.Array, *chunks: jax.Array, row_bytes: int, interpret: bool = False
+) -> jax.Array:
     """``int32[n]`` row ids -> ``int32[n, row_bytes // 4]`` from host chunks.
 
     ``chunks`` are consecutive ``pack_rows`` slabs, all but the last holding
     the same number of majors. Ids must be in range: the caller clamps them.
+    ``interpret`` runs the Pallas interpreter (CPU tests).
     """
     per_tile = rows_per_tile(row_bytes)
+    per_chunk = chunks[0].shape[0]
+    assert all(c.shape[0] == per_chunk for c in chunks[:-1]), [c.shape for c in chunks]
+    assert chunks[-1].shape[0] <= per_chunk, [c.shape for c in chunks]
     n = rows.shape[0]
     rows = rows.astype(jnp.int32)
     gathered = pl.pallas_call(
-        functools.partial(_gather_kernel, chunks[0].shape[0]),
+        functools.partial(_gather_kernel, per_chunk),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             grid=(1,),
@@ -138,5 +144,6 @@ def gather_rows_jax(rows: jax.Array, *chunks: jax.Array, row_bytes: int) -> jax.
         ),
         out_shape=pltpu.HBM((n, SUBLANES, LANES), jnp.int32),
         name="host_row_gather",
+        interpret=interpret,
     )(rows // per_tile, *chunks)
     return select_rows(gathered, rows % per_tile, row_bytes)

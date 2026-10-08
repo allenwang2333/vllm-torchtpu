@@ -2,11 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU tests for the pinned_host Engram row gather (``ENGRAM_HOST_DMA``).
 
-The Pallas host DMA itself needs a TPU; here the kernel's tile fetch is
-emulated in NumPy so the layout (``pack_rows``), the in-tile selection
-(``select_rows``) and the embedding's device lookup are checked bitwise.
+The kernel runs in the Pallas interpreter (``interpret=True`` supports the
+``pl.HOST`` operands on CPU); the layout (``pack_rows``), the in-tile
+selection (``select_rows``), the TorchTPU glue and the embedding's device
+lookup are checked bitwise.
 """
 
+import inspect
+from types import SimpleNamespace
+
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -15,6 +20,8 @@ import torch
 from vllm_torchtpu.kernels.deepseek_v41 import host_row_gather as hrg
 from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common_engram
 from vllm_torchtpu.models.vllm.deepseek_v41.common import host_row_table
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as v2_model
+from vllm_torchtpu.runner import utils as runner_utils
 
 
 @pytest.fixture(autouse=True)
@@ -160,3 +167,206 @@ def test_move_rows_to_pinned_host_frees_cpu_rows(monkeypatch):
     assert torch.equal(built[0][0].view(torch.uint8), weight.view(torch.uint8))
     assert emb.weight.shape == (0, 32)
     assert torch.equal(emb.weight_scale_inv.data, scales)
+
+
+# --- Kernel through the Pallas interpreter -----------------------------------
+
+
+@pytest.mark.parametrize("per_chunk", [6, 2, 4])
+def test_gather_rows_jax_interpret(per_chunk):
+    """Single, equal and partial-tail multi-chunk kernels match NumPy bitwise."""
+    rng = np.random.default_rng(3)
+    rows = rng.integers(0, 256, (700, 256), dtype=np.uint8)
+    packed = hrg.pack_rows(rows)  # 6 majors of 128 rows
+    chunks = [jnp.asarray(packed[i : i + per_chunk]) for i in range(0, 6, per_chunk)]
+    ids = np.array([0, 5, 127, 128, 255, 256, 383, 699, 3], dtype=np.int32)
+    got = hrg.gather_rows_jax(jnp.asarray(ids), *chunks, row_bytes=256, interpret=True)
+    np.testing.assert_array_equal(np.asarray(got), rows[ids].view(np.int32))
+
+
+# --- TorchTPU glue -------------------------------------------------------------
+
+
+@torch.library.custom_op(
+    f"{host_row_table.HOST_OP_NAMESPACE}::test_gather", mutates_args=()
+)
+def _test_gather(row_ids: torch.Tensor, chunk: torch.Tensor) -> torch.Tensor:
+    return row_ids.clone()
+
+
+def test_install_patches_placeholder_and_mark(monkeypatch):
+    from torch_tpu._internal.compile import _backend as tpu_backend
+    from torch_tpu._internal.compile import compiler as tpu_compiler
+    from torch_tpu._internal.pallas import pallas as tpu_pallas
+
+    pinned = torch.zeros(2, 8, 1024, dtype=torch.int32)
+    plain = torch.zeros(4, dtype=torch.int32)
+
+    def base_placeholder(tensor, mesh=None, partition_spec=None):
+        if not isinstance(tensor, torch.Tensor):
+            return tensor
+        return jax.ShapeDtypeStruct(tuple(tensor.shape), jnp.int32)
+
+    base_marks = []
+    monkeypatch.setattr(tpu_pallas, "jax_placeholder", base_placeholder)
+    monkeypatch.setattr(tpu_compiler, "is_pinned_host_tensor", lambda t: t is pinned)
+    monkeypatch.setattr(
+        tpu_backend,
+        "_mark_pinned_host_inputs",
+        lambda gm, inputs: base_marks.append(len(inputs)),
+    )
+    host_row_table._install.__wrapped__()
+
+    placeholder = tpu_pallas.jax_placeholder
+    assert placeholder(pinned).sharding.memory_kind == "pinned_host"
+    assert placeholder(plain).sharding is None
+    assert placeholder(pinned, mesh=object()).sharding is None  # mesh: untouched
+    assert placeholder(3) == 3
+
+    def fn(row_ids, chunk, other):
+        return torch.ops.dsv41_host_rows.test_gather(row_ids, chunk) + other
+
+    graph = torch.fx.symbolic_trace(fn)
+    inputs = [torch.zeros(4, dtype=torch.int32) for _ in range(3)]
+    tpu_backend._mark_pinned_host_inputs(graph, inputs)
+    assert base_marks == [3]
+    assert [getattr(t, "_is_pinned_host", False) for t in inputs] == [
+        False,
+        True,
+        False,
+    ]
+
+
+def test_gather_op_signature_and_fake(monkeypatch):
+    from torch_tpu._internal.pallas import pallas as tpu_pallas
+
+    made = {}
+
+    class FakeOp:
+        def register_fake(self, fn):
+            made["fake"] = fn
+
+    def jax_op(name, fn):
+        made["name"], made["fn"] = name, fn
+        return FakeOp()
+
+    calls = []
+    monkeypatch.setattr(tpu_pallas, "jax_op", jax_op)
+    monkeypatch.setattr(
+        hrg,
+        "gather_rows_jax",
+        lambda rows, *chunks, row_bytes: calls.append((rows, chunks, row_bytes)),
+    )
+    op = host_row_table._gather_op.__wrapped__(2, 256)
+    assert isinstance(op, FakeOp)
+    assert made["name"] == "dsv41_host_rows::gather_c2_b256"
+    params = inspect.signature(made["fn"]).parameters.values()
+    assert [p.annotation for p in params] == [jax.Array] * 3
+    made["fn"]("ids", "c0", "c1")
+    assert calls == [("ids", ("c0", "c1"), 256)]
+    out = made["fake"](torch.zeros(5, dtype=torch.int32), torch.zeros(1, 8, 1024))
+    assert out.shape == (5, 64) and out.dtype == torch.int32
+
+
+def test_host_row_table_chunks_and_gathers(monkeypatch):
+    """Chunked pack/offload and gather end to end, kernel interpreted."""
+    monkeypatch.setattr(host_row_table, "_install", lambda: None)
+    monkeypatch.setattr(
+        torch.ops, "ao", SimpleNamespace(offload=lambda t: t.clone()), raising=False
+    )
+
+    def gather_op(num_chunks, row_bytes):
+        def op(row_ids, *chunks):
+            assert len(chunks) == num_chunks
+            out = hrg.gather_rows_jax(
+                jnp.asarray(row_ids.numpy()),
+                *(jnp.asarray(c.numpy()) for c in chunks),
+                row_bytes=row_bytes,
+                interpret=True,
+            )
+            return torch.from_numpy(np.asarray(out))
+
+        return op
+
+    monkeypatch.setattr(host_row_table, "_gather_op", gather_op)
+    rng = np.random.default_rng(5)
+    rows = rng.integers(0, 256, (700, 256), dtype=np.uint8)
+    # 700 rows = 6 majors of 128; 4 majors per chunk: the last chunk partial.
+    table = host_row_table.HostRowTable(
+        torch.from_numpy(rows).view(torch.float8_e4m3fn),
+        torch.device("cpu"),
+        chunk_bytes=4 * hrg.SUBLANES * hrg.MAJOR_LANES * 4,
+    )
+    assert [tuple(c.shape) for c in table.chunks] == [(4, 8, 1024), (2, 8, 1024)]
+    ids = torch.tensor([699, 0, 511, 512, 640, 17], dtype=torch.int64)
+    got = table.gather(ids)
+    assert got.dtype == torch.uint8
+    np.testing.assert_array_equal(got.numpy(), rows[ids.numpy()])
+
+
+# --- Model and runner hooks ----------------------------------------------------
+
+
+def _layer(cpu_offload=True, host_dma=True, engram=True):
+    if not engram:
+        return SimpleNamespace(engram=None)
+    moved = []
+
+    def move(device):
+        moved.append(device)
+        embed._host_rows = SimpleNamespace(chunks=[0, 1])
+
+    embed = SimpleNamespace(
+        cpu_offload=cpu_offload,
+        host_dma=host_dma,
+        _host_rows=None,
+        move_rows_to_pinned_host=move,
+        moved=moved,
+    )
+    return SimpleNamespace(
+        engram=SimpleNamespace(embed_tokens=embed, staged_rows=torch.empty(1))
+    )
+
+
+def _model(layers):
+    model = object.__new__(v2_model.DeepseekV41Model)
+    model.__dict__.update(layers=layers, start_layer=0, end_layer=len(layers))
+    return model
+
+
+def test_has_cpu_offloaded_engram_excludes_host_dma():
+    assert not _model([_layer(engram=False), _layer()])._has_cpu_offloaded_engram()
+    assert _model([_layer(host_dma=False)])._has_cpu_offloaded_engram()
+    assert not _model([_layer(cpu_offload=False)])._has_cpu_offloaded_engram()
+
+
+def test_move_engram_rows_to_pinned_host_runs_once():
+    layers = [_layer(engram=False), _layer(), _layer()]
+    model = _model(layers)
+    model._move_engram_rows_to_pinned_host()
+    model._move_engram_rows_to_pinned_host()
+    for layer in layers[1:]:
+        assert layer.engram.embed_tokens.moved == [torch.device("cpu")]
+    assert model._engram_rows_pinned
+
+
+@pytest.mark.parametrize("host_dma", ["0", "1"])
+def test_causal_lm_converts_after_load_and_before_forward(monkeypatch, host_dma):
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA", host_dma)
+    upstream_lm = v2_model.upstream.DeepseekV41LLMForCausalLM
+    monkeypatch.setattr(upstream_lm, "process_weights_after_loading", lambda self: None)
+    monkeypatch.setattr(upstream_lm, "forward", lambda self, *a, **k: "out")
+    moves = []
+    lm = object.__new__(v2_model.DeepseekV41ForCausalLM)
+    lm.__dict__["model"] = SimpleNamespace(
+        engram_hash=None, _move_engram_rows_to_pinned_host=lambda: moves.append(1)
+    )
+    lm.process_weights_after_loading()
+    assert lm.forward() == "out"
+    assert len(moves) == (2 if host_dma == "1" else 0)
+
+
+@pytest.mark.parametrize("host_dma,expected", [("0", True), ("1", False)])
+def test_entry_layout_pins_supported(monkeypatch, host_dma, expected):
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA", host_dma)
+    assert runner_utils.entry_layout_pins_supported() is expected

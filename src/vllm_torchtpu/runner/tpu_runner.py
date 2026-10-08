@@ -4819,10 +4819,9 @@ class TPUModelRunner(GPUModelRunner):
                 self._pp_topk_buffer.fill_(-1)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
-        # Row-major relayouts rely on entry-layout pins, which TorchTPU drops
-        # for executables with a pinned_host parameter (Engram host DMA): a
-        # {1,0} buffer then fails at launch with RuntimeProgramInputMismatch.
-        relayout = not envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA
+        # Row-major relayouts rely on entry-layout pins, which executables
+        # with a pinned_host parameter (Engram host DMA) ignore.
+        relayout = runner_utils.entry_layout_pins_supported()
         if not relayout:
             logger.info("Engram host DMA: keeping default parameter layouts")
         if envs.TPU_ROPE_CACHE_ROW_MAJOR and relayout:
