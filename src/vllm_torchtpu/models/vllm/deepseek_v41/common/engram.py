@@ -278,7 +278,15 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         loader(stager.host_param(param), loaded_weight)
         stager.flush(param)
 
-    def __init__(self, *args, cpu_offload: bool | None = None, **kwargs):
+    def __init__(
+        self,
+        num_embeddings: int,
+        dim: int,
+        head_sizes: tuple[int, ...],
+        *args,
+        cpu_offload: bool | None = None,
+        **kwargs,
+    ):
         self.cpu_offload = (
             bool(envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD)
             if cpu_offload is None
@@ -289,13 +297,14 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         # memory, after which `lookup` runs on device like an HBM table.
         self.host_dma = self.cpu_offload and bool(envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA)
         self._host_rows: HostRowTable | None = None
+        self._head_sizes = tuple(head_sizes)
         # Upstream asks for the SM count solely to size its Triton lookup grid.
         # The TPU lookup below does not use that launch property.
         with device_hooks(
             torch.cuda,
             get_device_properties=lambda _: SimpleNamespace(multi_processor_count=0),
         ):
-            super().__init__(*args, **kwargs)
+            super().__init__(num_embeddings, dim, head_sizes, *args, **kwargs)
         upstream.set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
         if self.weight_scale_inv is not None:
             upstream.set_weight_attrs(
@@ -320,16 +329,26 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             ),
         )
 
+    def max_shard_rows(self) -> int:
+        """Rows of the largest head shard on any rank (upstream's split)."""
+        num_shards, _ = self._get_shard_info()
+        per = self.part_n_hash_cols
+        sizes = self._head_sizes
+        return max(sum(sizes[r * per : (r + 1) * per]) for r in range(num_shards))
+
     def move_rows_to_pinned_host(self, device: torch.device) -> None:
         """Loaded Host-DRAM rows -> TPU pinned_host, scales -> HBM (host_dma).
 
         Runs once, outside compilation, after weights are loaded. Frees the
-        CPU tables.
+        CPU tables. Chunks are sized for the largest shard so that every
+        rank compiles the same program.
         """
         if not self.host_dma or self._host_rows is not None:
             return
         weight, scales = self._storage()
-        self._host_rows = HostRowTable(weight, device)
+        self._host_rows = HostRowTable(
+            weight, device, capacity_rows=self.max_shard_rows()
+        )
         # `.data =` cannot move a CPU parameter to the TPU; replace it.
         self.weight_scale_inv = torch.nn.Parameter(
             scales.to(device), requires_grad=False

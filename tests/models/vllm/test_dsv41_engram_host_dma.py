@@ -156,8 +156,8 @@ def test_move_rows_to_pinned_host_frees_cpu_rows(monkeypatch):
     scales = emb.weight_scale_inv.data.clone()
     built = []
 
-    def fake_table(rows, device):
-        built.append((rows.clone(), device))
+    def fake_table(rows, device, capacity_rows):
+        built.append((rows.clone(), device, capacity_rows))
         return _NumpyRows(rows)
 
     monkeypatch.setattr(common_engram, "HostRowTable", fake_table)
@@ -165,8 +165,23 @@ def test_move_rows_to_pinned_host_frees_cpu_rows(monkeypatch):
     emb.move_rows_to_pinned_host(torch.device("cpu"))  # idempotent
     assert len(built) == 1
     assert torch.equal(built[0][0].view(torch.uint8), weight.view(torch.uint8))
+    assert built[0][2] == 16
     assert emb.weight.shape == (0, 32)
     assert torch.equal(emb.weight_scale_inv.data, scales)
+
+
+@pytest.mark.parametrize(
+    "tp_size,expected", [(1, 552), (2, 331), (4, 199), (5, 144), (10, 73)]
+)
+def test_max_shard_rows_is_rank_independent(monkeypatch, tp_size, expected):
+    """Every rank sizes its pinned table for the largest shard."""
+    head_sizes = (37, 41, 43, 47, 53, 59, 61, 67, 71, 73)
+    sizes = set()
+    for rank in range(tp_size):
+        emb = _embedding(monkeypatch, tp_size, rank, head_sizes, dim=32)
+        assert emb.part_num_embeddings <= emb.max_shard_rows()
+        sizes.add(emb.max_shard_rows())
+    assert sizes == {expected}
 
 
 # --- Kernel through the Pallas interpreter -----------------------------------
@@ -293,17 +308,27 @@ def test_host_row_table_chunks_and_gathers(monkeypatch):
     monkeypatch.setattr(host_row_table, "_gather_op", gather_op)
     rng = np.random.default_rng(5)
     rows = rng.integers(0, 256, (700, 256), dtype=np.uint8)
-    # 700 rows = 6 majors of 128; 4 majors per chunk: the last chunk partial.
+    chunk_bytes = 4 * hrg.SUBLANES * hrg.MAJOR_LANES * 4
+    # 700 rows = 6 majors of 128; at most 4 majors per chunk: 2 x 3 majors.
     table = host_row_table.HostRowTable(
         torch.from_numpy(rows).view(torch.float8_e4m3fn),
         torch.device("cpu"),
-        chunk_bytes=4 * hrg.SUBLANES * hrg.MAJOR_LANES * 4,
+        chunk_bytes=chunk_bytes,
     )
-    assert [tuple(c.shape) for c in table.chunks] == [(4, 8, 1024), (2, 8, 1024)]
+    assert [tuple(c.shape) for c in table.chunks] == [(3, 8, 1024)] * 2
     ids = torch.tensor([699, 0, 511, 512, 640, 17], dtype=torch.int64)
     got = table.gather(ids)
     assert got.dtype == torch.uint8
     np.testing.assert_array_equal(got.numpy(), rows[ids.numpy()])
+    # A smaller shard sized for a 1100-row capacity: 9 majors -> 3 x 3, with
+    # the chunk past its rows all zero.
+    small = host_row_table.HostRowTable(
+        torch.from_numpy(rows[:300]), torch.device("cpu"), chunk_bytes, 1100
+    )
+    assert [tuple(c.shape) for c in small.chunks] == [(3, 8, 1024)] * 3
+    assert not small.chunks[2].any()
+    ids = torch.tensor([299, 0, 128, 255], dtype=torch.int64)
+    np.testing.assert_array_equal(small.gather(ids).numpy(), rows[ids.numpy()])
 
 
 # --- Model and runner hooks ----------------------------------------------------

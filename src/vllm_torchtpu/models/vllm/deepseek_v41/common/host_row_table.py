@@ -131,8 +131,15 @@ class HostRowTable:
         rows: torch.Tensor,
         device: torch.device,
         chunk_bytes: int = CHUNK_BYTES,
+        capacity_rows: int = 0,
     ) -> None:
         """Pack and offload the CPU ``rows`` (any 1-byte dtype) chunk by chunk.
+
+        Chunk count and shape depend only on ``max(num_rows, capacity_rows)``
+        and ``row_bytes``, and every chunk has the same shape. Pass the
+        largest row count any TP rank holds as ``capacity_rows``: chunk
+        shapes are compiled into the graph, and ranks whose programs differ
+        hang the engine (40L Engram, TD3.9a). Rows past ``num_rows`` are zero.
 
         The caller frees ``rows`` afterwards; peak extra host memory is one
         packed chunk.
@@ -141,17 +148,15 @@ class HostRowTable:
         assert rows.element_size() == 1, rows.dtype
         _install()
         self.num_rows, self.row_bytes = rows.shape
-        majors = chunk_majors(self.row_bytes, chunk_bytes)
-        rows_per_chunk = (
-            majors * hrg.TILES_PER_MAJOR * hrg.rows_per_tile(self.row_bytes)
-        )
+        per_major = hrg.TILES_PER_MAJOR * hrg.rows_per_tile(self.row_bytes)
+        total_majors = max(1, -(-max(self.num_rows, capacity_rows) // per_major))
+        num_chunks = -(-total_majors // chunk_majors(self.row_bytes, chunk_bytes))
+        majors = -(-total_majors // num_chunks)
+        rows_per_chunk = majors * per_major
         host = rows.view(torch.uint8).numpy()
         self.chunks: list[torch.Tensor] = []
-        for start in range(0, self.num_rows, rows_per_chunk):
-            part = host[start : start + rows_per_chunk]
-            packed = hrg.pack_rows(
-                part, majors if len(part) == rows_per_chunk else None
-            )
+        for start in range(0, num_chunks * rows_per_chunk, rows_per_chunk):
+            packed = hrg.pack_rows(host[start : start + rows_per_chunk], majors)
             staged = torch.from_numpy(packed).to(device)
             self.chunks.append(torch.ops.ao.offload(staged))
             del staged, packed
