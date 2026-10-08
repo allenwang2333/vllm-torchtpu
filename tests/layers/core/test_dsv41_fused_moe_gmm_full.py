@@ -134,10 +134,10 @@ def test_moe_gmm_tiling(monkeypatch):
         fused_moe_gmm, "calculate_tiling", lambda *args, **kwargs: base_tiles
     )
     # 1. Matching decode dims:
-    # size_group > 1 and 32 <= size_m <= size_group * 80 and 32 % sublane == 0
-    for size_m in (576, 2304, 3456):
+    # size_group > 1 and 32 <= size_m <= size_group * 112 and 32 % sublane == 0
+    for size_group, size_m in ((48, 576), (48, 2304), (48, 3456), (16, 1728)):
         match_dims = types.SimpleNamespace(
-            size_group=48, size_m=size_m, size_lhs_sublane=8
+            size_group=size_group, size_m=size_m, size_lhs_sublane=8
         )
         assert fused_moe_gmm._moe_gmm_tiling(
             match_dims, None, None, 64 << 20, "silu"
@@ -149,8 +149,8 @@ def test_moe_gmm_tiling(monkeypatch):
         types.SimpleNamespace(size_group=1, size_m=576, size_lhs_sublane=8),
         # size_m < 32
         types.SimpleNamespace(size_group=48, size_m=16, size_lhs_sublane=8),
-        # size_m > size_group * 80
-        types.SimpleNamespace(size_group=48, size_m=48 * 80 + 1, size_lhs_sublane=8),
+        # size_m > size_group * 112
+        types.SimpleNamespace(size_group=48, size_m=48 * 112 + 1, size_lhs_sublane=8),
         # 32 % sublane != 0
         types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=12),
     ):
@@ -244,14 +244,22 @@ def test_counting_sort_positions(monkeypatch):
 
 
 def test_pairwise_sort_positions():
-    """Verify _pairwise_sort_positions implementation (Cut a)."""
+    """Verify _pairwise_sort_positions implementation (Cut a + TD5.4 packed weights)."""
     sort_keys = jnp.array([2, 0, 1, 0], dtype=jnp.int32)
     tokens = jnp.array([10, 20, 30, 40], dtype=jnp.int32)
-    pos, sorted_tokens = fused_moe_gmm._pairwise_sort_positions(sort_keys, tokens)
+    weights = jnp.array([0.125, 0.25, 0.5, 0.75], dtype=jnp.bfloat16)
+    pos, sorted_tokens, sorted_weights = fused_moe_gmm._pairwise_sort_positions(
+        sort_keys, tokens, weights
+    )
     assert pos.shape == (4,)
     assert sorted_tokens.shape == (4,)
+    assert sorted_weights.shape == (4,)
     np.testing.assert_array_equal(np.asarray(pos), np.array([3, 0, 2, 1]))
     np.testing.assert_array_equal(np.asarray(sorted_tokens), np.array([20, 40, 30, 10]))
+    np.testing.assert_array_equal(
+        np.asarray(sorted_weights),
+        np.asarray(jnp.array([0.25, 0.75, 0.5, 0.125], dtype=jnp.bfloat16)),
+    )
 
 
 def test_prepare_routed_gmm_inputs():
@@ -754,3 +762,21 @@ def test_ext2_2d_combine_mathematical_invariants():
         for inv_pos in invalid_positions:
             inv_sorted = int(argsort_revert[inv_pos])
             assert float(combine_2d[:, inv_sorted].sum()) == 0.0
+
+    # Invariant E: Packed pairwise sort returns topk_weights_sorted bitwise
+    # identical to scattering gated_weights by argsort_revert
+    *_, packed_weights_sorted = fused_moe_gmm._prepare_routed_gmm_inputs(
+        x,
+        topk_ids,
+        topk_weights.astype(jnp.bfloat16),
+        local_num_experts=local_experts,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=128,
+    )
+    assert packed_weights_sorted is not None
+    np.testing.assert_array_equal(
+        np.asarray(jax.lax.bitcast_convert_type(packed_weights_sorted, jnp.uint16)),
+        np.asarray(jax.lax.bitcast_convert_type(topk_weights_sorted, jnp.uint16)),
+    )
