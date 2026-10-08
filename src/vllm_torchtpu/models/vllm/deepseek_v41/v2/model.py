@@ -221,6 +221,17 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 return True
         return False
 
+    def _has_host_dma_engram(self) -> bool:
+        """Whether an Engram table uses TPU ``pinned_host`` DMA on device."""
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            engram = getattr(layer, "engram", None)
+            if engram is not None and (
+                getattr(engram.embed_tokens, "host_dma", False) is True
+                or getattr(engram.embed_tokens, "_host_rows", None) is not None
+            ):
+                return True
+        return False
+
     def _move_engram_rows_to_pinned_host(self) -> None:
         """One-time ``host_dma`` conversion once weights are loaded."""
         if getattr(self, "_engram_rows_pinned", False):
@@ -348,8 +359,15 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     dp_shared_memory=self.engram_dp_shared_memory,
                     gather_fn=upstream.gather_engram_hashes,
                 )
-                if self._has_cpu_offloaded_engram():
+                cpu_offload = self._has_cpu_offloaded_engram()
+                host_dma = not cpu_offload and self._has_host_dma_engram()
+                if cpu_offload:
                     gathered_hashes = gathered_hashes.to("cpu")
+                elif host_dma and gathered_hashes.device.type == "tpu":
+                    # Flush engram_hash (which contains HBM token_map/slot_cache
+                    # gathers offloaded to SparseCore) into its own executable
+                    # before launching any pinned_host DMA custom call.
+                    synchronize_tensors((gathered_hashes,), wait=False)
                 end_layer = (
                     getattr(self, "_ced_boundary", self.end_layer)
                     if stage == "encoder"
@@ -361,6 +379,10 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                         engram.prepare_embeddings(
                             gathered_hashes[:, engram.layer_hash_index]
                         )
+                        if host_dma:
+                            staged = getattr(engram, "_active_rows", None)
+                            if staged is not None and staged.device.type == "tpu":
+                                synchronize_tensors((staged,), wait=False)
         return engram_hashes, engram_mask
 
     def forward(
@@ -371,7 +393,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         inputs_embeds=None,
         lookback_token_ids=None,
     ):
-        offload_engram = self._has_cpu_offloaded_engram()
+        offload_engram = self._has_cpu_offloaded_engram() or self._has_host_dma_engram()
         if offload_engram:
             input_ids_prep = (
                 input_ids.to(torch.int64)
@@ -573,7 +595,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             input_ids = input_ids.to(torch.int64)
 
         skip_lookup = getattr(self, "_engram_prepared_outside_stage", False) or (
-            torch.compiler.is_compiling() and self._has_cpu_offloaded_engram()
+            torch.compiler.is_compiling()
+            and (self._has_cpu_offloaded_engram() or self._has_host_dma_engram())
         )
         engram_hashes, engram_mask = self._prepare_engram(
             input_ids,

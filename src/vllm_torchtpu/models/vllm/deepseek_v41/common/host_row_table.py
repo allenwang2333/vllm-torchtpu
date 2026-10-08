@@ -73,8 +73,10 @@ def _install() -> None:
         for node in graph_module.graph.nodes:
             if node.op != "call_function" or HOST_OP_NAMESPACE not in str(node.target):
                 continue
-            # Argument 0 is the row ids (HBM); the rest are pinned chunks.
-            for arg in node.args[1:]:
+            # `lookup_and_dequant` takes (rows, valid, weight_scale_inv, *chunks);
+            # `gather` takes (row_ids, *chunks).
+            chunk_start = 3 if "lookup_and_dequant" in str(node.target) else 1
+            for arg in node.args[chunk_start:]:
                 index = placeholders.get(arg)
                 if index is not None and isinstance(
                     example_inputs[index], torch.Tensor
@@ -113,6 +115,42 @@ def _gather_op(num_chunks: int, row_bytes: int):
     def fake(row_ids, *chunks):
         # The default fake kernel rejects symbolic (bucketed token) dims.
         return row_ids.new_empty((row_ids.shape[0], hrg.row_words(row_bytes)))
+
+    op.register_fake(fake)
+    return op
+
+
+@functools.cache
+def _lookup_and_dequant_op(num_chunks: int, row_bytes: int, block_size: int):
+    """``jax_op`` gathering ``row_bytes`` rows and dequantizing to bf16."""
+    from torch_tpu._internal.pallas import pallas as tpu_pallas
+
+    def fn(*args):
+        return hrg.lookup_and_dequant_rows_jax(
+            args[0],
+            args[1],
+            args[2],
+            *args[3:],
+            row_bytes=row_bytes,
+            block_size=block_size,
+        )
+
+    fn.__signature__ = inspect.Signature(  # pyrefly: ignore[missing-attribute]
+        [
+            inspect.Parameter(
+                f"arg{i}", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=jax.Array
+            )
+            for i in range(3 + num_chunks)
+        ],
+        return_annotation=jax.Array,
+    )
+    op = tpu_pallas.jax_op(
+        f"{HOST_OP_NAMESPACE}::lookup_and_dequant_c{num_chunks}_b{row_bytes}_s{block_size}",
+        fn,
+    )
+
+    def fake(row_ids, valid, weight_scale_inv, *chunks):
+        return row_ids.new_empty((row_ids.shape[0], row_bytes), dtype=torch.bfloat16)
 
     op.register_fake(fake)
     return op
@@ -166,3 +204,19 @@ class HostRowTable:
     def gather(self, row_ids: torch.Tensor) -> torch.Tensor:
         """``int32[n]`` in-range row ids -> ``uint8[n, row_bytes]`` on device."""
         return self._op(row_ids.to(torch.int32), *self.chunks).view(torch.uint8)
+
+    def lookup_and_dequant(
+        self,
+        row_ids: torch.Tensor,
+        valid: torch.Tensor,
+        weight_scale_inv: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        """Gather ``row_ids`` from ``pinned_host`` chunks and dequantize to bf16."""
+        op = _lookup_and_dequant_op(len(self.chunks), self.row_bytes, block_size)
+        return op(
+            row_ids.to(torch.int32),
+            valid.to(torch.bool),
+            weight_scale_inv,
+            *self.chunks,
+        )

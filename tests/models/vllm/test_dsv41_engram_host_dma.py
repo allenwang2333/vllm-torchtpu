@@ -21,7 +21,6 @@ from vllm_torchtpu.kernels.deepseek_v41 import host_row_gather as hrg
 from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common_engram
 from vllm_torchtpu.models.vllm.deepseek_v41.common import host_row_table
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as v2_model
-from vllm_torchtpu.runner import utils as runner_utils
 
 
 @pytest.fixture(autouse=True)
@@ -85,7 +84,7 @@ def test_chunk_majors():
 
 
 class _NumpyRows:
-    """Stand-in for ``HostRowTable`` with the same ``gather`` contract."""
+    """Stand-in for ``HostRowTable`` with ``gather`` and ``lookup_and_dequant``."""
 
     def __init__(self, rows: torch.Tensor):
         self.rows = rows.view(torch.uint8).clone()
@@ -93,6 +92,22 @@ class _NumpyRows:
     def gather(self, row_ids: torch.Tensor) -> torch.Tensor:
         assert row_ids.min() >= 0 and row_ids.max() < self.rows.shape[0]
         return self.rows[row_ids.long()]
+
+    def lookup_and_dequant(
+        self,
+        row_ids: torch.Tensor,
+        valid: torch.Tensor,
+        weight_scale_inv: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        raw = self.gather(row_ids).numpy().view(np.int32)
+        scale = weight_scale_inv[row_ids.long()].clone()
+        scale.masked_fill_(~valid[:, None], hrg.INVALID_SCALE)
+        dequant = hrg.dequant_fp8_rows_jax(
+            jnp.asarray(raw), jnp.asarray(scale.numpy()), block_size
+        )
+        bits = np.asarray(jax.lax.bitcast_convert_type(dequant, jnp.int16))
+        return torch.from_numpy(bits.copy()).view(torch.bfloat16)
 
 
 def _embedding(monkeypatch, tp_size, rank, head_sizes, dim=64):
@@ -199,6 +214,37 @@ def test_gather_rows_jax_interpret(per_chunk):
     np.testing.assert_array_equal(np.asarray(got), rows[ids].view(np.int32))
 
 
+def test_lookup_and_dequant_rows_jax_interpret():
+    """Fused Pallas gather + barrier + scale gather + dequant matches Torch."""
+    rng = np.random.default_rng(11)
+    rows = rng.integers(0, 256, (300, 256), dtype=np.uint8)
+    rows[rows == 0x7F] = 0x7E
+    rows[rows == 0xFF] = 0xFE
+    rows[13, 128:] = 0x7F  # FP8 NaN masked by invalid=False
+    scales = rng.integers(100, 150, (300, 2), dtype=np.uint8)
+    scales[0, 0] = 0  # subnormal 2**-127 flushes to +0.0
+    packed = hrg.pack_rows(rows)
+    chunks = [jnp.asarray(packed[:2]), jnp.asarray(packed[2:])]
+    ids = np.array([0, 13, 127, 128, 299], dtype=np.int32)
+    valid = np.array([True, False, True, True, False], dtype=np.bool_)
+    got = hrg.lookup_and_dequant_rows_jax(
+        jnp.asarray(ids),
+        jnp.asarray(valid),
+        jnp.asarray(scales),
+        *chunks,
+        row_bytes=256,
+        block_size=128,
+        interpret=True,
+    )
+    got_bits = np.asarray(jax.lax.bitcast_convert_type(got, jnp.int16))
+    expected_scale = torch.from_numpy(scales[ids].copy())
+    expected_scale[~torch.from_numpy(valid)] = hrg.INVALID_SCALE
+    expected = common_engram.dequant_fp8_rows(
+        torch.from_numpy(rows[ids]), expected_scale, 128
+    )
+    np.testing.assert_array_equal(got_bits, expected.view(torch.int16).numpy())
+
+
 # --- TorchTPU glue -------------------------------------------------------------
 
 
@@ -206,6 +252,18 @@ def test_gather_rows_jax_interpret(per_chunk):
     f"{host_row_table.HOST_OP_NAMESPACE}::test_gather", mutates_args=()
 )
 def _test_gather(row_ids: torch.Tensor, chunk: torch.Tensor) -> torch.Tensor:
+    return row_ids.clone()
+
+
+@torch.library.custom_op(
+    f"{host_row_table.HOST_OP_NAMESPACE}::lookup_and_dequant_test", mutates_args=()
+)
+def _test_lookup_and_dequant(
+    row_ids: torch.Tensor,
+    valid: torch.Tensor,
+    scale: torch.Tensor,
+    chunk: torch.Tensor,
+) -> torch.Tensor:
     return row_ids.clone()
 
 
@@ -238,23 +296,29 @@ def test_install_patches_placeholder_and_mark(monkeypatch):
     assert placeholder(pinned, mesh=object()).sharding is None  # mesh: untouched
     assert placeholder(3) == 3
 
-    def fn(row_ids, chunk, other):
+    def fn(row_ids, chunk, other, valid, scale, chunk2):
         # ``other + 0`` is not a placeholder: it must stay unmarked.
         extra = torch.ops.dsv41_host_rows.test_gather(row_ids, other + 0)
-        return torch.ops.dsv41_host_rows.test_gather(row_ids, chunk) + extra
+        deq = torch.ops.dsv41_host_rows.lookup_and_dequant_test(
+            row_ids, valid, scale, chunk2
+        )
+        return torch.ops.dsv41_host_rows.test_gather(row_ids, chunk) + extra + deq
 
     graph = torch.fx.symbolic_trace(fn)
-    inputs = [torch.zeros(4, dtype=torch.int32) for _ in range(3)]
+    inputs = [torch.zeros(4, dtype=torch.int32) for _ in range(6)]
     tpu_backend._mark_pinned_host_inputs(graph, inputs)
-    assert base_marks == [3]
+    assert base_marks == [6]
     assert [getattr(t, "_is_pinned_host", False) for t in inputs] == [
         False,
         True,
         False,
+        False,
+        False,
+        True,
     ]
 
 
-def test_gather_op_signature_and_fake(monkeypatch):
+def test_gather_and_lookup_op_signatures_and_fakes(monkeypatch):
     from torch_tpu._internal.pallas import pallas as tpu_pallas
 
     made = {}
@@ -284,9 +348,32 @@ def test_gather_op_signature_and_fake(monkeypatch):
     out = made["fake"](torch.zeros(5, dtype=torch.int32), torch.zeros(1, 8, 1024))
     assert out.shape == (5, 64) and out.dtype == torch.int32
 
+    deq_calls = []
+    monkeypatch.setattr(
+        hrg,
+        "lookup_and_dequant_rows_jax",
+        lambda rows, valid, scale, *chunks, row_bytes, block_size: deq_calls.append(
+            (rows, valid, scale, chunks, row_bytes, block_size)
+        ),
+    )
+    deq_op = host_row_table._lookup_and_dequant_op.__wrapped__(2, 256, 128)
+    assert isinstance(deq_op, FakeOp)
+    assert made["name"] == "dsv41_host_rows::lookup_and_dequant_c2_b256_s128"
+    deq_params = inspect.signature(made["fn"]).parameters.values()
+    assert [p.annotation for p in deq_params] == [jax.Array] * 5
+    made["fn"]("ids", "valid", "scale", "c0", "c1")
+    assert deq_calls == [("ids", "valid", "scale", ("c0", "c1"), 256, 128)]
+    deq_out = made["fake"](
+        torch.zeros(5, dtype=torch.int32),
+        torch.ones(5, dtype=torch.bool),
+        torch.ones(10, 2, dtype=torch.uint8),
+        torch.zeros(1, 8, 1024),
+    )
+    assert deq_out.shape == (5, 256) and deq_out.dtype == torch.bfloat16
+
 
 def test_host_row_table_chunks_and_gathers(monkeypatch):
-    """Chunked pack/offload and gather end to end, kernel interpreted."""
+    """Chunked pack/offload, gather, and lookup_and_dequant end to end."""
     monkeypatch.setattr(host_row_table, "_install", lambda: None)
     monkeypatch.setattr(
         torch.ops, "ao", SimpleNamespace(offload=lambda t: t.clone()), raising=False
@@ -301,13 +388,34 @@ def test_host_row_table_chunks_and_gathers(monkeypatch):
                 row_bytes=row_bytes,
                 interpret=True,
             )
-            return torch.from_numpy(np.asarray(out))
+            return torch.from_numpy(np.asarray(out).copy())
+
+        return op
+
+    def lookup_and_dequant_op(num_chunks, row_bytes, block_size):
+        def op(row_ids, valid, scale, *chunks):
+            assert len(chunks) == num_chunks
+            out = hrg.lookup_and_dequant_rows_jax(
+                jnp.asarray(row_ids.numpy()),
+                jnp.asarray(valid.numpy()),
+                jnp.asarray(scale.numpy()),
+                *(jnp.asarray(c.numpy()) for c in chunks),
+                row_bytes=row_bytes,
+                block_size=block_size,
+                interpret=True,
+            )
+            bits = np.asarray(jax.lax.bitcast_convert_type(out, jnp.int16))
+            return torch.from_numpy(bits.copy()).view(torch.bfloat16)
 
         return op
 
     monkeypatch.setattr(host_row_table, "_gather_op", gather_op)
+    monkeypatch.setattr(host_row_table, "_lookup_and_dequant_op", lookup_and_dequant_op)
     rng = np.random.default_rng(5)
     rows = rng.integers(0, 256, (700, 256), dtype=np.uint8)
+    rows[rows == 0x7F] = 0x7E
+    rows[rows == 0xFF] = 0xFE
+    scales = rng.integers(100, 150, (700, 2), dtype=np.uint8)
     chunk_bytes = 4 * hrg.SUBLANES * hrg.MAJOR_LANES * 4
     # 700 rows = 6 majors of 128; at most 4 majors per chunk: 2 x 3 majors.
     table = host_row_table.HostRowTable(
@@ -320,6 +428,15 @@ def test_host_row_table_chunks_and_gathers(monkeypatch):
     got = table.gather(ids)
     assert got.dtype == torch.uint8
     np.testing.assert_array_equal(got.numpy(), rows[ids.numpy()])
+
+    valid = torch.tensor([True, False, True, True, False, True])
+    scales_t = torch.from_numpy(scales)
+    got_deq = table.lookup_and_dequant(ids, valid, scales_t, 128)
+    exp_scale = scales_t[ids].clone()
+    exp_scale[~valid] = hrg.INVALID_SCALE
+    exp_deq = common_engram.dequant_fp8_rows(got, exp_scale, 128)
+    assert torch.equal(got_deq.view(torch.int16), exp_deq.view(torch.int16))
+
     # A smaller shard sized for a 1100-row capacity: 9 majors -> 3 x 3, with
     # the chunk past its rows all zero.
     small = host_row_table.HostRowTable(
@@ -331,10 +448,29 @@ def test_host_row_table_chunks_and_gathers(monkeypatch):
     np.testing.assert_array_equal(small.gather(ids).numpy(), rows[ids.numpy()])
 
 
+def test_engram_host_dma_staging_reuses_bucket_rows(monkeypatch):
+    emb = _embedding(monkeypatch, 1, 0, (16, 16), dim=64)
+    emb.host_dma = True
+    emb._host_rows = _NumpyRows(emb.weight.data)
+    engram = object.__new__(common_engram.Engram)
+    engram.__dict__["embed_tokens"] = emb
+    engram._init_staging(max_tokens=16, head_dim=64)
+    # Before prepare_embeddings, _ready_rows falls back to staged_rows[:n].
+    assert engram._ready_rows(3).shape == (3, 2, 64)
+    # Single-token bucket (num_tokens=1 < 2) and multi-token bucket (num_tokens=4 >= 2).
+    for num_tokens in (1, 4):
+        hashes = torch.randint(0, 32, (num_tokens, 2))
+        engram.prepare_embeddings(hashes)
+        first = engram._ready_rows(num_tokens)
+        assert first.shape == (num_tokens, 2, 64)
+        engram.prepare_embeddings(hashes)
+        assert engram._ready_rows(num_tokens) is first
+
+
 # --- Model and runner hooks ----------------------------------------------------
 
 
-def _layer(cpu_offload=True, host_dma=True, engram=True):
+def _layer(cpu_offload=True, host_dma=True, engram=True, layer_hash_index=0):
     if not engram:
         return SimpleNamespace(engram=None)
     moved = []
@@ -350,8 +486,21 @@ def _layer(cpu_offload=True, host_dma=True, engram=True):
         move_rows_to_pinned_host=move,
         moved=moved,
     )
+    prepared = []
+    active_rows = torch.empty(2, 2, 4)
+
+    def prepare(hashes):
+        prepared.append(hashes.clone())
+
     return SimpleNamespace(
-        engram=SimpleNamespace(embed_tokens=embed, staged_rows=torch.empty(1))
+        engram=SimpleNamespace(
+            embed_tokens=embed,
+            staged_rows=torch.empty(1),
+            _active_rows=active_rows,
+            layer_hash_index=layer_hash_index,
+            prepare_embeddings=prepare,
+            prepared=prepared,
+        )
     )
 
 
@@ -361,10 +510,148 @@ def _model(layers):
     return model
 
 
-def test_has_cpu_offloaded_engram_excludes_host_dma():
+def test_has_cpu_offloaded_and_host_dma_engram():
     assert not _model([_layer(engram=False), _layer()])._has_cpu_offloaded_engram()
+    assert _model([_layer(engram=False), _layer()])._has_host_dma_engram()
     assert _model([_layer(host_dma=False)])._has_cpu_offloaded_engram()
-    assert not _model([_layer(cpu_offload=False)])._has_cpu_offloaded_engram()
+    assert not _model([_layer(host_dma=False)])._has_host_dma_engram()
+    assert not _model(
+        [_layer(cpu_offload=False, host_dma=False)]
+    )._has_cpu_offloaded_engram()
+    layer_with_rows = _layer(cpu_offload=False, host_dma=False)
+    layer_with_rows.engram.embed_tokens._host_rows = object()
+    assert _model([layer_with_rows])._has_host_dma_engram()
+
+
+def test_prepare_engram_and_forward_host_dma_outside_stage(monkeypatch):
+    class FakeTpuTensor:
+        def __init__(self, t, dev_type="tpu"):
+            self.t = t
+            self.device = SimpleNamespace(type=dev_type)
+            self.shape = t.shape
+
+        def to(self, dev):
+            return self.t.to(dev)
+
+        def __getitem__(self, idx):
+            return self.t[idx]
+
+    synced = []
+    monkeypatch.setattr(
+        v2_model,
+        "synchronize_tensors",
+        lambda tensors, wait=True: synced.append((tuple(tensors), wait)),
+    )
+    monkeypatch.setattr(v2_model.upstream, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        v2_model.upstream,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={
+                "swa": SimpleNamespace(
+                    query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+                    seq_lens=torch.tensor([2], dtype=torch.int32),
+                )
+            },
+            additional_kwargs={},
+        ),
+    )
+    monkeypatch.setattr(
+        v2_model.upstream,
+        "image_sentinel_mask",
+        lambda t: torch.zeros_like(t, dtype=torch.bool),
+    )
+    monkeypatch.setattr(v2_model, "_cache_slots", lambda kv, meta, pos: None)
+    monkeypatch.setattr(v2_model, "_block_table", lambda meta: None)
+    raw_hashes = torch.tensor([[[1, 2], [3, 4]], [[5, 6], [7, 8]]], dtype=torch.int32)
+    tpu_hashes = FakeTpuTensor(raw_hashes, "tpu")
+    monkeypatch.setattr(
+        v2_model,
+        "gather_host_engram_hashes",
+        lambda h, dp_shared_memory, gather_fn: tpu_hashes,
+    )
+
+    class FakeHash:
+        use_slot_cache = True
+        lookback_depth = 2
+        multipliers = torch.ones(2, 3, dtype=torch.int64)
+        swa_cache_module = SimpleNamespace(kv_cache=torch.ones(1))
+
+        def ensure_cache(self):
+            return True
+
+        def __call__(self, *args):
+            return raw_hashes
+
+    l0 = _layer(engram=False)
+    l1 = _layer(cpu_offload=True, host_dma=True, layer_hash_index=0)
+    l2 = _layer(cpu_offload=True, host_dma=True, layer_hash_index=1)
+    tpu_active = FakeTpuTensor(torch.zeros(2, 2, 4), "tpu")
+    l1.engram._active_rows = tpu_active
+    l2.engram._active_rows = torch.zeros(2, 2, 4)  # cpu device: no sync
+
+    model = _model([l0, l1, l2])
+    model.__dict__.update(
+        engram_hash=FakeHash(),
+        engram_swa_prefix="swa",
+        engram_dp_shared_memory=True,
+        use_mega_moe=False,
+        _ced_enabled=False,
+    )
+    seen_outside = []
+    model.__dict__["full_stage"] = lambda *a: (
+        seen_outside.append(model._engram_prepared_outside_stage) or "full_out"
+    )
+    input_ids = torch.tensor([10, 11], dtype=torch.int32)
+    positions = torch.tensor([0, 1], dtype=torch.int32)
+    assert model.forward(input_ids, positions) == "full_out"
+    assert seen_outside == [True]
+    assert not model._engram_prepared_outside_stage
+    assert len(l1.engram.prepared) == 1 and len(l2.engram.prepared) == 1
+    assert synced == [((tpu_hashes,), False), ((tpu_active,), False)]
+
+    # When gathered_hashes is on CPU under host_dma, no sync is issued.
+    synced.clear()
+    tpu_hashes.device.type = "cpu"
+    l1.engram._active_rows = None
+    model._prepare_engram(input_ids, positions, None)
+    assert synced == []
+
+    # Under cpu_offload=True, host_dma=False, gathered_hashes moves to CPU and no
+    # host_dma sync runs.
+    l1.engram.embed_tokens.host_dma = False
+    l2.engram.embed_tokens.host_dma = False
+    model._prepare_engram(input_ids, positions, None)
+    assert synced == []
+
+    # Under _forward_stage while compiling with host_dma=True, skip_lookup is True.
+    l1.engram.embed_tokens.host_dma = True
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(
+        v2_model.upstream,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=False),
+    )
+    model.__dict__.update(
+        use_sequence_parallel=False,
+    )
+    skip_seen = []
+    orig_prepare = model._prepare_engram
+
+    class _StopStage(Exception):
+        pass
+
+    def spy_prepare(*args, **kwargs):
+        skip_seen.append(kwargs.get("skip_lookup"))
+        orig_prepare(*args, **kwargs)
+        raise _StopStage
+
+    monkeypatch.setattr(model, "_prepare_engram", spy_prepare)
+    with pytest.raises(_StopStage):
+        model._forward_stage(
+            input_ids, positions, None, inputs_embeds=torch.zeros(2, 4, 8)
+        )
+    assert skip_seen == [True]
 
 
 def test_move_engram_rows_to_pinned_host_runs_once():
@@ -391,9 +678,3 @@ def test_causal_lm_converts_after_load_and_before_forward(monkeypatch, host_dma)
     lm.process_weights_after_loading()
     assert lm.forward() == "out"
     assert len(moves) == (2 if host_dma == "1" else 0)
-
-
-@pytest.mark.parametrize("host_dma,expected", [("0", True), ("1", False)])
-def test_entry_layout_pins_supported(monkeypatch, host_dma, expected):
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA", host_dma)
-    assert runner_utils.entry_layout_pins_supported() is expected

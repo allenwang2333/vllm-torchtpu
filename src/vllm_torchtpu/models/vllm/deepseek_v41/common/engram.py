@@ -357,24 +357,26 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
 
     def _host_dma_lookup(self, indices, out):
         assert self._host_rows is not None
-        dev = indices.device
-        heads = torch.arange(self.part_n_hash_cols, device=dev) + self.head_start
-        selected = indices[:, heads.clamp(max=self.n_hash_cols - 1)].long()
-        valid = (
-            (heads < self.n_hash_cols)[None, :]
-            & (selected >= self.vocab_start_idx)
-            & (selected < self.vocab_end_idx)
-        )
+        start = min(self.head_start, self.n_hash_cols)
+        end = min(self.head_start + self.part_n_hash_cols, self.n_hash_cols)
+        selected = indices[:, start:end].long()
+        valid = (selected >= self.vocab_start_idx) & (selected < self.vocab_end_idx)
+        pad = self.part_n_hash_cols - (end - start)
+        if pad:
+            selected = torch.nn.functional.pad(selected, (0, pad))
+            valid = torch.nn.functional.pad(valid, (0, pad), value=False)
         rows = (
             (selected - self.vocab_start_idx)
             .clamp(min=0, max=self.part_num_embeddings - 1)
             .flatten()
         )
-        raw = self._host_rows.gather(rows)
-        scale = torch.index_select(self.weight_scale_inv.data, 0, rows).masked_fill(
-            ~valid.flatten()[:, None], _INVALID_SCALE
+        dequant = self._host_rows.lookup_and_dequant(
+            rows,
+            valid.flatten(),
+            self.weight_scale_inv.data,
+            self.block_size,
         )
-        out.copy_(dequant_fp8_rows(raw, scale, self.block_size).view(out.shape))
+        out.copy_(dequant.view(out.shape))
 
     def lookup(self, indices, out, background=False):
         if self._host_rows is not None:
@@ -526,8 +528,10 @@ class Engram(upstream.Engram):
         super()._init_staging(max_tokens, head_dim)
         self._staged_raw: torch.Tensor | None = None
         self._active_raw: torch.Tensor | None = None
+        self._active_rows: torch.Tensor | None = None
         self._staged_by_tokens: dict[int, torch.Tensor] = {}
         self._staged_views_by_tokens: dict[int, torch.Tensor] = {}
+        self._staged_rows_by_tokens: dict[int, torch.Tensor] = {}
         if getattr(self.embed_tokens, "cpu_offload", False) and (
             getattr(self.embed_tokens, "host_dma", False) is not True
         ):
@@ -598,7 +602,22 @@ class Engram(upstream.Engram):
             self._staged_views_by_tokens[num_tokens] = view
         return view
 
+    def _host_dma_rows(self, num_tokens: int) -> torch.Tensor:
+        rows = self._staged_rows_by_tokens.get(num_tokens)
+        if rows is None:
+            _, cols, head_dim = self.staged_rows.shape
+            rows = self.staged_rows.new_empty((num_tokens, cols, head_dim))
+            if num_tokens >= 2:
+                torch._dynamo.mark_dynamic(rows, 0)
+            self._staged_rows_by_tokens[num_tokens] = rows
+        return rows
+
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
+        if getattr(self.embed_tokens, "_host_rows", None) is not None:
+            rows = self._host_dma_rows(hash_ids.shape[0])
+            self.embed_tokens.lookup(hash_ids, rows)
+            self._active_rows = rows
+            return
         if (
             self._staged_raw is not None
             and hash_ids.shape[0] <= self._host_raw.shape[0]
@@ -635,6 +654,8 @@ class Engram(upstream.Engram):
         super().prepare_embeddings(hash_ids)
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
+        if self._active_rows is not None:
+            return self._active_rows
         if self._staged_raw is None:
             return super()._ready_rows(num_tokens)
         _, cols, head_dim = self._host_raw.shape

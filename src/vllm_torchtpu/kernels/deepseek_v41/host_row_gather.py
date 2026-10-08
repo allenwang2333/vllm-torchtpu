@@ -147,3 +147,55 @@ def gather_rows_jax(
         interpret=interpret,
     )(rows // per_tile, *chunks)
     return select_rows(gathered, rows % per_tile, row_bytes)
+
+
+INVALID_SCALE = 255
+
+
+def dequant_fp8_rows_jax(
+    raw: jax.Array,
+    scale: jax.Array,
+    block_size: int,
+    invalid_scale: int = INVALID_SCALE,
+) -> jax.Array:
+    """``[n, row_bytes // 4]`` int32 raw words x ``[n, blocks]`` uint8 scale -> bf16.
+
+    Bitwise equivalent to ``common.engram.dequant_fp8_rows``: ``scale`` byte
+    ``b`` encodes ``2**(b - 127)`` via ``(b << 23)`` bitcast to float32, byte 0
+    (subnormal ``2**-127``) flushes to 0, and ``invalid_scale`` (255) maps the
+    entire block to ``+0.0`` even if the raw FP8 byte is NaN.
+    """
+    values = (
+        jax.lax.bitcast_convert_type(raw, jnp.float8_e4m3fn)
+        .reshape(raw.shape[0], -1)
+        .astype(jnp.float32)
+    )
+    power = jax.lax.bitcast_convert_type(scale.astype(jnp.int32) << 23, jnp.float32)
+    power = jnp.repeat(power, block_size, axis=-1)
+    invalid = jnp.repeat(scale == invalid_scale, block_size, axis=-1)
+    return jnp.where(invalid, 0.0, values * power).astype(jnp.bfloat16)
+
+
+def lookup_and_dequant_rows_jax(
+    rows: jax.Array,
+    valid: jax.Array,
+    weight_scale_inv: jax.Array,
+    *chunks: jax.Array,
+    row_bytes: int,
+    block_size: int,
+    invalid_scale: int = INVALID_SCALE,
+    interpret: bool = False,
+) -> jax.Array:
+    """Gather ``rows`` from ``pinned_host`` chunks, barrier, then scale & dequant.
+
+    An explicit ``optimization_barrier`` separates the ``pinned_host`` DMA custom
+    call (``gather_rows_jax``) from the HBM scale gather (``jnp.take``) so XLA's
+    LatencyHidingScheduler cannot overlap a SparseCore gather offload with the
+    host DMA on the same ``rows`` operand.
+    """
+    rows, valid = jax.lax.optimization_barrier((rows, valid))
+    raw = gather_rows_jax(rows, *chunks, row_bytes=row_bytes, interpret=interpret)
+    raw, rows, valid = jax.lax.optimization_barrier((raw, rows, valid))
+    scale = jnp.take(weight_scale_inv, rows, axis=0)
+    scale = jnp.where(valid[:, None], scale, jnp.uint8(invalid_scale))
+    return dequant_fp8_rows_jax(raw, scale, block_size, invalid_scale=invalid_scale)

@@ -4819,16 +4819,10 @@ class TPUModelRunner(GPUModelRunner):
                 self._pp_topk_buffer.fill_(-1)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
-        # Row-major relayouts rely on entry-layout pins, which executables
-        # with a pinned_host parameter (Engram host DMA) ignore.
-        relayout = runner_utils.entry_layout_pins_supported()
-        if not relayout:
-            logger.info("Engram host DMA: keeping default parameter layouts")
-        if envs.TPU_ROPE_CACHE_ROW_MAJOR and relayout:
+        if envs.TPU_ROPE_CACHE_ROW_MAJOR:
             runner_utils.relayout_rope_caches(self.model)
-        if relayout:
-            runner_utils.relayout_rope_tables(self.model)
-        if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR and relayout:
+        runner_utils.relayout_rope_tables(self.model)
+        if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(self.model)
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
@@ -4836,7 +4830,7 @@ class TPUModelRunner(GPUModelRunner):
         if self._is_async_drafter:
             self._async_drafter.load_model(self.model)
             draft_model = getattr(self._async_drafter, "draft_model", None)
-            if draft_model is not None and relayout:
+            if draft_model is not None:
                 # Draft layers own compact RoPE tables too; executables are
                 # compiled against row-major tables, so a {0,1} draft table
                 # fails at launch with RuntimeProgramInputMismatch.
