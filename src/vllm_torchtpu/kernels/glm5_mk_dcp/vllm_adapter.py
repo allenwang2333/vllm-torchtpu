@@ -182,7 +182,11 @@ class Glm5MKD:
         bb = _find_backbone(runner.model)
         self.backbone = bb
         _need(len(bb.layers) == cfg.L, f"{len(bb.layers)} layers")
-        self.max_pages = int(runner.max_num_blocks_per_req)
+        # local pages a request can span on one rank: a block-table entry is a DCP virtual page of
+        # page * R positions (runner.max_num_blocks_per_req is the generic width, R times larger,
+        # and sized the key scratch 16x too big: 79.6 MiB VMEM, j-f2171e56)
+        mml = int(runner.model_config.max_model_len)
+        self.max_pages = -(-mml // (FULL.page * R))
         self.rotary = bb.layers[0].self_attn.rotary_emb
         _need(self.rotary.cos_sin_cache.shape[-1] == cfg.DR, "rope cache width")
         self.wk = K.weight_kinds(cfg)
