@@ -698,6 +698,7 @@ def test_forward_unsharded_bypasses_sp_gathers(monkeypatch):
         head_dim=16,
         padded_heads=2,
         _sp_sharded_input=False,
+        _replicated_local_q=False,
         _run_parallel_input_projections=lambda hs: (None, None, None),
         _split_qkv_and_norm=lambda qk: (qr, None, kv),
         _prepare_and_attn_fn=attn_fn_mock,
