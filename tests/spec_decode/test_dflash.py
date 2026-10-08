@@ -25,6 +25,26 @@ from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs
 
 
+@pytest.fixture
+def device(monkeypatch):
+    try:
+        import torch_tpu  # noqa: F401
+
+        return torch.device("tpu")
+    except Exception:
+        monkeypatch.setattr(
+            DFlashProposer,
+            "_tpu_build_dflash_inputs_next_tokens",
+            torch._dynamo.disable(DFlashProposer._tpu_build_dflash_inputs_next_tokens),
+        )
+        monkeypatch.setattr(
+            DFlashProposer,
+            "_tpu_build_dflash_inputs_seed",
+            torch._dynamo.disable(DFlashProposer._tpu_build_dflash_inputs_seed),
+        )
+        return torch.device("cpu")
+
+
 def _make_proposer(draft_tp: int | None = 1, target_tp: int = 1) -> DFlashProposer:
     hf_config_mock = mock.MagicMock()
     hf_config_mock.to_dict.return_value = {
