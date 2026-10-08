@@ -134,8 +134,21 @@ def test_moe_gmm_tiling(monkeypatch):
         fused_moe_gmm, "calculate_tiling", lambda *args, **kwargs: base_tiles
     )
     # 1. Matching decode dims:
-    # size_group > 1 and 32 <= size_m <= size_group * 112 and 32 % sublane == 0
-    for size_group, size_m in ((48, 576), (48, 2304), (48, 3456), (16, 1728)):
+    # size_group > 1 and 32 <= size_m <= size_group * 176 and 32 % sublane == 0
+    bound = fused_moe_gmm._DECODE_TILE_M32_ROWS_PER_GROUP
+    assert bound == 176
+    for size_group, size_m in (
+        (48, 576),
+        (48, 2304),
+        (48, 3456),
+        (16, 1728),
+        # DP2xTP4+EP8 verify batches T_ep = 768, 960, 1152, 1344 (M = 6 * T_ep).
+        (48, 4608),
+        (48, 5760),
+        (48, 6912),
+        (48, 8064),
+        (48, 48 * bound),
+    ):
         match_dims = types.SimpleNamespace(
             size_group=size_group, size_m=size_m, size_lhs_sublane=8
         )
@@ -149,8 +162,8 @@ def test_moe_gmm_tiling(monkeypatch):
         types.SimpleNamespace(size_group=1, size_m=576, size_lhs_sublane=8),
         # size_m < 32
         types.SimpleNamespace(size_group=48, size_m=16, size_lhs_sublane=8),
-        # size_m > size_group * 112
-        types.SimpleNamespace(size_group=48, size_m=48 * 112 + 1, size_lhs_sublane=8),
+        # size_m > size_group * 176
+        types.SimpleNamespace(size_group=48, size_m=48 * bound + 1, size_lhs_sublane=8),
         # 32 % sublane != 0
         types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=12),
     ):

@@ -966,7 +966,16 @@ def test_moe_gmm_tiling_selects_32_for_sparse_decode_and_keeps_default_otherwise
     monkeypatch.setattr(
         fused_moe_gmm, "calculate_tiling", lambda *args, **kwargs: base_tiles
     )
-    for size_group, size_m in ((48, 576), (48, 2304), (48, 3456), (16, 1728)):
+    bound = fused_moe_gmm._DECODE_TILE_M32_ROWS_PER_GROUP
+    for size_group, size_m in (
+        (48, 576),
+        (48, 2304),
+        (48, 3456),
+        (16, 1728),
+        (48, 4608),
+        (48, 8064),
+        (48, 48 * bound),
+    ):
         decode_dims = types.SimpleNamespace(
             size_group=size_group, size_m=size_m, size_lhs_sublane=8
         )
@@ -976,7 +985,7 @@ def test_moe_gmm_tiling_selects_32_for_sparse_decode_and_keeps_default_otherwise
     for non_matching_dims in (
         types.SimpleNamespace(size_group=1, size_m=576, size_lhs_sublane=8),
         types.SimpleNamespace(size_group=48, size_m=16, size_lhs_sublane=8),
-        types.SimpleNamespace(size_group=48, size_m=48 * 112 + 1, size_lhs_sublane=8),
+        types.SimpleNamespace(size_group=48, size_m=48 * bound + 1, size_lhs_sublane=8),
         types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=12),
     ):
         assert (
