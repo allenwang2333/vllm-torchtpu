@@ -275,12 +275,9 @@ class Eagle3Proposer:
         )
         # TPU_SAMPLER_VOCAB_PARALLEL: the greedy draft argmax reduces per logit
         # shard and all-gathers (max, id) per row, not [rows, vocab] logits.
-        # The fused draft loop also argmaxes compute_logits; it keeps the
-        # full-logit path.
         self._vocab_parallel_argmax = None
         if (
             envs.TPU_SAMPLER_VOCAB_PARALLEL
-            and not envs.VLLM_TPU_FUSED_DRAFT_LOOP
             and getattr(self.draft_model, "draft_id_to_target_id", None) is None
         ):
             self._vocab_parallel_argmax = install_vocab_parallel_draft_argmax(
@@ -607,6 +604,7 @@ class Eagle3Proposer:
                     num_steps=K - 1,
                     dynamic_arg_dims=draft_dims,
                     topk_indices_buffer=topk_indices_buffer,
+                    vocab_parallel_argmax_info=self._vocab_parallel_argmax,
                 )
         except Exception:
             logger.warning(

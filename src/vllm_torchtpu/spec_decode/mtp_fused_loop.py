@@ -63,6 +63,7 @@ class _MtpFusedLoop(nn.Module):
         mtp: MtpDraftModel,
         num_steps: int,
         topk_indices_buffer: torch.Tensor | None = None,
+        vocab_parallel_argmax_info: Any = None,
     ) -> None:
         super().__init__()
         # Own compile-cache folder, as in MtpLoopStepModel.
@@ -74,6 +75,7 @@ class _MtpFusedLoop(nn.Module):
         # registered buffer: the draft owns it, and this module must not
         # save, move or cast it.
         self.topk_indices_buffer = topk_indices_buffer
+        self.vocab_parallel_argmax_info = vocab_parallel_argmax_info
 
     def _install_shared_topk(self, step: int, rows: torch.Tensor) -> None:
         """Put the chunk's step-0 top-k rows at the front of the table before
@@ -101,6 +103,8 @@ class _MtpFusedLoop(nn.Module):
                 "shared_topk_indices must be passed exactly when the fused MTP "
                 "loop was built with a topk_indices_buffer (IndexShare)."
             )
+        from vllm_torchtpu.spec_decode.utils import vocab_parallel_argmax
+
         tokens = []
         for i in range(self.num_steps):
             if i > 0:
@@ -124,12 +128,13 @@ class _MtpFusedLoop(nn.Module):
                 last_hidden, hidden_states = out
             else:
                 last_hidden = hidden_states = out
-            input_ids = (
-                self.mtp.compute_logits(last_hidden)
-                .argmax(dim=-1)
-                .to(torch.int32)
-                .clone()
-            )
+            logits = self.mtp.compute_logits(last_hidden)
+            if self.vocab_parallel_argmax_info is not None:
+                input_ids = vocab_parallel_argmax(
+                    logits, self.vocab_parallel_argmax_info
+                ).clone()
+            else:
+                input_ids = logits.argmax(dim=-1).to(torch.int32).clone()
             tokens.append(input_ids)
         return tuple(tokens)
 
@@ -142,6 +147,7 @@ def build_mtp_fused_loop(
     num_steps: int,
     dynamic_arg_dims: dict,
     topk_indices_buffer: torch.Tensor | None = None,
+    vocab_parallel_argmax_info: Any = None,
 ) -> nn.Module:
     """Compile `_MtpFusedLoop` with the draft's own dynamic dims (Qwen3.5's
     MTP marks positions -1, DeepSeek's 0), so both programs specialise the
@@ -159,4 +165,5 @@ def build_mtp_fused_loop(
         mtp=mtp,
         num_steps=num_steps,
         topk_indices_buffer=topk_indices_buffer,
+        vocab_parallel_argmax_info=vocab_parallel_argmax_info,
     )

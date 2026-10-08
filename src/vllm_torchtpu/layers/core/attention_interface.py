@@ -1363,30 +1363,30 @@ def sparse_mla_attention_dcp(
                 raise ValueError(
                     f"TPU_DCP_MLA_SMALL_CHUNK_BATCH must be >= 1, got {small_chunk_batch}"
                 )
-        output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
-            q,
-            kv_cache_nope,
-            kv_cache_rope,
-            topk_idx,
-            local_block_tables,
-            query_start_loc_,
-            request_distribution_,
-            sm_scale=sm_scale or 1.0,
-            k_scale=dequant_scale,
-            return_lse=True,
-            # The kernel defaults to tensorcore; the caches follow the spec.
-            cache_layout=cache_layout,
-            # Ranks own ~topk/dcp of each row: gather and attend those only.
-            packed_gather=envs.TPU_DCP_MLA_PACKED_GATHER,
-            # The rest: a static top-k width with an exact in-kernel overflow.
-            topk_cap=topk_cap,
-            # Capped path: window-major physical rows once, live windows only.
-            capped_window_prep=envs.TPU_DCP_MLA_CAPPED_PREP,
-            # Decode chunks: tokens per grid step (1 = kernel default).
-            small_chunk_batch_size=small_chunk_batch,
-            **chunk_kwargs,
-            **split_kwargs,
-        )
+            output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
+                q,
+                kv_cache_nope,
+                kv_cache_rope,
+                topk_idx,
+                local_block_tables,
+                query_start_loc_,
+                request_distribution_,
+                sm_scale=sm_scale or 1.0,
+                k_scale=dequant_scale,
+                return_lse=True,
+                # The kernel defaults to tensorcore; the caches follow the spec.
+                cache_layout=cache_layout,
+                # Ranks own ~topk/dcp of each row: gather and attend those only.
+                packed_gather=envs.TPU_DCP_MLA_PACKED_GATHER,
+                # The rest: a static top-k width with an exact in-kernel overflow.
+                topk_cap=topk_cap,
+                # Capped path: window-major physical rows once, live windows only.
+                capped_window_prep=envs.TPU_DCP_MLA_CAPPED_PREP,
+                # Decode chunks: tokens per grid step (1 = kernel default).
+                small_chunk_batch_size=small_chunk_batch,
+                **chunk_kwargs,
+                **split_kwargs,
+            )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
         output = output[..., : ql_nope.shape[-1]]
