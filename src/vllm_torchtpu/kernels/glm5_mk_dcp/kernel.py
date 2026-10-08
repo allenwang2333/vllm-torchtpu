@@ -404,7 +404,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         # MoE
         "wloc": pltpu.VMEM((M, 128), F32), "routed": pltpu.VMEM((M, H), F32),
         "shared": pltpu.VMEM((M, H), F32),
-        "sxb": pltpu.VMEM((max(NBLK13, NBLK2), M, 128), F32), "xqm": pltpu.VMEM((M, H), FP8),
+        "sxb": pltpu.VMEM((NBLK13, M, 128), F32), "sxb2": pltpu.VMEM((NBLK2, M, 128), F32), "xqm": pltpu.VMEM((M, H), FP8),
         "hitv": pltpu.VMEM((8, 128), I32), "hits": pltpu.SMEM((8, 128), I32),
         "es13": pltpu.VMEM((cfg.ER, 2 * cfg.I), F32), "es2": pltpu.VMEM((cfg.ER, H), F32),
         "es_sem": pltpu.SemaphoreType.DMA((2,)),
@@ -435,7 +435,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     scratch["pool_sem"] = pltpu.SemaphoreType.DMA((NB,))
     scratch["st"] = pltpu.SMEM((8,), I32)
     if debug:
-        scratch["dbg_sem"] = pltpu.SemaphoreType.DMA((2,))
+        scratch["dbg_sem"] = pltpu.SemaphoreType.DMA((3,))
+        scratch["dbgl"] = pltpu.VMEM((TMAX, 128), F32)
 
     # --- the stream: one layer's tiles in consumption order ---
     SEGS = ("qkv_a", "q_b", "w_uk", "idx_wq", "idx_wk", "w_uv", "o_proj", "w13", "w2",
@@ -480,8 +481,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         out_ref, nrow_out, rrow_out, irec_out = refs[o0:o0 + 4]
         rest = refs[o0 + 4:]
         if debug:
-            dbg_h, dbg_own = rest[:2]
-            rest = rest[2:]
+            dbg_h, dbg_own, dbg_lse = rest[:3]
+            rest = rest[3:]
         scr = dict(zip(s_names, rest))
         W, C, WS, CS = {}, {}, {}, {}
         for (k, l), r in zip(w_names, w_in):
@@ -637,7 +638,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             lax.fori_loop(0, nt, body, 0)
             return acc[:, :N]
 
-        def matmul_blk(kind, l, xref, K, N, j):
+        def matmul_blk(kind, l, xref, K, N, j, sname):
             """Expert GEMM with gmm_v2's lhs quant per row per QB-column block: acc[:, :N] =
             sum over 128-row segments s of (xq[:, s] @ W[s]) * sx[block(s)] (f32; main accumulates the
             blocks in bf16 -- deliberate, WHITEBOARD §10). sxb[b] holds block b's row scales."""
@@ -654,19 +655,20 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                     xs, ws = mxu(xref[:, pl.ds(pl.multiple_of(k0, 128), 128)],
                                  w_[sg * 128:(sg + 1) * 128, :], tiles)
                     acc[:, :N] += (lax.dot_general(xs, ws, NN, preferred_element_type=F32)
-                                   * scr["sxb"][blk][:, 0:1])
+                                   * scr[sname][blk][:, 0:1])
                 give(kind)
                 return c
             lax.fori_loop(0, nt, body, 0)
             return acc[:, :N]
 
-        def blk_quant(x, nblk):
-            """x f32 [M, nblk*QB] bf16-valued -> xq fp8 (into xqm / xq) and sxb[b] = scales."""
+        def blk_quant(x, nblk, sname):
+            """x f32 [M, nblk*QB] bf16-valued -> xq fp8 (returned) and scr[sname][b] = block b's
+            row scales (separate buffers for GEMM1 / GEMM2: GEMM2's quant runs between experts)."""
             out = []
             for b in range(nblk):
                 xb = x[:, b * cfg.QB:(b + 1) * cfg.QB]
                 q, s = quant_block_gmm(xb)
-                scr["sxb"][b] = jnp.broadcast_to(s, (M, 128))
+                scr[sname][b] = jnp.broadcast_to(s, (M, 128))
                 out.append(q)
             return jnp.concatenate(out, axis=1)
 
@@ -937,7 +939,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                                              scr["dbg_sem"].at[0]),
                        pltpu.make_async_copy(scr["res"].at[pl.ds(0, RPR)], dbg_h.at[l, 1],
                                              scr["dbg_sem"].at[0]),
-                       pltpu.make_async_copy(scr["own_v"], dbg_own.at[l], scr["dbg_sem"].at[1])]
+                       pltpu.make_async_copy(scr["own_v"], dbg_own.at[l], scr["dbg_sem"].at[1]),
+                       pltpu.make_async_copy(scr["dbgl"], dbg_lse.at[l], scr["dbg_sem"].at[2])]
                 for d_ in dcs:
                     d_.start()
                 for d_ in dcs:
@@ -1242,6 +1245,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 if NH < 128:
                     lse_b = jnp.concatenate([lse_b, jnp.full((128 - NH, 128), -jnp.inf, F32)], axis=0)
                 lse_row = jnp.transpose(lse_b)[0:1]                          # [1, 128], lane = head
+                if debug:
+                    scr["dbgl"][pl.ds(t_, 1), :] = lse_row
                 for d in range(R):
                     od = jnp.concatenate([out[d * HR + hh:d * HR + hh + 1] for hh in range(HR)], axis=1)
                     lrow = pltpu.roll(lse_row, (128 - d * HR) % 128, 1) if d else lse_row
@@ -1348,17 +1353,17 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             # routed experts
             pltpu.make_async_copy(scr["es13"], scr["es13"], scr["es_sem"].at[0]).wait()
             pltpu.make_async_copy(scr["es2"], scr["es2"], scr["es_sem"].at[1]).wait()
-            scr["xqm"][...] = blk_quant(X, NBLK13)
+            scr["xqm"][...] = blk_quant(X, NBLK13, "sxb")
             scr["routed"][...] = jnp.zeros((M, H), F32)
 
             def ebody(i, c):
                 j = scr["hits"][1, i]
-                a = matmul_blk("ew13", l, scr["xqm"], H, 2 * cfg.I, j)
+                a = matmul_blk("ew13", l, scr["xqm"], H, 2 * cfg.I, j, "sxb")
                 gu = bf(a * scr["es13"][pl.ds(j, 1), :])
                 mid_ = bf(gu[:, :cfg.I] * jax.nn.sigmoid(gu[:, :cfg.I]))
                 mid_ = bf(mid_ * gu[:, cfg.I:])
-                scr["xq"][:, :cfg.I] = blk_quant(mid_, NBLK2)
-                a = matmul_blk("ew2", l, scr["xq"], cfg.I, H, j)
+                scr["xq"][:, :cfg.I] = blk_quant(mid_, NBLK2, "sxb2")
+                a = matmul_blk("ew2", l, scr["xq"], cfg.I, H, j, "sxb2")
                 y_ = bf(a * scr["es2"][pl.ds(j, 1), :])
                 wcol = jnp.sum(jnp.where(lane128 == j, scr["wloc"][...], 0.0), axis=1, keepdims=True)
                 scr["routed"][...] += y_ * wcol
@@ -1402,8 +1407,9 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     out_specs = [pl.BlockSpec(memory_space=pltpu.VMEM)] + [pl.BlockSpec(memory_space=pl.ANY)] * 3
     if debug:
         out_shape += [jax.ShapeDtypeStruct((L, 2, RPR, H), F32),
-                      jax.ShapeDtypeStruct((L, TMAX, KR_, 128), I32)]
-        out_specs += [pl.BlockSpec(memory_space=pl.ANY)] * 2
+                      jax.ShapeDtypeStruct((L, TMAX, KR_, 128), I32),
+                      jax.ShapeDtypeStruct((L, TMAX, 128), F32)]
+        out_specs += [pl.BlockSpec(memory_space=pl.ANY)] * 3
     call = pl.pallas_call(
         kernel,
         name="glm5_mk_dcp",
