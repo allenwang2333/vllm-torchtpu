@@ -55,7 +55,12 @@ def render(baseline: dict, source_commit: str, model_uri: str) -> dict:
     if command.count(BASELINE_COMMIT) < 1 or old_uri not in command:
         raise ValueError("Baseline command no longer has the pinned source/model")
     command = command.replace(BASELINE_COMMIT, source_commit)
-    command = command.replace(BASELINE_COMMIT[:10], source_commit[:10])
+    cache_source = BASELINE_COMMIT[:9]
+    if command.count(cache_source + "-torchtpu") != 1:
+        raise ValueError("Baseline compilation cache key changed")
+    command = command.replace(
+        cache_source + "-torchtpu", source_commit[:9] + "-torchtpu"
+    )
     command = command.replace(old_uri, model_uri.rstrip("/") + "/")
     index_assertions = (
         "assert len(shards) == 48, len(shards)",
