@@ -23,7 +23,12 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
-from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    TileSizes,
+    calculate_tiling,
+    get_packing_factor,
+    gmm_v2,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -60,7 +65,7 @@ def _select_ragged_gather_reduce(version: str):
 # The non-EP combine in moe_gmm selects that kernel directly.
 ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
 
-_ONEHOT_AUTO_CAP = 768
+_ONEHOT_AUTO_CAP = 2048
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 
@@ -69,8 +74,9 @@ def resolve_onehot_permute_threshold() -> int:
     """Routed-row count at/below which MoE permute+combine run as TensorCore
     one-hot matmuls instead of the SparseCore gather/reduce kernels.
 
-    Auto (env unset/empty/negative) resolves to ``min(2 * SC block rows - 1,
-    _ONEHOT_AUTO_CAP)`` on SparseCore TPUs and 0 elsewhere. An explicit
+    Auto (env unset/empty/negative) resolves to ``min(mult * SC block rows - 1,
+    _ONEHOT_AUTO_CAP)`` on SparseCore TPUs (with ``mult = 4`` for 512-row v7x
+    blocks and ``2`` for smaller blocks) and 0 elsewhere. An explicit
     ``ONEHOT_MOE_PERMUTE_THRESHOLD`` wins: 0 disables the one-hot path, a
     positive value forces that threshold.
     """
@@ -85,7 +91,8 @@ def resolve_onehot_permute_threshold() -> int:
     if sc_info is None:
         return 0
     block_rows = sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores
-    threshold = min(2 * block_rows - 1, _ONEHOT_AUTO_CAP)
+    mult = 4 if block_rows >= 512 else 2
+    threshold = min(mult * block_rows - 1, _ONEHOT_AUTO_CAP)
 
     return threshold
 
@@ -179,6 +186,21 @@ def quantize_to_native_fp4_kmajor(
     return packed, scale
 
 
+def _moe_gmm_tiling(
+    dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes: int, fuse_act: str | None = None
+) -> TileSizes:
+    tiles = calculate_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
+    if (
+        dims.size_group > 1
+        and 32 <= dims.size_m <= dims.size_group * 40
+        and 32 % dims.size_lhs_sublane == 0
+    ):
+        return TileSizes(
+            tile_m=32, tile_k=tiles.tile_k, tile_n=tiles.tile_n, bucket_base=32
+        )
+    return tiles
+
+
 def gmm_wrapper(
     lhs,
     rhs,
@@ -205,6 +227,7 @@ def gmm_wrapper(
         rhs_bias=rhs_bias,
         group_sizes=group_sizes,
         group_offset=group_offset[0],
+        tile_info=_moe_gmm_tiling,
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,

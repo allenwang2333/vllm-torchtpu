@@ -272,9 +272,16 @@ def tpu_bind_kv_cache(
     forward_context: dict[str, Any],
     runner_kv_caches: list[torch.Tensor],
     num_attn_module: int = 1,
-    native_raw_cache: torch.Tensor | dict[str, torch.Tensor] | None = None,
+    native_raw_cache: (
+        torch.Tensor
+        | tuple[torch.Tensor, torch.Tensor]
+        | Mapping[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]
+        | None
+    ) = None,
     native_cache_layouts: Mapping[str, tuple] | None = None,
-    native_rope_pools: Mapping[str, torch.Tensor] | None = None,
+    native_rope_pools: (
+        Mapping[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]] | None
+    ) = None,
 ) -> None:
     """Bind kv_caches to ModelRunner and forward context."""
     assert len(runner_kv_caches) == 0

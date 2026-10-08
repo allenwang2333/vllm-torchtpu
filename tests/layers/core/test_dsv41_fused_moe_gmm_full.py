@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import pathlib
 import sys
+import types
 from unittest.mock import MagicMock, patch
 
 # Ensure repository root is in sys.path so 'tests' and package modules can be imported
@@ -80,7 +81,7 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
     ):
         assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
 
-    # 5. Env unset, device info has sparse_core
+    # 5. Env unset, device info has sparse_core with block_rows < 512 (mult = 2)
     mock_info_sc = MagicMock()
     mock_sc = MagicMock()
     mock_sc.num_lanes = 16
@@ -91,8 +92,68 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
         "jax.experimental.pallas.tpu.get_tpu_info",
         return_value=mock_info_sc,
     ):
-        # min(2 * (16 * 4 * 2) - 1, 768) = min(255, 768) = 255
+        # min(2 * (16 * 4 * 2) - 1, 2048) = min(255, 2048) = 255
         assert fused_moe_gmm.resolve_onehot_permute_threshold() == 255
+
+    # 6. Env unset, device info has sparse_core with block_rows >= 512 (mult = 4)
+    mock_sc_512 = MagicMock()
+    mock_sc_512.num_lanes = 16
+    mock_sc_512.num_cores = 4
+    mock_sc_512.num_subcores = 8  # 16 * 4 * 8 = 512
+    mock_info_sc_512 = MagicMock()
+    mock_info_sc_512.sparse_core = mock_sc_512
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=mock_info_sc_512,
+    ):
+        # min(4 * 512 - 1, 2048) = min(2047, 2048) = 2047
+        assert fused_moe_gmm.resolve_onehot_permute_threshold() == 2047
+
+    # 7. Env unset, oversized block rows capped at _ONEHOT_AUTO_CAP (2048)
+    mock_sc_1024 = MagicMock()
+    mock_sc_1024.num_lanes = 16
+    mock_sc_1024.num_cores = 8
+    mock_sc_1024.num_subcores = 8  # 16 * 8 * 8 = 1024
+    mock_info_sc_1024 = MagicMock()
+    mock_info_sc_1024.sparse_core = mock_sc_1024
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=mock_info_sc_1024,
+    ):
+        # min(4 * 1024 - 1, 2048) = min(4095, 2048) = 2048
+        assert fused_moe_gmm.resolve_onehot_permute_threshold() == 2048
+
+
+def test_moe_gmm_tiling(monkeypatch):
+    """Verify _moe_gmm_tiling fast-path (tile_m=32) and fallback to calculate_tiling."""
+    base_tiles = fused_moe_gmm.TileSizes(
+        tile_m=256, tile_k=512, tile_n=512, bucket_base=64
+    )
+    monkeypatch.setattr(
+        fused_moe_gmm, "calculate_tiling", lambda *args, **kwargs: base_tiles
+    )
+    # 1. Matching decode dims:
+    # size_group > 1 and 32 <= size_m <= size_group * 40 and 32 % sublane == 0
+    match_dims = types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=8)
+    assert fused_moe_gmm._moe_gmm_tiling(
+        match_dims, None, None, 64 << 20, "silu"
+    ) == fused_moe_gmm.TileSizes(tile_m=32, tile_k=512, tile_n=512, bucket_base=32)
+
+    # 2. Non-matching branches
+    for non_match in (
+        # size_group <= 1
+        types.SimpleNamespace(size_group=1, size_m=576, size_lhs_sublane=8),
+        # size_m < 32
+        types.SimpleNamespace(size_group=48, size_m=16, size_lhs_sublane=8),
+        # size_m > size_group * 40
+        types.SimpleNamespace(size_group=48, size_m=48 * 40 + 1, size_lhs_sublane=8),
+        # 32 % sublane != 0
+        types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=12),
+    ):
+        assert (
+            fused_moe_gmm._moe_gmm_tiling(non_match, None, None, 64 << 20, None)
+            == base_tiles
+        )
 
 
 def test_unpack_fp4_to_e2m1():

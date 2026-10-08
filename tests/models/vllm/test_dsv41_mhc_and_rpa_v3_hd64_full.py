@@ -1602,13 +1602,14 @@ class TestCommonMHCAndCacheDonate:
         )
         assert p128.shape == (128, mult, 1)
 
-        # Case B: tokens = 64 (tile = 64), fn is FP32
-        flat_64 = jnp.ones((64, mult * dim), dtype=jnp.bfloat16)
-        prev_64 = jnp.ones((64, mult), dtype=jnp.float32)
-        p64, c64, v64, np64 = mhc.delayed_pre_flat_jax(
-            flat_64, fn_f32, scale, base, prev_64, *constants
-        )
-        assert p64.shape == (64, mult, 1)
+        # Case B: tokens = 64, 256, 1024, fn is FP32
+        for t_p in (64, 256, 1024):
+            flat_p = jnp.ones((t_p, mult * dim), dtype=jnp.bfloat16)
+            prev_p = jnp.ones((t_p, mult), dtype=jnp.float32)
+            pp, _, _, _ = mhc.delayed_pre_flat_jax(
+                flat_p, fn_f32, scale, base, prev_p, *constants
+            )
+            assert pp.shape == (t_p, mult, 1)
 
     def test_post_jax_and_delayed_post_pre_flat_jax(self, monkeypatch):
         tokens = 64
@@ -1630,7 +1631,7 @@ class TestCommonMHCAndCacheDonate:
         post_out = mhc._post_jax(x_sub, flat, post_mix, comb_mix)
         assert post_out.shape == (tokens, mult * dim)
 
-        # 2. delayed_post_pre_flat_jax XLA fallback path (tokens < 64)
+        # 2. delayed_post_pre_flat_jax XLA fallback path (tokens < 64 and mult != 4)
         x_small = jnp.ones((16, dim), dtype=jnp.bfloat16)
         flat_small = jnp.ones((16, mult * dim), dtype=jnp.bfloat16)
         f_s, p_s, c_s, v_s, np_s = mhc.delayed_post_pre_flat_jax(
@@ -1646,6 +1647,20 @@ class TestCommonMHCAndCacheDonate:
         )
         assert f_s.shape == (16, mult * dim)
         assert p_s.shape == (16, mult, 1)
+
+        f_m2, p_m2, _, _, _ = mhc.delayed_post_pre_flat_jax(
+            x_small,
+            jnp.ones((16, 2 * dim), dtype=jnp.bfloat16),
+            jnp.ones((16, 2, 1), dtype=jnp.float32),
+            jnp.ones((16, 2, 2), dtype=jnp.float32),
+            jnp.ones((2 * 4, 2 * dim), dtype=jnp.float32),
+            scale,
+            jnp.zeros(2 * 4, dtype=jnp.float32),
+            jnp.ones((16, 2), dtype=jnp.float32),
+            *constants,
+        )
+        assert f_m2.shape == (16, 2 * dim)
+        assert p_m2.shape == (16, 2, 1)
 
         # 3. delayed_post_pre_flat_jax fused Pallas path with mock_pallas_call
         def mock_fused_pallas_call(
@@ -1707,19 +1722,20 @@ class TestCommonMHCAndCacheDonate:
         monkeypatch.setattr(
             "jax.experimental.pallas.pallas_call", mock_fused_pallas_call
         )
-        f_fused, p_fused, c_fused, v_fused, np_fused = mhc.delayed_post_pre_flat_jax(
-            x_sub,
-            flat,
-            post_mix,
-            comb_mix,
-            fn_f32,
-            scale,
-            base,
-            prev,
-            *constants,
-        )
-        assert f_fused.shape == (tokens, mult * dim)
-        assert p_fused.shape == (tokens, mult, 1)
+        for t_p in (64, 256, 1024):
+            f_fused, p_fused, _, _, _ = mhc.delayed_post_pre_flat_jax(
+                jnp.ones((t_p, dim), dtype=jnp.bfloat16),
+                jnp.ones((t_p, mult * dim), dtype=jnp.bfloat16),
+                jnp.ones((t_p, mult, 1), dtype=jnp.float32),
+                jnp.ones((t_p, mult, mult), dtype=jnp.float32),
+                fn_f32,
+                scale,
+                base,
+                jnp.ones((t_p, mult), dtype=jnp.float32),
+                *constants,
+            )
+            assert f_fused.shape == (t_p, mult * dim)
+            assert p_fused.shape == (t_p, mult, 1)
 
     def test_initialize_delayed_mhc_and_dispatch(self, monkeypatch):
         monkeypatch.setattr(mhc, "_pre_op", None)
