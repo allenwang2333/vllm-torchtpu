@@ -321,18 +321,45 @@ class Glm5MKD:
     # ----------------------------------------------------------------- caches
 
     def bind_caches(self, runner) -> None:
-        stk = getattr(runner, "glm5_kv_stack", None) or {}
-        _need(set(stk) == {"nope", "rope", "idx"}, "the megakernel needs GLM5_MKD_STACK_C=1 "
-              f"(stacked nope / rope / idx caches); have {sorted(stk)}")
+        """Stacked caches (GLM5_MKD_STACK_C=1: runner.glm5_kv_stack) when the runner allocated them,
+        else the served per-layer caches (one operand per (kind, layer): a larger program, ~81k
+        bundles vs ~49k, but the stock path is untouched)."""
         cfg = self.cfg
-        nb = int(stk["nope"][0].shape[1])
-        ck = K.cache_kinds(cfg, nb)
+        stk = getattr(runner, "glm5_kv_stack", None) or {}
         caches = []
-        for kind, (layers, shape, dtype) in ck.items():
-            t, row_names = stk[kind]
-            _need(tuple(t.shape) == (len(layers),) + tuple(shape),
-                  f"stacked cache {kind}: {tuple(t.shape)} != {(len(layers),) + tuple(shape)}")
-            caches.append(t)
+        if set(stk) == {"nope", "rope", "idx"}:
+            nb = int(stk["nope"][0].shape[1])
+            ck = K.cache_kinds(cfg, nb)
+            for kind, (layers, shape, dtype) in ck.items():
+                t, _ = stk[kind]
+                _need(tuple(t.shape) == (len(layers),) + tuple(shape),
+                      f"stacked cache {kind}: {tuple(t.shape)} != {(len(layers),) + tuple(shape)}")
+                caches.append(t)
+            self.stack_c = frozenset({"nope", "rope", "idx"})
+            self.c_specs = [P(None, AXIS)] * 3
+        else:
+            _need(not stk, f"partially stacked caches {sorted(stk)}")
+            per = {}
+            for l in range(cfg.L):
+                sa = self.backbone.layers[l].self_attn
+                kv = _unwrap(_attn_module(sa).kv_cache)
+                _need(isinstance(kv, (tuple, list)) and len(kv) == 2,
+                      f"layer {l}: MLA cache is not the (nope, rope) SparseCore pair")
+                per[("nope", l)], per[("rope", l)] = kv[0], kv[1]
+                idx = getattr(sa, "indexer", None)
+                if idx is not None:
+                    per[("idx", l)] = _unwrap(idx.k_cache.kv_cache)
+            nb = int(per[("nope", 0)].shape[0])
+            ck = K.cache_kinds(cfg, nb)
+            for kind, (layers, shape, dtype) in ck.items():
+                for l in layers:
+                    t = per[(kind, l)]
+                    _need(tuple(t.shape) == tuple(shape), f"cache {kind}[{l}]: {tuple(t.shape)} != {shape}")
+                    caches.append(t)
+            self.stack_c = frozenset()
+            self.c_specs = [P(AXIS)] * len(caches)
+        logger.info("GLM-5.2 TPxDCP megakernel: %s caches, %d operands, %d blocks",
+                    "stacked" if self.stack_c else "per-layer", len(caches), nb)
         self.caches = caches
         self.nb = nb
         self._step = self._build_op()
@@ -340,7 +367,7 @@ class Glm5MKD:
     def _build_op(self):
         cfg = self.cfg
         build_kw = dict(nb=self.nb, max_pages=self.max_pages, bmax=cfg.TMAX,
-                        stack_w=self.stack_w, stack_c=frozenset({"nope", "rope", "idx"}))
+                        stack_w=self.stack_w, stack_c=self.stack_c)
         call, info = K.build(cfg, axis_name=AXIS, **build_kw)
         writer, winfo = K.build_writer(cfg, axis_name=AXIS, nb=self.nb, max_pages=self.max_pages,
                                        bmax=cfg.TMAX, stack_c=build_kw["stack_c"])
@@ -349,8 +376,8 @@ class Glm5MKD:
         self.info = info
         n_w, n_c = len(self.weights), len(self.caches)
         rep = P()
-        in_specs = (rep,) * 7 + (P(AXIS),) + tuple(self.w_specs) + (P(None, AXIS),) * n_c
-        out_specs = (P(AXIS),) + (P(None, AXIS),) * n_c
+        in_specs = (rep,) * 7 + (P(AXIS),) + tuple(self.w_specs) + tuple(self.c_specs)
+        out_specs = (P(AXIS),) + tuple(self.c_specs)
 
         def body(*a):
             scal, rmeta, qmeta, bt, rvec, h0, tab, smalls = a[:8]
