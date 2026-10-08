@@ -932,10 +932,10 @@ def test_onehot_threshold_explicit_env_skips_tpu_info(monkeypatch):
 def test_onehot_threshold_auto_is_one_below_real_blocks(monkeypatch, explicit):
     monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", explicit, raising=False)
     # 16 lanes x 2 cores x 16 subcores = 512-row block (v7x geometry) resolves
-    # to min(2 * 512 - 1, 768) = 768, and a 256-row block (v6e) resolves to
-    # min(2 * 256 - 1, 768) = 511. None and -1 both select auto.
+    # to min(4 * 512 - 1, 2048) = 2047, and a 256-row block (v6e) resolves to
+    # min(2 * 256 - 1, 2048) = 511. None and -1 both select auto.
     for sc_info, expected in (
-        (_fake_sc_info(16, 2, 16), 768),
+        (_fake_sc_info(16, 2, 16), 2047),
         (_fake_sc_info(8, 2, 16), 511),
     ):
         monkeypatch.setattr(
@@ -954,7 +954,32 @@ def test_onehot_threshold_auto_caps_oversized_block(monkeypatch):
         "get_tpu_info",
         lambda: _fake_tpu_info(_fake_sc_info(32, 2, 16)),
     )
-    assert fused_moe_gmm.resolve_onehot_permute_threshold() == 768
+    assert fused_moe_gmm.resolve_onehot_permute_threshold() == 2048
+
+
+def test_moe_gmm_tiling_selects_32_for_sparse_decode_and_keeps_default_otherwise(
+    monkeypatch,
+):
+    base_tiles = fused_moe_gmm.TileSizes(
+        tile_m=256, tile_k=512, tile_n=512, bucket_base=64
+    )
+    monkeypatch.setattr(
+        fused_moe_gmm, "calculate_tiling", lambda *args, **kwargs: base_tiles
+    )
+    decode_dims = types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=8)
+    assert fused_moe_gmm._moe_gmm_tiling(
+        decode_dims, None, None, 64 << 20, "silu"
+    ) == fused_moe_gmm.TileSizes(tile_m=32, tile_k=512, tile_n=512, bucket_base=32)
+    for non_matching_dims in (
+        types.SimpleNamespace(size_group=1, size_m=576, size_lhs_sublane=8),
+        types.SimpleNamespace(size_group=48, size_m=16, size_lhs_sublane=8),
+        types.SimpleNamespace(size_group=48, size_m=48 * 40 + 1, size_lhs_sublane=8),
+        types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=12),
+    ):
+        assert (
+            fused_moe_gmm._moe_gmm_tiling(non_matching_dims, None, None, 64 << 20, None)
+            == base_tiles
+        )
 
 
 def test_onehot_threshold_auto_zero_without_sparse_core(monkeypatch):

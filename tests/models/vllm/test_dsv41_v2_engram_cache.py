@@ -25,6 +25,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.common.engram import (
     _load_local_rows,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
+    SPARSECORE_MAX_POOL_BANKS,
     SPARSECORE_MAX_POOL_BYTES,
     reserve_rope_companion,
     uses_fp8_rope_companion,
@@ -637,11 +638,20 @@ def test_reserve_rope_companion_capping():
     avail_small = 10 << 30
     assert reserve_rope_companion(cfg_v41, avail_small) == avail_small * 4 // 5
 
-    # Over limit: 30 GiB * 4 // 5 = 24 GiB > SPARSECORE_MAX_POOL_BYTES
-    avail_large = 30 << 30
+    # Marginal overflow (20 GiB * 4 // 5 = 16 GiB < 1.2 * SPARSECORE_MAX_POOL_BYTES)
+    # stays clamped to 1 bank so OFFLOAD=0 does not split into 2 banks.
+    avail_offload0 = 20 << 30
+    assert reserve_rope_companion(cfg_v41, avail_offload0) == SPARSECORE_MAX_POOL_BYTES
+
+    # 2-bank range: 30 GiB * 4 // 5 = 24 GiB <= 2 * SPARSECORE_MAX_POOL_BYTES
+    avail_mid = 30 << 30
+    assert reserve_rope_companion(cfg_v41, avail_mid) == avail_mid * 4 // 5
+
+    # Over 2-bank limit: 50 GiB * 4 // 5 = 40 GiB > 2 * SPARSECORE_MAX_POOL_BYTES
+    avail_large = 50 << 30
     capped = reserve_rope_companion(cfg_v41, avail_large)
-    assert capped == SPARSECORE_MAX_POOL_BYTES
-    assert capped == (16 << 30) - (64 << 20)
+    assert capped == SPARSECORE_MAX_POOL_BANKS * SPARSECORE_MAX_POOL_BYTES
+    assert capped == 2 * ((16 << 30) - (64 << 20))
 
 
 @pytest.mark.parametrize(
