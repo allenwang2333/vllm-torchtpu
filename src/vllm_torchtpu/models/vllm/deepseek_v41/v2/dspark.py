@@ -35,11 +35,10 @@ from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41Mo
 from vllm_torchtpu.logger import init_logger
 
 from ..common.mhc import (
-    collapse,
     initialize_delayed_mhc,
     initialize_mhc_post,
+    pack_mix_weight,
     pack_mix_weights,
-    post,
 )
 from . import attention as v2_attn
 from .attention import (
@@ -332,7 +331,17 @@ class DSparkDeepseekV41Model(nn.Module):
         layers = list(self.layers)
         if not layers:
             return
-        if layers[0].hc_attn_fn.dtype == torch.float32:
+        first_layer = layers[0]
+        if first_layer.hc_attn_fn.dtype == torch.float32:
+            if first_layer.hc_attn_fn.shape[-1] == self.hc_mult * self.hidden_size:
+                broadcast_fn = (
+                    first_layer.hc_attn_fn.detach()
+                    .view(-1, self.hc_mult, self.hidden_size)
+                    .sum(dim=1)
+                )
+                if first_layer.hc_attn_fn.device.type == "tpu":
+                    broadcast_fn = pack_mix_weight(broadcast_fn)
+                first_layer.hc_attn_fn_broadcast = broadcast_fn
             pack_mix_weights(layers)
         self._finalize_context_kv_weights(layers)
 
@@ -412,7 +421,10 @@ class DSparkDeepseekV41Model(nn.Module):
             inputs_embeds = _embed_draft_blocks(
                 self.embed_input_ids, input_ids, self.query_block_size
             )
-        hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        if getattr(self.layers[0], "hc_attn_fn_broadcast", None) is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
         residual = post_mix = res_mix = pre_mix = None
         with stage_attention_cache_scope():
@@ -426,9 +438,48 @@ class DSparkDeepseekV41Model(nn.Module):
                     res_mix,
                     residual,
                 )
-        hidden_states = post(hidden_states, residual, post_mix, res_mix)
-        assert pre_mix is not None
-        return collapse(hidden_states, pre_mix)
+        assert (
+            residual is not None
+            and post_mix is not None
+            and res_mix is not None
+            and pre_mix is not None
+        )
+        return _post_and_collapse(hidden_states, residual, post_mix, res_mix, pre_mix)
+
+
+def _post_and_collapse(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    pre_mix: torch.Tensor,
+) -> torch.Tensor:
+    """Fuse the final draft layer's mHC post and stream collapse.
+
+    Slicing the flat ``[T, M * D]`` residual avoids the Pallas ``mhc_post``
+    64-token pad/trim + ``[T, M * D]`` HBM round-trip and XLA's ``[T, M, D]``
+    ``T(4, 128)`` relayout copy in ``collapse``, while matching ``_post_kernel``
+    and ``_collapse_flat`` accumulation order.
+    """
+    tokens, mult, dim = residual.shape
+    flat = residual.reshape(tokens, mult * dim)
+    x_f32 = x.reshape(tokens, dim).to(residual.dtype).float()
+    post_f32 = post_layer_mix.reshape(tokens, mult).float()
+    comb_f32 = comb_res_mix.reshape(tokens, mult, mult).float()
+    pre_f32 = pre_mix.reshape(tokens, mult).float()
+    streams = [flat[:, i * dim : (i + 1) * dim].float() for i in range(mult)]
+    terms = []
+    for j in range(mult):
+        acc = post_f32[:, j : j + 1] * x_f32
+        for i in range(mult):
+            acc = acc + comb_f32[:, i, j : j + 1] * streams[i]
+        terms.append(pre_f32[:, j : j + 1] * acc.to(residual.dtype).float())
+    value = (
+        (terms[0] + terms[2]) + (terms[1] + terms[3])
+        if mult == 4
+        else torch.stack(terms, dim=0).sum(dim=0)
+    )
+    return value.to(residual.dtype)
 
 
 class DSparkDeepseekV41ForCausalLM(nn.Module):

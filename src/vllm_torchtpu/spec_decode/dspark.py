@@ -259,16 +259,21 @@ class DSparkProposer(DFlashProposer):
         assert self._vocab_shard_offset is not None
         padded_num_reqs = ids_3d.shape[0]
         tp_size = self._sharded_markov_tp
-        logits = self.draft_model.compute_draft_logits_local(valid_hidden)
-        logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
-        mask = self._vocab_shard_mask
+        slot_major_hidden = (
+            valid_hidden.view(padded_num_reqs, block_size, valid_hidden.shape[-1])
+            .transpose(0, 1)
+            .contiguous()
+            .view(valid_hidden.shape)
+        )
+        logits = self.draft_model.compute_draft_logits_local(slot_major_hidden)
+        if self._vocab_shard_mask is not None:
+            logits = logits + self._vocab_shard_mask
+        logits_slot_major = logits.view(block_size, padded_num_reqs, logits.shape[-1])
 
         prev = ids_3d[:, 0]
         draft_tokens = []
         for i in range(sample_start, block_size):
-            scores = logits_3d[:, i] + self._markov_bias_local(prev)
-            if mask is not None:
-                scores = scores + mask
+            scores = logits_slot_major[i] + self._markov_bias_local(prev)
             packed = self._pack_local_candidate(scores, self._vocab_shard_offset)
             gathered = tensor_model_parallel_all_gather(packed, dim=0)
             step = self.draft_model.map_draft_to_target(

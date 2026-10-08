@@ -1669,3 +1669,87 @@ def test_dspark_fused_context_kv_unquantized_and_fp8_parity(
         torch.Size([2 * head_dim]),
     )
     assert len(quant_inserts) == 2
+
+
+def test_dspark_mhc_broadcast_and_post_and_collapse(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify first-layer mHC broadcast weight folding/packing, 2D forward entry,
+    and fused _post_and_collapse (mult=2 and mult=4) parity with mhc_post + collapse.
+    """
+    from vllm.model_executor.kernels.mhc.torch import mhc_post_torch
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.common.mhc import collapse
+
+    _patch_dspark_env(monkeypatch)
+    vllm_cfg = _make_dspark_vllm_config()
+    draft_lm = v2_dspark.DSparkDeepseekV41ForCausalLM(vllm_config=vllm_cfg)
+    model = draft_lm.model
+    model.embed_tokens = nn.Embedding(32, 16)
+
+    # 1. Verify _post_and_collapse matches collapse(mhc_post_torch(...)) for mult=2, 4
+    torch.manual_seed(7)
+    for mult in (2, 4):
+        tokens, dim = 6, 16
+        x = torch.randn(tokens, dim, dtype=torch.bfloat16)
+        residual = torch.randn(tokens, mult, dim, dtype=torch.bfloat16)
+        post_mix = torch.rand(tokens, mult, 1, dtype=torch.float32)
+        comb_mix = torch.rand(tokens, mult, mult, dtype=torch.float32)
+        pre_mix = torch.rand(tokens, mult, dtype=torch.float32)
+        ref = collapse(mhc_post_torch(x, residual, post_mix, comb_mix), pre_mix)
+        got = v2_dspark._post_and_collapse(x, residual, post_mix, comb_mix, pre_mix)
+        assert got.dtype == torch.bfloat16
+        assert torch.equal(got, ref)
+
+    # 2. Verify finalize_mhc_broadcast_weights populates hc_attn_fn_broadcast when
+    # hc_attn_fn has shape [mixes, hc_mult * hidden_size] (CPU path)
+    layer0 = model.layers[0]
+    w_full = torch.randn(8, model.hc_mult * model.hidden_size, dtype=torch.float32)
+    layer0.hc_attn_fn = nn.Parameter(w_full.clone())
+    model.finalize_mhc_broadcast_weights()
+    expected_bcast = w_full.view(8, model.hc_mult, model.hidden_size).sum(dim=1)
+    assert torch.allclose(layer0.hc_attn_fn_broadcast, expected_bcast)
+
+    # Verify forward passes 2D inputs_embeds into layer0 when broadcast weight is set
+    seen_layer0_ndims: list[int] = []
+    orig_layer0_fwd = layer0.forward
+
+    def spy_layer0_fwd(hidden_states, *args, **kwargs):
+        seen_layer0_ndims.append(hidden_states.ndim)
+        if hidden_states.ndim == 2:
+            hidden_states = hidden_states.unsqueeze(-2).repeat(1, model.hc_mult, 1)
+        return orig_layer0_fwd(hidden_states, *args, **kwargs)
+
+    monkeypatch.setattr(layer0, "forward", spy_layer0_fwd)
+    ids = torch.tensor([1, 2, 3, 4], dtype=torch.long)
+    pos = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    out_2d = model(ids, pos)
+    assert seen_layer0_ndims == [2]
+
+    layer0.hc_attn_fn_broadcast = None
+    out_3d = model(ids, pos)
+    assert seen_layer0_ndims == [2, 3]
+    assert torch.equal(out_2d, out_3d)
+
+    # 3. Verify TPU device branch packs hc_attn_fn_broadcast via pack_mix_weight
+    class _FakeTPUTensor:
+        dtype = torch.float32
+        shape = (8, model.hc_mult * model.hidden_size)
+        device = SimpleNamespace(type="tpu")
+
+        def detach(self):
+            return w_full
+
+    packed_calls: list[torch.Size] = []
+
+    def fake_pack_mix_weight(fn: torch.Tensor) -> torch.Tensor:
+        packed_calls.append(fn.shape)
+        return fn.to(torch.bfloat16)
+
+    monkeypatch.setattr(v2_dspark, "pack_mix_weight", fake_pack_mix_weight)
+    monkeypatch.setattr(v2_dspark, "pack_mix_weights", lambda layers: None)
+    layer0.__dict__.pop("_parameters", None)
+    object.__setattr__(layer0, "hc_attn_fn", _FakeTPUTensor())
+    model.finalize_mhc_broadcast_weights()
+    assert packed_calls == [torch.Size([8, model.hidden_size])]
+    assert layer0.hc_attn_fn_broadcast.dtype == torch.bfloat16
