@@ -328,9 +328,7 @@ def _pad_next_tokens_tpu_impl(
 _pad_next_tokens_tpu_compiled = _tpu_compile(_pad_next_tokens_tpu_impl)
 
 
-def _pad_next_tokens_tpu(
-    next_tokens_tpu: torch.Tensor, pad_right: int
-) -> torch.Tensor:
+def _pad_next_tokens_tpu(next_tokens_tpu: torch.Tensor, pad_right: int) -> torch.Tensor:
     fn = (
         _pad_next_tokens_tpu_compiled
         if next_tokens_tpu.device.type == "tpu"
@@ -1180,9 +1178,7 @@ class TPUModelRunner(GPUModelRunner):
         finished_req_ids = getattr(scheduler_output, "finished_req_ids", None)
         if finished_req_ids is None:
             finished_req_ids = set()
-        finished_sending, finished_recving = kv_connector.get_finished(
-            finished_req_ids
-        )
+        finished_sending, finished_recving = kv_connector.get_finished(finished_req_ids)
         invalid_block_ids = (
             kv_connector.get_block_ids_with_load_errors()
             if hasattr(kv_connector, "get_block_ids_with_load_errors")
@@ -1192,9 +1188,7 @@ class TPUModelRunner(GPUModelRunner):
             kv_connector.get_block_ids_with_load_errors_group_index()
             if (
                 invalid_block_ids
-                and hasattr(
-                    kv_connector, "get_block_ids_with_load_errors_group_index"
-                )
+                and hasattr(kv_connector, "get_block_ids_with_load_errors_group_index")
             )
             else None
         )
@@ -3603,9 +3597,7 @@ class TPUModelRunner(GPUModelRunner):
         if scheduler_output.total_num_scheduled_tokens == 0:
             if not self._dp_lockstep_enabled():
                 if not has_kv_transfer_group():
-                    return self._attach_dp_step_active_decode(
-                        EMPTY_MODEL_RUNNER_OUTPUT
-                    )
+                    return self._attach_dp_step_active_decode(EMPTY_MODEL_RUNNER_OUTPUT)
                 return self._attach_dp_step_active_decode(
                     self.kv_connector_no_forward(scheduler_output, self.vllm_config)
                 )
@@ -3614,7 +3606,8 @@ class TPUModelRunner(GPUModelRunner):
             # DPEngineCoreProc.run_busy_loop -> execute_dummy_batch() does not
             # issue a duplicate collective on the same tick.
             self._dp_step_executed_in_empty_execute_model = True
-            # Under DP lockstep, coordinate with all DP ranks to see if ANY rank has tokens/chunks.
+            # Under DP lockstep, coordinate with all DP ranks to see if ANY
+            # rank has tokens/chunks.
             self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
                 0,
                 0,
@@ -3624,13 +3617,12 @@ class TPUModelRunner(GPUModelRunner):
             self._dp_step_num_chunks = target_num_chunks
             if target_num_chunks == 0:
                 if not has_kv_transfer_group():
-                    return self._attach_dp_step_active_decode(
-                        EMPTY_MODEL_RUNNER_OUTPUT
-                    )
+                    return self._attach_dp_step_active_decode(EMPTY_MODEL_RUNNER_OUTPUT)
                 return self._attach_dp_step_active_decode(
                     self.kv_connector_no_forward(scheduler_output, self.vllm_config)
                 )
-            # Other DP ranks have chunks; run idle pairing on this rank to maintain collective lockstep.
+            # Other DP ranks have chunks; run idle pairing on this rank to
+            # maintain collective lockstep.
             if self._dp_target_bucket is None:
                 self._dp_target_bucket = (
                     self.num_tokens_paddings[0]
@@ -3640,8 +3632,8 @@ class TPUModelRunner(GPUModelRunner):
             if not has_kv_transfer_group():
                 self._run_dp_idle_pairing(self._dp_target_bucket, target_num_chunks)
                 return self._attach_dp_step_active_decode(EMPTY_MODEL_RUNNER_OUTPUT)
-            # RC35-A / RC38-A: Set up KV connector (bind metadata / start async H2D loads)
-            # and enqueue/record pending save fences BEFORE running dummy
+            # RC35-A / RC38-A: Set up KV connector (bind metadata / start async
+            # H2D loads) and enqueue/record pending save fences BEFORE running dummy
             # Target + DSpark forwards on this idle DP rank. That way:
             # 1. Async Raiden H2D loads overlap with the dummy forward execution.
             # 2. The save fence event is recorded ahead of the dummy forwards
@@ -6700,8 +6692,8 @@ class TPUModelRunner(GPUModelRunner):
             try:
                 dummy_zero = torch.empty((1,), dtype=torch.int32, device=self.device)
                 dummy_zero.zero_()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed prewarming dummy_zero: %s", e)
             if hasattr(self._async_drafter, "_zero_draft_lengths"):
                 for r in self.num_reqs_paddings:
                     self._async_drafter._zero_draft_lengths(int(r))

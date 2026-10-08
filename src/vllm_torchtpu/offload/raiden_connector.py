@@ -340,14 +340,21 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         the scheduler/shutdown loop from declaring push work drained before
         fenced store jobs are submitted to ``RaidenOffloadingManager``.
         """
-        return bool(self._fence_pending) or super().has_pending_push_work()
+        if bool(self._fence_pending):
+            return True
+        super_fn = getattr(super(), "has_pending_push_work", None)
+        if callable(super_fn):
+            return bool(super_fn())
+        return bool(getattr(self, "_pending_store_jobs", None))
 
     def reset_cache(self) -> None:
         """Cancel store jobs parked in ``_fence_pending`` on cache reset (RC35-B)."""
         for parked in self._fence_pending.values():
             self._raiden_manager.on_store_job_cancelled(parked.keys)
         self._fence_pending.clear()
-        super().reset_cache()
+        super_fn = getattr(super(), "reset_cache", None)
+        if callable(super_fn):
+            super_fn()
 
     def estimate_external_prefix_warmth(
         self, request: Request, num_computed_tokens: int

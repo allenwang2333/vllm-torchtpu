@@ -616,6 +616,7 @@ def test_dp_lockstep_sharded_off_without_lockstep():
     proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: False)
     assert proposer._dp_lockstep_sharded() is False
 
+
 def test_static_attn_and_dummy_inputs_avoid_eager_device_ops():
     proposer = _make_proposer(draft_tp=1)
     proposer.speculative_config.num_speculative_tokens = 5

@@ -20,6 +20,7 @@ try:
     from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 except ImportError:
     from tests.test_m3_raiden_dspark_ep32 import _install_vllm_test_stubs
+
     _install_vllm_test_stubs()
     from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 
@@ -336,4 +337,3 @@ def test_pack_and_pad_helpers_and_per_req_rejection_sampling():
         synthetic_mode=False,
     )
     assert torch.equal(out_per_req, out_expanded)
-

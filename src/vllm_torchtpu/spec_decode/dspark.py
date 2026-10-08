@@ -21,6 +21,9 @@ Gumbel-coupled sampling is not implemented.
 
 from __future__ import annotations
 
+import dataclasses
+from typing import Any
+
 import torch
 from vllm.config import VllmConfig
 
@@ -158,11 +161,9 @@ class DSparkProposer(DFlashProposer):
 # and Host-Dispatch Overlap Engine
 # ==============================================================================
 
-import dataclasses
-import math
-from typing import Any
-
-SPARSECORE_SRAM_CEILING_BYTES: int = 131072  # 128.0 KiB strictly per bank (Cloud TPU v7x)
+SPARSECORE_SRAM_CEILING_BYTES: int = (
+    131072  # 128.0 KiB strictly per bank (Cloud TPU v7x)
+)
 MAX_SAFE_TREE_BRANCHING_FACTOR: int = 4  # Clamped per #sc-sram-spec-arbiter-v404
 DEEPSEEK_V4_DEFAULT_K_MTP: int = 5  # DSpark K=5 MTP steps
 DEEPSEEK_V4_TOPK_CANDIDATES: int = 32  # Candidates per branch slot
@@ -174,7 +175,7 @@ MLA_TOTAL_KV_DIM: int = 576  # 512 + 64
 
 
 class SparseCoreSRAMSpillError(RuntimeError):
-    """Raised when an unclamped tree branching factor overflows SparseCore SRAM ceiling."""
+    """Raised when branching factor overflows SparseCore SRAM ceiling."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -252,13 +253,13 @@ class DSparkTreeArbiter:
 
         # 1. Buffer 1: Top-K Candidate Token IDs
         # Shape: [C, K_mtp, B, K_cand] INT32 -> C * K_mtp * B * K_cand * 4 bytes
-        b1_token_ids_bytes = (
-            concurrency * k_steps * b * DEEPSEEK_V4_TOPK_CANDIDATES * 4
-        )
+        b1_token_ids_bytes = concurrency * k_steps * b * DEEPSEEK_V4_TOPK_CANDIDATES * 4
 
         # 2. Buffer 2: Cumulative & Branch Log-Probabilities
-        # Target verification probabilities: [C, K, B, K_cand] FP32 = C * K * B * K_cand * 4
-        # Draft branch probabilities & cumulative log-probs: 2 * [C, K, B] FP32 = 2 * C * K * B * 4
+        # Target verification probabilities: [C, K, B, K_cand] FP32
+        # = C * K * B * K_cand * 4
+        # Draft branch probabilities & cumulative log-probs:
+        # 2 * [C, K, B] FP32 = 2 * C * K * B * 4
         b2_log_probs_bytes = (
             concurrency * k_steps * b * DEEPSEEK_V4_TOPK_CANDIDATES * 4
             + 2 * concurrency * k_steps * b * 4
@@ -305,13 +306,15 @@ class DSparkTreeArbiter:
 
         if not fits_in_sram and not enforce_clamp:
             raise SparseCoreSRAMSpillError(
-                f"SparseCore SRAM ceiling overflow: requested B={branching_factor} requires "
-                f"{total_bytes} bytes ({total_kib:.2f} KiB), which strictly exceeds the "
-                f"128.0 KiB ({SPARSECORE_SRAM_CEILING_BYTES} bytes) ceiling. "
+                f"SparseCore SRAM ceiling overflow: requested B={branching_factor} "
+                f"requires {total_bytes} bytes ({total_kib:.2f} KiB), which strictly "
+                f"exceeds 128.0 KiB ({SPARSECORE_SRAM_CEILING_BYTES} B) ceiling. "
                 "Hardware trap #sc-sram-spec-arbiter-v404 requires B <= 4."
             )
 
-        passed_invariants = fits_in_sram and (clamped_b <= MAX_SAFE_TREE_BRANCHING_FACTOR)
+        passed_invariants = fits_in_sram and (
+            clamped_b <= MAX_SAFE_TREE_BRANCHING_FACTOR
+        )
 
         return DSparkTreeArbiterResult(
             requested_branching_factor=branching_factor,
@@ -352,7 +355,7 @@ class DSparkTreeArbiter:
             "branching_factor": b,
             "total_nodes": total_nodes,
             "adjacency_mask": adj_mask,
-            "max_paths": b ** k_steps,
+            "max_paths": b**k_steps,
         }
 
     @staticmethod
@@ -361,7 +364,7 @@ class DSparkTreeArbiter:
         draft_logprobs: torch.Tensor,
         threshold: float = 0.85,
     ) -> tuple[torch.Tensor, int]:
-        """Vectorized rejection verification of draft tree paths against target logits."""
+        """Vectorized verification of draft tree paths against target logits."""
         ratio = torch.exp(target_logprobs - draft_logprobs)
         accepted = ratio >= threshold
         accepted_count = int(accepted.sum().item())
@@ -372,7 +375,7 @@ class DSparkHostDispatchOverlapManager:
     """Non-blocking host dispatch overlap manager for DSpark decoding.
 
     Pipelining hides host Python/Ray/gRPC scheduling delay behind TPU forward execution.
-    Eliminates all blocking .item()/.cpu() synchronization calls in the inner decode loop (TRAP25).
+    Eliminates blocking .item()/.cpu() synchronization calls in decode loop (TRAP25).
     """
 
     def __init__(
@@ -428,10 +431,10 @@ class Stage3CFP8KVCacheEngine:
     """Stage 3C FP8 E4M3 KV Cache Quantization, Dequantization, & TPOT Engine.
 
     For DeepSeek-V4 MLA (Multi-Head Latent Attention):
-      - Quantizes the 512-dim compressed latent c_t to torch.float8_e4m3fn (or packed uint8)
+      - Quantizes 512-dim compressed latent c_t to torch.float8_e4m3fn
         with 64-lane UE8M0 block scaling.
       - Retains the 64-dim decoupled RoPE head in torch.bfloat16.
-      - Achieves exact 2.0x reduction in compressed KV HBM bandwidth (1,024 -> 512 bytes/token).
+      - Achieves 2.0x reduction in KV HBM bandwidth (1,024 -> 512 bytes/token).
       - Drives Decode median TPOT strictly below 18.0 ms.
     """
 
@@ -444,7 +447,7 @@ class Stage3CFP8KVCacheEngine:
         kv_latent: torch.Tensor,
         kv_rope: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Quantize MLA 512-dim compressed latent to FP8 E4M3 with 64-lane UE8M0 block scaling.
+        """Quantize MLA 512-dim compressed latent to FP8 E4M3 with UE8M0 scaling.
 
         Returns (latent_fp8, kv_rope_bf16, scale).
         """
@@ -488,7 +491,7 @@ class Stage3CFP8KVCacheEngine:
         scale: torch.Tensor,
         out_dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
-        """Dequantize FP8 latent and concatenate with RoPE head to reconstruct MLA KV tensor."""
+        """Dequantize FP8 latent and concatenate with RoPE to reconstruct MLA KV."""
         orig_shape = latent_fp8.shape
         num_blocks = orig_shape[-1] // cls.BLOCK_SIZE
         latent_f32 = latent_fp8.to(torch.float32).view(-1, num_blocks, cls.BLOCK_SIZE)
@@ -509,14 +512,14 @@ class Stage3CFP8KVCacheEngine:
         bf16_latent_bytes = MLA_COMPRESSED_KV_DIM * 2  # 1,024 bytes
         bf16_total_mb = (
             batch_size * seq_len * num_layers * bf16_bytes_per_token_layer
-        ) / (1024 ** 2)
+        ) / (1024**2)
 
-        # FP8 E4M3: (512 latent * 1 byte + 64 rope * 2 bytes + 4 bytes scale) = 644 bytes
+        # FP8 E4M3: (512 latent * 1B + 64 rope * 2B + 4B scale) = 644 bytes
         fp8_bytes_per_token_layer = MLA_COMPRESSED_KV_DIM * 1 + MLA_ROPE_DIM * 2 + 4
         fp8_latent_bytes = MLA_COMPRESSED_KV_DIM * 1  # 512 bytes
         fp8_total_mb = (
             batch_size * seq_len * num_layers * fp8_bytes_per_token_layer
-        ) / (1024 ** 2)
+        ) / (1024**2)
 
         latent_reduction_ratio = bf16_latent_bytes / fp8_latent_bytes  # Exactly 2.0x
         total_page_reduction_ratio = (
@@ -544,15 +547,19 @@ class Stage3CFP8KVCacheEngine:
         k_mtp: int = DEEPSEEK_V4_DEFAULT_K_MTP,
         acceptance_rate: float = 0.72,
     ) -> DecodeTPOTModelResult:
-        """Evaluate Stage 3C empirical step time and TPOT against the < 18.0 ms target."""
+        """Evaluate Stage 3C empirical step time and TPOT against target."""
         # Effective tokens verified and emitted per speculative forward pass:
         effective_tokens = 1.0 + k_mtp * acceptance_rate  # 1 + 5 * 0.72 = 4.60 tokens
 
         # Step time decomposition (based on Cloud TPU v7x 2x2x2 empirical roofline):
         if concurrency <= 16:
             baseline_step_ms = 98.4
-            fp8_saving_ms = 16.1  # 2.0x KV HBM bandwidth cut saves 16.1 ms in attention phase
-            host_overlap_saving_ms = 4.2  # Pipelined dispatch hides host scheduling overhead
+            fp8_saving_ms = (
+                16.1  # 2.0x KV HBM bandwidth cut saves 16.1 ms in attention phase
+            )
+            host_overlap_saving_ms = (
+                4.2  # Pipelined dispatch hides host scheduling overhead
+            )
             fused_attn_saving_ms = 20.0  # Pallas MLA fused epilogue
         else:
             baseline_step_ms = 126.8
@@ -587,12 +594,12 @@ class Stage3CFP8KVCacheEngine:
 
 
 def run_stage3c_gate7b_verification(verbose: bool = False) -> dict[str, Any]:
-    """Execute Gate 7B numerical parity check across FP8 E4M3 KV cache and DSpark tree arbiter.
+    """Execute Gate 7B numerical parity check across FP8 KV cache & DSpark arbiter.
 
     Admissibility thresholds:
       - Cosine Similarity >= 0.99999
       - SQNR >= 45.0 dB
-    Includes negative controls proving that corrupted scale / unscaled states strictly fail.
+    Includes negative controls proving corrupted scale / unscaled states fail.
     """
     import numpy as np
 
@@ -602,7 +609,7 @@ def run_stage3c_gate7b_verification(verbose: bool = False) -> dict[str, Any]:
     kv_latent = torch.randn((B, S, head_dim), dtype=torch.bfloat16)
     kv_rope = torch.randn((B, S, rope_dim), dtype=torch.bfloat16)
 
-    # 1. Candidate: Stage 3C Partitioned TP=2 FP8 E4M3 KV Cache with float32 accumulation
+    # 1. Candidate: Stage 3C Partitioned TP=2 FP8 KV Cache with f32 accumulation
     # Quantize to block-scaled FP8 E4M3
     latent_fp8, rope_bf16, scale = Stage3CFP8KVCacheEngine.quantize_mla_kv_to_fp8(
         kv_latent, kv_rope
@@ -627,17 +634,23 @@ def run_stage3c_gate7b_verification(verbose: bool = False) -> dict[str, Any]:
 
     # Dequantize each shard independently
     cand_latent0 = (
-        shard0_fp8.to(torch.float32).view(-1, half_blocks, Stage3CFP8KVCacheEngine.BLOCK_SIZE)
+        shard0_fp8.to(torch.float32).view(
+            -1, half_blocks, Stage3CFP8KVCacheEngine.BLOCK_SIZE
+        )
         * shard0_scale.view(-1, half_blocks, 1).to(torch.float32)
     ).view(B, S, head_dim // 2)
 
     cand_latent1 = (
-        shard1_fp8.to(torch.float32).view(-1, half_blocks, Stage3CFP8KVCacheEngine.BLOCK_SIZE)
+        shard1_fp8.to(torch.float32).view(
+            -1, half_blocks, Stage3CFP8KVCacheEngine.BLOCK_SIZE
+        )
         * shard1_scale.view(-1, half_blocks, 1).to(torch.float32)
     ).view(B, S, head_dim // 2)
 
     # Float32 AllReduce / concatenation (TRAP24 compliant)
-    cand_latent_merged = torch.cat([cand_latent0, cand_latent1], dim=-1).to(torch.bfloat16)
+    cand_latent_merged = torch.cat([cand_latent0, cand_latent1], dim=-1).to(
+        torch.bfloat16
+    )
     cand_rope_merged = torch.cat([shard0_rope, shard1_rope], dim=-1).to(torch.bfloat16)
     cand_dequant = torch.cat([cand_latent_merged, cand_rope_merged], dim=-1)
 
@@ -744,10 +757,8 @@ def run_stage3c_gate7b_verification(verbose: bool = False) -> dict[str, Any]:
     }
 
     if verbose:
-        print("=== Stage 3C Gate 7B Verification Results ===")
+        logger.info("=== Stage 3C Gate 7B Verification Results ===")
         for k, v in result.items():
-            print(f"  {k}: {v}")
+            logger.info("  %s: %s", k, v)
 
     return result
-
-

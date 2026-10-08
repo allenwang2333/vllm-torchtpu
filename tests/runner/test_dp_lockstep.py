@@ -26,7 +26,7 @@ ANALYTIC / MICROBENCHMARK PROJECTION (NOT E2E PHYSICAL VLLM RUN)
 from __future__ import annotations
 
 import collections
-import contextlib
+import logging
 import os
 import sys
 from types import SimpleNamespace
@@ -44,8 +44,7 @@ for _cand_path in (
     if os.path.isdir(_cand_path) and _cand_path not in sys.path:
         sys.path.insert(0, _cand_path)
 
-import torch
-import torch.nn.functional as F
+import torch  # noqa: E402
 
 try:
     import vllm  # noqa: F401
@@ -55,9 +54,9 @@ except ImportError:
     _ensure_vllm_offload_stubs()
 
 # Ensure worker_base stub exists when running in lightweight CPU test env
-import inspect as _inspect
-import sys as _sys
-import types as _types
+import inspect as _inspect  # noqa: E402
+import sys as _sys  # noqa: E402
+import types as _types  # noqa: E402
 
 if "vllm.v1.worker.worker_base" not in _sys.modules:
     _wb_mod = _types.ModuleType("vllm.v1.worker.worker_base")
@@ -85,9 +84,10 @@ if "torch_tpu._internal.profiler" not in _sys.modules:
 try:
     from vllm.v1.core.sched.output import SchedulerOutput as _SchedOut
 
-    if not hasattr(_SchedOut, "make_empty") or getattr(
-        _SchedOut.make_empty(), "total_num_scheduled_tokens", None
-    ) != 0:
+    if (
+        not hasattr(_SchedOut, "make_empty")
+        or getattr(_SchedOut.make_empty(), "total_num_scheduled_tokens", None) != 0
+    ):
         _SchedOut.make_empty = staticmethod(
             lambda: SimpleNamespace(
                 total_num_scheduled_tokens=0,
@@ -98,8 +98,9 @@ try:
                 kv_cache_block_copies=None,
             )
         )
-except Exception:
-    pass
+except Exception as e:
+    logging.debug("make_empty stub error: %s", e)
+
 
 def _disable_use_tpu_on_cpu_stub() -> None:
     try:
@@ -178,12 +179,12 @@ def _make_minimal_runner_and_worker(
     return runner, worker
 
 
-def test_rc39a_empty_execute_model_followed_by_execute_dummy_batch_skips_duplicate_collective():
+def test_rc39a_empty_execute_model_followed_by_execute_dummy_batch_skips_duplicate_collective():  # noqa: E501
     """Verify RC39-A: When `execute_model(total_num_scheduled_tokens == 0)` runs
     under `step_with_batch_queue` (which returns `model_executed = False`) and
     `DPEngineCoreProc.run_busy_loop` immediately calls `execute_dummy_batch()`
     on the same scheduler tick, `_dp_coordinated_step` and `_run_dp_idle_pairing`
-    execute EXACTLY ONCE on that tick, and the next genuinely idle tick (`has_requests() == False`)
+    execute EXACTLY ONCE on that tick, and the next idle tick
     executes `execute_dummy_batch()` normally.
     """
     runner, worker = _make_minimal_runner_and_worker(
@@ -200,12 +201,15 @@ def test_rc39a_empty_execute_model_followed_by_execute_dummy_batch_skips_duplica
         kv_cache_block_copies=None,
     )
 
-    with patch(
-        "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group",
-        return_value=False,
-    ), patch(
-        "vllm_torchtpu.worker.tpu_worker.has_kv_transfer_group",
-        return_value=False,
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group",
+            return_value=False,
+        ),
+        patch(
+            "vllm_torchtpu.worker.tpu_worker.has_kv_transfer_group",
+            return_value=False,
+        ),
     ):
         # Tick 1: step_with_batch_queue calls execute_model(0), then run_busy_loop
         # sees executed=False and calls worker.execute_dummy_batch().
@@ -219,12 +223,12 @@ def test_rc39a_empty_execute_model_followed_by_execute_dummy_batch_skips_duplica
         # Same Tick 1: run_busy_loop calls worker.execute_dummy_batch()
         worker.execute_dummy_batch()
         assert runner._dp_step_executed_in_empty_execute_model is False
-        # Must NOT have called _dp_coordinated_step or _run_dp_idle_pairing a second time!
+        # Must NOT call _dp_coordinated_step or _run_dp_idle_pairing again!
         assert runner._dp_coordinated_step.call_count == 1
         assert runner._run_dp_idle_pairing.call_count == 1
 
-        # Tick 2: Rank now has has_requests() == False (draining or idle), so
-        # execute_model is NOT called; run_busy_loop calls execute_dummy_batch() directly.
+        # Tick 2: Rank now has has_requests() == False, so execute_model
+        # is NOT called; run_busy_loop calls execute_dummy_batch() directly.
         worker.execute_dummy_batch()
         assert runner._dp_step_executed_in_empty_execute_model is False
         assert runner._dp_coordinated_step.call_count == 2
@@ -272,12 +276,15 @@ def test_rc39a_active_step_and_warmup_cleanup_reset_guard_and_raiden_fence():
     # Now verify execute_dummy_batch() after warmup cleanup runs normally AND
     # invokes record_pending_fences() when has_kv_transfer_group() is True.
     fake_kv_connector = SimpleNamespace(record_pending_fences=MagicMock())
-    with patch(
-        "vllm_torchtpu.worker.tpu_worker.has_kv_transfer_group",
-        return_value=True,
-    ), patch(
-        "vllm_torchtpu.worker.tpu_worker.get_kv_transfer_group",
-        return_value=fake_kv_connector,
+    with (
+        patch(
+            "vllm_torchtpu.worker.tpu_worker.has_kv_transfer_group",
+            return_value=True,
+        ),
+        patch(
+            "vllm_torchtpu.worker.tpu_worker.get_kv_transfer_group",
+            return_value=fake_kv_connector,
+        ),
     ):
         worker.execute_dummy_batch()
         assert runner._dp_coordinated_step.call_count == 2
@@ -511,7 +518,9 @@ def test_rc39b_dflash_layout_draft_block_zero_scatter_and_negative_control(monke
     proposer._cpu_draft_input_ids = np.full(512 * 8, 999, dtype=np.int32)
 
     def _forbid_scatter(*args, **kwargs):
-        raise AssertionError("RC39-B violation: torch.Tensor.scatter_ must not be called")
+        raise AssertionError(
+            "RC39-B violation: torch.Tensor.scatter_ must not be called"
+        )
 
     monkeypatch.setattr(torch.Tensor, "scatter_", _forbid_scatter)
 
@@ -524,16 +533,40 @@ def test_rc39b_dflash_layout_draft_block_zero_scatter_and_negative_control(monke
         base_tokens, base_pos, block_size=block_size, padded_len=16, mask_token_id=999
     )
     assert input_ids.tolist() == [
-        101, 999, 999, 999,
-        202, 999, 999, 999,
-        303, 999, 999, 999,
-        999, 999, 999, 999,
+        101,
+        999,
+        999,
+        999,
+        202,
+        999,
+        999,
+        999,
+        303,
+        999,
+        999,
+        999,
+        999,
+        999,
+        999,
+        999,
     ]
     assert positions.tolist() == [
-        10, 11, 12, 13,
-        40, 41, 42, 43,
-        4094, 4095, 4095, 4095,
-        0, 1, 2, 3,
+        10,
+        11,
+        12,
+        13,
+        40,
+        41,
+        42,
+        43,
+        4094,
+        4095,
+        4095,
+        4095,
+        0,
+        1,
+        2,
+        3,
     ]
     assert seq_lens.tolist() == [14, 44, 4096, 4]
 
@@ -699,7 +732,7 @@ def test_rc39c_dspark_proposer_init_via_tpu_model_runner_and_query_block_size():
     assert not hasattr(bare_dspark, "sample_from_anchor")
     assert bare_dspark._query_block_size(5) == 5
 
-    # Gate 4 Negative Control: Direct attribute access on bare instance raises AttributeError
+    # Gate 4 Negative Control: Direct access on bare instance raises AttributeError
     with pytest.raises(AttributeError, match="sample_from_anchor"):
         _ = 5 if bare_dspark.sample_from_anchor else 6
 

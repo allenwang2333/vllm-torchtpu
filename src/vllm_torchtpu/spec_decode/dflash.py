@@ -644,9 +644,7 @@ class DFlashProposer:
 
         return input_ids, positions, seq_lens
 
-    def _get_num_reqs_tpu(
-        self, num_reqs: int, device: torch.device
-    ) -> torch.Tensor:
+    def _get_num_reqs_tpu(self, num_reqs: int, device: torch.device) -> torch.Tensor:
         """Cached 1-element int32 device tensor for `num_reqs` so compiled
         input builders trace a static `(1,)` tensor shape instead of
         recompiling per Python `int` `num_reqs` (RC39-B)."""
@@ -672,9 +670,9 @@ class DFlashProposer:
         )
         zeros = self._zero_draft_lengths_cache.get(padded_num_reqs)
         if zeros is None:
-            zeros = torch.zeros(
-                padded_num_reqs, dtype=torch.int32
-            ).to(self.runner.device)
+            zeros = torch.zeros(padded_num_reqs, dtype=torch.int32).to(
+                self.runner.device
+            )
             self._zero_draft_lengths_cache[padded_num_reqs] = zeros
         return zeros
 
@@ -713,7 +711,7 @@ class DFlashProposer:
     def _record_chunk_draft_kv_tokens(
         self, chunk: DraftChunkInputs, positions: torch.Tensor
     ) -> None:
-        """Record newly verified context tokens per request for cold-handoff SWA tracking."""
+        """Record context tokens per request for cold-handoff SWA tracking."""
         if not is_target_only_kv_enabled(self.vllm_config) and not (
             self._req_draft_cold_handoff and any(self._req_draft_cold_handoff.values())
         ):
@@ -724,10 +722,16 @@ class DFlashProposer:
             return
         attn_ctx = getattr(chunk, "attn_ctx", None)
         qsl = getattr(attn_ctx, "query_start_loc", None)
-        if not isinstance(qsl, torch.Tensor) or qsl.numel() < 2:
+        if qsl is None or not isinstance(qsl, torch.Tensor):
+            return
+        if qsl.numel() < 2:
             return
         qsl_cpu = qsl.detach().cpu().tolist()
-        pos_cpu = positions.detach().cpu().tolist() if isinstance(positions, torch.Tensor) else []
+        pos_cpu = (
+            positions.detach().cpu().tolist()
+            if isinstance(positions, torch.Tensor)
+            else []
+        )
         num_reqs = min(int(chunk.num_reqs), len(qsl_cpu) - 1)
         for i in range(num_reqs):
             rid_idx = int(chunk.start_index) + i
@@ -740,9 +744,7 @@ class DFlashProposer:
             q_end = int(qsl_cpu[i + 1])
             num_new = max(0, q_end - q_start)
             start_pos = int(pos_cpu[q_start]) if q_start < len(pos_cpu) else 0
-            self.record_request_draft_kv_tokens(
-                rid, num_new, start_pos=start_pos
-            )
+            self.record_request_draft_kv_tokens(rid, num_new, start_pos=start_pos)
 
     def _update_draft_kv_cache_from_target(self, chunk) -> None:
         """
@@ -975,30 +977,23 @@ class DFlashProposer:
             embed_weight.dtype
             if embed_weight is not None
             else (
-                getattr(self.vllm_config.model_config, "dtype", None)
-                or torch.bfloat16
+                getattr(self.vllm_config.model_config, "dtype", None) or torch.bfloat16
             )
         )
         dummy_hidden = [
-            torch.zeros((num_tokens, target_hidden), dtype=dtype).to(
-                runner.device
-            )
+            torch.zeros((num_tokens, target_hidden), dtype=dtype).to(runner.device)
             for _ in self._target_layer_ids
         ]
-        dummy_positions = torch.zeros(
-            num_tokens, dtype=torch.int32
-        ).to(runner.device)
+        dummy_positions = torch.zeros(num_tokens, dtype=torch.int32).to(runner.device)
 
-        block_tables = torch.zeros(
-            (num_reqs * num_blocks,), dtype=torch.int32
-        ).to(runner.device)
+        block_tables = torch.zeros((num_reqs * num_blocks,), dtype=torch.int32).to(
+            runner.device
+        )
         seq_lens_cpu = torch.zeros((num_reqs,), dtype=torch.int32)
         seq_lens_cpu[0] = num_tokens
         seq_lens = seq_lens_cpu.to(runner.device)
 
-        query_start_loc_cpu = torch.full(
-            (num_reqs + 1,), num_tokens, dtype=torch.int32
-        )
+        query_start_loc_cpu = torch.full((num_reqs + 1,), num_tokens, dtype=torch.int32)
         query_start_loc_cpu[0] = 0
         query_start_loc = query_start_loc_cpu.to(runner.device)
 
@@ -1498,7 +1493,7 @@ class DFlashProposer:
         base_tokens = next_tokens_device_padded.gather(
             1, last_valid_col.unsqueeze(1)
         ).squeeze(1)
-        # Replace invalid_token_id (-1) and padding rows (>= num_reqs) with mask_token_id.
+        # Replace invalid_token_id (-1) and padding rows with mask_token_id.
         base_tokens = torch.where(
             (base_tokens == invalid_token_id) | (valid_mask.squeeze(1) == 0),
             torch.full_like(base_tokens, mask_token_id),

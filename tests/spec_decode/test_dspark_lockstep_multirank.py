@@ -14,14 +14,16 @@
 """Tests for RC34: DSpark MTP DP-EP Lockstep Collective Synchronization.
 
 Verifies:
-1. `model_has_moe` correctly identifies DSparkDeepseekV4Model and DSparkDeepseekV4ForCausalLM
+1. `model_has_moe` correctly identifies DSparkDeepseekV4Model and
+   DSparkDeepseekV4ForCausalLM
    even without vLLM's MixtureOfExperts base interface.
 2. `DFlashProposer._dp_lockstep_sharded()` returns True for DSpark models with MoE.
 3. Zero-token idle ranks execute `_run_dp_idle_pairing` during DP lockstep instead of
    returning early and desynchronizing collectives.
 4. Multirank lockstep phase alignment: all 16 DP ranks emit the identical sequence of
    target and draft collective phases when scheduled chunk counts vary (0, 1, 2 chunks).
-5. Elimination of device-side `tt_jit_zero_` allocations in all spec decode helper paths.
+5. Elimination of device-side `tt_jit_zero_` allocations in all spec
+   decode helper paths.
 """
 
 import os
@@ -29,26 +31,31 @@ import sys
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import MagicMock, patch
-import numpy as np
+
 import pytest
 import torch
-import torch.nn as nn
 import torch.nn as nn
 
 for _cand_path in (
     os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "src")),
     os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")),
-        ):
+):
     if os.path.isdir(_cand_path) and _cand_path not in sys.path:
         sys.path.insert(0, _cand_path)
 
 
 def _install_vllm_test_stubs():
-    import collections, contextlib, dataclasses, importlib.abc, importlib.machinery, logging, types
-    from unittest.mock import MagicMock
+    import contextlib
+    import dataclasses
+    import importlib.abc
+    import importlib.machinery
+    import logging
+    import types
+
     try:
-        import vllm  # noqa: F401
         import torch_tpu  # noqa: F401
+        import vllm  # noqa: F401
+
         return
     except ImportError:
         pass
@@ -89,11 +96,24 @@ def _install_vllm_test_stubs():
             return val
 
     class _AutoStubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-        PREFIXES = ("vllm", "torch_tpu", "einops", "compressed_tensors", "transformers", "safetensors", "portpicker", "requests")
+        PREFIXES = (
+            "vllm",
+            "torch_tpu",
+            "einops",
+            "compressed_tensors",
+            "transformers",
+            "safetensors",
+            "portpicker",
+            "requests",
+        )
+
         def find_spec(self, fullname, path, target=None):
-            if any(fullname == p or fullname.startswith(p + ".") for p in self.PREFIXES):
+            if any(
+                fullname == p or fullname.startswith(p + ".") for p in self.PREFIXES
+            ):
                 return importlib.machinery.ModuleSpec(fullname, self, is_package=True)
             return None
+
         def create_module(self, spec):
             if spec.name in sys.modules:
                 return sys.modules[spec.name]
@@ -104,18 +124,32 @@ def _install_vllm_test_stubs():
                 if parent_name in sys.modules:
                     setattr(sys.modules[parent_name], child_attr, mod)
             return mod
+
         def exec_module(self, module):
             pass
 
     sys.meta_path.insert(0, _AutoStubFinder())
     stub_modules = [
-        "torch_tpu", "vllm", "vllm.envs", "vllm.logger", "vllm.config",
-        "vllm.compilation", "vllm.compilation.backends", "vllm.distributed",
-        "vllm.distributed.parallel_state", "vllm.forward_context",
-        "vllm.v1", "vllm.v1.outputs", "vllm.v1.core", "vllm.v1.core.sched",
-        "vllm.v1.core.sched.async_scheduler", "vllm.v1.core.sched.interface",
-        "vllm.v1.core.sched.output", "vllm.v1.core.sched.request_queue",
-        "vllm.v1.worker", "vllm.v1.worker.gpu_model_runner",
+        "torch_tpu",
+        "vllm",
+        "vllm.envs",
+        "vllm.logger",
+        "vllm.config",
+        "vllm.compilation",
+        "vllm.compilation.backends",
+        "vllm.distributed",
+        "vllm.distributed.parallel_state",
+        "vllm.forward_context",
+        "vllm.v1",
+        "vllm.v1.outputs",
+        "vllm.v1.core",
+        "vllm.v1.core.sched",
+        "vllm.v1.core.sched.async_scheduler",
+        "vllm.v1.core.sched.interface",
+        "vllm.v1.core.sched.output",
+        "vllm.v1.core.sched.request_queue",
+        "vllm.v1.worker",
+        "vllm.v1.worker.gpu_model_runner",
     ]
     for mod_name in stub_modules:
         if mod_name not in sys.modules:
@@ -124,6 +158,7 @@ def _install_vllm_test_stubs():
     @contextlib.contextmanager
     def _noop_cm(*args, **kwargs):
         yield
+
     sys.modules["vllm.compilation.backends"].set_model_tag = _noop_cm
     sys.modules["vllm.config"].set_current_vllm_config = _noop_cm
 
@@ -173,12 +208,14 @@ def _install_vllm_test_stubs():
     try:
         import torch
         import torch._dynamo
+
         if "tpu" not in torch._dynamo.list_backends():
+
             @torch._dynamo.register_backend(name="tpu")
             def _dummy_tpu_backend(model, inputs):
                 return model
-    except Exception:
-        pass
+    except Exception as e:
+        logging.debug("torch._dynamo backend setup skipped: %s", e)
 
     class _GPUModelRunner:
         def __init__(self, *args, **kwargs):
@@ -187,15 +224,20 @@ def _install_vllm_test_stubs():
     sys.modules["vllm.v1.worker.gpu_model_runner"].GPUModelRunner = _GPUModelRunner
     sys.modules["vllm.logger"].init_logger = lambda name: logging.getLogger(name)
 
+
 _install_vllm_test_stubs()
 
 
-from vllm_torchtpu.spec_decode.dflash import DFlashProposer
-from vllm_torchtpu.spec_decode.utils import DraftChunkInputs, model_has_moe
+from vllm_torchtpu.spec_decode.dflash import DFlashProposer  # noqa: E402
+from vllm_torchtpu.spec_decode.utils import (  # noqa: E402
+    DraftChunkInputs,
+    model_has_moe,
+)
 
 
 def test_dspark_model_has_moe():
-    """Verify DSpark models are recognized as MoE without depending on isinstance(MixtureOfExperts)."""
+    """Verify DSpark models are recognized as MoE without depending on
+    isinstance(MixtureOfExperts)."""
     assert model_has_moe(None) is False
 
     # Plain dense module
@@ -228,7 +270,9 @@ def test_dspark_model_has_moe():
     assert model_has_moe(container_with_moe) is True
 
 
-def _make_lockstep_proposer(has_moe: bool = True, draft_tp: int = 1) -> tuple[DFlashProposer, mock.MagicMock]:
+def _make_lockstep_proposer(
+    has_moe: bool = True, draft_tp: int = 1
+) -> tuple[DFlashProposer, mock.MagicMock]:
     hf_config_mock = mock.MagicMock()
     hf_config_mock.to_dict.return_value = {
         "dflash_config": {
@@ -288,7 +332,8 @@ def _make_lockstep_proposer(has_moe: bool = True, draft_tp: int = 1) -> tuple[DF
 
 
 def test_dspark_dp_lockstep_sharded_detection():
-    """Verify _dp_lockstep_sharded enables lockstep for MoE draft models even when draft_tp=1."""
+    """Verify _dp_lockstep_sharded enables lockstep for MoE draft models even
+    when draft_tp=1."""
     proposer, _ = _make_lockstep_proposer(has_moe=True, draft_tp=1)
     assert proposer._dp_lockstep_sharded() is True
 
@@ -314,7 +359,8 @@ def test_zero_device_tt_jit_zero_in_draft_helpers():
 
 
 def test_16rank_lockstep_collective_symmetry():
-    """Simulate all 16 DP ranks in a heterogeneous step (busy, partially busy, and idle ranks).
+    """Simulate all 16 DP ranks in a heterogeneous step (busy, partially busy,
+    and idle ranks).
 
     Verifies that all 16 ranks execute the identical count of:
     - Target forwards (real + dummy)
@@ -341,15 +387,19 @@ def test_16rank_lockstep_collective_symmetry():
         def make_record(rank_id, name):
             def record_fn(*args, **kwargs):
                 rank_events[rank_id].append(name)
+
             return record_fn
 
         runner._run_dp_dummy_chunk = make_record(rank, "target_dummy_forward")
         proposer._dp_dummy_kv_update = make_record(rank, "draft_dummy_kv_update")
         proposer._dp_dummy_forward = make_record(rank, "draft_dummy_forward")
-        proposer._update_draft_kv_cache_from_target = make_record(rank, "draft_real_kv_update")
+        proposer._update_draft_kv_cache_from_target = make_record(
+            rank, "draft_real_kv_update"
+        )
         proposer._dflash_forward_and_sample = mock.MagicMock(
-            side_effect=lambda *args, **kwargs: (
-                rank_events[rank].append("draft_real_forward") or (torch.zeros((1, 4), dtype=torch.int32), None)
+            side_effect=lambda *args, _r=rank, **kwargs: (
+                rank_events[_r].append("draft_real_forward")
+                or (torch.zeros((1, 4), dtype=torch.int32), None)
             )
         )
 
@@ -399,24 +449,34 @@ def test_16rank_lockstep_collective_symmetry():
         draft_forwards = [e for e in events if "draft_" in e and "_forward" in e]
 
         assert len(target_forwards) == target_num_chunks, (
-            f"Rank {rank} had {len(target_forwards)} target forwards, expected {target_num_chunks}"
+            f"Rank {rank} had {len(target_forwards)} target forwards, "
+            f"expected {target_num_chunks}"
         )
         assert len(draft_kv_updates) == target_num_chunks, (
-            f"Rank {rank} had {len(draft_kv_updates)} draft KV updates, expected {target_num_chunks}"
+            f"Rank {rank} had {len(draft_kv_updates)} draft KV updates, "
+            f"expected {target_num_chunks}"
         )
         assert len(draft_forwards) == target_num_chunks, (
-            f"Rank {rank} had {len(draft_forwards)} draft forwards, expected {target_num_chunks}"
+            f"Rank {rank} had {len(draft_forwards)} draft forwards, "
+            f"expected {target_num_chunks}"
         )
 
         # Strict phase order: all target forwards precede all draft KV updates,
         # which precede all draft forwards.
         phase1 = events[:target_num_chunks]
-        phase2 = events[target_num_chunks:2*target_num_chunks]
-        phase3 = events[2*target_num_chunks:3*target_num_chunks]
+        phase2 = events[target_num_chunks : 2 * target_num_chunks]
+        phase3 = events[2 * target_num_chunks : 3 * target_num_chunks]
 
-        assert all("target_" in e for e in phase1), f"Rank {rank} phase 1 violation: {phase1}"
-        assert all("draft_" in e and "_kv_update" in e for e in phase2), f"Rank {rank} phase 2 violation: {phase2}"
-        assert all("draft_" in e and "_forward" in e for e in phase3), f"Rank {rank} phase 3 violation: {phase3}"
+        assert all("target_" in e for e in phase1), (
+            f"Rank {rank} phase 1 violation: {phase1}"
+        )
+        assert all("draft_" in e and "_kv_update" in e for e in phase2), (
+            f"Rank {rank} phase 2 violation: {phase2}"
+        )
+        assert all("draft_" in e and "_forward" in e for e in phase3), (
+            f"Rank {rank} phase 3 violation: {phase3}"
+        )
+
 
 # 2. Mechanism B: Hybrid TP=2/DP=8/EP=16 & TP=4/DP=4/EP=16 + RC34 + DSpark K=5
 # ==============================================================================
@@ -424,7 +484,8 @@ def test_16rank_lockstep_collective_symmetry():
 
 def test_populate_draft_embed_from_target_when_draft_embed_is_none():
     """Verify populate_draft_embed_from_target works when DSpark draft model has
-    `embed_tokens = None` under TP=2, DP=8, EP=16 or TP=4, DP=4, EP=16 (`target_tp > 1`, `draft_tp == 1`).
+    `embed_tokens = None` under TP=2, DP=8, EP=16 or TP=4, DP=4, EP=16
+    (`target_tp > 1`, `draft_tp == 1`).
     """
     from vllm_torchtpu.spec_decode.utils import (
         maybe_share_embeddings,
@@ -444,9 +505,7 @@ def test_populate_draft_embed_from_target_when_draft_embed_is_none():
     target_embed.weight = nn.Parameter(
         full_weight[: org_vocab_size // 2].clone(), requires_grad=False
     )
-    target_model = SimpleNamespace(
-        model=SimpleNamespace(embed_tokens=target_embed)
-    )
+    target_model = SimpleNamespace(model=SimpleNamespace(embed_tokens=target_embed))
 
     # DSparkDeepseekV4Model sets `self.embed_tokens = None` at __init__ and
     # `has_own_embed_tokens = False` on the outer CausalLM class.
@@ -478,25 +537,34 @@ def test_populate_draft_embed_from_target_when_draft_embed_is_none():
         populate_draft_embed_from_target(draft_model, target_embed)
         assert torch.equal(draft_model.model.embed_tokens.weight, full_weight)
 
-        # Negative Control: mismatched org_vocab_size on an existing draft_embed raises AssertionError.
+        # Negative Control: mismatched org_vocab_size on an existing
+        # draft_embed raises AssertionError.
         draft_model.model.embed_tokens.org_vocab_size = org_vocab_size + 64
         with pytest.raises(AssertionError, match="draft embed org_vocab"):
             populate_draft_embed_from_target(draft_model, target_embed)
 
 
 @pytest.mark.parametrize("tp_size,dp_size", [(2, 8), (4, 4)])
-def test_hybrid_tp_dp_ep16_dspark_lockstep_and_hash_moe_gather(tp_size: int, dp_size: int):
+def test_hybrid_tp_dp_ep16_dspark_lockstep_and_hash_moe_gather(
+    tp_size: int, dp_size: int
+):
     """Verify Hybrid `TP=2, DP=8, EP=16` and `TP=4, DP=4, EP=16` compatibility with:
     1. `DSparkDeepseekV4Model._dp_gather_hash_moe_input_ids` across `dp_size` ranks.
     2. `RC34` cross-DP lockstep `num_reqs > 0` indicator when some DP ranks are idle,
        some run decode (`K=5`), and some run micro-chunked prefill (`256` tokens).
-    3. `_sync_replicated_drafts_across_tp` broadcasting draft tokens cleanly across `tp_size` ranks.
+    3. `_sync_replicated_drafts_across_tp` broadcasting draft tokens
+       cleanly across `tp_size` ranks.
     """
-    # Ensure stub base classes do not trigger metaclass conflicts when running in CPU stub mode.
+    # Ensure stub base classes do not trigger metaclass conflicts when
+    # running in CPU stub mode.
     if "vllm.model_executor.models.deepseek_v4.attention" in sys.modules:
-        sys.modules["vllm.model_executor.models.deepseek_v4.attention"].DeepseekV4Attention = nn.Module
+        sys.modules[
+            "vllm.model_executor.models.deepseek_v4.attention"
+        ].DeepseekV4Attention = nn.Module
     if "vllm.model_executor.layers.attention_layer_base" in sys.modules:
-        sys.modules["vllm.model_executor.layers.attention_layer_base"].AttentionLayerBase = object
+        sys.modules[
+            "vllm.model_executor.layers.attention_layer_base"
+        ].AttentionLayerBase = object
     if "vllm.model_executor.models.interfaces" in sys.modules:
         sys.modules["vllm.model_executor.models.interfaces"].SupportsPP = object
     from vllm_torchtpu.models.vllm.deepseek_v4.dspark import DSparkDeepseekV4Model
@@ -525,12 +593,14 @@ def test_hybrid_tp_dp_ep16_dspark_lockstep_and_hash_moe_gather(tp_size: int, dp_
         gathered_ids = dummy_dspark._dp_gather_hash_moe_input_ids(local_ids)
         assert gathered_ids.shape == (8 * dp_size,)
 
-        # When Fused-EP owns dispatch (`routes_dp_gathered_tokens=False`), ids stay local.
+        # When Fused-EP owns dispatch (`routes_dp_gathered_tokens=False`),
+        # ids stay local.
         fake_layer.ffn.routes_dp_gathered_tokens = False
         local_kept = dummy_dspark._dp_gather_hash_moe_input_ids(local_ids)
         assert local_kept.shape == (8,)
 
-    # 2. Verify RC34 cross-DP lockstep + TP draft broadcast across all (dp_rank, tp_rank)
+    # 2. Verify RC34 cross-DP lockstep + TP draft broadcast across all
+    # (dp_rank, tp_rank)
     num_spec_tokens = 5
     golden_draft_by_dp = {
         dp_r: torch.tensor(
@@ -541,7 +611,8 @@ def test_hybrid_tp_dp_ep16_dspark_lockstep_and_hash_moe_gather(tp_size: int, dp_
     }
 
     for dp_rank in range(dp_size):
-        # Make half the DP ranks active decode, one rank micro-chunked prefill, and at least one idle.
+        # Make half the DP ranks active decode, one rank micro-chunked
+        # prefill, and at least one idle.
         is_idle_dp = dp_rank == (dp_size - 1)
         tp_masked_partials: list[torch.Tensor] = []
         runners_for_dp: list[tuple[int, TPUModelRunner, torch.Tensor]] = []
@@ -557,7 +628,8 @@ def test_hybrid_tp_dp_ep16_dspark_lockstep_and_hash_moe_gather(tp_size: int, dp_
                 method="dspark",
                 draft_tensor_parallel_size=1,
             )
-            # Corrupt non-zero TP ranks before sync to prove mask + all_reduce overwrites them.
+            # Corrupt non-zero TP ranks before sync to prove mask +
+            # all_reduce overwrites them.
             local_draft = (
                 golden_draft_by_dp[dp_rank].clone()
                 if tp_rank == 0
@@ -565,14 +637,17 @@ def test_hybrid_tp_dp_ep16_dspark_lockstep_and_hash_moe_gather(tp_size: int, dp_
             )
             runners_for_dp.append((tp_rank, runner, local_draft))
 
-        # First compute masked tensors across TP ranks (rank 0 keeps draft, rank > 0 zeros it).
+        # First compute masked tensors across TP ranks (rank 0 keeps
+        # draft, rank > 0 zeros it).
         for tp_rank, runner, local_draft in runners_for_dp:
             mask = 1 if tp_rank == 0 else 0
             tp_masked_partials.append(local_draft * mask)
         tp_sum = torch.stack(tp_masked_partials, dim=0).sum(dim=0)
 
         for tp_rank, runner, local_draft in runners_for_dp:
-            runner._tpu_pin_drafts_to_rank0 = lambda drafts, mask, _sum=tp_sum: _sum.clone()
+            runner._tpu_pin_drafts_to_rank0 = (
+                lambda drafts, mask, _sum=tp_sum: _sum.clone()
+            )
             with (
                 patch(
                     "vllm.distributed.get_tensor_model_parallel_world_size",
@@ -593,13 +668,11 @@ def test_hybrid_tp_dp_ep16_dspark_lockstep_and_hash_moe_gather(tp_size: int, dp_
                 assert runner._tp_rank0_mask is not None
                 assert int(runner._tp_rank0_mask.item()) == (1 if tp_rank == 0 else 0)
             else:
-                # Idle DP rank still sees _dp_step_max_reqs == 2 > 0 for RC34 dummy propose lockstep!
+                # Idle DP rank still sees _dp_step_max_reqs == 2 > 0 for
+                # RC34 dummy propose lockstep!
                 assert runner._dp_step_max_reqs > 0
 
 
 # ==============================================================================
 # 3. Gate 7 & Gate 7B (TRAP24) Numerical Parity + Negative Controls
 # ==============================================================================
-
-
-

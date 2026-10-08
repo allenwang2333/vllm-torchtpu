@@ -607,16 +607,12 @@ class RaidenOffloadingManager(OffloadingManager):
                 bs.HOST_AND_HBM,
             ) + ((bs.REMOTE,) if allow_remote else ())
         items = (
-            probe_results.items()
-            if isinstance(probe_results, dict)
-            else probe_results
+            probe_results.items() if isinstance(probe_results, dict) else probe_results
         )
         hash_to_adm = getattr(self, "_hash_to_admission", {})
         for item in items:
             sub_hash, block = (
-                item
-                if isinstance(item, tuple) and len(item) == 2
-                else (None, item)
+                item if isinstance(item, tuple) and len(item) == 2 else (None, item)
             )
             if block is None:
                 return False
@@ -1365,7 +1361,11 @@ def infer_draft_kv_tensor_count(vllm_config: VllmConfig | None) -> int:
                 return val
     method = str(getattr(spec_cfg, "method", "") or "").lower()
     if method in ("dspark", "dflash", "mtp", "deepseek_mtp"):
-        return 3 if method == "dspark" else int(getattr(spec_cfg, "num_speculative_tokens", 1) or 1)
+        return (
+            3
+            if method == "dspark"
+            else int(getattr(spec_cfg, "num_speculative_tokens", 1) or 1)
+        )
     return 0
 
 

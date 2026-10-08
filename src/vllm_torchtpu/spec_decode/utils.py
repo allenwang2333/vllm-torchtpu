@@ -431,7 +431,7 @@ def normalize_draft_config(hf_config) -> dict:
 
 
 def model_has_moe(model: torch.nn.Module | None) -> bool:
-    """Robustly detect if a model contains MoE layers across vLLM and custom TPU models."""
+    """Detect if a model contains MoE layers across vLLM and custom models."""
     if model is None:
         return False
     try:
@@ -440,20 +440,23 @@ def model_has_moe(model: torch.nn.Module | None) -> bool:
         res = is_mixture_of_experts(model)
         if isinstance(res, bool) and res:
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed checking is_mixture_of_experts: %s", e)
     if getattr(model, "has_moe", False) or getattr(model, "num_moe_layers", 0) > 0:
         return True
     for m in getattr(model, "modules", lambda: [])():
         name = type(m).__name__.lower()
         if "moe" in name:
             return True
-        if not type(m).__name__.startswith("MagicMock") and not type(m).__name__.startswith("Mock"):
-            if (
+        m_type = type(m).__name__
+        if (
+            not m_type.startswith("MagicMock")
+            and not m_type.startswith("Mock")
+            and (
                 hasattr(m, "num_experts")
                 or hasattr(m, "experts")
                 or hasattr(m, "local_experts")
-            ):
-                return True
+            )
+        ):
+            return True
     return False
-

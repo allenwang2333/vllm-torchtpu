@@ -28,20 +28,26 @@ import pytest
 for _cand_path in (
     os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")),
     os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
-        ):
+):
     if os.path.isdir(_cand_path) and _cand_path not in sys.path:
         sys.path.insert(0, _cand_path)
 
-import torch
-
+import torch  # noqa: E402
 
 
 def _install_vllm_test_stubs():
-    import collections, contextlib, dataclasses, importlib.abc, importlib.machinery, logging, types
+    import contextlib
+    import dataclasses
+    import importlib.abc
+    import importlib.machinery
+    import logging
+    import types
     from unittest.mock import MagicMock
+
     try:
-        import vllm  # noqa: F401
         import torch_tpu  # noqa: F401
+        import vllm  # noqa: F401
+
         return
     except ImportError:
         pass
@@ -84,11 +90,24 @@ def _install_vllm_test_stubs():
             return val
 
     class _AutoStubFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-        PREFIXES = ("vllm", "torch_tpu", "einops", "compressed_tensors", "transformers", "safetensors", "portpicker", "requests")
+        PREFIXES = (
+            "vllm",
+            "torch_tpu",
+            "einops",
+            "compressed_tensors",
+            "transformers",
+            "safetensors",
+            "portpicker",
+            "requests",
+        )
+
         def find_spec(self, fullname, path, target=None):
-            if any(fullname == p or fullname.startswith(p + ".") for p in self.PREFIXES):
+            if any(
+                fullname == p or fullname.startswith(p + ".") for p in self.PREFIXES
+            ):
                 return importlib.machinery.ModuleSpec(fullname, self, is_package=True)
             return None
+
         def create_module(self, spec):
             if spec.name in sys.modules:
                 return sys.modules[spec.name]
@@ -99,21 +118,43 @@ def _install_vllm_test_stubs():
                 if parent_name in sys.modules:
                     setattr(sys.modules[parent_name], child_attr, mod)
             return mod
+
         def exec_module(self, module):
             pass
 
     sys.meta_path.insert(0, _AutoStubFinder())
     stub_modules = [
-        "torch_tpu", "vllm", "vllm.envs", "vllm.logger", "vllm.config",
-        "vllm.compilation", "vllm.compilation.backends", "vllm.distributed",
-        "vllm.distributed.parallel_state", "vllm.forward_context",
-        "vllm.v1", "vllm.v1.outputs", "vllm.v1.core", "vllm.v1.core.sched",
-        "vllm.v1.core.sched.async_scheduler", "vllm.v1.core.sched.interface",
-        "vllm.v1.core.sched.output", "vllm.v1.core.sched.request_queue",
-        "vllm.v1.worker", "vllm.v1.worker.gpu_model_runner",
-        "vllm.v1.kv_offload", "vllm.v1.kv_offload.base",
+        "torch_tpu",
+        "vllm",
+        "vllm.envs",
+        "vllm.logger",
+        "vllm.config",
+        "vllm.compilation",
+        "vllm.compilation.backends",
+        "vllm.distributed",
+        "vllm.distributed.parallel_state",
+        "vllm.forward_context",
+        "vllm.v1",
+        "vllm.v1.outputs",
+        "vllm.v1.core",
+        "vllm.v1.core.sched",
+        "vllm.v1.core.sched.async_scheduler",
+        "vllm.v1.core.sched.interface",
+        "vllm.v1.core.sched.output",
+        "vllm.v1.core.sched.request_queue",
+        "vllm.v1.worker",
+        "vllm.v1.worker.gpu_model_runner",
+        "vllm.v1.kv_offload",
+        "vllm.v1.kv_offload.base",
         "vllm.distributed.kv_transfer.kv_connector.v1.base",
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading",
         "vllm.distributed.kv_transfer.kv_connector.v1.offloading.common",
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler",
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker",
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector",
+        "vllm.v1.core.sched.scheduler",
+        "vllm.v1.kv_cache_interface",
+        "vllm.v1.request",
     ]
     for mod_name in stub_modules:
         parts = mod_name.split(".")
@@ -123,11 +164,12 @@ def _install_vllm_test_stubs():
                 m = _DummyMod(sub)
                 sys.modules[sub] = m
                 if i > 1:
-                    setattr(sys.modules[".".join(parts[:i - 1])], parts[i - 1], m)
+                    setattr(sys.modules[".".join(parts[: i - 1])], parts[i - 1], m)
 
     @contextlib.contextmanager
     def _noop_cm(*args, **kwargs):
         yield
+
     sys.modules["vllm.compilation.backends"].set_model_tag = _noop_cm
     sys.modules["vllm.config"].set_current_vllm_config = _noop_cm
 
@@ -144,7 +186,7 @@ def _install_vllm_test_stubs():
         sampled_token_ranks: object = None
         cu_num_generated_tokens: object = None
 
-        def slice_request(self, req_idx: int, num_tokens: int) -> "LogprobsLists":
+        def slice_request(self, req_idx: int, num_tokens: int) -> LogprobsLists:
             start = self.cu_num_generated_tokens[req_idx]
             end = start + num_tokens
             return LogprobsLists(
@@ -176,12 +218,14 @@ def _install_vllm_test_stubs():
 
     try:
         import torch._dynamo
+
         if "tpu" not in torch._dynamo.list_backends():
+
             @torch._dynamo.register_backend(name="tpu")
             def _dummy_tpu_backend(model, inputs):
                 return model
-    except Exception:
-        pass
+    except Exception as e:
+        logging.debug("torch._dynamo backend setup skipped: %s", e)
 
     class _GPUModelRunner:
         def __init__(self, *args, **kwargs):
@@ -192,18 +236,24 @@ def _install_vllm_test_stubs():
     class _AsyncScheduler:
         def __init__(self, *args, **kwargs):
             pass
+
         def schedule(self, *args, **kwargs):
             return None
 
     sys.modules["vllm.v1.core.sched.async_scheduler"].AsyncScheduler = _AsyncScheduler
     sys.modules["vllm.logger"].init_logger = lambda name: logging.getLogger(name)
 
+
 _install_vllm_test_stubs()
+
 
 def _ensure_vllm_offload_stubs() -> None:
     """Ensure lightweight vllm offloading base classes exist for CPU unit testing."""
     vllm_mod = sys.modules.get("vllm")
-    if vllm_mod is not None and vllm_mod.__dict__.get("_offload_stubs_installed") is True:
+    if (
+        vllm_mod is not None
+        and vllm_mod.__dict__.get("_offload_stubs_installed") is True
+    ):
         return
     try:
         import vllm  # noqa: F401
@@ -212,12 +262,12 @@ def _ensure_vllm_offload_stubs() -> None:
     sys.modules["vllm"]._offload_stubs_installed = True
 
     import enum
-    from itertools import chain, islice
+    from itertools import chain
     from typing import NewType
 
     import vllm.distributed.kv_transfer.kv_connector.v1.base as v1_base
     import vllm.distributed.kv_transfer.kv_connector.v1.offloading.common as off_common
-    import vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler as off_sched
+    import vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler as off_sched  # noqa: E501
     import vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker as off_worker
     import vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector as off_conn
     import vllm.v1.core.sched.scheduler as v1_sched_mod
@@ -251,7 +301,6 @@ def _ensure_vllm_offload_stubs() -> None:
 
     kv_base.CanonicalKVCacheTensor = CanonicalKVCacheTensor
     kv_base.CanonicalKVCaches = CanonicalKVCaches
-
 
     class RequestStatus(enum.Enum):
         WAITING = 0
@@ -334,9 +383,7 @@ def _ensure_vllm_offload_stubs() -> None:
     OffloadKey = NewType("OffloadKey", bytes)
 
     def make_offload_key(block_hash: bytes, group_idx: int) -> OffloadKey:
-        return OffloadKey(
-            block_hash + group_idx.to_bytes(4, "big", signed=False)
-        )
+        return OffloadKey(block_hash + group_idx.to_bytes(4, "big", signed=False))
 
     def get_offload_block_hash(key: OffloadKey) -> bytes:
         return key[:-4]
@@ -585,9 +632,7 @@ def _ensure_vllm_offload_stubs() -> None:
                 self.config.kv_group_configs, req_status.group_states
             ):
                 if group_config.sliding_window_size_in_chunks is None:
-                    self.manager.touch(
-                        group_state.offload_keys, req_status.req_context
-                    )
+                    self.manager.touch(group_state.offload_keys, req_status.req_context)
                 else:
                     chunks_to_skip = max(
                         0,
@@ -728,12 +773,6 @@ def _ensure_vllm_offload_stubs() -> None:
                 )
             return store_jobs
 
-        def has_pending_push_work(self) -> bool:
-            return bool(self._pending_store_jobs)
-
-        def reset_cache(self) -> None:
-            self._pending_store_jobs.clear()
-
         def update_connector_output(self, connector_output) -> None:
             pass
 
@@ -747,6 +786,9 @@ def _ensure_vllm_offload_stubs() -> None:
     off_sched.RequestOffloadState = RequestOffloadState
     off_sched.is_store_reachable_swa_chunk = is_store_reachable_swa_chunk
     off_sched.OffloadingConnectorScheduler = OffloadingConnectorScheduler
+    _sched_pkg = "vllm.distributed.kv_transfer.kv_connector.v1.offloading"
+    sys.modules[f"{_sched_pkg}.scheduler"] = off_sched
+    sys.modules[_sched_pkg].scheduler = off_sched
 
     class OffloadingConnectorWorker:
         def __init__(self, spec=None, vllm_config=None, kv_cache_config=None):
@@ -832,7 +874,6 @@ from vllm_torchtpu.offload.raiden_connector import (  # noqa: E402
     TPURaidenOffloadingScheduler,
     _ParkedStore,
 )
-from vllm_torchtpu.offload.raiden_store import RaidenOffloadingManager  # noqa: E402
 
 PROVENANCE_BANNER = (
     "ANALYTIC / MICROBENCHMARK PROJECTION (NOT E2E PHYSICAL VLLM RUN) | "
@@ -854,21 +895,21 @@ def test_dspark_and_target_kv_cache_registration_in_raiden_connector():
 
     # Simulate DeepSeek-V4 + DSpark heterogeneous backing pools:
     # 1. CSA pool (36 KiB / block)
-    csa_storage = (
-        torch.zeros(num_blocks * 36864, dtype=torch.uint8, device=device).untyped_storage()
-    )
+    csa_storage = torch.zeros(
+        num_blocks * 36864, dtype=torch.uint8, device=device
+    ).untyped_storage()
     # 2. HCA pool (128 KiB / block - largest page, must sort to index 0)
-    hca_storage = (
-        torch.zeros(num_blocks * 131072, dtype=torch.uint8, device=device).untyped_storage()
-    )
+    hca_storage = torch.zeros(
+        num_blocks * 131072, dtype=torch.uint8, device=device
+    ).untyped_storage()
     # 3. DSpark Draft + SWA overlay pool (8 KiB / block)
-    dspark_storage = (
-        torch.zeros(num_blocks * 8192, dtype=torch.uint8, device=device).untyped_storage()
-    )
+    dspark_storage = torch.zeros(
+        num_blocks * 8192, dtype=torch.uint8, device=device
+    ).untyped_storage()
     # 4. Indexer k/s pool (4 KiB / block)
-    indexer_storage = (
-        torch.zeros(num_blocks * 4096, dtype=torch.uint8, device=device).untyped_storage()
-    )
+    indexer_storage = torch.zeros(
+        num_blocks * 4096, dtype=torch.uint8, device=device
+    ).untyped_storage()
 
     kv_caches: dict[str, list[torch.Tensor]] = {}
     for layer_id in range(61):
@@ -910,7 +951,8 @@ def test_dspark_and_target_kv_cache_registration_in_raiden_connector():
 
     connector.register_kv_caches(kv_caches)
 
-    # All 4 unique backing storages (CSA, HCA, DSpark, Indexer) are deduplicated and registered
+    # All 4 unique backing storages (CSA, HCA, DSpark, Indexer) are
+    # deduplicated and registered
     assert len(connector._pool_sync_tensors) == 4
     mock_worker._init_worker.assert_called_once()
     canonical_kv = mock_worker._init_worker.call_args[0][0]
@@ -928,7 +970,8 @@ def test_dspark_and_target_kv_cache_registration_in_raiden_connector():
 
 
 def test_rc35a_idle_dp_rank_records_fence_before_dummy_forward():
-    """Verify RC35-A records save fence BEFORE _run_dp_idle_pairing and retires in same step."""
+    """Verify RC35-A records save fence before idle pairing and retires in
+    the same step."""
     connector = TPURaidenOffloadingConnector.__new__(TPURaidenOffloadingConnector)
     connector.connector_worker = MagicMock()
     connector._fenced_jobs = {}
@@ -961,16 +1004,21 @@ def test_rc35a_idle_dp_rank_records_fence_before_dummy_forward():
         ),
         patch(
             "vllm_torchtpu.offload.raiden_connector._record_fence_event",
-            side_effect=lambda: (event_log.append("record_fence_event"), FakeEvent())[1],
+            side_effect=lambda: (event_log.append("record_fence_event"), FakeEvent())[
+                1
+            ],
         ),
         patch(
             "vllm_torchtpu.offload.raiden_connector._event_is_retired",
-            side_effect=lambda ev: ev.recorded_before_dummy and dummy_forward_completed["done"],
+            side_effect=lambda ev: ev.recorded_before_dummy
+            and dummy_forward_completed["done"],
         ),
     ):
         # Step 1: Call record_pending_fences() BEFORE _run_dp_idle_pairing
         connector.record_pending_fences()
-        assert meta.fence_job_ids == set(), "fence_job_ids must be cleared after recording"
+        assert meta.fence_job_ids == set(), (
+            "fence_job_ids must be cleared after recording"
+        )
         assert len(connector._pending_fences) == 1
 
         # Step 2: Simulate _run_dp_idle_pairing (Target + DSpark dummy forwards)
@@ -982,7 +1030,8 @@ def test_rc35a_idle_dp_rank_records_fence_before_dummy_forward():
         assert sending == set()
         assert recving == set()
 
-        # Verify ordering: enqueue_pool_writes -> record_fence_event -> run_dp_idle_pairing
+        # Verify ordering: enqueue_pool_writes -> record_fence_event ->
+        # run_dp_idle_pairing
         assert event_log == [
             "enqueue_pool_writes",
             "record_fence_event",
@@ -994,7 +1043,8 @@ def test_rc35a_idle_dp_rank_records_fence_before_dummy_forward():
 
 
 def test_rc35a_negative_control_unretired_fence_stays_pending():
-    """Negative control: if device fence has NOT retired yet, fenced_jobs stays empty."""
+    """Negative control: if device fence has not retired yet, fenced_jobs
+    stays empty."""
     connector = TPURaidenOffloadingConnector.__new__(TPURaidenOffloadingConnector)
     connector.connector_worker = MagicMock()
     connector._fenced_jobs = {}
@@ -1031,7 +1081,8 @@ def test_rc35a_negative_control_unretired_fence_stays_pending():
 
 
 def test_rc41_record_pending_fences_handles_none_metadata_safely():
-    """RC41: On idle DP ranks, _connector_metadata is None; record_pending_fences must not assert."""
+    """RC41: On idle DP ranks, _connector_metadata is None; record_pending_fences
+    must not assert."""
     connector = TPURaidenOffloadingConnector.__new__(TPURaidenOffloadingConnector)
     connector.connector_worker = SimpleNamespace()
     connector._pending_fences = []
@@ -1049,12 +1100,15 @@ def test_rc41_record_pending_fences_handles_none_metadata_safely():
 
 
 def test_rc41_record_pending_fences_negative_control_pre_rc41_assert():
-    """RC41 Negative control: pre-RC41 self._get_connector_metadata() asserted not None."""
+    """RC41 Negative control: pre-RC41 self._get_connector_metadata() asserted
+    not None."""
     connector = TPURaidenOffloadingConnector.__new__(TPURaidenOffloadingConnector)
     connector._connector_metadata = None
 
     def legacy_get_connector_metadata():
-        assert connector._connector_metadata is not None, "AssertionError on None metadata"
+        assert connector._connector_metadata is not None, (
+            "AssertionError on None metadata"
+        )
         return connector._connector_metadata
 
     with pytest.raises(AssertionError):
@@ -1062,21 +1116,31 @@ def test_rc41_record_pending_fences_negative_control_pre_rc41_assert():
 
 
 def test_rc41_tpu_worker_execute_dummy_batch_record_fences_exception_safe():
-    """RC41: Even if record_pending_fences raises an unexpected exception, execute_dummy_batch catches it."""
+    """RC41: Even if record_pending_fences raises an unexpected exception,
+    execute_dummy_batch catches it."""
     mock_runner = MagicMock()
     mock_runner._dp_step_executed_in_empty_execute_model = False
     mock_runner._dp_coordinated_step.return_value = (SimpleNamespace(), 1)
 
     mock_kv_connector = MagicMock()
-    mock_kv_connector.record_pending_fences.side_effect = RuntimeError("Simulated crash")
+    mock_kv_connector.record_pending_fences.side_effect = RuntimeError(
+        "Simulated crash"
+    )
 
     from vllm_torchtpu.worker.tpu_worker import TPUWorker
 
     worker = object.__new__(TPUWorker)
     worker.model_runner = mock_runner
 
-    with patch("vllm_torchtpu.worker.tpu_worker.has_kv_transfer_group", return_value=True), \
-         patch("vllm_torchtpu.worker.tpu_worker.get_kv_transfer_group", return_value=mock_kv_connector):
+    with (
+        patch(
+            "vllm_torchtpu.worker.tpu_worker.has_kv_transfer_group", return_value=True
+        ),
+        patch(
+            "vllm_torchtpu.worker.tpu_worker.get_kv_transfer_group",
+            return_value=mock_kv_connector,
+        ),
+    ):
         # Must not raise RuntimeError
         worker.execute_dummy_batch()
 
@@ -1085,7 +1149,8 @@ def test_rc41_tpu_worker_execute_dummy_batch_record_fences_exception_safe():
 
 
 def test_rc42_get_finished_safe_none_metadata_and_negative_control():
-    """RC42: TPURaidenOffloadingConnector.get_finished must handle None metadata safely and not assert."""
+    """RC42: TPURaidenOffloadingConnector.get_finished must handle None
+    metadata safely and not assert."""
     connector = TPURaidenOffloadingConnector.__new__(TPURaidenOffloadingConnector)
     connector.connector_worker = SimpleNamespace()
     connector._pending_fences = []
@@ -1095,7 +1160,8 @@ def test_rc42_get_finished_safe_none_metadata_and_negative_control():
     connector._load_error_block_ids = set()
     connector._connector_metadata = None
 
-    # Case 1: _connector_metadata is None (idle DP step or after clear_connector_metadata)
+    # Case 1: _connector_metadata is None (idle DP step or after
+    # clear_connector_metadata)
     sent, recvd = connector.get_finished(set())
     assert sent == set()
     assert recvd == set()
@@ -1112,31 +1178,43 @@ def test_rc42_get_finished_safe_none_metadata_and_negative_control():
     assert sent == set()
     assert recvd == set()
 
-    # Negative control: pre-RC42 logic asserted meta was RaidenOffloadingConnectorMetadata
+    # Negative control: pre-RC42 logic asserted meta was
+    # RaidenOffloadingConnectorMetadata
     connector._connector_metadata = None
+
     def legacy_get_finished():
         assert connector._connector_metadata is not None
-        assert isinstance(connector._connector_metadata, RaidenOffloadingConnectorMetadata)
+        assert isinstance(
+            connector._connector_metadata, RaidenOffloadingConnectorMetadata
+        )
 
     with pytest.raises(AssertionError):
         legacy_get_finished()
 
 
 def test_rc42_tpu_runner_maybe_setup_kv_connector_none_metadata_safe():
-    """RC42: maybe_setup_kv_connector must return early without asserting when metadata is None."""
+    """RC42: maybe_setup_kv_connector must return early without asserting
+    when metadata is None."""
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
     runner = TPUModelRunner.__new__(TPUModelRunner)
     mock_sched_out = SimpleNamespace(kv_connector_metadata=None)
 
-    with patch("vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True), \
-         patch("vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group") as mock_get_group:
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True
+        ),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group"
+        ) as mock_get_group,
+    ):
         runner.maybe_setup_kv_connector(mock_sched_out)
         mock_get_group.assert_not_called()
 
 
 def test_rc42_hybrid_tp2_dp8_ep16_invariants_and_gate7b_parity():
-    """RC42: Verify hybrid TP=2, DP=8, EP=16 topology invariants and Gate 7B (TRAP24) precision parity."""
+    """RC42: Verify hybrid TP=2, DP=8, EP=16 topology invariants and Gate 7B
+    (TRAP24) precision parity."""
     num_target_experts = 384
     num_dspark_experts = 160
     ep_size = 16
@@ -1156,14 +1234,22 @@ def test_rc42_hybrid_tp2_dp8_ep16_invariants_and_gate7b_parity():
     torch.manual_seed(20261006)
     num_tokens = 64
     hidden_size = 256
-    expert_outputs_bf16 = torch.randn((ep_size, num_tokens, hidden_size), dtype=torch.bfloat16)
+    expert_outputs_bf16 = torch.randn(
+        (ep_size, num_tokens, hidden_size), dtype=torch.bfloat16
+    )
 
     # Golden unpartitioned reference (float32 accumulation across all 16 EP shards)
-    golden_ref = torch.sum(expert_outputs_bf16.to(torch.float32), dim=0).to(torch.bfloat16)
+    golden_ref = torch.sum(expert_outputs_bf16.to(torch.float32), dim=0).to(
+        torch.bfloat16
+    )
 
     # Hybrid TP=2, DP=8, EP=16: TP=2 split in float32 + EP=16 reduction
-    tp0_half = expert_outputs_bf16[:, :, :hidden_size // 2].to(torch.float32).sum(dim=0)
-    tp1_half = expert_outputs_bf16[:, :, hidden_size // 2:].to(torch.float32).sum(dim=0)
+    tp0_half = (
+        expert_outputs_bf16[:, :, : hidden_size // 2].to(torch.float32).sum(dim=0)
+    )
+    tp1_half = (
+        expert_outputs_bf16[:, :, hidden_size // 2 :].to(torch.float32).sum(dim=0)
+    )
     hybrid_merged = torch.cat([tp0_half, tp1_half], dim=-1).to(torch.bfloat16)
 
     cossim, sqnr = _compute_cossim_and_sqnr(golden_ref, hybrid_merged)
@@ -1172,14 +1258,17 @@ def test_rc42_hybrid_tp2_dp8_ep16_invariants_and_gate7b_parity():
 
 
 def test_rc43_get_connector_metadata_safe_override_and_negative_control():
-    """RC43: TPURaidenOffloadingConnector._get_connector_metadata must safely return getattr(self, '_connector_metadata', None) without asserting."""
+    """RC43: TPURaidenOffloadingConnector._get_connector_metadata must safely
+    return getattr(self, '_connector_metadata', None) without asserting."""
     connector = TPURaidenOffloadingConnector.__new__(TPURaidenOffloadingConnector)
 
-    # Path 1: metadata is None (idle DP step) -> must return None without raising AssertionError
+    # Path 1: metadata is None (idle DP step) -> must return None without
+    # raising AssertionError
     connector._connector_metadata = None
     assert connector._get_connector_metadata() is None
 
-    # Path 2: metadata is unset (deleted attribute) -> must return None without raising AttributeError or AssertionError
+    # Path 2: metadata is unset (deleted attribute) -> must return None
+    # without raising AttributeError or AssertionError
     delattr(connector, "_connector_metadata")
     assert connector._get_connector_metadata() is None
 
@@ -1191,6 +1280,7 @@ def test_rc43_get_connector_metadata_safe_override_and_negative_control():
     # Negative control: legacy un-overridden base class method asserted not None
     class LegacyOffloadingConnector:
         _connector_metadata = None
+
         def _get_connector_metadata(self):
             assert self._connector_metadata is not None, "Legacy assertion failed"
             return self._connector_metadata
@@ -1198,8 +1288,6 @@ def test_rc43_get_connector_metadata_safe_override_and_negative_control():
     legacy = LegacyOffloadingConnector()
     with pytest.raises(AssertionError, match="Legacy assertion failed"):
         legacy._get_connector_metadata()
-
-
 
 
 def _make_real_raiden_connector_for_idle_dp(
@@ -1226,12 +1314,14 @@ def _make_real_raiden_connector_for_idle_dp(
 
 
 def test_rc35a_tpu_runner_execute_model_idle_dp_rank_with_kv_connector():
-    """Verify TPUModelRunner.execute_model idle DP rank calls REAL maybe_setup_kv_connector,
-    record_pending_fences BEFORE _run_dp_idle_pairing, REAL 6-tuple get_finished_kv_transfers,
-    and REAL module-level _build_kv_connector_output without mutating EMPTY_MODEL_RUNNER_OUTPUT.
+    """Verify execute_model idle DP rank calls REAL maybe_setup_kv_connector,
+    record_pending_fences before idle pairing, REAL get_finished,
+    and module-level _build_kv_connector_output without mutating
+    EMPTY_MODEL_RUNNER_OUTPUT.
     """
-    import vllm_torchtpu.runner.tpu_runner as tpu_runner_mod
     from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+
+    import vllm_torchtpu.runner.tpu_runner as tpu_runner_mod
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
     tpu_runner_mod.KVConnectorOutput = KVConnectorOutput
@@ -1301,7 +1391,9 @@ def test_rc35a_tpu_runner_execute_model_idle_dp_rank_with_kv_connector():
             self.recorded_before_dummy = not dummy_forward_done["done"]
 
     with (
-        patch("vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True
+        ),
         patch(
             "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
             return_value=connector,
@@ -1316,11 +1408,15 @@ def test_rc35a_tpu_runner_execute_model_idle_dp_rank_with_kv_connector():
         ),
         patch(
             "vllm_torchtpu.offload.raiden_connector._record_fence_event",
-            side_effect=lambda: (call_trace.append("record_fence_event"), _FenceEvent())[1],
+            side_effect=lambda: (
+                call_trace.append("record_fence_event"),
+                _FenceEvent(),
+            )[1],
         ),
         patch(
             "vllm_torchtpu.offload.raiden_connector._event_is_retired",
-            side_effect=lambda ev: ev.recorded_before_dummy and dummy_forward_done["done"],
+            side_effect=lambda ev: ev.recorded_before_dummy
+            and dummy_forward_done["done"],
         ),
     ):
         out = runner.execute_model(sched_out)
@@ -1350,10 +1446,12 @@ def test_rc35a_tpu_runner_execute_model_idle_dp_rank_with_kv_connector():
 
 def test_rc38a_idle_dp_rank_real_get_finished_kv_transfers_6tuple_and_worker_meta():
     """Verify RC38-A: Idle DP rank executes real 6-tuple get_finished_kv_transfers and
-    module-level _build_kv_connector_output for both non-empty and empty KVConnectorOutput.
+    module-level _build_kv_connector_output for both non-empty and empty
+    KVConnectorOutput.
     """
-    import vllm_torchtpu.runner.tpu_runner as tpu_runner_mod
     from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+
+    import vllm_torchtpu.runner.tpu_runner as tpu_runner_mod
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
     tpu_runner_mod.KVConnectorOutput = KVConnectorOutput
@@ -1370,8 +1468,9 @@ def test_rc38a_idle_dp_rank_real_get_finished_kv_transfers_6tuple_and_worker_met
 
     connector = _make_real_raiden_connector_for_idle_dp()
 
-    # Case 1: Non-empty KVConnectorOutput (completed store 303, completed load 404 -> req_loaded_1,
-    # retired fence 101, load error block 19, inline mode=True) with active peer decode=True.
+    # Case 1: Non-empty KVConnectorOutput (completed store 303, completed
+    # load 404 -> req_loaded_1, retired fence 101, load error block 19, inline
+    # mode=True) with active peer decode=True.
     def _coord_active(*args, **kwargs):
         runner._dp_step_has_active_decode = True
         return 256, 1
@@ -1392,7 +1491,9 @@ def test_rc38a_idle_dp_rank_real_get_finished_kv_transfers_6tuple_and_worker_met
     )
 
     with (
-        patch("vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True
+        ),
         patch(
             "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
             return_value=connector,
@@ -1426,9 +1527,11 @@ def test_rc38a_idle_dp_rank_real_get_finished_kv_transfers_6tuple_and_worker_met
     assert kv_out.kv_connector_worker_meta.fenced_jobs == {101: 1}
     assert connector._get_connector_metadata() is None
 
-    # Case 2: Empty KVConnectorOutput on idle DP rank (no fences, no completed jobs, no errors)
+    # Case 2: Empty KVConnectorOutput on idle DP rank (no fences, no completed
+    # jobs, no errors)
     # and peer decode=False -> kv_connector_output.is_empty() is True, returns copy of
-    # EMPTY_MODEL_RUNNER_OUTPUT with dp_step_has_active_decode=False and kv_connector_output=None.
+    # EMPTY_MODEL_RUNNER_OUTPUT with dp_step_has_active_decode=False and
+    # kv_connector_output=None.
     def _coord_idle(*args, **kwargs):
         runner._dp_step_has_active_decode = False
         return 256, 1
@@ -1449,7 +1552,9 @@ def test_rc38a_idle_dp_rank_real_get_finished_kv_transfers_6tuple_and_worker_met
     )
 
     with (
-        patch("vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True
+        ),
         patch(
             "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
             return_value=connector,
@@ -1488,13 +1593,15 @@ def _make_mock_raiden_scheduler(num_workers: int = 2) -> TPURaidenOffloadingSche
 
 
 def test_rc35b_has_pending_push_work_and_reset_cache_three_paths():
-    """Verify RC35-B across (1) normal ack path, (2) reset/cancel crash path, (3) repeat call."""
+    """Verify RC35-B across (1) normal ack, (2) reset/cancel crash path,
+    (3) repeat call."""
     sched = _make_mock_raiden_scheduler(num_workers=2)
 
     # Initially no pending push work
     assert not sched.has_pending_push_work()
 
-    # Park job 10 in _fence_pending (popped from _pending_store_jobs by build_connector_meta)
+    # Park job 10 in _fence_pending (popped from _pending_store_jobs by
+    # build_connector_meta)
     key_a = make_offload_key(b"hash_a_012345678", 0)
     sched._fence_pending[10] = _ParkedStore(
         keys=[key_a],
@@ -1517,7 +1624,8 @@ def test_rc35b_has_pending_push_work_and_reset_cache_three_paths():
     assert sched.has_pending_push_work() is True
     sched._raiden_manager.submit_store_job.assert_not_called()
 
-    # 2nd worker ack arrives -> job 10 transitions out of _fence_pending to submit_store_job
+    # 2nd worker ack arrives -> job 10 transitions out of _fence_pending to
+    # submit_store_job
     out_w1 = KVConnectorOutput(
         kv_connector_worker_meta=RaidenOffloadingWorkerMetadata(
             completed_jobs={}, fenced_jobs={10: 1}
@@ -1528,7 +1636,8 @@ def test_rc35b_has_pending_push_work_and_reset_cache_three_paths():
     assert 10 not in sched._fence_pending
     sched._raiden_manager.submit_store_job.assert_called_once_with(10, [key_a], [5])
 
-    # Path 2 (Crash / Reset path): Park job 11 in _fence_pending, then call reset_cache()
+    # Path 2 (Crash / Reset path): Park job 11 in _fence_pending, then call
+    # reset_cache()
     key_b = make_offload_key(b"hash_b_012345678", 0)
     sched._fence_pending[11] = _ParkedStore(
         keys=[key_b],
@@ -1543,7 +1652,8 @@ def test_rc35b_has_pending_push_work_and_reset_cache_three_paths():
     sched._raiden_manager.on_store_job_cancelled.assert_called_once_with([key_b])
     assert sched._fence_pending == {}
 
-    # Path 3 (Repeat / Late-Ack path): Late worker ack for cancelled job 11 arrives after reset_cache()
+    # Path 3 (Repeat / Late-Ack path): Late worker ack for cancelled job 11
+    # arrives after reset_cache()
     late_ack = KVConnectorOutput(
         kv_connector_worker_meta=RaidenOffloadingWorkerMetadata(
             completed_jobs={}, fenced_jobs={11: 1}
@@ -1578,7 +1688,8 @@ def _compute_cossim_and_sqnr(
 
 
 def test_ep32_topology_invariants_and_gate7b_sharded_merge_parity():
-    """Verify 2x2x4 EP=32 (g_local=12) alignment invariants and Gate 7B (TRAP24) parity."""
+    """Verify 2x2x4 EP=32 (g_local=12) alignment invariants and Gate 7B
+    (TRAP24) parity."""
     num_target_experts = 384
     num_dspark_experts = 160
     ep_size = 32
@@ -1608,19 +1719,19 @@ def test_ep32_topology_invariants_and_gate7b_sharded_merge_parity():
     )
 
     # Golden Unpartitioned Reference (float32 accumulation across all 384 experts)
-    golden_unpartitioned = torch.sum(
-        expert_outputs_bf16.to(torch.float32), dim=0
-    ).to(torch.bfloat16)
-
-    # Candidate Arm A (DP=32, EP=32, TP=1): 2-stage tree reduction in float32 (TRAP24 compliant)
-    stage1_shards = expert_outputs_bf16.view(4, 8, num_tokens, hidden_size).to(
-        torch.float32
-    )
-    arm_a_merged = torch.sum(torch.sum(stage1_shards, dim=1), dim=0).to(
+    golden_unpartitioned = torch.sum(expert_outputs_bf16.to(torch.float32), dim=0).to(
         torch.bfloat16
     )
 
-    # Candidate Arm B (TP=2, DP=16, EP=32): TP=2 half-width accumulation in float32 + AllReduce
+    # Candidate Arm A (DP=32, EP=32, TP=1): 2-stage tree reduction in float32
+    # (TRAP24 compliant)
+    stage1_shards = expert_outputs_bf16.view(4, 8, num_tokens, hidden_size).to(
+        torch.float32
+    )
+    arm_a_merged = torch.sum(torch.sum(stage1_shards, dim=1), dim=0).to(torch.bfloat16)
+
+    # Candidate Arm B (TP=2, DP=16, EP=32): TP=2 half-width accumulation in
+    # float32 + AllReduce
     tp0_part = (
         expert_outputs_bf16[:, :, : hidden_size // 2].to(torch.float32).sum(dim=0)
     )
@@ -1647,7 +1758,7 @@ def test_ep32_topology_invariants_and_gate7b_sharded_merge_parity():
         golden_unpartitioned, naive_bf16_accum
     )
     assert sqnr_naive_bf16 < 45.0, (
-        f"Negative control failed: naive bf16 shard merge achieved {sqnr_naive_bf16:.2f} dB"
+        f"Negative control failed: naive bf16 merge achieved {sqnr_naive_bf16:.2f} dB"
     )
 
 
@@ -1657,7 +1768,8 @@ def test_ep32_topology_invariants_and_gate7b_sharded_merge_parity():
 
 
 def test_rc35c_probe_key_resident_non_pinning_and_prefix_aware_scheduler():
-    """Verify RC35-C.1/C.2/C.3 against real FakeKVCacheStore list[tuple[bytes, Block]] & DeepSeek-V4 hybrid MLA+SWA."""
+    """Verify RC35-C.1/C.2/C.3 against FakeKVCacheStore tuple API and
+    DeepSeek-V4 hybrid MLA+SWA."""
     from tests.offload.test_raiden_store_offload import (
         FakeBlockStatus,
         FakeKVCacheStore,
@@ -1665,19 +1777,23 @@ def test_rc35c_probe_key_resident_non_pinning_and_prefix_aware_scheduler():
         make_global_manager,
         seed_global_entries,
         seed_host_entries,
+    )
+    from tests.offload.test_raiden_store_offload import (
         sub_hashes as expand_test_sub_hashes,
     )
 
     store = FakeKVCacheStore()
     mgr = make_global_manager(store, device_block_size_factor=4, num_blocks=32)
 
-    # 1. Verify RC35-C.1 on real FakeKVCacheStore returning list[tuple[bytes, SimpleNamespace(status=...)]]:
+    # 1. Verify RC35-C.1 on real FakeKVCacheStore returning
+    # list[tuple[bytes, SimpleNamespace(status=...)]]:
     #    - HOST resident key -> True, zero pins taken, _remote_slices untouched
     #    - REMOTE resident key -> True, zero pins taken, _remote_slices untouched
-    #    - Negative control A: HBM status WITHOUT active admission -> False (stale residue)
+    #    - Negative control A: HBM status WITHOUT active admission -> False
+    #      (stale residue)
     #    - Positive control B: HBM status WITH active admission -> True (save in flight)
     #    - Negative control C: Partial sub-hash miss (3 of 4 sub-hashes) -> False
-    hashes = [f"dsv4_blk_{i:04d}".encode("utf-8") for i in range(8)]
+    hashes = [f"dsv4_blk_{i:04d}".encode() for i in range(8)]
     key_host = make_offload_key(hashes[0], 0)
     key_remote = make_offload_key(hashes[1], 0)
     key_stale_hbm = make_offload_key(hashes[2], 0)
@@ -1710,12 +1826,16 @@ def test_rc35c_probe_key_resident_non_pinning_and_prefix_aware_scheduler():
     store.global_entries.clear()
     mgr._hash_to_admission.clear()
 
-    # 2. Verify RC35-C.2 & RC35-C.3: DeepSeek-V4 Hybrid MLA (full-attn) + SWA (sliding window)
-    #    - Group 0 (MLA full-attn): tokens_per_chunk=4096, hashes_per_chunk=4, sliding_window=None
+    # 2. Verify RC35-C.2 & RC35-C.3: DeepSeek-V4 Hybrid MLA (full-attn) +
+    #    SWA (sliding window)
+    #    - Group 0 (MLA full-attn): tokens_per_chunk=4096, hashes_per_chunk=4,
+    #      sliding_window=None
     #    - Group 1 (SWA sliding-window): tokens_per_chunk=1024, hashes_per_chunk=1,
     #      sliding_window_size_in_chunks=1, alignment_chunk_count=4
-    #    In upstream scheduler.py, is_store_reachable_swa_chunk skips storing early SWA chunks
-    #    0, 1, 2 (segment 0) and 4, 5, 6 (segment 1), storing ONLY trailing SWA chunks 3 and 7!
+    #    In upstream scheduler.py, is_store_reachable_swa_chunk skips storing
+    #    early SWA chunks
+    #    0, 1, 2 (segment 0) and 4, 5, 6 (segment 1), storing ONLY trailing
+    #    SWA chunks 3 and 7!
     mla_group = GroupOffloadConfig(
         group_idx=0,
         tokens_per_block=1024,
@@ -1743,7 +1863,8 @@ def test_rc35c_probe_key_resident_non_pinning_and_prefix_aware_scheduler():
     seed_host_entries(store, make_offload_key(hashes[3], 0), device_block_size_factor=4)
     seed_host_entries(store, make_offload_key(hashes[7], 0), device_block_size_factor=4)
 
-    # Seed SWA chunks ONLY where is_store_reachable_swa_chunk is True (chunks 3 and 7; 0..2 and 4..6 skipped!)
+    # Seed SWA chunks ONLY where is_store_reachable_swa_chunk is True
+    # (chunks 3 and 7; 0..2 and 4..6 skipped!)
     reachable_swa_chunks = []
     for swa_chunk_idx in range(8):
         if is_store_reachable_swa_chunk(
@@ -1765,7 +1886,7 @@ def test_rc35c_probe_key_resident_non_pinning_and_prefix_aware_scheduler():
     raiden_sched.config = dsv4_offload_cfg
     raiden_sched._raiden_manager = mgr
 
-    cold_hashes = [f"cold_blk_{i:04d}".encode("utf-8") for i in range(8)]
+    cold_hashes = [f"cold_blk_{i:04d}".encode() for i in range(8)]
     req_warm_raiden = SimpleNamespace(
         num_tokens=8193,
         num_computed_tokens=0,
@@ -1783,19 +1904,22 @@ def test_rc35c_probe_key_resident_non_pinning_and_prefix_aware_scheduler():
         arrival_time=9.0,
     )
 
-    # Both MLA chunks (0, 1) and trailing SWA chunks (3, 7) are resident -> full 8192 tokens!
+    # Both MLA chunks (0, 1) and trailing SWA chunks (3, 7) are resident
+    # -> full 8192 tokens!
     ext_warmth = raiden_sched.estimate_external_prefix_warmth(req_warm_raiden, 0)
     assert ext_warmth == 8192
     assert store.pinned_hashes() == {}
 
-    # Step-down verification: if trailing SWA chunk 7 is evicted, warmth steps down to 4096 (segment 0)
+    # Step-down verification: if trailing SWA chunk 7 is evicted, warmth
+    # steps down to 4096 (segment 0)
     for sh in expand_test_sub_hashes(
         make_offload_key(hashes[7], 1), device_block_size_factor=4
     ):
         del store.entries[sh]
     assert raiden_sched.estimate_external_prefix_warmth(req_warm_raiden, 0) == 4096
 
-    # Negative control: if SWA chunk 3 is ALSO evicted, no aligned segment has SWA coverage -> 0
+    # Negative control: if SWA chunk 3 is ALSO evicted, no aligned segment
+    # has SWA coverage -> 0
     for sh in expand_test_sub_hashes(
         make_offload_key(hashes[3], 1), device_block_size_factor=4
     ):
@@ -1821,13 +1945,17 @@ def test_rc35c_probe_key_resident_non_pinning_and_prefix_aware_scheduler():
 
     def _prefix_warmth_with_ext(self, request):
         kvm = self.kv_cache_manager
-        if not kvm.enable_caching or getattr(request, "skip_reading_prefix_cache", False):
+        if not kvm.enable_caching or getattr(
+            request, "skip_reading_prefix_cache", False
+        ):
             return 0
         if getattr(request, "num_computed_tokens", 0) > 0:
             return request.num_computed_tokens
         max_hit_len = max(getattr(request, "num_tokens", 1) - 1, 0)
         try:
-            result = kvm.coordinator.find_longest_cache_hit(request.block_hashes, max_hit_len)
+            result = kvm.coordinator.find_longest_cache_hit(
+                request.block_hashes, max_hit_len
+            )
             local_warmth = int(result[1])
         except Exception:
             return 0
@@ -1846,6 +1974,7 @@ def test_rc35c_probe_key_resident_non_pinning_and_prefix_aware_scheduler():
         return local_warmth
 
     import types
+
     paw._prefix_warmth = types.MethodType(_prefix_warmth_with_ext, paw)
 
     key_raiden, warmth_raiden = paw._rank_and_warmth(req_warm_raiden)
@@ -1878,7 +2007,8 @@ def test_rc35c_probe_key_resident_non_pinning_and_prefix_aware_scheduler():
 
 
 def benchmark_3way_prefix_warmth_ranking(iters: int = 500) -> dict[str, float]:
-    """Run 3-Way benchmark for _promote_warmest selection: Scalar Python vs Vectorized NumPy vs O(W) Candidate."""
+    """Run 3-Way benchmark for _promote_warmest selection: Scalar Python
+    vs Vectorized NumPy vs O(W) Candidate."""
     window = 64
     num_blocks_per_req = 64
     block_size = 64
@@ -1920,13 +2050,12 @@ def benchmark_3way_prefix_warmth_ranking(iters: int = 500) -> dict[str, float]:
         order = np.lexsort((arrival_times, cold_buf, tier_buf))
         return int(order[0])
 
-    # 3. Candidate O(W) composite int64 argmin (pre-packed static request base key - shifted contig)
+    # 3. Candidate O(W) composite int64 argmin (pre-packed static request
+    # base key - shifted contig)
     composite_key = np.empty((window,), dtype=np.int64)
     arrival_rank = np.arange(window, dtype=np.int64)
     static_base_key = (
-        np.left_shift(tier_buf, 48)
-        | np.left_shift(num_tokens, 16)
-        | arrival_rank
+        np.left_shift(tier_buf, 48) | np.left_shift(num_tokens, 16) | arrival_rank
     )
 
     def candidate_composite_best():
@@ -1973,11 +2102,13 @@ def test_check5_three_way_vectorized_numpy_baseline_prefix_warmth_ranking():
     res = benchmark_3way_prefix_warmth_ranking(iters=500)
     assert res["vectorized_numpy_us"] < res["scalar_python_us"]
     assert res["candidate_composite_us"] < res["vectorized_numpy_us"]
-    # Executes in single-digit microseconds (<< 0.1% of a ~45 ms decode step, TRAP25 <= 5.0%)
+    # Executes in single-digit microseconds (<< 0.1% of a ~45 ms decode step,
+    # TRAP25 <= 5.0%)
     assert res["candidate_composite_us"] < 50.0
 
 
 if __name__ == "__main__":
+
     class _CpuDevicePlugin:
         def pytest_configure(self, config):
             config.option.use_tpu = False
