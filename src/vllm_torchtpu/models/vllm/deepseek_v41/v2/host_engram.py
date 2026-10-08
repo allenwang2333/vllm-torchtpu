@@ -15,6 +15,7 @@ editing the shared runner: ``forward_model`` calls
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import repeat
 from typing import Any
 
 import numpy as np
@@ -108,7 +109,7 @@ def _resolve_async_spec_state(runner: Any, pre_async: Any) -> _AsyncSpecState | 
     sampled_cpu: Any = wait_for_copy() if callable(wait_for_copy) else None
     if not isinstance(sampled_cpu, torch.Tensor):
         return None
-    sampled = np.asarray(sampled_cpu)
+    sampled = sampled_cpu.numpy()
     if sampled.ndim == 1:
         sampled = sampled[:, None]
     num_rows = int(sampled.shape[0])
@@ -122,8 +123,11 @@ def _resolve_async_spec_state(runner: Any, pre_async: Any) -> _AsyncSpecState | 
     valid = sampled != -1
     lengths = valid.sum(axis=1, dtype=np.int64)
     # Compact each row's valid tokens to its front, preserving their order.
-    order = np.argsort(~valid, axis=1, kind="stable")
-    tokens = np.take_along_axis(sampled, order, axis=1)
+    if valid.shape[1] <= 1 or bool(np.all(valid[:, :-1] >= valid[:, 1:])):
+        tokens = sampled
+    else:
+        order = np.argsort(~valid, axis=1, kind="stable")
+        tokens = np.take_along_axis(sampled, order, axis=1)
     num_draft = np.zeros(num_rows, dtype=np.int64)
     num_draft_per_req = getattr(pre_async, "num_draft_per_req", None) or {}
     if num_draft_per_req:
@@ -140,11 +144,12 @@ def _resolve_async_spec_state(runner: Any, pre_async: Any) -> _AsyncSpecState | 
     else:
         rejected = np.zeros(num_rows, dtype=np.int64)
     discard = getattr(pre_async, "discard_sampled_tokens_req_indices", None) or ()
-    discard_idx = np.fromiter((int(i) for i in discard), dtype=np.int64)
-    discard_idx = discard_idx[(discard_idx >= 0) & (discard_idx < num_rows)]
-    if discard_idx.size:
-        lengths = lengths.copy()
-        lengths[discard_idx] = 0
+    if discard:
+        discard_idx = np.fromiter((int(i) for i in discard), dtype=np.int64)
+        discard_idx = discard_idx[(discard_idx >= 0) & (discard_idx < num_rows)]
+        if discard_idx.size:
+            lengths = lengths.copy()
+            lengths[discard_idx] = 0
     return _AsyncSpecState(stride, tokens, lengths, rejected, num_draft)
 
 
@@ -162,6 +167,30 @@ class _SampledOverlay:
     lengths: np.ndarray
 
 
+def _acquire_host_scratch(
+    runner: Any, attr: str, template: torch.Tensor, active_len: int
+) -> torch.Tensor:
+    """Return a reusable host scratch tensor synced over ``[:active_len]``."""
+    scratch: Any = getattr(runner, attr, None)
+    dirty_attr = f"{attr}_dirty"
+    if (
+        not isinstance(scratch, torch.Tensor)
+        or scratch.shape != template.shape
+        or scratch.dtype != template.dtype
+    ):
+        scratch = template.clone()
+        setattr(runner, attr, scratch)
+        setattr(runner, dirty_attr, active_len)
+        return scratch
+    sync_len = min(
+        int(template.shape[0]),
+        max(active_len, int(getattr(runner, dirty_attr, int(template.shape[0])))),
+    )
+    scratch.numpy()[:sync_len] = template.numpy()[:sync_len]
+    setattr(runner, dirty_attr, active_len)
+    return scratch
+
+
 def _resolve_decode_lookback_cpu(
     runner,
     batch,
@@ -172,9 +201,20 @@ def _resolve_decode_lookback_cpu(
     sampled_overlay: _SampledOverlay | None = None,
 ) -> torch.Tensor:
     """Fill lookback_token_ids on CPU for both prompt and generated positions."""
-    lookback = runner.lookback_token_ids.cpu.clone()
+    src_lookback = runner.lookback_token_ids.cpu
     if num_reqs <= 0:
-        return lookback
+        return src_lookback.clone()
+    lookback: Any = getattr(runner, "_host_engram_lookback_scratch", None)
+    if (
+        not isinstance(lookback, torch.Tensor)
+        or lookback.shape != src_lookback.shape
+        or lookback.dtype != src_lookback.dtype
+    ):
+        lookback = torch.empty_like(src_lookback)
+        runner._host_engram_lookback_scratch = lookback
+    lookback_np = lookback.numpy()
+    if num_reqs < int(lookback.shape[0]):
+        lookback_np[num_reqs:] = src_lookback.numpy()[num_reqs:]
     depth = int(lookback.shape[1])
     starts_1d = np.asarray(
         batch.num_computed_tokens_cpu[start_index : start_index + num_reqs],
@@ -187,23 +227,27 @@ def _resolve_decode_lookback_cpu(
     token_ids_cpu = np.asarray(batch.token_ids_cpu)
     max_cols = int(token_ids_cpu.shape[1])
     valid = (pos >= 0) & (pos < max_cols)
-    rows = np.arange(start_index, start_index + num_reqs, dtype=np.int64)[:, None]
-    clipped = np.clip(pos, 0, max(max_cols - 1, 0))
+    local = np.arange(num_reqs, dtype=np.int64)[:, None]
+    rows = local + start_index if start_index else local
+    clipped = np.where(valid, pos, 0)
     gathered = np.where(valid, token_ids_cpu[rows, clipped], -1)
     if sampled_overlay is not None:
         rel = pos - sampled_overlay.starts[:, None]
         hit = (rel >= 0) & (rel < sampled_overlay.lengths[:, None])
         if hit.any():
-            width = int(sampled_overlay.tokens.shape[1])
-            local = np.arange(num_reqs, dtype=np.int64)[:, None]
-            overlay = sampled_overlay.tokens[local, np.clip(rel, 0, width - 1)]
+            overlay = sampled_overlay.tokens[local, np.where(hit, rel, 0)]
             gathered = np.where(hit, overlay, gathered)
-    np.asarray(lookback[:num_reqs])[:] = gathered
+    lookback_np[:num_reqs] = gathered
     return lookback
 
 
 def _ragged_arange(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
     """Concatenation of ``range(starts[i], starts[i] + lengths[i])``."""
+    if lengths.size and bool(np.all(lengths == lengths[0])):
+        return (
+            np.asarray(starts, dtype=np.int64)[:, None]
+            + np.arange(int(lengths[0]), dtype=np.int64)
+        ).reshape(-1)
     offsets = np.repeat(np.cumsum(lengths) - lengths, lengths)
     return (
         np.arange(offsets.shape[0], dtype=np.int64)
@@ -320,12 +364,12 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
     if req_id_to_index and req_ids is not None:
         chunk_req_ids = req_ids[start_index : start_index + chunk_num_reqs]
         pre_pos = np.fromiter(
-            (req_id_to_index.get(req_id, -1) for req_id in chunk_req_ids),
+            map(req_id_to_index.get, chunk_req_ids, repeat(-1)),
             dtype=np.int64,
             count=chunk_num_reqs,
         )
-        qsl = np.asarray(runner.query_start_loc_cpu[: chunk_num_reqs + 1]).astype(
-            np.int64
+        qsl = runner.query_start_loc_cpu.numpy()[: chunk_num_reqs + 1].astype(
+            np.int64, copy=False
         )
         q_start = qsl[:-1]
         n_sched = qsl[1:] - q_start
@@ -362,22 +406,33 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
                 lengths=np.where(matched, spec_state.lengths[safe_pos], 0),
             )
         if matched.any():
-            m_start = q_start[matched]
             m_len = n_sched[matched]
-            dst_idx = _ragged_arange(m_start, m_len)
+            dst_idx: slice | np.ndarray = (
+                slice(int(qsl[0]), int(qsl[-1]))
+                if bool(matched.all())
+                else _ragged_arange(q_start[matched], m_len)
+            )
             src_idx = _ragged_arange(pre_pos[matched] * stride, m_len)
             flat_src = _async_source_tokens_cpu(
                 pre_async, prefer_next_tokens_tpu=(spec_state is not None)
             )
             if flat_src is None or int(flat_src.numel()) <= int(src_idx.max()):
                 return _unresolved_host_inputs(runner, all_prompt)
-            ids = runner.input_ids_cpu.clone()
-            np.asarray(ids)[dst_idx] = np.asarray(flat_src)[src_idx]
+            active_len = int(qsl[-1])
+            ids = _acquire_host_scratch(
+                runner, "_host_engram_ids_scratch", runner.input_ids_cpu, active_len
+            )
+            ids.numpy()[dst_idx] = flat_src.numpy()[src_idx]
             if rejected_by_req is not None:
                 m_rej = rejected_by_req[matched]
                 if m_rej.any():
-                    positions = runner.positions_cpu.clone()
-                    np.asarray(positions)[dst_idx] -= np.repeat(m_rej, m_len)
+                    positions = _acquire_host_scratch(
+                        runner,
+                        "_host_engram_pos_scratch",
+                        runner.positions_cpu,
+                        active_len,
+                    )
+                    positions.numpy()[dst_idx] -= np.repeat(m_rej, m_len)
 
     lookback = _resolve_decode_lookback_cpu(
         runner,

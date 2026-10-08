@@ -216,6 +216,18 @@ def test_resolve_async_spec_state_branches():
     assert plain.lengths.tolist() == [1, 0]
     assert plain.rejected.tolist() == [0, 0]
 
+    # Non-empty discard list where all indices are out of range -> lengths unchanged.
+    pre_oob_discard = SimpleNamespace(
+        req_id_to_index_copy={"a": 0},
+        wait_for_copy=lambda: torch.tensor([[7, 8, -1]], dtype=torch.int32),
+        spec_decode_num_rejected_tokens=None,
+        num_draft_per_req=None,
+        discard_sampled_tokens_req_indices=[99, -5],
+    )
+    oob_discard = he._resolve_async_spec_state(runner, pre_oob_discard)
+    assert oob_discard is not None
+    assert oob_discard.lengths.tolist() == [2]
+
     # Out-of-range previous index -> None (host falls back to the device hash).
     pre_oob = SimpleNamespace(
         req_id_to_index_copy={"a": 3},
@@ -234,6 +246,8 @@ def test_resolve_async_spec_state_branches():
 def test_ragged_arange():
     out = he._ragged_arange(np.array([10, 20, 30]), np.array([2, 0, 3]))
     assert out.tolist() == [10, 11, 30, 31, 32]
+    uniform = he._ragged_arange(np.array([10, 20]), np.array([2, 2]))
+    assert uniform.tolist() == [10, 11, 20, 21]
     empty = np.array([], dtype=np.int64)
     assert he._ragged_arange(empty, empty).tolist() == []
 
@@ -267,3 +281,33 @@ def test_lookback_overlay_edges():
     )
     out_far = he._resolve_decode_lookback_cpu(runner, batch, 2, 0, sampled_overlay=far)
     assert out_far.tolist() == [[105, 104, 103], [115, 114, 113]]
+
+
+def test_host_scratch_buffer_reuse_and_resync():
+    runner = _make_runner(4, seed=11)
+    # Pad input_ids_cpu and positions_cpu to a larger max_num_batched_tokens
+    runner.input_ids_cpu = torch.zeros(64, dtype=torch.int32)
+    pos_base = (
+        runner.input_batch.num_computed_tokens_cpu[:, None] + np.arange(6)
+    ).reshape(-1)
+    runner.positions_cpu = torch.zeros(64, dtype=torch.int64)
+    runner.positions_cpu[:24] = torch.from_numpy(pos_base)
+
+    res1 = he.capture_host_engram_inputs(runner, 4)
+    assert res1 is not None and res1.host_ready is True
+    ids_scratch = runner._host_engram_ids_scratch
+    pos_scratch = runner._host_engram_pos_scratch
+    lb_scratch = runner._host_engram_lookback_scratch
+    assert res1.input_ids is ids_scratch
+    assert res1.positions is pos_scratch
+    assert res1.lookback_token_ids is lb_scratch
+
+    # Second step with fewer active requests (2 instead of 4) reuses the exact
+    # same scratch tensors and restores the previously dirtied tail [12:24].
+    res2 = he.capture_host_engram_inputs(runner, 2)
+    assert res2 is not None and res2.host_ready is True
+    assert res2.input_ids is ids_scratch
+    assert res2.positions is pos_scratch
+    assert res2.lookback_token_ids is lb_scratch
+    assert torch.equal(res2.input_ids[12:24], runner.input_ids_cpu[12:24])
+    assert torch.equal(res2.positions[12:24], runner.positions_cpu[12:24])
