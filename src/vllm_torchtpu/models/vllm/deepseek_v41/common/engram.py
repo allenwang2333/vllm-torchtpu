@@ -411,7 +411,7 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         if indices.device != work_device:
             indices = indices.to(work_device)
         rows, valid = self._select_local_heads(indices)
-        values = weight.view(torch.uint8)[rows].view(weight.dtype).float()
+        values = weight[rows].float()
         scale = (
             (scales[rows].to(torch.int32) << 23)
             .view(torch.float32)

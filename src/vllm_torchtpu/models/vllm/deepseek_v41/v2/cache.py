@@ -225,7 +225,6 @@ _write_op = None
 _write_values_op = None
 _write_values_2bank_op = None
 _write_values_after_op = None
-_write_values_after_2bank_op = None
 _encode_fp8_op = None
 
 
@@ -407,26 +406,23 @@ class PagedCacheRows:
                 )
             return
         rec = records.int()
-        if self.raw_hi is not None:
-            if after is not None:
-                assert _write_values_after_2bank_op is not None
-                self.copy_raw(
-                    _write_values_after_2bank_op(
-                        self.raw, self.raw_hi, rec, values, after
-                    )
-                )
-            else:
-                assert _write_values_2bank_op is not None
-                self.copy_raw(
-                    _write_values_2bank_op(self.raw, self.raw_hi, rec, values)
-                )
-            return
         if after is not None:
             assert _write_values_after_op is not None
             self.raw.copy_(_write_values_after_op(self.raw, rec, values, after))
-        else:
-            assert _write_values_op is not None
-            self.raw.copy_(_write_values_op(self.raw, rec, values))
+            if self.raw_hi is not None:
+                rec_hi = torch.where(
+                    rec >= self.bank_records, rec - self.bank_records, -1
+                )
+                self.raw_hi.copy_(
+                    _write_values_after_op(self.raw_hi, rec_hi, values, after)
+                )
+            return
+        if self.raw_hi is not None:
+            assert _write_values_2bank_op is not None
+            self.copy_raw(_write_values_2bank_op(self.raw, self.raw_hi, rec, values))
+            return
+        assert _write_values_op is not None
+        self.raw.copy_(_write_values_op(self.raw, rec, values))
 
     def _write_fp8(self, records, values):
         """Quantize BF16 latents into NoPE rows and their RoPE companion slots."""
@@ -826,7 +822,6 @@ def encode_fp8_kv(latent: jax.Array) -> tuple[jax.Array, jax.Array]:
 def initialize_cache_ops():
     global _read_values_op, _read_values_2bank_op, _write_op, _write_values_op
     global _write_values_2bank_op, _encode_fp8_op, _write_values_after_op
-    global _write_values_after_2bank_op
     if _write_op is not None:
         return
     from jax.sharding import PartitionSpec as P
@@ -948,32 +943,6 @@ def initialize_cache_ops():
     )
     _write_values_after_op.register_fake(
         lambda cache, records, values, after: torch.empty_like(cache)
-    )
-
-    def write_values_after_2bank(
-        cache_lo: jax.Array,
-        cache_hi: jax.Array,
-        records: jax.Array,
-        values: jax.Array,
-        after: jax.Array,
-    ) -> tuple[jax.Array, jax.Array]:
-        cache_lo, cache_hi, _ = jax.lax.optimization_barrier(
-            (cache_lo, cache_hi, after)
-        )
-        return write_values_2bank(cache_lo, cache_hi, records, values)
-
-    _write_values_after_2bank_op = pallas.jax_op(
-        "pallas::dsv41v2_cache_write_values_after_2bank",
-        write_values_after_2bank,
-        donate_argnums=(0, 1),
-        mesh=mesh,
-        input_partition_specs=(P(), P(), P(), P(), P()),
-    )
-    _write_values_after_2bank_op.register_fake(
-        lambda cache_lo, cache_hi, records, values, after: (
-            torch.empty_like(cache_lo),
-            torch.empty_like(cache_hi),
-        )
     )
     _encode_fp8_op = pallas.jax_op(
         "pallas::dsv41v2_encode_fp8_kv",

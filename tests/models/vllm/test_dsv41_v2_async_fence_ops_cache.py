@@ -656,10 +656,7 @@ class TestPagedCacheRows:
         paged_2b.raw.copy_.assert_called_once()
         paged_2b.raw_hi.copy_.assert_called_once()
 
-        mock_write_after_2b = MagicMock(return_value=(torch.zeros(1), torch.zeros(1)))
-        monkeypatch.setattr(
-            v2_cache, "_write_values_after_2bank_op", mock_write_after_2b
-        )
+        mock_write_after.reset_mock()
         paged_2b.raw.copy_.reset_mock()
         paged_2b.raw_hi.copy_.reset_mock()
         paged_2b.write(
@@ -667,7 +664,7 @@ class TestPagedCacheRows:
             torch.zeros(2, 128, dtype=torch.bfloat16),
             after=torch.tensor(1),
         )
-        mock_write_after_2b.assert_called_once()
+        assert mock_write_after.call_count == 2
         paged_2b.raw.copy_.assert_called_once()
         paged_2b.raw_hi.copy_.assert_called_once()
 
@@ -994,12 +991,6 @@ class TestCacheMutationOps:
         assert res_wv2b_lo.shape == c_jax.shape
         assert res_wv2b_hi.shape == c_jax.shape
 
-        wva2b = captured_ops.get("pallas::dsv41v2_cache_write_values_after_2bank")
-        assert wva2b is not None
-        res_wva2b_lo, res_wva2b_hi = wva2b(c_jax, c_jax, r_jax, v_jax, after_jax)
-        assert res_wva2b_lo.shape == c_jax.shape
-        assert res_wva2b_hi.shape == c_jax.shape
-
         # Exercise registered fake handlers
         from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -1031,16 +1022,11 @@ class TestCacheMutationOps:
             assert out_wv2b_lo.shape == c_fake.shape
             assert out_wv2b_hi.shape == c_fake.shape
 
-            # _write_values_after_op and _write_values_after_2bank_op fakes
+            # _write_values_after_op fake
             out_wva = v2_cache._write_values_after_op(
                 c_fake, r_fake, val_fake, out_read
             )
             assert out_wva.shape == c_fake.shape
-            out_wva2b_lo, out_wva2b_hi = v2_cache._write_values_after_2bank_op(
-                c_fake, c_fake, r_fake, val_fake, out_read
-            )
-            assert out_wva2b_lo.shape == c_fake.shape
-            assert out_wva2b_hi.shape == c_fake.shape
 
             # _encode_fp8_op fake
             lat_fake = torch.empty(4, 512, dtype=torch.bfloat16)
