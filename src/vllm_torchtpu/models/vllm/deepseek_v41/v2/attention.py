@@ -471,6 +471,50 @@ def _read_rows(cache, block_table, requests, logical):
     return cache[slots // cache.shape[1], slots % cache.shape[1]]
 
 
+def _sp_gather_inputs(
+    qr, kv, kv_score, indexer_weights, *, local_q: bool, num_tokens: int
+):
+    """All-gather this rank's SP token shard of the input projections.
+
+    One collective per layer. ``qr`` (``q_lora_rank``), ``kv``
+    (``head_dim``) and ``indexer_weights`` (``indexer.n_head``) share the
+    activation dtype and are concatenated along the feature axis.
+    ``kv_score`` is the fp32 ``[T_local, head_dim + 1]`` compressor
+    projection; the collective only moves bytes, so it rides along as
+    ``2 * (head_dim + 1)`` activation-dtype columns through a dtype
+    bit-view and is viewed back to fp32 after the gather. That is
+    bit-exact and saves the second all-gather launch (and its barrier)
+    on every compressed-KV source layer of every prefill chunk.
+
+    Non-source layers with local_q do not consume full-token ``qr`` on
+    the host, so they gather only ``kv`` (512 cols instead of 2048).
+    """
+    gather_qr = indexer_weights is not None or not local_q
+    parts = []
+    if gather_qr:
+        parts.append(qr)
+    parts.append(kv)
+    if indexer_weights is not None:
+        parts.append(indexer_weights)
+    if kv_score is not None:
+        parts.append(kv_score.contiguous().view(kv.dtype))
+    assert all(part.dtype == kv.dtype for part in parts)
+    payload = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+    gathered = sp_all_gather(payload)[:num_tokens]
+    pieces = iter(
+        piece.contiguous()
+        for piece in gathered.split([part.shape[-1] for part in parts], dim=-1)
+    )
+    if gather_qr:
+        qr = next(pieces)
+    kv = next(pieces)
+    if indexer_weights is not None:
+        indexer_weights = next(pieces)
+    if kv_score is not None:
+        kv_score = next(pieces).view(kv_score.dtype)
+    return qr, kv, kv_score, indexer_weights
+
+
 class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     backend_cls = AttentionBackend
     swa_backend_cls = AttentionBackend
@@ -590,34 +634,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             else None
         )
         if self._sp_sharded_input:
-            if indexer_weights is not None:
-                assert qr.dtype == kv.dtype == indexer_weights.dtype
-                packed = sp_all_gather(torch.cat((qr, kv, indexer_weights), dim=-1))[
-                    :num_tokens
-                ]
-                qr, kv, indexer_weights = (
-                    t.contiguous()
-                    for t in packed.split(
-                        (self.q_lora_rank, self.head_dim, self.indexer.n_head),
-                        dim=-1,
-                    )
-                )
-            elif qr_local is not None:
-                # Non-source encoder layers with local_q do not consume
-                # full-token qr on the host; gather only kv (512 cols vs 2048).
-                kv = sp_all_gather(kv)[:num_tokens]
-            else:
-                assert qr.dtype == kv.dtype
-                packed = sp_all_gather(torch.cat((qr, kv), dim=-1))[:num_tokens]
-                qr, kv = (
-                    t.contiguous()
-                    for t in packed.split(
-                        (self.q_lora_rank, self.head_dim),
-                        dim=-1,
-                    )
-                )
-            if kv_score is not None:
-                kv_score = sp_all_gather(kv_score)[:num_tokens]
+            qr, kv, kv_score, indexer_weights = _sp_gather_inputs(
+                qr,
+                kv,
+                kv_score,
+                indexer_weights,
+                local_q=qr_local is not None,
+                num_tokens=num_tokens,
+            )
         args = (
             hidden_states,
             qr,

@@ -420,8 +420,21 @@ def test_attention_forward_sp_sharded_with_indexer_weights(monkeypatch):
 
     out = v2_attn.DeepseekV41Attention.forward(attn, positions, hidden_states)
     assert out.shape == (4, 16, 128)
-    # 2 gathers: packed (qr, kv, indexer_weights) and kv_score
-    assert len(gathered) == 2
+    # One gather: (qr, kv, indexer_weights) plus kv_score bit-viewed into the
+    # activation dtype (EXT-3c). Here every projection is fp32, so kv_score
+    # contributes head_dim + 1 columns as-is.
+    assert len(gathered) == 1
+    call_args = attn._prepare_and_attn_fn.call_args[0]
+    qr, kv, kv_score, indexer_weights = (
+        call_args[1],
+        call_args[2],
+        call_args[4],
+        call_args[5],
+    )
+    assert gathered[0].shape[-1] == (
+        qr.shape[-1] + kv.shape[-1] + indexer_weights.shape[-1] + kv_score.shape[-1]
+    )
+    assert kv_score.dtype == torch.float32
     attn._prepare_and_attn_fn.assert_called_once()
 
 

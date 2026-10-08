@@ -410,11 +410,12 @@ class TestSpAllGatherRoutingKvOnly:
             torch.zeros(tokens_local, 8),
         )
 
-        assert len(gathered_tensors) == 2
-        # Gathered concatenated (qr, kv, indexer_weights) = 16 + 128 + 8 = 152 cols
-        assert gathered_tensors[0].shape == (tokens_local, 16 + 128 + 8)
-        # Gathered kv_score
-        assert gathered_tensors[1].shape == (tokens_local, 1)
+        # One collective (EXT-3c): (qr, kv, indexer_weights) = 16 + 128 + 8 cols
+        # plus kv_score bit-viewed into kv's dtype. Everything is fp32 here, so
+        # kv_score adds its 1 column as-is (2 bf16 cols per fp32 in production).
+        assert len(gathered_tensors) == 1
+        assert gathered_tensors[0].shape == (tokens_local, 16 + 128 + 8 + 1)
+        assert gathered_tensors[0].dtype == kv.dtype
         assert seen_args["qr"].shape == (tokens_global, 16)
         assert seen_args["kv"].shape == (tokens_global, 128)
         assert seen_args["kv_score"].shape == (tokens_global, 1)

@@ -587,10 +587,20 @@ def test_forward_sp_sharded_with_indexer_weights(monkeypatch):
     positions = torch.arange(num_tokens, dtype=torch.int64)
 
     DeepseekV41Attention.forward(self_obj, positions, hidden)
-    assert len(gathered_calls) == 2  # packed (qr, kv, indexer) + kv_score
-    assert gathered_calls[0].shape == (num_tokens, q_lora_rank + head_dim + n_head)
-    assert gathered_calls[1].shape == kv_score.shape
+    # One bf16 collective (EXT-3c): (qr, kv, indexer) plus the fp32 kv_score
+    # bit-viewed as 2 bf16 columns per value.
+    assert len(gathered_calls) == 1
+    assert gathered_calls[0].dtype == torch.bfloat16
+    assert gathered_calls[0].shape == (
+        num_tokens,
+        q_lora_rank + head_dim + n_head + 2 * kv_score.shape[-1],
+    )
     assert attn_fn_mock.called
+    args = attn_fn_mock.call_args[0]
+    assert torch.equal(args[1], qr)
+    assert torch.equal(args[2], kv)
+    assert args[4].dtype == torch.float32 and torch.equal(args[4], kv_score)
+    assert torch.equal(args[5], indexer_w)
 
 
 def test_forward_sp_sharded_indexer_weights_dtype_mismatch_raises():

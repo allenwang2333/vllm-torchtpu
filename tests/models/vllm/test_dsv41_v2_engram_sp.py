@@ -332,9 +332,10 @@ def test_sp_sharded_attention_input_projections_match_tp(monkeypatch, has_source
 
     def fake_sp_all_gather(local_tensor: torch.Tensor) -> torch.Tensor:
         gather_widths.append(local_tensor.shape[-1])
-        # Replay the same local projection across all ranks to form the gathered tensor.
-        if local_tensor.dtype == torch.float32:
-            return torch.cat([s.float() @ w_comp for s in rank_Valid_shards], dim=0)
+        assert local_tensor.dtype == torch.bfloat16
+        # Replay the same local projection across all ranks to form the gathered
+        # tensor. Source layers ship the fp32 kv_score inside the same bf16
+        # payload as 2 bit-viewed columns per value (EXT-3c).
         pieces = []
         for s in rank_Valid_shards:
             qr_kv_r = s @ w_qkv
@@ -342,7 +343,8 @@ def test_sp_sharded_attention_input_projections_match_tp(monkeypatch, has_source
             kv_r = qr_kv_r[:, q_lora:] * 3.0
             if has_source:
                 idx_r = s @ w_idx
-                pieces.append(torch.cat((qr_r, kv_r, idx_r), dim=-1))
+                score_bits_r = (s.float() @ w_comp).contiguous().view(torch.bfloat16)
+                pieces.append(torch.cat((qr_r, kv_r, idx_r, score_bits_r), dim=-1))
             else:
                 pieces.append(torch.cat((qr_r, kv_r), dim=-1))
         return torch.cat(pieces, dim=0)
@@ -361,13 +363,16 @@ def test_sp_sharded_attention_input_projections_match_tp(monkeypatch, has_source
         sp_attn.captured["kv"], tp_attn.captured["kv"], rtol=0, atol=0
     )
     if has_source:
-        assert gather_widths == [q_lora + head_dim + n_idx_heads, head_dim + 1]
+        # One collective: qr | kv | indexer_weights | kv_score as 2 bf16 cols/fp32.
+        assert gather_widths == [q_lora + head_dim + n_idx_heads + 2 * (head_dim + 1)]
         torch.testing.assert_close(
             sp_attn.captured["indexer_weights"],
             tp_attn.captured["indexer_weights"],
             rtol=0,
             atol=0,
         )
+        assert sp_attn.captured["kv_score"].dtype == torch.float32
+        assert sp_attn.captured["kv_score"].shape == (num_tokens, head_dim + 1)
         torch.testing.assert_close(
             sp_attn.captured["kv_score"],
             tp_attn.captured["kv_score"],
@@ -378,6 +383,104 @@ def test_sp_sharded_attention_input_projections_match_tp(monkeypatch, has_source
         assert gather_widths == [q_lora + head_dim]
         assert sp_attn.captured["indexer_weights"] is None
         assert sp_attn.captured["kv_score"] is None
+
+
+@pytest.mark.parametrize("local_q", [False, True])
+@pytest.mark.parametrize("has_indexer", [False, True])
+@pytest.mark.parametrize("has_score", [False, True])
+def test_sp_gather_inputs_single_collective_bit_exact(
+    monkeypatch, local_q, has_indexer, has_score
+):
+    """`_sp_gather_inputs` issues exactly one `sp_all_gather` per layer and
+    round-trips every component bit-exactly, including the fp32 `kv_score`
+    carried as bf16 bit-view columns (NaN / inf / -0.0 / denormal payloads
+    included, which a numeric cast would destroy)."""
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention as v2_attn
+
+    ranks, t_local, q_lora, head_dim, n_head = 4, 3, 16, 8, 4
+    gen = torch.Generator().manual_seed(7)
+    # Per-rank shards; rank 0 is "this" rank.
+    qr_all = torch.randn(ranks, t_local, q_lora, generator=gen).to(torch.bfloat16)
+    kv_all = torch.randn(ranks, t_local, head_dim, generator=gen).to(torch.bfloat16)
+    idx_all = torch.randn(ranks, t_local, n_head, generator=gen).to(torch.bfloat16)
+    score_all = torch.randn(ranks, t_local, head_dim + 1, generator=gen)
+    score_all[0, 0, :4] = torch.tensor([float("nan"), float("inf"), -0.0, 1e-40])
+    score_all[1, 2, 0] = float("-inf")
+
+    calls: list[torch.Tensor] = []
+
+    def fake_sp_all_gather(payload):
+        calls.append(payload)
+        # Rebuild each rank's payload the same way and stack along tokens.
+        width = payload.shape[-1]
+        out = []
+        for r in range(ranks):
+            parts = []
+            if has_indexer or not local_q:
+                parts.append(qr_all[r])
+            parts.append(kv_all[r])
+            if has_indexer:
+                parts.append(idx_all[r])
+            if has_score:
+                parts.append(score_all[r].view(torch.bfloat16))
+            rank_payload = torch.cat(parts, dim=-1)
+            assert rank_payload.shape[-1] == width
+            out.append(rank_payload)
+        return torch.cat(out, dim=0)
+
+    monkeypatch.setattr(v2_attn, "sp_all_gather", fake_sp_all_gather)
+    # Views into non-contiguous storage to exercise the .contiguous() paths.
+    kv_score_in = score_all[0].t().contiguous().t() if has_score else None
+    qr_local = qr_all[0]
+    qr, kv, kv_score, idx = v2_attn._sp_gather_inputs(
+        qr_local,
+        kv_all[0],
+        kv_score_in,
+        idx_all[0] if has_indexer else None,
+        local_q=local_q,
+        num_tokens=ranks * t_local,
+    )
+
+    assert len(calls) == 1
+    assert calls[0].dtype == torch.bfloat16
+    expected_width = head_dim
+    if has_indexer or not local_q:
+        expected_width += q_lora
+    if has_indexer:
+        expected_width += n_head
+    if has_score:
+        expected_width += 2 * (head_dim + 1)
+    assert calls[0].shape == (t_local, expected_width)
+
+    assert torch.equal(kv, kv_all.reshape(-1, head_dim))
+    if has_indexer or not local_q:
+        assert torch.equal(qr, qr_all.reshape(-1, q_lora))
+    else:
+        assert qr is qr_local  # local_q non-source layer: qr stays local
+    if has_indexer:
+        assert torch.equal(idx, idx_all.reshape(-1, n_head))
+    else:
+        assert idx is None
+    if has_score:
+        assert kv_score.dtype == torch.float32
+        assert kv_score.shape == (ranks * t_local, head_dim + 1)
+        # Compare bit patterns: NaN != NaN numerically, but the bits must match.
+        assert torch.equal(
+            kv_score.view(torch.int32),
+            score_all.reshape(-1, head_dim + 1).view(torch.int32),
+        )
+    else:
+        assert kv_score is None
+
+
+def test_sp_gather_inputs_rejects_dtype_mismatch(monkeypatch):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention as v2_attn
+
+    monkeypatch.setattr(v2_attn, "sp_all_gather", lambda t: t)
+    qr = torch.zeros(2, 4, dtype=torch.bfloat16)
+    kv = torch.zeros(2, 8, dtype=torch.float16)
+    with pytest.raises(AssertionError):
+        v2_attn._sp_gather_inputs(qr, kv, None, None, local_q=False, num_tokens=2)
 
 
 def test_write_encoder_global_kv_sp_sharded_matches_tp(monkeypatch):
