@@ -21,11 +21,26 @@ elsewhere as the identical plain-torch algorithm in
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.router_topk import router_topk
+from vllm_torchtpu.kernels.router_topk import router_topk, router_topk_biased
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
 
 
-def _fake_router_topk(scores: torch.Tensor, topk: int):
+def _fake_router_topk(
+    scores: torch.Tensor, topk: int, renormalize: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows = scores.shape[0]
+    return (
+        torch.empty((rows, topk), dtype=torch.float32, device=scores.device),
+        torch.empty((rows, topk), dtype=torch.int32, device=scores.device),
+    )
+
+
+def _fake_router_topk_biased(
+    scores: torch.Tensor,
+    bias: torch.Tensor,
+    topk: int,
+    renormalize: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     rows = scores.shape[0]
     return (
         torch.empty((rows, topk), dtype=torch.float32, device=scores.device),
@@ -38,13 +53,29 @@ def _fake_router_topk(scores: torch.Tensor, topk: int):
 _op = pallas.jax_op("pallas::moe_router_topk", router_topk)
 _op.register_fake(_fake_router_topk)
 
+_biased_op = pallas.jax_op("pallas::moe_router_topk_biased", router_topk_biased)
+_biased_op.register_fake(_fake_router_topk_biased)
 
-def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
+
+def rowmax_select(
+    scores: torch.Tensor,
+    topk: int,
+    *,
+    bias: torch.Tensor | None = None,
+    renormalize: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Sort-free ``topk`` over the expert axis of ``[rows, experts]`` scores."""
     if scores.device.type != "tpu":
-        return rowmax_topk(scores, topk)
+        return rowmax_topk(scores, topk, bias=bias, renormalize=renormalize)
     if scores.dim() != 2:
         raise ValueError(
             f"router top-k kernel expects [rows, experts], got {scores.shape}"
         )
-    return _op(scores.float(), topk)
+    if bias is not None:
+        return _biased_op(
+            scores.float(),
+            bias.float().view(1, scores.shape[1]),
+            topk,
+            renormalize,
+        )
+    return _op(scores.float(), topk, renormalize)

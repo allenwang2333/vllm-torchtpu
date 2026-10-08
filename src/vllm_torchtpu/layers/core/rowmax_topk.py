@@ -25,12 +25,23 @@ import torch
 NEG = -3.0e38
 
 
-def rowmax_topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+def rowmax_topk(
+    scores: torch.Tensor,
+    k: int,
+    *,
+    bias: torch.Tensor | None = None,
+    renormalize: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """``torch.topk(scores, k, dim=-1)`` without the sort.
 
     Returns ``(values, indices)``, values descending and indices int32. Ties
     resolve to the lowest expert id; the sort path leaves them undefined,
     since torch_tpu emits ``is_stable=false``.
+
+    When ``bias`` is provided, experts are ranked by ``scores + bias`` while the
+    returned weights are the unbiased ``scores`` for the selected experts. When
+    ``renormalize=True``, the selected weights are normalized by their row sum
+    (clamped to ``1e-20``).
 
     Scores at or below ``NEG`` are clamped up to it, so every returned index
     is a real expert. A row made entirely of such scores keeps NaN weights and
@@ -40,22 +51,37 @@ def rowmax_topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tenso
     if k > n:
         raise ValueError(f"topk k={k} exceeds the expert count {n}")
     iota = torch.arange(n, device=scores.device, dtype=torch.int32)
-    masked = torch.finfo(scores.dtype).min
+    choice = (
+        scores
+        if bias is None
+        else scores + bias.to(scores.dtype).view([1] * (scores.dim() - 1) + [n])
+    )
+    masked = torch.finfo(choice.dtype).min
 
-    cur = torch.where(scores > NEG, scores, NEG)
+    cur = torch.where(choice > NEG, choice, NEG)
+    first_m: torch.Tensor | None = None
     values, indices = [], []
-    for _ in range(k):
+    for j in range(k):
         m = torch.amax(cur, dim=-1, keepdim=True)
+        if j == 0:
+            first_m = m
         # Lowest column attaining the max; the rest fill with the last expert
         # so the min never selects a phantom.
         idx = torch.amin(torch.where(cur == m, iota, n - 1), dim=-1, keepdim=True)
-        values.append(m)
+        sel = iota == idx
+        if bias is None:
+            values.append(m)
+        else:
+            values.append(torch.where(sel, scores, 0.0).sum(dim=-1, keepdim=True))
         indices.append(idx)
-        cur = torch.where(iota == idx, masked, cur)
+        cur = torch.where(sel, masked, cur)
 
+    assert first_m is not None
     weights = torch.cat(values, dim=-1)
     ids = torch.cat(indices, dim=-1)
+    if renormalize:
+        weights = weights / torch.clamp(weights.sum(dim=-1, keepdim=True), min=1e-20)
     # No score above the sentinel means no real maximum: keep the row
     # poisonous so the caller's renormalization propagates it.
-    weights = torch.where(weights[..., :1] <= NEG, torch.nan, weights)
+    weights = torch.where(first_m <= NEG, torch.nan, weights)
     return weights, ids

@@ -230,19 +230,21 @@ def test_moe_runner_maybe_dispatch_fallback_branches(monkeypatch, neg_case):
 # ==============================================================================
 
 
-def test_gather_partitioned_topk_bitpacked_bf16():
-    """Lines 150-167: bfloat16 + even topk + int32 ids -> packed int32 all_gather."""
+@pytest.mark.parametrize("topk", [3, 6])
+def test_gather_partitioned_topk_bitpacked_bf16(topk):
+    """Lines 153-189: bfloat16 + int32 ids -> 1-word packed int32 all_gather."""
     group = _FakeDistributedGroup(world_size=2, rank=0)
-    tokens, topk = 4, 6
+    tokens = 4
     weights = torch.randn(tokens, topk, dtype=torch.bfloat16)
-    ids = torch.randint(0, 100, (tokens, topk), dtype=torch.int32)
+    ids = torch.randint(0, 384, (tokens, topk), dtype=torch.int32)
+    ids[0, -1] = -1  # Verify sign extension of negative sentinel IDs
 
     out_w, out_i = moe_routing._gather_partitioned_topk(group, weights, ids, topk)
 
     assert len(group.all_gather_calls) == 1
     packed_sent, dim = group.all_gather_calls[0]
     assert dim == 0
-    assert packed_sent.shape == (tokens, topk // 2 + topk)
+    assert packed_sent.shape == (tokens, topk)
     assert packed_sent.dtype == torch.int32
     assert out_w.shape == (tokens * 2, topk)
     assert out_w.dtype == torch.bfloat16
@@ -254,7 +256,7 @@ def test_gather_partitioned_topk_bitpacked_bf16():
 
 
 def test_gather_partitioned_topk_bitpacked_fp16():
-    """Lines 150-167: float16 + even topk + int32 ids -> packed int32 all_gather."""
+    """Lines 153-189: float16 + int32 ids -> 1-word packed int32 all_gather."""
     group = _FakeDistributedGroup(world_size=2, rank=0)
     tokens, topk = 4, 4
     weights = torch.randn(tokens, topk, dtype=torch.float16)
@@ -273,7 +275,6 @@ def test_gather_partitioned_topk_bitpacked_fp16():
     "case,weights_dtype,topk,ids_dtype",
     [
         ("float32_weights", torch.float32, 6, torch.int32),
-        ("odd_topk", torch.bfloat16, 5, torch.int32),
         ("int64_ids", torch.bfloat16, 6, torch.int64),
     ],
 )

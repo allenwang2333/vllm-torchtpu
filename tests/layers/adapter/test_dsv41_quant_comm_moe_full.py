@@ -585,23 +585,36 @@ class TestMoeRunner:
 
 class TestMoeRouting:
     def test_topk(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test _topk with rowmax and default torch.topk."""
-        scores = torch.randn(4, 16)
+        """Test _topk with rowmax and torch.topk (with/without bias/renorm)."""
+        scores = torch.rand(4, 16) + 0.1
+        bias = torch.randn(16)
 
-        # 1. rowmax branch
+        # 1. rowmax branch (unbiased and biased/renormalized)
         monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "rowmax")
         mock_rowmax = Mock(return_value=("rowmax_vals", "rowmax_indices"))
         monkeypatch.setattr(moe_routing, "rowmax_select", mock_rowmax)
         val, idx = moe_routing._topk(scores, 4)
         mock_rowmax.assert_called_once_with(scores, 4)
         assert val == "rowmax_vals"
+        assert idx == "rowmax_indices"
 
-        # 2. default branch
+        mock_rowmax.reset_mock()
+        val_b, idx_b = moe_routing._topk(scores, 4, bias=bias, renormalize=True)
+        mock_rowmax.assert_called_once_with(scores, 4, bias=bias, renormalize=True)
+        assert val_b == "rowmax_vals"
+        assert idx_b == "rowmax_indices"
+
+        # 2. default branch (unbiased and biased/renormalized)
         monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "standard")
         val2, idx2 = moe_routing._topk(scores, 4)
         expected_val, expected_idx = torch.topk(scores, k=4, dim=-1)
         assert torch.equal(val2, expected_val)
         assert torch.equal(idx2, expected_idx)
+
+        val3, idx3 = moe_routing._topk(scores, 4, bias=bias, renormalize=True)
+        _, exp_idx3 = torch.topk(scores + bias.unsqueeze(0), k=4, dim=-1)
+        assert torch.equal(idx3, exp_idx3)
+        assert torch.allclose(val3.sum(dim=-1), torch.ones(4))
 
     def test_simulation_strategy_import_validation(
         self, monkeypatch: pytest.MonkeyPatch

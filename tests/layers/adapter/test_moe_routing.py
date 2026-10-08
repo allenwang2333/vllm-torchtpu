@@ -175,8 +175,8 @@ def test_routing_path_compiles_fullgraph(monkeypatch, impl):
     torch._dynamo.reset()
     monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", impl)
     layer = _routing_layer()
-    hidden = torch.randn(16, 8, dtype=torch.bfloat16).to("tpu")
-    logits = torch.randn(16, 512).to("tpu")
+    hidden = torch.randn(16, 8, dtype=torch.bfloat16)
+    logits = torch.randn(16, 512)
 
     def run(h, r):
         return moe_routing.select_experts(
@@ -272,3 +272,96 @@ def test_gather_expert_scores_ignores_nonfinite_unselected_scores():
     scores = torch.tensor([[0.5, float("nan"), float("inf"), 0.25]])
     got = moe_routing._gather_expert_scores(scores, torch.tensor([[3, 0]]))
     assert torch.equal(got, torch.tensor([[0.25, 0.5]]))
+
+
+def test_select_experts_rowmax_with_bias_matches_sort(monkeypatch):
+    """Fused biased + renormalized rowmax_select matches sort + gather bit-for-bit."""
+    import torch
+
+    torch.manual_seed(17)
+    hidden = torch.randn(32, 8, dtype=torch.bfloat16)
+    logits = torch.randn(32, 384)
+    layer = _routing_layer(topk=6, renormalize=True)
+    layer.scoring_func = "sqrtsoftplus"
+    layer.e_score_correction_bias = torch.randn(384)
+    layer.routed_scaling_factor = 2.5
+
+    def run():
+        return moe_routing.select_experts(
+            hidden_states=hidden,
+            router_logits=logits,
+            topk=6,
+            renormalize=True,
+            scoring_fn="sqrtsoftplus",
+            layer=layer,
+        )
+
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
+    ref_w, ref_i = run()
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "rowmax")
+    got_w, got_i = run()
+
+    assert torch.equal(got_i, ref_i)
+    assert torch.equal(got_w, ref_w)
+
+
+def test_router_topk_fake_and_tpu_dispatch_branches(monkeypatch):
+    """Cover _fake_router_topk, _fake_router_topk_biased, and TPU dispatch."""
+    import torch
+
+    from vllm_torchtpu.layers.adapter import router_topk
+
+    s = torch.randn(5, 16)
+    b = torch.randn(16)
+    fw, fi = router_topk._fake_router_topk(s, 4, True)
+    assert fw.shape == (5, 4) and fw.dtype == torch.float32
+    assert fi.shape == (5, 4) and fi.dtype == torch.int32
+
+    fbw, fbi = router_topk._fake_router_topk_biased(s, b.view(1, 16), 4, True)
+    assert fbw.shape == (5, 4) and fbw.dtype == torch.float32
+    assert fbi.shape == (5, 4) and fbi.dtype == torch.int32
+
+    class _FakeTpuTensor:
+        device = SimpleNamespace(type="tpu")
+
+        def __init__(self, t: torch.Tensor):
+            self._t = t
+            self.shape = t.shape
+
+        def dim(self) -> int:
+            return self._t.dim()
+
+        def float(self) -> torch.Tensor:
+            return self._t.float()
+
+    with pytest.raises(ValueError, match="expects \\[rows, experts\\]"):
+        router_topk.rowmax_select(_FakeTpuTensor(torch.randn(2, 3, 4)), 2)
+
+    op_calls = []
+    biased_op_calls = []
+    monkeypatch.setattr(
+        router_topk,
+        "_op",
+        lambda scores, topk, renorm: (
+            op_calls.append((scores.shape, topk, renorm)) or ("w", "i")
+        ),
+    )
+    monkeypatch.setattr(
+        router_topk,
+        "_biased_op",
+        lambda scores, bias, topk, renorm: (
+            biased_op_calls.append((scores.shape, bias.shape, topk, renorm))
+            or ("bw", "bi")
+        ),
+    )
+
+    assert router_topk.rowmax_select(_FakeTpuTensor(s), 4, renormalize=True) == (
+        "w",
+        "i",
+    )
+    assert op_calls == [((5, 16), 4, True)]
+
+    assert router_topk.rowmax_select(
+        _FakeTpuTensor(s), 4, bias=b, renormalize=False
+    ) == ("bw", "bi")
+    assert biased_op_calls == [((5, 16), (1, 16), 4, False)]

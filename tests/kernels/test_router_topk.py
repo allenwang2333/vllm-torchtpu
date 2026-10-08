@@ -164,3 +164,53 @@ def test_kernel_ties_and_nan_match_the_reference():
 def test_grid_rounds_up_over_the_tuned_block(rows, grid):
     block = min(MAX_BLOCK_ROWS, rows)
     assert -(-rows // block) == grid
+
+
+@pytest.mark.parametrize("renormalize", [False, True])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_kernel_fused_bias_and_renormalize_matches_torch_reference(
+    with_bias, renormalize
+):
+    rng = np.random.default_rng(2026)
+    scores = rng.random((37, 384), dtype=np.float32)
+    bias = rng.standard_normal((384,), dtype=np.float32) * 0.25 if with_bias else None
+    kw, ki = select(
+        jnp.asarray(scores),
+        6,
+        interpret=True,
+        bias=jnp.asarray(bias) if bias is not None else None,
+        renormalize=renormalize,
+    )
+    rw, ri = rowmax_topk(
+        torch.from_numpy(scores),
+        6,
+        bias=torch.from_numpy(bias) if bias is not None else None,
+        renormalize=renormalize,
+    )
+    np.testing.assert_array_equal(np.asarray(ki), ri.numpy())
+    np.testing.assert_allclose(np.asarray(kw), rw.numpy(), rtol=1e-6, atol=1e-6)
+
+
+def test_router_topk_and_biased_entrypoints(monkeypatch):
+    from jax.experimental import pallas as pl
+
+    from vllm_torchtpu.kernels.router_topk import router_topk, router_topk_biased
+
+    orig_pallas_call = pl.pallas_call
+
+    def _interpret_pallas_call(*args, **kwargs):
+        kwargs["interpret"] = True
+        return orig_pallas_call(*args, **kwargs)
+
+    monkeypatch.setattr(pl, "pallas_call", _interpret_pallas_call)
+    rng = np.random.default_rng(77)
+    scores = jnp.asarray(rng.random((8, 64), dtype=np.float32))
+    bias = jnp.asarray(rng.standard_normal((1, 64), dtype=np.float32) * 0.1)
+
+    w1, i1 = router_topk(scores, 4, renormalize=True)
+    assert w1.shape == (8, 4) and i1.shape == (8, 4)
+    np.testing.assert_allclose(np.asarray(w1).sum(axis=-1), np.ones(8), rtol=1e-6)
+
+    w2, i2 = router_topk_biased(scores, bias, 4, renormalize=True)
+    assert w2.shape == (8, 4) and i2.shape == (8, 4)
+    np.testing.assert_allclose(np.asarray(w2).sum(axis=-1), np.ones(8), rtol=1e-6)

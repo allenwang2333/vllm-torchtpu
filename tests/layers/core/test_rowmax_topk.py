@@ -298,3 +298,21 @@ def test_renormalized_weights_match_the_sort_path():
     ref_v, _ = torch.topk(scores, TOPK, dim=-1)
     got_v, _ = rowmax_topk(scores, TOPK)
     assert torch.equal(renorm(got_v), renorm(ref_v))
+    got_fused_v, _ = rowmax_topk(scores, TOPK, renormalize=True)
+    assert torch.equal(got_fused_v.to(torch.bfloat16), renorm(ref_v))
+
+
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_biased_rowmax_topk_matches_sort_and_gather(renormalize):
+    """Biased choice ranks by scores + bias and returns unbiased scores."""
+    torch.manual_seed(42)
+    scores = torch.rand(64, 384, dtype=torch.float32)
+    bias = torch.randn(384, dtype=torch.float32) * 0.25
+    got_w, got_i = rowmax_topk(scores, 6, bias=bias, renormalize=renormalize)
+
+    _, ref_i = torch.topk(scores + bias.unsqueeze(0), k=6, dim=-1)
+    ref_w = scores.gather(-1, ref_i)
+    if renormalize:
+        ref_w = ref_w / torch.clamp(ref_w.sum(dim=-1, keepdim=True), min=1e-20)
+    assert torch.equal(got_i, ref_i.to(torch.int32))
+    assert torch.equal(got_w, ref_w)

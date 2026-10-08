@@ -27,11 +27,30 @@ logger = init_logger(__name__)
 _ROUTER_TOPK = envs.TPU_MOE_ROUTER_TOPK
 
 
-def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _topk(
+    scores: torch.Tensor,
+    k: int,
+    *,
+    bias: torch.Tensor | None = None,
+    renormalize: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Top-k over the expert axis, by the configured implementation."""
     if _ROUTER_TOPK == "rowmax":
-        return rowmax_select(scores, k)
-    return torch.topk(scores, k=k, dim=-1)
+        if bias is None and not renormalize:
+            return rowmax_select(scores, k)
+        return rowmax_select(scores, k, bias=bias, renormalize=renormalize)
+    if bias is not None:
+        bias_shape = [1] * (scores.dim() - 1) + [-1]
+        scores_for_choice = scores + bias.float().view(bias_shape)
+        _, topk_ids = torch.topk(scores_for_choice, k=k, dim=-1)
+        topk_weights = _gather_expert_scores(scores, topk_ids)
+    else:
+        topk_weights, topk_ids = torch.topk(scores, k=k, dim=-1)
+    if renormalize:
+        topk_weights = topk_weights / torch.clamp(
+            topk_weights.sum(dim=-1, keepdim=True), min=1e-20
+        )
+    return topk_weights, topk_ids
 
 
 def _gather_expert_scores(scores: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
@@ -158,30 +177,27 @@ def _gather_partitioned_topk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """All-gather rank-local ``(topk_weights, topk_ids)`` across ``group``.
 
-    When ``topk_weights`` is 16-bit (``bfloat16`` / ``float16``), ``topk`` is
-    even, and ``topk_ids`` is ``int32``, both tensors are bit-packed into a
-    single ``int32[T_local, topk // 2 + topk]`` tensor before ``all_gather``
-    so only one collective runs (42.7x smaller than gathering ``f32[T, 384]``
-    router logits for DeepSeek-V4.1-Flash).
+    When ``topk_weights`` is 16-bit (``bfloat16`` / ``float16``) and
+    ``topk_ids`` is ``int32``, each ``(weight, id)`` pair is bit-packed into a
+    single ``int32`` word (upper 16 bits = weight, lower 16 bits = signed
+    16-bit expert id) of shape ``int32[T_local, topk]`` before ``all_gather``.
+    This runs a single collective for both even ``topk`` (target MoE,
+    ``topk=6``, 33.3% smaller than ``[T_local, 9]``) and odd ``topk`` (DSpark
+    drafter MoE, ``topk=3``, 1 collective instead of 2), and eliminates
+    minor-axis ``cat`` and slice copies.
     """
     if (
         topk_weights.dtype in (torch.bfloat16, torch.float16)
-        and topk % 2 == 0
         and topk_ids.dtype == torch.int32
     ):
-        half_k = topk // 2
-        packed = torch.cat(
-            [
-                topk_weights.contiguous().view(torch.int32),
-                topk_ids.contiguous(),
-            ],
-            dim=-1,
-        )
+        w_u16 = topk_weights.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+        packed = (w_u16 << 16) | (topk_ids.contiguous() & 0xFFFF)
         gathered = group.all_gather(packed, dim=0)
-        return (
-            gathered[:, :half_k].contiguous().view(topk_weights.dtype),
-            gathered[:, half_k:].contiguous(),
+        out_weights = (
+            ((gathered >> 16) & 0xFFFF).to(torch.int16).view(topk_weights.dtype)
         )
+        out_ids = (gathered << 16) >> 16
+        return out_weights, out_ids
     return (
         group.all_gather(topk_weights.contiguous(), dim=0),
         group.all_gather(topk_ids.contiguous(), dim=0),
@@ -365,20 +381,12 @@ def select_experts(
     e_score_correction_bias = (
         layer.e_score_correction_bias if layer is not None else None
     )
-
-    if e_score_correction_bias is not None:
-        bias_shape = [1] * (scores.dim() - 1) + [-1]
-        bias = e_score_correction_bias.float().view(bias_shape)
-        scores_for_choice = scores + bias
-        _, topk_ids = _topk(scores_for_choice, topk)
-        topk_weights = _gather_expert_scores(scores, topk_ids)
-    else:
-        topk_weights, topk_ids = _topk(scores, topk)
-
-    if renormalize:
-        topk_weights = topk_weights / torch.clamp(
-            topk_weights.sum(dim=-1, keepdim=True), min=1e-20
-        )
+    topk_weights, topk_ids = _topk(
+        scores,
+        topk,
+        bias=e_score_correction_bias,
+        renormalize=renormalize,
+    )
     routed_scaling_factor = layer.routed_scaling_factor if layer is not None else 1.0
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
