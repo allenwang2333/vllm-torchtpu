@@ -341,20 +341,29 @@ class Glm5MKD:
         else the served per-layer caches (one operand per (kind, layer): a larger program, ~81k
         bundles vs ~49k, but the stock path is untouched)."""
         cfg = self.cfg
-        stk = getattr(runner, "glm5_kv_stack", None) or {}
+        grp = getattr(runner, "glm5_kv_stack_groups", None) or {}
+        if not grp:                               # older runner contract: one tensor per kind
+            stk = getattr(runner, "glm5_kv_stack", None) or {}
+            grp = {k: [v] for k, v in stk.items()}
         caches = []
-        if set(stk) == {"nope", "rope", "idx"}:
-            nb = int(stk["nope"][0].shape[1])
+        if set(grp) == {"nope", "rope", "idx"}:
+            nb = int(grp["nope"][0][0].shape[1])
             ck = K.cache_kinds(cfg, nb)
+            G = {}
             for kind, (layers, shape, dtype) in ck.items():
-                t, _ = stk[kind]
-                _need(tuple(t.shape) == (len(layers),) + tuple(shape),
-                      f"stacked cache {kind}: {tuple(t.shape)} != {(len(layers),) + tuple(shape)}")
-                caches.append(t)
-            self.stack_c = frozenset({"nope", "rope", "idx"})
-            self.c_specs = [P(None, AXIS)] * 3
+                groups = grp[kind]
+                gs = len(layers) // len(groups)
+                _need(gs * len(groups) == len(layers), f"{kind}: {len(groups)} groups of {len(layers)} layers")
+                for gi, (t, names) in enumerate(groups):
+                    _need(tuple(t.shape) == (gs,) + tuple(shape),
+                          f"stacked cache {kind}[{gi}]: {tuple(t.shape)} != {(gs,) + tuple(shape)}")
+                    caches.append(t)
+                G[kind] = len(groups)
+            _need(G["nope"] == G["rope"], "nope / rope grouped differently")
+            self.stack_c = G
+            self.c_specs = [P(None, AXIS)] * len(caches)
         else:
-            _need(not stk, f"partially stacked caches {sorted(stk)}")
+            _need(not grp, f"partially stacked caches {sorted(grp)}")
             per = {}
             for l in range(cfg.L):
                 sa = self.backbone.layers[l].self_attn
@@ -375,7 +384,7 @@ class Glm5MKD:
             self.stack_c = frozenset()
             self.c_specs = [P(AXIS)] * len(caches)
         logger.info("GLM-5.2 TPxDCP megakernel: %s caches, %d operands, %d blocks",
-                    "stacked" if self.stack_c else "per-layer", len(caches), nb)
+                    f"stacked {self.stack_c}" if self.stack_c else "per-layer", len(caches), nb)
         self.caches = caches
         self.nb = nb
         self._step = self._build_op()

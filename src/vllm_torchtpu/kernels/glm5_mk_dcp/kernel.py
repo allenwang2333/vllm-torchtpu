@@ -250,6 +250,26 @@ class Phases:
             self.cur = None
 
 
+def cache_groups(v, ck):
+    """build()'s stack_c -> {kind: n_groups} for the stacked cache kinds. A set / bool stacks each
+    kind as one operand; a dict {kind: n} splits a kind into n equal groups of consecutive layers
+    (one operand each): SparseCore takes at most 16 GiB per tensor, so the runner stacks the full
+    78-layer nope / rope caches in 2 groups (GLM5_MKD_STACK_C, runner.glm5_kv_stack_groups)."""
+    if isinstance(v, dict):
+        g = {k: int(n) for k, n in v.items() if int(n) > 0}
+    else:
+        g = {k: 1 for k in stack_kinds(v, ck)}
+    for k, n in g.items():
+        assert k in ck and len(ck[k][0]) % n == 0, (k, n)
+    return g
+
+
+def cache_names(ck, G):
+    return [x for k, (ls, _, _) in ck.items()
+            for x in ([(k, "stk")] if G.get(k) == 1 else
+                      [(k, f"stk{i}") for i in range(G[k])] if k in G else [(k, l) for l in ls])]
+
+
 def stack_kinds(v, kinds):
     if v is None:
         v = ()
@@ -333,11 +353,11 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     KX = max(H, cfg.QL, KRO, cfg.IDR, cfg.I, cfg.ISR)
 
     SW = stack_kinds(stack_w, wk)
-    SC = stack_kinds(stack_c, ck)
+    SCG = cache_groups(stack_c, ck)
+    SC = frozenset(SCG)
     w_names = [x for k, (ls, _, _) in wk.items()
                for x in ([(k, "stk")] if k in SW else [(k, l) for l in ls])]
-    c_names = [x for k, (ls, _, _) in ck.items()
-               for x in ([(k, "stk")] if k in SC else [(k, l) for l in ls])]
+    c_names = cache_names(ck, SCG)
 
     def lpos_fn(ls):
         ls = list(ls)
@@ -494,11 +514,13 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             else:
                 W.setdefault(k, {})[l] = r
         for (k, l), r in zip(c_names, c_in):
-            if l == "stk":
-                CS[k] = r
-                C[k] = {ll: r.at[i] for i, ll in enumerate(ck[k][0])}
+            if isinstance(l, str):                               # a stacked group
+                CS.setdefault(k, []).append(r)
             else:
                 C.setdefault(k, {})[l] = r
+        for k, refs in CS.items():                               # static per-layer views (waits)
+            gs = len(ck[k][0]) // len(refs)
+            C[k] = {ll: refs[i // gs].at[i % gs] for i, ll in enumerate(ck[k][0])}
 
         def wsel(kind, l, fn):
             if kind in SW:
@@ -508,7 +530,16 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
         def csel(kinds, l, fn):
             if all(k in SC for k in kinds):
-                fn(*[CS[k].at[CPOS[k](l)] for k in kinds])
+                ng = len(CS[kinds[0]])
+                assert all(len(CS[k]) == ng for k in kinds), kinds
+                pos = CPOS[kinds[0]](l)
+                if ng == 1:
+                    fn(*[CS[k][0].at[pos] for k in kinds])
+                else:
+                    gs = len(ck[kinds[0]][0]) // ng
+                    bswitch(pos // gs, {gi: (lambda gi=gi: fn(*[CS[k][gi].at[pos - gi * gs]
+                                                                 for k in kinds]))
+                                        for gi in range(ng)})
             else:
                 ks = sorted(C[kinds[0]])
                 bswitch(l, {ll: (lambda ll=ll: fn(*[C[k][ll] for k in kinds])) for ll in ks})
@@ -1197,8 +1228,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
             def wait(t_, b):
                 n = n_of(t_)
-                ref0 = C["nope"][next(iter(C["nope"]))] if "nope" not in SC else CS["nope"].at[0]
-                rref0 = C["rope"][next(iter(C["rope"]))] if "rope" not in SC else CS["rope"].at[0]
+                ref0 = C["nope"][next(iter(C["nope"]))]
+                rref0 = C["rope"][next(iter(C["rope"]))]
 
                 def wbody(k, c2):                        # one wait per issued row (same bytes each)
                     pltpu.make_async_copy(ref0.at[0, pl.ds(0, 1)], scr["g_nope"].at[b, pl.ds(0, 1)],
@@ -1503,9 +1534,9 @@ def build_writer(cfg, *, nb, max_pages, bmax=None, interpret=False, axis_name=No
     ILV, G_ = cfg.ILV, cfg.ILV * cfg.R
     IR4 = cfg.IREC // 4
     ck = cache_kinds(cfg, nb)
-    SC = stack_kinds(stack_c, ck)
-    c_names = [x for k, (ls, _, _) in ck.items()
-               for x in ([(k, "stk")] if k in SC else [(k, l) for l in ls])]
+    SCG = cache_groups(stack_c, ck)
+    SC = frozenset(SCG)
+    c_names = cache_names(ck, SCG)
     n_c = len(c_names)
     CPOS = {}
     for k, (ls, _, _) in ck.items():
@@ -1534,14 +1565,21 @@ def build_writer(cfg, *, nb, max_pages, bmax=None, interpret=False, axis_name=No
         C = {}
         CS = {}
         for (k, l), r in zip(c_names, c_out):
-            if l == "stk":
-                CS[k] = r
+            if isinstance(l, str):
+                CS.setdefault(k, []).append(r)
             else:
                 C.setdefault(k, {})[l] = r
 
         def csel(k, l, fn):
             if k in SC:
-                fn(CS[k].at[CPOS[k](l)])
+                ng = len(CS[k])
+                pos = CPOS[k](l)
+                if ng == 1:
+                    fn(CS[k][0].at[pos])
+                else:
+                    gs = len(ck[k][0]) // ng
+                    bswitch(pos // gs, {gi: (lambda gi=gi: fn(CS[k][gi].at[pos - gi * gs]))
+                                        for gi in range(ng)})
             else:
                 bswitch(l, {ll: (lambda r=r: fn(r)) for ll, r in C[k].items()})
 
@@ -1680,8 +1718,8 @@ def build_writer(cfg, *, nb, max_pages, bmax=None, interpret=False, axis_name=No
             return c
         lax.fori_loop(0, n_own * L, drain, 0)
 
-    c_shapes = [jax.ShapeDtypeStruct(((len(ck[k][0]),) if l == "stk" else ()) + ck[k][1], ck[k][2])
-                for k, l in c_names]
+    c_shapes = [jax.ShapeDtypeStruct(((len(ck[k][0]) // SCG[k],) if isinstance(l, str) else ())
+                                     + ck[k][1], ck[k][2]) for k, l in c_names]
     call = pl.pallas_call(
         kernel,
         name="glm5_mk_dcp_writer",
