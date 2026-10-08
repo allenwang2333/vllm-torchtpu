@@ -75,14 +75,20 @@ def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, object]:
         text = model_config.hf_text_config
         hidden = int(text.hidden_size)
         inter = int(text.moe_intermediate_size)
-        if expert_placement.enabled():
+        if parallel_config.enable_expert_parallel and expert_placement.enabled():
             slots = expert_placement.slots()
             layers = len(expert_placement.data()["layers"])
-        else:
-            ep = int(parallel_config.tensor_parallel_size) * int(
-                parallel_config.data_parallel_size
+        elif parallel_config.enable_expert_parallel:
+            ep = (
+                int(parallel_config.tensor_parallel_size)
+                * int(parallel_config.data_parallel_size)
+                * int(getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
             )
             slots = int(text.num_experts) // max(ep, 1)
+            layers = int(text.num_hidden_layers)
+        else:
+            tp = int(parallel_config.tensor_parallel_size)
+            slots = int(text.num_experts) // max(tp, 1)
             layers = int(text.num_hidden_layers)
     except Exception as e:  # noqa: BLE001 - never block startup on the credit
         logger.warning("expert-slot KV credit unavailable (%s); using 0.", e)
@@ -876,65 +882,66 @@ class TpuPlatform(Platform):
             ):
                 scheduler_config.scheduler_cls = paw_cls
                 logger.info("Auto-enabled PrefixAwareScheduler for Qwen3.5-397B.")
-            # The regime hybrid-state retention and the Raiden partial-tail
-            # offload are built for: sparse retention, 128-token match unit.
-            if hasattr(cache_config, "prefix_cache_retention_interval"):
-                cache_config.prefix_cache_retention_interval = 0
-            if hasattr(cache_config, "prefix_match_unit") and getattr(
-                cache_config, "prefix_match_unit", None
-            ) in (None, 0, 1):
-                cache_config.prefix_match_unit = 128
-            dcp_size = int(
-                getattr(parallel_config, "decode_context_parallel_size", 1) or 1
-            )
-            if (
-                parallel_config.enable_expert_parallel
-                and "TPU_EXPERT_PLACEMENT" not in os.environ
-            ):
-                from vllm_torchtpu import expert_placement
+            if vllm_config.kv_transfer_config is None:
+                # The regime hybrid-state retention and the Raiden partial-tail
+                # offload are built for: sparse retention, 128-token match unit.
+                if hasattr(cache_config, "prefix_cache_retention_interval"):
+                    cache_config.prefix_cache_retention_interval = 0
+                if hasattr(cache_config, "prefix_match_unit") and getattr(
+                    cache_config, "prefix_match_unit", None
+                ) in (None, 0, 1):
+                    cache_config.prefix_match_unit = 128
+                dcp_size = int(
+                    getattr(parallel_config, "decode_context_parallel_size", 1) or 1
+                )
+                if (
+                    parallel_config.enable_expert_parallel
+                    and "TPU_EXPERT_PLACEMENT" not in os.environ
+                ):
+                    from vllm_torchtpu import expert_placement
 
-                table = expert_placement.auto_table(
-                    dcp_size, scheduler_config.max_num_seqs
-                )
-                # Set before the workers spawn so they inherit it.
-                if os.path.isfile(table):
-                    os.environ["TPU_EXPERT_PLACEMENT"] = table
-                logger.info(
-                    "Auto-selected Qwen3.5-397B expert placement %s "
-                    "(max_num_seqs=%d, dcp=%d).",
-                    os.path.basename(table),
-                    scheduler_config.max_num_seqs,
-                    dcp_size,
-                )
-            # Calibrated for 80 expert slots per rank (64 primary + 16
-            # replicated slots) while reserving ~2.5 GiB of HBM headroom for
-            # runtime activations and program-load scratch buffers under DCP=1
-            # and DCP>1; a placement holding other slot counts gets a credit.
-            if dcp_size == 1 and scheduler_config.max_num_seqs > 16:
-                safe_kv = 32_500_000_000
-            else:
-                safe_kv = 33_500_000_000
-            credit, slots = _expert_slot_kv_credit(model_config, parallel_config)
-            safe_kv += credit
-            # Apply the shape-calibrated HBM KV memory budget unless the caller
-            # explicitly opts out via TPU_KV_BYTES_EXPLICIT=1.
-            requested = cache_config.kv_cache_memory_bytes
-            keep = requested is not None and os.environ.get(
-                "TPU_KV_BYTES_EXPLICIT", "0"
-            ).strip().lower() in ("1", "true", "yes", "on")
-            if keep or requested != safe_kv:
-                logger.warning(
-                    "Qwen3.5-397B kv_cache_memory_bytes %s: requested %s, "
-                    "auto %d (slots=%s, dcp=%d, seqs=%d).",
-                    "kept (TPU_KV_BYTES_EXPLICIT=1)" if keep else "set to auto",
-                    requested,
-                    safe_kv,
-                    slots,
-                    dcp_size,
-                    scheduler_config.max_num_seqs,
-                )
-            if not keep:
-                cache_config.kv_cache_memory_bytes = safe_kv
+                    table = expert_placement.auto_table(
+                        dcp_size, scheduler_config.max_num_seqs
+                    )
+                    # Set before the workers spawn so they inherit it.
+                    if os.path.isfile(table):
+                        os.environ["TPU_EXPERT_PLACEMENT"] = table
+                    logger.info(
+                        "Auto-selected Qwen3.5-397B expert placement %s "
+                        "(max_num_seqs=%d, dcp=%d).",
+                        os.path.basename(table),
+                        scheduler_config.max_num_seqs,
+                        dcp_size,
+                    )
+                # Calibrated for 80 expert slots per rank (64 primary + 16
+                # replicated slots) while reserving ~2.5 GiB of HBM headroom for
+                # runtime activations and program-load scratch buffers under DCP=1
+                # and DCP>1; a placement holding other slot counts gets a credit.
+                if dcp_size == 1 and scheduler_config.max_num_seqs > 16:
+                    safe_kv = 32_500_000_000
+                else:
+                    safe_kv = 33_500_000_000
+                credit, slots = _expert_slot_kv_credit(model_config, parallel_config)
+                safe_kv += credit
+                # Apply the shape-calibrated HBM KV memory budget unless the caller
+                # explicitly opts out via TPU_KV_BYTES_EXPLICIT=1.
+                requested = cache_config.kv_cache_memory_bytes
+                keep = requested is not None and os.environ.get(
+                    "TPU_KV_BYTES_EXPLICIT", "0"
+                ).strip().lower() in ("1", "true", "yes", "on")
+                if keep or requested != safe_kv:
+                    logger.warning(
+                        "Qwen3.5-397B kv_cache_memory_bytes %s: requested %s, "
+                        "auto %d (slots=%s, dcp=%d, seqs=%d).",
+                        "kept (TPU_KV_BYTES_EXPLICIT=1)" if keep else "set to auto",
+                        requested,
+                        safe_kv,
+                        slots,
+                        dcp_size,
+                        scheduler_config.max_num_seqs,
+                    )
+                if not keep:
+                    cache_config.kv_cache_memory_bytes = safe_kv
 
         is_hybrid = model_config.is_hybrid if model_config is not None else False
         if (

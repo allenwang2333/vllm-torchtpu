@@ -807,22 +807,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A JSON table giving, per backbone MoE layer, the global experts each
     # expert-parallel rank holds (expert_placement.py); empty keeps the
     # checkpoint's contiguous placement.
-    "TPU_EXPERT_PLACEMENT": lambda: os.getenv(
-        "TPU_EXPERT_PLACEMENT",
-        os.path.abspath(
-            os.path.join(
-                os.path.dirname(__file__),
-                "..",
-                "..",
-                "scripts",
-                "vllm",
-                "benchmark",
-                "inferencex",
-                "qwen3.5",
-                "expert_placement_dp8_ep8_opt_copies128.json",
-            )
-        ),
-    ),
+    "TPU_EXPERT_PLACEMENT": lambda: os.getenv("TPU_EXPERT_PLACEMENT", ""),
     # 0 = the arithmetic device-order layout (the one every disaggregated
     # Raiden pair was verified with before #587; also the only option on a
     # torch_tpu older than 2026-08-13, which lacks the API).

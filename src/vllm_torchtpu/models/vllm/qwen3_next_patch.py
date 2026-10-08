@@ -192,7 +192,11 @@ def patched_decoder_layer_forward(
     else:
         hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-    if input_is_sequence_parallel and _sp.fp8_gather():
+    use_fp8_gather = _sp.fp8_gather() and not (
+        self.layer_type == "linear_attention"
+        and getattr(self.linear_attn, "_pcp_streaming_configured", False)
+    )
+    if input_is_sequence_parallel and use_fp8_gather:
         x_q, x_s = linear_common.quantize_rows(hidden_states)
         x_q = tensor_model_parallel_all_gather(x_q, 0)
         x_s = tensor_model_parallel_all_gather(x_s, 0)
