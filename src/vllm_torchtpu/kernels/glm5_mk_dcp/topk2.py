@@ -204,7 +204,12 @@ def extract_payload(keys_ref, nbk, T, P, K, idx_v, key_v, pre_ref, acc_ref, cc_r
         for q in range(kc // 128):
             key_v[pl.ds(ci * (kc // 128) + q, 1), :] = keyr[:, q * 128:(q + 1) * 128]
         return c
-    lax.fori_loop(0, K // kc, chunk, 0)
+    # only the chunks that hold selected entries (the global compaction owns ~K/R of K slots);
+    # the rest of the outputs are prefilled
+    idx_v[...] = jnp.full(idx_v.shape, -1, I32)
+    if key_v is not None:
+        key_v[...] = jnp.full(key_v.shape, jnp.int32(INT_MIN), I32)
+    lax.fori_loop(0, (n_sel + kc - 1) // kc, chunk, 0)
     return n_sel
 
 
