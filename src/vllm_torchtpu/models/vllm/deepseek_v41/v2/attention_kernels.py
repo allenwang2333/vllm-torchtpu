@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v41 import index_word_scores
 
 from .cache import (
@@ -1129,6 +1130,46 @@ def sparse_fp8_attention_jax(
     )
 
 
+def _permute_owner_tokens_jax(
+    x: jax.Array, owner_perm: jax.Array, fill_value: int | float = 0
+) -> jax.Array:
+    """Gather token rows ``x`` (``[T, ...]``) into owner-major ``[T_pad, ...]``."""
+    valid = owner_perm >= 0
+    gathered = x[jnp.maximum(owner_perm, 0)]
+    mask = valid.reshape((owner_perm.shape[0],) + (1,) * (x.ndim - 1))
+    return jnp.where(mask, gathered, jnp.asarray(fill_value, dtype=x.dtype))
+
+
+def _unpermute_owner_tokens_jax(x_perm: jax.Array, owner_inv: jax.Array) -> jax.Array:
+    """Restore owner-major ``x_perm`` (``[T_pad, ...]``) to batch order ``[T, ...]``."""
+    valid = owner_inv >= 0
+    gathered = x_perm[jnp.maximum(owner_inv, 0)]
+    mask = valid.reshape((owner_inv.shape[0],) + (1,) * (x_perm.ndim - 1))
+    return jnp.where(mask, gathered, jnp.zeros((), x_perm.dtype))
+
+
+def _permute_owner_tokens_torch(
+    x: torch.Tensor, owner_perm: torch.Tensor, fill_value: int | float = 0
+) -> torch.Tensor:
+    """Gather token rows ``x`` (``[T, ...]``) into owner-major ``[T_pad, ...]``."""
+    perm = owner_perm.long()
+    valid = perm >= 0
+    gathered = x.index_select(0, perm.clamp(min=0))
+    mask = valid.reshape((perm.shape[0],) + (1,) * (x.ndim - 1))
+    return gathered.masked_fill(~mask, fill_value)
+
+
+def _unpermute_owner_tokens_torch(
+    x_perm: torch.Tensor, owner_inv: torch.Tensor
+) -> torch.Tensor:
+    """Restore owner-major ``x_perm`` (``[T_pad, ...]``) to batch order ``[T, ...]``."""
+    inv = owner_inv.long()
+    valid = inv >= 0
+    gathered = x_perm.index_select(0, inv.clamp(min=0))
+    mask = valid.reshape((inv.shape[0],) + (1,) * (x_perm.ndim - 1))
+    return gathered.masked_fill(~mask, 0)
+
+
 def slice_token_parallel_attention_inputs(
     swa_records: jax.Array,
     main_records: jax.Array,
@@ -1136,14 +1177,48 @@ def slice_token_parallel_attention_inputs(
     tp_rank: jax.Array,
     tp_size: int,
     tokens: int,
+    owner_perm: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Slice ``[tokens, ...]`` records and ``query_start_loc`` to this rank's shard."""
-    tokens_local = tokens // tp_size
     rank_idx = tp_rank.reshape(())
-    start = rank_idx * tokens_local
-    swa_local = jax.lax.dynamic_slice_in_dim(swa_records, start, tokens_local, axis=0)
-    main_local = jax.lax.dynamic_slice_in_dim(main_records, start, tokens_local, axis=0)
-    q_loc_local = jnp.clip(query_start_loc - start, 0, tokens_local)
+    if owner_perm is not None:
+        tokens_local = owner_perm.shape[0] // tp_size
+        start = rank_idx * tokens_local
+        perm_local = jax.lax.dynamic_slice_in_dim(
+            owner_perm, start, tokens_local, axis=0
+        )
+        valid_local = perm_local >= 0
+        safe_perm = jnp.maximum(perm_local, 0)
+        swa_local = (
+            jnp.where(valid_local[:, None], swa_records, -1)
+            if swa_records.shape[0] == tokens_local
+            else jnp.where(valid_local[:, None], swa_records[safe_perm], -1)
+        )
+        main_local = (
+            jnp.where(valid_local[:, None], main_records, -1)
+            if main_records.shape[0] == tokens_local
+            else jnp.where(valid_local[:, None], main_records[safe_perm], -1)
+        )
+    else:
+        tokens_local = tokens // tp_size
+        start = rank_idx * tokens_local
+        swa_local = (
+            swa_records
+            if swa_records.shape[0] == tokens_local
+            else jax.lax.dynamic_slice_in_dim(swa_records, start, tokens_local, axis=0)
+        )
+        main_local = (
+            main_records
+            if main_records.shape[0] == tokens_local
+            else jax.lax.dynamic_slice_in_dim(main_records, start, tokens_local, axis=0)
+        )
+    if query_start_loc.ndim == 2:
+        q_loc_r = jax.lax.dynamic_index_in_dim(
+            query_start_loc, rank_idx, axis=0, keepdims=False
+        )
+        q_loc_local = jnp.clip(q_loc_r - q_loc_r[0], 0, tokens_local)
+    else:
+        q_loc_local = jnp.clip(query_start_loc - start, 0, tokens_local)
     return swa_local, main_local, q_loc_local
 
 
@@ -1161,11 +1236,169 @@ def initialize_paged_attention():
         get_vllm_model_wrapper_context,
     )
 
+    mesh = get_vllm_model_wrapper_context().mesh
+    try:
+        tp_group = get_tp_group().device_group
+        tp_size = tp_group.size() if tp_group is not None else 1
+    except Exception:
+        tp_group = None
+        tp_size = 1
+    if tp_size > 1 and tp_group is not None:
+        tp_mesh = pallas.get_pallas_mesh(axis_names=("tp",), process_group=tp_group)
+    else:
+        tp_mesh = mesh
+    bf16_in_specs = (P(),) * 8
+    in_specs = (P(),) * 11
+    out_spec = P()
+
+    def bf16_attention(
+        q: jax.Array,
+        swa_pool: jax.Array,
+        main_pool: jax.Array,
+        swa_records: jax.Array,
+        main_records: jax.Array,
+        sink: jax.Array,
+        full_sink: Any = None,
+        tp_rank: Any = None,
+        scale: float = 1.0,
+        token_parallel: bool = False,
+        block: int = 1,
+        owner_perm: jax.Array | None = None,
+        owner_inv: jax.Array | None = None,
+    ) -> jax.Array:
+        if tp_rank is None or isinstance(full_sink, (int, float)):
+            block = int(tp_rank) if tp_rank is not None else block
+            scale = float(full_sink) if full_sink is not None else scale
+            full_sink = sink
+            tp_rank = jnp.zeros((1,), dtype=jnp.int32)
+        if owner_perm is not None:
+            q = _permute_owner_tokens_jax(q, owner_perm, 0)
+            tokens_local_perm = owner_perm.shape[0] // max(1, tp_size)
+            if swa_records.shape[0] != tokens_local_perm:
+                swa_records = _permute_owner_tokens_jax(swa_records, owner_perm, -1)
+            if main_records.shape[0] != tokens_local_perm:
+                main_records = _permute_owner_tokens_jax(main_records, owner_perm, -1)
+        tokens = q.shape[0]
+        want_token_parallel = (
+            token_parallel or envs.TPU_DEEPSEEK_V41_KV_SHARD
+        ) and tp_size > 1
+        use_token_parallel = (
+            want_token_parallel
+            and tokens >= tp_size
+            and tokens % tp_size == 0
+            and (tokens // tp_size) % max(1, block) == 0
+        )
+        if (
+            want_token_parallel
+            and not use_token_parallel
+            and envs.TPU_DEEPSEEK_V41_KV_SHARD
+        ):
+            raise ValueError(
+                f"TPU_DEEPSEEK_V41_KV_SHARD requires token count ({tokens}) "
+                f"divisible by tp_size ({tp_size}) and block ({block})"
+            )
+        if use_token_parallel:
+            tokens_local = tokens // tp_size
+
+            def _bf16_token_parallel_body(q_l, s_p, m_p, s_r, m_r, _snk, f_snk, r_id):
+                q_tok = jax.lax.all_to_all(
+                    q_l, axis_name="tp", split_axis=0, concat_axis=1, tiled=True
+                )
+                start = r_id.reshape(()) * tokens_local
+                s_r_tok = (
+                    s_r
+                    if s_r.shape[0] == tokens_local
+                    else jax.lax.dynamic_slice_in_dim(s_r, start, tokens_local, axis=0)
+                )
+                m_r_tok = (
+                    m_r
+                    if m_r.shape[0] == tokens_local
+                    else jax.lax.dynamic_slice_in_dim(m_r, start, tokens_local, axis=0)
+                )
+                out_tok = paged_attention_jax(
+                    q_tok,
+                    s_p,
+                    m_p,
+                    s_r_tok,
+                    m_r_tok,
+                    f_snk,
+                    scale,
+                    block,
+                )
+                return jax.lax.all_to_all(
+                    out_tok, axis_name="tp", split_axis=1, concat_axis=0, tiled=True
+                )
+
+            if isinstance(swa_pool, tuple):
+                swa_lo, swa_hi = swa_pool
+                main_lo, main_hi = cast(tuple[jax.Array, jax.Array], main_pool)
+                out = jax.shard_map(
+                    lambda q_l, s_lo, s_hi, m_lo, m_hi, s_r, m_r, snk, f_snk, r_id: (
+                        _bf16_token_parallel_body(
+                            q_l,
+                            (s_lo, s_hi),
+                            (m_lo, m_hi),
+                            s_r,
+                            m_r,
+                            snk,
+                            f_snk,
+                            r_id,
+                        )
+                    ),
+                    mesh=tp_mesh,
+                    in_specs=(P(),) * 10,
+                    out_specs=out_spec,
+                    check_vma=False,
+                )(
+                    q,
+                    swa_lo,
+                    swa_hi,
+                    main_lo,
+                    main_hi,
+                    swa_records,
+                    main_records,
+                    sink,
+                    full_sink,
+                    tp_rank,
+                )
+            else:
+                out = jax.shard_map(
+                    _bf16_token_parallel_body,
+                    mesh=tp_mesh,
+                    in_specs=bf16_in_specs,
+                    out_specs=out_spec,
+                    check_vma=False,
+                )(
+                    q,
+                    swa_pool,
+                    main_pool,
+                    swa_records,
+                    main_records,
+                    sink,
+                    full_sink,
+                    tp_rank,
+                )
+            return (
+                _unpermute_owner_tokens_jax(out, owner_inv)
+                if owner_inv is not None
+                else out
+            )
+        return paged_attention_jax(
+            q,
+            swa_pool,
+            main_pool,
+            swa_records,
+            main_records,
+            sink,
+            scale,
+            block,
+        )
+
     _attention_op = pallas.jax_op(
         "pallas::dsv41v2_paged_bf16_attention",
-        paged_attention_jax,
-        mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(), P(), P(), P(), P(), P(), None, None),
+        bf16_attention,
+        mesh=tp_mesh,
+        input_partition_specs=bf16_in_specs + (None, None, None),
     )
     _attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1178,40 +1411,37 @@ def initialize_paged_attention():
         swa_records: jax.Array,
         main_records: jax.Array,
         sink: jax.Array,
-        scale: float,
+        full_sink: Any = None,
+        tp_rank: Any = None,
+        scale: float = 1.0,
+        token_parallel: bool = False,
         block: int = 1,
+        owner_perm: jax.Array | None = None,
+        owner_inv: jax.Array | None = None,
     ) -> jax.Array:
-        return paged_attention_jax(
+        return bf16_attention(
             q,
             cast(Any, (swa_lo, swa_hi)),
             cast(Any, (main_lo, main_hi)),
             swa_records,
             main_records,
             sink,
+            full_sink,
+            tp_rank,
             scale,
+            token_parallel,
             block,
+            owner_perm,
+            owner_inv,
         )
 
     _attention_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_paged_bf16_attention_2bank",
         paged_attention_2bank,
-        mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 8 + (None, None),
+        mesh=tp_mesh,
+        input_partition_specs=(P(),) * 10 + (None, None, None),
     )
     _attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
-    mesh = get_vllm_model_wrapper_context().mesh
-    try:
-        tp_group = get_tp_group().device_group
-        tp_size = tp_group.size() if tp_group is not None else 1
-    except Exception:
-        tp_group = None
-        tp_size = 1
-    if tp_size > 1 and tp_group is not None:
-        tp_mesh = pallas.get_pallas_mesh(axis_names=("tp",), process_group=tp_group)
-    else:
-        tp_mesh = mesh
-    in_specs = (P(),) * 11
-    out_spec = P()
 
     def fp8_attention(
         q: jax.Array,
@@ -1233,14 +1463,29 @@ def initialize_paged_attention():
         union_gather: bool,
         union_cap: int,
         fused_swa: bool = False,
+        owner_perm: jax.Array | None = None,
+        owner_inv: jax.Array | None = None,
     ) -> jax.Array:
+        if owner_perm is not None:
+            q = _permute_owner_tokens_jax(q, owner_perm, 0)
+            tokens_local_perm = owner_perm.shape[0] // max(1, tp_size)
+            if swa_records.shape[0] != tokens_local_perm:
+                swa_records = _permute_owner_tokens_jax(swa_records, owner_perm, -1)
+            if main_records.shape[0] != tokens_local_perm:
+                main_records = _permute_owner_tokens_jax(main_records, owner_perm, -1)
         tokens = q.shape[0]
+        min_tp_tokens = tp_size if envs.TPU_DEEPSEEK_V41_KV_SHARD else 6 * tp_size
         use_token_parallel = (
-            token_parallel
+            (token_parallel or envs.TPU_DEEPSEEK_V41_KV_SHARD)
             and tp_size > 1
-            and tokens >= 6 * tp_size
+            and tokens >= min_tp_tokens
             and tokens % tp_size == 0
         )
+        if not use_token_parallel and envs.TPU_DEEPSEEK_V41_KV_SHARD and tp_size > 1:
+            raise ValueError(
+                f"TPU_DEEPSEEK_V41_KV_SHARD requires token count ({tokens}) >= "
+                f"tp_size ({tp_size}) and divisible by tp_size"
+            )
         if use_token_parallel:
             tokens_local = tokens // tp_size
             padded_local = -(-tokens_local // 8) * 8
@@ -1287,7 +1532,7 @@ def initialize_paged_attention():
                     out_tok, axis_name="tp", split_axis=1, concat_axis=0, tiled=True
                 )
 
-            return jax.shard_map(
+            out = jax.shard_map(
                 _token_parallel_body,
                 mesh=tp_mesh,
                 in_specs=in_specs,
@@ -1305,6 +1550,11 @@ def initialize_paged_attention():
                 sink,
                 full_sink,
                 tp_rank,
+            )
+            return (
+                _unpermute_owner_tokens_jax(out, owner_inv)
+                if owner_inv is not None
+                else out
             )
 
         # Mosaic calls require explicit manual partitioning on a multi-device
@@ -1379,6 +1629,8 @@ def initialize_paged_attention():
         union_gather: bool,
         union_cap: int,
         fused_swa: bool = False,
+        owner_perm: jax.Array | None = None,
+        owner_inv: jax.Array | None = None,
     ) -> jax.Array:
         return fp8_attention(
             q,
@@ -1400,6 +1652,8 @@ def initialize_paged_attention():
             union_gather,
             union_cap,
             fused_swa,
+            owner_perm,
+            owner_inv,
         )
 
     _fp8_attention_2bank_op = pallas.jax_op(
@@ -1441,6 +1695,8 @@ def initialize_paged_attention():
         head_dim: int,
         replicated_qr: bool = False,
         fused_swa: bool = False,
+        owner_perm: jax.Array | None = None,
+        owner_inv: jax.Array | None = None,
     ) -> jax.Array:
         """q projection + RoPE, sparse FP8 attention and inverse-RoPE ``wo_a``.
 
@@ -1476,6 +1732,18 @@ def initialize_paged_attention():
             _rope_jax,
         )
 
+        if owner_perm is not None:
+            qr = _permute_owner_tokens_jax(qr, owner_perm, 0)
+            if replicated_qr:
+                qr_local = _permute_owner_tokens_jax(qr_local, owner_perm, 0)
+            positions = _permute_owner_tokens_jax(positions, owner_perm, 0)
+            valid = _permute_owner_tokens_jax(valid, owner_perm, 0)
+            tokens_local_perm = owner_perm.shape[0] // max(1, tp_size)
+            if swa_records.shape[0] != tokens_local_perm:
+                swa_records = _permute_owner_tokens_jax(swa_records, owner_perm, -1)
+            if main_records.shape[0] != tokens_local_perm:
+                main_records = _permute_owner_tokens_jax(main_records, owner_perm, -1)
+
         tokens = positions.shape[0]
         attn_kwargs = dict(
             scale=scale,
@@ -1486,14 +1754,23 @@ def initialize_paged_attention():
         )
         if replicated_qr:
             tokens_local = tokens // tp_size
-            use_local = tp_size > 1 and tokens >= 6 * tp_size and tokens % tp_size == 0
+            min_rep_tokens = tp_size if envs.TPU_DEEPSEEK_V41_KV_SHARD else 6 * tp_size
+            use_local = (
+                tp_size > 1 and tokens >= min_rep_tokens and tokens % tp_size == 0
+            )
         else:
             tokens_local = qr_local.shape[0]
+            min_qo_tokens = tp_size if envs.TPU_DEEPSEEK_V41_KV_SHARD else 128 * tp_size
             use_local = (
                 tp_size > 1
-                and tokens >= 128 * tp_size
-                and tokens % (128 * tp_size) == 0
+                and tokens >= min_qo_tokens
+                and tokens % min_qo_tokens == 0
                 and tokens_local * tp_size == tokens
+            )
+        if not use_local and envs.TPU_DEEPSEEK_V41_KV_SHARD and tp_size > 1:
+            raise ValueError(
+                f"TPU_DEEPSEEK_V41_KV_SHARD requires token-parallel fp8_attention_qo "
+                f"(tokens={tokens}, tp_size={tp_size})"
             )
         if use_local:
             pad_rows = -tokens_local % 8
@@ -1563,7 +1840,7 @@ def initialize_paged_attention():
                 )
                 return gathered.reshape(tokens, -1)
 
-            return jax.shard_map(
+            out = jax.shard_map(
                 _local_body,
                 mesh=tp_mesh,
                 in_specs=(P(),) * 17,
@@ -1587,6 +1864,11 @@ def initialize_paged_attention():
                 wo_a_full,
                 wo_a_full_scale,
                 valid,
+            )
+            return (
+                _unpermute_owner_tokens_jax(out, owner_inv)
+                if owner_inv is not None
+                else out
             )
 
         def _sharded_body(
@@ -1674,6 +1956,8 @@ def initialize_paged_attention():
         head_dim: int,
         replicated_qr: bool = False,
         fused_swa: bool = False,
+        owner_perm: jax.Array | None = None,
+        owner_inv: jax.Array | None = None,
     ) -> jax.Array:
         return fp8_attention_qo(
             qr,
@@ -1706,6 +1990,8 @@ def initialize_paged_attention():
             head_dim,
             replicated_qr,
             fused_swa,
+            owner_perm,
+            owner_inv,
         )
 
     _fp8_attention_qo_2bank_op = pallas.jax_op(
@@ -1768,6 +2054,10 @@ def sparse_fp8_attention_qo(
     head_dim,
     replicated_qr=False,
     fused_swa=False,
+    *,
+    owner_perm=None,
+    owner_inv=None,
+    main_records_segmented=False,
 ):
     """`fp8_attention_qo` entry: ``qr`` -> this rank's ``wo_b`` input ``[T, R]``.
 
@@ -1777,6 +2067,15 @@ def sparse_fp8_attention_qo(
     `sparse_fp8_attention` does.
     """
     assert _fp8_attention_qo_op is not None and main.rope is not None
+    if owner_perm is not None:
+        qr = _permute_owner_tokens_torch(qr, owner_perm, 0)
+        if replicated_qr:
+            qr_local = _permute_owner_tokens_torch(qr_local, owner_perm, 0)
+        positions = _permute_owner_tokens_torch(positions, owner_perm, 0)
+        valid = _permute_owner_tokens_torch(valid, owner_perm, 0)
+        swa_records = _permute_owner_tokens_torch(swa_records, owner_perm, -1)
+        if not main_records_segmented:
+            main_records = _permute_owner_tokens_torch(main_records, owner_perm, -1)
     page_size = main.shape[1]
     if pages is None:
         page_size, pages, starts = _resolve_fp8_pages(
@@ -1809,7 +2108,7 @@ def sparse_fp8_attention_qo(
             and swa.raw_hi is not None
             and main.rope_hi is not None
         )
-        return _fp8_attention_qo_2bank_op(
+        out = _fp8_attention_qo_2bank_op(
             qr,
             qr_local,
             wq_b,
@@ -1826,42 +2125,86 @@ def sparse_fp8_attention_qo(
             main.rope_hi,
             *tail_args,
         )
-    return _fp8_attention_qo_op(
-        qr,
-        qr_local,
-        wq_b,
-        wq_b_scale,
-        wq_b_full,
-        wq_b_full_scale,
-        positions,
-        cos_sin_cache,
-        swa.raw,
-        main.raw,
-        main.rope,
-        *tail_args,
+    else:
+        out = _fp8_attention_qo_op(
+            qr,
+            qr_local,
+            wq_b,
+            wq_b_scale,
+            wq_b_full,
+            wq_b_full_scale,
+            positions,
+            cos_sin_cache,
+            swa.raw,
+            main.raw,
+            main.rope,
+            *tail_args,
+        )
+    return (
+        _unpermute_owner_tokens_torch(out, owner_inv) if owner_inv is not None else out
     )
 
 
-def paged_attention(q, swa, main, swa_records, main_records, sink, scale, block=1):
+def paged_attention(
+    q,
+    swa,
+    main,
+    swa_records,
+    main_records,
+    sink,
+    scale,
+    block=1,
+    *,
+    token_parallel=False,
+    full_sink=None,
+    tp_rank=None,
+    owner_perm=None,
+    owner_inv=None,
+    main_records_segmented=False,
+):
     """``block > 1``: rows ``[r * block, (r + 1) * block)`` are one non-causal
     query block sharing its sliding window (see `_attend_shared_block`)."""
+    if owner_perm is not None:
+        q = _permute_owner_tokens_torch(q, owner_perm, 0)
+        swa_records = _permute_owner_tokens_torch(swa_records, owner_perm, -1)
+        if not main_records_segmented:
+            main_records = _permute_owner_tokens_torch(main_records, owner_perm, -1)
+    if full_sink is None:
+        full_sink = sink
+    if tp_rank is None:
+        tp_rank = swa_records.new_zeros((1,), dtype=torch.int32)
+    else:
+        tp_rank = tp_rank.reshape(1).int()
+    tail_args = (
+        swa_records.int(),
+        main_records.int(),
+        sink,
+        full_sink,
+        tp_rank,
+        scale,
+        token_parallel,
+        block,
+    )
     if _has_hi_bank(main):
         assert _attention_2bank_op is not None and swa.raw_hi is not None
-        return _attention_2bank_op(
+        out = _attention_2bank_op(
             q,
             swa.raw,
             swa.raw_hi,
             main.raw,
             main.raw_hi,
-            swa_records.int(),
-            main_records.int(),
-            sink,
-            scale,
-            block,
+            *tail_args,
         )
-    assert _attention_op is not None
-    return _attention_op(
-        q, swa.raw, main.raw, swa_records.int(), main_records.int(), sink, scale, block
+    else:
+        assert _attention_op is not None
+        out = _attention_op(
+            q,
+            swa.raw,
+            main.raw,
+            *tail_args,
+        )
+    return (
+        _unpermute_owner_tokens_torch(out, owner_inv) if owner_inv is not None else out
     )
 
 
@@ -1883,6 +2226,10 @@ def sparse_fp8_attention(
     union_gather=False,
     union_cap=4096,
     fused_swa=False,
+    *,
+    owner_perm=None,
+    owner_inv=None,
+    main_records_segmented=False,
 ):
     """``main_records`` are raw rows, or rows paged by ``pages`` (main.pages).
 
@@ -1890,6 +2237,11 @@ def sparse_fp8_attention(
     SparseMLA kernel (see `fused_swa_eligible`); other shapes are unaffected.
     """
     assert _fp8_attention_op is not None and main.rope is not None
+    if owner_perm is not None:
+        q = _permute_owner_tokens_torch(q, owner_perm, 0)
+        swa_records = _permute_owner_tokens_torch(swa_records, owner_perm, -1)
+        if not main_records_segmented:
+            main_records = _permute_owner_tokens_torch(main_records, owner_perm, -1)
     page_size = main.shape[1]
     if pages is None or starts is None:
         page_size, pages, starts = _resolve_fp8_pages(main, main_records, q.shape[0])
@@ -1922,7 +2274,7 @@ def sparse_fp8_attention(
             and swa.raw_hi is not None
             and main.rope_hi is not None
         )
-        return _fp8_attention_2bank_op(
+        out = _fp8_attention_2bank_op(
             q,
             swa.raw,
             swa.raw_hi,
@@ -1932,12 +2284,16 @@ def sparse_fp8_attention(
             main.rope_hi,
             *tail_args,
         )
-    return _fp8_attention_op(
-        q,
-        swa.raw,
-        main.raw,
-        main.rope,
-        *tail_args,
+    else:
+        out = _fp8_attention_op(
+            q,
+            swa.raw,
+            main.raw,
+            main.rope,
+            *tail_args,
+        )
+    return (
+        _unpermute_owner_tokens_torch(out, owner_inv) if owner_inv is not None else out
     )
 
 

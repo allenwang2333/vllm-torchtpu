@@ -288,9 +288,9 @@ class TestBenchDecodeAttention:
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels.slice_token_parallel_attention_inputs",
                 return_value=(
-                    jnp.zeros(1),
-                    jnp.zeros(1),
-                    jnp.zeros(1, dtype=jnp.int32),
+                    jnp.zeros((1, 8), dtype=jnp.int32),
+                    jnp.zeros((1, 8), dtype=jnp.int32),
+                    jnp.zeros(2, dtype=jnp.int32),
                 ),
             ),
             patch(
@@ -362,11 +362,17 @@ class TestBenchDecodeAttention:
                 assert res["loop_median_ms"] == 10.0
                 assert res["hbm_before"] == {"hbm": 1024}
 
-            # 2. Test token_parallel mode for all subops
-            for subop in ["all", "swa_only", "sc_gather_only", "mla_tc_only"]:
+            # 2. Test token_parallel mode (num_seqs=8 -> pad=7, num_seqs=64 -> pad=0)
+            for num_seqs, subop in [
+                (8, "all"),
+                (8, "swa_only"),
+                (8, "sc_gather_only"),
+                (8, "mla_tc_only"),
+                (64, "all"),
+            ]:
                 args = argparse.Namespace(
                     mode="token_parallel",
-                    num_seqs=8,
+                    num_seqs=num_seqs,
                     kv_len=512,
                     page_size=16,
                     swa_max_requests=4,

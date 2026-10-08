@@ -11,7 +11,7 @@ import copy
 import dataclasses
 import math
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.config import get_layers_from_vllm_config, set_current_vllm_config
@@ -1373,13 +1373,24 @@ class KVCacheManager:
             if envs.TPU_DEEPSEEK_V41_IMPL == "v2":
                 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
                     materialize_upstream_kv_cache,
+                    resolve_worker_owner_layout,
                 )
 
+                shard_kwargs: dict[str, Any] = {}
+                if envs.TPU_DEEPSEEK_V41_KV_SHARD:
+                    owner_layout = resolve_worker_owner_layout(
+                        self.runner.vllm_config, kv_cache_config
+                    )
+                    shard_kwargs = {
+                        "replicated_blocks": owner_layout.num_replicated,
+                        "scheduler_blocks": owner_layout.num_blocks,
+                    }
                 materialized = materialize_upstream_kv_cache(
                     kv_cache_config,
                     self.runner.device,
                     self.runner.cache_config.get_resolved_kv_cache_layout(),
                     word_rows=True,
+                    **shard_kwargs,
                 )
                 native_rope_pools = materialized.rope_pools
             else:

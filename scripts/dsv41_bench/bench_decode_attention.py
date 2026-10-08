@@ -276,14 +276,22 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
             q, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, **kw
         )
 
+    pad_rows = (-t_local) % 8
+
     def tp_once(q, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, r_id, kw=attn_kw):
         q_tok = jax.lax.all_to_all(q, "tp", split_axis=0, concat_axis=1, tiled=True)
         s_r_t, m_r_t, q_loc_t = slice_token_parallel_attention_inputs(
             s_r, m_r, q_loc, r_id, tp, seqs
         )
+        if pad_rows:
+            q_tok = jnp.pad(q_tok, ((0, pad_rows), (0, 0), (0, 0)))
+            s_r_t = jnp.pad(s_r_t, ((0, pad_rows), (0, 0)), constant_values=-1)
+            m_r_t = jnp.pad(m_r_t, ((0, pad_rows), (0, 0)), constant_values=-1)
         out = sparse_fp8_attention_jax(
             q_tok, s_p, m_p, r_p, s_r_t, m_r_t, pgs, q_loc_t, snk, **kw
         )
+        if pad_rows:
+            out = out[:-pad_rows]
         return jax.lax.all_to_all(out, "tp", split_axis=1, concat_axis=0, tiled=True)
 
     def hp_base(*xs):
