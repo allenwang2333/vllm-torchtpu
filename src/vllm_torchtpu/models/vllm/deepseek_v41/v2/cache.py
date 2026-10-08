@@ -223,7 +223,9 @@ _read_values_op = None
 _read_values_2bank_op = None
 _write_op = None
 _write_values_op = None
+_write_values_2bank_op = None
 _write_values_after_op = None
+_write_values_after_2bank_op = None
 _encode_fp8_op = None
 
 
@@ -404,25 +406,27 @@ class PagedCacheRows:
                     values[valid_hi].contiguous().view(torch.int8),
                 )
             return
-        rec_lo = records.int()
+        rec = records.int()
+        if self.raw_hi is not None:
+            if after is not None:
+                assert _write_values_after_2bank_op is not None
+                self.copy_raw(
+                    _write_values_after_2bank_op(
+                        self.raw, self.raw_hi, rec, values, after
+                    )
+                )
+            else:
+                assert _write_values_2bank_op is not None
+                self.copy_raw(
+                    _write_values_2bank_op(self.raw, self.raw_hi, rec, values)
+                )
+            return
         if after is not None:
             assert _write_values_after_op is not None
-            self.raw.copy_(_write_values_after_op(self.raw, rec_lo, values, after))
-            if self.raw_hi is not None:
-                rec_hi = torch.where(
-                    rec_lo >= self.bank_records, rec_lo - self.bank_records, -1
-                )
-                self.raw_hi.copy_(
-                    _write_values_after_op(self.raw_hi, rec_hi, values, after)
-                )
+            self.raw.copy_(_write_values_after_op(self.raw, rec, values, after))
         else:
             assert _write_values_op is not None
-            self.raw.copy_(_write_values_op(self.raw, rec_lo, values))
-            if self.raw_hi is not None:
-                rec_hi = torch.where(
-                    rec_lo >= self.bank_records, rec_lo - self.bank_records, -1
-                )
-                self.raw_hi.copy_(_write_values_op(self.raw_hi, rec_hi, values))
+            self.raw.copy_(_write_values_op(self.raw, rec, values))
 
     def _write_fp8(self, records, values):
         """Quantize BF16 latents into NoPE rows and their RoPE companion slots."""
@@ -450,18 +454,21 @@ class PagedCacheRows:
                 companion_hi = self.rope_hi.view(-1, ROPE_WORDS)
                 companion_hi.index_copy_(0, rows_hi, rope[valid_hi])
             return
-        assert _encode_fp8_op is not None and _write_values_op is not None
+        assert _encode_fp8_op is not None
         words, rope = _encode_fp8_op(values.to(torch.bfloat16))
-        rec_lo = records.int()
-        self.raw.copy_(_write_values_op(self.raw, rec_lo, words))
-        self.rope.copy_(_write_values_op(self.rope, rec_lo, rope))
+        rec = records.int()
         if self.raw_hi is not None:
-            assert self.rope_hi is not None
-            rec_hi = torch.where(
-                rec_lo >= self.bank_records, rec_lo - self.bank_records, -1
+            assert self.rope_hi is not None and _write_values_2bank_op is not None
+            self.copy_raw(_write_values_2bank_op(self.raw, self.raw_hi, rec, words))
+            rope_lo, rope_hi = _write_values_2bank_op(
+                self.rope, self.rope_hi, rec, rope
             )
-            self.raw_hi.copy_(_write_values_op(self.raw_hi, rec_hi, words))
-            self.rope_hi.copy_(_write_values_op(self.rope_hi, rec_hi, rope))
+            self.rope.copy_(rope_lo)
+            self.rope_hi.copy_(rope_hi)
+            return
+        assert _write_values_op is not None
+        self.raw.copy_(_write_values_op(self.raw, rec, words))
+        self.rope.copy_(_write_values_op(self.rope, rec, rope))
 
 
 class NativeCacheView:
@@ -818,7 +825,8 @@ def encode_fp8_kv(latent: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 def initialize_cache_ops():
     global _read_values_op, _read_values_2bank_op, _write_op, _write_values_op
-    global _encode_fp8_op, _write_values_after_op
+    global _write_values_2bank_op, _encode_fp8_op, _write_values_after_op
+    global _write_values_after_2bank_op
     if _write_op is not None:
         return
     from jax.sharding import PartitionSpec as P
@@ -891,6 +899,38 @@ def initialize_cache_ops():
         lambda cache, records, values: torch.empty_like(cache)
     )
 
+    def write_cache_values_2bank(
+        cache_lo: jax.Array,
+        cache_hi: jax.Array,
+        records: jax.Array,
+        values: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return cast(
+            tuple[jax.Array, jax.Array],
+            scatter_cache_values(cast(Any, (cache_lo, cache_hi)), records, values),
+        )
+
+    write_values_2bank = jax.shard_map(
+        write_cache_values_2bank,
+        mesh=mesh,
+        in_specs=(P(), P(), P(), P()),
+        out_specs=(P(), P()),
+        check_vma=False,
+    )
+    _write_values_2bank_op = pallas.jax_op(
+        "pallas::dsv41v2_cache_write_values_2bank",
+        write_values_2bank,
+        donate_argnums=(0, 1),
+        mesh=mesh,
+        input_partition_specs=(P(), P(), P(), P()),
+    )
+    _write_values_2bank_op.register_fake(
+        lambda cache_lo, cache_hi, records, values: (
+            torch.empty_like(cache_lo),
+            torch.empty_like(cache_hi),
+        )
+    )
+
     def write_values_after(
         cache: jax.Array, records: jax.Array, values: jax.Array, after: jax.Array
     ) -> jax.Array:
@@ -908,6 +948,32 @@ def initialize_cache_ops():
     )
     _write_values_after_op.register_fake(
         lambda cache, records, values, after: torch.empty_like(cache)
+    )
+
+    def write_values_after_2bank(
+        cache_lo: jax.Array,
+        cache_hi: jax.Array,
+        records: jax.Array,
+        values: jax.Array,
+        after: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        cache_lo, cache_hi, _ = jax.lax.optimization_barrier(
+            (cache_lo, cache_hi, after)
+        )
+        return write_values_2bank(cache_lo, cache_hi, records, values)
+
+    _write_values_after_2bank_op = pallas.jax_op(
+        "pallas::dsv41v2_cache_write_values_after_2bank",
+        write_values_after_2bank,
+        donate_argnums=(0, 1),
+        mesh=mesh,
+        input_partition_specs=(P(), P(), P(), P(), P()),
+    )
+    _write_values_after_2bank_op.register_fake(
+        lambda cache_lo, cache_hi, records, values, after: (
+            torch.empty_like(cache_lo),
+            torch.empty_like(cache_hi),
+        )
     )
     _encode_fp8_op = pallas.jax_op(
         "pallas::dsv41v2_encode_fp8_kv",
@@ -1017,22 +1083,6 @@ def scatter_cache_values(
     import jax.numpy as jnp
 
     assert values.dtype in (jnp.bfloat16, jnp.float32, jnp.int32)
-    if isinstance(cache, tuple):
-        cache_lo, cache_hi = cache
-        record_words = (
-            values.shape[1] // 2 if values.dtype == jnp.bfloat16 else values.shape[1]
-        )
-        bank_records = cache_lo.shape[0] * ROW_WORDS // record_words
-        records_lo = jnp.where(records < bank_records, records, -1)
-        records_hi = jnp.where(records >= bank_records, records - bank_records, -1)
-        return cast(
-            Any,
-            (
-                scatter_cache_values(cache_lo, records_lo, values),
-                scatter_cache_values(cache_hi, records_hi, values),
-            ),
-        )
-    assert cache.dtype == jnp.int32 and cache.ndim == 2 and cache.shape[1] == ROW_WORDS
     if not values.shape[0]:
         return cache
     words = (
@@ -1054,6 +1104,19 @@ def scatter_cache_values(
             )
         )
     )
+    if isinstance(cache, tuple):
+        cache_lo, cache_hi = cache
+        bank_records = cache_lo.shape[0] * ROW_WORDS // words.shape[1]
+        records_lo = jnp.where(records < bank_records, records, -1)
+        records_hi = jnp.where(records >= bank_records, records - bank_records, -1)
+        return cast(
+            Any,
+            (
+                scatter_cache_values(cache_lo, records_lo, words),
+                scatter_cache_values(cache_hi, records_hi, words),
+            ),
+        )
+    assert cache.dtype == jnp.int32 and cache.ndim == 2 and cache.shape[1] == ROW_WORDS
     width = words.shape[1]
     if width < ROW_WORDS and jax.default_backend() == "tpu":
         # An elementwise (row, lane) scatter is slow on TPU. Rebuild whole word

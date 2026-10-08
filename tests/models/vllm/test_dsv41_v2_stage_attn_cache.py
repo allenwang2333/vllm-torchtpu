@@ -170,12 +170,12 @@ class TestCachePiecesAndPackBf16:
         assert out1.dtype == jnp.int32
 
         # Branch 2: values is bfloat16 on TPU with shape[1] >= 2 * ROW_WORDS
-        pack_called = False
+        pack_calls = 0
         orig_pack = v2_cache._pack_bf16_words
 
         def mock_pack(v):
-            nonlocal pack_called
-            pack_called = True
+            nonlocal pack_calls
+            pack_calls += 1
             return orig_pack(v)
 
         from jax.experimental import pallas as pl
@@ -186,21 +186,27 @@ class TestCachePiecesAndPackBf16:
 
         val_bf16_tpu = jnp.zeros((2, 2 * ROW_WORDS), dtype=jnp.bfloat16)
         out2 = v2_cache.scatter_cache_values(cache, records, val_bf16_tpu)
-        assert pack_called is True
+        assert pack_calls == 1
         assert out2.dtype == jnp.int32
 
+        # Branch 2b: 2-bank tuple on TPU packs BF16 words only once
+        pack_calls = 0
+        out2_2b = v2_cache.scatter_cache_values((cache, cache), records, val_bf16_tpu)
+        assert pack_calls == 1
+        assert isinstance(out2_2b, tuple) and len(out2_2b) == 2
+
         # Branch 3: values is bfloat16 on CPU -> bitcast_convert_type fallback
-        pack_called = False
+        pack_calls = 0
         monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
         out3 = v2_cache.scatter_cache_values(cache, records, val_bf16_tpu)
-        assert pack_called is False
+        assert pack_calls == 0
         assert out3.dtype == jnp.int32
 
         # Branch 4: values is bfloat16 on TPU but shape[1] not divisible
         monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
         val_bf16_small = jnp.zeros((2, 16), dtype=jnp.bfloat16)
         out4 = v2_cache.scatter_cache_values(cache, records, val_bf16_small)
-        assert pack_called is False
+        assert pack_calls == 0
         assert out4.dtype == jnp.int32
 
         # Branch 5: values is float32 -> directly passed to bitcast
@@ -845,11 +851,18 @@ class TestCompressedAttentionAndQuerySplitCaching:
             assert len(captured_main_recs) == 2
             assert torch.equal(captured_main_recs[1], src_records)
 
-        # Subcase 2: cached_idx_req hit branch
+        # Subcase 2: cached_idx_req hit branch (stride != and == idx_page_rows)
         with v2_attn.stage_attention_cache_scope():
             source_attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
             # Second call runs indexer but hits cached_idx_req in stage_cache
             source_attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
+            # Also exercise stride == idx_page_rows (32 == 32) and row_offset is None
+            idx_cache_mock.page_stride = 32
+            source_attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
+            idx_cache_mock.row_offset = None
+            source_attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
+            idx_cache_mock.row_offset = 600
+            idx_cache_mock.page_stride = 64
 
         # Subcase 3: _all_indices_fit branch (lines 991-998)
         all_fit_attn = _make_swa_attn(
