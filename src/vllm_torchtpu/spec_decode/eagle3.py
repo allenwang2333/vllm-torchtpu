@@ -2535,6 +2535,7 @@ class Eagle3Proposer:
                 and not self._share_mtp_indices
                 and not self._draft_kv_shared
                 and not runner._dp_lockstep_enabled()
+                and not getattr(runner, "_pcp_enabled", False)
                 and is_step0_post_attn_gather_installed(self.draft_model)
             )
             if self._mtp_fused_loop is not None or step0_post_attn_gather:

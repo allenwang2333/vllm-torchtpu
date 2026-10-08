@@ -872,6 +872,7 @@ class TpuPlatform(Platform):
             model_config is not None
             and "Qwen3_5MoeForConditionalGeneration"
             in (model_config.architectures or [])
+            and vllm_config.kv_transfer_config is None
             and os.environ.get("TPU_QWEN35_AUTO_DEFAULTS", "1").strip().lower()
             in ("1", "true", "yes", "on")
         ):
@@ -882,7 +883,7 @@ class TpuPlatform(Platform):
             ):
                 scheduler_config.scheduler_cls = paw_cls
                 logger.info("Auto-enabled PrefixAwareScheduler for Qwen3.5-397B.")
-            if vllm_config.kv_transfer_config is None:
+            if True:
                 # The regime hybrid-state retention and the Raiden partial-tail
                 # offload are built for: sparse retention, 128-token match unit.
                 if hasattr(cache_config, "prefix_cache_retention_interval"):
