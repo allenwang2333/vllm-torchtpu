@@ -103,6 +103,18 @@ def _attn_module(self_attn):
     raise Unsupported("no MLA attention module with W_UK_T / W_UV / kv_cache")
 
 
+def _own(t: torch.Tensor) -> torch.Tensor:
+    """A tensor with storage of exactly its own shape (not a view): a view operand of the compiled
+    step is materialized by torch_tpu's execute_as_strided on EVERY call (2.2 ms/step of copies of
+    the stacked weights and smalls, j-725a55a4)."""
+    out = torch.empty(tuple(t.shape), dtype=t.dtype, device=t.device)
+    out.copy_(t)
+    if out._base is not None:
+        logger.warning("GLM-5.2 TPxDCP megakernel: owned operand %s %s is still a view",
+                       tuple(out.shape), out.dtype)
+    return out
+
+
 def _routed(mlp):
     exp = mlp.experts
     return getattr(exp, "routed_experts", exp)
@@ -189,6 +201,10 @@ class Glm5MKD:
         self.max_pages = -(-mml // (FULL.page * R))
         self.rotary = bb.layers[0].self_attn.rotary_emb
         _need(self.rotary.cos_sin_cache.shape[-1] == cfg.DR, "rope cache width")
+        # own row-major copy: gathering 16 rows of the served cache made XLA transpose the whole
+        # [max_pos, 64] param every step (246 us, j-725a55a4)
+        with torch.no_grad():
+            self.cos_sin = _own(self.rotary.cos_sin_cache.detach())
         self.wk = K.weight_kinds(cfg)
         self.stack_w = frozenset(set(self.wk) - set(EXPERT_ALIAS))
         with torch.no_grad():
@@ -259,7 +275,7 @@ class Glm5MKD:
                 _need(t.dtype == want, f"{kind}[{l}]: {t.dtype} != {want}")
                 ts.append(t.detach())
             if kind in self.stack_w:
-                out.append(torch.stack(ts).contiguous())
+                out.append(_own(torch.stack(ts)))
                 names.append((kind, "stk"))
                 specs.append(P(None, AXIS))
             else:
@@ -283,7 +299,7 @@ class Glm5MKD:
                 _need(v.numel() == n, f"smalls {name}[{l}]: {v.numel()} != {n}")
                 parts.append(torch.nn.functional.pad(v, (0, rup(n) - n)))
             rows.append(torch.cat(parts))
-        return torch.stack(rows).reshape(cfg.L + 1, 1, S).contiguous()
+        return _own(torch.stack(rows).reshape(cfg.L + 1, 1, S))
 
     def _small_fields(self, l: int) -> dict[str, torch.Tensor]:
         cfg, r = self.cfg, self.rank
@@ -508,7 +524,7 @@ class Glm5MKD:
             self.bind_caches(runner)
         md = self._metadata()
         out = self._step(input_ids, positions, md.query_start_loc, md.seq_lens, md.block_tables,
-                         self.rotary.cos_sin_cache.detach(), self.smalls, self.weights, self.caches)
+                         self.cos_sin, self.smalls, self.weights, self.caches)
         n = input_ids.shape[0]
         if n <= out.shape[0]:
             return out[:n]
@@ -528,8 +544,7 @@ class Glm5MKD:
         seq = torch.tensor([T] + [0] * (cfg.TMAX - 1), dtype=torch.int32, device=dev)
         bt = torch.zeros(cfg.TMAX * self.max_pages, dtype=torch.int32, device=dev)
         t0 = time.monotonic()
-        out = self._step(ids, pos, qsl, seq, bt, self.rotary.cos_sin_cache.detach(), self.smalls,
-                         self.weights, self.caches)
+        out = self._step(ids, pos, qsl, seq, bt, self.cos_sin, self.smalls, self.weights, self.caches)
         synchronize_tensors([out])
         logger.info("GLM-5.2 TPxDCP megakernel compiled and warmed in %.1f s (%d weight operands)",
                     time.monotonic() - t0, len(self.weights))
