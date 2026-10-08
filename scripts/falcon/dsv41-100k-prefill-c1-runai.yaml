@@ -1,0 +1,454 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Reproduce the 40-layer DSv4.1-Flash 100k prefill baseline on one TPU7x-8
+# host (4 physical chips, 8 framework devices): C1 / TP8 / EP8 / offload=0.
+#
+# Before submission, replace every REPLACE_WITH_* value. The model bucket
+# must contain DeepSeek-V4.1-Flash/{config.json,model.safetensors.index.json,...}.
+# The wheel prefix must contain the cp312 Linux torch-tpu wheel named below;
+# its SHA256 is checked before installation. Register your own Falcon Git
+# credential with read access to both source repositories. The cache bucket
+# needs write access; the model and wheel buckets need object list/read access.
+# Check live capacity with `falcon cluster resources get <cluster-id>` first.
+# Submit: falcon workflow exp submit -f <this-file.yaml> --output json
+#
+# This is a fixed historical baseline, not a benchmark of the current branch
+# HEAD. It pins both source commits and native runtime versions, uses only
+# [2048, 8192] compile buckets, runs two warmup and two measured requests,
+# and saves logs/results/runtime metadata under $ARTIFACT_LOCAL_DIR/c1-prefill.
+# It uses the existing run_benchmarks.sh without changing its timing logic.
+#
+# Validated with Run:AI 0.16.1: 68.0-70.5 GiB/rank in 87-99 s of streaming;
+# 52,061 input tok/s and 1.920 s mean TTFT (two requests, not a statistical
+# performance claim). Compilation remains a separate ~396 s startup phase.
+# The embedded GCS 0.16.1 workaround avoids unnecessary bucket metadata reads;
+# it is version-guarded and tests object-only permissions before startup.
+# The task exits on failure or after three hours, without a recovery hold.
+name: dsv41-100k-prefill-c1-runai
+exp_type: BENCHMARK
+artifact_type: GCS
+cluster_name: REPLACE_WITH_FALCON_CLUSTER
+config: '{"commit": "63e3476be4e76d7c89d38e1e7e47f64fb41d30be", "concurrency": 1, "input_len":
+  100000, "output_len": 1, "compile_sizes": [2048, 8192], "reference_input_tok_s": 50965,
+  "reference_ttft_ms": 1961, "weight_loader": "runai_streamer"}'
+role_to_task_spec:
+  worker:
+    replica: 1
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
+    mounts:
+    - name: dsv41-wheel
+      type: gcs
+      bucket: REPLACE_WITH_WHEEL_BUCKET
+      prefix: REPLACE_WITH_WHEEL_PREFIX
+      mount_path: /wheels/torch-tpu
+      read_only: true
+      mount_options:
+      - implicit-dirs
+    - name: dsv41-model
+      type: gcs
+      bucket: REPLACE_WITH_MODEL_BUCKET
+      prefix: DeepSeek-V4.1-Flash
+      mount_path: /models/DeepSeek-V4.1-Flash
+      read_only: true
+      mount_options:
+      - implicit-dirs
+      - read:enable-buffered-read:true
+    - name: dsv41-compile-cache
+      type: gcs
+      bucket: REPLACE_WITH_CACHE_BUCKET
+      prefix: caches/dsv41-prefill
+      mount_path: /cache/dsv41-prefill
+      mount_options:
+      - implicit-dirs
+    sources:
+    - name: vllm-torchtpu
+      type: git
+      repo: git@github.com:vllm-project/vllm-torchtpu.git
+      ref: epic/dsv41
+      commit: 63e3476be4e76d7c89d38e1e7e47f64fb41d30be
+      path: /workspace/vllm-torchtpu
+      auth:
+        cred: REPLACE_WITH_FALCON_GIT_CREDENTIAL
+    - name: vllm
+      type: git
+      repo: git@github.com:vllm-project/vllm.git
+      ref: v0.30.0
+      path: /workspace/vllm
+      auth:
+        cred: REPLACE_WITH_FALCON_GIT_CREDENTIAL
+      commit: ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    command: |
+      mkdir -p /tmp/tpu_logs/repro
+      cat > /tmp/tpu_logs/repro/run-c1-prefill.sh <<'REPRO_FILE_0'
+      #!/usr/bin/env bash
+      # Usage: bash run-c1-prefill.sh /workspace/vllm-torchtpu [harness options]
+      # The config is installed temporarily; benchmark logic stays in the repository.
+      set -euo pipefail
+      ulimit -c 0
+      repo=$(cd "${1:?pass the pinned repository checkout}" && pwd)
+      shift
+      here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+      export PYTHONPATH="$repo/src${PYTHONPATH:+:$PYTHONPATH}"
+      expected=63e3476be4e76d7c89d38e1e7e47f64fb41d30be
+      actual=$(git -C "$repo" rev-parse HEAD)
+      [[ "$actual" == "$expected" ]] || {
+          echo "Expected source $expected; got $actual" >&2
+          exit 1
+      }
+      git -C "$repo" diff --quiet HEAD -- || {
+          echo "Tracked source differs from the pinned commit" >&2
+          exit 1
+      }
+      python3 "$here/verify-runtime.py"
+
+      config=$(mktemp "$repo/scripts/vllm/benchmarking/configs/dsv41-c1-repro-XXXXXX.sh")
+      trap 'rm -f "$config"' EXIT
+      cp "$here/dsv41-c1-prefill.sh" "$config"
+      config_name=$(basename "$config" .sh)
+
+      export TMPDIR="${TMPDIR:-/tmp/tpu_logs/tmp}"
+      export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/tmp/tpu_logs/pip-cache}"
+      export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/tpu_logs/uv-cache}"
+      # Point DSV41_CACHE_DIR at a persistent Falcon mount for cross-job reuse.
+      # Namespace by source, wheel/runtime and the workload to avoid mixing experiments.
+      cache_parent="${DSV41_CACHE_DIR:-/tmp/tpu_logs/dsv41-cache}"
+      cache_key=63e3476be-torchtpu20260924085621-torch213-jax0102-libtpu0047-v7x8-c1-sp-localq-w4a8-b2048_8192
+      export VLLM_CACHE_ROOT="$cache_parent/$cache_key/vllm"
+      export JAX_COMPILATION_CACHE_DIR="$cache_parent/$cache_key/jax"
+      export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT="$cache_parent/$cache_key/torchtpu"
+      mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" \
+          "$VLLM_CACHE_ROOT" "$JAX_COMPILATION_CACHE_DIR" \
+          "$TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT"
+
+      cd "$repo"
+      bash scripts/vllm/benchmarking/run_benchmarks.sh --config "$config_name" "$@"
+
+      REPRO_FILE_0
+      cat > /tmp/tpu_logs/repro/dsv41-c1-prefill.sh <<'REPRO_FILE_1'
+      #!/usr/bin/env bash
+      # Run:AI loading with per-rank expert and Engram row filtering.
+      # Target: 100k input, one output token, C=1, TP8/EP8, no Engram offload.
+      MODEL="${DEEPSEEK_V41_MODEL:-deepseek-ai/DeepSeek-V4.1-Flash}"
+      MODEL_URI="${DEEPSEEK_V41_MODEL_URI:-gs://REPLACE_WITH_MODEL_BUCKET/DeepSeek-V4.1-Flash/}"
+      TENSOR_PARALLELISM=8
+      DATA_PARALLELISM=1
+      ENABLE_EP=true
+      MAX_MODEL_LEN=103424
+      MAX_NUM_BATCHED_TOKENS=8192
+      MAX_NUM_SEQS=1
+      ASYNC_SCHEDULING=true
+      GPU_MEMORY_UTILIZATION=0.85
+      KV_CACHE_DTYPE=fp8
+      NUM_PROMPTS=2
+      ISL_OSL_CONFIGS="100000:1"
+      CONCURRENCY_OPTIONS="1"
+      RANDOM_RANGE_RATIO="0.0"
+      BENCHMARK_TEMPERATURE=0
+      BENCHMARK_WARMUP_RUNS=1
+      EVAL_TOLERANCE="0.03"
+      SERVER_READY_WAIT_MIN=120
+
+      # Pin the streamer buffer explicitly. vLLM 0.30 also maps the equivalent
+      # model-loader-extra-config memory_limit/concurrency options into these envs.
+      # 32 GiB admits each ~12 GiB local Engram table slice; do not use an 8 GiB
+      # limit that is smaller than one indivisible tensor slice.
+      export RUNAI_STREAMER_MEMORY_LIMIT=34359738368
+      export TPU_SHARDED_LOAD_SYNC_EVERY=512
+      export OMP_NUM_THREADS=1
+      export NEW_MODEL_DESIGN=1 MODEL_IMPL_TYPE=vllm
+      export VLLM_TARGET_DEVICE=tpu
+      export VLLM_USE_BREAKABLE_CUDAGRAPH=0 VLLM_USE_AOT_COMPILE=0
+      export VLLM_ENGINE_READY_TIMEOUT_S=7200
+      export TORCHINDUCTOR_AUTOGRAD_CACHE=0
+      export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false
+      export TPU_DEEPSEEK_V41_IMPL=v2 TPU_DEEPSEEK_V41_CED=1
+      export TPU_DEEPSEEK_V41_SP=1 TPU_DEEPSEEK_V41_LOCAL_Q=1
+      export TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD=0
+      export USE_MOE_SPARSE_CORE=0 USE_MOE_FUSED_EP_KERNEL=1
+      export MOE_FUSED_EP_ENABLE_W4A8=1 MOE_FUSED_EP_V2_SHARDED_PLAN=1
+      export VLLM_DISABLE_COMPILE_CACHE=0
+
+      # Preserve the original real-request padding: 12 * 8192 + 1696 tokens;
+      # the tail pads to 2048, as does the final 128-token CED decoder window.
+      # No decode/speculation workload needs the old 16-token bucket.
+      # Retain the original SP/offload=0 suite's 14-GiB KV budget for comparison.
+      EXTRA_SERVE_ARGS='--language-model-only --no-enable-prefix-caching --enable-ep-weight-filter --block-size=16 --kv-cache-memory-bytes=15045270528 --attention-config={"indexer_kv_dtype":"fp8"} --compilation-config={"compile_sizes":[2048,8192]}'
+
+      if [[ "${LIBTPU_INIT_ARGS:-}" != *"--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"* ]]; then
+          export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-} --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0"
+      fi
+
+      REPRO_FILE_1
+      cat > /tmp/tpu_logs/repro/verify-runtime.py <<'REPRO_FILE_2'
+      """Run inside the TPU benchmark environment before importing model libraries."""
+
+      import importlib.metadata as md
+      import json
+      import platform
+      import subprocess
+      import sys
+
+      expected = {
+          "torch": "2.13.0",
+          "torch-tpu": "0.1.1.dev20260924085621",
+          "tpu-sync-torch": "0.0.1.dev20260923040928",
+          "libtpu": "0.0.47",
+          "jax": "0.10.2",
+          "jaxlib": "0.10.2",
+          "vllm": "0.30.0",
+      }
+      actual = {name: md.version(name) for name in expected}
+      record = {
+          "python": platform.python_version(),
+          "platform": platform.platform(),
+          "packages": actual,
+          "wheel_sha256": "5244643b28a6b6560a258f157ce0bac47956258e5d39b08560314a4f000b11b9",
+      }
+      print(json.dumps(record, indent=2))
+      vllm_head = subprocess.check_output(
+          ["git", "-C", "/workspace/vllm", "rev-parse", "HEAD"], text=True
+      ).strip()
+      assert vllm_head == "ced6857afa0ea7b2e3f0846a62e1394e90f15607", vllm_head
+      direct_url = json.loads(md.distribution("vllm").read_text("direct_url.json"))
+      assert direct_url["url"] == "file:///workspace/vllm", direct_url
+      record["vllm_source_commit"] = vllm_head
+      record["vllm_source_tag"] = "v0.30.0"
+      print("VLLM_SOURCE_VERIFIED", vllm_head, actual["vllm"])
+      errors = [
+          f"{name}: expected {version}, got {actual[name]}"
+          for name, version in expected.items()
+          if actual[name].split("+", 1)[0] != version
+          and not (name == "vllm" and actual[name] == "0.1.dev1+gced6857af.empty")
+      ]
+      if sys.version_info[:2] != (3, 12):
+          errors.append("Python 3.12 is required by the provided wheel")
+      if errors:
+          raise SystemExit("\n".join(errors))
+      REPRO_FILE_2
+      cat > /tmp/tpu_logs/repro/falcon-run.sh <<'REPRO_FILE_3'
+      #!/usr/bin/env bash
+      set -Eeuo pipefail
+      ulimit -c 0
+      export TMPDIR=/tmp/tpu_logs/tmp PIP_CACHE_DIR=/tmp/tpu_logs/pip-cache UV_CACHE_DIR=/tmp/tpu_logs/uv-cache
+      export HF_HOME=/tmp/tpu_logs/hf PYTHONUNBUFFERED=1 PYTHONNOUSERSITE=1
+      export VLLM_TARGET_DEVICE=empty SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0
+      export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM=0.30.0
+      export OUT="$ARTIFACT_LOCAL_DIR/c1-prefill"
+      mkdir -p "$TMPDIR" "$OUT" /tmp/tpu_logs/repro
+      exec > >(tee -a "$OUT/task.log") 2>&1
+      on_exit() {
+          local exit_code=$?
+          printf "%s\n" "$exit_code" > "$OUT/exit-code.txt"
+          echo "REPRO_EXIT $exit_code"
+      }
+      trap on_exit EXIT
+      echo "REPRO_SETUP $(date -Is)"
+      cd /workspace/vllm-torchtpu
+      git log -1 --format=fuller | tee "$OUT/source.txt"
+      git -C /workspace/vllm rev-parse HEAD | tee "$OUT/vllm-source.txt"
+      test "$(git -C /workspace/vllm rev-parse HEAD)" = ced6857afa0ea7b2e3f0846a62e1394e90f15607
+      python3 -m venv /tmp/tpu_logs/venv
+      # shellcheck source=/dev/null
+      source /tmp/tpu_logs/venv/bin/activate
+      python -m pip install --upgrade pip 'setuptools>=77,<81' wheel
+      python -m pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple 'torch==2.13.0+cpu' 'torchvision==0.28.0+cpu'
+      python - <<'VERIFY_WHEEL'
+      import hashlib
+      import json
+      import os
+      import pathlib
+
+      p = pathlib.Path(
+          "/wheels/torch-tpu/torch_tpu-0.1.1.dev20260924085621-cp312-cp312-manylinux_2_31_x86_64.whl"
+      )
+      h = hashlib.file_digest(p.open("rb"), "sha256").hexdigest()
+      assert h == "5244643b28a6b6560a258f157ce0bac47956258e5d39b08560314a4f000b11b9", h
+      pathlib.Path(os.environ["OUT"], "wheel.json").write_text(
+          json.dumps({"filename": p.name, "size": p.stat().st_size, "sha256": h}, indent=2)
+      )
+      print("WHEEL_VERIFIED", h, flush=True)
+      VERIFY_WHEEL
+      python -m pip install /wheels/torch-tpu/torch_tpu-0.1.1.dev20260924085621-cp312-cp312-manylinux_2_31_x86_64.whl
+      python - <<'DEPS'
+      import pathlib
+      import subprocess
+      import sys
+      import tomllib
+
+      project = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]
+      deps = [
+          d
+          for d in project["dependencies"]
+          if not d.startswith(("vllm ", "torch==", "torchvision==", "torch-tpu=="))
+      ]
+      subprocess.check_call([sys.executable, "-m", "pip", "install", *deps])
+      DEPS
+      python -m pip install -e /workspace/vllm
+      python -m pip install --no-deps -e /workspace/vllm-torchtpu
+      python -m pip install --no-deps /workspace/vllm/tests/vllm_test_utils
+      python -m pip install "runai-model-streamer[gcs]==0.16.1" "runai-model-streamer-gcs==0.16.1"
+      python /tmp/tpu_logs/repro/fix-runai-gcs.py
+      python -m pip freeze > "$OUT/pip-freeze.txt"
+      python -m pip check | tee "$OUT/pip-check.txt"
+      python /tmp/tpu_logs/repro/verify-runtime.py | tee "$OUT/runtime.json"
+      python - <<'MODEL'
+      import hashlib
+      import json
+      import os
+      import pathlib
+
+      root = pathlib.Path("/models/DeepSeek-V4.1-Flash")
+      config = json.loads((root / "config.json").read_text())
+      index = json.loads((root / "model.safetensors.index.json").read_text())
+      shards = sorted(set(index["weight_map"].values()))
+      assert config["text_config"]["num_hidden_layers"] == 40, config["text_config"][
+          "num_hidden_layers"
+      ]
+      assert len(shards) == 48, len(shards)
+      record = {
+          "config": config,
+          "shard_count": len(shards),
+          "total_size": index["metadata"]["total_size"],
+          "metadata_sha256": {
+              f: hashlib.sha256((root / f).read_bytes()).hexdigest()
+              for f in ["config.json", "model.safetensors.index.json"]
+          },
+      }
+      pathlib.Path(os.environ["OUT"], "model-metadata.json").write_text(
+          json.dumps(record, indent=2)
+      )
+      print("MODEL_VERIFIED", record["shard_count"], record["total_size"], flush=True)
+      MODEL
+      export VLLM_TARGET_DEVICE=tpu
+      python - <<'SMOKE' | tee "$OUT/tpu-smoke.log"
+      import json
+
+      import jax
+      import torch_tpu  # noqa: F401 -- verify backend import
+      import tpu_sync  # noqa: F401 -- verify package import
+      from tpu_sync.api.torch.reshard_store import (
+          RaidenId,  # noqa: F401 -- ABI smoke  # noqa: F401 -- ABI smoke
+      )
+
+      devices = jax.devices()
+      assert len(devices) == 8, devices
+      assert all(d.platform == "tpu" for d in devices), devices
+      assert jax.process_count() == 1
+      x = jax.numpy.arange(8)
+      assert int(jax.numpy.sum(x).block_until_ready()) == 28
+      print(
+          "TPU_RUNTIME_SMOKE_OK",
+          json.dumps(
+              {"devices": [str(x) for x in devices], "process_count": jax.process_count()}
+          ),
+          flush=True,
+      )
+      SMOKE
+      export DSV41_CACHE_DIR=/cache/dsv41-prefill DEEPSEEK_V41_MODEL=/models/DeepSeek-V4.1-Flash
+      cp /tmp/tpu_logs/repro/* "$OUT/"
+      echo "REPRO_BENCHMARK_START $(date -Is)"
+      bash /tmp/tpu_logs/repro/run-c1-prefill.sh /workspace/vllm-torchtpu --results-dir "$OUT/benchmark"
+      echo "REPRO_BENCHMARK_END $(date -Is)"
+
+      REPRO_FILE_3
+      cat > /tmp/tpu_logs/repro/fix-runai-gcs.py <<'RUNAI_GCS_FIX'
+      """Avoid unnecessary bucket metadata reads in pinned Run:AI GCS 0.16.1."""
+
+      import ast
+      import hashlib
+      import importlib
+      import importlib.metadata as md
+      import json
+      import os
+      from pathlib import Path
+      from tempfile import TemporaryDirectory
+      from types import SimpleNamespace
+      from unittest.mock import patch
+
+      assert md.version("runai-model-streamer-gcs") == "0.16.1"
+      module = importlib.import_module("runai_model_streamer_gcs.files.files")
+      path = Path(module.__file__)
+      before = path.read_text()
+      needle = "gcs.get_bucket(bucket_name)"
+      if needle in before:
+          assert before.count(needle) == 2, (
+              "Unexpected GCS package source; inspect before patching"
+          )
+          after = before.replace(needle, "gcs.bucket(bucket_name)")
+          ast.parse(after)
+          path.write_text(after)
+          importlib.reload(module)
+      else:
+          after = before
+          assert before.count("gcs.bucket(bucket_name)") == 2
+
+      # A principal can read/list objects without being allowed bucket metadata.
+      # Exercise both metadata listing and download with this permission boundary.
+      calls = []
+
+
+      class Bucket:
+          def list_blobs(self, **kw):
+              calls.append(("list", kw))
+              return [
+                  SimpleNamespace(name=n)
+                  for n in [
+                      "model/config.json",
+                      "model/tokenizer.json",
+                      "model/sub/extra.json",
+                      "model/model.safetensors",
+                      "model/sub/",
+                  ]
+              ]
+
+          def blob(self, name):
+              def download(dst):
+                  calls.append(("download", name))
+                  Path(dst).write_text(name)
+
+              return SimpleNamespace(download_to_filename=download)
+
+
+      class Client:
+          def get_bucket(self, name):
+              raise PermissionError("Bucket metadata access is intentionally denied")
+
+          def bucket(self, name):
+              assert name == "test-bucket"
+              return Bucket()
+
+
+      client = Client()
+      with patch.object(module, "_create_client", return_value=client):
+          got = module.glob("gs://test-bucket/model", ["*.safetensors"])
+          assert got == ["gs://test-bucket/model/model.safetensors"], got
+          with TemporaryDirectory() as dst:
+              module.pull_files(
+                  "gs://test-bucket/model", dst, ["*.json"], ["*/tokenizer.json"]
+              )
+              assert (Path(dst) / "config.json").read_text() == "model/config.json"
+              assert (Path(dst) / "sub/extra.json").read_text() == "model/sub/extra.json"
+              assert not (Path(dst) / "tokenizer.json").exists()
+      assert [v["delimiter"] for k, v in calls if k == "list"] == ["/", None]
+      record = {
+          "package": "runai-model-streamer-gcs",
+          "version": md.version("runai-model-streamer-gcs"),
+          "patch": (
+              "Replace the two gcs.get_bucket(bucket_name) metadata reads "
+              "with gcs.bucket(bucket_name)"
+          ),
+          "sha256_before": hashlib.sha256(before.encode()).hexdigest(),
+          "sha256_after": hashlib.sha256(after.encode()).hexdigest(),
+          "object_only_permission_tests": "passed",
+      }
+      print("RUNAI_GCS_PATCH_VERIFIED", json.dumps(record), flush=True)
+      if "OUT" in os.environ:
+          Path(os.environ["OUT"], "runai-gcs-patch.json").write_text(
+              json.dumps(record, indent=2)
+          )
+      RUNAI_GCS_FIX
+      timeout --signal=TERM --kill-after=60s 10800 bash /tmp/tpu_logs/repro/falcon-run.sh
