@@ -437,6 +437,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     if debug:
         scratch["dbg_sem"] = pltpu.SemaphoreType.DMA((3,))
         scratch["dbgl"] = pltpu.VMEM((TMAX, 128), F32)
+        scratch["dbgo"] = pltpu.VMEM((TMAX, NH, KL), F32)
 
     # --- the stream: one layer's tiles in consumption order ---
     SEGS = ("qkv_a", "q_b", "w_uk", "idx_wq", "idx_wk", "w_uv", "o_proj", "w13", "w2",
@@ -481,8 +482,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         out_ref, nrow_out, rrow_out, irec_out = refs[o0:o0 + 4]
         rest = refs[o0 + 4:]
         if debug:
-            dbg_h, dbg_own, dbg_lse = rest[:3]
-            rest = rest[3:]
+            dbg_h, dbg_own, dbg_lse, dbg_part = rest[:4]
+            rest = rest[4:]
         scr = dict(zip(s_names, rest))
         W, C, WS, CS = {}, {}, {}, {}
         for (k, l), r in zip(w_names, w_in):
@@ -940,7 +941,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                        pltpu.make_async_copy(scr["res"].at[pl.ds(0, RPR)], dbg_h.at[l, 1],
                                              scr["dbg_sem"].at[0]),
                        pltpu.make_async_copy(scr["own_v"], dbg_own.at[l], scr["dbg_sem"].at[1]),
-                       pltpu.make_async_copy(scr["dbgl"], dbg_lse.at[l], scr["dbg_sem"].at[2])]
+                       pltpu.make_async_copy(scr["dbgl"], dbg_lse.at[l], scr["dbg_sem"].at[2]),
+                       pltpu.make_async_copy(scr["dbgo"], dbg_part.at[l], scr["dbg_sem"].at[2])]
                 for d_ in dcs:
                     d_.start()
                 for d_ in dcs:
@@ -1247,6 +1249,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 lse_row = jnp.transpose(lse_b)[0:1]                          # [1, 128], lane = head
                 if debug:
                     scr["dbgl"][pl.ds(t_, 1), :] = lse_row
+                    scr["dbgo"][t_] = out
                 for d in range(R):
                     od = jnp.concatenate([out[d * HR + hh:d * HR + hh + 1] for hh in range(HR)], axis=1)
                     lrow = pltpu.roll(lse_row, (128 - d * HR) % 128, 1) if d else lse_row
@@ -1408,8 +1411,9 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     if debug:
         out_shape += [jax.ShapeDtypeStruct((L, 2, RPR, H), F32),
                       jax.ShapeDtypeStruct((L, TMAX, KR_, 128), I32),
-                      jax.ShapeDtypeStruct((L, TMAX, 128), F32)]
-        out_specs += [pl.BlockSpec(memory_space=pl.ANY)] * 3
+                      jax.ShapeDtypeStruct((L, TMAX, 128), F32),
+                      jax.ShapeDtypeStruct((L, TMAX, NH, KL), F32)]
+        out_specs += [pl.BlockSpec(memory_space=pl.ANY)] * 4
     call = pl.pallas_call(
         kernel,
         name="glm5_mk_dcp",

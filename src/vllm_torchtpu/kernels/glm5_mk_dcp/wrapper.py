@@ -28,7 +28,7 @@ def make(cfg, mesh, axis="d", donate=True, **build_kw):
         return tuple(o[None] for o in (out, *new, *outs[4:]))
 
     n_in = 8 + n_w + n_c
-    n_out = 1 + n_c + (3 if debug else 0)
+    n_out = 1 + n_c + (4 if debug else 0)
     fn = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(axis),) * n_in,
                                out_specs=(P(axis),) * n_out, check_vma=False),
                  donate_argnums=tuple(range(8 + n_w, n_in)) if donate else ())
