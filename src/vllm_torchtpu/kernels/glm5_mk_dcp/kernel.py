@@ -1406,6 +1406,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         out_specs += [pl.BlockSpec(memory_space=pl.ANY)] * 2
     call = pl.pallas_call(
         kernel,
+        name="glm5_mk_dcp",
         out_shape=out_shape,
         in_specs=in_specs,
         out_specs=out_specs,
@@ -1625,6 +1626,7 @@ def build_writer(cfg, *, nb, max_pages, bmax=None, interpret=False, axis_name=No
                 for k, l in c_names]
     call = pl.pallas_call(
         kernel,
+        name="glm5_mk_dcp_writer",
         out_shape=c_shapes,
         in_specs=([pl.BlockSpec(memory_space=pltpu.SMEM)] * 3 + [pl.BlockSpec(memory_space=pl.ANY)] * 3
                   + [pl.BlockSpec(memory_space=pl.ANY)] * n_c),
