@@ -103,6 +103,20 @@ PATCH_RUNAI_GCS
         marker,
         f"{runai_patch}export TPU_DSV41_STATIC_MOE_DIR={MODEL_MOUNT}\n{marker}",
     )
+    config_marker = "TENSOR_PARALLELISM=8"
+    if command.count(config_marker) != 1:
+        raise ValueError("Baseline tensor-parallel config changed")
+    command = command.replace(
+        config_marker, f'TOKENIZER="{MODEL_MOUNT}"\n{config_marker}'
+    )
+    serve_marker = "EXTRA_SERVE_ARGS='--language-model-only"
+    if command.count(serve_marker) != 1:
+        raise ValueError("Baseline serving arguments changed")
+    # Avoid Run:AI's tokenizer pull, which otherwise downloads every .fp4 shard.
+    command = command.replace(
+        serve_marker,
+        f"EXTRA_SERVE_ARGS='--tokenizer={MODEL_MOUNT} --language-model-only",
+    )
     benchmark_start = 'echo "REPRO_BENCHMARK_START $(date -Is)"'
     if command.count(benchmark_start) != 1:
         raise ValueError("Baseline benchmark start marker changed")
