@@ -58,7 +58,316 @@ class TpuCompilationHandle:
     was_wrapped: bool = False
 
 
+def _get_proc_mem_mb() -> tuple[float, float, float]:
+    """Get VmRSS, RssAnon, and VmSize from /proc/self/status in MB."""
+    vm_rss = 0.0
+    rss_anon = 0.0
+    vm_size = 0.0
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    vm_rss = float(line.split()[1]) / 1024.0
+                elif line.startswith("RssAnon:"):
+                    rss_anon = float(line.split()[1]) / 1024.0
+                elif line.startswith("VmSize:"):
+                    vm_size = float(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return vm_rss, rss_anon, vm_size
+
+
+_tcm_profiler_lib = None
+_tcm_profiler_active = False
+_tcm_dump_seq = 0
+
+
+def _is_worker_0() -> bool:
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank() == 0
+    except Exception:
+        pass
+    rank_env = os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or os.environ.get("TPU_WORKER_ID")
+    if rank_env is not None:
+        return str(rank_env) in ("0", "")
+    return True
+
+
+def _get_tcm_profiler():
+    global _tcm_profiler_lib
+    if _tcm_profiler_lib is None:
+        import ctypes
+        for p in [
+            "/usr/lib/x86_64-linux-gnu/libtcmalloc_and_profiler.so.4",
+            "libtcmalloc_and_profiler.so.4",
+        ]:
+            try:
+                lib = ctypes.CDLL(p)
+                lib.HeapProfilerStart.argtypes = [ctypes.c_char_p]
+                lib.HeapProfilerStart.restype = ctypes.c_int
+                lib.HeapProfilerDump.argtypes = [ctypes.c_char_p]
+                lib.HeapProfilerStop.restype = None
+                _tcm_profiler_lib = lib
+                break
+            except Exception:
+                pass
+    return _tcm_profiler_lib
+
+
+def _dump_tcm_heap(reason: str):
+    if not _is_worker_0():
+        return
+    tcm = _get_tcm_profiler()
+    if tcm is None:
+        logger.warning(f"[HEAP_DUMP] TCMalloc profiler library not found, skipping {reason}")
+        return
+    global _tcm_profiler_active
+    dump_prefix = os.environ.get("HEAP_DUMP_PREFIX", "/cdk-outputs/worker0_heap")
+    try:
+        os.makedirs(os.path.dirname(dump_prefix), exist_ok=True)
+    except Exception:
+        dump_prefix = "/tmp/worker0_heap"
+        os.makedirs(os.path.dirname(dump_prefix), exist_ok=True)
+    if not _tcm_profiler_active:
+        res = tcm.HeapProfilerStart(dump_prefix.encode("utf-8"))
+        _tcm_profiler_active = True
+        logger.info(f"[HEAP_DUMP] Started HeapProfiler with prefix {dump_prefix} (res={res})")
+    tcm.HeapProfilerDump(reason.encode("utf-8"))
+    global _tcm_dump_seq
+    _tcm_dump_seq += 1
+    logger.info(
+        f"[HEAP_DUMP] Dumped heap profile snapshot: {reason} "
+        f"-> {dump_prefix}.{_tcm_dump_seq:04d}.heap"
+    )
+
+
+def _py_compile_cache_stats() -> str:
+    """Sizes of torch's process-global compile artifact caches."""
+    parts = []
+    try:
+        from torch.compiler._cache import CacheArtifactManager as M
+
+        n = 0
+        nbytes = 0
+        for v in M._new_cache_artifacts.values():
+            for a in v if isinstance(v, (list, tuple)) else [v]:
+                n += 1
+                c = getattr(a, "content", None)
+                if isinstance(c, (bytes, bytearray)):
+                    nbytes += len(c)
+        parts.append(
+            f"CacheArtifactManager.new={n} ({nbytes / 2**20:.1f} MiB) "
+            f"seen={len(M._seen_artifacts)}"
+        )
+    except Exception as e:  # noqa: BLE001
+        parts.append(f"CacheArtifactManager=? ({e!r})")
+    try:
+        from torch._dynamo.precompile_context import PrecompileContext as P
+
+        n = 0
+        nbytes = 0
+        for a in P._backend_artifacts_by_key.values():
+            n += 1
+            c = getattr(a, "content", None)
+            if isinstance(c, (bytes, bytearray)):
+                nbytes += len(c)
+        parts.append(
+            f"PrecompileContext.backend={n} ({nbytes / 2**20:.1f} MiB bytes) "
+            f"dynamo_entries={len(P._dynamo_cache_entries)}"
+        )
+    except Exception as e:  # noqa: BLE001
+        parts.append(f"PrecompileContext=? ({e!r})")
+    return " | ".join(parts)
+
+
+_tm_state = "idle"
+
+
+
+
+def _tm_short(path: str) -> str:
+    for marker in ("site-packages/", "dist-packages/", "/workspace/"):
+        i = path.rfind(marker)
+        if i >= 0:
+            return path[i + len(marker):]
+    return path
+
+
+def _tracemalloc_report(reason: str, cumulative: bool = False) -> None:
+    """Python allocation sites (file:line) still alive after one compile.
+
+    PY_TRACEMALLOC=1 and PY_TRACEMALLOC_RANGE="(64, 64)": start tracing at
+    pre_compile_<RANGE>; at post_compile_<RANGE> report every live trace
+    (all allocated during that compile) and stop. Without a range, the first
+    call starts and the next call reports and stops.
+    """
+    if os.environ.get("PY_TRACEMALLOC", "0") != "1" or not _is_worker_0():
+        return
+    import time
+    import tracemalloc
+
+    global _tm_state
+    target = os.environ.get("PY_TRACEMALLOC_RANGE", "")
+    if _tm_state == "done":
+        return
+    if not tracemalloc.is_tracing():
+        if _tm_state != "idle" or (target and reason != f"pre_compile_{target}"):
+            return
+        tracemalloc.start(int(os.environ.get("PY_TRACEMALLOC_FRAMES", "12")))
+        _tm_state = "tracing"
+        logger.info(f"[PY_TRACEMALLOC][{reason}] tracing started")
+        return
+    if target and reason != f"post_compile_{target}":
+        return
+    t0 = time.time()
+    traces = tracemalloc._get_traces()  # (domain, size, frames, total_nframe)
+    cur, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    _tm_state = "done"
+    big_min = int(os.environ.get("PY_TRACEMALLOC_BIG_BYTES", str(64 * 1024)))
+    top_n = int(os.environ.get("PY_TRACEMALLOC_TOP", "15"))
+    by_tb: dict = {}
+    by_line: dict = {}
+    total = 0
+    for _dom, size, frames, _n in traces:
+        total += size
+        if not frames:
+            continue
+        top = frames[0]  # most recent frame first
+        e = by_line.get(top)
+        if e is None:
+            by_line[top] = [size, 1]
+        else:
+            e[0] += size
+            e[1] += 1
+        if size >= big_min:
+            e = by_tb.get(frames)
+            if e is None:
+                by_tb[frames] = [size, 1]
+            else:
+                e[0] += size
+                e[1] += 1
+    del traces
+    mib = 2**20
+    lines = [
+        f"[PY_TRACEMALLOC][{reason}] live allocations made during this compile: "
+        f"{total / mib:.1f} MiB (traced={cur / mib:.1f} MiB, peak={peak / mib:.1f} "
+        f"MiB, aggregation {time.time() - t0:.1f}s)",
+        f"  -- top {top_n} allocation lines (most recent frame) --",
+    ]
+    for (fn, ln), (sz, n) in sorted(by_line.items(), key=lambda kv: -kv[1][0])[:top_n]:
+        lines.append(f"  {sz / mib:9.1f} MiB  n={n:<8d} {_tm_short(fn)}:{ln}")
+    lines.append(f"  -- top {top_n} tracebacks of allocations >= {big_min} B --")
+    for frames, (sz, n) in sorted(by_tb.items(), key=lambda kv: -kv[1][0])[:top_n]:
+        lines.append(f"  {sz / mib:9.1f} MiB  n={n}")
+        for fn, ln in frames:
+            lines.append(f"        {_tm_short(fn)}:{ln}")
+    logger.info("\n".join(lines))
+
+
+def _heap_checkpoint(reason: str) -> None:
+    """gc + RSS/cache-size log (+ heap dump if HEAP_DUMP_PER_COMPILE=1)."""
+    if not _is_worker_0():
+        return
+    import gc
+
+    gc.collect()
+    rss, anon, _ = _get_proc_mem_mb()
+    logger.info(
+        f"[HEAP_CKPT][{reason}] VmRSS={rss:.2f} MB, RssAnon={anon:.2f} MB | "
+        f"{_py_compile_cache_stats()}"
+    )
+    if os.environ.get("HEAP_DUMP_PER_COMPILE", "0") == "1":
+        _dump_tcm_heap(reason)
+    try:
+        _tracemalloc_report(reason)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[PY_TRACEMALLOC][{reason}] failed: {e!r}")
+
+
+def clear_compile_artifact_caches() -> None:
+    """Drop torch's process-global compile artifact caches (experiment)."""
+    if not _is_worker_0():
+        before = None
+    else:
+        before = _py_compile_cache_stats()
+    try:
+        from torch.compiler._cache import CacheArtifactManager
+
+        CacheArtifactManager.clear()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[CACHE_CLEAR] CacheArtifactManager.clear failed: {e!r}")
+    try:
+        from torch._dynamo.precompile_context import PrecompileContext
+
+        PrecompileContext.clear()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[CACHE_CLEAR] PrecompileContext.clear failed: {e!r}")
+    import gc
+
+    gc.collect()
+    if before is not None:
+        rss, anon, _ = _get_proc_mem_mb()
+        logger.info(
+            f"[CACHE_CLEAR] before: {before} || after: {_py_compile_cache_stats()} "
+            f"| VmRSS={rss:.2f} MB, RssAnon={anon:.2f} MB"
+        )
+
+
 _tpu_backend = TpuBackend()
+
+
+def _install_executable_load_tracer() -> None:
+    """Wrap torch_tpu load/serialize_executable to log call stacks (worker 0).
+
+    Each load_serialized_executable creates a separate host copy of a
+    PjRtLoadedExecutable; this shows which Python path asks for it.
+    """
+    if os.environ.get("LOG_EXECUTABLE_LOADS", "1") != "1":
+        return
+    try:
+        from torch_tpu._internal.compile import tpu_torch_compile as ttc
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[EXEC_TRACE] cannot import tpu_torch_compile: {e!r}")
+        return
+    if getattr(ttc, "_vllm_exec_trace_installed", False):
+        return
+    import traceback
+
+    max_logs = int(os.environ.get("LOG_EXECUTABLE_LOADS_MAX", "40"))
+    counts = {"load": 0, "serialize": 0}
+
+    def _wrap(name, kind):
+        orig = getattr(ttc, name, None)
+        if orig is None:
+            return
+
+        def wrapper(*args, **kwargs):
+            out = orig(*args, **kwargs)
+            try:
+                counts[kind] += 1
+                if counts[kind] <= max_logs and _is_worker_0():
+                    obj = args[0] if kind == "load" and args else out
+                    nbytes = len(obj) if hasattr(obj, "__len__") else -1
+                    stack = "".join(traceback.format_stack(limit=28)[:-1])
+                    logger.info(
+                        f"[EXEC_TRACE][{kind} #{counts[kind]}] bytes={nbytes}\n{stack}"
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+            return out
+
+        setattr(ttc, name, wrapper)
+
+    _wrap("load_serialized_executable", "load")
+    _wrap("serialize_executable", "serialize")
+    ttc._vllm_exec_trace_installed = True
+    logger.info("[EXEC_TRACE] installed load/serialize_executable tracer")
+
+
+_install_executable_load_tracer()
 
 
 def _deserialize_entry(entry: Any) -> Callable[..., Any]:
@@ -447,8 +756,26 @@ class TpuCompilerAdaptor(CompilerInterface):
         from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
 
         config.reset_scheduling_group_ids()
+
+        import gc
+        gc.collect()
+        rss_0, anon_0, vms_0 = _get_proc_mem_mb()
+        node_count = len(graph.nodes) if hasattr(graph, "nodes") else 0
+        logger.info(
+            f"[COMPILE_MEM_TRACE][PRE] Graph nodes={node_count} | "
+            f"VmRSS={rss_0:.2f} MB, RssAnon={anon_0:.2f} MB, VmSize={vms_0:.2f} MB"
+        )
+
         with torch._guards.tracing(tracing_ctx):
             compiled_fn = _tpu_backend(graph, example_inputs)
+
+        rss_1, anon_1, vms_1 = _get_proc_mem_mb()
+        logger.info(
+            f"[COMPILE_MEM_TRACE][POST_TPU_BACKEND] "
+            f"VmRSS={rss_1:.2f} MB (+{rss_1 - rss_0:.2f} MB), "
+            f"RssAnon={anon_1:.2f} MB (+{anon_1 - anon_0:.2f} MB), "
+            f"VmSize={vms_1:.2f} MB (+{vms_1 - vms_0:.2f} MB)"
+        )
 
         # Read `serialize` off the object TpuBackend returned, before any
         # wrapping: the unwrap below replaces it with a plain closure that does
@@ -458,12 +785,28 @@ class TpuCompilerAdaptor(CompilerInterface):
         if serialize is not None:
             try:
                 entry = serialize()
+                rss_2, anon_2, vms_2 = _get_proc_mem_mb()
+                entry_size = len(entry) if hasattr(entry, "__len__") else 0
+                logger.info(
+                    f"[COMPILE_MEM_TRACE][POST_SERIALIZE] "
+                    f"VmRSS={rss_2:.2f} MB (+{rss_2 - rss_1:.2f} MB), "
+                    f"RssAnon={anon_2:.2f} MB (+{anon_2 - anon_1:.2f} MB), "
+                    f"EntrySize={entry_size}"
+                )
             except Exception as e:
                 logger.warning(
                     "[TpuCompilerAdaptor] serialize() failed, this graph will "
                     "not be cached: %s",
                     e,
                 )
+
+        gc.collect()
+        rss_3, anon_3, vms_3 = _get_proc_mem_mb()
+        logger.info(
+            f"[COMPILE_MEM_TRACE][SETTLED_POST_GC] "
+            f"VmRSS={rss_3:.2f} MB (Net change: {rss_3 - rss_0:+.2f} MB), "
+            f"RssAnon={anon_3:.2f} MB (Net change: {anon_3 - anon_0:+.2f} MB)"
+        )
         return compiled_fn, entry
 
     def _save_handle(
@@ -588,6 +931,7 @@ class TpuCompilerAdaptor(CompilerInterface):
             "[TpuCompilerAdaptor] Compiling FX graph for range %s",
             compile_range,
         )
+        _heap_checkpoint(f"pre_compile_{compile_range}")
 
         # aot_autograd (inside TpuBackend) requires tuple outputs. Deep-copied
         # first because _ensure_tuple_output rewrites the output node in place
@@ -635,6 +979,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # executable for it (see shape_variants.BucketExecutables).
         if key is not None and size is not None:
             shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
+        _heap_checkpoint(f"post_compile_{compile_range}")
         return compiled_fn, handle
 
     def load(

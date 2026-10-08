@@ -147,6 +147,10 @@ class TPUWorker(WorkerBase):
                 "Profiling enabled. Traces will be saved to: %s", self.profile_dir
             )
 
+        if self.rank == 0:
+            from vllm_torchtpu.compilation.tpu_compiler import _dump_tcm_heap
+            _dump_tcm_heap("init_before_weights")
+
     def set_kv_cache_layout(self, kv_cache_layout: str) -> None:
         # TPU resolves before model load because layout determines its page
         # geometry. Check the actual loaded backends when engine core publishes
@@ -694,12 +698,73 @@ class TPUWorker(WorkerBase):
 
         patch_registry.apply("model_load", model_config=self.model_config)
         self.model_runner.load_model()
+        if self.rank == 0:
+            from vllm_torchtpu.compilation.tpu_compiler import _dump_tcm_heap
+            _dump_tcm_heap("post_weights_loaded")
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
+
+        if self.rank == 0:
+            from vllm_torchtpu.compilation.tpu_compiler import _dump_tcm_heap
+            _dump_tcm_heap("post_all_compiles")
+            from vllm_torchtpu.compilation.tpu_compiler import _tracemalloc_report
+
+            _tracemalloc_report("post_all_compiles", cumulative=True)
+
+        import os as _os_env  # `os` is a function-local name further down
+
+        if _os_env.environ.get("TPU_CLEAR_COMPILE_CACHES", "0") == "1":
+            from vllm_torchtpu.compilation.tpu_compiler import (
+                clear_compile_artifact_caches,
+            )
+
+            clear_compile_artifact_caches()
+            if self.rank == 0:
+                from vllm_torchtpu.compilation.tpu_compiler import _dump_tcm_heap
+
+                _dump_tcm_heap("post_cache_clear")
+
+        # --- Post-Compile Memory Trim Hook ---
+        import os, gc, ctypes
+        def _get_rss_gb():
+            try:
+                with open("/proc/self/status") as f:
+                    for l in f:
+                        if l.startswith("VmRSS:"): return float(l.split()[1]) / (1024 * 1024)
+            except Exception: pass
+            return 0.0
+        rss_before = _get_rss_gb()
+        gc.collect()
+        try:
+            for libpath in ["/usr/lib/x86_64-linux-gnu/libtcmalloc_and_profiler.so.4", "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4", "libtcmalloc.so.4", "libtcmalloc.so"]:
+                try:
+                    ctypes.CDLL(libpath).MallocExtension_ReleaseFreeMemory()
+                    break
+                except Exception: pass
+        except Exception: pass
+        try:
+            ctypes.CDLL(None).malloc_trim(0)
+        except Exception: pass
+        rss_after = _get_rss_gb()
+        reclaimed = rss_before - rss_after
+        pct = (reclaimed / rss_before * 100.0) if rss_before > 0 else 0.0
+        logger.info(
+            "\n" + "=" * 68 +
+            f"\n  [Worker Rank {self.rank} POST-COMPILE MEMORY TRIM]"
+            f"\n  - Host DRAM RSS Before : {rss_before:6.2f} GB"
+            f"\n  - Host DRAM RSS After  : {rss_after:6.2f} GB"
+            f"\n  - Memory Reclaimed     : {reclaimed:6.2f} GB (-{pct:.1f}%)"
+            "\n" + "=" * 68
+        )
+
+        if self.rank == 0:
+            from vllm_torchtpu.compilation.tpu_compiler import _dump_tcm_heap
+            _dump_tcm_heap("final_settled_post_trim")
+
         set_torch_threads_for_runtime()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
