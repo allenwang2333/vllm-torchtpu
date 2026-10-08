@@ -223,11 +223,16 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
 
     def _has_host_dma_engram(self) -> bool:
         """Whether an Engram table uses TPU ``pinned_host`` DMA on device."""
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        layers = getattr(self, "layers", ())
+        for layer in islice(
+            layers,
+            getattr(self, "start_layer", 0),
+            getattr(self, "end_layer", len(layers)),
+        ):
             engram = getattr(layer, "engram", None)
-            if engram is not None and (
-                getattr(engram.embed_tokens, "host_dma", False) is True
-                or getattr(engram.embed_tokens, "_host_rows", None) is not None
+            if (
+                engram is not None
+                and getattr(engram.embed_tokens, "host_dma", False) is True
             ):
                 return True
         return False
@@ -360,7 +365,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     gather_fn=upstream.gather_engram_hashes,
                 )
                 cpu_offload = self._has_cpu_offloaded_engram()
-                host_dma = not cpu_offload and self._has_host_dma_engram()
+                host_dma = not cpu_offload and DeepseekV41Model._has_host_dma_engram(
+                    self
+                )
                 if cpu_offload:
                     gathered_hashes = gathered_hashes.to("cpu")
                 elif host_dma and gathered_hashes.device.type == "tpu":
@@ -393,7 +400,10 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         inputs_embeds=None,
         lookback_token_ids=None,
     ):
-        offload_engram = self._has_cpu_offloaded_engram() or self._has_host_dma_engram()
+        offload_engram = (
+            self._has_cpu_offloaded_engram()
+            or DeepseekV41Model._has_host_dma_engram(self)
+        )
         if offload_engram:
             input_ids_prep = (
                 input_ids.to(torch.int64)
@@ -596,7 +606,10 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
 
         skip_lookup = getattr(self, "_engram_prepared_outside_stage", False) or (
             torch.compiler.is_compiling()
-            and (self._has_cpu_offloaded_engram() or self._has_host_dma_engram())
+            and (
+                self._has_cpu_offloaded_engram()
+                or DeepseekV41Model._has_host_dma_engram(self)
+            )
         )
         engram_hashes, engram_mask = self._prepare_engram(
             input_ids,

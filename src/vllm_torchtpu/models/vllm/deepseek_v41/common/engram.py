@@ -613,7 +613,10 @@ class Engram(upstream.Engram):
         return rows
 
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
-        if getattr(self.embed_tokens, "_host_rows", None) is not None:
+        if (
+            getattr(self.embed_tokens, "host_dma", False) is True
+            and getattr(self.embed_tokens, "_host_rows", None) is not None
+        ):
             rows = self._host_dma_rows(hash_ids.shape[0])
             self.embed_tokens.lookup(hash_ids, rows)
             self._active_rows = rows
@@ -654,8 +657,9 @@ class Engram(upstream.Engram):
         super().prepare_embeddings(hash_ids)
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
-        if self._active_rows is not None:
-            return self._active_rows
+        active_rows = getattr(self, "_active_rows", None)
+        if active_rows is not None:
+            return active_rows
         if self._staged_raw is None:
             return super()._ready_rows(num_tokens)
         _, cols, head_dim = self._host_raw.shape

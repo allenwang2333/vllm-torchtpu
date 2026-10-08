@@ -518,9 +518,7 @@ def test_has_cpu_offloaded_and_host_dma_engram():
     assert not _model(
         [_layer(cpu_offload=False, host_dma=False)]
     )._has_cpu_offloaded_engram()
-    layer_with_rows = _layer(cpu_offload=False, host_dma=False)
-    layer_with_rows.engram.embed_tokens._host_rows = object()
-    assert _model([layer_with_rows])._has_host_dma_engram()
+    assert not v2_model.DeepseekV41Model._has_host_dma_engram(SimpleNamespace())
 
 
 def test_prepare_engram_and_forward_host_dma_outside_stage(monkeypatch):
