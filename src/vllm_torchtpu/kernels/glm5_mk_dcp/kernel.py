@@ -903,7 +903,9 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             scr["xq"][:, :KRO] = xq
             a = matmul("o_proj", l, scr["xq"], KRO, H)
             part = bf(a * sx * sm(slot, "o_proj_s"))
+            ph.mark("L_rs_attn")
             attn = reduce_scatter_rows(part, "rso_send", "rso_recv")         # (RPR, H)
+            ph.mark("L_ag_post")
 
             # 13: owner post norm, AG
             x = own_rows_pad(bf(attn)) + scr["res"][...]
@@ -931,6 +933,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             def _moe():
                 moe(l, slot, X)
 
+            ph.mark("L_rs_mlp")
             mlp = reduce_scatter_rows(scr["part"][...], "rsm_send", "rsm_recv")
             scr["h"][...] = own_rows_pad(bf(mlp))
             stage_wait(l)
@@ -952,6 +955,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         # ---------------- indexer ----------------
         def indexer(l, slot):
             IH, IDIM = cfg.IH, cfg.IDIM
+            pi = Phases(tiles.trace)
+            pi.mark("I_proj")
             # q: fp8 linear (replicated), rope on dims 0..DR-1, fp8 per (row, head), bf16 scale
             xq, sx = quant_rows(scr["qc"][...])
             scr["xq"][:, :cfg.QL] = xq
@@ -997,6 +1002,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             pltpu.make_async_copy(scr["rec_v"], irec_out.at[l], scr["kvw_sem"].at[2]).start()
             # local scan per request -> keys per row -> local top-KT -> ksend
             scr["ksend"][...] = jnp.full((TMAX, KR_, 128), INT_MIN, I32)
+            pi.mark("I_scan_ltopk")
 
             def per_req(b, c):
                 @pl.when(qmeta[b, 3] > 0)
@@ -1005,8 +1011,11 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 return c
             lax.fori_loop(0, B, per_req, 0)
             # AG candidate keys, global top-KT, owned winners
+            pi.mark("I_agk")
             scr["kall"][me] = scr["ksend"][...]
             exchange(lambda d: scr["ksend"], scr["kall"], "k_send", "k_recv", rows=T)
+
+            pi.mark("I_gtopk")
 
             def per_row(t_, c):
                 @pl.when(rmeta[t_, 0] > 0)
@@ -1019,6 +1028,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 return c
             lax.fori_loop(0, T, per_row, 0)
             pltpu.make_async_copy(scr["rec_v"], irec_out.at[l], scr["kvw_sem"].at[2]).wait()
+            pi.end()
 
         def scan_request(l, b):
             """Score request b's rows against this rank's local indexer keys; local top-KT per row."""
@@ -1148,6 +1158,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             NEG = jnp.finfo(F32).min
 
             def row(t_, c):
+                pa = Phases(tiles.trace)
+                pa.mark("A_gather")
                 n = jnp.where(rmeta[t_, 0] > 0, scr["nown_s"][t_], 0)
                 req = rmeta[t_, 2]
                 t0r, nqr, p0r, noldr = req_new(req)
@@ -1187,6 +1199,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 if "gather" not in skip:
                     csel(("nope", "rope"), l, gather)
 
+                pa.mark("A_qasm")
                 # q of all NH heads of row t_: R sources x HR heads, unpacked from u32 pairs
                 heads = []
                 for s_ in range(R):
@@ -1201,6 +1214,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 q0s = [q0.astype(BF16)] + [pltpu.roll(q0, 32 * sg, 1).astype(BF16) for sg in (1, 2, 3)]
                 q1s = [q1.astype(BF16)] + [pltpu.roll(q1, 32 * sg, 1).astype(BF16) for sg in (1, 2, 3)]
                 nc = jnp.where("attn" in skip, 0, (n + 127) // 128)
+                pa.mark("A_score")
 
                 def s_body(ci, c2):
                     r0 = pl.multiple_of(ci * 128, 128)
@@ -1227,6 +1241,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                     return c2
                 lax.fori_loop(0, nc, s_body, 0)
 
+                pa.mark("A_pv")
+
                 def m_body(ci, m):
                     return jnp.maximum(m, jnp.max(scr["s_all"][ci], axis=1, keepdims=True))
                 mx = lax.fori_loop(0, nc, m_body, jnp.full((NH, 1), NEG, F32))
@@ -1240,6 +1256,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                             pv + lax.dot_general(p, kv, NN, preferred_element_type=F32))
                 lsum, pv = lax.fori_loop(0, nc, pv_body, (jnp.zeros((NH, 1), F32),
                                                          jnp.zeros((NH, KL), F32)))
+                pa.mark("A_send")
                 has = n > 0
                 out = jnp.where(has, bf(pv * pl.reciprocal(jnp.maximum(lsum, 1e-30), approx=True)), 0.0)
                 lse = jnp.where(has, mx + jnp.log(jnp.maximum(lsum, 1e-30)), -jnp.inf)    # [NH, 1]
@@ -1255,6 +1272,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                     lrow = pltpu.roll(lse_row, (128 - d * HR) % 128, 1) if d else lse_row
                     scr["osend"][d, pl.ds(t_, 1), :] = jnp.concatenate(
                         [pack2(od[:, :OH], od[:, OH:]), lax.bitcast_convert_type(lrow, U32)], axis=1)
+                pa.end()
                 return c
             lax.fori_loop(0, T, row, 0)
 
@@ -1298,6 +1316,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         # ---------------- MoE ----------------
         def moe(l, slot, X):
             ER = cfg.ER
+            pm = Phases(tiles.trace)
+            pm.mark("M_sw13")
             wsel("es13", l, lambda r: pltpu.make_async_copy(r, scr["es13"], scr["es_sem"].at[0]).start())
             wsel("es2", l, lambda r: pltpu.make_async_copy(r, scr["es2"], scr["es_sem"].at[1]).start())
             xq, sx = quant_rows(X)
@@ -1307,6 +1327,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             gu = bf(a * sx * sm(slot, "sw13_s"))
             mid = bf(gu[:, :cfg.ISR] * jax.nn.sigmoid(gu[:, :cfg.ISR]))
             mid = bf(mid * gu[:, cfg.ISR:])
+            pm.mark("M_route")
             # router: bf16 logits -> f32 sigmoid + bias -> top-k (ties lowest id) -> renorm -> bf16
             logits = bf(matmul("gate", l, scr["xbf"], H, cfg.E))
             scv = jax.nn.sigmoid(logits)
@@ -1348,11 +1369,13 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             st[6] = n_hit
             st[5] = l
             pump("gate")
+            pm.mark("M_sw2")
             # shared down (local K, per-rank scale), the routed tiles stream under it
             xq2, sx2 = quant_rows(mid)
             scr["xq"][:, :cfg.ISR] = xq2
             a = matmul("sw2", l, scr["xq"], cfg.ISR, H)
             scr["shared"][...] = bf(a * sx2 * sm(slot, "sw2_s"))
+            pm.mark("M_exp")
             # routed experts
             pltpu.make_async_copy(scr["es13"], scr["es13"], scr["es_sem"].at[0]).wait()
             pltpu.make_async_copy(scr["es2"], scr["es2"], scr["es_sem"].at[1]).wait()
@@ -1374,6 +1397,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             lax.fori_loop(0, n_hit, ebody, 0)
             routed = bf(bf(scr["routed"][...]) * cfg.routed_scale)
             scr["part"][...] = bf(scr["shared"][...] + routed)
+            pm.end()
 
         # ---------------- step ----------------
         pltpu.make_async_copy(smalls.at[0], scr["sm"].at[0], scr["sm_sem"].at[0]).start()
