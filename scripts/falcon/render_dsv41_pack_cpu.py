@@ -14,6 +14,12 @@ SOURCE_PATH = "/workspace/vllm-torchtpu"
 MODEL_PATH = "/models/DeepSeek-V4.1-Flash"
 PREVIOUS_PATH = "/previous"
 CONVERTED_PATH = "/converted"
+PACK_RESOURCES = {
+    "cpu_request": "12",
+    "cpu_limit": "16",
+    "memory_request": "64Gi",
+    "memory_limit": "64Gi",
+}
 
 
 def render(conversion: dict, source_commit: str) -> dict:
@@ -32,6 +38,8 @@ def render(conversion: dict, source_commit: str) -> dict:
     task = spec["worker"]
     if task["device_type"] != "cpu" or task["replica"] != 1:
         raise ValueError("Expected one CPU packing worker")
+    # Falcon exp get omits resources from the submitted task spec.
+    task["resources"] = PACK_RESOURCES.copy()
     mounts = {item["mount_path"]: item for item in task["mounts"]}
     if MODEL_PATH not in mounts or PREVIOUS_PATH not in mounts:
         raise ValueError("Conversion model or previous-cache mount is missing")
