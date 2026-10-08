@@ -52,13 +52,10 @@ from . import pool_io
 
 logger = init_logger(__name__)
 
-_MTP_OPT_ENABLED = os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
 _DEFAULT_BUCKETS = (8, 16, 32)
-_DEFAULT_VERIFY_BUCKETS = (
-    (4, 8, 12, 16, 20, 24, 32, 48, 64)
-    if _MTP_OPT_ENABLED
-    else tuple(4 * n for n in range(1, 17))
-)
+# MTP=3 verify rows (4 per sequence). Above 8 sequences the stock path was at
+# or past parity in the per-bucket A/B, so larger batches stay on stock.
+_DEFAULT_VERIFY_BUCKETS = (4, 8, 12, 16, 20, 24, 32)
 
 
 def _need(cond: bool, msg: str) -> None:
@@ -1413,6 +1410,7 @@ class Qwen35Megakernel:
         self.page_size: int = 128
         self.max_pages_per_seq: int = 0
         self._bucket_steps: dict[Any, Any] = {}
+        self._bucket_out_rows: dict[tuple[int, int], int] = {}
         self._bucket_ops: dict[Any, Any] = {}
         self._bound = False
         self._zero_roff_1d: torch.Tensor | None = None
@@ -1514,23 +1512,30 @@ class Qwen35Megakernel:
         )
 
         def _runner_out_rows(b: int, m_rows: int) -> int:
+            # The runner pads a b-row step to its first token bucket >= b and
+            # takes back exactly that many hidden rows, which may be fewer
+            # than the kernel's 16-row-aligned m_rows (e.g. 24 vs 32).
             for p in runner_token_paddings:
                 if p >= b:
-                    return max(m_rows, p)
-            return 64 if m_rows == 48 else m_rows
+                    return p
+            return m_rows
 
         for b in self.buckets:
             m_rows = max(16, K.rup(b, 16))
+            out_rows = _runner_out_rows(b, m_rows)
             step_1 = self._build_bucket_op(
-                b, tokens_per_seq=1, out_pad_rows=_runner_out_rows(b, m_rows)
+                b, tokens_per_seq=1, out_pad_rows=out_rows
             )
             self._bucket_steps[(1, b)] = step_1
             self._bucket_steps[b] = step_1
+            self._bucket_out_rows[(1, b)] = out_rows
         for b in self.verify_buckets:
             m_rows = max(16, K.rup(b, 16))
+            out_rows = _runner_out_rows(b, m_rows)
             self._bucket_steps[(4, b)] = self._build_bucket_op(
-                b, tokens_per_seq=4, out_pad_rows=_runner_out_rows(b, m_rows)
+                b, tokens_per_seq=4, out_pad_rows=out_rows
             )
+            self._bucket_out_rows[(4, b)] = out_rows
 
         self._bound = True
         logger.info(
@@ -1636,7 +1641,7 @@ class Qwen35Megakernel:
         nseq_bkt = B // T
         max_pages = int(self.max_pages_per_seq)
         m_rows = c.M
-        target_out_rows = max(m_rows, int(out_pad_rows or m_rows))
+        target_out_rows = int(out_pad_rows or m_rows)
 
         def step(
             input_ids: torch.Tensor,
@@ -1733,7 +1738,11 @@ class Qwen35Megakernel:
             for dst, src in zip(pools, outs[1 : 1 + n_p]):
                 dst.copy_(src)
             h_out = outs[0]
-            if h_out.shape[0] < target_out_rows:
+            if h_out.shape[0] > target_out_rows:
+                # clone(): an output aliasing an intermediate is regenerated as
+                # a view outside the compiled program.
+                h_out = h_out[:target_out_rows].clone()
+            elif h_out.shape[0] < target_out_rows:
                 h_out = F.pad(h_out, (0, 0, 0, target_out_rows - h_out.shape[0]))
             return h_out
 
@@ -2102,6 +2111,10 @@ class Qwen35Megakernel:
             step_fn = self._bucket_steps.get((4, bkt))
             if step_fn is None:
                 return self._note_step("stock_t4_nobkt", False)
+            if self._bucket_out_rows.get((4, bkt), input_ids.shape[0]) != int(
+                input_ids.shape[0]
+            ):
+                return self._note_step(f"stock_t4_rows{bkt}", False)
             self._prepared_step = (
                 step_fn,
                 attn_md,
