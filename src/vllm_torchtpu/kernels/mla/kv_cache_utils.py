@@ -96,6 +96,79 @@ def get_kv_cache_shape(
     )
 
 
+# GLM5_MKD_STACK_C: the cache kinds that can be allocated as ONE
+# [n_layers_of_kind, num_blocks, ...] tensor instead of one tensor per layer.
+GLM5_STACKABLE_KV_KINDS = ("nope", "rope", "idx")
+
+
+def glm5_stacked_kv_kinds(value: str | None = None) -> frozenset[str]:
+    """GLM5_MKD_STACK_C -> the stacked GLM-5.2 cache kinds.
+
+    "" or "0": none. "1": all of nope, rope, idx. Otherwise a comma list of
+    kinds. nope and rope go together: the sparse MLA op takes the pair.
+    """
+    if value is None:
+        from vllm_torchtpu import envs
+
+        value = envs.GLM5_MKD_STACK_C
+    v = value.strip()
+    if v in ("", "0"):
+        return frozenset()
+    if v == "1":
+        kinds = frozenset(GLM5_STACKABLE_KV_KINDS)
+    else:
+        kinds = frozenset(x.strip() for x in v.split(",") if x.strip())
+    bad = kinds - set(GLM5_STACKABLE_KV_KINDS)
+    if bad:
+        raise ValueError(f"GLM5_MKD_STACK_C: unknown cache kinds {sorted(bad)}")
+    if ("nope" in kinds) != ("rope" in kinds):
+        raise ValueError(
+            "GLM5_MKD_STACK_C: nope and rope are stacked together or not at all"
+        )
+    return kinds
+
+
+def merge_kv_stack(cache: jax.Array, kv_stack: tuple[int, int]) -> jax.Array:
+    """GLM5_MKD_STACK_C: a stacked cache as one flat page pool, with no copy.
+
+    `cache` is one rank's `[n_layers, num_blocks, *page]` stack and `kv_stack`
+    is `(this layer's row, num_blocks)`. Returns `[n_layers * num_blocks,
+    *page]`: merging two untiled leading dims is a bitcast, so no per-layer
+    slice (which torch_tpu would materialize as a copy) is ever taken. Undo
+    with `split_kv_stack`; address this layer's pages with
+    `stack_page_table_dcp`.
+    """
+    row, num_blocks = kv_stack
+    if cache.ndim < 3 or cache.shape[1] != num_blocks or not 0 <= row < cache.shape[0]:
+        raise ValueError(
+            f"kv_stack={kv_stack} does not index a [n_layers, {num_blocks}, ...] "
+            f"stack; got cache shape {tuple(cache.shape)}"
+        )
+    return cache.reshape(cache.shape[0] * num_blocks, *cache.shape[2:])
+
+
+def split_kv_stack(merged: jax.Array, stacked_shape: tuple[int, ...]) -> jax.Array:
+    """Inverse of `merge_kv_stack`."""
+    return merged.reshape(stacked_shape)
+
+
+def stack_page_table_dcp(page_table: jax.Array, kv_stack: tuple[int, int]) -> jax.Array:
+    """GLM5_MKD_STACK_C: a DCP page table rewritten into the merged stack's pages.
+
+    Every DCP resolver maps a virtual page id to a rank-local page as
+    `id % num_pages`. For a per-layer cache `num_pages = num_blocks`; on the
+    merged stack it is `n_layers * num_blocks`. Rewriting each entry to
+    `id % num_blocks + row * num_blocks` lands it in `[row * num_blocks,
+    (row + 1) * num_blocks)`, where the resolver's `% (n_layers * num_blocks)`
+    is the identity -- so every entry (padding and negative ids included)
+    resolves to exactly the page the per-layer cache would use, offset to this
+    layer's row.
+    """
+    row, num_blocks = kv_stack
+    nb = jnp.int32(num_blocks)
+    return jnp.mod(page_table, nb) + jnp.int32(row) * nb
+
+
 @dataclasses.dataclass(frozen=True)
 class SparseMLAKVCacheSpec:
     cache_type: KVCacheType
