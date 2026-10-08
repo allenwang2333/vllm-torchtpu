@@ -19,32 +19,76 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 
 # The branch decides the tags. main pushes nightly-YYYYMMDD and moves latest.
-# release/X.Y.Z pushes YYYYMMDD-X.Y.Z and moves X.Y.Z, so a release nightly
+# releases/vX.Y.Z pushes YYYYMMDD-X.Y.Z and moves X.Y.Z, so a release nightly
 # never touches latest. The Buildkite pipeline runs this script from whichever
 # branch its schedule names, so a release branch cut from main after this
 # change needs only a new schedule, not a code change.
+#
+# With PUBLISH_DOCKERHUB=1 (set by pipeline_nightly_image.yml, which logs in to
+# Docker Hub) it also pushes one of the images it built to DOCKERHUB_REPO: main
+# pushes dev as nightly-YYYYMMDD-<commit>-<vllm> and moves nightly;
+# releases/vX.Y.Z pushes prod as X.Y.Z. A release build runs only after the
+# approval step, where the approver chooses whether to move latest and whether
+# an X.Y.Z already on Docker Hub may be overwritten.
 BRANCH="${BUILDKITE_BRANCH:-$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)}"
 DATE="$(date +%Y%m%d)"
+PUBLISH_DOCKERHUB="${PUBLISH_DOCKERHUB:-0}"
 case "${BRANCH}" in
   main)
     DATE_TAG="nightly-${DATE}"
     LATEST_TAG="latest"
     ;;
-  release/*)
-    VERSION="${BRANCH#release/}"
+  releases/v*)
+    VERSION="${BRANCH#releases/v}"
     # Starting with a digit keeps it from colliding with latest or nightly-*.
     if [[ ! "${VERSION}" =~ ^[0-9][A-Za-z0-9_.-]*$ ]]; then
-      echo "ERROR: branch '${BRANCH}' does not name a version usable as an image tag; expected release/X.Y.Z." >&2
+      echo "ERROR: branch '${BRANCH}' does not name a version usable as an image tag; expected releases/vX.Y.Z." >&2
       exit 1
     fi
     DATE_TAG="${DATE}-${VERSION}"
     LATEST_TAG="${VERSION}"
     ;;
   *)
-    echo "ERROR: nightly images are published from main or release/X.Y.Z, not '${BRANCH}'." >&2
+    echo "ERROR: nightly images are published from main or releases/vX.Y.Z, not '${BRANCH}'." >&2
     exit 1
     ;;
 esac
+
+# Docker Hub gets a release only from a build someone approved. A scheduled
+# nightly of a release branch skips the approval step, so it stops at GAR.
+if [[ "${BRANCH}" == releases/* ]] && ! buildkite-agent meta-data exists dockerhub_move_latest; then
+  PUBLISH_DOCKERHUB=0
+fi
+if [[ "${PUBLISH_DOCKERHUB}" == "1" ]]; then
+  DOCKERHUB_REPO="${DOCKERHUB_REPO:?DOCKERHUB_REPO must be set when PUBLISH_DOCKERHUB=1}"
+  MOVE_LATEST="yes"
+  if [[ "${BRANCH}" == releases/* ]]; then
+    DOCKERHUB_TARGET="prod"
+    DOCKERHUB_TAG="${VERSION}"
+    DOCKERHUB_LATEST_TAG="latest"
+    # The approver's choices in the block step of pipeline_nightly_image.yml.
+    MOVE_LATEST="$(buildkite-agent meta-data get dockerhub_move_latest --default no)"
+    OVERWRITE="$(buildkite-agent meta-data get dockerhub_overwrite --default no)"
+    # Released tags are immutable unless the approver chose to overwrite.
+    # Checked here so a refused release builds nothing.
+    if [[ "${OVERWRITE}" != "yes" ]] && docker manifest inspect "${DOCKERHUB_REPO}:${DOCKERHUB_TAG}" >/dev/null 2>&1; then
+      echo "ERROR: ${DOCKERHUB_REPO}:${DOCKERHUB_TAG} already exists; choose Overwrite in the approval step to replace it." >&2
+      exit 1
+    fi
+  else
+    # The pyproject.toml pin, which build_image.sh builds with.
+    # shellcheck source=/dev/null
+    source "${SCRIPT_DIR}/configs/pipeline_config.sh"
+    VLLM_COMMIT_HASH="$(get_vllm_commit_hash)"
+    DOCKERHUB_TARGET="dev"
+    VLLM_REF="${VLLM_COMMIT_HASH}"
+    if [[ "${VLLM_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+      VLLM_REF="${VLLM_REF:0:7}"
+    fi
+    DOCKERHUB_TAG="nightly-${DATE}-${BUILDKITE_COMMIT:0:7}-${VLLM_REF}"
+    DOCKERHUB_LATEST_TAG="nightly"
+  fi
+fi
 
 echo "--- Cleaning up old Docker images and cache"
 bash "${SCRIPT_DIR}/cleanup_docker.sh"
@@ -84,6 +128,23 @@ for TARGET in "${TARGETS[@]}"; do
   echo "--- :docker: Pushing extra images ${EXTRA_DATE_IMAGE} and ${EXTRA_LATEST_IMAGE} to Artifact Registry"
   docker push "${EXTRA_DATE_IMAGE}"
   docker push "${EXTRA_LATEST_IMAGE}"
+
+  # The same image goes to Docker Hub; nothing is rebuilt.
+  if [[ "${PUBLISH_DOCKERHUB}" == "1" && "${TARGET}" == "${DOCKERHUB_TARGET}" ]]; then
+    DOCKERHUB_IMAGES=("${DOCKERHUB_REPO}:${DOCKERHUB_TAG}")
+    if [[ "${MOVE_LATEST}" == "yes" ]]; then
+      DOCKERHUB_IMAGES+=("${DOCKERHUB_REPO}:${DOCKERHUB_LATEST_TAG}")
+    else
+      echo "--- Not moving ${DOCKERHUB_LATEST_TAG}: the approver chose not to."
+    fi
+    for DOCKERHUB_IMAGE in "${DOCKERHUB_IMAGES[@]}"; do
+      echo "--- :docker: Pushing ${DOCKERHUB_IMAGE} to Docker Hub"
+      docker tag "${DATE_IMAGE}" "${DOCKERHUB_IMAGE}"
+      # TODO(docker-hub): pushes are simulated until the Docker Hub repo is decided. Replace the echo with docker push then.
+      echo "[SIMULATED] docker push ${DOCKERHUB_IMAGE}"
+      docker rmi "${DOCKERHUB_IMAGE}" || true
+    done
+  fi
 
   echo "--- Cleaning up locally built image tags for ${TARGET}"
   docker rmi "${DATE_IMAGE}" "${LATEST_IMAGE}" "${EXTRA_DATE_IMAGE}" "${EXTRA_LATEST_IMAGE}" || true
