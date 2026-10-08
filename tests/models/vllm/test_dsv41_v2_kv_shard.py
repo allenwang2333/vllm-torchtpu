@@ -585,9 +585,7 @@ class TestAttentionKernelsKvShard:
                 ),
             ):
                 # 1. tokens = 8 (< 48): KV_SHARD=True uses token_parallel
-                monkeypatch.setitem(
-                    vars(envs), "TPU_DEEPSEEK_V41_KV_SHARD", True
-                )
+                monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_KV_SHARD", True)
                 out = fp8_attn(
                     jnp.zeros((8, 64, 512)),
                     jnp.zeros((8, 512)),
@@ -612,9 +610,7 @@ class TestAttentionKernelsKvShard:
                 assert len(a2a_calls) == 2
 
                 # 2. tokens = 64 (pad_rows = 0) with KV_SHARD=False -> token_parallel
-                monkeypatch.setitem(
-                    vars(envs), "TPU_DEEPSEEK_V41_KV_SHARD", False
-                )
+                monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_KV_SHARD", False)
                 out_64 = fp8_attn(
                     jnp.zeros((64, 64, 512)),
                     jnp.zeros((64, 512)),
@@ -686,9 +682,7 @@ class TestAttentionKernelsKvShard:
             attention_kernels.initialize_paged_attention()
             fn = captured_fns["pallas::dsv41v2_sparse_fp8_attention_qo"]
 
-            monkeypatch.setitem(
-                vars(envs), "TPU_DEEPSEEK_V41_KV_SHARD", True
-            )
+            monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_KV_SHARD", True)
             seen_q_shapes: list[tuple[int, ...]] = []
 
             def fake_sparse_attn(q, *a, **kw):
@@ -766,9 +760,7 @@ class TestAttentionKernelsKvShard:
                 assert seen_q_shapes == [(8, 256, 128), (8, 256, 128)]
 
                 # 3. With KV_SHARD=False, tokens=64 (< 128*8=1024) takes _sharded_body
-                monkeypatch.setitem(
-                    vars(envs), "TPU_DEEPSEEK_V41_KV_SHARD", False
-                )
+                monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_KV_SHARD", False)
                 res_sharded = fn(*args)
                 assert res_sharded.shape == (64, 1024)
 
@@ -1095,9 +1087,7 @@ class TestEndToEndOwnerShardedParity:
                 ),
             ):
                 # 1. 1-bank owner-parallel bf16_attention (KV_SHARD=True)
-                monkeypatch.setitem(
-                    vars(envs), "TPU_DEEPSEEK_V41_KV_SHARD", True
-                )
+                monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_KV_SHARD", True)
                 out_1b = bf16_attn(
                     jnp.zeros((16, 8, 512), dtype=jnp.bfloat16),
                     jnp.zeros((32, 128), dtype=jnp.int32),
@@ -1136,9 +1126,7 @@ class TestEndToEndOwnerShardedParity:
                 assert len(a2a_calls) == 4
 
                 # 3. Non-token-parallel fallback (KV_SHARD=False, token_parallel=False)
-                monkeypatch.setitem(
-                    vars(envs), "TPU_DEEPSEEK_V41_KV_SHARD", False
-                )
+                monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_KV_SHARD", False)
                 out_hp = bf16_attn(
                     jnp.zeros((16, 8, 512), dtype=jnp.bfloat16),
                     jnp.zeros((32, 128), dtype=jnp.int32),
