@@ -39,6 +39,8 @@ from vllm_torchtpu.distributed.mesh_utils import (
     _collect_rank_to_device_id,
     _get_current_global_rank,
     _get_tpu_global_device_id,
+    get_pipeline_stage,
+    get_stage_mesh,
 )
 from vllm_torchtpu.distributed.pcp import get_pcp_world_size
 from vllm_torchtpu.logger import init_logger
@@ -241,7 +243,8 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
     import torch.distributed as dist
 
     world_size = int(dist.get_world_size())
-    if len(device_ids) != world_size:
+    _, stages = get_pipeline_stage()
+    if len(device_ids) * stages != world_size:
         raise NotImplementedError(
             f"The EP group spans {len(device_ids)} devices inside a "
             f"torch.distributed world of {world_size}. get_pallas_mesh builds "
@@ -254,17 +257,25 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
     from jax.sharding import Mesh
     from torch_tpu._internal.pallas import get_pallas_mesh
 
-    ranked = get_pallas_mesh(axis_names=(axis_name,))
-    by_id = {int(d.id): d for d in ranked.devices.flat}
-    if sorted(by_id) != sorted(device_ids):
-        # The ids become the DeviceAssignment, and ep_rank_order/ep_mesh_index
-        # index into them assuming they are the ids gathered above.
-        raise RuntimeError(
-            "get_pallas_mesh device ids do not match the EP group's: "
-            f"pallas={[int(d.id) for d in ranked.devices.flat]}, "
-            f"ep_device_ids={unordered}"
+    if stages > 1:
+        # The EP group is one pipeline stage: its mesh is built over the
+        # stage's process group and holds the stage's devices in rank order.
+        mesh = get_stage_mesh(
+            (axis_name,), (len(device_ids),), get_ep_group(), unordered
         )
-    mesh = Mesh(np.asarray([by_id[d] for d in device_ids]), axis_names=(axis_name,))
+    else:
+        ranked = get_pallas_mesh(axis_names=(axis_name,))
+        by_id = {int(d.id): d for d in ranked.devices.flat}
+        if sorted(by_id) != sorted(device_ids):
+            # The ids become the DeviceAssignment, and
+            # ep_rank_order/ep_mesh_index index into them assuming they are
+            # the ids gathered above.
+            raise RuntimeError(
+                "get_pallas_mesh device ids do not match the EP group's: "
+                f"pallas={[int(d.id) for d in ranked.devices.flat]}, "
+                f"ep_device_ids={unordered}"
+            )
+        mesh = Mesh(np.asarray([by_id[d] for d in device_ids]), axis_names=(axis_name,))
     logger.info(
         "Built EP mesh | axis=%s | size=%d | device_ids=%s | ep_rank_order=%s",
         axis_name,
