@@ -53,6 +53,7 @@ import functools
 import math
 
 import jax
+import jax._src.state.discharge as _discharge
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
@@ -63,6 +64,36 @@ try:
     from . import pool_alias
 except ImportError:
     import pool_alias
+
+if not getattr(_discharge.transform_swap_array, "_pool_io_patched", False):
+    _orig_swap = _discharge.transform_swap_array
+
+    def _patched_swap(x, transforms, val):
+        if not transforms or all(
+            isinstance(t, _discharge.indexing.NDIndexer) for t in transforms
+        ):
+            return _orig_swap(x, transforms, val)
+        intermediates = [x]
+        new_val = x
+        for t in transforms:
+            new_val = _discharge.transform_array(new_val, [t])
+            intermediates.append(new_val)
+        if val is None:
+            return new_val, x
+        new_x = val
+        for inter, t in reversed(list(zip(intermediates[:-1], transforms))):
+            if isinstance(t, _discharge.indexing.NDIndexer):
+                _, new_x = _orig_swap(inter, [t], new_x)
+            elif isinstance(t, _discharge.BitcastTransform):
+                new_x = _discharge.bitcast(new_x, inter.dtype)
+            elif isinstance(t, _discharge.ReshapeTransform):
+                new_x = new_x.reshape(inter.shape)
+            else:
+                _, new_x = _orig_swap(inter, [t], new_x)
+        return new_val, new_x
+
+    _patched_swap._pool_io_patched = True
+    _discharge.transform_swap_array = _patched_swap
 
 FP8 = jnp.float8_e4m3fn
 BF16 = jnp.bfloat16
@@ -149,6 +180,11 @@ class MKConfig:
     num_pages: int = 37705
     page_size: int = 128
     max_pages_per_seq: int = 2050
+    fused_pool_io: bool = False  # P1+P2: gather/scatter GDN & KV states directly in raw[0..14]
+    act_mode: str = "from_ckpt"  # "from_ckpt", "all", or "ref" when fused_pool_io=True
+    ckpt_2d: bool = False        # True when ckpt_indices is 2D [NS, K] instead of 3D [G_PER_ATT, NS, K]
+    ckpt_k: int = 0              # K dimension of ckpt_indices (0 -> T)
+    roff_1d: bool = False        # True when read_offsets is 1D [NS] instead of 2D [G_PER_ATT, NS]
 
     @property
     def NS(self):  # sequences (KV caches, GDN input states)
@@ -317,6 +353,14 @@ class Tiles:
     # KV tokens per online-softmax update inside a block (0: the whole block). The verify pass
     # (T > 1) scores T * QR query rows per block; sub-chunks keep the score tile small.
     kv_sub: int = 0
+    # attention mask mode: 0 = legacy (TQ, SUB) + (HD, SUB) iotas on every block;
+    # 1 = (1, SUB) iota + U32 v-mask; 2 = (1, SUB) iota + skip mask on full blocks (off+SUB <= plen);
+    # 3 = (1, SUB) iota + skip scores mask on full blocks, no v-mask;
+    # 4 = (1, SUB) iota branchless scores mask, no v-mask.
+    amask: int = 1
+    # ECOPY dedup optimization: 1 = deduplicate unique experts in B*TOPK loop first, then classify
+    # only the n_tot unique experts.
+    ecopy_opt: int = 0
 
     def tk(self, K, N, dtype, bank):
         """Largest 128-multiple divisor of K whose [tk, N] tile fits a `bank`-byte slot."""
@@ -331,7 +375,7 @@ class Tiles:
 DEFAULT_TILES = Tiles(hier=1, pack=1, mb8=2)
 # 9..16 rows (MTP verify, 3..4 sequences x 4 tokens): 3-stage hierarchical all-reduces (on-chip
 # reduce-scatter + 4-chip push + on-chip all-gather), making room for a 4th KV stage
-VERIFY_TILES = dataclasses.replace(DEFAULT_TILES, nkv=4, rsag=True, hier=2)
+VERIFY_TILES = dataclasses.replace(DEFAULT_TILES, nkv=4, rsag=True, hier=2, ecopy_opt=1)
 # 17..48 rows (MTP verify of 5..12 sequences): VERIFY_TILES with chunked GatedDeltaNet states and
 # shallower rings, to fit the per-row buffers (activations, attention state, all-reduce payloads)
 WIDE_TILES = dataclasses.replace(VERIFY_TILES, nbd=10, nkv=3, vmem_mib=62, hier=0)
@@ -352,7 +396,7 @@ def default_tiles(c: MKConfig) -> Tiles:
     if c.B > 8:
         return VERIFY_TILES
     if c.B > 4:
-        return dataclasses.replace(DEFAULT_TILES, rsag=True, hier=2)
+        return dataclasses.replace(DEFAULT_TILES, rsag=True, hier=2, ecopy_opt=1)
     return DEFAULT_TILES
 
 
@@ -475,6 +519,20 @@ def state_shapes(c: MKConfig):
     (oldest first; rows >= 3 are scratch)."""
     ngdn = max(1, c.NGDN)
     conv = (ngdn, c.CR, c.QKV) if c.T == 1 else (ngdn, c.NS, c.HR, c.QKV)
+    if c.paged_kv and c.fused_pool_io:
+        G_PER_ATT = max(1, c.att_every - 1)
+        K_ckpt = c.ckpt_k if c.ckpt_k > 0 else c.T
+        ckpt_shape = (c.NS, K_ckpt) if c.ckpt_2d else (G_PER_ATT, c.NS, K_ckpt)
+        roff_shape = (c.NS,) if c.roff_1d else (G_PER_ATT, c.NS)
+        st = {
+            "raw": tuple(Spec((c.num_pages, 2, 64, 4, c.page_size), FP8) for _ in range(c.NATT)),
+            "page_table": Spec((c.NS, c.max_pages_per_seq), I32),
+            "ckpt_indices": Spec(ckpt_shape, I32),
+            "read_offsets": Spec(roff_shape, I32),
+        }
+        if c.act_mode == "ref":
+            st["active_seqs"] = Spec((c.NS,), I32)
+        return st
     if c.paged_kv:
         return {
             "conv": (conv, F32),
@@ -496,6 +554,11 @@ def kernel_out_shapes(c: MKConfig):
     T > 1: conv is the history [NS, HR, QKV]: rows 0..2 the cached taps, row 3 + t token t's conv
     input, so the conv state after token t is rows t+1 .. t+3. rec holds the state after every
     token (row b = s * T + t: after token t of sequence s). See accept_states."""
+    if c.paged_kv and c.fused_pool_io:
+        return {
+            "hidden": ((c.M, c.H), BF16),
+            "raw": tuple(Spec((c.num_pages, 2, 64, 4, c.page_size), FP8) for _ in range(c.NATT)),
+        }
     sh = state_shapes(c)
     ngdn = max(1, c.NGDN)
     kv_dt = FP8 if c.paged_kv else F32
@@ -616,8 +679,9 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
     #   the layer in buffer j % NRB; chunk j + NRB - 1 is fetched once chunk j - 1 is written back;
     #   NF full chunks, then a tail chunk NF of the TR = B % CB remaining rows)
     # - WAR: all-reduce on unfolded [MR, H] rows when WIDE or MR * H <= PR * PC (no row fold)
+    FUSED = c.paged_kv and c.fused_pool_io
     WIDE = B > 16
-    GCH = WIDE and tiles.gdn_rows > 0 and c.NGDN > 0
+    GCH = WIDE and tiles.gdn_rows > 0 and c.NGDN > 0 and not FUSED
     CB = tiles.gdn_rows if GCH else B
     assert not GCH or CB % 8 == 0, ("gdn_rows must be a multiple of 8", tiles.gdn_rows)
     assert not (GCH and VER) or CB % T == 0, ("gdn_rows must be a multiple of T", CB, T)
@@ -626,6 +690,17 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
     NRB = min(tiles.gdn_bufs, NCH)
     assert not GCH or NCH == 1 or NRB >= 2, ("gdn_bufs >= 2", tiles.gdn_bufs)
     CBV = CB * vh  # state heads per full chunk
+    NGI = min(NS, 8)
+    NGO = min(NS, 2)
+    G_PER_ATT = max(1, AE - 1)
+    qkv_128 = QKV // 128
+    A_conv = 16
+    conv8_rows = A_conv * qkv_128
+    ssm_u32_rows = (vh * KD) // 2
+    ckpt_is_3d = not c.ckpt_2d
+    roff_is_2d = not c.roff_1d
+    K_ckpt = c.ckpt_k if c.ckpt_k > 0 else T
+    ckpt_t_off = 0 if K_ckpt == T else 1
     HIER = tiles.hier if R > 1 else 0
     RSAG = tiles.rsag and R > 1 and HIER == 0
     WAR = (WIDE or MR * H <= PR * PC) if tiles.war < 0 else bool(tiles.war)
@@ -713,6 +788,27 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
         scratch["kv_sem"] = pltpu.SemaphoreType.DMA((NKV,))
         scratch["knew_o"] = pltpu.VMEM((MR, HD), FP8)
         scratch["vnew_o"] = pltpu.VMEM((MR, HD), FP8)
+    if FUSED:
+        for k in ("recb", "convb", "st_sem", "kv_out_sem"):
+            del scratch[k]
+        if c.NGDN > 0:
+            scratch.update({
+                "gdn_in_page": pltpu.VMEM((NGI, 5, 2, 64, 4, c.page_size), FP8),
+                "gdn_out_page": pltpu.VMEM((NGO, 5 * T, 2, 64, 4, c.page_size), FP8),
+                "gdn_in_sem": pltpu.SemaphoreType.DMA((NGI,)),
+                "gdn_out_sem": pltpu.SemaphoreType.DMA((NGO, T)),
+                "gdn_in_pend": pltpu.SMEM((NGI,), I32),
+                "gdn_out_mode": pltpu.SMEM((NGO,), I32),
+            })
+        else:
+            del scratch["sbuf"]
+        scratch.update({
+            "kv_scat_page": pltpu.VMEM((NS, 2, 64, 4, c.page_size), FP8),
+            "kv_rd_sem": pltpu.SemaphoreType.DMA((NS,)),
+            "kv_wr_sem": pltpu.SemaphoreType.DMA((NS,)),
+            "kv_rd_pend": pltpu.SMEM((NS,), I32),
+            "kv_wr_pend": pltpu.SMEM((NS,), I32),
+        })
     ECOPY = not c.moe_tp and c.e_slots > ER
     assert not (row_mask and ECOPY), "row_mask: identity expert placement only"
     EXTRA = c.EW - ER
@@ -726,6 +822,8 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
             "cpchoice": pltpu.SMEM((nb_picks,), I32),
             "rload": pltpu.SMEM((R,), I32),
         })
+        if tiles.ecopy_opt == 1:
+            scratch["ulist"] = pltpu.SMEM((nb_picks,), I32)
     if SPLIT:
         scratch.update({
             "qg": pltpu.VMEM((G, B, 8, HD), F32),  # [g]: group rank g's query rows (bf16-exact)
@@ -738,7 +836,7 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
         })
     elif VER:
         scratch["qg"] = pltpu.VMEM((1, B, 8, HD), F32)  # own query rows (bf16-exact)
-    if VER and not GCH:
+    if VER and not GCH and not FUSED:
         scratch.update({
             "ub": pltpu.VMEM((NS, rup(T, 8), QKV), F32),  # [s, t]: token t's conv output
             "rin_sem": pltpu.SemaphoreType.DMA((NS,)),  # recurrent state in, per sequence
@@ -760,7 +858,7 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
     if GCH:  # [buffer, CB * vh, KD, VD]: one row chunk of a layer's key-major states
         scratch["recb"] = pltpu.VMEM((NRB, CBV, KD, VD), BF16)
         scratch["rec_sem"] = pltpu.SemaphoreType.DMA((2, NRB))  # [in / out, buffer]
-    elif WIDE and c.NGDN == 0:  # attention-only stack: no GatedDeltaNet buffers
+    elif WIDE and c.NGDN == 0 and not FUSED:  # attention-only stack: no GatedDeltaNet buffers
         for k in ("recb", "sbuf", "convb"):
             del scratch[k]
     if PACK:  # [g, tile]: PB rows' slabs per tile (qrow)
@@ -781,7 +879,17 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
         scratch["dpool"] = pltpu.VMEM((NBD * BROWS, 128), U8)
         scratch["epool"] = pltpu.VMEM((NBE * EBROWS, 128), U8)
     s_names = list(scratch)
-    st_names = ("conv", "rec", "raw", "page_table") if c.paged_kv else S_NAMES
+    if FUSED:
+        st_names = ("raw", "page_table", "ckpt_indices", "read_offsets") + (
+            ("active_seqs",) if c.act_mode == "ref" else ()
+        )
+        o_names = ("hidden", "raw") if bool(interpret) else ("hidden",)
+    elif c.paged_kv:
+        st_names = ("conv", "rec", "raw", "page_table")
+        o_names = O_NAMES
+    else:
+        st_names = S_NAMES
+        o_names = O_NAMES
     n_w, n_s = len(W_NAMES), len(st_names)
 
     def mm(x, w, dims=NN):
@@ -802,9 +910,14 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
         if row_mask:
             mr_ref = refs[k_]
             k_ += 1
-        O = dict(zip(O_NAMES, refs[k_:k_ + len(O_NAMES)]))
+        O = dict(zip(o_names, refs[k_:k_ + len(o_names)]))
         out_ref = O["hidden"]
-        scr = dict(zip(s_names, refs[k_ + len(O_NAMES):]))
+        raw_refs = (
+            (O["raw"] if bool(interpret) else ST["raw"])
+            if FUSED
+            else (ST["raw"] if c.paged_kv else None)
+        )
+        scr = dict(zip(s_names, refs[k_ + len(o_names):]))
         me = lax.axis_index("tp").astype(I32)
         gi = lax.rem(me, G) if SPLIT else jnp.int32(0)  # place in the KV-head group
         lane_e8 = lax.broadcasted_iota(I32, (MR, E), 1)
@@ -814,6 +927,89 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
         live = row_m < B
         EM = (1 << max(1, (E - 1).bit_length())) - 1  # top-k key: low mantissa bits = lane
         FLT_MIN = float(jnp.finfo(F32).tiny)
+
+        def is_seq_active(s):
+            if c.act_mode == "ref":
+                return ST["active_seqs"][s] != 0
+            if c.act_mode == "from_ckpt":
+                return (
+                    (ST["ckpt_indices"][0, s, 0] > 0)
+                    if ckpt_is_3d
+                    else (ST["ckpt_indices"][s, 0] > 0)
+                )
+            if c.act_mode == "pos":
+                return pos_ref[s * T] >= 0
+            return jnp.bool_(True)
+
+        def gdn_roff(sub, s):
+            return ST["read_offsets"][sub, s] if roff_is_2d else ST["read_offsets"][s]
+
+        def gdn_pb_in(sub, s):
+            roff = gdn_roff(sub, s)
+            if ckpt_is_3d:
+                return ST["ckpt_indices"][sub, s, roff] * 5
+            return ST["ckpt_indices"][s, roff] * (5 * G_PER_ATT) + sub * 5
+
+        def gdn_pb_out(sub, s, t):
+            if ckpt_is_3d:
+                return ST["ckpt_indices"][sub, s, t + ckpt_t_off] * 5
+            return ST["ckpt_indices"][s, t + ckpt_t_off] * (5 * G_PER_ATT) + sub * 5
+
+        def gdn_contig_ckpt(sub, s):
+            if not ckpt_is_3d or T <= 1:
+                return jnp.bool_(T == 1)
+            s0 = ST["ckpt_indices"][sub, s, ckpt_t_off]
+            ok = jnp.bool_(True)
+            for t in range(1, T):
+                ok = jnp.logical_and(
+                    ok, ST["ckpt_indices"][sub, s, t + ckpt_t_off] == s0 + t
+                )
+            return ok
+
+        def wait_gdn_out(slot_o):
+            out_page = scr["gdn_out_page"]
+            out_sem = scr["gdn_out_sem"]
+            out_mode = scr["gdn_out_mode"]
+            mode = out_mode[slot_o]
+
+            @pl.when(mode == 1)
+            def _():
+                pltpu.make_async_copy(
+                    out_page.at[slot_o],
+                    raw_refs[0].at[pl.ds(0, 5 * T)],
+                    out_sem.at[slot_o, 0],
+                ).wait()
+
+            if T > 1:
+                @pl.when(mode == 2)
+                def _():
+                    for t in range(T):
+                        pltpu.make_async_copy(
+                            out_page.at[slot_o, pl.ds(t * 5, 5)],
+                            raw_refs[0].at[pl.ds(0, 5)],
+                            out_sem.at[slot_o, t],
+                        ).wait()
+
+            out_mode[slot_o] = jnp.int32(0)
+
+        def wait_kv_wr(s):
+            wr_pend = scr["kv_wr_pend"]
+            pend = wr_pend[s]
+
+            @pl.when(pend != 0)
+            def _():
+                pltpu.make_async_copy(
+                    scr["kv_scat_page"].at[s], raw_refs[0].at[0], scr["kv_wr_sem"].at[s]
+                ).wait()
+
+            wr_pend[s] = jnp.int32(0)
+
+        def batch_to_i32_cols(tok_mr_hd):
+            rows_bf16 = tok_mr_hd.astype(BF16)
+            if MR < c.page_size:
+                rows_bf16 = jnp.pad(rows_bf16, ((0, c.page_size - MR), (0, 0)))
+            cols_fp8 = jnp.swapaxes(rows_bf16, 0, 1).astype(FP8)
+            return pltpu.bitcast(cols_fp8, I32)
 
         # ------------------------------ weight rings ------------------------------
         def dview(kind, bank):
@@ -1170,6 +1366,235 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
 
         def gdn(l, slot, g0):
             o = l - (l + 1) // AE
+            if FUSED:
+                in_page = scr["gdn_in_page"]
+                out_page = scr["gdn_out_page"]
+                in_sem = scr["gdn_in_sem"]
+                out_sem = scr["gdn_out_sem"]
+                in_pend = scr["gdn_in_pend"]
+                out_mode = scr["gdn_out_mode"]
+                sb = scr["sbuf"]
+
+                def start_gdn_in(o_, s):
+                    slot_i = s % NGI
+                    sub = lax.rem(o_, G_PER_ATT)
+                    roff = gdn_roff(sub, s)
+                    act_in = jnp.logical_and(is_seq_active(s), roff >= 0)
+                    in_pend[slot_i] = jnp.where(act_in, 1, 0).astype(I32)
+
+                    @pl.when(act_in)
+                    def _():
+                        g_pool = lax.div(o_, G_PER_ATT)
+                        pb = gdn_pb_in(sub, s)
+
+                        def do_in(r):
+                            pltpu.make_async_copy(
+                                r.at[pl.ds(pb, 5)], in_page.at[slot_i], in_sem.at[slot_i]
+                            ).start()
+
+                        bswitch(g_pool, [lambda r=r: do_in(r) for r in raw_refs])
+
+                def wait_gdn_in(slot_i):
+                    pend = in_pend[slot_i]
+
+                    @pl.when(pend != 0)
+                    def _():
+                        pltpu.make_async_copy(
+                            raw_refs[0].at[pl.ds(0, 5)],
+                            in_page.at[slot_i],
+                            in_sem.at[slot_i],
+                        ).wait()
+
+                    in_pend[slot_i] = jnp.int32(0)
+                    return pend != 0
+
+                def start_gdn_out(o_, s):
+                    slot_o = s % NGO
+                    act_out = is_seq_active(s)
+                    sub = lax.rem(o_, G_PER_ATT)
+                    g_pool = lax.div(o_, G_PER_ATT)
+                    if T == 1:
+                        out_mode[slot_o] = jnp.where(act_out, 1, 0).astype(I32)
+
+                        @pl.when(act_out)
+                        def _():
+                            pb0 = gdn_pb_out(sub, s, 0)
+
+                            def do_out(r):
+                                pltpu.make_async_copy(
+                                    out_page.at[slot_o],
+                                    r.at[pl.ds(pb0, 5)],
+                                    out_sem.at[slot_o, 0],
+                                ).start()
+
+                            bswitch(g_pool, [lambda r=r: do_out(r) for r in raw_refs])
+                    else:
+                        contig = gdn_contig_ckpt(sub, s)
+                        out_mode[slot_o] = jnp.where(
+                            act_out, jnp.where(contig, 1, 2), 0
+                        ).astype(I32)
+
+                        @pl.when(jnp.logical_and(act_out, contig))
+                        def _():
+                            pb0 = gdn_pb_out(sub, s, 0)
+
+                            def do_out_c(r):
+                                pltpu.make_async_copy(
+                                    out_page.at[slot_o],
+                                    r.at[pl.ds(pb0, 5 * T)],
+                                    out_sem.at[slot_o, 0],
+                                ).start()
+
+                            bswitch(g_pool, [lambda r=r: do_out_c(r) for r in raw_refs])
+
+                        @pl.when(jnp.logical_and(act_out, jnp.logical_not(contig)))
+                        def _():
+                            def do_out_nc(r):
+                                for t in range(T):
+                                    pb_t = gdn_pb_out(sub, s, t)
+                                    pltpu.make_async_copy(
+                                        out_page.at[slot_o, pl.ds(t * 5, 5)],
+                                        r.at[pl.ds(pb_t, 5)],
+                                        out_sem.at[slot_o, t],
+                                    ).start()
+
+                            bswitch(g_pool, [lambda r=r: do_out_nc(r) for r in raw_refs])
+
+                with sc("gdn_in"):
+                    for s_ in range(NGI):
+                        start_gdn_in(o, s_)
+                    y = dmatmul("lin_in", g0, scr["xb"], c.NLI)
+                    ybuf = scr["ybuf"]
+                    ybuf[:, :c.NLI] = rnd(y * sm(slot, "in_s", c.NLI))
+
+                ow, _ = lay["conv"]
+                taps = [scr["sm"][slot, :, ow + t * QKV:ow + (t + 1) * QKV] for t in range(4)]
+                alog = sm(slot, "alog")[0, :vh]
+                dtb = sm(slot, "dtb")[0, :vh]
+                gnw = sm(slot, "gnorm")[0, :].astype(BF16)
+                expand = vh // kh
+                row_iota_conv = lax.broadcasted_iota(I32, (A_conv, QKV), 0)
+
+                def cols(x):
+                    xc = jnp.swapaxes(jnp.broadcast_to(x[:, None, :], (kh, VD, KD)), 1, 2)
+                    return jnp.broadcast_to(xc[:, None], (kh, expand, KD, VD)).reshape(vh, KD, VD)
+
+                for s in range(NS):
+                    slot_i = s % NGI
+                    slot_o = s % NGO
+                    with sc("gdn_rec_wait"):
+                        act_in = wait_gdn_in(slot_i)
+                    if typed:
+                        u32_in = pltpu.bitcast(
+                            in_page[slot_i, 0:4], U32
+                        ).reshape(512, 128)[:ssm_u32_rows, :]
+                        raw_conv = (
+                            pltpu.bitcast(in_page[slot_i, 4], BF16)
+                            .reshape(256, 128)[:conv8_rows, :]
+                            .reshape(A_conv, QKV)
+                            .astype(F32)
+                        )
+                    else:
+                        u32_in = (
+                            in_page.at[slot_i, pl.ds(0, 4)]
+                            .bitcast(U32)
+                            .reshape(512, 128)[:ssm_u32_rows, :]
+                        )
+                        raw_conv = (
+                            in_page.at[slot_i, 4]
+                            .bitcast(BF16)
+                            .reshape(256, 128)[:conv8_rows, :]
+                            .reshape(A_conv, QKV)
+                            .astype(F32)
+                        )
+                    u32_in = jnp.where(act_in, u32_in, jnp.uint32(0))
+                    s_bf16 = pltpu.bitcast(u32_in, BF16).reshape(vh, KD, VD)
+                    raw_conv = jnp.where(act_in, raw_conv, 0.0)
+                    c0 = raw_conv[0:1, :]
+                    c1 = raw_conv[1:2, :]
+                    c2 = raw_conv[2:3, :]
+                    if s + NGI < NS:
+                        start_gdn_in(o, s + NGI)
+                    wait_gdn_out(slot_o)
+                    if "gdn" not in skip:
+                        with sc("gdn_rec"):
+                            for t in range(T):
+                                b = s * T + t
+                                x_t = ybuf[b:b + 1, 0:QKV]
+                                u_t = rnd(
+                                    jax.nn.silu(
+                                        c0 * taps[0]
+                                        + c1 * taps[1]
+                                        + c2 * taps[2]
+                                        + x_t * taps[3]
+                                    )
+                                )
+                                c0, c1, c2 = c1, c2, x_t
+                                q = u_t[0, :kh * KD].reshape(kh, KD)
+                                k = u_t[0, kh * KD:2 * kh * KD].reshape(kh, KD)
+                                v = u_t[0, 2 * kh * KD:].reshape(vh, VD)
+                                q = q * lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + 1e-6)
+                                q = q * KD ** -0.5
+                                k = k * lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + 1e-6)
+                                qc, kc_ = cols(q), cols(k)
+                                beta = rnd(jax.nn.sigmoid(ybuf[b, BA:BA + vh]))
+                                a = ybuf[b, BA + 64:BA + 64 + vh]
+                                g = -jnp.exp(alog) * jax.nn.softplus(a + dtb)
+                                sb[...] = s_bf16.astype(F32) * jnp.exp(g)[:, None, None]
+                                pred = jnp.sum(sb[...] * kc_, axis=1)
+                                delta = (v - pred) * beta[:, None]
+                                sb[...] = sb[...] + kc_ * delta[:, None, :]
+                                out = rnd(jnp.sum(sb[...] * qc, axis=1))
+                                s_bf16 = sb[...].astype(BF16)
+                                val = out * lax.rsqrt(
+                                    jnp.mean(out * out, axis=-1, keepdims=True) + c.eps
+                                )
+                                val = (gnw[None, :] * val.astype(BF16)).astype(F32)
+                                zz = ybuf[b, QKV:QKV + Z].reshape(vh, VD)
+                                scr["mix"][b, :Z] = rnd(val * jax.nn.silu(zz)).reshape(Z)
+
+                                u32_out = pltpu.bitcast(s_bf16.reshape(vh * KD, VD), U32)
+                                c0_f = jnp.broadcast_to(c0, (A_conv, QKV))
+                                c1_f = jnp.broadcast_to(c1, (A_conv, QKV))
+                                c2_f = jnp.broadcast_to(c2, (A_conv, QKV))
+                                w_conv = jnp.where(
+                                    row_iota_conv == 0,
+                                    c0_f,
+                                    jnp.where(
+                                        row_iota_conv == 1,
+                                        c1_f,
+                                        jnp.where(row_iota_conv == 2, c2_f, 0.0),
+                                    ),
+                                ).astype(BF16)
+                                if typed:
+                                    u32_p = (
+                                        jnp.pad(u32_out, ((0, 512 - ssm_u32_rows), (0, 0)))
+                                        if ssm_u32_rows < 512
+                                        else u32_out
+                                    )
+                                    out_page[slot_o, t * 5:t * 5 + 4] = pltpu.bitcast(
+                                        u32_p.reshape(4, 2, 64, 1, 128), FP8
+                                    )
+                                    conv_p = w_conv.reshape(conv8_rows, 128)
+                                    if conv8_rows < 256:
+                                        conv_p = jnp.pad(conv_p, ((0, 256 - conv8_rows), (0, 0)))
+                                    out_page[slot_o, t * 5 + 4] = pltpu.bitcast(
+                                        conv_p.reshape(2, 64, 2, 128), FP8
+                                    )
+                                else:
+                                    out_page.at[slot_o, pl.ds(t * 5, 4)].bitcast(U32).reshape(
+                                        512, 128
+                                    )[:ssm_u32_rows, :] = u32_out
+                                    out_page.at[slot_o, t * 5 + 4].bitcast(BF16).reshape(
+                                        256, 128
+                                    )[:conv8_rows, :] = w_conv.reshape(conv8_rows, 128)
+                    start_gdn_out(o, s)
+
+                with sc("gdn_out"):
+                    scr["xb2"][:, :Z] = scr["mix"][:, :Z].astype(BF16)
+                    yo = dmatmul("lin_out", g0 + nt["lin_in"], scr["xb2"], H)
+                    return yo * sm(slot, "out_s")
+
             convb, recb, sem = scr["convb"], scr["recb"], scr["st_sem"]
 
             def rec_in():
@@ -1406,7 +1831,7 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
             # in the step prologue). Items depend only on pos: start before att_in.
             n_items = scr["st"][1]
             if c.paged_kv:
-                raw_refs, pt_ref = ST["raw"], ST["page_table"]
+                pt_ref = ST["page_table"]
                 kvbuf = scr["kvbuf"]
                 P_BLK = BLK // c.page_size
 
@@ -1520,13 +1945,15 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
                     else:
                         scr["knew"][b:b + 1, :] = k
                         scr["vnew"][b:b + 1, :] = v
-                k_src = scr["knew_o"] if c.paged_kv else scr["knew"]
-                v_src = scr["vnew_o"] if c.paged_kv else scr["vnew"]
-                kv_out = (
-                    pltpu.make_async_copy(k_src, O["knew"].at[a], scr["kv_out_sem"].at[0]),
-                    pltpu.make_async_copy(v_src, O["vnew"].at[a], scr["kv_out_sem"].at[1]))
-                for d in kv_out:
-                    d.start()
+                if not FUSED:
+                    k_src = scr["knew_o"] if c.paged_kv else scr["knew"]
+                    v_src = scr["vnew_o"] if c.paged_kv else scr["vnew"]
+                    kv_out = (
+                        pltpu.make_async_copy(k_src, O["knew"].at[a], scr["kv_out_sem"].at[0]),
+                        pltpu.make_async_copy(v_src, O["vnew"].at[a], scr["kv_out_sem"].at[1]),
+                    )
+                    for d in kv_out:
+                        d.start()
             if SPLIT or VER:
                 with sc("att_qgather"):
                     qgb = scr["qg"]
@@ -1550,8 +1977,13 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
                         scr["qb"][sq] = qs.astype(BF16)
 
             with sc("att_core"):
-                col = lax.broadcasted_iota(I32, (TQ, SUB), 1)
-                col_v = lax.broadcasted_iota(I32, (HD, SUB), 1) if c.paged_kv else None
+                AMASK = tiles.amask
+                col = lax.broadcasted_iota(I32, (1 if AMASK else TQ, SUB), 1)
+                col_v = (
+                    lax.broadcasted_iota(I32, (HD, SUB), 1)
+                    if (c.paged_kv and AMASK == 0)
+                    else None
+                )
                 am[...] = jnp.full(am.shape, -1e30, F32)
                 al[...] = jnp.zeros(al.shape, F32)
                 aacc[...] = jnp.zeros(aacc.shape, F32)
@@ -1571,22 +2003,53 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
                                 k_full = kvbuf[s, 0].reshape(HD, BLK)
                                 v_full = kvbuf[s, 1].reshape(HD, BLK)
                             else:
-                                k_full = pltpu.bitcast(
-                                    kvbuf.at[s, 0].bitcast(U32).reshape(64, BLK)[...], FP8)
-                                v_full = pltpu.bitcast(
-                                    kvbuf.at[s, 1].bitcast(U32).reshape(64, BLK)[...], FP8)
+                                k_u32 = kvbuf.at[s, 0].bitcast(U32).reshape(64, BLK)[...]
+                                v_u32 = kvbuf.at[s, 1].bitcast(U32).reshape(64, BLK)[...]
+                                k_full = pltpu.bitcast(k_u32, FP8)
+                                if AMASK in (0, 3, 4):
+                                    v_full = pltpu.bitcast(v_u32, FP8)
                         for j in range(BLK // SUB):
                             off = t * BLK + j * SUB
+                            rem = plen - off
+                            full_blk = off + SUB <= plen
                             if c.paged_kv:
                                 kj = k_full if SUB == BLK else k_full[:, j * SUB:(j + 1) * SUB]
-                                vj = v_full if SUB == BLK else v_full[:, j * SUB:(j + 1) * SUB]
-                                vj = jnp.where(col_v + off < plen, vj, jnp.zeros_like(vj))
+                                if AMASK == 0:
+                                    vj = v_full if SUB == BLK else v_full[:, j * SUB:(j + 1) * SUB]
+                                    vj = jnp.where(col_v + off < plen, vj, jnp.zeros_like(vj))
+                                elif interpret:
+                                    vj = v_full if SUB == BLK else v_full[:, j * SUB:(j + 1) * SUB]
+                                    if AMASK not in (3, 4):
+                                        vj = jnp.where(col < rem, vj, jnp.zeros_like(vj))
+                                elif AMASK == 1:
+                                    vu = v_u32 if SUB == BLK else v_u32[:, j * SUB:(j + 1) * SUB]
+                                    vu = jnp.where(col < rem, vu, jnp.uint32(0))
+                                    vj = pltpu.bitcast(vu, FP8)
+                                elif AMASK == 2:
+                                    vu = v_u32 if SUB == BLK else v_u32[:, j * SUB:(j + 1) * SUB]
+                                    vu = lax.cond(
+                                        full_blk,
+                                        lambda: vu,
+                                        lambda: jnp.where(col < rem, vu, jnp.uint32(0)),
+                                    )
+                                    vj = pltpu.bitcast(vu, FP8)
+                                else:
+                                    vj = v_full if SUB == BLK else v_full[:, j * SUB:(j + 1) * SUB]
                                 scores = mm(qrows, kj, NN)
                             else:
                                 kj = kbuf[s] if SUB == BLK else kbuf[s, j * SUB:(j + 1) * SUB]
                                 vj = vbuf[s] if SUB == BLK else vbuf[s, j * SUB:(j + 1) * SUB]
                                 scores = mm(qrows, kj, NT)
-                            scores = jnp.where(col + off < plen, scores, -jnp.inf)
+                            if AMASK == 0:
+                                scores = jnp.where(col + off < plen, scores, -jnp.inf)
+                            elif AMASK in (1, 4):
+                                scores = jnp.where(col < rem, scores, -jnp.inf)
+                            else:
+                                scores = lax.cond(
+                                    full_blk,
+                                    lambda: scores,
+                                    lambda: jnp.where(col < rem, scores, -jnp.inf),
+                                )
                             m_old = am[b]
                             m_new = jnp.maximum(m_old, jnp.max(scores, axis=-1, keepdims=True))
                             alpha = jnp.exp(m_old - m_new)
@@ -1599,6 +2062,39 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
                     return carry
 
                 lax.fori_loop(0, n_items, item, 0)
+
+            def seq_same_page(s):
+                if T == 1:
+                    return jnp.bool_(True)
+                b0 = s * T
+                lp0 = lax.div(pos_ref[b0], c.page_size)
+                ok = jnp.bool_(True)
+                for t in range(1, T):
+                    ok = jnp.logical_and(ok, lax.div(pos_ref[b0 + t], c.page_size) == lp0)
+                return ok
+
+            if FUSED:
+                kv_scat = scr["kv_scat_page"]
+                rd_sem, wr_sem = scr["kv_rd_sem"], scr["kv_wr_sem"]
+                rd_pend, wr_pend = scr["kv_rd_pend"], scr["kv_wr_pend"]
+                for s in range(NS):
+                    wait_kv_wr(s)
+                    act_s = is_seq_active(s)
+                    same_s = seq_same_page(s)
+                    do_rd = jnp.logical_and(act_s, same_s)
+                    rd_pend[s] = jnp.where(do_rd, 1, 0).astype(I32)
+
+                    @pl.when(do_rd)
+                    def _(s=s):
+                        lp0 = lax.div(pos_ref[s * T], c.page_size)
+                        kp0 = jnp.clip(pt_ref[s, lp0], 0, c.num_pages - 1)
+
+                        def issue_rd(r):
+                            pltpu.make_async_copy(
+                                r.at[kp0], kv_scat.at[s], rd_sem.at[s]
+                            ).start()
+
+                        bswitch(a, [lambda r=r: issue_rd(r) for r in raw_refs])
 
             if SPLIT:
                 with sc("att_merge"):
@@ -1681,8 +2177,130 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
                         scr["mix"][b:b + 1, h * HD:(h + 1) * HD] = rnd(oh * gh)
 
             with sc("att_out"):
-                for d in kv_out:
-                    d.wait()
+                if FUSED:
+                    lane_iota_kv = lax.broadcasted_iota(I32, (64, c.page_size), 1)
+                    k_cols = batch_to_i32_cols(scr["knew_o"][...])
+                    v_cols = batch_to_i32_cols(scr["vnew_o"][...])
+                    for s in range(NS):
+                        act_s = is_seq_active(s)
+                        same_s = seq_same_page(s)
+                        do_fast = rd_pend[s] != 0
+                        rd_pend[s] = jnp.int32(0)
+
+                        @pl.when(do_fast)
+                        def _(s=s):
+                            pltpu.make_async_copy(
+                                raw_refs[0].at[0], kv_scat.at[s], rd_sem.at[s]
+                            ).wait()
+                            b0 = s * T
+                            if typed:
+                                k_cur = pltpu.bitcast(kv_scat[s, 0], I32).reshape(64, c.page_size)
+                                v_cur = pltpu.bitcast(kv_scat[s, 1], I32).reshape(64, c.page_size)
+                            else:
+                                k_view = kv_scat.at[s, 0].bitcast(I32).reshape(64, c.page_size)
+                                v_view = kv_scat.at[s, 1].bitcast(I32).reshape(64, c.page_size)
+                                k_cur = k_view[...]
+                                v_cur = v_view[...]
+                            for t in range(T):
+                                mask_b = lane_iota_kv == (b0 + t)
+                                mask_ln = lane_iota_kv == lax.rem(pos_ref[b0 + t], c.page_size)
+                                k_col = jnp.sum(
+                                    jnp.where(mask_b, k_cols, jnp.int32(0)), axis=1, keepdims=True
+                                )
+                                v_col = jnp.sum(
+                                    jnp.where(mask_b, v_cols, jnp.int32(0)), axis=1, keepdims=True
+                                )
+                                k_cur = jnp.where(mask_ln, k_col, k_cur)
+                                v_cur = jnp.where(mask_ln, v_col, v_cur)
+                            if typed:
+                                kv_scat[s, 0] = pltpu.bitcast(
+                                    k_cur.reshape(64, 1, c.page_size), FP8
+                                )
+                                kv_scat[s, 1] = pltpu.bitcast(
+                                    v_cur.reshape(64, 1, c.page_size), FP8
+                                )
+                            else:
+                                k_view[...] = k_cur
+                                v_view[...] = v_cur
+                            lp0 = lax.div(pos_ref[b0], c.page_size)
+                            kp0 = jnp.clip(pt_ref[s, lp0], 0, c.num_pages - 1)
+
+                            def issue_wr(r):
+                                pltpu.make_async_copy(
+                                    kv_scat.at[s], r.at[kp0], wr_sem.at[s]
+                                ).start()
+
+                            bswitch(a, [lambda r=r: issue_wr(r) for r in raw_refs])
+
+                        wr_pend[s] = jnp.where(do_fast, 1, 0).astype(I32)
+                        if T > 1:
+                            @pl.when(jnp.logical_and(act_s, jnp.logical_not(same_s)))
+                            def _(s=s):
+                                b0 = s * T
+                                for t in range(T):
+                                    p_t = pos_ref[b0 + t]
+                                    lp_t = lax.div(p_t, c.page_size)
+                                    ln_t = lax.rem(p_t, c.page_size)
+                                    kp_t = jnp.clip(pt_ref[s, lp_t], 0, c.num_pages - 1)
+
+                                    def rd_one(r, kp_t=kp_t):
+                                        pltpu.make_async_copy(
+                                            r.at[kp_t], kv_scat.at[s], rd_sem.at[s]
+                                        ).start()
+
+                                    bswitch(a, [lambda r=r: rd_one(r) for r in raw_refs])
+                                    pltpu.make_async_copy(
+                                        raw_refs[0].at[0], kv_scat.at[s], rd_sem.at[s]
+                                    ).wait()
+                                    mask_b = lane_iota_kv == (b0 + t)
+                                    mask_ln = lane_iota_kv == ln_t
+                                    k_col = jnp.sum(
+                                        jnp.where(mask_b, k_cols, jnp.int32(0)),
+                                        axis=1,
+                                        keepdims=True,
+                                    )
+                                    v_col = jnp.sum(
+                                        jnp.where(mask_b, v_cols, jnp.int32(0)),
+                                        axis=1,
+                                        keepdims=True,
+                                    )
+                                    if typed:
+                                        k_cur = pltpu.bitcast(kv_scat[s, 0], I32).reshape(
+                                            64, c.page_size
+                                        )
+                                        v_cur = pltpu.bitcast(kv_scat[s, 1], I32).reshape(
+                                            64, c.page_size
+                                        )
+                                        k_cur = jnp.where(mask_ln, k_col, k_cur)
+                                        v_cur = jnp.where(mask_ln, v_col, v_cur)
+                                        kv_scat[s, 0] = pltpu.bitcast(
+                                            k_cur.reshape(64, 1, c.page_size), FP8
+                                        )
+                                        kv_scat[s, 1] = pltpu.bitcast(
+                                            v_cur.reshape(64, 1, c.page_size), FP8
+                                        )
+                                    else:
+                                        k_view = (
+                                            kv_scat.at[s, 0].bitcast(I32).reshape(64, c.page_size)
+                                        )
+                                        v_view = (
+                                            kv_scat.at[s, 1].bitcast(I32).reshape(64, c.page_size)
+                                        )
+                                        k_view[...] = jnp.where(mask_ln, k_col, k_view[...])
+                                        v_view[...] = jnp.where(mask_ln, v_col, v_view[...])
+
+                                    def wr_one(r, kp_t=kp_t):
+                                        pltpu.make_async_copy(
+                                            kv_scat.at[s], r.at[kp_t], wr_sem.at[s]
+                                        ).start()
+
+                                    bswitch(a, [lambda r=r: wr_one(r) for r in raw_refs])
+                                    pltpu.make_async_copy(
+                                        kv_scat.at[s], raw_refs[0].at[0], wr_sem.at[s]
+                                    ).wait()
+                else:
+                    for d in kv_out:
+                        d.wait()
                 NO = nh * HD
                 scr["xb2"][:, :NO] = scr["mix"][:, :NO].astype(BF16)
                 yo = dmatmul("att_out", g0 + nt["att_in"], scr["xb2"], H, lazy=LAZY_ATT)
@@ -1779,43 +2397,88 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
                 for r in range(R):
                     scr["rload"][r] = jnp.int32(0)
 
-                def pick_ecopy(b, k, carry):
-                    n, n_cp, n_tot = carry
-                    e = scr["hits"][b, k]
-                    hi, lo = lax.shift_right_logical(e, 7), lax.bitwise_and(e, 127)
-                    new = scr["seen"][hi, lo] != stamp
-                    scr["seen"][hi, lo] = stamp
-                    code = scr["ecopy"][slot, 0, e].astype(I32)
-                    has_cp = code > 0
-                    r0 = lax.div(e, ER)
-                    s0 = e - r0 * ER
-                    fixed_new = jnp.logical_and(new, jnp.logical_not(has_cp))
-                    cp_new = jnp.logical_and(new, has_cp)
-                    scr["rload"][r0] = scr["rload"][r0] + jnp.where(new, 1, 0).astype(I32)
-                    mine_fixed = jnp.logical_and(fixed_new, r0 == me)
-                    scr["elist"][n] = e
-                    scr["wlist"][n] = s0
-                    scr["cplist"][n_cp] = e
-                    return (
-                        n + jnp.where(mine_fixed, 1, 0).astype(I32),
-                        n_cp + jnp.where(cp_new, 1, 0).astype(I32),
-                        n_tot + jnp.where(new, 1, 0).astype(I32),
-                    )
+                if tiles.ecopy_opt == 1:
+                    def pick_uniq(b, k, n_tot):
+                        e = scr["hits"][b, k]
+                        hi, lo = lax.shift_right_logical(e, 7), lax.bitwise_and(e, 127)
+                        new = scr["seen"][hi, lo] != stamp
+                        scr["seen"][hi, lo] = stamp
+                        scr["ulist"][n_tot] = e
+                        return n_tot + jnp.where(new, 1, 0).astype(I32)
 
-                carry = (jnp.int32(0), jnp.int32(0), jnp.int32(0))
+                    def classify_uniq(i, carry_c):
+                        n, n_cp = carry_c
+                        e = scr["ulist"][i]
+                        code = scr["ecopy"][slot, 0, e].astype(I32)
+                        has_cp = code > 0
+                        r0 = lax.div(e, ER)
+                        s0 = e - r0 * ER
+                        scr["rload"][r0] = scr["rload"][r0] + jnp.int32(1)
+                        mine_fixed = jnp.logical_and(jnp.logical_not(has_cp), r0 == me)
+                        scr["elist"][n] = e
+                        scr["wlist"][n] = s0
+                        scr["cplist"][n_cp] = e
+                        return (
+                            n + jnp.where(mine_fixed, 1, 0).astype(I32),
+                            n_cp + jnp.where(has_cp, 1, 0).astype(I32),
+                        )
+
+                    n_tot = jnp.int32(0)
+                    with sc("route_dedup", 2):
+                        if WIDE:
+                            def row_uniq(b, nt_in):
+                                return lax.fori_loop(
+                                    0, c.TOPK, functools.partial(pick_uniq, b), nt_in, unroll=True
+                                )
+
+                            n_tot = lax.fori_loop(0, B, row_uniq, n_tot, unroll=2)
+                        else:
+                            for b in range(B):
+                                n_tot = lax.fori_loop(
+                                    0, c.TOPK, functools.partial(pick_uniq, b), n_tot, unroll=True
+                                )
+                        n_hit, n_cp = lax.fori_loop(
+                            0, n_tot, classify_uniq, (jnp.int32(0), jnp.int32(0))
+                        )
+                else:
+                    def pick_ecopy(b, k, carry):
+                        n, n_cp, n_tot = carry
+                        e = scr["hits"][b, k]
+                        hi, lo = lax.shift_right_logical(e, 7), lax.bitwise_and(e, 127)
+                        new = scr["seen"][hi, lo] != stamp
+                        scr["seen"][hi, lo] = stamp
+                        code = scr["ecopy"][slot, 0, e].astype(I32)
+                        has_cp = code > 0
+                        r0 = lax.div(e, ER)
+                        s0 = e - r0 * ER
+                        fixed_new = jnp.logical_and(new, jnp.logical_not(has_cp))
+                        cp_new = jnp.logical_and(new, has_cp)
+                        scr["rload"][r0] = scr["rload"][r0] + jnp.where(new, 1, 0).astype(I32)
+                        mine_fixed = jnp.logical_and(fixed_new, r0 == me)
+                        scr["elist"][n] = e
+                        scr["wlist"][n] = s0
+                        scr["cplist"][n_cp] = e
+                        return (
+                            n + jnp.where(mine_fixed, 1, 0).astype(I32),
+                            n_cp + jnp.where(cp_new, 1, 0).astype(I32),
+                            n_tot + jnp.where(new, 1, 0).astype(I32),
+                        )
+
+                    carry = (jnp.int32(0), jnp.int32(0), jnp.int32(0))
+                    with sc("route_dedup", 2):
+                        if WIDE:
+                            def row_ecopy(b, c_in):
+                                return lax.fori_loop(0, c.TOPK, functools.partial(pick_ecopy, b),
+                                                     c_in, unroll=True)
+
+                            n_hit, n_cp, n_tot = lax.fori_loop(0, B, row_ecopy, carry, unroll=2)
+                        else:
+                            for b in range(B):
+                                carry = lax.fori_loop(0, c.TOPK, functools.partial(pick_ecopy, b),
+                                                      carry, unroll=True)
+                            n_hit, n_cp, n_tot = carry
+
                 with sc("route_dedup", 2):
-                    if WIDE:
-                        def row_ecopy(b, c_in):
-                            return lax.fori_loop(0, c.TOPK, functools.partial(pick_ecopy, b),
-                                                 c_in, unroll=True)
-
-                        n_hit, n_cp, n_tot = lax.fori_loop(0, B, row_ecopy, carry, unroll=2)
-                    else:
-                        for b in range(B):
-                            carry = lax.fori_loop(0, c.TOPK, functools.partial(pick_ecopy, b),
-                                                  carry, unroll=True)
-                        n_hit, n_cp, n_tot = carry
-
                     def po2c_pass1(j, _):
                         e = scr["cplist"][j]
                         r0 = lax.div(e, ER)
@@ -1867,6 +2530,7 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
 
                     lax.fori_loop(0, n_cp, po2c_pass1, 0)
                     n_hit = lax.fori_loop(0, n_cp, po2c_pass2, n_hit)
+
             else:
                 def pick(b, k, n):
                     # branch-free: a repeated (or, for EP, remote) pick rewrites slot n and stamps
@@ -2103,6 +2767,16 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
         if c.paged_kv:
             scr["knew_o"][...] = jnp.zeros((MR, HD), FP8)
             scr["vnew_o"][...] = jnp.zeros((MR, HD), FP8)
+        if FUSED:
+            for s in range(NS):
+                scr["kv_rd_pend"][s] = jnp.int32(0)
+                scr["kv_wr_pend"][s] = jnp.int32(0)
+            if c.NGDN > 0:
+                for slot_i in range(NGI):
+                    scr["gdn_in_pend"][slot_i] = jnp.int32(0)
+                for slot_o in range(NGO):
+                    scr["gdn_out_mode"][slot_o] = jnp.int32(0)
+                scr["gdn_out_page"][...] = jnp.zeros(scr["gdn_out_page"].shape, FP8)
         if SPLIT:
             scr["pso"][...] = jnp.zeros(scr["pso"].shape, F32)
         if PACK:  # a partial last tile's spare rows are sent (never read): keep them defined
@@ -2114,7 +2788,13 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
                 for rnd_i in AR_ROUNDS:
                     for d in ar_copies(ar_slot, rnd_i):
                         d.wait_send()
-        if c.NGDN > 0:
+        if FUSED:
+            if c.NGDN > 0:
+                for slot_o in range(NGO):
+                    wait_gdn_out(slot_o)
+            for s in range(NS):
+                wait_kv_wr(s)
+        elif c.NGDN > 0:
             o_last = c.NGDN - 1
             pltpu.make_async_copy(scr["convb"], O["conv"].at[o_last], scr["st_sem"].at[2]).wait()
             if GCH:
@@ -2140,7 +2820,7 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
         tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in range(c.NATT))
         if k == "raw"
         else pl.BlockSpec(memory_space=pltpu.SMEM)
-        if k == "page_table"
+        if k in ("page_table", "ckpt_indices", "read_offsets", "active_seqs")
         else pl.BlockSpec(memory_space=pltpu.HBM)
         for k in st_names
     ]
@@ -2152,9 +2832,32 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
         + ([pl.BlockSpec(memory_space=pltpu.SMEM)] if row_mask else [])
     )
     n_w_leaves = sum(c.L if (not c.stack_e and k in ("e13", "e2")) else 1 for k in W_NAMES)
-    out_shape = [jax.ShapeDtypeStruct(*oshapes[k]) for k in O_NAMES]
-    out_specs = ([pl.BlockSpec(memory_space=pltpu.VMEM)]
-                 + [pl.BlockSpec(memory_space=pltpu.HBM)] * (len(O_NAMES) - 1))
+    out_shape = [
+        tuple(jax.ShapeDtypeStruct(*s) for s in oshapes[k])
+        if k == "raw"
+        else jax.ShapeDtypeStruct(*oshapes[k])
+        for k in o_names
+    ]
+    out_specs = [
+        pl.BlockSpec(memory_space=pltpu.VMEM)
+        if k == "hidden"
+        else tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in range(c.NATT))
+        if k == "raw"
+        else pl.BlockSpec(memory_space=pltpu.HBM)
+        for k in o_names
+    ]
+    if FUSED:
+        aliases = (
+            {2 + n_w_leaves + a: 1 + a for a in range(c.NATT)}
+            if bool(interpret)
+            else {}
+        )
+    else:
+        aliases = (
+            {2 + n_w_leaves + st_names.index(k): o_names.index(k) for k in ("conv", "rec")}
+            if tiles.inplace
+            else {}
+        )
     call = pl.pallas_call(
         kernel,
         out_shape=out_shape,
@@ -2162,8 +2865,7 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
         out_specs=out_specs,
         scratch_shapes=[scratch[k] for k in s_names],
         # GDN states update in place: layer o's slice is read (and waited) before it is written
-        input_output_aliases=({2 + n_w_leaves + st_names.index(k): O_NAMES.index(k)
-                               for k in ("conv", "rec")} if tiles.inplace else {}),
+        input_output_aliases=aliases,
         compiler_params=pltpu.CompilerParams(
             collective_id=COLLECTIVE_ID if R > 1 else None,
             vmem_limit_bytes=tiles.vmem_mib * 1024 * 1024,
