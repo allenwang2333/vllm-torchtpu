@@ -137,12 +137,12 @@ disk_monitor_pid=$!
     command = command.replace(
         benchmark_end, f'kill "$disk_monitor_pid" || true\n{benchmark_end}'
     )
-    launch_marker = (
-        "bash /tmp/tpu_logs/repro/run-c1-prefill.sh /workspace/vllm-torchtpu"
-    )
-    if command.count(launch_marker) != 1:
-        raise ValueError("Baseline benchmark launch marker changed")
-    stage = f"""static_stage=/tmp/tpu_logs/static-moe
+    setup_marker = 'echo "REPRO_SETUP $(date -Is)"'
+    if command.count(setup_marker) != 1:
+        raise ValueError("Baseline setup marker changed")
+    stage = f"""(
+set -euo pipefail
+static_stage=/tmp/tpu_logs/static-moe
 mkdir -p "$static_stage"
 echo "STATIC_MOE_STAGE_START $(date -Is)"
 cp {MODEL_MOUNT}/config.json {MODEL_MOUNT}/STATIC_MOE_READY.json \\
@@ -159,11 +159,22 @@ staged_files=$(find "$static_stage/prepared-weights" -maxdepth 1 \\
   echo "Static MoE staging incomplete: $staged_files/$expected_files files" >&2
   exit 1
 }}
-export TPU_DSV41_STATIC_MOE_DIR="$static_stage"
 staged_bytes=$(du -sb "$static_stage/prepared-weights" | cut -f1)
 echo "STATIC_MOE_STAGE_END $(date -Is) files=$staged_files bytes=$staged_bytes"
+) &
+static_stage_pid=$!
 """
-    command = command.replace(launch_marker, stage + launch_marker)
+    command = command.replace(setup_marker, setup_marker + "\n" + stage)
+    launch_marker = (
+        "bash /tmp/tpu_logs/repro/run-c1-prefill.sh /workspace/vllm-torchtpu"
+    )
+    if command.count(launch_marker) != 1:
+        raise ValueError("Baseline benchmark launch marker changed")
+    command = command.replace(
+        launch_marker,
+        'wait "$static_stage_pid"\n'
+        "export TPU_DSV41_STATIC_MOE_DIR=/tmp/tpu_logs/static-moe\n" + launch_marker,
+    )
     task["command"] = command
     return {
         "name": f"dsv41-100k-prefill-c1-static-moe-{source_commit[:10]}",
