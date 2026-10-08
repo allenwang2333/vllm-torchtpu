@@ -819,12 +819,16 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
             fused_moe_ep_supported as fused_moe_ep_v3_supported,
         )
+        from vllm_torchtpu.layers.adapter.fused_moe_tp_ar import (
+            fused_moe_tp_ar_supported,
+        )
 
         return (
             enable_pipelined_collective_and_compute()
             or fused_moe_ep_v2_supported(self)
             or fused_moe_ep_v3_supported(self)
             or adaptive_moe.adaptive_fused_moe_supported(self)
+            or fused_moe_tp_ar_supported(self)
             or envs.TPU_MOE_FP8_ALL_GATHER
         )
 
@@ -1259,6 +1263,16 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if owns_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
 
+        from vllm_torchtpu.layers.adapter.fused_moe_tp_ar import (
+            fused_moe_tp_ar,
+            fused_moe_tp_ar_supported,
+        )
+
+        if fused_moe_tp_ar_supported(self):
+            # Armed layer: the runner no longer runs the shared expert or the
+            # all-reduce, so this returns the reduced shared + routed sum.
+            return fused_moe_tp_ar(self, layer, x, topk_weights, topk_ids)
+
         return fused_moe_gmm(**kwargs)
 
     def _apply_owning_dispatch_v3(
@@ -1271,6 +1285,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         use_fused_kernel: bool = True,
     ) -> torch.Tensor:
         from vllm.distributed.parallel_state import get_ep_group
+
         from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
             fused_moe_ep,
             fused_moe_ep_supported,

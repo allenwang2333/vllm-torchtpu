@@ -58,6 +58,8 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_MOE_SINGLE_SORT: bool = True
     TPU_MOE_LOWTOK: bool = False
+    USE_MOE_FUSED_TP_AR: bool = False
+    VLLM_TPU_FUSED_TP_NUM_BUFFERS: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -167,7 +169,6 @@ if TYPE_CHECKING:
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     TPU_MTP_STEP0_POST_ATTN_GATHER: bool = True
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
-<<<<<<< HEAD
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     TPU_SCHED_SRPF_RUNNING: bool = True
@@ -177,9 +178,7 @@ if TYPE_CHECKING:
     TPU_SCHED_STEP_TOTAL_CAP: int = 4096
     TPU_SCHED_WARM_STREAK: int = 0
     TPU_SCHED_WARM_MIN_DECODERS: int = 24
-=======
     TPU_SMALL_ALL_REDUCE: bool = False
->>>>>>> d0b9b7457 ([#1469] [Collectives] Pallas all-reduce and reduce-scatter for small blocks)
 
 
 def env_with_choices(
@@ -614,6 +613,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_LOWTOK_MAX_TOKENS": env_nonnegative_int(
         "TPU_MOE_LOWTOK_MAX_TOKENS", 256
     ),
+    # Serve TP-sharded MoE layers with a single Pallas kernel that fuses the
+    # shared expert, the routed experts, and the TP all-reduce (or SP
+    # all-gather + reduce-scatter). Armed once after model load.
+    "USE_MOE_FUSED_TP_AR": env_bool("USE_MOE_FUSED_TP_AR"),
+    "VLLM_TPU_FUSED_TP_NUM_BUFFERS": env_int("VLLM_TPU_FUSED_TP_NUM_BUFFERS", 0),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

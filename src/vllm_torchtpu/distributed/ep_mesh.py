@@ -177,8 +177,14 @@ def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
         raise RuntimeError(
             f"Two EP ranks report the same TPU global device id: {device_ids}"
         )
+    from vllm_torchtpu import envs
+
     ep_ranks = range(len(device_ids))
-    if get_pcp_world_size() > 1 or get_dcp_world_size() > 1:
+    if (
+        get_pcp_world_size() > 1
+        or get_dcp_world_size() > 1
+        or (envs.USE_MOE_FUSED_TP_AR and envs.TPU_MOE_SEQUENCE_PARALLEL)
+    ):
         return tuple(ep_ranks)
     return tuple(sorted(ep_ranks, key=device_ids.__getitem__))
 

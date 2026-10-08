@@ -864,7 +864,8 @@ class TpuPlatform(Platform):
 
         if (
             model_config is not None
-            and "Qwen3_5MoeForConditionalGeneration" in (model_config.architectures or [])
+            and "Qwen3_5MoeForConditionalGeneration"
+            in (model_config.architectures or [])
             and os.environ.get("TPU_QWEN35_AUTO_DEFAULTS", "1").strip().lower()
             in ("1", "true", "yes", "on")
         ):
@@ -886,7 +887,10 @@ class TpuPlatform(Platform):
             dcp_size = int(
                 getattr(parallel_config, "decode_context_parallel_size", 1) or 1
             )
-            if "TPU_EXPERT_PLACEMENT" not in os.environ:
+            if (
+                parallel_config.enable_expert_parallel
+                and "TPU_EXPERT_PLACEMENT" not in os.environ
+            ):
                 from vllm_torchtpu import expert_placement
 
                 table = expert_placement.auto_table(

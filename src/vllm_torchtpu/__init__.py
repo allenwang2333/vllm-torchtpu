@@ -447,7 +447,7 @@ def _patch_sequence_parallel_moe_admission() -> None:
         ParallelConfig.use_sequence_parallel_moe = property(
             lambda self: bool(
                 not getattr(self, "_tpu_disable_sp_moe", False)
-                and self.enable_expert_parallel
+                and (self.enable_expert_parallel or envs.USE_MOE_FUSED_TP_AR)
                 and self.tensor_parallel_size > 1
                 and self.data_parallel_size == 1
             )
