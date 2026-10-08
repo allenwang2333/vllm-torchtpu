@@ -214,6 +214,42 @@ def test_draft_buckets_fit_dense_draft_blocks():
     assert proposer._draft_tokens_paddings() == [8, 480, 576]
 
 
+@pytest.mark.parametrize("num_tokens", [24, 240, 288])
+def test_dummy_draft_forward_uses_real_block_layout(num_tokens):
+    proposer = _make_proposer(draft_tp=8, target_tp=8)
+    proposer.speculative_config.num_speculative_tokens = 5
+    proposer._query_block_size = lambda K: K
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        mesh=None,
+        _dp_num_tokens_across_dp=lambda n: None,
+    )
+    proposer._build_attn_metadata_for_draft = mock.MagicMock(return_value={})
+    proposer._dflash_forward_and_sample = mock.MagicMock(
+        return_value=(torch.zeros(1), None)
+    )
+    with (
+        mock.patch("vllm_torchtpu.spec_decode.dflash.set_forward_context"),
+        mock.patch("vllm_torchtpu.spec_decode.dflash.set_vllm_model_wrapper_context"),
+        mock.patch("vllm_torchtpu.spec_decode.dflash.synchronize_tensors"),
+    ):
+        proposer._dummy_draft_forward(
+            num_tokens=num_tokens, use_max_model_len=True, sync=False
+        )
+
+    kwargs = proposer._build_attn_metadata_for_draft.call_args.kwargs
+    num_reqs = num_tokens // 5
+    assert kwargs["num_reqs"] == kwargs["padded_num_reqs"] == num_reqs
+    assert kwargs["query_start_loc"].tolist() == [5 * r for r in range(num_reqs + 1)]
+    assert kwargs["request_distribution"].tolist() == [0, 0, num_reqs]
+    assert kwargs["seq_lens"].tolist() == [5] * num_reqs
+    # Same static tensors as the real draft forward's metadata.
+    assert kwargs["query_start_loc"] is proposer._get_static_attn_tensors(num_reqs)[0]
+    input_ids, positions, block = proposer._dflash_forward_and_sample.call_args.args
+    assert input_ids.shape == positions.shape == (num_tokens,)
+    assert block == 5
+
+
 @pytest.mark.parametrize("has_upstream_hook", [False, True])
 def test_tpu_precompute_context_kv(device, has_upstream_hook):
     # Setup dimension sizes

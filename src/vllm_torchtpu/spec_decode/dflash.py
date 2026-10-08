@@ -790,24 +790,20 @@ class DFlashProposer:
         input_ids = torch.zeros((num_tokens), dtype=torch.int32).to(runner.device)
         positions = torch.zeros(num_tokens, dtype=torch.int32).to(runner.device)
 
-        # Map actual request count based on block allocations; the guard
-        # above makes this >= 1.
+        # Lay the dummies out exactly like the real draft forward
+        # (_get_static_attn_tensors): request r owns rows
+        # [r * block_size, (r + 1) * block_size) and tail rows are padding.
+        # Stretching requests to num_tokens // num_reqs rows would let a
+        # non-causal block straddle two requests, which the shared-window
+        # attention (block > 1) can turn into NaN rows; under EP-DP lockstep
+        # this forward also runs while serving. The guard above makes it >= 1.
         actual_num_reqs = num_tokens // block_size
-
-        num_tokens_per_req = num_tokens // actual_num_reqs
-        query_lens = [num_tokens_per_req] * actual_num_reqs
-        query_start_loc = torch.cumsum(
-            torch.tensor([0] + query_lens, dtype=torch.int32), dim=0, dtype=torch.int32
-        ).to(runner.device)
-
-        seq_lens = (
-            torch.ones((actual_num_reqs,), dtype=torch.int32).to(runner.device)
-            * num_tokens_per_req
+        query_start_loc, request_distribution = self._get_static_attn_tensors(
+            actual_num_reqs
         )
-
-        request_distribution = torch.tensor(
-            [0, 0, actual_num_reqs], dtype=torch.int32
-        ).to(runner.device)
+        seq_lens = torch.full(
+            (actual_num_reqs,), block_size, dtype=torch.int32, device=runner.device
+        )
 
         per_layer_attn_metadata = self._build_attn_metadata_for_draft(
             num_reqs=actual_num_reqs,
