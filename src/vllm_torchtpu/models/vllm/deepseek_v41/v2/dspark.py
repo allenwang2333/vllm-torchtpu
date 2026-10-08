@@ -43,6 +43,7 @@ from ..common.mhc import (
 from . import attention as v2_attn
 from .attention import (
     DeepseekV41Attention,
+    _block_table,
     _cache_slots,
     _insert,
     _token_requests,
@@ -159,29 +160,64 @@ def _insert_context_kv(
         swa_slots = metadata
         swa_valid = swa_slots >= 0
     else:
+        rows_per_page = swa_cache.shape[1]
         slot_key = (
             "context_kv_slots",
-            id(metadata),
-            swa_cache.shape[1],
+            metadata.seq_lens.shape,
+            rows_per_page,
             attn.window_size,
         )
+        block_tables = getattr(metadata, "block_tables", None)
         cached_slots = stage_cache.get(slot_key) if stage_cache is not None else None
-        if cached_slots is not None:
-            swa_slots, swa_valid = cached_slots
+        if cached_slots is not None and cached_slots[0] is block_tables:
+            _, swa_slots, swa_valid, _, _ = cached_slots
         else:
-            swa_slots = _cache_slots(swa_cache, metadata, positions)
-            if metadata.seq_lens.numel() > 0:
+            if cached_slots is not None:
+                _, _, _, in_window, addr = cached_slots
+            elif metadata.seq_lens.numel() > 0:
                 requests = _token_requests(metadata, positions).clamp(
                     max=metadata.seq_lens.shape[0] - 1
                 )
                 offsets = positions - metadata.seq_lens[requests] + attn.window_size
-                swa_valid = (
-                    (swa_slots >= 0) & (offsets >= 0) & (offsets < attn.window_size)
+                in_window = (offsets >= 0) & (offsets < attn.window_size)
+                if block_tables is not None:
+                    table = _block_table(metadata)
+                    pos_col = (
+                        (positions // rows_per_page)
+                        .clamp(max=table.shape[1] - 1)
+                        .long()
+                    )
+                    pos_rem = positions % rows_per_page
+                    rows = torch.arange(positions.shape[0], device=positions.device)
+                    valid_token = rows < metadata.query_start_loc[-1]
+                    addr = (requests, pos_col, pos_rem, valid_token)
+                else:
+                    addr = None
+            else:
+                in_window = None
+                addr = None
+            if addr is not None:
+                table = _block_table(metadata)
+                requests, pos_col, pos_rem, valid_token = addr
+                blocks = table[requests, pos_col].long()
+                swa_slots = (blocks * rows_per_page + pos_rem).masked_fill(
+                    ~valid_token, -1
                 )
             else:
-                swa_valid = swa_slots >= 0
+                swa_slots = _cache_slots(swa_cache, metadata, positions)
+            swa_valid = (
+                (swa_slots >= 0) & in_window
+                if in_window is not None
+                else swa_slots >= 0
+            )
             if stage_cache is not None:
-                stage_cache[slot_key] = (swa_slots, swa_valid)
+                stage_cache[slot_key] = (
+                    block_tables,
+                    swa_slots,
+                    swa_valid,
+                    in_window,
+                    addr,
+                )
     _insert(swa_cache, swa_slots, kv, swa_valid)
 
 
@@ -214,6 +250,7 @@ class DSparkDeepseekV41Model(nn.Module):
         self.embed_tokens: nn.Module | None = None
         self._fused_context_wkv_weight: torch.Tensor | None = None
         self._fused_context_wkv_scale: torch.Tensor | None = None
+        self._fused_context_kv_norm_weight: torch.Tensor | None = None
 
         self.main_proj = ReplicatedLinear(
             config.hidden_size * len(self.target_layer_ids),
@@ -326,6 +363,9 @@ class DSparkDeepseekV41Model(nn.Module):
                 for layer in layers
             ]
             self._fused_context_wkv_scale = torch.cat(wkv_scales, dim=-1).contiguous()
+        self._fused_context_kv_norm_weight = torch.stack(
+            [layer.attn.kv_norm.weight.detach() for layer in layers], dim=0
+        ).contiguous()
 
     def finalize_mhc_broadcast_weights(self) -> None:
         layers = list(self.layers)
@@ -385,15 +425,20 @@ class DSparkDeepseekV41Model(nn.Module):
                     )
                 else:
                     all_kv_raw = torch.matmul(main_x, self._fused_context_wkv_weight)
-                kv_normed = torch.stack(
-                    [
-                        layer.attn.kv_norm(kv_s)
-                        for layer, kv_s in zip(
-                            layers, all_kv_raw.split(head_dim, dim=-1), strict=True
+                all_kv_3d = all_kv_raw.view(-1, len(layers), head_dim)
+                x_f32 = all_kv_3d.to(torch.float32)
+                w_norm = self._fused_context_kv_norm_weight
+                assert w_norm is not None
+                kv_normed = (
+                    (
+                        x_f32
+                        * torch.rsqrt(
+                            x_f32.pow(2).mean(dim=-1, keepdim=True)
+                            + layers[0].attn.kv_norm.variance_epsilon
                         )
-                    ],
-                    dim=1,
-                )
+                    ).to(w_norm.dtype)
+                    * w_norm
+                ).to(all_kv_3d.dtype)
                 kv_rotated = layers[0].attn._rotate(kv_normed, positions)
                 assert v2_attn._active_stage_attn_cache is not None
                 v2_attn._active_stage_attn_cache["context_kv_pre_rotated"] = True
