@@ -137,6 +137,21 @@ disk_monitor_pid=$!
     command = command.replace(
         benchmark_end, f'kill "$disk_monitor_pid" || true\n{benchmark_end}'
     )
+    launch_marker = (
+        "bash /tmp/tpu_logs/repro/run-c1-prefill.sh /workspace/vllm-torchtpu"
+    )
+    if command.count(launch_marker) != 1:
+        raise ValueError("Baseline benchmark launch marker changed")
+    stage = f"""static_stage=/tmp/tpu_logs/static-moe
+mkdir -p "$static_stage"
+echo "STATIC_MOE_STAGE_START $(date -Is)"
+cp {MODEL_MOUNT}/config.json {MODEL_MOUNT}/STATIC_MOE_READY.json \\
+  {MODEL_MOUNT}/tpu-static-moe.json "$static_stage/"
+cp -a {MODEL_MOUNT}/prepared-weights "$static_stage/"
+export TPU_DSV41_STATIC_MOE_DIR="$static_stage"
+echo "STATIC_MOE_STAGE_END $(date -Is)"
+"""
+    command = command.replace(launch_marker, stage + launch_marker)
     task["command"] = command
     return {
         "name": f"dsv41-100k-prefill-c1-static-moe-{source_commit[:10]}",
@@ -154,6 +169,7 @@ disk_monitor_pid=$!
                 "concurrency": 1,
                 "compile_sizes": [2048, 8192],
                 "static_moe": True,
+                "static_moe_stage": "/tmp/tpu_logs/static-moe",
                 "dense_online_requant": True,
             }
         ),
