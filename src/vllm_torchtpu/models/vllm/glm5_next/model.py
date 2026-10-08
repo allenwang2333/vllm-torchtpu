@@ -50,7 +50,7 @@ from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 from vllm.model_executor.offloader import NoopOffloader, set_offloader
 from vllm.sequence import IntermediateTensors
 
-from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
     MHCOps, get_mhc_ops, get_mhc_post_op)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.model import _HostStagedParams
@@ -231,6 +231,10 @@ class Glm5NextModel(nn.Module):
         if not dense_dsa_fallback() and getattr(config, "index_topk", 0):
             width = config.index_topk + (config.index_kpool - 1 if getattr(
                 config, "index_kpool_always_select_tail", False) else 0)
+            # The sparse MLA kernel packs indices four at a time on the
+            # SparseCore. Rows are left-packed and the indexer -1-fills the
+            # whole row before writing, so the padding columns read as unused.
+            width = -(-width // 4) * 4
             self.topk_indices_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 width,

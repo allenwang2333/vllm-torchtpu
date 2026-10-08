@@ -61,7 +61,7 @@ from vllm.model_executor.layers.mla import MLAModules
 # `cls.__name__`, so a subclass of the in-tree base is *not* redirected: it
 # would build the CUDA `MLAAttention`, which on TPU dies importing the
 # FlashAttention MLA prefill backend.
-from vllm_torchtpu.layers.vllm.custom_ops.mla_attention_op import \
+from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import \
     VllmTPUMultiHeadLatentAttentionWrapper
 from vllm_torchtpu.models.vllm.glm5_next.indexer import Glm5NextIndexer
 from vllm_torchtpu.models.vllm.kimi_k3.attention import (KimiDeltaAttention,

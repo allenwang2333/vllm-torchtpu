@@ -99,11 +99,7 @@ class Glm5NextMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         org_shape = hidden_states.shape
-        if self.experts.is_internal_router:
-            out = self.experts(hidden_states=hidden_states,
-                               router_logits=hidden_states)
-        else:
-            router_logits, _ = self.gate(hidden_states)
-            out = self.experts(hidden_states=hidden_states,
-                               router_logits=router_logits)
+        # FusedMoEFactory gives the runner our gate, so it computes the logits.
+        out = self.experts(hidden_states=hidden_states,
+                           router_logits=hidden_states)
         return out.view(org_shape)

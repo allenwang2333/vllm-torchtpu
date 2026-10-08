@@ -54,9 +54,9 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 
-from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.vllm.attention import \
-    VllmTPUDeepseekV32IndexerBackend
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.adapter.attention import (
+    PallasMLAttentionBackend, VllmTPUDeepseekV32IndexerBackend)
 
 
 def dense_dsa_fallback() -> bool:
@@ -67,6 +67,40 @@ def dense_dsa_fallback() -> bool:
     run the same prompt both ways at >2048 tokens and diff the output.
     """
     return os.environ.get("GLM53_DENSE_DSA", "0") == "1"
+
+
+class Glm5NextIndexerBackend(VllmTPUDeepseekV32IndexerBackend):
+    """Plain bf16 rows in the MLA layout, not DeepSeek's packed uint8 rows.
+
+    The parent sizes a packed fp8 + scale layout; ours is ``[k | gate]`` bf16
+    and the scoring op reads it as ``[blocks, bs/4, 4, 2 * head_dim]``, which is
+    exactly the MLA latent cache shape. Answering with the MLA formulas also
+    covers the hybrid page accounting: ``_find_non_ssm_backend`` returns the
+    first non-SSM layer's backend, and an indexer registers before its
+    ``mla_attn`` sibling, so these hooks are asked for the MLA page size too.
+    """
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> tuple[int, ...]:
+        return PallasMLAttentionBackend.get_kv_cache_shape(
+            num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str)
+
+    @classmethod
+    def get_kv_cache_page_size_bytes(
+        cls,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> int:
+        return PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            block_size, num_kv_heads, head_size, cache_dtype_str)
 
 
 class Glm5NextIndexerCache(DeepseekV32IndexerCache):
@@ -98,8 +132,8 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
     # kv-dtype normalization (`fixed_dtype_layers` in `get_kv_cache_spec`).
     kv_dtype_is_fixed = True
 
-    def get_attn_backend(self) -> type[VllmTPUDeepseekV32IndexerBackend]:
-        return VllmTPUDeepseekV32IndexerBackend
+    def get_attn_backend(self) -> type[Glm5NextIndexerBackend]:
+        return Glm5NextIndexerBackend
 
 
 # How large an intermediate the pool-scoring step may materialise before it
