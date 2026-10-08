@@ -672,28 +672,45 @@ class TestFusedSwaDriver:
 
     def test_sparse_fp8_attention_jax_keeps_prefill_path(self):
         for tokens, want_chunk in ((128, 128), (192, 192), (256, 128)):
-            a = self._jax_args(tokens=tokens, width=64)
-            with (
-                mock.patch(
-                    "vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla.sparse_ragged_paged_attention",
-                    return_value=a["q"],
-                ) as plain,
-                mock.patch.object(
-                    attention_kernels, "fused_swa_inputs", side_effect=AssertionError
-                ),
-            ):
-                out = attention_kernels.sparse_fp8_attention_jax(
-                    *a.values(),
-                    scale=0.125,
-                    page_size=16,
-                    max_requests=48,
-                    fused_swa=True,
-                )
-            assert out is a["q"]
-            plain.assert_called_once()
-            assert (
-                plain.call_args.kwargs["gather_and_attention_chunk_size"] == want_chunk
-            )
+            for union_gather in (False, True):
+                a = self._jax_args(tokens=tokens, width=64)
+                with (
+                    mock.patch(
+                        "vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla.sparse_ragged_paged_attention",
+                        return_value=a["q"],
+                    ) as plain,
+                    mock.patch.object(
+                        attention_kernels,
+                        "sparse_ragged_paged_attention_union_gather",
+                        return_value=a["q"],
+                    ) as union,
+                    mock.patch.object(
+                        attention_kernels,
+                        "fused_swa_inputs",
+                        side_effect=AssertionError,
+                    ),
+                ):
+                    out = attention_kernels.sparse_fp8_attention_jax(
+                        *a.values(),
+                        scale=0.125,
+                        page_size=16,
+                        max_requests=48,
+                        union_gather=union_gather,
+                        fused_swa=True,
+                    )
+                assert out is a["q"]
+                if union_gather:
+                    union.assert_called_once()
+                    assert (
+                        union.call_args.kwargs["gather_and_attention_chunk_size"]
+                        == want_chunk
+                    )
+                else:
+                    plain.assert_called_once()
+                    assert (
+                        plain.call_args.kwargs["gather_and_attention_chunk_size"]
+                        == want_chunk
+                    )
 
 
 # ==============================================================================
