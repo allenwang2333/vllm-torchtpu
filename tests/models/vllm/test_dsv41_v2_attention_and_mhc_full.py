@@ -117,22 +117,22 @@ class TestCommonMHCFull:
         assert post2.shape == (tokens, mult, 1)
 
     def test_flat_pre_sums_and_delayed_pre_flat_jax(self, monkeypatch):
-        # 1. tokens < 64 -> takes delayed_pre_jax path
+        # 1. tokens < 16 -> takes delayed_pre_jax path
         mult, dim = 4, 8
         mixes = mult * (mult + 2)
-        flat_small = jnp.ones((32, mult * dim), dtype=jnp.bfloat16)
+        flat_small = jnp.ones((8, mult * dim), dtype=jnp.bfloat16)
         fn_f32 = jnp.ones((mixes, mult * dim), dtype=jnp.float32)
         scale = jnp.ones(3, dtype=jnp.float32)
         base = jnp.zeros(mixes, dtype=jnp.float32)
-        prev_pre_small = jnp.ones((32, mult), dtype=jnp.float32)
+        prev_pre_small = jnp.ones((8, mult), dtype=jnp.float32)
         constants = (1e-6, 1e-6, 1e-6, 2.0, 5)
 
         p1, c1, v1, np1 = mhc.delayed_pre_flat_jax(
             flat_small, fn_f32, scale, base, prev_pre_small, *constants
         )
-        assert p1.shape == (32, mult, 1)
+        assert p1.shape == (8, mult, 1)
 
-        # 2. tokens >= 64 with mock pallas_call to execute kernel
+        # 2. tokens >= 16 and tokens % 8 == 0 with mock pallas_call to execute kernel
         captured_kernel_calls = []
 
         class MockRef:
@@ -200,30 +200,54 @@ class TestCommonMHCFull:
         assert p128.shape == (128, mult, 1)
         assert len(captured_kernel_calls) == 1
 
-        # Case B: tokens = 64 (tokens % 128 != 0 -> tile = 64), fn is FP32
-        flat_64 = jnp.ones((64, mult * dim), dtype=jnp.bfloat16)
-        prev_64 = jnp.ones((64, mult), dtype=jnp.float32)
+        # Case B: tokens = 64, 96, 256, 1024, fn is FP32
+        for t_pallas in (64, 96, 256, 1024):
+            flat_p = jnp.ones((t_pallas, mult * dim), dtype=jnp.bfloat16)
+            prev_p = jnp.ones((t_pallas, mult), dtype=jnp.float32)
+            pp, _, _, _ = mhc.delayed_pre_flat_jax(
+                flat_p, fn_f32, scale, base, prev_p, *constants
+            )
+            assert pp.shape == (t_pallas, mult, 1)
+        assert len(captured_kernel_calls) == 5
 
-        p64, c64, v64, np64 = mhc.delayed_pre_flat_jax(
-            flat_64, fn_f32, scale, base, prev_64, *constants
+        # Case C: tokens = 16, 24, 144, 192, 288, 384, 512 take XLA path
+        for t_case in (16, 24, 144, 192, 288, 384, 512):
+            flat_t = jnp.ones((t_case, mult * dim), dtype=jnp.bfloat16)
+            prev_t = jnp.ones((t_case, mult), dtype=jnp.float32)
+            pt, _, _, _ = mhc.delayed_pre_flat_jax(
+                flat_t, fn_bf16, scale, base, prev_t, *constants
+            )
+            assert pt.shape == (t_case, mult, 1)
+        assert len(captured_kernel_calls) == 5
+
+        # Case D: mult != 4 in _collapse_flat (e.g. mult = 2)
+        flat_m2 = jnp.ones((8, 2 * dim), dtype=jnp.bfloat16)
+        fn_m2 = jnp.ones((2 * 4, 2 * dim), dtype=jnp.float32)
+        base_m2 = jnp.zeros(2 * 4, dtype=jnp.float32)
+        prev_m2 = jnp.ones((8, 2), dtype=jnp.float32)
+        pm2, _, _, _ = mhc.delayed_pre_flat_jax(
+            flat_m2, fn_m2, scale, base_m2, prev_m2, *constants
         )
-        assert p64.shape == (64, mult, 1)
-        assert len(captured_kernel_calls) == 2
+        assert pm2.shape == (8, 2, 1)
 
     def test_flat_post_pre_sums_and_delayed_post_pre_flat_jax(self, monkeypatch):
         mult, dim = 4, 8
         mixes = mult * (mult + 2)
-        x_small = jnp.ones((32, dim), dtype=jnp.bfloat16)
-        flat_small = jnp.ones((32, mult * dim), dtype=jnp.bfloat16)
-        post_small = jnp.ones((32, mult, 1), dtype=jnp.float32)
-        comb_small = jnp.ones((32, mult, mult), dtype=jnp.float32)
+        x_small = jnp.ones((8, dim), dtype=jnp.bfloat16)
+        flat_small = jnp.ones((8, mult * dim), dtype=jnp.bfloat16)
+        post_small = jnp.ones((8, mult, 1), dtype=jnp.float32)
+        comb_small = jnp.ones((8, mult, mult), dtype=jnp.float32)
         fn_f32 = jnp.ones((mixes, mult * dim), dtype=jnp.float32)
         scale = jnp.ones(3, dtype=jnp.float32)
         base = jnp.zeros(mixes, dtype=jnp.float32)
-        prev_pre_small = jnp.ones((32, mult), dtype=jnp.float32)
+        prev_pre_small = jnp.ones((8, mult), dtype=jnp.float32)
         constants = (1e-6, 1e-6, 1e-6, 2.0, 5)
 
-        # 1. tokens < 64 -> takes _post_jax + delayed_pre_jax path
+        # 0. Direct _post_jax check
+        post_out = mhc._post_jax(x_small, flat_small, post_small, comb_small)
+        assert post_out.shape == (8, mult * dim)
+
+        # 1. tokens < 64 -> takes _post_and_collapse_jax + delayed_pre_jax path
         f1, p1, c1, v1, np1 = mhc.delayed_post_pre_flat_jax(
             x_small,
             flat_small,
@@ -235,10 +259,25 @@ class TestCommonMHCFull:
             prev_pre_small,
             *constants,
         )
-        assert f1.shape == (32, mult * dim)
-        assert p1.shape == (32, mult, 1)
+        assert f1.shape == (8, mult * dim)
+        assert p1.shape == (8, mult, 1)
 
-        # 2. tokens >= 64 with mock pallas_call to execute _flat_post_pre_sums kernel
+        # 1b. mult != 4 in _post_and_collapse_jax (e.g. mult = 2)
+        fm2, pm2, _, _, _ = mhc.delayed_post_pre_flat_jax(
+            x_small,
+            jnp.ones((8, 2 * dim), dtype=jnp.bfloat16),
+            jnp.ones((8, 2, 1), dtype=jnp.float32),
+            jnp.ones((8, 2, 2), dtype=jnp.float32),
+            jnp.ones((2 * 4, 2 * dim), dtype=jnp.float32),
+            scale,
+            jnp.zeros(2 * 4, dtype=jnp.float32),
+            jnp.ones((8, 2), dtype=jnp.float32),
+            *constants,
+        )
+        assert fm2.shape == (8, 2 * dim)
+        assert pm2.shape == (8, 2, 1)
+
+        # 2. Pallas path (tokens in (64, 96, 128, 256) or >= 1024) with mock pallas_call
         captured_kernel_calls = []
 
         class MockRef:
@@ -342,27 +381,39 @@ class TestCommonMHCFull:
         assert p128.shape == (128, mult, 1)
         assert len(captured_kernel_calls) == 1
 
-        # Case B: tokens = 64 (tile = 64), fn is FP32
-        x_64 = jnp.ones((64, dim), dtype=jnp.bfloat16)
-        flat_64 = jnp.ones((64, mult * dim), dtype=jnp.bfloat16)
-        post_64 = jnp.ones((64, mult, 1), dtype=jnp.float32)
-        comb_64 = jnp.ones((64, mult, mult), dtype=jnp.float32)
-        prev_64 = jnp.ones((64, mult), dtype=jnp.float32)
+        # Case B: tokens = 64, 96, 256, 1024, fn is FP32
+        for t_pallas in (64, 96, 256, 1024):
+            fp, pp, _, _, _ = mhc.delayed_post_pre_flat_jax(
+                jnp.ones((t_pallas, dim), dtype=jnp.bfloat16),
+                jnp.ones((t_pallas, mult * dim), dtype=jnp.bfloat16),
+                jnp.ones((t_pallas, mult, 1), dtype=jnp.float32),
+                jnp.ones((t_pallas, mult, mult), dtype=jnp.float32),
+                fn_f32,
+                scale,
+                base,
+                jnp.ones((t_pallas, mult), dtype=jnp.float32),
+                *constants,
+            )
+            assert fp.shape == (t_pallas, mult * dim)
+            assert pp.shape == (t_pallas, mult, 1)
+        assert len(captured_kernel_calls) == 5
 
-        f64, p64, c64, v64, np64 = mhc.delayed_post_pre_flat_jax(
-            x_64,
-            flat_64,
-            post_64,
-            comb_64,
-            fn_f32,
-            scale,
-            base,
-            prev_64,
-            *constants,
-        )
-        assert f64.shape == (64, mult * dim)
-        assert p64.shape == (64, mult, 1)
-        assert len(captured_kernel_calls) == 2
+        # Case C: tokens = 16, 24, 144, 192, 288, 384, 512 take XLA path
+        for t_case in (16, 24, 144, 192, 288, 384, 512):
+            ft, pt, _, _, _ = mhc.delayed_post_pre_flat_jax(
+                jnp.ones((t_case, dim), dtype=jnp.bfloat16),
+                jnp.ones((t_case, mult * dim), dtype=jnp.bfloat16),
+                jnp.ones((t_case, mult, 1), dtype=jnp.float32),
+                jnp.ones((t_case, mult, mult), dtype=jnp.float32),
+                fn_bf16,
+                scale,
+                base,
+                jnp.ones((t_case, mult), dtype=jnp.float32),
+                *constants,
+            )
+            assert ft.shape == (t_case, mult * dim)
+            assert pt.shape == (t_case, mult, 1)
+        assert len(captured_kernel_calls) == 5
 
     def test_initialize_delayed_mhc_and_fakes(self, monkeypatch):
         monkeypatch.setattr(mhc, "_pre_op", None)

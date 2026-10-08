@@ -644,10 +644,18 @@ class TestSwaTokenAddressingAndFastOffsets:
             assert len(captured_records) == 1
             recs1 = captured_records[0]
 
-            # Hit
+            # Hit (same swa_meta.block_tables object -> reuses cached_swa_slots)
             attn_3page_fast._prepare_tpu(None, qr, kv, None, None, None, positions, out)
             assert len(captured_records) == 2
             assert torch.equal(captured_records[1], recs1)
+
+            # Different swa_meta.block_tables tensor -> hits cached_swa geometry
+            # but invalidates cached_swa_slots and recomputes records for new blocks
+            swa_meta.block_tables = swa_table + 100
+            attn_3page_fast._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+            assert len(captured_records) == 3
+            assert not torch.equal(captured_records[2], recs1)
+            swa_meta.block_tables = swa_table
 
         # 2. use_3page_swa=True, has_fast_swa_offset=False (row_indices branch)
         captured_records.clear()

@@ -294,6 +294,22 @@ def test_mxfp4_and_clamped_activations_admitted(m, activation):
         rhs_quant_dtype=jnp.float4_e2m1fn,
         skip_padded_tokens=False,
     )
+    unpacked_shapes = (
+        jax.ShapeDtypeStruct((m, 5120), jnp.bfloat16),
+        jax.ShapeDtypeStruct((48, 5120, 2 * 2560), jnp.float4_e2m1fn),
+        jax.ShapeDtypeStruct((48, 2560, 5120), jnp.float4_e2m1fn),
+        jax.ShapeDtypeStruct((48, 5120 // 512, 1, 2 * 2560), jnp.float32),
+        jax.ShapeDtypeStruct((48, 2560 // 512, 1, 5120), jnp.float32),
+    )
+    for quant_dtype in (None, jnp.float4_e2m1fn):
+        assert kernel.can_use_dense_expert(
+            *unpacked_shapes,
+            None,
+            None,
+            activation=activation,
+            rhs_quant_dtype=quant_dtype,
+            skip_padded_tokens=False,
+        )
     assert (
         kernel._select_expert_buffers(
             max(16, m), 5120, 2560, 48, 64 * 1024**2, 2, 10, 5
@@ -378,11 +394,80 @@ def test_mxfp4_block_scales_match_reference(m, activation, monkeypatch):
             ),
             dtype=np.float32,
         )
+        actual_unpacked = np.asarray(
+            kernel.dense_expert_moe(
+                x,
+                w1_fp4,
+                w2_fp4,
+                s1,
+                s2,
+                weights,
+                ids,
+                activation=activation,
+                rhs_quant_dtype=jnp.float4_e2m1fn,
+            ),
+            dtype=np.float32,
+        )
     finally:
         kernel.dense_expert_moe.clear_cache()
     assert np.isfinite(actual).all()
+    np.testing.assert_array_equal(actual_unpacked, actual)
     relative_l2 = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
     assert relative_l2 < 0.008, relative_l2
+
+
+def test_dense_expert_moe_single_buffer_schedule(monkeypatch):
+    """Verify single-buffer schedule (num_buffers == 1) inline transfers
+    and no-prefetch branch.
+    """
+    if jax.default_backend() != "cpu":
+        pytest.skip("CPU Pallas interpreter; run with JAX_PLATFORMS=cpu")
+    from vllm_torchtpu.layers.core.fused_moe_gmm import quantize_to_native_fp4_kmajor
+
+    h, i, e = 512, 512, 2
+    m = 4
+    rng = np.random.default_rng(20261008)
+    x = jnp.asarray(rng.normal(size=(m, h)), jnp.bfloat16)
+    w1_f32 = jnp.asarray(rng.normal(scale=0.1, size=(e, h, 2 * i)), jnp.float32)
+    w2_f32 = jnp.asarray(rng.normal(scale=0.1, size=(e, i, h)), jnp.float32)
+    w1, s1 = quantize_to_native_fp4_kmajor(w1_f32, block=512, pack=True)
+    w2, s2 = quantize_to_native_fp4_kmajor(w2_f32, block=512, pack=True)
+
+    route = [0, 1]
+    ids = jnp.asarray(np.tile(route, (m, 1)), jnp.int32)
+    weights = jnp.asarray(np.tile([0.5, 0.5], (m, 1)), jnp.bfloat16)
+
+    monkeypatch.setattr(
+        kernel.pl,
+        "pallas_call",
+        functools.partial(kernel.pl.pallas_call, interpret=True),
+    )
+    monkeypatch.setattr(
+        kernel.pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(vmem_capacity_bytes=64 * 1024**2),
+    )
+    monkeypatch.setattr(
+        kernel,
+        "_select_expert_buffers",
+        lambda *args, **kwargs: 1,
+    )
+    kernel.dense_expert_moe.clear_cache()
+    try:
+        out = kernel.dense_expert_moe(
+            x,
+            w1,
+            w2,
+            s1,
+            s2,
+            weights,
+            ids,
+            activation="silu_and_mul_with_clamp",
+            rhs_quant_dtype=jnp.float4_e2m1fn,
+        )
+        assert np.isfinite(np.asarray(out)).all()
+    finally:
+        kernel.dense_expert_moe.clear_cache()
 
 
 def test_packing_factor_and_activation_edge_cases(monkeypatch):

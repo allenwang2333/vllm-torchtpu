@@ -140,7 +140,9 @@ def test_torch_and_jax_packing_agree():
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("tokens", [1, 8, 63, 100])
+@pytest.mark.parametrize(
+    "tokens", [1, 8, 16, 24, 32, 48, 63, 100, 144, 192, 288, 384, 512]
+)
 def test_xla_path_matches_torch_reference(tokens, packed):
     """Token counts the Pallas pass does not take."""
     _check(tokens, 256, packed)
@@ -148,7 +150,16 @@ def test_xla_path_matches_torch_reference(tokens, packed):
 
 
 @pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("tokens,dim", [(64, 256), (192, 256), (128, 5120)])
+@pytest.mark.parametrize(
+    "tokens,dim",
+    [
+        (64, 256),
+        (96, 256),
+        (256, 256),
+        (1024, 256),
+        (128, 5120),
+    ],
+)
 def test_pallas_path_matches_torch_reference(tokens, dim, packed):
     if jax.default_backend() != "tpu":
         pytest.skip("Pallas TPU kernel needs TPU hardware")

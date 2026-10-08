@@ -203,6 +203,18 @@ class TestIndexPageRecords:
         cache = PagedCacheRows(raw, layout)
         assert _index_page_records(cache) == 16
 
+    def test_2bank_lo_rows_alignment(self):
+        """2-bank cache returns per_page if lo_rows*per_row % per_page == 0, else 0."""
+        raw_lo_aligned = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
+        raw_hi = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
+        layout = ((4, 16, 128), torch.bfloat16, 32 * 256, 0)
+        cache_aligned = PagedCacheRows((raw_lo_aligned, raw_hi), layout)
+        assert _index_page_records(cache_aligned) == 16
+
+        raw_lo_unaligned = torch.zeros((5, ROW_WORDS), dtype=torch.int32)
+        cache_unaligned = PagedCacheRows((raw_lo_unaligned, raw_hi), layout)
+        assert _index_page_records(cache_unaligned) == 0
+
 
 class TestAttentionKernelsDecodeIndexer:
     """Coverage for v2/attention_kernels.py / changes."""
@@ -298,14 +310,14 @@ class TestAttentionKernelsDecodeIndexer:
         pool = jnp.zeros((64, ROW_WORDS), dtype=jnp.int32)
 
         # Branch 1a: requests is not None, tokens <= records.shape[0],
-        # tokens >= 6 and tokens % 6 == 0 (grouped branch)
-        q_dec = jnp.zeros((6, heads, dim), dtype=jnp.bfloat16)
-        records_dec = jnp.full((8, 256), -1, dtype=jnp.int32)
-        weights_dec = jnp.zeros((6, heads), dtype=jnp.float32)
-        lengths_dec = jnp.full((6,), 10, dtype=jnp.int32)
-        requests_dec = jnp.zeros((6,), dtype=jnp.int32)
+        # tokens >= 6 and tokens % 6 == 0 (grouped branch with tokens=6 and tokens=18)
+        q_dec = jnp.zeros((18, heads, dim), dtype=jnp.bfloat16)
+        records_dec = jnp.full((24, 256), -1, dtype=jnp.int32)
+        weights_dec = jnp.zeros((18, heads), dtype=jnp.float32)
+        lengths_dec = jnp.full((18,), 10, dtype=jnp.int32)
+        requests_dec = jnp.zeros((18,), dtype=jnp.int32)
 
-        res_dec = paged_index_scores_jax(
+        res_dec_18 = paged_index_scores_jax(
             q_dec,
             pool,
             records_dec,
@@ -314,10 +326,21 @@ class TestAttentionKernelsDecodeIndexer:
             requests=requests_dec,
             page_records=16,
         )
+        assert res_dec_18.shape == (18, 256)
+
+        res_dec = paged_index_scores_jax(
+            q_dec[:6],
+            pool,
+            records_dec,
+            weights_dec[:6],
+            lengths_dec[:6],
+            requests=requests_dec[:6],
+            page_records=16,
+        )
         assert res_dec.shape == (6, 256)
 
         # Branch 1b: requests is not None, tokens <= records.shape[0],
-        # tokens not divisible by 6 (tokens = 2)
+        # tokens not divisible by 6 (tokens = 2 and tokens = 7)
         res_dec_2 = paged_index_scores_jax(
             q_dec[:2],
             pool,
@@ -328,6 +351,17 @@ class TestAttentionKernelsDecodeIndexer:
             page_records=16,
         )
         assert res_dec_2.shape == (2, 256)
+
+        res_dec_7 = paged_index_scores_jax(
+            q_dec[:7],
+            pool,
+            records_dec,
+            weights_dec[:7],
+            lengths_dec[:7],
+            requests=requests_dec[:7],
+            page_records=16,
+        )
+        assert res_dec_7.shape == (7, 256)
 
         # Branch 2: requests is not None and tokens > records.shape[0]
         # (prefill row_step loop)
@@ -893,3 +927,32 @@ class TestAttentionSelectPagedIndicesDecode:
             )
             assert sel2.shape == (count, 4)
             assert call_count == 2
+
+            # Call 3: 2-bank PagedCacheRows returning (lo, hi) tuple
+            raw_lo = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
+            raw_hi = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
+            layout = ((4, 16, 128), torch.bfloat16, 32 * 256, 0)
+            index_cache_2b = PagedCacheRows((raw_lo, raw_hi), layout)
+            monkeypatch.setattr(
+                v2_attn,
+                "paged_indexer",
+                lambda q_part, idx_c, *a, **kw: (
+                    (torch.ones_like(raw_lo), torch.full_like(raw_hi, 2)),
+                    torch.zeros(q_part.shape[0], 4, dtype=torch.int32),
+                    a[3],
+                ),
+            )
+            sel3 = attn._select_paged_indices(
+                qr,
+                positions,
+                index_cache_2b,
+                records,
+                requests,
+                weights,
+                lengths,
+                swa_slots,
+                None,
+            )
+            assert sel3.shape == (count, 4)
+            assert torch.all(index_cache_2b.raw == 1)
+            assert torch.all(index_cache_2b.raw_hi == 2)

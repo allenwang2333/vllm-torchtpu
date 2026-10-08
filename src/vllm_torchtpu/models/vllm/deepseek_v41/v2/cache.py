@@ -25,6 +25,10 @@ ROPE_WORDS = 32
 # not exceed 16 GiB (1 << 34 = 17,179,869,184 bytes). Leave 64 MiB of page
 # alignment headroom below 16 GiB when sizing the shared backing pool.
 SPARSECORE_MAX_POOL_BYTES = (16 << 30) - (64 << 20)
+SPARSECORE_MAX_POOL_BANKS = 2
+SPARSECORE_MIN_SECOND_BANK_BYTES = SPARSECORE_MAX_POOL_BYTES // 4
+
+RawCachePool = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
 
 def uses_fp8_rope_companion(vllm_config) -> bool:
@@ -34,19 +38,25 @@ def uses_fp8_rope_companion(vllm_config) -> bool:
 
 
 def reserve_rope_companion(vllm_config, available: int) -> int:
-    """Leave room for the RoPE companion and cap at SparseCore's 16 GiB tensor limit."""
+    """Leave room for the RoPE companion and cap at SparseCore's 2-bank pool limit."""
     if not uses_fp8_rope_companion(vllm_config):
         return available
-    return min(available * 4 // 5, SPARSECORE_MAX_POOL_BYTES)
+    main_budget = available * 4 // 5
+    if main_budget < SPARSECORE_MAX_POOL_BYTES + SPARSECORE_MIN_SECOND_BANK_BYTES:
+        return min(main_budget, SPARSECORE_MAX_POOL_BYTES)
+    return min(
+        main_budget,
+        SPARSECORE_MAX_POOL_BANKS * SPARSECORE_MAX_POOL_BYTES,
+    )
 
 
 @dataclass
 class MaterializedNativeKVCache:
     kv_caches: dict[str, torch.Tensor]
     raw_tensors: list[torch.Tensor]
-    native_raw_cache: dict[str, torch.Tensor] = field(default_factory=dict)
+    native_raw_cache: dict[str, RawCachePool] = field(default_factory=dict)
     native_cache_layouts: dict[str, tuple] = field(default_factory=dict)
-    rope_pools: dict[str, torch.Tensor] = field(default_factory=dict)
+    rope_pools: dict[str, RawCachePool] = field(default_factory=dict)
 
 
 def native_cache_view(raw, shape, dtype, block_stride_bytes, offset_bytes):
@@ -93,51 +103,112 @@ def materialize_upstream_kv_cache(
     # entire pool on every read, even when only a few rows are requested.
     if word_rows:
         assert pool_bytes % ROW_BYTES == 0, pool_bytes
-    raw_tensors = [
-        torch.zeros(
-            (pool_bytes // ROW_BYTES, ROW_WORDS) if word_rows else (pool_bytes,),
-            dtype=torch.int32 if word_rows else torch.int8,
-            device=device,
-        )
-        for _ in range(backing_bytes // pool_bytes)
-    ]
+    num_pools = backing_bytes // pool_bytes
+    split_banks = word_rows and pool_bytes > SPARSECORE_MAX_POOL_BYTES
+    if split_banks:
+        num_blocks = kv_cache_config.num_blocks
+        block_stride_bytes = pool_bytes // num_blocks
+        block_rows = block_stride_bytes // ROW_BYTES
+        lo_blocks = SPARSECORE_MAX_POOL_BYTES // block_stride_bytes
+        hi_blocks = num_blocks - lo_blocks
+        lo_rows = lo_blocks * block_rows
+        hi_rows = hi_blocks * block_rows
+        assert max(lo_rows, hi_rows) * ROW_BYTES <= SPARSECORE_MAX_POOL_BYTES
+        pool_owners: list[RawCachePool] = [
+            (
+                torch.zeros((lo_rows, ROW_WORDS), dtype=torch.int32, device=device),
+                torch.zeros((hi_rows, ROW_WORDS), dtype=torch.int32, device=device),
+            )
+            for _ in range(num_pools)
+        ]
+        raw_tensors = [
+            bank
+            for pair in cast(list[tuple[torch.Tensor, torch.Tensor]], pool_owners)
+            for bank in pair
+        ]
+    else:
+        raw_tensors = [
+            torch.zeros(
+                (pool_bytes // ROW_BYTES, ROW_WORDS) if word_rows else (pool_bytes,),
+                dtype=torch.int32 if word_rows else torch.int8,
+                device=device,
+            )
+            for _ in range(num_pools)
+        ]
+        pool_owners = list(raw_tensors)
     caches = {}
-    native_raw_cache = {}
+    native_raw_cache: dict[str, RawCachePool] = {}
     native_cache_layouts = {}
     for name, view in views.items():
         assert view.ndim == 4 and view.shape[1] == 1
         assert view.stride(-1) == 1 and view.stride(-2) == view.shape[-1]
         itemsize = view.element_size()
         pool_index = pool_indices[name]
-        native_raw_cache[name] = raw_tensors[pool_index]
+        stride_bytes = view.stride(0) * itemsize
+        offset_bytes = view.storage_offset() * itemsize - pool_index * pool_bytes
+        owner = pool_owners[pool_index]
+        native_raw_cache[name] = owner
         native_cache_layouts[name] = (
             (view.shape[0], *view.shape[2:]),
             view.dtype,
-            view.stride(0) * itemsize,
-            view.storage_offset() * itemsize - pool_index * pool_bytes,
+            stride_bytes,
+            offset_bytes,
         )
-        caches[name] = native_cache_view(
-            raw_tensors[pool_index].view(torch.int8).flatten(),
-            tuple(view.shape),
-            view.dtype,
-            view.stride(0) * itemsize,
-            view.storage_offset() * itemsize - pool_index * pool_bytes,
-        )
+        if isinstance(owner, tuple):
+            single_page = native_cache_view(
+                owner[0].view(torch.int8).flatten(),
+                (1, *view.shape[1:]),
+                view.dtype,
+                stride_bytes,
+                offset_bytes % stride_bytes,
+            )
+            caches[name] = single_page.expand(tuple(view.shape))
+        else:
+            caches[name] = native_cache_view(
+                owner.view(torch.int8).flatten(),
+                tuple(view.shape),
+                view.dtype,
+                stride_bytes,
+                offset_bytes,
+            )
     # FP8 NoPE layers (uint8 records) keep RoPE in a companion with one
     # 32-word slot per pool row, budgeted by `reserve_rope_companion`.
     fp8_layers = [name for name, view in views.items() if view.dtype == torch.uint8]
-    rope_pools = {}
+    rope_pools: dict[str, RawCachePool] = {}
     if fp8_layers:
         assert word_rows
-        companions = [
-            torch.zeros(
-                (raw.shape[0] * ROPE_WORDS // ROW_WORDS, ROW_WORDS),
-                dtype=torch.int32,
-                device=device,
-            )
-            for raw in raw_tensors
-        ]
-        rope_pools = {name: companions[pool_indices[name]] for name in fp8_layers}
+        if split_banks:
+            rope_owners: list[RawCachePool] = [
+                (
+                    torch.zeros(
+                        (pair[0].shape[0] * ROPE_WORDS // ROW_WORDS, ROW_WORDS),
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                    torch.zeros(
+                        (pair[1].shape[0] * ROPE_WORDS // ROW_WORDS, ROW_WORDS),
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                )
+                for pair in cast(list[tuple[torch.Tensor, torch.Tensor]], pool_owners)
+            ]
+            companions = [
+                bank
+                for pair in cast(list[tuple[torch.Tensor, torch.Tensor]], rope_owners)
+                for bank in pair
+            ]
+        else:
+            companions = [
+                torch.zeros(
+                    (raw.shape[0] * ROPE_WORDS // ROW_WORDS, ROW_WORDS),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                for raw in raw_tensors
+            ]
+            rope_owners = list(companions)
+        rope_pools = {name: rope_owners[pool_indices[name]] for name in fp8_layers}
         raw_tensors = raw_tensors + companions
     return MaterializedNativeKVCache(
         kv_caches=caches,
@@ -149,6 +220,7 @@ def materialize_upstream_kv_cache(
 
 
 _read_values_op = None
+_read_values_2bank_op = None
 _write_op = None
 _write_values_op = None
 _write_values_after_op = None
@@ -168,31 +240,64 @@ class PagedCacheRows:
     """
 
     def __init__(self, raw, layout, rope=None):
-        self.raw = raw
-        self.rope = rope
+        if isinstance(raw, tuple):
+            if len(raw) != 2:
+                raise ValueError("Split native cache requires exactly two banks")
+            self.raw, self.raw_hi = raw
+        else:
+            self.raw, self.raw_hi = raw, None
+        if isinstance(rope, tuple):
+            if len(rope) != 2:
+                raise ValueError("Split RoPE companion requires exactly two banks")
+            self.rope, self.rope_hi = rope
+        else:
+            self.rope, self.rope_hi = rope, None
         self.shape, self.dtype, stride_bytes, offset_bytes = layout
         self.row_bytes = math.prod(self.shape[2:]) * self.dtype.itemsize
-        if raw.dtype != torch.int32 or raw.ndim != 2 or raw.shape[1] != ROW_WORDS:
+        banks = (self.raw,) if self.raw_hi is None else (self.raw, self.raw_hi)
+        if any(
+            bank.dtype != torch.int32 or bank.ndim != 2 or bank.shape[1] != ROW_WORDS
+            for bank in banks
+        ):
             raise ValueError("Native cache requires DSV4 int32[..., 128] word rows")
         if self.dtype not in (torch.bfloat16, torch.float32, torch.uint8):
             raise ValueError("Native cache records must be BF16, FP32 or FP8 bytes")
         if self.dtype == torch.uint8 and (
             self.row_bytes != ROW_BYTES
-            or rope is None
-            or rope.shape != (raw.shape[0] * ROPE_WORDS // ROW_WORDS, ROW_WORDS)
+            or self.rope is None
+            or (self.rope_hi is not None) != (self.raw_hi is not None)
+            or self.rope.shape
+            != (self.raw.shape[0] * ROPE_WORDS // ROW_WORDS, ROW_WORDS)
+            or (
+                self.raw_hi is not None
+                and self.rope_hi is not None
+                and self.rope_hi.shape
+                != (self.raw_hi.shape[0] * ROPE_WORDS // ROW_WORDS, ROW_WORDS)
+            )
         ):
             raise ValueError("FP8 records are one pool row plus a RoPE companion")
         if self.row_bytes % 4 or (
             self.row_bytes % ROW_BYTES and ROW_BYTES % self.row_bytes
         ):
             raise ValueError("Cache records must divide or be a multiple of 512 bytes")
-        if stride_bytes % self.row_bytes or offset_bytes % self.row_bytes:
-            raise ValueError("Cache pages must be record-aligned")
         if (
-            max(raw.shape[0], raw.nbytes // self.row_bytes)
+            stride_bytes % self.row_bytes
+            or offset_bytes % self.row_bytes
+            or self.raw.nbytes % self.row_bytes
+        ):
+            raise ValueError("Cache pages must be record-aligned")
+        self.total_rows = self.raw.shape[0] + (
+            0 if self.raw_hi is None else self.raw_hi.shape[0]
+        )
+        total_bytes = self.raw.nbytes + (
+            0 if self.raw_hi is None else self.raw_hi.nbytes
+        )
+        if (
+            max(self.total_rows, total_bytes // self.row_bytes)
             > torch.iinfo(torch.int32).max
         ):
             raise ValueError("Native cache row counts must fit int32")
+        self.bank_records = self.raw.nbytes // self.row_bytes
         self.page_stride = stride_bytes // self.row_bytes
         self.row_offset = offset_bytes // self.row_bytes
 
@@ -218,28 +323,59 @@ class PagedCacheRows:
             or self.row_offset % rows
             or self.page_stride % rows
             or self.raw.shape[0] % rows
+            or (self.raw_hi is not None and self.raw_hi.shape[0] % rows)
         ):
             return None
         return block_table * (self.page_stride // rows) + self.row_offset // rows
+
+    def copy_raw(self, updated):
+        if self.raw_hi is None:
+            self.raw.copy_(updated)
+        else:
+            updated_lo, updated_hi = updated
+            self.raw.copy_(updated_lo)
+            self.raw_hi.copy_(updated_hi)
 
     def __getitem__(self, indices):
         blocks, rows = indices
         records = self.row_indices(blocks * self.shape[1] + rows)
         if self.raw.device.type == "cpu":
             pool = self.raw.view(torch.int8).reshape(-1, self.row_bytes)
+            if self.raw_hi is None:
+                selected = pool[records.long()]
+            else:
+                pool_hi = self.raw_hi.view(torch.int8).reshape(-1, self.row_bytes)
+                rec = records.long()
+                in_hi = rec >= self.bank_records
+                lo_idx = rec.masked_fill(in_hi, 0)
+                hi_idx = (rec - self.bank_records).masked_fill(~in_hi, 0)
+                selected = torch.where(
+                    in_hi.unsqueeze(-1), pool_hi[hi_idx], pool[lo_idx]
+                )
             return (
-                pool[records.long()]
-                .contiguous()
+                selected.contiguous()
                 .view(self.dtype)
                 .reshape(*records.shape, *self.shape[2:])
             )
-        assert _read_values_op is not None
-        gathered = _read_values_op(
-            self.raw,
-            records.flatten().int(),
-            self.row_bytes // self.dtype.itemsize,
-            self.dtype == torch.float32,
-        )
+        elem_count = self.row_bytes // self.dtype.itemsize
+        is_fp32 = self.dtype == torch.float32
+        if self.raw_hi is None:
+            assert _read_values_op is not None
+            gathered = _read_values_op(
+                self.raw,
+                records.flatten().int(),
+                elem_count,
+                is_fp32,
+            )
+        else:
+            assert _read_values_2bank_op is not None
+            gathered = _read_values_2bank_op(
+                self.raw,
+                self.raw_hi,
+                records.flatten().int(),
+                elem_count,
+                is_fp32,
+            )
         return gathered.reshape(*records.shape, *self.shape[2:])
 
     def write(self, slots, values, after=None):
@@ -253,18 +389,40 @@ class PagedCacheRows:
         )
         if self.raw.device.type == "cpu":
             pool = self.raw.view(torch.int8).reshape(-1, self.row_bytes)
-            valid = slots >= 0
+            valid = (slots >= 0) & (
+                True if self.raw_hi is None else (records < self.bank_records)
+            )
             pool.index_copy_(
                 0, records[valid].long(), values[valid].contiguous().view(torch.int8)
             )
-        elif after is not None:
+            if self.raw_hi is not None:
+                pool_hi = self.raw_hi.view(torch.int8).reshape(-1, self.row_bytes)
+                valid_hi = (slots >= 0) & (records >= self.bank_records)
+                pool_hi.index_copy_(
+                    0,
+                    (records[valid_hi] - self.bank_records).long(),
+                    values[valid_hi].contiguous().view(torch.int8),
+                )
+            return
+        rec_lo = records.int()
+        if after is not None:
             assert _write_values_after_op is not None
-            self.raw.copy_(
-                _write_values_after_op(self.raw, records.int(), values, after)
-            )
+            self.raw.copy_(_write_values_after_op(self.raw, rec_lo, values, after))
+            if self.raw_hi is not None:
+                rec_hi = torch.where(
+                    rec_lo >= self.bank_records, rec_lo - self.bank_records, -1
+                )
+                self.raw_hi.copy_(
+                    _write_values_after_op(self.raw_hi, rec_hi, values, after)
+                )
         else:
             assert _write_values_op is not None
-            self.raw.copy_(_write_values_op(self.raw, records.int(), values))
+            self.raw.copy_(_write_values_op(self.raw, rec_lo, values))
+            if self.raw_hi is not None:
+                rec_hi = torch.where(
+                    rec_lo >= self.bank_records, rec_lo - self.bank_records, -1
+                )
+                self.raw_hi.copy_(_write_values_op(self.raw_hi, rec_hi, values))
 
     def _write_fp8(self, records, values):
         """Quantize BF16 latents into NoPE rows and their RoPE companion slots."""
@@ -277,17 +435,33 @@ class PagedCacheRows:
                 torch.from_numpy(np.array(array))
                 for array in encode_fp8_kv(jax.numpy.asarray(latent))
             )
-            valid = records >= 0
-            rows = records[valid].long()
-            self.raw.index_copy_(0, rows, words[valid])
+            valid_lo = (records >= 0) & (
+                True if self.raw_hi is None else (records < self.bank_records)
+            )
+            rows_lo = records[valid_lo].long()
+            self.raw.index_copy_(0, rows_lo, words[valid_lo])
             companion = self.rope.view(-1, ROPE_WORDS)
-            companion.index_copy_(0, rows, rope[valid])
+            companion.index_copy_(0, rows_lo, rope[valid_lo])
+            if self.raw_hi is not None:
+                assert self.rope_hi is not None
+                valid_hi = records >= self.bank_records
+                rows_hi = (records[valid_hi] - self.bank_records).long()
+                self.raw_hi.index_copy_(0, rows_hi, words[valid_hi])
+                companion_hi = self.rope_hi.view(-1, ROPE_WORDS)
+                companion_hi.index_copy_(0, rows_hi, rope[valid_hi])
             return
         assert _encode_fp8_op is not None and _write_values_op is not None
         words, rope = _encode_fp8_op(values.to(torch.bfloat16))
-        records = records.int()
-        self.raw.copy_(_write_values_op(self.raw, records, words))
-        self.rope.copy_(_write_values_op(self.rope, records, rope))
+        rec_lo = records.int()
+        self.raw.copy_(_write_values_op(self.raw, rec_lo, words))
+        self.rope.copy_(_write_values_op(self.rope, rec_lo, rope))
+        if self.raw_hi is not None:
+            assert self.rope_hi is not None
+            rec_hi = torch.where(
+                rec_lo >= self.bank_records, rec_lo - self.bank_records, -1
+            )
+            self.raw_hi.copy_(_write_values_op(self.raw_hi, rec_hi, words))
+            self.rope_hi.copy_(_write_values_op(self.rope_hi, rec_hi, rope))
 
 
 class NativeCacheView:
@@ -315,7 +489,8 @@ class NativeCacheView:
         if layout is not None:
             self._tpu_cache_layout = layout
             return
-        if raw_cache is not None and raw_cache.device.type != "cpu":
+        raw_tensor = raw_cache[0] if isinstance(raw_cache, tuple) else raw_cache
+        if raw_tensor is not None and raw_tensor.device.type != "cpu":
             raise ValueError("TPU native caches require explicit allocator layout")
         view = self._bound_cache
         self._tpu_cache_layout = (
@@ -335,18 +510,47 @@ def _scatter_rows(cache: jax.Array, slots: jax.Array, values: jax.Array) -> jax.
     return rows.at[slots].set(values, mode="drop").reshape(cache.shape)
 
 
+def _cache_num_rows(cache: jax.Array | tuple[jax.Array, jax.Array]) -> int:
+    import jax.numpy as jnp
+
+    if isinstance(cache, tuple):
+        cache_lo, cache_hi = cache
+        assert cache_lo.dtype == cache_hi.dtype == jnp.int32
+        assert cache_lo.shape[1] == cache_hi.shape[1] == ROW_WORDS
+        return cache_lo.shape[0] + cache_hi.shape[0]
+    assert cache.dtype == jnp.int32 and cache.shape[1] == ROW_WORDS
+    return cache.shape[0]
+
+
+def _gather_raw_rows(
+    cache: jax.Array | tuple[jax.Array, jax.Array], indices: jax.Array
+) -> jax.Array:
+    import jax.numpy as jnp
+
+    if not isinstance(cache, tuple):
+        return cache[indices]
+    cache_lo, cache_hi = cache
+    lo_rows = cache_lo.shape[0]
+    hi_rows = cache_hi.shape[0]
+    in_hi = indices >= lo_rows
+    spread = jnp.arange(indices.size, dtype=indices.dtype).reshape(indices.shape)
+    idx_lo = jnp.where(in_hi, spread % lo_rows, indices)
+    idx_hi = jnp.where(in_hi, indices - lo_rows, spread % hi_rows)
+    return jnp.where(in_hi[..., None], cache_hi[idx_hi], cache_lo[idx_lo])
+
+
 def _gather_words(cache, records, record_words):
     import jax.numpy as jnp
 
-    assert cache.dtype == jnp.int32 and cache.shape[1] == ROW_WORDS
+    _cache_num_rows(cache)
     if record_words >= ROW_WORDS:
         chunks = record_words // ROW_WORDS
         indices = (records[:, None] * chunks + jnp.arange(chunks)[None]).reshape(-1)
-        return cache[indices].reshape(records.size, record_words)
+        return _gather_raw_rows(cache, indices).reshape(records.size, record_words)
     # Like DSV4's packed RoPE records, several records can share a word row.
     # Select contiguous segments; a per-element dynamic gather is costly on TPU.
     per_row = ROW_WORDS // record_words
-    words = cache[records // per_row]
+    words = _gather_raw_rows(cache, records // per_row)
     selected = words[:, :record_words]
     for segment in range(1, per_row):
         selected = jnp.where(
@@ -442,8 +646,9 @@ def merge_pieces(x: jax.Array) -> jax.Array:
 def _valid_records(cache, records, record_words):
     import jax.numpy as jnp
 
+    total_rows = _cache_num_rows(cache)
     spread = jnp.arange(records.size, dtype=records.dtype).reshape(records.shape)
-    spread %= cache.shape[0] * ROW_WORDS // record_words
+    spread %= total_rows * ROW_WORDS // record_words
     return jnp.where(records >= 0, records, spread)
 
 
@@ -463,7 +668,9 @@ def _split_words(words: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 
 def gather_cache_pieces(
-    cache: jax.Array, records: jax.Array, elements: int
+    cache: jax.Array | tuple[jax.Array, jax.Array],
+    records: jax.Array,
+    elements: int,
 ) -> jax.Array:
     """BF16 records as stacked ``[pieces, n, width]`` in `piece_order`.
 
@@ -481,7 +688,9 @@ def gather_cache_pieces(
     rows = (records[None] + jnp.arange(chunks, dtype=records.dtype)[:, None]).reshape(
         -1
     )
-    even, odd = _split_words(cache[rows].reshape(chunks, records.size, ROW_WORDS))
+    even, odd = _split_words(
+        _gather_raw_rows(cache, rows).reshape(chunks, records.size, ROW_WORDS)
+    )
     return jnp.stack([even, odd], axis=1).reshape(2 * chunks, records.size, ROW_WORDS)
 
 
@@ -521,7 +730,10 @@ def gather_cache_values(
 
 
 def gather_cache_page_words(
-    cache: jax.Array, first_records: jax.Array, page_records: int, elements: int
+    cache: jax.Array | tuple[jax.Array, jax.Array],
+    first_records: jax.Array,
+    page_records: int,
+    elements: int,
 ) -> jax.Array:
     """Raw int32 word rows ``[pages * rows, ROW_WORDS]`` of whole pages.
 
@@ -533,20 +745,27 @@ def gather_cache_page_words(
     record_words = elements // 2
     if ROW_WORDS % record_words or (page_records * record_words) % ROW_WORDS:
         raise ValueError("Pages must cover whole pool word rows")
+    total_rows = _cache_num_rows(cache)
     per_row = ROW_WORDS // record_words
     rows = page_records * record_words // ROW_WORDS
     first_records = first_records.reshape(-1)
     spread = jnp.arange(first_records.size, dtype=first_records.dtype) * rows
-    spread %= max(1, cache.shape[0] - rows + 1)
+    if isinstance(cache, tuple):
+        spread %= max(1, cache[0].shape[0] - rows + 1)
+    else:
+        spread %= max(1, total_rows - rows + 1)
     starts = jnp.where(first_records >= 0, first_records // per_row, spread)
     # A single-row index gather stays on SparseCore; vmap(dynamic_slice)
     # lowers to a windowed gather that measured ~25x slower on TPU7x.
     indices = (starts[:, None] + jnp.arange(rows, dtype=starts.dtype)[None]).reshape(-1)
-    return cache[indices]
+    return _gather_raw_rows(cache, indices)
 
 
 def gather_cache_page_values(
-    cache: jax.Array, first_records: jax.Array, page_records: int, elements: int
+    cache: jax.Array | tuple[jax.Array, jax.Array],
+    first_records: jax.Array,
+    page_records: int,
+    elements: int,
 ) -> jax.Array:
     """`gather_cache_values` (``split=True``) of whole pages.
 
@@ -598,8 +817,8 @@ def encode_fp8_kv(latent: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 
 def initialize_cache_ops():
-    global _read_values_op, _write_op, _write_values_op, _encode_fp8_op
-    global _write_values_after_op
+    global _read_values_op, _read_values_2bank_op, _write_op, _write_values_op
+    global _encode_fp8_op, _write_values_after_op
     if _write_op is not None:
         return
     from jax.sharding import PartitionSpec as P
@@ -617,6 +836,29 @@ def initialize_cache_ops():
     )
     _read_values_op.register_fake(
         lambda cache, records, elements, fp32=False: cache.new_empty(
+            (records.numel(), elements), dtype=torch.float32 if fp32 else torch.bfloat16
+        )
+    )
+
+    def read_cache_values_2bank(
+        cache_lo: jax.Array,
+        cache_hi: jax.Array,
+        records: jax.Array,
+        elements: int,
+        fp32: bool = False,
+    ) -> jax.Array:
+        return gather_cache_values(
+            cast(Any, (cache_lo, cache_hi)), records, elements, fp32
+        )
+
+    _read_values_2bank_op = pallas.jax_op(
+        "pallas::dsv41v2_cache_read_values_2bank",
+        read_cache_values_2bank,
+        mesh=get_vllm_model_wrapper_context().mesh,
+        input_partition_specs=(P(), P(), P(), None, None),
+    )
+    _read_values_2bank_op.register_fake(
+        lambda cache_lo, cache_hi, records, elements, fp32=False: cache_lo.new_empty(
             (records.numel(), elements), dtype=torch.float32 if fp32 else torch.bfloat16
         )
     )
@@ -706,7 +948,7 @@ def write_cache(cache, slots, values, valid, after=None):
 
 
 def merge_sub_rows(
-    cache: jax.Array, records: jax.Array, words: jax.Array
+    cache: jax.Array, records: jax.Array, values: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
     """Turn unique sub-row records into full word-row writes.
 
@@ -717,7 +959,7 @@ def merge_sub_rows(
     """
     import jax.numpy as jnp
 
-    width = words.shape[1]
+    width = values.shape[1]
     per_row = ROW_WORDS // width
     valid = (records >= 0) & (records < cache.shape[0] * per_row)
     rows = jnp.where(valid, records // per_row, -1)
@@ -729,7 +971,7 @@ def merge_sub_rows(
     pieces = []
     for segment in range(per_row):
         writers = same_row & (segments[None, :] == segment)
-        source = jnp.take(words, jnp.argmax(writers, axis=1), axis=0)
+        source = jnp.take(values, jnp.argmax(writers, axis=1), axis=0)
         pieces.append(
             jnp.where(
                 writers.any(axis=1)[:, None],
@@ -762,7 +1004,9 @@ def _pack_bf16_words(values: jax.Array) -> jax.Array:
 
 
 def scatter_cache_values(
-    cache: jax.Array, records: jax.Array, values: jax.Array
+    cache: jax.Array,
+    records: jax.Array,
+    values: jax.Array,
 ) -> jax.Array:
     """Write unique physical records, preserving the shared owner and padding.
 
@@ -772,8 +1016,23 @@ def scatter_cache_values(
     """
     import jax.numpy as jnp
 
-    assert cache.dtype == jnp.int32 and cache.ndim == 2 and cache.shape[1] == ROW_WORDS
     assert values.dtype in (jnp.bfloat16, jnp.float32, jnp.int32)
+    if isinstance(cache, tuple):
+        cache_lo, cache_hi = cache
+        record_words = (
+            values.shape[1] // 2 if values.dtype == jnp.bfloat16 else values.shape[1]
+        )
+        bank_records = cache_lo.shape[0] * ROW_WORDS // record_words
+        records_lo = jnp.where(records < bank_records, records, -1)
+        records_hi = jnp.where(records >= bank_records, records - bank_records, -1)
+        return cast(
+            Any,
+            (
+                scatter_cache_values(cache_lo, records_lo, values),
+                scatter_cache_values(cache_hi, records_hi, values),
+            ),
+        )
+    assert cache.dtype == jnp.int32 and cache.ndim == 2 and cache.shape[1] == ROW_WORDS
     if not values.shape[0]:
         return cache
     words = (

@@ -285,6 +285,7 @@ def test_reserve_rope_companion_caps_at_sparsecore_16gib_limit():
     from types import SimpleNamespace
 
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
+        SPARSECORE_MAX_POOL_BANKS,
         SPARSECORE_MAX_POOL_BYTES,
         reserve_rope_companion,
     )
@@ -297,12 +298,18 @@ def test_reserve_rope_companion_caps_at_sparsecore_16gib_limit():
     )
     small_avail = 10 << 30
     assert reserve_rope_companion(cfg, small_avail) == small_avail * 4 // 5
-    # When Engram CPU offload frees ~23.6 GiB/rank (available ~ 41.1 GiB),
-    # reserve_rope_companion must cap below 16 GiB (1 << 34) for SparseCore.
+    # Marginal overflow (20 GiB * 4 // 5 = 16 GiB < 1.2 * SPARSECORE_MAX_POOL_BYTES)
+    # stays clamped to 1 bank (SPARSECORE_MAX_POOL_BYTES).
+    assert reserve_rope_companion(cfg, 20 << 30) == SPARSECORE_MAX_POOL_BYTES
+    # With 2-bank SparseCore pool splitting, up to 2 * SPARSECORE_MAX_POOL_BYTES
+    # (~31.875 GiB main pool, ~39.84375 GiB with RoPE companion) is supported,
+    # keeping each bank below 16 GiB (1 << 34) for SparseCore.
+    mid_avail = 35 << 30
+    assert reserve_rope_companion(cfg, mid_avail) == mid_avail * 4 // 5
     offload_avail = 42 << 30
     capped = reserve_rope_companion(cfg, offload_avail)
-    assert capped == SPARSECORE_MAX_POOL_BYTES
-    assert capped < (16 << 30)
+    assert capped == SPARSECORE_MAX_POOL_BANKS * SPARSECORE_MAX_POOL_BYTES
+    assert capped // SPARSECORE_MAX_POOL_BANKS < (16 << 30)
 
 
 def test_slice_token_parallel_attention_inputs():

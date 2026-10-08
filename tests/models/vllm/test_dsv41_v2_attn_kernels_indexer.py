@@ -445,6 +445,31 @@ class TestSelectIndicesJax:
             np.asarray(published[:, 0:1]), np.asarray(last_block)
         )
 
+        # SparseCore candidate_write fast path: unordered=True, blocks >= 2048,
+        # blocks % 16 == 0, cand_k % 16 == 0
+        sc_scores = jnp.zeros((count, 2048 * 8), dtype=jnp.float32)
+        sc_lengths = jnp.array([1024, 2048, 4096, 8192], dtype=jnp.int32)
+        sc_candidates = jnp.full((count, 16), -1, dtype=jnp.int32)
+        with mock.patch(
+            "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels._sparsecore_top_k",
+            side_effect=lambda s, k, n: jnp.broadcast_to(
+                jnp.arange(k, dtype=jnp.int32), (s.shape[0], k)
+            ),
+        ) as mock_sc:
+            sel_sc, pub_sc = select_indices_jax(
+                sc_scores,
+                sc_lengths,
+                sc_candidates,
+                topk=16,
+                block_size=8,
+                candidate_write=True,
+                candidate_filter=False,
+                unordered=True,
+            )
+            assert sel_sc.shape == (count, 16)
+            assert pub_sc.shape == (count, 16)
+            assert mock_sc.call_count == 2
+
     def test_candidate_filter_branch_and_128_aligned_scatter(self):
         rng = np.random.default_rng(456)
         count, width, block_size = 4, 320, 16

@@ -358,11 +358,11 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict:
 
     geo = common.Dsv41Geometry()
     tokens_full = args.chunk_size
-    if tokens_full % (ctx.tp_size * 64):
+    min_tokens = ctx.tp_size * 64 if args.mode == "sp" else 64
+    if tokens_full < min_tokens or tokens_full % min_tokens:
         raise ValueError(
-            f"--chunk-size {tokens_full} must be a multiple of "
-            f"64*tp={64 * ctx.tp_size} so each SP slice stays on the Pallas "
-            "flat-pre path"
+            f"--chunk-size {tokens_full} must be a multiple of {min_tokens} "
+            f"so each slice stays on the Pallas flat-pre path"
         )
     tp_rank = get_tp_group().rank_in_group
     shard = tokens_full // ctx.tp_size

@@ -325,11 +325,18 @@ class TestCacheSizingAndConfig:
         vllm_cfg.cache_config.cache_dtype = "fp8_e4m3"
         assert v2_cache.reserve_rope_companion(vllm_cfg, 1000) == 800
 
-        # FP8 case above cap
+        # FP8 marginal overflow (e.g. 20 GiB -> 16 GiB main pool < 1.2x bank cap)
+        # stays clamped to 1 bank (SPARSECORE_MAX_POOL_BYTES).
+        assert (
+            v2_cache.reserve_rope_companion(vllm_cfg, 20 << 30)
+            == v2_cache.SPARSECORE_MAX_POOL_BYTES
+        )
+
+        # FP8 case above 2-bank cap
         huge_bytes = 100 << 30
         assert (
             v2_cache.reserve_rope_companion(vllm_cfg, huge_bytes)
-            == v2_cache.SPARSECORE_MAX_POOL_BYTES
+            == v2_cache.SPARSECORE_MAX_POOL_BANKS * v2_cache.SPARSECORE_MAX_POOL_BYTES
         )
 
     def test_native_cache_view(self):
@@ -402,6 +409,21 @@ class TestCacheSizingAndConfig:
         assert "fp8_layer" in res_fp8.rope_pools
         # Companion raw_tensor appended
         assert len(res_fp8.raw_tensors) == 2
+
+        # Case 4: split_banks = True when pool_bytes > SPARSECORE_MAX_POOL_BYTES
+        # Bank 0 fills to SPARSECORE_MAX_POOL_BYTES (12 blocks), Bank 1 gets 4 blocks.
+        monkeypatch.setattr(v2_cache, "SPARSECORE_MAX_POOL_BYTES", 12 * 512)
+        res_split = v2_cache.materialize_upstream_kv_cache(
+            cfg_fp8, torch.device("cpu"), layout_fp8, word_rows=True
+        )
+        assert isinstance(res_split.native_raw_cache["fp8_layer"], tuple)
+        assert len(res_split.native_raw_cache["fp8_layer"]) == 2
+        assert res_split.native_raw_cache["fp8_layer"][0].shape == (12, ROW_WORDS)
+        assert res_split.native_raw_cache["fp8_layer"][1].shape == (4, ROW_WORDS)
+        assert isinstance(res_split.rope_pools["fp8_layer"], tuple)
+        assert len(res_split.rope_pools["fp8_layer"]) == 2
+        assert len(res_split.raw_tensors) == 4
+        assert res_split.kv_caches["fp8_layer"].shape == (16, 1, 4, 128)
 
 
 # ==============================================================================
@@ -477,6 +499,31 @@ class TestPagedCacheRows:
         with pytest.raises(ValueError, match="Native cache row counts must fit int32"):
             v2_cache.PagedCacheRows(huge_raw, ((16, 1, 256), torch.bfloat16, 512, 0))
 
+        # 8. Split tuple length and companion validations
+        with pytest.raises(
+            ValueError, match="Split native cache requires exactly two banks"
+        ):
+            v2_cache.PagedCacheRows((valid_raw,), ((16, 4, 64), torch.bfloat16, 512, 0))
+        with pytest.raises(
+            ValueError, match="Split RoPE companion requires exactly two banks"
+        ):
+            v2_cache.PagedCacheRows(
+                (valid_raw, valid_raw),
+                ((16, 1, 512), torch.uint8, 512, 0),
+                rope=(torch.zeros((4, ROW_WORDS), dtype=torch.int32),),
+            )
+        with pytest.raises(
+            ValueError, match="FP8 records are one pool row plus a RoPE companion"
+        ):
+            v2_cache.PagedCacheRows(
+                (valid_raw, valid_raw),
+                ((32, 1, 512), torch.uint8, 512, 0),
+                rope=(
+                    torch.zeros((4, ROW_WORDS), dtype=torch.int32),
+                    torch.zeros((2, ROW_WORDS), dtype=torch.int32),
+                ),
+            )
+
     def test_numel_row_indices_pages(self):
         raw = torch.zeros((64, ROW_WORDS), dtype=torch.int32)
         # 16 pages, 4 records per page, 128 words per record
@@ -499,6 +546,23 @@ class TestPagedCacheRows:
         assert torch.equal(
             paged_aligned.pages(torch.tensor([1, 2])), torch.tensor([1, 2])
         )
+        paged_aligned.copy_raw(torch.ones_like(raw))
+        assert torch.all(paged_aligned.raw == 1)
+
+        # 2-bank pages and copy_raw
+        raw_lo = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
+        raw_hi_unaligned = torch.zeros((30, ROW_WORDS), dtype=torch.int32)
+        paged_2b_unaligned = v2_cache.PagedCacheRows(
+            (raw_lo, raw_hi_unaligned), layout_aligned
+        )
+        assert paged_2b_unaligned.pages(torch.tensor([0, 1])) is None
+
+        raw_hi = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
+        paged_2b = v2_cache.PagedCacheRows((raw_lo, raw_hi), layout_aligned)
+        assert torch.equal(paged_2b.pages(torch.tensor([1, 2])), torch.tensor([1, 2]))
+        paged_2b.copy_raw((torch.ones_like(raw_lo) * 2, torch.ones_like(raw_hi) * 3))
+        assert torch.all(paged_2b.raw == 2)
+        assert torch.all(paged_2b.raw_hi == 3)
 
     def test_getitem_and_write_cpu(self):
         raw = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
@@ -516,6 +580,21 @@ class TestPagedCacheRows:
         read_back = paged[blocks, rows]
         assert read_back.shape == (2, 128)
         assert torch.allclose(read_back, values)
+
+        # 2-bank write and __getitem__ on CPU spanning bank 0 and bank 1
+        raw_lo = torch.zeros((16, ROW_WORDS), dtype=torch.int32)
+        raw_hi = torch.zeros((16, ROW_WORDS), dtype=torch.int32)
+        paged_2b = v2_cache.PagedCacheRows((raw_lo, raw_hi), layout)
+        slots_2b = torch.tensor([1, 20])
+        values_2b = torch.stack(
+            [
+                torch.full((128,), 2.0, dtype=torch.bfloat16),
+                torch.full((128,), 5.0, dtype=torch.bfloat16),
+            ]
+        )
+        paged_2b.write(slots_2b, values_2b)
+        read_2b = paged_2b[torch.tensor([0, 5]), torch.tensor([1, 0])]
+        assert torch.allclose(read_2b, values_2b)
 
     def test_getitem_and_write_custom_op_paths(self, monkeypatch: pytest.MonkeyPatch):
         raw = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
@@ -554,6 +633,40 @@ class TestPagedCacheRows:
         mock_write_after.assert_called_once()
         paged.raw.copy_.assert_called_once()
 
+        # 2-bank non-CPU __getitem__ and write paths
+        raw_lo = torch.zeros((16, ROW_WORDS), dtype=torch.int32)
+        raw_hi = torch.zeros((16, ROW_WORDS), dtype=torch.int32)
+        paged_2b = v2_cache.PagedCacheRows((raw_lo, raw_hi), layout)
+        paged_2b.raw = SimpleNamespace(
+            device=SimpleNamespace(type="tpu"), copy_=MagicMock()
+        )
+        paged_2b.raw_hi = SimpleNamespace(
+            device=SimpleNamespace(type="tpu"), copy_=MagicMock()
+        )
+        mock_read_2b = MagicMock(return_value=torch.zeros(2, 128, dtype=torch.bfloat16))
+        monkeypatch.setattr(v2_cache, "_read_values_2bank_op", mock_read_2b)
+        out_2b = paged_2b[torch.tensor([0, 5]), torch.tensor([0, 1])]
+        assert out_2b.shape == (2, 128)
+        mock_read_2b.assert_called_once()
+
+        mock_write.reset_mock()
+        paged_2b.write(torch.tensor([0, 20]), torch.zeros(2, 128, dtype=torch.bfloat16))
+        assert mock_write.call_count == 2
+        paged_2b.raw.copy_.assert_called_once()
+        paged_2b.raw_hi.copy_.assert_called_once()
+
+        mock_write_after.reset_mock()
+        paged_2b.raw.copy_.reset_mock()
+        paged_2b.raw_hi.copy_.reset_mock()
+        paged_2b.write(
+            torch.tensor([0, 20]),
+            torch.zeros(2, 128, dtype=torch.bfloat16),
+            after=torch.tensor(1),
+        )
+        assert mock_write_after.call_count == 2
+        paged_2b.raw.copy_.assert_called_once()
+        paged_2b.raw_hi.copy_.assert_called_once()
+
     def test_write_fp8_cpu_and_custom_op(self, monkeypatch: pytest.MonkeyPatch):
         raw = torch.zeros((16, ROW_WORDS), dtype=torch.int32)
         rope = torch.zeros((4, ROW_WORDS), dtype=torch.int32)
@@ -590,6 +703,45 @@ class TestPagedCacheRows:
         assert mock_write_val.call_count == 2
         paged.raw.copy_.assert_called_once()
         paged.rope.copy_.assert_called_once()
+
+        # 3. 2-bank CPU FP8 write and Non-CPU FP8 write
+        raw_lo = torch.zeros((8, ROW_WORDS), dtype=torch.int32)
+        raw_hi = torch.zeros((8, ROW_WORDS), dtype=torch.int32)
+        rope_lo = torch.zeros((2, ROW_WORDS), dtype=torch.int32)
+        rope_hi = torch.zeros((2, ROW_WORDS), dtype=torch.int32)
+        paged_2b = v2_cache.PagedCacheRows(
+            (raw_lo, raw_hi), layout, rope=(rope_lo, rope_hi)
+        )
+        slots_2b = torch.tensor([1, 10])
+        paged_2b.write(slots_2b, latents)
+        assert not torch.equal(raw_lo, torch.zeros_like(raw_lo))
+        assert not torch.equal(raw_hi, torch.zeros_like(raw_hi))
+        assert not torch.equal(rope_lo, torch.zeros_like(rope_lo))
+        assert not torch.equal(rope_hi, torch.zeros_like(rope_hi))
+
+        paged_2b.raw = SimpleNamespace(
+            device=SimpleNamespace(type="tpu"), copy_=MagicMock()
+        )
+        paged_2b.raw_hi = SimpleNamespace(copy_=MagicMock())
+        paged_2b.rope = SimpleNamespace(copy_=MagicMock())
+        paged_2b.rope_hi = SimpleNamespace(copy_=MagicMock())
+        mock_encode.reset_mock()
+        mock_write_val_2b = MagicMock(
+            side_effect=[
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+            ]
+        )
+        monkeypatch.setattr(v2_cache, "_write_values_op", mock_write_val_2b)
+        paged_2b.write(slots_2b, latents)
+        mock_encode.assert_called_once()
+        assert mock_write_val_2b.call_count == 4
+        paged_2b.raw.copy_.assert_called_once()
+        paged_2b.raw_hi.copy_.assert_called_once()
+        paged_2b.rope.copy_.assert_called_once()
+        paged_2b.rope_hi.copy_.assert_called_once()
 
 
 # ==============================================================================
@@ -671,6 +823,21 @@ class TestCacheJaxHelpers:
         out_sub = v2_cache._gather_words(cache, records, 32)
         assert out_sub.shape == (2, 32)
 
+        # 3. 2-bank tuple matches 1-bank
+        cache_2b = (cache[:8], cache[8:])
+        assert jnp.array_equal(
+            v2_cache._gather_words(
+                cache_2b, jnp.array([1, 5], dtype=jnp.int32), 2 * ROW_WORDS
+            ),
+            v2_cache._gather_words(
+                cache, jnp.array([1, 5], dtype=jnp.int32), 2 * ROW_WORDS
+            ),
+        )
+        assert jnp.array_equal(
+            v2_cache._gather_words(cache_2b, jnp.array([2, 40], dtype=jnp.int32), 32),
+            v2_cache._gather_words(cache, jnp.array([2, 40], dtype=jnp.int32), 32),
+        )
+
     def test_permute_and_halves(self):
         x = jnp.arange(256, dtype=jnp.float32).reshape(1, 256)
         split = v2_cache.split_halves(x)
@@ -740,6 +907,17 @@ class TestCacheJaxHelpers:
         assert out.shape == (12, 64)
         assert out.dtype == jnp.bfloat16
 
+        # 2-bank valid call spanning bank 0 and bank 1
+        cache_2b = (cache[:32], cache[32:])
+        out_2b = v2_cache.gather_cache_page_values(
+            cache_2b,
+            jnp.array([0, 200, -1], dtype=jnp.int32),
+            page_records=4,
+            elements=64,
+        )
+        assert out_2b.shape == (12, 64)
+        assert out_2b.dtype == jnp.bfloat16
+
     def test_encode_fp8_kv(self):
         key = jax.random.PRNGKey(42)
         latent = jax.random.normal(key, (4, 512)).astype(jnp.bfloat16)
@@ -793,7 +971,7 @@ class TestCacheMutationOps:
         # Idempotency check
         v2_cache.initialize_cache_ops()
 
-        # Exercise real write_values_after (lines 642-643)
+        # Exercise real write_values_after (lines 642-643) and read_values_2bank
         wva = captured_ops.get("pallas::dsv41v2_cache_write_values_after")
         assert wva is not None
         c_jax = jnp.zeros((8, ROW_WORDS), dtype=jnp.int32)
@@ -803,6 +981,11 @@ class TestCacheMutationOps:
         res_wva = wva(c_jax, r_jax, v_jax, after_jax)
         assert res_wva.shape == c_jax.shape
 
+        rv2b = captured_ops.get("pallas::dsv41v2_cache_read_values_2bank")
+        assert rv2b is not None
+        res_rv2b = rv2b(c_jax, c_jax, r_jax, 64, False)
+        assert res_rv2b.shape == (2, 64)
+
         # Exercise registered fake handlers
         from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -811,10 +994,15 @@ class TestCacheMutationOps:
             r_fake = torch.empty(4, dtype=torch.int32)
             val_fake = torch.empty(4, 64, dtype=torch.bfloat16)
 
-            # _read_values_op fake
+            # _read_values_op and _read_values_2bank_op fakes
             out_read = v2_cache._read_values_op(c_fake, r_fake, 64, False)
             assert out_read.shape == (4, 64)
             assert out_read.dtype == torch.bfloat16
+            out_read_2b = v2_cache._read_values_2bank_op(
+                c_fake, c_fake, r_fake, 64, False
+            )
+            assert out_read_2b.shape == (4, 64)
+            assert out_read_2b.dtype == torch.bfloat16
 
             # _write_op fake
             out_write = v2_cache._write_op(c_fake, r_fake, val_fake)
@@ -897,10 +1085,23 @@ class TestCacheMutationOps:
         empty_vals = jnp.zeros((0, ROW_WORDS), dtype=jnp.int32)
         assert v2_cache.scatter_cache_values(cache, records[:0], empty_vals) is cache
 
-        # 2. int32 values on CPU
+        # 2. int32 values on CPU (1-bank and 2-bank)
         int32_vals = jnp.ones((2, 64), dtype=jnp.int32)
         out_i32 = v2_cache.scatter_cache_values(cache, records, int32_vals)
         assert out_i32.shape == cache.shape
+        out_2b_i32 = v2_cache.scatter_cache_values(
+            (cache[:4], cache[4:]), jnp.array([1, 10], dtype=jnp.int32), int32_vals
+        )
+        assert len(out_2b_i32) == 2
+        assert out_2b_i32[0].shape == (4, ROW_WORDS)
+        assert out_2b_i32[1].shape == (4, ROW_WORDS)
+
+        # 2b. bf16 values on CPU (2-bank)
+        bf16_vals = jnp.ones((2, 128), dtype=jnp.bfloat16)
+        out_2b_bf16 = v2_cache.scatter_cache_values(
+            (cache[:4], cache[4:]), jnp.array([1, 10], dtype=jnp.int32), bf16_vals
+        )
+        assert len(out_2b_bf16) == 2
 
         # 3. width >= ROW_WORDS on CPU
         full_vals = jnp.ones((2, ROW_WORDS), dtype=jnp.int32)

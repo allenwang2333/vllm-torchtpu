@@ -72,10 +72,15 @@ class _FakeKVBuffer:
         raw: torch.Tensor,
         rope: torch.Tensor | None = None,
         shape: tuple[int, ...] = (16, 16),
+        raw_hi: torch.Tensor | None = None,
+        rope_hi: torch.Tensor | None = None,
     ):
         self.raw = raw
+        self.raw_hi = raw_hi
         self.rope = rope
+        self.rope_hi = rope_hi
         self.shape = shape
+        self.total_rows = raw.shape[0] + (0 if raw_hi is None else raw_hi.shape[0])
 
 
 # ==============================================================================
@@ -196,6 +201,25 @@ class TestWindowAttentionAndAttend:
                 tile=64,
             )
             assert out is state128
+            mock_att.assert_called_once()
+
+        # 4. max_requests is None and tokens % 6 == 0 (192 % 64 == 0 and 192 % 6 == 0)
+        q192 = jnp.zeros((192, 2, 64), dtype=jnp.bfloat16)
+        state192 = _attention_state(q192)
+        with mock.patch(
+            "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels._attend",
+            return_value=state192,
+        ) as mock_att:
+            out = _attend_window(
+                q192,
+                pool,
+                jnp.zeros((192, 64), dtype=jnp.int32),
+                state192,
+                scale=0.125,
+                tile=64,
+                max_requests=None,
+            )
+            assert out is state192
             mock_att.assert_called_once()
 
     def test_attend_window_max_requests_none_fast_and_patch(self):
@@ -545,10 +569,43 @@ class TestGatherSparseKVAndUnionGather:
             )
             assert res.shape == (128, 4, 64)
 
+            # 2-bank with union_gather=False
+            res_2b = sparse_ragged_paged_attention_union_gather(
+                q,
+                (cache_nope[:2], cache_nope[2:]),
+                (cache_rope[:2], cache_rope[2:]),
+                topk_indices,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                attention_sinks,
+                swa_accum,
+                swa_l,
+                swa_m,
+                gather_and_attention_chunk_size=128,
+                union_gather=False,
+            )
+            assert res_2b.shape == (128, 4, 64)
+
+        # Direct test of _csa_gather_pool with 2-bank tuple and num_valid_indices=None
+        indices_2b = jnp.arange(32, dtype=jnp.int32)
+        g_n_all, g_r_all = attention_kernels._csa_gather_pool(
+            cache_nope, cache_rope, indices_2b, num_valid_indices=None, top_k=16
+        )
+        g_n_2b, g_r_2b = attention_kernels._csa_gather_pool(
+            (cache_nope[:2], cache_nope[2:]),
+            (cache_rope[:2], cache_rope[2:]),
+            indices_2b,
+            num_valid_indices=None,
+            top_k=16,
+        )
+        assert jnp.array_equal(g_n_2b, g_n_all)
+        assert jnp.array_equal(g_r_2b, g_r_all)
+
     def test_sparse_fp8_attention_jax_variants(self):
         q = jnp.ones((128, 4, 64), dtype=jnp.bfloat16)
         swa_pool = jnp.zeros((256, 128), dtype=jnp.int32)
-        main_pool = jnp.ones((256, 64), dtype=jnp.uint8)
+        main_pool = jnp.ones((256, 128), dtype=jnp.int32)
         rope_pool = jnp.ones((64, 128), dtype=jnp.int32)
         swa_records = jnp.zeros((128, 64), dtype=jnp.int32)
         main_records = jnp.zeros((128, 128), dtype=jnp.int32)
@@ -601,6 +658,25 @@ class TestGatherSparseKVAndUnionGather:
             )
             assert res2 is q
             mock_union_attn.assert_called_once()
+
+            # 3. 2-bank tuple with union_gather=False routes through union_gather helper
+            res3 = sparse_fp8_attention_jax(
+                q,
+                (swa_pool[:128], swa_pool[128:]),
+                (main_pool[:128], main_pool[128:]),
+                (rope_pool[:32], rope_pool[32:]),
+                swa_records,
+                main_records,
+                pages,
+                query_start_loc,
+                sink,
+                scale=0.125,
+                page_size=16,
+                precompacted=True,
+                union_gather=False,
+            )
+            assert res3 is q
+            assert mock_union_attn.call_count == 2
 
     def test_slice_token_parallel_attention_inputs(self):
         swa_rec = jnp.arange(1024 * 64, dtype=jnp.int32).reshape(1024, 64)
@@ -688,6 +764,32 @@ class TestInitializationAndCustomOps:
             out_fake_qo = fake_qo(qr, *dummy_args)
             assert out_fake_qo.shape == (16, 32)
 
+            # 4. 2-bank fake registrations
+            fake_attn_2b = captured_fakes["pallas::dsv41v2_paged_bf16_attention_2bank"]
+            assert fake_attn_2b(q_t).shape == (8, 4, 64)
+            fake_fp8_2b = captured_fakes["pallas::dsv41v2_sparse_fp8_attention_2bank"]
+            assert fake_fp8_2b(q_t).shape == (8, 4, 64)
+            fake_qo_2b = captured_fakes["pallas::dsv41v2_sparse_fp8_attention_qo_2bank"]
+            dummy_args_2b = [torch.zeros(1)] * 25
+            dummy_args_2b[5] = torch.zeros(16, dtype=torch.int64)
+            dummy_args_2b[20] = torch.zeros(128, 32)
+            assert fake_qo_2b(qr, *dummy_args_2b).shape == (16, 32)
+
+            # 5. Execute 2-bank inner wrappers (paged_attention_2bank)
+            attn_2b_fn = attention_kernels._attention_2bank_op._fn
+            res_2b_attn = attn_2b_fn(
+                jnp.zeros((2, 2, 128), dtype=jnp.bfloat16),
+                jnp.zeros((4, 128), dtype=jnp.int32),
+                jnp.zeros((4, 128), dtype=jnp.int32),
+                jnp.zeros((4, 128), dtype=jnp.int32),
+                jnp.zeros((4, 128), dtype=jnp.int32),
+                jnp.zeros((2, 64), dtype=jnp.int32),
+                jnp.zeros((2, 64), dtype=jnp.int32),
+                jnp.zeros((2,), dtype=jnp.float32),
+                0.5,
+            )
+            assert res_2b_attn.shape == (2, 2, 128)
+
     def test_fp8_attention_inner_bodies_tp_and_non_tp(self):
         mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
         captured_ops = {}
@@ -773,6 +875,35 @@ class TestInitializationAndCustomOps:
                     4096,
                 )
                 assert res_non_tp.shape == (64, 4, 64)
+
+                # 3. 2-bank wrapper: fp8_attention_2bank
+                fp8_attn_2b_fn = captured_ops[
+                    "pallas::dsv41v2_sparse_fp8_attention_2bank"
+                ]
+                res_2b = fp8_attn_2b_fn(
+                    jnp.zeros((64, 4, 64)),
+                    jnp.zeros((32, 64)),
+                    jnp.zeros((32, 64)),
+                    jnp.zeros((32, 64)),
+                    jnp.zeros((32, 64)),
+                    jnp.zeros((8, 128)),
+                    jnp.zeros((8, 128)),
+                    jnp.zeros((64, 64), dtype=jnp.int32),
+                    jnp.zeros((64, 128), dtype=jnp.int32),
+                    jnp.zeros((1, 1), dtype=jnp.int32),
+                    jnp.zeros((2,), dtype=jnp.int32),
+                    jnp.zeros((4,)),
+                    jnp.zeros((4,)),
+                    jnp.zeros((1,), dtype=jnp.int32),
+                    0.125,
+                    16,
+                    None,
+                    False,
+                    False,
+                    False,
+                    4096,
+                )
+                assert res_2b.shape == (64, 4, 64)
 
     def test_fp8_attention_qo_inner_bodies(self):
         mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
@@ -933,10 +1064,51 @@ class TestInitializationAndCustomOps:
                 )
                 assert res_sharded_no_gather.shape[0] == 64
 
+                # 4. 2-bank wrapper: fp8_attention_qo_2bank
+                fp8_qo_2b_fn = captured_ops[
+                    "pallas::dsv41v2_sparse_fp8_attention_qo_2bank"
+                ]
+                res_qo_2b = fp8_qo_2b_fn(
+                    jnp.zeros((64, 128)),
+                    jnp.zeros((32, 128)),
+                    jnp.zeros((128, 256)),
+                    jnp.zeros((256,)),
+                    jnp.zeros((128, 256)),
+                    jnp.zeros((256,)),
+                    jnp.zeros((64,), dtype=jnp.int32),
+                    jnp.zeros((64, 64)),
+                    jnp.zeros((128, 128), dtype=jnp.int32),
+                    jnp.zeros((128, 128), dtype=jnp.int32),
+                    jnp.zeros((128, 64), dtype=jnp.uint8),
+                    jnp.zeros((128, 64), dtype=jnp.uint8),
+                    jnp.zeros((32, 128), dtype=jnp.int32),
+                    jnp.zeros((32, 128), dtype=jnp.int32),
+                    jnp.zeros((64, 64), dtype=jnp.int32),
+                    jnp.zeros((64, 128), dtype=jnp.int32),
+                    jnp.zeros((1, 1), dtype=jnp.int32),
+                    jnp.zeros((2,), dtype=jnp.int32),
+                    jnp.zeros((4,)),
+                    jnp.zeros((4,)),
+                    jnp.zeros((1,), dtype=jnp.int32),
+                    jnp.zeros((64, 64)),
+                    jnp.zeros((64,)),
+                    jnp.zeros((64, 64)),
+                    jnp.zeros((64,)),
+                    jnp.ones((64,), dtype=jnp.int32),
+                    0.125,
+                    16,
+                    None,
+                    False,
+                    64,
+                )
+                assert res_qo_2b.shape[0] == 64
+
     def test_pytorch_wrappers(self, monkeypatch):
-        # 1. paged_attention
+        # 1. paged_attention (1-bank and 2-bank)
         mock_paged_op = mock.MagicMock(return_value=torch.zeros(4, 2, 64))
+        mock_paged_2b_op = mock.MagicMock(return_value=torch.zeros(4, 2, 64))
         monkeypatch.setattr(attention_kernels, "_attention_op", mock_paged_op)
+        monkeypatch.setattr(attention_kernels, "_attention_2bank_op", mock_paged_2b_op)
 
         q = torch.zeros(4, 2, 64)
         swa = _FakeKVBuffer(torch.zeros(32, 64))
@@ -947,12 +1119,36 @@ class TestInitializationAndCustomOps:
         assert out_paged.shape == (4, 2, 64)
         mock_paged_op.assert_called_once()
 
-        # 2. sparse_fp8_attention_qo (pages is None vs pages provided)
-        mock_qo_op = mock.MagicMock(return_value=torch.zeros(16, 32))
-        monkeypatch.setattr(attention_kernels, "_fp8_attention_qo_op", mock_qo_op)
-        main_rope = _FakeKVBuffer(torch.zeros(32, 64), rope=torch.zeros(32, 32))
+        swa_2b = _FakeKVBuffer(torch.zeros(16, 64), raw_hi=torch.zeros(16, 64))
+        main_2b = _FakeKVBuffer(torch.zeros(16, 64), raw_hi=torch.zeros(16, 64))
+        out_paged_2b = paged_attention(
+            q,
+            swa_2b,
+            main_2b,
+            torch.zeros(4, 64),
+            torch.zeros(4, 64),
+            torch.zeros(2),
+            0.125,
+        )
+        assert out_paged_2b.shape == (4, 2, 64)
+        mock_paged_2b_op.assert_called_once()
 
-        # pages is None branch
+        # 2. sparse_fp8_attention_qo (pages is None vs pages provided, 1-bank & 2-bank)
+        mock_qo_op = mock.MagicMock(return_value=torch.zeros(16, 32))
+        mock_qo_2b_op = mock.MagicMock(return_value=torch.zeros(16, 32))
+        monkeypatch.setattr(attention_kernels, "_fp8_attention_qo_op", mock_qo_op)
+        monkeypatch.setattr(
+            attention_kernels, "_fp8_attention_qo_2bank_op", mock_qo_2b_op
+        )
+        main_rope = _FakeKVBuffer(torch.zeros(32, 64), rope=torch.zeros(32, 32))
+        main_rope_2b = _FakeKVBuffer(
+            torch.zeros(16, 64),
+            rope=torch.zeros(16, 32),
+            raw_hi=torch.zeros(16, 64),
+            rope_hi=torch.zeros(16, 32),
+        )
+
+        # pages is None branch (1-bank)
         sparse_fp8_attention_qo(
             torch.zeros(16, 64),
             torch.zeros(8, 64),
@@ -982,6 +1178,37 @@ class TestInitializationAndCustomOps:
             head_dim=64,
         )
         assert mock_qo_op.call_count == 1
+
+        # pages is None branch (2-bank)
+        sparse_fp8_attention_qo(
+            torch.zeros(16, 64),
+            torch.zeros(8, 64),
+            torch.zeros(64, 128),
+            torch.zeros(128),
+            torch.zeros(64, 128),
+            torch.zeros(128),
+            torch.zeros(16, dtype=torch.int64),
+            torch.zeros(16, 32),
+            swa_2b,
+            main_rope_2b,
+            torch.zeros(16, 64),
+            torch.zeros(16, 128),
+            torch.zeros(4),
+            torch.zeros(4),
+            torch.zeros(1, dtype=torch.int32),
+            torch.zeros(64, 32),
+            torch.zeros(32),
+            torch.zeros(64, 32),
+            torch.zeros(32),
+            torch.ones(16, dtype=torch.int32),
+            0.125,
+            pages=None,
+            starts=None,
+            max_requests=None,
+            precompacted=False,
+            head_dim=64,
+        )
+        assert mock_qo_2b_op.call_count == 1
 
         # pages is not None branch (1221 -> 1225)
         sparse_fp8_attention_qo(
@@ -1016,7 +1243,11 @@ class TestInitializationAndCustomOps:
 
         # 3. sparse_fp8_attention wrapper (lines 1283-1296)
         mock_fp8_op = mock.MagicMock(return_value=torch.zeros(4, 2, 64))
+        mock_fp8_2b_op = mock.MagicMock(return_value=torch.zeros(4, 2, 64))
         monkeypatch.setattr(attention_kernels, "_fp8_attention_op", mock_fp8_op)
+        monkeypatch.setattr(
+            attention_kernels, "_fp8_attention_2bank_op", mock_fp8_2b_op
+        )
 
         # Call with defaults (pages=None, full_sink=None, tp_rank=None)
         out_fp8_def = sparse_fp8_attention(
@@ -1034,6 +1265,23 @@ class TestInitializationAndCustomOps:
         )
         assert out_fp8_def.shape == (4, 2, 64)
         assert mock_fp8_op.call_count == 1
+
+        # Call with 2-bank
+        out_fp8_2b = sparse_fp8_attention(
+            q,
+            swa_2b,
+            main_rope_2b,
+            torch.zeros(4, 64, dtype=torch.int32),
+            torch.zeros(4, 128, dtype=torch.int32),
+            torch.zeros(2),
+            0.125,
+            pages=None,
+            starts=None,
+            full_sink=None,
+            tp_rank=None,
+        )
+        assert out_fp8_2b.shape == (4, 2, 64)
+        assert mock_fp8_2b_op.call_count == 1
 
         # Call with explicit arguments (pages, full_sink, tp_rank provided)
         out_fp8_exp = sparse_fp8_attention(
@@ -1264,7 +1512,7 @@ class TestIndexerKernelsAndSelection:
         )
         assert selected_f2.shape == (4, 4)
 
-        # 4. unordered=True
+        # 4. unordered=True (width < 2048 fallback)
         selected_unord, _ = select_indices_jax(
             scores,
             lengths,
@@ -1276,6 +1524,26 @@ class TestIndexerKernelsAndSelection:
             unordered=True,
         )
         assert selected_unord.shape == (4, 4)
+
+        # 5. unordered=True, width >= 2048 (SparseCore fast path)
+        scores_2048 = jnp.zeros((4, 2048), dtype=jnp.float32).at[:, :16].set(1.0)
+        lengths_2048 = jnp.full((4,), 2048, dtype=jnp.int32)
+        with mock.patch(
+            "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels._sparsecore_top_k",
+            return_value=jnp.broadcast_to(jnp.arange(16, dtype=jnp.int32), (4, 16)),
+        ) as mock_sc_sel:
+            selected_sc, _ = select_indices_jax(
+                scores_2048,
+                lengths_2048,
+                candidates_valid,
+                topk=16,
+                block_size=16,
+                candidate_write=False,
+                candidate_filter=False,
+                unordered=True,
+            )
+            assert selected_sc.shape == (4, 16)
+            mock_sc_sel.assert_called_once()
 
     def test_paged_indexer_jax_branches(self):
         q = jnp.zeros((4, 2, 128), dtype=jnp.bfloat16)
@@ -1356,6 +1624,61 @@ class TestIndexerKernelsAndSelection:
         )
         assert sel_cand_ord.shape == (4, 4)
 
+        # 5. Candidate context: unordered=True, scores.shape[1] >= 2048 (SparseCore)
+        records_4096 = jnp.zeros((4, 4096), dtype=jnp.int32)
+        lengths_4096 = jnp.full((4,), 4096, dtype=jnp.int32)
+        candidates_128 = jnp.broadcast_to(
+            jnp.arange(128, dtype=jnp.int32)[None, :] * 2, (4, 128)
+        )
+        picked_16 = jnp.broadcast_to(
+            jnp.array(
+                [0, 15, 16, 31, 32, 33, 48, 63, 64, 80, 96, 112, 128, 144, -1, -1],
+                dtype=jnp.int32,
+            )[None, :],
+            (4, 16),
+        )
+        with (
+            mock.patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels.paged_index_scores_jax",
+                side_effect=lambda q, pool, rec, *a, **kw: jnp.zeros(
+                    (q.shape[0], rec.shape[1]), dtype=jnp.float32
+                ),
+            ),
+            mock.patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels._sparsecore_top_k",
+                return_value=picked_16,
+            ) as mock_sc_cand,
+        ):
+            sel_cand_sc, _ = paged_indexer_jax(
+                q,
+                pool,
+                records_4096,
+                weights,
+                lengths_4096,
+                candidates_128,
+                jnp.arange(4, dtype=jnp.int32),
+                topk=16,
+                block_size=16,
+                candidate_write=False,
+                candidate_filter=True,
+                unordered=True,
+            )
+            assert sel_cand_sc.shape == (4, 16)
+            assert mock_sc_cand.call_count == 2
+            # Verify exact arithmetic parity against logical[picked]
+            logical_ref = (
+                candidates_128[..., None] * 16 + jnp.arange(16, dtype=jnp.int32)
+            ).reshape(4, 2048)
+            want_sel = jnp.where(
+                picked_16 >= 0,
+                jnp.take_along_axis(logical_ref, jnp.maximum(picked_16, 0), axis=1),
+                -1,
+            )
+            np.testing.assert_array_equal(
+                np.asarray(sel_cand_sc),
+                np.asarray(attention_kernels._compact_selected(want_sel)),
+            )
+
     def test_write_index_keys_and_update_and_select(self):
         pool = jnp.zeros((64, 128), dtype=jnp.int32)
         write_records = jnp.array([0, 1], dtype=jnp.int32)
@@ -1405,6 +1728,29 @@ class TestIndexerKernelsAndSelection:
         assert sel.shape == (4, 8)
         assert pub.shape == (4, 2)
 
+        # 5. update_and_select_2bank_jax
+        up_lo, up_hi, sel_2b, pub_2b = attention_kernels.update_and_select_2bank_jax(
+            q,
+            pool[:32],
+            pool[32:],
+            records,
+            weights,
+            lengths,
+            candidates,
+            write_records,
+            keys_bf16,
+            requests,
+            batch_max,
+            topk=8,
+            block_size=16,
+            candidate_write=False,
+            candidate_filter=False,
+            unordered=False,
+        )
+        assert jnp.array_equal(jnp.concatenate((up_lo, up_hi), axis=0), up_pool)
+        assert jnp.array_equal(sel_2b, sel)
+        assert jnp.array_equal(pub_2b, pub)
+
     def test_initialize_indexer_and_paged_indexer_wrapper(self, monkeypatch):
         mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
         captured_fake = {}
@@ -1450,6 +1796,31 @@ class TestIndexerKernelsAndSelection:
             assert f_sel.shape == (4, 8)
             assert f_cands.shape == cands.shape
 
+            assert "pallas::dsv41v2_exact_indexer_2bank" in captured_fake
+            fake_2b_fn = captured_fake["pallas::dsv41v2_exact_indexer_2bank"]
+            f_lo, f_hi, f_sel_2b, f_cands_2b = fake_2b_fn(
+                q,
+                pool[:32],
+                pool[32:],
+                records,
+                torch.ones(4, 2),
+                torch.full((4,), 64),
+                cands,
+                torch.zeros(2),
+                torch.zeros(2, 128),
+                torch.zeros(4),
+                torch.tensor(64),
+                topk=8,
+                block_size=16,
+                candidate_write=False,
+                candidate_filter=False,
+                unordered=False,
+            )
+            assert f_lo.shape == (32, 128)
+            assert f_hi.shape == (32, 128)
+            assert f_sel_2b.shape == (4, 8)
+            assert f_cands_2b.shape == cands.shape
+
             # Test early return idempotency
             saved = attention_kernels._indexer_op
             initialize_indexer()
@@ -1459,7 +1830,16 @@ class TestIndexerKernelsAndSelection:
         mock_idx_op = mock.MagicMock(
             return_value=(torch.zeros(1), torch.zeros(4, 8), torch.zeros(4, 2))
         )
+        mock_idx_2b_op = mock.MagicMock(
+            return_value=(
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(4, 8),
+                torch.zeros(4, 2),
+            )
+        )
         monkeypatch.setattr(attention_kernels, "_indexer_op", mock_idx_op)
+        monkeypatch.setattr(attention_kernels, "_indexer_2bank_op", mock_idx_2b_op)
 
         cache = SimpleNamespace(raw=torch.zeros(64, 64))
         paged_indexer(
@@ -1497,3 +1877,23 @@ class TestIndexerKernelsAndSelection:
             batch_max=torch.tensor([64]),
         )
         assert mock_idx_op.call_count == 2
+
+        cache_2b = SimpleNamespace(raw=torch.zeros(32, 64), raw_hi=torch.zeros(32, 64))
+        up_2b, _, _ = paged_indexer(
+            torch.zeros(4, 2, 64),
+            cache_2b,
+            torch.zeros(2, 64),
+            torch.ones(4, 2),
+            torch.full((4,), 64),
+            torch.zeros(4, 2),
+            torch.zeros(2),
+            torch.zeros(2, 64),
+            torch.zeros(4),
+            topk=8,
+            block_size=16,
+            candidate_write=False,
+            candidate_filter=False,
+            batch_max=torch.tensor([64]),
+        )
+        assert isinstance(up_2b, tuple) and len(up_2b) == 2
+        assert mock_idx_2b_op.call_count == 1

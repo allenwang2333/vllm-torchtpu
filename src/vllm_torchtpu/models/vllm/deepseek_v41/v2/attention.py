@@ -405,7 +405,15 @@ def _index_page_records(index_cache):
     if row_bytes % record_bytes or (per_page * record_bytes) % row_bytes:
         return 0
     per_row = row_bytes // record_bytes
-    if index_cache.row_offset % per_row or index_cache.page_stride % per_row:
+    page_words = per_page // per_row
+    if (
+        index_cache.row_offset % per_row
+        or index_cache.page_stride % per_row
+        or (
+            getattr(index_cache, "raw_hi", None) is not None
+            and index_cache.raw.shape[0] % page_words
+        )
+    ):
         return 0
     return per_page
 
@@ -873,11 +881,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 "swa_token_addr",
                 swa_table.shape,
                 rows_per_page,
+                swa_cache.page_stride if has_fast_swa_offset else None,
                 self.window_size,
                 self._ced_decoder,
                 use_3page_swa,
                 non_causal,
                 swa_width,
+                tiled,
             )
             cached_swa = stage_cache.get(swa_key)
             if cached_swa is None:
@@ -960,29 +970,57 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     base_valid_window,
                     swa_3page,
                 ) = cached_swa
-            b2 = swa_table[requests, pos_col].long()
-            swa_slots = (b2 * rows_per_page + pos_rem).masked_fill(~valid_token, -1)
-            swa_valid = swa_slots >= 0
-            swa_invalid_3d = (~swa_valid)[:, None, None]
-            valid_window = base_valid_window & swa_valid[:, None]
-            if swa_3page is not None:
-                c0, c1, is_c2, is_c1, swa_page_rem = swa_3page
-                b1 = swa_table[requests, c1].long()
-                b0 = swa_table[requests, c0].long()
-                swa_blocks = torch.where(
-                    is_c2,
-                    b2[:, None],
-                    torch.where(is_c1, b1[:, None], b0[:, None]),
+            swa_slots_key = ("swa_token_slots", swa_key)
+            cached_swa_slots = stage_cache.get(swa_slots_key)
+            if cached_swa_slots is None or cached_swa_slots[0] is not swa.block_tables:
+                b2 = swa_table[requests, pos_col].long()
+                swa_slots = (b2 * rows_per_page + pos_rem).masked_fill(~valid_token, -1)
+                swa_valid = swa_slots >= 0
+                swa_invalid_3d = (~swa_valid)[:, None, None]
+                valid_window = base_valid_window & swa_valid[:, None]
+                if swa_3page is not None:
+                    c0, c1, is_c2, is_c1, swa_page_rem = swa_3page
+                    b1 = swa_table[requests, c1].long()
+                    b0 = swa_table[requests, c0].long()
+                    swa_blocks = torch.where(
+                        is_c2,
+                        b2[:, None],
+                        torch.where(is_c1, b1[:, None], b0[:, None]),
+                    )
+                    swa_row_slots = (
+                        swa_blocks * swa_cache.page_stride + swa_page_rem
+                        if has_fast_swa_offset
+                        else swa_blocks * rows_per_page + swa_page_rem
+                    )
+                else:
+                    raw_row_slots = (
+                        _row_slots(swa_cache, swa_table, requests, logical)
+                        if tiled
+                        else None
+                    )
+                    swa_row_slots = (
+                        raw_row_slots // rows_per_page * swa_cache.page_stride
+                        + raw_row_slots % rows_per_page
+                        if raw_row_slots is not None and has_fast_swa_offset
+                        else raw_row_slots
+                    )
+                stage_cache[swa_slots_key] = (
+                    swa.block_tables,
+                    swa_slots,
+                    swa_valid,
+                    swa_invalid_3d,
+                    valid_window,
+                    swa_row_slots,
                 )
-                swa_row_slots = None
             else:
-                swa_blocks = None
-                swa_page_rem = None
-                swa_row_slots = (
-                    _row_slots(swa_cache, swa_table, requests, logical)
-                    if tiled
-                    else None
-                )
+                (
+                    _,
+                    swa_slots,
+                    swa_valid,
+                    swa_invalid_3d,
+                    valid_window,
+                    swa_row_slots,
+                ) = cached_swa_slots
         else:
             swa_slots = _cache_slots(swa_cache, swa, positions)
             swa_valid = swa_slots >= 0
@@ -1016,11 +1054,26 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     "deepseek_v41_replay_starts"
                 ]
                 valid_window = valid_window & (logical >= replay_starts[requests, None])
-            swa_blocks = None
-            swa_page_rem = None
-            swa_row_slots = (
+            raw_row_slots = (
                 _row_slots(swa_cache, swa_table, requests, logical) if tiled else None
             )
+            swa_row_slots = (
+                raw_row_slots // rows_per_page * swa_cache.page_stride
+                + raw_row_slots % rows_per_page
+                if raw_row_slots is not None
+                and has_fast_swa_offset
+                and rows_per_page is not None
+                else raw_row_slots
+            )
+        records = (
+            (
+                swa_cache.row_offset + swa_row_slots
+                if has_fast_swa_offset and rows_per_page is not None
+                else swa_cache.row_indices(swa_row_slots)
+            ).masked_fill(~valid_window, -1)
+            if swa_row_slots is not None
+            else None
+        )
         # Token-local q path: q projection, attention and
         # wo_a run in one op that picks token-parallel vs head-sharded on
         # concrete shapes.
@@ -1254,28 +1307,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     rows = torch.cat((window, compressed_rows), 1)
                     valid_rows = torch.cat((valid_window, valid_compressed), 1)
         if tiled:
-            if (
-                swa_blocks is not None
-                and swa_page_rem is not None
-                and rows_per_page is not None
-            ):
-                records = (
-                    swa_cache.row_offset
-                    + swa_blocks * swa_cache.page_stride
-                    + swa_page_rem
-                    if has_fast_swa_offset
-                    else swa_cache.row_indices(
-                        swa_blocks * rows_per_page + swa_page_rem
-                    )
-                ).masked_fill(~valid_window, -1)
-            else:
-                records = (
-                    swa_cache.row_offset
-                    + swa_row_slots // rows_per_page * swa_cache.page_stride
-                    + swa_row_slots % rows_per_page
-                    if has_fast_swa_offset and rows_per_page is not None
-                    else swa_cache.row_indices(swa_row_slots)
-                ).masked_fill(~valid_window, -1)
+            assert records is not None
             if fused_qo:
                 return sparse_fp8_attention_qo(
                     qr,
@@ -1535,7 +1567,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             selected = _gather_query_rows(selected)[:count]
             if candidate_write:
                 published = _gather_query_rows(published)[:count]
-        index_cache.raw.copy_(updated_cache)
+        if isinstance(updated_cache, tuple):
+            index_cache.copy_raw(updated_cache)
+        else:
+            index_cache.raw.copy_(updated_cache)
         if candidate_write:
             self.candidate_block_buffer.copy_(
                 torch.nn.functional.pad(

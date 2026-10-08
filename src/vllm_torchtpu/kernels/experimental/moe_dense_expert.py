@@ -57,14 +57,24 @@ def _select_expert_buffers(
 
 
 def _packing_factor_for(w1, w2, rhs_quant_dtype):
-    if rhs_quant_dtype in (None, jnp.float8_e4m3fn):
-        if w1.dtype == jnp.float8_e4m3fn and w2.dtype == jnp.float8_e4m3fn:
-            return 1
-        return None
-    if rhs_quant_dtype == jnp.float4_e2m1fn:
-        if w1.dtype == jnp.uint8 and w2.dtype == jnp.uint8:
-            return 2
-        return None
+    if (
+        rhs_quant_dtype in (None, jnp.float8_e4m3fn)
+        and w1.dtype == jnp.float8_e4m3fn
+        and w2.dtype == jnp.float8_e4m3fn
+    ):
+        return 1
+    if (
+        rhs_quant_dtype in (None, jnp.float4_e2m1fn)
+        and w1.dtype == jnp.float4_e2m1fn
+        and w2.dtype == jnp.float4_e2m1fn
+    ):
+        return 1
+    if (
+        rhs_quant_dtype == jnp.float4_e2m1fn
+        and w1.dtype == jnp.uint8
+        and w2.dtype == jnp.uint8
+    ):
+        return 2
     return None
 
 
@@ -91,7 +101,8 @@ def can_use_dense_expert(
     i = i_packed * packing_factor
     if min(m, h, i, e) <= 0:
         return False
-    if (packing_factor == 1 and m % 16) or h % 512 or i % 512:
+    is_fp4 = rhs_quant_dtype == jnp.float4_e2m1fn or w1.dtype == jnp.float4_e2m1fn
+    if (not is_fp4 and m % 16) or h % 512 or i % 512:
         return False
     if out != h or w1.shape != (e, h // packing_factor, 2 * i):
         return False
@@ -180,7 +191,9 @@ def _kernel(
                     axis=1,
                 )
                 if packing_factor > 1:
-                    rhs = pltpu.bitcast(rhs, rhs_quant_dtype).astype(jnp.float8_e4m3fn)
+                    rhs = pltpu.bitcast(rhs, rhs_quant_dtype)
+                if rhs.dtype != jnp.float8_e4m3fn:
+                    rhs = rhs.astype(jnp.float8_e4m3fn)
                 part = jnp.matmul(
                     xq_ref[:, k : k + 512], rhs, preferred_element_type=jnp.float32
                 ).astype(jnp.bfloat16)
@@ -207,7 +220,9 @@ def _kernel(
                 k_hi = (k + 512) // packing_factor
                 rhs = w2_ref[k_lo:k_hi, n : n + 256]
                 if packing_factor > 1:
-                    rhs = pltpu.bitcast(rhs, rhs_quant_dtype).astype(jnp.float8_e4m3fn)
+                    rhs = pltpu.bitcast(rhs, rhs_quant_dtype)
+                if rhs.dtype != jnp.float8_e4m3fn:
+                    rhs = rhs.astype(jnp.float8_e4m3fn)
                 part = jnp.matmul(
                     aq_ref[:, k : k + 512],
                     rhs,
