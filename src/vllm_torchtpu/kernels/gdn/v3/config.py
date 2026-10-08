@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration dataclasses and hardware tiling constants for Gated DeltaNet (GDN) v3.
+"""
+
 import dataclasses
 import enum
 from typing import Any
@@ -74,6 +77,18 @@ class StateRegion:
     # where full-width states interleave Q and K row-pairs per tap so that
     # one whole pool token holds one head-pair's Q and K rows.
     rows_perm: tuple[int, ...] | None = None
+    pack: int = 1
+    block_row0: int = 0
+
+    def __post_init__(self):
+        if self.pack not in (1, 2, 4, 8):
+            raise ValueError(f"unsupported state pack factor: {self.pack}")
+        if self.pack != 1 and self.rows_perm is not None:
+            raise ValueError(
+                "a packed region's rows_perm would permute packed rows, not state rows"
+            )
+        if self.block_row0 and self.nblocks != 1:
+            raise ValueError("a co-located region spans one block")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,6 +106,7 @@ class StateSourcePlan:
     conv: StateRegion
     recurrent: StateRegion
     whole_block_dma: bool = False
+    scale: StateRegion | None = None
 
 
 @jax.tree_util.register_dataclass

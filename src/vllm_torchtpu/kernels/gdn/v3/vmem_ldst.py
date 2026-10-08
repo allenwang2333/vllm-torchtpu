@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Vectorized VMEM load/store and state ring-buffer helpers for GDN v3.
+"""
+
 import math
 
 import jax
@@ -20,7 +23,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels import typed_ldst
-from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
+from vllm_torchtpu.kernels.gdn.v3 import compute_gdn, config, memory_ref
 
 
 def load_strided_heads(
@@ -120,19 +123,37 @@ def load_state_region(
     Returns:
         The logical state of ``shape``.
     """
-    parts = [
-        typed_ldst.load_typed(
-            slot_ref.at[j], view_dtype=region.view_dtype, lane_split=region.lane_split
+    if region.nblocks == 1:
+        rows_per_vreg = 32 // jnp.dtype(region.view_dtype).itemsize
+        vreg_rows = -(-region.rows_used // rows_per_vreg) * rows_per_vreg
+        arr = typed_ldst.load_typed(
+            slot_ref.at[0],
+            view_dtype=region.view_dtype,
+            lane_split=region.lane_split,
+            row0=region.block_row0,
+            rows=vreg_rows,
         )
-        for j in range(region.nblocks)
-    ]
-    arr = parts[0] if region.nblocks == 1 else jnp.concat(parts, axis=0)
+    else:
+        assert region.block_row0 == 0, region.block_row0
+        parts = [
+            typed_ldst.load_typed(
+                slot_ref.at[j],
+                view_dtype=region.view_dtype,
+                lane_split=region.lane_split,
+            )
+            for j in range(region.nblocks)
+        ]
+        arr = jnp.concat(parts, axis=0)
     arr = arr[: region.rows_used]
-    # When a bfloat16 state uses a uint32 VMEM view (2 bf16 elements per
-    # uint32 word), unpack back to bfloat16 before reshaping to `shape`.
-    if region.view_dtype == jnp.uint32 and math.prod(shape) == arr.size * 2:
+    if region.pack == 2:
         assert region.rows_perm is None
-        arr = pltpu.bitcast(arr, jnp.bfloat16)
+        arr = typed_ldst.unpack_bf16_pairs(arr)
+    elif region.pack == 4:
+        assert region.rows_perm is None
+        arr = typed_ldst.unpack_fp8_quads(arr).astype(jnp.float32)
+    elif region.pack == 8:
+        assert region.rows_perm is None
+        arr = typed_ldst.unpack_fp4_octets(arr).astype(jnp.float32)
     if region.rows_perm is not None:
         # Static row gather from the stored order to the logical order;
         # sublane-dim slices + concat only, no lane crossing.
@@ -149,12 +170,23 @@ def store_state_region(
     region has deterministic bytes when copied out.
     """
     rows_pb, out_lanes = _region_rows_per_block(slot_ref, region)
-    if region.view_dtype == jnp.uint32 and values.dtype == jnp.float32:
+    if region.pack == 2:
         assert region.rows_perm is None
-        arr = pltpu.bitcast(values.astype(jnp.bfloat16), jnp.uint32)
+        arr = typed_ldst.pack_bf16_pairs(
+            values.astype(jnp.bfloat16).reshape(-1, out_lanes)
+        )
+    elif region.pack == 4:
+        assert region.rows_perm is None
+        arr = typed_ldst.pack_fp8_quads(
+            values.reshape(-1, out_lanes).astype(jnp.float8_e4m3fn)
+        )
+    elif region.pack == 8:
+        assert region.rows_perm is None
+        arr = typed_ldst.pack_fp4_octets(
+            values.reshape(-1, out_lanes).astype(jnp.float4_e2m1fn)
+        )
     else:
-        arr = values.astype(region.view_dtype)
-    arr = arr.reshape(-1, out_lanes)
+        arr = values.astype(region.view_dtype).reshape(-1, out_lanes)
     if region.rows_perm is not None:
         # Inverse of the load-side gather: logical row i is stored at
         # typed row rows_perm[i].
@@ -162,15 +194,29 @@ def store_state_region(
         for logical, stored in enumerate(region.rows_perm):
             inverse[stored] = logical
         arr = jnp.concat([arr[i][None] for i in inverse], axis=0)
-    capacity = region.nblocks * rows_pb
-    if region.rows_used < capacity:
-        arr = jnp.pad(arr, ((0, capacity - region.rows_used), (0, 0)))
-    for j in range(region.nblocks):
+    if region.nblocks == 1:
+        rows_per_vreg = 32 // jnp.dtype(region.view_dtype).itemsize
+        vreg_rows = -(-region.rows_used // rows_per_vreg) * rows_per_vreg
+        if region.rows_used < vreg_rows:
+            arr = jnp.pad(arr, ((0, vreg_rows - region.rows_used), (0, 0)))
         typed_ldst.store_typed(
-            slot_ref.at[j],
-            arr[j * rows_pb : (j + 1) * rows_pb],
+            slot_ref.at[0],
+            arr,
             lane_split=region.lane_split,
+            row0=region.block_row0,
+            rows=vreg_rows,
         )
+    else:
+        assert region.block_row0 == 0, region.block_row0
+        capacity = region.nblocks * rows_pb
+        if region.rows_used < capacity:
+            arr = jnp.pad(arr, ((0, capacity - region.rows_used), (0, 0)))
+        for j in range(region.nblocks):
+            typed_ldst.store_typed(
+                slot_ref.at[j],
+                arr[j * rows_pb : (j + 1) * rows_pb],
+                lane_split=region.lane_split,
+            )
 
 
 def _load_conv_state(slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int) -> jax.Array:
@@ -186,16 +232,75 @@ def _load_conv_state(slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int) -> jax.
 
 
 def _load_recurrent_state(
-    slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int
+    recurrent_slot_ref: jax.Ref,
+    conv_state_slot_ref: jax.Ref,
+    cfg: config.GDNConfig,
+    idx: int,
 ) -> jax.Array:
     """One slot's recurrent state, converted to FP32 for compute."""
     if cfg.state_plan is None:
-        return slot_ref[idx, cfg.state_in_pos].astype(jnp.float32)
-    return load_state_region(
-        slot_ref.at[idx, cfg.state_in_pos],
+        return recurrent_slot_ref[idx, cfg.state_in_pos].astype(jnp.float32)
+    state = load_state_region(
+        recurrent_slot_ref.at[idx, cfg.state_in_pos],
         cfg.state_plan.recurrent,
         (cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim),
     ).astype(jnp.float32)
+    if cfg.state_plan.scale is not None:
+        vreg_rows = cfg.state_plan.scale.rows_used
+        # The scale rides in the conv state's tile, so it arrives at the same
+        # incoming-state position (`GDNConfig.state_in_pos`).
+        scale_2d = load_state_region(
+            conv_state_slot_ref.at[idx, cfg.state_in_pos],
+            cfg.state_plan.scale,
+            (1, vreg_rows, cfg.v_head_dim),
+        ).astype(jnp.float32)
+        scale_3d = compute_gdn.fused_transpose_broadcast(
+            scale_2d, src_dim=1, dst_dim=0
+        )[: cfg.num_v_heads]
+        state = state * scale_3d
+    return state
+
+
+def store_recurrent_state(
+    recurrent_slot_ref: jax.Ref,
+    conv_state_slot_ref: jax.Ref,
+    cfg: config.GDNConfig,
+    state: jax.Array,
+) -> None:
+    """Stores one slot's recurrent state (and scale when quantized)."""
+    assert cfg.state_plan is not None
+    if cfg.state_plan.scale is None:
+        store_state_region(
+            recurrent_slot_ref,
+            cfg.state_plan.recurrent,
+            state,
+        )
+        return
+    qmax = 448.0 if cfg.state_plan.recurrent.pack == 4 else 6.0
+    amax = jnp.max(jnp.abs(state), axis=1, keepdims=True)
+    scale_3d = jnp.maximum(amax / qmax, jnp.finfo(jnp.float32).tiny)
+    inv_scale = 1.0 / scale_3d
+    scaled_2d = (state * inv_scale).reshape(-1, cfg.v_head_dim)
+    store_state_region(
+        recurrent_slot_ref,
+        cfg.state_plan.recurrent,
+        scaled_2d,
+    )
+    vreg_rows = cfg.state_plan.scale.rows_used
+    if cfg.num_v_heads < vreg_rows:
+        scale_3d_padded = jnp.pad(
+            scale_3d, ((0, vreg_rows - cfg.num_v_heads), (0, 0), (0, 0))
+        )
+    else:
+        scale_3d_padded = scale_3d
+    scale_2d = compute_gdn.fused_transpose_broadcast(
+        scale_3d_padded, src_dim=0, dst_dim=1
+    )[0]
+    store_state_region(
+        conv_state_slot_ref,
+        cfg.state_plan.scale,
+        scale_2d,
+    )
 
 
 def load_and_select_states(
@@ -260,7 +365,9 @@ def load_and_select_states(
             )
             prev_recurrent_state = jnp.where(
                 has_initial_state,
-                _load_recurrent_state(recurrent_slot_ref, cfg, idx),
+                _load_recurrent_state(
+                    recurrent_slot_ref, conv_state_slot_ref, cfg, idx
+                ),
                 0,
             )
             if carry_conv_scratch_ref is not None:
@@ -285,7 +392,9 @@ def load_and_select_states(
                 )
                 carry_recurrent_scratch_ref[idx] = jnp.where(
                     has_initial_state,
-                    _load_recurrent_state(recurrent_slot_ref, cfg, idx),
+                    _load_recurrent_state(
+                        recurrent_slot_ref, conv_state_slot_ref, cfg, idx
+                    ),
                     0,
                 )
 
@@ -312,18 +421,41 @@ def load_activation_as_compact(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Load activations from VMEM as a compact layout."""
 
-    qkv_vmem_ref[...] = qkv_vreg
-
     k_offset = cfgs.num_kq_heads * cfgs.kq_head_dim
     v_offset = 2 * k_offset
+    num_lanes = pltpu.get_tpu_info().num_lanes
 
-    q_compact = load_compact_heads(qkv_vmem_ref, cfgs.num_kq_heads, cfgs.kq_head_dim)
-    k_compact = load_compact_heads(
-        qkv_vmem_ref, cfgs.num_kq_heads, cfgs.kq_head_dim, k_offset
-    )
-    v_compact = load_compact_heads(
-        qkv_vmem_ref, cfgs.num_v_heads, cfgs.v_head_dim, v_offset
-    )
+    if cfgs.kq_head_dim % num_lanes == 0 and cfgs.v_head_dim % num_lanes == 0:
+        q_list = [
+            qkv_vreg[..., h * cfgs.kq_head_dim : (h + 1) * cfgs.kq_head_dim]
+            for h in range(cfgs.num_kq_heads)
+        ]
+        k_list = [
+            qkv_vreg[
+                ...,
+                k_offset + h * cfgs.kq_head_dim : k_offset + (h + 1) * cfgs.kq_head_dim,
+            ]
+            for h in range(cfgs.num_kq_heads)
+        ]
+        v_list = [
+            qkv_vreg[
+                ...,
+                v_offset + h * cfgs.v_head_dim : v_offset + (h + 1) * cfgs.v_head_dim,
+            ]
+            for h in range(cfgs.num_v_heads)
+        ]
+        q_compact = jnp.stack(q_list, axis=1)
+        k_compact = jnp.stack(k_list, axis=1)
+        v_compact = jnp.stack(v_list, axis=1)
+    else:
+        qkv_vmem_ref[...] = qkv_vreg
+        q_compact = load_compact_heads(qkv_vmem_ref, cfgs.num_kq_heads, cfgs.kq_head_dim)
+        k_compact = load_compact_heads(
+            qkv_vmem_ref, cfgs.num_kq_heads, cfgs.kq_head_dim, k_offset
+        )
+        v_compact = load_compact_heads(
+            qkv_vmem_ref, cfgs.num_v_heads, cfgs.v_head_dim, v_offset
+        )
     b_compact = jnp.expand_dims(b_vmem_ref[...], axis=1)
     if cfgs.is_kda:
         # KDA's gate is per-channel, so it splits into heads like q/k/v do
