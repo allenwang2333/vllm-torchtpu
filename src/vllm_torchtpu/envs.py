@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S: float = 30.0
     TPU_RAIDEN_ASYNC_COMPLETE: bool = False
     TPU_RAIDEN_COMPLETE_SLOW_MS: float = 100.0
+    TPU_PREFILL_SKIP_VERIFY_WARMUP: bool = False
     TPU_RAIDEN_TEST_REGISTRATION_DELAY_S: float = 0.0
     TPU_KV_STAGE_WAIT_TIMEOUT_SECS: float = 30.0
     TPU_KV_SHM_POOL_GB: float = 128.0
@@ -903,6 +904,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_RAIDEN_ASYNC_COMPLETE": env_bool("TPU_RAIDEN_ASYNC_COMPLETE", default=False),
     # Milliseconds; complete_request_blocks calls at least this slow are logged.
     "TPU_RAIDEN_COMPLETE_SLOW_MS": env_float("TPU_RAIDEN_COMPLETE_SLOW_MS", 100.0),
+    # Skip rejection sampler and decode/verify warmup on kv_producer nodes.
+    "TPU_PREFILL_SKIP_VERIFY_WARMUP": env_bool(
+        "TPU_PREFILL_SKIP_VERIFY_WARMUP", default=False
+    ),
     # TEST-ONLY fault injection, in seconds; 0 disables it.
     "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S": env_float(
         "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S", 0.0
