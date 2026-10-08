@@ -17,6 +17,9 @@ from vllm_torchtpu.layers.adapter.upstream_bindings import (
     device_hooks,
 )
 from vllm_torchtpu.model_loader_patches import register_row_slice
+from vllm_torchtpu.models.vllm.deepseek_v41.common.host_row_table import (
+    HostRowTable,
+)
 
 
 class NgramHashState(upstream.NgramHashState):
@@ -253,6 +256,9 @@ def _load_local_rows(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
 class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
     """Reuse upstream head sharding and checkpoint loaders; support Host DRAM."""
 
+    host_dma: bool = False
+    _host_rows: HostRowTable | None = None
+
     @staticmethod
     def _weight_loader(param, loaded_weight):
         loader = upstream.ParallelEngramEmbedding._weight_loader
@@ -278,6 +284,11 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             if cpu_offload is None
             else bool(cpu_offload)
         )
+        # Rows load into Host DRAM as with cpu_offload, then
+        # `move_rows_to_pinned_host` hands them to the TPU's pinned_host
+        # memory, after which `lookup` runs on device like an HBM table.
+        self.host_dma = self.cpu_offload and bool(envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA)
+        self._host_rows: HostRowTable | None = None
         # Upstream asks for the SM count solely to size its Triton lookup grid.
         # The TPU lookup below does not use that launch property.
         with device_hooks(
@@ -309,7 +320,46 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             ),
         )
 
+    def move_rows_to_pinned_host(self, device: torch.device) -> None:
+        """Loaded Host-DRAM rows -> TPU pinned_host, scales -> HBM (host_dma).
+
+        Runs once, outside compilation, after weights are loaded. Frees the
+        CPU tables.
+        """
+        if not self.host_dma or self._host_rows is not None:
+            return
+        weight, scales = self._storage()
+        self._host_rows = HostRowTable(weight, device)
+        # `.data =` cannot move a CPU parameter to the TPU; replace it.
+        self.weight_scale_inv = torch.nn.Parameter(
+            scales.to(device), requires_grad=False
+        )
+        self.weight.data = weight.new_empty((0, self.dim))
+
+    def _host_dma_lookup(self, indices, out):
+        assert self._host_rows is not None
+        dev = indices.device
+        heads = torch.arange(self.part_n_hash_cols, device=dev) + self.head_start
+        selected = indices[:, heads.clamp(max=self.n_hash_cols - 1)].long()
+        valid = (
+            (heads < self.n_hash_cols)[None, :]
+            & (selected >= self.vocab_start_idx)
+            & (selected < self.vocab_end_idx)
+        )
+        rows = (
+            (selected - self.vocab_start_idx)
+            .clamp(min=0, max=self.part_num_embeddings - 1)
+            .flatten()
+        )
+        raw = self._host_rows.gather(rows)
+        scale = torch.index_select(self.weight_scale_inv.data, 0, rows).masked_fill(
+            ~valid.flatten()[:, None], _INVALID_SCALE
+        )
+        out.copy_(dequant_fp8_rows(raw, scale, self.block_size).view(out.shape))
+
     def lookup(self, indices, out, background=False):
+        if self._host_rows is not None:
+            return self._host_dma_lookup(indices, out)
         weight, scales = self._storage()
         work_device = weight.device
         if indices.device != work_device:
@@ -459,7 +509,9 @@ class Engram(upstream.Engram):
         self._active_raw: torch.Tensor | None = None
         self._staged_by_tokens: dict[int, torch.Tensor] = {}
         self._staged_views_by_tokens: dict[int, torch.Tensor] = {}
-        if getattr(self.embed_tokens, "cpu_offload", False):
+        if getattr(self.embed_tokens, "cpu_offload", False) and (
+            getattr(self.embed_tokens, "host_dma", False) is not True
+        ):
             # Host DRAM tables: the host only gathers raw FP8 bytes and scale
             # bytes (a memcpy-bound index_select); dequantization runs inside
             # the compiled graph (`_ready_rows`). Dequantizing on the host cost

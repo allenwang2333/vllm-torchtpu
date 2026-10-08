@@ -312,7 +312,11 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         # row-major ({1,0}); artifacts compiled against the old {0,1} tables
         # fail at launch with RuntimeProgramInputMismatch. Bump this tag
         # whenever a load-time relayout changes a parameter layout.
-        "param_layouts": {"rope_tables": "row_major"},
+        "param_layouts": {
+            "rope_tables": "default"
+            if envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA
+            else "row_major"
+        },
     }
 
     repo_root = Path(__file__).resolve().parents[2]

@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v1"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
+    TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA: bool = False
     TPU_DEEPSEEK_V41_SP: bool = False
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
     TPU_K3_SP_PREFILL: bool = False
@@ -372,6 +373,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in (default False) to trade a small host-staging overhead for HBM.
     "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", default=False
+    ),
+    # With ENGRAM_CPU_OFFLOAD: after loading, move the Host-DRAM Engram rows
+    # into TPU pinned_host memory and gather them inside the compiled graph
+    # with a Pallas host DMA (kernels/deepseek_v41/host_row_gather.py), so
+    # decode needs no host hash/gather/H2D between steps. Scales go to HBM.
+    "TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA", default=False
     ),
     # Under V4.1 SP token-parallel FP8 attention, project q only for this
     # rank's token shard with an all-gathered wq_b and run wo_a for every

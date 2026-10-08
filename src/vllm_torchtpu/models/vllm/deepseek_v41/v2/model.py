@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Upstream V4.1 model assembly with TPU device operations."""
 
+import time
 from dataclasses import replace
 from itertools import islice
 
@@ -205,13 +206,39 @@ class DeepseekV41DecoderStage(_StageBase):
 
 class DeepseekV41Model(upstream.DeepseekV4Model):
     def _has_cpu_offloaded_engram(self) -> bool:
+        """Whether an Engram table is gathered on the host each step.
+
+        ``host_dma`` tables also load into Host DRAM but are gathered on
+        device (`_move_engram_rows_to_pinned_host`), like HBM tables.
+        """
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             engram = getattr(layer, "engram", None)
-            if engram is not None and getattr(
-                engram.embed_tokens, "cpu_offload", False
+            if (
+                engram is not None
+                and getattr(engram.embed_tokens, "cpu_offload", False)
+                and getattr(engram.embed_tokens, "host_dma", False) is not True
             ):
                 return True
         return False
+
+    def _move_engram_rows_to_pinned_host(self) -> None:
+        """One-time ``host_dma`` conversion once weights are loaded."""
+        if getattr(self, "_engram_rows_pinned", False):
+            return
+        start = time.perf_counter()
+        chunks = 0
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            engram = getattr(layer, "engram", None)
+            if engram is not None:
+                engram.embed_tokens.move_rows_to_pinned_host(engram.staged_rows.device)
+                rows = engram.embed_tokens._host_rows
+                chunks += 0 if rows is None else len(rows.chunks)
+        self._engram_rows_pinned = True
+        logger.info(
+            "Engram rows moved to TPU pinned_host (%d chunks) in %.1fs",
+            chunks,
+            time.perf_counter() - start,
+        )
 
     def _host_hash_inputs(self, input_ids, swa_metadata, lookback_token_ids):
         """CPU ``hash_on_host`` arguments for this step, or None.
@@ -817,7 +844,20 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         # vLLM's guard-free graph replays at every decode step.
         if self.model.engram_hash is not None:
             self.model.engram_hash.ensure_cache()
+        if envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA:
+            # Normally done by process_weights_after_loading; this covers
+            # loaders that skip load_weights (e.g. dummy weights). The
+            # compiled graph must see the pinned_host chunks, not the
+            # Host-DRAM tables.
+            self.model._move_engram_rows_to_pinned_host()
         return super().forward(*args, **kwargs)
+
+    def process_weights_after_loading(self) -> None:
+        super().process_weights_after_loading()
+        if envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA:
+            # Before the memory profile, so its HBM scales and staging are
+            # accounted for ahead of KV-cache sizing.
+            self.model._move_engram_rows_to_pinned_host()
 
     def __init__(self, *, vllm_config, prefix=""):
         # Keep capability guards until their device paths are validated.
@@ -840,7 +880,10 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
             from .async_fence import install_lookback_fence
 
             install_lookback_fence()
-        if envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:
+        if (
+            envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD
+            and not envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA
+        ):
             # Host-DRAM Engram tables: hash on the host from the runner's host
             # inputs instead of copying device hashes back every step.
             install_host_engram_inputs()
