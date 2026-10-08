@@ -546,6 +546,317 @@ def _attention_kernel(
     ### ------- Kernel end ------- ###
 
 
+def _attention_kernel_fused_swa(
+    # Prefetch
+    kv_lens_ref,  # [max_num_tokens]
+    start_end_seq_idx_ref,  # [3] (start_seq_idx, end_seq_idx, num_valid_tokens)
+    sem_ids_ref,  # [2] (bi_sem_idx, bo_sem_idx)
+    bo_ids_ref,  # [2] seq_idx_start of the in-flight bo DMA per bo sem
+    # Input
+    attention_sinks_ref,  # float32[num_q_heads]
+    q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
+    cache_kv_nope_hbm_ref,  # int32[chunk_size, topk, 128]
+    cache_kv_rope_hbm_ref,  # int32[chunk_size, topk // 4, 128]
+    swa_kv_hbm_ref,  # bf16[max_num_tokens, window, head_dim]
+    swa_bias_hbm_ref,  # float32[max_num_tokens, window]: 0 or finfo.min
+    # Output
+    o_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
+    # Scratch
+    bkv_nope_x2_ref,  # [2, batch_size, topk * 4, 128] uint8
+    bkv_rope_x2_ref,  # [2, batch_size, topk // 2, 128] bf16
+    bq_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
+    bo_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
+    swa_kv_x2_ref,  # [2, batch_size, window, head_dim] bf16
+    swa_bias_x2_ref,  # [2, batch_size, window] float32
+    sems,  # [6, 2]
+    *,
+    sm_scale: float,
+    batch_size: int = 1,
+):
+    """`_attention_kernel` with the sliding window folded into the softmax.
+
+    The window rows of every token arrive gathered in natural BF16 order
+    (``swa_kv``) with an additive column bias (``swa_bias``: 0 for a live
+    record, ``finfo.min`` for a ``-1`` record). One token's scores are the
+    lane concatenation ``[window | top-k]`` of two MXU products, one softmax
+    over both, and two PV products summed; there is no SWA pre-pass state.
+    """
+    assert q_hbm_ref.shape == o_hbm_ref.shape
+
+    num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
+    assert kv_lens_ref.shape[0] == num_tokens
+    cache_kv_nope_hbm_ref = cache_kv_nope_hbm_ref.bitcast(jnp.uint8)
+    cache_kv_rope_hbm_ref = cache_kv_rope_hbm_ref.bitcast(jnp.bfloat16)
+    bkv_sz = cache_kv_rope_hbm_ref.shape[1] * 2
+    window = swa_kv_hbm_ref.shape[1]
+    assert swa_kv_hbm_ref.shape == (num_tokens, window, head_dim)
+    assert swa_bias_hbm_ref.shape == (num_tokens, window)
+
+    q_dtype = q_hbm_ref.dtype
+    assert o_hbm_ref.dtype == q_dtype
+    assert head_dim % 128 == 0
+    assert window % 128 == 0
+
+    start_seq_idx = start_end_seq_idx_ref[0]
+    end_seq_idx = start_end_seq_idx_ref[1]
+    num_valid_tokens = start_end_seq_idx_ref[2]
+
+    batch_start_seq_idx = start_seq_idx + pl.program_id(0) * batch_size
+    batch_end_seq_idx = batch_start_seq_idx + batch_size - 1
+    score_min = jnp.finfo(jnp.float32).min
+
+    def qk_softmax(q, k_swa, swa_bias, kv, kv_len, attention_sinks):
+        # [num_q_heads, window + bkv_sz]: window columns first.
+        s_swa = jnp.einsum("nd,md->nm", q, k_swa, preferred_element_type=jnp.float32)
+        s_swa = s_swa * sm_scale + swa_bias
+        s_kv = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
+        s_kv *= sm_scale
+        k_span = lax.broadcasted_iota(jnp.int32, s_kv.shape, 1)
+        s_kv = jnp.where(k_span < kv_len, s_kv, score_min)
+        s = jnp.concatenate([s_swa, s_kv], axis=1)
+        m = jnp.max(s, axis=1, keepdims=True)
+        p = jnp.exp(s - m)
+        l_total = jnp.sum(p, axis=1, keepdims=True) + jnp.exp(attention_sinks - m)
+        return p, l_total
+
+    def pv(p, k_swa, kv, l_total):
+        acc = jnp.einsum(
+            "nm,md->nd", p[:, :window], k_swa, preferred_element_type=jnp.float32
+        )
+        acc += jnp.einsum(
+            "nm,md->nd", p[:, window:], kv, preferred_element_type=jnp.float32
+        )
+        return (
+            lax.div(acc, l_total)
+            if q_dtype == jnp.float32
+            else (acc * pl.reciprocal(l_total, approx=True)).astype(q_dtype)
+        )
+
+    def _async_copy(src, dst, sem, wait):
+        cp = pltpu.make_async_copy(src, dst, sem)
+        if wait:
+            cp.wait()
+        else:
+            cp.start()
+
+    def _fetch_inputs(seq_idx_start, sem_idx, *, wait=False):
+        page_idx_start = seq_idx_start - start_seq_idx
+        copies = (
+            (
+                cache_kv_nope_hbm_ref.at[pl.ds(page_idx_start, batch_size)],
+                bkv_nope_x2_ref.at[sem_idx, :],
+                sems.at[0, sem_idx],
+            ),
+            (
+                q_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
+                bq_x2_ref.at[sem_idx, :],
+                sems.at[1, sem_idx],
+            ),
+            (
+                swa_kv_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
+                swa_kv_x2_ref.at[sem_idx, :],
+                sems.at[3, sem_idx],
+            ),
+            (
+                swa_bias_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
+                swa_bias_x2_ref.at[sem_idx, :],
+                sems.at[4, sem_idx],
+            ),
+            (
+                cache_kv_rope_hbm_ref.at[pl.ds(page_idx_start, batch_size)],
+                bkv_rope_x2_ref.at[sem_idx, :],
+                sems.at[5, sem_idx],
+            ),
+        )
+        for src, dst, sem in copies:
+            if wait:
+                _async_copy(src=dst, dst=dst, sem=sem, wait=True)
+            else:
+                _async_copy(src, dst, sem, wait=False)
+
+    def _send_bo_batch(seq_idx_start, bo_sem_idx, *, wait=False):
+        sem = sems.at[2, bo_sem_idx]
+        sz = jnp.clip(num_valid_tokens - seq_idx_start, 1, batch_size)
+        vmem_ref = bo_x2_ref.at[bo_sem_idx, pl.ds(0, sz)]
+        if not wait:
+            bo_ids_ref[bo_sem_idx] = seq_idx_start
+            _async_copy(vmem_ref, o_hbm_ref.at[pl.ds(seq_idx_start, sz)], sem, wait)
+        else:
+            _async_copy(src=vmem_ref, dst=vmem_ref, sem=sem, wait=True)
+
+    def wait_send_bo_batch(bo_sem_idx):
+        old_seq_idx_start = bo_ids_ref[bo_sem_idx]
+
+        @pl.when(old_seq_idx_start >= 0)
+        def _():
+            _send_bo_batch(old_seq_idx_start, bo_sem_idx, wait=True)
+
+    def load_bkv(sem_idx, batch_idx):
+        bkv_nope = bkv_nope_x2_ref.at[sem_idx, batch_idx][...]
+        bkv_nope = _dequant_dsv4_fp8(bkv_nope.reshape(bkv_sz, -1))
+        bkv_rope = bkv_rope_x2_ref.at[sem_idx, batch_idx][...]
+        bkv_rope = bkv_rope.reshape(bkv_sz // 2, -1)
+        rope_dim = bkv_rope.shape[-1] // 2
+        bkv_rope = jnp.concatenate(
+            [bkv_rope[:, :rope_dim], bkv_rope[:, rope_dim:]], axis=0
+        )
+        bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
+        kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+        k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+        return jnp.where(k_span < kv_len, bkv, 0)
+
+    def load_swa(sem_idx, batch_idx):
+        bias = swa_bias_x2_ref[sem_idx, batch_idx, :][None, :]
+        k_swa = swa_kv_x2_ref.at[sem_idx, batch_idx][...]
+        # A dead record's row is arbitrary pool bytes (possibly NaN); its
+        # probability is exactly 0, so zero the row to keep 0 * NaN out.
+        live = (bias > score_min).reshape(window, 1)
+        return jnp.where(live, k_swa, jnp.zeros((), k_swa.dtype)), bias
+
+    def process():
+        bi_sem_idx = sem_ids_ref[0]
+        next_seq_idx = batch_start_seq_idx + batch_size
+        next_bi_sem_idx = lax.select(bi_sem_idx == 0, 1, 0)
+
+        @pl.when(next_seq_idx < end_seq_idx)
+        def prefetch_next_seq():
+            sem_ids_ref[0] = next_bi_sem_idx
+            _fetch_inputs(next_seq_idx, next_bi_sem_idx)
+
+        bo_sem_idx = sem_ids_ref[1]
+        sem_ids_ref[1] = lax.select(bo_sem_idx == 0, 1, 0)
+        attention_sinks = attention_sinks_ref[...][..., None]
+
+        _fetch_inputs(batch_start_seq_idx, bi_sem_idx, wait=True)
+
+        @pl.when(pl.program_id(0) >= 2)
+        def _wait_send():
+            wait_send_bo_batch(bo_sem_idx)
+
+        prev = None
+        prev_out = None
+        for batch_idx in range(batch_size):
+            bkv = load_bkv(bi_sem_idx, batch_idx)
+            k_swa, swa_bias = load_swa(bi_sem_idx, batch_idx)
+            bq = bq_x2_ref.at[bi_sem_idx, batch_idx][...]
+            if prev_out is not None:
+                # Artificial dependency limiting LLO's QK run-ahead, as in
+                # `_attention_kernel`.
+                bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
+            p, l_total = qk_softmax(
+                bq,
+                k_swa,
+                swa_bias,
+                bkv,
+                kv_lens_ref[batch_start_seq_idx + batch_idx],
+                attention_sinks,
+            )
+            if prev is not None:
+                out = pv(*prev)
+                bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out
+                prev_out = out
+            prev = (p.astype(jnp.bfloat16), k_swa, bkv, l_total)
+
+        assert prev is not None
+        bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = pv(*prev)
+        _send_bo_batch(batch_start_seq_idx, bo_sem_idx)
+
+    @pl.when(batch_start_seq_idx == start_seq_idx)
+    def prologue():
+        _fetch_inputs(batch_start_seq_idx, 0)
+
+    process()
+
+    @pl.when(batch_end_seq_idx == end_seq_idx - 1)
+    def epilogue():
+        wait_send_bo_batch(0)
+
+        @pl.when(pl.num_programs(0) >= 2)
+        def _wait_1():
+            wait_send_bo_batch(1)
+
+
+def fused_swa_attention_call(
+    q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim], padded
+    cache_kv_nope: jax.Array,  # int32[chunk_size, topk, 128]
+    cache_kv_rope: jax.Array,  # int32[chunk_size, topk // 4, 128]
+    swa_kv: jax.Array,  # bf16[max_num_tokens, window, head_dim]
+    swa_bias: jax.Array,  # float32[max_num_tokens, window]
+    kv_lens: jax.Array,  # i32[max_num_tokens]
+    attention_sinks: jax.Array,  # float32[num_q_heads], padded
+    *,
+    start_seq_idx: int,
+    end_seq_idx: jax.Array,
+    num_valid_tokens: jax.Array,
+    kernel_batch_size: int,
+    sm_scale: float,
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+) -> jax.Array:
+    """One chunk of `_attention_kernel_fused_swa`; returns the updated ``q``."""
+    batch_size = kernel_batch_size
+    _, num_q_heads, head_dim = q.shape
+    _, topk_rows, lanes = cache_kv_nope.shape
+    _, rope_rows, _ = cache_kv_rope.shape
+    window = swa_kv.shape[1]
+    end_seq_idx = jnp.maximum(start_seq_idx, end_seq_idx)
+    grid = (cdiv(end_seq_idx - start_seq_idx, batch_size),)
+    in_specs = [pl.BlockSpec(memory_space=pltpu.VMEM)] + [
+        pl.BlockSpec(memory_space=pltpu.HBM)
+    ] * 5
+    scratch_shapes = [
+        pltpu.VMEM((2, batch_size, topk_rows * 4, lanes), jnp.uint8),
+        pltpu.VMEM((2, batch_size, rope_rows * 2, lanes), jnp.bfloat16),
+        pltpu.VMEM((2, batch_size, num_q_heads, head_dim), q.dtype),
+        pltpu.VMEM((2, batch_size, num_q_heads, head_dim), q.dtype),
+        pltpu.VMEM((2, batch_size, window, head_dim), swa_kv.dtype),
+        pltpu.VMEM((2, batch_size, window), jnp.float32),
+        pltpu.SemaphoreType.DMA((6, 2)),
+    ]
+    scalar_prefetches = (
+        kv_lens,
+        jnp.array([start_seq_idx, end_seq_idx, num_valid_tokens], jnp.int32),
+        jnp.zeros((2,), jnp.int32),
+        jnp.full((2,), -1, jnp.int32),
+    )
+    scope_name = (
+        f"SparseMLA-fswa_{window}-p_{topk_rows}-bz_{batch_size}"
+        f"-gcz_{cache_kv_nope.shape[0]}"
+    )
+    kernel = jax.named_scope(scope_name)(
+        pl.pallas_call(
+            functools.partial(
+                _attention_kernel_fused_swa,
+                sm_scale=sm_scale,
+                batch_size=batch_size,
+            ),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=len(scalar_prefetches),
+                in_specs=in_specs,
+                out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+                grid=grid,
+                scratch_shapes=scratch_shapes,
+            ),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",),
+                vmem_limit_bytes=vmem_limit_bytes,
+                disable_bounds_checks=True,
+            ),
+            out_shape=jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
+            input_output_aliases={5: 0},
+            name=scope_name,
+        )
+    )
+    return kernel(
+        *scalar_prefetches,
+        attention_sinks,
+        q,
+        cache_kv_nope,
+        cache_kv_rope,
+        swa_kv,
+        swa_bias,
+    )
+
+
 def prepare_q_inputs(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
 ):

@@ -464,6 +464,33 @@ class TestBenchDecodeAttention:
                 res = bda.worker(ctx, args)
                 assert res["verify"]["finite_head_parallel"] is True
                 assert res["verify"]["token_parallel_vs_head_parallel"] == {"ok": True}
+                assert res["fused_swa"] is False
+                assert "fused_swa_vs_baseline" not in res["verify"]
+
+                # 1b. --fused-swa adds a same-mode baseline comparison; run the
+                # op bodies so the baseline wrappers execute.
+                def calling_op(name, fn, *a, **k):
+                    def call(*xs):
+                        with contextlib.suppress(Exception):
+                            fn(*xs)
+                        return torch.zeros((8, 8, 512), dtype=torch.bfloat16)
+
+                    return call
+
+                with (
+                    patch("torch_tpu._internal.pallas.jax_op", side_effect=calling_op),
+                    patch("jax.shard_map", side_effect=lambda f, **kw: f),
+                    patch(
+                        "jax.lax.fori_loop",
+                        side_effect=lambda low, high, body, init: body(0, init),
+                    ),
+                ):
+                    for mode in ("head_parallel", "token_parallel"):
+                        fused_args = argparse.Namespace(**vars(args), fused_swa=True)
+                        fused_args.mode = mode
+                        res = bda.worker(ctx, fused_args)
+                        assert res["fused_swa"] is True
+                        assert res["verify"]["fused_swa_vs_baseline"] == {"ok": True}
 
             # 2. Non-finite failure branch (lines 440-441)
             def non_finite_op(name, fn, *args, **kwargs):

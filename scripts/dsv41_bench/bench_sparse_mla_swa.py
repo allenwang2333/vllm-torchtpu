@@ -791,6 +791,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
     tokens = args.chunk_size
     q_len = int(getattr(args, "q_len", 0))
     swa_width_arg = int(getattr(args, "swa_width", 0))
+    fused_swa = bool(getattr(args, "fused_swa", False))
     if q_len > 0:
         if tokens % 4 != 0:
             raise ValueError(
@@ -1259,6 +1260,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                         starts=query_start_loc,
                         max_requests=max_requests,
                         precompacted=True,
+                        fused_swa=fused_swa,
                     )
                     return {"out": res.masked_fill(pad_mask, 0)}
             elif args.mode == "union_gather":
@@ -1278,6 +1280,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                         precompacted=True,
                         union_gather=True,
                         union_cap=union_cap,
+                        fused_swa=fused_swa,
                     )
                     return {"out": res.masked_fill(pad_mask, 0)}
             elif args.mode == "token_parallel":
@@ -1298,6 +1301,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                         token_parallel=True,
                         full_sink=sink_full,
                         tp_rank=tp_rank_t,
+                        fused_swa=fused_swa,
                     )
                     return {"out": res_hp.masked_fill(pad_mask, 0)}
             else:
@@ -1315,6 +1319,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                         starts=query_start_loc,
                         max_requests=max_requests,
                         precompacted=False,
+                        fused_swa=fused_swa,
                     )
                     return {"out": res.masked_fill(pad_mask, 0)}
 
@@ -1587,11 +1592,15 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                         common.LOSSLESS,
                         label="token_parallel vs baseline",
                     )
+                # The fused SWA kernel takes one joint softmax over window and
+                # top-k rows, so it is lossless, not bit-exact, against the
+                # two-stage baseline.
+                exact_mode = args.mode != "token_parallel" and not fused_swa
                 verify_report["selected_mode_vs_baseline"] = common.verify_outputs(
                     {"out": out["out"].cpu()},
                     {"out": base_out.cpu()},
-                    common.EXACT if args.mode != "token_parallel" else common.LOSSLESS,
-                    label=f"mode={args.mode} vs baseline",
+                    common.EXACT if exact_mode else common.LOSSLESS,
+                    label=f"mode={args.mode} fused_swa={fused_swa} vs baseline",
                 )
                 if args.mode == "token_parallel" and args.num_seqs == 1:
                     qsl_s4 = _build_query_start_loc(torch, tokens, 4).to("tpu")
@@ -1808,7 +1817,9 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                     )
                     verify_report["decode_subop_suite"] = subop_suite_res
                 criteria = (
-                    common.EXACT if args.mode != "token_parallel" else common.LOSSLESS
+                    common.EXACT
+                    if args.mode != "token_parallel" and not fused_swa
+                    else common.LOSSLESS
                 )
         else:
             criteria = common.LOSSLESS
@@ -1818,6 +1829,8 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
             if (q_len > 0 or window_size != geo.sliding_window)
             else ""
         )
+        if fused_swa:
+            case_suffix += "_FSWA"
         case_name = (
             f"sparse_mla_swa_{args.subop}_{args.mode}_T{tokens}_S{args.num_seqs}"
             f"_KV{args.kv_len}_CR{args.compress_ratio}_P{args.page_size}{case_suffix}"
@@ -1853,6 +1866,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
         "num_seqs": args.num_seqs,
         "q_len": q_len,
         "window_size": window_size,
+        "fused_swa": fused_swa,
         "kv_len": args.kv_len,
         "compress_ratio": args.compress_ratio,
         "page_size": args.page_size,
@@ -1883,6 +1897,11 @@ def main() -> None:
         type=int,
         default=0,
         help="Override sliding window width (e.g. 512 causal, 576 DSpark).",
+    )
+    parser.add_argument(
+        "--fused-swa",
+        action="store_true",
+        help="Fold SWA into the SparseMLA kernel on decode shapes (subop all).",
     )
     common.run_main("sparse_mla_swa", parser, worker)
 

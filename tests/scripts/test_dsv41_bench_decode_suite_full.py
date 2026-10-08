@@ -1816,6 +1816,37 @@ class TestBenchSparseMlaSwaFull:
                         "all_token_parallel" in res_dec["verify"]["decode_subop_suite"]
                     )
                 assert res_dec["window_size"] == swa_w
+                assert res_dec["fused_swa"] is False
+
+            # --fused-swa: lossless criteria and a distinct golden case.
+            for mode in ("baseline", "token_parallel"):
+                args_fswa = argparse.Namespace(
+                    chunk_size=128,
+                    q_len=6,
+                    swa_width=192,
+                    fused_swa=True,
+                    seed=42,
+                    num_seqs=4,
+                    kv_len=512,
+                    compress_ratio=2,
+                    page_size=16,
+                    unique_per_chunk=256,
+                    mode=mode,
+                    subop="all",
+                    verify=True,
+                    golden_dir=tmp_path / "golden",
+                    update_golden=False,
+                    profile=None,
+                    warmup=1,
+                    iters=1,
+                )
+                with patch.object(
+                    common, "golden_path", return_value=tmp_path / "missing.pt"
+                ) as golden_path:
+                    res_fswa = bs.worker(ctx, args_fswa)
+                assert res_fswa["fused_swa"] is True
+                assert golden_path.call_args.args[1].endswith("_FSWA")
+                assert res_fswa["verify"]["selected_mode_vs_baseline"] == {"ok": True}
 
     def test_sparse_mla_swa_main_and_entrypoint(self, monkeypatch):
         with patch.object(common, "run_main") as mock_rm:

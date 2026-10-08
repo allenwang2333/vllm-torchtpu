@@ -17,6 +17,7 @@ from .cache import (
     gather_cache_page_words,
     gather_cache_pieces,
     gather_cache_values,
+    merge_halves,
     merge_pieces,
     scatter_cache_values,
     split_halves,
@@ -764,22 +765,30 @@ def sparse_ragged_paged_attention_union_gather(
     cu_q_lens: jax.Array,
     distribution: jax.Array,
     attention_sinks: jax.Array,
-    swa_accumution: jax.Array,
-    swa_l: jax.Array,
-    swa_m: jax.Array,
+    swa_accumution: jax.Array | None,
+    swa_l: jax.Array | None,
+    swa_m: jax.Array | None,
     *,
     sm_scale: float = 1.0,
     gather_and_attention_chunk_size: int = 128,
     attention_kernel_batch_size: int = 16,
     union_cap: int = 4096,
     union_gather: bool = True,
+    swa_kv: jax.Array | None = None,
+    swa_bias: jax.Array | None = None,
 ) -> jax.Array:
-    """``sparse_ragged_paged_attention`` with per-chunk SparseCore Union Gather."""
+    """``sparse_ragged_paged_attention`` with per-chunk SparseCore Union Gather.
+
+    With ``swa_kv`` / ``swa_bias`` (see `fused_swa_inputs`) the chunks run
+    `sparse_mla.fused_swa_attention_call`, which attends the window rows and
+    the top-k rows in one softmax, and the SWA state arguments are unused.
+    """
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
     from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
 
+    fused_swa = swa_kv is not None
     _, actual_num_q_heads, actual_head_dim = q.shape
     q = sparse_mla.prepare_q_inputs(q)
     head_dim = q.shape[-1]
@@ -788,9 +797,14 @@ def sparse_ragged_paged_attention_union_gather(
         (0, q.shape[1] - actual_num_q_heads),
         constant_values=jnp.finfo(attention_sinks.dtype).min,
     )
-    swa_accumution, swa_l, swa_m = sparse_mla.prepare_swa_inputs(
-        swa_accumution, swa_l, swa_m
-    )
+    if fused_swa:
+        assert swa_bias is not None
+        swa_kv = jnp.pad(swa_kv, ((0, 0), (0, 0), (0, head_dim - actual_head_dim)))
+    else:
+        assert swa_accumution is not None and swa_l is not None and swa_m is not None
+        swa_accumution, swa_l, swa_m = sparse_mla.prepare_swa_inputs(
+            swa_accumution, swa_l, swa_m
+        )
 
     total_num_pages, page_size, _ = _paged_pool_shape(cache_kv_nope)
     _, num_q_heads, _ = q.shape
@@ -856,6 +870,23 @@ def sparse_ragged_paged_attention_union_gather(
         )
 
         end_seq_idx = jnp.maximum(start_pos, batch_end)
+        if fused_swa:
+            assert swa_kv is not None and swa_bias is not None
+            q = sparse_mla.fused_swa_attention_call(
+                q,
+                gathered_nope_buffer,
+                gathered_rope_buffer,
+                swa_kv,
+                swa_bias,
+                kv_lens,
+                attention_sinks,
+                start_seq_idx=start_pos,
+                end_seq_idx=end_seq_idx,
+                num_valid_tokens=valid_total,
+                kernel_batch_size=kbs,
+                sm_scale=sm_scale,
+            )
+            continue
         grid = (sparse_mla.cdiv(end_seq_idx - start_pos, kbs),)
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.VMEM),
@@ -924,6 +955,56 @@ def sparse_ragged_paged_attention_union_gather(
     return sparse_mla.prepare_outputs(q, actual_num_q_heads, actual_head_dim)
 
 
+def fused_swa_eligible(tokens: int, width: int, max_requests: int | None) -> bool:
+    """Shapes `_attend_window` hands to the per-token `_attend`: decode-sized.
+
+    Those are the batches where the window rows are gathered once per token
+    anyway, so folding them into the SparseMLA kernel costs no extra HBM
+    traffic and removes the XLA SWA pre-pass. Prefill tiles (``tokens`` a
+    multiple of 64 and at least 128, no ``tokens % 6`` DSpark verify batch)
+    keep the shared window-union gather. ``width`` (padded to 128) must leave
+    the ``[heads, width + top-k]`` score tile at or below 1024 lanes.
+    """
+    per_token = (
+        tokens % 64 != 0
+        or tokens < 128
+        or (max_requests is None and tokens % 6 == 0)
+        or width % 64 != 0
+        or width > 512
+    )
+    return per_token and 0 < width <= 512
+
+
+def fused_swa_inputs(
+    swa_pool: jax.Array | tuple[jax.Array, jax.Array],
+    swa_records: jax.Array,
+    dim: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Window rows in natural BF16 order and their additive score bias.
+
+    Returns ``(kv [tokens, width128, dim], bias [tokens, width128])`` with
+    ``width`` padded to a 128 multiple by ``-1`` records. The gather reads
+    the split element order (one SparseCore gather, as `_attend`) and
+    restores natural order with the MXU permutation `merge_halves`, so the
+    kernel can sum window and top-k PV products in one head-dim order.
+    Dead records read arbitrary pool rows; ``bias`` is ``finfo.min`` there
+    and the kernel zeroes those rows.
+    """
+    tokens, width = swa_records.shape
+    padded = max(128, -(-width // 128) * 128)
+    swa_records = jnp.pad(
+        swa_records, ((0, 0), (0, padded - width)), constant_values=-1
+    )
+    rows = gather_cache_values(
+        cast(Any, swa_pool), swa_records.reshape(-1), dim, split=True
+    )
+    kv = merge_halves(rows).reshape(tokens, padded, dim)
+    bias = jnp.where(swa_records >= 0, 0.0, jnp.finfo(jnp.float32).min).astype(
+        jnp.float32
+    )
+    return kv, bias
+
+
 def sparse_fp8_attention_jax(
     q: jax.Array,
     swa_pool: jax.Array | tuple[jax.Array, jax.Array],
@@ -940,6 +1021,7 @@ def sparse_fp8_attention_jax(
     precompacted: bool = False,
     union_gather: bool = False,
     union_cap: int = 4096,
+    fused_swa: bool = False,
 ) -> jax.Array:
     """BF16 SWA partial merged into V4's sparse MLA over FP8 NoPE + RoPE rows.
 
@@ -952,10 +1034,42 @@ def sparse_fp8_attention_jax(
     ``max_requests`` bounds requests per batch (see `_attend_window`).
     ``precompacted`` skips ``compact_records`` when ``main_records`` already has
     valid indices sorted ascending at the prefix and ``-1`` at the tail.
+    ``fused_swa`` attends the window inside the SparseMLA kernel on the
+    shapes of `fused_swa_eligible` instead of the XLA SWA pre-pass.
     """
     from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import (
         sparse_ragged_paged_attention,
     )
+
+    _cache_num_rows(main_pool)
+    compacted = (
+        _pad_compacted_records(main_records)
+        if precompacted
+        else compact_records(main_records)
+    )
+    nope_3d = _reshape_paged_pool(main_pool, page_size)
+    rope_3d = _reshape_paged_pool(rope_pool, page_size // 4)
+    distribution = jnp.array([0, 0, pages.shape[0]], jnp.int32)
+    if fused_swa and fused_swa_eligible(q.shape[0], swa_records.shape[1], max_requests):
+        swa_kv, swa_bias = fused_swa_inputs(swa_pool, swa_records, q.shape[-1])
+        return sparse_ragged_paged_attention_union_gather(
+            q,
+            nope_3d,
+            rope_3d,
+            compacted,
+            pages.reshape(-1),
+            query_start_loc,
+            distribution,
+            sink.astype(jnp.float32),
+            None,
+            None,
+            None,
+            sm_scale=scale,
+            union_cap=union_cap,
+            union_gather=union_gather,
+            swa_kv=swa_kv,
+            swa_bias=swa_bias,
+        )
 
     state = _attend_window(
         q,
@@ -971,17 +1085,9 @@ def sparse_fp8_attention_jax(
     # gathers after SWA instead so they pipeline with the SparseMLA chunks.
     # Without the conditional (``max_requests``) this ordering still measured
     # faster at 100k (16.0K vs 15.7K tok/s).
-    (maximum, denominator, numerator), main_pool, rope_pool = (
-        jax.lax.optimization_barrier((state, main_pool, rope_pool))
+    (maximum, denominator, numerator), nope_3d, rope_3d = jax.lax.optimization_barrier(
+        (state, nope_3d, rope_3d)
     )
-    _cache_num_rows(main_pool)
-    compacted = (
-        _pad_compacted_records(main_records)
-        if precompacted
-        else compact_records(main_records)
-    )
-    nope_3d = _reshape_paged_pool(main_pool, page_size)
-    rope_3d = _reshape_paged_pool(rope_pool, page_size // 4)
     if union_gather or isinstance(main_pool, tuple):
         return sparse_ragged_paged_attention_union_gather(
             q,
@@ -990,7 +1096,7 @@ def sparse_fp8_attention_jax(
             compacted,
             pages.reshape(-1),
             query_start_loc,
-            jnp.array([0, 0, pages.shape[0]], jnp.int32),
+            distribution,
             sink.astype(jnp.float32),
             numerator.astype(q.dtype),
             denominator,
@@ -1119,6 +1225,7 @@ def initialize_paged_attention():
         token_parallel: bool,
         union_gather: bool,
         union_cap: int,
+        fused_swa: bool = False,
     ) -> jax.Array:
         tokens = q.shape[0]
         use_token_parallel = (
@@ -1165,6 +1272,7 @@ def initialize_paged_attention():
                     precompacted=precompacted,
                     union_gather=union_gather,
                     union_cap=union_cap,
+                    fused_swa=fused_swa,
                 )
                 if pad_rows:
                     out_tok = out_tok[:-pad_rows]
@@ -1212,6 +1320,7 @@ def initialize_paged_attention():
                     precompacted=precompacted,
                     union_gather=union_gather,
                     union_cap=union_cap,
+                    fused_swa=fused_swa,
                 )
             ),
             mesh=tp_mesh,
@@ -1236,7 +1345,7 @@ def initialize_paged_attention():
         "pallas::dsv41v2_sparse_fp8_attention",
         fp8_attention,
         mesh=tp_mesh,
-        input_partition_specs=in_specs + (None,) * 7,
+        input_partition_specs=in_specs + (None,) * 8,
     )
     _fp8_attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1262,6 +1371,7 @@ def initialize_paged_attention():
         token_parallel: bool,
         union_gather: bool,
         union_cap: int,
+        fused_swa: bool = False,
     ) -> jax.Array:
         return fp8_attention(
             q,
@@ -1282,13 +1392,14 @@ def initialize_paged_attention():
             token_parallel,
             union_gather,
             union_cap,
+            fused_swa,
         )
 
     _fp8_attention_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_2bank",
         fp8_attention_2bank,
         mesh=tp_mesh,
-        input_partition_specs=(P(),) * 14 + (None,) * 7,
+        input_partition_specs=(P(),) * 14 + (None,) * 8,
     )
     _fp8_attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1712,8 +1823,13 @@ def sparse_fp8_attention(
     tp_rank=None,
     union_gather=False,
     union_cap=4096,
+    fused_swa=False,
 ):
-    """``main_records`` are raw rows, or rows paged by ``pages`` (main.pages)."""
+    """``main_records`` are raw rows, or rows paged by ``pages`` (main.pages).
+
+    ``fused_swa`` opts the small-batch decode shapes into the fused SWA
+    SparseMLA kernel (see `fused_swa_eligible`); other shapes are unaffected.
+    """
     assert _fp8_attention_op is not None and main.rope is not None
     page_size = main.shape[1]
     if pages is None or starts is None:
@@ -1739,6 +1855,7 @@ def sparse_fp8_attention(
         token_parallel,
         union_gather,
         union_cap,
+        fused_swa,
     )
     if _has_hi_bank(main):
         assert (

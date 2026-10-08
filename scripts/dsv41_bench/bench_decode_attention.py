@@ -240,24 +240,36 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
             input_partition_specs=(P(),) * n_in,
         )
 
+    fused_swa = bool(getattr(args, "fused_swa", False))
     attn_kw = dict(
-        scale=scale, page_size=page_size, max_requests=max_requests, precompacted=True
+        scale=scale,
+        page_size=page_size,
+        max_requests=max_requests,
+        precompacted=True,
+        fused_swa=fused_swa,
     )
+    base_kw = dict(attn_kw, fused_swa=False)
 
-    def hp_once(q, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, _r_id):
+    def hp_once(q, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, _r_id, kw=attn_kw):
         return sparse_fp8_attention_jax(
-            q, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, **attn_kw
+            q, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, **kw
         )
 
-    def tp_once(q, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, r_id):
+    def tp_once(q, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, r_id, kw=attn_kw):
         q_tok = jax.lax.all_to_all(q, "tp", split_axis=0, concat_axis=1, tiled=True)
         s_r_t, m_r_t, q_loc_t = slice_token_parallel_attention_inputs(
             s_r, m_r, q_loc, r_id, tp, seqs
         )
         out = sparse_fp8_attention_jax(
-            q_tok, s_p, m_p, r_p, s_r_t, m_r_t, pgs, q_loc_t, snk, **attn_kw
+            q_tok, s_p, m_p, r_p, s_r_t, m_r_t, pgs, q_loc_t, snk, **kw
         )
         return jax.lax.all_to_all(out, "tp", split_axis=1, concat_axis=0, tiled=True)
+
+    def hp_base(*xs):
+        return hp_once(*xs, kw=base_kw)
+
+    def tp_base(*xs):
+        return tp_once(*xs, kw=base_kw)
 
     def looped_all(once, n_reps):
         def fn(
@@ -439,6 +451,18 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
             )
             if not verify_report["finite_head_parallel"]:
                 raise common.VerificationError("head_parallel output has non-finite")
+            if fused_swa:
+                # Same mode without the fused kernel, on the same tree.
+                base_once = tp_base if tp_mode else hp_base
+                base1 = _op("verify_base", looped_all(base_once, 1), 10)
+                out_base = base1(*(tp_args if tp_mode else hp_args))
+                common.synchronize(out_base)
+                verify_report["fused_swa_vs_baseline"] = common.verify_outputs(
+                    {"out": (out_tp if tp_mode else out_hp).cpu()},
+                    {"out": out_base.cpu()},
+                    common.LOSSLESS,
+                    label=f"decode {args.mode} fused_swa vs baseline",
+                )
 
     per_rep = [s / reps for s in loop_samples]
     bytes_hp = decode_bytes_per_rank(seqs, topk, window)
@@ -447,6 +471,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
         "bench": "decode_attention",
         "subop": args.subop,
         "mode": args.mode,
+        "fused_swa": fused_swa,
         "num_seqs": seqs,
         "kv_len": args.kv_len,
         "page_size": page_size,
@@ -475,6 +500,11 @@ def main() -> None:
         type=int,
         default=None,
         help="serving uses max_num_seqs if <= 4 else None (attention.py:487)",
+    )
+    parser.add_argument(
+        "--fused-swa",
+        action="store_true",
+        help="Fold SWA into the SparseMLA kernel (TPU_DEEPSEEK_V41_FUSED_SWA).",
     )
     parser.set_defaults(num_seqs=16, kv_len=100000)
     common.run_main("decode_attention", parser, worker)
