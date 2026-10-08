@@ -97,7 +97,7 @@ def test_padded_kernel_copy_moves_bytes():
     ]
 
 
-@pytest.mark.parametrize("m", [32, 4096])
+@pytest.mark.parametrize("m", [17, 32, 4096])
 def test_fallback_path_reads_the_original_weight(m):
     """M > 16 stays on XLA and reads the original (unpadded) weight, so it is the
     incumbent's computation exactly, with or without a padded kernel copy."""

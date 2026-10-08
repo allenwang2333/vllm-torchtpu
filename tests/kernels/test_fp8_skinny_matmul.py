@@ -25,6 +25,7 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny, util
+from vllm_torchtpu.layers.adapter.linear_common import _fp8_linear_pallas_jax
 
 F8 = jnp.float8_e4m3fn
 
@@ -169,3 +170,68 @@ def test_supports():
     assert not fp8_skinny.supports(16, wq[:, :2624], ws[:2624])  # pad N at load first
     assert not fp8_skinny.supports(16, wq, ws.reshape(1, 1, 1, -1))  # blockwise scale
     assert not fp8_skinny.supports(16, wq.astype(jnp.bfloat16), ws)
+
+
+# --- Accuracy against the XLA path it replaces --------------------------------
+
+# GLM-5.2-FP8 MLA attention projections per rank (TP16): (K, logical N).
+ATTENTION_SITES = {
+    "fused_qkv_a_proj": (6144, 2624),
+    "q_b_proj": (2048, 16384),
+    "self_attn.o_proj": (1024, 6144),
+}
+
+
+def _dispatch(x, wq, ws):
+    """The runtime path, `_fp8_linear_pallas_jax`, padded copy included."""
+    n = wq.shape[1]
+    n_pad = fp8_skinny.padded_n(n)
+    if n_pad == n:
+        assert fp8_skinny.supports(x.shape[0], wq, ws)
+        return jax.jit(_fp8_linear_pallas_jax)(x, wq, ws)
+    wp = jnp.pad(wq.astype(jnp.float32), ((0, 0), (0, n_pad - n))).astype(F8)
+    sp = jnp.pad(ws, (0, n_pad - n), constant_values=1.0)
+    assert fp8_skinny.supports(x.shape[0], wp, sp)
+    return jax.jit(_fp8_linear_pallas_jax)(x, wq, ws, wp, sp)
+
+
+def _cos(a, b):
+    a = np.asarray(a, np.float64).ravel()
+    b = np.asarray(b, np.float64).ravel()
+    return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+
+@pytest.mark.parametrize("site", sorted(ATTENTION_SITES))
+@pytest.mark.parametrize("m", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("seed", [0, 1])
+def test_attention_site_accuracy_vs_xla(site, m, seed):
+    """Kernel vs `xla_quantized_matmul` at every decode batch size the kernel takes.
+
+    Measured on tpu7x: kernel 2.2-3.7e-3 from f64, XLA 6.6e-3-1.1e-2 (equal at M=1);
+    kernel vs XLA <= 1.16e-2, cos >= 0.999983; FP8 activation quantization
+    1.8-3.6e-2. Bounds below carry ~2x margin.
+    """
+    k, n = ATTENTION_SITES[site]
+    x = _x(m, k, m, seed=seed + 20)
+    wq, ws = _w(k, n, seed=seed + 30)
+    y_k = _dispatch(x, wq, ws)
+    y_x = jax.jit(util.xla_quantized_matmul)(x, wq, ws)
+    assert y_k.shape == y_x.shape == (m, n) and y_k.dtype == y_x.dtype
+    assert np.isfinite(np.asarray(y_k, np.float32)).all()
+
+    # Never less accurate than XLA against the same quantized operands, and f32-accurate
+    # in absolute terms (XLA's own error is loose enough to hide a bf16 accumulation).
+    ref = _oracle(x, wq, ws)
+    err_k, err_x = _row_err(y_k, ref), _row_err(y_x, ref)
+    assert err_k <= 1.1 * err_x + 2.0**-14, (err_k, err_x)
+    assert err_k <= 2.0**-7, err_k
+
+    # Close to XLA in absolute terms.
+    diff = _row_err(y_k, np.asarray(y_x, np.float64))
+    assert diff <= 0.025, diff
+    assert _cos(y_k, y_x) >= 0.9999
+
+    # Switching paths moves the output less than FP8 activation quantization does.
+    w64 = np.asarray(wq).astype(np.float64) * np.asarray(ws).astype(np.float64)[None]
+    unquantized = np.asarray(x, np.float64) @ w64
+    assert diff < _row_err(y_x, unquantized), (diff, _row_err(y_x, unquantized))
