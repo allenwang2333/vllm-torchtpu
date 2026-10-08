@@ -37,6 +37,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
+
 MAX_M = 16
 LANE = 128
 
@@ -169,7 +171,8 @@ def _build(m, k, n, n_stack, w_dtype, out_dtype, split, t, nbuf):
         in_specs=[
             pl.BlockSpec((m, k), lambda g, idx: (0, 0)),
             pl.BlockSpec((1, n), lambda g, idx: (0, 0)),
-            # W [s, k, n], pinned to HBM (MSA cannot move it into VMEM).
+            # W [s, k, n], read from HBM by the kernel's own DMA ring. XLA only
+            # keeps it there under TPU_FP8_SKINNY_PIN_HBM (see the call site).
             pl.BlockSpec(memory_space=pltpu.HBM),
         ],
         out_specs=pl.BlockSpec((m, n), lambda g, idx: (0, 0)),
@@ -210,6 +213,8 @@ def fp8_skinny_matmul_stacked(x, w_stack, idx, w_s, *, n_logical=None, config=No
     n_stack, _, n = w_stack.shape
     split, t, nbuf = config or pick_config(k, n)
     call = _build(m, k, n, n_stack, w_stack.dtype, x.dtype, split, t, nbuf)
+    if envs.TPU_FP8_SKINNY_PIN_HBM:
+        w_stack = pltpu.with_memory_space_constraint(w_stack, pltpu.HBM)
     out = call(idx, x, w_s.reshape(1, n).astype(jnp.float32), w_stack)
     if n_logical is not None and n_logical != n:
         out = out[:, :n_logical]

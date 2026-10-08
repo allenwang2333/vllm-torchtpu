@@ -177,6 +177,7 @@ if TYPE_CHECKING:
     TPU_FP8_LINEAR_PALLAS_SITES: str = (
         "fused_qkv_a_proj,q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     )
+    TPU_FP8_SKINNY_PIN_HBM: bool = True
 
 
 def env_with_choices(
@@ -1121,6 +1122,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_FP8_LINEAR_PALLAS_SITES",
         "fused_qkv_a_proj,q_b_proj,self_attn.o_proj,mlp.gate_up_proj",
     ),
+    # Constrain the fp8_skinny weight operand to HBM at the pallas_call boundary.
+    # The in-kernel HBM BlockSpec does not reach XLA, so without this MSA stages a
+    # small weight (o_proj, dense gate_up) into VMEM with a copy that starts right
+    # before the kernel, serialising the copy and the kernel's own stream.
+    "TPU_FP8_SKINNY_PIN_HBM": env_bool("TPU_FP8_SKINNY_PIN_HBM", default=True),
 }
 
 
