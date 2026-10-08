@@ -80,6 +80,14 @@ def weight_kinds(cfg):
         "sw2": (moe, (cfg.ISR, H), FP8),                    # TP slice
         "w13": (dense, (H, 2 * cfg.IDR), FP8),              # TP slice
         "w2": (dense, (cfg.IDR, H), FP8),                   # TP slice
+        # decode replicas (KREP > 0 only): slot q of this rank holds a copy of the kernel expert
+        # its smalls table names (rep_e / rep_s), see replicas.py
+        **({} if not cfg.KREP else {
+            "rw13": (moe, (cfg.KREP, H, 2 * cfg.I), FP8),
+            "rw2": (moe, (cfg.KREP, cfg.I, H), FP8),
+            "rs13": (moe, (cfg.KREP, 2 * cfg.I), F32),
+            "rs2": (moe, (cfg.KREP, H), F32),
+        }),
     }
 
 
@@ -427,7 +435,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         "shared": pltpu.VMEM((M, H), F32),
         "sxb": pltpu.VMEM((NBLK13, M, 128), F32), "sxb2": pltpu.VMEM((NBLK2, M, 128), F32), "xqm": pltpu.VMEM((M, H), FP8),
         "hitv": pltpu.VMEM((8, 128), I32), "hits": pltpu.SMEM((8, 128), I32),
-        "es13": pltpu.VMEM((cfg.ER, 2 * cfg.I), F32), "es2": pltpu.VMEM((cfg.ER, H), F32),
+        "es13": pltpu.VMEM((cfg.ER + cfg.KREP, 2 * cfg.I), F32),
+        "es2": pltpu.VMEM((cfg.ER + cfg.KREP, H), F32),
         "es_sem": pltpu.SemaphoreType.DMA((2,)),
     }
     for nm in ("ag", "q", "k", "a2a", "rso", "rsm"):
@@ -487,7 +496,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
     reach = {k: {SID[k]} for k in SEGS}
     reach["init"] = set()
-    for nh in sorted({0, 1, cfg.ER}):
+    for nh in sorted({0, 1, cfg.ER, cfg.ER + cfg.KREP}):
         seq = [SID[k] for l in range(L) for k in segs_py(l)
                for _ in range(nh * TE if k == "exp" else NTS[k])]
         reach["init"] |= set(seq[:NB])
@@ -593,13 +602,25 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             u = t - i * TE
             j = scr["hits"][1, i]
 
-            @pl.when(u < T13)
-            def _():
-                wsel("ew13", l, lambda r: copy("ew13", src_of("ew13", r, u, j), slot).start())
+            def exp_tiles(k13, k2, jj):
+                @pl.when(u < T13)
+                def _():
+                    wsel(k13, l, lambda r: copy("ew13", src_of("ew13", r, u, jj), slot).start())
 
-            @pl.when(u >= T13)
+                @pl.when(u >= T13)
+                def _():
+                    wsel(k2, l, lambda r: copy("ew2", src_of("ew2", r, u - T13, jj), slot).start())
+            if not cfg.KREP:
+                exp_tiles("ew13", "ew2", j)
+                return
+
+            @pl.when(j < cfg.ER)
             def _():
-                wsel("ew2", l, lambda r: copy("ew2", src_of("ew2", r, u - T13, j), slot).start())
+                exp_tiles("ew13", "ew2", j)
+
+            @pl.when(j >= cfg.ER)                    # replica slot q = j - ER
+            def _():
+                exp_tiles("rw13", "rw2", j - cfg.ER)
 
         def pump(site, allowed=None):
             """Issue stream tiles while a bank is free. st: 0 issued, 1 consumed, 2 layer, 3 segment,
@@ -1373,8 +1394,17 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             ER = cfg.ER
             pm = Phases(tiles.trace)
             pm.mark("M_sw13")
-            wsel("es13", l, lambda r: pltpu.make_async_copy(r, scr["es13"], scr["es_sem"].at[0]).start())
-            wsel("es2", l, lambda r: pltpu.make_async_copy(r, scr["es2"], scr["es_sem"].at[1]).start())
+            KREP, NS = cfg.KREP, cfg.R * cfg.KREP
+
+            def es_dst(k, rep_):
+                if not KREP:
+                    return scr[k]
+                return scr[k].at[pl.ds(ER, KREP)] if rep_ else scr[k].at[pl.ds(0, ER)]
+            wsel("es13", l, lambda r: pltpu.make_async_copy(r, es_dst("es13", False), scr["es_sem"].at[0]).start())
+            wsel("es2", l, lambda r: pltpu.make_async_copy(r, es_dst("es2", False), scr["es_sem"].at[1]).start())
+            if KREP:
+                wsel("rs13", l, lambda r: pltpu.make_async_copy(r, es_dst("es13", True), scr["es_sem"].at[0]).start())
+                wsel("rs2", l, lambda r: pltpu.make_async_copy(r, es_dst("es2", True), scr["es_sem"].at[1]).start())
             xq, sx = quant_rows(X)
             scr["xq"][:, :H] = xq
             # shared expert gate_up (TP slice)
@@ -1405,20 +1435,106 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 cnt = jnp.sum(jnp.where(eio == e, (wsel_ > 0).astype(I32), 0) * (rvalid > 0).astype(I32))
                 wloc = jnp.where(lane128 == j, col, wloc)
                 hitv = jnp.where(lane128 == j, cnt, hitv)
+            valid_tok = rvalid > 0
+            if KREP:
+                # replica table -> hits rows 2..7: 2-3 expert hit bits (all E), 4 rep_e, 5 rep_s,
+                # 6 per-rank distinct-expert loads, 7 moved flags. Routing is replicated, so every
+                # rank computes the same assignment (DP16 kernel, replicas.py).
+                hitf = jnp.sum(jnp.where(jnp.logical_and(wsel_ > 0, valid_tok), 1.0, 0.0),
+                               axis=0, keepdims=True)                      # [1, E]
+                hitb = (hitf > 0).astype(I32)
+                erow = lax.broadcasted_iota(I32, (1, cfg.E), 1)
+                for c_ in range(2):
+                    lo_, hi_ = c_ * 128, min(cfg.E, (c_ + 1) * 128)
+                    if hi_ <= lo_:
+                        row_ = jnp.zeros((1, 128), I32)
+                    elif hi_ - lo_ == 128:
+                        row_ = hitb[:, lo_:hi_]
+                    else:
+                        row_ = jnp.zeros((1, 128), I32)
+                        for e_ in range(lo_, hi_):
+                            row_ = jnp.where(lane128 == e_ - lo_,
+                                             jnp.sum(jnp.where(erow == e_, hitb, 0)), row_)
+                    scr["hitv"][2 + c_:3 + c_, :] = row_
+                rep_e = sm(slot, "rep_e").astype(I32)
+                rep_s = sm(slot, "rep_s").astype(I32)
+                scr["hitv"][4:5, :] = rep_e
+                scr["hitv"][5:6, :] = rep_s
+                ld_ = jnp.zeros((1, 128), I32)
+                for r_ in range(R):
+                    ld_ = jnp.where(lane128 == r_, jnp.sum(jnp.where(erow // ER == r_, hitb, 0)), ld_)
+                scr["hitv"][6:7, :] = ld_
+                scr["hitv"][7:8, :] = jnp.zeros((1, 128), I32)
+                ent = lane128 < NS
+                for q_ in range(KREP):                   # wloc lane ER + q: own slot q's expert
+                    eq = jnp.sum(jnp.where(jnp.logical_and(ent, rep_s == me * KREP + q_), rep_e, 0),
+                                 axis=1, keepdims=True)
+                    col = jnp.sum(jnp.where(eio == eq, wn, 0.0), axis=1, keepdims=True)
+                    wloc = jnp.where(lane128 == ER + q_, col, wloc)
             scr["wloc"][...] = wloc
             scr["hitv"][0:1, :] = hitv
             cp = pltpu.make_async_copy(scr["hitv"], scr["hits"], scr["misc_sem"])
             cp.start()
             cp.wait()
 
-            def cbody(j, n):
-                h_ = scr["hits"][0, j] > 0
+            if not KREP:
+                def cbody(j, n):
+                    h_ = scr["hits"][0, j] > 0
 
-                @pl.when(h_)
-                def _():
-                    scr["hits"][1, n] = j
-                return n + h_.astype(I32)
-            n_hit = lax.fori_loop(0, ER, cbody, jnp.int32(0))
+                    @pl.when(h_)
+                    def _():
+                        scr["hits"][1, n] = j
+                    return n + h_.astype(I32)
+                n_hit = lax.fori_loop(0, ER, cbody, jnp.int32(0))
+            else:
+                hs = scr["hits"]
+
+                def hrow(e):
+                    return 2 + e // 128, e % 128
+
+                def gbody(t, c):
+                    # greedy, 3 passes over the table: move hit expert e (not yet moved) to its
+                    # replica holder iff that leaves holder < owner in distinct-expert visits
+                    s_ = t % NS
+                    e = hs[4, s_]
+                    sl = hs[5, s_]
+                    ok = jnp.logical_and(e >= 0, sl >= 0)
+                    e = jnp.maximum(e, 0)
+                    r_ = jnp.maximum(sl, 0) // KREP
+                    a_ = e // ER
+                    la = hs[6, a_]
+                    lr = hs[6, r_]
+                    er_, el_ = hrow(e)
+                    mv = jnp.logical_and(ok, jnp.logical_and(hs[er_, el_] == 1, lr + 1 < la))
+
+                    @pl.when(mv)
+                    def _():
+                        hs[6, a_] = la - 1
+                        hs[6, r_] = lr + 1
+                        hs[er_, el_] = jnp.int32(2)
+                        hs[7, s_] = jnp.int32(1)
+                    return c
+                lax.fori_loop(0, 3 * NS, gbody, 0)
+
+                def pbody(j, n):                         # own primaries still here (hit, not moved)
+                    er_, el_ = hrow(me * ER + j)
+                    h_ = hs[er_, el_] == 1
+
+                    @pl.when(h_)
+                    def _():
+                        hs[1, n] = j
+                    return n + h_.astype(I32)
+                n_hit = lax.fori_loop(0, ER, pbody, jnp.int32(0))
+
+                def rbody(s_, n):                        # experts moved onto own replica slots
+                    sl = hs[5, s_]
+                    h_ = jnp.logical_and(hs[7, s_] == 1, jnp.logical_and(sl >= 0, sl // KREP == me))
+
+                    @pl.when(h_)
+                    def _():
+                        hs[1, n] = ER + sl % KREP
+                    return n + h_.astype(I32)
+                n_hit = lax.fori_loop(0, NS, rbody, n_hit)
             if "experts" in skip:
                 n_hit = jnp.int32(0)
             st[6] = n_hit
@@ -1432,8 +1548,11 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             scr["shared"][...] = bf(a * sx2 * sm(slot, "sw2_s"))
             pm.mark("M_exp")
             # routed experts
-            pltpu.make_async_copy(scr["es13"], scr["es13"], scr["es_sem"].at[0]).wait()
-            pltpu.make_async_copy(scr["es2"], scr["es2"], scr["es_sem"].at[1]).wait()
+            pltpu.make_async_copy(es_dst("es13", False), es_dst("es13", False), scr["es_sem"].at[0]).wait()
+            pltpu.make_async_copy(es_dst("es2", False), es_dst("es2", False), scr["es_sem"].at[1]).wait()
+            if KREP:
+                pltpu.make_async_copy(es_dst("es13", True), es_dst("es13", True), scr["es_sem"].at[0]).wait()
+                pltpu.make_async_copy(es_dst("es2", True), es_dst("es2", True), scr["es_sem"].at[1]).wait()
             scr["xqm"][...] = blk_quant(X, NBLK13, "sxb")
             scr["routed"][...] = jnp.zeros((M, H), F32)
 

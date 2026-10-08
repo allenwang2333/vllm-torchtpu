@@ -40,6 +40,7 @@ class MKDConfig:
     eps: float = 1e-5
     routed_scale: float = 2.5
     QB: int = 512          # expert lhs quant block (gmm_v2 quant_block_size)
+    KREP: int = 0          # decode replica slots per rank per MoE layer (0: off, program unchanged)
 
     @property
     def TMAX(self):
