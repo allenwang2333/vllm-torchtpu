@@ -28,7 +28,10 @@ os.environ.setdefault("TPU_SKIP_MDS_QUERY", "true")
 from vllm.config import CompilationMode
 
 from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.ced import DecoderReplayPlan
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.ced import (
+    DecoderReplayPlan,
+    plan_decoder_replay,
+)
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
     HOST_ENGRAM_KEY,
     HostEngramInputs,
@@ -1043,6 +1046,122 @@ class TestModelForward:
             model.encoder_stage = MagicMock(return_value=(hidden_tpu, pre_mix_tpu))
             model.forward(torch.tensor([1, 2, 3, 4]), torch.tensor([0, 1, 2, 3]))
             mock_sync.assert_called_once()
+
+    def test_forward_ced_identity_fast_path_and_plan_decoder_replay(self) -> None:
+        # 1. Direct plan_decoder_replay coverage (including is_identity)
+        assert (
+            plan_decoder_replay(
+                SimpleNamespace(
+                    query_start_loc_cpu=None, seq_lens_cpu=(1,), prompt_lens_cpu=(1,)
+                ),
+                512,
+                4,
+                (4, 8),
+            )
+            is None
+        )
+        with pytest.raises(ValueError, match="Invalid decoder replay"):
+            plan_decoder_replay(
+                SimpleNamespace(
+                    query_start_loc_cpu=(0, 1), seq_lens_cpu=(1,), prompt_lens_cpu=(1,)
+                ),
+                0,
+                4,
+                (4,),
+            )
+        with pytest.raises(ValueError, match="Query boundaries exceed"):
+            plan_decoder_replay(
+                SimpleNamespace(
+                    query_start_loc_cpu=(0, 5), seq_lens_cpu=(5,), prompt_lens_cpu=(5,)
+                ),
+                512,
+                4,
+                (4,),
+            )
+        with pytest.raises(ValueError, match="Invalid scheduled query"):
+            plan_decoder_replay(
+                SimpleNamespace(
+                    query_start_loc_cpu=(0, 2), seq_lens_cpu=(1,), prompt_lens_cpu=(1,)
+                ),
+                512,
+                4,
+                (4,),
+            )
+
+        id_meta = SimpleNamespace(
+            query_start_loc_cpu=(0, 2, 4),
+            seq_lens_cpu=(100, 1000),
+            prompt_lens_cpu=(80, 900),
+        )
+        plan_id = plan_decoder_replay(id_meta, 512, 4, (4, 8))
+        assert plan_id is not None and plan_id.is_identity is True
+        assert plan_id.replay_starts == (0, 388)
+
+        non_id_meta = SimpleNamespace(
+            query_start_loc_cpu=(0, 4),
+            seq_lens_cpu=(4,),
+            prompt_lens_cpu=(1000,),
+        )
+        plan_skip = plan_decoder_replay(non_id_meta, 512, 8, (4, 8))
+        assert plan_skip is not None and plan_skip.is_identity is False
+        assert plan_skip.indices == () and plan_skip.padded_num_tokens == 0
+
+        # 2. DeepseekV41Model.forward with plan.is_identity=True
+        # (zero & nonzero replay_starts, cache hits)
+        model = self._create_model(ced_enabled=True, sp_enabled=False)
+        hidden = torch.ones((4, 64))
+        pre_mix = torch.zeros((4, 64))
+        model.encoder_stage = MagicMock(return_value=(hidden, pre_mix))
+        dec_out = torch.ones((4, 64)) * 5.0
+        model.decoder_stage = MagicMock(return_value=dec_out)
+
+        plan_zero = DecoderReplayPlan(
+            indices=(0, 1, 2),
+            query_start_loc=(0, 2, 3),
+            replay_starts=(0, 0),
+            padded_num_tokens=4,
+            is_identity=True,
+        )
+        plan_nonzero = DecoderReplayPlan(
+            indices=(0, 1, 2),
+            query_start_loc=(0, 2, 3),
+            replay_starts=(0, 388),
+            padded_num_tokens=4,
+            is_identity=True,
+        )
+        meta_entry = _FakeAttnMeta(
+            input_positions=torch.tensor([0, 1, 2, 0]),
+            query_start_loc=torch.tensor([0, 2, 3]),
+            seq_lens=torch.tensor([10, 20]),
+        )
+        mock_ctx = _FakeForwardCtx(attn_metadata={"layer_0": meta_entry})
+        with patch(
+            "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
+            return_value=mock_ctx,
+        ):
+            with patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.plan_decoder_replay",
+                return_value=plan_zero,
+            ):
+                out1 = model.forward(
+                    torch.tensor([1, 2, 3, 0]), torch.tensor([0, 1, 2, 0])
+                )
+                out2 = model.forward(
+                    torch.tensor([1, 2, 3, 0]), torch.tensor([0, 1, 2, 0])
+                )
+                assert out1 is dec_out and out2 is dec_out
+
+            with patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.plan_decoder_replay",
+                return_value=plan_nonzero,
+            ):
+                out3 = model.forward(
+                    torch.tensor([1, 2, 3, 0]), torch.tensor([0, 1, 2, 0])
+                )
+                out4 = model.forward(
+                    torch.tensor([1, 2, 3, 0]), torch.tensor([0, 1, 2, 0])
+                )
+                assert out3 is dec_out and out4 is dec_out
 
 
 # ==============================================================================

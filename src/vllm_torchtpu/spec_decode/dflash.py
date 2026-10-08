@@ -249,6 +249,8 @@ class DFlashProposer:
         request_distribution: torch.Tensor,
         position_ids_override: torch.Tensor | None,
         padded_num_reqs: int,
+        seq_lens_cpu: tuple[int, ...] | None = None,
+        max_active_seq_len: int | None = None,
     ) -> dict:
         """Build the draft layers' attention metadata. The real path and
         the dummies share this so they dispatch the identical programs.
@@ -266,6 +268,8 @@ class DFlashProposer:
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
             position_ids_override=position_ids_override,
+            seq_lens_cpu=seq_lens_cpu,
+            max_active_seq_len=max_active_seq_len,
         )
         try:
             # Only the draft layers' KV cache groups. The full build walks
@@ -293,6 +297,24 @@ class DFlashProposer:
         query_start_loc, request_distribution = self._get_static_attn_tensors(
             padded_num_reqs
         )
+        chunk_seq_lens_cpu = getattr(chunk_ctx, "seq_lens_cpu", None)
+        chunk_max_seq_len = getattr(chunk_ctx, "max_active_seq_len", None)
+        if (
+            chunk_max_seq_len is None
+            and chunk_seq_lens_cpu is not None
+            and chunk.num_reqs > 0
+        ):
+            active = chunk_seq_lens_cpu[: chunk.num_reqs]
+            chunk_max_seq_len = (
+                int(active.max().item())
+                if isinstance(active, torch.Tensor)
+                else int(max(active))
+            )
+        draft_max_seq_len = (
+            min(chunk_max_seq_len + self.block_size, self._max_model_len)
+            if chunk_max_seq_len is not None
+            else None
+        )
         # num_reqs must be the REAL request count: the staging walk copies
         # exactly ctx.num_reqs block-table rows, and rows beyond the live
         # batch hold departed requests' freed block ids. With the real
@@ -306,6 +328,8 @@ class DFlashProposer:
             request_distribution=request_distribution,
             position_ids_override=chunk_ctx.position_ids_override,
             padded_num_reqs=padded_num_reqs,
+            seq_lens_cpu=chunk_seq_lens_cpu,
+            max_active_seq_len=draft_max_seq_len,
         )
 
     def _prepare_dflash_inputs(

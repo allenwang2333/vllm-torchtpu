@@ -70,6 +70,8 @@ def _versioned_subclass(base: type) -> type:
             self._row_rewrite[rows] = self._row_version[rows]
 
         def append_row(self, block_ids, row_idx):
+            if not block_ids:
+                return
             super().append_row(block_ids, row_idx)
             self._bt_mutations += 1
             self._row_version[row_idx] += 1
@@ -108,7 +110,9 @@ def ensure_tracked(block_table: Any) -> int:
     """
     token = getattr(block_table, "_bt_delta_token", None)
     if token is None:
-        num_rows = block_table.get_cpu_tensor().shape[0]
+        cpu_tensor = block_table.get_cpu_tensor()
+        num_rows = cpu_tensor.shape[0]
+        block_table._bt_cpu_np = cpu_tensor.numpy()
         block_table._row_version = np.zeros(num_rows, dtype=np.int64)
         block_table._row_rewrite = np.zeros(num_rows, dtype=np.int64)
         block_table._bt_mutations = 0
@@ -160,6 +164,7 @@ class _Layout:
     dev: torch.Tensor
     mirror: np.ndarray  # int32, equal to `dev` element for element
     entries: list[_EntryState]
+    tables: dict[int, torch.Tensor] | None = None
 
 
 class BlockTableDeltaStager:
@@ -181,6 +186,15 @@ class BlockTableDeltaStager:
             num_reqs_padded,
             start_index,
         )
+
+    def get_cached_tables(self, key: tuple) -> dict[int, torch.Tensor] | None:
+        layout = self._layouts.get(key)
+        return layout.tables if layout is not None else None
+
+    def set_cached_tables(self, key: tuple, tables: dict[int, torch.Tensor]) -> None:
+        layout = self._layouts.get(key)
+        if layout is not None:
+            layout.tables = tables
 
     def try_stage(
         self,
@@ -213,7 +227,7 @@ class BlockTableDeltaStager:
             nblocks = bt.num_blocks_per_row[start:end]
             region = layout.mirror[st.offset : st.offset + num_reqs_padded * tnb]
             mirror = region.reshape(num_reqs_padded, tnb)
-            source = bt.get_cpu_tensor().numpy()[start:end]
+            source = bt._bt_cpu_np[start:end]
             span = max(num_reqs, st.num_reqs)
             if active_cols != st.active_cols:
                 full_rows = np.arange(span)
@@ -270,6 +284,7 @@ class BlockTableDeltaStager:
             update[1, count:] = vals[0]
             update_dev = torch.from_numpy(update).to(layout.dev.device)
             layout.dev = apply_block_table_delta(layout.dev, update_dev)
+            layout.tables = None
             self.num_delta += 1
         else:
             self.num_reuse += 1

@@ -121,8 +121,9 @@ class AttentionMetadataBuilderContext:
     request_distribution: torch.Tensor
     position_ids_override: torch.Tensor | None = None
     query_start_loc_cpu: tuple[int, ...] | None = None
-    seq_lens_cpu: tuple[int, ...] | None = None
+    seq_lens_cpu: tuple[int, ...] | torch.Tensor | None = None
     prompt_lens_cpu: tuple[int, ...] | None = None
+    max_active_seq_len: int | None = None
     # Compact-mamba per-request recurrent-slot ids (device int32, length =
     # target_num_reqs). Only the mamba group's builder reads it; None when the
     # model has no mamba layers. See AttentionMetadata.mamba_state_indices.
@@ -337,16 +338,26 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         intact (avoiding XLA recompilation) while bounding the CPU slice copy to
         the power-of-2 bucket covering the active sequences' maximum block index.
         """
-        seq_lens_cpu = ctx.seq_lens_cpu
-        if (
-            seq_lens_cpu is None
-            and ctx.seq_lens is not None
-            and ctx.seq_lens.device.type == "cpu"
-        ):
-            seq_lens_cpu = ctx.seq_lens
-        if seq_lens_cpu is None or ctx.num_reqs <= 0 or target_num_blocks <= 16:
+        if ctx.num_reqs <= 0 or target_num_blocks <= 16:
             return target_num_blocks
-        max_seq_len = int(max(seq_lens_cpu[: ctx.num_reqs]))
+        max_seq_len = getattr(ctx, "max_active_seq_len", None)
+        if max_seq_len is None:
+            seq_lens_cpu = ctx.seq_lens_cpu
+            if (
+                seq_lens_cpu is None
+                and ctx.seq_lens is not None
+                and ctx.seq_lens.device.type == "cpu"
+            ):
+                seq_lens_cpu = ctx.seq_lens
+            if seq_lens_cpu is None:
+                return target_num_blocks
+            active = seq_lens_cpu[: ctx.num_reqs]
+            max_seq_len = (
+                int(active.max().item())
+                if isinstance(active, torch.Tensor)
+                else int(max(active))
+            )
+            ctx.max_active_seq_len = max_seq_len
         if max_seq_len <= 0:
             return min(16, target_num_blocks)
         needed_blocks = cdiv(max_seq_len, self.target_block_size)
@@ -615,6 +626,15 @@ def stage_block_table_uploads(
         ctx.staged_block_tables = {gid: staged_dev[:length]}
         return
 
+    if (
+        not mamba_geom
+        and stager is not None
+        and delta_key is not None
+        and (cached_tables := stager.get_cached_tables(delta_key)) is not None
+    ):
+        ctx.staged_block_tables = cached_tables
+        return
+
     if staged_dev.device.type == "tpu":
         products = _staged_walk_products_compiled(
             staged_dev,
@@ -637,6 +657,8 @@ def stage_block_table_uploads(
     ctx.staged_block_tables = {
         gid: products[i] for i, (gid, _, _) in enumerate(entries)
     }
+    if not mamba_geom and stager is not None and delta_key is not None:
+        stager.set_cached_tables(delta_key, ctx.staged_block_tables)
     if n_mamba:
         states = products[n_tables : n_tables + n_mamba]
         has_ckpt = ctx.mamba_ckpt_window > 1

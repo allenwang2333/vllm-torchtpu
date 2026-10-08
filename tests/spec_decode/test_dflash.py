@@ -572,3 +572,49 @@ def test_prepare_dflash_inputs_dp_lockstep(device):
     # Coordinated reqs = 4 -> 4 * 4 = 16 tokens padded.
     assert input_ids.shape == (16,)
     assert position_ids.shape == (16,)
+
+
+def test_build_draft_attn_metadata_propagates_max_active_seq_len():
+    device = torch.device("cpu")
+    proposer = _make_proposer(draft_tp=1)
+    proposer._draft_attn_layer_names = {"dummy_layer"}
+    captured_ctxs = []
+
+    def fake_build(layer_names, padded_num_reqs):
+        captured_ctxs.append(proposer.runner._attn_metadata_builder_ctx)
+        return {"dummy_layer": "ok"}
+
+    proposer.runner = SimpleNamespace(
+        device=device,
+        _attn_metadata_builder_ctx=None,
+        build_attention_metadata_for_layers=fake_build,
+    )
+    chunk = _make_chunk(
+        num_reqs=2,
+        start_index=0,
+        device=device,
+        query_start_loc_np=np.array([0, 2, 4], dtype=np.int32),
+        position_ids=torch.zeros(4, dtype=torch.int32, device=device),
+    )
+
+    # 1. Tuple seq_lens_cpu without pre-populated max_active_seq_len
+    chunk.attn_ctx.seq_lens_cpu = (100, 250, 0, 0)
+    proposer._build_draft_attn_metadata(
+        chunk, num_tokens_padded=10, seq_lens=torch.tensor([105, 255], device=device)
+    )
+    assert captured_ctxs[-1].seq_lens_cpu == (100, 250, 0, 0)
+    assert captured_ctxs[-1].max_active_seq_len == 250 + proposer.block_size
+
+    # 2. Tensor seq_lens_cpu without pre-populated max_active_seq_len
+    chunk.attn_ctx.seq_lens_cpu = torch.tensor([300, 120, 0, 0], dtype=torch.int32)
+    proposer._build_draft_attn_metadata(
+        chunk, num_tokens_padded=10, seq_lens=torch.tensor([305, 125], device=device)
+    )
+    assert captured_ctxs[-1].max_active_seq_len == 300 + proposer.block_size
+
+    # 3. Pre-populated max_active_seq_len clamped by _max_model_len
+    chunk.attn_ctx.max_active_seq_len = 2046
+    proposer._build_draft_attn_metadata(
+        chunk, num_tokens_padded=10, seq_lens=torch.tensor([2048, 125], device=device)
+    )
+    assert captured_ctxs[-1].max_active_seq_len == 2048

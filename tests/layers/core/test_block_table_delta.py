@@ -331,3 +331,38 @@ def test_warm_reuses_zero_update_and_device_copy_not_cloned(builders):
     assert stager._layouts[key].dev is dev
     assert btd.DELTA_CAPACITY == 8192
     assert btd.DELTA_CAPACITY >= 128 * 51
+
+
+def test_empty_append_row_cached_tables_and_active_cols_cache(builders, monkeypatch):
+    monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "1")
+    monkeypatch.setenv("TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", "0")
+    runner = _make_runner(builders)
+    for b in builders:
+        btd.ensure_tracked(b.bt)
+        b.bt.append_row([1, 2], 0)
+        mut_before = b.bt._bt_mutations
+        ver_before = int(b.bt._row_version[0])
+        b.bt.append_row([], 0)
+        assert b.bt._bt_mutations == mut_before
+        assert int(b.bt._row_version[0]) == ver_before
+
+    first = _stage(runner, 1, [8, 0], 2)
+    second = _stage(runner, 1, [8, 0], 2)
+    assert second is first
+    stager = runner._block_table_delta_stager
+    assert stager.get_cached_tables(("missing",)) is None
+    stager.set_cached_tables(("missing",), {})
+
+    # Tuple vs Tensor seq_lens_cpu and max_active_seq_len cache reuse
+    ctx_tuple = _ctx(1, [8, 0])
+    ctx_tuple.seq_lens_cpu = (8, 0)
+    cols0 = builders[0]._active_block_table_columns(ctx_tuple, MAX_BLOCKS)
+    assert ctx_tuple.max_active_seq_len == 8
+    cols1 = builders[1]._active_block_table_columns(ctx_tuple, MAX_BLOCKS)
+    assert cols0 == 16 and cols1 == 16
+
+    # Append beyond active_cols (st.nblocks[0] >= active_cols -> hi <= lo)
+    builders[0].bt.add_row(list(range(1, 20)), 0)
+    _stage(runner, 1, [4, 0], 2)
+    builders[0].bt.append_row([99], 0)
+    _stage(runner, 1, [4, 0], 2)

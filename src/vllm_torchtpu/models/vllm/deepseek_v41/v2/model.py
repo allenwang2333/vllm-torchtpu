@@ -482,19 +482,49 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # DEFER_AND_FUSE does not fuse both stages across the boundary.
                 synchronize_tensors((hidden, pre_mix))
 
-        if plan is None:
+        if plan is None or getattr(plan, "is_identity", False):
             decoder_metadata = metadata
             decoder_positions, decoder_ids = positions, input_ids
             decoder_hidden, decoder_mix = hidden, pre_mix
-            requests = first.seq_lens.shape[0] if first is not None else 1
-            replay_starts = positions.new_zeros(requests)
+            if plan is None:
+                requests = first.seq_lens.shape[0] if first is not None else 1
+                replay_starts = positions.new_zeros(requests)
+                decoder_padding = (
+                    torch.arange(positions.shape[0], device=positions.device)
+                    >= first.query_start_loc[-1]
+                    if first is not None
+                    else torch.zeros_like(positions, dtype=torch.bool)
+                )
+            else:
+                replay_key = (
+                    tuple(plan.replay_starts),
+                    positions.dtype,
+                    positions.device,
+                )
+                cached_replay = getattr(self, "_ced_replay_starts_cache", None)
+                if cached_replay is not None and cached_replay[0] == replay_key:
+                    replay_starts = cached_replay[1]
+                else:
+                    replay_starts = (
+                        torch.tensor(
+                            plan.replay_starts,
+                            dtype=positions.dtype,
+                            device=positions.device,
+                        )
+                        if any(plan.replay_starts)
+                        else positions.new_zeros(len(plan.replay_starts))
+                    )
+                    self._ced_replay_starts_cache = (replay_key, replay_starts)
+                pad_key = (positions.shape[0], len(plan.indices), positions.device)
+                cached_pad = getattr(self, "_ced_padding_mask_cache", None)
+                if cached_pad is not None and cached_pad[0] == pad_key:
+                    decoder_padding = cached_pad[1]
+                else:
+                    decoder_padding = torch.arange(
+                        positions.shape[0], device=positions.device
+                    ) >= len(plan.indices)
+                    self._ced_padding_mask_cache = (pad_key, decoder_padding)
             indices = None
-            decoder_padding = (
-                torch.arange(positions.shape[0], device=positions.device)
-                >= first.query_start_loc[-1]
-                if first is not None
-                else torch.zeros_like(positions, dtype=torch.bool)
-            )
         else:
             # The extra output row absorbs padded scatter writes. Reusing row
             # zero for padding would overwrite a real request's first result.

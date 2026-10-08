@@ -9,6 +9,7 @@ class DecoderReplayPlan:
     query_start_loc: tuple[int, ...]
     replay_starts: tuple[int, ...]
     padded_num_tokens: int
+    is_identity: bool = False
 
 
 def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
@@ -42,6 +43,11 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
     # independent symbolic token dimension into vLLM's guard-free full graph.
     buckets = sorted({num_tokens, *(int(n) for n in compile_sizes if int(n) > 0)})
     padded = next(n for n in buckets if n >= kept) if kept else 0
+    is_identity = kept > 0 and kept == bounds[-1] and padded == num_tokens
     return DecoderReplayPlan(
-        tuple(indices), tuple(output_bounds), tuple(replay_starts), padded
+        tuple(indices),
+        tuple(output_bounds),
+        tuple(replay_starts),
+        padded,
+        is_identity=is_identity,
     )
