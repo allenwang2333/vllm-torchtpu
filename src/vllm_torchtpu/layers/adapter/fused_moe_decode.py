@@ -22,6 +22,11 @@ all-reduce of their sum. The token count is static there, so the branch costs
 nothing at run time; branching in torch instead gives the two sides different
 graph inputs, which vLLM's per-bucket specialization of one traced graph
 refuses (``compilation.shape_variants``).
+
+``FUSED_MOE_PREFILL_KERNEL=1`` arms the same layers, with or without this
+kernel, and the same program serves steps of at least
+``FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS`` tokens with the fused MoE prefill
+kernel (``layers/adapter/fused_moe_prefill.py``).
 """
 
 import functools
@@ -40,6 +45,10 @@ from vllm_torchtpu.kernels.experimental.fused_moe_decode import (
     fused_moe_decode as _kernel_body,
 )
 from vllm_torchtpu.kernels.experimental.fused_moe_decode import vmem_bytes
+from vllm_torchtpu.layers.adapter.fused_moe_prefill import (
+    prefill_layer,
+    prefill_min_tokens,
+)
 from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
@@ -148,9 +157,28 @@ def _layer(
     topk,
     expert_parallel,
     max_tokens,
+    prefill_min_tokens=None,
 ):
-    """Per-rank body of the op: the kernel up to `max_tokens`, GMM MoE above."""
+    """Per-rank body of the op: the prefill kernel from `prefill_min_tokens`
+    tokens when it is on, else the decode kernel up to `max_tokens` and GMM MoE
+    above."""
     start = rank[0, 1] if expert_parallel else None
+    if prefill_min_tokens is not None and x.shape[0] >= prefill_min_tokens:
+        return prefill_layer(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            shared_w1,
+            shared_w1_scale,
+            shared_w2,
+            shared_w2_scale,
+            shared_gate_weight,
+            tw,
+            ti,
+            start,
+        )
     if x.shape[0] > max_tokens:
         return _gmm_layer(
             x,
@@ -190,8 +218,15 @@ def _layer(
     )
 
 
-def _build_op(mesh, n_ranks: int, topk: int, expert_parallel: bool, max_tokens: int):
-    key = (id(mesh), n_ranks, topk, expert_parallel, max_tokens)
+def _build_op(
+    mesh,
+    n_ranks: int,
+    topk: int,
+    expert_parallel: bool,
+    max_tokens: int,
+    prefill_min_tokens: int | None,
+):
+    key = (id(mesh), n_ranks, topk, expert_parallel, max_tokens, prefill_min_tokens)
     op = _OPS.get(key)
     if op is not None:
         return op
@@ -202,6 +237,7 @@ def _build_op(mesh, n_ranks: int, topk: int, expert_parallel: bool, max_tokens: 
         topk=topk,
         expert_parallel=expert_parallel,
         max_tokens=max_tokens,
+        prefill_min_tokens=prefill_min_tokens,
     )
 
     # torch_tpu infers static arguments from annotations: every operand is a
@@ -392,8 +428,9 @@ def _check_vmem(max_tokens: int, layer, i_s: int, n_ranks: int) -> None:
 
 
 def arm_fused_moe_decode(model: torch.nn.Module) -> int:
-    """Arm every eligible MoE layer of `model`; returns how many were armed."""
-    if not envs.FUSED_MOE_DECODE_KERNEL:
+    """Arm every eligible MoE layer of `model` for the decode and/or prefill
+    kernel; returns how many were armed."""
+    if not (envs.FUSED_MOE_DECODE_KERNEL or envs.FUSED_MOE_PREFILL_KERNEL):
         return 0
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
@@ -411,11 +448,15 @@ def arm_fused_moe_decode(model: torch.nn.Module) -> int:
     global _RANK_BUFFER, _RANK_BUFFER_START
     from vllm_torchtpu.layers.adapter.moe_routing import get_experts_start
 
-    max_tokens = envs.FUSED_MOE_DECODE_KERNEL_MAX_TOKENS
-    if max_tokens < 1:
-        raise ValueError(
-            f"FUSED_MOE_DECODE_KERNEL_MAX_TOKENS={max_tokens}: must be >= 1."
-        )
+    # 0: the decode kernel is off and GMM MoE serves what prefill does not.
+    max_tokens = 0
+    if envs.FUSED_MOE_DECODE_KERNEL:
+        max_tokens = envs.FUSED_MOE_DECODE_KERNEL_MAX_TOKENS
+        if max_tokens < 1:
+            raise ValueError(
+                f"FUSED_MOE_DECODE_KERNEL_MAX_TOKENS={max_tokens}: must be >= 1."
+            )
+    min_tokens = prefill_min_tokens()
     armed = 0
     for runner in runners:
         admitted = _admit(runner, n_ranks)
@@ -423,7 +464,8 @@ def arm_fused_moe_decode(model: torch.nn.Module) -> int:
             continue
         shared, expert_parallel = admitted
         layer = runner.routed_experts
-        _check_vmem(max_tokens, layer, shared[2].shape[0], n_ranks)
+        if max_tokens:
+            _check_vmem(max_tokens, layer, shared[2].shape[0], n_ranks)
         start = get_experts_start(layer) or 0
         if _RANK_BUFFER is None:
             _RANK_BUFFER = torch.tensor(
@@ -447,6 +489,7 @@ def arm_fused_moe_decode(model: torch.nn.Module) -> int:
                 layer.moe_config.experts_per_token,
                 expert_parallel,
                 max_tokens,
+                min_tokens,
             ),
         )
         for name, tensor in zip(_SHARED_BUFFERS, shared):
@@ -457,12 +500,14 @@ def arm_fused_moe_decode(model: torch.nn.Module) -> int:
         armed += 1
     if armed:
         logger.info(
-            "Armed the fused MoE decode kernel on %d of %d MoE layers "
-            "(%d ranks, up to %d tokens; GMM MoE above)",
+            "Armed fused MoE kernels on %d of %d MoE layers (%d ranks; decode "
+            "kernel up to %d tokens, prefill kernel from %s tokens, GMM MoE "
+            "otherwise)",
             armed,
             len(runners),
             n_ranks,
             max_tokens,
+            "-" if min_tokens is None else min_tokens,
         )
     return armed
 

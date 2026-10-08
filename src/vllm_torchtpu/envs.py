@@ -58,6 +58,8 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
+    FUSED_MOE_PREFILL_KERNEL: bool = False
+    FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -592,6 +594,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "FUSED_MOE_DECODE_KERNEL": env_bool("FUSED_MOE_DECODE_KERNEL"),
     "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS": env_int(
         "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256
+    ),
+    # Serve steps of at least FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS tokens of the
+    # same layers with the fused MoE prefill kernel: routed and shared experts,
+    # combine and all-reduce (layers/adapter/fused_moe_prefill.py). It takes
+    # precedence over the decode kernel; smaller steps run the decode kernel
+    # when that is on and its cap allows, else the GMM MoE path.
+    "FUSED_MOE_PREFILL_KERNEL": env_bool("FUSED_MOE_PREFILL_KERNEL"),
+    "FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS": env_int(
+        "FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS", 256
     ),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.

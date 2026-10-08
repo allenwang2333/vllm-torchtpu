@@ -4947,7 +4947,7 @@ class TPUModelRunner(GPUModelRunner):
             self._relayout_tables(getattr(self.drafter, "draft_model", None))
 
         # After the drafter, so its MTP layer is armed too.
-        if envs.FUSED_MOE_DECODE_KERNEL:
+        if envs.FUSED_MOE_DECODE_KERNEL or envs.FUSED_MOE_PREFILL_KERNEL:
             from vllm_torchtpu.layers.adapter.fused_moe_decode import arm_runner_models
 
             arm_runner_models(self)
