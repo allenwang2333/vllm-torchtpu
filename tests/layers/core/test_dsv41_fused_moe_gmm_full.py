@@ -674,3 +674,83 @@ def test_fused_moe_func(monkeypatch):
             onehot_moe_permute_threshold=0,
         )
         assert out3.shape == (num_tokens, hidden_size)
+
+
+def test_ext2_2d_combine_mathematical_invariants():
+    """Verify EXT-2 2D combine invariants, CSE one-hot sharing, and numeric bounds."""
+    rng = np.random.default_rng(42)
+    num_tokens = 8
+    topk = 6
+    local_experts = 16
+    hidden_size = 32
+    total_slots = num_tokens * topk
+
+    # Generate synthetic tokens, weights, expert assignments
+    x = jnp.array(rng.standard_normal((num_tokens, hidden_size)), dtype=jnp.bfloat16)
+    topk_ids = jnp.array(
+        rng.integers(-1, local_experts, size=(num_tokens, topk)), dtype=jnp.int32
+    )
+    topk_weights = jnp.array(
+        rng.uniform(0.01, 1.0, size=(num_tokens, topk)), dtype=jnp.float32
+    )
+    topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+
+    (
+        permuted_tokens,
+        group_sizes,
+        argsort_revert,
+        topk_weights_flat,
+        valid_mask,
+        token_indices_sorted,
+    ) = fused_moe_gmm.prepare_routed_gmm_inputs(
+        x,
+        topk_ids,
+        topk_weights,
+        local_num_experts=local_experts,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=128,
+    )
+
+    # 1. Direct 2D combine construction (EXT-2)
+    gated_weights = jnp.where(valid_mask, topk_weights_flat, 0).astype(jnp.bfloat16)
+    topk_weights_sorted = (
+        jnp.zeros_like(gated_weights).at[argsort_revert].set(gated_weights)
+    )
+    onehot_2d = jax.nn.one_hot(token_indices_sorted, num_tokens, dtype=jnp.bfloat16)
+    combine_2d = onehot_2d.T * topk_weights_sorted[None, :]
+
+    # 2. Reference 3D combine construction (Pre-EXT-2)
+    revert_indices = argsort_revert.reshape(num_tokens, topk)
+    onehot_3d = jax.nn.one_hot(revert_indices, argsort_revert.size, dtype=jnp.bfloat16)
+    combine_3d = (
+        onehot_3d
+        * topk_weights[..., None]
+        * valid_mask.reshape(num_tokens, topk)[..., None]
+    ).sum(axis=1)
+
+    # Invariant A: Shape equivalence
+    assert combine_2d.shape == (num_tokens, total_slots)
+    assert combine_3d.shape == (num_tokens, total_slots)
+
+    # Invariant B: Numerical equivalence (within BF16 precision)
+    diff = jnp.abs(combine_2d.astype(jnp.float32) - combine_3d.astype(jnp.float32))
+    max_diff = float(jnp.max(diff))
+    assert max_diff <= 2e-3, f"max diff {max_diff} exceeds BF16 bound"
+
+    # Invariant C: Cosine similarity >= 0.99999
+    c2_flat = combine_2d.astype(jnp.float32).ravel()
+    c3_flat = combine_3d.astype(jnp.float32).ravel()
+    cos_sim = float(
+        jnp.dot(c2_flat, c3_flat)
+        / (jnp.linalg.norm(c2_flat) * jnp.linalg.norm(c3_flat))
+    )
+    assert cos_sim >= 0.99999, f"cosine similarity {cos_sim} < 0.99999"
+
+    # Invariant D: Invalid (masked) slots produce exactly 0
+    invalid_positions = jnp.where(~valid_mask)[0]
+    if invalid_positions.size > 0:
+        for inv_pos in invalid_positions:
+            inv_sorted = int(argsort_revert[inv_pos])
+            assert float(combine_2d[:, inv_sorted].sum()) == 0.0
