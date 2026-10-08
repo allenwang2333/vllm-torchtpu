@@ -100,10 +100,11 @@ class Tiles:
     # TPU7x, j-da524a3e); "bf16": upcast both; "fp8": native.
     dot: str = "mixed"
     bank: int = 3 << 20
-    nbank: int = 12
+    nbank: int = 11          # 12 x 3 MiB overflowed VMEM by 291 KB with the double-buffered gather (AOT)
     trace: bool = False
     scan_depth: int = 8
-    topk_kc: int = 256
+    topk_kc: int = 512          # local extraction chunk (1-chip sweep j-ffda0844: 256 -> 512 = -3 us/row)
+    topk_kc_global: int = 256   # global compaction chunk (owns ~K/R slots: one chunk with the dyn count)
 
     def tk(self, K, N, dtype):
         """Largest 128-multiple divisor of K whose (tk, N) tile fits one bank."""
@@ -381,7 +382,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         "ip_sem": pltpu.SemaphoreType.DMA((tiles.scan_depth,)),
         "keys": pltpu.VMEM((cfg.QMAX, ROWSL, 128), I32),
         "kpre": pltpu.VMEM((max(ROWSL, 128), 128), I32),
-        "tk_acc": pltpu.VMEM((min(tiles.topk_kc, KT), 768), F32),
+        "tk_acc": pltpu.VMEM((min(max(tiles.topk_kc, tiles.topk_kc_global), KT), 768), F32),
         "tk_cc": pltpu.VMEM((2, 128, 128), F32),
         "cidx": pltpu.VMEM((KR_, 128), I32),
         "ksend": pltpu.VMEM((TMAX, KR_, 128), I32), "kall": pltpu.VMEM((R, TMAX, KR_, 128), I32),
@@ -1126,8 +1127,9 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 scr["gk"][s_ * KR_:(s_ + 1) * KR_, :] = scr["kall"][s_, t_]
             if GKR > R * KR_:
                 scr["gk"][R * KR_:GKR, :] = jnp.full((GKR - R * KR_, 128), INT_MIN, I32)
-            n_own = topk2.global_owned(scr["gk"], me, KT, scr["oslot"], scr["kpre"], scr["tk_acc"],
-                                       scr["tk_cc"], scr["gmk"], kc=tiles.topk_kc)
+            n_own = topk2.global_owned(scr["gk"], me, KT, scr["oslot"], scr["kpre"],
+                                       scr["tk_acc"].at[pl.ds(0, min(tiles.topk_kc_global, KT))],
+                                       scr["tk_cc"], scr["gmk"], kc=tiles.topk_kc_global)
             cp = pltpu.make_async_copy(scr["oslot"], scr["oslot_s"], scr["misc_sem"])
             cp.start()
             cp.wait()
@@ -1138,10 +1140,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 return c
             lax.fori_loop(0, n_own, mp, 0)
 
-            def pad(k, c):
-                scr["own_s"][t_ * KR_ + (k >> 7), k & 127] = jnp.int32(-1)
-                return c
-            lax.fori_loop(n_own, KT, pad, 0)
+            # own_s past n_own is never read (gather loops run to n; attention masks rows >= n)
             scr["nown_s"][t_] = n_own
             cp = pltpu.make_async_copy(scr["own_s"].at[pl.ds(t_ * KR_, KR_)], scr["own_v"].at[t_],
                                        scr["misc_sem"])
