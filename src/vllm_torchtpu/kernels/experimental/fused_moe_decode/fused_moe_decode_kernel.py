@@ -73,6 +73,7 @@ def _kernel(
     weight_dtype,
     rows=None,
     topk=None,
+    sent=None,
 ):
     """One rank's MoE block. Shapes use m tokens (padded to 16), h hidden, i
     and i_s the routed and shared intermediate sizes of this rank's slice, E
@@ -125,8 +126,9 @@ def _kernel(
       Output: out_ref [rows, h] bf16, this rank's rows, whatever the wire.
       Extra scratch: x_all [n, r16, h] and route_all [n, r16, 128] receive
         slab d from rank d (ag_* and route_* semaphores), r16 = rows rounded
-        up to 16; x_all is FP32 when rows is odd, and x_send [r16, h] FP32
-        stages the own rows for it (else unused); route_rows
+        up to 16; x_all is FP32 when the rows travel in FP32 (see the
+        gather below), and x_send [r16, h] FP32 stages the own rows for it
+        (else unused); route_rows
         [m, 128] f32 holds the routing token-major; coeff_ref [m, E padded]
         f32 is built here from it instead of arriving from XLA, and so is the
         compacted active-expert list: active_vmem [8, E padded] int32 holds
@@ -216,25 +218,28 @@ def _kernel(
         # every rank (itself included); the expert loop needs the routing
         # first, so it travels first.
         pl.semaphore_wait(barrier, n_ranks)
-        # Only the `rows` real rows travel, not the slab's tile padding (at
-        # one to four rows per rank the padded slab is 4-16x the bytes).
-        own = pl.ds(0, rows)
+        # Only the real rows travel (`sent` of them), not the slab's tile
+        # padding (at one to four rows per rank the padded slab is 4-16x the
+        # bytes). A DMA moves whole sublanes from a tile start: BF16 rows go
+        # when they are an even count under 16 or whole tiles; otherwise the
+        # rows go in FP32, rounded up to whole 8-row tiles above 8. Measured:
+        # one BF16 row arrived wrong, and both test jobs that sent 24 BF16
+        # rows (a tile and a half) died there with the node marked unhealthy.
+        own = pl.ds(0, sent)
         if x_send.dtype != x_ref.dtype:
-            # An odd row count is half a packed BF16 sublane, which a DMA
-            # cannot move alone (measured: one BF16 row arrived wrong), so
-            # those rows travel in FP32.
             x_send[:rows, :] = x_ref[...].astype(x_send.dtype)
             x_src = x_send.at[own]
         else:
             x_src = x_ref
-        for src, dst, send, recv_sem in (
-            (route_ref, route_all, route_send, route_recv),
-            (x_src, x_all, ag_send, ag_recv),
+        route_own = pl.ds(0, route_ref.shape[0])  # FP32 slab, same rule as x
+        for src, dst, send, recv_sem, part in (
+            (route_ref, route_all, route_send, route_recv, route_own),
+            (x_src, x_all, ag_send, ag_recv, own),
         ):
             for d in range(n_ranks):
                 copy = pltpu.make_async_remote_copy(
                     src,
-                    dst.at[me, own],
+                    dst.at[me, part],
                     send.at[d],
                     recv_sem,
                     device_id=(jnp.int32(d),),
@@ -244,7 +249,7 @@ def _kernel(
                 gather_sends.append(copy)
         # Token-major routing; rows past the n * rows real tokens stay 0.
         route_rows[...] = jnp.zeros(route_rows.shape, jnp.float32)
-        received = (slice(None), own)
+        received = (slice(None), route_own)
         pltpu.make_async_copy(
             route_all.at[received], route_all.at[received], route_recv
         ).wait()
@@ -271,6 +276,7 @@ def _kernel(
         copy.start()
         shared_gate = lane(2 * topk)
         acc_ref[...] = jnp.zeros((m, h), jnp.float32)
+        received = (slice(None), own)
         pltpu.make_async_copy(x_all.at[received], x_all.at[received], ag_recv).wait()
         for d in range(n_ranks):
             acc_ref[d * rows : (d + 1) * rows, :] = x_all[d, :rows, :].astype(
@@ -666,8 +672,15 @@ def _gather_rows_call(
     i_s = shared_w2.shape[0]
     weight_dtype = w1.dtype
     nb = _weight_ring_depth(h, i, weight_dtype)
-    # BF16 rows go two to a sublane: an odd count gathers in FP32.
-    xwire = hidden.dtype if rows % 2 == 0 else jnp.float32
+    # Rows the gather DMAs move, see _kernel: BF16 when an even count under
+    # 16 or whole tiles, else FP32 in whole 8-row tiles above 8.
+    if rows % 16 == 0 or (rows < 16 and rows % 2 == 0):
+        xwire, sent = hidden.dtype, rows
+    else:
+        xwire, sent = jnp.float32, rows if rows <= 8 else rows + (-rows) % 8
+    route_rows = rows if rows <= 8 else rows + (-rows) % 8  # FP32 slab, as x
+    if route_rows != rows:
+        route = jnp.pad(route, ((0, route_rows - rows), (0, 0)))
     # Reduce-scatter buffers exactly as scatter_rows on the gathered batch.
     wire = hidden.dtype if rows % 16 == 0 else jnp.float32
     out_rows = rows if rows % 16 == 0 else -(-rows // 8) * 8
@@ -684,6 +697,7 @@ def _gather_rows_call(
             weight_dtype=weight_dtype,
             rows=rows,
             topk=topk,
+            sent=sent,
         ),
         out_shape=jax.ShapeDtypeStruct((rows, h), hidden.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -715,7 +729,7 @@ def _gather_rows_call(
                 pltpu.SemaphoreType.DMA((n_ranks,)),
                 pltpu.SemaphoreType.DMA(()),
                 pltpu.SemaphoreType.DMA(()),
-                pltpu.VMEM((r16, h) if rows % 2 else (8, 128), xwire),
+                pltpu.VMEM((r16, h) if xwire != hidden.dtype else (8, 128), xwire),
             ],
         ),
         compiler_params=pltpu.CompilerParams(

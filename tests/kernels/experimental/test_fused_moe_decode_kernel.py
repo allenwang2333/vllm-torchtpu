@@ -326,13 +326,14 @@ def test_scatter_rows_is_own_slice_of_all_reduce(setup, m, ep):
     assert not np.allclose(np.roll(own, 1, axis=0), full, rtol=1e-2, atol=1e-3)
 
 
-@pytest.mark.parametrize("rows", [1, 4, 16, 24])
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 12, 16, 24])
 @pytest.mark.parametrize("ep", [False, True])
 def test_gather_rows_matches_scatter_rows_on_gathered_inputs(setup, rows, ep):
     """gather_rows=True on each rank's own rows (the kernel all-gathers them)
     returns exactly what scatter_rows=True returns when XLA all-gathered the
-    same rows rank-major first: bit-identical, on both wires (rows % 16 == 0
-    is BF16, the others FP32)."""
+    same rows rank-major first: bit-identical, on every gather wire (BF16 rows
+    for 2/4/8/12/16, FP32 for 1 and 24) and reduce-scatter wire (rows % 16 ==
+    0 is BF16, the others FP32)."""
     mesh, sh, rank, weights, shared_gate_weight = setup
     m = rows * N
     rng = np.random.default_rng(200 + m)
