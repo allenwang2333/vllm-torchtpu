@@ -253,6 +253,34 @@ def assemble_spec_next_tokens(
     return src.reshape(-1)  # [num_reqs * (1 + K)]
 
 
+def assemble_spec_next_tokens_and_num_rejected(
+    next_tokens: torch.Tensor,
+    drafts: torch.Tensor,
+    num_draft: torch.Tensor | None,
+    num_reqs: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused async substitution source and per-request rejected-draft count.
+
+    Computes ``num_valid = (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1)``
+    once and reuses it for both bonus-column extraction and ``num_rejected``.
+    """
+    nt = next_tokens[:num_reqs]
+    drafts = drafts[:num_reqs]
+    num_valid = (nt != INVALID_TOKEN_ID).sum(dim=1)
+    last_valid_col = num_valid.clamp(min=1) - 1
+    bonus = nt.gather(1, last_valid_col.unsqueeze(1))  # [num_reqs, 1]
+    src = torch.cat([bonus.to(drafts.dtype), drafts], dim=1).reshape(-1)
+    if num_draft is None:
+        num_rejected = torch.zeros(
+            num_reqs, dtype=torch.int32, device=next_tokens.device
+        )
+    else:
+        num_rejected = (
+            (num_draft[:num_reqs] - num_valid + 1).clamp(min=0).to(torch.int32)
+        )
+    return src, num_rejected
+
+
 def subtract_num_rejected_tokens(
     seq_lens: torch.Tensor,
     positions: torch.Tensor,
@@ -277,18 +305,17 @@ def subtract_num_rejected_tokens(
         positions_subtract_indices: ``[total_tokens]`` index into ``num_rejected``
             for each position slot, ``-1`` to leave it unchanged.
     """
-    zero = num_rejected.new_zeros(())
     seq_subtract = torch.where(
         seq_lens_subtract_indices >= 0,
         num_rejected[seq_lens_subtract_indices.clamp(min=0)],
-        zero,
+        0,
     )
     seq_lens = seq_lens - seq_subtract
 
     pos_subtract = torch.where(
         positions_subtract_indices >= 0,
         num_rejected[positions_subtract_indices.clamp(min=0)],
-        zero,
+        0,
     )
     if positions.ndim == 2:  # mrope (out of text-MVP scope; kept for parity)
         pos_subtract = pos_subtract.unsqueeze(0)

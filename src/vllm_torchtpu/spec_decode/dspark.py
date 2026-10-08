@@ -22,6 +22,7 @@ Gumbel-coupled sampling is not implemented.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from vllm.config import VllmConfig
 
 from vllm_torchtpu.logger import init_logger
@@ -125,23 +126,38 @@ class DSparkProposer(DFlashProposer):
         )
 
         padded_num_reqs = hidden.shape[0] // block_size
-        valid_hidden = hidden[: padded_num_reqs * block_size]
+        num_valid_tokens = padded_num_reqs * block_size
+        # Transpose [padded_num_reqs, block_size, H] -> [block_size, padded_num_reqs, H]
+        # before compute_draft_logits so each Markov step i indexes a contiguous
+        # [padded_num_reqs, vocab] slice instead of a strided [:, i] view across
+        # the full draft-vocab logits tensor, and pad back to hidden.shape[0] so
+        # the TP all-gather inside compute_draft_logits stays 8-row aligned.
+        slot_major_hidden = (
+            hidden[:num_valid_tokens]
+            .view(padded_num_reqs, block_size, hidden.shape[-1])
+            .transpose(0, 1)
+            .contiguous()
+            .view(num_valid_tokens, hidden.shape[-1])
+        )
+        pad_tokens = hidden.shape[0] - num_valid_tokens
+        if pad_tokens > 0:
+            slot_major_hidden = F.pad(slot_major_hidden, (0, 0, 0, pad_tokens))
 
         # Draft-vocab logits for every slot; the Markov bias is added in
         # draft space and ids are remapped to target vocab after argmax.
-        logits = self.draft_model.compute_draft_logits(valid_hidden)
-        logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
-
-        ids_3d = input_ids[: padded_num_reqs * block_size].view(
-            padded_num_reqs, block_size
+        logits = self.draft_model.compute_draft_logits(slot_major_hidden)
+        logits_slot_major = logits[:num_valid_tokens].view(
+            block_size, padded_num_reqs, logits.shape[-1]
         )
+
+        ids_3d = input_ids[:num_valid_tokens].view(padded_num_reqs, block_size)
         prev = ids_3d[:, 0]
         draft_tokens = []
         sample_start = 0 if self.sample_from_anchor else 1
         for i in range(sample_start, block_size):
             bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
             step = self.draft_model.map_draft_to_target(
-                (logits_3d[:, i] + bias).argmax(dim=-1)
+                (logits_slot_major[i] + bias).argmax(dim=-1)
             )
             draft_tokens.append(step)
             prev = step

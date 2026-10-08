@@ -218,8 +218,13 @@ def _greedy_rejection_sample_with_segment(
     batch_size = num_draft_tokens.shape[0]
     device = draft_token_ids.device
 
-    # Get target argmax
-    target_logits_argmax = torch.argmax(target_logits, dim=-1).to(torch.int32)
+    # Accept either 1D pre-argmax'd target token IDs (from spec_bonus_and_target_logits)
+    # or 2D [num_tokens, vocab_size] target logits.
+    target_logits_argmax = (
+        target_logits.to(torch.int32)
+        if target_logits.ndim == 1
+        else torch.argmax(target_logits, dim=-1).to(torch.int32)
+    )
     draft_token_ids = draft_token_ids.to(torch.int32)
 
     # Find the first mismatch index per segment using matrix masking.

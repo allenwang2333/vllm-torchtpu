@@ -166,3 +166,109 @@ def test_no_forced_embedding_sharing():
     # has_own_embed_tokens / has_own_lm_head instead of force-sharing.
     p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
     assert p._force_share_target_embeddings is False
+
+
+class _FakeDSparkDraftModel:
+    def __init__(
+        self, hidden: torch.Tensor, lm_weight: torch.Tensor, markov_table: torch.Tensor
+    ):
+        self._hidden = hidden
+        self._lm_weight = lm_weight
+        self._markov_table = markov_table
+        self.last_logits_input_shape: tuple[int, ...] | None = None
+
+    def model(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        del input_ids, positions
+        return self._hidden
+
+    def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        self.last_logits_input_shape = tuple(hidden_states.shape)
+        return hidden_states @ self._lm_weight.T
+
+    def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self._markov_table[token_ids]
+
+    def markov_bias(self, embed: torch.Tensor) -> torch.Tensor:
+        return embed
+
+    def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
+        return draft_ids + 2
+
+
+@pytest.mark.parametrize("sample_from_anchor", [True, False])
+@pytest.mark.parametrize("pad_tokens", [0, 3])
+def test_dflash_forward_and_sample_slot_major_parity(
+    sample_from_anchor: bool, pad_tokens: int
+):
+    num_spec = 5
+    p = _make_proposer(
+        {
+            "dspark_noise_token_id": 7,
+            "dspark_block_size": num_spec,
+            "sample_from_anchor": sample_from_anchor,
+            **_LAYER_IDS,
+        },
+        num_speculative_tokens=num_spec,
+    )
+    block_size = p.block_size
+    padded_num_reqs = 4
+    total_tokens = padded_num_reqs * block_size + pad_tokens
+    hidden_size = 8
+    draft_vocab = 16
+    target_vocab = 24
+
+    gen = torch.Generator().manual_seed(42 + pad_tokens + int(sample_from_anchor))
+    hidden = torch.randn(total_tokens, hidden_size, generator=gen)
+    lm_weight = torch.randn(draft_vocab, hidden_size, generator=gen)
+    markov_table = torch.randn(target_vocab, draft_vocab, generator=gen)
+    input_ids = torch.randint(0, 10, (total_tokens,), generator=gen, dtype=torch.int32)
+    positions = torch.arange(total_tokens, dtype=torch.int32)
+
+    p.draft_model = _FakeDSparkDraftModel(hidden, lm_weight, markov_table)
+    fn = getattr(
+        DSparkProposer._dflash_forward_and_sample,
+        "__wrapped__",
+        DSparkProposer._dflash_forward_and_sample,
+    )
+    draft_tokens_chunk, out_hidden = fn(p, input_ids, positions, block_size)
+
+    assert torch.equal(out_hidden, hidden)
+    assert p.draft_model.last_logits_input_shape == (total_tokens, hidden_size)
+
+    # Reference request-major calculation.
+    valid_hidden = hidden[: padded_num_reqs * block_size]
+    ref_logits_3d = (valid_hidden @ lm_weight.T).view(
+        padded_num_reqs, block_size, draft_vocab
+    )
+    prev = input_ids[: padded_num_reqs * block_size].view(padded_num_reqs, block_size)[
+        :, 0
+    ]
+    ref_steps = []
+    sample_start = 0 if sample_from_anchor else 1
+    for i in range(sample_start, block_size):
+        bias = markov_table[prev]
+        step = (ref_logits_3d[:, i] + bias).argmax(dim=-1) + 2
+        ref_steps.append(step)
+        prev = step
+    ref_chunk = torch.stack(ref_steps, dim=1)
+    assert torch.equal(draft_tokens_chunk, ref_chunk)
+
+
+def test_load_model_validates_dspark_interface(monkeypatch):
+    from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+
+    p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
+    monkeypatch.setattr(DFlashProposer, "load_model", lambda self, tm: None)
+    p.draft_model = SimpleNamespace(
+        compute_draft_logits=lambda x: x,
+        markov_embed=lambda x: x,
+        markov_bias=lambda x: x,
+        map_draft_to_target=lambda x: x,
+        has_own_lm_head=True,
+        has_own_embed_tokens=True,
+    )
+    p.load_model(target_model=object())
+
+    p.draft_model = SimpleNamespace(compute_draft_logits=lambda x: x)
+    with pytest.raises(RuntimeError, match="DSpark draft model lacks markov_embed"):
+        p.load_model(target_model=object())

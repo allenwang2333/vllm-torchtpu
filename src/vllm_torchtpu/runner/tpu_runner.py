@@ -2196,6 +2196,44 @@ class TPUModelRunner(GPUModelRunner):
         ):
             stride = 1 + self.speculative_config.num_speculative_tokens
 
+        if layout_plan is None and num_reqs > 0:
+            req_id_to_index = self._pre_async_results.req_id_to_index_copy
+            req_ids = self.input_batch.req_ids
+            pos_arr = np.array(
+                [
+                    req_id_to_index.get(req_ids[start_index + i], -1)
+                    for i in range(num_reqs)
+                ],
+                dtype=np.int32,
+            )
+            valid_reqs = pos_arr >= 0
+            if not valid_reqs.any():
+                return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+            if valid_reqs.all():
+                total_sched = int(num_scheduled_tokens_per_req.sum())
+                cur_indices = np.arange(total_sched, dtype=np.int32)
+                first_sched = int(num_scheduled_tokens_per_req[0])
+                if (
+                    total_sched == num_reqs * first_sched
+                    and (num_scheduled_tokens_per_req == first_sched).all()
+                ):
+                    pre_indices = (
+                        pos_arr[:, None] * stride
+                        + np.arange(first_sched, dtype=np.int32)[None, :]
+                    ).reshape(-1)
+                else:
+                    offsets = np.concatenate(
+                        [
+                            np.arange(int(n), dtype=np.int32)
+                            for n in num_scheduled_tokens_per_req
+                        ]
+                    )
+                    pre_indices = (
+                        np.repeat(pos_arr * stride, num_scheduled_tokens_per_req)
+                        + offsets
+                    )
+                return cur_indices, pre_indices.astype(np.int32, copy=False)
+
         for i in range(num_reqs):
             req_id = self.input_batch.req_ids[start_index + i]
             n_sched = int(num_scheduled_tokens_per_req[i])
@@ -2266,47 +2304,20 @@ class TPUModelRunner(GPUModelRunner):
                 if len(next_tpu) >= len(input_ids):
                     return next_tpu[: len(input_ids)]
 
-            # Fast path 2: Cache persistent device indices to eliminate per-step
-            # H2D uploads
-            # Avoids Eager XLA overhead by relying on the compiled kernel + cached
-            # index tensors
-            subst_key = (
-                len(input_ids),
-                tuple(token_in_tpu_cur_input_indices),
-                tuple(token_in_tpu_pre_next_tokens_indices),
-            )
-            if (
-                getattr(self, "_cached_subst_key", None) == subst_key
-                and hasattr(self, "_cached_cur_input_indices")
-                and hasattr(self, "_cached_pre_next_tokens_indices")
-            ):
-                cur_input_indices = self._cached_cur_input_indices
-                pre_next_tokens_indices = self._cached_pre_next_tokens_indices
-            else:
-                idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
-                _missing_mask = np.ones(len(input_ids), dtype=bool)
-                _missing_mask[token_in_tpu_cur_input_indices] = False
-                missing_values = np.flatnonzero(_missing_mask).astype(np.int32)
-                padded_token_in_tpu_cur_input_indices = np.concatenate(
-                    (token_in_tpu_cur_input_indices, missing_values)
-                )
-
-                padded_token_in_tpu_pre_next_tokens_indices = np.pad(
-                    token_in_tpu_pre_next_tokens_indices,
-                    (0, idx_pad_len),
-                    mode="constant",
-                    constant_values=-1,
-                )
-
-                cur_input_indices = torch.from_numpy(
-                    padded_token_in_tpu_cur_input_indices
-                ).to(self.device, non_blocking=True)
-                pre_next_tokens_indices = torch.from_numpy(
-                    padded_token_in_tpu_pre_next_tokens_indices
-                ).to(self.device, non_blocking=True)
-                self._cached_subst_key = subst_key
-                self._cached_cur_input_indices = cur_input_indices
-                self._cached_pre_next_tokens_indices = pre_next_tokens_indices
+        # Cache persistent device index tensors when the substitution mapping
+        # repeats across steady-state steps to avoid per-step H2D uploads.
+        subst_key = (
+            len(input_ids),
+            token_in_tpu_cur_input_indices.tobytes(),
+            token_in_tpu_pre_next_tokens_indices.tobytes(),
+        )
+        if (
+            getattr(self, "_cached_subst_key", None) == subst_key
+            and hasattr(self, "_cached_cur_input_indices")
+            and hasattr(self, "_cached_pre_next_tokens_indices")
+        ):
+            cur_input_indices = self._cached_cur_input_indices
+            pre_next_tokens_indices = self._cached_pre_next_tokens_indices
         else:
             idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
             _missing_mask = np.ones(len(input_ids), dtype=bool)
@@ -2329,6 +2340,9 @@ class TPUModelRunner(GPUModelRunner):
             pre_next_tokens_indices = torch.from_numpy(
                 padded_token_in_tpu_pre_next_tokens_indices
             ).to(self.device, non_blocking=True)
+            self._cached_subst_key = subst_key
+            self._cached_cur_input_indices = cur_input_indices
+            self._cached_pre_next_tokens_indices = pre_next_tokens_indices
 
         return _substitute_placeholder_token(
             input_ids,
@@ -2636,8 +2650,7 @@ class TPUModelRunner(GPUModelRunner):
         spec_decode_num_rejected_tokens, num_draft_per_req)``.
         """
         from vllm_torchtpu.runner.tpu_runner_async_output import (
-            assemble_spec_next_tokens,
-            compute_num_rejected,
+            assemble_spec_next_tokens_and_num_rejected,
         )
 
         assert drafts is not None, (
@@ -2657,25 +2670,24 @@ class TPUModelRunner(GPUModelRunner):
             next_tokens_per_chunk, state.num_reqs_list, state.spec_decode_metadata_list
         ):
             drafts_chunk = drafts[req_offset : req_offset + num_reqs]
-            src = assemble_spec_next_tokens(nt_chunk, drafts_chunk, num_reqs)
+            src, num_rejected = assemble_spec_next_tokens_and_num_rejected(
+                nt_chunk,
+                drafts_chunk,
+                md.draft_lengths if md is not None else None,
+                num_reqs,
+            )
+            num_rejected_chunks.append(num_rejected)
             if md is not None:
-                num_rejected_chunks.append(
-                    compute_num_rejected(nt_chunk, md.draft_lengths[:num_reqs])
-                )
                 for r in range(num_reqs):
                     num_draft_per_req[req_offset + r] = int(md.draft_lengths_cpu[r])
-            else:
-                # No drafts were verified this step, so there is no rejection
-                # correction or speculative output-placeholder rollback.
-                num_rejected_chunks.append(
-                    torch.zeros(num_reqs, dtype=torch.int32, device=nt_chunk.device)
-                )
             next_tokens_tpu_chunks.append(src)
             for r in range(num_reqs):
                 next_token_indices[req_offset + r] = req_offset + r
             req_offset += num_reqs
         spec_num_rejected = (
-            torch.cat(num_rejected_chunks) if num_rejected_chunks else None
+            num_rejected_chunks[0]
+            if len(num_rejected_chunks) == 1
+            else (torch.cat(num_rejected_chunks) if num_rejected_chunks else None)
         )
         return (
             next_tokens_tpu_chunks,
@@ -2851,9 +2863,17 @@ class TPUModelRunner(GPUModelRunner):
 
             # Get batched arange.
             # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-            arange = np.concatenate(
-                [self.arange_np[:n] for n in num_scheduled_tokens_per_req]
-            )
+            if (
+                total_num_scheduled_tokens
+                == num_reqs * max_num_scheduled_tokens_all_reqs
+            ):
+                arange = np.tile(
+                    self.arange_np[:max_num_scheduled_tokens_all_reqs], num_reqs
+                )
+            else:
+                arange = np.concatenate(
+                    [self.arange_np[:n] for n in num_scheduled_tokens_per_req]
+                )
 
             # Get positions.
             positions_np = self.positions_np[:total_num_scheduled_tokens]
@@ -2988,23 +3008,53 @@ class TPUModelRunner(GPUModelRunner):
                 subtract_num_rejected_tokens,
             )
 
-            seq_idx_np = np.full(target_num_reqs, -1, dtype=np.int32)
-            pos_idx_np = np.full(padded_total_num_scheduled_tokens, -1, dtype=np.int32)
-            acc = 0
-            for i in range(num_reqs):
-                req_id = self.input_batch.req_ids[start_index + i]
-                n_sched = int(num_scheduled_tokens_per_req[i])
-                pos = self._pre_async_results.req_id_to_index_copy.get(req_id)
-                if pos is not None:
-                    seq_idx_np[i] = pos
-                    pos_idx_np[acc : acc + n_sched] = pos
-                acc += n_sched
+            req_id_to_index = self._pre_async_results.req_id_to_index_copy
+            req_ids = self.input_batch.req_ids
+            seq_idx_prefix = np.array(
+                [
+                    req_id_to_index.get(req_ids[start_index + i], -1)
+                    for i in range(num_reqs)
+                ],
+                dtype=np.int32,
+            )
+            reject_subtract_key = (
+                target_num_reqs,
+                padded_total_num_scheduled_tokens,
+                seq_idx_prefix.tobytes(),
+                num_scheduled_tokens_per_req.tobytes(),
+            )
+            if (
+                getattr(self, "_cached_reject_subtract_key", None)
+                == reject_subtract_key
+                and hasattr(self, "_cached_reject_seq_idx")
+                and hasattr(self, "_cached_reject_pos_idx")
+            ):
+                seq_idx_dev = self._cached_reject_seq_idx
+                pos_idx_dev = self._cached_reject_pos_idx
+            else:
+                seq_idx_np = np.full(target_num_reqs, -1, dtype=np.int32)
+                seq_idx_np[:num_reqs] = seq_idx_prefix
+                pos_idx_np = np.full(
+                    padded_total_num_scheduled_tokens, -1, dtype=np.int32
+                )
+                pos_idx_np[:total_num_scheduled_tokens] = np.repeat(
+                    seq_idx_prefix, num_scheduled_tokens_per_req
+                )
+                seq_idx_dev = torch.from_numpy(seq_idx_np).to(
+                    self.device, non_blocking=True
+                )
+                pos_idx_dev = torch.from_numpy(pos_idx_np).to(
+                    self.device, non_blocking=True
+                )
+                self._cached_reject_subtract_key = reject_subtract_key
+                self._cached_reject_seq_idx = seq_idx_dev
+                self._cached_reject_pos_idx = pos_idx_dev
             seq_lens, self.position_ids = subtract_num_rejected_tokens(
                 seq_lens,
                 self.position_ids,
                 self._pre_async_results.spec_decode_num_rejected_tokens,
-                torch.from_numpy(seq_idx_np).to(self.device, non_blocking=True),
-                torch.from_numpy(pos_idx_np).to(self.device, non_blocking=True),
+                seq_idx_dev,
+                pos_idx_dev,
             )
 
         # For decode-only case, cache constant device tensors to skip H2D.
@@ -4522,9 +4572,6 @@ class TPUModelRunner(GPUModelRunner):
                     spec_logprobs=spec_logprobs_chunks,
                 )
 
-        if self.scheduler_config.async_scheduling:
-            self._modify_prev_results()
-
         # Unified eagle3 draft propose -- ONE call serving both sync and async
         # (mirrors the tpu-inference reference, where a single
         # propose_draft_token_ids call runs every step and an async bool only
@@ -4535,7 +4582,8 @@ class TPUModelRunner(GPUModelRunner):
         # substitution assemblers below); sync caches the host list in the
         # manager for take_draft_token_ids(). ngram has no device path and
         # keeps proposing from the host-materialized output in the sync block
-        # below.
+        # below. Dispatched before _modify_prev_results() so the drafter TPU
+        # programs are queued before waiting on the previous step's D2H copy.
         is_async = bool(self.scheduler_config.async_scheduling)
         eagle3_drafts = None
         if self._is_async_drafter and combined_selected_tokens:
@@ -4570,6 +4618,9 @@ class TPUModelRunner(GPUModelRunner):
                         return_device=is_async,
                         device_seed=device_seed,
                     )
+
+        if self.scheduler_config.async_scheduling:
+            self._modify_prev_results()
 
         # Save, poll and clear the KV connector only after the drafter. Its
         # forward above writes the draft layers' KV into the blocks the target
@@ -6853,18 +6904,16 @@ class TPUModelRunner(GPUModelRunner):
         bonus_logits_indices: torch.Tensor,
         target_logits_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Spec-decode verify prelude: gather the bonus-token logits + argmax, and
-        # gather the target_logits rows for the rejection sampler, in ONE compiled
-        # region keyed on [num_tokens, num_reqs] shapes. Run raw (the
-        # logits[indices] gathers + argmax at the verify site), these are eager
-        # ops torch-tpu's DEFER_AND_FUSE fuses with the live per-step dispatch
-        # into per-context programs (the cold target-side recompiles). index_select
-        # is value-identical to logits[indices]. Same pattern as the draft wraps.
-        bonus_token_ids = torch.argmax(
-            torch.index_select(logits, 0, bonus_logits_indices), dim=-1
+        # Spec-decode greedy verify prelude: compute argmax over all verify rows
+        # once and gather 1D bonus_token_ids and target_token_ids in ONE compiled
+        # region keyed on [num_tokens, num_reqs] shapes, avoiding materializing
+        # and re-reading the 2D [num_tokens, vocab_size] target_logits tensor.
+        token_ids = torch.argmax(logits, dim=-1)
+        bonus_token_ids = torch.index_select(token_ids, 0, bonus_logits_indices)
+        target_token_ids = torch.index_select(token_ids, 0, target_logits_indices).to(
+            torch.int32
         )
-        target_logits = torch.index_select(logits, 0, target_logits_indices)
-        return bonus_token_ids, target_logits
+        return bonus_token_ids, target_token_ids
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_gather_bonus_and_target_logits(

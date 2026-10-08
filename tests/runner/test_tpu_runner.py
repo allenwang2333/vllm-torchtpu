@@ -2531,3 +2531,274 @@ def test_init_num_reqs_caps_deepseek_v41_v2_vs_rpa(monkeypatch):
     runner._init_num_reqs_caps()
     assert runner.num_reqs_max_model_len == 20
     assert runner.num_reqs_most_model_len is None
+
+
+def test_async_sub_indices_non_uniform_and_all_new():
+    cur_zero, src_zero = _sub_indices({"r0": 0}, [], [], spec_k=3)
+    assert cur_zero == []
+    assert src_zero == []
+
+    cur_empty, src_empty = _sub_indices({}, ["r0", "r1"], [2, 3], spec_k=3)
+    assert cur_empty == []
+    assert src_empty == []
+
+    cur, src = _sub_indices({"r0": 1, "r1": 0}, ["r0", "r1"], [2, 4], spec_k=3)
+    assert cur == [0, 1, 2, 3, 4, 5]
+    assert src == [4, 5, 0, 1, 2, 3]
+
+
+def test_apply_async_token_substitution_caches_indices():
+    fake = SimpleNamespace(
+        _pre_async_results=SimpleNamespace(
+            next_tokens_tpu=torch.tensor([101, 102, 103, 104], dtype=torch.int32),
+        ),
+        _fast_token_substitution=False,
+        device=torch.device("cpu"),
+    )
+    input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    cur_idx = np.array([0, 2], dtype=np.int32)
+    pre_idx = np.array([1, 3], dtype=np.int32)
+
+    with patch.object(
+        tpu_runner,
+        "_substitute_placeholder_token",
+        side_effect=tpu_runner._substitute_placeholder_token.__wrapped__,
+    ):
+        out1 = TPUModelRunner._apply_async_token_substitution(
+            fake, input_ids, cur_idx, pre_idx
+        )
+        cached_cur = fake._cached_cur_input_indices
+        cached_pre = fake._cached_pre_next_tokens_indices
+        out2 = TPUModelRunner._apply_async_token_substitution(
+            fake, input_ids, cur_idx, pre_idx
+        )
+
+    assert out1.tolist() == [102, 2, 104, 4]
+    assert out2.tolist() == [102, 2, 104, 4]
+    assert fake._cached_cur_input_indices is cached_cur
+    assert fake._cached_pre_next_tokens_indices is cached_pre
+
+
+def test_assemble_async_spec_substitution_single_and_multi_chunk():
+    runner = object.__new__(TPUModelRunner)
+    drafts = torch.tensor([[201, 202], [211, 212], [221, 222]], dtype=torch.int32)
+    nt_chunk0 = torch.tensor([[11, 99, -1], [77, -1, -1]], dtype=torch.int32)
+    md0 = SimpleNamespace(
+        draft_lengths=torch.tensor([2, 2], dtype=torch.int32),
+        draft_lengths_cpu=np.array([2, 2], dtype=np.int32),
+    )
+    state_single = SimpleNamespace(
+        num_reqs_list=[2],
+        spec_decode_metadata_list=[md0],
+    )
+    chunks, idx_map, num_rejected, num_draft = runner._assemble_async_spec_substitution(
+        drafts[:2], [nt_chunk0], state_single
+    )
+    assert len(chunks) == 1
+    assert chunks[0].tolist() == [99, 201, 202, 77, 211, 212]
+    assert idx_map == {0: 0, 1: 1}
+    assert num_rejected.tolist() == [1, 2]
+    assert num_draft == {0: 2, 1: 2}
+
+    nt_chunk1 = torch.tensor([[55, -1, -1]], dtype=torch.int32)
+    state_multi = SimpleNamespace(
+        num_reqs_list=[2, 1],
+        spec_decode_metadata_list=[md0, None],
+    )
+    chunks_m, idx_map_m, num_rejected_m, num_draft_m = (
+        runner._assemble_async_spec_substitution(
+            drafts, [nt_chunk0, nt_chunk1], state_multi
+        )
+    )
+    assert len(chunks_m) == 2
+    assert idx_map_m == {0: 0, 1: 1, 2: 2}
+    assert num_rejected_m.tolist() == [1, 2, 0]
+    assert num_draft_m == {0: 2, 1: 2}
+
+
+def test_spec_bonus_and_target_logits():
+    runner = object.__new__(TPUModelRunner)
+    logits = torch.tensor(
+        [
+            [0.1, 0.9, 0.2, 0.0],
+            [0.8, 0.1, 0.0, 0.2],
+            [0.0, 0.2, 0.7, 0.1],
+            [0.1, 0.0, 0.2, 0.95],
+        ],
+        dtype=torch.float32,
+    )
+    bonus_idx = torch.tensor([1, 3], dtype=torch.int32)
+    target_idx = torch.tensor([0, 2], dtype=torch.int32)
+
+    bonus_ids, target_ids = TPUModelRunner.spec_bonus_and_target_logits.__wrapped__(
+        runner, logits, bonus_idx, target_idx
+    )
+    assert bonus_ids.tolist() == [0, 3]
+    assert target_ids.dtype == torch.int32
+    assert target_ids.tolist() == [1, 2]
+
+
+def test_prepare_inputs_uniform_multi_token_and_reject_subtract_cache():
+    from vllm_torchtpu.layers.core.sequence_layout import AllSequenceLayoutPlanner
+
+    max_num_reqs = 2
+    max_model_len = 32
+    token_ids_cpu = np.arange(max_num_reqs * max_model_len, dtype=np.int32).reshape(
+        max_num_reqs, max_model_len
+    )
+    positions_cpu = torch.full((max_model_len,), -1, dtype=torch.int32)
+    query_start_loc_cpu = torch.zeros(max_num_reqs + 1, dtype=torch.int32)
+    seq_lens_cpu = torch.zeros(max_num_reqs, dtype=torch.int32)
+
+    runner = SimpleNamespace(
+        reorder_batch_threshold=1,
+        sequence_layout_planner=AllSequenceLayoutPlanner(),
+        _dp_target_bucket=None,
+        input_batch=SimpleNamespace(
+            num_reqs=2,
+            req_ids=["req-0", "req-1"],
+            num_computed_tokens_cpu=np.array([4, 8], dtype=np.int32),
+            token_ids_cpu=token_ids_cpu,
+            token_ids_cpu_tensor=torch.from_numpy(token_ids_cpu),
+            num_prompt_tokens=np.full(max_num_reqs, 16, dtype=np.int32),
+        ),
+        _wait_input_staging_fence=lambda: None,
+        most_model_len=None,
+        num_reqs_max_model_len=max_num_reqs,
+        num_reqs_most_model_len=max_num_reqs,
+        max_num_reqs=max_num_reqs,
+        uses_mrope=False,
+        arange_np=np.arange(max_model_len, dtype=np.int32),
+        positions_cpu=positions_cpu,
+        positions_np=positions_cpu.numpy(),
+        input_ids_cpu=torch.full((max_model_len,), -1, dtype=torch.int32),
+        query_start_loc_cpu=query_start_loc_cpu,
+        query_start_loc_np=query_start_loc_cpu.numpy(),
+        seq_lens_cpu=seq_lens_cpu,
+        seq_lens_np=seq_lens_cpu.numpy(),
+        _check_attention_schedule=lambda *a: None,
+        _pcp_enabled=False,
+        _mtp_enabled=False,
+        device=torch.device("cpu"),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        speculative_config=SimpleNamespace(num_speculative_tokens=2),
+        _pre_async_results=SimpleNamespace(
+            req_id_to_index_copy={"req-0": 0, "req-1": 1},
+            spec_decode_num_rejected_tokens=torch.tensor([1, 2], dtype=torch.int32),
+            next_tokens_tpu=None,
+        ),
+        _decode_device_cache_key=None,
+        _request_distribution_cpu=torch.zeros(3, dtype=torch.int32),
+        _has_mamba_state=False,
+        mamba_slot_read_offsets=None,
+        _mamba_ckpt_window=1,
+        _unified_kv_layout=False,
+        empty_slot_mappings=None,
+        _build_attention_metadata=lambda **kw: ({}, None),
+        lora_config=None,
+        _prepare_async_token_substitution_indices=lambda *a: (
+            np.array([], dtype=np.int32),
+            np.array([], dtype=np.int32),
+        ),
+        _apply_async_token_substitution=lambda ids, *a: ids,
+        _collect_mamba_state_seed_copies=lambda *a: None,
+        num_tokens_paddings=[8, 16, 32],
+        pcp_size=1,
+        dcp_size=1,
+    )
+    sched = SimpleNamespace(
+        total_num_scheduled_tokens=6,
+        num_scheduled_tokens={"req-0": 3, "req-1": 3},
+        scheduled_spec_decode_tokens={},
+    )
+
+    TPUModelRunner._prepare_inputs(runner, sched, start_index=0, num_decode_reqs=0)
+    cached_seq_idx = runner._cached_reject_seq_idx
+    cached_pos_idx = runner._cached_reject_pos_idx
+    assert runner.position_ids[:6].tolist() == [3, 4, 5, 6, 7, 8]
+
+    TPUModelRunner._prepare_inputs(runner, sched, start_index=0, num_decode_reqs=0)
+    assert runner._cached_reject_seq_idx is cached_seq_idx
+    assert runner._cached_reject_pos_idx is cached_pos_idx
+
+
+def test_sample_tokens_dispatches_drafter_before_modify_prev_results():
+    call_order = []
+    state = SimpleNamespace(
+        scheduler_output=SimpleNamespace(
+            num_scheduled_tokens={"req-0": 2},
+            has_structured_output_requests=False,
+        ),
+        spec_decode_metadata_list=[
+            SimpleNamespace(
+                draft_lengths=torch.tensor([1], dtype=torch.int32),
+                draft_lengths_cpu=np.array([1], dtype=np.int32),
+            )
+        ],
+        mamba_state_indices_list=None,
+        logits_list=[torch.zeros((2, 8), dtype=torch.float32)],
+        num_reqs_list=[1],
+        pooler_output_list=[],
+        draft_chunks=[],
+    )
+    runner = SimpleNamespace(
+        execute_model_state=state,
+        _get_sampling_generator=lambda: None,
+        _async_drafter=SimpleNamespace(draft_chunks=None),
+        input_batch=SimpleNamespace(
+            num_reqs=1,
+            req_ids=["req-0"],
+            req_id_to_index={"req-0": 0},
+            all_greedy=True,
+            max_num_logprobs=None,
+            generators={},
+            num_tokens_no_spec=[4],
+        ),
+        requests={
+            "req-0": SimpleNamespace(
+                req_id="req-0",
+                num_computed_tokens=2,
+                num_tokens=4,
+                output_token_ids=[10, 11],
+            )
+        },
+        is_pooling_model=False,
+        _stage_timing=SimpleNamespace(
+            stage=lambda _name: contextlib.nullcontext(),
+            host_stage=lambda _name: contextlib.nullcontext(),
+        ),
+        _sample_spec_verify_chunk=lambda *a: torch.tensor(
+            [[12, 13]], dtype=torch.int32
+        ),
+        _update_mamba_slot_read_offsets=lambda *a: None,
+        _update_num_xla_graphs=lambda *a: None,
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        _is_async_drafter=True,
+        spec_decode_manager=SimpleNamespace(
+            propose_draft_token_ids=lambda **kw: (
+                call_order.append("propose") or torch.tensor([[21]], dtype=torch.int32)
+            )
+        ),
+        _modify_prev_results=lambda: call_order.append("modify_prev"),
+        maybe_wait_for_kv_save=lambda: None,
+        get_finished_kv_transfers=lambda _so: (None, None, None, set(), None, None),
+        _sync_replicated_drafts_across_tp=lambda d: d,
+        _assemble_async_spec_substitution=lambda d, nt, st: (
+            [torch.tensor([13, 21], dtype=torch.int32)],
+            {0: 0},
+            torch.tensor([0], dtype=torch.int32),
+            {0: 1},
+        ),
+        _update_placeholder=lambda *a: {"req-0": 0},
+        max_num_reqs=2,
+        speculative_config=SimpleNamespace(num_speculative_tokens=1),
+        _pre_async_results=None,
+    )
+    with patch.object(
+        tpu_runner.AsyncTPUCopyState,
+        "from_device_chunks",
+        return_value=SimpleNamespace(),
+    ):
+        TPUModelRunner.sample_tokens(runner, grammar_output=None)
+
+    assert call_order == ["propose", "modify_prev"]

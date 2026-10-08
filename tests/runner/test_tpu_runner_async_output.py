@@ -23,6 +23,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUModelRunnerOutput,
     SpecLogprobsChunk,
     assemble_spec_next_tokens,
+    assemble_spec_next_tokens_and_num_rejected,
     compute_num_rejected,
     extract_draft_token_ids,
     spec_logprobs_lists,
@@ -52,6 +53,36 @@ def test_assemble_spec_next_tokens(device):
         [99, 201, 202, 203, 77, 211, 212, 213], dtype=torch.int32, device=device
     )
     assert torch.equal(src, expected)
+
+
+def test_assemble_spec_next_tokens_and_num_rejected(device):
+    next_tokens = torch.tensor(
+        [
+            [11, 12, 99, INVALID_TOKEN_ID],
+            [77, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+            [0, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    drafts = torch.tensor(
+        [[201, 202, 203], [211, 212, 213], [999, 999, 999]],
+        dtype=torch.int32,
+        device=device,
+    )
+    num_draft = torch.tensor([3, 3, 3], dtype=torch.int32, device=device)
+
+    src, num_rejected = assemble_spec_next_tokens_and_num_rejected(
+        next_tokens, drafts, num_draft, num_reqs=2
+    )
+    assert torch.equal(src, assemble_spec_next_tokens(next_tokens, drafts, num_reqs=2))
+    assert num_rejected.tolist() == [1, 3]
+
+    src_no_draft, num_rejected_no_draft = assemble_spec_next_tokens_and_num_rejected(
+        next_tokens, drafts, None, num_reqs=2
+    )
+    assert torch.equal(src_no_draft, src)
+    assert num_rejected_no_draft.tolist() == [0, 0]
 
 
 def test_assemble_spec_next_tokens_ignores_padded_rows(device):
