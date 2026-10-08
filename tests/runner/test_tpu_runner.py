@@ -2985,3 +2985,34 @@ def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):
         assert torch.cuda.current_stream() is fake_stream
         assert torch.cuda.set_stream(fake_stream) == "set_stream_" + str(fake_stream)
         assert torch.cuda.synchronize() == "synchronized"
+
+
+def test_init_num_reqs_caps_deepseek_v41_v2_vs_rpa(monkeypatch):
+    """Verify DeepSeek-V4.1 v2 bypasses PallasAttentionBackend SMEM cap."""
+    runner = object.__new__(TPUModelRunner)
+    runner.max_model_len = 103424
+    runner.most_model_len = 90000
+    runner.block_size = 16
+    runner.max_num_reqs = 64
+    runner.max_num_tokens = 8192
+    runner.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
+    )
+
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_IMPL", "v2")
+    runner._init_num_reqs_caps()
+    assert runner.num_reqs_max_model_len == 64
+    assert runner.num_reqs_most_model_len == 64
+
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_IMPL", "v1")
+    runner._init_num_reqs_caps()
+    assert runner.num_reqs_max_model_len == 20
+    assert runner.num_reqs_most_model_len == 23
+
+    runner.most_model_len = None
+    runner.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+    )
+    runner._init_num_reqs_caps()
+    assert runner.num_reqs_max_model_len == 20
+    assert runner.num_reqs_most_model_len is None
