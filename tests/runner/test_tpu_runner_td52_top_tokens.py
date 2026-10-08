@@ -698,3 +698,459 @@ def test_precompile_top_tokens_subgraphs():
             TPUModelRunner._precompile_rejection_sampler(runner)
 
     assert len(sync_calls) > 0
+
+
+def test_td68_attention_metadata_and_runner_optimizations():
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+
+    from vllm_torchtpu.layers.core import attention_metadata as am
+    from vllm_torchtpu.layers.core.attention_metadata import (
+        AttentionMetadataBuilder,
+        AttentionMetadataBuilderContext,
+        _staged_walk_products,
+        _staged_walk_products_compiled,
+        stage_block_table_uploads,
+    )
+
+    # 1. _staged_walk_products with mamba_geom and ckpt_window == 1, plus
+    # _staged_walk_products_compiled.__wrapped__
+    staged_dev = torch.arange(16, dtype=torch.int32)
+    seq_lens = torch.tensor([4, 16], dtype=torch.int32)
+    table_geom = ((0, 2, 4), (8, 2, 4))
+    mamba_geom = ((1, 4, 8),)
+    out_w1 = _staged_walk_products(
+        staged_dev, seq_lens, table_geom, mamba_geom, ckpt_window=1
+    )
+    out_compiled = _staged_walk_products_compiled.__wrapped__(
+        staged_dev, seq_lens, table_geom, mamba_geom, ckpt_window=1
+    )
+    assert len(out_w1) == 3
+    for a, b in zip(out_w1, out_compiled):
+        assert torch.equal(a, b)
+
+    # 2. _active_block_table_columns edge branches:
+    #    - seq_lens_cpu is None and ctx.seq_lens is None -> returns target_num_blocks
+    #    - max_seq_len <= 0 -> returns min(16, target_num_blocks)
+    #    - is_mamba_group and mamba_ckpt_window > 1 -> adds mamba_ckpt_window - 1
+    class _FakeBT:
+        append_row = None
+
+        def __init__(self, offset: int):
+            self.max_num_blocks_per_req = 64
+            self.num_blocks_per_row = np.zeros(4, dtype=np.int32)
+            self._cpu = torch.arange(256, dtype=torch.int32).reshape(4, 64) + offset
+
+        def get_cpu_tensor(self):
+            return self._cpu
+
+    bt0 = _FakeBT(0)
+    bt1 = _FakeBT(100)
+    bt2 = _FakeBT(200)
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        max_num_reqs=4,
+        most_model_len=512,
+        position_ids=torch.arange(4, dtype=torch.int32),
+        _block_table_stage_cpu=None,
+        _unified_kv_layout=False,
+        input_batch=SimpleNamespace(block_table=[bt0, bt1, bt2]),
+        attn_groups=[],
+    )
+    attn_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=torch.bfloat16,
+        page_size_padded=16384,
+    )
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=[(4, 128)],
+        dtypes=[torch.bfloat16],
+        page_size_padded=16384,
+    )
+    b_attn0 = AttentionMetadataBuilder(
+        attn_spec, ["attn.0"], MagicMock(), runner.device, runner, 0
+    )
+    b_attn1 = AttentionMetadataBuilder(
+        attn_spec, ["attn.1"], MagicMock(), runner.device, runner, 1
+    )
+    b_mamba = AttentionMetadataBuilder(
+        mamba_spec, ["mamba.0"], MagicMock(), runner.device, runner, 2
+    )
+
+    ctx_none_seq = AttentionMetadataBuilderContext(
+        num_reqs=2,
+        start_index=0,
+        use_max_model_len=True,
+        seq_lens=None,  # type: ignore[arg-type]
+        query_start_loc=torch.arange(3, dtype=torch.int32),
+        request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+    )
+    assert b_attn0._active_block_table_columns(ctx_none_seq, 64) == 64
+
+    ctx_zero_seq = AttentionMetadataBuilderContext(
+        num_reqs=2,
+        start_index=0,
+        use_max_model_len=True,
+        seq_lens=torch.zeros(4, dtype=torch.int32),
+        query_start_loc=torch.arange(5, dtype=torch.int32),
+        request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+    )
+    assert b_attn0._active_block_table_columns(ctx_zero_seq, 64) == 16
+    # Cache hit on second call with same geometry key
+    assert b_attn1._active_block_table_columns(ctx_zero_seq, 64) == 16
+
+    ctx_mamba_ckpt = AttentionMetadataBuilderContext(
+        num_reqs=2,
+        start_index=0,
+        use_max_model_len=True,
+        seq_lens=torch.tensor([256, 256, 0, 0], dtype=torch.int32),
+        query_start_loc=torch.arange(5, dtype=torch.int32),
+        request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        mamba_ckpt_window=3,
+    )
+    # 256 // 16 = 16 blocks + 2 ckpt blocks = 18 -> next power of 2 is 32
+    assert b_mamba._active_block_table_columns(ctx_mamba_ckpt, 64) == 32
+
+    # 3. build() branches:
+    #    - active_cols == target_num_blocks and ctx.num_reqs < target_num_reqs
+    #    - active_cols == target_num_blocks and ctx.num_reqs == target_num_reqs
+    #    - mamba with ctx.mamba_state_indices is not None
+    #    - mamba with staged is not None, unified_kv_layout, staged_mamba_products=None
+    #    - mamba with ctx.mamba_state_indices is None and unified_kv_layout=False
+    cm4 = SimpleNamespace(num_reqs=4)
+    ctx_full_cols_partial_reqs = AttentionMetadataBuilderContext(
+        num_reqs=2,
+        start_index=0,
+        use_max_model_len=True,
+        seq_lens=torch.tensor([1024, 1024, 0, 0], dtype=torch.int32),
+        query_start_loc=torch.arange(5, dtype=torch.int32),
+        request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+    )
+    runner._attn_metadata_builder_ctx = ctx_full_cols_partial_reqs
+    md_partial = b_attn0.build(0, cm4)
+    assert torch.equal(
+        md_partial.block_tables.reshape(4, 64)[2:],
+        torch.zeros((2, 64), dtype=torch.int32),
+    )
+
+    ctx_full_cols_all_reqs = AttentionMetadataBuilderContext(
+        num_reqs=4,
+        start_index=0,
+        use_max_model_len=True,
+        seq_lens=torch.full((4,), 1024, dtype=torch.int32),
+        query_start_loc=torch.arange(5, dtype=torch.int32),
+        request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+    )
+    runner._attn_metadata_builder_ctx = ctx_full_cols_all_reqs
+    md_all = b_attn0.build(0, cm4)
+    assert torch.equal(md_all.block_tables.reshape(4, 64), bt0.get_cpu_tensor())
+
+    # Mamba with compact mamba_state_indices provided
+    compact_slots = torch.tensor([3, 1, 0, 0], dtype=torch.int32)
+    ctx_compact_mamba = AttentionMetadataBuilderContext(
+        num_reqs=2,
+        start_index=0,
+        use_max_model_len=True,
+        seq_lens=torch.tensor([16, 32, 0, 0], dtype=torch.int32),
+        query_start_loc=torch.arange(5, dtype=torch.int32),
+        request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        mamba_state_indices=compact_slots,
+    )
+    runner._attn_metadata_builder_ctx = ctx_compact_mamba
+    md_compact = b_mamba.build(0, cm4)
+    assert md_compact.mamba_state_indices is compact_slots
+
+    # Mamba with staged table, unified_kv_layout=True, but staged_mamba_products=None
+    runner._unified_kv_layout = True
+    ctx_staged_mamba_no_products = AttentionMetadataBuilderContext(
+        num_reqs=2,
+        start_index=0,
+        use_max_model_len=True,
+        seq_lens=torch.tensor([16, 32, 0, 0], dtype=torch.int32),
+        query_start_loc=torch.arange(5, dtype=torch.int32),
+        request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        staged_block_tables={2: bt2.get_cpu_tensor().reshape(-1)},
+        staged_mamba_products=None,
+    )
+    runner._attn_metadata_builder_ctx = ctx_staged_mamba_no_products
+    md_staged_mamba = b_mamba.build(0, cm4)
+    assert md_staged_mamba.mamba_state_indices is not None
+
+    # Mamba with mamba_state_indices is None and unified_kv_layout=False
+    runner._unified_kv_layout = False
+    ctx_fallback_mamba = AttentionMetadataBuilderContext(
+        num_reqs=2,
+        start_index=0,
+        use_max_model_len=True,
+        seq_lens=torch.tensor([16, 32, 0, 0], dtype=torch.int32),
+        query_start_loc=torch.arange(5, dtype=torch.int32),
+        request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+    )
+    runner._attn_metadata_builder_ctx = ctx_fallback_mamba
+    md_fallback = b_mamba.build(0, cm4)
+    assert md_fallback.mamba_state_indices is None
+
+    # 4. stage_block_table_uploads & build_attention_metadata_for_layers:
+    #    - gids=set() -> plan is None early return
+    #    - multi-group non-mamba build() template reuse (with_block_tables)
+    #    - full columns with ctx.num_reqs < num_reqs_padded vs == num_reqs_padded
+    #    - staged_dev.device.type == "tpu" branch
+    runner.attn_groups = [
+        [SimpleNamespace(metadata_builders=[b_attn0], layer_names=["attn.0"])],
+        [SimpleNamespace(metadata_builders=[b_attn1], layer_names=["attn.1"])],
+    ]
+    ctx_empty_gids = AttentionMetadataBuilderContext(
+        num_reqs=2,
+        start_index=0,
+        use_max_model_len=True,
+        seq_lens=torch.tensor([1024, 1024, 0, 0], dtype=torch.int32),
+        query_start_loc=torch.arange(5, dtype=torch.int32),
+        request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+    )
+    stage_block_table_uploads(runner, ctx_empty_gids, 4, gids=set())
+    assert ctx_empty_gids.staged_block_tables is None
+
+    # Stage with num_reqs < num_reqs_padded and active_cols == target_num_blocks
+    ctx_stage_partial = AttentionMetadataBuilderContext(
+        num_reqs=2,
+        start_index=0,
+        use_max_model_len=True,
+        seq_lens=torch.tensor([1024, 1024, 0, 0], dtype=torch.int32),
+        query_start_loc=torch.arange(5, dtype=torch.int32),
+        request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+    )
+    stage_block_table_uploads(runner, ctx_stage_partial, 4)
+    runner._attn_metadata_builder_ctx = ctx_stage_partial
+    built0 = b_attn0.build(0, cm4)
+    built1 = b_attn1.build(0, cm4)
+    assert ctx_stage_partial.base_attn_metadata is built0
+    assert built1 is not built0
+    assert torch.equal(built1.block_tables, ctx_stage_partial.staged_block_tables[1])
+
+    # Stage with num_reqs == num_reqs_padded and active_cols == target_num_blocks
+    runner._block_table_delta_stager = None
+    ctx_stage_full = AttentionMetadataBuilderContext(
+        num_reqs=4,
+        start_index=0,
+        use_max_model_len=True,
+        seq_lens=torch.full((4,), 1024, dtype=torch.int32),
+        query_start_loc=torch.arange(5, dtype=torch.int32),
+        request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+    )
+    stage_block_table_uploads(runner, ctx_stage_full, 4)
+    assert ctx_stage_full.staged_block_tables is not None
+
+    # TPU device dispatch in stage_block_table_uploads
+    tpu_staged = MagicMock()
+    tpu_staged.device.type = "tpu"
+    with (
+        patch.object(am.BlockTableDeltaStager, "try_stage", return_value=tpu_staged),
+        patch.object(am.BlockTableDeltaStager, "get_cached_tables", return_value=None),
+        patch.object(
+            am,
+            "_staged_walk_products_compiled",
+            return_value=(torch.zeros(256, dtype=torch.int32),) * 2,
+        ) as mock_compiled,
+    ):
+        ctx_tpu = AttentionMetadataBuilderContext(
+            num_reqs=4,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.full((4,), 1024, dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+        )
+        stage_block_table_uploads(runner, ctx_tpu, 4)
+        mock_compiled.assert_called_once()
+
+    # build_attention_metadata_for_layers cache miss + hit + pre-staged + empty
+    runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+        num_reqs=2,
+        start_index=0,
+        use_max_model_len=True,
+        seq_lens=torch.tensor([1024, 1024, 0, 0], dtype=torch.int32),
+        query_start_loc=torch.arange(5, dtype=torch.int32),
+        request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+    )
+    md_layers1 = TPUModelRunner.build_attention_metadata_for_layers(
+        runner, ["attn.0", "attn.1"], 4
+    )
+    assert set(md_layers1) == {"attn.0", "attn.1"}
+    # Second call hits _layer_group_selection_cache and pre-staged block tables
+    md_layers2 = TPUModelRunner.build_attention_metadata_for_layers(
+        runner, ["attn.0", "attn.1"], 4
+    )
+    assert set(md_layers2) == {"attn.0", "attn.1"}
+    # Empty layer selection
+    md_empty = TPUModelRunner.build_attention_metadata_for_layers(
+        runner, ["nonexistent"], 4
+    )
+    assert md_empty == {}
+
+    # 5. _apply_async_token_substitution: idx_pad_len > 0, cache hit, idx_pad_len == 0
+    subst_runner = SimpleNamespace(
+        _pre_async_results=SimpleNamespace(
+            next_tokens_tpu=torch.tensor([[100, 200], [300, 400]], dtype=torch.int32)
+        ),
+        _fast_token_substitution=False,
+        device=torch.device("cpu"),
+    )
+    input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    cur_idx_padded = np.array([0, 2], dtype=np.int32)
+    pre_idx_padded = np.array([0, 2], dtype=np.int32)
+    with patch.object(
+        tpu_runner,
+        "_substitute_placeholder_token",
+        side_effect=lambda ids, c, p, nxt: (ids, c, p),
+    ):
+        _, c1, p1 = TPUModelRunner._apply_async_token_substitution(
+            subst_runner, input_ids, cur_idx_padded, pre_idx_padded
+        )
+        # Cache hit reuses exact same tensor objects
+        _, c2, p2 = TPUModelRunner._apply_async_token_substitution(
+            subst_runner, input_ids, cur_idx_padded, pre_idx_padded
+        )
+        assert c2 is c1 and p2 is p1
+        # Unpadded (idx_pad_len == 0)
+        cur_idx_full = np.array([0, 1, 2, 3], dtype=np.int32)
+        pre_idx_full = np.array([0, 1, 2, 3], dtype=np.int32)
+        _, c3, p3 = TPUModelRunner._apply_async_token_substitution(
+            subst_runner, input_ids, cur_idx_full, pre_idx_full
+        )
+        assert c3.tolist() == [0, 1, 2, 3]
+        assert p3.tolist() == [0, 1, 2, 3]
+
+    # 6. fast_swap_row in _install_spec_token_room_guard:
+    #    - i1 == i2 early return
+    #    - bt with _bt_cpu_np and _rewrote
+    #    - bt without _bt_cpu_np (uses block_table.np) and without _rewrote
+    rewrote_calls = []
+    arr0 = np.array([[1, 2], [3, 4]], dtype=np.int32)
+    arr1 = np.array([[10, 20], [30, 40]], dtype=np.int32)
+    bt_tracked = SimpleNamespace(
+        num_blocks_per_row=np.array([1, 2], dtype=np.int32),
+        _bt_cpu_np=arr0,
+        _rewrote=lambda r: rewrote_calls.append(r),
+    )
+    bt_untracked = SimpleNamespace(
+        num_blocks_per_row=np.array([2, 1], dtype=np.int32),
+        block_table=SimpleNamespace(np=arr1),
+    )
+    swap_runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            update_req_spec_token_ids=lambda req, spec: None,
+            block_table=SimpleNamespace(
+                block_tables=[bt_tracked, bt_untracked],
+                append_row=None,
+                swap_row=None,
+            ),
+        )
+    )
+    TPUModelRunner._install_spec_token_room_guard(swap_runner)
+    swap_runner.input_batch.block_table.swap_row(1, 1)
+    assert rewrote_calls == []
+    swap_runner.input_batch.block_table.swap_row(0, 1)
+    assert rewrote_calls == [0, 1]
+    assert bt_tracked.num_blocks_per_row.tolist() == [2, 1]
+    assert bt_untracked.num_blocks_per_row.tolist() == [1, 2]
+    assert arr0[0].tolist() == [3, 4] and arr0[1].tolist() == [1, 2]
+    assert arr1[0].tolist() == [30, 40] and arr1[1].tolist() == [10, 20]
+
+    # 7. _prepare_inputs branches for non-cached prefill and non-ALL sequence layout
+    max_num_reqs = 2
+    max_model_len = 32
+    token_ids_cpu = np.arange(max_num_reqs * max_model_len, dtype=np.int32).reshape(
+        max_num_reqs, max_model_len
+    )
+    positions_cpu = torch.full((max_model_len,), -1, dtype=torch.int32)
+    query_start_loc_cpu = torch.zeros(max_num_reqs + 1, dtype=torch.int32)
+    seq_lens_cpu = torch.zeros(max_num_reqs, dtype=torch.int32)
+    prep_runner = SimpleNamespace(
+        reorder_batch_threshold=1,
+        sequence_layout_planner=AllSequenceLayoutPlanner(),
+        _dp_target_bucket=None,
+        input_batch=SimpleNamespace(
+            num_reqs=2,
+            req_ids=["req-0", "req-1"],
+            num_computed_tokens_cpu=np.array([0, 0], dtype=np.int32),
+            token_ids_cpu=token_ids_cpu,
+            token_ids_cpu_tensor=torch.from_numpy(token_ids_cpu),
+            num_prompt_tokens=np.full(max_num_reqs, 8, dtype=np.int32),
+        ),
+        _wait_input_staging_fence=lambda: None,
+        most_model_len=None,
+        num_reqs_max_model_len=max_num_reqs,
+        num_reqs_most_model_len=max_num_reqs,
+        max_num_reqs=max_num_reqs,
+        uses_mrope=False,
+        arange_np=np.arange(max_model_len, dtype=np.int32),
+        positions_cpu=positions_cpu,
+        positions_np=positions_cpu.numpy(),
+        input_ids_cpu=torch.full((max_model_len,), -1, dtype=torch.int32),
+        query_start_loc_cpu=query_start_loc_cpu,
+        query_start_loc_np=query_start_loc_cpu.numpy(),
+        seq_lens_cpu=seq_lens_cpu,
+        seq_lens_np=seq_lens_cpu.numpy(),
+        _check_attention_schedule=lambda *a: None,
+        _pcp_enabled=False,
+        _mtp_enabled=False,
+        device=torch.device("cpu"),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        speculative_config=None,
+        _pre_async_results=None,
+        _decode_device_cache_key=None,
+        _request_distribution_cpu=torch.zeros(3, dtype=torch.int32),
+        _has_mamba_state=False,
+        mamba_slot_read_offsets=None,
+        _mamba_ckpt_window=1,
+        _unified_kv_layout=False,
+        empty_slot_mappings=None,
+        _build_attention_metadata=lambda **kw: ({}, None),
+        lora_config=None,
+        _collect_mamba_state_seed_copies=lambda *a: None,
+        num_tokens_paddings=[8, 16, 32],
+        pcp_size=1,
+        dcp_size=1,
+        _prepare_async_token_substitution_indices=lambda s, n, arr: (
+            np.array([], dtype=np.int32),
+            np.array([], dtype=np.int32),
+        ),
+    )
+    sched_prefill = SimpleNamespace(
+        total_num_scheduled_tokens=8,
+        num_scheduled_tokens={"req-0": 4, "req-1": 4},
+        scheduled_spec_decode_tokens={},
+    )
+    # Prefill step: can_cache_decode_metadata is False
+    TPUModelRunner._prepare_inputs(
+        prep_runner, sched_prefill, start_index=0, num_decode_reqs=0
+    )
+    assert prep_runner._attn_metadata_builder_ctx.query_start_loc_cpu == (0, 4, 8)
+    assert prep_runner._attn_metadata_builder_ctx.prompt_lens_cpu == (8, 8)
+
+    # Non-ALL layout plan: query_start_loc_cpu, seq_lens_cpu, prompt_lens_cpu are None
+    partial_desc = SequenceLayoutDescriptor(
+        kind=SequenceLayoutKind.PARTIAL,
+        protocol="pcp_streaming",
+        version=1,
+    )
+    partial_plan = SequenceLayoutPlan(
+        descriptor=partial_desc,
+        token_slice=slice(0, 8),
+        global_num_tokens=8,
+        global_padded_num_tokens=8,
+        local_num_tokens=8,
+        local_padded_num_tokens=8,
+    )
+    prep_runner.sequence_layout_planner = SimpleNamespace(
+        reserve_host_token_capacity=lambda *a, **kw: None,
+        prepare_real=lambda **kw: partial_plan,
+    )
+    TPUModelRunner._prepare_inputs(
+        prep_runner, sched_prefill, start_index=0, num_decode_reqs=0
+    )
+    assert prep_runner._attn_metadata_builder_ctx.query_start_loc_cpu is None
+    assert prep_runner._attn_metadata_builder_ctx.seq_lens_cpu is None
+    assert prep_runner._attn_metadata_builder_ctx.prompt_lens_cpu is None

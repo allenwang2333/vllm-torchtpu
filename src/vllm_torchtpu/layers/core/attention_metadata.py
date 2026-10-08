@@ -100,6 +100,12 @@ class AttentionMetadata:
     seq_lens_cpu: tuple[int, ...] | None = field(default=None, init=False)
     prompt_lens_cpu: tuple[int, ...] | None = field(default=None, init=False)
 
+    def with_block_tables(self, block_tables: Any) -> AttentionMetadata:
+        clone = object.__new__(AttentionMetadata)
+        clone.__dict__ = self.__dict__.copy()
+        clone.block_tables = block_tables
+        return clone
+
 
 @dataclass
 class AttentionMetadataBuilderContext:
@@ -162,6 +168,24 @@ class AttentionMetadataBuilderContext:
     # (state_indices, ckpt_indices | None) from the single
     # `_staged_walk_products_compiled` program; None -> per-group fallback.
     staged_mamba_products: dict | None = None
+    # Per-chunk cache of `_active_block_table_columns` keyed by
+    # `(target_block_size, target_num_blocks, is_mamba_group)` so 54-group
+    # walks with 3 distinct block geometries compute the bucket once per shape.
+    active_cols_cache: dict[tuple[int, int, bool], int] = field(default_factory=dict)
+    # Template non-mamba AttentionMetadata instance constructed by the first
+    # staged non-mamba group in a walk and shallow-copied by remaining groups.
+    base_attn_metadata: AttentionMetadata | None = None
+
+
+@dataclass
+class _StagedWalkPlan:
+    entries: list[tuple[int, Any, int]]
+    entry_builders: list[Any]
+    table_geom: tuple[tuple[int, int, int], ...]
+    mamba_geom: tuple[tuple[int, int, int], ...]
+    mamba_entry_indices: tuple[int, ...]
+    total: int
+    tracked_entries_key: tuple[tuple[int, int, int], ...] | None = None
 
 
 def _staged_walk_products(
@@ -340,6 +364,10 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         """
         if ctx.num_reqs <= 0 or target_num_blocks <= 16:
             return target_num_blocks
+        cache_key = (self.target_block_size, target_num_blocks, self.is_mamba_group)
+        cached = ctx.active_cols_cache.get(cache_key)
+        if cached is not None:
+            return cached
         max_seq_len = getattr(ctx, "max_active_seq_len", None)
         if max_seq_len is None:
             seq_lens_cpu = ctx.seq_lens_cpu
@@ -359,18 +387,20 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             )
             ctx.max_active_seq_len = max_seq_len
         if max_seq_len <= 0:
-            return min(16, target_num_blocks)
-        needed_blocks = cdiv(max_seq_len, self.target_block_size)
-        if self.is_mamba_group and ctx.mamba_ckpt_window > 1:
-            needed_blocks += ctx.mamba_ckpt_window - 1
-        bucket_cols = 1 << max(4, (needed_blocks - 1).bit_length())
-        return min(target_num_blocks, bucket_cols)
+            res = min(16, target_num_blocks)
+        else:
+            needed_blocks = cdiv(max_seq_len, self.target_block_size)
+            if self.is_mamba_group and ctx.mamba_ckpt_window > 1:
+                needed_blocks += ctx.mamba_ckpt_window - 1
+            bucket_cols = 1 << max(4, (needed_blocks - 1).bit_length())
+            res = min(target_num_blocks, bucket_cols)
+        ctx.active_cols_cache[cache_key] = res
+        return res
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         runner = self.runner
         ctx = runner._attn_metadata_builder_ctx
         target_num_reqs = common_attn_metadata.num_reqs
-        block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
 
         # `position_ids` is only used for the dummy run in dummy runs, where we
         # want to use fixed position IDs instead of copying from the CPU tensor
@@ -381,6 +411,8 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             else None
         )
         if staged is not None:
+            if not self.is_mamba_group and ctx.base_attn_metadata is not None:
+                return ctx.base_attn_metadata.with_block_tables(staged)
             # The walk pre-uploaded every group's table in one batched
             # transfer; see `stage_block_table_uploads`.
             block_tables_dev = staged
@@ -389,25 +421,33 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 if ctx.position_ids_override is not None
                 else runner.position_ids
             )
-        elif ctx.position_ids_override is not None:
-            block_tables_dev = torch.zeros(
-                (target_num_reqs * target_num_blocks,), dtype=torch.int32
-            ).to(runner.device)
-            input_positions = ctx.position_ids_override
+            target_num_blocks = 0
         else:
-            active_cols = self._active_block_table_columns(ctx, target_num_blocks)
-            block_tables = self.block_tables_cpu[:target_num_reqs, :target_num_blocks]
-            block_tables.zero_()
-            source_block_tables = block_table_obj.get_cpu_tensor()
-            block_tables[: ctx.num_reqs, :active_cols] = source_block_tables[
-                ctx.start_index : ctx.start_index + ctx.num_reqs, :active_cols
-            ]
-            # Flatten on CPU before H2D to avoid device-side
-            # as_strided/reshape materialization on every decode step.
-            block_tables_dev = block_tables.reshape(-1).to(
-                runner.device, non_blocking=True
-            )
-            input_positions = runner.position_ids
+            block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
+            if ctx.position_ids_override is not None:
+                block_tables_dev = torch.zeros(
+                    (target_num_reqs * target_num_blocks,), dtype=torch.int32
+                ).to(runner.device)
+                input_positions = ctx.position_ids_override
+            else:
+                active_cols = self._active_block_table_columns(ctx, target_num_blocks)
+                block_tables = self.block_tables_cpu[
+                    :target_num_reqs, :target_num_blocks
+                ]
+                if active_cols < target_num_blocks:
+                    block_tables.zero_()
+                elif ctx.num_reqs < target_num_reqs:
+                    block_tables[ctx.num_reqs :].zero_()
+                source_block_tables = block_table_obj.get_cpu_tensor()
+                block_tables[: ctx.num_reqs, :active_cols] = source_block_tables[
+                    ctx.start_index : ctx.start_index + ctx.num_reqs, :active_cols
+                ]
+                # Flatten on CPU before H2D to avoid device-side
+                # as_strided/reshape materialization on every decode step.
+                block_tables_dev = block_tables.reshape(-1).to(
+                    runner.device, non_blocking=True
+                )
+                input_positions = runner.position_ids
 
         mamba_ckpt_indices = None
         if not self.is_mamba_group:
@@ -434,6 +474,8 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 # program alongside the staged tables.
                 mamba_state_indices, mamba_ckpt_indices = staged_products
             else:
+                if target_num_blocks == 0:
+                    _, target_num_blocks = self._block_table_geometry(ctx)
                 block_tables_2d = block_tables_dev.reshape(
                     target_num_reqs, target_num_blocks
                 )
@@ -492,7 +534,88 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         metadata.query_start_loc_cpu = ctx.query_start_loc_cpu
         metadata.seq_lens_cpu = ctx.seq_lens_cpu
         metadata.prompt_lens_cpu = ctx.prompt_lens_cpu
+        if not self.is_mamba_group and staged is not None:
+            ctx.base_attn_metadata = metadata
         return metadata
+
+
+def _get_staged_walk_plan(
+    runner: Any,
+    ctx: AttentionMetadataBuilderContext,
+    num_reqs_padded: int,
+    gids: set[int] | None,
+) -> _StagedWalkPlan | None:
+    unified_mamba = bool(
+        ctx.mamba_state_indices is None and getattr(runner, "_unified_kv_layout", False)
+    )
+    plan_key = (
+        id(runner.attn_groups),
+        len(runner.attn_groups),
+        id(runner.attn_groups[0][0].metadata_builders[0]),
+        id(runner.attn_groups[-1][-1].metadata_builders[0]),
+        ctx.use_max_model_len,
+        None if ctx.use_max_model_len else getattr(runner, "most_model_len", None),
+        ctx.mamba_ckpt_window,
+        unified_mamba,
+        num_reqs_padded,
+        frozenset(gids) if gids is not None else None,
+    )
+    cache = getattr(runner, "_staged_walk_plan_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        runner._staged_walk_plan_cache = cache
+    else:
+        cached_plan = cache.get(plan_key)
+        if cached_plan is not None:
+            return cached_plan
+
+    # Walk in the same order the builds will, deduping shared group ids.
+    entries: list[tuple[int, Any, int]] = []
+    entry_builders: list[Any] = []
+    seen: set[int] = set()
+    for group_list in runner.attn_groups:
+        for group in group_list:
+            builder = group.metadata_builders[0]
+            gid = builder.kv_cache_group_id
+            if gid in seen or (gids is not None and gid not in gids):
+                continue
+            seen.add(gid)
+            block_table_obj, target_num_blocks = builder._block_table_geometry(ctx)
+            entries.append((gid, block_table_obj, target_num_blocks))
+            entry_builders.append(builder)
+    if not entries:
+        return None
+
+    # One compiled program splits the staged tensor into per-group tables
+    # and derives every unified-pool mamba group's state/checkpoint indices
+    # (replaces one micro-program per group per step).
+    table_geom: list[tuple[int, int, int]] = []
+    offset = 0
+    for _, _, target_num_blocks in entries:
+        table_geom.append((offset, num_reqs_padded, target_num_blocks))
+        offset += num_reqs_padded * target_num_blocks
+
+    # Mirror of build()'s branch order: the compact path
+    # (ctx.mamba_state_indices) wins, otherwise the unified layout derives
+    # per-group indices — which is what this precompute batches.
+    mamba_geom: list[tuple[int, int, int]] = []
+    mamba_entry_indices: list[int] = []
+    if unified_mamba:
+        for i, builder in enumerate(entry_builders):
+            if builder.is_mamba_group:
+                mamba_geom.append((i, table_geom[i][2], builder.target_block_size))
+                mamba_entry_indices.append(i)
+
+    plan = _StagedWalkPlan(
+        entries=entries,
+        entry_builders=entry_builders,
+        table_geom=tuple(table_geom),
+        mamba_geom=tuple(mamba_geom),
+        mamba_entry_indices=tuple(mamba_entry_indices),
+        total=offset,
+    )
+    cache[plan_key] = plan
+    return plan
 
 
 def stage_block_table_uploads(
@@ -515,43 +638,14 @@ def stage_block_table_uploads(
         # groups exist; each build() synthesizes its own table there.
         return
 
-    # Walk in the same order the builds will, deduping shared group ids.
-    entries: list[tuple[int, Any, int]] = []
-    entry_builders: list[Any] = []
-    seen: set[int] = set()
-    for group_list in runner.attn_groups:
-        for group in group_list:
-            builder = group.metadata_builders[0]
-            gid = builder.kv_cache_group_id
-            if gid in seen or (gids is not None and gid not in gids):
-                continue
-            seen.add(gid)
-            block_table_obj, target_num_blocks = builder._block_table_geometry(ctx)
-            entries.append((gid, block_table_obj, target_num_blocks))
-            entry_builders.append(builder)
-    if not entries:
+    plan = _get_staged_walk_plan(runner, ctx, num_reqs_padded, gids)
+    if plan is None:
         return
-
-    # One compiled program splits the staged tensor into per-group tables
-    # and derives every unified-pool mamba group's state/checkpoint indices
-    # (replaces one micro-program per group per step).
-    table_geom: list[tuple[int, int, int]] = []
-    offset = 0
-    for _, _, target_num_blocks in entries:
-        table_geom.append((offset, num_reqs_padded, target_num_blocks))
-        offset += num_reqs_padded * target_num_blocks
-
-    # Mirror of build()'s branch order: the compact path
-    # (ctx.mamba_state_indices) wins, otherwise the unified layout derives
-    # per-group indices — which is what this precompute batches.
-    unified_mamba = ctx.mamba_state_indices is None and runner._unified_kv_layout
-    mamba_geom: list[tuple[int, int, int]] = []
-    mamba_entry_indices: list[int] = []
-    if unified_mamba:
-        for i, builder in enumerate(entry_builders):
-            if builder.is_mamba_group:
-                mamba_geom.append((i, table_geom[i][2], builder.target_block_size))
-                mamba_entry_indices.append(i)
+    entries = plan.entries
+    entry_builders = plan.entry_builders
+    table_geom = plan.table_geom
+    mamba_geom = plan.mamba_geom
+    mamba_entry_indices = plan.mamba_entry_indices
 
     # Incremental staging keeps the packed buffer on device across steps and
     # uploads only changed entries (`block_table_delta.py`). Limited to walks
@@ -563,7 +657,15 @@ def stage_block_table_uploads(
     if (len(entries) > 1 or mamba_geom) and envs.TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD:
         stager = get_stager(runner)
         if not is_dummy:
-            delta_key = stager.layout_key(entries, num_reqs_padded, ctx.start_index)
+            if (
+                plan.tracked_entries_key is not None
+                and getattr(entries[0][1], "_bt_delta_token", None)
+                == plan.tracked_entries_key[0][1]
+            ):
+                delta_key = (plan.tracked_entries_key, num_reqs_padded, ctx.start_index)
+            else:
+                delta_key = stager.layout_key(entries, num_reqs_padded, ctx.start_index)
+                plan.tracked_entries_key = delta_key[0]
     staged_dev = None
     if stager is not None and delta_key is not None:
         staged_dev = stager.try_stage(
@@ -572,7 +674,7 @@ def stage_block_table_uploads(
     verify = staged_dev is not None and envs.TPU_VERIFY_INCREMENTAL_BLOCK_TABLE
 
     if staged_dev is None or verify:
-        total = offset
+        total = plan.total
         scratch = runner._block_table_stage_cpu
         if scratch is None or scratch.numel() < total:
             scratch = torch.zeros(
@@ -580,9 +682,10 @@ def stage_block_table_uploads(
             )
             runner._block_table_stage_cpu = scratch
         flat = scratch[:total]
-        flat.zero_()
 
-        if not is_dummy:
+        if is_dummy:
+            flat.zero_()
+        else:
             for builder, (_, block_table_obj, target_num_blocks), (off, _, _) in zip(
                 entry_builders, entries, table_geom
             ):
@@ -592,6 +695,10 @@ def stage_block_table_uploads(
                 rows = flat[off : off + num_reqs_padded * target_num_blocks].view(
                     num_reqs_padded, target_num_blocks
                 )
+                if active_cols < target_num_blocks:
+                    rows.zero_()
+                elif ctx.num_reqs < num_reqs_padded:
+                    rows[ctx.num_reqs :].zero_()
                 source = block_table_obj.get_cpu_tensor()
                 rows[: ctx.num_reqs, :active_cols] = source[
                     ctx.start_index : ctx.start_index + ctx.num_reqs, :active_cols
@@ -639,16 +746,16 @@ def stage_block_table_uploads(
         products = _staged_walk_products_compiled(
             staged_dev,
             ctx.seq_lens,
-            tuple(table_geom),
-            tuple(mamba_geom),
+            table_geom,
+            mamba_geom,
             ctx.mamba_ckpt_window,
         )
     else:
         products = _staged_walk_products(
             staged_dev,
             ctx.seq_lens,
-            tuple(table_geom),
-            tuple(mamba_geom),
+            table_geom,
+            mamba_geom,
             ctx.mamba_ckpt_window,
         )
 

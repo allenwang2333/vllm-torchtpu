@@ -1556,12 +1556,30 @@ class TPUModelRunner(GPUModelRunner):
         # `AttentionMetadataBuilder.build` takes only `num_reqs` off the
         # common metadata; everything else it needs comes from
         # `_attn_metadata_builder_ctx`.
-        selected_groups = []
-        for group_list in self.attn_groups:
-            for group in group_list:
-                selected = [n for n in group.layer_names if n in layer_names]
-                if selected:
-                    selected_groups.append((group, selected))
+        selection_key = (
+            id(self.attn_groups),
+            len(self.attn_groups),
+            frozenset(layer_names),
+        )
+        selection_cache = getattr(self, "_layer_group_selection_cache", None)
+        if not isinstance(selection_cache, dict):
+            selection_cache = {}
+            self._layer_group_selection_cache = selection_cache
+        cached_selection = selection_cache.get(selection_key)
+        if cached_selection is not None:
+            selected_groups, gids = cached_selection
+        else:
+            selected_groups = []
+            for group_list in self.attn_groups:
+                for group in group_list:
+                    selected = [n for n in group.layer_names if n in layer_names]
+                    if selected:
+                        selected_groups.append((group, selected))
+            gids = {
+                group.metadata_builders[0].kv_cache_group_id
+                for group, _ in selected_groups
+            }
+            selection_cache[selection_key] = (selected_groups, gids)
         ctx = self._attn_metadata_builder_ctx
         if ctx.staged_block_tables is None and selected_groups:
             # One H2D for exactly the groups this targeted walk will build.
@@ -1569,10 +1587,7 @@ class TPUModelRunner(GPUModelRunner):
                 self,
                 ctx,
                 num_reqs_padded,
-                gids={
-                    group.metadata_builders[0].kv_cache_group_id
-                    for group, _ in selected_groups
-                },
+                gids=gids,
             )
         common = SimpleNamespace(num_reqs=num_reqs_padded)
         metadata: dict[str, AttentionMetadata] = {}
@@ -2326,19 +2341,24 @@ class TPUModelRunner(GPUModelRunner):
             pre_next_tokens_indices = self._cached_pre_next_tokens_indices
         else:
             idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
-            _missing_mask = np.ones(len(input_ids), dtype=bool)
-            _missing_mask[token_in_tpu_cur_input_indices] = False
-            missing_values = np.flatnonzero(_missing_mask).astype(np.int32)
-            padded_token_in_tpu_cur_input_indices = np.concatenate(
-                (token_in_tpu_cur_input_indices, missing_values)
-            )
-
-            padded_token_in_tpu_pre_next_tokens_indices = np.pad(
-                token_in_tpu_pre_next_tokens_indices,
-                (0, idx_pad_len),
-                mode="constant",
-                constant_values=-1,
-            )
+            if idx_pad_len > 0:
+                _missing_mask = np.ones(len(input_ids), dtype=bool)
+                _missing_mask[token_in_tpu_cur_input_indices] = False
+                missing_values = np.flatnonzero(_missing_mask).astype(np.int32)
+                padded_token_in_tpu_cur_input_indices = np.concatenate(
+                    (token_in_tpu_cur_input_indices, missing_values)
+                )
+                padded_token_in_tpu_pre_next_tokens_indices = np.pad(
+                    token_in_tpu_pre_next_tokens_indices,
+                    (0, idx_pad_len),
+                    mode="constant",
+                    constant_values=-1,
+                )
+            else:
+                padded_token_in_tpu_cur_input_indices = token_in_tpu_cur_input_indices
+                padded_token_in_tpu_pre_next_tokens_indices = (
+                    token_in_tpu_pre_next_tokens_indices
+                )
 
             cur_input_indices = torch.from_numpy(
                 padded_token_in_tpu_cur_input_indices
@@ -2447,7 +2467,28 @@ class TPUModelRunner(GPUModelRunner):
                     if bids:
                         bt.append_row(bids, row_idx)
 
+            def fast_swap_row(i1, i2):
+                if i1 == i2:
+                    return
+                for bt in tables:
+                    nb = bt.num_blocks_per_row
+                    n1 = int(nb[i1])
+                    n2 = int(nb[i2])
+                    nb[i1] = n2
+                    nb[i2] = n1
+                    arr = getattr(bt, "_bt_cpu_np", None)
+                    if arr is None:
+                        arr = bt.block_table.np
+                    tmp = arr[i1].copy()
+                    arr[i1] = arr[i2]
+                    arr[i2] = tmp
+                    rewrote = getattr(bt, "_rewrote", None)
+                    if rewrote is not None:
+                        rewrote(i1)
+                        rewrote(i2)
+
             block_table.append_row = fast_append_row
+            block_table.swap_row = fast_swap_row
         input_batch._tpu_spec_room_guard = True
 
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
@@ -3256,6 +3297,40 @@ class TPUModelRunner(GPUModelRunner):
             request_distribution = combined_device[0:3]
             mamba_request_distribution = combined_device[3:6]
 
+        if layout_plan.kind is SequenceLayoutKind.ALL:
+            if getattr(self, "_cached_qsl_cpu_key", None) == decode_cache_key:
+                query_start_loc_cpu = self._cached_query_start_loc_cpu
+            else:
+                query_start_loc_cpu = tuple(
+                    self.query_start_loc_np[: target_num_reqs + 1].tolist()
+                )
+                if can_cache_decode_metadata:
+                    self._cached_qsl_cpu_key = decode_cache_key
+                    self._cached_query_start_loc_cpu = query_start_loc_cpu
+            seq_lens_cpu = tuple(self.seq_lens_np[:target_num_reqs].tolist())
+            prompt_slice = self.input_batch.num_prompt_tokens[
+                start_index : start_index + num_reqs
+            ]
+            prompt_key = (
+                start_index,
+                num_reqs,
+                target_num_reqs,
+                prompt_slice.tobytes(),
+            )
+            if getattr(self, "_cached_prompt_lens_key", None) == prompt_key:
+                prompt_lens_cpu = self._cached_prompt_lens_cpu
+            else:
+                prompt_lens_cpu = tuple(prompt_slice.tolist()) + (0,) * (
+                    target_num_reqs - num_reqs
+                )
+                self._cached_prompt_lens_key = prompt_key
+                self._cached_prompt_lens_cpu = prompt_lens_cpu
+        else:
+            query_start_loc_cpu = None
+            seq_lens_cpu = None
+            prompt_lens_cpu = None
+        max_active_seq_len = int(self.seq_lens_np[:num_reqs].max())
+
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=start_index,
@@ -3263,31 +3338,10 @@ class TPUModelRunner(GPUModelRunner):
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
-            query_start_loc_cpu=(
-                tuple(self.query_start_loc_np[: target_num_reqs + 1].tolist())
-                if layout_plan.kind is SequenceLayoutKind.ALL
-                else None
-            ),
-            seq_lens_cpu=(
-                (
-                    tuple(self.seq_lens_np[:num_reqs].tolist())
-                    + (0,) * (target_num_reqs - num_reqs)
-                )
-                if layout_plan.kind is SequenceLayoutKind.ALL
-                else None
-            ),
-            prompt_lens_cpu=(
-                (
-                    tuple(
-                        self.input_batch.num_prompt_tokens[
-                            start_index : start_index + num_reqs
-                        ].tolist()
-                    )
-                    + (0,) * (target_num_reqs - num_reqs)
-                )
-                if layout_plan.kind is SequenceLayoutKind.ALL
-                else None
-            ),
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens_cpu=seq_lens_cpu,
+            prompt_lens_cpu=prompt_lens_cpu,
+            max_active_seq_len=max_active_seq_len,
             mamba_state_indices=mamba_state_indices,
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
             mamba_ckpt_window=self._mamba_ckpt_window,
