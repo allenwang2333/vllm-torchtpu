@@ -26,29 +26,60 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
     prompts = metadata.prompt_lens_cpu
     if bounds is None or lengths is None or prompts is None:
         return None  # Profiling/warmup executes both stages at the full bucket.
-    if window < 1 or len(bounds) != len(lengths) + 1 or len(prompts) != len(lengths):
+    bounds_list = bounds.tolist() if isinstance(bounds, torch.Tensor) else bounds
+    lengths_list = lengths.tolist() if isinstance(lengths, torch.Tensor) else lengths
+    prompts_list = prompts.tolist() if isinstance(prompts, torch.Tensor) else prompts
+    if (
+        window < 1
+        or len(bounds_list) != len(lengths_list) + 1
+        or len(prompts_list) != len(lengths_list)
+    ):
         raise ValueError("Invalid decoder replay scheduling metadata")
-    if bounds[0] != 0 or bounds[-1] > num_tokens:
+    if bounds_list[0] != 0 or bounds_list[-1] > num_tokens:
         raise ValueError("Query boundaries exceed the input token bucket")
-    indices, replay_starts, output_bounds = [], [], [0]
-    for start, end, length, prompt in zip(bounds, bounds[1:], lengths, prompts):
+    replay_starts = []
+    any_skipped = False
+    for start, end, length, prompt in zip(
+        bounds_list, bounds_list[1:], lengths_list, prompts_list
+    ):
         count = end - start
         if count < 0 or length < count or prompt < 0:
             raise ValueError("Invalid scheduled query or prompt length")
-        replay_start = max(0, prompt - window)
-        skip = min(count, max(0, replay_start - (length - count)))
-        indices.extend(range(start + skip, end))
+        replay_start = prompt - window if prompt > window else 0
         replay_starts.append(replay_start)
-        output_bounds.append(len(indices))
-    kept = len(indices)
+        if replay_start > length - count and count > 0:
+            any_skipped = True
+    if not any_skipped:
+        kept = bounds_list[-1]
+        indices_tuple = tuple(range(kept))
+        output_bounds_tuple = tuple(bounds_list)
+    else:
+        indices = []
+        output_bounds = [0]
+        for start, end, length, replay_start in zip(
+            bounds_list, bounds_list[1:], lengths_list, replay_starts
+        ):
+            count = end - start
+            skip = min(count, max(0, replay_start - (length - count)))
+            indices.extend(range(start + skip, end))
+            output_bounds.append(len(indices))
+        kept = len(indices)
+        indices_tuple = tuple(indices)
+        output_bounds_tuple = tuple(output_bounds)
     # Each stage dispatches by its own token bucket. Never introduce a second,
     # independent symbolic token dimension into vLLM's guard-free full graph.
-    buckets = sorted({num_tokens, *(int(n) for n in compile_sizes if int(n) > 0)})
-    padded = next(n for n in buckets if n >= kept) if kept else 0
-    is_identity = kept > 0 and kept == bounds[-1] and padded == num_tokens
+    if kept == 0:
+        padded = 0
+    else:
+        padded = int(num_tokens)
+        for size in compile_sizes:
+            n = int(size)
+            if kept <= n < padded:
+                padded = n
+    is_identity = kept > 0 and kept == bounds_list[-1] and padded == num_tokens
     return DecoderReplayPlan(
-        tuple(indices),
-        tuple(output_bounds),
+        indices_tuple,
+        output_bounds_tuple,
         tuple(replay_starts),
         padded,
         is_identity=is_identity,
