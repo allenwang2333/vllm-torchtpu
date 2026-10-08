@@ -201,6 +201,7 @@ if [ "${DOCKER_EXIT_CODE}" -ne 0 ]; then
   echo "Last 40 lines of container output:"
   tail -n 40 "${RUN_LOG}"
 
+  export BQ_FAILURE_TABLE="${BQ_FAILURE_TABLE:-cloud-ullm-inference-ci-cd.llm_benchmark_analytics.ci_failures}"
   python3 "${SCRIPT_DIR}/record_ci_failure.py" \
     --log-file "${RUN_LOG}" \
     --exit-code "${DOCKER_EXIT_CODE}" \

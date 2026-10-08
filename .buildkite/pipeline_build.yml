@@ -13,6 +13,23 @@
 # limitations under the License.
 
 steps:
+  - label: ":warning: Test CI Failure BigQuery Recording"
+    key: "test_ci_failure_recording"
+    agents:
+      queue: cpu_64_core
+    commands:
+      - |
+        echo "Simulating CI runner failure: disk full..."
+        echo "Writing cache..." > /tmp/test_error.log
+        echo "OSError: [Errno 28] No space left on device" >> /tmp/test_error.log
+        export BQ_FAILURE_TABLE="cloud-ullm-inference-ci-cd.llm_benchmark_analytics.ci_failures"
+        python3 .buildkite/scripts/record_ci_failure.py \
+          --log-file /tmp/test_error.log \
+          --exit-code 1 \
+          --step-label "Test CI Failure BigQuery Recording"
+        rm -f /tmp/test_error.log
+        exit 1
+
   - group: "Build Docker Images"
     key: "build_docker_group"
     steps:
