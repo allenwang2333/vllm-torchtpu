@@ -27,6 +27,10 @@ from vllm.model_executor.models.qwen3_dspark import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.models.deepseek_v41.nvidia import model as upstream
 
+from vllm_torchtpu.layers.adapter.linear_common import (
+    WEIGHT_FLIPPED_ATTR,
+    quantized_matmul,
+)
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
 from vllm_torchtpu.logger import init_logger
 
@@ -37,6 +41,7 @@ from ..common.mhc import (
     pack_mix_weights,
     post,
 )
+from . import attention as v2_attn
 from .attention import (
     DeepseekV41Attention,
     _cache_slots,
@@ -148,20 +153,36 @@ def _insert_context_kv(
     swa_cache = attn.swa_cache_layer.kv_cache
     if metadata is None or not swa_cache.numel():
         return
-    kv = attn._rotate(kv, positions)
+    stage_cache = v2_attn._active_stage_attn_cache
+    if stage_cache is None or not stage_cache.get("context_kv_pre_rotated", False):
+        kv = attn._rotate(kv, positions)
     if isinstance(metadata, torch.Tensor):
         swa_slots = metadata
         swa_valid = swa_slots >= 0
     else:
-        swa_slots = _cache_slots(swa_cache, metadata, positions)
-        if metadata.seq_lens.numel() > 0:
-            requests = _token_requests(metadata, positions).clamp(
-                max=metadata.seq_lens.shape[0] - 1
-            )
-            offsets = positions - metadata.seq_lens[requests] + attn.window_size
-            swa_valid = (swa_slots >= 0) & (offsets >= 0) & (offsets < attn.window_size)
+        slot_key = (
+            "context_kv_slots",
+            id(metadata),
+            swa_cache.shape[1],
+            attn.window_size,
+        )
+        cached_slots = stage_cache.get(slot_key) if stage_cache is not None else None
+        if cached_slots is not None:
+            swa_slots, swa_valid = cached_slots
         else:
-            swa_valid = swa_slots >= 0
+            swa_slots = _cache_slots(swa_cache, metadata, positions)
+            if metadata.seq_lens.numel() > 0:
+                requests = _token_requests(metadata, positions).clamp(
+                    max=metadata.seq_lens.shape[0] - 1
+                )
+                offsets = positions - metadata.seq_lens[requests] + attn.window_size
+                swa_valid = (
+                    (swa_slots >= 0) & (offsets >= 0) & (offsets < attn.window_size)
+                )
+            else:
+                swa_valid = swa_slots >= 0
+            if stage_cache is not None:
+                stage_cache[slot_key] = (swa_slots, swa_valid)
     _insert(swa_cache, swa_slots, kv, swa_valid)
 
 
@@ -192,6 +213,8 @@ class DSparkDeepseekV41Model(nn.Module):
         # Aliased to the target's embedding by the proposer's sharing utility
         # after load (has_own_embed_tokens=False).
         self.embed_tokens: nn.Module | None = None
+        self._fused_context_wkv_weight: torch.Tensor | None = None
+        self._fused_context_wkv_scale: torch.Tensor | None = None
 
         self.main_proj = ReplicatedLinear(
             config.hidden_size * len(self.target_layer_ids),
@@ -282,11 +305,36 @@ class DSparkDeepseekV41Model(nn.Module):
                 prefix=maybe_prefix(prefix, "confidence_head"),
             )
 
+    def _finalize_context_kv_weights(
+        self, layers: list[DeepseekV41DecoderLayer]
+    ) -> None:
+        if self._fused_context_wkv_weight is not None:
+            return
+        attn0 = layers[0].attn
+        w0_mod = getattr(attn0, "fused_wqa_wkv", None)
+        if not getattr(w0_mod, WEIGHT_FLIPPED_ATTR, False):
+            return
+        q_rank = attn0.q_lora_rank
+        head_dim = attn0.head_dim
+        wkv_weights = [
+            layer.attn.fused_wqa_wkv.weight[:, q_rank : q_rank + head_dim]
+            for layer in layers
+        ]
+        self._fused_context_wkv_weight = torch.cat(wkv_weights, dim=-1).contiguous()
+        if getattr(w0_mod, "weight_scale", None) is not None:
+            wkv_scales = [
+                layer.attn.fused_wqa_wkv.weight_scale[..., q_rank : q_rank + head_dim]
+                for layer in layers
+            ]
+            self._fused_context_wkv_scale = torch.cat(wkv_scales, dim=-1).contiguous()
+
     def finalize_mhc_broadcast_weights(self) -> None:
         layers = list(self.layers)
-        if layers and layers[0].hc_attn_fn.dtype != torch.float32:
+        if not layers:
             return
-        pack_mix_weights(layers)
+        if layers[0].hc_attn_fn.dtype == torch.float32:
+            pack_mix_weights(layers)
+        self._finalize_context_kv_weights(layers)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         assert self.embed_tokens is not None
@@ -316,12 +364,42 @@ class DSparkDeepseekV41Model(nn.Module):
             main_x = self.combine_hidden_states(target_hidden_states)
         else:
             main_x = target_hidden_states
-        for i, layer in enumerate(cast(Iterable[DeepseekV41DecoderLayer], self.layers)):
-            attn = layer.attn
-            qr_kv = attn._fused_wqa_wkv_gemm(main_x)
-            _, _, kv = attn._split_qkv_and_norm(qr_kv)
-            layer_md = None if metadata is None else metadata[i]
-            _insert_context_kv(attn, kv, positions, layer_md)
+        layers = list(cast(Iterable[DeepseekV41DecoderLayer], self.layers))
+        with stage_attention_cache_scope():
+            if self._fused_context_wkv_weight is not None:
+                head_dim = layers[0].attn.head_dim
+                if self._fused_context_wkv_scale is not None:
+                    all_kv_raw = quantized_matmul(
+                        main_x,
+                        self._fused_context_wkv_weight,
+                        self._fused_context_wkv_scale,
+                    )
+                else:
+                    all_kv_raw = torch.matmul(main_x, self._fused_context_wkv_weight)
+                kv_normed = torch.stack(
+                    [
+                        layer.attn.kv_norm(kv_s)
+                        for layer, kv_s in zip(
+                            layers, all_kv_raw.split(head_dim, dim=-1), strict=True
+                        )
+                    ],
+                    dim=1,
+                )
+                kv_rotated = layers[0].attn._rotate(kv_normed, positions)
+                assert v2_attn._active_stage_attn_cache is not None
+                v2_attn._active_stage_attn_cache["context_kv_pre_rotated"] = True
+                for i, layer in enumerate(layers):
+                    layer_md = None if metadata is None else metadata[i]
+                    _insert_context_kv(
+                        layer.attn, kv_rotated[:, i], positions, layer_md
+                    )
+            else:
+                for i, layer in enumerate(layers):
+                    attn = layer.attn
+                    qr_kv = attn._fused_wqa_wkv_gemm(main_x)
+                    _, _, kv = attn._split_qkv_and_norm(qr_kv)
+                    layer_md = None if metadata is None else metadata[i]
+                    _insert_context_kv(attn, kv, positions, layer_md)
         return main_x
 
     def forward(

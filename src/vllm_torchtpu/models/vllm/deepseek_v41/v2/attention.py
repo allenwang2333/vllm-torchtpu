@@ -884,10 +884,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and swa.seq_lens.numel() > 0
         ):
             use_3page_swa = (
-                not non_causal
-                and tiled
-                and swa_table.shape[1] > 0
-                and self.window_size <= 4 * rows_per_page
+                tiled and swa_table.shape[1] > 0 and swa_width <= 6 * rows_per_page
             )
             swa_key = (
                 "swa_token_addr",
@@ -954,7 +951,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     )
                     swa_pages = (safe // rows_per_page).long()
                     swa_page_rem = safe % rows_per_page
-                    max_prev_pages = max(2, (self.window_size - 1) // rows_per_page + 1)
+                    max_prev_pages = max(2, (swa_width - 1) // rows_per_page + 1)
                     c_last = swa_pages[:, -1]
                     prev_cols = tuple(
                         (c_last - k).clamp(min=0) for k in range(1, max_prev_pages + 1)
@@ -963,7 +960,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     is_prev_cols = tuple(
                         swa_pages == col[:, None] for col in prev_cols[:-1]
                     )
-                    swa_3page = (prev_cols, is_c_last, is_prev_cols, swa_page_rem)
+                    swa_3page = (
+                        c_last,
+                        prev_cols,
+                        is_c_last,
+                        is_prev_cols,
+                        swa_page_rem,
+                    )
                 else:
                     swa_3page = None
                 cached_swa = (
@@ -995,7 +998,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 swa_invalid_3d = (~swa_valid)[:, None, None]
                 valid_window = base_valid_window & swa_valid[:, None]
                 if swa_3page is not None:
-                    prev_cols, is_c_last, is_prev_cols, swa_page_rem = swa_3page
+                    (
+                        c_last,
+                        prev_cols,
+                        is_c_last,
+                        is_prev_cols,
+                        swa_page_rem,
+                    ) = swa_3page
+                    b_last = swa_table[requests, c_last].long() if non_causal else b2
                     swa_blocks = swa_table[requests, prev_cols[-1]].long()[:, None]
                     for col, is_col in zip(
                         reversed(prev_cols[:-1]),
@@ -1004,7 +1014,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     ):
                         b_col = swa_table[requests, col].long()[:, None]
                         swa_blocks = torch.where(is_col, b_col, swa_blocks)
-                    swa_blocks = torch.where(is_c_last, b2[:, None], swa_blocks)
+                    swa_blocks = torch.where(is_c_last, b_last[:, None], swa_blocks)
                     swa_row_slots = (
                         swa_blocks * swa_cache.page_stride + swa_page_rem
                         if has_fast_swa_offset

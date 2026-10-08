@@ -1399,3 +1399,273 @@ def test_dspark_query_block_size(
     draft_lm = v2_dspark.DSparkDeepseekV41ForCausalLM(vllm_config=vllm_cfg)
     for layer in draft_lm.model.layers:
         assert layer.attn.query_block_size == expected
+
+
+def test_prepare_tpu_non_causal_3page_swa_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify non-causal DSpark SWA uses the multi-page fast path."""
+    attn: Any = object.__new__(v2_attn.DeepseekV41Attention)
+    torch.nn.Module.__init__(attn)
+    attn.prefix = "swa_pfx"
+    attn.window_size = 128
+    attn._ced_decoder = False
+    attn._ced_global_from_encoder = False
+    attn._local_q_attn = False
+    attn.compressor = None
+    attn.indexer = None
+    attn.compress_ratio = 0
+    attn._config = {"index_topk": 4}
+    attn._max_model_len = 512
+    attn._fp8_kv = False
+    attn.n_local_heads = 2
+    attn.head_dim = 8
+    attn.scale = 0.25
+    attn.attn_sink = torch.zeros(2)
+    attn._swa_max_requests = 16
+    attn._precompact_records = False
+    attn._token_parallel_attn = False
+    attn._full_attn_sink = False
+    attn._tp_rank_1d = 0
+    attn.topk_indices_buffer = torch.full((16, 8), -1, dtype=torch.int32)
+    attn._rotate = lambda x, p: x
+    attn.wq_b = lambda qr: qr
+    attn.non_causal_multi_token_decode = True
+    attn.dspark_block_size = 5
+
+    cache_mock = MagicMock(spec=PagedCacheRows)
+    cache_mock.numel.return_value = 1024
+    cache_mock.shape = (64, 32, 8)
+    cache_mock.page_stride = 32
+    cache_mock.row_offset = 100
+    cache_mock.row_indices = lambda slots: 100 + slots
+
+    attn.swa_cache_layer = SimpleNamespace(prefix="swa_pfx", kv_cache=cache_mock)
+    attn.kv_cache = cache_mock
+    attn._static_forward_context = {"swa_pfx": SimpleNamespace(kv_cache=cache_mock)}
+    attn.compressed_cache_prefix = "swa_pfx"
+
+    # Two requests with non-sequential block tables spanning 6 pages (32 rows/page)
+    positions = torch.tensor(
+        [140, 141, 142, 143, 144, 70, 71, 72, 73, 74], dtype=torch.long
+    )
+    block_tables = torch.tensor(
+        [
+            [11, 25, 3, 47, 19, 8, 31, 2],
+            [5, 14, 29, 6, 41, 12, 7, 18],
+        ],
+        dtype=torch.int32,
+    )
+    swa_md = SimpleNamespace(
+        seq_lens=torch.tensor([145, 75], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 5, 10], dtype=torch.int32),
+        block_tables=block_tables,
+        slot_mapping=positions.clone(),
+    )
+    ctx = SimpleNamespace(attn_metadata={"swa_pfx": swa_md}, additional_kwargs={})
+    monkeypatch.setattr(v2_attn, "get_forward_context", lambda: ctx)
+    monkeypatch.setattr(v2_attn, "_insert", lambda *a, **kw: None)
+
+    captured_records: list[torch.Tensor] = []
+
+    def fake_paged_attn(q, swa_c, main_c, records, main_rec, *args, **kwargs):
+        captured_records.append(records.clone())
+        return torch.zeros_like(q)
+
+    monkeypatch.setattr(v2_attn, "paged_attention", fake_paged_attn)
+
+    hidden = torch.zeros((10, 16))
+    qr = torch.zeros((10, 16))
+    kv = torch.zeros((10, 8))
+    out = torch.zeros((10, 2, 8))
+
+    # Reference uncached path (uses _row_slots)
+    attn._prepare_tpu(hidden, qr, kv, None, None, None, positions, out)
+    assert len(captured_records) == 1
+    rec_ref = captured_records[0]
+
+    # Stage-cached path must use use_3page_swa (no _row_slots) and match rec_ref
+    captured_records.clear()
+    row_slots_called = False
+    orig_row_slots = v2_attn._row_slots
+
+    def fail_row_slots(*a, **kw):
+        nonlocal row_slots_called
+        row_slots_called = True
+        return orig_row_slots(*a, **kw)
+
+    monkeypatch.setattr(v2_attn, "_row_slots", fail_row_slots)
+    with v2_attn.stage_attention_cache_scope():
+        attn._prepare_tpu(hidden, qr, kv, None, None, None, positions, out)
+        attn._prepare_tpu(hidden, qr, kv, None, None, None, positions, out)
+    assert row_slots_called is False
+    assert len(captured_records) == 2
+    assert torch.equal(captured_records[0], rec_ref)
+    assert torch.equal(captured_records[1], rec_ref)
+
+
+def test_insert_context_kv_stage_cache_and_pre_rotated(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify _insert_context_kv caches SWA slots and respects pre-rotated flag."""
+    inserted: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    rotate_calls = 0
+    cache_slots_calls = 0
+
+    def fake_insert(cache, slots, kv, valid):
+        inserted.append((slots.clone(), kv.clone(), valid.clone()))
+
+    def fake_rotate(kv, pos):
+        nonlocal rotate_calls
+        rotate_calls += 1
+        return kv + 10.0
+
+    def fake_cache_slots(cache, md, pos):
+        nonlocal cache_slots_calls
+        cache_slots_calls += 1
+        return torch.tensor([1, 2, 3], dtype=torch.long)
+
+    monkeypatch.setattr(v2_dspark, "_insert", fake_insert)
+    monkeypatch.setattr(v2_dspark, "_cache_slots", fake_cache_slots)
+    monkeypatch.setattr(
+        v2_dspark,
+        "_token_requests",
+        lambda md, pos: torch.tensor([0, 0, 0], dtype=torch.long),
+    )
+
+    attn = SimpleNamespace(
+        window_size=4,
+        swa_cache_layer=SimpleNamespace(kv_cache=torch.zeros((2, 4, 1, 8))),
+        _rotate=fake_rotate,
+    )
+    kv = torch.ones((3, 8))
+    positions = torch.tensor([1, 2, 5], dtype=torch.long)
+    md_nonempty = SimpleNamespace(seq_lens=torch.tensor([6], dtype=torch.int32))
+    md_empty = SimpleNamespace(seq_lens=torch.empty(0, dtype=torch.int32))
+
+    with v2_attn.stage_attention_cache_scope():
+        # Layer 0: computes slots and rotates
+        v2_dspark._insert_context_kv(attn, kv, positions, md_nonempty)
+        # Layer 1: reuses cached slots from stage_cache
+        v2_dspark._insert_context_kv(attn, kv, positions, md_nonempty)
+        assert cache_slots_calls == 1
+        assert rotate_calls == 2
+        assert torch.equal(inserted[0][0], inserted[1][0])
+        assert torch.equal(inserted[0][2], inserted[1][2])
+
+        # Empty seq_lens inside stage_attention_cache_scope
+        v2_dspark._insert_context_kv(attn, kv, positions, md_empty)
+        assert cache_slots_calls == 2
+        assert rotate_calls == 3
+
+        # Pre-rotated flag skips attn._rotate
+        assert v2_attn._active_stage_attn_cache is not None
+        v2_attn._active_stage_attn_cache["context_kv_pre_rotated"] = True
+        v2_dspark._insert_context_kv(attn, kv, positions, md_nonempty)
+        assert rotate_calls == 3
+        assert torch.equal(inserted[-1][1], kv)
+
+
+def test_dspark_fused_context_kv_unquantized_and_fp8_parity(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify fused 3-layer context WKV GEMM + batched 3D RoPE matches unfused path."""
+    _patch_dspark_env(monkeypatch)
+    vllm_cfg = _make_dspark_vllm_config()
+    draft_lm = v2_dspark.DSparkDeepseekV41ForCausalLM(vllm_config=vllm_cfg)
+    model = draft_lm.model
+
+    q_rank = 8
+    head_dim = 8
+    hidden_size = 16
+    for i, layer in enumerate(model.layers):
+        attn = layer.attn
+        attn.q_lora_rank = q_rank
+        attn.head_dim = head_dim
+        attn.kv_norm = v2_dspark.RMSNorm(head_dim, eps=1e-6)
+        attn.kv_norm.weight.data.fill_(1.0 + 0.1 * i)
+        # Set up a flipped [hidden_size, q_rank + head_dim] weight
+        w_flipped = torch.randn(hidden_size, q_rank + head_dim)
+        attn.fused_wqa_wkv.weight = nn.Parameter(w_flipped, requires_grad=False)
+        attn.fused_wqa_wkv._tpu_weight_flipped = True
+        attn.fused_wqa_wkv.weight_scale = None
+        attn._fused_wqa_wkv_gemm = lambda x, w=w_flipped: torch.matmul(x, w)
+        attn._split_qkv_and_norm = lambda qr_kv, a=attn: (
+            qr_kv[:, : a.q_lora_rank],
+            None,
+            a.kv_norm(qr_kv[:, a.q_lora_rank :]),
+        )
+        # Position-dependent rotation that works for both 2D [T, D] and 3D [T, L, D]
+        attn._rotate = lambda x, pos: (
+            x + pos.view(-1, *([1] * (x.ndim - 1))).to(x.dtype) * 0.25
+        )
+
+    main_x = torch.randn(4, hidden_size)
+    positions = torch.tensor([10, 11, 12, 13], dtype=torch.long)
+    md = [
+        torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        torch.tensor([0, 1, 2, 3], dtype=torch.long),
+    ]
+
+    # 1. Unfused reference (before _finalize_context_kv_weights)
+    assert model._fused_context_wkv_weight is None
+    unfused_inserts: list[torch.Tensor] = []
+    monkeypatch.setattr(
+        v2_dspark,
+        "_insert",
+        lambda cache, slots, kv, valid: unfused_inserts.append(kv.clone()),
+    )
+    model.precompute_and_store_context_kv(main_x, positions, metadata=md)
+    assert len(unfused_inserts) == 2
+
+    # 2. Finalize fused context KV weights (unquantized) and verify idempotency
+    draft_lm.process_weights_after_loading()
+    assert model._fused_context_wkv_weight is not None
+    assert model._fused_context_wkv_weight.shape == (hidden_size, 2 * head_dim)
+    assert model._fused_context_wkv_scale is None
+    packed_ptr = model._fused_context_wkv_weight.data_ptr()
+    draft_lm.process_weights_after_loading()
+    assert model._fused_context_wkv_weight.data_ptr() == packed_ptr
+
+    fused_inserts: list[torch.Tensor] = []
+    monkeypatch.setattr(
+        v2_dspark,
+        "_insert",
+        lambda cache, slots, kv, valid: fused_inserts.append(kv.clone()),
+    )
+    model.precompute_and_store_context_kv(main_x, positions, metadata=md)
+    assert len(fused_inserts) == 2
+    for u_kv, f_kv in zip(unfused_inserts, fused_inserts, strict=True):
+        assert torch.allclose(u_kv, f_kv, atol=1e-6, rtol=1e-6)
+
+    # 3. Quantized (FP8 weight_scale) path
+    model._fused_context_wkv_weight = None
+    model._fused_context_wkv_scale = None
+    for i, layer in enumerate(model.layers):
+        layer.attn.fused_wqa_wkv.weight_scale = torch.full(
+            (q_rank + head_dim,), 0.5 * (i + 1)
+        )
+    draft_lm.process_weights_after_loading()
+    assert model._fused_context_wkv_scale is not None
+    assert model._fused_context_wkv_scale.shape == (2 * head_dim,)
+
+    q_matmul_calls: list[tuple[torch.Size, torch.Size]] = []
+
+    def fake_quantized_matmul(x, w, s):
+        q_matmul_calls.append((w.shape, s.shape))
+        return torch.matmul(x, w) * s
+
+    monkeypatch.setattr(v2_dspark, "quantized_matmul", fake_quantized_matmul)
+    quant_inserts: list[torch.Tensor] = []
+    monkeypatch.setattr(
+        v2_dspark,
+        "_insert",
+        lambda cache, slots, kv, valid: quant_inserts.append(kv.clone()),
+    )
+    model.precompute_and_store_context_kv(main_x, positions, metadata=md)
+    assert len(q_matmul_calls) == 1
+    assert q_matmul_calls[0] == (
+        torch.Size([hidden_size, 2 * head_dim]),
+        torch.Size([2 * head_dim]),
+    )
+    assert len(quant_inserts) == 2
