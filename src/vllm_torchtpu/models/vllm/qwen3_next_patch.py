@@ -40,6 +40,14 @@ from vllm.distributed import (
 from vllm.model_executor.models import qwen3_next, qwen3_next_mtp
 from vllm.sequence import IntermediateTensors
 
+# Imported at module load, not inside the decoder forward: that forward is
+# traced by torch.compile, and Dynamo resolves an in-function
+# `from vllm_torchtpu.layers.adapter import fused_moe_tp_ar` as an attribute
+# lookup on the package without running the import. On paths that never armed
+# fused TP-MoE (e.g. EP + SP with USE_MOE_FUSED_TP_AR=0) the submodule was not
+# yet loaded, so a cold compile died with "module 'vllm_torchtpu.layers.adapter'
+# has no attribute 'fused_moe_tp_ar'".
+from vllm_torchtpu.layers.adapter import fused_moe_tp_ar as _ftp
 from vllm_torchtpu.layers.adapter import linear_common
 from vllm_torchtpu.logger import init_logger
 
@@ -252,8 +260,6 @@ def patched_decoder_layer_forward(
     # Fully Connected
     hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
     if self.use_attn_reduce_scatter_for_moe:
-        from vllm_torchtpu.layers.adapter import fused_moe_tp_ar as _ftp
-
         prev_sp = _ftp._CURRENT_LAYER_USE_SP
         _ftp._CURRENT_LAYER_USE_SP = sp
         try:
@@ -311,11 +317,7 @@ def patched_model_forward(
         islice(self.layers, self.start_layer, self.end_layer),
         start=self.start_layer,
     ):
-        if (
-            sp
-            and residual is not None
-            and not layer.use_attn_reduce_scatter_for_moe
-        ):
+        if sp and residual is not None and not layer.use_attn_reduce_scatter_for_moe:
             hidden_states, residual = _all_gather_hidden_and_residual(
                 hidden_states,
                 residual,
