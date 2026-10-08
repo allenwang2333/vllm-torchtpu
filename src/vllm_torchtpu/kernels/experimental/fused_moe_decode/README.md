@@ -97,8 +97,9 @@ own T/n rows. The kernel runs no all-gather. Things to know:
 - With `gather_rows` each rank waits on the cross-rank barrier at entry, then
   sends its routing slab (`[T/n, 128]` FP32: global expert ids, weights and the
   shared gate) and its hidden rows to every rank by remote DMA, only the real
-  rows (BF16; FP32 when `T/n` is odd, since one BF16 row is half a packed
-  sublane). The receiver builds the route-weight table and compacts the
+  rows (BF16 as whole 16-row tiles or 2 or 4 rows; other counts in FP32,
+  whole 8-row tiles from 8 rows up: other partial BF16 tiles were measured
+  unsafe). The receiver builds the route-weight table and compacts the
   active experts with vector ops (a prefix-sum matmul), and the id list
   reaches SMEM by a VMEM-to-SMEM DMA. The shared expert's weights load during
   the gather. The output is exactly `[T/n, H]` in the hidden dtype.

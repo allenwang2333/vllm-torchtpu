@@ -220,11 +220,12 @@ def _kernel(
         pl.semaphore_wait(barrier, n_ranks)
         # Only the real rows travel (`sent` of them), not the slab's tile
         # padding (at one to four rows per rank the padded slab is 4-16x the
-        # bytes). A DMA moves whole sublanes from a tile start: BF16 rows go
-        # when they are an even count under 16 or whole tiles; otherwise the
-        # rows go in FP32, rounded up to whole 8-row tiles above 8. Measured:
-        # one BF16 row arrived wrong, and both test jobs that sent 24 BF16
-        # rows (a tile and a half) died there with the node marked unhealthy.
+        # bytes). Partial BF16 tiles are kept to what was measured safe: BF16
+        # rows go as whole 16-row tiles or as 2 or 4 rows; any other count
+        # goes in FP32, as whole 8-row tiles from 8 rows up (1 FP32 row is
+        # safe). Measured: one BF16 row arrived wrong, and test jobs sending
+        # 8 or 24 BF16 rows (a partial tile) stalled until the node was
+        # terminated (3 of 3).
         own = pl.ds(0, sent)
         if x_send.dtype != x_ref.dtype:
             x_send[:rows, :] = x_ref[...].astype(x_send.dtype)
@@ -677,13 +678,13 @@ def _gather_rows_call(
     i_s = shared_w2.shape[0]
     weight_dtype = w1.dtype
     nb = _weight_ring_depth(h, i, weight_dtype)
-    # Rows the gather DMAs move, see _kernel: BF16 when an even count under
-    # 16 or whole tiles, else FP32 in whole 8-row tiles above 8.
-    if rows % 16 == 0 or (rows < 16 and rows % 2 == 0):
+    # Rows the gather DMAs move, see _kernel: BF16 as whole tiles or 2 / 4
+    # rows, else FP32, in whole 8-row tiles from 8 rows up.
+    if rows % 16 == 0 or rows in (2, 4):
         xwire, sent = hidden.dtype, rows
     else:
-        xwire, sent = jnp.float32, rows if rows <= 8 else rows + (-rows) % 8
-    route_rows = rows if rows <= 8 else rows + (-rows) % 8  # FP32 slab, as x
+        xwire, sent = jnp.float32, rows if rows < 8 else rows + (-rows) % 8
+    route_rows = rows if rows < 8 else rows + (-rows) % 8  # FP32 slab, as x
     if route_rows != rows:
         route = jnp.pad(route, ((0, route_rows - rows), (0, 0)))
     # Reduce-scatter buffers exactly as scatter_rows on the gathered batch.

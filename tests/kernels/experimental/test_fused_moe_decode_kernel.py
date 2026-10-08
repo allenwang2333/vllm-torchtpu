@@ -332,7 +332,7 @@ def test_gather_rows_matches_scatter_rows_on_gathered_inputs(setup, rows, ep):
     """gather_rows=True on each rank's own rows (the kernel all-gathers them)
     returns exactly what scatter_rows=True returns when XLA all-gathered the
     same rows rank-major first: bit-identical, on every gather wire (BF16 rows
-    for 2/4/8/12/16, FP32 for 1 and 24) and reduce-scatter wire (rows % 16 ==
+    for 2/4/16, FP32 for 1/8/12/24) and reduce-scatter wire (rows % 16 ==
     0 is BF16, the others FP32)."""
     mesh, sh, rank, weights, shared_gate_weight = setup
     m = rows * N
