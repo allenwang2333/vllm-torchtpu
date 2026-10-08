@@ -1863,3 +1863,41 @@ def test_dspark_mhc_broadcast_and_post_and_collapse(
     model.finalize_mhc_broadcast_weights()
     assert packed_calls == [torch.Size([8, model.hidden_size])]
     assert layer0.hc_attn_fn_broadcast.dtype == torch.bfloat16
+
+
+def test_embed_draft_blocks_full_coverage():
+    weight = torch.randn(32, 16, generator=torch.Generator().manual_seed(0))
+    calls: list[torch.Tensor] = []
+
+    def embed(ids: torch.Tensor) -> torch.Tensor:
+        calls.append(ids.clone())
+        return weight[ids.long()]
+
+    # 1. Exact blocks + tail blocks
+    for tokens in (15, 18):
+        calls.clear()
+        ids = torch.full((tokens,), 7, dtype=torch.int32)
+        ids[:15:5] = torch.tensor([3, 9, 11], dtype=torch.int32)
+        out = v2_dspark._embed_draft_blocks(embed, ids, 5)
+        assert torch.equal(out, weight[ids.long()])
+        assert len(calls) == 1
+        assert calls[0].shape == (tokens // 5 + 1,)
+
+    # 2. Fallback when block <= 1 or num_blocks == 0
+    for block, tokens in ((1, 8), (5, 4)):
+        calls.clear()
+        ids = torch.arange(tokens, dtype=torch.int32)
+        out = v2_dspark._embed_draft_blocks(embed, ids, block)
+        assert torch.equal(out, weight[ids.long()])
+        assert torch.equal(calls[0], ids)
+
+    # 3. Layout violations in noise columns and tail rows become NaN
+    for bad_row in (2, 16):
+        ids = torch.full((18,), 7, dtype=torch.int32)
+        ids[:15:5] = torch.tensor([3, 9, 11], dtype=torch.int32)
+        ids[bad_row] = 1
+        out = v2_dspark._embed_draft_blocks(embed, ids, 5)
+        bad = torch.isnan(out).all(-1)
+        assert bad.tolist() == [i == bad_row for i in range(18)]
+        keep = ~bad
+        assert torch.equal(out[keep], weight[ids.long()][keep])

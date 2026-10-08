@@ -239,14 +239,20 @@ class DSparkProposer(DFlashProposer):
     ) -> torch.Tensor:
         """Global argmax from the [tp * B, 2] all-gathered shard candidates.
 
-        Shards are ordered by vocab offset and ``argmax`` keeps the first
-        maximum, so ties resolve to the lowest token id exactly like a
-        full-vocab ``argmax``.
+        Shards are ordered by vocab offset and strict ``>`` comparisons keep
+        the first maximum, so ties resolve to the lowest token id without an
+        indirect ``gather`` across ``tp_size``.
         """
         gathered = gathered.view(tp_size, num_reqs, 2)
-        best_rank = gathered[..., 0].argmax(dim=0)
-        token_ids = gathered[..., 1].gather(0, best_rank.unsqueeze(0)).squeeze(0)
-        return token_ids.to(torch.int64)
+        scores = gathered[..., 0]
+        ids = gathered[..., 1]
+        best_score = scores[0]
+        best_id = ids[0]
+        for r in range(1, tp_size):
+            better = scores[r] > best_score
+            best_score = torch.where(better, scores[r], best_score)
+            best_id = torch.where(better, ids[r], best_id)
+        return best_id.to(torch.int64)
 
     def _sample_markov_sharded(
         self,
@@ -259,20 +265,27 @@ class DSparkProposer(DFlashProposer):
         assert self._vocab_shard_offset is not None
         padded_num_reqs = ids_3d.shape[0]
         tp_size = self._sharded_markov_tp
+        num_sampled_slots = block_size - sample_start
+        hidden_3d = valid_hidden.view(
+            padded_num_reqs, block_size, valid_hidden.shape[-1]
+        )
+        if sample_start > 0:
+            hidden_3d = hidden_3d[:, sample_start:]
         slot_major_hidden = (
-            valid_hidden.view(padded_num_reqs, block_size, valid_hidden.shape[-1])
-            .transpose(0, 1)
+            hidden_3d.transpose(0, 1)
             .contiguous()
-            .view(valid_hidden.shape)
+            .view(padded_num_reqs * num_sampled_slots, valid_hidden.shape[-1])
         )
         logits = self.draft_model.compute_draft_logits_local(slot_major_hidden)
         if self._vocab_shard_mask is not None:
             logits = logits + self._vocab_shard_mask
-        logits_slot_major = logits.view(block_size, padded_num_reqs, logits.shape[-1])
+        logits_slot_major = logits.view(
+            num_sampled_slots, padded_num_reqs, logits.shape[-1]
+        )
 
         prev = ids_3d[:, 0]
         draft_tokens = []
-        for i in range(sample_start, block_size):
+        for i in range(num_sampled_slots):
             scores = logits_slot_major[i] + self._markov_bias_local(prev)
             packed = self._pack_local_candidate(scores, self._vocab_shard_offset)
             gathered = tensor_model_parallel_all_gather(packed, dim=0)
@@ -292,17 +305,18 @@ class DSparkProposer(DFlashProposer):
     ) -> list[torch.Tensor]:
         assert self.draft_model is not None
         padded_num_reqs = ids_3d.shape[0]
-        num_valid_tokens = padded_num_reqs * block_size
-        # Draft-vocab logits for every slot; the Markov bias is added in
+        num_sampled_slots = block_size - sample_start
+        num_sampled_tokens = padded_num_reqs * num_sampled_slots
+        # Draft-vocab logits for every sampled slot; the Markov bias is added in
         # draft space and ids are remapped to target vocab after argmax.
         logits = self.draft_model.compute_draft_logits(slot_major_hidden)
-        logits_slot_major = logits[:num_valid_tokens].view(
-            block_size, padded_num_reqs, logits.shape[-1]
+        logits_slot_major = logits[:num_sampled_tokens].view(
+            num_sampled_slots, padded_num_reqs, logits.shape[-1]
         )
 
         prev = ids_3d[:, 0]
         draft_tokens = []
-        for i in range(sample_start, block_size):
+        for i in range(num_sampled_slots):
             bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
             step = self.draft_model.map_draft_to_target(
                 (logits_slot_major[i] + bias).argmax(dim=-1)
@@ -345,20 +359,29 @@ class DSparkProposer(DFlashProposer):
                 valid_hidden, ids_3d, block_size, sample_start
             )
         else:
-            # Transpose [padded_num_reqs, block_size, H] ->
-            # [block_size, padded_num_reqs, H] before compute_draft_logits so
-            # each Markov step i indexes a contiguous [padded_num_reqs, vocab]
-            # slice instead of a strided [:, i] view across the full draft-vocab
-            # logits tensor, and pad back to hidden.shape[0] so the TP all-gather
-            # inside compute_draft_logits stays 8-row aligned.
-            slot_major_hidden = (
-                hidden[:num_valid_tokens]
-                .view(padded_num_reqs, block_size, hidden.shape[-1])
-                .transpose(0, 1)
-                .contiguous()
-                .view(num_valid_tokens, hidden.shape[-1])
+            # Slice to the sampled slots [padded_num_reqs, num_sampled_slots, H]
+            # and transpose to [num_sampled_slots, padded_num_reqs, H] before
+            # compute_draft_logits so slot 0 is not projected when
+            # sample_start > 0 and each Markov step indexes a contiguous
+            # [padded_num_reqs, vocab] slice, preserving 8-row alignment when
+            # the input batch was padded.
+            num_sampled_slots = block_size - sample_start
+            num_sampled_tokens = padded_num_reqs * num_sampled_slots
+            hidden_3d = hidden[:num_valid_tokens].view(
+                padded_num_reqs, block_size, hidden.shape[-1]
             )
-            pad_tokens = hidden.shape[0] - num_valid_tokens
+            if sample_start > 0:
+                hidden_3d = hidden_3d[:, sample_start:]
+            slot_major_hidden = (
+                hidden_3d.transpose(0, 1)
+                .contiguous()
+                .view(num_sampled_tokens, hidden.shape[-1])
+            )
+            pad_tokens = (
+                (-num_sampled_tokens) % 8
+                if sample_start > 0 and hidden.shape[0] % 8 == 0
+                else hidden.shape[0] - num_valid_tokens
+            )
             if pad_tokens > 0:
                 slot_major_hidden = F.pad(slot_major_hidden, (0, 0, 0, pad_tokens))
             draft_tokens = self._sample_markov_replicated(

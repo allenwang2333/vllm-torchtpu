@@ -196,9 +196,9 @@ class _FakeDSparkDraftModel:
 
 
 @pytest.mark.parametrize("sample_from_anchor", [True, False])
-@pytest.mark.parametrize("pad_tokens", [0, 3])
+@pytest.mark.parametrize("padded_num_reqs,pad_tokens", [(4, 0), (4, 3), (8, 0)])
 def test_dflash_forward_and_sample_slot_major_parity(
-    sample_from_anchor: bool, pad_tokens: int
+    sample_from_anchor: bool, padded_num_reqs: int, pad_tokens: int
 ):
     num_spec = 5
     p = _make_proposer(
@@ -211,13 +211,14 @@ def test_dflash_forward_and_sample_slot_major_parity(
         num_speculative_tokens=num_spec,
     )
     block_size = p.block_size
-    padded_num_reqs = 4
     total_tokens = padded_num_reqs * block_size + pad_tokens
     hidden_size = 8
     draft_vocab = 16
     target_vocab = 24
 
-    gen = torch.Generator().manual_seed(42 + pad_tokens + int(sample_from_anchor))
+    gen = torch.Generator().manual_seed(
+        42 + padded_num_reqs + pad_tokens + int(sample_from_anchor)
+    )
     hidden = torch.randn(total_tokens, hidden_size, generator=gen)
     lm_weight = torch.randn(draft_vocab, hidden_size, generator=gen)
     markov_table = torch.randn(target_vocab, draft_vocab, generator=gen)
@@ -233,7 +234,17 @@ def test_dflash_forward_and_sample_slot_major_parity(
     draft_tokens_chunk, out_hidden = fn(p, input_ids, positions, block_size)
 
     assert torch.equal(out_hidden, hidden)
-    assert p.draft_model.last_logits_input_shape == (total_tokens, hidden_size)
+    sample_start = 0 if sample_from_anchor else 1
+    num_sampled_tokens = padded_num_reqs * (block_size - sample_start)
+    expected_pad = (
+        (-num_sampled_tokens) % 8
+        if sample_start > 0 and total_tokens % 8 == 0
+        else pad_tokens
+    )
+    assert p.draft_model.last_logits_input_shape == (
+        num_sampled_tokens + expected_pad,
+        hidden_size,
+    )
 
     # Reference request-major calculation.
     valid_hidden = hidden[: padded_num_reqs * block_size]
@@ -244,7 +255,6 @@ def test_dflash_forward_and_sample_slot_major_parity(
         :, 0
     ]
     ref_steps = []
-    sample_start = 0 if sample_from_anchor else 1
     for i in range(sample_start, block_size):
         bias = markov_table[prev]
         step = (ref_logits_3d[:, i] + bias).argmax(dim=-1) + 2
@@ -714,6 +724,30 @@ def test_dflash_forward_and_sample_eager_matches_reference(monkeypatch):
     bias = p._markov_bias_local(ids_3d[:, 0])
     assert bias.dtype == torch.bfloat16
     assert torch.equal(bias.float(), w1[ids_3d[:, 0]] @ w2.t())
+
+    # Also verify sample_from_anchor=False (sample_start=1), non-None
+    # _vocab_shard_mask, and matching fp32 _markov_w2_local on the main thread.
+    p_bonus = _make_proposer(
+        dict(_DSPARK_HF, dspark_block_size=K, sample_from_anchor=False),
+        num_speculative_tokens=K,
+    )
+    p_bonus.draft_model = _Draft()
+    p_bonus._sharded_markov_tp = 2
+    p_bonus._markov_w2_local = w2
+    p_bonus._vocab_shard_offset = torch.tensor(0, dtype=torch.int64)
+    p_bonus._vocab_shard_mask = torch.zeros(vocab, dtype=torch.float32)
+    block_bonus = p_bonus.block_size
+    ids_bonus = torch.randint(0, hidden, (num_reqs * block_bonus,))
+    pos_bonus = torch.arange(num_reqs * block_bonus)
+    ids_bonus_3d = ids_bonus.view(num_reqs, block_bonus)
+    logits_bonus = (
+        torch.nn.functional.one_hot(ids_bonus, hidden).float() @ lm_head_weight.t()
+    ).view(num_reqs, block_bonus, vocab)
+    expected_bonus = _reference_markov_chain(
+        logits_bonus, w1, w2, ids_bonus_3d, vocab, 1
+    )
+    tokens_bonus, _ = forward_and_sample(p_bonus, ids_bonus, pos_bonus, block_bonus)
+    assert torch.equal(tokens_bonus, expected_bonus)
 
 
 def test_load_model_initializes_sharded_sampling(monkeypatch):

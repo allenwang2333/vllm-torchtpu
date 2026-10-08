@@ -122,25 +122,25 @@ def _embed_draft_blocks(
     if block <= 1 or num_blocks == 0:
         return embed(input_ids)
     tail = tokens - num_blocks * block
-    base = input_ids[: num_blocks * block].view(num_blocks, block)[:, 0]
+    ids_2d = input_ids[: num_blocks * block].view(num_blocks, block)
+    base = ids_2d[:, 0]
     noise = input_ids[1:2]
     rows = embed(torch.cat([base, noise]))
     hidden = rows.shape[-1]
     noise_row = rows[num_blocks:]
-    blocks = torch.cat(
-        [
-            rows[:num_blocks].unsqueeze(1),
-            noise_row.unsqueeze(1).expand(num_blocks, block - 1, hidden),
-        ],
-        dim=1,
-    ).reshape(num_blocks * block, hidden)
-    expected = torch.cat(
-        [base.unsqueeze(1), noise.expand(num_blocks, block - 1)], dim=1
-    ).reshape(-1)
+    noise_cols = noise_row.unsqueeze(1).expand(num_blocks, block - 1, hidden)
+    noise_cols = noise_cols.masked_fill(
+        (ids_2d[:, 1:] != noise).unsqueeze(-1), float("nan")
+    )
+    blocks = torch.cat([rows[:num_blocks].unsqueeze(1), noise_cols], dim=1).reshape(
+        num_blocks * block, hidden
+    )
     if tail:
-        blocks = torch.cat([blocks, noise_row.expand(tail, hidden)])
-        expected = torch.cat([expected, noise.expand(tail)])
-    return blocks.masked_fill((expected != input_ids).unsqueeze(-1), float("nan"))
+        tail_rows = noise_row.expand(tail, hidden).masked_fill(
+            (input_ids[num_blocks * block :] != noise).unsqueeze(-1), float("nan")
+        )
+        blocks = torch.cat([blocks, tail_rows])
+    return blocks
 
 
 def _insert_context_kv(
@@ -172,6 +172,7 @@ def _insert_context_kv(
         if cached_slots is not None and cached_slots[0] is block_tables:
             _, swa_slots, swa_valid, _, _ = cached_slots
         else:
+            table = None
             if cached_slots is not None:
                 _, _, _, in_window, addr = cached_slots
             elif metadata.seq_lens.numel() > 0:
@@ -190,26 +191,34 @@ def _insert_context_kv(
                     pos_rem = positions % rows_per_page
                     rows = torch.arange(positions.shape[0], device=positions.device)
                     valid_token = rows < metadata.query_start_loc[-1]
-                    addr = (requests, pos_col, pos_rem, valid_token)
+                    addr = (
+                        requests,
+                        pos_col,
+                        pos_rem,
+                        valid_token,
+                        valid_token & in_window,
+                    )
                 else:
                     addr = None
             else:
                 in_window = None
                 addr = None
             if addr is not None:
-                table = _block_table(metadata)
-                requests, pos_col, pos_rem, valid_token = addr
+                if table is None:
+                    table = _block_table(metadata)
+                requests, pos_col, pos_rem, valid_token, valid_in_window = addr
                 blocks = table[requests, pos_col].long()
                 swa_slots = (blocks * rows_per_page + pos_rem).masked_fill(
                     ~valid_token, -1
                 )
+                swa_valid = (blocks >= 0) & valid_in_window
             else:
                 swa_slots = _cache_slots(swa_cache, metadata, positions)
-            swa_valid = (
-                (swa_slots >= 0) & in_window
-                if in_window is not None
-                else swa_slots >= 0
-            )
+                swa_valid = (
+                    (swa_slots >= 0) & in_window
+                    if in_window is not None
+                    else swa_slots >= 0
+                )
             if stage_cache is not None:
                 stage_cache[slot_key] = (
                     block_tables,
@@ -364,7 +373,7 @@ class DSparkDeepseekV41Model(nn.Module):
             ]
             self._fused_context_wkv_scale = torch.cat(wkv_scales, dim=-1).contiguous()
         self._fused_context_kv_norm_weight = torch.stack(
-            [layer.attn.kv_norm.weight.detach() for layer in layers], dim=0
+            [layer.attn.kv_norm.weight.detach().float() for layer in layers], dim=0
         ).contiguous()
 
     def finalize_mhc_broadcast_weights(self) -> None:
@@ -430,13 +439,11 @@ class DSparkDeepseekV41Model(nn.Module):
                 w_norm = self._fused_context_kv_norm_weight
                 assert w_norm is not None
                 kv_normed = (
-                    (
-                        x_f32
-                        * torch.rsqrt(
-                            x_f32.pow(2).mean(dim=-1, keepdim=True)
-                            + layers[0].attn.kv_norm.variance_epsilon
-                        )
-                    ).to(w_norm.dtype)
+                    x_f32
+                    * torch.rsqrt(
+                        x_f32.pow(2).mean(dim=-1, keepdim=True)
+                        + layers[0].attn.kv_norm.variance_epsilon
+                    )
                     * w_norm
                 ).to(all_kv_3d.dtype)
                 kv_rotated = layers[0].attn._rotate(kv_normed, positions)
