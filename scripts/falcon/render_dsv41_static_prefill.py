@@ -147,9 +147,21 @@ mkdir -p "$static_stage"
 echo "STATIC_MOE_STAGE_START $(date -Is)"
 cp {MODEL_MOUNT}/config.json {MODEL_MOUNT}/STATIC_MOE_READY.json \\
   {MODEL_MOUNT}/tpu-static-moe.json "$static_stage/"
-cp -a {MODEL_MOUNT}/prepared-weights "$static_stage/"
+mkdir -p "$static_stage/prepared-weights"
+find {MODEL_MOUNT}/prepared-weights -maxdepth 1 -type f -name '*.fp4' -print0 | \\
+  xargs -0 -r -P 16 -I '{{}}' cp '{{}}' "$static_stage/prepared-weights/"
+expected_files=$(python3 -c \\
+  'import json,sys; print(json.load(open(sys.argv[1]))["static_files"])' \\
+  "$static_stage/STATIC_MOE_READY.json")
+staged_files=$(find "$static_stage/prepared-weights" -maxdepth 1 \\
+  -type f -name '*.fp4' | wc -l)
+[[ "$staged_files" -eq "$expected_files" ]] || {{
+  echo "Static MoE staging incomplete: $staged_files/$expected_files files" >&2
+  exit 1
+}}
 export TPU_DSV41_STATIC_MOE_DIR="$static_stage"
-echo "STATIC_MOE_STAGE_END $(date -Is)"
+staged_bytes=$(du -sb "$static_stage/prepared-weights" | cut -f1)
+echo "STATIC_MOE_STAGE_END $(date -Is) files=$staged_files bytes=$staged_bytes"
 """
     command = command.replace(launch_marker, stage + launch_marker)
     task["command"] = command
