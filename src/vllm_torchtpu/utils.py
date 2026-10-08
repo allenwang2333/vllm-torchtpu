@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+import ctypes
+import gc
 import importlib
 import os
 import time
@@ -75,6 +77,28 @@ def min_across_ep_dp(parallel_config, value: int) -> int:
         t, op=torch.distributed.ReduceOp.MIN, group=get_dp_group().cpu_group
     )
     return int(t.item())
+
+
+def host_rss_gib() -> float:
+    """This process's resident host memory, in GiB."""
+    with open("/proc/self/statm") as f:
+        return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**30
+
+
+def release_memory_to_os() -> None:
+    """Forces Python GC and instructs the C allocator to return free memory
+    to the OS.
+
+    Dropping the last reference to a host tensor frees it, but glibc keeps
+    chunks below its mmap threshold (up to 32 MiB) in its arenas for reuse,
+    so a process that freed tens of GiB of mid-sized tensors can stay that
+    large. The GC pass reaps tensors held only by reference cycles first.
+    """
+    gc.collect()
+    try:  # noqa: SIM105 (malloc_trim exists only on glibc)
+        ctypes.CDLL(None).malloc_trim(0)
+    except Exception:  # noqa: S110
+        pass
 
 
 def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:

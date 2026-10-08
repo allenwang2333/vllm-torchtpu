@@ -24,10 +24,9 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
 )
 from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (  # noqa: E501
     get_cpu_weight_loader_hook,
-    release_memory_to_os,
 )
 from vllm_torchtpu.layers.core.quantization import e8m0_to_fp32
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import release_memory_to_os, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.quantization.configs import TpuRoutedExperts
