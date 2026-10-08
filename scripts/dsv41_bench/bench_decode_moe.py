@@ -9,6 +9,29 @@ from scripts.dsv41_bench import bench_mhc, common
 
 SUBOPS = ("all", "mhc_only", "moe_only")
 
+# Verify batches entering the MoE. 4..576 is the TP8+EP8 DSpark sweep (C = 16..96
+# at K = 5); 768..1344 is the DP2xTP4+EP8 regime (EXT-1B), where both DP groups'
+# tokens enter the EP8 MoE (T_ep = 768, 960, 1152, 1344 -> M = 6 * T_ep =
+# 4608..8064 routed rows, only 1/8 of them local to a rank).
+MOE_SWEEP_TOKENS = (4, 8, 16, 32, 64, 144, 192, 288, 384, 576, 768, 960, 1152, 1344)
+# Production one-hot permute threshold on v7x (`fused_moe_gmm._ONEHOT_AUTO_CAP`,
+# `resolve_onehot_permute_threshold()` returns 4095 there): M at or below it
+# takes the one-hot permute/combine path, above it the SparseCore ragged path.
+_SWEEP_ONEHOT_THRESHOLD = 4096
+# Threshold that keeps every swept M on the one-hot path, for the A/B column
+# against the ragged path above `_SWEEP_ONEHOT_THRESHOLD`.
+_ONEHOT_FORCE_THRESHOLD = 1 << 15
+
+
+def _parse_tokens(spec: str) -> tuple[int, ...]:
+    """Parse a comma-separated ``--moe-tokens`` list of positive ints."""
+    tokens = tuple(int(part) for part in spec.split(",") if part.strip())
+    if not tokens or any(t <= 0 for t in tokens):
+        raise argparse.ArgumentTypeError(
+            f"--moe-tokens needs a comma-separated list of positive ints, got {spec!r}"
+        )
+    return tokens
+
 
 def _bench_ms(
     ctx: common.WorkerContext, fn, *, warmup: int = 3, iters: int = 10
@@ -282,9 +305,10 @@ def _run_moe_sweep(
         op.register_fake(lambda hs, *_: torch.empty_like(hs))
         return op
 
-    gmm_sc1_op = _make_gmm_op(True, 4096)
+    gmm_sc1_op = _make_gmm_op(True, _SWEEP_ONEHOT_THRESHOLD)
     gmm_sc1_raw_op = _make_gmm_op(True, 0)
     gmm_sc0_op = _make_gmm_op(False, 0)
+    gmm_sc1_onehot_forced_op = _make_gmm_op(True, _ONEHOT_FORCE_THRESHOLD)
     dense_exp_op = _make_dense_expert_op()
 
     all_ranks_group = (tuple(range(ep_size)),)
@@ -339,7 +363,8 @@ def _run_moe_sweep(
     v2_sp_op = _make_v2_op("sp", sp_ranks_group)
 
     moe_results: dict[str, Any] = {}
-    for t_full in (4, 8, 16, 32, 64, 144, 192, 288, 384, 576):
+    for t_full in args.moe_tokens:
+        m_routed = t_full * k_top
         g_tok = torch.Generator(device="cpu").manual_seed(args.seed + t_full)
         x_full = (
             torch.randn((t_full, d), generator=g_tok, dtype=torch.bfloat16) * 0.1
@@ -422,6 +447,12 @@ def _run_moe_sweep(
 
         row: dict[str, Any] = {
             "T": t_full,
+            "M_routed": m_routed,
+            # Which permute/combine path `gmm_sc1_onehot_tp_ms` really measures
+            # at this T under the production threshold.
+            "gmm_sc1_path": "onehot"
+            if m_routed <= _SWEEP_ONEHOT_THRESHOLD
+            else "ragged",
             "gmm_sc1_onehot_tp_ms": _bench_ms(ctx, _gmm_sc1_tp),
             "gmm_sc1_ragged_tp_ms": _bench_ms(ctx, _gmm_sc1_raw_tp),
             "gmm_sc0_argsort_tp_ms": _bench_ms(ctx, _gmm_sc0_tp),
@@ -430,6 +461,35 @@ def _run_moe_sweep(
             "dense_vs_sc1_cos": round(float(cmp_dense["cos_sim"]), 7),
             "dense_vs_sc1_max_abs": round(float(cmp_dense["max_abs_diff"]), 6),
         }
+
+        if m_routed > _SWEEP_ONEHOT_THRESHOLD:
+            # Above the production cap the one-hot path is the argsort-based
+            # fallback (double argsort + [T, M] one-hot combine); measure it
+            # against the ragged path the threshold selects.
+
+            def _gmm_sc1_onehot_forced_tp(x=x_full, tw=topk_weights, ti=topk_ids):
+                return tensor_model_parallel_all_reduce(
+                    gmm_sc1_onehot_forced_op(
+                        x,
+                        w1_gmm,
+                        w2_gmm,
+                        w1_scale_gmm,
+                        w2_scale_gmm,
+                        tw,
+                        ti,
+                        experts_start_t,
+                    )
+                )
+
+            out_forced = _gmm_sc1_onehot_forced_tp()
+            common.synchronize(out_forced)
+            cmp_forced = common.compare_tensors(
+                out_forced.cpu(), out_sc0.cpu(), common.LOSSLESS
+            )
+            row["gmm_sc1_onehot_forced_tp_ms"] = _bench_ms(
+                ctx, _gmm_sc1_onehot_forced_tp
+            )
+            row["onehot_forced_vs_sc0_cos"] = round(float(cmp_forced["cos_sim"]), 6)
 
         if t_full >= ep_size and t_full % ep_size == 0:
 
@@ -525,6 +585,15 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     common.add_common_args(parser, SUBOPS)
+    parser.add_argument(
+        "--moe-tokens",
+        type=_parse_tokens,
+        default=MOE_SWEEP_TOKENS,
+        help=(
+            "Comma-separated verify batches T for the MoE sweep (M = 6 * T routed"
+            " rows); e.g. 768,960,1152,1344 for the DP2xTP4+EP8 regime only."
+        ),
+    )
     common.run_main("decode_moe_mhc", parser, worker)
 
 

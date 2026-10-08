@@ -219,7 +219,7 @@ class TestBenchDecodeMoe:
             cpu_group=None,
             result_dir=pathlib.Path("/tmp"),
         )
-        args = argparse.Namespace(seed=42, subop="all")
+        args = argparse.Namespace(seed=42, subop="all", moe_tokens=bdm.MOE_SWEEP_TOKENS)
 
         # Mock ep_mesh
         mock_mesh = MagicMock()
@@ -295,16 +295,32 @@ class TestBenchDecodeMoe:
         with common.model_wrapper_context():
             results = bdm._run_moe_sweep(ctx, args)
         assert isinstance(results, dict)
-        for t in (4, 8, 16, 32, 64, 144, 192, 288, 384, 576):
+        assert bdm.MOE_SWEEP_TOKENS == (
+            4, 8, 16, 32, 64, 144, 192, 288, 384, 576, 768, 960, 1152, 1344
+        )  # fmt: skip
+        assert len(results) == len(bdm.MOE_SWEEP_TOKENS)
+        for t in bdm.MOE_SWEEP_TOKENS:
             key = f"T={t}"
             assert key in results
             assert results[key]["T"] == t
+            assert results[key]["M_routed"] == 6 * t
             assert "dense_expert_tp_ms" in results[key]
+            if 6 * t > 4096:
+                # DP2xTP4+EP8 regime: the production threshold takes the ragged
+                # path and the forced one-hot A/B column is present.
+                assert results[key]["gmm_sc1_path"] == "ragged"
+                assert results[key]["gmm_sc1_onehot_forced_tp_ms"] == 0.05
+                assert results[key]["onehot_forced_vs_sc0_cos"] == 1.0
+            else:
+                assert results[key]["gmm_sc1_path"] == "onehot"
+                assert "gmm_sc1_onehot_forced_tp_ms" not in results[key]
+                assert "onehot_forced_vs_sc0_cos" not in results[key]
             if t >= 8:
                 assert "fused_ep_v2_w4a8_tp_ms" in results[key]
                 assert "gmm_sc1_onehot_sp_ms" in results[key]
                 assert "dense_expert_sp_ms" in results[key]
                 assert "fused_ep_v2_w4a8_sp_ms" in results[key]
+        assert [r["gmm_sc1_path"] for r in results.values()].count("ragged") == 4
 
         # Verify all registered fake functions were called
         for op in captured_ops:
@@ -312,6 +328,18 @@ class TestBenchDecodeMoe:
             dummy_in = torch.zeros((2, 2))
             fake_out = op._fake_fn(dummy_in)
             assert fake_out.shape == dummy_in.shape
+
+        # Ops in creation order: sc1(thr 4096), sc1 ragged (thr 0), sc0,
+        # sc1 one-hot forced, dense expert, v2 tp, v2 sp.
+        assert [op._name for op in captured_ops] == [
+            "pallas::bench_decode_moe_gmm_sc1_thr4096",
+            "pallas::bench_decode_moe_gmm_sc1_thr0",
+            "pallas::bench_decode_moe_gmm_sc0_thr0",
+            f"pallas::bench_decode_moe_gmm_sc1_thr{1 << 15}",
+            "pallas::bench_decode_moe_dense_expert",
+            "pallas::bench_decode_moe_v2_tp",
+            "pallas::bench_decode_moe_v2_sp",
+        ]
 
         # Now exercise the inner _fn implementations of each captured op
         dummy_jax_args = (
@@ -331,12 +359,12 @@ class TestBenchDecodeMoe:
         assert res_gmm.shape == dummy_jax_args[0].shape
 
         # Call Dense Expert op _fn
-        dense_fn = captured_ops[3]._fn
+        dense_fn = captured_ops[4]._fn
         res_dense = dense_fn(*dummy_jax_args)
         assert res_dense.shape == dummy_jax_args[0].shape
 
-        # Call V2 op _fn (captured_ops[4..5])
-        v2_fn = captured_ops[4]._fn
+        # Call V2 op _fn (captured_ops[5..6])
+        v2_fn = captured_ops[5]._fn
         dummy_v2_args = (
             jnp.zeros((4, 512), dtype=jnp.bfloat16),
             jnp.zeros((6, 512, 256), dtype=jnp.uint8),
@@ -399,12 +427,28 @@ class TestBenchDecodeMoe:
 
         def mock_run_main(name, parser, worker_fn):
             called_run_main["name"] = name
+            called_run_main["parser"] = parser
             called_run_main["worker_fn"] = worker_fn
 
         monkeypatch.setattr(common, "run_main", mock_run_main)
         bdm.main()
         assert called_run_main["name"] == "decode_moe_mhc"
         assert called_run_main["worker_fn"] == bdm.worker
+        # --moe-tokens: full sweep by default, override for the EXT-1B regime.
+        parser = called_run_main["parser"]
+        assert parser.parse_args([]).moe_tokens == bdm.MOE_SWEEP_TOKENS
+        assert parser.parse_args(["--moe-tokens", "768,960,1152,1344"]).moe_tokens == (
+            768,
+            960,
+            1152,
+            1344,
+        )
+        assert bdm._parse_tokens("1344,") == (1344,)
+        for bad in ("", ",", "0", "768,-8"):
+            with pytest.raises(argparse.ArgumentTypeError, match="positive ints"):
+                bdm._parse_tokens(bad)
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--moe-tokens", "abc"])
 
         # 5. test __main__ entrypoint via runpy
         main_invoked = []
