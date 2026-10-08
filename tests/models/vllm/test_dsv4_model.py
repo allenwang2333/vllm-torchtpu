@@ -53,6 +53,27 @@ def test_deepseek_v4_model_registration():
     assert model_cls is DeepseekV4ForCausalLM
 
 
+def test_flush_all_writes_staged_params_then_releases_host_memory(monkeypatch):
+    """Staging is tens of GiB per worker; flushing must hand it back to the OS.
+
+    The release has to come after every parameter is written, or it would
+    trim memory the remaining host buffers still occupy.
+    """
+    calls = []
+    monkeypatch.setattr(
+        model_mod, "release_memory_to_os", lambda: calls.append(len(staged._staged))
+    )
+    staged = model_mod._HostStagedParams()
+    params = [nn.Parameter(torch.zeros(4, 3), requires_grad=False) for _ in range(2)]
+    for i, param in enumerate(params):
+        host = staged.stage(f"p{i}", param)
+        host.data.fill_(i + 1)
+    staged.flush_all()
+    assert calls == [0], "released before every staged parameter was written"
+    for i, param in enumerate(params):
+        assert torch.equal(param.data, torch.full((4, 3), float(i + 1)))
+
+
 def test_weight_loader_drops_mtp_after_mapping_and_keeps_plain_weights():
     model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
     nn.Module.__init__(model)
