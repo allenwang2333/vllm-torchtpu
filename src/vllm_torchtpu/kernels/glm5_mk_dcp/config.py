@@ -41,6 +41,7 @@ class MKDConfig:
     routed_scale: float = 2.5
     QB: int = 512          # expert lhs quant block (gmm_v2 quant_block_size)
     KREP: int = 0          # decode replica slots per rank per MoE layer (0: off, program unchanged)
+    V: int = 0             # vocab (> 0: the MTP drafter build; tied to the target's TP vocab shards)
 
     @property
     def TMAX(self):
@@ -103,3 +104,7 @@ FULL = MKDConfig(R=16, L=78, first_dense=3, H=6144, NH=64, QL=2048)
 TINY = MKDConfig(R=4, L=5, first_dense=1, H=512, NH=8, QL=256, DN=64, DV=128,
                  E=8, TOPK=2, I=256, IS=512, ID=512, IH=4, KT=256, idx_freq=2,
                  idx_skip=1, page=128, RPR=2, QB=128)
+
+# MTP drafter (WHITEBOARD.v4): 3 passes of the one MTP layer as 3 "layers" (fresh top-k on pass 0 only)
+FULL_DRAFT = dataclasses.replace(FULL, L=3, first_dense=0, idx_skip=1, idx_freq=64, V=154880)
+TINY_DRAFT = dataclasses.replace(TINY, L=3, first_dense=0, idx_skip=1, idx_freq=64, V=800)
