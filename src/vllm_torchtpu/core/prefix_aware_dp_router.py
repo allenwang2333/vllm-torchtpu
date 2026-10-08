@@ -44,10 +44,11 @@ Enable in the API-server process with::
 from __future__ import annotations
 
 import array
-import os
 import zlib
 from collections.abc import Sequence
 from typing import Any
+
+import vllm_torchtpu.envs as envs
 
 _PATCH_MARKER = "_tpu_prefix_aware_dp_routing_patch"
 
@@ -70,7 +71,7 @@ def prefix_route_index(
 
 
 def _env_enabled() -> bool:
-    return os.environ.get("ENABLE_PREFIX_ROUTING", "1") in ("1", "true", "True")
+    return bool(envs.ENABLE_PREFIX_ROUTING)
 
 
 def install_prefix_aware_dp_routing(client_cls: Any = None) -> bool:
@@ -93,9 +94,9 @@ def install_prefix_aware_dp_routing(client_cls: Any = None) -> bool:
     if client_cls.__dict__.get(_PATCH_MARKER, False):
         return True
 
-    prefix_len = int(os.environ.get("PREFIX_ROUTING_TOKENS", "512"))
-    max_queue = int(os.environ.get("PREFIX_ROUTING_MAX_QUEUE", "2"))
-    max_kv = float(os.environ.get("PREFIX_ROUTING_MAX_KV", "0.95"))
+    prefix_len = int(envs.PREFIX_ROUTING_TOKENS)
+    max_queue = int(envs.PREFIX_ROUTING_MAX_QUEUE)
+    max_kv = float(envs.PREFIX_ROUTING_MAX_KV)
     if prefix_len <= 0:
         raise ValueError(f"PREFIX_ROUTING_TOKENS must be positive, got {prefix_len}")
     orig_get = client_cls.get_core_engine_for_request

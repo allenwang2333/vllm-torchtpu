@@ -296,23 +296,27 @@ class TpuDpScheduler(AsyncScheduler):
             self.max_num_scheduled_tokens if has_max_scheduled else None
         )
         sched_cfg = getattr(self, "scheduler_config", None)
-        has_cfg_batched = sched_cfg is not None and hasattr(
-            sched_cfg, "max_num_batched_tokens"
-        )
-        orig_cfg_batched = sched_cfg.max_num_batched_tokens if has_cfg_batched else None
-        has_long_prefill = sched_cfg is not None and hasattr(
-            sched_cfg, "long_prefill_token_threshold"
+        orig_cfg_batched = (
+            getattr(sched_cfg, "max_num_batched_tokens", None)
+            if sched_cfg is not None
+            else None
         )
         orig_long_prefill = (
-            sched_cfg.long_prefill_token_threshold if has_long_prefill else None
+            getattr(sched_cfg, "long_prefill_token_threshold", None)
+            if sched_cfg is not None
+            else None
         )
 
         if clamped:
             if has_max_scheduled:
                 self.max_num_scheduled_tokens = effective_budget
-            if has_cfg_batched:
+            if sched_cfg is not None and orig_cfg_batched is not None:
                 sched_cfg.max_num_batched_tokens = effective_budget
-            if has_long_prefill and orig_long_prefill:
+            if (
+                sched_cfg is not None
+                and orig_long_prefill is not None
+                and int(orig_long_prefill) > 0
+            ):
                 sched_cfg.long_prefill_token_threshold = min(
                     int(orig_long_prefill), effective_budget
                 )
@@ -325,7 +329,7 @@ class TpuDpScheduler(AsyncScheduler):
             if clamped:
                 if has_max_scheduled:
                     self.max_num_scheduled_tokens = orig_max_scheduled
-                if has_cfg_batched:
+                if sched_cfg is not None and orig_cfg_batched is not None:
                     sched_cfg.max_num_batched_tokens = orig_cfg_batched
-                if has_long_prefill:
+                if sched_cfg is not None and orig_long_prefill is not None:
                     sched_cfg.long_prefill_token_threshold = orig_long_prefill
