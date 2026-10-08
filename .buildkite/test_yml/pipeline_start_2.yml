@@ -21,11 +21,11 @@ steps:
       - sleep 40
 
   
-  - label: ":err: Err"
-    key: "err"
-    depends_on: "w40s"
-    agents:
-      queue: cpu
-    commands:
-      - exit 1
+  # - label: ":err: Err"
+  #   key: "err"
+  #   depends_on: "w40s"
+  #   agents:
+  #     queue: cpu
+  #   commands:
+  #     - exit 1
 
