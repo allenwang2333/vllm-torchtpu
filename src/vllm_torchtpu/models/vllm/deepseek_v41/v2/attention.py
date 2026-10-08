@@ -875,7 +875,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 not non_causal
                 and tiled
                 and swa_table.shape[1] > 0
-                and self.window_size <= 2 * rows_per_page
+                and self.window_size <= 4 * rows_per_page
             )
             swa_key = (
                 "swa_token_addr",
@@ -942,12 +942,16 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     )
                     swa_pages = (safe // rows_per_page).long()
                     swa_page_rem = safe % rows_per_page
-                    c2 = swa_pages[:, -1]
-                    c1 = (c2 - 1).clamp(min=0)
-                    c0 = (c2 - 2).clamp(min=0)
-                    is_c2 = swa_pages == c2[:, None]
-                    is_c1 = swa_pages == c1[:, None]
-                    swa_3page = (c0, c1, is_c2, is_c1, swa_page_rem)
+                    max_prev_pages = max(2, (self.window_size - 1) // rows_per_page + 1)
+                    c_last = swa_pages[:, -1]
+                    prev_cols = tuple(
+                        (c_last - k).clamp(min=0) for k in range(1, max_prev_pages + 1)
+                    )
+                    is_c_last = swa_pages == c_last[:, None]
+                    is_prev_cols = tuple(
+                        swa_pages == col[:, None] for col in prev_cols[:-1]
+                    )
+                    swa_3page = (prev_cols, is_c_last, is_prev_cols, swa_page_rem)
                 else:
                     swa_3page = None
                 cached_swa = (
@@ -979,14 +983,16 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 swa_invalid_3d = (~swa_valid)[:, None, None]
                 valid_window = base_valid_window & swa_valid[:, None]
                 if swa_3page is not None:
-                    c0, c1, is_c2, is_c1, swa_page_rem = swa_3page
-                    b1 = swa_table[requests, c1].long()
-                    b0 = swa_table[requests, c0].long()
-                    swa_blocks = torch.where(
-                        is_c2,
-                        b2[:, None],
-                        torch.where(is_c1, b1[:, None], b0[:, None]),
-                    )
+                    prev_cols, is_c_last, is_prev_cols, swa_page_rem = swa_3page
+                    swa_blocks = swa_table[requests, prev_cols[-1]].long()[:, None]
+                    for col, is_col in zip(
+                        reversed(prev_cols[:-1]),
+                        reversed(is_prev_cols),
+                        strict=True,
+                    ):
+                        b_col = swa_table[requests, col].long()[:, None]
+                        swa_blocks = torch.where(is_col, b_col, swa_blocks)
+                    swa_blocks = torch.where(is_c_last, b2[:, None], swa_blocks)
                     swa_row_slots = (
                         swa_blocks * swa_cache.page_stride + swa_page_rem
                         if has_fast_swa_offset

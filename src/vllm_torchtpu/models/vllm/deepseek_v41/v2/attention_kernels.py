@@ -537,12 +537,16 @@ def _csa_gather_pool(
             nope_hi, rope_hi, idx_hi, num_valid_indices=valid_hi, top_k=top_k
         )
         nope_out = jnp.where(in_hi[:, None], nope_1, nope_0)
-        r0 = unpack_union_rope_words(rope_0, top_k)
-        r1 = unpack_union_rope_words(rope_1, top_k)
-        rope_words = jnp.where(in_hi[:, None], r1, r0)
-        rope_out = repack_chunk_rope_words(
-            rope_words.reshape(num_periods, top_k, -1)
-        ).reshape(out_size // 4, -1)
+        half_rows = top_k // 4
+        in_hi_pairs = in_hi.reshape(num_periods, 2, half_rows, 2).swapaxes(1, 2)
+        mask_even = jnp.where(in_hi_pairs[..., 0:1], jnp.int32(0xFFFF), jnp.int32(0))
+        mask_odd = jnp.where(in_hi_pairs[..., 1:2], jnp.int32(-65536), jnp.int32(0))
+        rope_mask = mask_even | mask_odd
+        r0_4d = rope_0.reshape(num_periods, half_rows, 2, -1)
+        r1_4d = rope_1.reshape(num_periods, half_rows, 2, -1)
+        rope_out = ((r1_4d & rope_mask) | (r0_4d & ~rope_mask)).reshape(
+            out_size // 4, -1
+        )
         return nope_out, rope_out
 
     assert not isinstance(rope_cache, tuple)

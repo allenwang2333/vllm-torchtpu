@@ -658,25 +658,45 @@ class TestSwaTokenAddressingAndFastOffsets:
             swa_meta.block_tables = swa_table
 
         # 2. use_3page_swa=True, has_fast_swa_offset=False (row_indices branch)
+        #    and 5-page span (window_size=128, rows_per_page=32) parity vs uncached
         captured_records.clear()
+        swa_table_5p = torch.tensor(
+            [[10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25]], dtype=torch.int32
+        )
+        swa_meta.block_tables = swa_table_5p
         attn_3page_slow = _make_swa_attn(
-            window_size=128, ced_decoder=False, has_fast_swa_offset=False
+            window_size=128,
+            ced_decoder=False,
+            has_fast_swa_offset=False,
+            rows_per_page=32,
         )
         with v2_attn.stage_attention_cache_scope():
             out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
             attn_3page_slow._prepare_tpu(None, qr, kv, None, None, None, positions, out)
             assert len(captured_records) == 1
+            recs_5page = captured_records[0]
+        # Verify exact bitwise parity with uncached _row_slots path
+        captured_records.clear()
+        attn_3page_slow._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+        assert torch.equal(recs_5page, captured_records[0])
+        swa_meta.block_tables = swa_table
 
-        # 3. use_3page_swa=False (window_size > 2 * rows_per_page = 256 > 128)
+        # 3. use_3page_swa=False (window_size > 4 * rows_per_page = 512 > 256)
         #    Exercises swa_3page is None and swa_row_slots calculation
         captured_records.clear()
         attn_no_3page = _make_swa_attn(
-            window_size=256, ced_decoder=False, has_fast_swa_offset=True
+            window_size=512, ced_decoder=False, has_fast_swa_offset=True
+        )
+        attn_no_3page_slow = _make_swa_attn(
+            window_size=512, ced_decoder=False, has_fast_swa_offset=False
         )
         with v2_attn.stage_attention_cache_scope():
             out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
             attn_no_3page._prepare_tpu(None, qr, kv, None, None, None, positions, out)
-            assert len(captured_records) == 1
+            attn_no_3page_slow._prepare_tpu(
+                None, qr, kv, None, None, None, positions, out
+            )
+            assert len(captured_records) == 2
 
         # 4. Fallback when stage_cache is None
         captured_records.clear()

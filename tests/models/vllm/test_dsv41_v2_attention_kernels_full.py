@@ -588,13 +588,20 @@ class TestGatherSparseKVAndUnionGather:
             assert res_2b.shape == (128, 4, 64)
 
         # Direct test of _csa_gather_pool with 2-bank tuple and num_valid_indices=None
-        indices_2b = jnp.arange(32, dtype=jnp.int32)
+        rng = np.random.default_rng(1234)
+        nope_rand = jnp.asarray(rng.integers(0, 255, size=(4, 16, 64), dtype=np.uint8))
+        rope_rand = jnp.asarray(
+            rng.integers(-(2**31), 2**31 - 1, size=(4, 4, 128), dtype=np.int32)
+        )
+        indices_2b = jnp.asarray(
+            rng.permutation(np.arange(64, dtype=np.int32))[:32], dtype=jnp.int32
+        )
         g_n_all, g_r_all = attention_kernels._csa_gather_pool(
-            cache_nope, cache_rope, indices_2b, num_valid_indices=None, top_k=16
+            nope_rand, rope_rand, indices_2b, num_valid_indices=None, top_k=16
         )
         g_n_2b, g_r_2b = attention_kernels._csa_gather_pool(
-            (cache_nope[:2], cache_nope[2:]),
-            (cache_rope[:2], cache_rope[2:]),
+            (nope_rand[:2], nope_rand[2:]),
+            (rope_rand[:2], rope_rand[2:]),
             indices_2b,
             num_valid_indices=None,
             top_k=16,
