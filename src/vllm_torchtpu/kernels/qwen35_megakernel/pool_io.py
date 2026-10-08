@@ -485,9 +485,12 @@ def scatter_pool_states(
       knew: `(c.NATT, c.MR, c.HD) fp8` (or `f32`/`bf16`, cast to `fp8`) new keys.
       vnew: `(c.NATT, c.MR, c.HD) fp8` (or `f32`/`bf16`, cast to `fp8`) new values.
       conv: GDN conv output from megakernel (`(ngdn, NS, HR, QKV)` for `T > 1` or
-        `(ngdn, CR, QKV)` for `T == 1`, or `(ngdn, NS, 3, QKV)`).
-      rec: `(ngdn, B * vh, KD, VD) bf16` per-token GDN recurrent states from megakernel.
-      ckpt_indices: `(G_PER_ATT, c.NS, K)` or `(c.NS, K) int32` checkpoint slot table.
+        `(ngdn, CR, QKV)` for `T == 1`, or `(ngdn, NS, 3, QKV)`); `None` when
+        `c.att_every == 1` (attention-only stack: KV scatter only).
+      rec: `(ngdn, B * vh, KD, VD) bf16` per-token GDN recurrent states from megakernel
+        (`None` when `c.att_every == 1`).
+      ckpt_indices: `(G_PER_ATT, c.NS, K)` or `(c.NS, K) int32` checkpoint slot table
+        (`None` when `c.att_every == 1`).
       active_seqs: optional `(c.NS,) int32` mask (non-zero for active sequences; defaults to 1s).
       interpret: run Pallas in CPU interpret mode.
 
@@ -510,6 +513,8 @@ def scatter_pool_states(
 
     AE = c.att_every
     G_PER_ATT = AE - 1
+    has_gdn = G_PER_ATT > 0
+    assert has_gdn or act_mode != "from_ckpt", "attention-only stacks have no checkpoints"
     NS, B, T = c.NS, c.B, c.T
     vh, KD, VD, QKV, HD = c.vh, c.KD, c.VD, c.QKV, c.HD
     ssm_u32_rows = (vh * KD) // 2
@@ -519,12 +524,15 @@ def scatter_pool_states(
     n_pairs = NS // 2
 
     direct_conv = (
-        T > 1
+        has_gdn
+        and T > 1
         and conv.ndim == 4
         and conv.shape[2] >= 3 + T
         and ((4 * qkv_128) % 16 == 0 or bool(interpret))
     )
-    if direct_conv:
+    if not has_gdn:
+        conv_in = None
+    elif direct_conv:
         conv_in = conv
         conv_buf_shape = (2, 1, conv.shape[2], QKV)
         conv_buf_dt = conv.dtype
@@ -556,28 +564,31 @@ def scatter_pool_states(
         conv_buf_shape = (2, T * conv_rows_pad, 128)
         conv_buf_dt = BF16
 
-    ckpt_is_3d = ckpt_indices.ndim == 3
-    ckpt_k = ckpt_indices.shape[-1]
+    ckpt_is_3d = has_gdn and ckpt_indices.ndim == 3
+    ckpt_k = ckpt_indices.shape[-1] if has_gdn else T
     ckpt_t_off = 0 if ckpt_k == T else 1
 
     scratch = {
         "kv_page": pltpu.VMEM((2, 2, 64, 4, c.page_size), FP8),
         "knew_buf": pltpu.VMEM((c.NATT, c.MR, HD), FP8),
         "vnew_buf": pltpu.VMEM((c.NATT, c.MR, HD), FP8),
-        "page_buf": pltpu.VMEM((2, T * 5, 2, 64, 4, c.page_size), FP8),
-        "rec_buf": pltpu.VMEM((2, T * vh, KD, VD), rec.dtype),
-        "conv_buf": pltpu.VMEM(conv_buf_shape, conv_buf_dt),
-        "sem_kv_rd": pltpu.SemaphoreType.DMA((2,)),
-        "sem_kv_wr": pltpu.SemaphoreType.DMA((2,)),
-        "sem_kv_in": pltpu.SemaphoreType.DMA((2,)),
-        "sem_in": pltpu.SemaphoreType.DMA((2, 2)),
-        "sem_p": pltpu.SemaphoreType.DMA((2, T)),
     }
+    if has_gdn:
+        scratch["page_buf"] = pltpu.VMEM((2, T * 5, 2, 64, 4, c.page_size), FP8)
+        scratch["rec_buf"] = pltpu.VMEM((2, T * vh, KD, VD), rec.dtype)
+        scratch["conv_buf"] = pltpu.VMEM(conv_buf_shape, conv_buf_dt)
+    scratch["sem_kv_rd"] = pltpu.SemaphoreType.DMA((2,))
+    scratch["sem_kv_wr"] = pltpu.SemaphoreType.DMA((2,))
+    scratch["sem_kv_in"] = pltpu.SemaphoreType.DMA((2,))
+    if has_gdn:
+        scratch["sem_in"] = pltpu.SemaphoreType.DMA((2, 2))
+        scratch["sem_p"] = pltpu.SemaphoreType.DMA((2, T))
     if NS > 1:
         scratch["k_cols_buf"] = pltpu.VMEM((c.NATT, 64, c.page_size), I32)
         scratch["v_cols_buf"] = pltpu.VMEM((c.NATT, 64, c.page_size), I32)
     s_names = list(scratch)
-    n_smem = 4 if act_mode == "ref" else 3
+    n_smem = 2 + int(has_gdn) + int(act_mode == "ref")
+    n_hbm = 4 if has_gdn else 2
 
     def batch_to_i32_cols(tok_mr_hd):
         rows_bf16 = tok_mr_hd.astype(BF16)
@@ -587,28 +598,28 @@ def scatter_pool_states(
         return pltpu.bitcast(cols_fp8, I32)
 
     def kernel(*refs):
-        # Inputs: *raw_pools (NATT), pos, page_table, ckpt_indices, [active_seqs], knew, vnew, conv, rec
-        if act_mode == "ref":
-            pos_ref, pt_ref, ckpt_ref, act_ref = refs[c.NATT:c.NATT + 4]
-        else:
-            pos_ref, pt_ref, ckpt_ref = refs[c.NATT:c.NATT + 3]
-            act_ref = None
-        knew_ref, vnew_ref, conv_ref, rec_ref = refs[
-            c.NATT + n_smem : c.NATT + n_smem + 4
-        ]
-        raw_out_refs = refs[c.NATT + n_smem + 4 : 2 * c.NATT + n_smem + 4]
-        scr = dict(zip(s_names, refs[2 * c.NATT + n_smem + 4 :]))
+        # Inputs: *raw_pools (NATT), pos, page_table, [ckpt_indices], [active_seqs], knew, vnew,
+        # [conv, rec] (the bracketed GDN operands only when has_gdn)
+        smem_refs = list(refs[c.NATT:c.NATT + n_smem])
+        pos_ref, pt_ref = smem_refs[:2]
+        ckpt_ref = smem_refs[2] if has_gdn else None
+        act_ref = smem_refs[-1] if act_mode == "ref" else None
+        knew_ref, vnew_ref, conv_ref, rec_ref = (
+            refs[c.NATT + n_smem : c.NATT + n_smem + n_hbm] + (None, None)
+        )[:4]
+        raw_out_refs = refs[c.NATT + n_smem + n_hbm : 2 * c.NATT + n_smem + n_hbm]
+        scr = dict(zip(s_names, refs[2 * c.NATT + n_smem + n_hbm :]))
         kv_page = scr["kv_page"]
         knew_buf = scr["knew_buf"]
         vnew_buf = scr["vnew_buf"]
-        page_buf = scr["page_buf"]
-        rec_buf = scr["rec_buf"]
-        conv_buf = scr["conv_buf"]
+        page_buf = scr.get("page_buf")
+        rec_buf = scr.get("rec_buf")
+        conv_buf = scr.get("conv_buf")
         sem_kv_rd = scr["sem_kv_rd"]
         sem_kv_wr = scr["sem_kv_wr"]
         sem_kv_in = scr["sem_kv_in"]
-        sem_in = scr["sem_in"]
-        sem_p = scr["sem_p"]
+        sem_in = scr.get("sem_in")
+        sem_p = scr.get("sem_p")
         k_cols_buf = scr["k_cols_buf"] if NS > 1 else None
         v_cols_buf = scr["v_cols_buf"] if NS > 1 else None
         lane_iota = lax.broadcasted_iota(I32, (64, c.page_size), 1)
@@ -1203,7 +1214,7 @@ def scatter_pool_states(
             pl.BlockSpec(memory_space=pltpu.HBM),   # vnew (3D HBM)
             pl.BlockSpec(memory_space=pltpu.HBM),   # conv_in
             pl.BlockSpec(memory_space=pltpu.HBM),   # rec
-        ]
+        ][:n_hbm]
     )
     out_shape = [jax.ShapeDtypeStruct(r.shape, r.dtype) for r in raw_pools]
     out_specs = [pl.BlockSpec(memory_space=pltpu.HBM)] * c.NATT
@@ -1222,17 +1233,19 @@ def scatter_pool_states(
         name="qwen3_5_scatter_pool_states",
     )
     smem_args = (
-        (pos, page_table, ckpt_indices, active_seqs)
-        if act_mode == "ref"
-        else (pos, page_table, ckpt_indices)
+        (pos, page_table)
+        + ((ckpt_indices,) if has_gdn else ())
+        + ((active_seqs,) if act_mode == "ref" else ())
     )
     if not interpret and isinstance(knew, jax.core.Tracer):
         knew = pltpu.with_memory_space_constraint(knew, pltpu.HBM)
         vnew = pltpu.with_memory_space_constraint(vnew, pltpu.HBM)
-        conv_in = pltpu.with_memory_space_constraint(conv_in, pltpu.HBM)
-        rec = pltpu.with_memory_space_constraint(rec, pltpu.HBM)
+        if has_gdn:
+            conv_in = pltpu.with_memory_space_constraint(conv_in, pltpu.HBM)
+            rec = pltpu.with_memory_space_constraint(rec, pltpu.HBM)
+    gdn_args = (conv_in, rec) if has_gdn else ()
     out = call(
-        *raw_pools, *smem_args, knew, vnew, conv_in, rec
+        *raw_pools, *smem_args, knew, vnew, *gdn_args
     )
     return tuple(out)
 
@@ -1341,6 +1354,97 @@ def make_flat_pooled_step(
             rec_out,
             ckpt_indices,
             active_seqs="from_ckpt",
+            interpret=interpret,
+        )
+        return (hid, *raw_out)
+
+    smap = jax.shard_map(
+        _body, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False
+    )
+    return smap, in_specs, out_specs, donate_argnums
+
+
+def make_flat_attn_step(
+    mesh,
+    c: MKConfig,
+    tiles: Tiles | None = None,
+    *,
+    interpret=False,
+    skip=frozenset(),
+    scopes=False,
+):
+    """Flat `shard_map` pooled step of an attention-only stack (`c.att_every == 1`, the MTP
+    draft layer) for `sharded_jax_callable`.
+
+    Like `make_flat_pooled_step` without GatedDeltaNet states. Operands (all `PartitionSpec("tp")`,
+    per-rank shapes): `pos [B]`, `hidden [M, H]`, `*w_flat`, `*raw_pools`,
+    `page_table [NS, max_pages_per_seq]`, `active_seqs [NS]` (sequences whose new KV tokens are
+    scattered) and `moe_rows [B]` (rows whose routed experts count, see `megakernel.build`).
+
+    Returns:
+      `(flat_step_fn, in_specs, out_specs, donate_argnums)`
+    """
+    assert c.att_every == 1, c.att_every
+    c_paged = dataclasses.replace(c, paged_kv=True)
+    call, info = build(
+        c_paged,
+        tiles,
+        interpret=interpret,
+        forced_routing=False,
+        skip=skip,
+        scopes=scopes,
+        row_mask=True,
+    )
+    tk = plan(c_paged, tiles or default_tiles(c_paged))["tk"]
+    e13_shape_4d = (c_paged.EW, c_paged.H // tk["e13"], tk["e13"], 2 * c_paged.IR)
+    e2_shape_4d = (c_paged.EW, c_paged.IR // tk["e2"], tk["e2"], c_paged.H)
+    n_w_leaves = sum(
+        c_paged.L if (not c_paged.stack_e and k in ("e13", "e2")) else 1 for k in W_NAMES
+    )
+    n_p = c_paged.NATT
+    A = P(mesh.axis_names[0])
+    in_specs = (A,) * (2 + n_w_leaves + n_p + 3)
+    out_specs = (A,) * (1 + n_p)
+    donate_argnums = tuple(range(2 + n_w_leaves, 2 + n_w_leaves + n_p))
+
+    def _body(*args):
+        pos, hidden = args[0], args[1]
+        w_leaves = args[2:2 + n_w_leaves]
+        raw_pools = args[2 + n_w_leaves:2 + n_w_leaves + n_p]
+        page_table, active_seqs, moe_rows = args[2 + n_w_leaves + n_p:]
+
+        w_grouped = []
+        idx = 0
+        for k in W_NAMES:
+            if not c_paged.stack_e and k in ("e13", "e2"):
+                target_4d = e13_shape_4d if k == "e13" else e2_shape_4d
+                w_grouped.append(
+                    tuple(
+                        w.reshape(target_4d) if w.ndim == 3 else w
+                        for w in w_leaves[idx:idx + c_paged.L]
+                    )
+                )
+                idx += c_paged.L
+            else:
+                w_grouped.append(w_leaves[idx])
+                idx += 1
+
+        # The kernel never touches the GatedDeltaNet state operands of an attention-only stack.
+        no_gdn = jnp.zeros((8, 128), BF16)
+        hid, _, _, knew, vnew = call(
+            pos, hidden, *w_grouped, no_gdn, no_gdn, raw_pools, page_table, moe_rows
+        )
+        raw_out = scatter_pool_states(
+            c_paged,
+            raw_pools,
+            pos,
+            page_table,
+            knew,
+            vnew,
+            None,
+            None,
+            None,
+            active_seqs,
             interpret=interpret,
         )
         return (hid, *raw_out)
