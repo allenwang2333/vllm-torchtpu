@@ -103,6 +103,8 @@ class DFlashProposer:
         # Keyed by the chunk's padded request count; the all-zero
         # `draft_lengths` a chunk without spec metadata routes on.
         self._zero_draft_lengths_cache: dict[int, torch.Tensor] = {}
+        # (runner bucket list it was derived from, draft-forward buckets).
+        self._draft_paddings_cache: tuple[list[int], list[int]] | None = None
 
     @property
     def block_size(self) -> int:
@@ -232,8 +234,37 @@ class DFlashProposer:
                 model_config=draft_model_config,
             )
 
+    def _draft_tokens_paddings(self) -> list[int]:
+        """Token buckets for the draft forward.
+
+        The runner's buckets are sized for verify steps of ``K + 1`` rows per
+        request, but a draft forward has ``block_size`` rows per request
+        (``K`` for DSpark's dense layout), so a decode step's draft batch
+        would pad e.g. 48 requests x 5 rows = 240 up to the 288 verify
+        bucket. For every runner bucket ``p`` that holds whole verify steps
+        (``p % (K + 1) == 0``), add the 8-aligned draft rows of its
+        ``p // (K + 1)`` requests.
+
+        Returns:
+            Sorted draft-forward token buckets (a superset of the runner's).
+        """
+        paddings = self.runner.num_tokens_paddings
+        cached = self._draft_paddings_cache
+        if cached is not None and cached[0] is paddings:
+            return cached[1]
+        verify_rows = self.speculative_config.num_speculative_tokens + 1
+        block = self.block_size
+        extra = {
+            -(-(block * (p // verify_rows)) // 8) * 8
+            for p in paddings
+            if p % verify_rows == 0
+        }
+        draft = sorted(set(paddings) | {d for d in extra if d >= block})
+        self._draft_paddings_cache = (paddings, draft)
+        return draft
+
     def _get_padded_len(self, target_len: int) -> int:
-        for p in self.runner.num_tokens_paddings:
+        for p in self._draft_tokens_paddings():
             if p >= target_len:
                 return p
         return target_len
@@ -645,8 +676,9 @@ class DFlashProposer:
                         sync=True,
                     )
 
-                # Context-KV updates allow short chunks;
-                # draft forward needs a full block.
+            # Context-KV updates follow the target's buckets; draft forwards
+            # run on the draft buckets and need a full block.
+            for num_tokens in self._draft_tokens_paddings():
                 if not block_size <= num_tokens <= max_draft_tokens:
                     continue
 

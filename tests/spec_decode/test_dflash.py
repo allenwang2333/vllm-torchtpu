@@ -162,6 +162,58 @@ def test_precompile_skips_sub_block_draft_forward():
     ] == [8, 16, 512]
 
 
+def test_draft_buckets_fit_dense_draft_blocks():
+    # DSpark dense layout: K=5 draft rows per request vs K+1=6 verify rows.
+    proposer = _make_proposer(draft_tp=8, target_tp=8)
+    proposer.speculative_config.num_speculative_tokens = 5
+    proposer._query_block_size = lambda K: K
+    proposer.draft_model = SimpleNamespace(
+        model=SimpleNamespace(
+            context_proj=SimpleNamespace(weight=torch.empty((1, 32))),
+            embed_tokens=SimpleNamespace(weight=torch.empty((1, 1))),
+        )
+    )
+    paddings = [4, 8, 16, 24, 32, 48, 64, 96, 144, 192, 288, 384, 576, 2048]
+    proposer.runner = SimpleNamespace(
+        num_reqs_max_model_len=48,
+        num_reqs_most_model_len=None,
+        most_model_len=None,
+        max_num_blocks_per_req=4,
+        num_tokens_paddings=paddings,
+        _precompile_timed=mock.MagicMock(
+            return_value=mock.MagicMock(
+                __enter__=mock.MagicMock(return_value=None),
+                __exit__=mock.MagicMock(return_value=False),
+            )
+        ),
+    )
+    # Verify buckets 48..576 carry 8..96 requests -> 40..480 draft rows.
+    assert proposer._draft_tokens_paddings() == sorted(
+        set(paddings) | {40, 80, 120, 160, 240, 320, 480}
+    )
+    assert proposer._draft_tokens_paddings() is proposer._draft_tokens_paddings()
+    assert proposer._get_padded_len(48 * 5) == 240
+    assert proposer._get_padded_len(47 * 5) == 240
+    assert proposer._get_padded_len(49 * 5) == 288
+    assert proposer._get_padded_len(4096) == 4096
+
+    proposer._dummy_precompute_and_update_kv_cache = mock.MagicMock()
+    proposer._dummy_draft_forward = mock.MagicMock()
+    proposer.precompile()
+    assert [
+        call.kwargs["num_tokens"]
+        for call in proposer._dummy_precompute_and_update_kv_cache.call_args_list
+    ] == paddings
+    assert [
+        call.kwargs["num_tokens"]
+        for call in proposer._dummy_draft_forward.call_args_list
+    ] == [8, 16, 24, 32, 40, 48, 64, 80, 96, 120, 144, 160, 192, 240]
+
+    # A changed runner bucket list (e.g. pipeline chunk buckets) re-derives.
+    proposer.runner.num_tokens_paddings = [8, 576]
+    assert proposer._draft_tokens_paddings() == [8, 480, 576]
+
+
 @pytest.mark.parametrize("has_upstream_hook", [False, True])
 def test_tpu_precompute_context_kv(device, has_upstream_hook):
     # Setup dimension sizes
