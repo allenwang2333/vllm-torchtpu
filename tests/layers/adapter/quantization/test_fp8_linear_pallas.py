@@ -211,3 +211,88 @@ def test_post_load_hook_selects_and_pads(monkeypatch, n_out, copy):
     assert sorted(before) == sorted(after)
     for n, p in before.items():
         assert torch.equal(p.view(torch.uint8), after[n].detach().view(torch.uint8))
+
+
+class _Recorder:
+    """Stands in for a matmul entry point: records its args, returns a fixed output."""
+
+    def __init__(self, out):
+        self.out, self.calls = out, []
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        return self.out
+
+
+def _apply(monkeypatch, layer, x, bias=None):
+    """Run `VllmFp8LinearMethodTPU.apply` with both matmul paths recorded."""
+    out_xla, out_pallas = torch.full((4, 200), 1.0), torch.full((4, 200), 2.0)
+    xla, pallas = _Recorder(out_xla), _Recorder(out_pallas)
+    monkeypatch.setattr(fp8_mod, "quantized_matmul", xla)
+    monkeypatch.setattr(fp8_mod, "quantized_matmul_pallas", pallas)
+    method = object.__new__(fp8_mod.VllmFp8LinearMethodTPU)  # apply() reads no state
+    y = method.apply(layer, x, bias)
+    return y, xla, pallas
+
+
+def _same(got, want):
+    return all(a is b for a, b in zip(got, want, strict=True))
+
+
+def test_apply_unmarked_layer_takes_xla(monkeypatch):
+    layer, x = _fp8_layer(64, 200), torch.randn(4, 64)
+    y, xla, pallas = _apply(monkeypatch, layer, x)
+    assert pallas.calls == [] and len(xla.calls) == 1
+    assert _same(xla.calls[0], (x, layer.weight, layer.weight_scale))
+    assert y is xla.out
+
+
+def test_apply_marker_none_is_unmarked(monkeypatch):
+    layer = _fp8_layer(64, 200)
+    setattr(layer, fp8_mod.FP8_PALLAS_N_ATTR, None)
+    _, xla, pallas = _apply(monkeypatch, layer, torch.randn(4, 64))
+    assert pallas.calls == [] and len(xla.calls) == 1
+
+
+def test_apply_marked_layer_takes_pallas(monkeypatch):
+    layer, x = _fp8_layer(64, 256), torch.randn(4, 64)
+    setattr(layer, fp8_mod.FP8_PALLAS_N_ATTR, 256)
+    y, xla, pallas = _apply(monkeypatch, layer, x)
+    assert xla.calls == [] and len(pallas.calls) == 1
+    assert _same(pallas.calls[0][:3], (x, layer.weight, layer.weight_scale))
+    assert pallas.calls[0][3:] == (None, None)  # lane-aligned: no padded copy
+    assert y is pallas.out
+
+
+def test_apply_marked_layer_passes_padded_copy(monkeypatch):
+    layer, x = _fp8_layer(64, 200), torch.randn(4, 64)
+    setattr(layer, fp8_mod.FP8_PALLAS_N_ATTR, 200)
+    fp8_mod._set_fp8_pallas_copy(layer)
+    _, xla, pallas = _apply(monkeypatch, layer, x)
+    assert xla.calls == [] and len(pallas.calls) == 1
+    want = (x, layer.weight, layer.weight_scale)
+    want += (layer.weight_pallas, layer.weight_scale_pallas)
+    assert _same(pallas.calls[0], want)
+
+
+@pytest.mark.parametrize("marked", [False, True])
+def test_apply_adds_bias_on_both_paths(monkeypatch, marked):
+    layer = _fp8_layer(64, 200)
+    if marked:
+        setattr(layer, fp8_mod.FP8_PALLAS_N_ATTR, 200)
+    bias = torch.arange(200, dtype=torch.float32)
+    y, xla, pallas = _apply(monkeypatch, layer, torch.randn(4, 64), bias)
+    taken = pallas if marked else xla
+    assert torch.equal(y, taken.out + bias)
+
+
+def test_apply_keep_vllm_layout_transposes_for_xla(monkeypatch):
+    """A raw-layout [n_out, n_in] weight reaches XLA as its (k, n) view."""
+    layer = _fp8_layer(200, 64)
+    setattr(layer, fp8_mod.KEEP_VLLM_LAYOUT_ATTR, True)
+    _, xla, _ = _apply(monkeypatch, layer, torch.randn(4, 64))
+    w = xla.calls[0][1]
+    assert w.shape == (64, 200)
+    assert torch.equal(
+        w.view(torch.uint8), layer.weight.transpose(0, 1).view(torch.uint8)
+    )
