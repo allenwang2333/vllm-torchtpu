@@ -39,6 +39,7 @@ from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import CircularBufferSpec, FullAttentionSpec
 
 from vllm_torchtpu.kernels.deepseek_v4 import o_projection as op
+from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 from vllm_torchtpu.kernels.deepseek_v4.rope import LANE
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -617,7 +618,7 @@ class TestOProjectionFull:
         ref_out = MockArrayRef(np.zeros((tile_n, 2 * LANE), dtype=np.float32))
 
         # inverse = False
-        op._cos_sin_body(
+        rope_kernel._cos_sin_body(
             ref_in,
             ref_out,
             rotary_dim=rotary_dim,
@@ -629,7 +630,7 @@ class TestOProjectionFull:
 
         # inverse = True
         ref_out_inv = MockArrayRef(np.zeros((tile_n, 2 * LANE), dtype=np.float32))
-        op._cos_sin_body(
+        rope_kernel._cos_sin_body(
             ref_in,
             ref_out_inv,
             rotary_dim=rotary_dim,
@@ -653,20 +654,22 @@ class TestOProjectionFull:
         mock_alloc = SimpleNamespace()
 
         with (
-            patch.object(op.pltpu, "emit_pipeline", side_effect=fake_emit),
-            patch.object(op.CosSinRef, "create", return_value=mock_alloc),
+            patch.object(rope_kernel.pltpu, "emit_pipeline", side_effect=fake_emit),
+            patch.object(rope_kernel.CosSinRef, "create", return_value=mock_alloc),
             patch.object(
-                op.pl,
+                rope_kernel.pl,
                 "with_scoped",
                 side_effect=lambda allocations: lambda fn: lambda: fn(allocations),
             ),
-            patch.object(op.pltpu.BufferedRef, "output", return_value=mock_alloc),
+            patch.object(
+                rope_kernel.pltpu.BufferedRef, "output", return_value=mock_alloc
+            ),
         ):
             pos_ref = MockArrayRef(np.zeros(8, dtype=np.int32))
             cs_cache = MockArrayRef(np.zeros((64, 64), dtype=np.float32))
             out_hbm = MockArrayRef(np.zeros((8, 2 * LANE), dtype=np.float32))
 
-            op._cos_sin_kernel(
+            rope_kernel._cos_sin_kernel(
                 pos_ref,
                 cs_cache,
                 out_hbm,

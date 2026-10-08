@@ -159,26 +159,155 @@ def _rotate_gptj(x: jax.Array) -> jax.Array:
     return _lane_gather(x, lane ^ 1) * sign
 
 
+def _cos_sin_body(
+    cos_sin_ref: jax.Ref,
+    out_ref: jax.Ref,
+    *,
+    rotary_dim: int,
+    inverse: bool,
+    out_dtype: jnp.dtype,
+) -> None:
+    """Expand a ``(tile_n, rotary_dim)`` block to ``(tile_n, 2 * LANE)``."""
+    cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
+    out_ref[...] = jnp.concatenate([cos, sin], axis=-1).astype(out_dtype)
+
+
+def _cos_sin_kernel(
+    # scalar prefetch
+    positions_ref: jax.Ref,
+    # HBM input
+    cos_sin_cache_hbm_ref: jax.Ref,
+    # HBM output
+    out_hbm_ref: jax.Ref,
+    *,
+    num_tiles: int,
+    tile_n: int,
+    rotary_dim: int,
+    inverse: bool,
+    cos_sin_dtype: jnp.dtype,
+    out_dtype: jnp.dtype,
+) -> None:
+    cos_sin_spec = pl.BlockSpec(
+        block_shape=(tile_n, rotary_dim),
+        memory_space=pltpu.VMEM,
+        index_map=lambda i: (i, 0),
+    )
+    out_spec = pl.BlockSpec(
+        block_shape=(tile_n, 2 * LANE),
+        memory_space=pltpu.VMEM,
+        index_map=lambda i: (i, 0),
+    )
+    # The per-token row gather; one buffer of lookahead hides its DMAs.
+    cos_sin_alloc = CosSinRef.create(
+        spec=cos_sin_spec, dtype=cos_sin_dtype, buffer_count=2, tile_n=tile_n
+    )
+
+    pipeline = pltpu.emit_pipeline(
+        functools.partial(
+            _cos_sin_body,
+            rotary_dim=rotary_dim,
+            inverse=inverse,
+            out_dtype=out_dtype,
+        ),
+        grid=(num_tiles,),
+        in_specs=[cos_sin_spec],
+        out_specs=[out_spec],
+    )
+    allocations = (
+        cos_sin_alloc,
+        pltpu.BufferedRef.output(out_spec, out_dtype, buffer_count=2),
+    )
+
+    @pl.with_scoped(allocations=allocations)
+    def _run(allocations):
+        pipeline(
+            (cos_sin_cache_hbm_ref, positions_ref),
+            out_hbm_ref,
+            allocations=allocations,
+        )
+
+    _run()
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("inverse", "out_dtype", "name"),
+)
+def gather_cos_sin(
+    positions: jax.Array,  # [T] int
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    *,
+    inverse: bool = False,
+    out_dtype: jnp.dtype = jnp.float32,
+    name: str = "gather_cos_sin",
+) -> jax.Array:
+    """Gathers ``cos_sin_cache[positions]`` into a ``[T, 2 * LANE]`` cos | sin table.
+
+    Each row is ``_cos_sin_lanes`` of the token's cache row: cos widened to the
+    full ``LANE`` block (``1`` on the NoPE lanes), then sin (``0`` on the NoPE
+    lanes, negated when ``inverse``). The gather issues one small DMA per token,
+    so its cost is latency, not bytes. Every layer of a step rotates by the same
+    positions, so callers build the table through this one function with fixed
+    arguments and XLA CSEs the identical calls into one per step.
+    """
+    assert positions.ndim == 1
+    assert cos_sin_cache.ndim == 2
+
+    num_tokens = positions.shape[0]
+    rotary_dim = cos_sin_cache.shape[1]
+    assert rotary_dim % 2 == 0 and rotary_dim <= LANE
+
+    tile_n = largest_divisor(num_tokens, cap=128)
+
+    return pl.pallas_call(
+        functools.partial(
+            _cos_sin_kernel,
+            num_tiles=num_tokens // tile_n,
+            tile_n=tile_n,
+            rotary_dim=rotary_dim,
+            inverse=inverse,
+            cos_sin_dtype=cos_sin_cache.dtype,
+            out_dtype=out_dtype,
+        ),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, 2 * LANE), out_dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=(pl.BlockSpec(memory_space=pltpu.HBM),),
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+    )(positions, cos_sin_cache)
+
+
+def _split_cos_sin(cos_sin: jax.Array, ndim: int) -> tuple[jax.Array, jax.Array]:
+    """``gather_cos_sin`` rows as ``(cos, sin)``, broadcast over heads if 3-D."""
+    cos, sin = cos_sin[:, :LANE], cos_sin[:, LANE:]
+    if ndim == 3:  # [tokens, heads, lanes]: cos/sin are per token
+        cos = cos[:, None, :]
+        sin = sin[:, None, :]
+    return cos, sin
+
+
 def _rope_body(
     x_ref: jax.Ref,
     cos_sin_ref: jax.Ref,
     *out_refs: jax.Ref,
-    rotary_dim: int,
-    inverse: bool,
     out_dtype: jnp.dtype,
     quant_dtype: jnp.dtype | None,
 ) -> None:
     """Process one ``(tile_n, [num_heads,] LANE)`` chunk.
 
-    Without ``quant_dtype`` the rotation is written back into ``x_ref`` in place.
-    With it, the rotated chunk is quantized along the lanes and written to the
+    ``cos_sin_ref`` holds the chunk's ``gather_cos_sin`` rows. Without
+    ``quant_dtype`` the rotation is written back into ``x_ref`` in place. With
+    it, the rotated chunk is quantized along the lanes and written to the
     ``(q_ref, scale_ref)`` outputs instead.
     """
     x = x_ref[...].astype(jnp.float32)
-    cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
-    if x.ndim == 3:  # [tokens, heads, lanes]: cos/sin are per token
-        cos = cos[:, None, :]
-        sin = sin[:, None, :]
+    cos, sin = _split_cos_sin(cos_sin_ref[...], x.ndim)
 
     rotated = _rotate_gptj(x)
     y = x * cos + rotated * sin
@@ -198,11 +327,9 @@ def _rope_body(
 
 
 def _kernel(
-    # scalar prefetch
-    positions_ref: jax.Ref,
     # HBM inputs
     x_hbm_ref: jax.Ref,
-    cos_sin_cache_hbm_ref: jax.Ref,
+    cos_sin_hbm_ref: jax.Ref,
     # HBM outputs: (out,) aliased onto x_hbm_ref, or (q, scales) when quantizing
     *out_hbm_refs: jax.Ref,
     num_tiles: int,
@@ -210,11 +337,8 @@ def _kernel(
     x_block_shape: tuple[int, ...],
     scale_block_shape: tuple[int, ...],
     lane_block: int,
-    rotary_dim: int,
-    inverse: bool,
     in_dtype: jnp.dtype,
     out_dtype: jnp.dtype,
-    cos_sin_dtype: jnp.dtype,
     quant_dtype: jnp.dtype | None,
 ) -> None:
     def x_index_map(i):
@@ -227,13 +351,11 @@ def _kernel(
     )
 
     cos_sin_spec = pl.BlockSpec(
-        block_shape=(tile_n, rotary_dim),
+        block_shape=(tile_n, 2 * LANE),
         memory_space=pltpu.VMEM,
         index_map=lambda i: (i, 0),
     )
-    cos_sin_alloc = CosSinRef.create(
-        spec=cos_sin_spec, dtype=cos_sin_dtype, buffer_count=2, tile_n=tile_n
-    )
+    cos_sin_alloc = pltpu.BufferedRef.input(cos_sin_spec, jnp.float32, buffer_count=2)
 
     if quant_dtype is None:
         del x_hbm_ref  # aliased to the output; read/written through the latter.
@@ -269,8 +391,6 @@ def _kernel(
     pipeline = pltpu.emit_pipeline(
         functools.partial(
             _rope_body,
-            rotary_dim=rotary_dim,
-            inverse=inverse,
             out_dtype=out_dtype,
             quant_dtype=quant_dtype,
         ),
@@ -283,7 +403,7 @@ def _kernel(
     def _run(allocations):
         pipeline(
             *x_ref_args,
-            (cos_sin_cache_hbm_ref, positions_ref),
+            cos_sin_hbm_ref,
             *out_ref_args,
             allocations=allocations,
         )
@@ -296,9 +416,7 @@ def _qnorm_rope_body(
     cos_sin_ref: jax.Ref,
     out_ref: jax.Ref,
     *,
-    rotary_dim: int,
     eps: float,
-    inverse: bool,
     out_dtype: jnp.dtype,
 ) -> None:
     """Process one ``(tile_n, num_heads, head_dim)`` chunk.
@@ -313,32 +431,25 @@ def _qnorm_rope_body(
     # Only the last lane block holds roped channels; the rest of the row passes
     # through with nothing but the norm applied.
     tail = y[..., -LANE:]
-    cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
     assert tail.ndim == 3
-    cos = cos[:, None, :]
-    sin = sin[:, None, :]
+    cos, sin = _split_cos_sin(cos_sin_ref[...], tail.ndim)
     roped = tail * cos + _rotate_gptj(tail) * sin
 
     out_ref[...] = jnp.concatenate([y[..., :-LANE], roped], axis=-1).astype(out_dtype)
 
 
 def _qnorm_rope_kernel(
-    # scalar prefetch
-    positions_ref: jax.Ref,
     # HBM inputs
     x_hbm_ref: jax.Ref,
-    cos_sin_cache_hbm_ref: jax.Ref,
+    cos_sin_hbm_ref: jax.Ref,
     # HBM output, aliased onto x_hbm_ref
     out_hbm_ref: jax.Ref,
     *,
     num_tiles: int,
     tile_n: int,
     x_block_shape: tuple[int, ...],
-    rotary_dim: int,
     eps: float,
-    inverse: bool,
     in_dtype: jnp.dtype,
-    cos_sin_dtype: jnp.dtype,
 ) -> None:
     x_spec = pl.BlockSpec(
         block_shape=x_block_shape,
@@ -346,29 +457,20 @@ def _qnorm_rope_kernel(
         index_map=lambda i: (i, 0, 0),
     )
     cos_sin_spec = pl.BlockSpec(
-        block_shape=(tile_n, rotary_dim),
+        block_shape=(tile_n, 2 * LANE),
         memory_space=pltpu.VMEM,
         index_map=lambda i: (i, 0),
     )
-    cos_sin_alloc = CosSinRef.create(
-        spec=cos_sin_spec, dtype=cos_sin_dtype, buffer_count=2, tile_n=tile_n
-    )
 
     pipeline = pltpu.emit_pipeline(
-        functools.partial(
-            _qnorm_rope_body,
-            rotary_dim=rotary_dim,
-            eps=eps,
-            inverse=inverse,
-            out_dtype=in_dtype,
-        ),
+        functools.partial(_qnorm_rope_body, eps=eps, out_dtype=in_dtype),
         grid=(num_tiles,),
         in_specs=[x_spec, cos_sin_spec],
         out_specs=[x_spec],
     )
     allocations = (
         pltpu.BufferedRef.input(x_spec, in_dtype, buffer_count=2),
-        cos_sin_alloc,
+        pltpu.BufferedRef.input(cos_sin_spec, jnp.float32, buffer_count=2),
         pltpu.BufferedRef.output(x_spec, in_dtype, buffer_count=2),
     )
 
@@ -376,12 +478,28 @@ def _qnorm_rope_kernel(
     def _run(allocations):
         pipeline(
             x_hbm_ref,
-            (cos_sin_cache_hbm_ref, positions_ref),
+            cos_sin_hbm_ref,
             out_hbm_ref,
             allocations=allocations,
         )
 
     _run()
+
+
+def _rope_cos_sin(
+    positions: jax.Array, cos_sin_cache: jax.Array, *, inverse: bool
+) -> jax.Array:
+    """The step-wide ``gather_cos_sin`` table every RoPE kernel reads.
+
+    The name depends only on ``inverse`` so the calls of all layers in a step
+    stay identical and XLA CSEs them into a single gather.
+    """
+    return gather_cos_sin(
+        positions,
+        cos_sin_cache,
+        inverse=inverse,
+        name="rope_cos_sin_inverse" if inverse else "rope_cos_sin",
+    )
 
 
 def _rope_call(
@@ -425,18 +543,15 @@ def _rope_call(
         x_block_shape=x_block_shape,
         scale_block_shape=scale_block_shape,
         lane_block=head_dim // LANE - 1,  # last lane block has the roped channels
-        rotary_dim=rotary_dim,
-        inverse=inverse,
         in_dtype=x.dtype,
         out_dtype=x.dtype,
-        cos_sin_dtype=cos_sin_cache.dtype,
         quant_dtype=quant_dtype,
     )
 
     if quant_dtype is None:
         out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
         out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
-        input_output_aliases = {1: 0}  # x (after the scalar prefetch) -> out
+        input_output_aliases = {0: 0}  # x -> out
     else:
         out_shape = (
             jax.ShapeDtypeStruct(x.shape, quant_dtype),
@@ -448,26 +563,21 @@ def _rope_call(
         )
         input_output_aliases = {}
 
-    grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=1,
-        in_specs=(
-            pl.BlockSpec(memory_space=pltpu.HBM),  # x
-            pl.BlockSpec(memory_space=pltpu.HBM),  # cos_sin_cache
-        ),
-        out_specs=out_specs,
-    )
-
     return pl.pallas_call(
         kernel,
         out_shape=out_shape,
-        grid_spec=grid_spec,
+        in_specs=(
+            pl.BlockSpec(memory_space=pltpu.HBM),  # x
+            pl.BlockSpec(memory_space=pltpu.HBM),  # cos_sin table
+        ),
+        out_specs=out_specs,
         input_output_aliases=input_output_aliases,
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
             disable_bounds_checks=True,
         ),
         name=name,
-    )(positions, x, cos_sin_cache)
+    )(x, _rope_cos_sin(positions, cos_sin_cache, inverse=inverse))
 
 
 @functools.partial(
@@ -541,33 +651,25 @@ def qnorm_rope(
         num_tiles=num_tokens // tile_n,
         tile_n=tile_n,
         x_block_shape=x_block_shape,
-        rotary_dim=rotary_dim,
         eps=eps,
-        inverse=inverse,
         in_dtype=x.dtype,
-        cos_sin_dtype=cos_sin_cache.dtype,
-    )
-
-    grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=1,
-        in_specs=(
-            pl.BlockSpec(memory_space=pltpu.HBM),  # x
-            pl.BlockSpec(memory_space=pltpu.HBM),  # cos_sin_cache
-        ),
-        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
     )
 
     return pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-        grid_spec=grid_spec,
-        input_output_aliases={1: 0},  # x (after the scalar prefetch) -> out
+        in_specs=(
+            pl.BlockSpec(memory_space=pltpu.HBM),  # x
+            pl.BlockSpec(memory_space=pltpu.HBM),  # cos_sin table
+        ),
+        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+        input_output_aliases={0: 0},  # x -> out
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
             disable_bounds_checks=True,
         ),
         name=name,
-    )(positions, x, cos_sin_cache)
+    )(x, _rope_cos_sin(positions, cos_sin_cache, inverse=inverse))
 
 
 @functools.partial(jax.jit, static_argnames=("inverse", "quant_dtype", "name"))

@@ -738,12 +738,10 @@ class TestRopeHelpersAndBody:
     def test_rope_body_unquantized_and_quantized(self):
         # 2D unquantized (quant_dtype is None, x.ndim == 2)
         x_2d = MockArrayRef(np.ones((4, 128), dtype=np.float32))
-        cos_sin = MockArrayRef(np.ones((4, 64), dtype=np.float32))
+        cos_sin = MockArrayRef(np.ones((4, 2 * rope.LANE), dtype=np.float32))
         rope._rope_body(
             x_2d,
             cos_sin,
-            rotary_dim=64,
-            inverse=False,
             out_dtype=jnp.float32,
             quant_dtype=None,
         )
@@ -754,8 +752,6 @@ class TestRopeHelpersAndBody:
         rope._rope_body(
             x_3d,
             cos_sin,
-            rotary_dim=64,
-            inverse=True,
             out_dtype=jnp.float32,
             quant_dtype=None,
         )
@@ -769,8 +765,6 @@ class TestRopeHelpersAndBody:
             cos_sin,
             q_ref,
             scale_ref,
-            rotary_dim=64,
-            inverse=False,
             out_dtype=jnp.float32,
             quant_dtype=jnp.float8_e4m3fn,
         )
@@ -786,8 +780,6 @@ class TestRopeHelpersAndBody:
             cos_sin,
             q_ref,
             scale_ref,
-            rotary_dim=64,
-            inverse=False,
             out_dtype=jnp.float32,
             quant_dtype=jnp.float8_e4m3fn,
         )
@@ -796,16 +788,14 @@ class TestRopeHelpersAndBody:
     def test_qnorm_rope_body(self):
         # 3D: (tile_n, num_heads, head_dim)
         x_ref = MockArrayRef(np.ones((2, 4, 256), dtype=np.float32))
-        cos_sin_ref = MockArrayRef(np.ones((2, 64), dtype=np.float32))
+        cos_sin_ref = MockArrayRef(np.ones((2, 2 * rope.LANE), dtype=np.float32))
         out_ref = MockArrayRef(np.zeros((2, 4, 256), dtype=np.float32))
 
         rope._qnorm_rope_body(
             x_ref,
             cos_sin_ref,
             out_ref,
-            rotary_dim=64,
             eps=1e-6,
-            inverse=False,
             out_dtype=jnp.float32,
         )
         assert out_ref.arr.shape == (2, 4, 256)
@@ -832,7 +822,6 @@ class TestRopeHelpersAndBody:
 
         with (
             patch.object(rope.pltpu, "emit_pipeline", side_effect=fake_emit),
-            patch.object(rope.CosSinRef, "create", return_value=mock_alloc),
             patch.object(
                 rope.pl,
                 "with_scoped",
@@ -845,13 +834,11 @@ class TestRopeHelpersAndBody:
             patch.object(rope.pltpu.BufferedRef, "output", return_value=mock_alloc),
         ):
             # 3D block shape, quant_dtype=None (covers lines 221-222, 238-246)
-            # *out_hbm_refs is passed positionally after cos_sin_cache_hbm_ref
-            pos_ref = MockArrayRef(np.zeros(16, dtype=np.int32))
-            cs_ref = MockArrayRef(np.zeros((100, 64), dtype=np.float32))
+            # *out_hbm_refs is passed positionally after cos_sin_hbm_ref
+            cs_ref = MockArrayRef(np.zeros((16, 2 * rope.LANE), dtype=np.float32))
             out_hbm = MockArrayRef(np.zeros((16, 4, 128), dtype=np.float32))
 
             rope._kernel(
-                pos_ref,
                 None,
                 cs_ref,
                 out_hbm,
@@ -860,11 +847,8 @@ class TestRopeHelpersAndBody:
                 x_block_shape=(16, 4, 128),
                 scale_block_shape=(16, 4),
                 lane_block=0,
-                rotary_dim=64,
-                inverse=False,
                 in_dtype=jnp.float32,
                 out_dtype=jnp.float32,
-                cos_sin_dtype=jnp.float32,
                 quant_dtype=None,
             )
 
@@ -874,7 +858,6 @@ class TestRopeHelpersAndBody:
             sc_hbm = MockArrayRef(np.zeros((16,), dtype=np.float32))
 
             rope._kernel(
-                pos_ref,
                 x_hbm,
                 cs_ref,
                 q_hbm,
@@ -884,28 +867,21 @@ class TestRopeHelpersAndBody:
                 x_block_shape=(16, 128),
                 scale_block_shape=(16,),
                 lane_block=0,
-                rotary_dim=64,
-                inverse=True,
                 in_dtype=jnp.float32,
                 out_dtype=jnp.float32,
-                cos_sin_dtype=jnp.float32,
                 quant_dtype=jnp.float8_e4m3fn,
             )
 
             # Test _qnorm_rope_kernel (covers lines 325-385)
             rope._qnorm_rope_kernel(
-                pos_ref,
                 MockArrayRef(np.zeros((16, 4, 256), dtype=np.float32)),
                 cs_ref,
                 MockArrayRef(np.zeros((16, 4, 256), dtype=np.float32)),
                 num_tiles=1,
                 tile_n=16,
                 x_block_shape=(16, 4, 256),
-                rotary_dim=64,
                 eps=1e-6,
-                inverse=False,
                 in_dtype=jnp.float32,
-                cos_sin_dtype=jnp.float32,
             )
 
 
@@ -952,17 +928,24 @@ class TestRopeCallAndPublicWrappers:
 
     def test_public_wrappers_with_mock_pallas_call(self):
         # Pure JAX reference implementations for tracing inside jax.jit
-        def jax_ref_rope(x, pos, cache, inverse=False):
-            rot_dim = cache.shape[1]
+        def jax_ref_cos_sin(pos, cache, inverse=False):
+            # The dense ``gather_cos_sin`` table: [cos | sin], LANE lanes each.
             c, s = jnp.split(cache[pos], 2, axis=-1)
             c = jnp.repeat(c, 2, axis=-1)
             s = jnp.repeat(s, 2, axis=-1)
             if inverse:
                 s = -s
+            nope = rope.LANE - c.shape[-1]
+            c = jnp.pad(c, ((0, 0), (nope, 0)), constant_values=1.0)
+            s = jnp.pad(s, ((0, 0), (nope, 0)))
+            return jnp.concatenate([c, s], axis=-1)
+
+        def jax_ref_rope(x, cs):
+            c, s = cs[:, : rope.LANE], cs[:, rope.LANE :]
             if x.ndim == 3:
                 c = c[:, None, :]
                 s = s[:, None, :]
-            x_pass, x_rot = x[..., :-rot_dim], x[..., -rot_dim:]
+            x_pass, x_rot = x[..., : -rope.LANE], x[..., -rope.LANE :]
             rotated = jnp.stack([-x_rot[..., 1::2], x_rot[..., 0::2]], axis=-1).reshape(
                 x_rot.shape
             )
@@ -976,27 +959,26 @@ class TestRopeCallAndPublicWrappers:
             q = (y * scale_inv).astype(quant_dtype)
             return q, jnp.squeeze(scale, -1)
 
-        def jax_ref_qnorm_rope(x, pos, cache, eps=1e-6, inverse=False):
+        def jax_ref_qnorm_rope(x, cs, eps=1e-6):
             rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
-            return jax_ref_rope(x * rms, pos, cache, inverse=inverse)
+            return jax_ref_rope(x * rms, cs)
 
-        def fake_pallas_call(
-            kernel,
-            out_shape=None,
-            grid_spec=None,
-            input_output_aliases=None,
-            compiler_params=None,
-            name=None,
-        ):
-            def runner(pos, x, cache):
+        names = []
+
+        def fake_pallas_call(kernel, *, out_shape=None, name=None, **kwargs):
+            names.append(name)
+            if "cos_sin" in name:
+                inverse = kernel.keywords["inverse"]
+                return lambda pos, cache: jax_ref_cos_sin(pos, cache, inverse)
+
+            def runner(x, cs):
+                assert cs.shape == (x.shape[0], 2 * rope.LANE)
                 if "qnorm" in name:
-                    return jax_ref_qnorm_rope(x, pos, cache, inverse=False)
+                    return jax_ref_qnorm_rope(x, cs)
                 elif "quant" in name:
-                    return jax_ref_quant(
-                        jax_ref_rope(x, pos, cache, inverse=False), jnp.float8_e4m3fn
-                    )
+                    return jax_ref_quant(jax_ref_rope(x, cs), jnp.float8_e4m3fn)
                 else:
-                    return jax_ref_rope(x, pos, cache, inverse=False)
+                    return jax_ref_rope(x, cs)
 
             return runner
 
@@ -1028,3 +1010,7 @@ class TestRopeCallAndPublicWrappers:
             q3, sc3 = rope.rope_quant(x3_q, pos, cache, inverse=False)
             assert q3.shape == (16, 4, 128)
             assert sc3.shape == (16, 4)
+
+            # Every wrapper reads the shared, fixed-name step table.
+            assert "rope_cos_sin" in names
+            assert "rope_cos_sin_inverse" in names
