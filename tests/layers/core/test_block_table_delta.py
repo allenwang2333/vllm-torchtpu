@@ -244,6 +244,25 @@ def test_capacity_overflow_falls_back_to_full(builders, monkeypatch):
         assert torch.equal(got[gid], want[gid])
     assert stager.num_delta == 1
 
+    # Single-block fast path capacity overflow (3 single-block appends > cap=2)
+    monkeypatch.setattr(btd, "DELTA_CAPACITY", 2)
+    for b in builders:
+        b.bt.append_row([21], 0)
+    got = _stage(runner, 1, seq, 2)
+    want = _reference(builders, 1, seq, 2, 0)
+    for gid in want:
+        assert torch.equal(got[gid], want[gid])
+    assert stager.num_full == 3
+
+    # Full-row rewrite path capacity overflow (add_row changes > cap=2 entries)
+    for b in builders:
+        b.bt.add_row([30, 31, 32], 0)
+    got = _stage(runner, 1, seq, 2)
+    want = _reference(builders, 1, seq, 2, 0)
+    for gid in want:
+        assert torch.equal(got[gid], want[gid])
+    assert stager.num_full == 4
+
 
 def test_disabled_dummy_and_single_group_paths(builders, monkeypatch):
     monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "0")
@@ -336,8 +355,11 @@ def test_warm_reuses_zero_update_and_device_copy_not_cloned(builders):
 def test_empty_append_row_cached_tables_and_active_cols_cache(builders, monkeypatch):
     monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "1")
     monkeypatch.setenv("TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", "0")
-    runner = _make_runner(builders)
-    for b in builders:
+    # Include two groups with identical block_size=16 to exercise cross-group
+    # active_cols_cache and prev_plan sharing on single-block decode appends.
+    same_bs_builders = builders + [_Builder(3, _make_block_table(16), 16)]
+    runner = _make_runner(same_bs_builders)
+    for b in same_bs_builders:
         btd.ensure_tracked(b.bt)
         b.bt.append_row([1, 2], 0)
         mut_before = b.bt._bt_mutations
@@ -349,6 +371,12 @@ def test_empty_append_row_cached_tables_and_active_cols_cache(builders, monkeypa
     first = _stage(runner, 1, [8, 0], 2)
     second = _stage(runner, 1, [8, 0], 2)
     assert second is first
+    for b in same_bs_builders:
+        b.bt.append_row([3], 0)
+    got = _stage(runner, 1, [8, 0], 2)
+    want = _reference(same_bs_builders, 1, [8, 0], 2, 0)
+    for gid in want:
+        assert torch.equal(got[gid], want[gid])
     stager = runner._block_table_delta_stager
     assert stager.get_cached_tables(("missing",)) is None
     stager.set_cached_tables(("missing",), {})
@@ -365,4 +393,7 @@ def test_empty_append_row_cached_tables_and_active_cols_cache(builders, monkeypa
     builders[0].bt.add_row(list(range(1, 20)), 0)
     _stage(runner, 1, [4, 0], 2)
     builders[0].bt.append_row([99], 0)
+    _stage(runner, 1, [4, 0], 2)
+    # Also exercise multi-block append beyond active_cols in the general path
+    builders[0].bt.append_row([100, 101], 0)
     _stage(runner, 1, [4, 0], 2)

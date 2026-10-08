@@ -269,6 +269,45 @@ class DFlashProposer:
                 return p
         return target_len
 
+    def _can_reuse_staged_block_tables(
+        self,
+        chunk_ctx: AttentionMetadataBuilderContext | None,
+        draft_ctx: AttentionMetadataBuilderContext,
+        padded_num_reqs: int,
+    ) -> dict[int, torch.Tensor] | None:
+        """Return `chunk_ctx.staged_block_tables` when its draft-group tables
+        already match `padded_num_reqs` and `draft_ctx`'s active column bound."""
+        staged_tables = getattr(chunk_ctx, "staged_block_tables", None)
+        attn_groups = getattr(self.runner, "attn_groups", None)
+        if (
+            chunk_ctx is None
+            or not staged_tables
+            or chunk_ctx.position_ids_override is not None
+            or not attn_groups
+            or not self._draft_attn_layer_names
+        ):
+            return None
+        matched = False
+        for group_list in attn_groups:
+            for group in group_list:
+                if not any(
+                    name in self._draft_attn_layer_names for name in group.layer_names
+                ):
+                    continue
+                matched = True
+                builder = group.metadata_builders[0]
+                staged = staged_tables.get(builder.kv_cache_group_id)
+                if staged is None:
+                    return None
+                _, tnb = builder._block_table_geometry(draft_ctx)
+                if staged.numel() != padded_num_reqs * tnb:
+                    return None
+                if builder._active_block_table_columns(
+                    draft_ctx, tnb
+                ) > builder._active_block_table_columns(chunk_ctx, tnb):
+                    return None
+        return staged_tables if matched else None
+
     def _build_attn_metadata_for_draft(
         self,
         *,
@@ -282,6 +321,7 @@ class DFlashProposer:
         padded_num_reqs: int,
         seq_lens_cpu: tuple[int, ...] | None = None,
         max_active_seq_len: int | None = None,
+        chunk_ctx: AttentionMetadataBuilderContext | None = None,
     ) -> dict:
         """Build the draft layers' attention metadata. The real path and
         the dummies share this so they dispatch the identical programs.
@@ -291,7 +331,7 @@ class DFlashProposer:
             "load_model() must run before draft attention metadata is built"
         )
         saved_ctx = runner._attn_metadata_builder_ctx
-        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+        draft_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=start_index,
             use_max_model_len=use_max_model_len,
@@ -302,6 +342,10 @@ class DFlashProposer:
             seq_lens_cpu=seq_lens_cpu,
             max_active_seq_len=max_active_seq_len,
         )
+        draft_ctx.staged_block_tables = self._can_reuse_staged_block_tables(
+            chunk_ctx, draft_ctx, padded_num_reqs
+        )
+        runner._attn_metadata_builder_ctx = draft_ctx
         try:
             # Only the draft layers' KV cache groups. The full build walks
             # every group in the deployment and we would discard all but
@@ -361,6 +405,7 @@ class DFlashProposer:
             padded_num_reqs=padded_num_reqs,
             seq_lens_cpu=chunk_seq_lens_cpu,
             max_active_seq_len=draft_max_seq_len,
+            chunk_ctx=chunk_ctx,
         )
 
     def _prepare_dflash_inputs(

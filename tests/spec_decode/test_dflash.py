@@ -726,3 +726,88 @@ def test_build_draft_attn_metadata_propagates_max_active_seq_len():
         chunk, num_tokens_padded=10, seq_lens=torch.tensor([2048, 125], device=device)
     )
     assert captured_ctxs[-1].max_active_seq_len == 2048
+
+
+def test_build_draft_attn_metadata_reuses_target_staged_block_tables():
+    device = torch.device("cpu")
+    proposer = _make_proposer(draft_tp=1)
+    proposer._draft_attn_layer_names = {"draft_layer"}
+    captured_ctxs = []
+
+    def fake_build(layer_names, padded_num_reqs):
+        captured_ctxs.append(proposer.runner._attn_metadata_builder_ctx)
+        return {"draft_layer": "ok"}
+
+    class _FakeBuilder:
+        def __init__(self, gid: int, tnb: int):
+            self.kv_cache_group_id = gid
+            self.tnb = tnb
+
+        def _block_table_geometry(self, _ctx):
+            return None, self.tnb
+
+        def _active_block_table_columns(self, ctx, tnb):
+            if getattr(ctx, "max_active_seq_len", 0) > 512:
+                return min(tnb, 64)
+            return min(tnb, 16)
+
+    target_group = SimpleNamespace(
+        layer_names=["target_layer"],
+        metadata_builders=[_FakeBuilder(0, 64)],
+    )
+    draft_group = SimpleNamespace(
+        layer_names=["draft_layer"],
+        metadata_builders=[_FakeBuilder(1, 64)],
+    )
+    proposer.runner = SimpleNamespace(
+        device=device,
+        _attn_metadata_builder_ctx=None,
+        attn_groups=[[target_group, draft_group]],
+        build_attention_metadata_for_layers=fake_build,
+    )
+    chunk = _make_chunk(
+        num_reqs=2,
+        start_index=0,
+        device=device,
+        query_start_loc_np=np.array([0, 2, 4], dtype=np.int32),
+        position_ids=torch.zeros(4, dtype=torch.int32, device=device),
+    )
+    chunk.attn_ctx.max_active_seq_len = 100
+    # num_tokens_padded=10, block_size=5 -> padded_num_reqs=2; tnb=64 -> numel=128
+    staged_tables = {1: torch.ones(128, dtype=torch.int32)}
+    chunk.attn_ctx.staged_block_tables = staged_tables
+
+    # 1. Matching shape and active_cols -> reuses staged_tables directly
+    proposer._build_draft_attn_metadata(
+        chunk, num_tokens_padded=10, seq_lens=torch.tensor([105, 105], device=device)
+    )
+    assert captured_ctxs[-1].staged_block_tables is staged_tables
+
+    # 2. Active column bucket grows across chunk -> draft boundary (510 -> 515 > 512)
+    chunk.attn_ctx.max_active_seq_len = 510
+    proposer._build_draft_attn_metadata(
+        chunk, num_tokens_padded=10, seq_lens=torch.tensor([515, 105], device=device)
+    )
+    assert captured_ctxs[-1].staged_block_tables is None
+
+    # 3. Padded request count mismatch (num_tokens_padded=20 -> padded_num_reqs=4)
+    chunk.attn_ctx.max_active_seq_len = 100
+    proposer._build_draft_attn_metadata(
+        chunk, num_tokens_padded=20, seq_lens=torch.tensor([105, 105], device=device)
+    )
+    assert captured_ctxs[-1].staged_block_tables is None
+
+    # 4. Missing draft group id in staged_block_tables
+    chunk.attn_ctx.staged_block_tables = {0: torch.ones(128, dtype=torch.int32)}
+    proposer._build_draft_attn_metadata(
+        chunk, num_tokens_padded=10, seq_lens=torch.tensor([105, 105], device=device)
+    )
+    assert captured_ctxs[-1].staged_block_tables is None
+
+    # 5. No matching draft group in attn_groups
+    chunk.attn_ctx.staged_block_tables = staged_tables
+    proposer.runner.attn_groups = [[target_group]]
+    proposer._build_draft_attn_metadata(
+        chunk, num_tokens_padded=10, seq_lens=torch.tensor([105, 105], device=device)
+    )
+    assert captured_ctxs[-1].staged_block_tables is None
