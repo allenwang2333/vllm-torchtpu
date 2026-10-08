@@ -50,11 +50,13 @@ def _pre_gates(
     comb_mix = jax.nn.softmax(comb_logits, axis=-1) + hc_sinkhorn_eps
     comb_mix = comb_mix / (jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps)
 
-    def normalize(_, value):
-        value = value / (jnp.sum(value, axis=-1, keepdims=True) + hc_sinkhorn_eps)
-        return value / (jnp.sum(value, axis=-2, keepdims=True) + hc_sinkhorn_eps)
-
-    comb_mix = jax.lax.fori_loop(0, sinkhorn_repeat - 1, normalize, comb_mix)
+    for _ in range(sinkhorn_repeat - 1):
+        comb_mix = comb_mix / (
+            jnp.sum(comb_mix, axis=-1, keepdims=True) + hc_sinkhorn_eps
+        )
+        comb_mix = comb_mix / (
+            jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps
+        )
     return pre_mix, post_mix, comb_mix
 
 
@@ -287,21 +289,23 @@ def delayed_pre_flat_jax(
     dim = width // mult
     constants = (rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats)
     mixes = mult * (mult + 2)
-    if tokens < 64 or tokens % 64 or 3 * mixes > 128:
+    if 3 * mixes > 128 or (
+        tokens not in (64, 96, 128, 256) and (tokens < 1024 or tokens % 64 != 0)
+    ):
         return _delayed_pre_flat_small(flat, fn, scale, base, previous_pre, *constants)
-    tile = 128 if tokens % 128 == 0 else 64
+    tile = tokens if tokens <= 128 else (128 if tokens == 256 else 64)
     weight = fn if fn.dtype == jnp.bfloat16 else _pack_mix_weight(fn)
     mixes, square, value = _flat_pre_sums(flat, weight, previous_pre, mixes, tile)
     new_pre, post, comb = _pre_gates(mixes, square, mult, dim, scale, base, *constants)
     return post[..., None], comb, value, new_pre
 
 
-def _post_jax(
+def _post_streams_jax(
     x: jax.Array,
     flat: jax.Array,
     post_layer_mix: jax.Array,
     comb_res_mix: jax.Array,
-) -> jax.Array:
+) -> list[jax.Array]:
     """XLA 2D stream recombine matching `_post_kernel` accumulation order."""
     mult = comb_res_mix.shape[-1]
     dim = flat.shape[-1] // mult
@@ -317,7 +321,47 @@ def _post_jax(
         for i in range(mult):
             acc = acc + comb[:, i, j : j + 1] * streams[i]
         out_streams.append(acc.astype(flat.dtype))
-    return jnp.concatenate(out_streams, axis=1)
+    return out_streams
+
+
+def _post_jax(
+    x: jax.Array,
+    flat: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+) -> jax.Array:
+    """Concatenated `[T, M*D]` residual from `_post_streams_jax`."""
+    return jnp.concatenate(
+        _post_streams_jax(x, flat, post_layer_mix, comb_res_mix), axis=1
+    )
+
+
+def _post_and_collapse_jax(
+    x: jax.Array,
+    flat: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    previous_pre: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Fused stream recombine and collapse before `optimization_barrier`.
+
+    Collapsing directly from the recombined stream slices avoids re-reading
+    `flat_new [T, M*D]` from HBM in a separate `_collapse_flat` fusion after
+    the barrier while preserving `_collapse_flat`'s `(s0 + s2) + (s1 + s3)`
+    accumulation order.
+    """
+    out_streams = _post_streams_jax(x, flat, post_layer_mix, comb_res_mix)
+    flat_new = jnp.concatenate(out_streams, axis=1)
+    terms = [
+        previous_pre[:, m : m + 1] * s.astype(jnp.float32)
+        for m, s in enumerate(out_streams)
+    ]
+    value = (
+        (terms[0] + terms[2]) + (terms[1] + terms[3])
+        if len(terms) == 4
+        else functools.reduce(jnp.add, terms)
+    )
+    return flat_new, value.astype(flat.dtype)
 
 
 def _flat_post_pre_sums(
@@ -423,20 +467,29 @@ def delayed_post_pre_flat_jax(
     dim = width // mult
     constants = (rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats)
     mixes = mult * (mult + 2)
-    if tokens < 64 or tokens % 64 or 3 * mixes > 128:
-        flat_new = jax.lax.optimization_barrier(
-            _post_jax(
+    if 3 * mixes > 128 or (
+        tokens not in (64, 96, 128, 256) and (tokens < 1024 or tokens % 64 != 0)
+    ):
+        flat_new, value = jax.lax.optimization_barrier(
+            _post_and_collapse_jax(
                 x,
                 flat,
                 post_layer_mix,
                 comb_res_mix,
+                previous_pre,
             )
         )
-        post, comb, value, new_pre = _delayed_pre_flat_small(
-            flat_new, fn, scale, base, previous_pre, *constants
+        post, comb, _, new_pre = delayed_pre_jax(
+            flat_new.reshape(tokens, mult, dim),
+            flat_new,
+            fn,
+            scale,
+            base,
+            previous_pre,
+            *constants,
         )
         return flat_new, post, comb, value, new_pre
-    tile = 64
+    tile = tokens if tokens <= 128 else (128 if tokens == 256 else 64)
     weight = fn if fn.dtype == jnp.bfloat16 else _pack_mix_weight(fn)
     flat_new, mixes_out, square, value = _flat_post_pre_sums(
         x.reshape(tokens, dim).astype(flat.dtype),
