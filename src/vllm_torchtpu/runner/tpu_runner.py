@@ -1376,6 +1376,7 @@ class TPUModelRunner(GPUModelRunner):
         self.mesh = self._create_mesh_for_parallelism()
         self.batch_counter = 0
         self._qwen35_mk: Any = None
+        self._qwen35_mtp_mk: Any = None
         self._in_precompile_backbone: bool = False
 
         # Pipeline parallelism: this worker runs one stage's layer slice.
@@ -6504,6 +6505,14 @@ class TPUModelRunner(GPUModelRunner):
             from vllm_torchtpu.kernels.qwen35_megakernel import Qwen35Megakernel
 
             self._qwen35_mk = Qwen35Megakernel.maybe_create(self)
+        if os.environ.get("VLLM_TPU_QWEN35_MTP_MK", "0") == "1" and hasattr(
+            self.drafter, "attach_mtp_megakernel"
+        ):
+            from vllm_torchtpu.kernels.qwen35_megakernel import Qwen35MtpMegakernel
+
+            mtp_mk = Qwen35MtpMegakernel.maybe_create(self)
+            if mtp_mk is not None and self.drafter.attach_mtp_megakernel(mtp_mk):
+                self._qwen35_mtp_mk = mtp_mk
 
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
@@ -8074,6 +8083,16 @@ class TPUModelRunner(GPUModelRunner):
                 self._qwen35_mk.bind_caches(self)
                 if not self.enforce_eager:
                     self._qwen35_mk.warmup(self)
+        if self._qwen35_mtp_mk is not None:
+            try:
+                # Unbound, the drafter routes no step to it.
+                self._qwen35_mtp_mk.bind_caches(self)
+            except Exception:
+                logger.warning(
+                    "Qwen3.5 MTP megakernel disabled: could not bind the draft "
+                    "KV cache.",
+                    exc_info=True,
+                )
         if self.enforce_eager:
             return
         with self.maybe_setup_dummy_loras(self.lora_config):
@@ -8119,7 +8138,13 @@ class TPUModelRunner(GPUModelRunner):
         roots = [self.model]
         drafter = getattr(self, "drafter", None)
         if drafter is not None:
-            for attr in ("draft_model", "_mtp_loop_model", "_mtp_fused_loop"):
+            for attr in (
+                "draft_model",
+                "_mtp_loop_model",
+                "_mtp_fused_loop",
+                "_mtp_mk_step0",
+                "_mtp_fused_loop_mk",
+            ):
                 m = getattr(drafter, attr, None)
                 if m is not None:
                     roots.append(m)
@@ -8633,6 +8658,8 @@ class TPUModelRunner(GPUModelRunner):
                         self._warmup_spec_batch(int(R), P_small, greedy=True)
                         self._warmup_spec_batch(int(R), P_small, greedy=False)
         logger.info("spec-decode warmup compiled %d graphs", self.num_xla_graphs - n0)
+        if self._qwen35_mtp_mk is not None:
+            self.drafter.check_mtp_megakernel_warm()
 
     def _warmup_spec_batch(self, R: int, P: int, greedy: bool = True) -> None:
         """Warm an nr=R decode batch: prefill R synthetic requests then decode
