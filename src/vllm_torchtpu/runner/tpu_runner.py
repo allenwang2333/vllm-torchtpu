@@ -2623,6 +2623,7 @@ class TPUModelRunner(GPUModelRunner):
             and pre_next_tokens_cpu.ndim == 2
             and pre_request_seq_lens[0][0] == 0
             and pre_request_seq_lens[-1][0] == n_reqs - 1
+            and len(gen_lens) == n_reqs
             and all(gen_lens)
             and [req_id_to_index.get(r[3]) for r in pre_request_seq_lens]
             == list(range(n_reqs))

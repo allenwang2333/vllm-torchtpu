@@ -2966,3 +2966,39 @@ def test_assemble_async_spec_substitution_padded_single_chunk_and_prefill_bootst
     # Empty prefill bootstrap returns spec_num_rejected = None
     _, _, boot_rej_empty, _ = runner._assemble_async_prefill_bootstrap(drafts, [], [])
     assert boot_rej_empty is None
+
+
+def test_modify_prev_results_vectorized_skips_when_req_ids_exceed_seq_lens():
+    """req_ids may list more rows than request_seq_lens (a request left the
+    batch); the vectorized commit must fall back instead of broadcasting
+    gen_lens (len 3) against the committed rows (len 2)."""
+    from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
+
+    req0 = SimpleNamespace(req_id="req-0", output_token_ids=[0, 0])
+    req1 = SimpleNamespace(req_id="req-1", output_token_ids=[0, 0])
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            req_id_to_index={"req-0": 0, "req-1": 1},
+            num_tokens_no_spec=np.array([14, 20], dtype=np.int32),
+            token_ids_cpu=np.zeros((2, 32), dtype=np.int32),
+        ),
+    )
+    copy_state = AsyncTPUCopyState(
+        chunks_cpu=[torch.tensor([[10, 11], [20, 21], [30, 31]], dtype=torch.int32)],
+        chunk_real_lens=[3],
+        copy_ready_event=None,
+        completed=True,
+    )
+    runner._pre_async_results = SimpleNamespace(
+        req_ids=["req-0", "req-1", "req-gone"],
+        request_seq_lens=[(0, req0, 10, "req-0"), (1, req1, 12, "req-1")],
+        discard_sampled_tokens_req_indices=[],
+        num_draft_per_req={0: 1, 1: 1},
+        copy_state=copy_state,
+    )
+    TPUModelRunner._modify_prev_results(runner)
+    assert req0.output_token_ids == [10, 11]
+    assert req1.output_token_ids == [20, 21]
+    assert runner.input_batch.num_tokens_no_spec.tolist() == [14, 20]
+    assert runner.input_batch.token_ids_cpu[0, 12:14].tolist() == [10, 11]
+    assert runner.input_batch.token_ids_cpu[1, 18:20].tolist() == [20, 21]
