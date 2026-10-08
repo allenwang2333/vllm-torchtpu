@@ -13,6 +13,37 @@
 # limitations under the License.
 
 steps:
+  # A release is a build of release/X.Y.Z started by hand. Like a wait, this
+  # block holds the step below until someone approves; main skips it. This
+  # pipeline runs no tests, so the approver checks that the vllm-torchtpu-ci
+  # build of this commit passed.
+  - block: ":rotating_light: Approve vllm-torchtpu release"
+    key: "approve_release"
+    if: 'build.branch =~ /^release\//'
+    prompt: "Did the vllm-torchtpu-ci build of this commit pass? Build and publish this release?"
+    # TODO(release-approvers): limit who can unblock to a Buildkite team.
+    # Read by publish_nightly_images.sh from build meta-data.
+    fields:
+      - select: "Move the latest tag on Docker Hub to this version?"
+        key: "dockerhub_move_latest"
+        hint: "Choose No for a release candidate or for a patch to an older release."
+        required: true
+        options:
+          - label: "Yes"
+            value: "yes"
+          - label: "No"
+            value: "no"
+      - select: "Overwrite X.Y.Z if it is already on Docker Hub?"
+        key: "dockerhub_overwrite"
+        hint: "Released tags should not change; choose Yes only to replace a broken image."
+        required: true
+        default: "no"
+        options:
+          - label: "No"
+            value: "no"
+          - label: "Yes"
+            value: "yes"
+
   - group: "Publish Nightly Docker Images"
     key: "publish_nightly_images_group"
     steps:
@@ -20,5 +51,20 @@ steps:
         key: "publish_nightly_images"
         agents:
           queue: cpu_64_core
+        env:
+          # Also push to Docker Hub: dev from main, prod from release/X.Y.Z.
+          # This pipeline, not the public vllm-torchtpu-ci, holds the secret.
+          PUBLISH_DOCKERHUB: "1"
+          # TODO(docker-hub): replace this dummy repo with the real Docker Hub repo, e.g. vllm/vllm-torchtpu.
+          DOCKERHUB_REPO: "test/vllm-torchtpu"
+        # TODO(docker-hub): the secret name configured in the Buildkite cluster.
+        # secrets:
+        #   - DOCKERHUB_TOKEN
+        # plugins:
+        #   - docker-login#v3.0.0:
+        #       # TODO(docker-hub): the Docker Hub bot account with push access to
+        #       # DOCKERHUB_REPO. Login fails until this is set.
+        #       username: "REPLACE_WITH_DOCKERHUB_USERNAME"
+        #       password-env: DOCKERHUB_TOKEN
         commands:
           - bash .buildkite/scripts/publish_nightly_images.sh
