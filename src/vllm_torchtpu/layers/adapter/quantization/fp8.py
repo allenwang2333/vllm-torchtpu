@@ -70,6 +70,7 @@ from vllm_torchtpu.kernels.quantized_matmul.fp8_skinny import TUNED, padded_n
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
+    fused_moe_decode_layer,
     fused_moe_gmm,
     prebuild_fused_moe_kernel,
 )
@@ -1031,6 +1032,63 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             # sufficient on its own; it has to exist.
             register_score_bias_buffer(layer)
 
+    def tpu_fused_decode_shared_operands(
+        self, layer: RoutedExperts, x: torch.Tensor, shared_mlp: torch.nn.Module
+    ) -> tuple[torch.Tensor, ...] | None:
+        """TPU_MOE_FUSED_DECODE_LAYER gate, decided before the MoE runs.
+
+        Returns the shared expert's (w13 [H, 2*Is], w13_scale [2*Is],
+        w2 [Is, H], w2_scale [H]) when this batch takes the dense-expert
+        decode kernel AND the shared MLP is a plain per-channel FP8 SwiGLU
+        whose separate path is ``xla_quantized_matmul`` -- the numerics the
+        kernel reproduces. Otherwise None, and nothing changes.
+        """
+        if not envs.TPU_MOE_FUSED_DECODE_LAYER or x.dtype != torch.bfloat16:
+            return None
+        if self._use_adaptive_fused_moe or enable_pipelined_collective_and_compute():
+            return None
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+
+        if fused_moe_ep_supported(self):
+            return None
+        shared = _fused_decode_shared_weights(shared_mlp)
+        if shared is None:
+            return None
+        import jax
+
+        from vllm_torchtpu.layers.core import fused_moe_gmm as _gmm
+
+        operands = (
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
+            *shared,
+        )
+        if any(t is None or t.dtype not in _TORCH_TO_JNP_DTYPE for t in operands):
+            return None
+
+        def sds(t):
+            if t is None:
+                return None
+            return jax.ShapeDtypeStruct(tuple(t.shape), _TORCH_TO_JNP_DTYPE[t.dtype])
+
+        if not _gmm.fused_decode_layer_admits(
+            sds(x),
+            sds(layer.w13_weight),
+            sds(layer.w2_weight),
+            sds(layer.w13_weight_scale_inv),
+            sds(layer.w2_weight_scale_inv),
+            sds(getattr(layer, "w13_bias", None)),
+            sds(getattr(layer, "w2_bias", None)),
+            tuple(sds(t) for t in shared),
+            activation=self._tpu_activation_str,
+            skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS,
+        ):
+            return None
+        return shared
+
     def apply_monolithic(
         self,
         layer: RoutedExperts,
@@ -1099,6 +1157,28 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 is_local_tensor=enable_pipelined_collective_and_compute(),
             )
 
+        # TPU_MOE_FUSED_DECODE_LAYER: the runner admitted this batch and
+        # skipped the separate shared expert; it is run inside the kernel.
+        fused_decode = getattr(layer, "_tpu_fused_decode_layer", None)
+        if fused_decode is not None:
+            shared, routed_scale = fused_decode
+            return fused_moe_decode_layer(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+                getattr(layer, "w13_bias", None),
+                getattr(layer, "w2_bias", None),
+                topk_weights,
+                topk_ids,
+                layer._experts_start,
+                shared,
+                topk=layer.moe_config.experts_per_token,
+                activation=activation_str,
+                routed_scale=routed_scale,
+            )
+
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).
         kwargs = {
@@ -1119,6 +1199,65 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)
+
+
+_TORCH_TO_JNP_DTYPE: dict = {}
+
+
+def _init_dtype_map() -> None:
+    import jax.numpy as jnp
+
+    _TORCH_TO_JNP_DTYPE.update(
+        {
+            torch.bfloat16: jnp.bfloat16,
+            torch.float32: jnp.float32,
+            torch.float8_e4m3fn: jnp.float8_e4m3fn,
+            torch.int32: jnp.int32,
+        }
+    )
+
+
+_init_dtype_map()
+
+
+def _fused_decode_shared_weights(
+    shared_mlp: torch.nn.Module,
+) -> tuple[torch.Tensor, ...] | None:
+    """(w13, w13_scale, w2, w2_scale) of a fusable shared expert, else None.
+
+    Fusable = gate_up_proj -> SiluAndMul -> down_proj, both linears on this
+    file's per-channel FP8 method in the canonical (k, n) layout, no bias, not
+    routed to the TPU_FP8_LINEAR_PALLAS kernel, and a down_proj that does not
+    reduce its own output (the MoE all-reduce covers it).
+    """
+    gate_up = getattr(shared_mlp, "gate_up_proj", None)
+    down = getattr(shared_mlp, "down_proj", None)
+    act = getattr(shared_mlp, "act_fn", None)
+    if gate_up is None or down is None or type(act).__name__ != "SiluAndMul":
+        return None
+    if getattr(down, "reduce_results", True):
+        return None
+    out = []
+    for linear in (gate_up, down):
+        if not isinstance(
+            getattr(linear, "quant_method", None), VllmFp8LinearMethodTPU
+        ):
+            return None
+        if getattr(linear, "bias", None) is not None:
+            return None
+        if not getattr(linear, WEIGHT_FLIPPED_ATTR, False) or getattr(
+            linear, KEEP_VLLM_LAYOUT_ATTR, False
+        ):
+            return None
+        if getattr(linear, FP8_PALLAS_N_ATTR, None) is not None:
+            return None
+        weight, scale = linear.weight, linear.weight_scale
+        if weight.dtype != torch.float8_e4m3fn or weight.ndim != 2:
+            return None
+        if scale.dtype != torch.float32 or tuple(scale.shape) != (weight.shape[1],):
+            return None
+        out += [weight, scale]
+    return tuple(out)
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):

@@ -23,6 +23,7 @@ from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
+    fused_moe_decode_layer_func,
     fused_moe_func,
     quantize_to_native_fp4_kmajor,
     requant_unpack_kmajor,
@@ -32,6 +33,7 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
+_fused_decode_layer_cache: dict[tuple[int, str, bool, Any, bool, float], Callable] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
@@ -291,4 +293,96 @@ def fused_moe_gmm(
         topk_weights,
         topk_ids,
         experts_start,
+    )
+
+
+def _get_fused_decode_layer_op(
+    *,
+    topk: int,
+    activation: str,
+    use_ep: bool,
+    rhs_quant_dtype,
+    skip_padded_tokens: bool,
+    routed_scale: float,
+) -> Callable:
+    """One custom op per static configuration, like the fused MoE op.
+
+    ``routed_scale`` is a model constant (identical on every rank), so binding
+    it into the closure keeps every EP rank's program identical.
+    """
+    key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens, routed_scale)
+    op = _fused_decode_layer_cache.get(key)
+    if op is not None:
+        return op
+    op = pallas.jax_op(
+        f"pallas::fused_moe_decode_layer_{_allocate_kernel_instance_id()}",
+        functools.partial(
+            fused_moe_decode_layer_func,
+            topk=topk,
+            activation=activation,
+            use_ep=use_ep,
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens,
+            routed_scale=routed_scale,
+        ),
+    )
+
+    def _fake(hidden_states, *args, **kwargs):
+        return torch.empty_like(hidden_states)
+
+    op.register_fake(_fake)
+    _fused_decode_layer_cache[key] = op
+    return op
+
+
+def fused_moe_decode_layer(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    w1_bias: torch.Tensor | None,
+    w2_bias: torch.Tensor | None,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    experts_start: torch.Tensor | None,
+    shared: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    topk: int,
+    activation: str,
+    routed_scale: float = 1.0,
+    rhs_quant_dtype=None,
+    skip_padded_tokens: bool | None = None,
+) -> torch.Tensor:
+    """TPU_MOE_FUSED_DECODE_LAYER: routed + shared expert in one kernel.
+
+    Same operands as fused_moe_gmm plus the shared expert's
+    (w13 [H, 2*Is], w13_scale [2*Is], w2 [Is, H], w2_scale [H]). The output
+    already contains the shared expert and ``routed_scale``; only the
+    all-reduce is left to the caller.
+    """
+    if skip_padded_tokens is None:
+        skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
+    use_ep = experts_start is not None
+    op = _get_fused_decode_layer_op(
+        topk=topk,
+        activation=activation,
+        use_ep=use_ep,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+        routed_scale=float(routed_scale),
+    )
+    if experts_start is None:
+        experts_start = torch.zeros((), dtype=torch.int32, device=hidden_states.device)
+    return op(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        topk_weights,
+        topk_ids,
+        experts_start,
+        *shared,
     )

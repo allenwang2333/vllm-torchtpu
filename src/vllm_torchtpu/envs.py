@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
+    TPU_MOE_FUSED_DECODE_LAYER: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -657,6 +658,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
         "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
     ),
+    # When a batch is admitted by the dense-expert decode MoE (see
+    # TPU_MOE_DENSE_EXPERT_THRESHOLD), run the EP remap, the coefficient and
+    # active-expert build and a per-channel FP8 shared expert inside the same
+    # Pallas kernel (moe_dense_expert_fused), and skip the separate shared
+    # expert linears, so the layer is router -> one kernel -> all-reduce.
+    # Prefill/mixed batches, unsupported layouts and the flag-off path are
+    # unchanged.
+    "TPU_MOE_FUSED_DECODE_LAYER": env_bool("TPU_MOE_FUSED_DECODE_LAYER"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

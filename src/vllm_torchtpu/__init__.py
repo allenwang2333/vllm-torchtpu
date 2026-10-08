@@ -385,6 +385,116 @@ def _patch_moe_explicit_pcp_collectives() -> None:
     )
 
 
+def _patch_moe_runner_fused_decode_layer() -> None:
+    """TPU_MOE_FUSED_DECODE_LAYER: run the shared expert inside the MoE kernel.
+
+    For a batch the dense-expert decode kernel admits, and a shared expert the
+    kernel can reproduce (``tpu_fused_decode_shared_operands``), the runner
+    skips the separate shared-expert linears and hands their weights to the
+    routed kernel, which also applies ``routed_scaling_factor`` to the routed
+    FP32 sum before adding the shared output. The runner then sees no shared
+    output and must not scale again, so the layer is router -> kernel ->
+    all-reduce. Every other batch, and the whole flag-off process, takes the
+    upstream methods untouched (the patch is not even installed when off).
+    """
+    from vllm_torchtpu import envs
+
+    if not envs.TPU_MOE_FUSED_DECODE_LAYER:
+        return
+    import torch
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as _mr
+    from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+        SharedExpertsOrder,
+    )
+
+    cls = _mr.MoERunner
+    if getattr(cls, "_tpu_fused_decode_layer_patch", False):
+        return
+    upstream_apply = cls._apply_quant_method
+    upstream_combine = cls._maybe_combine
+    upstream_scale = cls._maybe_apply_routed_scale_to_output
+
+    def fused_shared_operands(self, hidden_states, shared_experts_input, overlapping):
+        shared = self._shared_experts
+        if shared is None or overlapping or shared_experts_input is None:
+            return None
+        if (
+            self.routed_input_transform is not None
+            or self.routed_output_transform is not None
+            or self.shared_expert_gate is not None
+            or self.moe_config.is_sequence_parallel
+            or shared_experts_input.shape != hidden_states.shape
+            or not self.routed_experts.quant_method.is_monolithic
+        ):
+            return None
+        if hidden_states.dtype == torch.float16:
+            return None  # upstream scales the shared output instead
+        if (
+            shared._determine_shared_experts_order(shared_experts_input)
+            != SharedExpertsOrder.NO_OVERLAP
+        ):
+            return None
+        gate = getattr(self._quant_method, "tpu_fused_decode_shared_operands", None)
+        if gate is None:
+            return None
+        return gate(self.routed_experts, hidden_states, shared._layer)
+
+    def apply_quant_method(
+        self,
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids=None,
+        shared_experts_overlapping=False,
+    ):
+        self._tpu_fused_decode_pending = False
+        operands = fused_shared_operands(
+            self, hidden_states, shared_experts_input, shared_experts_overlapping
+        )
+        if operands is None:
+            return upstream_apply(
+                self,
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+                shared_experts_overlapping,
+            )
+        routed = self.routed_experts
+        routed._tpu_fused_decode_layer = (operands, float(self.routed_scaling_factor))
+        try:
+            fused_out = routed.forward_monolithic(
+                x=hidden_states, router_logits=router_logits, input_ids=input_ids
+            )
+        finally:
+            routed._tpu_fused_decode_layer = None
+        self._tpu_fused_decode_pending = True
+        return None, fused_out
+
+    def maybe_combine(self, shared_output, hidden_states):
+        if shared_output is None and getattr(self, "_tpu_fused_decode_pending", False):
+            # Upstream asserts a shared output whenever the layer has shared
+            # experts; it is inside hidden_states here. Pass a stand-in.
+            _, hidden_states = upstream_combine(self, hidden_states, hidden_states)
+            return None, hidden_states
+        return upstream_combine(self, shared_output, hidden_states)
+
+    def maybe_apply_routed_scale(self, shared_output, fused_output):
+        if getattr(self, "_tpu_fused_decode_pending", False):
+            self._tpu_fused_decode_pending = False
+            return shared_output, fused_output  # applied in-kernel
+        return upstream_scale(self, shared_output, fused_output)
+
+    cls._apply_quant_method = apply_quant_method
+    cls._maybe_combine = maybe_combine
+    cls._maybe_apply_routed_scale_to_output = maybe_apply_routed_scale
+    cls._tpu_fused_decode_layer_patch = True
+    logger.info(
+        "Applied TPU patch: TPU_MOE_FUSED_DECODE_LAYER runs the shared expert "
+        "inside the dense-expert decode kernel."
+    )
+
+
 def _patch_expert_map_host_lookup() -> None:
     """Build the expert map on the host and serve host readers from a copy.
 
