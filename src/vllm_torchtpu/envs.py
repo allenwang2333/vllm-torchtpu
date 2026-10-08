@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
+    TPU_DCP_MLA_CAPPED_PREP: bool = False
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     JAX_PLATFORMS: str = ""
@@ -364,6 +365,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is chunk * topk rows (~335 MB at 256), of which only the live windows
     # are written.
     "TPU_DCP_MLA_TOPK_CAP_CHUNK": env_int("TPU_DCP_MLA_TOPK_CAP_CHUNK", 256),
+    # Capped path: window-major physical rows once per call, live windows only.
+    "TPU_DCP_MLA_CAPPED_PREP": env_bool("TPU_DCP_MLA_CAPPED_PREP", default=False),
     # Opt in to the all-to-all DCP MLA lse merge for decode-sized steps.
     "TPU_DCP_LSE_MERGE_A2A": env_bool("TPU_DCP_LSE_MERGE_A2A", default=False),
     # Largest step (tokens) that uses it; above this, the reduce-scatter is

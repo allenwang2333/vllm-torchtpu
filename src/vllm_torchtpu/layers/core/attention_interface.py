@@ -1189,6 +1189,8 @@ def sparse_mla_attention_dcp(
             # Ranks own ~topk/dcp of each row: a static top-k width with an
             # exact in-kernel overflow pass for the rows that need more.
             topk_cap=topk_cap,
+            # Capped path: window-major physical rows once, live windows only.
+            capped_window_prep=envs.TPU_DCP_MLA_CAPPED_PREP,
             **chunk_kwargs,
         )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
