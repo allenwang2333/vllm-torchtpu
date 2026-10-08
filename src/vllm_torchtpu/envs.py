@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_SP: bool = False
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
     TPU_DEEPSEEK_V41_FUSED_SWA: bool = False
+    TPU_DEEPSEEK_V41_DECODE_LOCAL_Q: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
@@ -390,6 +391,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fold the sliding-window attention into the SparseMLA Pallas kernel for
     # small decode batches, replacing the XLA gather and partial softmax.
     "TPU_DEEPSEEK_V41_FUSED_SWA": env_bool("TPU_DEEPSEEK_V41_FUSED_SWA", default=False),
+    # Same token-local q / wo_a path for TP-replicated layers (the CED decoder
+    # at decode): each rank projects q for its contiguous T/tp token shard of
+    # the replicated qr with the all-gathered wq_b, so the q all_to_all
+    # disappears and the return all_to_all carries [T/tp, groups, o_lora_rank]
+    # instead of [T/tp, heads, head_dim]. Applies under the token-parallel
+    # attention gate (tokens >= 6 * tp). Costs replicated wq_b/wo_a HBM per
+    # rank on every such layer.
+    "TPU_DEEPSEEK_V41_DECODE_LOCAL_Q": env_bool(
+        "TPU_DEEPSEEK_V41_DECODE_LOCAL_Q", default=False
+    ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # Keep the staged block tables on device between steps and upload only

@@ -480,6 +480,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     _sp_sharded_input = False
     # True once `_init_local_q_weights` built the gathered weights.
     _local_q_attn = False
+    # True when that path takes the TP-replicated full ``qr`` and slices each
+    # rank's token shard itself (`TPU_DEEPSEEK_V41_DECODE_LOCAL_Q`).
+    _replicated_local_q = False
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads):
@@ -573,11 +576,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             hidden_states
         )
         qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
-        # This rank's SP token shard of qr, before the gather.
+        # This rank's SP token shard of qr, before the gather; or, for the
+        # replicated decode path, the full qr the op slices per rank.
         swa_kv = getattr(getattr(self, "swa_cache_layer", None), "kv_cache", None)
         qr_local = (
             qr
-            if self._sp_sharded_input
+            if (self._sp_sharded_input or self._replicated_local_q)
             and getattr(self, "_local_q_attn", False)
             and (
                 swa_kv is None
@@ -1350,6 +1354,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     self._swa_max_requests,
                     self._precompact_records,
                     int(self.head_dim),
+                    replicated_qr=self._replicated_local_q,
+                    fused_swa=envs.TPU_DEEPSEEK_V41_FUSED_SWA,
                 )
             assert q is not None
             if self._fp8_kv and self.compress_ratio:
@@ -1407,12 +1413,22 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         same rank-major head/group order the token-parallel ``all_to_all``
         uses, so every per-head/per-group product is computed from identical
         weights. FP8 tensors are gathered as bytes.
+
+        ``TPU_DEEPSEEK_V41_LOCAL_Q`` serves SP-sharded (encoder) layers;
+        ``TPU_DEEPSEEK_V41_DECODE_LOCAL_Q`` serves TP-replicated layers (the
+        CED decoder at decode), where the op slices each rank's token shard
+        from the full ``qr`` instead of taking an SP shard.
         """
         tp_size = get_tensor_model_parallel_world_size()
+        replicated = bool(
+            envs.TPU_DEEPSEEK_V41_DECODE_LOCAL_Q and not self._sp_sharded_input
+        )
+        sharded = bool(
+            envs.TPU_DEEPSEEK_V41_LOCAL_Q and not getattr(self, "_ced_decoder", False)
+        )
         if (
-            not envs.TPU_DEEPSEEK_V41_LOCAL_Q
+            not (replicated or sharded)
             or tp_size <= 1
-            or getattr(self, "_ced_decoder", False)
             or not (self._fp8_kv and self.compress_ratio)
             or self.n_local_groups != 1
         ):
@@ -1445,6 +1461,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         for name, value in buffers.items():
             self.register_buffer(name, value, persistent=False)
         self._local_q_attn = True
+        self._replicated_local_q = replicated
 
     def _select_paged_indices(
         self,

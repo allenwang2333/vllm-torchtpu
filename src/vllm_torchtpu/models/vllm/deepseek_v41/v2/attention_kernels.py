@@ -1435,6 +1435,8 @@ def initialize_paged_attention():
         max_requests: int | None,
         precompacted: bool,
         head_dim: int,
+        replicated_qr: bool = False,
+        fused_swa: bool = False,
     ) -> jax.Array:
         """q projection + RoPE, sparse FP8 attention and inverse-RoPE ``wo_a``.
 
@@ -1448,6 +1450,21 @@ def initialize_paged_attention():
         local ``wq_b``/``wo_a``. Per token, head and group both paths are the
         same quantized matmul, RoPE, attention and ``wo_a`` math as the unfused
         `_prepare_tpu` + ``_o_proj`` sequence.
+
+        ``replicated_qr`` (CED decoder layers at decode, where every rank holds
+        the whole batch's ``qr``): ``qr_local`` is the full ``[T, q_lora_rank]``
+        and each rank slices its own contiguous ``T/tp`` token shard, the same
+        split `fp8_attention`'s token-parallel body uses, under that body's
+        ``tokens >= 6 * tp`` gate. ``T/tp`` is padded to a multiple of 8 rows
+        for the attention call as there, so the SP gate's ``128 * tp`` multiple
+        is not needed. The q ``all_to_all`` (``[T/tp, heads, head_dim]`` in)
+        disappears and the return one shrinks ``head_dim / o_lora_rank *
+        groups / heads`` fold, at the cost of reading the gathered
+        ``wq_b_full`` / ``wo_a_full`` per layer.
+
+        ``fused_swa`` is `sparse_fp8_attention_jax`'s, decided on the rows each
+        body hands it (the padded ``T/tp`` shard or the full ``T``), exactly as
+        `fp8_attention` does.
         """
         from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
         from vllm_torchtpu.models.vllm.deepseek_v4.attention import (
@@ -1456,19 +1473,26 @@ def initialize_paged_attention():
         )
 
         tokens = positions.shape[0]
-        tokens_local = qr_local.shape[0]
         attn_kwargs = dict(
             scale=scale,
             page_size=page_size,
             max_requests=max_requests,
             precompacted=precompacted,
+            fused_swa=fused_swa,
         )
-        if (
-            tp_size > 1
-            and tokens >= 128 * tp_size
-            and tokens % (128 * tp_size) == 0
-            and tokens_local * tp_size == tokens
-        ):
+        if replicated_qr:
+            tokens_local = tokens // tp_size
+            use_local = tp_size > 1 and tokens >= 6 * tp_size and tokens % tp_size == 0
+        else:
+            tokens_local = qr_local.shape[0]
+            use_local = (
+                tp_size > 1
+                and tokens >= 128 * tp_size
+                and tokens % (128 * tp_size) == 0
+                and tokens_local * tp_size == tokens
+            )
+        if use_local:
+            pad_rows = -tokens_local % 8
 
             def _local_body(
                 q_in,
@@ -1495,10 +1519,22 @@ def initialize_paged_attention():
                 start = r_id.reshape(()) * tokens_local
                 pos_tok = jax.lax.dynamic_slice_in_dim(pos, start, tokens_local, axis=0)
                 ok_tok = jax.lax.dynamic_slice_in_dim(ok, start, tokens_local, axis=0)
+                if replicated_qr:
+                    q_in = jax.lax.dynamic_slice_in_dim(
+                        q_in, start, tokens_local, axis=0
+                    )
                 q_tok = _quantized_matmul_jax(q_in, wq, wqs)
                 q_tok = _rope_jax(
                     q_tok.reshape(tokens_local, -1, head_dim), pos_tok, cs
                 )
+                if pad_rows:
+                    q_tok = jnp.pad(q_tok, ((0, pad_rows), (0, 0), (0, 0)))
+                    s_r_tok = jnp.pad(
+                        s_r_tok, ((0, pad_rows), (0, 0)), constant_values=-1
+                    )
+                    m_r_tok = jnp.pad(
+                        m_r_tok, ((0, pad_rows), (0, 0)), constant_values=-1
+                    )
                 out_tok = sparse_fp8_attention_jax(
                     q_tok,
                     s_p,
@@ -1511,6 +1547,8 @@ def initialize_paged_attention():
                     f_snk,
                     **attn_kwargs,
                 )
+                if pad_rows:
+                    out_tok = out_tok[:-pad_rows]
                 out_tok = jnp.where(
                     ok_tok[:, None, None] != 0, out_tok, jnp.zeros((), out_tok.dtype)
                 )
@@ -1591,7 +1629,7 @@ def initialize_paged_attention():
         "pallas::dsv41v2_sparse_fp8_attention_qo",
         fp8_attention_qo,
         mesh=tp_mesh,
-        input_partition_specs=(P(),) * 23 + (None,) * 5,
+        input_partition_specs=(P(),) * 23 + (None,) * 7,
     )
     # [T, o_lora_rank]: positions is args[5], wo_a is args[17].
     _fp8_attention_qo_op.register_fake(
@@ -1630,6 +1668,8 @@ def initialize_paged_attention():
         max_requests: int | None,
         precompacted: bool,
         head_dim: int,
+        replicated_qr: bool = False,
+        fused_swa: bool = False,
     ) -> jax.Array:
         return fp8_attention_qo(
             qr,
@@ -1660,13 +1700,15 @@ def initialize_paged_attention():
             max_requests,
             precompacted,
             head_dim,
+            replicated_qr,
+            fused_swa,
         )
 
     _fp8_attention_qo_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_qo_2bank",
         fp8_attention_qo_2bank,
         mesh=tp_mesh,
-        input_partition_specs=(P(),) * 26 + (None,) * 5,
+        input_partition_specs=(P(),) * 26 + (None,) * 7,
     )
     # [T, o_lora_rank]: positions is args[5], wo_a is args[20].
     _fp8_attention_qo_2bank_op.register_fake(
@@ -1720,8 +1762,16 @@ def sparse_fp8_attention_qo(
     max_requests,
     precompacted,
     head_dim,
+    replicated_qr=False,
+    fused_swa=False,
 ):
-    """`fp8_attention_qo` entry: ``qr`` -> this rank's ``wo_b`` input ``[T, R]``."""
+    """`fp8_attention_qo` entry: ``qr`` -> this rank's ``wo_b`` input ``[T, R]``.
+
+    ``replicated_qr``: ``qr_local`` is the TP-replicated full ``qr`` (decoder
+    layers at decode) and the op slices each rank's token shard itself.
+    ``fused_swa`` is forwarded to `sparse_fp8_attention_jax` as
+    `sparse_fp8_attention` does.
+    """
     assert _fp8_attention_qo_op is not None and main.rope is not None
     page_size = main.shape[1]
     if pages is None:
@@ -1746,6 +1796,8 @@ def sparse_fp8_attention_qo(
         max_requests,
         precompacted,
         head_dim,
+        replicated_qr,
+        fused_swa,
     )
     if _has_hi_bank(main):
         assert (
