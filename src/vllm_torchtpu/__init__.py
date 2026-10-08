@@ -1558,6 +1558,20 @@ def _patch_vllm_block_pool_lifo_free() -> None:
     logger.info("Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")
 
 
+def _patch_vllm_owner_affine_block_pool() -> None:
+    """Allocate every KV block of a request from its owner rank's range.
+
+    With TPU_DEEPSEEK_V41_KV_SHARD=1 each TP rank stores only its own slice
+    of the KV pool, so the scheduler must keep each request on one rank. See
+    vllm_torchtpu.core.owner_affine_block_pool.
+    """
+    if not envs.TPU_DEEPSEEK_V41_KV_SHARD:
+        return
+    from vllm_torchtpu.core import owner_affine_block_pool
+
+    owner_affine_block_pool.install()
+
+
 def _patch_vllm_same_step_prefix_hits() -> None:
     """Keep prefix-cache hits off blocks the current step has not written.
 

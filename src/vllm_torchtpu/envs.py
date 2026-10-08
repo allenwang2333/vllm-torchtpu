@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA: bool = False
     TPU_DEEPSEEK_V41_SP: bool = False
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
+    TPU_DEEPSEEK_V41_KV_SHARD: bool = False
     TPU_DEEPSEEK_V41_FUSED_SWA: bool = False
     TPU_DEEPSEEK_V41_DECODE_LOCAL_Q: bool = False
     TPU_K3_SP_PREFILL: bool = False
@@ -388,6 +389,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # o_group on that shard, shrinking both attention all_to_alls.
     # Costs replicated wq_b/wo_a HBM per rank.
     "TPU_DEEPSEEK_V41_LOCAL_Q": env_bool("TPU_DEEPSEEK_V41_LOCAL_Q", default=False),
+    # Shard V4.1 MQA KV and Indexer K cache blocks across TP ranks by request
+    # owner (each rank stores 1/TP of them) using owner-rank token-parallel
+    # decode attention and indexer scoring. SWA and compressor-state blocks
+    # stay replicated on every rank.
+    "TPU_DEEPSEEK_V41_KV_SHARD": env_bool("TPU_DEEPSEEK_V41_KV_SHARD", default=False),
     # Fold the sliding-window attention into the SparseMLA Pallas kernel for
     # small decode batches, replacing the XLA gather and partial softmax.
     "TPU_DEEPSEEK_V41_FUSED_SWA": env_bool("TPU_DEEPSEEK_V41_FUSED_SWA", default=False),
