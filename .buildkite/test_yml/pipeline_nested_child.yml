@@ -24,10 +24,10 @@ steps:
     commands:
       - sleep 60
 
-  - label: ":err: Nested err"
-    key: "nested_err"
-    depends_on: "nested_w60s"
-    agents:
-      queue: cpu
-    commands:
-      - exit 1
+  # - label: ":err: Nested err"
+  #   key: "nested_err"
+  #   depends_on: "nested_w60s"
+  #   agents:
+  #     queue: cpu
+  #   commands:
+  #     - exit 1
