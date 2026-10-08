@@ -1356,15 +1356,13 @@ def sparse_mla_attention_dcp(
                 q_pe=q_pe,
                 lse_lane_dense=True,
             )
-            lse = jnp.where(owns[:, None], lse, -jnp.inf)
-            return (kv_cache_nope, kv_cache_rope, output, lse)
-
-        # Decode-sized chunks: query tokens per attention grid step.
-        small_chunk_batch = envs.TPU_DCP_MLA_SMALL_CHUNK_BATCH
-        if small_chunk_batch < 1:
-            raise ValueError(
-                f"TPU_DCP_MLA_SMALL_CHUNK_BATCH must be >= 1, got {small_chunk_batch}"
-            )
+        else:
+            # Decode-sized chunks: query tokens per attention grid step.
+            small_chunk_batch = envs.TPU_DCP_MLA_SMALL_CHUNK_BATCH
+            if small_chunk_batch < 1:
+                raise ValueError(
+                    f"TPU_DCP_MLA_SMALL_CHUNK_BATCH must be >= 1, got {small_chunk_batch}"
+                )
         output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,
