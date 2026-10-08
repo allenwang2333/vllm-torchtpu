@@ -45,6 +45,7 @@ scaling.
    - Returns output tensor
 """
 
+import time
 from math import lcm
 from typing import TYPE_CHECKING, Any, cast
 
@@ -633,6 +634,9 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         # standalone utility PR.
         assert isinstance(layer, RoutedExperts)
         layer = cast("TpuRoutedExperts", layer)
+        if static_root := envs.TPU_DSV41_STATIC_MOE_DIR:
+            self._load_static_moe(layer, static_root)
+            return
         device = layer.w13_weight.device
 
         activation_str = self._set_tpu_activation(layer)
@@ -747,6 +751,86 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 "DeepSeek-V4 MXFP4 fused EP W4A8 enabled: block-%d",
                 REQUANTIZED_BLOCK_SIZE,
             )
+
+    def _load_static_moe(self, layer: "TpuRoutedExperts", root: str) -> None:
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            FUSED_MOE_EP_OP_ATTR,
+            fused_moe_ep_unsupported_reason,
+            register_score_bias_buffer,
+        )
+        from vllm_torchtpu.layers.adapter.quantization.static_dsv41_moe import (
+            load_layer,
+        )
+
+        if (
+            getattr(layer, "w13_bias", None) is not None
+            or getattr(layer, "w2_bias", None) is not None
+        ):
+            raise ValueError("Static DSv4.1 MoE does not support expert biases")
+        if not layer.moe_config.moe_parallel_config.use_ep:
+            raise ValueError("Static DSv4.1 MoE requires expert parallelism")
+        activation = self._set_tpu_activation(layer)
+        local_experts = layer.local_num_experts
+        op = self._prebuild_w4a8(
+            layer,
+            activation,
+            torch.empty(
+                (local_experts, 5120, 5120), dtype=torch.bfloat16, device="meta"
+            ),
+            torch.empty(
+                (local_experts, 2560, 5120), dtype=torch.bfloat16, device="meta"
+            ),
+            2304,
+        )
+        if op is None:
+            raise ValueError("Static DSv4.1 MoE requires fused EP W4A8 block-512")
+        started = time.monotonic()
+        device = layer.w13_weight.device
+        w13, w2, s13, s2 = load_layer(root, layer, device)
+        self._release_source_weights(layer)
+        layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+        layer.w13_weight_scale = torch.nn.Parameter(s13, requires_grad=False)
+        layer.w2_weight_scale = torch.nn.Parameter(s2, requires_grad=False)
+        synchronize_tensors([layer.w13_weight, layer.w2_weight])
+
+        moe_routing.validate_linear_ep_placement(layer)
+        moe_routing.register_experts_start_buffer(layer, device=device)
+        prebuild_fused_moe_kernel(
+            topk=layer.moe_config.experts_per_token,
+            activation=activation,
+            use_ep=True,
+            rhs_quant_dtype=jnp.float4_e2m1fn,
+        )
+        setattr(self, FUSED_MOE_EP_OP_ATTR, op)
+        reason = fused_moe_ep_unsupported_reason(
+            layer,
+            (
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+            ),
+            activation,
+            weight_format="fp4",
+            rhs_qb=REQUANTIZED_BLOCK_SIZE,
+            supplies_hash_ids=True,
+        )
+        if reason is not None:
+            raise ValueError(f"Static DSv4.1 MoE layout rejected: {reason}")
+        register_score_bias_buffer(layer)
+        layer.register_buffer(
+            "_tpu_fused_w13_scale", s13.squeeze(2).contiguous(), persistent=False
+        )
+        layer.register_buffer(
+            "_tpu_fused_w2_scale", s2.squeeze(2).contiguous(), persistent=False
+        )
+        logger.info(
+            "Static DSv4.1 MoE loaded %s: %d experts, %.2f s",
+            layer.layer_name,
+            local_experts,
+            time.monotonic() - started,
+        )
 
     def _forward_monolithic_tpu(
         self,
