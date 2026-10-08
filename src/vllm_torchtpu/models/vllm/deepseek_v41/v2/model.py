@@ -949,6 +949,15 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
             raise NotImplementedError(
                 "V4.1 TPU currently requires PP1 and DP1 (or DP with EP)"
             )
+        engram_config = getattr(vllm_config, "engram_config", None)
+        if getattr(engram_config, "dp_shared_memory", False) is True:
+            # TPU shards Engram heads across the node-local DP group and
+            # gathers hash ids for it (common/engram.py); a DP-shared host
+            # table would skip that gather while the heads stay sharded.
+            raise NotImplementedError(
+                "V4.1 TPU Engram shards tables across DP ranks; "
+                "engram dp_shared_memory is not supported"
+            )
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         if spec_cfg is not None and getattr(spec_cfg, "method", None) not in (
             "dspark",

@@ -297,15 +297,24 @@ class TestHostEngram:
                 out_exact = gather_host_engram_hashes(hashes)
                 assert out_exact.shape == (2, 1, 2)
 
-            # 2c. ValueError when shape[0] > slot
+            # 2c. A non-positive gathered slot (dummy run) falls back to the
+            # local token count instead of raising.
+            with patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.engram_gathered_num_tokens",
+                return_value=0,
+            ):
+                out_fallback = gather_host_engram_hashes(hashes)
+                assert out_fallback.shape == (2, 1, 2)
+
+            # 2d. ValueError when shape[0] > slot > 0
             with (
                 patch(
                     "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.engram_gathered_num_tokens",
-                    return_value=0,
+                    return_value=1,
                 ),
                 pytest.raises(ValueError, match="exceeds the DP token slot"),
             ):
-                gather_host_engram_hashes(hashes)
+                gather_host_engram_hashes(torch.cat([hashes, hashes]))
 
         # 3. CPU group all_gather without forward context (dp_metadata is None)
         with (

@@ -569,6 +569,7 @@ class Engram(upstream.Engram):
         self._staged_raw: torch.Tensor | None = None
         self._active_raw: torch.Tensor | None = None
         self._active_rows: torch.Tensor | None = None
+        self._dp_staged: torch.Tensor | None = None
         self._staged_by_tokens: dict[int, torch.Tensor] = {}
         self._staged_views_by_tokens: dict[int, torch.Tensor] = {}
         self._staged_rows_by_tokens: dict[int, torch.Tensor] = {}
@@ -693,6 +694,11 @@ class Engram(upstream.Engram):
             self._active_raw = self._staged_views(num_tokens)
             return
         super().prepare_embeddings(hash_ids)
+        if _embed_dp_size(self) > 1:
+            # HBM table under DP: the gathered ids are `dp * slot` rows; keep
+            # the slice so `_ready_rows` reads the group's slot from it instead
+            # of re-deriving it from the forward context inside the stage.
+            self._dp_staged = self.staged_rows[: hash_ids.shape[0]]
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
         dp_size = _embed_dp_size(self)
@@ -705,10 +711,11 @@ class Engram(upstream.Engram):
             )
         if self._staged_raw is None:
             if dp_size > 1:
-                slot = _engram_dp_slot(num_tokens)
-                return _dp_gather_engram_rows(
-                    self.staged_rows[: slot * dp_size], num_tokens
-                )
+                staged = getattr(self, "_dp_staged", None)
+                if staged is None:
+                    slot = _engram_dp_slot(num_tokens)
+                    staged = self.staged_rows[: slot * dp_size]
+                return _dp_gather_engram_rows(staged, num_tokens)
             return super()._ready_rows(num_tokens)
         _, cols, head_dim = self._host_raw.shape
         blocks = self._host_scale.shape[-1]
