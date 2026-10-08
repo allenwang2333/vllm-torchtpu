@@ -2217,29 +2217,39 @@ class TPUModelRunner(GPUModelRunner):
             if cached_prefix is not None and len(cached_prefix) == num_reqs:
                 pos_arr = cached_prefix
             else:
-                req_id_to_index = self._pre_async_results.req_id_to_index_copy
+                get_req_idx = self._pre_async_results.req_id_to_index_copy.get
                 req_ids = self.input_batch.req_ids
-                pos_arr = np.array(
-                    [
-                        req_id_to_index.get(req_ids[start_index + i], -1)
+                pos_arr = np.fromiter(
+                    (
+                        get_req_idx(req_ids[start_index + i], -1)
                         for i in range(num_reqs)
-                    ],
+                    ),
                     dtype=np.int32,
+                    count=num_reqs,
                 )
             valid_reqs = pos_arr >= 0
             if not valid_reqs.any():
                 return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
             if valid_reqs.all():
                 total_sched = int(num_scheduled_tokens_per_req.sum())
-                cur_indices = np.arange(total_sched, dtype=np.int32)
+                arange_np = getattr(self, "arange_np", None)
+                cur_indices = (
+                    arange_np[:total_sched]
+                    if arange_np is not None
+                    else np.arange(total_sched, dtype=np.int32)
+                )
                 first_sched = int(num_scheduled_tokens_per_req[0])
                 if (
                     total_sched == num_reqs * first_sched
                     and (num_scheduled_tokens_per_req == first_sched).all()
                 ):
+                    sched_arange = (
+                        arange_np[:first_sched]
+                        if arange_np is not None
+                        else np.arange(first_sched, dtype=np.int32)
+                    )
                     pre_indices = (
-                        pos_arr[:, None] * stride
-                        + np.arange(first_sched, dtype=np.int32)[None, :]
+                        pos_arr[:, None] * stride + sched_arange[None, :]
                     ).reshape(-1)
                 else:
                     offsets = np.concatenate(
@@ -2308,15 +2318,18 @@ class TPUModelRunner(GPUModelRunner):
             # Fast path 1: Direct device token slicing for 1:1 steady-state decode
             # Bypasses the _substitute_placeholder_token kernel entirely when unpadded
             n_subst = len(token_in_tpu_cur_input_indices)
+            arange_np = getattr(self, "arange_np", None)
+            identity_indices = (
+                arange_np[:n_subst]
+                if arange_np is not None
+                else np.arange(n_subst, dtype=np.int32)
+            )
             if (
                 n_subst == len(input_ids)
-                and np.array_equal(
-                    token_in_tpu_cur_input_indices,
-                    np.arange(len(input_ids), dtype=np.int32),
-                )
+                and np.array_equal(token_in_tpu_cur_input_indices, identity_indices)
                 and np.array_equal(
                     token_in_tpu_pre_next_tokens_indices,
-                    np.arange(len(input_ids), dtype=np.int32),
+                    identity_indices,
                 )
             ):
                 next_tpu = self._pre_async_results.next_tokens_tpu.flatten().to(
@@ -2982,17 +2995,16 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 end_index = num_reqs
         max_num_scheduled_tokens_all_reqs = max(num_scheduled_tokens_per_req)
-        num_scheduled_tokens_per_req = np.array(
-            num_scheduled_tokens_per_req, dtype=np.int32
-        )
         total_num_scheduled_tokens = sum(num_scheduled_tokens_per_req)
-        assert max_num_scheduled_tokens_all_reqs > 0
-
         num_reqs = len(num_scheduled_tokens_per_req)
+        num_scheduled_tokens_per_req = np.fromiter(
+            num_scheduled_tokens_per_req, dtype=np.int32, count=num_reqs
+        )
+        assert max_num_scheduled_tokens_all_reqs > 0
 
         sequence_layout_planner = _get_sequence_layout_planner_for_runner(self)
         sequence_layout_planner.reserve_host_token_capacity(
-            self, int(total_num_scheduled_tokens)
+            self, total_num_scheduled_tokens
         )
 
         if self.uses_mrope:
@@ -3038,41 +3050,51 @@ class TPUModelRunner(GPUModelRunner):
                     start_pos : start_pos + total_num_scheduled_tokens,
                 ]
             )
+        elif total_num_scheduled_tokens == num_reqs * max_num_scheduled_tokens_all_reqs:
+            # Fast path for uniform multi-token steps (e.g., steady-state
+            # speculative decode where every request schedules 1 + K tokens):
+            # compute positions_np and token_indices via 2D broadcasting without
+            # np.repeat, np.tile, or 1D req_indices fancy indexing.
+            k_sched = max_num_scheduled_tokens_all_reqs
+            base_pos = self.input_batch.num_computed_tokens_cpu[
+                start_index : start_index + num_reqs
+            ]
+            arange_k = self.arange_np[:k_sched][None, :]
+            positions_np = self.positions_np[:total_num_scheduled_tokens]
+            np.add(
+                base_pos[:, None],
+                arange_k,
+                out=positions_np.reshape(num_reqs, k_sched),
+            )
+            req_rows = self.arange_np[start_index : start_index + num_reqs]
+            row_bases = (base_pos + req_rows * self.input_batch.token_ids_cpu.shape[1])[
+                :, None
+            ]
+            token_indices = (row_bases + arange_k).reshape(-1)
+            torch.index_select(
+                self.input_batch.token_ids_cpu_tensor.flatten(),
+                0,
+                torch.from_numpy(token_indices),
+                out=self.input_ids_cpu[:total_num_scheduled_tokens],
+            )
         else:
-            # General path: mixed prefill + decode.
-            # Get request indices.
+            # General path: mixed prefill + decode with heterogeneous token counts.
             req_indices = np.repeat(
                 self.arange_np[start_index : start_index + num_reqs],
                 num_scheduled_tokens_per_req,
             )
-
-            # Get batched arange.
-            # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-            if (
-                total_num_scheduled_tokens
-                == num_reqs * max_num_scheduled_tokens_all_reqs
-            ):
-                arange = np.tile(
-                    self.arange_np[:max_num_scheduled_tokens_all_reqs], num_reqs
-                )
-            else:
-                arange = np.concatenate(
-                    [self.arange_np[:n] for n in num_scheduled_tokens_per_req]
-                )
-
-            # Get positions.
+            arange = np.concatenate(
+                [self.arange_np[:n] for n in num_scheduled_tokens_per_req]
+            )
             positions_np = self.positions_np[:total_num_scheduled_tokens]
             np.add(
                 self.input_batch.num_computed_tokens_cpu[req_indices],
                 arange,
                 out=positions_np,
             )
-
-            # Get token indices.
             token_indices = (
                 positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
             )
-
             torch.index_select(
                 self.input_batch.token_ids_cpu_tensor.flatten(),
                 0,
@@ -3107,7 +3129,7 @@ class TPUModelRunner(GPUModelRunner):
             # prepare_real() may repack input_ids_cpu in place. Preserve only
             # the real request-major prefix before crossing that boundary.
             request_major_input_ids_cpu = self.input_ids_cpu.narrow(
-                0, 0, int(total_num_scheduled_tokens)
+                0, 0, total_num_scheduled_tokens
             ).clone()
 
         if use_max_model_len:
@@ -3125,7 +3147,7 @@ class TPUModelRunner(GPUModelRunner):
             start_index=start_index,
             num_reqs=num_reqs,
             num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
-            total_num_scheduled_tokens=int(total_num_scheduled_tokens),
+            total_num_scheduled_tokens=total_num_scheduled_tokens,
             use_max_model_len=use_max_model_len,
             target_num_reqs=target_num_reqs,
             padded_num_reqs=padded_num_reqs,
@@ -3194,14 +3216,12 @@ class TPUModelRunner(GPUModelRunner):
                 subtract_num_rejected_tokens,
             )
 
-            req_id_to_index = self._pre_async_results.req_id_to_index_copy
+            get_req_idx = self._pre_async_results.req_id_to_index_copy.get
             req_ids = self.input_batch.req_ids
-            seq_idx_prefix = np.array(
-                [
-                    req_id_to_index.get(req_ids[start_index + i], -1)
-                    for i in range(num_reqs)
-                ],
+            seq_idx_prefix = np.fromiter(
+                (get_req_idx(req_ids[start_index + i], -1) for i in range(num_reqs)),
                 dtype=np.int32,
+                count=num_reqs,
             )
             self._last_async_seq_idx_prefix = seq_idx_prefix
             reject_subtract_key = (
@@ -3260,24 +3280,28 @@ class TPUModelRunner(GPUModelRunner):
         # Speculative decoding metadata.
         spec_decode_metadata = None
         if self.speculative_config:
-            num_draft_tokens = np.array(
-                [
-                    len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
-                    for req_id in self.input_batch.req_ids[
-                        start_index : start_index + num_reqs
-                    ]
-                ],
-                dtype=np.int32,
-            )
-            if num_draft_tokens.any():
-                spec_decode_metadata = (
-                    self.spec_decode_manager.get_spec_decode_metadata(
-                        num_draft_tokens,
-                        self.query_start_loc_np[1 : num_reqs + 1],
-                        padded_num_reqs,
-                        skip_host_draft_tokens=skip_host_draft_tokens,
-                    )
+            sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+            if sched_spec_tokens:
+                get_spec = sched_spec_tokens.get
+                num_draft_tokens = np.fromiter(
+                    (
+                        len(get_spec(req_id, ()))
+                        for req_id in self.input_batch.req_ids[
+                            start_index : start_index + num_reqs
+                        ]
+                    ),
+                    dtype=np.int32,
+                    count=num_reqs,
                 )
+                if num_draft_tokens.any():
+                    spec_decode_metadata = (
+                        self.spec_decode_manager.get_spec_decode_metadata(
+                            num_draft_tokens,
+                            self.query_start_loc_np[1 : num_reqs + 1],
+                            padded_num_reqs,
+                            skip_host_draft_tokens=skip_host_draft_tokens,
+                        )
+                    )
 
         # For decode-only and steady-state spec-verify steps, cache constant
         # device tensors to skip H2D. query_start_loc, logits_indices, and

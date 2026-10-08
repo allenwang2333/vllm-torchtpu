@@ -1227,3 +1227,101 @@ def test_td73_spec_bookkeeping_and_acceptance_fast_paths():
     )
     assert idx_map_discard == {"req-1": 1}
     assert num_tokens_no_spec.tolist() == [7, 8]
+
+
+def test_td713_prepare_inputs_uniform_2d_broadcast_and_fast_subst():
+    # 1. _apply_async_token_substitution with _fast_token_substitution=True
+    fast_runner = SimpleNamespace(
+        _pre_async_results=SimpleNamespace(
+            next_tokens_tpu=torch.tensor([101, 102, 103, 104], dtype=torch.int32)
+        ),
+        _fast_token_substitution=True,
+        arange_np=np.arange(16, dtype=np.int32),
+        device=torch.device("cpu"),
+    )
+    input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    idx4 = np.arange(4, dtype=np.int32)
+    out_fast = TPUModelRunner._apply_async_token_substitution(
+        fast_runner, input_ids, idx4, idx4
+    )
+    assert out_fast.tolist() == [101, 102, 103, 104]
+
+    # 2. _prepare_inputs uniform multi-token 2D broadcast and empty spec tokens
+    max_num_reqs = 2
+    max_model_len = 32
+    token_ids_cpu = np.arange(max_num_reqs * max_model_len, dtype=np.int32).reshape(
+        max_num_reqs, max_model_len
+    )
+    positions_cpu = torch.full((max_model_len,), -1, dtype=torch.int32)
+    query_start_loc_cpu = torch.zeros(max_num_reqs + 1, dtype=torch.int32)
+    seq_lens_cpu = torch.zeros(max_num_reqs, dtype=torch.int32)
+    prep_runner = SimpleNamespace(
+        reorder_batch_threshold=1,
+        sequence_layout_planner=AllSequenceLayoutPlanner(),
+        _dp_target_bucket=None,
+        input_batch=SimpleNamespace(
+            num_reqs=2,
+            req_ids=["req-0", "req-1"],
+            num_computed_tokens_cpu=np.array([4, 10], dtype=np.int32),
+            token_ids_cpu=token_ids_cpu,
+            token_ids_cpu_tensor=torch.from_numpy(token_ids_cpu),
+            num_prompt_tokens=np.full(max_num_reqs, 4, dtype=np.int32),
+        ),
+        _wait_input_staging_fence=lambda: None,
+        most_model_len=None,
+        num_reqs_max_model_len=max_num_reqs,
+        num_reqs_most_model_len=max_num_reqs,
+        max_num_reqs=max_num_reqs,
+        uses_mrope=False,
+        arange_np=np.arange(max_model_len, dtype=np.int32),
+        positions_cpu=positions_cpu,
+        positions_np=positions_cpu.numpy(),
+        input_ids_cpu=torch.full((max_model_len,), -1, dtype=torch.int32),
+        query_start_loc_cpu=query_start_loc_cpu,
+        query_start_loc_np=query_start_loc_cpu.numpy(),
+        seq_lens_cpu=seq_lens_cpu,
+        seq_lens_np=seq_lens_cpu.numpy(),
+        _check_attention_schedule=lambda *a: None,
+        _pcp_enabled=False,
+        _mtp_enabled=False,
+        device=torch.device("cpu"),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        _pre_async_results=None,
+        _decode_device_cache_key=None,
+        _request_distribution_cpu=torch.zeros(3, dtype=torch.int32),
+        _has_mamba_state=False,
+        mamba_slot_read_offsets=None,
+        _mamba_ckpt_window=1,
+        _unified_kv_layout=False,
+        empty_slot_mappings=None,
+        _build_attention_metadata=lambda **kw: ({}, None),
+        lora_config=None,
+        _collect_mamba_state_seed_copies=lambda *a: None,
+        num_tokens_paddings=[8, 16, 32],
+        pcp_size=1,
+        dcp_size=1,
+        _prepare_async_token_substitution_indices=lambda s, n, arr: (
+            np.array([], dtype=np.int32),
+            np.array([], dtype=np.int32),
+        ),
+    )
+    sched_uniform = SimpleNamespace(
+        total_num_scheduled_tokens=8,
+        num_scheduled_tokens={"req-0": 4, "req-1": 4},
+        scheduled_spec_decode_tokens={"req-0": [], "req-1": []},
+    )
+    TPUModelRunner._prepare_inputs(
+        prep_runner, sched_uniform, start_index=0, num_decode_reqs=0
+    )
+    assert prep_runner.positions_np[:8].tolist() == [4, 5, 6, 7, 10, 11, 12, 13]
+    assert prep_runner.input_ids_cpu[:8].tolist() == [
+        4,
+        5,
+        6,
+        7,
+        32 + 10,
+        32 + 11,
+        32 + 12,
+        32 + 13,
+    ]
