@@ -101,4 +101,4 @@ FULL = MKDConfig(R=16, L=78, first_dense=3, H=6144, NH=64, QL=2048)
 
 TINY = MKDConfig(R=4, L=5, first_dense=1, H=512, NH=8, QL=256, DN=64, DV=128,
                  E=8, TOPK=2, I=256, IS=512, ID=512, IH=4, KT=256, idx_freq=2,
-                 idx_skip=1, page=64, RPR=2)
+                 idx_skip=1, page=128, RPR=2, QB=128)
