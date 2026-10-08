@@ -42,6 +42,7 @@ class _BypassRef(_BaseBufferedRef):
         return dataclasses.replace(self, src_ref=src_ref, dst_ref=dst_ref)
 
     @classmethod
+    # pyrefly: ignore[bad-override]
     def create(
         cls,
         spec: pl.BlockSpec,
@@ -70,6 +71,7 @@ class _BypassRef(_BaseBufferedRef):
         )
 
     @abc.abstractmethod
+    # pyrefly: ignore[bad-override]
     def copy_in(
         self,
         step: int | jax.Array,
@@ -79,6 +81,7 @@ class _BypassRef(_BaseBufferedRef):
         pass
 
     @abc.abstractmethod
+    # pyrefly: ignore[bad-override]
     def wait_in(
         self,
         step: int | jax.Array,
@@ -88,6 +91,7 @@ class _BypassRef(_BaseBufferedRef):
         pass
 
     @abc.abstractmethod
+    # pyrefly: ignore[bad-override]
     def copy_out(
         self,
         step: int | jax.Array,
@@ -97,6 +101,7 @@ class _BypassRef(_BaseBufferedRef):
         pass
 
     @abc.abstractmethod
+    # pyrefly: ignore[bad-override]
     def wait_out(
         self,
         step: int | jax.Array,

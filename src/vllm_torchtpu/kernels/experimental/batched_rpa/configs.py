@@ -233,7 +233,7 @@ class RpaConfigs:
         return self.block.batch_size
 
     def seq_range(
-        self, distribution: jax.Array
+        self, distribution: jax.Array | jax.Ref
     ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
         """Sequences this kernel call schedules.
 

@@ -384,7 +384,7 @@ def generate_mask(
 
 
 def rpa_body(
-    step: int | jax.Array,
+    step: jax.Array,
     slot: int | jax.Array,
     # Inputs.
     q_vref: jax.Ref,
@@ -412,6 +412,7 @@ def rpa_body(
 ):
     del slot
 
+    # pyrefly: ignore[bad-assignment]
     kv_in_vref = pltpu.annotate(kv_in_vref, no_hazard_no_deps=True)
 
     # Step 1: Fetch the metadata the stitch needs. Everything the mask needs is
