@@ -56,7 +56,14 @@ class SpeculativeDecodingManager:
         # as (cpu_tensor, ready_event, req_ids snapshot). See
         # stage_draft_token_ids_for_host.
         self._staged_draft_copy: (
-            tuple[torch.Tensor, torch.Event | None, list[str]] | None
+            tuple[
+                torch.Tensor,
+                torch.Event | None,
+                list[str],
+                tuple[int, ...],
+                torch.Tensor,
+            ]
+            | None
         ) = None
         self.spec_token_ids: dict[str, list[int]] = {}
         # Content-keyed cache for get_spec_decode_metadata: 7 of its 8 device
@@ -74,11 +81,11 @@ class SpeculativeDecodingManager:
             # For async scheduling: the engine only asks when a step carries
             # structured-output requests, to swap real drafts into the
             # deferred grammar-bitmask computation.
-            drafts_cpu, ready_event, req_ids = self._staged_draft_copy
+            drafts_cpu, ready_event, req_ids, drafts_shape, _ = self._staged_draft_copy
             self._staged_draft_copy = None
             if ready_event is not None:
                 ready_event.synchronize()
-            return DraftTokenIds(req_ids, drafts_cpu.tolist())
+            return DraftTokenIds(req_ids, drafts_cpu.reshape(drafts_shape).tolist())
         if self._draft_token_ids is None:
             return None
         num_reqs = self.runner.input_batch.num_reqs
@@ -102,12 +109,22 @@ class SpeculativeDecodingManager:
             f"drafts rows {drafts.shape[0]} != num_reqs {num_reqs}"
         )
         req_ids = list(self.runner.input_batch.req_ids[:num_reqs])
-        drafts_cpu = drafts.to("cpu", non_blocking=True)
+        drafts_shape = tuple(drafts.shape)
+        # Flatten 2D+ drafts to 1D before D2H copy to hit PJRT's 1D 32-bit fast
+        # path (tpu_linearizer.cc:37) and retain device tensor until sync.
+        drafts_flat = drafts.reshape(-1) if drafts.ndim > 1 else drafts
+        drafts_cpu = drafts_flat.to("cpu", non_blocking=True)
         ready_event = None
         if drafts.device.type != "cpu":
             ready_event = torch.tpu.Event()
             ready_event.record()
-        self._staged_draft_copy = (drafts_cpu, ready_event, req_ids)
+        self._staged_draft_copy = (
+            drafts_cpu,
+            ready_event,
+            req_ids,
+            drafts_shape,
+            drafts_flat,
+        )
 
     def propose_draft_token_ids(
         self,
@@ -269,11 +286,13 @@ class SpeculativeDecodingManager:
         num_sampled_tokens = num_draft_tokens + 1
 
         # Step 1. cu_num_sampled_tokens
-        cu_num_sampled_tokens = np.cumsum(num_sampled_tokens)
+        cu_num_sampled_tokens = np.cumsum(num_sampled_tokens, dtype=np.int32)
+        cu_sampled_starts = cu_num_sampled_tokens - num_sampled_tokens
 
         arange_cpu_np = self.runner.arange_np
 
-        arange = np.concatenate([arange_cpu_np[:n] for n in num_sampled_tokens])
+        rep_sampled_starts = np.repeat(cu_sampled_starts, num_sampled_tokens)
+        arange = arange_cpu_np[: rep_sampled_starts.shape[0]] - rep_sampled_starts
 
         # Step 2. logits_indices for all tokens (draft + target)
         logits_indices = np.repeat(
@@ -286,13 +305,15 @@ class SpeculativeDecodingManager:
         # Compute the bonus logits indices.
         bonus_logits_indices = cu_num_sampled_tokens - 1
 
-        # Compute the target logits indices
-        target_logits_indices = np.repeat(
-            cu_num_sampled_tokens - num_sampled_tokens, num_draft_tokens
+        # Compute the target logits indices and within-segment group indices.
+        cu_draft_tokens = np.cumsum(num_draft_tokens, dtype=np.int32)
+        rep_draft_starts = np.repeat(
+            cu_draft_tokens - num_draft_tokens, num_draft_tokens
         )
-
-        arange_draft = np.concatenate([arange_cpu_np[:n] for n in num_draft_tokens])
-        target_logits_indices += arange_draft
+        group_indices = arange_cpu_np[: rep_draft_starts.shape[0]] - rep_draft_starts
+        target_logits_indices = (
+            np.repeat(cu_sampled_starts, num_draft_tokens) + group_indices
+        )
 
         # The host indexing just below and the async device path both read
         # logits_indices[target_logits_indices + 1], the bonus slot must stay
@@ -337,11 +358,6 @@ class SpeculativeDecodingManager:
 
         segment_ids = np.repeat(
             np.arange(num_draft_tokens.shape[0], dtype=np.int64), num_draft_tokens
-        )
-        group_indices = (
-            np.concatenate([np.arange(n, dtype=np.int32) for n in num_draft_tokens])
-            if num_draft_tokens.any()
-            else np.array([], dtype=np.int32)
         )
 
         padded_segment_ids = np.full(

@@ -1154,3 +1154,76 @@ def test_td68_attention_metadata_and_runner_optimizations():
     assert prep_runner._attn_metadata_builder_ctx.query_start_loc_cpu is None
     assert prep_runner._attn_metadata_builder_ctx.seq_lens_cpu is None
     assert prep_runner._attn_metadata_builder_ctx.prompt_lens_cpu is None
+
+
+def test_td73_spec_bookkeeping_and_acceptance_fast_paths():
+    from vllm_torchtpu.runner.tpu_runner_async_output import (
+        INVALID_TOKEN_ID,
+        AsyncPreResults,
+        AsyncTPUCopyState,
+    )
+
+    num_tokens_no_spec = np.array([4, 6], dtype=np.int32)
+    token_ids_cpu = np.zeros((2, 16), dtype=np.int32)
+    token_ids_cpu[0, :4] = [1, 2, 3, 4]
+    token_ids_cpu[1, :6] = [10, 20, 30, 40, 50, 60]
+    req0 = SimpleNamespace(req_id="req-0", output_token_ids=[101, 102])
+    req1 = SimpleNamespace(req_id="req-1", output_token_ids=[201, 202])
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            req_id_to_index={"req-0": 0, "req-1": 1},
+            num_tokens_no_spec=num_tokens_no_spec,
+            token_ids_cpu=token_ids_cpu,
+        ),
+        _pre_async_results=None,
+    )
+
+    # 1. Empty request_seq_lens in _update_placeholder
+    assert TPUModelRunner._update_placeholder(runner, [], [], {}) == {}
+
+    # 2. Heterogeneous num_draft_per_req in contiguous _update_placeholder fast path
+    req_seq_lens = [(0, req0, 4, "req-0"), (1, req1, 6, "req-1")]
+    num_draft_hetero = {0: 3, 1: 1}
+    idx_map = TPUModelRunner._update_placeholder(
+        runner, [], req_seq_lens, {0: 0, 1: 1}, num_draft_hetero
+    )
+    assert idx_map == {"req-0": 0, "req-1": 1}
+    # req-0 advanced by 1+3=4 (to 8), req-1 advanced by 1+1=2 (to 8)
+    assert num_tokens_no_spec.tolist() == [8, 8]
+    assert req0.output_token_ids == [101, 102, 0, 0, 0, 0]
+    assert req1.output_token_ids == [201, 202, 0, 0]
+
+    # 3. _modify_prev_results contiguous fast path with heterogeneous num_draft_per_req
+    #    and AsyncTPUCopyState (1D-flattened chunk reshaped back to 2D)
+    sampled_2d = torch.tensor(
+        [
+            [11, 12, 13, INVALID_TOKEN_ID],
+            [21, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+        ],
+        dtype=torch.int32,
+    )
+    with patch.object(torch, "tpu", SimpleNamespace(Event=MagicMock()), create=True):
+        copy_state = AsyncTPUCopyState.from_device_chunks([sampled_2d], [2])
+    runner._pre_async_results = AsyncPreResults(
+        req_ids=["req-0", "req-1"],
+        next_tokens_tpu=torch.zeros(8, dtype=torch.int32),
+        request_seq_lens=req_seq_lens,
+        discard_sampled_tokens_req_indices=[],
+        req_id_to_index_copy={"req-0": 0, "req-1": 1},
+        copy_state=copy_state,
+        num_draft_per_req=num_draft_hetero,
+    )
+    TPUModelRunner._modify_prev_results(runner)
+    # req-0 committed 3 tokens (4+3=7), req-1 committed 1 token (6+1=7)
+    assert num_tokens_no_spec.tolist() == [7, 7]
+    assert req0.output_token_ids == [101, 102, 11, 12, 13]
+    assert req1.output_token_ids == [201, 202, 21]
+    assert token_ids_cpu[0, :7].tolist() == [1, 2, 3, 4, 11, 12, 13]
+    assert token_ids_cpu[1, :7].tolist() == [10, 20, 30, 40, 50, 60, 21]
+
+    # 4. _update_placeholder slow path with discard_sampled_tokens_req_indices
+    idx_map_discard = TPUModelRunner._update_placeholder(
+        runner, [0], req_seq_lens, {0: 0, 1: 1}, None
+    )
+    assert idx_map_discard == {"req-1": 1}
+    assert num_tokens_no_spec.tolist() == [7, 8]

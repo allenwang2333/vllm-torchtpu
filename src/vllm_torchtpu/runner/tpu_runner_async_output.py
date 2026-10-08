@@ -28,7 +28,8 @@ def parse_sampled_token_ids_cpu(
         rows = selected_token_ids.tolist()
         return rows, [1] * len(rows)
     rows = [
-        [t for t in row if t != INVALID_TOKEN_ID] for row in selected_token_ids.tolist()
+        [t for t in row if t != INVALID_TOKEN_ID] if INVALID_TOKEN_ID in row else row
+        for row in selected_token_ids.tolist()
     ]
     return rows, [len(row) for row in rows]
 
@@ -64,11 +65,15 @@ def spec_logprobs_lists(
     offset = 0
     for chunk in chunks:
         n = len(chunk.row_starts)
-        take = [
-            np.arange(start, start + g, dtype=np.int64)
-            for start, g in zip(chunk.row_starts, gen_lens[offset : offset + n])
-        ]
-        rows = np.concatenate(take) if take else np.zeros(0, dtype=np.int64)
+        if n:
+            g_arr = np.asarray(gen_lens[offset : offset + n], dtype=np.int64)
+            cu_g = np.cumsum(g_arr)
+            rows = np.repeat(
+                chunk.row_starts.astype(np.int64, copy=False) - (cu_g - g_arr),
+                g_arr,
+            ) + np.arange(int(cu_g[-1]), dtype=np.int64)
+        else:
+            rows = np.zeros(0, dtype=np.int64)
         ids.append(chunk.tensors.logprob_token_ids.numpy()[rows])
         lps.append(chunk.tensors.logprobs.numpy()[rows])
         ranks.append(chunk.tensors.selected_token_ranks.numpy()[rows])
@@ -96,6 +101,7 @@ class AsyncTPUCopyState:
     chunk_real_lens: list[int]
     copy_ready_event: Any
     chunks_tpu: list[torch.Tensor] | None = None
+    chunk_shapes: list[tuple[int, ...]] | None = None
     completed: bool = False
     _sampled_token_ids_cpu: torch.Tensor | None = None
     _parsed_sampled_tokens: tuple[list[list[int]], list[int]] | None = None
@@ -113,7 +119,11 @@ class AsyncTPUCopyState:
         spec_logprobs: list[SpecLogprobsChunk] | None = None,
     ) -> "AsyncTPUCopyState":
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
-        chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
+        # Flatten 2D+ chunks to 1D before D2H transfer to hit PJRT's 1D 32-bit
+        # zero-repack fast path (tpu_linearizer.cc:37); reshape back on CPU.
+        chunk_shapes = [tuple(t.shape) for t in chunks_tpu]
+        flat_chunks_tpu = [t.reshape(-1) if t.ndim > 1 else t for t in chunks_tpu]
+        chunks_cpu = [t.to("cpu", non_blocking=True) for t in flat_chunks_tpu]
         spec_logprobs_tpu = None
         if spec_logprobs:
             spec_logprobs_tpu = [c.tensors for c in spec_logprobs]
@@ -127,7 +137,8 @@ class AsyncTPUCopyState:
             chunks_cpu=chunks_cpu,
             chunk_real_lens=chunk_real_lens,
             copy_ready_event=copy_ready_event,
-            chunks_tpu=chunks_tpu,
+            chunks_tpu=flat_chunks_tpu,
+            chunk_shapes=chunk_shapes,
             spec_logprobs=spec_logprobs or None,
             _spec_logprobs_tpu=spec_logprobs_tpu,
         )
@@ -148,21 +159,31 @@ class AsyncTPUCopyState:
         length on the host (no device recompile).
         """
         if self._sampled_token_ids_cpu is None:
-            trimmed = [t[:n] for t, n in zip(self.chunks_cpu, self.chunk_real_lens)]
+            if self.chunk_shapes is not None:
+                trimmed = [
+                    (t.reshape(s) if t.shape != s else t)[:n]
+                    for t, s, n in zip(
+                        self.chunks_cpu, self.chunk_shapes, self.chunk_real_lens
+                    )
+                ]
+            else:
+                trimmed = [t[:n] for t, n in zip(self.chunks_cpu, self.chunk_real_lens)]
             if len(trimmed) == 1:
                 self._sampled_token_ids_cpu = trimmed[0]
             else:
                 self._sampled_token_ids_cpu = torch.cat(trimmed, dim=0)
         return self._sampled_token_ids_cpu
 
-    def parse_sampled_tokens(self) -> tuple[list[list[int]], list[int]]:
+    def parse_sampled_tokens(
+        self, *, copy_rows: bool = True
+    ) -> tuple[list[list[int]], list[int]]:
         """Wait for D2H completion and return ``(valid_sampled_token_ids, gen_lens)``.
 
         Caches the parsed lists across ``_modify_prev_results`` and
         ``AsyncTPUModelRunnerOutput.get_output`` so ``.tolist()`` and
-        ``INVALID_TOKEN_ID`` filtering run only once per step, returning fresh
-        per-row shallow copies so in-place ``.clear()`` for discarded requests
-        does not mutate the cached rows.
+        ``INVALID_TOKEN_ID`` filtering run only once per step. When
+        ``copy_rows=True`` (default), returns fresh per-row shallow copies so
+        in-place caller mutations do not affect the cached rows.
         """
         self.wait()
         if self._parsed_sampled_tokens is None:
@@ -170,7 +191,9 @@ class AsyncTPUCopyState:
                 self.sampled_token_ids_cpu
             )
         rows, gen_lens = self._parsed_sampled_tokens
-        return [row.copy() for row in rows], gen_lens
+        if copy_rows:
+            return [row.copy() for row in rows], gen_lens
+        return rows, gen_lens
 
 
 @dataclass
@@ -239,7 +262,9 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             self._model_runner_output.sampled_token_ids = []
             return self._model_runner_output
 
-        valid_sampled_token_ids, gen_lens = self.copy_state.parse_sampled_tokens()
+        valid_sampled_token_ids, gen_lens = self.copy_state.parse_sampled_tokens(
+            copy_rows=False
+        )
         if (
             self.copy_state.spec_logprobs
             and selected_token_ids.dim() > 1
@@ -248,8 +273,10 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             self._model_runner_output.logprobs = spec_logprobs_lists(
                 self.copy_state.spec_logprobs, gen_lens
             )
-        for i in self.discard_sampled_tokens_req_indices:
-            valid_sampled_token_ids[i].clear()
+        if self.discard_sampled_tokens_req_indices:
+            valid_sampled_token_ids = list(valid_sampled_token_ids)
+            for i in self.discard_sampled_tokens_req_indices:
+                valid_sampled_token_ids[i] = []
 
         self._model_runner_output.sampled_token_ids = valid_sampled_token_ids
         return self._model_runner_output

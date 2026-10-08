@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -24,6 +25,16 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpeculativeDecodingManager,
 )
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+
+@pytest.fixture
+def device():
+    try:
+        import torch_tpu  # noqa: F401
+
+        return torch.device("tpu")
+    except Exception:
+        return torch.device("cpu")
 
 
 def test_speculative_decoding_manager_metadata_indices(device):
@@ -325,3 +336,54 @@ def test_spec_decode_metadata_cache_miss_on_changed_inputs(device):
             f"{f} differs from uncached build"
         )
     assert np.array_equal(m2.draft_lengths_cpu, nd2)
+
+
+class _FakeTPUTensor(torch.Tensor):
+    @property
+    def device(self):  # type: ignore[override]
+        return SimpleNamespace(type="tpu")
+
+
+def test_stage_and_take_draft_token_ids_tpu_event_and_sync_cache():
+    manager, mock_runner, _ = _make_manager_with_eagle3_drafter(num_reqs=2)
+    mock_runner.input_batch.req_ids = ["req-0", "req-1", None]
+    fake_event = MagicMock()
+    drafts_tpu = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32).as_subclass(
+        _FakeTPUTensor
+    )
+    with patch.object(
+        torch,
+        "tpu",
+        SimpleNamespace(Event=MagicMock(return_value=fake_event)),
+        create=True,
+    ):
+        manager.stage_draft_token_ids_for_host(drafts_tpu)
+    fake_event.record.assert_called_once()
+    assert manager._staged_draft_copy is not None
+    # Verify 1D flattening of 2D drafts for PJRT 1D 32-bit D2H fast path.
+    assert manager._staged_draft_copy[0].ndim == 1
+    assert manager._staged_draft_copy[3] == (2, 2)
+
+    taken = manager.take_draft_token_ids()
+    fake_event.synchronize.assert_called_once()
+    assert taken is not None
+    assert taken.req_ids == ["req-0", "req-1"]
+    assert taken.draft_token_ids == [[10, 11], [20, 21]]
+
+    # Sync cached path in take_draft_token_ids
+    manager._draft_token_ids = [[7, 8], [9, 10]]
+    taken_sync = manager.take_draft_token_ids()
+    assert taken_sync is not None
+    assert taken_sync.req_ids == ["req-0", "req-1"]
+    assert taken_sync.draft_token_ids == [[7, 8], [9, 10]]
+    assert manager._draft_token_ids is None
+
+
+def test_propose_draft_token_ids_unsupported_method_raises():
+    mock_runner = MagicMock()
+    mock_runner.input_batch.num_reqs = 1
+    mock_runner._is_async_drafter = False
+    mock_runner.speculative_config.method = "medusa"
+    manager = SpeculativeDecodingManager(mock_runner)
+    with pytest.raises(NotImplementedError, match="medusa"):
+        manager.propose_draft_token_ids(sampled_token_ids=[[1]])
