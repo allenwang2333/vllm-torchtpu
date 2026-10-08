@@ -7,9 +7,11 @@ from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 import torch
 
 from vllm_torchtpu.gdn_pool_layout import (
+    DEFAULT_POOLED_GDN_SSM_STATE_DTYPE,
     QWEN_GDN_ARCHITECTURES,
     PooledGDNStateLayout,
     derive_pooled_gdn_state_layout,
+    pooled_gdn_conv_and_scale_state_bytes,
     pooled_gdn_state_dtypes,
     pooled_gdn_state_itemsize,
     unified_kv_layout_enabled_for_architecture,
@@ -268,25 +270,43 @@ def _hybrid_mamba_state_layout(
             f"(conv, SSM), got dtypes={dtypes}"
         )
     conv_dtype, ssm_dtype = pooled_gdn_state_dtypes(dtypes)
+    if isinstance(ssm_dtype, str):
+        ssm_dtype = getattr(torch, ssm_dtype.removeprefix("torch."), ssm_dtype)
     conv_itemsize = pooled_gdn_state_itemsize(conv_dtype)
-    ssm_itemsize = pooled_gdn_state_itemsize(ssm_dtype)
-    conv_bytes = math.prod(shapes[0]) * conv_itemsize
-    ssm_bytes = math.prod(shapes[1]) * ssm_itemsize
+    raw_conv_bytes = math.prod(shapes[0]) * conv_itemsize
+    if "float4_e2m1fn" in str(ssm_dtype):
+        ssm_bytes = math.prod(shapes[1]) // 2
+    else:
+        ssm_itemsize = pooled_gdn_state_itemsize(ssm_dtype)
+        ssm_bytes = math.prod(shapes[1]) * ssm_itemsize
 
     if pcp_size > 1 and model_config.architecture not in QWEN_GDN_ARCHITECTURES:
         # Same item sizes on both sides of the ratio, so the check compares
         # sharding rather than dtype bookkeeping.
         full_conv_bytes = math.prod(tp_local_shapes[0]) * conv_itemsize
-        full_ssm_bytes = math.prod(tp_local_shapes[1]) * ssm_itemsize
-        if (conv_bytes + ssm_bytes) * pcp_size != (full_conv_bytes + full_ssm_bytes):
+        full_ssm_bytes = (
+            math.prod(tp_local_shapes[1]) // 2
+            if "float4_e2m1fn" in str(ssm_dtype)
+            else math.prod(tp_local_shapes[1]) * ssm_itemsize
+        )
+        if (raw_conv_bytes + ssm_bytes) * pcp_size != (
+            full_conv_bytes + full_ssm_bytes
+        ):
             raise ValueError(
                 "PCP-local Mamba state size must be exactly 1/pcp_size of "
                 "the TP-local state: "
                 f"architecture={model_config.architecture!r}, "
                 f"pcp_size={pcp_size}, full_page_size_bytes="
                 f"{full_conv_bytes + full_ssm_bytes}, local_page_size_bytes="
-                f"{conv_bytes + ssm_bytes}"
+                f"{raw_conv_bytes + ssm_bytes}"
             )
+
+    conv_bytes = pooled_gdn_conv_and_scale_state_bytes(
+        kernel_size=0,
+        conv_dim=0,
+        ssm_dtype=ssm_dtype,
+        raw_conv_bytes=raw_conv_bytes,
+    )
 
     return derive_pooled_gdn_state_layout(
         ssm_bytes=ssm_bytes,
