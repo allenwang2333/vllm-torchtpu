@@ -24,6 +24,7 @@ out = fused_moe_decode(
     n_ranks=8,
     expert_start=None,    # global id of the first local expert (EP); None for TP
     scatter_rows=False,   # True for DP attention, see below
+    gather_rows=False,    # with scatter_rows: inputs are this rank's own rows
 )  # -> [T, H] bf16, all-reduced, identical on every rank
    #    scatter_rows=True: [T / n_ranks, H], this rank's rows only
 ```
@@ -38,9 +39,13 @@ out = fused_moe_decode(
   are the global batch, all-gathered rank-major by the caller. The all-reduce
   becomes a reduce-scatter over token rows. Rank `r` returns rows
   `[r·T/n, (r+1)·T/n)` and no all-gather runs. Needs `T % n_ranks == 0`.
-- `vmem_bytes(tokens, h, i, i_s, experts, n_ranks, weight_dtype)` returns the
-  VMEM one call declares. The adapter uses it to refuse a token cap that cannot
-  compile.
+- `gather_rows=True` (with `scatter_rows`): `hidden`, `topk_weights` and
+  `topk_ids` are this rank's own `T/n` rows. The kernel all-gathers them
+  itself, so the caller runs no XLA all-gather. The result is bit-identical
+  to `scatter_rows` on the XLA-gathered inputs. `topk <= 63`.
+- `vmem_bytes(tokens, h, i, i_s, experts, n_ranks, weight_dtype, gather_rows=False)`
+  returns the VMEM one call declares (`tokens` is global). The adapter uses it
+  to refuse a token cap that cannot compile.
 
 ### Serving
 
@@ -77,16 +82,24 @@ GMM path.
 
 ### DP attention
 
-With DP attention each rank owns T/n tokens. The caller all-gathers every
-rank's tokens and routing, rank-major, and calls the kernel with
-`scatter_rows=True`. The kernel computes the experts over the global batch and
+With DP attention each rank owns T/n tokens. Either the caller all-gathers
+every rank's tokens and routing, rank-major, and calls the kernel with
+`scatter_rows=True`, or it passes its own rows with `gather_rows=True` as well
+and the kernel does that all-gather. The kernel computes the experts over the global batch and
 ends with a reduce-scatter over token rows, so each rank gets back exactly its
 own T/n rows. The kernel runs no all-gather. Things to know:
 
 - The token cap counts global tokens: a cap of 256 at DP8 is 32 tokens per
   rank. Larger DP decode batches are better served by fused EP MoE, which
   works on each rank's own rows.
-- The start all-gather runs in XLA, outside the kernel, and is not hidden.
+- Without `gather_rows` the start all-gather runs in XLA, outside the kernel,
+  and is not hidden.
+- With `gather_rows` each rank waits on the cross-rank barrier at entry, then
+  sends its routing slab (`[T/n, 128]` FP32: global expert ids, weights and the
+  shared gate) and its BF16 hidden rows to every rank by remote DMA. The
+  receiver builds the route-weight table and the active-expert mask itself
+  (the mask reaches SMEM by a VMEM-to-SMEM DMA). The shared expert's weights
+  load during the gather.
 - Small per-rank row counts (T/n not a multiple of 16) use an FP32 wire.
 
 The serving adapter does not support DP attention yet; that is TBD. Today it

@@ -63,42 +63,7 @@ _NUM_BUFFERS = 6
 
 
 def _kernel(
-    active_ref,
-    rank_ref,
-    x_ref,
-    coeff_ref,
-    shared_gate_ref,
-    w1_hbm,
-    w2_hbm,
-    w1_scale_hbm,
-    w2_scale_hbm,
-    shared_w1_hbm,
-    shared_w1_scale_hbm,
-    shared_w2_hbm,
-    shared_w2_scale_hbm,
-    out_ref,
-    w1_ring,
-    w2_ring,
-    w1_scale_ring,
-    w2_scale_ring,
-    shared_w1_vmem,
-    shared_w1_scale_vmem,
-    shared_w2_vmem,
-    shared_w2_scale_vmem,
-    xq_ref,
-    xs_ref,
-    acc_ref,
-    acc_bf16,
-    recv,
-    red,
-    ids_ref,
-    sem_ref,
-    shared_sem,
-    rs_send,
-    rs_recv,
-    ag_send,
-    ag_recv,
-    *,
+    *refs,
     m,
     h,
     i,
@@ -107,6 +72,7 @@ def _kernel(
     n_ranks,
     weight_dtype,
     rows=None,
+    topk=None,
 ):
     """One rank's MoE block. Shapes use m tokens (padded to 16), h hidden, i
     and i_s the routed and shared intermediate sizes of this rank's slice, E
@@ -147,7 +113,73 @@ def _kernel(
       shared_sem DMA [4]: shared expert transfers.
       rs_send DMA [n], rs_recv DMA: reduce-scatter.
       ag_send DMA [n], ag_recv DMA: all-gather.
+
+    With `topk` set (gather_rows, needs `rows`), every input is this rank's
+    own `rows` tokens and the kernel all-gathers them itself:
+      Scalar prefetch: rank_ref [2] int32: this rank's mesh index and the
+        global id of its first expert (0 with TP experts).
+      x_ref [r16, h] bf16: own hidden rows, padded to r16 = rows rounded up
+        to 16.
+      route_ref [r16, 128] f32: own routing, lanes [0, k) global expert ids
+        (as f32; each receiver offsets them by its own first expert), [k, 2 k)
+        route weights, 2 k the shared gate sigmoid(x . w_g).
+      Extra scratch: x_all [n, r16, h] and route_all [n, r16, 128] receive
+        slab d from rank d (ag_* and route_* semaphores); route_rows
+        [m, 128] f32 holds the routing token-major; coeff_ref [m, E padded]
+        f32 and active_ref [8, E padded] int32 (SMEM, row 0 read) are built
+        here from it instead of arriving from XLA; active_vmem [8, E padded]
+        int32 stages the mask for its DMA into SMEM (active_sem).
     """
+    if topk is None:
+        active_ref, rank_ref, x_ref, coeff_ref, shared_gate_ref = refs[:5]
+        refs = refs[5:]
+    else:
+        rank_ref, x_ref, route_ref = refs[:3]
+        refs = refs[3:]
+    (
+        w1_hbm,
+        w2_hbm,
+        w1_scale_hbm,
+        w2_scale_hbm,
+        shared_w1_hbm,
+        shared_w1_scale_hbm,
+        shared_w2_hbm,
+        shared_w2_scale_hbm,
+        out_ref,
+        w1_ring,
+        w2_ring,
+        w1_scale_ring,
+        w2_scale_ring,
+        shared_w1_vmem,
+        shared_w1_scale_vmem,
+        shared_w2_vmem,
+        shared_w2_scale_vmem,
+        xq_ref,
+        xs_ref,
+        acc_ref,
+        acc_bf16,
+        recv,
+        red,
+        ids_ref,
+        sem_ref,
+        shared_sem,
+        rs_send,
+        rs_recv,
+        ag_send,
+        ag_recv,
+    ) = refs[:30]
+    if topk is not None:
+        (
+            x_all,
+            route_all,
+            route_rows,
+            coeff_ref,
+            active_vmem,
+            active_ref,
+            route_send,
+            route_recv,
+            active_sem,
+        ) = refs[30:]
     me = rank_ref[0]
     qmax = float(jnp.finfo(weight_dtype).max)
     chunk = h // n_ranks
@@ -173,19 +205,86 @@ def _kernel(
     for copy in shared_copies:
         copy.start()
 
-    acc_ref[...] = jnp.zeros((m, h), jnp.float32)
-    x = x_ref[...].astype(jnp.float32)
+    gather_sends = []
+    if topk is not None:
+        # gather_rows: every peer's buffers are live once all have entered.
+        # Each rank sends its routing, then its hidden rows, to slab `me` of
+        # every rank (itself included); the expert loop needs the routing
+        # first, so it travels first.
+        pl.semaphore_wait(barrier, n_ranks)
+        for src, dst, send, recv_sem in (
+            (route_ref, route_all, route_send, route_recv),
+            (x_ref, x_all, ag_send, ag_recv),
+        ):
+            for d in range(n_ranks):
+                copy = pltpu.make_async_remote_copy(
+                    src,
+                    dst.at[me],
+                    send.at[d],
+                    recv_sem,
+                    device_id=(jnp.int32(d),),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+                copy.start()
+                gather_sends.append(copy)
+        # Token-major routing; rows past the n * rows real tokens stay 0.
+        route_rows[...] = jnp.zeros(route_rows.shape, jnp.float32)
+        pltpu.make_async_copy(route_all, route_all, route_recv).wait()
+        for d in range(n_ranks):
+            route_rows[d * rows : (d + 1) * rows, :] = route_all[d, :rows, :]
+        route = route_rows[...]
+        lanes = lax.broadcasted_iota(jnp.int32, route.shape, 1)
+
+        def lane(j):
+            return jnp.sum(jnp.where(lanes == j, route, 0.0), axis=1, keepdims=True)
+
+        # The dense route-weight table XLA builds otherwise: at most one
+        # route of a token selects a given expert, so the sum is exact. Ids
+        # are global; this rank's local expert e is global rank_ref[1] + e.
+        experts_f = (
+            lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1) + rank_ref[1]
+        ).astype(jnp.float32)
+        coeff = jnp.zeros(coeff_ref.shape, jnp.float32)
+        for j in range(topk):
+            coeff = coeff + jnp.where(experts_f == lane(j), lane(topk + j), 0.0)
+        coeff_ref[...] = coeff
+        active = jnp.max((coeff != 0).astype(jnp.int32), axis=0, keepdims=True)
+        active_vmem[...] = jnp.broadcast_to(active, active_vmem.shape)
+        copy = pltpu.make_async_copy(active_vmem, active_ref, active_sem)
+        copy.start()
+        shared_gate = lane(2 * topk)
+        acc_ref[...] = jnp.zeros((m, h), jnp.float32)
+        pltpu.make_async_copy(x_all, x_all, ag_recv).wait()
+        for d in range(n_ranks):
+            acc_ref[d * rows : (d + 1) * rows, :] = x_all[d, :rows, :].astype(
+                jnp.float32
+            )
+        x = acc_ref[...]
+        acc_ref[...] = jnp.zeros((m, h), jnp.float32)
+        copy.wait()
+    else:
+        acc_ref[...] = jnp.zeros((m, h), jnp.float32)
+        x = x_ref[...].astype(jnp.float32)
     xsc = jnp.max(jnp.abs(x), axis=1, keepdims=True) / qmax
     xq_ref[...] = (x * jnp.where(xsc == 0, 0.0, 1.0 / xsc)).astype(weight_dtype)
     xs_ref[...] = jnp.broadcast_to(xsc, (m, 2 * i))
     cols = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
+    if topk is None:
+
+        def is_active(e):
+            return active_ref[e] != 0
+
+    else:
+
+        def is_active(e):
+            return active_ref[0, e] != 0
 
     def compact(e, count):
-        @pl.when(active_ref[e] != 0)
+        @pl.when(is_active(e))
         def record():
             ids_ref[count] = e
 
-        return count + (active_ref[e] != 0).astype(jnp.int32)
+        return count + is_active(e).astype(jnp.int32)
 
     count = lax.fori_loop(0, experts, compact, jnp.int32(0))
 
@@ -235,7 +334,10 @@ def _kernel(
     # Shared expert first; its slabs were issued at entry with the routed primes.
     for copy in shared_copies:
         copy.wait()
-    shared_coeff = jnp.max(shared_gate_ref[...], axis=1, keepdims=True)
+    if topk is None:
+        shared_coeff = jnp.max(shared_gate_ref[...], axis=1, keepdims=True)
+    else:
+        shared_coeff = shared_gate
     accumulate(
         jnp.matmul(
             xq_ref[...], shared_w1_vmem[...], preferred_element_type=jnp.float32
@@ -294,7 +396,8 @@ def _kernel(
             acc_bf16[d, :rows, :] = acc_ref[d * rows : (d + 1) * rows, :].astype(
                 acc_bf16.dtype
             )
-        pl.semaphore_wait(barrier, n_ranks)
+        if topk is None:  # gather_rows waited at entry
+            pl.semaphore_wait(barrier, n_ranks)
         scatter = [
             pltpu.make_async_remote_copy(
                 acc_bf16.at[d],
@@ -313,7 +416,7 @@ def _kernel(
         for s in range(1, n_ranks):
             acc = acc + recv[s].astype(jnp.float32)
         out_ref[...] = acc.astype(out_ref.dtype)
-        for copy in scatter:
+        for copy in scatter + gather_sends:
             copy.wait_send()
         return
 
@@ -368,12 +471,27 @@ def _weight_ring_depth(h, i, weight_dtype):
     return max(3, min(_NUM_BUFFERS, fit))
 
 
-def vmem_bytes(tokens, h, i, i_s, experts, n_ranks, weight_dtype):
+def vmem_bytes(tokens, h, i, i_s, experts, n_ranks, weight_dtype, gather_rows=False):
     """VMEM the call declares for `tokens` rows: its VMEM operands, output and
     scratch (compiler temporaries excluded). The weight ring takes about half
-    of VMEM, so the token-proportional buffers bound the rows one call takes."""
+    of VMEM, so the token-proportional buffers bound the rows one call takes.
+    With gather_rows, `tokens` is still the global count (n_ranks x own rows)."""
     m = tokens + (-tokens) % 16
     wt, f32, bf16 = jnp.dtype(weight_dtype).itemsize, 4, 2
+    extra = 0
+    if gather_rows:
+        own = tokens // n_ranks
+        r16 = own + (-own) % 16
+        e_pad = experts + (-experts) % 128
+        # own x + route in, x_all + route_all slabs, token-major routing, and
+        # the active mask staging; the hidden and shared-gate inputs are gone
+        # (coeff moves from input to scratch, same size).
+        extra = (
+            (n_ranks + 1) * r16 * (h * bf16 + 128 * f32)
+            + m * 128 * f32
+            + 8 * e_pad * 4
+            - m * (h * bf16 + 128 * f32)
+        )
     ring = _weight_ring_depth(h, i, weight_dtype) * (3 * h * i * wt + (2 * i + h) * f32)
     shared = 3 * h * i_s * wt + (2 * i_s + h) * f32
     rows = m * (
@@ -388,7 +506,169 @@ def vmem_bytes(tokens, h, i, i_s, experts, n_ranks, weight_dtype):
         + n_ranks * (h // n_ranks) * bf16  # reduce-scatter slots
         + (h // n_ranks) * bf16  # reduced chunk
     )
-    return ring + shared + rows
+    return ring + shared + rows + extra
+
+
+def _scratch(
+    nb,
+    m,
+    h,
+    i,
+    i_s,
+    experts,
+    n_ranks,
+    weight_dtype,
+    wire,
+    acc_bf16_shape,
+    recv_shape,
+    red_shape,
+):
+    """The scratch every mode declares, in _kernel's order."""
+    return [
+        pltpu.VMEM((nb, h, 2 * i), weight_dtype),
+        pltpu.VMEM((nb, i, h), weight_dtype),
+        pltpu.VMEM((nb, 1, 2 * i), jnp.float32),
+        pltpu.VMEM((nb, 1, h), jnp.float32),
+        pltpu.VMEM((h, 2 * i_s), weight_dtype),
+        pltpu.VMEM((1, 2 * i_s), jnp.float32),
+        pltpu.VMEM((i_s, h), weight_dtype),
+        pltpu.VMEM((1, h), jnp.float32),
+        pltpu.VMEM((m, h), weight_dtype),
+        pltpu.VMEM((m, 2 * i), jnp.float32),
+        pltpu.VMEM((m, h), jnp.float32),
+        pltpu.VMEM(acc_bf16_shape, wire),
+        pltpu.VMEM(recv_shape, wire),
+        pltpu.VMEM(red_shape, wire),
+        pltpu.SMEM((experts,), jnp.int32),
+        pltpu.SemaphoreType.DMA((nb, 4)),
+        pltpu.SemaphoreType.DMA((4,)),
+        pltpu.SemaphoreType.DMA((n_ranks,)),
+        pltpu.SemaphoreType.DMA(()),
+        pltpu.SemaphoreType.DMA((n_ranks,)),
+        pltpu.SemaphoreType.DMA(()),
+    ]
+
+
+def _gather_rows_call(
+    rank,
+    hidden,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    shared_w1,
+    shared_w1_scale,
+    shared_w2,
+    shared_w2_scale,
+    shared_gate_weight,
+    topk_weights,
+    topk_ids,
+    *,
+    n_ranks,
+    expert_start,
+):
+    """fused_moe_decode(gather_rows=True, scatter_rows=True): inputs are this
+    rank's own rows; the kernel gathers them (see _kernel)."""
+    rows, h = hidden.shape
+    topk = topk_ids.shape[1]
+    if 2 * topk + 1 > 128:
+        raise ValueError(f"gather_rows packs routing in 128 lanes; topk {topk}")
+    tokens = rows * n_ranks
+    m = tokens + (-tokens) % 16
+    r16 = rows + (-rows) % 16
+    experts, i, _ = w2.shape
+    e_pad = experts + (-experts) % 128
+    # Row-local work stays with the caller's rows: the global expert ids
+    # (exact in FP32), the weights as the gathered path rounds them, and the
+    # shared gate. Ids stay global: every receiver holds different experts.
+    ids = topk_ids.astype(jnp.float32)
+    start = jnp.zeros((), jnp.int32) if expert_start is None else expert_start
+    rank_start = jnp.stack(
+        [rank.reshape(()).astype(jnp.int32), jnp.asarray(start, jnp.int32).reshape(())]
+    )
+    weights = topk_weights.astype(hidden.dtype).astype(jnp.float32)
+    shared_gate = jax.nn.sigmoid(
+        jnp.dot(
+            hidden,
+            shared_gate_weight.astype(hidden.dtype),
+            preferred_element_type=jnp.float32,
+        )
+    )
+    route = jnp.concatenate([ids, weights, shared_gate], axis=1)
+    route = jnp.pad(route, ((0, r16 - rows), (0, 128 - route.shape[1])))
+    hidden_own = jnp.pad(hidden, ((0, r16 - rows), (0, 0)))
+    i_s = shared_w2.shape[0]
+    weight_dtype = w1.dtype
+    nb = _weight_ring_depth(h, i, weight_dtype)
+    # Reduce-scatter buffers exactly as scatter_rows on the gathered batch.
+    wire = hidden.dtype if rows % 16 == 0 else jnp.float32
+    out_rows = rows if rows % 16 == 0 else -(-rows // 8) * 8
+    acc_bf16_shape = recv_shape = (n_ranks, out_rows, h)
+    out = pl.pallas_call(
+        functools.partial(
+            _kernel,
+            m=m,
+            h=h,
+            i=i,
+            experts=experts,
+            nb=nb,
+            n_ranks=n_ranks,
+            weight_dtype=weight_dtype,
+            rows=rows,
+            topk=topk,
+        ),
+        out_shape=jax.ShapeDtypeStruct((out_rows, h), wire),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 2
+            + [pl.BlockSpec(memory_space=pltpu.HBM)] * 8,
+            out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+            scratch_shapes=_scratch(
+                nb,
+                m,
+                h,
+                i,
+                i_s,
+                experts,
+                n_ranks,
+                weight_dtype,
+                wire,
+                acc_bf16_shape,
+                recv_shape,
+                (8, 128),
+            )
+            + [
+                pltpu.VMEM((n_ranks, r16, h), hidden.dtype),
+                pltpu.VMEM((n_ranks, r16, 128), jnp.float32),
+                pltpu.VMEM((m, 128), jnp.float32),
+                pltpu.VMEM((m, e_pad), jnp.float32),
+                pltpu.VMEM((8, e_pad), jnp.int32),
+                pltpu.SMEM((8, e_pad), jnp.int32),
+                pltpu.SemaphoreType.DMA((n_ranks,)),
+                pltpu.SemaphoreType.DMA(()),
+                pltpu.SemaphoreType.DMA(()),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=0,
+            vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
+        ),
+        name=f"fused_moe_decode_ag-e_{experts}-m_{m}-h_{h}"
+        f"-i_{i}-is_{i_s}-n_{n_ranks}-buffers_{nb}",
+    )(
+        rank_start,
+        hidden_own,
+        route,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        shared_w1,
+        shared_w1_scale,
+        shared_w2,
+        shared_w2_scale,
+    )
+    return out[:rows].astype(hidden.dtype)
 
 
 def fused_moe_decode(
@@ -409,6 +689,7 @@ def fused_moe_decode(
     n_ranks,
     expert_start=None,
     scatter_rows=False,
+    gather_rows=False,
 ):
     """Per-rank body; call inside shard_map over the TP mesh.
 
@@ -445,11 +726,37 @@ def fused_moe_decode(
         n_ranks), [tokens / n_ranks, H], and no all-gather runs. Needs tokens
         % n_ranks == 0. The wire is BF16 when tokens / n_ranks is a multiple
         of 16, else FP32.
+      gather_rows: with scatter_rows, for callers that have NOT all-gathered:
+        `hidden`, `topk_weights` and `topk_ids` are this rank's own rows
+        [rows, ...] and the kernel all-gathers them rank-major itself (remote
+        DMA, BF16 hidden rows and an FP32 routing slab per rank), so the call
+        computes exactly what scatter_rows computes on the gathered inputs
+        and returns this rank's [rows, H]. No XLA collective runs.
 
     The weights' dtype (FP8 in production) is also the dtype the kernel
     quantizes the hidden states and the activated intermediate to, so both
     matmuls run in it with FP32 accumulation.
     """
+    if gather_rows:
+        if not scatter_rows:
+            raise ValueError("gather_rows needs scatter_rows")
+        return _gather_rows_call(
+            rank,
+            hidden,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            shared_w1,
+            shared_w1_scale,
+            shared_w2,
+            shared_w2_scale,
+            shared_gate_weight,
+            topk_weights,
+            topk_ids,
+            n_ranks=n_ranks,
+            expert_start=expert_start,
+        )
     tokens, h = hidden.shape
     if scatter_rows and tokens % n_ranks:
         raise ValueError(f"scatter_rows needs tokens % n_ranks == 0; got {tokens}")
@@ -510,29 +817,20 @@ def fused_moe_decode(
             in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 3
             + [pl.BlockSpec(memory_space=pltpu.HBM)] * 8,
             out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
-            scratch_shapes=[
-                pltpu.VMEM((nb, h, 2 * i), weight_dtype),
-                pltpu.VMEM((nb, i, h), weight_dtype),
-                pltpu.VMEM((nb, 1, 2 * i), jnp.float32),
-                pltpu.VMEM((nb, 1, h), jnp.float32),
-                pltpu.VMEM((h, 2 * i_s), weight_dtype),
-                pltpu.VMEM((1, 2 * i_s), jnp.float32),
-                pltpu.VMEM((i_s, h), weight_dtype),
-                pltpu.VMEM((1, h), jnp.float32),
-                pltpu.VMEM((m, h), weight_dtype),
-                pltpu.VMEM((m, 2 * i), jnp.float32),
-                pltpu.VMEM((m, h), jnp.float32),
-                pltpu.VMEM(acc_bf16_shape, wire),
-                pltpu.VMEM(recv_shape, wire),
-                pltpu.VMEM(red_shape, wire),
-                pltpu.SMEM((experts,), jnp.int32),
-                pltpu.SemaphoreType.DMA((nb, 4)),
-                pltpu.SemaphoreType.DMA((4,)),
-                pltpu.SemaphoreType.DMA((n_ranks,)),
-                pltpu.SemaphoreType.DMA(()),
-                pltpu.SemaphoreType.DMA((n_ranks,)),
-                pltpu.SemaphoreType.DMA(()),
-            ],
+            scratch_shapes=_scratch(
+                nb,
+                m,
+                h,
+                i,
+                i_s,
+                experts,
+                n_ranks,
+                weight_dtype,
+                wire,
+                acc_bf16_shape,
+                recv_shape,
+                red_shape,
+            ),
         ),
         compiler_params=pltpu.CompilerParams(
             collective_id=0,

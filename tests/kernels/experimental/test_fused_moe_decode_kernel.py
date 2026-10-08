@@ -259,6 +259,9 @@ def test_vmem_bound_matches_build_limits():
     assert vmem_bytes(1024, 4096, 128, 128, 512, 8, jnp.float8_e4m3fn) > have
     assert vmem_bytes(256, 4096, 1024, 128, 64, 8, jnp.float8_e4m3fn) <= have
     assert vmem_bytes(512, 4096, 1024, 128, 64, 8, jnp.float8_e4m3fn) > have
+    # gather_rows (DP attention, global tokens) at the adapter's default cap.
+    for i, e in ((128, 512), (1024, 64)):
+        assert vmem_bytes(256, 4096, i, 128, e, 8, jnp.float8_e4m3fn, True) <= have
 
 
 @pytest.mark.parametrize("m", [8, 32, 128])
@@ -321,3 +324,67 @@ def test_scatter_rows_is_own_slice_of_all_reduce(setup, m, ep):
         assert rel.max() < 1e-2
     # Positive control: a one-row shift of the slices must not match.
     assert not np.allclose(np.roll(own, 1, axis=0), full, rtol=1e-2, atol=1e-3)
+
+
+@pytest.mark.parametrize("rows", [1, 4, 16, 24])
+@pytest.mark.parametrize("ep", [False, True])
+def test_gather_rows_matches_scatter_rows_on_gathered_inputs(setup, rows, ep):
+    """gather_rows=True on each rank's own rows (the kernel all-gathers them)
+    returns exactly what scatter_rows=True returns when XLA all-gathered the
+    same rows rank-major first: bit-identical, on both wires (rows % 16 == 0
+    is BF16, the others FP32)."""
+    mesh, sh, rank, weights, shared_gate_weight = setup
+    m = rows * N
+    rng = np.random.default_rng(200 + m)
+    x = jnp.asarray(rng.normal(size=(m, H)), jnp.bfloat16)
+    n_global = N * E if ep else E
+    ids = jnp.asarray(
+        np.stack([rng.choice(n_global, TOPK, replace=False) for _ in range(m)]),
+        jnp.int32,
+    )
+    tw = jnp.asarray(rng.dirichlet(np.ones(TOPK), size=m), jnp.bfloat16)
+    specs = (P("d"),) * 10 + (P(), P("d"), P("d"))
+
+    def call(rank, x, *rest, gather_rows):
+        return fused_moe_decode(
+            rank.reshape(-1),
+            x,
+            *rest,
+            n_ranks=N,
+            expert_start=rank.reshape(()) * E if ep else None,
+            scatter_rows=True,
+            gather_rows=gather_rows,
+        )
+
+    def run(gather_rows, x, tw, ids):
+        if not gather_rows:  # every rank holds the whole gathered batch
+            x, tw, ids = (jnp.tile(a, (N, 1)) for a in (x, tw, ids))
+        out = jax.jit(
+            jax.shard_map(
+                functools.partial(call, gather_rows=gather_rows),
+                mesh=mesh,
+                in_specs=specs,
+                out_specs=P("d"),
+                check_vma=False,
+            )
+        )(
+            rank,
+            jax.device_put(x, sh),
+            *weights,
+            shared_gate_weight,
+            jax.device_put(tw, sh),
+            jax.device_put(ids, sh),
+        )
+        return np.asarray(out.astype(jnp.float32))
+
+    want = run(False, x, tw, ids)
+    got = run(True, x, tw, ids)
+    assert got.shape == (m, H)
+    assert np.isfinite(got).all()
+    np.testing.assert_array_equal(got, want)
+    # Must-fail control: ranks 0 and 1 swap their own rows, so the gathered
+    # batch is not rank-major; rows of both blocks must then differ.
+    perm = np.r_[rows : 2 * rows, 0:rows, 2 * rows : m]
+    swapped = run(True, x[perm], tw[perm], ids[perm])
+    for block in (slice(0, rows), slice(rows, 2 * rows)):
+        assert not np.allclose(swapped[block], want[block], rtol=1e-2, atol=1e-3)
