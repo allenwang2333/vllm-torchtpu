@@ -77,9 +77,25 @@ def _async_source_tokens_cpu(
     return None
 
 
-def _resolve_async_spec_state(
-    runner: Any, pre_async: Any
-) -> tuple[int, dict[int, int], dict[int, list[int]], dict[int, int]] | None:
+@dataclass(frozen=True)
+class _AsyncSpecState:
+    """Previous-step speculative results, indexed by the previous step's
+    request position (``pre_idx``), as flat NumPy arrays.
+
+    ``tokens[pre_idx, :lengths[pre_idx]]`` are the accepted tokens of that
+    request in order (``row[row != -1]`` of the sampled copy, empty for
+    discarded requests), ``rejected`` the draft count rolled back for it
+    (``compute_num_rejected``) and ``num_draft`` its scheduled drafts.
+    """
+
+    stride: int
+    tokens: np.ndarray
+    lengths: np.ndarray
+    rejected: np.ndarray
+    num_draft: np.ndarray
+
+
+def _resolve_async_spec_state(runner: Any, pre_async: Any) -> _AsyncSpecState | None:
     """Resolve async speculative stride, rejection counts, and committed tokens."""
     spec_config = getattr(runner, "speculative_config", None)
     num_spec = getattr(spec_config, "num_speculative_tokens", None)
@@ -90,32 +106,58 @@ def _resolve_async_spec_state(
     sampled_cpu: Any = wait_for_copy() if callable(wait_for_copy) else None
     if not isinstance(sampled_cpu, torch.Tensor):
         return None
-    if sampled_cpu.ndim == 1:
-        sampled_cpu = sampled_cpu.unsqueeze(-1)
+    sampled = np.asarray(sampled_cpu)
+    if sampled.ndim == 1:
+        sampled = sampled[:, None]
+    num_rows = int(sampled.shape[0])
+    pre_positions = np.fromiter(
+        req_id_to_index.values(), dtype=np.int64, count=len(req_id_to_index)
+    )
+    if int(pre_positions.min()) < 0 or int(pre_positions.max()) >= num_rows:
+        return None
     spec_num_rejected = getattr(pre_async, "spec_decode_num_rejected_tokens", None)
     stride = 1 + num_spec if spec_num_rejected is not None else 1
-    discard_set = set(
-        getattr(pre_async, "discard_sampled_tokens_req_indices", None) or ()
-    )
+    valid = sampled != -1
+    lengths = valid.sum(axis=1, dtype=np.int64)
+    # Compact each row's valid tokens to its front, preserving their order.
+    order = np.argsort(~valid, axis=1, kind="stable")
+    tokens = np.take_along_axis(sampled, order, axis=1)
+    num_draft = np.zeros(num_rows, dtype=np.int64)
     num_draft_per_req = getattr(pre_async, "num_draft_per_req", None) or {}
-    rejected_by_pre_idx: dict[int, int] = {}
-    sampled_by_pre_idx: dict[int, list[int]] = {}
-    draft_by_pre_idx: dict[int, int] = {}
-    num_rows = int(sampled_cpu.shape[0])
-    for pre_idx in set(req_id_to_index.values()):
-        pos = int(pre_idx)
-        if pos < 0 or pos >= num_rows:
-            return None
-        row = sampled_cpu[pos]
-        valid_tokens = row[row != -1].tolist()
-        n_draft = int(num_draft_per_req.get(pos, 0))
-        draft_by_pre_idx[pos] = n_draft
-        if spec_num_rejected is not None and n_draft > 0:
-            rejected_by_pre_idx[pos] = max(0, n_draft - len(valid_tokens) + 1)
-        else:
-            rejected_by_pre_idx[pos] = 0
-        sampled_by_pre_idx[pos] = [] if pos in discard_set else valid_tokens
-    return stride, rejected_by_pre_idx, sampled_by_pre_idx, draft_by_pre_idx
+    if num_draft_per_req:
+        draft_pos = np.fromiter(
+            num_draft_per_req.keys(), dtype=np.int64, count=len(num_draft_per_req)
+        )
+        draft_cnt = np.fromiter(
+            num_draft_per_req.values(), dtype=np.int64, count=len(num_draft_per_req)
+        )
+        in_range = (draft_pos >= 0) & (draft_pos < num_rows)
+        num_draft[draft_pos[in_range]] = draft_cnt[in_range]
+    if spec_num_rejected is not None:
+        rejected = np.where(num_draft > 0, np.maximum(num_draft - lengths + 1, 0), 0)
+    else:
+        rejected = np.zeros(num_rows, dtype=np.int64)
+    discard = getattr(pre_async, "discard_sampled_tokens_req_indices", None) or ()
+    discard_idx = np.fromiter((int(i) for i in discard), dtype=np.int64)
+    discard_idx = discard_idx[(discard_idx >= 0) & (discard_idx < num_rows)]
+    if discard_idx.size:
+        lengths = lengths.copy()
+        lengths[discard_idx] = 0
+    return _AsyncSpecState(stride, tokens, lengths, rejected, num_draft)
+
+
+@dataclass(frozen=True)
+class _SampledOverlay:
+    """Tokens committed in the previous step, per local request row.
+
+    ``tokens[i, :lengths[i]]`` were written at positions ``starts[i] ..
+    starts[i] + lengths[i]`` of request ``i`` after ``token_ids_cpu`` was
+    snapshotted, so lookback positions in that range read from here.
+    """
+
+    tokens: np.ndarray
+    starts: np.ndarray
+    lengths: np.ndarray
 
 
 def _resolve_decode_lookback_cpu(
@@ -125,7 +167,7 @@ def _resolve_decode_lookback_cpu(
     start_index: int,
     *,
     rejected_by_req: np.ndarray | None = None,
-    sampled_overlay: list[tuple[int, int, list[int]]] | None = None,
+    sampled_overlay: _SampledOverlay | None = None,
 ) -> torch.Tensor:
     """Fill lookback_token_ids on CPU for both prompt and generated positions."""
     lookback = runner.lookback_token_ids.cpu.clone()
@@ -146,21 +188,47 @@ def _resolve_decode_lookback_cpu(
     rows = np.arange(start_index, start_index + num_reqs, dtype=np.int64)[:, None]
     clipped = np.clip(pos, 0, max(max_cols - 1, 0))
     gathered = np.where(valid, token_ids_cpu[rows, clipped], -1)
-    if sampled_overlay:
-        for req_local_idx, write_start, sampled_ids in sampled_overlay:
-            write_end = write_start + len(sampled_ids)
-            for col_idx in range(depth):
-                p = int(pos[req_local_idx, col_idx])
-                if write_start <= p < write_end:
-                    gathered[req_local_idx, col_idx] = sampled_ids[p - write_start]
-    lookback[:num_reqs] = torch.from_numpy(
-        np.ascontiguousarray(gathered, dtype=np.int64)
-    ).to(dtype=lookback.dtype)
+    if sampled_overlay is not None:
+        rel = pos - sampled_overlay.starts[:, None]
+        hit = (rel >= 0) & (rel < sampled_overlay.lengths[:, None])
+        if hit.any():
+            width = int(sampled_overlay.tokens.shape[1])
+            local = np.arange(num_reqs, dtype=np.int64)[:, None]
+            overlay = sampled_overlay.tokens[local, np.clip(rel, 0, width - 1)]
+            gathered = np.where(hit, overlay, gathered)
+    np.asarray(lookback[:num_reqs])[:] = gathered
     return lookback
 
 
+def _ragged_arange(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """Concatenation of ``range(starts[i], starts[i] + lengths[i])``."""
+    offsets = np.repeat(np.cumsum(lengths) - lengths, lengths)
+    return (
+        np.arange(offsets.shape[0], dtype=np.int64)
+        - offsets
+        + np.repeat(starts, lengths)
+    )
+
+
+def _unresolved_host_inputs(runner, all_prompt: bool) -> HostEngramInputs:
+    return HostEngramInputs(
+        input_ids=runner.input_ids_cpu,
+        positions=runner.positions_cpu,
+        query_start_loc=runner.query_start_loc_cpu,
+        lookback_token_ids=runner.lookback_token_ids.cpu,
+        all_prompt=all_prompt,
+        host_ready=False,
+    )
+
+
 def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None:
-    """Snapshot the runner's host hash inputs, or None if they do not apply."""
+    """Snapshot the runner's host hash inputs, or None if they do not apply.
+
+    This runs on the host between the previous step's completion and the
+    next step's launch under ``OFFLOAD=1``, so everything per request is
+    expressed as NumPy array operations over the chunk rather than per-request
+    tensor ops.
+    """
     from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 
     plan = getattr(runner, "_last_sequence_layout_plan", None)
@@ -190,14 +258,7 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
         getattr(batch, "num_computed_tokens_cpu", None) is None
         or getattr(batch, "token_ids_cpu", None) is None
     ):
-        return HostEngramInputs(
-            input_ids=runner.input_ids_cpu,
-            positions=runner.positions_cpu,
-            query_start_loc=runner.query_start_loc_cpu,
-            lookback_token_ids=runner.lookback_token_ids.cpu,
-            all_prompt=all_prompt,
-            host_ready=False,
-        )
+        return _unresolved_host_inputs(runner, all_prompt)
 
     pre_async = getattr(runner, "_pre_async_results", None)
     is_async_spec = pre_async is not None and (
@@ -206,20 +267,13 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
     )
     spec_state = _resolve_async_spec_state(runner, pre_async) if is_async_spec else None
     if is_async_spec and spec_state is None:
-        return HostEngramInputs(
-            input_ids=runner.input_ids_cpu,
-            positions=runner.positions_cpu,
-            query_start_loc=runner.query_start_loc_cpu,
-            lookback_token_ids=runner.lookback_token_ids.cpu,
-            all_prompt=all_prompt,
-            host_ready=False,
-        )
+        return _unresolved_host_inputs(runner, all_prompt)
 
-    stride = spec_state[0] if spec_state is not None else 1
+    stride = spec_state.stride if spec_state is not None else 1
     ids = runner.input_ids_cpu
     positions = runner.positions_cpu
     rejected_by_req: np.ndarray | None = None
-    sampled_overlay: list[tuple[int, int, list[int]]] | None = None
+    sampled_overlay: _SampledOverlay | None = None
     req_id_to_index = (
         getattr(pre_async, "req_id_to_index_copy", None)
         if pre_async is not None
@@ -227,63 +281,66 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
     )
     req_ids = getattr(batch, "req_ids", None)
     if req_id_to_index and req_ids is not None:
-        dst_idx: list[int] = []
-        src_idx: list[int] = []
-        pos_adjustments: list[tuple[int, int, int]] = []
-        num_tokens_no_spec = getattr(batch, "num_tokens_no_spec", None)
+        chunk_req_ids = req_ids[start_index : start_index + chunk_num_reqs]
+        pre_pos = np.fromiter(
+            (req_id_to_index.get(req_id, -1) for req_id in chunk_req_ids),
+            dtype=np.int64,
+            count=chunk_num_reqs,
+        )
+        qsl = np.asarray(runner.query_start_loc_cpu[: chunk_num_reqs + 1]).astype(
+            np.int64
+        )
+        q_start = qsl[:-1]
+        n_sched = qsl[1:] - q_start
+        matched = (pre_pos >= 0) & (n_sched > 0)
         if spec_state is not None:
-            rejected_by_req = np.zeros(chunk_num_reqs, dtype=np.int64)
-            sampled_overlay = []
-        qsl = runner.query_start_loc_cpu[: chunk_num_reqs + 1].tolist()
-        for i in range(chunk_num_reqs):
-            req_idx = start_index + i
-            req_id = req_ids[req_idx]
-            if req_id in req_id_to_index:
-                pre_pos = int(req_id_to_index[req_id])
-                q_start = int(qsl[i])
-                q_end = int(qsl[i + 1])
-                if q_end > q_start:
-                    n_sched = q_end - q_start
-                    src_start = pre_pos * stride
-                    dst_idx.extend(range(q_start, q_end))
-                    src_idx.extend(range(src_start, src_start + n_sched))
-                    if spec_state is not None:
-                        assert (
-                            rejected_by_req is not None and sampled_overlay is not None
-                        )
-                        n_rej = spec_state[1][pre_pos]
-                        rejected_by_req[i] = n_rej
-                        if n_rej > 0:
-                            pos_adjustments.append((q_start, q_end, n_rej))
-                        sampled_ids = spec_state[2][pre_pos]
-                        if sampled_ids:
-                            n_draft = spec_state[3][pre_pos]
-                            write_start = (
-                                int(num_tokens_no_spec[req_idx]) - (1 + n_draft)
-                                if num_tokens_no_spec is not None
-                                else int(batch.num_computed_tokens_cpu[req_idx])
-                                - n_draft
-                            )
-                            sampled_overlay.append((i, write_start, sampled_ids))
-        if dst_idx:
+            # Rows this step did not carry over keep zero rejections and no
+            # overlay; the lookback then reads token_ids_cpu as-is.
+            safe_pos = np.where(matched, pre_pos, 0)
+            rejected_by_req = np.where(matched, spec_state.rejected[safe_pos], 0)
+            num_tokens_no_spec = getattr(batch, "num_tokens_no_spec", None)
+            n_draft = spec_state.num_draft[safe_pos]
+            if num_tokens_no_spec is not None:
+                write_start = (
+                    np.asarray(
+                        num_tokens_no_spec[start_index : start_index + chunk_num_reqs],
+                        dtype=np.int64,
+                    )
+                    - 1
+                    - n_draft
+                )
+            else:
+                write_start = (
+                    np.asarray(
+                        batch.num_computed_tokens_cpu[
+                            start_index : start_index + chunk_num_reqs
+                        ],
+                        dtype=np.int64,
+                    )
+                    - n_draft
+                )
+            sampled_overlay = _SampledOverlay(
+                tokens=spec_state.tokens[safe_pos],
+                starts=write_start,
+                lengths=np.where(matched, spec_state.lengths[safe_pos], 0),
+            )
+        if matched.any():
+            m_start = q_start[matched]
+            m_len = n_sched[matched]
+            dst_idx = _ragged_arange(m_start, m_len)
+            src_idx = _ragged_arange(pre_pos[matched] * stride, m_len)
             flat_src = _async_source_tokens_cpu(
                 pre_async, prefer_next_tokens_tpu=(spec_state is not None)
             )
-            if flat_src is None or int(flat_src.numel()) <= max(src_idx):
-                return HostEngramInputs(
-                    input_ids=runner.input_ids_cpu,
-                    positions=runner.positions_cpu,
-                    query_start_loc=runner.query_start_loc_cpu,
-                    lookback_token_ids=runner.lookback_token_ids.cpu,
-                    all_prompt=all_prompt,
-                    host_ready=False,
-                )
+            if flat_src is None or int(flat_src.numel()) <= int(src_idx.max()):
+                return _unresolved_host_inputs(runner, all_prompt)
             ids = runner.input_ids_cpu.clone()
-            ids[dst_idx] = flat_src[src_idx].to(dtype=ids.dtype)
-        if pos_adjustments:
-            positions = runner.positions_cpu.clone()
-            for q_start, q_end, n_rej in pos_adjustments:
-                positions[q_start:q_end] -= n_rej
+            np.asarray(ids)[dst_idx] = np.asarray(flat_src)[src_idx]
+            if rejected_by_req is not None:
+                m_rej = rejected_by_req[matched]
+                if m_rej.any():
+                    positions = runner.positions_cpu.clone()
+                    np.asarray(positions)[dst_idx] -= np.repeat(m_rej, m_len)
 
     lookback = _resolve_decode_lookback_cpu(
         runner,
