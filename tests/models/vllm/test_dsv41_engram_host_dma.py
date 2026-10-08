@@ -224,7 +224,9 @@ def test_install_patches_placeholder_and_mark(monkeypatch):
     assert placeholder(3) == 3
 
     def fn(row_ids, chunk, other):
-        return torch.ops.dsv41_host_rows.test_gather(row_ids, chunk) + other
+        # ``other + 0`` is not a placeholder: it must stay unmarked.
+        extra = torch.ops.dsv41_host_rows.test_gather(row_ids, other + 0)
+        return torch.ops.dsv41_host_rows.test_gather(row_ids, chunk) + extra
 
     graph = torch.fx.symbolic_trace(fn)
     inputs = [torch.zeros(4, dtype=torch.int32) for _ in range(3)]
