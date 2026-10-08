@@ -416,7 +416,7 @@ def test_moe_gmm(monkeypatch):
         )
         assert out1.shape == (num_tokens, hidden_size)
 
-        # Branch 2: EP + SC, size <= threshold, TPU_MOE_OWNER_OUTPUT_MODE == "off"
+        # Branch 2a: EP + SC, size <= 2304 (zero_init_gmm2=True), owner_output == "off"
         monkeypatch.setattr(envs, "TPU_MOE_OWNER_OUTPUT_MODE", "off")
         out2 = fused_moe_gmm.moe_gmm(
             x,
@@ -439,6 +439,37 @@ def test_moe_gmm(monkeypatch):
             onehot_moe_permute_threshold=128,
         )
         assert out2.shape == (num_tokens, hidden_size)
+
+        # Branch 2b: EP + SC, 2304 < size <= threshold (zero_init_gmm2=False)
+        n_tok_hi = 400
+        routes_hi = n_tok_hi * 6  # 2400 > 2304
+        x_hi = jnp.ones((routes_hi, hidden_size), dtype=jnp.bfloat16)
+        group_sizes_hi = jnp.array([600, 600, 600, 600], dtype=jnp.int32)
+        revert_hi = jnp.arange(routes_hi, dtype=jnp.int32)
+        weights_hi = jnp.ones(routes_hi, dtype=jnp.float32) * (1.0 / 6.0)
+        valid_hi = jnp.ones(routes_hi, dtype=bool)
+        tok_sorted_hi = jnp.arange(routes_hi, dtype=jnp.int32) // 6
+        out2b = fused_moe_gmm.moe_gmm(
+            x_hi,
+            w1,
+            None,
+            None,
+            w2,
+            None,
+            None,
+            group_sizes_hi,
+            revert_hi,
+            weights_hi,
+            valid_hi,
+            tok_sorted_hi,
+            activation="silu",
+            num_tokens=n_tok_hi,
+            topk=6,
+            use_ep=True,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=4096,
+        )
+        assert out2b.shape == (n_tok_hi, hidden_size)
 
         # Branch 3: EP + SC, size <= threshold, owner_output == "on", blockwise
         monkeypatch.setattr(envs, "TPU_MOE_OWNER_OUTPUT_MODE", "on")
