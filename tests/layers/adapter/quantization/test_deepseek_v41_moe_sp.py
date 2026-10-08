@@ -115,8 +115,8 @@ def _make_non_sp_ep_moe(
     "override_kwargs,ep_size,ep_rank,num_tokens,use_sim,expect_sliced",
     [
         ({}, 4, 2, 16, False, True),
+        ({"dp_size": 2}, 4, 2, 16, False, True),
         ({"sp": True}, 4, 2, 16, False, False),
-        ({"dp_size": 2}, 4, 2, 16, False, False),
         ({"pcp_size": 2}, 4, 2, 16, False, False),
         ({"use_ep": False}, 4, 2, 16, False, False),
         ({"is_monolithic": False}, 4, 2, 16, False, False),
@@ -130,8 +130,9 @@ def _make_non_sp_ep_moe(
 def test_maybe_slice_gate_input_guards(
     monkeypatch, override_kwargs, ep_size, ep_rank, num_tokens, use_sim, expect_sliced
 ):
-    ep = SimpleNamespace(world_size=ep_size, rank_in_group=ep_rank)
-    monkeypatch.setattr(mod, "get_ep_group", lambda: ep)
+    group = SimpleNamespace(world_size=ep_size, rank_in_group=ep_rank)
+    monkeypatch.setattr(mod, "get_ep_group", lambda: group)
+    monkeypatch.setattr(mod, "get_tp_group", lambda: group)
     monkeypatch.setattr(
         mod.moe_routing,
         "_SIMULATION_STRATEGY",
@@ -283,6 +284,125 @@ def test_non_sp_ep8_partitioned_routing_bit_exact_parity(
     monkeypatch.setattr(ps, "get_ep_group", _ReplayAllRanksGroup)
     ep_weights, ep_ids = mod.moe_routing.route(
         ep_layer, hidden, rank_sliced_logits[0], input_ids=input_ids
+    )
+
+    assert torch.equal(ep_weights, ref_weights)
+    assert torch.equal(ep_ids, ref_ids)
+
+
+@pytest.mark.parametrize("use_hash", [False, True])
+def test_non_sp_dp2_tp4_ep8_partitioned_routing_bit_exact_parity(monkeypatch, use_hash):
+    """Verify DP=2 x TP=4 + EP=8 non-SP TP gate slicing + route matches full routing."""
+    import vllm.distributed.parallel_state as ps
+
+    monkeypatch.setattr(mod.moe_routing, "_SIMULATION_STRATEGY", None)
+    monkeypatch.setattr(mod.moe_routing, "_ROUTER_TOPK", "rowmax")
+
+    dp_size = 2
+    tp_size = 4
+    ep_size = dp_size * tp_size
+    total_tokens = 288
+    dp_tokens = total_tokens // dp_size
+    hidden_dim = 32
+    num_experts = 96
+    topk = 8
+
+    torch.manual_seed(77)
+    hidden = torch.randn(total_tokens, hidden_dim, dtype=torch.bfloat16)
+    gate_weight = torch.randn(num_experts, hidden_dim, dtype=torch.float32)
+    bias = torch.randn(num_experts, dtype=torch.float32)
+    tid2eid = (
+        torch.randint(0, num_experts, (512, topk), dtype=torch.int32)
+        if use_hash
+        else None
+    )
+    input_ids = torch.randint(0, 512, (total_tokens,), dtype=torch.int64)
+
+    def gate_fn(x):
+        return torch.nn.functional.linear(x.float(), gate_weight), None
+
+    def make_routing_layer(dp_sz: int, use_ep_flag: bool):
+        return SimpleNamespace(
+            moe_config=SimpleNamespace(
+                experts_per_token=topk,
+                is_sequence_parallel=False,
+                dp_size=dp_sz,
+                pcp_size=1,
+                moe_parallel_config=SimpleNamespace(use_ep=use_ep_flag),
+            ),
+            custom_routing_function=None,
+            renormalize=True,
+            scoring_func="sigmoid",
+            e_score_correction_bias=None if use_hash else bias,
+            routed_scaling_factor=1.0,
+            use_grouped_topk=False,
+            topk_group=None,
+            num_expert_group=None,
+            router=SimpleNamespace(
+                hash_indices_table=tid2eid,
+                bias_vl=None,
+                image_sentinel_lo=0,
+            ),
+        )
+
+    # 1. Unpartitioned reference over all 288 tokens
+    ref_logits, _ = gate_fn(hidden)
+    ref_layer = make_routing_layer(dp_sz=1, use_ep_flag=False)
+    ref_weights, ref_ids = mod.moe_routing.route(
+        ref_layer, hidden, ref_logits, input_ids=input_ids
+    )
+
+    # 2. Simulate DP=2 x TP=4 (8 EP ranks) slicing DP-local hidden via get_tp_group()
+    rank_sliced_logits = []
+    for dp_rank in range(dp_size):
+        dp_hidden = hidden[dp_rank * dp_tokens : (dp_rank + 1) * dp_tokens]
+        for tp_rank in range(tp_size):
+            tp_stub = SimpleNamespace(world_size=tp_size, rank_in_group=tp_rank)
+            monkeypatch.setattr(mod, "get_tp_group", lambda tp_stub=tp_stub: tp_stub)
+            moe = _make_non_sp_ep_moe(dp_size=dp_size, gate_fn=gate_fn)
+            gate_in = moe._maybe_slice_gate_input(dp_hidden)
+            assert gate_in.shape == (dp_tokens // tp_size, hidden_dim)
+            local_logits, _ = moe.gate(gate_in)
+            rank_sliced_logits.append(local_logits)
+
+    ep_layer = make_routing_layer(dp_sz=dp_size, use_ep_flag=True)
+    local_packed_shards: list[torch.Tensor] = []
+
+    class _CaptureEpGroup:
+        def __init__(self, rank: int):
+            self.world_size = ep_size
+            self.rank_in_group = rank
+
+        def all_gather(self, tensor, dim=0):
+            local_packed_shards.append(tensor)
+            return tensor.repeat(ep_size, 1)
+
+    for dp_rank in range(dp_size):
+        dp_ids = input_ids[dp_rank * dp_tokens : (dp_rank + 1) * dp_tokens]
+        for tp_rank in range(tp_size):
+            ep_rank = dp_rank * tp_size + tp_rank
+            monkeypatch.setattr(
+                ps, "get_ep_group", lambda ep_rank=ep_rank: _CaptureEpGroup(ep_rank)
+            )
+            mod.moe_routing.route(
+                ep_layer, hidden, rank_sliced_logits[ep_rank], input_ids=dp_ids
+            )
+
+    full_packed = torch.cat(local_packed_shards, dim=0)
+
+    class _ReplayAllEpRanksGroup:
+        world_size = ep_size
+        rank_in_group = 0
+
+        def all_gather(self, tensor, dim=0):
+            return full_packed
+
+    monkeypatch.setattr(ps, "get_ep_group", _ReplayAllEpRanksGroup)
+    ep_weights, ep_ids = mod.moe_routing.route(
+        ep_layer,
+        hidden,
+        rank_sliced_logits[0],
+        input_ids=input_ids[:dp_tokens],
     )
 
     assert torch.equal(ep_weights, ref_weights)

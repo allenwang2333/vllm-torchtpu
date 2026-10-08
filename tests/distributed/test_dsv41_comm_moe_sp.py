@@ -156,6 +156,21 @@ def test_router_logits_distinct_tensor_gathered_twice(monkeypatch, communicator)
     torch.testing.assert_close(g_logits, torch.tensor([[3, 4], [13, 14]]))
 
 
+def test_router_logits_tp_sliced_not_gathered_under_dp(monkeypatch, communicator):
+    """Verify TP-sliced router_logits (< hidden_states) stays rank-local under DP."""
+    dp = Mock(world_size=2)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: dp)
+    dp.all_gather.side_effect = lambda x, dim: torch.cat([x, x + 10], dim=dim)
+    hidden = torch.tensor([[1, 2], [3, 4], [5, 6], [7, 8]])
+    logits = torch.tensor([[9, 10]])  # 1 < 4 (TP=4 slice of T_dp=4)
+    g_hidden, g_logits = communicator.dispatch_router_logits(
+        hidden, logits, is_sequence_parallel=False
+    )
+    dp.all_gather.assert_called_once_with(hidden, dim=0)
+    assert g_hidden.shape == (8, 2)
+    assert g_logits is logits
+
+
 # ==============================================================================
 # 2. Tests for VllmDeepseekV41Fp8Config & DeepseekV41MoE
 # ==============================================================================

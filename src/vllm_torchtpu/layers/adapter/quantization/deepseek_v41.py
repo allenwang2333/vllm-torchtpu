@@ -1,6 +1,6 @@
 """V4.1 model bindings for the shared DeepSeek V4 TPU quantization path."""
 
-from vllm.distributed.parallel_state import get_ep_group
+from vllm.distributed.parallel_state import get_ep_group, get_tp_group
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.models.deepseek_v4.nvidia import model as v4_upstream
 from vllm.models.deepseek_v41.nvidia.model import DeepseekV4MoE
@@ -51,12 +51,8 @@ class DeepseekV41MoE(DeepseekV4MoE):
             return hidden_states
         experts = getattr(self, "experts", None)
         moe_config = getattr(experts, "moe_config", None)
-        if (
-            getattr(moe_config, "dp_size", 1) > 1
-            or getattr(moe_config, "pcp_size", 1) > 1
-            or not getattr(
-                getattr(moe_config, "moe_parallel_config", None), "use_ep", False
-            )
+        if getattr(moe_config, "pcp_size", 1) > 1 or not getattr(
+            getattr(moe_config, "moe_parallel_config", None), "use_ep", False
         ):
             return hidden_states
         routed_experts = getattr(experts, "routed_experts", None)
@@ -68,14 +64,16 @@ class DeepseekV41MoE(DeepseekV4MoE):
             or moe_routing._SIMULATION_STRATEGY is not None
         ):
             return hidden_states
-        ep_group = get_ep_group()
-        ep_size = ep_group.world_size
+        slice_group = (
+            get_tp_group() if getattr(moe_config, "dp_size", 1) > 1 else get_ep_group()
+        )
+        group_size = slice_group.world_size
         num_tokens = hidden_states.shape[0]
-        if ep_size <= 1 or num_tokens % ep_size != 0:
+        if group_size <= 1 or num_tokens % group_size != 0:
             return hidden_states
-        chunk = num_tokens // ep_size
-        ep_rank = ep_group.rank_in_group
-        return hidden_states[ep_rank * chunk : (ep_rank + 1) * chunk]
+        chunk = num_tokens // group_size
+        rank = slice_group.rank_in_group
+        return hidden_states[rank * chunk : (rank + 1) * chunk]
 
     def _forward_fused_moe(self, hidden_states, input_ids=None):
         org_shape = hidden_states.shape
