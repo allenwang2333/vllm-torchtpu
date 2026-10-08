@@ -381,6 +381,36 @@ def test_route_partitioned_dp_input_ids_none(monkeypatch):
     assert out_i.shape == (total_t, 2)
 
 
+def test_route_partitioned_non_sp_ep_uses_ep_group(monkeypatch):
+    """Non-SP layer with dp_size=1 and use_ep=True gathers over get_ep_group()."""
+    monkeypatch.setattr(moe_routing, "_SIMULATION_STRATEGY", None)
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
+
+    world_size = 4
+    total_t = 16
+    local_t = total_t // world_size
+    hidden = torch.randn(total_t, 16, dtype=torch.bfloat16)
+    logits_shard = torch.randn(local_t, 32, dtype=torch.float32)
+    input_ids = torch.arange(total_t, dtype=torch.int64)
+
+    fake_ep = _FakeDistributedGroup(world_size=world_size, rank=2)
+    fake_dp = _FakeDistributedGroup(world_size=1, rank=0)
+    import vllm.distributed.parallel_state as ps
+
+    monkeypatch.setattr(ps, "get_ep_group", lambda: fake_ep)
+    monkeypatch.setattr(ps, "get_dp_group", lambda: fake_dp)
+
+    layer = _make_routing_layer(topk=4, is_sequence_parallel=False)
+    layer.moe_config.dp_size = 1
+    layer.moe_config.moe_parallel_config = SimpleNamespace(use_ep=True)
+    out_w, out_i = moe_routing.route(layer, hidden, logits_shard, input_ids=input_ids)
+
+    assert len(fake_ep.all_gather_calls) == 1
+    assert len(fake_dp.all_gather_calls) == 0
+    assert out_w.shape == (total_t, 4)
+    assert out_i.shape == (total_t, 4)
+
+
 def test_route_partitioned_input_ids_mismatched_numel(monkeypatch):
     """Lines 211-213: When input_ids.numel() != hidden_states.shape[0], no slicing."""
     monkeypatch.setattr(moe_routing, "_SIMULATION_STRATEGY", None)

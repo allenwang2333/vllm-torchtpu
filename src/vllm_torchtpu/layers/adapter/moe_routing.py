@@ -235,10 +235,19 @@ def route(
     if router_logits.shape[0] < hidden_states.shape[0]:
         from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 
-        is_sp = bool(
-            getattr(getattr(layer, "moe_config", None), "is_sequence_parallel", False)
+        moe_config = getattr(layer, "moe_config", None)
+        use_ep_group = bool(
+            getattr(moe_config, "is_sequence_parallel", False)
+            or (
+                getattr(moe_config, "dp_size", 1) <= 1
+                and getattr(
+                    getattr(moe_config, "moe_parallel_config", None),
+                    "use_ep",
+                    False,
+                )
+            )
         )
-        group = get_ep_group() if is_sp else get_dp_group()
+        group = get_ep_group() if use_ep_group else get_dp_group()
         local_t = router_logits.shape[0]
         local_input_ids = input_ids
         if input_ids is not None and input_ids.numel() == hidden_states.shape[0]:

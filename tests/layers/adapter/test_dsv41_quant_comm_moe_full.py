@@ -160,6 +160,7 @@ class TestDeepseekV41Quant:
         # Instantiate
         _ = DeepseekV41MoE(vllm_config, 1, 2, kw="test")
         assert called_options["apply_routed_scale_to_output"] is True
+        assert called_options["gate"] is None
         assert called_options["routed_scaling"] == 2.0
 
     def test_deepseek_v41_moe_forward_branches(

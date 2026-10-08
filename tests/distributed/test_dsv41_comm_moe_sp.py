@@ -227,6 +227,7 @@ def test_moe_init_success_wraps_factory(monkeypatch):
     moe = moe_quant.DeepseekV41MoE(vllm_config)
     assert isinstance(moe, moe_quant.DeepseekV41MoE)
     assert captured_options.get("apply_routed_scale_to_output") is True
+    assert captured_options.get("gate") is None
     assert captured_options.get("foo") == "bar"
 
 
