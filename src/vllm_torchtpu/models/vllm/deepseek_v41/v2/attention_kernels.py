@@ -65,13 +65,19 @@ def _attend(q, pool, records, state, scale, tile=64):
 
     def step(index, carry):
         maximum, denominator, numerator = carry
-        addresses = jax.lax.dynamic_slice_in_dim(records, index * tile, tile, axis=1)
+        if isinstance(index, int):
+            start = index * tile
+            addresses = records[:, start : start + tile]
+            kv_slice = gathered[:, :, start : start + tile]
+        else:
+            addresses = jax.lax.dynamic_slice_in_dim(
+                records, index * tile, tile, axis=1
+            )
+            kv_slice = jax.lax.dynamic_slice_in_dim(
+                gathered, index * tile, tile, axis=2
+            )
         valid = addresses >= 0
-        kv = jnp.where(
-            valid[None, ..., None],
-            jax.lax.dynamic_slice_in_dim(gathered, index * tile, tile, axis=2),
-            0,
-        )
+        kv = jnp.where(valid[None, ..., None], kv_slice, 0)
         scores = (
             jnp.einsum(
                 "pthd,ptkd->thk",
@@ -94,9 +100,13 @@ def _attend(q, pool, records, state, scale, tile=64):
         )
         return new_max, denominator, numerator
 
-    maximum, denominator, numerator = jax.lax.fori_loop(
-        0, records.shape[1] // tile, step, state
-    )
+    steps = records.shape[1] // tile
+    if steps <= 8:
+        for index in range(steps):
+            state = step(index, state)
+        maximum, denominator, numerator = state
+    else:
+        maximum, denominator, numerator = jax.lax.fori_loop(0, steps, step, state)
     return maximum, denominator, merge_pieces(numerator)
 
 
@@ -287,24 +297,22 @@ def _attend_shared_block(q, pool, records, state, scale, block, tile=64):
     gathered = gathered.reshape(count, groups, shared.shape[1], -1)
 
     maximum, denominator, numerator = (s[:full] for s in state)
-    carry = (
-        maximum.reshape(groups, block, heads),
-        denominator.reshape(groups, block, heads),
-        split_pieces(numerator, count).reshape(count, groups, block, heads, -1),
-    )
+    maximum = maximum.reshape(groups, block, heads)
+    denominator = denominator.reshape(groups, block, heads)
+    numerator = split_pieces(numerator, count).reshape(count, groups, block, heads, -1)
     qb = (
         split_pieces(q[:full], count)
         .astype(jnp.float32)
         .reshape(count, groups, block, heads, -1)
     )
 
-    def step(index, carry):
-        maximum, denominator, numerator = carry
-        addresses = jax.lax.dynamic_slice_in_dim(shared, index * tile, tile, axis=1)
+    for start in range(0, shared.shape[1], tile):
+        end = start + tile
+        addresses = shared[:, start:end]
         valid = addresses >= 0
         kv = jnp.where(
             valid[None, ..., None],
-            jax.lax.dynamic_slice_in_dim(gathered, index * tile, tile, axis=2),
+            gathered[:, :, start:end],
             0,
         )
         scores = (
@@ -327,11 +335,7 @@ def _attend_shared_block(q, pool, records, state, scale, block, tile=64):
             kv,
             preferred_element_type=jnp.float32,
         )
-        return new_max, denominator, numerator
-
-    maximum, denominator, numerator = jax.lax.fori_loop(
-        0, shared.shape[1] // tile, step, carry
-    )
+        maximum = new_max
     bad = mismatch[:, None]
     result = (
         jnp.where(bad, jnp.nan, maximum.reshape(full, heads)),

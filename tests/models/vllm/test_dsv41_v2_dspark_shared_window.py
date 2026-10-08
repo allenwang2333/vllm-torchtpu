@@ -138,3 +138,95 @@ def test_paged_attention_forwards_block(monkeypatch, hi):
         torch.zeros(4, 2, 64), _Buf(hi), _Buf(hi), rec, rec, torch.zeros(2), 0.1
     )
     assert op.call_args.args[-1] == 1
+
+
+def test_attend_large_width_fori_loop_matches_unrolled():
+    """Verify _attend fori_loop branch (steps > 8) matches static unroll."""
+    tokens, width, tile = 4, 72, 8
+    q, pool = _q(tokens), _pool()
+    records = _block_records(tokens, 1, width, 0)
+    state = _attention_state(q)
+    got_fori = _attend(q, pool, records, state, 0.125, tile=tile)
+    got_unrolled = _attend_shared_block(
+        q, pool, records, state, 0.125, block=1, tile=tile
+    )
+    for g, w in zip(got_fori, got_unrolled):
+        np.testing.assert_allclose(np.asarray(g), np.asarray(w), rtol=1e-5, atol=1e-5)
+
+
+def test_non_causal_swa_6page_fast_path_matches_uncached(monkeypatch):
+    """Verify non_causal=True 6-page SWA fast path matches uncached _row_slots."""
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention as v2_attn
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
+
+    count = 10
+    rows_per_page = 32
+    positions = torch.tensor(
+        [150, 151, 152, 153, 154, 15, 16, 17, 18, 19], dtype=torch.int32
+    )
+    swa_table = torch.tensor(
+        [[10, 11, 12, 13, 14, 15, 16], [20, 21, 22, 23, 24, 25, 26]],
+        dtype=torch.int32,
+    )
+    swa_meta = SimpleNamespace(
+        seq_lens=torch.tensor([155, 20], dtype=torch.int32),
+        block_tables=swa_table,
+        query_start_loc=torch.tensor([0, 5, 10], dtype=torch.int32),
+    )
+    forward_ctx = SimpleNamespace(
+        attn_metadata={"swa_pfx": swa_meta}, additional_kwargs={}
+    )
+    monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
+    monkeypatch.setattr(v2_attn, "_insert", lambda *a, **kw: None)
+
+    captured: list[torch.Tensor] = []
+    monkeypatch.setattr(
+        v2_attn,
+        "paged_attention",
+        lambda q, swa_c, main_c, recs, *args, **kw: (
+            captured.append(recs.clone()) or torch.zeros_like(q)
+        ),
+    )
+
+    cache_mock = mock.MagicMock(spec=PagedCacheRows)
+    cache_mock.numel.return_value = 1024
+    cache_mock.shape = (64, rows_per_page, 512)
+    cache_mock.page_stride = rows_per_page
+    cache_mock.row_offset = 1000
+
+    attn = object.__new__(v2_attn.DeepseekV41Attention)
+    torch.nn.Module.__init__(attn)
+    attn.prefix = "swa_pfx"
+    attn.window_size = 128
+    attn.non_causal_multi_token_decode = True
+    attn.dspark_block_size = 5
+    attn.query_block_size = 5
+    attn._ced_decoder = False
+    attn._ced_global_from_encoder = False
+    attn._local_q_attn = False
+    attn.compressor = None
+    attn.indexer = None
+    attn.compress_ratio = 0
+    attn._fp8_kv = False
+    attn.n_local_heads = 2
+    attn.head_dim = 8
+    attn.scale = 0.25
+    attn.attn_sink = torch.zeros(2)
+    attn._full_attn_sink = None
+    attn._tp_rank_1d = None
+    attn._rotate = lambda x, p: x
+    attn.wq_b = lambda qr: qr
+    attn.swa_cache_layer = SimpleNamespace(prefix="swa_pfx", kv_cache=cache_mock)
+    attn.kv_cache = cache_mock
+
+    qr = torch.ones((count, 16), dtype=torch.bfloat16)
+    kv = torch.ones((count, 8), dtype=torch.bfloat16)
+    out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
+
+    with v2_attn.stage_attention_cache_scope():
+        attn._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+    attn._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+    assert len(captured) == 2
+    assert torch.equal(captured[0], captured[1])
