@@ -1610,13 +1610,19 @@ class TestS62AndS65OwnerComposition:
         self, monkeypatch
     ):
         """Verify R=3, P=5, tp=8 (M=8, N=43) row_indices & pages match OwnerLayout."""
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec,
+            KVCacheConfig,
+            KVCacheGroupSpec,
+        )
+
         from vllm_torchtpu.core import owner_affine_block_pool as oabp
         from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
             materialize_upstream_kv_cache,
             resolve_worker_owner_layout,
         )
 
-        # 1. Test resolve_worker_owner_layout (both fallback and explicit helper)
+        # 1. Test resolve_worker_owner_layout delegating to oabp.worker_owner_layout
         vllm_cfg = SimpleNamespace(
             parallel_config=SimpleNamespace(tensor_parallel_size=8),
             scheduler_config=SimpleNamespace(max_num_seqs=2),
@@ -1624,39 +1630,34 @@ class TestS62AndS65OwnerComposition:
             max_in_flight_tokens=16,
             cache_config=SimpleNamespace(enable_prefix_caching=False),
         )
-        kv_cfg = SimpleNamespace(
+        spec = FullAttentionSpec(
+            block_size=64, num_kv_heads=1, head_size=256, dtype=torch.bfloat16
+        )
+        kv_cfg = KVCacheConfig(
             num_blocks=8,
             kv_cache_tensors=[SimpleNamespace(size=8 * 64 * 512)],
             kv_cache_groups=[
-                SimpleNamespace(kv_cache_spec=SimpleNamespace(page_size_bytes=64 * 512))
+                KVCacheGroupSpec(
+                    layer_names=["model.layers.0.self_attn.attn"], kv_cache_spec=spec
+                )
             ],
         )
         monkeypatch.setattr(oabp, "replicated_blocks_needed", lambda vc, kc: 3)
-        monkeypatch.delattr(oabp, "worker_owner_layout", raising=False)
         layout = resolve_worker_owner_layout(vllm_cfg, kv_cfg)
         assert layout == oabp.OwnerLayout(3, 8, 5)
         assert layout.num_blocks == 43
 
-        bad_kv_cfg = SimpleNamespace(
+        bad_kv_cfg = KVCacheConfig(
             num_blocks=3,
-            kv_cache_tensors=[SimpleNamespace(size=3 * 64 * 512)],
+            kv_cache_tensors=[],
             kv_cache_groups=[
-                SimpleNamespace(kv_cache_spec=SimpleNamespace(page_size_bytes=64 * 512))
+                KVCacheGroupSpec(
+                    layer_names=["model.layers.0.self_attn.attn"], kv_cache_spec=spec
+                )
             ],
         )
         with pytest.raises(ValueError, match="needs more than 3 KV blocks per rank"):
             resolve_worker_owner_layout(vllm_cfg, bad_kv_cfg)
-
-        # Also test delegation when worker_owner_layout is present on oabp
-        monkeypatch.setattr(
-            oabp,
-            "worker_owner_layout",
-            lambda vc, kc: oabp.OwnerLayout(3, 8, 5),
-            raising=False,
-        )
-        assert resolve_worker_owner_layout(vllm_cfg, kv_cfg) == oabp.OwnerLayout(
-            3, 8, 5
-        )
 
         # 2. Verify materialize_upstream_kv_cache with scheduler_blocks=43, M=8
         def fake_alloc(cfg, dev, lay):
@@ -1783,6 +1784,7 @@ class TestS62AndS65OwnerComposition:
                 )
             ),
             device=torch.device("cpu"),
+            num_tokens_paddings=[8, 16],
             _unified_kv_layout=False,
             may_reinitialize_input_batch=lambda kc, bs: None,
             block_table_cpu=torch.zeros((1, 1), dtype=torch.int32),
@@ -1820,10 +1822,23 @@ class TestS62AndS65OwnerComposition:
             "replicated_blocks": 3,
             "scheduler_blocks": 43,
         }
+        assert mgr.runner._kv_shard_owner_layout == oabp.OwnerLayout(3, 8, 5)
+        meta_dict = {
+            "layer0": SimpleNamespace(
+                block_tables=torch.tensor([[1, 15], [3, 4]], dtype=torch.int32),
+                query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+            )
+        }
+        tok_layout = mgr.prepare_owner_token_layout(meta_dict, [1, 1])
+        assert tok_layout is not None
+        assert meta_dict["layer0"].owner_token_layout is tok_layout
+
         seen_kwargs.clear()
         monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_KV_SHARD", False)
         mgr.initialize_kv_cache(kv_cfg)
         assert seen_kwargs == {"word_rows": True}
+        assert mgr.runner._kv_shard_owner_layout is None
+        assert mgr.prepare_owner_token_layout(meta_dict, [1, 1]) is None
 
     def test_s65_permute_unpermute_and_slice_token_parallel_with_owner_perm(
         self, monkeypatch
@@ -2451,3 +2466,214 @@ class TestS62AndS65OwnerComposition:
             match="FP8 V4.1 KV cache requires the tiled path",
         ):
             attn._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+
+    def test_s65b_e2e_8rank_multi_request_decode_and_dspark_parity(self):
+        """End-to-end S6.2 + S6.5a/b + S6.6b/c 8-rank multi-request CPU parity."""
+        from vllm_torchtpu.core.owner_affine_block_pool import OwnerLayout
+        from vllm_torchtpu.runner.owner_token_layout import (
+            prepare_kv_shard_owner_token_layout,
+        )
+
+        torch.manual_seed(20261008)
+        tp_size = 8
+        block_size = 4
+        replicated_blocks = 2
+        blocks_per_owner = 2
+        owner_layout = OwnerLayout(
+            num_replicated=replicated_blocks,
+            num_owners=tp_size,
+            blocks_per_owner=blocks_per_owner,
+        )
+        total_blocks = owner_layout.num_blocks  # 2 + 8 * 2 = 18
+        local_blocks = replicated_blocks + blocks_per_owner  # 4
+
+        # 5 requests with imbalanced/interleaved owners: [2, 0, 2, 5, 7]
+        req_owners = [2, 0, 2, 5, 7]
+        num_reqs = len(req_owners)
+        # Replicated SWA blocks in [0, 2); sharded main blocks in owner's region
+        swa_block_table = torch.tensor([[0], [1], [0], [1], [0]], dtype=torch.int32)
+        main_block_table = torch.tensor(
+            [
+                [replicated_blocks + 2 * blocks_per_owner + 0],
+                [replicated_blocks + 0 * blocks_per_owner + 1],
+                [replicated_blocks + 2 * blocks_per_owner + 1],
+                [replicated_blocks + 5 * blocks_per_owner + 0],
+                [replicated_blocks + 7 * blocks_per_owner + 1],
+            ],
+            dtype=torch.int32,
+        )
+
+        # Build global BF16 pool (18 blocks * 4 rows/block = 72 rows)
+        head_dim = 128
+        global_bf16 = torch.randn(
+            (total_blocks * block_size, 2, head_dim), dtype=torch.bfloat16
+        )
+        global_raw = torch.zeros(
+            (total_blocks * block_size, ROW_WORDS), dtype=torch.int32
+        )
+        global_raw.view(torch.bfloat16)[:, : 2 * head_dim] = global_bf16.reshape(
+            -1, 2 * head_dim
+        )
+        global_cache = PagedCacheRows(
+            global_raw,
+            (
+                (total_blocks, block_size, head_dim),
+                torch.bfloat16,
+                block_size * ROW_WORDS * 4,
+                0,
+                0,
+                True,
+            ),
+        )
+
+        # Build per-rank sharded physical pools (M = 4 blocks = 16 rows per rank)
+        rank_caches: list[PagedCacheRows] = []
+        for r in range(tp_size):
+            r_offset = replicated_blocks + r * blocks_per_owner
+            rep_rows = global_raw[: replicated_blocks * block_size]
+            own_rows = global_raw[
+                r_offset * block_size : (r_offset + blocks_per_owner) * block_size
+            ]
+            local_raw = torch.cat([rep_rows, own_rows], dim=0).clone()
+            rank_caches.append(
+                PagedCacheRows(
+                    local_raw,
+                    (
+                        (local_blocks, block_size, head_dim),
+                        torch.bfloat16,
+                        block_size * ROW_WORDS * 4,
+                        0,
+                        r_offset,
+                        True,
+                        replicated_blocks,
+                    ),
+                )
+            )
+
+        # Test both q_len=1 (decode, T=5) and q_len=2 (DSpark verify, T=10)
+        for q_len in (1, 2):
+            tokens_per_req = [q_len] * num_reqs
+            total_tokens = num_reqs * q_len
+            swa_meta = SimpleNamespace(
+                block_tables=swa_block_table,
+                query_start_loc=torch.arange(
+                    0, total_tokens + 1, q_len, dtype=torch.int32
+                ),
+            )
+            main_meta = SimpleNamespace(
+                block_tables=main_block_table,
+                query_start_loc=torch.arange(
+                    0, total_tokens + 1, q_len, dtype=torch.int32
+                ),
+            )
+            metadata = {"swa": swa_meta, "main": main_meta}
+            tok_layout = prepare_kv_shard_owner_token_layout(
+                metadata,
+                owner_layout,
+                tokens_per_req,
+                token_paddings=[8, 16, 32],
+                num_padded_tokens=total_tokens,
+            )
+            assert main_meta.owner_token_layout is tok_layout
+            np.testing.assert_array_equal(
+                tok_layout.owner_tokens,
+                [q_len, 0, 2 * q_len, 0, 0, q_len, 0, q_len],
+            )
+
+            # Build global slot indices per token for SWA and Main
+            swa_slots = torch.zeros((total_tokens, 2), dtype=torch.long)
+            main_slots = torch.zeros((total_tokens, 2), dtype=torch.long)
+            for req_i in range(num_reqs):
+                s_blk = int(swa_block_table[req_i, 0].item())
+                m_blk = int(main_block_table[req_i, 0].item())
+                for t in range(q_len):
+                    tok_idx = req_i * q_len + t
+                    swa_slots[tok_idx] = torch.tensor(
+                        [s_blk * block_size + 0, s_blk * block_size + 1],
+                        dtype=torch.long,
+                    )
+                    main_slots[tok_idx] = torch.tensor(
+                        [m_blk * block_size + 0, m_blk * block_size + 1],
+                        dtype=torch.long,
+                    )
+
+            swa_records_global = torch.full((total_tokens, 64), -1, dtype=torch.int32)
+            main_records_global = torch.full((total_tokens, 64), -1, dtype=torch.int32)
+            swa_records_global[:, :2] = global_cache.row_indices(swa_slots)
+            main_records_global[:, :2] = global_cache.row_indices(main_slots)
+
+            q_batch = torch.randn((total_tokens, 8, head_dim), dtype=torch.bfloat16)
+            sink = torch.zeros((8,), dtype=torch.float32)
+
+            # Reference: each token attends against global_cache on its SWA + Main rows
+            ref_out = torch.empty_like(q_batch)
+            for tok_idx in range(total_tokens):
+                q_tok = q_batch[tok_idx : tok_idx + 1]
+                s_rec = jnp.asarray(swa_records_global[tok_idx : tok_idx + 1].numpy())
+                m_rec = jnp.asarray(main_records_global[tok_idx : tok_idx + 1].numpy())
+                out_j = attention_kernels.paged_attention_jax(
+                    jnp.asarray(q_tok.float().numpy()).astype(jnp.bfloat16),
+                    jnp.asarray(global_cache.raw.numpy()),
+                    jnp.asarray(global_cache.raw.numpy()),
+                    s_rec,
+                    m_rec,
+                    jnp.asarray(sink.numpy()),
+                    0.125,
+                )
+                ref_out[tok_idx] = torch.from_numpy(
+                    np.asarray(out_j, dtype=np.float32)
+                ).to(torch.bfloat16)[0]
+
+            # Sharded 8-rank execution using runner-produced owner_perm/inv/q_loc
+            perm_j = jnp.asarray(main_meta.owner_perm.numpy())
+            inv_j = jnp.asarray(main_meta.owner_inv.numpy())
+            q_loc_j = jnp.asarray(main_meta.owner_q_loc.numpy())
+            seg_len = tok_layout.segment_tokens
+
+            q_perm = attention_kernels._permute_owner_tokens_jax(
+                jnp.asarray(q_batch.float().numpy()).astype(jnp.bfloat16), perm_j
+            )
+            rank_outputs = []
+            for r in range(tp_size):
+                # Rank r translates its own segment's main_slots through rank_caches[r]
+                perm_seg = main_meta.owner_perm[r * seg_len : (r + 1) * seg_len]
+                safe_seg = perm_seg.clamp(min=0).to(torch.long)
+                main_slots_seg = main_slots[safe_seg]
+                main_rec_local = torch.full((seg_len, 64), -1, dtype=torch.int32)
+                main_rec_local[:, :2] = rank_caches[r].row_indices(main_slots_seg)
+                main_rec_local = torch.where(
+                    perm_seg.unsqueeze(-1) >= 0,
+                    main_rec_local,
+                    torch.full_like(main_rec_local, -1),
+                )
+                s_loc, m_loc, _ = (
+                    attention_kernels.slice_token_parallel_attention_inputs(
+                        jnp.asarray(swa_records_global.numpy()),
+                        jnp.asarray(main_rec_local.numpy()),
+                        q_loc_j,
+                        jnp.asarray(r, dtype=jnp.int32),
+                        tp_size,
+                        total_tokens,
+                        owner_perm=perm_j,
+                    )
+                )
+                q_seg = q_perm[r * seg_len : (r + 1) * seg_len]
+                out_seg = attention_kernels.paged_attention_jax(
+                    q_seg,
+                    jnp.asarray(rank_caches[r].raw.numpy()),
+                    jnp.asarray(rank_caches[r].raw.numpy()),
+                    s_loc,
+                    m_loc,
+                    jnp.asarray(sink.numpy()),
+                    0.125,
+                )
+                rank_outputs.append(out_seg)
+
+            sharded_perm_out = jnp.concatenate(rank_outputs, axis=0)
+            sharded_out_j = attention_kernels._unpermute_owner_tokens_jax(
+                sharded_perm_out, inv_j
+            )
+            sharded_out = torch.from_numpy(
+                np.asarray(sharded_out_j, dtype=np.float32)
+            ).to(torch.bfloat16)
+            assert torch.equal(sharded_out, ref_out)

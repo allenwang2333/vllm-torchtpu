@@ -121,21 +121,7 @@ def resolve_worker_owner_layout(vllm_config, kv_cache_config):
     """Derive the scheduler's `OwnerLayout` from a worker's `kv_cache_config`."""
     from vllm_torchtpu.core import owner_affine_block_pool as oabp
 
-    fn = getattr(oabp, "worker_owner_layout", None)
-    if fn is not None:
-        return fn(vllm_config, kv_cache_config)
-    num_replicated = oabp.replicated_blocks_needed(vllm_config, kv_cache_config)
-    per_owner = kv_cache_config.num_blocks - num_replicated
-    if per_owner < 1:
-        raise ValueError(
-            f"TPU_DEEPSEEK_V41_KV_SHARD=1 needs more than {num_replicated} KV "
-            f"blocks per rank, got {kv_cache_config.num_blocks}"
-        )
-    return oabp.OwnerLayout(
-        num_replicated,
-        vllm_config.parallel_config.tensor_parallel_size,
-        per_owner,
-    )
+    return oabp.worker_owner_layout(vllm_config, kv_cache_config)
 
 
 def materialize_upstream_kv_cache(

@@ -1369,6 +1369,7 @@ class KVCacheManager:
         native_raw_cache = None
         native_cache_layouts = None
         native_rope_pools = None
+        self.runner._kv_shard_owner_layout = None
         if use_upstream_allocator:
             if envs.TPU_DEEPSEEK_V41_IMPL == "v2":
                 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
@@ -1381,6 +1382,7 @@ class KVCacheManager:
                     owner_layout = resolve_worker_owner_layout(
                         self.runner.vllm_config, kv_cache_config
                     )
+                    self.runner._kv_shard_owner_layout = owner_layout
                     shard_kwargs = {
                         "replicated_blocks": owner_layout.num_replicated,
                         "scheduler_blocks": owner_layout.num_blocks,
@@ -1850,3 +1852,40 @@ class KVCacheManager:
 
         if not self.runner.enforce_eager:
             self.runner._precompile_substitute_placeholder_token()
+
+    def prepare_owner_token_layout(
+        self,
+        attn_metadata: dict[str, Any],
+        tokens_per_req: Any,
+        token_paddings: Any | None = None,
+        *,
+        num_padded_tokens: int | None = None,
+        num_reqs_padded: int | None = None,
+        segment_multiple: int = 1,
+        default_owner: int = 0,
+    ) -> Any:
+        """Build and attach the S6.5 owner-grouped token layout when KV sharding
+        is active."""
+        owner_layout = getattr(self.runner, "_kv_shard_owner_layout", None)
+        if owner_layout is None:
+            return None
+        from vllm_torchtpu.runner.owner_token_layout import (
+            prepare_kv_shard_owner_token_layout,
+        )
+
+        paddings = (
+            token_paddings
+            if token_paddings is not None
+            else getattr(self.runner, "num_tokens_paddings", ())
+        )
+        return prepare_kv_shard_owner_token_layout(
+            attn_metadata,
+            owner_layout,
+            tokens_per_req,
+            paddings,
+            device=self.runner.device,
+            num_padded_tokens=num_padded_tokens,
+            num_reqs_padded=num_reqs_padded,
+            segment_multiple=segment_multiple,
+            default_owner=default_owner,
+        )

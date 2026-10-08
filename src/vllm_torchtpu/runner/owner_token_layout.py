@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
+import torch
 
 
 @dataclasses.dataclass(frozen=True)
@@ -159,3 +161,207 @@ def build_owner_token_layout(
         query_start_loc=query_start_loc.astype(np.int32),
         owner_tokens=owner_tokens.astype(np.int32),
     )
+
+
+def _to_2d_numpy(table: Any) -> np.ndarray:
+    if hasattr(table, "block_tables") and table.block_tables is not None:
+        table = table.block_tables
+    raw = table.get_cpu_tensor() if hasattr(table, "get_cpu_tensor") else table
+    arr = (
+        raw.detach().cpu().numpy() if isinstance(raw, torch.Tensor) else np.asarray(raw)
+    )
+    if arr.ndim != 2:
+        raise ValueError(
+            f"Expected 2D block table [reqs, blocks], got shape {arr.shape}"
+        )
+    return arr
+
+
+def extract_request_owners_from_block_table(
+    block_table: Any,
+    num_blocks_per_req_or_layout: Any,
+    owner_layout: Any = None,
+    *,
+    num_reqs: int | None = None,
+    num_blocks_per_req: Sequence[int] | np.ndarray | torch.Tensor | None = None,
+    start_index: int = 0,
+    default_owner: int = 0,
+) -> np.ndarray:
+    """Resolve each active request's owner rank in ``[0, tp_size)`` from its
+    allocated block table(s) and ``owner_layout``.
+
+    Scans the request's allocated block IDs for the first block in
+    ``[owner_layout.num_replicated, owner_layout.num_blocks)`` and maps it via
+    ``owner_layout.region_of(block_id)``. Falls back to ``default_owner`` when a
+    short or dummy request only occupies replicated blocks ``< num_replicated``.
+    """
+    if hasattr(num_blocks_per_req_or_layout, "region_of"):
+        layout = num_blocks_per_req_or_layout
+        blocks_per_req = num_blocks_per_req
+    else:
+        layout = owner_layout
+        blocks_per_req = (
+            num_blocks_per_req_or_layout
+            if num_blocks_per_req is None
+            else num_blocks_per_req
+        )
+    if layout is None or not hasattr(layout, "region_of"):
+        raise ValueError(f"Expected a valid OwnerLayout, got {layout}")
+    if isinstance(block_table, dict):
+        raw_tables = [
+            m
+            for m in block_table.values()
+            if getattr(m, "block_tables", None) is not None
+        ]
+    elif (
+        isinstance(block_table, (np.ndarray, torch.Tensor))
+        or hasattr(block_table, "get_cpu_tensor")
+        or getattr(block_table, "block_tables", None) is not None
+    ):
+        raw_tables = [block_table]
+    else:
+        raw_tables = list(block_table)
+    tables = tuple(_to_2d_numpy(t) for t in raw_tables)
+    if not tables:
+        raise ValueError("Expected at least one block table")
+    total_reqs = tables[0].shape[0] - start_index if num_reqs is None else int(num_reqs)
+    if (
+        total_reqs < 0
+        or start_index < 0
+        or start_index + total_reqs > tables[0].shape[0]
+    ):
+        raise ValueError(
+            f"Invalid request slice [{start_index}, {start_index + total_reqs}) "
+            f"for block table with {tables[0].shape[0]} rows"
+        )
+    limits = (
+        None if blocks_per_req is None else np.asarray(blocks_per_req, dtype=np.int64)
+    )
+    if limits is not None and limits.shape != (total_reqs,):
+        raise ValueError(
+            f"Expected num_blocks_per_req of shape ({total_reqs},), got {limits.shape}"
+        )
+    owners = np.full(total_reqs, int(default_owner), dtype=np.int64)
+    num_rep = int(layout.num_replicated)
+    num_total = int(layout.num_blocks)
+    for req_idx in range(total_reqs):
+        row_idx = start_index + req_idx
+        for tbl in tables:
+            max_cols = (
+                tbl.shape[1]
+                if limits is None
+                else max(0, min(tbl.shape[1], int(limits[req_idx])))
+            )
+            row = tbl[row_idx, :max_cols]
+            owned_mask = (row >= num_rep) & (row < num_total)
+            if np.any(owned_mask):
+                first_block = int(row[int(np.argmax(owned_mask))])
+                owners[req_idx] = int(layout.region_of(first_block))
+                break
+    return owners
+
+
+def owner_layout_tensors(
+    layout: OwnerTokenLayout,
+    *,
+    device: torch.device | str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert ``layout`` into ``(owner_perm, owner_inv, owner_q_loc)`` int32
+    tensors with padding rows/tokens masked to ``-1``."""
+    target_device = torch.device("cpu") if device is None else torch.device(device)
+    seg_col = np.arange(layout.padded_tokens) % layout.segment_tokens
+    seg_owner = np.arange(layout.padded_tokens) // layout.segment_tokens
+    valid_perm = seg_col < layout.owner_tokens[seg_owner]
+    perm_masked = np.where(valid_perm, layout.perm, -1).astype(np.int32)
+    total_real = int(layout.owner_tokens.sum())
+    valid_inv = np.arange(layout.inv.shape[0]) < total_real
+    inv_masked = np.where(valid_inv, layout.inv, -1).astype(np.int32)
+    return (
+        torch.as_tensor(perm_masked, dtype=torch.int32, device=target_device),
+        torch.as_tensor(inv_masked, dtype=torch.int32, device=target_device),
+        torch.as_tensor(
+            layout.query_start_loc, dtype=torch.int32, device=target_device
+        ),
+    )
+
+
+def attach_owner_token_layout(
+    attn_metadata: Any,
+    layout: OwnerTokenLayout,
+    *,
+    device: torch.device | str | None = None,
+) -> Any:
+    """Attach ``layout`` and device ``int32`` tensors onto ``attn_metadata``."""
+    targets = (
+        tuple(attn_metadata.values())
+        if isinstance(attn_metadata, dict)
+        else (attn_metadata,)
+    )
+    first_q_loc: Any = getattr(targets[0], "query_start_loc", None) if targets else None
+    if device is not None:
+        target_device: torch.device | str = device
+    elif isinstance(first_q_loc, torch.Tensor):
+        target_device = first_q_loc.device
+    else:
+        target_device = torch.device("cpu")
+    perm_t, inv_t, q_loc_t = owner_layout_tensors(layout, device=target_device)
+    for meta in targets:
+        meta.owner_token_layout = layout
+        meta.owner_perm = perm_t
+        meta.owner_inv = inv_t
+        meta.owner_q_loc = q_loc_t
+    return attn_metadata
+
+
+def prepare_kv_shard_owner_token_layout(
+    block_table: Any,
+    owner_layout: Any,
+    num_scheduled_tokens: Sequence[int] | np.ndarray | torch.Tensor,
+    token_paddings: Sequence[int],
+    *,
+    num_padded_tokens: int | None = None,
+    num_reqs_padded: int | None = None,
+    segment_multiple: int = 1,
+    num_blocks_per_req: Sequence[int] | np.ndarray | torch.Tensor | None = None,
+    start_index: int = 0,
+    default_owner: int = 0,
+    attn_metadata: Any = None,
+    device: torch.device | str | None = None,
+) -> OwnerTokenLayout:
+    """Extract request owners from ``block_table``, build ``OwnerTokenLayout``,
+    and optionally attach it onto ``attn_metadata``."""
+    tokens_arr = (
+        num_scheduled_tokens.detach().cpu().numpy()
+        if isinstance(num_scheduled_tokens, torch.Tensor)
+        else np.asarray(num_scheduled_tokens, dtype=np.int64)
+    )
+    owners = extract_request_owners_from_block_table(
+        block_table,
+        owner_layout,
+        num_reqs=int(tokens_arr.shape[0]),
+        num_blocks_per_req=num_blocks_per_req,
+        start_index=start_index,
+        default_owner=default_owner,
+    )
+    layout = build_owner_token_layout(
+        owners,
+        tokens_arr,
+        int(owner_layout.num_owners),
+        token_paddings,
+        num_padded_tokens=num_padded_tokens,
+        num_reqs_padded=num_reqs_padded,
+        segment_multiple=segment_multiple,
+    )
+    meta_target = (
+        attn_metadata
+        if attn_metadata is not None
+        else (
+            block_table
+            if isinstance(block_table, dict)
+            or getattr(block_table, "block_tables", None) is not None
+            else None
+        )
+    )
+    if meta_target is not None:
+        attach_owner_token_layout(meta_target, layout, device=device)
+    return layout

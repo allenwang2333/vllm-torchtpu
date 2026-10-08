@@ -180,3 +180,114 @@ def test_segment_multiple_picks_a_larger_padding():
 def test_invalid_inputs(owners, tokens, tp, kwargs, match):
     with pytest.raises(ValueError, match=match):
         build_owner_token_layout(owners, tokens, tp, [8, 12], **kwargs)
+
+
+def test_extract_request_owners_and_prepare_kv_shard_layout():
+    from types import SimpleNamespace
+
+    import torch
+    import vllm  # noqa: F401
+
+    from vllm_torchtpu.core.owner_affine_block_pool import OwnerLayout
+    from vllm_torchtpu.runner.owner_token_layout import (
+        attach_owner_token_layout,
+        extract_request_owners_from_block_table,
+        owner_layout_tensors,
+        prepare_kv_shard_owner_token_layout,
+    )
+
+    owner_layout = OwnerLayout(num_replicated=4, num_owners=4, blocks_per_owner=5)
+    # Replicated: [0, 4). Owners 0..3: [4, 9), [9, 14), [14, 19), [19, 24).
+    # Table 0 (SWA): only replicated blocks [1, 2, 0]
+    swa_tbl = SimpleNamespace(
+        get_cpu_tensor=lambda: torch.tensor(
+            [[1, 2, 0], [3, 0, 0], [2, 1, 0], [0, 0, 0]], dtype=torch.int32
+        )
+    )
+    # Table 1 (Main sharded): req 0 -> 2, req 1 -> 0, req 2 -> 3, req 3 -> default
+    main_tbl = np.array([[1, 15, 16], [5, 6, 0], [2, 21, 9], [1, 2, 0]], dtype=np.int32)
+
+    owners = extract_request_owners_from_block_table(
+        [swa_tbl, main_tbl],
+        [2, 2, 2, 1],
+        owner_layout,
+        default_owner=1,
+    )
+    np.testing.assert_array_equal(owners, [2, 0, 3, 1])
+
+    # 2-arg form (block_table, owner_layout) with metadata dict & start_index/num_reqs
+    meta_swa = SimpleNamespace(
+        block_tables=torch.tensor([[1, 2, 0], [3, 0, 0], [2, 1, 0]], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1, 3], dtype=torch.int32),
+    )
+    meta_main = SimpleNamespace(
+        block_tables=torch.tensor(
+            [[1, 15, 16], [5, 6, 0], [2, 21, 9]], dtype=torch.int32
+        ),
+        query_start_loc=torch.tensor([0, 1, 3], dtype=torch.int32),
+    )
+    meta_dict = {"swa": meta_swa, "main": meta_main}
+    owners_slice = extract_request_owners_from_block_table(
+        meta_dict,
+        owner_layout,
+        num_reqs=2,
+        num_blocks_per_req=[2, 2],
+        start_index=1,
+    )
+    np.testing.assert_array_equal(owners_slice, [0, 3])
+
+    # Single metadata object with .block_tables and prepare_kv_shard_owner_token_layout
+    layout = prepare_kv_shard_owner_token_layout(
+        meta_dict,
+        owner_layout,
+        torch.tensor([1, 2, 1], dtype=torch.int32),
+        [8, 16],
+        num_padded_tokens=6,
+    )
+    assert meta_swa.owner_token_layout is layout
+    assert meta_main.owner_token_layout is layout
+    assert meta_main.owner_perm.dtype == torch.int32
+    assert meta_main.owner_inv.dtype == torch.int32
+    assert meta_main.owner_q_loc.shape == (4, 4)
+    # Real tokens = 4, num_padded_tokens = 6 -> inv[4:] masked to -1
+    assert torch.all(meta_main.owner_inv[4:] == -1)
+    # Segment size = 2 across 4 owners: counts are [2, 0, 1, 1]
+    np.testing.assert_array_equal(
+        meta_main.owner_perm.numpy(), [1, 2, -1, -1, 0, -1, 3, -1]
+    )
+
+    # Also test with raw block_table and explicit attn_metadata / None
+    single_meta = SimpleNamespace(query_start_loc=None)
+    layout2 = prepare_kv_shard_owner_token_layout(
+        main_tbl[:3],
+        owner_layout,
+        [1, 2, 1],
+        [8],
+        attn_metadata=single_meta,
+        device="cpu",
+    )
+    assert single_meta.owner_token_layout is layout2
+    layout3 = prepare_kv_shard_owner_token_layout(
+        main_tbl[:3],
+        owner_layout,
+        [1, 2, 1],
+        [8],
+    )
+    perm_t, inv_t, q_loc_t = owner_layout_tensors(layout3)
+    assert perm_t.shape == (8,) and inv_t.shape == (8,) and q_loc_t.shape == (4, 4)
+    assert attach_owner_token_layout({}, layout3) == {}
+    assert attach_owner_token_layout(single_meta, layout3) is single_meta
+
+    # Error guards in _to_2d_numpy and extract_request_owners_from_block_table
+    with pytest.raises(ValueError, match="Expected 2D block table"):
+        extract_request_owners_from_block_table(
+            np.zeros((4,), dtype=np.int32), owner_layout
+        )
+    with pytest.raises(ValueError, match="Expected a valid OwnerLayout"):
+        extract_request_owners_from_block_table(main_tbl, None)
+    with pytest.raises(ValueError, match="Expected at least one block table"):
+        extract_request_owners_from_block_table([], owner_layout)
+    with pytest.raises(ValueError, match="Invalid request slice"):
+        extract_request_owners_from_block_table(main_tbl, owner_layout, num_reqs=5)
+    with pytest.raises(ValueError, match="Expected num_blocks_per_req of shape"):
+        extract_request_owners_from_block_table(main_tbl, [1, 2], owner_layout)
