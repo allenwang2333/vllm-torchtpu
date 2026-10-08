@@ -1915,6 +1915,23 @@ class VllmTPUDeepseekV32IndexerBackend(DeepseekV32IndexerBackend):
     def get_min_page_size(vllm_config: VllmConfig) -> int:
         return PallasMLAttentionBackend.get_min_page_size(vllm_config)
 
+    @staticmethod
+    def get_kv_cache_page_size_bytes(
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> int:
+        # Same delegation, and reached the same way: on a *hybrid* sparse-MLA
+        # model (KDA + DSA, e.g. GLM-5.3-Flash) `_update_mamba_page_size_padded`
+        # asks `_find_non_ssm_backend` for the attention backend and lands here,
+        # because an indexer cache registers before its `mla_attn` sibling. The
+        # question being asked is "how big is an attention page", and the
+        # arguments describing it are the caller's, so answer with the MLA
+        # backend's formula rather than the indexer's own layout.
+        return PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            block_size, num_kv_heads, head_size, cache_dtype_str)
+
 
 class PallasMLAttentionBackendImpl(MLAAttentionImpl):
     def __init__(
