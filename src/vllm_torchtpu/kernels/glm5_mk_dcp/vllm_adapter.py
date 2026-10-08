@@ -366,9 +366,11 @@ class Glm5MKD:
         ns: dict[str, Any] = {"jax": jax, "_smap": smap}
         exec(compile(src, "<glm5_mkd>", "exec"), ns)  # noqa: S102 - arity is data
         name = "glm5_mkd::step"
-        flat = sharded_jax_op(name, ns["glm5_mkd"], mesh=self.mesh, input_partition_specs=in_specs,
-                              output_partition_specs=out_specs,
-                              donate_argnums=tuple(range(n_in - n_c, n_in)))
+        # unregistered callable: ~175 operands exceed a torch op schema's 64 (j-a67fe755); the op
+        # below takes the weights and caches as two Tensor[] arguments
+        flat = sharded_jax_op(name + "_flat", ns["glm5_mkd"], mesh=self.mesh,
+                              input_partition_specs=in_specs, output_partition_specs=out_specs,
+                              donate_argnums=tuple(range(n_in - n_c, n_in)), register=False)
 
         @torch.library.custom_op(name, mutates_args=())
         def op(scal: torch.Tensor, rmeta: torch.Tensor, qmeta: torch.Tensor, bt: torch.Tensor,
