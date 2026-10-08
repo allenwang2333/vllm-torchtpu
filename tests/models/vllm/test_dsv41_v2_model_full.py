@@ -2190,3 +2190,156 @@ class TestDeepseekV41ForCausalLM:
         ):
             res = model_inst.forward("arg2")
             assert res == "fwd_out2"
+
+
+# ==============================================================================
+# 4. TD7.9: Flat-Slice Collapse & Final-Layer _post_and_collapse Fusion Tests
+# ==============================================================================
+
+
+class TestMhcFlatSliceAndPostCollapseFusion:
+    @pytest.mark.parametrize("mult", [2, 4])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+    def test_flat_collapse_and_post_and_collapse_parity(
+        self, mult: int, dtype: torch.dtype
+    ) -> None:
+        from vllm_torchtpu.models.vllm.deepseek_v41.common import mhc as common_mhc
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as v2_model
+
+        torch.manual_seed(100 + mult)
+        tokens, dim = 12, 32
+        x = torch.randn(tokens, dim, dtype=dtype)
+        residual = torch.randn(tokens, mult, dim, dtype=dtype)
+        post_mix = torch.randn(tokens, mult, 1, dtype=torch.float32)
+        res_mix = torch.randn(tokens, mult, mult, dtype=torch.float32)
+        pre_mix = torch.sigmoid(torch.randn(tokens, mult, dtype=torch.float32))
+
+        ref_post_torch = common_mhc.mhc_post_torch(x, residual, post_mix, res_mix)
+        stream_list = []
+        for j in range(mult):
+            acc = post_mix[:, j, 0:1].float() * x.float()
+            for i in range(mult):
+                acc = acc + res_mix[:, i, j : j + 1].float() * residual[:, i, :].float()
+            stream_list.append(acc.to(dtype))
+        stream_post = torch.stack(stream_list, dim=1)
+        terms = [
+            pre_mix[:, m : m + 1].float() * stream_post[:, m, :].float()
+            for m in range(mult)
+        ]
+        if mult == 4:
+            ref_collapsed = ((terms[0] + terms[2]) + (terms[1] + terms[3])).to(dtype)
+        else:
+            ref_collapsed = common_mhc.collapse(stream_post, pre_mix)
+
+        flat_collapsed = v2_model.collapse(stream_post, pre_mix)
+        assert torch.equal(flat_collapsed, ref_collapsed)
+        torch.testing.assert_close(
+            flat_collapsed,
+            common_mhc.collapse(ref_post_torch, pre_mix),
+            rtol=1e-2 if dtype == torch.bfloat16 else 1e-6,
+            atol=1e-2 if dtype == torch.bfloat16 else 1e-6,
+        )
+
+        fused_collapsed_no_aux, aux_none = v2_model._post_and_collapse(
+            x, residual, post_mix, res_mix, pre_mix, capture_aux=False
+        )
+        assert aux_none is None
+        assert torch.equal(fused_collapsed_no_aux, ref_collapsed)
+
+        fused_collapsed_aux, fused_aux = v2_model._post_and_collapse(
+            x, residual, post_mix, res_mix, pre_mix, capture_aux=True
+        )
+        ref_aux = v2_model._mean_hc_streams(stream_post)
+        assert torch.equal(fused_collapsed_aux, ref_collapsed)
+        assert fused_aux is not None
+        assert torch.equal(fused_aux, ref_aux)
+        old_mean = (sum(ref_post_torch.float().unbind(dim=1)) * (1.0 / mult)).to(dtype)
+        torch.testing.assert_close(
+            fused_aux,
+            old_mean,
+            rtol=1e-2 if dtype == torch.bfloat16 else 1e-6,
+            atol=1e-2 if dtype == torch.bfloat16 else 1e-6,
+        )
+
+    @pytest.mark.parametrize("stage_sp", [False, True])
+    @pytest.mark.parametrize("capture_aux", [False, True])
+    def test_forward_stage_fuses_final_post_and_collapse(
+        self, stage_sp: bool, capture_aux: bool
+    ) -> None:
+        from vllm_torchtpu.models.vllm.deepseek_v41.common import mhc as common_mhc
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as v2_model
+
+        torch.manual_seed(42)
+        tokens, mult, dim = 4, 4, 16
+        x_layer = torch.randn(tokens, dim, dtype=torch.bfloat16)
+        res_layer = torch.randn(tokens, mult, dim, dtype=torch.bfloat16)
+        post_mix_layer = torch.randn(tokens, mult, 1, dtype=torch.float32)
+        res_mix_layer = torch.randn(tokens, mult, mult, dtype=torch.float32)
+        pre_mix_layer = torch.sigmoid(torch.randn(tokens, mult, dtype=torch.float32))
+
+        model = DeepseekV41Model.__new__(DeepseekV41Model)
+        model.use_sequence_parallel = stage_sp
+        model.use_mega_moe = False
+        model._mtp_hidden_buffer = None
+        model.start_layer = 0
+        model.end_layer = 1
+        model._ced_boundary = 1
+        model.aux_hidden_state_layers = [1] if capture_aux else []
+        model._has_cpu_offloaded_engram = lambda: False
+        model._prepare_engram = lambda *a, **kw: (None, None)
+        model.embed_input_ids = lambda ids: torch.zeros(
+            (ids.shape[0], dim), dtype=torch.bfloat16
+        )
+        model.norm = lambda h: h * 2.0
+
+        def real_mix_layer(
+            h, pos, inp, pm, post_m, res_m, res, eh, em, capture_previous_aux=False
+        ):
+            return (
+                x_layer,
+                res_layer,
+                post_mix_layer,
+                res_mix_layer,
+                pre_mix_layer,
+                None,
+            )
+
+        model.layers = [real_mix_layer]
+
+        inp = torch.tensor([1, 2, 3, 4])
+        pos = torch.tensor([0, 1, 2, 3])
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_pp_group",
+                return_value=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_tensor_model_parallel_world_size",
+                return_value=2 if stage_sp else 1,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.sp_shard",
+                side_effect=lambda t: t,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.sp_all_gather",
+                side_effect=lambda t: t,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.post",
+            ) as mock_post,
+        ):
+            out = model._forward_stage(inp, pos, None, stage="full")
+            mock_post.assert_not_called()
+
+        ref_post = common_mhc.mhc_post_torch(
+            x_layer, res_layer, post_mix_layer, res_mix_layer
+        )
+        ref_collapsed = v2_model.collapse(ref_post, pre_mix_layer) * 2.0
+        if capture_aux:
+            hidden_out, aux_list = out
+            assert torch.equal(hidden_out, ref_collapsed)
+            assert len(aux_list) == 1
+            assert torch.equal(aux_list[0], v2_model._mean_hc_streams(ref_post))
+        else:
+            assert torch.equal(out, ref_collapsed)

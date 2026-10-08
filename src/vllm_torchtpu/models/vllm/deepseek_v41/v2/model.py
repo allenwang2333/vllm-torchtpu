@@ -19,7 +19,6 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
 from ..common.mhc import (
-    collapse,
     initialize_delayed_mhc,
     initialize_mhc_post,
     pack_mix_weights,
@@ -75,17 +74,80 @@ def _scatter_decoder_rows(
     return result.index_copy_(0, indices, tensor)[:-1]
 
 
+def _sum_hc_terms(terms: list[torch.Tensor]) -> torch.Tensor:
+    if len(terms) == 4:
+        return (terms[0] + terms[2]) + (terms[1] + terms[3])
+    return torch.stack(terms, dim=0).sum(dim=0)
+
+
+def _mean_flat_streams(
+    streams: list[torch.Tensor],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    return (_sum_hc_terms(streams) * (1.0 / len(streams))).to(dtype)
+
+
 def _mean_hc_streams(hidden_states: torch.Tensor) -> torch.Tensor:
-    # Unroll the small static HC stream axis (hc_mult=4) instead of emitting a
-    # second HLO reduce over dim=1 alongside collapse(hidden_states, pre_mix).
-    # XLA MultiOutputFusion otherwise fuses the bf16 mean reduce and f32
-    # collapse reduce into a mixed-type tuple reduce fusion that aborts in
-    # libtpu FusionEmitter::ComputeWindowConfigInternal at N=2048.
-    streams = hidden_states.float().unbind(dim=1)
-    acc = streams[0]
-    for s in streams[1:]:
-        acc = acc + s
-    return (acc * (1.0 / len(streams))).to(hidden_states.dtype)
+    # Slice the flattened [tokens, mult * dim] representation into 2D [tokens, dim]
+    # streams instead of reducing over dim=1 of a 3D [tokens, mult, dim] view,
+    # avoiding XLA T(4, 128) relayout copies and mixed-type MultiOutputFusion.
+    tokens = hidden_states.shape[0]
+    mult = hidden_states.shape[1]
+    flat = hidden_states.reshape(tokens, -1)
+    dim = flat.shape[1] // mult
+    streams = [flat[:, i * dim : (i + 1) * dim].float() for i in range(mult)]
+    return _mean_flat_streams(streams, hidden_states.dtype)
+
+
+def _collapse_streams(
+    streams: list[torch.Tensor],
+    pre_mix: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    mult = len(streams)
+    pre_f32 = pre_mix.reshape(streams[0].shape[0], mult).float()
+    terms = [pre_f32[:, m : m + 1] * streams[m] for m in range(mult)]
+    return _sum_hc_terms(terms).to(dtype)
+
+
+def collapse(hidden_states: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
+    # Collapse HC streams directly from 2D [tokens, dim] slices of the flattened
+    # [tokens, mult * dim] buffer so XLA keeps T(8, 128) layout without a 3D
+    # dim=-2 reduction relayout copy.
+    tokens, mult = pre_mix.shape
+    flat = hidden_states.reshape(tokens, -1)
+    dim = flat.shape[1] // mult
+    streams = [flat[:, m * dim : (m + 1) * dim].float() for m in range(mult)]
+    return _collapse_streams(streams, pre_mix, hidden_states.dtype)
+
+
+def _post_and_collapse(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    pre_mix: torch.Tensor,
+    *,
+    capture_aux: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    # Fuse the final layer's mHC post-mix and pre-mix collapse in 2D [tokens, dim]
+    # register slices so the intermediate [tokens, mult, dim] post output is never
+    # materialized to HBM or padded to the standalone mhc_post Pallas tile size.
+    tokens, mult, dim = residual.shape
+    flat = residual.reshape(tokens, mult * dim)
+    x_f32 = x.reshape(tokens, dim).to(residual.dtype).float()
+    post_f32 = post_layer_mix.reshape(tokens, mult).float()
+    comb_f32 = comb_res_mix.reshape(tokens, mult, mult).float()
+    streams = [flat[:, i * dim : (i + 1) * dim].float() for i in range(mult)]
+    out_streams = []
+    for j in range(mult):
+        acc = post_f32[:, j : j + 1] * x_f32
+        for i in range(mult):
+            acc = acc + comb_f32[:, i, j : j + 1] * streams[i]
+        out_streams.append(acc.to(residual.dtype).float())
+    collapsed = _collapse_streams(out_streams, pre_mix, residual.dtype)
+    aux = _mean_flat_streams(out_streams, residual.dtype) if capture_aux else None
+    return collapsed, aux
 
 
 class DeepseekV41DecoderLayer(upstream.DeepseekV4DecoderLayer):
@@ -756,6 +818,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             if stage_sp:
                 aux_hidden = upstream.sp_all_gather(aux_hidden)[:full_num_tokens]
             aux_hidden_by_layer[start_layer] = aux_hidden
+        collapsed_final = False
         with stage_attention_cache_scope():
             for idx, layer in enumerate(
                 islice(self.layers, start_layer, end_layer),
@@ -791,12 +854,34 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     aux_hidden_by_layer[idx] = previous_aux
             if layer is not None:
                 # The last layer has no successor to fold its post into.
-                hidden_states = post(hidden_states, residual, post_mix, res_mix)
-                if (
+                capture_final_aux = (
                     stage != "encoder"
                     and self.end_layer in self.aux_hidden_state_layers
+                )
+                if (
+                    stage != "encoder"
+                    and post_mix is not None
+                    and res_mix is not None
+                    and upstream.get_pp_group().is_last_rank
+                    and self._mtp_hidden_buffer is None
                 ):
-                    final_aux = _mean_hc_streams(hidden_states)
+                    assert residual is not None
+                    assert pre_mix is not None
+                    hidden_states, final_aux = _post_and_collapse(
+                        hidden_states,
+                        residual,
+                        post_mix,
+                        res_mix,
+                        pre_mix,
+                        capture_aux=capture_final_aux,
+                    )
+                    collapsed_final = True
+                else:
+                    hidden_states = post(hidden_states, residual, post_mix, res_mix)
+                    final_aux = (
+                        _mean_hc_streams(hidden_states) if capture_final_aux else None
+                    )
+                if final_aux is not None:
                     if stage_sp:
                         final_aux = upstream.sp_all_gather(final_aux)[:full_num_tokens]
                     aux_hidden_by_layer[self.end_layer] = final_aux
@@ -842,8 +927,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         # Collapse the hc copies with the pre-mix from the last layer's FFN
         # mixes — the mix the reference applies via
         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
-        assert pre_mix is not None
-        hidden_states = collapse(hidden_states, pre_mix)
+        if not collapsed_final:
+            assert pre_mix is not None
+            hidden_states = collapse(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
         if stage_sp and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
