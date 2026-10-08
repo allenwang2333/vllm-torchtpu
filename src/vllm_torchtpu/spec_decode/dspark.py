@@ -86,6 +86,7 @@ class DSparkProposer(DFlashProposer):
         # Full-vocab Markov sampling until load_model() has seen the lm_head
         # layout (see _init_sharded_markov_sampling).
         self._sharded_markov_tp = 1
+        self._markov_w1_local: torch.Tensor | None = None
         self._markov_w2_local: torch.Tensor | None = None
         self._vocab_shard_offset: torch.Tensor | None = None
         self._vocab_shard_mask: torch.Tensor | None = None
@@ -135,6 +136,7 @@ class DSparkProposer(DFlashProposer):
     def _init_sharded_markov_sampling(self) -> None:
         """Pre-slice the Markov head for this rank's lm_head vocab shard."""
         self._sharded_markov_tp = 1
+        self._markov_w1_local = None
         self._markov_w2_local = None
         self._vocab_shard_offset = None
         self._vocab_shard_mask = None
@@ -148,7 +150,8 @@ class DSparkProposer(DFlashProposer):
 
         lm_head = draft.lm_head
         shard_indices = lm_head.shard_indices
-        markov_w2 = draft.model.markov_head.markov_w2
+        markov_head = draft.model.markov_head
+        markov_w2 = markov_head.markov_w2
         logits_processor = resolve_draft_logits_processor(draft)
         head_dtype = getattr(logits_processor, "head_dtype", None)
 
@@ -160,8 +163,17 @@ class DSparkProposer(DFlashProposer):
         if head_dtype is not None:
             rows = rows.to(head_dtype)
         self._markov_w2_local = rows.contiguous().clone()
+        markov_w1 = getattr(markov_head, "markov_w1", None)
+        w1_weight = getattr(markov_w1, "weight", None)
+        if w1_weight is not None:
+            self._markov_w1_local = (
+                w1_weight.detach()
+                .to(dtype=rows.dtype, device=rows.device)
+                .contiguous()
+                .clone()
+            )
         self._vocab_shard_offset = torch.tensor(
-            start, dtype=torch.int64, device=rows.device
+            start, dtype=torch.float32, device=rows.device
         )
         # Whether any shard carries vocab padding is a global property, so
         # the mask add is present in every rank's graph or in none.
@@ -211,9 +223,12 @@ class DSparkProposer(DFlashProposer):
 
     def _markov_bias_local(self, prev: torch.Tensor) -> torch.Tensor:
         """Markov bias restricted to this rank's vocab shard ([B] -> [B, W])."""
-        assert self.draft_model is not None
         w2_local = self._markov_w2_local
         assert w2_local is not None
+        w1_local = self._markov_w1_local
+        if w1_local is not None:
+            return F.linear(F.embedding(prev, w1_local), w2_local)
+        assert self.draft_model is not None
         embed = self.draft_model.markov_embed(prev)
         if embed.dtype != w2_local.dtype:
             embed = embed.to(w2_local.dtype)
@@ -228,7 +243,7 @@ class DSparkProposer(DFlashProposer):
         return torch.stack(
             [
                 local_max.to(torch.float32),
-                (local_idx + vocab_offset).to(torch.float32),
+                local_idx.to(torch.float32) + vocab_offset.to(torch.float32),
             ],
             dim=-1,
         )
@@ -244,8 +259,8 @@ class DSparkProposer(DFlashProposer):
         full-vocab ``argmax``.
         """
         gathered = gathered.view(tp_size, num_reqs, 2)
-        best_rank = gathered[..., 0].argmax(dim=0)
-        token_ids = gathered[..., 1].gather(0, best_rank.unsqueeze(0)).squeeze(0)
+        best_rank = gathered[..., 0].argmax(dim=0, keepdim=True)
+        token_ids = gathered[..., 1].gather(0, best_rank).squeeze(0)
         return token_ids.to(torch.int64)
 
     def _sample_markov_sharded(
@@ -256,7 +271,8 @@ class DSparkProposer(DFlashProposer):
         sample_start: int,
     ) -> list[torch.Tensor]:
         assert self.draft_model is not None
-        assert self._vocab_shard_offset is not None
+        vocab_offset = self._vocab_shard_offset
+        assert vocab_offset is not None
         padded_num_reqs = ids_3d.shape[0]
         tp_size = self._sharded_markov_tp
         slot_major_hidden = (
@@ -271,12 +287,13 @@ class DSparkProposer(DFlashProposer):
         logits_slot_major = logits.view(block_size, padded_num_reqs, logits.shape[-1])
 
         prev = ids_3d[:, 0]
+        map_to_target = self.draft_model.map_draft_to_target
         draft_tokens = []
         for i in range(sample_start, block_size):
             scores = logits_slot_major[i] + self._markov_bias_local(prev)
-            packed = self._pack_local_candidate(scores, self._vocab_shard_offset)
+            packed = self._pack_local_candidate(scores, vocab_offset)
             gathered = tensor_model_parallel_all_gather(packed, dim=0)
-            step = self.draft_model.map_draft_to_target(
+            step = map_to_target(
                 self._select_gathered_candidate(gathered, tp_size, padded_num_reqs)
             )
             draft_tokens.append(step)
@@ -301,12 +318,13 @@ class DSparkProposer(DFlashProposer):
         )
 
         prev = ids_3d[:, 0]
+        markov_embed = self.draft_model.markov_embed
+        markov_bias = self.draft_model.markov_bias
+        map_to_target = self.draft_model.map_draft_to_target
         draft_tokens = []
         for i in range(sample_start, block_size):
-            bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
-            step = self.draft_model.map_draft_to_target(
-                (logits_slot_major[i] + bias).argmax(dim=-1)
-            )
+            bias = markov_bias(markov_embed(prev))
+            step = map_to_target((logits_slot_major[i] + bias).argmax(dim=-1))
             draft_tokens.append(step)
             prev = step
         return draft_tokens

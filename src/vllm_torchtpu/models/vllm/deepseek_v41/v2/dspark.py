@@ -121,26 +121,17 @@ def _embed_draft_blocks(
     num_blocks = tokens // block
     if block <= 1 or num_blocks == 0:
         return embed(input_ids)
-    tail = tokens - num_blocks * block
-    base = input_ids[: num_blocks * block].view(num_blocks, block)[:, 0]
+    body = num_blocks * block
+    base = input_ids[:body].view(num_blocks, block)[:, 0]
     noise = input_ids[1:2]
     rows = embed(torch.cat([base, noise]))
-    hidden = rows.shape[-1]
-    noise_row = rows[num_blocks:]
-    blocks = torch.cat(
-        [
-            rows[:num_blocks].unsqueeze(1),
-            noise_row.unsqueeze(1).expand(num_blocks, block - 1, hidden),
-        ],
-        dim=1,
-    ).reshape(num_blocks * block, hidden)
-    expected = torch.cat(
-        [base.unsqueeze(1), noise.expand(num_blocks, block - 1)], dim=1
-    ).reshape(-1)
-    if tail:
-        blocks = torch.cat([blocks, noise_row.expand(tail, hidden)])
-        expected = torch.cat([expected, noise.expand(tail)])
-    return blocks.masked_fill((expected != input_ids).unsqueeze(-1), float("nan"))
+    nan_row = torch.full(
+        (1, rows.shape[-1]), float("nan"), dtype=rows.dtype, device=rows.device
+    )
+    table = torch.cat([rows, nan_row], dim=0)
+    idx = torch.where(input_ids == noise, num_blocks, num_blocks + 1)
+    idx[:body:block] = torch.arange(num_blocks, device=input_ids.device)
+    return table.index_select(0, idx)
 
 
 def _insert_context_kv(
@@ -517,13 +508,17 @@ def _post_and_collapse(
     for j in range(mult):
         acc = post_f32[:, j : j + 1] * x_f32
         for i in range(mult):
-            acc = acc + comb_f32[:, i, j : j + 1] * streams[i]
-        terms.append(pre_f32[:, j : j + 1] * acc.to(residual.dtype).float())
-    value = (
-        (terms[0] + terms[2]) + (terms[1] + terms[3])
-        if mult == 4
-        else torch.stack(terms, dim=0).sum(dim=0)
-    )
+            acc += comb_f32[:, i, j : j + 1] * streams[i]
+        term = acc.to(residual.dtype).float()
+        term *= pre_f32[:, j : j + 1]
+        terms.append(term)
+    if mult == 4:
+        terms[0] += terms[2]
+        terms[1] += terms[3]
+        terms[0] += terms[1]
+        value = terms[0]
+    else:
+        value = torch.stack(terms, dim=0).sum(dim=0)
     return value.to(residual.dtype)
 
 

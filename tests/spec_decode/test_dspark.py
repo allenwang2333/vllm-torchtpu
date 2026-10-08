@@ -495,18 +495,32 @@ def test_sharded_markov_padding_mask_and_w2_slice(monkeypatch):
     # A Markov head shorter than the lm_head partition is zero-padded.
     p = _make_proposer(_DSPARK_HF)
     p._draft_replicated = False
+    w1 = torch.randint(-1, 2, (org_vocab, rank_r)).float()
     p.draft_model = _ShardedDraft(
         torch.zeros(padded, 8),
-        torch.zeros(org_vocab, rank_r),
+        w1,
         w2[:org_vocab],
         org_vocab,
         tp_size - 1,
         tp_size,
+        head_dtype=torch.bfloat16,
     )
+    p.draft_model.model.markov_head.markov_w1 = SimpleNamespace(weight=w1)
     p._init_sharded_markov_sampling()
     width = padded // tp_size
+    assert p._vocab_shard_offset.dtype == torch.float32
+    assert p._markov_w1_local is not None
+    assert p._markov_w1_local.dtype == torch.bfloat16
+    assert torch.equal(p._markov_w1_local, w1.to(torch.bfloat16))
     assert p._markov_w2_local.shape == (width, rank_r)
     assert torch.all(p._markov_w2_local[org_vocab - (tp_size - 1) * width :] == 0)
+    prev = torch.tensor([0, 3, 7], dtype=torch.int64)
+    p.draft_model.markov_embed = lambda prev: (_ for _ in ()).throw(
+        AssertionError("markov_embed should be bypassed when _markov_w1_local is set")
+    )
+    bias_local = p._markov_bias_local(prev)
+    expected_bias = w1[prev].to(torch.bfloat16) @ p._markov_w2_local.t()
+    assert torch.equal(bias_local, expected_bias)
 
 
 def test_sharded_markov_fallback_reasons(monkeypatch):
@@ -714,6 +728,12 @@ def test_dflash_forward_and_sample_eager_matches_reference(monkeypatch):
     bias = p._markov_bias_local(ids_3d[:, 0])
     assert bias.dtype == torch.bfloat16
     assert torch.equal(bias.float(), w1[ids_3d[:, 0]] @ w2.t())
+
+    # Same-dtype w2_local (no cast) + non-None _vocab_shard_mask on main thread.
+    p._markov_w2_local = w2
+    p._vocab_shard_mask = torch.zeros(vocab, dtype=w2.dtype)
+    tokens_masked, _ = forward_and_sample(p, input_ids, positions, K)
+    assert torch.equal(tokens_masked, expected)
 
 
 def test_load_model_initializes_sharded_sampling(monkeypatch):
