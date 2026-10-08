@@ -1507,10 +1507,12 @@ def test_prepare_tpu_non_causal_3page_swa_fast_path(
 def test_insert_context_kv_stage_cache_and_pre_rotated(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Verify _insert_context_kv caches SWA slots and respects pre-rotated flag."""
+    """Verify _insert_context_kv caches SWA slots/addressing and pre-rotated flag."""
     inserted: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     rotate_calls = 0
     cache_slots_calls = 0
+    token_req_calls = 0
+    orig_token_requests = v2_attn._token_requests
 
     def fake_insert(cache, slots, kv, valid):
         inserted.append((slots.clone(), kv.clone(), valid.clone()))
@@ -1525,17 +1527,21 @@ def test_insert_context_kv_stage_cache_and_pre_rotated(
         cache_slots_calls += 1
         return torch.tensor([1, 2, 3], dtype=torch.long)
 
+    def spy_token_requests(md, pos):
+        nonlocal token_req_calls
+        token_req_calls += 1
+        if getattr(md, "query_start_loc", None) is None:
+            return torch.tensor([0, 0, 0], dtype=torch.long)
+        return orig_token_requests(md, pos)
+
     monkeypatch.setattr(v2_dspark, "_insert", fake_insert)
     monkeypatch.setattr(v2_dspark, "_cache_slots", fake_cache_slots)
-    monkeypatch.setattr(
-        v2_dspark,
-        "_token_requests",
-        lambda md, pos: torch.tensor([0, 0, 0], dtype=torch.long),
-    )
+    monkeypatch.setattr(v2_dspark, "_token_requests", spy_token_requests)
 
+    swa_cache = torch.zeros((8, 4, 1, 8))
     attn = SimpleNamespace(
         window_size=4,
-        swa_cache_layer=SimpleNamespace(kv_cache=torch.zeros((2, 4, 1, 8))),
+        swa_cache_layer=SimpleNamespace(kv_cache=swa_cache),
         _rotate=fake_rotate,
     )
     kv = torch.ones((3, 8))
@@ -1544,16 +1550,18 @@ def test_insert_context_kv_stage_cache_and_pre_rotated(
     md_empty = SimpleNamespace(seq_lens=torch.empty(0, dtype=torch.int32))
 
     with v2_attn.stage_attention_cache_scope():
-        # Layer 0: computes slots and rotates
+        # Layer 0 (block_tables=None): computes slots via _cache_slots and rotates
         v2_dspark._insert_context_kv(attn, kv, positions, md_nonempty)
-        # Layer 1: reuses cached slots from stage_cache
-        v2_dspark._insert_context_kv(attn, kv, positions, md_nonempty)
+        # Layer 1 (distinct metadata object, block_tables=None): reuses cached slots
+        md_nonempty_2 = SimpleNamespace(seq_lens=torch.tensor([6], dtype=torch.int32))
+        v2_dspark._insert_context_kv(attn, kv, positions, md_nonempty_2)
         assert cache_slots_calls == 1
+        assert token_req_calls == 1
         assert rotate_calls == 2
         assert torch.equal(inserted[0][0], inserted[1][0])
         assert torch.equal(inserted[0][2], inserted[1][2])
 
-        # Empty seq_lens inside stage_attention_cache_scope
+        # Empty seq_lens inside stage_attention_cache_scope (different seq_lens.shape)
         v2_dspark._insert_context_kv(attn, kv, positions, md_empty)
         assert cache_slots_calls == 2
         assert rotate_calls == 3
@@ -1565,11 +1573,108 @@ def test_insert_context_kv_stage_cache_and_pre_rotated(
         assert rotate_calls == 3
         assert torch.equal(inserted[-1][1], kv)
 
+    # Verify block_tables-backed fast addressing (uncached + 2-level stage cache)
+    inserted.clear()
+    cache_slots_calls = 0
+    token_req_calls = 0
+    qsl = torch.tensor([0, 2, 2], dtype=torch.int32)
+    seq_lens = torch.tensor([6, 4], dtype=torch.int32)
+    bt0 = torch.tensor([[2, 5], [1, 3]], dtype=torch.int32)
+    bt1 = torch.tensor([[4, 7], [0, 6]], dtype=torch.int32)
+    md_bt0 = SimpleNamespace(seq_lens=seq_lens, query_start_loc=qsl, block_tables=bt0)
+    md_bt1 = SimpleNamespace(seq_lens=seq_lens, query_start_loc=qsl, block_tables=bt1)
+    md_bt2_shared = SimpleNamespace(
+        seq_lens=seq_lens, query_start_loc=qsl, block_tables=bt1
+    )
+
+    # Uncached with block_tables: uses direct addr path and matches _cache_slots
+    v2_dspark._insert_context_kv(attn, kv, positions, md_bt0)
+    assert cache_slots_calls == 0
+    assert token_req_calls == 1
+    expected_slots_0 = v2_attn._cache_slots(swa_cache, md_bt0, positions)
+    expected_slots_1 = v2_attn._cache_slots(swa_cache, md_bt1, positions)
+    assert torch.equal(inserted[0][0], expected_slots_0)
+
+    # Inside stage_attention_cache_scope across 3 draft layers:
+    # Layer 0 (bt0) computes addr + in_window; Layer 1 (bt1) reuses addr + in_window
+    # without calling _token_requests; Layer 2 (shares bt1) reuses cached slots.
+    inserted.clear()
+    token_req_calls = 0
+    with v2_attn.stage_attention_cache_scope():
+        v2_dspark._insert_context_kv(attn, kv, positions, md_bt0)
+        v2_dspark._insert_context_kv(attn, kv, positions, md_bt1)
+        v2_dspark._insert_context_kv(attn, kv, positions, md_bt2_shared)
+    assert cache_slots_calls == 0
+    assert token_req_calls == 1
+    assert len(inserted) == 3
+    assert torch.equal(inserted[0][0], expected_slots_0)
+    assert torch.equal(inserted[1][0], expected_slots_1)
+    assert torch.equal(inserted[2][0], expected_slots_1)
+    assert torch.equal(inserted[0][2], inserted[1][2])
+    assert torch.equal(inserted[1][2], inserted[2][2])
+
+
+def test_insert_context_kv_dynamo_no_recompiles_across_steps():
+    """Regression test: fresh per-step AttentionMetadata objects do not recompile."""
+    import sys
+
+    orig_trace = sys.gettrace()
+    sys.settrace(None)
+    torch._dynamo.reset()
+    try:
+        cnt = torch._dynamo.testing.CompileCounter()
+        swa_caches = [torch.zeros((8, 4, 8)) for _ in range(3)]
+        attns = [
+            SimpleNamespace(
+                window_size=4,
+                swa_cache_layer=SimpleNamespace(kv_cache=c),
+                _rotate=lambda kv, pos: kv,
+            )
+            for c in swa_caches
+        ]
+
+        def step_fn(kv_rot, positions, md0, md1, md2):
+            with v2_attn.stage_attention_cache_scope():
+                assert v2_attn._active_stage_attn_cache is not None
+                v2_attn._active_stage_attn_cache["context_kv_pre_rotated"] = True
+                v2_dspark._insert_context_kv(attns[0], kv_rot[:, 0], positions, md0)
+                v2_dspark._insert_context_kv(attns[1], kv_rot[:, 1], positions, md1)
+                v2_dspark._insert_context_kv(attns[2], kv_rot[:, 2], positions, md2)
+            return swa_caches[0].sum() + swa_caches[1].sum() + swa_caches[2].sum()
+
+        compiled_step = torch.compile(
+            step_fn, backend=cnt, fullgraph=True, dynamic=False
+        )
+        for step in range(5):
+            kv_rot = torch.full((4, 3, 8), float(step + 1))
+            positions = torch.tensor([1, 2, 3, 4], dtype=torch.long) + step
+            seq_lens = torch.tensor([5 + step, 5 + step], dtype=torch.int32)
+            qsl = torch.tensor([0, 2, 4], dtype=torch.int32)
+            bt0 = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32)
+            bt1 = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
+            bt2 = torch.tensor([[2, 3, 4], [5, 6, 7]], dtype=torch.int32)
+            # Brand-new metadata objects every step (distinct object ids)
+            md0 = SimpleNamespace(
+                seq_lens=seq_lens, query_start_loc=qsl, block_tables=bt0
+            )
+            md1 = SimpleNamespace(
+                seq_lens=seq_lens, query_start_loc=qsl, block_tables=bt1
+            )
+            md2 = SimpleNamespace(
+                seq_lens=seq_lens, query_start_loc=qsl, block_tables=bt2
+            )
+            out = compiled_step(kv_rot, positions, md0, md1, md2)
+            assert float(out.item()) > 0.0
+        assert cnt.frame_count == 1
+    finally:
+        torch._dynamo.reset()
+        sys.settrace(orig_trace)
+
 
 def test_dspark_fused_context_kv_unquantized_and_fp8_parity(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Verify fused 3-layer context WKV GEMM + batched 3D RoPE matches unfused path."""
+    """Verify fused 3-layer WKV GEMM + 3D RMSNorm + 3D RoPE matches unfused path."""
     _patch_dspark_env(monkeypatch)
     vllm_cfg = _make_dspark_vllm_config()
     draft_lm = v2_dspark.DSparkDeepseekV41ForCausalLM(vllm_config=vllm_cfg)
@@ -1609,6 +1714,7 @@ def test_dspark_fused_context_kv_unquantized_and_fp8_parity(
 
     # 1. Unfused reference (before _finalize_context_kv_weights)
     assert model._fused_context_wkv_weight is None
+    assert model._fused_context_kv_norm_weight is None
     unfused_inserts: list[torch.Tensor] = []
     monkeypatch.setattr(
         v2_dspark,
@@ -1622,6 +1728,8 @@ def test_dspark_fused_context_kv_unquantized_and_fp8_parity(
     draft_lm.process_weights_after_loading()
     assert model._fused_context_wkv_weight is not None
     assert model._fused_context_wkv_weight.shape == (hidden_size, 2 * head_dim)
+    assert model._fused_context_kv_norm_weight is not None
+    assert model._fused_context_kv_norm_weight.shape == (2, head_dim)
     assert model._fused_context_wkv_scale is None
     packed_ptr = model._fused_context_wkv_weight.data_ptr()
     draft_lm.process_weights_after_loading()
@@ -1641,6 +1749,7 @@ def test_dspark_fused_context_kv_unquantized_and_fp8_parity(
     # 3. Quantized (FP8 weight_scale) path
     model._fused_context_wkv_weight = None
     model._fused_context_wkv_scale = None
+    model._fused_context_kv_norm_weight = None
     for i, layer in enumerate(model.layers):
         layer.attn.fused_wqa_wkv.weight_scale = torch.full(
             (q_rank + head_dim,), 0.5 * (i + 1)
@@ -1648,6 +1757,7 @@ def test_dspark_fused_context_kv_unquantized_and_fp8_parity(
     draft_lm.process_weights_after_loading()
     assert model._fused_context_wkv_scale is not None
     assert model._fused_context_wkv_scale.shape == (2 * head_dim,)
+    assert model._fused_context_kv_norm_weight is not None
 
     q_matmul_calls: list[tuple[torch.Size, torch.Size]] = []
 
