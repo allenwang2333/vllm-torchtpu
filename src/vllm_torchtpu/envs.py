@@ -102,6 +102,7 @@ if TYPE_CHECKING:
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
+    GLM5_MKD_STACK_C: str = ""
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -412,6 +413,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SPARSE_MLA_ROPE_LAYOUT": env_with_choices(
         "TPU_SPARSE_MLA_ROPE_LAYOUT", "sparsecore", ["sparsecore", "tensorcore"]
     ),
+    # GLM-5.2 DCP: allocate the target model's sparse-MLA (nope, rope) caches
+    # and indexer K caches as ONE [n_layers_of_kind, num_blocks, ...] tensor
+    # per kind (the operand shape the glm5_mk_dcp decode megakernel takes).
+    # Every layer of a kind is bound to the same tensor with
+    # `module.kv_stack = (row, num_blocks)`; the stock DCP ops address their
+    # row through the page table. "" (default) = per-layer caches; "1" =
+    # stack nope + rope + idx; or a comma list of kinds ("nope,rope", "idx").
+    "GLM5_MKD_STACK_C": lambda: os.getenv("GLM5_MKD_STACK_C", "").strip(),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),
     # TPU accelerator type (e.g., "v5litepod-16", "v4-8")

@@ -99,6 +99,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_blocks,
     copy_mamba_state_rows,
     copy_pool_blocks,
+    copy_stacked_pool_blocks,
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
@@ -2098,7 +2099,9 @@ class TPUModelRunner(GPUModelRunner):
         assert self.kv_cache_config is not None
         num_blocks = self.kv_cache_config.num_blocks
         pool_sets: dict[int, list[torch.Tensor]] = {}
-        seen: set[int] = set()
+        # GLM5_MKD_STACK_C stacks ([n_layers, num_blocks, ...]) are copied by
+        # `_dense_kv_copy_stacked_pools`' op instead.
+        seen: set[int] = {id(t) for t in self._dense_kv_copy_stacked_pools()}
         for cache in self.kv_caches:
             if id(cache) in seen:
                 continue
@@ -2109,6 +2112,16 @@ class TPUModelRunner(GPUModelRunner):
             )
             pool_sets.setdefault(cache.shape[0] // num_blocks, []).append(cache)
         return pool_sets
+
+    def _dense_kv_copy_stacked_pools(self) -> list[torch.Tensor]:
+        """GLM5_MKD_STACK_C stacked caches: one manager block per row each."""
+        stacks = getattr(self, "glm5_kv_stack", None) or {}
+        num_blocks = self.kv_cache_config.num_blocks
+        pools = []
+        for tensor, _ in stacks.values():
+            assert tensor.shape[1] == num_blocks, (tensor.shape, num_blocks)
+            pools.append(tensor)
+        return pools
 
     def _apply_dense_kv_cache_block_copies(self, copies) -> None:
         """Copy CoW blocks in every per-layer KV cache tensor.
@@ -2132,6 +2145,18 @@ class TPUModelRunner(GPUModelRunner):
                 self.device, non_blocking=True
             )
             copy_pool_blocks(pools, src_t, dst_t)
+        stacked = self._dense_kv_copy_stacked_pools()
+        if stacked:
+            pairs = self._pad_to_bucket(
+                [(c.src_block_id, c.dst_block_id) for c in copies], pad=(0, 0)
+            )
+            src_t = torch.tensor([s for s, _ in pairs], dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            dst_t = torch.tensor([d for _, d in pairs], dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            copy_stacked_pool_blocks(stacked, src_t, dst_t)
 
     def _precompile_dense_kv_cache_block_copies(self) -> None:
         """Warm the dense CoW copy program at every bucket length.
@@ -2156,6 +2181,17 @@ class TPUModelRunner(GPUModelRunner):
                     copy_pool_blocks(pools, src, dst)
                     n *= 4
                 synchronize_tensors(pools)
+            stacked = self._dense_kv_copy_stacked_pools()
+            if stacked:
+                synchronize_tensors(stacked)
+                limit = self._bucket_len(self.max_num_reqs)
+                n = 8
+                while n <= limit:
+                    src = torch.zeros(n, dtype=torch.int32).to(self.device)
+                    dst = torch.zeros(n, dtype=torch.int32).to(self.device)
+                    copy_stacked_pool_blocks(stacked, src, dst)
+                    n *= 4
+                synchronize_tensors(stacked)
 
     def _prepare_async_token_substitution_indices(
         self, start_index: int, num_reqs: int, num_scheduled_tokens_per_req: np.ndarray
@@ -3517,6 +3553,11 @@ class TPUModelRunner(GPUModelRunner):
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
         )
         self._dp_step_num_chunks = target_num_chunks
+        # GLM5_MKD: the whole decode / verify forward as one megakernel on eligible steps
+        mkd = getattr(self, "glm5_mkd", None)
+        self._mkd_step = bool(
+            mkd is not None and mkd.step_ok(self, scheduler_output, target_num_chunks)
+        )
 
         # Run the multimodal (vision) encoder. vLLM's base
         # GPUModelRunner.execute_model does this; our override must do it
@@ -4954,6 +4995,10 @@ class TPUModelRunner(GPUModelRunner):
 
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
+        from vllm_torchtpu.kernels.glm5_mk_dcp.vllm_adapter import Glm5MKD
+
+        self.glm5_mkd = Glm5MKD.maybe_create(self)
+        self._mkd_step = False
 
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
@@ -5138,6 +5183,8 @@ class TPUModelRunner(GPUModelRunner):
     ) -> float | None:
         """Run the forward at one bucket shape.
 
+        Never takes the GLM5_MKD megakernel (``_mkd_step`` is cleared).
+
         With ``profile_prefix`` the batch is one prefill request of
         ``num_tokens`` tokens behind that many computed tokens (the same
         program: only the metadata values differ), and the forward's wall
@@ -5148,6 +5195,7 @@ class TPUModelRunner(GPUModelRunner):
         stage must then run the same sequence of forwards, and the caller
         settles the hand-off afterwards.
         """
+        self._mkd_step = False
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
 
@@ -6117,6 +6165,10 @@ class TPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
+        mkd = getattr(self, "glm5_mkd", None)
+        if mkd is not None:
+            mkd.bind_caches(self)
+            mkd.warmup(self)
         self._add_pipeline_chunk_buckets()
         if self.parallel_config.pipeline_parallel_size > 1 and self._pp_wave is None:
             self._pp_intermediate_tensors(1, zeros=True)
@@ -6994,6 +7046,8 @@ class TPUModelRunner(GPUModelRunner):
     def forward_model(
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
     ):
+        if getattr(self, "_mkd_step", False):
+            return self.glm5_mkd(self, input_ids, positions), None
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
         kwargs = {}

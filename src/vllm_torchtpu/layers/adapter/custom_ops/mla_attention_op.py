@@ -59,7 +59,13 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
-from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
+from vllm_torchtpu.kernels.mla.kv_cache_utils import (
+    OOB_PAGE,
+    _row_positions,
+    merge_kv_stack,
+    split_kv_stack,
+    stack_page_table_dcp,
+)
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     PallasMLAttentionBackendImpl,
@@ -225,6 +231,7 @@ def _cp_scatter_indexer_k(
     axis_name: str = DCP_AXIS_NAME,
     writer: str = "xla",
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
+    kv_stack: tuple[int, int] | None = None,
 ) -> jax.Array:
     """Scatter this step's indexer K rows into the DCP-sharded K cache.
 
@@ -240,6 +247,11 @@ def _cp_scatter_indexer_k(
     come from `cu_q_lens`/`seq_lens`.
 
     `axis_name`/`cp_size` name the axis the cache is split over.
+
+    `kv_stack` (GLM5_MKD_STACK_C): `(row, num_blocks)` when `cache_kv` is the
+    `[n_layers, num_blocks, ...]` stack shared by every indexer layer. Each
+    rank writes through its stack merged into one page pool (a bitcast) and a
+    page table rewritten into this layer's pages, and returns the whole stack.
     """
     if writer not in ("xla", "pallas"):
         raise ValueError(f"Expected writer in ('xla', 'pallas'), got {writer!r}.")
@@ -249,6 +261,19 @@ def _cp_scatter_indexer_k(
         )
 
     def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens):
+        if kv_stack is None:
+            return _local_layer(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens)
+        stacked_shape = cache_kv.shape
+        new_cache = _local_layer(
+            merge_kv_stack(cache_kv, kv_stack),
+            k_packed,
+            seq_lens,
+            stack_page_table_dcp(page_indices, kv_stack),
+            cu_q_lens,
+        )
+        return split_kv_stack(new_cache, stacked_shape)
+
+    def _local_layer(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens):
         rank = cp_rank_as_data(axis_name, cp_size)
         if writer == "pallas":
             return coalesced_kv_append_dcp(
@@ -317,6 +342,84 @@ def _cp_scatter_indexer_k(
         out_specs=sharded,
         check_vma=False,
     )(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens)
+
+
+def streamidx_topk_dcp_step(
+    q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
+    weights: jax.Array,  # replicated
+    cache_kv: jax.Array,  # this rank's position shard (or stack, see kv_stack)
+    k_packed: jax.Array,  # replicated
+    seq_lens: jax.Array,
+    page_indices: jax.Array,  # virtual page ordinals
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    mesh,
+    topk: int,
+    dcp_size: int,
+    interleave_size: int,
+    chunk_tokens: int | None,
+    kv_cache_mode: str | None,
+    kv_stack: tuple[int, int] | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """The DCP indexer step: append this step's K rows, then the rank-local top-k.
+
+    The body of `VllmTPUSparseAttnIndexer`'s DCP op. `kv_stack`
+    (GLM5_MKD_STACK_C) is `(row, num_blocks)` when `cache_kv` is the
+    `[n_layers, num_blocks, ...]` indexer stack (global leading dim
+    `dcp_size * n_layers`) shared by every indexer layer; the writer and the
+    reader each address this layer's row through the page table and the
+    returned cache is the whole stack.
+    """
+    # The layout is decided from one layer's page geometry; the merged stack
+    # has the same per-page shape, so describe it as one flat page pool.
+    layout_probe = cache_kv
+    if kv_stack is not None:
+        layout_probe = jax.ShapeDtypeStruct(
+            (cache_kv.shape[0] * cache_kv.shape[1], *cache_kv.shape[2:]),
+            cache_kv.dtype,
+        )
+    writer, kv_layout = _resolve_indexer_kv_cache_mode(
+        layout_probe, k_packed, mode=kv_cache_mode
+    )
+    # `_cp_scatter_indexer_k` pads the packed fp8+scale rows out to
+    # the cache's record width itself.
+    cache_kv = _cp_scatter_indexer_k(
+        cache_kv,
+        k_packed,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        mesh=mesh,
+        cp_size=dcp_size,
+        interleave_size=interleave_size,
+        axis_name=DCP_AXIS_NAME,
+        writer=writer,
+        kv_layout=kv_layout,
+        kv_stack=kv_stack,
+    )
+
+    q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+    local_topk = streamindex_topk_dcp(
+        q,
+        weights,
+        cache_kv,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        mesh=mesh,
+        k=topk,
+        compression_ratio=1,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+        num_kv_pages_per_block=(2, 2, 2),
+        num_queries_per_block=(1, 128, 128),
+        kv_layout=kv_layout,
+        chunk_tokens=chunk_tokens,
+        kv_stack=kv_stack,
+    )
+    return cache_kv, local_topk
 
 
 @SparseAttnIndexer.register_oot
@@ -470,6 +573,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             else None
         )
 
+        k_cache_module = self.k_cache
+
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
             weights: jax.Array,  # replicated
@@ -480,45 +585,25 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens: jax.Array,
             distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
-            writer, kv_layout = _resolve_indexer_kv_cache_mode(
-                cache_kv, k_packed, mode=kv_cache_mode
-            )
-            # `_cp_scatter_indexer_k` pads the packed fp8+scale rows out to
-            # the cache's record width itself.
-            cache_kv = _cp_scatter_indexer_k(
+            return streamidx_topk_dcp_step(
+                q_bytes,
+                weights,
                 cache_kv,
                 k_packed,
                 seq_lens,
                 page_indices,
                 cu_q_lens,
-                mesh=mesh,
-                cp_size=dcp_size,
-                interleave_size=interleave_size,
-                axis_name=DCP_AXIS_NAME,
-                writer=writer,
-                kv_layout=kv_layout,
-            )
-
-            q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
-            local_topk = streamindex_topk_dcp(
-                q,
-                weights,
-                cache_kv,
-                seq_lens,
-                page_indices,
-                cu_q_lens,
                 distribution,
                 mesh=mesh,
-                k=topk,
-                compression_ratio=1,
+                topk=topk,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
-                num_kv_pages_per_block=(2, 2, 2),
-                num_queries_per_block=(1, 128, 128),
-                kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
+                kv_cache_mode=kv_cache_mode,
+                # GLM5_MKD_STACK_C: read at trace time; the runner binds it
+                # with the stacked cache, after this op is built.
+                kv_stack=getattr(k_cache_module, "kv_stack", None),
             )
-            return cache_kv, local_topk
 
         replicated = jax.sharding.PartitionSpec()
         sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
@@ -642,6 +727,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
             )
         else:
+            assert getattr(self.k_cache, "kv_stack", None) is None, (
+                "GLM5_MKD_STACK_C stacked indexer caches are only wired into "
+                "the DCP indexer"
+            )
             topk_indices = self.topk_op(
                 q_values.view(torch.uint8),
                 weights,

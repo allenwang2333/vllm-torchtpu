@@ -1285,6 +1285,7 @@ def streamindex_topk(
         "kv_layout",
         "chunk_tokens",
         "dcp_axis_name",
+        "kv_stack",
     ),
 )
 def streamindex_topk_dcp(
@@ -1309,6 +1310,7 @@ def streamindex_topk_dcp(
     kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
+    kv_stack: tuple[int, int] | None = None,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1369,6 +1371,12 @@ def streamindex_topk_dcp(
         query-token axis, which is orthogonal to the KV axis DCP shards, so the
         two compose.
       dcp_axis_name: name of the DCP mesh axis.
+      kv_stack: GLM5_MKD_STACK_C. `(row, num_blocks)` when `cache_kv` is the
+        `[n_layers, num_blocks, ...]` indexer stack shared by every indexer
+        layer (each rank's shard is its own stack) and this layer is `row`.
+        Each rank reads its stack as one `[n_layers * num_blocks, ...]` page
+        pool (a bitcast, see `kv_cache_utils.merge_kv_stack`) through a page
+        table rewritten into this layer's pages. None: a per-layer cache.
 
     Returns:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1408,6 +1416,11 @@ def streamindex_topk_dcp(
         distribution,
     ):
         dcp_rank = cp_rank_as_data(dcp_axis_name, dcp_size)
+        if kv_stack is not None:
+            from vllm_torchtpu.kernels.mla import kv_cache_utils as mla_kv_utils
+
+            cache_kv = mla_kv_utils.merge_kv_stack(cache_kv, kv_stack)
+            page_indices = mla_kv_utils.stack_page_table_dcp(page_indices, kv_stack)
         local_page_indices = jnp.mod(page_indices, jnp.int32(cache_kv.shape[0]))
 
         idxs, scores = streamindex_topk(

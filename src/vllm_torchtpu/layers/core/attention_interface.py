@@ -1,3 +1,4 @@
+import dataclasses
 import functools
 import math
 from collections.abc import Callable
@@ -1029,6 +1030,7 @@ def sparse_mla_attention_dcp(
     dcp_size: int,
     interleave_size: int,
     dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+    kv_stack: tuple[int, int] | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1045,6 +1047,14 @@ def sparse_mla_attention_dcp(
         sequence coordinates, replicated. `block_tables` holds virtual page
         ordinals, resolved per rank exactly as on the indexer side.
       dcp_size, interleave_size: the shard layout.
+      kv_stack: GLM5_MKD_STACK_C. `(row, num_blocks)` when the caches are the
+        stacked `[n_layers, num_blocks, ...]` pair shared by every layer
+        (each rank's shard is its own stack) and this layer is `row`; the
+        specs still describe one layer. Each rank merges its stack into one
+        `[n_layers * num_blocks, ...]` page pool (a bitcast) and rewrites the
+        block table into this layer's pages (`stack_page_table_dcp`), so the
+        writer and the kernel run unchanged; the returned caches are the
+        whole stacks. None: per-layer caches.
 
     Returns:
       `(kv_cache_nope, kv_cache_rope, output, lse)`. `output` is
@@ -1131,6 +1141,19 @@ def sparse_mla_attention_dcp(
         request_distribution_,
     ):
         dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
+        local_nope_spec, local_rope_spec = nope_spec, rope_spec
+        if kv_stack is not None:
+            stacked_shapes = (kv_cache_nope.shape, kv_cache_rope.shape)
+            kv_cache_nope = kv_cache_utils.merge_kv_stack(kv_cache_nope, kv_stack)
+            kv_cache_rope = kv_cache_utils.merge_kv_stack(kv_cache_rope, kv_stack)
+            block_tables_ = kv_cache_utils.stack_page_table_dcp(block_tables_, kv_stack)
+            # Same per-page geometry, a pool of n_layers * num_blocks pages.
+            local_nope_spec = dataclasses.replace(
+                nope_spec, num_pages=kv_cache_nope.shape[0]
+            )
+            local_rope_spec = dataclasses.replace(
+                rope_spec, num_pages=kv_cache_rope.shape[0]
+            )
         kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
             kv_cache_nope,
             kv_cache_rope,
@@ -1140,8 +1163,8 @@ def sparse_mla_attention_dcp(
             block_tables_,
             query_start_loc_,
             dcp_rank,
-            nope_spec=nope_spec,
-            rope_spec=rope_spec,
+            nope_spec=local_nope_spec,
+            rope_spec=local_rope_spec,
             dcp_size=dcp_size,
             interleave_size=interleave_size,
         )
@@ -1171,7 +1194,9 @@ def sparse_mla_attention_dcp(
         )
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
-        local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
+        local_block_tables = jnp.mod(
+            block_tables_, jnp.int32(local_nope_spec.num_pages)
+        )
         output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -1191,6 +1216,13 @@ def sparse_mla_attention_dcp(
             **chunk_kwargs,
         )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
+        if kv_stack is not None:
+            kv_cache_nope = kv_cache_utils.split_kv_stack(
+                kv_cache_nope, stacked_shapes[0]
+            )
+            kv_cache_rope = kv_cache_utils.split_kv_stack(
+                kv_cache_rope, stacked_shapes[1]
+            )
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
         return (kv_cache_nope, kv_cache_rope, output[..., : ql_nope.shape[-1]], lse)
 
