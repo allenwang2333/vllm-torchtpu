@@ -27,7 +27,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 
 import vllm_torchtpu
-from vllm_torchtpu import _patch_vllm_block_pool_lifo_free
+from vllm_torchtpu import _patch_vllm_block_pool_lifo_free, envs
 from vllm_torchtpu.core import owner_affine_block_pool as oab
 from vllm_torchtpu.core.owner_affine_block_pool import (
     OwnerAffineBlockPool,
@@ -149,9 +149,12 @@ def installed(restore):
 
 @pytest.fixture
 def v2_env(monkeypatch):
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_IMPL", "v2")
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_SP", "0")
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_LOCAL_Q", "0")
+    # Set the flags on the module: an env var would be shadowed by the real
+    # attribute that another test's ``monkeypatch.setattr(envs, ...)`` leaves
+    # behind on undo (tests/conftest.py runs files in path order).
+    monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_IMPL", "v2")
+    monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_SP", False)
+    monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_LOCAL_Q", False)
 
 
 def test_layout_maps_ids_to_regions_and_rank_local_ids():
@@ -317,9 +320,9 @@ def test_owner_bookkeeping(pool):
 def test_validate_config(monkeypatch, v2_env):
     oab.validate_config(_vllm_config())
 
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_IMPL", "v1")
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_SP", "1")
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_LOCAL_Q", "1")
+    monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_IMPL", "v1")
+    monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_SP", True)
+    monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_LOCAL_Q", True)
     bad = _vllm_config(
         tp=1, pp=2, dcp=2, pcp=2, prefix_caching=True, kv_transfer=object()
     )
@@ -585,10 +588,10 @@ def test_install_is_idempotent(installed):
 def test_patch_installs_only_with_kv_shard(monkeypatch):
     calls = []
     monkeypatch.setattr(oab, "install", lambda: calls.append(True))
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_KV_SHARD", "0")
+    monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_KV_SHARD", False)
     vllm_torchtpu._patch_vllm_owner_affine_block_pool()
     assert calls == []
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_KV_SHARD", "1")
+    monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_KV_SHARD", True)
     vllm_torchtpu._patch_vllm_owner_affine_block_pool()
     assert calls == [True]
 
