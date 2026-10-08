@@ -74,6 +74,29 @@ def test_flush_all_writes_staged_params_then_releases_host_memory(monkeypatch):
         assert torch.equal(param.data, torch.full((4, 3), float(i + 1)))
 
 
+def test_host_tensor_audit_names_what_keeps_a_buffer_alive(monkeypatch, caplog):
+    """The audit's job is to name the reference that pins host memory."""
+
+    class Keeper:
+        pass
+
+    keeper = Keeper()
+    keeper.leaked = torch.zeros(64 << 20, dtype=torch.uint8)  # 64 MiB, largest here
+    lines = []
+    monkeypatch.setattr(model_mod.logger, "info", lambda msg, *a: lines.append(msg % a))
+    model_mod._log_live_host_tensors(top=1)
+    assert lines[0].startswith("Host tensors still reachable after weight loading")
+    assert "0.06 GiB" in lines[1] and "Keeper.leaked" in lines[1], lines
+
+
+def test_host_tensor_audit_never_raises(monkeypatch):
+    monkeypatch.setattr(model_mod.gc, "get_objects", lambda: 1 / 0)
+    warned = []
+    monkeypatch.setattr(model_mod.logger, "warning", lambda *a: warned.append(a))
+    model_mod._log_live_host_tensors()
+    assert warned
+
+
 def test_weight_loader_drops_mtp_after_mapping_and_keeps_plain_weights():
     model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
     nn.Module.__init__(model)

@@ -13,6 +13,7 @@
 # limitations under the License.
 """Native DeepSeek-V4 TPU model implementation."""
 
+import gc
 import re
 import sys
 import typing
@@ -49,6 +50,7 @@ from vllm.model_executor.models.utils import (
 from vllm.model_executor.offloader import NoopOffloader, set_offloader
 from vllm.sequence import IntermediateTensors
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,  # noqa: E501
 )
@@ -281,6 +283,80 @@ class _HostStagedParams:
             rss_before,
             host_rss_gib(),
         )
+        if envs.TPU_LOG_HOST_TENSORS_AFTER_LOAD:
+            _log_live_host_tensors()
+
+
+def _holders(obj: object, skip: set[int], limit: int = 4) -> list[str]:
+    """Name what references `obj`: `Class.attr` for an instance attribute,
+    otherwise the referrer's type. Containers built here are in `skip`."""
+    names = []
+    for ref in gc.get_referrers(obj):
+        if id(ref) in skip or type(ref).__name__ == "frame":
+            continue
+        name = type(ref).__name__
+        if isinstance(ref, dict):
+            for owner in gc.get_referrers(ref):
+                if getattr(owner, "__dict__", None) is ref:
+                    key = next((k for k, v in ref.items() if v is obj), "?")
+                    name = f"{type(owner).__name__}.{key}"
+                    break
+        elif isinstance(getattr(ref, "__dict__", None), dict):
+            # Python 3.12 keeps instance attributes inline, so the instance
+            # itself is the referrer rather than its __dict__.
+            key = next((k for k, v in vars(ref).items() if v is obj), None)
+            if key is not None:
+                name = f"{name}.{key}"
+        names.append(name)
+        if len(names) == limit:
+            break
+    return names
+
+
+def _log_live_host_tensors(top: int = 5) -> None:
+    """Log the CPU tensor storage Python can still reach, and its largest holders.
+
+    Storage that RSS shows but this does not find is held below Python (the
+    runtime, a C++ allocator); storage it does find names the reference to drop.
+    Diagnostic only: any failure is logged, never raised.
+    """
+    try:
+        gc.collect()
+        storages: dict[int, tuple[int, torch.Tensor]] = {}
+        objects = gc.get_objects()
+        for obj in objects:
+            if not isinstance(obj, torch.Tensor):
+                continue
+            try:
+                if obj.device.type != "cpu":
+                    continue
+                storage = obj.untyped_storage()
+                storages.setdefault(storage.data_ptr(), (storage.nbytes(), obj))
+            except Exception:  # noqa: S112 (meta tensors, sparse layouts)
+                continue
+        del objects
+        total = sum(nbytes for nbytes, _ in storages.values())
+        logger.info(
+            "Host tensors still reachable after weight loading: %d storages, "
+            "%.1f GiB, RSS %.1f GiB.",
+            len(storages),
+            total / 2**30,
+            host_rss_gib(),
+        )
+        largest = sorted(storages.values(), key=lambda entry: -entry[0])[:top]
+        skip = {id(storages), id(largest)} | {id(entry) for entry in largest}
+        skip |= {id(entry) for entry in storages.values()}
+        for nbytes, tensor in largest:
+            logger.info(
+                "  %.2f GiB %s %s %s held by %s",
+                nbytes / 2**30,
+                type(tensor).__name__,
+                tuple(tensor.shape),
+                tensor.dtype,
+                _holders(tensor, skip),
+            )
+    except Exception as e:
+        logger.warning("Host tensor audit after weight loading failed: %s", e)
 
 
 @support_torch_compile(
