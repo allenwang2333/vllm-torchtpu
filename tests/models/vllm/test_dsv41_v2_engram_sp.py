@@ -290,6 +290,9 @@ def test_sp_sharded_attention_input_projections_match_tp(monkeypatch, has_source
             head_dim=head_dim,
             q_lora_rank=q_lora,
             _sp_sharded_input=sp_sharded,
+            # Class default on DeepseekV41Attention (DECODE_LOCAL_Q, e1f17ef7);
+            # forward() reads it unconditionally, so the stub must carry it.
+            _replicated_local_q=False,
             _ced_global_from_encoder=False,
             _all_indices_fit=False,
             compressor=(
@@ -621,7 +624,9 @@ def test_partitioned_moe_routing_bitwise_equal(monkeypatch):
     assert dispatched_router is router_shards[0]
 
     # 2. Simulate partitioned moe_routing.route across all 8 EP ranks and verify
-    #    single packed int32[T/8, 9] all-gather and bitwise-exact outputs.
+    #    a single 1-word packed int32[T/8, topk] all-gather (upper 16 bits =
+    #    bf16 weight, lower 16 bits = expert id; TD6.6, 401c0ad0) and
+    #    bitwise-exact outputs.
     packed_shards: list[torch.Tensor] = []
     for r in range(world_size):
         w_r, id_r = moe_routing.select_experts(
@@ -632,9 +637,8 @@ def test_partitioned_moe_routing_bitwise_equal(monkeypatch):
             scoring_fn=layer.scoring_func,
             layer=layer,
         )
-        packed_shards.append(
-            torch.cat([w_r.contiguous().view(torch.int32), id_r.contiguous()], dim=-1)
-        )
+        w_bits = w_r.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+        packed_shards.append((w_bits << 16) | (id_r.contiguous() & 0xFFFF))
 
     route_gather_shapes: list[torch.Size] = []
 
@@ -655,7 +659,7 @@ def test_partitioned_moe_routing_bitwise_equal(monkeypatch):
     monkeypatch.setattr(parallel_state, "get_ep_group", lambda: fake_route_group)
 
     part_weights, part_ids = moe_routing.route(layer, full_hidden, router_shards[0])
-    assert route_gather_shapes == [torch.Size([local_tokens, topk // 2 + topk])]
+    assert route_gather_shapes == [torch.Size([local_tokens, topk])]
     assert torch.equal(part_weights, ref_weights)
     assert torch.equal(part_ids, ref_ids)
 
