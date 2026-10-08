@@ -27,6 +27,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasMLAttentionBackend,
     PallasMLAttentionBackendImpl,
 )
+from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_op_module
 from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
     VllmMLAAttention,
     VllmMultiHeadLatentAttentionWrapper,
@@ -741,6 +742,56 @@ def test_mla_weight_layout_is_restored_on_error(layout):
     ):
         attention.process_weights_after_loading(torch.float32)
     torch.testing.assert_close(getattr(attention.kv_b_proj, parameter_name), weight)
+
+
+def _on_tpu():
+    try:
+        return torch.empty(1, device="tpu").device.type == "tpu"
+    except RuntimeError:
+        return False
+
+
+class _PastTheWeights(Exception):
+    pass
+
+
+@pytest.mark.skipif(not _on_tpu(), reason="moves the absorbed weights to tpu")
+def test_mla_kv_b_replicate_uses_upstream_group_weight_without_gather(monkeypatch):
+    """With --dcp-kv-b-replicate upstream already built the group-wide W_UK_T,
+    so post-load must keep it and never all-gather."""
+    group_heads, num_heads = 8, 2
+    w_uk_t_group = torch.randn(group_heads, 3, 5)
+    attention = VllmMLAAttention.__new__(VllmMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.prefix = "model.layers.0.self_attn.attn"
+    attention.dcp_q_replicate = True
+    attention.kv_b_proj = torch.nn.Module()
+    attention.kv_b_proj.local_output = True
+
+    def upstream_process(act_dtype):
+        attention.W_UK_T = torch.nn.Parameter(w_uk_t_group[:num_heads].clone())
+        attention.W_UV = torch.nn.Parameter(torch.randn(num_heads, 5, 4))
+        attention.W_UK_T_dcp_qrep = w_uk_t_group.clone()
+
+    def no_gather():
+        raise AssertionError("kv_b replicate must not all-gather W_UK_T")
+
+    monkeypatch.setattr(mla_op_module, "get_dcp_group", no_gather)
+    monkeypatch.setattr(mla_op_module, "should_quantize_on_load", lambda _: False)
+    attention.impl = SimpleNamespace(
+        _get_kv_scales=MagicMock(side_effect=_PastTheWeights)
+    )
+    with (
+        patch(
+            "vllm.model_executor.layers.attention.mla_attention.MLAAttention.process_weights_after_loading",
+            side_effect=upstream_process,
+        ),
+        pytest.raises(_PastTheWeights),
+    ):
+        attention.process_weights_after_loading(torch.float32)
+
+    assert attention.W_UK_T_dcp_qrep.device.type == "tpu"
+    torch.testing.assert_close(attention.W_UK_T_dcp_qrep.cpu(), w_uk_t_group)
 
 
 def test_mla_flipped_projection_requires_weight():

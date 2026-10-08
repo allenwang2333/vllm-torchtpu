@@ -871,6 +871,13 @@ class VllmTPUMLAAttention(MLAAttention):
                 self.kv_b_proj.weight = Parameter(kv_b_weight, requires_grad=False)
 
         device = torch.device("tpu")
+        # Set by upstream only when kv_b_proj was loaded for the whole DCP group
+        # (--dcp-kv-b-replicate): already group-wide, no gather needed.
+        w_uk_t_group = (
+            self.W_UK_T_dcp_qrep
+            if getattr(self.kv_b_proj, "local_output", False)
+            else None
+        )
 
         if should_quantize_on_load(self.prefix):
             W_UK_T, w_uk_scale = quantize_tensor(
@@ -905,7 +912,16 @@ class VllmTPUMLAAttention(MLAAttention):
         # gathering q every step -- that trade is the point of qrep.
         self.W_UK_T_dcp_qrep = None
         self.W_UK_T_dcp_qrep_scale = None
-        if self.dcp_q_replicate:
+        if self.dcp_q_replicate and w_uk_t_group is not None:
+            if should_quantize_on_load(self.prefix):
+                w_uk_t_group, w_uk_group_scale = quantize_tensor(
+                    w_uk_t_group.to(torch.float32), torch.float8_e4m3fn, axis=1
+                )
+                self.W_UK_T_dcp_qrep_scale = _fresh(
+                    w_uk_group_scale.to(act_dtype)
+                ).to(device)
+            self.W_UK_T_dcp_qrep = _fresh(w_uk_t_group).to(device)
+        elif self.dcp_q_replicate:
             dcp_group = get_dcp_group()
             if dcp_group is None or int(dcp_group.world_size) <= 1:
                 raise RuntimeError(
