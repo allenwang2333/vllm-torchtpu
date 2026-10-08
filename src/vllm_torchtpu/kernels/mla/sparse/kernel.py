@@ -17,6 +17,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -915,6 +916,7 @@ def prepare_outputs(
         "small_chunk_gather_atoms",
         "live_gather_all_chunks",
         "topk_cap",
+        "capped_window_prep",
     ),
 )
 def sparse_ragged_paged_attention(
