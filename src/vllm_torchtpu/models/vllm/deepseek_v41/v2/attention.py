@@ -129,8 +129,16 @@ def _block_table(metadata):
 
 
 def _token_requests(metadata, positions):
+    """Request index of every token row: ``bucketize(rows, qsl[1:], right=True)``.
+
+    Counts the (non-decreasing) request ends at or below each row with one
+    ``[tokens, requests]`` compare + reduce. ``torch.bucketize`` lowers on TPU
+    to a fusion taking one scalar operand per boundary, which cost 31-37 us
+    per call at 288 tokens x 48 requests (C=48 DSpark K=5 xprof).
+    """
     rows = torch.arange(positions.shape[0], device=positions.device)
-    return torch.bucketize(rows, metadata.query_start_loc[1:], right=True)
+    ends = metadata.query_start_loc[1:]
+    return (rows.unsqueeze(1) >= ends.unsqueeze(0)).sum(-1)
 
 
 def _cache_slots(cache, metadata, positions, *, compress_ratio=1, ring=False):

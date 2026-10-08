@@ -788,3 +788,24 @@ def test_write_encoder_global_kv_empty_metadata(monkeypatch):
 
     # With empty kv_cache or None metadata, does nothing
     attn.write_encoder_global_kv(torch.randn(2, 10), torch.tensor([0, 1]))
+
+
+@pytest.mark.parametrize(
+    "lens",
+    [
+        [6] * 48,  # C=48 verify step
+        [5] * 45 + [0] * 3,  # draft step with trailing padded requests
+        [1, 7, 0, 3, 2048 - 11],  # mixed prefill / decode / empty request
+    ],
+)
+def test_token_requests_matches_bucketize(lens):
+    qsl = torch.cat(
+        [torch.zeros(1, dtype=torch.int32), torch.tensor(lens).cumsum(0).int()]
+    )
+    tokens = int(qsl[-1]) + 5  # rows past the last request map to len(lens)
+    metadata = SimpleNamespace(query_start_loc=qsl)
+    out = v2_attn._token_requests(metadata, torch.zeros(tokens, dtype=torch.int32))
+    rows = torch.arange(tokens)
+    ref = torch.bucketize(rows, qsl[1:], right=True)
+    assert out.dtype == ref.dtype
+    assert torch.equal(out, ref)
