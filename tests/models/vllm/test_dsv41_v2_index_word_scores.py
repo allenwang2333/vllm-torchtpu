@@ -231,7 +231,7 @@ def test_score_word_rows_wrapper_mesh_and_standalone():
     np.testing.assert_allclose(np.asarray(sharded), reference, rtol=1e-6, atol=1e-5)
 
 
-@pytest.mark.parametrize("tokens", [36, 72, 96])
+@pytest.mark.parametrize("tokens", [36, 72, 96, 144, 168, 192])
 def test_paged_index_scores_single_16k_tile_for_candidate_and_verify(tokens):
     width = 12928
     pool = jnp.zeros((64, ROW_WORDS), jnp.int32)

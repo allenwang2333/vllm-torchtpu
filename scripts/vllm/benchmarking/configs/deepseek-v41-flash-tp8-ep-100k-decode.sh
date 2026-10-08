@@ -37,6 +37,7 @@ export VLLM_USE_AOT_COMPILE=0
 # token bucket and needs ~32 GiB of scratch beyond the weights at C16.
 export TPU_DEEPSEEK_V41_IMPL="${TPU_DEEPSEEK_V41_IMPL:-v2}"
 export TPU_DEEPSEEK_V41_CED="${TPU_DEEPSEEK_V41_CED:-1}"
+export TPU_DEEPSEEK_V41_FUSED_SWA="${TPU_DEEPSEEK_V41_FUSED_SWA:-1}"
 # 16 x the 1280 MiB single-request budget of deepseek-v41-flash-tp8-ep-100k.
 # On CDK, 16 x 100k requests peaked at 25% of it.
 KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-21474836480}"

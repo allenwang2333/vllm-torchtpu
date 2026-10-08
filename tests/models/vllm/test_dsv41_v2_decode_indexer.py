@@ -976,3 +976,137 @@ class TestAttentionSelectPagedIndicesDecode:
             assert sel3.shape == (count, 4)
             assert torch.all(index_cache_2b.raw == 1)
             assert torch.all(index_cache_2b.raw_hi == 2)
+
+    def test_prestrided_pages_and_verify_tile_192(self):
+        """Verifies prestrided_pages=True and 16K tile preservation up to tokens=192."""
+        rng = np.random.default_rng(77)
+        heads, dim = 2, 128
+        tokens, width, page_records = 6, 1024, 32
+        pool = jnp.asarray(
+            rng.integers(-(2**31), 2**31, (256, ROW_WORDS)), dtype=jnp.int32
+        ) & jnp.int32(0x3FFF3FFF)
+        records = np.zeros((tokens, width), dtype=np.int32)
+        for r in range(tokens):
+            for p in range(0, width, page_records):
+                base = int(rng.integers(0, 256) * 2)
+                records[r, p : p + page_records] = base + np.arange(page_records)
+        records[:, -page_records:] = -1
+        records_j = jnp.asarray(records)
+        first_records_j = records_j[:, ::page_records]
+
+        q = jnp.asarray(rng.standard_normal((tokens, heads, dim)), jnp.bfloat16)
+        weights = jnp.asarray(rng.standard_normal((tokens, heads)), jnp.float32)
+        lengths = jnp.full((tokens,), width, dtype=jnp.int32)
+
+        scores_full = paged_index_scores_jax(
+            q, pool, records_j, weights, lengths, page_records=page_records
+        )
+        scores_prestrided = paged_index_scores_jax(
+            q,
+            pool,
+            first_records_j,
+            weights,
+            lengths,
+            page_records=page_records,
+            prestrided_pages=True,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(scores_prestrided), np.asarray(scores_full)
+        )
+
+        # Verify tokens=144, 168, 192 with requests (DP=2 x TP=4 verify batches)
+        # maintain 16K tile budget without collapsing to 8K.
+        for tok in (144, 168, 192):
+            n_req = tok // 6
+            q_v = jnp.zeros((tok, heads, dim), dtype=jnp.bfloat16)
+            rec_v = jnp.full((n_req, 16384), -1, dtype=jnp.int32)
+            w_v = jnp.zeros((tok, heads), dtype=jnp.float32)
+            len_v = jnp.full((tok,), 32, dtype=jnp.int32)
+            req_v = jnp.repeat(jnp.arange(n_req, dtype=jnp.int32), 6)
+            out_v = paged_index_scores_jax(
+                q_v,
+                pool,
+                rec_v,
+                w_v,
+                len_v,
+                requests=req_v,
+                page_records=page_records,
+            )
+            assert out_v.shape == (tok, 16384)
+
+        # Cover pages=True with non-bfloat16 q (gather_cache_page_values step loop)
+        scores_fp32 = paged_index_scores_jax(
+            q.astype(jnp.float32),
+            pool,
+            records_j,
+            weights,
+            lengths,
+            page_records=page_records,
+        )
+        assert scores_fp32.shape == (tokens, width)
+
+    def test_paged_indexer_prestrided_candidate_and_full_context(self):
+        """Verifies pre-strided candidate_context and full_context gathers."""
+        rng = np.random.default_rng(88)
+        tokens, width, topk = 6, 1024, 64
+        heads, dim = 2, 128
+        pool = jnp.asarray(
+            rng.integers(-(2**31), 2**31, (512, ROW_WORDS)), dtype=jnp.int32
+        ) & jnp.int32(0x3FFF3FFF)
+
+        for block_size, page_records in ((8, 32), (16, 8)):
+            records = np.zeros((tokens, width), dtype=np.int32)
+            for r in range(tokens):
+                for p in range(0, width, page_records):
+                    base = int(rng.integers(0, 512) * 2)
+                    records[r, p : p + page_records] = base + np.arange(page_records)
+            records[0, -page_records:] = -1
+            records_j = jnp.asarray(records)
+
+            q = jnp.asarray(rng.standard_normal((tokens, heads, dim)), jnp.bfloat16)
+            weights = jnp.asarray(rng.standard_normal((tokens, heads)), jnp.float32)
+            lengths = jnp.asarray(rng.integers(128, width, tokens), dtype=jnp.int32)
+            lengths = lengths.at[-1].set(0)
+            candidates = jnp.asarray(
+                rng.integers(-1, width // block_size + 2, (tokens, 16)),
+                dtype=jnp.int32,
+            )
+            requests = jnp.arange(tokens, dtype=jnp.int32)
+
+            for cand_filter in (False, True):
+                sel_ref, pub_ref = v2_kernels.paged_indexer_jax(
+                    q,
+                    pool,
+                    records_j,
+                    weights,
+                    lengths,
+                    candidates,
+                    requests,
+                    topk=topk,
+                    block_size=block_size,
+                    candidate_write=not cand_filter,
+                    candidate_filter=cand_filter,
+                    unordered=False,
+                    page_records=None,
+                )
+                sel_paged, pub_paged = v2_kernels.paged_indexer_jax(
+                    q,
+                    pool,
+                    records_j,
+                    weights,
+                    lengths,
+                    candidates,
+                    requests,
+                    topk=topk,
+                    block_size=block_size,
+                    candidate_write=not cand_filter,
+                    candidate_filter=cand_filter,
+                    unordered=False,
+                    page_records=page_records,
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(sel_paged), np.asarray(sel_ref)
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(pub_paged), np.asarray(pub_ref)
+                )

@@ -1957,6 +1957,7 @@ def paged_index_scores_jax(
     lengths: jax.Array,
     requests: jax.Array | None = None,
     page_records: int | None = None,
+    prestrided_pages: bool = False,
 ) -> jax.Array:
     """Index scores ``[tokens, width]``.
 
@@ -1967,15 +1968,21 @@ def paged_index_scores_jax(
     of every records row are one page's contiguous, pool-word-aligned records
     (`_request_row_slots` layout); score tiles, shared or per-token, then
     gather whole pages (see `gather_cache_page_values`).
+    ``prestrided_pages``: when True, ``records`` already holds one first-record
+    slot per ``page_records`` segment (shape ``[tokens, width // page_records]``).
     """
     tokens, dim = q.shape[0], q.shape[-1]
-    width = records.shape[1]
+    width = (
+        records.shape[1] * page_records
+        if prestrided_pages and page_records is not None
+        else records.shape[1]
+    )
     # Keep about `_INDEX_KEYS_PER_ITER` keys per iteration: small (decode)
     # batches otherwise run many latency-bound tiny gathers. Prefill batches use
     # 512: with 128 the loop is iteration-latency bound (2.3x slower at T=512
     # over 16.9K rows).
     eff_tokens = (
-        tokens // 6
+        min(tokens // 6, _INDEX_KEYS_PER_ITER // _INDEX_MAX_TILE)
         if (tokens // 6 <= records.shape[0] and 6 <= tokens <= 192 and tokens % 6 == 0)
         else tokens
     )
@@ -2060,7 +2067,7 @@ def paged_index_scores_jax(
         page = page_records
         page_tile = tile // page
         rows = tile // index_word_scores.SLOTS
-        page_rec_all = records[:, ::page]
+        page_rec_all = records if prestrided_pages else records[:, ::page]
         page_pad = padded_width // page - page_rec_all.shape[1]
 
         def _run_word_loop(page_rec):
@@ -2397,7 +2404,16 @@ def paged_indexer_jax(
         scores = paged_index_scores_jax(
             q, pool, records, weights, lengths, requests, page_records
         )
-        scores = jnp.where(jnp.take(records >= 0, requests, axis=0), scores, -jnp.inf)
+        if (
+            page_records is not None
+            and 512 % page_records == 0
+            and (page_records * q.shape[-1] // 2) % ROW_WORDS == 0
+        ):
+            page_valid = jnp.take(records[:, ::page_records] >= 0, requests, axis=0)
+            row_valid = jnp.repeat(page_valid, page_records, axis=1)[:, :width]
+        else:
+            row_valid = jnp.take(records >= 0, requests, axis=0)
+        scores = jnp.where(row_valid, scores, -jnp.inf)
         return select_indices_jax(
             scores,
             lengths,
@@ -2433,19 +2449,60 @@ def paged_indexer_jax(
         )
         valid = logical < jnp.minimum(lengths[:, None], width)
         valid &= jnp.repeat(unique & (ids < blocks), block_size, axis=-1)
-        # Gather only the candidate columns: per-token copies of whole
-        # records rows ([tokens, width]) cost more than the candidates.
-        compact = records[requests[:, None], jnp.minimum(logical, width - 1)]
-        compact = jnp.where(valid, compact, -1)
         # This bounds both key reads and QK work by the candidate pool size;
         # zero-length padding rows do not trigger key reads.
-        compact_lengths = jnp.where(lengths > 0, compact.shape[1], 0)
+        compact_lengths = jnp.where(lengths > 0, logical.shape[1], 0)
         # Candidate blocks are aligned runs of a page's contiguous records.
         segment = math.gcd(block_size, page_records) if page_records else None
-        scores = paged_index_scores_jax(
-            q, pool, compact, weights, compact_lengths, page_records=segment
-        )
-        scores = jnp.where(compact >= 0, scores, -jnp.inf)
+        dim = q.shape[-1]
+        if (
+            segment is not None
+            and 512 % segment == 0
+            and (segment * dim // 2) % ROW_WORDS == 0
+            and dim == index_word_scores.DIM
+            and q.dtype == jnp.bfloat16
+        ):
+            per_block = block_size // segment
+            seg_ids = (
+                ids
+                if per_block == 1
+                else (ids[..., None] * per_block + jnp.arange(per_block)).reshape(
+                    q.shape[0], -1
+                )
+            )
+            seg_table = records[:, ::segment]
+            seg_records = seg_table[
+                requests[:, None], jnp.minimum(seg_ids, seg_table.shape[1] - 1)
+            ]
+            seg_valid = jnp.repeat(unique & (ids < blocks), per_block, axis=-1) & (
+                seg_records >= 0
+            )
+            first_records = jnp.where(
+                seg_valid & (seg_ids * segment < jnp.minimum(lengths[:, None], width)),
+                seg_records,
+                -1,
+            )
+            scores = paged_index_scores_jax(
+                q,
+                pool,
+                first_records,
+                weights,
+                compact_lengths,
+                page_records=segment,
+                prestrided_pages=True,
+            )
+            scores = jnp.where(
+                valid & jnp.repeat(seg_valid, segment, axis=-1), scores, -jnp.inf
+            )
+        else:
+            # Gather only the candidate columns: per-token copies of whole
+            # records rows ([tokens, width]) cost more than the candidates.
+            compact = records[requests[:, None], jnp.minimum(logical, width - 1)]
+            compact = jnp.where(valid, compact, -1)
+            scores = paged_index_scores_jax(
+                q, pool, compact, weights, compact_lengths, page_records=segment
+            )
+            scores = jnp.where(compact >= 0, scores, -jnp.inf)
         output_width = min(topk, width)
         if (
             unordered
