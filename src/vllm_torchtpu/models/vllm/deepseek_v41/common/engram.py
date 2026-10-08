@@ -632,6 +632,66 @@ def _dp_gather_engram_rows(staged: torch.Tensor, num_tokens: int) -> torch.Tenso
     )
 
 
+def _dp_gather_packed_rows(
+    active_raw: torch.Tensor,
+    num_tokens: int,
+    *,
+    cols: int,
+    head_dim: int,
+    blocks: int,
+    block_size: int,
+) -> torch.Tensor | None:
+    """DP token-for-heads exchange on the packed int32 staging words.
+
+    Same result as dequantizing every staged token and calling
+    ``_dp_gather_engram_rows`` on the bf16 rows, but the collective moves the
+    packed FP8 + E8M0 bytes (``cols * head_dim * 9 / 8`` B/token instead of
+    ``cols * head_dim * 2`` B/token, 1.9x less), and only this replica's
+    ``num_tokens`` of the ``dp * slot`` staged tokens are unpacked and
+    dequantized (``dp_size``x fewer bf16/fp32 intermediates in HBM).
+    ``dequant_fp8_rows`` is elementwise per (token, head, block), so slicing
+    before it is bit-identical to slicing after it.
+
+    ``active_raw`` is the ``[staged_tokens, words_per_tok]`` view of a 1-D
+    buffer laid out as all raw words then all scale words (see
+    ``_init_staging``). Returns ``None`` without a DP group, in which case the
+    caller keeps the single-replica path.
+    """
+    dp_group = get_engram_dp_group()
+    if dp_group is None or dp_group.world_size <= 1:
+        return None
+    dp_size = dp_group.world_size
+    staged_tokens = active_raw.shape[0]
+    slot, remainder = divmod(staged_tokens, dp_size)
+    assert remainder == 0 and 0 <= num_tokens <= slot
+    raw_words_per_tok = (cols * head_dim) // 4
+    raw_words = staged_tokens * raw_words_per_tok
+    start = dp_group.rank_in_group * slot
+    gathered = dp_group.all_gather(active_raw, dim=0).view(dp_size, -1)
+    # Raw FP8 bytes: token-major words, so this replica's window is a row
+    # slice taken before unpacking.
+    raw_sel = gathered[:, :raw_words].reshape(dp_size, staged_tokens, -1)[
+        :, start : start + num_tokens
+    ]
+    raw = _unpack_bytes(raw_sel, dp_size * num_tokens * cols * head_dim).reshape(
+        dp_size, num_tokens, cols, head_dim
+    )
+    # Scale bytes (~1/32 of the raw bytes): a token's bytes may straddle a
+    # word when ``cols * blocks % 4 != 0``, so unpack every replica's small
+    # scale section and slice bytes.
+    scale_words = gathered[:, raw_words:]
+    scale = (
+        _unpack_bytes(scale_words, scale_words.numel() * 4)
+        .reshape(dp_size, -1)[:, : staged_tokens * cols * blocks]
+        .reshape(dp_size, staged_tokens, cols, blocks)[:, start : start + num_tokens]
+    )
+    return dequant_fp8_rows(
+        raw.transpose(0, 1).reshape(num_tokens, dp_size * cols, head_dim),
+        scale.transpose(0, 1).reshape(num_tokens, dp_size * cols, blocks),
+        block_size,
+    )
+
+
 def _embed_dp_size(engram: object) -> int:
     embed = getattr(engram, "embed_tokens", None)
     dp_size = getattr(embed, "dp_size", 1)
@@ -822,6 +882,20 @@ class Engram(upstream.Engram):
         raw_words_per_tok = (cols * head_dim) // 4
         scale_words_per_tok = -(-(cols * blocks) // 4)
         assert self._active_raw is not None
+        if dp_size > 1:
+            # Exchange the packed words and dequantize only this replica's
+            # tokens, instead of dequantizing all `dp * slot` staged tokens
+            # and gathering bf16 rows.
+            rows = _dp_gather_packed_rows(
+                self._active_raw,
+                num_tokens,
+                cols=cols,
+                head_dim=head_dim,
+                blocks=blocks,
+                block_size=self.embed_tokens.block_size,
+            )
+            if rows is not None:
+                return rows
         staged_tokens = num_tokens if dp_size == 1 else self._active_raw.shape[0]
         raw_bytes = staged_tokens * cols * head_dim
         scale_bytes = staged_tokens * cols * blocks

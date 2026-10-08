@@ -325,9 +325,19 @@ def test_ready_rows_dp2_all_modes_both_ranks(
         staged_by_rank = [e._active_rows for e in engrams]
 
     for rank, engram in enumerate(engrams):
-        group = _FakeDpGroup(dp_size, rank, inputs=staged_by_rank)
+        # host_raw exchanges the packed int32 staging words (EXT-6d); the other
+        # modes exchange bf16 rows. The reference stays the dequantized rows.
+        gather_inputs = (
+            [e._active_raw for e in engrams] if mode == "host_raw" else staged_by_rank
+        )
+        group = _FakeDpGroup(dp_size, rank, inputs=gather_inputs)
         monkeypatch.setattr(common_engram, "get_engram_dp_group", lambda g=group: g)
         rows = engram._ready_rows(num_tokens)
+        if mode == "host_raw":
+            words_per_tok = (cols * head_dim) // 4 + -(
+                -(cols * (head_dim // block)) // 4
+            )
+            assert group.calls == [((dp_size * slot, words_per_tok), 0)]
         assert rows.shape == (num_tokens, dp_size * cols, head_dim)
         expected = _reference_exchange(staged_by_rank, rank, num_tokens)
         np.testing.assert_array_equal(np.asarray(rows.float()), expected)
