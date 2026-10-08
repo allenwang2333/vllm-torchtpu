@@ -3,7 +3,7 @@
 """DSpark draft model for DeepSeek-V4.1 on TPU."""
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import cast
 
 import torch
@@ -86,6 +86,56 @@ def _remap_dspark_name(name: str, *, enable_confidence_head: bool = True) -> str
     if rest.endswith("ffn.gate.bias_vl"):
         rest = rest.removesuffix("ffn.gate.bias_vl") + "ffn.gate.bias"
     return f"model.layers.{stage}.{rest}"
+
+
+def _embed_draft_blocks(
+    embed: Callable[[torch.Tensor], torch.Tensor],
+    input_ids: torch.Tensor,
+    block: int,
+) -> torch.Tensor:
+    """Embed a draft batch laid out as ``[base, noise x (block - 1)]`` per request.
+
+    The draft forward's rows are ``[r * block, (r + 1) * block)`` for request
+    ``r`` with one shared noise (MASK) id after each base id, and the tail past
+    the last full block is noise too (``DFlashProposer._layout_draft_block``).
+    Only the per-request base ids and the noise id go through ``embed`` (a
+    vocab-parallel lookup plus a TP all-reduce), and the rows are broadcast
+    back, so the gather and the all-reduce shrink by ~``block``x. Each row is
+    the same single-rank sum as the full lookup, so the result is bitwise
+    equal. Rows whose id breaks the layout are NaN instead of silently wrong.
+
+    Args:
+        embed: Token-id -> ``[n, hidden]`` embedding lookup.
+        input_ids: ``[tokens]`` draft input ids.
+        block: Query rows per request.
+
+    Returns:
+        ``[tokens, hidden]`` embeddings.
+    """
+    tokens = input_ids.shape[0]
+    num_blocks = tokens // block
+    if block <= 1 or num_blocks == 0:
+        return embed(input_ids)
+    tail = tokens - num_blocks * block
+    base = input_ids[: num_blocks * block].view(num_blocks, block)[:, 0]
+    noise = input_ids[1:2]
+    rows = embed(torch.cat([base, noise]))
+    hidden = rows.shape[-1]
+    noise_row = rows[num_blocks:]
+    blocks = torch.cat(
+        [
+            rows[:num_blocks].unsqueeze(1),
+            noise_row.unsqueeze(1).expand(num_blocks, block - 1, hidden),
+        ],
+        dim=1,
+    ).reshape(num_blocks * block, hidden)
+    expected = torch.cat(
+        [base.unsqueeze(1), noise.expand(num_blocks, block - 1)], dim=1
+    ).reshape(-1)
+    if tail:
+        blocks = torch.cat([blocks, noise_row.expand(tail, hidden)])
+        expected = torch.cat([expected, noise.expand(tail)])
+    return blocks.masked_fill((expected != input_ids).unsqueeze(-1), float("nan"))
 
 
 def _insert_context_kv(
@@ -197,6 +247,7 @@ class DSparkDeepseekV41Model(nn.Module):
         query_block_size = (
             num_spec if getattr(config, "sample_from_anchor", True) else num_spec + 1
         )
+        self.query_block_size = int(query_block_size)
         for layer in cast(Iterable[DeepseekV41DecoderLayer], self.layers):
             if max_block_rows > layer.attn.window_size:
                 raise ValueError(
@@ -280,7 +331,9 @@ class DSparkDeepseekV41Model(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if inputs_embeds is None:
-            inputs_embeds = self.embed_input_ids(input_ids)
+            inputs_embeds = _embed_draft_blocks(
+                self.embed_input_ids, input_ids, self.query_block_size
+            )
         hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
         residual = post_mix = res_mix = pre_mix = None
