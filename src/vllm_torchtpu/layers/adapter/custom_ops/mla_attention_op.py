@@ -123,6 +123,11 @@ def _topk_rows_update_jax(buf: jax.Array, rows: jax.Array) -> jax.Array:
     return jax.lax.dynamic_update_slice(buf, rows.astype(buf.dtype), (0, 0))
 
 
+def _fake_topk_rows_update(buf: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+    del rows
+    return torch.empty_like(buf)
+
+
 # The shared top-k table's row update, donating the table.
 #
 # `buf[:n] = rows` on the module buffer reaches XLA as a graph input that is
@@ -133,29 +138,6 @@ def _topk_rows_update_jax(buf: jax.Array, rows: jax.Array) -> jax.Array:
 # `copy_` writeback (the KV-cache pattern) marks the table a buffer donor, so
 # XLA updates it in place. Built at import, not lazily: dynamo cannot trace the
 # op's construction from inside a compiled forward.
-_TOPK_ROWS_UPDATE_OP = pallas.jax_op(
-    "pallas::indexer_topk_rows_update", _topk_rows_update_jax, donate_argnums=(0,)
-)
-
-
-def _fake_topk_rows_update(buf: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
-    del rows
-    return torch.empty_like(buf)
-
-
-_TOPK_ROWS_UPDATE_OP.register_fake(_fake_topk_rows_update)
-
-
-def _topk_rows_update_jax(buf: jax.Array, rows: jax.Array) -> jax.Array:
-    """`buf[:rows.shape[0]] = rows` as one row update of a donated buffer."""
-    return jax.lax.dynamic_update_slice(buf, rows.astype(buf.dtype), (0, 0))
-
-
-def _fake_topk_rows_update(buf: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
-    del rows
-    return torch.empty_like(buf)
-
-
 _jax_op_fn = getattr(pallas, "jax_op", None)
 if _jax_op_fn is None and hasattr(pallas, "pallas"):
     _jax_op_fn = getattr(pallas.pallas, "jax_op", None)
