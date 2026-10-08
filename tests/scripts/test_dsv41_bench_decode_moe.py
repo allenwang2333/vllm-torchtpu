@@ -319,7 +319,11 @@ class TestBenchDecodeMoe:
                 assert "fused_ep_v2_w4a8_tp_ms" in results[key]
                 assert "gmm_sc1_onehot_sp_ms" in results[key]
                 assert "dense_expert_sp_ms" in results[key]
-                assert "fused_ep_v2_w4a8_sp_ms" in results[key]
+                t_local = t // 8
+                if t_local <= 8 or t_local % 8 == 0:
+                    assert "fused_ep_v2_w4a8_sp_ms" in results[key]
+                else:
+                    assert "fused_ep_v2_w4a8_sp_ms" not in results[key]
         assert [r["gmm_sc1_path"] for r in results.values()].count("ragged") == 4
 
         # Verify all registered fake functions were called
