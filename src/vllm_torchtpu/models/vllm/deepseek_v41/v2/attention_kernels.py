@@ -982,27 +982,30 @@ def fused_swa_inputs(
 ) -> tuple[jax.Array, jax.Array]:
     """Window rows in natural BF16 order and their additive score bias.
 
-    Returns ``(kv [tokens, width128, dim], bias [tokens, width128])`` with
-    ``width`` padded to a 128 multiple by ``-1`` records. The gather reads
-    the split element order (one SparseCore gather, as `_attend`) and
-    restores natural order with the MXU permutation `merge_halves`, so the
-    kernel can sum window and top-k PV products in one head-dim order.
-    Dead records read arbitrary pool rows; ``bias`` is ``finfo.min`` there
-    and the kernel zeroes those rows.
+    Returns ``(kv [tokens, width128, dim], bias [tokens, width128 // 128,
+    128])`` with ``width`` padded to a 128 multiple by ``-1`` records. The
+    gather reads the split element order (one SparseCore gather, as
+    `_attend`) and restores natural order with the MXU permutation
+    `merge_halves`, so the kernel can sum window and top-k PV products in one
+    head-dim order. Dead records read arbitrary pool rows (possibly NaN);
+    their probability is exactly 0, so the rows are zeroed here to keep
+    ``0 * NaN`` out of the PV product. ``bias`` is ``finfo.min`` for them,
+    laid out as one 128-lane row per 128 window columns so the kernel's
+    per-batch DMA slices an untiled token axis.
     """
     tokens, width = swa_records.shape
     padded = max(128, -(-width // 128) * 128)
     swa_records = jnp.pad(
         swa_records, ((0, 0), (0, padded - width)), constant_values=-1
     )
+    live = swa_records >= 0
     rows = gather_cache_values(
         cast(Any, swa_pool), swa_records.reshape(-1), dim, split=True
     )
     kv = merge_halves(rows).reshape(tokens, padded, dim)
-    bias = jnp.where(swa_records >= 0, 0.0, jnp.finfo(jnp.float32).min).astype(
-        jnp.float32
-    )
-    return kv, bias
+    kv = jnp.where(live[..., None], kv, jnp.zeros((), kv.dtype))
+    bias = jnp.where(live, 0.0, jnp.finfo(jnp.float32).min).astype(jnp.float32)
+    return kv, bias.reshape(tokens, padded // 128, 128)
 
 
 def sparse_fp8_attention_jax(

@@ -46,6 +46,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import common  # noqa: E402
 from bench_sparse_mla_swa import (  # noqa: E402
+    FUSED_SWA_MATCH,
     _mla_tc_only_jax,
     _pregather_all_chunks_jax,
     _sc_gather_only_jax,
@@ -460,7 +461,7 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                 verify_report["fused_swa_vs_baseline"] = common.verify_outputs(
                     {"out": (out_tp if tp_mode else out_hp).cpu()},
                     {"out": out_base.cpu()},
-                    common.LOSSLESS,
+                    FUSED_SWA_MATCH,
                     label=f"decode {args.mode} fused_swa vs baseline",
                 )
 

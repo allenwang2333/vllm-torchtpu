@@ -558,7 +558,7 @@ def _attention_kernel_fused_swa(
     cache_kv_nope_hbm_ref,  # int32[chunk_size, topk, 128]
     cache_kv_rope_hbm_ref,  # int32[chunk_size, topk // 4, 128]
     swa_kv_hbm_ref,  # bf16[max_num_tokens, window, head_dim]
-    swa_bias_hbm_ref,  # float32[max_num_tokens, window]: 0 or finfo.min
+    swa_bias_hbm_ref,  # float32[max_num_tokens, window // 128, 128]
     # Output
     o_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     # Scratch
@@ -567,7 +567,7 @@ def _attention_kernel_fused_swa(
     bq_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
     bo_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
     swa_kv_x2_ref,  # [2, batch_size, window, head_dim] bf16
-    swa_bias_x2_ref,  # [2, batch_size, window] float32
+    swa_bias_x2_ref,  # [2, batch_size, window // 128, 128] float32
     sems,  # [6, 2]
     *,
     sm_scale: float,
@@ -576,10 +576,12 @@ def _attention_kernel_fused_swa(
     """`_attention_kernel` with the sliding window folded into the softmax.
 
     The window rows of every token arrive gathered in natural BF16 order
-    (``swa_kv``) with an additive column bias (``swa_bias``: 0 for a live
-    record, ``finfo.min`` for a ``-1`` record). One token's scores are the
-    lane concatenation ``[window | top-k]`` of two MXU products, one softmax
-    over both, and two PV products summed; there is no SWA pre-pass state.
+    (``swa_kv``, dead records zeroed) with an additive column bias
+    (``swa_bias``: 0 for a live record, ``finfo.min`` for a ``-1`` record,
+    one sublane row per 128 window columns so the token axis stays untiled).
+    One token's scores are the lane concatenation ``[window | top-k]`` of two
+    MXU products, one softmax over both, and two PV products summed; there is
+    no SWA pre-pass state.
     """
     assert q_hbm_ref.shape == o_hbm_ref.shape
 
@@ -590,7 +592,7 @@ def _attention_kernel_fused_swa(
     bkv_sz = cache_kv_rope_hbm_ref.shape[1] * 2
     window = swa_kv_hbm_ref.shape[1]
     assert swa_kv_hbm_ref.shape == (num_tokens, window, head_dim)
-    assert swa_bias_hbm_ref.shape == (num_tokens, window)
+    assert swa_bias_hbm_ref.shape == (num_tokens, window // 128, 128)
 
     q_dtype = q_hbm_ref.dtype
     assert o_hbm_ref.dtype == q_dtype
@@ -706,12 +708,15 @@ def _attention_kernel_fused_swa(
         return jnp.where(k_span < kv_len, bkv, 0)
 
     def load_swa(sem_idx, batch_idx):
-        bias = swa_bias_x2_ref[sem_idx, batch_idx, :][None, :]
-        k_swa = swa_kv_x2_ref.at[sem_idx, batch_idx][...]
-        # A dead record's row is arbitrary pool bytes (possibly NaN); its
-        # probability is exactly 0, so zero the row to keep 0 * NaN out.
-        live = (bias > score_min).reshape(window, 1)
-        return jnp.where(live, k_swa, jnp.zeros((), k_swa.dtype)), bias
+        # One (1, 128) row per 128 window columns, concatenated along lanes;
+        # a (1, W) -> (W, 1) cast is not a Mosaic-supported relayout, which
+        # is why dead rows are zeroed by `fused_swa_inputs` rather than here.
+        rows = [
+            swa_bias_x2_ref[sem_idx, batch_idx, pl.ds(i, 1), :]
+            for i in range(window // 128)
+        ]
+        bias = rows[0] if len(rows) == 1 else jnp.concatenate(rows, axis=1)
+        return swa_kv_x2_ref.at[sem_idx, batch_idx][...], bias
 
     def process():
         bi_sem_idx = sem_ids_ref[0]
@@ -781,7 +786,7 @@ def fused_swa_attention_call(
     cache_kv_nope: jax.Array,  # int32[chunk_size, topk, 128]
     cache_kv_rope: jax.Array,  # int32[chunk_size, topk // 4, 128]
     swa_kv: jax.Array,  # bf16[max_num_tokens, window, head_dim]
-    swa_bias: jax.Array,  # float32[max_num_tokens, window]
+    swa_bias: jax.Array,  # float32[max_num_tokens, window // 128, 128]
     kv_lens: jax.Array,  # i32[max_num_tokens]
     attention_sinks: jax.Array,  # float32[num_q_heads], padded
     *,
@@ -809,7 +814,7 @@ def fused_swa_attention_call(
         pltpu.VMEM((2, batch_size, num_q_heads, head_dim), q.dtype),
         pltpu.VMEM((2, batch_size, num_q_heads, head_dim), q.dtype),
         pltpu.VMEM((2, batch_size, window, head_dim), swa_kv.dtype),
-        pltpu.VMEM((2, batch_size, window), jnp.float32),
+        pltpu.VMEM((2, batch_size, window // 128, 128), jnp.float32),
         pltpu.SemaphoreType.DMA((6, 2)),
     ]
     scalar_prefetches = (

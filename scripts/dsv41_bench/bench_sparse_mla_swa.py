@@ -51,6 +51,11 @@ MODES = (
     "union_gather",
 )
 COMPRESSED_LAYERS = 38
+# The fused SWA kernel takes one joint f32 softmax where the baseline merges a
+# BF16-rounded SWA pre-pass, so each BF16 output element may round one ulp
+# apart (measured: max |diff| = 2^-11, i.e. one ulp below 0.25). ``rel_l2``
+# is then bounded by one BF16 ulp, 2^-8, not ``common.LOSSLESS``'s 1e-3.
+FUSED_SWA_MATCH = common.MatchCriteria("lossless", min_cos=0.99999, max_rel_l2=2.0**-8)
 REUSE_INDEX_LAYERS = 30
 
 
@@ -1592,14 +1597,15 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                         common.LOSSLESS,
                         label="token_parallel vs baseline",
                     )
-                # The fused SWA kernel takes one joint softmax over window and
-                # top-k rows, so it is lossless, not bit-exact, against the
-                # two-stage baseline.
+                # The fused SWA kernel is one BF16 ulp, not bit-exact, against
+                # the two-stage baseline (see `FUSED_SWA_MATCH`).
                 exact_mode = args.mode != "token_parallel" and not fused_swa
                 verify_report["selected_mode_vs_baseline"] = common.verify_outputs(
                     {"out": out["out"].cpu()},
                     {"out": base_out.cpu()},
-                    common.EXACT if exact_mode else common.LOSSLESS,
+                    common.EXACT
+                    if exact_mode
+                    else (FUSED_SWA_MATCH if fused_swa else common.LOSSLESS),
                     label=f"mode={args.mode} fused_swa={fused_swa} vs baseline",
                 )
                 if args.mode == "token_parallel" and args.num_seqs == 1:
@@ -1816,11 +1822,12 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
                         label="swa_only vs _attend",
                     )
                     verify_report["decode_subop_suite"] = subop_suite_res
-                criteria = (
-                    common.EXACT
-                    if args.mode != "token_parallel" and not fused_swa
-                    else common.LOSSLESS
-                )
+                if fused_swa:
+                    criteria = FUSED_SWA_MATCH
+                elif args.mode != "token_parallel":
+                    criteria = common.EXACT
+                else:
+                    criteria = common.LOSSLESS
         else:
             criteria = common.LOSSLESS
 

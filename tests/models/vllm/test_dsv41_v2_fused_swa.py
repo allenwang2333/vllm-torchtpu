@@ -196,11 +196,13 @@ def _dequant_rows(words, rope):
 
 
 def _reference(q, keys, kv_lens, swa_kv, swa_bias, sinks, scale):
-    """Plain softmax over ``[window | top-k]`` with the kernel's roundings."""
+    """Plain softmax over ``[window | top-k]`` with the kernel's roundings.
+
+    ``swa_bias`` is 2-D ``[tokens, window]``; the kernel takes it as
+    ``[tokens, window // 128, 128]`` (see `_kernel_bias`).
+    """
     q = q.astype(jnp.float32)
-    swa = jnp.where(
-        (swa_bias > jnp.finfo(jnp.float32).min)[..., None], swa_kv, 0
-    ).astype(jnp.float32)
+    swa = swa_kv.astype(jnp.float32)
     k_span = jnp.arange(keys.shape[1])[None]
     keys = jnp.where((k_span < kv_lens[:, None])[..., None], keys, 0)
     s_swa = jnp.einsum("thd,twd->thw", q, swa) * scale + swa_bias[:, None]
@@ -219,6 +221,12 @@ def _reference(q, keys, kv_lens, swa_kv, swa_bias, sinks, scale):
     return acc / denominator[..., None]
 
 
+def _kernel_bias(swa_bias):
+    """The kernel's lane-tiled bias layout, one sublane row per 128 columns."""
+    tokens, window = swa_bias.shape
+    return jnp.asarray(swa_bias, jnp.float32).reshape(tokens, window // 128, 128)
+
+
 def _run_fused_kernel(
     q, nope_words, rope_words, swa_kv, swa_bias, kv_lens, sinks, *, scale, batch_size
 ):
@@ -226,6 +234,7 @@ def _run_fused_kernel(
     tokens, heads, dim = q.shape
     topk = nope_words.shape[1]
     window = swa_kv.shape[1]
+    swa_bias = _kernel_bias(swa_bias)
     valid = int(jnp.sum(kv_lens >= 0))
     grid = -(-tokens // batch_size)
     out = np.zeros(q.shape, q.dtype)
@@ -246,7 +255,7 @@ def _run_fused_kernel(
         bq_x2_ref=_Ref(np.zeros((2, batch_size, heads, dim), q.dtype)),
         bo_x2_ref=_Ref(np.zeros((2, batch_size, heads, dim), q.dtype)),
         swa_kv_x2_ref=_Ref(np.zeros((2, batch_size, window, dim), jnp.bfloat16)),
-        swa_bias_x2_ref=_Ref(np.zeros((2, batch_size, window), np.float32)),
+        swa_bias_x2_ref=_Ref(np.zeros((2, batch_size, window // 128, 128), np.float32)),
         sems=_Ref(np.zeros((6, 2), np.int32)),
     )
     for step in range(grid):
@@ -289,7 +298,7 @@ class TestFusedSwaKernel:
         live = np.ones((tokens, window), bool)
         live[:, 100:] = False  # padded -1 records
         live[3] = False  # a token with no live window row at all
-        swa_kv[~live] = np.nan  # dead rows read arbitrary pool bytes
+        swa_kv[~live] = 0  # `fused_swa_inputs` zeroes dead rows
         swa_kv = jnp.asarray(swa_kv, jnp.bfloat16)
         swa_bias = jnp.where(live, 0.0, jnp.finfo(jnp.float32).min)
         kv_lens = jnp.asarray(
@@ -357,11 +366,11 @@ class TestFusedSwaKernel:
             cache_kv_nope_hbm_ref=_Ref(np.zeros((4, 16, 128), np.int32)),
             cache_kv_rope_hbm_ref=_Ref(np.zeros((4, 4, 128), np.int32)),
             swa_kv_hbm_ref=_Ref(np.zeros((4, 128, HEAD_DIM), jnp.bfloat16)),
-            swa_bias_hbm_ref=_Ref(np.zeros((4, 128), np.float32)),
+            swa_bias_hbm_ref=_Ref(np.zeros((4, 1, 128), np.float32)),
             o_hbm_ref=q,
         )
         scratch = [None] * 7
-        bad = dict(good, swa_bias_hbm_ref=_Ref(np.zeros((4, 64), np.float32)))
+        bad = dict(good, swa_bias_hbm_ref=_Ref(np.zeros((4, 128), np.float32)))
         with pytest.raises(AssertionError):
             sparse_mla._attention_kernel_fused_swa(
                 *bad.values(), *scratch, sm_scale=1.0, batch_size=4
@@ -392,7 +401,7 @@ class TestFusedSwaAttentionCall:
                 jnp.zeros((tokens, topk, 128), jnp.int32),
                 jnp.zeros((tokens, topk // 4, 128), jnp.int32),
                 jnp.zeros((tokens, window, HEAD_DIM), jnp.bfloat16),
-                jnp.zeros((tokens, window), jnp.float32),
+                jnp.zeros((tokens, window // 128, 128), jnp.float32),
                 jnp.zeros((tokens,), jnp.int32),
                 jnp.zeros((heads,), jnp.float32),
                 start_seq_idx=0,
@@ -412,7 +421,7 @@ class TestFusedSwaAttentionCall:
         scratch = grid_spec.scratch_shapes
         assert len(scratch) == 7
         assert scratch[4].shape == (2, 8, window, HEAD_DIM)
-        assert scratch[5].shape == (2, 8, window)
+        assert scratch[5].shape == (2, 8, window // 128, 128)
         assert int(grid_spec.grid[0]) == 3
 
 
@@ -477,26 +486,29 @@ class TestFusedSwaHelpers:
         rng = np.random.default_rng(2)
         dim = 256
         rows = jnp.asarray(rng.standard_normal((40, dim)), jnp.bfloat16)
+        # Poison the rows a -1 record may read (clamped or wrapped index).
+        rows = rows.at[0].set(jnp.nan).at[-1].set(jnp.nan)
         # Pack BF16 pairs into int32 words: element 2i low, 2i + 1 high.
         bits = jax.lax.bitcast_convert_type(rows, jnp.uint16).astype(jnp.uint32)
         pool = (bits[:, 0::2] | (bits[:, 1::2] << 16)).astype(jnp.int32)
         records = jnp.asarray(
-            [[3, 7, -1, 11] + [-1] * 60, [0] * 64],
+            [[3, 7, -1, 11] + [-1] * 60, [1] * 64],
             jnp.int32,
         )
         kv, bias = attention_kernels.fused_swa_inputs(pool, records, dim)
         assert kv.shape == (2, 128, dim) and kv.dtype == jnp.bfloat16
-        assert bias.shape == (2, 128) and bias.dtype == jnp.float32
+        assert bias.shape == (2, 1, 128) and bias.dtype == jnp.float32
         assert jnp.array_equal(kv[0, 0], rows[3])
         assert jnp.array_equal(kv[0, 1], rows[7])
         assert jnp.array_equal(kv[0, 3], rows[11])
-        assert jnp.array_equal(kv[1, :64], jnp.broadcast_to(rows[0], (64, dim)))
-        want_bias = jnp.where(
-            jnp.pad(records, ((0, 0), (0, 64)), constant_values=-1) >= 0,
-            0.0,
-            jnp.finfo(jnp.float32).min,
-        )
-        assert jnp.array_equal(bias, want_bias)
+        assert jnp.array_equal(kv[1, :64], jnp.broadcast_to(rows[1], (64, dim)))
+        padded = jnp.pad(records, ((0, 0), (0, 64)), constant_values=-1)
+        want_bias = jnp.where(padded >= 0, 0.0, jnp.finfo(jnp.float32).min)
+        assert jnp.array_equal(bias[:, 0], want_bias)
+        # Dead records (-1 and the pad) are zero rows, whatever the pool holds.
+        assert jnp.all(kv[0, 2] == 0) and jnp.all(kv[0, 4:] == 0)
+        assert jnp.all(kv[1, 64:] == 0)
+        assert not jnp.isnan(kv).any()
         # Natural order agrees with the lane-gather reader as well.
         natural = gather_cache_values(pool, records[0, :2], dim)
         assert jnp.array_equal(kv[0, :2], natural)
@@ -509,8 +521,11 @@ class TestFusedSwaHelpers:
         records = jnp.full((3, 200), 20, jnp.int32)
         kv, bias = attention_kernels.fused_swa_inputs(banks, records, dim)
         assert kv.shape == (3, 256, dim)
-        assert jnp.all(bias[:, :200] == 0)
-        assert jnp.all(bias[:, 200:] == jnp.finfo(jnp.float32).min)
+        assert bias.shape == (3, 2, 128)
+        flat = bias.reshape(3, 256)
+        assert jnp.all(flat[:, :200] == 0)
+        assert jnp.all(flat[:, 200:] == jnp.finfo(jnp.float32).min)
+        assert jnp.all(kv[:, 200:] == 0)
         single_kv, _ = attention_kernels.fused_swa_inputs(pool, records, dim)
         assert jnp.array_equal(kv, single_kv)
 
@@ -527,7 +542,7 @@ class TestFusedSwaDriver:
             distribution=jnp.array([0, 0, 1], jnp.int32),
             sinks=jnp.zeros((heads,), jnp.float32),
             swa_kv=jnp.ones((tokens, window, 64), jnp.bfloat16),
-            swa_bias=jnp.zeros((tokens, window), jnp.float32),
+            swa_bias=jnp.zeros((tokens, window // 128, 128), jnp.float32),
         )
 
     @pytest.mark.parametrize("two_bank", [False, True])
@@ -575,7 +590,7 @@ class TestFusedSwaDriver:
         q_shape, kv_shape, bias_shape, kw = calls[0]
         assert q_shape[-1] == 128  # padded head dim
         assert kv_shape == (24, 128, 128)  # window rows padded alongside q
-        assert bias_shape == (24, 128)
+        assert bias_shape == (24, 1, 128)
         assert kw["sm_scale"] == 0.25 and kw["kernel_batch_size"] == 16
         assert calls[1][3]["start_seq_idx"] == 16
         assert calls[1][3]["kernel_batch_size"] == 8
@@ -650,7 +665,7 @@ class TestFusedSwaDriver:
                 kw = union.call_args.kwargs
                 assert kw["union_gather"] is union_gather
                 assert kw["swa_kv"].shape == (24, 128, 64)
-                assert kw["swa_bias"].shape == (24, 128)
+                assert kw["swa_bias"].shape == (24, 1, 128)
                 assert union.call_args.args[8:11] == (None, None, None)
 
     def test_sparse_fp8_attention_jax_keeps_prefill_path(self):
