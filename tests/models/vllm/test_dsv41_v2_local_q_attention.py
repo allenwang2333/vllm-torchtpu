@@ -105,8 +105,11 @@ def _stub_attn(
 class TestInitLocalQWeights:
     """Verify _init_local_q_weights early return guards and gather logic."""
 
-    def test_gather_columns_and_register_buffers(self, monkeypatch: pytest.MonkeyPatch):
-        attn = _stub_attn(monkeypatch)
+    @pytest.mark.parametrize("groups", [1, 2])
+    def test_gather_columns_and_register_buffers(
+        self, monkeypatch: pytest.MonkeyPatch, groups: int
+    ):
+        attn = _stub_attn(monkeypatch, groups=groups)
         attn._init_local_q_weights()
 
         assert attn._local_q_attn is True
@@ -134,7 +137,7 @@ class TestInitLocalQWeights:
             {"tp": 1},
             {"fp8_kv": False},
             {"compress_ratio": 0},
-            {"groups": 2},
+            {"groups": 0},
         ],
     )
     def test_early_returns_config_guards(

@@ -86,6 +86,7 @@ def _stub_attn(
     sp_sharded: bool = False,
     ced_decoder: bool = False,
     tp: int = 2,
+    groups: int = 1,
 ):
     monkeypatch.setattr(v2_attn.envs, "TPU_DEEPSEEK_V41_LOCAL_Q", local_q)
     monkeypatch.setattr(v2_attn.envs, "TPU_DEEPSEEK_V41_DECODE_LOCAL_Q", decode_local_q)
@@ -96,7 +97,7 @@ def _stub_attn(
     torch.nn.Module.__init__(attn)
     attn._fp8_kv = True
     attn.compress_ratio = 4
-    attn.n_local_groups = 1
+    attn.n_local_groups = groups
     attn._token_parallel_attn = True
     attn._sp_sharded_input = sp_sharded
     attn._ced_decoder = ced_decoder
@@ -121,6 +122,10 @@ class TestInitLocalQWeightsGating:
         [
             # Decoder layer at decode: replicated input, DECODE flag only.
             (dict(decode_local_q=True, ced_decoder=True), True, True),
+            # TP=4 (2 local o_groups per rank): both DECODE_LOCAL_Q and LOCAL_Q work.
+            (dict(decode_local_q=True, ced_decoder=True, tp=4, groups=2), True, True),
+            (dict(decode_local_q=True, tp=4, groups=2), True, True),
+            (dict(local_q=True, sp_sharded=True, tp=4, groups=2), True, False),
             # Any TP-replicated layer qualifies, not only the CED decoder.
             (dict(decode_local_q=True), True, True),
             # DECODE flag does nothing for SP-sharded layers...
@@ -133,8 +138,9 @@ class TestInitLocalQWeightsGating:
             # LOCAL_Q alone on a replicated non-decoder layer (pre-existing).
             (dict(local_q=True), True, False),
             (dict(), False, False),
-            # tp == 1 never gathers.
+            # tp == 1 or groups == 0 never gathers.
             (dict(decode_local_q=True, tp=1), False, False),
+            (dict(decode_local_q=True, groups=0), False, False),
         ],
     )
     def test_flag_matrix(
@@ -705,3 +711,4 @@ def test_replicated_local_q_bit_exact_vs_token_parallel_8_cpu_devices():
     )
     assert "EXACTNESS_OK" in proc.stdout, proc.stdout
     assert proc.stdout.count("bit-exact on 8 ranks") == 3
+    assert proc.stdout.count("bit-exact on 4 ranks (2 groups/rank)") == 4

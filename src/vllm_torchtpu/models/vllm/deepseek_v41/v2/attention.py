@@ -1464,7 +1464,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             not (replicated or sharded)
             or tp_size <= 1
             or not (self._fp8_kv and self.compress_ratio)
-            or self.n_local_groups != 1
+            or self.n_local_groups < 1
         ):
             return
         wq_scale = getattr(self.wq_b, "weight_scale", None)

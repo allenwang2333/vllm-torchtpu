@@ -63,8 +63,9 @@ def o_proj_ref(x, pos, cs, w, ws, head_dim):
     return y.reshape(t, -1).astype(jnp.bfloat16)
 
 
-def make_inputs(tokens):
-    heads = TP * HEADS_PER_GROUP
+def make_inputs(tokens, *, tp=TP, local_groups=1):
+    total_groups = tp * local_groups
+    heads = total_groups * HEADS_PER_GROUP
 
     def b(*s):
         return jnp.asarray(rng.integers(0, 2, size=s), dtype=jnp.bfloat16)
@@ -86,24 +87,25 @@ def make_inputs(tokens):
         pages=jnp.zeros((2, 2), jnp.int32),
         query_start_loc=jnp.asarray([0, tokens // 3, tokens], jnp.int32),
         full_sink=jnp.asarray(rng.integers(0, 2, size=heads), jnp.float32),
-        wo_a_full=f8(HEADS_PER_GROUP * HEAD_DIM, TP * R),
+        wo_a_full=f8(HEADS_PER_GROUP * HEAD_DIM, total_groups * R),
         wo_a_full_scale=jnp.asarray(
-            rng.choice([0.5, 1.0, 2.0], size=TP * R), jnp.float32
+            rng.choice([0.5, 1.0, 2.0], size=total_groups * R), jnp.float32
         ),
         valid=jnp.asarray(rng.integers(0, 2, size=tokens), jnp.int32),
     )
 
 
-def reference_per_rank(tokens, a):
+def reference_per_rank(tokens, a, *, tp=TP, local_groups=1, tp_mesh=mesh):
     """Production decode sequence: `_token_parallel_body` + torch `_o_proj`."""
-    tokens_local = tokens // TP
+    tokens_local = tokens // tp
     pad_rows = -tokens_local % 8
+    local_r = local_groups * R
 
     def body(
         qr, wq, wqs, pos, cs, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, f_snk, w, ws, ok
     ):
         r = jax.lax.axis_index("tp")
-        cols = HEADS_PER_GROUP * HEAD_DIM
+        cols = local_groups * HEADS_PER_GROUP * HEAD_DIM
         wq_r = jax.lax.dynamic_slice_in_dim(wq, r * cols, cols, axis=1)
         wqs_r = jax.lax.dynamic_slice_in_dim(wqs, r * cols, cols, axis=0)
         q = _quantized_matmul_jax(qr, wq_r, wqs_r).reshape(tokens, -1, HEAD_DIM)
@@ -112,7 +114,7 @@ def reference_per_rank(tokens, a):
             q, axis_name="tp", split_axis=0, concat_axis=1, tiled=True
         )
         s_r_tok, m_r_tok, q_loc_tok = ak.slice_token_parallel_attention_inputs(
-            s_r, m_r, q_loc, r.reshape(1), TP, tokens
+            s_r, m_r, q_loc, r.reshape(1), tp, tokens
         )
         if pad_rows:
             q_tok = jnp.pad(q_tok, ((0, pad_rows), (0, 0), (0, 0)))
@@ -127,12 +129,12 @@ def reference_per_rank(tokens, a):
             out_tok, axis_name="tp", split_axis=1, concat_axis=0, tiled=True
         )
         out = jnp.where(ok[:, None, None] != 0, out, jnp.zeros((), out.dtype))
-        w_r = jax.lax.dynamic_slice_in_dim(w, r * R, R, axis=1)
-        ws_r = jax.lax.dynamic_slice_in_dim(ws, r * R, R, axis=0)
+        w_r = jax.lax.dynamic_slice_in_dim(w, r * local_r, local_r, axis=1)
+        ws_r = jax.lax.dynamic_slice_in_dim(ws, r * local_r, local_r, axis=0)
         return o_proj_ref(out, pos, cs, w_r, ws_r, HEAD_DIM)[None]
 
     fn = jax.shard_map(
-        body, mesh=mesh, in_specs=(P(),) * 16, out_specs=P("tp"), check_vma=False
+        body, mesh=tp_mesh, in_specs=(P(),) * 16, out_specs=P("tp"), check_vma=False
     )
     return np.asarray(
         fn(
@@ -156,7 +158,7 @@ def reference_per_rank(tokens, a):
     )
 
 
-def candidate_per_rank(fn, tokens, a):
+def candidate_per_rank(fn, tokens, a, *, tp=TP, local_groups=1):
     real_shard_map = jax.shard_map
 
     def per_rank_shard_map(body, *, mesh, in_specs, out_specs, check_vma):
@@ -201,9 +203,9 @@ def candidate_per_rank(fn, tokens, a):
             a["main_records"],
             a["pages"],
             a["query_start_loc"],
-            jnp.zeros((HEADS_PER_GROUP,)),
+            jnp.zeros((local_groups * HEADS_PER_GROUP,)),
             a["full_sink"],
-            jnp.arange(TP, dtype=jnp.int32),
+            jnp.arange(tp, dtype=jnp.int32),
             unused_local,
             unused_local,
             a["wo_a_full"],
@@ -250,7 +252,7 @@ for tokens in (96, 192, 56):
     got = candidate_per_rank(fn, tokens, a)
     assert ref.shape == got.shape == (TP, tokens, R), (ref.shape, got.shape)
     assert ref.dtype == got.dtype, (ref.dtype, got.dtype)
-    assert np.isfinite(ref.astype(np.float32)).all()
+    assert np.isfinite(ref.astype(jnp.float32)).all()
     assert ref.astype(np.float32).any(), "degenerate reference"
     # Ranks differ from one another (each owns one o_group).
     assert not np.array_equal(ref[0], ref[1])
@@ -259,4 +261,32 @@ for tokens in (96, 192, 56):
         f"tokens={tokens}: {mism.shape[0]} mismatches, first {mism[:5]}"
     )
     print(f"tokens={tokens}: bit-exact on {TP} ranks", flush=True)
+
+# Verify TP=4 with 2 o_groups per rank (16 local heads/rank, 8 total groups).
+mesh_tp4 = Mesh(np.array(jax.devices()[:4]), ("tp",))
+mock_tp.device_group.size.return_value = 4
+with (
+    set_vllm_model_wrapper_context(mesh=mesh_tp4),
+    mock.patch("vllm.distributed.get_tp_group", return_value=mock_tp),
+    mock.patch("torch_tpu._internal.pallas.get_pallas_mesh", return_value=mesh_tp4),
+    mock.patch("torch_tpu._internal.pallas.jax_op", side_effect=recorder),
+):
+    ak._attention_op = None
+    ak.initialize_paged_attention()
+fn_tp4 = captured["pallas::dsv41v2_sparse_fp8_attention_qo"]
+
+for tokens in (24, 96, 144, 28):
+    a = make_inputs(tokens, tp=4, local_groups=2)
+    ref = reference_per_rank(tokens, a, tp=4, local_groups=2, tp_mesh=mesh_tp4)
+    got = candidate_per_rank(fn_tp4, tokens, a, tp=4, local_groups=2)
+    assert ref.shape == got.shape == (4, tokens, 2 * R), (ref.shape, got.shape)
+    assert ref.dtype == got.dtype, (ref.dtype, got.dtype)
+    assert np.isfinite(ref.astype(jnp.float32)).all()
+    assert ref.astype(np.float32).any(), "degenerate reference"
+    assert not np.array_equal(ref[0], ref[1])
+    mism = np.argwhere(ref != got)
+    assert mism.size == 0, (
+        f"tp=4 tokens={tokens}: {mism.shape[0]} mismatches, first {mism[:5]}"
+    )
+    print(f"tokens={tokens}: bit-exact on 4 ranks (2 groups/rank)", flush=True)
 print("EXACTNESS_OK")

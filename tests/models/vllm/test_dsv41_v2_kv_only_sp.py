@@ -594,9 +594,17 @@ class TestInitLocalQWeightsCedDecoderAndCompressRatio:
         attn = _setup_mock_attn(
             monkeypatch, ced_decoder=False, fp8_kv=True, compress_ratio=4
         )
-        attn.n_local_groups = 2
+        attn.n_local_groups = 0
         v2_attn.DeepseekV41Attention._init_local_q_weights(attn)
         assert not hasattr(attn, "_wq_b_full")
+
+        attn_tp4 = _setup_mock_attn(
+            monkeypatch, ced_decoder=False, fp8_kv=True, compress_ratio=4, tp_size=4
+        )
+        attn_tp4.n_local_groups = 2
+        v2_attn.DeepseekV41Attention._init_local_q_weights(attn_tp4)
+        assert hasattr(attn_tp4, "_wq_b_full")
+        assert attn_tp4._local_q_attn is True
 
     def test_missing_scale_or_vllm_layout_skips_allocation(
         self, monkeypatch: pytest.MonkeyPatch

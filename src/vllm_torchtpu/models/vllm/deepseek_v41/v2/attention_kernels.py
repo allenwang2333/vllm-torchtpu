@@ -1053,6 +1053,7 @@ def sparse_fp8_attention_jax(
     nope_3d = _reshape_paged_pool(main_pool, page_size)
     rope_3d = _reshape_paged_pool(rope_pool, page_size // 4)
     distribution = jnp.array([0, 0, pages.shape[0]], jnp.int32)
+    chunk_size = max(128, q.shape[0]) if q.shape[0] <= 192 else 128
     if fused_swa and fused_swa_eligible(q.shape[0], swa_records.shape[1], max_requests):
         swa_kv, swa_bias = fused_swa_inputs(swa_pool, swa_records, q.shape[-1])
         return sparse_ragged_paged_attention_union_gather(
@@ -1068,6 +1069,7 @@ def sparse_fp8_attention_jax(
             None,
             None,
             sm_scale=scale,
+            gather_and_attention_chunk_size=chunk_size,
             union_cap=union_cap,
             union_gather=union_gather,
             swa_kv=swa_kv,
@@ -1105,6 +1107,7 @@ def sparse_fp8_attention_jax(
             denominator,
             maximum,
             sm_scale=scale,
+            gather_and_attention_chunk_size=chunk_size,
             union_cap=union_cap,
             union_gather=union_gather,
         )
@@ -1122,6 +1125,7 @@ def sparse_fp8_attention_jax(
         denominator,
         maximum,
         sm_scale=scale,
+        gather_and_attention_chunk_size=chunk_size,
     )
 
 
