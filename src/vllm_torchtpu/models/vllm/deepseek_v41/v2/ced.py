@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+import torch
+
 
 @dataclass(frozen=True)
 class DecoderReplayPlan:
@@ -49,5 +51,62 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
         tuple(output_bounds),
         tuple(replay_starts),
         padded,
+        is_identity=is_identity,
+    )
+
+
+def sync_decoder_replay_plan(
+    plan: DecoderReplayPlan | None,
+    metadata,
+    num_tokens: int,
+    dp_cpu_group=None,
+) -> DecoderReplayPlan | None:
+    """Synchronize decoder stage execution and padded token bucket across DP ranks.
+
+    Under DP+EP, decoder layers execute cross-DP MoE collectives, so every DP
+    rank must agree on whether to skip ``decoder_stage`` (``padded_num_tokens == 0``)
+    or execute ``decoder_stage`` at the exact same ``padded_num_tokens`` bucket.
+    """
+    if dp_cpu_group is None:
+        return plan
+    state = torch.tensor(
+        [
+            1 if plan is not None else 0,
+            plan.padded_num_tokens if plan is not None else 0,
+        ],
+        dtype=torch.int64,
+        device="cpu",
+    )
+    torch.distributed.all_reduce(
+        state, op=torch.distributed.ReduceOp.MAX, group=dp_cpu_group
+    )
+    if int(state[0].item()) == 0:
+        return None
+    target_padded = int(state[1].item())
+    if plan is None:
+        seq_lens = getattr(metadata, "seq_lens", None)
+        requests = int(seq_lens.shape[0]) if seq_lens is not None else 1
+        return DecoderReplayPlan(
+            (),
+            (0,) * (requests + 1),
+            (0,) * requests,
+            target_padded,
+            is_identity=False,
+        )
+    if plan.padded_num_tokens == target_padded:
+        return plan
+    bounds = getattr(metadata, "query_start_loc_cpu", None)
+    kept = len(plan.indices)
+    is_identity = (
+        kept > 0
+        and bounds is not None
+        and kept == bounds[-1]
+        and target_padded == num_tokens
+    )
+    return DecoderReplayPlan(
+        plan.indices,
+        plan.query_start_loc,
+        plan.replay_starts,
+        target_padded,
         is_identity=is_identity,
     )

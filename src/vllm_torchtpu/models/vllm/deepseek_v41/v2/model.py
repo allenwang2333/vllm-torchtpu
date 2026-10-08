@@ -9,6 +9,7 @@ from itertools import islice
 import torch
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
+from vllm.distributed.parallel_state import get_dp_group
 from vllm.forward_context import override_forward_context
 from vllm.models.deepseek_v41.nvidia import model as upstream
 
@@ -34,7 +35,7 @@ from .attention import (
 )
 from .attention_kernels import initialize_indexer, initialize_paged_attention
 from .cache import initialize_cache_ops
-from .ced import plan_decoder_replay
+from .ced import plan_decoder_replay, sync_decoder_replay_plan
 from .engram import Engram, NgramHashState
 from .host_engram import (
     HOST_ENGRAM_KEY,
@@ -51,14 +52,12 @@ def _ced_config(
 ) -> tuple[bool, int]:
     cache_config = getattr(vllm_config, "cache_config", None)
     enable_prefix_caching = bool(getattr(cache_config, "enable_prefix_caching", False))
-    parallel_config = getattr(vllm_config, "parallel_config", None)
-    dp_size = int(getattr(parallel_config, "data_parallel_size", 1) or 1)
     ced_enabled = bool(envs.TPU_DEEPSEEK_V41_CED)
-    if ced_enabled and (enable_prefix_caching or dp_size > 1):
+    if ced_enabled and enable_prefix_caching:
         if warn_prefix_caching:
             logger.warning(
-                "CED bounded replay requires prefix caching disabled and DP=1; "
-                "using full forward to keep stage execution synchronized"
+                "CED bounded replay requires prefix caching disabled; "
+                "using full forward to retain cached SWA state semantics"
             )
         ced_enabled = False
     hf_config = getattr(
@@ -448,6 +447,13 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 if first is not None
                 else None
             )
+            if getattr(self, "_ced_dp_sync", False):
+                plan = sync_decoder_replay_plan(
+                    plan,
+                    first,
+                    positions.shape[0],
+                    get_dp_group().cpu_group,
+                )
             encoded = self.encoder_stage(
                 input_ids,
                 positions,
@@ -466,7 +472,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         else:
             hidden, pre_mix = encoded
             encoder_aux = []
-        if plan is not None and not plan.indices:
+        if plan is not None and plan.padded_num_tokens == 0:
             # The scheduler ignores logits for incomplete prefills. The
             # encoder has still published every global KV row for this chunk;
             # skip the inter-stage SP all-gather when no decoder replay runs.
@@ -848,6 +854,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             n
             for n in (vllm_config.compilation_config.compile_sizes or [])
             if isinstance(n, int)
+        )
+        self._ced_dp_sync = (
+            int(getattr(vllm_config.parallel_config, "data_parallel_size", 1) or 1) > 1
         )
         if self._ced_enabled:
             if (

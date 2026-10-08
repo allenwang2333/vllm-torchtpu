@@ -31,6 +31,7 @@ from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.ced import (
     DecoderReplayPlan,
     plan_decoder_replay,
+    sync_decoder_replay_plan,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
     HOST_ENGRAM_KEY,
@@ -263,7 +264,7 @@ class TestCedConfig:
             assert boundary == 20
             mock_log.warning.assert_not_called()
 
-        # 3b. CED=1 and dp_size > 1 (EXT-1B DP=2 x TP=4) disables CED
+        # 3b. CED=1 and dp_size > 1 (EXT-1B DP=2 x TP=4) keeps CED enabled
         cfg_dp2 = _mock_vllm_config(
             num_hidden_layers=40, enable_prefix_caching=False, dp_size=2
         )
@@ -272,9 +273,9 @@ class TestCedConfig:
             patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.logger") as mock_log,
         ):
             enabled, boundary = _ced_config(cfg_dp2, warn_prefix_caching=True)
-            assert enabled is False
+            assert enabled is True
             assert boundary == 20
-            mock_log.warning.assert_called_once()
+            mock_log.warning.assert_not_called()
 
         # 4. CED=0 -> enabled False
         with patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_CED", False):
@@ -1187,6 +1188,157 @@ class TestModelForward:
                 )
                 assert out3 is dec_out and out4 is dec_out
 
+    def test_sync_decoder_replay_plan_and_dp_forward(self) -> None:
+        # 1. dp_cpu_group is None -> returns plan unchanged
+        base_plan = DecoderReplayPlan(
+            indices=(0, 1),
+            query_start_loc=(0, 2),
+            replay_starts=(0,),
+            padded_num_tokens=2,
+            is_identity=False,
+        )
+        assert sync_decoder_replay_plan(base_plan, None, 4, None) is base_plan
+
+        def _fake_max_reduce(peer_real: int, peer_padded: int):
+            def _all_reduce(tensor: torch.Tensor, op=None, group=None) -> None:
+                tensor[0] = max(int(tensor[0].item()), peer_real)
+                tensor[1] = max(int(tensor[1].item()), peer_padded)
+
+            return _all_reduce
+
+        # 2. Both DP ranks have plan=None (startup warmup) -> returns None
+        with patch("torch.distributed.all_reduce", side_effect=_fake_max_reduce(0, 0)):
+            assert sync_decoder_replay_plan(None, None, 4, "cpu_grp") is None
+
+        # 3. Local rank is idle dummy (plan=None) while peer has incomplete prefill (0)
+        meta_2req = SimpleNamespace(seq_lens=torch.tensor([1, 1]))
+        with patch("torch.distributed.all_reduce", side_effect=_fake_max_reduce(1, 0)):
+            synced_skip = sync_decoder_replay_plan(None, meta_2req, 4, "cpu_grp")
+            assert synced_skip == DecoderReplayPlan(
+                indices=(),
+                query_start_loc=(0, 0, 0),
+                replay_starts=(0, 0),
+                padded_num_tokens=0,
+                is_identity=False,
+            )
+
+        # 4. Idle dummy rank (plan=None, metadata=None) while peer needs 4 tokens
+        with patch("torch.distributed.all_reduce", side_effect=_fake_max_reduce(1, 4)):
+            synced_dummy = sync_decoder_replay_plan(None, None, 8, "cpu_grp")
+            assert synced_dummy == DecoderReplayPlan(
+                indices=(),
+                query_start_loc=(0, 0),
+                replay_starts=(0,),
+                padded_num_tokens=4,
+                is_identity=False,
+            )
+
+        # 5. Local plan already matches target_padded -> returns same plan object
+        with patch("torch.distributed.all_reduce", side_effect=_fake_max_reduce(1, 2)):
+            assert (
+                sync_decoder_replay_plan(base_plan, meta_2req, 4, "cpu_grp")
+                is base_plan
+            )
+
+        # 6. Local plan has padded_num_tokens=2 (kept=2 == bounds[-1]), peer has 4
+        # -> upgrades padded_num_tokens to 4 and restores is_identity=True
+        meta_cpu = SimpleNamespace(query_start_loc_cpu=(0, 2))
+        with patch("torch.distributed.all_reduce", side_effect=_fake_max_reduce(1, 4)):
+            synced_id = sync_decoder_replay_plan(base_plan, meta_cpu, 4, "cpu_grp")
+            assert synced_id == DecoderReplayPlan(
+                indices=(0, 1),
+                query_start_loc=(0, 2),
+                replay_starts=(0,),
+                padded_num_tokens=4,
+                is_identity=True,
+            )
+
+        # 7. DeepseekV41Model.forward with _ced_dp_sync=True:
+        # Local rank has incomplete prefill (indices=(), padded=0), peer has padded=2
+        # -> runs decoder_stage with 2 padded rows and scatters back to zeros (4, 64)
+        model = self._create_model(ced_enabled=True, sp_enabled=False)
+        model._ced_dp_sync = True
+        hidden = torch.ones((4, 64))
+        pre_mix = torch.zeros((4, 64))
+        model.encoder_stage = MagicMock(return_value=(hidden, pre_mix))
+        model.decoder_stage = MagicMock(return_value=torch.ones((2, 64)) * 9.0)
+
+        empty_local_plan = DecoderReplayPlan(
+            indices=(),
+            query_start_loc=(0, 0),
+            replay_starts=(0,),
+            padded_num_tokens=0,
+            is_identity=False,
+        )
+        meta_entry = _FakeAttnMeta(
+            input_positions=torch.tensor([0, 1, 2, 3]),
+            query_start_loc=torch.tensor([0, 4]),
+            seq_lens=torch.tensor([4]),
+        )
+        mock_ctx = _FakeForwardCtx(attn_metadata={"layer_0": meta_entry})
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
+                return_value=mock_ctx,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.plan_decoder_replay",
+                return_value=empty_local_plan,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.get_dp_group",
+                return_value=SimpleNamespace(cpu_group="cpu_grp"),
+            ),
+            patch("torch.distributed.all_reduce", side_effect=_fake_max_reduce(1, 2)),
+        ):
+            out = model.forward(torch.tensor([1, 2, 3, 4]), torch.tensor([0, 1, 2, 3]))
+            model.decoder_stage.assert_called_once()
+            assert model.decoder_stage.call_args[0][1].shape == (2,)
+            assert out.shape == (4, 64)
+            assert torch.all(out == 0)
+
+        # 8. encoder_aux non-empty when decoder_stage returns a single tensor
+        # (both indices is None [line 591] and indices is not None [line 607])
+        enc_aux = [torch.ones((4, 64)) * 2.0]
+        model._ced_dp_sync = False
+        model.encoder_stage = MagicMock(return_value=(hidden, pre_mix, enc_aux))
+        model.decoder_stage = MagicMock(return_value=torch.ones((4, 64)) * 7.0)
+        id_plan = DecoderReplayPlan(
+            indices=(0, 1, 2, 3),
+            query_start_loc=(0, 4),
+            replay_starts=(0,),
+            padded_num_tokens=4,
+            is_identity=True,
+        )
+        non_id_plan = DecoderReplayPlan(
+            indices=(0, 1),
+            query_start_loc=(0, 2),
+            replay_starts=(0,),
+            padded_num_tokens=2,
+            is_identity=False,
+        )
+        with patch(
+            "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
+            return_value=mock_ctx,
+        ):
+            with patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.plan_decoder_replay",
+                return_value=id_plan,
+            ):
+                out_id, aux_id = model.forward(
+                    torch.tensor([1, 2, 3, 4]), torch.tensor([0, 1, 2, 3])
+                )
+                assert out_id.shape == (4, 64) and aux_id == enc_aux
+            model.decoder_stage = MagicMock(return_value=torch.ones((2, 64)) * 7.0)
+            with patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.plan_decoder_replay",
+                return_value=non_id_plan,
+            ):
+                out_sc, aux_sc = model.forward(
+                    torch.tensor([1, 2, 3, 4]), torch.tensor([0, 1, 2, 3])
+                )
+                assert out_sc.shape == (4, 64) and aux_sc == enc_aux
+
 
 # ==============================================================================
 # 8. Tests for DeepseekV41Model._forward_stage
@@ -1548,6 +1700,45 @@ class TestModelForwardStage:
             model_no_sp_mtp._forward_stage(inp, pos, inter_tensors, stage="full")
             assert model_no_sp_mtp._mtp_hidden_buffer[0, 0].item() != 0.0
 
+        # 3. stage=="decoder" with _stage_uses_sequence_parallel mocked True (line 701)
+        model_dec_sp = self._create_stage_model(stage_sp=True, mtp=False)
+        model_dec_sp._stage_uses_sequence_parallel = MagicMock(return_value=True)
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_pp_group",
+                return_value=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_tensor_model_parallel_world_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.sp_shard",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.sp_all_gather",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.post",
+                side_effect=lambda h, *a: h,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.collapse",
+                side_effect=lambda h, pm: h,
+            ),
+        ):
+            out_dec, aux_dec = model_dec_sp._forward_stage(
+                inp,
+                pos,
+                None,
+                inputs_embeds=torch.ones((4, 4, 64)),
+                encoder_pre_mix=embeds,
+                stage="decoder",
+            )
+            assert out_dec.shape == (4, 64) and len(aux_dec) == 2
+
 
 # ==============================================================================
 # 9. Tests for Model Init and Weights Finalization
@@ -1604,6 +1795,7 @@ class TestModelInitAndWeights:
             self.use_sequence_parallel = getattr(
                 vllm_config, "_test_use_sequence_parallel", False
             )
+            self._mtp_hidden_buffer = "mtp_buf"
             self.config = SimpleNamespace(num_hidden_layers=4, hidden_size=16)
             self.start_layer = 0
             self.end_layer = 4
@@ -1654,10 +1846,11 @@ class TestModelInitAndWeights:
         ):
             DeepseekV41Model(vllm_config=cfg_sp_err)
 
-        # 1b. SP valid compile sizes logs enabled
+        # 1b. SP valid compile sizes logs enabled + method=="mtp" retains buffer
         cfg_sp_ok = _mock_vllm_config(
             num_hidden_layers=4, tp_size=4, compile_sizes=[8, 16]
         )
+        cfg_sp_ok.speculative_config = SimpleNamespace(method="mtp")
         cfg_sp_ok._test_use_sequence_parallel = True
         with (
             patch(
