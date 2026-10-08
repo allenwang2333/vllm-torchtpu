@@ -118,17 +118,20 @@ def _kernel(
     own `rows` tokens and the kernel all-gathers them itself:
       Scalar prefetch: rank_ref [2] int32: this rank's mesh index and the
         global id of its first expert (0 with TP experts).
-      x_ref [r16, h] bf16: own hidden rows, padded to r16 = rows rounded up
-        to 16.
-      route_ref [r16, 128] f32: own routing, lanes [0, k) global expert ids
+      x_ref [rows, h] bf16: own hidden rows.
+      route_ref [rows, 128] f32: own routing, lanes [0, k) global expert ids
         (as f32; each receiver offsets them by its own first expert), [k, 2 k)
         route weights, 2 k the shared gate sigmoid(x . w_g).
+      Output: out_ref [rows, h] bf16, this rank's rows, whatever the wire.
       Extra scratch: x_all [n, r16, h] and route_all [n, r16, 128] receive
-        slab d from rank d (ag_* and route_* semaphores); route_rows
+        slab d from rank d (ag_* and route_* semaphores), r16 = rows rounded
+        up to 16; x_all is FP32 when rows is odd, and x_send [r16, h] FP32
+        stages the own rows for it (else unused); route_rows
         [m, 128] f32 holds the routing token-major; coeff_ref [m, E padded]
-        f32 and active_ref [8, E padded] int32 (SMEM, row 0 read) are built
-        here from it instead of arriving from XLA; active_vmem [8, E padded]
-        int32 stages the mask for its DMA into SMEM (active_sem).
+        f32 is built here from it instead of arriving from XLA, and so is the
+        compacted active-expert list: active_vmem [8, E padded] int32 holds
+        the ids in row 0 and their count in row 1, and is DMA'd into
+        active_ref (SMEM, same shape; active_sem). ids_ref is unused.
     """
     if topk is None:
         active_ref, rank_ref, x_ref, coeff_ref, shared_gate_ref = refs[:5]
@@ -179,6 +182,7 @@ def _kernel(
             route_send,
             route_recv,
             active_sem,
+            x_send,
         ) = refs[30:]
     me = rank_ref[0]
     qmax = float(jnp.finfo(weight_dtype).max)
@@ -212,14 +216,25 @@ def _kernel(
         # every rank (itself included); the expert loop needs the routing
         # first, so it travels first.
         pl.semaphore_wait(barrier, n_ranks)
+        # Only the `rows` real rows travel, not the slab's tile padding (at
+        # one to four rows per rank the padded slab is 4-16x the bytes).
+        own = pl.ds(0, rows)
+        if x_send.dtype != x_ref.dtype:
+            # An odd row count is half a packed BF16 sublane, which a DMA
+            # cannot move alone (measured: one BF16 row arrived wrong), so
+            # those rows travel in FP32.
+            x_send[:rows, :] = x_ref[...].astype(x_send.dtype)
+            x_src = x_send.at[own]
+        else:
+            x_src = x_ref
         for src, dst, send, recv_sem in (
             (route_ref, route_all, route_send, route_recv),
-            (x_ref, x_all, ag_send, ag_recv),
+            (x_src, x_all, ag_send, ag_recv),
         ):
             for d in range(n_ranks):
                 copy = pltpu.make_async_remote_copy(
                     src,
-                    dst.at[me],
+                    dst.at[me, own],
                     send.at[d],
                     recv_sem,
                     device_id=(jnp.int32(d),),
@@ -229,7 +244,10 @@ def _kernel(
                 gather_sends.append(copy)
         # Token-major routing; rows past the n * rows real tokens stay 0.
         route_rows[...] = jnp.zeros(route_rows.shape, jnp.float32)
-        pltpu.make_async_copy(route_all, route_all, route_recv).wait()
+        received = (slice(None), own)
+        pltpu.make_async_copy(
+            route_all.at[received], route_all.at[received], route_recv
+        ).wait()
         for d in range(n_ranks):
             route_rows[d * rows : (d + 1) * rows, :] = route_all[d, :rows, :]
         route = route_rows[...]
@@ -248,19 +266,17 @@ def _kernel(
         for j in range(topk):
             coeff = coeff + jnp.where(experts_f == lane(j), lane(topk + j), 0.0)
         coeff_ref[...] = coeff
-        active = jnp.max((coeff != 0).astype(jnp.int32), axis=0, keepdims=True)
-        active_vmem[...] = jnp.broadcast_to(active, active_vmem.shape)
+        active_vmem[...] = _compact_active(coeff)
         copy = pltpu.make_async_copy(active_vmem, active_ref, active_sem)
         copy.start()
         shared_gate = lane(2 * topk)
         acc_ref[...] = jnp.zeros((m, h), jnp.float32)
-        pltpu.make_async_copy(x_all, x_all, ag_recv).wait()
+        pltpu.make_async_copy(x_all.at[received], x_all.at[received], ag_recv).wait()
         for d in range(n_ranks):
             acc_ref[d * rows : (d + 1) * rows, :] = x_all[d, :rows, :].astype(
                 jnp.float32
             )
         x = acc_ref[...]
-        acc_ref[...] = jnp.zeros((m, h), jnp.float32)
         copy.wait()
     else:
         acc_ref[...] = jnp.zeros((m, h), jnp.float32)
@@ -268,28 +284,31 @@ def _kernel(
     xsc = jnp.max(jnp.abs(x), axis=1, keepdims=True) / qmax
     xq_ref[...] = (x * jnp.where(xsc == 0, 0.0, 1.0 / xsc)).astype(weight_dtype)
     xs_ref[...] = jnp.broadcast_to(xsc, (m, 2 * i))
+    if topk is not None:  # the accumulator held the gathered rows until now
+        acc_ref[...] = jnp.zeros((m, h), jnp.float32)
     cols = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
     if topk is None:
 
-        def is_active(e):
-            return active_ref[e] != 0
+        def compact(e, count):
+            @pl.when(active_ref[e] != 0)
+            def record():
+                ids_ref[count] = e
+
+            return count + (active_ref[e] != 0).astype(jnp.int32)
+
+        count = lax.fori_loop(0, experts, compact, jnp.int32(0))
+
+        def expert_id(step):
+            return ids_ref[step]
 
     else:
+        count = active_ref[1, 0]
 
-        def is_active(e):
-            return active_ref[0, e] != 0
-
-    def compact(e, count):
-        @pl.when(is_active(e))
-        def record():
-            ids_ref[count] = e
-
-        return count + is_active(e).astype(jnp.int32)
-
-    count = lax.fori_loop(0, experts, compact, jnp.int32(0))
+        def expert_id(step):
+            return active_ref[0, step]
 
     def transfers(step):
-        e, slot = ids_ref[step], step % nb
+        e, slot = expert_id(step), step % nb
         return [
             pltpu.make_async_copy(w1_hbm.at[e], w1_ring.at[slot], sem_ref.at[slot, 0]),
             pltpu.make_async_copy(w2_hbm.at[e], w2_ring.at[slot], sem_ref.at[slot, 1]),
@@ -365,7 +384,7 @@ def _kernel(
                 xq_ref[...], w1_ring[nxt % nb], preferred_element_type=jnp.float32
             )
             slot = step % nb
-            e = ids_ref[step]
+            e = expert_id(step)
             coeff = jnp.sum(
                 jnp.where(cols == e, coeff_ref[...], 0.0), axis=1, keepdims=True
             )
@@ -415,7 +434,10 @@ def _kernel(
         acc = recv[0].astype(jnp.float32)
         for s in range(1, n_ranks):
             acc = acc + recv[s].astype(jnp.float32)
-        out_ref[...] = acc.astype(out_ref.dtype)
+        if topk is None:
+            out_ref[...] = acc.astype(out_ref.dtype)
+        else:  # exactly this rank's rows, in the hidden dtype
+            out_ref[...] = acc[:rows].astype(out_ref.dtype)
         for copy in scatter + gather_sends:
             copy.wait_send()
         return
@@ -461,6 +483,47 @@ def _kernel(
     pltpu.make_async_copy(out_ref, out_ref, ag_recv).wait()
     for copy in gather:
         copy.wait_send()
+
+
+def _compact_active(coeff):
+    """[8, E] int32 from the route-weight table coeff [m, E] (E a multiple of
+    128): row 0 lists the experts any token routes to, ascending (the order
+    the scalar compaction visits them), then zeros; row 1 is their count.
+
+    Vector work instead of a scalar loop over E (about 10 us at E = 512 on
+    tpu7x): an exclusive prefix sum of the active flags by a matmul with a
+    strictly upper-triangular matrix, then a one-hot [slot, expert] matrix
+    contracted against the expert ids. Every operand is an integer exact in
+    bf16 (ids split as 32 * hi + lo) and the sums are exact in f32.
+    """
+    e = coeff.shape[1]
+    nt = (((1,), (1,)), ((), ()))
+    active = jnp.max(jnp.where(coeff != 0, 1.0, 0.0), axis=0, keepdims=True)
+    rows = lax.broadcasted_iota(jnp.int32, (e, e), 0)
+    cols = lax.broadcasted_iota(jnp.int32, (e, e), 1)
+    upper = jnp.where(rows < cols, 1.0, 0.0).astype(jnp.bfloat16)
+    slot = jnp.dot(
+        jnp.broadcast_to(active, (8, e)).astype(jnp.bfloat16),
+        upper,
+        preferred_element_type=jnp.float32,
+    )[:1]
+    onehot = jnp.where(
+        (slot == rows.astype(jnp.float32)) & (active != 0), 1.0, 0.0
+    ).astype(jnp.bfloat16)
+    lane = lax.broadcasted_iota(jnp.int32, (8, e), 1)
+    hi = lax.dot_general(
+        (lane // 32).astype(jnp.bfloat16),
+        onehot,
+        nt,
+        preferred_element_type=jnp.float32,
+    )
+    lo = lax.dot_general(
+        (lane % 32).astype(jnp.bfloat16), onehot, nt, preferred_element_type=jnp.float32
+    )
+    ids = (hi * 32 + lo).astype(jnp.int32)
+    count = jnp.sum(active, axis=1, keepdims=True).astype(jnp.int32)
+    sub = lax.broadcasted_iota(jnp.int32, (8, e), 0)
+    return jnp.where(sub == 1, jnp.broadcast_to(count, (8, e)), ids)
 
 
 def _weight_ring_depth(h, i, weight_dtype):
@@ -587,24 +650,29 @@ def _gather_rows_call(
         [rank.reshape(()).astype(jnp.int32), jnp.asarray(start, jnp.int32).reshape(())]
     )
     weights = topk_weights.astype(hidden.dtype).astype(jnp.float32)
+    # A one-row [1, H] x [H, 1] gate dot came out of XLA with other bits than
+    # the gathered path's [T, H] one (measured at H 4096); 2 and 4 rows
+    # matched, so one row is padded to two for the dot only.
+    gate_rows = jnp.pad(hidden, ((0, 1), (0, 0))) if rows == 1 else hidden
     shared_gate = jax.nn.sigmoid(
         jnp.dot(
-            hidden,
+            gate_rows,
             shared_gate_weight.astype(hidden.dtype),
             preferred_element_type=jnp.float32,
         )
-    )
+    )[:rows]
     route = jnp.concatenate([ids, weights, shared_gate], axis=1)
-    route = jnp.pad(route, ((0, r16 - rows), (0, 128 - route.shape[1])))
-    hidden_own = jnp.pad(hidden, ((0, r16 - rows), (0, 0)))
+    route = jnp.pad(route, ((0, 0), (0, 128 - route.shape[1])))
     i_s = shared_w2.shape[0]
     weight_dtype = w1.dtype
     nb = _weight_ring_depth(h, i, weight_dtype)
+    # BF16 rows go two to a sublane: an odd count gathers in FP32.
+    xwire = hidden.dtype if rows % 2 == 0 else jnp.float32
     # Reduce-scatter buffers exactly as scatter_rows on the gathered batch.
     wire = hidden.dtype if rows % 16 == 0 else jnp.float32
     out_rows = rows if rows % 16 == 0 else -(-rows // 8) * 8
     acc_bf16_shape = recv_shape = (n_ranks, out_rows, h)
-    out = pl.pallas_call(
+    return pl.pallas_call(
         functools.partial(
             _kernel,
             m=m,
@@ -617,7 +685,7 @@ def _gather_rows_call(
             rows=rows,
             topk=topk,
         ),
-        out_shape=jax.ShapeDtypeStruct((out_rows, h), wire),
+        out_shape=jax.ShapeDtypeStruct((rows, h), hidden.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 2
@@ -638,7 +706,7 @@ def _gather_rows_call(
                 (8, 128),
             )
             + [
-                pltpu.VMEM((n_ranks, r16, h), hidden.dtype),
+                pltpu.VMEM((n_ranks, r16, h), xwire),
                 pltpu.VMEM((n_ranks, r16, 128), jnp.float32),
                 pltpu.VMEM((m, 128), jnp.float32),
                 pltpu.VMEM((m, e_pad), jnp.float32),
@@ -647,6 +715,7 @@ def _gather_rows_call(
                 pltpu.SemaphoreType.DMA((n_ranks,)),
                 pltpu.SemaphoreType.DMA(()),
                 pltpu.SemaphoreType.DMA(()),
+                pltpu.VMEM((r16, h) if rows % 2 else (8, 128), xwire),
             ],
         ),
         compiler_params=pltpu.CompilerParams(
@@ -657,7 +726,7 @@ def _gather_rows_call(
         f"-i_{i}-is_{i_s}-n_{n_ranks}-buffers_{nb}",
     )(
         rank_start,
-        hidden_own,
+        hidden,
         route,
         w1,
         w2,
@@ -668,7 +737,6 @@ def _gather_rows_call(
         shared_w2,
         shared_w2_scale,
     )
-    return out[:rows].astype(hidden.dtype)
 
 
 def fused_moe_decode(

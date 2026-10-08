@@ -96,14 +96,21 @@ own T/n rows. The kernel runs no all-gather. Things to know:
   and is not hidden.
 - With `gather_rows` each rank waits on the cross-rank barrier at entry, then
   sends its routing slab (`[T/n, 128]` FP32: global expert ids, weights and the
-  shared gate) and its BF16 hidden rows to every rank by remote DMA. The
-  receiver builds the route-weight table and the active-expert mask itself
-  (the mask reaches SMEM by a VMEM-to-SMEM DMA). The shared expert's weights
-  load during the gather.
+  shared gate) and its hidden rows to every rank by remote DMA, only the real
+  rows (BF16; FP32 when `T/n` is odd, since one BF16 row is half a packed
+  sublane). The receiver builds the route-weight table and compacts the
+  active experts with vector ops (a prefix-sum matmul), and the id list
+  reaches SMEM by a VMEM-to-SMEM DMA. The shared expert's weights load during
+  the gather. The output is exactly `[T/n, H]` in the hidden dtype.
 - Small per-rank row counts (T/n not a multiple of 16) use an FP32 wire.
 
-The serving adapter does not support DP attention yet; that is TBD. Today it
-arms only with TP attention (DP 1).
+The serving adapter arms TP attention (DP 1) layers and, with
+`TPU_MOE_SEQUENCE_PARALLEL=1`, sequence-parallel MoE layers (EP over the mesh,
+TP attention that reduce-scatters, DP 1): those run `gather_rows` +
+`scatter_rows` on each rank's own rows, with the rank's TP slice of the
+replicated shared expert. Above the token cap (global tokens) an SP layer runs
+the kernel-off SP path in the same program. DP attention proper (DP > 1) is
+not served.
 
 ## Design
 
