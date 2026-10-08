@@ -388,3 +388,121 @@ def test_gather_rows_matches_scatter_rows_on_gathered_inputs(setup, rows, ep):
     swapped = run(True, x[perm], tw[perm], ids[perm])
     for block in (slice(0, rows), slice(rows, 2 * rows)):
         assert not np.allclose(swapped[block], want[block], rtol=1e-2, atol=1e-3)
+
+
+@pytest.mark.parametrize("rows", [4, 64])
+def test_sequence_parallel_layer_matches_kernel_off_sp_path(setup, rows):
+    """The adapter's sequence-parallel body on each rank's own rows against
+    the kernel-off SP path computed independently in f32: all-gather, every
+    expert on every row, reduce-scatter, plus the whole replicated shared
+    expert on the rank's own rows. rows=4 (32 global tokens) is a decode
+    bucket served by the kernel (gather_rows); rows=64 (512 global) is above
+    the cap of 256 and takes the in-program GMM path."""
+    import torch
+
+    mesh, sh, rank, weights, shared_gate_weight = setup
+    w1, w2, w1_scale, w2_scale = weights[:4]
+    m = rows * N
+    i_full = N * INTER_S
+    rng = np.random.default_rng(300 + m)
+
+    def q(w, axis):
+        s = np.max(np.abs(w), axis=axis, keepdims=True) / 448.0
+        return jnp.asarray(w / s, F8), s.astype(np.float32)
+
+    full_w1, full_s1 = q(rng.normal(size=(H, 2 * i_full)) * 0.02, 0)
+    full_w2, full_s2 = q(rng.normal(size=(i_full, H)) * 0.02, 0)
+    full = (
+        np.asarray(full_w1.astype(jnp.float32)),
+        full_s1.reshape(-1),
+        np.asarray(full_w2.astype(jnp.float32)),
+        full_s2.reshape(-1),
+        np.zeros(1, np.float32),
+    )
+    # Each rank's kernel slice, cut by the adapter's own slicing.
+    slices = [
+        [
+            t.numpy()
+            for t in adapter._shared_tp_slice(
+                tuple(torch.from_numpy(a) for a in full), r, N
+            )[:4]
+        ]
+        for r in range(N)
+    ]
+    per_rank = [np.concatenate([s[k] for s in slices]) for k in range(4)]
+    per_rank[0] = jnp.asarray(per_rank[0], F8)
+    per_rank[2] = jnp.asarray(per_rank[2], F8)
+    rep = [
+        jnp.asarray(np.tile(a, (N,) + (1,) * (a.ndim - 1)), d)
+        for a, d in zip(full[:4], (F8, jnp.float32, F8, jnp.float32))
+    ]
+    x = jnp.asarray(rng.normal(size=(m, H)), jnp.bfloat16)
+    ids = jnp.asarray(
+        np.stack([rng.choice(N * E, TOPK, replace=False) for _ in range(m)]),
+        jnp.int32,
+    )
+    tw = jnp.asarray(rng.dirichlet(np.ones(TOPK), size=m), jnp.bfloat16)
+    put = functools.partial(jax.device_put, device=sh)
+    args = (
+        rank,
+        put(x),
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        put(per_rank[0]),
+        put(per_rank[1]),
+        put(per_rank[2]),
+        put(np.tile(full[3], N)),
+        shared_gate_weight,
+        put(tw),
+        put(ids),
+        *(put(a) for a in rep),
+    )
+    specs = (P("d"),) * 10 + (P(), P("d"), P("d")) + (P("d"),) * 4
+
+    def sp(rank, *a):
+        return adapter._sp_layer(
+            jnp.concatenate([rank, rank * E], axis=1),
+            *a,
+            n_ranks=N,
+            topk=TOPK,
+            max_tokens=256,
+        )
+
+    def reference(rank, x, w1, w2, w1_scale, w2_scale, *rest, skip_expert=None):
+        _, _, _, _, gate_w, tw, ti, fw1, fs1, fw2, fs2 = rest
+        xg = jax.lax.all_gather(x, "d", axis=0, tiled=True).astype(jnp.float32)
+        tig = jax.lax.all_gather(ti, "d", axis=0, tiled=True) - rank.reshape(()) * E
+        twg = jax.lax.all_gather(tw, "d", axis=0, tiled=True)
+        routed = _routed(
+            xg, w1, w2, w1_scale, w2_scale, twg, tig, skip_expert=skip_expert
+        )
+        routed = jax.lax.psum_scatter(routed, "d", scatter_dimension=0, tiled=True)
+        shared = _ffn(x.astype(jnp.float32), fw1, fs1.reshape(1, -1), fw2, fs2)
+        gate = jax.nn.sigmoid(jnp.dot(x, gate_w, preferred_element_type=jnp.float32))
+        return (routed + gate * shared).astype(x.dtype)
+
+    def run(fn):
+        f = jax.jit(
+            jax.shard_map(
+                fn, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False
+            )
+        )
+        return f, np.asarray(f(*args).astype(jnp.float32))
+
+    f, got = run(sp)
+    _, ref = run(reference)
+    hlo = f.lower(*args).as_text()
+    assert ("fused_moe_decode_ag" in hlo) == (m <= 256), "wrong branch"
+    assert got.shape == (m, H) and np.isfinite(got).all()
+
+    def max_rel(a, b):
+        return (
+            np.linalg.norm(a - b, axis=1) / np.maximum(np.linalg.norm(b, axis=1), 1e-30)
+        ).max()
+
+    assert max_rel(got, ref) < 0.08
+    # Positive control: a reference missing one routed expert fails the bound.
+    _, broken = run(functools.partial(reference, skip_expert=int(ids[0, 0]) % E))
+    assert max_rel(got, broken) > 0.08

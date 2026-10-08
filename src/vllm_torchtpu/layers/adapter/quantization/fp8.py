@@ -1170,11 +1170,19 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             enable_pipelined_collective_and_compute() or envs.TPU_MOE_FP8_ALL_GATHER
         )
 
+        from vllm_torchtpu.layers.adapter.fused_moe_decode import (
+            fused_moe_decode,
+            fused_moe_decode_supported,
+            sequence_parallel_rank,
+        )
+
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                 topk_ids,
                 topk_weights,
                 is_local_tensor=owns_collectives,
+                # An armed sequence-parallel layer routes this rank's own rows.
+                sequence_parallel_rank=sequence_parallel_rank(self, layer),
             )
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
@@ -1195,11 +1203,6 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         }
         if owns_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
-
-        from vllm_torchtpu.layers.adapter.fused_moe_decode import (
-            fused_moe_decode,
-            fused_moe_decode_supported,
-        )
 
         if fused_moe_decode_supported(self):
             # Armed layer: the runner no longer runs the shared expert or the

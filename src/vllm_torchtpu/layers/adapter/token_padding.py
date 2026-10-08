@@ -49,7 +49,10 @@ def set_padding_state(state: "TokenPaddingState | None") -> None:
 
 
 def zero_routing_weights_for_padding(
-    topk_ids: torch.Tensor, topk_weights: torch.Tensor, is_local_tensor: bool = False
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    is_local_tensor: bool = False,
+    sequence_parallel_rank: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Set routing weights to 0 for padded tokens.
 
@@ -61,6 +64,9 @@ def zero_routing_weights_for_padding(
         topk_weights: Routing weights for each token.
         is_local_tensor: Whether topk_ids and topk_weights are local tensors
             (i.e. not gathered across DP ranks). If True, skips DP all_gather.
+        sequence_parallel_rank: set when the rows are this TP rank's
+            sequence-parallel chunk of the step (rows [rank * n, (rank + 1) *
+            n) of it), so their mask is that slice of the step's mask.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor]: The (topk_ids, topk_weights) tensors
@@ -69,7 +75,11 @@ def zero_routing_weights_for_padding(
     if _padding_state is None:
         return topk_ids, topk_weights
     num_tokens = topk_ids.shape[0]
-    if is_local_tensor:
+    if sequence_parallel_rank is not None:
+        is_padding = _padding_state.local_padding_mask.narrow(
+            0, sequence_parallel_rank * num_tokens, num_tokens
+        )
+    elif is_local_tensor:
         is_padding = _padding_state.get_local_padding_mask(num_tokens)
     else:
         from vllm.distributed.parallel_state import get_dp_group

@@ -131,7 +131,17 @@ class VllmMoERunner(MoERunner):
         owner = self._quant_method
         return fused_moe_ep_supported(owner) or adaptive_fused_moe_supported(owner)
 
+    def _fused_moe_decode_owns_sp_collectives(self) -> bool:
+        # A sequence-parallel layer armed by fused_moe_decode gets this rank's
+        # own rows; its kernel gathers them and reduce-scatters the result
+        # itself, so upstream's SP all-gather / reduce-scatter must not run.
+        return getattr(self, "_fused_moe_decode_armed", False) and bool(
+            getattr(self.moe_config, "is_sequence_parallel", False)
+        )
+
     def _maybe_dispatch(self, hidden_states, router_logits):
+        if self._fused_moe_decode_owns_sp_collectives():
+            return hidden_states, router_logits
         if self._fused_ep_owns_pcp_collectives():
             # An armed fused method also reports supports_internal_mk, so
             # upstream's generic DP/EP dispatch is a no-op. The only work
@@ -140,6 +150,11 @@ class VllmMoERunner(MoERunner):
         return super()._maybe_dispatch(hidden_states, router_logits)
 
     def _maybe_combine(self, shared_output, hidden_states):
+        if self._fused_moe_decode_owns_sp_collectives():
+            # Armed layers have no runner shared expert (the kernel owns it).
+            if self.shared_experts is not None:
+                return shared_output, hidden_states
+            return hidden_states
         if self._fused_ep_owns_pcp_collectives():
             # The fused program has already pushed and summed routed rows
             # back onto their token-owning PCP rank. Preserve upstream's

@@ -22,6 +22,19 @@ all-reduce of their sum. The token count is static there, so the branch costs
 nothing at run time; branching in torch instead gives the two sides different
 graph inputs, which vLLM's per-bucket specialization of one traced graph
 refuses (``compilation.shape_variants``).
+
+Sequence-parallel MoE (``TPU_MOE_SEQUENCE_PARALLEL=1``: EP over the mesh, TP
+attention that reduce-scatters, DP 1) hands each rank only its own T / n
+tokens. An armed SP layer runs the kernel with ``gather_rows`` and
+``scatter_rows`` on those rows, so the kernel gathers them, computes every
+expert's share and reduce-scatters each rank's rows back: no XLA collective.
+The SP shared expert is replicated whole on every rank; the kernel takes this
+rank's TP slice of it (an exact partition, summed by the reduce-scatter).
+Above the cap (global tokens) the program does what the runner does with the
+kernel off under SP: all-gather, GMM MoE, reduce-scatter of the routed rows,
+plus the whole shared expert on the rank's own rows. The runner's own SP
+dispatch and combine are skipped for an armed layer
+(``VllmMoERunner._maybe_dispatch``).
 """
 
 import functools
@@ -61,6 +74,9 @@ _SHARED_BUFFERS = (
     "_fmd_s2s",
     "_fmd_wg",
 )
+# Sequence parallel only: the whole replicated shared expert, for the path
+# above the cap (the kernel takes the _SHARED_BUFFERS slice of it).
+_SP_FULL_BUFFERS = ("_fmd_w1f", "_fmd_s1f", "_fmd_w2f", "_fmd_s2f")
 # One exported program per distinct closure; the mesh never enters a traced
 # frame (ops are built at arming time and only looked up in forward).
 _OPS: dict[tuple, Any] = {}
@@ -73,6 +89,18 @@ _RANK_BUFFER_START = 0
 
 def fused_moe_decode_supported(quant_method: Any) -> bool:
     return getattr(quant_method, FUSED_MOE_DECODE_OP_ATTR, None) is not None
+
+
+def sequence_parallel_rank(quant_method: Any, layer: Any) -> int | None:
+    """The TP rank whose sequence-parallel chunk an armed SP layer's rows are
+    (the runner skips the all-gather for it), else None."""
+    if not fused_moe_decode_supported(quant_method) or not getattr(
+        layer.moe_config.moe_parallel_config, "is_sequence_parallel", False
+    ):
+        return None
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    return get_tensor_model_parallel_rank()
 
 
 def _gmm_layer(
@@ -190,12 +218,119 @@ def _layer(
     )
 
 
-def _build_op(mesh, n_ranks: int, topk: int, expert_parallel: bool, max_tokens: int):
-    key = (id(mesh), n_ranks, topk, expert_parallel, max_tokens)
+def _shared_expert(x, w1, w1_scale, w2, w2_scale, gate_weight):
+    """Qwen2MoeMLP.forward of a replicated shared expert on these rows: FP8
+    gate_up / down linears, SiluAndMul and the sigmoid of expert_gate."""
+    i_s = w2.shape[0]
+    gate_up = _quantized_matmul_jax(x, w1, w1_scale.reshape(-1))
+    out = _quantized_matmul_jax(
+        jax.nn.silu(gate_up[:, :i_s]) * gate_up[:, i_s:], w2, w2_scale.reshape(-1)
+    )
+    return jax.nn.sigmoid(jnp.dot(x, gate_weight.reshape(-1, 1).astype(x.dtype))) * out
+
+
+def _sp_layer(
+    rank,
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    shared_w1,
+    shared_w1_scale,
+    shared_w2,
+    shared_w2_scale,
+    shared_gate_weight,
+    tw,
+    ti,
+    full_w1,
+    full_w1_scale,
+    full_w2,
+    full_w2_scale,
+    *,
+    n_ranks,
+    topk,
+    max_tokens,
+):
+    """Per-rank body of a sequence-parallel layer: x, tw, ti are this rank's
+    own rows and so is the result. The kernel (gather_rows) up to `max_tokens`
+    global tokens; above, the kernel-off SP path."""
+    start = rank[0, 1]
+    if x.shape[0] * n_ranks > max_tokens:
+
+        def gather(a):
+            return jax.lax.all_gather(a, EP_AXIS_NAME, axis=0, tiled=True)
+
+        # MoERunner under SP: dispatch all-gathers the rows, the GMM MoE runs
+        # on all of them, combine reduce-scatters; the replicated shared
+        # expert runs on the rank's own rows and is added after.
+        routed = fused_moe_func(
+            gather(x),
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            None,
+            None,
+            gather(tw),
+            gather(ti),
+            start,
+            topk=topk,
+            activation="silu",
+            use_ep=True,
+            use_sparse_core=envs.USE_MOE_SPARSE_CORE,
+            onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
+            rhs_quant_dtype=None,
+            skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS,
+        )
+        routed = jax.lax.psum_scatter(
+            routed, EP_AXIS_NAME, scatter_dimension=0, tiled=True
+        )
+        shared = _shared_expert(
+            x, full_w1, full_w1_scale, full_w2, full_w2_scale, shared_gate_weight
+        )
+        return shared + routed
+    logger.info(
+        "Fused MoE decode kernel traced for %d tokens per rank "
+        "(sequence parallel, in-kernel all-gather)",
+        x.shape[0],
+    )
+    return _kernel_body(
+        rank[0, :1],
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        shared_w1,
+        shared_w1_scale.reshape(1, -1),
+        shared_w2,
+        shared_w2_scale.reshape(1, -1),
+        shared_gate_weight.reshape(-1, 1),
+        tw,
+        ti,
+        n_ranks=n_ranks,
+        expert_start=start,
+        scatter_rows=True,
+        gather_rows=True,
+    )
+
+
+def _build_op(
+    mesh,
+    n_ranks: int,
+    topk: int,
+    expert_parallel: bool,
+    max_tokens: int,
+    sequence_parallel: bool = False,
+):
+    key = (id(mesh), n_ranks, topk, expert_parallel, max_tokens, sequence_parallel)
     op = _OPS.get(key)
     if op is not None:
         return op
     spec = PartitionSpec(EP_AXIS_NAME)
+    if sequence_parallel:
+        return _build_sp_op(mesh, n_ranks, topk, max_tokens, key)
     local = functools.partial(
         _layer,
         n_ranks=n_ranks,
@@ -261,6 +396,92 @@ def _build_op(mesh, n_ranks: int, topk: int, expert_parallel: bool, max_tokens: 
     return op
 
 
+def _build_sp_op(mesh, n_ranks: int, topk: int, max_tokens: int, key):
+    """The op of a sequence-parallel layer: the operands of the TP-attention
+    op plus the whole shared expert (per rank, after the rank buffer)."""
+    spec = PartitionSpec(EP_AXIS_NAME)
+    local = functools.partial(
+        _sp_layer, n_ranks=n_ranks, topk=topk, max_tokens=max_tokens
+    )
+    specs = (spec,) * 9 + (PartitionSpec(), spec, spec, spec) + (spec,) * 4
+
+    def fn(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        shared_w1: jax.Array,
+        shared_w1_scale: jax.Array,
+        shared_w2: jax.Array,
+        shared_w2_scale: jax.Array,
+        shared_gate_weight: jax.Array,
+        tw: jax.Array,
+        ti: jax.Array,
+        rank: jax.Array,
+        full_w1: jax.Array,
+        full_w1_scale: jax.Array,
+        full_w2: jax.Array,
+        full_w2_scale: jax.Array,
+    ) -> jax.Array:
+        body = jax.shard_map(
+            lambda *a: local(a[12], *a[:12], *a[13:]),
+            mesh=mesh,
+            in_specs=specs,
+            out_specs=spec,
+            check_vma=False,
+        )
+        return body(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            shared_w1,
+            shared_w1_scale,
+            shared_w2,
+            shared_w2_scale,
+            shared_gate_weight,
+            tw,
+            ti.astype(jnp.int32),
+            rank,
+            full_w1,
+            full_w1_scale,
+            full_w2,
+            full_w2_scale,
+        )
+
+    name = "pallas::fused_moe_decode" + (f"_{len(_OPS)}" if _OPS else "")
+    op = jax_op(
+        name,
+        fn,
+        mesh=mesh,
+        input_partition_specs=specs,
+        output_partition_specs=spec,
+    )
+
+    def _fake(x, *_args, **_kwargs):
+        return torch.empty_like(x)
+
+    op.register_fake(_fake)
+    _OPS[key] = op
+    return op
+
+
+def _shared_tp_slice(shared: tuple, index: int, n_ranks: int) -> tuple:
+    """Rank `index`'s TP slice of a replicated shared expert, in the layout of
+    a TP-sharded one: columns [index * i_s, (index + 1) * i_s) of gate and of
+    up, the same rows of down; i_s = I / n_ranks. The n slices partition the
+    expert exactly, so their outputs summed over ranks are the whole one."""
+    w1, s1, w2, s2, wg = shared
+    i_full = w2.shape[0]
+    i_s = i_full // n_ranks
+    lo, hi = index * i_s, (index + 1) * i_s
+    w1s = torch.cat([w1[:, lo:hi], w1[:, i_full + lo : i_full + hi]], dim=1)
+    s1s = torch.cat([s1[lo:hi], s1[i_full + lo : i_full + hi]])
+    return (w1s.contiguous(), s1s.contiguous(), w2[lo:hi].contiguous(), s2, wg)
+
+
 def _shared_slice(runner) -> tuple | None:
     """This rank's shared-expert tensors in the kernel's layout, or None."""
     shared = getattr(runner, "_shared_experts", None)
@@ -315,8 +536,10 @@ def _shared_slice(runner) -> tuple | None:
     )
 
 
-def _admit(runner, n_ranks: int) -> tuple[tuple, bool] | None:
-    """(shared-expert tensors, expert_parallel) for an eligible layer, else None."""
+def _admit(runner, n_ranks: int) -> tuple[tuple, bool, bool] | None:
+    """(shared-expert tensors, expert_parallel, sequence_parallel) for an
+    eligible layer, else None. Sequence parallel needs EP over the mesh; its
+    shared expert is replicated whole (I), and the kernel takes I / n_ranks."""
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
     cfg = runner.moe_config
@@ -336,8 +559,9 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool] | None:
         getattr(layer, "w2_bias", None) is not None
     ):
         return None
-    if getattr(cfg, "is_sequence_parallel", False) or getattr(
-        cfg, "skip_final_all_reduce", False
+    sequence_parallel = bool(getattr(cfg, "is_sequence_parallel", False))
+    if getattr(cfg, "skip_final_all_reduce", False) or (
+        sequence_parallel and not expert_parallel
     ):
         return None
     if (
@@ -358,7 +582,13 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool] | None:
     w1_scale, w2_scale = layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
     e, h, two_i = w1.shape
     i = two_i // 2
-    i_s = shared_w2.shape[0]  # the shared expert is a TP slice, even under EP
+    # The shared expert is a TP slice, even under EP; under SP it is whole.
+    i_s = shared_w2.shape[0]
+    if sequence_parallel:
+        if i_s % n_ranks or tuple(shared_w1.shape) != (h, 2 * i_s):
+            return None
+        i_s //= n_ranks
+        shared_w1 = shared_w1[:, : 2 * i_s]
     if (
         w1.dtype != torch.float8_e4m3fn
         or tuple(w2.shape) != (e, i, h)
@@ -372,15 +602,21 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool] | None:
         or shared_gate_weight.numel() != h
     ):
         return None
-    return shared, expert_parallel
+    return shared, expert_parallel, sequence_parallel
 
 
-def _check_vmem(max_tokens: int, layer, i_s: int, n_ranks: int) -> None:
+def _check_vmem(
+    max_tokens: int, layer, i_s: int, n_ranks: int, gather_rows: bool = False
+) -> None:
     """Refuse a token cap the kernel cannot be built for, at arming rather than
     as a Mosaic VMEM error when the first bucket above it compiles."""
     e, h, two_i = layer.w13_weight.shape
     weight_dtype = jnp.dtype(str(layer.w13_weight.dtype).removeprefix("torch."))
-    need = vmem_bytes(max_tokens, h, two_i // 2, i_s, e, n_ranks, weight_dtype)
+    if gather_rows:  # global tokens split over the ranks: round down to a split
+        max_tokens -= max_tokens % n_ranks
+    need = vmem_bytes(
+        max_tokens, h, two_i // 2, i_s, e, n_ranks, weight_dtype, gather_rows
+    )
     have = pltpu.get_tpu_info().vmem_capacity_bytes
     if need > have:
         raise ValueError(
@@ -416,18 +652,22 @@ def arm_fused_moe_decode(model: torch.nn.Module) -> int:
         raise ValueError(
             f"FUSED_MOE_DECODE_KERNEL_MAX_TOKENS={max_tokens}: must be >= 1."
         )
-    armed = 0
+    armed = armed_sp = 0
+    index = ep_mesh_index()
     for runner in runners:
         admitted = _admit(runner, n_ranks)
         if admitted is None:
             continue
-        shared, expert_parallel = admitted
+        shared, expert_parallel, sequence_parallel = admitted
         layer = runner.routed_experts
-        _check_vmem(max_tokens, layer, shared[2].shape[0], n_ranks)
+        full = None
+        if sequence_parallel:
+            full, shared = shared[:4], _shared_tp_slice(shared, index, n_ranks)
+        _check_vmem(max_tokens, layer, shared[2].shape[0], n_ranks, sequence_parallel)
         start = get_experts_start(layer) or 0
         if _RANK_BUFFER is None:
             _RANK_BUFFER = torch.tensor(
-                [[ep_mesh_index(), start]],
+                [[index, start]],
                 dtype=torch.int32,
                 device=layer.w13_weight.device,
             )
@@ -447,21 +687,31 @@ def arm_fused_moe_decode(model: torch.nn.Module) -> int:
                 layer.moe_config.experts_per_token,
                 expert_parallel,
                 max_tokens,
+                sequence_parallel,
             ),
         )
         for name, tensor in zip(_SHARED_BUFFERS, shared):
             layer.register_buffer(name, tensor, persistent=False)
+        if full is not None:
+            for name, tensor in zip(_SP_FULL_BUFFERS, full):
+                layer.register_buffer(name, tensor, persistent=False)
+            armed_sp += 1
         runner._shared_experts = None
         runner._forward_entry = runner._select_forward()
         object.__setattr__(runner, _RUNNER_ARMED_ATTR, True)
         armed += 1
     if armed:
+        # Every rank logs its own line: a collective kernel must arm the same
+        # layers on every rank.
         logger.info(
             "Armed the fused MoE decode kernel on %d of %d MoE layers "
-            "(%d ranks, up to %d tokens; GMM MoE above)",
+            "(mesh index %s of %d ranks, %d sequence parallel with in-kernel "
+            "all-gather, up to %d tokens; GMM MoE above)",
             armed,
             len(runners),
+            index,
             n_ranks,
+            armed_sp,
             max_tokens,
         )
     return armed
@@ -480,6 +730,9 @@ def fused_moe_decode(
         getattr(layer, name) for name in _SHARED_BUFFERS
     )
     op = getattr(quant_method, FUSED_MOE_DECODE_OP_ATTR)
+    full = tuple(getattr(layer, name, None) for name in _SP_FULL_BUFFERS)
+    if full[0] is None:
+        full = ()
     return op(
         x,
         layer.w13_weight,
@@ -494,6 +747,7 @@ def fused_moe_decode(
         topk_weights,
         topk_ids,
         _RANK_BUFFER,
+        *full,
     )
 
 
