@@ -134,19 +134,18 @@ def test_moe_gmm_tiling(monkeypatch):
         fused_moe_gmm, "calculate_tiling", lambda *args, **kwargs: base_tiles
     )
     # 1. Matching decode dims:
-    # size_group > 1 and 32 <= size_m <= size_group * 176 and 32 % sublane == 0
+    # size_group > 1 and 32 <= size_m <= size_group * 144 and 32 % sublane == 0
     bound = fused_moe_gmm._DECODE_TILE_M32_ROWS_PER_GROUP
-    assert bound == 176
+    assert bound == 144
     for size_group, size_m in (
         (48, 576),
         (48, 2304),
         (48, 3456),
         (16, 1728),
-        # DP2xTP4+EP8 verify batches T_ep = 768, 960, 1152, 1344 (M = 6 * T_ep).
+        # DP2xTP4+EP8 verify batches T_ep = 768, 960, 1152 (M = 6 * T_ep <= 6912).
         (48, 4608),
         (48, 5760),
         (48, 6912),
-        (48, 8064),
         (48, 48 * bound),
     ):
         match_dims = types.SimpleNamespace(
@@ -156,13 +155,14 @@ def test_moe_gmm_tiling(monkeypatch):
             match_dims, None, None, 64 << 20, "silu"
         ) == fused_moe_gmm.TileSizes(tile_m=32, tile_k=512, tile_n=512, bucket_base=32)
 
-    # 2. Non-matching branches
+    # 2. Non-matching branches (including T_ep = 1344 -> M = 8064 > 6912)
     for non_match in (
         # size_group <= 1
         types.SimpleNamespace(size_group=1, size_m=576, size_lhs_sublane=8),
         # size_m < 32
         types.SimpleNamespace(size_group=48, size_m=16, size_lhs_sublane=8),
-        # size_m > size_group * 176
+        # size_m > size_group * 144 (e.g. T=1344 -> M=8064)
+        types.SimpleNamespace(size_group=48, size_m=8064, size_lhs_sublane=8),
         types.SimpleNamespace(size_group=48, size_m=48 * bound + 1, size_lhs_sublane=8),
         # 32 % sublane != 0
         types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=12),
@@ -374,6 +374,47 @@ def test_prepare_routed_gmm_inputs():
             topk_weights,
         )
         assert out4b[0].shape == (8, 16)
+
+        # 7. use_ep=True, use_sparse_core=True, M=8064 (T=1344, topk=6) > 6912:
+        # bijective scatter eliminates jax.lax.sort completely (0 sorts in jaxpr).
+        h_1344 = jnp.ones((1344, 16), dtype=jnp.bfloat16)
+        ti_1344 = (jnp.arange(1344 * 6, dtype=jnp.int32) % 48).reshape(1344, 6)
+        tw_1344 = jnp.full((1344, 6), 1.0 / 6.0, dtype=jnp.bfloat16)
+        jaxpr_1344 = jax.make_jaxpr(
+            lambda h, ti, tw: fused_moe_gmm.prepare_routed_gmm_inputs(
+                h,
+                ti,
+                tw,
+                local_num_experts=48,
+                topk=6,
+                use_ep=True,
+                use_sparse_core=True,
+                onehot_moe_permute_threshold=4096,
+            )
+        )(h_1344, ti_1344, tw_1344)
+        assert str(jaxpr_1344).count(" sort[") == 0
+        out_1344_ragged = fused_moe_gmm.prepare_routed_gmm_inputs(
+            h_1344,
+            ti_1344,
+            tw_1344,
+            local_num_experts=48,
+            topk=6,
+            use_ep=True,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=4096,
+        )
+        out_1344_plain = fused_moe_gmm.prepare_routed_gmm_inputs(
+            h_1344,
+            ti_1344,
+            tw_1344,
+            local_num_experts=48,
+            topk=6,
+            use_ep=True,
+            use_sparse_core=False,
+            onehot_moe_permute_threshold=0,
+        )
+        for got, want in zip(out_1344_ragged, out_1344_plain):
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
 def test_moe_gmm(monkeypatch):

@@ -438,12 +438,8 @@ def _run_moe_sweep(
 
         out_sc1 = _gmm_sc1_tp()
         out_sc0 = _gmm_sc0_tp()
-        out_dense = _dense_exp_tp()
-        common.synchronize((out_sc1, out_sc0, out_dense))
+        common.synchronize((out_sc1, out_sc0))
         cmp_sc = common.compare_tensors(out_sc1.cpu(), out_sc0.cpu(), common.LOSSLESS)
-        cmp_dense = common.compare_tensors(
-            out_dense.cpu(), out_sc1.cpu(), common.LOSSLESS
-        )
 
         row: dict[str, Any] = {
             "T": t_full,
@@ -456,11 +452,20 @@ def _run_moe_sweep(
             "gmm_sc1_onehot_tp_ms": _bench_ms(ctx, _gmm_sc1_tp),
             "gmm_sc1_ragged_tp_ms": _bench_ms(ctx, _gmm_sc1_raw_tp),
             "gmm_sc0_argsort_tp_ms": _bench_ms(ctx, _gmm_sc0_tp),
-            "dense_expert_tp_ms": _bench_ms(ctx, _dense_exp_tp),
             "sc1_vs_sc0_cos": round(float(cmp_sc["cos_sim"]), 6),
-            "dense_vs_sc1_cos": round(float(cmp_dense["cos_sim"]), 7),
-            "dense_vs_sc1_max_abs": round(float(cmp_dense["max_abs_diff"]), 6),
         }
+        # Full-batch dense_expert_moe keeps f32[T, H] + 2x bf16[T, H] + f8[T, H]
+        # + expert weight tiles in VMEM; at T >= 960 (H=5120, I_pad=2560) it
+        # needs 69.57 MiB > 63.94 MiB VMEM capacity on v7x.
+        if t_full <= 768:
+            out_dense = _dense_exp_tp()
+            common.synchronize(out_dense)
+            cmp_dense = common.compare_tensors(
+                out_dense.cpu(), out_sc1.cpu(), common.LOSSLESS
+            )
+            row["dense_expert_tp_ms"] = _bench_ms(ctx, _dense_exp_tp)
+            row["dense_vs_sc1_cos"] = round(float(cmp_dense["cos_sim"]), 7)
+            row["dense_vs_sc1_max_abs"] = round(float(cmp_dense["max_abs_diff"]), 6)
 
         if m_routed > _SWEEP_ONEHOT_THRESHOLD:
             # Above the production cap the one-hot path is the argsort-based
@@ -554,10 +559,11 @@ def _run_moe_sweep(
                     rank_buf,
                 )
 
-            out_dense_sp = _dense_exp_sp()
-            common.synchronize(out_dense_sp)
             row["gmm_sc1_onehot_sp_ms"] = _bench_ms(ctx, _gmm_sc1_sp)
-            row["dense_expert_sp_ms"] = _bench_ms(ctx, _dense_exp_sp)
+            if t_full <= 768:
+                out_dense_sp = _dense_exp_sp()
+                common.synchronize(out_dense_sp)
+                row["dense_expert_sp_ms"] = _bench_ms(ctx, _dense_exp_sp)
             if t_local <= 8 or t_local % 8 == 0:
                 out_v2_sp = _v2_w4a8_sp()
                 common.synchronize(out_v2_sp)

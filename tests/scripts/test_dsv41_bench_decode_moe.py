@@ -304,7 +304,10 @@ class TestBenchDecodeMoe:
             assert key in results
             assert results[key]["T"] == t
             assert results[key]["M_routed"] == 6 * t
-            assert "dense_expert_tp_ms" in results[key]
+            if t <= 768:
+                assert "dense_expert_tp_ms" in results[key]
+            else:
+                assert "dense_expert_tp_ms" not in results[key]
             if 6 * t > 4096:
                 # DP2xTP4+EP8 regime: the production threshold takes the ragged
                 # path and the forced one-hot A/B column is present.
@@ -318,8 +321,14 @@ class TestBenchDecodeMoe:
             if t >= 8:
                 assert "fused_ep_v2_w4a8_tp_ms" in results[key]
                 assert "gmm_sc1_onehot_sp_ms" in results[key]
-                assert "dense_expert_sp_ms" in results[key]
-                assert "fused_ep_v2_w4a8_sp_ms" in results[key]
+                if t <= 768:
+                    assert "dense_expert_sp_ms" in results[key]
+                else:
+                    assert "dense_expert_sp_ms" not in results[key]
+                if (t // 8) <= 8 or (t // 8) % 8 == 0:
+                    assert "fused_ep_v2_w4a8_sp_ms" in results[key]
+                else:
+                    assert "fused_ep_v2_w4a8_sp_ms" not in results[key]
         assert [r["gmm_sc1_path"] for r in results.values()].count("ragged") == 4
 
         # Verify all registered fake functions were called
@@ -759,6 +768,23 @@ class TestMoeDenseExpertDiff:
             None,
             activation="silu",
             rhs_quant_dtype=None,
+            skip_padded_tokens=False,
+        )
+
+        # Rejection: scoped VMEM footprint exceeds v7x capacity (T=960, H=5120, I=2560)
+        x_oom, w1_oom, w2_oom, s1_oom, s2_oom = _make_tensors(
+            m=960, h=5120, i=2560, e=48, pack=2
+        )
+        assert not kde.can_use_dense_expert(
+            x_oom,
+            w1_oom,
+            w2_oom,
+            s1_oom,
+            s2_oom,
+            None,
+            None,
+            activation="silu_and_mul_with_clamp",
+            rhs_quant_dtype=jnp.float4_e2m1fn,
             skip_padded_tokens=False,
         )
 

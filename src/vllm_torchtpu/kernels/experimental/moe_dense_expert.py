@@ -108,6 +108,11 @@ def can_use_dense_expert(
         return False
     if hidden.dtype != jnp.bfloat16:
         return False
+    # Scoped VMEM footprint: f32[m,h] acc + 2x bf16[m,h] windows + f8[m,h]
+    # quantized input + 1.5*h*i unpacked expert weight scratch must fit in 64 MiB
+    # VMEM after scale scratch and register spill headroom (~8 MiB on v7x).
+    if m * h * 9 + (3 * h * i) // 2 > 56 << 20:
+        return False
     valid_s1 = s1.shape in ((e, 1, 1, 2 * i), (e, h // 512, 1, 2 * i))
     valid_s2 = s2.shape in ((e, 1, 1, h), (e, i // 512, 1, h))
     return valid_s1 and valid_s2 and s1.dtype == jnp.float32 and s2.dtype == jnp.float32

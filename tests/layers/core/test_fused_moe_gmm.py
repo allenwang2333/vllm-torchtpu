@@ -973,7 +973,7 @@ def test_moe_gmm_tiling_selects_32_for_sparse_decode_and_keeps_default_otherwise
         (48, 3456),
         (16, 1728),
         (48, 4608),
-        (48, 8064),
+        (48, 6912),
         (48, 48 * bound),
     ):
         decode_dims = types.SimpleNamespace(
@@ -985,6 +985,7 @@ def test_moe_gmm_tiling_selects_32_for_sparse_decode_and_keeps_default_otherwise
     for non_matching_dims in (
         types.SimpleNamespace(size_group=1, size_m=576, size_lhs_sublane=8),
         types.SimpleNamespace(size_group=48, size_m=16, size_lhs_sublane=8),
+        types.SimpleNamespace(size_group=48, size_m=8064, size_lhs_sublane=8),
         types.SimpleNamespace(size_group=48, size_m=48 * bound + 1, size_lhs_sublane=8),
         types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=12),
     ):
@@ -1280,8 +1281,8 @@ def test_moe_gmm_onehot_combine_keeps_operand_dtype(monkeypatch):
 def test_moe_gmm_onehot_combine_zeroes_uncomputed_rows(monkeypatch):
     # gmm output rows past the valid prefix (non-local experts under EP, or
     # skipped padded tokens) are never written and may hold NaN; the one-hot
-    # combine must zero them before the matmul, without any flag, or they
-    # would spread to every token in the batch.
+    # combine must zero them before the matmul, either via zero_initialize=True
+    # (for M <= 2304) or explicit prefix masking (for M > 2304).
     kwargs = _small_moe_gmm_kwargs()
     rows = kwargs["argsort_revert_indices"].size
     valid_rows = rows - 2
@@ -1289,9 +1290,14 @@ def test_moe_gmm_onehot_combine_zeroes_uncomputed_rows(monkeypatch):
     gmm2 = jnp.ones((rows, 8), dtype=jnp.bfloat16)
     gmm2 = gmm2.at[valid_rows:].set(jnp.nan)
     outputs = iter([jnp.ones((rows, 8), dtype=jnp.bfloat16), gmm2])
-    monkeypatch.setattr(
-        fused_moe_gmm, "gmm_wrapper", lambda *args, **kwargs: next(outputs)
-    )
+
+    def _mock_gmm(*args, zero_initialize=False, **kw):
+        out = next(outputs)
+        if zero_initialize:
+            out = jnp.where(jnp.isfinite(out), out, 0)
+        return out
+
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", _mock_gmm)
     # Mark the slots whose routed rows fall in the NaN tail as invalid, as
     # prepare_routed_gmm_inputs does for padded tokens.
     revert = kwargs["argsort_revert_indices"]
