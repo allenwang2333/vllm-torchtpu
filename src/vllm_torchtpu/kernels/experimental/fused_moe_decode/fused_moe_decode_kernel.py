@@ -264,9 +264,14 @@ def _kernel(
         # The dense route-weight table XLA builds otherwise: at most one
         # route of a token selects a given expert, so the sum is exact. Ids
         # are global; this rank's local expert e is global rank_ref[1] + e.
-        experts_f = (
-            lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1) + rank_ref[1]
-        ).astype(jnp.float32)
+        # Columns past the local experts (lane padding) match no id: under
+        # EP they would otherwise name the next rank's experts, and the
+        # compaction would hand the weight ring ids past the local range
+        # (measured: a DMA bounds-check core halt).
+        local = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
+        experts_f = jnp.where(
+            local < experts, (local + rank_ref[1]).astype(jnp.float32), -1.0
+        )
         coeff = jnp.zeros(coeff_ref.shape, jnp.float32)
         for j in range(topk):
             coeff = coeff + jnp.where(experts_f == lane(j), lane(topk + j), 0.0)
@@ -736,7 +741,7 @@ def _gather_rows_call(
             collective_id=0,
             vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
         ),
-        name=f"fused_moe_decode_ag-e_{experts}-m_{m}-h_{h}"
+        name=f"fused_moe_decode_ag-e_{experts}-m_{m}-r_{rows}-h_{h}"
         f"-i_{i}-is_{i_s}-n_{n_ranks}-buffers_{nb}",
     )(
         rank_start,
