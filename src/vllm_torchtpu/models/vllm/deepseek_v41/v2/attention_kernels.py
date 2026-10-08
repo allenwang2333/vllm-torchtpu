@@ -259,6 +259,95 @@ def _attend_window(
     )
 
 
+def _attend_shared_block(q, pool, records, state, scale, block, tile=64):
+    """`_attend` for non-causal query blocks that share one key window.
+
+    DSpark draft layers attend each request's ``block`` query tokens (rows
+    ``[r * block, (r + 1) * block)``) non-causally over the same sliding
+    window, so the valid records rows of a block are identical. `_attend`
+    gathers that window once per token; here it is gathered once per block
+    and all of the block's queries attend to it in one batched product.
+    Invalid tokens (all ``-1`` rows) inside a block see the block's window;
+    callers mask them. Tokens past the last full block use `_attend`. A token
+    whose valid records differ from its block's comes out NaN rather than
+    silently wrong.
+    """
+    tokens, heads, dim = q.shape
+    width = records.shape[1]
+    groups = tokens // block
+    full = groups * block
+    rows = records[:full].reshape(groups, block, width)
+    shared = rows.max(axis=1)
+    mismatch = ((rows >= 0) & (rows != shared[:, None])).any(-1).reshape(full)
+    shared = jnp.pad(shared, ((0, 0), (0, -width % tile)), constant_values=-1)
+    gathered = gather_cache_pieces(pool, shared.reshape(-1), dim)
+    count = gathered.shape[0]
+    gathered = gathered.reshape(count, groups, shared.shape[1], -1)
+
+    maximum, denominator, numerator = (s[:full] for s in state)
+    carry = (
+        maximum.reshape(groups, block, heads),
+        denominator.reshape(groups, block, heads),
+        split_pieces(numerator, count).reshape(count, groups, block, heads, -1),
+    )
+    qb = (
+        split_pieces(q[:full], count)
+        .astype(jnp.float32)
+        .reshape(count, groups, block, heads, -1)
+    )
+
+    def step(index, carry):
+        maximum, denominator, numerator = carry
+        addresses = jax.lax.dynamic_slice_in_dim(shared, index * tile, tile, axis=1)
+        valid = addresses >= 0
+        kv = jnp.where(
+            valid[None, ..., None],
+            jax.lax.dynamic_slice_in_dim(gathered, index * tile, tile, axis=2),
+            0,
+        )
+        scores = (
+            jnp.einsum(
+                "pgbhe,pgke->gbhk",
+                qb,
+                kv.astype(jnp.float32),
+                preferred_element_type=jnp.float32,
+            )
+            * scale
+        )
+        scores = jnp.where(valid[:, None, None], scores, -jnp.inf)
+        new_max = jnp.maximum(maximum, scores.max(-1))
+        correction = jnp.exp(maximum - new_max)
+        exponentials = jnp.exp(scores - new_max[..., None])
+        denominator = denominator * correction + exponentials.sum(-1)
+        numerator = numerator * correction[None, ..., None] + jnp.einsum(
+            "gbhk,pgke->pgbhe",
+            exponentials.astype(jnp.bfloat16),
+            kv,
+            preferred_element_type=jnp.float32,
+        )
+        return new_max, denominator, numerator
+
+    maximum, denominator, numerator = jax.lax.fori_loop(
+        0, shared.shape[1] // tile, step, carry
+    )
+    bad = mismatch[:, None]
+    result = (
+        jnp.where(bad, jnp.nan, maximum.reshape(full, heads)),
+        jnp.where(bad, jnp.nan, denominator.reshape(full, heads)),
+        jnp.where(
+            bad[..., None],
+            jnp.nan,
+            merge_pieces(numerator.reshape(count, full, heads, -1)),
+        ),
+    )
+    if full == tokens:
+        return result
+    tail = _attend(
+        q[full:], pool, records[full:], tuple(s[full:] for s in state), scale
+    )
+    return tuple(jnp.concatenate(pair) for pair in zip(result, tail))
+
+
 def paged_attention_jax(
     q: jax.Array,
     swa_pool: jax.Array,
@@ -267,16 +356,18 @@ def paged_attention_jax(
     main_records: jax.Array,
     sink: jax.Array,
     scale: float,
+    block: int = 1,
 ) -> jax.Array:
+    """``block > 1``: non-causal query blocks of ``block`` tokens share their
+    sliding window (DSpark draft layers); see `_attend_shared_block`."""
+    state = _attention_state(q)
+    if block > 1 and q.shape[0] >= block:
+        window = _attend_shared_block(q, swa_pool, swa_records, state, scale, block)
+    else:
+        window = _attend_window(q, swa_pool, swa_records, state, scale)
     # SWA widths in the released model are multiples of 64, preserving the
     # reference's accumulation boundaries when compressed rows follow.
-    maximum, denominator, numerator = _attend(
-        q,
-        main_pool,
-        main_records,
-        _attend_window(q, swa_pool, swa_records, _attention_state(q), scale),
-        scale,
-    )
+    maximum, denominator, numerator = _attend(q, main_pool, main_records, window, scale)
     denominator += jnp.exp(sink.astype(jnp.float32)[None] - maximum)
     return (numerator / denominator[..., None]).astype(q.dtype)
 
@@ -961,7 +1052,7 @@ def initialize_paged_attention():
         "pallas::dsv41v2_paged_bf16_attention",
         paged_attention_jax,
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(), P(), P(), P(), P(), P(), None),
+        input_partition_specs=(P(), P(), P(), P(), P(), P(), None, None),
     )
     _attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -975,6 +1066,7 @@ def initialize_paged_attention():
         main_records: jax.Array,
         sink: jax.Array,
         scale: float,
+        block: int = 1,
     ) -> jax.Array:
         return paged_attention_jax(
             q,
@@ -984,13 +1076,14 @@ def initialize_paged_attention():
             main_records,
             sink,
             scale,
+            block,
         )
 
     _attention_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_paged_bf16_attention_2bank",
         paged_attention_2bank,
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 8 + (None,),
+        input_partition_specs=(P(),) * 8 + (None, None),
     )
     _attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
     mesh = get_vllm_model_wrapper_context().mesh
@@ -1579,7 +1672,9 @@ def sparse_fp8_attention_qo(
     )
 
 
-def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
+def paged_attention(q, swa, main, swa_records, main_records, sink, scale, block=1):
+    """``block > 1``: rows ``[r * block, (r + 1) * block)`` are one non-causal
+    query block sharing its sliding window (see `_attend_shared_block`)."""
     if _has_hi_bank(main):
         assert _attention_2bank_op is not None and swa.raw_hi is not None
         return _attention_2bank_op(
@@ -1592,10 +1687,11 @@ def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
             main_records.int(),
             sink,
             scale,
+            block,
         )
     assert _attention_op is not None
     return _attention_op(
-        q, swa.raw, main.raw, swa_records.int(), main_records.int(), sink, scale
+        q, swa.raw, main.raw, swa_records.int(), main_records.int(), sink, scale, block
     )
 
 

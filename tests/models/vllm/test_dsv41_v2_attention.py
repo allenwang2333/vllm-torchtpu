@@ -533,7 +533,10 @@ def test_prepare_tpu_tiled_paged_attention_dispatch_bfloat16(monkeypatch):
 
     paged_attn_called = []
 
-    def fake_paged_attn(q, swa_cache, main_cache, records, main_records, sink, scale):
+    def fake_paged_attn(
+        q, swa_cache, main_cache, records, main_records, sink, scale, block=1
+    ):
+        assert block == 1  # target (causal) layers keep per-token windows
         paged_attn_called.append(True)
         return torch.zeros(
             count, attn.n_local_heads, attn.head_dim, dtype=torch.bfloat16

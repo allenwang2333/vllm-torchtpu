@@ -1382,3 +1382,20 @@ def test_v2_attention_kernels_attend_window_union_path(
     out = v2_kernels._attend_window(q, pool, records, state, 1.0)
     assert union_called is True
     assert out is state
+
+
+@pytest.mark.parametrize(
+    "sample_from_anchor,expected", [(None, 5), (True, 5), (False, 6)]
+)
+def test_dspark_query_block_size(
+    monkeypatch: pytest.MonkeyPatch, sample_from_anchor, expected
+):
+    """Draft attention gets the proposer's query block (K or K + 1 rows)."""
+    _patch_dspark_env(monkeypatch)
+    vllm_cfg = _make_dspark_vllm_config(num_speculative_tokens=5)
+    if sample_from_anchor is not None:
+        hf_cfg = vllm_cfg.speculative_config.draft_model_config.hf_config
+        hf_cfg.sample_from_anchor = sample_from_anchor
+    draft_lm = v2_dspark.DSparkDeepseekV41ForCausalLM(vllm_config=vllm_cfg)
+    for layer in draft_lm.model.layers:
+        assert layer.attn.query_block_size == expected

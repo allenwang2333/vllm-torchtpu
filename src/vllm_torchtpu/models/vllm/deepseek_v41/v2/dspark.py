@@ -190,7 +190,13 @@ class DSparkDeepseekV41Model(nn.Module):
             or getattr(config, "block_size", None)
             or vllm_config.speculative_config.num_speculative_tokens
         )
-        max_block_rows = vllm_config.speculative_config.num_speculative_tokens + 1
+        num_spec = vllm_config.speculative_config.num_speculative_tokens
+        max_block_rows = num_spec + 1
+        # Query tokens per request in a draft forward, laid out as rows
+        # [r * block, (r + 1) * block) (DSparkProposer._query_block_size).
+        query_block_size = (
+            num_spec if getattr(config, "sample_from_anchor", True) else num_spec + 1
+        )
         for layer in cast(Iterable[DeepseekV41DecoderLayer], self.layers):
             if max_block_rows > layer.attn.window_size:
                 raise ValueError(
@@ -199,6 +205,7 @@ class DSparkDeepseekV41Model(nn.Module):
                 )
             layer.attn.non_causal_multi_token_decode = True
             layer.attn.dspark_block_size = int(dspark_block_size)
+            layer.attn.query_block_size = int(query_block_size)
 
         compact_rope_caches(
             (layer.attn for layer in self.layers),
