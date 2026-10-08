@@ -215,12 +215,17 @@ class TestTpuCompilerCache:
             "TORCH_TPU_MP_RENDEZVOUS_PORT",
             "TPU_LOCAL_RANK_OFFSET",
             "TPU_SHARDED_LOAD_SYNC_EVERY",
+            "TPU_WORKER_NUMA_BIND",
             "VLLM_TORCHTPU_IPC_KEY",
             "VLLM_TPU_DEBUG_PCP_LAYOUT",
             "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
             "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
             "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
             "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+            "TPU_SCHED_COLD_CHUNK_CAP",
+            "TPU_SCHED_COLD_MIN_DECODERS",
+            "TPU_SCHED_COLD_THRESHOLD",
+            "TPU_SCHED_SRPF_RUNNING",
         }
 
         assert serving_only <= _TPU_COMPILE_ENV_IGNORED
