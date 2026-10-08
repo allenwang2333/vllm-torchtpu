@@ -295,7 +295,7 @@ class TestBenchDecodeMoe:
         with common.model_wrapper_context():
             results = bdm._run_moe_sweep(ctx, args)
         assert isinstance(results, dict)
-        for t in (4, 8, 16, 32, 64):
+        for t in (4, 8, 16, 32, 64, 144, 192, 288, 384, 576):
             key = f"T={t}"
             assert key in results
             assert results[key]["T"] == t

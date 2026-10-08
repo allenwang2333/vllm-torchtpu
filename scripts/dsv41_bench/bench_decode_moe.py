@@ -282,7 +282,7 @@ def _run_moe_sweep(
         op.register_fake(lambda hs, *_: torch.empty_like(hs))
         return op
 
-    gmm_sc1_op = _make_gmm_op(True, 512)
+    gmm_sc1_op = _make_gmm_op(True, 4096)
     gmm_sc1_raw_op = _make_gmm_op(True, 0)
     gmm_sc0_op = _make_gmm_op(False, 0)
     dense_exp_op = _make_dense_expert_op()
@@ -339,7 +339,7 @@ def _run_moe_sweep(
     v2_sp_op = _make_v2_op("sp", sp_ranks_group)
 
     moe_results: dict[str, Any] = {}
-    for t_full in (4, 8, 16, 32, 64):
+    for t_full in (4, 8, 16, 32, 64, 144, 192, 288, 384, 576):
         g_tok = torch.Generator(device="cpu").manual_seed(args.seed + t_full)
         x_full = (
             torch.randn((t_full, d), generator=g_tok, dtype=torch.bfloat16) * 0.1

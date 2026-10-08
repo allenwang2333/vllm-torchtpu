@@ -547,10 +547,13 @@ def moe_gmm(
             # for small batch size.
             # `argsort_revert_indices` is the inverse of the sort, so scattering
             # through it is the gather by the (unmaterialised) forward one.
+            gated_weights = jnp.where(valid_mask_flat, topk_weights_flat, 0).astype(
+                gmm2_res.dtype
+            )
             topk_weights_sorted = (
-                jnp.zeros_like(topk_weights_flat)
+                jnp.zeros_like(gated_weights)
                 .at[argsort_revert_indices]
-                .set(topk_weights_flat)
+                .set(gated_weights)
             )
             valid_count = group_sizes.sum(dtype=jnp.int32)[None]
             if (
@@ -580,16 +583,11 @@ def moe_gmm(
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
-            computed = jnp.arange(gmm2_res.shape[0], dtype=jnp.int32) < group_sizes.sum(
-                dtype=jnp.int32
-            )
+            computed = jnp.arange(gmm2_res.shape[0], dtype=jnp.int32) < valid_count[0]
             gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
-            revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
-            onehot = jax.nn.one_hot(
-                revert_indices, argsort_revert_indices.size, dtype=gmm2_res.dtype
-            )
-            combine = (onehot * topk_weights[..., None] * valid_mask[..., None]).sum(
-                axis=1
+            combine = (
+                jax.nn.one_hot(token_indices_sorted, num_tokens, dtype=gmm2_res.dtype).T
+                * topk_weights_sorted[None, :]
             )
             return (combine @ gmm2_res).astype(x.dtype)
         return ragged_gather_reduce(
