@@ -293,7 +293,7 @@ def stack_kinds(v, kinds):
 # ------------------------------------------------------------------------------------------
 
 def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debug=False,
-          skip=frozenset(), axis_name=None, stack_w=None, stack_c=None):
+          skip=frozenset(), axis_name=None, stack_w=None, stack_c=None, draft=False):
     """Returns (step_fn, info). step_fn(scal, rmeta, qmeta, bt, rvec, h0, rope_tab, smalls, *weights,
     *caches) -> (out [M, H] bf16, *caches[, dbg_h, dbg_own]) for ONE rank; wrap in shard_map.
 
@@ -307,8 +307,17 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                                  lanes 128-DR..127 (2, 3); identity elsewhere
     smalls HBM f32 [L + 1, 1, S]: this rank's per-layer vectors (smalls_layout; row L: final norm)
     caches: aliased in -> out; new rows are written in place before they are read.
-    skip: timing ablations only (numerics garbage)."""
+    skip: timing ablations only (numerics garbage).
+
+    draft=True (cfg.V > 0; WHITEBOARD.v4): the MTP drafter -- L = 3 passes of the one MTP layer
+    (weights stacked 3x; caches = the draft layer's, 3 views). scal / rmeta / qmeta / rvec / rope_tab
+    gain a leading [3] (per pass); h0 = the target's post-final-norm hidden; after smalls come dmeta
+    SMEM i32 [4, 128] (rows 0-2: per pass the rows whose logits are taken; row 3: pass 0's token ids),
+    the vocab shard of embed [VR, H] and lm_head [VRP, H] (bf16, HBM) and eh_proj^T's output-column
+    shard [2, H/R, H] (bf16; 0: embed half, 1: hidden half). out = tokens [M, 128] i32 (row b, lane
+    pass). Only pass 0 writes KV (passes 1-2's rows are dead stores in main, never attended)."""
     assert set(skip) <= set(ABLATIONS), skip
+    assert not draft or cfg.V > 0
     R, L, H = cfg.R, cfg.L, cfg.H
     TMAX, RPR = cfg.TMAX, cfg.RPR
     BMAX = bmax or TMAX
@@ -370,6 +379,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     def lpos_fn(ls):
         ls = list(ls)
         n = len(ls)
+        if not n:                                        # a kind no layer has (drafter: dense MLP)
+            return lambda l: jnp.int32(0)
         if ls == list(range(ls[0], ls[0] + n)):
             a = ls[0]
             f = (lambda l: l) if a == 0 else (lambda l: l - a)
@@ -382,8 +393,14 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         return lambda l: jnp.clip(f(l), 0, n - 1)
     WPOS = {k: lpos_fn(ls) for k, (ls, _, _) in wk.items()}
     CPOS = {k: lpos_fn(ls) for k, (ls, _, _) in ck.items()}
-    n_fixed = 8
+    n_fixed = 12 if draft else 8
     n_w = len(w_names)
+    if draft:
+        VR = cfg.V // R                                  # this rank's vocab rows
+        VRP = rup(VR, 128)
+        XR = rup(BMAX, 8)                                # rows whose logits are taken
+        DH = H // R                                      # eh_proj output columns per rank
+        assert cfg.V % R == 0 and DH % 128 == 0 and XR <= M
     n_c = len(c_names)
 
     # --- scratch ---
@@ -472,6 +489,16 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         scratch["pool"] = pltpu.VMEM((NB * BROWS, 128), U8)
     scratch["pool_sem"] = pltpu.SemaphoreType.DMA((NB,))
     scratch["st"] = pltpu.SMEM((8,), I32)
+    if draft:
+        scratch["lmb"] = pltpu.VMEM((128, H), BF16)      # lm_head / eh_proj tiles
+        scratch["lm_sem"] = pltpu.SemaphoreType.DMA(())
+        scratch["carry"] = pltpu.VMEM((XR, H), F32)      # next pass's previous hidden rows
+        scratch["dsend"] = pltpu.VMEM((XR, 128), I32)
+        scratch["drecv"] = pltpu.VMEM((R, XR, 128), I32)
+        scratch["tokv"] = pltpu.VMEM((XR, 128), I32)
+        scratch["tok_s"] = pltpu.SMEM((XR, 128), I32)
+        scratch["d_send"] = pltpu.SemaphoreType.DMA(())
+        scratch["d_recv"] = pltpu.SemaphoreType.DMA(())
     if debug:
         scratch["dbg_sem"] = pltpu.SemaphoreType.DMA((3,))
         scratch["dbgl"] = pltpu.VMEM((TMAX, 128), F32)
@@ -513,7 +540,12 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     s_names = list(scratch)
 
     def kernel(*refs):
-        scal, rmeta, qmeta, bt, rvec, h0, rope_tab, smalls = refs[:n_fixed]
+        if draft:
+            scal_a, rmeta_a, qmeta_a, bt, rvec_a, h0, tab_a, smalls, dmeta, emb_h, lm_h, eht_h = refs[:n_fixed]
+            scal, rmeta, qmeta, rvec, rope_tab = (scal_a.at[0], rmeta_a.at[0], qmeta_a.at[0],
+                                                  rvec_a.at[0], tab_a.at[0])
+        else:
+            scal, rmeta, qmeta, bt, rvec, h0, rope_tab, smalls = refs[:n_fixed]
         w_in = refs[n_fixed:n_fixed + n_w]
         c_in = refs[n_fixed + n_w:n_fixed + n_w + n_c]          # read-only (see build_writer)
         o0 = n_fixed + n_w + n_c
@@ -856,16 +888,29 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             pltpu.make_async_copy(scr["wrow"], nrow_out.at[l], scr["kvw_sem"].at[0]).wait()
             pltpu.make_async_copy(scr["rwrow"], rrow_out.at[l], scr["kvw_sem"].at[1]).wait()
 
-        def req_new(req):
+        def req_new(req, qm=None):
             """(first row, rows, first new position, this rank's local length before the step)."""
-            t0 = qmeta[req, 0]
-            nq = qmeta[req, 1]
-            p0 = qmeta[req, 2] - nq
+            qm = qmeta if qm is None else qm
+            t0 = qm[req, 0]
+            nq = qm[req, 1]
+            p0 = qm[req, 2] - nq
             nold = (p0 // G_) * ILV + jnp.clip(p0 % G_ - ILV * me, 0, ILV)
             return t0, nq, p0, nold
 
         # ---------------- one layer ----------------
         def layer(l, carry):
+            nonlocal scal, rmeta, qmeta, rvec, rope_tab, T, B, nrows, rvalid, rpos
+            if draft:                                    # this pass's rows
+                scal, rmeta, qmeta = scal_a.at[l], rmeta_a.at[l], qmeta_a.at[l]
+                rvec, rope_tab = rvec_a.at[l], tab_a.at[l]
+                T, B = scal[0], scal[1]
+                nrows = jnp.minimum((T + 7) // 8 * 8, TMAX)
+                rvalid = (rvec[:, 0:1] > 0).astype(F32)
+                rpos = rvec[:, 1:2]
+
+                @pl.when(l == 1)
+                def _():
+                    index_share()
             ph = Phases(tiles.trace)
             ph.mark("L_norm")
             slot = l % 2
@@ -933,7 +978,10 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
             # 4: this layer's new KV rows -> staging (the AG of q flies meanwhile)
             ph.mark("L_kvw")
-            stage_rows(l)
+            if draft:
+                pl.when(l == 0)(lambda: stage_rows(l))
+            else:
+                stage_rows(l)
 
             @pl.when(jnp.logical_not(full_idx))
             def _():
@@ -985,18 +1033,19 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
             ph.mark("L_mlp")
 
-            @pl.when(jnp.logical_not(is_moe))
-            def _dense():
-                xq, sx = quant_rows(X)
-                scr["xq"][:, :H] = xq
-                a = matmul("w13", l, scr["xq"], H, 2 * cfg.IDR)
-                gu = bf(a * sx * sm(slot, "w13_s"))
-                mid = bf(gu[:, :cfg.IDR] * jax.nn.sigmoid(gu[:, :cfg.IDR]))
-                mid = bf(mid * gu[:, cfg.IDR:])
-                xq, sx = quant_rows(mid)
-                scr["xq"][:, :cfg.IDR] = xq
-                a = matmul("w2", l, scr["xq"], cfg.IDR, H)
-                scr["part"][...] = bf(a * sx * sm(slot, "w2_s"))
+            if cfg.first_dense > 0:                     # a dense layer exists (not in the drafter)
+                @pl.when(jnp.logical_not(is_moe))
+                def _dense():
+                    xq, sx = quant_rows(X)
+                    scr["xq"][:, :H] = xq
+                    a = matmul("w13", l, scr["xq"], H, 2 * cfg.IDR)
+                    gu = bf(a * sx * sm(slot, "w13_s"))
+                    mid = bf(gu[:, :cfg.IDR] * jax.nn.sigmoid(gu[:, :cfg.IDR]))
+                    mid = bf(mid * gu[:, cfg.IDR:])
+                    xq, sx = quant_rows(mid)
+                    scr["xq"][:, :cfg.IDR] = xq
+                    a = matmul("w2", l, scr["xq"], cfg.IDR, H)
+                    scr["part"][...] = bf(a * sx * sm(slot, "w2_s"))
 
             @pl.when(is_moe)
             def _moe():
@@ -1005,7 +1054,10 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             ph.mark("L_rs_mlp")
             mlp = reduce_scatter_rows(scr["part"][...], "rsm_send", "rsm_recv")
             scr["h"][...] = own_rows_pad(bf(mlp))
-            stage_wait(l)
+            if draft:
+                pl.when(l == 0)(lambda: stage_wait(l))
+            else:
+                stage_wait(l)
             ph.end()
             if debug:
                 dcs = [pltpu.make_async_copy(scr["h"].at[pl.ds(0, RPR)], dbg_h.at[l, 0],
@@ -1019,6 +1071,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                     d_.start()
                 for d_ in dcs:
                     d_.wait()
+            if draft:
+                draft_glue(l, slot)
             return carry
 
         # ---------------- indexer ----------------
@@ -1199,7 +1253,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                     cp.start()
                     cp.wait()
 
-        def build_union(b, off):
+        def build_union(b, off, rn=None):
             """Request b's rows' owned winner lists (ascending local indices) -> their merged union at
             flat rows [off, off + ceil(nu/128)) of own_u, with memb = the bitmask of the request's rows
             (bit qq) holding each entry; nu_s[b], uo_s[b] = (nu, off). Returns the next free row.
@@ -1208,7 +1262,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             nq = qmeta[b, 1]
             QM = cfg.QMAX
             BIG = jnp.int32(2 ** 30)
-            t0r, _, p0r, noldr = req_new(b)
+            t0r, _, p0r, noldr = req_new(b) if rn is None else rn
             ns = [jnp.where(qq < nq, scr["nown_s"][jnp.minimum(t0 + qq, TMAX - 1)], 0) for qq in range(QM)]
             tot = ns[0]
             for x in ns[1:]:
@@ -1710,11 +1764,163 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             scr["part"][...] = bf(scr["shared"][...] + routed)
             pm.end()
 
+        # ---------------- MTP drafter glue (draft=True; WHITEBOARD.v4) ----------------
+        def index_share():
+            """Pass 1's rows (one per request) take pass 0's owned lists of row P_i (IndexShare); the
+            union's gather sources resolve with pass 0's request geometry (its staged rows stay in
+            wrow: passes 1-2 stage nothing). In place, ascending: P_j >= j, so a source is never
+            overwritten before it is read."""
+            def cp(i, c):
+                src = dmeta[0, i]
+                n = scr["nown_s"][src]
+
+                @pl.when(src != i)
+                def _():
+                    def e(k, c2):
+                        scr["own_s"][i * KR_ + (k >> 7), k & 127] = scr["own_s"][src * KR_ + (k >> 7), k & 127]
+                        return c2
+                    lax.fori_loop(0, n, e, 0)
+                if debug:                                # dbg_own exports -1 past n
+
+                    def pad(k, c2):
+                        scr["own_s"][i * KR_ + (k >> 7), k & 127] = jnp.int32(-1)
+                        return c2
+                    lax.fori_loop(n, KT, pad, 0)
+                scr["nown_s"][i] = n
+                return c
+            lax.fori_loop(0, B, cp, 0)
+
+            def zr(t_, c):
+                scr["nown_s"][t_] = jnp.int32(0)
+                return c
+            lax.fori_loop(B, TMAX, zr, 0)
+            for t_ in range(TMAX):                       # own_v (debug view) row by row
+                c_ = pltpu.make_async_copy(scr["own_s"].at[pl.ds(t_ * KR_, KR_)], scr["own_v"].at[t_],
+                                           scr["misc_sem"])
+                c_.start()
+                c_.wait()
+
+            def per_req_u(b, off):
+                return lax.cond(qmeta[b, 3] > 0,
+                                lambda: build_union(b, off, rn=req_new(b, qmeta_a.at[0])), lambda: off)
+            lax.fori_loop(0, B, per_req_u, jnp.int32(0))
+            cpu = [pltpu.make_async_copy(scr["own_u"], scr["own_uv"], scr["misc_sem"]),
+                   pltpu.make_async_copy(scr["memb"], scr["memb_v"], scr["misc_sem"])]
+            for c_ in cpu:
+                c_.start()
+            for c_ in cpu:
+                c_.wait()
+
+        def hbm_tile(src):
+            c_ = pltpu.make_async_copy(src, scr["lmb"], scr["lm_sem"])
+            c_.start()
+            c_.wait()
+            return scr["lmb"][...]
+
+        def draft_prologue(tok_of, valid_of, prev, slot):
+            """x = eh_proj([enorm(embed(tok)); hnorm(prev)]) -> this rank's owner rows of h (res = 0).
+            embed: the owning vocab shard DMAs the row, RS sums the (one-hot) partials onto owners,
+            AG to all ranks; eh_proj: this rank's H/R output columns, RS of the column blocks."""
+            scr["xbf"][...] = jnp.zeros((M, H), BF16)
+            for t_ in range(TMAX):
+                tok = tok_of(t_)
+
+                @pl.when(jnp.logical_and(valid_of(t_), tok // VR == me))
+                def _(t_=t_, tok=tok):
+                    c_ = pltpu.make_async_copy(emb_h.at[pl.ds(tok - me * VR, 1)], scr["xbf"].at[pl.ds(t_, 1)],
+                                               scr["lm_sem"])
+                    c_.start()
+                    c_.wait()
+            e_own = reduce_scatter_rows(scr["xbf"][...].astype(F32), "rso_send", "rso_recv")
+            E = gather_rows_all(own_rows_pad(e_own), "ag_send", "ag_recv")          # [M, H]
+            en = rmsnorm(E, sm(slot, "enorm"), cfg.eps).astype(BF16)
+            hn_ = rmsnorm(prev, sm(slot, "hnorm"), cfg.eps).astype(BF16)
+            ys = []
+            for c in range(DH // 128):
+                w0 = hbm_tile(eht_h.at[0, pl.ds(c * 128, 128)])
+                a = lax.dot_general(en, w0, NT, preferred_element_type=F32)
+                w1 = hbm_tile(eht_h.at[1, pl.ds(c * 128, 128)])
+                a = a + lax.dot_general(hn_, w1, NT, preferred_element_type=F32)
+                ys.append(bf(a))
+            y = jnp.concatenate(ys, axis=1)                                      # [M, DH]
+            col = lax.broadcasted_iota(I32, (M, H), 1) // DH
+            yfull = jnp.where(col == me, jnp.concatenate([y] * R, axis=1), 0.0)
+            h_own = reduce_scatter_rows(yfull, "rsm_send", "rsm_recv")
+            scr["h"][...] = own_rows_pad(h_own)
+            scr["res"][...] = jnp.zeros((RO8, H), F32)
+
+        def draft_glue(l, slot):
+            """After pass l: h = res + block (bf16), shared-head norm, the rows whose logits count,
+            lm_head over this rank's vocab shard -> first max -> AG -> global first max (rank-major
+            vocab); then pass l+1's prologue."""
+            x = scr["h"][...] + scr["res"][...]
+            hn = rmsnorm(bf(x), sm(slot, "shead"), cfg.eps) * own_valid()
+            X = gather_rows_all(hn, "ag_send", "ag_recv").astype(BF16)          # [M, H]
+            i0 = lax.broadcasted_iota(I32, (XR, 1), 0)
+            selc = jnp.zeros((XR, 1), I32)
+            for b_ in range(XR):
+                selc = jnp.where(i0 == b_, dmeta[l, b_], selc)
+            oh = jnp.where(jnp.logical_and(lax.broadcasted_iota(I32, (XR, M), 1) == selc, i0 < B), 1.0, 0.0)
+            xs = lax.dot_general(oh.astype(BF16), X, NN, preferred_element_type=F32)   # exact
+            scr["carry"][...] = xs
+            xsb = xs.astype(BF16)
+            lane_t = lax.broadcasted_iota(I32, (1, 128), 1)
+
+            def lm_body(j, c):
+                bv, bi = c
+                lg = bf(lax.dot_general(xsb, hbm_tile(lm_h.at[pl.ds(j * 128, 128)]), NT,
+                                        preferred_element_type=F32))             # [XR, 128]
+                gi = j * 128 + lane_t
+                lg = jnp.where(gi < VR, lg, -jnp.inf)
+                tv = jnp.max(lg, axis=1, keepdims=True)
+                ti = jnp.min(jnp.where(lg == tv, gi, jnp.int32(2 ** 30)), axis=1, keepdims=True)
+                take_ = tv > bv
+                return jnp.where(take_, tv, bv), jnp.where(take_, ti, bi)
+            bv, bi = lax.fori_loop(0, VRP // 128, lm_body,
+                                   (jnp.full((XR, 1), -jnp.inf, F32), jnp.zeros((XR, 1), I32)))
+            lane_x = lax.broadcasted_iota(I32, (XR, 128), 1)
+            scr["dsend"][...] = jnp.where(lane_x == 0, lax.bitcast_convert_type(bv, I32),
+                                          jnp.where(lane_x == 1, bi + me * VR, 0))
+            scr["drecv"][me] = scr["dsend"][...]
+            exchange(lambda d: scr["dsend"], scr["drecv"], "d_send", "d_recv")
+            gv, gi_ = jnp.full((XR, 1), -jnp.inf, F32), jnp.zeros((XR, 1), I32)
+            for s_ in range(R):                          # rank-major vocab: strict > keeps the first
+                blk = scr["drecv"][s_]
+                v_ = lax.bitcast_convert_type(blk[:, 0:1], F32)
+                take_ = v_ > gv
+                gv, gi_ = jnp.where(take_, v_, gv), jnp.where(take_, blk[:, 1:2], gi_)
+            tokc = jnp.where(i0 < B, gi_, 0)
+            tok_m = tokc if M == XR else jnp.concatenate([tokc, jnp.zeros((M - XR, 1), I32)], axis=0)
+            out_ref[...] = jnp.where(lax.broadcasted_iota(I32, (M, 128), 1) == l, tok_m, out_ref[...])
+
+            @pl.when(l + 1 < L)
+            def _():
+                scr["tokv"][...] = jnp.broadcast_to(tokc, (XR, 128))
+                c_ = pltpu.make_async_copy(scr["tokv"], scr["tok_s"], scr["misc_sem"])
+                c_.start()
+                c_.wait()
+                rm1 = rmeta_a.at[jnp.minimum(l + 1, L - 1)]
+                prev = scr["carry"][...]
+                if M > XR:
+                    prev = jnp.concatenate([prev, jnp.zeros((M - XR, H), F32)], axis=0)
+                draft_prologue(lambda t_: scr["tok_s"][t_, 0] if t_ < XR else jnp.int32(0),
+                               lambda t_: rm1[t_, 0] > 0 if t_ < XR else jnp.bool_(False), prev, slot)
+
         # ---------------- step ----------------
         pltpu.make_async_copy(smalls.at[0], scr["sm"].at[0], scr["sm_sem"].at[0]).start()
-        h_rows = [h0[pl.ds(me + R * k_, 1), :] for k_ in range(RPR)]
-        scr["h"][...] = own_rows_pad(jnp.concatenate(h_rows, axis=0))
-        scr["res"][...] = jnp.zeros((RO8, H), F32)
+        if draft:
+            out_ref[...] = jnp.zeros((M, 128), I32)
+            pltpu.make_async_copy(smalls.at[0], scr["sm"].at[0], scr["sm_sem"].at[0]).wait()
+            prev0 = h0[...]
+            if M > TMAX:
+                prev0 = jnp.concatenate([prev0, jnp.zeros((M - TMAX, H), F32)], axis=0)
+            draft_prologue(lambda t_: dmeta[3, t_], lambda t_: rmeta[t_, 0] > 0, prev0, 0)
+            # layer 0 waits slot 0 again
+            pltpu.make_async_copy(smalls.at[0], scr["sm"].at[0], scr["sm_sem"].at[0]).start()
+        else:
+            h_rows = [h0[pl.ds(me + R * k_, 1), :] for k_ in range(RPR)]
+            scr["h"][...] = own_rows_pad(jnp.concatenate(h_rows, axis=0))
+            scr["res"][...] = jnp.zeros((RO8, H), F32)
         scr["osend"][...] = jnp.zeros(scr["osend"].shape, U32)
         scr["own_v"][...] = jnp.full(scr["own_v"].shape, -1, I32)
         scr["own_uv"][...] = jnp.full(scr["own_uv"].shape, -1, I32)
@@ -1737,6 +1943,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             if len(tkinds) < len(wshape):
                 scr["pool"][...] = jnp.zeros(scr["pool"].shape, U8)
         lax.fori_loop(0, L, layer, 0)
+        if draft:
+            return
         x = scr["h"][...] + scr["res"][...]
         pltpu.make_async_copy(smalls.at[L], scr["sm"].at[0], scr["sm_sem"].at[0]).start()
         pltpu.make_async_copy(smalls.at[L], scr["sm"].at[0], scr["sm_sem"].at[0]).wait()
@@ -1748,8 +1956,11 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     in_specs = ([pl.BlockSpec(memory_space=pltpu.SMEM)] * 4
                 + [pl.BlockSpec(memory_space=pltpu.VMEM)] * 3
                 + [pl.BlockSpec(memory_space=pl.ANY)]
+                + ([pl.BlockSpec(memory_space=pltpu.SMEM)] + [pl.BlockSpec(memory_space=pl.ANY)] * 3
+                   if draft else [])
                 + [pl.BlockSpec(memory_space=pl.ANY)] * (n_w + n_c))
-    out_shape = [jax.ShapeDtypeStruct((M, H), BF16), jax.ShapeDtypeStruct((L, TMAX, 128), U32),
+    out0 = jax.ShapeDtypeStruct((M, 128), I32) if draft else jax.ShapeDtypeStruct((M, H), BF16)
+    out_shape = [out0, jax.ShapeDtypeStruct((L, TMAX, 128), U32),
                  jax.ShapeDtypeStruct((L, TMAX, 128), U32), jax.ShapeDtypeStruct((L, TMAX, 256), I32)]
     out_specs = [pl.BlockSpec(memory_space=pltpu.VMEM)] + [pl.BlockSpec(memory_space=pl.ANY)] * 3
     if debug:
@@ -1760,7 +1971,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         out_specs += [pl.BlockSpec(memory_space=pl.ANY)] * 4
     call = pl.pallas_call(
         kernel,
-        name="glm5_mk_dcp",
+        name="glm5_mk_draft" if draft else "glm5_mk_dcp",
         out_shape=out_shape,
         in_specs=in_specs,
         out_specs=out_specs,
@@ -1775,6 +1986,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                if str(getattr(v, "memory_space", "")).lower().endswith("vmem")}
     info = dict(s_names=s_names, w_names=w_names, c_names=c_names, tk=tk, S=S, ROWSL=ROWSL, M=M, wk=wk,
                 ck=ck, vmem_scratch_bytes=sum(vmem_by.values()), vmem_by=vmem_by, stack_w=SW, stack_c=SC)
+    if draft:
+        info.update(VR=VR, VRP=VRP, XR=XR, DH=DH)
     return call, info
 
 

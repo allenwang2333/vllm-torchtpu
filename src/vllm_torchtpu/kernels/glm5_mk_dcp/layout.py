@@ -22,6 +22,10 @@ def smalls_layout(cfg):
         ("gate_bias", cfg.E), ("sw13_s", 2 * cfg.ISR), ("sw2_s", cfg.H),
         ("w13_s", 2 * cfg.IDR), ("w2_s", cfg.H),
     ]
+    if getattr(cfg, "V", 0):
+        # MTP drafter: the shared-head / embed / hidden norms, in every pass row (the glue after
+        # pass l reads them from pass l's slot)
+        fields += [("shead", cfg.H), ("enorm", cfg.H), ("hnorm", cfg.H)]
     if getattr(cfg, "KREP", 0):
         # decode replica table, one entry per slot in greedy order (-1 = empty): rep_e = kernel
         # expert, rep_s = slot = holder * KREP + q (replicas.table). Appended last.

@@ -33,3 +33,36 @@ def make(cfg, mesh, axis="d", donate=True, **build_kw):
                                out_specs=(P(axis),) * n_out, check_vma=False),
                  donate_argnums=tuple(range(8 + n_w, n_in)) if donate else ())
     return fn, info
+
+
+def make_draft(cfg, mesh, axis="d", donate=True, **build_kw):
+    """The MTP drafter (cfg.V > 0, L = 3 passes). fn(*operands), every operand [R, ...]: fixed (12:
+    scal, rmeta, qmeta [3, ...], bt, rvec [3, ...], h0, rope_tab [3, ...], smalls, dmeta, embed shard,
+    lm_head shard, eh_proj^T shard), weights (info['w_names'], the MTP layer 3x), the draft layer's
+    caches ONCE (info['c_unique']) -> (tokens [R, M, 128], *caches, *debug). The kernel reads the
+    caches as one view per pass; the writer applies pass 0's rows (the only live KV writes)."""
+    import dataclasses
+    call, info = K.build(cfg, axis_name=axis, draft=True, **build_kw)
+    cfg1 = dataclasses.replace(cfg, L=1, V=0)
+    wkw = {k: build_kw[k] for k in ("nb", "max_pages", "bmax", "interpret", "stack_c") if k in build_kw}
+    writer, winfo = K.build_writer(cfg1, axis_name=axis, **wkw)
+    uniq = list(winfo["c_names"])                    # (kind, 0)
+    pick = [uniq.index((k, 0)) for k, _ in info["c_names"]]
+    info["c_unique"] = uniq
+    n_w, n_u = len(info["w_names"]), len(uniq)
+    debug = build_kw.get("debug", False)
+
+    def body(*ops):
+        ops = [o[0] for o in ops]
+        fixed, w, cu = ops[:12], ops[12:12 + n_w], ops[12 + n_w:]
+        outs = call(*fixed, *w, *[cu[i] for i in pick])
+        tok, nrow, rrow, irec = outs[:4]
+        new = writer(fixed[0][0], fixed[1][0], fixed[3], nrow[0:1], rrow[0:1], irec[0:1], *cu)
+        return tuple(o[None] for o in (tok, *new, *outs[4:]))
+
+    n_in = 12 + n_w + n_u
+    n_out = 1 + n_u + (4 if debug else 0)
+    fn = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P(axis),) * n_in,
+                               out_specs=(P(axis),) * n_out, check_vma=False),
+                 donate_argnums=tuple(range(12 + n_w, n_in)) if donate else ())
+    return fn, info
