@@ -362,6 +362,42 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids
 
+    def _compute_sharded_vocab_proj(
+        self, lm_head: nn.Module, x: torch.Tensor
+    ) -> torch.Tensor:
+        """Project ``x`` onto this TP rank's local vocabulary shard."""
+        logits = lm_head.quant_method.apply(lm_head, x, bias=None)
+        shard_indices = getattr(lm_head, "shard_indices", None)
+        if shard_indices is not None and shard_indices.num_org_vocab_padding > 0:
+            logits[..., -shard_indices.num_org_vocab_padding :] = -float("inf")
+        return logits
+
+    def compute_sharded_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """TP vocab-sharded base draft logits without cross-rank All-Gather."""
+        assert self.lm_head is not None
+        return self._compute_sharded_vocab_proj(
+            self.lm_head, self.model.norm(hidden_states)
+        )
+
+    def sharded_markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        """TP vocab-sharded Markov transition bias without cross-rank All-Gather."""
+        assert self.lm_head is not None
+        w2 = self.model.markov_head.markov_w2
+        lm_shard_size = self.lm_head.weight.shape[0]
+        if w2.weight.shape[0] > lm_shard_size:
+            shard_indices = getattr(self.lm_head, "shard_indices", None)
+            vocab_start = (
+                int(shard_indices.org_vocab_start_index)
+                if shard_indices is not None
+                else get_tensor_model_parallel_rank() * lm_shard_size
+            )
+            w2_shard = w2.weight[vocab_start : vocab_start + lm_shard_size]
+            bias = torch.nn.functional.linear(markov_embed, w2_shard)
+            if shard_indices is not None and shard_indices.num_org_vocab_padding > 0:
+                bias[..., -shard_indices.num_org_vocab_padding :] = -float("inf")
+            return bias
+        return self._compute_sharded_vocab_proj(w2, markov_embed)
+
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.embed(token_ids)
 

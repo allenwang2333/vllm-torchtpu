@@ -23,6 +23,11 @@ from __future__ import annotations
 
 import torch
 from vllm.config import VllmConfig
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
@@ -127,24 +132,67 @@ class DSparkProposer(DFlashProposer):
         padded_num_reqs = hidden.shape[0] // block_size
         valid_hidden = hidden[: padded_num_reqs * block_size]
 
-        # Draft-vocab logits for every slot; the Markov bias is added in
-        # draft space and ids are remapped to target vocab after argmax.
-        logits = self.draft_model.compute_draft_logits(valid_hidden)
-        logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
-
         ids_3d = input_ids[: padded_num_reqs * block_size].view(
             padded_num_reqs, block_size
         )
         prev = ids_3d[:, 0]
         draft_tokens = []
         sample_start = 0 if self.sample_from_anchor else 1
-        for i in range(sample_start, block_size):
-            bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
-            step = self.draft_model.map_draft_to_target(
-                (logits_3d[:, i] + bias).argmax(dim=-1)
+        if (
+            getattr(self.draft_model, "draft_id_to_target_id", None) is None
+            and hasattr(self.draft_model, "compute_sharded_draft_logits")
+            and hasattr(self.draft_model, "sharded_markov_bias")
+        ):
+            # Lossless TP vocab-sharded argmax fast path: keep base logits and
+            # Markov biases sharded on each TP rank ([B, V_local]), reduce to a
+            # local (max_val, global_idx) pair, and All-Gather only [B, 2 * TP].
+            logits = self.draft_model.compute_sharded_draft_logits(valid_hidden)
+            vocab_shard_size = logits.shape[-1]
+            logits_3d = logits.view(padded_num_reqs, block_size, vocab_shard_size)
+            tp_size = get_tensor_model_parallel_world_size()
+            lm_head = getattr(self.draft_model, "lm_head", None)
+            shard_indices = getattr(lm_head, "shard_indices", None)
+            vocab_start = (
+                int(shard_indices.org_vocab_start_index)
+                if shard_indices is not None
+                else get_tensor_model_parallel_rank() * vocab_shard_size
             )
-            draft_tokens.append(step)
-            prev = step
+            for i in range(sample_start, block_size):
+                bias = self.draft_model.sharded_markov_bias(
+                    self.draft_model.markov_embed(prev)
+                )
+                local_max_vals, local_max_indices = (logits_3d[:, i] + bias).max(dim=-1)
+                global_indices = local_max_indices + vocab_start
+                if tp_size > 1:
+                    local_pair = torch.stack(
+                        [local_max_vals.float(), global_indices.float()], dim=-1
+                    )
+                    gathered = tensor_model_parallel_all_gather(
+                        local_pair, dim=-1
+                    ).view(padded_num_reqs, tp_size, 2)
+                    max_rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
+                    step = (
+                        gathered[:, :, 1]
+                        .gather(dim=-1, index=max_rank_idx)
+                        .squeeze(-1)
+                        .to(torch.int64)
+                    )
+                else:
+                    step = global_indices
+                draft_tokens.append(step)
+                prev = step
+        else:
+            # Draft-vocab logits for every slot; the Markov bias is added in
+            # draft space and ids are remapped to target vocab after argmax.
+            logits = self.draft_model.compute_draft_logits(valid_hidden)
+            logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
+            for i in range(sample_start, block_size):
+                bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
+                step = self.draft_model.map_draft_to_target(
+                    (logits_3d[:, i] + bias).argmax(dim=-1)
+                )
+                draft_tokens.append(step)
+                prev = step
         draft_tokens_chunk = torch.stack(draft_tokens, dim=1)
 
         return draft_tokens_chunk, hidden
