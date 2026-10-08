@@ -381,8 +381,8 @@ class TestCommonMHCFull:
         assert p128.shape == (128, mult, 1)
         assert len(captured_kernel_calls) == 1
 
-        # Case B: tokens = 64, 96, 256, 1024, fn is FP32
-        for t_pallas in (64, 96, 256, 1024):
+        # Case B: tokens = 64, 96, 256, 384, 512, 576, 1024, fn is FP32
+        for t_pallas in (64, 96, 256, 384, 512, 576, 1024):
             fp, pp, _, _, _ = mhc.delayed_post_pre_flat_jax(
                 jnp.ones((t_pallas, dim), dtype=jnp.bfloat16),
                 jnp.ones((t_pallas, mult * dim), dtype=jnp.bfloat16),
@@ -396,10 +396,10 @@ class TestCommonMHCFull:
             )
             assert fp.shape == (t_pallas, mult * dim)
             assert pp.shape == (t_pallas, mult, 1)
-        assert len(captured_kernel_calls) == 5
+        assert len(captured_kernel_calls) == 8
 
-        # Case C: tokens = 16, 24, 144, 192, 288, 384, 512 take XLA path
-        for t_case in (16, 24, 144, 192, 288, 384, 512):
+        # Case C: tokens = 16, 24, 144, 192, 288, 520 take XLA path
+        for t_case in (16, 24, 144, 192, 288, 520):
             ft, pt, _, _, _ = mhc.delayed_post_pre_flat_jax(
                 jnp.ones((t_case, dim), dtype=jnp.bfloat16),
                 jnp.ones((t_case, mult * dim), dtype=jnp.bfloat16),
@@ -413,7 +413,7 @@ class TestCommonMHCFull:
             )
             assert ft.shape == (t_case, mult * dim)
             assert pt.shape == (t_case, mult, 1)
-        assert len(captured_kernel_calls) == 5
+        assert len(captured_kernel_calls) == 8
 
     def test_initialize_delayed_mhc_and_fakes(self, monkeypatch):
         monkeypatch.setattr(mhc, "_pre_op", None)

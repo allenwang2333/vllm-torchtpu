@@ -1,8 +1,9 @@
 """Checks for the DeepSeek V4.1 delayed mHC shared by the v1 and v2 paths.
 
 The oracle is vLLM's ``mhc_pre_delayed_torch``. ``delayed_pre_flat_jax``
-takes the XLA path below 64 tokens (or off a multiple of 64) and the Pallas
-pass otherwise; the Pallas cases need TPU hardware.
+and ``delayed_post_pre_flat_jax`` take the Pallas pass for the token counts
+`_pallas_tile` accepts and the XLA path otherwise; the Pallas cases need TPU
+hardware.
 """
 
 import jax
@@ -101,10 +102,19 @@ def _check_post_pre(tokens, dim, packed):
         _jax(previous_pre),
         *CONSTANTS,
     )
+    #    when both take the same path. From `_POST_PRE_PALLAS_MIN_TOKENS` the
+    #    fused pass may take Pallas while the pre-only pass stays on XLA; the
+    #    two differ only in accumulation order.
     flat_new, post, comb, value, new_pre = got
     np.testing.assert_array_equal(_np(flat_new), _np(step_flat))
+    same_path = mhc._pallas_tile(tokens, MIXES) == mhc._pallas_tile(
+        tokens, MIXES, fused_post=True
+    )
     for g, s in zip((post, comb, value, new_pre), step_pre):
-        np.testing.assert_array_equal(_np(g), _np(s))
+        if same_path:
+            np.testing.assert_array_equal(_np(g), _np(s))
+        else:
+            np.testing.assert_allclose(_np(g), _np(s), rtol=GATE_RTOL, atol=GATE_ATOL)
 
     # 2. Close agreement with vLLM PyTorch reference
     want_res = mhc_post_torch(x, residual, post_mix, comb_mix)
@@ -141,12 +151,46 @@ def test_torch_and_jax_packing_agree():
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize(
-    "tokens", [1, 8, 16, 24, 32, 48, 63, 100, 144, 192, 288, 384, 512]
+    "tokens", [1, 8, 16, 24, 32, 48, 63, 100, 144, 192, 200, 288, 520]
 )
 def test_xla_path_matches_torch_reference(tokens, packed):
-    """Token counts the Pallas pass does not take."""
+    """Token counts neither Pallas pass takes."""
+    assert mhc._pallas_tile(tokens, MIXES) is None
+    assert mhc._pallas_tile(tokens, MIXES, fused_post=True) is None
     _check(tokens, 256, packed)
     _check_post_pre(tokens, 256, packed)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "tokens,pre_tile,post_tile",
+    [
+        (63, None, None),
+        (64, 64, 64),
+        (96, 96, 96),
+        (100, None, None),
+        (128, 128, 128),
+        (144, None, None),
+        (192, None, None),
+        (256, 128, 128),
+        (288, None, None),
+        (320, None, None),
+        (384, None, 96),
+        (512, None, 64),
+        (520, None, None),
+        (576, None, 96),
+        (640, None, 64),
+        (768, None, 96),
+        (960, None, 96),
+        (1024, 64, 64),
+        (1056, None, 96),
+        (2048, 64, 64),
+    ],
+)
+def test_pallas_tile(tokens, pre_tile, post_tile):
+    assert mhc._pallas_tile(tokens, MIXES) == pre_tile
+    assert mhc._pallas_tile(tokens, MIXES, fused_post=True) == post_tile
+    assert mhc._pallas_tile(tokens, 3 * 128, fused_post=True) is None
 
 
 @pytest.mark.parametrize("packed", [False, True])
@@ -156,8 +200,14 @@ def test_xla_path_matches_torch_reference(tokens, packed):
         (64, 256),
         (96, 256),
         (256, 256),
+        (384, 256),
+        (512, 256),
+        (576, 256),
+        (960, 256),
         (1024, 256),
         (128, 5120),
+        (384, 5120),
+        (768, 5120),
     ],
 )
 def test_pallas_path_matches_torch_reference(tokens, dim, packed):

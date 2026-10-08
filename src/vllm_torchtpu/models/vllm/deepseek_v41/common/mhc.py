@@ -266,6 +266,40 @@ def _delayed_pre_flat_small(
     return post, comb, value, new_pre
 
 
+# Smallest verify-sized batch (beyond the fixed sizes below) for which the
+# fused post+pre Pallas pass beats the XLA path. Job 1225 (tpu7x, width 20480,
+# packed weight), XLA -> Pallas tile 96, in µs: 288: 41.3 -> 42.9,
+# 384: 65.7 -> 56.6, 576: 98.0 -> 71.0, 768: 118.1 -> 88.0. The pre-only pass
+# was slower than XLA at every size from 192 to 960, so it gets no new sizes.
+_POST_PRE_PALLAS_MIN_TOKENS = 384
+
+
+def _pallas_tile(tokens: int, mixes: int, fused_post: bool = False) -> int | None:
+    """Row tile for the flat Pallas passes, or None for the XLA path.
+
+    Fixed sizes: 64, 96 and 128 (tile = tokens), 256 (tile 128), and
+    ``>= 1024`` multiples of 64 (tile 64). With ``fused_post``, DSpark verify
+    buckets ``>= _POST_PRE_PALLAS_MIN_TOKENS`` that are multiples of 96 or 64
+    (``C * (K + 1)``: 384, 576, 768, ...) also take Pallas. On the XLA path
+    they pay a ``T(4,128)`` relayout plus extra HBM passes over ``flat``. Tile
+    128 is not used for them: the fused kernel's VMEM overflows at T=384/768.
+    The kernels are row-independent, so the tile only affects speed.
+    """
+    if 3 * mixes > 128:
+        return None
+    if tokens in (64, 96, 128):
+        return tokens
+    if tokens == 256:
+        return 128
+    if tokens >= 1024 and tokens % 64 == 0:
+        return 64
+    if fused_post and tokens >= _POST_PRE_PALLAS_MIN_TOKENS:
+        for tile in (96, 64):
+            if tokens % tile == 0:
+                return tile
+    return None
+
+
 def delayed_pre_flat_jax(
     flat: jax.Array,
     fn: jax.Array,
@@ -280,20 +314,18 @@ def delayed_pre_flat_jax(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """`delayed_pre_jax` with ``x = residual = flat [T, M*D]``.
 
-    Prefill-sized batches use one Pallas pass; viewing the flat residual as
-    ``[T, M, D]`` costs XLA a relayout copy plus an FP32 copy for the
-    projection. Small (decode) batches keep the XLA path.
+    Batches `_pallas_tile` accepts use one Pallas pass; viewing the flat
+    residual as ``[T, M, D]`` costs XLA a relayout copy plus an FP32 copy for
+    the projection. Other batches keep the XLA path.
     """
     tokens, width = flat.shape
     mult = previous_pre.shape[1]
     dim = width // mult
     constants = (rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats)
     mixes = mult * (mult + 2)
-    if 3 * mixes > 128 or (
-        tokens not in (64, 96, 128, 256) and (tokens < 1024 or tokens % 64 != 0)
-    ):
+    tile = _pallas_tile(tokens, mixes)
+    if tile is None:
         return _delayed_pre_flat_small(flat, fn, scale, base, previous_pre, *constants)
-    tile = tokens if tokens <= 128 else (128 if tokens == 256 else 64)
     weight = fn if fn.dtype == jnp.bfloat16 else _pack_mix_weight(fn)
     mixes, square, value = _flat_pre_sums(flat, weight, previous_pre, mixes, tile)
     new_pre, post, comb = _pre_gates(mixes, square, mult, dim, scale, base, *constants)
@@ -467,9 +499,8 @@ def delayed_post_pre_flat_jax(
     dim = width // mult
     constants = (rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats)
     mixes = mult * (mult + 2)
-    if 3 * mixes > 128 or (
-        tokens not in (64, 96, 128, 256) and (tokens < 1024 or tokens % 64 != 0)
-    ):
+    tile = _pallas_tile(tokens, mixes, fused_post=True)
+    if tile is None:
         flat_new, value = jax.lax.optimization_barrier(
             _post_and_collapse_jax(
                 x,
@@ -489,7 +520,6 @@ def delayed_post_pre_flat_jax(
             *constants,
         )
         return flat_new, post, comb, value, new_pre
-    tile = tokens if tokens <= 128 else (128 if tokens == 256 else 64)
     weight = fn if fn.dtype == jnp.bfloat16 else _pack_mix_weight(fn)
     flat_new, mixes_out, square, value = _flat_post_pre_sums(
         x.reshape(tokens, dim).astype(flat.dtype),
