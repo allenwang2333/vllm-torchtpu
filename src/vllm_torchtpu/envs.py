@@ -103,6 +103,7 @@ if TYPE_CHECKING:
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
     GLM5_MKD_STACK_C: str = ""
+    GLM5_MKD_STACK_GROUP_BYTES: int = 0
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -421,6 +422,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # row through the page table. "" (default) = per-layer caches; "1" =
     # stack nope + rope + idx; or a comma list of kinds ("nope,rope", "idx").
     "GLM5_MKD_STACK_C": lambda: os.getenv("GLM5_MKD_STACK_C", "").strip(),
+    # GLM5_MKD_STACK_C: the largest stacked tensor (bytes). A kind whose stack
+    # is larger is split into the fewest equal groups of layers that fit. 0 =
+    # the SparseCore per-tensor limit (16 GiB), which the DCP ops' SC kernels
+    # cannot exceed.
+    "GLM5_MKD_STACK_GROUP_BYTES": env_int("GLM5_MKD_STACK_GROUP_BYTES", 0),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),
     # TPU accelerator type (e.g., "v5litepod-16", "v4-8")

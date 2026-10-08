@@ -56,7 +56,10 @@ from vllm_torchtpu.block_major_pool import (
     unified_block_major_enabled,
 )
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
-from vllm_torchtpu.kernels.mla.kv_cache_utils import glm5_stacked_kv_kinds
+from vllm_torchtpu.kernels.mla.kv_cache_utils import (
+    glm5_stack_group_sizes,
+    glm5_stacked_kv_kinds,
+)
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id,
     can_share_attention_cache,
@@ -583,7 +586,11 @@ class KVCacheManager:
     ) -> dict[str, object]:
         """GLM5_MKD_STACK_C: allocate the target model's sparse-MLA (nope, rope)
         and/or indexer K caches as one tensor per kind,
-        `[n_layers_of_kind, num_blocks, *per-layer page shape]`.
+        `[n_layers_of_kind, num_blocks, *per-layer page shape]` -- or, when that
+        tensor would exceed the SparseCore per-tensor limit (16 GiB; the DCP ops
+        hand the merged stack to SC kernels, which cannot address more), the
+        fewest equal groups of consecutive layers that fit (`kv_stack` then
+        indexes the layer's group; nope and rope share nope's grouping).
 
         Byte-identical to the per-layer allocations it replaces. Only the target
         model's layers (layer index < num_hidden_layers) are stacked, rows in
@@ -592,8 +599,10 @@ class KVCacheManager:
         (nope, rope) pair or the shared indexer tensor), sets
         `module.kv_stack = (row, num_blocks)` -- which the DCP ops turn into a
         page offset inside their JAX functions, so no per-layer view ever
-        enters a graph -- and records `runner.glm5_kv_stack = {kind: (tensor,
-        [layer names by row])}` for the megakernel.
+        enters a graph -- and records `runner.glm5_kv_stack_groups = {kind:
+        [(tensor, [layer names by row]), ...]}` plus, for each kind that is one
+        tensor, `runner.glm5_kv_stack = {kind: (tensor, [names])}` for the
+        megakernel.
         """
         from vllm.v1.worker.utils import extract_layer_index
 
@@ -655,8 +664,21 @@ class KVCacheManager:
 
         dev = self.runner.device
         bound: dict[str, object] = {}
-        record: dict[str, tuple[torch.Tensor, list[str]]] = {}
+        groups: dict[str, list[tuple[torch.Tensor, list[str]]]] = {}
         region_bytes: dict[tuple[int, int], int] = {}
+        max_group_bytes = envs.GLM5_MKD_STACK_GROUP_BYTES or None
+
+        def split(names: list[str], per_layer_bytes: int) -> list[list[str]]:
+            # The DCP ops hand a merged stack to SparseCore kernels, which cannot
+            # address a tensor over 16 GiB: a larger stack is split into the
+            # fewest equal groups of consecutive layers that fit.
+            sizes = glm5_stack_group_sizes(len(names), per_layer_bytes, max_group_bytes)
+            out, start = [], 0
+            for size in sizes:
+                out.append(names[start : start + size])
+                start += size
+            return out
+
         if sparse:
             spec0 = per_layer_spec(sparse[0])
             specs = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
@@ -676,26 +698,34 @@ class KVCacheManager:
                 region_bytes[layer_region[name]] = (
                     region_bytes.get(layer_region[name], 0) + per_layer
                 )
-            n = len(sparse)
-            nope, rope = (
-                # Directly on device: a host staging copy of a whole stack
-                # would be n_layers x the per-layer allocation's.
-                torch.zeros((n, *spec.shape), dtype=spec.torch_dtype, device=dev)
-                for spec in specs
-            )
-            for row, name in enumerate(sparse):
-                module = fwd[name]
-                mla_dispatch.admit_layer(self.runner, module, specs, spec0.block_size)
-                if getattr(module, "allow_masked_dense", False) is True:
-                    raise ValueError(
-                        "GLM5_MKD_STACK_C: masked-dense MLA routing is not wired "
-                        f"for stacked caches ({name})"
+            # nope and rope share one grouping (the op takes the pair with one
+            # row), sized by the larger of the two: nope.
+            nope_bytes = math.prod(specs[0].shape) * specs[0].torch_dtype.itemsize
+            groups["nope"], groups["rope"] = [], []
+            for names in split(sparse, nope_bytes):
+                nope, rope = (
+                    # Directly on device: a host staging copy of a whole stack
+                    # would be n_layers x the per-layer allocation's.
+                    torch.zeros(
+                        (len(names), *spec.shape), dtype=spec.torch_dtype, device=dev
                     )
-                module.mla_kv_spec = specs
-                module.kv_stack = (row, num_blocks)
-                bound[name] = (nope, rope)
-            record["nope"] = (nope, sparse)
-            record["rope"] = (rope, sparse)
+                    for spec in specs
+                )
+                for row, name in enumerate(names):
+                    module = fwd[name]
+                    mla_dispatch.admit_layer(
+                        self.runner, module, specs, spec0.block_size
+                    )
+                    if getattr(module, "allow_masked_dense", False) is True:
+                        raise ValueError(
+                            "GLM5_MKD_STACK_C: masked-dense MLA routing is not wired "
+                            f"for stacked caches ({name})"
+                        )
+                    module.mla_kv_spec = specs
+                    module.kv_stack = (row, num_blocks)
+                    bound[name] = (nope, rope)
+                groups["nope"].append((nope, names))
+                groups["rope"].append((rope, names))
         if indexer:
             spec0 = per_layer_spec(indexer[0])
             shape = tuple(
@@ -720,11 +750,13 @@ class KVCacheManager:
                 region_bytes[layer_region[name]] = (
                     region_bytes.get(layer_region[name], 0) + per_layer
                 )
-            idx = torch.zeros((len(indexer), *shape), dtype=spec0.dtype, device=dev)
-            for row, name in enumerate(indexer):
-                fwd[name].kv_stack = (row, num_blocks)
-                bound[name] = idx
-            record["idx"] = (idx, indexer)
+            groups["idx"] = []
+            for names in split(indexer, per_layer):
+                idx = torch.zeros((len(names), *shape), dtype=spec0.dtype, device=dev)
+                for row, name in enumerate(names):
+                    fwd[name].kv_stack = (row, num_blocks)
+                    bound[name] = idx
+                groups["idx"].append((idx, names))
         # The per-layer allocation's budget (`allocate_attention_region`): what
         # each region holds must fit the block stride the pool was sized with.
         for region, nbytes in region_bytes.items():
@@ -733,14 +765,17 @@ class KVCacheManager:
                     f"GLM5_MKD_STACK_C: region {region} needs {nbytes} B, it holds "
                     f"{num_blocks * region[1]}"
                 )
-        total = sum(t.nbytes for t, _ in record.values())
+        total = sum(t.nbytes for g in groups.values() for t, _ in g)
         assert total == sum(region_bytes.values()), (total, region_bytes)
-        self.runner.glm5_kv_stack = record
+        # Every kind as its groups; and, for each kind that is ONE tensor, the
+        # {kind: (tensor, [layer names by row])} view the megakernel binds.
+        self.runner.glm5_kv_stack_groups = groups
+        self.runner.glm5_kv_stack = {k: g[0] for k, g in groups.items() if len(g) == 1}
         logger.info(
             "GLM5_MKD_STACK_C: stacked KV %s, %.3f GiB/rank (== the per-layer "
             "total), %d blocks; per-layer: %d sparse MLA / %d indexer layers "
             "left unstacked (drafter)",
-            {k: tuple(t.shape) for k, (t, _) in record.items()},
+            {k: [tuple(t.shape) for t, _ in g] for k, g in groups.items()},
             total / 2**30,
             num_blocks,
             sum(
@@ -1786,6 +1821,7 @@ class KVCacheManager:
         # page offset (no per-layer view ever enters a graph).
         stacked_kv: dict[str, object] = {}
         self.runner.glm5_kv_stack = {}
+        self.runner.glm5_kv_stack_groups = {}
         stack_kinds = (
             frozenset() if (_is_ds_v4 or use_block_major) else glm5_stacked_kv_kinds()
         )

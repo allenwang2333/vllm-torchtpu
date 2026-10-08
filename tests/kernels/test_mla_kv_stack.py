@@ -30,9 +30,11 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 )
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     OOB_PAGE,
+    SPARSECORE_MAX_TENSOR_BYTES,
     KVCacheLayout,
     KVCacheType,
     SparseMLAKVCacheSpec,
+    glm5_stack_group_sizes,
     glm5_stacked_kv_kinds,
     merge_kv_stack,
     split_kv_stack,
@@ -271,3 +273,29 @@ class StackKindsEnvTest(parameterized.TestCase):
             glm5_stacked_kv_kinds("nope")
         with self.assertRaisesRegex(ValueError, "unknown"):
             glm5_stacked_kv_kinds("kv")
+
+
+class StackGroupSizesTest(parameterized.TestCase):
+    def test_glm52_full_depth_nope_splits_in_two(self):
+        # 78 layers x 2085 pages x 128 KiB = 20.8 GB > the 16 GiB SC limit.
+        per_layer = 2085 * 256 * 128 * 4
+        self.assertEqual(glm5_stack_group_sizes(78, per_layer), [39, 39])
+        # rope (32 KiB pages) and the 21 indexer layers fit in one tensor.
+        self.assertEqual(glm5_stack_group_sizes(78, 2085 * 64 * 128 * 4), [78])
+        self.assertEqual(glm5_stack_group_sizes(21, 2085 * 33 * 4 * 256), [21])
+
+    @parameterized.parameters((78, 7, 100), (10, 3, 9), (5, 1, 1), (21, 5, 49))
+    def test_fewest_balanced_groups_under_the_limit(self, n, per, limit):
+        sizes = glm5_stack_group_sizes(n, per, limit)
+        self.assertEqual(sum(sizes), n)
+        self.assertLessEqual(max(sizes) * per, limit)
+        self.assertLessEqual(max(sizes) - min(sizes), 1)
+        if len(sizes) > 1:  # one fewer group would not fit
+            self.assertGreater(-(-n // (len(sizes) - 1)) * per, limit)
+
+    def test_default_limit_and_oversized_layer(self):
+        self.assertEqual(
+            glm5_stack_group_sizes(3, SPARSECORE_MAX_TENSOR_BYTES // 3), [3]
+        )
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            glm5_stack_group_sizes(2, 11, 10)

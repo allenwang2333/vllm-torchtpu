@@ -2115,12 +2115,13 @@ class TPUModelRunner(GPUModelRunner):
 
     def _dense_kv_copy_stacked_pools(self) -> list[torch.Tensor]:
         """GLM5_MKD_STACK_C stacked caches: one manager block per row each."""
-        stacks = getattr(self, "glm5_kv_stack", None) or {}
+        groups = getattr(self, "glm5_kv_stack_groups", None) or {}
         num_blocks = self.kv_cache_config.num_blocks
         pools = []
-        for tensor, _ in stacks.values():
-            assert tensor.shape[1] == num_blocks, (tensor.shape, num_blocks)
-            pools.append(tensor)
+        for group in groups.values():
+            for tensor, _ in group:
+                assert tensor.shape[1] == num_blocks, (tensor.shape, num_blocks)
+                pools.append(tensor)
         return pools
 
     def _apply_dense_kv_cache_block_copies(self, copies) -> None:
