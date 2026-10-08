@@ -200,6 +200,50 @@ def _get_segment_info(num_draft_tokens: torch.Tensor, total_tokens: int):
     return segment_ids, group_indices
 
 
+def _valid_slot_mask(
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+) -> torch.Tensor:
+    """``[T]`` mask of declared draft slots: ``group_index < num_draft[segment]``.
+
+    Equals ``any(segment_ids[None] == arange(B)[:, None] & (group_indices <
+    num_draft_tokens[:, None]), 0)`` without the ``[B, T]`` intermediate.
+    Padding segment sentinels (outside ``[0, B)``) are never valid.
+    """
+    batch_size = num_draft_tokens.shape[0]
+    if batch_size == 0:
+        return torch.zeros_like(segment_ids, dtype=torch.bool)
+    in_batch = (segment_ids >= 0) & (segment_ids < batch_size)
+    safe_segment_ids = segment_ids.clamp(min=0, max=batch_size - 1)
+    limits = num_draft_tokens.to(group_indices.dtype)[safe_segment_ids]
+    return in_batch & (group_indices < limits)
+
+
+def _place_bonus_tokens(
+    selected_tokens: torch.Tensor,
+    accepted_count: torch.Tensor,
+    should_get_bonus: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Write ``bonus_token_ids[b]`` at column ``accepted_count[b]`` of the rows
+    in ``should_get_bonus``; other rows are unchanged.
+
+    One ``[B, K + 1]`` select instead of a gather plus a 2D scatter.
+    """
+    columns = torch.arange(
+        selected_tokens.shape[1],
+        dtype=accepted_count.dtype,
+        device=accepted_count.device,
+    )
+    place = should_get_bonus.unsqueeze(1) & (
+        columns.unsqueeze(0) == accepted_count.unsqueeze(1)
+    )
+    return torch.where(
+        place, bonus_token_ids.to(torch.int32).unsqueeze(1), selected_tokens
+    )
+
+
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def _greedy_rejection_sample_with_segment(
     draft_token_ids: torch.Tensor,
@@ -231,10 +275,7 @@ def _greedy_rejection_sample_with_segment(
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
     match_mask = segment_ids.unsqueeze(0) == batch_indices
     # Only declared draft slots may participate in rejection sampling.
-    draft_limits = num_draft_tokens.to(group_indices.dtype).unsqueeze(1)
-    valid_slot_mask = torch.any(
-        match_mask & (group_indices.unsqueeze(0) < draft_limits), dim=0
-    )
+    valid_slot_mask = _valid_slot_mask(segment_ids, group_indices, num_draft_tokens)
 
     # Large value for positions with no mismatches
     # Create an array where mismatched positions hold their `group_index`
@@ -332,15 +373,12 @@ def _greedy_rejection_sample_with_segment(
         first_mismatch_idx_per_segment,
     ).to(torch.int64)
 
-    batch_range = torch.arange(batch_size, dtype=torch.int64, device=device)
-    bonus_token_at_accepted_count = torch.where(
+    return _place_bonus_tokens(
+        selected_tokens[:batch_size],
+        accepted_count,
         should_get_bonus,
-        bonus_token_ids.to(torch.int32),
-        selected_tokens[batch_range, accepted_count],
+        bonus_token_ids,
     )
-    selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
-
-    return selected_tokens[:batch_size]
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -396,9 +434,11 @@ def _random_rejection_sample_with_segment(
     # On rejection, resample from the residual max(0, p - q). With q a delta at
     # x, subtracting q only touches entry x, so the residual is just p with the
     # drafted token zeroed out.
-    draft_token_mask = torch.nn.functional.one_hot(
-        safe_draft_token_ids, num_classes=vocab_size
-    ).to(torch.bool)
+    # Broadcast compare instead of `one_hot(...).to(bool)`, which builds an
+    # int64 [T, V] tensor before the cast.
+    draft_token_mask = safe_draft_token_ids.unsqueeze(-1) == torch.arange(
+        vocab_size, device=device, dtype=safe_draft_token_ids.dtype
+    )
     # Placeholder drafts have no q mass to subtract, so their recovery
     # distribution remains the full target distribution. In particular, do
     # not let the safe clamp above accidentally mask vocabulary token 0.
@@ -432,10 +472,7 @@ def _random_rejection_sample_with_segment(
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
     match_mask = segment_ids.unsqueeze(0) == batch_indices
     # Only declared draft slots may participate in rejection sampling.
-    draft_limits = num_draft_tokens.to(group_indices.dtype).unsqueeze(1)
-    valid_slot_mask = torch.any(
-        match_mask & (group_indices.unsqueeze(0) < draft_limits), dim=0
-    )
+    valid_slot_mask = _valid_slot_mask(segment_ids, group_indices, num_draft_tokens)
     large_value = total_tokens
 
     if total_tokens > 0:
@@ -514,12 +551,9 @@ def _random_rejection_sample_with_segment(
         first_rejection_idx_per_segment,
     ).to(torch.int64)
 
-    batch_range = torch.arange(batch_size, dtype=torch.int64, device=device)
-    bonus_token_at_accepted_count = torch.where(
+    return _place_bonus_tokens(
+        selected_tokens[:batch_size],
+        accepted_count,
         should_get_bonus,
-        bonus_token_ids.to(torch.int32),
-        selected_tokens[batch_range, accepted_count],
+        bonus_token_ids,
     )
-    selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
-
-    return selected_tokens[:batch_size]
