@@ -831,3 +831,29 @@ def test_dspark_load_weights(monkeypatch: pytest.MonkeyPatch):
     assert "model.confidence_head.proj.weight" in loaded2
     assert "model.layers.0.ffn.experts.w13_weight_scale_inv" in loaded2
     assert draft_lm2.model.confidence_head is not None
+
+
+def test_dspark_mhc_broadcast_and_post_and_collapse(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.kernels.mhc.torch import mhc_post_torch
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.common.mhc import collapse
+
+    _patch_dspark_env(monkeypatch)
+    vllm_cfg = _make_dspark_vllm_config()
+    draft_lm = v2_dspark.DSparkDeepseekV41ForCausalLM(vllm_config=vllm_cfg)
+    model = draft_lm.model
+    model.embed_tokens = nn.Embedding(32, 16)
+
+    torch.manual_seed(7)
+    for mult in (2, 4):
+        tokens, dim = 6, 16
+        x = torch.randn(tokens, dim, dtype=torch.bfloat16)
+        residual = torch.randn(tokens, mult, dim, dtype=torch.bfloat16)
+        post_mix = torch.rand(tokens, mult, 1, dtype=torch.float32)
+        comb_mix = torch.rand(tokens, mult, mult, dtype=torch.float32)
+        pre_mix = torch.rand(tokens, mult, dtype=torch.float32)
+        ref = collapse(mhc_post_torch(x, residual, post_mix, comb_mix), pre_mix)
+        got = v2_dspark._post_and_collapse(x, residual, post_mix, comb_mix, pre_mix)
+        assert torch.equal(got, ref)
