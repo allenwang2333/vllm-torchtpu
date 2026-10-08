@@ -392,8 +392,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         "nown_s": pltpu.SMEM((TMAX,), I32),
         "misc_sem": pltpu.SemaphoreType.DMA(()),
         # attention
-        "g_nope": pltpu.VMEM((KT, 128), U32), "g_rope": pltpu.VMEM((KT, 128), U32),
-        "g_sem": pltpu.SemaphoreType.DMA((2,)),
+        "g_nope": pltpu.VMEM((2, KT, 128), U32), "g_rope": pltpu.VMEM((2, KT, 128), U32),
+        "g_sem": pltpu.SemaphoreType.DMA((2, 2)),
         "kvb": pltpu.VMEM((KT, KL), BF16),
         "s_all": pltpu.VMEM((NC_, NH, 128), F32),
         "osend": pltpu.VMEM((R, TMAX, OW), U32), "orecv": pltpu.VMEM((R, TMAX, OW), U32),
@@ -1157,49 +1157,71 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             lane_h = lax.broadcasted_iota(I32, (NH, 128), 1)
             NEG = jnp.finfo(F32).min
 
-            def row(t_, c):
-                pa = Phases(tiles.trace)
-                pa.mark("A_gather")
-                n = jnp.where(rmeta[t_, 0] > 0, scr["nown_s"][t_], 0)
-                req = rmeta[t_, 2]
+            def n_of(t_):
+                return jnp.where(jnp.logical_and(t_ < T, rmeta[jnp.minimum(t_, TMAX - 1), 0] > 0),
+                                 scr["nown_s"][jnp.minimum(t_, TMAX - 1)], 0)
+
+            def issue(t_, b):
+                """Start row t_'s gather into buffer b (owned winners: HBM rows, or this step's own
+                new rows from the VMEM staging)."""
+                t_c = jnp.minimum(t_, TMAX - 1)
+                n = n_of(t_)
+                req = rmeta[t_c, 2]
                 t0r, nqr, p0r, noldr = req_new(req)
 
-                def gather(rn, rr):
+                def go(rn, rr):
                     def gbody(k, c2):
-                        lo = scr["own_s"][t_ * KR_ + (k >> 7), k & 127]
+                        lo = scr["own_s"][t_c * KR_ + (k >> 7), k & 127]
                         new = lo >= noldr
 
                         @pl.when(jnp.logical_not(new))
                         def _():
                             page = bt[req, lo >> lg_pg]
                             sl = lo & (pg - 1)
-                            pltpu.make_async_copy(rn.at[page, pl.ds(sl, 1)],
-                                                  scr["g_nope"].at[pl.ds(k, 1)], scr["g_sem"].at[0]).start()
+                            pltpu.make_async_copy(rn.at[page, pl.ds(sl, 1)], scr["g_nope"].at[b, pl.ds(k, 1)],
+                                                  scr["g_sem"].at[b, 0]).start()
                             pltpu.make_async_copy(rr.at[page, pl.ds(sl >> 2, 1)],
-                                                  scr["g_rope"].at[pl.ds(k, 1)], scr["g_sem"].at[1]).start()
+                                                  scr["g_rope"].at[b, pl.ds(k, 1)], scr["g_sem"].at[b, 1]).start()
 
                         @pl.when(new)
                         def _():
                             g = (lo // ILV) * G_ + me * ILV + lo % ILV
                             t2 = jnp.clip(t0r + (g - p0r), 0, TMAX - 1)
-                            pltpu.make_async_copy(scr["wrow"].at[pl.ds(t2, 1)],
-                                                  scr["g_nope"].at[pl.ds(k, 1)], scr["g_sem"].at[0]).start()
-                            pltpu.make_async_copy(scr["rwrow"].at[pl.ds(t2, 1)],
-                                                  scr["g_rope"].at[pl.ds(k, 1)], scr["g_sem"].at[1]).start()
+                            pltpu.make_async_copy(scr["wrow"].at[pl.ds(t2, 1)], scr["g_nope"].at[b, pl.ds(k, 1)],
+                                                  scr["g_sem"].at[b, 0]).start()
+                            pltpu.make_async_copy(scr["rwrow"].at[pl.ds(t2, 1)], scr["g_rope"].at[b, pl.ds(k, 1)],
+                                                  scr["g_sem"].at[b, 1]).start()
                         return c2
                     lax.fori_loop(0, n, gbody, 0)
-
-                    def wbody(k, c2):                    # one wait per issued row (same bytes each)
-                        pltpu.make_async_copy(rn.at[0, pl.ds(0, 1)], scr["g_nope"].at[pl.ds(0, 1)],
-                                              scr["g_sem"].at[0]).wait()
-                        pltpu.make_async_copy(rr.at[0, pl.ds(0, 1)], scr["g_rope"].at[pl.ds(0, 1)],
-                                              scr["g_sem"].at[1]).wait()
-                        return c2
-                    lax.fori_loop(0, n, wbody, 0)
                 if "gather" not in skip:
-                    csel(("nope", "rope"), l, gather)
+                    csel(("nope", "rope"), l, go)
 
-                pa.mark("A_qasm")
+            def wait(t_, b):
+                n = n_of(t_)
+                ref0 = C["nope"][next(iter(C["nope"]))] if "nope" not in SC else CS["nope"].at[0]
+                rref0 = C["rope"][next(iter(C["rope"]))] if "rope" not in SC else CS["rope"].at[0]
+
+                def wbody(k, c2):                        # one wait per issued row (same bytes each)
+                    pltpu.make_async_copy(ref0.at[0, pl.ds(0, 1)], scr["g_nope"].at[b, pl.ds(0, 1)],
+                                          scr["g_sem"].at[b, 0]).wait()
+                    pltpu.make_async_copy(rref0.at[0, pl.ds(0, 1)], scr["g_rope"].at[b, pl.ds(0, 1)],
+                                          scr["g_sem"].at[b, 1]).wait()
+                    return c2
+                if "gather" not in skip:
+                    lax.fori_loop(0, n, wbody, 0)
+
+            def row(t_, c):
+                pa = Phases(tiles.trace)
+                pa.mark("A_gather")
+                b = t_ % 2
+                n = n_of(t_)
+                wait(t_, b)
+
+                @pl.when(t_ + 1 < T)
+                def _():
+                    issue(t_ + 1, 1 - b)                 # flies under this row's compute
+                gn, gr = scr["g_nope"].at[b], scr["g_rope"].at[b]
+
                 # q of all NH heads of row t_: R sources x HR heads, unpacked from u32 pairs
                 heads = []
                 for s_ in range(R):
@@ -1218,14 +1240,14 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
                 def s_body(ci, c2):
                     r0 = pl.multiple_of(ci * 128, 128)
-                    w = lax.bitcast_convert_type(scr["g_nope"][pl.ds(r0, 128), :], I32)
+                    w = lax.bitcast_convert_type(gn[pl.ds(r0, 128), :], I32)
                     s = jnp.zeros((NH, 128), F32)
                     for b_ in range(4):
                         band = fp8_decode_hw(shr(w, 8 * b_) & 0xFF)
                         scr["kvb"][pl.ds(r0, 128), b_ * 128:(b_ + 1) * 128] = band
                         s = s + lax.dot_general(qn[:, b_ * 128:(b_ + 1) * 128], band, NT,
                                                 preferred_element_type=F32)
-                    rw_ = lax.bitcast_convert_type(scr["g_rope"][pl.ds(r0, 128), :], I32)
+                    rw_ = lax.bitcast_convert_type(gr[pl.ds(r0, 128), :], I32)
                     B0 = fp8_decode_hw(rw_ & 0xFF)
                     B1 = fp8_decode_hw(shr(rw_, 8) & 0xFF)
                     iv = scr["own_v"][t_, pl.ds(ci, 1), :]                   # [1, 128] local idx
@@ -1274,6 +1296,9 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                         [pack2(od[:, :OH], od[:, OH:]), lax.bitcast_convert_type(lrow, U32)], axis=1)
                 pa.end()
                 return c
+            @pl.when(T > 0)
+            def _():
+                issue(jnp.int32(0), 0)
             lax.fori_loop(0, T, row, 0)
 
         def merge():
