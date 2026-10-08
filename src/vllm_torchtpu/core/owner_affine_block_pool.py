@@ -21,10 +21,13 @@ A request gets its owner on its first successful allocation and keeps it until
 it is freed or preempted. Its blocks in owner-sharded groups come from its
 owner's region, and its blocks in replicated groups from the replicated region.
 
-This module only changes engine-core bookkeeping. Worker-side capacity, block
-translation and owner-parallel attention are separate changes. With data
-parallelism, each replica has its own scheduler and pool, and owners are the
-ranks of that replica's TP group.
+The engine core sizes the KV cache per rank: ``M`` blocks. Workers keep that
+config and store ``M = R + P`` blocks, while the scheduler allocates from
+``N = R + tp * (M - R)`` ids (``globalize_kv_cache_config``). Workers get the
+same layout from ``worker_owner_layout``. Block translation and owner-parallel
+attention on the workers are separate changes. With data parallelism, each
+replica has its own scheduler and pool, and owners are the ranks of that
+replica's TP group.
 """
 
 import contextlib
@@ -38,10 +41,15 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue, KVCacheBlock
+from vllm.v1.core.kv_cache_utils import (
+    FreeKVCacheBlockQueue,
+    KVCacheBlock,
+    get_max_concurrency_for_kv_cache_config,
+)
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     KVCacheConfig,
+    KVCacheGroupSpec,
     KVCacheSpec,
     SlidingWindowSpec,
 )
@@ -164,6 +172,75 @@ def owner_layout(
         vllm_config.parallel_config.tensor_parallel_size,
         replicated_blocks_needed(vllm_config, kv_cache_config),
     )
+
+
+def _owned_groups(kv_cache_config: KVCacheConfig) -> list[KVCacheGroupSpec]:
+    return [
+        group
+        for group in kv_cache_config.kv_cache_groups
+        if not is_replicated_spec(group.kv_cache_spec)
+    ]
+
+
+def globalize_kv_cache_config(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> KVCacheConfig:
+    """The scheduler's copy of one rank's ``kv_cache_config``.
+
+    Every rank stores ``M = kv_cache_config.num_blocks`` blocks: the ``R``
+    replicated ones and ``P = M - R`` of its own region. The scheduler hands
+    out ``N = R + tp * P`` ids. Only ``num_blocks`` changes: the workers keep
+    the per-rank config, so the KV cache tensors keep their size.
+    """
+    if not _owned_groups(kv_cache_config):
+        raise ValueError(
+            "TPU_DEEPSEEK_V41_KV_SHARD=1 but no KV cache group is owner-sharded"
+        )
+    num_replicated = replicated_blocks_needed(vllm_config, kv_cache_config)
+    per_owner = kv_cache_config.num_blocks - num_replicated
+    if per_owner < 1:
+        raise ValueError(
+            f"TPU_DEEPSEEK_V41_KV_SHARD=1 needs more than {num_replicated} KV "
+            "blocks per rank for the replicated cache groups, but each rank "
+            f"holds {kv_cache_config.num_blocks}; raise the KV cache memory or "
+            "lower max_num_seqs"
+        )
+    layout = OwnerLayout(
+        num_replicated, vllm_config.parallel_config.tensor_parallel_size, per_owner
+    )
+    return dataclasses.replace(kv_cache_config, num_blocks=layout.num_blocks)
+
+
+def worker_owner_layout(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> OwnerLayout:
+    """The scheduler's layout, derived from a worker's per-rank config.
+
+    Workers store ``layout.blocks_per_rank`` blocks, which equals their
+    ``kv_cache_config.num_blocks``, and translate the scheduler's block ids
+    with ``layout.local_block_id``.
+    """
+    return owner_layout(
+        vllm_config, globalize_kv_cache_config(vllm_config, kv_cache_config)
+    )
+
+
+def max_concurrency(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, layout: OwnerLayout
+) -> float:
+    """How many ``max_model_len`` requests the owner regions hold.
+
+    Only the owner-sharded groups count: ``replicated_blocks_needed`` sizes
+    the replicated region for ``max_num_seqs`` requests. Like vLLM's own
+    estimate, the result is fractional; it also ignores that a request cannot
+    span owners.
+    """
+    owned = dataclasses.replace(
+        kv_cache_config,
+        num_blocks=layout.num_owners * layout.blocks_per_owner,
+        kv_cache_groups=_owned_groups(kv_cache_config),
+    )
+    return get_max_concurrency_for_kv_cache_config(vllm_config, owned)
 
 
 @contextlib.contextmanager
@@ -450,14 +527,51 @@ def _arg(args: tuple[Any, ...], kwargs: dict[str, Any], name: str, index: int) -
     return kwargs[name] if name in kwargs else args[index]
 
 
+def _with_arg(
+    args: tuple[Any, ...], kwargs: dict[str, Any], name: str, index: int, value: Any
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    if name in kwargs:
+        return args, {**kwargs, name: value}
+    return (*args[:index], value, *args[index + 1 :]), kwargs
+
+
+def _publish_capacity(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, layout: OwnerLayout
+) -> None:
+    """Report the scheduler's block count and capacity in place of one rank's.
+
+    The engine core set them from the per-rank config before building the
+    scheduler; the frontend reads them from ``cache_config``.
+    """
+    concurrency = max_concurrency(vllm_config, kv_cache_config, layout)
+    max_model_len = vllm_config.model_config.max_model_len
+    cache_config = vllm_config.cache_config
+    cache_config.num_gpu_blocks = layout.num_blocks
+    cache_config.kv_cache_max_concurrency = concurrency
+    cache_config.kv_cache_size_tokens = int(concurrency * max_model_len)
+    logger.info(
+        "Owner-sharded KV: %d blocks per rank (%d replicated + %d owned) give "
+        "the scheduler %d blocks over %d owners. Maximum concurrency for %s "
+        "tokens per request: %.2fx",
+        layout.blocks_per_rank,
+        layout.num_replicated,
+        layout.blocks_per_owner,
+        layout.num_blocks,
+        layout.num_owners,
+        f"{max_model_len:,}",
+        concurrency,
+    )
+
+
 def install() -> None:
     """Make schedulers allocate KV blocks from ``OwnerAffineBlockPool``.
 
     Rebinds the ``BlockPool`` name that ``KVCacheCoordinator`` resolves at
-    construction. Wraps ``Scheduler.__init__`` so that the config is validated
-    and the pool gets its layout. Wraps ``KVCacheManager`` so that each
-    request's allocations run inside its owner's scope and the replicated
-    groups allocate from the replicated region.
+    construction. Wraps ``Scheduler.__init__`` so that the config is
+    validated, the scheduler allocates from every owner's region, and the
+    pool gets its layout. Wraps ``KVCacheManager`` so that each request's
+    allocations run inside its owner's scope and the replicated groups
+    allocate from the replicated region.
     """
     from vllm.v1.core import kv_cache_coordinator
     from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -478,7 +592,12 @@ def install() -> None:
         vllm_config = _arg(args, kwargs, "vllm_config", 0)
         kv_cache_config = _arg(args, kwargs, "kv_cache_config", 1)
         validate_config(vllm_config)
-        with layout_scope(owner_layout(vllm_config, kv_cache_config)):
+        # The engine core passes one rank's config; the workers keep it.
+        kv_cache_config = globalize_kv_cache_config(vllm_config, kv_cache_config)
+        args, kwargs = _with_arg(args, kwargs, "kv_cache_config", 1, kv_cache_config)
+        layout = owner_layout(vllm_config, kv_cache_config)
+        _publish_capacity(vllm_config, kv_cache_config, layout)
+        with layout_scope(layout):
             orig_scheduler_init(self, *args, **kwargs)
 
     @functools.wraps(orig_init)

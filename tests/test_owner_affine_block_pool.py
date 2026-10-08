@@ -98,6 +98,7 @@ def _vllm_config(
         ),
         cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
         kv_transfer_config=kv_transfer,
+        model_config=SimpleNamespace(max_model_len=1024),
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
         speculative_config=spec_config,
         max_in_flight_tokens=64,
@@ -444,23 +445,55 @@ def test_plain_pool_is_left_alone(installed, monkeypatch):
     assert manager.pop_blocks_for_free(second)
 
 
-def test_scheduler_init_validates_and_scopes_the_layout(restore, monkeypatch, v2_env):
+def test_globalize_gives_the_scheduler_every_owner_region():
+    config, per_rank = _vllm_config(), _kv_config(200, (FULL, SWA, RING))
+    scheduler_config = oab.globalize_kv_cache_config(config, per_rank)
+    # R = 25 replicated blocks, so each rank owns P = 175 and N = 25 + 8 * 175.
+    assert scheduler_config.num_blocks == 1425
+    assert scheduler_config.kv_cache_groups is per_rank.kv_cache_groups
+    assert per_rank.num_blocks == 200
+    layout = oab.owner_layout(config, scheduler_config)
+    assert layout == OwnerLayout(25, OWNERS, 175)
+    assert layout.blocks_per_rank == per_rank.num_blocks
+    assert oab.worker_owner_layout(config, per_rank) == layout
+
+
+def test_globalize_rejects_configs_it_cannot_shard():
+    with pytest.raises(ValueError, match="needs more than 25 KV blocks"):
+        oab.globalize_kv_cache_config(_vllm_config(), _kv_config(25, (FULL, SWA, RING)))
+    with pytest.raises(ValueError, match="no KV cache group is owner-sharded"):
+        oab.globalize_kv_cache_config(_vllm_config(), _kv_config(200, (SWA, RING)))
+
+
+def test_max_concurrency_counts_the_owner_regions():
+    layout = OwnerLayout(25, OWNERS, 175)
+    kv_config = _kv_config(layout.num_blocks, (FULL, SWA, RING))
+    # A 1024-token request needs 64 FULL blocks; the owners hold 8 * 175.
+    assert oab.max_concurrency(_vllm_config(), kv_config, layout) == 1400 / 64
+
+
+def test_scheduler_init_validates_and_globalizes(restore, monkeypatch, v2_env):
     seen = []
 
     def fake_init(self, vllm_config, kv_cache_config, *args, **kwargs):
-        seen.append(oab._LAYOUT.get())
+        seen.append((oab._LAYOUT.get(), kv_cache_config.num_blocks))
 
     monkeypatch.setattr(Scheduler, "__init__", fake_init)
     oab.install()
-    config, kv_config = _vllm_config(), _kv_config(200, (FULL, SWA, RING))
-    expected = oab.owner_layout(config, kv_config)
-    Scheduler.__init__(SimpleNamespace(), config, kv_config)
-    Scheduler.__init__(SimpleNamespace(), vllm_config=config, kv_cache_config=kv_config)
-    assert seen == [expected, expected]
+    config, per_rank = _vllm_config(), _kv_config(200, (FULL, SWA, RING))
+    expected = OwnerLayout(25, OWNERS, 175)
+    Scheduler.__init__(SimpleNamespace(), config, per_rank)
+    Scheduler.__init__(SimpleNamespace(), vllm_config=config, kv_cache_config=per_rank)
+    assert seen == [(expected, 1425), (expected, 1425)]
+    assert per_rank.num_blocks == 200
     assert oab._LAYOUT.get() is None
+    cache_config = config.cache_config
+    assert cache_config.num_gpu_blocks == 1425
+    assert cache_config.kv_cache_max_concurrency == 1400 / 64
+    assert cache_config.kv_cache_size_tokens == 22400
     with pytest.raises(ValueError, match="prefix caching"):
         Scheduler.__init__(
-            SimpleNamespace(), _vllm_config(prefix_caching=True), kv_config
+            SimpleNamespace(), _vllm_config(prefix_caching=True), per_rank
         )
     assert len(seen) == 2
 
