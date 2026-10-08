@@ -364,6 +364,45 @@ class TestCsaGatherFunctionAndValidation:
 
             assert actual_subchunks == expected_subchunks
 
+        # Branch 4: TPU7x 32-subcore (num_cores=2, num_subcores=16) zero-padding
+        # verification for multi-token verify batches (C=32, 48, 64, 96, 128 ->
+        # padded_local = 24, 40, 48, 72, 96).
+        tpu7x_info = SimpleNamespace(
+            sparse_core=SimpleNamespace(num_lanes=8, num_cores=2, num_subcores=16)
+        )
+        captured_tpu7x = []
+
+        def fake_pl_kernel_tpu7x(kernel_fn, *, out_type, **kwargs):
+            n_rows = out_type[0].shape[0]
+            captured_tpu7x.append((kernel_fn.keywords["num_row_subchunks"], n_rows))
+            nope_buf = jnp.zeros((n_rows, 128), dtype=jnp.int32)
+            rope_buf = jnp.zeros((n_rows // 4, 128), dtype=jnp.int32)
+            return lambda nope_c, rope_c, idx, valid: (nope_buf, rope_buf)
+
+        with (
+            patch.object(csa_gather.pltpu, "get_tpu_info", return_value=tpu7x_info),
+            patch.object(
+                csa_gather.plsc, "VectorSubcoreMesh", lambda **kw: SimpleNamespace(**kw)
+            ),
+            patch.object(csa_gather.pl, "kernel", fake_pl_kernel_tpu7x),
+        ):
+            for num_tok, want_subchunks in [
+                (24, 16),
+                (40, 16),
+                (48, 32),
+                (72, 16),
+                (96, 64),
+            ]:
+                idx = jnp.zeros((num_tok * 512,), dtype=jnp.int32)
+                out_n, out_r = csa_gather.csa_gather.__wrapped__(
+                    nope_cache, rope_cache, idx, top_k=512
+                )
+                got_subchunks, got_rows = captured_tpu7x[-1]
+                assert got_subchunks == want_subchunks
+                assert got_rows == num_tok * 512
+                assert out_n.shape == (num_tok * 512, 128)
+                assert out_r.shape == (num_tok * 512 // 4, 128)
+
 
 # ==============================================================================
 # 3. v2/attention.py: _query_split and Even Part Allocation

@@ -1710,7 +1710,7 @@ def paged_index_scores_jax(
         tokens // 6
         if (
             tokens <= records.shape[0]
-            and tokens <= 64
+            and tokens <= 96
             and tokens >= 6
             and tokens % 6 == 0
         )
@@ -1718,7 +1718,7 @@ def paged_index_scores_jax(
     )
     budget = min(
         max(512, min(_INDEX_MAX_TILE, _INDEX_KEYS_PER_ITER // max(eff_tokens, 1))),
-        -(-width // 128) * 128,
+        1 << (max(width, 128) - 1).bit_length(),
     )
     tile = 1 << (budget.bit_length() - 1)
     padded_width = width + (-width % tile)
@@ -1795,17 +1795,20 @@ def paged_index_scores_jax(
         # result cost 68 us per call to interleave in XLA.
         assert page_records is not None  # implied by `pages`
         page = page_records
+        page_tile = tile // page
         rows = tile // index_word_scores.SLOTS
+        page_rec_all = records[:, ::page]
+        page_pad = padded_width // page - page_rec_all.shape[1]
 
-        def _run_word_loop(rec):
-            rec = jnp.pad(rec, ((0, 0), (0, -width % tile)), constant_values=-1)
-            n_rows = rec.shape[0]
+        def _run_word_loop(page_rec):
+            page_rec = jnp.pad(page_rec, ((0, 0), (0, page_pad)), constant_values=-1)
+            n_rows = page_rec.shape[0]
 
             def word_step(index, result):
-                addresses = jax.lax.dynamic_slice_in_dim(
-                    rec, index * tile, tile, axis=1
+                first_records = jax.lax.dynamic_slice_in_dim(
+                    page_rec, index * page_tile, page_tile, axis=1
                 )
-                words = gather_cache_page_words(pool, addresses[:, ::page], page, dim)
+                words = gather_cache_page_words(pool, first_records, page, dim)
                 values = _score_word_rows(
                     q, weights, words.reshape(n_rows, rows, ROW_WORDS)
                 )
@@ -1824,14 +1827,14 @@ def paged_index_scores_jax(
             return jax.lax.cond(
                 can_group,
                 lambda _: _run_word_loop(
-                    jnp.take(records, requests[::group_tokens], axis=0)
+                    jnp.take(page_rec_all, requests[::group_tokens], axis=0)
                 ),
-                lambda _: _run_word_loop(jnp.take(records, requests, axis=0)),
+                lambda _: _run_word_loop(jnp.take(page_rec_all, requests, axis=0)),
                 None,
             )
         if requests is not None:
-            records = jnp.take(records, requests, axis=0)
-        return _run_word_loop(records)
+            page_rec_all = jnp.take(page_rec_all, requests, axis=0)
+        return _run_word_loop(page_rec_all)
 
     if requests is not None:
         records = jnp.take(records, requests, axis=0)

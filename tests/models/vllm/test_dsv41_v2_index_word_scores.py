@@ -192,8 +192,18 @@ def test_paged_index_scores_fp32_query_keeps_xla_page_path():
         scores = ak.paged_index_scores_jax(
             q, pool, jnp.asarray(records), weights, n, None, PAGE
         )
+        shared_scores = ak.paged_index_scores_jax(
+            q,
+            pool,
+            jnp.asarray(records[:1]),
+            weights,
+            n,
+            jnp.zeros((2,), jnp.int32),
+            PAGE,
+        )
     word_rows.assert_not_called()
     assert scores.shape == (2, 1024)
+    assert shared_scores.shape == (2, 1024)
 
 
 def test_score_word_rows_wrapper_mesh_and_standalone():
@@ -219,3 +229,26 @@ def test_score_word_rows_wrapper_mesh_and_standalone():
         sharded = ak._score_word_rows(q, weights, words)
     shard_map.assert_called_once()
     np.testing.assert_allclose(np.asarray(sharded), reference, rtol=1e-6, atol=1e-5)
+
+
+@pytest.mark.parametrize("tokens", [36, 72, 96])
+def test_paged_index_scores_single_16k_tile_for_candidate_and_verify(tokens):
+    width = 12928
+    pool = jnp.zeros((64, ROW_WORDS), jnp.int32)
+    records = jnp.zeros((tokens, width), jnp.int32)
+    q = jnp.zeros((tokens, 4, 128), jnp.bfloat16)
+    weights = jnp.ones((tokens, 4), jnp.float32)
+    lengths = jnp.full((tokens,), width, jnp.int32)
+    observed_word_shapes = []
+
+    def _fake_score_word_rows(q_in, w_in, words_in):
+        observed_word_shapes.append(words_in.shape)
+        return jnp.zeros(
+            (q_in.shape[0], words_in.shape[1] * index_word_scores.SLOTS),
+            dtype=jnp.float32,
+        )
+
+    with mock.patch.object(ak, "_score_word_rows", side_effect=_fake_score_word_rows):
+        out = ak.paged_index_scores_jax(q, pool, records, weights, lengths, None, 8)
+    assert out.shape == (tokens, width)
+    assert observed_word_shapes == [(tokens, 8192, ROW_WORDS)]

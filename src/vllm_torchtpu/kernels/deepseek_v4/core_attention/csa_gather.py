@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import math
 from typing import Any
 
 import jax
@@ -268,8 +269,11 @@ def csa_gather(
     num_streams = 4
     assert out_size % top_k == 0
     max_subchunks = top_k // row_subchunk_size
-    target_subchunks = (out_size + num_cores * row_subchunk_size - 1) // (
-        num_cores * row_subchunk_size
+    core_step = num_cores * row_subchunk_size
+    target_subchunks = (
+        math.gcd(max_subchunks, out_size // core_step)
+        if out_size % (core_step * 16) == 0
+        else (out_size + core_step - 1) // core_step
     )
     num_row_subchunks = num_streams
     while num_row_subchunks < max_subchunks and (
@@ -319,4 +323,8 @@ def csa_gather(
         mesh=vector_mesh,
         name="sc_csa_gather",
     )(nope_cache, rope_cache, indices, valid_indices)
-    return nope_out[:out_size], rope_out[: out_size // 4]
+    return (
+        (nope_out[:out_size], rope_out[: out_size // 4])
+        if out_pad_size
+        else (nope_out, rope_out)
+    )
