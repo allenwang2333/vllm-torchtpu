@@ -2499,24 +2499,28 @@ class TPUModelRunner(GPUModelRunner):
         # below. None/absent -> 0 drafts (non-spec or a non-spec mixed chunk).
         pre_num_draft_per_req = self._pre_async_results.num_draft_per_req
 
-        pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
-        assert pre_next_tokens_cpu is not None
-
-        pre_next_tokens_cpu = pre_next_tokens_cpu[: len(pre_req_ids)]
-        max_gen_len = pre_next_tokens_cpu.shape[-1]
-
-        if max_gen_len == 1:
-            valid_sampled_token_ids = pre_next_tokens_cpu.tolist()
+        copy_state = getattr(self._pre_async_results, "copy_state", None)
+        if copy_state is not None and hasattr(copy_state, "parse_sampled_tokens"):
+            valid_sampled_token_ids, _ = copy_state.parse_sampled_tokens()
+            valid_sampled_token_ids = valid_sampled_token_ids[: len(pre_req_ids)]
         else:
-            valid_mask = pre_next_tokens_cpu != INVALID_TOKEN_ID
-            gen_lens = valid_mask.sum(dim=1).tolist()
-            valid_sampled_token_ids = [
-                seq.tolist() for seq in pre_next_tokens_cpu[valid_mask].split(gen_lens)
-            ]
+            from vllm_torchtpu.runner.tpu_runner_async_output import (
+                parse_sampled_token_ids_cpu,
+            )
+
+            pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
+            assert pre_next_tokens_cpu is not None
+            valid_sampled_token_ids, _ = parse_sampled_token_ids_cpu(
+                pre_next_tokens_cpu[: len(pre_req_ids)]
+            )
 
         for i in pre_discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
 
+        req_id_to_index = self.input_batch.req_id_to_index
+        num_tokens_no_spec = self.input_batch.num_tokens_no_spec
+        token_ids_cpu = self.input_batch.token_ids_cpu
+        max_model_len = token_ids_cpu.shape[1]
         for pre_req_idx, req_state, seq_len, req_id in pre_request_seq_lens:
             sampled_ids = valid_sampled_token_ids[pre_req_idx]
             if not sampled_ids:
@@ -2542,27 +2546,27 @@ class TPUModelRunner(GPUModelRunner):
             del req_state.output_token_ids[-n_placeholder:]
             req_state.output_token_ids.extend(sampled_ids)
 
-            if req_id not in self.input_batch.req_id_to_index:
+            if req_id not in req_id_to_index:
                 continue
 
-            req_idx = self.input_batch.req_id_to_index[req_id]
+            req_idx = req_id_to_index[req_id]
 
             # num_tokens_no_spec was advanced to (start_tok_idx + n_placeholder)
             # optimistically; roll back the over-count (= num_rejected) so it
             # reflects the real committed length (start_idx + len(sampled_ids)).
-            end_idx = self.input_batch.num_tokens_no_spec[req_idx]
+            end_idx = num_tokens_no_spec[req_idx]
             start_idx = end_idx - n_placeholder
             end_tok_idx = start_idx + len(sampled_ids)
-            self.input_batch.num_tokens_no_spec[req_idx] = end_tok_idx
+            num_tokens_no_spec[req_idx] = end_tok_idx
 
             target_slice = slice(start_idx, end_tok_idx)
             # The committed tokens must fit within token_ids_cpu
             # ([num_reqs, max_model_len]); writing past the end is a sizing bug.
-            assert end_tok_idx <= self.input_batch.token_ids_cpu.shape[1], (
+            assert end_tok_idx <= max_model_len, (
                 f"req {req_id}: write end {end_tok_idx} exceeds max_model_len "
-                f"{self.input_batch.token_ids_cpu.shape[1]}"
+                f"{max_model_len}"
             )
-            self.input_batch.token_ids_cpu[req_idx, target_slice] = sampled_ids
+            token_ids_cpu[req_idx, target_slice] = sampled_ids
 
     def _update_placeholder(
         self,
@@ -2662,6 +2666,17 @@ class TPUModelRunner(GPUModelRunner):
         num_rejected_chunks: list[torch.Tensor] = []
         num_draft_per_req: dict[int, int] = {}
         req_offset = 0
+        single_chunk_pad_reqs = (
+            getattr(self, "max_num_reqs", None)
+            if len(next_tokens_per_chunk) == 1
+            and getattr(self, "speculative_config", None) is not None
+            else None
+        )
+        single_chunk_pad_src = (
+            single_chunk_pad_reqs * (1 + self.speculative_config.num_speculative_tokens)
+            if single_chunk_pad_reqs is not None
+            else None
+        )
         # Uniform `1+K` source span per request: req position `p` maps to source
         # `[p*(1+K) .. p*(1+K)+K]`, and `req_id_to_index_copy` stores `p` (the
         # index builder multiplies by the stride). All chunks carry their next
@@ -2675,11 +2690,13 @@ class TPUModelRunner(GPUModelRunner):
                 drafts_chunk,
                 md.draft_lengths if md is not None else None,
                 num_reqs,
+                padded_src_len=single_chunk_pad_src,
+                padded_num_reqs=single_chunk_pad_reqs,
             )
             num_rejected_chunks.append(num_rejected)
             if md is not None:
-                for r in range(num_reqs):
-                    num_draft_per_req[req_offset + r] = int(md.draft_lengths_cpu[r])
+                for r, d_len in enumerate(md.draft_lengths_cpu[:num_reqs].tolist()):
+                    num_draft_per_req[req_offset + r] = d_len
             next_tokens_tpu_chunks.append(src)
             for r in range(num_reqs):
                 next_token_indices[req_offset + r] = req_offset + r
@@ -2713,7 +2730,6 @@ class TPUModelRunner(GPUModelRunner):
         )
         next_tokens_tpu_chunks: list[torch.Tensor] = []
         next_token_indices: dict[int, int] = {}
-        num_rejected_chunks: list[torch.Tensor] = []
         num_draft_per_req: dict[int, int] = {}
         req_offset = 0
         for sel, n in zip(combined_selected_tokens, combined_real_lens):
@@ -2723,17 +2739,18 @@ class TPUModelRunner(GPUModelRunner):
                 [bonus.to(drafts_chunk.dtype), drafts_chunk], dim=1
             )  # [n, 1+K] = [bonus, draft_1..K]
             next_tokens_tpu_chunks.append(src.reshape(-1))
-            num_rejected_chunks.append(
-                torch.zeros(n, dtype=torch.int32, device=src.device)
-            )
             for r in range(n):
                 next_token_indices[req_offset + r] = req_offset + r
                 # These drafts belong to the NEXT step. The current prefill
                 # sampled one token and has only one output placeholder.
                 num_draft_per_req[req_offset + r] = 0
             req_offset += n
+        max_reqs = getattr(self, "max_num_reqs", None)
+        rejected_len = max(req_offset, max_reqs) if max_reqs is not None else req_offset
         spec_num_rejected = (
-            torch.cat(num_rejected_chunks) if num_rejected_chunks else None
+            torch.zeros(rejected_len, dtype=torch.int32, device=drafts.device)
+            if next_tokens_tpu_chunks
+            else None
         )
         return (
             next_tokens_tpu_chunks,
@@ -4739,6 +4756,11 @@ class TPUModelRunner(GPUModelRunner):
                     if next_tokens_tpu.shape[0] < bound:
                         next_tokens_tpu = torch.nn.functional.pad(
                             next_tokens_tpu, (0, bound - next_tokens_tpu.shape[0])
+                        )
+                    if spec_num_rejected.shape[0] < self.max_num_reqs:
+                        spec_num_rejected = torch.nn.functional.pad(
+                            spec_num_rejected,
+                            (0, self.max_num_reqs - spec_num_rejected.shape[0]),
                         )
                 self._pre_async_results = AsyncPreResults(
                     req_ids=req_ids,

@@ -2802,3 +2802,138 @@ def test_sample_tokens_dispatches_drafter_before_modify_prev_results():
         TPUModelRunner.sample_tokens(runner, grammar_output=None)
 
     assert call_order == ["propose", "modify_prev"]
+    assert runner._pre_async_results.next_tokens_tpu.shape[0] == 4
+    assert runner._pre_async_results.spec_decode_num_rejected_tokens.shape[0] == 2
+
+    # Already-padded single-chunk outputs skip the fallback F.pad branches.
+    runner.execute_model_state = state
+    runner._assemble_async_spec_substitution = lambda d, nt, st: (
+        [torch.tensor([13, 21, 0, 0], dtype=torch.int32)],
+        {0: 0},
+        torch.tensor([0, 0], dtype=torch.int32),
+        {0: 1},
+    )
+    with patch.object(
+        tpu_runner.AsyncTPUCopyState,
+        "from_device_chunks",
+        return_value=SimpleNamespace(),
+    ):
+        TPUModelRunner.sample_tokens(runner, grammar_output=None)
+    assert runner._pre_async_results.next_tokens_tpu.tolist() == [13, 21, 0, 0]
+    assert runner._pre_async_results.spec_decode_num_rejected_tokens.tolist() == [0, 0]
+
+    # Non-spec / empty spec_num_rejected skips spec padding completely.
+    runner.execute_model_state = state
+    runner._assemble_async_spec_substitution = lambda d, nt, st: (
+        [torch.tensor([13, 21], dtype=torch.int32)],
+        {0: 0},
+        None,
+        {},
+    )
+    with patch.object(
+        tpu_runner.AsyncTPUCopyState,
+        "from_device_chunks",
+        return_value=SimpleNamespace(),
+    ):
+        TPUModelRunner.sample_tokens(runner, grammar_output=None)
+    assert runner._pre_async_results.spec_decode_num_rejected_tokens is None
+
+
+def test_modify_prev_results_uses_cached_copy_state_and_handles_discard_or_removed():
+    from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
+
+    runner = SimpleNamespace(
+        _pre_async_results=None,
+        input_batch=SimpleNamespace(
+            req_id_to_index={"req-1": 0},
+            num_tokens_no_spec=[14],
+            token_ids_cpu=np.zeros((1, 32), dtype=np.int32),
+        ),
+    )
+    # 1) _pre_async_results is None -> early return
+    TPUModelRunner._modify_prev_results(runner)
+
+    # 2) copy_state with parse_sampled_tokens, req-0 discarded, req-1 committed,
+    #    req-2 removed from input_batch.req_id_to_index.
+    req0 = SimpleNamespace(req_id="req-0", output_token_ids=[0, 0])
+    req1 = SimpleNamespace(req_id="req-1", output_token_ids=[0, 0])
+    req2 = SimpleNamespace(req_id="req-2", output_token_ids=[0, 0])
+    copy_state = AsyncTPUCopyState(
+        chunks_cpu=[
+            torch.tensor(
+                [[10, 11], [20, INVALID_TOKEN_ID], [30, 31], [99, 99]],
+                dtype=torch.int32,
+            )
+        ],
+        chunk_real_lens=[3],
+        copy_ready_event=None,
+        completed=True,
+    )
+    runner._pre_async_results = SimpleNamespace(
+        req_ids=["req-0", "req-1", "req-2"],
+        request_seq_lens=[
+            (0, req0, 10, "req-0"),
+            (1, req1, 12, "req-1"),
+            (2, req2, 8, "req-2"),
+        ],
+        discard_sampled_tokens_req_indices=[0],
+        num_draft_per_req={0: 1, 1: 1, 2: 1},
+        copy_state=copy_state,
+    )
+    TPUModelRunner._modify_prev_results(runner)
+    assert req0.output_token_ids == [0, 0]
+    assert req1.output_token_ids == [20]
+    assert req2.output_token_ids == [30, 31]
+    assert runner.input_batch.num_tokens_no_spec[0] == 13
+    assert runner.input_batch.token_ids_cpu[0, 12] == 20
+
+
+def test_assemble_async_spec_substitution_padded_single_chunk_and_prefill_bootstrap():
+    runner = object.__new__(TPUModelRunner)
+    runner.max_num_reqs = 4
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=2)
+
+    drafts = torch.tensor([[201, 202], [211, 212]], dtype=torch.int32)
+    nt_chunk0 = torch.tensor([[11, 99, -1], [77, -1, -1]], dtype=torch.int32)
+    md0 = SimpleNamespace(
+        draft_lengths=torch.tensor([2, 2], dtype=torch.int32),
+        draft_lengths_cpu=np.array([2, 2], dtype=np.int32),
+    )
+    state_single = SimpleNamespace(
+        num_reqs_list=[2],
+        spec_decode_metadata_list=[md0],
+    )
+    chunks, idx_map, num_rejected, num_draft = runner._assemble_async_spec_substitution(
+        drafts, [nt_chunk0], state_single
+    )
+    assert len(chunks) == 1
+    assert chunks[0].tolist() == [99, 201, 202, 77, 211, 212, 0, 0, 0, 0, 0, 0]
+    assert idx_map == {0: 0, 1: 1}
+    assert num_rejected.tolist() == [1, 2, 0, 0]
+    assert num_draft == {0: 2, 1: 2}
+
+    # Empty chunk list returns spec_num_rejected = None
+    empty_state = SimpleNamespace(num_reqs_list=[], spec_decode_metadata_list=[])
+    chunks_e, _, rej_e, _ = runner._assemble_async_spec_substitution(
+        drafts, [], empty_state
+    )
+    assert chunks_e == []
+    assert rej_e is None
+
+    # Prefill bootstrap pads spec_num_rejected to max(req_offset, max_num_reqs)
+    boot_chunks, boot_idx, boot_rej, boot_draft = (
+        runner._assemble_async_prefill_bootstrap(
+            drafts,
+            [torch.tensor([[99], [77]], dtype=torch.int32)],
+            [2],
+        )
+    )
+    assert len(boot_chunks) == 1
+    assert boot_chunks[0].tolist() == [99, 201, 202, 77, 211, 212]
+    assert boot_idx == {0: 0, 1: 1}
+    assert boot_rej is not None and boot_rej.tolist() == [0, 0, 0, 0]
+    assert boot_draft == {0: 0, 1: 0}
+
+    # Empty prefill bootstrap returns spec_num_rejected = None
+    _, _, boot_rej_empty, _ = runner._assemble_async_prefill_bootstrap(drafts, [], [])
+    assert boot_rej_empty is None
