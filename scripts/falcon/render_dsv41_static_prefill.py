@@ -49,6 +49,11 @@ def render(baseline: dict, source_commit: str, model_uri: str) -> dict:
     model_mount["prefix"] = parsed.path.strip("/")
     if model_mount["mount_path"] != MODEL_MOUNT:
         raise ValueError("Unexpected baseline model mount")
+    model_mount["mount_options"] = [
+        option
+        for option in model_mount["mount_options"]
+        if not option.startswith("file-cache:")
+    ] + ["file-cache:max-size-mb:1024", "file-cache:cache-file-for-range-read:true"]
 
     command = task["command"]
     old_uri = "gs://inference-model-storage-poc-tpu-hns/DeepSeek-V4.1-Flash/"
@@ -97,6 +102,26 @@ PATCH_RUNAI_GCS
     command = command.replace(
         marker,
         f"{runai_patch}export TPU_DSV41_STATIC_MOE_DIR={MODEL_MOUNT}\n{marker}",
+    )
+    benchmark_start = 'echo "REPRO_BENCHMARK_START $(date -Is)"'
+    if command.count(benchmark_start) != 1:
+        raise ValueError("Baseline benchmark start marker changed")
+    disk_monitor = """(
+  while true; do
+    echo "DISK_USAGE $(date -Is)"
+    df -h / /tmp/tpu_logs
+    du -xsh /tmp/tpu_logs /root/.cache /workspace /var/tmp 2>/dev/null || true
+    sleep 60
+  done
+) &
+disk_monitor_pid=$!
+"""
+    command = command.replace(benchmark_start, disk_monitor + benchmark_start)
+    benchmark_end = 'echo "REPRO_BENCHMARK_END $(date -Is)"'
+    if command.count(benchmark_end) != 1:
+        raise ValueError("Baseline benchmark end marker changed")
+    command = command.replace(
+        benchmark_end, f'kill "$disk_monitor_pid" || true\n{benchmark_end}'
     )
     task["command"] = command
     return {
