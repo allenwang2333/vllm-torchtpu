@@ -76,6 +76,7 @@ class NgramHashState(upstream.NgramHashState):
             )
         if slot_mapping is not None:
             slot_mapping = slot_mapping[:count]
+        mapped: torch.Tensor | None = None
         if self.use_slot_cache:
             assert self._cache is not None and slot_mapping is not None
             mapped = self.token_map[input_ids.long()].masked_fill(
@@ -107,6 +108,7 @@ class NgramHashState(upstream.NgramHashState):
             lookback_token_ids,
             lookback_dead_mask,
             fallback,
+            mapped_batch=mapped,
         )
 
     def hash_on_host(
@@ -142,11 +144,11 @@ class NgramHashState(upstream.NgramHashState):
             )
             self._host_tables = tables
         token_map_np, mult_np, primes_np, offsets_np = tables
-        ids_np = np.asarray(input_ids, dtype=np.int64)
+        ids_np = np.asarray(input_ids)
         pos_np = np.asarray(positions, dtype=np.int64)
-        qsl_np = np.asarray(query_start_loc, dtype=np.int64)
+        qsl_np = np.asarray(query_start_loc)
         dead_np = np.asarray(dead_mask, dtype=np.bool_)
-        lb_np = np.asarray(lookback_token_ids, dtype=np.int64)
+        lb_np = np.asarray(lookback_token_ids)
         lb_dead_np = np.asarray(lookback_dead_mask, dtype=np.bool_)
         rows = np.arange(count, dtype=np.int64)
         reqs = np.minimum(
@@ -159,8 +161,7 @@ class NgramHashState(upstream.NgramHashState):
         past = pos_np[:, None] - shifts
         in_chunk = past >= chunk_positions[:, None]
         indices = np.maximum(rows[:, None] - shifts, 0)
-        mapped_batch = token_map_np[ids_np].copy()
-        mapped_batch[dead_np] = upstream.DEAD_ID
+        mapped_batch = np.where(dead_np, upstream.DEAD_ID, token_map_np[ids_np])
         batch = mapped_batch[indices]
         cols = chunk_positions[:, None] - 1 - past
         in_window = (~in_chunk) & (cols >= 0) & (cols < self.lookback_depth)
@@ -168,9 +169,11 @@ class NgramHashState(upstream.NgramHashState):
         reqs_col = reqs[:, None]
         window_ids = lb_np[reqs_col, cols_clamped]
         known = in_window & (window_ids >= 0)
-        mapped_lb = token_map_np[np.maximum(lb_np, 0)].copy()
-        mapped_lb[lb_dead_np] = upstream.DEAD_ID
-        window = mapped_lb[reqs_col, cols_clamped]
+        window = np.where(
+            lb_dead_np[reqs_col, cols_clamped],
+            upstream.DEAD_ID,
+            token_map_np[np.maximum(window_ids, 0)],
+        )
         source = np.where(in_chunk, batch, np.where(known, window, int(self.pad_id)))
         blocked = np.cumsum((past < 0) | (source == upstream.DEAD_ID), axis=1) > 0
         source = np.where(blocked, int(self.pad_id), source)
@@ -191,6 +194,8 @@ class NgramHashState(upstream.NgramHashState):
         lookback_token_ids,
         lookback_dead_mask,
         fallback,
+        *,
+        mapped_batch: torch.Tensor | None = None,
     ):
         token_map, multipliers, primes, offsets = tables
         count = input_ids.numel()
@@ -206,9 +211,10 @@ class NgramHashState(upstream.NgramHashState):
         past = positions[:, None] - shifts
         in_chunk = past >= chunk_positions[:, None]
         indices = (rows[:, None] - shifts).clamp(min=0)
-        mapped_batch = token_map[input_ids.long()].masked_fill(
-            dead_mask, upstream.DEAD_ID
-        )
+        if mapped_batch is None:
+            mapped_batch = token_map[input_ids.long()].masked_fill(
+                dead_mask, upstream.DEAD_ID
+            )
         batch = mapped_batch[indices]
         cols = chunk_positions[:, None] - 1 - past
         in_window = ~in_chunk & (cols >= 0) & (cols < self.lookback_depth)
@@ -355,8 +361,9 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         )
         self.weight.data = weight.new_empty((0, self.dim))
 
-    def _host_dma_lookup(self, indices, out):
-        assert self._host_rows is not None
+    def _select_local_heads(
+        self, indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         start = min(self.head_start, self.n_hash_cols)
         end = min(self.head_start + self.part_n_hash_cols, self.n_hash_cols)
         selected = indices[:, start:end].long()
@@ -365,13 +372,16 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         if pad:
             selected = torch.nn.functional.pad(selected, (0, pad))
             valid = torch.nn.functional.pad(valid, (0, pad), value=False)
-        rows = (
-            (selected - self.vocab_start_idx)
-            .clamp(min=0, max=self.part_num_embeddings - 1)
-            .flatten()
+        rows = (selected - self.vocab_start_idx).clamp(
+            min=0, max=self.part_num_embeddings - 1
         )
+        return rows, valid
+
+    def _host_dma_lookup(self, indices, out):
+        assert self._host_rows is not None
+        rows, valid = self._select_local_heads(indices)
         dequant = self._host_rows.lookup_and_dequant(
-            rows,
+            rows.flatten(),
             valid.flatten(),
             self.weight_scale_inv.data,
             self.block_size,
@@ -385,21 +395,12 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         work_device = weight.device
         if indices.device != work_device:
             indices = indices.to(work_device)
-        heads = (
-            torch.arange(self.part_n_hash_cols, device=work_device) + self.head_start
-        )
-        selected = indices[:, heads.clamp(max=self.n_hash_cols - 1)].long()
-        valid = (
-            (heads < self.n_hash_cols)[None, :]
-            & (selected >= self.vocab_start_idx)
-            & (selected < self.vocab_end_idx)
-        )
-        rows = (selected - self.vocab_start_idx).clamp(
-            min=0, max=self.part_num_embeddings - 1
-        )
-        values = weight[rows].float()
+        rows, valid = self._select_local_heads(indices)
+        values = weight.view(torch.uint8)[rows].view(weight.dtype).float()
         scale = (
-            (scales[rows].float() - 127).exp2().repeat_interleave(self.block_size, -1)
+            (scales[rows].to(torch.int32) << 23)
+            .view(torch.float32)
+            .repeat_interleave(self.block_size, -1)
         )
         out.copy_((values * scale).masked_fill(~valid[:, :, None], 0).to(out.dtype))
 
@@ -418,27 +419,7 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         work_device = weight.device
         if indices.device != work_device:
             indices = indices.to(work_device)
-        heads_cache = getattr(self, "_gather_heads_cache", None)
-        if heads_cache is None or heads_cache[0].device != work_device:
-            heads = (
-                torch.arange(self.part_n_hash_cols, device=work_device)
-                + self.head_start
-            )
-            heads_cache = (
-                heads.clamp(max=self.n_hash_cols - 1),
-                (heads < self.n_hash_cols)[None, :],
-            )
-            self._gather_heads_cache = heads_cache
-        heads_clamped, heads_valid = heads_cache
-        selected = indices[:, heads_clamped].long()
-        valid = (
-            heads_valid
-            & (selected >= self.vocab_start_idx)
-            & (selected < self.vocab_end_idx)
-        )
-        rows = (selected - self.vocab_start_idx).clamp(
-            min=0, max=self.part_num_embeddings - 1
-        )
+        rows, valid = self._select_local_heads(indices)
         flat = rows.flatten()
         torch.index_select(
             weight.view(torch.uint8), 0, flat, out=raw_out.view(-1, self.dim)
@@ -651,7 +632,7 @@ class Engram(upstream.Engram):
                 self._host_scale_buf[: scale_words * 4].view(torch.int32)
             )
             staged = self._staged_tensors(num_tokens)
-            staged.copy_(host_words[: raw_words + scale_words])
+            staged.copy_(host_words[: raw_words + scale_words], non_blocking=True)
             self._active_raw = self._staged_views(num_tokens)
             return
         super().prepare_embeddings(hash_ids)

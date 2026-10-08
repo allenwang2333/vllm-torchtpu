@@ -676,3 +676,60 @@ def test_causal_lm_converts_after_load_and_before_forward(monkeypatch, host_dma)
     lm.process_weights_after_loading()
     assert lm.forward() == "out"
     assert len(moves) == (2 if host_dma == "1" else 0)
+
+
+def test_select_rows_lowers_without_stablehlo_gather():
+    dummy_tiles = jnp.zeros((16, 8, 128), dtype=jnp.int32)
+    dummy_slot = jnp.zeros((16,), dtype=jnp.int32)
+    hlo_text = str(
+        jax.jit(hrg.select_rows, static_argnums=(2,))
+        .lower(dummy_tiles, dummy_slot, 64)
+        .compiler_ir("stablehlo")
+    )
+    assert "stablehlo.gather" not in hlo_text
+
+
+def test_ngram_hash_state_forward_reuses_mapped_batch():
+    class CountingTokenMap:
+        def __init__(self, tensor: torch.Tensor):
+            self._tensor = tensor
+            self.calls = 0
+
+        def __getitem__(self, idx):
+            self.calls += 1
+            return self._tensor[idx]
+
+    class SpyState(common_engram.NgramHashState):
+        def write_cache(self, cache, slots, values, valid):
+            pass
+
+    state = object.__new__(SpyState)
+    torch.nn.Module.__init__(state)
+    state.token_map = CountingTokenMap(torch.arange(100, dtype=torch.int64))
+    state.multipliers = torch.ones((2, 3), dtype=torch.int64)
+    state.primes = torch.full((2, 2, 4), 97, dtype=torch.int64)
+    state.offsets = torch.zeros((2, 8), dtype=torch.int64)
+    state.lookback_depth = 4
+    state.pad_id = 0
+    state.use_slot_cache = True
+    state.block_size = 8
+    state._cache = torch.zeros((64,), dtype=torch.int64)
+    state._kv_cache_ref = None
+    state.swa_cache_module = SimpleNamespace(
+        kv_cache=torch.zeros((8, 8), dtype=torch.int64),
+        bound_cache=torch.zeros((8, 8), dtype=torch.int64),
+        block_size=8,
+    )
+
+    ids = torch.tensor([1, 2], dtype=torch.int32)
+    pos = torch.tensor([0, 1], dtype=torch.int64)
+    qsl = torch.tensor([0, 2], dtype=torch.int32)
+    dead = torch.zeros(2, dtype=torch.bool)
+    lookback = torch.full((1, 4), -1, dtype=torch.int32)
+    dead_lb = torch.zeros((1, 4), dtype=torch.bool)
+    slots = torch.tensor([0, 1], dtype=torch.int64)
+    block_table = torch.zeros((1, 4), dtype=torch.int32)
+
+    out = state.forward(ids, pos, qsl, dead, lookback, dead_lb, slots, block_table)
+    assert out.shape == (2, 2, 8)
+    assert state.token_map.calls == 2

@@ -5,7 +5,10 @@
 # step carries C * (1 + K) tokens, so add 6x buckets for C=4/8/16 (or up to
 # C=96 / B_verify=576 with 40 GiB 2-bank KV cache under OFFLOAD=1).
 CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ "${OFFLOAD:-0}" == "1" ]]; then
+if [[ "${HOST_DMA:-0}" == "1" ]]; then
+  export TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA="${TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA:-1}"
+fi
+if [[ "${OFFLOAD:-0}" == "1" || "${TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA:-0}" == "1" ]]; then
   export TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD="${TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:-1}"
 fi
 if [[ "${TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:-0}" == "1" ]]; then

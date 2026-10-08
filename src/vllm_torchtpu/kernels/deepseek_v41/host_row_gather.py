@@ -111,11 +111,18 @@ def select_rows(tiles: jax.Array, slot: jax.Array, row_bytes: int) -> jax.Array:
 
     A tile's row ``s`` sits at sublane ``s // per_sub``, lanes
     ``w * (s % per_sub)`` onward (``pack_rows``), i.e. sub-row ``s`` of the
-    tile viewed as ``[8 * per_sub, w]``.
+    tile viewed as ``[8 * per_sub, w]``. Uses a VPU mask reduction rather than
+    ``take_along_axis`` so XLA's ``sparse_core_gather_offload`` pass never
+    offloads ``select_rows`` to SparseCore at large token counts.
     """
     w = row_words(row_bytes)
-    sub_rows = tiles.reshape(tiles.shape[0], SUBLANES * (LANES // w), w)
-    return jnp.take_along_axis(sub_rows, slot[:, None, None], axis=1)[:, 0]
+    num_slots = SUBLANES * (LANES // w)
+    sub_rows = tiles.reshape(tiles.shape[0], num_slots, w)
+    mask = (
+        jnp.arange(num_slots, dtype=jnp.int32)[None, :, None]
+        == slot.astype(jnp.int32)[:, None, None]
+    )
+    return jnp.sum(jnp.where(mask, sub_rows, 0), axis=1, dtype=tiles.dtype)
 
 
 def gather_rows_jax(
