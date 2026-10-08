@@ -1048,7 +1048,12 @@ def patched_decoder_layer_forward(
         hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
     prequant = None
-    if sp and sequence_parallel.fp8_gather():
+    # A PCP-streaming GDN layer takes bf16 rows, so skip the FP8 pre-gather.
+    use_fp8_gather = sequence_parallel.fp8_gather() and not (
+        self.layer_type == "linear_attention"
+        and getattr(self.linear_attn, "_pcp_streaming_configured", False)
+    )
+    if sp and use_fp8_gather:
         x_q, x_s = linear_common.quantize_rows(hidden_states)
         x_q = tensor_model_parallel_all_gather(x_q, 0).narrow(0, 0, full_num_tokens)
         x_s = tensor_model_parallel_all_gather(x_s, 0).narrow(0, 0, full_num_tokens)
