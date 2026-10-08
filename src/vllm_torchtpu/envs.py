@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_LOG_HOST_TENSORS_AFTER_LOAD: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
@@ -657,6 +658,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # After DeepSeek-V4 writes its host-staged weights to the device, walk the
+    # live Python objects and log how much CPU tensor storage is still
+    # reachable and what holds the largest of it. A one-off diagnostic for host
+    # memory that does not come back after loading; costs one GC walk.
+    "TPU_LOG_HOST_TENSORS_AFTER_LOAD": env_bool("TPU_LOG_HOST_TENSORS_AFTER_LOAD"),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
