@@ -23,6 +23,10 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
+from vllm_torchtpu.kernels.experimental.moe_dense_expert_fused import (
+    can_use_dense_expert_fused,
+    dense_expert_moe_fused,
+)
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
@@ -756,3 +760,134 @@ def fused_moe_func(
         rhs_quant_dtype=rhs_quant_dtype,
     )
     return x[:num_tokens, :hidden_size]
+
+
+def _expand_moe_scales(w1_scale, w2_scale):
+    """fused_moe_func's 3D [E, blocks, N] -> 4D [E, blocks, 1, N] scales."""
+    if w1_scale is not None and w1_scale.ndim == 3:
+        w1_scale = jnp.expand_dims(w1_scale, 2)
+    if w2_scale is not None and w2_scale.ndim == 3:
+        w2_scale = jnp.expand_dims(w2_scale, 2)
+    return w1_scale, w2_scale
+
+
+def fused_decode_layer_admits(
+    hidden_states,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    w1_bias,
+    w2_bias,
+    shared,
+    *,
+    activation: str,
+    rhs_quant_dtype=None,
+    skip_padded_tokens: bool = False,
+) -> bool:
+    """Static gate of the fused decode layer (TPU_MOE_FUSED_DECODE_LAYER).
+
+    Exactly fused_moe_func's dense-expert gate (token threshold first, then
+    the routed admission) plus the shared-expert operand check. Shapes and
+    dtypes only -- callable on jax.ShapeDtypeStruct before tracing, so the
+    torch side can decide to skip the separate shared expert.
+    """
+    num_tokens = hidden_states.shape[0]
+    if not 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD:
+        return False
+    w1_scale, w2_scale = _expand_moe_scales(w1_scale, w2_scale)
+    return can_use_dense_expert_fused(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        shared,
+        activation=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+    )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "topk",
+        "activation",
+        "use_ep",
+        "rhs_quant_dtype",
+        "skip_padded_tokens",
+        "routed_scale",
+    ),
+)
+def fused_moe_decode_layer_func(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2_bias: jax.Array | None,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    experts_start: jax.Array | None,
+    shared_w13: jax.Array,
+    shared_w13_scale: jax.Array,
+    shared_w2: jax.Array,
+    shared_w2_scale: jax.Array,
+    topk: int = 1,
+    activation: str = "silu",
+    use_ep: bool = False,
+    rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
+    routed_scale: float = 1.0,
+) -> jax.Array:
+    """Routed experts + one shared expert in one dense-expert kernel.
+
+    Same contract as fused_moe_func's dense branch -- global ``topk_ids``,
+    ``experts_start`` traced, weights pinned to the hidden dtype -- but the EP
+    remap, coefficient build and the per-channel FP8 shared expert
+    (``shared_w13`` [H, 2*Is] gate|up, ``shared_w2`` [Is, H], 1-D scales) run
+    inside the kernel. ``routed_scale`` is the MoE runner's
+    routed_scaling_factor, applied to the routed FP32 sum before the shared
+    add; the caller must then not scale the output again. Only callable for
+    batches ``fused_decode_layer_admits`` accepts.
+    """
+    shared = (shared_w13, shared_w13_scale, shared_w2, shared_w2_scale)
+    if not fused_decode_layer_admits(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        shared,
+        activation=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+    ):
+        raise ValueError(
+            "fused_moe_decode_layer_func called for a batch the fused decode "
+            f"layer does not admit: hidden={hidden_states.shape}, "
+            f"w1={w1.shape}, shared_w2={shared_w2.shape}"
+        )
+    num_tokens, _ = hidden_states.shape
+    assert topk_weights.shape == (num_tokens, topk)
+    assert topk_ids.shape == (num_tokens, topk)
+    w1_scale, w2_scale = _expand_moe_scales(w1_scale, w2_scale)
+    logger.info_once("Selected fused dense-expert decode MoE layer")
+    return dense_expert_moe_fused(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        topk_weights.astype(hidden_states.dtype),
+        topk_ids,
+        experts_start if use_ep else None,
+        shared,
+        routed_scale=routed_scale,
+    )
