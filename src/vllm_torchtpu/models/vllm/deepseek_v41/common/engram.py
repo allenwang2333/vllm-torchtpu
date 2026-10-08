@@ -5,6 +5,7 @@ subclasses ``NgramHashState`` to bind its own slot-cache write op and, when
 its SWA cache module differs, the cache lifetime in ``ensure_cache``.
 """
 
+import dataclasses
 from types import SimpleNamespace
 
 import numpy as np
@@ -135,6 +136,13 @@ class NgramHashState(upstream.NgramHashState):
         (which do need the cache) keep the device path. Padded rows read
         ``pad_id`` here instead of an arbitrary cache slot; their outputs are
         never consumed. Integer math, so hashes equal the device path's.
+
+        This sits on the host critical path of ``OFFLOAD=1`` decode steps, so
+        it is a fixed number of whole-chunk NumPy operations laid out
+        token-last (``[ngram, T]``, ``[layers, ngram, T]``, ``[layers, ngram -
+        1, heads, T]``) so every inner loop runs over the tokens rather than
+        over the 4 shifts or 8 heads; the lookback window is resolved once per
+        request and the in-chunk sources are a strided view of the mapped ids.
         """
         count = input_ids.numel()
         layers, ngram = self.multipliers.shape
@@ -144,51 +152,80 @@ class NgramHashState(upstream.NgramHashState):
             )
         tables = getattr(self, "_host_tables", None)
         if tables is None:
-            tables = tuple(
-                np.asarray(t.to("cpu"), dtype=np.int64)
-                for t in (self.token_map, self.multipliers, self.primes, self.offsets)
-            )
+            tables = _HostHashTables.from_state(self)
             self._host_tables = tables
-        token_map_np, mult_np, primes_np, offsets_np = tables
+        depth = int(self.lookback_depth)
+        pad_id = int(self.pad_id)
         ids_np = np.asarray(input_ids)
         pos_np = np.asarray(positions, dtype=np.int64)
         qsl_np = np.asarray(query_start_loc)
         dead_np = np.asarray(dead_mask, dtype=np.bool_)
-        lb_np = np.asarray(lookback_token_ids)
-        lb_dead_np = np.asarray(lookback_dead_mask, dtype=np.bool_)
+        lb_np = np.asarray(lookback_token_ids)[:, :depth]
+        lb_dead_np = np.asarray(lookback_dead_mask, dtype=np.bool_)[:, :depth]
         rows = np.arange(count, dtype=np.int64)
         reqs = np.minimum(
             np.searchsorted(qsl_np[1:], rows, side="right"),
             lb_np.shape[0] - 1,
         )
         starts = np.minimum(qsl_np[reqs], count - 1)
-        chunk_positions = pos_np[starts]
-        shifts = np.arange(ngram, dtype=np.int64)
-        past = pos_np[:, None] - shifts
-        in_chunk = past >= chunk_positions[:, None]
-        indices = np.maximum(rows[:, None] - shifts, 0)
-        mapped_batch = np.where(dead_np, upstream.DEAD_ID, token_map_np[ids_np])
-        batch = mapped_batch[indices]
-        cols = chunk_positions[:, None] - 1 - past
-        in_window = (~in_chunk) & (cols >= 0) & (cols < self.lookback_depth)
-        cols_clamped = np.clip(cols, 0, self.lookback_depth - 1)
-        reqs_col = reqs[:, None]
-        window_ids = lb_np[reqs_col, cols_clamped]
-        known = in_window & (window_ids >= 0)
-        window = np.where(
-            lb_dead_np[reqs_col, cols_clamped],
-            upstream.DEAD_ID,
-            token_map_np[np.maximum(window_ids, 0)],
+        # Offset of each token from its request's first chunk position; the
+        # n-gram source `shift` back is in the chunk iff shift <= offset.
+        offset = pos_np - pos_np[starts]
+        shifts = tables.shifts
+        in_chunk = shifts <= offset[None, :]
+        # In-chunk sources: batch[s, t] = mapped[max(t - s, 0)], as a strided
+        # window over a front-padded copy instead of a gather.
+        mapped = np.where(dead_np, upstream.DEAD_ID, tables.token_map[ids_np])
+        padded = np.concatenate(
+            (np.full(ngram - 1, mapped[0], dtype=mapped.dtype), mapped)
         )
-        source = np.where(in_chunk, batch, np.where(known, window, int(self.pad_id)))
-        blocked = np.cumsum((past < 0) | (source == upstream.DEAD_ID), axis=1) > 0
-        source = np.where(blocked, int(self.pad_id), source)
-        terms = source[:, None, :] * mult_np[None, :, :]
-        rolled = np.bitwise_xor.accumulate(terms, axis=2)[:, :, 1:]
-        hashed = (rolled[:, :, :, None] % primes_np[None, :, :, :]).reshape(
-            count, layers, -1
-        ) + offsets_np[None, :, :]
-        return torch.from_numpy(np.ascontiguousarray(hashed, dtype=np.int32))
+        batch = np.lib.stride_tricks.sliding_window_view(padded, count)[::-1]
+        # Lookback sources, resolved once per request: column `c` of
+        # `window_table` is the mapped id `c + 1` positions before the chunk
+        # (pad_id when unknown), and column `depth` is pad_id for sources
+        # beyond the window. Source `shift` of a token at chunk offset `o`
+        # reads column shift - o - 1.
+        known = lb_np >= 0
+        window_table = np.full(
+            (lb_np.shape[0], depth + 1), pad_id, dtype=tables.token_map.dtype
+        )
+        window_table[:, :depth] = np.where(
+            known,
+            np.where(
+                lb_dead_np,
+                upstream.DEAD_ID,
+                tables.token_map[np.where(known, lb_np, 0)],
+            ),
+            pad_id,
+        )
+        cols = shifts - offset[None, :] - 1
+        cols = np.where((cols >= 0) & (cols < depth), cols, depth)
+        window = np.take(window_table.reshape(-1), reqs[None, :] * (depth + 1) + cols)
+        source = np.where(in_chunk, batch, window)
+        # A dead or pre-sequence source blocks every longer n-gram.
+        blocked = (shifts > pos_np[None, :]) | (source == upstream.DEAD_ID)
+        for shift in range(1, ngram):
+            blocked[shift] |= blocked[shift - 1]
+        source = np.where(blocked, pad_id, source)
+        terms = tables.multipliers[:, :, None] * source[None, :, :]
+        rolled = terms[:, 1:]
+        np.bitwise_xor(terms[:, 0], rolled[:, 0], out=rolled[:, 0])
+        for shift in range(2, ngram):
+            np.bitwise_xor(
+                rolled[:, shift - 2], rolled[:, shift - 1], out=rolled[:, shift - 1]
+            )
+        # The int64 bucket ids reuse one scratch buffer: a fresh array of this
+        # size is page-faulted in on every call otherwise.
+        hashed = tables.scratch(count)
+        np.remainder(rolled[:, :, None, :], tables.primes, out=hashed)
+        hashed += tables.offsets
+        # Back to the device path's [T, layers, heads] layout in one
+        # narrowing copy.
+        return torch.from_numpy(
+            hashed.reshape(layers, -1, count)
+            .transpose(2, 0, 1)
+            .astype(np.int32, order="C")
+        )
 
     def _hash(
         self,
@@ -252,6 +289,44 @@ class NgramHashState(upstream.NgramHashState):
             None, :, :
         ]
         return hashed.to(torch.int32)
+
+
+@dataclasses.dataclass(frozen=True)
+class _HostHashTables:
+    """Host (NumPy) copies of ``NgramHashState``'s tables, token-last shaped.
+
+    Built once per state on the first ``hash_on_host`` call. ``token_map`` is
+    int32 (ids are far below 2**31) so the random per-token gathers touch
+    half the cache lines of the int64 original.
+    """
+
+    token_map: np.ndarray  # [vocab] int32
+    multipliers: np.ndarray  # [layers, ngram] int64
+    primes: np.ndarray  # [layers, ngram - 1, heads, 1] int64
+    offsets: np.ndarray  # [layers, ngram - 1, heads, 1] int64
+    shifts: np.ndarray  # [ngram, 1] int64
+    _scratch: list[np.ndarray] = dataclasses.field(default_factory=list)
+
+    @classmethod
+    def from_state(cls, state) -> "_HostHashTables":
+        token_map, multipliers, primes, offsets = (
+            np.asarray(t.to("cpu"), dtype=np.int64)
+            for t in (state.token_map, state.multipliers, state.primes, state.offsets)
+        )
+        primes_4d = np.ascontiguousarray(primes[..., None])
+        return cls(
+            token_map=token_map.astype(np.int32),
+            multipliers=multipliers,
+            primes=primes_4d,
+            offsets=np.ascontiguousarray(offsets.reshape(primes_4d.shape)),
+            shifts=np.arange(multipliers.shape[1], dtype=np.int64)[:, None],
+        )
+
+    def scratch(self, count: int) -> np.ndarray:
+        """``[layers, ngram - 1, heads, count]`` int64 work buffer, reused."""
+        if not self._scratch or self._scratch[0].shape[-1] != count:
+            self._scratch[:] = [np.empty((*self.primes.shape[:3], count), np.int64)]
+        return self._scratch[0]
 
 
 def _load_local_rows(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
@@ -419,31 +494,55 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         )
         out.copy_((values * scale).masked_fill(~valid[:, :, None], 0).to(out.dtype))
 
+    def _select_local_heads_np(
+        self, indices: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """``_select_local_heads`` for host (NumPy) hash ids."""
+        start = min(self.head_start, self.n_hash_cols)
+        end = min(self.head_start + self.part_n_hash_cols, self.n_hash_cols)
+        selected = indices[:, start:end].astype(np.int64)
+        valid = (selected >= self.vocab_start_idx) & (selected < self.vocab_end_idx)
+        pad = self.part_n_hash_cols - (end - start)
+        if pad:
+            selected = np.pad(selected, ((0, 0), (0, pad)))
+            valid = np.pad(valid, ((0, 0), (0, pad)))
+        rows = np.clip(selected - self.vocab_start_idx, 0, self.part_num_embeddings - 1)
+        return rows, valid
+
     def gather_raw(self, indices, raw_out, scale_out):
         """Gather local heads' raw FP8 bytes and E8M0 scale bytes (no dequant).
 
-        ``raw_out`` is ``[T, local_heads, dim]`` uint8 and ``scale_out`` is
-        ``[T, local_heads, dim // block_size]`` uint8, both on the table's
-        device. Rows outside this shard (or padded heads) get the
+        Host-DRAM tables only. ``raw_out`` is ``[T, local_heads, dim]`` uint8
+        and ``scale_out`` is ``[T, local_heads, dim // block_size]`` uint8,
+        both on the host. Rows outside this shard (or padded heads) get the
         ``_INVALID_SCALE`` sentinel in every scale block; their raw bytes are
         left as gathered (masking them too cost ~11 ms per 8192-token step on
         the host). ``dequant_fp8_rows`` maps sentinel blocks to +0,
         exactly the zero rows that ``lookup`` writes for them.
+
+        Everything but the wide raw-row gather is NumPy: at decode sizes the
+        per-op cost of the torch CPU ops (head select, ``valid.all()``, the
+        8-byte scale-row ``index_select``) exceeded the work itself. The raw
+        rows stay on ``torch.index_select``, which parallelizes the
+        memory-latency-bound 256-byte row copies across intra-op threads.
         """
         weight, scales = self._storage()
         work_device = weight.device
         if indices.device != work_device:
             indices = indices.to(work_device)
-        rows, valid = self._select_local_heads(indices)
-        flat = rows.flatten()
+        rows, valid = self._select_local_heads_np(np.asarray(indices))
+        flat = rows.reshape(-1)
         torch.index_select(
-            weight.view(torch.uint8), 0, flat, out=raw_out.view(-1, self.dim)
+            weight.view(torch.uint8),
+            0,
+            torch.from_numpy(flat),
+            out=raw_out.view(-1, self.dim),
         )
-        torch.index_select(
-            scales, 0, flat, out=scale_out.view(-1, self.dim // self.block_size)
-        )
-        if not bool(valid.all()):
-            scale_out.masked_fill_(~valid[:, :, None], _INVALID_SCALE)
+        blocks = self.dim // self.block_size
+        scale_dst = np.asarray(scale_out.view(-1, blocks))
+        np.take(np.asarray(scales), flat, axis=0, out=scale_dst)
+        if not valid.all():
+            scale_dst.reshape(*valid.shape, blocks)[~valid] = _INVALID_SCALE
 
 
 # E8M0 scale byte for 2**0. Scale bytes encode 2**(byte - 127).
@@ -673,10 +772,14 @@ class Engram(upstream.Engram):
             raw_words = num_tokens * ((cols * head_dim) // 4)
             scale_bytes = num_tokens * cols * blocks
             scale_words = num_tokens * (-(-(cols * blocks) // 4))
-            if scale_words * 4 > scale_bytes:
-                self._host_scale_buf[scale_bytes : scale_words * 4].fill_(
-                    _INVALID_SCALE
-                )
+            # Pack the scale bytes right behind the raw bytes (a NumPy memmove;
+            # the torch CPU fill_/copy_ pair cost more than the 32 KB moved).
+            scale_src = np.asarray(self._host_scale_buf)
+            scale_src[scale_bytes : scale_words * 4] = _INVALID_SCALE
+            raw_bytes = raw_words * 4
+            np.asarray(self._host_packed_buf)[
+                raw_bytes : raw_bytes + scale_words * 4
+            ] = scale_src[: scale_words * 4]
             # On TorchTPU, `copy_()` into a slice/view of a materialized device
             # tensor allocates a fresh buffer per call instead of overwriting in
             # place, whereas a whole-tensor `copy_()` overwrites in place (see
@@ -686,9 +789,6 @@ class Engram(upstream.Engram):
             # exposing a 2-D `[num_tokens, words_per_tok]` dynamic-dim0 view to
             # `torch.compile` (`create_concrete_args`).
             host_words = self._host_packed_buf.view(torch.int32)
-            host_words[raw_words : raw_words + scale_words].copy_(
-                self._host_scale_buf[: scale_words * 4].view(torch.int32)
-            )
             staged = self._staged_tensors(num_tokens)
             staged.copy_(host_words[: raw_words + scale_words], non_blocking=True)
             self._active_raw = self._staged_views(num_tokens)
