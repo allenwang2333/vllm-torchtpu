@@ -15,6 +15,7 @@ from vllm.v1.core import kv_cache_coordinator
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
@@ -477,6 +478,7 @@ def test_scheduler_init_validates_and_globalizes(restore, monkeypatch, v2_env):
 
     def fake_init(self, vllm_config, kv_cache_config, *args, **kwargs):
         seen.append((oab._LAYOUT.get(), kv_cache_config.num_blocks))
+        self.kv_cache_manager = SimpleNamespace(block_pool=None)
 
     monkeypatch.setattr(Scheduler, "__init__", fake_init)
     oab.install()
@@ -496,6 +498,69 @@ def test_scheduler_init_validates_and_globalizes(restore, monkeypatch, v2_env):
             SimpleNamespace(), _vllm_config(prefix_caching=True), per_rank
         )
     assert len(seen) == 2
+
+
+def _scheduler(manager, running, policy=SchedulingPolicy.FCFS):
+    scheduler = SimpleNamespace(
+        kv_cache_manager=manager, policy=policy, running=running
+    )
+    oab._steer_preemption(scheduler)
+    return scheduler
+
+
+def test_full_owner_preempts_its_own_request(installed):
+    manager = _manager(specs=(FULL,))
+    pool = manager.block_pool
+    requests = [_request(f"r{i}", 64) for i in range(OWNERS + 2)]
+    for request in requests:
+        assert manager.allocate_slots(request, 64) is not None
+    # r0 .. r7 take owners 0 .. 7, then r8 fills owner 0 and r9 joins owner 1.
+    assert [pool.owner_of(r.request_id) for r in requests[8:]] == [0, 1]
+    scheduler = _scheduler(manager, list(requests))
+    first, victim, last = requests[0], requests[8], requests[9]
+    first.num_computed_tokens = 64
+    assert manager.allocate_slots(first, 16) is None
+    # FCFS would evict r9, which frees nothing on owner 0; r8 goes last.
+    assert scheduler.running == [*requests[:8], last, victim]
+    manager.free(scheduler.running.pop())
+    assert manager.allocate_slots(first, 16) is not None
+    assert scheduler.running == [*requests[:8], last]
+
+
+def test_preemption_victim_choice(pool):
+    a, b, c, d, e, x, y = (_request(name, 16) for name in "abcdexy")
+    for request, owner in ((a, 0), (b, 1), (c, 0), (d, 1), (e, 2), (y, 0)):
+        pool.bind(request.request_id, owner)
+    outcome = None
+    manager = SimpleNamespace(
+        block_pool=pool, allocate_slots=lambda request, *args, **kwargs: outcome
+    )
+    scheduler = _scheduler(manager, [a, b, c, d, e])
+    # The last request of a's owner behind it, skipping e of owner 2.
+    assert manager.allocate_slots(a, 16) is None
+    assert scheduler.running == [a, b, d, e, c]
+    # No request of d's owner behind it: d evicts itself, never b ahead of it.
+    scheduler.running = [a, b, c, d, e]
+    manager.allocate_slots(d, 16)
+    assert scheduler.running == [a, b, c, e, d]
+    # Success, a request without an owner, and one that is not running.
+    outcome = ["blocks"]
+    assert manager.allocate_slots(a, 16) == ["blocks"]
+    outcome = None
+    manager.allocate_slots(x, 16)
+    manager.allocate_slots(y, 16)
+    assert scheduler.running == [a, b, c, e, d]
+
+
+def test_preemption_steering_needs_fcfs_and_an_owner_pool(pool):
+    allocate_slots = object()
+    for block_pool, policy in (
+        (pool, SchedulingPolicy.PRIORITY),
+        (BlockPool(NUM_BLOCKS, False, BLOCK_SIZE), SchedulingPolicy.FCFS),
+    ):
+        manager = SimpleNamespace(block_pool=block_pool, allocate_slots=allocate_slots)
+        _scheduler(manager, [], policy)
+        assert manager.allocate_slots is allocate_slots
 
 
 def test_install_is_idempotent(installed):

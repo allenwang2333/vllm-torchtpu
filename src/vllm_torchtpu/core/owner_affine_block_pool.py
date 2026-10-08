@@ -20,6 +20,9 @@ the scheduler and the workers agree on it.
 A request gets its owner on its first successful allocation and keeps it until
 it is freed or preempted. Its blocks in owner-sharded groups come from its
 owner's region, and its blocks in replicated groups from the replicated region.
+When a running request cannot grow, only blocks of its owner help it, so FCFS
+preemption evicts the latest request of the same owner (or the request itself)
+instead of the latest request overall (``_queue_same_owner_victim``).
 
 The engine core sizes the KV cache per rank: ``M`` blocks. Workers keep that
 config and store ``M = R + P`` blocks, while the scheduler allocates from
@@ -46,6 +49,7 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
     get_max_concurrency_for_kv_cache_config,
 )
+from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     KVCacheConfig,
@@ -53,6 +57,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     SlidingWindowSpec,
 )
+from vllm.v1.request import Request
 
 from vllm_torchtpu import envs
 
@@ -563,15 +568,66 @@ def _publish_capacity(
     )
 
 
+def _queue_same_owner_victim(
+    running: list[Request], request: Request, pool: OwnerAffineBlockPool
+) -> None:
+    """Put the request that FCFS preemption should evict at ``running[-1]``.
+
+    ``request`` could not grow on its owner, and only that owner's blocks
+    help it. Evicting a request of another owner would discard its KV and
+    free nothing ``request`` can use. So the last request of the same owner
+    behind ``request`` goes to the end, or ``request`` itself if there is
+    none. The requests ahead of ``request`` are already scheduled this step
+    and stay where they are.
+    """
+    owner = pool.owner_of(request.request_id)
+    if owner is None or request not in running:
+        return
+    index = running.index(request)
+    for i in range(len(running) - 1, index, -1):
+        if pool.owner_of(running[i].request_id) == owner:
+            running.append(running.pop(i))
+            return
+    running.append(running.pop(index))
+
+
+def _steer_preemption(scheduler: Any) -> None:
+    """Make ``scheduler``'s FCFS preemption evict requests of the right owner.
+
+    The scheduler evicts ``running[-1]`` whenever ``allocate_slots`` fails for
+    a running request, so a failed allocation reorders ``scheduler.running``
+    first. The list is read at call time, as the scheduler rebinds it every
+    step. The priority policy picks victims by priority, not position, and is
+    left alone.
+    """
+    manager = scheduler.kv_cache_manager
+    pool = manager.block_pool
+    if not isinstance(pool, OwnerAffineBlockPool):
+        return
+    if scheduler.policy != SchedulingPolicy.FCFS:
+        return
+    allocate_slots = manager.allocate_slots
+
+    @functools.wraps(allocate_slots)
+    def steered_allocate_slots(request: Request, *args: Any, **kwargs: Any) -> Any:
+        blocks = allocate_slots(request, *args, **kwargs)
+        if blocks is None:
+            _queue_same_owner_victim(scheduler.running, request, pool)
+        return blocks
+
+    manager.allocate_slots = steered_allocate_slots
+
+
 def install() -> None:
     """Make schedulers allocate KV blocks from ``OwnerAffineBlockPool``.
 
     Rebinds the ``BlockPool`` name that ``KVCacheCoordinator`` resolves at
     construction. Wraps ``Scheduler.__init__`` so that the config is
-    validated, the scheduler allocates from every owner's region, and the
-    pool gets its layout. Wraps ``KVCacheManager`` so that each request's
-    allocations run inside its owner's scope and the replicated groups
-    allocate from the replicated region.
+    validated, the scheduler allocates from every owner's region, the pool
+    gets its layout, and FCFS preemption evicts requests of the right owner.
+    Wraps ``KVCacheManager`` so that each request's allocations run inside
+    its owner's scope and the replicated groups allocate from the replicated
+    region.
     """
     from vllm.v1.core import kv_cache_coordinator
     from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -599,6 +655,7 @@ def install() -> None:
         _publish_capacity(vllm_config, kv_cache_config, layout)
         with layout_scope(layout):
             orig_scheduler_init(self, *args, **kwargs)
+        _steer_preemption(self)
 
     @functools.wraps(orig_init)
     def __init__(self, *args, **kwargs):
