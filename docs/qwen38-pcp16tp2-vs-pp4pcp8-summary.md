@@ -6,7 +6,7 @@ Part 1 compares disaggregated 1P1D serving (prefill engine feeding a TP32 + DCP8
 
 ## Setup
 
-- Prefill engine (32 cores, 2x2x4 slice): baseline = PCP16xTP2; exp = PP4xPCP8 (dynamic chunks + lazy push enabled).
+- Prefill engine (32 cores, 2x2x4 slice): baseline = PCP16xTP2; exp = PP4xPCP8.
 - Decode engine (32 cores, 2x2x4 slice, identical on both legs): TP32 + DCP8, EP32, `--async-scheduling`, max 256 sequences, block size 384, fp8 KV.
 - KV hand-off: Raiden Stage-3 (seq-on-lane layout), resharding 32 producer ranks into 32 decode shards x 8 DCP lanes, with per-layer pool pairing on pipeline stages (`TPU_RAIDEN_POOL_TAGS_PER_LAYER=1`).
 - Δ = (exp − baseline) / baseline. Positive Δ tok/s means exp is faster; negative Δ TTFT, TPOT, ITL, or fill time means exp is faster.
