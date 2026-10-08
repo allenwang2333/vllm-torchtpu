@@ -126,6 +126,9 @@ from vllm_torchtpu.runner.mm_encoder_manager import (
     maybe_create_mm_encoder_manager,
 )
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
+from vllm_torchtpu.runner.owner_token_layout import (
+    attach_step_owner_token_layout,
+)
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -1534,6 +1537,14 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 for layer_name in group.layer_names:
                     per_layer_attn_metadata[layer_name] = built
+        if envs.TPU_DEEPSEEK_V41_KV_SHARD:
+            attach_step_owner_token_layout(
+                self,
+                per_layer_attn_metadata,
+                num_tokens_padded=(
+                    num_tokens_padded if num_tokens_padded is not None else num_tokens
+                ),
+            )
         return per_layer_attn_metadata, None
 
     def build_attention_metadata_for_layers(

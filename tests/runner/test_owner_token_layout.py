@@ -291,3 +291,309 @@ def test_extract_request_owners_and_prepare_kv_shard_layout():
         extract_request_owners_from_block_table(main_tbl, owner_layout, num_reqs=5)
     with pytest.raises(ValueError, match="Expected num_blocks_per_req of shape"):
         extract_request_owners_from_block_table(main_tbl, [1, 2], owner_layout)
+
+
+def test_request_owners_and_overflow_paddings():
+    import torch
+
+    from vllm_torchtpu.core.owner_affine_block_pool import OwnerLayout
+    from vllm_torchtpu.runner.owner_token_layout import (
+        prepare_kv_shard_owner_token_layout,
+        request_owners,
+    )
+
+    layout = OwnerLayout(num_replicated=5, num_owners=4, blocks_per_owner=10)
+    block_ids = np.zeros((8, 4), dtype=np.int32)
+    block_ids[:4, 0] = [38, 6, 25, 14]
+
+    owners = request_owners(block_ids, slice(0, 4), layout)
+    np.testing.assert_array_equal(owners, [3, 0, 2, 0])
+    assert owners.dtype == np.int32
+
+    # Error guard when column 0 holds a replicated or out-of-range block id
+    for bad_id in (4, 45):
+        bad_table = block_ids.copy()
+        bad_table[1, 0] = bad_id
+        with pytest.raises(ValueError, match="not in an owner region"):
+            request_owners(bad_table, slice(0, 4), layout)
+
+    # Overflowing owner fallback in prepare_kv_shard_owner_token_layout:
+    # owner 0 has 6 tokens (need = 4 * 6 = 24 > max([4, 8])), so _owner_paddings
+    # scales [4, 8] -> [16, 32] and selects padded_tokens=32, segment_tokens=8.
+    tok_layout = prepare_kv_shard_owner_token_layout(
+        block_ids[:4],
+        layout,
+        [1, 5, 1, 1],
+        [4, 8],
+        num_padded_tokens=8,
+    )
+    assert (tok_layout.padded_tokens, tok_layout.segment_tokens) == (32, 8)
+    np.testing.assert_array_equal(tok_layout.owner_tokens, [6, 0, 1, 1])
+
+    # Empty tokens_arr guard in prepare_kv_shard_owner_token_layout raises ValueError
+    with pytest.raises(ValueError, match="no scheduled tokens"):
+        prepare_kv_shard_owner_token_layout(
+            block_ids[:0], layout, torch.zeros((0,), dtype=torch.int32), [8]
+        )
+
+
+def test_attach_step_owner_token_layout_and_tpu_runner_build_metadata(monkeypatch):
+    import os
+    from types import SimpleNamespace
+
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    import torch
+    from vllm.v1.kv_cache_interface import (
+        CircularBufferSpec,
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        SlidingWindowSpec,
+    )
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.core.attention_metadata import (
+        AttentionMetadata,
+        AttentionMetadataBuilderContext,
+    )
+    from vllm_torchtpu.runner.owner_token_layout import (
+        attach_step_owner_token_layout,
+    )
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    swa_spec = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.bfloat16,
+        sliding_window=32,
+    )
+    ring_spec = CircularBufferSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float32,
+    )
+    full_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.bfloat16,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=20,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attn.swa"], swa_spec),
+            KVCacheGroupSpec(["attn.ring"], ring_spec),
+            KVCacheGroupSpec(["attn.full.0", "attn.full.1"], full_spec),
+        ],
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        scheduler_config=SimpleNamespace(max_num_seqs=2),
+        speculative_config=None,
+        max_in_flight_tokens=16,
+    )
+
+    # worker_owner_layout gives num_replicated = 1 + 2 + 2*(2+2)+1 = 12,
+    # per_owner = 20 - 12 = 8 -> owner 0 is [12, 20), owner 1 is [20, 28).
+    replicated_ids = np.zeros((4, 4), dtype=np.int32)
+    sharded_ids = np.zeros((4, 4), dtype=np.int32)
+    sharded_ids[0, 0] = 22  # owner 1
+    sharded_ids[1, 0] = 14  # owner 0
+    sharded_ids[2, 0] = 25  # owner 1
+
+    # Table 2 uses table.block_table.np when _bt_cpu_np is absent
+    block_tables = [
+        SimpleNamespace(_bt_cpu_np=replicated_ids),
+        SimpleNamespace(_bt_cpu_np=replicated_ids),
+        SimpleNamespace(block_table=SimpleNamespace(np=sharded_ids)),
+    ]
+
+    def _make_metas():
+        q_loc = torch.tensor([0, 2, 3, 6, 6], dtype=torch.int32)
+        swa_meta = AttentionMetadata(input_positions=None, query_start_loc=q_loc)
+        ring_meta = AttentionMetadata(input_positions=None, query_start_loc=q_loc)
+        full_meta = AttentionMetadata(input_positions=None, query_start_loc=q_loc)
+        return {
+            "attn.swa": swa_meta,
+            "attn.ring": ring_meta,
+            "attn.full.0": full_meta,
+            "attn.full.1": full_meta,
+        }
+
+    runner = object.__new__(TPUModelRunner)
+    runner.vllm_config = vllm_config
+    runner.parallel_config = vllm_config.parallel_config
+    runner.kv_cache_config = kv_cache_config
+    runner.input_batch = SimpleNamespace(
+        block_table=SimpleNamespace(block_tables=block_tables)
+    )
+    runner.num_tokens_paddings = [4, 8, 16]
+    runner.num_tokens_padded = 8
+
+    # 1. Disabled when TPU_DEEPSEEK_V41_KV_SHARD is False
+    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_KV_SHARD", False)
+    metas = _make_metas()
+    assert attach_step_owner_token_layout(runner, metas) is None
+    assert getattr(metas["attn.full.0"], "owner_perm", None) is None
+
+    # 2. Enabled guard branches (tp_size <= 1, empty dict, ctx None/empty)
+    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_KV_SHARD", True)
+    runner.parallel_config = SimpleNamespace(tensor_parallel_size=1)
+    assert attach_step_owner_token_layout(runner, metas) is None
+    runner.parallel_config = vllm_config.parallel_config
+    assert attach_step_owner_token_layout(runner, {}) is None
+    runner._attn_metadata_builder_ctx = None
+    assert attach_step_owner_token_layout(runner, metas) is None
+    runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+        num_reqs=0,
+        start_index=0,
+        use_max_model_len=True,
+        seq_lens=torch.zeros(0, dtype=torch.int32),
+        query_start_loc=torch.zeros(1, dtype=torch.int32),
+        request_distribution=torch.zeros(3, dtype=torch.int32),
+    )
+    assert attach_step_owner_token_layout(runner, metas) is None
+    runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+        num_reqs=3,
+        start_index=0,
+        use_max_model_len=True,
+        seq_lens=torch.tensor([2, 1, 3, 0], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2, 3, 6, 6], dtype=torch.int32),
+        request_distribution=torch.tensor([0, 0, 3], dtype=torch.int32),
+        query_start_loc_cpu=None,
+    )
+    assert attach_step_owner_token_layout(runner, metas) is None
+
+    # 3. Live serving step via TPUModelRunner._build_attention_metadata
+    q_loc_cpu = torch.tensor([0, 2, 3, 6, 6], dtype=torch.int32)
+    runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+        num_reqs=3,
+        start_index=0,
+        use_max_model_len=True,
+        seq_lens=torch.tensor([2, 1, 3, 0], dtype=torch.int32),
+        query_start_loc=q_loc_cpu.clone(),
+        request_distribution=torch.tensor([0, 0, 3], dtype=torch.int32),
+        query_start_loc_cpu=q_loc_cpu,
+        staged_block_tables={0: torch.zeros((4, 1), dtype=torch.int32)},
+    )
+
+    class _FakeBuilder:
+        def build(self, common_prefix_len, common_attn_metadata):
+            return AttentionMetadata(
+                input_positions=None, query_start_loc=q_loc_cpu.clone()
+            )
+
+    runner.attn_groups = [
+        [
+            SimpleNamespace(
+                metadata_builders=[_FakeBuilder()],
+                layer_names=["attn.swa"],
+            ),
+            SimpleNamespace(
+                metadata_builders=[_FakeBuilder()],
+                layer_names=["attn.full.0", "attn.full.1"],
+            ),
+        ]
+    ]
+    built_metas, spec_meta = runner._build_attention_metadata(
+        num_tokens=6, num_reqs=3, num_tokens_padded=8, num_reqs_padded=4
+    )
+    assert spec_meta is None
+    full0 = built_metas["attn.full.0"]
+    assert full0 is built_metas["attn.full.1"]
+    assert full0.owner_token_layout is not None
+    assert runner._kv_shard_group_cache == (id(kv_cache_config), 2)
+    assert torch.equal(
+        full0.owner_perm,
+        torch.tensor(
+            [2, -1, -1, -1, -1, -1, -1, -1, 0, 1, 3, 4, 5, -1, -1, -1],
+            dtype=torch.int32,
+        ),
+    )
+    assert torch.equal(
+        full0.owner_inv,
+        torch.tensor([8, 9, 0, 10, 11, 12, -1, -1], dtype=torch.int32),
+    )
+    assert torch.equal(
+        full0.owner_q_loc,
+        torch.tensor([[0, 0, 1, 1, 1], [0, 2, 2, 5, 5]], dtype=torch.int32),
+    )
+
+    # Also test CED=0 fallback (query_start_loc_cpu=None, runner.query_start_loc_np set)
+    # hitting the steady-state step layout cache, and CED=1 tuple + req_indices
+    block_tables[2] = SimpleNamespace(_bt_cpu_np=sharded_ids)
+    runner._attn_metadata_builder_ctx.query_start_loc_cpu = None
+    runner.query_start_loc_np = np.array([0, 2, 3, 6, 6], dtype=np.int32)
+    metas_np_fallback = _make_metas()
+    tok_np_fallback = attach_step_owner_token_layout(runner, metas_np_fallback)
+    assert tok_np_fallback is full0.owner_token_layout
+    assert metas_np_fallback["attn.full.0"].owner_perm is full0.owner_perm
+
+    runner._attn_metadata_builder_ctx.req_indices = [0, 2]
+    runner._attn_metadata_builder_ctx.num_reqs = 2
+    runner._attn_metadata_builder_ctx.query_start_loc_cpu = (0, 3, 6, 6, 6)
+    runner.num_tokens_paddings = [4, 8]
+    runner.num_tokens_padded = 8
+    metas_overflow = _make_metas()
+    tok_overflow = attach_step_owner_token_layout(runner, metas_overflow)
+    assert tok_overflow is not None
+    assert (tok_overflow.padded_tokens, tok_overflow.segment_tokens) == (16, 8)
+
+    # 4. Dummy / profile run with position_ids_override != None (padded > num_tokens)
+    runner.num_tokens_padded = 6
+    runner.num_tokens_paddings = [8]
+    runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+        num_reqs=3,
+        start_index=0,
+        use_max_model_len=True,
+        seq_lens=torch.ones(3, dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2, 4, 6], dtype=torch.int32),
+        request_distribution=torch.tensor([0, 0, 3], dtype=torch.int32),
+        position_ids_override=torch.zeros(6, dtype=torch.int32),
+    )
+    dummy_metas = {
+        "attn.swa": AttentionMetadata(
+            input_positions=None,
+            query_start_loc=torch.tensor([0, 2, 4, 6], dtype=torch.int32),
+        )
+    }
+    assert attach_step_owner_token_layout(runner, dummy_metas) is None
+    assert torch.equal(
+        dummy_metas["attn.swa"].owner_perm,
+        torch.tensor([0, 1, 2, 3, 4, 5, -1, -1], dtype=torch.int32),
+    )
+    assert torch.equal(
+        dummy_metas["attn.swa"].owner_inv,
+        torch.arange(6, dtype=torch.int32),
+    )
+    assert torch.equal(
+        dummy_metas["attn.swa"].owner_q_loc,
+        torch.tensor([[0, 2, 4, 4], [0, 0, 0, 2]], dtype=torch.int32),
+    )
+
+    # Dummy run with padded == num_tokens_padded (8 == 8)
+    runner.num_tokens_padded = 8
+    dummy_metas_eq = {
+        "attn.swa": AttentionMetadata(
+            input_positions=None,
+            query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+        )
+    }
+    assert attach_step_owner_token_layout(runner, dummy_metas_eq) is None
+    assert torch.equal(
+        dummy_metas_eq["attn.swa"].owner_perm,
+        torch.arange(8, dtype=torch.int32),
+    )
+
+    # 5. Disabled TPU_DEEPSEEK_V41_KV_SHARD in _build_attention_metadata is a no-op
+    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_KV_SHARD", False)
+    runner._attn_metadata_builder_ctx.staged_block_tables = {
+        0: torch.zeros((4, 1), dtype=torch.int32)
+    }
+    built_off, _ = runner._build_attention_metadata(
+        num_tokens=6, num_reqs=3, num_tokens_padded=8, num_reqs_padded=4
+    )
+    assert getattr(built_off["attn.full.0"], "owner_perm", None) is None
