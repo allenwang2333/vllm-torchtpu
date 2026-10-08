@@ -682,15 +682,25 @@ class TestGatherHostEngramHashes:
                     out_exact = gather_host_engram_hashes(hashes)
                     assert out_exact.shape == (2, 1, 2)
 
-                # 2c. engram_hashes.shape[0] > slot -> ValueError
+                # 2c. engram_gathered_num_tokens == 0 (dummy run with dp_lockstep=False)
+                # falls back to slot = engram_hashes.shape[0]
+                with patch(
+                    "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.engram_gathered_num_tokens",
+                    return_value=0,
+                ):
+                    out_zero_slot = gather_host_engram_hashes(hashes)
+                    assert out_zero_slot.shape == (2, 1, 2)
+
+                # 2d. engram_hashes.shape[0] > slot (slot > 0) -> ValueError
+                hashes_two = torch.zeros((2, 1, 2), dtype=torch.int32)
                 with (
                     patch(
                         "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.engram_gathered_num_tokens",
-                        return_value=0,
+                        return_value=1,
                     ),
                     pytest.raises(ValueError, match="exceeds the DP token slot"),
                 ):
-                    gather_host_engram_hashes(hashes)
+                    gather_host_engram_hashes(hashes_two)
 
     def test_fallback_import_when_gather_fn_none(self):
         hashes = torch.tensor([[[1, 2]]], device="meta")
@@ -702,6 +712,27 @@ class TestGatherHostEngramHashes:
                 hashes, dp_shared_memory=True, gather_fn=None
             )
             assert out == "default_nvidia_gather"
+
+        # Non-CPU dummy run (raw_slot <= 0, gather_fn None) uses dp_group.all_gather
+        fake_dp_dev = SimpleNamespace(
+            world_size=2,
+            cpu_group="fake_cpu",
+            all_gather=lambda t, dim=0: "device_dummy_gather",
+        )
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.get_engram_dp_group",
+                return_value=fake_dp_dev,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.is_forward_context_available",
+                return_value=False,
+            ),
+        ):
+            out_dev_dummy = gather_host_engram_hashes(
+                hashes, dp_shared_memory=False, gather_fn=None
+            )
+            assert out_dev_dummy == "device_dummy_gather"
 
 
 # ==============================================================================

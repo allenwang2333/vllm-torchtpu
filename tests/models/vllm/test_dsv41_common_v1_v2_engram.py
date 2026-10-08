@@ -713,6 +713,128 @@ class TestEngramModule:
             rows.float(), torch.ones_like(rows.float()), atol=1e-3
         ).all()
 
+    def test_dp_engram_sharding_and_ready_rows_branches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        # 1. ParallelEngramEmbedding._get_shard_info with dp_size > 1
+        monkeypatch.setattr(
+            common_engram.upstream, "get_tensor_model_parallel_world_size", lambda: 4
+        )
+        monkeypatch.setattr(
+            common_engram.upstream, "get_tensor_model_parallel_rank", lambda: 1
+        )
+        monkeypatch.setattr(common_engram, "get_engram_dp_size", lambda: 2)
+        monkeypatch.setattr(common_engram, "engram_head_shard_rank", lambda: 3)
+
+        head_sizes = tuple([8] * 24)
+        emb_dp = common_engram.ParallelEngramEmbedding(
+            256, 32, head_sizes, cpu_offload=True
+        )
+        assert emb_dp.dp_size == 2
+        assert emb_dp._get_shard_info() == (8, 3)
+        assert emb_dp.part_n_hash_cols == 3
+        assert emb_dp.head_start == 9
+
+        emb_shm = common_engram.ParallelEngramEmbedding(
+            256, 32, head_sizes, cpu_offload=True, dp_shared_memory=True
+        )
+        assert emb_shm.dp_shared_memory is True
+        assert emb_shm.dp_size == 1
+        assert emb_shm._get_shard_info() == (4, 1)
+
+        # 2. _engram_dp_slot branches (no ctx, slot <= 0, slot > 0)
+        monkeypatch.setattr(
+            common_engram, "is_forward_context_available", lambda: False
+        )
+        assert common_engram._engram_dp_slot(5) == 5
+
+        monkeypatch.setattr(common_engram, "is_forward_context_available", lambda: True)
+        monkeypatch.setattr(
+            common_engram,
+            "get_forward_context",
+            lambda: SimpleNamespace(dp_metadata=object()),
+        )
+        monkeypatch.setattr(common_engram, "engram_gathered_num_tokens", lambda: 0)
+        assert common_engram._engram_dp_slot(5) == 5
+        monkeypatch.setattr(common_engram, "engram_gathered_num_tokens", lambda: 8)
+        assert common_engram._engram_dp_slot(5) == 8
+
+        # 3. _dp_gather_engram_rows branches (None/size 1, padded/aligned width)
+        t_in = torch.arange(24, dtype=torch.bfloat16).reshape(4, 3, 2)
+        monkeypatch.setattr(common_engram, "get_engram_dp_group", lambda: None)
+        assert torch.equal(common_engram._dp_gather_engram_rows(t_in, 2), t_in[:2])
+
+        dp0_staged = torch.tensor(
+            [[[1.0, 2.0]], [[3.0, 4.0]], [[5.0, 6.0]], [[7.0, 8.0]]],
+            dtype=torch.bfloat16,
+        )  # [dp_size * slot = 4, local_heads = 1, width = 2]
+        dp1_staged = dp0_staged + 10.0
+
+        fake_dp = SimpleNamespace(
+            world_size=2,
+            rank_in_group=1,
+            all_gather=lambda t, dim=0: torch.cat(
+                [t - 10.0, t], dim=0
+            ),  # rank 0 + rank 1
+        )
+        monkeypatch.setattr(common_engram, "get_engram_dp_group", lambda: fake_dp)
+        # Unaligned width=2 (pads to 128) and num_tokens=1 out of slot=2 on rank 1
+        out_unaligned = common_engram._dp_gather_engram_rows(dp1_staged, 1)
+        assert out_unaligned.shape == (1, 2, 2)
+        assert torch.equal(
+            out_unaligned,
+            torch.tensor([[[5.0, 6.0], [15.0, 16.0]]], dtype=torch.bfloat16),
+        )
+
+        # Aligned width=128 (no padding)
+        dp1_aligned = torch.ones((4, 1, 128), dtype=torch.bfloat16)
+        fake_dp_aligned = SimpleNamespace(
+            world_size=2,
+            rank_in_group=0,
+            all_gather=lambda t, dim=0: torch.cat([t, t * 2], dim=0),
+        )
+        monkeypatch.setattr(
+            common_engram, "get_engram_dp_group", lambda: fake_dp_aligned
+        )
+        out_aligned = common_engram._dp_gather_engram_rows(dp1_aligned, 2)
+        assert out_aligned.shape == (2, 2, 128)
+        assert torch.all(out_aligned[:, 0] == 1.0)
+        assert torch.all(out_aligned[:, 1] == 2.0)
+
+        # 4. Engram._ready_rows under dp_size=2 across active_rows, unstaged, and staged
+        engram = object.__new__(common_engram.Engram)
+        engram.embed_tokens = SimpleNamespace(
+            dp_size=2,
+            cpu_offload=True,
+            host_dma=False,
+            part_n_hash_cols=1,
+            block_size=8,
+            dim=16,
+            gather_raw=lambda hids, r_out, s_out: (
+                r_out.fill_(0x38),
+                s_out.fill_(127),
+            ),
+        )
+        common_engram.Engram._init_staging(engram, 4, 16)
+        assert engram._host_raw.shape == (8, 1, 16)
+
+        # 4a. active_rows (HOST_DMA=1) with dp_size=2
+        engram._active_rows = torch.ones((4, 1, 16), dtype=torch.bfloat16)
+        rows_dma = engram._ready_rows(2)
+        assert rows_dma.shape == (2, 2, 16)
+        engram._active_rows = None
+
+        # 4b. staged (OFFLOAD=1) with dp_size=2: 4 DP tokens -> 2 local tokens
+        engram.prepare_embeddings(torch.zeros((4, 1), dtype=torch.int32))
+        rows_staged = engram._ready_rows(2)
+        assert rows_staged.shape == (2, 2, 16)
+
+        # 4c. unstaged (OFFLOAD=0) with dp_size=2
+        engram._staged_raw = None
+        monkeypatch.setattr(common_engram, "engram_gathered_num_tokens", lambda: 2)
+        rows_unstaged = engram._ready_rows(1)
+        assert rows_unstaged.shape == (1, 2, 16)
+
     @pytest.mark.parametrize("num_tokens", [6, 7])
     @pytest.mark.parametrize("tp_size", [1, 2])
     def test_engram_sp_embed_and_forward(

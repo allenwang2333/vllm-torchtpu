@@ -310,38 +310,39 @@ def gather_host_engram_hashes(
     gather_fn: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Gather Engram hashes across DP, using ``dp_group.cpu_group`` on CPU."""
-    if engram_hashes.device.type == "cpu" and not dp_shared_memory:
+    if not dp_shared_memory:
         dp_group = get_engram_dp_group()
-        if (
-            dp_group is not None
-            and getattr(dp_group, "world_size", 1) > 1
-            and getattr(dp_group, "cpu_group", None) is not None
-        ):
+        if dp_group is not None and getattr(dp_group, "world_size", 1) > 1:
             dp_metadata = (
                 getattr(get_forward_context(), "dp_metadata", None)
                 if is_forward_context_available()
                 else None
             )
-            slot = (
-                engram_gathered_num_tokens()
-                if dp_metadata is not None
-                else int(engram_hashes.shape[0])
+            raw_slot = engram_gathered_num_tokens() if dp_metadata is not None else 0
+            slot = raw_slot if raw_slot > 0 else int(engram_hashes.shape[0])
+            cpu_group = (
+                getattr(dp_group, "cpu_group", None)
+                if engram_hashes.device.type == "cpu"
+                else None
             )
-            if engram_hashes.shape[0] > slot:
-                raise ValueError("Engram token count exceeds the DP token slot")
-            if engram_hashes.shape[0] < slot:
-                pad = engram_hashes.new_full(
-                    (slot - engram_hashes.shape[0], *engram_hashes.shape[1:]),
-                    DEAD_ID,
+            if cpu_group is not None:
+                if engram_hashes.shape[0] > slot:
+                    raise ValueError("Engram token count exceeds the DP token slot")
+                if engram_hashes.shape[0] < slot:
+                    pad = engram_hashes.new_full(
+                        (slot - engram_hashes.shape[0], *engram_hashes.shape[1:]),
+                        DEAD_ID,
+                    )
+                    engram_hashes = torch.cat((engram_hashes, pad))
+                out = engram_hashes.new_empty(
+                    (dp_group.world_size * slot, *engram_hashes.shape[1:])
                 )
-                engram_hashes = torch.cat((engram_hashes, pad))
-            out = engram_hashes.new_empty(
-                (dp_group.world_size * slot, *engram_hashes.shape[1:])
-            )
-            torch.distributed.all_gather_into_tensor(
-                out, engram_hashes.contiguous(), group=dp_group.cpu_group
-            )
-            return out
+                torch.distributed.all_gather_into_tensor(
+                    out, engram_hashes.contiguous(), group=cpu_group
+                )
+                return out
+            if raw_slot <= 0 and gather_fn is None:
+                return dp_group.all_gather(engram_hashes, dim=0)
     if gather_fn is not None:
         return gather_fn(engram_hashes, dp_shared_memory=dp_shared_memory)
     from vllm.models.deepseek_v41.nvidia.engram import gather_engram_hashes

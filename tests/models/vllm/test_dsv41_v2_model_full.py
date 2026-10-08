@@ -263,6 +263,19 @@ class TestCedConfig:
             assert boundary == 20
             mock_log.warning.assert_not_called()
 
+        # 3b. CED=1 and dp_size > 1 (EXT-1B DP=2 x TP=4) disables CED
+        cfg_dp2 = _mock_vllm_config(
+            num_hidden_layers=40, enable_prefix_caching=False, dp_size=2
+        )
+        with (
+            patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_CED", True),
+            patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.logger") as mock_log,
+        ):
+            enabled, boundary = _ced_config(cfg_dp2, warn_prefix_caching=True)
+            assert enabled is False
+            assert boundary == 20
+            mock_log.warning.assert_called_once()
+
         # 4. CED=0 -> enabled False
         with patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_CED", False):
             enabled, boundary = _ced_config(cfg, warn_prefix_caching=False)

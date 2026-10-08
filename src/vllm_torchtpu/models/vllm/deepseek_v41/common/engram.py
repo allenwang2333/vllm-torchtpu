@@ -9,7 +9,13 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+from vllm.distributed import get_engram_dp_group, get_engram_dp_size
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.models.deepseek_v41.common import engram as upstream
+from vllm.models.deepseek_v41.nvidia.engram import (
+    engram_gathered_num_tokens,
+    engram_head_shard_rank,
+)
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.upstream_bindings import (
@@ -202,8 +208,10 @@ class NgramHashState(upstream.NgramHashState):
         _, ngram = multipliers.shape
         dev = input_ids.device
         rows = torch.arange(count, device=dev)
-        reqs = torch.bucketize(rows, query_start_loc[1:], right=True).clamp(
-            max=lookback_token_ids.shape[0] - 1
+        reqs = (
+            (rows.unsqueeze(1) >= query_start_loc[1:].unsqueeze(0))
+            .sum(-1)
+            .clamp(max=lookback_token_ids.shape[0] - 1)
         )
         starts = query_start_loc[reqs].long().clamp(max=count - 1)
         chunk_positions = positions[starts]
@@ -298,6 +306,8 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             if cpu_offload is None
             else bool(cpu_offload)
         )
+        self.dp_shared_memory = bool(kwargs.pop("dp_shared_memory", False))
+        self.dp_size = 1 if self.dp_shared_memory else get_engram_dp_size()
         # Rows load into Host DRAM as with cpu_offload, then
         # `move_rows_to_pinned_host` hands them to the TPU's pinned_host
         # memory, after which `lookup` runs on device like an HBM table.
@@ -316,6 +326,11 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             upstream.set_weight_attrs(
                 self.weight_scale_inv, {"dummy_weight_value": 127}
             )
+
+    def _get_shard_info(self) -> tuple[int, int]:
+        if getattr(self, "dp_size", 1) == 1:
+            return super()._get_shard_info()
+        return self.tp_size * self.dp_size, engram_head_shard_rank()
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.cpu_offload:
@@ -481,6 +496,49 @@ def _gather_engram_rows(rows, dim):
     return result[..., :width].contiguous() if padding else result
 
 
+def _engram_dp_slot(default_tokens: int) -> int:
+    if (
+        is_forward_context_available()
+        and getattr(get_forward_context(), "dp_metadata", None) is not None
+    ):
+        slot = engram_gathered_num_tokens()
+        if slot > 0:
+            return slot
+    return default_tokens
+
+
+def _dp_gather_engram_rows(staged: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """Exchange DP tokens for heads, retaining only this replica's tokens."""
+    dp_group = get_engram_dp_group()
+    if dp_group is None or dp_group.world_size <= 1:
+        return staged[:num_tokens]
+    dp_size = dp_group.world_size
+    slot, remainder = divmod(staged.shape[0], dp_size)
+    assert remainder == 0 and 0 <= num_tokens <= slot
+    local_heads, width = staged.shape[1:]
+    padding = (-width) % 128
+    if padding:
+        staged = torch.nn.functional.pad(staged, (0, padding))
+    gathered = dp_group.all_gather(staged, dim=0)
+    if padding:
+        gathered = gathered[..., :width]
+    start = dp_group.rank_in_group * slot
+    selected = gathered.view(dp_size, dp_size * slot, local_heads, width)[
+        :, start : start + num_tokens
+    ]
+    return (
+        selected.transpose(0, 1)
+        .reshape(num_tokens, dp_size * local_heads, width)
+        .contiguous()
+    )
+
+
+def _embed_dp_size(engram: object) -> int:
+    embed = getattr(engram, "embed_tokens", None)
+    dp_size = getattr(embed, "dp_size", 1)
+    return dp_size if type(dp_size) is int else 1
+
+
 class Engram(upstream.Engram):
     """Inherit projections, staging and collective head gather from upstream."""
 
@@ -506,7 +564,8 @@ class Engram(upstream.Engram):
         return embedding
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
-        super()._init_staging(max_tokens, head_dim)
+        dp_tokens = max_tokens * _embed_dp_size(self)
+        super()._init_staging(dp_tokens, head_dim)
         self._staged_raw: torch.Tensor | None = None
         self._active_raw: torch.Tensor | None = None
         self._active_rows: torch.Tensor | None = None
@@ -532,28 +591,26 @@ class Engram(upstream.Engram):
             scale_words_per_tok = -(-(cols * blocks) // 4)
             words_per_tok = raw_words_per_tok + scale_words_per_tok
             self._host_packed_buf = torch.zeros(
-                max_tokens * words_per_tok * 4, dtype=torch.uint8, device="cpu"
+                dp_tokens * words_per_tok * 4, dtype=torch.uint8, device="cpu"
             )
             self._host_raw = self._host_packed_buf[
-                : max_tokens * raw_words_per_tok * 4
-            ].view(max_tokens, cols, head_dim)
-            scale_bytes = max_tokens * cols * blocks
+                : dp_tokens * raw_words_per_tok * 4
+            ].view(dp_tokens, cols, head_dim)
+            scale_bytes = dp_tokens * cols * blocks
             self._host_scale_buf = torch.full(
-                (max_tokens * scale_words_per_tok * 4,),
+                (dp_tokens * scale_words_per_tok * 4,),
                 _INVALID_SCALE,
                 dtype=torch.uint8,
                 device="cpu",
             )
             self._host_scale = self._host_scale_buf[:scale_bytes].view(
-                max_tokens, cols, blocks
+                dp_tokens, cols, blocks
             )
-            self._staged_raw = torch.zeros(
-                max_tokens * words_per_tok, dtype=torch.int32
-            )
+            self._staged_raw = torch.zeros(dp_tokens * words_per_tok, dtype=torch.int32)
             # -1 is four `_INVALID_SCALE` bytes, matching `_host_scale_buf`.
-            self._staged_raw[max_tokens * raw_words_per_tok :].fill_(-1)
-            self._staged_by_tokens[max_tokens] = self._staged_raw
-            self._active_raw = self._staged_views(max_tokens)
+            self._staged_raw[dp_tokens * raw_words_per_tok :].fill_(-1)
+            self._staged_by_tokens[dp_tokens] = self._staged_raw
+            self._active_raw = self._staged_views(dp_tokens)
 
     def _staged_tensors(self, num_tokens: int) -> torch.Tensor:
         assert self._staged_raw is not None
@@ -638,28 +695,40 @@ class Engram(upstream.Engram):
         super().prepare_embeddings(hash_ids)
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
+        dp_size = _embed_dp_size(self)
         active_rows = getattr(self, "_active_rows", None)
         if active_rows is not None:
-            return active_rows
+            return (
+                _dp_gather_engram_rows(active_rows, num_tokens)
+                if dp_size > 1
+                else active_rows
+            )
         if self._staged_raw is None:
+            if dp_size > 1:
+                slot = _engram_dp_slot(num_tokens)
+                return _dp_gather_engram_rows(
+                    self.staged_rows[: slot * dp_size], num_tokens
+                )
             return super()._ready_rows(num_tokens)
         _, cols, head_dim = self._host_raw.shape
         blocks = self._host_scale.shape[-1]
         raw_words_per_tok = (cols * head_dim) // 4
         scale_words_per_tok = -(-(cols * blocks) // 4)
-        raw_bytes = num_tokens * cols * head_dim
-        scale_bytes = num_tokens * cols * blocks
         assert self._active_raw is not None
+        staged_tokens = num_tokens if dp_size == 1 else self._active_raw.shape[0]
+        raw_bytes = staged_tokens * cols * head_dim
+        scale_bytes = staged_tokens * cols * blocks
         by_word = self._active_raw.view(
-            raw_words_per_tok + scale_words_per_tok, num_tokens
+            raw_words_per_tok + scale_words_per_tok, staged_tokens
         )
         raw = _unpack_bytes(by_word[:raw_words_per_tok].view(-1), raw_bytes)
         scale = _unpack_bytes(by_word[raw_words_per_tok:].view(-1), scale_bytes)
-        return dequant_fp8_rows(
-            raw.reshape(num_tokens, cols, head_dim),
-            scale.reshape(num_tokens, cols, blocks),
+        rows = dequant_fp8_rows(
+            raw.reshape(staged_tokens, cols, head_dim),
+            scale.reshape(staged_tokens, cols, blocks),
             self.embed_tokens.block_size,
         )
+        return _dp_gather_engram_rows(rows, num_tokens) if dp_size > 1 else rows
 
     def _sp_embed(self, hash_ids):
         """Rows for this rank's SP token chunk with all hash heads.

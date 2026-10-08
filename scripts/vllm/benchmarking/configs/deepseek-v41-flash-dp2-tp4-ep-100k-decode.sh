@@ -33,7 +33,7 @@ export VLLM_USE_BREAKABLE_CUDAGRAPH=0
 export VLLM_USE_AOT_COMPILE=0
 # V4.1 impl v2 (models/vllm/deepseek_v41/v2).
 export TPU_DEEPSEEK_V41_IMPL="${TPU_DEEPSEEK_V41_IMPL:-v2}"
-export TPU_DEEPSEEK_V41_CED="${TPU_DEEPSEEK_V41_CED:-1}"
+export TPU_DEEPSEEK_V41_CED="${TPU_DEEPSEEK_V41_CED:-0}"
 # 20 GiB per rank (1-bank); with DP=2 x TP=4 each TP=4 replica holds its own
 # 20 GiB pool (~83 x 100k requests/replica = ~166 total across DP=2).
 KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-21474836480}"

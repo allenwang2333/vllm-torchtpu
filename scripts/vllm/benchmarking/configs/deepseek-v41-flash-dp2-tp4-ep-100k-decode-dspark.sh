@@ -8,6 +8,7 @@
 CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "${OFFLOAD:-0}" == "1" ]]; then
   export TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD="${TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:-1}"
+  export TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA="${HOST_DMA:-1}"
 fi
 if [[ "${TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:-0}" == "1" ]]; then
   MAX_NUM_SEQS="${MAX_NUM_SEQS:-96}"

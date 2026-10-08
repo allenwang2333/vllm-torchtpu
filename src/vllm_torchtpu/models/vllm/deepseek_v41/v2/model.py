@@ -51,12 +51,14 @@ def _ced_config(
 ) -> tuple[bool, int]:
     cache_config = getattr(vllm_config, "cache_config", None)
     enable_prefix_caching = bool(getattr(cache_config, "enable_prefix_caching", False))
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    dp_size = int(getattr(parallel_config, "data_parallel_size", 1) or 1)
     ced_enabled = bool(envs.TPU_DEEPSEEK_V41_CED)
-    if ced_enabled and enable_prefix_caching:
+    if ced_enabled and (enable_prefix_caching or dp_size > 1):
         if warn_prefix_caching:
             logger.warning(
-                "CED bounded replay requires prefix caching disabled; "
-                "using full forward to retain cached SWA state semantics"
+                "CED bounded replay requires prefix caching disabled and DP=1; "
+                "using full forward to keep stage execution synchronized"
             )
         ced_enabled = False
     hf_config = getattr(
