@@ -14,6 +14,7 @@ GCE_TPU_ACCELERATOR_ENDPOINT = (
     "http://metadata.google.internal/computeMetadata/v1/instance/attributes/"
 )
 GCE_TPU_HEADERS = {"Metadata-Flavor": "Google"}
+_CHIP_VERSION_ALIASES = {"v5litepod": "v5e", "v7x": "7x"}
 
 
 def get_tpu_metadata(key: str = "") -> str:
@@ -59,7 +60,7 @@ def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
     # add a chip-count suffix and sometimes a "tpu" prefix ("tpu7x", "v6e-8").
     name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
     # v5litepod and v7x are the only two that still differ after stripping.
-    name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
+    name = _CHIP_VERSION_ALIASES.get(name, name)
     try:
         return pltpu.ChipVersion(name)
     except ValueError:
@@ -90,7 +91,7 @@ def get_node_worker_id() -> int:
 
 def get_num_cores_per_chip() -> int:
     tpu_type = get_tpu_type()
-    if tpu_type.startswith(("v5litepod", "v6e")):
+    if tpu_type and tpu_type.startswith(("v5litepod", "v6e")):
         return 1
     return 2
 
@@ -101,8 +102,7 @@ def get_num_chips() -> int:
         return len(accel_files)
     try:
         vfio_entries = os.listdir("/dev/vfio")
-        numeric_entries = [int(entry) for entry in vfio_entries if entry.isdigit()]
-        return len(numeric_entries)
+        return sum(1 for entry in vfio_entries if entry.isdigit())
     except FileNotFoundError as e:
         logger.warning("Failed to detect number of TPUs: %s", e)
         return 0

@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import collections
 
+import torch.distributed as dist
+
 from vllm_torchtpu.distributed.chip_topology import get_chip_topology
 from vllm_torchtpu.logger import init_logger
 
@@ -35,20 +37,20 @@ def _chip_rank_groups() -> list[list[int]] | None:
     topology = get_chip_topology()
     if topology is None:
         return None
-    if topology.cores_per_chip < 2:
+    cores_per_chip = topology.cores_per_chip
+    if cores_per_chip < 2:
         logger.warning(
             "Only %d core(s) per chip; nothing to split within a chip.",
-            topology.cores_per_chip,
+            cores_per_chip,
         )
         return None
-
-    import torch.distributed as dist
 
     if not (dist.is_available() and dist.is_initialized()):
         return None
 
     world_size = dist.get_world_size()
-    if world_size != len(topology.device_ids):
+    num_devices = len(topology.device_ids)
+    if world_size != num_devices:
         # `chip_of` indexes the runtime's device order, which only coincides
         # with the global rank when TP spans every visible device (no DP/PP).
         # Anything else would silently pair up the wrong cores.
@@ -56,7 +58,7 @@ def _chip_rank_groups() -> list[list[int]] | None:
             "World size %d does not match the %d visible devices; refusing to "
             "guess the intra-chip grouping.",
             world_size,
-            len(topology.device_ids),
+            num_devices,
         )
         return None
 
@@ -65,10 +67,10 @@ def _chip_rank_groups() -> list[list[int]] | None:
         chip_index, _ = topology.chip_of(rank)
         by_chip[chip_index].append(rank)
 
-    groups = [sorted(by_chip[chip]) for chip in sorted(by_chip)]
-    sizes = {len(g) for g in groups}
-    if sizes != {topology.cores_per_chip}:
-        logger.warning("Chip groups are ragged (%s); not usable.", sorted(sizes))
+    groups = [by_chip[chip] for chip in sorted(by_chip)]
+    if any(len(g) != cores_per_chip for g in groups):
+        sizes = sorted({len(g) for g in groups})
+        logger.warning("Chip groups are ragged (%s); not usable.", sizes)
         return None
     return groups
 
@@ -89,7 +91,6 @@ def get_intra_chip_group():
     if groups is None:
         return None
 
-    import torch.distributed as dist
     from vllm.distributed.parallel_state import (
         get_world_group,
         init_model_parallel_group,

@@ -22,22 +22,25 @@ class PcpStaticConfig:
         return self.pcp_size > 1
 
 
+_DEFAULT_PCP_STATIC_CONFIG = PcpStaticConfig(
+    pcp_size=1,
+    interleave_size=1,
+    dcp_size=1,
+    pipeline_parallel_size=1,
+    async_scheduling=False,
+    speculative_enabled=False,
+    speculative_method=None,
+    num_speculative_tokens=0,
+    is_moe=False,
+    expert_parallel=False,
+)
+
+
 class PcpStaticSupportValidator:
     @staticmethod
     def from_vllm_config(vllm_config: Any) -> PcpStaticConfig:
         if vllm_config is None:
-            return PcpStaticConfig(
-                pcp_size=1,
-                interleave_size=1,
-                dcp_size=1,
-                pipeline_parallel_size=1,
-                async_scheduling=False,
-                speculative_enabled=False,
-                speculative_method=None,
-                num_speculative_tokens=0,
-                is_moe=False,
-                expert_parallel=False,
-            )
+            return _DEFAULT_PCP_STATIC_CONFIG
 
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
@@ -69,18 +72,14 @@ class PcpStaticSupportValidator:
         kv_cache_layout: str,
     ) -> PcpStaticConfig:
         config = PcpStaticSupportValidator.from_vllm_config(vllm_config)
-        if (
-            config.enabled
-            and kv_cache_layout == "HND"
-            and config.interleave_size % 128 != 0
-        ):
+        if not config.enabled:
+            return config
+        if kv_cache_layout == "HND" and config.interleave_size % 128 != 0:
             raise ValueError(
                 "PCP with HND KV cache layout requires "
                 "cp_kv_cache_interleave_size to be a multiple of 128, "
                 f"got {config.interleave_size}."
             )
-        if not config.enabled:
-            return config
 
         if config.dcp_size > 1:
             raise NotImplementedError("PCP runner path does not support DCP yet.")

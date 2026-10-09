@@ -59,10 +59,11 @@ def reconcile_num_gpu_blocks_override(
             )
             for start in range(0, len(worker_overrides), workers_per_stage)
         ]
-        if all(value is None for value in stage_values):
+        present = [value for value in stage_values if value is not None]
+        if not present:
             return None
-        missing = [i for i, value in enumerate(stage_values) if value is None]
-        if missing:
+        if len(present) != len(stage_values):
+            missing = [i for i, value in enumerate(stage_values) if value is None]
             raise ValueError(
                 f"[kv-sizing] pipeline stage(s) {missing} set no compact-mamba "
                 "attention block count while the other stages did (per-stage "
@@ -72,18 +73,18 @@ def reconcile_num_gpu_blocks_override(
                 "stage holds both attention and mamba layers, or pin "
                 "--num-gpu-blocks-override."
             )
-        # None was rejected above; the filter only narrows the type.
-        return min(value for value in stage_values if value is not None)
+        return min(present)
     overrides = [ovr for ovr in worker_overrides if ovr is not None]
     if not overrides:
         return None
 
     lo, hi = min(overrides), max(overrides)
+    spread = hi - lo
     tol = max(_NUM_BLOCKS_OVERRIDE_TOL, int(lo * _NUM_BLOCKS_OVERRIDE_REL_TOL))
-    if hi - lo > tol:
+    if spread > tol:
         raise ValueError(
             "[kv-sizing] workers disagree on the compact-mamba "
-            f"attention block count by {hi - lo} blocks "
+            f"attention block count by {spread} blocks "
             f"(min={lo}, max={hi}, tolerance={tol}). Each worker "
             "sizes the pool from its own measured free HBM, so a "
             "spread this large means the workers do not have "
@@ -100,7 +101,7 @@ def reconcile_num_gpu_blocks_override(
         len(overrides),
         lo,
         hi,
-        hi - lo,
+        spread,
         tol,
         lo,
     )
