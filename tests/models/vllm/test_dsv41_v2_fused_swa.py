@@ -840,6 +840,6 @@ class TestFusedSwaPlumbing:
     def test_env_flag(self, monkeypatch):
         monkeypatch.delenv("TPU_DEEPSEEK_V41_FUSED_SWA", raising=False)
         resolver = envs.environment_variables["TPU_DEEPSEEK_V41_FUSED_SWA"]
-        assert resolver() is False
-        monkeypatch.setenv("TPU_DEEPSEEK_V41_FUSED_SWA", "1")
         assert resolver() is True
+        monkeypatch.setenv("TPU_DEEPSEEK_V41_FUSED_SWA", "0")
+        assert resolver() is False

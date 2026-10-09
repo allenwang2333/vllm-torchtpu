@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_SP: bool = False
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
     TPU_DEEPSEEK_V41_KV_SHARD: bool = False
-    TPU_DEEPSEEK_V41_FUSED_SWA: bool = False
+    TPU_DEEPSEEK_V41_FUSED_SWA: bool = True
     TPU_DEEPSEEK_V41_DECODE_LOCAL_Q: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
@@ -396,7 +396,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DEEPSEEK_V41_KV_SHARD": env_bool("TPU_DEEPSEEK_V41_KV_SHARD", default=False),
     # Fold the sliding-window attention into the SparseMLA Pallas kernel for
     # small decode batches, replacing the XLA gather and partial softmax.
-    "TPU_DEEPSEEK_V41_FUSED_SWA": env_bool("TPU_DEEPSEEK_V41_FUSED_SWA", default=False),
+    "TPU_DEEPSEEK_V41_FUSED_SWA": env_bool("TPU_DEEPSEEK_V41_FUSED_SWA", default=True),
     # Same token-local q / wo_a path for TP-replicated layers (the CED decoder
     # at decode): each rank projects q for its contiguous T/tp token shard of
     # the replicated qr with the all-gathered wq_b, so the q all_to_all
