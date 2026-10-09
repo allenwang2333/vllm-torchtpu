@@ -176,10 +176,13 @@ def _mhc_pre_op(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    suffix: str | None = None,
 ):
-    op_name = "pallas::deepseek_v4_mhc_pre_v1" + _gate_suffix(
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
-    )
+    if suffix is None:
+        suffix = _gate_suffix(
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        )
+    op_name = "pallas::deepseek_v4_mhc_pre_v1" + suffix
     op = _mhc_op_cache.get(op_name)
     if op is None:
         op = pallas.jax_op(
@@ -236,10 +239,13 @@ def _mhc_fused_post_pre_op(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    suffix: str | None = None,
 ):
-    op_name = "pallas::deepseek_v4_mhc_fused_post_pre_v1" + _gate_suffix(
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
-    )
+    if suffix is None:
+        suffix = _gate_suffix(
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        )
+    op_name = "pallas::deepseek_v4_mhc_fused_post_pre_v1" + suffix
     op = _mhc_op_cache.get(op_name)
     if op is None:
         op = pallas.jax_op(
@@ -306,12 +312,11 @@ def get_mhc_ops(
     the returned ops and invoke them directly, keeping the op lookup out of
     the traced graph entirely.
     """
+    gates = (rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat)
+    # Both gated ops are named by the same constants; format the suffix once.
+    suffix = _gate_suffix(*gates)
     return MHCOps(
-        pre=_mhc_pre_op(
-            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
-        ),
-        fused=_mhc_fused_post_pre_op(
-            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
-        ),
+        pre=_mhc_pre_op(*gates, suffix=suffix),
+        fused=_mhc_fused_post_pre_op(*gates, suffix=suffix),
         post=get_mhc_post_op(),
     )

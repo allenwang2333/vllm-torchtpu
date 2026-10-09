@@ -239,7 +239,11 @@ def test_adaptive_runner_owns_reduction_and_pcp(monkeypatch, armed):
     torch.nn.Module.__init__(runner)
     runner.routed_experts = SimpleNamespace(quant_method=quant_method)
     runner._shared_experts = object()
-    runner.moe_config = SimpleNamespace(pcp_size=8, skip_final_all_reduce=False)
+    # dp_size / is_sequence_parallel feed upstream's do_naive_dispatch_combine,
+    # which the unarmed _maybe_dispatch path reads before deferring outward.
+    runner.moe_config = SimpleNamespace(
+        pcp_size=8, skip_final_all_reduce=False, dp_size=1, is_sequence_parallel=False
+    )
     assert runner._fused_output_is_reduced is armed
     assert runner._maybe_dispatch("x", "gate") == (
         ("x", "gate") if armed else ("outer_dispatch", "gate")

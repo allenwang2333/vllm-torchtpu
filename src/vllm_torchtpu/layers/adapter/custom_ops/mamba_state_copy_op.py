@@ -14,6 +14,7 @@
 """Donating slot-to-slot copy for Mamba recurrent state arrays."""
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -86,17 +87,13 @@ def _copy_step_budget_bytes() -> int:
 
 def _row_copy_step_rows(rows: int, kernel_block_bytes: int, budget_bytes: int) -> int:
     """Returns the largest divisor of `rows` whose blocks fit in `budget_bytes`."""
-    fitting = [
-        k
-        for k in range(1, rows + 1)
-        if rows % k == 0 and k * kernel_block_bytes <= budget_bytes
-    ]
-    if not fitting:
-        raise ValueError(
-            f"a kernel block of {kernel_block_bytes} bytes exceeds the "
-            f"{budget_bytes}-byte VMEM step budget of the row copy"
-        )
-    return max(fitting)
+    for k in range(rows, 0, -1):
+        if rows % k == 0 and k * kernel_block_bytes <= budget_bytes:
+            return k
+    raise ValueError(
+        f"a kernel block of {kernel_block_bytes} bytes exceeds the "
+        f"{budget_bytes}-byte VMEM step budget of the row copy"
+    )
 
 
 @functools.cache
@@ -145,7 +142,8 @@ def copy_mamba_state_rows(
 
     Each `(src[i], dst[i])` pair moves `num_pools * split` kernel blocks.
     """
-    kernel_block_bytes = pool[0, 0].numel() * pool.element_size()
+    # Shape arithmetic only: no device-tensor indexing to size one block.
+    kernel_block_bytes = math.prod(pool.shape[2:]) * pool.element_size()
     step_rows = _row_copy_step_rows(
         num_pools * split, kernel_block_bytes, _copy_step_budget_bytes()
     )
