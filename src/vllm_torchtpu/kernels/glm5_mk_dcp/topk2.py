@@ -236,7 +236,8 @@ def local_topk(keys_ref, n_valid, K, idx_v, key_v, pre_ref, acc_ref, cc_ref, kc=
     return jnp.minimum(n_valid, K)
 
 
-def global_owned(kall_ref, me, K, own_v, pre_ref, acc_ref, cc_ref, mk_ref, kc=256):
+def global_owned(kall_ref, me, K, own_v, pre_ref, acc_ref, cc_ref, mk_ref, kc=256, pay_ref=None,
+                 pay_out=None):
     """kall_ref (R*K//128, 128) i32: the R ranks' candidate keys, rank-major (position = r*K + slot).
     The global top-K (ties -> lower position) restricted to rank `me`'s rows, compacted:
     own_v (K//128, 128) i32 = this rank's winning candidate SLOTS ascending, -1 padded.
@@ -254,6 +255,12 @@ def global_owned(kall_ref, me, K, own_v, pre_ref, acc_ref, cc_ref, mk_ref, kc=25
     pos = (r0 + lax.broadcasted_iota(I32, (KR, 128), 0)) * 128 + lax.broadcasted_iota(I32, (KR, 128), 1)
     sel = (blk > T) | ((blk == T) & (pos < P))
     mk_ref[...] = jnp.full((128, 128), jnp.int32(INT_MIN))
-    mk_ref[0:KR, :] = jnp.where(sel, jnp.int32(1), jnp.int32(INT_MIN))
-    return extract_payload(mk_ref, 1, jnp.int32(1), jnp.int32(INT_MAX), K, own_v, None, pre_ref,
+    if pay_ref is None:
+        mk_ref[0:KR, :] = jnp.where(sel, jnp.int32(1), jnp.int32(INT_MIN))
+        return extract_payload(mk_ref, 1, jnp.int32(1), jnp.int32(INT_MAX), K, own_v, None, pre_ref,
+                               acc_ref, cc_ref, kc=kc)
+    # pay_ref (KR, 128) i32 >= 0 per candidate slot: the selected slots' payloads compacted in slot
+    # order into pay_out (INT_MIN past the count) by the same extraction (keys = payloads, T = 0)
+    mk_ref[0:KR, :] = jnp.where(sel, pay_ref[...], jnp.int32(INT_MIN))
+    return extract_payload(mk_ref, 1, jnp.int32(0), jnp.int32(INT_MAX), K, own_v, pay_out, pre_ref,
                            acc_ref, cc_ref, kc=kc)
