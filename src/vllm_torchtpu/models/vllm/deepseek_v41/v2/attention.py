@@ -595,6 +595,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )
         self._precompact_records = self._fp8_kv
         self._token_parallel_attn = self._fp8_kv
+        self._indexer_weight_scale = (
+            (self.indexer.head_dim * self.indexer.n_head) ** -0.5
+            if self.indexer is not None
+            else 1.0
+        )
         object.__setattr__(self, "mla_attn", self)
         self._prepare_and_attn_fn = self._prepare_tpu
 
@@ -952,6 +957,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             if non_causal
             else self.window_size
         )
+        swa_row_slots_masked = None
         if (
             stage_cache is not None
             and rows_per_page is not None
@@ -1108,6 +1114,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         if raw_row_slots is not None and has_fast_swa_offset
                         else raw_row_slots
                     )
+                swa_row_slots_masked = (
+                    swa_row_slots.masked_fill(invalid_window, -1)
+                    if swa_row_slots is not None
+                    else None
+                )
                 stage_cache[swa_slots_key] = (
                     swa.block_tables,
                     swa_slots,
@@ -1117,6 +1128,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     valid_window,
                     invalid_window,
                     swa_row_slots,
+                    swa_row_slots_masked,
                 )
             else:
                 (
@@ -1128,6 +1140,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     valid_window,
                     invalid_window,
                     swa_row_slots,
+                    swa_row_slots_masked,
                 ) = cached_swa_slots
         else:
             swa_slots = _cache_slots(swa_cache, swa, positions)
@@ -1175,15 +1188,22 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 and rows_per_page is not None
                 else raw_row_slots
             )
-        records = (
-            (
-                swa_cache.row_offset + swa_row_slots
-                if has_fast_swa_offset and rows_per_page is not None
-                else swa_cache.row_indices(swa_row_slots)
-            ).masked_fill(invalid_window, -1)
-            if swa_row_slots is not None
-            else None
-        )
+        if swa_row_slots is None:
+            records = None
+        elif has_fast_swa_offset and rows_per_page is not None:
+            records = (
+                swa_row_slots_masked
+                if swa_cache.row_offset == 0 and swa_row_slots_masked is not None
+                else (
+                    swa_row_slots
+                    if swa_cache.row_offset == 0
+                    else swa_cache.row_offset + swa_row_slots
+                ).masked_fill(invalid_window, -1)
+            )
+        else:
+            records = swa_cache.row_indices(swa_row_slots).masked_fill(
+                invalid_window, -1
+            )
         # Token-local q path: q projection, attention and
         # wo_a run in one op that picks token-parallel vs head-sharded on
         # concrete shapes.
@@ -1211,10 +1231,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if self.compressor is not None and not self._ced_global_from_encoder:
             pending_index_write = self._write_global_kv(kv_score, positions)
         if self.indexer is not None and not self._all_indices_fit:
-            weights = (
-                index_weights.float()
-                * self.indexer.head_dim**-0.5
-                * self.indexer.n_head**-0.5
+            weights = index_weights.float() * getattr(
+                self,
+                "_indexer_weight_scale",
+                (self.indexer.head_dim * self.indexer.n_head) ** -0.5,
             )
         count = positions.shape[0]
         window = None if tiled else _read_rows(swa_cache, swa_table, requests, logical)
@@ -1278,7 +1298,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             else:
                 source = self._static_forward_context[self.compressed_cache_prefix]
                 capacity = max(1, self._max_model_len // self.compress_ratio)
-                lengths = ((positions + 1) // self.compress_ratio)[:, None]
                 tp_ranks = (
                     get_tensor_model_parallel_world_size()
                     if owner_perm is not None
@@ -1290,6 +1309,53 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     and tp_ranks > 1
                     and (self.indexer is None or not self._all_indices_fit)
                 )
+                comp_inputs_key = (
+                    "compressed_inputs",
+                    self.compress_ratio,
+                    segmented_main,
+                    tp_ranks,
+                    id(owner_perm) if segmented_main else None,
+                )
+                cached_comp_inputs = (
+                    stage_cache.get(comp_inputs_key)
+                    if stage_cache is not None
+                    else None
+                )
+                if cached_comp_inputs is None:
+                    lengths = ((positions + 1) // self.compress_ratio)[:, None]
+                    if segmented_main and owner_perm is not None:
+                        tp_rank = self._get_stage_tp_rank(stage_cache)
+                        seg_count = owner_perm.shape[0] // tp_ranks
+                        seg_perm = owner_perm[
+                            tp_rank * seg_count : (tp_rank + 1) * seg_count
+                        ]
+                        seg_valid = seg_perm >= 0
+                        seg_idx = seg_perm.clamp(min=0).long()
+                        lengths_comp = lengths.index_select(0, seg_idx).masked_fill(
+                            ~seg_valid[:, None], 0
+                        )
+                        swa_valid_comp = swa_valid.index_select(0, seg_idx) & seg_valid
+                        requests_comp = requests.index_select(0, seg_idx).masked_fill(
+                            ~seg_valid, 0
+                        )
+                    else:
+                        lengths_comp = lengths
+                        swa_valid_comp = swa_valid
+                        requests_comp = requests
+                    if stage_cache is not None:
+                        stage_cache[comp_inputs_key] = (
+                            lengths,
+                            lengths_comp,
+                            swa_valid_comp,
+                            requests_comp,
+                        )
+                else:
+                    (
+                        lengths,
+                        lengths_comp,
+                        swa_valid_comp,
+                        requests_comp,
+                    ) = cached_comp_inputs
                 if self.indexer is not None:
                     if self._all_indices_fit:
                         logical_compressed = torch.arange(
@@ -1341,11 +1407,27 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                                 )
                                 if stage_cache is not None:
                                     stage_cache[idx_req_key] = cached_idx_req
-                            index_records = (
-                                index_cache.row_offset + cached_idx_req
-                                if has_fast_idx_offset
-                                else index_cache.row_indices(cached_idx_req)
-                            )
+                            if has_fast_idx_offset:
+                                idx_rec_key = (
+                                    "index_records",
+                                    idx_req_key,
+                                    index_cache.row_offset,
+                                )
+                                index_records = (
+                                    stage_cache.get(idx_rec_key)
+                                    if stage_cache is not None
+                                    else None
+                                )
+                                if index_records is None:
+                                    index_records = (
+                                        cached_idx_req
+                                        if index_cache.row_offset == 0
+                                        else index_cache.row_offset + cached_idx_req
+                                    )
+                                    if stage_cache is not None:
+                                        stage_cache[idx_rec_key] = index_records
+                            else:
+                                index_records = index_cache.row_indices(cached_idx_req)
                             selected = self._select_paged_indices(
                                 qr,
                                 positions,
@@ -1423,24 +1505,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         :sel_count, : min(capacity, self.topk_indices_buffer.shape[-1])
                     ]
                 main_cache = source.kv_cache
-                if segmented_main and owner_perm is not None:
-                    tp_rank = self._get_stage_tp_rank(stage_cache)
-                    seg_perm = owner_perm[
-                        tp_rank * sel_count : (tp_rank + 1) * sel_count
-                    ]
-                    seg_valid = seg_perm >= 0
-                    seg_idx = seg_perm.clamp(min=0).long()
-                    lengths_comp = lengths.index_select(0, seg_idx).masked_fill(
-                        ~seg_valid[:, None], 0
-                    )
-                    swa_valid_comp = swa_valid.index_select(0, seg_idx) & seg_valid
-                    requests_comp = requests.index_select(0, seg_idx).masked_fill(
-                        ~seg_valid, 0
-                    )
-                else:
-                    lengths_comp = lengths
-                    swa_valid_comp = swa_valid
-                    requests_comp = requests
                 valid_compressed = (
                     (selected >= 0)
                     & (selected < lengths_comp)
