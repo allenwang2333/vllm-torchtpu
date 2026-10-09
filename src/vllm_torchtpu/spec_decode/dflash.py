@@ -299,11 +299,13 @@ class DFlashProposer:
     def _get_draft_group_builders(self, attn_groups) -> tuple[Any, ...]:
         frozen_names = self._get_frozen_draft_attn_layer_names()
         key = (
-            id(attn_groups),
-            len(attn_groups),
-            tuple(id(gl) for gl in attn_groups),
-            tuple(len(gl) for gl in attn_groups),
-            frozen_names,
+            (id(attn_groups), id(attn_groups[0]), len(attn_groups[0]), frozen_names)
+            if len(attn_groups) == 1
+            else (
+                id(attn_groups),
+                tuple((id(gl), len(gl)) for gl in attn_groups),
+                frozen_names,
+            )
         )
         cached = self._draft_group_builders_cache
         if cached is not None and cached[0] == key:
@@ -416,8 +418,9 @@ class DFlashProposer:
         Scales query boundaries and request token distribution to block_size.
         """
         chunk_ctx = chunk.attn_ctx
+        block_size = self.block_size
         # `num_tokens_padded` is a bucket of at least one full block.
-        padded_num_reqs = num_tokens_padded // self.block_size
+        padded_num_reqs = num_tokens_padded // block_size
         query_start_loc, request_distribution = self._get_static_attn_tensors(
             padded_num_reqs
         )
@@ -435,7 +438,7 @@ class DFlashProposer:
                 else int(max(active))
             )
         draft_max_seq_len = (
-            min(chunk_max_seq_len + self.block_size, self._max_model_len)
+            min(chunk_max_seq_len + block_size, self._max_model_len)
             if chunk_max_seq_len is not None
             else None
         )
@@ -1101,7 +1104,7 @@ class DFlashProposer:
             kw = [layer.self_attn.k_norm.weight for layer in self_model.layers]
             kw_stack = torch.stack(kw, dim=0).view(L, 1, 1, hd)
             eps = self_model.layers[0].self_attn.k_norm.variance_epsilon
-            variance = all_k.pow(2).mean(-1, keepdim=True)
+            variance = all_k.square().mean(-1, keepdim=True)
             all_k_normed = all_k * torch.rsqrt(variance + eps) * kw_stack
         else:
             all_k_normed = all_k
@@ -1312,18 +1315,17 @@ class DFlashProposer:
         # Replace invalid_token_id (-1) with mask_token_id for padding rows.
         base_tokens = torch.where(
             base_tokens == invalid_token_id,
-            torch.full_like(base_tokens, mask_token_id),
+            mask_token_id,
             base_tokens,
         )
-        num_accepted = num_valid.unsqueeze(1).to(torch.int32)
+        num_accepted = num_valid.unsqueeze(1)
 
         # Anchor verify windows at start + num_accepted;
         # anchor prompt chunks at last_pos + 1.
         num_draft = draft_lengths[safe_req_indices].unsqueeze(1)
-        is_verify_window = (num_draft > 0).to(torch.int32)
         verify_base = start_positions_padded + num_accepted
         prompt_base = ((last_positions + 1) * valid_mask).to(torch.int32)
-        base_pos = is_verify_window * verify_base + (1 - is_verify_window) * prompt_base
+        base_pos = torch.where(num_draft > 0, verify_base, prompt_base)
 
         return self._layout_draft_block(
             base_tokens, base_pos, block_size, padded_len, mask_token_id

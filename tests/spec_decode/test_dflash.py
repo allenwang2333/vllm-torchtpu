@@ -813,7 +813,8 @@ def test_build_draft_attn_metadata_reuses_target_staged_block_tables():
     assert captured_ctxs[-1].staged_block_tables is None
 
     # 6. Two draft groups with identical (target_block_size, tnb, is_mamba_group)
-    # geometry skip duplicate _active_block_table_columns checks (354->342 branch).
+    # geometry skip duplicate _active_block_table_columns checks (354->342 branch),
+    # and multi-list attn_groups exercises the len(attn_groups) > 1 cache key path.
     b1 = _FakeBuilder(1, 64)
     b1.target_block_size = 16
     b1.is_mamba_group = False
@@ -823,7 +824,7 @@ def test_build_draft_attn_metadata_reuses_target_staged_block_tables():
     proposer._draft_attn_layer_names = {"draft_layer_1", "draft_layer_2"}
     g1 = SimpleNamespace(layer_names=["draft_layer_1"], metadata_builders=[b1])
     g2 = SimpleNamespace(layer_names=["draft_layer_2"], metadata_builders=[b2])
-    proposer.runner.attn_groups = [[g1, g2]]
+    proposer.runner.attn_groups = [[g1], [g2]]
     staged_multi = {
         1: torch.ones(128, dtype=torch.int32),
         2: torch.ones(128, dtype=torch.int32),
