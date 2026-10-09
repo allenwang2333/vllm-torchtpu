@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GDN projections with whole-head TP sharding and Q/K replication."""
 
+import itertools
+
 import torch
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -47,6 +49,7 @@ class GdnColumnParallelLinear(MergedColumnParallelLinear):
         self.replication_factors = [geometry.kq_replication_factor] * 2 + [1] * (
             1 + include_z
         )
+        self._default_shard_ids = tuple(range(len(self.checkpoint_sizes)))
         super().__init__(
             input_size=input_size,
             output_sizes=[
@@ -59,6 +62,9 @@ class GdnColumnParallelLinear(MergedColumnParallelLinear):
             quant_config=quant_config,
             params_dtype=params_dtype,
             prefix=prefix,
+        )
+        self._output_partition_offsets = tuple(
+            itertools.accumulate(self.output_partition_sizes, initial=0)
         )
 
     def _parameter_slice(
@@ -84,25 +90,22 @@ class GdnColumnParallelLinear(MergedColumnParallelLinear):
         output_dim = param.output_dim
         if not isinstance(loaded_shard_id, int):
             shard_ids = (
-                tuple(range(len(self.checkpoint_sizes)))
-                if loaded_shard_id is None
-                else loaded_shard_id
+                self._default_shard_ids if loaded_shard_id is None else loaded_shard_id
             )
             offset = 0
             for shard_id in shard_ids:
-                size, storage_offset = self._parameter_slice(
-                    param, self.checkpoint_sizes[shard_id], offset
-                )
+                ckpt_size = self.checkpoint_sizes[shard_id]
+                size, storage_offset = self._parameter_slice(param, ckpt_size, offset)
                 self.weight_loader(
                     param,
                     loaded_weight.narrow(output_dim, storage_offset, size),
                     shard_id,
                 )
-                offset += self.checkpoint_sizes[shard_id]
+                offset += ckpt_size
             return
 
         size = self.output_partition_sizes[loaded_shard_id]
-        offset = sum(self.output_partition_sizes[:loaded_shard_id])
+        offset = self._output_partition_offsets[loaded_shard_id]
         size, offset = self._parameter_slice(param, size, offset)
         param.load_qkv_weight(
             loaded_weight=loaded_weight,
@@ -141,15 +144,17 @@ class GdnInterleavedColumnParallelLinear(MergedColumnParallelLinear):
     ) -> None:
         self.geometry = geometry
         self.group_sizes = group_sizes
+        self._group_size_sum = sum(group_sizes)
         self.replicated_segments = replicated_segments
         self.local_group_sizes = [
             size if replicated else size // geometry.kq_replication_factor
             for size, replicated in zip(group_sizes, replicated_segments)
         ]
+        self._local_group_size_sum = sum(self.local_group_sizes)
         super().__init__(
             input_size=input_size,
             output_sizes=[
-                sum(self.local_group_sizes)
+                self._local_group_size_sum
                 * geometry.local_num_kq_heads
                 * geometry.parallel_size
             ],
@@ -170,33 +175,37 @@ class GdnInterleavedColumnParallelLinear(MergedColumnParallelLinear):
         geometry = self.geometry
         sizes = self.group_sizes
         local_sizes = self.local_group_sizes
+        group_size_sum = self._group_size_sum
         if isinstance(param, BlockQuantScaleParameter):
             block = self.weight_block_size[0]
-            if any(size % block for size in sizes + local_sizes):
+            if any(size % block for size in sizes) or any(
+                size % block for size in local_sizes
+            ):
                 raise ValueError(
                     "GDN interleaved scale blocks must align "
                     "with rank-local head segments."
                 )
             sizes = [size // block for size in sizes]
             local_sizes = [size // block for size in local_sizes]
+            group_size_sum = sum(sizes)
         if isinstance(param, ChannelQuantScaleParameter):
             loaded_weight = loaded_weight.reshape(-1, *param.shape[1:])
         source = loaded_weight.movedim(param.output_dim, 0)
-        groups = source.reshape(geometry.num_kq_heads, sum(sizes), *source.shape[1:])
+        groups = source.reshape(
+            geometry.num_kq_heads, group_size_sum, *source.shape[1:]
+        )
         first = geometry.kq_shard_index(self.tp_rank) * geometry.local_num_kq_heads
         groups = groups.narrow(0, first, geometry.local_num_kq_heads)
         replica = self.tp_rank % geometry.kq_replication_factor
+        # Flatten each segment's head groups before concatenating segments.
+        # Scales take exactly the same permutation as their weight rows.
         pieces = [
-            piece.narrow(1, 0 if shared else replica * width, width)
+            piece.narrow(1, 0 if shared else replica * width, width).flatten(0, 1)
             for piece, width, shared in zip(
                 groups.split(sizes, dim=1), local_sizes, self.replicated_segments
             )
         ]
-        # Flatten each segment's head groups before concatenating segments.
-        # Scales take exactly the same permutation as their weight rows.
-        local = torch.cat([piece.flatten(0, 1) for piece in pieces], dim=0).movedim(
-            0, param.output_dim
-        )
+        local = torch.cat(pieces, dim=0).movedim(0, param.output_dim)
         assert local.shape == param.shape
         param.data.copy_(local)
 

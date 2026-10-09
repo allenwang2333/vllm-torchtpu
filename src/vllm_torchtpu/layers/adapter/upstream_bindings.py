@@ -1,7 +1,9 @@
 """Bind device implementations into reused upstream Python code."""
 
+import sys
 from contextlib import contextmanager
 from threading import RLock
+from types import FunctionType, ModuleType
 
 _lock = RLock()
 
@@ -25,18 +27,18 @@ def bind_device_ops(function, **operations):
     Unlike runtime module monkeypatches, bindings are immutable during forward
     and TorchDynamo can trace them without locks or global mutation.
     """
-    import sys
-    from types import FunctionType, ModuleType
-
     # Dynamo guards resolve global functions by module name. A copied globals
     # dict with the upstream name would make guards inspect the GPU operation.
     name = f"{__name__}.{function.__qualname__.replace('.', '_')}"
     namespace = ModuleType(name)
-    namespace.__dict__.update(function.__globals__ | operations | {"__name__": name})
+    ns_dict = namespace.__dict__
+    ns_dict.update(function.__globals__)
+    ns_dict.update(operations)
+    ns_dict["__name__"] = name
     sys.modules[name] = namespace
     bound = FunctionType(
         function.__code__,
-        namespace.__dict__,
+        ns_dict,
         function.__name__,
         function.__defaults__,
         function.__closure__,
