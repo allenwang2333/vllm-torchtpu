@@ -197,7 +197,12 @@ class PcpSequenceLayoutEligibility:
         num_scheduled_tokens_per_req: np.ndarray,
         absolute_query_start_offsets_per_req: np.ndarray | None,
     ) -> tuple[PcpRequestSpan, ...]:
-        scheduled = np.asarray(num_scheduled_tokens_per_req, dtype=np.int64)
+        if isinstance(
+            num_scheduled_tokens_per_req, np.ndarray
+        ) and num_scheduled_tokens_per_req.dtype.kind in ("i", "u"):
+            scheduled = num_scheduled_tokens_per_req
+        else:
+            scheduled = np.asarray(num_scheduled_tokens_per_req, dtype=np.int64)
         if scheduled.ndim != 1:
             raise ValueError("num_scheduled_tokens_per_req must be a 1D array.")
         if scheduled.size < num_reqs:
@@ -207,9 +212,14 @@ class PcpSequenceLayoutEligibility:
 
         absolute_query_starts = None
         if absolute_query_start_offsets_per_req is not None:
-            absolute_query_starts = np.asarray(
-                absolute_query_start_offsets_per_req, dtype=np.int64
-            )
+            if isinstance(
+                absolute_query_start_offsets_per_req, np.ndarray
+            ) and absolute_query_start_offsets_per_req.dtype.kind in ("i", "u"):
+                absolute_query_starts = absolute_query_start_offsets_per_req
+            else:
+                absolute_query_starts = np.asarray(
+                    absolute_query_start_offsets_per_req, dtype=np.int64
+                )
             if absolute_query_starts.ndim != 1 or absolute_query_starts.size < num_reqs:
                 raise ValueError(
                     "absolute_query_start_offsets_per_req must cover every "
@@ -301,7 +311,11 @@ class PcpSequenceLayoutEligibility:
         local_padded_tokens = None
         global_padded_tokens = None
         if num_tokens_paddings is not None:
-            paddings = sorted(int(padding) for padding in num_tokens_paddings)
+            paddings = (
+                num_tokens_paddings
+                if isinstance(num_tokens_paddings, (list, tuple))
+                else sorted(int(padding) for padding in num_tokens_paddings)
+            )
             local_padded_tokens = _first_ge(paddings, local_required_tokens)
             if dp_target_bucket is not None and dp_target_bucket > local_padded_tokens:
                 local_padded_tokens = int(dp_target_bucket)

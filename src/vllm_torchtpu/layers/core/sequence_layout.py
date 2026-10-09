@@ -37,10 +37,10 @@ DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR = SequenceLayoutDescriptor()
 def is_pcp_streaming_sequence_layout_descriptor(
     descriptor: SequenceLayoutDescriptor,
 ) -> bool:
-    return descriptor.cache_key == (
-        SequenceLayoutKind.PARTIAL.value,
-        PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
-        1,
+    return (
+        descriptor.kind is SequenceLayoutKind.PARTIAL
+        and descriptor.protocol == PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL
+        and descriptor.version == 1
     )
 
 
@@ -114,11 +114,12 @@ class SequenceLayoutPlan:
             return request_major_token_tensor, request_major_gather_indices
 
         num_gathers = request_major_gather_indices.shape[0]
-        request_major_gather_indices = torch.nn.functional.pad(
-            request_major_gather_indices[:num_valid_gathers],
-            (0, num_gathers - num_valid_gathers),
-            value=-1,
-        )
+        if num_valid_gathers != num_gathers:
+            request_major_gather_indices = torch.nn.functional.pad(
+                request_major_gather_indices[:num_valid_gathers],
+                (0, num_gathers - num_valid_gathers),
+                value=-1,
+            )
 
         packed_to_request = self._packed_to_request_major_token_indices
         request_to_packed = self._request_major_to_packed_token_indices
@@ -173,7 +174,7 @@ def _localize_token_tensor_and_gather_indices(
     local_end: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pure tensor transform shared by all partial sequence layout plans."""
-    source_indices = torch.tensor(
+    source_indices = torch.as_tensor(
         local_packed_to_request,
         dtype=torch.long,
         device=request_major_token_tensor.device,
@@ -190,12 +191,17 @@ def _localize_token_tensor_and_gather_indices(
         torch.zeros_like(local_tokens),
     )
 
-    request_to_packed_tensor = torch.tensor(
+    request_to_packed_tensor = torch.as_tensor(
         request_to_packed,
         dtype=torch.long,
         device=request_major_gather_indices.device,
     )
-    request_gathers = request_major_gather_indices.to(torch.long)
+    gather_dtype = request_major_gather_indices.dtype
+    request_gathers = (
+        request_major_gather_indices
+        if gather_dtype == torch.long
+        else request_major_gather_indices.to(torch.long)
+    )
     gather_valid = request_gathers.ge(0)
     safe_request_gathers = request_gathers.clamp_min(0)
     packed_gathers = torch.index_select(
@@ -207,7 +213,9 @@ def _localize_token_tensor_and_gather_indices(
     local_gathers = torch.where(
         owner_mask, packed_gathers - local_start, torch.full_like(packed_gathers, -1)
     )
-    return local_tokens, local_gathers.to(request_major_gather_indices.dtype)
+    if local_gathers.dtype != gather_dtype:
+        local_gathers = local_gathers.to(gather_dtype)
+    return local_tokens, local_gathers
 
 
 class SequenceLayoutPlanner(Protocol):

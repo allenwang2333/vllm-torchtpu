@@ -65,13 +65,15 @@ def inverse_reorder_for_sharding(
         dim += reordered_tensor.ndim
 
     old_shape = reordered_tensor.shape
+    prefix_shape = old_shape[:dim]
+    suffix_shape = old_shape[dim + 1 :]
     shard_split_sizes = []
     for split_size in split_sizes:
         assert split_size % n_shards == 0
         shard_split_sizes.append(split_size // n_shards)
 
     shard_size = sum(shard_split_sizes)
-    new_shape = old_shape[:dim] + (n_shards, shard_size) + old_shape[dim + 1 :]
+    new_shape = prefix_shape + (n_shards, shard_size) + suffix_shape
     reshaped = reordered_tensor.reshape(new_shape)
 
     split_tensors = []
@@ -80,9 +82,7 @@ def inverse_reorder_for_sharding(
         split_tensor = jax.lax.slice_in_dim(
             reshaped, start_offset, start_offset + shard_split_size, axis=dim + 1
         )
-        split_shape = (
-            old_shape[:dim] + (n_shards * shard_split_size,) + old_shape[dim + 1 :]
-        )
+        split_shape = prefix_shape + (n_shards * shard_split_size,) + suffix_shape
         split_tensors.append(split_tensor.reshape(split_shape))
         start_offset += shard_split_size
 
@@ -111,9 +111,11 @@ def slice_sharded_tensor_for_concatenation(
         split_sizes: each individual tensor's size on the last dim.
         n_shards: num of shards.
     """
-    new_shape = sharded_tensor.shape[:-1] + (n_shards, -1)
+    prefix_shape = sharded_tensor.shape[:-1]
+    new_shape = prefix_shape + (n_shards, -1)
     # New shape ensures each sharded_tensor[:, i] maps to a tensor in ith shards
     sharded_tensor = sharded_tensor.reshape(new_shape)
+    out_shape = prefix_shape + (-1,)
 
     split_tensors = []
     start_offset = 0
@@ -124,7 +126,7 @@ def slice_sharded_tensor_for_concatenation(
         # Because we are slicing over last dim, sharding dim remains intact.
         # Therefore, splitting happens locally.
         split_tensor = sharded_tensor[..., start_offset:end_offset]
-        split_tensors.append(split_tensor.reshape(new_shape[:-2] + (-1,)))
+        split_tensors.append(split_tensor.reshape(out_shape))
         start_offset = end_offset
 
     return split_tensors

@@ -377,16 +377,16 @@ def test_partial_plan_buckets_mapping_before_device_copy(
     original_mapping = request_to_packed.copy()
     request_tokens = torch.arange(num_tokens, dtype=torch.int32)
     request_gathers = torch.tensor([0, num_tokens - 1, 0])
-    tensor = torch.tensor
+    as_tensor = torch.as_tensor
     host_arrays = []
 
     def record_tensor(data, *args, **kwargs):
         if isinstance(data, np.ndarray):
             host_arrays.append(data.copy())
-        return tensor(data, *args, **kwargs)
+        return as_tensor(data, *args, **kwargs)
 
     # Observe the actual host-to-device boundary while running the real ops.
-    monkeypatch.setattr(sequence_layout.torch, "tensor", record_tensor)
+    monkeypatch.setattr(sequence_layout.torch, "as_tensor", record_tensor)
     for rank in range(2):
         local_start = rank * 3
         plan = SequenceLayoutPlan(
@@ -410,7 +410,7 @@ def test_partial_plan_buckets_mapping_before_device_copy(
         assert [array.shape for array in host_arrays] == [(3,), (6,)]
         np.testing.assert_array_equal(host_arrays[1][:num_tokens], original_mapping)
         np.testing.assert_array_equal(host_arrays[1][num_tokens:], -1)
-        torch.testing.assert_close(local_gathers, tensor(expected_gathers[rank]))
+        torch.testing.assert_close(local_gathers, torch.tensor(expected_gathers[rank]))
         np.testing.assert_array_equal(request_to_packed, original_mapping)
 
 
@@ -808,3 +808,366 @@ def test_pcp_planner_preinit_and_dummy_share_the_v1_layout_contract():
     assert after_cache.requires_hidden_state_gather is True
 
     assert before_cache == after_cache
+
+
+def test_sequence_layout_and_pcp_remaining_branches(monkeypatch):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.core import pcp_sequence_layout as pcp_mod
+    from vllm_torchtpu.layers.core.pcp_sequence_layout import (
+        PcpSequenceLayoutDecision,
+        _ensure_host_token_buffer_capacity,
+        prepare_pcp_sequence_layout,
+    )
+    from vllm_torchtpu.layers.core.sequence_layout import (
+        DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+        create_sequence_layout_planner,
+        is_pcp_streaming_attention_metadata,
+        is_pcp_streaming_sequence_layout,
+    )
+
+    # 1. SequenceLayoutDescriptor.cache_key & SequenceLayoutPlan edge cases
+    assert DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR.cache_key == ("all", "default", 1)
+    plan_no_remap = SequenceLayoutPlan(
+        descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+        token_slice=slice(0, 4),
+        global_num_tokens=4,
+        global_padded_num_tokens=4,
+        local_num_tokens=4,
+        local_padded_num_tokens=4,
+    )
+    assert plan_no_remap.local_index_for_request_major_token(2) == 2
+
+    plan_bad_step = SequenceLayoutPlan(
+        descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+        token_slice=slice(0, 4, 2),
+        global_num_tokens=4,
+        global_padded_num_tokens=4,
+        local_num_tokens=2,
+        local_padded_num_tokens=2,
+    )
+    with pytest.raises(RuntimeError, match="contiguous token slices"):
+        plan_bad_step.local_index_for_request_major_token(0)
+
+    plan_no_stop = SequenceLayoutPlan(
+        descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+        token_slice=slice(0, None),
+        global_num_tokens=4,
+        global_padded_num_tokens=4,
+        local_num_tokens=4,
+        local_padded_num_tokens=4,
+    )
+    with pytest.raises(RuntimeError, match="finite token_slice stop"):
+        plan_no_stop.local_index_for_request_major_token(0)
+
+    t_tok = torch.arange(4, dtype=torch.int32)
+    t_gath = torch.tensor([0, 1], dtype=torch.int32)
+    out_tok, out_gath = plan_no_remap.localize_token_tensor_and_gather_indices(
+        t_tok, t_gath, num_valid_gathers=2
+    )
+    assert out_tok is t_tok and out_gath is t_gath
+
+    # Partial plan with int32 gather_indices to cover gather_dtype != torch.long cast
+    partial_plan = SequenceLayoutPlan(
+        descriptor=PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR,
+        token_slice=slice(0, 2),
+        global_num_tokens=2,
+        global_padded_num_tokens=2,
+        local_num_tokens=2,
+        local_padded_num_tokens=2,
+        _packed_to_request_major_token_indices=np.array([0, 1], dtype=np.int64),
+        _request_major_to_packed_token_indices=np.array([0, 1], dtype=np.int64),
+    )
+    _, local_gath_i32 = partial_plan.localize_token_tensor_and_gather_indices(
+        torch.tensor([10, 20], dtype=torch.int32),
+        torch.tensor([0, 1], dtype=torch.int32),
+        num_valid_gathers=2,
+    )
+    assert local_gath_i32.dtype == torch.int32
+
+    bad_desc = SequenceLayoutDescriptor(
+        kind=SequenceLayoutKind.PARTIAL, protocol="custom", version=2
+    )
+    with pytest.raises(RuntimeError, match="Unsupported draft sequence layout"):
+        _carry_plan(bad_desc).aggregate_request_aligned_tensor(
+            torch.ones(3, 1), torch.ones(3, dtype=torch.bool)
+        )
+
+    # 2. AllSequenceLayoutPlanner properties & create_sequence_layout_planner
+    all_planner = AllSequenceLayoutPlanner()
+    assert all_planner.requires_backend_preinit is False
+    assert all_planner.backend_preinit_world_size == 1
+    assert all_planner.uses_selected_logits_hidden_states is False
+    all_planner.reserve_host_token_capacity(None, 16)
+    hs = torch.ones(4, 2)
+    assert all_planner.finalize_hidden_states(hs, None) is hs
+    assert all_planner.maybe_select_logits_hidden_states(hs, None, t_gath) is None
+
+    runner_dp = SimpleNamespace(num_tokens_paddings=[16, 32], _dp_target_bucket=64)
+    dp_plan = all_planner.prepare_real(
+        runner=runner_dp,
+        scheduler_output=None,
+        start_index=0,
+        num_reqs=1,
+        num_scheduled_tokens_per_req=[8],
+        total_num_scheduled_tokens=8,
+        use_max_model_len=False,
+        target_num_reqs=1,
+        padded_num_reqs=1,
+    )
+    assert dp_plan.local_padded_num_tokens == 64
+
+    assert isinstance(create_sequence_layout_planner(None), AllSequenceLayoutPlanner)
+    pcp_vllm_cfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2,
+            cp_kv_cache_interleave_size=16,
+            decode_context_parallel_size=1,
+            pipeline_parallel_size=1,
+        ),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+    )
+    created_pcp = create_sequence_layout_planner(pcp_vllm_cfg)
+    assert isinstance(created_pcp, PcpSequenceLayoutPlanner)
+    assert created_pcp.uses_selected_logits_hidden_states is True
+
+    assert is_pcp_streaming_sequence_layout(
+        kind=SequenceLayoutKind.PARTIAL, protocol="pcp_streaming"
+    )
+    assert is_pcp_streaming_attention_metadata(
+        SimpleNamespace(
+            sequence_layout_kind="partial", sequence_layout_protocol="pcp_streaming"
+        )
+    )
+    assert not is_pcp_streaming_attention_metadata(SimpleNamespace())
+
+    # 3. PcpSequenceLayoutDecision, Eligibility, and _evaluate_streaming_query branches
+    disabled_dec = PcpSequenceLayoutDecision(
+        mode=PcpSequenceLayoutMode.DISABLED, spans=()
+    )
+    assert disabled_dec.enabled is False
+    with pytest.raises(NotImplementedError, match="cannot be used"):
+        PcpSequenceLayoutEligibility.require_mode(
+            disabled_dec, PcpSequenceLayoutMode.STREAMING
+        )
+
+    elig = _eligibility(pcp_size=2, interleave_size=16)
+    batch = _input_batch(computed=[0, 0], prompt=[16, 16])
+    batch.req_ids = [None, "req1"]
+    sched_out = SimpleNamespace(num_scheduled_tokens={})
+
+    with pytest.raises(ValueError, match="1D array"):
+        elig._build_request_spans(
+            input_batch=batch,
+            scheduler_output=sched_out,
+            start_index=0,
+            num_reqs=2,
+            num_scheduled_tokens_per_req=np.zeros((1, 2), dtype=np.int32),
+            absolute_query_start_offsets_per_req=None,
+        )
+    with pytest.raises(ValueError, match="cover every request"):
+        elig._build_request_spans(
+            input_batch=batch,
+            scheduler_output=sched_out,
+            start_index=0,
+            num_reqs=2,
+            num_scheduled_tokens_per_req=[16],
+            absolute_query_start_offsets_per_req=None,
+        )
+    with pytest.raises(ValueError, match="absolute_query_start_offsets_per_req"):
+        elig._build_request_spans(
+            input_batch=batch,
+            scheduler_output=sched_out,
+            start_index=0,
+            num_reqs=2,
+            num_scheduled_tokens_per_req=[16, 16],
+            absolute_query_start_offsets_per_req=[0],
+        )
+
+    spans_list = elig._build_request_spans(
+        input_batch=batch,
+        scheduler_output=sched_out,
+        start_index=0,
+        num_reqs=2,
+        num_scheduled_tokens_per_req=[16, 16],
+        absolute_query_start_offsets_per_req=[0, 8],
+    )
+    assert len(spans_list) == 1 and spans_list[0].absolute_query_start == 8
+
+    spans_np = elig._build_request_spans(
+        input_batch=batch,
+        scheduler_output=sched_out,
+        start_index=0,
+        num_reqs=2,
+        num_scheduled_tokens_per_req=np.array([16, 16], dtype=np.int32),
+        absolute_query_start_offsets_per_req=np.array([0, 12], dtype=np.int32),
+    )
+    assert len(spans_np) == 1 and spans_np[0].absolute_query_start == 12
+
+    with pytest.raises(NotImplementedError, match="scheduled query tokens"):
+        elig._evaluate_streaming_query(
+            (pcp_mod.PcpRequestSpan(0, 0, 16, 0),),
+            num_tokens_paddings=None,
+            max_num_tokens=None,
+            dp_target_bucket=None,
+        )
+
+    elig_bad_interleave = _eligibility(pcp_size=2, interleave_size=7)
+    with pytest.raises(
+        NotImplementedError, match="multiple of cp_kv_cache_interleave_size"
+    ):
+        elig_bad_interleave._evaluate_streaming_query(
+            spans_np,
+            num_tokens_paddings=None,
+            max_num_tokens=None,
+            dp_target_bucket=None,
+        )
+
+    dec_no_pad = elig._evaluate_streaming_query(
+        spans_np,
+        num_tokens_paddings=None,
+        max_num_tokens=None,
+        dp_target_bucket=None,
+    )
+    assert dec_no_pad.local_padded_tokens is None
+
+    dec_gen_pad = elig._evaluate_streaming_query(
+        spans_np,
+        num_tokens_paddings=(x for x in (16, 32)),
+        max_num_tokens=None,
+        dp_target_bucket=64,
+    )
+    assert dec_gen_pad.local_padded_tokens == 64
+
+    with pytest.raises(ValueError, match="exceeds runner max token buffer"):
+        elig._evaluate_streaming_query(
+            spans_np,
+            num_tokens_paddings=[16, 32],
+            max_num_tokens=32,
+            dp_target_bucket=64,
+        )
+
+    # 4. PcpSequenceLayoutPlanner & prepare_pcp_sequence_layout
+    disabled_planner = PcpSequenceLayoutPlanner.from_vllm_config(None)
+    disabled_planner.reserve_host_token_capacity(None, 32)
+    dummy_disabled = disabled_planner.prepare_dummy(
+        num_tokens=8, num_reqs=1, kv_cache_initialized=False
+    )
+    assert dummy_disabled.kind is SequenceLayoutKind.ALL
+    assert disabled_planner.finalize_hidden_states(hs, None) is hs
+    assert disabled_planner.finalize_hidden_states(hs, dummy_disabled) is hs
+    assert disabled_planner.maybe_select_logits_hidden_states(hs, None, t_gath) is None
+    assert (
+        disabled_planner.maybe_select_logits_hidden_states(hs, dummy_disabled, t_gath)
+        is None
+    )
+
+    monkeypatch.setattr(pcp_mod, "_pcp_all_gather_equal_tokens", lambda t, dim=0: t * 2)
+    dummy_enabled = created_pcp.prepare_dummy(
+        num_tokens=8, num_reqs=1, kv_cache_initialized=False
+    )
+    torch.testing.assert_close(
+        created_pcp.finalize_hidden_states(hs, dummy_enabled), hs * 2
+    )
+
+    runner_grow = _planner_runner_stub(
+        scheduled=[16], computed=[0], prompt=[16], token_paddings=[16]
+    )
+    runner_grow.arange_np = np.arange(2, dtype=np.int64)
+    runner_grow.input_ids_cpu = torch.ones(4, dtype=torch.int32)
+    runner_grow.positions_cpu = torch.ones(4, dtype=torch.int32)
+    runner_grow.supports_mm_inputs = True
+    runner_grow.is_mm_embed_cpu = torch.ones(4, dtype=torch.bool)
+    runner_grow.uses_mrope = True
+    runner_grow.mrope_positions = SimpleNamespace(
+        cpu=torch.ones((3, 5), dtype=torch.int32)
+    )
+    runner_grow._make_buffer = lambda r, c, dtype: SimpleNamespace(
+        cpu=torch.zeros((r, c), dtype=dtype)
+    )
+    runner_grow.seq_lens_np = np.array([16], dtype=np.int32)
+    runner_grow.vllm_config = pcp_vllm_cfg
+
+    _ensure_host_token_buffer_capacity(runner_grow, 0)
+    created_pcp.reserve_host_token_capacity(runner_grow, 64)
+    assert runner_grow.input_ids_cpu.shape[0] == 64
+    assert runner_grow.is_mm_embed_cpu.shape[0] == 64
+    assert runner_grow.mrope_positions.cpu.shape == (3, 65)
+
+    with pytest.raises(ValueError, match="prefill_context_parallel_size > 1"):
+        prepare_pcp_sequence_layout(
+            runner_grow,
+            _scheduler_output([16]),
+            0,
+            1,
+            np.array([16], dtype=np.int32),
+            16,
+            False,
+            1,
+            1,
+            decision=PcpSequenceLayoutDecision(
+                mode=PcpSequenceLayoutMode.STREAMING, spans=(), pcp_size=1
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        prepare_pcp_sequence_layout(
+            runner_grow,
+            _scheduler_output([16]),
+            0,
+            1,
+            np.array([16], dtype=np.int32),
+            16,
+            False,
+            1,
+            1,
+            get_native_pcp_rank=lambda: 0,
+            get_native_pcp_world_size=lambda: 4,
+        )
+
+    with pytest.raises(RuntimeError, match="out of range"):
+        prepare_pcp_sequence_layout(
+            runner_grow,
+            _scheduler_output([16]),
+            0,
+            1,
+            np.array([16], dtype=np.int32),
+            16,
+            False,
+            1,
+            1,
+            get_native_pcp_rank=lambda: 5,
+            get_native_pcp_world_size=lambda: 2,
+        )
+
+    monkeypatch.setattr(envs, "VLLM_TPU_DEBUG_PCP_LAYOUT", True)
+    runner_grow2 = _planner_runner_stub(
+        scheduled=[16, 16], computed=[0, 0], prompt=[16, 16], token_paddings=[16]
+    )
+    runner_grow2.uses_mrope = True
+    runner_grow2.mrope_positions = SimpleNamespace(
+        cpu=torch.zeros((3, 64), dtype=torch.int32)
+    )
+    runner_grow2.seq_lens_np = np.array([16, 16], dtype=np.int32)
+    runner_grow2.vllm_config = pcp_vllm_cfg
+    prepared_dbg = prepare_pcp_sequence_layout(
+        runner_grow2,
+        _scheduler_output([16, 16]),
+        0,
+        2,
+        np.array([16, 16], dtype=np.int32),
+        32,
+        False,
+        2,
+        2,
+        get_native_pcp_rank=lambda: 0,
+        get_native_pcp_world_size=lambda: 2,
+    )
+    assert prepared_dbg.padded_total_num_scheduled_tokens == 32
+
+    runner_no_mm = _planner_runner_stub(
+        scheduled=[16], computed=[0], prompt=[16], token_paddings=[16]
+    )
+    runner_no_mm.supports_mm_inputs = False
+    runner_no_mm.uses_mrope = False
+    _ensure_host_token_buffer_capacity(runner_no_mm, 128)
+    assert runner_no_mm.input_ids_cpu.shape[0] == 128
