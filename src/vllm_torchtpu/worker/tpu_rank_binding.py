@@ -138,11 +138,10 @@ def _slice_binding_from_env(
     local_rank_offset: int,
 ) -> TpuWorkerBinding | None:
     """Return the executor-assigned binding, or None when none was supplied."""
-    present = [name for name in _SLICE_BINDING_ENV_VARS if env.get(name)]
-    if not present:
-        return None
-    if len(present) != len(_SLICE_BINDING_ENV_VARS):
-        missing = [name for name in _SLICE_BINDING_ENV_VARS if not env.get(name)]
+    missing = [name for name in _SLICE_BINDING_ENV_VARS if not env.get(name)]
+    if missing:
+        if len(missing) == len(_SLICE_BINDING_ENV_VARS):
+            return None
         raise ValueError(
             "Executor-assigned TPU slice binding is incomplete: missing "
             f"{missing}. Set all of {list(_SLICE_BINDING_ENV_VARS)} or none."

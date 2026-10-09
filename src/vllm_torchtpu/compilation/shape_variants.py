@@ -68,13 +68,22 @@ def _placeholder_values(graph: fx.GraphModule) -> list[Any]:
     return values
 
 
+_UNSET = object()
+
+
 def trace_shape_env(graph: fx.GraphModule) -> Any | None:
     """The ShapeEnv of the trace this graph came from, if it has one."""
+    cached = getattr(graph, "_cached_trace_shape_env", _UNSET)
+    if cached is not _UNSET:
+        return cached
+    shape_env = None
     for value in _placeholder_values(graph):
         mode = getattr(value, "fake_mode", None)
         if mode is not None and mode.shape_env is not None:
-            return mode.shape_env
-    return None
+            shape_env = mode.shape_env
+            break
+    graph._cached_trace_shape_env = shape_env
+    return shape_env
 
 
 def _finite(value: Any) -> int | None:
@@ -140,6 +149,9 @@ def _signature(graph: fx.GraphModule) -> tuple:
     but a structural difference -- a split graph whose subgraph takes one chunk
     in one variant and two in another -- does not.
     """
+    cached = getattr(graph, "_cached_signature", None)
+    if cached is not None:
+        return cached
 
     def shape(value: Any) -> Any:
         if not isinstance(value, torch.Tensor):
@@ -149,7 +161,9 @@ def _signature(graph: fx.GraphModule) -> tuple:
         )
         return (str(value.dtype), dims)
 
-    return tuple(shape(value) for value in _placeholder_values(graph))
+    sig = tuple(shape(value) for value in _placeholder_values(graph))
+    graph._cached_signature = sig
+    return sig
 
 
 def graph_signature(graph: fx.GraphModule) -> tuple:
@@ -191,10 +205,11 @@ class BucketExecutables:
         if found is None:
             return None
         runnable, signature = found
-        if signature != _signature(graph):
+        actual_sig = _signature(graph)
+        if signature != actual_sig:
             raise ShapeSpecializationError(
                 f"{key} was compiled by another trace of this model whose "
-                f"inputs differ ({signature} vs {_signature(graph)}). The "
+                f"inputs differ ({signature} vs {actual_sig}). The "
                 "graph is split, so its subgraph boundaries move with the "
                 "specialization and a bucket cannot be handed between traces; "
                 "unset TPU_KERNEL_ITER_MODE to serve this model."
