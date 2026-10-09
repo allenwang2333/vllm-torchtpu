@@ -16,6 +16,8 @@
 import datetime
 import os
 
+import pytest
+
 from vllm_torchtpu import profiler_trace
 
 
@@ -169,3 +171,104 @@ def test_merge_rank_capture_without_capture_is_noop(tmp_path):
 
     assert not (tmp_path / "plugins").exists()
     assert capture_dir.exists()
+
+
+def test_profiler_trace_edge_branches(tmp_path, monkeypatch):
+    # Default session_key resolution in resolve_canonical_dst_ts and clear
+    monkeypatch.setenv("TORCH_TPU_DP_MASTER_PORT", "54321")
+    ts = profiler_trace.resolve_canonical_dst_ts(str(tmp_path), 0)
+    assert (tmp_path / ".canonical_ts_dp54321").read_text().strip() == ts
+    profiler_trace.clear_canonical_ts_marker(str(tmp_path))
+    assert not (tmp_path / ".canonical_ts_dp54321").exists()
+
+    # Rank 0 write failure logs warning and returns canonical_ts
+    missing_dir = tmp_path / "nonexistent_parent" / "child"
+    ts_err = profiler_trace.resolve_canonical_dst_ts(
+        str(missing_dir), 0, session_key="err"
+    )
+    datetime.datetime.strptime(ts_err, profiler_trace.CANONICAL_TS_FORMAT)
+
+    # Non-zero rank sees an empty marker file before timeout
+    (tmp_path / ".canonical_ts_empty").write_text("   \n")
+    monkeypatch.setattr(profiler_trace, "CANONICAL_TS_POLL_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(profiler_trace, "CANONICAL_TS_POLL_INTERVAL_S", 0.01)
+    ts_fallback = profiler_trace.resolve_canonical_dst_ts(
+        str(tmp_path), 2, session_key="empty"
+    )
+    datetime.datetime.strptime(ts_fallback, profiler_trace.CANONICAL_TS_FORMAT)
+
+    # merge_rank_capture skips non-directory entries under plugins/profile
+    capture_dir = tmp_path / "rank_non_dir"
+    profile_dir = capture_dir / "plugins" / "profile"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "stray_file.txt").write_text("ignore")
+    profiler_trace.merge_rank_capture(str(capture_dir), str(tmp_path), "ts_nd", 0)
+
+    # merge_rank_capture handles unexpected exception gracefully
+    capture_err = tmp_path / "rank_err"
+    _stage_capture(capture_err, "pt_ts", "file.xplane.pb", "data")
+    monkeypatch.setattr(
+        profiler_trace.os,
+        "makedirs",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    profiler_trace.merge_rank_capture(str(capture_err), str(tmp_path), "ts_err", 0)
+
+
+def test_runner_stage_timing_full_coverage(monkeypatch):
+    import time
+
+    from vllm_torchtpu.runner import stage_timing
+
+    class FakeTpuEvent:
+        def record(self) -> None:
+            pass
+
+        def synchronize(self) -> None:
+            pass
+
+    monkeypatch.setattr(stage_timing, "TpuEvent", FakeTpuEvent)
+    timing = stage_timing.RunnerStageTiming(rank=3)
+
+    with timing.host_stage("prepare"):
+        pass
+
+    with timing.stage("forward"):
+        pass
+
+    # Wait briefly for daemon collector thread to record the device sample
+    deadline = time.monotonic() + 2.0
+    cpu_samples, device_samples = [], []
+    while time.monotonic() < deadline:
+        c, d = timing.take_samples()
+        cpu_samples.extend(c)
+        device_samples.extend(d)
+        if len(device_samples) >= 1:
+            break
+        time.sleep(0.005)
+
+    assert [s[1] for s in cpu_samples] == ["prepare", "forward"]
+    assert all(s[0] == "3" for s in cpu_samples)
+    assert len(device_samples) == 1
+    assert device_samples[0][0] == "3" and device_samples[0][1] == "forward"
+
+    # Exhaust semaphore slots so stage() falls back to host_stage()
+    while timing._slots.acquire(blocking=False):
+        pass
+    with timing.stage("overflow_stage"):
+        pass
+    cpu_overflow, dev_overflow = timing.take_samples()
+    assert len(cpu_overflow) == 1 and cpu_overflow[0][1] == "overflow_stage"
+    assert dev_overflow == []
+
+    # Exercise _collect_device_time on main thread so sys.monitoring records it
+    pending = stage_timing._PendingTiming(
+        "direct_stage", FakeTpuEvent(), FakeTpuEvent()
+    )
+    pending.end_recorded.set()
+    items = iter([pending])
+    monkeypatch.setattr(timing._pending, "get", lambda: next(items))
+    with pytest.raises(StopIteration):
+        timing._collect_device_time()
+    _, dev_direct = timing.take_samples()
+    assert len(dev_direct) == 1 and dev_direct[0][1] == "direct_stage"

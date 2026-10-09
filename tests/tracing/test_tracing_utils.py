@@ -77,3 +77,17 @@ def test_extract_kv_lens_for_tracing():
     # Case C: Empty slice yields no kwargs and no summary stats
     res_3 = extract_kv_lens_for_tracing(num_computed_tokens, start_index=4, num_reqs=2)
     assert res_3 == {}
+
+    # Case D: Non-monotonic kv_lens exercises both min_kv_len and max_kv_len updates
+    res_4 = extract_kv_lens_for_tracing([200, 100, 300])
+    assert res_4 == {
+        "kv_len1": 200,
+        "kv_len2": 100,
+        "kv_len3": 300,
+        "min_kv_len": 100,
+        "max_kv_len": 300,
+        "avg_kv_len": 200,
+    }
+    assert extract_request_ids_for_tracing(["cmpl-1", None]) == {
+        "request_id1": "cmpl-1"
+    }

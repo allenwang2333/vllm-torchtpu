@@ -16,6 +16,11 @@ class TraceAnnotation(contextlib.ContextDecorator):
     def __init__(self, name: str, **kwargs: Any) -> None:
         self.name = name
         self.kwargs = kwargs
+        self._record_name = (
+            f"{name}#{','.join(f'{k}={v}' for k, v in kwargs.items())}#"
+            if kwargs
+            else name
+        )
         self._rf = None
 
     @classmethod
@@ -24,11 +29,7 @@ class TraceAnnotation(contextlib.ContextDecorator):
 
     def __enter__(self):
         if self.is_enabled():
-            name = self.name
-            if self.kwargs:
-                args_str = ",".join(f"{k}={v}" for k, v in self.kwargs.items())
-                name = f"{name}#{args_str}#"
-            self._rf = torch.profiler.record_function(name)
+            self._rf = torch.profiler.record_function(self._record_name)
             self._rf.__enter__()
         return self
 

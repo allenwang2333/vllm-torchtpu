@@ -109,3 +109,20 @@ def test_resolve_with_env_vars(monkeypatch):
     assert standard["host_tracer_level"] == 1
     assert standard["device_tracer_level"] == 2
     assert advanced["tpu_trace_mode"] == "TRACE_COMPUTE_AND_SYNC"
+
+
+def test_parse_and_resolve_edge_branches():
+    with pytest.raises(ValueError, match="non-ASCII"):
+        parse_profile_options("host_tracer_level:\u2603")
+
+    profile_dir, standard, advanced = resolve_profile_dir_and_opts(
+        "/tmp/base",
+        None,
+        profiler_kwargs={
+            "profile_prefix": "from_kwargs",
+            "e2e_false": "false",
+        },
+    )
+    assert profile_dir == "/tmp/base/from_kwargs"
+    assert advanced["e2e_false"] is False
+    assert standard["host_tracer_level"] == 2
