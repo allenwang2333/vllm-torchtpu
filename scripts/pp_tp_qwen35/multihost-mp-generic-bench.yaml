@@ -271,7 +271,7 @@ spec:
                     SITEDIR=/tmp/torchtpu-bench-sitecustomize
                     mkdir -p "${SITEDIR}"
                     printf "from torch_tpu import _loader\n_loader._init_device_impl(\"tpu\")\n" > "${SITEDIR}/sitecustomize.py"
-                    export PYTHONPATH="${SITEDIR}:${PYTHONPATH:-}"
+                    export PYTHONPATH="${SITEDIR}:/workspace/vllm-torchtpu/src:${PYTHONPATH:-}"
 
                     if [ -f "/workspace/vllm-torchtpu/scripts/pp_tp_qwen35/run_qwen35_probes.py" ]; then
                       echo "Running deterministic greedy needle & reasoning probes..."

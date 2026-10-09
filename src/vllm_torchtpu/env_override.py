@@ -354,7 +354,11 @@ def _apply_qwen35_serve_cli_defaults() -> None:
     import sys
 
     argv = sys.argv
-    if "serve" not in argv[:3] or "qwen3.5-397b" not in " ".join(argv).lower():
+    if (
+        "serve" not in argv[:3]
+        or "bench" in argv[:3]
+        or "qwen3.5-397b" not in " ".join(argv).lower()
+    ):
         return
     is_pp = _is_cli_pp()
     cli_defaults = [("--renderer-num-workers", "4")]
