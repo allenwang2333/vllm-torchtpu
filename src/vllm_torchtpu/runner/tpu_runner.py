@@ -383,6 +383,72 @@ def _spec_warmup_group_num_blocks(runner: Any, group: Any, max_pos: int) -> int:
     return g_nblk
 
 
+def _spec_warmup_request_block_ids(
+    runner: Any,
+    group_nblks: list[int],
+    req_index: int = 0,
+    num_reqs: int = 1,
+) -> tuple[list[int], ...] | None:
+    """Build per-group block ID lists for synthetic spec-decode warmup request
+    ``req_index`` out of ``num_reqs``, or ``None`` if the pool is too small."""
+    cfg = runner.kv_cache_config
+    tp_size = int(
+        getattr(getattr(runner, "parallel_config", None), "tensor_parallel_size", 1)
+    )
+    if not envs.TPU_DEEPSEEK_V41_KV_SHARD or tp_size <= 1:
+        nblk = max(group_nblks)
+        if int(cfg.num_blocks) <= num_reqs * nblk + 1:
+            return None
+        lo = 1 + req_index * nblk
+        return tuple(list(range(lo, lo + g_nblk)) for g_nblk in group_nblks)
+
+    from vllm_torchtpu.core.owner_affine_block_pool import (
+        is_replicated_spec,
+        worker_owner_layout,
+    )
+
+    owner_layout = getattr(runner, "_kv_shard_owner_layout", None)
+    if owner_layout is None:
+        owner_layout = worker_owner_layout(runner.vllm_config, cfg)
+        runner._kv_shard_owner_layout = owner_layout
+    groups = cfg.kv_cache_groups
+    rep_stride = max(
+        (n for g, n in zip(groups, group_nblks) if is_replicated_spec(g.kv_cache_spec)),
+        default=0,
+    )
+    sharded_stride = max(
+        (
+            n
+            for g, n in zip(groups, group_nblks)
+            if not is_replicated_spec(g.kv_cache_spec)
+        ),
+        default=0,
+    )
+    num_owners = int(owner_layout.num_owners)
+    reqs_per_owner = cdiv(num_reqs, num_owners)
+    if (
+        rep_stride > 0 and owner_layout.num_replicated <= num_reqs * rep_stride + 1
+    ) or (
+        sharded_stride > 0
+        and owner_layout.blocks_per_owner < reqs_per_owner * sharded_stride
+    ):
+        return None
+    owner = req_index % num_owners
+    owner_slot = req_index // num_owners
+    rep_lo = 1 + req_index * rep_stride
+    sharded_lo = (
+        owner_layout.num_replicated
+        + owner * owner_layout.blocks_per_owner
+        + owner_slot * sharded_stride
+    )
+    return tuple(
+        list(range(rep_lo, rep_lo + g_nblk))
+        if is_replicated_spec(g.kv_cache_spec)
+        else list(range(sharded_lo, sharded_lo + g_nblk))
+        for g, g_nblk in zip(groups, group_nblks)
+    )
+
+
 @contextmanager
 def _suspend_kv_transfer_group() -> Iterator[None]:
     """Hide the process-global connector during worker-local warmup."""
@@ -6643,9 +6709,14 @@ class TPUModelRunner(GPUModelRunner):
         assert self.speculative_config is not None
         assert self.kv_cache_config is not None
         K = self.speculative_config.num_speculative_tokens
-        room = self.max_model_len - P
+        tp_size = int(
+            getattr(getattr(self, "parallel_config", None), "tensor_parallel_size", 1)
+        )
+        kv_shard = bool(envs.TPU_DEEPSEEK_V41_KV_SHARD and tp_size > 1)
+        P_req = max(1, P // tp_size) if kv_shard else P
+        room = self.max_model_len - P_req
         n_decode = min(max(5, K + 2), max(0, room // (1 + K) - 1))
-        max_pos = min(self.max_model_len, P + n_decode * (1 + K))
+        max_pos = min(self.max_model_len, P_req + n_decode * (1 + K))
         # Per-group block counts at each group's own block size (see
         # _warmup_one_spec_request); the per-request stride uses the widest
         # group so every group's ranges stay disjoint across requests.
@@ -6653,9 +6724,7 @@ class TPUModelRunner(GPUModelRunner):
             _spec_warmup_group_num_blocks(self, group, max_pos)
             for group in self.kv_cache_config.kv_cache_groups
         ]
-        nblk = max(group_nblks)
-        top = int(self.kv_cache_config.num_blocks)
-        if top <= R * nblk + 1:
+        if _spec_warmup_request_block_ids(self, group_nblks, 0, R) is None:
             logger.warning("skip spec-decode warmup R=%d: not enough kv blocks", R)
             return
         rids = [f"__spec_warmup_b{R}_{j}__" for j in range(R)]
@@ -6669,17 +6738,16 @@ class TPUModelRunner(GPUModelRunner):
             # reserve block 0 and keep each synthetic request's range disjoint.
             new_reqs = []
             for j, rid in enumerate(rids):
-                lo = 1 + j * nblk
+                req_block_ids = _spec_warmup_request_block_ids(self, group_nblks, j, R)
+                assert req_block_ids is not None
                 new_reqs.append(
                     NewRequestData(
                         req_id=rid,
-                        prompt_token_ids=[0] * P,
+                        prompt_token_ids=[0] * P_req,
                         mm_features=[],
                         sampling_params=sp,
                         pooling_params=None,
-                        block_ids=tuple(
-                            list(range(lo, lo + g_nblk)) for g_nblk in group_nblks
-                        ),
+                        block_ids=req_block_ids,
                         num_computed_tokens=0,
                         lora_request=None,
                     )
@@ -6688,18 +6756,22 @@ class TPUModelRunner(GPUModelRunner):
             # A single R*P prefill overflows positions_np ([max_num_tokens]) when
             # Decode below schedules R*(1+K) <= max_num_tokens, so only
             # the prefill needs chunking; the nr=R decode shape is unchanged.
-            reqs_per_chunk = max(1, self.max_num_tokens // P)
+            if kv_shard:
+                reqs_per_owner_chunk = max(1, self.max_num_tokens // (tp_size * P_req))
+                reqs_per_chunk = max(1, reqs_per_owner_chunk * tp_size)
+            else:
+                reqs_per_chunk = max(1, self.max_num_tokens // P_req)
             for c0 in range(0, R, reqs_per_chunk):
                 chunk = new_reqs[c0 : c0 + reqs_per_chunk]
                 so = SchedulerOutput.make_empty()
                 so.scheduled_new_reqs = chunk
-                so.num_scheduled_tokens = {r.req_id: P for r in chunk}
-                so.total_num_scheduled_tokens = len(chunk) * P
+                so.num_scheduled_tokens = {r.req_id: P_req for r in chunk}
+                so.total_num_scheduled_tokens = len(chunk) * P_req
                 assert self.execute_model(so) is None
                 self.sample_tokens(None)
                 self.take_draft_token_ids()
             # ---- decode all R together: real nr=R propose + verify + sample ---
-            nct = [P] * R
+            nct = [P_req] * R
             for t in range(n_decode):
                 all_token_ids = _spec_warmup_all_token_ids(rids, nct)
                 creq = CachedRequestData(
@@ -6747,11 +6819,19 @@ class TPUModelRunner(GPUModelRunner):
         assert self.speculative_config is not None
         assert self.kv_cache_config is not None
         K = self.speculative_config.num_speculative_tokens
+        tp_size = int(
+            getattr(getattr(self, "parallel_config", None), "tensor_parallel_size", 1)
+        )
+        P_req = (
+            max(1, P // tp_size)
+            if (envs.TPU_DEEPSEEK_V41_KV_SHARD and tp_size > 1)
+            else P
+        )
         # The contexts (num_computed_tokens) to run decode steps at: a short walk
         # near the prefill.
-        room = self.max_model_len - P
+        room = self.max_model_len - P_req
         n_dec = min(max(5, K + 2), max(0, room // (1 + K) - 1))
-        decode_ncts = [P + t for t in range(n_dec)]
+        decode_ncts = [P_req + t for t in range(n_dec)]
         # Reuse low physical block ids, as in _warmup_spec_batch and the LIFO
         # BlockPool workaround, rather than exercising the SC2-sensitive end
         # of the pool. Warmup runs before serving and tears down each request;
@@ -6761,24 +6841,21 @@ class TPUModelRunner(GPUModelRunner):
         # groups differ on hybrid models (mamba vs attention), and the
         # runner-level self.block_size predates the executor's post-load
         # block-size finalization.
-        max_pos = min(self.max_model_len, max([P] + decode_ncts) + (1 + K))
-        top = int(self.kv_cache_config.num_blocks)
-        block_ids_per_group = []
-        max_nblk = 0
-        for group in self.kv_cache_config.kv_cache_groups:
-            g_nblk = _spec_warmup_group_num_blocks(self, group, max_pos)
-            block_ids_per_group.append(list(range(1, 1 + g_nblk)))
-            max_nblk = max(max_nblk, g_nblk)
-        if top <= max_nblk + 1:
+        max_pos = min(self.max_model_len, max([P_req] + decode_ncts) + (1 + K))
+        group_nblks = [
+            _spec_warmup_group_num_blocks(self, group, max_pos)
+            for group in self.kv_cache_config.kv_cache_groups
+        ]
+        block_ids = _spec_warmup_request_block_ids(self, group_nblks, 0, 1)
+        if block_ids is None:
             logger.warning("skip spec-decode warmup P=%d: not enough kv blocks", P)
             return False
-        block_ids = tuple(block_ids_per_group)
         sp = SamplingParams(temperature=0.0 if greedy else 1.0)
         try:
             # ---- prefill ----
             new_req = NewRequestData(
                 req_id=rid,
-                prompt_token_ids=[0] * P,
+                prompt_token_ids=[0] * P_req,
                 mm_features=[],
                 sampling_params=sp,
                 pooling_params=None,
@@ -6788,8 +6865,8 @@ class TPUModelRunner(GPUModelRunner):
             )
             so = SchedulerOutput.make_empty()
             so.scheduled_new_reqs = [new_req]
-            so.num_scheduled_tokens = {rid: P}
-            so.total_num_scheduled_tokens = P
+            so.num_scheduled_tokens = {rid: P_req}
+            so.total_num_scheduled_tokens = P_req
             assert self.execute_model(so) is None
             self.sample_tokens(None)
             d = self.take_draft_token_ids()

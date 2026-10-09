@@ -677,6 +677,19 @@ def test_ced_non_identity_replay_with_owner_token_layout():
     assert kw["owner_perm"].shape == (8,)
     assert kw["owner_inv"].shape == (8,)
     assert kw["owner_q_loc"].shape == (2, 3)
+    assert kw["owner_perm"].storage_offset() == 0
+    assert kw["owner_inv"].storage_offset() == 0
+    assert kw["owner_q_loc"].storage_offset() == 0
+    assert (
+        len(
+            {
+                kw["owner_perm"].untyped_storage().data_ptr(),
+                kw["owner_inv"].untyped_storage().data_ptr(),
+                kw["owner_q_loc"].untyped_storage().data_ptr(),
+            }
+        )
+        == 3
+    )
 
     # Empty indices (dummy DP sync replay) uses _positional_layout
     empty_plan = SimpleNamespace(
@@ -695,3 +708,67 @@ def test_ced_non_identity_replay_with_owner_token_layout():
     from vllm_torchtpu.runner.owner_token_layout import _mark_token_dim_dynamic
 
     _mark_token_dim_dynamic(torch.zeros(1, dtype=torch.int32))
+
+
+def test_spec_warmup_request_block_ids_kv_shard(monkeypatch):
+    """Verify _spec_warmup_request_block_ids places sharded groups in owner regions."""
+    from types import SimpleNamespace
+
+    import torch
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+    from vllm_torchtpu.core.owner_affine_block_pool import OwnerLayout
+    from vllm_torchtpu.runner.tpu_runner import _spec_warmup_request_block_ids
+
+    swa_group = SimpleNamespace(
+        kv_cache_spec=SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.bfloat16,
+            sliding_window=32,
+        )
+    )
+    full_group = SimpleNamespace(
+        kv_cache_spec=FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.bfloat16,
+        )
+    )
+    runner = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=20,
+            kv_cache_groups=[swa_group, full_group],
+        ),
+        _kv_shard_owner_layout=OwnerLayout(
+            num_replicated=10, num_owners=2, blocks_per_owner=10
+        ),
+    )
+
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_KV_SHARD", "0")
+    assert _spec_warmup_request_block_ids(runner, [2, 3], 1, 2) == (
+        [4, 5],
+        [4, 5, 6],
+    )
+    assert _spec_warmup_request_block_ids(runner, [2, 10], 0, 2) is None
+
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_KV_SHARD", "1")
+    # Request 0 -> owner 0 ([10, 20)), request 1 -> owner 1 ([20, 30)),
+    # request 2 -> owner 0 slot 1 ([10 + 3, 20))
+    assert _spec_warmup_request_block_ids(runner, [2, 3], 0, 3) == (
+        [1, 2],
+        [10, 11, 12],
+    )
+    assert _spec_warmup_request_block_ids(runner, [2, 3], 1, 3) == (
+        [3, 4],
+        [20, 21, 22],
+    )
+    assert _spec_warmup_request_block_ids(runner, [2, 3], 2, 3) == (
+        [5, 6],
+        [13, 14, 15],
+    )
+    # Insufficient sharded blocks per owner (2 requests on owner 0 * 6 = 12 > 10)
+    assert _spec_warmup_request_block_ids(runner, [2, 6], 0, 3) is None

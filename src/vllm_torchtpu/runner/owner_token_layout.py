@@ -344,31 +344,25 @@ def owner_layout_tensors(
     device: torch.device | str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Convert ``layout`` into ``(owner_perm, owner_inv, owner_q_loc)`` int32
-    tensors with padding rows/tokens masked to ``-1`` in a single H2D copy."""
+    tensors with padding rows/tokens masked to ``-1``."""
     target_device = torch.device("cpu") if device is None else torch.device(device)
-    n_perm = layout.padded_tokens
-    n_inv = layout.inv.shape[0]
-    q_loc_flat = np.asarray(layout.query_start_loc, dtype=np.int32).reshape(-1)
-    packed_np = np.empty(n_perm + n_inv + q_loc_flat.size, dtype=np.int32)
     valid_perm = (
         np.arange(layout.segment_tokens, dtype=np.int32)[None, :]
         < layout.owner_tokens[:, None]
     ).reshape(-1)
-    np.copyto(packed_np[:n_perm], layout.perm)
-    packed_np[:n_perm][~valid_perm] = -1
+    perm_np = np.empty(layout.padded_tokens, dtype=np.int32)
+    np.copyto(perm_np, layout.perm)
+    perm_np[~valid_perm] = -1
     total_real = int(layout.owner_tokens.sum())
-    packed_np[n_perm : n_perm + total_real] = layout.inv[:total_real]
-    packed_np[n_perm + total_real : n_perm + n_inv] = -1
-    packed_np[n_perm + n_inv :] = q_loc_flat
-    packed = torch.from_numpy(packed_np).to(device=target_device)
-    perm = packed[:n_perm]
-    inv = packed[n_perm : n_perm + n_inv]
+    inv_np = np.empty(layout.inv.shape[0], dtype=np.int32)
+    inv_np[:total_real] = layout.inv[:total_real]
+    inv_np[total_real:] = -1
+    q_loc_np = np.ascontiguousarray(layout.query_start_loc, dtype=np.int32)
+    perm = torch.from_numpy(perm_np).to(device=target_device, non_blocking=True)
+    inv = torch.from_numpy(inv_np).to(device=target_device, non_blocking=True)
+    q_loc = torch.from_numpy(q_loc_np).to(device=target_device, non_blocking=True)
     _mark_token_dim_dynamic(perm, inv)
-    return (
-        perm,
-        inv,
-        packed[n_perm + n_inv :].reshape(layout.query_start_loc.shape),
-    )
+    return perm, inv, q_loc
 
 
 def _mark_token_dim_dynamic(*tensors: torch.Tensor) -> None:
