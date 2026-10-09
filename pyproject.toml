@@ -165,9 +165,21 @@ ignore = [
 # tools/check_b023_baseline.py counts the findings per file and fails when a
 # file gains one. Both move together.
 "src/vllm_torchtpu/kernels/**" = ["B023"]
+# The megakernel kernels (one file per role, several thousand lines) keep
+# their own dense 120-column layout, so `ruff format` skips them (see
+# [tool.ruff.format]); B023 is exempt for the reason above, under the same
+# ratchet.
+"src/vllm_torchtpu/megakernel/common/**" = ["B023", "E501", "E701", "E702", "E741"]
+"src/vllm_torchtpu/megakernel/kimi_k3/kernels/**" = [
+    "B023", "E501", "E701", "E702", "E741",
+]
 
 [tool.ruff.format]
 docstring-code-format = true
+exclude = [
+    "src/vllm_torchtpu/megakernel/common/**",
+    "src/vllm_torchtpu/megakernel/kimi_k3/kernels/**",
+]
 
 [tool.pyrefly]
 project-includes = ["src"]
@@ -204,6 +216,7 @@ ignore-missing-imports = [
     "google.protobuf", "google.protobuf.*",
     "jax", "jax.*",
     "jaxlib", "jaxlib.*",
+    "ml_dtypes", "ml_dtypes.*",
     "numpy", "numpy.*",
     "packaging", "packaging.*",
     "pathwaysutils", "pathwaysutils.*",
@@ -211,9 +224,11 @@ ignore-missing-imports = [
     "ray", "ray.*",
     "requests", "requests.*",
     "sympy", "sympy.*",
+    "tiktoken", "tiktoken.*",
     "torch", "torch.*",
     "torch_tpu", "torch_tpu.*",
     "runai_model_streamer", "runai_model_streamer.*",
+    "safetensors", "safetensors.*",
     "tpu_sync", "tpu_sync.*",
     "tqdm", "tqdm.*",
     "transformers", "transformers.*",

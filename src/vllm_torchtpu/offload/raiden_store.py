@@ -1398,6 +1398,32 @@ def resolve_kernel_geometry(
     return kernel_block_size, per_block_shape, spec0.dtype, spec0.block_size
 
 
+def view_on_current_storage(
+    view: torch.Tensor, source: torch.Tensor | None
+) -> torch.Tensor:
+    """``view`` rebuilt on the current storage of ``source``, the runner's
+    tensor for the pool ``view`` covers (from offset 0). A runner that donates
+    its pools to every op re-binds ``source`` to each fresh buffer with
+    ``Tensor.set_``; ``view`` stays on the buffer it was built from, which the
+    first op deletes."""
+    if source is None:
+        return view
+    import torch
+
+    storage = source.untyped_storage()
+    assert view.storage_offset() == 0, view.storage_offset()
+    assert view.numel() * view.element_size() == storage.nbytes(), (
+        "registered view does not cover its pool storage: "
+        f"view_bytes={view.numel() * view.element_size()}, "
+        f"storage_bytes={storage.nbytes()}"
+    )
+    return (
+        torch.empty(0, dtype=view.dtype, device=source.device)
+        .set_(storage)
+        .view(view.shape)
+    )
+
+
 class RaidenStoreOffloadingWorker(OffloadingWorker):
     """Worker-side endpoint that registers local TPU HBM device buffers with
     the Controller.
@@ -1428,10 +1454,12 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         controller_address: str,
         rank: int,
         block_major_contract: BlockMajorContract | None = None,
+        pool_sources: list[torch.Tensor] | None = None,
     ):
         import numpy as np
         import torch
 
+        self._pool_sources = list(pool_sources or ())
         (kernel_block_size, per_block_shape, kv_dtype, device_block_size) = (
             resolve_kernel_geometry(vllm_config, kv_cache_config)
         )
@@ -1545,6 +1573,14 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         # Hold strong references to ensure PyTorch tensors remain allocated
         # while Raiden C++ retains raw pointers to their underlying storage.
         self._device_tensors = [[t] for t in device_tensors]
+        # Each view's pool tensor, matched while both still share a storage:
+        # registration rebuilds the views on the pools' storage at that time.
+        source_of = {int(s.untyped_storage().data_ptr()): s for s in self._pool_sources}
+        self._view_sources = (
+            [source_of.get(int(t.untyped_storage().data_ptr())) for t in device_tensors]
+            if source_of
+            else [None] * len(device_tensors)
+        )
         self._host_blocks_to_allocate = host_blocks_to_allocate
         self._controller_address = controller_address
         self._rank = rank
@@ -1584,6 +1620,12 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                 try:
                     from tpu_sync.api.torch import kv_cache_manager as _kcm
 
+                    self._device_tensors = [
+                        [view_on_current_storage(view, source)]
+                        for [view], source in zip(
+                            self._device_tensors, self._view_sources, strict=True
+                        )
+                    ]
                     self._mgr = _kcm.KVCacheManager(
                         kv_caches=self._device_tensors,
                         local_control_port=0,
@@ -1817,6 +1859,9 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
         self._manager: RaidenOffloadingManager | None = None
         self._worker: RaidenStoreOffloadingWorker | None = None
+        # The runner's tensor per KV pool storage (set by the connector before
+        # the worker is built); see RaidenStoreOffloadingWorker.
+        self.pool_sources: list[torch.Tensor] = []
 
     def get_manager(self) -> OffloadingManager:
         if self._manager is None:
@@ -1852,5 +1897,6 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 controller_address=controller_address,
                 rank=rank,
                 block_major_contract=self.block_major_contract,
+                pool_sources=self.pool_sources,
             )
         return self._worker

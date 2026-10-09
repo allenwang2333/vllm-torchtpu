@@ -378,7 +378,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             self._fenced_jobs: dict[int, int] = {}
             self._completed_jobs: dict[int, int] = {}
             self._load_error_block_ids: set[int] = set()
-            # Registered KV pool byte views whose deferred writes are dispatched before
+            # Registered KV pool tensors whose deferred writes are dispatched before
             # recording fence events.
             self._pool_sync_tensors: list[torch.Tensor] = []
             # In-flight fence events awaiting device retirement before acknowledging
@@ -416,6 +416,9 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         num_blocks = self.connector_worker.kv_cache_config.num_blocks
 
         pool_storages: dict[int, tuple[torch.UntypedStorage, torch.device]] = {}
+        # The runner's own tensor per pool storage, which anything touching a
+        # pool after startup goes through (see `view_on_current_storage`).
+        pool_sources: dict[int, torch.Tensor] = {}
         for layer_kv_cache in kv_caches.values():
             state_tensors = (
                 [layer_kv_cache]
@@ -425,6 +428,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             for tensor in state_tensors:
                 storage = tensor.untyped_storage()
                 pool_storages.setdefault(storage.data_ptr(), (storage, tensor.device))
+                pool_sources.setdefault(storage.data_ptr(), tensor)
 
         pool_tensors: list[CanonicalKVCacheTensor] = []
         for storage, device in pool_storages.values():
@@ -446,7 +450,8 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             )
 
         # Retain pool tensor references to dispatch their writes during save fences.
-        self._pool_sync_tensors = [pool_tensor.tensor for pool_tensor in pool_tensors]
+        self._pool_sync_tensors = list(pool_sources.values())
+        self.connector_worker.spec.pool_sources = list(pool_sources.values())
 
         group_data_refs = [
             [
