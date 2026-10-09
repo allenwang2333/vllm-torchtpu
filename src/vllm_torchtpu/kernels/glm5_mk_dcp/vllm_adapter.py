@@ -450,6 +450,7 @@ class Glm5MKD:
                     + [torch.empty_like(c) for c in caches] + dbg)
 
         TMAX, M, DR = cfg.TMAX, info["M"], cfg.DR
+        nb = int(self.nb)
         BMAX = cfg.TMAX
         max_pages = self.max_pages
 
@@ -470,7 +471,11 @@ class Glm5MKD:
             qsl_b = torch.cat([qsl_, last.expand(BMAX + 1)])[: BMAX + 1]
             T = qsl_[-1]
             seq_b = fit(seq_lens.to(i32), BMAX)
-            bt_b = fit(fit(bt2, BMAX, 0), max_pages, 1)
+            # DCP block tables hold VIRTUAL page ordinals; every main reader / writer resolves them on
+            # this rank as `virtual % num_pages` (kernels/mla/kv_cache_utils.py:583, :713). Unresolved,
+            # ids >= nb made the megakernel read (and its writer write) out of bounds -- the
+            # real-weight parity failure (bounds checks are off in the kernel)
+            bt_b = torch.remainder(fit(fit(bt2, BMAX, 0), max_pages, 1), nb)
             t = torch.arange(TMAX, device=dev, dtype=i32)
             valid = (t < T).to(i32)
             req = (qsl_b[1:BMAX + 1][None, :] <= t[:, None]).sum(1).to(i32)
