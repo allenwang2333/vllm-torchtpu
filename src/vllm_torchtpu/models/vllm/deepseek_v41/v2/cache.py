@@ -440,6 +440,8 @@ class PagedCacheRows:
         return math.prod(self.shape)
 
     def row_indices(self, slots):
+        if not self.sharded and self.page_stride == self.shape[1]:
+            return self.row_offset + slots
         blocks = slots // self.shape[1]
         rem = slots % self.shape[1]
         if not self.sharded:
@@ -540,7 +542,12 @@ class PagedCacheRows:
 
     def write(self, slots, values, after=None):
         """``after`` (optional) must be computed before the in-place write."""
-        records = self.row_indices(slots.clamp(min=0)).masked_fill(slots < 0, -1)
+        if self.sharded:
+            records = self.row_indices(slots)
+        elif self.page_stride == self.shape[1]:
+            records = torch.where(slots >= 0, self.row_offset + slots, -1)
+        else:
+            records = self.row_indices(slots.clamp(min=0)).masked_fill(slots < 0, -1)
         if self.dtype == torch.uint8:
             self._write_fp8(records, values)
             return
@@ -637,9 +644,13 @@ class NativeCacheView:
         if (
             torch.compiler.is_compiling() or getattr(self, "_tpu_kv_shard", False)
         ) and raw is not None:
-            return PagedCacheRows(
-                raw, self._tpu_cache_layout, getattr(self, "_tpu_rope_pool", None)
-            )
+            paged = getattr(self, "_tpu_paged_cache_rows", None)
+            if paged is None:
+                paged = PagedCacheRows(
+                    raw, self._tpu_cache_layout, getattr(self, "_tpu_rope_pool", None)
+                )
+                self._tpu_paged_cache_rows = paged
+            return paged
         return self._bound_cache
 
     @kv_cache.setter
@@ -653,16 +664,21 @@ class NativeCacheView:
         self._tpu_kv_shard = bool(layout is not None and len(layout) >= 6 and layout[5])
         if layout is not None:
             self._tpu_cache_layout = layout
-            return
-        raw_tensor = raw_cache[0] if isinstance(raw_cache, tuple) else raw_cache
-        if raw_tensor is not None and raw_tensor.device.type != "cpu":
-            raise ValueError("TPU native caches require explicit allocator layout")
-        view = self._bound_cache
-        self._tpu_cache_layout = (
-            tuple(view.shape),
-            view.dtype,
-            view.stride(0) * view.element_size(),
-            view.storage_offset() * view.element_size(),
+        else:
+            raw_tensor = raw_cache[0] if isinstance(raw_cache, tuple) else raw_cache
+            if raw_tensor is not None and raw_tensor.device.type != "cpu":
+                raise ValueError("TPU native caches require explicit allocator layout")
+            view = self._bound_cache
+            self._tpu_cache_layout = (
+                tuple(view.shape),
+                view.dtype,
+                view.stride(0) * view.element_size(),
+                view.storage_offset() * view.element_size(),
+            )
+        self._tpu_paged_cache_rows = (
+            PagedCacheRows(raw_cache, self._tpu_cache_layout, rope_pool)
+            if raw_cache is not None
+            else None
         )
 
 
@@ -962,14 +978,17 @@ def encode_fp8_kv(latent: jax.Array) -> tuple[jax.Array, jax.Array]:
 
     nope = latent[:, :NOPE_DIM].astype(jnp.float32)
     groups = NOPE_DIM // NOPE_SCALE_PERIOD
-    amax = jnp.abs(nope).reshape(-1, groups, NOPE_SCALE_PERIOD).max(axis=1)
+    nope_3d = nope.reshape(-1, groups, NOPE_SCALE_PERIOD)
+    amax = jnp.abs(nope_3d).max(axis=1)
     fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
     exponent = jnp.ceil(jnp.log2(jnp.maximum(amax, 1e-4) / fp8_max)).astype(jnp.int32)
     # Build the power of two from its bits: exp2 is approximate on some
     # backends, and a scale off by one ulp flips e4m3 rounding at ties.
     biased = exponent + 127
     scales = jax.lax.bitcast_convert_type(biased << 23, jnp.float32)
-    values = (nope / jnp.tile(scales, groups)).astype(jnp.float8_e4m3fn)
+    values = (
+        (nope_3d / scales[:, None, :]).reshape(-1, NOPE_DIM).astype(jnp.float8_e4m3fn)
+    )
     record = jnp.concatenate(
         (jax.lax.bitcast_convert_type(values, jnp.uint8), biased.astype(jnp.uint8)),
         axis=-1,
@@ -1127,12 +1146,12 @@ def write_cache(cache, slots, values, valid, after=None):
     """
     count = values.shape[0]
     slots, valid = slots[:count], valid[:count]
-    slots = slots.masked_fill(~valid, -1).long()
+    slots = slots.masked_fill(~valid, -1)
     if isinstance(cache, PagedCacheRows):
         cache.write(slots, values, after)
         return
     if cache.device.type == "cpu":
-        selected = slots[valid]
+        selected = slots[valid].long()
         if cache.ndim == values.ndim:
             cache.index_copy_(0, selected, values[valid])
         else:

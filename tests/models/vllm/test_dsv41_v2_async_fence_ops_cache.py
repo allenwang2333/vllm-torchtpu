@@ -536,6 +536,18 @@ class TestPagedCacheRows:
         # slots // 4 * 4 + slots % 4 + 2 -> slot + 2
         assert torch.equal(paged.row_indices(slots), slots + 2)
 
+        # Unsharded with page_stride (8) != shape[1] (4)
+        layout_strided = ((8, 4, 128), torch.bfloat16, 2048, 256)
+        paged_strided = v2_cache.PagedCacheRows(raw, layout_strided)
+        assert torch.equal(
+            paged_strided.row_indices(slots),
+            torch.tensor([1, 2, 9, 12]),
+        )
+        paged_strided.write(
+            torch.tensor([0, -1, 4], dtype=torch.int32),
+            torch.ones(3, 128, dtype=torch.bfloat16),
+        )
+
         # Aligned pages
         # rows = shape[1] = 4, rows % 4 == 0, row_offset % 4 == 2 != 0 -> returns None
         assert paged.pages(torch.tensor([0, 1])) is None
@@ -766,13 +778,20 @@ class TestNativeCacheView:
         adapter.bind_kv_cache(bound_tensor)
         assert adapter.kv_cache is bound_tensor
 
-        # 2. Compiling with raw_cache present -> returns PagedCacheRows
+        # 2. Compiling with raw_cache present -> returns cached PagedCacheRows
         raw_cpu = torch.zeros(64, ROW_WORDS, dtype=torch.int32)
         adapter.bind_kv_cache(bound_tensor, raw_cache=raw_cpu)
 
         monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
         view_result = adapter.kv_cache
         assert isinstance(view_result, v2_cache.PagedCacheRows)
+        assert adapter.kv_cache is view_result
+
+        # Lazy fallback when _tpu_paged_cache_rows is cleared
+        adapter._tpu_paged_cache_rows = None
+        rebuilt = adapter.kv_cache
+        assert isinstance(rebuilt, v2_cache.PagedCacheRows)
+        assert adapter.kv_cache is rebuilt
 
         # 3. Setter
         new_tensor = torch.zeros(8, 4, 128)
