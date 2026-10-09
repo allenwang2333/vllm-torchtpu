@@ -28,10 +28,46 @@ run_or_print() {
   echo ""
   echo "================================================================================"
   if [[ "${MODE}" == "--execute" ]]; then
-    "$@"
+    local out
+    out=$("$@" 2>&1 | tee /dev/stderr)
+    local job_id
+    job_id=$(echo "${out}" | grep -oE 'j-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}' | tail -n 1)
+    if [[ -n "${job_id}" && "${KUEUE_BUMP_PRIORITY:-1}" == "1" ]]; then
+      bump_kueue_priority "${job_id}"
+    fi
   else
     echo "(Dry run only. Pass --execute to submit the CDK job.)"
   fi
+}
+
+# Team runbook for multi-node jobs: cdk-cluster-queue is BestEffortFIFO with
+# LowerPriority preemption, so a 2-node job at the per-user fair-share priority
+# (cdk-p1 = 400) starves behind 1-node backfill and is preempted by every new
+# cdk-p0 job. The CDK webhook blocks JobSet/Job/Pod edits but not Kueue
+# Workloads; patch the Workload to cdk-p0 (500) as soon as it exists. CDK's
+# job-manager re-syncs it to cdk-p1 within seconds, but the window is enough
+# for Kueue to reserve quota and admit; an admitted job is not un-admitted.
+bump_kueue_priority() {
+  local job_id="$1" w=""
+  for _ in $(seq 1 24); do
+    w=$(kubectl get workloads -n cloud-devkit-jobs --no-headers 2>/dev/null | awk -v j="${job_id}" '$1 ~ j {print $1}' | head -n 1)
+    [[ -n "${w}" ]] && break
+    sleep 5
+  done
+  if [[ -z "${w}" ]]; then
+    echo "[kueue] no Workload for ${job_id} after 120s; skipping priority bump"
+    return 0
+  fi
+  for _ in $(seq 1 6); do
+    kubectl patch workload "${w}" -n cloud-devkit-jobs --type=merge \
+      -p '{"spec":{"priority":500,"priorityClassRef":{"group":"kueue.x-k8s.io","kind":"WorkloadPriorityClass","name":"cdk-p0"}}}' >/dev/null 2>&1 || true
+    sleep 3
+    local st
+    st=$(kubectl get workload "${w}" -n cloud-devkit-jobs -o jsonpath='{.spec.priority} admitted={.status.conditions[?(@.type=="Admitted")].status}' 2>/dev/null)
+    echo "[kueue] ${w}: ${st}"
+    [[ "${st}" == *"admitted=True"* ]] && return 0
+  done
+  return 0
 }
 
 cd "${CDK_DIR}"
