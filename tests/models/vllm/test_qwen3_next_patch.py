@@ -606,8 +606,9 @@ def test_cat768_fp8_fusion_and_weight_deletion():
                     skip_final_all_reduce=False, is_sequence_parallel=False
                 ),
                 "maybe_all_reduce_tensor_model_parallel": lambda self, t: t,
-                "__call__": lambda self, hidden_states, router_logits: hidden_states
-                * 0.5,
+                "__call__": lambda self, hidden_states, router_logits: (
+                    hidden_states * 0.5
+                ),
             },
         )()
 
@@ -641,3 +642,19 @@ def test_cat768_fp8_fusion_and_weight_deletion():
             dim=0,
         ).item()
         assert cos_moe > 0.999, f"cos_moe={cos_moe}"
+
+
+@pytest.mark.parametrize(
+    ("rows", "cols", "expected"),
+    [
+        (16, 1024, 16),  # < 32: full shape
+        (32, 1024, 32),  # 32-aligned decode bucket (TP=8)
+        (64, 1024, 32),  # 32-aligned sub-block for 2D float8_e4m3fn (32, 128) tiling
+        (512, 1024, 64),  # TP=8 prefill bucket
+        (4096, 4096, 32),  # TP=2 prefill bucket (must stay 32, not 4096)
+    ],
+)
+def test_sigmoid_gate_quant_tile_selection(rows, cols, expected):
+    bm = patch_mod._legal_tile(rows, patch_mod._select_gate_q_tile(rows, cols))
+    assert bm == expected
+    assert bm == rows or (rows % bm == 0 and bm % 32 == 0)
