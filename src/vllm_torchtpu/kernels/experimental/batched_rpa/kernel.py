@@ -326,7 +326,8 @@ def generate_mask(
         # Step 2
         #   offset = causal_offset - bq_start
         offset = step_meta.causal_offset[b_idx] - bq_start
-        mask_b = q_kv_diff >= offset
+        n_valid = step_meta.bkv_sz_frm_cache[b_idx] + step_meta.bkv_sz_frm_new[b_idx]
+        mask_b = jnp.logical_and(q_kv_diff >= offset, kv_iota < n_valid)
         if (sliding_window := cfgs.model.sliding_window) is not None:
             mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
         if step_meta.local_k_start is not None:
@@ -474,7 +475,11 @@ def block_fully_visible(
         return None
     full = None
     for b_idx in range(cfgs.batch_size):
-        full_b = step_meta.causal_offset[b_idx] <= 1 - cfgs.bkv_sz
+        n_valid = step_meta.bkv_sz_frm_cache[b_idx] + step_meta.bkv_sz_frm_new[b_idx]
+        full_b = jnp.logical_and(
+            step_meta.causal_offset[b_idx] <= 1 - cfgs.bkv_sz,
+            n_valid >= cfgs.bkv_sz,
+        )
         if step_meta.local_k_start is not None:
             full_b = jnp.logical_and(full_b, step_meta.local_k_start[b_idx] <= 0)
         if step_meta.local_k_end is not None:
