@@ -9,7 +9,8 @@ Three arms per cell, all from the same inputs:
 * native reference: today's path -- fused_moe_func's EP remap/mask and BF16
   weight cast, the incumbent ``dense_expert_moe``, then the XLA shared expert
   (``xla_quantized_matmul`` gate/up as its own op; silu*up fused with the down
-  activation quantization, as XLA fuses it) and the BF16 shared + routed add;
+  activation quantization, as XLA fuses it) and the BF16 shared + routed add
+  (the runner's routed scale, when not 1, applied to the BF16 routed output);
 * candidate: ``dense_expert_moe_fused`` with global ids, the EP offset and the
   shared expert inside.
 
@@ -149,9 +150,22 @@ def _xla_shared(x, ws13, ss13, ws2, ss2):
     shared_i = ws2.shape[0]
     gate_up = jax.jit(xla_quantized_matmul)(x, ws13, ss13)
 
+    on_tpu = jax.default_backend() == "tpu"
+
     @jax.jit
     def down(gu):
-        act = jax.nn.silu(gu[:, :shared_i]) * gu[:, shared_i:]
+        if on_tpu:
+            # Today's form: torch SiluAndMul on BF16, fused by XLA into the
+            # down quantization.
+            act = jax.nn.silu(gu[:, :shared_i]) * gu[:, shared_i:]
+        else:
+            # XLA:TPU computes the form above as FP32 silu*up rounded once to
+            # BF16 (bit-exact, probe j-1999b8dc-ecff-439d-b68e); XLA:CPU keeps
+            # excess precision through the fusion instead. State the TPU
+            # semantics explicitly so the CPU run checks the same numerics.
+            g = gu[:, :shared_i].astype(jnp.float32)
+            u = gu[:, shared_i:].astype(jnp.float32)
+            act = (jax.nn.silu(g) * u).astype(jnp.bfloat16)
         return xla_quantized_matmul(act, ws2, ss2)
 
     return down(gate_up)

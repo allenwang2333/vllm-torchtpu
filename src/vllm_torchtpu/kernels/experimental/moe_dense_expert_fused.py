@@ -235,7 +235,7 @@ def _kernel(
 
     # 5. Shared expert, coefficient 1 per row in xla_quantized_matmul numerics:
     #    per-token full-K FP8 activation quantization, FP32 MXU accumulation,
-    #    * x scale * per-channel w scale, BF16 output; silu(gate) * up in BF16.
+    #    * x scale * per-channel w scale, BF16 output.
     if shared_i:
         xq_s, xsc_s = quantize_block(x_ref[...], axis=1, target_dtype=jnp.float8_e4m3fn)
         xsc_s = xsc_s.astype(jnp.float32)
@@ -248,13 +248,16 @@ def _kernel(
                 sw13_ref[k : k + 512, :],
                 preferred_element_type=jnp.float32,
             )
-        # Fusion boundaries follow the XLA path: the gate/up output is a
-        # materialized BF16 tensor (its own fusion), while silu(gate) * up is
-        # fused into the down activation's quantization, so it is not forced
-        # through a BF16 buffer here either. FP8 rounding of the down
-        # activation is sensitive to that intermediate precision.
+        # The gate/up output is a materialized BF16 tensor, as XLA's own
+        # fusion writes it. silu(gate) * up is then computed in FP32 and
+        # rounded once to BF16 before the down quantization: on TPU that is
+        # bit-exactly what the XLA path computes (probe j-1999b8dc-ecff-439d-
+        # b68e), whereas BF16 jnp ops here let Mosaic carry excess precision
+        # into the FP8 quantization (~1.7% relative on the shared output).
         sgu_ref[...] = ((gu * xsc_s) * ss13_ref[...]).astype(jnp.bfloat16)
-        act = jax.nn.silu(sgu_ref[:, :shared_i]) * sgu_ref[:, shared_i:]
+        gate = sgu_ref[:, :shared_i].astype(jnp.float32)
+        up = sgu_ref[:, shared_i:].astype(jnp.float32)
+        act = (jax.nn.silu(gate) * up).astype(jnp.bfloat16)
         aq_s, asc_s = quantize_block(act, axis=1, target_dtype=jnp.float8_e4m3fn)
         asc_s = asc_s.astype(jnp.float32)
         for n in range(0, h, 512):
