@@ -378,7 +378,6 @@ class DFlashProposer:
                 query_start_loc_device,
                 position_ids_device,
                 draft_lengths,
-                num_reqs,
                 block_size,
                 padded_len,
                 self.mask_token_id,
@@ -389,7 +388,6 @@ class DFlashProposer:
                 device_seed,
                 query_start_loc_device,
                 position_ids_device,
-                num_reqs,
                 block_size,
                 padded_len,
                 self.mask_token_id,
@@ -1033,21 +1031,28 @@ class DFlashProposer:
         self,
         query_start_loc: torch.Tensor,
         position_ids: torch.Tensor,
-        num_reqs: int,
         padded_num_reqs: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Per padded request row: the clamped request index, a
         `[padded_num_reqs, 1]` int32 live-row mask, and the positions of the
-        request's first and last query token this step. Padding rows alias
-        the last live request; callers zero them with the mask. Traced
-        inline by both compiled input builders."""
+        request's first and last query token this step. Traced inline by both
+        compiled input builders.
+
+        Live rows are read off `query_start_loc`, whose entries past the last
+        request repeat its end (zero-length rows), not passed as a Python int:
+        an int argument is a compile-time constant, so every live count would
+        compile its own program while serving."""
         req_indices = torch.arange(
             padded_num_reqs, dtype=torch.int32, device=query_start_loc.device
         )
-        safe_req_indices = torch.clamp(req_indices, max=max(num_reqs - 1, 0))
-        valid_mask = (req_indices < num_reqs).unsqueeze(1).to(torch.int32)
-        start_positions = position_ids[query_start_loc[safe_req_indices]].unsqueeze(1)
-        end_indices = torch.clamp(query_start_loc[safe_req_indices + 1] - 1, min=0)
+        safe_req_indices = torch.clamp(req_indices, max=query_start_loc.shape[0] - 2)
+        q_start = query_start_loc[safe_req_indices]
+        q_end = query_start_loc[safe_req_indices + 1]
+        valid = (q_end > q_start) & (req_indices < query_start_loc.shape[0] - 1)
+        valid_mask = valid.unsqueeze(1).to(torch.int32)
+        last_token = position_ids.shape[0] - 1
+        start_positions = position_ids[torch.clamp(q_start, max=last_token)].unsqueeze(1)
+        end_indices = torch.clamp(q_end - 1, min=0, max=last_token)
         last_positions = position_ids[end_indices].unsqueeze(1)
         return safe_req_indices, valid_mask, start_positions, last_positions
 
@@ -1103,7 +1108,6 @@ class DFlashProposer:
         query_start_loc: torch.Tensor,
         position_ids: torch.Tensor,
         draft_lengths: torch.Tensor,
-        num_reqs: int,
         block_size: int,
         padded_len: int,
         mask_token_id: int,
@@ -1119,7 +1123,6 @@ class DFlashProposer:
             query_start_loc: 1D Tensor containing starting query locations per request.
             position_ids: 1D Tensor containing position IDs.
             draft_lengths: Number of verified drafts per request (0 for prompt chunks).
-            num_reqs: Number of active requests.
             block_size: K + 1 (1 base token + K draft mask slots).
             padded_len: Total length of the flattened tensors
                 (padded_num_reqs * block_size).
@@ -1146,9 +1149,7 @@ class DFlashProposer:
         ).to(torch.int32)
 
         (safe_req_indices, valid_mask, start_positions, last_positions) = (
-            self._request_window_bounds(
-                query_start_loc, position_ids, num_reqs, padded_num_reqs
-            )
+            self._request_window_bounds(query_start_loc, position_ids, padded_num_reqs)
         )
         start_positions_padded = (start_positions * valid_mask).to(torch.int32)
 
@@ -1170,7 +1171,9 @@ class DFlashProposer:
 
         # Anchor verify windows at start + num_accepted;
         # anchor prompt chunks at last_pos + 1.
-        num_draft = draft_lengths[safe_req_indices].unsqueeze(1)
+        num_draft = draft_lengths[
+            torch.clamp(safe_req_indices, max=draft_lengths.shape[0] - 1)
+        ].unsqueeze(1)
         is_verify_window = (num_draft > 0).to(torch.int32)
         verify_base = start_positions_padded + num_accepted
         prompt_base = ((last_positions + 1) * valid_mask).to(torch.int32)
@@ -1186,7 +1189,6 @@ class DFlashProposer:
         device_seed: torch.Tensor,
         query_start_loc: torch.Tensor,
         position_ids: torch.Tensor,
-        num_reqs: int,
         block_size: int,
         padded_len: int,
         mask_token_id: int,
@@ -1199,7 +1201,6 @@ class DFlashProposer:
             device_seed: 1D Tensor of shape [num_reqs] containing base tokens.
             query_start_loc: 1D Tensor containing starting query locations per request.
             position_ids: 1D Tensor containing position IDs.
-            num_reqs: Number of active requests.
             block_size: K + 1 (1 base token + K draft mask slots).
             padded_len: Total length of the flattened tensors
                 (padded_num_reqs * block_size).
@@ -1223,7 +1224,7 @@ class DFlashProposer:
 
         # Anchor one past the last prompt token in the chunk.
         _, valid_mask, _, last_positions = self._request_window_bounds(
-            query_start_loc, position_ids, num_reqs, padded_num_reqs
+            query_start_loc, position_ids, padded_num_reqs
         )
         base_pos = ((last_positions + 1) * valid_mask).to(torch.int32)
 

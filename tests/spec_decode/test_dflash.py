@@ -397,6 +397,46 @@ def test_prepare_dflash_inputs(device):
 
 
 @pytest.mark.tpu_test
+def test_prepare_dflash_inputs_padding_rows_from_query_start_loc(device):
+    """Live rows come from query_start_loc's zero-length padding entries, not
+    from num_reqs, so one compiled builder serves every live count."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(
+        device=device,
+        num_tokens_paddings=[8, 16, 32],
+        max_num_reqs=8,
+        _dp_lockstep_enabled=lambda: False,
+    )
+    position_ids = torch.tensor(
+        [10, 11, 12, 40, 41, 0, 0, 0], dtype=torch.int32, device=device
+    )
+    next_tokens = torch.tensor(
+        [[101, 102, 103, -1], [201, 202, -1, -1]],
+        dtype=torch.int32,
+        device=device,
+    )
+    for num_reqs, qsl in ((2, [0, 3, 5, 5, 5]), (1, [0, 3, 3, 3, 3])):
+        chunk = _make_chunk(
+            num_reqs=num_reqs,
+            start_index=0,
+            device=device,
+            query_start_loc_np=np.array(qsl, dtype=np.int32),
+            position_ids=position_ids,
+        )
+        input_ids, positions, _ = proposer._prepare_dflash_inputs(
+            chunk, next_tokens_device=next_tokens[:2]
+        )
+        # Both live counts pad to one 8-token bucket (two rows of 4); a
+        # padding row anchors at position 0.
+        assert input_ids.shape == (8,)
+        expected_pos = [13, 14, 15, 16] + (
+            [42, 43, 44, 45] if num_reqs == 2 else [0, 1, 2, 3]
+        )
+        assert positions.tolist() == expected_pos
+
+
+@pytest.mark.tpu_test
 def test_update_draft_kv_cache_from_target_unit(device):
     proposer = _make_proposer(draft_tp=1)
     proposer._tpu_precompute_and_update_kv_cache = mock.MagicMock(
