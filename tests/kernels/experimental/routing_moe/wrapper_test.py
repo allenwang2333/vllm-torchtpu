@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 from tokamax._src import test_utils
 from vllm_torchtpu.kernels.experimental.routing_moe.layer import wrapper
-from vllm_torchtpu.kernels.experimental.routing_moe.test import reference
+from tests.kernels.experimental.routing_moe import reference
 
 from google3.perftools.accelerators.xprof.api.python import xprof_session
 
