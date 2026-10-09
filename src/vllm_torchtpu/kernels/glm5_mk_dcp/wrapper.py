@@ -42,6 +42,9 @@ def make_draft(cfg, mesh, axis="d", donate=True, **build_kw):
     caches ONCE (info['c_unique']) -> (tokens [R, M, 128], *caches, *debug). The kernel reads the
     caches as one view per pass; the writer applies pass 0's rows (the only live KV writes)."""
     import dataclasses
+    # 9-bank weight ring: the drafter streams one layer per pass, and 11 banks overflow VMEM (68.2 of
+    # 63.9 MiB with the drafter's scratch; FULL AOT, 2026-10-09)
+    build_kw.setdefault("tiles", K.Tiles(nbank=9))
     call, info = K.build(cfg, axis_name=axis, draft=True, **build_kw)
     cfg1 = dataclasses.replace(cfg, L=1, V=0)
     wkw = {k: build_kw[k] for k in ("nb", "max_pages", "bmax", "interpret", "stack_c") if k in build_kw}
@@ -55,7 +58,11 @@ def make_draft(cfg, mesh, axis="d", donate=True, **build_kw):
     def body(*ops):
         ops = [o[0] for o in ops]
         fixed, w, cu = ops[:12], ops[12:12 + n_w], ops[12 + n_w:]
-        outs = call(*fixed, *w, *[cu[i] for i in pick])
+        flat = list(fixed)                       # per-pass metadata flattened (rank <= 2 SMEM refs)
+        for i_ in (1, 2, 4):
+            flat[i_] = fixed[i_].reshape((-1,) + fixed[i_].shape[2:])
+        flat[6] = fixed[6].reshape((-1,) + fixed[6].shape[2:])
+        outs = call(*flat, *w, *[cu[i] for i in pick])
         tok, nrow, rrow, irec = outs[:4]
         new = writer(fixed[0][0], fixed[1][0], fixed[3], nrow[0:1], rrow[0:1], irec[0:1], *cu)
         return tuple(o[None] for o in (tok, *new, *outs[4:]))
