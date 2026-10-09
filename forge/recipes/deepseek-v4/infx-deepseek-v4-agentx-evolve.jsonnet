@@ -212,23 +212,24 @@ local extraVllmArgs = cdk.var('EXTRA_VLLM_ARGS', '');
 
 // --- Speculative decoding ------------------------------------------------------
 // SPEC_METHOD=dspark serves the DSpark draft that ships in the target checkpoint (mtp.0-2.*, config.json
-// dspark_block_size=5), as the InferenceX B200 run does (K=6, probabilistic drafts, synthetic AL 3.77). Empty = off.
+// dspark_block_size=5), as the InferenceX B200 run does (K=6, probabilistic drafts, synthetic AL 3.77); the
+// defaults below are that reference config. SPEC_METHOD=none turns it off. j-59ba1696: 148,940 vs 86,862 total tok/s without it.
 // The draft holds ~4.2 GiB of HBM per rank (j-9719749f-0a6b-47c7-b249: 77.64 vs 73.44 GiB used). At a 2048-token
 // step budget K=6 needs GPU_MEMORY_UTILIZATION >= 0.94 to fit one MAX_MODEL_LEN=1048576 request
 // (j-a300025a-c924-4600-b9e5 refused to start at 0.93: 9.78 GiB of KV against 9.85 needed).
-local specMethod = cdk.var('SPEC_METHOD', '');
-local numSpecTokens = cdk.numVar('NUM_SPEC_TOKENS', 5);
+local specMethod = cdk.var('SPEC_METHOD', 'dspark');
+local numSpecTokens = cdk.numVar('NUM_SPEC_TOKENS', 6);
 // SPEC_SYNTHETIC_AL=<mean acceptance length> accepts drafts at fixed per-position rates that give this
 // length (vLLM rejection_sample_method=synthetic) instead of by the target's probabilities, as the InferenceX
 // reference measures DSpark throughput. Outputs are then not samples of the target. The reference's
 // golden curve for DeepSeek-V4-Pro-0813 DSpark is K1 1.84, K2 2.51, K3 3.01, K4 3.36, K5 3.61, K6 3.77.
 // Empty = real rejection sampling.
-local specSyntheticAl = cdk.var('SPEC_SYNTHETIC_AL', '');
+local specSyntheticAl = cdk.var('SPEC_SYNTHETIC_AL', '3.77');
 // SPEC_DRAFT_SAMPLE=probabilistic draws drafts from the draft distribution at the request's temperature
 // (vLLM draft_sample_method); on TPU it needs SPEC_SYNTHETIC_AL. Empty = greedy drafting.
-local specDraftSample = cdk.var('SPEC_DRAFT_SAMPLE', '');
+local specDraftSample = cdk.var('SPEC_DRAFT_SAMPLE', 'probabilistic');
 local specConfig =
-  if specMethod == '' then ''
+  if specMethod == 'none' then ''
   else if specMethod == 'dspark' then
     '{"method":"dspark","num_speculative_tokens":%d%s%s}' % [
       numSpecTokens,
@@ -236,12 +237,12 @@ local specConfig =
       if specSyntheticAl == '' then ''
       else ',"rejection_sample_method":"synthetic","synthetic_acceptance_length":%s' % specSyntheticAl,
     ]
-  else error 'SPEC_METHOD must be empty or dspark, got "%s"' % specMethod;
+  else error 'SPEC_METHOD must be none or dspark, got "%s"' % specMethod;
 // vLLM drops the last matched prefix-cache block of every hit for EAGLE-style drafts (DSpark and the
 // DeepSeek-V4 groups included): ~BLOCK_SIZE more prefill tokens per request. DSpark's draft KV for verified
 // tokens is projected from the target's hidden states, so the dropped block protects nothing. 1 keeps it
 // (vllm-torchtpu #1530); empty leaves vLLM's behaviour.
-local disableEagleBlockDrop = cdk.var('VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP', '');
+local disableEagleBlockDrop = cdk.var('VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP', '1');
 // SANITY_PROBE=true: once the server is healthy, send two fixed temperature-0 chat requests and log the
 // replies as "sanity-probe:" lines (pod log and sanity_probe.log), to compare output text across arms.
 local sanityProbe = cdk.boolVar('SANITY_PROBE', false);
