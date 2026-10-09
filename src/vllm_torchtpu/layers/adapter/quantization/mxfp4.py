@@ -760,6 +760,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         )
         from vllm_torchtpu.layers.adapter.quantization.static_dsv41_moe import (
             load_layer,
+            synchronize_loaded_layer,
         )
 
         if (
@@ -792,7 +793,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
         layer.w13_weight_scale = torch.nn.Parameter(s13, requires_grad=False)
         layer.w2_weight_scale = torch.nn.Parameter(s2, requires_grad=False)
-        synchronize_tensors([layer.w13_weight, layer.w2_weight])
+        synchronize_loaded_layer(layer)
 
         moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=device)

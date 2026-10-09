@@ -16,12 +16,14 @@ from safetensors.torch import load  # pyrefly: ignore[missing-import]
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.utils import synchronize_tensors
 
 _GroupTensors = dict[str, torch.Tensor]
 _GroupStream = Iterator[tuple[int, _GroupTensors] | None]
 _GROUPED_STREAMS: dict[tuple[str, int], _GroupStream] = {}
 _GROUPED_PENDING: dict[tuple[str, int], dict[int, _GroupTensors]] = {}
 _GROUPED_LOADED: dict[tuple[str, int], set[int]] = {}
+_PENDING_DEVICE_WEIGHTS: list[torch.Tensor] = []
 
 
 def _sha256(path: Path) -> str:
@@ -261,6 +263,15 @@ def _load_grouped_layer(
         tensors["s13"].to(device),
         tensors["s2"].to(device),
     )
+
+
+def synchronize_loaded_layer(layer: RoutedExperts) -> None:
+    _PENDING_DEVICE_WEIGHTS.extend((layer.w13_weight, layer.w2_weight))
+    match = re.search(r"(?:^|\.)layers\.(\d+)\.", layer.layer_name)
+    assert match is not None
+    if len(_PENDING_DEVICE_WEIGHTS) >= 8 or int(match[1]) == 39:
+        synchronize_tensors(_PENDING_DEVICE_WEIGHTS)
+        _PENDING_DEVICE_WEIGHTS.clear()
 
 
 def _read_tensors(
