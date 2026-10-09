@@ -107,7 +107,7 @@ def _load_ep8_layer(
         "w13": (48, 5120, 2560),
         "w2": (48, 2560, 2560),
         "s13": (48, 10, 1, 5120),
-        "s2": (48, 5, 1, 2560),
+        "s2": (48, 5, 1, 5120),
     }
     if set(tensors) != set(shapes):
         raise ValueError(f"Unexpected static MoE EP8 tensors: {path}")

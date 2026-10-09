@@ -32,7 +32,7 @@ SHAPES = {
     "w13": (EXPERTS_PER_RANK, 5120, 2560),
     "w2": (EXPERTS_PER_RANK, 2560, 2560),
     "s13": (EXPERTS_PER_RANK, 10, 1, 5120),
-    "s2": (EXPERTS_PER_RANK, 5, 1, 2560),
+    "s2": (EXPERTS_PER_RANK, 5, 1, 5120),
 }
 
 
@@ -108,7 +108,7 @@ def store_expert(
         or w2.shape != (2560, 2560)
         or s1.shape != (10, 1, 2560)
         or s3.shape != s1.shape
-        or s2.shape != (5, 1, 2560)
+        or s2.shape != (5, 1, 5120)
     ):
         raise ValueError("Unexpected MoE projection shape")
     tensors["w13"][slot, :, :1280] = w1

@@ -44,14 +44,14 @@ def test_store_expert_preserves_fp4_and_scale_order() -> None:
         "w13": np.empty((1, 5120, 2560), dtype=np.uint8),
         "w2": np.empty((1, 2560, 2560), dtype=np.uint8),
         "s13": np.empty((1, 10, 1, 5120), dtype=np.float32),
-        "s2": np.empty((1, 5, 1, 2560), dtype=np.float32),
+        "s2": np.empty((1, 5, 1, 5120), dtype=np.float32),
     }
     parts = {
         "w1::fp4": np.full((5120, 1280), 1, dtype=np.uint8),
         "w2::fp4": np.full((2560, 2560), 2, dtype=np.uint8),
         "w3::fp4": np.full((5120, 1280), 3, dtype=np.uint8),
         "w1::scale": np.full((10, 1, 2560), 11, dtype=np.float32),
-        "w2::scale": np.full((5, 1, 2560), 12, dtype=np.float32),
+        "w2::scale": np.full((5, 1, 5120), 12, dtype=np.float32),
         "w3::scale": np.full((10, 1, 2560), 13, dtype=np.float32),
     }
     store_expert(tensors, parts, 0)
