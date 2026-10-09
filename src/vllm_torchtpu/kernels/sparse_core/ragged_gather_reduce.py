@@ -63,20 +63,24 @@ def _pad_inputs_if_needed(
         math.lcm(num_row_partitions * row_tile_size, reduce_group_size),
     )
     pad_input_size = padded_input_size - input_size
+    pad_hidden_size = aligned_hidden_size - hidden_size
 
-    x = jnp.pad(
-        x,
-        ((0, pad_input_size), (0, aligned_hidden_size - hidden_size)),
-        constant_values=0,
-    )
-    indices = jnp.pad(indices, (0, pad_input_size), constant_values=0)
-    topk_weights = jnp.pad(topk_weights, (0, pad_input_size), constant_values=0)
-    valid_rows_mask = jnp.pad(
-        valid_rows_mask, (0, pad_input_size), constant_values=False
-    )
+    if pad_input_size > 0 or pad_hidden_size > 0:
+        x = jnp.pad(
+            x,
+            ((0, pad_input_size), (0, pad_hidden_size)),
+            constant_values=0,
+        )
+    if pad_input_size > 0:
+        indices = jnp.pad(indices, (0, pad_input_size), constant_values=0)
+        topk_weights = jnp.pad(topk_weights, (0, pad_input_size), constant_values=0)
+        valid_rows_mask = jnp.pad(
+            valid_rows_mask, (0, pad_input_size), constant_values=False
+        )
     return x, indices, topk_weights, valid_rows_mask
 
 
+@functools.lru_cache(maxsize=64)
 def _calculate_num_col_column_partitions(
     hidden_size: int, num_cores: int, num_lanes: int
 ) -> int:
@@ -172,6 +176,17 @@ def main_kernel(
         row_start = row_partition_id * row_partition_size
         col_start = col_partition_id * col_size
 
+        in_dtype = in_hbm_ref.dtype
+        input_dtype_bits = jax.dtypes.itemsize_bits(in_dtype)
+        input_packing = 32 // input_dtype_bits
+
+        in_32b_hbm_ref = in_hbm_ref.bitcast(  # pyrefly: ignore[missing-attribute]
+            jnp.uint32
+        )
+        out_32b_hbm_ref = out_hbm_ref.bitcast(  # pyrefly: ignore[missing-attribute]
+            jnp.uint32
+        )
+
         @pl.loop(0, num_row_tiles)
         def row_loop(row_block_id):
             row_tile_start = row_start + row_block_id * num_simd_lanes
@@ -197,8 +212,10 @@ def main_kernel(
                     recv_sem,
                 )
             )
-            jax.tree.map(lambda x: x.start(), dma_list)
-            jax.tree.map(lambda x: x.wait(), dma_list)
+            for dma in dma_list:
+                dma.start()
+            for dma in dma_list:
+                dma.wait()
 
             dma_list = []
             dma_list.append(
@@ -215,20 +232,15 @@ def main_kernel(
                     recv_sem,
                 )
             )
-            jax.tree.map(lambda x: x.start(), dma_list)
-            jax.tree.map(lambda x: x.wait(), dma_list)
+            for dma in dma_list:
+                dma.start()
+            for dma in dma_list:
+                dma.wait()
 
             # HBM to VMEM transfer.
             src_indices = src_indices_vmem_ref[...]
             dst_indices = dst_indices_vmem_ref[...]
             topk_weights = topk_weights_vmem_ref[...]
-
-            in_dtype = in_hbm_ref.dtype
-            input_dtype_bits = jax.dtypes.itemsize_bits(in_dtype)
-            input_packing = 32 // input_dtype_bits
-
-            in_32b_hbm_ref = in_hbm_ref.bitcast(jnp.uint32)
-            out_32b_hbm_ref = out_hbm_ref.bitcast(jnp.uint32)
 
             for col_vmem_start in range(0, col_size, num_lanes):
                 col_hbm_start = col_start + col_vmem_start
@@ -328,7 +340,7 @@ def main_kernel(
                 # efficiency. We just repeat the write of lastest accumulated data
                 # multiple times.
                 # `src_row_idx_in_vmem` tracks the right idx in vmem for each hbm write.
-                src_row_idx_in_vmem = []
+                src_row_idx_in_vmem: list[int | jax.Array] = []
                 row_valid_vec = []
                 for row_vmem_idx in reversed(range(num_simd_lanes)):
                     row_idx = row_block_id * num_simd_lanes + row_vmem_idx

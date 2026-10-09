@@ -1,5 +1,7 @@
 """Auto-tuned block sizes for ragged paged attention."""
 
+import functools
+
 import jax.numpy as jnp
 
 from vllm_torchtpu.kernels.ragged_paged_attention.v3.util import (
@@ -259,6 +261,7 @@ TUNED_BLOCK_SIZES = {
 }
 
 
+@functools.lru_cache(maxsize=128)
 def get_tuned_block_sizes(
     q_dtype,
     kv_dtype,
@@ -344,6 +347,7 @@ def get_lookup_keys(
     )
 
 
+@functools.lru_cache(maxsize=128)
 def get_simplified_raw_key(
     page_size,
     q_dtype,
