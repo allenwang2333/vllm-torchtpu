@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 from collections.abc import Iterator
 from functools import lru_cache
 from pathlib import Path
+from queue import Queue
 
 import numpy as np
 import torch
@@ -20,6 +22,9 @@ from vllm_torchtpu import envs
 _GroupTensors = dict[str, torch.Tensor]
 _GroupStream = Iterator[tuple[int, _GroupTensors] | None]
 _GROUPED_STREAMS: dict[tuple[str, int], _GroupStream] = {}
+_GROUPED_QUEUES: dict[
+    tuple[str, int], Queue[tuple[int, _GroupTensors] | Exception | None]
+] = {}
 _GROUPED_PENDING: dict[tuple[str, int], dict[int, _GroupTensors]] = {}
 _GROUPED_LOADED: dict[tuple[str, int], set[int]] = {}
 
@@ -162,6 +167,20 @@ def _open_group_stream(
     return stream
 
 
+def _drain_group_stream(
+    stream: _GroupStream,
+    queue: Queue[tuple[int, _GroupTensors] | Exception | None],
+) -> None:
+    try:
+        for item in stream:
+            assert item is not None
+            queue.put(item)
+    except Exception as error:
+        queue.put(error)
+    finally:
+        queue.put(None)
+
+
 def start_grouped_prefetch(root: str, uri: str, local_experts: set[int]) -> None:
     if len(local_experts) != 48:
         return
@@ -173,9 +192,18 @@ def start_grouped_prefetch(root: str, uri: str, local_experts: set[int]) -> None
         return
     key = (uri, group)
     if key not in _GROUPED_STREAMS:
-        _GROUPED_STREAMS[key] = _open_group_stream(uri, group, index["__ep8__"])
+        stream = _open_group_stream(uri, group, index["__ep8__"])
+        queue: Queue[tuple[int, _GroupTensors] | Exception | None] = Queue(maxsize=2)
+        _GROUPED_STREAMS[key] = stream
+        _GROUPED_QUEUES[key] = queue
         _GROUPED_PENDING[key] = {}
         _GROUPED_LOADED[key] = set()
+        threading.Thread(
+            target=_drain_group_stream,
+            args=(stream, queue),
+            name="dsv41-moe-chunks",
+            daemon=True,
+        ).start()
 
 
 def _streamed_group(
@@ -188,23 +216,39 @@ def _streamed_group(
         _GROUPED_LOADED[key] = set()
     pending = _GROUPED_PENDING[key]
     while layer not in pending:
-        try:
-            item = next(_GROUPED_STREAMS[key])
-        except StopIteration as error:
-            raise ValueError(f"Static MoE layer {layer} missing from stream") from error
-        assert item is not None
+        if queue := _GROUPED_QUEUES.get(key):
+            item = queue.get()
+            if isinstance(item, Exception):
+                raise item
+            if item is None:
+                raise ValueError(f"Static MoE layer {layer} missing from stream")
+        else:
+            try:
+                item = next(_GROUPED_STREAMS[key])
+            except StopIteration as error:
+                raise ValueError(
+                    f"Static MoE layer {layer} missing from stream"
+                ) from error
+            assert item is not None
         next_layer, tensors = item
         pending[next_layer] = tensors
     tensors = pending.pop(layer)
     loaded = _GROUPED_LOADED[key]
     loaded.add(layer)
     if len(loaded) == 40:
-        try:
-            next(_GROUPED_STREAMS[key])
-        except StopIteration:
-            pass
+        if queue := _GROUPED_QUEUES.pop(key, None):
+            item = queue.get()
+            if isinstance(item, Exception):
+                raise item
+            if item is not None:
+                raise ValueError("Static MoE stream has extra layers")
         else:
-            raise ValueError("Static MoE stream has extra layers")
+            try:
+                next(_GROUPED_STREAMS[key])
+            except StopIteration:
+                pass
+            else:
+                raise ValueError("Static MoE stream has extra layers")
         del _GROUPED_STREAMS[key], _GROUPED_PENDING[key], _GROUPED_LOADED[key]
     return tensors
 
