@@ -276,7 +276,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         drained = manager.drain_jobs(launched_flush_ids) if launched_flush_ids else []
 
         # Collect completed/drained jobs for the worker echo channel.
-        for finished_job in list(drained) + manager.poll_finished_jobs():
+        polled = manager.poll_finished_jobs()
+        finished_iter = (*drained, *polled) if drained else polled
+        for finished_job in finished_iter:
             if finished_job.op == AdmissionOp.STORE:
                 finished_store_ids.append(finished_job.job_id)
             else:
@@ -506,6 +508,8 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         block_ids = self._load_error_block_ids
+        if not block_ids:
+            return block_ids
         self._load_error_block_ids = set()
         return block_ids
 

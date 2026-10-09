@@ -207,3 +207,86 @@ def test_omni_tpu_patches_configuration(monkeypatch):
         os.environ.pop("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", None)
         apply_omni_tpu_patches.__wrapped__()
         assert os.environ["VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"] == "1800.0"
+
+    patched_interp = torch.nn.functional.interpolate
+    x_cpu = torch.ones(1, 2, 4)
+    out_nearest = patched_interp(x_cpu, size=8, mode="nearest")
+    assert out_nearest.shape == (1, 2, 8)
+
+    class _FakeTpuInput:
+        device = type("D", (), {"type": "tpu"})()
+
+        def cpu(self):
+            return x_cpu
+
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, dev, *a, **kw: self)
+    out_linear = patched_interp(_FakeTpuInput(), size=8, mode="linear")
+    assert out_linear.shape == (1, 2, 8)
+
+
+def test_omni_platform_remaining_methods(monkeypatch):
+    assert OmniTpuPlatform.supports_float64() is False
+    assert OmniTpuPlatform.supports_cpu_offload() is False
+    assert OmniTpuPlatform.get_device_version() is None
+    assert OmniTpuPlatform.empty_cache() is None
+    assert (
+        OmniTpuPlatform.get_omni_ar_worker_cls()
+        == "vllm_torchtpu.worker.tpu_worker.TPUWorker"
+    )
+    assert (
+        OmniTpuPlatform.get_omni_generation_worker_cls()
+        == "vllm_torchtpu.worker.tpu_worker.TPUWorker"
+    )
+    assert OmniTpuPlatform.get_default_stage_config_path() == "vllm_omni/deploy"
+
+    monkeypatch.setattr(OmniTpuPlatform, "device_count", classmethod(lambda cls: 4))
+    assert OmniTpuPlatform.get_device_count() == 4
+
+    prep_calls = []
+    sync_calls = []
+    reset_calls = []
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        classmethod(lambda cls, ws: prep_calls.append(ws)),
+    )
+    monkeypatch.setattr(
+        torch,
+        "accelerator",
+        type(
+            "Acc",
+            (),
+            {
+                "set_device_index": staticmethod(
+                    lambda idx: prep_calls.append(("idx", idx))
+                ),
+                "synchronize": staticmethod(lambda: sync_calls.append(True)),
+                "reset_peak_memory_stats": staticmethod(
+                    lambda dev=None: reset_calls.append(dev)
+                ),
+            },
+        )(),
+        raising=False,
+    )
+    cpu_dev = torch.device("cpu")
+    monkeypatch.setattr(torch, "device", lambda *_a, **_kw: cpu_dev)
+    monkeypatch.setattr(torch, "empty", lambda *_a, **_kw: None)
+    OmniTpuPlatform.set_device(cpu_dev)
+    assert prep_calls == [1, ("idx", 0)]
+    OmniTpuPlatform.synchronize()
+    assert len(sync_calls) == 2
+    OmniTpuPlatform.reset_peak_memory_stats()
+    assert reset_calls == [None]
+
+    with (
+        patch(
+            "torch_tpu._internal.utils.hardware.get_hbm_bytes_per_device",
+            return_value=None,
+        ),
+        patch(
+            "torch_tpu._internal.utils.hardware.get_tpu_device_name",
+            return_value="TPUv7",
+        ),
+        pytest.raises(ValueError, match="Could not determine HBM memory"),
+    ):
+        OmniTpuPlatform.get_device_total_memory()

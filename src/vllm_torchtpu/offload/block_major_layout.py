@@ -48,6 +48,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+import torch
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
@@ -182,14 +183,10 @@ def resolve_block_major_contract(
         )
 
     # Compute the physical byte size of a single fragment row for one kernel block.
-    import numpy as np
-    import torch
-
     assert isinstance(per_block_shape, tuple)
     assert isinstance(kv_dtype, torch.dtype)
-    fragment_row_bytes = (
-        int(np.prod(per_block_shape)) * torch.empty(0, dtype=kv_dtype).element_size()
-    )
+    # pyrefly: ignore[missing-attribute]
+    fragment_row_bytes = math.prod(per_block_shape) * kv_dtype.itemsize
 
     indices = block_major_layer_indices(kv_cache_config, fragment_row_bytes)
     fragment_count = len(set(indices.values()))
