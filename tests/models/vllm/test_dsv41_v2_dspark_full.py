@@ -675,7 +675,9 @@ def test_dspark_deepseek_v41_for_causal_lm_forward_and_hooks(
     monkeypatch.setattr(
         v2_dspark,
         "_insert_context_kv",
-        lambda attn, kv, pos, md: inserted_calls.append((kv.shape, md)),
+        lambda attn, kv, pos, md: inserted_calls.append(
+            (kv.shape, md, kv.is_contiguous())
+        ),
     )
     main_x1 = draft_lm.precompute_and_store_context_kv(
         raw_aux, positions, metadata=None
@@ -683,6 +685,7 @@ def test_dspark_deepseek_v41_for_causal_lm_forward_and_hooks(
     assert main_x1.shape == (4, 16)
     assert len(inserted_calls) == 2
     assert inserted_calls[0][1] is None
+    assert all(c[2] for c in inserted_calls)
 
     inserted_calls.clear()
     main_x2 = draft_lm.precompute_and_store_context_kv(
@@ -690,6 +693,7 @@ def test_dspark_deepseek_v41_for_causal_lm_forward_and_hooks(
     )
     assert torch.equal(main_x2, combined)
     assert [c[1] for c in inserted_calls] == ["md0", "md1"]
+    assert all(c[2] for c in inserted_calls)
 
     # Forward both with inputs_embeds=None and inputs_embeds provided
     out_from_ids = draft_lm(input_ids, positions)

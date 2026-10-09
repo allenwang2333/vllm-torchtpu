@@ -228,6 +228,7 @@ def test_token_threshold_dispatch_and_resource_failure_propagation(
     monkeypatch.setattr(wrapper, "_DENSE_EXPERT_THRESHOLD", threshold)
     monkeypatch.setattr(wrapper, "dense_expert_moe", resource_failure)
     monkeypatch.setattr(wrapper, "prepare_routed_gmm_inputs", standard_selected)
+    monkeypatch.setattr(wrapper, "_prepare_routed_gmm_inputs", standard_selected)
     wrapper.fused_moe_func.clear_cache()
     x, w1, w2, s1, s2 = _shapes(m, 512, 512, 4)
     args = (
@@ -315,6 +316,14 @@ def test_mxfp4_and_clamped_activations_admitted(m, activation):
             max(16, m), 5120, 2560, 48, 64 * 1024**2, 2, 10, 5
         )
         == 2
+    )
+    assert not kernel.can_use_dense_expert(
+        *_mxfp4_shapes(960, 5120, 2560, 48),
+        None,
+        None,
+        activation=activation,
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+        skip_padded_tokens=False,
     )
 
 

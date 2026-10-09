@@ -22,6 +22,7 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
 )
 
 _MAX_EXPERT_BUFFERS = 3
+_MAX_DENSE_EXPERT_VMEM_BYTES = 56 * 1024 * 1024
 _SUPPORTED_ACTIVATIONS = ("silu", "silu_and_mul_with_clamp", "swigluoai")
 
 
@@ -107,6 +108,11 @@ def can_use_dense_expert(
     if out != h or w1.shape != (e, h // packing_factor, 2 * i):
         return False
     if hidden.dtype != jnp.bfloat16:
+        return False
+    # Scoped VMEM footprint: f32[m,h] acc + 2x bf16[m,h] windows + f8[m,h]
+    # quantized input + 1.5*h*i unpacked expert weight scratch must fit in 64 MiB
+    # VMEM after scale scratch and register spill headroom (~8 MiB on v7x).
+    if is_fp4 and 9 * m * h + (3 * h * i) // 2 > _MAX_DENSE_EXPERT_VMEM_BYTES:
         return False
     valid_s1 = s1.shape in ((e, 1, 1, 2 * i), (e, h // 512, 1, 2 * i))
     valid_s2 = s2.shape in ((e, 1, 1, h), (e, i // 512, 1, h))

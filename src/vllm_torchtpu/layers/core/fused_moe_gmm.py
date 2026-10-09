@@ -186,13 +186,26 @@ def quantize_to_native_fp4_kmajor(
     return packed, scale
 
 
+# Routed rows per local expert group up to which the decode GMM keeps a single
+# 32-row tile (`tile_m == bucket_base == 32`) instead of `calculate_tiling`'s
+# 64..256-row buckets. Under EP the GMM only computes the valid local prefix
+# (`group_sizes` sum to M / ep_size), so the rows per group that actually hit
+# the MXU are M / num_global_experts: up to 144 routed rows per local expert
+# (M <= 48 * 144 = 6912, T <= 1152 under EP8; M <= 16 * 144 = 2304 for the
+# 16-expert DSpark drafter MoE), a single 32-row tile fits local experts without
+# tile spill; above 144 rows/group (e.g. T = 1344, M = 8064), switching to
+# calculate_tiling's 64-row tile avoids re-streaming spilled expert weights.
+_DECODE_TILE_M32_ROWS_PER_GROUP = 144
+_DENSE_EXPERT_LOW_EXPERT_MAX_TOKENS = 576
+
+
 def _moe_gmm_tiling(
     dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes: int, fuse_act: str | None = None
 ) -> TileSizes:
     tiles = calculate_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
     if (
         dims.size_group > 1
-        and 32 <= dims.size_m <= dims.size_group * 112
+        and 32 <= dims.size_m <= dims.size_group * _DECODE_TILE_M32_ROWS_PER_GROUP
         and 32 % dims.size_lhs_sublane == 0
     ):
         return TileSizes(
@@ -307,10 +320,8 @@ def _pairwise_sort_positions(
     """
     m = sort_keys.shape[0]
     row = jnp.arange(m, dtype=jnp.int32)
-    key_i = sort_keys[:, None]
-    key_j = sort_keys[None, :]
-    before = (key_j < key_i) | ((key_j == key_i) & (row[None, :] < row[:, None]))
-    pos = before.sum(axis=1, dtype=jnp.int32)
+    composite_key = jax.lax.shift_left(sort_keys, 16) | row
+    pos = (composite_key[None, :] < composite_key[:, None]).sum(axis=1, dtype=jnp.int32)
     at_pos = pos[:, None] == row[None, :]
     w_u16 = jax.lax.bitcast_convert_type(
         gated_weights.astype(jnp.bfloat16), jnp.uint16
@@ -392,24 +403,18 @@ def _prepare_routed_gmm_inputs(
     else:
         argsort_revert_indices = None
     token_bits = max(1, (num_tokens_local - 1).bit_length())
-    packable = (local_num_experts + 1).bit_length() + token_bits < 31
-    sorted_indices = (
-        jnp.argsort(sort_keys)
-        if token_indices_sorted is None
-        and (argsort_revert_indices is None or not packable)
-        else None
-    )
-
+    packable = (
+        local_num_experts + 1
+    ).bit_length() + token_bits < 31 and token_indices_flat.shape[0] <= 6912
     if bucket_counts is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
     else:
         if argsort_revert_indices is None:
+            sorted_indices = jnp.argsort(sort_keys)
             argsort_revert_indices = jnp.argsort(sorted_indices)
-        topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
         group_sizes_local = jax.nn.one_hot(
-            topk_indices_for_count, local_num_experts, dtype=jnp.int32
-        ) * valid_mask[:, None].astype(jnp.int32)
-        group_sizes_local = group_sizes_local.sum(axis=0)
+            sort_keys, local_num_experts, dtype=jnp.int32
+        ).sum(axis=0)
 
     if token_indices_sorted is None and packable:
         # Packing (key, token) into one int32 keeps the payload out of the sort
@@ -420,7 +425,11 @@ def _prepare_routed_gmm_inputs(
         )
         token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
     elif token_indices_sorted is None:
-        token_indices_sorted = token_indices_flat[sorted_indices]
+        token_indices_sorted = (
+            jnp.empty_like(token_indices_flat)
+            .at[argsort_revert_indices]
+            .set(token_indices_flat)
+        )
 
     if use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
@@ -533,6 +542,11 @@ def moe_gmm(
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
 
+    zero_init_gmm2 = (
+        use_ep
+        and use_sparse_core
+        and argsort_revert_indices.size <= min(onehot_moe_permute_threshold, 2304)
+    )
     gmm2_res = gmm_wrapper(
         gmm1_res,
         w2,
@@ -540,7 +554,7 @@ def moe_gmm(
         w2_bias,
         group_sizes,
         group_offset,
-        zero_initialize=False,
+        zero_initialize=zero_init_gmm2,
         preferred_element_type=x.dtype,
         rhs_quant_dtype=rhs_quant_dtype,
     )
@@ -630,11 +644,14 @@ def moe_gmm(
                     valid_count,
                     num_tokens=num_tokens,
                 ).astype(x.dtype)
-            # Rows past the computed prefix (non-local experts under EP,
-            # skipped padded tokens) are never written by the GMM; zero them
-            # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
-            computed = jnp.arange(gmm2_res.shape[0], dtype=jnp.int32) < valid_count[0]
-            gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
+            if not zero_init_gmm2:
+                # Rows past the computed prefix (non-local experts under EP,
+                # skipped padded tokens) are never written by the GMM; zero them
+                # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
+                computed = (
+                    jnp.arange(gmm2_res.shape[0], dtype=jnp.int32) < valid_count[0]
+                )
+                gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
             combine = (
                 jax.nn.one_hot(token_indices_sorted, num_tokens, dtype=gmm2_res.dtype).T
                 * topk_weights_sorted[None, :]
@@ -741,7 +758,12 @@ def fused_moe_func(
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
-    if 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD and can_use_dense_expert(
+    dense_expert_limit = (
+        _DENSE_EXPERT_THRESHOLD
+        if _DENSE_EXPERT_THRESHOLD > 0 or w1.shape[0] > 2
+        else _DENSE_EXPERT_LOW_EXPERT_MAX_TOKENS
+    )
+    if 0 < num_tokens <= dense_expert_limit and can_use_dense_expert(
         hidden_states,
         w1,
         w2,

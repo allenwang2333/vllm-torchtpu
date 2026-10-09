@@ -134,8 +134,19 @@ def test_moe_gmm_tiling(monkeypatch):
         fused_moe_gmm, "calculate_tiling", lambda *args, **kwargs: base_tiles
     )
     # 1. Matching decode dims:
-    # size_group > 1 and 32 <= size_m <= size_group * 112 and 32 % sublane == 0
-    for size_group, size_m in ((48, 576), (48, 2304), (48, 3456), (16, 1728)):
+    # size_group > 1 and 32 <= size_m <= size_group * 144 and 32 % sublane == 0
+    bound = fused_moe_gmm._DECODE_TILE_M32_ROWS_PER_GROUP
+    assert bound == 144
+    for size_group, size_m in (
+        (48, 576),
+        (48, 2304),
+        (48, 3456),
+        (16, 1728),
+        (48, 4608),
+        (48, 5760),
+        (48, 6912),
+        (48, 48 * bound),
+    ):
         match_dims = types.SimpleNamespace(
             size_group=size_group, size_m=size_m, size_lhs_sublane=8
         )
@@ -143,14 +154,15 @@ def test_moe_gmm_tiling(monkeypatch):
             match_dims, None, None, 64 << 20, "silu"
         ) == fused_moe_gmm.TileSizes(tile_m=32, tile_k=512, tile_n=512, bucket_base=32)
 
-    # 2. Non-matching branches
+    # 2. Non-matching branches (including T_ep = 1344 -> M = 8064 > 6912)
     for non_match in (
         # size_group <= 1
         types.SimpleNamespace(size_group=1, size_m=576, size_lhs_sublane=8),
         # size_m < 32
         types.SimpleNamespace(size_group=48, size_m=16, size_lhs_sublane=8),
-        # size_m > size_group * 112
-        types.SimpleNamespace(size_group=48, size_m=48 * 112 + 1, size_lhs_sublane=8),
+        # size_m > size_group * 144 (e.g. T=1344 -> M=8064)
+        types.SimpleNamespace(size_group=48, size_m=8064, size_lhs_sublane=8),
+        types.SimpleNamespace(size_group=48, size_m=48 * bound + 1, size_lhs_sublane=8),
         # 32 % sublane != 0
         types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=12),
     ):
@@ -362,6 +374,22 @@ def test_prepare_routed_gmm_inputs():
         )
         assert out4b[0].shape == (8, 16)
 
+        # 7. use_ep=True, use_sparse_core=True, M=8064 > 6912 bijective scatter
+        h_1344 = jnp.ones((1344, 16), dtype=jnp.bfloat16)
+        ti_1344 = (jnp.arange(1344 * 6, dtype=jnp.int32) % 48).reshape(1344, 6)
+        tw_1344 = jnp.full((1344, 6), 1.0 / 6.0, dtype=jnp.bfloat16)
+        out_1344 = fused_moe_gmm.prepare_routed_gmm_inputs(
+            h_1344,
+            ti_1344,
+            tw_1344,
+            local_num_experts=48,
+            topk=6,
+            use_ep=True,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=4096,
+        )
+        assert out_1344[0].shape == (8064, 16)
+
 
 def test_moe_gmm(monkeypatch):
     """Verify moe_gmm across all routing, permutation, and combine branches."""
@@ -403,7 +431,7 @@ def test_moe_gmm(monkeypatch):
         )
         assert out1.shape == (num_tokens, hidden_size)
 
-        # Branch 2: EP + SC, size <= threshold, TPU_MOE_OWNER_OUTPUT_MODE == "off"
+        # Branch 2a: EP + SC, size <= 2304 (zero_init_gmm2=True), owner_output == "off"
         monkeypatch.setattr(envs, "TPU_MOE_OWNER_OUTPUT_MODE", "off")
         out2 = fused_moe_gmm.moe_gmm(
             x,
@@ -426,6 +454,37 @@ def test_moe_gmm(monkeypatch):
             onehot_moe_permute_threshold=128,
         )
         assert out2.shape == (num_tokens, hidden_size)
+
+        # Branch 2b: EP + SC, 2304 < size <= threshold (zero_init_gmm2=False)
+        n_tok_hi = 400
+        routes_hi = n_tok_hi * 6
+        x_hi = jnp.ones((routes_hi, hidden_size), dtype=jnp.bfloat16)
+        group_sizes_hi = jnp.array([600, 600, 600, 600], dtype=jnp.int32)
+        revert_hi = jnp.arange(routes_hi, dtype=jnp.int32)
+        weights_hi = jnp.ones(routes_hi, dtype=jnp.float32) * (1.0 / 6.0)
+        valid_hi = jnp.ones(routes_hi, dtype=bool)
+        tok_sorted_hi = jnp.arange(routes_hi, dtype=jnp.int32) // 6
+        out2b = fused_moe_gmm.moe_gmm(
+            x_hi,
+            w1,
+            None,
+            None,
+            w2,
+            None,
+            None,
+            group_sizes_hi,
+            revert_hi,
+            weights_hi,
+            valid_hi,
+            tok_sorted_hi,
+            activation="silu",
+            num_tokens=n_tok_hi,
+            topk=6,
+            use_ep=True,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=4096,
+        )
+        assert out2b.shape == (n_tok_hi, hidden_size)
 
         # Branch 3: EP + SC, size <= threshold, owner_output == "on", blockwise
         monkeypatch.setattr(envs, "TPU_MOE_OWNER_OUTPUT_MODE", "on")
@@ -638,7 +697,7 @@ def test_fused_moe_func(monkeypatch):
         )
         assert out1.shape == (num_tokens, hidden_size)
 
-    # 2. dense_expert_moe branch
+    # 2. dense_expert_moe explicit threshold branch
     monkeypatch.setattr(fused_moe_gmm, "_DENSE_EXPERT_THRESHOLD", 64)
     with (
         patch.object(fused_moe_gmm, "can_use_dense_expert", return_value=True),
@@ -662,8 +721,37 @@ def test_fused_moe_func(monkeypatch):
         )
         assert out2.shape == (num_tokens, hidden_size)
 
+    # 2b. DSpark low-expert (w1.shape[0] <= 2) auto-dispatch when threshold == 0
+    monkeypatch.setattr(fused_moe_gmm, "_DENSE_EXPERT_THRESHOLD", 0)
+    fused_moe_gmm.fused_moe_func.clear_cache()
+    w1_low = jnp.ones((2, hidden_size, intermediate_size), dtype=jnp.bfloat16)
+    w2_low = jnp.ones((2, intermediate_size, hidden_size), dtype=jnp.bfloat16)
+    with (
+        patch.object(fused_moe_gmm, "can_use_dense_expert", return_value=True),
+        patch.object(
+            fused_moe_gmm,
+            "dense_expert_moe",
+            return_value=jnp.zeros((num_tokens, hidden_size), dtype=jnp.bfloat16),
+        ) as mock_dense,
+    ):
+        out2b = fused_moe_gmm.fused_moe_func(
+            hidden_states,
+            w1_low,
+            w2_low,
+            None,
+            None,
+            None,
+            None,
+            topk_weights,
+            topk_ids,
+            topk=topk,
+        )
+        assert out2b.shape == (num_tokens, hidden_size)
+        mock_dense.assert_called_once()
+
     # 3. routed GMM with w1_scale=None and w2_scale=None
     monkeypatch.setattr(fused_moe_gmm, "_DENSE_EXPERT_THRESHOLD", 0)
+    fused_moe_gmm.fused_moe_func.clear_cache()
     with patch.object(fused_moe_gmm, "gmm_v2", side_effect=mock_gmm):
         out3 = fused_moe_gmm.fused_moe_func(
             hidden_states,
