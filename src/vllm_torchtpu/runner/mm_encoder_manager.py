@@ -196,10 +196,8 @@ class MMEncoderManager(EncoderCudaGraphManager):
         """Pads actual inputs and runs the compiled XLA graph."""
         del axis_keys
         num_items = len(self._get_item_specs(mm_kwargs))
-        if (
-            path not in self.budget_templates
-            or token_budget not in self.budget_templates[path]
-        ):
+        path_templates = self.budget_templates.get(path)
+        if path_templates is None or token_budget not in path_templates:
             self.graph_misses += num_items
             return None
 

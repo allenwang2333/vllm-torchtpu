@@ -80,6 +80,8 @@ def test_scheduler_mamba_split_accepts_external_kv_tokens():
         cache_config=SimpleNamespace(block_size=16),
         block_size=16,
         use_eagle=False,
+        use_eagle_block_drop=False,
+        mamba_fine_grained_prefix_cache=False,
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
         hash_block_size=16,
@@ -1057,8 +1059,8 @@ class TestQwen3VLModelPatches:
         # Test masked_scatter size mismatch error
         class MockTPUTensor(torch.Tensor):
             @property
-            def device(self):
-                return torch.device("tpu")
+            def device(self):  # type: ignore[override]
+                return SimpleNamespace(type="tpu")
 
         inp = torch.zeros(4).as_subclass(MockTPUTensor)
         mask = torch.tensor([True, True, True, False])

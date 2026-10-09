@@ -81,11 +81,16 @@ def _align_block_to_backend(block_size: int, supported) -> int:
     any multiple of b directly."""
     from vllm.v1.attention.backend import MultipleOf
 
-    candidates = []
-    for entry in supported:
-        base = entry.base if isinstance(entry, MultipleOf) else int(entry)
-        candidates.append(_round_up_to_multiple(block_size, base))
-    return min(candidates) if candidates else block_size
+    return min(
+        (
+            _round_up_to_multiple(
+                block_size,
+                entry.base if isinstance(entry, MultipleOf) else int(entry),
+            )
+            for entry in supported
+        ),
+        default=block_size,
+    )
 
 
 def _resolve_tpu_cache_dtype(vllm_config: VllmConfig) -> torch.dtype:

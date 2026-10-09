@@ -30,11 +30,12 @@ def _stage_without_full_attention(vllm_config: Any) -> str | None:
     layer_types = getattr(hf_config, "layer_types", None)
     if layer_types is None:
         return None
+    num_layers = len(layer_types)
     stages = vllm_config.parallel_config.pipeline_parallel_size
     for stage in range(stages):
-        start, end = get_pp_indices(len(layer_types), stage, stages)
+        start, end = get_pp_indices(num_layers, stage, stages)
         kinds = layer_types[start:end]
-        if not any(kind in _FULL_ATTENTION_LAYER_TYPES for kind in kinds):
+        if _FULL_ATTENTION_LAYER_TYPES.isdisjoint(kinds):
             return (
                 f"stage {stage} holds layers {start}-{end - 1}, "
                 f"{'/'.join(sorted(set(kinds)))} only"

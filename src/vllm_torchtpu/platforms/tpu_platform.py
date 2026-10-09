@@ -1240,8 +1240,10 @@ def _get_token_paddings(
     paddings = _get_exponential_token_paddings(min_token_size, max_token_size)
     if extra_bucket_sizes:
         paddings = sorted(
-            set(paddings)
-            | {size for size in extra_bucket_sizes if 0 < size <= max_token_size}
+            {
+                *paddings,
+                *(size for size in extra_bucket_sizes if 0 < size <= max_token_size),
+            }
         )
     logger.info("Using token paddings: %s", paddings)
     return paddings

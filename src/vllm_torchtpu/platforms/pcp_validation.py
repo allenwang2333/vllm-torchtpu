@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PcpStaticConfig:
     pcp_size: int
     interleave_size: int

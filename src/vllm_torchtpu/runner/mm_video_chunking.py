@@ -284,7 +284,7 @@ def _encode_video_item(
     for t_start in range(0, t, chunk_t):
         chunk_len = min(chunk_t, t - t_start)
         row_start = t_start * rows_per_t
-        row_end = (t_start + chunk_len) * rows_per_t
+        row_end = row_start + chunk_len * rows_per_t
 
         chunk_grid = grid[:1].clone()
         chunk_grid[0, 0] = chunk_len

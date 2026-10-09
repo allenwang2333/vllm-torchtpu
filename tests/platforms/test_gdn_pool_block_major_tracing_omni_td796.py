@@ -22,7 +22,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_torchtpu import block_major_pool, envs, gdn_pool_layout
+from vllm_torchtpu import block_major_pool, gdn_pool_layout
 from vllm_torchtpu.tracing import options as tracing_options
 
 
@@ -100,11 +100,11 @@ def test_gdn_pool_layout_all_paths(monkeypatch):
     with pytest.raises(ValueError, match="unsupported pooled GDN state dtype"):
         gdn_pool_layout.pooled_gdn_state_itemsize("torch.int8")
 
-    monkeypatch.setattr(envs, "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", True, raising=False)
+    monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
     assert gdn_pool_layout.unified_kv_layout_enabled_for_architecture(
         "LlamaForCausalLM"
     )
-    monkeypatch.setattr(envs, "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", None, raising=False)
+    monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
     assert gdn_pool_layout.unified_kv_layout_enabled_for_architecture(
         "KimiLinearForCausalLM"
     )
@@ -137,11 +137,11 @@ def test_gdn_pool_layout_all_paths(monkeypatch):
 def test_block_major_pool_all_paths(monkeypatch):
     import vllm_torchtpu.platforms.tpu_block_size_utils as bsu
 
-    monkeypatch.setattr(envs, "VLLM_TPU_BLOCK_MAJOR_KV", False, raising=False)
+    monkeypatch.setenv("VLLM_TPU_BLOCK_MAJOR_KV", "0")
     fake_cfg = SimpleNamespace(model_config=SimpleNamespace(is_hybrid=True))
     assert not block_major_pool.unified_block_major_enabled(fake_cfg)
 
-    monkeypatch.setattr(envs, "VLLM_TPU_BLOCK_MAJOR_KV", True, raising=False)
+    monkeypatch.setenv("VLLM_TPU_BLOCK_MAJOR_KV", "1")
     monkeypatch.setattr(bsu, "unified_kv_layout_enabled", lambda cfg: True)
     assert block_major_pool.unified_block_major_enabled(fake_cfg)
 

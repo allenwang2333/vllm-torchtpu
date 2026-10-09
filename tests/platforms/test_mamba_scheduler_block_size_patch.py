@@ -34,9 +34,11 @@ def _scheduler():
         cache_config=physical_cache_config,
         block_size=3072,
         use_eagle=True,
+        use_eagle_block_drop=True,
         max_num_scheduled_tokens=16384,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         mamba_partial_cache_hit=False,
+        mamba_fine_grained_prefix_cache=False,
         mamba_has_prefill_checkpoint_blocks=False,
         hash_block_size=3072,
     )
