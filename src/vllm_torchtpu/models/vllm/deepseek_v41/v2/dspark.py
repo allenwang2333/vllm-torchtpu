@@ -631,7 +631,11 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the ``mtp.{0,1,2}.*`` draft weights from the target checkpoint."""
         first_layer = self.model.layers[0]
-        use_native_mega_moe = first_layer.ffn.use_native_mega_moe
+        use_native_mega_moe = getattr(
+            first_layer.ffn,
+            "use_native_mega_moe",
+            getattr(first_layer.ffn, "use_mega_moe", False),
+        )
         n_draft_experts = (
             getattr(self.config, "dspark_n_routed_experts", 0)
             or self.config.n_routed_experts

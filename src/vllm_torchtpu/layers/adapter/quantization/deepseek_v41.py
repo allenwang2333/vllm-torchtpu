@@ -119,4 +119,9 @@ class DeepseekV41MoE(DeepseekV4MoE):
             # the runner gathers those over the EP group (TpuDeviceCommunicator)
             # but passes input_ids through as this rank's shard.
             input_ids = get_ep_group().all_gather(input_ids, dim=0)
-        return super().forward(hidden_states, input_ids, mega_gate_metadata)
+        if mega_gate_metadata is None:
+            return super().forward(hidden_states, input_ids)
+        try:
+            return super().forward(hidden_states, input_ids, mega_gate_metadata)
+        except TypeError:
+            return super().forward(hidden_states, input_ids)
