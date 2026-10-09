@@ -218,9 +218,20 @@ local extraVllmArgs = cdk.var('EXTRA_VLLM_ARGS', '');
 // GPU_MEMORY_UTILIZATION=0.90 the KV cache no longer fits one MAX_MODEL_LEN=1048576 request; raise it with this.
 local specMethod = cdk.var('SPEC_METHOD', '');
 local numSpecTokens = cdk.numVar('NUM_SPEC_TOKENS', 5);
+// SPEC_SYNTHETIC_AL=<mean acceptance length> accepts drafts at fixed per-position rates that give this
+// length (vLLM rejection_sample_method=synthetic) instead of by the target's probabilities, as the InferenceX
+// reference measures DSpark throughput. Outputs are then not samples of the target. The reference's
+// golden curve for DeepSeek-V4-Pro-0813 DSpark is K1 1.84, K2 2.51, K3 3.01, K4 3.36, K5 3.61, K6 3.77.
+// Empty = real rejection sampling.
+local specSyntheticAl = cdk.var('SPEC_SYNTHETIC_AL', '');
 local specConfig =
   if specMethod == '' then ''
-  else if specMethod == 'dspark' then '{"method":"dspark","num_speculative_tokens":%d}' % numSpecTokens
+  else if specMethod == 'dspark' then
+    '{"method":"dspark","num_speculative_tokens":%d%s}' % [
+      numSpecTokens,
+      if specSyntheticAl == '' then ''
+      else ',"rejection_sample_method":"synthetic","synthetic_acceptance_length":%s' % specSyntheticAl,
+    ]
   else error 'SPEC_METHOD must be empty or dspark, got "%s"' % specMethod;
 // vLLM drops the last matched prefix-cache block of every hit for EAGLE-style drafts (DSpark and the
 // DeepSeek-V4 groups included): ~BLOCK_SIZE more prefill tokens per request. DSpark's draft KV for verified
