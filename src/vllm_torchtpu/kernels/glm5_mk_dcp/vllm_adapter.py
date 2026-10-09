@@ -264,6 +264,8 @@ class Glm5MKD:
         per_layer = {}
         out, names, specs = [], [], []
         for kind, (layers, shape, dtype) in self.wk.items():
+            if not layers:                       # a kind no layer has (kernel.build drops it too)
+                continue
             want = {"float8_e4m3fn": torch.float8_e4m3fn, "bfloat16": torch.bfloat16,
                     "float32": torch.float32}[jax.numpy.dtype(dtype).name]
             ts = []
