@@ -270,3 +270,85 @@ def test_spec_warmup_off_spellings(monkeypatch):
     monkeypatch.setenv("SPEC_WARMUP", "nope")
     with pytest.raises(ValueError, match="SPEC_WARMUP"):
         _ = envs.SPEC_WARMUP
+
+
+def test_all_env_builders_and_caching_100pct(monkeypatch):
+    """Exercise remaining builder branches and cache helpers in envs.py."""
+    from vllm_torchtpu import envs
+
+    p_ci = envs.env_with_choices(
+        "_TEST_CHOICE_CI", default="a", choices=["A", "B"], case_sensitive=False
+    )
+    monkeypatch.delenv("_TEST_CHOICE_CI", raising=False)
+    assert p_ci() == "a"
+    monkeypatch.setenv("_TEST_CHOICE_CI", "b")
+    assert p_ci() == "b"
+    monkeypatch.setenv("_TEST_CHOICE_CI", "bad")
+    with pytest.raises(ValueError, match="Invalid value"):
+        p_ci()
+
+    p_cs = envs.env_with_choices(
+        "_TEST_CHOICE_CS",
+        default="X",
+        choices=lambda: ["X", "Y"],
+        case_sensitive=True,
+    )
+    monkeypatch.setenv("_TEST_CHOICE_CS", "X")
+    assert p_cs() == "X"
+    monkeypatch.setenv("_TEST_CHOICE_CS", "x")
+    with pytest.raises(ValueError, match="Invalid value"):
+        p_cs()
+
+    p_ob = envs.env_optional_bool("_TEST_OPT_BOOL")
+    monkeypatch.delenv("_TEST_OPT_BOOL", raising=False)
+    assert p_ob() is None
+    monkeypatch.setenv("_TEST_OPT_BOOL", "1")
+    assert p_ob() is True
+
+    p_oi = envs.env_optional_int("_TEST_OPT_INT")
+    monkeypatch.delenv("_TEST_OPT_INT", raising=False)
+    assert p_oi() is None
+    monkeypatch.setenv("_TEST_OPT_INT", "7")
+    assert p_oi() == 7
+
+    p_pos = envs.env_positive_int_or_none("_TEST_POS_INT")
+    monkeypatch.delenv("_TEST_POS_INT", raising=False)
+    assert p_pos() is None
+    monkeypatch.setenv("_TEST_POS_INT", "5")
+    assert p_pos() == 5
+    monkeypatch.setenv("_TEST_POS_INT", "0")
+    with pytest.raises(ValueError, match="must be > 0"):
+        p_pos()
+
+    monkeypatch.setenv("REQUANTIZE_BLOCK_SIZE", "64")
+    assert envs.environment_variables["REQUANTIZE_BLOCK_SIZE"]() == 64
+    monkeypatch.delenv("REQUANTIZE_BLOCK_SIZE", raising=False)
+
+    monkeypatch.setenv("MOE_REQUANTIZE_BLOCK_SIZE", "64")
+    assert envs.environment_variables["MOE_REQUANTIZE_BLOCK_SIZE"]() == 64
+    monkeypatch.delenv("MOE_REQUANTIZE_BLOCK_SIZE", raising=False)
+
+    monkeypatch.setenv("VLLM_TPU_MOST_MODEL_LEN", "4096")
+    assert envs.environment_variables["VLLM_TPU_MOST_MODEL_LEN"]() == 4096
+    monkeypatch.delenv("VLLM_TPU_MOST_MODEL_LEN", raising=False)
+
+    monkeypatch.setenv("TPU_TOKEN_BUCKET_EXTRA", "16,32")
+    assert envs.environment_variables["TPU_TOKEN_BUCKET_EXTRA"]() == [16, 32]
+    monkeypatch.delenv("TPU_TOKEN_BUCKET_EXTRA", raising=False)
+
+    monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "mlp,attn")
+    assert envs.environment_variables["QUANTIZE_ON_LOAD_PREFIXES"]() == ["mlp", "attn"]
+    monkeypatch.delenv("QUANTIZE_ON_LOAD_PREFIXES", raising=False)
+
+    for fn in envs.environment_variables.values():
+        fn()
+    assert "TPU_DEEPSEEK_V41_FUSED_SWA" in dir(envs)
+    with pytest.raises(AttributeError):
+        _ = envs.NON_EXISTENT_ENV_KNOB
+
+    orig_getattr = envs.__getattr__
+    try:
+        envs.enable_envs_cache()
+        assert envs.TPU_DEEPSEEK_V41_FUSED_SWA is True
+    finally:
+        envs.__getattr__ = orig_getattr
