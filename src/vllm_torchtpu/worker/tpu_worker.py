@@ -303,8 +303,9 @@ class TPUWorker(WorkerBase):
                 # chips. Both TPU_VISIBLE_CHIPS and TPU_VISIBLE_DEVICES must
                 # be set -- TorchTPU only honors the chip pin under the
                 # RANK/WORLD_SIZE distributed bootstrap when both agree.
-                os.environ["TPU_VISIBLE_CHIPS"] = str(binding.native_local_rank)
-                os.environ["TPU_VISIBLE_DEVICES"] = str(binding.native_local_rank)
+                native_local_rank_str = str(binding.native_local_rank)
+                os.environ["TPU_VISIBLE_CHIPS"] = native_local_rank_str
+                os.environ["TPU_VISIBLE_DEVICES"] = native_local_rank_str
                 os.environ["ALLOW_MULTIPLE_LIBTPU_LOAD"] = "1"
                 init_rank = binding.init_rank
                 init_world = binding.init_world_size
@@ -390,13 +391,13 @@ class TPUWorker(WorkerBase):
                 _configure_tpu_process_env(
                     self.rank, tpu_local_rank_env, pc.world_size, tpu_local_world
                 )
-            if envs.TPU_LOCAL_RANK_OFFSET:
+            if local_rank_offset := envs.TPU_LOCAL_RANK_OFFSET:
                 logger.info(
                     "TPU local-rank offset binding | rank=%d local_rank=%d "
                     "offset=%d -> tpu_local_rank=%d tpu_local_world=%d",
                     self.rank,
                     self.local_rank,
-                    envs.TPU_LOCAL_RANK_OFFSET,
+                    local_rank_offset,
                     binding.local_rank,
                     binding.local_world_size,
                 )
@@ -430,21 +431,19 @@ class TPUWorker(WorkerBase):
         # the rank -> chip binding is already a Hamiltonian cycle: libtpu opens
         # devices in ascending PCI order, and consecutive ranks land on
         # ICI-adjacent chips.
+        dcp_size = pc.decode_context_parallel_size
         with (
             set_current_vllm_config(self.vllm_config),
             pcp_topology_order(
                 None,
-                preserve_dcp_order=(
-                    pcp_size > 1
-                    and self.parallel_config.decode_context_parallel_size > 1
-                ),
+                preserve_dcp_order=pcp_size > 1 and dcp_size > 1,
             ),
         ):
             ensure_model_parallel_initialized(
-                tensor_model_parallel_size=self.parallel_config.tensor_parallel_size,
-                pipeline_model_parallel_size=self.parallel_config.pipeline_parallel_size,
+                tensor_model_parallel_size=pc.tensor_parallel_size,
+                pipeline_model_parallel_size=pc.pipeline_parallel_size,
                 prefill_context_model_parallel_size=pcp_size,
-                decode_context_model_parallel_size=self.parallel_config.decode_context_parallel_size,
+                decode_context_model_parallel_size=dcp_size,
             )
 
         pp_group = get_pp_group()

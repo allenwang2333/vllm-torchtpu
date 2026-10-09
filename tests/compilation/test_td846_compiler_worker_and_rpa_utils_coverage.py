@@ -83,6 +83,16 @@ class TestTpuCompilerFullCoverage:
             files = tc._iter_runtime_cache_key_files(tmp_path)
         assert files == [tmp_path / dir_rel / "sub.py"]
 
+        with patch.object(tc.envs, "TPU_KERNEL_ITER_MODE", False):
+            files_no_iter = tc._iter_runtime_cache_key_files(tmp_path)
+        assert files_no_iter == [
+            tmp_path / file_rel,
+            tmp_path / dir_rel / "sub.py",
+        ]
+
+        with patch.object(tc.importlib_metadata, "version", return_value="9.9.9"):
+            assert tc._pkg_version("custom-pkg") == "9.9.9"
+
     def test_reloadable_kernel_relpaths_all_branches(self, tmp_path: Path) -> None:
         inside_file = tmp_path / "pkg" / "mod_in.py"
         inside_file.parent.mkdir(parents=True, exist_ok=True)
@@ -214,9 +224,14 @@ class TestTpuCompilerFullCoverage:
         assert entry2 is None
 
     def test_save_handle_and_replay_all_branches(self, tmp_path: Path) -> None:
+        import pickle
+
         adaptor = tc.TpuCompilerAdaptor()
         gm = fx.symbolic_trace(_TupleOutMod())
         artifact_path = str(tmp_path / "sub" / "artifact.pkl")
+
+        # Unreadable / missing artifact returns None
+        assert adaptor._replay(str(tmp_path / "missing.pkl"), gm, False) is None
 
         assert (
             adaptor._save_handle("k1", artifact_path, "entry_data", gm, False) is True
@@ -247,6 +262,17 @@ class TestTpuCompilerFullCoverage:
             tc.shape_variants, "graph_signature", return_value=(("other",),)
         ):
             assert adaptor._replay(artifact_path, gm, False) is None
+
+        # Replay non-TpuCompilationHandle payload and entry=None payload
+        bad_payload_path = tmp_path / "bad_payload.pkl"
+        bad_payload_path.write_bytes(pickle.dumps("not_a_handle"))
+        assert adaptor._replay(str(bad_payload_path), gm, False) is None
+
+        empty_entry_path = tmp_path / "empty_entry.pkl"
+        empty_entry_path.write_bytes(
+            pickle.dumps(tc.TpuCompilationHandle(key="k1", entry=None))
+        )
+        assert adaptor._replay(str(empty_entry_path), gm, False) is None
 
     def test_compile_and_load_all_branches(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

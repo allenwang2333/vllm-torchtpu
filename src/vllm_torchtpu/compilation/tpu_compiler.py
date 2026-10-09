@@ -271,11 +271,10 @@ def _reloadable_kernel_relpaths(repo_root: Path) -> list[str]:
 def _tpu_compile_env_factors() -> dict[str, Any]:
     """Return TorchTPU plugin env values that can affect compilation."""
     factors = {}
-    for name, getter in envs.environment_variables.items():
-        if name in _TPU_COMPILE_ENV_IGNORED:
-            continue
+    env_vars = envs.environment_variables
+    for name in env_vars.keys() - _TPU_COMPILE_ENV_IGNORED:
         try:
-            factors[name] = getter()
+            factors[name] = env_vars[name]()
         except Exception as exc:
             logger.warning(
                 "Skipping TPU compile environment variable %s: %s", name, exc
@@ -362,11 +361,10 @@ def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
 
     Returns (wrapped_graph, was_wrapped).
     """
-    output_node = None
-    for node in graph.graph.nodes:
-        if node.op == "output":
-            output_node = node
-            break
+    output_node = next(
+        (node for node in reversed(graph.graph.nodes) if node.op == "output"),
+        None,
+    )
 
     if output_node is None:
         return graph, False

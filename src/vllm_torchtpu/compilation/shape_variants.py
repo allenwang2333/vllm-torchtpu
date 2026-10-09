@@ -112,14 +112,10 @@ def unsupported_reason(shape_env: Any, size: int) -> str | None:
     the same trace. An expression that stays symbolic is treated as satisfied:
     this only ever refuses a bucket it can prove wrong.
     """
-    if shape_env is None:
-        return None
-    symbols = set(shape_env.var_to_range)
-    if not symbols:
+    if shape_env is None or not shape_env.var_to_range:
         return None
 
-    for symbol in symbols:
-        value_range = shape_env.var_to_range[symbol]
+    for symbol, value_range in shape_env.var_to_range.items():
         lower, upper = _finite(value_range.lower), _finite(value_range.upper)
         # A backed size is guarded >= 2 only to dodge 0/1 specialization;
         # upstream discounts that same bound when it evaluates guards
@@ -129,7 +125,7 @@ def unsupported_reason(shape_env: Any, size: int) -> str | None:
         if upper is not None and size > upper:
             return f"{symbol} <= {upper}"
 
-    substitution = {symbol: size for symbol in symbols}
+    substitution = dict.fromkeys(shape_env.var_to_range, size)
     for guard in shape_env.guards:
         expr = guard.expr
         if _holds_at(expr, substitution) is False:
