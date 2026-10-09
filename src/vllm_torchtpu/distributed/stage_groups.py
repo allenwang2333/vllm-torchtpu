@@ -59,19 +59,31 @@ def _stage_groups() -> list[Any]:
     return groups
 
 
-def _load_make_standalone() -> Callable[[Any], None]:
+def _load_make_standalone() -> Callable[[Any], None] | None:
+    import os
+
+    mode = os.environ.get("VLLM_PP_STAGE_STANDALONE", "auto").strip().lower()
+    if mode in ("0", "false", "no", "off"):
+        logger.info("VLLM_PP_STAGE_STANDALONE=%s: skipping make_standalone", mode)
+        return None
     try:
         from torch_tpu._internal.distributed.spmd_util import make_standalone
     except ImportError as e:
-        raise RuntimeError(
-            "Pipeline stages of more than one device (--pipeline-parallel-size "
-            "> 1 with --tensor-parallel-size > 1) need a torch_tpu with "
-            "standalone process subgroups (google-pytorch/torch_tpu#4387); the "
-            "installed torch_tpu has no "
-            "torch_tpu._internal.distributed.spmd_util.make_standalone. Without "
-            "it the stage's collectives compile slice-wide and the first uneven "
-            "launch (the last stage's logits all-gather) hangs."
-        ) from e
+        if mode in ("1", "true", "yes", "on"):
+            raise RuntimeError(
+                "Pipeline stages of more than one device (--pipeline-parallel-size "
+                "> 1 with --tensor-parallel-size > 1) need a torch_tpu with "
+                "standalone process subgroups (google-pytorch/torch_tpu#4387); the "
+                "installed torch_tpu has no "
+                "torch_tpu._internal.distributed.spmd_util.make_standalone. Without "
+                "it the stage's collectives compile slice-wide and the first uneven "
+                "launch (the last stage's logits all-gather) hangs."
+            ) from e
+        logger.info(
+            "torch_tpu has no make_standalone; relying on process-group "
+            "rank_to_device_id subgroup collectives (google-pytorch/torch_tpu#4178)"
+        )
+        return None
     return make_standalone
 
 
@@ -91,12 +103,14 @@ def make_stage_groups_standalone(parallel_config: Any) -> None:
         return
     make_standalone = _load_make_standalone()
     groups = _stage_groups()
-    for group in groups:
-        # Returns once every member of the group has called it.
-        make_standalone(group.device_group)
+    if make_standalone is not None:
+        for group in groups:
+            # Returns once every member of the group has called it.
+            make_standalone(group.device_group)
     setattr(pp_group, _DONE_ATTR, True)
     logger.info(
-        "pipeline stage %d: standalone process groups %s",
+        "pipeline stage %d: standalone process groups %s (make_standalone=%s)",
         pp_group.rank_in_group,
         [(getattr(g, "unique_name", "?"), list(g.ranks)) for g in groups],
+        make_standalone is not None,
     )

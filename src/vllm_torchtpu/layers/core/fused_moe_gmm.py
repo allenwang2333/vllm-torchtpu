@@ -343,7 +343,7 @@ def prepare_routed_gmm_inputs(
     flat_bits = max(1, (token_indices_flat.shape[0] - 1).bit_length())
     single_sort = (
         _SINGLE_SORT
-        and not ragged_permute
+        and argsort_revert_indices is None
         and token_indices_flat.shape[0] <= _SINGLE_SORT_MAX_ROWS
         and (local_num_experts + 1).bit_length() + flat_bits < 31
     )
@@ -354,7 +354,7 @@ def prepare_routed_gmm_inputs(
     )
     token_indices_sorted: jax.Array | None = None
 
-    if ragged_permute:
+    if argsort_revert_indices is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
     else:
         if single_sort:

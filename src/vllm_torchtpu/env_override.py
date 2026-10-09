@@ -278,6 +278,8 @@ def _get_cli_opt(argv: list[str], opt: str) -> str | None:
 
 
 def _is_cli_pp() -> bool:
+    if os.environ.get("VLLM_TPU_PP_ACTIVE") == "1":
+        return True
     import sys
 
     argv = sys.argv
@@ -286,7 +288,10 @@ def _is_cli_pp() -> bool:
         or _get_cli_opt(argv, "-pp")
         or ""
     )
-    return pp_raw.isdigit() and int(pp_raw) > 1
+    if pp_raw.isdigit() and int(pp_raw) > 1:
+        os.environ["VLLM_TPU_PP_ACTIVE"] = "1"
+        return True
+    return False
 
 
 _libtpu_extra_args: list[str] = []
@@ -299,7 +304,14 @@ _libtpu_extra_args: list[str] = []
 # un-offloaded all-reduce-start reaches LoweringEmitter and fails with
 # "HLO all-reduce-start is not implemented on TPU". Disable SC all-reduce
 # offload and keep the merger enabled when PP > 1.
+# Also disable Inductor autograd cache and /dev/shm Tier-2 cache under PP > 1
+# (matching sglang-torchtpu#869) so multiple pipeline stages on the same host
+# with identical layer shapes never collide across distinct TP sub-slices.
 _pp_active = _is_cli_pp()
+if _pp_active:
+    os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
+    os.environ["TORCH_TPU_TIER2_COMPILATION_CACHE"] = "disabled"
+    os.environ["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] = "disabled"
 
 for _default_flag, _default_val in (
     ("--xla_tpu_use_dynamic_smem_negotiation", "true"),
