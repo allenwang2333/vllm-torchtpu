@@ -362,7 +362,7 @@ def _apply_qwen35_serve_cli_defaults() -> None:
         return
     is_pp = _is_cli_pp()
     cli_defaults = [("--renderer-num-workers", "4")]
-    if not is_pp:
+    if not is_pp and os.environ.get("TPU_QWEN35_AUTO_DEFAULTS", "1") != "0":
         cli_defaults.insert(
             0,
             ("--speculative-config", '{"method":"mtp","num_speculative_tokens":3}'),

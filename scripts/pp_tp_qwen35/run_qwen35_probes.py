@@ -26,7 +26,7 @@ def build_needle_prompt(target_words: int, needle_code: str) -> str:
     )
     question = (
         "\nBased on the text above, what is the exact secret verification passkey? "
-        "Reply with the passkey."
+        "Reply with the passkey.\nAnswer:"
     )
     return prefix + needle + suffix + question
 
@@ -48,7 +48,7 @@ def query_completion(
     url = f"http://{host}:{port}/v1/completions"
     payload = {
         "model": model,
-        "prompt": format_qwen35_prompt(prompt),
+        "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": 0.0,
     }
@@ -74,7 +74,7 @@ def main() -> int:
     probes: list[dict[str, Any]] = [
         {
             "name": "math_reasoning",
-            "prompt": (
+            "prompt": format_qwen35_prompt(
                 "Solve concisely in 2-3 sentences: A train travels 120 km at "
                 "60 km/h, then 180 km at 90 km/h. What is the average speed "
                 "for the entire journey in km/h? State the final numeric value."
