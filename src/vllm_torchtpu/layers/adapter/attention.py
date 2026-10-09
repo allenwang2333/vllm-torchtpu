@@ -32,7 +32,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
 
 import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched_wrapper
-import vllm_torchtpu.layers.adapter.cp_mla_attention as _cp_mla_attention
 from vllm_torchtpu import envs
 from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
@@ -146,8 +145,7 @@ def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch
 
     finite = torch.isfinite(gathered)
     shift = torch.where(finite, gathered, -float("inf")).amax(dim=0)
-    empty = ~torch.isfinite(shift)
-    shift = torch.where(empty, 0.0, shift)
+    shift = torch.where(torch.isfinite(shift), shift, 0.0)
 
     weights = torch.where(finite, torch.exp(gathered - shift.unsqueeze(0)), 0.0)
     denom = weights.sum(dim=0)
@@ -181,11 +179,6 @@ def merge_lse_partials_scatter_heads(
     scattered_hm = group.reduce_scatter(weighted_hm, dim=0).to(output.dtype)
     return scattered_hm.transpose(0, 1)
 
-
-_cp_mla_attention.all_gather_heads = all_gather_heads
-_cp_mla_attention._weight_by_lse = _weight_by_lse
-_cp_mla_attention.merge_lse_partials_scatter_heads = merge_lse_partials_scatter_heads
-_cp_mla_attention.all_gather_q_nope_pe_heads = all_gather_q_nope_pe_heads
 
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
@@ -228,8 +221,11 @@ TPU_STR_DTYPE_TO_TORCH_DTYPE = {
 }
 
 
+_FP8_KV_CACHE_DTYPES: frozenset[str] = frozenset(("fp8", "fp8_e4m3", "fp8_e5m2"))
+
+
 def _is_fp8_kv_cache_dtype(cache_dtype_str: str) -> bool:
-    return cache_dtype_str.lower().strip() in frozenset(("fp8", "fp8_e4m3", "fp8_e5m2"))
+    return cache_dtype_str.lower().strip() in _FP8_KV_CACHE_DTYPES
 
 
 def _resolve_kv_cache_dtype(cache_dtype: str | torch.dtype) -> torch.dtype:
@@ -247,15 +243,35 @@ def _resolve_kv_cache_dtype(cache_dtype: str | torch.dtype) -> torch.dtype:
     return dtype
 
 
+@functools.cache
 def get_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
     """Return number of dtype values packed into a packing_bits lane."""
-    bits = torch.empty((), dtype=dtype).element_size() * 8
+    bits = dtype.itemsize * 8
     if packing_bits % bits != 0:
         raise ValueError(
             f"The bit width must divide {packing_bits}, but got {bits} for "
             f"dtype={dtype}."
         )
     return packing_bits // bits
+
+
+@functools.cache
+def _get_kernel_entry_param_names(kernel_entry: Any) -> frozenset[str]:
+    """Return the cached parameter names of an RPA kernel entry callable."""
+    return frozenset(inspect.signature(kernel_entry).parameters)
+
+
+def _extract_scalar_scale(layer: Any, float_attr: str, raw_attr: str) -> float | None:
+    """Extract a scalar quantization scale from `layer`."""
+    scale = getattr(layer, float_attr, None)
+    if scale is None and hasattr(layer, raw_attr):
+        raw = getattr(layer, raw_attr)
+        scale = (
+            raw.item()
+            if isinstance(raw, torch.Tensor) and raw.ndim == 0
+            else getattr(raw, "tolist", lambda: raw)()
+        )
+    return scale
 
 
 # HND is SEQ_ALONG_LANE: head_dim, not KV heads, fills the 32-bit words, so an
@@ -716,8 +732,7 @@ class PallasAttentionBackend(AttentionBackend):
             head_size,
             dtype,
         )
-        num_elements = functools.reduce(lambda x, y: x * y, shape, 1)
-        return num_elements * torch.empty((), dtype=dtype).element_size()
+        return math.prod(shape) * dtype.itemsize
 
     @staticmethod
     def swap_blocks(
@@ -1092,7 +1107,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             )
             wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
         else:
-            entry_params = inspect.signature(self._kernel_entry).parameters
+            entry_params = _get_kernel_entry_param_names(self._kernel_entry)
             entry_kwargs: dict[str, Any] = {}
             if "kv_layout" in entry_params:
                 entry_kwargs["kv_layout"] = self.kv_layout
@@ -1863,8 +1878,7 @@ class PallasMLAttentionBackend(AttentionBackend):
             head_size,
             dtype,
         )
-        num_elements = functools.reduce(lambda x, y: x * y, shape, 1)
-        return num_elements * torch.empty((), dtype=dtype).element_size()
+        return math.prod(shape) * dtype.itemsize
 
     @staticmethod
     def swap_blocks(
@@ -2000,14 +2014,14 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         )
         self._dcp_mesh = None
 
-        if self.dcp_size > 1 and envs.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER:
-            logger.info_once(
-                "Applied TPU patch: TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER - one "
-                "all-gather of concatenated (q_nope, q_pe) whenever q is "
-                "not replicated and both share a dtype (dcp=%d).",
-                self.dcp_size,
-            )
         if self.dcp_size > 1:
+            if envs.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER:
+                logger.info_once(
+                    "Applied TPU patch: TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER - one "
+                    "all-gather of concatenated (q_nope, q_pe) whenever q is "
+                    "not replicated and both share a dtype (dcp=%d).",
+                    self.dcp_size,
+                )
             logger.info_once(
                 "Applied TPU patch: DCP MLA head-major dim=0 collectives "
                 "(all_gather_heads / merge_lse_partials_scatter_heads "
@@ -2043,29 +2057,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         inside Pallas FX graphs without tracing dynamic tensor-shape overhead right when
         consuming heterogeneous checkpoint FP8 scales.
         """
-        q_scale = getattr(layer, "_q_scale_float", None)
-        if q_scale is None and hasattr(layer, "_q_scale"):
-            q_scale = (
-                layer._q_scale.item()
-                if isinstance(layer._q_scale, torch.Tensor) and layer._q_scale.ndim == 0
-                else getattr(layer._q_scale, "tolist", lambda: layer._q_scale)()
-            )
-
-        k_scale = getattr(layer, "_k_scale_float", None)
-        if k_scale is None and hasattr(layer, "_k_scale"):
-            k_scale = (
-                layer._k_scale.item()
-                if isinstance(layer._k_scale, torch.Tensor) and layer._k_scale.ndim == 0
-                else getattr(layer._k_scale, "tolist", lambda: layer._k_scale)()
-            )
-
-        v_scale = getattr(layer, "_v_scale_float", None)
-        if v_scale is None and hasattr(layer, "_v_scale"):
-            v_scale = (
-                layer._v_scale.item()
-                if isinstance(layer._v_scale, torch.Tensor) and layer._v_scale.ndim == 0
-                else getattr(layer._v_scale, "tolist", lambda: layer._v_scale)()
-            )
+        q_scale = _extract_scalar_scale(layer, "_q_scale_float", "_q_scale")
+        k_scale = _extract_scalar_scale(layer, "_k_scale_float", "_k_scale")
+        v_scale = _extract_scalar_scale(layer, "_v_scale_float", "_v_scale")
         if v_scale is None:
             v_scale = k_scale
 
