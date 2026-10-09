@@ -42,7 +42,7 @@ from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref, pcp_metadata, wrapp
 from vllm_torchtpu.kernels.gdn.v3.projection_scale import normalize_projection_scale
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class _ProjectionConfig:
     """Static geometry for the in-kernel QKVZ projection schedule."""
 
@@ -56,7 +56,20 @@ class _ProjectionConfig:
 _TPU_TILE_ROWS = 8
 _TPU_TILE_COLUMNS = 128
 
+_SMEM_BLOCK_SPEC = pl.BlockSpec(memory_space=pltpu.SMEM)
+_VMEM_BLOCK_SPEC = pl.BlockSpec(memory_space=pltpu.VMEM)
+_HBM_BLOCK_SPEC = pl.BlockSpec(memory_space=pltpu.HBM)
 
+
+@functools.lru_cache(maxsize=32)
+def _get_compiler_params(vmem_limit_bytes: int | None) -> pltpu.CompilerParams:
+    return pltpu.CompilerParams(
+        disable_bounds_checks=True,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+
+
+@functools.lru_cache(maxsize=64)
 def _qkv_receive_group_stride(
     comm_chunk_size: int,
     tile_size: int,
@@ -264,6 +277,18 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     """Schedule QKVZ projection, QKV remote DMA, and per-sequence GDN."""
     del packed_out_hbm_ref
     is_fp8_projection = projection_weight_ref.dtype == jnp.float8_e4m3fn
+    fp8_dtype_info = (
+        jnp.finfo(projection_weight_ref.dtype) if is_fp8_projection else None
+    )
+    fp8_blocked = (
+        is_fp8_projection
+        and projection_weight_scale_vmem_ref is not None
+        and projection_weight_scale_vmem_ref.ndim == 2
+    )
+    fp8_num_blocks = projection_weight_scale_vmem_ref.shape[0] if fp8_blocked else 0
+    fp8_block_k = (
+        projection_weight_vmem_ref.shape[1] // fp8_num_blocks if fp8_blocked else 0
+    )
     projection_pending_out_ref[0] = -1
 
     rank = lax.axis_index(pcp_axis_name)
@@ -392,6 +417,13 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     num_z_out_blocks = pcp_size
     num_projection_out_blocks = num_qkv_out_blocks + num_z_out_blocks
     full_key_dim = projection_cfg.full_key_dim
+    projection_token_num_groups = projection_token_block_size // _TPU_TILE_ROWS
+    z_lanes = shard_value_dim // _TPU_TILE_COLUMNS
+    z_pad_width = (
+        (0, 0),
+        (0, _TPU_TILE_ROWS - z_lanes),
+        (0, 0),
+    )
 
     def _projection_job(out_block):
         is_qkv = out_block < num_qkv_out_blocks
@@ -627,14 +659,14 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             ).wait()
             x = projection_x_ref[...]
             if is_fp8_projection:
-                dtype_info = jnp.finfo(projection_weight_ref.dtype)
+                assert fp8_dtype_info is not None
                 x_abs_max = jnp.max(jnp.abs(x), axis=1)
-                x_scale = x_abs_max.astype(jnp.float32) / float(dtype_info.max)
+                x_scale = x_abs_max.astype(jnp.float32) / float(fp8_dtype_info.max)
                 x_scale = jnp.where(x_scale == 0, 1.0, x_scale)
                 projection_x_prepared_ref[...] = jnp.clip(
                     x.astype(jnp.float32) / x_scale[:, None],
-                    float(dtype_info.min),
-                    float(dtype_info.max),
+                    float(fp8_dtype_info.min),
+                    float(fp8_dtype_info.max),
                 ).astype(projection_weight_ref.dtype)
                 projection_x_scale_ref[...] = x_scale
             else:
@@ -655,10 +687,9 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 dst_ref=weight_ref,
                 sem=projection_weight_sem,
             ).wait()
-            blocked = is_fp8_projection and projection_weight_scale_vmem_ref.ndim == 2
             if is_fp8_projection:
                 scale_slice = (pl.ds(0, width),)
-                if blocked:
+                if fp8_blocked:
                     scale_slice = (slice(None),) + scale_slice
                 scale_ref = projection_weight_scale_vmem_ref.at[scale_slice]
                 pltpu.make_async_copy(
@@ -666,12 +697,10 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                     dst_ref=scale_ref,
                     sem=projection_scale_sem,
                 ).wait()
-            if blocked:
-                num_blocks = projection_weight_scale_vmem_ref.shape[0]
-                block_k = projection_weight_vmem_ref.shape[1] // num_blocks
+            if fp8_blocked:
                 acc = jnp.zeros((projection_token_block_size, width), jnp.float32)
-                for block in range(num_blocks):
-                    k_slice = pl.ds(block * block_k, block_k)
+                for block in range(fp8_num_blocks):
+                    k_slice = pl.ds(block * fp8_block_k, fp8_block_k)
                     part = jax.lax.dot_general(
                         projection_x_prepared_ref[:, k_slice],
                         projection_weight_vmem_ref[pl.ds(0, width), k_slice],
@@ -709,19 +738,14 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
 
         @pl.when(jnp.logical_not(is_qkv))
         def _finish_z() -> None:
-            lanes = shard_value_dim // _TPU_TILE_COLUMNS
             values = _finish_matmul(shard_value_dim).reshape(
                 projection_token_block_size,
-                lanes,
+                z_lanes,
                 _TPU_TILE_COLUMNS,
             )
             projection_z_out_ref[...] = jnp.pad(
                 values,
-                (
-                    (0, 0),
-                    (0, _TPU_TILE_ROWS - lanes),
-                    (0, 0),
-                ),
+                z_pad_width,
             )
 
         token_row = token_block * projection_token_block_size
@@ -729,12 +753,11 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         @pl.when(is_qkv)
         def _write_qkv_projection() -> None:
             group_start = token_row // _TPU_TILE_ROWS
-            num_groups = projection_token_block_size // _TPU_TILE_ROWS
             pltpu.make_async_copy(
                 src_ref=projection_out_ref,
                 dst_ref=projected_qkv_ref.at[
                     destination,
-                    pl.ds(group_start, num_groups),
+                    pl.ds(group_start, projection_token_num_groups),
                     :,
                     :,
                     :,
@@ -1184,6 +1207,8 @@ def _scatter_compact_state_updates(
     """
     num_sequences = state_indices.shape[0]
     active_bound = jnp.minimum(num_active_seqs, num_sequences)
+    trailing_zeros = (0,) * (state_source.ndim - 1)
+    trailing_zeros_2 = (0,) * (state_source.ndim - 2)
 
     def _apply_one(sequence_id, pool):
         state_index = state_indices[sequence_id]
@@ -1197,12 +1222,12 @@ def _scatter_compact_state_updates(
 
         def _write(pool):
             if whole_block_dma:
-                start_indices = (block_start, *(0,) * (state_source.ndim - 1))
+                start_indices = (block_start, *trailing_zeros)
             else:
                 start_indices = (
                     block_start,
                     region.row0,
-                    *(0,) * (state_source.ndim - 2),
+                    *trailing_zeros_2,
                 )
             return lax.dynamic_update_slice(pool, updates[sequence_id], start_indices)
 
@@ -1473,12 +1498,11 @@ def fused_qkvz_projection_pcp_gdn(
     num_lanes = pltpu.get_tpu_info().num_lanes
     aligned_num_v_heads = pl.cdiv(local_n_v, num_lanes) * num_lanes
     num_v_padding = aligned_num_v_heads - local_n_v
-    b = jnp.pad(b, ((0, 0), (0, num_v_padding))).reshape(
-        global_batch_size, 1, aligned_num_v_heads
-    )
-    a = jnp.pad(a, ((0, 0), (0, num_v_padding))).reshape(
-        global_batch_size, 1, aligned_num_v_heads
-    )
+    if num_v_padding > 0:
+        b = jnp.pad(b, ((0, 0), (0, num_v_padding)))
+        a = jnp.pad(a, ((0, 0), (0, num_v_padding)))
+    b = b.reshape(global_batch_size, 1, aligned_num_v_heads)
+    a = a.reshape(global_batch_size, 1, aligned_num_v_heads)
 
     cfg = config.GDNConfig(
         mode=config.GDNMode.PER_SEQ,
@@ -1520,11 +1544,11 @@ def fused_qkvz_projection_pcp_gdn(
         num_projection_out_blocks=num_projection_out_blocks,
     )
     metadata_spec = jax.tree.map(
-        lambda _: pl.BlockSpec(memory_space=pltpu.SMEM),
+        lambda _: _SMEM_BLOCK_SPEC,
         metadata_obj,
     )
     stage_metadata_spec = jax.tree.map(
-        lambda _: pl.BlockSpec(memory_space=pltpu.SMEM),
+        lambda _: _SMEM_BLOCK_SPEC,
         stage_metadata_obj,
     )
 
@@ -1541,11 +1565,11 @@ def fused_qkvz_projection_pcp_gdn(
         gdn=gdn_weights,
     )
     weights_spec = jax.tree.map(
-        lambda _: pl.BlockSpec(memory_space=pltpu.VMEM),
+        lambda _: _VMEM_BLOCK_SPEC,
         weights,
     )
 
-    hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    hbm_spec = _HBM_BLOCK_SPEC
     gdn_out_shape = cfg.get_out_shape()
     zero_gdn_out = jnp.zeros(gdn_out_shape.shape, gdn_out_shape.dtype)
     packed_out_shape = (
@@ -1747,10 +1771,7 @@ def fused_qkvz_projection_pcp_gdn(
             pltpu.SemaphoreType.DMA,
         ),
         input_output_aliases=input_output_aliases,
-        compiler_params=pltpu.CompilerParams(
-            disable_bounds_checks=True,
-            vmem_limit_bytes=vmem_limit_bytes,
-        ),
+        compiler_params=_get_compiler_params(vmem_limit_bytes),
         name=kernel_name,
         metadata=cfg.get_metadata(),
     )(
