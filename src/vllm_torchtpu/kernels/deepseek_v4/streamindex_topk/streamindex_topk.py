@@ -1125,7 +1125,8 @@ def streamindex_topk(
       vmem_limit_bytes: the vmem limit for the pallas kernel.
       enable_early_exit: whether to enable early exit using jax.lax.cond when k >=
         kv_len for all sequences in the batch. Defaults to False.
-      decode_req_batch_size: maximum decode batch size per iteration.
+      decode_req_batch_size: maximum decode batch size per iteration; 1 runs
+        every decode sequence on its own.
       kv_layout: memory layout of `cache_kv`. `SEQ_ALONG_LANE` removes the lane
         padding that per-token quantization forces on `HEAD_ALONG_SUBLANE` and is
         therefore substantially faster whenever the kernel is HBM bound.
@@ -1216,6 +1217,9 @@ def streamindex_topk(
         )
 
     max_num_seqs = seq_lens.shape[0]
+    # A batch of one is the per-sequence pass itself, so it takes no pass of
+    # its own (which would only add an empty kernel launch).
+    batch_decode = 1 < decode_req_batch_size <= max_num_seqs
 
     original_dtype = q.dtype
     actual_head_dim = q.shape[-1]
@@ -1405,7 +1409,7 @@ def streamindex_topk(
         )
         batched_decode = (
             ()
-            if max_num_seqs < decode_req_batch_size
+            if not batch_decode
             else (
                 dict(
                     start_seq_idx=jnp.array(0),
@@ -1508,7 +1512,7 @@ def streamindex_topk(
         # blocks to run computation for.
         decode_batch_end = (
             jnp.array(0)
-            if max_num_seqs < decode_req_batch_size
+            if not batch_decode
             else distribution[0] // decode_req_batch_size * decode_req_batch_size
         )
 

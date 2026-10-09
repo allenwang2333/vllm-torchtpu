@@ -102,9 +102,11 @@ def _indexer_jax(
             distribution=distribution,
             k=k,
             compression_ratio=compression_ratio,
-            # The following parameters are tuned based on microbenchmark results.
-            num_kv_pages_per_block=(3, 2, 2),
+            # Tuned on tpu7x at max-model-len 1M: large KV blocks, and decode
+            # sequences scored one at a time rather than in batches of 4.
+            num_kv_pages_per_block=(16, 2, 8),
             num_queries_per_block=(1, 128, 128),
+            decode_req_batch_size=1,
         )
 
     return _indexer_local(
