@@ -600,17 +600,11 @@ def _next_host_buf(nbytes: int, row_span: int) -> torch.Tensor:
     return buf
 
 
-def _gather_into(
-    lib: ctypes.CDLL,
-    hashes: np.ndarray,
-    table_ids: list[int],
-    packed_dim: int,
-    out: torch.Tensor,
-) -> None:
-    num_tokens, n_tables, n_hash_cols = hashes.shape
+def _ensure_engram_ptrs(table_ids: list[int]) -> tuple[Any, ...]:
     key = tuple(table_ids)
     cached = _ENGRAM_PTRS_CACHE.get(key)
     if cached is None:
+        n_tables = len(table_ids)
         w_ptrs = (ctypes.c_void_p * n_tables)()
         s_ptrs = (ctypes.c_void_p * n_tables)()
         max_rows = (ctypes.c_int64 * n_tables)()
@@ -625,7 +619,18 @@ def _gather_into(
         cached = (w_ptrs, s_ptrs, max_rows, val_dim, scl_dim)
         if all(p is not None for p in pairs):
             _ENGRAM_PTRS_CACHE[key] = cached
-    w_ptrs, s_ptrs, max_rows, val_dim, scl_dim = cached
+    return cached
+
+
+def _gather_into(
+    lib: ctypes.CDLL,
+    hashes: np.ndarray,
+    table_ids: list[int],
+    packed_dim: int,
+    out: torch.Tensor,
+) -> None:
+    num_tokens, n_tables, n_hash_cols = hashes.shape
+    w_ptrs, s_ptrs, max_rows, val_dim, scl_dim = _ensure_engram_ptrs(table_ids)
     lib.engram_gather_omp(
         hashes.ctypes.data,
         w_ptrs,
@@ -795,6 +800,32 @@ def engram_prefetch_prefill(
         for ti, pi in zip(g_tok[valid_g].tolist(), g_pre[valid_g].tolist()):
             debug_tok0_out[int(ti)] = int(sampled_arr[pi])
 
+    # Resolve all PJRT / torch_tpu D2H copies and tensor data_ptrs synchronously
+    # on the main worker thread before launching background OpenMP work so
+    # background threads never race with PJRT's non-thread-safe C++ event lists.
+    _ensure_engram_ptrs(table_ids)
+    sampled_main_np: np.ndarray | None = None
+    pre_sampled_main_np: np.ndarray | None = None
+    next_main_np: np.ndarray | None = None
+    if pre_async is not None:
+        if local_subst is not None:
+            sampled_main_np = _resolve_async_tokens_cpu(pre_async)
+        elif spec_async_subst is not None:
+            pre_sampled_t = pre_async.wait_for_copy()
+            next_t_fn = getattr(pre_async, "wait_for_next_tokens_cpu", None)
+            next_t = next_t_fn() if callable(next_t_fn) else None
+            if next_t is None:
+                next_tpu: Any = getattr(pre_async, "next_tokens_tpu", None)
+                if isinstance(next_tpu, torch.Tensor):
+                    next_t = next_tpu.to("cpu")
+            if pre_sampled_t is not None and next_t is not None:
+                pre_sampled_main_np = pre_sampled_t.detach().to(torch.int64).numpy()
+                if pre_sampled_main_np.ndim == 1:
+                    pre_sampled_main_np = pre_sampled_main_np[:, None]
+                next_main_np = next_t.detach().reshape(-1).to(torch.int64).numpy()
+        elif debug_tok0_out is not None and norm_subst is not None:
+            sampled_main_np = _resolve_async_tokens_cpu(pre_async)
+
     def _bg_hash_and_gather() -> dict[str, Any]:
         if n_real_local > 0:
             hashes_s = np.full(
@@ -805,7 +836,7 @@ def engram_prefetch_prefill(
             if local_subst is not None and pre_async is not None:
                 cum_xor = hash_state.cpu_hashes_tail(token_ids, req_k, pos_k)
                 ids_0_all = token_ids[req_slice, np.maximum(pos_slice, 0)].copy()
-                sampled = _resolve_async_tokens_cpu(pre_async)
+                sampled = sampled_main_np
                 if sampled is not None:
                     loc_tok, loc_pre = local_subst
                     valid_p = (loc_pre >= 0) & (loc_pre < sampled.shape[0])
@@ -817,28 +848,25 @@ def engram_prefetch_prefill(
                 )
             elif spec_async_subst is not None and pre_async is not None:
                 spec_reqs, stride = spec_async_subst
-                pre_sampled_t = pre_async.wait_for_copy()
-                next_t_fn = getattr(pre_async, "wait_for_next_tokens_cpu", None)
-                next_t = next_t_fn() if callable(next_t_fn) else None
-                if next_t is None:
-                    next_tpu: Any = getattr(pre_async, "next_tokens_tpu", None)
-                    if isinstance(next_tpu, torch.Tensor):
-                        next_t = next_tpu.to("cpu")
-                if pre_sampled_t is not None and next_t is not None and spec_reqs:
-                    pre_sampled_np = pre_sampled_t.detach().to(torch.int64).numpy()
-                    if pre_sampled_np.ndim == 1:
-                        pre_sampled_np = pre_sampled_np[:, None]
-                    next_np = next_t.detach().reshape(-1).to(torch.int64).numpy()
+                if (
+                    pre_sampled_main_np is not None
+                    and next_main_np is not None
+                    and spec_reqs
+                ):
+                    pre_sampled_np = pre_sampled_main_np
+                    next_np = next_main_np
                     max_r = max(
                         int(token_ids.shape[0]) - 1,
                         max(r for r, _, _, _, _ in spec_reqs),
                     )
+                    max_sched = max((ns for _, _, _, _, ns in spec_reqs), default=0)
                     num_rej_by_req = np.zeros(max_r + 1, dtype=np.int32)
                     span_start_by_req = np.full(
                         max_r + 1, token_ids.shape[1] + 100, dtype=np.int32
                     )
                     span_tokens = np.zeros(
-                        (max_r + 1, 2 * stride + 2), dtype=token_ids.dtype
+                        (max_r + 1, max(2 * stride + 2, stride + max_sched + 2)),
+                        dtype=token_ids.dtype,
                     )
                     for (
                         r,
@@ -884,14 +912,14 @@ def engram_prefetch_prefill(
                     and norm_subst is not None
                     and pre_async is not None
                 ):
-                    _populate_debug(_resolve_async_tokens_cpu(pre_async))
+                    _populate_debug(sampled_main_np)
             _gather_into(lib, hashes_s, table_ids, packed_dim, buf)
         elif (
             debug_tok0_out is not None
             and norm_subst is not None
             and pre_async is not None
         ):
-            _populate_debug(_resolve_async_tokens_cpu(pre_async))
+            _populate_debug(sampled_main_np)
         return pf_meta
 
     _ENGRAM_PREFETCH_FUTURE = _ENGRAM_BG_POOL.submit(_bg_hash_and_gather)
