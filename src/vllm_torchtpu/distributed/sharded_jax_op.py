@@ -158,7 +158,7 @@ def sharded_jax_op(
     global _SHARDED_CALLABLE_CLS
     if _SHARDED_CALLABLE_CLS is None:
         _SHARDED_CALLABLE_CLS = _build_sharded_callable_cls()
-    if "::" not in name or len(name.split("::")) != 2:
+    if name.count("::") != 1:
         raise ValueError(f"Op name {name} must be 'namespace::op', with one '::'.")
 
     signature = inspect.signature(inspect.unwrap(fn), eval_str=True)

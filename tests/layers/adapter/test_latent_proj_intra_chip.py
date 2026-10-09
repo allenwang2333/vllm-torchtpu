@@ -197,6 +197,54 @@ def test_grouping_declines_an_unreadable_topology(monkeypatch):
     assert intra_chip._chip_rank_groups() is None
 
 
+def test_grouping_declines_uninitialized_dist_or_ragged_chips(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.distributed import parallel_state
+
+    from vllm_torchtpu.distributed import intra_chip
+
+    topology = _topology_from(_tpu7x_two_hosts())
+    monkeypatch.setattr(intra_chip, "get_chip_topology", lambda: topology)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    assert intra_chip._chip_rank_groups() is None
+
+    ragged = SimpleNamespace(
+        cores_per_chip=2,
+        device_ids=[0, 1, 2, 3],
+        chip_of=lambda rank: (0 if rank < 3 else 1, 0),
+    )
+    monkeypatch.setattr(intra_chip, "get_chip_topology", lambda: ragged)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+    assert intra_chip._chip_rank_groups() is None
+
+    # Exercise get_intra_chip_group() when _chip_rank_groups() returns None and caching.
+    monkeypatch.setattr(intra_chip, "_initialized", False)
+    monkeypatch.setattr(intra_chip, "_group", None)
+    monkeypatch.setattr(intra_chip, "_chip_rank_groups", lambda: None)
+    assert intra_chip.get_intra_chip_group() is None
+    assert intra_chip._initialized is True
+    assert intra_chip.get_intra_chip_group() is None
+
+    # Exercise get_intra_chip_group() when _chip_rank_groups() returns valid groups.
+    monkeypatch.setattr(intra_chip, "_initialized", False)
+    monkeypatch.setattr(intra_chip, "_group", None)
+    monkeypatch.setattr(intra_chip, "_chip_rank_groups", lambda: [[0, 1], [2, 3]])
+    fake_world = SimpleNamespace(device_group="dev_grp", local_rank=1)
+    fake_coord = SimpleNamespace(rank_in_group=1, world_size=2)
+    monkeypatch.setattr(parallel_state, "get_world_group", lambda: fake_world)
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda grp: "gloo")
+    monkeypatch.setattr(
+        parallel_state,
+        "init_model_parallel_group",
+        lambda groups, local_rank, backend, group_name: fake_coord,
+    )
+    assert intra_chip.get_intra_chip_group() is fake_coord
+    assert intra_chip.get_intra_chip_group() is fake_coord
+
+
 # --------------------------------------------------------------------------
 # The fallbacks. Every one of these must leave the model as it was.
 # --------------------------------------------------------------------------

@@ -11,13 +11,20 @@ import math
 
 
 def _convert_partitioned_shape(shape, mesh, partition_spec, *, to_global):
-    if mesh is None or partition_spec is None:
-        return tuple(shape)
+    if mesh is None or partition_spec is None or len(partition_spec) == 0:
+        return shape if isinstance(shape, tuple) else tuple(shape)
+    mesh_shape = mesh.shape
+    spec_len = len(partition_spec)
     result = []
     for index, size in enumerate(shape):
-        axes = partition_spec[index] if index < len(partition_spec) else None
-        axes = () if axes is None else axes if isinstance(axes, tuple) else (axes,)
-        factor = math.prod(int(mesh.shape[axis]) for axis in axes)
+        axes = partition_spec[index] if index < spec_len else None
+        if axes is None:
+            result.append(size)
+            continue
+        if isinstance(axes, tuple):
+            factor = math.prod(int(mesh_shape[axis]) for axis in axes)
+        else:
+            factor = int(mesh_shape[axes])
         if not to_global and size % factor:
             raise ValueError(
                 f"Global dimension {size} is not divisible by mesh factor {factor}."

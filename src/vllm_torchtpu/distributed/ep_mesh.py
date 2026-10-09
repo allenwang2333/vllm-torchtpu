@@ -166,7 +166,7 @@ def ep_rank_order() -> tuple[int, ...] | None:
     group = get_ep_group()
     if group is None:
         return None
-    return tuple(range(len(tuple(group.ranks))))
+    return tuple(range(len(group.ranks)))
 
 
 def ep_mesh_index() -> int | None:

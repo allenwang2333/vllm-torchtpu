@@ -48,6 +48,8 @@ def test_disabled_ep_helpers(monkeypatch):
     assert ep.ep_rank_order() is None
     assert ep.ep_mesh_index() is None
     assert ep.build_ep_mesh() is None
+    with pytest.raises(RuntimeError, match="require an initialized EP group"):
+        ep.ep_token_replica_groups()
 
 
 @pytest.fixture
@@ -181,6 +183,7 @@ def test_token_groups_use_native_membership_and_mesh_order(
     "reports",
     [
         [None] * 4,
+        [(2, (2, 6)), (4, (4, 8)), (6, (2, 6)), (99, (4, 8))],
         [(2, (2, 6)), (4, (4, 8)), (6, (6, 2)), (8, (4, 8))],
         [(2, (2, 6)), (4, (4, 8)), (6, (2, 6)), (8, (8, 10))],
         [(2, (2,)), (4, (4, 8)), (6, (6,)), (8, (4, 8))],
@@ -199,3 +202,16 @@ def test_token_groups_reject_inconsistent_membership(monkeypatch, group, reports
     monkeypatch.setattr(ep.torch.distributed, "all_gather_object", gather)
     with pytest.raises(RuntimeError, match="replica"):
         ep.ep_token_replica_groups()
+
+
+def test_token_groups_reject_duplicate_device_ids(monkeypatch, group):
+    group.cpu_group = object()
+    monkeypatch.setattr(ep, "ep_device_ids", lambda: (40, 40, 10, 30))
+    reports = [(r, (r,)) for r in group.ranks]
+
+    def gather(output, value, *, group):
+        output[:] = reports
+
+    monkeypatch.setattr(ep.torch.distributed, "all_gather_object", gather)
+    with pytest.raises(RuntimeError, match="distinct devices"):
+        ep.ep_token_replica_groups(is_sequence_parallel=True)
