@@ -35,8 +35,9 @@ class TpuDpScheduler(AsyncScheduler):
     def _schedule_paused_new(self) -> SchedulerOutput:
         """Run one step while keeping newly prefills buffered."""
         prev_pause_state = self._pause_state
-        if prev_pause_state == PauseState.UNPAUSED:
-            self._pause_state = PauseState.PAUSED_NEW
+        if prev_pause_state != PauseState.UNPAUSED:
+            return super().schedule(False)
+        self._pause_state = PauseState.PAUSED_NEW
         try:
             return super().schedule(False)
         finally:
@@ -47,6 +48,9 @@ class TpuDpScheduler(AsyncScheduler):
         if not throttle_prefills:
             # Open window for draining accumulated prefills.
             self._drain_prefill = True
+        elif not self._drain_prefill:
+            return self._schedule_paused_new()
+
         if self._drain_prefill and not (self.waiting or self.skipped_waiting):
             # In drain mode until all accumulated prefills are scheduled.
             self._drain_prefill = False

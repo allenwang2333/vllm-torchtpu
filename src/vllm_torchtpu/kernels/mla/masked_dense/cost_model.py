@@ -25,6 +25,23 @@ class MaskedDensePrefillCostModel(NamedTuple):
     sparse_fixed_ns: int
     sparse_token_ns: int
 
+    def estimate_analytic_cost_ns(self, num_tokens: int, num_kv_blocks: int) -> int:
+        return (
+            self.analytic_fixed_ns
+            + num_tokens * self.analytic_token_ns
+            + num_kv_blocks * self.q_kv_block_ns
+        )
+
+    def estimate_bitmap_cost_ns(self, num_tokens: int, num_kv_blocks: int) -> int:
+        return (
+            self.bitmap_fixed_ns
+            + num_tokens * self.bitmap_token_ns
+            + num_kv_blocks * self.q_kv_block_ns
+        )
+
+    def estimate_sparse_cost_ns(self, num_tokens: int) -> int:
+        return self.sparse_fixed_ns + num_tokens * self.sparse_token_ns
+
 
 # Geometry of the tuned GLM-5.2 kernel.
 KV_BLOCK_SIZE = 1024

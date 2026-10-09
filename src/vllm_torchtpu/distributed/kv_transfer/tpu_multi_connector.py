@@ -19,6 +19,8 @@ class TPUMultiConnector(MultiConnector):
         # torchtpu extension unknown to upstream MultiConnector: forward it to
         # the children, or the Raiden child never gets a runner and fails with
         # "register_runner must be called before transfer" on the first load.
+        if not self._connectors:
+            return
         for c in self._connectors:
             fn = getattr(c, "register_runner", None)
             if fn is not None:
@@ -33,6 +35,8 @@ class TPUMultiConnector(MultiConnector):
         One scalar cannot scope two groups, so conflicting child indices
         raise instead of mis-scoping.
         """
+        if not self._connectors:
+            return None
         index: int | None = None
         for c in self._connectors:
             fn = getattr(c, "get_block_ids_with_load_errors_group_index", None)

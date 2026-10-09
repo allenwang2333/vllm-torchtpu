@@ -33,15 +33,30 @@ from vllm_torchtpu.distributed.mesh_utils import (
 # The JAX mesh axis the DCP kernels shard the KV cache over.
 DCP_AXIS_NAME = "dcp"
 
+_vllm_get_dcp_group = None
+_vllm_get_dcp_group_resolved = False
+
 
 def get_dcp_group() -> Any | None:
     """Return vLLM's DCP GroupCoordinator, or None if not initialized."""
-    try:
-        from vllm.distributed.parallel_state import get_dcp_group as _get_group
+    global _vllm_get_dcp_group, _vllm_get_dcp_group_resolved
+    if not _vllm_get_dcp_group_resolved:
+        try:
+            from vllm.distributed.parallel_state import (
+                get_dcp_group as _get_group,
+            )
 
-        return _get_group()
-    except (AssertionError, ImportError):
-        return None
+            _vllm_get_dcp_group = _get_group
+        except (AssertionError, ImportError):
+            _vllm_get_dcp_group = None
+        _vllm_get_dcp_group_resolved = True
+
+    if _vllm_get_dcp_group is not None:
+        try:
+            return _vllm_get_dcp_group()
+        except (AssertionError, ImportError):
+            return None
+    return None
 
 
 def get_dcp_rank() -> int:
@@ -59,7 +74,7 @@ def get_dcp_group_layout() -> CpGroupLayout:
     return get_cp_group_layout(get_dcp_group())
 
 
-def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
+def get_or_create_dcp_mesh(axis_name: str | None = DCP_AXIS_NAME) -> Any:
     """Build the op-local JAX mesh for the DCP axis.
 
     Under `tp=N, dcp=N` the DCP group covers the same devices as the TP group,
