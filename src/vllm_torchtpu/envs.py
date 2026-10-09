@@ -13,6 +13,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
+    TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
+    TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 1
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -73,8 +75,11 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_MOE_ONEHOT_SORTFREE: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_MOE_EP_TP_SIZE: int = 1
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
+    TPU_MOE_ROUTER_TOPK_BIAS: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -89,6 +94,8 @@ if TYPE_CHECKING:
     TPU_PP_LAZY_PUSH: bool = False
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
+    TPU_MLA_ROPE_NEOX_PERMUTE: bool = False
+    TPU_INDEXER_ROPE_NEOX_PERMUTE: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
@@ -96,6 +103,10 @@ if TYPE_CHECKING:
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
+    TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
+    TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
+    TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = False
+    TPU_INDEXER_TOPK_SHARED_READ: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -165,6 +176,17 @@ if TYPE_CHECKING:
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
+    TPU_SMALL_ALL_REDUCE: bool = False
+    TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
+    TPU_SMALL_ALL_REDUCE_DRAFT: bool = False
+    TPU_FP8_LINEAR_PALLAS: bool = False
+    TPU_SAMPLER_VOCAB_PARALLEL: bool = False
+    TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
+    TPU_SAMPLER_FAST_TOP_P: bool = False
+    TPU_SAMPLER_FUSED_CHAIN: bool = False
+    TPU_FP8_LINEAR_PALLAS_SITES: str = (
+        "fused_qkv_a_proj,q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
+    )
 
 
 def env_with_choices(
@@ -391,6 +413,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # faster. Only the backbone uses the all-to-all; the MTP drafter, traced
     # once for every bucket, always takes the reduce-scatter.
     "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64),
+    # DCP sparse MLA kernel I/O (`sparse_ragged_paged_attention(q_pe=...,
+    # lse_lane_dense=True)`): hand q_nope and q_pe to the kernel as separate
+    # operands (it joins them in VMEM; the output aliases q_nope, 512 wide)
+    # instead of materialising a padded [T, H, 640] concat, and export the
+    # log-sum-exp as a lane-dense f32[T, H] instead of f32[T, H, 1], whose
+    # lane-padded tiles cost a broadcast init, a relayout copy and padded
+    # copies through the LSE merge. Bit-identical outputs.
+    "TPU_DCP_MLA_SPLIT_Q_LSE": env_bool("TPU_DCP_MLA_SPLIT_Q_LSE", default=False),
+    # DCP sparse MLA attention grid step for decode-sized chunks
+    # (`sparse_ragged_paged_attention(small_chunk_batch_size=...)`): attend
+    # this many query tokens per kernel grid step instead of one, so the
+    # fixed per-step cost is paid once per N tokens (MTP decode has q=4 per
+    # request). The kernel uses the largest divisor of the chunk <= N and
+    # grids `cdiv(real tokens, step)` steps, so up to N-1 padding rows are
+    # attended (outputs don't-care). 1 = the kernel default (unchanged).
+    "TPU_DCP_MLA_SMALL_CHUNK_BATCH": env_int("TPU_DCP_MLA_SMALL_CHUNK_BATCH", 1),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
@@ -647,17 +685,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # Under the EP one-hot MoE permute (routed rows <= the one-hot threshold,
+    # at most 1024), derive the stable-sort positions, permuted token ids and
+    # group sizes by int32 compare-and-count instead of three comparison
+    # sorts. Outputs are bit-identical to the sorted form.
+    "TPU_MOE_ONEHOT_SORTFREE": env_bool("TPU_MOE_ONEHOT_SORTFREE"),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
     # weight-bandwidth bound and the per-device expert load is badly
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP": env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # Tensor-parallel degree of the routed experts inside each expert-parallel
+    # group: with --enable-expert-parallel on W ranks, the experts split into
+    # W/N groups of N consecutive ranks, and each rank holds 1/N of the
+    # intermediate width of every expert in its group (EP W/N x TP N) instead
+    # of whole experts (EP W). Same weight bytes per rank and the same final
+    # all-reduce over TP. At decode the MoE is weight-bandwidth bound and the
+    # step waits for the rank with the most active experts; splitting each
+    # expert N ways evens that out. 0 or 1 = off (vLLM's flat EP).
+    "TPU_MOE_EP_TP_SIZE": env_nonnegative_int("TPU_MOE_EP_TP_SIZE", 1),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
         "TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]
     ),
+    # With the rowmax router and a score-correction bias, add the bias inside
+    # the top-k kernel and return the unbiased scores at the chosen ids, so
+    # the separate scores.gather (one gather fusion per MoE layer) goes away.
+    # Ids and weights are bit-identical to the gather path.
+    "TPU_MOE_ROUTER_TOPK_BIAS": env_bool("TPU_MOE_ROUTER_TOPK_BIAS"),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's
@@ -706,6 +763,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Materialize the rotary cos_sin caches with a row-major ({1,0}) device
     # layout at load, May cost more HBM due to padding.
     "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=False),
+    # Permute each MLA head's interleaved (GPT-J) rope columns of the q and
+    # k_pe projections to half-split order at load and run the MLA rope
+    # NeoX-style. q.k is unchanged; the `x[..., ::2]` split and its relayout
+    # copies disappear.
+    "TPU_MLA_ROPE_NEOX_PERMUTE": env_bool("TPU_MLA_ROPE_NEOX_PERMUTE", default=False),
+    # The same for the sparse-attention indexer: permute each indexer head's
+    # interleaved rope columns of wq_b, the k rope columns of wk_weights_proj
+    # and the matching k_norm weight/bias entries at load, and run the indexer
+    # rope NeoX-style. Indexer scores are unchanged; independent of the MLA
+    # flag so each can be measured alone.
+    "TPU_INDEXER_ROPE_NEOX_PERMUTE": env_bool(
+        "TPU_INDEXER_ROPE_NEOX_PERMUTE", default=False
+    ),
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
@@ -762,6 +832,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ).lower(),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
+    ),
+    # Query block size for the StreamIndex top-k MIXED pass when the padded
+    # token bucket is small (<= 16 tokens). Under MTP every decode request has
+    # q_len = gamma + 1 > 1, so decode runs in the MIXED pass, whose default
+    # 128-row query block computes ~124 padding rows per real row. Unset keeps
+    # the default 128. 4 (one MTP request per block) measured fastest.
+    "TPU_STREAMIDX_SMALL_BUCKET_BQ": env_positive_int_or_none(
+        "TPU_STREAMIDX_SMALL_BUCKET_BQ"
+    ),
+    # KV pages per block for that same small-bucket MIXED pass. Read only when
+    # `TPU_STREAMIDX_SMALL_BUCKET_BQ` is set; unset then takes
+    # `STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP` (mla_attention_op.py), the value
+    # the decode-shape sweep picked.
+    "TPU_STREAMIDX_SMALL_BUCKET_BKVP": env_positive_int_or_none(
+        "TPU_STREAMIDX_SMALL_BUCKET_BKVP"
+    ),
+    # Branch at runtime around StreamIndex top-k's two DECODE (q_len 1)
+    # passes when the batch has no q_len-1 sequence -- every step under MTP,
+    # where they launch over an empty range. Unchunked calls only. Exact.
+    "TPU_STREAMIDX_SKIP_EMPTY_DECODE": env_bool(
+        "TPU_STREAMIDX_SKIP_EMPTY_DECODE", default=False
+    ),
+    # The indexed layer's own attention reads its rows back from the updated
+    # shared table, the same `table[:num_tokens]` expression the following
+    # skip_topk layers read, instead of the fresh rows. One expression lets XLA
+    # CSE the attention's top-k-only index prep (physical rows, live counts,
+    # window metadata) across the indexed layer and its skip_topk layers; with
+    # the fresh rows the first skip_topk layer recomputes it whenever
+    # num_tokens is short of the table height (decode). Same values either way.
+    "TPU_INDEXER_TOPK_SHARED_READ": env_bool(
+        "TPU_INDEXER_TOPK_SHARED_READ", default=False
     ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
@@ -1003,6 +1104,63 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # deterministic cap from the scheduler config, 0 disables the cap (all
     # post-profile HBM goes to KV), N > 0 caps KV at N tokens.
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS": env_int("VLLM_TPU_POOLING_KV_CACHE_TOKENS", -1),
+    # --- Small collectives ---
+    # Run small decode-step TP all-reduces and DP MoE combines as Pallas
+    # kernels (kernels/experimental/small_collectives) instead of XLA's.
+    "TPU_SMALL_ALL_REDUCE": env_bool("TPU_SMALL_ALL_REDUCE"),
+    # Largest TP all-reduce, in rows, that TPU_SMALL_ALL_REDUCE hands to the
+    # kernel; 0 keeps small_all_reduce_op.MAX_ROWS. The crossover moves with
+    # the core count and hidden size, so a slice other than the one MAX_ROWS
+    # was measured on sets its own; mixed-step blocks stay on XLA's above it.
+    "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
+        "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 0
+    ),
+    # With TPU_SMALL_ALL_REDUCE, also give the small kernel the TP all-reduces
+    # of traces compiled outside the backbone warmup -- the MTP drafter's step-0
+    # and loop-step programs. The row choice is taken per compiled bucket inside
+    # the JAX op (XLA's all-reduce above the cap), so no trace forks.
+    "TPU_SMALL_ALL_REDUCE_DRAFT": env_bool("TPU_SMALL_ALL_REDUCE_DRAFT"),
+    # Per-channel FP8 dense linears whose decode weight XLA reads from HBM: route
+    # M <= 16 through the weight-streaming Pallas kernel
+    # (kernels/quantized_matmul/fp8_skinny.py), XLA otherwise. Outputs differ from
+    # the XLA path in the f32 accumulation (exact here; XLA's fp8 x fp8 dot is not).
+    # A selected layer whose width is not a multiple of 128 (q_a + kv_a, 2624) also
+    # keeps a zero-padded copy of its weight for the kernel: +16.5 MB per layer on
+    # GLM-5.2-FP8, i.e. about 1.3 GB per rank over 79 layers.
+    # --- Sampler ---
+    # Lighter non-greedy sampler / spec-verify (rejection) programs. Skips the
+    # 32-pass top-k bisection when no active request sets top_k, and the
+    # 33-pass top-p bisection when none sets top_p < 1 (both decided on the
+    # host per step; a skipped mask is the identity, so tokens are exact). The
+    # greedy draft argmax all-gathers a (max, id) pair per row instead of the
+    # full logits (spec_decode/utils.vocab_parallel_argmax).
+    "TPU_SAMPLER_VOCAB_PARALLEL": env_bool("TPU_SAMPLER_VOCAB_PARALLEL"),
+    # Bits of the float32 threshold bisection resolved per vocab pass in
+    # top-k/top-p masking (2**bits - 1 candidate thresholds per pass, same
+    # result as 1 bit/pass since the predicate is monotonic). 0 = 1. Measured
+    # slower than 1 on tpu7x at decode shapes; kept for other vocab/row counts.
+    "TPU_SAMPLER_BSEARCH_RADIX_BITS": env_nonnegative_int(
+        "TPU_SAMPLER_BSEARCH_RADIX_BITS", 0
+    ),
+    # Non-greedy sampler + verify: run the top-p threshold bisection without
+    # the steps proven never to set a bit for softmax probs (bit 30; bits 15..0
+    # on the bf16 bonus rows): 15 vocab passes instead of 32 there, 31 on f32
+    # verify rows. Same threshold bit for bit (top_k_top_p.topp_mask). A top-K
+    # candidate prefilter was measured 10x slower (lax.top_k sorts the vocab).
+    "TPU_SAMPLER_FAST_TOP_P": env_bool("TPU_SAMPLER_FAST_TOP_P"),
+    # Non-greedy spec verify: logits gathers, bonus sampling, the per-token
+    # param gathers and the rejection sampler as ONE compiled program (the
+    # three uniform draws stay eager: same generator, shapes and order).
+    "TPU_SAMPLER_FUSED_CHAIN": env_bool("TPU_SAMPLER_FUSED_CHAIN"),
+    "TPU_FP8_LINEAR_PALLAS": env_bool("TPU_FP8_LINEAR_PALLAS"),
+    # Comma-separated layer-prefix suffixes that take that path, matched on a "."
+    # boundary. The defaults are the sites XLA does not prefetch on GLM-5.2-FP8
+    # decode; a VMEM-prefetched weight (indexer wq_b, shared experts, dense
+    # down_proj) is faster under XLA than any HBM stream.
+    "TPU_FP8_LINEAR_PALLAS_SITES": env_str(
+        "TPU_FP8_LINEAR_PALLAS_SITES",
+        "fused_qkv_a_proj,q_b_proj,self_attn.o_proj,mlp.gate_up_proj",
+    ),
 }
 
 
