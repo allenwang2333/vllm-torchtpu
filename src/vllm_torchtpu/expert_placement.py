@@ -286,12 +286,27 @@ def hot_order(layer: int) -> list[int]:
     return [vid[e] for lst in cs for e in lst[o:]]
 
 
+def _use_ep_active() -> bool:
+    """Whether expert parallelism is active in the current vLLM config
+    (defaulting to True outside an active vLLM config context)."""
+    try:
+        from vllm.config import get_current_vllm_config
+
+        cfg = get_current_vllm_config()
+    except Exception:
+        return True
+    pc = getattr(cfg, "parallel_config", None)
+    if pc is None:
+        return True
+    return bool(getattr(pc, "enable_expert_parallel", True))
+
+
 def permute_router_rows(name: str, tensor):
     """The router's weight (rows = experts) or per-expert bias reordered into
     the virtual order at load. Returns the tensor unchanged when the name is
     not a router parameter of a placed layer (the MTP drafter's router among
     them)."""
-    if not enabled() or not _ROUTER_RE.search(name):
+    if not enabled() or not _ROUTER_RE.search(name) or not _use_ep_active():
         return tensor
     layer = layer_index(name)
     if layer is None or str(layer) not in data()["layers"]:

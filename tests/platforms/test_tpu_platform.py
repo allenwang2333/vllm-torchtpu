@@ -1347,6 +1347,7 @@ def test_env_override_qwen35_serve_cli_defaults_under_pp(monkeypatch):
 
     monkeypatch.delenv("TPU_SMALL_ALL_REDUCE", raising=False)
     monkeypatch.delenv("TPU_MOE_LOWTOK", raising=False)
+    monkeypatch.delenv("TPU_EXPERT_PLACEMENT", raising=False)
     argv = [
         "vllm",
         "serve",
@@ -1363,4 +1364,5 @@ def test_env_override_qwen35_serve_cli_defaults_under_pp(monkeypatch):
     assert "--renderer-num-workers" in argv
     assert os.environ.get("TPU_SMALL_ALL_REDUCE") == "0"
     assert os.environ.get("TPU_MOE_LOWTOK") == "0"
+    assert os.environ.get("TPU_EXPERT_PLACEMENT") == ""
 

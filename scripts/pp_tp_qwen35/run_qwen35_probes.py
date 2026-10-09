@@ -31,6 +31,13 @@ def build_needle_prompt(target_words: int, needle_code: str) -> str:
     return prefix + needle + suffix + question
 
 
+def format_qwen35_prompt(user_prompt: str) -> str:
+    return (
+        f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
+
+
 def query_completion(
     host: str,
     port: int,
@@ -41,7 +48,7 @@ def query_completion(
     url = f"http://{host}:{port}/v1/completions"
     payload = {
         "model": model,
-        "prompt": prompt,
+        "prompt": format_qwen35_prompt(prompt),
         "max_tokens": max_tokens,
         "temperature": 0.0,
     }
@@ -73,7 +80,7 @@ def main() -> int:
                 "journey in km/h?"
             ),
             "expected": "75",
-            "max_tokens": 128,
+            "max_tokens": 256,
         },
         {
             "name": "needle_4k",

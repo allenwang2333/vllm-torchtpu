@@ -1087,7 +1087,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 if expert_placement.placed(getattr(layer, "layer_name", ""))
                 else int(layer.w13_weight.shape[0])
             )
-            if expert_placement.has_copies()
+            if layer.moe_config.moe_parallel_config.use_ep
+            and expert_placement.has_copies()
             else None
         )
         prebuild_fused_moe_kernel(
