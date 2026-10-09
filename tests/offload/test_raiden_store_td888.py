@@ -112,6 +112,25 @@ def test_resolve_kernel_geometry_dispatches_multi_shapes():
     m.assert_called_once_with("kvc")
 
 
+def test_resolve_kernel_geometry_unified_block_major():
+    fake_spec = SimpleNamespace(block_size=16, dtype=torch.bfloat16)
+    fake_layout = SimpleNamespace(split=2)
+    with (
+        patch(f"{_MOD}.has_multi_shapes_kv_caches", return_value=False),
+        patch(
+            f"{_MOD}.resolve_attention_geometry",
+            return_value=(fake_spec, 16, (16, 2, 4)),
+        ),
+        patch(f"{_MOD}.unified_block_major_enabled", return_value=True),
+        patch(
+            "vllm_torchtpu.kv_cache_materializer.resolve_block_major_pool_layout",
+            return_value=fake_layout,
+        ),
+    ):
+        res = rs.resolve_kernel_geometry(MagicMock(), MagicMock())
+        assert res == (16, (2, 16, 2, 4), torch.bfloat16, 16)
+
+
 # ---------------------------------------------------------------------------
 # RaidenOffloadingManager
 # ---------------------------------------------------------------------------

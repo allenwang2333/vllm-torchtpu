@@ -613,10 +613,15 @@ class _MockSDPABackendBase:
 
 
 def test_omni_attention_coverage(monkeypatch) -> None:
-    monkeypatch.setattr(_omni_attention, "SDPAImpl", _MockSDPAImplBase)
-    monkeypatch.setattr(_omni_attention, "SDPABackend", _MockSDPABackendBase)
+    monkeypatch.setattr(
+        TpuSDPAImpl,
+        "_forward_impl",
+        lambda self, q, k, v, attn_metadata, mask_mode: SimpleNamespace(
+            query=q, key=k, value=v, attn_metadata=attn_metadata, mask_mode=mask_mode
+        ),
+    )
 
-    impl = TpuSDPAImpl()
+    impl = TpuSDPAImpl.__new__(TpuSDPAImpl)
     q = torch.ones((1, 2, 4))
     k = torch.ones((1, 2, 4))
     v = torch.ones((1, 2, 4))
