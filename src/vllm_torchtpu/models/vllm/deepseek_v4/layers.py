@@ -36,15 +36,16 @@ def mhc_collapse_head(
     hc_eps: float,
 ) -> torch.Tensor:
     """Collapse multi-stream residual manifold into a single vector before LM head."""
-    residual_flat = hidden_states.flatten(-2).float()
+    orig_dtype = hidden_states.dtype
+    hs_f32 = hidden_states if orig_dtype == torch.float32 else hidden_states.float()
+    residual_flat = hs_f32.flatten(-2)
     residual_norm = residual_flat * torch.rsqrt(
         residual_flat.square().mean(dim=-1, keepdim=True) + rms_norm_eps
     )
     pre_mix = torch.nn.functional.linear(residual_norm, hc_fn)
     pre_mix = torch.sigmoid(pre_mix * hc_scale + hc_base) + hc_eps
-    return torch.sum(pre_mix.unsqueeze(-1) * hidden_states.float(), dim=-2).to(
-        hidden_states.dtype
-    )
+    out = torch.sum(pre_mix.unsqueeze(-1) * hs_f32, dim=-2)
+    return out if orig_dtype == torch.float32 else out.to(orig_dtype)
 
 
 class DeepseekV4MLP(nn.Module):
@@ -64,7 +65,7 @@ class DeepseekV4MLP(nn.Module):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
-            [intermediate_size] * 2,
+            [intermediate_size, intermediate_size],
             bias=False,
             quant_config=quant_config,
             disable_tp=is_sequence_parallel,

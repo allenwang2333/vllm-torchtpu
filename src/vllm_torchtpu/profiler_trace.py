@@ -158,7 +158,7 @@ def merge_rank_capture(
     # comparison covers every parallelism mode. Deciding purely from it also
     # keeps the verdict identical on every rank, which is what makes the rank
     # prefix present on all of a run's files or absent from all of them.
-    multi_worker = world_size > 1
+    rank_prefix = f"rank{worker_rank}_" if world_size > 1 else ""
 
     try:
         os.makedirs(dst_ts_dir, exist_ok=True)
@@ -170,7 +170,7 @@ def merge_rank_capture(
                 # Mind the two spellings of the same idea: the capture
                 # sandbox is `rank_<N>` (see `rank_capture_dir`), the merged
                 # filename is `rank<N>_`.
-                new_fname = f"rank{worker_rank}_{fname}" if multi_worker else fname
+                new_fname = f"{rank_prefix}{fname}" if rank_prefix else fname
                 shutil.move(
                     os.path.join(src_ts_dir, fname),
                     os.path.join(dst_ts_dir, new_fname),

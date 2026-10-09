@@ -110,7 +110,7 @@ class VllmMoERunner(MoERunner):
         # Asked of this layer's quant method, because arming is per layer: a
         # model whose layers do not all qualify must not have one armed layer
         # answer for the rest.
-        owner = self._quant_method
+        owner = self.routed_experts.quant_method
         return (
             fused_moe_ep_supported(owner)
             or adaptive_fused_moe_supported(owner)
@@ -125,7 +125,7 @@ class VllmMoERunner(MoERunner):
         # _patch_moe_explicit_pcp_collectives.
         if self.moe_config.pcp_size <= 1:
             return False
-        owner = self._quant_method
+        owner = self.routed_experts.quant_method
         return fused_moe_ep_supported(owner) or adaptive_fused_moe_supported(owner)
 
     def _maybe_dispatch(self, hidden_states, router_logits):
@@ -135,12 +135,12 @@ class VllmMoERunner(MoERunner):
             # being bypassed here is its explicit PCP all-gather pair.
             return hidden_states, router_logits
         if (
-            self.do_naive_dispatch_combine
-            and self.moe_config.pcp_size <= 1
-            and self.routed_experts.quant_method.is_monolithic
-            and self.routed_experts.custom_routing_function is None
+            router_logits is not hidden_states
+            and self.do_naive_dispatch_combine
             and moe_routing._SIMULATION_STRATEGY is None
-            and router_logits is not hidden_states
+            and self.moe_config.pcp_size <= 1
+            and self.routed_experts.custom_routing_function is None
+            and self.routed_experts.quant_method.is_monolithic
         ):
             group = (
                 get_ep_group()

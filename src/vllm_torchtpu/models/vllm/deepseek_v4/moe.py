@@ -119,7 +119,8 @@ class DeepseekV4MoE(nn.Module):
         # `layer.hash_indices_table`. Passing `hash_indices_table` to
         # `FusedMoEFactory` above only reaches the router object, so mirror it
         # onto the experts layer.
-        if self.gate.tid2eid is not None:
+        self._is_hash_moe = self.gate.tid2eid is not None
+        if self._is_hash_moe:
             object.__setattr__(
                 self.experts.routed_experts, "hash_indices_table", self.gate.tid2eid
             )
@@ -141,7 +142,7 @@ class DeepseekV4MoE(nn.Module):
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Forward pass executing router gate and fused expert computation."""
-        if self.gate.tid2eid is not None and input_ids is None:
+        if self._is_hash_moe and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 
         org_shape = hidden_states.shape
@@ -152,4 +153,8 @@ class DeepseekV4MoE(nn.Module):
             input_ids=input_ids,
         )
 
-        return final_hidden_states.view(org_shape)
+        return (
+            final_hidden_states
+            if final_hidden_states.shape == org_shape
+            else final_hidden_states.view(org_shape)
+        )

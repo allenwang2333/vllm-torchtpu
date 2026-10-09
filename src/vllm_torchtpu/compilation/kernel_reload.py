@@ -55,6 +55,9 @@ _LIVE: dict[str, Callable] = {}
 _BUILDERS: dict[str, Callable[[], Callable]] = {}
 
 
+_MISSING = object()
+
+
 def is_enabled() -> bool:
     return envs.TPU_KERNEL_ITER_MODE
 
@@ -62,7 +65,7 @@ def is_enabled() -> bool:
 def default_reload_modules() -> tuple[str, ...]:
     configured = envs.TPU_KERNEL_RELOAD_MODULES
     if configured:
-        return tuple(m.strip() for m in configured.split(",") if m.strip())
+        return tuple(s for m in configured.split(",") if (s := m.strip()))
     return _DEFAULT_RELOAD_MODULES
 
 
@@ -91,11 +94,9 @@ class _KernelDispatch:
     def __init__(self, name: str, template: Callable) -> None:
         self._name = name
         for attr in self._COPY_ATTRS:
-            try:
-                value = getattr(template, attr)
-            except AttributeError:
-                continue
-            setattr(self, attr, value)
+            value = getattr(template, attr, _MISSING)
+            if value is not _MISSING:
+                setattr(self, attr, value)
         self.__wrapped__ = template
 
     def __call__(self, *args, **kwargs):
