@@ -97,6 +97,14 @@ def test_default_tiles(m, k, n, groups):
         assert tile % 128 == 0
 
 
+def test_default_tiles_loop_exhaustion(monkeypatch):
+    monkeypatch.setattr(
+        tuned_block_sizes, "round_up_to_multiple_of_128_within_limit", lambda *args: 0
+    )
+    tm, tk, tn = tuned_block_sizes.get_default_gmm_block_sizes(128, 512, 512, 1)
+    assert tm == 0
+
+
 @pytest.mark.parametrize("tiles", [(128, 512, 1024), (64, 1024, 512)])
 def test_tuned_lookup(monkeypatch, tiles):
     key = (128, 320, 6144, 160, 160, "bfloat16", "float8_e4m3fn", 320)

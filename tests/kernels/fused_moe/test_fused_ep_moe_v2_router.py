@@ -136,3 +136,10 @@ def test_the_bias_moves_the_selection_and_not_the_weights():
         "the fixture's bias does not reorder the top-k, so this test cannot "
         "tell a kernel that applies it from one that ignores it"
     )
+
+
+def test_pallas_select_shape_mismatch_raises():
+    scores = jnp.zeros((16, 32), dtype=jnp.float32)
+    bad_weights = jnp.zeros((16, 16), dtype=jnp.float32)
+    with pytest.raises(ValueError, match="weight_scores.*must match scores"):
+        router_ops.pallas_select(scores, weight_scores=bad_weights, block_rows=16)

@@ -139,6 +139,41 @@ def test_supported_shape_is_not_restricted_to_tpu7():
             _shape((1,), jnp.int32),
             127,
         ),
+        (
+            _shape((2560, 4096), jnp.bfloat16),
+            _shape((10,), jnp.int32),
+            _shape((2560,), jnp.bfloat16),
+            _shape((1,), jnp.int32),
+            256,
+        ),
+        (
+            _shape((2560, 4096), jnp.bfloat16),
+            _shape((2560,), jnp.int64),
+            _shape((2560,), jnp.bfloat16),
+            _shape((1,), jnp.int32),
+            256,
+        ),
+        (
+            _shape((2560, 4096), jnp.bfloat16),
+            _shape((2560,), jnp.int32),
+            _shape((10,), jnp.bfloat16),
+            _shape((1,), jnp.int32),
+            256,
+        ),
+        (
+            _shape((2560, 4096), jnp.bfloat16),
+            _shape((2560,), jnp.int32),
+            _shape((2560,), jnp.bfloat16),
+            _shape((2,), jnp.int32),
+            256,
+        ),
+        (
+            _shape((2560, 4096), jnp.bfloat16),
+            _shape((2560,), jnp.int32),
+            _shape((2560,), jnp.bfloat16),
+            _shape((1,), jnp.int64),
+            256,
+        ),
     ],
 )
 def test_incompatible_shapes_use_dense_fallback(
@@ -174,4 +209,29 @@ def test_aligned_shapes_are_not_restricted_to_qwen35_config(
             _shape((route_capacity,), jnp.bfloat16),
             _shape((1,), jnp.int32),
             num_tokens=num_tokens,
+        )
+
+
+def test_validate_onehot_unpermute_arguments_type_error():
+    with pytest.raises(TypeError, match="num_tokens must be a static Python integer"):
+        moe_onehot_unpermute._validate_inputs(
+            _shape((2560, 4096), jnp.bfloat16),
+            _shape((2560,), jnp.int32),
+            _shape((2560,), jnp.bfloat16),
+            _shape((1,), jnp.int32),
+            num_tokens="not-an-int",
+        )
+
+
+def test_validate_onehot_unpermute_arguments_incompatible_raises():
+    with (
+        _cpu_tpu7_registry(),
+        pytest.raises(ValueError, match="blockwise one-hot unpermute does not support"),
+    ):
+        moe_onehot_unpermute._validate_inputs(
+            _shape((2560, 4096), jnp.float32),
+            _shape((2560,), jnp.int32),
+            _shape((2560,), jnp.bfloat16),
+            _shape((1,), jnp.int32),
+            num_tokens=256,
         )
