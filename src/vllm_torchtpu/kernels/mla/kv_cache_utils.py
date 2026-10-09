@@ -199,10 +199,11 @@ def as_token_bytes(values: jax.Array, token_bytes: int) -> jax.Array:
             values.shape[0], -1
         )
     )
-    assert u8.shape[-1] <= token_bytes, (
-        f"token is {u8.shape[-1]}B, more than the {token_bytes}B reserved for it"
+    width = u8.shape[-1]
+    assert width <= token_bytes, (
+        f"token is {width}B, more than the {token_bytes}B reserved for it"
     )
-    pad = token_bytes - u8.shape[-1]
+    pad = token_bytes - width
     return jnp.pad(u8, ((0, 0), (0, pad))) if pad else u8
 
 
@@ -244,8 +245,9 @@ def _row_positions(
     valid = tok < query_start_loc[-1]
 
     seq_id = jnp.minimum(seq_id, num_seqs - 1)
-    q_len = query_start_loc[seq_id + 1] - query_start_loc[seq_id]
-    pos = seq_lens[seq_id] - q_len + (tok - query_start_loc[seq_id])
+    start_loc = query_start_loc[seq_id]
+    q_len = query_start_loc[seq_id + 1] - start_loc
+    pos = seq_lens[seq_id] - q_len + (tok - start_loc)
     return tok, seq_id, pos, valid
 
 

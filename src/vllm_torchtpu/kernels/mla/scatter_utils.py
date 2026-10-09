@@ -187,9 +187,10 @@ def scatter_rows(
     sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None, "SparseCore info is missing."
     num_cores = sc_info.num_cores * sc_info.num_subcores
-    plan = split_plan(src.shape[0], sc_info.num_lanes, num_cores)
+    num_tokens = src.shape[0]
+    plan = split_plan(num_tokens, sc_info.num_lanes, num_cores)
 
-    pad_tokens = plan.total_tokens - src.shape[0]
+    pad_tokens = plan.total_tokens - num_tokens
     if pad_tokens > 0:
         dst_rows = jnp.pad(
             dst_rows, (0, pad_tokens), constant_values=kv_cache_utils.SKIP_ROW

@@ -180,12 +180,10 @@ def xpose_pipeline(
     def xpose_kernel(input_ref, output_ref):
         output_ref[...] = input_ref[...].transpose(*transpose_axes)
 
-    n_tile = (
-        n_tile if n_tile <= input.shape[parallel_axis] else input.shape[parallel_axis]
-    )
-    m_tile = (
-        m_tile if m_tile <= input.shape[pipeline_axis] else input.shape[pipeline_axis]
-    )
+    parallel_size = input.shape[parallel_axis]
+    pipeline_size = input.shape[pipeline_axis]
+    n_tile = n_tile if n_tile <= parallel_size else parallel_size
+    m_tile = m_tile if m_tile <= pipeline_size else pipeline_size
     # Find the best tile that (a) divides the axis inclusively
     # and (b) satisfies Pallas's sublane alignment
     # requirement: block dims must be divisible by
@@ -193,21 +191,21 @@ def xpose_pipeline(
     # then throw a ValueError
     sublane_multiple = get_dtype_packing(input.dtype) * 8
     n_tile_new = prev_closest_valid_divisor(
-        input.shape[parallel_axis], n_tile, multiple_of=sublane_multiple
+        parallel_size, n_tile, multiple_of=sublane_multiple
     )
-    if input.shape[parallel_axis] % n_tile_new != 0:
+    if parallel_size % n_tile_new != 0:
         raise ValueError(
-            f"No divisor of parallel axis size {input.shape[parallel_axis]} "
+            f"No divisor of parallel axis size {parallel_size} "
             f"is both <= {n_tile} and divisible by {sublane_multiple} "
             f"(dtype={input.dtype}). Consider increasing n_tile and/or padding "
             f"your input to be suble-aligned (i.e. a multiple of {sublane_multiple})."
         )
     m_tile_new = prev_closest_valid_divisor(
-        input.shape[pipeline_axis], m_tile, multiple_of=sublane_multiple
+        pipeline_size, m_tile, multiple_of=sublane_multiple
     )
-    if input.shape[pipeline_axis] % m_tile_new != 0:
+    if pipeline_size % m_tile_new != 0:
         raise ValueError(
-            f"No divisor of pipeline axis size {input.shape[pipeline_axis]} "
+            f"No divisor of pipeline axis size {pipeline_size} "
             f"is both <= {m_tile} and divisible by {sublane_multiple} "
             f"(dtype={input.dtype}). Consider increasing n_tile and/or padding "
             f"your input to be suble-aligned (i.e. a multiple of {sublane_multiple})."
@@ -233,7 +231,7 @@ def xpose_pipeline(
             sublane_multiple,
         )
     n_tile, m_tile = n_tile_new, m_tile_new
-    grid = (input.shape[parallel_axis] // n_tile, input.shape[pipeline_axis] // m_tile)
+    grid = (parallel_size // n_tile, pipeline_size // m_tile)
 
     # Define the input and ouptut shapes and block shapes.
     full_block_shape = list(input.shape)

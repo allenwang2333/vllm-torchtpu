@@ -14,7 +14,6 @@
 """TPU-Friendly MLA Ragged Paged Attention kernel."""
 
 import functools
-import math
 from enum import Enum
 
 import jax
@@ -31,37 +30,44 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _XPOSE_N_TILE_SIZE = envs.MLA_XPOSE_N_TILE_SIZE
+_HBM_BLOCK_SPEC = pl.BlockSpec(memory_space=pltpu.HBM)
+_MLA_IN_SPECS = [_HBM_BLOCK_SPEC] * 5
+_MLA_OUT_SPECS = [_HBM_BLOCK_SPEC] * 2
+_INPUT_OUTPUT_ALIASES = {
+    7: 0,  # Alias output activation with ql_nope
+    11: 1,  # Aliasing cache_kv with updated_cache_kv
+}
 
 
 def unsigned_mod(a, b):
-    exponent = int(math.log2(b))
-    if b == int(math.pow(2, exponent)):
+    b_int = int(b)
+    if b_int > 0 and (b_int & (b_int - 1)) == 0:
         # Use bitmask instead of modulo for efficiency.
-        return a & (b - 1)
+        return a & (b_int - 1)
     return a % b
 
 
 def unsigned_cdiv(a, b):
-    exponent = int(math.log2(b))
-    if b == int(math.pow(2, exponent)):
+    b_int = int(b)
+    if b_int > 0 and (b_int & (b_int - 1)) == 0:
         # Use bit shift instead of division for efficiency.
-        return (a + b - 1) >> exponent
+        return (a + b_int - 1) >> (b_int.bit_length() - 1)
     return (a + b - 1) // b
 
 
 def unsigned_floor_div(a, b):
-    exponent = int(math.log2(b))
-    if b == int(math.pow(2, exponent)):
+    b_int = int(b)
+    if b_int > 0 and (b_int & (b_int - 1)) == 0:
         # Use bit shift instead of division for efficiency.
-        return a >> exponent
+        return a >> (b_int.bit_length() - 1)
     return a // b
 
 
 def unsigned_align_to(a, b):
-    exponent = int(math.log2(b))
-    if b == int(math.pow(2, exponent)):
+    b_int = int(b)
+    if b_int > 0 and (b_int & (b_int - 1)) == 0:
         # Use bitmask instead of division and multiply for efficiency.
-        return (a + b - 1) & (-int(b))
+        return (a + b_int - 1) & (-b_int)
 
     return unsigned_cdiv(a, b) * b
 
@@ -121,12 +127,15 @@ class MlaCase(Enum):
 
     @property
     def symbol(self):
-        return {
-            MlaCase.DECODE: "d",
-            MlaCase.PREFILL: "p",
-            MlaCase.MIXED: "m",
-            MlaCase.BATCHED_DECODE: "bd",
-        }[self]
+        return _MLA_CASE_SYMBOLS[self]
+
+
+_MLA_CASE_SYMBOLS = {
+    MlaCase.DECODE: "d",
+    MlaCase.PREFILL: "p",
+    MlaCase.MIXED: "m",
+    MlaCase.BATCHED_DECODE: "bd",
+}
 
 
 # Expect to run this validation during compile time.
@@ -1789,13 +1798,15 @@ def _mla_ragged_paged_attention_kernel(
     def broadcast_minor(src, shape):
         if src.shape == shape:
             return src
+        src_minor = src.shape[-1]
+        target_end = shape[-1]
         assert src.shape[:-1] == shape[:-1]
-        assert src.shape[-1] % 128 == 0
-        target_minor = unsigned_align_to(shape[-1], src.shape[-1])
+        assert src_minor % 128 == 0
+        target_minor = unsigned_align_to(target_end, src_minor)
         # no-op concatenation.
-        return jnp.concatenate(
-            [src for _ in range(target_minor // src.shape[-1])], axis=-1
-        )[..., : shape[-1]]
+        return jnp.concatenate((src,) * (target_minor // src_minor), axis=-1)[
+            ..., :target_end
+        ]
 
     kv_len_max = kv_lens_ref[batch_start_seq_idx]
     for b in range(1, batch_size):
@@ -2426,7 +2437,7 @@ def mla_ragged_paged_attention(
     )  # [max_num_tokens, num_q_heads, lkv_dim]
     q_pe = prepare_q_inputs(q_pe)  # [max_num_tokens, num_q_heads, r_dim]
     if not transpose_kv_cache:
-        _, _, kv_packing, _ = cache_kv.shape
+        _, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
         new_kv_c = prepare_kv_inputs(
             new_kv_c, kv_packing
         )  # [max_num_tokens_per_kv_packing, kv_packing, lkv_dim]
@@ -2435,7 +2446,9 @@ def mla_ragged_paged_attention(
         )  # [max_num_tokens_per_kv_packing, kv_packing, r_dim]
         lkv_dim = new_kv_c.shape[-1]
         r_dim = new_k_pe.shape[-1]
+        page_size = page_size_per_kv_packing * kv_packing
     else:
+        _, _, page_size = cache_kv.shape
         new_kv_c = prepare_kv_inputs_for_transposed_kv_cache(
             new_kv_c
         )  # [lkv_dim, max_num_tokens]
@@ -2444,12 +2457,6 @@ def mla_ragged_paged_attention(
         )  # [r_dim, max_num_tokens]
         lkv_dim = new_kv_c.shape[0]
         r_dim = new_k_pe.shape[0]
-
-    if not transpose_kv_cache:
-        _, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
-        page_size = page_size_per_kv_packing * kv_packing
-    else:
-        _, _, page_size = cache_kv.shape
     _, num_q_heads, _ = ql_nope.shape
     max_num_seqs = kv_lens.shape[0]
     num_page_indices = page_indices.shape[0]
@@ -2500,19 +2507,6 @@ def mla_ragged_paged_attention(
         # We have 12 total tokens, so normally we would only allocate 12/4=3 words
         # But due to misalignment, we need to allocate 5 words.
         grid = ((end_seq_idx - start_seq_idx) // batch_size,)
-
-        in_specs = [
-            pl.BlockSpec(memory_space=pltpu.HBM),  # ql_nope
-            pl.BlockSpec(memory_space=pltpu.HBM),  # q_pe
-            pl.BlockSpec(memory_space=pltpu.HBM),  # new_kv_c
-            pl.BlockSpec(memory_space=pltpu.HBM),  # new_k_pe
-            pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv
-        ]
-
-        out_specs = [
-            pl.BlockSpec(memory_space=pltpu.HBM),  # o
-            pl.BlockSpec(memory_space=pltpu.HBM),  # updated_cache_kv
-        ]
 
         if not transpose_kv_cache:
             bkv_sz_per_kv_packing = bkv_p * page_size_per_kv_packing
@@ -2624,8 +2618,8 @@ def mla_ragged_paged_attention(
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
-                    in_specs=in_specs,
-                    out_specs=out_specs,
+                    in_specs=_MLA_IN_SPECS,
+                    out_specs=_MLA_OUT_SPECS,
                     grid=grid,
                     scratch_shapes=scratch_shapes,
                 ),
@@ -2638,10 +2632,7 @@ def mla_ragged_paged_attention(
                     jax.ShapeDtypeStruct(shape=ql_nope.shape, dtype=ql_nope.dtype),
                     jax.ShapeDtypeStruct(shape=cache_kv.shape, dtype=cache_kv.dtype),
                 ],
-                input_output_aliases={
-                    7: 0,  # Alias output activation with ql_nope
-                    11: 1,  # Aliasing cache_kv with updated_cache_kv
-                },
+                input_output_aliases=_INPUT_OUTPUT_ALIASES,
                 name=scope_name,
             )
         )
