@@ -43,7 +43,6 @@ import torch.nn.functional as F
 from jax.sharding import PartitionSpec as P
 
 from vllm.forward_context import get_forward_context
-from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_callable
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.logger import init_logger
@@ -62,6 +61,35 @@ _DEFAULT_VERIFY_BUCKETS = (4, 8, 12, 16, 20, 24, 32)
 def _need(cond: bool, msg: str) -> None:
     if not cond:
         raise ValueError(f"Qwen3.5 megakernel: {msg}")
+
+
+def _build_tp_rank_mesh(tp_size: int) -> jax.sharding.Mesh:
+    """Build a 1D `'tp'` JAX Mesh whose partition index `me` equals `tp_rank`.
+
+    Unlike `build_ep_mesh` (which sorts devices by physical TPU `device_id`,
+    permuting `me` vs `tp_rank` on `tpu7x` hosts where ranks `0..7` map to
+    device IDs `[0, 1, 4, 5, 6, 7, 2, 3]`), `Qwen35Megakernel` and
+    `Qwen35MTPMegakernel` index both EP expert ownership (`r0 == me`,
+    `pick_r == me`) and sequence-split full-attention KV-head groups (`me ^ off`
+    for `off in 1..3`) directly by `me = lax.axis_index("tp")`, requiring
+    `me == tp_rank == ep_rank`.
+    """
+    try:
+        from torch_tpu._internal.pallas import get_pallas_mesh
+
+        mesh = get_pallas_mesh(axis_names=("tp",))
+        if int(mesh.devices.size) == int(tp_size):
+            logger.info(
+                "Built Qwen3.5 megakernel rank-ordered mesh | axis=tp | "
+                "size=%d | device_ids=%s",
+                tp_size,
+                [int(d.id) for d in mesh.devices.flat],
+            )
+            return mesh
+    except Exception:
+        pass
+    devices = jax.devices()[:tp_size]
+    return jax.sharding.Mesh(devices, ("tp",))
 
 
 # Persistent megakernel inputs must be torch_tpu base buffers. A tensor whose
@@ -1585,10 +1613,7 @@ class Qwen35Megakernel:
         )
 
         if mesh is None:
-            mesh = build_ep_mesh(axis_name="tp")
-        if mesh is None:
-            devices = jax.devices()[: self.tp_size]
-            mesh = jax.sharding.Mesh(devices, ("tp",))
+            mesh = _build_tp_rank_mesh(self.tp_size)
         self.mesh = mesh
 
         with torch.no_grad():
