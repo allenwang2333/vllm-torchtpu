@@ -4908,6 +4908,12 @@ class TPUModelRunner(GPUModelRunner):
             model = load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
+        # Diagnostic branch only: candidate fix. Model construction leaves each
+        # attention layer's torch.tensor([]) kv_cache placeholder as a pending
+        # zero-element copy; a sync here materializes them on every boot rather
+        # than on the ~1 in 8 where a deferred-graph cut happens to take one.
+        if os.environ.get("DIAG_SYNC_AFTER_LOAD") == "1":
+            torch.accelerator.synchronize()
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
         if self.is_pooling_model:
