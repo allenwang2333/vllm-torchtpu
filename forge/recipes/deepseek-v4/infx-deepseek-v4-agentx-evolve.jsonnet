@@ -212,8 +212,7 @@ local extraVllmArgs = cdk.var('EXTRA_VLLM_ARGS', '');
 
 // --- Speculative decoding ------------------------------------------------------
 // SPEC_METHOD=dspark serves the DSpark draft that ships in the target checkpoint (mtp.0-2.*, config.json
-// dspark_block_size=5), as the InferenceX B200 run does with its own DSpark checkpoint. The TPU proposer only
-// drafts greedily and only a whole block, so NUM_SPEC_TOKENS must equal dspark_block_size. Empty = off.
+// dspark_block_size=5), as the InferenceX B200 run does (K=6, probabilistic drafts, synthetic AL 3.77). Empty = off.
 // The draft holds ~4.2 GiB of HBM per rank (j-9719749f-0a6b-47c7-b249: 77.64 vs 73.44 GiB used), so at
 // GPU_MEMORY_UTILIZATION=0.90 the KV cache no longer fits one MAX_MODEL_LEN=1048576 request; raise it with this.
 local specMethod = cdk.var('SPEC_METHOD', '');
@@ -224,11 +223,15 @@ local numSpecTokens = cdk.numVar('NUM_SPEC_TOKENS', 5);
 // golden curve for DeepSeek-V4-Pro-0813 DSpark is K1 1.84, K2 2.51, K3 3.01, K4 3.36, K5 3.61, K6 3.77.
 // Empty = real rejection sampling.
 local specSyntheticAl = cdk.var('SPEC_SYNTHETIC_AL', '');
+// SPEC_DRAFT_SAMPLE=probabilistic draws drafts from the draft distribution at the request's temperature
+// (vLLM draft_sample_method); on TPU it needs SPEC_SYNTHETIC_AL. Empty = greedy drafting.
+local specDraftSample = cdk.var('SPEC_DRAFT_SAMPLE', '');
 local specConfig =
   if specMethod == '' then ''
   else if specMethod == 'dspark' then
-    '{"method":"dspark","num_speculative_tokens":%d%s}' % [
+    '{"method":"dspark","num_speculative_tokens":%d%s%s}' % [
       numSpecTokens,
+      if specDraftSample == '' then '' else ',"draft_sample_method":"%s"' % specDraftSample,
       if specSyntheticAl == '' then ''
       else ',"rejection_sample_method":"synthetic","synthetic_acceptance_length":%s' % specSyntheticAl,
     ]
