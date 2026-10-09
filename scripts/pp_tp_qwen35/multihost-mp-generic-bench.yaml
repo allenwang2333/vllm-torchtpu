@@ -317,13 +317,13 @@ spec:
                       lm_eval --model local-chat-completions --apply_chat_template \
                         --include_path /tmp/infx_tasks \
                         --tasks gsm8k_infx \
-                        --model_args "model=${MODEL_ID},base_url=http://${VLLM_SERVER_DNS}:${SERVER_PORT}/v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=16,timeout=1800,tokenized_requests=False,max_length=9472" \
+                        --model_args "model=${MODEL_ID},base_url=http://${VLLM_SERVER_DNS}:${SERVER_PORT}/v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=32,timeout=1800,tokenized_requests=False,max_length=9472" \
                         --gen_kwargs max_tokens=5376,temperature=0,top_p=1 \
                         --output_path "${CDK_OUTPUT_DIR:-/tmp}/eval_suite_a" || true
 
                       echo "=== Suite B1: Standard lm_eval GSM8K (local-chat-completions --apply_chat_template) ==="
                       lm_eval --model local-chat-completions --apply_chat_template \
-                        --model_args "model=${MODEL_ID},base_url=http://${VLLM_SERVER_DNS}:${SERVER_PORT}/v1/chat/completions,num_concurrent=16,max_retries=5,timeout=1800,tokenized_requests=False" \
+                        --model_args "model=${MODEL_ID},base_url=http://${VLLM_SERVER_DNS}:${SERVER_PORT}/v1/chat/completions,num_concurrent=32,max_retries=5,timeout=1800,tokenized_requests=False" \
                         --tasks gsm8k \
                         --output_path "${CDK_OUTPUT_DIR:-/tmp}/eval_suite_b1" || true
                     fi
