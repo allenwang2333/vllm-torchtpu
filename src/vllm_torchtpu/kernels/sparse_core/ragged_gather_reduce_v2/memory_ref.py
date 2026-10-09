@@ -49,7 +49,7 @@ class ScratchRef:
             num_rows_per_row_partition_vmem=pltpu.VMEM((num_simd_lanes,), jnp.int32),
             next_window_first_row_vmem=pltpu.VMEM((num_simd_lanes,), jnp.int32),
             prev_iter_last_row_vmem=pltpu.VMEM(
-                (cfg.col_size // cfg.col_chunk_size, cfg.col_chunk_size),
+                (cfg.num_col_chunks, cfg.col_chunk_size),
                 jnp.float32,
             ),
             prev_dst_row_smem=pltpu.SMEM((1,), jnp.int32),

@@ -12,6 +12,12 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import (
     memory_ref,
 )
 
+_SC_RGR_V2_COMPILER_PARAMS = pltpu.CompilerParams(
+    use_tc_tiling_on_sc=True,
+    disable_bounds_checks=True,
+    needs_layout_passes=False,
+)
+
 
 def _fallback_implementation(
     x: jax.Array,
@@ -59,7 +65,8 @@ def _preprocess_scalar_data(
     )
 
     padding = cfg.row_partition_size_padded - cfg.row_partition_size
-    sorted_by_validity = jnp.pad(sorted_by_validity, ((0, 0), (0, padding)))
+    if padding:
+        sorted_by_validity = jnp.pad(sorted_by_validity, ((0, 0), (0, padding)))
     sorted_by_validity = sorted_by_validity.reshape(-1)
 
     num_src_rows_per_row_partition = jnp.pad(
@@ -162,11 +169,12 @@ def ragged_gather_reduce_v2(
 
     # Pad the input so each row partition holds a whole number of reduce
     # groups; no group is then split across two physical cores.
-    valid_rows_mask = jnp.pad(
-        valid_rows_mask,
-        (0, cfg.padded_input_size - cfg.input_size),
-        constant_values=False,
-    )
+    if cfg.padded_input_size != cfg.input_size:
+        valid_rows_mask = jnp.pad(
+            valid_rows_mask,
+            (0, cfg.padded_input_size - cfg.input_size),
+            constant_values=False,
+        )
 
     scalar, mask = _preprocess_scalar_data(indices, valid_rows_mask, cfg)
 
@@ -188,11 +196,7 @@ def ragged_gather_reduce_v2(
             ),
             jnp.float32,
         ),
-        compiler_params=pltpu.CompilerParams(
-            use_tc_tiling_on_sc=True,
-            disable_bounds_checks=True,
-            needs_layout_passes=False,
-        ),
+        compiler_params=_SC_RGR_V2_COMPILER_PARAMS,
         scratch_types=(memory_ref.ScratchRef.create_scratch_types(cfg),),
         mesh=vector_mesh,
         name="sc_ragged_gather_reduce_v2",
@@ -201,5 +205,5 @@ def ragged_gather_reduce_v2(
     # Step 5: Post-process the output (drop padding, zero empty groups, cast).
     out = out[: cfg.output_size, : cfg.hidden_size]
     # TODO(kyuyeunk): Use zero initialization instead of masking.
-    out = jnp.where(mask[: cfg.output_size, None], out, jnp.zeros_like(out))
+    out = jnp.where(mask[: cfg.output_size, None], out, 0)
     return out.astype(x.dtype)

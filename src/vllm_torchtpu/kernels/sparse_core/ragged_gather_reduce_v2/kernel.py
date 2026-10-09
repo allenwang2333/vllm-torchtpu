@@ -345,16 +345,16 @@ def _col_kernel(
         col_slice = pl.ds(col_compute_offset, num_simd_lanes)
         # Running sum, seeded by the carry from the previous sub-chunk.
         previous_accumulated_data = refs.scratch.prev_iter_last_row_vmem[c, col_slice]
+        is_bf16 = cfg.in_dtype == jnp.bfloat16
+        upper_mask = jnp.uint32(0xFFFF0000)
         for row_src in range(num_simd_lanes):
             val_u32 = gather_ref[row_src, col_slice]
-            if cfg.in_dtype == jnp.bfloat16:
+            if is_bf16:
                 # The two bfloat16 rows packed in one uint32 word sit in the low
                 # (even row) or high (odd row) 16 bits. Shift the wanted half
                 # into the float32 sign/exponent position and clear the rest.
                 is_even_row = jnp.bitwise_and(src_idx_slice[row_src], 1) == 0
                 shift = jnp.where(is_even_row, 16, 0)
-                lower_mask = jnp.uint32(jnp.iinfo(jnp.uint16).max)
-                upper_mask = jnp.left_shift(lower_mask, 16)
                 shifted = jnp.bitwise_and(jnp.left_shift(val_u32, shift), upper_mask)
                 data_f32 = plsc.bitcast(shifted, jnp.float32)
             else:

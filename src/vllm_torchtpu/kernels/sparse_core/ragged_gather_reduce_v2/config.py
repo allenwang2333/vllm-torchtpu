@@ -1,4 +1,5 @@
 import dataclasses
+import functools
 from typing import Any
 
 import jax
@@ -71,7 +72,7 @@ class Config:
     def in_dtype_bytes(self) -> int:
         return jax.dtypes.itemsize_bits(self.in_dtype) // 8
 
-    @property
+    @functools.cached_property
     def padded_input_size(self) -> int:
         align_val = self.num_row_partitions * self.reduce_group_size
         return _align_to(self.input_size, align_val)
@@ -91,7 +92,7 @@ class Config:
     def row_partition_size(self) -> int:
         return self.padded_input_size // self.num_row_partitions
 
-    @property
+    @functools.cached_property
     def row_partition_size_padded(self) -> int:
         # Pad each partition to a whole number of windows (fixed per-window DMA size).
         return _align_to(self.row_partition_size, self.window_size)
@@ -100,7 +101,7 @@ class Config:
     def max_blocks_per_partition(self) -> int:
         return pl.cdiv(self.row_partition_size, self.row_chunk_size)
 
-    @property
+    @functools.cached_property
     def max_window(self) -> int:
         """Largest window of row-blocks whose resident sort permutation fits SPMEM.
 
@@ -129,7 +130,7 @@ class Config:
         """Number of rows whose sort permutation is resident per window."""
         return self.max_window * self.row_chunk_size
 
-    @property
+    @functools.cached_property
     def row_chunk_size(self) -> int:
         """Number of rows handled per row-pipeline block."""
         return self.get_row_chunk_size(self.num_row_partitions)
@@ -158,7 +159,7 @@ class Config:
         )
         return num_row_partitions
 
-    @property
+    @functools.cached_property
     def num_column_partitions(self) -> int:
         """Calculates the number of row partitions."""
         # DMA constraint requires column partition to be multiple of lane size.
@@ -208,7 +209,7 @@ class Config:
         """Calculates the column size."""
         return self.aligned_hidden_size // self.num_column_partitions
 
-    @property
+    @functools.cached_property
     def col_chunk_size(self) -> int:
         """Picks the column chunk size the inner pipeline gathers at a time.
 

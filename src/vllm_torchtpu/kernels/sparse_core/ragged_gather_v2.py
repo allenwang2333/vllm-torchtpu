@@ -23,6 +23,12 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.sparse_core import core_map_helper
 
+_SC_GATHER_V2_COMPILER_PARAMS = pltpu.CompilerParams(
+    use_tc_tiling_on_sc=True,
+    needs_layout_passes=True,
+    disable_bounds_checks=True,
+)
+
 
 def calculate_col_size(hidden_size: int, packing: int) -> int:
     """Calculates the max column size bounded by VMEM limits and
@@ -73,7 +79,8 @@ def main_kernel_v2(
     assert sc_info is not None
     num_simd_lanes = sc_info.num_lanes
     hidden_size = in_hbm_ref.shape[-1]
-    dtype_bits = jax.dtypes.itemsize_bits(out_hbm_ref.dtype)
+    dtype = out_hbm_ref.dtype
+    dtype_bits = jax.dtypes.itemsize_bits(dtype)
     packing = 32 // dtype_bits
     col_size = calculate_col_size(hidden_size, packing)
 
@@ -103,10 +110,6 @@ def main_kernel_v2(
     num_blocks = jnp.where(end <= start, 0, num_blocks)
 
     num_cols = pl.cdiv(hidden_size, col_size)
-
-    dtype = out_hbm_ref.dtype
-    dtype_bits = jax.dtypes.itemsize_bits(dtype)
-    packing = 32 // dtype_bits
 
     core_index = lax.axis_index((core_axis_name, subcore_axis_name))
 
@@ -260,7 +263,8 @@ def ragged_gather_v2(
     block_size = row_chunk_size * num_cores
 
     out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size
-    indices = jnp.pad(indices, ((0, out_pad_size)))
+    if out_pad_size:
+        indices = jnp.pad(indices, ((0, out_pad_size)))
 
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
@@ -278,11 +282,7 @@ def ragged_gather_v2(
         out_type=jax.ShapeDtypeStruct(
             (out_size + out_pad_size, aligned_hidden_size), dtype
         ),
-        compiler_params=pltpu.CompilerParams(
-            use_tc_tiling_on_sc=True,
-            needs_layout_passes=True,
-            disable_bounds_checks=True,
-        ),
+        compiler_params=_SC_GATHER_V2_COMPILER_PARAMS,
         scratch_types=[
             pltpu.VMEM((16,), jnp.int32),
             pltpu.VMEM((16,), jnp.int32),

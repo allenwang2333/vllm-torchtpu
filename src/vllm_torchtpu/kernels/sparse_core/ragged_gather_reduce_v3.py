@@ -37,6 +37,13 @@ _ROUTE_INDEX_BITS = 20
 _ROUTE_INDEX_MASK = (1 << _ROUTE_INDEX_BITS) - 1
 
 
+_SC_RGR_V3_COMPILER_PARAMS = pltpu.CompilerParams(
+    use_tc_tiling_on_sc=True,
+    disable_bounds_checks=True,
+    needs_layout_passes=False,
+)
+
+
 def _align_to(value: int, alignment: int) -> int:
     return pl.cdiv(value, alignment) * alignment
 
@@ -54,6 +61,7 @@ def _fallback_implementation(
     return jnp.sum(out, axis=1).astype(x.dtype)
 
 
+@functools.lru_cache(maxsize=64)
 def _calculate_num_column_partitions(
     hidden_size: int, num_cores: int, num_lanes: int
 ) -> int:
@@ -337,11 +345,12 @@ def ragged_gather_reduce(
     reduce_group_size: int,
 ) -> jax.Array:
     """Destination-major prototype for MoE output combine."""
-    sc_info = pltpu.get_tpu_info().sparse_core
+    tpu_info = pltpu.get_tpu_info()
+    sc_info = tpu_info.sparse_core
     if (
         sc_info is None
         or x.dtype != jnp.bfloat16
-        or x.shape[-1] % pltpu.get_tpu_info().num_lanes != 0
+        or x.shape[-1] % tpu_info.num_lanes != 0
     ):
         return _fallback_implementation(
             x,
@@ -351,7 +360,7 @@ def ragged_gather_reduce(
             reduce_group_size,
         )
     dtype_bytes = jax.dtypes.itemsize_bits(x.dtype) // 8
-    if jnp.size(x) * dtype_bytes * 2 < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6:
+    if jnp.size(x) * dtype_bytes * 2 < tpu_info.vmem_capacity_bytes * 0.6:
         return _fallback_implementation(
             x,
             indices,
@@ -373,9 +382,7 @@ def ragged_gather_reduce(
             f"destination-major prototype supports at most "
             f"{1 << _ROUTE_INDEX_BITS} source rows, got {x.shape[0]}"
         )
-    num_column_partitions, num_row_partitions = partition_counts(
-        hidden_size, pltpu.get_tpu_info()
-    )
+    num_column_partitions, num_row_partitions = partition_counts(hidden_size, tpu_info)
 
     token_alignment = num_row_partitions * _TOKEN_BLOCK
     padded_num_tokens = _align_to(num_tokens, token_alignment)
@@ -456,11 +463,7 @@ def ragged_gather_reduce(
             topk=reduce_group_size,
         ),
         out_type=jax.ShapeDtypeStruct((padded_num_tokens, hidden_size), jnp.bfloat16),
-        compiler_params=pltpu.CompilerParams(
-            use_tc_tiling_on_sc=True,
-            disable_bounds_checks=True,
-            needs_layout_passes=False,
-        ),
+        compiler_params=_SC_RGR_V3_COMPILER_PARAMS,
         scratch_types=(
             pltpu.VMEM((_TOKEN_BLOCK, col_size), jnp.float32),
             pltpu.VMEM((2, _TOKEN_SUBCHUNK // 2, col_size), jnp.uint32),
