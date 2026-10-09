@@ -84,7 +84,13 @@ spec:
                 # google-pytorch/torch_tpu#4387 build (standalone subgroups).
                 # Set TORCH_TPU_WHEEL="" to keep the image's torch_tpu.
                 - name: TORCH_TPU_WHEEL
-                  value: '{{ .TORCH_TPU_WHEEL | default "gs://yinlin-tpu-bucket-us/pp4pcp2/torch_tpu-0.1.2.dev20261006192405-cp312-cp312-manylinux_2_31_x86_64.whl" }}'
+                  value: '{{ .TORCH_TPU_WHEEL | default "gs://yinlin-tpu-bucket-us/shriharim-pptp/wheels/torch_tpu-0.1.2.dev20261006192405-cp312-cp312-manylinux_2_31_x86_64.whl" }}'
+                # libtpu override. Standalone-subgroup (sub-slice) programs on
+                # libtpu 0.0.47 fail with "HLO all-reduce-start is not
+                # implemented on TPU"; sglang PR 869 validated #4387 with
+                # 0.0.49. Set LIBTPU_WHEEL="" to keep the image's libtpu.
+                - name: LIBTPU_WHEEL
+                  value: '{{ .LIBTPU_WHEEL | default "gs://yinlin-tpu-bucket-us/shriharim-pptp/wheels/libtpu-0.0.49-cp312-cp312-manylinux_2_31_x86_64.whl" }}'
                 command: ["/bin/bash", "-c"]
                 args:
                   - |
@@ -95,11 +101,18 @@ spec:
 
                     if [ -n "${TORCH_TPU_WHEEL}" ]; then
                       echo "Installing torch_tpu override: ${TORCH_TPU_WHEEL}"
-                      mkdir -p /tmp/wheels
-                      gcloud storage cp "${TORCH_TPU_WHEEL}" /tmp/wheels/
-                      pip install --no-deps --force-reinstall --quiet /tmp/wheels/*.whl
+                      mkdir -p /tmp/wheels/torch_tpu
+                      gcloud storage cp "${TORCH_TPU_WHEEL}" /tmp/wheels/torch_tpu/
+                      pip install --no-deps --force-reinstall --quiet /tmp/wheels/torch_tpu/*.whl
                       pip show torch_tpu | grep -E "^(Name|Version)"
                       python3 -c "from torch_tpu._internal.distributed.spmd_util import make_standalone; print('make_standalone: OK')"
+                    fi
+                    if [ -n "${LIBTPU_WHEEL}" ]; then
+                      echo "Installing libtpu override: ${LIBTPU_WHEEL}"
+                      mkdir -p /tmp/wheels/libtpu
+                      gcloud storage cp "${LIBTPU_WHEEL}" /tmp/wheels/libtpu/
+                      pip install --no-deps --force-reinstall --quiet /tmp/wheels/libtpu/*.whl
+                      pip show libtpu | grep -E "^(Name|Version)"
                     fi
 
                     if [ -d "/workspace/vllm-torchtpu/src/vllm_torchtpu" ]; then
