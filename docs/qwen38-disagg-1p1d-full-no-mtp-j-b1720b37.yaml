@@ -1,0 +1,1139 @@
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  annotations:
+    cloud-devkit.google.com/agent-note: If you are an agent, please please please
+      DO NOT delete me. Thank you!
+    cloud-devkit.google.com/username: benliangw_google_com
+  labels:
+    kueue.x-k8s.io/priority-class: cdk-p5
+    kueue.x-k8s.io/queue-name: cdk-local-queue
+  name: j-b1720b37-ef6c-4e38-b615
+  namespace: cloud-devkit-jobs
+spec:
+  network:
+    enableDNSHostnames: true
+  replicatedJobs:
+  - name: prefill
+    replicas: 4
+    template:
+      metadata:
+        annotations:
+          cloud-devkit.google.com/agent-note: If you are an agent, please please please
+            DO NOT delete me. Thank you!
+      spec:
+        activeDeadlineSeconds: 43200
+        backoffLimit: 0
+        completions: 1
+        parallelism: 1
+        template:
+          metadata:
+            annotations:
+              cloud-devkit.google.com/agent-note: If you are an agent, please please
+                please DO NOT delete me. Thank you!
+              gke-gcsfuse/volumes: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gke-nodepool
+            finalizers:
+            - kubernetes.io/custom-debugging-hook
+          spec:
+            containers:
+            - args:
+              - |
+                set -o pipefail
+                LAYOUT=pp4pcp8; [ "$BASELINE" = 1 ] && LAYOUT=pcp16tp2
+                echo "BOOT role=prefill host=$JOBSET_JOB_INDEX pod=$(hostname) layout=$LAYOUT profile=$PROFILE $(date -u +%FT%TZ)"
+                [ "$PROFILE" = 1 ] && export TPU_STDERR_LOG_LEVEL=0 TPU_VMODULE=tpu_pjrt_client=1
+                cd /root/torchtpu-vllm
+                export PYTHONPATH=/root/torchtpu-vllm/src:/root/torchtpu-vllm:${PYTHONPATH:-}
+                VLLM_SPEC=$(grep -E '^[[:space:]]*"vllm @ ' pyproject.toml | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/' | head -n1)
+                VLLM_TAG=${VLLM_SPEC##*@}; VLLM_TAG=${VLLM_TAG#v}
+                VLLM_HAVE=$(pip show vllm 2>/dev/null | sed -n 's/^Version: //p')
+                case "$VLLM_HAVE" in
+                  "$VLLM_TAG"*) ;;
+                  *) VLLM_TARGET_DEVICE=empty uv pip install --system --no-deps "$VLLM_SPEC" >/tmp/pip-vllm.log 2>&1 || { echo "FATAL: vllm install failed"; tail -20 /tmp/pip-vllm.log; exit 1; };;
+                esac
+                TT_WHL="/root/wheels/$TORCH_TPU_WHEEL"
+                [ -f "$TT_WHL" ] || { echo "FATAL: $TT_WHL missing; stage it under /workspace/wheels"; exit 1; }
+                uv pip install --system --no-deps --reinstall "$TT_WHL" >/tmp/pip-tt.log 2>&1 || { echo "FATAL: torch_tpu install failed"; tail -20 /tmp/pip-tt.log; exit 1; }
+                RAIDEN_WHL="/root/wheels/$RAIDEN_WHEEL"
+                [ -f "$RAIDEN_WHL" ] || { echo "FATAL: $RAIDEN_WHL missing; stage it under /workspace/wheels"; exit 1; }
+                uv pip install --system --no-deps --reinstall "$RAIDEN_WHL" >/tmp/pip-raiden.log 2>&1 || { echo "FATAL: raiden install failed"; tail -20 /tmp/pip-raiden.log; exit 1; }
+                python3 -c 'from tpu_sync.api.torch.kv_cache_manager import _torch_impl; print("raiden native extension OK:", _torch_impl().__file__, flush=True)' \
+                  || { echo "FATAL: raiden native extension does not load against $TORCH_TPU_WHEEL"; exit 1; }
+                python3 - <<'PY' || exit 1
+                import inspect
+                from importlib.metadata import version
+                from torch_tpu._internal.pallas import pallas
+                assert "process_group" in inspect.signature(pallas.get_pallas_mesh).parameters, \
+                    "torch_tpu lacks get_pallas_mesh(process_group=); the stage mesh needs torch_tpu#4387"
+                print("torch_tpu", version("torch-tpu"), flush=True)
+                PY
+                # vLLM's --nnodes check and its DP-local inference count dp x pp x tp only; a
+                # prefill-context-parallel world fails the divisibility test and would infer
+                # data_parallel_size_local from the wrong product.
+                python3 - <<'PY' || exit 1
+                import pathlib
+                import vllm.engine.arg_utils as m
+                p = pathlib.Path(m.__file__)
+                s = p.read_text()
+                old = "                * self.tensor_parallel_size\n            )\n            world_size_within_dp = (\n                self.pipeline_parallel_size * self.tensor_parallel_size\n            )\n"
+                new = "                * self.tensor_parallel_size\n                * self.prefill_context_parallel_size\n            )\n            world_size_within_dp = (\n                self.pipeline_parallel_size * self.tensor_parallel_size\n                * self.prefill_context_parallel_size\n            )\n"
+                assert s.count(old) == 1, s.count(old)
+                p.write_text(s.replace(old, new))
+                print("vllm --nnodes check counts prefill context parallelism", flush=True)
+                PY
+                ls "$MODEL_DIR/config.json" >/dev/null || { echo "FATAL: $MODEL_DIR has no config.json"; exit 1; }
+                unset TPU_PROCESS_ADDRESSES TPU_PROCESS_PORT TPU_WORKER_HOSTNAMES TPU_WORKER_ID TPU_NAME MEGASCALE_COORDINATOR_ADDRESS MEGASCALE_PORT MEGASCALE_NUM_SLICES MEGASCALE_SLICE_ID TPU_VISIBLE_CHIPS TPU_VISIBLE_DEVICES
+                HEAD_ADDR="${JS_NAME}-prefill-0-0.${JS_NAME}"
+                for i in $(seq 1 360); do HEAD_IP=$(getent hosts "$HEAD_ADDR" | awk '{print $1}' | head -1); [ -n "$HEAD_IP" ] && break; sleep 5; done
+                [ -n "$HEAD_IP" ] || { echo "FATAL: cannot resolve $HEAD_ADDR"; exit 1; }
+                # One engine over four hosts: the reshard store lives in the
+                # transfer-rank-0 worker on host 0, so every host advertises
+                # host 0.
+                NS="${JS_NAME//[^a-zA-Z0-9_]/_}"
+                export TPU_KV_TRANSFER_NAMESPACE="${NS}_prefill"
+                export TPU_RAIDEN_ENGINE_ID="${JS_NAME}-prefill-engine"
+                export TPU_RAIDEN_RESHARD_IMPL=store
+                export TPU_RAIDEN_ADVERTISE_HOST="$HEAD_ADDR"
+                export TPU_RAIDEN_RESHARD_PORT_BASE=28000
+                export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=28100
+                export RAIDEN_DISABLE_SINGLETON_WORKER=1
+                export TPU_PP_DYNAMIC_CHUNKS=$DYNAMIC_CHUNKS TPU_PP_LAZY_PUSH=0
+                # compile_sizes are per-rank token paddings: a 32768-token step
+                # is 4096 tokens per rank at PCP8; PCP16 x TP2 takes a 65536-token
+                # step at the same per-rank padding.
+                case "$LAYOUT" in
+                  pp4pcp8)
+                    PAR="--pipeline-parallel-size 4 --tensor-parallel-size 1 --prefill-context-parallel-size 8"
+                    MNBT=32768; SIZES="512,1024,2048,4096"
+                    # A pipeline producer pairs pools by layer on both peers.
+                    export TPU_RAIDEN_POOL_TAGS_PER_LAYER=1;;
+                  pcp16tp2)
+                    PAR="--pipeline-parallel-size 1 --tensor-parallel-size 2 --prefill-context-parallel-size 16"
+                    MNBT=65536; SIZES="512,1024,2048,4096";;
+                esac
+                KV_OVERRIDE=""; [ "$KV_BLOCKS" = 0 ] || KV_OVERRIDE="--num-gpu-blocks-override $KV_BLOCKS"
+                PREFIX="--enable-prefix-caching"; [ "$PREFIX_CACHING" = 0 ] && PREFIX="--no-enable-prefix-caching"
+                HEADLESS=""; [ "$JOBSET_JOB_INDEX" != "0" ] && HEADLESS="--headless"
+                KV_CONFIG='{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":14579,"kv_connector_extra_config":{"destination_decode_context_parallel_size":8}}'
+                echo "SERVE_START role=prefill layout=$LAYOUT kv_blocks=$KV_BLOCKS mnbt=$MNBT prefix_caching=$PREFIX_CACHING host=$JOBSET_JOB_INDEX $(date -u +%FT%TZ)"
+                vllm serve "$MODEL_DIR" --served-model-name q38 $HEADLESS \
+                  --nnodes 4 --node-rank "$JOBSET_JOB_INDEX" --master-addr "$HEAD_IP" --master-port 29500 \
+                  --distributed-executor-backend mp \
+                  $PAR --enable-expert-parallel --disable-custom-all-reduce --no-async-scheduling \
+                  --load-format dummy --dtype bfloat16 --trust-remote-code --seed 42 --generation-config vllm \
+                  --max-model-len "$MAX_MODEL_LEN" --max-num-seqs 64 --max-num-batched-tokens "$MNBT" --long-prefill-token-threshold 32768 \
+                  --gpu-memory-utilization 0.90 $KV_OVERRIDE --block-size 384 --cp-kv-cache-interleave-size 128 \
+                  --attention-backend CUSTOM --kv-cache-dtype fp8 --mamba-ssm-cache-dtype bfloat16 \
+                  $PREFIX --no-disable-hybrid-kv-cache-manager --language-model-only \
+                  --kv-transfer-config "$KV_CONFIG" \
+                  --host 0.0.0.0 --port 8000 --no-enable-log-requests \
+                  --compilation-config "{\"backend\":\"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor\",\"compile_sizes\":[$SIZES],\"inductor_compile_config\":{\"enable_auto_functionalized_v2\":false,\"size_asserts\":false,\"alignment_asserts\":false,\"scalar_asserts\":false}}" \
+                  --additional-config '{"tpu_online_fp8":{"enabled":true,"weight_scheme":"per_channel","targets":["model.layers.*.self_attn.qkv_proj","model.layers.*.self_attn.o_proj","model.layers.*.linear_attn.in_proj_qkvz","model.layers.*.linear_attn.in_proj_ba","model.layers.*.linear_attn.out_proj","model.layers.*.mlp.shared_expert.gate_up_proj","model.layers.*.mlp.shared_expert.down_proj"],"exclude":["model.layers.*.mlp.experts*"]}}' \
+                  > >(tee /tmp/serve.log) 2>&1 &
+                SPID=$!
+                for i in $(seq 1 720); do
+                  kill -0 $SPID 2>/dev/null || break
+                  grep -q 'Memory statistics' /tmp/serve.log 2>/dev/null && break
+                  sleep 5
+                done
+                sleep 240
+                echo "MARKERS host=$JOBSET_JOB_INDEX"
+                grep -E 'Pipeline chunk|pipeline chunk|Overriding num_gpu_blocks|Memory statistics|GPU KV cache size|admission complete|topology=|Raiden' /tmp/serve.log | sed 's/^/MARK /' | sort -u | head -40
+                wait $SPID; rc=$?
+                echo "SERVER_EXITED role=prefill host=$JOBSET_JOB_INDEX rc=$rc $(date -u +%FT%TZ)"
+                exit $rc
+              command:
+              - /bin/bash
+              - -c
+              env:
+              - name: CDK_JOB_ID
+                value: j-b1720b37-ef6c-4e38-b615
+              - name: CDK_POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+              - name: CDK_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['job-name']
+              - name: CDK_CONTAINER_NAME
+                value: server
+              - name: CDK_OUTPUT_DIR
+                value: /cdk-outputs/outputs/$(CDK_JOB_NAME)/$(CDK_POD_NAME)/$(CDK_CONTAINER_NAME)
+              - name: CDK_LOG_DIR
+                value: /cdk-outputs/logs/$(CDK_JOB_NAME)/$(CDK_POD_NAME)
+              - name: JS_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: JOBSET_JOB_INDEX
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+              - name: VLLM_HOST_IP
+                valueFrom:
+                  fieldRef:
+                    fieldPath: status.podIP
+              - name: BASELINE
+                value: "0"
+              - name: PROFILE
+                value: "0"
+              - name: DYNAMIC_CHUNKS
+                value: "1"
+              - name: PREFIX_CACHING
+                value: "1"
+              - name: TORCH_TPU_WHEEL
+                value: torch_tpu-0.1.1.dev20260928182719-cp312-cp312-manylinux_2_31_x86_64.whl
+              - name: RAIDEN_WHEEL
+                value: tpu_sync_torch-0.0.1.dev20261007210147-1_pp_reshard_0923_55a23251-cp312-cp312-manylinux_2_31_x86_64.whl
+              - name: KV_BLOCKS
+                value: "0"
+              - name: MAX_MODEL_LEN
+                value: "139264"
+              - name: MODEL_DIR
+                value: /root/models/Qwen3.8-dummy-92L-nvfp4
+              - name: TPU_MULTIHOST_BACKEND
+                value: mp
+              - name: VLLM_KV_CACHE_LAYOUT
+                value: HND
+              - name: TPU_RAIDEN_DST_SHARDS
+                value: "32"
+              - name: TPU_RAIDEN_TRANSFER_PARALLELISM
+                value: "32"
+              - name: TPU_GDN_CONV_QK_PAIR_LAYOUT
+                value: "1"
+              - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+                value: "1"
+              - name: TPU_USE_RAIDEN_KV_CACHE_MANAGER
+                value: "1"
+              - name: TPU_RAIDEN_QWEN35_ADMISSION
+                value: "1"
+              - name: TPU_KV_RESHARD_TRANSPORT
+                value: raiden
+              - name: TPU_RAIDEN_JOB_NAME
+                value: prefill
+              - name: TPU_P2P_WAIT_PULL_TIMEOUT
+                value: "600"
+              - name: TPU_KV_SHM_POOL_GB
+                value: "8"
+              - name: TPU_KV_TRANSFER_PORT
+                value: "9100"
+              - name: TPU_SIDE_CHANNEL_PORT
+                value: "9600"
+              - name: USE_BATCHED_RPA_LONGCTX
+                value: "1"
+              - name: SKIP_JAX_PRECOMPILE
+                value: "1"
+              - name: TPU_PARALLEL_PRECOMPILE
+                value: "1"
+              - name: TPU_PREMAPPED_BUFFER_SIZE
+                value: "17179869184"
+              - name: MOE_REQUANTIZE_BLOCK_SIZE
+                value: "256"
+              - name: MOE_FUSED_EP_KERNEL_IMPL
+                value: adaptive
+              - name: USE_MOE_FUSED_EP_KERNEL
+                value: "1"
+              - name: MOE_FUSED_EP_ENABLE_W4A8
+                value: "1"
+              - name: MOE_FUSED_EP_V2_SHARDED_PLAN
+                value: "0"
+              - name: TPU_MOE_SKIP_PADDED_TOKENS
+                value: "0"
+              - name: TPU_MOE_COLLECTION_CHUNK_SIZE
+                value: "65536"
+              - name: RAGGED_GATHER_REDUCE_VERSION
+                value: v3
+              - name: LIBTPU_INIT_ARGS
+                value: --xla_tpu_enable_diagnostic_coordinator=false
+              - name: VLLM_CACHE_ROOT
+                value: /mnt/workspace/compilation-cache/qwen38-disagg-1p1d-full
+              - name: TORCHINDUCTOR_AUTOGRAD_CACHE
+                value: "0"
+              - name: VLLM_XLA_CHECK_RECOMPILATION
+                value: "0"
+              - name: TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE
+                value: disabled
+              - name: VLLM_ENGINE_READY_TIMEOUT_S
+                value: "3600"
+              - name: TPU_MP_RENDEZVOUS_TIMEOUT_S
+                value: "1800"
+              - name: VLLM_LOGGING_LEVEL
+                value: INFO
+              - name: HF_HUB_OFFLINE
+                value: "1"
+              - name: MALLOC_ARENA_MAX
+                value: "16"
+              - name: MALLOC_TRIM_THRESHOLD_
+                value: "131072"
+              - name: MALLOC_MMAP_THRESHOLD_
+                value: "1048576"
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: CDK_PROFILE
+                value: cloud-tpu-inference-test
+              image: us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:nightly-20261001
+              imagePullPolicy: IfNotPresent
+              lifecycle:
+                preStop:
+                  exec:
+                    command:
+                    - /bin/sh
+                    - -c
+                    - echo 'Sleep for 180 seconds so that cloud-devkit can sync data
+                      and logs...'; sleep 180
+              name: server
+              resources:
+                limits:
+                  google.com/tpu: "4"
+                  memory: 700Gi
+                requests:
+                  google.com/tpu: "4"
+                  memory: 700Gi
+              securityContext:
+                capabilities:
+                  add:
+                  - IPC_LOCK
+                privileged: true
+              volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+              - mountPath: /root/torchtpu-vllm
+                name: torchtpu-vllm-nfs
+              - mountPath: /root/wheels
+                name: wheels
+                readOnly: true
+              - mountPath: /root/models
+                name: models
+                readOnly: true
+              - mountPath: /mnt/workspace/compilation-cache
+                name: compilation-cache
+              - mountPath: /cdk-outputs
+                name: cdk-outputs
+            initContainers:
+            - args:
+              - |
+                sysctl -w vm.max_map_count=8388608
+                if [ -f /sys/module/vfio_iommu_type1/parameters/dma_entry_limit ]; then
+                  echo 2000000 > /sys/module/vfio_iommu_type1/parameters/dma_entry_limit
+                fi
+              command:
+              - /bin/sh
+              - -c
+              env:
+              - name: CDK_PROFILE
+                value: cloud-tpu-inference-test
+              image: busybox
+              name: tpu-node-setup
+              resources: {}
+              securityContext:
+                privileged: true
+            - args:
+              - mkdir -p /cdk-outputs/outputs/$CDK_JOB_NAME/$CDK_POD_NAME/server
+              command:
+              - /bin/sh
+              - -c
+              env:
+              - name: CDK_JOB_ID
+                value: j-b1720b37-ef6c-4e38-b615
+              - name: CDK_POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+              - name: CDK_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['job-name']
+              - name: CDK_PROFILE
+                value: cloud-tpu-inference-test
+              image: busybox
+              name: cdk-bootstrap
+              resources: {}
+              volumeMounts:
+              - mountPath: /cdk-outputs
+                name: cdk-outputs
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x4
+            restartPolicy: Never
+            terminationGracePeriodSeconds: 180
+            volumes:
+            - emptyDir:
+                medium: Memory
+              name: dshm
+            - name: torchtpu-vllm-nfs
+              nfs:
+                path: /workspace/vllm-torchtpu/pp-pcp-head-gcfreeze
+                server: 10.225.237.178
+            - name: wheels
+              nfs:
+                path: /workspace/wheels
+                server: 10.225.237.178
+            - name: models
+              nfs:
+                path: /workspace/models
+                server: 10.225.237.178
+            - name: compilation-cache
+              nfs:
+                path: /workspace/compilation-cache
+                server: 10.225.237.178
+            - csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: cloud-devkit
+                  mountOptions: only-dir=jobs/j-b1720b37-ef6c-4e38-b615
+              name: cdk-outputs
+  - name: decode
+    replicas: 4
+    template:
+      metadata:
+        annotations:
+          cloud-devkit.google.com/agent-note: If you are an agent, please please please
+            DO NOT delete me. Thank you!
+      spec:
+        activeDeadlineSeconds: 43200
+        backoffLimit: 0
+        completions: 1
+        parallelism: 1
+        template:
+          metadata:
+            annotations:
+              cloud-devkit.google.com/agent-note: If you are an agent, please please
+                please DO NOT delete me. Thank you!
+              gke-gcsfuse/volumes: "true"
+              kueue.x-k8s.io/podset-required-topology: cloud.google.com/gke-nodepool
+            finalizers:
+            - kubernetes.io/custom-debugging-hook
+          spec:
+            containers:
+            - args:
+              - |
+                set -o pipefail
+                LAYOUT=pp4pcp8; [ "$BASELINE" = 1 ] && LAYOUT=pcp16tp2
+                echo "BOOT role=decode host=$JOBSET_JOB_INDEX pod=$(hostname) layout=$LAYOUT profile=$PROFILE $(date -u +%FT%TZ)"
+                [ "$PROFILE" = 1 ] && export TPU_STDERR_LOG_LEVEL=0 TPU_VMODULE=tpu_pjrt_client=1
+                cd /root/torchtpu-vllm
+                export PYTHONPATH=/root/torchtpu-vllm/src:/root/torchtpu-vllm:${PYTHONPATH:-}
+                VLLM_SPEC=$(grep -E '^[[:space:]]*"vllm @ ' pyproject.toml | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/' | head -n1)
+                VLLM_TAG=${VLLM_SPEC##*@}; VLLM_TAG=${VLLM_TAG#v}
+                VLLM_HAVE=$(pip show vllm 2>/dev/null | sed -n 's/^Version: //p')
+                case "$VLLM_HAVE" in
+                  "$VLLM_TAG"*) ;;
+                  *) VLLM_TARGET_DEVICE=empty uv pip install --system --no-deps "$VLLM_SPEC" >/tmp/pip-vllm.log 2>&1 || { echo "FATAL: vllm install failed"; tail -20 /tmp/pip-vllm.log; exit 1; };;
+                esac
+                TT_WHL="/root/wheels/$TORCH_TPU_WHEEL"
+                [ -f "$TT_WHL" ] || { echo "FATAL: $TT_WHL missing; stage it under /workspace/wheels"; exit 1; }
+                uv pip install --system --no-deps --reinstall "$TT_WHL" >/tmp/pip-tt.log 2>&1 || { echo "FATAL: torch_tpu install failed"; tail -20 /tmp/pip-tt.log; exit 1; }
+                RAIDEN_WHL="/root/wheels/$RAIDEN_WHEEL"
+                [ -f "$RAIDEN_WHL" ] || { echo "FATAL: $RAIDEN_WHL missing; stage it under /workspace/wheels"; exit 1; }
+                uv pip install --system --no-deps --reinstall "$RAIDEN_WHL" >/tmp/pip-raiden.log 2>&1 || { echo "FATAL: raiden install failed"; tail -20 /tmp/pip-raiden.log; exit 1; }
+                python3 -c 'from tpu_sync.api.torch.kv_cache_manager import _torch_impl; print("raiden native extension OK:", _torch_impl().__file__, flush=True)' \
+                  || { echo "FATAL: raiden native extension does not load against $TORCH_TPU_WHEEL"; exit 1; }
+                ls "$MODEL_DIR/config.json" >/dev/null || { echo "FATAL: $MODEL_DIR has no config.json"; exit 1; }
+                unset TPU_PROCESS_ADDRESSES TPU_PROCESS_PORT TPU_WORKER_HOSTNAMES TPU_WORKER_ID TPU_NAME MEGASCALE_COORDINATOR_ADDRESS MEGASCALE_PORT MEGASCALE_NUM_SLICES MEGASCALE_SLICE_ID TPU_VISIBLE_CHIPS TPU_VISIBLE_DEVICES
+                HEAD_ADDR="${JS_NAME}-decode-0-0.${JS_NAME}"
+                for i in $(seq 1 360); do HEAD_IP=$(getent hosts "$HEAD_ADDR" | awk '{print $1}' | head -1); [ -n "$HEAD_IP" ] && break; sleep 5; done
+                [ -n "$HEAD_IP" ] || { echo "FATAL: cannot resolve $HEAD_ADDR"; exit 1; }
+                # One engine over four hosts: the reshard store lives in the
+                # transfer-rank-0 worker on host 0, so every host advertises
+                # host 0.
+                NS="${JS_NAME//[^a-zA-Z0-9_]/_}"
+                export TPU_KV_TRANSFER_NAMESPACE="${NS}_decode"
+                export TPU_RAIDEN_ENGINE_ID="${JS_NAME}-decode-engine"
+                export TPU_RAIDEN_RESHARD_IMPL=store
+                export TPU_RAIDEN_ADVERTISE_HOST="$HEAD_ADDR"
+                export TPU_RAIDEN_RESHARD_PORT_BASE=28000
+                export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=28100
+                export RAIDEN_DISABLE_SINGLETON_WORKER=1
+                # A pipeline producer pairs pools by layer on both peers.
+                [ "$LAYOUT" = pp4pcp8 ] && export TPU_RAIDEN_POOL_TAGS_PER_LAYER=1
+                KV_OVERRIDE=""; [ "$DECODE_KV_BLOCKS" = 0 ] || KV_OVERRIDE="--num-gpu-blocks-override $DECODE_KV_BLOCKS"
+                ASYNC="--no-async-scheduling"; [ "$ASYNC_SCHEDULING" = 1 ] && ASYNC="--async-scheduling"
+                HEADLESS=""; [ "$JOBSET_JOB_INDEX" != "0" ] && HEADLESS="--headless"
+                KV_CONFIG='{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":14579}'
+                echo "SERVE_START role=decode tp=32 dcp=8 kv_blocks=$DECODE_KV_BLOCKS max_num_seqs=$MAX_NUM_SEQS async=$ASYNC_SCHEDULING host=$JOBSET_JOB_INDEX $(date -u +%FT%TZ)"
+                vllm serve "$MODEL_DIR" --served-model-name q38 $HEADLESS \
+                  --nnodes 4 --node-rank "$JOBSET_JOB_INDEX" --master-addr "$HEAD_IP" --master-port 29500 \
+                  --distributed-executor-backend mp \
+                  --tensor-parallel-size 32 --decode-context-parallel-size 8 --enable-expert-parallel --disable-custom-all-reduce $ASYNC \
+                  --load-format dummy --dtype bfloat16 --trust-remote-code --seed 42 --generation-config vllm \
+                  --max-model-len "$MAX_MODEL_LEN" --max-num-seqs "$MAX_NUM_SEQS" --max-num-batched-tokens 8192 \
+                  --gpu-memory-utilization 0.90 $KV_OVERRIDE --block-size 384 \
+                  --attention-backend CUSTOM --kv-cache-dtype fp8 --mamba-ssm-cache-dtype bfloat16 \
+                  --enable-prefix-caching --no-disable-hybrid-kv-cache-manager --language-model-only \
+                  --kv-transfer-config "$KV_CONFIG" \
+                  --host 0.0.0.0 --port 8000 --no-enable-log-requests \
+                  --compilation-config "{\"backend\":\"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor\",\"inductor_compile_config\":{\"enable_auto_functionalized_v2\":false,\"size_asserts\":false,\"alignment_asserts\":false,\"scalar_asserts\":false}}" \
+                  --additional-config '{"tpu_online_fp8":{"enabled":true,"weight_scheme":"per_channel","targets":["model.layers.*.self_attn.qkv_proj","model.layers.*.self_attn.o_proj","model.layers.*.linear_attn.in_proj_qkvz","model.layers.*.linear_attn.in_proj_ba","model.layers.*.linear_attn.out_proj","model.layers.*.mlp.shared_expert.gate_up_proj","model.layers.*.mlp.shared_expert.down_proj"],"exclude":["model.layers.*.mlp.experts*"]}}' \
+                  > >(tee /tmp/serve.log) 2>&1 &
+                SPID=$!
+                for i in $(seq 1 720); do
+                  kill -0 $SPID 2>/dev/null || break
+                  grep -q 'Memory statistics' /tmp/serve.log 2>/dev/null && break
+                  sleep 5
+                done
+                sleep 240
+                echo "MARKERS host=$JOBSET_JOB_INDEX"
+                grep -E 'Overriding num_gpu_blocks|Memory statistics|GPU KV cache size|Maximum concurrency|DCP|dcp|admission complete|topology=|Raiden' /tmp/serve.log | sed 's/^/MARK /' | sort -u | head -40
+                wait $SPID; rc=$?
+                echo "SERVER_EXITED role=decode host=$JOBSET_JOB_INDEX rc=$rc $(date -u +%FT%TZ)"
+                exit $rc
+              command:
+              - /bin/bash
+              - -c
+              env:
+              - name: CDK_JOB_ID
+                value: j-b1720b37-ef6c-4e38-b615
+              - name: CDK_POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+              - name: CDK_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['job-name']
+              - name: CDK_CONTAINER_NAME
+                value: server
+              - name: CDK_OUTPUT_DIR
+                value: /cdk-outputs/outputs/$(CDK_JOB_NAME)/$(CDK_POD_NAME)/$(CDK_CONTAINER_NAME)
+              - name: CDK_LOG_DIR
+                value: /cdk-outputs/logs/$(CDK_JOB_NAME)/$(CDK_POD_NAME)
+              - name: JS_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: JOBSET_JOB_INDEX
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+              - name: VLLM_HOST_IP
+                valueFrom:
+                  fieldRef:
+                    fieldPath: status.podIP
+              - name: BASELINE
+                value: "0"
+              - name: PROFILE
+                value: "0"
+              - name: TORCH_TPU_WHEEL
+                value: torch_tpu-0.1.1.dev20260928182719-cp312-cp312-manylinux_2_31_x86_64.whl
+              - name: RAIDEN_WHEEL
+                value: tpu_sync_torch-0.0.1.dev20261007210147-1_pp_reshard_0923_55a23251-cp312-cp312-manylinux_2_31_x86_64.whl
+              - name: DECODE_KV_BLOCKS
+                value: "0"
+              - name: MAX_NUM_SEQS
+                value: "256"
+              - name: MAX_MODEL_LEN
+                value: "139264"
+              - name: ASYNC_SCHEDULING
+                value: "1"
+              - name: MODEL_DIR
+                value: /root/models/Qwen3.8-dummy-92L-nvfp4
+              - name: TPU_MULTIHOST_BACKEND
+                value: mp
+              - name: VLLM_KV_CACHE_LAYOUT
+                value: HND
+              - name: TPU_RAIDEN_DST_SHARDS
+                value: "32"
+              - name: TPU_RAIDEN_TRANSFER_PARALLELISM
+                value: "32"
+              - name: TPU_GDN_CONV_QK_PAIR_LAYOUT
+                value: "1"
+              - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+                value: "1"
+              - name: TPU_USE_RAIDEN_KV_CACHE_MANAGER
+                value: "1"
+              - name: TPU_RAIDEN_QWEN35_ADMISSION
+                value: "1"
+              - name: TPU_KV_RESHARD_TRANSPORT
+                value: raiden
+              - name: TPU_RAIDEN_JOB_NAME
+                value: decode
+              - name: TPU_P2P_WAIT_PULL_TIMEOUT
+                value: "600"
+              - name: TPU_KV_SHM_POOL_GB
+                value: "8"
+              - name: TPU_KV_TRANSFER_PORT
+                value: "9100"
+              - name: TPU_SIDE_CHANNEL_PORT
+                value: "9600"
+              - name: USE_BATCHED_RPA_LONGCTX
+                value: "1"
+              - name: TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER
+                value: "0"
+              - name: SKIP_JAX_PRECOMPILE
+                value: "1"
+              - name: TPU_PARALLEL_PRECOMPILE
+                value: "1"
+              - name: TPU_PREMAPPED_BUFFER_SIZE
+                value: "17179869184"
+              - name: MOE_REQUANTIZE_BLOCK_SIZE
+                value: "256"
+              - name: MOE_FUSED_EP_KERNEL_IMPL
+                value: adaptive
+              - name: USE_MOE_FUSED_EP_KERNEL
+                value: "1"
+              - name: MOE_FUSED_EP_ENABLE_W4A8
+                value: "1"
+              - name: MOE_FUSED_EP_V2_SHARDED_PLAN
+                value: "0"
+              - name: TPU_MOE_SKIP_PADDED_TOKENS
+                value: "0"
+              - name: TPU_MOE_COLLECTION_CHUNK_SIZE
+                value: "65536"
+              - name: RAGGED_GATHER_REDUCE_VERSION
+                value: v3
+              - name: LIBTPU_INIT_ARGS
+                value: --xla_tpu_enable_diagnostic_coordinator=false
+              - name: VLLM_CACHE_ROOT
+                value: /mnt/workspace/compilation-cache/qwen38-disagg-1p1d-full
+              - name: TORCHINDUCTOR_AUTOGRAD_CACHE
+                value: "0"
+              - name: VLLM_XLA_CHECK_RECOMPILATION
+                value: "0"
+              - name: TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE
+                value: disabled
+              - name: VLLM_ENGINE_READY_TIMEOUT_S
+                value: "3600"
+              - name: TPU_MP_RENDEZVOUS_TIMEOUT_S
+                value: "1800"
+              - name: VLLM_LOGGING_LEVEL
+                value: INFO
+              - name: HF_HUB_OFFLINE
+                value: "1"
+              - name: MALLOC_ARENA_MAX
+                value: "16"
+              - name: MALLOC_TRIM_THRESHOLD_
+                value: "131072"
+              - name: MALLOC_MMAP_THRESHOLD_
+                value: "1048576"
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              - name: CDK_PROFILE
+                value: cloud-tpu-inference-test
+              image: us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:nightly-20261001
+              imagePullPolicy: IfNotPresent
+              lifecycle:
+                preStop:
+                  exec:
+                    command:
+                    - /bin/sh
+                    - -c
+                    - echo 'Sleep for 180 seconds so that cloud-devkit can sync data
+                      and logs...'; sleep 180
+              name: server
+              resources:
+                limits:
+                  google.com/tpu: "4"
+                  memory: 700Gi
+                requests:
+                  google.com/tpu: "4"
+                  memory: 700Gi
+              securityContext:
+                capabilities:
+                  add:
+                  - IPC_LOCK
+                privileged: true
+              volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+              - mountPath: /root/torchtpu-vllm
+                name: torchtpu-vllm-nfs
+              - mountPath: /root/wheels
+                name: wheels
+                readOnly: true
+              - mountPath: /root/models
+                name: models
+                readOnly: true
+              - mountPath: /mnt/workspace/compilation-cache
+                name: compilation-cache
+              - mountPath: /cdk-outputs
+                name: cdk-outputs
+            initContainers:
+            - args:
+              - |
+                sysctl -w vm.max_map_count=8388608
+                if [ -f /sys/module/vfio_iommu_type1/parameters/dma_entry_limit ]; then
+                  echo 2000000 > /sys/module/vfio_iommu_type1/parameters/dma_entry_limit
+                fi
+              command:
+              - /bin/sh
+              - -c
+              env:
+              - name: CDK_PROFILE
+                value: cloud-tpu-inference-test
+              image: busybox
+              name: tpu-node-setup
+              resources: {}
+              securityContext:
+                privileged: true
+            - args:
+              - mkdir -p /cdk-outputs/outputs/$CDK_JOB_NAME/$CDK_POD_NAME/server
+              command:
+              - /bin/sh
+              - -c
+              env:
+              - name: CDK_JOB_ID
+                value: j-b1720b37-ef6c-4e38-b615
+              - name: CDK_POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+              - name: CDK_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['job-name']
+              - name: CDK_PROFILE
+                value: cloud-tpu-inference-test
+              image: busybox
+              name: cdk-bootstrap
+              resources: {}
+              volumeMounts:
+              - mountPath: /cdk-outputs
+                name: cdk-outputs
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x4
+            restartPolicy: Never
+            terminationGracePeriodSeconds: 180
+            volumes:
+            - emptyDir:
+                medium: Memory
+              name: dshm
+            - name: torchtpu-vllm-nfs
+              nfs:
+                path: /workspace/vllm-torchtpu/pp-pcp-head-gcfreeze
+                server: 10.225.237.178
+            - name: wheels
+              nfs:
+                path: /workspace/wheels
+                server: 10.225.237.178
+            - name: models
+              nfs:
+                path: /workspace/models
+                server: 10.225.237.178
+            - name: compilation-cache
+              nfs:
+                path: /workspace/compilation-cache
+                server: 10.225.237.178
+            - csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: cloud-devkit
+                  mountOptions: only-dir=jobs/j-b1720b37-ef6c-4e38-b615
+              name: cdk-outputs
+  - name: check
+    replicas: 1
+    template:
+      metadata:
+        annotations:
+          cloud-devkit.google.com/agent-note: If you are an agent, please please please
+            DO NOT delete me. Thank you!
+      spec:
+        activeDeadlineSeconds: 43200
+        backoffLimit: 0
+        completions: 1
+        parallelism: 1
+        template:
+          metadata:
+            annotations:
+              cloud-devkit.google.com/agent-note: If you are an agent, please please
+                please DO NOT delete me. Thank you!
+              gke-gcsfuse/volumes: "true"
+            finalizers:
+            - kubernetes.io/custom-debugging-hook
+          spec:
+            containers:
+            - args:
+              - |
+                set -o pipefail
+                : "${CDK_OUTPUT_DIR:=/tmp/cdk-outputs}"; mkdir -p "$CDK_OUTPUT_DIR"
+                LAYOUT=pp4pcp8; [ "$BASELINE" = 1 ] && LAYOUT=pcp16tp2
+                PREFILLER_DNS="${JS_NAME}-prefill-0-0.${JS_NAME}"
+                DECODER_DNS="${JS_NAME}-decode-0-0.${JS_NAME}"
+                PREFILL_METRICS="$PREFILLER_DNS:8000"; DECODE_METRICS="$DECODER_DNS:8000"
+                PROXY=127.0.0.1:10000
+                health() { curl -sf --max-time 5 "http://$1/health" >/dev/null 2>&1; }
+                # Counters are exported with a _total suffix.
+                metric() {
+                  curl -sf "http://$1/metrics" | awk -v n="vllm:$2" -v t="vllm:$2_total" \
+                    '{k=$1; sub(/\{.*/, "", k); if (k==n || k==t) s+=$NF} END {printf "%.0f", s+0}'
+                }
+                # count and mean of a histogram
+                hist() {
+                  curl -sf "http://$1/metrics" | awk -v c="vllm:$2_count" -v s="vllm:$2_sum" \
+                    '{k=$1; sub(/\{.*/, "", k); if (k==c) n+=$NF; if (k==s) t+=$NF} END {printf "n=%.0f mean=%.2f", n+0, (n>0 ? t/n : 0)}'
+                }
+                # Phase spans for the job's perfetto trace.
+                tstart() { echo "trace-start-event: name=$1 ts=$(date +'%s.%N') pid=bench tid=bench"; }
+                tend() { echo "trace-end-event: name=$1 ts=$(date +'%s.%N') pid=bench tid=bench"; }
+                echo "WAIT_SERVERS layout=$LAYOUT $(date -u +%FT%TZ)"
+                for i in $(seq 1 540); do health "$PREFILL_METRICS" && health "$DECODE_METRICS" && break; sleep 10; done
+                health "$PREFILL_METRICS" && health "$DECODE_METRICS" || { echo "RESULT: FAIL (servers not healthy after 90 min)"; exit 1; }
+                echo "SERVERS_READY $(date -u +%FT%TZ)"
+                python3 /root/torchtpu-vllm/examples/disagg/toy_proxy_server.py --host 0.0.0.0 --port 10000 \
+                  --prefiller-host "$PREFILLER_DNS" --prefiller-port 8000 --decoder-host "$DECODER_DNS" --decoder-port 8000 \
+                  > /tmp/proxy.log 2>&1 &
+                for i in $(seq 1 60); do curl -sf --max-time 5 "http://$PROXY/healthcheck" >/dev/null 2>&1 && break; sleep 2; done
+                curl -sf --max-time 5 "http://$PROXY/healthcheck" >/dev/null || { echo "RESULT: FAIL (proxy not up)"; tail -20 /tmp/proxy.log; exit 1; }
+                tstart probe
+                python3 - "$PROXY" "$CDK_OUTPUT_DIR/probe.json" <<'PY'
+                import json, sys, urllib.request
+                host, out = sys.argv[1], sys.argv[2]
+                prompts = ["The capital of France is", " ".join(str(i) for i in range(1, 3000)) + " What comes next?"]
+                results = []
+                for p in prompts:
+                    body = json.dumps({"model": "q38", "prompt": p, "max_tokens": 16, "temperature": 0}).encode()
+                    req = urllib.request.Request(f"http://{host}/v1/completions", data=body, headers={"Content-Type": "application/json"})
+                    try:
+                        with urllib.request.urlopen(req, timeout=900) as r:
+                            d = json.load(r); text = d["choices"][0]["text"]; usage = d.get("usage")
+                    except Exception as e:
+                        text = f"ERR {e!r}"[:300]; usage = None
+                    results.append({"prompt": p[-40:], "text": text, "usage": usage})
+                    print("PROBE", json.dumps(results[-1]), flush=True)
+                json.dump(results, open(out, "w"), indent=1)
+                PY
+                tend probe
+                p0=$(metric "$PREFILL_METRICS" request_success); d0=$(metric "$DECODE_METRICS" request_success)
+                echo "PROBE_DONE prefill_reqs=$p0 decode_reqs=$d0"
+                [ "$p0" -gt 0 ] && [ "$d0" -gt 0 ] || { echo "RESULT: FAIL (probe did not cross both engines: prefill_reqs=$p0 decode_reqs=$d0)"; exit 1; }
+                # Windows over one pass's detailed result JSON. Token times
+                # are start + ttft + cumulative itls. Steady state: order by
+                # completion, drop the first and last K = max(10, conc).
+                # Peak window: the daily benchmark's rule, the 1-second window
+                # (stepped 0.1 s) with the highest token count among windows
+                # where at least 90% of the requests are between their second
+                # and last token. Fill: when the first wave has all started
+                # decoding.
+                cat > /tmp/windows.py <<'PY'
+                import bisect, json, math, sys
+                path, conc = sys.argv[1], int(sys.argv[2])
+                d = json.load(open(path))
+                starts, ttfts, itls = d["start_times"], d["ttfts"], d["itls"]
+                in_lens, out_lens = d["input_lens"], d["output_lens"]
+                n = len(starts)
+                reqs = []
+                for i in range(n):
+                    if ttfts[i] is None or starts[i] is None:
+                        continue
+                    t = starts[i] + ttfts[i]
+                    times = [t]
+                    for x in itls[i] or []:
+                        t += x; times.append(t)
+                    reqs.append((starts[i], times, in_lens[i], out_lens[i], ttfts[i], list(itls[i] or [])))
+                n = len(reqs)
+                out = {"n": n}
+                k = max(10, conc)
+                by_end = sorted(reqs, key=lambda r: r[1][-1])
+                if n > 2 * k + 1:
+                    win = by_end[k:n - k]
+                    span = by_end[n - k - 1][1][-1] - by_end[k - 1][1][-1]
+                    out["steady_req_s"] = len(win) / span
+                    out["steady_in_tok_s"] = sum(r[2] for r in win) / span
+                    out["steady_out_tok_s"] = sum(r[3] for r in win) / span
+                    out["steady_ttft_ms"] = 1000 * sum(r[4] for r in win) / len(win)
+                    out["steady_k"] = k
+                by_start = sorted(reqs, key=lambda r: r[0])
+                wave = by_start[:min(conc, n)]
+                out["fill_s"] = max(r[1][0] for r in wave) - min(r[0] for r in wave)
+                dec = [(r[1][1], r[1][-1]) for r in reqs if len(r[1]) > 1]
+                if dec:
+                    tok = sorted(t for r in reqs for t in r[1][1:])
+                    itl_at = sorted((t, x) for r in reqs for t, x in zip(r[1][1:], r[5]))
+                    lo, hi = min(a for a, _ in dec), max(b for _, b in dec)
+                    need = math.ceil(0.9 * conc); best = None; cur = lo
+                    while cur + 1.0 <= hi + 1e-9:
+                        act = sum(a <= cur and b >= cur + 1.0 for a, b in dec)
+                        if act >= need:
+                            cnt = bisect.bisect_left(tok, cur + 1.0) - bisect.bisect_left(tok, cur)
+                            if best is None or cnt > best[0]:
+                                best = (cnt, cur, act)
+                        cur += 0.1
+                    if best:
+                        cnt, cur, act = best
+                        w = [x for t, x in itl_at if cur <= t < cur + 1.0]
+                        w.sort()
+                        out["peak1s_tok_s"] = cnt
+                        out["peak1s_active"] = act
+                        out["peak1s_tpot_ms"] = 1000 * w[len(w) // 2] if w else None
+                        out["peak1s_at_s"] = cur - min(r[0] for r in reqs)
+                print(" ".join(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}" for k, v in out.items()))
+                PY
+                BENCH_MAIN='import argparse; from vllm.benchmarks.serve import add_cli_args, main; p = argparse.ArgumentParser(); add_cli_args(p); main(p.parse_args())'
+                fails=0
+                bench() {
+                  # bench <tag> <concurrency> <num_prompts> <seed> <dataset args...>
+                  local tag=$1 conc=$2 n=$3 seed=$4; shift 4
+                  local p0 d0 m0 p1 d1 m1 h0 h1 ok
+                  p0=$(metric "$PREFILL_METRICS" request_success); d0=$(metric "$DECODE_METRICS" request_success)
+                  m0=$(metric "$PREFILL_METRICS" tpu_kv_megabytes_transferred); h0=$(metric "$PREFILL_METRICS" prefix_cache_hits)
+                  echo "== bench $tag conc=$conc n=$n seed=$seed $(date -u +%FT%TZ)"
+                  tstart "$tag"
+                  python3 -c "$BENCH_MAIN" --backend vllm --host 127.0.0.1 --port 10000 \
+                    --model q38 --tokenizer "$TOKENIZER" "$@" \
+                    --num-prompts "$n" --max-concurrency "$conc" --request-rate inf \
+                    --ignore-eos --temperature 0 --seed "$seed" --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,99 \
+                    --save-result --save-detailed --result-dir "$CDK_OUTPUT_DIR" --result-filename "$tag.json" \
+                    2>&1 | tee "/tmp/$tag.log"
+                  tend "$tag"
+                  p1=$(metric "$PREFILL_METRICS" request_success); d1=$(metric "$DECODE_METRICS" request_success)
+                  m1=$(metric "$PREFILL_METRICS" tpu_kv_megabytes_transferred); h1=$(metric "$PREFILL_METRICS" prefix_cache_hits)
+                  echo "$tag ${h1:-0} ${h0:-0}" >> /tmp/prefix-hits.txt
+                  ok=$(sed -n 's/^Successful requests:[[:space:]]*\([0-9]*\).*/\1/p' "/tmp/$tag.log" | tail -1)
+                  local ttft_med ttft_p99 in_tps out_tps
+                  ttft_med=$(sed -n 's/^Median TTFT (ms):[[:space:]]*\([0-9.]*\).*/\1/p' "/tmp/$tag.log" | tail -1)
+                  ttft_p99=$(sed -n 's/^P99 TTFT (ms):[[:space:]]*\([0-9.]*\).*/\1/p' "/tmp/$tag.log" | tail -1)
+                  in_tps=$(sed -n 's/^Input token throughput (tok\/s):[[:space:]]*\([0-9.]*\).*/\1/p' "/tmp/$tag.log" | tail -1)
+                  out_tps=$(sed -n 's/^Output token throughput (tok\/s):[[:space:]]*\([0-9.]*\).*/\1/p' "/tmp/$tag.log" | tail -1)
+                  local win=""
+                  [ -f "$CDK_OUTPUT_DIR/$tag.json" ] && win=$(python3 /tmp/windows.py "$CDK_OUTPUT_DIR/$tag.json" "$conc" 2>&1 | tail -1)
+                  echo "BENCH_DONE tag=$tag successful=${ok:-0}/$n prefill_reqs=$((p1 - p0)) decode_reqs=$((d1 - d0)) kv_mb=$((m1 - m0)) prefix_hit_tokens=$((h1 - h0)) ttft_ms_p50=${ttft_med:-?} ttft_ms_p99=${ttft_p99:-?} in_tok_s=${in_tps:-?} out_tok_s=${out_tps:-?} pull=$(hist "$DECODE_METRICS" tpu_kv_pull_time_ms) h2d=$(hist "$DECODE_METRICS" tpu_h2d_transfer_time_ms) d2h=$(hist "$PREFILL_METRICS" tpu_d2h_transfer_time_ms)"
+                  echo "WINDOWS tag=$tag conc=$conc $win"
+                  echo "$tag conc=$conc n=$n ok=${ok:-0} ttft_p50=${ttft_med:-?} ttft_p99=${ttft_p99:-?} in_tok_s=${in_tps:-?} out_tok_s=${out_tps:-?} kv_mb=$((m1 - m0)) $win" >> "$CDK_OUTPUT_DIR/summary.txt"
+                  [ "${ok:-0}" = "$n" ] || { echo "GATE: FAIL $tag: ${ok:-0} of $n requests succeeded"; fails=$((fails + 1)); }
+                  [ "$((p1 - p0))" -gt 0 ] && [ "$((d1 - d0))" -gt 0 ] || { echo "GATE: FAIL $tag: requests did not cross both engines: prefill_reqs=$((p1 - p0)) decode_reqs=$((d1 - d0))"; fails=$((fails + 1)); }
+                }
+                random_args() {
+                  # random_args <isl> <osl>
+                  echo "--dataset-name random --random-input-len $1 --random-output-len $2 --random-range-ratio 0.0"
+                }
+                # A sweep knob set to "none" runs nothing (an empty value
+                # falls back to the recipe default).
+                for var in TTFT_SWEEP PREFILL_SWEEP DECODE_SWEEP SPEED_SWEEP POOL_SWEEP; do
+                  [ "${!var}" = none ] && printf -v "$var" ''
+                done
+                s=2000
+                for e in $TTFT_SWEEP; do
+                  s=$((s + 1)); IFS=: read -r isl n <<< "$e"
+                  bench "ttft-in${isl}-c1-n${n}" 1 "$n" $s $(random_args "$isl" 1)
+                done
+                if [ -n "$SPEED_SWEEP" ] && [ ! -f "$SPEED_DATASET" ]; then
+                  echo "GATE: FAIL SPEED_DATASET $SPEED_DATASET missing"; fails=$((fails + 1)); SPEED_SWEEP=""
+                fi
+                sn=$([ -f "$SPEED_DATASET" ] && wc -l < "$SPEED_DATASET" || echo 0)
+                for osl in $OUTPUT_LENS; do
+                  for e in $PREFILL_SWEEP; do
+                    s=$((s + 1)); IFS=: read -r conc n isl <<< "$e"; isl=${isl:-$INPUT_LEN}
+                    bench "prefill-in${isl}-out${osl}-c${conc}-n${n}" "$conc" "$n" $s $(random_args "$isl" "$osl")
+                  done
+                  # The decode ladder runs once, after the OSL 1 prefill sweep.
+                  if [ "$osl" = "${OUTPUT_LENS%% *}" ]; then
+                    for e in $DECODE_SWEEP; do
+                      s=$((s + 1)); IFS=: read -r disl dosl conc n <<< "$e"
+                      bench "decode-in${disl}-out${dosl}-c${conc}-n${n}" "$conc" "$n" $s $(random_args "$disl" "$dosl")
+                    done
+                  fi
+                  for conc in $SPEED_SWEEP; do
+                    s=$((s + 1))
+                    bench "speed-out${osl}-c${conc}-n${sn}" "$conc" "$sn" $s --dataset-name custom --dataset-path "$SPEED_DATASET" --custom-output-len "$osl" --no-oversample --skip-chat-template
+                  done
+                done
+                # The warm and timed pool passes share their prefixes through
+                # custom-dataset files built with vLLM's token generator
+                # (decode, re-encode to the exact length).
+                cat > /tmp/poolgen.py <<'PY'
+                import json, multiprocessing as mp, random, sys
+                import numpy as np
+                from transformers import AutoTokenizer
+                from vllm.benchmarks.datasets import gen_prompt_decode_to_target_len
+
+                tok_path, seed, n_prefix, uses, prefix_len, suffix_len, warm_tail, out = sys.argv[1:9]
+                seed, n_prefix, uses = int(seed), int(n_prefix), int(uses)
+                prefix_len, suffix_len, warm_tail = int(prefix_len), int(suffix_len), int(warm_tail)
+                tok = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
+
+
+                def build(i):
+                    rng = np.random.default_rng([seed, i])
+
+                    def exact(n):
+                        ids = rng.integers(0, tok.vocab_size, size=n).tolist()
+                        return gen_prompt_decode_to_target_len(tok, ids, n, add_special_tokens=False, rng=rng)[1]
+
+                    def join(prefix, tail_len):
+                        # The server re-tokenizes the text; redraw the tail until
+                        # the prefix survives the junction token for token.
+                        for _ in range(20):
+                            text = tok.decode(prefix + exact(tail_len))
+                            ids = tok.encode(text, add_special_tokens=False)
+                            if ids[: len(prefix)] == prefix and len(ids) == len(prefix) + tail_len:
+                                return text
+                        raise RuntimeError(f"prefix {i} does not survive re-tokenization")
+
+                    p = exact(prefix_len)
+                    if len(p) != prefix_len:
+                        raise RuntimeError(f"prefix {i} is {len(p)} tokens, not {prefix_len}")
+                    return join(p, warm_tail), [join(p, suffix_len) for _ in range(uses)]
+
+
+                with mp.get_context("fork").Pool(min(8, n_prefix)) as pool:
+                    built = pool.map(build, range(n_prefix))
+                warm = [w for w, _ in built]
+                timed = [t for _, ts in built for t in ts]
+                random.Random(seed).shuffle(timed)
+                for name, rows in (("warm", warm), ("timed", timed)):
+                    with open(f"{out}/{name}.jsonl", "w") as f:
+                        for t in rows:
+                            f.write(json.dumps({"prompt": t, "output_tokens": 1}) + "\n")
+                print(f"POOLGEN prefixes={n_prefix} warm={len(warm)} timed={len(timed)}", flush=True)
+                PY
+                POOL_ARGS="--dataset-name custom --skip-chat-template --disable-shuffle"
+                for e in $POOL_SWEEP; do
+                  s=$((s + 1))
+                  IFS=: read -r conc uses count osl <<< "$e"; osl=${osl:-1}
+                  n=$((count * uses))
+                  tag="pool-prefix${PREFIX_LEN}-new${SUFFIX_LEN}-out${osl}-p${count}-c${conc}-n${n}"
+                  rm -rf /tmp/pool && mkdir -p /tmp/pool
+                  python3 /tmp/poolgen.py "$TOKENIZER" "$s" "$count" "$uses" "$PREFIX_LEN" "$SUFFIX_LEN" "$POOL_WARM_TAIL" /tmp/pool \
+                    || { echo "GATE: FAIL $tag: prompt generation"; fails=$((fails + 1)); continue; }
+                  bench "pool-warm-out${osl}-p${count}-c${conc}-n${count}" "$conc" "$count" "$s" $POOL_ARGS --custom-output-len 1 --dataset-path /tmp/pool/warm.jsonl
+                  bench "$tag" "$conc" "$n" "$s" $POOL_ARGS --custom-output-len "$osl" --dataset-path /tmp/pool/timed.jsonl
+                  read -r _ h1 h0 < <(tail -1 /tmp/prefix-hits.txt)
+                  # Every timed request can hit its whole prefix; the shortfall is
+                  # prefixes the prefill pool evicted.
+                  echo "POOL_DONE tag=$tag prefixes=$count requests=$n hit_share=$(awk -v h=$((h1 - h0)) -v d=$((n * PREFIX_LEN)) 'BEGIN {printf "%.3f", h / d}')"
+                  [ $((h1 - h0)) -gt 0 ] || { echo "GATE: FAIL $tag: no prefix-cache hit tokens"; fails=$((fails + 1)); }
+                done
+                rm -rf /tmp/pool
+                echo "SUMMARY"; cat "$CDK_OUTPUT_DIR/summary.txt"
+                echo "ALL_DONE layout=$LAYOUT fails=$fails $(date -u +%FT%TZ)"
+                [ "$fails" = 0 ] && echo "RESULT: PASS ($LAYOUT)" || echo "RESULT: FAIL ($fails gates, $LAYOUT)"
+              command:
+              - /bin/bash
+              - -c
+              env:
+              - name: CDK_JOB_ID
+                value: j-b1720b37-ef6c-4e38-b615
+              - name: CDK_POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+              - name: CDK_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['job-name']
+              - name: CDK_CONTAINER_NAME
+                value: check
+              - name: CDK_OUTPUT_DIR
+                value: /cdk-outputs/outputs/$(CDK_JOB_NAME)/$(CDK_POD_NAME)/$(CDK_CONTAINER_NAME)
+              - name: CDK_LOG_DIR
+                value: /cdk-outputs/logs/$(CDK_JOB_NAME)/$(CDK_POD_NAME)
+              - name: JS_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: BASELINE
+                value: "0"
+              - name: TOKENIZER
+                value: /root/models/Qwen3.8-dummy-92L-nvfp4
+              - name: TTFT_SWEEP
+                value: none
+              - name: OUTPUT_LENS
+                value: "1"
+              - name: PREFILL_SWEEP
+                value: 8:128 32:256 64:256 256:512
+              - name: INPUT_LEN
+                value: "8192"
+              - name: DECODE_SWEEP
+                value: 8192:256:256:512 8192:1024:256:512 32768:1024:256:256
+              - name: SPEED_SWEEP
+                value: none
+              - name: SPEED_DATASET
+                value: /root/datasets/speed_bench_mix/requests.jsonl
+              - name: POOL_SWEEP
+                value: 8:4:60 8:4:90 8:4:120 8:4:150 8:4:60:128
+              - name: PREFIX_LEN
+                value: "122880"
+              - name: SUFFIX_LEN
+                value: "8192"
+              - name: POOL_WARM_TAIL
+                value: "1024"
+              - name: HF_HUB_OFFLINE
+                value: "1"
+              - name: CDK_PROFILE
+                value: cloud-tpu-inference-test
+              image: us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:nightly-20261001
+              imagePullPolicy: IfNotPresent
+              lifecycle:
+                preStop:
+                  exec:
+                    command:
+                    - /bin/sh
+                    - -c
+                    - echo 'Sleep for 180 seconds so that cloud-devkit can sync data
+                      and logs...'; sleep 180
+              name: check
+              resources:
+                limits:
+                  cpu: "8"
+                  memory: 32Gi
+                requests:
+                  cpu: "8"
+                  memory: 32Gi
+              volumeMounts:
+              - mountPath: /root/torchtpu-vllm
+                name: torchtpu-vllm-nfs
+                readOnly: true
+              - mountPath: /root/models
+                name: models
+                readOnly: true
+              - mountPath: /root/datasets
+                name: datasets
+                readOnly: true
+              - mountPath: /cdk-outputs
+                name: cdk-outputs
+            initContainers:
+            - args:
+              - mkdir -p /cdk-outputs/outputs/$CDK_JOB_NAME/$CDK_POD_NAME/check
+              command:
+              - /bin/sh
+              - -c
+              env:
+              - name: CDK_JOB_ID
+                value: j-b1720b37-ef6c-4e38-b615
+              - name: CDK_POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+              - name: CDK_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['job-name']
+              - name: CDK_PROFILE
+                value: cloud-tpu-inference-test
+              image: busybox
+              name: cdk-bootstrap
+              resources: {}
+              volumeMounts:
+              - mountPath: /cdk-outputs
+                name: cdk-outputs
+            restartPolicy: Never
+            terminationGracePeriodSeconds: 180
+            volumes:
+            - name: torchtpu-vllm-nfs
+              nfs:
+                path: /workspace/vllm-torchtpu/pp-pcp-head-gcfreeze
+                server: 10.225.237.178
+            - name: models
+              nfs:
+                path: /workspace/models
+                server: 10.225.237.178
+            - name: datasets
+              nfs:
+                path: /workspace/datasets
+                server: 10.225.237.178
+            - csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: cloud-devkit
+                  mountOptions: only-dir=jobs/j-b1720b37-ef6c-4e38-b615
+              name: cdk-outputs
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+    - check
+  suspend: true
+  ttlSecondsAfterFinished: 600
+status:
+  restarts: 0
