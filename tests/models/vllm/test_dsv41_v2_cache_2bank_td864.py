@@ -102,3 +102,32 @@ def test_scatter_cache_values_tuple_sub_row_keeps_per_bank(monkeypatch):
     )
     assert int(out_lo[0, ROW // 2]) == 1 and int(out_hi[0, ROW // 2]) == 1
     assert jax.default_backend() == "cpu"
+
+
+def test_scatter_cache_values_single_bank_full_row_cpu():
+    cache = jnp.zeros((8, ROW), jnp.int32)
+    records = jnp.asarray([0, 2, -1], jnp.int32)
+    words = jnp.ones((3, ROW * 2), jnp.int32)
+    out = v2_cache.scatter_cache_values(cache, records, words)
+    assert out.shape == cache.shape
+    np.testing.assert_array_equal(np.asarray(out[0]), 1)
+    np.testing.assert_array_equal(np.asarray(out[1]), 1)
+    np.testing.assert_array_equal(np.asarray(out[4]), 1)
+    np.testing.assert_array_equal(np.asarray(out[5]), 1)
+    np.testing.assert_array_equal(np.asarray(out[2]), 0)
+
+
+def test_scatter_cache_values_sub_row_tpu_merge(monkeypatch):
+    cache = jnp.zeros((8, ROW), jnp.int32)
+    records = jnp.asarray([0, 1], jnp.int32)
+    words = jnp.ones((2, ROW // 2), jnp.int32)
+    monkeypatch.setattr(v2_cache.jax, "default_backend", lambda: "tpu")
+    calls = []
+    real = v2_cache.merge_sub_rows
+    monkeypatch.setattr(
+        v2_cache, "merge_sub_rows", lambda c, r, w: calls.append(1) or real(c, r, w)
+    )
+    with pltpu.force_tpu_interpret_mode():
+        out = v2_cache.scatter_cache_values(cache, records, words)
+    assert calls == [1]
+    assert out.shape == cache.shape
