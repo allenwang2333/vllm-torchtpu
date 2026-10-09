@@ -410,6 +410,7 @@ def _patch_moe_runner_fused_decode_layer() -> None:
     cls = _mr.MoERunner
     if getattr(cls, "_tpu_fused_decode_layer_patch", False):
         return
+    upstream_init = cls.__init__
     upstream_apply = cls._apply_quant_method
     upstream_combine = cls._maybe_combine
     upstream_scale = cls._maybe_apply_routed_scale_to_output
@@ -437,7 +438,12 @@ def _patch_moe_runner_fused_decode_layer() -> None:
         gate = getattr(self._quant_method, "tpu_fused_decode_shared_operands", None)
         if gate is None:
             return None
-        return gate(self.routed_experts, hidden_states, shared._layer)
+        return gate(
+            self.routed_experts,
+            hidden_states,
+            shared._layer,
+            float(self.routed_scaling_factor),
+        )
 
     def apply_quant_method(
         self,
@@ -461,7 +467,7 @@ def _patch_moe_runner_fused_decode_layer() -> None:
                 shared_experts_overlapping,
             )
         routed = self.routed_experts
-        routed._tpu_fused_decode_layer = (operands, float(self.routed_scaling_factor))
+        routed._tpu_fused_decode_layer = operands
         try:
             fused_out = routed.forward_monolithic(
                 x=hidden_states, router_logits=router_logits, input_ids=input_ids
@@ -485,6 +491,13 @@ def _patch_moe_runner_fused_decode_layer() -> None:
             return shared_output, fused_output  # applied in-kernel
         return upstream_scale(self, shared_output, fused_output)
 
+    def init(self, *args, **kwargs):
+        upstream_init(self, *args, **kwargs)
+        # Read at weight load (fp8 process_weights_after_loading), which runs
+        # after model construction, to build the persistent scale operand.
+        self.routed_experts._tpu_runner_routed_scale = float(self.routed_scaling_factor)
+
+    cls.__init__ = init
     cls._apply_quant_method = apply_quant_method
     cls._maybe_combine = maybe_combine
     cls._maybe_apply_routed_scale_to_output = maybe_apply_routed_scale

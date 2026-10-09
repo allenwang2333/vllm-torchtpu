@@ -128,6 +128,7 @@ def _kernel(
     x_ref,
     ids_ref,
     w_ref,
+    rscale_ref,
     w1_hbm,
     w2_hbm,
     s1_hbm,
@@ -140,7 +141,6 @@ def _kernel(
     topk,
     num_buffers,
     shared_i,
-    routed_scale,
 ):
     if shared_i:
         ws13_hbm, ss13_ref, ws2_hbm, ss2_ref = rest[:4]
@@ -346,15 +346,13 @@ def _kernel(
 
     # 7. One BF16 write: routed FP32 sum (x the runner's routed scale, when
     #    it is moved in here) + the shared expert at coefficient 1.
-    routed = owner_ref[...]
-    if routed_scale != 1.0:
-        routed = routed * jnp.float32(routed_scale)
+    routed = owner_ref[...] * rscale_ref[...]
     if shared_i:
         routed = routed + sh_ref[...].astype(jnp.float32)
     out_ref[...] = routed.astype(jnp.bfloat16)
 
 
-@functools.partial(jax.jit, static_argnames=("routed_scale",))
+@jax.jit
 def dense_expert_moe_fused(
     hidden,
     w1,
@@ -365,8 +363,7 @@ def dense_expert_moe_fused(
     topk_ids,
     experts_start=None,
     shared=None,
-    *,
-    routed_scale=1.0,
+    routed_scale=None,
 ):
     """Local routed (+ optional shared) contribution, BF16 [tokens, hidden].
 
@@ -377,7 +374,8 @@ def dense_expert_moe_fused(
     to ``hidden.dtype`` first, as fused_moe_func does for the incumbent.
     ``shared`` is None or (ws13 f8[H, 2*Is], ws13_scale f32[2*Is],
     ws2 f8[Is, H], ws2_scale f32[H]); its BF16 output is added in FP32 with
-    coefficient 1. ``routed_scale`` (static) multiplies the routed FP32 sum
+    coefficient 1. ``routed_scale`` (f32 scalar array, traced; None = 1)
+    multiplies the routed FP32 sum
     before that add -- the MoE runner's ``routed_scaling_factor`` when the
     caller moves it in here, instead of scaling the BF16 output afterwards.
     Callers must first check can_use_dense_expert_fused.
@@ -400,13 +398,19 @@ def dense_expert_moe_fused(
     else:
         offset = jnp.asarray(experts_start, jnp.int32).reshape(1)
 
+    if routed_scale is None:
+        routed_scale = jnp.ones((1, 1), jnp.float32)
+    else:
+        routed_scale = jnp.asarray(routed_scale, jnp.float32).reshape(1, 1)
     in_specs = [
+        pl.BlockSpec(memory_space=pltpu.VMEM),
         pl.BlockSpec(memory_space=pltpu.VMEM),
         pl.BlockSpec(memory_space=pltpu.VMEM),
         pl.BlockSpec(memory_space=pltpu.VMEM),
         *[pl.BlockSpec(memory_space=pltpu.HBM)] * 4,
     ]
-    operands = [ids, wbits, offset, hidden, ids, weights, w1, w2, s1, s2]
+    operands = [ids, wbits, offset, hidden, ids, weights, routed_scale]
+    operands += [w1, w2, s1, s2]
     scratch = [
         pltpu.VMEM((num_buffers, h, 2 * i), jnp.float8_e4m3fn),
         pltpu.VMEM((num_buffers, i, h), jnp.float8_e4m3fn),
@@ -453,7 +457,6 @@ def dense_expert_moe_fused(
             topk=topk,
             num_buffers=num_buffers,
             shared_i=shared_i,
-            routed_scale=float(routed_scale),
         ),
         out_shape=jax.ShapeDtypeStruct((m, h), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
