@@ -45,6 +45,7 @@ from vllm.models.deepseek_v41.common.engram import (
     compute_hash_multipliers,
 )
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.tp_collectives import (
     tp_all_gather,
     tp_shard_slice,

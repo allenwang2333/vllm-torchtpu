@@ -149,7 +149,15 @@ def _signature(graph: fx.GraphModule) -> tuple:
         )
         return (str(value.dtype), dims)
 
-    return tuple(shape(value) for value in _placeholder_values(graph))
+    sig = []
+    for node in graph.graph.nodes:
+        if node.op != "placeholder":
+            break
+        value = node.meta.get("example_value", node.meta.get("val"))
+        if value is not None:
+            tgt = str(node.target)
+            sig.append((tgt if tgt.startswith("L_self_") else None, shape(value)))
+    return tuple(sig)
 
 
 def graph_signature(graph: fx.GraphModule) -> tuple:

@@ -340,6 +340,16 @@ class DeepseekV41DecoderLayer(nn.Module):
         torch.Tensor,
         torch.Tensor | None,
     ]:
+        _ = [
+            torch.ops.aten.alias.default(t)
+            for _, t in self.named_parameters(recurse=True)
+            if t is not None
+        ]
+        _ = [
+            torch.ops.aten.alias.default(b)
+            for _, b in self.named_buffers(recurse=True)
+            if b is not None
+        ]
         ops = self.mhc_ops
         if (
             getattr(self, "_hc_attn_fn_split", None) is None
