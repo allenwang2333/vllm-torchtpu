@@ -457,6 +457,16 @@ class TPUWorker(WorkerBase):
         is_first_rank = pp_group.is_first_rank
         is_last_rank = pp_group.is_last_rank
 
+        # A tensor-parallel pipeline stage launches its collectives on its own
+        # schedule (the last stage alone all-gathers the logits), so its groups
+        # must compile for the stage's devices only (torch_tpu#4387). Must run
+        # before the first collective of those groups.
+        from vllm_torchtpu.distributed.stage_groups import (
+            make_stage_groups_standalone,
+        )
+
+        make_stage_groups_standalone(self.parallel_config)
+
         # TODO: Fix device assignment
         # WorkerBase declares `nn.Module | None`; this worker always holds a
         # TPUModelRunner from here on.

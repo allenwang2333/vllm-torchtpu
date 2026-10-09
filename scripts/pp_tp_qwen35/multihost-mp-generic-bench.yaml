@@ -78,6 +78,13 @@ spec:
                   value: '{{ .MASTER_PORT | default "29500" }}'
                 - name: ENABLE_XPROF
                   value: '{{ .ENABLE_XPROF | default "0" }}'
+                # torch_tpu override. The image's torch_tpu (release.2026.9.22)
+                # compiles subgroup collectives slice-wide, so a TP pipeline
+                # stage hangs at its first uneven launch. Default: Yin's
+                # google-pytorch/torch_tpu#4387 build (standalone subgroups).
+                # Set TORCH_TPU_WHEEL="" to keep the image's torch_tpu.
+                - name: TORCH_TPU_WHEEL
+                  value: '{{ .TORCH_TPU_WHEEL | default "gs://yinlin-tpu-bucket-us/pp4pcp2/torch_tpu-0.1.2.dev20261006192405-cp312-cp312-manylinux_2_31_x86_64.whl" }}'
                 command: ["/bin/bash", "-c"]
                 args:
                   - |
@@ -85,6 +92,15 @@ spec:
                     export TPU_NODE_ID=${JOBSET_JOB_INDEX}
                     export TPU_WORKER_ID=${JOBSET_JOB_INDEX}
                     mkdir -p "${CDK_OUTPUT_DIR}"
+
+                    if [ -n "${TORCH_TPU_WHEEL}" ]; then
+                      echo "Installing torch_tpu override: ${TORCH_TPU_WHEEL}"
+                      mkdir -p /tmp/wheels
+                      gcloud storage cp "${TORCH_TPU_WHEEL}" /tmp/wheels/
+                      pip install --no-deps --force-reinstall --quiet /tmp/wheels/*.whl
+                      pip show torch_tpu | grep -E "^(Name|Version)"
+                      python3 -c "from torch_tpu._internal.distributed.spmd_util import make_standalone; print('make_standalone: OK')"
+                    fi
 
                     if [ -d "/workspace/vllm-torchtpu/src/vllm_torchtpu" ]; then
                       # The mapped checkout shadows the image's install via

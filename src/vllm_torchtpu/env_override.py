@@ -247,7 +247,10 @@ if os.environ.get("TPU_DISABLE_PR989_KERNELS", "0").strip().lower() in (
     _set_env("TPU_FUSED_QK_NORM_ROPE", "0")
     _set_env("TPU_EXPERT_PLACEMENT", "")
 else:
-    _set_env("USE_MOE_FUSED_EP_KERNEL", "1")
+    # Default the fused EP kernel on, but keep an explicit recipe setting
+    # (e.g. USE_MOE_FUSED_EP_KERNEL=0 for PP x TP stages) as given.
+    if "USE_MOE_FUSED_EP_KERNEL" not in os.environ:
+        _set_env("USE_MOE_FUSED_EP_KERNEL", "1")
     if os.environ.get("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS") in (None, "", "33"):
         _set_env("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "64")
 
