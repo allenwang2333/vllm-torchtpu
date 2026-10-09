@@ -471,8 +471,7 @@ def lower_glm_row_spans(
             dst_offset_bytes=page * live_bytes_per_block,
             size_bytes=(tail_bytes if page == num_pages - 1 else live_bytes_per_block),
         )
-        for page in range(num_pages)
-        if page % parallelism == transfer_rank
+        for page in range(transfer_rank, num_pages, parallelism)
     )
     return PoolSpanRegistration(
         tag=tag,
@@ -534,8 +533,7 @@ def lower_dsv4_row_spans(
             dst_offset_bytes=page * live_bytes_per_block,
             size_bytes=(tail_bytes if page == num_pages - 1 else live_bytes_per_block),
         )
-        for page in range(num_pages)
-        if page % parallelism == transfer_rank
+        for page in range(transfer_rank, num_pages, parallelism)
     )
     return PoolSpanRegistration(
         tag=tag,

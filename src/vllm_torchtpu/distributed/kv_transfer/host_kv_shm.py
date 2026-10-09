@@ -17,6 +17,7 @@ Free-list is held on rank-0 only. Other ranks compute offsets from
 """
 
 import ctypes
+import math
 import os
 import queue
 import threading
@@ -70,7 +71,7 @@ def _shm_base_addr(shm: shared_memory.SharedMemory) -> int:
 
 
 def _dtype_bytes(dtype: torch.dtype) -> int:
-    return torch.tensor([], dtype=dtype).element_size()
+    return dtype.itemsize
 
 
 @dataclass(frozen=True)
@@ -88,10 +89,7 @@ class PoolSpec:
 
     @property
     def per_layer_bytes(self) -> int:
-        n = 1
-        for d in self.layer_shard_shape:
-            n *= d
-        return n * _dtype_bytes(self.dtype)
+        return math.prod(self.layer_shard_shape) * _dtype_bytes(self.dtype)
 
     @property
     def per_rank_bytes(self) -> int:
@@ -293,9 +291,7 @@ class HostKVShmPool:
             + rank * spec.per_rank_bytes
             + layer_idx * spec.per_layer_bytes
         )
-        count = num_blocks
-        for d in spec.layer_shard_shape[1:]:
-            count *= d
+        count = num_blocks * math.prod(spec.layer_shard_shape[1:])
         # frombuffer returns a flat tensor; reshape to the layer shard shape
         # with the actual block count on dim 0.
         flat = torch.frombuffer(
@@ -306,9 +302,9 @@ class HostKVShmPool:
 
     def _used_per_layer(self, num_blocks: int) -> int:
         """Bytes used by one layer's shard at the actual block count."""
-        bytes_per_block = _dtype_bytes(self.spec.dtype)
-        for d in self.spec.layer_shard_shape[1:]:
-            bytes_per_block *= d
+        bytes_per_block = _dtype_bytes(self.spec.dtype) * math.prod(
+            self.spec.layer_shard_shape[1:]
+        )
         return bytes_per_block * num_blocks
 
     def pack_rank(self, slot_idx: int, rank: int, num_blocks: int) -> bytes:
@@ -316,6 +312,7 @@ class HostKVShmPool:
         contiguous bytes buffer (strips per-layer padding). Suitable as a ZMQ
         payload frame."""
         spec = self.spec
+        per_layer_bytes = spec.per_layer_bytes
         rank_start = slot_idx * spec.per_slot_bytes + rank * spec.per_rank_bytes
         used = self._used_per_layer(num_blocks)
         out = bytearray(used * spec.num_layers)
@@ -323,7 +320,7 @@ class HostKVShmPool:
         buf = self._shm.buf
         assert buf is not None
         for li in range(spec.num_layers):
-            layer_off = rank_start + li * spec.per_layer_bytes
+            layer_off = rank_start + li * per_layer_bytes
             out[pos : pos + used] = buf[layer_off : layer_off + used]
             pos += used
         return bytes(out)
@@ -338,6 +335,7 @@ class HostKVShmPool:
         sendmsg from shm straight to the NIC buffer. The returned views
         alias live shm and must not outlive the current slot."""
         spec = self.spec
+        per_layer_bytes = spec.per_layer_bytes
         rank_start = slot_idx * spec.per_slot_bytes + rank * spec.per_rank_bytes
         used = self._used_per_layer(num_blocks)
         buf = self._shm.buf
@@ -345,7 +343,7 @@ class HostKVShmPool:
         base = memoryview(buf)
         out: list[memoryview] = []
         for li in range(spec.num_layers):
-            layer_off = rank_start + li * spec.per_layer_bytes
+            layer_off = rank_start + li * per_layer_bytes
             out.append(base[layer_off : layer_off + used])
         return out
 
@@ -362,6 +360,7 @@ class HostKVShmPool:
                 f"unpack_rank_layers: got {len(layer_buffers)} layers, "
                 f"expected {spec.num_layers}"
             )
+        per_layer_bytes = spec.per_layer_bytes
         rank_start = slot_idx * spec.per_slot_bytes + rank * spec.per_rank_bytes
         used = self._used_per_layer(num_blocks)
         for li, buf in enumerate(layer_buffers):
@@ -371,7 +370,7 @@ class HostKVShmPool:
                     f"unpack_rank_layers: layer {li} size {src.nbytes} != "
                     f"expected {used} (num_blocks={num_blocks})"
                 )
-            layer_off = rank_start + li * spec.per_layer_bytes
+            layer_off = rank_start + li * per_layer_bytes
             self._copy_into_shm(layer_off, src, used)
 
     def _copy_into_shm(self, offset: int, src: memoryview, nbytes: int) -> None:
@@ -398,6 +397,7 @@ class HostKVShmPool:
         """Inverse of pack_rank: scatter a received contiguous payload into
         the per-layer regions of this slot/rank."""
         spec = self.spec
+        per_layer_bytes = spec.per_layer_bytes
         rank_start = slot_idx * spec.per_slot_bytes + rank * spec.per_rank_bytes
         used = self._used_per_layer(num_blocks)
         expected = used * spec.num_layers
@@ -410,7 +410,7 @@ class HostKVShmPool:
         buf = self._shm.buf
         assert buf is not None
         for li in range(spec.num_layers):
-            layer_off = rank_start + li * spec.per_layer_bytes
+            layer_off = rank_start + li * per_layer_bytes
             buf[layer_off : layer_off + used] = mv[li * used : (li + 1) * used]
 
     # ---- Lifecycle ------------------------------------------------------

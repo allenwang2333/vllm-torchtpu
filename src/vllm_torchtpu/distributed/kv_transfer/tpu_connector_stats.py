@@ -149,11 +149,8 @@ class TpuKVConnectorStats(KVConnectorStats):
         decode_queue_length = np.asarray(self.data.get("decode_queue_length", []))
 
         total_mb = mb_transferred.sum()
-        avg_mb = (
-            total_mb / self.num_successful_transfers
-            if self.num_successful_transfers > 0
-            else 0
-        )
+        num_successful = self.num_successful_transfers
+        avg_mb = total_mb / num_successful if num_successful > 0 else 0
 
         total_time_seconds = kv_pull_time.sum() / 1e3
         throughput_mb_s = total_mb / total_time_seconds if total_time_seconds > 0 else 0
@@ -175,7 +172,7 @@ class TpuKVConnectorStats(KVConnectorStats):
             )
             if h2d_transfer_time.size > 0
             else 0.0,
-            "Num successful transfers": self.num_successful_transfers,
+            "Num successful transfers": num_successful,
             "Num failed transfers": self.data["num_failed_transfers"],
             "Avg KV pull time (ms)": round(kv_pull_time.mean(), 3)
             if kv_pull_time.size > 0
@@ -336,12 +333,12 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         base_labels = list(labelnames) if labelnames is not None else []
         # Dynamically load TPU Raiden C++ metric schema descriptors
         metric_defs = {}
+        descriptors = []
         try:
             # Without this call, get_metric_metadata won't return the correct
             # metrics definitions
             dist_utils.configure_raiden_telemetry()
             telemetry = dist_utils.get_raiden_telemetry_module()
-            descriptors = []
             if telemetry is not None and hasattr(telemetry, "get_metric_metadata"):
                 descriptors = telemetry.get_metric_metadata()
         except Exception as e:

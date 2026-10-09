@@ -43,6 +43,7 @@ def _row_major_minor_to_major(rank: int) -> tuple[int, ...]:
 EXPECTED_FA_MINOR_TO_MAJOR = _row_major_minor_to_major(5)
 EXPECTED_BLOCK_MAJOR_FA_MINOR_TO_MAJOR = _row_major_minor_to_major(6)
 ROW_CACHE_MINOR_TO_MAJOR = _row_major_minor_to_major(4)
+WORD_ROW_MINOR_TO_MAJOR = _row_major_minor_to_major(3)
 EXPECTED_FA_TILES = ((4, 128), (4, 1))
 FA_LAYOUT_FINGERPRINT_SCHEMA = "qwen35-fa-raw-layout-fingerprint-v1"
 GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA = "glm-mla-raw-layout-fingerprint-v1"
@@ -387,7 +388,7 @@ def _measure_packed_row_layouts(
                     f"match page_tokens {page_tokens}"
                 )
         expected_order = (
-            _row_major_minor_to_major(3) if word_rows else ROW_CACHE_MINOR_TO_MAJOR
+            WORD_ROW_MINOR_TO_MAJOR if word_rows else ROW_CACHE_MINOR_TO_MAJOR
         )
         if minor_to_major != expected_order:
             raise RuntimeError(

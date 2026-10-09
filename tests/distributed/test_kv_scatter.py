@@ -29,10 +29,24 @@ from vllm_torchtpu.distributed.kv_transfer.kv_scatter import (
 )
 
 
+def _has_tpu_device() -> bool:
+    import os
+
+    if os.environ.get("JAX_PLATFORMS", "").lower() == "cpu":
+        return False
+    try:
+        tpu_mod = getattr(torch, "tpu", None)
+        return bool(tpu_mod is not None and tpu_mod.is_available())
+    except Exception:
+        return False
+
+
 def _subprocess_worker(target, queue):
     try:
         target()
         queue.put(("OK", None))
+    except pytest.skip.Exception as exc:
+        queue.put(("SKIP", str(exc)))
     except BaseException:
         queue.put(("ERROR", traceback.format_exc()))
 
@@ -42,6 +56,8 @@ def _run_in_subprocess(target):
 
     `target` must be a top-level function so it's picklable for spawn.
     """
+    if not _has_tpu_device():
+        pytest.skip("TPU device not available")
     ctx = multiprocessing.get_context("spawn")
     queue = ctx.Queue()
     p = ctx.Process(target=_subprocess_worker, args=(target, queue))
@@ -50,6 +66,8 @@ def _run_in_subprocess(target):
     if p.exitcode != 0 and queue.empty():
         raise AssertionError(f"Isolated TPU test crashed (exitcode={p.exitcode})")
     status, payload = queue.get()
+    if status == "SKIP":
+        pytest.skip(payload)
     if status == "ERROR":
         raise AssertionError(f"Isolated TPU test failed:\n{payload}")
 

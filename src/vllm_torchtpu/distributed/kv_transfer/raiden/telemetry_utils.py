@@ -11,11 +11,12 @@ _LABEL_PAIR_REGEX = re.compile(
     r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"([^"\\]*(?:\\.[^"\\]*)*)"'
 )
 _UNESCAPE_PATTERN = re.compile(r'\\([\\n"tr])')
+_UNESCAPE_MAP = {"n": "\n", "t": "\t", "r": "\r"}
 
 
 def _unescape_match(match: re.Match) -> str:
     escaped = match.group(1)
-    return {"n": "\n", "t": "\t", "r": "\r"}.get(escaped, escaped)
+    return _UNESCAPE_MAP.get(escaped, escaped)
 
 
 def parse_raiden_metric_key(raw_key: str) -> tuple[str, dict[str, str]]:
@@ -24,9 +25,10 @@ def parse_raiden_metric_key(raw_key: str) -> tuple[str, dict[str, str]]:
     tpu_raiden_sent_bytes_total{direction="push"} into base name and labels
     dict.
     """
-    match = _LABELED_METRIC_KEY_REGEX.fullmatch(raw_key.strip())
+    stripped = raw_key.strip()
+    match = _LABELED_METRIC_KEY_REGEX.fullmatch(stripped)
     if not match:
-        return raw_key.strip(), {}
+        return stripped, {}
 
     base_name = match.group(1)
     raw_labels = match.group(2)
