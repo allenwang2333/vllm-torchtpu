@@ -233,6 +233,9 @@ local premappedBufferSize = cdk.var('TPU_PREMAPPED_BUFFER_SIZE', '4294967296');
 // vllm-torchtpu ee93d4833+: after loading, log the CPU tensor storage still reachable and what holds
 // it, to find what keeps the staged weights resident. 0 turns it off.
 local logHostTensorsAfterLoad = cdk.var('TPU_LOG_HOST_TENSORS_AFTER_LOAD', '1');
+// Steps between each rank's "step timing" log line (step period by DP token bucket, vllm-torchtpu
+// runner/step_timing_log.py); 0 turns it off.
+local stepTimingLogSteps = cdk.var('TPU_STEP_TIMING_LOG_STEPS', '2000');
 
 // --- Benchmark client --------------------------------------------------------
 local fastMode = cdk.boolVar('FAST', false) || cdk.boolVar('FAST_MODE', false);
@@ -637,6 +640,7 @@ local serverJob = cdk.job(
           'TPU_PREMAPPED_BUFFER_SIZE',
           'TPU_PREMAPPED_BUFFER_TRANSFER_THRESHOLD_BYTES',
           'TPU_LOG_HOST_TENSORS_AFTER_LOAD',
+          'TPU_STEP_TIMING_LOG_STEPS',
           'TPU_PJRT_EVENT_TRACE_ENABLE',
           'USE_PHASED_PROFILER',
           'VLLM_TPU_MOST_MODEL_LEN',
@@ -664,6 +668,7 @@ local serverJob = cdk.job(
         [if premappedBufferSize != 'none' then 'TPU_PREMAPPED_BUFFER_SIZE']: premappedBufferSize,
         [if premappedBufferSize != 'none' then 'TPU_PREMAPPED_BUFFER_TRANSFER_THRESHOLD_BYTES']: premappedBufferSize,
         TPU_LOG_HOST_TENSORS_AFTER_LOAD: logHostTensorsAfterLoad,
+        TPU_STEP_TIMING_LOG_STEPS: stepTimingLogSteps,
         // Read by the scheduler in the EngineCore processes, not by Ray workers.
         [if prefillGateMinCadences != '' then 'TPU_PREFILL_GATE_MIN_CADENCES']: prefillGateMinCadences,
         [if prefillGateLogSteps != '' then 'TPU_PREFILL_GATE_LOG_STEPS']: prefillGateLogSteps,

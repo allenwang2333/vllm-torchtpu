@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     DP_SCHED_ENABLED: bool = False
     TPU_PREFILL_GATE_MIN_CADENCES: int = 0
     TPU_PREFILL_GATE_LOG_STEPS: int = 1000
+    TPU_STEP_TIMING_LOG_STEPS: int = 0
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -624,6 +625,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PREFILL_GATE_LOG_STEPS": env_nonnegative_int(
         "TPU_PREFILL_GATE_LOG_STEPS", 1000
     ),
+    # Steps between per-rank "step timing" log lines: the step period grouped
+    # by DP token bucket (runner/step_timing_log.py). 0 disables it.
+    "TPU_STEP_TIMING_LOG_STEPS": env_nonnegative_int("TPU_STEP_TIMING_LOG_STEPS", 0),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
