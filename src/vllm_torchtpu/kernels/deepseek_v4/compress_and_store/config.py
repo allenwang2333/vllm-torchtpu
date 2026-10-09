@@ -38,6 +38,8 @@ Modes:
 
 import dataclasses
 import enum
+import functools
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -57,7 +59,7 @@ class Mode(enum.Enum):
     CSA_INDEXER = "csa_indexer"
 
 
-_MODE_DEFAULTS = {
+_MODE_DEFAULTS: dict[Mode, dict[str, Any]] = {
     Mode.HCA: dict(
         head_dim=512,
         rope_head_dim=64,
@@ -168,6 +170,7 @@ _PEER_MODE: dict[Mode, Mode] = {
 }
 
 
+@functools.lru_cache(maxsize=64)
 def state_block_size(
     mode: Mode,
     kv_cache_block_size: int,

@@ -186,8 +186,12 @@ def mhc_pre_mixes_collapse(
     hidden_size = hc_hidden // hc_mult
 
     fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
-    sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
-    hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
+    sc2d = hc_scale.reshape(1, 3)
+    if sc2d.dtype != jnp.float32:
+        sc2d = sc2d.astype(jnp.float32)
+    hb2d = hc_base.reshape(1, hc_mult3)
+    if hb2d.dtype != jnp.float32:
+        hb2d = hb2d.astype(jnp.float32)
 
     def _vmem_need(tb: int) -> int:
         # Double-buffered bf16 x block + layer output, transient f32

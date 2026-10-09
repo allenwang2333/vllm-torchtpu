@@ -108,11 +108,15 @@ def derive_metadata(
     )
 
     # 2. Map tokens to request indices (Handles Ragged Batch)
-    query_lens = jnp.diff(query_start_loc)
     batch_size = query_start_loc.shape[0] - 1
-    token_to_req_indices = jnp.repeat(
-        jnp.arange(batch_size), query_lens, total_repeat_length=num_tokens
-    )
+    token_to_req_indices = jnp.minimum(
+        jnp.searchsorted(
+            query_start_loc[1:],
+            jnp.arange(num_tokens, dtype=query_start_loc.dtype),
+            side="right",
+        ),
+        batch_size - 1,
+    ).astype(jnp.int32)
     req = token_to_req_indices
 
     block_table_stride = block_table_row_stride(block_table, batch_size)
@@ -193,9 +197,7 @@ def prepare_boundary_batch(
 
     # 3. Calculate row-tiling ONLY for prefill tokens
     row = jnp.where(is_prefill, kv // rope_pack, -1)
-    row_shifted = jnp.roll(row, 1)
-    starts_row = (row != row_shifted) & is_prefill
-    starts_row = starts_row.at[0].set(is_prefill[0])
+    starts_row = is_prefill & jnp.pad(row[1:] != row[:-1], (1, 0), constant_values=True)
 
     tile_index = jnp.cumsum(starts_row.astype(jnp.int32)) - 1
 

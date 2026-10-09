@@ -73,7 +73,9 @@ def mhc_post_2d(
     hc_mult = comb_res_mix.shape[-1]
     hidden_size = res2d.shape[-1] // hc_mult
 
-    x2d = x.reshape(-1, hidden_size).astype(jnp.bfloat16)
+    x2d = x.reshape(-1, hidden_size)
+    if x2d.dtype != jnp.bfloat16:
+        x2d = x2d.astype(jnp.bfloat16)
     post2d = post_layer_mix.reshape(-1, hc_mult)
     comb2d = comb_res_mix.reshape(-1, hc_mult * hc_mult)
     num_tokens = res2d.shape[0]

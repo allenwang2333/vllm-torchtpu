@@ -110,7 +110,11 @@ def split_fn3(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     rem = fn - fn_hi
     fn_mid = jax.lax.reduce_precision(rem, 8, 7)
     fn_lo = jax.lax.reduce_precision(rem - fn_mid, 8, 7)
-    return tuple(t.astype(jnp.bfloat16) for t in (fn_hi, fn_mid, fn_lo))
+    return (
+        fn_hi.astype(jnp.bfloat16),
+        fn_mid.astype(jnp.bfloat16),
+        fn_lo.astype(jnp.bfloat16),
+    )
 
 
 def mhc_pre_gates(

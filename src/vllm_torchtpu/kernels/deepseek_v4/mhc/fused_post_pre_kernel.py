@@ -52,13 +52,14 @@ def _fused_kernel(
     # leaving VMEM headroom for the pipeline to prefetch the next block.
     # bf16 -> f32 casts are exact, so results are unchanged.
     x_bf = x_ref[...]  # (tb, hidden) bf16
+    x_f = x_bf.astype(jnp.float32)
     old_bf = [
         res_ref[:, i * hidden_size : (i + 1) * hidden_size] for i in range(hc_mult)
     ]
 
     streams_bf = []
     for j in range(hc_mult):
-        acc = post[:, j : j + 1] * x_bf.astype(jnp.float32)
+        acc = post[:, j : j + 1] * x_f
         for i in range(hc_mult):
             k = i * hc_mult + j
             acc = acc + comb[:, k : k + 1] * old_bf[i].astype(jnp.float32)
@@ -169,8 +170,12 @@ def fused_post_pre_mixes(
     x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
 
     fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
-    sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
-    hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
+    sc2d = hc_scale.reshape(1, 3)
+    if sc2d.dtype != jnp.float32:
+        sc2d = sc2d.astype(jnp.float32)
+    hb2d = hc_base.reshape(1, hc_mult3)
+    if hb2d.dtype != jnp.float32:
+        hb2d = hb2d.astype(jnp.float32)
 
     compiler_params = utils.compiler_params(vmem_limit_bytes)
 
@@ -240,7 +245,9 @@ def mhc_fused_post_pre(
     outer_shape = residual.shape[:-2]
     hc_mult, hidden_size = residual.shape[-2:]
 
-    x2d = x.reshape(-1, hidden_size).astype(jnp.bfloat16)
+    x2d = x.reshape(-1, hidden_size)
+    if x2d.dtype != jnp.bfloat16:
+        x2d = x2d.astype(jnp.bfloat16)
     res2d = residual.reshape(-1, hc_mult * hidden_size)
     post2d = post_layer_mix.reshape(-1, hc_mult)
     comb2d = comb_res_mix.reshape(-1, hc_mult * hc_mult)

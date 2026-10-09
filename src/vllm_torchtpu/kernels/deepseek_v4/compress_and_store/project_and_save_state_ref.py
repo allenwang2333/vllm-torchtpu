@@ -66,9 +66,7 @@ def ref_wkv_proj_and_save_state(
     num_tokens_flat = num_pages * tokens_per_page
     valid = slot_mapping >= 0
     slots = jnp.where(valid, slot_mapping // slots_per_token, num_tokens_flat)
-    flat_padded = jnp.concatenate([flat, jnp.zeros((1, state_dim))], axis=0)
-    flat_padded = flat_padded.at[slots].set(packed)
-    flat = flat_padded[:-1]
+    flat = flat.at[slots].set(packed, mode="drop")
 
     # 5. Pack inline back
     chunk_bytes = jax.lax.bitcast_convert_type(flat, jnp.uint8)

@@ -18,6 +18,7 @@ import jax.numpy as jnp
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 
 _FP8_E4M3_MAX = float(jnp.finfo(jnp.float8_e4m3fn).max)
+_INV_FP8_E4M3_MAX = 1.0 / _FP8_E4M3_MAX
 
 
 def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
@@ -25,7 +26,7 @@ def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
     *lead, dim = x.shape
     blocked = x.reshape(*lead, dim // block_size, block_size)
     amax = jnp.clip(jnp.max(jnp.abs(blocked), axis=-1, keepdims=True), 1e-4, None)
-    scale = jnp.exp2(jnp.ceil(jnp.log2(amax / _FP8_E4M3_MAX)))
+    scale = jnp.exp2(jnp.ceil(jnp.log2(amax * _INV_FP8_E4M3_MAX)))
     q = (blocked * (1.0 / scale)).astype(jnp.float8_e4m3fn).reshape(x.shape)
     scale = jnp.squeeze(scale, -1).astype(jnp.float8_e8m0fnu)
     return q, scale
@@ -42,7 +43,7 @@ def quantize_fp8_lane_periodic(x: jax.Array, period: int, nope_dim: int):
     amax = jnp.clip(
         jnp.max(kept.reshape(*x.shape[:-1], dim // period, period), axis=-2), 1e-4, None
     )
-    scale = jnp.exp2(jnp.ceil(jnp.log2(amax / _FP8_E4M3_MAX)))
+    scale = jnp.exp2(jnp.ceil(jnp.log2(amax * _INV_FP8_E4M3_MAX)))
     q = (x / jnp.tile(scale, dim // period)).astype(jnp.float8_e4m3fn)
     return q, scale.astype(jnp.float8_e8m0fnu)
 
@@ -148,11 +149,12 @@ def compress_norm_rope(
 
     # rms_weight: [1, D]
     # normed: [N, D]
-    normed = (
-        compressed_kv
-        * jax.lax.rsqrt(variance + rms_eps)
-        * rms_weight[None, :].astype(compressed_kv.dtype)
+    weight = (
+        rms_weight
+        if rms_weight.dtype == compressed_kv.dtype
+        else rms_weight.astype(compressed_kv.dtype)
     )
+    normed = compressed_kv * jax.lax.rsqrt(variance + rms_eps) * weight[None, :]
 
     # cos_sin: [N, R]
     cos_sin = cos_sin_cache[compressed_pos]
