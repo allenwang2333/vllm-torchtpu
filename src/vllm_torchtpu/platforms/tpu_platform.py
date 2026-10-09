@@ -932,7 +932,10 @@ class TpuPlatform(Platform):
             dcp_size = int(
                 getattr(parallel_config, "decode_context_parallel_size", 1) or 1
             )
-            if "TPU_EXPERT_PLACEMENT" not in os.environ:
+            ep_size = int(parallel_config.tensor_parallel_size) * int(
+                parallel_config.data_parallel_size
+            )
+            if "TPU_EXPERT_PLACEMENT" not in os.environ and ep_size == 8:
                 from vllm_torchtpu import expert_placement
 
                 table = expert_placement.auto_table(

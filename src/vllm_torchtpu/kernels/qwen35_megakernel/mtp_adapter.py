@@ -198,11 +198,12 @@ class Qwen35MtpMegakernel:
 
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
-        _need(self.tp_size == K.FULL.R, f"tp_size={self.tp_size} != {K.FULL.R}")
+        _need(self.tp_size in (8, 16), f"tp_size={self.tp_size} must be 8 or 16")
         _need(get_pp_group().world_size == 1, "pipeline parallelism")
 
         base_cfg = dataclasses.replace(
             K.FULL_EP,
+            R=self.tp_size,
             L=1,
             att_every=1,
             moe_tp=False,
