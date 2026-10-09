@@ -29,17 +29,25 @@ def swa_attention_state(q, pool, records, scale):
     gathered = gather_cache_values(
         pool, jnp.maximum(records, 0).reshape(-1), dim
     ).reshape(tokens, records.shape[1], dim)
+    q_f32 = q if q.dtype == jnp.float32 else q.astype(jnp.float32)
 
     def step(index, carry):
         maximum, denominator, numerator = carry
-        addresses = jax.lax.dynamic_slice_in_dim(records, index * tile, tile, axis=1)
+        if isinstance(index, int):
+            start = index * tile
+            addresses = records[:, start : start + tile]
+            kv = gathered[:, start : start + tile]
+        else:
+            addresses = jax.lax.dynamic_slice_in_dim(
+                records, index * tile, tile, axis=1
+            )
+            kv = jax.lax.dynamic_slice_in_dim(gathered, index * tile, tile, axis=1)
         valid = addresses >= 0
-        kv = jax.lax.dynamic_slice_in_dim(gathered, index * tile, tile, axis=1)
         kv = jnp.where(valid[..., None], kv, 0)
         scores = (
             jnp.einsum(
                 "thd,tkd->thk",
-                q.astype(jnp.float32),
+                q_f32,
                 kv.astype(jnp.float32),
                 preferred_element_type=jnp.float32,
             )
@@ -58,7 +66,12 @@ def swa_attention_state(q, pool, records, scale):
         )
         return new_max, denominator, numerator
 
-    return jax.lax.fori_loop(0, records.shape[1] // tile, step, state)
+    steps = records.shape[1] // tile
+    if steps <= 8:
+        for index in range(steps):
+            state = step(index, state)
+        return state
+    return jax.lax.fori_loop(0, steps, step, state)
 
 
 def ced_attention_jax(
@@ -176,12 +189,14 @@ def ced_attention(
     q, swa, main, slots, selected, metadata, sink, scale, num_states, *, layout
 ):
     assert _attention_op is not None
+    slots_i32 = slots if slots.dtype == torch.int32 else slots.int()
+    selected_i32 = selected if selected.dtype == torch.int32 else selected.int()
     return _attention_op(
         q,
         swa,
         *main,
-        slots.int(),
-        selected.int(),
+        slots_i32,
+        selected_i32,
         metadata.block_tables,
         metadata.query_start_loc,
         metadata.request_distribution,
