@@ -50,6 +50,63 @@ _compressor_op_cache = {}
 # TODO(patemotter): name it here once the DP-attention PR adds the axis.
 BATCH_AXIS = None
 
+_INDEXER_PARTITION_SPECS = (
+    P(None, None),  # hidden_states
+    P(),  # wkv_wgate
+    P(),  # ape
+    P(),  # norm_weight
+    P(),  # cos_sin_cache
+    P(None),  # positions
+    P(BATCH_AXIS),  # state_block_tables
+    P(),  # query_start_loc
+    P(BATCH_AXIS),  # k_block_tables
+    P(),  # request_distribution
+    P(),  # cache
+)
+_INDEXER_DONATE_ARGNUMS = (len(_INDEXER_PARTITION_SPECS) - 1,)
+_TWO_CACHE_PARTITION_SPECS = (*_INDEXER_PARTITION_SPECS, P())
+_TWO_CACHE_DONATE_ARGNUMS = (
+    *_INDEXER_DONATE_ARGNUMS,
+    len(_TWO_CACHE_PARTITION_SPECS) - 1,
+)
+
+
+def _fake_compressor_indexer(
+    hidden_states,
+    wkv_wgate,
+    ape,
+    norm_weight,
+    cos_sin_cache,
+    positions,
+    state_block_tables,
+    query_start_loc,
+    k_block_tables,
+    request_distribution,
+    cache,
+    *args,
+    **kwargs,
+):
+    return torch.empty_like(cache)
+
+
+def _fake_compressor_two_cache(
+    hidden_states,
+    wkv_wgate,
+    ape,
+    norm_weight,
+    cos_sin_cache,
+    positions,
+    state_block_tables,
+    query_start_loc,
+    k_block_tables,
+    request_distribution,
+    cache,
+    second_cache,
+    *args,
+    **kwargs,
+):
+    return torch.empty_like(cache), torch.empty_like(second_cache)
+
 
 def _run_compressor(
     hidden_states: jax.Array,
@@ -433,25 +490,14 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         if op_name in _compressor_op_cache:
             return _compressor_op_cache[op_name]
 
-        attn_data_axis = None
-        batch_axis = BATCH_AXIS
-        input_partition_specs = (
-            P(attn_data_axis, None),  # hidden_states
-            P(),  # wkv_wgate
-            P(),  # ape
-            P(),  # norm_weight
-            P(),  # cos_sin_cache
-            P(attn_data_axis),  # positions
-            P(batch_axis),  # state_block_tables
-            P(),  # query_start_loc
-            P(batch_axis),  # k_block_tables
-            P(),  # request_distribution
-            P(),  # cache
-        )
-        donate_argnums = (len(input_partition_specs) - 1,)  # cache
-        if variant != "indexer":
-            input_partition_specs += (P(),)  # rope_cache / state_cache
-            donate_argnums += (len(input_partition_specs) - 1,)
+        if variant == "indexer":
+            input_partition_specs = _INDEXER_PARTITION_SPECS
+            donate_argnums = _INDEXER_DONATE_ARGNUMS
+            fake_fn = _fake_compressor_indexer
+        else:
+            input_partition_specs = _TWO_CACHE_PARTITION_SPECS
+            donate_argnums = _TWO_CACHE_DONATE_ARGNUMS
+            fake_fn = _fake_compressor_two_cache
 
         compressor_jax_op = pallas.jax_op(
             op_name,
@@ -461,45 +507,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             input_partition_specs=input_partition_specs,
         )
 
-        if variant == "indexer":
-
-            def _fake_compressor(
-                hidden_states,
-                wkv_wgate,
-                ape,
-                norm_weight,
-                cos_sin_cache,
-                positions,
-                state_block_tables,
-                query_start_loc,
-                k_block_tables,
-                request_distribution,
-                cache,
-                *args,
-                **kwargs,
-            ):
-                return torch.empty_like(cache)
-        else:
-
-            def _fake_compressor(
-                hidden_states,
-                wkv_wgate,
-                ape,
-                norm_weight,
-                cos_sin_cache,
-                positions,
-                state_block_tables,
-                query_start_loc,
-                k_block_tables,
-                request_distribution,
-                cache,
-                second_cache,
-                *args,
-                **kwargs,
-            ):
-                return torch.empty_like(cache), torch.empty_like(second_cache)
-
-        compressor_jax_op.register_fake(_fake_compressor)
+        compressor_jax_op.register_fake(fake_fn)
 
         _compressor_op_cache[op_name] = compressor_jax_op
         return compressor_jax_op
@@ -515,7 +523,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         """
         if cache is None or cache.numel() == 0:
             return None
-        if cache.dtype in (torch.uint8, torch.int32):
+        if cache.dtype is torch.uint8 or cache.dtype is torch.int32:
             return cache
         return cache.view(torch.uint8)
 
@@ -536,9 +544,11 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         # would scatter rows into that layer's pages.
         state_prefix = self.state_cache.prefix
         _k_cache_obj = getattr(self, "k_cache", None)
-        k_cache_prefix = getattr(
-            _k_cache_obj, "prefix", getattr(_k_cache_obj, "custom_prefix", None)
-        ) or getattr(self, "k_cache_prefix", None)
+        k_cache_prefix = (
+            getattr(_k_cache_obj, "prefix", None)
+            or getattr(_k_cache_obj, "custom_prefix", None)
+            or getattr(self, "k_cache_prefix", None)
+        )
         for _name, _key in (("state_cache", state_prefix), ("k_cache", k_cache_prefix)):
             if _key not in attn_ctx:
                 raise KeyError(

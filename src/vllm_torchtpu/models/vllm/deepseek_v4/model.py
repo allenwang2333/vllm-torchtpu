@@ -64,6 +64,20 @@ from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
 
 logger = init_logger(__name__)
 
+_LAYER_IDX_RE = re.compile(r"layers\.(\d+)")
+_FP4_EXPERT_SCALE_RE = re.compile(r"(\.experts\.\d+\.w[123])\.scale$")
+_SCALE_SUFFIX_RE = re.compile(r"\.scale$")
+_STACKED_PARAMS_MAPPING: tuple[tuple[str, str, int], ...] = (
+    # (param_name, shard_name, shard_id)
+    ("gate_up_proj", "w1", 0),
+    ("gate_up_proj", "w3", 1),
+    ("attn.fused_wqa_wkv", "attn.wq_a", 0),
+    ("attn.fused_wqa_wkv", "attn.wkv", 1),
+    ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
+    ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
+)
+_SKIP_MTP_MAPPER = WeightsMapper(orig_to_new_substr={"mtp.": None})
+
 
 class DeepseekV4DecoderLayer(nn.Module):
     """Single transformer decoder layer for DeepSeek-V4 with MHC residual stream."""
@@ -80,7 +94,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.prefix = prefix
 
-        _m = re.search(r"layers\.(\d+)", prefix or "")
+        _m = _LAYER_IDX_RE.search(prefix or "")
         self.layer_idx = int(_m.group(1)) if _m else -1
 
         self.rms_norm_eps = config.rms_norm_eps
@@ -297,7 +311,8 @@ class DeepseekV4Model(nn.Module):
             dtype=torch.int32,
         )
 
-        if get_pp_group().is_first_rank:
+        pp_group = get_pp_group()
+        if pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -318,7 +333,7 @@ class DeepseekV4Model(nn.Module):
             prefix=f"{prefix}.layers",
         )
 
-        if get_pp_group().is_last_rank:
+        if pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
@@ -336,7 +351,7 @@ class DeepseekV4Model(nn.Module):
             requires_grad=False,
         )
 
-        if get_pp_group().is_last_rank:
+        if pp_group.is_last_rank:
             self._mtp_hidden_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 self.hc_dim,
@@ -384,9 +399,11 @@ class DeepseekV4Model(nn.Module):
         # rows they want. They are built from one config and armed by one
         # weight-load path, so disagreeing is a bug here rather than a case to
         # handle -- and it would be a silent shape mismatch deep in a layer.
-        hash_layers = self.layers[
-            self.start_layer : min(self.end_layer, self.config.num_hash_layers)
-        ]
+        hash_layers = islice(
+            self.layers,
+            self.start_layer,
+            min(self.end_layer, self.config.num_hash_layers),
+        )
         wants = {layer.ffn.routes_dp_gathered_tokens for layer in hash_layers}
         assert len(wants) == 1, (
             "DeepSeek-V4 hash MoE layers disagree on whether the MoE runner "
@@ -419,7 +436,8 @@ class DeepseekV4Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        if get_pp_group().is_first_rank:
+        pp_group = get_pp_group()
+        if pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -438,6 +456,7 @@ class DeepseekV4Model(nn.Module):
             moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
 
         residual, post_mix, res_mix = None, None, None
+        aux_layers = self.aux_hidden_state_layers
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None
         for idx, layer in enumerate(
@@ -452,7 +471,7 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
-            if idx + 1 in self.aux_hidden_state_layers:
+            if idx + 1 in aux_layers:
                 # Reconstruct the full hc-stream state and collapse it the
                 # way the drafts were trained on: settle the deferred post,
                 # then mean over the hc streams (upstream numerics).
@@ -461,10 +480,7 @@ class DeepseekV4Model(nn.Module):
                 final_aux_recon = aux_recon
 
         if post_mix is not None:
-            if (
-                final_aux_recon is not None
-                and self.end_layer in self.aux_hidden_state_layers
-            ):
+            if final_aux_recon is not None and self.end_layer in aux_layers:
                 hidden_states = final_aux_recon
             else:
                 # Fused path: settle the post the last layer deferred.
@@ -472,7 +488,7 @@ class DeepseekV4Model(nn.Module):
                     hidden_states, residual, post_mix, res_mix
                 )
 
-        if not get_pp_group().is_last_rank:
+        if not pp_group.is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
         hidden_states = mhc_collapse_head(
@@ -490,15 +506,6 @@ class DeepseekV4Model(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load checkpoint tensors into stacked, expert, sink and plain params."""
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "w1", 0),
-            ("gate_up_proj", "w3", 1),
-            ("attn.fused_wqa_wkv", "attn.wq_a", 0),
-            ("attn.fused_wqa_wkv", "attn.wkv", 1),
-            ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
-            ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
-        ]
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         # Weight loading writes each parameter in slices (per expert, per
@@ -520,7 +527,7 @@ class DeepseekV4Model(nn.Module):
 
         try:
             for name, loaded_weight in weights:
-                for param_name, weight_name, shard_id in stacked_params_mapping:
+                for param_name, weight_name, shard_id in _STACKED_PARAMS_MAPPING:
                     # Skip non-stacked layers and experts (experts handled below).
                     if ".experts." in name:
                         continue
@@ -618,12 +625,12 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     """Weights mapper adapting checkpoint naming to vllm-torchtpu layer names."""
     if expert_dtype == "fp4":
         scale_regex = {
-            re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
-            re.compile(r"\.scale$"): ".weight_scale_inv",
+            _FP4_EXPERT_SCALE_RE: r"\1.weight_scale",
+            _SCALE_SUFFIX_RE: ".weight_scale_inv",
         }
     else:
         scale_regex = {
-            re.compile(r"\.scale$"): ".weight_scale_inv",
+            _SCALE_SUFFIX_RE: ".weight_scale_inv",
         }
     return WeightsMapper(
         orig_to_new_prefix={
@@ -716,7 +723,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         loader = AutoWeightsLoader(self)
         loaded_params = loader.load_weights(
             self.hf_to_vllm_mapper.apply(weights),
-            mapper=WeightsMapper(orig_to_new_substr={"mtp.": None}),
+            mapper=_SKIP_MTP_MAPPER,
         )
 
         # Post-load weight surgery goes here.
