@@ -614,7 +614,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # expert MoE. 0 disables it; larger shapes and unsupported layouts use
     # the original GMM path. This counts tokens, not tokens * topk.
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
-        "TPU_MOE_DENSE_EXPERT_THRESHOLD", 256
+        "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
     ),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
@@ -633,7 +633,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
     "RAGGED_GATHER_REDUCE_VERSION": env_with_choices(
-        "RAGGED_GATHER_REDUCE_VERSION", "v3", ["v1", "v2", "v3"]
+        "RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2", "v3"]
     ),
     # Capture one trace per inference phase instead of one continuous trace.
     # The trace directory and iteration limits come from `profiler_config`;
@@ -686,7 +686,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     else None,
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
-    "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS", default=True),
+    "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
@@ -703,12 +703,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # program, instead of bracketing the per-rank compute with vLLM's
     # all-gather and reduce-scatter. The transport then overlaps the matmuls;
     # the reduce-scatter it replaces is otherwise fully exposed.
-    "USE_MOE_FUSED_EP_KERNEL": env_bool("USE_MOE_FUSED_EP_KERNEL", default=True),
+    "USE_MOE_FUSED_EP_KERNEL": lambda: (
+        environment_variables["MOE_FUSED_EP_KERNEL_IMPL"]() is not None
+        or env_bool("USE_MOE_FUSED_EP_KERNEL")()
+    ),
     # Fused EP kernel implementation. Default "v3"
     # pairs with TPU_MOE_LOWTOK_MAX_TOKENS=256 and TPU_SP_MIN_ROWS=512 so
     # steps <= 256 run moe_lowtok and steps >= 512 run SP=1 + Fused EP v3.
     "MOE_FUSED_EP_KERNEL_IMPL": env_with_choices(
-        "MOE_FUSED_EP_KERNEL_IMPL", "v3", ["v2", "adaptive", "v3"]
+        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive"]
     ),
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
@@ -739,10 +742,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_LATENT_PROJ_INTRA_CHIP_TP": env_bool("TPU_LATENT_PROJ_INTRA_CHIP_TP"),
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
-    "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE", default=True),
+    "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE"),
     # Materialize the rotary cos_sin caches with a row-major ({1,0}) device
     # layout at load, May cost more HBM due to padding.
-    "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=True),
+    "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=False),
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
@@ -764,18 +767,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_RPA_DECODE_BATCHED": env_bool("TPU_RPA_DECODE_BATCHED"),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
-        int(v)
-        for v in (
-            (
-                "4,8,24,40,48,56,72,80,88,96,112,3072"
-                if os.getenv("TPU_TOKEN_BUCKET_EXTRA_FINE", "0") == "1"
-                else "4,8,24,48,96,3072"
-            )
-            if os.getenv("TPU_TOKEN_BUCKET_EXTRA")
-            in (None, "4,8,48,3072", "4,8,24,48,96,3072")
-            else os.getenv("TPU_TOKEN_BUCKET_EXTRA", "")
-        ).split(",")
-        if v.strip()
+        int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
     ],
     # Add linear token buckets above a quarter of the token budget, for
     # prompt-sized steps (platforms/tpu_platform.py _get_linear_token_paddings).
@@ -1062,9 +1054,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
-    "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool(
-        "VLLM_TPU_FAST_TOKEN_SUBSTITUTION", default=True
-    ),
+    "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
