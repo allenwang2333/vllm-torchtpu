@@ -141,10 +141,11 @@ def prebuild_adaptive_fused_moe(
     if weight_format == "fp8" and inter % host.HIDDEN_LANE_BLOCK:
         raise ValueError("FP8 intermediate dimension must be lane aligned")
     info = _device_info()
-    if host.chip_generation(info) < host.MIN_GENERATION:
+    chip_gen = host.chip_generation(info)
+    if chip_gen < host.MIN_GENERATION:
         raise ValueError(
             f"adaptive fused MoE requires TPU generation >= {host.MIN_GENERATION}; "
-            f"got generation {host.chip_generation(info)}"
+            f"got generation {chip_gen}"
         )
     smem_bytes = _SMEM_OVERHEAD_BYTES + host.token_gather_smem_bytes(_TILE_M)
     if smem_bytes > info.smem_capacity_bytes:
@@ -255,7 +256,7 @@ def _squeeze_channel_scale(
         s = s.squeeze(1)
     if s.shape != (experts, channels):
         return None
-    return s.contiguous()
+    return s if s.is_contiguous() else s.contiguous()
 
 
 def _squeeze_channel_scale_checked(scale: torch.Tensor) -> torch.Tensor:

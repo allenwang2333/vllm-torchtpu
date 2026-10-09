@@ -9,7 +9,7 @@ import jax.numpy as jnp
 from jax import lax
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TokenReplicaLayout:
     """Groups are ordered mesh coordinates, independent of expert ownership.
 
@@ -71,7 +71,8 @@ class TokenReplicaLayout:
         if len(self.groups[0]) == 1:
             return rows
         padding = self.local_rows * len(self.groups[0]) - self.input_rows
-        rows = jnp.pad(rows, ((0, padding), (0, 0)), constant_values=fill_value)
+        if padding:
+            rows = jnp.pad(rows, ((0, padding), (0, 0)), constant_values=fill_value)
         slot = jnp.asarray(self.slots, dtype=jnp.int32)[rank]
         return lax.dynamic_slice_in_dim(
             rows, slot * self.local_rows, self.local_rows, axis=0
@@ -83,4 +84,6 @@ class TokenReplicaLayout:
         gathered = lax.all_gather(
             rows, axis, axis=0, tiled=True, axis_index_groups=self.groups
         )
+        if self.local_rows * len(self.groups[0]) == self.input_rows:
+            return gathered
         return gathered[: self.input_rows]

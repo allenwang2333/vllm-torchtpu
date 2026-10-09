@@ -17,6 +17,7 @@ enters the kernel, and the VMEM accounting that answers whether a build
 fits. Nothing here runs inside the Pallas body."""
 
 import enum
+import functools
 import math
 from typing import NamedTuple
 
@@ -99,6 +100,7 @@ ROUTING_WINDOW = 32
 ROUTING_WINDOW_MIN_PAIRS = 4096
 
 
+@functools.lru_cache(maxsize=64)
 def pow2_shift(m, what):
     """The shift a division by `m` is, refusing anything else by name.
 
@@ -313,8 +315,16 @@ WEIGHT_FORMS = {
 WEIGHT_FORMAT_NAMES = tuple(WEIGHT_FORMS)
 
 
+_DTYPE_TO_WEIGHT_FORMAT = {
+    jnp.dtype(form.weight_dtype): weight_format
+    for weight_format, form in WEIGHT_FORMS.items()
+}
+
+
 def weight_form(weight_format):
     """The record for a format; raises naming the accepted set."""
+    if isinstance(weight_format, WeightFormat):
+        return WEIGHT_FORMS[weight_format]
     try:
         return WEIGHT_FORMS[WeightFormat(weight_format)]
     except ValueError:
@@ -331,10 +341,7 @@ def weight_format_of_dtype(dtype):
     also the one place the enum is constructed from something outside it;
     everything downstream carries the member this returns.
     """
-    for weight_format, form in WEIGHT_FORMS.items():
-        if jnp.dtype(form.weight_dtype) == jnp.dtype(dtype):
-            return WeightFormat(weight_format)
-    return None
+    return _DTYPE_TO_WEIGHT_FORMAT.get(jnp.dtype(dtype))
 
 
 def ragged_stride_bound(num_tokens, topk, e_total, capacity):
@@ -381,6 +388,7 @@ def gather_clamp_bounds(T):
     return 0, max(T - 1, 0)
 
 
+@functools.lru_cache(maxsize=64)
 def routing_block(t_local, topk):
     """The widest power-of-two block dividing this shard's routed pairs."""
     b = MAX_ROUTING_BLOCK
@@ -658,6 +666,7 @@ def pair_block_hist(expert_blocks, e_total):
     return _block_hist(expert_blocks, jnp.arange(e_total, dtype=jnp.int32))
 
 
+@functools.lru_cache(maxsize=64)
 def rank_window(block, shard_pairs):
     """The width the rank pass self-compares over, `block` where it pays."""
     if shard_pairs < ROUTING_WINDOW_MIN_PAIRS:

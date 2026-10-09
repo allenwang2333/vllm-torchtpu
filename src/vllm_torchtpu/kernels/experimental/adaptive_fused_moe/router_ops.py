@@ -37,7 +37,8 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk, n):
     """One block of rows: take the top `topk` by repeated max-and-mask."""
     # NaN is flushed to the sentinel so every row has a maximum some
     # column equals; an all-NaN row selects expert 0 with weight NEG.
-    x = jnp.where(jnp.isnan(x_ref[...]), NEG, x_ref[...])  # [R, n] f32
+    x_val = x_ref[...]
+    x = jnp.where(jnp.isnan(x_val), NEG, x_val)  # [R, n] f32
     iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
     for j in range(topk):
         m = jnp.max(x, axis=1, keepdims=True)  # [R,1] rowmax
@@ -67,7 +68,7 @@ def pallas_select(scores, topk=10, block_rows=256):
     return pl.pallas_call(
         functools.partial(_select_kernel, topk=topk, n=N),
         grid=grid,
-        in_specs=list(bs),
-        out_specs=list(os),
-        out_shape=list(out_shapes),
+        in_specs=bs,
+        out_specs=os,
+        out_shape=out_shapes,
     )(scores)
