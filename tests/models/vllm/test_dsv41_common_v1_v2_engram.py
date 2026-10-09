@@ -1048,3 +1048,35 @@ class TestV2Engram:
         assert set(v2_engram.__all__) == expected_exports
         for name in expected_exports:
             assert hasattr(v2_engram, name)
+
+
+def test_common_engram_v030_v031_import_fallback():
+    """Verify common/engram.py imports engram symbols under both runtimes.
+
+    Supports v0.31 (common.engram) and v0.30 (nvidia.engram).
+    """
+    import importlib
+    import sys
+    from types import ModuleType
+
+    # 1. v0.31 runtime scenario: common.engram exports symbols
+    mock_common = ModuleType("vllm.models.deepseek_v41.common.engram")
+    mock_common.engram_gathered_num_tokens = "mock_gathered_tokens_v031"
+    mock_common.engram_head_shard_rank = "mock_shard_rank_v031"
+    orig_common = sys.modules.get("vllm.models.deepseek_v41.common.engram")
+    sys.modules["vllm.models.deepseek_v41.common.engram"] = mock_common
+    try:
+        importlib.reload(common_engram)
+        assert common_engram.engram_gathered_num_tokens == "mock_gathered_tokens_v031"
+        assert common_engram.engram_head_shard_rank == "mock_shard_rank_v031"
+    finally:
+        if orig_common is not None:
+            sys.modules["vllm.models.deepseek_v41.common.engram"] = orig_common
+        else:
+            sys.modules.pop("vllm.models.deepseek_v41.common.engram", None)
+
+    # 2. v0.30 runtime scenario: restore normal environment and reload
+    # (nvidia.engram fallback)
+    importlib.reload(common_engram)
+    assert hasattr(common_engram, "engram_gathered_num_tokens")
+    assert hasattr(common_engram, "engram_head_shard_rank")
