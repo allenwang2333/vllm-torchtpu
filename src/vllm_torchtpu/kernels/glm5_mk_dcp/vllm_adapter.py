@@ -59,7 +59,7 @@ def _need(cond: bool, why: str) -> None:
 
 
 def enabled() -> bool:
-    return os.environ.get("GLM5_MKD", "0") == "1"
+    return os.environ.get("GLM5_MKD", "1") == "1"      # -on image: megakernel by default (served recipes have no env hook)
 
 
 def _unwrap(x):
