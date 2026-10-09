@@ -14,6 +14,7 @@
 
 import dataclasses
 import enum
+import functools
 from typing import Any
 
 import jax
@@ -123,7 +124,7 @@ class GDNConfig:
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
 
-    @property
+    @functools.cached_property
     def chunk_size(self) -> int:
         if self.mode == GDNMode.PER_SEQ:
             return self.tile_size
@@ -131,21 +132,21 @@ class GDNConfig:
         # the single-token case of that (window_size == 1).
         return self.window_size
 
-    @property
+    @functools.cached_property
     def seq_tile_size(self) -> int:
         if self.mode == GDNMode.PER_SEQ:
             return 1
         return self.tile_size
 
-    @property
+    @functools.cached_property
     def prev_kernel_size(self) -> int:
         return self.kernel_size - 1
 
-    @property
+    @functools.cached_property
     def is_kda(self) -> bool:
         return self.attention_mode == AttentionMode.KDA
 
-    @property
+    @functools.cached_property
     def gate_dim(self) -> int:
         """Width of the gate activation `a`, in elements per token."""
         if self.is_kda:
@@ -157,7 +158,7 @@ class GDNConfig:
         num_lanes = pltpu.get_tpu_info().num_lanes
         return pl.cdiv(self.gate_dim, num_lanes) * num_lanes
 
-    @property
+    @functools.cached_property
     def triangular_block_size(self) -> int:
         """Sub-block size of the chunked KDA intra-chunk solve.
 
@@ -173,7 +174,7 @@ class GDNConfig:
         #   B inversely with head_groups (head_groups * B <= 16).
         # - KDA also tiles Aqk and L into O(1 / B^2) sub-block matmuls per token,
         #   so scale B^2 inversely with head_groups (head_groups * B**2 <= 16**2).
-        head_groups = pl.cdiv(self.num_v_heads, 8)
+        head_groups = (self.num_v_heads + 7) // 8
         if self.is_kda:
             for b in (16, 8, 4):
                 if head_groups * b * b <= 256:
@@ -182,7 +183,7 @@ class GDNConfig:
         # GDN: between-block updates scale as 1 / B.
         return max(2, min(16, 16 // head_groups))
 
-    @property
+    @functools.cached_property
     def use_recurrent(self) -> bool:
         """Whether GDN runs the token-recurrent scan instead of the chunked one.
 
@@ -191,15 +192,15 @@ class GDNConfig:
         """
         return self.chunk_size == 1 or self.window_size > 1
 
-    @property
+    @functools.cached_property
     def v_dim_size(self) -> int:
         return self.num_v_heads * self.v_head_dim
 
-    @property
+    @functools.cached_property
     def kq_dim_size(self) -> int:
         return self.num_kq_heads * self.kq_head_dim
 
-    @property
+    @functools.cached_property
     def v_per_kq_head(self) -> int:
         return self.num_v_heads // self.num_kq_heads
 

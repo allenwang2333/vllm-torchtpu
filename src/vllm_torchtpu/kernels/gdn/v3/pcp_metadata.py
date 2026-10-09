@@ -147,9 +147,13 @@ def compute_pcp_stage_metadata(
         raise ValueError("state_indices and seq_lens must have equal size.")
     if query_start_loc.size != seq_lens.size + 1:
         raise ValueError("query_start_loc must contain max_num_seqs + 1 entries.")
+    if seq_lens.dtype != jnp.int32:
+        seq_lens = seq_lens.astype(jnp.int32)
+    if query_start_loc.dtype != jnp.int32:
+        query_start_loc = query_start_loc.astype(jnp.int32)
     q_lens = query_start_loc[1:] - query_start_loc[:-1]
-    request_absolute_starts = seq_lens.astype(jnp.int32) - q_lens.astype(jnp.int32)
-    token_owner_starts = query_start_loc[:-1].astype(jnp.int32)
+    request_absolute_starts = seq_lens - q_lens
+    token_owner_starts = query_start_loc[:-1]
     return _compute_pcp_stage_metadata_from_coordinates(
         cfg,
         query_start_loc,
@@ -222,13 +226,20 @@ def _compute_pcp_stage_metadata_from_coordinates(
     )
     int_dtype = jnp.int32
     ranks = jnp.arange(pcp_size, dtype=int_dtype)
-    query_start_loc = query_start_loc.astype(int_dtype)
-    token_owner_starts = token_owner_starts.astype(int_dtype)
-    request_absolute_starts = request_absolute_starts.astype(int_dtype)
-    state_indices = state_indices.astype(int_dtype)
-    start_seq = start_seq.astype(int_dtype)
-    end_seq = end_seq.astype(int_dtype)
+    if query_start_loc.dtype != int_dtype:
+        query_start_loc = query_start_loc.astype(int_dtype)
+    if token_owner_starts.dtype != int_dtype:
+        token_owner_starts = token_owner_starts.astype(int_dtype)
+    if request_absolute_starts.dtype != int_dtype:
+        request_absolute_starts = request_absolute_starts.astype(int_dtype)
+    if state_indices.dtype != int_dtype:
+        state_indices = state_indices.astype(int_dtype)
+    if start_seq.dtype != int_dtype:
+        start_seq = start_seq.astype(int_dtype)
+    if end_seq.dtype != int_dtype:
+        end_seq = end_seq.astype(int_dtype)
     round_size = pcp_size * comm_chunk_size
+    recv_starts = ranks * comm_chunk_size
 
     initial = _BuilderState(
         request_index=jnp.asarray(0, dtype=int_dtype),
@@ -289,13 +300,12 @@ def _compute_pcp_stage_metadata_from_coordinates(
 
         def _emit_window(carry):
             window, consumed, inner_state = carry
-            rank_chunk_begin = window + ranks * comm_chunk_size
+            rank_chunk_begin = window + recv_starts
             rank_chunk_end = rank_chunk_begin + comm_chunk_size
             overlap_begin = jnp.maximum(rank_chunk_begin, token_owner_begin)
             overlap_end = jnp.minimum(rank_chunk_end, token_owner_end)
             valid_rows = jnp.maximum(overlap_end - overlap_begin, 0)
             dense_starts = jnp.cumsum(valid_rows, dtype=int_dtype) - valid_rows
-            recv_starts = ranks * comm_chunk_size
             stage_tokens = jnp.sum(valid_rows, dtype=int_dtype)
             stage_query_begin = (
                 query_begin + jnp.maximum(window, token_owner_begin) - token_owner_begin

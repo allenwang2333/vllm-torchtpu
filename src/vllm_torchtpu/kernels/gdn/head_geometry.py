@@ -14,6 +14,7 @@
 """Head geometry shared by the GDN TP and PCP kernel paths."""
 
 import dataclasses
+import functools
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,11 +56,17 @@ class GdnHeadGeometry:
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         """Apply head ownership, preserving tap/speculation and layout axes."""
         conv_shape, recurrent_shape = shapes
-        conv_shape = list(conv_shape)
-        conv_shape[conv_dim_axis] = self.local_conv_dim(d_k, d_v)
-        return (tuple(conv_shape), (self.local_num_v_heads, *recurrent_shape[1:]))
+        local_cdim = self.local_conv_dim(d_k, d_v)
+        if conv_dim_axis == -1:
+            new_conv_shape = (*conv_shape[:-1], local_cdim)
+        else:
+            conv_list = list(conv_shape)
+            conv_list[conv_dim_axis] = local_cdim
+            new_conv_shape = tuple(conv_list)
+        return (new_conv_shape, (self.local_num_v_heads, *recurrent_shape[1:]))
 
 
+@functools.cache
 def derive_gdn_head_geometry(
     num_kq_heads: int,
     num_v_heads: int,

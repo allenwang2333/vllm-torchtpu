@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP8 QKVZ scale layouts shared by the Torch bridge and PCP kernel."""
 
+import functools
 import math
 from enum import Enum, auto
 
@@ -14,17 +15,10 @@ class ProjectionScaleLayout(Enum):
     LINEAR_RUNTIME = auto()
 
 
-def projection_scale_layout(
-    weight_shape, scale_shape
+@functools.cache
+def _projection_scale_layout_cached(
+    n: int, k: int, shape: tuple[int, ...]
 ) -> tuple[ProjectionScaleLayout, int, int]:
-    """Validate N-major weights and return (layout, N blocks, K blocks).
-
-    Accept tensor scales, channel vectors, N/K block grids, and the existing
-    Linear runtime layout [1, K_blocks, 1, N]. K block boundaries must
-    align with the 128-column VMEM tile used by the FP8 projection operands.
-    """
-    n, k = weight_shape
-    shape = tuple(scale_shape)
     if math.prod(shape) == 1:
         return ProjectionScaleLayout.TENSOR, 1, 1
     if shape == (n,):
@@ -44,13 +38,27 @@ def projection_scale_layout(
     if nb <= 0 or kb <= 0 or n % nb or k % kb:
         raise ValueError(
             "FP8 QKVZ scale block counts must divide N and K "
-            f"exactly: weight={weight_shape}, scale={shape}."
+            f"exactly: weight={(n, k)}, scale={shape}."
         )
     if kb > 1 and (k // kb) % 128:
         raise ValueError(
             "FP8 QKVZ K block size must be a multiple of 128 for VMEM slicing."
         )
     return layout, nb, kb
+
+
+def projection_scale_layout(
+    weight_shape, scale_shape
+) -> tuple[ProjectionScaleLayout, int, int]:
+    """Validate N-major weights and return (layout, N blocks, K blocks).
+
+    Accept tensor scales, channel vectors, N/K block grids, and the existing
+    Linear runtime layout [1, K_blocks, 1, N]. K block boundaries must
+    align with the 128-column VMEM tile used by the FP8 projection operands.
+    """
+    n, k = weight_shape
+    shape = scale_shape if isinstance(scale_shape, tuple) else tuple(scale_shape)
+    return _projection_scale_layout_cached(int(n), int(k), shape)
 
 
 def normalize_projection_scale(weight_shape, scale):
@@ -67,7 +75,7 @@ def normalize_projection_scale(weight_shape, scale):
     if layout is ProjectionScaleLayout.CHANNEL:
         return scale
     if layout is ProjectionScaleLayout.BLOCK_GRID:
-        scale = jnp.repeat(scale, n // nb, axis=0).T
+        scale = scale.T if nb == n else jnp.repeat(scale, n // nb, axis=0).T
     else:
         scale = scale.reshape(kb, n)
     return scale.reshape(n) if kb == 1 else scale
