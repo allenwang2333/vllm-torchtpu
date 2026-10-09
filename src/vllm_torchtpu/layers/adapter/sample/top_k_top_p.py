@@ -22,6 +22,9 @@ from collections.abc import Callable, Sequence
 import torch
 
 MASKED_LOGIT_VALUE = -1e12
+_INT32_MIN = -(1 << 31)
+_INT32_MAX = (1 << 31) - 1
+_FLOAT32_EXPONENT_BITS = (1 << 31) - (1 << 23)
 
 
 def _int32_bsearch(
@@ -48,19 +51,16 @@ def _int32_bsearch(
       For each element of the batch, the largest int32 for which the predicate
       returns False. Shape: batch_shape.
     """
-    current_bits = torch.zeros(batch_shape, dtype=torch.int32, device=device)
-    zero = torch.zeros_like(current_bits)
-    sign_bit = torch.full_like(current_bits, -(1 << 31))
+    zero = torch.zeros(batch_shape, dtype=torch.int32, device=device)
 
     # bit 31 is special, because it compares in the opposite order of all other
-    # bits.
-    current_bits = current_bits | torch.where(predicate(current_bits), sign_bit, zero)
+    # bits: set it where the predicate holds at 0.
+    current_bits = torch.where(predicate(zero), _INT32_MIN, zero).to(torch.int32)
 
     for i in range(31):
-        bit = 1 << (30 - i)
-        bit_t = torch.full_like(current_bits, bit)
-        midpoint = current_bits | bit
-        current_bits = current_bits | torch.where(predicate(midpoint), zero, bit_t)
+        midpoint = current_bits | (1 << (30 - i))
+        # Keep the bit (take the midpoint) where the predicate is False.
+        current_bits = torch.where(predicate(midpoint), current_bits, midpoint)
     return current_bits
 
 
@@ -79,8 +79,6 @@ def _monotonic_int32_to_float32_bit_pattern(x: torch.Tensor) -> torch.Tensor:
     Returns:
       int32 bit pattern of a float32 number.
     """
-    non_sign_bits = torch.full_like(x, (1 << 31) - 1)
-    zero = torch.zeros_like(x)
     # See
     # https://stackoverflow.com/questions/20097380/iee-754-total-order-in-standard-c11
     # for the relationship between int32 order and f32 total order, including
@@ -91,7 +89,8 @@ def _monotonic_int32_to_float32_bit_pattern(x: torch.Tensor) -> torch.Tensor:
     # negative bit pattern (it's int32::MIN), whereas on float32 it's the least
     # negative bit pattern (it's -0.0). Flipping all the non-sign bits makes the
     # int32 sort order consistent with the float32 sort order.
-    return x ^ torch.where(x < 0, non_sign_bits, zero)
+    # ``x >> 31`` (arithmetic) is all ones exactly where ``x < 0``.
+    return x ^ ((x >> 31) & _INT32_MAX)
 
 
 def _monotonic_int32_to_float32(x: torch.Tensor) -> torch.Tensor:
@@ -134,9 +133,8 @@ def _float32_bsearch(
     """
 
     def int32_predicate(x: torch.Tensor) -> torch.Tensor:
-        exponent_bits = torch.full_like(x, (1 << 31) - (1 << 23))
         x = _monotonic_int32_to_float32_bit_pattern(x)
-        is_finite = (x & exponent_bits) != exponent_bits
+        is_finite = (x & _FLOAT32_EXPONENT_BITS) != _FLOAT32_EXPONENT_BITS
 
         # Non-finite numbers (infinity and NaN) are at the very extremes of the
         # int32 range, i.e. they include int32::MAX and int32::MIN, plus the
@@ -190,8 +188,7 @@ def topk_mask(
 
     cutoff = -_float32_bsearch(logits.shape[:-1], predicate, logits.device)
     cutoff = cutoff.unsqueeze(-1)
-    replace_tensor = torch.full_like(logits, replace_val)
-    return torch.where(logits >= cutoff, logits, replace_tensor)
+    return torch.where(logits >= cutoff, logits, replace_val)
 
 
 def topp_mask(
@@ -223,20 +220,18 @@ def topp_mask(
     """
     p = p.squeeze(-1)
     probs = torch.softmax(logits, dim=-1)
-    zero_val = torch.zeros_like(probs)
-    replace_tensor = torch.full_like(logits, replace_val)
 
     def predicate(threshold: torch.Tensor) -> torch.Tensor:
         threshold = threshold.unsqueeze(-1)
         probability_mass = torch.sum(
-            torch.where(probs >= threshold, probs, zero_val),
+            torch.where(probs >= threshold, probs, 0.0),
             dim=-1,
         )
         return probability_mass < p
 
     threshold = _float32_bsearch(logits.shape[:-1], predicate, logits.device)
     threshold = threshold.unsqueeze(-1)
-    return torch.where(probs >= threshold, logits, replace_tensor)
+    return torch.where(probs >= threshold, logits, replace_val)
 
 
 def apply_top_k_top_p(
