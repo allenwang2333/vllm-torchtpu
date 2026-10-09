@@ -352,9 +352,9 @@ def stitch_batch_gate(
     barrier instead of `batch_size` and leaves the batched fetch/store split
     intact.
     """
-    gate = stitch_meta.bkv_sz_frm_cache[0] < cfgs.bkv_sz
+    gate = stitch_meta.bkv_sz_frm_new[0] > 0
     for b_idx in range(1, cfgs.batch_size):
-        gate = gate | (stitch_meta.bkv_sz_frm_cache[b_idx] < cfgs.bkv_sz)
+        gate = gate | (stitch_meta.bkv_sz_frm_new[b_idx] > 0)
     return gate
 
 
