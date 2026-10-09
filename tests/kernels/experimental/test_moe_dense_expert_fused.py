@@ -199,7 +199,7 @@ def _candidate(x, routed, weights, ids, offset, shared, rsf):
         ids,
         jnp.int32(offset),
         shared,
-        jnp.full((1,), rsf, jnp.float32),  # traced; the runner skips its own scaling
+        routed_scale=rsf,  # the runner skips its own scaling on this path
     )
     return np.asarray(out, np.float32)
 
@@ -578,6 +578,7 @@ def test_decode_layer_op_is_never_built_in_the_forward():
         use_ep=True,
         rhs_quant_dtype=None,
         skip_padded_tokens=False,
+        routed_scale=2.5,
     )
     with pytest.raises(RuntimeError, match="not prebuilt"):
         adapter._get_fused_decode_layer_op(**config)

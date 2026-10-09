@@ -297,11 +297,18 @@ def fused_moe_gmm(
 
 
 def _fused_decode_layer_key(
-    topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens
+    topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens, routed_scale
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
-    return (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    return (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        skip_padded_tokens,
+        float(routed_scale),
+    )
 
 
 def prebuild_fused_moe_decode_layer(
@@ -311,19 +318,24 @@ def prebuild_fused_moe_decode_layer(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    routed_scale: float = 1.0,
 ) -> None:
     """Build the TPU_MOE_FUSED_DECODE_LAYER op at weight load, outside tracing.
 
     ``pallas.jax_op`` inspects the wrapped function's signature, which Dynamo
     cannot trace, so the forward must only ever hit this cache -- the same
     reason ``prebuild_fused_moe_kernel`` exists for the fused MoE op.
+    ``routed_scale`` (the MoE runner's routed_scaling_factor) is a model
+    constant, identical on every rank, so it is bound into the closure rather
+    than passed as a tensor: a tensor operand would be a lifted input only
+    the fused (decode) trace has, which breaks bucket sharing between traces.
     """
     key = _fused_decode_layer_key(
-        topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens
+        topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens, routed_scale
     )
     if key in _fused_decode_layer_cache:
         return
-    topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens = key
+    topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens, routed_scale = key
     op = pallas.jax_op(
         f"pallas::fused_moe_decode_layer_{_allocate_kernel_instance_id()}",
         functools.partial(
@@ -333,6 +345,7 @@ def prebuild_fused_moe_decode_layer(
             use_ep=use_ep,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
+            routed_scale=routed_scale,
         ),
     )
 
@@ -350,7 +363,8 @@ def _get_fused_decode_layer_op(**config) -> Callable:
     if op is None:
         raise RuntimeError(
             "TPU_MOE_FUSED_DECODE_LAYER op was not prebuilt for "
-            f"(topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)={key}; "
+            "(topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens, "
+            f"routed_scale)={key}; "
             "call prebuild_fused_moe_decode_layer at weight load."
         )
     return op
@@ -368,17 +382,18 @@ def fused_moe_decode_layer(
     topk_ids: torch.Tensor,
     experts_start: torch.Tensor | None,
     shared: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    routed_scale: torch.Tensor,
     topk: int,
     activation: str,
+    routed_scale: float = 1.0,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
 ) -> torch.Tensor:
     """TPU_MOE_FUSED_DECODE_LAYER: routed + shared expert in one kernel.
 
     Same operands as fused_moe_gmm plus the shared expert's
-    (w13 [H, 2*Is], w13_scale [2*Is], w2 [Is, H], w2_scale [H]) and
-    ``routed_scale``, a persistent one-element f32 tensor holding the runner's
+    (w13 [H, 2*Is], w13_scale [2*Is], w2 [Is, H], w2_scale [H]), all module
+    parameters the separate shared-expert path also reads, so no new lifted
+    input. ``routed_scale`` selects the op prebuilt for the runner's
     routed_scaling_factor. The output already contains the shared expert and
     the routed scale; only the all-reduce is left to the caller.
     """
@@ -389,6 +404,7 @@ def fused_moe_decode_layer(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        routed_scale=routed_scale,
     )
     if experts_start is None:
         experts_start = torch.zeros((), dtype=torch.int32, device=hidden_states.device)
@@ -404,5 +420,4 @@ def fused_moe_decode_layer(
         topk_ids,
         experts_start,
         *shared,
-        routed_scale,
     )
