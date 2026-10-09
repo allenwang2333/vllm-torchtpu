@@ -136,17 +136,16 @@ def test_moe_gmm_tiling(monkeypatch):
     # 1. Matching decode dims:
     # size_group > 1 and 32 <= size_m <= size_group * 176 and 32 % sublane == 0
     bound = fused_moe_gmm._DECODE_TILE_M32_ROWS_PER_GROUP
-    assert bound == 176
+    assert bound == 144
     for size_group, size_m in (
         (48, 576),
         (48, 2304),
         (48, 3456),
         (16, 1728),
-        # DP2xTP4+EP8 verify batches T_ep = 768, 960, 1152, 1344 (M = 6 * T_ep).
+        # DP2xTP4+EP8 verify batches T_ep = 768, 960, 1152 (M = 6 * T_ep <= 6912).
         (48, 4608),
         (48, 5760),
         (48, 6912),
-        (48, 8064),
         (48, 48 * bound),
     ):
         match_dims = types.SimpleNamespace(
@@ -162,7 +161,8 @@ def test_moe_gmm_tiling(monkeypatch):
         types.SimpleNamespace(size_group=1, size_m=576, size_lhs_sublane=8),
         # size_m < 32
         types.SimpleNamespace(size_group=48, size_m=16, size_lhs_sublane=8),
-        # size_m > size_group * 176
+        # size_m > size_group * 144 (e.g. T_ep = 1344 -> M = 8064)
+        types.SimpleNamespace(size_group=48, size_m=8064, size_lhs_sublane=8),
         types.SimpleNamespace(size_group=48, size_m=48 * bound + 1, size_lhs_sublane=8),
         # 32 % sublane != 0
         types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=12),
@@ -439,6 +439,29 @@ def test_moe_gmm(monkeypatch):
             onehot_moe_permute_threshold=128,
         )
         assert out2.shape == (num_tokens, hidden_size)
+
+        out2_presorted = fused_moe_gmm.moe_gmm(
+            x,
+            w1,
+            None,
+            None,
+            w2,
+            None,
+            None,
+            group_sizes,
+            argsort_revert,
+            topk_weights_flat,
+            valid_mask,
+            token_indices_sorted,
+            activation="silu",
+            num_tokens=num_tokens,
+            topk=topk,
+            use_ep=True,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=128,
+            topk_weights_sorted=topk_weights_flat,
+        )
+        assert out2_presorted.shape == (num_tokens, hidden_size)
 
         # Branch 2b: EP + SC, 2304 < size <= threshold (zero_init_gmm2=False)
         n_tok_hi = 400
@@ -824,3 +847,88 @@ def test_ext2_2d_combine_mathematical_invariants():
         np.asarray(jax.lax.bitcast_convert_type(packed_weights_sorted, jnp.uint16)),
         np.asarray(jax.lax.bitcast_convert_type(topk_weights_sorted, jnp.uint16)),
     )
+
+
+def test_low_expert_dense_limit_and_bijective_scatter(monkeypatch):
+    """Verify w1.shape[0] <= 2 dense dispatch, M > 6912 scatter, and unaligned slice."""
+    assert fused_moe_gmm._DECODE_TILE_M32_ROWS_PER_GROUP == 144
+    assert fused_moe_gmm._DENSE_EXPERT_LOW_EXPERT_MAX_TOKENS == 576
+
+    rng = np.random.default_rng(7)
+    num_tokens_big = 1344
+    topk = 6
+    x_big = jnp.ones((num_tokens_big, 128), dtype=jnp.bfloat16)
+    ids_big = jnp.array(
+        rng.integers(-1, 48, size=(num_tokens_big, topk)), dtype=jnp.int32
+    )
+    wts_big = jnp.ones((num_tokens_big, topk), dtype=jnp.float32) / topk
+    _, _, revert_big, _, _, tok_sorted_big = fused_moe_gmm.prepare_routed_gmm_inputs(
+        x_big,
+        ids_big,
+        wts_big,
+        local_num_experts=48,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=2048,
+    )
+    assert tok_sorted_big.shape == (num_tokens_big * topk,)
+    np.testing.assert_array_equal(
+        np.asarray(tok_sorted_big[revert_big]),
+        np.repeat(np.arange(num_tokens_big, dtype=np.int32), topk),
+    )
+
+    monkeypatch.setattr(fused_moe_gmm, "_DENSE_EXPERT_THRESHOLD", 0)
+    monkeypatch.setattr(fused_moe_gmm, "can_use_dense_expert", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "dense_expert_moe",
+        lambda h, *a, **kw: jnp.full_like(h, 3.0),
+    )
+    fused_moe_gmm.fused_moe_func.clear_cache()
+    try:
+        out_dense = fused_moe_gmm.fused_moe_func(
+            jnp.ones((64, 16), dtype=jnp.bfloat16),
+            jnp.ones((2, 16, 32), dtype=jnp.bfloat16),
+            jnp.ones((2, 16, 16), dtype=jnp.bfloat16),
+            None,
+            None,
+            None,
+            None,
+            jnp.ones((64, 6), dtype=jnp.float32) / 6.0,
+            jnp.zeros((64, 6), dtype=jnp.int32),
+            topk=6,
+            use_ep=True,
+            use_sparse_core=False,
+        )
+        assert float(out_dense[0, 0]) == 3.0
+    finally:
+        fused_moe_gmm.fused_moe_func.clear_cache()
+
+    # Exercise padded hidden_size (line 813) and padded gmm1_res slice (line 545).
+    monkeypatch.setattr(fused_moe_gmm, "can_use_dense_expert", lambda *a, **kw: False)
+
+    def _fake_gmm_wrapper(lhs, rhs, *a, **kw):
+        out_cols = rhs.shape[-1] + (8 if rhs.shape[-1] == 32 else 0)
+        return jnp.ones((lhs.shape[0], out_cols), dtype=lhs.dtype)
+
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", _fake_gmm_wrapper)
+    fused_moe_gmm.fused_moe_func.clear_cache()
+    try:
+        out_pad = fused_moe_gmm.fused_moe_func(
+            jnp.ones((8, 12), dtype=jnp.bfloat16),
+            jnp.ones((2, 16, 32), dtype=jnp.bfloat16),
+            jnp.ones((2, 32, 12), dtype=jnp.bfloat16),
+            None,
+            None,
+            None,
+            None,
+            jnp.ones((8, 2), dtype=jnp.float32) / 2.0,
+            jnp.zeros((8, 2), dtype=jnp.int32),
+            topk=2,
+            use_ep=False,
+            use_sparse_core=False,
+        )
+        assert out_pad.shape == (8, 12)
+    finally:
+        fused_moe_gmm.fused_moe_func.clear_cache()

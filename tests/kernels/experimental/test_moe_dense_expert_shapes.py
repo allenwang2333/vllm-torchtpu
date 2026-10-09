@@ -317,6 +317,14 @@ def test_mxfp4_and_clamped_activations_admitted(m, activation):
         )
         == 2
     )
+    assert not kernel.can_use_dense_expert(
+        *_mxfp4_shapes(960, 5120, 2560, 48),
+        None,
+        None,
+        activation=activation,
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+        skip_padded_tokens=False,
+    )
 
 
 @pytest.mark.parametrize("m", [4, 16])
@@ -609,3 +617,27 @@ def test_packing_factor_and_activation_edge_cases(monkeypatch):
         "activation": "silu_and_mul_with_clamp",
         "rhs_quant_dtype": jnp.float4_e2m1fn,
     }
+
+
+def test_apply_activation_swigluoai_and_blockwise_s2():
+    """Cover _apply_activation swigluoai + invalid activation and multi-block s2."""
+    import vllm_torchtpu.kernels.experimental.moe_dense_expert as moe_dense_expert
+
+    gate = jnp.ones((8, 128), jnp.bfloat16)
+    up = jnp.ones((8, 128), jnp.bfloat16)
+    out = moe_dense_expert._apply_activation(gate, up, "swigluoai")
+    assert out.shape == (8, 128)
+    with pytest.raises(NotImplementedError, match="Unsupported activation"):
+        moe_dense_expert._apply_activation(gate, up, "unsupported_act")
+
+    # Exercise s2_blocks > 1 (i = 1024 -> 2 blocks of 512)
+    h, i, m = 512, 1024, 32
+    x = jnp.ones((m, h), jnp.bfloat16) * 0.1
+    w1 = jnp.ones((2, h, 2 * i), jnp.float8_e4m3fn) * 0.1
+    w2 = jnp.ones((2, i, h), jnp.float8_e4m3fn) * 0.1
+    s1 = jnp.ones((2, 1, 1, 2 * i), jnp.float32)
+    s2 = jnp.ones((2, 2, 1, h), jnp.float32)
+    weights = jnp.full((m, 1), 1.0, jnp.bfloat16)
+    ids = jnp.zeros((m, 1), jnp.int32)
+    res = moe_dense_expert.dense_expert_moe(x, w1, w2, s1, s2, weights, ids)
+    assert res.shape == (m, h)
