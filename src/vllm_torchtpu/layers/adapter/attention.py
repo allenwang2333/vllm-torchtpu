@@ -68,6 +68,9 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
 )
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.layers.adapter.cp_attention import (
+    build_dcp_decode_single_pass_kernel as _build_dcp_decode_single_pass_kernel,
+)
+from vllm_torchtpu.layers.adapter.cp_attention import (
     build_dcp_kernels as _build_dcp_kernels,
 )
 from vllm_torchtpu.layers.adapter.cp_attention import (
@@ -888,6 +891,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
         self.dcp_rank = 0
         self.rpa_dcp_cache_kernel = None  # CACHE_ONLY pass, returns (out, lse)
         self.rpa_dcp_new_kernel = None  # NEW_TOKENS_ONLY pass, returns (out, lse)
+        # Single pass for all-decode steps (TPU_DCP_RPA_DECODE_SINGLE_PASS), or None
+        # when this layer cannot take it.
+        self.rpa_dcp_decode_single_pass_kernel = None
         # Block-major bundled kernel and pre-allocated layer index. Initialized by
         # setup_bundled() after bundle allocation and prior to torch.compile tracing.
         # During profile_run, ctx.kv_cache_bundle is None and forward falls back to
@@ -1156,6 +1162,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
             dcp_rank=self.dcp_rank,
             kv_layout=self.kv_layout,
             decode_query_size=self.decode_query_size,
+            decode_single_pass=(
+                self.rpa_dcp_decode_single_pass_kernel is not None
+                and attn_metadata.dcp_decode_single_pass
+            ),
         )
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
@@ -1379,6 +1389,23 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     kv_layout=self.kv_layout,
                     decode_query_size=self.decode_query_size,
                 )
+                # A KV-sharing layer attends a cache another layer writes, so
+                # it keeps the two-pass path, which never writes for it.
+                if envs.TPU_DCP_RPA_DECODE_SINGLE_PASS and not skip_kv_update:
+                    self.rpa_dcp_decode_single_pass_kernel = (
+                        _build_dcp_decode_single_pass_kernel(
+                            sliding_window=self.sliding_window,
+                            sm_scale=self.scale,
+                            logits_soft_cap=self.logits_soft_cap,
+                            q_scale=q_scale,
+                            k_scale=k_scale,
+                            v_scale=v_scale,
+                            cp_group_size=self.dcp_world_size,
+                            cp_rank=self.dcp_rank,
+                            kv_layout=self.kv_layout,
+                            decode_query_size=self.decode_query_size,
+                        )
+                    )
             return
 
         self.rpa_kernel = self._build_rpa_kernel(

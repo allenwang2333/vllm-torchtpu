@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
+    TPU_DCP_RPA_DECODE_SINGLE_PASS: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -385,6 +386,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # faster. Only the backbone uses the all-to-all; the MTP drafter, traced
     # once for every bucket, always takes the reduce-scatter.
     "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64),
+    # Opt in to the single-pass DCP attention for steps where every request
+    # is a decode or speculative verify window: each rank stores its new
+    # tokens, then one CACHE_ONLY pass replaces CACHE_ONLY + NEW_TOKENS_ONLY
+    # + merge. Adds one compiled backbone graph per decode-sized bucket.
+    # Remove once the single pass is the default DCP decode path.
+    "TPU_DCP_RPA_DECODE_SINGLE_PASS": env_bool(
+        "TPU_DCP_RPA_DECODE_SINGLE_PASS", default=False
+    ),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per

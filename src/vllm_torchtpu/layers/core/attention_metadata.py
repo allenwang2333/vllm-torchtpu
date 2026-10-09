@@ -60,6 +60,7 @@ def attention_block_table_width(
         "sequence_layout_kind",
         "sequence_layout_protocol",
         "sequence_layout_version",
+        "dcp_decode_single_pass",
     ],
     drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
 )
@@ -109,6 +110,10 @@ class AttentionMetadata:
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
+    # Static: DCP attention may take its decode single pass (every
+    # request is a decode or speculative verify window, all in the RPA decode
+    # segment). A distinct value is a distinct compiled graph.
+    dcp_decode_single_pass: bool = False
 
     query_start_loc_cpu: Any = field(init=False)
     seq_lens_cpu: Any = field(init=False)
@@ -154,6 +159,8 @@ class AttentionMetadataBuilderContext:
     sequence_layout_descriptor: SequenceLayoutDescriptor = (
         DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
     )
+    # See AttentionMetadata.dcp_decode_single_pass.
+    dcp_decode_single_pass: bool = False
     # Per-chunk cache of the shared mamba row-offset plan, keyed by
     # (target_block_size, target_num_blocks) -> (state_index, ckpt_index,
     # ckpt_in_row). Valid only because every context is constructed fresh
@@ -463,6 +470,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,
+            dcp_decode_single_pass=ctx.dcp_decode_single_pass,
         )
 
 

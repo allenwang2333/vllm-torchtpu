@@ -215,6 +215,8 @@ class StepMetadata:
     new_kv_len_start: list[jax.Array]
     local_k_start: list[jax.Array] | None = None
     local_k_end: list[jax.Array] | None = None
+    # First local KV position of the step's block; cp_cache_causal only.
+    k_start: list[jax.Array] | None = None
 
 
 def fetch_step_metadata(
@@ -241,6 +243,7 @@ def fetch_step_metadata(
     local_k_end_list = (
         [] if cfgs.serve.attention_scope == configs.AttentionScope.CACHE_ONLY else None
     )
+    k_start_list = [] if cfgs.serve.cp_cache_causal else None
     for b_idx in range(cfgs.batch_size):
         s_idx = schedule_ref.s_idx[step, b_idx]
         is_valid = s_idx != -1
@@ -256,6 +259,8 @@ def fetch_step_metadata(
         q_base = q_idx * cfgs.bq_sz + q_offset
         causal_offset = k_id - q_base
         causal_offset_list.append(causal_offset)
+        if k_start_list is not None:
+            k_start_list.append(k_id)
         if local_k_start_list is not None:
             local_k_start_list.append(q_offset - k_id)
         if local_k_end_list is not None:
@@ -289,6 +294,7 @@ def fetch_step_metadata(
         new_kv_len_start=new_kv_len_start_list,
         local_k_start=local_k_start_list,
         local_k_end=local_k_end_list,
+        k_start=k_start_list,
     )
 
 
@@ -318,7 +324,18 @@ def generate_mask(
         # Step 2
         #   offset = causal_offset - bq_start
         offset = step_meta.causal_offset[b_idx] - bq_start
-        mask_b = q_kv_diff >= offset
+        if step_meta.k_start is not None:
+            # cp_cache_causal: queries carry shifted global positions, KV is
+            # this rank's local cache, so compare through the local prefix
+            # each query may see instead of a position difference.
+            k_id = step_meta.k_start[b_idx]
+            q_pos = q_iota + (k_id - offset)  # q_base + bq_start + q_iota
+            visible = utils.cp_visible_kv_len(
+                q_pos, cfgs.serve.cp_group_size, cfgs.serve.page_size
+            )
+            mask_b = kv_iota + k_id < visible
+        else:
+            mask_b = q_kv_diff >= offset
         if (sliding_window := cfgs.model.sliding_window) is not None:
             mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
         if step_meta.local_k_start is not None:

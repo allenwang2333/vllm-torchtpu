@@ -581,6 +581,9 @@ def ragged_paged_attention(
         debug_mode: Not used.
         out_dtype: Dtype of output. Defaults to dtype of queries.
         use_causal_mask: Not used.
+        skip_kv_update: The step's new tokens are already in the cache (KV
+            sharing, or the DCP decode single pass). Nothing is written; with
+            CACHE_ONLY under CP the attended cache includes them, causally.
         decode_query_size: Number of query tokens in decode (1 by default, can be
             higher in case of speculative decoding).
         cp_group_size: Size of the context parallelism (CP) group. KV cache is
@@ -710,15 +713,26 @@ def ragged_paged_attention(
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     global_kv_cache_lens = kv_lens - q_lens
     if attention_scope == configs.AttentionScope.CACHE_ONLY:
+        kv_new_lens = jnp.zeros_like(q_lens)
         if cp_group_size is not None:
+            # Queries keep their global positions (shifted so the kernel needs
+            # no rank) for the causal mask over the local cache. With
+            # skip_kv_update the step's tokens are already written, so the
+            # local cache runs to kv_lens and covers them; without, it stops
+            # before them.
             rank = cp_rank[0] if cp_rank is not None else 0
             kv_cache_lens = utils.cp_local_cache_len(
-                global_kv_cache_lens, cp_group_size, rank, page_size
+                kv_lens if skip_kv_update else global_kv_cache_lens,
+                cp_group_size,
+                rank,
+                page_size,
+            )
+            q_offsets = global_kv_cache_lens + utils.cp_q_position_shift(
+                cp_group_size, rank, page_size
             )
         else:
             kv_cache_lens = global_kv_cache_lens
-        kv_new_lens = jnp.zeros_like(q_lens)
-        q_offsets = kv_cache_lens
+            q_offsets = kv_cache_lens
     elif attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
         kv_cache_lens = global_kv_cache_lens
         kv_new_lens = q_lens

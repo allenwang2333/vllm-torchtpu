@@ -765,6 +765,16 @@ class TPUModelRunner(GPUModelRunner):
         self._fast_token_substitution: bool = bool(
             envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION
         )
+        # Single-pass DCP attention on steps where every request is in the
+        # RPA decode segment (decodes and verify windows); per step it is
+        # AttentionMetadata.dcp_decode_single_pass. See
+        # envs.TPU_DCP_RPA_DECODE_SINGLE_PASS.
+        parallel_config = self.vllm_config.parallel_config
+        self._dcp_decode_single_pass: bool = bool(
+            envs.TPU_DCP_RPA_DECODE_SINGLE_PASS
+            and parallel_config.decode_context_parallel_size > 1
+            and parallel_config.prefill_context_parallel_size == 1
+        )
         # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
         # block_table capacity if already created during super().__init__().
         # This ensures that calculations derived from max_num_blocks_per_req
@@ -3121,6 +3131,9 @@ class TPUModelRunner(GPUModelRunner):
             mamba_request_distribution = combined_device[3:6]
         assert request_distribution is not None
 
+        dcp_decode_single_pass = self._dcp_decode_single_pass and (
+            max(0, min(rpa_num_decode_reqs - start_index, num_reqs)) == num_reqs
+        )
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=start_index,
@@ -3128,6 +3141,7 @@ class TPUModelRunner(GPUModelRunner):
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
+            dcp_decode_single_pass=dcp_decode_single_pass,
             mamba_state_indices=mamba_state_indices,
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
             mamba_ckpt_window=self._mamba_ckpt_window,
@@ -5134,6 +5148,7 @@ class TPUModelRunner(GPUModelRunner):
         dp_lockstep: bool = False,
         profile_prefix: int | None = None,
         through_handoff: bool = False,
+        dcp_decode_single_pass: bool = False,
     ) -> float | None:
         """Run the forward at one bucket shape.
 
@@ -5146,7 +5161,11 @@ class TPUModelRunner(GPUModelRunner):
         hand-off and passes its output on, as a serving step does; every
         stage must then run the same sequence of forwards, and the caller
         settles the hand-off afterwards.
+
+        ``dcp_decode_single_pass`` compiles the single-pass DCP graph for the shape;
+        the dummy batch is all decodes, which that graph requires.
         """
+        assert not (dcp_decode_single_pass and profile_prefix is not None)
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
 
@@ -5235,6 +5254,7 @@ class TPUModelRunner(GPUModelRunner):
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
                 position_ids_override=position_ids,
+                dcp_decode_single_pass=dcp_decode_single_pass,
                 mamba_state_indices=dummy_mamba_state_indices,
                 mamba_slot_read_offsets=self.mamba_slot_read_offsets,
                 mamba_ckpt_window=self._mamba_ckpt_window,
@@ -5273,6 +5293,7 @@ class TPUModelRunner(GPUModelRunner):
                 sequence_layout_kind=(dummy_layout_plan.descriptor.kind.value),
                 sequence_layout_protocol=(dummy_layout_plan.descriptor.protocol),
                 sequence_layout_version=(dummy_layout_plan.descriptor.version),
+                dcp_decode_single_pass=dcp_decode_single_pass,
             )
 
             per_layer_attn_metadata = {
@@ -6266,6 +6287,20 @@ class TPUModelRunner(GPUModelRunner):
             )
         return attempt_succeeded
 
+    def _dcp_decode_single_pass_variants(self, num_tokens: int, num_reqs: int) -> tuple:
+        """The dcp_decode_single_pass values a step of this shape can take.
+
+        An all-decode step has at most reorder_batch_threshold tokens per
+        request (1 + num_speculative_tokens with spec decode), so larger
+        token buckets never see the single-pass graph.
+        """
+        assert self.reorder_batch_threshold is not None
+        if self._dcp_decode_single_pass and num_tokens <= (
+            num_reqs * self.reorder_batch_threshold
+        ):
+            return (False, True)
+        return (False,)
+
     def _precompile_backbone(self) -> None:
         """Compile the backbone for every token bucket.
 
@@ -6280,21 +6315,29 @@ class TPUModelRunner(GPUModelRunner):
                 logger.info("  -- num_tokens: %d", num_tokens)
                 if buckets.needs_retrace(num_tokens):
                     shape_variants.retrace(self.model, self.vllm_config)
-                self._dummy_run(
-                    num_tokens,
-                    self.num_reqs_max_model_len,
-                    self.max_num_blocks_per_req,
-                    use_max_model_len=True,
-                )
+                for dcp_decode_single_pass in self._dcp_decode_single_pass_variants(
+                    num_tokens, self.num_reqs_max_model_len
+                ):
+                    self._dummy_run(
+                        num_tokens,
+                        self.num_reqs_max_model_len,
+                        self.max_num_blocks_per_req,
+                        use_max_model_len=True,
+                        dcp_decode_single_pass=dcp_decode_single_pass,
+                    )
                 if self.most_model_len is not None:
                     assert self.num_reqs_most_model_len is not None
                     assert self.num_blocks_per_most_len_req is not None
-                    self._dummy_run(
-                        num_tokens,
-                        self.num_reqs_most_model_len,
-                        self.num_blocks_per_most_len_req,
-                        use_max_model_len=False,
-                    )
+                    for dcp_decode_single_pass in self._dcp_decode_single_pass_variants(
+                        num_tokens, self.num_reqs_most_model_len
+                    ):
+                        self._dummy_run(
+                            num_tokens,
+                            self.num_reqs_most_model_len,
+                            self.num_blocks_per_most_len_req,
+                            use_max_model_len=False,
+                            dcp_decode_single_pass=dcp_decode_single_pass,
+                        )
             if buckets.refused:
                 # A refusal that no trace picked up leaves a raising closure in
                 # the live graph, which would surface as a failed request. Fail

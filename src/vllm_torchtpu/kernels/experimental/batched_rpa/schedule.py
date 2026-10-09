@@ -739,9 +739,16 @@ class BaseMetadataComputer:
             sw_start_idx = q_offset + q_idx * cfgs.bq_sz - sliding_window + 1
             start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
 
-        end_k_idx_causal = (
-            q_offset + q_idx * cfgs.bq_sz + q_sz_task - 1
-        ) // cfgs.bkv_sz + 1
+        last_q_pos = q_offset + q_idx * cfgs.bq_sz + q_sz_task - 1
+        if cfgs.serve.cp_cache_causal:
+            # Global query position, local KV: the causal prefix is the local
+            # tokens up to the last query's global position.
+            visible = utils.cp_visible_kv_len(
+                last_q_pos, cfgs.serve.cp_group_size, cfgs.serve.page_size
+            )
+            end_k_idx_causal = pl.cdiv(visible, cfgs.bkv_sz)
+        else:
+            end_k_idx_causal = last_q_pos // cfgs.bkv_sz + 1
         end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
         if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
             start_k_idx = jnp.maximum(start_k_idx, kv_cache_len // cfgs.bkv_sz)

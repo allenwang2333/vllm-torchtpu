@@ -40,6 +40,36 @@ def cp_local_cache_len(global_kv_cache_len, cp_group_size, cp_rank, page_size):
     return full_tokens + rem_tokens
 
 
+def cp_q_position_shift(cp_group_size, cp_rank, cp_interleave_size):
+    """Shift added to a global query position to make it rank-free.
+
+    Rank r owns global position j iff ((j - r * I) // I) % cp_group_size == 0
+    for interleave size I, so shifting by (cp_group_size - r) * I turns every
+    rank into rank 0 and keeps positions non-negative. See
+    `cp_visible_kv_len`.
+    """
+    return (cp_group_size - cp_rank) * cp_interleave_size
+
+
+def cp_visible_kv_len(shifted_q_pos, cp_group_size, cp_interleave_size):
+    """Local KV tokens a query may attend causally under interleaved CP.
+
+    `shifted_q_pos` is the query's global position plus `cp_q_position_shift`.
+    A rank's tokens keep their global order in its local cache, so the
+    tokens a query sees causally are a local prefix; this returns its
+    length, i.e. cp_local_cache_len(q_pos + 1) for the shifted rank. Static
+    sizes make it rank-free, so it works on scalars and on vectors inside a
+    kernel without the rank.
+    """
+    stride = cp_group_size * cp_interleave_size
+    n = shifted_q_pos + 1
+    return (
+        (n // stride) * cp_interleave_size
+        + jnp.minimum(n % stride, cp_interleave_size)
+        - cp_interleave_size
+    )
+
+
 def broadcast_minor(src, shape):
     """Broadcasts 'src' to 'shape' in the minor dimension."""
     if src.shape == shape:

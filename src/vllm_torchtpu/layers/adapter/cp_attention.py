@@ -35,6 +35,9 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     wrapper as _batched_rpa_wrapper,
 )
+from vllm_torchtpu.kernels.experimental.batched_rpa.write_new_kv import (
+    write_new_kv as _write_new_kv,
+)
 from vllm_torchtpu.utils import synchronize_tensors
 
 # ---------------------------------------------------------------------------
@@ -134,6 +137,80 @@ def _pallas_rpa_kernel_dcp(
         decode_query_size=decode_query_size,
         return_lse=True,
         kv_layout=kv_layout,
+    )
+    return new_kv_cache, output, lse
+
+
+def _pallas_rpa_kernel_dcp_decode_single_pass(
+    kv_cache: jax.Array,
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    q_scale: float | None,
+    k_scale: float | None,
+    v_scale: float | None,
+    *,
+    sliding_window: int | None,
+    sm_scale: float | None = None,
+    soft_cap: float | None = None,
+    cp_group_size: int,
+    cp_rank_val: int,
+    kv_layout: _batched_rpa_configs.KVLayout = (
+        _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+    ),
+    decode_query_size: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """DCP decode single pass, for steps of decodes and verify windows only.
+
+    Stores this rank's share of the new tokens, then one CACHE_ONLY pass
+    with skip_kv_update (the tokens are in the cache) attends, for each
+    query, every local token that precedes it globally. Returns
+    (new_kv_cache, output, lse) like
+    _pallas_rpa_kernel_dcp; the caller merges ranks by LSE, and no
+    NEW_TOKENS_ONLY pass or local merge follows.
+    """
+    import jax.numpy as jnp
+
+    cp_rank_arr = jnp.array([cp_rank_val], dtype=jnp.int32)
+    kv_cache = _write_new_kv(
+        kv_cache,
+        key,
+        value,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        cp_rank_arr,
+        cp_group_size=cp_group_size,
+        kv_layout=kv_layout,
+        max_q_len=decode_query_size,
+    )
+    output, new_kv_cache, lse = _batched_rpa_wrapper.ragged_paged_attention(
+        queries=query,
+        keys=key,
+        values=value,
+        kv_cache=kv_cache,
+        kv_lens=seq_lens,
+        page_indices=block_tables,
+        cu_q_lens=query_start_loc,
+        distribution=request_distribution,
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        cp_group_size=cp_group_size,
+        cp_rank=cp_rank_arr,
+        attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
+        decode_query_size=decode_query_size,
+        return_lse=True,
+        kv_layout=kv_layout,
+        skip_kv_update=True,
     )
     return new_kv_cache, output, lse
 
@@ -266,6 +343,54 @@ def build_dcp_kernels(
     return cached_cache, cached_new
 
 
+def build_dcp_decode_single_pass_kernel(
+    sliding_window: int | None,
+    sm_scale: float,
+    logits_soft_cap: float | None,
+    q_scale: float | None,
+    k_scale: float | None,
+    v_scale: float | None,
+    cp_group_size: int,
+    cp_rank: int,
+    kv_layout: _batched_rpa_configs.KVLayout = (
+        _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+    ),
+    decode_query_size: int = 1,
+):
+    """Build and cache the decode single-pass jax_op; same call shape as
+    build_dcp_kernels' kernels. Build it before torch.compile traces."""
+    kv_layout = _batched_rpa_configs.KVLayout(kv_layout)
+    key = (
+        "dcp_decode_single_pass",
+        sliding_window,
+        sm_scale,
+        logits_soft_cap,
+        q_scale,
+        k_scale,
+        v_scale,
+        cp_group_size,
+        cp_rank,
+        kv_layout,
+        decode_query_size,
+    )
+    kernel = _DCP_KERNEL_REGISTRY.get(key)
+    if kernel is None:
+        fn = functools.partial(
+            _pallas_rpa_kernel_dcp_decode_single_pass,
+            sliding_window=sliding_window,
+            sm_scale=sm_scale,
+            soft_cap=logits_soft_cap,
+            cp_group_size=cp_group_size,
+            cp_rank_val=cp_rank,
+            kv_layout=kv_layout,
+            decode_query_size=decode_query_size,
+        )
+        kernel = _DCP_KERNEL_REGISTRY[key] = _build_dcp_kernel_op(
+            f"pallas::rpa_dcp_decode_single_pass_{_alloc_instance_id()}", fn
+        )
+    return kernel
+
+
 # ---------------------------------------------------------------------------
 # Top-level DCP forward
 # ---------------------------------------------------------------------------
@@ -289,14 +414,21 @@ def forward_with_dcp(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
+    decode_single_pass: bool = False,
 ) -> torch.Tensor:
-    """Two-pass DCP attention forward.
+    """DCP attention forward.
+
+    Two passes by default:
     1. CACHE_ONLY: query is all-gathered by heads to attend every rank's KV
         shard, then partials are merged by `cp_lse_ag_out_rs` back to own heads.
     2. NEW_TOKENS_ONLY: new tokens aren't DCP-sharded (every rank has the
         full local K/V for this step), so this rank's own heads attend
             directly; no gather/combine needed.
 
+    With `decode_single_pass` (every request is a decode or verify window), each
+    rank first stores the new tokens it owns, so one CACHE_ONLY pass over
+    the all-gathered query covers cache and new tokens, and the rank merge
+    is the whole result.
     """
     dcp_group = get_dcp_group()
     if dcp_group is None:
@@ -306,7 +438,7 @@ def forward_with_dcp(
     k_scale = layer._k_scale_float if kv_cache_quantized_dtype else None
     v_scale = layer._v_scale_float if kv_cache_quantized_dtype else None
 
-    cache_kernel, new_kernel = build_dcp_kernels(
+    kernel_config = dict(
         sliding_window=sliding_window,
         sm_scale=sm_scale,
         logits_soft_cap=logits_soft_cap,
@@ -333,6 +465,17 @@ def forward_with_dcp(
         v_scale,
     )
 
+    if decode_single_pass:
+        decode_single_pass_kernel = build_dcp_decode_single_pass_kernel(**kernel_config)
+        output, lse = decode_single_pass_kernel(
+            kv_cache, query_across_dcp, *shared_args
+        )
+        output = cp_lse_ag_out_rs(output, lse, dcp_group)
+        if not torch.compiler.is_compiling():
+            synchronize_tensors(kv_cache, wait=False)
+        return output
+
+    cache_kernel, new_kernel = build_dcp_kernels(**kernel_config)
     ctx_output, ctx_lse = cache_kernel(kv_cache, query_across_dcp, *shared_args)
 
     ctx_output, ctx_lse = cp_lse_ag_out_rs(

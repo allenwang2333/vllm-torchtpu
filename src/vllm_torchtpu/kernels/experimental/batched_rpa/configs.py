@@ -108,6 +108,16 @@ class ServingConfigs:
     skip_kv_update: bool = False
 
     @property
+    def cp_cache_causal(self) -> bool:
+        """CACHE_ONLY over a CP-sharded cache: q_offsets are shifted global
+        positions (utils.cp_q_position_shift) while KV positions are local,
+        so causality goes through utils.cp_visible_kv_len."""
+        return (
+            self.cp_group_size is not None
+            and self.attention_scope == AttentionScope.CACHE_ONLY
+        )
+
+    @property
     def max_decode_bkv_p_new(self) -> int:
         return 1 + pl.cdiv(self.decode_query_size - 1, self.page_size)
 
