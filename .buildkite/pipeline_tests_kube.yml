@@ -210,7 +210,7 @@ steps:
         key: "unit_tests_spec_decode_nightly"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
-        parallelism: 3
+        parallelism: 4
         env:
           SHAPE: *shape_single
           PYTEST_ADDOPTS: "-m 'not multichip'"

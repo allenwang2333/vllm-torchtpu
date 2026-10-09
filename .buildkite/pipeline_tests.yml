@@ -173,7 +173,7 @@ steps:
         key: "unit_tests_spec_decode_nightly"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") == "1"'
-        parallelism: 3
+        parallelism: 4
         env:
           PYTEST_ADDOPTS: "-m 'not multichip'"
         agents:
