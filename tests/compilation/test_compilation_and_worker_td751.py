@@ -311,13 +311,13 @@ def test_bucket_executables_warmup_runnable_for_remember_and_retrace(monkeypatch
 
 
 def test_kernel_reload_all_branches(monkeypatch):
-    monkeypatch.setattr(kr.envs, "TPU_KERNEL_ITER_MODE", True)
+    monkeypatch.setenv("TPU_KERNEL_ITER_MODE", "1")
     assert kr.is_enabled() is True
 
-    monkeypatch.setattr(kr.envs, "TPU_KERNEL_RELOAD_MODULES", "")
+    monkeypatch.setenv("TPU_KERNEL_RELOAD_MODULES", "")
     assert kr.default_reload_modules() == kr._DEFAULT_RELOAD_MODULES
 
-    monkeypatch.setattr(kr.envs, "TPU_KERNEL_RELOAD_MODULES", " mod_a , , mod_b ")
+    monkeypatch.setenv("TPU_KERNEL_RELOAD_MODULES", " mod_a , , mod_b ")
     assert kr.default_reload_modules() == ("mod_a", "mod_b")
 
     # _KernelDispatch with a function and a callable lacking __globals__
@@ -369,9 +369,7 @@ def test_kernel_reload_all_branches(monkeypatch):
         assert disp1(5) == 105
 
         # Default modules list when modules=None
-        monkeypatch.setattr(
-            kr.envs, "TPU_KERNEL_RELOAD_MODULES", "_dummy_reload_mod_td751"
-        )
+        monkeypatch.setenv("TPU_KERNEL_RELOAD_MODULES", "_dummy_reload_mod_td751")
         res2 = kr.reload_kernels(modules=None)
         assert res2["reloaded_modules"] == ["_dummy_reload_mod_td751"]
     finally:
