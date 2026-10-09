@@ -326,6 +326,17 @@ def _expand_selected_pools(
     """Selected pool ids -> left-packed token indices plus the tail."""
     num_tokens = selected.shape[0]
     visible = (pos + 1) // kpool  # [tokens]
+
+    # Put the selection in position order. Attention over a set is order-
+    # free only in exact arithmetic: the sparse kernel accumulates in row
+    # order, so a selection that comes back score-ordered from one scorer and
+    # position-ordered from another gives (slightly) different outputs for
+    # the same set. One canonical order makes the two scorers agree exactly
+    # whenever they agree on the set, and walks the KV pages front to back.
+    # Unselected slots sort last, keeping the row left-packed.
+    unused = jnp.iinfo(jnp.int32).max
+    selected = jnp.sort(jnp.where(selected_ok, selected, unused), axis=-1)
+    selected_ok = selected != unused
     token_ids = (selected[..., None] * kpool +
                  jnp.arange(kpool, dtype=jnp.int32))
     token_ids = jnp.where(selected_ok[..., None], token_ids, -1)
