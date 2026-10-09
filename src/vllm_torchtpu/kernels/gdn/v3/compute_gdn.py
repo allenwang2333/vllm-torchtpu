@@ -19,11 +19,17 @@ from vllm_torchtpu.kernels.gdn.v3 import config
 
 
 def l2_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
-    norm = jnp.sqrt(jnp.sum(x * x, axis=-1, keepdims=True, dtype=x.dtype) + eps)
-    return x / norm
+    inv_norm = jax.lax.rsqrt(
+        jnp.sum(x * x, axis=-1, keepdims=True, dtype=x.dtype) + eps
+    )
+    return x * inv_norm
 
 
 def get_mask_dtype(dtype: jnp.dtype) -> jnp.dtype:
+    if dtype == jnp.float32 or dtype == jnp.int32:
+        return jnp.int32
+    if dtype == jnp.bfloat16 or dtype == jnp.float16 or dtype == jnp.int16:
+        return jnp.int16
     match jnp.dtype(dtype).itemsize:
         case 4:
             return jnp.int32
@@ -88,13 +94,13 @@ def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
 
 def fused_transpose_broadcast(x: jax.Array, src_dim: int, dst_dim: int) -> jax.Array:
     """Perform 1D transpose where results are broadcasted along src_dim."""
-    assert x.shape[dst_dim] == 1
+    shape = x.shape
+    assert shape[dst_dim] == 1
 
     dtype = x.dtype
     mask_dtype = get_mask_dtype(dtype)
-    mask_shape = list(x.shape)
-    mask_size = mask_shape[src_dim]
-    mask_shape[dst_dim] = mask_size
+    dst_idx = dst_dim % len(shape)
+    mask_shape = shape[:dst_idx] + (shape[src_dim],) + shape[dst_idx + 1 :]
     src_mask = jax.lax.broadcasted_iota(mask_dtype, mask_shape, src_dim)
     dst_mask = jax.lax.broadcasted_iota(mask_dtype, mask_shape, dst_dim)
     mask = src_mask == dst_mask

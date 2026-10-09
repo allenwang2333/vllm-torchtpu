@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import math
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -23,8 +25,16 @@ from vllm_torchtpu.kernels import typed_ldst
 from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
 
 
+@functools.lru_cache(maxsize=64)
+def _invert_rows_perm(rows_perm: tuple[int, ...]) -> tuple[int, ...]:
+    inverse = [0] * len(rows_perm)
+    for logical, stored in enumerate(rows_perm):
+        inverse[stored] = logical
+    return tuple(inverse)
+
+
 def load_strided_heads(
-    vmem_ref: jax.Ref, num_heads: int, head_dim: int, lane_offset: int = 0
+    vmem_ref: Any, num_heads: int, head_dim: int, lane_offset: int = 0
 ) -> jax.Array:
     """Use strided LDST to split heads along the last dim and transpose.
 
@@ -45,8 +55,9 @@ def load_strided_heads(
     flat_ref = vmem_ref.reshape(-1, num_lanes)
     head_list = []
     for head in range(num_heads):
+        base_offset = lane_offset + head * lanes_per_head
         head_lanes = [
-            flat_ref[lane_offset + head * lanes_per_head + lane :: lanes_per_col]
+            flat_ref[base_offset + lane :: lanes_per_col]
             for lane in range(lanes_per_head)
         ]
         head_list.append(jnp.concat(head_lanes, axis=-1))
@@ -54,7 +65,7 @@ def load_strided_heads(
 
 
 def load_compact_heads(
-    vmem_ref: jax.Ref, num_heads: int, head_dim: int, dim_offset: int = 0
+    vmem_ref: Any, num_heads: int, head_dim: int, dim_offset: int = 0
 ) -> jax.Array:
     """Use contiguous slices to split heads along the last dim and stack.
 
@@ -75,7 +86,7 @@ def load_compact_heads(
     return jnp.stack(head_list, axis=1)
 
 
-def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
+def load_compact_to_large(vmem_ref: Any) -> jax.Array:
     """Use strided load to convert compact to large layout without transpose."""
 
     # NOTE: Only support 32-bits for now.
@@ -96,7 +107,7 @@ def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
 
 
 def _region_rows_per_block(
-    slot_ref: jax.Ref, region: config.StateRegion
+    slot_ref: Any, region: config.StateRegion
 ) -> tuple[int, int]:
     """(typed rows per source block, typed lane count) of a slot tile."""
     out_lanes = slot_ref.shape[-1] // region.lane_split
@@ -106,7 +117,7 @@ def _region_rows_per_block(
 
 
 def load_state_region(
-    slot_ref: jax.Ref, region: config.StateRegion, shape: tuple[int, ...]
+    slot_ref: Any, region: config.StateRegion, shape: tuple[int, ...]
 ) -> jax.Array:
     """Loads one slot's state from its raw source-layout tile.
 
@@ -141,7 +152,7 @@ def load_state_region(
 
 
 def store_state_region(
-    slot_ref: jax.Ref, region: config.StateRegion, values: jax.Array
+    slot_ref: Any, region: config.StateRegion, values: jax.Array
 ) -> None:
     """Stores one slot's logical state into its raw source-layout tile.
 
@@ -158,9 +169,7 @@ def store_state_region(
     if region.rows_perm is not None:
         # Inverse of the load-side gather: logical row i is stored at
         # typed row rows_perm[i].
-        inverse = [0] * len(region.rows_perm)
-        for logical, stored in enumerate(region.rows_perm):
-            inverse[stored] = logical
+        inverse = _invert_rows_perm(tuple(region.rows_perm))
         arr = jnp.concat([arr[i][None] for i in inverse], axis=0)
     capacity = region.nblocks * rows_pb
     if region.rows_used < capacity:
@@ -173,7 +182,7 @@ def store_state_region(
         )
 
 
-def _load_conv_state(slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int) -> jax.Array:
+def _load_conv_state(slot_ref: Any, cfg: config.GDNConfig, idx: int) -> jax.Array:
     """One slot's conv state, decoded through the plan when there is one."""
     # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
     if cfg.state_plan is None:
@@ -185,9 +194,7 @@ def _load_conv_state(slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int) -> jax.
     ).astype(jnp.float32)
 
 
-def _load_recurrent_state(
-    slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int
-) -> jax.Array:
+def _load_recurrent_state(slot_ref: Any, cfg: config.GDNConfig, idx: int) -> jax.Array:
     """One slot's recurrent state, converted to FP32 for compute."""
     if cfg.state_plan is None:
         return slot_ref[idx, 0].astype(jnp.float32)
@@ -201,10 +208,10 @@ def _load_recurrent_state(
 def load_and_select_states(
     metadata_ref: memory_ref.MetadataRef,
     p_id: jax.Array,
-    conv_state_slot_ref: jax.Ref,
-    recurrent_slot_ref: jax.Ref,
-    carry_conv_scratch_ref: jax.Ref | None,
-    carry_recurrent_scratch_ref: jax.Ref | None,
+    conv_state_slot_ref: Any,
+    recurrent_slot_ref: Any,
+    carry_conv_scratch_ref: Any,
+    carry_recurrent_scratch_ref: Any,
     cfg: config.GDNConfig,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Load correct states from HBM or prior tile, and masks invalid states.
@@ -305,9 +312,9 @@ def load_and_select_states(
 
 def load_activation_as_compact(
     qkv_vreg: jax.Array,
-    qkv_vmem_ref: jax.Ref,
-    b_vmem_ref: jax.Ref,
-    a_vmem_ref: jax.Ref,
+    qkv_vmem_ref: Any,
+    b_vmem_ref: Any,
+    a_vmem_ref: Any,
     cfgs: config.GDNConfig,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Load activations from VMEM as a compact layout."""
@@ -336,9 +343,9 @@ def load_activation_as_compact(
 
 def load_activation_as_large(
     qkv_vreg: jax.Array,
-    qkv_vmem_ref: jax.Ref,
-    b_vmem_ref: jax.Ref,
-    a_vmem_ref: jax.Ref,
+    qkv_vmem_ref: Any,
+    b_vmem_ref: Any,
+    a_vmem_ref: Any,
     cfgs: config.GDNConfig,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Load activations from VMEM as a large layout."""

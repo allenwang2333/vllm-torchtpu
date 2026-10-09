@@ -135,6 +135,7 @@ def chunked_kda_per_seq(
     causal_mask_block = (
         jnp.arange(block_size)[:, None] >= jnp.arange(block_size)[None, :]
     )
+    b_zero = jnp.zeros((cfg.num_v_heads, block_size, block_size), dtype=jnp.float32)
 
     aqk_row_strips = []
     t_inv_row_strips = []
@@ -149,6 +150,13 @@ def chunked_kda_per_seq(
         # Sub-block anchor: row 0 of the current sub-block.
         g_ref = g_row[:, :1, :]
 
+        qk_scaled_merged = b_zero
+        if r_b > 0:
+            exp_g_row_ref = jnp.exp(g_row - g_ref)
+            q_scaled = q_row * exp_g_row_ref
+            k_beta_scaled = (k_row * beta_row) * exp_g_row_ref
+            qk_scaled_merged = jnp.concat([q_scaled, k_beta_scaled], axis=1)
+
         aqk_col_blocks = []
         L_interaction_blocks = []
 
@@ -159,13 +167,10 @@ def chunked_kda_per_seq(
 
             if c_b < r_b:
                 # Off-diagonal: factored through g_ref, GEMM on the MXU.
-                q_scaled = q_row * jnp.exp(g_row - g_ref)
-                k_beta_scaled = (k_row * beta_row) * jnp.exp(g_row - g_ref)
                 k_col_scaled = k_col * jnp.exp(g_ref - g_col)
 
                 # [H, 2*BC, K] @ [H, BC, K]^T -> [H, 2*BC, BC], giving
                 # both Aqk[r_b, c_b] and L[r_b, c_b] in one instruction.
-                qk_scaled_merged = jnp.concat([q_scaled, k_beta_scaled], axis=1)
                 gemm_out = jax.lax.dot(
                     qk_scaled_merged,
                     k_col_scaled,
@@ -190,9 +195,6 @@ def chunked_kda_per_seq(
                 aqk_col_blocks.append(b_aqk)
 
             else:
-                b_zero = jnp.zeros(
-                    (cfg.num_v_heads, block_size, block_size), dtype=jnp.float32
-                )
                 aqk_col_blocks.append(b_zero)
 
         # concat into: [H, BC, chunk_size]
@@ -251,8 +253,9 @@ def chunked_kda_per_seq(
     Aqk = jnp.concat(aqk_row_strips, axis=1)  # [H, chunk_size, chunk_size]
     T_inv = jnp.concat(t_inv_row_strips, axis=1)  # [H, chunk_size, chunk_size]
 
+    exp_g_cumsum = jnp.exp(g_cumsum)
     v_beta = v_large * beta
-    k_beta_gating = (k * beta) * jnp.exp(g_cumsum)
+    k_beta_gating = (k * beta) * exp_g_cumsum
 
     merged_v_k = jnp.concat([v_beta, k_beta_gating], axis=-1)
     merged_uw = jax.lax.dot(
@@ -264,7 +267,7 @@ def chunked_kda_per_seq(
 
     u, w = jnp.split(merged_uw, [cfg.v_head_dim], axis=-1)
 
-    q_gated = q * jnp.exp(g_cumsum)
+    q_gated = q * exp_g_cumsum
     wq = jnp.concat([w, q_gated], axis=1)
     ws_and_out = jax.lax.dot_general(
         wq,

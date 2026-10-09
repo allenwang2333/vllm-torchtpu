@@ -54,6 +54,8 @@ class SmemWrapper:
     shape: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
 
     def _get_pos(self, indices):
+        if len(self.shape) == 2 and len(indices) == 2:
+            return indices[0] * self.shape[1] + indices[1]
         strides = pl.strides_from_shape(self.shape)
         assert len(strides) == len(indices)
 
@@ -122,7 +124,12 @@ class MetadataRef:
         )
 
     def __len__(self) -> int:
-        return len(jax.tree_util.tree_leaves(self))
+        return 9 if self.s_idx_to_ckpt_indices is None else 10
+
+
+_BUFFERED_REF_FIELD_NAMES: tuple[str, ...] = tuple(
+    f.name for f in dataclasses.fields(pltpu.BufferedRef)
+)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -134,7 +141,7 @@ class BaseBufferedRef(pltpu.BufferedRef):
     metadata_ref: MetadataRef = dataclasses.field(metadata=dict(static=True))
 
     @classmethod
-    def create(
+    def create(  # type: ignore[override]
         cls,
         spec: pl.BlockSpec,
         dtype_or_type: jax.Array,
@@ -157,10 +164,7 @@ class BaseBufferedRef(pltpu.BufferedRef):
             cfg=cfg,
             metadata_ref=metadata_ref,
             **fields,
-            **{
-                f.name: getattr(standard_ref, f.name)
-                for f in dataclasses.fields(pltpu.BufferedRef)
-            },
+            **{name: getattr(standard_ref, name) for name in _BUFFERED_REF_FIELD_NAMES},
         )
 
 
@@ -172,7 +176,7 @@ class InBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref: Any = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -189,7 +193,7 @@ class InBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref: Any = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -211,7 +215,7 @@ class OutBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref: Any = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -228,7 +232,7 @@ class OutBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref: Any = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -269,7 +273,7 @@ class StateBufferedRef(BaseBufferedRef):
         """Source rows one state occupies (checkpoints for the dense path)."""
         return 1
 
-    def _wait_slice(self, vmem_ref: jax.Ref, count):
+    def _wait_slice(self, vmem_ref: Any, count):
         """Never-executed self-copy ref carrying the bytes to wait on.
 
         ``count`` is a number of participating SLOTS, not source rows: one
@@ -287,7 +291,7 @@ class StateBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref: Any = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -312,7 +316,7 @@ class StateBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref: Any = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -334,7 +338,7 @@ class StateBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref: Any = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -360,7 +364,7 @@ class StateBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref: Any = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -441,7 +445,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref: Any = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -476,7 +480,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref: Any = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -499,7 +503,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref: Any = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -527,7 +531,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref: Any = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -551,7 +555,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref: Any = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
         dma_size = 0

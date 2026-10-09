@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -29,21 +30,25 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     vmem_ldst,
 )
 
+_SMEM_SPEC = pl.BlockSpec(memory_space=pltpu.SMEM)
+_VMEM_SPEC = pl.BlockSpec(memory_space=pltpu.VMEM)
+_HBM_SPEC = pl.BlockSpec(memory_space=pltpu.HBM)
+
 
 def inner_kernel(
     # Inputs.
-    qkv_slot_ref: jax.Array,  # [seq, chunk, 1, dim_size]
-    b_slot_ref: jax.Array,  # [seq, chunk, 1, num_v_heads]
-    a_slot_ref: jax.Array,  # [seq, chunk, 1, num_v_heads]
-    conv_state_slot_ref: jax.Array,  # [seq, prev_kernel_size, 1, dim_size]
-    recurrent_slot_ref: jax.Array,  # [seq, num_v_heads, kq_head, v_head]
+    qkv_slot_ref: Any,  # [seq, chunk, 1, dim_size]
+    b_slot_ref: Any,  # [seq, chunk, 1, num_v_heads]
+    a_slot_ref: Any,  # [seq, chunk, 1, num_v_heads]
+    conv_state_slot_ref: Any,  # [seq, prev_kernel_size, 1, dim_size]
+    recurrent_slot_ref: Any,  # [seq, num_v_heads, kq_head, v_head]
     # Outputs.
-    out_slot_ref: jax.Array,  # [seq * chunk, num_v_heads, v_head]
+    out_slot_ref: Any,  # [seq * chunk, num_v_heads, v_head]
     # Scratches.
     metadata_ref: memory_ref.MetadataRef,
     weights_ref: memory_ref.WeightRefs,
-    carry_conv_scratch_ref: jax.Array | None,
-    carry_recurrent_scratch_ref: jax.Array | None,
+    carry_conv_scratch_ref: Any,
+    carry_recurrent_scratch_ref: Any,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
@@ -151,15 +156,13 @@ def inner_kernel(
     # Step 2: GDN.
 
     # Prepare gdn weights.
-    if cfg.is_kda:
-        # KDA reshapes these per (head, channel) rather than padding out to
-        # a lane multiple over heads.
-        a_log = weights_ref.gdn.a_log[...]
-        dt_bias = weights_ref.gdn.dt_bias[...]
-    else:
+    a_log = weights_ref.gdn.a_log[...]
+    dt_bias = weights_ref.gdn.dt_bias[...]
+    if not cfg.is_kda:
         padding_size = cfg.aligned_num_v_heads - cfg.num_v_heads
-        a_log = jnp.pad(weights_ref.gdn.a_log[...], ((0, padding_size)))
-        dt_bias = jnp.pad(weights_ref.gdn.dt_bias[...], ((0, padding_size)))
+        if padding_size > 0:
+            a_log = jnp.pad(a_log, ((0, padding_size),))
+            dt_bias = jnp.pad(dt_bias, ((0, padding_size),))
 
     # NOTE: Ideally, we want to move this branching logic into gdn.py. However,
     # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
@@ -473,6 +476,7 @@ def fused_conv1d_gdn(
         )
     else:
         assert state_source is None
+        assert conv_state is not None and recurrent_state is not None
         conv_out_dtype = conv_state.dtype
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
@@ -603,17 +607,17 @@ def fused_conv1d_gdn(
     weights = memory_ref.WeightRefs(conv=conv_weights, gdn=gdn_weights)
 
     # Step 5: Create specs.
-    smem_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
-    vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
-    hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    smem_spec = _SMEM_SPEC
+    vmem_spec = _VMEM_SPEC
+    hbm_spec = _HBM_SPEC
     weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
 
     def call_kernel(
-        in_conv_state: jax.Array,
-        in_recurrent_state: jax.Array | None,
-        in_act: jax.Array | None,
+        in_conv_state: Any,
+        in_recurrent_state: Any,
+        in_act: Any,
         mode: config.GDNMode,
-    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+    ) -> tuple[Any, Any, Any]:
         # With a state source, it rides the conv-state slot and the dense
         # recurrent-state input is absent.
         if mode == config.GDNMode.PER_SEQ:
@@ -713,7 +717,7 @@ def fused_conv1d_gdn(
                 vmem_limit_bytes=cfg.get_vmem_limit_bytes(),
             ),
             name=cfg.get_kernel_name(),
-            metadata=cfg.get_metadata(),
+            metadata=cast(Any, cfg.get_metadata()),
         )(
             metadata_obj,
             qkv,
@@ -729,7 +733,8 @@ def fused_conv1d_gdn(
         raise ValueError("batched_only and prefill_only are mutually exclusive")
 
     if pooled:
-        out_act, out_source = None, state_source
+        out_act: Any = None
+        out_source: Any = state_source
         if not prefill_only:
             out_act, out_source, _ = call_kernel(
                 state_source, None, None, config.GDNMode.BATCHED
