@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Iterator
 from functools import lru_cache
 from pathlib import Path
 
@@ -15,6 +16,12 @@ from safetensors.torch import load  # pyrefly: ignore[missing-import]
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
 from vllm_torchtpu import envs
+
+_GROUPED_STREAMS: dict[
+    tuple[str, int], Iterator[tuple[int, dict[str, torch.Tensor]]]
+] = {}
+_GROUPED_PENDING: dict[tuple[str, int], dict[int, dict[str, torch.Tensor]]] = {}
+_GROUPED_LOADED: dict[tuple[str, int], set[int]] = {}
 
 
 def _sha256(path: Path) -> str:
@@ -105,6 +112,73 @@ def _select_grouped_experts(
     }
 
 
+def _stream_grouped_shards(
+    uri: str, group: int, files: dict[tuple[int, int], dict]
+) -> Iterator[tuple[int, dict[str, torch.Tensor]]]:
+    import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
+    from runai_model_streamer.file_streamer import FileChunks
+    from runai_model_streamer.safetensors_streamer.safetensors_streamer import (
+        SafetensorsStreamer,
+    )
+
+    names = {"w13", "w2", "s13", "s2"}
+    paths = [uri.rstrip("/") + "/" + files[layer, group]["file"] for layer in range(40)]
+    with SafetensorsStreamer() as streamer:
+        fs = streamer.file_streamer
+        metas = sp.SafetensorsMetadata.from_files(fs, paths, None)
+        requests = []
+        tensor_names = []
+        for layer, (path, meta) in enumerate(zip(paths, metas, strict=True)):
+            members = [tensor.name for tensor in meta.tensors_metadata]
+            if set(members) != names or len(members) != len(names):
+                raise ValueError(f"Unexpected static MoE tensors: {path}")
+            requests.append(FileChunks(layer, path, meta.offset, meta.read_sizes))
+            tensor_names.append(meta.tensors_metadata)
+        fs.stream_files(requests, credentials=None, device="cpu", is_distributed=False)
+        pending: dict[int, dict[str, torch.Tensor]] = {}
+        for layer, chunk, buffer in fs.get_chunks():
+            meta = tensor_names[layer][chunk]
+            tensors = pending.setdefault(layer, {})
+            if meta.name in tensors:
+                raise ValueError(
+                    f"Duplicate static MoE tensor: {paths[layer]}:{meta.name}"
+                )
+            tensors[meta.name] = sp.create_torch_tensor(buffer, meta).clone()
+            if len(tensors) == len(names):
+                yield layer, pending.pop(layer)
+        if pending:
+            raise ValueError(f"Incomplete static MoE stream: {sorted(pending)}")
+
+
+def _streamed_group(
+    uri: str, group: int, layer: int, files: dict[tuple[int, int], dict]
+) -> dict[str, torch.Tensor]:
+    key = (uri, group)
+    if key not in _GROUPED_STREAMS:
+        _GROUPED_STREAMS[key] = _stream_grouped_shards(uri, group, files)
+        _GROUPED_PENDING[key] = {}
+        _GROUPED_LOADED[key] = set()
+    pending = _GROUPED_PENDING[key]
+    while layer not in pending:
+        try:
+            next_layer, tensors = next(_GROUPED_STREAMS[key])
+        except StopIteration as error:
+            raise ValueError(f"Static MoE layer {layer} missing from stream") from error
+        pending[next_layer] = tensors
+    tensors = pending.pop(layer)
+    loaded = _GROUPED_LOADED[key]
+    loaded.add(layer)
+    if len(loaded) == 40:
+        try:
+            next(_GROUPED_STREAMS[key])
+        except StopIteration:
+            pass
+        else:
+            raise ValueError("Static MoE stream has extra layers")
+        del _GROUPED_STREAMS[key], _GROUPED_PENDING[key], _GROUPED_LOADED[key]
+    return tensors
+
+
 def _load_grouped_layer(
     root: Path,
     files: dict[tuple[int, int], dict],
@@ -137,12 +211,7 @@ def _load_grouped_layer(
         if path.stat().st_size != item["bytes"]:
             raise ValueError(f"Static MoE shard size mismatch: {path}")
         if static_uri := envs.TPU_DSV41_STATIC_MOE_URI:
-            from vllm_torchtpu.model_loader_patches import (
-                _sharded_runai_weights_iterator,
-            )
-
-            uri = static_uri.rstrip("/") + "/" + item["file"]
-            tensors = dict(_sharded_runai_weights_iterator([uri], set(), False))
+            tensors = _streamed_group(static_uri, group, layer_id, files)
         else:
             tensors = load(path.read_bytes())
         if set(tensors) != set(shapes):
