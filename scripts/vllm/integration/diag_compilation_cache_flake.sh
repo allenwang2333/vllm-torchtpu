@@ -28,7 +28,9 @@ export VLLM_TARGET_DEVICE="tpu"
 export VLLM_DISABLE_COMPILE_CACHE=1
 export VLLM_XLA_CHECK_RECOMPILATION=1
 export DIAG_DUMP_ON_CACHE_MISS=1
-export DIAG_SYNC_AFTER_LOAD="${DIAG_SYNC_AFTER_LOAD:-1}"
+export DIAG_SYNC_AFTER_LOAD="${DIAG_SYNC_AFTER_LOAD:-0}"
+# Run 4: the repeated-ops split off, to confirm it is what takes the placeholder.
+export TORCH_TPU_INTERNAL_DETECT_REPEATED_OPS="${TORCH_TPU_INTERNAL_DETECT_REPEATED_OPS:-off}"
 
 mkdir -p "${OUT}" "${TIER3_DIR}" "${VLLM_CACHE_ROOT}"
 : > "${KNOWN}"
