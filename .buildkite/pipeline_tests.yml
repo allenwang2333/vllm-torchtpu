@@ -99,6 +99,7 @@ steps:
         key: "unit_tests_multichip_pr"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") != "1"'
+        parallelism: 2
         agents:
           queue: "tpu_v7x_8_queue"
         plugins:
@@ -192,6 +193,11 @@ steps:
         key: "unit_tests_spec_decode_multichip_nightly"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") == "1"'
+        parallelism: 2
+        env:
+          # Keeps the split over the multichip examples; see the single-chip
+          # Speculative Decoding steps.
+          PYTEST_ADDOPTS: "-m 'multichip'"
         agents:
           queue: "tpu_v7x_8_queue"
         artifact_paths:
@@ -199,6 +205,7 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
+              split-by-example: true
               test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=3600 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
@@ -219,6 +226,7 @@ steps:
         key: "unit_tests_multichip_nightly"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") == "1"'
+        parallelism: 2
         agents:
           queue: "tpu_v7x_8_queue"
         plugins:
