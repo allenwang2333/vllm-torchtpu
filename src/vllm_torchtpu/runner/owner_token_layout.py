@@ -27,6 +27,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm_torchtpu import envs
+
 
 @dataclasses.dataclass(frozen=True)
 class OwnerTokenLayout:
@@ -64,6 +66,7 @@ def build_owner_token_layout(
     num_padded_tokens: int | None = None,
     num_reqs_padded: int | None = None,
     segment_multiple: int = 1,
+    scale_paddings: bool = False,
 ) -> OwnerTokenLayout:
     """Lay out one step's tokens owner-major, one segment per owner.
 
@@ -81,9 +84,24 @@ def build_owner_token_layout(
         num_reqs_padded: The requests in each ``query_start_loc`` row, at least
             the real requests. Defaults to the real requests.
         segment_multiple: What ``segment_tokens`` must be a multiple of.
+        scale_paddings: Whether to scale ``token_paddings`` by
+            ``tp_size * segment_multiple`` when ``need`` exceeds the largest
+            aligned bucket.
     """
-    owners = np.asarray(owners, dtype=np.int64)
-    tokens = np.asarray(num_scheduled_tokens, dtype=np.int64)
+    owners = (
+        owners
+        if isinstance(owners, np.ndarray)
+        and owners.ndim == 1
+        and np.issubdtype(owners.dtype, np.integer)
+        else np.asarray(owners, dtype=np.int64)
+    )
+    tokens = (
+        num_scheduled_tokens
+        if isinstance(num_scheduled_tokens, np.ndarray)
+        and num_scheduled_tokens.ndim == 1
+        and np.issubdtype(num_scheduled_tokens.dtype, np.integer)
+        else np.asarray(num_scheduled_tokens, dtype=np.int64)
+    )
     if owners.ndim != 1 or owners.shape != tokens.shape:
         raise ValueError(
             f"Expected one owner per request, got owners {owners.shape} and "
@@ -109,17 +127,24 @@ def build_owner_token_layout(
         )
 
     # Row o: exclusive prefix sums of owner o's token counts, in batch order.
-    request_ids = np.arange(num_reqs)
-    per_owner = np.zeros((tp_size, num_reqs), dtype=np.int64)
+    request_ids = np.arange(num_reqs, dtype=np.int32)
+    per_owner = np.zeros((tp_size, num_reqs), dtype=np.int32)
     per_owner[owners, request_ids] = tokens
-    query_start_loc = np.zeros((tp_size, reqs_padded + 1), dtype=np.int64)
-    query_start_loc[:, 1 : num_reqs + 1] = np.cumsum(per_owner, axis=1)
+    query_start_loc = np.zeros((tp_size, reqs_padded + 1), dtype=np.int32)
+    np.cumsum(
+        per_owner, axis=1, dtype=np.int32, out=query_start_loc[:, 1 : num_reqs + 1]
+    )
     query_start_loc[:, num_reqs + 1 :] = query_start_loc[:, num_reqs, None]
     owner_tokens = query_start_loc[:, num_reqs]
 
     need = tp_size * int(owner_tokens.max())
     step = tp_size * segment_multiple
-    padded = select_owner_padded_tokens(need, step, token_paddings)
+    paddings = (
+        _owner_paddings(token_paddings, tp_size, need, segment_multiple)
+        if scale_paddings
+        else token_paddings
+    )
+    padded = select_owner_padded_tokens(need, step, paddings)
     segment = padded // tp_size
     padded_batch = padded if num_padded_tokens is None else num_padded_tokens
     if padded_batch < total:
@@ -139,11 +164,13 @@ def build_owner_token_layout(
     pad_rows = np.flatnonzero(~used)
 
     perm = np.empty(padded, dtype=np.int32)
-    perm[rows] = np.arange(total)
+    perm[rows] = np.arange(total, dtype=np.int32)
     # Pair padding rows with padding tokens. When their counts differ, repeat
     # them; with none, use row/token 0. Either way the pairs are never read
     # back, as padding is outside every request of every segment.
-    perm[pad_rows] = np.resize(np.arange(total, padded_batch), pad_rows.size)
+    perm[pad_rows] = np.resize(
+        np.arange(total, padded_batch, dtype=np.int32), pad_rows.size
+    )
     inv = np.empty(padded_batch, dtype=np.int32)
     inv[:total] = rows
     inv[total:] = np.resize(pad_rows, padded_batch - total)
@@ -152,8 +179,8 @@ def build_owner_token_layout(
         segment_tokens=segment,
         perm=perm,
         inv=inv,
-        query_start_loc=query_start_loc.astype(np.int32),
-        owner_tokens=owner_tokens.astype(np.int32),
+        query_start_loc=query_start_loc,
+        owner_tokens=owner_tokens.copy(),
     )
 
 
@@ -186,14 +213,7 @@ def _owner_paddings(
     return [step * size for size in token_paddings]
 
 
-def request_owners(
-    block_ids: np.ndarray,
-    rows: slice | Sequence[int] | np.ndarray,
-    layout: Any,
-) -> np.ndarray:
-    """Owner rank of each request in ``rows`` from column 0 of a sharded KV
-    cache group's host block table."""
-    first = np.asarray(block_ids[rows, 0], dtype=np.int64)
+def _owners_from_first_blocks(first: np.ndarray, layout: Any) -> np.ndarray:
     invalid = (first < layout.num_replicated) | (first >= layout.num_blocks)
     if invalid.any():
         bad = int(first[invalid][0])
@@ -201,7 +221,21 @@ def request_owners(
             f"Block {bad} in the sharded block table is not in an owner "
             f"region of {layout}"
         )
-    return ((first - layout.num_replicated) // layout.blocks_per_owner).astype(np.int32)
+    return ((first - layout.num_replicated) // layout.blocks_per_owner).astype(
+        np.int32, copy=False
+    )
+
+
+def request_owners(
+    block_ids: np.ndarray,
+    rows: slice | Sequence[int] | np.ndarray,
+    layout: Any,
+) -> np.ndarray:
+    """Owner rank of each request in ``rows`` from column 0 of a sharded KV
+    cache group's host block table."""
+    return _owners_from_first_blocks(
+        np.asarray(block_ids[rows, 0], dtype=np.int64), layout
+    )
 
 
 def _to_2d_numpy(table: Any) -> np.ndarray:
@@ -391,20 +425,15 @@ def prepare_kv_shard_owner_token_layout(
         default_owner=default_owner,
     )
     tp_size = int(owner_layout.num_owners)
-    need = (
-        tp_size * int(np.bincount(owners, weights=tokens_arr, minlength=tp_size).max())
-        if tokens_arr.size > 0
-        else 0
-    )
-    paddings = _owner_paddings(token_paddings, tp_size, need, segment_multiple)
     layout = build_owner_token_layout(
         owners,
         tokens_arr,
         tp_size,
-        paddings,
+        token_paddings,
         num_padded_tokens=num_padded_tokens,
         num_reqs_padded=num_reqs_padded,
         segment_multiple=segment_multiple,
+        scale_paddings=True,
     )
     meta_target = (
         attn_metadata
@@ -468,8 +497,6 @@ def attach_step_owner_token_layout(
 ) -> OwnerTokenLayout | None:
     """Build and attach the step's ``OwnerTokenLayout`` onto
     ``per_layer_attn_metadata`` when ``TPU_DEEPSEEK_V41_KV_SHARD=1``."""
-    from vllm_torchtpu import envs
-
     if not envs.TPU_DEEPSEEK_V41_KV_SHARD:
         return None
     tp_size = int(runner.parallel_config.tensor_parallel_size)
@@ -485,12 +512,18 @@ def attach_step_owner_token_layout(
         return None
     metas = tuple({id(m): m for m in per_layer_attn_metadata.values()}.values())
     first = metas[0]
+    raw_paddings = runner.num_tokens_paddings
+    paddings_cache = getattr(runner, "_kv_shard_paddings_cache", None)
+    if paddings_cache is None or paddings_cache[0] != id(raw_paddings):
+        paddings_cache = (id(raw_paddings), tuple(raw_paddings))
+        runner._kv_shard_paddings_cache = paddings_cache
+    paddings_tuple = paddings_cache[1]
     if ctx.position_ids_override is not None:
         perm, inv, q_loc = _positional_layout(
             first.query_start_loc,
             padded_tokens,
             tp_size,
-            runner.num_tokens_paddings,
+            paddings_tuple,
         )
         for meta in metas:
             meta.owner_perm = perm
@@ -517,13 +550,19 @@ def attach_step_owner_token_layout(
     rows = getattr(ctx, "req_indices", None)
     if rows is None:
         rows = slice(ctx.start_index, ctx.start_index + ctx.num_reqs)
-    q_loc_np = np.asarray(
+    raw_q_loc = (
         q_loc_cpu.detach().cpu().numpy()
         if isinstance(q_loc_cpu, torch.Tensor)
-        else q_loc_cpu,
-        dtype=np.int64,
+        else q_loc_cpu
     )
-    first_blocks = np.asarray(block_ids[rows, 0], dtype=np.int64)
+    q_loc_np = (
+        raw_q_loc
+        if isinstance(raw_q_loc, np.ndarray)
+        and raw_q_loc.ndim == 1
+        and np.issubdtype(raw_q_loc.dtype, np.integer)
+        else np.asarray(raw_q_loc, dtype=np.int64)
+    )
+    first_blocks = block_ids[rows, 0]
     num_reqs_padded = int(first.query_start_loc.shape[0]) - 1
     step_key = (
         tp_size,
@@ -531,7 +570,7 @@ def attach_step_owner_token_layout(
         num_reqs_padded,
         first.query_start_loc.device,
         owner_layout,
-        tuple(runner.num_tokens_paddings),
+        paddings_tuple,
         first_blocks.tobytes(),
         q_loc_np[: ctx.num_reqs + 1].tobytes(),
     )
@@ -544,28 +583,30 @@ def attach_step_owner_token_layout(
             meta.owner_inv = inv_t
             meta.owner_q_loc = q_loc_t
         return layout
-    owners = request_owners(block_ids, rows, owner_layout)
+    owners = _owners_from_first_blocks(first_blocks, owner_layout)
     scheduled = q_loc_np[1 : ctx.num_reqs + 1] - q_loc_np[: ctx.num_reqs]
-    need = tp_size * int(
-        np.bincount(owners, weights=scheduled, minlength=tp_size).max()
-    )
-    paddings = _owner_paddings(runner.num_tokens_paddings, tp_size, need)
     layout = build_owner_token_layout(
         owners,
         scheduled,
         tp_size,
-        paddings,
+        paddings_tuple,
         num_padded_tokens=padded_tokens,
         num_reqs_padded=num_reqs_padded,
+        scale_paddings=True,
     )
-    attach_owner_token_layout(
-        per_layer_attn_metadata, layout, device=first.query_start_loc.device
+    perm_t, inv_t, q_loc_t = owner_layout_tensors(
+        layout, device=first.query_start_loc.device
     )
+    for meta in metas:
+        meta.owner_token_layout = layout
+        meta.owner_perm = perm_t
+        meta.owner_inv = inv_t
+        meta.owner_q_loc = q_loc_t
     runner._kv_shard_step_layout_cache = (
         step_key,
         layout,
-        first.owner_perm,
-        first.owner_inv,
-        first.owner_q_loc,
+        perm_t,
+        inv_t,
+        q_loc_t,
     )
     return layout

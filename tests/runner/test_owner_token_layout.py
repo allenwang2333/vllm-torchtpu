@@ -351,7 +351,6 @@ def test_attach_step_owner_token_layout_and_tpu_runner_build_metadata(monkeypatc
         SlidingWindowSpec,
     )
 
-    from vllm_torchtpu import envs
     from vllm_torchtpu.layers.core.attention_metadata import (
         AttentionMetadata,
         AttentionMetadataBuilderContext,
@@ -434,13 +433,13 @@ def test_attach_step_owner_token_layout_and_tpu_runner_build_metadata(monkeypatc
     runner.num_tokens_padded = 8
 
     # 1. Disabled when TPU_DEEPSEEK_V41_KV_SHARD is False
-    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_KV_SHARD", False)
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_KV_SHARD", "0")
     metas = _make_metas()
     assert attach_step_owner_token_layout(runner, metas) is None
     assert getattr(metas["attn.full.0"], "owner_perm", None) is None
 
     # 2. Enabled guard branches (tp_size <= 1, empty dict, ctx None/empty)
-    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_KV_SHARD", True)
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_KV_SHARD", "1")
     runner.parallel_config = SimpleNamespace(tensor_parallel_size=1)
     assert attach_step_owner_token_layout(runner, metas) is None
     runner.parallel_config = vllm_config.parallel_config
@@ -589,7 +588,7 @@ def test_attach_step_owner_token_layout_and_tpu_runner_build_metadata(monkeypatc
     )
 
     # 5. Disabled TPU_DEEPSEEK_V41_KV_SHARD in _build_attention_metadata is a no-op
-    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_KV_SHARD", False)
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_KV_SHARD", "0")
     runner._attn_metadata_builder_ctx.staged_block_tables = {
         0: torch.zeros((4, 1), dtype=torch.int32)
     }

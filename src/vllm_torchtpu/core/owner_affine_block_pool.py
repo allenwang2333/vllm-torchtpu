@@ -84,10 +84,22 @@ class OwnerLayout:
     num_replicated: int
     num_owners: int
     blocks_per_owner: int
+    num_blocks: int = dataclasses.field(init=False, repr=False, compare=False)
+    blocks_per_rank: int = dataclasses.field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.num_replicated < 1 or self.num_owners < 2 or self.blocks_per_owner < 1:
             raise ValueError(f"Invalid owner-sharded KV layout: {self}")
+        object.__setattr__(
+            self,
+            "num_blocks",
+            self.num_replicated + self.num_owners * self.blocks_per_owner,
+        )
+        object.__setattr__(
+            self,
+            "blocks_per_rank",
+            self.num_replicated + self.blocks_per_owner,
+        )
 
     @classmethod
     def split(
@@ -102,14 +114,6 @@ class OwnerLayout:
             )
         per_owner = (num_blocks - min_replicated) // num_owners
         return cls(num_blocks - num_owners * per_owner, num_owners, per_owner)
-
-    @property
-    def num_blocks(self) -> int:
-        return self.num_replicated + self.num_owners * self.blocks_per_owner
-
-    @property
-    def blocks_per_rank(self) -> int:
-        return self.num_replicated + self.blocks_per_owner
 
     def region_of(self, block_id: int) -> int:
         """The owner of ``block_id``, or ``num_owners`` if it is replicated."""
@@ -387,6 +391,8 @@ class OwnerAffineBlockPool(BlockPool):
         self.layout = layout
         self.region_free_queue = RegionFreeQueue(layout, regions)
         self.free_block_queue = self.region_free_queue
+        self._owner_queues = tuple(self.region_free_queue.queues[: layout.num_owners])
+        self._replicated_queue = self.region_free_queue.queues[layout.num_owners]
         # Replicated-group blocks counted by the admission check in progress.
         self.pending_replicated_blocks = 0
         self._request_owner: dict[str, int] = {}
@@ -411,11 +417,10 @@ class OwnerAffineBlockPool(BlockPool):
 
     @property
     def num_free_replicated_blocks(self) -> int:
-        return self.region_free_queue.queues[self.layout.num_owners].num_free_blocks
+        return self._replicated_queue.num_free_blocks
 
     def owner_free_blocks(self) -> list[int]:
-        owners = self.region_free_queue.queues[: self.layout.num_owners]
-        return [queue.num_free_blocks for queue in owners]
+        return [queue.num_free_blocks for queue in self._owner_queues]
 
     def owner_of(self, request_id: str) -> int | None:
         return self._request_owner.get(request_id)
@@ -427,10 +432,11 @@ class OwnerAffineBlockPool(BlockPool):
         them the per-rank attention segments, balanced. Most free blocks
         breaks ties.
         """
-        free = self.owner_free_blocks()
+        req_counts = self._owner_num_requests
+        owner_queues = self._owner_queues
         return sorted(
             range(self.layout.num_owners),
-            key=lambda o: (self._owner_num_requests[o], -free[o], o),
+            key=lambda o: (req_counts[o], -owner_queues[o].num_free_blocks, o),
         )
 
     def bind(self, request_id: str, owner: int) -> None:
