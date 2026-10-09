@@ -139,9 +139,15 @@ def quantized_matmul(
             f"{w_q.shape[0]}."
         )
 
+    op = _quantized_matmul_kernel_op
+    if op is None:
+        op = _get_quantized_matmul_op()
+    if x.ndim == 2:
+        return op(x, w_q, w_s)
+
     orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
-    out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s)
+    out_2d = op(x_2d, w_q, w_s)
     return out_2d.reshape(orig_out_shape)
 
 
@@ -209,9 +215,15 @@ def quantized_matmul_fp4(
     last dim is packed). The fused fp32 block scale `w_s` [1, num_blocks, 1,
     n_out] carries the logical output width.
     """
+    op = _quantized_matmul_fp4_op
+    if op is None:
+        op = _get_quantized_matmul_fp4_op()
+    if x.ndim == 2:
+        return op(x, w_q, w_s)
+
     orig_out_shape = (*x.shape[:-1], w_s.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
-    out_2d = _get_quantized_matmul_fp4_op()(x_2d, w_q, w_s)
+    out_2d = op(x_2d, w_q, w_s)
     return out_2d.reshape(orig_out_shape)
 
 
