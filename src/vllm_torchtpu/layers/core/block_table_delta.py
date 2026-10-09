@@ -173,6 +173,7 @@ class _EntryState:
     nblocks: np.ndarray  # source-row num_blocks_per_row at upload
     mutations: int  # source table's total mutation count at upload
     total_rewrites: int = 0  # source table's total rewrite count at upload
+    bt: Any = None
 
 
 @dataclass
@@ -180,6 +181,7 @@ class _Layout:
     dev: torch.Tensor
     mirror: np.ndarray  # int32, equal to `dev` element for element
     entries: list[_EntryState]
+    unique_geoms: tuple[tuple[Any, int, _EntryState], ...] = ()
     tables: dict[int, torch.Tensor] | None = None
 
 
@@ -226,6 +228,18 @@ class BlockTableDeltaStager:
         if layout is None:
             return None
         start, num_reqs = ctx.start_index, ctx.num_reqs
+        if (
+            layout.entries
+            and num_reqs == layout.entries[0].num_reqs
+            and all(st.bt._bt_mutations == st.mutations for st in layout.entries)
+            and all(
+                b._active_block_table_columns(ctx, tnb) == st.active_cols
+                for b, tnb, st in layout.unique_geoms
+            )
+        ):
+            self._layouts.move_to_end(key)
+            self.num_reuse += 1
+            return layout.dev
         end = start + num_reqs
         cap = DELTA_CAPACITY
         update_buf = self._update_buf
@@ -418,26 +432,34 @@ class BlockTableDeltaStager:
         """Remember a full upload so the next walk can send a delta."""
         start, num_reqs = ctx.start_index, ctx.num_reqs
         states: list[_EntryState] = []
+        unique_geoms: list[tuple[Any, int, _EntryState]] = []
+        seen_geoms: set[tuple[int, bool, int]] = set()
         offset = 0
         for builder, (_, bt, tnb) in zip(builders, entries, strict=True):
-            states.append(
-                _EntryState(
-                    offset,
-                    tnb,
-                    builder._active_block_table_columns(ctx, tnb),
-                    num_reqs,
-                    bt._row_rewrite[start : start + num_reqs].copy(),
-                    bt.num_blocks_per_row[start : start + num_reqs].copy(),
-                    bt._bt_mutations,
-                    bt._bt_rewrites,
-                )
+            st = _EntryState(
+                offset,
+                tnb,
+                builder._active_block_table_columns(ctx, tnb),
+                num_reqs,
+                bt._row_rewrite[start : start + num_reqs].copy(),
+                bt.num_blocks_per_row[start : start + num_reqs].copy(),
+                bt._bt_mutations,
+                bt._bt_rewrites,
+                bt,
             )
+            states.append(st)
+            ac_key = (builder.target_block_size, builder.is_mamba_group, tnb)
+            if ac_key not in seen_geoms:
+                seen_geoms.add(ac_key)
+                unique_geoms.append((builder, tnb, st))
             offset += num_reqs_padded * tnb
         if staged_dev.device.type == "cpu":
             # `.to()` on a CPU device returns the shared host scratch itself,
             # which the next full upload overwrites.
             staged_dev = staged_dev.clone()
-        self._layouts[key] = _Layout(staged_dev, flat.numpy().copy(), states)
+        self._layouts[key] = _Layout(
+            staged_dev, flat.numpy().copy(), states, tuple(unique_geoms)
+        )
         self._layouts.move_to_end(key)
         while len(self._layouts) > MAX_LAYOUTS:
             self._layouts.popitem(last=False)

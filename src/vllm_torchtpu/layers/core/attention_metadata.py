@@ -185,7 +185,10 @@ class _StagedWalkPlan:
     mamba_geom: tuple[tuple[int, int, int], ...]
     mamba_entry_indices: tuple[int, ...]
     total: int
+    entry_gids: tuple[int, ...] = ()
+    mamba_gids: tuple[int, ...] = ()
     tracked_entries_key: tuple[tuple[int, int, int], ...] | None = None
+    delta_key_zero_start: tuple | None = None
 
 
 def _staged_walk_products(
@@ -368,7 +371,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         cached = ctx.active_cols_cache.get(cache_key)
         if cached is not None:
             return cached
-        max_seq_len = getattr(ctx, "max_active_seq_len", None)
+        max_seq_len = ctx.max_active_seq_len
         if max_seq_len is None:
             seq_lens_cpu = ctx.seq_lens_cpu
             if (
@@ -389,7 +392,8 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         if max_seq_len <= 0:
             res = min(16, target_num_blocks)
         else:
-            needed_blocks = cdiv(max_seq_len, self.target_block_size)
+            bs = self.target_block_size
+            needed_blocks = (max_seq_len + bs - 1) // bs
             if self.is_mamba_group and ctx.mamba_ckpt_window > 1:
                 needed_blocks += ctx.mamba_ckpt_window - 1
             bucket_cols = 1 << max(4, (needed_blocks - 1).bit_length())
@@ -400,14 +404,14 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         runner = self.runner
         ctx = runner._attn_metadata_builder_ctx
-        target_num_reqs = common_attn_metadata.num_reqs
 
         # `position_ids` is only used for the dummy run in dummy runs, where we
         # want to use fixed position IDs instead of copying from the CPU tensor
         # that gets updated every step.
+        staged_tables = ctx.staged_block_tables
         staged = (
-            ctx.staged_block_tables.get(self.kv_cache_group_id)
-            if ctx.staged_block_tables is not None
+            staged_tables.get(self.kv_cache_group_id)
+            if staged_tables is not None
             else None
         )
         if staged is not None:
@@ -422,7 +426,9 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 else runner.position_ids
             )
             target_num_blocks = 0
+            target_num_reqs = common_attn_metadata.num_reqs
         else:
+            target_num_reqs = common_attn_metadata.num_reqs
             block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
             if ctx.position_ids_override is not None:
                 block_tables_dev = torch.zeros(
@@ -543,10 +549,15 @@ def _get_staged_walk_plan(
     runner: Any,
     ctx: AttentionMetadataBuilderContext,
     num_reqs_padded: int,
-    gids: set[int] | None,
+    gids: set[int] | frozenset[int] | None,
 ) -> _StagedWalkPlan | None:
     unified_mamba = bool(
         ctx.mamba_state_indices is None and getattr(runner, "_unified_kv_layout", False)
+    )
+    gids_key = (
+        None
+        if gids is None
+        else (gids if isinstance(gids, frozenset) else frozenset(gids))
     )
     plan_key = (
         id(runner.attn_groups),
@@ -558,7 +569,7 @@ def _get_staged_walk_plan(
         ctx.mamba_ckpt_window,
         unified_mamba,
         num_reqs_padded,
-        frozenset(gids) if gids is not None else None,
+        gids_key,
     )
     cache = getattr(runner, "_staged_walk_plan_cache", None)
     if not isinstance(cache, dict):
@@ -606,6 +617,8 @@ def _get_staged_walk_plan(
                 mamba_geom.append((i, table_geom[i][2], builder.target_block_size))
                 mamba_entry_indices.append(i)
 
+    entry_gids = tuple(gid for gid, _, _ in entries)
+    mamba_gids = tuple(entries[ei][0] for ei in mamba_entry_indices)
     plan = _StagedWalkPlan(
         entries=entries,
         entry_builders=entry_builders,
@@ -613,6 +626,8 @@ def _get_staged_walk_plan(
         mamba_geom=tuple(mamba_geom),
         mamba_entry_indices=tuple(mamba_entry_indices),
         total=offset,
+        entry_gids=entry_gids,
+        mamba_gids=mamba_gids,
     )
     cache[plan_key] = plan
     return plan
@@ -622,7 +637,7 @@ def stage_block_table_uploads(
     runner: Any,
     ctx: AttentionMetadataBuilderContext,
     num_reqs_padded: int,
-    gids: set[int] | None = None,
+    gids: set[int] | frozenset[int] | None = None,
 ) -> None:
     """One batched H2D transfer for every block table a walk will build.
 
@@ -645,7 +660,6 @@ def stage_block_table_uploads(
     entry_builders = plan.entry_builders
     table_geom = plan.table_geom
     mamba_geom = plan.mamba_geom
-    mamba_entry_indices = plan.mamba_entry_indices
 
     # Incremental staging keeps the packed buffer on device across steps and
     # uploads only changed entries (`block_table_delta.py`). Limited to walks
@@ -662,10 +676,15 @@ def stage_block_table_uploads(
                 and getattr(entries[0][1], "_bt_delta_token", None)
                 == plan.tracked_entries_key[0][1]
             ):
-                delta_key = (plan.tracked_entries_key, num_reqs_padded, ctx.start_index)
+                delta_key = (
+                    plan.delta_key_zero_start
+                    if ctx.start_index == 0
+                    else (plan.tracked_entries_key, num_reqs_padded, ctx.start_index)
+                )
             else:
                 delta_key = stager.layout_key(entries, num_reqs_padded, ctx.start_index)
                 plan.tracked_entries_key = delta_key[0]
+                plan.delta_key_zero_start = (delta_key[0], num_reqs_padded, 0)
     staged_dev = None
     if stager is not None and delta_key is not None:
         staged_dev = stager.try_stage(
@@ -761,16 +780,15 @@ def stage_block_table_uploads(
 
     n_tables = len(entries)
     n_mamba = len(mamba_geom)
-    ctx.staged_block_tables = {
-        gid: products[i] for i, (gid, _, _) in enumerate(entries)
-    }
+    ctx.staged_block_tables = dict(zip(plan.entry_gids, products))
     if not mamba_geom and stager is not None and delta_key is not None:
         stager.set_cached_tables(delta_key, ctx.staged_block_tables)
     if n_mamba:
         states = products[n_tables : n_tables + n_mamba]
-        has_ckpt = ctx.mamba_ckpt_window > 1
-        ckpts = products[n_tables + n_mamba :] if has_ckpt else (None,) * n_mamba
-        ctx.staged_mamba_products = {
-            entries[ei][0]: (states[j], ckpts[j] if has_ckpt else None)
-            for j, ei in enumerate(mamba_entry_indices)
-        }
+        if ctx.mamba_ckpt_window > 1:
+            ckpts = products[n_tables + n_mamba :]
+            ctx.staged_mamba_products = dict(zip(plan.mamba_gids, zip(states, ckpts)))
+        else:
+            ctx.staged_mamba_products = {
+                gid: (state, None) for gid, state in zip(plan.mamba_gids, states)
+            }

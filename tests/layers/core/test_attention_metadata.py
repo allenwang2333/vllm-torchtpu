@@ -708,3 +708,163 @@ class TestAttentionMetadataBuilderPlumbing:
             meta_c.block_tables.reshape(4, 64)[0, 16:],
             torch.zeros(48, dtype=torch.int32),
         )
+
+    def test_td716_fast_paths_and_full_branch_coverage(self, monkeypatch):
+        from vllm_torchtpu.layers.core import attention_metadata as am_mod
+
+        # 1. Unified mamba staged walk with ckpt_window == 1 (covers 218->210 and 794)
+        #    plus frozenset gids and start_index == 0 vs != 0 delta_key reuse.
+        runner = self._make_runner_mock(num_groups=3, max_num_blocks_per_req=32)
+        runner._unified_kv_layout = True
+        b_attn0 = self._make_builder(runner, kv_cache_group_id=0)
+        b_attn1 = self._make_builder(runner, kv_cache_group_id=1)
+        b_mamba = self._make_mamba_builder(runner, kv_cache_group_id=2)
+        self._make_attn_groups(runner, [b_attn0, b_attn1, b_mamba])
+
+        for step_start in (0, 0, 1):
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=2,
+                start_index=step_start,
+                use_max_model_len=True,
+                seq_lens=torch.tensor([16, 32, 0, 0], dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+                mamba_ckpt_window=1,
+            )
+            runner._attn_metadata_builder_ctx = ctx
+            stage_block_table_uploads(runner, ctx, 4, gids=frozenset({0, 1, 2}))
+            assert ctx.staged_mamba_products is not None
+            assert ctx.staged_mamba_products[2][1] is None
+            m0 = b_attn0.build(0, self._make_cm(4))
+            m1 = b_attn1.build(0, self._make_cm(4))
+            assert m0 is not m1
+            assert m1.block_tables is ctx.staged_block_tables[1]
+
+        # 2. Empty entries when gids matches no group (covers 598 and 658).
+        ctx_empty = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.ones((4,), dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+        stage_block_table_uploads(runner, ctx_empty, 4, gids=frozenset({99}))
+        assert ctx_empty.staged_block_tables is None
+
+        # 3. _active_block_table_columns edge cases:
+        #    - seq_lens_cpu is None and seq_lens is None (line 384)
+        #    - max_seq_len <= 0 (line 393)
+        #    - is_mamba_group with mamba_ckpt_window > 1 (line 398)
+        ctx_none_seq = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=None,
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+        assert b_attn0._active_block_table_columns(ctx_none_seq, 32) == 32
+
+        ctx_zero_seq = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.zeros((4,), dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+        assert b_attn0._active_block_table_columns(ctx_zero_seq, 32) == 16
+
+        ctx_mamba_cols = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([256, 256, 0, 0], dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+            mamba_ckpt_window=3,
+        )
+        assert b_mamba._active_block_table_columns(ctx_mamba_cols, 64) == 32
+
+        # 4. Mamba build() branches:
+        #    - compact mamba (ctx.mamba_state_indices is not None, line 464)
+        #    - staged block table without staged_mamba_products (line 484)
+        #    - non-unified mamba without ctx.mamba_state_indices (line 517)
+        compact_slots = torch.tensor([3, 1, 0, 0], dtype=torch.int32)
+        ctx_compact = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([16, 16, 0, 0], dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+            mamba_state_indices=compact_slots,
+        )
+        runner._attn_metadata_builder_ctx = ctx_compact
+        meta_compact = b_mamba.build(0, self._make_cm(4))
+        assert meta_compact.mamba_state_indices is compact_slots
+
+        ctx_staged_no_prod = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([16, 16, 0, 0], dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+            staged_block_tables={2: torch.zeros((4 * 32,), dtype=torch.int32)},
+        )
+        runner._attn_metadata_builder_ctx = ctx_staged_no_prod
+        meta_staged_no_prod = b_mamba.build(0, self._make_cm(4))
+        assert meta_staged_no_prod.mamba_state_indices is not None
+
+        runner._unified_kv_layout = False
+        ctx_non_unified = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([16, 16, 0, 0], dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+        runner._attn_metadata_builder_ctx = ctx_non_unified
+        meta_non_unified = b_mamba.build(0, self._make_cm(4))
+        assert meta_non_unified.mamba_state_indices is None
+
+        # 5. TPU compiled products dispatch path (lines 246 and 765).
+        orig_compiled = am_mod._staged_walk_products_compiled
+        wrapped_fn = getattr(orig_compiled, "__wrapped__", am_mod._staged_walk_products)
+        monkeypatch.setattr(am_mod, "_staged_walk_products_compiled", wrapped_fn)
+
+        class _FakeTpuTensor(torch.Tensor):
+            @property
+            def device(self):
+                return SimpleNamespace(type="tpu")
+
+        from types import SimpleNamespace
+
+        runner_tpu = self._make_runner_mock(num_groups=2, max_num_blocks_per_req=4)
+        b0 = self._make_builder(runner_tpu, kv_cache_group_id=0)
+        b1 = self._make_builder(runner_tpu, kv_cache_group_id=1)
+        self._make_attn_groups(runner_tpu, [b0, b1])
+        monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "0")
+        orig_to = torch.Tensor.to
+        monkeypatch.setattr(
+            torch.Tensor,
+            "to",
+            lambda self, *args, **kwargs: (
+                self.as_subclass(_FakeTpuTensor)
+                if args and args[0] is runner_tpu.device
+                else orig_to(self, *args, **kwargs)
+            ),
+        )
+        ctx_tpu = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.ones((4,), dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+        stage_block_table_uploads(runner_tpu, ctx_tpu, 4)
+        assert set(ctx_tpu.staged_block_tables) == {0, 1}
