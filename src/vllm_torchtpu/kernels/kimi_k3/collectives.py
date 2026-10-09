@@ -170,12 +170,15 @@ def ring_tables(devices, token_ranks):
     if len(physical_to_mesh) != 32:
         raise ValueError("Duplicate physical cores")
     result = []
+    token_ranks_tuple = tuple(token_ranks)
     for cycle in CYCLES:
         peers = tuple(
             physical_to_mesh[chip * 2 + core] for chip in cycle for core in range(2)
         )
-        positions = tuple(peers.index(i) for i in range(32))
-        result.append((positions, peers, tuple(token_ranks)))
+        positions = [0] * 32
+        for pos, peer in enumerate(peers):
+            positions[peer] = pos
+        result.append((tuple(positions), peers, token_ranks_tuple))
     return np.asarray(result, np.int32)
 
 

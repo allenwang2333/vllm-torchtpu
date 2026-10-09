@@ -131,8 +131,7 @@ def _kernel(
 
     mixed_qkv = mixed_qkv_ref[0].astype(compute_dtype)
     stored_conv = conv_state_ref[0].astype(compute_dtype)
-    prev_conv = stored_conv
-    prev_conv = jnp.where(use_carried_state, prev_conv, 0.0)
+    prev_conv = jnp.where(use_carried_state, stored_conv, 0.0)
 
     conv_weight = conv_weight_ref[...].astype(compute_dtype)
     conv_out = mixed_qkv * conv_weight[kernel_size - 1]
@@ -176,11 +175,10 @@ def _kernel(
 
     new_stored = jnp.swapaxes(new_state, -1, -2) if state_transposed else new_state
     new_conv = jnp.concat([prev_conv[1:], mixed_qkv[None]], axis=0)
-    new_stored_conv = new_conv
     # Invalid entries emit zeros and leave their slot as found. Their writes land
     # on slot 0, which is reserved and never handed to a request.
     out = jnp.where(valid, out, 0.0)
-    new_stored_conv = jnp.where(valid, new_stored_conv, stored_conv)
+    new_stored_conv = jnp.where(valid, new_conv, stored_conv)
     new_stored = jnp.where(valid, new_stored, stored)
 
     out_ref[0] = out.astype(out_ref.dtype)
@@ -257,6 +255,28 @@ def _get_compiler_params(vmem_capacity_bytes: int) -> pltpu.CompilerParams:
     return pltpu.CompilerParams(
         dimension_semantics=("arbitrary",),
         vmem_limit_bytes=int(0.9 * vmem_capacity_bytes),
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _get_decode_kernel(
+    n_v: int,
+    d_k: int,
+    kernel_size: int,
+    lower_bound: float | None,
+    compute_dtype: jnp.dtype,
+    scale: float,
+    state_transposed: bool,
+):
+    return functools.partial(
+        _kernel,
+        n_v=n_v,
+        d_k=d_k,
+        kernel_size=kernel_size,
+        lower_bound=lower_bound,
+        compute_dtype=compute_dtype,
+        scale=scale,
+        state_transposed=state_transposed,
     )
 
 
@@ -345,8 +365,7 @@ def decode_kda(
 
     a_log_2d = a_log.reshape(n_v, 1)
 
-    kernel = functools.partial(
-        _kernel,
+    kernel = _get_decode_kernel(
         n_v=n_v,
         d_k=d_k,
         kernel_size=kernel_size,

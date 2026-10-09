@@ -40,13 +40,9 @@ def causal_conv1d(
     conv_bias_3d = conv_bias.reshape(1, 1, -1) if conv_bias is not None else None
 
     for c_idx in range(cfg.chunk_size):
-        out = jnp.zeros((cfg.seq_tile_size, 1, cfg.dim_size), jnp.float32)
-
-        end_idx = c_idx + cfg.prev_kernel_size
-        start_idx = 1 + end_idx - cfg.kernel_size
-        for k in range(cfg.kernel_size):
-            lhs_curr = lhs[:, start_idx + k]
-            out += lhs_curr * weight_slices[k]
+        out = (lhs[:, c_idx] * weight_slices[0]).astype(jnp.float32)
+        for k in range(1, cfg.kernel_size):
+            out += lhs[:, c_idx + k] * weight_slices[k]
 
         if conv_bias_3d is not None:
             out += conv_bias_3d

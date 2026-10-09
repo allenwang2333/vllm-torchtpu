@@ -35,6 +35,14 @@ _VMEM_SPEC = pl.BlockSpec(memory_space=pltpu.VMEM)
 _HBM_SPEC = pl.BlockSpec(memory_space=pltpu.HBM)
 
 
+@functools.lru_cache(maxsize=32)
+def _get_compiler_params(vmem_limit_bytes: int) -> pltpu.CompilerParams:
+    return pltpu.CompilerParams(
+        disable_bounds_checks=True,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+
+
 def inner_kernel(
     # Inputs.
     qkv_slot_ref: Any,  # [seq, chunk, 1, dim_size]
@@ -712,10 +720,7 @@ def fused_conv1d_gdn(
             out_specs=(hbm_spec, hbm_spec, None if pooled else hbm_spec),
             scratch_shapes=cfg.get_scratch_shape_dict(),
             input_output_aliases=input_output_aliases,
-            compiler_params=pltpu.CompilerParams(
-                disable_bounds_checks=True,
-                vmem_limit_bytes=cfg.get_vmem_limit_bytes(),
-            ),
+            compiler_params=_get_compiler_params(cfg.get_vmem_limit_bytes()),
             name=cfg.get_kernel_name(),
             metadata=cast(Any, cfg.get_metadata()),
         )(

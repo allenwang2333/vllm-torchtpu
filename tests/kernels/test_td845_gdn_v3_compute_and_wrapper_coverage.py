@@ -1464,3 +1464,29 @@ def test_fused_conv1d_gdn_validation_and_dispatch(monkeypatch):
         state_plan=plan,
         prefill_only=True,
     )
+
+
+def test_td897_optimizations():
+    from vllm_torchtpu.kernels.kimi_k3 import decode_kda
+
+    # 1. SmemWrapper._get_pos unit-stride and zero-col fast path
+    data = jnp.arange(8, dtype=jnp.int32)
+    smem_unit = memory_ref.SmemWrapper(data, (1, 1))
+    row_obj = object()
+    assert smem_unit._get_pos((row_obj, 0)) is row_obj
+    assert smem_unit[3, 0] == 3
+    assert smem_unit[3, 1] == 4
+
+    smem_strided = memory_ref.SmemWrapper(data, (1, 4))
+    assert smem_strided[1, 0] == 4
+    assert smem_strided[1, 2] == 6
+
+    # 2. Cached CompilerParams and decode kernel partial
+    assert wrapper._get_compiler_params(4096) is wrapper._get_compiler_params(4096)
+    k1 = decode_kda._get_decode_kernel(
+        4, 128, 4, -5.0, jnp.dtype(jnp.float32), 0.5, False
+    )
+    k2 = decode_kda._get_decode_kernel(
+        4, 128, 4, -5.0, jnp.dtype(jnp.float32), 0.5, False
+    )
+    assert k1 is k2

@@ -55,7 +55,10 @@ class SmemWrapper:
 
     def _get_pos(self, indices):
         if len(self.shape) == 2 and len(indices) == 2:
-            return indices[0] * self.shape[1] + indices[1]
+            row, col = indices
+            stride = self.shape[1]
+            base = row if stride == 1 else row * stride
+            return base if type(col) is int and col == 0 else base + col
         strides = pl.strides_from_shape(self.shape)
         assert len(strides) == len(indices)
 
