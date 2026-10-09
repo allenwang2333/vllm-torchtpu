@@ -942,7 +942,10 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
                 @pl.when(jnp.logical_and(l == 1, "d_ishare" not in skip))
                 def _():
+                    pd = Phases(tiles.trace)
+                    pd.mark("D_ishare")
                     index_share()
+                    pd.end()
             ph = Phases(tiles.trace)
             ph.mark("L_norm")
             slot = l % 2
@@ -1104,7 +1107,10 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 for d_ in dcs:
                     d_.wait()
             if draft and "d_glue" not in skip:
+                pd = Phases(tiles.trace)
+                pd.mark("D_glue")
                 draft_glue(l, slot)
+                pd.end()
             return carry
 
         # ---------------- indexer ----------------
