@@ -758,3 +758,16 @@ def test_mha_reference_functions() -> None:
     # 3. mha_reference JIT wrapper & _mha_reference
     out_ref = mha_reference(q, k, v, ab, seg, causal=True, sm_scale=0.5)
     assert out_ref.shape == q.shape
+
+    # 4. Direct get_tuned_params lookup (miss & hit)
+    tkey = kernel.make_tuning_key(
+        q,
+        k,
+        v,
+        causal=True,
+        has_segment_ids=False,
+        has_attention_bias=False,
+        vmem_limit_bytes=None,
+        device_kind="TPU v5",
+    )
+    assert kernel.get_tuned_params(tkey) is None

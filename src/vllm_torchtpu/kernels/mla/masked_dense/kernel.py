@@ -426,12 +426,14 @@ def _mla_ragged_paged_attention_kernel(
     def broadcast_minor(src, shape):
         if src.shape == shape:
             return src
+        src_minor = src.shape[-1]
+        target_end = shape[-1]
         assert src.shape[:-1] == shape[:-1]
-        assert src.shape[-1] % 128 == 0
-        target_minor = align_to(shape[-1], src.shape[-1])
+        assert src_minor % 128 == 0
+        target_minor = align_to(target_end, src_minor)
         # no-op concatenation.
-        return jnp.concatenate((src,) * (target_minor // src.shape[-1]), axis=-1)[
-            ..., : shape[-1]
+        return jnp.concatenate((src,) * (target_minor // src_minor), axis=-1)[
+            ..., :target_end
         ]
 
     def process():

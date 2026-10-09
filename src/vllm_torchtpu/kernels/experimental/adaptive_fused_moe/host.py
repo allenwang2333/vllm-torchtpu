@@ -513,16 +513,12 @@ def build_routing_tables(
     expert_blocks = expert_of_pair.reshape(n_blocks, block)
     bins = jnp.arange(e_total, dtype=jnp.int32)
 
-    block_hist = jnp.sum(
-        (expert_blocks[:, :, None] == bins[None, None, :]).astype(jnp.int32), axis=1
-    )  # [n_blocks, E]
+    block_hist = _block_hist(expert_blocks, bins)  # [n_blocks, E]
     block_off = jnp.cumsum(block_hist, axis=0) - block_hist  # excl over blocks
     base_per_slot = _lookup_per_pair(
         block_off, expert_blocks, bins
     )  # [n_blocks, block]
-    eq = expert_blocks[:, :, None] == expert_blocks[:, None, :]
-    tri = jnp.tril(jnp.ones((block, block), dtype=jnp.bool_), k=-1)
-    rank = jnp.sum((eq & tri[None]).astype(jnp.int32), axis=2)
+    rank = _rank_within_block(expert_blocks, block)
     pair_rank = (base_per_slot + rank).reshape(-1)  # [n] rank in its expert
 
     blocks_per_dest = (t_local * K) // block
@@ -1105,8 +1101,6 @@ def shard_transport_tables_in_blocks(routing, me, *, e_total, ep):
 
     # One expert per push, so an expert's contrib offset is its region's.
     contrib_off = contrib_base[None, :] + grp_off  # [G, d]
-
-    push_src = contrib_base[None, :] + grp_off  # [g, d]
     push_len = my_region_rows
     # recv_base[d (receiver), me (src), g] for every d: [d, g] -> [g, d].
     my_recv_base = lax.dynamic_slice(recv_base, (0, me, 0), (ep, 1, g_local))[:, 0]
@@ -1126,11 +1120,12 @@ def shard_transport_tables_in_blocks(routing, me, *, e_total, ep):
         """One table in block units: the row count's high bits."""
         return jnp.right_shift(a, ROWBLK_SHIFT).astype(jnp.int32)
 
+    contrib_off_i32 = i32(contrib_off)
     return (
         i32(run_start),
         i32(aligned_rows),
-        i32(contrib_off),
-        i32(push_src),
+        contrib_off_i32,
+        contrib_off_i32,
         i32(push_len),
         i32(push_dst),
         totals,

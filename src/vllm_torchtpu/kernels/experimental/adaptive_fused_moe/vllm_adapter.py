@@ -508,6 +508,16 @@ def _build_op(
     return op
 
 
+def _squeeze_block_scale_checked(scale: torch.Tensor) -> torch.Tensor:
+    # FP4 scales are already [E, K/block, N]. Even a single block must
+    # retain its axis; the per-channel helper would incorrectly drop it.
+    if scale.ndim == 4 and scale.shape[2] == 1:
+        return scale.squeeze(2)
+    if scale.ndim != 3:
+        raise ValueError("FP4 runtime scales require a contraction-block axis")
+    return scale
+
+
 def run_adaptive_fused_moe(
     owner: Any,
     hidden_states: torch.Tensor,
@@ -522,21 +532,12 @@ def run_adaptive_fused_moe(
     if op is None:
         raise RuntimeError("adaptive fused MoE was not prebuilt for this layer")
     if w1.dtype == torch.float4_e2m1fn_x2:
-        # FP4 scales are already [E, K/block, N]. Even a single block must
-        # retain its axis; the per-channel helper would incorrectly drop it.
-        def block_scale(scale):
-            if scale.ndim == 4 and scale.shape[2] == 1:
-                return scale.squeeze(2)
-            if scale.ndim != 3:
-                raise ValueError("FP4 runtime scales require a contraction-block axis")
-            return scale
-
         return op(
             hidden_states,
             w1,
             w2,
-            block_scale(w1_scale),
-            block_scale(w2_scale),
+            _squeeze_block_scale_checked(w1_scale),
+            _squeeze_block_scale_checked(w2_scale),
             router_logits,
             _RANK_BUFFER,
         )

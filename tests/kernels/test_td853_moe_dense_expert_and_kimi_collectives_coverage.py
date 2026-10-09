@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest  # type: ignore[missing-import]
@@ -263,6 +264,19 @@ def test_moe_dense_expert_selectors_and_validation():
         None,
         activation="silu",
         rhs_quant_dtype=None,
+        skip_padded_tokens=False,
+    )
+    # FP4 VMEM budget exceeded (> _MAX_DENSE_EXPERT_VMEM_BYTES)
+    assert not mde.can_use_dense_expert(
+        jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16),
+        jax.ShapeDtypeStruct((2, 2048, 8192), jnp.uint8),
+        jax.ShapeDtypeStruct((2, 2048, 4096), jnp.uint8),
+        jax.ShapeDtypeStruct((2, 8, 1, 8192), jnp.float32),
+        jax.ShapeDtypeStruct((2, 8, 1, 4096), jnp.float32),
+        None,
+        None,
+        activation="silu",
+        rhs_quant_dtype=jnp.float4_e2m1fn,
         skip_padded_tokens=False,
     )
 

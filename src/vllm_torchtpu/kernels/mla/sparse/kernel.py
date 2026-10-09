@@ -529,15 +529,16 @@ def _attention_kernel(
     @pl.when(batch_end_seq_idx == end_seq_idx - 1)
     def epilogue():
         # Partial stores must wait for the same byte count as their send.
-        last_even = (pl.num_programs(0) - 1) // 2 * 2
+        num_progs = pl.num_programs(0)
+        last_even = (num_progs - 1) // 2 * 2
         sent_start = start_seq_idx + last_even * batch_size if preserve_suffix else 0
         wait_send_bo_batch(sent_start, 0)
         if return_lse:
             _send_blse_batch(0, 0, wait=True)
 
-        @pl.when(pl.num_programs(0) >= 2)
+        @pl.when(num_progs >= 2)
         def _wait_1():
-            last_odd = (pl.num_programs(0) - 2) // 2 * 2 + 1
+            last_odd = (num_progs - 2) // 2 * 2 + 1
             sent_start = start_seq_idx + last_odd * batch_size if preserve_suffix else 0
             wait_send_bo_batch(sent_start, 1)
             if return_lse:

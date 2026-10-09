@@ -68,9 +68,10 @@ class TokenReplicaLayout:
     def split(
         self, rows: jax.Array, rank: jax.Array, *, fill_value: float = 0
     ) -> jax.Array:
-        if len(self.groups[0]) == 1:
+        width = len(self.groups[0])
+        if width == 1:
             return rows
-        padding = self.local_rows * len(self.groups[0]) - self.input_rows
+        padding = self.local_rows * width - self.input_rows
         if padding:
             rows = jnp.pad(rows, ((0, padding), (0, 0)), constant_values=fill_value)
         slot = jnp.asarray(self.slots, dtype=jnp.int32)[rank]
@@ -79,11 +80,12 @@ class TokenReplicaLayout:
         )
 
     def restore(self, rows: jax.Array, axis: str) -> jax.Array:
-        if len(self.groups[0]) == 1:
+        width = len(self.groups[0])
+        if width == 1:
             return rows
         gathered = lax.all_gather(
             rows, axis, axis=0, tiled=True, axis_index_groups=self.groups
         )
-        if self.local_rows * len(self.groups[0]) == self.input_rows:
+        if self.local_rows * width == self.input_rows:
             return gathered
         return gathered[: self.input_rows]
