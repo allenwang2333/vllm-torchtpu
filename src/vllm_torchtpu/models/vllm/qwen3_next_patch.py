@@ -130,8 +130,8 @@ def is_step0_post_attn_gather_installed(draft_model: Any) -> bool:
 
 
 def _legal_tile(rows: int, cap: int) -> int:
-    for t in range(min(cap, rows), 31, -1):
-        if rows % t == 0 and t % 32 == 0:
+    for t in range(min(cap, rows), 7, -1):
+        if rows % t == 0 and t % 8 == 0:
             return t
     return rows
 
@@ -987,9 +987,20 @@ def _rows_are_sequence_parallel(num_tokens: int) -> bool:
     A step below `sequence_parallel.min_rows()` keeps its rows replicated, and
     so does the MTP step-0 post-attention gather, whose rows shrink mid-layer.
     The runner records the same decision with `sequence_parallel.set_active`
-    for the MoE dispatch and combine.
+    for the MoE dispatch and combine. Non-backbone modules compiled outside
+    `shape_variants.warmup()` share a single FX trace across all their compile
+    buckets, so while tracing they read the caller's Python boolean from
+    `sequence_parallel.is_active()` instead of guarding on symbolic
+    `num_tokens`.
     """
-    return _step0_gather_indices is None and num_tokens >= sequence_parallel.min_rows()
+    if _step0_gather_indices is not None:
+        return False
+    if torch.compiler.is_compiling():
+        from vllm_torchtpu.compilation import shape_variants
+
+        if not shape_variants.in_warmup():
+            return sequence_parallel.is_active()
+    return num_tokens >= sequence_parallel.min_rows()
 
 
 def _sp_chunk(layer: Any, x: torch.Tensor) -> torch.Tensor:
