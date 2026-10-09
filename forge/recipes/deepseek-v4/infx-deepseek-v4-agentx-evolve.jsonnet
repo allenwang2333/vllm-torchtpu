@@ -213,8 +213,9 @@ local extraVllmArgs = cdk.var('EXTRA_VLLM_ARGS', '');
 // --- Speculative decoding ------------------------------------------------------
 // SPEC_METHOD=dspark serves the DSpark draft that ships in the target checkpoint (mtp.0-2.*, config.json
 // dspark_block_size=5), as the InferenceX B200 run does (K=6, probabilistic drafts, synthetic AL 3.77). Empty = off.
-// The draft holds ~4.2 GiB of HBM per rank (j-9719749f-0a6b-47c7-b249: 77.64 vs 73.44 GiB used), so at
-// GPU_MEMORY_UTILIZATION=0.90 the KV cache no longer fits one MAX_MODEL_LEN=1048576 request; raise it with this.
+// The draft holds ~4.2 GiB of HBM per rank (j-9719749f-0a6b-47c7-b249: 77.64 vs 73.44 GiB used). At a 2048-token
+// step budget K=6 needs GPU_MEMORY_UTILIZATION >= 0.94 to fit one MAX_MODEL_LEN=1048576 request
+// (j-a300025a-c924-4600-b9e5 refused to start at 0.93: 9.78 GiB of KV against 9.85 needed).
 local specMethod = cdk.var('SPEC_METHOD', '');
 local numSpecTokens = cdk.numVar('NUM_SPEC_TOKENS', 5);
 // SPEC_SYNTHETIC_AL=<mean acceptance length> accepts drafts at fixed per-position rates that give this
