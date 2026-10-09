@@ -62,9 +62,12 @@ def flash_attention_qk_softmax(
         )
     qk = qk.reshape(b, k_heads, tq, s)
 
-    qk *= cfgs.model.sm_scale
-    if cfgs.serve.scale_q is not None:
-        qk *= cfgs.serve.scale_q
+    qk_scalar_scale = (
+        cfgs.model.sm_scale
+        if cfgs.serve.scale_q is None
+        else cfgs.model.sm_scale * cfgs.serve.scale_q
+    )
+    qk *= qk_scalar_scale
     if k_scale is not None:
         qk *= k_scale
 

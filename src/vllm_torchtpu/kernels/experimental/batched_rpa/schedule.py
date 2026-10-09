@@ -14,17 +14,20 @@
 
 import dataclasses
 import functools
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import Any
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
+
+_SMEM_BLOCK_SPEC = pl.BlockSpec(memory_space=pltpu.SMEM)
+_HBM_BLOCK_SPEC = pl.BlockSpec(memory_space=pltpu.HBM)
 
 
 class FieldOffset:
@@ -129,6 +132,11 @@ class HeadAlongSublaneDmaNew(DmaNew):
         self._flags[...] = fetch_val
 
 
+@functools.lru_cache(maxsize=64)
+def _cached_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+    return tuple(pl.strides_from_shape(shape))
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class SmemWrapper:
@@ -139,12 +147,14 @@ class SmemWrapper:
 
     @classmethod
     def create_shape_dtype(cls, shape):
-        return cls(data=jax.ShapeDtypeStruct((np.prod(shape),), jnp.int32), shape=shape)
+        return cls(
+            data=jax.ShapeDtypeStruct((math.prod(shape),), jnp.int32), shape=shape
+        )
 
     def _get_pos(self, indices):
         if not isinstance(indices, tuple):
             indices = (indices,)
-        strides = pl.strides_from_shape(self.shape)
+        strides = _cached_strides(self.shape)
         assert len(strides) == len(indices)
         pos = 0
         for stride, idx in zip(strides, indices):
@@ -172,20 +182,14 @@ class SmemArrayOfStructs(SmemWrapper):
     ):  # pytype: disable=bad-override
         assert struct_size == struct_cls.num_fields()
         return cls(
-            data=jax.ShapeDtypeStruct((np.prod(shape) * struct_size,), jnp.int32),
+            data=jax.ShapeDtypeStruct((math.prod(shape) * struct_size,), jnp.int32),
             shape=shape,
             struct_cls=struct_cls,
             struct_size=struct_size,
         )
 
     def _get_pos(self, indices):
-        strides = pl.strides_from_shape(self.shape)
-        assert len(strides) == len(indices)
-
-        pos = 0
-        for stride, idx in zip(strides, indices):
-            pos += stride * idx
-        return pos * self.struct_size
+        return super()._get_pos(indices) * self.struct_size
 
     def __getitem__(self, indices):
         pos_start = self._get_pos(indices)
@@ -292,13 +296,13 @@ class RpaSchedule:
 
         def wrapper(x):
             if x.size == 1:
-                return pl.BlockSpec(memory_space=pltpu.SMEM)
+                return _SMEM_BLOCK_SPEC
             else:
                 # Since we use maximum upper bound when allocating scheduler data,
                 # it is not feasible to use scalar prefetch and fetch entire scheduler
                 # data into the kernel. Instead, we stored it to HBM first and perform
                 # dynamic sized DMA inside the kernel using actual number of steps.
-                return pl.BlockSpec(memory_space=pltpu.HBM)
+                return _HBM_BLOCK_SPEC
 
         return jax.tree.map(wrapper, self)
 
@@ -306,7 +310,7 @@ class RpaSchedule:
         """Returns a Pytree of output BlockSpecs."""
 
         return jax.tree.map(
-            lambda x: pl.BlockSpec(memory_space=pltpu.HBM),
+            lambda x: _HBM_BLOCK_SPEC,
             self,
         )
 
@@ -380,8 +384,10 @@ def _write_schedule_to_hbm(
         )
         dma_list.append(copy)
 
-    jax.tree.map(lambda x: x.start(), dma_list)
-    jax.tree.map(lambda x: x.wait(), dma_list)
+    for copy in dma_list:
+        copy.start()
+    for copy in dma_list:
+        copy.wait()
 
 
 def _compute_waits(
@@ -396,6 +402,12 @@ def _compute_waits(
     kv_bytes_per_token = cfgs.kv_bytes_per_token
     q_bytes_per_token = cfgs.q_bytes_per_token
     o_bytes_per_token = cfgs.o_bytes_per_token
+    lse_bytes_per_token = (
+        cfgs.model.num_kv_heads
+        * cfgs.aligned_num_q_heads_per_kv_head
+        * 128
+        * jnp.dtype(cfgs.serve.dtype_out).itemsize
+    )
 
     # Reshape buffers to (-1, 128) in u32 to perform contiguous 512-byte lane
     # waits (1 row of 128 u32 words = 512 bytes).
@@ -449,31 +461,21 @@ def _compute_waits(
             kv_out_tokens * kv_bytes_per_token
         ) // dma_chunk_size
 
-        # Q IN
+        # Q IN & O OUT
         q_in_tokens = 0
+        o_out_tokens = 0
         for b in range(cfgs.batch_size):
             _, q_sz = schedule.get_dma_q(step, b)
             q_in_tokens += q_sz
+            is_last_k = schedule.is_last_k[step, b] == 1
+            o_out_tokens += jnp.where(is_last_k, q_sz, 0)
         schedule.total_wait_q_in[step] = (
             q_in_tokens * q_bytes_per_token
         ) // dma_chunk_size
-
-        # O OUT
-        o_out_tokens = 0
-        for b in range(cfgs.batch_size):
-            is_last_k = schedule.is_last_k[step, b] == 1
-            _, q_sz = schedule.get_dma_q(step, b)
-            o_out_tokens += jnp.where(is_last_k, q_sz, 0)
         schedule.total_wait_o_out[step] = (
             o_out_tokens * o_bytes_per_token
         ) // dma_chunk_size
         # LSE OUT
-        lse_bytes_per_token = (
-            cfgs.model.num_kv_heads
-            * cfgs.aligned_num_q_heads_per_kv_head
-            * 128
-            * cfgs.serve.dtype_out.itemsize
-        )
         schedule.total_wait_lse_out[step] = (
             o_out_tokens * lse_bytes_per_token
         ) // dma_chunk_size
@@ -591,7 +593,8 @@ class BaseMetadataComputer:
             kv_left_frm_cache = kv_left
         else:
             kv_left_frm_cache = jnp.maximum(kv_cache_len - kv_len_start, 0)
-        p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
+        seq_page_base = s_idx * cfgs.serve.pages_per_seq
+        p_offset = seq_page_base + kv_p_start
         for i in range(cfgs.bkv_p_cache):
             dst_vmem = i << cfgs.serve.page_size_log2
             dma_sz = kv_left_frm_cache - dst_vmem
@@ -619,26 +622,25 @@ class BaseMetadataComputer:
         do_writeback = jnp.where((new_sz > 0) & (q_idx == q_wb), 1, 0)
         schedule.do_writeback[step, target_lane] = do_writeback
         src_hbm = q_end - kv_left_frm_new
+        if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            cache_pages = pl.cdiv(bkv_sz_cache, cfgs.serve.page_size)
+            new_tok_offset = src_hbm % cfgs.serve.page_size
+            # If new_sz = 150, new_tok_offset = 120, page_size = 128.  The new
+            # tokens occupy indices 120 through 269 relative to the HBM page
+            # boundaries.  This spans 3 pages: [120-127], [128-255], and [256-269].
+            # (120 + 150 - 1) // 128 + 1 = 269 // 128 + 1 = 3 pages.
+            num_pages_to_fetch = jnp.where(
+                new_sz > 0,
+                (new_tok_offset + new_sz - 1) // cfgs.serve.page_size + 1,
+                0,
+            )
+            aligned_new_page_base = src_hbm - new_tok_offset
 
         def fill_dma_kv_new(i, dst_vmem, dma_sz, slot_start):
             dma_entry = schedule.dma_kv_new[step, target_lane, i]
             if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-                cache_pages = pl.cdiv(bkv_sz_cache, cfgs.serve.page_size)
-                hbm_token_idx_base = q_end - kv_left_frm_new
-                new_tok_offset = hbm_token_idx_base % cfgs.serve.page_size
-                # If new_sz = 150, new_tok_offset = 120, page_size = 128.  The new
-                # tokens occupy indices 120 through 269 relative to the HBM page
-                # boundaries.  This spans 3 pages: [120-127], [128-255], and [256-269].
-                # (120 + 150 - 1) // 128 + 1 = 269 // 128 + 1 = 3 pages.
-                num_pages_to_fetch = jnp.where(
-                    new_sz > 0,
-                    (new_tok_offset + new_sz - 1) // cfgs.serve.page_size + 1,
-                    0,
-                )
                 fetch_val = jnp.where(i < num_pages_to_fetch, 1, 0)
-                new_page_start = (
-                    hbm_token_idx_base - new_tok_offset
-                ) + i * cfgs.serve.page_size
+                new_page_start = aligned_new_page_base + i * cfgs.serve.page_size
                 # Fetched pages of new tokens are placed sequentially in VMEM
                 # immediately following the existing cached pages. E.g., if
                 # cache_pages=2, new pages go to offsets 2*page_size, 3*page_size, etc.
@@ -647,7 +649,7 @@ class BaseMetadataComputer:
                     (kv_len_start + slot_start) >> cfgs.serve.page_size_log2,
                     cfgs.serve.pages_per_seq - 1,
                 )
-                dst_hbm = s_idx * cfgs.serve.pages_per_seq + p_idx
+                dst_hbm = seq_page_base + p_idx
                 wb_val = jnp.where(dma_sz > 0, 1, 0)
 
                 dma_entry.fetch_hbm[...] = new_page_start
@@ -661,10 +663,7 @@ class BaseMetadataComputer:
                     cfgs.serve.pages_per_seq - 1,
                 )
                 p_off = (kv_len_start + dst_vmem) & cfgs.serve.page_size_mask
-                dst_hbm = (
-                    (s_idx * cfgs.serve.pages_per_seq + p_idx)
-                    << cfgs.serve.page_size_log2
-                ) | p_off
+                dst_hbm = ((seq_page_base + p_idx) << cfgs.serve.page_size_log2) | p_off
 
                 dma_entry.fetch_hbm[...] = src_hbm
                 dma_entry.fetch_vmem[...] = dst_vmem

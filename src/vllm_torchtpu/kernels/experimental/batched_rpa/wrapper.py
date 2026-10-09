@@ -31,6 +31,8 @@ layers in a model.
 Note: batched_rpa is build on top / derived from RPA3.
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -64,35 +66,40 @@ def prepare_inputs(
     kv_packing = utils.get_dtype_packing(kv_dtype)
 
     aligned_num_q_heads_per_kv_head = utils.align_to(num_q_heads_per_kv_head, q_packing)
-    num_lanes = pltpu.get_tpu_info().num_lanes
-    num_sublanes = pltpu.get_tpu_info().num_sublanes
+    tpu_info = pltpu.get_tpu_info()
+    num_lanes = tpu_info.num_lanes
+    num_sublanes = tpu_info.num_sublanes
     aligned_q_head_dim = utils.align_to(actual_q_head_dim, num_lanes)
 
     # Compute aligned kv head dimension, accounting for per-token scale if
     # present.
+    has_scales = k_scale is not None and v_scale is not None
+    if has_scales:
+        scale_bits = jax.dtypes.itemsize_bits(k_scale.dtype)
+        kv_bits = jax.dtypes.itemsize_bits(kv_dtype)
+        num_scale_channels = max(1, scale_bits // kv_bits)
+    else:
+        num_scale_channels = 0
+
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-        if k_scale is not None and v_scale is not None:
-            scale_bits = jax.dtypes.itemsize_bits(k_scale.dtype)
-            kv_bits = jax.dtypes.itemsize_bits(kv_dtype)
-            num_scale_channels = max(1, scale_bits // kv_bits)
-            aligned_kv_head_dim = utils.align_to(
-                actual_kv_head_dim + num_scale_channels, num_sublanes * kv_packing
-            )
-        else:
-            aligned_kv_head_dim = utils.align_to(
-                actual_kv_head_dim, num_sublanes * kv_packing
-            )
+        aligned_kv_head_dim = utils.align_to(
+            actual_kv_head_dim + num_scale_channels, num_sublanes * kv_packing
+        )
     else:
         aligned_kv_head_dim = utils.align_to(actual_kv_head_dim, num_lanes)
     # queries: (T, H, D) -> (T, H_kv, G, D)
-    o_hbm_alias_q_hbm = (
-        jnp.pad(
-            q.reshape(
-                total_q_tokens,
-                actual_num_kv_heads,
-                num_q_heads_per_kv_head,
-                actual_q_head_dim,
-            ),
+    q_reshaped = q.reshape(
+        total_q_tokens,
+        actual_num_kv_heads,
+        num_q_heads_per_kv_head,
+        actual_q_head_dim,
+    )
+    if (
+        aligned_num_q_heads_per_kv_head != num_q_heads_per_kv_head
+        or aligned_q_head_dim != actual_q_head_dim
+    ):
+        q_reshaped = jnp.pad(
+            q_reshaped,
             (
                 (0, 0),
                 (0, 0),
@@ -101,27 +108,21 @@ def prepare_inputs(
             ),
             constant_values=0,
         )
-        .reshape(
-            total_q_tokens,
-            actual_num_kv_heads,
-            aligned_num_q_heads_per_kv_head // q_packing,
-            q_packing,
-            aligned_q_head_dim,
-        )
-        .swapaxes(0, 1)
-    )
+    o_hbm_alias_q_hbm = q_reshaped.reshape(
+        total_q_tokens,
+        actual_num_kv_heads,
+        aligned_num_q_heads_per_kv_head // q_packing,
+        q_packing,
+        aligned_q_head_dim,
+    ).swapaxes(0, 1)
 
     # Pad keys and values head_dim
     actual_num_kv_heads_x2 = actual_num_kv_heads * 2
     num_kv_heads_x2_aligned = utils.align_to(actual_num_kv_heads_x2, kv_packing)
 
-    if k_scale is not None and v_scale is not None:
+    if has_scales:
         k_scale = k_scale.reshape(total_q_tokens, actual_num_kv_heads)
         v_scale = v_scale.reshape(total_q_tokens, actual_num_kv_heads)
-
-        scale_bits = jax.dtypes.itemsize_bits(k_scale.dtype)
-        kv_bits = jax.dtypes.itemsize_bits(k.dtype)
-        num_scale_channels = max(1, scale_bits // kv_bits)
 
         # Bitcast the scale factors to the kv dtype and reshape scale factors to
         # (T, H_kv, num_scale_channels).
@@ -138,15 +139,18 @@ def prepare_inputs(
 
         actual_kv_head_dim += num_scale_channels
 
+    kv_concat = jnp.concatenate([k, v], axis=-1).reshape(
+        total_q_tokens, actual_num_kv_heads_x2, actual_kv_head_dim
+    )
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-        num_lanes = pltpu.get_tpu_info().num_lanes
         align_tokens = max(num_lanes, page_size)
         padded_total_tokens = utils.align_to(total_q_tokens, align_tokens)
-        new_kv_hbm = (
-            jnp.pad(
-                jnp.concatenate([k, v], axis=-1).reshape(
-                    total_q_tokens, actual_num_kv_heads_x2, actual_kv_head_dim
-                ),
+        if (
+            padded_total_tokens != total_q_tokens
+            or aligned_kv_head_dim != actual_kv_head_dim
+        ):
+            kv_concat = jnp.pad(
+                kv_concat,
                 (
                     (0, padded_total_tokens - total_q_tokens),
                     (0, 0),
@@ -154,26 +158,27 @@ def prepare_inputs(
                 ),
                 constant_values=0,
             )
-            .reshape(
-                padded_total_tokens,
-                actual_num_kv_heads_x2,
-                aligned_kv_head_dim // kv_packing,
-                kv_packing,
-            )
-            .transpose(1, 2, 3, 0)
-        )
+        new_kv_hbm = kv_concat.reshape(
+            padded_total_tokens,
+            actual_num_kv_heads_x2,
+            aligned_kv_head_dim // kv_packing,
+            kv_packing,
+        ).transpose(1, 2, 3, 0)
     else:
-        new_kv_hbm = jnp.pad(
-            jnp.concatenate([k, v], axis=-1).reshape(
-                total_q_tokens, actual_num_kv_heads_x2, actual_kv_head_dim
-            ),
-            (
-                (0, 0),
-                (0, num_kv_heads_x2_aligned - actual_num_kv_heads_x2),
-                (0, aligned_kv_head_dim - actual_kv_head_dim),
-            ),
-            constant_values=0,
-        ).reshape(
+        if (
+            num_kv_heads_x2_aligned != actual_num_kv_heads_x2
+            or aligned_kv_head_dim != actual_kv_head_dim
+        ):
+            kv_concat = jnp.pad(
+                kv_concat,
+                (
+                    (0, 0),
+                    (0, num_kv_heads_x2_aligned - actual_num_kv_heads_x2),
+                    (0, aligned_kv_head_dim - actual_kv_head_dim),
+                ),
+                constant_values=0,
+            )
+        new_kv_hbm = kv_concat.reshape(
             total_q_tokens,
             num_kv_heads_x2_aligned // kv_packing,
             kv_packing,
@@ -231,8 +236,23 @@ def calculate_block_sizes(
     decode_query_size: int = 1,
 ) -> tuple[configs.BlockSizes, configs.BlockSizes]:
     """Calculate optimal block size for decode and prefill."""
+    return _calculate_block_sizes_cached(
+        model_cfgs,
+        serve_cfgs,
+        vmem_limit_bytes,
+        decode_query_size,
+        pltpu.get_tpu_info(),
+    )
 
-    tpu_info = pltpu.get_tpu_info()
+
+@functools.lru_cache(maxsize=64)
+def _calculate_block_sizes_cached(
+    model_cfgs: configs.ModelConfigs,
+    serve_cfgs: configs.ServingConfigs,
+    vmem_limit_bytes: int,
+    decode_query_size: int,
+    tpu_info: pltpu.TpuInfo,
+) -> tuple[configs.BlockSizes, configs.BlockSizes]:
     num_lanes = tpu_info.num_lanes
     mxu_column_size = tpu_info.mxu_column_size
 
@@ -262,7 +282,6 @@ def calculate_block_sizes(
     if is_packed_fp4:
         physical_kv_head_dim = physical_kv_head_dim // 2
 
-    num_sublanes = tpu_info.num_sublanes
     packing_kv = serve_cfgs.packing_kv
 
     if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
@@ -271,6 +290,14 @@ def calculate_block_sizes(
         aligned_kv_head_dim_val = utils.align_to(base_dim, num_sublanes * packing_kv)
     else:
         aligned_kv_head_dim_val = utils.align_to(model_cfgs.head_dim, num_lanes)
+
+    scale_bytes_per_bkv = (
+        2
+        * model_cfgs.num_kv_heads
+        * (jax.dtypes.itemsize_bits(serve_cfgs.per_token_scale_dtype) // 8)
+        if serve_cfgs.per_token_scale
+        else 0
+    )
 
     def calculate_vmem_usage(
         batch_size: int, n_buffer: int, bq_sz: int, bkv_sz: int
@@ -323,12 +350,7 @@ def calculate_block_sizes(
         # along with our active k_scale and v_scale tensors (no upfront dequantized
         # intermediate copy), we only need to account for unpacked k_scale + v_scale
         # during compute.
-        loaded_scale_bytes = 0
-        if serve_cfgs.per_token_scale:
-            scale_bits = jax.dtypes.itemsize_bits(serve_cfgs.per_token_scale_dtype)
-            scale_bytes = scale_bits // 8
-            # Active k_scale and v_scale each have shape (num_kv_heads, bkv_sz)
-            loaded_scale_bytes = 2 * bkv_sz * model_cfgs.num_kv_heads * scale_bytes
+        loaded_scale_bytes = bkv_sz * scale_bytes_per_bkv
 
         # Sum up all compute memory usage.
         compute_bytes = (
@@ -342,18 +364,6 @@ def calculate_block_sizes(
         total_bytes *= batch_size
 
         return total_bytes
-
-    def calculate_compute_buffer_time(
-        batch_size: int, bq_c_sz: int, bkv_sz: int
-    ) -> int:
-        """Calculate computational complexity of a single compute block."""
-
-        num_k_rows = pl.cdiv(bkv_sz, mxu_column_size)
-        num_k_cols = pl.cdiv(model_cfgs.head_dim, mxu_column_size)
-        num_k = num_k_rows * num_k_cols
-        num_muls = bq_c_sz * num_k * model_cfgs.num_q_heads
-
-        return batch_size * num_muls
 
     def find_best_block_sizes(
         max_batch_size: int, max_n_buffer: int, fixed_bq_sz: int | None = None
@@ -398,7 +408,6 @@ def calculate_block_sizes(
         if batch_size == 0 or n_buffer == 0:
             raise ValueError("Cannot find batch size that fits within VMEM limit.")
 
-        max_seq_len = serve_cfgs.pages_per_seq * serve_cfgs.page_size
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
         max_seq_len = serve_cfgs.pages_per_seq * serve_cfgs.page_size
         while (
@@ -428,7 +437,6 @@ def calculate_block_sizes(
         # Step 3: Given current tile size, calculate compute tile size.
 
         # Threshold value based on hardware generation and precision.
-        tpu_info = pltpu.get_tpu_info()
         is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1
 
         match tpu_info.generation:
@@ -446,10 +454,13 @@ def calculate_block_sizes(
         num_bq_c = 1
         last_valid_bq_c_sz = bq_c_sz = bq_sz
         bq_c_rem = 0
+        num_k = pl.cdiv(bkv_sz, mxu_column_size) * pl.cdiv(
+            model_cfgs.head_dim, mxu_column_size
+        )
+        muls_per_bq_c = batch_size * num_k * model_cfgs.num_q_heads
 
         while (
-            calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) > threshold
-            or bq_c_rem != 0
+            bq_c_sz * muls_per_bq_c > threshold or bq_c_rem != 0
         ) and num_bq_c < bq_sz:
             if bq_c_rem == 0:
                 last_valid_bq_c_sz = bq_c_sz

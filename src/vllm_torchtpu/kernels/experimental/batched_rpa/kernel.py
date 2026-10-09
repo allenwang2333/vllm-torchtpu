@@ -83,6 +83,8 @@ def calculate_and_store_out(
     *,
     cfgs: configs.RpaConfigs,
 ):
+    pad_amount = cfgs.aligned_q_head_dim - cfgs.compute_kv_head_dim
+
     def _accum(b_idx: jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
 
@@ -97,9 +99,9 @@ def calculate_and_store_out(
 
         o_u32_vref = o_vref.at[b_idx].bitcast(jnp.uint32)
         out_ref = o_u32_vref.reshape(-1, cfgs.aligned_q_head_dim)
-        pad_width = [[0, 0] for _ in range(out.ndim)]
-        pad_width[-1][-1] = cfgs.aligned_q_head_dim - cfgs.compute_kv_head_dim
-        out = jnp.pad(out, pad_width, constant_values=0)
+        if pad_amount > 0:
+            pad_width = ((0, 0),) * (out.ndim - 1) + ((0, pad_amount),)
+            out = jnp.pad(out, pad_width, constant_values=0)
         out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
         utils.strided_store(out_ref, 0, out_ref.shape[0], 1, out)
 
@@ -406,22 +408,23 @@ def rpa_body(
                 stitch_results[b_idx],
                 cfgs=cfgs,
             )
+        target_shape = (-1, cfgs.bkv_sz + 2 * cfgs.serve.page_size)
+        pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
+        is_uint8_kv = cfgs.serve.dtype_kv == jnp.uint8
         for b_idx in range(cfgs.batch_size):
             ks = []
             vs = []
             for kv_head in range(cfgs.model.num_kv_heads):
                 k_slice = kv_in_vref.at[b_idx, kv_head * 2].bitcast(jnp.uint32)
                 v_slice = kv_in_vref.at[b_idx, kv_head * 2 + 1].bitcast(jnp.uint32)
-                target_shape = (-1, cfgs.bkv_sz + 2 * cfgs.serve.page_size)
                 k_head_ref = k_slice.reshape(target_shape)
                 v_head_ref = v_slice.reshape(target_shape)
-                pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
 
                 # Load as uint32 to avoid dtype conversion during strided load
                 k_head_u32 = utils.strided_load(k_head_ref, 0, pack_dim, 1)
                 v_head_u32 = utils.strided_load(v_head_ref, 0, pack_dim, 1)
 
-                if cfgs.serve.dtype_kv == jnp.uint8:
+                if is_uint8_kv:
                     fp4 = jnp.float4_e2m1fn
                     k_head = pltpu.bitcast(k_head_u32, fp4)[:, : cfgs.bkv_sz]
                     v_head = pltpu.bitcast(v_head_u32, fp4)[:, : cfgs.bkv_sz]
@@ -437,8 +440,8 @@ def rpa_body(
             k_b.append(jnp.stack(ks, axis=0))
             v_b.append(jnp.stack(vs, axis=0))
     else:
+        heads_per_load = pl.cdiv(cfgs.serve.packing_kv, 2)
         for b_idx in range(cfgs.batch_size):
-            heads_per_load = pl.cdiv(cfgs.serve.packing_kv, 2)
             ks = []
             vs = []
             for kv_head_start in range(0, cfgs.model.num_kv_heads, heads_per_load):
@@ -636,11 +639,12 @@ def create_allocs(
 
 def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
     serve = cfgs.serve
-    name = f"RPA{cfgs.mode.symbol}-{serve.kv_layout.symbol}-p{serve.page_size}"
-    name += f"-b{cfgs.batch_size}-q{cfgs.bq_sz}-k{cfgs.bkv_sz}"
-    if cfgs.model.sliding_window:
-        name += f"-sw{cfgs.model.sliding_window}"
-    return name
+    sw = cfgs.model.sliding_window
+    sw_suffix = f"-sw{sw}" if sw else ""
+    return (
+        f"RPA{cfgs.mode.symbol}-{serve.kv_layout.symbol}-p{serve.page_size}"
+        f"-b{cfgs.batch_size}-q{cfgs.bq_sz}-k{cfgs.bkv_sz}{sw_suffix}"
+    )
 
 
 def get_kernel_metadata(
@@ -807,7 +811,8 @@ def rpa_kernel(
                         )
                         copy.start()
                         dma_list.append(copy)
-                jax.tree.map(lambda x: x.wait(), dma_list)
+                for copy in dma_list:
+                    copy.wait()
 
                 pipeline_func = pltpu.emit_pipeline(
                     body=functools.partial(
