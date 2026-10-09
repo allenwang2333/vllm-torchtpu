@@ -1329,11 +1329,16 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 if cached_comp_inputs is None:
                     lengths = ((positions + 1) // self.compress_ratio)[:, None]
                     if segmented_main and owner_perm is not None:
-                        tp_rank = self._get_stage_tp_rank(stage_cache)
                         seg_count = owner_perm.shape[0] // tp_ranks
-                        seg_perm = owner_perm[
-                            tp_rank * seg_count : (tp_rank + 1) * seg_count
-                        ]
+                        # index_select, not a tensor-bound slice: slicing calls
+                        # Tensor.__index__ (.item()), creating unbacked SymInts
+                        # that break stage-cache reuse under compile (KV_SHARD).
+                        seg_perm = (
+                            owner_perm[: tp_ranks * seg_count]
+                            .reshape(tp_ranks, seg_count)
+                            .index_select(0, self._get_stage_tp_rank_1d(stage_cache))
+                            .squeeze(0)
+                        )
                         seg_valid = seg_perm >= 0
                         seg_idx = seg_perm.clamp(min=0).long()
                         lengths_comp = lengths.index_select(0, seg_idx).masked_fill(
@@ -1806,7 +1811,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 if owner_perm is not None:
                     part = owner_perm.shape[0] // ranks
                     padding = 1
-                    seg_perm = owner_perm[tp_rank * part : (tp_rank + 1) * part]
+                    seg_perm = (
+                        owner_perm[: ranks * part]
+                        .reshape(ranks, part)
+                        .index_select(0, self._get_stage_tp_rank_1d(stage_cache))
+                        .squeeze(0)
+                    )
                     mine = torch.where(seg_perm >= 0, seg_perm, count).to(torch.int32)
                 else:
                     part, padding = _query_split(count, ranks, kv_shard=kv_shard)
