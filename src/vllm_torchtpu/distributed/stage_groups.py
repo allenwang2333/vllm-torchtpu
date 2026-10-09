@@ -25,19 +25,17 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _DONE_ATTR = "_tpu_stage_groups_standalone"
+_STANDALONE_PG_BY_RANKS: dict[tuple[int, ...], Any] = {}
 
 
 def _stage_groups() -> list[Any]:
     """The distinct model-parallel groups of more than one device inside this
-    rank's tensor-parallel pipeline stage, in the same order on every rank.
-
-    The PCP group is deliberately left alone: PP x PCP stages (#1346) move
-    K/V through shard_map meshes and run on stock torch_tpu.
+    rank's tensor-parallel or PCP pipeline stage, in the same order on every rank.
     """
     from vllm.distributed import parallel_state
 
     candidates: list[Any] = [parallel_state.get_tp_group()]
-    for getter in ("get_ep_group", "get_dp_group"):
+    for getter in ("get_pcp_group", "get_ep_group", "get_dp_group"):
         fn = getattr(parallel_state, getter, None)
         if fn is None:
             continue
@@ -51,12 +49,19 @@ def _stage_groups() -> list[Any]:
             continue
         if any(group is seen for seen in groups):
             continue
-        # Two coordinators over identical ranks (e.g. TP and EP with DP=1)
-        # back the same device set; one call per distinct rank list.
+        # Two coordinators over identical ranks (e.g. TP and EP, or PCP and EP
+        # with DP=1) back the same device set; one call per distinct rank list.
         if any(tuple(group.ranks) == tuple(seen.ranks) for seen in groups):
             continue
         groups.append(group)
     return groups
+
+
+def standalone_device_group(group: Any) -> Any:
+    """Return the standalone ProcessGroup registered for ``group.ranks``, or
+    ``group.device_group`` if none was registered."""
+    ranks_key = tuple(int(r) for r in getattr(group, "ranks", ()))
+    return _STANDALONE_PG_BY_RANKS.get(ranks_key, group.device_group)
 
 
 def _load_make_standalone() -> Callable[[Any], None] | None:
@@ -88,13 +93,14 @@ def _load_make_standalone() -> Callable[[Any], None] | None:
 
 
 def make_stage_groups_standalone(parallel_config: Any) -> None:
-    """Let every tensor-parallel pipeline stage launch its collectives without
-    the other stages. Must run after the model-parallel groups exist and
-    before their first collective. Nothing to do for one-device stages or a
-    single stage. Idempotent per process."""
+    """Let every multi-device pipeline stage (PP x TP or PP x PCP) launch its
+    collectives and Pallas stage meshes without the other stages. Must run after
+    the model-parallel groups exist and before their first collective. Nothing
+    to do for one-device stages or a single stage. Idempotent per process."""
     pp = int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1)
     tp = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
-    if pp == 1 or tp == 1:
+    pcp = int(getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+    if pp == 1 or (tp == 1 and pcp == 1):
         return
     from vllm.distributed import parallel_state
 
@@ -107,6 +113,9 @@ def make_stage_groups_standalone(parallel_config: Any) -> None:
         for group in groups:
             # Returns once every member of the group has called it.
             make_standalone(group.device_group)
+            _STANDALONE_PG_BY_RANKS[tuple(int(r) for r in group.ranks)] = (
+                group.device_group
+            )
     setattr(pp_group, _DONE_ATTR, True)
     logger.info(
         "pipeline stage %d: standalone process groups %s (make_standalone=%s)",

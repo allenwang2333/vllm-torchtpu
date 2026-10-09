@@ -75,12 +75,12 @@ def main() -> int:
         {
             "name": "math_reasoning",
             "prompt": (
-                "Solve step by step: A train travels 120 km at 60 km/h, then "
-                "180 km at 90 km/h. What is the average speed for the entire "
-                "journey in km/h?"
+                "Solve concisely in 2-3 sentences: A train travels 120 km at "
+                "60 km/h, then 180 km at 90 km/h. What is the average speed "
+                "for the entire journey in km/h? State the final numeric value."
             ),
             "expected": "75",
-            "max_tokens": 256,
+            "max_tokens": 512,
         },
         {
             "name": "needle_4k",

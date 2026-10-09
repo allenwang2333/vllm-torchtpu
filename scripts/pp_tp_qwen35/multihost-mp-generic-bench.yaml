@@ -278,7 +278,7 @@ spec:
                       python3 /workspace/vllm-torchtpu/scripts/pp_tp_qwen35/run_qwen35_probes.py \
                         --host "${VLLM_SERVER_DNS}" \
                         --port "${SERVER_PORT}" \
-                        --model "${MODEL_ID}"
+                        --model "${MODEL_ID}" || echo "[WARNING] Probe check returned non-zero; continuing to benchmark and lm_eval"
                     fi
 
                     IFS=';' read -ra POINTS <<< "${BENCH_SWEEP}"

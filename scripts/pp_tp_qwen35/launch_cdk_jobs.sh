@@ -164,7 +164,7 @@ case "${JOB_NAME}" in
       TPU_TOPOLOGY=2x2x1 \
       DOCKER_IMAGE="${DOCKER_IMAGE}" \
       MODEL_ID="${MODEL_ID}" \
-      ENV_VARS="TPU_QWEN35_AUTO_DEFAULTS=0 USE_MOE_FUSED_EP_KERNEL=1 VLLM_DISABLE_COMPILE_CACHE=1 VLLM_LOGGING_LEVEL=INFO" \
+      ENV_VARS="TPU_QWEN35_AUTO_DEFAULTS=0 TPU_EXPERT_PLACEMENT= USE_MOE_FUSED_EP_KERNEL=1 VLLM_DISABLE_COMPILE_CACHE=1 VLLM_LOGGING_LEVEL=INFO" \
       SERVER_ARGS="--tensor-parallel-size 8 --enable-expert-parallel --async-scheduling --max-model-len 36864 --max-num-batched-tokens 16384 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
       BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
       RUN_EVAL="true" \

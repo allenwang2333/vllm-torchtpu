@@ -182,11 +182,12 @@ def get_stage_mesh(
       device_ids: the TPU device ids of `group`, in rank order.
     """
     from torch_tpu._internal.pallas import get_pallas_mesh
+    from vllm_torchtpu.distributed.stage_groups import standalone_device_group
 
     mesh = get_pallas_mesh(
         axis_names=axis_names,
         mesh_shape=mesh_shape,
-        process_group=group.device_group,
+        process_group=standalone_device_group(group),
     )
     mesh_device_ids = tuple(int(device.id) for device in mesh.devices.flat)
     if mesh_device_ids != tuple(device_ids):
