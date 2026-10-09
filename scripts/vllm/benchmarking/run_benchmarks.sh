@@ -142,6 +142,14 @@ NUM_PROMPTS=""
 #               nominal ISL+OSL <= max-model-len guarantees full completion.
 RANGE_RATIO_STYLE="symmetric"
 BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-0}"
+# Prompts per warmup run; empty means two waves, 2 x the cell's concurrency,
+# capped at the measured run's count. The warmup takes first-use costs (step
+# variants compiled lazily, first allocations) off the measured run, and in CI
+# they land in its first requests: warmup p99 TTFT runs 1.4-18x the measured
+# run's while the medians match. The first wave covers pure prefill and pure
+# decode steps; the second is where new prefills join running decodes. A
+# warmup used to repeat the whole measured run.
+BENCHMARK_WARMUP_NUM_PROMPTS="${BENCHMARK_WARMUP_NUM_PROMPTS:-}"
 # Empty => do not pass --temperature, so the server default applies
 # (for Qwen3-Coder the model's generation_config enables sampling =>
 # non-greedy: temp 0.7 / top_p 0.8 / top_k 20).
@@ -212,6 +220,10 @@ if [ "$RANGE_RATIO_STYLE" != "symmetric" ] && [ "$RANGE_RATIO_STYLE" != "min" ];
 fi
 if ! [[ "$BENCHMARK_WARMUP_RUNS" =~ ^[0-9]+$ ]]; then
     echo "ERROR: BENCHMARK_WARMUP_RUNS must be a non-negative integer"
+    exit 1
+fi
+if [ -n "$BENCHMARK_WARMUP_NUM_PROMPTS" ] && ! [[ "$BENCHMARK_WARMUP_NUM_PROMPTS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: BENCHMARK_WARMUP_NUM_PROMPTS must be a positive integer"
     exit 1
 fi
 
@@ -436,6 +448,12 @@ run_benchmark_once() {
         profile_arg="--profile"
         # One full wave, so decode reaches the measured run's batch width.
         num_prompts="${PROFILE_NUM_PROMPTS:-$concurrency}"
+    elif [ "$mode" = "warmup" ]; then
+        # See BENCHMARK_WARMUP_NUM_PROMPTS.
+        local warmup_prompts="${BENCHMARK_WARMUP_NUM_PROMPTS:-$((2 * concurrency))}"
+        if [ "$warmup_prompts" -lt "$num_prompts" ]; then
+            num_prompts="$warmup_prompts"
+        fi
     fi
 
     # Force greedy (or any fixed temperature) when BENCHMARK_TEMPERATURE is set.
@@ -603,6 +621,7 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "random_range_ratio": $RANDOM_RANGE_RATIO,
     "range_ratio_style": "$RANGE_RATIO_STYLE",
     "benchmark_warmup_runs": $BENCHMARK_WARMUP_RUNS,
+    "benchmark_warmup_num_prompts": "${BENCHMARK_WARMUP_NUM_PROMPTS:-2x concurrency}",
     "benchmark_temperature": $benchmark_temperature_json,
     "benchmark_extra_body": $benchmark_extra_body_json,
     "max_model_len": $max_model_len,
@@ -635,7 +654,7 @@ echo "  TP=$TENSOR_PARALLELISM DP=$DATA_PARALLELISM EP=$ENABLE_EP"
 echo "  ISL/OSL: $ISL_OSL_CONFIGS"
 echo "  Concurrency: $CONCURRENCY_OPTIONS"
 echo "  Num prompts: ${NUM_PROMPTS:-320}"
-echo "  Benchmark warmup runs: $BENCHMARK_WARMUP_RUNS"
+echo "  Benchmark warmup runs: $BENCHMARK_WARMUP_RUNS (${BENCHMARK_WARMUP_NUM_PROMPTS:-2 x concurrency} prompts each, at most ${NUM_PROMPTS:-320})"
 echo "  Benchmark temperature: ${BENCHMARK_TEMPERATURE:-<server default (non-greedy)>}"
 echo "  Results: $RESULTS_DIR"
 echo "================================================"
