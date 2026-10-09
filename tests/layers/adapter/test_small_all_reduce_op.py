@@ -177,11 +177,21 @@ def test_prebuild_is_a_no_op_with_the_flag_off(monkeypatch):
 
 
 def test_prebuild_refuses_a_deployment_without_an_ep_group(monkeypatch):
+    monkeypatch.setenv("TPU_SMALL_ALL_REDUCE", "1")
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE", True)
     monkeypatch.setattr(op, "build_ep_mesh", lambda: None)
     monkeypatch.setattr(op, "_AR_OP", None)
     with pytest.raises(NotImplementedError, match="TPU_SMALL_ALL_REDUCE"):
         op.prebuild()
+
+
+def test_prebuild_is_a_no_op_without_an_ep_group_when_not_explicitly_set(monkeypatch):
+    monkeypatch.delenv("TPU_SMALL_ALL_REDUCE", raising=False)
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE", True)
+    monkeypatch.setattr(op, "build_ep_mesh", lambda: None)
+    monkeypatch.setattr(op, "_AR_OP", None)
+    op.prebuild()
+    assert op._AR_OP is None
 
 
 def test_retain_is_the_identity_when_unarmed_or_outside_the_warmup(monkeypatch):

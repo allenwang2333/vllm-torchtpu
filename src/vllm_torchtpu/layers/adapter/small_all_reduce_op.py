@@ -15,6 +15,7 @@
 """
 
 import contextlib
+import os
 
 import jax
 import torch
@@ -140,11 +141,18 @@ def prebuild() -> None:
         return
     mesh = build_ep_mesh()
     if mesh is None:
-        raise NotImplementedError(
-            "TPU_SMALL_ALL_REDUCE=1 builds its kernels over the expert-parallel "
-            "mesh, and this deployment has no expert-parallel group (a dense "
-            "model or one core). Unset TPU_SMALL_ALL_REDUCE."
-        )
+        if os.environ.get("TPU_SMALL_ALL_REDUCE", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            raise NotImplementedError(
+                "TPU_SMALL_ALL_REDUCE=1 builds its kernels over the expert-parallel "
+                "mesh, and this deployment has no expert-parallel group (a dense "
+                "model or one core). Unset TPU_SMALL_ALL_REDUCE."
+            )
+        return
     from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 
     _CORES = mesh.shape[EP_AXIS_NAME]

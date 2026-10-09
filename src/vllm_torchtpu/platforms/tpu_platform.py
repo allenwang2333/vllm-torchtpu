@@ -907,7 +907,9 @@ class TpuPlatform(Platform):
 
         if (
             model_config is not None
-            and "Qwen3_5MoeForConditionalGeneration" in (model_config.architectures or [])
+            and "Qwen3_5MoeForConditionalGeneration"
+            in (model_config.architectures or [])
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
             and os.environ.get("TPU_QWEN35_AUTO_DEFAULTS", "1").strip().lower()
             in ("1", "true", "yes", "on")
         ):

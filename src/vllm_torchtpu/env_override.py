@@ -313,13 +313,32 @@ def _apply_qwen35_serve_cli_defaults() -> None:
     argv = sys.argv
     if "serve" not in argv[:3] or "qwen3.5-397b" not in " ".join(argv).lower():
         return
-    for opt, val in (
-        ("--speculative-config", '{"method":"mtp","num_speculative_tokens":3}'),
-        ("--renderer-num-workers", "4"),
+    pp_raw = (
+        _get_cli_opt(argv, "--pipeline-parallel-size")
+        or _get_cli_opt(argv, "-pp")
+        or ""
+    )
+    is_pp = pp_raw.isdigit() and int(pp_raw) > 1
+    cli_defaults = [("--renderer-num-workers", "4")]
+    if not is_pp:
+        cli_defaults.insert(
+            0,
+            ("--speculative-config", '{"method":"mtp","num_speculative_tokens":3}'),
+        )
+    elif not _has_cli_opt(argv, "--async-scheduling") and not _has_cli_opt(
+        argv, "--no-async-scheduling"
     ):
+        argv.append("--no-async-scheduling")
+        CHANGES.append(["argv_add", "--no-async-scheduling"])
+    for opt, val in cli_defaults:
         if not _has_cli_opt(argv, opt):
             argv.extend([opt, val])
             CHANGES.append(["argv_add", opt, val])
+    if is_pp:
+        if "TPU_SMALL_ALL_REDUCE" not in os.environ:
+            _set_env("TPU_SMALL_ALL_REDUCE", "0")
+        if "TPU_MOE_LOWTOK" not in os.environ:
+            _set_env("TPU_MOE_LOWTOK", "0")
     # <=64-row decode/MTP-draft buckets use half VMEM (32 MiB on v7x) so XLA
     # prefetches next layers' weights across batched RPA, while 128-row c=32
     # MTP=3 target verification keeps full VMEM.

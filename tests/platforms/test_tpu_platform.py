@@ -1220,6 +1220,7 @@ def test_check_and_update_config_auto_stream_interval(monkeypatch):
             enable_prefix_caching=False,
             mamba_cache_mode="none",
             kv_cache_memory_bytes=None,
+            kv_cache_layout=None,
         )
         vllm_config.compilation_config = MagicMock()
         vllm_config.compilation_config.compile_sizes = [16, 32]
@@ -1241,7 +1242,10 @@ def test_check_and_update_config_auto_stream_interval(monkeypatch):
             pipeline_parallel_size=1,
             tensor_parallel_size=1,
             prefill_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
             decode_context_parallel_size=1,
+            enable_expert_parallel=False,
+            is_moe_model=False,
             use_sequence_parallel_moe=False,
         )
         return vllm_config
@@ -1259,3 +1263,104 @@ def test_check_and_update_config_auto_stream_interval(monkeypatch):
     cfg_explicit = _make_cfg(10)
     TpuPlatform.check_and_update_config(cfg_explicit)
     assert cfg_explicit.scheduler_config.stream_interval == 10
+
+
+def test_check_and_update_config_qwen35_skips_auto_defaults_under_pp(monkeypatch):
+    """Under pipeline parallelism (PP > 1), Qwen3.5-397B retains PPChunkScheduler
+    and per-stage KV sizing instead of single-stage TP8 auto-defaults."""
+    from vllm_torchtpu.core.pp_chunk_scheduler import SCHEDULER_CLS
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    monkeypatch.delenv("TPU_EXPERT_PLACEMENT", raising=False)
+    monkeypatch.setattr(
+        "vllm_torchtpu.distributed.pp_push.patch_executor_for_pp_wave",
+        lambda _cfg: None,
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.core.pp_chunk_scheduler.patch_engine_core_for_pp_chunks",
+        lambda _cfg: None,
+    )
+    monkeypatch.setattr(
+        TpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        classmethod(lambda cls, world_size: None),
+    )
+
+    vllm_config = MagicMock()
+    vllm_config.additional_config = {}
+    vllm_config.model_config = MagicMock()
+    vllm_config.model_config.dtype = torch.bfloat16
+    vllm_config.model_config.architectures = ["Qwen3_5MoeForConditionalGeneration"]
+    vllm_config.model_config.is_hybrid = True
+    vllm_config.model_config.max_model_len = 131072
+    vllm_config.model_config.get_head_size.return_value = 256
+    vllm_config.model_config.get_num_layers.return_value = 60
+    vllm_config.model_config.get_total_num_kv_heads.return_value = 2
+    vllm_config.cache_config = SimpleNamespace(
+        enable_prefix_caching=False,
+        mamba_cache_mode="none",
+        kv_cache_memory_bytes=None,
+        kv_cache_layout=None,
+        cache_dtype="bfloat16",
+    )
+    vllm_config.compilation_config = MagicMock()
+    vllm_config.compilation_config.compile_sizes = [16, 32]
+    vllm_config.scheduler_config = SimpleNamespace(
+        max_num_batched_tokens=16384,
+        max_num_seqs=64,
+        async_scheduling=False,
+        enable_chunked_prefill=True,
+        scheduler_cls=None,
+        stream_interval=1,
+    )
+    vllm_config.speculative_config = None
+    vllm_config.kv_transfer_config = None
+    vllm_config.parallel_config = SimpleNamespace(
+        nnodes=1,
+        node_rank=0,
+        world_size=8,
+        world_size_across_dp=8,
+        data_parallel_size=1,
+        pipeline_parallel_size=4,
+        tensor_parallel_size=2,
+        prefill_context_parallel_size=1,
+        cp_kv_cache_interleave_size=1,
+        decode_context_parallel_size=1,
+        enable_expert_parallel=False,
+        is_moe_model=True,
+        use_sequence_parallel_moe=False,
+    )
+
+    TpuPlatform.check_and_update_config(vllm_config)
+    assert vllm_config.scheduler_config.scheduler_cls == SCHEDULER_CLS
+    assert vllm_config.cache_config.kv_cache_memory_bytes is None
+    assert "TPU_EXPERT_PLACEMENT" not in os.environ
+
+
+def test_env_override_qwen35_serve_cli_defaults_under_pp(monkeypatch):
+    """`vllm serve` for Qwen3.5-397B with --pipeline-parallel-size > 1 skips
+    --speculative-config injection, adds --no-async-scheduling, and defaults
+    small-batch decode kernels off."""
+    import sys
+
+    from vllm_torchtpu import env_override
+
+    monkeypatch.delenv("TPU_SMALL_ALL_REDUCE", raising=False)
+    monkeypatch.delenv("TPU_MOE_LOWTOK", raising=False)
+    argv = [
+        "vllm",
+        "serve",
+        "Qwen/Qwen3.5-397B-A17B-FP8",
+        "--pipeline-parallel-size",
+        "4",
+        "--tensor-parallel-size",
+        "2",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    env_override._apply_qwen35_serve_cli_defaults()
+    assert "--speculative-config" not in argv
+    assert "--no-async-scheduling" in argv
+    assert "--renderer-num-workers" in argv
+    assert os.environ.get("TPU_SMALL_ALL_REDUCE") == "0"
+    assert os.environ.get("TPU_MOE_LOWTOK") == "0"
+
