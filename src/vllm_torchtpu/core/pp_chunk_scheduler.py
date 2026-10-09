@@ -81,7 +81,7 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._step_squares = 0.0
         self._step_prefill_tokens = 0
         self._step_schedule = 0
-        self._seeded = set()
+        self._seeded.clear()
         self._step_limit = self._pending_step_limit()
         # Every running request past its prefill with a token left to
         # compute takes it this step; count them before the loop sizes any

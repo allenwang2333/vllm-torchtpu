@@ -232,6 +232,13 @@ def test_the_schedule_capacity_bounds_a_chunk_deep_in_a_prompt():
     # Pairs already in the step leave less room.
     less = model.chunk(49152, 16384, 2048, 0.0, 2048.0**2, None, 6000)
     assert less < got and model.pairs(less, 49152) <= 4000
+    # Exhausted capacity returns 0.
+    assert model.chunk(49152, 16384, 37, 0.0, 37.0, None, 10000) == 0
+    # Non-zero step_tokens stays granule-aligned on the step total.
+    aligned = model.chunk(49152, 16384, 37, 0.0, 37.0, None, 4000)
+    assert (37 + aligned) % 2048 == 0
+    assert model.pairs(aligned, 49152) <= 6000
+    assert model.pairs(aligned + 2048, 49152) > 6000
     # A first chunk with a short prefix is not bounded.
     assert model.chunk(0, 16384, 0, 0.0, 0.0) == 16384
 

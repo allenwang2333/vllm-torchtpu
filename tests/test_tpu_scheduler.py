@@ -83,3 +83,26 @@ def test_pause_state_restored_when_schedule_raises():
         scheduler.schedule(throttle_prefills=True)
 
     assert scheduler._pause_state is PauseState.UNPAUSED
+
+
+def test_init_and_already_paused_state():
+    with patch.object(AsyncScheduler, "__init__", return_value=None):
+        scheduler = TpuDpScheduler()
+    assert scheduler._drain_prefill is False
+
+    scheduler.waiting = [object()]
+    scheduler.skipped_waiting = []
+    scheduler._pause_state = PauseState.PAUSED_ALL
+    expected = object()
+    seen = {}
+
+    def capture(*args, **kwargs):
+        seen["pause_state"] = scheduler._pause_state
+        return expected
+
+    with patch.object(AsyncScheduler, "schedule", side_effect=capture):
+        result = scheduler.schedule(throttle_prefills=True)
+
+    assert result is expected
+    assert seen["pause_state"] is PauseState.PAUSED_ALL
+    assert scheduler._pause_state is PauseState.PAUSED_ALL

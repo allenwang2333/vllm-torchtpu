@@ -202,3 +202,42 @@ def test_coordinator_failure_falls_back_to_fcfs():
     assert q is not None
     assert [r.request_id for r in q] == ["r1", "r2"]
     assert s._paw_scoring_broken is True
+
+
+def test_init_and_edge_branches():
+    from unittest.mock import patch
+
+    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+
+    with patch.object(AsyncScheduler, "__init__", return_value=None):
+        s = PrefixAwareScheduler()
+    assert s._paw_n == 0
+    assert s._paw_cold_tokens == 0
+    assert s._paw_prompt_tokens == 0
+    assert s._paw_scoring_broken is False
+
+    # _select_waiting_queue_for_scheduling returning None
+    with patch.object(
+        AsyncScheduler, "_select_waiting_queue_for_scheduling", return_value=None
+    ):
+        assert s._select_waiting_queue_for_scheduling() is None
+
+    # Non-FCFS policy is a no-op
+    now = time.time()
+    r1 = _make_request("r1", num_tokens=1000, arrival_time=now - 15)
+    r2 = _make_request("r2", num_tokens=1000, arrival_time=now - 10)
+    r3 = _make_request("r3", num_tokens=1000, arrival_time=now - 5)
+    s_prio = _make_scheduler([r1, r2], {"r1": 0, "r2": 800})
+    s_prio.policy = SchedulingPolicy.PRIORITY
+    s_prio._promote_warmest(s_prio.waiting)
+    assert s_prio._paw_n == 0
+
+    # Window with best in the middle (both rank < best_rank True and False)
+    # and _paw_n reaching _LOG_EVERY to exercise periodic logging
+    s_log = _make_scheduler([r1, r2, r3], {"r1": 100, "r2": 900, "r3": 200})
+    s_log._paw_n = 999
+    q = s_log._select_waiting_queue_for_scheduling()
+    assert q is not None
+    assert [r.request_id for r in q] == ["r2", "r1", "r3"]
+    assert s_log._paw_n == 1000
+    assert isinstance(s_log._rank_and_warmth(r1)[0][1], int)

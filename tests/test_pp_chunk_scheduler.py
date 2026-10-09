@@ -254,18 +254,33 @@ def test_the_step_limit_keeps_a_prompt_whole_when_halves_are_no_faster():
 
 
 def test_schedule_resets_the_step_accounting():
-    scheduler = _scheduler(cost=_model())
+    def fake_super_init(self, *args, **kwargs):
+        self.need_mamba_block_aligned_split = False
+
+    with patch.object(Scheduler, "__init__", fake_super_init):
+        scheduler = TpuPipelineChunkScheduler()
+    assert scheduler._mamba_split is False
+    assert scheduler.need_mamba_block_aligned_split is True
+    scheduler.vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16384),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=8),
+    )
+    scheduler.running = []
+    scheduler.waiting = []
+    scheduler.install_cost_model(_model())
+    seeded_id = id(scheduler._seeded)
     scheduler._step_tokens = 5
     scheduler._step_pairs = 7.0
     scheduler._step_squares = 9.0
     scheduler._step_prefill_tokens = 5
-    scheduler._seeded = {"x"}
+    scheduler._seeded.add("x")
     with patch.object(Scheduler, "schedule", return_value="out") as schedule:
         assert scheduler.schedule(throttle_prefills=True) == "out"
     schedule.assert_called_once_with(True)
     assert scheduler._step_tokens == 0 and scheduler._step_pairs == 0.0
     assert scheduler._step_squares == 0.0
     assert scheduler._step_prefill_tokens == 0 and not scheduler._seeded
+    assert id(scheduler._seeded) == seeded_id
 
 
 def _config(pp=8, cls=SCHEDULER_CLS):

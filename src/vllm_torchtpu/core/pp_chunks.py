@@ -250,10 +250,20 @@ class StepCostModel:
                 fit = total - total % self.granularity - step_tokens
             if self.schedule is not None:
                 capacity = self.schedule[0] - step_schedule
-                while fit > 0 and self.pairs(fit, prefix) > capacity:
-                    # Back off a granule, keeping the step total aligned.
-                    total = step_tokens + fit - 1
-                    fit = total - total % self.granularity - step_tokens
+                if fit > 0 and self.pairs(fit, prefix) > capacity:
+                    # Binary search over granule-aligned step totals.
+                    granularity = self.granularity
+                    lo = step_tokens // granularity + 1
+                    hi = (step_tokens + fit - 1) // granularity
+                    fit = 0
+                    while lo <= hi:
+                        mid = (lo + hi) // 2
+                        cand = mid * granularity - step_tokens
+                        if self.pairs(cand, prefix) <= capacity:
+                            fit = cand
+                            lo = mid + 1
+                        else:
+                            hi = mid - 1
             best = max(best, fit)
         return best
 

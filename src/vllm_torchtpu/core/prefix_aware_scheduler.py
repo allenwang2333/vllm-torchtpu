@@ -84,12 +84,10 @@ class PrefixAwareScheduler(AsyncScheduler):
                 )
             return 0
 
-    def _rank_and_warmth(
-        self, request: Request
-    ) -> tuple[tuple[int, float, float], int]:
+    def _rank_and_warmth(self, request: Request) -> tuple[tuple[int, int, float], int]:
         """Return (sort_key, warmth). Lower sort_key is admitted first."""
         warmth = self._prefix_warmth(request)
-        cold_tokens = float(request.num_tokens - warmth)
+        cold_tokens = request.num_tokens - warmth
         tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
         return (tier, cold_tokens, request.arrival_time), warmth
 
@@ -104,12 +102,19 @@ class PrefixAwareScheduler(AsyncScheduler):
         if self.policy != SchedulingPolicy.FCFS or len(queue) < 2:
             return
 
-        window = list(islice(queue, self.WINDOW))
-        head = window[0]
-        scored = [(self._rank_and_warmth(r), r) for r in window]
-        (best_rank, best_warmth), best = min(scored, key=lambda t: t[0][0])
+        it = islice(queue, self.WINDOW)
+        head = next(it)
+        head_rank, best_warmth = self._rank_and_warmth(head)
+        best = head
+        best_rank = head_rank
+        for request in it:
+            rank, warmth = self._rank_and_warmth(request)
+            if rank < best_rank:
+                best = request
+                best_rank = rank
+                best_warmth = warmth
 
-        if best is not head and best_rank < scored[0][0][0]:
+        if best is not head:
             # Only FCFS reaches here (see the early return above).
             cast(FCFSRequestQueue, queue).remove(best)
             queue.prepend_request(best)
