@@ -54,6 +54,8 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    scatter_rows, streamindex_topk)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.adapter.attention import (
     PallasMLAttentionBackend, VllmTPUDeepseekV32IndexerBackend)
@@ -136,6 +138,77 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         return Glm5NextIndexerBackend
 
 
+# One record per pool: `[fp8 key x 128 | e8m0 scale | pad]`, the 128-lane
+# padded format `streamindex_topk` reads.
+POOL_KEY_RECORD_BYTES = 256
+POOL_KEY_KPOOL = 4
+
+
+class Glm5NextPoolKeyBackend(VllmTPUDeepseekV32IndexerBackend):
+    """Pages of fp8 pool-key records, ``kpool`` tokens per record.
+
+    vLLM sizes a cache by bytes per token, so the spec declares
+    ``POOL_KEY_RECORD_BYTES / kpool`` (64) bytes per token; a block of
+    ``block_size`` tokens is then exactly ``block_size / kpool`` records, laid
+    out as `streamindex_topk`'s ``[pages, rows // 4, 4, record]``.
+    """
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> tuple[int, ...]:
+        del num_kv_heads, cache_dtype_str
+        rows = block_size // POOL_KEY_KPOOL
+        if rows % 4 or head_size * POOL_KEY_KPOOL != POOL_KEY_RECORD_BYTES:
+            raise ValueError(
+                f"pool key cache needs block_size / {POOL_KEY_KPOOL} to be a "
+                f"multiple of 4 (block_size={block_size}) and "
+                f"{POOL_KEY_RECORD_BYTES // POOL_KEY_KPOOL} bytes per token "
+                f"(got {head_size})")
+        return (num_blocks, rows // 4, 4, POOL_KEY_RECORD_BYTES)
+
+    @classmethod
+    def get_kv_cache_page_size_bytes(
+        cls,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> int:
+        del num_kv_heads, cache_dtype_str
+        return block_size * head_size
+
+
+class Glm5NextPoolKeyCache(DeepseekV32IndexerCache):
+    """fp8 key of every *complete* pool, scored by `streamindex_topk`.
+
+    A second indexer cache beside `Glm5NextIndexerCache`: the member rows are
+    still needed to build a key, but scoring only ever reads keys, and reading
+    them from here means 64 bytes per token instead of the 512-byte member
+    row, in the record format the kernel consumes directly.
+    """
+
+    kv_dtype_is_fixed = True
+
+    def __init__(self, prefix: str, cache_config: CacheConfig) -> None:
+        super().__init__(head_dim=POOL_KEY_RECORD_BYTES // POOL_KEY_KPOOL,
+                         dtype=torch.uint8,
+                         prefix=prefix,
+                         cache_config=cache_config)
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # The base class squeezes dim 1, which here is `rows // 4` and is 1
+        # at a 16-token block. Keep the 4-D page layout as allocated.
+        self.kv_cache = kv_cache
+
+    def get_attn_backend(self) -> type[Glm5NextPoolKeyBackend]:
+        return Glm5NextPoolKeyBackend
+
+
 # How large an intermediate the pool-scoring step may materialise before it
 # falls back to a loop. 128 MiB is comfortable next to the fp32 `[tokens,
 # pools]` score matrix it has to hold anyway. Read at trace time, so lowering
@@ -146,42 +219,39 @@ _SCORE_INTERMEDIATE_BUDGET_BYTES = int(
     os.environ.get("GLM53_INDEX_SCORE_BUDGET", 128 * 1024 * 1024))
 
 
-def _kpool_index_jax(
-        cache: jax.Array,  # bf16 [blocks, bs/4, 4, 2 * head_dim]
-        k_new: jax.Array,  # bf16 [tokens, head_dim]
-        gate_new: jax.Array,  # bf16 [tokens, head_dim]
-        q: jax.Array,  # f32  [tokens, heads, head_dim]
-        weights: jax.Array,  # f32  [tokens, heads]
-        ape: jax.Array,  # f32  [kpool, head_dim]
-        seq_lens: jax.Array,  # i32  [seqs]
-        page_indices: jax.Array,  # i32  [seqs * pages_per_seq]
-        cu_q_lens: jax.Array,  # i32  [seqs + 1]
-        *,
-        kpool: int,
-        select_k: int,
-        width: int,
-        max_pools: int,
-        num_heads: int,
-) -> tuple[jax.Array, jax.Array]:
-    """The whole indexer, as one jnp function. See `_build_kpool_index_op`.
-
-    Module level so `test_kpool_index_op.py` can run it against the torch
-    reference on CPU, without a TPU or a vLLM engine.
-    """
-    _, block_size_per_packing, packing, row_width = cache.shape
-    block_size = block_size_per_packing * packing
-    num_seqs = seq_lens.shape[0]
-    num_tokens = k_new.shape[0]
-    head_dim = k_new.shape[-1]
-    pages = page_indices.reshape(num_seqs, -1)
-
-    # ---- absolute position of every token in this step --------------------
+def _step_positions(seq_lens: jax.Array, cu_q_lens: jax.Array,
+                    num_tokens: int) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """(sequence id, absolute position, is-real) of every token in the step."""
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
     seq_id = jnp.searchsorted(cu_q_lens[1:], tok,
                               side="right").astype(jnp.int32)
     q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
     pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
     live = tok < cu_q_lens[-1]
+    return seq_id, pos, live
+
+
+def _write_members_and_pool_keys(
+        cache: jax.Array,  # bf16 [blocks, bs/4, 4, 2 * head_dim]
+        k_new: jax.Array,
+        gate_new: jax.Array,
+        ape: jax.Array,
+        pages: jax.Array,  # i32 [seqs, pages_per_seq]
+        seq_id: jax.Array,
+        pos: jax.Array,
+        live: jax.Array,
+        *,
+        kpool: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Store this step's ``[k | gate]`` rows and key the pools they complete.
+
+    Returns ``(cache, new_keys, completes, pool_of, m_k)``: ``new_keys[t]`` is
+    the key of the pool token ``t`` completes, meaningful where
+    ``completes[t]``; ``m_k`` are those pools' member ``k`` rows.
+    """
+    _, block_size_per_packing, packing, row_width = cache.shape
+    block_size = block_size_per_packing * packing
+    head_dim = k_new.shape[-1]
 
     # ---- write [k | gate] into this step's slots --------------------------
     # Padded rows are aimed at an out-of-bounds page. `mode="drop"` is not
@@ -239,6 +309,101 @@ def _kpool_index_jax(
     # weighted average, not a mean, and `ape` makes member order matter.
     probs = jax.nn.softmax(m_gate + ape, axis=-2)
     new_keys = jnp.sum(probs * m_k, axis=-2)  # [tokens, head_dim]
+
+    return cache, new_keys, completes, pool_of, m_k
+
+
+def _expand_selected_pools(
+        selected: jax.Array,  # i32 [tokens, select_k]
+        selected_ok: jax.Array,  # bool [tokens, select_k]
+        pos: jax.Array,
+        live: jax.Array,
+        *,
+        kpool: int,
+        select_k: int,
+        width: int,
+) -> jax.Array:
+    """Selected pool ids -> left-packed token indices plus the tail."""
+    num_tokens = selected.shape[0]
+    visible = (pos + 1) // kpool  # [tokens]
+    token_ids = (selected[..., None] * kpool +
+                 jnp.arange(kpool, dtype=jnp.int32))
+    token_ids = jnp.where(selected_ok[..., None], token_ids, -1)
+    token_ids = token_ids.reshape(num_tokens, select_k * kpool)
+
+    # The query's own incomplete pool is never a candidate, so its tokens
+    # are appended unconditionally -- that is what `always_select_tail`
+    # means. There are `kpool - 1` slots and `pos % kpool` real entries.
+    tail = (visible * kpool)[:, None] + jnp.arange(kpool - 1, dtype=jnp.int32)
+    tail = jnp.where(tail <= pos[:, None], tail, -1)
+
+    # Every row must be **left-packed**: the kernel derives the per-token kv
+    # length as `sum(topk_indices != -1)` and then attends to that many
+    # *leading* entries (see `kernels/mla/sparse/kernel.py`, "Mask scores past
+    # kv_len (the -1 tail)"). Padding entries are gathered from pseudo-random
+    # pages to spread the memory traffic, so a -1 in the middle of a row does
+    # not read as zero, it reads as another sequence's KV. Concatenating the
+    # tail after the full-width pool block would do exactly that whenever
+    # fewer than `select_k` pools are visible, i.e. below 8K of context.
+    #
+    # `-inf` scores sort last, so the `v = min(visible, select_k)` real pools
+    # already occupy the first `v` slots of `selected`, and the real tail
+    # entries are the first `(pos + 1) % kpool` of `tail`. Both halves are
+    # therefore prefixes, and packing is a shift of the tail block down to
+    # offset `kpool * v`.
+    offset = jnp.minimum(visible, select_k) * kpool  # [tokens]
+    col = jnp.arange(width, dtype=jnp.int32)[None, :]
+    in_tail = col - offset[:, None]
+    # `tail[t, c]` is just `visible[t] * kpool + c`, so compute it in place.
+    # A `take_along_axis` from the `[tokens, kpool - 1]` table lowers to one
+    # gather per output element: 17M of them, 179 ms, for an 8K prefill.
+    tail_at_col = (visible * kpool)[:, None] + in_tail
+    tail_at_col = jnp.where(tail_at_col <= pos[:, None], tail_at_col, -1)
+    pool_at_col = jnp.pad(token_ids,
+                          ((0, 0), (0, max(0, width - token_ids.shape[-1]))),
+                          constant_values=-1)[:, :width]
+
+    topk_indices = jnp.where(
+        col < offset[:, None], pool_at_col,
+        jnp.where((in_tail >= 0) & (in_tail < kpool - 1), tail_at_col, -1))
+    topk_indices = jnp.where(live[:, None], topk_indices, -1)
+    return topk_indices
+
+
+def _kpool_index_jax(
+        cache: jax.Array,  # bf16 [blocks, bs/4, 4, 2 * head_dim]
+        k_new: jax.Array,  # bf16 [tokens, head_dim]
+        gate_new: jax.Array,  # bf16 [tokens, head_dim]
+        q: jax.Array,  # f32  [tokens, heads, head_dim]
+        weights: jax.Array,  # f32  [tokens, heads]
+        ape: jax.Array,  # f32  [kpool, head_dim]
+        seq_lens: jax.Array,  # i32  [seqs]
+        page_indices: jax.Array,  # i32  [seqs * pages_per_seq]
+        cu_q_lens: jax.Array,  # i32  [seqs + 1]
+        *,
+        kpool: int,
+        select_k: int,
+        width: int,
+        max_pools: int,
+        num_heads: int,
+) -> tuple[jax.Array, jax.Array]:
+    """The whole indexer, as one jnp function. See `_build_kpool_index_op`.
+
+    Module level so `test_kpool_index_op.py` can run it against the torch
+    reference on CPU, without a TPU or a vLLM engine. The pool keys live over
+    member 0's ``gate`` half and are scored by plain XLA, which reads every
+    sequence's ``max_pools`` keys each step; `_kpool_index_v2_jax` is the
+    serving path.
+    """
+    _, block_size_per_packing, packing, row_width = cache.shape
+    block_size = block_size_per_packing * packing
+    num_seqs = seq_lens.shape[0]
+    num_tokens = k_new.shape[0]
+    head_dim = k_new.shape[-1]
+    pages = page_indices.reshape(num_seqs, -1)
+    seq_id, pos, live = _step_positions(seq_lens, cu_q_lens, num_tokens)
+    cache, new_keys, completes, pool_of, m_k = _write_members_and_pool_keys(
+        cache, k_new, gate_new, ape, pages, seq_id, pos, live, kpool=kpool)
 
     key_slot = (pool_of * kpool) % block_size
     key_page = jnp.where(completes,
@@ -326,51 +491,122 @@ def _kpool_index_jax(
     index_scores = jnp.where(candidate, index_scores,
                              jnp.finfo(jnp.float32).min)
 
-    # ---- select and expand pools back to token indices ---------------------
     selected = jax.lax.top_k(index_scores, select_k)[1].astype(jnp.int32)
     selected_ok = jnp.take_along_axis(candidate, selected, axis=-1)
-    token_ids = (selected[..., None] * kpool +
-                 jnp.arange(kpool, dtype=jnp.int32))
-    token_ids = jnp.where(selected_ok[..., None], token_ids, -1)
-    token_ids = token_ids.reshape(num_tokens, select_k * kpool)
-
-    # The query's own incomplete pool is never a candidate, so its tokens
-    # are appended unconditionally -- that is what `always_select_tail`
-    # means. There are `kpool - 1` slots and `pos % kpool` real entries.
-    tail = (visible * kpool)[:, None] + jnp.arange(kpool - 1, dtype=jnp.int32)
-    tail = jnp.where(tail <= pos[:, None], tail, -1)
-
-    # Every row must be **left-packed**: the kernel derives the per-token kv
-    # length as `sum(topk_indices != -1)` and then attends to that many
-    # *leading* entries (see `kernels/mla/sparse/kernel.py`, "Mask scores past
-    # kv_len (the -1 tail)"). Padding entries are gathered from pseudo-random
-    # pages to spread the memory traffic, so a -1 in the middle of a row does
-    # not read as zero, it reads as another sequence's KV. Concatenating the
-    # tail after the full-width pool block would do exactly that whenever
-    # fewer than `select_k` pools are visible, i.e. below 8K of context.
-    #
-    # `-inf` scores sort last, so the `v = min(visible, select_k)` real pools
-    # already occupy the first `v` slots of `selected`, and the real tail
-    # entries are the first `(pos + 1) % kpool` of `tail`. Both halves are
-    # therefore prefixes, and packing is a shift of the tail block down to
-    # offset `kpool * v`.
-    offset = jnp.minimum(visible, select_k) * kpool  # [tokens]
-    col = jnp.arange(width, dtype=jnp.int32)[None, :]
-    in_tail = col - offset[:, None]
-    # `tail[t, c]` is just `visible[t] * kpool + c`, so compute it in place.
-    # A `take_along_axis` from the `[tokens, kpool - 1]` table lowers to one
-    # gather per output element: 17M of them, 179 ms, for an 8K prefill.
-    tail_at_col = (visible * kpool)[:, None] + in_tail
-    tail_at_col = jnp.where(tail_at_col <= pos[:, None], tail_at_col, -1)
-    pool_at_col = jnp.pad(token_ids,
-                          ((0, 0), (0, max(0, width - token_ids.shape[-1]))),
-                          constant_values=-1)[:, :width]
-
-    topk_indices = jnp.where(
-        col < offset[:, None], pool_at_col,
-        jnp.where((in_tail >= 0) & (in_tail < kpool - 1), tail_at_col, -1))
-    topk_indices = jnp.where(live[:, None], topk_indices, -1)
+    topk_indices = _expand_selected_pools(selected, selected_ok, pos, live,
+                                          kpool=kpool, select_k=select_k,
+                                          width=width)
     return cache, topk_indices
+
+
+# (decode, prefill, mixed). The kernel needs `rows_per_page * pages` to be a
+# multiple of 128; at block 256 a page holds 64 pool rows, so the page counts
+# are even. Untuned starting point taken from DeepSeek-V4's indexer
+# (`deepseek_v4_indexer.py`, (3, 2, 2) on its larger pages).
+_STREAMINDEX_KV_PAGES_PER_BLOCK = (4, 2, 2)
+_STREAMINDEX_QUERIES_PER_BLOCK = (1, 128, 128)
+
+
+def _pool_key_records(keys: jax.Array, record_width: int) -> jax.Array:
+    """f32 ``[n, head_dim]`` keys -> ``[fp8 x head_dim | e8m0 scale | pad]`` u8.
+
+    The record `streamindex_topk` reads: one power-of-two scale per key, so
+    the score can be rescaled after the fp8 dot product.
+    """
+    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+    amax = jnp.maximum(jnp.max(jnp.abs(keys), axis=-1, keepdims=True), 1e-4)
+    scale = jnp.exp2(jnp.ceil(jnp.log2(amax / fp8_max)))
+    q = (keys / scale).astype(jnp.float8_e4m3fn)
+    record = jnp.concatenate([
+        jax.lax.bitcast_convert_type(q, jnp.uint8),
+        jax.lax.bitcast_convert_type(scale.astype(jnp.float8_e8m0fnu),
+                                     jnp.uint8),
+    ], axis=-1)
+    return jnp.pad(record, ((0, 0), (0, record_width - record.shape[-1])))
+
+
+def _kpool_index_v2_jax(
+        cache: jax.Array,  # bf16 [blocks, bs/4, 4, 2 * head_dim]
+        key_cache: jax.Array,  # u8 [blocks, bs/kpool/4, 4, record_width]
+        k_new: jax.Array,  # bf16 [tokens, head_dim]
+        gate_new: jax.Array,  # bf16 [tokens, head_dim]
+        q: jax.Array,  # f32  [tokens, heads, head_dim]
+        weights: jax.Array,  # f32  [tokens, heads]
+        ape: jax.Array,  # f32  [kpool, head_dim]
+        seq_lens: jax.Array,  # i32  [seqs]
+        page_indices: jax.Array,  # i32  [seqs * pages_per_seq]
+        cu_q_lens: jax.Array,  # i32  [seqs + 1]
+        distribution: jax.Array,  # i32  [3]
+        key_page_indices: jax.Array,  # i32  [seqs * pages_per_seq]
+        *,
+        kpool: int,
+        select_k: int,
+        width: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """The indexer with pool keys in their own fp8 cache, scored by a kernel.
+
+    Members are still stored and keyed exactly as in `_kpool_index_jax`. The
+    finished keys then go, fp8-quantized, into ``key_cache`` -- one record per
+    pool, addressed through the same block table at ``kpool`` tokens per row
+    -- and `streamindex_topk` (DeepSeek-V4's indexer kernel: relu(q.k)
+    weighted over heads, top-k on the SparseCore) scores and selects them.
+    That kernel walks only the pages each sequence actually has, where the
+    XLA path reads ``max_pools`` keys per sequence per step regardless of
+    length.
+
+    The two caches sit in different vLLM KV cache groups and so have
+    different block tables: ``page_indices`` addresses ``cache`` and
+    ``key_page_indices`` addresses ``key_cache``.
+    """
+    num_seqs = seq_lens.shape[0]
+    num_tokens = k_new.shape[0]
+    head_dim = k_new.shape[-1]
+    block_size = cache.shape[1] * cache.shape[2]
+    rows_per_page = key_cache.shape[1] * key_cache.shape[2]
+    if rows_per_page * kpool != block_size:
+        raise ValueError(
+            f"pool key cache holds {rows_per_page} rows per page, expected "
+            f"block_size / kpool = {block_size} / {kpool}")
+    pages = page_indices.reshape(num_seqs, -1)
+    seq_id, pos, live = _step_positions(seq_lens, cu_q_lens, num_tokens)
+    cache, new_keys, completes, pool_of, _ = _write_members_and_pool_keys(
+        cache, k_new, gate_new, ape, pages, seq_id, pos, live, kpool=kpool)
+
+    # Pool `j` is row `j` of its sequence's compressed address space: page
+    # `j // rows_per_page` of the block table, row `j % rows_per_page`.
+    key_pages = key_page_indices.reshape(num_seqs, -1)
+    dst_rows = jnp.where(
+        completes,
+        key_pages[seq_id, pool_of // rows_per_page] * rows_per_page +
+        pool_of % rows_per_page, -1)
+    key_cache = scatter_rows(key_cache,
+                             _pool_key_records(new_keys, key_cache.shape[-1]),
+                             dst_rows)
+
+    # relu(c * x) = c * relu(x) for c > 0, so the softmax scale and the
+    # per-row fp8 scale of q both fold into the head weights.
+    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+    qf = q.astype(jnp.float32) * jnp.float32(head_dim**-0.5)
+    q_scale = jnp.maximum(jnp.max(jnp.abs(qf), axis=-1), 1e-12) / fp8_max
+    q_fp8 = (qf / q_scale[..., None]).astype(jnp.float8_e4m3fn)
+    selected = streamindex_topk(
+        q=q_fp8,
+        indexer_weights=weights.astype(jnp.float32) * q_scale,
+        cache_kv=key_cache,
+        seq_lens=seq_lens,
+        page_indices=key_page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        k=select_k,
+        compression_ratio=kpool,
+        num_kv_pages_per_block=_STREAMINDEX_KV_PAGES_PER_BLOCK,
+        num_queries_per_block=_STREAMINDEX_QUERIES_PER_BLOCK,
+        complete_rows_only=True,
+    )
+    topk_indices = _expand_selected_pools(selected, selected >= 0, pos, live,
+                                          kpool=kpool, select_k=select_k,
+                                          width=width)
+    return cache, key_cache, topk_indices
 
 
 @functools.lru_cache(maxsize=None)
@@ -442,6 +678,59 @@ def _build_kpool_index_op(kpool: int, select_k: int, width: int,
         return topk_indices
 
     return op
+
+
+@functools.lru_cache(maxsize=None)
+def _build_kpool_index_v2_op(kpool: int, select_k: int, width: int):
+    """`_kpool_index_v2_jax` as a torch op; both caches updated in place.
+
+    Returned callable: ``op(cache, key_cache, k_new, gate_new, q, weights,
+    ape, seq_lens, page_indices, cu_q_lens, distribution, key_page_indices)
+    -> int32 [num_tokens, width]``. Cached for the same reason as
+    `_build_kpool_index_op`.
+    """
+
+    # `pallas.jax_op` reads the annotations to build the torch schema.
+    def _bound(cache: jax.Array, key_cache: jax.Array, k_new: jax.Array,
+               gate_new: jax.Array, q: jax.Array, weights: jax.Array,
+               ape: jax.Array, seq_lens: jax.Array, page_indices: jax.Array,
+               cu_q_lens: jax.Array, distribution: jax.Array,
+               key_page_indices: jax.Array
+               ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return _kpool_index_v2_jax(cache, key_cache, k_new, gate_new, q,
+                                   weights, ape, seq_lens, page_indices,
+                                   cu_q_lens, distribution, key_page_indices,
+                                   kpool=kpool, select_k=select_k, width=width)
+
+    jax_op = pallas.jax_op("pallas::glm5_next_kpool_index_v2",
+                           _bound,
+                           donate_argnums=(0, 1))
+
+    def _fake(cache, key_cache, k_new, *args, **kwargs):
+        return (torch.empty_like(cache), torch.empty_like(key_cache),
+                torch.empty((k_new.shape[0], width),
+                            dtype=torch.int32,
+                            device=k_new.device))
+
+    jax_op.register_fake(_fake)
+
+    def op(cache, key_cache, *args):
+        new_cache, new_key_cache, topk_indices = jax_op(cache, key_cache, *args)
+        cache.copy_(new_cache)
+        key_cache.copy_(new_key_cache)
+        return topk_indices
+
+    return op
+
+
+def use_v1_indexer() -> bool:
+    """``GLM53_INDEXER_V1=1``: score pools with the XLA path, no key cache.
+
+    The v1 op is the reference `test_kpool_index_op.py` checks against torch;
+    v2 (`_kpool_index_v2_jax`) scores fp8 keys and can swap near-tied pools at
+    the top-k boundary, so this is the switch for A/B-ing that.
+    """
+    return os.environ.get("GLM53_INDEXER_V1", "0") == "1"
 
 
 class Glm5NextIndexer(nn.Module):
@@ -516,10 +805,21 @@ class Glm5NextIndexer(nn.Module):
             cache_config=cache_config,
         )
 
-        max_pools = vllm_config.model_config.max_model_len // self.kpool
-        self.index_op = _build_kpool_index_op(self.kpool, self.select_k,
-                                              self.width, max_pools,
-                                              self.n_heads)
+        self.key_cache = None
+        if use_v1_indexer():
+            max_pools = vllm_config.model_config.max_model_len // self.kpool
+            self.index_op = _build_kpool_index_op(self.kpool, self.select_k,
+                                                  self.width, max_pools,
+                                                  self.n_heads)
+        else:
+            if self.kpool != POOL_KEY_KPOOL:
+                raise ValueError(
+                    f"pool key cache is laid out for kpool {POOL_KEY_KPOOL}, "
+                    f"got {self.kpool}")
+            self.key_cache = Glm5NextPoolKeyCache(
+                prefix=f"{prefix}.key_cache", cache_config=cache_config)
+            self.index_op = _build_kpool_index_v2_op(self.kpool,
+                                                     self.select_k, self.width)
 
     def forward(self, hidden_states: torch.Tensor,
                 q_resid: torch.Tensor) -> torch.Tensor:
@@ -530,7 +830,13 @@ class Glm5NextIndexer(nn.Module):
         if isinstance(attn_metadata, dict):
             metadata = attn_metadata.get(self.k_cache.prefix)
         cache = self.k_cache.kv_cache
-        if not isinstance(metadata, AttentionMetadata) or cache.numel() == 0:
+        key_metadata = None
+        if self.key_cache is not None and isinstance(attn_metadata, dict):
+            key_metadata = attn_metadata.get(self.key_cache.prefix)
+        if (not isinstance(metadata, AttentionMetadata) or cache.numel() == 0
+                or (self.key_cache is not None and
+                    (not isinstance(key_metadata, AttentionMetadata)
+                     or self.key_cache.kv_cache.numel() == 0))):
             # Profiling / warmup pass before the caches are bound. Returning
             # the buffer unchanged keeps the graph shape stable.
             return self.topk_indices_buffer
@@ -542,8 +848,7 @@ class Glm5NextIndexer(nn.Module):
         weights = self.weights_proj(hidden_states)[0].float() * (
             self.n_heads**-0.5)
 
-        topk_indices = self.index_op(
-            cache,
+        common = (
             k.to(cache.dtype),
             gate.to(cache.dtype),
             q.float(),
@@ -553,6 +858,13 @@ class Glm5NextIndexer(nn.Module):
             metadata.block_tables,
             metadata.query_start_loc,
         )
+        if self.key_cache is None:
+            topk_indices = self.index_op(cache, *common)
+        else:
+            topk_indices = self.index_op(cache, self.key_cache.kv_cache,
+                                         *common,
+                                         metadata.request_distribution,
+                                         key_metadata.block_tables)
 
         # Returned directly rather than written into `topk_indices_buffer`:
         # the GLM MLA consumes this tensor itself, and updating the shared
@@ -561,4 +873,7 @@ class Glm5NextIndexer(nn.Module):
         return topk_indices
 
 
-__all__ = ["Glm5NextIndexer", "Glm5NextIndexerCache", "dense_dsa_fallback"]
+__all__ = [
+    "Glm5NextIndexer", "Glm5NextIndexerCache", "Glm5NextPoolKeyCache",
+    "dense_dsa_fallback"
+]

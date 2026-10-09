@@ -395,10 +395,11 @@ class KVCacheManager:
                     # Exempt specs skip the normalizer, which is what pins
                     # `page_size_padded` to the TPU-actual page everywhere
                     # else. vLLM sizes `num_blocks` off that value, so pin it
-                    # here with the same formula the allocation uses.
+                    # here with the formula the allocation uses: the layer's
+                    # own backend's.
                     spec = dataclasses.replace(
                         spec,
-                        page_size_padded=PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+                        page_size_padded=attn_module.get_attn_backend().get_kv_cache_page_size_bytes(
                             spec.block_size, spec.num_kv_heads, spec.head_size, spec.dtype
                         ),
                     )
@@ -764,22 +765,25 @@ class KVCacheManager:
         # Leaving them out of the accounting below makes the uniform page too
         # small, and every layer then reports a page size that does not match
         # what the TPU actually allocates.
-        indexer_modules = [
-            m for m in layers.values() if isinstance(m, DeepseekV32IndexerCache)
-        ]
-        indexer_page_size_bytes = 0
-        if indexer_modules:
-            # Indexer caches allocate through the MLA path (one "head" of
-            # `head_dim` values per token) and keep their declared dtype: it
-            # is either non-floating (DeepSeek's packed uint8 rows) or
-            # explicitly pinned (`kv_dtype_is_fixed`), so the kv-dtype
-            # normalization never reaches them.
-            indexer_page_size_bytes = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
-                self.runner.block_size,
-                1,
-                indexer_modules[0].head_dim,
-                indexer_modules[0].dtype,
+        # A model may carry more than one kind (GLM-5.3-Flash: a bf16 member
+        # cache and an fp8 pool-key cache per DSA layer); each kind is its own
+        # spec and so its own set of kv-cache groups. Every kind allocates
+        # through its layer's backend and keeps its declared dtype -- either
+        # non-floating (DeepSeek's packed uint8 rows) or pinned
+        # (`kv_dtype_is_fixed`) -- so ask that backend for the page.
+        indexer_kinds: dict[tuple, list] = {}
+        for m in layers.values():
+            if isinstance(m, DeepseekV32IndexerCache):
+                indexer_kinds.setdefault(
+                    (m.get_attn_backend(), m.head_dim, m.dtype), []
+                ).append(m)
+        indexer_page_sizes = [
+            backend.get_kv_cache_page_size_bytes(
+                self.runner.block_size, 1, head_dim, dtype
             )
+            for backend, head_dim, dtype in indexer_kinds
+        ]
+        indexer_counts = [len(ms) for ms in indexer_kinds.values()]
 
         mamba_modules = [m for m in layers.values() if isinstance(m, MambaBase)]
         if not mamba_modules:
@@ -824,10 +828,9 @@ class KVCacheManager:
         # allocator landed.
         num_attn = len(attn_modules)
         num_mamba = len(mamba_modules)
-        num_indexer = len(indexer_modules)
-        # vLLM takes the min/max over *every* bucket of same-spec layers, so a
-        # third type participates in the heuristic too.
-        counts = [num_attn, num_mamba] + ([num_indexer] if num_indexer else [])
+        # vLLM takes the min/max over *every* bucket of same-spec layers, so
+        # each indexer kind participates in the heuristic too.
+        counts = [num_attn, num_mamba] + indexer_counts
         min_count = min(counts)
         max_count = max(counts)
 
@@ -837,22 +840,27 @@ class KVCacheManager:
 
         num_attn_groups = (num_attn + group_size - 1) // group_size
         num_mamba_groups = (num_mamba + group_size - 1) // group_size
-        num_indexer_groups = (
-            (num_indexer + group_size - 1) // group_size if num_indexer else 0
+        # Indexer pages are per-token like attention pages, so they belong on
+        # the attention side of every block-count computation: below they are
+        # folded into one "indexer bytes per block" figure.
+        num_indexer_groups = sum(
+            (n + group_size - 1) // group_size for n in indexer_counts
+        )
+        indexer_bytes_per_block = sum(
+            (n + group_size - 1) // group_size * page
+            for n, page in zip(indexer_counts, indexer_page_sizes)
         )
 
-        # Indexer pages are per-token like attention pages, so they belong on
-        # the attention side of every block-count computation.
         uniform_page_size_bytes = (
             num_attn_groups * attn_page_size_bytes
-            + num_indexer_groups * indexer_page_size_bytes
+            + indexer_bytes_per_block
             + num_mamba_groups * unpadded_mamba_page_size
         )
 
         logger.info(
             "Hybrid KV cache: padding every layer spec to %d bytes "
             "(num_attn_groups=%d × attn_page=%d + "
-            "num_indexer_groups=%d × indexer_page=%d + "
+            "num_indexer_groups=%d (%d B per block, pages %s) + "
             "num_mamba_groups=%d × mamba_unpadded=%d). This makes vLLM's "
             "num_blocks match per-layer TPU allocation when mamba layers "
             "cannot be truly shared.",
@@ -860,7 +868,8 @@ class KVCacheManager:
             num_attn_groups,
             attn_page_size_bytes,
             num_indexer_groups,
-            indexer_page_size_bytes,
+            indexer_bytes_per_block,
+            indexer_page_sizes,
             num_mamba_groups,
             unpadded_mamba_page_size,
         )
@@ -881,8 +890,7 @@ class KVCacheManager:
             num_attn_groups,
             num_mamba_groups,
             group_size,
-            num_indexer_groups,
-            indexer_page_size_bytes,
+            indexer_bytes_per_block,
         )
 
         # Fallback (compact sizing skipped, e.g. CPU-only tests or a
@@ -929,8 +937,7 @@ class KVCacheManager:
         num_attn_groups: int,
         num_mamba_groups: int,
         group_size: int,
-        num_indexer_groups: int = 0,
-        indexer_page_size_bytes: int = 0,
+        indexer_bytes_per_block: int = 0,
     ) -> None:
         """Cap mamba layers at `max_num_reqs + 1` recurrent slots and pin
         `cache_config.num_gpu_blocks_override` so the freed HBM grows the
@@ -974,10 +981,9 @@ class KVCacheManager:
             group_size: # layer regions vLLM allocates (= layers per
                 kv-cache group); the same value passed to
                 `_maybe_set_num_blocks_override`.
-            num_indexer_groups: # DSA indexer caches backed by each
-                KVCacheTensor (0 when the model has none).
-            indexer_page_size_bytes: TPU-actual bytes per block per indexer
-                layer. Indexer state is per-token, so it scales with
+            indexer_bytes_per_block: TPU-actual bytes per block of all DSA
+                indexer layers backed by each KVCacheTensor (0 when the model
+                has none). Indexer state is per-token, so it scales with
                 `N_attn`, not with `N_mamba`.
 
         On success: sets `cache_config.num_gpu_blocks_override` (attention
@@ -1026,8 +1032,7 @@ class KVCacheManager:
             )
 
         attn_bytes_per_block = (
-            num_attn_groups * attn_page_size_bytes
-            + num_indexer_groups * indexer_page_size_bytes
+            num_attn_groups * attn_page_size_bytes + indexer_bytes_per_block
         )
         attn_num_blocks = attn_per_tensor_avail // attn_bytes_per_block
         if attn_num_blocks <= 0:
@@ -1046,9 +1051,7 @@ class KVCacheManager:
         attn_bytes = (
             group_size * num_attn_groups * attn_num_blocks * attn_page_size_bytes
         )
-        indexer_bytes = (
-            group_size * num_indexer_groups * attn_num_blocks * indexer_page_size_bytes
-        )
+        indexer_bytes = group_size * attn_num_blocks * indexer_bytes_per_block
         mamba_bytes = (
             group_size
             * num_mamba_groups
