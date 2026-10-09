@@ -2,7 +2,7 @@
 
 The runner (``vllm_torchtpu/runner/tpu_runner.py`` ``forward_model``) uploads
 the lookback ids through upstream's ``GPUModelRunner._prepare_lookback_token_ids``
-(vLLM v0.30.0 ``vllm/v1/worker/gpu_model_runner.py:1070``), which refills a
+(vLLM v0.31.1rc0 ``vllm/v1/worker/gpu_model_runner.py:1052``), which refills a
 reused host buffer and copies it with ``non_blocking=True``. That upload is
 issued after the runner's ``_record_input_staging_fence``, so under async
 scheduling the next step can refill the host buffer while the previous upload

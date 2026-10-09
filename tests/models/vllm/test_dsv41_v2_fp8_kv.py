@@ -177,7 +177,7 @@ def test_parallel_engram_embedding_cpu_offload_and_row_slice(monkeypatch):
         emb_cpu = ParallelEngramEmbedding(
             num_embeddings, dim, head_sizes, block_size=32
         )
-    assert emb_cpu.cpu_offload is True
+    assert emb_cpu.host_offload is True
     assert emb_cpu.weight.device.type == "cpu"
     assert emb_cpu.weight_scale_inv.device.type == "cpu"
     assert getattr(emb_cpu.weight, "dummy_weight_value", None) == 1.0
@@ -185,7 +185,7 @@ def test_parallel_engram_embedding_cpu_offload_and_row_slice(monkeypatch):
 
     monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", "0")
     emb_dev = ParallelEngramEmbedding(num_embeddings, dim, head_sizes, block_size=32)
-    assert emb_dev.cpu_offload is False
+    assert emb_dev.host_offload is False
     rng = torch.Generator().manual_seed(42)
     full_w = torch.randn(num_embeddings, dim, generator=rng).to(torch.float8_e4m3fn)
     full_s = torch.randint(

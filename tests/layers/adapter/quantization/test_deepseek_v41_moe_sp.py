@@ -45,7 +45,7 @@ def test_hash_ids_follow_sp_dispatch(monkeypatch, sp, hash_table, naive, gathere
     monkeypatch.setattr(mod, "get_ep_group", lambda: ep)
     seen = {}
 
-    def upstream_forward(self, hidden_states, input_ids=None):
+    def upstream_forward(self, hidden_states, input_ids=None, mega_gate_metadata=None):
         seen["ids"] = input_ids
         return hidden_states
 

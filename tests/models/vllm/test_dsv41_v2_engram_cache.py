@@ -158,7 +158,7 @@ def test_parallel_engram_embedding_init_offload_flag(
         kwargs["cpu_offload"] = init_arg
 
     emb = ParallelEngramEmbedding(32, 16, (8, 8, 8, 8), block_size=16, **kwargs)
-    assert emb.cpu_offload is expected_offload
+    assert emb.host_offload is expected_offload
     if expected_offload:
         assert emb.weight.device.type == "cpu"
         assert emb.weight_scale_inv is not None
@@ -399,7 +399,11 @@ def test_engram_init_staging_branches():
     engram_on = object.__new__(Engram)
     nn.Module.__init__(engram_on)
     engram_on.embed_tokens = SimpleNamespace(
-        cpu_offload=True, part_n_hash_cols=4, block_size=8
+        host_offload=True,
+        cpu_offload=False,
+        part_n_hash_cols=4,
+        block_size=8,
+        dp_size=1,
     )
     Engram._init_staging(engram_on, max_tokens=10, head_dim=16)
     for name, last in (("_host_raw", 16), ("_host_scale", 2)):
@@ -418,7 +422,9 @@ def test_engram_init_staging_branches():
     # Branch 2: cpu_offload = False
     engram_off = object.__new__(Engram)
     nn.Module.__init__(engram_off)
-    engram_off.embed_tokens = SimpleNamespace(cpu_offload=False, part_n_hash_cols=4)
+    engram_off.embed_tokens = SimpleNamespace(
+        host_offload=False, cpu_offload=False, part_n_hash_cols=4, dp_size=1
+    )
     Engram._init_staging(engram_off, max_tokens=10, head_dim=16)
     assert engram_off._staged_raw is None
     assert engram_off.staged_rows.shape == (10, 4, 16)
@@ -436,7 +442,8 @@ def test_engram_prepare_embeddings_branching(monkeypatch: pytest.MonkeyPatch):
         engram = object.__new__(Engram)
         nn.Module.__init__(engram)
         embed = MagicMock()
-        embed.cpu_offload = cpu_offload
+        embed.host_offload = cpu_offload
+        embed.cpu_offload = False
         embed.part_n_hash_cols = cols
         embed.block_size = block
 

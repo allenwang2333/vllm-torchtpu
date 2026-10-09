@@ -41,7 +41,7 @@ class DeepseekV41MoE(DeepseekV4MoE):
         ):
             super().__init__(vllm_config, *args, **kwargs)
 
-    def forward(self, hidden_states, input_ids=None):
+    def forward(self, hidden_states, input_ids=None, mega_gate_metadata=None):
         if (
             self.use_sequence_parallel
             and input_ids is not None
@@ -53,4 +53,4 @@ class DeepseekV41MoE(DeepseekV4MoE):
             # the runner gathers those over the EP group (TpuDeviceCommunicator)
             # but passes input_ids through as this rank's shard.
             input_ids = get_ep_group().all_gather(input_ids, dim=0)
-        return super().forward(hidden_states, input_ids)
+        return super().forward(hidden_states, input_ids, mega_gate_metadata)

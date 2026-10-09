@@ -1056,13 +1056,13 @@ class TpuPlatform(Platform):
 
     @classmethod
     def _find_non_ssm_backend(cls, vllm_config: VllmConfig) -> Any:
-        """Returns the primary non-SSM attention backend for the config."""
+        """First non-SSM attention backend in layer order, or None.
+
+        vLLM v0.31 replaced this helper with `_find_non_ssm_backends`, which
+        lists every distinct backend; the TPU callers need the first one.
+        """
         backends = cls._find_non_ssm_backends(vllm_config)
-        if not backends:
-            return None
-        if isinstance(backends, (list, tuple)):
-            return backends[0]
-        return next(iter(backends), None)
+        return backends[0] if backends else None
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:

@@ -159,7 +159,7 @@ def test_model_forward_stage_write_encoder_global_kv(monkeypatch):
     model.layers = [FakeEncoderLayer(), FakeDecoderLayer()]
     model._stage_uses_sequence_parallel = lambda stage: True
     model._prepare_engram = MagicMock(return_value=(None, None))
-    model.use_mega_moe = False
+    model.use_native_mega_moe = False
     model.aux_hidden_state_layers = []
     model.use_sparse_mhc = False
     model.use_spec_layer = False

@@ -250,7 +250,9 @@ def test_moe_forward_sp_input_ids_gathering(
 
     captured_args = {}
 
-    def mock_super_forward(self, hidden_states, input_ids=None):
+    def mock_super_forward(
+        self, hidden_states, input_ids=None, mega_gate_metadata=None
+    ):
         captured_args["hidden_states"] = hidden_states
         captured_args["input_ids"] = input_ids
         return "super_forward_out"

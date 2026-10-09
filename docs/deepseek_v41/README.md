@@ -3,7 +3,7 @@
 The runtime entry is
 `vllm_torchtpu.models.vllm.deepseek_v41.v1.model:DeepseekV41ForCausalLM`.
 Model construction, decoder order, checkpoint names and cache ownership are
-inherited from pinned vLLM v0.30.0.
+inherited from pinned vLLM v0.31.1rc0.
 
 The retained path targets DeepSeek-V4.1-Flash text generation with MXFP4 routed
 experts, FP8 indexer keys, BF16 SWA and packed FP8 compressed KV, TP/EP, PP1 and

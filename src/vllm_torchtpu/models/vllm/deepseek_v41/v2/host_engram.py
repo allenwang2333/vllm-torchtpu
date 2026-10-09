@@ -21,8 +21,10 @@ import numpy as np
 import torch
 from vllm.distributed import get_engram_dp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
-from vllm.models.deepseek_v41.common.engram import DEAD_ID
-from vllm.models.deepseek_v41.nvidia.engram import engram_gathered_num_tokens
+from vllm.models.deepseek_v41.common.engram import (
+    DEAD_ID,
+    engram_gathered_num_tokens,
+)
 
 HOST_ENGRAM_KEY = "deepseek_v41_host_engram"
 
@@ -230,7 +232,7 @@ def gather_host_engram_hashes(
             return out
     if gather_fn is not None:
         return gather_fn(engram_hashes, dp_shared_memory=dp_shared_memory)
-    from vllm.models.deepseek_v41.nvidia.engram import gather_engram_hashes
+    from vllm.models.deepseek_v41.common.engram import gather_engram_hashes
 
     return gather_engram_hashes(engram_hashes, dp_shared_memory=dp_shared_memory)
 
