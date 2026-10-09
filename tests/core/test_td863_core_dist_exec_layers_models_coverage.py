@@ -22,7 +22,9 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
-# Stub vllm_omni modules if not installed
+# Stub vllm_omni modules if not installed. The stubs are scoped to this
+# module's import: they (and the omni.attention module bound to them) are
+# removed again below so later test modules import against their own mocks.
 if "vllm_omni" not in sys.modules:
     vllm_omni_mod = ModuleType("vllm_omni")
     diff_mod = ModuleType("vllm_omni.diffusion")
@@ -75,6 +77,18 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_backend i
 from vllm_torchtpu.layers.adapter.linear import TpuRowParallelLinear
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import async_fence, engram
 from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
+
+_omni_attention = sys.modules["vllm_torchtpu.omni.attention"]
+if _omni_attention.SDPABackend.__name__ == "_StubSDPABackend":
+    for _name in (
+        "vllm_omni",
+        "vllm_omni.diffusion",
+        "vllm_omni.diffusion.attention",
+        "vllm_omni.diffusion.attention.backends",
+        "vllm_omni.diffusion.attention.backends.sdpa",
+        "vllm_torchtpu.omni.attention",
+    ):
+        sys.modules.pop(_name, None)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -599,10 +613,8 @@ class _MockSDPABackendBase:
 
 
 def test_omni_attention_coverage(monkeypatch) -> None:
-    monkeypatch.setattr("vllm_torchtpu.omni.attention.SDPAImpl", _MockSDPAImplBase)
-    monkeypatch.setattr(
-        "vllm_torchtpu.omni.attention.SDPABackend", _MockSDPABackendBase
-    )
+    monkeypatch.setattr(_omni_attention, "SDPAImpl", _MockSDPAImplBase)
+    monkeypatch.setattr(_omni_attention, "SDPABackend", _MockSDPABackendBase)
 
     impl = TpuSDPAImpl()
     q = torch.ones((1, 2, 4))

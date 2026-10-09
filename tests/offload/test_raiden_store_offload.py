@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     Locality,
@@ -1125,6 +1126,9 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
                     hashes_per_chunk=1,
                     kv_event_group_spec=MagicMock(),
                     sliding_window_size_in_chunks=None,
+                    # Required since upstream added per-group spec metadata.
+                    kv_cache_spec=MagicMock(),
+                    manager_cls=FullAttentionManager,
                 ),
             ),
             blocks_per_chunk=1,
