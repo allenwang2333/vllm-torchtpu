@@ -293,26 +293,47 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             cache[key] = engrams
         return engrams
 
+    def _engram_offload_flags(self) -> tuple[bool, bool]:
+        """Cached `(has_cpu_offload, has_host_dma)` across active Engram modules."""
+        engrams = DeepseekV41Model._engram_modules(self)
+        if not engrams:
+            return False, False
+        first_embed = engrams[0].embed_tokens
+        last_embed = engrams[-1].embed_tokens
+        key = (
+            engrams,
+            getattr(first_embed, "cpu_offload", False),
+            getattr(first_embed, "host_dma", False),
+            getattr(last_embed, "cpu_offload", False),
+            getattr(last_embed, "host_dma", False),
+        )
+        cached = getattr(self, "_engram_offload_flags_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        has_cpu_offload = any(
+            getattr(engram.embed_tokens, "cpu_offload", False)
+            and getattr(engram.embed_tokens, "host_dma", False) is not True
+            for engram in engrams
+        )
+        has_host_dma = any(
+            getattr(engram.embed_tokens, "host_dma", False) is True
+            for engram in engrams
+        )
+        flags = (has_cpu_offload, has_host_dma)
+        self._engram_offload_flags_cache = (key, flags)
+        return flags
+
     def _has_cpu_offloaded_engram(self) -> bool:
         """Whether an Engram table is gathered on the host each step.
 
         ``host_dma`` tables also load into Host DRAM but are gathered on
         device (`_move_engram_rows_to_pinned_host`), like HBM tables.
         """
-        for engram in DeepseekV41Model._engram_modules(self):
-            if (
-                getattr(engram.embed_tokens, "cpu_offload", False)
-                and getattr(engram.embed_tokens, "host_dma", False) is not True
-            ):
-                return True
-        return False
+        return DeepseekV41Model._engram_offload_flags(self)[0]
 
     def _has_host_dma_engram(self) -> bool:
         """Whether an Engram table uses TPU ``pinned_host`` DMA on device."""
-        for engram in DeepseekV41Model._engram_modules(self):
-            if getattr(engram.embed_tokens, "host_dma", False) is True:
-                return True
-        return False
+        return DeepseekV41Model._engram_offload_flags(self)[1]
 
     def _move_engram_rows_to_pinned_host(self) -> None:
         """One-time ``host_dma`` conversion once weights are loaded."""
@@ -409,7 +430,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 )
                 if host is not None:
                     engram_hashes = self.engram_hash.hash_on_host(*host)
-                    engram_mask = ~upstream.image_sentinel_mask(host[0])
+                    host_image_mask = (
+                        host[3]
+                        if len(host) > 3 and host[3] is not None
+                        else upstream.image_sentinel_mask(host[0])
+                    )
+                    engram_mask = ~host_image_mask
                 else:
                     image_mask = upstream.image_sentinel_mask(input_ids)
                     engram_mask = ~image_mask
@@ -643,8 +669,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 requests = first.seq_lens.shape[0] if first is not None else 1
                 replay_starts = positions.new_zeros(requests)
                 decoder_padding = (
-                    torch.arange(positions.shape[0], device=positions.device)
-                    >= first.query_start_loc[-1]
+                    DeepseekV41Model._get_ced_padding_mask(
+                        self,
+                        positions.shape[0],
+                        int(first.query_start_loc[-1]),
+                        positions.device,
+                    )
                     if first is not None
                     else torch.zeros_like(positions, dtype=torch.bool)
                 )
@@ -1066,12 +1096,14 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         # vLLM's guard-free graph replays at every decode step.
         if self.model.engram_hash is not None:
             self.model.engram_hash.ensure_cache()
-        if envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA:
-            # Normally done by process_weights_after_loading; this covers
-            # loaders that skip load_weights (e.g. dummy weights). The
-            # compiled graph must see the pinned_host chunks, not the
-            # Host-DRAM tables.
-            self.model._move_engram_rows_to_pinned_host()
+        if not getattr(self.model, "_engram_rows_pinned", False):
+            if envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA:
+                # Normally done by process_weights_after_loading; this covers
+                # loaders that skip load_weights (e.g. dummy weights). The
+                # compiled graph must see the pinned_host chunks, not the
+                # Host-DRAM tables.
+                self.model._move_engram_rows_to_pinned_host()
+            self.model._engram_rows_pinned = True
         return super().forward(*args, **kwargs)
 
     def process_weights_after_loading(self) -> None:
