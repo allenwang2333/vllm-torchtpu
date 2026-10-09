@@ -180,6 +180,10 @@ def quantized_matmul_kernel(
         raise ValueError(f"{out_block_size=} must be divisible by {compute_tile_n=}.")
     steps_n = out_block_size // compute_tile_n
 
+    preferred_element_type = (
+        jnp.int32 if jnp.issubdtype(x_q_dtype, jnp.integer) else jnp.float32
+    )
+
     def kernel(lhs_ref, rhs_ref, w_scales_ref, out_ref, acc_scratch):
         pid_k = pl.program_id(2)
         is_first_step = pid_k == 0
@@ -202,10 +206,6 @@ def quantized_matmul_kernel(
 
                     rhs_q_slice = rhs_q_full[n_start:n_end, :]
                     rhs_scale_slice = rhs_scale_full[:, n_start:n_end]
-                    if jnp.issubdtype(x_q_dtype, jnp.integer):
-                        preferred_element_type = jnp.int32
-                    else:
-                        preferred_element_type = jnp.float32
                     dot_res = jax.lax.dot_general(
                         lhs_q,
                         rhs_q_slice,
@@ -283,4 +283,6 @@ def quantized_matmul_kernel(
     with jax.named_scope(kernel_name):
         out = kernel(x, w_q, w_scale)
 
+    if orig_n_batch == padded_n_batch and orig_n_out == padded_n_out:
+        return out
     return out[:orig_n_batch, :orig_n_out]

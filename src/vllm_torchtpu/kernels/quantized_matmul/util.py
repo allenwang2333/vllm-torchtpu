@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Utility functions for quantized matmul kernel."""
 
+import functools
 from collections.abc import Callable
 from typing import Any
 
@@ -89,9 +90,7 @@ def xla_quantized_matmul(
         Output of the quantized matmul.
     """
     if quantize_activation:
-        acc_dtype = jnp.float32
-        if quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer):
-            acc_dtype = jnp.int32
+        acc_dtype = jnp.int32 if jnp.issubdtype(w_q.dtype, jnp.integer) else jnp.float32
 
         x_q, x_scale = quantize_tensor(x, w_q.dtype)
         out = jax.lax.dot_general(
@@ -140,9 +139,7 @@ def xla_quantized_batched_matmul(
     contract_dims, batch_dims = dimension_numbers
 
     if quantize_activation:
-        acc_dtype = jnp.float32
-        if jnp.issubdtype(w_q.dtype, jnp.integer):
-            acc_dtype = jnp.int32
+        acc_dtype = jnp.int32 if jnp.issubdtype(w_q.dtype, jnp.integer) else jnp.float32
 
         x_q, x_scale = quantize_tensor(x, w_q.dtype)
         out = jax.lax.dot_general(
@@ -186,9 +183,8 @@ def quantize_array(
     x_abs_max: jax.Array,  # [1, bs_block_size]
     quant_dtype: jnp.dtype,
 ):
-    is_float = jnp.issubdtype(quant_dtype, jnp.floating)
-    dtype_info = jnp.finfo(quant_dtype) if is_float else jnp.iinfo(quant_dtype)
-    dtype_max = float(dtype_info.max)
+    dtype_max, _ = get_max_min(quant_dtype)
+    dtype_max = float(dtype_max)
 
     # TODO(kyuyeunk): Investigate performance gain from non xlu transpose.
     scale = jnp.transpose(x_abs_max / dtype_max)
@@ -215,12 +211,16 @@ def get_vmem_limit(
 ):
     """Calculate VMEM limit for the kernel."""
 
+    scale_bits = dtypes.itemsize_bits(scale_dtype)
+    batch_in = batch_block_size * in_block_size
+    batch_out = batch_block_size * out_block_size
+
     # Calculate in/out VMEM size.
-    x_size = batch_block_size * in_block_size * dtypes.itemsize_bits(x_dtype)
-    x_abs_max_size = batch_block_size * dtypes.itemsize_bits(scale_dtype)
+    x_size = batch_in * dtypes.itemsize_bits(x_dtype)
+    x_abs_max_size = batch_block_size * scale_bits
     w_q_size = out_block_size * in_block_size * dtypes.itemsize_bits(w_q_dtype)
-    w_scale_size = out_block_size * dtypes.itemsize_bits(scale_dtype)
-    out_size = batch_block_size * out_block_size * dtypes.itemsize_bits(out_dtype)
+    w_scale_size = out_block_size * scale_bits
+    out_size = batch_out * dtypes.itemsize_bits(out_dtype)
 
     vmem_in_out = x_size + x_abs_max_size + w_q_size + w_scale_size + out_size
     vmem_in_out *= 2  # Account for compute and vreg spills.
@@ -234,9 +234,9 @@ def get_vmem_limit(
     vmem_in_out += out_size if (n_batch > 1 or n_out > 1) else 0
 
     # Calculate scratch VMEM size.
-    acc_size = batch_block_size * out_block_size * dtypes.itemsize_bits(acc_dtype)
-    x_q_size = batch_block_size * in_block_size * dtypes.itemsize_bits(x_q_dtype)
-    x_scale_size = batch_block_size * dtypes.itemsize_bits(scale_dtype)
+    acc_size = batch_out * dtypes.itemsize_bits(acc_dtype)
+    x_q_size = batch_in * dtypes.itemsize_bits(x_q_dtype)
+    x_scale_size = x_abs_max_size
 
     vmem_scratch = acc_size if save_acc else 0
     vmem_scratch += x_q_size + x_scale_size if save_x_q else 0
@@ -279,13 +279,13 @@ def validate_inputs(
         raise ValueError(f"{x.shape[1]=} must be a multiple of {in_block_size=}")
 
 
+@functools.cache
 def get_max_min(target_dtype):
     if jnp.issubdtype(target_dtype, jnp.floating):
-        return jnp.finfo(target_dtype).max.astype(jnp.float32), jnp.finfo(
-            target_dtype
-        ).min.astype(jnp.float32)
-    else:
-        return jnp.iinfo(target_dtype).max, jnp.iinfo(target_dtype).min
+        info = jnp.finfo(target_dtype)
+        return info.max.astype(jnp.float32), info.min.astype(jnp.float32)
+    info = jnp.iinfo(target_dtype)
+    return info.max, info.min
 
 
 def quantize_block(data, axis, target_dtype):

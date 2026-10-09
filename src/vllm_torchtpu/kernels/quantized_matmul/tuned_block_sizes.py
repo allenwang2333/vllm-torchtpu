@@ -525,6 +525,8 @@ TUNED_BLOCK_SIZES: dict[TunedKey, TunedValue] = {
 }
 
 DEVICE_VMEM_LIMIT = {6: 96 * 1024 * 1024, 7: 48 * 1024 * 1024}
+_TPU_VERSION_RE = re.compile(r"^TPU[^\d]*(\d+)")
+_DEFAULT_TUNED_VALUE = TunedValue(128, 128, 128)
 
 
 def get_device_vmem_limit() -> int:
@@ -542,7 +544,7 @@ def get_device_vmem_limit() -> int:
 def get_tpu_version() -> int:
     """Returns the numeric version of the TPU, or -1 if not on TPU."""
     kind = jax.devices()[0].device_kind
-    match = re.match(r"^TPU[^\d]*(\d+)", kind)
+    match = _TPU_VERSION_RE.match(kind)
     if match is None:
         return -1
     return int(match.group(1))
@@ -598,6 +600,5 @@ def get_tuned_block_sizes(
         logger.warning_once(
             "Couldn`t find tuned sizes for the quantized matmul kernel with %s", key
         )
-        return TunedValue(128, 128, 128)
-    else:
-        return tuned_value
+        return _DEFAULT_TUNED_VALUE
+    return tuned_value

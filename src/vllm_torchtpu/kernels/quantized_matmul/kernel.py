@@ -5,7 +5,6 @@ import functools
 
 import jax
 import jax.numpy as jnp
-from jax._src import dtypes
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -16,6 +15,8 @@ from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import (
 )
 from vllm_torchtpu.kernels.quantized_matmul.util import (
     get_kernel_name,
+    get_max_min,
+    get_vmem_limit,
     next_multiple,
     unfold_args,
 )
@@ -26,68 +27,12 @@ def quantize_array(
     x_abs_max: jax.Array,  # [1, bs_block_size]
     quant_dtype: jnp.dtype,
 ):
-    is_float = jnp.issubdtype(quant_dtype, jnp.floating)
-    dtype_info = jnp.finfo(quant_dtype) if is_float else jnp.iinfo(quant_dtype)
-    dtype_max = float(dtype_info.max)
+    dtype_max, _ = get_max_min(quant_dtype)
+    dtype_max = float(dtype_max)
 
     # TODO(kyuyeunk): Investigate performance gain from non xlu transpose.
     scale = jnp.transpose(x_abs_max / dtype_max)
     return (x / scale).astype(quant_dtype), scale.astype(jnp.float32)
-
-
-def get_vmem_limit(
-    n_batch: int,
-    n_out: int,
-    n_in: int,
-    batch_block_size: int,
-    out_block_size: int,
-    in_block_size: int,
-    x_dtype: jnp.dtype,
-    x_q_dtype: jnp.dtype,
-    w_q_dtype: jnp.dtype,
-    scale_dtype: jnp.dtype,
-    out_dtype: jnp.dtype,
-    acc_dtype: jnp.dtype,
-    save_acc: bool,
-    save_x_q: bool,
-    upper_limit_bytes: int,
-):
-    """Calculate VMEM limit for the kernel."""
-
-    # Calculate in/out VMEM size.
-    x_size = batch_block_size * in_block_size * dtypes.itemsize_bits(x_dtype)
-    x_abs_max_size = batch_block_size * dtypes.itemsize_bits(scale_dtype)
-    w_q_size = out_block_size * in_block_size * dtypes.itemsize_bits(w_q_dtype)
-    w_scale_size = out_block_size * dtypes.itemsize_bits(scale_dtype)
-    out_size = batch_block_size * out_block_size * dtypes.itemsize_bits(out_dtype)
-
-    vmem_in_out = x_size + x_abs_max_size + w_q_size + w_scale_size + out_size
-    vmem_in_out *= 2  # Account for compute and vreg spills.
-
-    # Account for double buffering.
-    # Double buffering is used only if there are multiple blocks per in/out.
-    vmem_in_out += x_size if (n_batch > 1 or n_in > 1) else 0
-    vmem_in_out += x_abs_max_size if (n_batch > 1) else 0
-    vmem_in_out += w_q_size if (n_out > 1 or n_in > 1) else 0
-    vmem_in_out += w_scale_size if (n_out > 1) else 0
-    vmem_in_out += out_size if (n_batch > 1 or n_out > 1) else 0
-
-    # Calculate scratch VMEM size.
-    acc_size = batch_block_size * out_block_size * dtypes.itemsize_bits(acc_dtype)
-    x_q_size = batch_block_size * in_block_size * dtypes.itemsize_bits(x_q_dtype)
-    x_scale_size = batch_block_size * dtypes.itemsize_bits(scale_dtype)
-
-    vmem_scratch = acc_size if save_acc else 0
-    vmem_scratch += x_q_size + x_scale_size if save_x_q else 0
-    vmem_scratch *= 2  # Account for compute and vreg spills.
-
-    # Add in/out and scratch VMEM size.
-    vmem_used = vmem_in_out + vmem_scratch
-    vmem_used_bytes = vmem_used // 8  # Convert bits to bytes.
-    # Specify upper limit. Defaults to 96MB.
-    vmem_limit_bytes = min(vmem_used_bytes, upper_limit_bytes)
-
-    return vmem_limit_bytes
 
 
 def validate_inputs(
@@ -165,9 +110,11 @@ def matmul_kernel(
         is_first_step = True
         is_last_step = True
 
-    acc_dtype = jnp.float32
-    if quantize_activation and jnp.issubdtype(w_q_ref.dtype, jnp.integer):
-        acc_dtype = jnp.int32
+    acc_dtype = (
+        jnp.int32
+        if quantize_activation and jnp.issubdtype(w_q_ref.dtype, jnp.integer)
+        else jnp.float32
+    )
 
     # Start of actual computation logic.
     def matmul_body(quant: bool, is_first_step: bool, is_last_step: bool):
@@ -313,9 +260,11 @@ def quantized_matmul_kernel(
     # used per batch.
     save_x_q = quantize_activation and n_in == 1 and n_out > 1
 
-    acc_dtype = jnp.float32
-    if quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer):
-        acc_dtype = jnp.int32
+    acc_dtype = (
+        jnp.int32
+        if quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer)
+        else jnp.float32
+    )
 
     vmem_limit_bytes = get_vmem_limit(
         n_batch=n_batch,
@@ -395,4 +344,6 @@ def quantized_matmul_kernel(
     with jax.named_scope(kernel_name):
         out = kernel(x, w_q, w_scale, x_abs_max)
 
+    if orig_n_batch == padded_n_batch and orig_n_out == padded_n_out:
+        return out
     return out[:orig_n_batch, :orig_n_out]
