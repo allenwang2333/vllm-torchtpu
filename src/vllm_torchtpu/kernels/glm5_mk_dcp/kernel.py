@@ -1084,9 +1084,10 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                     a = matmul("w2", l, scr["xq"], cfg.IDR, H)
                     scr["part"][...] = bf(a * sx * sm(slot, "w2_s"))
 
-            @pl.when(is_moe)
-            def _moe():
-                moe(l, slot, X)
+            if cfg.first_dense < L:                     # a MoE layer exists (not in a dense-only build)
+                @pl.when(is_moe)
+                def _moe():
+                    moe(l, slot, X)
 
             ph.mark("L_rs_mlp")
             mlp = reduce_scatter_rows(scr["part"][...], "rsm_send", "rsm_recv")
