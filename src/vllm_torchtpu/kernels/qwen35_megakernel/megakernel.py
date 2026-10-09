@@ -243,12 +243,20 @@ class MKConfig:
         return self.E // self.R
 
     @property
-    def ISR(self):
+    def IS_SLICE(self):
         return self.IS // self.R
 
     @property
-    def IR(self):  # routed-expert intermediate width per rank
+    def ISR(self):
+        return rup(self.IS // self.R, 128)
+
+    @property
+    def I_SLICE(self):
         return self.I // self.R if self.moe_tp else self.I
+
+    @property
+    def IR(self):  # routed-expert intermediate width per rank (128-lane padded)
+        return rup(self.I // self.R if self.moe_tp else self.I, 128)
 
     @property
     def EW(self):  # routed experts with weights on each rank (or physical e_slots when > 0)
@@ -271,6 +279,14 @@ class MKConfig:
         return self.NATT
 
     @property
+    def rec_pages(self) -> int:  # 128-token (64 KiB) kernel pages per GDN recurrent state checkpoint
+        return max(1, ((self.vh * self.KD) // 2 + 127) // 128)
+
+    @property
+    def gdn_pages(self) -> int:  # total kernel pages per GDN state checkpoint (recurrent + 1 conv)
+        return self.rec_pages + 1
+
+    @property
     def CR(self):  # conv state rows: three taps x B rows
         return rup(3 * self.B, 8)
 
@@ -285,6 +301,7 @@ class MKConfig:
     def check(self):
         assert self.L % self.att_every == 0 and self.NH % self.R == 0 and self.R % self.NKV == 0
         assert self.KH % self.R == 0 and self.VH % self.R == 0 and self.E % self.R == 0
+        assert self.IS % self.R == 0 and (not self.moe_tp or self.I % self.R == 0)
         assert self.vh <= 64 and self.B * self.TOPK <= 640 and 1 <= self.B <= self.M <= 64
         assert self.E % 128 == 0 and self.E <= 1024 and self.H % self.PC == 0 and self.nh <= 8
         assert self.ROT % 2 == 0 and self.R & (self.R - 1) == 0 and self.VH % self.KH == 0
@@ -335,7 +352,7 @@ class Tiles:
     rsag: bool = False
     # hierarchical all-reduce on v7x-8 (2x2x1: me ^ 1 on-chip, me ^ 2/4/6 same core across chips):
     # 0: flat R-1 peer rounds (one-shot or rsag); 1: on-chip push + 4-chip push; 2: on-chip
-    # reduce-scatter + 4-chip push + on-chip all-gather; 3: 3-step butterfly (off = 1, 2, 4).
+    # reduce-scatter + 4-chip push + on-chip all-gather; 3: log2(R)-step butterfly (off = 1, 2, ...).
     hier: int = 0
     # unfolded [MR, H] all-reduce payload (-1: auto when WIDE or MR * H <= PR * PC; 0: folded
     # [PR, PC]; 1: unfolded [MR, H])
@@ -386,18 +403,22 @@ TINY_TILES = Tiles(bank=128 << 10, nbd=10, nbe=6, ebank=256 << 10, kv_blk=256, n
 def default_tiles(c: MKConfig) -> Tiles:
     """Tuned tiles for c's row count: 2-stage hierarchical push up to 4 rows, 3-stage hierarchical
     RS+push+AG at 5..8 rows (nkv=3), 9..16 rows (VERIFY_TILES, nkv=4), and 17..32 rows, else
-    WIDE_TILES."""
+    WIDE_TILES. On non-8-rank meshes (e.g. R=16), uses butterfly all-reduce (hier=3) up to 32 rows."""
     if c.B > 32:
-        return WIDE_TILES
-    if c.B > 24:
-        return dataclasses.replace(WIDE_TILES, hier=2)
-    if c.B > 16:
-        return dataclasses.replace(WIDE_TILES, nbd=12, hier=2)
-    if c.B > 8:
-        return VERIFY_TILES
-    if c.B > 4:
-        return dataclasses.replace(DEFAULT_TILES, rsag=True, hier=2, ecopy_opt=1)
-    return DEFAULT_TILES
+        t = WIDE_TILES
+    elif c.B > 24:
+        t = dataclasses.replace(WIDE_TILES, hier=2)
+    elif c.B > 16:
+        t = dataclasses.replace(WIDE_TILES, nbd=12, hier=2)
+    elif c.B > 8:
+        t = VERIFY_TILES
+    elif c.B > 4:
+        t = dataclasses.replace(DEFAULT_TILES, rsag=True, hier=2, ecopy_opt=1)
+    else:
+        t = DEFAULT_TILES
+    if c.R != 8 and t.hier in (1, 2):
+        t = dataclasses.replace(t, hier=3)
+    return t
 
 
 def stream_kinds(c: MKConfig):
@@ -697,21 +718,33 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
     A_conv = 16
     conv8_rows = A_conv * qkv_128
     ssm_u32_rows = (vh * KD) // 2
+    REC_PAGES = c.rec_pages
+    GDN_PAGES = c.gdn_pages
+    SSM_U32_CAP = REC_PAGES * 128
     ckpt_is_3d = not c.ckpt_2d
     roff_is_2d = not c.roff_1d
     K_ckpt = c.ckpt_k if c.ckpt_k > 0 else T
     ckpt_t_off = 0 if K_ckpt == T else 1
     HIER = tiles.hier if R > 1 else 0
+    N_HIER3 = max(1, R.bit_length() - 1)
     RSAG = tiles.rsag and R > 1 and HIER == 0
-    WAR = (WIDE or MR * H <= PR * PC) if tiles.war < 0 else bool(tiles.war)
+    WAR = (
+        (WIDE or MR * H <= PR * PC or (RSAG and (PC // R) % 128 != 0))
+        if tiles.war < 0
+        else bool(tiles.war)
+    )
     AR_R = MR if WAR else PR
     AR_C = H if WAR else PC
     CW = AR_C // R  # rsag: payload lanes summed by each rank
     HC2 = AR_C // 2  # hier=2: payload lanes per on-chip core
     assert not RSAG or CW % 128 == 0
-    assert HIER in (0, 1, 2, 3) and (HIER == 0 or R == 8)
+    assert HIER in (0, 1, 2, 3) and (HIER == 0 or R == 8 or (HIER == 3 and R >= 2))
     assert HIER != 2 or HC2 % 128 == 0
-    AR_ROUNDS = (0, 1, 2) if HIER in (2, 3) else ((0, 1) if (RSAG or HIER == 1) else (0,))
+    AR_ROUNDS = (
+        tuple(range(N_HIER3))
+        if HIER == 3
+        else ((0, 1, 2) if HIER == 2 else ((0, 1) if (RSAG or HIER == 1) else (0,)))
+    )
     AR_PEERS = 1 if HIER == 3 else (3 if HIER in (1, 2) else max(R - 1, 1))
     # - PACK: the split attention's per-row slabs (q of this rank's nh heads; partial softmax of a
     #   group rank's heads) pack PB rows per 8-row tile: row b at tile b // PB, rows
@@ -737,10 +770,10 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
         "part": pltpu.VMEM((MB, H), F32),
         "mix": pltpu.VMEM((MB, NMIX), F32),
         # all-reduce [slot, ...]; rsag: lane chunks [slot, rank, AR_R, CW] (round 1 send / receive)
-        "send": pltpu.VMEM((3, 2, AR_R, AR_C) if HIER == 3 else
+        "send": pltpu.VMEM((N_HIER3, 2, AR_R, AR_C) if HIER == 3 else
                            (2, 2, AR_R, HC2) if HIER == 2 else
                            (2, R, AR_R, CW) if RSAG else (2, AR_R, AR_C), BF16),
-        "recv": pltpu.VMEM((3, 2, 2, AR_R, AR_C) if HIER == 3 else
+        "recv": pltpu.VMEM((N_HIER3, 2, 2, AR_R, AR_C) if HIER == 3 else
                            (2, 2, AR_R, HC2) if HIER == 2 else
                            (2, 2, AR_R, AR_C) if HIER == 1 else
                            (2, R, AR_R, CW) if RSAG else (2, R, AR_R, AR_C), BF16),
@@ -793,8 +826,8 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
             del scratch[k]
         if c.NGDN > 0:
             scratch.update({
-                "gdn_in_page": pltpu.VMEM((NGI, 5, 2, 64, 4, c.page_size), FP8),
-                "gdn_out_page": pltpu.VMEM((NGO, 5 * T, 2, 64, 4, c.page_size), FP8),
+                "gdn_in_page": pltpu.VMEM((NGI, GDN_PAGES, 2, 64, 4, c.page_size), FP8),
+                "gdn_out_page": pltpu.VMEM((NGO, GDN_PAGES * T, 2, 64, 4, c.page_size), FP8),
                 "gdn_in_sem": pltpu.SemaphoreType.DMA((NGI,)),
                 "gdn_out_sem": pltpu.SemaphoreType.DMA((NGO, T)),
                 "gdn_in_pend": pltpu.SMEM((NGI,), I32),
@@ -947,13 +980,13 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
         def gdn_pb_in(sub, s):
             roff = gdn_roff(sub, s)
             if ckpt_is_3d:
-                return ST["ckpt_indices"][sub, s, roff] * 5
-            return ST["ckpt_indices"][s, roff] * (5 * G_PER_ATT) + sub * 5
+                return ST["ckpt_indices"][sub, s, roff] * GDN_PAGES
+            return ST["ckpt_indices"][s, roff] * (GDN_PAGES * G_PER_ATT) + sub * GDN_PAGES
 
         def gdn_pb_out(sub, s, t):
             if ckpt_is_3d:
-                return ST["ckpt_indices"][sub, s, t + ckpt_t_off] * 5
-            return ST["ckpt_indices"][s, t + ckpt_t_off] * (5 * G_PER_ATT) + sub * 5
+                return ST["ckpt_indices"][sub, s, t + ckpt_t_off] * GDN_PAGES
+            return ST["ckpt_indices"][s, t + ckpt_t_off] * (GDN_PAGES * G_PER_ATT) + sub * GDN_PAGES
 
         def gdn_contig_ckpt(sub, s):
             if not ckpt_is_3d or T <= 1:
@@ -976,7 +1009,7 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
             def _():
                 pltpu.make_async_copy(
                     out_page.at[slot_o],
-                    raw_refs[0].at[pl.ds(0, 5 * T)],
+                    raw_refs[0].at[pl.ds(0, GDN_PAGES * T)],
                     out_sem.at[slot_o, 0],
                 ).wait()
 
@@ -985,8 +1018,8 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
                 def _():
                     for t in range(T):
                         pltpu.make_async_copy(
-                            out_page.at[slot_o, pl.ds(t * 5, 5)],
-                            raw_refs[0].at[pl.ds(0, 5)],
+                            out_page.at[slot_o, pl.ds(t * GDN_PAGES, GDN_PAGES)],
+                            raw_refs[0].at[pl.ds(0, GDN_PAGES)],
                             out_sem.at[slot_o, t],
                         ).wait()
 
@@ -1281,22 +1314,21 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
             with sc("ar_comm"):
                 ar_round(slot, 0)
             if HIER == 3:
+                for rnd_i in range(1, N_HIER3):
+                    with sc("ar_sum"):
+                        b_i = lax.rem(me // (1 << rnd_i), 2)
+                        send[rnd_i, slot] = (
+                            recv[rnd_i - 1, slot, 0].astype(F32)
+                            + recv[rnd_i - 1, slot, 1].astype(F32)
+                        ).astype(BF16)
+                        recv[rnd_i, slot, b_i] = send[rnd_i, slot]
+                    with sc("ar_comm"):
+                        ar_round(slot, rnd_i)
                 with sc("ar_sum"):
-                    b1 = lax.rem(me // 2, 2)
-                    send[1, slot] = (recv[0, slot, 0].astype(F32)
-                                     + recv[0, slot, 1].astype(F32)).astype(BF16)
-                    recv[1, slot, b1] = send[1, slot]
-                with sc("ar_comm"):
-                    ar_round(slot, 1)
-                with sc("ar_sum"):
-                    b2 = lax.rem(me // 4, 2)
-                    send[2, slot] = (recv[1, slot, 0].astype(F32)
-                                     + recv[1, slot, 1].astype(F32)).astype(BF16)
-                    recv[2, slot, b2] = send[2, slot]
-                with sc("ar_comm"):
-                    ar_round(slot, 2)
-                with sc("ar_sum"):
-                    return recv[2, slot, 0].astype(F32) + recv[2, slot, 1].astype(F32)
+                    return (
+                        recv[N_HIER3 - 1, slot, 0].astype(F32)
+                        + recv[N_HIER3 - 1, slot, 1].astype(F32)
+                    )
             if HIER in (1, 2):
                 ag_send, ag_recv = scr["ag_send"], scr["ag_recv"]
                 with sc("ar_sum"):
@@ -1389,7 +1421,9 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
 
                         def do_in(r):
                             pltpu.make_async_copy(
-                                r.at[pl.ds(pb, 5)], in_page.at[slot_i], in_sem.at[slot_i]
+                                r.at[pl.ds(pb, GDN_PAGES)],
+                                in_page.at[slot_i],
+                                in_sem.at[slot_i],
                             ).start()
 
                         bswitch(g_pool, [lambda r=r: do_in(r) for r in raw_refs])
@@ -1400,7 +1434,7 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
                     @pl.when(pend != 0)
                     def _():
                         pltpu.make_async_copy(
-                            raw_refs[0].at[pl.ds(0, 5)],
+                            raw_refs[0].at[pl.ds(0, GDN_PAGES)],
                             in_page.at[slot_i],
                             in_sem.at[slot_i],
                         ).wait()
@@ -1423,7 +1457,7 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
                             def do_out(r):
                                 pltpu.make_async_copy(
                                     out_page.at[slot_o],
-                                    r.at[pl.ds(pb0, 5)],
+                                    r.at[pl.ds(pb0, GDN_PAGES)],
                                     out_sem.at[slot_o, 0],
                                 ).start()
 
@@ -1441,7 +1475,7 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
                             def do_out_c(r):
                                 pltpu.make_async_copy(
                                     out_page.at[slot_o],
-                                    r.at[pl.ds(pb0, 5 * T)],
+                                    r.at[pl.ds(pb0, GDN_PAGES * T)],
                                     out_sem.at[slot_o, 0],
                                 ).start()
 
@@ -1453,8 +1487,8 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
                                 for t in range(T):
                                     pb_t = gdn_pb_out(sub, s, t)
                                     pltpu.make_async_copy(
-                                        out_page.at[slot_o, pl.ds(t * 5, 5)],
-                                        r.at[pl.ds(pb_t, 5)],
+                                        out_page.at[slot_o, pl.ds(t * GDN_PAGES, GDN_PAGES)],
+                                        r.at[pl.ds(pb_t, GDN_PAGES)],
                                         out_sem.at[slot_o, t],
                                     ).start()
 
@@ -1486,22 +1520,22 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
                         act_in = wait_gdn_in(slot_i)
                     if typed:
                         u32_in = pltpu.bitcast(
-                            in_page[slot_i, 0:4], U32
-                        ).reshape(512, 128)[:ssm_u32_rows, :]
+                            in_page[slot_i, 0:REC_PAGES], U32
+                        ).reshape(SSM_U32_CAP, 128)[:ssm_u32_rows, :]
                         raw_conv = (
-                            pltpu.bitcast(in_page[slot_i, 4], BF16)
+                            pltpu.bitcast(in_page[slot_i, REC_PAGES], BF16)
                             .reshape(256, 128)[:conv8_rows, :]
                             .reshape(A_conv, QKV)
                             .astype(F32)
                         )
                     else:
                         u32_in = (
-                            in_page.at[slot_i, pl.ds(0, 4)]
+                            in_page.at[slot_i, pl.ds(0, REC_PAGES)]
                             .bitcast(U32)
-                            .reshape(512, 128)[:ssm_u32_rows, :]
+                            .reshape(SSM_U32_CAP, 128)[:ssm_u32_rows, :]
                         )
                         raw_conv = (
-                            in_page.at[slot_i, 4]
+                            in_page.at[slot_i, REC_PAGES]
                             .bitcast(BF16)
                             .reshape(256, 128)[:conv8_rows, :]
                             .reshape(A_conv, QKV)
@@ -1568,26 +1602,33 @@ def build(c: MKConfig, tiles: Tiles | None = None, *, interpret=False, forced_ro
                                 ).astype(BF16)
                                 if typed:
                                     u32_p = (
-                                        jnp.pad(u32_out, ((0, 512 - ssm_u32_rows), (0, 0)))
-                                        if ssm_u32_rows < 512
+                                        jnp.pad(u32_out, ((0, SSM_U32_CAP - ssm_u32_rows), (0, 0)))
+                                        if ssm_u32_rows < SSM_U32_CAP
                                         else u32_out
                                     )
-                                    out_page[slot_o, t * 5:t * 5 + 4] = pltpu.bitcast(
-                                        u32_p.reshape(4, 2, 64, 1, 128), FP8
+                                    out_page[
+                                        slot_o,
+                                        t * GDN_PAGES : t * GDN_PAGES + REC_PAGES,
+                                    ] = pltpu.bitcast(
+                                        u32_p.reshape(REC_PAGES, 2, 64, 1, 128), FP8
                                     )
                                     conv_p = w_conv.reshape(conv8_rows, 128)
                                     if conv8_rows < 256:
                                         conv_p = jnp.pad(conv_p, ((0, 256 - conv8_rows), (0, 0)))
-                                    out_page[slot_o, t * 5 + 4] = pltpu.bitcast(
+                                    out_page[slot_o, t * GDN_PAGES + REC_PAGES] = pltpu.bitcast(
                                         conv_p.reshape(2, 64, 2, 128), FP8
                                     )
                                 else:
-                                    out_page.at[slot_o, pl.ds(t * 5, 4)].bitcast(U32).reshape(
-                                        512, 128
-                                    )[:ssm_u32_rows, :] = u32_out
-                                    out_page.at[slot_o, t * 5 + 4].bitcast(BF16).reshape(
-                                        256, 128
-                                    )[:conv8_rows, :] = w_conv.reshape(conv8_rows, 128)
+                                    out_page.at[
+                                        slot_o, pl.ds(t * GDN_PAGES, REC_PAGES)
+                                    ].bitcast(U32).reshape(SSM_U32_CAP, 128)[
+                                        :ssm_u32_rows, :
+                                    ] = u32_out
+                                    out_page.at[slot_o, t * GDN_PAGES + REC_PAGES].bitcast(
+                                        BF16
+                                    ).reshape(256, 128)[:conv8_rows, :] = w_conv.reshape(
+                                        conv8_rows, 128
+                                    )
                     start_gdn_out(o, s)
 
                 with sc("gdn_out"):

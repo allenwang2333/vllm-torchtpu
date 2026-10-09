@@ -537,36 +537,61 @@ def pack_router_and_shared_layer(
             .view(c.H // tk_router, tk_router, c.E)
         )
 
-        # Shared-expert gate|up: either replicated [4096, E + 2*IS] or TP-sliced [4096, E + 2*ISR]
+        # Shared-expert gate|up: replicated [4096, E + 2*IS], TP-sliced [4096, E + 2*is_slice], or padded [4096, E + 2*ISR]
+        is_slice = c.IS // c.R
         n_cols = int(w_gu.shape[1])
         if n_cols == c.E + 2 * c.IS:
-            g0 = c.E + tp_rank * c.ISR
-            u0 = c.E + c.IS + tp_rank * c.ISR
-            w_sh13 = torch.cat(
-                [w_gu.data[:, g0 : g0 + c.ISR], w_gu.data[:, u0 : u0 + c.ISR]], dim=1
-            ).contiguous()
-            s_sh13 = torch.cat(
-                [s_gu[g0 : g0 + c.ISR], s_gu[u0 : u0 + c.ISR]], dim=0
-            ).contiguous()
+            g0 = c.E + tp_rank * is_slice
+            u0 = c.E + c.IS + tp_rank * is_slice
+            g_sl = w_gu.data[:, g0 : g0 + is_slice]
+            u_sl = w_gu.data[:, u0 : u0 + is_slice]
+            sg_sl = s_gu[g0 : g0 + is_slice]
+            su_sl = s_gu[u0 : u0 + is_slice]
+        elif n_cols == c.E + 2 * is_slice:
+            g_sl = w_gu.data[:, c.E : c.E + is_slice]
+            u_sl = w_gu.data[:, c.E + is_slice : c.E + 2 * is_slice]
+            sg_sl = s_gu[c.E : c.E + is_slice]
+            su_sl = s_gu[c.E + is_slice : c.E + 2 * is_slice]
         elif n_cols == c.E + 2 * c.ISR:
-            w_sh13 = w_gu.data[:, c.E : c.E + 2 * c.ISR].contiguous()
-            s_sh13 = s_gu[c.E : c.E + 2 * c.ISR].contiguous()
+            g_sl = w_gu.data[:, c.E : c.E + c.ISR]
+            u_sl = w_gu.data[:, c.E + c.ISR : c.E + 2 * c.ISR]
+            sg_sl = s_gu[c.E : c.E + c.ISR]
+            su_sl = s_gu[c.E + c.ISR : c.E + 2 * c.ISR]
         else:
             raise ValueError(
                 f"Unexpected _fused_gate_gu_fp8_weight shape {tuple(w_gu.shape)}"
             )
+        if int(g_sl.shape[1]) < c.ISR:
+            pad_c = c.ISR - int(g_sl.shape[1])
+            z_w = torch.zeros(
+                (c.H, pad_c), dtype=g_sl.dtype, device=g_sl.device
+            )
+            z_s = torch.zeros((pad_c,), dtype=sg_sl.dtype, device=sg_sl.device)
+            g_sl = torch.cat([g_sl, z_w], dim=1)
+            u_sl = torch.cat([u_sl, z_w], dim=1)
+            sg_sl = torch.cat([sg_sl, z_s], dim=0)
+            su_sl = torch.cat([su_sl, z_s], dim=0)
+        w_sh13 = torch.cat([g_sl, u_sl], dim=1).contiguous()
+        s_sh13 = torch.cat([sg_sl, su_sl], dim=0).contiguous()
 
         if int(w_down.shape[0]) == c.IS:
-            r0 = tp_rank * c.ISR
-            w_sh2 = w_down[r0 : r0 + c.ISR, :].contiguous()
-        elif int(w_down.shape[0]) == c.ISR:
+            r0 = tp_rank * is_slice
+            w_sh2 = w_down[r0 : r0 + is_slice, :].contiguous()
+        elif int(w_down.shape[0]) in (is_slice, c.ISR):
             w_sh2 = w_down.contiguous()
         else:
             raise ValueError(
                 f"Unexpected _fused_se_down_fp8_weight shape {tuple(w_down.shape)}"
             )
+        if int(w_sh2.shape[0]) < c.ISR:
+            pad_r = c.ISR - int(w_sh2.shape[0])
+            z_d = torch.zeros(
+                (pad_r, c.H), dtype=w_sh2.dtype, device=w_sh2.device
+            )
+            w_sh2 = torch.cat([w_sh2, z_d], dim=0).contiguous()
     else:
         # Unfused fallback
+        is_slice = c.IS // c.R
         gate_w = mlp.gate.weight.data
         if tuple(gate_w.shape) == (c.E, c.H):
             gate_w = gate_w.transpose(0, 1)
@@ -586,19 +611,32 @@ def pack_router_and_shared_layer(
         )
         w_gu_only, s_gu_only = extract_kn_fp8_weight(gu_proj, c.H, gu_cols)
         if gu_cols == 2 * c.IS:
-            g0 = tp_rank * c.ISR
-            u0 = c.IS + tp_rank * c.ISR
-            w_sh13 = torch.cat(
-                [w_gu_only[:, g0 : g0 + c.ISR], w_gu_only[:, u0 : u0 + c.ISR]], dim=1
-            ).contiguous()
-            s_sh13 = torch.cat(
-                [s_gu_only[g0 : g0 + c.ISR], s_gu_only[u0 : u0 + c.ISR]], dim=0
-            ).contiguous()
-        elif gu_cols == 2 * c.ISR:
-            w_sh13 = w_gu_only.contiguous()
-            s_sh13 = s_gu_only.contiguous()
+            g0 = tp_rank * is_slice
+            u0 = c.IS + tp_rank * is_slice
+            g_sl = w_gu_only[:, g0 : g0 + is_slice]
+            u_sl = w_gu_only[:, u0 : u0 + is_slice]
+            sg_sl = s_gu_only[g0 : g0 + is_slice]
+            su_sl = s_gu_only[u0 : u0 + is_slice]
+        elif gu_cols in (2 * is_slice, 2 * c.ISR):
+            half = gu_cols // 2
+            g_sl = w_gu_only[:, :half]
+            u_sl = w_gu_only[:, half:]
+            sg_sl = s_gu_only[:half]
+            su_sl = s_gu_only[half:]
         else:
             raise ValueError(f"Unexpected shared_expert.gate_up_proj cols {gu_cols}")
+        if int(g_sl.shape[1]) < c.ISR:
+            pad_c = c.ISR - int(g_sl.shape[1])
+            z_w = torch.zeros(
+                (c.H, pad_c), dtype=g_sl.dtype, device=g_sl.device
+            )
+            z_s = torch.zeros((pad_c,), dtype=sg_sl.dtype, device=sg_sl.device)
+            g_sl = torch.cat([g_sl, z_w], dim=1)
+            u_sl = torch.cat([u_sl, z_w], dim=1)
+            sg_sl = torch.cat([sg_sl, z_s], dim=0)
+            su_sl = torch.cat([su_sl, z_s], dim=0)
+        w_sh13 = torch.cat([g_sl, u_sl], dim=1).contiguous()
+        s_sh13 = torch.cat([sg_sl, su_sl], dim=0).contiguous()
 
         down_rows = int(
             down_proj.weight.shape[0]
@@ -608,12 +646,18 @@ def pack_router_and_shared_layer(
         )
         w_down_only, s_down = extract_kn_fp8_weight(down_proj, down_rows, c.H)
         if down_rows == c.IS:
-            r0 = tp_rank * c.ISR
-            w_sh2 = w_down_only[r0 : r0 + c.ISR, :].contiguous()
-        elif down_rows == c.ISR:
+            r0 = tp_rank * is_slice
+            w_sh2 = w_down_only[r0 : r0 + is_slice, :].contiguous()
+        elif down_rows in (is_slice, c.ISR):
             w_sh2 = w_down_only.contiguous()
         else:
             raise ValueError(f"Unexpected shared_expert.down_proj rows {down_rows}")
+        if int(w_sh2.shape[0]) < c.ISR:
+            pad_r = c.ISR - int(w_sh2.shape[0])
+            z_d = torch.zeros(
+                (pad_r, c.H), dtype=w_sh2.dtype, device=w_sh2.device
+            )
+            w_sh2 = torch.cat([w_sh2, z_d], dim=0).contiguous()
 
         sh_gate = mlp.shared_expert_gate.weight.data.float().reshape(c.H).contiguous()
 
@@ -867,22 +911,37 @@ def reshard_experts_ep_to_tp_local(
       - `s13_tp`: `[E, 1, 1, 2*IR]` (`[512, 1, 1, 256]`) `float32`
       - `s2_tp`: `[E, 1, 1, H]` (`[512, 1, 1, H]`) `float32`
     """
-    ir = c.I // c.R  # 128
-    g0 = tp_rank * ir
-    u0 = c.I + tp_rank * ir
+    i_slice = c.I // c.R  # 128 at R=8, 64 at R=16
+    g0 = tp_rank * i_slice
+    u0 = c.I + tp_rank * i_slice
 
-    w13_tp = torch.cat(
-        [w13_all[:, :, g0 : g0 + ir], w13_all[:, :, u0 : u0 + ir]], dim=-1
-    ).contiguous()
-    w2_tp = w2_all[:, g0 : g0 + ir, :].contiguous()
+    g_w = w13_all[:, :, g0 : g0 + i_slice]
+    u_w = w13_all[:, :, u0 : u0 + i_slice]
+    w2_tp = w2_all[:, g0 : g0 + i_slice, :]
 
     s13_flat = s13_all.float().reshape(c.E, 2 * c.I)
     s2_flat = s2_all.float().reshape(c.E, c.H)
-    s13_tp = _fresh(
-        torch.cat(
-            [s13_flat[:, g0 : g0 + ir], s13_flat[:, u0 : u0 + ir]], dim=-1
-        ).reshape(c.E, 1, 1, 2 * ir)
-    )
+    g_s = s13_flat[:, g0 : g0 + i_slice]
+    u_s = s13_flat[:, u0 : u0 + i_slice]
+
+    if i_slice < c.IR:
+        pad_c = c.IR - i_slice
+        z_w13 = torch.zeros(
+            (c.E, c.H, pad_c), dtype=g_w.dtype, device=g_w.device
+        )
+        z_w2 = torch.zeros(
+            (c.E, pad_c, c.H), dtype=w2_tp.dtype, device=w2_tp.device
+        )
+        z_s13 = torch.zeros((c.E, pad_c), dtype=g_s.dtype, device=g_s.device)
+        g_w = torch.cat([g_w, z_w13], dim=-1)
+        u_w = torch.cat([u_w, z_w13], dim=-1)
+        w2_tp = torch.cat([w2_tp, z_w2], dim=1)
+        g_s = torch.cat([g_s, z_s13], dim=-1)
+        u_s = torch.cat([u_s, z_s13], dim=-1)
+
+    w13_tp = torch.cat([g_w, u_w], dim=-1).contiguous()
+    w2_tp = w2_tp.contiguous()
+    s13_tp = _fresh(torch.cat([g_s, u_s], dim=-1).reshape(c.E, 1, 1, 2 * c.IR))
     s2_tp = _fresh(s2_flat.reshape(c.E, 1, 1, c.H))
     return w13_tp, w2_tp, s13_tp, s2_tp
 
@@ -1521,8 +1580,8 @@ class Qwen35Megakernel:
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         _need(
-            self.tp_size == K.FULL.R,
-            f"tp_size={self.tp_size} != expected {K.FULL.R}",
+            self.tp_size in (8, 16),
+            f"tp_size={self.tp_size} must be 8 or 16",
         )
 
         if mesh is None:
@@ -1537,12 +1596,13 @@ class Qwen35Megakernel:
                 logger.info(
                     "Qwen3.5 megakernel: resharding 60 MoE layers from EP to TP in-place"
                 )
-                for l in range(K.FULL.L):
+                tp_full = dataclasses.replace(K.FULL, R=self.tp_size)
+                for l in range(tp_full.L):
                     layer_l = self.backbone.layers[l]
                     reshard_layer_experts_ep_to_tp(
                         layer_l.mlp,
                         tp_rank=self.tp_rank,
-                        c=K.FULL,
+                        c=tp_full,
                     )
                     _try_set(layer_l, "use_attn_reduce_scatter_for_moe", False)
                     linear_attn = getattr(layer_l, "linear_attn", None)
@@ -1566,6 +1626,7 @@ class Qwen35Megakernel:
                 self.e_slots = 0
                 self.base_cfg = dataclasses.replace(
                     K.FULL,
+                    R=self.tp_size,
                     moe_tp=True,
                     stack_e=False,
                     e_slots=0,
@@ -1579,6 +1640,7 @@ class Qwen35Megakernel:
                 self.e_slots = e_slots
                 self.base_cfg = dataclasses.replace(
                     K.FULL_EP,
+                    R=self.tp_size,
                     moe_tp=False,
                     stack_e=False,
                     e_slots=e_slots,
