@@ -311,9 +311,11 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
     draft=True (cfg.V > 0; WHITEBOARD.v4): the MTP drafter -- L = 3 passes of the one MTP layer
     (weights stacked 3x; caches = the draft layer's, 3 views). scal / rmeta / qmeta / rvec / rope_tab
-    gain a leading [3] (per pass); h0 = the target's post-final-norm hidden; after smalls come dmeta
+    gain a leading [3] (per pass) flattened into the row axis (rmeta [3*TMAX, 8], qmeta [3*BMAX, 4],
+    rvec [3*M, 128], rope_tab [12, M, 128]); h0 = the target's post-final-norm hidden; after smalls come dmeta
     SMEM i32 [4, 128] (rows 0-2: per pass the rows whose logits are taken; row 3: pass 0's token ids),
-    the vocab shard of embed [VR, H] and lm_head [VRP, H] (bf16, HBM) and eh_proj^T's output-column
+    the vocab shard of embed [VR, H/2] (u32 pairs: bf16 row[:H/2] | row[H/2:] << 16) and lm_head
+    [VRP, H] (bf16, HBM) and eh_proj^T's output-column
     shard [2, H/R, H] (bf16; 0: embed half, 1: hidden half). out = tokens [M, 128] i32 (row b, lane
     pass). Only pass 0 writes KV (passes 1-2's rows are dead stores in main, never attended)."""
     assert set(skip) <= set(ABLATIONS), skip
@@ -369,7 +371,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                    rup(cfg.IDIM + cfg.IH), cfg.E))
     KX = max(H, cfg.QL, KRO, cfg.IDR, cfg.I, cfg.ISR)
 
-    SW = stack_kinds(stack_w, wk)
+    SW = frozenset(k for k in stack_kinds(stack_w, wk) if wk[k][0])   # never a 0-length stack (Mosaic SIGILL)
     SCG = cache_groups(stack_c, ck)
     SC = frozenset(SCG)
     w_names = [x for k, (ls, _, _) in wk.items()
@@ -491,6 +493,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     scratch["st"] = pltpu.SMEM((8,), I32)
     if draft:
         scratch["lmb"] = pltpu.VMEM((128, H), BF16)      # lm_head / eh_proj tiles
+        scratch["demb"] = pltpu.VMEM((1, M, H // 2), U32)   # embed rows (u32 pairs; 3-D: row DMAs)
         scratch["lm_sem"] = pltpu.SemaphoreType.DMA(())
         scratch["carry"] = pltpu.VMEM((XR, H), F32)      # next pass's previous hidden rows
         scratch["dsend"] = pltpu.VMEM((XR, 128), I32)
@@ -498,8 +501,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         scratch["tokv"] = pltpu.VMEM((XR, 128), I32)
         scratch["tok_s"] = pltpu.SMEM((XR, 128), I32)
         scratch["d_send"] = pltpu.SemaphoreType.DMA(())
-        # this pass's metadata, copied in the target's operand shapes (ref views of the [3, ...]
-        # inputs crash Mosaic's relayout insertion at FULL)
+        # this pass's metadata, copied in the target's operand shapes
         scratch["scal_s"] = pltpu.SMEM((8,), I32)
         scratch["rmeta_s"] = pltpu.SMEM((TMAX, 8), I32)
         scratch["qmeta_s"] = pltpu.SMEM((BMAX, 4), I32)
@@ -570,17 +572,19 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
                 def cr(t_, c):
                     for j_ in range(8):
-                        rmeta[t_, j_] = rmeta_a[p_, t_, j_]
+                        rmeta[t_, j_] = rmeta_a[p_ * TMAX + t_, j_]
                     return c
                 lax.fori_loop(0, TMAX, cr, 0)
 
                 def cq(b_, c):
                     for j_ in range(4):
-                        qmeta[b_, j_] = qmeta_a[p_, b_, j_]
+                        qmeta[b_, j_] = qmeta_a[p_ * BMAX + b_, j_]
                     return c
                 lax.fori_loop(0, BMAX, cq, 0)
-                rvec[...] = rvec_a[p_]
-                rope_tab[...] = tab_a[p_]
+                r0_ = pl.multiple_of(p_ * M, 8)
+                rvec[...] = rvec_a[pl.ds(r0_, M), :]
+                for i_ in range(4):
+                    rope_tab[i_] = tab_a[p_ * 4 + i_]
             load_pass(0)
         W, C, WS, CS = {}, {}, {}, {}
         for (k, l), r in zip(w_names, w_in):
@@ -1829,7 +1833,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
             def per_req_u(b, off):
                 return lax.cond(qmeta[b, 3] > 0,
-                                lambda: build_union(b, off, rn=req_new(b, lambda r_, k_: qmeta_a[0, r_, k_])),
+                                lambda: build_union(b, off, rn=req_new(b, lambda r_, k_: qmeta_a[r_, k_])),
                                 lambda: off)
             lax.fori_loop(0, B, per_req_u, jnp.int32(0))
             cpu = [pltpu.make_async_copy(scr["own_u"], scr["own_uv"], scr["misc_sem"]),
@@ -1849,17 +1853,19 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             """x = eh_proj([enorm(embed(tok)); hnorm(prev)]) -> this rank's owner rows of h (res = 0).
             embed: the owning vocab shard DMAs the row, RS sums the (one-hot) partials onto owners,
             AG to all ranks; eh_proj: this rank's H/R output columns, RS of the column blocks."""
-            scr["xbf"][...] = jnp.zeros((M, H), BF16)
+            scr["demb"][...] = jnp.zeros((1, M, H // 2), U32)
             for t_ in range(TMAX):
                 tok = tok_of(t_)
 
                 @pl.when(jnp.logical_and(valid_of(t_), tok // VR == me))
                 def _(t_=t_, tok=tok):
-                    c_ = pltpu.make_async_copy(emb_h.at[pl.ds(tok - me * VR, 1)], scr["xbf"].at[pl.ds(t_, 1)],
+                    c_ = pltpu.make_async_copy(emb_h.at[pl.ds(tok - me * VR, 1)], scr["demb"].at[0, pl.ds(t_, 1)],
                                                scr["lm_sem"])
                     c_.start()
                     c_.wait()
-            e_own = reduce_scatter_rows(scr["xbf"][...].astype(F32), "rso_send", "rso_recv")
+            w_ = scr["demb"][0]                                                  # [M, H/2] u32 pairs
+            e_own = reduce_scatter_rows(jnp.concatenate([unpack_lo(w_), unpack_hi(w_)], axis=1),
+                                        "rso_send", "rso_recv")
             E = gather_rows_all(own_rows_pad(e_own), "ag_send", "ag_recv")          # [M, H]
             en = rmsnorm(E, sm(slot, "enorm"), cfg.eps).astype(BF16)
             hn_ = rmsnorm(prev, sm(slot, "hnorm"), cfg.eps).astype(BF16)
@@ -1935,7 +1941,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 if M > XR:
                     prev = jnp.concatenate([prev, jnp.zeros((M - XR, H), F32)], axis=0)
                 draft_prologue(lambda t_: scr["tok_s"][t_, 0] if t_ < XR else jnp.int32(0),
-                               lambda t_: rmeta_a[l1, t_, 0] > 0 if t_ < XR else jnp.bool_(False), prev, slot)
+                               lambda t_: rmeta_a[l1 * TMAX + t_, 0] > 0 if t_ < XR else jnp.bool_(False), prev, slot)
 
         # ---------------- step ----------------
         pltpu.make_async_copy(smalls.at[0], scr["sm"].at[0], scr["sm_sem"].at[0]).start()
