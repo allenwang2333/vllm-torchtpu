@@ -23,6 +23,17 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.sparse_core import core_map_helper
 
+_BF16_UPPER_MASK_INT = (2**16 - 1) << 16
+_COMPILER_PARAMS = pltpu.CompilerParams(
+    use_tc_tiling_on_sc=True,
+    disable_bounds_checks=True,
+    # Mosaic's apply-vector-layout pass rejects this kernel's
+    # i32<->f32 bitcast; JAX 0.10.2 flipped `needs_layout_passes` to
+    # True by default (jax commit 7ca29680b), so pin it False here.
+    needs_layout_passes=False,
+)
+_DMA_SEM_2 = pltpu.SemaphoreType.DMA((2,))
+
 
 # ceil up to the nearest multiple of b.
 def _align_to(a, b):
@@ -80,7 +91,7 @@ def _pad_inputs_if_needed(
     return x, indices, topk_weights, valid_rows_mask
 
 
-@functools.lru_cache(maxsize=64)
+@functools.cache
 def _calculate_num_col_column_partitions(
     hidden_size: int, num_cores: int, num_lanes: int
 ) -> int:
@@ -140,6 +151,14 @@ def main_kernel(
     recv_sem = sem_ref.at[0]
     send_sem = sem_ref.at[1]
 
+    in_dtype = in_hbm_ref.dtype
+    input_dtype_bits = jax.dtypes.itemsize_bits(in_dtype)
+    input_packing = 32 // input_dtype_bits
+    bf16_upper_mask = jnp.uint32(_BF16_UPPER_MASK_INT)
+    in_32b_hbm_ref = in_hbm_ref.bitcast(jnp.uint32)
+    out_32b_hbm_ref = out_hbm_ref.bitcast(jnp.uint32)
+    row_partition_size = in_hbm_ref.shape[0] // num_row_partitions
+
     # TODO(gxd): Investigate on using `pl.Indirect`, which may bring us additional
     # performance benefit.
     @functools.partial(
@@ -150,7 +169,6 @@ def main_kernel(
     )
     def inner_kernel():
         core_id = pl.program_id(0)
-        row_partition_size = in_hbm_ref.shape[0] // num_row_partitions
         row_partition_id = core_id // num_column_partitions
         col_partition_id = core_id % num_column_partitions
 
@@ -176,17 +194,6 @@ def main_kernel(
         row_start = row_partition_id * row_partition_size
         col_start = col_partition_id * col_size
 
-        in_dtype = in_hbm_ref.dtype
-        input_dtype_bits = jax.dtypes.itemsize_bits(in_dtype)
-        input_packing = 32 // input_dtype_bits
-
-        in_32b_hbm_ref = in_hbm_ref.bitcast(  # pyrefly: ignore[missing-attribute]
-            jnp.uint32
-        )
-        out_32b_hbm_ref = out_hbm_ref.bitcast(  # pyrefly: ignore[missing-attribute]
-            jnp.uint32
-        )
-
         @pl.loop(0, num_row_tiles)
         def row_loop(row_block_id):
             row_tile_start = row_start + row_block_id * num_simd_lanes
@@ -195,57 +202,48 @@ def main_kernel(
             prev_dst_row_hbm = jnp.where(
                 row_block_id == 0, -1, dst_indices_vmem_ref[...][num_simd_lanes - 1]
             )
-            dma_list = []
-            dma_list.append(
-                pltpu.make_async_copy(
-                    sorted_by_validity_hbm_ref.at[
-                        pl.ds(row_tile_start, num_simd_lanes)
-                    ],
-                    sorted_by_validity_vmem_ref,
-                    recv_sem,
-                )
+            dma_val = pltpu.make_async_copy(
+                sorted_by_validity_hbm_ref.at[pl.ds(row_tile_start, num_simd_lanes)],
+                sorted_by_validity_vmem_ref,
+                recv_sem,
             )
-            dma_list.append(
-                pltpu.make_async_copy(
-                    dst_indices_hbm_ref.at[pl.ds(row_tile_start, num_simd_lanes)],
-                    dst_indices_vmem_ref,
-                    recv_sem,
-                )
+            dma_dst = pltpu.make_async_copy(
+                dst_indices_hbm_ref.at[pl.ds(row_tile_start, num_simd_lanes)],
+                dst_indices_vmem_ref,
+                recv_sem,
             )
-            for dma in dma_list:
-                dma.start()
-            for dma in dma_list:
-                dma.wait()
+            dma_val.start()
+            dma_dst.start()
+            dma_val.wait()
+            dma_dst.wait()
 
-            dma_list = []
-            dma_list.append(
-                pltpu.make_async_copy(
-                    topk_weights_hbm_ref.at[sorted_by_validity_vmem_ref],
-                    topk_weights_vmem_ref,
-                    recv_sem,
-                )
+            dma_weights = pltpu.make_async_copy(
+                topk_weights_hbm_ref.at[sorted_by_validity_vmem_ref],
+                topk_weights_vmem_ref,
+                recv_sem,
             )
-            dma_list.append(
-                pltpu.make_async_copy(
-                    indices_hbm_ref.at[sorted_by_validity_vmem_ref],
-                    src_indices_vmem_ref,
-                    recv_sem,
-                )
+            dma_src = pltpu.make_async_copy(
+                indices_hbm_ref.at[sorted_by_validity_vmem_ref],
+                src_indices_vmem_ref,
+                recv_sem,
             )
-            for dma in dma_list:
-                dma.start()
-            for dma in dma_list:
-                dma.wait()
+            dma_weights.start()
+            dma_src.start()
+            dma_weights.wait()
+            dma_src.wait()
 
             # HBM to VMEM transfer.
             src_indices = src_indices_vmem_ref[...]
             dst_indices = dst_indices_vmem_ref[...]
             topk_weights = topk_weights_vmem_ref[...]
+            rows_hbm = [
+                src_indices[row_vmem] // input_packing
+                for row_vmem in range(num_simd_lanes)
+            ]
 
             for col_vmem_start in range(0, col_size, num_lanes):
                 col_hbm_start = col_start + col_vmem_start
-                for row_vmem in range(num_simd_lanes):
-                    row_hbm = src_indices[row_vmem] // input_packing
+                for row_vmem, row_hbm in enumerate(rows_hbm):
                     # Since we have changed layout from (8, 128) to (1, 128), continuous
                     # memory addresss does not yield desired values anymore. Therefore,
                     # we break up a dmas into multiple num_lanes sized requests.
@@ -254,6 +252,50 @@ def main_kernel(
                         out_vmem_ref.at[row_vmem, pl.ds(col_vmem_start, num_lanes)],
                         recv_sem,
                     ).start()
+
+            # Precompute write row pairs once per row tile (independent of
+            # col_vmem_start).
+            src_row_idx_in_vmem = []
+            row_valid_vec = []
+            base_row_idx = row_block_id * num_simd_lanes
+            for row_vmem_idx in reversed(range(num_simd_lanes)):
+                row_valid = (
+                    base_row_idx + row_vmem_idx
+                ) < num_rows_current_row_partition
+                row_valid_vec.append(row_valid)
+                if row_vmem_idx == num_simd_lanes - 1:
+                    src_row_idx_in_vmem.append(row_vmem_idx)
+                else:
+                    next_row_valid = row_valid_vec[-2]
+                    valid_data_in_next_row_vmem = jnp.logical_and(
+                        next_row_valid,
+                        dst_indices[row_vmem_idx] == dst_indices[row_vmem_idx + 1],
+                    )
+                    src_row_idx_in_vmem.append(
+                        jnp.where(
+                            valid_data_in_next_row_vmem,
+                            src_row_idx_in_vmem[-1],
+                            row_vmem_idx,
+                        )
+                    )
+            src_row_idx_in_vmem.reverse()
+            row_valid_vec.reverse()
+
+            write_row_pairs = []
+            last_valid_src_row_vmem = -1
+            last_valid_dst_row_hbm = -1
+            for i, (src_row_idx, row_valid) in enumerate(
+                zip(src_row_idx_in_vmem, row_valid_vec, strict=True)
+            ):
+                src_row_vmem = jnp.where(
+                    row_valid, src_row_idx, last_valid_src_row_vmem
+                )
+                dst_row_hbm = jnp.where(
+                    row_valid, dst_indices[i], last_valid_dst_row_hbm
+                )
+                write_row_pairs.append((src_row_vmem, dst_row_hbm))
+                last_valid_src_row_vmem = src_row_vmem
+                last_valid_dst_row_hbm = dst_row_hbm
 
             # VMEM to HBM transfer.
             # Use dynamic loop to minimize register spills.
@@ -276,17 +318,16 @@ def main_kernel(
 
                     previous_accumulated_data = None
                     for row_src in range(num_simd_lanes):
-                        row_src_pack = src_indices[row_src] % input_packing
-
                         # Load data from vmem.
                         data = out_vmem_ref[row_src, col_slice]
 
                         # Extract data and cast to float32.
                         if in_dtype == jnp.bfloat16:
+                            row_src_pack = src_indices[row_src] % input_packing
                             shift_bits = jnp.where(row_src_pack == 0, 16, 0)
                             data = jnp.bitwise_left_shift(data, shift_bits)
                             # Mask out the lower 16 bits.
-                            data = jnp.bitwise_and(data, jnp.uint32((2**16 - 1) << 16))
+                            data = jnp.bitwise_and(data, bf16_upper_mask)
                             data = plsc.bitcast(data, jnp.float32)
                         elif in_dtype == jnp.float32:
                             data = plsc.bitcast(data, jnp.float32)
@@ -331,57 +372,7 @@ def main_kernel(
                         if row_src == num_simd_lanes - 1:
                             prev_iter_last_row_vmem_ref[0, col_slice] = data_to_write
 
-                # Start dma write.
-                # When there are multiple sources rows in the current row_tile that
-                # contribute to the same destination row, the accumulated data is
-                # stored in the last row's idx in `out_vmem_ref`.
-                # Logically, we could skip all the source rows that are not the last
-                # for each destination row, but we want to avoid using `pl.when` for
-                # efficiency. We just repeat the write of lastest accumulated data
-                # multiple times.
-                # `src_row_idx_in_vmem` tracks the right idx in vmem for each hbm write.
-                src_row_idx_in_vmem: list[int | jax.Array] = []
-                row_valid_vec = []
-                for row_vmem_idx in reversed(range(num_simd_lanes)):
-                    row_idx = row_block_id * num_simd_lanes + row_vmem_idx
-                    row_valid = row_idx < num_rows_current_row_partition
-                    row_valid_vec.append(row_valid)
-                    if row_vmem_idx == num_simd_lanes - 1:
-                        src_row_idx_in_vmem.append(row_vmem_idx)
-                    else:
-                        next_row_valid = row_valid_vec[-2]
-                        valid_data_in_next_row_vmem = jnp.logical_and(
-                            next_row_valid,
-                            (
-                                dst_indices[row_vmem_idx]
-                                == dst_indices[row_vmem_idx + 1]
-                            ),
-                        )
-                        src_row_idx_in_vmem.append(
-                            jnp.where(
-                                valid_data_in_next_row_vmem,
-                                src_row_idx_in_vmem[-1],
-                                row_vmem_idx,
-                            )
-                        )
-                src_row_idx_in_vmem.reverse()
-                row_valid_vec.reverse()
-
-                # There must be at least one valid row to write in the current row_tile.
-                # When num valid writes is not a multiple of row_tile_size, we repeat
-                # the last valid write to avoid valid data in hbm being overwritten
-                # (and to avoid using `pl.when`).
-                last_valid_src_row_vmem = -1
-                last_valid_dst_row_hbm = -1
-                for i, (src_row_idx, row_valid) in enumerate(
-                    zip(src_row_idx_in_vmem, row_valid_vec, strict=True)
-                ):
-                    src_row_vmem = jnp.where(
-                        row_valid, src_row_idx, last_valid_src_row_vmem
-                    )
-                    dst_row_hbm = jnp.where(
-                        row_valid, dst_indices[i], last_valid_dst_row_hbm
-                    )
+                for src_row_vmem, dst_row_hbm in write_row_pairs:
                     pltpu.make_async_copy(
                         out_vmem_ref.at[src_row_vmem, pl.ds(col_vmem_start, num_lanes)],
                         out_32b_hbm_ref.at[
@@ -389,8 +380,6 @@ def main_kernel(
                         ],
                         send_sem,
                     ).start()
-                    last_valid_src_row_vmem = src_row_vmem
-                    last_valid_dst_row_hbm = dst_row_hbm
 
                 return carry
 
@@ -425,10 +414,7 @@ def _preprocess(
         ~valid_rows_mask, descending=False, stable=True, axis=-1
     )
     sorted_by_validity += (
-        jnp.broadcast_to(
-            jnp.arange(num_row_partitions)[:, None],
-            (num_row_partitions, row_partition_size),
-        )
+        jnp.arange(num_row_partitions, dtype=sorted_by_validity.dtype)[:, None]
         * row_partition_size
     )
     sorted_by_validity = sorted_by_validity.reshape(-1)
@@ -438,12 +424,14 @@ def _preprocess(
     dst_indices = sorted_by_validity // reduce_group_size
     sorted_by_validity = sorted_by_validity.astype(jnp.int32)
 
-    num_src_rows_per_row_partition = jnp.sum(valid_rows_mask, axis=-1)
     assert num_row_partitions <= num_simd_lanes
-    num_src_rows_per_row_partition = jnp.pad(
-        num_src_rows_per_row_partition.astype(jnp.int32),
-        (0, num_simd_lanes - num_row_partitions),
-    )
+    num_src_rows_per_row_partition = jnp.sum(valid_rows_mask, axis=-1, dtype=jnp.int32)
+    pad_partitions = num_simd_lanes - num_row_partitions
+    if pad_partitions > 0:
+        num_src_rows_per_row_partition = jnp.pad(
+            num_src_rows_per_row_partition,
+            (0, pad_partitions),
+        )
     # If there is no valid source row in a reduce group, we set the mask to
     # False, so that the output for that group is set to zero.
     mask = jnp.any(valid_rows_mask.reshape(-1, reduce_group_size), axis=-1)
@@ -498,7 +486,8 @@ def ragged_gather_reduce(
         "ragged_gather_reduce only supports 1d valid_rows_mask."
     )
 
-    sc_info = pltpu.get_tpu_info().sparse_core
+    tpu_info = pltpu.get_tpu_info()
+    sc_info = tpu_info.sparse_core
     if sc_info is None:
         return _fallback_implementation(
             x, indices, topk_weights, valid_rows_mask, reduce_group_size
@@ -507,7 +496,7 @@ def ragged_gather_reduce(
     # Heuristic threshold on whether to fallback for small inputs.
     dtype = x.dtype
     dtype_bytes = jax.dtypes.itemsize_bits(dtype) // 8
-    if jnp.size(x) * dtype_bytes * 2 < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6:
+    if jnp.size(x) * dtype_bytes * 2 < tpu_info.vmem_capacity_bytes * 0.6:
         # For small {input + output}, it's likely that both can be put in TC VMEM,
         # so it's likely faster to run TC-based implementation on it than going
         # through SC, without data movement to/from HBM.
@@ -531,7 +520,7 @@ def ragged_gather_reduce(
     # imbalanced load (valid_rows_mask may have more rows in some partitions than
     # others).
     num_column_partitions = _calculate_num_col_column_partitions(
-        hidden_size, num_cores, pltpu.get_tpu_info().num_lanes
+        hidden_size, num_cores, tpu_info.num_lanes
     )
     assert num_cores % num_column_partitions == 0
     num_row_partitions = num_cores // num_column_partitions
@@ -581,14 +570,7 @@ def ragged_gather_reduce(
             (x.shape[0] // reduce_group_size, x.shape[1]),
             jnp.float32,
         ),
-        compiler_params=pltpu.CompilerParams(
-            use_tc_tiling_on_sc=True,
-            disable_bounds_checks=True,
-            # Mosaic's apply-vector-layout pass rejects this kernel's
-            # i32<->f32 bitcast; JAX 0.10.2 flipped `needs_layout_passes` to
-            # True by default (jax commit 7ca29680b), so pin it False here.
-            needs_layout_passes=False,
-        ),
+        compiler_params=_COMPILER_PARAMS,
         scratch_types=dict(
             num_rows_per_row_partition_vmem_ref=pltpu.VMEM(
                 (num_simd_lanes,), jnp.int32
@@ -599,7 +581,7 @@ def ragged_gather_reduce(
             dst_indices_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
             topk_weights_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.float32),
             sorted_by_validity_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
-            sem_ref=pltpu.SemaphoreType.DMA((2,)),
+            sem_ref=_DMA_SEM_2,
         ),
         mesh=vector_mesh,
         name="sc_ragged_gather_reduce",
@@ -608,14 +590,21 @@ def ragged_gather_reduce(
         x,
         indices,
         dst_indices,
-        topk_weights.astype(jnp.float32),
+        topk_weights.astype(jnp.float32)
+        if topk_weights.dtype != jnp.float32
+        else topk_weights,
         sorted_by_validity,
     )
 
     # If there is no valid source row in a reduce group, set that group's output
     # to zero.
+    out_rows = input_size // reduce_group_size
+    if out.shape[0] != out_rows or out.shape[1] != hidden_size:
+        out = out[:out_rows, :hidden_size]
+        mask = mask[:out_rows]
+    out_cast = out.astype(dtype)
     return jnp.where(
         mask[:, None],
-        out.astype(x.dtype),
-        jnp.zeros_like(out, dtype=x.dtype),
-    )[: (input_size // reduce_group_size), :hidden_size]
+        out_cast,
+        jnp.zeros_like(out_cast),
+    )

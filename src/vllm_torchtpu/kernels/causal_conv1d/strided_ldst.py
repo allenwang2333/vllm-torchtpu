@@ -25,26 +25,28 @@ def load_large_to_compact(vmem_ref, dst_dtype: jnp.dtype | None = None) -> jax.A
 
     row_size = vmem_ref.shape[0]
     src_dtype = vmem_ref.dtype
-    should_unpack = dst_dtype is not None and dst_dtype != src_dtype
     packing = 4 // src_dtype.itemsize
 
-    unpacked_list = []
-    for row_start in range(0, row_size, packing):
-        row_end = row_start + packing
-        if should_unpack:
-            packed_row = row_start // packing
-            u32_vmem_ref = vmem_ref.bitcast(jnp.uint32)
+    if dst_dtype is not None and dst_dtype != src_dtype:
+        u32_vmem_ref = vmem_ref.bitcast(jnp.uint32)
+        unpacked_list = []
+        for packed_row in range(row_size // packing):
             packed = u32_vmem_ref[packed_row : packed_row + 1]
-
             for p in range(packing):
-                unpacked = pltpu.unpack_elementwise(
-                    packed,
-                    index=p,
-                    packed_dtype=src_dtype,
-                    unpacked_dtype=dst_dtype,
+                unpacked_list.append(
+                    pltpu.unpack_elementwise(
+                        packed,
+                        index=p,
+                        packed_dtype=src_dtype,
+                        unpacked_dtype=dst_dtype,
+                    )
                 )
-                unpacked_list.append(unpacked)
-        else:
-            unpacked_list.append(vmem_ref[row_start:row_end])
+        return jnp.stack(unpacked_list, axis=0)
 
-    return jnp.stack(unpacked_list, axis=0)
+    return jnp.stack(
+        [
+            vmem_ref[row_start : row_start + packing]
+            for row_start in range(0, row_size, packing)
+        ],
+        axis=0,
+    )

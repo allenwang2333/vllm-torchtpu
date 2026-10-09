@@ -36,6 +36,10 @@ def _empty_out_ref(out_type):
     return jax_core.new_ref(value, memory_space=memory_space)
 
 
+def _deref(ref):
+    return ref[...]
+
+
 def kernel(
     body,
     *,
@@ -56,26 +60,27 @@ def kernel(
     """
     single_output = not isinstance(out_type, (tuple, list))
     out_types = (out_type,) if single_output else out_type
+    core_map_decorator = pl_core.core_map(
+        mesh,
+        scratch_shapes=scratch_types,
+        compiler_params=compiler_params,
+        interpret=interpret,
+        cost_estimate=cost_estimate,
+        debug=debug,
+        name=name,
+        metadata=metadata,
+    )
 
     @api.jit
     def run(*operands):
         arg_refs = tree_util.tree_map(jax_core.new_ref, operands)
         out_refs = tree_util.tree_map(_empty_out_ref, out_types)
 
-        @pl_core.core_map(
-            mesh,
-            scratch_shapes=scratch_types,
-            compiler_params=compiler_params,
-            interpret=interpret,
-            cost_estimate=cost_estimate,
-            debug=debug,
-            name=name,
-            metadata=metadata,
-        )
+        @core_map_decorator
         def _(*scratch_refs, **scratch_kwrefs):
             return body(*arg_refs, *out_refs, *scratch_refs, **scratch_kwrefs)
 
-        outs = tree_util.tree_map(lambda ref: ref[...], out_refs)
+        outs = tree_util.tree_map(_deref, out_refs)
         return outs[0] if single_output else outs
 
     return run
