@@ -22,6 +22,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.experimental.routing_moe.common import layout_util
 from vllm_torchtpu.kernels.experimental.routing_moe.gmm import (
   config,
   memory_ref,
@@ -134,7 +135,7 @@ def routing_gmm(
   # Step 5: Call kernel.
   return pl.kernel(
       functools.partial(pipeline.outer_pipeline, cfg=cfg),
-      mesh=pltpu.TensorCoreMesh(axis_name="core", num_cores=1),
+      mesh=layout_util.create_tensorcore_mesh(axis_name="core", num_cores=1),
       out_type=out,
       compiler_params=pltpu.CompilerParams(
           vmem_limit_bytes=cfg.tpu_info.vmem_capacity_bytes,

@@ -146,7 +146,7 @@ def input_pack(x: jax.Array, tile_size: int = 256) -> jax.Array:
   return pl.kernel(
       outer_kernel,
       out_type=jax.ShapeDtypeStruct(out_shape, x_dtype),
-      mesh=pltpu.TensorCoreMesh(axis_name="core", num_cores=1),
+      mesh=layout_util.create_tensorcore_mesh(axis_name="core", num_cores=1),
       scratch_types=(
           pltpu.VMEM((num_buffers, tile_size, dim_size), x_dtype),
           pltpu.VMEM(

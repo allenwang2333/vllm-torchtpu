@@ -21,6 +21,19 @@ from jax.experimental import hijax
 from jax.experimental.pallas import tpu as pltpu
 
 
+def create_tensorcore_mesh(axis_name: str = "core", num_cores: int = 1):
+  """Compat helper for TensorCoreMesh across different JAX versions."""
+  if hasattr(pltpu, "create_tensorcore_mesh"):
+    return pltpu.create_tensorcore_mesh(axis_name, num_cores=num_cores)
+  if hasattr(pltpu, "TensorCoreMesh"):
+    return pltpu.TensorCoreMesh(axis_name=axis_name, num_cores=num_cores)
+  raise RuntimeError(
+      "Neither create_tensorcore_mesh nor TensorCoreMesh available in"
+      " jax.experimental.pallas.tpu"
+  )
+
+
+
 def get_uint_dtype(itemsize: int) -> jnp.dtype:
   match itemsize:
     case 4:
