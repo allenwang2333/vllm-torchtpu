@@ -31,9 +31,6 @@ from jax.sharding import PartitionSpec as P
 from torch._subclasses.fake_tensor import FakeTensorMode
 from vllm.config.utils import Range
 
-from tests.compilation.test_tpu_compiler import *  # noqa: F401, F403
-from tests.worker.test_runai_repull import *  # noqa: F401, F403
-from tests.worker.test_tpu_worker_rank_binding import *  # noqa: F401, F403
 from vllm_torchtpu.compilation import tpu_compiler as tc
 from vllm_torchtpu.kernels.flash_attention import tuned_params
 from vllm_torchtpu.kernels.ragged_paged_attention.v2 import (
