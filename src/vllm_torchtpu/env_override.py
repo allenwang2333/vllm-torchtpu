@@ -69,30 +69,25 @@ if (
     os.getenv("TPU_KV_RESHARD_TRANSPORT") == "raiden"
     or os.getenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER") == "1"
 ):
-    os.environ.setdefault("TPU_PREMAPPED_BUFFER_SIZE", str(16 << 30))
-
-# TPU_GDN_CONV_QK_PAIR_LAYOUT resolves in two layers:
-#   1. An explicitly set value always wins (enable or disable), for both
-#      raiden and non-raiden runs — hence setdefault below.
-#   2. Otherwise, when the Raiden reshard stack is enabled, the layout
-#      follows the reshard's source fan-in: enabled iff
-#      TPU_RAIDEN_TRANSFER_PARALLELISM >= 8.  At such degrees a rank's
-#      conv Q and K segments are sub-token (512 B halves of the 1024-byte
-#      physical pool token under TP8), so only the pair-blocked layout
-#      gives whole-token — placement-exact — raw transfer spans; at lower
-#      source degrees the segment-major layout is already token-aligned.
-# The fan-in is parsed exactly like envs.TPU_RAIDEN_TRANSFER_PARALLELISM
-# (unset/empty means the default degree of 8 — keep the two in sync), so
-# the layout decision and the transfer stack always agree; today that
-# makes the pair layout the raiden default.  The launcher exports the
-# variable identically on both roles, so producer and consumer resolve the
-# same layout; a mismatched pair still fails closed through the layout
-# fingerprint.  An unparsable value raises here, at startup, rather than
-# letting the two readers diverge.
-if (
-    os.getenv("TPU_KV_RESHARD_TRANSPORT") == "raiden"
-    or os.getenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER") == "1"
-):
+    os.environ.setdefault("TPU_PREMAPPED_BUFFER_SIZE", "17179869184")
+    # TPU_GDN_CONV_QK_PAIR_LAYOUT resolves in two layers:
+    #   1. An explicitly set value always wins (enable or disable), for both
+    #      raiden and non-raiden runs — hence setdefault below.
+    #   2. Otherwise, when the Raiden reshard stack is enabled, the layout
+    #      follows the reshard's source fan-in: enabled iff
+    #      TPU_RAIDEN_TRANSFER_PARALLELISM >= 8.  At such degrees a rank's
+    #      conv Q and K segments are sub-token (512 B halves of the 1024-byte
+    #      physical pool token under TP8), so only the pair-blocked layout
+    #      gives whole-token — placement-exact — raw transfer spans; at lower
+    #      source degrees the segment-major layout is already token-aligned.
+    # The fan-in is parsed exactly like envs.TPU_RAIDEN_TRANSFER_PARALLELISM
+    # (unset/empty means the default degree of 8 — keep the two in sync), so
+    # the layout decision and the transfer stack always agree; today that
+    # makes the pair layout the raiden default.  The launcher exports the
+    # variable identically on both roles, so producer and consumer resolve the
+    # same layout; a mismatched pair still fails closed through the layout
+    # fingerprint.  An unparsable value raises here, at startup, rather than
+    # letting the two readers diverge.
     _raiden_transfer_degree = int(os.getenv("TPU_RAIDEN_TRANSFER_PARALLELISM") or "8")
     if _raiden_transfer_degree >= 8:
         os.environ.setdefault("TPU_GDN_CONV_QK_PAIR_LAYOUT", "1")
@@ -158,13 +153,18 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
 
 
 _existing_libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "")
+_SC_OFFLOAD_FLAG_NAMES = (
+    "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
+    "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
+)
 
 
 def _user_has_flag(flag_name: str) -> bool:
     # Tokenized startswith("<flag>=") check so a hypothetical longer flag
     # that embeds ours as a prefix doesn't false-positive.
+    flag_prefix = flag_name + "="
     return any(
-        token.startswith(flag_name + "=") or token == flag_name
+        token.startswith(flag_prefix) or token == flag_name
         for token in _existing_libtpu_args.split()
     )
 
@@ -185,10 +185,7 @@ if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
 # each flag is added only if the user hasn't supplied it explicitly.
 _sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
 if _sc_offload_bytes is not None:
-    for _flag_name in (
-        "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
-        "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
-    ):
+    for _flag_name in _SC_OFFLOAD_FLAG_NAMES:
         if not _user_has_flag(_flag_name):
             _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
 

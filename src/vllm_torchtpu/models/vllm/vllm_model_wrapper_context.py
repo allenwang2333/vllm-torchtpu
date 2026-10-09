@@ -19,7 +19,7 @@ import torch
 from jax.sharding import Mesh
 
 
-@dataclass
+@dataclass(slots=True)
 class VllmModelWrapperContext:
     # TODO need discussion, ullm use this context to manager kv_caches
     # while vllm binds the KV cache to the attention layer

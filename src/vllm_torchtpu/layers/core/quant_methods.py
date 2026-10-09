@@ -1,3 +1,5 @@
+import functools
+
 UNQUANTIZED = "unquantized"
 MXFP4 = "mxfp4"
 AWQ = "awq"
@@ -9,5 +11,6 @@ NVFP4 = "modelopt_fp4"
 DEEPSEEK_V4_FP8 = "deepseek_v4_fp8"
 
 
+@functools.lru_cache(maxsize=32)
 def get_tpu_quant_method(quant_method: str) -> str:
-    return "tpu-" + quant_method
+    return f"tpu-{quant_method}"

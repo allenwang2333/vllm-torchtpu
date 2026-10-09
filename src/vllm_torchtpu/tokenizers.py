@@ -45,8 +45,11 @@ def _tpu_deepseek_v4_tokenizer(tokenizer):
                 # The parent renders the conversation from kwargs when it is
                 # there, so the marked copy goes back the same way.
                 conversation = list(kwargs.get("conversation", messages))
-                if conversation and conversation[-1].get("role") == "assistant":
-                    conversation[-1] = {**conversation[-1], "wo_eos": True}
+                if (
+                    conversation
+                    and (last_msg := conversation[-1]).get("role") == "assistant"
+                ):
+                    conversation[-1] = {**last_msg, "wo_eos": True}
                 kwargs["conversation"] = conversation
             return super().apply_chat_template(messages, tools, **kwargs)
 

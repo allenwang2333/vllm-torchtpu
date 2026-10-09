@@ -7,6 +7,11 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.chip_topology import hierarchical_moe_split
 from vllm_torchtpu.logger import init_logger
@@ -23,15 +28,10 @@ def hierarchical_split_or_none() -> tuple[int, int, int, int] | None:
     if not envs.TPU_MOE_HIERARCHICAL_EP:
         return None
 
-    from vllm.distributed import (
-        get_tensor_model_parallel_rank,
-        get_tensor_model_parallel_world_size,
-    )
-
     world_size = get_tensor_model_parallel_world_size()
-    rank = get_tensor_model_parallel_rank()
     if world_size <= 1:
         return None
+    rank = get_tensor_model_parallel_rank()
 
     split = hierarchical_moe_split(world_size, rank)
     if split is None:
@@ -47,15 +47,18 @@ def hierarchical_split_or_none() -> tuple[int, int, int, int] | None:
 _filter_patched = False
 
 
-def align_ep_weight_filter() -> None:
+def align_ep_weight_filter(
+    split: tuple[int, int, int, int] | None = None,
+) -> None:
     """Teach ``--enable-ep-weight-filter`` the chip-block expert ownership."""
     global _filter_patched
     if _filter_patched:
         return
 
-    split = hierarchical_split_or_none()
     if split is None:
-        return
+        split = hierarchical_split_or_none()
+        if split is None:
+            return
     chip_ep_size, chip_ep_rank, _, _ = split
 
     from vllm.model_executor.model_loader import default_loader
@@ -110,7 +113,7 @@ def hierarchical_moe_parallel_config():
 
     # Safe here: the loader calls _init_ep_weight_filter from load_weights,
     # which runs after the model is constructed, so this lands in time.
-    align_ep_weight_filter()
+    align_ep_weight_filter(split)
 
     logger.info_once(
         "Hierarchical MoE parallelism: EP between chips (ep_size=%d, "

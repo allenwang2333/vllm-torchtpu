@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from torch_tpu._internal.stream.streams import TpuEvent
 
 
-@dataclass
+@dataclass(slots=True)
 class _PendingTiming:
     stage: str
     start: TpuEvent
@@ -23,6 +23,14 @@ class _PendingTiming:
 
 class RunnerStageTiming:
     MAX_IN_FLIGHT_DEVICE_TIMINGS = 1024
+    __slots__ = (
+        "_cpu_samples",
+        "_device_samples",
+        "_pending",
+        "_rank",
+        "_samples_lock",
+        "_slots",
+    )
 
     def __init__(self, rank: int):
         self._rank = str(rank)
@@ -40,22 +48,28 @@ class RunnerStageTiming:
         threading.Thread(target=self._collect_device_time, daemon=True).start()
 
     def _collect_device_time(self) -> None:
+        perf_counter = time.perf_counter
+        pending_get = self._pending.get
+        samples_lock = self._samples_lock
+        release_slot = self._slots.release
+        rank = self._rank
         while True:
-            pending = self._pending.get()
+            pending = pending_get()
             pending.start.synchronize()
-            start_time = time.perf_counter()
+            start_time = perf_counter()
             pending.end_recorded.wait()
             pending.end.synchronize()
-            seconds = time.perf_counter() - start_time
-            with self._samples_lock:
-                self._device_samples.append((self._rank, pending.stage, seconds))
-            self._slots.release()
+            seconds = perf_counter() - start_time
+            with samples_lock:
+                self._device_samples.append((rank, pending.stage, seconds))
+            release_slot()
 
     @contextlib.contextmanager
     def host_stage(self, stage: str) -> Iterator[None]:
-        cpu_start = time.perf_counter()
+        perf_counter = time.perf_counter
+        cpu_start = perf_counter()
         yield
-        self._cpu_samples.append((self._rank, stage, time.perf_counter() - cpu_start))
+        self._cpu_samples.append((self._rank, stage, perf_counter() - cpu_start))
 
     @contextlib.contextmanager
     def stage(self, stage: str) -> Iterator[None]:
@@ -64,17 +78,18 @@ class RunnerStageTiming:
                 yield
             return
 
+        perf_counter = time.perf_counter
         start = TpuEvent()
         end = TpuEvent()
         start.record()
         pending = _PendingTiming(stage, start, end)
         self._pending.put_nowait(pending)
-        cpu_start = time.perf_counter()
+        cpu_start = perf_counter()
         # Close the queued timing even when the stage body raises.
         try:
             yield
         finally:
-            cpu_elapsed = time.perf_counter() - cpu_start
+            cpu_elapsed = perf_counter() - cpu_start
             end.record()
             pending.end_recorded.set()
             self._cpu_samples.append((self._rank, stage, cpu_elapsed))
