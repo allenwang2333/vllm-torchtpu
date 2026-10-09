@@ -250,7 +250,7 @@ class TestHostEngram:
 
         # 1. Fallback to default gather_engram_hashes when dp_shared_memory=True
         with patch(
-            "vllm.models.deepseek_v41.nvidia.engram.gather_engram_hashes",
+            "vllm.models.deepseek_v41.common.engram.gather_engram_hashes",
             side_effect=lambda x, **kw: x,
         ) as mock_default_gather:
             out = gather_host_engram_hashes(hashes, dp_shared_memory=True)

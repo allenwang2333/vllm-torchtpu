@@ -839,7 +839,7 @@ class TestV2HostEngramFull:
 
         # 3. Fallback to upstream gather_engram_hashes
         with patch(
-            "vllm.models.deepseek_v41.nvidia.engram.gather_engram_hashes",
+            "vllm.models.deepseek_v41.common.engram.gather_engram_hashes",
             return_value=torch.ones((4, 2, 1)),
         ) as mock_up_gather:
             out3 = gather_host_engram_hashes(hashes_cpu, dp_shared_memory=True)
