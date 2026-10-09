@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.models.deepseek_v4.attention import DeepseekV4Indexer, DeepseekV4IndexerCache
@@ -64,6 +64,7 @@ def _indexer_jax(
     compression_ratio: int,
     softmax_scale: float,
     n_head: int,
+    uniform_q_len: int | None,
 ) -> jax.Array:
     if cache_kv.shape[0] == 0:
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
@@ -107,6 +108,7 @@ def _indexer_jax(
             num_kv_pages_per_block=(16, 2, 8),
             num_queries_per_block=(1, 128, 128),
             decode_req_batch_size=1,
+            uniform_q_len=uniform_q_len,
         )
 
     return _indexer_local(
@@ -155,6 +157,10 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
 
     def _build_indexer_op(self):
         mesh = get_pallas_op_mesh()
+        # Speculative verify windows all hold K + 1 tokens; the runner puts
+        # them in `[distribution[0], distribution[1])`.
+        spec = get_current_vllm_config().speculative_config
+        uniform_q_len = None if spec is None else spec.num_speculative_tokens + 1
 
         wrapped_fn = functools.partial(
             _indexer_jax,
@@ -162,6 +168,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             compression_ratio=self.compress_ratio,
             softmax_scale=self.softmax_scale,
             n_head=self.n_head,
+            uniform_q_len=uniform_q_len,
         )
 
         _scale = (
@@ -172,6 +179,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         op_name = (
             f"pallas::deepseek_v4_indexer_k{self.topk_tokens}"
             f"_c{self.compress_ratio}_h{self.n_head}_s{_scale}"
+            f"{'' if uniform_q_len is None else f'_u{uniform_q_len}'}"
         )
         global _indexer_op_cache
         if op_name in _indexer_op_cache:
