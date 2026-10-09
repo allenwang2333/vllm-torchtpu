@@ -375,3 +375,29 @@ def test_a_stage_of_several_chips_drains_before_every_hand_off(monkeypatch):
     wave.warmup()
     wave.start_forward(16)
     assert drains == [] and wave.launches == 3
+
+
+def test_pipeline_permutation_forms_one_cycle_per_column():
+    from vllm_torchtpu.distributed.pp_shift import pipeline_permutation
+
+    # 1 device per stage (PP3 x TP1): one cycle over 3 stages
+    assert pipeline_permutation((0, 1, 2), stages=3) == [(0, 1), (1, 2), (2, 0)]
+
+    # 2 devices per stage (PP4 x TP2) with non-identity rank->pos mapping:
+    # Stage 0: (4, 5), Stage 1: (0, 1), Stage 2: (6, 7), Stage 3: (2, 3)
+    pos = (4, 5, 0, 1, 6, 7, 2, 3)
+    perm = pipeline_permutation(pos, stages=4)
+    assert perm == [
+        # Column 0: 4 -> 0 -> 6 -> 2 -> 4
+        (4, 0),
+        (0, 6),
+        (6, 2),
+        (2, 4),
+        # Column 1: 5 -> 1 -> 7 -> 3 -> 5
+        (5, 1),
+        (1, 7),
+        (7, 3),
+        (3, 5),
+    ]
+    assert sorted(s for s, _ in perm) == sorted(t for _, t in perm)
+

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Hand one pipeline stage's activations to the next over ICI.
 
-The op is an XLA collective-permute over a mesh of the pipeline group's
-devices: every stage's block lands on the stage after it, and the last stage's
-block lands on the first stage, which ignores it, so the permutation is one
-closed cycle. Every stage must call it at the same point in its launch
+The op is an XLA collective-permute over a mesh of the slice's devices: every
+stage's block lands on the stage after it, and the last stage's block lands on
+the first stage, which ignores it, so the permutation is one closed cycle per
+device column. Every rank must call it at the same point in its launch
 sequence; ``pp_wave`` arranges that.
 """
 
@@ -32,17 +32,22 @@ _OPS: dict[tuple, object] = {}
 
 
 def get_or_create_pp_mesh() -> Mesh:
-    """A JAX mesh over the pipeline group's devices in device-id order.
+    """A JAX mesh over the slice's devices in device-id order.
 
     The runtime addresses collective peers by device order, so mesh positions
-    follow device ids; ``pp_positions()`` maps pipeline ranks onto them.
+    follow device ids; ``pp_positions()`` maps world ranks onto them.
     """
     global _MESH, _POS_OF_RANK
     if _MESH is not None:
         return _MESH
-    from vllm.distributed.parallel_state import get_pp_group
+    from vllm.distributed.parallel_state import get_pp_group, get_world_group
 
-    group = get_pp_group()
+    try:
+        group = get_world_group()
+        if len(group.ranks) == 1 and len(get_pp_group().ranks) > 1:
+            group = get_pp_group()
+    except (AssertionError, AttributeError):
+        group = get_pp_group()
     ranks = tuple(int(rank) for rank in group.ranks)
     rank_to_device = _collect_rank_to_device_id(
         group, _get_current_global_rank(), _get_tpu_global_device_id()
@@ -62,9 +67,34 @@ def get_or_create_pp_mesh() -> Mesh:
 
 
 def pp_positions() -> tuple[int, ...]:
-    """Mesh position of each pipeline rank, in rank order."""
+    """Mesh position of each world rank of the slice, in rank order."""
     get_or_create_pp_mesh()
     return _POS_OF_RANK
+
+
+def pipeline_permutation(
+    pos: tuple[int, ...], stages: int | None = None
+) -> list[tuple[int, int]]:
+    """Source/target mesh-position pairs of the hand-off: stage s's column c
+    (world rank ``s * cols + c``) sends to stage ``(s + 1) % stages``'s
+    column c, one closed cycle per column."""
+    if stages is None:
+        try:
+            from vllm.distributed.parallel_state import get_pp_group
+
+            stages = int(get_pp_group().world_size)
+        except (AssertionError, AttributeError, ImportError):
+            stages = len(pos)
+    if stages < 1 or len(pos) % stages != 0:
+        raise ValueError(
+            f"{len(pos)} ranks cannot form {stages} equal pipeline stages"
+        )
+    cols = len(pos) // stages
+    return [
+        (pos[s * cols + c], pos[((s + 1) % stages) * cols + c])
+        for c in range(cols)
+        for s in range(stages)
+    ]
 
 
 def pp_permute_op(mesh: Mesh, num_tensors: int = 1):
@@ -80,12 +110,16 @@ def pp_permute_op(mesh: Mesh, num_tensors: int = 1):
     """
     if num_tensors < 1:
         raise ValueError(f"a hand-off carries at least one tensor; got {num_tensors}")
-    key = ("permute", int(num_tensors)) + tuple(int(d.id) for d in mesh.devices)
+    pos = pp_positions()
+    perm = pipeline_permutation(pos)
+    key = (
+        ("permute", int(num_tensors))
+        + tuple(int(d.id) for d in mesh.devices)
+        + tuple(x for pair in perm for x in pair)
+    )
     op = _OPS.get(key)
     if op is not None:
         return op
-    pos = pp_positions()
-    perm = [(pos[r], pos[(r + 1) % len(pos)]) for r in range(len(pos))]
     spec = PartitionSpec(AXIS)
 
     if num_tensors == 1:
