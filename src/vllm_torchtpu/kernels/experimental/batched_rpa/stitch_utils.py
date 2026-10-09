@@ -33,9 +33,38 @@ def _stitch_decode_lane(
 ):
     """O(1) Decode Path: Target only the VREGs containing the stitch boundary.
 
-    The new tokens are contiguous in both the source and the destination, so a
-    single lane rotation places all of them. Requires bq_sz <= num_lanes, which
-    bounds the run to two VREG columns.
+    Args:
+      vmem_u32_ref: VMEM slice for a single batch item bitcast to uint32, with
+        arbitrary outer dimensions and innermost dimension `v_len` (e.g. `[...,
+        v_len]`). Reshaped internally to `(-1, num_lanes)` (i.e. `[outer_dim *
+        lanes_per_col, num_lanes]`). Contains existing cached KV tokens up to
+        `bkv_sz_cache` and newly DMA'd tokens starting at `cache_end +
+        new_tok_offset`.
+      bkv_sz_cache: Scalar integer (`shape=()`, `int32`), the number of KV tokens
+        already present in the current block's cache for this batch item. Defines
+        the destination stitch insertion point: column `bkv_sz_cache // num_lanes`
+        and lane offset `bkv_sz_cache % num_lanes`.
+      cache_end: Scalar integer (`shape=()`, `int32`), the end of the cached token
+        region rounded up to `cfgs.kv_token_align` (`align_to(bkv_sz_cache,
+        kv_token_align)`). DMA transfers for new KV tokens land immediately after
+        this boundary.
+      new_tok_offset: Scalar integer (`shape=()`, `int32`), the intra-alignment
+        offset (`new_kv_len_start % cfgs.kv_token_align`) of the first new token
+        within the DMA transfer region. Together with `cache_end`, `src_tok_idx =
+        cache_end + new_tok_offset` gives the exact VMEM token index where newly
+        fetched tokens begin.
+      bkv_sz_new: Scalar integer (`shape=()`, `int32`), the number of valid new KV
+        tokens to be merged into the current block for this sequence (`<= bq_sz`).
+        Used in `rel < bkv_sz_new` to mask out padding or uninitialized memory
+        beyond the valid new tokens.
+      v_len: Total VMEM lane allocation length (`cfgs.kv_vmem_lanes`), a multiple
+        of `num_lanes` defining the total capacity of the VMEM buffer per lane.
+      cfgs: RPA kernel configuration dataclass.
+
+    Returns:
+      A tuple of `(cols, outer_dim, lanes_per_col, merged)` where `cols` contains
+      the destination column indices and `merged` contains the corresponding
+      stitched VREG values.
     """
     num_lanes = pltpu.get_tpu_info().num_lanes
     lanes_per_col = v_len // num_lanes
@@ -50,43 +79,35 @@ def _stitch_decode_lane(
 
     # Source: first fetched new token in VMEM.
     src_tok_idx = cache_end + new_tok_offset
+    src_chunk_idx = src_tok_idx // num_lanes
+    src_rel = src_tok_idx % num_lanes
 
     lane_idx = lax.broadcasted_iota(jnp.int32, (outer_dim, num_lanes), 1)
 
-    if cfgs.block.bq_sz == 1:
-        # A single token needs neither a second destination column nor the
-        # wrap-around source column: its source column is unambiguous.
-        dst_vreg = strided_vmem_ref[pl.ds(dst_chunk_idx, outer_dim, lanes_per_col)]
-        src_vreg = strided_vmem_ref[
-            pl.ds(src_tok_idx // num_lanes, outer_dim, lanes_per_col)
+    # Roll source columns by the lane shift between destination and source.
+    shift = lax.rem(lax.rem(dst_rel - src_rel, num_lanes) + num_lanes, num_lanes)
+
+    src_col0 = strided_vmem_ref[
+        pl.ds(jnp.minimum(src_chunk_idx, max_col), outer_dim, lanes_per_col)
+    ]
+    rolled0 = pltpu.roll(src_col0, shift, axis=1)
+
+    if cfgs.block.bq_sz > 1:
+        src_col1 = strided_vmem_ref[
+            pl.ds(jnp.minimum(src_chunk_idx + 1, max_col), outer_dim, lanes_per_col)
         ]
-        rolled = pltpu.roll(src_vreg, dst_rel - src_tok_idx % num_lanes, axis=1)
-        merged_dst_vreg = lax.select(
-            lane_idx == dst_rel, rolled, jnp.where(lane_idx < dst_rel, dst_vreg, 0)
-        )
-        return [dst_chunk_idx], outer_dim, lanes_per_col, [merged_dst_vreg]
-
-    # Lanes below `shift` wrap in from the preceding source column.
-    delta = bkv_sz_cache - src_tok_idx
-    shift = lax.rem(lax.rem(delta, num_lanes) + num_lanes, num_lanes)
-    src_base = (delta - shift) // num_lanes
-
-    def rolled_src(j: int) -> jax.Array:
-        col = jnp.clip(dst_chunk_idx + j - src_base - 1, 0, max_col)
-        return pltpu.roll(
-            strided_vmem_ref[pl.ds(col, outer_dim, lanes_per_col)], shift, axis=1
-        )
+        rolled1 = pltpu.roll(src_col1, shift, axis=1)
+    else:
+        rolled1 = rolled0
 
     n_cols = pl.cdiv(num_lanes - 1 + cfgs.block.bq_sz, num_lanes)
-    rolled = [rolled_src(j) for j in range(n_cols + 1)]
-
     cols = []
     merged = []
     for k in range(n_cols):
         col = jnp.minimum(dst_chunk_idx + k, max_col)
-        src_vreg = jnp.where(lane_idx >= shift, rolled[k + 1], rolled[k])
         dst_vreg = strided_vmem_ref[pl.ds(col, outer_dim, lanes_per_col)]
         rel = k * num_lanes + lane_idx - dst_rel
+        src_vreg = jnp.where(src_rel + rel < num_lanes, rolled0, rolled1)
         cols.append(col)
         merged.append(
             jnp.where(rel < 0, dst_vreg, jnp.where(rel < bkv_sz_new, src_vreg, 0))
@@ -138,7 +159,7 @@ def store_new_kv_lane(
     v_len = cfgs.kv_vmem_lanes
     vmem_u32_ref = vmem_ref.at[b_idx].bitcast(jnp.uint32)
 
-    if cfgs.block.bq_sz <= pltpu.get_tpu_info().num_lanes:
+    if cfgs.use_decode_stitch:
         cols, outer_dim, lanes_per_col, merged = stitch_result
         num_lanes = pltpu.get_tpu_info().num_lanes
         strided_vmem_ref = vmem_u32_ref.reshape(-1, num_lanes)
@@ -182,9 +203,9 @@ def stitch_new_kv_lane(
 
     vmem_u32_ref = vmem_ref.at[b_idx].bitcast(jnp.uint32)
 
-    # Up to num_lanes new kv tokens span at most two 128-lane registers, so they
-    # can be rolled in place instead of rolling the entire bkv_sz.
-    if cfgs.block.bq_sz <= pltpu.get_tpu_info().num_lanes:
+    # Up to num_lanes new kv tokens in DECODE span at most two 128-lane registers,
+    # so they can be rolled in place instead of rolling the entire bkv_sz.
+    if cfgs.use_decode_stitch:
         return _stitch_decode_lane(
             vmem_u32_ref,
             bkv_sz_cache,

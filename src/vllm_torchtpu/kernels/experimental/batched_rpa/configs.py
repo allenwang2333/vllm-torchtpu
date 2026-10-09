@@ -374,6 +374,13 @@ class RpaConfigs:
         return self.mode == RpaCase.DECODE
 
     @property
+    def use_decode_stitch(self) -> bool:
+        """Whether the O(1) lane-rotation stitch covers this bq_sz."""
+        if self.mode != RpaCase.DECODE:
+            return False
+        return self.block.bq_sz <= pltpu.get_tpu_info().num_lanes
+
+    @property
     def kv_bytes_per_token(self) -> int:
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             num_elements = self.model.num_kv_heads * 2 * self.aligned_kv_head_dim
