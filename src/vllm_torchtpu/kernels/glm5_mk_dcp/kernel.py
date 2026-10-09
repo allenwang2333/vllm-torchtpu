@@ -436,9 +436,9 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         "ksend": pltpu.VMEM((TMAX, KR_, 128), I32), "kall": pltpu.VMEM((R, TMAX, KR_, 128), I32),
         "gk": pltpu.VMEM((GKR, 128), I32), "gmk": pltpu.VMEM((128, 128), I32),
         "oslot": pltpu.VMEM((KR_, 128), I32),
-        "cand_s": pltpu.SMEM((TMAX * KR_, 128), I32), "oslot_s": pltpu.SMEM((KR_, 128), I32),
+        "oslot_s": pltpu.SMEM((KR_, 128), I32),
         "cand_v": pltpu.VMEM((TMAX, KR_, 128), I32),
-        "own_s": pltpu.SMEM((TMAX * KR_, 128), I32), "own_v": pltpu.VMEM((TMAX, KR_, 128), I32),
+        "own_s": pltpu.SMEM((cfg.QMAX * KR_, 128), I32), "own_v": pltpu.VMEM((TMAX, KR_, 128), I32),
         "nown_s": pltpu.SMEM((TMAX,), I32),
         # per-request union of the rows' owned winners (+ per-row membership over it)
         "own_u": pltpu.SMEM((UR_, 128), I32), "own_uv": pltpu.VMEM((UR_, 128), I32),
@@ -1295,10 +1295,6 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                     topk2.local_topk(scr["keys"].at[qq], nval, KT, scr["cidx"], scr["ksend"].at[t_],
                                      scr["kpre"], scr["tk_acc"], scr["tk_cc"], kc=tiles.topk_kc)
                     scr["cand_v"][t_] = scr["cidx"][...]
-                    cp = pltpu.make_async_copy(scr["cidx"], scr["cand_s"].at[pl.ds(t_ * KR_, KR_)],
-                                               scr["misc_sem"])
-                    cp.start()
-                    cp.wait()
 
         def build_union(b, off, rn=None):
             """Request b's rows' owned winner lists (ascending local indices) -> their merged union at
@@ -1311,13 +1307,24 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             BIG = jnp.int32(2 ** 30)
             t0r, _, p0r, noldr = req_new(b) if rn is None else rn
             ns = [jnp.where(qq < nq, scr["nown_s"][jnp.minimum(t0 + qq, TMAX - 1)], 0) for qq in range(QM)]
+            # this request's owned lists -> own_s rows [qq * KR_, (qq + 1) * KR_): SMEM per request, not
+            # per step (TMAX * KR_ rows overflowed SMEM at RPR 2)
+            for qq in range(QM):
+                @pl.when(qq < nq)
+                def _(qq=qq):
+                    pltpu.make_async_copy(scr["own_v"].at[jnp.minimum(t0 + qq, TMAX - 1)],
+                                          scr["own_s"].at[pl.ds(qq * KR_, KR_)], scr["misc_sem"]).start()
+            for qq in range(QM):
+                @pl.when(qq < nq)
+                def _(qq=qq):
+                    pltpu.make_async_copy(scr["own_v"].at[0], scr["own_s"].at[pl.ds(qq * KR_, KR_)],
+                                          scr["misc_sem"]).wait()
             tot = ns[0]
             for x in ns[1:]:
                 tot = tot + x
 
             def head(qq, p):
-                t_ = jnp.minimum(t0 + qq, TMAX - 1)
-                v = scr["own_s"][t_ * KR_ + (jnp.minimum(p, KT - 1) >> 7), jnp.minimum(p, KT - 1) & 127]
+                v = scr["own_s"][qq * KR_ + (jnp.minimum(p, KT - 1) >> 7), jnp.minimum(p, KT - 1) & 127]
                 return jnp.where(p < ns[qq], v, BIG)
 
             def cond(c):
@@ -1358,7 +1365,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             return off + (res[1] + 127) // 128
 
         def global_row(t_):
-            """Row t_'s global top-KT over all ranks' candidates -> own_s / own_v / nown_s."""
+            """Row t_'s global top-KT over all ranks' candidates -> own_v / nown_s (build_union copies a
+            request's rows to own_s)."""
             for s_ in range(R):
                 scr["gk"][s_ * KR_:(s_ + 1) * KR_, :] = scr["kall"][s_, t_]
             if GKR > R * KR_:
@@ -1373,10 +1381,6 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             kio = (lax.broadcasted_iota(I32, (KR_, 128), 0) * 128 + lax.broadcasted_iota(I32, (KR_, 128), 1))
             scr["own_v"][t_] = jnp.where(kio < n_own, scr["own_v"][t_], -1)
             scr["nown_s"][t_] = n_own
-            cp = pltpu.make_async_copy(scr["own_v"].at[t_], scr["own_s"].at[pl.ds(t_ * KR_, KR_)],
-                                       scr["misc_sem"])
-            cp.start()
-            cp.wait()
 
         # ---------------- attention ----------------
         QN = cfg.QMAX * NH                                   # a request's rows x heads (MXU M dim)
