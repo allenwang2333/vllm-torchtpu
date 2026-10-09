@@ -1,0 +1,57 @@
+/.venv
+/build
+dist
+vllm/*.so
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+.mypy_cache
+
+# Distribution / packaging
+.Python
+/build/
+cmake-build-*/
+CMakeUserPresets.json
+develop-eggs/
+/dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+# Git repository
+.git
+
+# Test caches & coverage
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+
+# Non-runtime files excluded from container images (Fixes #820)
+docs/
+.buildkite/
+# ...except what the kube pods exec at runtime: the engine and benchmark
+# scripts, and parse_gke_results.py, which the benchmark calls to load its
+# results into BigQuery.
+!.buildkite/kubernetes/
+!.buildkite/scripts/
+.github/
+mkdocs.yml
+.readthedocs.yaml
+.pre-commit-config.yaml
+# .coveragerc stays in the image: the coverage pipeline runs pytest --cov
+# inside the container and needs it for branch, parallel and subprocess
+# measurement.

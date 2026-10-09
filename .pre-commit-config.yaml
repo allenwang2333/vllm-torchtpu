@@ -1,0 +1,118 @@
+default_install_hook_types:
+  - pre-commit
+  - commit-msg
+default_stages:
+  - pre-commit # Run locally
+  - manual # Run in CI
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+    -   id: check-yaml
+        # mkdocs.yml uses mkdocs-specific tags; the lm_eval_tasks yamls use
+        # lm-eval's !function tag. Neither parses with plain safe_load.
+        exclude: ^(mkdocs\.yml|scripts/vllm/benchmarking/lm_eval_tasks/.*\.ya?ml)$
+        args: [--allow-multiple-documents] # k8s manifests are multi-document
+    -   id: end-of-file-fixer
+    -   id: trailing-whitespace
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  rev: v0.14.0
+  hooks:
+  - id: ruff-check
+    args: [--output-format, github, --fix]
+  - id: ruff-format
+- repo: https://github.com/pre-commit/mirrors-clang-format
+  rev: v20.1.3
+  hooks:
+  - id: clang-format
+    types_or: [c++, cuda]
+    args: [--style=file, --verbose]
+- repo: https://github.com/jackdewinter/pymarkdown
+  rev: v0.9.29
+  hooks:
+  - id: pymarkdown
+    args: [fix]
+- repo: https://github.com/rhysd/actionlint
+  rev: v1.7.7
+  hooks:
+  - id: actionlint
+- repo: https://github.com/astral-sh/uv-pre-commit
+  rev: 0.7.2
+  hooks:
+    - id: pip-compile
+      args: [requirements/test.in, -o, requirements/test.txt, --index-strategy, unsafe-best-match, --torch-backend, cu128]
+      files: ^requirements/test\.(in|txt)$
+-   repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+    -   id: shellcheck
+- repo: https://github.com/lk16/detect-missing-init
+  rev: v0.1.6
+  hooks:
+  - id: detect-missing-init
+    args: ['--create', "--track", "--python-folders", "src/vllm_torchtpu"]
+- repo: local
+  hooks:
+  - id: signoff-commit
+    name: Sign-off Commit
+    entry: bash
+    args:
+      - -c
+      - |
+        if ! grep -q "^Signed-off-by: $(git config user.name) <$(git config user.email)>" "$(git rev-parse --git-path COMMIT_EDITMSG)"; then
+          printf "\nSigned-off-by: $(git config user.name) <$(git config user.email)>\n" >> "$(git rev-parse --git-path COMMIT_EDITMSG)"
+        fi
+    language: system
+    verbose: true
+    stages: [commit-msg]
+  - id: check-env-reads
+    name: Env vars must be declared in envs.py
+    # Ratchet against tools/env_reads_baseline.txt: existing direct reads
+    # stay until migrated, a newly added one fails. See issue #773.
+    # `script`, not `system`: the file carries its own shebang and is
+    # executable, so the hook does not depend on a bare `python` being on
+    # PATH in whatever environment pre-commit runs in.
+    entry: tools/check_env_reads.py
+    language: script
+    always_run: true
+    pass_filenames: false
+  - id: check-b023-baseline
+    name: Kernels must not gain closures over loop variables
+    # Ratchet against tools/b023_baseline.txt. B023 is switched off for
+    # src/vllm_torchtpu/kernels in pyproject.toml because pl.when and pl.loop
+    # bodies run inside the iteration that defined them; this keeps a new
+    # capture there from arriving unnoticed.
+    # `python`, not `script`: the entry shells out to ruff, so it needs an
+    # environment that has it. Keep this pin equal to the ruff-pre-commit rev
+    # above, or the two disagree about what B023 finds.
+    entry: tools/check_b023_baseline.py
+    language: python
+    additional_dependencies: [ruff==0.14.0]
+    always_run: true
+    pass_filenames: false
+  - id: check-filenames
+    name: Check for spaces in all filenames
+    entry: bash
+    args:
+      - -c
+      - 'git ls-files | grep " " && echo "Filenames should not contain spaces!" && exit 1 || exit 0'
+    language: system
+    always_run: true
+    pass_filenames: false
+  - id: pyrefly
+    name: Pyrefly type check
+    # Checks the whole project (see [tool.pyrefly] in pyproject.toml) rather
+    # than staged files, so results do not depend on which files a commit
+    # happens to touch. A full run is well under a second.
+    entry: pyrefly check
+    language: python
+    additional_dependencies: [pyrefly==1.3.0]
+    pass_filenames: false
+    always_run: true
+  - id: suggestion
+    name: Suggestion
+    entry: bash -c 'echo "To bypass pre-commit hooks, add --no-verify to git commit."'
+    language: system
+    verbose: true
+    pass_filenames: false
+  # Insert new entries above the `suggestion` entry
