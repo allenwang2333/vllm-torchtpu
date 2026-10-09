@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # Diagnostic, not a test. Boots the compilation-cache-e2e model repeatedly
-# against one Tier-3 cache with TORCH_TRACE set, to find out which program
-# roughly 1 boot in 10 compiles during weight loading
-# (414a3bcdb281ad91_761b6dd1fdb0fa32_*.bin in the flaky Test 5 diffs) and why
-# torch_tpu's DEFER_AND_FUSE cut it.
+# against one Tier-3 cache, to find out which program roughly 1 boot in 10
+# compiles during weight loading (414a3bcdb281ad91_761b6dd1fdb0fa32_*.bin in the
+# flaky Test 5 diffs).
 #
-# Every boot's log and TORCH_TRACE output go under
-# $ARTIFACTS_DIR/ccdiag/<host>/, with one row per boot in summary.tsv. A warm
-# boot that adds Tier-3 files has them recorded and then deleted from the
-# cache, so the next boot that builds the same program compiles it again, and
-# traces its ATen graph, instead of loading it.
+# DIAG_DUMP_ON_CACHE_MISS=1 makes the worker log the StableHLO, with source
+# locations, of every program new to the process, tagged with its cache key.
+# Every boot's log goes under $ARTIFACTS_DIR/ccdiag/<host>/ with the keys it
+# dumped, one row per boot in summary.tsv, and the dump of the target program
+# in target_graph.txt for the boots that built it.
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../../.." || exit 1
 
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
-WARM_BOOTS="${DIAG_WARM_BOOTS:-20}"
+WARM_BOOTS="${DIAG_WARM_BOOTS:-10}"
+TARGET_KEY="414a3bcdb281ad91"
 OUT="$(pwd)/${ARTIFACTS_DIR:-perf_eval_results}/ccdiag/$(hostname)"
 CACHE_DIR="$(mktemp -d /tmp/ccdiag_XXXXXX)"
 TIER3_DIR="${CACHE_DIR}/torch_tpu_tier3"
@@ -27,10 +27,11 @@ export VLLM_CACHE_ROOT="${CACHE_DIR}/vllm_cache"
 export VLLM_TARGET_DEVICE="tpu"
 export VLLM_DISABLE_COMPILE_CACHE=1
 export VLLM_XLA_CHECK_RECOMPILATION=1
+export DIAG_DUMP_ON_CACHE_MISS=1
 
 mkdir -p "${OUT}" "${TIER3_DIR}" "${VLLM_CACHE_ROOT}"
 : > "${KNOWN}"
-printf 'boot\trc\tsecs\tfirst_report_graphs\tcompile_secs\tnew_tier3_files\n' \
+printf 'boot\trc\tsecs\tfirst_report_graphs\tcompile_secs\tdumped_keys\ttarget_dumped\tnew_tier3_files\n' \
   > "${OUT}/summary.tsv"
 
 clean_tpu_processes() {
@@ -51,10 +52,10 @@ clean_tpu_processes() {
 boot() {
   local name=$1
   local dir="${OUT}/${name}"
-  mkdir -p "${dir}/trace"
+  mkdir -p "${dir}"
   clean_tpu_processes
   local start=${SECONDS}
-  TORCH_TRACE="${dir}/trace" python3 examples/offline_inference.py \
+  python3 examples/offline_inference.py \
     --model "${MODEL}" \
     --max-model-len 256 --max-num-batched-tokens 256 --max-tokens 8 \
     --prompt "The capital of France is" > "${dir}/log.txt" 2>&1
@@ -84,10 +85,21 @@ boot() {
     while read -r f; do rm -f "${TIER3_DIR}/${f}"; done <<< "${new}"
   fi
 
-  tar -czf "${dir}/trace.tar.gz" -C "${dir}" trace && rm -rf "${dir}/trace"
+  grep -oE 'due to cache miss for key: .{0,200}' "${dir}/log.txt" | sort -u > "${dir}/keys.txt"
+  local target=no
+  if grep -q "due to cache miss for key: .*${TARGET_KEY}" "${dir}/log.txt"; then
+    target=yes
+    # From the target's dump header up to the next program's dump or the next
+    # Python log line.
+    awk -v key="${TARGET_KEY}" '
+      /due to cache miss for key: / { on = index($0, key) > 0 }
+      /^\(EngineCore|^(INFO|WARNING|ERROR) / { on = 0 }
+      on' "${dir}/log.txt" > "${dir}/target_graph.txt"
+  fi
+  gzip -f "${dir}/log.txt"
   local row
-  row=$(printf '%s\t%s\t%s\t%s\t%s\t%s' "${name}" "${rc}" "${secs}" "${graphs:-?}" \
-    "${compile_secs}" "$(echo "${new}" | tr '\n' ' ')")
+  row=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "${name}" "${rc}" "${secs}" "${graphs:-?}" \
+    "${compile_secs}" "$(wc -l < "${dir}/keys.txt")" "${target}" "$(echo "${new}" | tr '\n' ' ')")
   echo "${row}" >> "${OUT}/summary.tsv"
   echo "=== ${row}"
   return "${rc}"
@@ -96,15 +108,20 @@ boot() {
 echo "--- Cold boot (${MODEL})"
 if ! boot cold; then
   echo "Cold boot failed; last lines:"
-  tail -50 "${OUT}/cold/log.txt"
+  zcat "${OUT}/cold/log.txt.gz" | grep -v 'compilation_cache.cc' | tail -50
   exit 1
 fi
 
 for i in $(seq -w 1 "${WARM_BOOTS}"); do
   echo "--- Warm boot ${i}/${WARM_BOOTS}"
-  boot "warm${i}" || tail -30 "${OUT}/warm${i}/log.txt"
+  boot "warm${i}" || zcat "${OUT}/warm${i}/log.txt.gz" | grep -v 'compilation_cache.cc' | tail -30
 done
 
 echo "--- Summary"
 column -t -s $'\t' "${OUT}/summary.tsv" || cat "${OUT}/summary.tsv"
+for f in "${OUT}"/*/target_graph.txt; do
+  [[ -f "${f}" ]] || continue
+  echo "--- ${f#"${OUT}"/} (first 80 of $(wc -l < "${f}") lines)"
+  head -80 "${f}"
+done
 rm -rf "${CACHE_DIR}"

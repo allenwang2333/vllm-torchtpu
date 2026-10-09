@@ -447,6 +447,12 @@ class TPUWorker(WorkerBase):
         is_first_rank = pp_group.is_first_rank
         is_last_rank = pp_group.is_last_rank
 
+        # Diagnostic branch only: log the StableHLO, with source locations, of
+        # every program this process has not compiled before, tagged with its
+        # cache key, so the flaky weight-loading program can be identified.
+        if os.environ.get("DIAG_DUMP_ON_CACHE_MISS") == "1":
+            torch.tpu._set_dump_on_cache_miss(True)
+
         # TODO: Fix device assignment
         # WorkerBase declares `nn.Module | None`; this worker always holds a
         # TPUModelRunner from here on.
