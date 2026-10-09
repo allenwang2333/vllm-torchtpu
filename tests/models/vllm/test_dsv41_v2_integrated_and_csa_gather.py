@@ -453,6 +453,7 @@ class TestIntegratedEvenQuerySplit:
         mock_attn.candidate_block_buffer = None
         mock_attn.paged_index_block_buffer = None
         mock_attn._project_index_q = lambda q, pos: q
+        mock_attn._get_stage_tp_rank = lambda stage_cache: 0
 
         captured_args = {}
 
