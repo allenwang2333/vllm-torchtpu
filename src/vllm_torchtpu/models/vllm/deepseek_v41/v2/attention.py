@@ -1797,7 +1797,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             active_lengths = lengths.masked_fill(swa_slots[:, None] < 0, 0)
             batch_max = active_lengths.max()
             if split:
-                tp_rank = self._get_stage_tp_rank(stage_cache)
+                tp_rank = (
+                    self._get_stage_tp_rank(stage_cache)
+                    if hasattr(self, "_get_stage_tp_rank")
+                    else getattr(self, "_tp_rank", 0)
+                )
                 if owner_perm is not None:
                     part = owner_perm.shape[0] // ranks
                     padding = 1

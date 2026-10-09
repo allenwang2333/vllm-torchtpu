@@ -47,7 +47,10 @@ class TpuDpScheduler(AsyncScheduler):
         if not throttle_prefills:
             # Open window for draining accumulated prefills.
             self._drain_prefill = True
-        if self._drain_prefill and not (self.waiting or self.kv_holding_waiting):
+        waiting_drain = self.waiting or getattr(
+            self, "kv_holding_waiting", getattr(self, "skipped_waiting", None)
+        )
+        if self._drain_prefill and not waiting_drain:
             # In drain mode until all accumulated prefills are scheduled.
             self._drain_prefill = False
         if self._drain_prefill:

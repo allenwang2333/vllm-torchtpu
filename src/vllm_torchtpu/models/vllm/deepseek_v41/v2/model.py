@@ -586,7 +586,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         if offload_engram:
             input_ids_prep = (
                 input_ids.to(torch.int64)
-                if self.use_native_mega_moe
+                if getattr(
+                    self, "use_native_mega_moe", getattr(self, "use_mega_moe", False)
+                )
                 and input_ids is not None
                 and input_ids.device.type == "cpu"
                 else input_ids
@@ -797,7 +799,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        if self.use_native_mega_moe:
+        if getattr(self, "use_native_mega_moe", getattr(self, "use_mega_moe", False)):
             input_ids = input_ids.to(torch.int64)
 
         skip_lookup = getattr(self, "_engram_prepared_outside_stage", False) or (

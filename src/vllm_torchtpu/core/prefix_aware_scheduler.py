@@ -101,7 +101,12 @@ class PrefixAwareScheduler(AsyncScheduler):
         vLLM v0.31 dropped its per-admission queue-selection hook, so this runs
         once per step: only the step's first admission is warmth-ordered.
         """
-        queue = self.kv_holding_waiting or self.waiting or None
+        queue = (
+            getattr(self, "kv_holding_waiting", None)
+            or getattr(self, "skipped_waiting", None)
+            or getattr(self, "waiting", None)
+            or None
+        )
         if queue is not None:
             self._promote_warmest(queue)
         return queue
