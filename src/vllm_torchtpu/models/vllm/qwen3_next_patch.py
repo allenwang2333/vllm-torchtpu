@@ -142,9 +142,13 @@ def _select_gate_q_tile(rows: int, cols: int) -> int:
     Keeps live fp32 arrays within the 64-VREG hardware file (preventing multi-MiB
     VMEM spills at N=2048) and ensures grid >= 6 at decode/verify batch sizes
     (N=96, 128) so double-buffered VMEM DMAs overlap with compute.
+
+    The cap is clamped to >= 32 rows: wider per-rank slabs (e.g. the 4096-wide
+    GDN output at TP=2) would otherwise drive the VREG-derived cap below the
+    32-row minimum tile, and `_legal_tile` would fall back to an untiled grid.
     """
     vregs_per_row = max(1, (cols + 1023) // 1024)
-    vreg_cap = max(16, (64 // vregs_per_row // 8) * 8)
+    vreg_cap = max(32, (64 // vregs_per_row // 8) * 8)
     if rows <= 256:
         dma_cap = max(8, (rows // 6 // 8) * 8)
         return min(vreg_cap, dma_cap)
