@@ -91,13 +91,16 @@ spec:
                 # 0.0.49. Set LIBTPU_WHEEL="" to keep the image's libtpu.
                 - name: LIBTPU_WHEEL
                   value: '{{ .LIBTPU_WHEEL | default "gs://yinlin-tpu-bucket-us/shriharim-pptp/wheels/libtpu-0.0.49-cp312-cp312-manylinux_2_31_x86_64.whl" }}'
-                # XLA flags. Standalone-subgroup (sub-slice) programs fail with
-                # "HLO all-reduce-start is not implemented on TPU" unless XLA
-                # fuses async collectives; these are the flags the sglang PP x TP
-                # recipes (PR 869) ran with on torch_tpu#4387. env_override.py
-                # appends its own defaults (SC offload, merger) after these.
+                # XLA flags for standalone TP subgroups (2-core sub-slices):
+                # TpuAsyncCollectiveCreator converts >=64 MiB all-reduces
+                # ([8192, 4096] bf16) to all-reduce-start/done when SparseCore
+                # all-reduce offload is enabled (default on tpu7x), which
+                # SparseCoreCollectiveOffload then rejects on a 2-core
+                # sub-slice; if AsyncCollectiveMerger is disabled, the
+                # un-offloaded all-reduce-start fails in LoweringEmitter with
+                # "HLO all-reduce-start is not implemented on TPU".
                 - name: LIBTPU_INIT_ARGS
-                  value: '{{ .LIBTPU_INIT_ARGS | default "--xla_tpu_enable_async_collective_fusion=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_enable_latency_hiding_scheduler=true" }}'
+                  value: '{{ .LIBTPU_INIT_ARGS | default "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_enable_async_collective_merger=true" }}'
                 command: ["/bin/bash", "-c"]
                 args:
                   - |

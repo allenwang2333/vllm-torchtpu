@@ -264,7 +264,42 @@ def _user_has_flag(flag_name: str) -> bool:
     )
 
 
+def _has_cli_opt(argv: list[str], opt: str) -> bool:
+    return any(a == opt or a.startswith(opt + "=") for a in argv)
+
+
+def _get_cli_opt(argv: list[str], opt: str) -> str | None:
+    for i, a in enumerate(argv):
+        if a == opt and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(opt + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def _is_cli_pp() -> bool:
+    import sys
+
+    argv = sys.argv
+    pp_raw = (
+        _get_cli_opt(argv, "--pipeline-parallel-size")
+        or _get_cli_opt(argv, "-pp")
+        or ""
+    )
+    return pp_raw.isdigit() and int(pp_raw) > 1
+
+
 _libtpu_extra_args: list[str] = []
+
+# Under pipeline parallelism (e.g. PP8 x TP2 standalone sub-slices), XLA's
+# TpuAsyncCollectiveCreator converts >=64 MiB all-reduces ([8192, 4096] bf16)
+# into all-reduce-start/done when SparseCore all-reduce offload is enabled
+# (the default on tpu7x), and SparseCoreCollectiveOffload then rejects the
+# 2-core sub-slice candidate. If AsyncCollectiveMerger is disabled, the
+# un-offloaded all-reduce-start reaches LoweringEmitter and fails with
+# "HLO all-reduce-start is not implemented on TPU". Disable SC all-reduce
+# offload and keep the merger enabled when PP > 1.
+_pp_active = _is_cli_pp()
 
 for _default_flag, _default_val in (
     ("--xla_tpu_use_dynamic_smem_negotiation", "true"),
@@ -272,8 +307,13 @@ for _default_flag, _default_val in (
     ("--xla_tpu_use_minor_sharding_for_major_trivial_input", "true"),
     ("--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter", "false"),
     ("--xla_tpu_enable_sparse_core_collective_offload_all_gather", "false"),
+    *(
+        (("--xla_tpu_enable_sparse_core_collective_offload_all_reduce", "false"),)
+        if _pp_active
+        else ()
+    ),
     ("--xla_tpu_ars_combiner_threshold_in_bytes", "0"),
-    ("--xla_tpu_enable_async_collective_merger", "false"),
+    ("--xla_tpu_enable_async_collective_merger", "true" if _pp_active else "false"),
 ):
     if not _user_has_flag(_default_flag):
         _libtpu_extra_args.append(f"{_default_flag}={_default_val}")
@@ -295,19 +335,6 @@ if _libtpu_extra_args or _existing_libtpu_args:
     os.environ["LIBTPU_INIT_ARGS"] = _assembled
 
 
-def _has_cli_opt(argv: list[str], opt: str) -> bool:
-    return any(a == opt or a.startswith(opt + "=") for a in argv)
-
-
-def _get_cli_opt(argv: list[str], opt: str) -> str | None:
-    for i, a in enumerate(argv):
-        if a == opt and i + 1 < len(argv):
-            return argv[i + 1]
-        if a.startswith(opt + "="):
-            return a.split("=", 1)[1]
-    return None
-
-
 def _apply_qwen35_serve_cli_defaults() -> None:
     """`vllm serve` of the Qwen3.5-397B checkpoint: MTP=3 speculative decoding
     and 4 tokenizer renderer workers unless the command line sets them."""
@@ -316,12 +343,7 @@ def _apply_qwen35_serve_cli_defaults() -> None:
     argv = sys.argv
     if "serve" not in argv[:3] or "qwen3.5-397b" not in " ".join(argv).lower():
         return
-    pp_raw = (
-        _get_cli_opt(argv, "--pipeline-parallel-size")
-        or _get_cli_opt(argv, "-pp")
-        or ""
-    )
-    is_pp = pp_raw.isdigit() and int(pp_raw) > 1
+    is_pp = _is_cli_pp()
     cli_defaults = [("--renderer-num-workers", "4")]
     if not is_pp:
         cli_defaults.insert(
