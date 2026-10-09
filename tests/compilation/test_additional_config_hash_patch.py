@@ -57,8 +57,8 @@ class _StubVllmConfig:
 
     A real VllmConfig needs a fully materialized ModelConfig to construct.
     ``compute_hash()`` guards every sub-config with ``if self.x:``, so ``None``
-    sends them all down the "absent" branch -- except ``observability_config``,
-    which is dereferenced unconditionally.
+    sends them all down the "absent" branch -- except ``observability_config``
+    and ``aux_output_config``, which are dereferenced unconditionally.
     """
 
     def __init__(self, additional_config=None):
@@ -66,6 +66,7 @@ class _StubVllmConfig:
         self.observability_config = SimpleNamespace(
             compute_hash=lambda: "observability"
         )
+        self.aux_output_config = SimpleNamespace(compute_hash=lambda: "aux_output")
 
     def __getattr__(self, name):
         # Let dunders (``__setstate__``/``__deepcopy__``/...) miss normally so

@@ -18,6 +18,19 @@ from vllm.models.deepseek_v41.nvidia.engram import (
     engram_head_shard_rank,
 )
 
+if not hasattr(upstream, "gather_engram_hashes"):
+    try:
+        from vllm.models.deepseek_v41.nvidia import engram as _nvidia_engram
+
+        upstream.gather_engram_hashes = getattr(
+            _nvidia_engram, "gather_engram_hashes", None
+        )
+    except ImportError:
+        pass
+
+if not hasattr(upstream, "engram_gathered_num_tokens"):
+    upstream.engram_gathered_num_tokens = engram_gathered_num_tokens
+
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.upstream_bindings import (
     bind_device_ops,
@@ -388,17 +401,23 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         cpu_offload: bool | None = None,
         **kwargs,
     ):
-        self.cpu_offload = (
+        # Upstream's own `cpu_offload` means a pinned table read through UVA
+        # (CUDA only) and it resets the attribute in `__init__`; keep it False
+        # and track the TPU host table separately.
+        self.host_offload = (
             bool(envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD)
             if cpu_offload is None
             else bool(cpu_offload)
         )
+        self.cpu_offload = self.host_offload
         self.dp_shared_memory = bool(kwargs.pop("dp_shared_memory", False))
         self.dp_size = 1 if self.dp_shared_memory else get_engram_dp_size()
         # Rows load into Host DRAM as with cpu_offload, then
         # `move_rows_to_pinned_host` hands them to the TPU's pinned_host
         # memory, after which `lookup` runs on device like an HBM table.
-        self.host_dma = self.cpu_offload and bool(envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA)
+        self.host_dma = self.host_offload and bool(
+            envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA
+        )
         self._host_rows: HostRowTable | None = None
         self._head_sizes = tuple(head_sizes)
         # Upstream asks for the SM count solely to size its Triton lookup grid.
@@ -407,7 +426,13 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             torch.cuda,
             get_device_properties=lambda _: SimpleNamespace(multi_processor_count=0),
         ):
-            super().__init__(num_embeddings, dim, head_sizes, *args, **kwargs)
+            try:
+                super().__init__(
+                    num_embeddings, dim, head_sizes, *args, cpu_offload=False, **kwargs
+                )
+            except TypeError:
+                super().__init__(num_embeddings, dim, head_sizes, *args, **kwargs)
+        self.cpu_offload = self.host_offload
         upstream.set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
         if self.weight_scale_inv is not None:
             upstream.set_weight_attrs(
@@ -420,7 +445,7 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         return self.tp_size * self.dp_size, engram_head_shard_rank()
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self.cpu_offload:
+        if not self.host_offload:
             return super()._allocate_weights()
         return (
             torch.empty(
@@ -756,9 +781,13 @@ class Engram(upstream.Engram):
                 tuple[int, int],
             ],
         ] = {}
-        if getattr(self.embed_tokens, "cpu_offload", False) and (
-            getattr(self.embed_tokens, "host_dma", False) is not True
-        ):
+        if (
+            getattr(
+                self.embed_tokens,
+                "host_offload",
+                getattr(self.embed_tokens, "cpu_offload", False),
+            )
+        ) and (getattr(self.embed_tokens, "host_dma", False) is not True):
             # Host DRAM tables: the host only gathers raw FP8 bytes and scale
             # bytes (a memcpy-bound index_select); dequantization runs inside
             # the compiled graph (`_ready_rows`). Dequantizing on the host cost

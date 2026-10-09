@@ -250,7 +250,7 @@ class TestHostEngram:
 
         # 1. Fallback to default gather_engram_hashes when dp_shared_memory=True
         with patch(
-            "vllm.models.deepseek_v41.nvidia.engram.gather_engram_hashes",
+            "vllm.models.deepseek_v41.common.engram.gather_engram_hashes",
             side_effect=lambda x, **kw: x,
         ) as mock_default_gather:
             out = gather_host_engram_hashes(hashes, dp_shared_memory=True)
@@ -692,13 +692,13 @@ class TestModelEngramPreparation:
         model._ced_enabled = ced_enabled
         model._ced_window = 128
         model._ced_compile_sizes = [16, 2048]
-        model.use_mega_moe = False
+        model.use_native_mega_moe = False
         model.start_layer = 0
         model.end_layer = 1
         model.engram_dp_shared_memory = True
 
         engram_mock = SimpleNamespace(
-            embed_tokens=SimpleNamespace(cpu_offload=cpu_offload),
+            embed_tokens=SimpleNamespace(host_offload=cpu_offload),
             layer_hash_index=0,
             prepare_embeddings=MagicMock(),
         )
@@ -1008,8 +1008,8 @@ class TestModelEngramPreparation:
         model._prepare_engram = MagicMock()
         model.full_stage = MagicMock(return_value=(torch.zeros((2, 64)), None))
 
-        # use_mega_moe=True converts input_ids to int64
-        model.use_mega_moe = True
+        # use_native_mega_moe=True converts input_ids to int64
+        model.use_native_mega_moe = True
         model.forward(ids, pos)
         model._prepare_engram.assert_called_once()
         call_ids = model._prepare_engram.call_args[0][0]

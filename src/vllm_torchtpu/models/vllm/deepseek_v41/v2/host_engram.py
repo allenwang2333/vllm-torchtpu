@@ -23,7 +23,15 @@ import torch
 from vllm.distributed import get_engram_dp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.models.deepseek_v41.common.engram import DEAD_ID
-from vllm.models.deepseek_v41.nvidia.engram import engram_gathered_num_tokens
+
+try:
+    from vllm.models.deepseek_v41.common.engram import (
+        engram_gathered_num_tokens,
+    )
+except ImportError:
+    from vllm.models.deepseek_v41.nvidia.engram import (
+        engram_gathered_num_tokens,
+    )
 
 from vllm_torchtpu import envs
 
@@ -499,7 +507,10 @@ def gather_host_engram_hashes(
                 return dp_group.all_gather(engram_hashes, dim=0)
     if gather_fn is not None:
         return gather_fn(engram_hashes, dp_shared_memory=dp_shared_memory)
-    from vllm.models.deepseek_v41.nvidia.engram import gather_engram_hashes
+    try:
+        from vllm.models.deepseek_v41.common.engram import gather_engram_hashes
+    except ImportError:
+        from vllm.models.deepseek_v41.nvidia.engram import gather_engram_hashes
 
     return gather_engram_hashes(engram_hashes, dp_shared_memory=dp_shared_memory)
 

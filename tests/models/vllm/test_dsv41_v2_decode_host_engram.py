@@ -757,7 +757,7 @@ class TestGatherHostEngramHashes:
     def test_fallback_import_when_gather_fn_none(self):
         hashes = torch.tensor([[[1, 2]]], device="meta")
         with patch(
-            "vllm.models.deepseek_v41.nvidia.engram.gather_engram_hashes",
+            "vllm.models.deepseek_v41.common.engram.gather_engram_hashes",
             return_value="default_nvidia_gather",
         ):
             out = gather_host_engram_hashes(
@@ -978,7 +978,7 @@ class TestModelDecodeEngram:
         model.end_layer = 1
 
         mock_engram = SimpleNamespace(
-            embed_tokens=SimpleNamespace(cpu_offload=cpu_offload),
+            embed_tokens=SimpleNamespace(host_offload=cpu_offload),
             layer_hash_index=0,
             prepare_embeddings=MagicMock(),
         )
