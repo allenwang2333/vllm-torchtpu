@@ -45,6 +45,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import (
     dcp_rank_operand,
     get_dcp_group,
+    get_dcp_world_size,
     get_or_create_dcp_mesh,
 )
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import parse_partition_override
@@ -367,6 +368,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         small_bucket_bq = envs.TPU_STREAMIDX_SMALL_BUCKET_BQ
         small_bucket_bkvp = envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
+        exact_rows = envs.TPU_INDEXER_TOPK_POST_FUSED
         # The DCP rank as a sharded operand (each rank's own index) instead of
         # an all_to_all inside the op; the tensor is built here, outside any
         # traced region, and appended to every call by `op` below.
@@ -423,6 +425,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 single_slice=single_slice,
                 local_topk_partition=local_topk_partition,
                 global_topk_partition=global_topk_partition,
+                exact_rows=exact_rows,
                 dcp_rank=dcp_rank,
             )
             return cache_kv, local_topk
@@ -1255,6 +1258,12 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         self.is_sparse = mla_modules.is_sparse
         self.skip_topk = skip_topk
         self.topk_indices_buffer = mla_modules.topk_indices_buffer
+        # TPU_INDEXER_TOPK_POST_FUSED: the DCP sparse MLA op reads the top-k
+        # table in place (its first num_tokens rows), so the `[:num_tokens]`
+        # view -- a copy at the op boundary -- is not taken.
+        self.topk_table_in_place = bool(
+            envs.TPU_INDEXER_TOPK_POST_FUSED and get_dcp_world_size() > 1
+        )
 
         if self.indexer is not None and not self.skip_topk:
             assert hasattr(self.indexer, "topk_tokens")
@@ -1458,7 +1467,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             else:
                 # reuse the indices an earlier layer wrote into the shared buffer.
                 topk_index = self.topk_indices_buffer
-            topk_indices = topk_index[: hidden_states.shape[0]]
+            if self.topk_table_in_place:
+                topk_indices = topk_index
+            else:
+                topk_indices = topk_index[: hidden_states.shape[0]]
 
             # print(f"top_k_indices.shape: {topk_indices.shape}, topk_indices: {topk_indices[0]}")  # noqa: E501
 

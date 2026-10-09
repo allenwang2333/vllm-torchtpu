@@ -627,6 +627,7 @@ def _effective_row_lengths(
         "single_slice",
         "skip_empty_decode",
         "topk_partition",
+        "exact_rows",
     ),
 )
 def streamindex_topk(
@@ -659,6 +660,7 @@ def streamindex_topk(
     single_slice: bool = False,
     skip_empty_decode: bool = False,
     topk_partition: int | None = None,
+    exact_rows: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -725,6 +727,9 @@ def streamindex_topk(
         result.
       topk_partition: forwarded to `sparsecore_topk` as ``partition``; forces
         its subcore partition factor. Same result.
+      exact_rows: forwarded to `sparsecore_topk`; its SparseCore calls read and
+        write exactly the real rows, without the pad-to-32 / slice copies.
+        Same result.
       skip_empty_decode: when the batch has no decode (q_len 1) sequence --
         every step under speculative decoding, whose decode rows have q_len
         gamma + 1 and go to the MIXED pass -- branch at runtime around the two
@@ -1164,6 +1169,7 @@ def streamindex_topk(
                 fused_payload=fused_payload,
                 single_slice=single_slice,
                 partition=topk_partition,
+                exact_rows=exact_rows,
             )
             topk_idxs.append(chunk_topk_idxs)
             if need_scores:
@@ -1234,6 +1240,7 @@ def streamindex_topk(
         "skip_empty_decode",
         "local_topk_partition",
         "global_topk_partition",
+        "exact_rows",
     ),
 )
 def streamindex_topk_dcp(
@@ -1262,6 +1269,7 @@ def streamindex_topk_dcp(
     skip_empty_decode: bool = False,
     local_topk_partition: int | None = None,
     global_topk_partition: int | None = None,
+    exact_rows: bool = False,
     dcp_rank: jax.Array | None = None,  # i32[dcp_size], sharded over the axis
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
@@ -1329,6 +1337,9 @@ def streamindex_topk_dcp(
       local_topk_partition / global_topk_partition: the ``partition`` of the
         per-rank and the cross-rank merge `sparsecore_topk` calls (None = its
         heuristic). Same result.
+      exact_rows: every SparseCore top-k and pack call reads and writes exactly
+        the `padded_num_tokens` real rows -- no pad to a multiple of 32 rows in
+        front of a kernel and no `[:rows]` slice copy behind it. Same result.
       dcp_rank: `jnp.arange(dcp_size)` sharded over `dcp_axis_name` (each rank
         passes its own position), read in place of the per-call
         `cp_rank_as_data` all_to_all. A caller going through torch_tpu must
@@ -1402,6 +1413,7 @@ def streamindex_topk_dcp(
             single_slice=single_slice,
             skip_empty_decode=skip_empty_decode,
             topk_partition=local_topk_partition,
+            exact_rows=exact_rows,
         )
 
         # Stage 1. All-gather the scores; the indices stay home.
@@ -1427,16 +1439,20 @@ def streamindex_topk_dcp(
                 ),
                 fused_payload=True,
                 partition=global_topk_partition,
+                exact_rows=exact_rows,
             )
-            return dcp_sc_compact.pack_nonnegative(owned)
+            return dcp_sc_compact.pack_nonnegative(owned, exact_rows=exact_rows)
         slots = sparsecore_topk(
             scores,
             k,
             row_lengths=full_rows,
             write_empty_rows=True,
             partition=global_topk_partition,
+            exact_rows=exact_rows,
         )
-        return dcp_sc_compact.resolve_owned_winners(idxs, slots, k, dcp_rank)
+        return dcp_sc_compact.resolve_owned_winners(
+            idxs, slots, k, dcp_rank, exact_rows=exact_rows
+        )
 
     replicated = P()
     rank_args = () if dcp_rank is None else (dcp_rank,)

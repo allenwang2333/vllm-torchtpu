@@ -2161,6 +2161,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         k_scale = None
         if layer.kv_cache_quantized_dtype is not None:
             _, k_scale, _ = self._get_kv_scales(layer)
+        post_fused = bool(envs.TPU_INDEXER_TOPK_POST_FUSED)
         # TPU_DCP_RANK_OPERAND: the DCP rank rides in as a sharded operand,
         # built here outside any traced region and appended to every call.
         rank_operand = dcp_rank_operand() if envs.TPU_DCP_RANK_OPERAND else None
@@ -2200,6 +2201,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
                 dcp_rank=dcp_rank,
+                post_fused=post_fused,
             )
 
         # torch_tpu infers the op's schema from the annotated signature, so

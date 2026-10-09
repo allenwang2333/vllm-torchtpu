@@ -399,6 +399,34 @@ def test_dcp_topk_partition_is_bit_identical(partition, fused_payload, q_len, dc
     assert (got >= 0).any()
 
 
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 8])
+@pytest.mark.parametrize("q_len", [16, 40, Q_LEN])
+@pytest.mark.parametrize("fused_payload", [False, True])
+@pytest.mark.parametrize("single_slice", [False, True])
+def test_dcp_exact_rows_is_bit_identical(single_slice, fused_payload, q_len, dcp_size):
+    """`exact_rows` (TPU_INDEXER_TOPK_POST_FUSED) changes no output element.
+
+    q_len=16 is the decode bucket: every SparseCore call runs 16 of its 32
+    rows, which is where the pad/slice copies the flag removes live. 40 is a
+    second partial wave; Q_LEN is a whole number of waves (flag is a no-op).
+    """
+    _need_devices(dcp_size)
+    if q_len % dcp_size:
+        pytest.skip("q_len must divide over the DCP ranks")
+    _, args, kwargs = _dcp_case(dcp_size, 13, q_len=q_len)
+    kwargs = dict(
+        kwargs,
+        fused_payload=fused_payload,
+        single_slice=single_slice,
+        global_topk_partition=1,
+    )
+    want = np.asarray(streamindex_topk_dcp(*args, **kwargs))
+    got = np.asarray(streamindex_topk_dcp(*args, **kwargs, exact_rows=True))
+    np.testing.assert_array_equal(got, want)
+    assert (got >= 0).any()
+
+
 def _rank_operand(mesh, dcp_size):
     """What `dcp_rank_operand` hands the op: arange sharded over the DCP axis."""
     return jax.device_put(

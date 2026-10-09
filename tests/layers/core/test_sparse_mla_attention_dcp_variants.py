@@ -19,6 +19,9 @@ the partial lse -- against the default call on the same inputs:
 
 * `dcp_rank` (TPU_DCP_RANK_OPERAND): the rank as a sharded operand instead of
   the per-call `all_to_all`.
+* `post_fused` (TPU_INDEXER_TOPK_POST_FUSED): the "owns nothing" dummy slot 0
+  and the `-inf` lse applied inside the capped window prep / attention kernel,
+  and the top-k table read in place from a taller buffer.
 
 The inputs are the decode shape the GLM-5.2 MTP drafter and backbone run:
 16 token rows, four sequences of q_len 4 with the last one empty (rows 12..15
@@ -205,16 +208,16 @@ class SparseMlaAttentionDcpVariantsTest(parameterized.TestCase):
 
     @parameterized.product(
         dcp_size=[2, 8],
-        variant=["rank"],
+        variant=["rank", "fused", "fused_table", "rank_fused_table"],
         capped_prep=[True, False],
     )
     def test_variant_is_bit_identical(self, dcp_size, variant, capped_prep):
         self._require(dcp_size)
         mesh, args, rows, table, rank = self._case(dcp_size, seed=dcp_size)
         env = dict(SERVED_ENV, TPU_DCP_MLA_CAPPED_PREP="1" if capped_prep else "0")
-        want = self._run(dcp_size, mesh, args, rows, env)
+        want = self._run(dcp_size, mesh, args, rows, env, post_fused=False)
 
-        kw = {}
+        kw = dict(post_fused=False)
         topk = rows
         if "rank" in variant:
             kw["dcp_rank"] = rank
