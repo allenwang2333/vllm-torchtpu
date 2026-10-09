@@ -59,12 +59,12 @@ def dtype_max(dtype: jnp.dtype) -> float:
 
 
 def is_floating_dtype(dtype: torch.dtype) -> bool:
-    return torch.is_floating_point(torch.empty((), dtype=dtype))
+    return dtype.is_floating_point
 
 
 def _safe_inverse_scale(scale: torch.Tensor) -> torch.Tensor:
     """Return 1 / scale while keeping zero-scale blocks exactly zero."""
-    return torch.where(scale == 0, torch.zeros_like(scale), 1.0 / scale)
+    return torch.where(scale == 0, 0.0, 1.0 / scale)
 
 
 def static_per_tensor_quantize_tensor(
@@ -204,9 +204,11 @@ def dequantize_tensor(
 
     if tensor_q.ndim == scale.ndim:
         # Block quantized - need to reshape for broadcasting
+        axis_normalized = sorted(a % tensor_q.ndim for a in axis)
+        axis_set = set(axis_normalized)
         blocked_shape = []
         for i, dim in enumerate(orig_shape):
-            if i in [(a + tensor_q.ndim) % tensor_q.ndim for a in axis]:
+            if i in axis_set:
                 num_blocks = scale.shape[i]
                 block_size = dim // num_blocks
                 blocked_shape.extend([num_blocks, block_size])
@@ -214,7 +216,6 @@ def dequantize_tensor(
                 blocked_shape.append(dim)
 
         # Calculate the axis positions after reshaping
-        axis_normalized = sorted([(a + tensor_q.ndim) % tensor_q.ndim for a in axis])
         expanded_axis = [1 + n + a for n, a in enumerate(axis_normalized)]
 
         tensor_q = tensor_q.reshape(blocked_shape)
@@ -258,10 +259,8 @@ def quantize_tensor(
             f"block_size={block_size}."
         )
 
-    if torch.empty((), dtype=quant_dtype).is_floating_point():
-        dtype_info = torch.finfo(quant_dtype)
-    else:
-        dtype_info = torch.iinfo(quant_dtype)
+    is_floating = quant_dtype.is_floating_point
+    dtype_info = torch.finfo(quant_dtype) if is_floating else torch.iinfo(quant_dtype)
 
     axis = axis % tensor.ndim
     moved = tensor.movedim(axis, -1)
@@ -305,7 +304,7 @@ def quantize_tensor(
     blocked_q = torch.clamp(
         blocked * scale_inv, min=float(dtype_info.min), max=float(dtype_info.max)
     )
-    if not is_floating_dtype(quant_dtype):
+    if not is_floating:
         # A float->int cast truncates toward zero, biasing every element by
         # half an LSB; float dtypes already round in the cast. Half-to-even,
         # matching `quantized_matmul.util.quantize_block`.
@@ -394,9 +393,11 @@ def quantize_tensor_to_fp4(
     orig_shape = tensor.shape
 
     # Reshape to expose block structure
+    axis_normalized = sorted(a % tensor.ndim for a in axis)
+    axis_set = set(axis_normalized)
     blocked_shape = []
     for i, dim in enumerate(orig_shape):
-        if i in [(a + tensor.ndim) % tensor.ndim for a in axis]:
+        if i in axis_set:
             if dim % block_size != 0:
                 raise ValueError(
                     f"Dimension {i} of size {dim} is not divisible by "
@@ -407,7 +408,6 @@ def quantize_tensor_to_fp4(
         else:
             blocked_shape.append(dim)
 
-    axis_normalized = sorted([a % tensor.ndim for a in axis])
     expanded_axis = [1 + n + a for n, a in enumerate(axis_normalized)]
 
     tensor_blocked = tensor.reshape(blocked_shape)

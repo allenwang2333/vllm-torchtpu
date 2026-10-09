@@ -106,3 +106,14 @@ def test_unique_rows_and_original_output_on_every_tp_rank(groups, rows, alignmen
 def test_invalid_replica_groups_are_rejected(groups):
     with pytest.raises(ValueError):
         TokenReplicaLayout.create(ep=4, input_rows=16, groups=groups)
+
+
+def test_invalid_ep_rows_or_alignment_are_rejected():
+    with pytest.raises(ValueError, match="must be positive"):
+        TokenReplicaLayout.create(ep=0, input_rows=16)
+    with pytest.raises(ValueError, match="must be positive"):
+        TokenReplicaLayout.create(ep=4, input_rows=0)
+    with pytest.raises(ValueError, match="power of two"):
+        TokenReplicaLayout.create(ep=4, input_rows=16, row_alignment=0)
+    with pytest.raises(ValueError, match="power of two"):
+        TokenReplicaLayout.create(ep=4, input_rows=16, row_alignment=3)

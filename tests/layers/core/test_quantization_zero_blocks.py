@@ -13,12 +13,25 @@
 # limitations under the License.
 """Regression tests for zero-valued quantization blocks."""
 
+import jax.numpy as jnp
+import pytest
 import torch
 
 from vllm_torchtpu.layers.core.quantization import (
+    dequantize_tensor,
+    dtype_max,
+    is_floating_dtype,
+    pack_fp4_indices,
+    quantize_kv,
     quantize_tensor,
     quantize_tensor_to_fp4,
+    static_per_tensor_quantize_tensor,
 )
+
+
+@pytest.fixture
+def device():
+    return torch.device("cpu")
 
 
 def test_quantize_tensor_keeps_zero_rows_finite(device):
@@ -40,9 +53,9 @@ def test_quantize_tensor_keeps_zero_rows_finite(device):
 
 def test_quantize_tensor_uses_reciprocal_multiply_scale_rounding():
     tensor = torch.tensor([[0.0010000200709328055]], device="cpu", dtype=torch.float32)
-    dtype_max = float(torch.finfo(torch.float8_e4m3fn).max)
+    max_val = float(torch.finfo(torch.float8_e4m3fn).max)
     expected_scale = tensor.abs().amax(dim=-1, keepdim=True) * torch.tensor(
-        1.0 / dtype_max, dtype=torch.float32
+        1.0 / max_val, dtype=torch.float32
     )
 
     _, scale = quantize_tensor(
@@ -72,3 +85,50 @@ def test_quantize_tensor_to_fp4_keeps_zero_blocks_finite(device):
             [[0.0, 1.0 / 6.0], [2.0 / 6.0, 0.0]], device=device, dtype=torch.float32
         ),
     )
+
+
+def test_quantization_helpers_and_validation_branches():
+    assert dtype_max(jnp.int8) == 127.0
+    assert dtype_max(jnp.float8_e4m3fn) == 448.0
+    assert is_floating_dtype(torch.float32) is True
+    assert is_floating_dtype(torch.int8) is False
+
+    with pytest.raises(ValueError, match="non-zero"):
+        static_per_tensor_quantize_tensor(torch.ones(2), torch.int8, 0.0)
+
+    q_fp8 = static_per_tensor_quantize_tensor(
+        torch.tensor([1.0, -2.0]), torch.float8_e4m3fn, 0.5
+    )
+    assert q_fp8.dtype == torch.float8_e4m3fn
+    q_int8 = static_per_tensor_quantize_tensor(
+        torch.tensor([1.0, -2.0]), torch.int8, 0.5
+    )
+    assert q_int8.dtype == torch.int8
+
+    k_only, v_none = quantize_kv(torch.int8, torch.tensor([2.0, -4.0]), None, 0.5)
+    assert k_only.dtype == torch.int8 and v_none is None
+    k_q, v_q = quantize_kv(
+        torch.int8,
+        torch.tensor([2.0, -4.0]),
+        torch.tensor([1.0, -1.0]),
+        k_scale=0.5,
+        v_scale=0.25,
+    )
+    assert k_q.dtype == torch.int8 and v_q is not None and v_q.dtype == torch.int8
+
+    # dequantize_tensor when tensor_q.ndim != scale.ndim (per-tensor scale)
+    dq = dequantize_tensor(
+        torch.tensor([[2, -4]], dtype=torch.int8),
+        torch.tensor(0.5, dtype=torch.float32),
+        axis=-1,
+    )
+    torch.testing.assert_close(dq, torch.tensor([[1.0, -2.0]]))
+
+    with pytest.raises(ValueError, match="divisible by block_size"):
+        quantize_tensor(torch.ones(2, 5), torch.int8, axis=-1, block_size=2)
+
+    with pytest.raises(ValueError, match="not divisible by block_size"):
+        quantize_tensor_to_fp4(torch.ones(2, 5), axis=[-1], block_size=2)
+
+    with pytest.raises(ValueError, match="Last dimension must be even"):
+        pack_fp4_indices(torch.zeros(2, 3, dtype=torch.int8))
