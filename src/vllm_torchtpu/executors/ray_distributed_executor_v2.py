@@ -101,7 +101,11 @@ class RayDistributedExecutorV2(RayExecutorV2):
             )
         return dp_size, int(dp_rank), world_size * dp_size
 
-    def _slice_host_layout(self, device_str: str) -> tuple[list[str], dict[str, int]]:
+    def _slice_host_layout(
+        self,
+        device_str: str,
+        ray_nodes: list[dict[str, Any]] | None = None,
+    ) -> tuple[list[str], dict[str, int]]:
         """Return the slice's hosts in rank order and their device counts.
 
         Each DP engine owns a placement group covering only its own chips, so
@@ -109,9 +113,11 @@ class RayDistributedExecutorV2(RayExecutorV2):
         from `ray.nodes()` and ordering by address gives every engine the same
         answer without any of them having to agree on anything.
         """
+        if ray_nodes is None:
+            ray_nodes = ray.nodes()
         hosts: list[tuple[int, str, int]] = []
         has_worker_id = True
-        for node in ray.nodes():
+        for node in ray_nodes:
             if not node.get("Alive", True):
                 continue
             resources = node.get("Resources", {})
@@ -194,9 +200,9 @@ class RayDistributedExecutorV2(RayExecutorV2):
         vLLM's base RayExecutorV2._init_executor(). The main differences are:
           1. We use a custom, TPU-optimized placement group initialization.
           2. We construct and propagate a rich set of TorchTPU multi-host
-             environment variables (e.g. RANK, LOCAL_RANK, WORLD_SIZE,
-             TORCH_TPU_SLICEBUILDER_ADDRESSES, etc.) as part of the worker's
-             env_vars.
+            environment variables (e.g. RANK, LOCAL_RANK, WORLD_SIZE,
+            TORCH_TPU_SLICEBUILDER_ADDRESSES, etc.) as part of the worker's
+            env_vars.
 
         TODO(ranlihao): Eventually, we should add a hook in the upstream vLLM
         RayExecutorV2 to customize/extend the placement group creation and
@@ -344,9 +350,11 @@ class RayDistributedExecutorV2(RayExecutorV2):
         # different quantity from the slice-local rank computed below, which
         # addresses the chips of the whole slice on a host.
         engine_node_workers: dict[str, list[int]] = defaultdict(list)
+        engine_local_ranks: list[int] = []
         for i, (node_id, physical_tpu_ids) in enumerate(
             worker_node_and_physical_tpu_ids
         ):
+            engine_local_ranks.append(len(engine_node_workers[node_id]))
             engine_node_workers[node_id].append(i)
             node_physical_tpu_ids[node_id].extend(physical_tpu_ids)
         for node_id, physical_tpu_ids in node_physical_tpu_ids.items():
@@ -395,6 +403,8 @@ class RayDistributedExecutorV2(RayExecutorV2):
 
         node_rank_by_ip = {ip: rank for rank, ip in enumerate(host_order)}
         num_nodes = len(host_order)
+        num_nodes_str = str(num_nodes)
+        dp_size_str = str(dp_size)
         master_addr = host_order[0]
         if dp_size > 1:
             # Every worker of every DP engine joins one TorchTPU world, so the
@@ -411,8 +421,8 @@ class RayDistributedExecutorV2(RayExecutorV2):
         # The topology describes the whole DP*TP slice, not this engine's
         # window of it, so it is keyed on slice_world_size.
         topology = get_tpu_multihost_topology(slice_world_size)
-        xprof_session_id = os.environ.get(
-            "TORCH_TPU_XPROF_SESSION_ID", str(time.time_ns())
+        xprof_session_id = os.environ.get("TORCH_TPU_XPROF_SESSION_ID") or str(
+            time.time_ns()
         )
         os.environ["TORCH_TPU_XPROF_SESSION_ID"] = xprof_session_id
 
@@ -494,20 +504,20 @@ class RayDistributedExecutorV2(RayExecutorV2):
 
         # Initialize workers with correct environment variables and local_rank.
         init_worker_refs = []
-        for i, (node_id, physical_ids) in enumerate(worker_node_and_physical_tpu_ids):
+        for i, (node_id, _physical_ids) in enumerate(worker_node_and_physical_tpu_ids):
             assignment = bundle_assignments[i]
             node_ip = assignment["node_ip"]
             # Slot inside this engine, handed to vLLM.
-            engine_local_rank = engine_node_workers[node_id].index(i)
+            engine_local_rank = engine_local_ranks[i]
             slice_rank, slice_local_rank, local_world_size = slice_placements[i]
             node_rank = node_rank_by_ip[node_ip]
-            assigned_physical_tpu_ids = sorted(node_physical_tpu_ids[node_id])
+            assigned_physical_tpu_ids = list(node_physical_tpu_ids[node_id])
 
             worker_env_vars = {
                 "LOCAL_WORLD_SIZE": str(local_world_size),
-                "NNODES": str(num_nodes),
+                "NNODES": num_nodes_str,
                 "NODE_RANK": str(node_rank),
-                "TPU_NUM_HOSTS": str(num_nodes),
+                "TPU_NUM_HOSTS": num_nodes_str,
                 "MASTER_ADDR": master_addr,
                 "MASTER_PORT": master_port,
                 "TORCH_TPU_TOPOLOGY": topology,
@@ -520,7 +530,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 # agree with the slice the executor actually built.
                 worker_env_vars.update(
                     {
-                        "TORCH_TPU_DP_SIZE": str(dp_size),
+                        "TORCH_TPU_DP_SIZE": dp_size_str,
                         "TORCH_TPU_DP_MASTER_ADDR": master_addr,
                         "TORCH_TPU_DP_MASTER_PORT": master_port,
                     }
@@ -566,7 +576,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
             )
         if len(node_physical_tpu_ids) == 1:
             node_id_0 = worker_node_and_physical_tpu_ids[0][0]
-            self.vllm_config.parallel_config.assigned_physical_gpu_ids = sorted(
+            self.vllm_config.parallel_config.assigned_physical_gpu_ids = list(
                 node_physical_tpu_ids[node_id_0]
             )
         ray.get(init_worker_refs)
@@ -650,7 +660,9 @@ class RayDistributedExecutorV2(RayExecutorV2):
             # Pin each worker to a host in this engine's aligned block while
             # preserving one bundle per worker for VLLM_RAY_BUNDLE_INDICES.
             # The aligned-block check still covers chip assignment on a host.
-            host_order, chips_per_host = self._slice_host_layout(device_str)
+            host_order, chips_per_host = self._slice_host_layout(
+                device_str, ray_nodes=ray_nodes
+            )
             block_start = dp_rank * self.parallel_config.world_size
             block_end = block_start + self.parallel_config.world_size
             offset = 0
@@ -701,7 +713,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
             current_ip = get_ip()
             current_node_id = ray.get_runtime_context().get_node_id()
             current_node_info = next(
-                (n for n in ray.nodes() if n["NodeID"] == current_node_id), None
+                (n for n in ray_nodes if n["NodeID"] == current_node_id), None
             )
             current_node_resource = (
                 current_node_info.get("Resources", {}) if current_node_info else {}

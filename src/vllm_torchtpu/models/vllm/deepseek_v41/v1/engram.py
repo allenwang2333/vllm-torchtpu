@@ -26,7 +26,8 @@ class NgramHashState(common.NgramHashState):
             return super().ensure_cache()
         # The kernel property derives a view of the canonical pool. Lifetime
         # tracking must use the stable allocator object, not that temporary view.
-        kv_cache = self.swa_cache_module.bound_cache
+        swa_mod = self.swa_cache_module
+        kv_cache = swa_mod.bound_cache
         if not kv_cache.numel():
             self._cache = None
             self._kv_cache_ref = None
@@ -37,7 +38,7 @@ class NgramHashState(common.NgramHashState):
         # block size copied at model construction. Match the bound view
         # used by slot_mapping and block_table before upstream sizes its
         # generated-token history cache.
-        block_size = self.swa_cache_module.block_size
+        block_size = swa_mod.block_size
         if self.block_size != block_size:
             self.block_size = block_size
             self._kv_cache_ref = None
