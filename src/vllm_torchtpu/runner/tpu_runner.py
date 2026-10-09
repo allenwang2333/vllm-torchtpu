@@ -4847,6 +4847,8 @@ class TPUModelRunner(GPUModelRunner):
                     if next_tokens_tpu.device.type == "tpu":
                         next_tokens_ready_event = torch.tpu.Event()
                         next_tokens_ready_event.record()
+                if self._pre_async_results is not None:
+                    self._pre_async_results.wait_for_next_tokens_cpu()
                 self._pre_async_results = AsyncPreResults(
                     req_ids=req_ids,
                     next_tokens_tpu=next_tokens_tpu,
@@ -4860,6 +4862,8 @@ class TPUModelRunner(GPUModelRunner):
                     next_tokens_ready_event=next_tokens_ready_event,
                 )
             else:
+                if self._pre_async_results is not None:
+                    self._pre_async_results.wait_for_next_tokens_cpu()
                 self._pre_async_results = None
 
         pooler_output = []
@@ -6635,9 +6639,18 @@ class TPUModelRunner(GPUModelRunner):
         # D2H / placeholder rollback on the torn-down synthetic request, and no
         # in-flight copy host buffer is freed mid-transfer (defensive: covers the
         # `if present:`-skip path). No-op in sync (always None).
+        try:
+            from vllm_torchtpu.models.vllm.deepseek_v41.engram import (
+                _get_prefetch_state,
+            )
+
+            _get_prefetch_state(consume=True)
+        except Exception:
+            pass
         if self._pre_async_results is not None:
             try:
                 self._pre_async_results.wait_for_copy()
+                self._pre_async_results.wait_for_next_tokens_cpu()
             except Exception:
                 cleanup_succeeded = False
                 logger.exception("spec-decode warmup async copy wait failed")

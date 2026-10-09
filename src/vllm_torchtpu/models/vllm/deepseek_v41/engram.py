@@ -783,6 +783,31 @@ def engram_prefetch_prefill(
             "row_bytes": row_bytes,
         }
 
+    # Resolve all PJRT / torch_tpu D2H copies and tensor data_ptrs synchronously
+    # on the main worker thread across all TP ranks before any n_real_local == 0
+    # early return so every TP rank drains pre_async D2H events symmetrically and
+    # background threads never race with PJRT's non-thread-safe C++ event lists.
+    _ensure_engram_ptrs(table_ids)
+    sampled_main_np: np.ndarray | None = None
+    pre_sampled_main_np: np.ndarray | None = None
+    next_main_np: np.ndarray | None = None
+    if pre_async is not None:
+        if spec_async_subst is not None:
+            pre_sampled_t = pre_async.wait_for_copy()
+            next_t_fn = getattr(pre_async, "wait_for_next_tokens_cpu", None)
+            next_t = next_t_fn() if callable(next_t_fn) else None
+            if next_t is None:
+                next_tpu: Any = getattr(pre_async, "next_tokens_tpu", None)
+                if isinstance(next_tpu, torch.Tensor):
+                    next_t = next_tpu.to("cpu")
+            if pre_sampled_t is not None and next_t is not None:
+                pre_sampled_main_np = pre_sampled_t.detach().to(torch.int64).numpy()
+                if pre_sampled_main_np.ndim == 1:
+                    pre_sampled_main_np = pre_sampled_main_np[:, None]
+                next_main_np = next_t.detach().reshape(-1).to(torch.int64).numpy()
+        elif norm_subst is not None:
+            sampled_main_np = _resolve_async_tokens_cpu(pre_async)
+
     if n_real_local == 0 and debug_tok0_out is None:
         _ENGRAM_PREFETCH = pf_meta
         return
@@ -799,32 +824,6 @@ def engram_prefetch_prefill(
         valid_g = (g_pre >= 0) & (g_pre < sampled_arr.shape[0])
         for ti, pi in zip(g_tok[valid_g].tolist(), g_pre[valid_g].tolist()):
             debug_tok0_out[int(ti)] = int(sampled_arr[pi])
-
-    # Resolve all PJRT / torch_tpu D2H copies and tensor data_ptrs synchronously
-    # on the main worker thread before launching background OpenMP work so
-    # background threads never race with PJRT's non-thread-safe C++ event lists.
-    _ensure_engram_ptrs(table_ids)
-    sampled_main_np: np.ndarray | None = None
-    pre_sampled_main_np: np.ndarray | None = None
-    next_main_np: np.ndarray | None = None
-    if pre_async is not None:
-        if local_subst is not None:
-            sampled_main_np = _resolve_async_tokens_cpu(pre_async)
-        elif spec_async_subst is not None:
-            pre_sampled_t = pre_async.wait_for_copy()
-            next_t_fn = getattr(pre_async, "wait_for_next_tokens_cpu", None)
-            next_t = next_t_fn() if callable(next_t_fn) else None
-            if next_t is None:
-                next_tpu: Any = getattr(pre_async, "next_tokens_tpu", None)
-                if isinstance(next_tpu, torch.Tensor):
-                    next_t = next_tpu.to("cpu")
-            if pre_sampled_t is not None and next_t is not None:
-                pre_sampled_main_np = pre_sampled_t.detach().to(torch.int64).numpy()
-                if pre_sampled_main_np.ndim == 1:
-                    pre_sampled_main_np = pre_sampled_main_np[:, None]
-                next_main_np = next_t.detach().reshape(-1).to(torch.int64).numpy()
-        elif debug_tok0_out is not None and norm_subst is not None:
-            sampled_main_np = _resolve_async_tokens_cpu(pre_async)
 
     def _bg_hash_and_gather() -> dict[str, Any]:
         if n_real_local > 0:

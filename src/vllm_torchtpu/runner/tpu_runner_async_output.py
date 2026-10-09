@@ -160,6 +160,7 @@ class AsyncPreResults:
     _next_tokens_completed: bool = False
 
     def wait_for_copy(self) -> torch.Tensor | None:
+        self.wait_for_next_tokens_cpu()
         if self.copy_state is None:
             return None
         self.copy_state.wait()
