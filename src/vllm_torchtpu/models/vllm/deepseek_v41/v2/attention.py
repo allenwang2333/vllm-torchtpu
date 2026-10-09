@@ -721,9 +721,48 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
 
         return cast(Callable, VllmDeepseekV4MLAAttention.kv_rope_op.fget)(self)
 
+    def _get_stage_tp_rank(self, stage_cache: dict[Any, Any] | None = None):
+        rank = self._tp_rank
+        if stage_cache is not None and isinstance(rank, torch.Tensor):
+            return stage_cache.setdefault(
+                ("stage_tp_rank", rank.device, rank.dtype), rank
+            )
+        return rank
+
+    def _get_stage_tp_rank_1d(self, stage_cache: dict[Any, Any] | None = None):
+        rank_1d = self._tp_rank_1d
+        if stage_cache is not None and isinstance(rank_1d, torch.Tensor):
+            key = ("stage_tp_rank_1d", rank_1d.device)
+            cached = stage_cache.get(key)
+            if cached is None:
+                cached = (
+                    rank_1d
+                    if rank_1d.shape == (1,) and rank_1d.dtype == torch.int32
+                    else rank_1d.reshape(1).int()
+                )
+                stage_cache[key] = cached
+            return cached
+        return rank_1d
+
+    def _get_stage_rope_cache(self, stage_cache: dict[Any, Any] | None = None):
+        rope_cache = self._tpu_rope_cache
+        if stage_cache is not None and isinstance(rope_cache, torch.Tensor):
+            return stage_cache.setdefault(
+                (
+                    "stage_tpu_rope_cache",
+                    rope_cache.device,
+                    rope_cache.shape,
+                    rope_cache.dtype,
+                ),
+                rope_cache,
+            )
+        return rope_cache
+
     def _rotate(self, values, positions, inverse=False):
         if values.device.type != "cpu" and not inverse:
-            return self.kv_rope_op(values, positions, self._tpu_rope_cache)
+            return self.kv_rope_op(
+                values, positions, self._get_stage_rope_cache(_active_stage_attn_cache)
+            )
         return rotary(
             values.unsqueeze(0),
             positions,
@@ -1030,8 +1069,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 b2 = swa_table[requests, pos_col].long()
                 swa_slots = (b2 * rows_per_page + pos_rem).masked_fill(~valid_token, -1)
                 swa_valid = swa_slots >= 0
+                swa_valid_int32 = swa_valid.int()
                 swa_invalid_3d = (~swa_valid)[:, None, None]
                 valid_window = base_valid_window & swa_valid[:, None]
+                invalid_window = ~valid_window
                 if swa_3page is not None:
                     (
                         c_last,
@@ -1071,8 +1112,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     swa.block_tables,
                     swa_slots,
                     swa_valid,
+                    swa_valid_int32,
                     swa_invalid_3d,
                     valid_window,
+                    invalid_window,
                     swa_row_slots,
                 )
             else:
@@ -1080,13 +1123,16 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     _,
                     swa_slots,
                     swa_valid,
+                    swa_valid_int32,
                     swa_invalid_3d,
                     valid_window,
+                    invalid_window,
                     swa_row_slots,
                 ) = cached_swa_slots
         else:
             swa_slots = _cache_slots(swa_cache, swa, positions)
             swa_valid = swa_slots >= 0
+            swa_valid_int32 = swa_valid
             swa_invalid_3d = (~swa_valid)[:, None, None]
             requests = _token_requests(swa, positions).clamp(max=swa_table.shape[0] - 1)
             if non_causal and swa.seq_lens.numel() > 0:
@@ -1117,6 +1163,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     "deepseek_v41_replay_starts"
                 ]
                 valid_window = valid_window & (logical >= replay_starts[requests, None])
+            invalid_window = ~valid_window
             raw_row_slots = (
                 _row_slots(swa_cache, swa_table, requests, logical) if tiled else None
             )
@@ -1133,7 +1180,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 swa_cache.row_offset + swa_row_slots
                 if has_fast_swa_offset and rows_per_page is not None
                 else swa_cache.row_indices(swa_row_slots)
-            ).masked_fill(~valid_window, -1)
+            ).masked_fill(invalid_window, -1)
             if swa_row_slots is not None
             else None
         )
@@ -1174,7 +1221,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         rows = window
         valid_rows = valid_window
         main_cache = swa_cache
-        main_records = positions.new_empty((count, 0))
+        main_records = (
+            None
+            if self.compress_ratio
+            else positions.new_empty((count, 0), dtype=torch.int32)
+        )
         pages = starts = None
         owner_layout = getattr(swa, "owner_token_layout", None)
         owner_perm = getattr(swa, "owner_perm", getattr(owner_layout, "perm", None))
@@ -1373,8 +1424,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     ]
                 main_cache = source.kv_cache
                 if segmented_main and owner_perm is not None:
+                    tp_rank = self._get_stage_tp_rank(stage_cache)
                     seg_perm = owner_perm[
-                        self._tp_rank * sel_count : (self._tp_rank + 1) * sel_count
+                        tp_rank * sel_count : (tp_rank + 1) * sel_count
                     ]
                     seg_valid = seg_perm >= 0
                     seg_idx = seg_perm.clamp(min=0).long()
@@ -1408,6 +1460,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         if pages is None:
                             pages = main_cache.pages(_block_table(source_meta))
                             if stage_cache is not None and pages is not None:
+                                if pages.dtype != torch.int32:
+                                    pages = pages.int()
                                 stage_cache[pages_key] = pages
                     else:
                         pages = None
@@ -1420,6 +1474,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             if owner_q_loc is not None
                             else source_meta.query_start_loc
                         )
+                        if stage_cache is not None and starts.dtype != torch.int32:
+                            starts = starts.int()
                     else:
                         slots = _row_slots(
                             main_cache,
@@ -1448,7 +1504,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     rows = torch.cat((window, compressed_rows), 1)
                     valid_rows = torch.cat((valid_window, valid_compressed), 1)
         if tiled:
-            assert records is not None
+            assert records is not None and main_records is not None
+            tp_rank_1d = self._get_stage_tp_rank_1d(stage_cache)
             owner_kwargs = (
                 {
                     "owner_perm": owner_perm,
@@ -1467,19 +1524,19 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     self._wq_b_full,
                     self._wq_b_full_scale,
                     positions,
-                    self._tpu_rope_cache,
+                    self._get_stage_rope_cache(stage_cache),
                     swa_cache,
                     main_cache,
                     records,
                     main_records,
                     self.attn_sink,
                     self._full_attn_sink,
-                    self._tp_rank_1d,
+                    tp_rank_1d,
                     self.wo_a.weight,
                     self.wo_a.weight_scale,
                     self._wo_a_full,
                     self._wo_a_full_scale,
-                    swa_valid,
+                    swa_valid_int32,
                     self.scale,
                     pages,
                     starts,
@@ -1506,7 +1563,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     precompacted=self._precompact_records,
                     token_parallel=self._token_parallel_attn,
                     full_sink=self._full_attn_sink,
-                    tp_rank=self._tp_rank_1d,
+                    tp_rank=tp_rank_1d,
                     fused_swa=envs.TPU_DEEPSEEK_V41_FUSED_SWA,
                     **owner_kwargs,
                 )
@@ -1526,7 +1583,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         or getattr(swa_cache, "sharded", False)
                     ),
                     full_sink=self._full_attn_sink,
-                    tp_rank=self._tp_rank_1d,
+                    tp_rank=tp_rank_1d,
                     **owner_kwargs,
                 )
             output.copy_(result.masked_fill(swa_invalid_3d, 0))
@@ -1676,16 +1733,15 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             active_lengths = lengths.masked_fill(swa_slots[:, None] < 0, 0)
             batch_max = active_lengths.max()
             if split:
+                tp_rank = self._get_stage_tp_rank(stage_cache)
                 if owner_perm is not None:
                     part = owner_perm.shape[0] // ranks
                     padding = 1
-                    seg_perm = owner_perm[
-                        self._tp_rank * part : (self._tp_rank + 1) * part
-                    ]
+                    seg_perm = owner_perm[tp_rank * part : (tp_rank + 1) * part]
                     mine = torch.where(seg_perm >= 0, seg_perm, count).to(torch.int32)
                 else:
                     part, padding = _query_split(count, ranks, kv_shard=kv_shard)
-                    mine = self._tp_rank * part + torch.arange(
+                    mine = tp_rank * part + torch.arange(
                         part, dtype=torch.int32, device=qr.device
                     )
                 positions_part, lengths_part, requests_part = (
@@ -1901,7 +1957,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         projected = self.o_proj_op(
             output,
             positions,
-            self._tpu_rope_cache,
+            self._get_stage_rope_cache(_active_stage_attn_cache),
             self.wo_a.weight,
             self.wo_a.weight_scale,
         )
