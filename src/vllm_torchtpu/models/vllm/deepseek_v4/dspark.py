@@ -36,25 +36,32 @@ from vllm_torchtpu.models.vllm.deepseek_v4.model import (
 logger = init_logger(__name__)
 
 
+_MTP_NAME_RE = re.compile(r"mtp\.(\d+)\.(.*)")
+_HEAD_AND_MAIN_PREFIXES = (
+    "main_proj.",
+    "main_norm.",
+    "norm.",
+    "hc_head_fn",
+    "hc_head_base",
+    "hc_head_scale",
+    "markov_head.",
+)
+
+
 def _remap_dspark_name(name: str) -> str | None:
     """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.
     Returns None for non-mtp weights (owned by the target model).
     """
-    m = re.match(r"mtp\.(\d+)\.(.*)", name)
+    if not name.startswith("mtp."):
+        return None
+    m = _MTP_NAME_RE.match(name)
     if m is None:
         return None
     stage = int(m.group(1))
     rest = m.group(2)
     if rest.startswith("confidence_head."):
         return None
-    head_prefixes = (
-        "norm.",
-        "hc_head_fn",
-        "hc_head_base",
-        "hc_head_scale",
-        "markov_head.",
-    )
-    if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(head_prefixes):
+    if rest.startswith(_HEAD_AND_MAIN_PREFIXES):
         return f"model.{rest}"
     return f"model.layers.{stage}.{rest}"
 
@@ -214,6 +221,11 @@ class DSparkDeepseekV4Model(nn.Module):
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
         )
+        self._draft_attn_causal: tuple[bool, ...] = (False,) * len(self.layers)
+        self._draft_kv_cache_layer_names: tuple[str, ...] = tuple(
+            layer.attn.swa_cache_layer.prefix
+            for layer in cast(Iterable[DeepseekV4DecoderLayer], self.layers)
+        )
 
     # Borrowed from the target: the lazily built MHC post op, the expert
     # mapping, and the per-layer loader.
@@ -233,13 +245,10 @@ class DSparkDeepseekV4Model(nn.Module):
     def get_draft_attn_causal(self) -> list[bool]:
         # In-block attention is non-causal; consumed by the DSV4 attention
         # op's draft mode, not by the dense RPA kernel-init path.
-        return [False] * len(self.layers)
+        return list(self._draft_attn_causal)
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
-        return [
-            layer.attn.swa_cache_layer.prefix
-            for layer in cast(Iterable[DeepseekV4DecoderLayer], self.layers)
-        ]
+        return list(self._draft_kv_cache_layer_names)
 
     def precompute_and_store_context_kv(
         self,
