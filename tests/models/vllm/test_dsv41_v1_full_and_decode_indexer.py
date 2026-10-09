@@ -5,6 +5,7 @@ v1/ops.py, v1/replay_plan.py, v1/attention.py, v1/model.py, and diffs.
 
 from __future__ import annotations
 
+import functools
 import os
 import sys
 from dataclasses import dataclass, field
@@ -488,17 +489,18 @@ class TestV1Attention:
             == "target_cache"
         )
 
-        # kv_cache getter/setter
-        attn._bound_cache = ("nope", "rope")
-        attn._tpu_raw_cache = None
+        # kv_cache getter/setter: the setter clears the raw-cache view, so the
+        # getter falls back to the bound pair.
+        v1_attention.DeepseekV41Attention.kv_cache.fset(attn, ("nope", "rope"))
+        assert attn._tpu_viewed_cache is None
         assert v1_attention.DeepseekV41Attention.kv_cache.fget(attn) == (
             "nope",
             "rope",
         )
 
+        # A bound raw cache is exposed through its kernel-shaped view.
         raw = torch.zeros(16, 64)
-        attn._tpu_raw_cache = raw
-        attn._tpu_kernel_shape = (4, 4, 64)
+        attn._tpu_viewed_cache = (raw.view(4, 4, 64), "rope")
         got_raw, got_rope = v1_attention.DeepseekV41Attention.kv_cache.fget(attn)
         assert got_raw.shape == (4, 4, 64)
         assert got_rope == "rope"
@@ -775,6 +777,11 @@ class TestV1Attention:
             pool=torch.zeros(16, 16), layout="layout"
         )
         attn.window_size = 8
+        # The real offsets helper (a MagicMock attribute would stand in a mock).
+        attn._window_offsets = None
+        attn._get_window_offsets = functools.partial(
+            v1_attention.DeepseekV41Attention._get_window_offsets, attn
+        )
         attn.main_cache_layer = mock.MagicMock()
         attn.main_cache_layer.kv_cache = ("nope", "rope")
         attn.main_cache_layer.cache_num_states = 16
