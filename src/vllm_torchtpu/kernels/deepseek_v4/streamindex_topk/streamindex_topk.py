@@ -1251,9 +1251,15 @@ def streamindex_topk(
                 f"bkv_sz ({page_size} * {bkv_p} = {bkv_sz}) must be a multiple of 128."
             )
 
-    num_sublanes_total = max(
-        align_to(pages_per_seq, bkv_p) * page_size // 128
-        for bkv_p in num_kv_pages_per_blocks
+    # A whole number of (8, 128) tiles per token row makes the [T, sublanes, 128]
+    # scores the same bytes as the flat rows the SparseCore top-k reads, so the
+    # reshape between them is a bitcast rather than a relayout of every row.
+    num_sublanes_total = align_to(
+        max(
+            align_to(pages_per_seq, bkv_p) * page_size // 128
+            for bkv_p in num_kv_pages_per_blocks
+        ),
+        8,
     )
 
     def _block_sizes(num_queries_per_block, bkv_p, static_q_len):

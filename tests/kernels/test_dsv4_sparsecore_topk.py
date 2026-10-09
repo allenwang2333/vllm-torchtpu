@@ -62,9 +62,9 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
-# `n` for a given `--max-model-len`, mirroring `streamindex_topk.py:602-605`:
-# `align_to(pages_per_seq, bkv_p) * page_size // 128 * 128` with page_size=1024
-# and bkv_p=2 on the GLM path.
+# `n` for a given `--max-model-len`, mirroring `num_sublanes_total` in
+# `streamindex_topk.py`: `align_to(align_to(pages_per_seq, bkv_p) * page_size //
+# 128, 8) * 128` with page_size=1024 and bkv_p=2 on the GLM path.
 N_SHORT = 10240  # --max-model-len 9216
 N_128K = 133120  # --max-model-len 132096
 N_1M = 1048576  # --max-model-len 1048576, the GLM-5.2 DCP=16 shape
@@ -74,7 +74,7 @@ SEED = 20260904
 
 def _topk_n(max_model_len: int, page_size: int = 1024, bkv_p: int = 2) -> int:
     pages_per_seq = -(-max_model_len // page_size)
-    return _align_to(pages_per_seq, bkv_p) * page_size // 128 * 128
+    return _align_to(_align_to(pages_per_seq, bkv_p) * page_size // 128, 8) * 128
 
 
 def _reference_scores(
