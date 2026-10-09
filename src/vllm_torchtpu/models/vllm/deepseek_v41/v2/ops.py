@@ -101,32 +101,44 @@ def rotary(x, positions, config, *, compressed, inverse=False):
             (torch.arange(dim // 2, device=x.device) - low) / max(high - low, 1e-3)
         ).clamp(0, 1)
         frequencies = frequencies * (1 - ramp + ramp / yarn["factor"])
-    angles = positions.to(device=x.device, dtype=torch.float32)[:, None] * frequencies
+    pos_f32 = (
+        positions
+        if positions.device == x.device and positions.dtype == torch.float32
+        else positions.to(device=x.device, dtype=torch.float32)
+    )
+    angles = pos_f32[:, None] * frequencies
     shape = (1, len(positions), *((1,) * (x.ndim - 3)), dim // 2)
     cosine, sine = angles.cos().reshape(shape), angles.sin().reshape(shape)
     if inverse:
         sine = -sine
-    pairs = x[..., -dim:].float().unflatten(-1, (-1, 2))
+    x_rope = x[..., -dim:]
+    x_rope_f32 = x_rope if x.dtype == torch.float32 else x_rope.float()
+    pairs = x_rope_f32.unflatten(-1, (-1, 2))
     real, imag = pairs[..., 0], pairs[..., 1]
     rotated = torch.stack(
         (real * cosine - imag * sine, real * sine + imag * cosine), -1
     ).flatten(-2)
-    return torch.cat((x[..., :-dim], rotated.to(x.dtype)), -1)
+    rotated_out = rotated if x.dtype == torch.float32 else rotated.to(x.dtype)
+    if dim == x.shape[-1]:
+        return rotated_out
+    return torch.cat((x[..., :-dim], rotated_out), -1)
 
 
 def round_fp8_activation(x, block_size=32):
     if x.shape[-1] % block_size:
         raise ValueError("FP8 block size must divide contraction dimension")
-    blocks = x.float().unflatten(-1, (-1, block_size))
+    x_f32 = x if x.dtype == torch.float32 else x.float()
+    blocks = x_f32.unflatten(-1, (-1, block_size))
     scales = torch.pow(
         2.0, torch.ceil(torch.log2(blocks.abs().amax(-1).clamp_min(1e-4) / 448))
     )
     values = (blocks / scales.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
-    return (values.float() * scales.unsqueeze(-1)).flatten(-2).to(x.dtype)
+    dequant = (values.float() * scales.unsqueeze(-1)).flatten(-2)
+    return dequant if x.dtype == torch.float32 else dequant.to(x.dtype)
 
 
 def rms_norm(x, weight, eps):
-    normalized = x.float() * torch.rsqrt(
-        x.float().square().mean(-1, keepdim=True) + eps
-    )
-    return (normalized * weight.float()).to(x.dtype)
+    x_f32 = x if x.dtype == torch.float32 else x.float()
+    w_f32 = weight if weight.dtype == torch.float32 else weight.float()
+    out = x_f32 * torch.rsqrt(x_f32.square().mean(-1, keepdim=True) + eps) * w_f32
+    return out if x.dtype == torch.float32 else out.to(x.dtype)
