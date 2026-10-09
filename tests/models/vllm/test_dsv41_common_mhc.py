@@ -110,11 +110,14 @@ def _check_post_pre(tokens, dim, packed):
     same_path = mhc._pallas_tile(tokens, MIXES) == mhc._pallas_tile(
         tokens, MIXES, fused_post=True
     )
-    for g, s in zip((post, comb, value, new_pre), step_pre):
+    #    ``value`` is BF16, so a one-ulp rounding flip needs the BF16 tolerance.
+    tolerances = ((GATE_RTOL, GATE_ATOL),) * 2 + ((BF16_RTOL, BF16_ATOL),)
+    tolerances += ((GATE_RTOL, GATE_ATOL),)
+    for g, s, (rtol, atol) in zip((post, comb, value, new_pre), step_pre, tolerances):
         if same_path:
             np.testing.assert_array_equal(_np(g), _np(s))
         else:
-            np.testing.assert_allclose(_np(g), _np(s), rtol=GATE_RTOL, atol=GATE_ATOL)
+            np.testing.assert_allclose(_np(g), _np(s), rtol=rtol, atol=atol)
 
     # 2. Close agreement with vLLM PyTorch reference
     want_res = mhc_post_torch(x, residual, post_mix, comb_mix)
