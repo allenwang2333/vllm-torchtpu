@@ -95,7 +95,10 @@ local port = cdk.numVar('PORT', 47903);
 local dataParallelSize = cdk.numVar('DATA_PARALLEL_SIZE', 16);
 local tensorParallelSize = cdk.numVar('TENSOR_PARALLEL_SIZE', 1);
 local maxModelLen = cdk.numVar('MAX_MODEL_LEN', 1048576);
-local maxNumSeqs = cdk.numVar('MAX_NUM_SEQS', 8);
+// Evolve defaults (forge run x2vw65z3, j-9fc3926b: 86,862 vs 69,267 total tok/s for the values in the notes
+// below, j-c7c6502d): every step carries at most a 128-token prefill chunk, so the DP-wide bucket stays
+// at 128 instead of a 2048 mixed step every 8th step that all 16 ranks pay for.
+local maxNumSeqs = cdk.numVar('MAX_NUM_SEQS', 64);
 // Note: On TP=16, DP=1 (94.74 GiB HBM/core), MAX_NUM_BATCHED_TOKENS=2048 with GPU_MEMORY_UTILIZATION=0.90
 // allocates 3,208,656 HBM KV cache tokens (6,266 blocks) + 2,311,168 Host DRAM tokens (4,514 blocks)
 // = 5.52M total tokens, sustaining 62.1% HBM / 71.8% total cache hit rate and 31.95 tok/s at C=64.
@@ -119,14 +122,14 @@ local maxNumSeqs = cdk.numVar('MAX_NUM_SEQS', 8);
 //   Both limits only meet near 0.92, with ~35M to spare. 2048 at 0.90 had 15.59 GiB (1,264,937
 //   tokens, j-68dfea6b-1db1-465b-91ef). Interpolating, 3072 at 0.90 leaves ~13.4 GiB and ~2G of
 //   compile headroom.
-local maxNumBatchedTokens = cdk.numVar('MAX_NUM_BATCHED_TOKENS', 2048);
+local maxNumBatchedTokens = cdk.numVar('MAX_NUM_BATCHED_TOKENS', 128);
 // As in j-2c8a1b3b-17f0-4b33-bfb6. BLOCK_SIZE=0 drops --block-size and leaves it to vLLM.
 local blockSize = cdk.numVar('BLOCK_SIZE', 1024);
 local quantization = cdk.var('QUANTIZATION', 'deepseek_v4_fp8');
 local kvCacheDtype = cdk.var('KV_CACHE_DTYPE', 'fp8_e4m3');
 // Raising this enlarges the KV cache but shrinks the HBM left for compiling the largest token bucket after
 // it is allocated; vLLM's profile run under-counts that compile. See MAX_NUM_BATCHED_TOKENS above for 0.93.
-local gpuMemoryUtilization = cdk.var('GPU_MEMORY_UTILIZATION', '0.90');
+local gpuMemoryUtilization = cdk.var('GPU_MEMORY_UTILIZATION', '0.96');
 local enablePrefixCaching = cdk.boolVar('ENABLE_PREFIX_CACHING', true);
 // Token interval between retained sliding-window prefix-cache checkpoints (vLLM CacheConfig
 // prefix_cache_retention_interval). 32768 and the env-var spelling are the InferenceX B200 setup
@@ -158,14 +161,14 @@ local prefillGateLogSteps = cdk.var('TPU_PREFILL_GATE_LOG_STEPS', '');
 // TTFT doubled (9 s -> 18 s) and uncached prefill fell from 3.2k to 1.7-1.9k tok/s in the 16-interval
 // runs (j-430349bf-ea70-428e-9d1a, j-f74e6597-85ac-4f79-869a). j-9472b9c6-fc62-465a-bb63 ran 4.
 // PREFILL_SCHEDULE_INTERVAL=0 drops --prefill-schedule-interval.
-local prefillScheduleInterval = cdk.numVar('PREFILL_SCHEDULE_INTERVAL', 8);
+local prefillScheduleInterval = cdk.numVar('PREFILL_SCHEDULE_INTERVAL', 0);
 // LONG_PREFILL_TOKEN_THRESHOLD=0 drops --long-prefill-token-threshold (vLLM's default).
 // Default 512 - MAX_NUM_SEQS (504): the runner pads every DP rank to the MAX over ranks of step tokens,
 // rounded up to a power-of-two bucket, so one 512 chunk plus a few decodes (515) cost all 16 ranks a
 // 1024 forward and two chunks cost 2048. At 504 a chunk plus up to MAX_NUM_SEQS-1 decodes fits 512 and
 // two fit 1024. j-d0188942-b76b-47ec-98db (512) had ~2k real prefill tokens per prefill step across all
 // 16 ranks, against 1024-2048 buckets.
-local longPrefillTokenThreshold = cdk.numVar('LONG_PREFILL_TOKEN_THRESHOLD', 512 - maxNumSeqs);
+local longPrefillTokenThreshold = cdk.numVar('LONG_PREFILL_TOKEN_THRESHOLD', 0);
 local loadFormat = cdk.var('LOAD_FORMAT', '');
 local toolCallParser = cdk.var('TOOL_CALL_PARSER', '');
 local reasoningParser = cdk.var('REASONING_PARSER', 'deepseek_r1');
