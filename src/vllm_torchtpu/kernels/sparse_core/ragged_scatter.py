@@ -269,15 +269,11 @@ def main_kernel(
     kernel_wrapper()
 
 
-def calculate_col_size(hidden_size: int) -> int:
-    """Calculate col size for ragged gather kernel."""
-    tpu_info = pltpu.get_tpu_info()
-    sc_info = tpu_info.sparse_core
-    assert sc_info is not None
-    num_lanes = tpu_info.num_lanes
-    num_simd_lanes = sc_info.num_lanes
-
-    match tpu_info.generation:
+@functools.lru_cache(maxsize=64)
+def _calculate_col_size_impl(
+    hidden_size: int, generation: int, num_lanes: int, num_simd_lanes: int
+) -> int:
+    match generation:
         case 6:
             target_bytes = (256 * 1024) * 0.8
         case 7:
@@ -289,6 +285,16 @@ def calculate_col_size(hidden_size: int) -> int:
     max_col_bytes = int(target_bytes // num_lanes) * num_lanes
     num_cols = max(1, pl.cdiv(base_bytes, max_col_bytes))
     return pl.cdiv(hidden_size, (num_cols * num_lanes)) * num_lanes
+
+
+def calculate_col_size(hidden_size: int) -> int:
+    """Calculate col size for ragged gather kernel."""
+    tpu_info = pltpu.get_tpu_info()
+    sc_info = tpu_info.sparse_core
+    assert sc_info is not None
+    return _calculate_col_size_impl(
+        hidden_size, tpu_info.generation, tpu_info.num_lanes, sc_info.num_lanes
+    )
 
 
 def _preprocess_indices(

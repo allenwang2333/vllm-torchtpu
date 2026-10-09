@@ -196,11 +196,12 @@ def _main_kernel(
             )
             route_weights = route_weights_ref[metadata_slice]
 
+            base_feature_indices = jnp.arange(_TOKEN_SUBCHUNK, dtype=jnp.int32)
+            bf16_upper_mask = jnp.int32(-65536)
+
             def fixed_two_route_column_loop(col_offset):
                 col_slice = pl.ds(col_offset, _TOKEN_SUBCHUNK)
-                feature_indices = col_offset + jnp.arange(
-                    _TOKEN_SUBCHUNK, dtype=jnp.int32
-                )
+                feature_indices = col_offset + base_feature_indices
                 route_batch_size = 16
                 for route_batch_start in range(0, _TOKEN_SUBCHUNK, route_batch_size):
                     weighted_values = []
@@ -215,7 +216,7 @@ def _main_kernel(
                         )
                         shifted = jnp.bitwise_and(
                             jnp.left_shift(value_i32, shift),
-                            jnp.int32(-65536),
+                            bf16_upper_mask,
                         )
                         value_f32 = plsc.bitcast(shifted, jnp.float32)
                         value_f32 *= route_weights[route_lane]
@@ -235,9 +236,7 @@ def _main_kernel(
 
             def generic_column_loop(col_offset):
                 col_slice = pl.ds(col_offset, _TOKEN_SUBCHUNK)
-                feature_indices = col_offset + jnp.arange(
-                    _TOKEN_SUBCHUNK, dtype=jnp.int32
-                )
+                feature_indices = col_offset + base_feature_indices
                 route_batch_size = 4
                 for route_batch_start in range(0, _TOKEN_SUBCHUNK, route_batch_size):
                     weighted_values = []
@@ -252,7 +251,7 @@ def _main_kernel(
                         )
                         shifted = jnp.bitwise_and(
                             jnp.left_shift(value_i32, shift),
-                            jnp.int32(-65536),
+                            bf16_upper_mask,
                         )
                         value_f32 = plsc.bitcast(shifted, jnp.float32)
                         value_f32 *= route_weights[route_lane]

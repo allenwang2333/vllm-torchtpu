@@ -30,15 +30,11 @@ _SC_GATHER_V2_COMPILER_PARAMS = pltpu.CompilerParams(
 )
 
 
-def calculate_col_size(hidden_size: int, packing: int) -> int:
-    """Calculates the max column size bounded by VMEM limits and
-    hidden_size divisibility."""
-    tpu_info = pltpu.get_tpu_info()
-    sc_info = tpu_info.sparse_core
-    assert sc_info is not None, "SparseCore info is missing."
-    lanes = sc_info.num_lanes
-
-    match tpu_info.generation:
+@functools.lru_cache(maxsize=64)
+def _calculate_col_size_impl(
+    hidden_size: int, packing: int, generation: int, lanes: int
+) -> int:
+    match generation:
         case 6:
             target_bytes = (256 * 1024) * 0.8
         case 7:
@@ -58,6 +54,17 @@ def calculate_col_size(hidden_size: int, packing: int) -> int:
         if hidden_size % c == 0:
             return c
     return max_safe_col
+
+
+def calculate_col_size(hidden_size: int, packing: int) -> int:
+    """Calculates the max column size bounded by VMEM limits and
+    hidden_size divisibility."""
+    tpu_info = pltpu.get_tpu_info()
+    sc_info = tpu_info.sparse_core
+    assert sc_info is not None, "SparseCore info is missing."
+    return _calculate_col_size_impl(
+        hidden_size, packing, tpu_info.generation, sc_info.num_lanes
+    )
 
 
 def main_kernel_v2(
@@ -145,9 +152,16 @@ def main_kernel_v2(
             mask = (1 << dtype_bits) - 1
             shift_multiplier = dtype_bits.bit_length() - 1
             for i in range(num_simd_lanes // packing):
-                packed_row = jnp.zeros((1, unpack_col_chunk), dtype=jnp.int32)
-                for j in range(packing):
-                    k = i * packing + j
+                k0 = i * packing
+                dynamic_shift0 = jnp.left_shift(idx_rem[k0], shift_multiplier)
+                packed_row = jnp.bitwise_and(
+                    jnp.bitwise_right_shift(
+                        gather_ref[pl.ds(k0, 1), col_slice], dynamic_shift0
+                    ),
+                    mask,
+                )
+                for j in range(1, packing):
+                    k = k0 + j
                     dynamic_shift = jnp.left_shift(idx_rem[k], shift_multiplier)
                     val = jnp.bitwise_right_shift(
                         gather_ref[pl.ds(k, 1), col_slice], dynamic_shift

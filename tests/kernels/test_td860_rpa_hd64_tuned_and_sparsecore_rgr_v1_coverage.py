@@ -499,6 +499,17 @@ def test_ragged_gather_reduce_full_sparse_core_path():
         out = rgr.ragged_gather_reduce.__wrapped__(x, indices, weights, mask, 8)
         assert out.shape == (32, 128)
 
+        # Already-aligned input (2048 rows, 128 cols) so no post-kernel
+        # slicing is needed (602->605).
+        x_aligned = jnp.ones((2048, 128), dtype=jnp.bfloat16)
+        indices_aligned = jnp.arange(2048, dtype=jnp.int32)
+        weights_aligned = jnp.ones(2048, dtype=jnp.bfloat16)
+        mask_aligned = jnp.ones(2048, dtype=bool)
+        out_aligned = rgr.ragged_gather_reduce.__wrapped__(
+            x_aligned, indices_aligned, weights_aligned, mask_aligned, 8
+        )
+        assert out_aligned.shape == (256, 128)
+
 
 # ==============================================================================
 # 3. Tests for main_kernel inside ragged_gather_reduce.py

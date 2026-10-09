@@ -118,8 +118,8 @@ def _pack_scalars_to_vector(scalar_list: list[jax.Array]) -> jax.Array:
     """Pack list of scalar values into a single VMEM lane."""
     num_lanes = len(scalar_list)
     idx_vec = jax.lax.broadcasted_iota(jnp.int32, (num_lanes,), 0)
-    vec = jnp.zeros((num_lanes,), jnp.int32)
-    for i in range(num_lanes):
+    vec = jnp.broadcast_to(jnp.asarray(scalar_list[0], dtype=jnp.int32), (num_lanes,))
+    for i in range(1, num_lanes):
         vec = jnp.where(idx_vec == i, scalar_list[i], vec)
     return vec
 

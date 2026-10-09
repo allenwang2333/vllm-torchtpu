@@ -174,14 +174,15 @@ def main_kernel(
                         data = jnp.bitwise_right_shift(data, rightshift_bits)
                         # Mask out unwanted bits.
                         data = jnp.bitwise_and(data, bit_mask)
-                        # Left shift data into the target bit location.
-                        data = jnp.bitwise_left_shift(data, leftshift_bits)
 
                         if row_dst_pack == 0:
                             out = data
                         else:
                             assert out is not None
-                            out = jnp.bitwise_or(out, data)
+                            # Left shift data into the target bit location.
+                            out = jnp.bitwise_or(
+                                out, jnp.bitwise_left_shift(data, leftshift_bits)
+                            )
 
                         if row_dst_pack == packing - 1:
                             # Store packed data into correct position.
@@ -215,15 +216,11 @@ def main_kernel(
     inner_kernel()
 
 
-def calculate_col_size(hidden_size: int) -> int:
-    """Calculate col size for ragged gather kernel."""
-    tpu_info = pltpu.get_tpu_info()
-    sc_info = tpu_info.sparse_core
-    assert sc_info is not None
-    num_lanes = tpu_info.num_lanes
-    num_simd_lanes = sc_info.num_lanes
-
-    match tpu_info.generation:
+@functools.lru_cache(maxsize=64)
+def _calculate_col_size_impl(
+    hidden_size: int, generation: int, num_lanes: int, num_simd_lanes: int
+) -> int:
+    match generation:
         case 6:
             target_bytes = (256 * 1024) * 0.8
         case 7:
@@ -235,6 +232,16 @@ def calculate_col_size(hidden_size: int) -> int:
     max_col_bytes = int(target_bytes // num_lanes) * num_lanes
     num_cols = max(1, pl.cdiv(base_bytes, max_col_bytes))
     return pl.cdiv(hidden_size, (num_cols * num_lanes)) * num_lanes
+
+
+def calculate_col_size(hidden_size: int) -> int:
+    """Calculate col size for ragged gather kernel."""
+    tpu_info = pltpu.get_tpu_info()
+    sc_info = tpu_info.sparse_core
+    assert sc_info is not None
+    return _calculate_col_size_impl(
+        hidden_size, tpu_info.generation, tpu_info.num_lanes, sc_info.num_lanes
+    )
 
 
 @jax.jit
