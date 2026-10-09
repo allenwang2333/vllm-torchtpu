@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers import linear as vllm_linear
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.quantization import (
@@ -31,6 +32,7 @@ from vllm_torchtpu.layers.adapter.quantization.fp8 import (
 from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmDeepseekV4Mxfp4MoEMethod
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedFusedMoEMethod,
+    VllmUnquantizedLinearMethod,
 )
 from vllm_torchtpu.layers.core.quant_methods import (
     DEEPSEEK_V4_FP8,
@@ -56,8 +58,6 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
     @property
     def is_scale_e8m0(self) -> bool:
         try:
-            from vllm.config import get_current_vllm_config
-
             hf_config = get_current_vllm_config().model_config.hf_config
             quant_cfg = getattr(hf_config, "quantization_config", None) or {}
             if isinstance(quant_cfg, dict) and quant_cfg.get("scale_fmt") == "ue8m0":
@@ -82,10 +82,6 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
                 ignored_layers=self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
             ):
-                from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-                    VllmUnquantizedLinearMethod,
-                )
-
                 return VllmUnquantizedLinearMethod()
             return VllmFp8LinearMethodTPU(self, linear_config, prefix=prefix)
         elif isinstance(layer, RoutedExperts):
