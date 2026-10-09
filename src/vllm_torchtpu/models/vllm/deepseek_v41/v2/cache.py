@@ -435,17 +435,30 @@ class PagedCacheRows:
         self.bank_records = self.raw.nbytes // self.row_bytes
         self.page_stride = stride_bytes // self.row_bytes
         self.row_offset = offset_bytes // self.row_bytes
+        self.elem_count = self.row_bytes // self.dtype.itemsize
+        self.is_fp32 = self.dtype == torch.float32
+        rows = self.shape[1]
+        self.pages_aligned = not (
+            rows % 4
+            or self.row_offset % rows
+            or self.page_stride % rows
+            or self.raw.shape[0] % rows
+            or (self.raw_hi is not None and self.raw_hi.shape[0] % rows)
+        )
+        self.page_scale = self.page_stride // rows if self.pages_aligned else 0
+        self.page_offset = self.row_offset // rows if self.pages_aligned else 0
 
     def numel(self):
         return math.prod(self.shape)
 
     def row_indices(self, slots):
         if not self.sharded and self.page_stride == self.shape[1]:
-            return self.row_offset + slots
+            return slots if self.row_offset == 0 else self.row_offset + slots
         blocks = slots // self.shape[1]
         rem = slots % self.shape[1]
         if not self.sharded:
-            return self.row_offset + blocks * self.page_stride + rem
+            base = blocks * self.page_stride + rem
+            return base if self.row_offset == 0 else self.row_offset + base
         sharded_blocks = self.shape[0] - self.replicated_blocks
         sharded_local = blocks - self.block_offset
         in_rep = (blocks >= 0) & (blocks < self.replicated_blocks)
@@ -464,17 +477,13 @@ class PagedCacheRows:
         Page ``p`` is raw rows ``[p * shape[1], (p + 1) * shape[1])``, and its
         RoPE companion rows ``[p * shape[1] / 4, ...)``.
         """
-        rows = self.shape[1]
-        if (
-            rows % 4
-            or self.row_offset % rows
-            or self.page_stride % rows
-            or self.raw.shape[0] % rows
-            or (self.raw_hi is not None and self.raw_hi.shape[0] % rows)
-        ):
+        if not self.pages_aligned:
             return None
         if not self.sharded:
-            return block_table * (self.page_stride // rows) + self.row_offset // rows
+            pages = (
+                block_table if self.page_scale == 1 else block_table * self.page_scale
+            )
+            return pages if self.page_offset == 0 else pages + self.page_offset
         sharded_blocks = self.shape[0] - self.replicated_blocks
         sharded_local = block_table - self.block_offset
         in_rep = (block_table >= 0) & (block_table < self.replicated_blocks)
@@ -484,7 +493,9 @@ class PagedCacheRows:
             in_rep, block_table, self.replicated_blocks + sharded_local
         )
         safe_blocks = local_blocks.clamp(min=0, max=max(self.shape[0] - 1, 0))
-        pages = safe_blocks * (self.page_stride // rows) + self.row_offset // rows
+        pages = safe_blocks if self.page_scale == 1 else safe_blocks * self.page_scale
+        if self.page_offset != 0:
+            pages = pages + self.page_offset
         return pages.masked_fill(~owned, 0)
 
     def copy_raw(self, updated):
@@ -519,24 +530,24 @@ class PagedCacheRows:
                 .view(self.dtype)
                 .reshape(*records.shape, *self.shape[2:])
             )
-        elem_count = self.row_bytes // self.dtype.itemsize
-        is_fp32 = self.dtype == torch.float32
+        flat_rec = records.flatten()
+        rec_i32 = flat_rec if flat_rec.dtype == torch.int32 else flat_rec.int()
         if self.raw_hi is None:
             assert _read_values_op is not None
             gathered = _read_values_op(
                 self.raw,
-                records.flatten().int(),
-                elem_count,
-                is_fp32,
+                rec_i32,
+                self.elem_count,
+                self.is_fp32,
             )
         else:
             assert _read_values_2bank_op is not None
             gathered = _read_values_2bank_op(
                 self.raw,
                 self.raw_hi,
-                records.flatten().int(),
-                elem_count,
-                is_fp32,
+                rec_i32,
+                self.elem_count,
+                self.is_fp32,
             )
         return gathered.reshape(*records.shape, *self.shape[2:])
 
@@ -545,15 +556,19 @@ class PagedCacheRows:
         if self.sharded:
             records = self.row_indices(slots)
         elif self.page_stride == self.shape[1]:
-            records = torch.where(slots >= 0, self.row_offset + slots, -1)
+            records = (
+                slots.clamp(min=-1)
+                if self.row_offset == 0
+                else torch.where(slots >= 0, self.row_offset + slots, -1)
+            )
         else:
             records = self.row_indices(slots.clamp(min=0)).masked_fill(slots < 0, -1)
         if self.dtype == torch.uint8:
             self._write_fp8(records, values)
             return
-        values = values.to(self.dtype).reshape(
-            slots.shape[0], self.row_bytes // self.dtype.itemsize
-        )
+        if values.dtype != self.dtype:
+            values = values.to(self.dtype)
+        values = values.reshape(slots.shape[0], self.elem_count)
         if self.raw.device.type == "cpu":
             pool = self.raw.view(torch.int8).reshape(-1, self.row_bytes)
             valid = (records >= 0) & (
@@ -571,7 +586,7 @@ class PagedCacheRows:
                     values[valid_hi].contiguous().view(torch.int8),
                 )
             return
-        rec = records.int()
+        rec = records if records.dtype == torch.int32 else records.int()
         if after is not None:
             assert _write_values_after_op is not None
             self.raw.copy_(_write_values_after_op(self.raw, rec, values, after))
@@ -593,10 +608,13 @@ class PagedCacheRows:
     def _write_fp8(self, records, values):
         """Quantize BF16 latents into NoPE rows and their RoPE companion slots."""
         assert self.rope is not None
+        values_bf16 = (
+            values if values.dtype == torch.bfloat16 else values.to(torch.bfloat16)
+        )
         if self.raw.device.type == "cpu":
             import numpy as np
 
-            latent = values.to(torch.bfloat16).float().numpy()
+            latent = values_bf16.float().numpy()
             words, rope = (
                 torch.from_numpy(np.array(array))
                 for array in encode_fp8_kv(jax.numpy.asarray(latent))
@@ -617,8 +635,8 @@ class PagedCacheRows:
                 companion_hi.index_copy_(0, rows_hi, rope[valid_hi])
             return
         assert _encode_fp8_op is not None
-        words, rope = _encode_fp8_op(values.to(torch.bfloat16))
-        rec = records.int()
+        words, rope = _encode_fp8_op(values_bf16)
+        rec = records if records.dtype == torch.int32 else records.int()
         if self.raw_hi is not None:
             assert self.rope_hi is not None and _write_values_2bank_op is not None
             self.copy_raw(_write_values_2bank_op(self.raw, self.raw_hi, rec, words))
@@ -1160,7 +1178,8 @@ def write_cache(cache, slots, values, valid, after=None):
             )
     else:
         assert _write_op is not None
-        cache.copy_(_write_op(cache, slots.int(), values))
+        slots_i32 = slots if slots.dtype == torch.int32 else slots.int()
+        cache.copy_(_write_op(cache, slots_i32, values))
 
 
 def merge_sub_rows(

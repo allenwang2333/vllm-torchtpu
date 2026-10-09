@@ -63,6 +63,45 @@ def _pre_gates(
 _pre_op = None
 
 
+def _pre_mix_and_gates_jax(
+    x: jax.Array,
+    fn: jax.Array,
+    scale: jax.Array,
+    base: jax.Array,
+    mult: int,
+    dim: int,
+    rms_eps: float,
+    pre_eps: float,
+    sinkhorn_eps: float,
+    post_multiplier: float,
+    repeats: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Mix projection and Sinkhorn gating on ``x`` without 3D residual collapse."""
+    x_f32 = x.astype(jnp.float32)
+    if fn.dtype == jnp.bfloat16:
+        # Load-time packed weight (see `pack_mix_weight`).
+        mixes = _packed_mixes(x, fn, mult * (mult + 2))
+    else:
+        mixes = jnp.matmul(x_f32, fn.T, precision=jax.lax.Precision.HIGHEST)
+    # Upstream's first-layer broadcast optimization folds x/fn to hidden_size.
+    # Gate normalization must still use the actual projection input width.
+    squares = jnp.mean(jnp.square(x_f32), -1, keepdims=True) * (mult * dim)
+    new_pre, post, comb = _pre_gates(
+        mixes,
+        squares,
+        mult,
+        dim,
+        scale,
+        base,
+        rms_eps,
+        pre_eps,
+        sinkhorn_eps,
+        post_multiplier,
+        repeats,
+    )
+    return post[..., None], comb, new_pre
+
+
 def delayed_pre_jax(
     residual: jax.Array,
     x: jax.Array,
@@ -77,24 +116,13 @@ def delayed_pre_jax(
     repeats: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     mult, dim = residual.shape[-2:]
-    if fn.dtype == jnp.bfloat16:
-        # Load-time packed weight (see `pack_mix_weight`).
-        mixes = _packed_mixes(x, fn, mult * (mult + 2))
-    else:
-        mixes = jnp.matmul(
-            x.astype(jnp.float32), fn.T, precision=jax.lax.Precision.HIGHEST
-        )
-    x = x.astype(jnp.float32)
-    # Upstream's first-layer broadcast optimization folds x/fn to hidden_size.
-    # Gate normalization must still use the actual projection input width.
-    squares = jnp.mean(jnp.square(x), -1, keepdims=True) * (mult * dim)
-    new_pre, post, comb = _pre_gates(
-        mixes,
-        squares,
-        mult,
-        dim,
+    post, comb, new_pre = _pre_mix_and_gates_jax(
+        x,
+        fn,
         scale,
         base,
+        mult,
+        dim,
         rms_eps,
         pre_eps,
         sinkhorn_eps,
@@ -102,7 +130,7 @@ def delayed_pre_jax(
         repeats,
     )
     value = (previous_pre[..., None] * residual.astype(jnp.float32)).sum(1)
-    return post[..., None], comb, value.astype(residual.dtype), new_pre
+    return post, comb, value.astype(residual.dtype), new_pre
 
 
 def _truncate_bf16(values: jax.Array) -> jax.Array:
@@ -248,18 +276,17 @@ def _delayed_pre_flat_small(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """XLA `delayed_pre_jax` on a flat residual, collapsed by `_collapse_flat`.
 
-    The value `delayed_pre_jax` derives from the ``[T, M, D]`` view is unused
-    and dead-code eliminated, so the view's relayout copy disappears.
+    Calling `_pre_mix_and_gates_jax` directly avoids materializing the
+    ``[T, M, D]`` view and its discarded 3D reduction.
     """
-    tokens, width = flat.shape
     mult = previous_pre.shape[1]
-    post, comb, _, new_pre = delayed_pre_jax(
-        flat.reshape(tokens, mult, width // mult),
+    post, comb, new_pre = _pre_mix_and_gates_jax(
         flat,
         fn,
         scale,
         base,
-        previous_pre,
+        mult,
+        flat.shape[1] // mult,
         *constants,
     )
     value = _collapse_flat(flat, previous_pre).astype(flat.dtype)
@@ -510,13 +537,13 @@ def delayed_post_pre_flat_jax(
                 previous_pre,
             )
         )
-        post, comb, _, new_pre = delayed_pre_jax(
-            flat_new.reshape(tokens, mult, dim),
+        post, comb, new_pre = _pre_mix_and_gates_jax(
             flat_new,
             fn,
             scale,
             base,
-            previous_pre,
+            mult,
+            dim,
             *constants,
         )
         return flat_new, post, comb, value, new_pre
