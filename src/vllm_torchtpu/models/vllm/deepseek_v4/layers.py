@@ -24,6 +24,12 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    quantized_matmul_prequant,
+)
+
 
 # Pure PyTorch head projection for MHC manifold collapse;
 # upstream vLLM only provides Triton/TileLang GPU kernels for hc_head.
@@ -62,6 +68,7 @@ class DeepseekV4MLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self._prequant: list[torch.Tensor | None] = [None, None]
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -88,8 +95,57 @@ class DeepseekV4MLP(nn.Module):
         else:
             self.act_fn = SiluAndMul()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
+    def can_accept_prequant_hidden(self, *, token_sharded: bool = False) -> bool:
+        if not envs.VLLM_DSV41_FUSED_SEAM_QUANT:
+            return False
+        w_s = getattr(self.gate_up_proj, "weight_scale", None)
+        ok = (
+            w_s is not None
+            and w_s.ndim == 1
+            and getattr(self.gate_up_proj, "bias", None) is None
+        )
+        return ok and not token_sharded
+
+    def set_prequant_hidden(
+        self,
+        hidden_states_fp8: torch.Tensor | None,
+        hidden_states_scale: torch.Tensor | None,
+    ) -> None:
+        self._prequant[0] = hidden_states_fp8
+        self._prequant[1] = hidden_states_scale
+
+    def _apply_gate_up_proj(
+        self,
+        x: torch.Tensor,
+        hidden_states_fp8: torch.Tensor | None,
+        hidden_states_scale: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if hidden_states_fp8 is not None and hidden_states_scale is not None:
+            weight = self.gate_up_proj.weight
+            if getattr(self.gate_up_proj, KEEP_VLLM_LAYOUT_ATTR, False):
+                weight = weight.transpose(0, 1)
+            return quantized_matmul_prequant(
+                hidden_states_fp8,
+                hidden_states_scale,
+                weight,
+                self.gate_up_proj.weight_scale,
+            )
+        return self.gate_up_proj(x)[0]
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        hidden_states_fp8: torch.Tensor | None = None,
+        hidden_states_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if hidden_states_fp8 is None:
+            hidden_states_fp8 = self._prequant[0]
+            hidden_states_scale = self._prequant[1]
+        self._prequant[0] = None
+        self._prequant[1] = None
+        gate_up = self._apply_gate_up_proj(
+            x, hidden_states_fp8, hidden_states_scale
+        )
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x

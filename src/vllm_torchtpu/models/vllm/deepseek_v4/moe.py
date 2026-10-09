@@ -141,23 +141,41 @@ class DeepseekV4MoE(nn.Module):
         """
         return self.experts.do_naive_dispatch_combine
 
+    def can_accept_prequant_hidden(self, *, token_sharded: bool = False) -> bool:
+        return (
+            self.shared_experts is not None
+            and self.shared_experts.can_accept_prequant_hidden(
+                token_sharded=token_sharded
+            )
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         return_token_sharded: bool = False,
+        hidden_states_fp8: torch.Tensor | None = None,
+        hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass executing router gate and fused expert computation."""
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 
         org_shape = hidden_states.shape
-        # FusedMoEFactory gives the runner our gate, so it computes the logits.
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            router_logits=hidden_states,
-            input_ids=input_ids,
-        )
+        if self.shared_experts is not None:
+            self.shared_experts.set_prequant_hidden(
+                hidden_states_fp8, hidden_states_scale
+            )
+        try:
+            # FusedMoEFactory gives the runner our gate, so it computes the logits.
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=hidden_states,
+                input_ids=input_ids,
+            )
+        finally:
+            if self.shared_experts is not None:
+                self.shared_experts.set_prequant_hidden(None, None)
         if self.experts.moe_config.skip_final_all_reduce and self.tp_size > 1:
             if return_token_sharded:
                 final_hidden_states = tp_reduce_scatter(final_hidden_states, dim=0)

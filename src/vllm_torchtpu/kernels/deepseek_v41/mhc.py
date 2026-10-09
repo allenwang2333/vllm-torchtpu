@@ -1271,6 +1271,62 @@ def mhc_pre_quant_v41(
     )
 
 
+def _v41_fused_post_pre_quant_1strip_kernel(
+    x_ref,
+    res_ref,
+    post_ref,
+    comb_ref,
+    pre_in_ref,
+    nw_ref,
+    fn_72_ref,
+    scale_ref,
+    hb_ref,
+    newres_ref,
+    post_out_ref,
+    comb_out_ref,
+    normed_ref,
+    pre_out_ref,
+    normed_fp8_ref,
+    normed_scale_ref,
+    *,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+):
+    """Seam kernel (num_tokens <= 16): 1-pass packed GEMM + Sinkhorn + FP8 quant."""
+    _v41_fused_post_pre_1strip_kernel(
+        x_ref,
+        res_ref,
+        post_ref,
+        comb_ref,
+        pre_in_ref,
+        nw_ref,
+        fn_72_ref,
+        scale_ref,
+        hb_ref,
+        newres_ref,
+        post_out_ref,
+        comb_out_ref,
+        normed_ref,
+        pre_out_ref,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+    )
+    val_f32 = normed_ref[...].astype(jnp.float32)
+    abs_max = jnp.max(jnp.abs(val_f32), axis=-1, keepdims=True)
+    scale = abs_max / _FP8_E4M3_MAX
+    scale = jnp.where(scale == 0, 1.0, scale)
+    normed_scale_ref[...] = scale
+    normed_fp8_ref[...] = jnp.clip(
+        val_f32 / scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX
+    ).astype(jnp.float8_e4m3fn)
+
+
 def mhc_fused_post_pre_quant_v41(
     x: jax.Array,
     residual: jax.Array,
@@ -1299,6 +1355,11 @@ def mhc_fused_post_pre_quant_v41(
     *outer_shape, hc_mult, hidden_size = residual.shape
     num_tokens = x.size // hidden_size
     if num_tokens <= 256:
+        seam_fn = (
+            _v41_fused_post_pre_quant_1strip_kernel
+            if num_tokens <= 16
+            else _v41_fused_post_pre_quant_kernel
+        )
         (
             new_res2d,
             post_mix,
@@ -1309,7 +1370,7 @@ def mhc_fused_post_pre_quant_v41(
             normed_scale,
         ) = _v41_mhc_pallas_call(
             functools.partial(
-                _v41_fused_post_pre_quant_kernel,
+                seam_fn,
                 rms_eps=rms_eps,
                 hc_pre_eps=hc_pre_eps,
                 hc_sinkhorn_eps=hc_sinkhorn_eps,
@@ -1337,7 +1398,7 @@ def mhc_fused_post_pre_quant_v41(
                 (hidden_size, jnp.float8_e4m3fn),
                 (1, jnp.float32),
             ),
-            max_token_block=256,
+            max_token_block=64 if num_tokens <= 16 else 256,
         )
     else:
         mix_hc = hc_mult * (hc_mult + 2)

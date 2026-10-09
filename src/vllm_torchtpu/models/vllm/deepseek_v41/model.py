@@ -514,6 +514,44 @@ class DeepseekV41DecoderLayer(nn.Module):
                 hidden_states_scale=hidden_states_scale,
             )
 
+        use_prequant_ffn = (
+            ops.fused_quant is not None
+            and getattr(self.ffn, "can_accept_prequant_hidden", lambda **_: False)(
+                token_sharded=token_sharded
+            )
+            and not token_sharded
+        )
+        if use_prequant_ffn:
+            (
+                residual,
+                ffn_post,
+                ffn_comb,
+                hidden_states,
+                ffn_pre,
+                ffn_fp8,
+                ffn_scale,
+            ) = ops.fused_quant(
+                x,
+                residual,
+                attn_post,
+                attn_comb,
+                attn_pre,
+                self.ffn_norm.weight,
+                hc_ffn_fn,
+                hc_ffn_scale,
+                hc_ffn_base,
+            )
+            return (
+                self.ffn(
+                    hidden_states,
+                    hidden_states_fp8=ffn_fp8,
+                    hidden_states_scale=ffn_scale,
+                ),
+                residual,
+                ffn_pre,
+                ffn_post,
+                ffn_comb,
+            )
         residual, ffn_post, ffn_comb, hidden_states, ffn_pre = ops.fused(
             x,
             residual,

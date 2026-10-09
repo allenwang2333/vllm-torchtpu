@@ -316,3 +316,60 @@ def test_tagged_forward_captures_and_keeps_main_output(tiny_fc):
     # reuses its reconstruction: one post-op call per tag, none extra.
     torch.testing.assert_close(hidden, baseline)
     assert tiny_fc.model.mhc_post_op.calls == len(tags)
+
+
+@pytest.mark.cpu_test
+def test_dsv4_mlp_and_moe_prequant_forwarding(monkeypatch):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.models.vllm.deepseek_v4 import layers as layers_mod
+    from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
+    from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
+
+    prequant_calls = []
+
+    def fake_prequant(x_q, x_s, w_q, w_s):
+        prequant_calls.append((x_q, x_s, w_q, w_s))
+        return (x_q.float() * x_s) @ w_q.float() * w_s
+
+    monkeypatch.setattr(layers_mod, "quantized_matmul_prequant", fake_prequant)
+    monkeypatch.setattr(envs, "VLLM_DSV41_FUSED_SEAM_QUANT", True)
+
+    mlp = DeepseekV4MLP.__new__(DeepseekV4MLP)
+    nn.Module.__init__(mlp)
+    mlp._prequant = [None, None]
+    mlp.gate_up_proj = nn.Module()
+    mlp.gate_up_proj.weight = nn.Parameter(torch.ones(8, 8))
+    mlp.gate_up_proj.weight_scale = nn.Parameter(torch.full((8,), 0.5))
+    mlp.gate_up_proj.bias = None
+    mlp.act_fn = lambda g: g[:, :4] * g[:, 4:]
+    mlp.down_proj = lambda a: (a @ torch.ones(4, 8), None)
+
+    assert mlp.can_accept_prequant_hidden(token_sharded=False) is True
+    assert mlp.can_accept_prequant_hidden(token_sharded=True) is False
+
+    x = torch.ones(3, 8)
+    x_fp8 = torch.full((3, 8), 2.0)
+    x_scale = torch.full((3, 1), 0.25)
+
+    # 1. Direct prequant call on DeepseekV4MLP
+    out_direct = mlp(x, hidden_states_fp8=x_fp8, hidden_states_scale=x_scale)
+    assert len(prequant_calls) == 1
+    assert mlp._prequant == [None, None]
+    assert out_direct.shape == (3, 8)
+
+    # 2. Staged prequant forwarding via DeepseekV4MoE -> shared_experts
+    moe = DeepseekV4MoE.__new__(DeepseekV4MoE)
+    nn.Module.__init__(moe)
+    moe.tp_size = 1
+    moe.shared_experts = mlp
+    moe.gate = SimpleNamespace(tid2eid=None)
+    moe.experts = lambda **kw: mlp(kw["hidden_states"])
+    moe.experts.moe_config = SimpleNamespace(skip_final_all_reduce=False)
+
+    assert moe.can_accept_prequant_hidden(token_sharded=False) is True
+    assert moe.can_accept_prequant_hidden(token_sharded=True) is False
+
+    out_moe = moe(x, hidden_states_fp8=x_fp8, hidden_states_scale=x_scale)
+    assert len(prequant_calls) == 2
+    assert mlp._prequant == [None, None]
+    torch.testing.assert_close(out_moe, out_direct)
