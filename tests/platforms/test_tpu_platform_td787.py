@@ -767,3 +767,42 @@ def test_update_block_size_pipeline_chunks_and_token_paddings(monkeypatch):
     # 3. _get_token_paddings with extra_bucket_sizes
     paddings = tpu_platform._get_token_paddings(16, 64, extra_bucket_sizes=[24, 96])
     assert paddings == [16, 24, 32, 64]
+
+
+def test_find_non_ssm_backend_compatibility(monkeypatch):
+    """Test dual-compatibility across v0.30 and v0.31."""
+    from unittest.mock import MagicMock
+
+    from vllm.platforms import Platform
+
+    cfg = MagicMock()
+
+    # Case 1: v0.31 environment where Platform defines _find_non_ssm_backends
+    backend_a = MagicMock(name="backend_a")
+    backend_b = MagicMock(name="backend_b")
+    monkeypatch.setattr(
+        Platform,
+        "_find_non_ssm_backends",
+        classmethod(lambda cls, c: [backend_a, backend_b]),
+        raising=False,
+    )
+    assert TpuPlatform._find_non_ssm_backend(cfg) is backend_a
+    assert TpuPlatform._find_non_ssm_backends(cfg) == [backend_a, backend_b]
+
+    # Case 2: v0.30 environment where Platform defines only _find_non_ssm_backend
+    if hasattr(Platform, "_find_non_ssm_backends"):
+        monkeypatch.delattr(Platform, "_find_non_ssm_backends")
+    monkeypatch.setattr(
+        Platform,
+        "_find_non_ssm_backend",
+        classmethod(lambda cls, c: backend_b),
+        raising=False,
+    )
+    assert TpuPlatform._find_non_ssm_backend(cfg) is backend_b
+    assert TpuPlatform._find_non_ssm_backends(cfg) == [backend_b]
+
+    # Case 3: Neither defined on superclass
+    if hasattr(Platform, "_find_non_ssm_backend"):
+        monkeypatch.delattr(Platform, "_find_non_ssm_backend")
+    assert TpuPlatform._find_non_ssm_backend(cfg) is None
+    assert TpuPlatform._find_non_ssm_backends(cfg) == []

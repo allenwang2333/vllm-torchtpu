@@ -1023,8 +1023,27 @@ class TpuPlatform(Platform):
         vLLM v0.31 replaced this helper with `_find_non_ssm_backends`, which
         lists every distinct backend; the TPU callers need the first one.
         """
-        backends = cls._find_non_ssm_backends(vllm_config)
-        return backends[0] if backends else None
+        find_all = getattr(super(), "_find_non_ssm_backends", None)
+        if find_all is not None:
+            backends = find_all(vllm_config)
+            return backends[0] if backends else None
+        find_single = getattr(super(), "_find_non_ssm_backend", None)
+        if find_single is not None:
+            return find_single(vllm_config)
+        return None
+
+    @classmethod
+    def _find_non_ssm_backends(cls, vllm_config: VllmConfig) -> list[Any]:
+        """All non-SSM attention backends in layer order.
+
+        vLLM v0.31 introduced `_find_non_ssm_backends`. On v0.30, wrap
+        `_find_non_ssm_backend` as a single-element list.
+        """
+        find_all = getattr(super(), "_find_non_ssm_backends", None)
+        if find_all is not None:
+            return find_all(vllm_config)
+        backend = cls._find_non_ssm_backend(vllm_config)
+        return [backend] if backend is not None else []
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
