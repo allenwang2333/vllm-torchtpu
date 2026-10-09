@@ -585,11 +585,11 @@ def test_auto_table_rule_and_files_exist():
 
     pick = expert_placement.auto_table
     assert pick(1, 8).endswith("_opt_copies128.json")
-    assert pick(4, 32).endswith("_opt_copies32.json")
-    assert pick(2, 16).endswith("_opt_copies32.json")
-    assert pick(1, 12).endswith("_opt_copies64.json")
-    assert pick(1, 16).endswith("_opt_copies64.json")
-    assert pick(1, 24).endswith("_opt_copies32.json")
+    assert pick(4, 32).endswith("_corr_c32.json")
+    assert pick(2, 16).endswith("_corr_c32.json")
+    assert pick(1, 12).endswith("_corr_c64_mk2p.json")
+    assert pick(1, 16).endswith("_corr_c64_mk2p.json")
+    assert pick(1, 24).endswith("_corr_c32.json")
     for args in ((1, 8), (1, 16), (1, 24), (4, 32)):
         path = pick(*args)
         with open(path) as f:
