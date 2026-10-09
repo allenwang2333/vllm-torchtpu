@@ -1063,6 +1063,16 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         """
         if not envs.TPU_MOE_FUSED_DECODE_LAYER or x.dtype != torch.bfloat16:
             return None
+        # This gate branches on the token count at trace time. Only the
+        # backbone warmup traces each side of such a branch separately and
+        # hands buckets between the traces; a trace outside it (the MTP
+        # drafter, traced once for every bucket) would bake the decode side
+        # into every bucket. Those keep the separate shared expert, like
+        # small_all_reduce_op._fits(in_warmup=True).
+        from vllm_torchtpu.compilation import shape_variants
+
+        if torch.compiler.is_compiling() and not shape_variants.in_warmup():
+            return None
         if self._use_adaptive_fused_moe or enable_pipelined_collective_and_compute():
             return None
         from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
