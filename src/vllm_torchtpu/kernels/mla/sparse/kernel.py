@@ -31,6 +31,39 @@ DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE = 64
 DEFAULT_ATTENTION_KERNEL_BATCH_SIZE = 16
 
 
+_FLOAT32_MIN = float(jnp.finfo(jnp.float32).min)
+_HBM_BLOCK_SPEC = pl.BlockSpec(memory_space=pltpu.HBM)
+_ATTENTION_IN_SPECS_NO_LSE = [
+    _HBM_BLOCK_SPEC,
+    _HBM_BLOCK_SPEC,
+    _HBM_BLOCK_SPEC,
+]
+_ATTENTION_IN_SPECS_LSE = [
+    _HBM_BLOCK_SPEC,
+    _HBM_BLOCK_SPEC,
+    _HBM_BLOCK_SPEC,
+    _HBM_BLOCK_SPEC,
+]
+_ATTENTION_OUT_SPECS_LSE = [_HBM_BLOCK_SPEC, _HBM_BLOCK_SPEC]
+_DMA_SEMAPHORE_NO_LSE = pltpu.SemaphoreType.DMA((4, 2))
+_DMA_SEMAPHORE_LSE = pltpu.SemaphoreType.DMA((5, 2))
+_ALIASES_NO_LSE = {3: 0}
+_ALIASES_LSE = {3: 0, 6: 1}
+_GATHER_PAGE_IDS_COMPILER_PARAMS = pltpu.CompilerParams(
+    dimension_semantics=("arbitrary",),
+    disable_bounds_checks=True,
+)
+
+
+@functools.cache
+def _get_compiler_params(vmem_limit_bytes: int) -> pltpu.CompilerParams:
+    return pltpu.CompilerParams(
+        dimension_semantics=("arbitrary",),
+        vmem_limit_bytes=vmem_limit_bytes,
+        disable_bounds_checks=True,
+    )
+
+
 def cdiv(a, b):
     assert b != 0
     return (a + b - 1) // b
@@ -44,11 +77,13 @@ def get_dtype_bitwidth(dtype):
     return jax.dtypes.itemsize_bits(dtype)
 
 
+@functools.cache
 def get_dtype_packing(dtype):
     bits = get_dtype_bitwidth(dtype)
     return 32 // bits
 
 
+@functools.cache
 def _largest_divisor(x: int, cap: int) -> int:
     """Largest divisor of ``x`` that is <= ``cap``."""
     for candidate in range(min(x, cap), 0, -1):
@@ -58,6 +93,10 @@ def _largest_divisor(x: int, cap: int) -> int:
 
 
 _GATHER_PAGE_CHUNK = 128
+
+
+def _row_index_map(t):
+    return (t, 0)
 
 
 def _gather_page_ids_kernel(windows_ref, logical_ref, out_ref, *, num_chunks):
@@ -102,22 +141,20 @@ def gather_page_ids(
         windows = jnp.pad(windows, ((0, pad), (0, 0)))
         logical = jnp.pad(logical, ((0, pad), (0, 0)))
 
+    logical_spec = pl.BlockSpec((block_tokens, topk), _row_index_map)
     out = pl.pallas_call(
         functools.partial(_gather_page_ids_kernel, num_chunks=num_chunks),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
-                pl.BlockSpec((block_tokens, padded_pps), lambda t: (t, 0)),
-                pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
+                pl.BlockSpec((block_tokens, padded_pps), _row_index_map),
+                logical_spec,
             ],
-            out_specs=pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
+            out_specs=logical_spec,
             grid=(padded_tokens // block_tokens,),
         ),
         out_shape=jax.ShapeDtypeStruct((padded_tokens, topk), jnp.int32),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary",),
-            disable_bounds_checks=True,
-        ),
+        compiler_params=_GATHER_PAGE_IDS_COMPILER_PARAMS,
         name="gather_page_ids",
     )(windows, logical)
     return out[:num_tokens]
@@ -193,6 +230,7 @@ def _attention_kernel(
 
     batch_start_seq_idx = start_seq_idx + pl.program_id(0) * batch_size
     batch_end_seq_idx = batch_start_seq_idx + batch_size - 1
+    qk_scale = sm_scale if k_scale == 1.0 else sm_scale * k_scale
 
     def attention_step1_qk_softmax(
         q,  # [num_q_heads, head_dim]
@@ -210,15 +248,13 @@ def _attention_kernel(
         # has no SWA or sinks). The step1/step2 split only interleaves VPU
         # and MXU work across batch entries.
         s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
-        s *= sm_scale
-        if k_scale != 1.0:
-            s *= k_scale
+        s *= qk_scale
 
         # Mask scores past kv_len (the "-1" tail): zeroing the keys alone is
         # not enough -- a zeroed key still scores 0 and inflates the softmax
         # denominator whenever kv_len << topk.
         kv_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
-        s = jnp.where(kv_span < kv_len, s, jnp.finfo(jnp.float32).min)
+        s = jnp.where(kv_span < kv_len, s, _FLOAT32_MIN)
 
         m = jnp.max(s, axis=1, keepdims=True)
         p = jnp.exp(s - m)
@@ -263,10 +299,10 @@ def _attention_kernel(
         bkv_nope_vmem_ref = bkv_nope_x2_ref.at[bkv_sem_idx, :]
         bkv_rope_vmem_ref = bkv_rope_x2_ref.at[bkv_sem_idx, :]
 
-        # The index into cache_kv_hbm_ref should be relative to the current
-        # chunk.
-        page_idx_start = seq_idx_start - start_seq_idx
         if not wait:
+            # The index into cache_kv_hbm_ref should be relative to the current
+            # chunk.
+            page_idx_start = seq_idx_start - start_seq_idx
             _async_copy(
                 cache_kv_nope_hbm_ref.at[pl.ds(page_idx_start, batch_size)],
                 bkv_nope_vmem_ref,
@@ -361,7 +397,7 @@ def _attention_kernel(
         q = bq_x2_ref.at[bq_sem_idx, batch_idx][...]
         return q
 
-    def load_bkv(bkv_sem_idx, batch_idx):
+    def load_bkv(bkv_sem_idx, batch_idx, kv_len):
         bkv_nope = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx][...]
         if sparsecore_layout:
             # Native SC returns one uint32[128] row per token. Bitcasting
@@ -389,7 +425,6 @@ def _attention_kernel(
         # Zero keys beyond kv_len: the "-1" tail is gathered from scattered
         # pages and can decode to fp8 NaN; score masking zeroes the weights,
         # but 0 * NaN = NaN in the PV einsum, so the data must be finite too.
-        kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
         k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
         bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
@@ -447,7 +482,7 @@ def _attention_kernel(
 
         for batch_idx in range(batch_size):
             kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-            bkv = load_bkv(bi_sem_idx, batch_idx)
+            bkv = load_bkv(bi_sem_idx, batch_idx, kv_len)
             bq = load_bq(bi_sem_idx, batch_idx)
 
             if prev_out is not None:
@@ -516,18 +551,15 @@ def prepare_q_inputs(
 ):
     _, actual_num_q_heads, actual_head_dim = q.shape
     q_packing = get_dtype_packing(q.dtype)
-    num_q_heads = align_to(actual_num_q_heads, q_packing)
-    head_dim = align_to(actual_head_dim, 128)
-    q = jnp.pad(
+    pad_heads = align_to(actual_num_q_heads, q_packing) - actual_num_q_heads
+    pad_dim = align_to(actual_head_dim, 128) - actual_head_dim
+    if pad_heads == 0 and pad_dim == 0:
+        return q
+    return jnp.pad(
         q,
-        (
-            (0, 0),
-            (0, num_q_heads - actual_num_q_heads),
-            (0, head_dim - actual_head_dim),
-        ),
+        ((0, 0), (0, pad_heads), (0, pad_dim)),
         constant_values=0,
     )
-    return q
 
 
 def prepare_outputs(
@@ -535,6 +567,8 @@ def prepare_outputs(
     actual_num_q_heads: int,
     actual_head_dim: int,
 ):
+    if out.shape[1] == actual_num_q_heads and out.shape[2] == actual_head_dim:
+        return out
     return out[:, :actual_num_q_heads, :actual_head_dim]
 
 
@@ -613,7 +647,7 @@ def sparse_ragged_paged_attention(
         serving.
 
     Returns:
-      The output of attention, or `(output, lse)` when `return_lse` is set.
+       The output of attention, or `(output, lse)` when `return_lse` is set.
       `lse` is f32[max_num_tokens, actual_num_q_heads].
     """
     if cache_layout not in (TENSORCORE_CACHE_LAYOUT, SPARSECORE_CACHE_LAYOUT):
@@ -704,13 +738,12 @@ def sparse_ragged_paged_attention(
     # sentinel, so a downstream merge weights them at exp(min - max) == 0
     # instead of tripping on uninitialised memory.
     lse = (
-        jnp.full(
-            (q.shape[0], num_q_heads, 1), jnp.finfo(jnp.float32).min, dtype=jnp.float32
-        )
+        jnp.full((q.shape[0], num_q_heads, 1), _FLOAT32_MIN, dtype=jnp.float32)
         if return_lse
         else None
     )
 
+    token_end = cu_q_lens[distribution[2]]
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
@@ -723,7 +756,7 @@ def sparse_ragged_paged_attention(
             lse,
             start_pos=start_pos,
             end_pos=end_pos,
-            token_end=cu_q_lens[distribution[2]],
+            token_end=token_end,
             sm_scale=sm_scale,
             k_scale=k_scale,
             attention_kernel_batch_size=attention_kernel_batch_size,
@@ -852,19 +885,15 @@ def sparse_attention_chunk(
         batch_size = kernel_batch_size
         end_seq_idx = jnp.maximum(start_seq_idx, end_seq_idx)
         grid = (cdiv(end_seq_idx - start_seq_idx, batch_size),)
-        in_specs = [
-            pl.BlockSpec(memory_space=pltpu.HBM),  # q
-            pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_nope
-            pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_rope
-        ]
-
-        out_specs = pl.BlockSpec(memory_space=pltpu.HBM)  # o
         # Each chunk writes only its own token rows, so -- exactly like `q` --
         # the lse buffer is threaded through as an aliased in/out to carry
         # earlier chunks' rows forward.
         if return_lse:
-            in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # lse (in)
-            out_specs = [out_specs, pl.BlockSpec(memory_space=pltpu.HBM)]
+            in_specs = _ATTENTION_IN_SPECS_LSE
+            out_specs = _ATTENTION_OUT_SPECS_LSE
+        else:
+            in_specs = _ATTENTION_IN_SPECS_NO_LSE
+            out_specs = _HBM_BLOCK_SPEC
 
         # One batch entry's worth of gathered top-k rows, per cache.
         bkv_nope_double_buf = pltpu.VMEM(
@@ -881,25 +910,25 @@ def sparse_attention_chunk(
             q.dtype,
         )
 
-        bo_double_buf = bq_double_buf
-
         scratch_shapes = [
             bkv_nope_double_buf,
             bkv_rope_double_buf,
             bq_double_buf,
-            bo_double_buf,  # Double buffering for output block.
+            bq_double_buf,  # Double buffering for output block.
         ]
         if return_lse:
             scratch_shapes.append(
                 pltpu.VMEM((2, batch_size, num_q_heads, 1), jnp.float32)
             )
-        # Semaphores for double buffering of bkv_nope, bq, bo, bkv_rope
-        # (+ blse when the log-sum-exp is exported).
-        scratch_shapes.append(pltpu.SemaphoreType.DMA((5 if return_lse else 4, 2)))
+            scratch_shapes.append(_DMA_SEMAPHORE_LSE)
+        else:
+            scratch_shapes.append(_DMA_SEMAPHORE_NO_LSE)
 
-        bounds = [start_seq_idx, end_seq_idx]
-        if preserve_suffix:
-            bounds.append(token_end)
+        bounds = (
+            [start_seq_idx, end_seq_idx, token_end]
+            if preserve_suffix
+            else [start_seq_idx, end_seq_idx]
+        )
         scalar_prefetches = (
             kv_lens,
             jnp.array(bounds, jnp.int32),
@@ -911,6 +940,7 @@ def sparse_attention_chunk(
             f"MLA-{cache_layout}-p_{cache_kv_rope.shape[1]}-"
             f"bz_{batch_size}-gcz_{cache_kv_nope.shape[0]}"
         )
+        q_out_shape = jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 functools.partial(
@@ -923,44 +953,28 @@ def sparse_attention_chunk(
                     sparsecore_layout=sparsecore_layout,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
-                    num_scalar_prefetch=len(scalar_prefetches),
+                    num_scalar_prefetch=3,
                     in_specs=in_specs,
                     out_specs=out_specs,
                     grid=grid,
                     scratch_shapes=scratch_shapes,
                 ),
-                compiler_params=pltpu.CompilerParams(
-                    dimension_semantics=("arbitrary",),
-                    vmem_limit_bytes=vmem_limit_bytes,
-                    disable_bounds_checks=True,
-                ),
+                compiler_params=_get_compiler_params(vmem_limit_bytes),
                 out_shape=(
                     [
-                        jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
+                        q_out_shape,
                         jax.ShapeDtypeStruct(shape=lse.shape, dtype=lse.dtype),
                     ]
                     if return_lse
-                    else jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
+                    else q_out_shape
                 ),
-                input_output_aliases=(
-                    {
-                        3: 0,
-                        6: 1,
-                    }
-                    if return_lse
-                    else {
-                        # 3 = q; operand indices count the scalar prefetches
-                        # (DSV4's "4" also counted attention_sinks).
-                        3: 0,  # Alias output activation with q
-                    }
-                ),
+                input_output_aliases=_ALIASES_LSE if return_lse else _ALIASES_NO_LSE,
                 name=scope_name,
             )
         )
-        operands = [q, cache_kv_nope, cache_kv_rope]
         if return_lse:
-            operands.append(lse)
-        return kernel(*scalar_prefetches, *operands)
+            return kernel(*scalar_prefetches, q, cache_kv_nope, cache_kv_rope, lse)
+        return kernel(*scalar_prefetches, q, cache_kv_nope, cache_kv_rope)
 
     indices = physical_indices[start_pos:end_pos]
 

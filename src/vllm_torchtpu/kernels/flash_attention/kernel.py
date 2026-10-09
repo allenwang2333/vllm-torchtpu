@@ -106,7 +106,7 @@ def calculate_vmem_usage_bytes(
 
     q_and_output = q_elements * jnp.dtype(q_dtype).itemsize * 2
     k_and_v = kv_elements * jnp.dtype(kv_dtype).itemsize * 2
-    logits_and_probs = logits_elements * jnp.dtype(jnp.float32).itemsize * 2
+    logits_and_probs = logits_elements * 8
 
     attention_bias = 0
     if ab is not None:
@@ -119,10 +119,9 @@ def calculate_vmem_usage_bytes(
 
     segments = 0
     if segment_ids is not None:
-        segment_bytes = jnp.dtype(jnp.int32).itemsize
         segments = (
-            block_sizes.block_b * block_sizes.block_q * num_lanes * segment_bytes
-            + block_sizes.block_b * num_sublanes * kv_seq_len * segment_bytes
+            block_sizes.block_b * block_sizes.block_q * num_lanes * 4
+            + block_sizes.block_b * num_sublanes * kv_seq_len * 4
         )
 
     return q_and_output + k_and_v + logits_and_probs + attention_bias + segments
@@ -682,26 +681,19 @@ def _flash_attention_impl(
     out_specs = [pl.BlockSpec((block_b, 1, block_q, head_dim), o_index_map)]
 
     if block_k != kv_seq_len:
-        m_scratch = pltpu.VMEM((block_b, 1, block_q, MIN_BLOCK_SIZE), jnp.float32)
-        l_scratch = pltpu.VMEM((block_b, 1, block_q, MIN_BLOCK_SIZE), jnp.float32)
+        ml_scratch = pltpu.VMEM((block_b, 1, block_q, MIN_BLOCK_SIZE), jnp.float32)
         acc_scratch = pltpu.VMEM((block_b, 1, block_q, head_dim), jnp.float32)
-        scratch_shapes = [m_scratch, l_scratch, acc_scratch]
+        scratch_shapes = [ml_scratch, ml_scratch, acc_scratch]
     else:
         scratch_shapes = []
 
     if save_residuals:
-        out_specs = [
-            *out_specs,
-            pl.BlockSpec((block_b, 1, block_q, MIN_BLOCK_SIZE), lm_index_map),
-            pl.BlockSpec((block_b, 1, block_q, MIN_BLOCK_SIZE), lm_index_map),
-        ]
-        l = jax.ShapeDtypeStruct(
+        lm_spec = pl.BlockSpec((block_b, 1, block_q, MIN_BLOCK_SIZE), lm_index_map)
+        out_specs = [*out_specs, lm_spec, lm_spec]
+        lm_shape = jax.ShapeDtypeStruct(
             (batch_size, num_heads, q_seq_len, MIN_BLOCK_SIZE), dtype=jnp.float32
         )
-        m = jax.ShapeDtypeStruct(
-            (batch_size, num_heads, q_seq_len, MIN_BLOCK_SIZE), dtype=jnp.float32
-        )
-        out_shape = (*out_shape, l, m)
+        out_shape = (*out_shape, lm_shape, lm_shape)
     else:
         out_specs = [*out_specs, None, None]
         out_shape = (*out_shape, None, None)
@@ -754,10 +746,11 @@ def _flash_attention_impl(
             ),
         )
 
+    kv_spec = pl.BlockSpec((block_b, 1, block_k_major, head_dim), kv_index_map)
     in_specs = [
         pl.BlockSpec((block_b, 1, block_q, head_dim), q_index_map),
-        pl.BlockSpec((block_b, 1, block_k_major, head_dim), kv_index_map),
-        pl.BlockSpec((block_b, 1, block_k_major, head_dim), kv_index_map),
+        kv_spec,
+        kv_spec,
         ab_block_spec,
         q_segment_ids_spec,
         kv_segment_ids_spec,
