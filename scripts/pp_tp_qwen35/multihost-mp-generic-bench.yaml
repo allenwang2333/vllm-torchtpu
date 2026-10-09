@@ -8,7 +8,11 @@ spec:
     targetReplicatedJobs:
       - bench
   failurePolicy:
-    maxRestarts: 0
+    # Kueue preemption on the contended 2x2x2 pool can kill one node's pod
+    # (non-zero exit) before the JobSet is suspended; with maxRestarts 0 that
+    # is terminal and CDK TTL-deletes the job. Recreate instead.
+    maxRestarts: 3
+    restartStrategy: Recreate
   network:
     enableDNSHostnames: true
   replicatedJobs:
