@@ -1,7 +1,6 @@
 """StreamIndex Top-K Configuration."""
 
 import enum
-import itertools
 import threading
 
 
@@ -19,11 +18,14 @@ class MlaCase(enum.Enum):
 
     @property
     def symbol(self):
-        return {
-            MlaCase.DECODE: "d",
-            MlaCase.PREFILL: "p",
-            MlaCase.MIXED: "m",
-        }[self]
+        return _MLA_CASE_SYMBOLS[self]
+
+
+_MLA_CASE_SYMBOLS: dict[MlaCase, str] = {
+    MlaCase.DECODE: "d",
+    MlaCase.PREFILL: "p",
+    MlaCase.MIXED: "m",
+}
 
 
 class KVLayout(enum.Enum):
@@ -60,18 +62,22 @@ class KVLayout(enum.Enum):
         if isinstance(value, cls):
             return value
         normalized = str(value).strip().lower()
-        aliases = {
-            "head_along_sublane": cls.HEAD_ALONG_SUBLANE,
-            "seq_along_lane": cls.SEQ_ALONG_LANE,
-            # Tolerate the common typo seen in flags/configs.
-            "seq_alone_lane": cls.SEQ_ALONG_LANE,
-        }
-        if normalized not in aliases:
+        layout = _KV_LAYOUT_ALIASES.get(normalized)
+        if layout is None:
             raise ValueError(
-                f"Unknown kv_layout {value!r}; expected one of {sorted(aliases)}."
+                f"Unknown kv_layout {value!r}; expected one of "
+                f"{_KV_LAYOUT_SORTED_ALIASES}."
             )
-        return aliases[normalized]
+        return layout
 
+
+_KV_LAYOUT_ALIASES: dict[str, KVLayout] = {
+    "head_along_sublane": KVLayout.HEAD_ALONG_SUBLANE,
+    "seq_along_lane": KVLayout.SEQ_ALONG_LANE,
+    # Tolerate the common typo seen in flags/configs.
+    "seq_alone_lane": KVLayout.SEQ_ALONG_LANE,
+}
+_KV_LAYOUT_SORTED_ALIASES: list[str] = sorted(_KV_LAYOUT_ALIASES)
 
 # Default buffer_count for (DECODE, PREFILL, MIXED) cases.
 # Determined from microbenchmarks for 8k/1k and 256k/1k.
@@ -88,7 +94,7 @@ DEFAULT_BUFFER_COUNT: tuple[int, int, int] = (4, 3, 3)
 # `reset_scheduling_group_ids`): otherwise the ids, and with them the key,
 # depend on which programs this process traced before, and two ranks building
 # the same bucket in a different order miss each other's cached executable.
-_scheduling_group_ids = itertools.count(1)
+_next_scheduling_group_id = 1
 _scheduling_group_ids_lock = threading.Lock()
 
 
@@ -105,10 +111,10 @@ def reserve_scheduling_group_ids(count: int) -> int:
     """
     if count < 1:
         raise ValueError(f"count ({count}) must be positive.")
+    global _next_scheduling_group_id
     with _scheduling_group_ids_lock:
-        first = next(_scheduling_group_ids)
-        for _ in range(count - 1):
-            next(_scheduling_group_ids)
+        first = _next_scheduling_group_id
+        _next_scheduling_group_id = first + count
     return first
 
 
@@ -119,6 +125,6 @@ def reset_scheduling_group_ids() -> None:
     reuse them; resetting makes a program's ids, and so its cache key, the same
     whatever this process compiled before.
     """
-    global _scheduling_group_ids
+    global _next_scheduling_group_id
     with _scheduling_group_ids_lock:
-        _scheduling_group_ids = itertools.count(1)
+        _next_scheduling_group_id = 1

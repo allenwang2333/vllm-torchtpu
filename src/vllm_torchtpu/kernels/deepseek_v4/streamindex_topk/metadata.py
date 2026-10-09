@@ -222,7 +222,7 @@ def compute_batched_seq_metadata(
         all_seq_tiles = jnp.arange(max_seq_tiles, dtype=jnp.int32)
         padded_len = max_seq_tiles * seq_batch_size
         pad_size = padded_len - max_num_seqs
-        padded_seq_lens = jnp.pad(seq_lens, (0, pad_size))
+        padded_seq_lens = jnp.pad(seq_lens, (0, pad_size)) if pad_size > 0 else seq_lens
         # A sequence tile is a group of seq_batch_size sequences processed together
         # (e.g. 4 sequences per tile in decode mode, or 1 sequence per tile in
         # prefill mode).
@@ -256,7 +256,7 @@ def compute_batched_seq_metadata(
         if static_q_len is not None:
             s_num_bq = jnp.full(
                 (max_seq_tiles,),
-                jnp.maximum(1, pl.cdiv(static_q_len, bq_sz)),
+                max(1, pl.cdiv(static_q_len, bq_sz)),
                 dtype=jnp.int32,
             )
         else:
@@ -287,8 +287,12 @@ def compute_batched_seq_metadata(
         # on one flat axis, so chunk m owns the max_seq_tiles segments starting at
         # m * max_seq_tiles, and everything below reads per segment exactly as it
         # used to read per sequence tile.
-        seg_num_bkv = jnp.tile(s_num_bkv, num_chunks)
-        seg_seq_tiles = jnp.tile(all_seq_tiles, num_chunks)
+        if num_chunks == 1:
+            seg_num_bkv = s_num_bkv
+            seg_batch_tile_idx = starting_seq_tile_idx
+        else:
+            seg_num_bkv = jnp.tile(s_num_bkv, num_chunks)
+            seg_batch_tile_idx = jnp.tile(starting_seq_tile_idx, num_chunks)
         seg_num_steps = num_bq.reshape(-1) * seg_num_bkv
         seg_start_step_id = jnp.cumulative_sum(seg_num_steps, include_initial=True)
 
@@ -298,10 +302,8 @@ def compute_batched_seq_metadata(
             all_steps[None, :] < seg_start_step_id[1:, None]
         )
 
-        # Map each flat pipeline step t to its sequence tile index (0, 1, ...) and
-        # convert it to the starting sequence index in the batch (batch_tile_idx).
-        repeat_seq_tiles = jnp.sum(seg_seq_tiles[:, None] * is_step_in_seg, axis=0)
-        batch_tile_idx = repeat_seq_tiles * seq_batch_size
+        # Map each flat pipeline step t to its starting sequence index in the batch.
+        batch_tile_idx = jnp.sum(seg_batch_tile_idx[:, None] * is_step_in_seg, axis=0)
         # Holds the starting sequence index per flat pipeline step.
         start_step_id_repeat = jnp.sum(
             seg_start_step_id[:-1, None] * is_step_in_seg, axis=0
@@ -314,9 +316,10 @@ def compute_batched_seq_metadata(
         # row = tile_step_id // width, col = tile_step_id % width.
         # jnp.maximum(1, ...) prevents division by zero on inactive steps.
         nbkv_per_step_id = jnp.sum(seg_num_bkv[:, None] * is_step_in_seg, axis=0)
+        safe_nbkv = jnp.maximum(1, nbkv_per_step_id)
 
-        bq_idx = jnp.maximum(0, tile_step_id // jnp.maximum(1, nbkv_per_step_id))
-        bkv_idx = jnp.maximum(0, tile_step_id % jnp.maximum(1, nbkv_per_step_id))
+        bq_idx = jnp.maximum(0, tile_step_id // safe_nbkv)
+        bkv_idx = jnp.maximum(0, tile_step_id % safe_nbkv)
 
         chunk_num_steps = jnp.sum(
             seg_num_steps.reshape(num_chunks, max_seq_tiles), axis=1

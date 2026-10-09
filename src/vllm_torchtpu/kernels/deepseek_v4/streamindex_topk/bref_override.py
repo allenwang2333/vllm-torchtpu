@@ -21,9 +21,15 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+_BUFFERED_REF_FIELD_NAMES: tuple[str, ...] = tuple(
+    f.name for f in dataclasses.fields(pltpu.BufferedRef)
+)
+
 
 def _step_offset(meta_ref: Any, chunk_idx: int):
     """Flat schedule row where chunk `chunk_idx`'s pipeline steps begin."""
+    if chunk_idx == 0:
+        return 0
     return sum(meta_ref.num_steps[m] for m in range(chunk_idx))
 
 
@@ -98,10 +104,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
             chunk_idx=chunk_idx,
-            **{
-                f.name: getattr(standard_ref, f.name)
-                for f in dataclasses.fields(pltpu.BufferedRef)
-            },
+            **{name: getattr(standard_ref, name) for name in _BUFFERED_REF_FIELD_NAMES},
         )
 
     @classmethod
@@ -152,37 +155,39 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         sem = self.sem_recvs.at[slot]
         vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
 
+        page_size_per_kv_packing = self.page_size_per_kv_packing
         reshaped_cache_hbm_ref: Any = (
             cache_kv_hbm.reshape(  # pytype: disable=attribute-error
-                cache_kv_hbm.shape[0] * self.page_size_per_kv_packing,
+                cache_kv_hbm.shape[0] * page_size_per_kv_packing,
                 self.kv_packing,
                 cache_kv_hbm.shape[-1],
             )
         )
         max_hbm_pages = reshaped_cache_hbm_ref.shape[0]
-        num_page_indices = page_indices_ref.shape[0]
-        effective_seq_idx = batch_tile_idx
+        max_safe_page_offset = max(0, max_hbm_pages - page_size_per_kv_packing)
+        max_page_idx = page_indices_ref.shape[0] - 1
+        kv_p_start = bkv_idx * self.bkv_p
+        pages_per_seq = self.pages_per_seq
 
         for batch_idx in range(self.seq_batch_size):
-            kv_p_start = bkv_idx * self.bkv_p
             page_indices_offset = (
-                effective_seq_idx + batch_idx
-            ) * self.pages_per_seq + kv_p_start
+                batch_tile_idx + batch_idx
+            ) * pages_per_seq + kv_p_start
             for i in range(self.bkv_p):
-                page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
+                page_idx = jnp.minimum(page_indices_offset + i, max_page_idx)
                 safe_page_offset = jnp.minimum(
-                    page_indices_ref[page_idx] * self.page_size_per_kv_packing,
-                    jnp.maximum(0, max_hbm_pages - self.page_size_per_kv_packing),
+                    page_indices_ref[page_idx] * page_size_per_kv_packing,
+                    max_safe_page_offset,
                 )
                 pltpu.make_async_copy(
                     reshaped_cache_hbm_ref.at[
-                        pl.ds(safe_page_offset, self.page_size_per_kv_packing)
+                        pl.ds(safe_page_offset, page_size_per_kv_packing)
                     ],
                     vmem_dst.at[  # pytype: disable=attribute-error
                         batch_idx,
                         pl.ds(
-                            i * self.page_size_per_kv_packing,
-                            self.page_size_per_kv_packing,
+                            i * page_size_per_kv_packing,
+                            page_size_per_kv_packing,
                         ),
                     ],
                     sem,
@@ -256,10 +261,7 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
             chunk_idx=chunk_idx,
-            **{
-                f.name: getattr(standard_ref, f.name)
-                for f in dataclasses.fields(pltpu.BufferedRef)
-            },
+            **{name: getattr(standard_ref, name) for name in _BUFFERED_REF_FIELD_NAMES},
         )
 
     @classmethod
@@ -308,30 +310,31 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
         sem = self.sem_recvs.at[slot]
         vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
 
-        max_hbm_pages = cache_kv_hbm.shape[0]
-        num_page_indices = page_indices_ref.shape[0]
-        effective_seq_idx = batch_tile_idx
+        max_hbm_page = cache_kv_hbm.shape[0] - 1
+        max_page_idx = page_indices_ref.shape[0] - 1
+        kv_p_start = bkv_idx * self.bkv_p
+        pages_per_seq = self.pages_per_seq
+        page_size = self.page_size
 
         for batch_idx in range(self.seq_batch_size):
-            kv_p_start = bkv_idx * self.bkv_p
             page_indices_offset = (
-                effective_seq_idx + batch_idx
-            ) * self.pages_per_seq + kv_p_start
+                batch_tile_idx + batch_idx
+            ) * pages_per_seq + kv_p_start
             for i in range(self.bkv_p):
-                page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
-                safe_page = jnp.minimum(page_indices_ref[page_idx], max_hbm_pages - 1)
+                page_idx = jnp.minimum(page_indices_offset + i, max_page_idx)
+                safe_page = jnp.minimum(page_indices_ref[page_idx], max_hbm_page)
                 # One page is contiguous in HBM; it lands in lanes
                 # [i * page_size, (i + 1) * page_size) of the block. The offset is a
                 # compile-time constant and page_size is a multiple of the lane count,
                 # so the destination slice is always tile aligned.
-                dst_lane_start = i * self.page_size
+                dst_lane_start = i * page_size
                 pltpu.make_async_copy(
                     cache_kv_hbm.at[safe_page],
                     vmem_dst.at[  # pytype: disable=attribute-error
                         batch_idx,
                         :,
                         :,
-                        pl.ds(dst_lane_start, self.page_size),
+                        pl.ds(dst_lane_start, page_size),
                     ],
                     sem,
                 ).start()
@@ -394,10 +397,7 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
             seq_batch_size=seq_batch_size,
             chunk_tokens=chunk_tokens,
             chunk_idx=chunk_idx,
-            **{
-                f.name: getattr(standard_ref, f.name)
-                for f in dataclasses.fields(pltpu.BufferedRef)
-            },
+            **{name: getattr(standard_ref, name) for name in _BUFFERED_REF_FIELD_NAMES},
         )
 
     @classmethod
@@ -476,10 +476,11 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
             seq_batch_size=self.seq_batch_size,
             chunk_idx=self.chunk_idx,
         )
+        vmem_slice = vmem_dst.at[pl.ds(0, total_sz)]
 
         pltpu.make_async_copy(
-            vmem_dst.at[pl.ds(0, total_sz)],
-            vmem_dst.at[pl.ds(0, total_sz)],
+            vmem_slice,
+            vmem_slice,
             sem,
         ).wait()
 
@@ -522,10 +523,7 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
             num_sublanes=num_sublanes,
             seq_batch_size=seq_batch_size,
             chunk_idx=chunk_idx,
-            **{
-                f.name: getattr(standard_ref, f.name)
-                for f in dataclasses.fields(pltpu.BufferedRef)
-            },
+            **{name: getattr(standard_ref, name) for name in _BUFFERED_REF_FIELD_NAMES},
         )
 
     @classmethod
@@ -615,9 +613,10 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
             seq_batch_size=self.seq_batch_size,
             chunk_idx=self.chunk_idx,
         )
+        vmem_slice = vmem_src.at[pl.ds(0, total_sz)]
 
         pltpu.make_async_copy(
-            vmem_src.at[pl.ds(0, total_sz)],
-            vmem_src.at[pl.ds(0, total_sz)],
+            vmem_slice,
+            vmem_slice,
             sem,
         ).wait()

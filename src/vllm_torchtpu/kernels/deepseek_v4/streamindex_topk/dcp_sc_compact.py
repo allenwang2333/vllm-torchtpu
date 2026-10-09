@@ -27,6 +27,9 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
 SCAN_UNROLL = 8
+_PACK_COMPILER_PARAMS = pltpu.CompilerParams(
+    disable_bounds_checks=True, needs_layout_passes=False
+)
 
 
 def _pack_body(
@@ -43,9 +46,10 @@ def _pack_body(
 ):
     flat = lax.axis_index("core") * num_subcores + lax.axis_index("subcore")
     chunks = width // lanes
+    cores_per_chip = num_cores * num_subcores
 
     def pipeline_step(vals_vmem, out_vmem):
-        row = pl.program_id(0) * (num_cores * num_subcores) + flat
+        row = pl.program_id(0) * cores_per_chip + flat
 
         def fill(i):
             rowbuf_vmem[pl.ds(i * lanes, lanes)] = jnp.full((lanes,), -1, jnp.int32)
@@ -69,22 +73,17 @@ def _pack_body(
 
         plsc.parallel_loop(0, chunks, unroll=4)(copy_out)
 
-    cores_per_chip = num_cores * num_subcores
     buf_count = 1 if num_waves == 1 else 2
-    in_specs = (
-        pl.BlockSpec(
-            (width,),
-            lambda w: (w * cores_per_chip + flat,),
-            pipeline_mode=pl.Buffered(buf_count),
-        ),
-    )
-    out_specs = pl.BlockSpec(
+    block_spec = pl.BlockSpec(
         (width,),
         lambda w: (w * cores_per_chip + flat,),
         pipeline_mode=pl.Buffered(buf_count),
     )
     pltpu.emit_pipeline(
-        pipeline_step, grid=(num_waves,), in_specs=in_specs, out_specs=out_specs
+        pipeline_step,
+        grid=(num_waves,),
+        in_specs=(block_spec,),
+        out_specs=block_spec,
     )(vals_hbm, out_hbm)
 
 
@@ -130,14 +129,13 @@ def pack_nonnegative(vals: jax.Array) -> jax.Array:  # i32[num_rows, width]
             num_subcores=sc.num_subcores,
         ),
         out_type=jax.ShapeDtypeStruct((padded_b * width,), jnp.int32),
-        compiler_params=pltpu.CompilerParams(
-            disable_bounds_checks=True, needs_layout_passes=False
-        ),
+        compiler_params=_PACK_COMPILER_PARAMS,
         scratch_types=(pltpu.VMEM((width + lanes,), jnp.int32),),
         mesh=mesh,
         name=f"sc_pack_nonneg_b{b}_w{width}",
     )(vals.reshape(-1))
-    return out.reshape(padded_b, width)[:b]
+    out_2d = out.reshape(padded_b, width)
+    return out_2d[:b] if padded_b > b else out_2d
 
 
 def resolve_owned_winners(
@@ -155,6 +153,7 @@ def resolve_owned_winners(
     which is also why this is the only place ownership is decided.
     """
     safe = jnp.maximum(slots, 0)
-    ours = (slots >= 0) & (jnp.floor_divide(safe, k) == dcp_rank)
-    mine = jnp.take_along_axis(local_idxs, jnp.mod(safe, k), axis=1)
+    owner_rank = jnp.floor_divide(safe, k)
+    ours = (slots >= 0) & (owner_rank == dcp_rank)
+    mine = jnp.take_along_axis(local_idxs, safe - owner_rank * k, axis=1)
     return pack_nonnegative(jnp.where(ours, mine, -1))
