@@ -372,7 +372,9 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         """
         if self._wkv_wgate_transposed:
             return
-        weight = cast(torch.Tensor, self.fused_wkv_wgate.weight).data.t().contiguous()
+        w_t = cast(torch.Tensor, self.fused_wkv_wgate.weight).data.t()
+        # A fresh base tensor, so the parameter carries no transpose-view lineage.
+        weight = torch.empty(w_t.shape, dtype=w_t.dtype, device=w_t.device).copy_(w_t)
         self.fused_wkv_wgate.weight = torch.nn.Parameter(weight, requires_grad=False)
         self._wkv_wgate_transposed = True
 
@@ -598,8 +600,8 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         operands = (
             hidden_states,
             self.fused_wkv_wgate.weight,
-            self.ape.clone(),
-            self.norm.weight.clone(),
+            self.ape,
+            self.norm.weight,
             rotary_emb.cos_sin_cache,
             positions,
             state_block_tables,
