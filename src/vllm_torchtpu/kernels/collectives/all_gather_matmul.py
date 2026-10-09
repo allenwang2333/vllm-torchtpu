@@ -576,7 +576,7 @@ def validate_inputs(x, y, tp_size, rhs_transpose=False):
 
     m_per_device_per_direction = m // tp_size // 2
     if m_per_device_per_direction % 8 != 0:
-        raise ValueError(f"m ({m}) must be divisible by {{tp_size * 2 * 8}}.")
+        raise ValueError(f"m ({m}) must be divisible by {tp_size * 2 * 8}.")
 
     if m % (tp_size * 2) != 0:
         raise ValueError(
@@ -616,17 +616,49 @@ def all_gather_matmul(
     """
     tp_size = mesh.shape[axis_name]
     validate_inputs(x, y, tp_size, rhs_transpose)
-    m, k = x.shape
+    # The jitted shard_map kernel depends only on these static values, so it
+    # is built once per configuration instead of re-traced on every call.
+    return _build_all_gather_matmul(
+        mesh,
+        axis_name,
+        collective_id,
+        bn,
+        bk,
+        rhs_transpose,
+        x.shape,
+        y.shape,
+        jnp.dtype(x.dtype),
+    )(x, y)
+
+
+@functools.lru_cache(maxsize=64)
+def _build_all_gather_matmul(
+    mesh: jax.sharding.AbstractMesh,
+    axis_name: str,
+    collective_id: int | None,
+    bn: int | None,
+    bk: int | None,
+    rhs_transpose: bool,
+    x_shape: tuple[int, ...],
+    y_shape: tuple[int, ...],
+    dtype: jnp.dtype,
+):
+    """The jitted shard_map kernel for one static configuration.
+
+    ``validate_inputs`` has already checked that x and y share ``dtype``.
+    """
+    tp_size = mesh.shape[axis_name]
+    m, k = x_shape
     if rhs_transpose:
-        n, _ = y.shape
+        n, _ = y_shape
         y_in_spec = P(axis_name, None)
     else:
-        _, n = y.shape
+        _, n = y_shape
         y_in_spec = P(None, axis_name)
     m_per_device = m // tp_size
     n_per_device = n // tp_size
     tuned_bn, tuned_bk = all_gather_matmul_tuned_block_sizes.get_tuned_block_sizes(
-        m, n, k, jnp.dtype(x.dtype).name, tp_size
+        m, n, k, dtype.name, tp_size
     )
     if bn is None:
         bn = tuned_bn if tuned_bn is not None else n
@@ -647,13 +679,13 @@ def all_gather_matmul(
         bn,
         acc_bytes,
         tp_size,
-        x.dtype,
-        y.dtype,
-        x.dtype,
+        dtype,
+        dtype,
+        dtype,
     )
     out_shape = [
-        jax.ShapeDtypeStruct((m, n_per_device), x.dtype),  # output
-        jax.ShapeDtypeStruct((tp_size - 1, m_per_device, k), x.dtype),  # x HBM scratch
+        jax.ShapeDtypeStruct((m, n_per_device), dtype),  # output
+        jax.ShapeDtypeStruct((tp_size - 1, m_per_device, k), dtype),  # x HBM scratch
     ]
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=0,
@@ -676,15 +708,15 @@ def all_gather_matmul(
                     tp_size - 1,
                 )
             ),  # left and right recv semaphores
-            pltpu.VMEM((2, m_per_device, k), x.dtype),  # x vmem scratch
-            pltpu.VMEM(y_vmem_shape, y.dtype),  # y vmem scratch
-            pltpu.VMEM((2, m_per_device, bn), x.dtype),  # output vmem scratch
+            pltpu.VMEM((2, m_per_device, k), dtype),  # x vmem scratch
+            pltpu.VMEM(y_vmem_shape, dtype),  # y vmem scratch
+            pltpu.VMEM((2, m_per_device, bn), dtype),  # output vmem scratch
             pltpu.VMEM(acc_shape, jnp.float32),  # acc vmem scratch
         ),
         grid=(tp_size + 2, grid_n, grid_k),
     )
     flops = 2 * m * k * n_per_device
-    bytes_accessed = x.dtype.itemsize * (m * k + k * n_per_device + m * n_per_device)
+    bytes_accessed = dtype.itemsize * (m * k + k * n_per_device + m * n_per_device)
     cost_estimate = pl.CostEstimate(
         flops=flops, bytes_accessed=bytes_accessed, transcendentals=0
     )
@@ -709,7 +741,7 @@ def all_gather_matmul(
             name=get_kernel_name(bn, bk, rhs_transpose),
         )(x, y)[0]
 
-    shard_map_kernel = jax.jit(
+    return jax.jit(
         jax.shard_map(
             functools.partial(
                 _all_gather_matmul_call,
@@ -723,8 +755,6 @@ def all_gather_matmul(
             check_vma=False,
         ),
     )
-
-    return shard_map_kernel(x, y)
 
 
 def get_kernel_name(bn: int, bk: int, rhs_transpose: bool):

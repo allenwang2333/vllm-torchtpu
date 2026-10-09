@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """All-gather matmul kernel's tuned block sizes."""
 
+import functools
+
 import jax
 
 # key:
@@ -25,13 +27,24 @@ TUNED_BLOCK_SIZES = {
 }
 
 
+@functools.cache
 def get_tpu_version() -> int:
-    """Returns the numeric version of the TPU, or -1 if not on TPU."""
+    """Returns the numeric version of the TPU, or -1 if not on TPU.
+
+    The device kind is fixed for the process, so the result is cached.
+    Recognizes the same kinds as the RPA v3 helper: ``TPU7x`` and the
+    ``p`` / ``e`` / `` lite`` suffixed v5 names, which the old
+    ``"TPU v<digit>"`` assertion rejected.
+    """
     kind = jax.devices()[0].device_kind
     if "TPU" not in kind:
         return -1
     if kind.endswith(" lite"):
         kind = kind[: -len(" lite")]
+    if kind.endswith("p") or kind.endswith("e"):
+        kind = kind[:-1]
+    if kind == "TPU7x":
+        return 7
     assert kind[:-1] == "TPU v", kind
     return int(kind[-1])
 
