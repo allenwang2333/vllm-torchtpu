@@ -244,7 +244,8 @@ def quantize_online_fp8(
     """Quantize a loaded local [N, K] shard; expand only scales along N."""
     n_out, k_in = weight.shape
     scheme = policy.weight_scheme
-    weight = weight.to(torch.float32)
+    if weight.dtype != torch.float32:
+        weight = weight.to(torch.float32)
     if scheme == "per_tensor":
         # Keep the matrix layout: flattening tens of millions of elements
         # into one TPU lane dimension makes load-time compilation expensive.

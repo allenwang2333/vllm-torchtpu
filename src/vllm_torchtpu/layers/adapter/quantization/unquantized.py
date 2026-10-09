@@ -138,6 +138,8 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         # diverges from F.linear's single rounding and would silently change
         # outputs for every bf16 model. addmm accumulates then rounds once,
         # keeping this bit-identical to vLLM's stock path.
+        if x.ndim == 2:
+            return torch.addmm(bias, x, weight)
         orig_out_shape = (*x.shape[:-1], weight.shape[-1])
         x_2d = x.reshape(-1, x.shape[-1])
         return torch.addmm(bias, x_2d, weight).reshape(orig_out_shape)
@@ -193,7 +195,7 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
         if isinstance(layer, LinearBase):
             # Skip kv_b_proj: MLAAttention slices W_UK_T/W_UV from unquantized
             # kv_b_proj.weight and quantizes them separately after loading.
-            if should_quantize_on_load(prefix) and "kv_b_proj" not in prefix.split("."):
+            if should_quantize_on_load(prefix) and ".kv_b_proj." not in f".{prefix}.":
                 from vllm_torchtpu.layers.adapter.quantization.fp8 import (
                     VllmFp8Config,
                     VllmFp8LinearMethodTPU,
@@ -354,21 +356,35 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
 
-        kwargs = {
-            "hidden_states": x,
-            "w1": layer.w13_weight,
-            "w2": layer.w2_weight,
-            "w1_scale": None,
-            "w2_scale": None,
-            "w1_bias": getattr(layer, "w13_bias", None),
-            "w2_bias": getattr(layer, "w2_bias", None),
-            "topk_weights": topk_weights,
-            "topk_ids": topk_ids,
-            "experts_start": layer._experts_start,
-            "topk": layer.moe_config.experts_per_token,
-            "activation": activation_str,
-        }
+        w1_bias = getattr(layer, "w13_bias", None)
+        w2_bias = getattr(layer, "w2_bias", None)
         if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
+            return pipelined_fused_moe_gmm(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                w1_scale=None,
+                w2_scale=None,
+                w1_bias=w1_bias,
+                w2_bias=w2_bias,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                experts_start=layer._experts_start,
+                topk=layer.moe_config.experts_per_token,
+                activation=activation_str,
+            )
 
-        return fused_moe_gmm(**kwargs)
+        return fused_moe_gmm(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=None,
+            w2_scale=None,
+            w1_bias=w1_bias,
+            w2_bias=w2_bias,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=layer._experts_start,
+            topk=layer.moe_config.experts_per_token,
+            activation=activation_str,
+        )
