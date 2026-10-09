@@ -384,11 +384,12 @@ def get_tuned_block_sizes(
         quant_block_size,
     )
 
-    if key not in TUNED_BLOCK_SIZES:
+    tuned = TUNED_BLOCK_SIZES.get(key)
+    if tuned is None:
         default_val = get_default_gmm_block_sizes(m, k, n, num_current_groups)
         logger.warning_once(
             f"[GMM kernel] using default block sizes for key: {key}: {default_val}"
         )
         return default_val
 
-    return TUNED_BLOCK_SIZES.get(key)
+    return tuned

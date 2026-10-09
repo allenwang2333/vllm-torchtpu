@@ -332,19 +332,17 @@ def dense_expert_moe(
     s1_blocks = s1.shape[1]
     s2_blocks = s2.shape[1]
     vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
-    if packing_factor == 1 and s1_blocks == 1 and s2_blocks == 1:
-        num_buffers = _select_expert_buffers(m, h, i, experts, vmem_capacity_bytes)
-    else:
-        num_buffers = _select_expert_buffers(
-            m,
-            h,
-            i,
-            experts,
-            vmem_capacity_bytes,
-            packing_factor,
-            s1_blocks,
-            s2_blocks,
-        )
+    # _select_expert_buffers branches on the same FP8/one-block condition.
+    num_buffers = _select_expert_buffers(
+        m,
+        h,
+        i,
+        experts,
+        vmem_capacity_bytes,
+        packing_factor,
+        s1_blocks,
+        s2_blocks,
+    )
     # Dense route coefficients are only [tokens, local experts], not expert
     # output tensors. Accumulation handles repeated IDs without reloading an
     # expert. Unroll the static top-k dimension to avoid the [M,K,E] reduction
