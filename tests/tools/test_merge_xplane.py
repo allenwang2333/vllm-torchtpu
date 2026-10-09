@@ -286,3 +286,202 @@ def test_rerunning_ignores_previously_merged_output(tmp_path):
     assert [str(p.relative_to(tmp_path)) for p in tmp_path.glob("*/*.xplane.pb")] == [
         "decode_only/decode_only_2026_08_20_10_00_00.xplane.pb"
     ]
+
+
+def test_varint_multibyte_and_format_size_units():
+    """Verify multi-byte protobuf varints and human-readable byte formatting."""
+    assert merge_xplane._varint(1) == b"\x01"
+    assert merge_xplane._varint(300) == b"\xac\x02"
+    assert merge_xplane._format_size(512) == "512 B"
+    assert merge_xplane._format_size(2048) == "2 KB"
+    assert merge_xplane._format_size(3 * 1024 * 1024) == "3 MB"
+
+
+def test_unranked_session_properties_and_non_phase_dir(tmp_path):
+    """Verify Session properties when captures have no rank and directory is flat."""
+    flat_dir = tmp_path / "flat_traces"
+    p0 = _write_trace(flat_dir, None, host="worker-a", planes=["Task Environment"])
+    session = merge_xplane.discover_sessions([str(p0)])[0]
+
+    assert session.captures[0].label == "file 0"
+    assert session.missing_ranks == []
+    assert session.timestamp == ""
+    assert session.output_name == "flat_traces.xplane.pb"
+    assert session.default_output_dir == str(flat_dir / "merged")
+
+
+def test_discover_sessions_explicit_files_skip_and_missing(tmp_path):
+    """Verify explicit file discovery, skip filtering, and FileNotFoundError."""
+    sdir = _session_dir(tmp_path)
+    f0 = _write_trace(sdir, 0)
+    f1 = _write_trace(sdir, 1)
+
+    # Explicit file list is grouped into a single session unless skipped.
+    sessions = merge_xplane.discover_sessions([str(f0), str(f1)])
+    assert len(sessions) == 1
+    assert len(sessions[0].captures) == 2
+
+    skipped_explicit = merge_xplane.discover_sessions([str(f0)], skip=(str(f0),))
+    assert skipped_explicit == []
+
+    skipped_dir = merge_xplane.discover_sessions([str(tmp_path)], skip=(str(sdir),))
+    assert skipped_dir == []
+
+    with pytest.raises(FileNotFoundError):
+        merge_xplane.discover_sessions([str(tmp_path / "does_not_exist")])
+
+
+def test_tag_host_cpu_plane_existing_process_id_and_line_variants():
+    """Verify _tag_host_cpu_plane with existing process_id and line naming rules."""
+    plane = xplane_pb2.XPlane(id=1, name="/host:CPU")
+    plane.stat_metadata[7].id = 7
+    plane.stat_metadata[7].name = "process_id"
+    stat = plane.stats.add()
+    stat.metadata_id = 7
+    stat.int64_value = 99
+
+    # Line 0: empty events -> untouched
+    plane.lines.add(id=10, name="untouched_empty")
+    # Line 1: pjrt-tpu-tasks line
+    line_pjrt = plane.lines.add(id=11, name="PJRT-TPU-Tasks/stream_0")
+    line_pjrt.events.add(metadata_id=1, offset_ps=1, duration_ps=1)
+    # Line 2: subsystem/thread line
+    line_sub = plane.lines.add(id=12, name="runtime/worker")
+    line_sub.events.add(metadata_id=1, offset_ps=1, duration_ps=1)
+
+    capture = merge_xplane.Capture(path="rank2_host.xplane.pb", rank=2, slot=2)
+    merge_xplane._tag_host_cpu_plane(plane, capture)
+
+    assert plane.name == "/host:CPU [2]"
+    assert [s.int64_value for s in plane.stats if s.metadata_id == 7] == [2]
+    assert plane.lines[0].name == "untouched_empty"
+    assert plane.lines[1].name == "pjrt-tpu-tasks [rank 2]/stream_0"
+    assert plane.lines[2].name == "runtime worker [rank 2]"
+
+
+def test_merge_session_preserves_errors_warnings_and_cleans_tmp(tmp_path):
+    """Verify errors/warnings serialization and .tmp file cleanup on failure."""
+    sdir = _session_dir(tmp_path)
+    sdir.mkdir(parents=True, exist_ok=True)
+    space = xplane_pb2.XSpace()
+    space.hostnames.append("host-0")
+    space.errors.append("oom_error")
+    space.warnings.append("clock_skew")
+    space.planes.add(id=1, name="/device:TPU:0")
+    p0 = sdir / "rank0_host.xplane.pb"
+    p0.write_bytes(space.SerializeToString())
+
+    session = merge_xplane.discover_sessions([str(tmp_path)])[0]
+    out_file = tmp_path / "merged_err_warn.xplane.pb"
+    merge_xplane.merge_session(session, str(out_file))
+    merged = _load(out_file)
+    assert list(merged.errors) == ["oom_error"]
+    assert list(merged.warnings) == ["clock_skew"]
+
+    # Broken session where second capture is missing triggers finally cleanup of .tmp
+    bad_session = merge_xplane.Session(
+        label="bad",
+        timestamp="ts",
+        directory=str(sdir),
+        captures=(
+            merge_xplane.Capture(path=str(p0), rank=0, slot=0),
+            merge_xplane.Capture(path=str(sdir / "missing.xplane.pb"), rank=1, slot=1),
+        ),
+    )
+    failed_out = tmp_path / "failed_out.xplane.pb"
+    with pytest.raises(FileNotFoundError):
+        merge_xplane.merge_session(bad_session, str(failed_out))
+    assert not (tmp_path / "failed_out.xplane.pb.tmp").exists()
+
+
+def test_cli_output_flags_error_cases_and_size_reporting(tmp_path, capsys):
+    """Verify CLI -o, -d, empty input, multi-session -o, and size change branches."""
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    assert merge_xplane.main([str(empty_dir)]) == 2
+    assert "No .xplane.pb files found" in capsys.readouterr().err
+
+    # Two sessions with -o must fail with exit code 2
+    for phase in ("phase_a", "phase_b"):
+        _write_trace(
+            _session_dir(tmp_path / "multi", phase), 0, planes=["/device:TPU:0"]
+        )
+    assert (
+        merge_xplane.main(
+            [str(tmp_path / "multi"), "-o", str(tmp_path / "single_out.xplane.pb")]
+        )
+        == 2
+    )
+    assert "--output takes a single file" in capsys.readouterr().err
+
+    # Single session with -o and identical output size (1 rank, only /device:TPU:0)
+    equal_dir = _session_dir(tmp_path / "equal")
+    _write_trace(equal_dir, 0, planes=["/device:TPU:0"])
+    exact_out = tmp_path / "exact.xplane.pb"
+    assert merge_xplane.main([str(tmp_path / "equal"), "-o", str(exact_out)]) == 0
+    assert exact_out.exists()
+
+    # Single session with -d (--output-dir) where tagging makes output larger than input
+    larger_dir = _session_dir(tmp_path / "larger")
+    _write_trace(larger_dir, 1, planes=["/host:CPU"])
+    out_dir = tmp_path / "custom_out_dir"
+    assert merge_xplane.main([str(tmp_path / "larger"), "-d", str(out_dir)]) == 0
+    out_text = capsys.readouterr().out
+    assert "larger" in out_text
+
+
+def test_cli_dunder_main_entrypoint(tmp_path, monkeypatch):
+    """Verify running merge_xplane as __main__ invokes sys.exit(main())."""
+    import runpy
+    import sys
+
+    empty_dir = tmp_path / "empty_main"
+    empty_dir.mkdir()
+    monkeypatch.setattr(sys, "argv", ["merge_xplane", str(empty_dir)])
+    with pytest.raises(SystemExit) as exc_info:
+        runpy.run_module("vllm_torchtpu.tools.merge_xplane", run_name="__main__")
+    assert exc_info.value.code == 2
+
+
+def test_xplane_pb2_pure_python_descriptor_branch(monkeypatch):
+    """Verify the _USE_C_DESCRIPTORS == False branch in generated xplane_pb2.py."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from google.protobuf import descriptor as _descriptor
+    from google.protobuf import descriptor_pool as _descriptor_pool
+    from google.protobuf.internal import builder as _builder
+
+    descriptor_keys = (
+        "_XSPACE",
+        "_XPLANE",
+        "_XPLANE_EVENTMETADATAENTRY",
+        "_XPLANE_STATMETADATAENTRY",
+        "_XLINE",
+        "_XEVENT",
+        "_XSTAT",
+        "_XEVENTMETADATA",
+        "_XSTATMETADATA",
+    )
+    fake_pool = SimpleNamespace(AddSerializedFile=lambda _bytes: SimpleNamespace())
+
+    def _fake_build_msg_enum(desc, module_globals):
+        for key in descriptor_keys:
+            module_globals[key] = SimpleNamespace()
+
+    monkeypatch.setattr(_descriptor, "_USE_C_DESCRIPTORS", False)
+    monkeypatch.setattr(_descriptor_pool, "Default", lambda: fake_pool)
+    monkeypatch.setattr(
+        _builder, "BuildMessageAndEnumDescriptors", _fake_build_msg_enum
+    )
+    monkeypatch.setattr(
+        _builder,
+        "BuildTopDescriptorsAndMessages",
+        lambda desc, mod_name, module_globals: None,
+    )
+
+    pb2_path = Path(xplane_pb2.__file__)
+    code = compile(pb2_path.read_text(encoding="utf-8"), str(pb2_path), "exec")
+    ns: dict[str, object] = {}
+    exec(code, ns)
+    assert ns["_XSTATMETADATA"]._serialized_end == 1336

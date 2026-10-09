@@ -131,10 +131,10 @@ class Session:
         A capture that lost a rank still merges, but the result silently
         describes less of the slice than it appears to, so callers warn.
         """
-        ranks = sorted(c.rank for c in self.captures if c.rank is not None)
-        if not ranks:
+        rank_set = {c.rank for c in self.captures if c.rank is not None}
+        if not rank_set:
             return []
-        return [r for r in range(ranks[-1]) if r not in set(ranks)]
+        return [r for r in range(max(rank_set)) if r not in rank_set]
 
 
 def _varint(value: int) -> bytes:
@@ -223,16 +223,20 @@ def _make_session(directory: str, paths: list[str]) -> Session:
     # Absolute and normalized: `_phase_dir` walks up with `dirname`, which
     # cannot see past a relative path (`dirname(".")` is `""`), and a trailing
     # separator would otherwise shift every component by one.
-    directory = os.path.normpath(os.path.abspath(directory))
+    directory = _normalize_path(directory)
     label, timestamp = _session_identity(directory)
     return Session(
         label=label, timestamp=timestamp, directory=directory, captures=tuple(captures)
     )
 
 
+def _normalize_path(path: str) -> str:
+    return os.path.normpath(os.path.abspath(path))
+
+
 def _is_within(path: str, ancestor: str) -> bool:
-    path = os.path.normpath(os.path.abspath(path))
-    ancestor = os.path.normpath(os.path.abspath(ancestor))
+    path = _normalize_path(path)
+    ancestor = _normalize_path(ancestor)
     return path == ancestor or path.startswith(ancestor + os.sep)
 
 
@@ -279,11 +283,8 @@ def discover_sessions(paths: list[str], *, skip: tuple[str, ...] = ()) -> list[S
     if explicit:
         sessions.insert(0, _make_session(os.path.dirname(explicit[0]), explicit))
 
-    def normalized(path: str) -> str:
-        return os.path.normpath(os.path.abspath(path))
-
     phase_dirs = {
-        normalized(session.default_output_dir)
+        _normalize_path(session.default_output_dir)
         for session in sessions
         if _phase_dir(session.directory)
     }
@@ -291,7 +292,7 @@ def discover_sessions(paths: list[str], *, skip: tuple[str, ...] = ()) -> list[S
         session
         for session in sessions
         if _phase_dir(session.directory)
-        or normalized(session.directory) not in phase_dirs
+        or _normalize_path(session.directory) not in phase_dirs
     ]
 
 
@@ -367,10 +368,12 @@ def _rewrite_plane_name(
             match.group(3) or "",
         )
         key = (prefix, local_id)
-        if key not in local_to_global:
-            local_to_global[key] = next_id_per_prefix.get(prefix, 0)
-            next_id_per_prefix[prefix] = local_to_global[key] + 1
-        plane.name = f"{prefix}:{local_to_global[key]}{trailing}"
+        global_id = local_to_global.get(key)
+        if global_id is None:
+            global_id = next_id_per_prefix.get(prefix, 0)
+            local_to_global[key] = global_id
+            next_id_per_prefix[prefix] = global_id + 1
+        plane.name = f"{prefix}:{global_id}{trailing}"
     elif plane.name == _HOST_CPU_PLANE:
         _tag_host_cpu_plane(plane, capture)
     else:
@@ -404,6 +407,7 @@ def merge_session(session: Session, output_path: str) -> MergeResult:
 
     next_id_per_prefix: dict[str, int] = {}
     hostnames: list[str] = []
+    seen_hostnames: set[str] = set()
     plane_count = 0
     planes_read = 0
     deduplicated = 0
@@ -419,7 +423,8 @@ def merge_session(session: Session, output_path: str) -> MergeResult:
                     space.ParseFromString(handle.read())
 
                 for hostname in space.hostnames:
-                    if hostname not in hostnames:
+                    if hostname not in seen_hostnames:
+                        seen_hostnames.add(hostname)
                         hostnames.append(hostname)
 
                 local_to_global: dict[tuple[str, int], int] = {}
@@ -474,7 +479,7 @@ def _is_inside_session_dir(directory: str) -> bool:
     merged file dropped beside the per-rank ones shows up as an extra host
     holding a second copy of every rank.
     """
-    normalized = os.path.normpath(os.path.abspath(directory))
+    normalized = _normalize_path(directory)
     return f"{os.sep}plugins{os.sep}profile{os.sep}" in f"{normalized}{os.sep}"
 
 
@@ -603,8 +608,9 @@ def main(argv: list[str] | None = None) -> int:
             f"{rank_note}, {_format_size(source_bytes)}"
         )
 
-        if session.missing_ranks:
-            gaps = ", ".join(str(r) for r in session.missing_ranks)
+        missing = session.missing_ranks
+        if missing:
+            gaps = ", ".join(str(r) for r in missing)
             print(
                 f"    WARNING: no trace for rank(s) {gaps}. The merged file "
                 "will describe only part of the slice."
