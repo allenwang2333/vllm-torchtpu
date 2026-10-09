@@ -22,6 +22,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
@@ -104,7 +105,9 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
             maybe_quantize_lhs=True,
             zero_initialize=True,
         )
-    return xla_quantized_matmul(x, w_q, w_s)
+    # Rows is static at trace time, so each token bucket picks one path.
+    quantize_activation = x.shape[0] > envs.TPU_FP8_LINEAR_W8A16_MAX_ROWS
+    return xla_quantized_matmul(x, w_q, w_s, quantize_activation=quantize_activation)
 
 
 _quantized_matmul_kernel_op: Callable | None = None

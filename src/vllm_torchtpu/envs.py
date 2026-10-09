@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_PP_LAZY_PUSH: bool = False
     TPU_ROPE_CACHE_TRUNCATE: bool = False
+    TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -732,6 +733,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
     "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE"),
+    # FP8 dense linears on the per-channel path: a step with at most this many
+    # rows keeps bf16 activations against the FP8 weights (W8A16) instead of
+    # quantizing them per call. Small decode steps are weight-bandwidth bound,
+    # so the per-call activation quantization (an abs-max reduction and a
+    # cast) costs more than FP8 activations save. 0 keeps W8A8 everywhere.
+    "TPU_FP8_LINEAR_W8A16_MAX_ROWS": env_nonnegative_int(
+        "TPU_FP8_LINEAR_W8A16_MAX_ROWS", 0
+    ),
     # Materialize the rotary cos_sin caches with a row-major ({1,0}) device
     # layout at load, May cost more HBM due to padding.
     "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=False),
