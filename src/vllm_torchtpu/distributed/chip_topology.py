@@ -20,6 +20,11 @@ class ChipTopology:
         self.device_ids = device_ids  # global device order
         self.num_chips = len(chips)
         self.cores_per_chip = len(chips[0]) if chips else 0
+        self._device_to_chip: dict[int, tuple[int, int]] = {
+            dev_id: (chip_idx, core_idx)
+            for chip_idx, ids in enumerate(chips)
+            for core_idx, dev_id in enumerate(ids)
+        }
 
     def chip_of(self, rank: int) -> tuple[int, int]:
         """``(chip_index, core_on_chip)`` for a global device rank.
@@ -33,9 +38,9 @@ class ChipTopology:
                 f"rank {rank} outside the {len(self.device_ids)} visible devices"
             )
         device_id = self.device_ids[rank]
-        for chip_index, ids in enumerate(self.chips):
-            if device_id in ids:
-                return chip_index, ids.index(device_id)
+        loc = self._device_to_chip.get(device_id)
+        if loc is not None:
+            return loc
         raise RuntimeError(f"device {device_id} is on no chip; chips={self.chips}")
 
     def describe(self) -> str:

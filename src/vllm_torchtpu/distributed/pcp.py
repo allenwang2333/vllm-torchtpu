@@ -86,8 +86,8 @@ def get_or_create_pcp_mesh(
     import torch.distributed as dist
     from torch_tpu._internal.pallas import get_pallas_mesh
 
-    layout = get_pcp_group_layout()
     group = get_pcp_group()
+    layout = get_cp_group_layout(group)
     axis_names = (axis_name,) if tp_axis_name is None else (axis_name, tp_axis_name)
     if len(set(axis_names)) != len(axis_names):
         raise ValueError("PCP and TP mesh axis names must be distinct.")

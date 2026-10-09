@@ -201,11 +201,10 @@ def pcp_topology_order(
     def patched(group_ranks, local_rank, backend, *args, **kwargs):
         nonlocal preserving
         axis = kwargs.get("group_name")
+        orig_lists = [list(g) for g in group_ranks]
         # Logged for every axis, whether or not it is being replaced, so the
         # log shows vLLM's own layout even when the mesh does not apply.
-        logger.info(
-            "vLLM layout | %s: vLLM built %s", axis, [list(g) for g in group_ranks]
-        )
+        logger.info("vLLM layout | %s: vLLM built %s", axis, orig_lists)
         replacement = replacements.get(axis) if axis else None
         reordered = False
         if replacement is not None:
@@ -215,12 +214,12 @@ def pcp_topology_order(
         elif axis == "dcp" and preserve_dcp_order:
             # DCP rank transposition across PCP slices produces unsorted ranks;
             # sort so GroupCoordinator.ranks matches device_group order.
-            sorted_group_ranks = [sorted(int(r) for r in g) for g in group_ranks]
-            if sorted_group_ranks != [list(g) for g in group_ranks]:
+            sorted_group_ranks = [sorted(int(r) for r in g) for g in orig_lists]
+            if sorted_group_ranks != orig_lists:
                 logger.info(
                     "DCP layout | %s: sorted %s -> %s",
                     axis,
-                    [list(g) for g in group_ranks],
+                    orig_lists,
                     sorted_group_ranks,
                 )
                 group_ranks = sorted_group_ranks
