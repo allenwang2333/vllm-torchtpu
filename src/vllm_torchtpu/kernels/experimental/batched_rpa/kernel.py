@@ -341,6 +341,23 @@ def fetch_compute_metadata(
     )
 
 
+def stitch_batch_gate(
+    stitch_meta: StitchMetadata,
+    *,
+    cfgs: configs.RpaConfigs,
+) -> jax.Array:
+    """One predicate for the whole batch: any slot needing a stitch runs all.
+
+    Coarser than per-slot, so it fires more often, but it costs one scheduling
+    barrier instead of `batch_size` and leaves the batched fetch/store split
+    intact.
+    """
+    gate = stitch_meta.bkv_sz_frm_cache[0] < cfgs.bkv_sz
+    for b_idx in range(1, cfgs.batch_size):
+        gate = gate | (stitch_meta.bkv_sz_frm_cache[b_idx] < cfgs.bkv_sz)
+    return gate
+
+
 def generate_mask(
     shape: tuple[int, int, int, int],
     *,
@@ -439,9 +456,9 @@ def rpa_body(
     @jax.named_scope("stitch_and_issue_writeback")
     def _kv_store_fence():
         if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-            stitch_results = []
-            for b_idx in range(cfgs.batch_size):
-                res = stitch_utils.stitch_new_kv_lane(
+
+            def fetch(b_idx: int):
+                return stitch_utils.stitch_new_kv_lane(
                     kv_in_vref,
                     b_idx,
                     stitch_meta.bkv_sz_frm_cache[b_idx],
@@ -449,14 +466,18 @@ def rpa_body(
                     stitch_meta.bkv_sz_frm_new[b_idx],
                     cfgs=cfgs,
                 )
-                stitch_results.append(res)
-            for b_idx in range(cfgs.batch_size):
-                stitch_utils.store_new_kv_lane(
-                    kv_in_vref,
-                    b_idx,
-                    stitch_results[b_idx],
-                    cfgs=cfgs,
-                )
+
+            def store(b_idx: int, result):
+                stitch_utils.store_new_kv_lane(kv_in_vref, b_idx, result, cfgs=cfgs)
+
+            def stitch_batch():
+                # Every slot is fetched before any is stored: reads and writes to
+                # kv_in_vref must not interleave, see `stitch_new_kv_lane`.
+                results = [fetch(b_idx) for b_idx in range(cfgs.batch_size)]
+                for b_idx, result in enumerate(results):
+                    store(b_idx, result)
+
+            pl.when(stitch_batch_gate(stitch_meta, cfgs=cfgs))(stitch_batch)
 
         start_kv_writeback()
 
