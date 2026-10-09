@@ -68,22 +68,17 @@ def _placeholder_values(graph: fx.GraphModule) -> list[Any]:
     return values
 
 
-_UNSET = object()
-
-
 def trace_shape_env(graph: fx.GraphModule) -> Any | None:
     """The ShapeEnv of the trace this graph came from, if it has one."""
-    cached = getattr(graph, "_cached_trace_shape_env", _UNSET)
-    if cached is not _UNSET:
-        return cached
-    shape_env = None
-    for value in _placeholder_values(graph):
-        mode = getattr(value, "fake_mode", None)
-        if mode is not None and mode.shape_env is not None:
-            shape_env = mode.shape_env
+    for node in graph.graph.nodes:
+        if node.op != "placeholder":
             break
-    graph._cached_trace_shape_env = shape_env
-    return shape_env
+        value = node.meta.get("example_value", node.meta.get("val"))
+        if value is not None:
+            mode = getattr(value, "fake_mode", None)
+            if mode is not None and mode.shape_env is not None:
+                return mode.shape_env
+    return None
 
 
 def _finite(value: Any) -> int | None:

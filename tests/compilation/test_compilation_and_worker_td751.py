@@ -90,8 +90,10 @@ def test_placeholder_values_trace_shape_env_and_signatures():
     vals = _placeholder_values(g_with_env)
     assert len(vals) == 2
     assert trace_shape_env(g_with_env) is shape_env_obj
-    # Second call hits cached branch
-    assert trace_shape_env(g_with_env) is shape_env_obj
+
+    # Graph with placeholder (no shape_env) followed by non-placeholder
+    g_no_env_break = _make_fake_graph([n1, n2, n4])
+    assert trace_shape_env(g_no_env_break) is None
 
     # Graph with only placeholders and no shape_env
     g_no_env = _make_fake_graph(
@@ -105,7 +107,30 @@ def test_placeholder_values_trace_shape_env_and_signatures():
         ]
     )
     assert trace_shape_env(g_no_env) is None
-    assert trace_shape_env(g_no_env) is None
+
+    # Regression test: trace_shape_env must not attach ShapeEnv onto
+    # GraphModule.__dict__ (which would cause copy.deepcopy(gm) to deepcopy
+    # FakeTensors and access data_ptr).
+    import copy
+    import warnings
+
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    real_shape_env = ShapeEnv()
+    with FakeTensorMode(shape_env=real_shape_env) as fake_mode:
+        ft = fake_mode.from_tensor(torch.zeros(4, 8), static_shapes=False)
+        real_shape_env.tracked_fakes = [SimpleNamespace(fake=ft)]  # type: ignore[attr-defined]
+    fx_g = torch.fx.Graph()
+    p_node = fx_g.placeholder("x")
+    p_node.meta["val"] = ft
+    fx_g.output(p_node)
+    gm = torch.fx.GraphModule(torch.nn.Module(), fx_g)
+    assert trace_shape_env(gm) is real_shape_env
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        gm_copy = copy.deepcopy(gm)
+    assert isinstance(gm_copy, torch.fx.GraphModule)
 
     # Signature with non-tensor, concrete tensor, and symbolic dim tensor
     sym_int = torch.SymInt(8)
