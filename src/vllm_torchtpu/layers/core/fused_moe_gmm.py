@@ -35,6 +35,13 @@ from vllm_torchtpu.kernels.experimental.moe_lowtok import (
 from vllm_torchtpu.kernels.experimental.moe_lowtok import (
     routing_table as moe_lowtok_routing_table,
 )
+from vllm_torchtpu.kernels.experimental.routing_moe.common import layout_util
+from vllm_torchtpu.kernels.experimental.routing_moe.gmm import (
+    kernel as routing_gmm_kernel,
+)
+from vllm_torchtpu.kernels.experimental.routing_moe.io_relayout import (
+    output_reduce,
+)
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
@@ -602,6 +609,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "num_experts",
     ),
 )
 def fused_moe_func(
@@ -622,6 +630,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    num_experts: int | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -666,6 +675,8 @@ def fused_moe_func(
     # reduce, and `where` propagate in BF16 — some custom_routing_fn
     # callers return FP32 weights and would otherwise promote downstream.
     topk_weights = topk_weights.astype(hidden_states.dtype)
+    global_topk_ids = topk_ids
+    orig_topk_weights = topk_weights
 
     if use_ep and experts_start is not None:
         local_ids = topk_ids - experts_start
@@ -736,6 +747,108 @@ def fused_moe_func(
         return dense_expert_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
         )
+
+    if (
+        (envs.USE_ROUTING_MOE or envs.USE_FUSED_UNPERMUTE_GMM)
+        and rhs_quant_dtype is None
+        and hidden_size % 256 == 0
+        and (num_tokens * topk) % 16 == 0
+        and num_tokens >= envs.TPU_ROUTING_MOE_MIN_TOKENS
+    ):
+        logger.info_once("Selected routing GMM MoE (CL 995002390)")
+        if padded_hidden_size != hidden_size:
+            hidden_states = jnp.pad(
+                hidden_states, ((0, 0), (0, padded_hidden_size - hidden_size))
+            )
+        batch_size, model_dim = hidden_states.shape
+        x_compact = hidden_states.reshape(
+            layout_util.to_compact_shape(hidden_states.shape, hidden_states.dtype)
+        )
+
+        if use_ep:
+            global_num_experts = 512 if num_experts is None else num_experts
+            group_offset = (
+                jnp.zeros((1,), dtype=jnp.int32)
+                if experts_start is None
+                else jnp.reshape(experts_start, (1,)).astype(jnp.int32)
+            )
+        else:
+            global_num_experts = w1.shape[0]
+            group_offset = jnp.zeros((1,), dtype=jnp.int32)
+
+        topk_indices_flat = global_topk_ids.flatten()
+        topk_argsort_indices = jnp.argsort(topk_indices_flat)
+        group_sizes = jnp.bincount(topk_indices_flat, length=global_num_experts)
+
+        inter_dim = w2.shape[1]
+        target_inter_dim = -(-inter_dim // 256) * 256
+        pad_size = target_inter_dim - inter_dim
+
+        w1_in = w1
+        w2_in = w2
+        w1_scale_in = w1_scale
+        w2_scale_in = w2_scale
+
+        if pad_size > 0:
+            gate = w1[..., :inter_dim]
+            up = w1[..., inter_dim:]
+            gate_padded = jnp.pad(gate, ((0, 0), (0, 0), (0, pad_size)))
+            up_padded = jnp.pad(up, ((0, 0), (0, 0), (0, pad_size)))
+            w1_in = jnp.concatenate([gate_padded, up_padded], axis=-1)
+            w2_in = jnp.pad(w2, ((0, 0), (0, pad_size), (0, 0)))
+
+        if w1_scale is not None:
+            if w1_scale.ndim == 2:
+                w1_scale_in = w1_scale[:, None, None, :]
+            elif w1_scale.ndim == 3:
+                w1_scale_in = jnp.expand_dims(w1_scale, 2)
+            if pad_size > 0:
+                scale_gate = w1_scale_in[..., :inter_dim]
+                scale_up = w1_scale_in[..., inter_dim:]
+                scale_gate_padded = jnp.pad(
+                    scale_gate,
+                    ((0, 0), (0, 0), (0, 0), (0, pad_size)),
+                    constant_values=1.0,
+                )
+                scale_up_padded = jnp.pad(
+                    scale_up,
+                    ((0, 0), (0, 0), (0, 0), (0, pad_size)),
+                    constant_values=1.0,
+                )
+                w1_scale_in = jnp.concatenate(
+                    [scale_gate_padded, scale_up_padded], axis=-1
+                )
+
+        if w2_scale is not None:
+            if w2_scale.ndim == 2:
+                w2_scale_in = w2_scale[:, None, None, :]
+            elif w2_scale.ndim == 3:
+                w2_scale_in = jnp.expand_dims(w2_scale, 2)
+
+        gmm_out = routing_gmm_kernel.routing_gmm(
+            x_compact,
+            w=w1_in,
+            w_scale=w1_scale_in,
+            group_sizes=group_sizes,
+            w2=w2_in,
+            w2_scale=w2_scale_in,
+            gather_indices=topk_argsort_indices // topk,
+            scatter_indices=topk_argsort_indices,
+            fuse_act=activation,
+            group_offset=group_offset,
+        )
+
+        out = output_reduce.output_reduce_unpack(
+            gmm_out,
+            orig_topk_weights,
+            global_topk_ids,
+            group_offset,
+            w1.shape[0],
+        )
+
+        if w2_bias is not None:
+            out = out + w2_bias
+        return out[:num_tokens, :hidden_size]
 
     (
         x,

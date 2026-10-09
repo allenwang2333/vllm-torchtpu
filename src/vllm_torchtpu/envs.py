@@ -58,6 +58,9 @@ if TYPE_CHECKING:
     TPU_MOE_LOWTOK: bool = False
     USE_MOE_FUSED_TP_KERNEL: bool = False
     MOE_FUSED_TP_KERNEL_MAX_TOKENS: int = 512
+    USE_ROUTING_MOE: bool = False
+    USE_FUSED_UNPERMUTE_GMM: bool = False
+    TPU_ROUTING_MOE_MIN_TOKENS: int = 256
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -580,6 +583,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "USE_MOE_FUSED_TP_KERNEL": env_bool("USE_MOE_FUSED_TP_KERNEL"),
     "MOE_FUSED_TP_KERNEL_MAX_TOKENS": env_nonnegative_int(
         "MOE_FUSED_TP_KERNEL_MAX_TOKENS", 512
+    ),
+    "USE_ROUTING_MOE": env_bool("USE_ROUTING_MOE", default=False),
+    "USE_FUSED_UNPERMUTE_GMM": env_bool("USE_FUSED_UNPERMUTE_GMM", default=False),
+    "TPU_ROUTING_MOE_MIN_TOKENS": env_nonnegative_int(
+        "TPU_ROUTING_MOE_MIN_TOKENS", 256
     ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
