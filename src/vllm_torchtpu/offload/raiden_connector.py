@@ -48,10 +48,10 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import VllmConfig
+from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -92,9 +92,6 @@ from vllm_torchtpu.offload.raiden_store import (
     RaidenOffloadingManager,
     TPURaidenStoreOffloadingSpec,
 )
-
-if TYPE_CHECKING:
-    from vllm.distributed.kv_events import KVCacheEvent
 
 logger = init_logger(__name__)
 
@@ -180,7 +177,7 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class _ParkedStore:
     """A store job parked until every worker rank acknowledges the device fence."""
 
@@ -257,23 +254,28 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         finished_store_ids: list[int] = []
         finished_loads: dict[int, str] = {}
         failed_load_block_ids: list[int] = []
-        flush_ids = meta.jobs_to_flush or set()
-        launched_flush_ids: set[int] = set()
-        for job_id in flush_ids:
-            parked = self._fence_pending.pop(job_id, None)
-            if parked is not None:
-                manager.on_store_job_cancelled(parked.keys)
-                finished_store_ids.append(job_id)
-                # Avoid useless TPU sync if created and cancelled in the same step.
-                new_fence_ids.discard(job_id)
-                logger.debug(
-                    "TPURaidenOffloadingConnector: cancelled fence-pending "
-                    "store job %d (source blocks reused)",
-                    job_id,
-                )
-            elif manager.is_job_launched(job_id):
-                launched_flush_ids.add(job_id)
-        drained = manager.drain_jobs(launched_flush_ids) if launched_flush_ids else []
+        flush_ids = meta.jobs_to_flush
+        if flush_ids:
+            launched_flush_ids: set[int] = set()
+            for job_id in flush_ids:
+                parked = self._fence_pending.pop(job_id, None)
+                if parked is not None:
+                    manager.on_store_job_cancelled(parked.keys)
+                    finished_store_ids.append(job_id)
+                    # Avoid useless TPU sync if created and cancelled in the same step.
+                    new_fence_ids.discard(job_id)
+                    logger.debug(
+                        "TPURaidenOffloadingConnector: cancelled fence-pending "
+                        "store job %d (source blocks reused)",
+                        job_id,
+                    )
+                elif manager.is_job_launched(job_id):
+                    launched_flush_ids.add(job_id)
+            drained = (
+                manager.drain_jobs(launched_flush_ids) if launched_flush_ids else ()
+            )
+        else:
+            drained = ()
 
         # Collect completed/drained jobs for the worker echo channel.
         polled = manager.poll_finished_jobs()
@@ -497,12 +499,14 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             self._pending_fences = still_pending
 
         finished_recving: set[str] = set()
+        completed_jobs = self._completed_jobs
         for job_id in meta.finished_store_job_ids:
-            self._completed_jobs[job_id] = 1
+            completed_jobs[job_id] = 1
         for job_id, req_id in meta.finished_load_jobs.items():
-            self._completed_jobs[job_id] = 1
+            completed_jobs[job_id] = 1
             finished_recving.add(req_id)
-        self._load_error_block_ids.update(meta.failed_load_device_block_ids)
+        if meta.failed_load_device_block_ids:
+            self._load_error_block_ids.update(meta.failed_load_device_block_ids)
 
         return set(), finished_recving
 

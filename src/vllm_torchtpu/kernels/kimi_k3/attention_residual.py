@@ -9,6 +9,20 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+_COMPILER_PARAMS = pltpu.CompilerParams(vmem_limit_bytes=63 * 1024**2)
+
+
+def _idx_map_2d(i):
+    return (i, 0)
+
+
+def _idx_map_3d(i):
+    return (i, 0, 0)
+
+
+def _idx_map_1d(i):
+    return (0,)
+
 
 def _mix_kernel(prefix, history, weight, output, *, eps):
     values = jnp.concatenate((history[...], prefix[...][:, None, :]), axis=1).astype(
@@ -21,6 +35,22 @@ def _mix_kernel(prefix, history, weight, output, *, eps):
     )
     probabilities = jax.nn.softmax(scores, axis=1)
     output[...] = jnp.sum(values * probabilities, axis=1).astype(output.dtype)
+
+
+@functools.lru_cache(maxsize=64)
+def _get_block_specs(hidden: int, num_blocks: int):
+    out_spec = pl.BlockSpec((16, hidden), _idx_map_2d)
+    in_specs = (
+        out_spec,
+        pl.BlockSpec((16, num_blocks, hidden), _idx_map_3d),
+        pl.BlockSpec((hidden,), _idx_map_1d),
+    )
+    return in_specs, out_spec
+
+
+@functools.lru_cache(maxsize=16)
+def _get_mix_kernel(eps: float):
+    return functools.partial(_mix_kernel, eps=eps)
 
 
 def attention_residual(prefix, history, folded_weight, *, eps=1e-5, interpret=False):
@@ -37,21 +67,19 @@ def attention_residual(prefix, history, folded_weight, *, eps=1e-5, interpret=Fa
         raise ValueError(
             "Attention Residual needs one folded weight per hidden feature"
         )
-    if history.shape[1] == 0 or tokens == 0:
+    num_blocks = history.shape[1]
+    if num_blocks == 0 or tokens == 0:
         return prefix
     if tokens % 16:
         raise ValueError("Fused Attention Residual requires 16-token tiles")
+    in_specs, out_specs = _get_block_specs(hidden, num_blocks)
     return pl.pallas_call(
-        functools.partial(_mix_kernel, eps=eps),
+        _get_mix_kernel(eps),
         out_shape=jax.ShapeDtypeStruct(prefix.shape, prefix.dtype),
         grid=(tokens // 16,),
-        in_specs=(
-            pl.BlockSpec((16, hidden), lambda i: (i, 0)),
-            pl.BlockSpec((16, history.shape[1], hidden), lambda i: (i, 0, 0)),
-            pl.BlockSpec((hidden,), lambda i: (0,)),
-        ),
-        out_specs=pl.BlockSpec((16, hidden), lambda i: (i, 0)),
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=63 * 1024**2),
+        in_specs=in_specs,
+        out_specs=out_specs,
+        compiler_params=_COMPILER_PARAMS,
         interpret=interpret,
         name="kimi_attnres_compact_m16",
     )(prefix, history, folded_weight)

@@ -37,8 +37,9 @@ def _layout_supported(
     if query_start_loc.shape[0] <= 3:
         return jnp.asarray(True)
 
-    starts = jnp.minimum(query_start_loc[:-1], num_tokens)
-    ends = jnp.minimum(query_start_loc[1:], num_tokens)
+    clamped_loc = jnp.minimum(query_start_loc, num_tokens)
+    starts = clamped_loc[:-1]
+    ends = clamped_loc[1:]
     tile_starts = jnp.arange(0, num_tokens, chunk_size, dtype=jnp.int32)
     tile_ends = tile_starts + chunk_size
     overlaps = (
@@ -103,31 +104,34 @@ def kda_forward_inference(
     Raises:
       ValueError: If shapes, dtypes, or static inference options are invalid.
     """
-    if q.dtype != jnp.bfloat16:
+    q_dtype = q.dtype
+    if q_dtype != jnp.bfloat16:
         raise ValueError(
-            f"kda_forward_inference currently requires BF16, got {q.dtype}"
+            f"kda_forward_inference currently requires BF16, got {q_dtype}"
         )
-    if not (q.dtype == k.dtype == v.dtype == g.dtype):
+    if not (q_dtype == k.dtype == v.dtype == g.dtype):
         raise ValueError("q, k, v, and g must have the same dtype")
-    if beta.dtype != q.dtype:
+    if beta.dtype != q_dtype:
         raise ValueError("beta must have the same dtype as q")
     if chunk_size != 64:
         raise ValueError(
             "the optimized inference kernel currently requires chunk_size=64"
         )
-    if q.shape[:3] != k.shape[:3] or q.shape != g.shape:
+    q_shape = q.shape
+    b_t_h = q_shape[:3]
+    if b_t_h != k.shape[:3] or q_shape != g.shape:
         raise ValueError("q, k, and g must agree on [B, T, H, K]")
-    if q.shape[:3] != v.shape[:3] or q.shape[:3] != beta.shape:
+    if b_t_h != v.shape[:3] or b_t_h != beta.shape:
         raise ValueError("v and beta must agree with q on [B, T, H]")
-    if q.shape[-1] != k.shape[-1]:
+    if q_shape[-1] != k.shape[-1]:
         raise ValueError("q and k must have the same key dimension")
-    if q.shape[1] % chunk_size:
+    if q_shape[1] % chunk_size:
         raise ValueError("T must be padded to a multiple of chunk_size")
     if segment_ids.ndim == 1:
         segment_ids = segment_ids[None, :]
-    if segment_ids.shape != q.shape[:2]:
+    if segment_ids.shape != q_shape[:2]:
         raise ValueError(
-            f"segment_ids must have shape {q.shape[:2]}, got {segment_ids.shape}"
+            f"segment_ids must have shape {q_shape[:2]}, got {segment_ids.shape}"
         )
     if segment_ids.dtype != jnp.int32:
         raise ValueError(f"segment_ids must use int32, got {segment_ids.dtype}")
@@ -153,9 +157,9 @@ def kda_forward_inference(
     # exp(80) is finite in FP32 and already far beyond the sigmoid saturation
     # point. Preserve valid model values while preventing exp(A_log) from
     # becoming inf before gate activation.
-    A_log = jnp.minimum(A_log, jnp.asarray(80.0, dtype=A_log.dtype))
+    A_log = jnp.minimum(A_log, 80.0)
 
-    actual_scale = q.shape[-1] ** -0.5 if scale is None else scale
+    actual_scale = q_shape[-1] ** -0.5 if scale is None else scale
     output, final_state, *_ = _chunk_kda_fwd_native_segids(
         q=q,
         k=k,

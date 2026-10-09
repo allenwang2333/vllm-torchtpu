@@ -27,6 +27,8 @@ from vllm_torchtpu.kernels.gdn.v3.compute_gdn import fused_transpose_broadcast
 __all__ = ["decode_kda"]
 
 _L2_EPS = 1e-6
+_CONTRACT_DK = (((2,), (1,)), ((0,), (0,)))
+_IO_ALIASES = {5: 1, 9: 2}
 
 
 def _l2_norm(x: jax.Array) -> jax.Array:
@@ -61,8 +63,6 @@ def _decode_step(q, k, k_t, v, decay, beta, state, compute_dtype):
     Structure follows ``recurrent_gdn_per_seq``; the only change is that
     ``decay`` carries a ``d_k`` axis instead of being a scalar per head.
     """
-    contract_dk = (((2,), (1,)), ((0,), (0,)))
-
     # Per-channel decay: scales row k of the state, broadcasting over d_v.
     state_decayed = state * decay
 
@@ -70,7 +70,7 @@ def _decode_step(q, k, k_t, v, decay, beta, state, compute_dtype):
     v_updated = jax.lax.dot(
         k,
         state_decayed,
-        dimension_numbers=contract_dk,
+        dimension_numbers=_CONTRACT_DK,
         preferred_element_type=jnp.float32,
     ).astype(compute_dtype)
 
@@ -83,7 +83,7 @@ def _decode_step(q, k, k_t, v, decay, beta, state, compute_dtype):
     out = jax.lax.dot(
         q,
         state,
-        dimension_numbers=contract_dk,
+        dimension_numbers=_CONTRACT_DK,
         preferred_element_type=jnp.float32,
     )
     return out[:, 0, :], state
@@ -186,6 +186,78 @@ def _kernel(
     out_ref[0] = out.astype(out_ref.dtype)
     conv_state_out_ref[0] = new_stored_conv.astype(conv_state_out_ref.dtype)
     state_out_ref[0] = new_stored.astype(state_out_ref.dtype)
+
+
+def _seq_map_3d(s, si, hi):
+    return (s, 0, 0)
+
+
+def _seq_map_4d(s, si, hi):
+    return (s, 0, 0, 0)
+
+
+def _slot_map_5d(s, si, hi):
+    return (si[s], 0, 0, 0, 0)
+
+
+def _slot_map_4d(s, si, hi):
+    return (si[s], 0, 0, 0)
+
+
+def _zero_map_4d(s, si, hi):
+    return (0, 0, 0, 0)
+
+
+def _zero_map_2d(s, si, hi):
+    return (0, 0)
+
+
+@functools.lru_cache(maxsize=64)
+def _get_decode_grid_spec(
+    num_seqs: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+) -> pltpu.PrefetchScalarGridSpec:
+    # Per-sequence activations are indexed by grid step; the state pool is
+    # indexed by that step's slot. Weights are resident (index_map -> 0).
+    state_len = kernel_size - 1
+    conv_spec = pl.BlockSpec((1, state_len, 3, n_v, d_k), _slot_map_5d)
+    state_spec = pl.BlockSpec((1, n_v, d_k, d_v), _slot_map_4d)
+    return pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=2,
+        grid=(num_seqs,),
+        in_specs=[
+            pl.BlockSpec((1, 3, n_v, d_k), _seq_map_4d),
+            pl.BlockSpec((1, n_v, d_k), _seq_map_3d),  # g
+            # beta is carried as [num_seqs, n_v, 1]: Pallas requires a block's
+            # last two dims to be divisible by (8, 128) or match the array, and
+            # a 2-D [num_seqs, n_v] array blocked as [1, n_v] satisfies neither.
+            pl.BlockSpec((1, n_v, 1), _seq_map_3d),  # beta
+            conv_spec,  # convolution state
+            pl.BlockSpec(
+                (kernel_size, 3, n_v, d_k), _zero_map_4d
+            ),  # convolution weight
+            pl.BlockSpec((n_v, 1), _zero_map_2d),  # a_log
+            pl.BlockSpec((n_v, d_k), _zero_map_2d),  # dt_bias
+            # Paged state: this is the gather, expressed as a DMA.
+            state_spec,
+        ],
+        out_specs=[
+            pl.BlockSpec((1, n_v, d_v), _seq_map_3d),  # out
+            conv_spec,  # convolution state
+            state_spec,  # state
+        ],
+    )
+
+
+@functools.lru_cache(maxsize=16)
+def _get_compiler_params(vmem_capacity_bytes: int) -> pltpu.CompilerParams:
+    return pltpu.CompilerParams(
+        dimension_semantics=("arbitrary",),
+        vmem_limit_bytes=int(0.9 * vmem_capacity_bytes),
+    )
 
 
 @functools.partial(
@@ -292,42 +364,7 @@ def decode_kda(
         conv_state = conv_state.reshape(conv_state.shape[0], state_len, 3, n_v, d_k)
     mixed_qkv = mixed_qkv.reshape(num_seqs, 3, n_v, d_k)
 
-    # Per-sequence activations are indexed by grid step; the state pool is
-    # indexed by that step's slot. Weights are resident (index_map -> 0).
-    def seq_map(s, si, hi):
-        return (s, 0, 0)
-
-    grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=2,
-        grid=(num_seqs,),
-        in_specs=[
-            pl.BlockSpec((1, 3, n_v, d_k), lambda s, si, hi: (s, 0, 0, 0)),
-            pl.BlockSpec((1, n_v, d_k), seq_map),  # g
-            # beta is carried as [num_seqs, n_v, 1]: Pallas requires a block's
-            # last two dims to be divisible by (8, 128) or match the array, and
-            # a 2-D [num_seqs, n_v] array blocked as [1, n_v] satisfies neither.
-            pl.BlockSpec((1, n_v, 1), seq_map),  # beta
-            pl.BlockSpec(
-                (1, state_len, 3, n_v, d_k), lambda s, si, hi: (si[s], 0, 0, 0, 0)
-            ),  # convolution state
-            pl.BlockSpec(
-                (kernel_size, 3, n_v, d_k), lambda s, si, hi: (0, 0, 0, 0)
-            ),  # convolution weight
-            pl.BlockSpec((n_v, 1), lambda s, si, hi: (0, 0)),  # a_log
-            pl.BlockSpec((n_v, d_k), lambda s, si, hi: (0, 0)),  # dt_bias
-            # Paged state: this is the gather, expressed as a DMA.
-            pl.BlockSpec((1, n_v, d_k, d_v), lambda s, si, hi: (si[s], 0, 0, 0)),
-        ],
-        out_specs=[
-            pl.BlockSpec((1, n_v, d_v), seq_map),  # out
-            pl.BlockSpec(
-                (1, state_len, 3, n_v, d_k), lambda s, si, hi: (si[s], 0, 0, 0, 0)
-            ),  # convolution state
-            pl.BlockSpec(
-                (1, n_v, d_k, d_v), lambda s, si, hi: (si[s], 0, 0, 0)
-            ),  # state
-        ],
-    )
+    grid_spec = _get_decode_grid_spec(num_seqs, n_v, d_k, d_v, kernel_size)
 
     out_shapes = [
         jax.ShapeDtypeStruct((num_seqs, n_v, d_v), mixed_qkv.dtype),
@@ -341,12 +378,9 @@ def decode_kda(
         kernel,
         grid_spec=grid_spec,
         out_shape=out_shapes,
-        input_output_aliases={5: 1, 9: 2},
+        input_output_aliases=_IO_ALIASES,
         name="kda_decode_fused_conv_recurrent",
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary",),
-            vmem_limit_bytes=int(0.9 * pltpu.get_tpu_info().vmem_capacity_bytes),
-        ),
+        compiler_params=_get_compiler_params(pltpu.get_tpu_info().vmem_capacity_bytes),
     )(
         state_indices.astype(jnp.int32),
         has_initial_state.astype(jnp.int32),
