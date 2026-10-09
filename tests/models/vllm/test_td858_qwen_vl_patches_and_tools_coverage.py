@@ -72,7 +72,15 @@ def _patched_tensor_to(self, *args, **kwargs):
     return _orig_tensor_to(self, *args, **kwargs)
 
 
-torch.Tensor.to = _patched_tensor_to
+@pytest.fixture(autouse=True)
+def _fake_tpu_tensor_to(monkeypatch):
+    """Route `.to(tpu)` to fake TPU tensors for this module's tests only.
+
+    Assigned at import time this patch outlived the module and broke every
+    later test that calls `nn.Module.to(device=None, dtype=...)` (e.g. the
+    Kimi K3 vision tower), depending on collection order.
+    """
+    monkeypatch.setattr(torch.Tensor, "to", _patched_tensor_to)
 
 
 # ---------------------------------------------------------------------------
