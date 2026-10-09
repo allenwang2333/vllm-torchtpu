@@ -1491,7 +1491,10 @@ class TPUModelRunner(GPUModelRunner):
         # common metadata; everything else it needs comes from
         # `_attn_metadata_builder_ctx`.
         # Keyed by identity: the drafter passes one persistent layer-name set.
-        cached = self._layer_attn_groups_cache.get(id(layer_names))
+        cache = getattr(self, "_layer_attn_groups_cache", None)
+        if cache is None:
+            cache = self._layer_attn_groups_cache = {}
+        cached = cache.get(id(layer_names))
         if cached is None:
             selected_groups = [
                 (g, sel)
@@ -1502,7 +1505,7 @@ class TPUModelRunner(GPUModelRunner):
             gids = {
                 g.metadata_builders[0].kv_cache_group_id for g, _ in selected_groups
             }
-            cached = self._layer_attn_groups_cache[id(layer_names)] = (
+            cached = cache[id(layer_names)] = (
                 selected_groups,
                 gids,
             )
@@ -1532,6 +1535,7 @@ class TPUModelRunner(GPUModelRunner):
         self._block_tables_dirty = True
         self._cached_bt_key = None
         self._cached_staged_block_tables = None
+        self._layer_attn_groups_cache = {}
         with set_current_vllm_config(self.vllm_config):
             self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
 
