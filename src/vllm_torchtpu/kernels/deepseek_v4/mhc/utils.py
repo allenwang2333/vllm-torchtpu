@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+import math
 from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 
 # bf16 tiles are (16, 128); keep token blocks sublane-aligned.
 SUBLANE = 16
@@ -28,6 +31,32 @@ DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 def round_up(x: int, multiple: int) -> int:
     return (x + multiple - 1) // multiple * multiple
+
+
+@functools.cache
+def compiler_params(vmem_limit_bytes: int) -> pltpu.CompilerParams:
+    """Shared 1D token-grid Mosaic params for the mHC kernels.
+
+    ``pltpu.CompilerParams`` is a frozen dataclass, so one instance per
+    VMEM budget is safely shared across every trace of every kernel.
+    """
+    return pltpu.CompilerParams(
+        dimension_semantics=("parallel",),
+        vmem_limit_bytes=vmem_limit_bytes,
+        disable_bounds_checks=True,
+    )
+
+
+def hc_mult_from_mix_dim(hc_mult3: int) -> int:
+    """Invert ``hc_mult3 = hc_mult * (hc_mult + 2)``.
+
+    ``hc_mult3 + 1 == (hc_mult + 1) ** 2``, so the inverse is exact
+    integer arithmetic; a non-square ``hc_mult3 + 1`` is rejected.
+    """
+    hc_mult = math.isqrt(hc_mult3 + 1) - 1
+    if hc_mult < 1 or hc_mult * (hc_mult + 2) != hc_mult3:
+        raise ValueError(f"hc_mult3={hc_mult3} is not hc_mult * (hc_mult + 2)")
+    return hc_mult
 
 
 def select_token_block(

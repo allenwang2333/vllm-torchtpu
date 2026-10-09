@@ -17,7 +17,6 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
 from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
@@ -94,11 +93,7 @@ def mhc_post_2d(
     )
     x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
 
-    compiler_params = pltpu.CompilerParams(
-        dimension_semantics=("parallel",),
-        vmem_limit_bytes=vmem_limit_bytes,
-        disable_bounds_checks=True,
-    )
+    compiler_params = utils.compiler_params(vmem_limit_bytes)
 
     out = pl.pallas_call(
         functools.partial(_post_kernel, hc_mult=hc_mult, hidden_size=hidden_size),

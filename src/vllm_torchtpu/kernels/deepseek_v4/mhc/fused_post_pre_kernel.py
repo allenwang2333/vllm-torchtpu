@@ -17,7 +17,6 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
 from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
@@ -173,11 +172,7 @@ def fused_post_pre_mixes(
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
-    compiler_params = pltpu.CompilerParams(
-        dimension_semantics=("parallel",),
-        vmem_limit_bytes=vmem_limit_bytes,
-        disable_bounds_checks=True,
-    )
+    compiler_params = utils.compiler_params(vmem_limit_bytes)
 
     resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
     new_res, mixes, sqrsum, layer2d = pl.pallas_call(

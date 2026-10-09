@@ -17,7 +17,6 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
 from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
@@ -131,11 +130,7 @@ def mhc_pre_mixes(
 
     fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
 
-    compiler_params = pltpu.CompilerParams(
-        dimension_semantics=("parallel",),
-        vmem_limit_bytes=vmem_limit_bytes,
-        disable_bounds_checks=True,
-    )
+    compiler_params = utils.compiler_params(vmem_limit_bytes)
 
     resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
     mixes, sqrsum = pl.pallas_call(
@@ -187,7 +182,7 @@ def mhc_pre_mixes_collapse(
     hc_mult3 = fn.shape[0]
     assert fn.shape == (hc_mult3, hc_hidden), (fn.shape, x2d.shape)
     # hc_mult3 = hc_mult * (hc_mult + 2) -> unique positive hc_mult.
-    hc_mult = next(m for m in range(1, 64) if m * (m + 2) == hc_mult3)
+    hc_mult = utils.hc_mult_from_mix_dim(hc_mult3)
     hidden_size = hc_hidden // hc_mult
 
     fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
@@ -213,11 +208,7 @@ def mhc_pre_mixes_collapse(
     # are sliced off below.
     (x2d,) = utils.pad_to(padded_tokens, x2d)
 
-    compiler_params = pltpu.CompilerParams(
-        dimension_semantics=("parallel",),
-        vmem_limit_bytes=vmem_limit_bytes,
-        disable_bounds_checks=True,
-    )
+    compiler_params = utils.compiler_params(vmem_limit_bytes)
 
     resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
     mixes, sqrsum, layer2d = pl.pallas_call(

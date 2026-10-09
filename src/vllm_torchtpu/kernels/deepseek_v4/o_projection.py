@@ -30,6 +30,12 @@ DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 SUBLANE = 8
 
+# Frozen dataclass: one instance is shared by every trace.
+_COMPILER_PARAMS = pltpu.CompilerParams(
+    vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+    disable_bounds_checks=True,
+)
+
 
 def _largest_divisor(x: int, cap: int) -> int:
     """Largest divisor of ``x`` that is <= ``cap``."""
@@ -195,10 +201,7 @@ def wo_a_projection(
         out_specs=pl.BlockSpec(
             (tile_t, tile_r), lambda g, t, r: (t, g * num_r_tiles + r)
         ),
-        compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
-            disable_bounds_checks=True,
-        ),
+        compiler_params=_COMPILER_PARAMS,
         name=name,
     )(x, wo_a, wo_a_scale.reshape(1, out_features), cos_sin)
 
