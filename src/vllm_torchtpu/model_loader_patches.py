@@ -52,11 +52,12 @@ import copy
 import functools
 import gc
 import json
+import logging
 import os
 import struct
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -77,6 +78,7 @@ _EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale
 # Filled at model construction by layers that shard a tensor by rows and load
 # only their part. See register_row_slice.
 _ROW_SLICES: dict[str, tuple[int, int]] = {}
+_parse_expert_id: Callable[[str], int | None] | None = None
 
 
 def register_row_slice(name: str, start: int, rows: int) -> None:
@@ -93,21 +95,27 @@ def register_row_slice(name: str, start: int, rows: int) -> None:
 
 
 def _row_slice_for(name: str) -> tuple[int, int] | None:
+    if not _ROW_SLICES:
+        return None
+    if (exact := _ROW_SLICES.get(name)) is not None:
+        return exact
     for key, row_slice in _ROW_SLICES.items():
-        if name == key or name.endswith("." + key):
+        if name.endswith(key) and name[len(name) - len(key) - 1] == ".":
             return row_slice
     return None
 
 
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
-    from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
-
-    expert_id = parse_expert_id(name)
-    if expert_id is None:
-        return False
     if not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
         return False
-    return expert_id not in local_expert_ids
+    global _parse_expert_id
+    parser = _parse_expert_id
+    if parser is None:
+        from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
+
+        _parse_expert_id = parser = parse_expert_id
+    expert_id = parser(name)
+    return expert_id is not None and expert_id not in local_expert_ids
 
 
 def _should_skip_weight_tpu(
@@ -492,13 +500,13 @@ def _local_tensor_ranges(
         for name, v in header.items()
         if name != "__metadata__" and not _should_skip(name, local_expert_ids)
     )
-    merged: list[list[int]] = []
+    merged: list[tuple[int, int]] = []
     for start, end in spans:
         if merged and start <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], end)
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
         else:
-            merged.append([start, end])
-    return [(start, end) for start, end in merged]
+            merged.append((start, end))
+    return merged
 
 
 def _start_ep_range_prefetch(
@@ -687,11 +695,15 @@ class ExpertWriteTracker:
         shards = _SHARDS_PER_EXPERT.get(shard_id)
         if shards is None:
             return False
-        seen = self._seen.setdefault(id(param), set())
+        param_id = id(param)
+        seen = self._seen.get(param_id)
+        if seen is None:
+            seen = set()
+            self._seen[param_id] = seen
         seen.add((expert_id, shard_id))
         complete = len(seen) == param.shape[0] * shards
         if complete:
-            del self._seen[id(param)]
+            del self._seen[param_id]
         return complete
 
 
@@ -732,7 +744,8 @@ class ExpertParamStager:
         return id(param) not in self.written_early
 
     def host_param(self, param: torch.nn.Parameter) -> torch.Tensor:
-        entry = self._staged.get(id(param))
+        param_id = id(param)
+        entry = self._staged.get(param_id)
         if entry is None:
             if len(self._staged) >= _MAX_STAGED:
                 oldest = next(iter(self._staged.values()))[0]
@@ -750,7 +763,7 @@ class ExpertParamStager:
             host = torch.Tensor._make_subclass(type(param), buffer, False)
             host.__dict__.update(param.__dict__)
             entry = (param, host)
-            self._staged[id(param)] = entry
+            self._staged[param_id] = entry
         return entry[1]
 
     def written(self, param: torch.nn.Parameter, expert_id: int, shard_id: str) -> bool:
@@ -787,16 +800,22 @@ class ExpertParamStager:
             synchronize_tensors([param.data], wait=True)
         self.flushed += 1
         buffer = torch.Tensor._make_subclass(torch.Tensor, host.data, False)
-        self._pool.setdefault((tuple(host.shape), host.dtype), []).append(buffer)
-        logger.debug(
-            "Staged expert parameter %d written: shape=%s staged=%d "
-            "pooled=%d rss=%.1f GiB",
-            self.flushed,
-            tuple(param.shape),
-            len(self._staged),
-            sum(len(v) for v in self._pool.values()),
-            _rss_gib(),
-        )
+        pool_key = (tuple(host.shape), host.dtype)
+        free = self._pool.get(pool_key)
+        if free is None:
+            self._pool[pool_key] = [buffer]
+        else:
+            free.append(buffer)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Staged expert parameter %d written: shape=%s staged=%d "
+                "pooled=%d rss=%.1f GiB",
+                self.flushed,
+                pool_key[0],
+                len(self._staged),
+                sum(len(v) for v in self._pool.values()),
+                _rss_gib(),
+            )
 
     def flush_all(self) -> None:
         for param, _ in list(self._staged.values()):
@@ -872,7 +891,7 @@ def patch_moe_expert_write_staging() -> None:
         if result is not False:
             stager.written(param, expert_id, shard_id)
         calls[0] += 1
-        if calls[0] % 1000 == 0:
+        if calls[0] % 1000 == 0 and logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "Expert writes: %d, parameters staged: %d, rss=%.1f GiB",
                 calls[0],

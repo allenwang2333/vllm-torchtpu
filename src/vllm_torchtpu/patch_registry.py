@@ -12,6 +12,7 @@ registry; forked processes inherit patches and their application records.
 import importlib
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from threading import RLock
 from typing import TYPE_CHECKING, Literal
@@ -139,6 +140,9 @@ PATCHES = (
     ),
 )
 
+_VALID_STAGES: frozenset[Stage] = frozenset(
+    ("import", "platform_activation", "engine_core", "worker_init", "model_load")
+)
 _applied: set[str] = set()
 _applying: set[str] = set()
 _active_stages: set[Stage] = set()
@@ -160,7 +164,9 @@ os.register_at_fork(after_in_child=_reset_after_fork)
 
 def _invoke(target: str, **kwargs):
     module_name, _, name = target.partition(":")
-    module = importlib.import_module(module_name)
+    module = sys.modules.get(module_name)
+    if module is None:
+        module = importlib.import_module(module_name)
     if name:
         return getattr(module, name)(**kwargs)
     return None
@@ -173,13 +179,7 @@ def apply(stage: Stage, *, model_config: "ModelConfig | None" = None) -> None:
     outer invocation already owns that ordered pass. Failures propagate and
     leave the failing patch eligible for retry, retaining completed patches.
     """
-    if stage not in (
-        "import",
-        "platform_activation",
-        "engine_core",
-        "worker_init",
-        "model_load",
-    ):
+    if stage not in _VALID_STAGES:
         raise ValueError(f"Unknown TPU patch stage: {stage}")
     with _lock:
         if stage in _active_stages:
