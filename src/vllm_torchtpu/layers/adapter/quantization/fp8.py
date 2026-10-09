@@ -69,6 +69,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
+from vllm_torchtpu.layers.adapter import fused_moe_ep as fused_moe_ep_bridge
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
@@ -799,11 +800,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         refuses -- TP, over the SMEM bound, under the token threshold, or
         a weight or routing layout the kernel cannot serve.
         """
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
-
         return (
             enable_pipelined_collective_and_compute()
-            or fused_moe_ep_supported(self)
+            or fused_moe_ep_bridge.fused_moe_ep_supported(self)
             or adaptive_moe.adaptive_fused_moe_supported(self)
         )
 
@@ -1005,6 +1004,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
+        self._prebuild_moe_ops(layer, activation_str)
+
+    def _prebuild_moe_ops(self, layer, activation_str: str) -> None:
+        """Build the adaptive, GMM and fused-EP MoE ops once at load time."""
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = adaptive_moe.prebuild_adaptive_fused_moe(
                 layer,
@@ -1023,19 +1026,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # collective inside the compiled graph. The result is recorded on this
         # method, which vLLM builds one of per MoE layer, so a layer the kernel
         # cannot serve is refused on its own rather than for the process.
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-            FUSED_MOE_EP_OP_ATTR,
-            prebuild_fused_moe_ep,
-            register_score_bias_buffer,
-        )
-
-        _ep_op = prebuild_fused_moe_ep(
+        _ep_op = fused_moe_ep_bridge.prebuild_fused_moe_ep(
             layer,
             topk=layer.moe_config.experts_per_token,
             renormalize=layer.renormalize,
             activation=activation_str,
         )
-        setattr(self, FUSED_MOE_EP_OP_ATTR, _ep_op)
+        setattr(self, fused_moe_ep_bridge.FUSED_MOE_EP_OP_ATTR, _ep_op)
         if _ep_op is not None:
             # Stage the bias, exactly as the nvfp4 and mxfp4 methods do. This
             # is the other half of the arity contract: `_routing_config`
@@ -1047,7 +1044,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             # seven, which Dynamo rejects with `missing value for argument
             # 'score_bias'`. Passing the operand at the call site is not
             # sufficient on its own; it has to exist.
-            register_score_bias_buffer(layer)
+            fused_moe_ep_bridge.register_score_bias_buffer(layer)
 
     def apply_monolithic(
         self,
@@ -1088,14 +1085,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # survived here for as long as this path served only such models; a
         # `noaux_tc` router carries the bias and does not. The nvfp4 and mxfp4
         # methods already pass it.
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-            fused_moe_ep,
-            fused_moe_ep_supported,
-            score_bias_operand,
-        )
-
-        if fused_moe_ep_supported(self):
-            return fused_moe_ep(
+        if fused_moe_ep_bridge.fused_moe_ep_supported(self):
+            return fused_moe_ep_bridge.fused_moe_ep(
                 self,
                 x,
                 layer.w13_weight,
@@ -1103,7 +1094,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer.w13_weight_scale_inv,
                 layer.w2_weight_scale_inv,
                 router_logits,
-                score_bias_operand(layer),
+                fused_moe_ep_bridge.score_bias_operand(layer),
             )
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
@@ -1111,33 +1102,31 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
 
+        pipelined = enable_pipelined_collective_and_compute()
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                 topk_ids,
                 topk_weights,
-                is_local_tensor=enable_pipelined_collective_and_compute(),
+                is_local_tensor=pipelined,
             )
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).
-        kwargs = {
-            "hidden_states": x,
-            "w1": layer.w13_weight,
-            "w2": layer.w2_weight,
-            "w1_scale": layer.w13_weight_scale_inv,
-            "w2_scale": layer.w2_weight_scale_inv,
-            "w1_bias": getattr(layer, "w13_bias", None),
-            "w2_bias": getattr(layer, "w2_bias", None),
-            "topk_weights": topk_weights,
-            "topk_ids": topk_ids,
-            "experts_start": layer._experts_start,
-            "topk": layer.moe_config.experts_per_token,
-            "activation": activation_str,
-        }
-        if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
-
-        return fused_moe_gmm(**kwargs)
+        gmm = pipelined_fused_moe_gmm if pipelined else fused_moe_gmm
+        return gmm(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            w1_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=layer._experts_start,
+            topk=layer.moe_config.experts_per_token,
+            activation=activation_str,
+        )
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):
