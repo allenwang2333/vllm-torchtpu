@@ -52,6 +52,7 @@ import functools
 import gc
 import json
 import os
+import re
 import struct
 import threading
 import time
@@ -72,9 +73,109 @@ logger = init_logger(__name__)
 _EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
 
 
+# A model served from its first N decoder layers, cut with
+# ``--hf-overrides '{"num_hidden_layers": N, ...}'``, has no module for a later
+# layer, and the model's weight loader would refuse that layer's tensors. They
+# are skipped like a non-local expert's, so they are never fetched at all. A
+# layer run uses this to time a few layers with real weights streamed from the
+# full checkpoint. The MTP layer comes after the last decoder layer and is
+# skipped with the rest. The cut is read from the vLLM config, which every
+# rank receives, so a Ray worker on another host applies it too.
+_LAYER_INDEX = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+
+def _hf_override(*keys: str) -> int | None:
+    """The first of ``keys`` that ``--hf-overrides`` sets to a positive int."""
+    try:
+        from vllm.config import get_current_vllm_config
+
+        overrides = get_current_vllm_config().model_config.hf_overrides
+    except Exception:
+        return None
+    if not isinstance(overrides, dict):
+        return None
+    for key in keys:
+        n = overrides.get(key)
+        if isinstance(n, int) and n > 0:
+            return n
+    return None
+
+
+def _layer_cut() -> int | None:
+    """The decoder-layer count ``--hf-overrides`` cut the model to, or None."""
+    return _hf_override("num_hidden_layers")
+
+
+# A model cut to its first E routed experts, with ``--hf-overrides
+# '{"n_routed_experts": E}'`` (or the model's own name for the count), keeps
+# each MoE layer's experts below E. The EP filter already skips the rest:
+# every rank's share is computed from the overridden count, so an expert past
+# it is no rank's. What still arrives sized for the full model is each layer's
+# router, a row per expert, and a hash-routed layer's token-to-expert table,
+# whose ids run past E. Both are cut as they stream: the router to its first E
+# rows, the table's ids modulo E. A layer run uses this to keep a deployment's
+# experts per chip, and tokens per expert, on fewer chips (perfkit's topology
+# twin).
+_EXPERT_COUNT_KEYS = ("n_routed_experts", "num_experts", "num_local_experts",
+                      "moe_num_experts")
+_ROUTER = re.compile(r"(?:^|\.)gate\.(?:weight|bias|e_score_correction_bias)$")
+_HASH_TABLE = re.compile(r"(?:^|\.)gate\.tid2eid$")
+
+
+def _expert_cut() -> int | None:
+    """The routed-expert count ``--hf-overrides`` cut the model to, or None."""
+    return _hf_override(*_EXPERT_COUNT_KEYS)
+
+
+def _cut_experts(name: str, tensor: torch.Tensor) -> torch.Tensor:
+    """``tensor`` as a model cut to its first experts expects it."""
+    e = _expert_cut()
+    if e is None:
+        return tensor
+    if _ROUTER.search(name) and tensor.dim() >= 1 and tensor.shape[0] > e:
+        return tensor[:e].contiguous()
+    if _HASH_TABLE.search(name):
+        return torch.remainder(tensor, e)
+    return tensor
+
+
+def _with_experts_cut(weights):
+    """``weights``, (name, tensor) pairs, with ``_cut_experts`` applied."""
+    if _expert_cut() is None:
+        yield from weights
+        return
+    for name, tensor in weights:
+        yield name, _cut_experts(name, tensor)
+
+
+def _past_layer_cut(name: str) -> bool:
+    n = _layer_cut()
+    if n is None:
+        return False
+    m = _LAYER_INDEX.search(name)
+    return m is not None and int(m.group(1)) >= n
+
+
+def _past_expert_cut(name: str) -> bool:
+    """Whether ``name`` is a routed expert's tensor past an expert cut,
+    whatever its suffix. The EP filter's suffix allowlist leaves out names
+    such as an fp8 block scale's ``weight_scale_inv``; in the full model the
+    MoE loader drops another rank's expert anyway, but past the cut there is
+    no expert to map it to, and the load fails on it."""
+    e = _expert_cut()
+    if e is None:
+        return False
+    from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
+
+    expert_id = parse_expert_id(name)
+    return expert_id is not None and expert_id >= e
+
+
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
     from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
 
+    if _past_layer_cut(name) or _past_expert_cut(name):
+        return True
     expert_id = parse_expert_id(name)
     if expert_id is None:
         return False
@@ -91,8 +192,11 @@ def _should_skip_weight_tpu(
     Same contract as upstream (``local_expert_ids=None`` means no
     filtering), but the suffix allowlist also covers the compressed-tensors
     MXFP4 ``.weight_packed`` and ``.weight_scale`` names, so non-local
-    experts are skipped before their bytes are read.
+    experts are skipped before their bytes are read. A layer past a
+    ``num_hidden_layers`` override is skipped either way.
     """
+    if _past_layer_cut(weight_name) or _past_expert_cut(weight_name):
+        return True
     if local_expert_ids is None:
         return False
     return _should_skip(weight_name, local_expert_ids)
@@ -329,7 +433,7 @@ def patch_runai_sharded_expert_streaming() -> None:
             )
             local_expert_ids = None
         if local_expert_ids is None:
-            return original_get_iterator(self, model_or_path, revision)
+            return _with_experts_cut(original_get_iterator(self, model_or_path, revision))
         if getattr(self, "_is_distributed", False):
             # Per-rank fetch plans differ, so the streamer's cross-rank
             # broadcast mode would corrupt the chunk-id maps. Sharded
@@ -340,8 +444,10 @@ def patch_runai_sharded_expert_streaming() -> None:
                 "plans; streaming per rank instead."
             )
         hf_weights_files = self._prepare_weights(model_or_path, revision)
-        return _sharded_runai_weights_iterator(
-            hf_weights_files, local_expert_ids, self.load_config.use_tqdm_on_load
+        return _with_experts_cut(
+            _sharded_runai_weights_iterator(
+                hf_weights_files, local_expert_ids, self.load_config.use_tqdm_on_load
+            )
         )
 
     rsl.RunaiModelStreamerLoader._get_weights_iterator = _get_weights_iterator
@@ -404,12 +510,14 @@ def patch_default_loader_ep_weight_filter() -> None:
                 ),
             )
             safetensors_load_strategy = "lazy"
-        return original_iterator(
-            hf_weights_files,
-            use_tqdm_on_load,
-            safetensors_load_strategy,
-            local_expert_ids,
-            **kwargs,
+        return _with_experts_cut(
+            original_iterator(
+                hf_weights_files,
+                use_tqdm_on_load,
+                safetensors_load_strategy,
+                local_expert_ids,
+                **kwargs,
+            )
         )
 
     weight_utils.safetensors_weights_iterator = safetensors_weights_iterator
