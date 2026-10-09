@@ -382,6 +382,29 @@ def fused_moe_ep(
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
 
 
+def register_fused_scale_buffers(layer) -> None:
+    """Stage the fp4 weight scales as the `[E, K/block, N]` tables the op takes.
+
+    The loader's tables are `[E, K/block, 1, N]`. A squeeze of one is a view,
+    and torch_tpu materializes a view graph input with a program of its own
+    before every step, in a layout the kernel then copies out of again inside
+    the step. So each table is copied once into a base tensor of its own, and
+    the 4-D parameter becomes a view of that copy rather than a second one.
+    """
+    for param, buf in (
+        ("w13_weight_scale", "_tpu_fused_w13_scale"),
+        ("w2_weight_scale", "_tpu_fused_w2_scale"),
+    ):
+        squeezed = getattr(layer, param).squeeze(2)
+        table = torch.empty(
+            squeezed.shape, dtype=squeezed.dtype, device=squeezed.device
+        ).copy_(squeezed)
+        layer.register_buffer(buf, table, persistent=False)
+        setattr(
+            layer, param, torch.nn.Parameter(table.unsqueeze(2), requires_grad=False)
+        )
+
+
 # The buffer `register_score_bias_buffer` stages the bias operand under, and
 # the name callers read back to hand to `fused_moe_ep`.
 FUSED_MOE_EP_SCORE_BIAS_ATTR = "_tpu_fused_score_bias"
