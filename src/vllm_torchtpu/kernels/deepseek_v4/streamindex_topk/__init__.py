@@ -31,6 +31,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import 
     cp_local_to_global,
     cp_owner_rank,
     cp_rank_as_data,
+    cp_rank_from_operand,
     streamindex_topk,
     streamindex_topk_dcp,
 )
@@ -49,6 +50,7 @@ __all__ = [
     "cp_owner_rank",
     "cp_global_to_local",
     "cp_rank_as_data",
+    "cp_rank_from_operand",
     "streamindex_topk",
     "streamindex_topk_dcp",
 ]

@@ -1030,6 +1030,7 @@ def sparse_mla_attention_dcp(
     dcp_size: int,
     interleave_size: int,
     dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+    dcp_rank: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1046,6 +1047,9 @@ def sparse_mla_attention_dcp(
         sequence coordinates, replicated. `block_tables` holds virtual page
         ordinals, resolved per rank exactly as on the indexer side.
       dcp_size, interleave_size: the shard layout.
+      dcp_rank: `jnp.arange(dcp_size)` sharded over `dcp_axis_name`, read in
+        place of the per-call `cp_rank_as_data` all_to_all
+        (`TPU_DCP_RANK_OPERAND`). Must be a real operand under torch_tpu.
 
     Returns:
       `(kv_cache_nope, kv_cache_rope, output, lse)`. `output` is
@@ -1130,8 +1134,11 @@ def sparse_mla_attention_dcp(
         block_tables_,
         query_start_loc_,
         request_distribution_,
+        *rank_operand,
     ):
-        dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
+        dcp_rank = streamindex_topk.cp_rank_from_operand(
+            rank_operand[0] if rank_operand else None, dcp_axis_name, dcp_size
+        )
         kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
             kv_cache_nope,
             kv_cache_rope,
@@ -1213,6 +1220,8 @@ def sparse_mla_attention_dcp(
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
         return (kv_cache_nope, kv_cache_rope, output[..., : ql_nope.shape[-1]], lse)
 
+    rank_args = () if dcp_rank is None else (dcp_rank,)
+    in_specs = in_specs + (P(dcp_axis_name),) * len(rank_args)  # dcp_rank
     return jax.jit(
         shard_map.shard_map(
             _local, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
@@ -1229,4 +1238,5 @@ def sparse_mla_attention_dcp(
         block_tables,
         query_start_loc,
         request_distribution,
+        *rank_args,
     )

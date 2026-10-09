@@ -42,11 +42,15 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.dcp import get_dcp_group, get_or_create_dcp_mesh
+from vllm_torchtpu.distributed.dcp import (
+    dcp_rank_operand,
+    get_dcp_group,
+    get_or_create_dcp_mesh,
+)
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import parse_partition_override
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
-    cp_rank_as_data,
+    cp_rank_from_operand,
     streamindex_topk,
     streamindex_topk_dcp,
 )
@@ -147,6 +151,7 @@ def _cp_scatter_indexer_k(
     cp_size: int,
     interleave_size: int,
     axis_name: str = DCP_AXIS_NAME,
+    rank: jax.Array | None = None,
 ) -> jax.Array:
     """Scatter this step's indexer K rows into the DCP-sharded K cache.
 
@@ -161,11 +166,15 @@ def _cp_scatter_indexer_k(
     `k_packed` must already be in request-major order, since the positions
     come from `cu_q_lens`/`seq_lens`.
 
-    `axis_name`/`cp_size` name the axis the cache is split over.
+    `axis_name`/`cp_size` name the axis the cache is split over. `rank`, if
+    given, is `arange(cp_size)` sharded over that axis (`TPU_DCP_RANK_OPERAND`),
+    read instead of an `all_to_all` per call.
     """
 
-    def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens):
-        rank = cp_rank_as_data(axis_name, cp_size)
+    def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens, *rank_operand):
+        rank = cp_rank_from_operand(
+            rank_operand[0] if rank_operand else None, axis_name, cp_size
+        )
         _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
         page_size = block_size_per_kv_packing * kv_packing
         # The latent cache is guarded on its own page size in
@@ -213,13 +222,15 @@ def _cp_scatter_indexer_k(
 
     replicated = jax.sharding.PartitionSpec()
     sharded = jax.sharding.PartitionSpec(axis_name)
+    rank_args = () if rank is None else (rank,)
     return jax.shard_map(
         _local,
         mesh=mesh,
-        in_specs=(sharded, replicated, replicated, replicated, replicated),
+        in_specs=(sharded, replicated, replicated, replicated, replicated)
+        + (sharded,) * len(rank_args),
         out_specs=sharded,
         check_vma=False,
-    )(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens)
+    )(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens, *rank_args)
 
 
 @SparseAttnIndexer.register_oot
@@ -356,17 +367,22 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         small_bucket_bq = envs.TPU_STREAMIDX_SMALL_BUCKET_BQ
         small_bucket_bkvp = envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
+        # The DCP rank as a sharded operand (each rank's own index) instead of
+        # an all_to_all inside the op; the tensor is built here, outside any
+        # traced region, and appended to every call by `op` below.
+        rank_operand = dcp_rank_operand() if envs.TPU_DCP_RANK_OPERAND else None
 
-        def _streamidx_topk_dcp_jax(
-            q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
-            weights: jax.Array,  # replicated
-            cache_kv: jax.Array,  # this rank's position shard
-            k_packed: jax.Array,  # replicated
-            seq_lens: jax.Array,
-            page_indices: jax.Array,  # virtual page ordinals
-            cu_q_lens: jax.Array,
-            distribution: jax.Array,
-        ) -> tuple[jax.Array, jax.Array]:
+        def _topk_dcp_impl(
+            q_bytes,  # replicated, uint8 view of fp8 q
+            weights,  # replicated
+            cache_kv,  # this rank's position shard
+            k_packed,  # replicated
+            seq_lens,
+            page_indices,  # virtual page ordinals
+            cu_q_lens,
+            distribution,
+            dcp_rank,  # None, or i32[dcp_size] sharded over the DCP axis
+        ):
             # `_cp_scatter_indexer_k` pads the packed fp8+scale rows out to
             # the cache's 128-lane width itself.
             cache_kv = _cp_scatter_indexer_k(
@@ -379,6 +395,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 cp_size=dcp_size,
                 interleave_size=interleave_size,
                 axis_name=DCP_AXIS_NAME,
+                rank=dcp_rank,
             )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
@@ -406,8 +423,62 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 single_slice=single_slice,
                 local_topk_partition=local_topk_partition,
                 global_topk_partition=global_topk_partition,
+                dcp_rank=dcp_rank,
             )
             return cache_kv, local_topk
+
+        # torch_tpu infers the op's schema from the annotated signature, so
+        # each variant is a plain function with named, annotated parameters.
+        def _streamidx_topk_dcp_jax(
+            q_bytes: jax.Array,
+            weights: jax.Array,
+            cache_kv: jax.Array,
+            k_packed: jax.Array,
+            seq_lens: jax.Array,
+            page_indices: jax.Array,
+            cu_q_lens: jax.Array,
+            distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return _topk_dcp_impl(
+                q_bytes,
+                weights,
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                None,
+            )
+
+        def _streamidx_topk_dcp_rank_jax(
+            q_bytes: jax.Array,
+            weights: jax.Array,
+            cache_kv: jax.Array,
+            k_packed: jax.Array,
+            seq_lens: jax.Array,
+            page_indices: jax.Array,
+            cu_q_lens: jax.Array,
+            distribution: jax.Array,
+            dcp_rank: jax.Array,  # i32[dcp_size], sharded over the DCP axis
+        ) -> tuple[jax.Array, jax.Array]:
+            return _topk_dcp_impl(
+                q_bytes,
+                weights,
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                dcp_rank,
+            )
+
+        topk_dcp_jax = (
+            _streamidx_topk_dcp_jax
+            if rank_operand is None
+            else _streamidx_topk_dcp_rank_jax
+        )
 
         replicated = jax.sharding.PartitionSpec()
         sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
@@ -418,7 +489,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # sharded dims to global size -- applies identically here.
         jax_op = pcp_streaming_jax_op(
             op_name,
-            _streamidx_topk_dcp_jax,
+            topk_dcp_jax,
             donate_argnums=(2,),
             mesh=mesh,
             input_partition_specs=(
@@ -430,7 +501,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 replicated,  # page_indices
                 replicated,  # cu_q_lens
                 replicated,  # distribution
-            ),
+            )
+            + ((sharded,) if rank_operand is not None else ()),  # dcp_rank
             output_partition_specs=(
                 sharded,  # new cache_kv
                 sharded,  # local_topk: [num_tokens, topk] per rank
@@ -448,6 +520,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             page_indices,
             cu_q_lens,
             distribution,
+            *rank_args,
             **kwargs,
         ):
             del (
@@ -457,6 +530,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 page_indices,
                 cu_q_lens,
                 distribution,
+                rank_args,
                 kwargs,
             )
             return (
@@ -467,6 +541,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         jax_op.register_fake(_fake_streamidx_topk_dcp)
 
         def op(*args):
+            if rank_operand is not None:
+                args = (*args, rank_operand)
             new_cache, local_topk = jax_op(*args)
             args[2].copy_(new_cache)
             return local_topk
