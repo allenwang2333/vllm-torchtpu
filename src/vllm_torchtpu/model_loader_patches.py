@@ -52,6 +52,7 @@ import functools
 import gc
 import json
 import os
+import re
 import struct
 import threading
 import time
@@ -72,9 +73,42 @@ logger = init_logger(__name__)
 _EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
 
 
+# A model served from its first N decoder layers, cut with
+# ``--hf-overrides '{"num_hidden_layers": N, ...}'``, has no module for a later
+# layer, and the model's weight loader would refuse that layer's tensors. They
+# are skipped like a non-local expert's, so they are never fetched at all. A
+# layer run uses this to time a few layers with real weights streamed from the
+# full checkpoint. The MTP layer comes after the last decoder layer and is
+# skipped with the rest. The cut is read from the vLLM config, which every
+# rank receives, so a Ray worker on another host applies it too.
+_LAYER_INDEX = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+
+def _layer_cut() -> int | None:
+    """The decoder-layer count ``--hf-overrides`` cut the model to, or None."""
+    try:
+        from vllm.config import get_current_vllm_config
+
+        overrides = get_current_vllm_config().model_config.hf_overrides
+    except Exception:
+        return None
+    n = overrides.get("num_hidden_layers") if isinstance(overrides, dict) else None
+    return n if isinstance(n, int) and n > 0 else None
+
+
+def _past_layer_cut(name: str) -> bool:
+    n = _layer_cut()
+    if n is None:
+        return False
+    m = _LAYER_INDEX.search(name)
+    return m is not None and int(m.group(1)) >= n
+
+
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
     from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
 
+    if _past_layer_cut(name):
+        return True
     expert_id = parse_expert_id(name)
     if expert_id is None:
         return False
@@ -91,8 +125,11 @@ def _should_skip_weight_tpu(
     Same contract as upstream (``local_expert_ids=None`` means no
     filtering), but the suffix allowlist also covers the compressed-tensors
     MXFP4 ``.weight_packed`` and ``.weight_scale`` names, so non-local
-    experts are skipped before their bytes are read.
+    experts are skipped before their bytes are read. A layer past a
+    ``num_hidden_layers`` override is skipped either way.
     """
+    if _past_layer_cut(weight_name):
+        return True
     if local_expert_ids is None:
         return False
     return _should_skip(weight_name, local_expert_ids)
