@@ -55,14 +55,21 @@ def rotary(x, positions, config, *, compressed, inverse=False):
             (torch.arange(dim // 2, device=x.device) - low) / max(high - low, 1e-3)
         ).clamp(0, 1)
         frequencies = frequencies * (1 - ramp + ramp / yarn["factor"])
-    angles = positions.to(device=x.device, dtype=torch.float32)[:, None] * frequencies
+    pos_f32 = (
+        positions
+        if positions.device == x.device and positions.dtype == torch.float32
+        else positions.to(device=x.device, dtype=torch.float32)
+    )
+    angles = pos_f32[:, None] * frequencies
     shape = (1, len(positions), *((1,) * (x.ndim - 3)), dim // 2)
     cosine, sine = angles.cos().reshape(shape), angles.sin().reshape(shape)
     if inverse:
         sine = -sine
-    pairs = x[..., -dim:].float().unflatten(-1, (-1, 2))
+    x_tail = x[..., -dim:] if x.dtype == torch.float32 else x[..., -dim:].float()
+    pairs = x_tail.unflatten(-1, (-1, 2))
     real, imag = pairs[..., 0], pairs[..., 1]
     rotated = torch.stack(
         (real * cosine - imag * sine, real * sine + imag * cosine), -1
     ).flatten(-2)
-    return torch.cat((x[..., :-dim], rotated.to(x.dtype)), -1)
+    rotated_out = rotated if x.dtype == torch.float32 else rotated.to(x.dtype)
+    return torch.cat((x[..., :-dim], rotated_out), -1)
