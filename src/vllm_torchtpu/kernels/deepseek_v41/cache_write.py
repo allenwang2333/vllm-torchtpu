@@ -125,9 +125,11 @@ def write_index_cache(pool, scales, records, keys, page_stride, *, interpret=Fal
     if page_stride % SLAB_KEYS:
         raise ValueError("Index pages must be 128-key aligned")
     sentinel = pool.shape[0] * 4
-    order = jnp.argsort(jnp.where(records >= 0, records, sentinel), stable=True)
-    sorted_records = jnp.where(records[order] >= 0, records[order], sentinel)
-    sorted_records = jnp.pad(sorted_records, (0, INPUT_KEYS), constant_values=sentinel)
+    sanitized = jnp.where(records >= 0, records, sentinel)
+    order = jnp.argsort(sanitized, stable=True)
+    sorted_records = jnp.pad(
+        sanitized[order], (0, INPUT_KEYS), constant_values=sentinel
+    )
     sorted_keys = jnp.pad(keys[order], ((0, INPUT_KEYS), (0, 0))).reshape(-1)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     return pl.pallas_call(
@@ -222,10 +224,11 @@ def write_cache_words(
         raise ValueError("Sub-row writes require int32 records that divide 128 words")
     per_row = 128 // width
     sentinel = cache.shape[0] * per_row
-    order = jnp.argsort(jnp.where(records >= 0, records, sentinel), stable=True)
+    sanitized = jnp.where(records >= 0, records, sentinel)
+    order = jnp.argsort(sanitized, stable=True)
     padding = -count % per_row + 2 * per_row
     sorted_records = jnp.pad(
-        jnp.where(records[order] >= 0, records[order], sentinel),
+        sanitized[order],
         (0, padding),
         constant_values=sentinel,
     )
