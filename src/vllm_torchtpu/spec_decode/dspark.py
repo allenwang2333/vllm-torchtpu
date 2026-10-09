@@ -15,8 +15,12 @@ FIRST prediction position and every slot predicts the NEXT token — versus
 DFlash's 1 + K (anchor is bonus only). Speculators-format checkpoints set
 ``sample_from_anchor=False`` and keep the DFlash layout.
 
-PoC scope: greedy draft sampling only (argmax + d2t remap); probabilistic
-Gumbel-coupled sampling is not implemented.
+Draft sampling: greedy (argmax + d2t remap), or ``probabilistic`` as upstream
+draws it: per request, Gumbel-max over the Markov-biased logits divided by the
+request's temperature (argmax at temperature 0). The rejection sampler here
+treats a draft as one-hot, so probabilistic drafts are only accepted with
+``rejection_sample_method="synthetic"``, whose accept test does not read the
+draft distribution.
 """
 
 from __future__ import annotations
@@ -49,29 +53,55 @@ class DSparkProposer(DFlashProposer):
         # Same key/default as upstream DSparkSpeculator: dense checkpoints
         # omit it (-> True); the speculators converter writes it explicitly.
         self.sample_from_anchor = bool(hf_dict.get("sample_from_anchor", True))
-        block = hf_dict.get("dspark_block_size") or hf_dict.get("block_size")
+        # Like upstream DSparkSpeculator, the query block follows K, not the
+        # block length the checkpoint was trained at; acceptance past that
+        # length is the checkpoint's business.
+        trained_block = hf_dict.get("dspark_block_size") or hf_dict.get("block_size")
         K = self.speculative_config.num_speculative_tokens
-        if block is not None and int(block) != K:
-            raise ValueError(
-                f"num_speculative_tokens={K} does not match the DSpark "
-                f"checkpoint's block size {block}; the block/Markov-head "
-                "machinery is trained for exactly that block length."
-            )
         # vLLM 0.29 drafting options this proposer does not implement yet.
         spec = self.speculative_config
-        if (
-            spec.draft_sample_method != "greedy"
-            or spec.enable_adaptive_verification
-            or spec.dspark_draft_topk is not None
-        ):
+        if spec.enable_adaptive_verification or spec.dspark_draft_topk is not None:
+            raise ValueError(
+                "DSpark on TPU does not support enable_adaptive_verification="
+                f"{spec.enable_adaptive_verification}, dspark_draft_topk="
+                f"{spec.dspark_draft_topk}; only a fixed block is implemented."
+            )
+        self._probabilistic = spec.draft_sample_method == "probabilistic"
+        if self._probabilistic and spec.rejection_sample_method != "synthetic":
             raise ValueError(
                 "DSpark on TPU does not support draft_sample_method="
-                f"{spec.draft_sample_method!r}, enable_adaptive_verification="
-                f"{spec.enable_adaptive_verification}, dspark_draft_topk="
-                f"{spec.dspark_draft_topk}; only greedy drafting of a fixed "
-                "block is implemented."
+                "'probabilistic' with rejection_sample_method="
+                f"{spec.rejection_sample_method!r}: the TPU rejection sampler "
+                "accepts a draft as if it were greedy (q one-hot), which is "
+                "only distribution-preserving for greedy drafts. Use "
+                "rejection_sample_method='synthetic' or greedy drafting."
             )
-        logger.info("DSpark: sample_from_anchor=%s, K=%d.", self.sample_from_anchor, K)
+        if not self._probabilistic and spec.draft_sample_method != "greedy":
+            raise ValueError(
+                "DSpark on TPU does not support draft_sample_method="
+                f"{spec.draft_sample_method!r}."
+            )
+        # Width of compute_draft_logits: a reduced-vocab draft samples in its
+        # own vocabulary and remaps after, which draws the same token as
+        # upstream's scatter into target space (the other columns are -inf).
+        self._draft_vocab_size = hf_dict.get("draft_vocab_size") or hf_dict.get(
+            "vocab_size"
+        )
+        if self._probabilistic and not self._draft_vocab_size:
+            raise ValueError(
+                "Probabilistic DSpark drafting needs the draft vocab size."
+            )
+        # Keyed by padded request count: the all-greedy inputs of dummy
+        # forwards.
+        self._dummy_sample_inputs: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        logger.info(
+            "DSpark: sample_from_anchor=%s, K=%d (checkpoint block %s), "
+            "draft sampling %s.",
+            self.sample_from_anchor,
+            K,
+            trained_block,
+            spec.draft_sample_method,
+        )
 
     # A reduced-vocab DSpark checkpoint carries its own lm_head
     # ([draft_vocab, hidden] plus a d2t remap) and possibly its own
@@ -102,14 +132,80 @@ class DSparkProposer(DFlashProposer):
                     "Qwen3DSpark/Gemma4DSpark-family model."
                 )
 
+    def _num_sampled(self, block_size: int) -> int:
+        return block_size if self.sample_from_anchor else block_size - 1
+
+    def _draft_sample_inputs(
+        self, padded_num_reqs: int, start_index: int = 0, num_reqs: int = 0
+    ) -> tuple[torch.Tensor, ...]:
+        """Probabilistic drafting: per-row temperatures [P] (0 = greedy) and
+        uniform noise [P, num_sampled, vocab] for the Gumbel-max draw."""
+        if not self._probabilistic:
+            return ()
+        device = self.runner.device
+        if num_reqs == 0:
+            cached = self._dummy_sample_inputs.get(padded_num_reqs)
+            if cached is None:
+                cached = (
+                    torch.zeros(padded_num_reqs, dtype=torch.float32, device=device),
+                    torch.full(
+                        (
+                            padded_num_reqs,
+                            self._num_sampled(self.block_size),
+                            self._draft_vocab_size,
+                        ),
+                        0.5,
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                )
+                self._dummy_sample_inputs[padded_num_reqs] = cached
+            return cached
+        temps_cpu = torch.zeros(padded_num_reqs, dtype=torch.float32)
+        temps_cpu[:num_reqs].copy_(
+            self.runner.input_batch.temperature_cpu_tensor[
+                start_index : start_index + num_reqs
+            ]
+        )
+        temps = temps_cpu.to(device, non_blocking=True)
+        noise = torch.rand(
+            (
+                padded_num_reqs,
+                self._num_sampled(self.block_size),
+                self._draft_vocab_size,
+            ),
+            dtype=torch.float32,
+            device=device,
+        )
+        return temps, noise
+
+    @staticmethod
+    def _sample_draft(
+        logits: torch.Tensor,
+        temps: torch.Tensor | None,
+        noise: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """argmax, or the Gumbel-max draw from softmax(logits / T) per row
+        (rows at T == 0 stay greedy). `logits` is [P, V], `noise` [P, V]."""
+        if temps is None or noise is None:
+            return logits.argmax(dim=-1)
+        greedy = temps <= 0.0
+        scaled = logits.float() / torch.where(greedy, 1.0, temps).unsqueeze(1)
+        u = noise.clamp(min=torch.finfo(torch.float32).tiny, max=1.0 - 1e-7)
+        gumbel = -torch.log(-torch.log(u))
+        sampled = (scaled + gumbel).argmax(dim=-1)
+        return torch.where(greedy, logits.argmax(dim=-1), sampled)
+
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         block_size: int,
+        temps: torch.Tensor | None = None,
+        noise: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Backbone forward + sequential greedy Markov sampling, in-graph.
+        """Backbone forward + sequential Markov sampling, in-graph.
 
         Dense layout: every query slot predicts the token at its position + 1,
         so all block_size slots are sampled (DFlash samples only the mask
@@ -128,7 +224,7 @@ class DSparkProposer(DFlashProposer):
         valid_hidden = hidden[: padded_num_reqs * block_size]
 
         # Draft-vocab logits for every slot; the Markov bias is added in
-        # draft space and ids are remapped to target vocab after argmax.
+        # draft space and ids are remapped to target vocab after sampling.
         logits = self.draft_model.compute_draft_logits(valid_hidden)
         logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
 
@@ -138,10 +234,14 @@ class DSparkProposer(DFlashProposer):
         prev = ids_3d[:, 0]
         draft_tokens = []
         sample_start = 0 if self.sample_from_anchor else 1
-        for i in range(sample_start, block_size):
+        for j, i in enumerate(range(sample_start, block_size)):
             bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
             step = self.draft_model.map_draft_to_target(
-                (logits_3d[:, i] + bias).argmax(dim=-1)
+                self._sample_draft(
+                    logits_3d[:, i] + bias,
+                    temps,
+                    None if noise is None else noise[:, j],
+                )
             )
             draft_tokens.append(step)
             prev = step

@@ -27,6 +27,7 @@ def _make_proposer(hf_dict, num_speculative_tokens=4, **spec_fields):
         draft_sample_method="greedy",
         enable_adaptive_verification=False,
         dspark_draft_topk=None,
+        rejection_sample_method=None,
     )
     fields.update(spec_fields)
     speculative_config = SimpleNamespace(
@@ -91,7 +92,9 @@ def test_bonus_anchor_keeps_dflash_layout():
 @pytest.mark.parametrize(
     "field,value",
     [
+        # Probabilistic drafts are only accepted with synthetic rejection.
         ("draft_sample_method", "probabilistic"),
+        ("draft_sample_method", "topk"),
         ("enable_adaptive_verification", True),
         ("dspark_draft_topk", 8),
     ],
@@ -108,16 +111,42 @@ def test_rejects_unsupported_drafting_options(field, value):
         )
 
 
-def test_block_size_guard():
-    with pytest.raises(ValueError, match="block size"):
-        _make_proposer(
-            {
-                "dspark_noise_token_id": 7,
-                "dspark_block_size": 7,
-                **_LAYER_IDS,
-            },
-            num_speculative_tokens=4,
-        )
+def test_probabilistic_with_synthetic_rejection():
+    p = _make_proposer(
+        {
+            "dspark_noise_token_id": 7,
+            "dspark_block_size": 4,
+            "vocab_size": 32,
+            **_LAYER_IDS,
+        },
+        draft_sample_method="probabilistic",
+        rejection_sample_method="synthetic",
+    )
+    assert p._probabilistic
+    assert p._draft_vocab_size == 32
+
+
+def test_query_block_follows_k_not_checkpoint_block():
+    # As upstream: K need not equal the trained block length.
+    p = _make_proposer(
+        {
+            "dspark_noise_token_id": 7,
+            "dspark_block_size": 5,
+            **_LAYER_IDS,
+        },
+        num_speculative_tokens=6,
+    )
+    assert p.block_size == 6
+
+
+def test_sample_draft_keeps_greedy_rows():
+    logits = torch.tensor([[0.0, 5.0, 0.0, 0.0], [5.0, 0.0, 0.0, 0.0]])
+    temps = torch.tensor([0.0, 1.0])
+    # Row 1's noise makes token 2 win the Gumbel-max draw over the argmax.
+    noise = torch.tensor([[0.5] * 4, [1e-30, 1e-30, 1.0 - 1e-7, 1e-30]])
+    sampled = DSparkProposer._sample_draft(logits, temps, noise)
+    assert sampled.tolist() == [1, 2]
+    assert DSparkProposer._sample_draft(logits, None, None).tolist() == [1, 0]
 
 
 def test_missing_noise_token():
