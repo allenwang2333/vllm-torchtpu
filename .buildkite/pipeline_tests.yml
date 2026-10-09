@@ -86,7 +86,7 @@ steps:
         key: "unit_tests_general_pr"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") != "1"'
-        parallelism: 3
+        parallelism: 4
         agents:
           queue: "tpu_v7x_2_queue"
         plugins:
@@ -206,6 +206,7 @@ steps:
         key: "unit_tests_general_nightly"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") == "1"'
+        parallelism: 4
         agents:
           queue: "tpu_v7x_2_queue"
         plugins:
