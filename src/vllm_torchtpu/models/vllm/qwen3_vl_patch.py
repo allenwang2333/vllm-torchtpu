@@ -22,6 +22,9 @@ logger = init_logger(__name__)
 _qwen3_vl_torch_ops_depth = 0
 _orig_torch_ops: dict = {}
 _torch_ops_lock = threading.RLock()
+_INT_CPU_FALLBACK_DTYPES = frozenset(
+    {torch.int64, torch.int32, torch.int16, torch.bool}
+)
 
 
 def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:
@@ -101,7 +104,7 @@ def _patched_repeat_interleave(
     if (
         isinstance(input, torch.Tensor)
         and input.device.type == "tpu"
-        and input.dtype in (torch.int64, torch.int32, torch.int16, torch.bool)
+        and input.dtype in _INT_CPU_FALLBACK_DTYPES
     ):
         input_cpu = input.cpu()
         repeats_cpu = repeats.cpu() if isinstance(repeats, torch.Tensor) else repeats
@@ -117,7 +120,7 @@ def _patched_cumsum(input: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     if (
         isinstance(input, torch.Tensor)
         and input.device.type == "tpu"
-        and input.dtype in (torch.int64, torch.int32, torch.int16, torch.bool)
+        and input.dtype in _INT_CPU_FALLBACK_DTYPES
     ):
         return orig_fn(input.cpu(), *args, **kwargs).to(input.device)
     return orig_fn(input, *args, **kwargs)
@@ -125,12 +128,7 @@ def _patched_cumsum(input: torch.Tensor, *args, **kwargs) -> torch.Tensor:
 
 def _patched_tensor_cumsum(self: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     orig_fn = _orig_torch_ops.get("tensor_cumsum", torch.Tensor.cumsum)
-    if self.device.type == "tpu" and self.dtype in (
-        torch.int64,
-        torch.int32,
-        torch.int16,
-        torch.bool,
-    ):
+    if self.device.type == "tpu" and self.dtype in _INT_CPU_FALLBACK_DTYPES:
         return orig_fn(self.cpu(), *args, **kwargs).to(self.device)
     return orig_fn(self, *args, **kwargs)
 
@@ -233,8 +231,6 @@ def _patch_qwen3_vl_get_rope_index(modeling) -> None:
         return t
 
     def to_device(r, target_device):
-        if target_device is None:
-            return r
         if isinstance(r, torch.Tensor):
             return r.to(target_device)
         if isinstance(r, (tuple, list)):

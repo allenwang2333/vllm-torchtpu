@@ -128,14 +128,20 @@ class TpuMMEncoderAttention(MMEncoderAttention):
         # <= t. Real image i -> id i+1; flash-padding positions (>=
         # cu_seqlens[-1]) -> the highest id. The kernel mask is pure equality, so
         # real tokens attend only within their image and never to padding.
-        positions = torch.arange(padded, device=q.device)
         if cu_seqlens is not None:
-            cu = cu_seqlens.to(positions.dtype)
-            seg = (positions[None, :] >= cu[:, None]).sum(dim=0).to(torch.int32)
+            positions = torch.arange(padded, dtype=torch.int32, device=q.device)
+            cu = (
+                cu_seqlens
+                if cu_seqlens.dtype == torch.int32
+                else cu_seqlens.to(torch.int32)
+            )
+            seg = (positions[None, :] >= cu[:, None]).sum(dim=0, dtype=torch.int32)
             seg = seg.unsqueeze(0).expand(bsz, padded).contiguous()
-        else:
+        elif pad:
             seg = torch.zeros((bsz, padded), dtype=torch.int32, device=q.device)
             seg[:, :seq_len] = 1
+        else:
+            seg = torch.ones((bsz, padded), dtype=torch.int32, device=q.device)
 
         def _prep(x: torch.Tensor) -> torch.Tensor:
             # [b, s, h, d] -> pad seq -> [b, h, s_pad, d]
@@ -149,7 +155,7 @@ class TpuMMEncoderAttention(MMEncoderAttention):
         # Fold sm_scale into q so the op stays scale-agnostic.
         out = op(_prep(q * self.scale), _prep(k), _prep(v), seg, seg)
         out = out.permute(0, 2, 1, 3)  # [b, s_pad, h, d]
-        return out[:, :seq_len].contiguous()
+        return (out[:, :seq_len] if pad else out).contiguous()
 
     # vllm-torchtpu registers TpuPlatform as an out-of-tree plugin, so vLLM's
     # CustomOp.dispatch_forward routes to forward_oot. Alias forward_tpu to the
