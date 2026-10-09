@@ -211,11 +211,14 @@ def _kpool_index_jax(
         raise ValueError(
             f"indexer cache row is {row_width} wide, expected 2 * {head_dim}: "
             "the pool key is stored over member 0's gate half")
-    # Same buffer, split into k/gate halves, so both the key write and the key
-    # read touch `head_dim` values instead of gathering the whole `2 * head_dim`
-    # row and slicing it afterwards.
-    halves = cache.reshape(cache.shape[0], block_size_per_packing, 2 * packing,
-                           head_dim)
+    # Every access below moves whole `2 * head_dim` rows. Two tempting
+    # shortcuts are both far slower on TPU:
+    #   * reshaping the cache into k/gate halves tiles differently (`T(4,128)`
+    #     vs `T(2,128)`), so the reshape is a physical copy of the *whole*
+    #     cache, twice per layer -- 16 ms of a 29 ms decode step;
+    #   * gathering/scattering a `[head_dim:]` window of a row lowers to a
+    #     `while` loop of per-index dynamic slices -- 120K of them per step,
+    #     ~800 ms.
 
     # Pool `j` is tokens `4j .. 4j+3`, cut on absolute position, so a token
     # completes a pool exactly when `pos + 1` is a multiple of `kpool`, and the
@@ -243,18 +246,20 @@ def _kpool_index_jax(
                          jnp.int32(2**30))
     # Most tokens do not complete a pool, so most rows of this scatter are
     # aimed out of bounds -- `mode="drop"` again, for the same reason.
-    key_sub = 2 * (key_slot % packing) + 1  # the gate half of member 0
-    halves = halves.at[key_page, key_slot // packing, key_sub].set(
-        new_keys.astype(halves.dtype), mode="drop")
+    # Member 0's `k` half is rewritten with the value just read, which
+    # round-trips exactly (bf16 -> f32 -> bf16).
+    key_row = jnp.concatenate([m_k[:, 0, :], new_keys],
+                              axis=-1).astype(cache.dtype)
+    cache = cache.at[key_page, key_slot // packing,
+                     key_slot % packing].set(key_row, mode="drop")
 
     # ---- read back every pool's key ---------------------------------------
     # Incomplete pools return whatever their gate half holds; `candidate`
     # below discards those scores, so the garbage never reaches `top_k`.
     key_pos = jnp.arange(max_pools, dtype=jnp.int32) * kpool
     p_slot = key_pos % block_size
-    pool_keys = halves[pages[:, key_pos // block_size], p_slot // packing,
-                       2 * (p_slot % packing) + 1].astype(jnp.float32)
-    cache = halves.reshape(cache.shape)
+    pool_keys = cache[pages[:, key_pos // block_size], p_slot // packing,
+                      p_slot % packing][..., head_dim:].astype(jnp.float32)
 
     # ---- score -------------------------------------------------------------
     scale = jnp.float32(head_dim**-0.5)
@@ -459,8 +464,11 @@ class Glm5NextIndexer(nn.Module):
         self.topk_tokens = int(config.index_topk)
         self.select_k = self.topk_tokens // self.kpool
         self.always_select_tail = bool(config.index_kpool_always_select_tail)
-        self.width = self.topk_tokens + (self.kpool -
-                                         1 if self.always_select_tail else 0)
+        # The op's output goes straight to the sparse MLA kernel, so it takes
+        # the buffer's width: `topk + kpool - 1` padded to the kernel's
+        # multiple of 4. The extra columns come out as -1, past the packed
+        # prefix.
+        self.width = topk_indices_buffer.shape[1]
         self.softmax_scale = self.head_dim**-0.5
         self.topk_indices_buffer = topk_indices_buffer
 
@@ -543,10 +551,11 @@ class Glm5NextIndexer(nn.Module):
             metadata.query_start_loc,
         )
 
-        self.topk_indices_buffer[:num_tokens] = -1
-        num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])
-        self.topk_indices_buffer[:num_out, :self.width] = topk_indices[:num_out]
-        return self.topk_indices_buffer
+        # Returned directly rather than written into `topk_indices_buffer`:
+        # the GLM MLA consumes this tensor itself, and updating the shared
+        # `[max_num_batched_tokens, width]` buffer in place cost three full
+        # copies of it per layer (1.5 ms of a decode step).
+        return topk_indices
 
 
 __all__ = ["Glm5NextIndexer", "Glm5NextIndexerCache", "dense_dsa_fallback"]
