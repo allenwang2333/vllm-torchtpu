@@ -52,6 +52,14 @@ TPU_HBM_ROW_TILE = 16
 ONLINE_STATE_PADDED_LANES = 128
 TPU_KV_DMA_ALIGNMENT = 128
 KVLayout = batched_rpa_configs.KVLayout
+# Whole-array HBM block specs are immutable and shape-independent, so one
+# shared instance serves every Pallas call in this module instead of
+# constructing fresh BlockSpec objects on each trace.
+_HBM_BLOCK_SPEC = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+_HBM_IN_SPECS_2 = (_HBM_BLOCK_SPEC,) * 2
+_HBM_IN_SPECS_7 = (_HBM_BLOCK_SPEC,) * 7
+_HBM_IN_SPECS_9 = (_HBM_BLOCK_SPEC,) * 9
+_HBM_OUT_SPECS_4 = (_HBM_BLOCK_SPEC,) * 4
 
 
 def _copy_hnd_token_slice(
@@ -265,11 +273,8 @@ def write_captured_kv_to_local_cache(
         out_shape=jax.ShapeDtypeStruct(writeback_cache.shape, writeback_cache.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
-            in_specs=(
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-            ),
-            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            in_specs=_HBM_IN_SPECS_2,
+            out_specs=_HBM_BLOCK_SPEC,
             scratch_shapes=(pltpu.SemaphoreType.DMA,),
             grid=(1,),
         ),
@@ -279,6 +284,8 @@ def write_captured_kv_to_local_cache(
         ),
         name="pcp_write_captured_kv_to_local_cache",
     )(num_segments, segment_descriptors, captured_kv, writeback_cache)
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        return updated_cache
     return updated_cache.reshape(kv_cache.shape)
 
 
@@ -420,6 +427,18 @@ def _consume_scheduled_kv_page_multi_head(
     causal,
     kv_layout,
 ):
+    q_per_kv = q_vmem_ref.shape[2]
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        kv_block_tokens = kv_vmem_ref.shape[-1]
+        qk_dimensions = (((2,), (0,)), ((), ()))
+        pv_dimensions = (((2,), (1,)), ((), ()))
+        kv_sequence_axis = 1
+    else:
+        page_size = kv_vmem_ref.shape[2]
+        kv_block_tokens = kv_vmem_ref.shape[1] * page_size
+        qk_dimensions = (((2,), (1,)), ((), ()))
+        pv_dimensions = (((2,), (0,)), ((), ()))
+        kv_sequence_axis = 0
     if causal:
         q_global_start = sched_vmem_ref[
             consumer_rank, lane, RuntimeScheduleField.Q_GLOBAL_START
@@ -437,12 +456,18 @@ def _consume_scheduled_kv_page_multi_head(
         kv_valid_len = sched_vmem_ref[
             consumer_rank, lane, RuntimeScheduleField.KV_VALID_LEN
         ]
-    q_per_kv = q_vmem_ref.shape[2]
-    if kv_layout == KVLayout.SEQ_ALONG_LANE:
-        kv_block_tokens = kv_vmem_ref.shape[-1]
+        kv_local_pos = lax.broadcasted_iota(jnp.int32, (1, 1, kv_block_tokens), 2)
+        kv_valid = kv_local_pos < kv_valid_len
+        kv_chunk_idx = lax.div(kv_local_pos, interleave_size)
+        kv_chunk_offset = lax.rem(kv_local_pos, interleave_size)
+        kv_pos = (
+            kv_global_start
+            + kv_chunk_idx * pcp_size * interleave_size
+            + kv_chunk_offset
+        )
+        entry_valid = req_id != -1
     else:
-        page_size = kv_vmem_ref.shape[2]
-        kv_block_tokens = kv_vmem_ref.shape[1] * page_size
+        kv_valid_len = 0
     num_q_compute_blocks = q_vmem_ref.shape[0] // q_compute_size
     compute_dtype = q_vmem_ref.dtype
 
@@ -451,13 +476,16 @@ def _consume_scheduled_kv_page_multi_head(
             k = (k.astype(jnp.float32) * k_scale).astype(compute_dtype)
         if v_scale is not None:
             v = (v.astype(jnp.float32) * v_scale).astype(compute_dtype)
-        if not causal:
-            k = k * sm_scale
+        if causal:
+            kv_input_pos = lax.broadcasted_iota(jnp.int32, k.shape, kv_sequence_axis)
+            k_compute = jnp.where(kv_input_pos < kv_valid_len, k, 0.0)
+            v_compute = jnp.where(kv_input_pos < kv_valid_len, v, 0.0)
+        else:
+            k_compute = k * sm_scale
+            v_compute = v
 
         def _q_compute_loop(q_compute_idx, carry):
             del carry
-            k_compute = k
-            v_compute = v
             q_start = pl.multiple_of(q_compute_idx * q_compute_size, q_compute_size)
             q_slice = q_vmem_ref.at[
                 pl.ds(q_start, q_compute_size),
@@ -488,23 +516,9 @@ def _consume_scheduled_kv_page_multi_head(
                 q_row = q_start + lax.broadcasted_iota(
                     jnp.int32, (q_compute_size, q_per_kv, 1), 0
                 )
-                kv_local_pos = lax.broadcasted_iota(
-                    jnp.int32, (1, 1, kv_block_tokens), 2
-                )
                 q_valid = q_row < q_tile_size
-                kv_valid = kv_local_pos < kv_valid_len
                 q_slice = jnp.where(q_valid, q_slice, 0.0)
-                kv_sequence_axis = 1 if kv_layout == KVLayout.SEQ_ALONG_LANE else 0
-                kv_input_pos = lax.broadcasted_iota(
-                    jnp.int32, k.shape, kv_sequence_axis
-                )
-                k_compute = jnp.where(kv_input_pos < kv_valid_len, k, 0.0)
-                v_compute = jnp.where(kv_input_pos < kv_valid_len, v, 0.0)
 
-            if kv_layout == KVLayout.SEQ_ALONG_LANE:
-                qk_dimensions = (((2,), (0,)), ((), ()))
-            else:
-                qk_dimensions = (((2,), (1,)), ((), ()))
             scores = lax.dot_general(
                 q_slice,
                 k_compute,
@@ -514,22 +528,13 @@ def _consume_scheduled_kv_page_multi_head(
 
             if causal:
                 scores = scores * sm_scale
-                q_interleave = interleave_size
                 q_pos = query_row_positions(
                     q_global_start,
                     q_hbm_offset,
                     q_row,
                     pcp_size=pcp_size,
-                    interleave_size=q_interleave,
+                    interleave_size=interleave_size,
                 )
-                kv_chunk_idx = lax.div(kv_local_pos, q_interleave)
-                kv_chunk_offset = lax.rem(kv_local_pos, q_interleave)
-                kv_pos = (
-                    kv_global_start
-                    + kv_chunk_idx * pcp_size * q_interleave
-                    + kv_chunk_offset
-                )
-                entry_valid = req_id != -1
                 row_active = jnp.logical_and(entry_valid, q_valid)
                 mask = jnp.logical_and(
                     jnp.logical_and(q_pos >= kv_pos, kv_valid), q_valid
@@ -549,10 +554,6 @@ def _consume_scheduled_kv_page_multi_head(
                 p = jnp.where(row_active, p, 0.0)
                 alpha = jnp.where(row_active, alpha, 1.0)
             l_next = alpha * l_head + jnp.sum(p, axis=2, keepdims=True)
-            if kv_layout == KVLayout.SEQ_ALONG_LANE:
-                pv_dimensions = (((2,), (1,)), ((), ()))
-            else:
-                pv_dimensions = (((2,), (0,)), ((), ()))
             pv = lax.dot_general(
                 p.astype(compute_dtype),
                 v_compute,
@@ -2131,21 +2132,8 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            in_specs=[
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-            ],
-            out_specs=(
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-            ),
+            in_specs=_HBM_IN_SPECS_7,
+            out_specs=_HBM_OUT_SPECS_4,
             scratch_shapes=(
                 pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.DMA,
@@ -2257,18 +2245,8 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
         out_shape=jax.ShapeDtypeStruct(q_multi_head.shape, q_multi_head.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            in_specs=[
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-            ],
-            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            in_specs=_HBM_IN_SPECS_9,
+            out_specs=_HBM_BLOCK_SPEC,
             scratch_shapes=(
                 pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.DMA,
@@ -2348,16 +2326,8 @@ def _pcp_streaming_attention_zero_history_output_multi_head_pallas_call(
         out_shape=jax.ShapeDtypeStruct(o_multi_head.shape, o_multi_head.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            in_specs=[
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-            ],
-            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            in_specs=_HBM_IN_SPECS_7,
+            out_specs=_HBM_BLOCK_SPEC,
             scratch_shapes=(
                 pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.DMA,
