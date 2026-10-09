@@ -162,6 +162,12 @@ def _state_page_capacity(
     return page_rows // state_rows_per_token(mode, head_dim, defaults["overlap"])
 
 
+_PEER_MODE: dict[Mode, Mode] = {
+    Mode.CSA: Mode.CSA_INDEXER,
+    Mode.CSA_INDEXER: Mode.CSA,
+}
+
+
 def state_block_size(
     mode: Mode,
     kv_cache_block_size: int,
@@ -176,10 +182,7 @@ def state_block_size(
     """
     own = _state_page_capacity(mode, kv_cache_block_size, compress_ratio, head_dim)
     # CSA and the indexer are each other's peer; HCA has none and pages alone.
-    peer_mode = {
-        Mode.CSA: Mode.CSA_INDEXER,
-        Mode.CSA_INDEXER: Mode.CSA,
-    }.get(mode)
+    peer_mode = _PEER_MODE.get(mode)
     if peer_mode is None:
         return own
     return min(own, _state_page_capacity(peer_mode, kv_cache_block_size))
@@ -259,7 +262,7 @@ class Configs:
         state and the compressed KV share one buffer.
         """
         actual_overrides = {**_MODE_DEFAULTS[mode], **overrides}
-        if mode == Mode.HCA:
+        if mode is Mode.HCA:
             actual_overrides["quant_block"] = 0
 
         dims = Dimensions(
@@ -451,7 +454,7 @@ class Configs:
 
     def output_shape(self) -> tuple[int, ...]:
         """Packed output tile / VMEM block: (tile, record_rows) + cache_last_dims."""
-        return (self._tile_n, self.record_rows) + self.cache_last_dims
+        return (self._tile_n, self.record_rows, *self.cache_last_dims)
 
     def page_buffer_shape(self) -> tuple[int, ...]:
         """Page-buffer VMEM block: (tile, pages, state page rows) + cache_last_dims.
@@ -463,7 +466,8 @@ class Configs:
             self._tile_n,
             self.pages_to_buffer_per_token,
             self.state_physical_page_size,
-        ) + self.cache_last_dims
+            *self.cache_last_dims,
+        )
 
     def rope_output_shape(self) -> tuple[int, ...]:
         """RoPE output VMEM block: (tile, 4, lane)."""
@@ -480,11 +484,11 @@ class Configs:
         CSA's arrays are allocated as ``(num_pages, rows, 128)`` int32
         (`csa_cache_layout`), the same bytes as this shape.
         """
-        return (num_pages, self.physical_page_size) + self.cache_last_dims
+        return (num_pages, self.physical_page_size, *self.cache_last_dims)
 
     def state_cache_shape(self, num_pages: int) -> tuple[int, ...]:
         """Shape of the global HBM array hosting the f32 compressor state."""
-        return (num_pages, self.state_physical_page_size) + self.cache_last_dims
+        return (num_pages, self.state_physical_page_size, *self.cache_last_dims)
 
     def rope_cache_shape(self, num_pages: int) -> tuple[int, ...]:
         """Shape of the global HBM RoPE cache, as uint8 slabs."""

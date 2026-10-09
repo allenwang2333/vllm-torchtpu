@@ -19,6 +19,16 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 
+_ROPE_GATHER_DN = jax.lax.GatherDimensionNumbers(
+    offset_dims=(),
+    collapsed_slice_dims=(1,),
+    start_index_map=(1,),
+    operand_batching_dims=(0,),
+    start_indices_batching_dims=(0,),
+)
+_FP8_MAX: float = float(jnp.finfo(jnp.float8_e4m3fn).max)
+_INV_FP8_MAX: float = 1.0 / _FP8_MAX
+
 
 def interleaved_rope_vector(x, cos_val_32, sin_val_32):
     """Applies interleaved Rotary Position Embedding (RoPE) to a vector."""
@@ -37,18 +47,10 @@ def interleaved_rope_vector(x, cos_val_32, sin_val_32):
         :, :, None
     ]  # (tile_n, 128, 1)
 
-    gather_dn = jax.lax.GatherDimensionNumbers(
-        offset_dims=(),
-        collapsed_slice_dims=(1,),
-        start_index_map=(1,),
-        operand_batching_dims=(0,),
-        start_indices_batching_dims=(0,),
-    )
-
     x_swapped_2d = jax.lax.gather(
         x_2d,
         swap_coords,
-        dimension_numbers=gather_dn,
+        dimension_numbers=_ROPE_GATHER_DN,
         slice_sizes=(1, 1),
         unique_indices=True,
         mode=jax.lax.GatherScatterMode.PROMISE_IN_BOUNDS,
@@ -72,7 +74,7 @@ def interleaved_rope_vector(x, cos_val_32, sin_val_32):
     cos_dup_2d = jax.lax.gather(
         cos_pairs,
         dup_coords,
-        dimension_numbers=gather_dn,
+        dimension_numbers=_ROPE_GATHER_DN,
         slice_sizes=(1, 1),
         unique_indices=False,
         mode=jax.lax.GatherScatterMode.PROMISE_IN_BOUNDS,
@@ -81,7 +83,7 @@ def interleaved_rope_vector(x, cos_val_32, sin_val_32):
     sin_dup_2d = jax.lax.gather(
         sin_pairs,
         dup_coords,
-        dimension_numbers=gather_dn,
+        dimension_numbers=_ROPE_GATHER_DN,
         slice_sizes=(1, 1),
         unique_indices=False,
         mode=jax.lax.GatherScatterMode.PROMISE_IN_BOUNDS,
@@ -98,7 +100,6 @@ def interleaved_rope_vector(x, cos_val_32, sin_val_32):
 
 def quantize_fp8_tiled(x, block_size):
     # x: (tile_n, S, 128) f32
-    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
     tile_n, slots, width = x.shape  # (tile_n, S, 128) f32
     num_blocks = width // block_size
 
@@ -113,7 +114,7 @@ def quantize_fp8_tiled(x, block_size):
             jnp.max(jnp.abs(x_block), axis=-1, keepdims=True), 1e-4, None
         )  # (tile_n, S, 1) f32
 
-        log2_val = jnp.log2(amax / fp8_max)  # f32
+        log2_val = jnp.log2(amax * _INV_FP8_MAX)  # f32
         scale = jnp.exp2(jnp.ceil(log2_val))  # (tile_n, S, 1) f32
 
         q_block = (x_block * (1.0 / scale)).astype(
@@ -148,7 +149,6 @@ def quantize_fp8_lane_periodic(x, period, nope_dim):
     the ones the record keeps.
     Returns (tile_n, S, 128) fp8 values and (tile_n, 1, period) e8m0 scales.
     """
-    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
     _, _, width = x.shape
     assert width == 2 * period, (width, period)
 
@@ -160,7 +160,7 @@ def quantize_fp8_lane_periodic(x, period, nope_dim):
     a = jnp.where(dim < nope_dim, jnp.abs(x), 0.0)
     folded = jnp.maximum(a[:, :, :period], a[:, :, period:])
     amax = jnp.clip(jnp.max(folded, axis=1, keepdims=True), 1e-4, None)
-    scale = jnp.exp2(jnp.ceil(jnp.log2(amax / fp8_max)))  # (tile_n, 1, period)
+    scale = jnp.exp2(jnp.ceil(jnp.log2(amax * _INV_FP8_MAX)))  # (tile_n, 1, period)
 
     q = (x * (1.0 / jnp.concatenate([scale, scale], axis=-1))).astype(jnp.float8_e4m3fn)
     scale_u8 = (pltpu.bitcast(scale, jnp.uint32) >> 23).astype(jnp.uint8)
@@ -243,13 +243,15 @@ def merge_rope_row(
     window = jax.lax.broadcasted_iota(jnp.int32, row.shape, 1) // width
     curr_slot = kv_slots[n]
     curr_row = curr_slot // per_row
+    curr_valid = curr_slot >= 0
 
     for i in range(kv_slots.shape[0]):
         slot_i = kv_slots[i]
-        hit = (slot_i >= 0) & (curr_slot >= 0) & (slot_i // per_row == curr_row)
+        hit = (slot_i >= 0) & curr_valid & (slot_i // per_row == curr_row)
         pos_i = slot_i % per_row
+        words_i = words[i]
         for j in range(per_row):
-            placed = pltpu.roll(words[i], (j * width - rope_lane) % lanes, 1)
+            placed = pltpu.roll(words_i, (j * width - rope_lane) % lanes, 1)
             row = jnp.where(hit & (pos_i == j) & (window == j), placed, row)
     return row
 
@@ -277,6 +279,7 @@ def merge_slot_updates(
     pack_factor = slots_val.shape[0]
 
     curr_row = curr_slot // pack_factor
+    curr_valid = curr_slot >= 0
 
     slots_list = [slots_val[i] for i in range(pack_factor)]
 
@@ -286,9 +289,9 @@ def merge_slot_updates(
         row_i = slot_i // pack_factor
         sub_idx = slot_i % pack_factor
 
-        update_cond = valid_i & (row_i == curr_row) & (curr_slot >= 0)
+        update_cond = valid_i & (row_i == curr_row) & curr_valid
 
-        val = val_padded[i].flatten()
+        val = val_padded[i].reshape(-1)
 
         for target_s in range(pack_factor):
             slots_list[target_s] = jax.lax.select(
@@ -318,6 +321,7 @@ def gather_from_page_buffer(
 ):
     """Extracts kv_window, score_window from page buffer."""
     tile_n = page_buffer.shape[0]
+    half_window = window // 2
     if is_indexer:
         # CSA_INDEXER (layout 32x4x256)
         # page_buffer shape: (tile_n, pages_to_buffer, 32, 4, 256)
@@ -351,7 +355,7 @@ def gather_from_page_buffer(
                     # 256 floats across its LANES. The prev/curr halves of the
                     # overlapping state are therefore lanes 0:128 and 128:256.
                     if overlap:
-                        is_prev = w < (window // 2)
+                        is_prev = w < half_window
                         val_kv = jax.lax.select(
                             is_prev,
                             row_kv[:, 0:128],
@@ -372,6 +376,10 @@ def gather_from_page_buffer(
     else:
         # Standard HCA/CSA (last dim 128)
         slots_per_part_head = kv_window_u8.shape[2]
+        slots_per_part_row = field_rows
+        slots_per_token_row = state_rows_per_token
+        score_prev_start = 2 * slots_per_part_row
+        score_curr_start = 3 * slots_per_part_row
 
         for n in range(tile_n):
             safe_idx = jnp.minimum(global_idx + n, num_tokens - 1)
@@ -386,32 +394,25 @@ def gather_from_page_buffer(
                 block_idx_w = pos_w // block_size
                 p = block_idx_w - block_idx_curr + pages_to_buffer_per_token - 1
 
-                slots_per_part_row = field_rows
-                slots_per_token_row = state_rows_per_token
                 if overlap:
-                    is_prev = w < (window // 2)
+                    is_prev = w < half_window
                     kv_slot_start_row = jax.lax.select(is_prev, 0, slots_per_part_row)
                     score_slot_start_row = jax.lax.select(
-                        is_prev, 2 * slots_per_part_row, 3 * slots_per_part_row
+                        is_prev, score_prev_start, score_curr_start
                     )
                 else:
                     kv_slot_start_row = 0
                     score_slot_start_row = slots_per_part_row
 
                 offset_in_block = pos_w % block_size
+                base_token_row = offset_in_block * slots_per_token_row
+                kv_base_row = base_token_row + kv_slot_start_row
+                score_base_row = base_token_row + score_slot_start_row
 
                 @pl.loop(0, slots_per_part_head, unroll=True)
                 def gather_loop(d_idx):
-                    kv_src_row = (
-                        offset_in_block * slots_per_token_row
-                        + kv_slot_start_row
-                        + d_idx
-                    )
-                    score_src_row = (
-                        offset_in_block * slots_per_token_row
-                        + score_slot_start_row
-                        + d_idx
-                    )
+                    kv_src_row = kv_base_row + d_idx
+                    score_src_row = score_base_row + d_idx
 
                     kv_window_u8[n, w, d_idx, :, :] = page_buffer[
                         n, p, kv_src_row, :, :

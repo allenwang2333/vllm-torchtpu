@@ -25,6 +25,10 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     config,
 )
 
+_VMEM_BLOCK_SPEC = pl.BlockSpec(memory_space=pltpu.VMEM)
+_HBM_BLOCK_SPEC = pl.BlockSpec(memory_space=pltpu.HBM)
+_COMPILER_PARAMS = pltpu.CompilerParams(disable_bounds_checks=True)
+
 
 def inner_kernel(
     cos_sin_vmem,
@@ -74,7 +78,7 @@ def inner_kernel(
         field_rows=cfgs.field_rows,
         state_rows_per_token=cfgs.state_rows_per_token,
         overlap=cfgs.dims.overlap,
-        is_indexer=cfgs.dims.mode == config.Mode.CSA_INDEXER,
+        is_indexer=cfgs.dims.mode is config.Mode.CSA_INDEXER,
     )
 
     kv_val = window_vmem.at[0][...]  # (tile_n, window, head_tiles, 128)
@@ -83,13 +87,11 @@ def inner_kernel(
 
     # --- windowed softmax ---
     curr_pos = start[:, None] + jnp.arange(window)[None, :]  # (tile_n, window)
-    mask = curr_pos >= 0  # (tile_n, window)
-    mask_float = mask.astype(scores_val.dtype)
-    mask_float_reshaped = mask_float[:, :, None, None]  # (tile_n, window, 1, 1)
+    mask_4d = (curr_pos >= 0)[:, :, None, None]  # (tile_n, window, 1, 1)
     neg_inf = jnp.array(-jnp.inf, dtype=scores_val.dtype)
-    masked_scores = jnp.where(mask_float_reshaped > 0.5, scores_val, neg_inf)
+    masked_scores = jnp.where(mask_4d, scores_val, neg_inf)
     weights = jax.nn.softmax(masked_scores, axis=1)
-    kv_val = jnp.where(mask_float_reshaped > 0.5, kv_val, 0.0)
+    kv_val = jnp.where(mask_4d, kv_val, 0.0)
     compressed = jnp.sum(weights * kv_val, axis=1)  # (tile_n, head_tiles, 128)
 
     # --- rms norm ---
@@ -118,7 +120,7 @@ def inner_kernel(
 
     # --- pack + store ---
     if cfgs.dims.is_quantized:
-        if cfgs.dims.mode == config.Mode.CSA:
+        if cfgs.dims.mode is config.Mode.CSA:
             # CSA's reader wants the scales per lane, not per block.
             q, scale = compute.quantize_fp8_lane_periodic(
                 normed, cfgs.dims.quant_block, cfgs.nope_store_dim
@@ -140,11 +142,10 @@ def inner_kernel(
                 nope_width_bytes=cfgs.record_bytes,
                 last_dim_size=cfgs.last_dim_size,
             )
-        if cfgs.dims.mode == config.Mode.CSA_INDEXER:
-            kv_slots = []
-            for i in range(tile_n):
-                kv_slots.append(kv_slot_mapping_ref[global_idx + i])
-            kv_slots = jnp.stack(kv_slots)
+        if cfgs.dims.mode is config.Mode.CSA_INDEXER:
+            kv_slots = jnp.stack(
+                [kv_slot_mapping_ref[global_idx + i] for i in range(tile_n)]
+            )
 
             for n in range(tile_n):
                 is_first = is_first_mask_ref[global_idx + n]
@@ -168,10 +169,9 @@ def inner_kernel(
             # `csa_cache_layout`); rope_out_vmem holds each row-writer's row.
             words = compute.rope_words_tiled(rope_ropped, cfgs.dims.rope_head_dim)
             rope_lane = config.LANE - cfgs.dims.rope_head_dim
-            kv_slots = []
-            for i in range(tile_n):
-                kv_slots.append(kv_slot_mapping_ref[global_idx + i])
-            kv_slots = jnp.stack(kv_slots)
+            kv_slots = jnp.stack(
+                [kv_slot_mapping_ref[global_idx + i] for i in range(tile_n)]
+            )
             for n in range(tile_n):
                 is_first = is_first_mask_rope_ref[global_idx + n]
 
@@ -298,7 +298,7 @@ def compute_is_first_mask(kv_slot_mapping, tile_n, pack_factor=4):
     has_conflict = jnp.any(conflict, axis=-1)
     is_first = valid & ~has_conflict
 
-    return is_first.flatten()[:num_tokens]
+    return is_first.reshape(-1)[:num_tokens]
 
 
 @functools.partial(
@@ -404,23 +404,15 @@ def compress_norm_rope_store(
     rope_operand = rope_cache if cfgs.dims.has_rope_cache else None
 
     in_specs = (
-        pl.BlockSpec(memory_space=pltpu.VMEM),  # rms_weight
-        (
-            pl.BlockSpec(memory_space=pltpu.HBM) if cfgs.dims.has_rope else None
-        ),  # cos_sin
-        pl.BlockSpec(memory_space=pltpu.HBM),  # cache
-        (
-            pl.BlockSpec(memory_space=pltpu.HBM) if cfgs.dims.has_rope_cache else None
-        ),  # rope_cache
-        (
-            pl.BlockSpec(memory_space=pltpu.HBM) if state_operand is not None else None
-        ),  # state_cache
+        _VMEM_BLOCK_SPEC,  # rms_weight
+        (_HBM_BLOCK_SPEC if cfgs.dims.has_rope else None),  # cos_sin
+        _HBM_BLOCK_SPEC,  # cache
+        (_HBM_BLOCK_SPEC if cfgs.dims.has_rope_cache else None),  # rope_cache
+        (_HBM_BLOCK_SPEC if state_operand is not None else None),  # state_cache
     )
     out_specs = (
-        pl.BlockSpec(memory_space=pltpu.HBM),  # cache
-        (
-            pl.BlockSpec(memory_space=pltpu.HBM) if cfgs.dims.has_rope_cache else None
-        ),  # rope_cache
+        _HBM_BLOCK_SPEC,  # cache
+        (_HBM_BLOCK_SPEC if cfgs.dims.has_rope_cache else None),  # rope_cache
     )
     out_shapes = (
         jax.ShapeDtypeStruct(cache.shape, cache.dtype),
@@ -445,7 +437,7 @@ def compress_norm_rope_store(
         out_shape=out_shapes,
         grid_spec=grid_spec,
         input_output_aliases=aliases,
-        compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
+        compiler_params=_COMPILER_PARAMS,
         interpret=interpret,
         name=name,
     )(

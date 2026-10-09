@@ -23,6 +23,10 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import config
 
+_BUFFERED_REF_FIELD_NAMES: tuple[str, ...] = tuple(
+    f.name for f in dataclasses.fields(pltpu.BufferedRef)
+)
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -49,10 +53,7 @@ class _BufferedRef(pltpu.BufferedRef):
         )
         return cls(
             cfgs=cfgs,
-            **{
-                f.name: getattr(standard_ref, f.name)
-                for f in dataclasses.fields(pltpu.BufferedRef)
-            },
+            **{name: getattr(standard_ref, name) for name in _BUFFERED_REF_FIELD_NAMES},
         )
 
 
@@ -158,6 +159,7 @@ class OutputRef(_BufferedRef):
         # Cache is laid out like this:
         # [num_page, kv_block_size / 4, 4, 256]
         page_size = self.cfgs.kv_block_size
+        tokens_in_second_minor = self.cfgs.tokens_in_second_minor
 
         @pl.loop(0, tile_n)
         def loop_body(n):
@@ -169,7 +171,7 @@ class OutputRef(_BufferedRef):
             def _read_nope():
                 p = kv_slot // page_size
                 # we fetch the entire tile (4, 128), with 4 pages per tile
-                s_row = (kv_slot % page_size) // (self.cfgs.tokens_in_second_minor)
+                s_row = (kv_slot % page_size) // tokens_in_second_minor
                 src = cache_ref.at[p, s_row, :, :]
                 dest = dest_ref.at[n, 0, :, :]
                 pltpu.make_async_copy(src, dest, sem).start()
@@ -206,8 +208,10 @@ class OutputRef(_BufferedRef):
         tile_n = self.cfgs.tile_sizes.tile_n
         global_idx = pid * tile_n
 
-        if self.cfgs.dims.mode == config.Mode.CSA_INDEXER:
+        if self.cfgs.dims.mode is config.Mode.CSA_INDEXER:
             cache_ref, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
+            page_size = self.cfgs.kv_block_size
+            tokens_in_second_minor = self.cfgs.tokens_in_second_minor
 
             @pl.loop(0, tile_n)
             def loop_body(n):
@@ -218,15 +222,15 @@ class OutputRef(_BufferedRef):
 
                 @pl.when(valid)
                 def _write_nope():
-                    p = kv_slot // self.cfgs.kv_block_size
-                    s_row = (kv_slot % self.cfgs.kv_block_size) // (
-                        self.cfgs.tokens_in_second_minor
-                    )
+                    p = kv_slot // page_size
+                    s_row = (kv_slot % page_size) // tokens_in_second_minor
                     src = src_ref.at[n, 0, :, :]
                     dest = cache_ref.at[p, s_row, :, :]
                     pltpu.make_async_copy(src, dest, sem).start()
         else:
             cache_ref, kv_slot_mapping_ref = dest_ref
+            physical_page_size = self.cfgs.physical_page_size
+            record_rows = self.cfgs.record_rows
 
             # HCA: [num_pages, kv_block_size * 2, 4, 128] uint8
             # CSA: [num_pages, kv_block_size, 4, 128] uint8
@@ -237,10 +241,10 @@ class OutputRef(_BufferedRef):
 
                 @pl.when(kv_slot >= 0)
                 def _write_nope():
-                    p = kv_slot // self.cfgs.physical_page_size
-                    s = kv_slot % self.cfgs.physical_page_size
+                    p = kv_slot // physical_page_size
+                    s = kv_slot % physical_page_size
 
-                    @pl.loop(0, self.cfgs.record_rows, unroll=True)
+                    @pl.loop(0, record_rows, unroll=True)
                     def write_loop(o):
                         src_nope = src_ref.at[n, o, ...]
                         dest_nope = cache_ref.at[p, s + o, ...]
@@ -254,7 +258,7 @@ class OutputRef(_BufferedRef):
         tile_n = self.cfgs.tile_sizes.tile_n
         global_idx = pid * tile_n
 
-        is_indexer = self.cfgs.dims.mode == config.Mode.CSA_INDEXER
+        is_indexer = self.cfgs.dims.mode is config.Mode.CSA_INDEXER
 
         if is_indexer:
             _, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
@@ -275,6 +279,7 @@ class OutputRef(_BufferedRef):
                     ).wait()
         else:
             _, kv_slot_mapping_ref = dest_ref
+            record_rows = self.cfgs.record_rows
 
             @pl.loop(0, tile_n)
             def loop_body(n):
@@ -283,7 +288,7 @@ class OutputRef(_BufferedRef):
 
                 @pl.when(kv_slot >= 0)
                 def _wait_nope():
-                    @pl.loop(0, self.cfgs.record_rows, unroll=True)
+                    @pl.loop(0, record_rows, unroll=True)
                     def wait_loop(o):
                         pltpu.make_async_copy(
                             vmem_ref.at[n, o, :, :],
@@ -308,6 +313,7 @@ class RoPEOutputRef(_BufferedRef):
 
         tile_n = self.cfgs.tile_sizes.tile_n
         global_idx = pid * tile_n
+        rope_page_size = self.cfgs.rope_page_size
 
         @pl.loop(0, tile_n)
         def loop_body(n):
@@ -321,8 +327,8 @@ class RoPEOutputRef(_BufferedRef):
                 # divide by 4 because we pack 4 pages into 1 tile
                 # layout: [num_page, kv_block_size / 4, 4, 256]
                 rope_slot = kv_slot // 4
-                rope_p = rope_slot // self.cfgs.rope_page_size
-                s_row = rope_slot % self.cfgs.rope_page_size
+                rope_p = rope_slot // rope_page_size
+                s_row = rope_slot % rope_page_size
                 src = rope_cache_ref.at[rope_p, s_row, :, :]
                 dest = dest_ref.at[n, :, :]
                 pltpu.make_async_copy(src, dest, sem).start()
@@ -362,6 +368,7 @@ class RoPEOutputRef(_BufferedRef):
 
         tile_n = self.cfgs.tile_sizes.tile_n
         global_idx = pid * tile_n
+        rope_page_size = self.cfgs.rope_page_size
 
         @pl.loop(0, tile_n)
         def loop_body(n):
@@ -373,8 +380,8 @@ class RoPEOutputRef(_BufferedRef):
             @pl.when(valid & is_first)
             def _write_rope():
                 rope_slot = kv_slot // 4
-                rope_p = rope_slot // self.cfgs.rope_page_size
-                s_row = rope_slot % self.cfgs.rope_page_size
+                rope_p = rope_slot // rope_page_size
+                s_row = rope_slot % rope_page_size
                 src_rope = src_ref.at[n, :, :]
                 dest_rope = rope_cache_ref.at[rope_p, s_row, :, :]
                 pltpu.make_async_copy(src_rope, dest_rope, sem).start()
