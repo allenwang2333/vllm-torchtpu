@@ -1030,6 +1030,8 @@ def sparse_mla_attention_dcp(
     dcp_size: int,
     interleave_size: int,
     dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+    dcp_rank: jax.Array | None = None,
+    post_fused: bool | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1046,6 +1048,14 @@ def sparse_mla_attention_dcp(
         sequence coordinates, replicated. `block_tables` holds virtual page
         ordinals, resolved per rank exactly as on the indexer side.
       dcp_size, interleave_size: the shard layout.
+      dcp_rank: `jnp.arange(dcp_size)` sharded over `dcp_axis_name`, read in
+        place of the per-call `cp_rank_as_data` all_to_all
+        (`TPU_DCP_RANK_OPERAND`). Must be a real operand under torch_tpu.
+      post_fused: `TPU_INDEXER_TOPK_POST_FUSED` (None reads the env). The
+        "owns nothing" dummy slot 0 and the `-inf` lse go into the capped
+        window prep and the attention kernel instead of XLA compare/select
+        ops, and `local_topk_indices` may carry more rows per rank than
+        `num_tokens` (the shared top-k table, read in place). Bit-identical.
 
     Returns:
       `(kv_cache_nope, kv_cache_rope, output, lse)`. `output` is
@@ -1071,8 +1081,20 @@ def sparse_mla_attention_dcp(
             f"dcp_size={dcp_size} does not match mesh axis "
             f"{dcp_axis_name!r} of size {mesh.shape[dcp_axis_name]}."
         )
+    if post_fused is None:
+        post_fused = envs.TPU_INDEXER_TOPK_POST_FUSED
     num_tokens = ql_nope.shape[0]
-    if local_topk_indices.shape[0] != dcp_size * num_tokens:
+    if post_fused:
+        if (
+            local_topk_indices.shape[0] % dcp_size
+            or local_topk_indices.shape[0] // dcp_size < num_tokens
+        ):
+            raise ValueError(
+                "local_topk_indices must carry at least num_tokens rows per "
+                f"rank: {num_tokens} tokens at dcp_size={dcp_size}, got "
+                f"{local_topk_indices.shape[0]} rows."
+            )
+    elif local_topk_indices.shape[0] != dcp_size * num_tokens:
         raise ValueError(
             "local_topk_indices must carry one row per (rank, token): "
             f"expected {dcp_size * num_tokens} rows for {num_tokens} tokens "
@@ -1130,8 +1152,11 @@ def sparse_mla_attention_dcp(
         block_tables_,
         query_start_loc_,
         request_distribution_,
+        *rank_operand,
     ):
-        dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
+        dcp_rank = streamindex_topk.cp_rank_from_operand(
+            rank_operand[0] if rank_operand else None, dcp_axis_name, dcp_size
+        )
         kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
             kv_cache_nope,
             kv_cache_rope,
@@ -1151,9 +1176,15 @@ def sparse_mla_attention_dcp(
         # valid entry: the kernel derives `kv_len` from the `-1` tail and
         # requires `kv_len >= 1`. Position 0 always exists, so it is the
         # cheapest dummy; the softmax it produces is real but meaningless, and
-        # `owns` below is what keeps it out of the merge.
-        owns = jnp.any(topk_idx >= 0, axis=-1)
-        topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
+        # `owns` below is what keeps it out of the merge. With `post_fused`
+        # the kernel does both (`dcp_dummy_slot0`).
+        if post_fused:
+            owns = None
+        else:
+            owns = jnp.any(topk_idx >= 0, axis=-1)
+            topk_idx = topk_idx.at[:, 0].set(
+                jnp.where(owns, topk_idx[:, 0], jnp.int32(0))
+            )
 
         # Split q / lane-dense lse: the kernel joins q_nope and q_pe in VMEM
         # (no padded [T, H, 640] concat) and exports f32[T, H] lse directly.
@@ -1206,13 +1237,17 @@ def sparse_mla_attention_dcp(
             capped_window_prep=envs.TPU_DCP_MLA_CAPPED_PREP,
             # Decode chunks: tokens per grid step (1 = kernel default).
             small_chunk_batch_size=small_chunk_batch,
+            dcp_dummy_slot0=post_fused,
             **chunk_kwargs,
             **split_kwargs,
         )
-        lse = jnp.where(owns[:, None], lse, -jnp.inf)
+        if owns is not None:
+            lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
         return (kv_cache_nope, kv_cache_rope, output[..., : ql_nope.shape[-1]], lse)
 
+    rank_args = () if dcp_rank is None else (dcp_rank,)
+    in_specs = in_specs + (P(dcp_axis_name),) * len(rank_args)  # dcp_rank
     return jax.jit(
         shard_map.shard_map(
             _local, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
@@ -1229,4 +1264,5 @@ def sparse_mla_attention_dcp(
         block_tables,
         query_start_loc,
         request_distribution,
+        *rank_args,
     )

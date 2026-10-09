@@ -40,11 +40,15 @@ def _pack_body(
     lanes: int,
     num_cores: int,
     num_subcores: int,
+    exact_rows: bool = False,
 ):
+    # ``exact_rows``: ``vals_hbm`` / ``out_hbm`` hold exactly ``b`` rows. Rows
+    # past ``b`` re-read row ``b - 1`` and write nothing; each live row is
+    # DMA'd out by its own subcore instead of through pipeline output blocks.
     flat = lax.axis_index("core") * num_subcores + lax.axis_index("subcore")
     chunks = width // lanes
 
-    def pipeline_step(vals_vmem, out_vmem):
+    def pipeline_step(vals_vmem, out_vmem=None):
         row = pl.program_id(0) * (num_cores * num_subcores) + flat
 
         def fill(i):
@@ -64,6 +68,17 @@ def _pack_body(
             0, jnp.where(row < b, chunks, 0), unroll=SCAN_UNROLL, carry=jnp.int32(0)
         )(emit)
 
+        if exact_rows:
+
+            @pl.when(row < b)
+            def _():
+                pltpu.sync_copy(
+                    rowbuf_vmem.at[pl.ds(0, width)],
+                    out_hbm.at[pl.ds(row * width, width)],
+                )
+
+            return
+
         def copy_out(i):
             out_vmem[pl.ds(i * lanes, lanes)] = rowbuf_vmem[pl.ds(i * lanes, lanes)]
 
@@ -74,10 +89,17 @@ def _pack_body(
     in_specs = (
         pl.BlockSpec(
             (width,),
-            lambda w: (w * cores_per_chip + flat,),
+            (lambda w: (jnp.minimum(w * cores_per_chip + flat, b - 1),))
+            if exact_rows
+            else (lambda w: (w * cores_per_chip + flat,)),
             pipeline_mode=pl.Buffered(buf_count),
         ),
     )
+    if exact_rows:
+        pltpu.emit_pipeline(
+            pipeline_step, grid=(num_waves,), in_specs=in_specs, out_specs=()
+        )(vals_hbm)
+        return
     out_specs = pl.BlockSpec(
         (width,),
         lambda w: (w * cores_per_chip + flat,),
@@ -88,11 +110,16 @@ def _pack_body(
     )(vals_hbm, out_hbm)
 
 
-def pack_nonnegative(vals: jax.Array) -> jax.Array:  # i32[num_rows, width]
+def pack_nonnegative(
+    vals: jax.Array, *, exact_rows: bool = False
+) -> jax.Array:  # i32[num_rows, width]
     """Left-packs each row's non-negative entries into a `-1` padded prefix.
 
     Relative order is preserved, and a row of all non-negatives fills exactly
     `width`, so this never truncates.
+
+    ``exact_rows`` runs the kernel on exactly ``num_rows`` rows (no pad to a
+    multiple of the subcore count, no ``[:num_rows]`` slice). Same result.
     """
     b, width = vals.shape
     if vals.dtype != jnp.int32:
@@ -109,7 +136,8 @@ def pack_nonnegative(vals: jax.Array) -> jax.Array:  # i32[num_rows, width]
 
     num_waves = (b + rows_per_wave - 1) // rows_per_wave
     padded_b = num_waves * rows_per_wave
-    if padded_b > b:
+    exact_rows = exact_rows and padded_b > b
+    if padded_b > b and not exact_rows:
         # `-1`, not the default 0: 0 is a real position.
         vals = jnp.pad(vals, ((0, padded_b - b), (0, 0)), constant_values=-1)
 
@@ -128,15 +156,20 @@ def pack_nonnegative(vals: jax.Array) -> jax.Array:  # i32[num_rows, width]
             lanes=lanes,
             num_cores=sc.num_cores,
             num_subcores=sc.num_subcores,
+            exact_rows=exact_rows,
         ),
-        out_type=jax.ShapeDtypeStruct((padded_b * width,), jnp.int32),
+        out_type=jax.ShapeDtypeStruct(
+            ((b if exact_rows else padded_b) * width,), jnp.int32
+        ),
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True, needs_layout_passes=False
         ),
         scratch_types=(pltpu.VMEM((width + lanes,), jnp.int32),),
         mesh=mesh,
-        name=f"sc_pack_nonneg_b{b}_w{width}",
+        name=f"sc_pack_nonneg_b{b}_w{width}" + ("_x" if exact_rows else ""),
     )(vals.reshape(-1))
+    if exact_rows:
+        return out.reshape(b, width)
     return out.reshape(padded_b, width)[:b]
 
 
@@ -145,6 +178,8 @@ def resolve_owned_winners(
     slots: jax.Array,  # i32[num_rows, k], flat columns of the merged score list
     k: int,
     dcp_rank: jax.Array | int,
+    *,
+    exact_rows: bool = False,
 ) -> jax.Array:
     """Picks the merged winners this rank produced out of its own list, packed.
 
@@ -157,4 +192,4 @@ def resolve_owned_winners(
     safe = jnp.maximum(slots, 0)
     ours = (slots >= 0) & (jnp.floor_divide(safe, k) == dcp_rank)
     mine = jnp.take_along_axis(local_idxs, jnp.mod(safe, k), axis=1)
-    return pack_nonnegative(jnp.where(ours, mine, -1))
+    return pack_nonnegative(jnp.where(ours, mine, -1), exact_rows=exact_rows)

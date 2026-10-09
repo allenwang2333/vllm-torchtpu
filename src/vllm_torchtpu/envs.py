@@ -110,6 +110,8 @@ if TYPE_CHECKING:
     TPU_INDEXER_TOPK_SINGLE_WRITE: bool = False
     TPU_INDEXER_TOPK_NOCOPY: bool = False
     TPU_INDEXER_TOPK_SHARED_READ: bool = False
+    TPU_DCP_RANK_OPERAND: bool = False
+    TPU_INDEXER_TOPK_POST_FUSED: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -893,6 +895,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the table height (decode). Same values either way.
     "TPU_INDEXER_TOPK_SHARED_READ": env_bool(
         "TPU_INDEXER_TOPK_SHARED_READ", default=False
+    ),
+    # The sparse indexer's and sparse MLA's DCP rank comes in as a sharded
+    # int32 operand (each rank's own `rank_in_group`) instead of being derived
+    # per step by an `all_to_all` of an arange (`cp_rank_as_data`). Same rank
+    # value, one fewer collective per traced program (backbone and drafter).
+    "TPU_DCP_RANK_OPERAND": env_bool("TPU_DCP_RANK_OPERAND", default=False),
+    # DCP sparse indexer -> sparse MLA top-k post-processing folded into the
+    # kernels: the SparseCore top-k / pack kernels emit exactly `num_tokens`
+    # rows (no pad-to-32 / slice copies), sparse MLA reads the shared top-k
+    # table in place (no `[:num_tokens]` copy), and the "owns nothing" dummy
+    # slot 0 and `-inf` lse are applied inside the capped-window prep and the
+    # attention kernel instead of as XLA compare/select ops. Bit-identical.
+    "TPU_INDEXER_TOPK_POST_FUSED": env_bool(
+        "TPU_INDEXER_TOPK_POST_FUSED", default=False
     ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.

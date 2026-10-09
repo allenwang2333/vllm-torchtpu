@@ -39,7 +39,7 @@ from vllm_torchtpu.block_major_pool import (
     unified_block_major_enabled,
 )
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
-from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
+from vllm_torchtpu.distributed.dcp import dcp_rank_operand, get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as batched_rpa_configs,
@@ -2161,20 +2161,25 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         k_scale = None
         if layer.kv_cache_quantized_dtype is not None:
             _, k_scale, _ = self._get_kv_scales(layer)
+        post_fused = bool(envs.TPU_INDEXER_TOPK_POST_FUSED)
+        # TPU_DCP_RANK_OPERAND: the DCP rank rides in as a sharded operand,
+        # built here outside any traced region and appended to every call.
+        rank_operand = dcp_rank_operand() if envs.TPU_DCP_RANK_OPERAND else None
 
-        def sparse_mla_attention_core_tpu_dcp(
-            kv_cache_nope: jax.Array,
-            kv_cache_rope: jax.Array,
-            ql_nope: jax.Array,
-            q_pe: jax.Array,
-            kv_c_normed: jax.Array,
-            k_pe: jax.Array,
-            local_topk_indices: jax.Array,
-            seq_lens: jax.Array,
-            block_tables: jax.Array,
-            query_start_loc: jax.Array,
-            request_distribution: jax.Array,
-        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        def _core_dcp(
+            kv_cache_nope,
+            kv_cache_rope,
+            ql_nope,
+            q_pe,
+            kv_c_normed,
+            k_pe,
+            local_topk_indices,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            dcp_rank,
+        ):
             nope_spec, rope_spec = layer.mla_kv_spec
             return sparse_mla_attention_dcp(
                 ql_nope,
@@ -2195,6 +2200,67 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 k_scale=k_scale,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
+                dcp_rank=dcp_rank,
+                post_fused=post_fused,
+            )
+
+        # torch_tpu infers the op's schema from the annotated signature, so
+        # each variant is a plain function with named, annotated parameters.
+        def sparse_mla_attention_core_tpu_dcp(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            local_topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return _core_dcp(
+                kv_cache_nope,
+                kv_cache_rope,
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                None,
+            )
+
+        def sparse_mla_attention_core_tpu_dcp_rank(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            local_topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+            dcp_rank: jax.Array,  # i32[dcp_size], sharded over the DCP axis
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return _core_dcp(
+                kv_cache_nope,
+                kv_cache_rope,
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                dcp_rank,
             )
 
         op_name = (
@@ -2202,10 +2268,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         )
         sparse_mla_jax_op = pcp_streaming_jax_op(
             op_name,
-            sparse_mla_attention_core_tpu_dcp,
+            sparse_mla_attention_core_tpu_dcp
+            if rank_operand is None
+            else sparse_mla_attention_core_tpu_dcp_rank,
             donate_argnums=(0, 1),
             mesh=mesh,
-            input_partition_specs=_SPARSE_MLA_DCP_INPUT_PARTITION_SPECS,
+            input_partition_specs=_SPARSE_MLA_DCP_INPUT_PARTITION_SPECS
+            + ((P(DCP_AXIS_NAME),) if rank_operand is not None else ()),
             output_partition_specs=_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS,
         )
 
@@ -2250,6 +2319,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 block_tables,
                 query_start_loc,
                 request_distribution,
+                *(() if rank_operand is None else (rank_operand,)),
             )
             nope_cache.copy_(new_nope)
             rope_cache.copy_(new_rope)

@@ -75,6 +75,23 @@ def cp_rank_as_data(cp_axis_name: str, cp_size: int):
     return lax.dynamic_slice_in_dim(exchanged, 0, 1, axis=0)[0]
 
 
+def cp_rank_from_operand(rank_operand, cp_axis_name: str, cp_size: int):
+    """This shard's index along `cp_axis_name`.
+
+    `rank_operand` is this shard's slice of an int32 arange sharded over the
+    axis -- inside a `shard_map` with spec `P(cp_axis_name)` it is a one-element
+    array holding the shard's own mesh position -- so reading it costs nothing.
+    It has to come in as a real operand of the exported function: an arange
+    built inside the trace is a constant, and sharding a constant compiles to
+    `dynamic-slice(constant, partition-id)`, which the torch_tpu export bridge
+    refuses (see `kernels/fused_moe/v2/layer.py`). `None` falls back to
+    `cp_rank_as_data`, one `all_to_all` per call.
+    """
+    if rank_operand is None:
+        return cp_rank_as_data(cp_axis_name, cp_size)
+    return rank_operand.reshape(-1)[0].astype(jnp.int32)
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class MetadataRef:

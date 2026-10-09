@@ -169,6 +169,7 @@ def _capped_window_indices_kernel(
     page_size: int,
     pages_per_seq: int,
     total_num_pages: int,
+    dummy_slot0: bool = False,
 ):
     """`prepare_gather_indices` for one (window, chunk, token block)."""
     del live_windows_ref
@@ -176,6 +177,12 @@ def _capped_window_indices_kernel(
     c = pl.program_id(1)
     tb = pl.program_id(2)
     idx = topk_ref[...]
+    if dummy_slot0:
+        # DCP: a rank owning none of a token's (prefix-packed) top-k still
+        # attends one valid entry, position 0. Rows are prefix-packed, so the
+        # rank owns nothing exactly when slot 0 is -1.
+        slot0 = (w == 0) & (lax.broadcasted_iota(jnp.int32, idx.shape, 1) == 0)
+        idx = jnp.where(slot0 & (idx == -1), 0, idx)
     is_padding = idx == -1
     seq_page, token_offset = _floor_divmod_const(idx, page_size)
     logical = jnp.clip(seq_page, 0, pages_per_seq - 1)
@@ -219,8 +226,15 @@ def prepare_capped_window_indices(
     page_size: int,
     total_num_pages: int,
     block_tokens: int | None = None,
+    num_tokens: int | None = None,
+    dummy_slot0: bool = False,
 ) -> jax.Array:
     """Physical gather rows of every chunk, window-major, live windows only.
+
+    `num_tokens` (default: all rows of `topk_indices`) lets `topk_indices` be
+    a taller table read in place -- only its first `num_tokens` rows are read.
+    `dummy_slot0` maps a `-1` in slot 0 to position 0, the DCP "owns nothing"
+    dummy entry (`sparse_ragged_paged_attention`'s `dcp_dummy_slot0`).
 
     Returns i32[num_chunks * W * chunk_size, topk_cap], W = topk // topk_cap:
     chunk c's rows `[c * W * chunk, (c + 1) * W * chunk)` are exactly the
@@ -232,7 +246,11 @@ def prepare_capped_window_indices(
     instead of `topk`; rows of later windows are left unwritten, which is safe
     as long as every chunk's gather is bounded to `live_windows` windows.
     """
-    num_tokens, topk = topk_indices.shape
+    table_rows, topk = topk_indices.shape
+    if num_tokens is None:
+        num_tokens = table_rows
+    if num_tokens > table_rows:
+        raise ValueError(f"num_tokens ({num_tokens}) exceeds the table ({table_rows})")
     if num_tokens % chunk_size or topk % topk_cap:
         raise ValueError(
             f"num_tokens ({num_tokens}) and topk ({topk}) must be multiples of "
@@ -274,6 +292,7 @@ def prepare_capped_window_indices(
         page_size=page_size,
         pages_per_seq=pages_per_seq,
         total_num_pages=total_num_pages,
+        dummy_slot0=dummy_slot0,
     )
     return pl.pallas_call(
         kernel,
@@ -359,7 +378,15 @@ def _attention_kernel(
     capped_windows: int | None = None,
     split_q: bool = False,
     lse_lane_dense: bool = False,
+    owns_from_kv_lens: bool = False,
 ):
+    # Owns-from-kv_lens mode (`owns_from_kv_lens`, DCP): `kv_lens_ref` holds
+    # the raw live counts, 0 where this rank owns none of the token's top-k.
+    # Such a token attends one dummy entry (kv_len 1, whose index the caller
+    # pointed at position 0) and its lse is stored as -inf, so the cross-rank
+    # merge drops it: exactly what the caller used to do with a dummy slot 0,
+    # a `kv_len` of 1 and `where(owns, lse, -inf)` around the kernel.
+    #
     # Split-q mode (`split_q`): `q_hbm_ref` holds q_nope only and the rope
     # part arrives as a separate input `q_pe_hbm_ref` (first of `refs`), with
     # its own VMEM double buffer (last scratch ref). The two are joined and
@@ -453,6 +480,12 @@ def _attention_kernel(
 
     batch_start_seq_idx = start_seq_idx + pl.program_id(0) * batch_size
     batch_end_seq_idx = batch_start_seq_idx + batch_size - 1
+
+    def kv_len_at(seq_idx):
+        kv_len = kv_lens_ref[seq_idx]
+        if owns_from_kv_lens:
+            kv_len = jnp.maximum(kv_len, 1)
+        return kv_len
 
     def attention_step1_qk_softmax(
         q,  # [num_q_heads, head_dim]
@@ -701,7 +734,7 @@ def _attention_kernel(
         return unpack_bkv(
             bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx],
             bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx],
-            lambda: kv_lens_ref[batch_start_seq_idx + batch_idx],
+            lambda: kv_len_at(batch_start_seq_idx + batch_idx),
         )
 
     def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len):
@@ -975,7 +1008,11 @@ def _attention_kernel(
             # o = sum_r softmax(lse_r) * o_r without knowing our max.
             if not return_lse:
                 return
-            store_blse(bo_sem_idx, batch_idx, m + jnp.log(l_sum))
+            lse_col = m + jnp.log(l_sum)
+            if owns_from_kv_lens:
+                owns = kv_lens_ref[batch_start_seq_idx + batch_idx] > 0
+                lse_col = jnp.where(owns, lse_col, -jnp.inf)
+            store_blse(bo_sem_idx, batch_idx, lse_col)
 
         # Wait for cur blocks if not ready yet
         wait_fetch_bq_batch(batch_start_seq_idx, bi_sem_idx)
@@ -994,7 +1031,7 @@ def _attention_kernel(
                 _send_blse_batch(batch_start_seq_idx, bo_sem_idx, wait=True)
 
         for batch_idx in range(batch_size):
-            kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+            kv_len = kv_len_at(batch_start_seq_idx + batch_idx)
             bkv = load_bkv(bi_sem_idx, batch_idx)
             bq = load_bq(bi_sem_idx, batch_idx)
 
@@ -1245,6 +1282,7 @@ def prepare_outputs(
         "topk_cap",
         "capped_window_prep",
         "lse_lane_dense",
+        "dcp_dummy_slot0",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -1284,8 +1322,19 @@ def sparse_ragged_paged_attention(
     capped_window_prep: bool = False,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    dcp_dummy_slot0: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
+
+    `dcp_dummy_slot0` (with `return_lse`; DCP rank-local top-k): a row with no
+    entry (all `-1`) means this rank owns none of the token's top-k. Such a
+    token attends one dummy entry, position 0, and its lse comes back `-inf`,
+    so the cross-rank log-sum-exp merge drops it -- bit-identical to setting
+    slot 0 to 0 in those rows before the call and `where(owns, lse, -inf)`
+    after it. Rows must be prefix-packed (they are: `streamindex_topk_dcp`).
+    On the capped window-prep path both happen inside the kernels, and
+    `topk_indices` may also be a taller table (e.g. the shared top-k buffer)
+    whose first `q.shape[0]` rows are read in place.
 
     Args:
       q: concatenated all sequences' queries.
@@ -1450,6 +1499,12 @@ def sparse_ragged_paged_attention(
 
     if topk_indices.dtype != jnp.int32 or topk_indices.ndim != 2:
         raise ValueError("topk_indices must be int32[num_tokens, topk]")
+    if dcp_dummy_slot0 and not return_lse:
+        raise ValueError("dcp_dummy_slot0 needs return_lse")
+    # The rows past q's are another table's; read only q's in place.
+    topk_table = topk_indices
+    if dcp_dummy_slot0 and topk_indices.shape[0] > q.shape[0]:
+        topk_indices = topk_indices[: q.shape[0]]
     if q.shape[0] != topk_indices.shape[0]:
         raise ValueError(
             f"q tokens ({q.shape[0]}) must match topk_indices tokens "
@@ -1481,8 +1536,18 @@ def sparse_ragged_paged_attention(
         and not (packed_gather and uniform_chunk <= packed_chunk_tokens)
     )
     window_indices_all = None
+    owns = None
+    if dcp_dummy_slot0 and not window_prep:
+        # Outside the capped prep, the dummy goes in as data, as it used to.
+        owns = jnp.any(topk_indices >= 0, axis=-1)
+        topk_indices = topk_indices.at[:, 0].set(
+            jnp.where(owns, topk_indices[:, 0], jnp.int32(0))
+        )
     if window_prep:
         kv_lens = jnp.sum(topk_indices != -1, axis=-1)
+        if dcp_dummy_slot0:
+            # Raw counts: 0 marks "owns nothing" for the kernel.
+            owns = kv_lens > 0
         physical_indices = None
         _, prep_batch = _chunk_kernel_batch_size(
             uniform_chunk,
@@ -1499,7 +1564,7 @@ def sparse_ragged_paged_attention(
             num_windows=topk // topk_cap,
         )
         window_indices_all = prepare_capped_window_indices(
-            topk_indices,
+            topk_table if dcp_dummy_slot0 else topk_indices,
             page_indices,
             cu_q_lens,
             live_windows,
@@ -1507,6 +1572,8 @@ def sparse_ragged_paged_attention(
             topk_cap=topk_cap,
             page_size=page_size,
             total_num_pages=cache_kv_nope.shape[0],
+            num_tokens=q.shape[0],
+            dummy_slot0=dcp_dummy_slot0,
         )
     else:
         kv_lens, physical_indices = prepare_gather_indices(
@@ -1531,6 +1598,15 @@ def sparse_ragged_paged_attention(
         if return_lse
         else None
     )
+    owns_in_kernel = dcp_dummy_slot0 and window_prep
+    if owns_in_kernel:
+        # Rows the grid never reaches keep their initial value; give a row
+        # that owns nothing the -inf the merge mask would have given it.
+        lse = jnp.where(
+            owns.reshape((-1,) + (1,) * (lse.ndim - 1)),
+            lse,
+            jnp.float32(-jnp.inf),
+        )
 
     packed_chunks = [None] * num_chunks
     if packed_gather and sparsecore_layout and not window_prep:
@@ -1604,6 +1680,7 @@ def sparse_ragged_paged_attention(
             topk=topk,
             q_pe=q_pe,
             lse_lane_dense=lse_lane_dense,
+            owns_from_kv_lens=owns_in_kernel,
         )
         if return_lse:
             q, lse = result
@@ -1614,8 +1691,12 @@ def sparse_ragged_paged_attention(
     out = prepare_outputs(q, actual_num_q_heads, actual_head_dim)
     if return_lse:
         if lse_lane_dense:
-            return out, lse[:, :actual_num_q_heads]
-        return out, lse[:, :actual_num_q_heads, 0]
+            lse = lse[:, :actual_num_q_heads]
+        else:
+            lse = lse[:, :actual_num_q_heads, 0]
+        if dcp_dummy_slot0 and not owns_in_kernel:
+            lse = jnp.where(owns[:, None], lse, -jnp.inf)
+        return out, lse
     return out
 
 
@@ -1708,8 +1789,12 @@ def sparse_attention_chunk(
     topk: int | None = None,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    owns_from_kv_lens: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
+
+    `owns_from_kv_lens` (capped path, DCP): `kv_lens` are raw live counts, a
+    0 meaning this rank owns none of the token's top-k; see `_attention_kernel`.
 
     The output aliases `q`. Returns the updated `q`, or `(q, lse)` when `lse`
     is given. The attention grid is rounded up to its kernel batch size, so
@@ -1741,6 +1826,8 @@ def sparse_attention_chunk(
         topk = physical_indices.shape[-1]
     if window_indices is not None and topk_cap is None:
         raise ValueError("window_indices requires topk_cap")
+    if owns_from_kv_lens and window_indices is None:
+        raise ValueError("owns_from_kv_lens requires the capped window prep")
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
     if packed is not None and not sparsecore_layout:
         raise ValueError("packed gather requires the sparsecore cache layout")
@@ -1883,6 +1970,7 @@ def sparse_attention_chunk(
             capped_windows=capped_windows,
             split_q=split_q,
             lse_lane_dense=lse_lane_dense,
+            owns_from_kv_lens=owns_from_kv_lens,
         )
         if packed is not None:
             # Fourth scalar prefetch: per-token atom offset into the stream.

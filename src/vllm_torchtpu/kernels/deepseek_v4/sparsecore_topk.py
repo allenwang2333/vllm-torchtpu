@@ -86,7 +86,16 @@ def _topk_body(
     write_empty: bool,
     pay_w: int = 0,
     row_stride: int = 1,
+    exact_rows: bool = False,
 ):
+    # ``exact_rows``: ``scores_hbm``, ``payload_hbm``, ``out_hbm`` and
+    # ``keys_hbm`` hold exactly ``b`` rows instead of ``padded_b``. Inactive
+    # subcores (rows past ``b``) re-read row ``b - 1`` instead of a padding
+    # row, and every subcore writes its row out with its own DMA, skipped for
+    # the inactive ones, instead of through the pipeline's per-wave output
+    # blocks -- so neither a pad copy in front of the kernel nor a ``[:b]``
+    # slice copy behind it is needed. The rows written are the same.
+    #
     # ``row_stride > 1``: ``scores_hbm`` holds ``b`` rows of ``row_stride *
     # slice_len`` words and each subcore DMAs only the first ``slice_len`` of
     # its row, in place -- the first of ``row_stride`` equal slices. Rows past
@@ -169,6 +178,9 @@ def _topk_body(
         )  # pytype: disable=bad-argument-type
 
     def pipeline_step(*refs):
+        if exact_rows:
+            # No pipeline output blocks: the row is DMA'd out at the end.
+            refs = refs + (None, None)
         if pay_w:
             scores_vmem, len_slice_vmem, pay_vmem, out_vmem, keys_vmem = refs
             pay_off = vec_at(len_slice_vmem, LANES)
@@ -340,6 +352,19 @@ def _topk_body(
             carry=(jnp.int32(0), jnp.int32(0)),
         )(emit_ranked)
 
+        if exact_rows:
+
+            @pl.when(active)
+            def _():
+                pltpu.sync_copy(
+                    rowbuf_vmem.at[pl.ds(0, k)], out_hbm.at[pl.ds(row * k, k)]
+                )
+                pltpu.sync_copy(
+                    keybuf_vmem.at[pl.ds(0, k)], keys_hbm.at[pl.ds(row * k, k)]
+                )
+
+            return
+
         def copy_out(i):
             out_vmem[pl.ds(i * LANES, LANES)] = rowbuf_vmem[pl.ds(i * LANES, LANES)]
             keys_vmem[pl.ds(i * LANES, LANES)] = keybuf_vmem[pl.ds(i * LANES, LANES)]
@@ -356,8 +381,17 @@ def _topk_body(
             pipeline_mode=pl.Buffered(buf_count),
         )
 
+    def clamped_row_spec(width):
+        # Rows past `b` exist only when the arrays are padded; with exact rows
+        # the inactive subcores re-read the last real row instead.
+        return pl.BlockSpec(
+            (width,),
+            lambda w: (jnp.minimum(w * cores_per_chip + flat, b - 1),),
+            pipeline_mode=pl.Buffered(buf_count),
+        )
+
     if row_stride == 1:
-        scores_spec = row_spec(slice_len)
+        scores_spec = (clamped_row_spec if exact_rows else row_spec)(slice_len)
     else:
         scores_spec = pl.BlockSpec(
             (slice_len,),
@@ -367,8 +401,16 @@ def _topk_body(
     in_specs = (scores_spec, row_spec(2 * LANES if pay_w else LANES))
     ins = (scores_hbm, lengths_hbm)
     if pay_w:
-        in_specs += (row_spec(pay_w),)
+        in_specs += ((clamped_row_spec if exact_rows else row_spec)(pay_w),)
         ins += (payload_hbm,)
+    if exact_rows:
+        pltpu.emit_pipeline(
+            pipeline_step,
+            grid=(num_waves,),
+            in_specs=in_specs,
+            out_specs=(),
+        )(*ins)
+        return
     out_specs = (row_spec(k), row_spec(k))
     pltpu.emit_pipeline(
         pipeline_step,
@@ -388,6 +430,7 @@ def _topk_kernel(
     write_empty: bool,
     pay_w: int = 0,
     row_stride: int = 1,
+    exact_rows: bool = False,
 ):
     """Indices (or payload values) plus each winner's score."""
     if pay_w:
@@ -408,6 +451,7 @@ def _topk_kernel(
         write_empty=write_empty,
         pay_w=pay_w,
         row_stride=row_stride,
+        exact_rows=exact_rows,
     )
 
 
@@ -437,8 +481,13 @@ def _sc_topk_direct(
     payload: jax.Array | None = None,  # i32[b, pay_w]
     payload_offset: jax.Array | None = None,  # i32[b], LANES-aligned
     row_stride: int = 1,
+    exact_rows: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Single-stage lock-free SparseCore top-k on 32 subcores.
+
+    With ``exact_rows`` the kernel reads ``scores`` / ``payload`` and writes
+    its outputs at exactly ``b`` rows: no pad to a multiple of 32 rows in front
+    of it and no ``[:b]`` slice behind it (see `_topk_body`). Same arrays.
 
     With ``row_stride > 1`` each row is read only over its first
     ``n // row_stride`` columns, in place (no slice copy), and indices are
@@ -473,7 +522,9 @@ def _sc_topk_direct(
     padded_b = num_waves * 32
     pad_b = padded_b - b
     pad_n = slice_len - n
-    if row_stride == 1 and (pad_b > 0 or pad_n > 0):
+    # Exact rows only matter when there are padding rows to drop.
+    exact_rows = exact_rows and pad_b > 0 and pad_n == 0
+    if row_stride == 1 and not exact_rows and (pad_b > 0 or pad_n > 0):
         words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
 
     lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
@@ -489,7 +540,11 @@ def _sc_topk_direct(
         offs = jnp.pad(payload_offset.astype(jnp.int32), (0, padded_b - b))
         offs_2d = jnp.pad(offs[:, None], ((0, 0), (0, LANES - 1)))
         lengths_2d = jnp.concatenate([lengths_2d, offs_2d], axis=1)
-        extra_inputs = (jnp.pad(payload, ((0, pad_b), (0, 0))).reshape(-1),)
+        extra_inputs = (
+            payload.reshape(-1)
+            if exact_rows
+            else jnp.pad(payload, ((0, pad_b), (0, 0))).reshape(-1),
+        )
 
     mesh = plsc.VectorSubcoreMesh(
         num_cores=sc.num_cores,
@@ -497,7 +552,8 @@ def _sc_topk_direct(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    slot_type = jax.ShapeDtypeStruct((padded_b * k,), jnp.int32)
+    out_rows = b if exact_rows else padded_b
+    slot_type = jax.ShapeDtypeStruct((out_rows * k,), jnp.int32)
     out_type = (slot_type, slot_type)
 
     scratch_types = (
@@ -517,6 +573,7 @@ def _sc_topk_direct(
             write_empty=write_empty,
             pay_w=pay_w,
             row_stride=row_stride,
+            exact_rows=exact_rows,
         ),
         out_type=out_type,
         compiler_params=pltpu.CompilerParams(
@@ -527,6 +584,7 @@ def _sc_topk_direct(
         name=(
             f"sc_topk_direct{'_pay' if pay_w else ''}_b{b}_n{n}_k{k}"
             + (f"_s{row_stride}" if row_stride > 1 else "")
+            + ("_x" if exact_rows else "")
         ),
     )(words.reshape(-1), lengths_2d.reshape(-1), *extra_inputs)
     if scheduling_group_id is not None:
@@ -534,6 +592,8 @@ def _sc_topk_direct(
             out, _scheduling_group_id=scheduling_group_id
         )
     slots, keys = out
+    if exact_rows:
+        return slots.reshape(b, k), keys.reshape(b, k)
     slots_2d = slots.reshape(padded_b, k)[:b]
     keys_2d = keys.reshape(padded_b, k)[:b]
     return slots_2d, keys_2d
@@ -625,6 +685,7 @@ def _gather_payload(
         "fused_payload",
         "single_slice",
         "partition",
+        "exact_rows",
     ),
 )
 def sparsecore_topk(
@@ -641,6 +702,7 @@ def sparsecore_topk(
     fused_payload: bool = False,
     single_slice: bool = False,
     partition: int | None = None,
+    exact_rows: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
 
@@ -681,6 +743,10 @@ def sparsecore_topk(
     slice is a single call with no stage-2 merge, trading subcore utilisation
     for one SparseCore launch fewer. With ``single_slice`` it also sets the
     in-place read window to ``n // P``. The returned arrays do not change.
+
+    ``exact_rows`` has every SparseCore call read and write exactly its real
+    rows (no pad to a multiple of 32 rows, no ``[:b]`` slice copy). The
+    returned arrays do not change.
     """
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
@@ -708,6 +774,8 @@ def sparsecore_topk(
         payload_offset = payload_offset.astype(jnp.int32)
 
     p = _pick_partition(b, n, k, partition)
+    # Only passed when set, so the flag-off calls are exactly the old ones.
+    exact_kw = {"exact_rows": True} if exact_rows else {}
 
     # Fast-path: single-stage execution when p == 1
     if p == 1:
@@ -717,6 +785,7 @@ def sparsecore_topk(
             k,
             row_lengths,
             write_empty=write_empty_rows,
+            **exact_kw,
             scheduling_group_id=scheduling_group_id,
             **(dict(payload=payload, payload_offset=payload_offset) if fuse else {}),
         )
@@ -752,6 +821,7 @@ def sparsecore_topk(
             k_p,
             lengths_p,
             write_empty=True,
+            **exact_kw,
             scheduling_group_id=sg1,
             **(
                 dict(
@@ -790,6 +860,7 @@ def sparsecore_topk(
                     k,
                     row_lengths=cand_lengths,
                     write_empty_rows=write_empty_rows,
+                    exact_rows=exact_rows,
                     scheduling_group_id=sg2,
                     return_scores=True,
                     payload=global_cand_indices,
@@ -801,6 +872,7 @@ def sparsecore_topk(
                     k,
                     row_lengths=cand_lengths,
                     write_empty_rows=write_empty_rows,
+                    exact_rows=exact_rows,
                     scheduling_group_id=sg2,
                     return_scores=True,
                 )
@@ -812,6 +884,7 @@ def sparsecore_topk(
                 k,
                 cand_lengths,
                 write_empty=write_empty_rows,
+                **exact_kw,
                 scheduling_group_id=sg2,
                 **(dict(payload=global_cand_indices) if fuse2 else {}),
             )
@@ -837,6 +910,7 @@ def sparsecore_topk(
             k,
             row_lengths,
             write_empty=write_empty_rows,
+            **exact_kw,
             scheduling_group_id=scheduling_group_id,
             row_stride=p,
             **(dict(payload=payload, payload_offset=payload_offset) if fuse_s else {}),

@@ -74,3 +74,29 @@ def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
     if axis_name is None:
         axis_name = DCP_AXIS_NAME
     return get_or_create_cp_mesh(axis_name=axis_name, group=get_dcp_group())
+
+
+# This rank's DCP mesh position as an int32 [1] device tensor; see
+# `dcp_rank_operand`.
+_DCP_RANK_OPERAND: Any = None
+
+
+def dcp_rank_operand() -> Any:
+    """This rank's position on the DCP mesh, as an int32 [1] TPU tensor.
+
+    Passed to a DCP op with partition spec `P(DCP_AXIS_NAME)`, the per-rank
+    tensors form `arange(dcp_size)` sharded over the axis, so inside the op's
+    `shard_map` each rank reads its own index for free instead of deriving it
+    with an `all_to_all` (`cp_rank_as_data`). The mesh is built by walking the
+    group's ranks in order (`get_or_create_cp_mesh`), so the position is
+    `rank_in_group`. Built once, outside any traced region -- a tensor made
+    inside a compiled forward would be a per-rank constant of the graph.
+    """
+    global _DCP_RANK_OPERAND
+    if _DCP_RANK_OPERAND is None:
+        import torch
+
+        _DCP_RANK_OPERAND = torch.tensor(
+            [get_dcp_rank()], dtype=torch.int32, device="tpu"
+        )
+    return _DCP_RANK_OPERAND
