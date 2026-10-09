@@ -32,7 +32,7 @@ run_or_print() {
     out=$("$@" 2>&1 | tee /dev/stderr)
     local job_id
     job_id=$(echo "${out}" | grep -oE 'j-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}' | tail -n 1)
-    if [[ -n "${job_id}" && "${KUEUE_BUMP_PRIORITY:-1}" == "1" ]]; then
+    if [[ -n "${job_id}" && "${KUEUE_BUMP_PRIORITY:-0}" == "1" ]]; then
       bump_kueue_priority "${job_id}"
     fi
   else
