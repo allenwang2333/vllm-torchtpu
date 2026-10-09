@@ -21,7 +21,7 @@ DEFAULT_SEQUENCE_LAYOUT_PROTOCOL = "default"
 PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL = "pcp_streaming"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SequenceLayoutDescriptor:
     kind: SequenceLayoutKind = SequenceLayoutKind.ALL
     protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
@@ -45,7 +45,7 @@ def is_pcp_streaming_sequence_layout_descriptor(
     )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SequenceLayoutPlan:
     descriptor: SequenceLayoutDescriptor
     token_slice: slice

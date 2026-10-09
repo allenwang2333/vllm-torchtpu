@@ -316,3 +316,8 @@ def test_biased_rowmax_topk_matches_sort_and_gather(renormalize):
         ref_w = ref_w / torch.clamp(ref_w.sum(dim=-1, keepdim=True), min=1e-20)
     assert torch.equal(got_i, ref_i.to(torch.int32))
     assert torch.equal(got_w, ref_w)
+
+    scores_3d = scores.view(4, 16, 384)
+    got_w3, got_i3 = rowmax_topk(scores_3d, 6, bias=bias, renormalize=renormalize)
+    assert torch.equal(got_i3, got_i.view(4, 16, 6))
+    assert torch.equal(got_w3, got_w.view(4, 16, 6))

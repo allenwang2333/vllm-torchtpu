@@ -59,7 +59,7 @@ class PcpSequenceLayoutMode(Enum):
     STREAMING = "STREAMING"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PcpRequestSpan:
     computed_tokens: int
     scheduled_tokens: int
@@ -75,7 +75,7 @@ class PcpRequestSpan:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PcpSequenceLayoutDecision:
     mode: PcpSequenceLayoutMode
     spans: tuple[PcpRequestSpan, ...]
@@ -289,9 +289,16 @@ class PcpSequenceLayoutEligibility:
                 f"cp_kv_cache_interleave_size={self.interleave_size}."
             )
 
-        q_lens = np.asarray([span.scheduled_tokens for span in spans], dtype=np.int32)
-        absolute_query_starts = np.asarray(
-            [span.absolute_query_start for span in spans], dtype=np.int64
+        num_spans = len(spans)
+        q_lens = np.fromiter(
+            (span.scheduled_tokens for span in spans),
+            dtype=np.int32,
+            count=num_spans,
+        )
+        absolute_query_starts = np.fromiter(
+            (span.absolute_query_start for span in spans),
+            dtype=np.int64,
+            count=num_spans,
         )
         # Assign the current batch's request-major query rows as one flat token
         # stream. This is exactly query_start_loc[:-1]: ownership is local to
@@ -342,7 +349,7 @@ class PcpSequenceLayoutEligibility:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PcpPreparedBatch:
     local_token_slice: slice
     padded_total_num_scheduled_tokens: int

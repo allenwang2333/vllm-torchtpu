@@ -33,6 +33,8 @@ Usage in MXFP4 MoE pipeline:
 5. Use in GMM kernel with rhs_scale
 """
 
+import functools
+
 import jax.numpy as jnp
 import torch
 
@@ -52,7 +54,31 @@ E8M0_MAX_EXP = 127
 # Same value as jnp.finfo(jnp.float8_e4m3fn).max (448.0).
 FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 
+# FP4 e2m1 lookup table mapping 4-bit index (0-15) to float32 value.
+_FP4_VALUES_CPU = torch.tensor(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ],
+    dtype=torch.float32,
+)
 
+
+@functools.cache
 def dtype_max(dtype: jnp.dtype) -> float:
     info = jnp.iinfo(dtype) if jnp.issubdtype(dtype, jnp.integer) else jnp.finfo(dtype)
     return float(info.max)
@@ -141,36 +167,15 @@ def unpack_uint8_to_fp4(packed: torch.Tensor) -> torch.Tensor:
         float32 tensor of shape [..., N] with unpacked FP4 values.
     """
     # FP4 e2m1 lookup table mapping 4-bit index to float value
-    FP4_LUT = torch.tensor(
-        [
-            0.0,
-            0.5,
-            1.0,
-            1.5,
-            2.0,
-            3.0,
-            4.0,
-            6.0,
-            -0.0,
-            -0.5,
-            -1.0,
-            -1.5,
-            -2.0,
-            -3.0,
-            -4.0,
-            -6.0,
-        ],
-        dtype=torch.float32,
-        device=packed.device,
-    )
+    fp4_lut = _FP4_VALUES_CPU.to(packed.device)
 
     # Extract low and high nibbles
     low_nibble = (packed & 0x0F).to(torch.int64)
     high_nibble = ((packed >> 4) & 0x0F).to(torch.int64)
 
     # Convert to float using LUT
-    low_fp32 = FP4_LUT[low_nibble]
-    high_fp32 = FP4_LUT[high_nibble]
+    low_fp32 = fp4_lut[low_nibble]
+    high_fp32 = fp4_lut[high_nibble]
 
     # Interleave: [low0, high0, low1, high1, ...]
     result = torch.stack([low_fp32, high_fp32], dim=-1)
@@ -365,28 +370,7 @@ def quantize_tensor_to_fp4(
         axis = [axis]
 
     # FP4 e2m1 representable values
-    FP4_VALUES = torch.tensor(
-        [
-            0.0,
-            0.5,
-            1.0,
-            1.5,
-            2.0,
-            3.0,
-            4.0,
-            6.0,
-            -0.0,
-            -0.5,
-            -1.0,
-            -1.5,
-            -2.0,
-            -3.0,
-            -4.0,
-            -6.0,
-        ],
-        dtype=torch.float32,
-        device=tensor.device,
-    )
+    fp4_values = _FP4_VALUES_CPU.to(tensor.device)
     FP4_MAX = 6.0  # Maximum representable magnitude
     FP4_MIN = -6.0
 
@@ -426,7 +410,7 @@ def quantize_tensor_to_fp4(
 
     # Find nearest FP4 value (quantize by finding closest in LUT)
     tensor_for_compare = tensor_clipped.unsqueeze(-1)
-    fp4_for_compare = FP4_VALUES.view([1] * tensor_clipped.ndim + [16])
+    fp4_for_compare = fp4_values.view([1] * tensor_clipped.ndim + [16])
 
     distances = (tensor_for_compare - fp4_for_compare).abs()
     indices = distances.argmin(dim=-1).to(torch.int8)
@@ -475,27 +459,5 @@ def fp4_indices_to_float(indices: torch.Tensor) -> torch.Tensor:
     Returns:
         float32 tensor with FP4 values.
     """
-    FP4_VALUES = torch.tensor(
-        [
-            0.0,
-            0.5,
-            1.0,
-            1.5,
-            2.0,
-            3.0,
-            4.0,
-            6.0,
-            -0.0,
-            -0.5,
-            -1.0,
-            -1.5,
-            -2.0,
-            -3.0,
-            -4.0,
-            -6.0,
-        ],
-        dtype=torch.float32,
-        device=indices.device,
-    )
-
-    return FP4_VALUES[indices.to(torch.int64)]
+    fp4_values = _FP4_VALUES_CPU.to(indices.device)
+    return fp4_values[indices.to(torch.int64)]
