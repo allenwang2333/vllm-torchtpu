@@ -213,7 +213,9 @@ def fp8_skinny_matmul_stacked(x, w_stack, idx, w_s, *, n_logical=None, config=No
     n_stack, _, n = w_stack.shape
     split, t, nbuf = config or pick_config(k, n)
     call = _build(m, k, n, n_stack, w_stack.dtype, x.dtype, split, t, nbuf)
-    if envs.TPU_FP8_SKINNY_PIN_HBM:
+    # The constraint only exists at trace time (it annotates the pallas_call operand);
+    # an eager call has no XLA program to constrain and the primitive refuses to run.
+    if envs.TPU_FP8_SKINNY_PIN_HBM and isinstance(w_stack, jax.core.Tracer):
         w_stack = pltpu.with_memory_space_constraint(w_stack, pltpu.HBM)
     out = call(idx, x, w_s.reshape(1, n).astype(jnp.float32), w_stack)
     if n_logical is not None and n_logical != n:
