@@ -115,13 +115,18 @@ def gather_sharded_weight(
 
     num_org = si.org_vocab_end_index - si.org_vocab_start_index
     full = torch.zeros(org_vocab, dim, dtype=torch.float32)
-    my_rows = weight.data[:num_org].to(torch.float32).cpu()
+    my_slice = weight.data[:num_org]
+    if my_slice.dtype != torch.float32:
+        my_slice = my_slice.to(torch.float32)
+    my_rows = my_slice if my_slice.device.type == "cpu" else my_slice.cpu()
     full[si.org_vocab_start_index : si.org_vocab_end_index] = my_rows
     dist.all_reduce(full, group=tp_group)
 
     draft_dtype = weight.dtype
     draft_device = weight.device
-    full_dev = full.to(draft_dtype).to(draft_device)
+    full_dev = full if full.dtype == draft_dtype else full.to(draft_dtype)
+    if full_dev.device != draft_device:
+        full_dev = full_dev.to(draft_device)
     return full_dev, org_vocab, dim, draft_device
 
 

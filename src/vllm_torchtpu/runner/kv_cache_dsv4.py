@@ -313,7 +313,7 @@ class DsV4KVCacheAllocator:
         def _create_cache(
             shape: tuple[int, ...], tag: str, dtype: torch.dtype = torch.uint8
         ) -> torch.Tensor:
-            cache = torch.zeros(shape, dtype=dtype).to(self.runner.device)
+            cache = torch.zeros(shape, dtype=dtype, device=self.runner.device)
             logger.debug(
                 "DeepSeek-V4 KV array for %s: shape=%s dtype=%s", tag, shape, dtype
             )
