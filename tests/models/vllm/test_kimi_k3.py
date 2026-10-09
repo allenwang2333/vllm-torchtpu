@@ -834,6 +834,7 @@ def test_kda_forward_dispatches_to_both_custom_ops(monkeypatch) -> None:
     layer.v_conv1d = _ConvWeight()
     # The ops take the fused conv weight, built once at load time.
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
+    _derive_kda_split_sizes(layer)
     KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
@@ -890,6 +891,7 @@ def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(monkeypatch) -> 
     layer.k_conv1d = _ConvWeight()
     layer.v_conv1d = _ConvWeight()
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
+    _derive_kda_split_sizes(layer)
     KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
@@ -935,6 +937,17 @@ def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(monkeypatch) -> 
     torch.testing.assert_close(
         output,
         torch.tensor([[0, 1, 2, 3], [14, 15, 16, 17]], dtype=torch.float32),
+    )
+
+
+def _derive_kda_split_sizes(layer) -> None:
+    """Mirror the sizes `KimiDeltaAttention.__init__` precomputes from the
+    head geometry, for layers built with `__new__` in these tests."""
+    layer._qkvb_split_sizes = [3 * layer.local_projection_size, layer.num_heads]
+    layer._fa_ga_split_sizes = [layer.head_dim, layer.head_dim]
+    layer._state_shape = (
+        (layer.conv_size - 1, 1, 3 * layer.local_projection_size),
+        (layer.num_heads, layer.head_dim, layer.head_dim),
     )
 
 
@@ -1189,6 +1202,7 @@ def _make_bare_kda_layer(use_full_rank_gate: bool = False):
     layer.fused_qkvb_proj = _Projection(14)
     layer.local_projection_size = 4
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
+    _derive_kda_split_sizes(layer)
     layer.f_b_proj = _Projection(4)
     layer.o_proj = _IdentityProjection()
     layer.q_conv1d = _ConvWeight()
@@ -1442,6 +1456,7 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     layer.v_conv1d = _ConvWeight()
     # The ops take the fused conv weight, built once at load time.
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
+    _derive_kda_split_sizes(layer)
     KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
@@ -1485,6 +1500,7 @@ def test_kda_state_shapes_use_the_fused_kernel_conv_layout() -> None:
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     layer.conv_size, layer.num_heads, layer.head_dim = 4, 3, 128
     layer.local_projection_size = layer.num_heads * layer.head_dim
+    _derive_kda_split_sizes(layer)
     conv_shape, recurrent_shape = layer.get_state_shape()
     assert conv_shape == (3, 1, 1152)
     assert recurrent_shape == (3, 128, 128)

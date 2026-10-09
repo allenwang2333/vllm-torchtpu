@@ -786,7 +786,12 @@ class _FakeQProj:
 
 
 class _FakeHeadGatherGroup:
-    """Serves `all_gather(dim=1)` from a known per-rank stack."""
+    """Serves the head-major `all_gather(dim=0)` from a known per-rank stack.
+
+    `all_gather_heads` gathers `[heads, tokens, dim]` along dim 0 (a zero-copy
+    view of the collective output) and transposes back, so the fake receives
+    and returns head-major tensors.
+    """
 
     def __init__(self, per_rank, rank):
         self.world_size = len(per_rank)
@@ -794,9 +799,11 @@ class _FakeHeadGatherGroup:
         self._per_rank = per_rank
 
     def all_gather(self, tensor, dim=0):
-        assert dim == 1
-        torch.testing.assert_close(tensor, self._per_rank[self.rank_in_group])
-        return torch.cat(self._per_rank, dim=1)
+        assert dim == 0
+        torch.testing.assert_close(
+            tensor, self._per_rank[self.rank_in_group].transpose(0, 1)
+        )
+        return torch.cat([t.transpose(0, 1) for t in self._per_rank], dim=0)
 
 
 def test_qrep_local_view_matches_the_head_all_gather_order(monkeypatch):
@@ -933,9 +940,11 @@ def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):
     torch.testing.assert_close(q_pe, q_pe_rep)
 
 
-def test_mla_forward_without_qrep_still_gathers(monkeypatch):
+@pytest.mark.parametrize("fused", [False, True])
+def test_mla_forward_without_qrep_still_gathers(monkeypatch, fused):
     """The gather is only skipped when a replicated q actually arrives; the
-    unreplicated DCP path is untouched."""
+    unreplicated DCP path is untouched, fused or per-tensor."""
+    monkeypatch.setitem(vars(envs), "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", fused)
     dcp_size, local_heads, num_tokens = 2, 16, 4
     impl, layer, inputs, _ = _make_impl_and_layer()
     impl.dcp_size = dcp_size
@@ -955,6 +964,14 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
         attention_adapter,
         "all_gather_heads",
         lambda t: (gathered.append(t), t.repeat(1, dcp_size, 1))[1],
+    )
+    monkeypatch.setattr(
+        attention_adapter,
+        "all_gather_q_nope_pe_heads",
+        lambda nope, pe, _rank: (
+            gathered.extend((nope, pe)),
+            (nope.repeat(1, dcp_size, 1), pe.repeat(1, dcp_size, 1)),
+        )[1],
     )
     monkeypatch.setattr(
         attention_adapter,

@@ -57,6 +57,10 @@ def _make_ctx(**kwargs):
         "unified_mamba_state_indices": None,
         "sequence_layout_descriptor": DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
         "mamba_row_plans": {},
+        # Per-walk caches on AttentionMetadataBuilderContext.
+        "max_active_seq_len": None,
+        "active_cols_cache": {},
+        "base_attn_metadata": None,
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -179,7 +183,9 @@ def test_active_block_table_columns_mamba_group_and_power_of_2():
 
     # max_seq_len=300 -> needed_blocks = cdiv(300, 16) = 19
     # 1 << max(4, 18.bit_length()=5) = 32
-    ctx.seq_lens_cpu = (300, 100)
+    # The context memoizes the max length and bucket per walk, so a new batch
+    # gets a new context (as each chunk's walk does in the runner).
+    ctx = _make_ctx(seq_lens_cpu=(300, 100), num_reqs=2, mamba_ckpt_window=1)
     assert builder._active_block_table_columns(ctx, 64) == 32
     # target_num_blocks caps the bucket
     assert builder._active_block_table_columns(ctx, 24) == 24
@@ -442,7 +448,11 @@ def test_modify_prev_results_branches():
         copy_state=object(),
         wait_for_copy=Mock(return_value=torch.tensor([[42]])),
     )
-    runner.input_batch = SimpleNamespace(req_id_to_index={})
+    runner.input_batch = SimpleNamespace(
+        req_id_to_index={},
+        num_tokens_no_spec=np.zeros(1, dtype=np.int32),
+        token_ids_cpu=np.zeros((1, 8), dtype=np.int32),
+    )
     runner._modify_prev_results()
     assert req_state.output_token_ids == [42]
 
