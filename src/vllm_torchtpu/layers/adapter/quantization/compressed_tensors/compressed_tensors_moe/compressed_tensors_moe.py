@@ -67,7 +67,7 @@ class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
         scheme_dict = all_scheme_dicts.pop()
 
         # multiple schemes found
-        if not all([cur_dict == scheme_dict for cur_dict in all_scheme_dicts]):
+        if not all(cur_dict == scheme_dict for cur_dict in all_scheme_dicts):
             raise ValueError(
                 "All MoE projections need to have same "
                 "quantization scheme but found multiple"

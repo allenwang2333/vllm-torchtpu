@@ -74,10 +74,10 @@ def _is_int4_w4aN(weight_quant: QuantizationArgs | None) -> bool:
     is_int4_weight = (
         int(weight_quant.num_bits) == 4 and weight_quant.type == QuantizationType.INT
     )
-    is_group_or_channel_weight = weight_quant.strategy in [
+    is_group_or_channel_weight = weight_quant.strategy in (
         QuantizationStrategy.GROUP,
         QuantizationStrategy.CHANNEL,
-    ]
+    )
     is_static_weight = not weight_quant.dynamic
 
     return is_int4_weight and is_group_or_channel_weight and is_static_weight

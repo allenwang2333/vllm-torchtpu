@@ -116,7 +116,9 @@ def get_cpu_weight_loader_hook(
             ].copy_(weight_shard)
             return True
 
-        elif "w2_weight_scale" in weight_name:
+        else:
+            # "w2_weight_scale": the only main-weight name left (see
+            # is_main_weight above), so there is no further fallback.
             # Shard along dim 1
             loaded_per_rank = loaded_weight.shape[1] // tp_size
             start = loaded_per_rank * tp_rank
@@ -124,19 +126,6 @@ def get_cpu_weight_loader_hook(
 
             cpu_scratch.data[expert_id].copy_(weight_shard)
             return True
-
-        # Fallback to default loader (e.g., for helper tensors)
-        if orig_loader is not None:
-            return orig_loader(
-                cpu_scratch,
-                loaded_weight,
-                weight_name,
-                shard_id,
-                expert_id,
-                *args,
-                **kwargs,
-            )
-        return False
 
     return _cpu_weight_loader_hook
 
@@ -161,11 +150,8 @@ def quantize_to_fp4_e2m1_nibbles(tensor_scaled: torch.Tensor) -> torch.Tensor:
         device=tensor_scaled.device,
     )
     mag = torch.bucketize(abs_x, thresholds).to(torch.uint8)
-    sign = torch.where(
-        tensor_scaled < 0,
-        torch.tensor(8, dtype=torch.uint8, device=tensor_scaled.device),
-        torch.tensor(0, dtype=torch.uint8, device=tensor_scaled.device),
-    )
+    # Sign bit 3 straight from the mask: no per-call 0-d constant tensors.
+    sign = (tensor_scaled < 0).to(torch.uint8) << 3
     return mag | sign
 
 
@@ -213,9 +199,7 @@ def requantize_int4_weights(
     abs_max = real_max_per_in_block.amax(dim=-1, keepdim=True)
 
     new_scale = abs_max / 7.0
-    safe_scale_inv = torch.where(
-        new_scale == 0, torch.zeros_like(new_scale), 1.0 / new_scale
-    )
+    safe_scale_inv = torch.where(new_scale == 0, 0.0, 1.0 / new_scale)
 
     # 3. Multiplier per in_block and requantize
     mult = (scale_f_blocked * safe_scale_inv).unsqueeze(-1)
@@ -290,9 +274,7 @@ def requantize_int4_to_fp4_weights(
     # 3. Compute FP4 Scale per block (max magnitude / 6.0)
     abs_max = w_float.abs().amax(dim=-1, keepdim=True)
     fp4_scale = abs_max / 6.0
-    safe_scale_inv = torch.where(
-        fp4_scale == 0, torch.zeros_like(fp4_scale), 1.0 / fp4_scale
-    )
+    safe_scale_inv = torch.where(fp4_scale == 0, 0.0, 1.0 / fp4_scale)
 
     # 4. Quantize to FP4 E2M1 nibbles (0..15)
     w_scaled = w_float * safe_scale_inv
