@@ -200,7 +200,6 @@ def _attention_csa(
         return jnp.zeros(q.shape, dtype=q.dtype), sw_cache
 
     swa_page_indices = swa_page_indices.flatten()
-    main_page_indices = main_page_indices.flatten()
 
     swa_output, updated_sw_cache, swa_l, swa_m = _run_swa(
         q=q,

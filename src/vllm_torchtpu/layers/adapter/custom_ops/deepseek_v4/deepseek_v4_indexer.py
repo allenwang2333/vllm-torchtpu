@@ -90,7 +90,8 @@ def _indexer_jax(
         )
 
         # Fold the query quantization scales into the weights.
-        weights = indexer_weights * softmax_scale * (n_head**-0.5) * q_scales
+        combined_scale = softmax_scale * (n_head**-0.5)
+        weights = indexer_weights * combined_scale * q_scales
 
         return streamindex_topk(
             q=q_quant,
@@ -150,6 +151,11 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             dsv4_attention.DeepseekV4IndexerCache = orig_cache
         object.__setattr__(self, "indexer_op", self._build_indexer_op())
         object.__setattr__(self.compressor, "k_cache", self.k_cache)
+        object.__setattr__(
+            self,
+            "_prefix_key",
+            getattr(getattr(self, "k_cache", None), "prefix", None),
+        )
 
     def _build_indexer_op(self):
         vllm_context = get_vllm_model_wrapper_context()
@@ -235,7 +241,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             get_forward_context().attn_metadata,
         )
         if isinstance(attn_ctx, dict):
-            prefix_key = getattr(getattr(self, "k_cache", None), "prefix", None)
+            prefix_key = self._prefix_key
             if prefix_key not in attn_ctx:
                 raise KeyError(
                     f"DeepSeek-V4 indexer prefix {prefix_key!r} has no "
