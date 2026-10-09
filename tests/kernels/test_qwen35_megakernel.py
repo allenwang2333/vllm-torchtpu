@@ -509,9 +509,9 @@ def test_amask_default_and_nan_kv_padding_guard():
         for s in range(len(starts)):
             blk_id = int(ckpt[g_sub, s, 0])
             if blk_id > 0:
-                p0 = blk_id * 5
-                clean_u8[p0 : p0 + 5] = 0x00
-                nan_u8[p0 : p0 + 5] = 0x00
+                p0 = blk_id * c.gdn_pages
+                clean_u8[p0 : p0 + c.gdn_pages] = 0x00
+                nan_u8[p0 : p0 + c.gdn_pages] = 0x00
 
     raw_clean = [
         jax.lax.bitcast_convert_type(jnp.asarray(clean_u8), K.FP8)
@@ -548,5 +548,200 @@ def test_amask_default_and_nan_kv_padding_guard():
     )
     assert float(jnp.max(diff_am1)) == 0.0
     assert int(jnp.isnan(out_am4[: c.B]).sum()) > 0
+
+
+def test_tp16_config_packing_and_gdn_pool_geometry():
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import Mesh
+
+    c16_ep = dataclasses.replace(K.FULL_EP, R=16, paged_kv=True, fused_pool_io=True)
+    c16_tp = dataclasses.replace(K.FULL, R=16, paged_kv=True, fused_pool_io=True)
+    c16_ep.check()
+    c16_tp.check()
+
+    assert c16_ep.nh == 2
+    assert c16_ep.kh == 1
+    assert c16_ep.vh == 4
+    assert c16_ep.QKV == 768
+    assert c16_ep.Z == 512
+    assert c16_ep.G == 8
+    assert c16_ep.ER == 32
+    assert c16_ep.IS_SLICE == 64
+    assert c16_ep.ISR == 128
+    assert c16_ep.IR == 1024
+    assert c16_tp.I_SLICE == 64
+    assert c16_tp.IR == 128
+    assert c16_ep.rec_pages == 2
+    assert c16_ep.gdn_pages == 3
+
+    # Verify default_tiles and build() across decode and verify buckets at R=16
+    for t_tok, b_rows in ((1, 8), (1, 16), (1, 32), (4, 16), (4, 32), (4, 64)):
+        cfg_b = dataclasses.replace(c16_ep, B=b_rows, T=t_tok, L=4)
+        tiles_b = K.default_tiles(cfg_b)
+        if b_rows <= 32:
+            assert tiles_b.hier == 3
+        else:
+            assert tiles_b.hier == 0 and tiles_b.rsag is True
+        _, info = K.build(cfg_b, tiles_b)
+        assert info["vmem_scratch_bytes"] <= tiles_b.vmem_mib * 1024 * 1024
+
+    # Verify 64 -> 128 zero-padded shared expert and TP routed expert packing at R=16
+    c_tiny16_ep = dataclasses.replace(
+        K.TINY_EP,
+        R=16,
+        NH=16,
+        KH=16,
+        VH=32,
+        E=128,
+        I=1024,
+        IS=1024,
+        stack_e=False,
+        e_slots=8,
+        paged_kv=True,
+    )
+    c_tiny16_ep.check()
+    assert c_tiny16_ep.IS_SLICE == 64 and c_tiny16_ep.ISR == 128
+
+    backbone = _make_tiny_backbone(c_tiny16_ep, e_slots=8)
+    mlp0 = backbone.layers[0].mlp
+    torch.manual_seed(0)
+    x_test = torch.randn((4, c_tiny16_ep.H), dtype=torch.float32) * 0.01
+
+    # Full unsharded shared expert output vs sum over 16 zero-padded 128-lane ranks
+    w_gu_full = mlp0._fused_gate_gu_fp8_weight[:, c_tiny16_ep.E :].float()
+    s_gu_full = mlp0._fused_gate_gu_fp8_scale.reshape(-1)[c_tiny16_ep.E :].float()
+    w_down_full = mlp0.shared_expert.down_proj.weight.float()
+    s_down_full = mlp0.shared_expert.down_proj.weight_scale.reshape(-1).float()
+    g_full = (x_test @ w_gu_full[:, : c_tiny16_ep.IS]) * s_gu_full[: c_tiny16_ep.IS]
+    u_full = (x_test @ w_gu_full[:, c_tiny16_ep.IS :]) * s_gu_full[c_tiny16_ep.IS :]
+    sh_ref = (torch.nn.functional.silu(g_full) * u_full) @ w_down_full * s_down_full
+
+    sh_sum = torch.zeros_like(sh_ref)
+    sh_unpadded_sum = torch.zeros_like(sh_ref)
+    for r in range(16):
+        pk_r = pack_router_and_shared_layer(
+            mlp0,
+            c=c_tiny16_ep,
+            tp_rank=r,
+            tk_router=c_tiny16_ep.H,
+            tk_sh13=c_tiny16_ep.H,
+            tk_sh2=c_tiny16_ep.ISR,
+        )
+        w13_r = pk_r["sh13"].reshape(c_tiny16_ep.H, 2 * c_tiny16_ep.ISR).float()
+        s13_r = pk_r["sh13_s"].float()
+        w2_r = pk_r["sh2"].reshape(c_tiny16_ep.ISR, c_tiny16_ep.H).float()
+        s2_r = pk_r["sh2_s"].float()
+        # Upper 64 lanes of each 128-lane half must be strictly zero
+        assert torch.all(w13_r[:, 64:128] == 0)
+        assert torch.all(w13_r[:, 192:256] == 0)
+        assert torch.all(w2_r[64:128, :] == 0)
+        h_r = (x_test @ w13_r) * s13_r
+        mid_r = torch.nn.functional.silu(h_r[:, :128]) * h_r[:, 128:]
+        out_r_padded = (mid_r @ w2_r) * s2_r
+        out_r_unpadded = (mid_r[:, :64] @ w2_r[:64, :]) * s2_r
+        assert torch.equal(out_r_padded, out_r_unpadded)
+        sh_sum = sh_sum + out_r_padded
+        sh_unpadded_sum = sh_unpadded_sum + out_r_unpadded
+
+    assert torch.equal(sh_sum, sh_unpadded_sum)
+    torch.testing.assert_close(sh_sum, sh_ref, rtol=5e-4, atol=5e-2)
+
+    # Test EP -> TP resharding at R=16 (64 -> 128 zero-padded IR)
+    c_tiny16_tp = dataclasses.replace(c_tiny16_ep, moe_tp=True, e_slots=0)
+    assert c_tiny16_tp.I_SLICE == 64 and c_tiny16_tp.IR == 128
+    for layer_idx in range(c_tiny16_tp.L):
+        reshard_layer_experts_ep_to_tp(
+            backbone.layers[layer_idx].mlp,
+            tp_rank=3,
+            c=c_tiny16_tp,
+            all_gather_fn=lambda x: x.repeat(c_tiny16_tp.R, *([1] * (x.ndim - 1))),
+        )
+    packed_tp16 = pack_weights(
+        backbone,
+        c_tiny16_tp,
+        tp_rank=3,
+        tiles=dataclasses.replace(K.TINY_TILES, bank=256 << 10),
+    )
+    assert packed_tp16["e13"][0].shape == (c_tiny16_tp.E, c_tiny16_tp.H, 256)
+    assert packed_tp16["e2"][0].shape == (c_tiny16_tp.E, 128, c_tiny16_tp.H)
+
+    # Verify 3-page GDN checkpoint geometry (vh=4 -> rec_pages=2, gdn_pages=3)
+    # in fused vs split pool IO.
+    c_gdn3 = dataclasses.replace(
+        K.TINY_EP,
+        R=1,
+        B=4,
+        T=2,
+        L=4,
+        H=2048,
+        att_every=4,
+        NH=1,
+        NKV=1,
+        KH=1,
+        VH=4,
+        I=128,
+        IS=128,
+        E=128,
+        TOPK=2,
+        e_slots=128,
+        paged_kv=True,
+        num_pages=128,
+        page_size=128,
+        max_pages_per_seq=8,
+        ctx=1024,
+    )
+    assert c_gdn3.vh == 4 and c_gdn3.rec_pages == 2 and c_gdn3.gdn_pages == 3
+    tiles_gdn3 = dataclasses.replace(
+        K.TINY_TILES, bank=256 << 10, hier=0, pack=0, mb8=0, kv_blk=256, nkv=2
+    )
+    mesh1 = Mesh(np.array(jax.devices()[:1]), ("tp",))
+    pt, ckpt, roff, min_pages = pool_io.default_pool_layout(c_gdn3)
+    assert min_pages % 3 == 0
+    bb_gdn3 = _make_tiny_backbone(c_gdn3, e_slots=c_gdn3.EW)
+    packed_gdn3 = pack_weights(bb_gdn3, c_gdn3, tp_rank=0, tiles=tiles_gdn3)
+    w_leaves = [
+        jnp.asarray(packed_gdn3[k].view(torch.uint8).numpy()).view(
+            K.FP8
+            if packed_gdn3[k].dtype == torch.float8_e4m3fn
+            else (
+                jnp.bfloat16
+                if packed_gdn3[k].dtype == torch.bfloat16
+                else jnp.float32
+            )
+        )
+        for k in K.W_NAMES
+    ]
+    sh_ref_st = K.state_shapes(dataclasses.replace(c_gdn3, paged_kv=False))
+    St = {
+        k: jax.random.normal(
+            jax.random.PRNGKey(10 + idx), (c_gdn3.R, *s), jnp.float32
+        ).astype(dt)
+        * 0.1
+        for idx, (k, (s, dt)) in enumerate(sh_ref_st.items())
+    }
+
+    raw_init = pool_io.states_to_pool(c_gdn3, St, pt, ckpt, roff)
+    raw_split = [jnp.array(r, copy=True) for r in raw_init]
+    raw_fused = [jnp.array(r, copy=True) for r in raw_init]
+    pos = jnp.asarray([10, 11, 20, 21], dtype=jnp.int32)
+    hid = jax.random.normal(jax.random.PRNGKey(7), (c_gdn3.M, c_gdn3.H), jnp.bfloat16)
+
+    skip_exp = frozenset({"experts"})
+    fn_split, _, _, _ = pool_io.make_flat_pooled_step(
+        mesh1, c_gdn3, tiles_gdn3, skip=skip_exp, fused_pool_io=False, interpret=True
+    )
+    fn_fused, _, _, _ = pool_io.make_flat_pooled_step(
+        mesh1, c_gdn3, tiles_gdn3, skip=skip_exp, fused_pool_io=True, interpret=True
+    )
+    out_split = fn_split(pos, hid, *w_leaves, *raw_split, pt, ckpt, roff)
+    out_fused = fn_fused(pos, hid, *w_leaves, *raw_fused, pt, ckpt, roff)
+    np.testing.assert_allclose(
+        np.asarray(out_split[0][: c_gdn3.B], dtype=np.float32),
+        np.asarray(out_fused[0][: c_gdn3.B], dtype=np.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )
 
 
