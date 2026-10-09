@@ -15,12 +15,13 @@
 from dataclasses import dataclass, field
 
 import torch
+from vllm.distributed.parallel_state import get_dp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 
 _padding_state: "TokenPaddingState | None" = None
 
 
-@dataclass
+@dataclass(slots=True)
 class TokenPaddingState:
     """Track token padding."""
 
@@ -59,7 +60,7 @@ class TokenPaddingState:
             padding_range = (rows.start, rows.stop) if rows else (0, 0)
         cached = self._host_cache
         if cached is None:
-            host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
+            host = torch.zeros(n, dtype=torch.bool)
         elif cached[1] == padding_range:
             return
         else:
@@ -110,8 +111,6 @@ def zero_routing_weights_for_padding(
     if is_local_tensor:
         is_padding = _padding_state.get_local_padding_mask(num_tokens)
     else:
-        from vllm.distributed.parallel_state import get_dp_group
-
         dp_group = get_dp_group()
         dp_size = dp_group.world_size
         if dp_size > 1:

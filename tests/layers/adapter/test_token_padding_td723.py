@@ -157,3 +157,70 @@ def test_zero_routing_without_state_and_with_stage_mask(monkeypatch):
     ):
         _, out = token_padding.zero_routing_weights_for_padding(ids, weights)
     assert out.tolist() == [[0.0], [1.0]]
+
+
+def test_set_padding_state_and_non_local_dp_branches(monkeypatch):
+    monkeypatch.setattr(token_padding, "_padding_state", None)
+    state = TokenPaddingState.create(4, "cpu")
+    state.update(2, 4)
+    token_padding.set_padding_state(state)
+    assert token_padding._padding_state is state
+
+    ids = torch.arange(8).reshape(4, 2)
+    weights = torch.ones(4, 2)
+    with (
+        mock.patch.object(
+            token_padding, "is_forward_context_available", return_value=False
+        ),
+        mock.patch.object(
+            token_padding,
+            "get_dp_group",
+            return_value=SimpleNamespace(world_size=1),
+        ),
+    ):
+        got_ids, got_weights = token_padding.zero_routing_weights_for_padding(
+            ids, weights, is_local_tensor=False
+        )
+    assert got_ids is ids
+    assert got_weights.tolist() == [[1.0, 1.0], [1.0, 1.0], [0.0, 0.0], [0.0, 0.0]]
+
+    def _fake_all_gather(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        assert tensor.dtype == torch.int8
+        assert dim == 0
+        return torch.cat([tensor, tensor], dim=0)
+
+    state_dp = TokenPaddingState.create(2, "cpu")
+    state_dp.update(1, 2)
+    token_padding.set_padding_state(state_dp)
+    with (
+        mock.patch.object(
+            token_padding, "is_forward_context_available", return_value=False
+        ),
+        mock.patch.object(
+            token_padding,
+            "get_dp_group",
+            return_value=SimpleNamespace(world_size=2, all_gather=_fake_all_gather),
+        ),
+    ):
+        _, got_dp_weights = token_padding.zero_routing_weights_for_padding(
+            ids, weights, is_local_tensor=False
+        )
+    assert got_dp_weights.tolist() == [[1.0, 1.0], [0.0, 0.0], [1.0, 1.0], [0.0, 0.0]]
+    token_padding.set_padding_state(None)
+    assert token_padding._padding_state is None
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_rms_norm_fp32_and_bf16(dtype: torch.dtype):
+    from vllm_torchtpu.layers.adapter.normalization import rms_norm
+
+    x = torch.tensor([[3.0, 4.0]], dtype=dtype)
+    weight = torch.tensor([1.0, 2.0], dtype=dtype)
+    out = rms_norm(x, weight, 1e-6)
+    assert out.dtype == dtype
+    expected = (
+        x.float()
+        * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+        * weight.float()
+    ).to(dtype)
+    assert torch.allclose(out, expected)
