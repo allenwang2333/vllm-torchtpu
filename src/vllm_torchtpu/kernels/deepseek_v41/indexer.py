@@ -333,7 +333,9 @@ def _native_score_kernel(
                     + jnp.maximum(similarities[:, head], 0)
                     * weighted[:, head : head + 1]
                 )
-            logical = block * tile_keys + jnp.arange(tile_keys)
+            tile_iota = jnp.arange(tile_keys)
+            key_page_ids = tile_iota // page_size
+            logical = block * tile_keys + tile_iota
             page_valid = jnp.zeros((tile_keys,), jnp.bool_)
             for page_in_tile in range(pages_per_tile):
                 logical_page = block * pages_per_tile + page_in_tile
@@ -346,9 +348,7 @@ def _native_score_kernel(
                     & (physical >= 0)
                     & (physical < scales.shape[0])
                 )
-                page_valid = page_valid | (
-                    valid & (jnp.arange(tile_keys) // page_size == page_in_tile)
-                )
+                page_valid = page_valid | (valid & (key_page_ids == page_in_tile))
             for row in range(rows):
                 score_buffer[row] = jnp.where(
                     (logical < lengths[row]) & page_valid,

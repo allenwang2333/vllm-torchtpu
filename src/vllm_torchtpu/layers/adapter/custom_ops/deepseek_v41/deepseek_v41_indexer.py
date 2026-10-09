@@ -127,9 +127,9 @@ def gather_index_keys(
     pool: jax.Array, scales: jax.Array, records: jax.Array, page_stride: int
 ):
     """Decode only selected records, keeping key operands in FP8 for the dot."""
+    safe = jnp.maximum(records, 0)
 
     def arbitrary_rows(_):
-        safe = jnp.maximum(records, 0)
         word_rows = safe // KEYS_PER_WORD_ROW
         shifts = (safe % KEYS_PER_WORD_ROW * 8).astype(jnp.int32)
         return ((pool[word_rows] >> shifts[..., None]) & 255).astype(jnp.uint8)
@@ -158,7 +158,6 @@ def gather_index_keys(
             return keys.astype(jnp.uint8).reshape(*records.shape, INDEX_HEAD_DIM)
 
         key_bytes = jax.lax.cond(grouped, four_key_slabs, arbitrary_rows, None)
-    safe = jnp.maximum(records, 0)
     within_page = safe % page_stride
     scale_bytes = scales[
         safe // page_stride, within_page // ROW_WORDS, within_page % ROW_WORDS
@@ -418,11 +417,12 @@ def paged_indexer_jax(
             (jnp.ones_like(ids[:, :1], dtype=jnp.bool_), ids[:, 1:] != ids[:, :-1]),
             axis=-1,
         )
-        logical = (ids[..., None] * block_size + jnp.arange(block_size)).reshape(
-            records.shape[0], -1
-        )
-        valid = logical < jnp.minimum(lengths[:, None], width)
-        valid &= jnp.repeat(unique & (ids < blocks), block_size, axis=-1)
+        logical_3d = ids[..., None] * block_size + jnp.arange(block_size)
+        valid = (
+            (logical_3d < jnp.minimum(lengths, width)[:, None, None])
+            & (unique & (ids < blocks))[..., None]
+        ).reshape(records.shape[0], -1)
+        logical = logical_3d.reshape(records.shape[0], -1)
         compact = jnp.take_along_axis(records, jnp.minimum(logical, width - 1), axis=1)
         compact = jnp.where(valid, compact, -1)
         return _compact_candidate_indices(
@@ -470,11 +470,20 @@ def bounded_indexer_jax(
     tile = min(QUERY_TILE, count)
     padded_count = (count + tile - 1) // tile * tile
     padding = padded_count - count
-    lengths_padded = jnp.pad(lengths, (0, padding))
-    requests_padded = jnp.pad(requests, (0, padding))
-    candidates_padded = jnp.pad(candidates, ((0, padding), (0, 0)), constant_values=-1)
-    q_padded = jnp.pad(q, ((0, padding), (0, 0), (0, 0)))
-    weights_padded = jnp.pad(weights, ((0, padding), (0, 0)))
+    if padding:
+        lengths_padded = jnp.pad(lengths, (0, padding))
+        requests_padded = jnp.pad(requests, (0, padding))
+        candidates_padded = jnp.pad(
+            candidates, ((0, padding), (0, 0)), constant_values=-1
+        )
+        q_padded = jnp.pad(q, ((0, padding), (0, 0), (0, 0)))
+        weights_padded = jnp.pad(weights, ((0, padding), (0, 0)))
+    else:
+        lengths_padded = lengths
+        requests_padded = requests
+        candidates_padded = candidates
+        q_padded = q
+        weights_padded = weights
     selected = jnp.full((padded_count, min(topk, capacity)), -1, jnp.int32)
     published = candidates_padded
     sparsecore = jax.default_backend() == "tpu"
@@ -531,7 +540,9 @@ def bounded_indexer_jax(
         selected = pipeline_score_topk(
             padded_count // tile, prepare, score, select, write, selected
         )
-        return selected[:count], published[:count]
+        return (
+            (selected[:count], published[:count]) if padding else (selected, published)
+        )
 
     def step(index, output):
         start = index * tile
@@ -585,11 +596,12 @@ def bounded_indexer_jax(
                     ),
                     axis=-1,
                 )
-                logical = (
-                    ids[..., None] * block_size + jnp.arange(block_size)
+                logical_3d = ids[..., None] * block_size + jnp.arange(block_size)
+                valid = (
+                    (logical_3d < lens[:, None, None])
+                    & (unique & (ids < blocks))[..., None]
                 ).reshape(tile, -1)
-                valid = logical < lens[:, None]
-                valid &= jnp.repeat(unique & (ids < blocks), block_size, axis=-1)
+                logical = logical_3d.reshape(tile, -1)
                 safe = jnp.minimum(logical, capacity - 1)
                 pages = block_table[reqs[:, None], safe // page_size]
                 records = row_indices(
@@ -629,7 +641,7 @@ def bounded_indexer_jax(
     selected, published = jax.lax.fori_loop(
         0, padded_count // tile, step, (selected, published)
     )
-    return selected[:count], published[:count]
+    return (selected[:count], published[:count]) if padding else (selected, published)
 
 
 def write_index_keys(
@@ -790,8 +802,10 @@ def initialize_indexer():
 
 def publish_index_keys(cache, scales, slots, keys, *, layout):
     assert _write_index_op is not None
+    if slots.dtype != torch.int32:
+        slots = slots.int()
     updated, updated_scales = _write_index_op(
-        cache, scales, slots.int(), keys, *layout.geometry
+        cache, scales, slots, keys, *layout.geometry
     )
     cache.copy_(updated)
     scales.copy_(updated_scales)
@@ -817,17 +831,29 @@ def paged_indexer(
     candidate_filter,
 ):
     assert _indexer_op is not None
+    if block_table.dtype != torch.int32:
+        block_table = block_table.int()
+    if lengths.ndim != 1:
+        lengths = lengths.flatten()
+    if lengths.dtype != torch.int32:
+        lengths = lengths.int()
+    if candidates.dtype != torch.int32:
+        candidates = candidates.int()
+    if write_slots.dtype != torch.int32:
+        write_slots = write_slots.int()
+    if requests.dtype != torch.int32:
+        requests = requests.int()
     return _indexer_op(
         q,
         cache,
         scales,
-        block_table.int(),
+        block_table,
         weights,
-        lengths.flatten().int(),
-        candidates.int(),
-        write_slots.int(),
+        lengths,
+        candidates,
+        write_slots,
         keys,
-        requests.int(),
+        requests,
         capacity,
         topk,
         block_size,
