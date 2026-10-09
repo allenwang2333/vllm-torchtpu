@@ -130,23 +130,24 @@ def is_step0_post_attn_gather_installed(draft_model: Any) -> bool:
 
 
 def _legal_tile(rows: int, cap: int) -> int:
-    for t in range(min(cap, rows), 7, -1):
-        if rows % t == 0 and t % 8 == 0:
+    for t in range(min(cap, rows), 31, -1):
+        if rows % t == 0 and t % 32 == 0:
             return t
     return rows
 
 
 def _select_gate_q_tile(rows: int, cols: int) -> int:
-    """Select multiple-of-8 tile cap for [rows, cols] sigmoid-gate + FP8 quant.
+    """Select multiple-of-32 tile cap for [rows, cols] sigmoid-gate + FP8 quant.
 
-    Keeps live fp32 arrays within the 64-VREG hardware file (preventing multi-MiB
-    VMEM spills at N=2048) and ensures grid >= 6 at decode/verify batch sizes
-    (N=96, 128) so double-buffered VMEM DMAs overlap with compute.
+    2D float8_e4m3fn outputs have hardware tiling (32, 128), so any sub-block
+    smaller than `rows` must have `bm % 32 == 0`. Keeps live fp32 arrays within
+    the 64-VREG hardware file (preventing multi-MiB VMEM spills at N=2048 or
+    TP=2 cols=4096) and bounds VMEM DMA windows at decode/verify batch sizes.
     """
     vregs_per_row = max(1, (cols + 1023) // 1024)
-    vreg_cap = max(16, (64 // vregs_per_row // 8) * 8)
+    vreg_cap = max(32, (64 // vregs_per_row // 32) * 32)
     if rows <= 256:
-        dma_cap = max(8, (rows // 6 // 8) * 8)
+        dma_cap = max(32, (rows // 6 // 32) * 32)
         return min(vreg_cap, dma_cap)
     return vreg_cap
 
