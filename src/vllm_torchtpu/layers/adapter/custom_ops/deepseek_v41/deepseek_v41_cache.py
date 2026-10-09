@@ -74,6 +74,16 @@ class NativeBinding:
     layout: RecordLayout
     scales: torch.Tensor | None = None
     kernel_shape: tuple[int, ...] | None = None
+    viewed_pool: torch.Tensor = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "viewed_pool",
+            self.pool.view(self.kernel_shape)
+            if self.kernel_shape is not None
+            else self.pool,
+        )
 
 
 class NativeCacheBinding:
@@ -99,12 +109,7 @@ class NativeCacheBinding:
     @property
     def kv_cache(self):
         if self._native is not None:
-            binding = self._native
-            return (
-                binding.pool.view(binding.kernel_shape)
-                if binding.kernel_shape is not None
-                else binding.pool
-            )
+            return self._native.viewed_pool
         return self._bound_cache
 
     @kv_cache.setter
@@ -193,6 +198,8 @@ def cache_record_layout(raw, layout):
 
 def row_indices(slots, page_size, page_stride, row_offset):
     """Map slots using prevalidated record geometry, never pool byte offsets."""
+    if page_size == page_stride:
+        return slots if row_offset == 0 else row_offset + slots
     return row_offset + slots // page_size * page_stride + slots % page_size
 
 
@@ -358,11 +365,13 @@ def write_cache(cache, slots, values, valid, *, layout=None):
     """Valid destinations must be unique; invalid rows have no side effects."""
     count = values.shape[0]
     slots, valid = slots[:count], valid[:count]
-    slots = slots.masked_fill(~valid, -1).long()
+    slots = slots.masked_fill(~valid, -1)
     if layout is not None:
         page_size, page_stride, row_offset = layout.geometry
         elements, dtype = layout.elements, layout.dtype
-        values = values.to(dtype).reshape(slots.shape[0], elements)
+        values = (values if values.dtype == dtype else values.to(dtype)).reshape(
+            slots.shape[0], elements
+        )
         if cache.device.type == "cpu":
             records = row_indices(
                 slots.clamp(min=0), page_size, page_stride, row_offset
@@ -374,10 +383,11 @@ def write_cache(cache, slots, values, valid, *, layout=None):
             )
         else:
             assert _write_values_op is not None
-            cache.copy_(_write_values_op(cache, slots.int(), values, *layout.geometry))
+            slots_i32 = slots if slots.dtype == torch.int32 else slots.int()
+            cache.copy_(_write_values_op(cache, slots_i32, values, *layout.geometry))
         return
     if cache.device.type == "cpu":
-        selected = slots[valid]
+        selected = slots[valid].long()
         if cache.ndim == values.ndim:
             cache.index_copy_(0, selected, values[valid])
         else:
@@ -386,7 +396,8 @@ def write_cache(cache, slots, values, valid, *, layout=None):
             )
     else:
         assert _write_op is not None
-        cache.copy_(_write_op(cache, slots.int(), values))
+        slots_i32 = slots if slots.dtype == torch.int32 else slots.int()
+        cache.copy_(_write_op(cache, slots_i32, values))
 
 
 def scatter_cache_values(
@@ -485,24 +496,35 @@ def block_table(metadata):
     return metadata.block_tables.reshape(metadata.seq_lens.shape[0], -1)
 
 
-def token_requests(metadata, positions):
-    rows = torch.arange(positions.shape[0], device=positions.device)
+def token_requests(metadata, positions, *, rows=None):
+    if rows is None:
+        rows = torch.arange(positions.shape[0], device=positions.device)
     return torch.bucketize(rows, metadata.query_start_loc[1:], right=True)
 
 
-def cache_slots(metadata, positions, *, rows_per_page, compress_ratio=1, ring=False):
+def cache_slots(
+    metadata,
+    positions,
+    *,
+    rows_per_page,
+    compress_ratio=1,
+    ring=False,
+    requests=None,
+):
     """Derive this cache's addresses from the shared TPU metadata contract."""
     if metadata.seq_lens.numel() == 0:
         return torch.full_like(positions, -1)
     table = block_table(metadata)
-    requests = token_requests(metadata, positions).clamp(max=table.shape[0] - 1)
+    rows = torch.arange(positions.shape[0], device=positions.device)
+    if requests is None:
+        requests = token_requests(metadata, positions, rows=rows)
+    requests = requests.clamp(max=table.shape[0] - 1)
     logical = positions // compress_ratio
     columns = torch.zeros_like(logical) if ring else logical // rows_per_page
     blocks = table[requests, columns.clamp(max=table.shape[1] - 1).long()].long()
     slots = blocks * rows_per_page + logical % rows_per_page
     # Padded request boundaries repeat the last real token offset. Keep the
     # mask on device, including dummy runs and batches with no active tokens.
-    rows = torch.arange(positions.shape[0], device=positions.device)
     return slots.masked_fill(rows >= metadata.query_start_loc[-1], -1)
 
 

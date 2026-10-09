@@ -49,7 +49,8 @@ def save_compress_norm(
     if token_to_req_indices is not None:
         token_to_req_indices = token_to_req_indices[:count]
     dim = norm_weight.numel()
-    values = kv_score[:, :dim].float()
+    kv_score_f32 = kv_score if kv_score.dtype == torch.float32 else kv_score.float()
+    values = kv_score_f32[:, :dim]
     valid = slot_mapping >= 0
     if ratio == 2:
         capacity = (
@@ -66,15 +67,15 @@ def save_compress_norm(
         )
         previous = torch.where(
             (rows > starts)[:, None],
-            kv_score[(rows - 1).clamp(min=0)].float(),
+            kv_score_f32[(rows - 1).clamp(min=0)],
             read_cache(cache, previous_slots, layout=state_layout),
         )
-        scores = torch.stack((previous[:, dim:], kv_score[:, dim:].float()), 1)
+        scores = torch.stack((previous[:, dim:], kv_score_f32[:, dim:]), 1)
         pair = torch.stack((previous[:, :dim], values), 1)
         values = (pair * scores.softmax(1)).sum(1)
         # All reads above refer to the old ring. Keep unique physical writes.
         publish = valid & (rows >= ends - capacity)
-        write_cache(cache, slot_mapping, kv_score.float(), publish, layout=state_layout)
+        write_cache(cache, slot_mapping, kv_score_f32, publish, layout=state_layout)
         valid = valid & (positions % 2 == 1)
     elif ratio != 1:
         raise ValueError(f"V4.1 compression ratio must be 1 or 2, got {ratio}")
@@ -211,6 +212,8 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
             )
             state_cache = self.state_cache.kv_cache
             state_layout = binding.layout if binding is not None else None
+            query_start_loc = state_metadata.query_start_loc
+            requests = token_requests(state_metadata, positions)
             slots = cache_slots(
                 state_metadata,
                 positions,
@@ -220,9 +223,8 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
                     if state_layout is not None
                     else state_cache.shape[1]
                 ),
+                requests=requests,
             )
-            query_start_loc = state_metadata.query_start_loc
-            requests = token_requests(state_metadata, positions)
         latent = torch.empty(
             (kv_score.shape[0], self.head_dim),
             dtype=torch.bfloat16,
