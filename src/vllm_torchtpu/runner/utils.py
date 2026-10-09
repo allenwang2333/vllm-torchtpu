@@ -93,10 +93,9 @@ def get_batch_composition_stats(
     num_prefill_tokens = 0
     num_decode_tokens = 0
 
-    # Get the number of scheduled tokens for each request.
-    num_scheduled_tokens_per_req_list = []
     # Get the number of tokens already processed for each request.
     num_computed_tokens_per_req = input_batch.num_computed_tokens_cpu[:num_reqs]
+    num_scheduled_tokens = scheduler_output.num_scheduled_tokens
 
     scheduled_spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
     min_kv_len = float("inf") if num_reqs > 0 else 0
@@ -104,8 +103,7 @@ def get_batch_composition_stats(
         assert req_id is not None
 
         # This is the number of tokens to process in the current step for this request
-        num_scheduled_for_req = scheduler_output.num_scheduled_tokens[req_id]
-        num_scheduled_tokens_per_req_list.append(num_scheduled_for_req)
+        num_scheduled_for_req = num_scheduled_tokens[req_id]
 
         # This is the number of tokens already processed for this request
         # (before this step)
@@ -185,6 +183,7 @@ class PhaseBasedProfiler:
             InferencePhase.DECODE_HEAVY: False,
             InferencePhase.BALANCED: False,
         }
+        self._all_phases_seen: bool = False
         self.current_phase: str = ""
         self.worker_rank = worker_rank
         self.world_size = world_size
@@ -275,6 +274,7 @@ class PhaseBasedProfiler:
                     break
 
             self.inference_phase_seen[phase] = True
+            self._all_phases_seen = all(self.inference_phase_seen.values())
             self.profiling_n_steps_left = self.num_steps_to_profile_for
             self.current_phase = phase.name.lower()
 
@@ -374,7 +374,6 @@ class PhaseBasedProfiler:
 
     def step(self, batch_composition_stats: dict) -> None:
         """Steps the profiler and logs batch composition stats."""
-        have_seen_all_phases = all(self.inference_phase_seen.values())
         # A batch with no work has no phase -- the classifier divides by
         # total_num_scheduled_tokens. execute_model already returns before
         # calling us in that case, so this only keeps the invariant local.
@@ -388,7 +387,7 @@ class PhaseBasedProfiler:
         # under the phase that opened it.
         has_scheduled_work = batch_composition_stats["total_num_scheduled_tokens"] > 0
         if has_scheduled_work and (
-            not have_seen_all_phases or self.current_phase != ""
+            not self._all_phases_seen or self.current_phase != ""
         ):
             if self.profiling_n_steps_left <= 0:
                 self._start_profiling(batch_composition_stats)

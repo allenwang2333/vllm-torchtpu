@@ -123,9 +123,16 @@ class AsyncTPUCopyState:
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
         # Flatten 2D+ chunks to 1D before D2H transfer to hit PJRT's 1D 32-bit
         # zero-repack fast path (tpu_linearizer.cc:37); reshape back on CPU.
-        chunk_shapes = [tuple(t.shape) for t in chunks_tpu]
-        flat_chunks_tpu = [t.reshape(-1) if t.ndim > 1 else t for t in chunks_tpu]
-        chunks_cpu = [t.to("cpu", non_blocking=True) for t in flat_chunks_tpu]
+        if len(chunks_tpu) == 1:
+            t0 = chunks_tpu[0]
+            chunk_shapes = [tuple(t0.shape)]
+            flat_t0 = t0.reshape(-1) if t0.ndim > 1 else t0
+            flat_chunks_tpu = [flat_t0]
+            chunks_cpu = [flat_t0.to("cpu", non_blocking=True)]
+        else:
+            chunk_shapes = [tuple(t.shape) for t in chunks_tpu]
+            flat_chunks_tpu = [t.reshape(-1) if t.ndim > 1 else t for t in chunks_tpu]
+            chunks_cpu = [t.to("cpu", non_blocking=True) for t in flat_chunks_tpu]
         spec_logprobs_tpu = None
         if spec_logprobs:
             spec_logprobs_tpu = [c.tensors for c in spec_logprobs]
@@ -309,12 +316,15 @@ def assemble_spec_next_tokens(
         drafts: device proposer output ``[>=num_reqs, K]``.
         num_reqs: real request count (both inputs may be bucket-padded in dim 0).
     """
-    nt = next_tokens[:num_reqs]
-    drafts = drafts[:num_reqs]
+    nt = next_tokens if next_tokens.shape[0] == num_reqs else next_tokens[:num_reqs]
+    if drafts.shape[0] != num_reqs:
+        drafts = drafts[:num_reqs]
     # Last non-padding column per row is the bonus.
     last_valid_col = (nt != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1) - 1
     bonus = nt.gather(1, last_valid_col.unsqueeze(1))  # [num_reqs, 1]
-    src = torch.cat([bonus.to(drafts.dtype), drafts], dim=1)  # [num_reqs, 1+K]
+    if bonus.dtype != drafts.dtype:
+        bonus = bonus.to(drafts.dtype)
+    src = torch.cat([bonus, drafts], dim=1)  # [num_reqs, 1+K]
     return src.reshape(-1)  # [num_reqs * (1 + K)]
 
 
@@ -326,12 +336,15 @@ def _assemble_spec_next_tokens_and_num_rejected(
     padded_src_len: int | None = None,
     padded_num_reqs: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    nt = next_tokens[:num_reqs]
-    drafts = drafts[:num_reqs]
-    num_valid = (nt != INVALID_TOKEN_ID).sum(dim=1)
-    last_valid_col = num_valid.clamp(min=1) - 1
+    nt = next_tokens if next_tokens.shape[0] == num_reqs else next_tokens[:num_reqs]
+    if drafts.shape[0] != num_reqs:
+        drafts = drafts[:num_reqs]
+    num_valid = (nt != INVALID_TOKEN_ID).sum(dim=1, dtype=torch.int32)
+    last_valid_col = (num_valid.clamp(min=1) - 1).to(torch.int64)
     bonus = nt.gather(1, last_valid_col.unsqueeze(1))  # [num_reqs, 1]
-    src = torch.cat([bonus.to(drafts.dtype), drafts], dim=1).reshape(-1)
+    if bonus.dtype != drafts.dtype:
+        bonus = bonus.to(drafts.dtype)
+    src = torch.cat([bonus, drafts], dim=1).reshape(-1)
     if padded_src_len is not None and src.shape[0] < padded_src_len:
         src = F.pad(src, (0, padded_src_len - src.shape[0]))
     if num_draft is None:
@@ -344,9 +357,10 @@ def _assemble_spec_next_tokens_and_num_rejected(
             rej_len, dtype=torch.int32, device=next_tokens.device
         )
     else:
-        num_rejected = (
-            (num_draft[:num_reqs] - num_valid + 1).clamp(min=0).to(torch.int32)
-        )
+        nd = num_draft if num_draft.shape[0] == num_reqs else num_draft[:num_reqs]
+        num_rejected = (nd - num_valid + 1).clamp(min=0)
+        if num_rejected.dtype != torch.int32:
+            num_rejected = num_rejected.to(torch.int32)
         if padded_num_reqs is not None and num_rejected.shape[0] < padded_num_reqs:
             num_rejected = F.pad(
                 num_rejected, (0, padded_num_reqs - num_rejected.shape[0])
@@ -517,5 +531,7 @@ def compute_num_rejected(
         num_draft: ``[num_reqs]`` scheduled draft count per request.
     """
     num_reqs = num_draft.shape[0]
-    num_valid = (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1)
-    return (num_draft - num_valid + 1).clamp(min=0).to(torch.int32)
+    nt = next_tokens if next_tokens.shape[0] == num_reqs else next_tokens[:num_reqs]
+    num_valid = (nt != INVALID_TOKEN_ID).sum(dim=1, dtype=torch.int32)
+    res = (num_draft - num_valid + 1).clamp(min=0)
+    return res if res.dtype == torch.int32 else res.to(torch.int32)
