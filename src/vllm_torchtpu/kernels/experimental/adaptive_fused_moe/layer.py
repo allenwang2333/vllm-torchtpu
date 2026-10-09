@@ -211,8 +211,8 @@ def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
 # plan is long enough to pay for it.
 AGQ_MIN_LOCAL_TOKENS = 1024
 
-# Per-config cache of the shard_map'd MoE callable and its jit; a fresh
-# shard_map body would re-trace the whole kernel for every hidden layer.
+# Per-config cache of the shard_map'd MoE callable; a fresh shard_map
+# body would re-trace the whole kernel for every hidden layer.
 _LAYER_SM_CACHE = {}
 _LAYER_SM_CACHE_LOCK = threading.Lock()
 
@@ -658,9 +658,16 @@ def adaptive_fused_moe(
     args = (x, rank, w1, w2) + scale_args + (gating,) + bias_args
     NS = jax.sharding.NamedSharding
     args = tuple(jax.device_put(a, NS(mesh, sp)) for a, sp in zip(args, in_specs))
+    # Under an outer trace -- torch_tpu's export of the op, or a caller's jit --
+    # the shard_map is traced into that program, so it is cached as is and the
+    # program stays what it was. Called eagerly, as the device tests do, a bare
+    # shard_map runs op by op and compiles every op again on every call, so an
+    # eager call caches its jit, which compiles once per key.
+    traced = any(isinstance(a, jax.core.Tracer) for a in args)
     # local_fn closes over config-static values only -- the per-call data
     # are the shard_map arguments -- so this key is exact.
     key = (
+        traced,
         mesh,
         T,
         hidden,
@@ -684,11 +691,11 @@ def adaptive_fused_moe(
         has_w1_bias and w1_bias.dtype,
         has_w2_bias and w2_bias.dtype,
     )
-    cached = _LAYER_SM_CACHE.get(key)
-    if cached is None:
+    fn = _LAYER_SM_CACHE.get(key)
+    if fn is None:
         with _LAYER_SM_CACHE_LOCK:
-            cached = _LAYER_SM_CACHE.get(key)
-            if cached is None:
+            fn = _LAYER_SM_CACHE.get(key)
+            if fn is None:
                 sm = jax.shard_map(
                     local_fn,
                     mesh=mesh,
@@ -696,14 +703,6 @@ def adaptive_fused_moe(
                     out_specs=P(ax),
                     check_vma=False,
                 )
-                cached = (sm, jax.jit(sm))
-                _LAYER_SM_CACHE[key] = cached
-    sm, sm_jit = cached
-    # Under an outer trace -- torch_tpu's export of the op, or a caller's jit --
-    # the shard_map is traced into that program, so it is called as is and the
-    # program stays what it was. Called eagerly, as the device tests do, a bare
-    # shard_map runs op by op and compiles every op again on every call; its
-    # jit compiles once per key.
-    if any(isinstance(a, jax.core.Tracer) for a in args):
-        return sm(*args)
-    return sm_jit(*args)
+                fn = sm if traced else jax.jit(sm)
+                _LAYER_SM_CACHE[key] = fn
+    return fn(*args)
