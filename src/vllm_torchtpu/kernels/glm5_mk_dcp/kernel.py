@@ -1198,12 +1198,14 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             def per_req_u(b, off):
                 return lax.cond(qmeta[b, 3] > 0, lambda: build_union(b, off), lambda: off)
             lax.fori_loop(0, B, per_req_u, jnp.int32(0))
+            pi.mark("I_udma")
             cpu = [pltpu.make_async_copy(scr["own_u"], scr["own_uv"], scr["misc_sem"]),
                    pltpu.make_async_copy(scr["memb"], scr["memb_v"], scr["misc_sem"])]
             for c_ in cpu:
                 c_.start()
             for c_ in cpu:
                 c_.wait()
+            pi.mark("I_recw")
             pltpu.make_async_copy(scr["rec_v"], irec_out.at[l], scr["kvw_sem"].at[2]).wait()
             pi.end()
 
