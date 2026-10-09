@@ -45,10 +45,10 @@ def query_completion(
     prompt: str,
     max_tokens: int = 64,
 ) -> str:
-    url = f"http://{host}:{port}/v1/completions"
+    url = f"http://{host}:{port}/v1/chat/completions"
     payload = {
         "model": model,
-        "prompt": prompt,
+        "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0.0,
     }
@@ -60,7 +60,7 @@ def query_completion(
     )
     with urllib.request.urlopen(req, timeout=600) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-    return data["choices"][0]["text"]
+    return data["choices"][0]["message"]["content"]
 
 
 def main() -> int:
@@ -74,7 +74,7 @@ def main() -> int:
     probes: list[dict[str, Any]] = [
         {
             "name": "math_reasoning",
-            "prompt": format_qwen35_prompt(
+            "prompt": (
                 "Solve concisely in 2-3 sentences: A train travels 120 km at "
                 "60 km/h, then 180 km at 90 km/h. What is the average speed "
                 "for the entire journey in km/h? State the final numeric value."
@@ -86,25 +86,25 @@ def main() -> int:
             "name": "needle_4k",
             "prompt": build_needle_prompt(2800, "OMEGA-7429-TPU"),
             "expected": "OMEGA-7429-TPU",
-            "max_tokens": 48,
+            "max_tokens": 64,
         },
         {
             "name": "needle_8k",
             "prompt": build_needle_prompt(5600, "SIGMA-9183-VLLM"),
             "expected": "SIGMA-9183-VLLM",
-            "max_tokens": 48,
+            "max_tokens": 64,
         },
         {
             "name": "needle_16k",
             "prompt": build_needle_prompt(11200, "DELTA-4402-PALLAS"),
             "expected": "DELTA-4402-PALLAS",
-            "max_tokens": 48,
+            "max_tokens": 64,
         },
         {
             "name": "needle_32k",
             "prompt": build_needle_prompt(22400, "KAPPA-6017-STAGE"),
             "expected": "KAPPA-6017-STAGE",
-            "max_tokens": 48,
+            "max_tokens": 64,
         },
     ]
 
