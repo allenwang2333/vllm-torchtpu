@@ -210,6 +210,27 @@ local libtpuInitArgs = cdk.var('LIBTPU_INIT_ARGS', std.join(' ', [
 ]));
 local extraVllmArgs = cdk.var('EXTRA_VLLM_ARGS', '');
 
+// --- Speculative decoding ------------------------------------------------------
+// SPEC_METHOD=dspark serves the DSpark draft that ships in the target checkpoint (mtp.0-2.*, config.json
+// dspark_block_size=5), as the InferenceX B200 run does with its own DSpark checkpoint. The TPU proposer only
+// drafts greedily and only a whole block, so NUM_SPEC_TOKENS must equal dspark_block_size. Empty = off.
+// The draft holds ~4.2 GiB of HBM per rank (j-9719749f-0a6b-47c7-b249: 77.64 vs 73.44 GiB used), so at
+// GPU_MEMORY_UTILIZATION=0.90 the KV cache no longer fits one MAX_MODEL_LEN=1048576 request; raise it with this.
+local specMethod = cdk.var('SPEC_METHOD', '');
+local numSpecTokens = cdk.numVar('NUM_SPEC_TOKENS', 5);
+local specConfig =
+  if specMethod == '' then ''
+  else if specMethod == 'dspark' then '{"method":"dspark","num_speculative_tokens":%d}' % numSpecTokens
+  else error 'SPEC_METHOD must be empty or dspark, got "%s"' % specMethod;
+// vLLM drops the last matched prefix-cache block of every hit for EAGLE-style drafts (DSpark and the
+// DeepSeek-V4 groups included): ~BLOCK_SIZE more prefill tokens per request. DSpark's draft KV for verified
+// tokens is projected from the target's hidden states, so the dropped block protects nothing. 1 keeps it
+// (vllm-torchtpu #1530); empty leaves vLLM's behaviour.
+local disableEagleBlockDrop = cdk.var('VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP', '');
+// SANITY_PROBE=true: once the server is healthy, send two fixed temperature-0 chat requests and log the
+// replies as "sanity-probe:" lines (pod log and sanity_probe.log), to compare output text across arms.
+local sanityProbe = cdk.boolVar('SANITY_PROBE', false);
+
 // --- Profiling ----------------------------------------------------------------
 local enableXprof = cdk.boolVar('ENABLE_XPROF', false);
 local enablePerfetto = cdk.boolVar('ENABLE_PERFETTO', false);
@@ -333,6 +354,7 @@ local serveArgs = [
   '--reasoning-parser=%s' % reasoningParser,
   '--chat-template=%s' % chatTemplate,
 ]
++ (if specConfig != '' then ["--speculative-config '%s'" % specConfig] else [])
 + (if enableProfiling then agentx.profilerArgs('"%s"' % xprofDir) else []);
 
 local serverScript = agentx.fill(
@@ -498,6 +520,18 @@ local serverScript = agentx.fill(
         fi
       ) &
 
+      if [ "@SANITY_PROBE@" = "true" ]; then
+        (
+          { set +x; } 2>/dev/null
+          until curl -sf "http://127.0.0.1:@PORT@/health" >/dev/null; do sleep 10; done
+          for q in "Write a Python function that returns the n-th Fibonacci number." "List the first ten prime numbers, separated by commas."; do
+            body=$(python3 -c 'import json, sys; print(json.dumps({"model": sys.argv[1], "messages": [{"role": "user", "content": sys.argv[2]}], "max_tokens": 256, "temperature": 0}))' "$SERVED_MODEL_NAME" "$q")
+            reply=$(curl -s "http://127.0.0.1:@PORT@/v1/chat/completions" -H "Content-Type: application/json" -d "$body")
+            echo "sanity-probe: $reply" | tee -a "${CDK_OUTPUT_DIR:-/tmp/cdk_output}/sanity_probe.log"
+          done
+        ) &
+      fi
+
       "${VLLM_ARGS[@]}" @EXTRA_ARGS@ 2>&1 | tee "${CDK_OUTPUT_DIR:-/tmp/cdk_output}/vllm.log"
       # Exit with vLLM's status, not tee's: a head that exits 0 after a crash is marked Succeeded, is
       # not recreated when Kueue re-admits the JobSet, and the client waits out its whole timeout.
@@ -527,6 +561,8 @@ local serverScript = agentx.fill(
     OFFLOAD_SETUP: std.lstripChars(agentx.indent(offloadSetup, 6), ' '),
     SERVE_ARGS: std.lstripChars(agentx.indent(std.join('\n', serveArgs), 8), ' '),
     EXTRA_ARGS: extraVllmArgs,
+    SANITY_PROBE: if sanityProbe then 'true' else 'false',
+    PORT: port,
   }
 );
 
@@ -677,6 +713,8 @@ local serverJob = cdk.job(
         [if prefillGateLogSteps != '' then 'TPU_PREFILL_GATE_LOG_STEPS']: prefillGateLogSteps,
         // DSv4 multi-shape KV tensors require VLLM_TPU_BLOCK_MAJOR_KV=0 (PR #787)
         VLLM_TPU_BLOCK_MAJOR_KV: '0',
+        // Read by the scheduler in the EngineCore processes.
+        [if disableEagleBlockDrop != '' then 'VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP']: disableEagleBlockDrop,
         [if kvOffload then 'RAIDEN_EXPECTED_WORKERS_TIMEOUT_S']: cdk.var('RAIDEN_EXPECTED_WORKERS_TIMEOUT_S', '900'),
         [if kvOffload then 'RAIDEN_NUMA_POLICY']: cdk.var('RAIDEN_NUMA_POLICY', 'preferred'),
         [if kvOffload then 'TPU_EVICT_WEIGHTS_PAGE_CACHE']: cdk.var('TPU_EVICT_WEIGHTS_PAGE_CACHE', 'true'),
