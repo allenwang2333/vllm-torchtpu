@@ -1160,7 +1160,7 @@ class TPUModelRunner(GPUModelRunner):
                     f"{self.speculative_config.method}"
                 )
 
-    def _truncate_rope_caches(self) -> None:
+    def _truncate_rope_caches(self, model: torch.nn.Module | None = None) -> None:
         """Slice rotary cos_sin caches to max_model_len which can reduce
         the overhead of xla layout data copy. Applicable to text-only.
         """
@@ -1173,10 +1173,11 @@ class TPUModelRunner(GPUModelRunner):
                 "not bounded by max_model_len"
             )
             return
+        target = self.model if model is None else model
         max_len = self.model_config.max_model_len
         num_eligible = 0
         num_truncated = 0
-        for name, module in self.model.named_modules():
+        for name, module in target.named_modules():
             if type(module) not in (
                 RotaryEmbedding,
                 MRotaryEmbedding,
@@ -1489,24 +1490,27 @@ class TPUModelRunner(GPUModelRunner):
         # `AttentionMetadataBuilder.build` takes only `num_reqs` off the
         # common metadata; everything else it needs comes from
         # `_attn_metadata_builder_ctx`.
-        selected_groups = []
-        for group_list in self.attn_groups:
-            for group in group_list:
-                selected = [n for n in group.layer_names if n in layer_names]
-                if selected:
-                    selected_groups.append((group, selected))
+        # Keyed by identity: the drafter passes one persistent layer-name set.
+        cached = self._layer_attn_groups_cache.get(id(layer_names))
+        if cached is None:
+            selected_groups = [
+                (g, sel)
+                for group_list in self.attn_groups
+                for g in group_list
+                if (sel := [n for n in g.layer_names if n in layer_names])
+            ]
+            gids = {
+                g.metadata_builders[0].kv_cache_group_id for g, _ in selected_groups
+            }
+            cached = self._layer_attn_groups_cache[id(layer_names)] = (
+                selected_groups,
+                gids,
+            )
+        selected_groups, gids = cached
         ctx = self._attn_metadata_builder_ctx
         if ctx.staged_block_tables is None and selected_groups:
             # One H2D for exactly the groups this targeted walk will build.
-            stage_block_table_uploads(
-                self,
-                ctx,
-                num_reqs_padded,
-                gids={
-                    group.metadata_builders[0].kv_cache_group_id
-                    for group, _ in selected_groups
-                },
-            )
+            stage_block_table_uploads(self, ctx, num_reqs_padded, gids=gids)
         common = SimpleNamespace(num_reqs=num_reqs_padded)
         metadata: dict[str, AttentionMetadata] = {}
         for group, selected in selected_groups:
@@ -2632,6 +2636,7 @@ class TPUModelRunner(GPUModelRunner):
         num_rejected_chunks: list[torch.Tensor] = []
         num_draft_per_req: dict[int, int] = {}
         req_offset = 0
+        single_chunk = len(next_tokens_per_chunk) == 1
         # Uniform `1+K` source span per request: req position `p` maps to source
         # `[p*(1+K) .. p*(1+K)+K]`, and `req_id_to_index_copy` stores `p` (the
         # index builder multiplies by the stride). All chunks carry their next
@@ -2639,11 +2644,15 @@ class TPUModelRunner(GPUModelRunner):
         for nt_chunk, num_reqs, md in zip(
             next_tokens_per_chunk, state.num_reqs_list, state.spec_decode_metadata_list
         ):
-            drafts_chunk = drafts[req_offset : req_offset + num_reqs]
-            src = assemble_spec_next_tokens(nt_chunk, drafts_chunk, num_reqs)
+            keep_pad = single_chunk and drafts.shape[0] == nt_chunk.shape[0]
+            rows = nt_chunk.shape[0] if keep_pad else num_reqs
+            drafts_chunk = (
+                drafts if keep_pad else drafts[req_offset : req_offset + num_reqs]
+            )
+            src = assemble_spec_next_tokens(nt_chunk, drafts_chunk, rows)
             if md is not None:
                 num_rejected_chunks.append(
-                    compute_num_rejected(nt_chunk, md.draft_lengths[:num_reqs])
+                    compute_num_rejected(nt_chunk, md.draft_lengths[:rows])
                 )
                 for r in range(num_reqs):
                     num_draft_per_req[req_offset + r] = int(md.draft_lengths_cpu[r])
@@ -2651,7 +2660,7 @@ class TPUModelRunner(GPUModelRunner):
                 # No drafts were verified this step, so there is no rejection
                 # correction or speculative output-placeholder rollback.
                 num_rejected_chunks.append(
-                    torch.zeros(num_reqs, dtype=torch.int32, device=nt_chunk.device)
+                    torch.zeros(rows, dtype=torch.int32, device=nt_chunk.device)
                 )
             next_tokens_tpu_chunks.append(src)
             for r in range(num_reqs):
@@ -2687,15 +2696,18 @@ class TPUModelRunner(GPUModelRunner):
         num_rejected_chunks: list[torch.Tensor] = []
         num_draft_per_req: dict[int, int] = {}
         req_offset = 0
+        single_chunk = len(combined_selected_tokens) == 1
         for sel, n in zip(combined_selected_tokens, combined_real_lens):
-            bonus = sel.view(-1)[:n].unsqueeze(1)  # [n, 1]
-            drafts_chunk = drafts[req_offset : req_offset + n]  # [n, K]
+            sel_flat = sel.view(-1)
+            keep_pad = single_chunk and drafts.shape[0] == sel_flat.shape[0]
+            bonus = sel_flat if keep_pad else sel_flat[:n]
+            drafts_chunk = drafts if keep_pad else drafts[req_offset : req_offset + n]
             src = torch.cat(
-                [bonus.to(drafts_chunk.dtype), drafts_chunk], dim=1
-            )  # [n, 1+K] = [bonus, draft_1..K]
+                [bonus.unsqueeze(1).to(drafts_chunk.dtype), drafts_chunk], dim=1
+            )  # [rows, 1+K] = [bonus, draft_1..K]
             next_tokens_tpu_chunks.append(src.reshape(-1))
             num_rejected_chunks.append(
-                torch.zeros(n, dtype=torch.int32, device=src.device)
+                torch.zeros(src.shape[0], dtype=torch.int32, device=src.device)
             )
             for r in range(n):
                 next_token_indices[req_offset + r] = req_offset + r
@@ -2750,11 +2762,10 @@ class TPUModelRunner(GPUModelRunner):
         max_len = self.input_batch.token_ids_cpu.shape[1]
         known = (positions_np >= 0) & (positions_np < max_len)
         pre_async = (
-            self._pre_async_results
-            if self.scheduler_config.async_scheduling
-            else None
+            self._pre_async_results if self.scheduler_config.async_scheduling else None
         )
         async_subst: tuple[np.ndarray, np.ndarray] | None = None
+        spec_async_subst: tuple[list[tuple[int, int, int, int, int]], int] | None = None
         if layout_plan.kind is not SequenceLayoutKind.ALL:
             known[:] = False
             pre_async = None
@@ -2763,7 +2774,11 @@ class TPUModelRunner(GPUModelRunner):
             dec_mask = known & (
                 positions_np >= self.input_batch.num_prompt_tokens[req_indices]
             )
-            if self.speculative_config is not None and dec_mask.any():
+            if (
+                self.speculative_config is not None
+                and dec_mask.any()
+                and not envs.VLLM_DSV41_ENGRAM_H2D_PREFIX
+            ):
                 known[dec_mask] = False
                 if known.any():
                     self.input_batch.token_ids_cpu[
@@ -2779,24 +2794,45 @@ class TPUModelRunner(GPUModelRunner):
                 req_id_map = pre_async.req_id_to_index_copy
                 req_pre_idx = np.array(
                     [
-                        req_id_map.get(req_ids[r], -1)
-                        if req_ids[r] is not None
-                        else -1
+                        req_id_map.get(req_ids[r], -1) if req_ids[r] is not None else -1
                         for r in range(self.input_batch.num_reqs)
                     ],
                     dtype=np.int32,
                 )
                 tok_pre_idx = np.where(dec_mask, req_pre_idx[req_indices], -1)
-                subst_tok_idx = np.flatnonzero(tok_pre_idx >= 0).astype(np.int32)
                 write_mask = known & (tok_pre_idx < 0)
                 if write_mask.any():
                     self.input_batch.token_ids_cpu[
                         req_indices[write_mask], positions_np[write_mask]
                     ] = sched_ids[write_mask]
-                if subst_tok_idx.size > 0:
-                    async_subst = (subst_tok_idx, tok_pre_idx[subst_tok_idx])
+                if (
+                    self.speculative_config is not None
+                    and pre_async.spec_decode_num_rejected_tokens is not None
+                ):
+                    spec_reqs: list[tuple[int, int, int, int, int]] = []
+                    num_draft_map = pre_async.num_draft_per_req or {}
+                    for r in np.unique(req_indices[tok_pre_idx >= 0]).tolist():
+                        r_int = int(r)
+                        pre_pos = int(req_pre_idx[r_int])
+                        end_idx_no_spec = int(
+                            self.input_batch.num_tokens_no_spec[r_int]
+                        )
+                        n_placeholder = 1 + int(num_draft_map.get(pre_pos, 0))
+                        n_sched = int(((req_indices == r_int) & dec_mask).sum())
+                        spec_reqs.append(
+                            (r_int, pre_pos, end_idx_no_spec, n_placeholder, n_sched)
+                        )
+                    if spec_reqs:
+                        stride = 1 + self.speculative_config.num_speculative_tokens
+                        spec_async_subst = (spec_reqs, stride)
+                    else:
+                        pre_async = None
                 else:
-                    pre_async = None
+                    subst_tok_idx = np.flatnonzero(tok_pre_idx >= 0).astype(np.int32)
+                    if subst_tok_idx.size > 0:
+                        async_subst = (subst_tok_idx, tok_pre_idx[subst_tok_idx])
+                    else:
+                        pre_async = None
             else:
                 self.input_batch.token_ids_cpu[
                     req_indices[known], positions_np[known]
@@ -2817,6 +2853,7 @@ class TPUModelRunner(GPUModelRunner):
             layout_plan.global_padded_num_tokens,
             pre_async=pre_async,
             async_subst=async_subst,
+            spec_async_subst=spec_async_subst,
             debug_tok0_out=debug_tok0_out,
         )
 
@@ -4642,14 +4679,22 @@ class TPUModelRunner(GPUModelRunner):
                 # Seed = the just-sampled tokens, kept on-device (no D2H):
                 # propose takes the sync seed path but reads the seed from
                 # `device_seed`.
-                device_seed = torch.cat(
-                    [
-                        sel.view(-1)[:n]
-                        for sel, n in zip(
-                            combined_selected_tokens, combined_selected_tokens_real_lens
-                        )
-                    ]
-                )
+                # DFlash pads one chunk's seed itself; skipping the slice keeps
+                # the seed shape static.
+                if len(combined_selected_tokens) == 1 and isinstance(
+                    self.drafter, DFlashProposer
+                ):
+                    device_seed = combined_selected_tokens[0].view(-1)
+                else:
+                    device_seed = torch.cat(
+                        [
+                            sel.view(-1)[:n]
+                            for sel, n in zip(
+                                combined_selected_tokens,
+                                combined_selected_tokens_real_lens,
+                            )
+                        ]
+                    )
                 with self._stage_timing.stage("draft_propose"):
                     eagle3_drafts = self.spec_decode_manager.propose_draft_token_ids(
                         sampled_token_ids=[],
@@ -4714,7 +4759,9 @@ class TPUModelRunner(GPUModelRunner):
                 # take_draft_token_ids() to replace the async scheduler's -1
                 # splaceholders. Stage after the TP pin above so the host
                 # copy matches what gets substituted on device.
-                self.spec_decode_manager.stage_draft_token_ids_for_host(eagle3_drafts)
+                self.spec_decode_manager.stage_draft_token_ids_for_host(
+                    eagle3_drafts[:num_reqs]
+                )
 
             # Build the async substitution source from the drafts proposed
             # above: the [bonus, draft_1..K] source + 1+K next_token_indices,
@@ -4771,10 +4818,31 @@ class TPUModelRunner(GPUModelRunner):
                     bound = self.max_num_reqs * (
                         1 + self.speculative_config.num_speculative_tokens
                     )
-                    if next_tokens_tpu.shape[0] < bound:
-                        next_tokens_tpu = torch.nn.functional.pad(
-                            next_tokens_tpu, (0, bound - next_tokens_tpu.shape[0])
+                    if spec_num_rejected.shape[0] < self.max_num_reqs:
+                        spec_num_rejected = torch.nn.functional.pad(
+                            spec_num_rejected,
+                            (0, self.max_num_reqs - spec_num_rejected.shape[0]),
                         )
+                else:
+                    bound = _get_padded_num_reqs_with_upper_limit(
+                        next_tokens_tpu.shape[0], self.max_num_reqs
+                    )
+                if next_tokens_tpu.shape[0] < bound:
+                    next_tokens_tpu = torch.nn.functional.pad(
+                        next_tokens_tpu, (0, bound - next_tokens_tpu.shape[0])
+                    )
+                next_tokens_cpu = None
+                next_tokens_ready_event = None
+                if (
+                    spec_num_rejected is not None
+                    and envs.VLLM_DSV41_ENGRAM_H2D_PREFIX
+                    and getattr(getattr(self.model, "model", None), "engram_hash", None)
+                    is not None
+                ):
+                    next_tokens_cpu = next_tokens_tpu.to("cpu", non_blocking=True)
+                    if next_tokens_tpu.device.type == "tpu":
+                        next_tokens_ready_event = torch.tpu.Event()
+                        next_tokens_ready_event.record()
                 self._pre_async_results = AsyncPreResults(
                     req_ids=req_ids,
                     next_tokens_tpu=next_tokens_tpu,
@@ -4784,6 +4852,8 @@ class TPUModelRunner(GPUModelRunner):
                     copy_state=copy_state,
                     spec_decode_num_rejected_tokens=spec_num_rejected,
                     num_draft_per_req=num_draft_per_req,
+                    next_tokens_cpu=next_tokens_cpu,
+                    next_tokens_ready_event=next_tokens_ready_event,
                 )
             else:
                 self._pre_async_results = None
@@ -4906,6 +4976,12 @@ class TPUModelRunner(GPUModelRunner):
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
             self.drafter.load_model(self.model)
+            draft_model = getattr(self.drafter, "draft_model", None)
+            if draft_model is not None:
+                if envs.TPU_ROPE_CACHE_TRUNCATE:
+                    self._truncate_rope_caches(draft_model)
+                if envs.TPU_ROPE_CACHE_ROW_MAJOR:
+                    runner_utils.relayout_rope_caches(draft_model)
 
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
@@ -5280,7 +5356,7 @@ class TPUModelRunner(GPUModelRunner):
                     inputs.append(self._pp_topk_buffer)
                 synchronize_tensors(inputs)
             started = time.perf_counter()
-            out, _ = self.forward_model(
+            out, aux = self.forward_model(
                 input_ids=input_ids,
                 positions=position_ids,
                 inputs_embeds=inputs_embeds,
@@ -5307,7 +5383,8 @@ class TPUModelRunner(GPUModelRunner):
                 _idx = torch.zeros(num_reqs, dtype=torch.int32, device=out.device)
                 _ = self.compute_selected_logits(out, _idx)
             if not dp_lockstep:
-                synchronize_tensors(out)
+                # Also materialize the aux hidden states (drafter inputs).
+                synchronize_tensors([out, *aux] if aux else out)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
         self._hidden_states_dtype = out.dtype
         return elapsed_ms if profiling else None
@@ -6308,6 +6385,47 @@ class TPUModelRunner(GPUModelRunner):
                         self._warmup_spec_batch(int(R), P_small, greedy=False)
         logger.info("spec-decode warmup compiled %d graphs", self.num_xla_graphs - n0)
 
+    def _spec_warmup_group_layout(
+        self, max_pos: int, num_reqs: int = 1
+    ) -> list[tuple[int, int]] | None:
+        """(base_block, blocks_per_req) per kv-cache group, or None if short."""
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+
+        from vllm_torchtpu.runner.kv_cache_deepseek_v41_flash import (
+            DeepseekV41FlashKVCacheAllocator,
+        )
+
+        top = int(self.kv_cache_config.num_blocks)
+        groups = self.kv_cache_config.kv_cache_groups
+        specs = [g.kv_cache_spec for g in groups]
+        max_reqs = getattr(self, "max_num_reqs", None)
+        num_state, num_swa = DeepseekV41FlashKVCacheAllocator.aux_partition_sizes(
+            top, max_reqs if isinstance(max_reqs, int) else None
+        )
+        has_dsv4_aux = (
+            num_state
+            and any(isinstance(s, MLAAttentionSpec) for s in specs)
+            and any(isinstance(s, SlidingWindowMLASpec) for s in specs)
+        )
+        max_pos = min(max_pos, self.max_model_len)
+        layout: list[tuple[int, int]] = []
+        for g in groups:
+            # DSV4 keeps SWA and compressor-state blocks in top-of-pool
+            # partitions, so those groups take warmup ids from there.
+            if not has_dsv4_aux or not isinstance(
+                g.kv_cache_spec, SlidingWindowMLASpec
+            ):
+                base = 1
+            elif any(n.endswith(".compressor.state_cache") for n in g.layer_names):
+                base = top - num_state
+            else:
+                base = top - num_state - num_swa
+            g_nblk = cdiv(max_pos, int(g.kv_cache_spec.block_size))
+            if base + num_reqs * g_nblk > top:
+                return None
+            layout.append((base, g_nblk))
+        return layout
+
     def _warmup_spec_batch(self, R: int, P: int, greedy: bool = True) -> None:
         """Warm an nr=R decode batch: prefill R synthetic requests then decode
         them together so the multi-request fused programs are compiled.
@@ -6324,17 +6442,8 @@ class TPUModelRunner(GPUModelRunner):
         K = self.speculative_config.num_speculative_tokens
         room = self.max_model_len - P
         n_decode = min(max(5, K + 2), max(0, room // (1 + K) - 1))
-        max_pos = min(self.max_model_len, P + n_decode * (1 + K))
-        # Per-group block counts at each group's own block size (see
-        # _warmup_one_spec_request); the per-request stride uses the widest
-        # group so every group's ranges stay disjoint across requests.
-        group_nblks = []
-        for group in self.kv_cache_config.kv_cache_groups:
-            gbs = int(group.kv_cache_spec.block_size)
-            group_nblks.append(min(cdiv(max_pos, gbs), cdiv(self.max_model_len, gbs)))
-        nblk = max(group_nblks)
-        top = int(self.kv_cache_config.num_blocks)
-        if top <= R * nblk + 1:
+        group_layout = self._spec_warmup_group_layout(P + n_decode * (1 + K), R)
+        if group_layout is None:
             logger.warning("skip spec-decode warmup R=%d: not enough kv blocks", R)
             return
         rids = [f"__spec_warmup_b{R}_{j}__" for j in range(R)]
@@ -6348,7 +6457,6 @@ class TPUModelRunner(GPUModelRunner):
             # reserve block 0 and keep each synthetic request's range disjoint.
             new_reqs = []
             for j, rid in enumerate(rids):
-                lo = 1 + j * nblk
                 new_reqs.append(
                     NewRequestData(
                         req_id=rid,
@@ -6357,7 +6465,8 @@ class TPUModelRunner(GPUModelRunner):
                         sampling_params=sp,
                         pooling_params=None,
                         block_ids=tuple(
-                            list(range(lo, lo + g_nblk)) for g_nblk in group_nblks
+                            list(range(b + j * n, b + (j + 1) * n))
+                            for b, n in group_layout
                         ),
                         num_computed_tokens=0,
                         lora_request=None,
@@ -6429,28 +6538,13 @@ class TPUModelRunner(GPUModelRunner):
         room = self.max_model_len - P
         n_dec = min(max(5, K + 2), max(0, room // (1 + K) - 1))
         decode_ncts = [P + t for t in range(n_dec)]
-        # Reuse low physical block ids, as in _warmup_spec_batch and the LIFO
-        # BlockPool workaround, rather than exercising the SC2-sensitive end
-        # of the pool. Warmup runs before serving and tears down each request;
-        # real requests overwrite their valid KV positions on first prefill.
-        # Cover the highest context this request reaches, reserving block 0.
-        # Count blocks per kv-cache group at that group's own block size:
-        # groups differ on hybrid models (mamba vs attention), and the
-        # runner-level self.block_size predates the executor's post-load
-        # block-size finalization.
-        max_pos = min(self.max_model_len, max([P] + decode_ncts) + (1 + K))
-        top = int(self.kv_cache_config.num_blocks)
-        block_ids_per_group = []
-        max_nblk = 0
-        for group in self.kv_cache_config.kv_cache_groups:
-            gbs = int(group.kv_cache_spec.block_size)
-            g_nblk = min(cdiv(max_pos, gbs), cdiv(self.max_model_len, gbs))
-            block_ids_per_group.append(list(range(1, 1 + g_nblk)))
-            max_nblk = max(max_nblk, g_nblk)
-        if top <= max_nblk + 1:
+        group_layout = self._spec_warmup_group_layout(max([P] + decode_ncts) + (1 + K))
+        if group_layout is None:
             logger.warning("skip spec-decode warmup P=%d: not enough kv blocks", P)
             return
-        block_ids = tuple(block_ids_per_group)
+        block_ids = tuple(
+            list(range(base, base + g_nblk)) for base, g_nblk in group_layout
+        )
         sp = SamplingParams(temperature=0.0 if greedy else 1.0)
         try:
             # ---- prefill ----

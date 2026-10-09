@@ -59,7 +59,6 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_flash_mhc
     get_mhc_ops_v41,
     get_mhc_post_collapse_norm_v41_op,
     get_mhc_post_v41_op,
-    mhc_collapse_v41,
 )
 from vllm_torchtpu.models.vllm.deepseek_v4.model import (
     DeepseekV4ForCausalLM,
@@ -154,10 +153,14 @@ def _ced_zero_output(hidden_states: torch.Tensor) -> torch.Tensor:
     return fn(hidden_states)
 
 
-def _moe_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
+def _moe_vllm_config(
+    vllm_config: VllmConfig, overrides: dict[str, int] | None = None
+) -> VllmConfig:
     """Shallow config view for the shared V4 MoE, which reads hf_config."""
     hf_config = copy.copy(vllm_config.model_config.hf_config)
     hf_config.num_hash_layers = 0
+    for k, v in (overrides or {}).items():
+        setattr(hf_config, k, v)
     model_config = copy.copy(vllm_config.model_config)
     model_config.hf_config = hf_config
     moe_vllm_config = copy.copy(vllm_config)
@@ -175,10 +178,12 @@ class DeepseekV41DecoderLayer(nn.Module):
         topk_indices_buffer: torch.Tensor,
         engram_layout: EngramLayout | None = None,
         candidate_block_buffer: torch.Tensor | None = None,
+        moe_overrides: dict[str, int] | None = None,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
         layer_idx = extract_layer_index(prefix)
+        self.layer_id = layer_idx
         self.is_first_stream_layer = layer_idx in (0, config.num_hidden_layers)
         tp_size = get_tensor_model_parallel_world_size()
         self.attn = VllmDeepseekV41MLAAttention(
@@ -188,7 +193,7 @@ class DeepseekV41DecoderLayer(nn.Module):
             candidate_block_buffer=candidate_block_buffer,
         )
         self.ffn = DeepseekV4MoE(
-            _moe_vllm_config(vllm_config),
+            _moe_vllm_config(vllm_config, moe_overrides),
             prefix=f"{prefix}.ffn",
             reduce_results=(tp_size <= 1),
         )
@@ -326,7 +331,15 @@ class DeepseekV41DecoderLayer(nn.Module):
         ced_decoder: bool | None = None,
         ced_global_from_encoder: bool | None = None,
         tp_rank_idx: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        capture_entry_aux: bool = False,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
         ops = self.mhc_ops
         if (
             getattr(self, "_hc_attn_fn_split", None) is None
@@ -355,10 +368,12 @@ class DeepseekV41DecoderLayer(nn.Module):
         )
         hidden_states_fp8: torch.Tensor | None = None
         hidden_states_scale: torch.Tensor | None = None
+        entry_aux: torch.Tensor | None = None
         engram_fused_done = False
         if self.engram is not None:
             if (
-                engram_hashes is not None
+                not capture_entry_aux
+                and engram_hashes is not None
                 and previous_x is not None
                 and (
                     ops.fused_engram_quant is not None
@@ -416,11 +431,15 @@ class DeepseekV41DecoderLayer(nn.Module):
                     engram_fused_done = True
             if not engram_fused_done:
                 if previous_x is not None:
-                    assert previous_post_mix is not None and previous_res_mix is not None
+                    assert (
+                        previous_post_mix is not None and previous_res_mix is not None
+                    )
                     residual = ops.post(
                         previous_x, residual, previous_post_mix, previous_res_mix
                     )
                     previous_x = None
+                if capture_entry_aux:
+                    entry_aux = residual.mean(dim=-2)
                 if engram_hashes is not None:
                     residual = self.engram(
                         residual,
@@ -491,6 +510,9 @@ class DeepseekV41DecoderLayer(nn.Module):
                     hc_attn_base,
                 )
 
+        if capture_entry_aux and entry_aux is None:
+            entry_aux = residual.mean(dim=-2)
+
         if token_sharded:
             x = self.attn(
                 positions,
@@ -551,6 +573,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                 ffn_pre,
                 ffn_post,
                 ffn_comb,
+                entry_aux,
             )
         residual, ffn_post, ffn_comb, hidden_states, ffn_pre = ops.fused(
             x,
@@ -566,8 +589,8 @@ class DeepseekV41DecoderLayer(nn.Module):
         if token_sharded:
             hidden_states_ffn = tp_all_gather(hidden_states, dim=0)
             ffn_out = self.ffn(hidden_states_ffn, return_token_sharded=True)
-            return ffn_out, residual, ffn_pre, ffn_post, ffn_comb
-        return self.ffn(hidden_states), residual, ffn_pre, ffn_post, ffn_comb
+            return ffn_out, residual, ffn_pre, ffn_post, ffn_comb, entry_aux
+        return self.ffn(hidden_states), residual, ffn_pre, ffn_post, ffn_comb, entry_aux
 
 
 def _clear_stage_caches(layers: Iterable[nn.Module]) -> None:
@@ -576,6 +599,17 @@ def _clear_stage_caches(layers: Iterable[nn.Module]) -> None:
         if attn is not None:
             attn._step_indexer_metadata = None
             attn._step_csa_union = None
+
+
+def _gather_aux_hidden_states(
+    aux_hidden_states: list[torch.Tensor], token_sharded_mhc: bool
+) -> list[torch.Tensor]:
+    if not aux_hidden_states or not token_sharded_mhc:
+        return aux_hidden_states
+    if len(aux_hidden_states) == 1:
+        return [tp_all_gather(aux_hidden_states[0], dim=0)]
+    gathered = tp_all_gather(torch.cat(aux_hidden_states, dim=-1), dim=0)
+    return list(gathered.chunk(len(aux_hidden_states), dim=-1))
 
 
 def _run_engram_prelude_and_layers(
@@ -593,6 +627,7 @@ def _run_engram_prelude_and_layers(
     intermediate_tensors: IntermediateTensors | None,
     inputs_embeds: torch.Tensor | None,
     precomputed_engram_hashes: torch.Tensor | None = None,
+    aux_hidden_state_layers: tuple[int, ...] = (),
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -601,6 +636,7 @@ def _run_engram_prelude_and_layers(
     torch.Tensor | None,
     torch.Tensor | None,
     bool,
+    list[torch.Tensor],
 ]:
     tp_size = get_tensor_model_parallel_world_size()
     if tp_size > 1 and envs.VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS > 0:
@@ -628,9 +664,7 @@ def _run_engram_prelude_and_layers(
             engram_hashes_raw = engram_hash.dummy_hashes(input_ids)
         if precomputed_engram_hashes is not None:
             t_local = (
-                input_ids.shape[0] // tp_size
-                if tp_shard_engram
-                else input_ids.shape[0]
+                input_ids.shape[0] // tp_size if tp_shard_engram else input_ids.shape[0]
             )
             n_hash_cols = int(engram_hash.offsets.shape[1])
             table_bytes = _engram_table_bytes(n_hash_cols, engram_packed_dim)
@@ -699,6 +733,7 @@ def _run_engram_prelude_and_layers(
         pre_mix = intermediate_tensors["pre_mix"]
 
     previous_x, previous_post_mix, previous_res_mix = None, None, None
+    aux_hidden_states: list[torch.Tensor] = []
     for layer in layers:
         if (
             layer.engram is not None
@@ -744,6 +779,7 @@ def _run_engram_prelude_and_layers(
             pre_mix,
             previous_post_mix,
             previous_res_mix,
+            entry_aux,
         ) = layer(
             positions,
             hidden_states,
@@ -754,7 +790,10 @@ def _run_engram_prelude_and_layers(
             engram_hashes=engram_hashes,
             token_sharded=token_sharded_mhc,
             tp_rank_idx=tp_rank_idx,
+            capture_entry_aux=(layer.layer_id in aux_hidden_state_layers),
         )
+        if entry_aux is not None:
+            aux_hidden_states.append(entry_aux)
     return (
         positions,
         hidden_states,
@@ -763,6 +802,7 @@ def _run_engram_prelude_and_layers(
         previous_post_mix,
         previous_res_mix,
         token_sharded_mhc,
+        aux_hidden_states,
     )
 
 
@@ -799,6 +839,7 @@ class DeepseekV41FullStage(nn.Module):
         self._single_backbone_cond = single_backbone_cond
         self._engram_table_ids = engram_table_ids
         self._engram_packed_dim = engram_packed_dim
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
         self.embed_tokens = embed_tokens
         self.layers = nn.ModuleList(layers)
         self.engram_hash = engram_hash
@@ -814,7 +855,7 @@ class DeepseekV41FullStage(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         engram_hashes: torch.Tensor | None = None,
         run_upper_layers: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if self._single_backbone_cond:
             from vllm_torchtpu.models.vllm.deepseek_v41.cond_backbone import (
                 _dsv41_cond_upper_boundary_op,
@@ -831,6 +872,7 @@ class DeepseekV41FullStage(nn.Module):
                 previous_post_mix,
                 previous_res_mix,
                 token_sharded_mhc,
+                aux_hidden_states,
             ) = _run_engram_prelude_and_layers(
                 embed_tokens=self.embed_tokens,
                 layers=enc_layers,
@@ -845,6 +887,7 @@ class DeepseekV41FullStage(nn.Module):
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
                 precomputed_engram_hashes=engram_hashes,
+                aux_hidden_state_layers=self.aux_hidden_state_layers,
             )
             _clear_stage_caches(enc_layers)
             hidden_states, normalized = get_mhc_post_collapse_norm_v41_op(
@@ -874,6 +917,7 @@ class DeepseekV41FullStage(nn.Module):
                     pre_mix,
                     previous_post_mix,
                     previous_res_mix,
+                    entry_aux,
                 ) = layer(
                     positions,
                     hidden_states,
@@ -886,7 +930,10 @@ class DeepseekV41FullStage(nn.Module):
                     ced_decoder=True,
                     ced_global_from_encoder=(idx == 0),
                     tp_rank_idx=self.tp_rank_idx,
+                    capture_entry_aux=(layer.layer_id in self.aux_hidden_state_layers),
                 )
+                if entry_aux is not None:
+                    aux_hidden_states.append(entry_aux)
             _clear_stage_caches(dec_layers)
             out = get_mhc_final_collapse_norm_v41_op(self.rms_norm_eps)(
                 previous_x,
@@ -898,6 +945,11 @@ class DeepseekV41FullStage(nn.Module):
             )
             if token_sharded_mhc:
                 out = tp_all_gather(out, dim=0)
+            aux_hidden_states = _gather_aux_hidden_states(
+                aux_hidden_states, token_sharded_mhc
+            )
+            if self.aux_hidden_state_layers:
+                return out, aux_hidden_states
             return out
 
         (
@@ -908,6 +960,7 @@ class DeepseekV41FullStage(nn.Module):
             previous_post_mix,
             previous_res_mix,
             token_sharded_mhc,
+            aux_hidden_states,
         ) = _run_engram_prelude_and_layers(
             embed_tokens=self.embed_tokens,
             layers=self.layers,
@@ -922,6 +975,7 @@ class DeepseekV41FullStage(nn.Module):
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             precomputed_engram_hashes=engram_hashes,
+            aux_hidden_state_layers=self.aux_hidden_state_layers,
         )
         _clear_stage_caches(self.layers)
         if not get_pp_group().is_last_rank:
@@ -941,6 +995,11 @@ class DeepseekV41FullStage(nn.Module):
         )
         if token_sharded_mhc:
             out = tp_all_gather(out, dim=0)
+        aux_hidden_states = _gather_aux_hidden_states(
+            aux_hidden_states, token_sharded_mhc
+        )
+        if self.aux_hidden_state_layers:
+            return out, aux_hidden_states
         return out
 
 
@@ -976,6 +1035,7 @@ class DeepseekV41EncoderStage(nn.Module):
         self.rms_norm_eps = float(vllm_config.model_config.hf_config.rms_norm_eps)
         self._engram_table_ids = engram_table_ids
         self._engram_packed_dim = engram_packed_dim
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
         self.embed_tokens = embed_tokens
         self.layers = nn.ModuleList(encoder_layers)
         self.decoder0_attn_norm = decoder0_attn_norm
@@ -991,7 +1051,7 @@ class DeepseekV41EncoderStage(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         engram_hashes: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         for layer in self.layers:
             layer.attn._in_encoder_stage = True
         (
@@ -1002,6 +1062,7 @@ class DeepseekV41EncoderStage(nn.Module):
             previous_post_mix,
             previous_res_mix,
             token_sharded_mhc,
+            _,
         ) = _run_engram_prelude_and_layers(
             embed_tokens=self.embed_tokens,
             layers=self.layers,
@@ -1058,6 +1119,7 @@ class DeepseekV41DecoderStage(nn.Module):
         super().__init__()
         self.prefix = prefix
         self.rms_norm_eps = float(vllm_config.model_config.hf_config.rms_norm_eps)
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
         self.layers = nn.ModuleList(decoder_layers)
         self.norm = norm
         self.register_buffer("tp_rank_idx", tp_rank_idx, persistent=False)
@@ -1067,7 +1129,7 @@ class DeepseekV41DecoderStage(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         pre_mix: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         tp_size = get_tensor_model_parallel_world_size()
         assert hidden_states.shape[0] == positions.shape[0]
         assert pre_mix.shape[0] == positions.shape[0]
@@ -1087,6 +1149,7 @@ class DeepseekV41DecoderStage(nn.Module):
             pre_mix = tp_shard_slice(pre_mix, tp_size, tp_rank, self.tp_rank_idx)
 
         previous_x, previous_post_mix, previous_res_mix = None, None, None
+        aux_hidden_states: list[torch.Tensor] = []
         for idx, layer in enumerate(self.layers):
             (
                 previous_x,
@@ -1094,6 +1157,7 @@ class DeepseekV41DecoderStage(nn.Module):
                 pre_mix,
                 previous_post_mix,
                 previous_res_mix,
+                entry_aux,
             ) = layer(
                 positions,
                 hidden_states,
@@ -1106,7 +1170,10 @@ class DeepseekV41DecoderStage(nn.Module):
                 ced_decoder=True,
                 ced_global_from_encoder=(idx == 0),
                 tp_rank_idx=self.tp_rank_idx,
+                capture_entry_aux=(layer.layer_id in self.aux_hidden_state_layers),
             )
+            if entry_aux is not None:
+                aux_hidden_states.append(entry_aux)
         _clear_stage_caches(self.layers)
         out = get_mhc_final_collapse_norm_v41_op(self.rms_norm_eps)(
             previous_x,
@@ -1118,6 +1185,11 @@ class DeepseekV41DecoderStage(nn.Module):
         )
         if token_sharded_mhc:
             out = tp_all_gather(out, dim=0)
+        aux_hidden_states = _gather_aux_hidden_states(
+            aux_hidden_states, token_sharded_mhc
+        )
+        if self.aux_hidden_state_layers:
+            return out, aux_hidden_states
         return out
 
 
@@ -1325,9 +1397,7 @@ class DeepseekV41Model(nn.Module):
                     else DeepseekV41DecoderStage(
                         vllm_config=vllm_config,
                         prefix=f"{prefix}.decoder_stage",
-                        decoder_layers=self.layers[
-                            ced_boundary : self.end_layer
-                        ],
+                        decoder_layers=self.layers[ced_boundary : self.end_layer],
                         norm=self.norm,
                         tp_rank_idx=self.tp_rank_idx,
                     )
@@ -1358,6 +1428,13 @@ class DeepseekV41Model(nn.Module):
                     self._ced_enabled,
                     envs.VLLM_DSV41_TP_ATTN_MIN_TOKENS,
                 )
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
+
+    def _set_aux_hidden_state_layers(self, layer_ids: tuple[int, ...]) -> None:
+        self.aux_hidden_state_layers = tuple(layer_ids)
+        for stage in (self.full_stage, self.encoder_stage, self.decoder_stage):
+            if stage is not None:
+                stage.aux_hidden_state_layers = self.aux_hidden_state_layers
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1371,6 +1448,7 @@ class DeepseekV41Model(nn.Module):
         padded_num_tokens: int,
         pre_async: Any = None,
         async_subst: Any = None,
+        spec_async_subst: Any = None,
         debug_tok0_out: dict[int, int] | None = None,
     ) -> None:
         if self.engram_hash is not None:
@@ -1384,6 +1462,7 @@ class DeepseekV41Model(nn.Module):
                 known,
                 pre_async=pre_async,
                 async_subst=async_subst,
+                spec_async_subst=spec_async_subst,
                 debug_tok0_out=debug_tok0_out,
                 padded_num_tokens=padded_num_tokens,
             )
@@ -1392,11 +1471,7 @@ class DeepseekV41Model(nn.Module):
     def precompile_ced_helpers(
         self, num_tokens_paddings: list[int], device: torch.device
     ) -> None:
-        if (
-            not self._ced_enabled
-            or self.decoder_stage is None
-            or device.type != "tpu"
-        ):
+        if not self._ced_enabled or self.decoder_stage is None or device.type != "tpu":
             return
         dtype = self._vllm_config.model_config.dtype
         hsize = int(self.config.hidden_size)
@@ -1512,18 +1587,15 @@ class DeepseekV41Model(nn.Module):
                 need_upper = abs(int(self._dp_ced_decoder_bucket)) > 0
             else:
                 attn_metadata = fwd_ctx.attn_metadata
-                swa_prefix = (
-                    self.layers[self._ced_boundary].attn.swa_cache_layer.prefix
-                )
+                swa_prefix = self.layers[self._ced_boundary].attn.swa_cache_layer.prefix
                 swa_meta = (
                     attn_metadata.get(swa_prefix)
                     if isinstance(attn_metadata, dict)
                     else attn_metadata
                 )
-                compile_sizes = (
-                    self._vllm_config.compilation_config.compile_sizes
-                    or [num_tokens]
-                )
+                compile_sizes = self._vllm_config.compilation_config.compile_sizes or [
+                    num_tokens
+                ]
                 plan = plan_decoder_replay(
                     swa_meta,
                     self._ced_window,
@@ -1531,9 +1603,7 @@ class DeepseekV41Model(nn.Module):
                     compile_sizes,
                 )
                 need_upper = plan is None or plan.padded_num_tokens > 0
-            run_upper = (
-                self._cond_flag_one if need_upper else self._cond_flag_zero
-            )
+            run_upper = self._cond_flag_one if need_upper else self._cond_flag_zero
             return self.full_stage(
                 input_ids=input_ids,
                 positions=positions,
@@ -1675,6 +1745,12 @@ class DeepseekV41Model(nn.Module):
                 hidden_states=dec_hidden,
                 pre_mix=dec_pre_mix,
             )
+        if isinstance(dec_out, tuple):
+            dec_out_t, dec_aux = dec_out
+            return (
+                _ced_scatter_output(dec_out_t, scatter_idx),
+                [_ced_scatter_output(a, scatter_idx) for a in dec_aux],
+            )
         return _ced_scatter_output(dec_out, scatter_idx)
 
     get_expert_mapping = DeepseekV4Model.get_expert_mapping
@@ -1794,6 +1870,9 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
     """DeepSeek-V4.1 causal language model on TPU."""
 
     model_cls = DeepseekV41Model  # type: ignore[assignment]
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model._set_aux_hidden_state_layers(layers)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         filtered_weights = (

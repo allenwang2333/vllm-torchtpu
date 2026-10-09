@@ -166,3 +166,25 @@ def test_no_forced_embedding_sharing():
     # has_own_embed_tokens / has_own_lm_head instead of force-sharing.
     p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
     assert p._force_share_target_embeddings is False
+
+
+def test_draft_token_paddings_tuned_buckets():
+    p = _make_proposer(
+        {"dspark_noise_token_id": 7, "dspark_block_size": 5, **_LAYER_IDS},
+        num_speculative_tokens=5,
+    )
+    p.runner = SimpleNamespace(
+        num_reqs_max_model_len=64,
+        num_reqs_most_model_len=None,
+        num_tokens_paddings=[16, 32, 64, 128, 256, 512],
+    )
+    assert p._get_draft_token_paddings() == [16, 80, 160, 240, 320]
+    assert (p._get_padded_len(10), p._get_padded_len(325)) == (16, 512)
+
+
+@pytest.mark.parametrize("model_type,shift", [("deepseek_v41", 0), ("qwen3", 1)])
+def test_aux_layer_shift(model_type, shift):
+    # DeepSeek-V4.1 drafts read each target layer's entry stream.
+    with mock.patch.object(_FakeHFConfig, "model_type", model_type, create=True):
+        p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
+    assert p._aux_layer_shift == shift

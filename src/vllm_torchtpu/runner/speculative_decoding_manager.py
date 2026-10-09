@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -225,6 +225,9 @@ class SpeculativeDecodingManager:
         )
         if cache_key == self._meta_cache_key:
             assert self._meta_cache is not None
+            if self.runner.scheduler_config.async_scheduling:
+                # Runner fills draft_token_ids on device; copy so chunks don't share it.
+                return replace(self._meta_cache)
             assert self._meta_cache_np is not None
             logits_indices, target_logits_indices, padded_logits_length = (
                 self._meta_cache_np

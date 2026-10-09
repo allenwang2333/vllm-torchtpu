@@ -166,9 +166,7 @@ def _engram_hash_jax(
         total_sum = total_sum + lk[:, :, :, None] * w_limbs[k][None, :, :, :]
 
     rem_all = (total_sum % p_u32[None, :, :, :]).astype(jnp.int32)
-    out_hashes = (
-        rem_all.reshape(num_tokens, primes.shape[0], -1) + offsets[None, :, :]
-    )
+    out_hashes = rem_all.reshape(num_tokens, primes.shape[0], -1) + offsets[None, :, :]
     out_hashes = jnp.where(valid[:, None, None], out_hashes, jnp.int32(-1))
     return out_hashes, hash_cache
 
@@ -231,7 +229,13 @@ class TpuNgramHashState(nn.Module):
         self._offsets_np = layout.offsets.cpu().numpy().astype(np.int64)
 
     def cpu_hashes(
-        self, token_ids: np.ndarray, req_idx: np.ndarray, pos: np.ndarray
+        self,
+        token_ids: np.ndarray,
+        req_idx: np.ndarray,
+        pos: np.ndarray,
+        *,
+        span_start_by_req: np.ndarray | None = None,
+        span_tokens: np.ndarray | None = None,
     ) -> np.ndarray:
         """Compute _engram_hash_jax hashes on CPU from host prompt token history."""
         tm = self._token_map_np
@@ -240,9 +244,19 @@ class TpuNgramHashState(nn.Module):
         for shift in range(self.layout.max_ngram_size):
             lookback = pos - shift
             blocked |= lookback < 0
-            ids = np.clip(
-                token_ids[req_idx, np.maximum(lookback, 0)], 0, tm.shape[0] - 1
-            )
+            clipped_lb = np.maximum(lookback, 0)
+            ids = token_ids[req_idx, clipped_lb]
+            if span_start_by_req is not None and span_tokens is not None:
+                in_span = lookback >= span_start_by_req[req_idx]
+                if in_span.any():
+                    ids = ids.copy()
+                    rel = np.clip(
+                        lookback[in_span] - span_start_by_req[req_idx[in_span]],
+                        0,
+                        span_tokens.shape[1] - 1,
+                    )
+                    ids[in_span] = span_tokens[req_idx[in_span], rel]
+            ids = np.clip(ids, 0, tm.shape[0] - 1)
             toks.append(np.where(blocked, self.pad_id, tm[ids]))
         roll = toks[0][:, None] * self._mult_np[None, :, 0]
         out = []
@@ -279,11 +293,9 @@ class TpuNgramHashState(nn.Module):
         t_0 = np.where(pos < 0, self.pad_id, tm[clipped_0])
         term_0 = t_0[:, None, None] * self._mult_np[None, :, 0, None]
         rolled = term_0 ^ cum_xor
-        hashed = (
-            rolled[:, :, :, None] % self._primes_np[None, :, :, :]
-        ).reshape(pos.shape[0], self._mult_np.shape[0], -1) + self._offsets_np[
-            None, :, :
-        ]
+        hashed = (rolled[:, :, :, None] % self._primes_np[None, :, :, :]).reshape(
+            pos.shape[0], self._mult_np.shape[0], -1
+        ) + self._offsets_np[None, :, :]
         return hashed.astype(np.int32)
 
     @property
@@ -555,9 +567,7 @@ class _EngramTableSlices:
 
     __slots__ = ("_buf_2d", "_num_tokens", "_table_bytes")
 
-    def __init__(
-        self, buf_2d: torch.Tensor, num_tokens: int, table_bytes: int
-    ) -> None:
+    def __init__(self, buf_2d: torch.Tensor, num_tokens: int, table_bytes: int) -> None:
         t_u8 = min(max(num_tokens, 32), buf_2d.shape[0])
         self._buf_2d = buf_2d[:t_u8]
         self._num_tokens = num_tokens
@@ -697,6 +707,7 @@ def engram_prefetch_prefill(
     padded_num_tokens: int,
     pre_async: Any = None,
     async_subst: tuple[np.ndarray, np.ndarray] | list[tuple[int, int]] | None = None,
+    spec_async_subst: tuple[list[tuple[int, int, int, int, int]], int] | None = None,
     debug_tok0_out: dict[int, int] | None = None,
 ) -> None:
     """Gather Engram rows for scheduled tokens on CPU during input preparation."""
@@ -735,9 +746,7 @@ def engram_prefetch_prefill(
             g_tok, g_pre = norm_subst
             in_slice = (g_tok >= t_start) & (g_tok < t_start + n_real_local)
             local_subst = (
-                (g_tok[in_slice] - t_start, g_pre[in_slice])
-                if in_slice.any()
-                else None
+                (g_tok[in_slice] - t_start, g_pre[in_slice]) if in_slice.any() else None
             )
         else:
             local_subst = None
@@ -806,10 +815,70 @@ def engram_prefetch_prefill(
                 hashes_s[known_slice] = hash_state.cpu_hashes_finish_tok0(
                     ids_0_all[known_slice], pos_k, cum_xor
                 )
+            elif spec_async_subst is not None and pre_async is not None:
+                spec_reqs, stride = spec_async_subst
+                pre_sampled_t = pre_async.wait_for_copy()
+                next_t_fn = getattr(pre_async, "wait_for_next_tokens_cpu", None)
+                next_t = next_t_fn() if callable(next_t_fn) else None
+                if next_t is None:
+                    next_tpu: Any = getattr(pre_async, "next_tokens_tpu", None)
+                    if isinstance(next_tpu, torch.Tensor):
+                        next_t = next_tpu.to("cpu")
+                if pre_sampled_t is not None and next_t is not None and spec_reqs:
+                    pre_sampled_np = pre_sampled_t.detach().to(torch.int64).numpy()
+                    if pre_sampled_np.ndim == 1:
+                        pre_sampled_np = pre_sampled_np[:, None]
+                    next_np = next_t.detach().reshape(-1).to(torch.int64).numpy()
+                    max_r = max(
+                        int(token_ids.shape[0]) - 1,
+                        max(r for r, _, _, _, _ in spec_reqs),
+                    )
+                    num_rej_by_req = np.zeros(max_r + 1, dtype=np.int32)
+                    span_start_by_req = np.full(
+                        max_r + 1, token_ids.shape[1] + 100, dtype=np.int32
+                    )
+                    span_tokens = np.zeros(
+                        (max_r + 1, 2 * stride + 2), dtype=token_ids.dtype
+                    )
+                    for (
+                        r,
+                        pre_pos,
+                        end_idx_no_spec,
+                        n_placeholder,
+                        n_sched,
+                    ) in spec_reqs:
+                        if 0 <= pre_pos < pre_sampled_np.shape[0]:
+                            row = pre_sampled_np[pre_pos]
+                            sampled_r = row[row != -1]
+                            l_acc = max(1, int(sampled_r.shape[0]))
+                        else:
+                            sampled_r = np.zeros(1, dtype=np.int64)
+                            l_acc = 1
+                        n_rej = max(0, n_placeholder - l_acc)
+                        start_idx = end_idx_no_spec - n_placeholder
+                        src_off = pre_pos * stride
+                        src = next_np[src_off : src_off + n_sched]
+                        n_prev_acc = max(0, l_acc - 1)
+                        if n_prev_acc > 0:
+                            span_tokens[r, :n_prev_acc] = sampled_r[:n_prev_acc]
+                        if src.shape[0] > 0:
+                            span_tokens[r, n_prev_acc : n_prev_acc + src.shape[0]] = src
+                        num_rej_by_req[r] = n_rej
+                        span_start_by_req[r] = start_idx
+                    pos_k_adj = pos_k - num_rej_by_req[req_k]
+                    hashes_s[known_slice] = hash_state.cpu_hashes(
+                        token_ids,
+                        req_k,
+                        pos_k_adj,
+                        span_start_by_req=span_start_by_req,
+                        span_tokens=span_tokens,
+                    )
+                else:
+                    hashes_s[known_slice] = hash_state.cpu_hashes(
+                        token_ids, req_k, pos_k
+                    )
             else:
-                hashes_s[known_slice] = hash_state.cpu_hashes(
-                    token_ids, req_k, pos_k
-                )
+                hashes_s[known_slice] = hash_state.cpu_hashes(token_ids, req_k, pos_k)
                 if (
                     debug_tok0_out is not None
                     and norm_subst is not None
@@ -1133,9 +1202,7 @@ class TpuParallelEngramEmbedding(nn.Module):
             s_u8 = torch.full((2, self.scale_dim), 127, dtype=torch.uint8, device="cpu")
             _CPU_ENGRAM_WEIGHTS[self.table_id] = (w_u8, s_u8)
 
-    def forward(
-        self, packed: torch.Tensor | _EngramTableSlice
-    ) -> torch.Tensor:
+    def forward(self, packed: torch.Tensor | _EngramTableSlice) -> torch.Tensor:
         """Dequantize 2D [T_pad, table_bytes] or 3D [T, n_hash_cols, packed_dim] FP8+E8M0 rows to BF16."""
         if isinstance(packed, _EngramTableSlice) or packed.ndim == 2:
             if isinstance(packed, _EngramTableSlice):
@@ -1182,9 +1249,9 @@ class TpuParallelEngramEmbedding(nn.Module):
                 self.block_size,
                 packed.device,
             )
-            scales_expanded = torch.matmul(
-                scales_f32.to(torch.bfloat16), expand_3d
-            ).to(torch.float32)
+            scales_expanded = torch.matmul(scales_f32.to(torch.bfloat16), expand_3d).to(
+                torch.float32
+            )
             return (values.to(torch.float32) * scales_expanded).to(torch.bfloat16)
         return (
             (

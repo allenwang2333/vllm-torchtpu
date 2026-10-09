@@ -153,12 +153,25 @@ class AsyncPreResults:
     # it does not count proposals for the next step. Bootstrap/non-spec: 0 or
     # absent entry (None for an entirely non-spec result).
     num_draft_per_req: dict[int, int] | None = None
+    # Non-blocking D2H copy of `next_tokens_tpu` (`[max_num_reqs * (1 + K)]`)
+    # for 1+K speculative host Engram prefetch.
+    next_tokens_cpu: torch.Tensor | None = None
+    next_tokens_ready_event: Any = None
+    _next_tokens_completed: bool = False
 
     def wait_for_copy(self) -> torch.Tensor | None:
         if self.copy_state is None:
             return None
         self.copy_state.wait()
         return self.copy_state.sampled_token_ids_cpu
+
+    def wait_for_next_tokens_cpu(self) -> torch.Tensor | None:
+        if self.next_tokens_cpu is None:
+            return None
+        if not self._next_tokens_completed and self.next_tokens_ready_event is not None:
+            self.next_tokens_ready_event.synchronize()
+            self._next_tokens_completed = True
+        return self.next_tokens_cpu
 
 
 class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):

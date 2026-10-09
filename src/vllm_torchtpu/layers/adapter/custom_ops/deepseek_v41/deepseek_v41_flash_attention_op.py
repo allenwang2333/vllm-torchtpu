@@ -91,6 +91,7 @@ def _run_swa(
     swa_only: bool,
     ced_decoder: bool = False,
     token_parallel: bool = False,
+    non_causal_block: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """SWA pass; output stays unnormalized when CSA follows (folds swa_l/swa_m)."""
     if sw_cache.shape[0] == 0:
@@ -142,8 +143,14 @@ def _run_swa(
             if sliding_window == 1
             else (
                 max(2, (sliding_window + logical_page_size - 1) // logical_page_size),
-                max(2, (sliding_window + 128 + logical_page_size - 1) // logical_page_size),
-                max(2, (sliding_window + 128 + logical_page_size - 1) // logical_page_size),
+                max(
+                    2,
+                    (sliding_window + 128 + logical_page_size - 1) // logical_page_size,
+                ),
+                max(
+                    2,
+                    (sliding_window + 128 + logical_page_size - 1) // logical_page_size,
+                ),
             )
         ),
         # With L10 single_bkv=True (bkv_p=16 covers bq_sz=128 + sw=128 - 1 <= 256),
@@ -151,7 +158,7 @@ def _run_swa(
         num_queries_per_block=(
             1,
             128,
-            8 if ced_decoder else 128,
+            8 if (ced_decoder or non_causal_block or sliding_window == 1) else 128,
         ),
         q_compute_block_size=(
             16 if q.shape[1] > 32 else (32 if q.shape[1] > 8 else 64)
@@ -168,6 +175,8 @@ def _run_swa(
             )
         ),
         unnormalized_output=not swa_only or sliding_window == 1,
+        non_causal_block=non_causal_block,
+        block_anchored_window=non_causal_block,
         ced_decoder=ced_decoder,
     )
 
@@ -194,6 +203,7 @@ def _attention_swa(
     logical_page_size: int,
     ced_decoder: bool = False,
     token_parallel: bool = False,
+    non_causal_block: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """SWA-only layers; the main-cache inputs keep the CSA op's signature."""
     output, updated_sw_cache, _, _ = _run_swa(
@@ -211,6 +221,7 @@ def _attention_swa(
         swa_only=True,
         ced_decoder=ced_decoder,
         token_parallel=token_parallel,
+        non_causal_block=non_causal_block,
     )
     return output, updated_sw_cache
 
@@ -235,8 +246,7 @@ def _attention_csa(
     cand_bits_tiled: jax.Array | None = None,
     n_unique: jax.Array | None = None,
     *,
-    precomputed_union: tuple[jax.Array, jax.Array, jax.Array]
-    | None = None,
+    precomputed_union: tuple[jax.Array, jax.Array, jax.Array] | None = None,
     sm_scale: float,
     sliding_window: int,
     logical_page_size: int,

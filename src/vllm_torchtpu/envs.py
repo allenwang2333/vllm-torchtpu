@@ -153,6 +153,7 @@ if TYPE_CHECKING:
     VLLM_DSV41_TP_INDEXER_MIN_TOKENS: int = 64
     VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS: int = 0
     VLLM_DSV41_TP_ATTN_LOCAL_TOPK: bool = False
+    VLLM_DSV41_ENGRAM_H2D_PREFIX: bool = True
 
 
 def env_with_choices(
@@ -897,9 +898,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Token-parallel indexer at TP>1: each rank scores T/tp tokens, then the
     # top-k indices are all-gathered. Used when T >= MIN_TOKENS and T/tp >= 8.
     "VLLM_DSV41_TP_INDEXER": env_bool("VLLM_DSV41_TP_INDEXER", False),
-    "VLLM_DSV41_TP_INDEXER_MIN_TOKENS": env_int(
-        "VLLM_DSV41_TP_INDEXER_MIN_TOKENS", 64
-    ),
+    "VLLM_DSV41_TP_INDEXER_MIN_TOKENS": env_int("VLLM_DSV41_TP_INDEXER_MIN_TOKENS", 64),
     # L12: steps with fewer tokens keep the mHC residual replicated over TP
     # (all-reduce) instead of token-sharded (reduce-scatter + all-gathers).
     # tp_collectives.tp_token_shard_ok is the one predicate for the Engram
@@ -911,6 +910,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # when the indexer layer and every layer reusing its top-k rows run
     # token-parallel attention, which reads only this rank's T/tp rows.
     "VLLM_DSV41_TP_ATTN_LOCAL_TOPK": env_bool("VLLM_DSV41_TP_ATTN_LOCAL_TOPK", False),
+    # Enable host Engram prefetch and active-bucket prefix H2D upload across
+    # 1+K speculative verify tokens.
+    "VLLM_DSV41_ENGRAM_H2D_PREFIX": env_bool("VLLM_DSV41_ENGRAM_H2D_PREFIX", True),
 }
 
 

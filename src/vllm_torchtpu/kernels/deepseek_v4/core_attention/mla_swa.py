@@ -110,6 +110,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     logical_page_size: int,
     unnormalized_output: bool,
     non_causal_block: bool,
+    block_anchored_window: bool,
     q_compute_block_size: int | None,
     bkv_p,
     bq_sz,
@@ -152,6 +153,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     # Static upper bound on the number of bkv blocks any (seq, bq) block can
     # need
     max_bkv_blocks = cdiv(bq_sz + sliding_window - 1, bkv_sz)
+    if non_causal_block and block_anchored_window:
+        # The shared window starts one key before the first query's own window.
+        max_bkv_blocks = cdiv(bq_sz + sliding_window, bkv_sz)
     single_bkv_block = max_bkv_blocks == 1
 
     start_seq_idx = start_end_seq_idx_ref[0]
@@ -225,7 +229,10 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                 // num_q_heads
             )
             keep = (q_span - k_span).astype(jnp.uint32) < jnp.uint32(sliding_window)
-            if non_causal_block:
+            if non_causal_block and block_anchored_window:
+                # Every block query sees [kv_len - q_len - sliding_window, kv_len).
+                keep = (k_span >= (kv_len - q_len - sliding_window)) & (k_span < kv_len)
+            elif non_causal_block:
                 keep = keep | ((k_span >= kv_len - q_len) & (k_span < kv_len))
             s = jnp.einsum("nd,md->nm", qc, kv, preferred_element_type=jnp.float32)
             s *= sm_scale
@@ -240,7 +247,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                     p = jnp.exp(s_curr - m_curr)
                     # Issue MXU Q_{c+1} K^T immediately so MXU and VPU overlap across chunks
                     s_next = _compute_qk_and_mask(c + 1) if c + 1 < num_chunks else None
-                    pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
+                    pv = jnp.einsum(
+                        "nm,md->nd", p, kv, preferred_element_type=jnp.float32
+                    )
                     l_curr = jnp.sum(p, axis=1, keepdims=True)
                     if unnormalized_output:
                         out_c = pv.astype(q_dtype)
@@ -258,7 +267,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                     p = jnp.exp(s_curr - m_curr[:, None])
                     # Issue MXU Q_{c+1} K^T immediately so MXU and VPU overlap across chunks
                     s_next = _compute_qk_and_mask(c + 1) if c + 1 < num_chunks else None
-                    pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
+                    pv = jnp.einsum(
+                        "nm,md->nd", p, kv, preferred_element_type=jnp.float32
+                    )
                     l_curr = jnp.sum(p, axis=1)
                     if unnormalized_output:
                         out_c = pv.astype(q_dtype)
@@ -267,9 +278,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                         out_c = (
                             lax.div(pv, l_tot[:, None])
                             if q_dtype == jnp.float32
-                            else (pv * pl.reciprocal(l_tot[:, None], approx=True)).astype(
-                                q_dtype
-                            )
+                            else (
+                                pv * pl.reciprocal(l_tot[:, None], approx=True)
+                            ).astype(q_dtype)
                         )
                 q_row_start = c * chunk_sz
                 q_row_end = q_row_start + chunk_sz
@@ -325,6 +336,11 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         )
 
     def _start_offset(seq_idx, bq_idx):
+        if non_causal_block and block_anchored_window:
+            return jnp.maximum(
+                _get_kv_len(seq_idx) - _get_q_len(seq_idx) - sliding_window,
+                0,
+            )
         # Exact start of the sliding window for this (seq, bq) block, in tokens.
         # The first query row of this bq block sits at position
         #   q_pos_min = kv_len - q_len + bq_idx * bq_sz
@@ -800,7 +816,9 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                 wait_send_bo(bo_sem_idx)
 
                 # Store output from acc to bo.
-                bo_x2_ref.at[bo_sem_idx][...] = out.reshape(bq_sz, num_q_heads, head_dim)
+                bo_x2_ref.at[bo_sem_idx][...] = out.reshape(
+                    bq_sz, num_q_heads, head_dim
+                )
                 if num_q_heads % 128 == 0:
                     bl_x2_ref.at[bo_sem_idx][...] = l_ref[...].reshape(
                         bq_sz, num_q_heads
@@ -1496,6 +1514,7 @@ def run_mla_batched_decode_kernel(
         "logical_page_size",
         "unnormalized_output",
         "non_causal_block",
+        "block_anchored_window",
         "q_compute_block_size",
         "decode_seq_batch_size",
         "ced_decoder",
@@ -1529,6 +1548,8 @@ def mla_sliding_window_ragged_paged_attention(
     # sequence attend bidirectionally within themselves (window still bounds
     # context keys). Requires q_len <= sliding_window.
     non_causal_block: bool = False,
+    # V4.1 draft blocks: each query sees the block and sliding_window keys before it.
+    block_anchored_window: bool = False,
     decode_seq_batch_size: int = 32,
     ced_decoder: bool = False,
 ) -> tuple[
@@ -1627,9 +1648,9 @@ def mla_sliding_window_ragged_paged_attention(
         )
         lo = u16[:, :lkv_dim].astype(jnp.uint32)
         hi = u16[:, lkv_dim:].astype(jnp.uint32)
-        new_kv = lax.bitcast_convert_type(
-            lo | (hi << 16), jnp.int32
-        ).reshape(new_kv.shape[0], slots_per_token, lkv_dim)
+        new_kv = lax.bitcast_convert_type(lo | (hi << 16), jnp.int32).reshape(
+            new_kv.shape[0], slots_per_token, lkv_dim
+        )
     else:
         new_kv = prepare_kv_inputs(new_kv)  # [max_num_tokens, token_bytes] uint8
         new_kv = new_kv.reshape(new_kv.shape[0], slots_per_token * kv_packing, lkv_dim)
@@ -1704,7 +1725,11 @@ def mla_sliding_window_ragged_paged_attention(
         )
         bm_double_buf = bl_double_buf
 
-        single_bkv = cdiv(bq_sz + sliding_window - 1, bkv_sz) == 1
+        single_bkv = (
+            cdiv(bq_sz + sliding_window, bkv_sz) == 1
+            if (non_causal_block and block_anchored_window)
+            else cdiv(bq_sz + sliding_window - 1, bkv_sz) == 1
+        )
         scratch_rows = 128 if single_bkv else bq_sz * num_q_heads
         l_scratch = pltpu.VMEM(
             (scratch_rows,),
@@ -1762,6 +1787,7 @@ def mla_sliding_window_ragged_paged_attention(
                     logical_page_size=logical_page_size,
                     unnormalized_output=unnormalized_output,
                     non_causal_block=non_causal_block,
+                    block_anchored_window=block_anchored_window,
                     q_compute_block_size=q_compute_block_size,
                     ced_decoder=ced_decoder,
                 ),
@@ -1829,6 +1855,7 @@ def mla_sliding_window_ragged_paged_attention(
 
     bkv_sz = num_kv_pages_per_blocks[0] * logical_page_size
     if sliding_window <= bkv_sz:
+
         def _run_dec_batch(args):
             return run_mla_batched_decode_kernel(
                 q,

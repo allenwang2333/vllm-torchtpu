@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from vllm_torchtpu.models.vllm.deepseek_v41.dspark import DSparkDeepseekV41ForCausalLM
 from vllm_torchtpu.models.vllm.deepseek_v41.model import DeepseekV41ForCausalLM
 
-__all__ = ["DeepseekV41ForCausalLM"]
+__all__ = ["DSparkDeepseekV41ForCausalLM", "DeepseekV41ForCausalLM"]
