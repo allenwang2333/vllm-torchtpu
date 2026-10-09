@@ -63,9 +63,11 @@ def test_async_fence_install_and_execution(monkeypatch: pytest.MonkeyPatch):
     res2 = patched_fn(runner, 2)
     assert torch.equal(res2, torch.tensor([1, 2, 3]))
     assert called_original == [4, 2]
+    # One event per runner: the second call waits on it, then re-records.
     mock_event.synchronize.assert_called_once()
-    mock_event2.record.assert_called_once()
-    assert runner._deepseek_v41_lookback_fence is mock_event2
+    mock_event.record.assert_called_once()
+    mock_event2.record.assert_not_called()
+    assert runner._deepseek_v41_lookback_fence is mock_event
 
 
 def test_v2_engram_ngram_hash_state_write_cache(monkeypatch: pytest.MonkeyPatch):

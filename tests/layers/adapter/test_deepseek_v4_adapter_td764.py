@@ -684,5 +684,9 @@ class TestV1V2EngramAndAsyncFence:
         ev1.record.assert_called_once()
 
         assert torch.equal(wrapped(runner, 5), torch.tensor([5]))
+        # One event per runner: the second call waits on it, then re-records.
         ev1.synchronize.assert_called_once()
-        ev2.record.assert_called_once()
+        assert ev1.record.call_count == 2
+        ev2.record.assert_not_called()
+        assert runner._deepseek_v41_lookback_fence is ev1
+        assert calls == [3, 5]

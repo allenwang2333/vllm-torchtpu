@@ -1050,33 +1050,40 @@ class TestV2Engram:
             assert hasattr(v2_engram, name)
 
 
-def test_common_engram_v030_v031_import_fallback():
+def test_common_engram_v030_v031_import_fallback(monkeypatch):
     """Verify common/engram.py imports engram symbols under both runtimes.
 
-    Supports v0.31 (common.engram) and v0.30 (nvidia.engram).
+    Supports v0.31 (common.engram) and v0.30 (nvidia.engram). The module
+    source is re-executed into a throwaway namespace with ``runpy`` rather
+    than ``importlib.reload``: a reload rebinds ``common_engram`` classes and
+    leaves the v1/v2 ``NgramHashState`` / ``Engram`` subclasses pointing at the
+    stale bases, which broke later tests depending on run order.
     """
-    import importlib
+    import runpy
     import sys
     from types import ModuleType
 
-    # 1. v0.31 runtime scenario: common.engram exports symbols
+    # v0.31 runtime scenario: common.engram exports symbols.
     mock_common = ModuleType("vllm.models.deepseek_v41.common.engram")
     mock_common.engram_gathered_num_tokens = "mock_gathered_tokens_v031"
     mock_common.engram_head_shard_rank = "mock_shard_rank_v031"
-    orig_common = sys.modules.get("vllm.models.deepseek_v41.common.engram")
-    sys.modules["vllm.models.deepseek_v41.common.engram"] = mock_common
-    try:
-        importlib.reload(common_engram)
-        assert common_engram.engram_gathered_num_tokens == "mock_gathered_tokens_v031"
-        assert common_engram.engram_head_shard_rank == "mock_shard_rank_v031"
-    finally:
-        if orig_common is not None:
-            sys.modules["vllm.models.deepseek_v41.common.engram"] = orig_common
-        else:
-            sys.modules.pop("vllm.models.deepseek_v41.common.engram", None)
+    mock_common.gather_engram_hashes = "mock_gather_v031"
+    real = sys.modules["vllm.models.deepseek_v41.common.engram"]
+    for key, value in vars(real).items():
+        if not key.startswith("__") and not hasattr(mock_common, key):
+            setattr(mock_common, key, value)
+    monkeypatch.setitem(
+        sys.modules, "vllm.models.deepseek_v41.common.engram", mock_common
+    )
+    import vllm.models.deepseek_v41.common as upstream_common_pkg
 
-    # 2. v0.30 runtime scenario: restore normal environment and reload
-    # (nvidia.engram fallback)
-    importlib.reload(common_engram)
+    monkeypatch.setattr(upstream_common_pkg, "engram", mock_common)
+    ns = runpy.run_path(common_engram.__file__, run_name="_engram_v031_check")
+    assert ns["engram_gathered_num_tokens"] == "mock_gathered_tokens_v031"
+    assert ns["engram_head_shard_rank"] == "mock_shard_rank_v031"
+    monkeypatch.undo()
+
+    # The real module keeps its normal-environment symbols, unreloaded.
+    assert sys.modules[common_engram.__name__] is common_engram
     assert hasattr(common_engram, "engram_gathered_num_tokens")
     assert hasattr(common_engram, "engram_head_shard_rank")
