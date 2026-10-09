@@ -17,7 +17,9 @@ adaptive_fused_moe wraps the kernel builder in a shard_map over the
 expert-parallel mesh axis: quantize, dispatch, kernel, combine.
 """
 
+import functools
 import threading
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -121,6 +123,7 @@ def _combine_arrivals(
     return sum(terms).astype(out_dtype).reshape(t_local, hidden)
 
 
+@functools.lru_cache(maxsize=64)
 def _exchange_layout(t_local, topk, e_total, quantized):
     """(scale offset, count offset, width) of the flat routing payload.
 
@@ -175,6 +178,16 @@ def _unpack_routing_exchange(exchange, layout, t_local, topk, e_total):
     return pairs, scale_bits, counts
 
 
+@functools.lru_cache(maxsize=64)
+def _validate_mesh_ep_ranks(mesh_ep_ranks: tuple[int, ...], ep: int) -> bool:
+    """Validate mesh_ep_ranks is a permutation of range(ep) and return if identity."""
+    if tuple(sorted(mesh_ep_ranks)) != tuple(range(ep)):
+        raise ValueError(
+            f"mesh_ep_ranks must be a permutation of range({ep}); got {mesh_ep_ranks}"
+        )
+    return mesh_ep_ranks == tuple(range(ep))
+
+
 def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
     """Map selected experts from EP-rank order to device-mesh order.
 
@@ -190,14 +203,12 @@ def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
     """
     if mesh_ep_ranks is None:
         return topk_idx
-    ep = len(mesh_ep_ranks)
-    if tuple(sorted(mesh_ep_ranks)) != tuple(range(ep)):
-        raise ValueError(
-            f"mesh_ep_ranks must be a permutation of range({ep}); got {mesh_ep_ranks}"
-        )
+    ranks_tuple = tuple(int(r) for r in mesh_ep_ranks)
+    if _validate_mesh_ep_ranks(ranks_tuple, len(ranks_tuple)):
+        return topk_idx
     owning_rank = topk_idx // g_local
     mesh_block = jnp.zeros_like(topk_idx)
-    for mesh_index, ep_rank in enumerate(mesh_ep_ranks):
+    for mesh_index, ep_rank in enumerate(ranks_tuple):
         mesh_block = jnp.where(
             owning_rank == ep_rank, jnp.int32(mesh_index), mesh_block
         )
@@ -318,7 +329,7 @@ def adaptive_fused_moe(
         if actual != weight_format:
             raise ValueError(
                 f"weight format {weight_format!r} takes "
-                f"{jnp.dtype(form.weight_dtype).name} expert weights and "
+                f"{jnp.dtype(cast(Any, form.weight_dtype)).name} expert weights and "
                 f"{name} is {jnp.dtype(w.dtype).name}"
                 f"{f', which is the {actual!r} form' if actual else ''}"
             )
@@ -365,11 +376,7 @@ def adaptive_fused_moe(
     ep = mesh.shape[ax]
     if mesh_ep_ranks is not None:
         mesh_ep_ranks = tuple(int(rank) for rank in mesh_ep_ranks)
-        if tuple(sorted(mesh_ep_ranks)) != tuple(range(ep)):
-            raise ValueError(
-                "mesh_ep_ranks must be a permutation of "
-                f"range({ep}); got {mesh_ep_ranks}"
-            )
+        _validate_mesh_ep_ranks(mesh_ep_ranks, ep)
     if T <= 0 or T % ep or e_total <= 0 or e_total % ep:
         raise ValueError(
             "positive token and expert counts must be divisible by EP size"
@@ -577,7 +584,7 @@ def adaptive_fused_moe(
         # dropped; nothing reads them, and the slab's own rows are the same
         # either way.
         if form.quantized_activations:
-            scale_bits = jnp.repeat(scale_bits_g, topk)
+            scale_bits = jnp.repeat(cast(jax.Array, scale_bits_g), topk)
             scale_rows = act_scale_slab_rows(ragged_stride)
             scale_slab = lax.bitcast_convert_type(
                 jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)

@@ -114,6 +114,13 @@ N_SCALE_TABLES = 2  # a weight scale table per matmul, where the format has
 # the clamped GPT-OSS form, whose math is the grouped-matmul kernel's
 # function imported above rather than a second copy.
 ACT_FNS = ("silu", "swigluoai")
+_HBM_BLOCK_SPEC = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+_FORMAT_TAGS = {
+    host.WeightFormat.FP8: "",
+    host.WeightFormat.FP4: "_fp4w",
+    host.WeightFormat.INT8: "_int8w",
+    host.WeightFormat.BF16: "_bf16w",
+}
 
 
 def _apply_act(gate, up, act_fn):
@@ -132,6 +139,7 @@ def _apply_act(gate, up, act_fn):
     )
 
 
+@functools.lru_cache(maxsize=64)
 def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     """The ascending static tile heights a build emits, ending at tile_m.
 
@@ -1667,7 +1675,6 @@ def _build_fused_ep_moe_kernel(
         drain_transport()
         _all_pairs_barrier(ep)
 
-    hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     # The VMEM buffers come from the same list the VMEM accounting sums, in
     # the order the kernel body unpacks them: lhs_vm, w1_vm, w2_vm, the scale
     # tables where the format has them, the bias tables each build asked for,
@@ -1744,9 +1751,25 @@ def _build_fused_ep_moe_kernel(
         + int(has_w1_bias)
         + int(has_w2_bias)
     )
+    scratch_tuple = tuple(scratch)
+    in_specs = [_HBM_BLOCK_SPEC] * n_inputs
+    out_specs = [_HBM_BLOCK_SPEC] * 4
+    format_tag = _FORMAT_TAGS[weight_format]
+    bias_tag = ("_w13bias" if has_w1_bias else "") + ("_w2bias" if has_w2_bias else "")
+    kernel_name = (
+        f"adaptive_fused_moe"
+        f"{format_tag}"
+        f"{'' if act_fn == 'silu' else '_' + act_fn}"
+        f"{bias_tag}"
+        f"_g{g_local}_c{capacity}_w1b{w1_nbuf}_w2b{w2_nbuf}"
+    )
+    _call_cache = {}
 
     def make_call(recv_rows):
         """The pallas_call for this build, at this arrival-buffer height."""
+        cached = _call_cache.get(recv_rows)
+        if cached is not None:
+            return cached
         # A caller value, so it refuses rather than asserts: under `python
         # -O` a non-multiple truncates in the two divisions below and the
         # arrival buffer comes out short by up to ROWBLK - 1 rows, while the
@@ -1772,30 +1795,13 @@ def _build_fused_ep_moe_kernel(
                 jnp.float32,
             ),
         ]
-        # Include both selected ring depths in the compiled program name.
-        format_tag = {
-            host.WeightFormat.FP8: "",
-            host.WeightFormat.FP4: "_fp4w",
-            host.WeightFormat.INT8: "_int8w",
-            host.WeightFormat.BF16: "_bf16w",
-        }[weight_format]
-        bias_tag = ("_w13bias" if has_w1_bias else "") + (
-            "_w2bias" if has_w2_bias else ""
-        )
-        name = (
-            f"adaptive_fused_moe"
-            f"{format_tag}"
-            f"{'' if act_fn == 'silu' else '_' + act_fn}"
-            f"{bias_tag}"
-            f"_g{g_local}_c{capacity}_w1b{w1_nbuf}_w2b{w2_nbuf}"
-        )
-        return pl.pallas_call(
+        call = pl.pallas_call(
             kernel,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=N_PREFETCH,
-                in_specs=[hbm] * n_inputs,
-                out_specs=[hbm] * len(out_shape),
-                scratch_shapes=tuple(scratch),
+                in_specs=in_specs,
+                out_specs=out_specs,
+                scratch_shapes=scratch_tuple,
                 grid=(),
             ),
             out_shape=out_shape,
@@ -1805,8 +1811,10 @@ def _build_fused_ep_moe_kernel(
                 # Bounds checks cost time and change no computed value.
                 disable_bounds_checks=True,
             ),
-            name=name,
+            name=kernel_name,
         )
+        _call_cache[recv_rows] = call
+        return call
 
     def fn(
         tables,
@@ -1978,6 +1986,7 @@ COMBINE_PARITIES = 4
 COMBINE_LEAD = 2
 
 
+@functools.lru_cache(maxsize=64)
 def combine_step_tokens(t_local):
     """Tokens a combine step stages, or 0 where this path does not apply.
 
@@ -2103,13 +2112,12 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
         for p in range(COMBINE_PARITIES):
             pltpu.make_async_copy(out_vm.at[p], out_vm.at[p], out_sems.at[p]).wait()
 
-    hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     call = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
-            in_specs=[hbm],
-            out_specs=hbm,
+            in_specs=[_HBM_BLOCK_SPEC],
+            out_specs=_HBM_BLOCK_SPEC,
             scratch_shapes=(
                 pltpu.VMEM(
                     (COMBINE_PARITIES, topk * tb, lane_blocks, lanes), wire_dtype
