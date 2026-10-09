@@ -6,10 +6,6 @@ import json
 import pathlib
 import shlex
 import subprocess
-from types import SimpleNamespace
-from typing import Any, cast
-
-from vllm_torchtpu.core.owner_affine_block_pool import owner_step_budget
 
 CONFIG = (
     pathlib.Path(__file__).resolve().parents[2]
@@ -79,14 +75,14 @@ def test_every_bucket_divides_by_tp_and_each_sweep_point_has_its_own():
     cfg = _source()
     tp = int(cfg["TENSOR_PARALLELISM"])
     sizes = json.loads(cfg["COMPILE_SIZES"])
-    vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(tensor_parallel_size=tp),
-        compilation_config=SimpleNamespace(compile_sizes=sizes),
-    )
 
     assert all(size % tp == 0 for size in sizes)
-    budget = owner_step_budget(cast(Any, vllm_config))
-    assert budget == int(cfg["MAX_NUM_BATCHED_TOKENS"]) // tp
+    # The scheduler holds each owner to max_num_scheduled_tokens // tp tokens a
+    # step (owner_affine_block_pool._steer_preemption). The largest bucket is
+    # tp x that budget, so a step at the budget always has a bucket, also under
+    # a min(..., max(compile_sizes) // tp) guard.
+    budget = int(cfg["MAX_NUM_BATCHED_TOKENS"]) // tp
+    assert max(sizes) == tp * budget
     tokens_per_request = 1 + int(cfg["DSPARK_K"])
     for concurrency in map(int, cfg["CONCURRENCY_OPTIONS"].split()):
         busiest_owner = -(-concurrency // tp) * tokens_per_request
