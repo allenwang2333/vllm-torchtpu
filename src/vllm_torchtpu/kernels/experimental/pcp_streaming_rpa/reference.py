@@ -23,7 +23,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
 )
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class RuntimeScheduleReference:
     """Current/history runtime rows expanded from one production tile plan.
 
@@ -158,121 +158,122 @@ def build_runtime_schedule_reference(
         capture_current_kv = bool(plan[0, TilePlanField.CAPTURE_CURRENT_KV])
         block_table = block_tables[req_id]
         history_boundary_present = absolute_start % virtual_page_size != 0
+        token_owner_end = token_owner_start + current_effective_len
+        boundary_local_page = absolute_start // virtual_page_size
+        safe_boundary_page = min(max(boundary_local_page, 0), block_table.size - 1)
+        boundary_page_idx = int(block_table[safe_boundary_page])
+        owner_start_counts = [
+            _rank_token_count_before(
+                token_owner_start,
+                r,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+            )
+            for r in range(pcp_size)
+        ]
+        abs_start_counts = [
+            _rank_token_count_before(
+                absolute_start,
+                r,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+            )
+            for r in range(pcp_size)
+        ]
+        current_kv_hbm_starts = [
+            int(plan[r, TilePlanField.CURRENT_KV_HBM_START]) for r in range(pcp_size)
+        ]
+        writeback_hbm_prefixes = [
+            int(plan[r, TilePlanField.WRITEBACK_HBM_PREFIX]) for r in range(pcp_size)
+        ]
 
         for group_idx in range(int(current_num_groups[tile_idx])):
             is_history_boundary = history_boundary_present and group_idx == 0
             fresh_group_idx = max(group_idx - int(history_boundary_present), 0)
             cycle_start = token_owner_start // cycle * cycle + fresh_group_idx * cycle
-            token_owner_end = token_owner_start + current_effective_len
 
             for source_rank in range(pcp_size):
-                source_chunk_start = cycle_start + source_rank * interleave_size
-                overlap_start = max(source_chunk_start, token_owner_start)
-                overlap_end = min(source_chunk_start + interleave_size, token_owner_end)
-                fresh_valid_len = max(overlap_end - overlap_start, 0)
-                fresh_global_start = absolute_start + overlap_start - token_owner_start
-                source_rows_before_overlap = _rank_token_count_before(
-                    overlap_start,
-                    source_rank,
-                    pcp_size=pcp_size,
-                    interleave_size=interleave_size,
-                ) - _rank_token_count_before(
-                    token_owner_start,
-                    source_rank,
-                    pcp_size=pcp_size,
-                    interleave_size=interleave_size,
-                )
-                fresh_hbm_offset = (
-                    int(plan[source_rank, TilePlanField.CURRENT_KV_HBM_START])
-                    + source_rows_before_overlap
-                )
-
-                boundary_local_page = absolute_start // virtual_page_size
-                safe_boundary_page = min(
-                    max(boundary_local_page, 0), block_table.size - 1
-                )
-                boundary_page_idx = int(block_table[safe_boundary_page])
-                boundary_global_start = (
-                    boundary_local_page * virtual_page_size
-                    + source_rank * interleave_size
-                )
-                boundary_valid_len = _local_page_valid_len(
-                    absolute_start,
-                    boundary_local_page,
-                    source_rank,
-                    page_size=page_size,
-                    pcp_size=pcp_size,
-                    interleave_size=interleave_size,
-                )
-
-                if is_history_boundary:
-                    kv_valid_len = boundary_valid_len
-                    kv_page_idx = boundary_page_idx
-                    kv_global_start = boundary_global_start
-                    kv_hbm_offset = -1
-                else:
-                    kv_valid_len = fresh_valid_len
-                    kv_page_idx = 0
-                    kv_global_start = fresh_global_start
-                    kv_hbm_offset = fresh_hbm_offset
-                scheduled_req_id = req_id if kv_valid_len > 0 else -1
-
                 capture_len_0 = 0
                 capture_len_1 = 0
                 capture_owner_0 = -1
                 capture_owner_1 = -1
                 capture_offset_0 = 0
                 capture_offset_1 = 0
-                if (
-                    capture_current_kv
-                    and not is_history_boundary
-                    and fresh_valid_len > 0
-                ):
-                    capture_owner_0 = (fresh_global_start // interleave_size) % pcp_size
-                    next_owner_boundary = (
-                        fresh_global_start // interleave_size + 1
-                    ) * interleave_size
-                    capture_len_0 = min(
-                        fresh_valid_len,
-                        max(next_owner_boundary - fresh_global_start, 0),
+                if is_history_boundary:
+                    kv_valid_len = _local_page_valid_len(
+                        absolute_start,
+                        boundary_local_page,
+                        source_rank,
+                        page_size=page_size,
+                        pcp_size=pcp_size,
+                        interleave_size=interleave_size,
                     )
-                    capture_len_1 = fresh_valid_len - capture_len_0
-                    capture_global_start_1 = fresh_global_start + capture_len_0
-                    capture_owner_1 = (
-                        capture_global_start_1 // interleave_size
-                    ) % pcp_size
-                    capture_offset_0 = int(
-                        plan[capture_owner_0, TilePlanField.WRITEBACK_HBM_PREFIX]
-                    ) + (
+                    kv_page_idx = boundary_page_idx
+                    kv_global_start = (
+                        boundary_local_page * virtual_page_size
+                        + source_rank * interleave_size
+                    )
+                    kv_hbm_offset = -1
+                else:
+                    source_chunk_start = cycle_start + source_rank * interleave_size
+                    overlap_start = max(source_chunk_start, token_owner_start)
+                    overlap_end = min(
+                        source_chunk_start + interleave_size, token_owner_end
+                    )
+                    fresh_valid_len = max(overlap_end - overlap_start, 0)
+                    fresh_global_start = (
+                        absolute_start + overlap_start - token_owner_start
+                    )
+                    source_rows_before_overlap = (
                         _rank_token_count_before(
-                            fresh_global_start,
-                            capture_owner_0,
+                            overlap_start,
+                            source_rank,
                             pcp_size=pcp_size,
                             interleave_size=interleave_size,
                         )
-                        - _rank_token_count_before(
-                            absolute_start,
-                            capture_owner_0,
-                            pcp_size=pcp_size,
-                            interleave_size=interleave_size,
-                        )
+                        - owner_start_counts[source_rank]
                     )
-                    capture_offset_1 = int(
-                        plan[capture_owner_1, TilePlanField.WRITEBACK_HBM_PREFIX]
-                    ) + (
-                        _rank_token_count_before(
-                            capture_global_start_1,
-                            capture_owner_1,
-                            pcp_size=pcp_size,
-                            interleave_size=interleave_size,
-                        )
-                        - _rank_token_count_before(
-                            absolute_start,
-                            capture_owner_1,
-                            pcp_size=pcp_size,
-                            interleave_size=interleave_size,
-                        )
+                    kv_valid_len = fresh_valid_len
+                    kv_page_idx = 0
+                    kv_global_start = fresh_global_start
+                    kv_hbm_offset = (
+                        current_kv_hbm_starts[source_rank] + source_rows_before_overlap
                     )
+                    if capture_current_kv and fresh_valid_len > 0:
+                        capture_owner_0 = (
+                            fresh_global_start // interleave_size
+                        ) % pcp_size
+                        next_owner_boundary = (
+                            fresh_global_start // interleave_size + 1
+                        ) * interleave_size
+                        capture_len_0 = min(
+                            fresh_valid_len,
+                            max(next_owner_boundary - fresh_global_start, 0),
+                        )
+                        capture_len_1 = fresh_valid_len - capture_len_0
+                        capture_global_start_1 = fresh_global_start + capture_len_0
+                        capture_owner_1 = (
+                            capture_global_start_1 // interleave_size
+                        ) % pcp_size
+                        capture_offset_0 = writeback_hbm_prefixes[capture_owner_0] + (
+                            _rank_token_count_before(
+                                fresh_global_start,
+                                capture_owner_0,
+                                pcp_size=pcp_size,
+                                interleave_size=interleave_size,
+                            )
+                            - abs_start_counts[capture_owner_0]
+                        )
+                        capture_offset_1 = writeback_hbm_prefixes[capture_owner_1] + (
+                            _rank_token_count_before(
+                                capture_global_start_1,
+                                capture_owner_1,
+                                pcp_size=pcp_size,
+                                interleave_size=interleave_size,
+                            )
+                            - abs_start_counts[capture_owner_1]
+                        )
+                scheduled_req_id = req_id if kv_valid_len > 0 else -1
 
                 for consumer_rank in range(pcp_size):
                     row = current_rows[tile_idx, group_idx, source_rank, consumer_rank]

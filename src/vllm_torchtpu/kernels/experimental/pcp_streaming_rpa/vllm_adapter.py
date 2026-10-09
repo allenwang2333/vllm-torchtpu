@@ -127,13 +127,17 @@ def pcp_streaming_jax_op(
     torch op. Callers that do not use TPU_KERNEL_ITER_MODE -- the GDN PCP ops,
     for instance -- should call ``pallas.jax_op`` directly rather than this.
     """
+    input_specs = tuple(input_partition_specs)
+    output_specs = tuple(
+        output_partition_specs or PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS
+    )
     wrapped_fn = build_pcp_streaming_callable(
         name,
         fn,
         donate_argnums=donate_argnums,
         mesh=mesh,
-        input_partition_specs=input_partition_specs,
-        output_partition_specs=output_partition_specs,
+        input_partition_specs=input_specs,
+        output_partition_specs=output_specs,
     )
 
     # Kernel-iteration mode registers the op against a dispatcher indirection
@@ -148,10 +152,6 @@ def pcp_streaming_jax_op(
 
     result = torch.library.custom_op(name, op_target, mutates_args=())
 
-    output_specs = tuple(
-        output_partition_specs or PCP_STREAMING_RPA_OUTPUT_PARTITION_SPECS
-    )
-
     def fake_fn(*args, **kwargs):
         # Mirrors stock's fake kernel: size the outputs from the specs the
         # caller declared, not from lowered.out_avals, which jax.export
@@ -159,7 +159,7 @@ def pcp_streaming_jax_op(
         jax_args = pallas_impl.jax_placeholders(
             args,
             mesh=mesh,
-            partition_specs=tuple(input_partition_specs),
+            partition_specs=input_specs,
         )
         with jax._src.config.export_ignore_forward_compatibility(True):
             lowered = wrapped_fn.exported(*jax_args, **kwargs)

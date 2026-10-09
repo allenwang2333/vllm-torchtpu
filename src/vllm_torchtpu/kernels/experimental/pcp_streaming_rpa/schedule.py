@@ -13,7 +13,9 @@
 # limitations under the License.
 """Runtime schedules for PCP streaming prefill RPA."""
 
+import jax.numpy as jnp
 import numpy as np
+from jax import lax
 
 
 class RuntimeScheduleField:
@@ -63,8 +65,6 @@ def query_row_positions(
     offset within an interleave, even when a request starts mid-interleave.
     History changes absolute positions, but does not change this offset.
     """
-    from jax import lax
-
     # All local coordinates are nonnegative. Truncating division avoids the
     # signed floor/mod corrections in the per-page Pallas causal mask.
     offset = lax.rem(q_hbm_offset, interleave_size)
@@ -89,8 +89,6 @@ def _validate_page_interleave_size(
 
 
 def _reshape_metadata_page_indices_jax(page_indices, max_num_seqs: int):
-    import jax.numpy as jnp
-
     if max_num_seqs <= 0:
         raise ValueError("metadata must contain at least one sequence slot.")
     if page_indices.ndim == 1:
@@ -130,8 +128,6 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
     remain request-absolute. The result is always the compact tile plan consumed
     by the production Pallas kernels; there is no dense schedule fallback.
     """
-    import jax.numpy as jnp
-
     global_bucket_tokens = int(global_bucket_tokens)
     local_kv_cache_num_blocks = int(local_kv_cache_num_blocks)
     page_size = int(page_size)
@@ -184,26 +180,6 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
     interleave_size_i32 = jnp.asarray(interleave_size, dtype=jnp.int32)
     cycle_i32 = pcp_size_i32 * interleave_size_i32
     virtual_page_size_i32 = page_size_i32 * pcp_size_i32
-    chunks_per_page_i32 = page_size_i32 // interleave_size_i32
-
-    def _local_page_global_start(local_page_idx, src_rank):
-        return local_page_idx * virtual_page_size_i32 + src_rank * interleave_size_i32
-
-    def _local_page_valid_len(kv_len, local_page_idx, src_rank):
-        base = _local_page_global_start(local_page_idx, src_rank)
-        delta = kv_len - base
-        full_chunks = jnp.minimum(
-            chunks_per_page_i32,
-            jnp.maximum(delta, 0) // cycle_i32,
-        )
-        partial = jnp.minimum(
-            interleave_size_i32,
-            jnp.maximum(delta - full_chunks * cycle_i32, 0),
-        )
-        valid_len = full_chunks * interleave_size_i32 + jnp.where(
-            full_chunks < chunks_per_page_i32, partial, 0
-        )
-        return jnp.where(kv_len > base, valid_len, 0)
 
     def _rank_tile(
         q_len,
@@ -390,6 +366,7 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
         )
         * TilePlanField.HBM_ROW_FIELDS
     )
+    positions = jnp.arange(num_tiles, dtype=jnp.int32)
 
     def _compact_pass(num_groups):
         active = num_groups > 0
@@ -397,7 +374,6 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
         tile_ids = jnp.nonzero(active, size=num_tiles, fill_value=0)[0].astype(
             jnp.int32
         )
-        positions = jnp.arange(num_tiles, dtype=jnp.int32)
         compact_groups = jnp.where(positions < active_count, num_groups[tile_ids], 0)
         group_starts = jnp.cumsum(compact_groups) - compact_groups
 

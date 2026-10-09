@@ -85,6 +85,21 @@ def pcp_query_chunk_ranges(
     )
 
 
+def _rank_token_count_before_np(
+    positions: np.ndarray,
+    ranks: np.ndarray,
+    *,
+    pcp_size: int,
+    interleave_size: int,
+) -> np.ndarray:
+    cycle = pcp_size * interleave_size
+    full_cycles = positions // cycle
+    cycle_offset = positions - full_cycles * cycle
+    rank_start = ranks * interleave_size
+    partial = np.clip(cycle_offset - rank_start, 0, interleave_size)
+    return full_cycles * interleave_size + partial
+
+
 def pcp_local_token_counts(
     num_scheduled_tokens_per_req: list[int] | np.ndarray,
     pcp_size: int,
@@ -107,14 +122,21 @@ def pcp_local_token_counts(
         token_owner_start_offsets_per_req,
         token_start_offsets_per_req,
     )
-    counts = np.zeros(pcp_size, dtype=np.int64)
-    for q_len, token_owner_start in zip(tokens, owner_starts):
-        for rank in range(pcp_size):
-            for chunk_start, chunk_end in pcp_token_owner_chunk_ranges(
-                int(q_len), int(token_owner_start), rank, pcp_size, interleave_size
-            ):
-                counts[rank] += chunk_end - chunk_start
-    return counts.astype(np.int32)
+    q_starts = owner_starts[:, None]
+    q_ends = (owner_starts + np.maximum(tokens, 0))[:, None]
+    ranks = np.arange(pcp_size, dtype=np.int64)[None, :]
+    per_req_counts = _rank_token_count_before_np(
+        q_ends,
+        ranks,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+    ) - _rank_token_count_before_np(
+        q_starts,
+        ranks,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+    )
+    return np.sum(per_req_counts, axis=0, dtype=np.int64).astype(np.int32)
 
 
 def build_pcp_rank_major_token_order(
@@ -210,16 +232,17 @@ def apply_pcp_rank_major_token_order(
         token_start_offsets_per_req=token_start_offsets_per_req,
     )
     valid = token_order >= 0
+    valid_order = token_order[valid]
     original_input_ids = input_ids_cpu[:total_num_tokens].copy()
     original_positions = positions_cpu[:total_num_tokens].copy()
     input_ids_cpu[:] = 0
     positions_cpu[:] = 0
-    input_ids_cpu[valid] = original_input_ids[token_order[valid]]
-    positions_cpu[valid] = original_positions[token_order[valid]]
+    input_ids_cpu[valid] = original_input_ids[valid_order]
+    positions_cpu[valid] = original_positions[valid_order]
     if mrope_positions_cpu is not None:
         original_mrope = mrope_positions_cpu[:, :total_num_tokens].copy()
         mrope_positions_cpu[:, :] = 0
-        mrope_positions_cpu[:, valid] = original_mrope[:, token_order[valid]]
+        mrope_positions_cpu[:, valid] = original_mrope[:, valid_order]
     return inverse_order
 
 

@@ -32,6 +32,34 @@ TP_AXIS_NAME = "tp"
 
 KVLayout = batched_rpa_configs.KVLayout
 
+_METADATA_SPEC = P()
+_QKV_SPEC_WITH_TP = P(PCP_AXIS_NAME, TP_AXIS_NAME)
+_KV_CACHE_SPEC_WITH_TP = P(PCP_AXIS_NAME, None, TP_AXIS_NAME)
+_IN_SPECS_WITH_TP = (
+    _QKV_SPEC_WITH_TP,
+    _QKV_SPEC_WITH_TP,
+    _QKV_SPEC_WITH_TP,
+    _KV_CACHE_SPEC_WITH_TP,
+    _METADATA_SPEC,
+    _METADATA_SPEC,
+    _METADATA_SPEC,
+    _METADATA_SPEC,
+)
+_OUT_SPECS_WITH_TP = (_QKV_SPEC_WITH_TP, _KV_CACHE_SPEC_WITH_TP)
+_QKV_SPEC_NO_TP = P(PCP_AXIS_NAME)
+_KV_CACHE_SPEC_NO_TP = P(PCP_AXIS_NAME)
+_IN_SPECS_NO_TP = (
+    _QKV_SPEC_NO_TP,
+    _QKV_SPEC_NO_TP,
+    _QKV_SPEC_NO_TP,
+    _KV_CACHE_SPEC_NO_TP,
+    _METADATA_SPEC,
+    _METADATA_SPEC,
+    _METADATA_SPEC,
+    _METADATA_SPEC,
+)
+_OUT_SPECS_NO_TP = (_QKV_SPEC_NO_TP, _KV_CACHE_SPEC_NO_TP)
+
 
 class _PCPQueryRowMapping(NamedTuple):
     """Query-row coordinates in the batch-flat PCP token stream."""
@@ -115,13 +143,7 @@ def _prepare_packed_kv_for_cache(
         return packed_kv.astype(kv_cache.dtype)
 
     if packed_kv.shape[1:] != kv_cache.shape[2:]:
-        packed_tail = 1
-        for dim in packed_kv.shape[1:]:
-            packed_tail *= dim
-        cache_tail = 1
-        for dim in kv_cache.shape[2:]:
-            cache_tail *= dim
-        if packed_tail != cache_tail:
+        if math.prod(packed_kv.shape[1:]) != math.prod(kv_cache.shape[2:]):
             raise ValueError(
                 "packed KV update shape is incompatible with KV cache layout: "
                 f"{packed_kv.shape[1:]} vs {kv_cache.shape[2:]}."
@@ -690,23 +712,11 @@ def sharded_pcp_ragged_paged_attention(
             f"{kv_cache.shape[0]=} {pcp_size=}."
         )
     if TP_AXIS_NAME in mesh.axis_names:
-        qkv_spec = P(PCP_AXIS_NAME, TP_AXIS_NAME)
-        kv_cache_spec = P(PCP_AXIS_NAME, None, TP_AXIS_NAME)
+        in_specs = _IN_SPECS_WITH_TP
+        out_specs = _OUT_SPECS_WITH_TP
     else:
-        qkv_spec = P(PCP_AXIS_NAME)
-        kv_cache_spec = P(PCP_AXIS_NAME)
-    metadata_spec = P()
-    in_specs = (
-        qkv_spec,
-        qkv_spec,
-        qkv_spec,
-        kv_cache_spec,
-        metadata_spec,
-        metadata_spec,
-        metadata_spec,
-        metadata_spec,
-    )
-    out_specs = (qkv_spec, kv_cache_spec)
+        in_specs = _IN_SPECS_NO_TP
+        out_specs = _OUT_SPECS_NO_TP
     args = (
         q,
         k,
