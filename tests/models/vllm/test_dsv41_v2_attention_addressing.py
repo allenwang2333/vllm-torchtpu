@@ -542,7 +542,18 @@ def test_attend_window_branch_free_matches_conditional(lengths):
         q, pool, jnp.asarray(records), state, dim**-0.5, max_requests=len(lengths)
     )
     for e, g in zip(expected, got):
-        np.testing.assert_array_equal(np.asarray(g), np.asarray(e))
+        if jax.default_backend() == "cpu":
+            # XLA:CPU may reassociate the two paths' f32 reductions
+            # differently (observed max |diff| 7.6e-6, rel 8.6e-8); the
+            # bitwise contract is a TPU-lowering property.
+            np.testing.assert_allclose(
+                np.asarray(g, np.float32),
+                np.asarray(e, np.float32),
+                rtol=1e-6,
+                atol=1e-5,
+            )
+        else:
+            np.testing.assert_array_equal(np.asarray(g), np.asarray(e))
 
 
 @pytest.mark.parametrize(
