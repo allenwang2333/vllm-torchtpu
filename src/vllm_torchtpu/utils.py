@@ -69,8 +69,9 @@ def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
         # TODO(ranlihao): find a proper way to get the memory usage of each device.
         for device in devices:
             try:
-                hbm_used = device.memory_stats()["bytes_in_use"]
-                hbm_limit = device.memory_stats()["bytes_limit"]
+                stats = device.memory_stats()
+                hbm_used = stats["bytes_in_use"]
+                hbm_limit = stats["bytes_limit"]
                 logger.info(
                     "Get memory stats for device %s. "
                     "Assuming all devices have the same usage.",
@@ -84,8 +85,9 @@ def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
                 )
     else:
         for device in devices:
-            hbm_used = device.memory_stats()["bytes_in_use"]
-            hbm_limit = device.memory_stats()["bytes_limit"]
+            stats = device.memory_stats()
+            hbm_used = stats["bytes_in_use"]
+            hbm_limit = stats["bytes_limit"]
             usage.append((hbm_used, hbm_limit))
 
     return usage

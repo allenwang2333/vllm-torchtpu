@@ -16,7 +16,9 @@ class _LazyVllmLogger:
         return self._logger
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._resolve(), name)
+        if (logger := self._logger) is None:
+            logger = self._resolve()
+        return getattr(logger, name)
 
 
 def init_logger(name: str) -> _LazyVllmLogger:

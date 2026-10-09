@@ -101,7 +101,8 @@ def _normalize_one_spec(
     if not isinstance(spec, AttentionSpec):
         return spec
 
-    if isinstance(spec, MLAAttentionSpec) and not spec.dtype.is_floating_point:
+    is_mla = isinstance(spec, MLAAttentionSpec)
+    if is_mla and not spec.dtype.is_floating_point:
         # An integer-typed MLA cache is a packed layout: quantized float KV
         # values and their scale factors share one byte row (DSA indexer K
         # rows). That layout is fixed by the kernel reading it, so the fp8/bf16
@@ -110,24 +111,12 @@ def _normalize_one_spec(
         # normalize to the TPU fp8 dtype below.
         kv_cache_dtype = spec.dtype
 
-    if isinstance(spec, MLAAttentionSpec):
-        page_size = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
-            spec.block_size,
-            spec.num_kv_heads,
-            spec.head_size,
-            kv_cache_dtype,
-        )
-    else:
-        page_size = attention_backend.get_kv_cache_page_size_bytes(
-            spec.block_size,
-            spec.num_kv_heads,
-            spec.head_size,
-            kv_cache_dtype,
-        )
-    backend = (
-        PallasMLAttentionBackend
-        if isinstance(spec, MLAAttentionSpec)
-        else attention_backend
+    backend = PallasMLAttentionBackend if is_mla else attention_backend
+    page_size = backend.get_kv_cache_page_size_bytes(
+        spec.block_size,
+        spec.num_kv_heads,
+        spec.head_size,
+        kv_cache_dtype,
     )
     target_spec = backend.customize_spec(replace(spec, dtype=kv_cache_dtype))
     padded_page_size = spec.page_size_padded or 0
@@ -140,11 +129,16 @@ def _normalize_one_spec(
 def _has_hybrid_attention_and_mamba(
     kv_cache_specs: dict[str, KVCacheSpec],
 ) -> bool:
-    has_attention = any(
-        isinstance(spec, AttentionSpec) for spec in kv_cache_specs.values()
-    )
-    has_mamba = any(isinstance(spec, MambaSpec) for spec in kv_cache_specs.values())
-    return has_attention and has_mamba
+    has_attention = False
+    has_mamba = False
+    for spec in kv_cache_specs.values():
+        if isinstance(spec, AttentionSpec):
+            has_attention = True
+        elif isinstance(spec, MambaSpec):
+            has_mamba = True
+        if has_attention and has_mamba:
+            return True
+    return False
 
 
 def _mamba_unpadded_page_size_bytes(spec: MambaSpec) -> int:
