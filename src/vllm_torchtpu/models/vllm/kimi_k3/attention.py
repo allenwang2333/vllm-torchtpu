@@ -413,6 +413,9 @@ class MultiHeadLatentAttention(nn.Module):
         )
 
 
+_PACKED_PREFILL_SPLIT_SIZES = [1152, 128, 384, 128]
+
+
 class CausalDepthwiseConv1d(nn.Module):
     """Checkpoint-compatible depthwise-convolution weight container."""
 
@@ -421,6 +424,7 @@ class CausalDepthwiseConv1d(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
         if channels % tp_size:
             raise ValueError("Convolution channels must be divisible by TP size")
+        self.tp_size = tp_size
         self.channels = channels // tp_size
         self.kernel_size = kernel_size
         self.weight = nn.Parameter(torch.empty(self.channels, 1, kernel_size))
@@ -434,9 +438,7 @@ class CausalDepthwiseConv1d(nn.Module):
         if loaded_weight.ndim == 2:
             loaded_weight = loaded_weight.unsqueeze(1)
         rank = get_tensor_model_parallel_rank()
-        loaded_weight = loaded_weight.chunk(
-            get_tensor_model_parallel_world_size(), dim=0
-        )[rank]
+        loaded_weight = loaded_weight.narrow(0, rank * self.channels, self.channels)
         parameter.data.copy_(loaded_weight)
 
 
@@ -467,6 +469,12 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self.projection_size = self.total_heads * self.head_dim
         self.local_projection_size = self.num_heads * self.head_dim
         self.conv_size = int(kda_config["short_conv_kernel_size"])
+        self._qkvb_split_sizes = [3 * self.local_projection_size, self.num_heads]
+        self._fa_ga_split_sizes = [self.head_dim, self.head_dim]
+        self._state_shape = (
+            (self.conv_size - 1, 1, 3 * self.local_projection_size),
+            (self.num_heads, self.head_dim, self.head_dim),
+        )
         self.num_spec_tokens = (
             vllm_config.speculative_config.num_speculative_tokens
             if vllm_config.speculative_config is not None
@@ -502,7 +510,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         else:
             self.fused_fa_ga_proj = MergedColumnParallelLinear(
                 config.hidden_size,
-                [self.head_dim, self.head_dim],
+                self._fa_ga_split_sizes,
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.fused_fa_ga_proj",
@@ -602,10 +610,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
     def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
         # Declared in the fused kernel's (taps, 1, dim) slot layout so XLA does
         # not relayout the whole pool around every call.
-        return (
-            (self.conv_size - 1, 1, 3 * self.local_projection_size),
-            (self.num_heads, self.head_dim, self.head_dim),
-        )
+        return self._state_shape
 
     def _metadata(self) -> AttentionMetadata | None:
         if not is_forward_context_available():
@@ -699,16 +704,14 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                     hidden_states = group.all_gather(hidden_states, dim=0)
                 packed = hidden_states @ self.packed_prefill_weight
             mixed_qkv, beta_pad, output_gate, f_a = packed.split(
-                self._PACKED_PREFILL_SPLIT_SIZES, dim=-1
+                _PACKED_PREFILL_SPLIT_SIZES, dim=-1
             )
             beta = beta_pad[:, : self.num_heads]
         else:
             if sequence_parallel:
                 hidden_states = group.all_gather(hidden_states, dim=0)
             projected, _ = self.fused_qkvb_proj(hidden_states)
-            mixed_qkv, beta = projected.split(
-                (3 * self.local_projection_size, self.num_heads), dim=-1
-            )
+            mixed_qkv, beta = projected.split(self._qkvb_split_sizes, dim=-1)
             if self.use_full_rank_gate:
                 assert self.f_a_proj is not None
                 f_a, _ = self.f_a_proj(hidden_states)
@@ -717,9 +720,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             else:
                 assert self.fused_fa_ga_proj is not None
                 gate_inputs, _ = self.fused_fa_ga_proj(hidden_states)
-                f_a, gate_input = gate_inputs.split(
-                    (self.head_dim, self.head_dim), dim=-1
-                )
+                f_a, gate_input = gate_inputs.split(self._fa_ga_split_sizes, dim=-1)
         raw_gate, _ = self.f_b_proj(f_a)
         if not self.use_full_rank_gate:
             assert self.g_b_proj is not None

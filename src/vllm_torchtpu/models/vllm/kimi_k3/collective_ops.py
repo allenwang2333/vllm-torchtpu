@@ -28,6 +28,14 @@ from vllm_torchtpu.kernels.kimi_k3.collectives import (  # isort: skip
 _OPS: dict[tuple, Any] = {}
 _RING_COLLECTIVE_WIDTHS = frozenset((2176, 3584, 7168))
 _MLA_PREPROCESS_OUT_WIDTHS = (1536, 512, 64, 384)
+_P_K3_SP = P("k3_sp", None)
+_P_EMPTY = P()
+_P_K3_SP_1 = (_P_K3_SP,)
+_P_K3_SP_2 = (_P_K3_SP, _P_K3_SP)
+_P_K3_SP_3 = (_P_K3_SP,) * 3
+_P_K3_SP_4 = (_P_K3_SP,) * 4
+_P_EMPTY_3 = (_P_EMPTY,) * 3
+_MLA_PREPROCESS_IN_SPECS = _P_K3_SP_3 + _P_EMPTY_3
 
 
 def _build_mla_ops(mesh, owners, layer, eps):
@@ -50,8 +58,8 @@ def _build_mla_ops(mesh, owners, layer, eps):
         f"pallas::kimi_mla_pack_gate_{layer}",
         pack,
         mesh=mesh,
-        input_partition_specs=(P("k3_sp", None),),
-        output_partition_specs=P("k3_sp", None),
+        input_partition_specs=_P_K3_SP_1,
+        output_partition_specs=_P_K3_SP,
     )
     pack_op.register_fake(lambda weight: weight.new_empty((7168, 6144)))
 
@@ -79,8 +87,8 @@ def _build_mla_ops(mesh, owners, layer, eps):
         f"pallas::kimi_mla_preprocess_{layer}",
         preprocess,
         mesh=mesh,
-        input_partition_specs=(P("k3_sp", None),) * 3 + (P(), P(), P()),
-        output_partition_specs=(P("k3_sp", None),) * 4,
+        input_partition_specs=_MLA_PREPROCESS_IN_SPECS,
+        output_partition_specs=_P_K3_SP_4,
     )
 
     def fake(x, weight, packed_gate, qnorm, kvnorm, sequence_parallel):
@@ -114,8 +122,8 @@ def _build_moe_gather_op(mesh, tables, collective_id):
         f"pallas::kimi_moe_ag_{collective_id}",
         gather,
         mesh=mesh,
-        input_partition_specs=(P("k3_sp", None),) * 3,
-        output_partition_specs=(P(),) * 3,
+        input_partition_specs=_P_K3_SP_3,
+        output_partition_specs=_P_EMPTY_3,
     )
 
     def fake(x, weights, ids):
@@ -155,8 +163,8 @@ def _build_op(mesh, tables, gather, collective_id):
         name,
         collective,
         mesh=mesh,
-        input_partition_specs=(P("k3_sp", None),),
-        output_partition_specs=P() if gather else P("k3_sp", None),
+        input_partition_specs=_P_K3_SP_1,
+        output_partition_specs=_P_EMPTY if gather else _P_K3_SP,
     )
 
     def fake(x):
@@ -192,8 +200,8 @@ def _build_project_op(mesh, tables, collective_id):
         f"pallas::kimi_project_rs_{collective_id}",
         project,
         mesh=mesh,
-        input_partition_specs=(P("k3_sp", None), P("k3_sp", None)),
-        output_partition_specs=P("k3_sp", None),
+        input_partition_specs=_P_K3_SP_2,
+        output_partition_specs=_P_K3_SP,
     )
 
     def fake(x, w):
@@ -227,8 +235,8 @@ def _build_gather_project_op(mesh, tables, collective_id):
         f"pallas::kimi_gather_project_{collective_id}",
         project,
         mesh=mesh,
-        input_partition_specs=(P("k3_sp", None), P("k3_sp", None)),
-        output_partition_specs=P("k3_sp", None),
+        input_partition_specs=_P_K3_SP_2,
+        output_partition_specs=_P_K3_SP,
     )
 
     def fake(x, w):
@@ -277,8 +285,8 @@ def _build_token_op(world_size, gather):
         return jax.shard_map(
             local,
             mesh=mesh,
-            in_specs=P("k3_sp", None),
-            out_specs=P("k3_sp", None),
+            in_specs=_P_K3_SP,
+            out_specs=_P_K3_SP,
             check_vma=False,
         )(x)
 
@@ -286,8 +294,8 @@ def _build_token_op(world_size, gather):
         f"pallas::kimi_token_{world_size}_{'ag' if gather else 'rs'}",
         collective,
         mesh=mesh,
-        input_partition_specs=(P("k3_sp", None),),
-        output_partition_specs=P("k3_sp", None),
+        input_partition_specs=_P_K3_SP_1,
+        output_partition_specs=_P_K3_SP,
     )
 
     def fake(x):

@@ -134,6 +134,7 @@ class KimiDecoderLayer(nn.Module):
             self.attn_res_block_size is not None
             and self.layer_idx % self.attn_res_block_size == 0
         )
+        self._is_attn_res_block_start = self._starts_attn_res_block
         if self.attn_res_block_size is not None:
             self.self_attention_res = AttentionResidual(
                 config.hidden_size,
@@ -153,6 +154,7 @@ class KimiDecoderLayer(nn.Module):
         block_residuals: torch.Tensor | None,
         sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        ffn = self.block_sparse_moe if self.is_moe else self.mlp
         if self.attn_res_block_size is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -162,14 +164,7 @@ class KimiDecoderLayer(nn.Module):
             hidden_states = residual + hidden_states
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
-            if self.is_moe:
-                hidden_states = self.block_sparse_moe(
-                    hidden_states, sequence_parallel=sequence_parallel
-                )
-            else:
-                hidden_states = self.mlp(
-                    hidden_states, sequence_parallel=sequence_parallel
-                )
+            hidden_states = ffn(hidden_states, sequence_parallel=sequence_parallel)
             return residual + hidden_states, None
 
         assert block_residuals is not None
@@ -189,12 +184,7 @@ class KimiDecoderLayer(nn.Module):
         prefix_sum = hidden_states if prefix_sum is None else prefix_sum + hidden_states
         hidden_states = self.mlp_res(prefix_sum, block_residuals)
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if self.is_moe:
-            hidden_states = self.block_sparse_moe(
-                hidden_states, sequence_parallel=sequence_parallel
-            )
-        else:
-            hidden_states = self.mlp(hidden_states, sequence_parallel=sequence_parallel)
+        hidden_states = ffn(hidden_states, sequence_parallel=sequence_parallel)
         return prefix_sum + hidden_states, block_residuals
 
 
@@ -781,10 +771,8 @@ class KimiK3ForConditionalGeneration(
             }
 
         cum = [0]
-        running = 0
         for t, h, w in grid_thw_list:
-            running += t * h * w
-            cum.append(running)
+            cum.append(cum[-1] + t * h * w)
         selected_pv = torch.cat([pixel_values[cum[i] : cum[i + 1]] for i in indices])
         return {
             "pixel_values": selected_pv,
