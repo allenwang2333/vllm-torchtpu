@@ -294,7 +294,7 @@ def stack_kinds(v, kinds):
 # ------------------------------------------------------------------------------------------
 
 def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debug=False,
-          skip=frozenset(), axis_name=None, stack_w=None, stack_c=None, draft=False):
+          skip=frozenset(), axis_name=None, stack_w=None, stack_c=None, draft=False, dbg_part=True):
     """Returns (step_fn, info). step_fn(scal, rmeta, qmeta, bt, rvec, h0, rope_tab, smalls, *weights,
     *caches) -> (out [M, H] bf16, *caches[, dbg_h, dbg_own]) for ONE rank; wrap in shard_map.
 
@@ -513,7 +513,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     if debug:
         scratch["dbg_sem"] = pltpu.SemaphoreType.DMA((3,))
         scratch["dbgl"] = pltpu.VMEM((TMAX, 128), F32)
-        if not draft:                            # 2 MiB; the drafter's debug build overflows VMEM with it
+        if dbg_part and not draft:               # 2 MiB: the drafter's / adapter's debug builds go without
             scratch["dbgo"] = pltpu.VMEM((TMAX, NH, KL), F32)
 
     # --- the stream: one layer's tiles in consumption order ---
@@ -1104,7 +1104,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                                              scr["dbg_sem"].at[0]),
                        pltpu.make_async_copy(scr["own_v"], dbg_own.at[l], scr["dbg_sem"].at[1]),
                        pltpu.make_async_copy(scr["dbgl"], dbg_lse.at[l], scr["dbg_sem"].at[2]),
-                       ] + ([] if draft else [pltpu.make_async_copy(scr["dbgo"], dbg_part.at[l], scr["dbg_sem"].at[2])])
+                       ] + ([pltpu.make_async_copy(scr["dbgo"], dbg_part.at[l], scr["dbg_sem"].at[2])]
+                            if "dbgo" in scr else [])
                 for d_ in dcs:
                     d_.start()
                 for d_ in dcs:
@@ -1532,7 +1533,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 lse_row = jnp.transpose(lse_b)[0:1]                          # [1, 128], lane = head
                 if debug:
                     scr["dbgl"][pl.ds(t_, 1), :] = lse_row
-                    if not draft:
+                    if "dbgo" in scr:
                         scr["dbgo"][t_] = out
                 for d in range(R):
                     od = jnp.concatenate([out[d * HR + hh:d * HR + hh + 1] for hh in range(HR)], axis=1)
