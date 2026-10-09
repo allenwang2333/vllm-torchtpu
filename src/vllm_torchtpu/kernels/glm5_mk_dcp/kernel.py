@@ -498,6 +498,13 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         scratch["tokv"] = pltpu.VMEM((XR, 128), I32)
         scratch["tok_s"] = pltpu.SMEM((XR, 128), I32)
         scratch["d_send"] = pltpu.SemaphoreType.DMA(())
+        # this pass's metadata, copied in the target's operand shapes (ref views of the [3, ...]
+        # inputs crash Mosaic's relayout insertion at FULL)
+        scratch["scal_s"] = pltpu.SMEM((8,), I32)
+        scratch["rmeta_s"] = pltpu.SMEM((TMAX, 8), I32)
+        scratch["qmeta_s"] = pltpu.SMEM((BMAX, 4), I32)
+        scratch["rvec_s"] = pltpu.VMEM((M, 128), I32)
+        scratch["tab_s"] = pltpu.VMEM((4, M, 128), F32)
         scratch["d_recv"] = pltpu.SemaphoreType.DMA(())
     if debug:
         scratch["dbg_sem"] = pltpu.SemaphoreType.DMA((3,))
@@ -542,8 +549,6 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     def kernel(*refs):
         if draft:
             scal_a, rmeta_a, qmeta_a, bt, rvec_a, h0, tab_a, smalls, dmeta, emb_h, lm_h, eht_h = refs[:n_fixed]
-            scal, rmeta, qmeta, rvec, rope_tab = (scal_a.at[0], rmeta_a.at[0], qmeta_a.at[0],
-                                                  rvec_a.at[0], tab_a.at[0])
         else:
             scal, rmeta, qmeta, bt, rvec, h0, rope_tab, smalls = refs[:n_fixed]
         w_in = refs[n_fixed:n_fixed + n_w]
@@ -555,6 +560,28 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             dbg_h, dbg_own, dbg_lse, dbg_part = rest[:4]
             rest = rest[4:]
         scr = dict(zip(s_names, rest))
+        if draft:
+            scal, rmeta, qmeta = scr["scal_s"], scr["rmeta_s"], scr["qmeta_s"]
+            rvec, rope_tab = scr["rvec_s"], scr["tab_s"]
+
+            def load_pass(p_):
+                for i_ in range(8):
+                    scal[i_] = scal_a[p_, i_]
+
+                def cr(t_, c):
+                    for j_ in range(8):
+                        rmeta[t_, j_] = rmeta_a[p_, t_, j_]
+                    return c
+                lax.fori_loop(0, TMAX, cr, 0)
+
+                def cq(b_, c):
+                    for j_ in range(4):
+                        qmeta[b_, j_] = qmeta_a[p_, b_, j_]
+                    return c
+                lax.fori_loop(0, BMAX, cq, 0)
+                rvec[...] = rvec_a[p_]
+                rope_tab[...] = tab_a[p_]
+            load_pass(0)
         W, C, WS, CS = {}, {}, {}, {}
         for (k, l), r in zip(w_names, w_in):
             if l == "stk":
@@ -889,20 +916,20 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             pltpu.make_async_copy(scr["rwrow"], rrow_out.at[l], scr["kvw_sem"].at[1]).wait()
 
         def req_new(req, qm=None):
-            """(first row, rows, first new position, this rank's local length before the step)."""
-            qm = qmeta if qm is None else qm
-            t0 = qm[req, 0]
-            nq = qm[req, 1]
-            p0 = qm[req, 2] - nq
+            """(first row, rows, first new position, this rank's local length before the step).
+            qm: optional getter (req, field) -> value (the drafter's pass-0 geometry)."""
+            qm = (lambda r_, k_: qmeta[r_, k_]) if qm is None else qm
+            t0 = qm(req, 0)
+            nq = qm(req, 1)
+            p0 = qm(req, 2) - nq
             nold = (p0 // G_) * ILV + jnp.clip(p0 % G_ - ILV * me, 0, ILV)
             return t0, nq, p0, nold
 
         # ---------------- one layer ----------------
         def layer(l, carry):
-            nonlocal scal, rmeta, qmeta, rvec, rope_tab, T, B, nrows, rvalid, rpos
+            nonlocal T, B, nrows, rvalid, rpos
             if draft:                                    # this pass's rows
-                scal, rmeta, qmeta = scal_a.at[l], rmeta_a.at[l], qmeta_a.at[l]
-                rvec, rope_tab = rvec_a.at[l], tab_a.at[l]
+                load_pass(l)
                 T, B = scal[0], scal[1]
                 nrows = jnp.minimum((T + 7) // 8 * 8, TMAX)
                 rvalid = (rvec[:, 0:1] > 0).astype(F32)
@@ -1802,7 +1829,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
             def per_req_u(b, off):
                 return lax.cond(qmeta[b, 3] > 0,
-                                lambda: build_union(b, off, rn=req_new(b, qmeta_a.at[0])), lambda: off)
+                                lambda: build_union(b, off, rn=req_new(b, lambda r_, k_: qmeta_a[0, r_, k_])),
+                                lambda: off)
             lax.fori_loop(0, B, per_req_u, jnp.int32(0))
             cpu = [pltpu.make_async_copy(scr["own_u"], scr["own_uv"], scr["misc_sem"]),
                    pltpu.make_async_copy(scr["memb"], scr["memb_v"], scr["misc_sem"])]
@@ -1870,25 +1898,28 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 bv, bi = c
                 lg = bf(lax.dot_general(xsb, hbm_tile(lm_h.at[pl.ds(j * 128, 128)]), NT,
                                         preferred_element_type=F32))             # [XR, 128]
-                gi = j * 128 + lane_t
+                gi = (j * 128 + lane_t).astype(F32)      # exact (< 2^24); f32 lane reductions
                 lg = jnp.where(gi < VR, lg, -jnp.inf)
                 tv = jnp.max(lg, axis=1, keepdims=True)
-                ti = jnp.min(jnp.where(lg == tv, gi, jnp.int32(2 ** 30)), axis=1, keepdims=True)
+                ti = jnp.min(jnp.where(lg == tv, gi, 3e7), axis=1, keepdims=True)
                 take_ = tv > bv
                 return jnp.where(take_, tv, bv), jnp.where(take_, ti, bi)
             bv, bi = lax.fori_loop(0, VRP // 128, lm_body,
-                                   (jnp.full((XR, 1), -jnp.inf, F32), jnp.zeros((XR, 1), I32)))
+                                   (jnp.full((XR, 1), -jnp.inf, F32), jnp.zeros((XR, 1), F32)))
             lane_x = lax.broadcasted_iota(I32, (XR, 128), 1)
-            scr["dsend"][...] = jnp.where(lane_x == 0, lax.bitcast_convert_type(bv, I32),
-                                          jnp.where(lane_x == 1, bi + me * VR, 0))
+            pay = jnp.where(lane_x == 0, jnp.broadcast_to(bv, (XR, 128)),
+                            jnp.broadcast_to(bi + jnp.float32(VR) * me.astype(F32), (XR, 128)))
+            scr["dsend"][...] = lax.bitcast_convert_type(pay, I32)   # lane 0 value, lane 1 index (f32)
             scr["drecv"][me] = scr["dsend"][...]
             exchange(lambda d: scr["dsend"], scr["drecv"], "d_send", "d_recv")
-            gv, gi_ = jnp.full((XR, 1), -jnp.inf, F32), jnp.zeros((XR, 1), I32)
+            gv, gf = jnp.full((XR, 1), -jnp.inf, F32), jnp.zeros((XR, 1), F32)
             for s_ in range(R):                          # rank-major vocab: strict > keeps the first
-                blk = scr["drecv"][s_]
-                v_ = lax.bitcast_convert_type(blk[:, 0:1], F32)
+                blk = lax.bitcast_convert_type(scr["drecv"][s_], F32)          # [XR, 128]
+                v_ = jnp.sum(jnp.where(lane_x == 0, blk, 0.0), axis=1, keepdims=True)
+                i_ = jnp.sum(jnp.where(lane_x == 1, blk, 0.0), axis=1, keepdims=True)
                 take_ = v_ > gv
-                gv, gi_ = jnp.where(take_, v_, gv), jnp.where(take_, blk[:, 1:2], gi_)
+                gv, gf = jnp.where(take_, v_, gv), jnp.where(take_, i_, gf)
+            gi_ = gf.astype(I32)
             tokc = jnp.where(i0 < B, gi_, 0)
             tok_m = tokc if M == XR else jnp.concatenate([tokc, jnp.zeros((M - XR, 1), I32)], axis=0)
             out_ref[...] = jnp.where(lax.broadcasted_iota(I32, (M, 128), 1) == l, tok_m, out_ref[...])
@@ -1899,12 +1930,12 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 c_ = pltpu.make_async_copy(scr["tokv"], scr["tok_s"], scr["misc_sem"])
                 c_.start()
                 c_.wait()
-                rm1 = rmeta_a.at[jnp.minimum(l + 1, L - 1)]
+                l1 = jnp.minimum(l + 1, L - 1)
                 prev = scr["carry"][...]
                 if M > XR:
                     prev = jnp.concatenate([prev, jnp.zeros((M - XR, H), F32)], axis=0)
                 draft_prologue(lambda t_: scr["tok_s"][t_, 0] if t_ < XR else jnp.int32(0),
-                               lambda t_: rm1[t_, 0] > 0 if t_ < XR else jnp.bool_(False), prev, slot)
+                               lambda t_: rmeta_a[l1, t_, 0] > 0 if t_ < XR else jnp.bool_(False), prev, slot)
 
         # ---------------- step ----------------
         pltpu.make_async_copy(smalls.at[0], scr["sm"].at[0], scr["sm_sem"].at[0]).start()
