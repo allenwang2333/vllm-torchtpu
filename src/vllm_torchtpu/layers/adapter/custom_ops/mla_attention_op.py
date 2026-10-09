@@ -1467,7 +1467,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             else:
                 # reuse the indices an earlier layer wrote into the shared buffer.
                 topk_index = self.topk_indices_buffer
-            if self.topk_table_in_place:
+            # getattr: a wrapper built without __init__ (tests) has no flag.
+            if getattr(self, "topk_table_in_place", False):
                 topk_indices = topk_index
             else:
                 topk_indices = topk_index[: hidden_states.shape[0]]
