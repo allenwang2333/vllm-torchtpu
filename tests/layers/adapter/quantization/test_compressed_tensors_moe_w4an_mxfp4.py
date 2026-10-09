@@ -1,11 +1,49 @@
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
 from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
     VllmCompressedTensorsW4ANMxfp4MoEMethod,
 )
+
+
+def _has_tpu_device() -> bool:
+    try:
+        torch.empty(0, device="tpu")
+        return True
+    except RuntimeError:
+        return False
+
+
+def _cpu_mxfp4_load_patches() -> ExitStack:
+    stack = ExitStack()
+    if not _has_tpu_device():
+        orig_to = torch.Tensor.to
+        stack.enter_context(
+            patch.object(
+                torch.Tensor,
+                "to",
+                lambda self, *a, **kw: (
+                    self if (a and a[0] == "tpu") else orig_to(self, *a, **kw)
+                ),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "vllm_torchtpu.layers.adapter.quantization.compressed_tensors."
+                "compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4."
+                "load_kmajor_fp4",
+                side_effect=lambda w: torch.empty(
+                    (w.shape[0], w.shape[2] * 2, w.shape[1] // 2),
+                    dtype=torch.uint8,
+                    device=w.device,
+                ).view(getattr(torch, "float4_e2m1fn_x2", torch.uint8)),
+            )
+        )
+    return stack
 
 
 class FakeRoutedExperts(RoutedExperts):
@@ -113,9 +151,12 @@ def test_mxfp4_create_weights_and_process():
         )
 
     # 2. process_weights_after_loading
-    with patch(
-        "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.prebuild_fused_moe_kernel"
-    ) as mock_prebuild:
+    with (
+        _cpu_mxfp4_load_patches(),
+        patch(
+            "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.prebuild_fused_moe_kernel"
+        ) as mock_prebuild,
+    ):
         method.process_weights_after_loading(layer)
     mock_prebuild.assert_called_once_with(
         topk=2, activation="silu", use_ep=False, skip_padded_tokens=True
@@ -206,6 +247,8 @@ def test_mxfp4_apply_masks_padded_token_routes():
 
 def test_mxfp4_duplicate_active_rows_with_padding_are_identical():
     """The decode-shaped MoE call must not mix otherwise identical rows."""
+    if not _has_tpu_device():
+        pytest.skip("Pallas MXFP4 MoE kernel execution requires TPU device.")
     moe_config = MagicMock(w13_num_shards=2)
     moe_config.tp_size = 1
     moe_config.tp_rank = 0
@@ -368,8 +411,11 @@ def test_mxfp4_processes_directly_materialized_dummy_weights():
         assert not hasattr(parameter, "_cpu_scratch")
         parameter.data.zero_()
 
-    with patch(
-        "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.prebuild_fused_moe_kernel"
+    with (
+        _cpu_mxfp4_load_patches(),
+        patch(
+            "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.prebuild_fused_moe_kernel"
+        ),
     ):
         method.process_weights_after_loading(layer)
 
@@ -494,6 +540,8 @@ def test_mxfp4_neutralizes_only_unloaded_padded_scales():
 
 
 def test_mxfp4_requantize_block():
+    if not _has_tpu_device():
+        pytest.skip("Pallas MXFP4 requant_load_kmajor_fp4 requires TPU device.")
     from vllm_torchtpu.layers.core.quantization import (
         dequantize_mxfp4_packed,
         fp4_indices_to_float,

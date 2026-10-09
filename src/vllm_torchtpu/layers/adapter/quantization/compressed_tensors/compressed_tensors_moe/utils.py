@@ -81,7 +81,7 @@ def get_cpu_weight_loader_hook(
 
         cpu_scratch = param._cpu_scratch
 
-        if "w13_weight_packed" in weight_name:
+        if "w13_weight_packed" in weight_name or "w13_weight_scale" in weight_name:
             # Shard along dim 0
             loaded_per_rank = loaded_weight.shape[0] // tp_size
             start = loaded_per_rank * tp_rank
@@ -94,40 +94,19 @@ def get_cpu_weight_loader_hook(
             ].copy_(weight_shard)
             return True
 
-        elif "w2_weight_packed" in weight_name:
-            # Shard along dim 1
-            loaded_per_rank = loaded_weight.shape[1] // tp_size
-            start = loaded_per_rank * tp_rank
-            weight_shard = loaded_weight[:, start : start + loaded_per_rank]
+        # "w2_weight_packed" or "w2_weight_scale": shard along dim 1
+        loaded_per_rank = loaded_weight.shape[1] // tp_size
+        start = loaded_per_rank * tp_rank
+        weight_shard = loaded_weight[:, start : start + loaded_per_rank]
 
-            cpu_scratch.data[expert_id].copy_(weight_shard)
-            return True
-
-        elif "w13_weight_scale" in weight_name:
-            # Shard along dim 0
-            loaded_per_rank = loaded_weight.shape[0] // tp_size
-            start = loaded_per_rank * tp_rank
-            weight_shard = loaded_weight[start : start + loaded_per_rank, :]
-
-            shard_size = cpu_scratch.shape[1] // 2
-            offset = 0 if shard_id == "w1" else shard_size
-            cpu_scratch.data[
-                expert_id, offset : offset + weight_shard.shape[0], :
-            ].copy_(weight_shard)
-            return True
-
-        else:
-            # "w2_weight_scale": the only main-weight name left (see
-            # is_main_weight above), so there is no further fallback.
-            # Shard along dim 1
-            loaded_per_rank = loaded_weight.shape[1] // tp_size
-            start = loaded_per_rank * tp_rank
-            weight_shard = loaded_weight[:, start : start + loaded_per_rank]
-
-            cpu_scratch.data[expert_id].copy_(weight_shard)
-            return True
+        cpu_scratch.data[expert_id].copy_(weight_shard)
+        return True
 
     return _cpu_weight_loader_hook
+
+
+_FP4_E2M1_THRESHOLDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+_INT4_UNPACK_SHIFTS = (0, 4, 8, 12, 16, 20, 24, 28)
 
 
 def release_memory_to_os() -> None:
@@ -145,7 +124,7 @@ def quantize_to_fp4_e2m1_nibbles(tensor_scaled: torch.Tensor) -> torch.Tensor:
     indices (0..15)."""
     abs_x = tensor_scaled.abs()
     thresholds = torch.tensor(
-        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+        _FP4_E2M1_THRESHOLDS,
         dtype=tensor_scaled.dtype,
         device=tensor_scaled.device,
     )
@@ -181,9 +160,7 @@ def requantize_int4_weights(
     num_out_blocks = size_k // effective_requant_block
 
     # 1. Vectorized Unpack to Signed INT4 [-8..7]
-    shifts = torch.tensor(
-        [0, 4, 8, 12, 16, 20, 24, 28], dtype=torch.int32, device=device
-    )
+    shifts = torch.tensor(_INT4_UNPACK_SHIFTS, dtype=torch.int32, device=device)
     p_reshaped = w_packed.reshape(*out_dim_prefix, num_in_blocks, in_block_size // 8, 1)
     w_u4 = ((p_reshaped >> shifts) & 0xF).to(torch.int8)
     w_s4 = (w_u4 - 8).reshape(
@@ -254,9 +231,7 @@ def requantize_int4_to_fp4_weights(
     num_out_blocks = size_k // effective_requant_block
 
     # 1. Vectorized Unpack to Signed INT4 [-8..7]
-    shifts = torch.tensor(
-        [0, 4, 8, 12, 16, 20, 24, 28], dtype=torch.int32, device=device
-    )
+    shifts = torch.tensor(_INT4_UNPACK_SHIFTS, dtype=torch.int32, device=device)
     p_reshaped = w_packed.reshape(*out_dim_prefix, num_in_blocks, in_block_size // 8, 1)
     w_u4 = ((p_reshaped >> shifts) & 0xF).to(torch.int8)
     w_s4 = (w_u4 - 8).reshape(

@@ -40,6 +40,9 @@ if TYPE_CHECKING:
     )
 
 
+_UNFUSED_PROJ_SUFFIXES = (".0.gate_proj", ".0.up_proj", ".0.down_proj")
+
+
 class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
     """TPU dispatcher for Compressed Tensors MoE schemes."""
 
@@ -56,13 +59,10 @@ class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
         # RoutedExperts was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         quant_config._add_fused_moe_to_target_scheme_map()
-        unfused_names = [
-            layer_name + proj_name
-            for proj_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
-        ]
         # TODO: refactor this to use expert_mapping and check all layer numbers
         all_scheme_dicts = [
-            quant_config.get_scheme_dict(layer, name) for name in unfused_names
+            quant_config.get_scheme_dict(layer, layer_name + proj_name)
+            for proj_name in _UNFUSED_PROJ_SUFFIXES
         ]
         scheme_dict = all_scheme_dicts.pop()
 

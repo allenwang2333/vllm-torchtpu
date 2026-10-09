@@ -161,6 +161,11 @@ class FakeRoutedExperts(RoutedExperts):
         self.routed_scaling_factor = 1.0
 
 
+@pytest.fixture
+def device():
+    return torch.device("cpu")
+
+
 class TestW4MoEUpstreamHooks:
     """Inherited hooks must not read state the skipped __init__ never set."""
 
@@ -176,6 +181,7 @@ class TestW4MoEUpstreamHooks:
 
         assert not hasattr(method, "wna16_backend")
         assert method.supports_eplb is False
+        assert method.supports_internal_mk is False
 
 
 class TestW4MoEWeightPreprocessing:

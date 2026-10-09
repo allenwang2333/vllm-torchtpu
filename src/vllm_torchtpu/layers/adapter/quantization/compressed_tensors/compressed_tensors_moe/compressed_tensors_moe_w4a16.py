@@ -365,22 +365,23 @@ class VllmCompressedTensorsW4A16MoEMethod(
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
 
-        kwargs = {
-            "hidden_states": x,
-            "w1": layer.w13_weight_packed,
-            "w2": layer.w2_weight_packed,
-            "w1_scale": layer.w13_weight_scale,
-            "w2_scale": layer.w2_weight_scale,
-            "w1_bias": None,
-            "w2_bias": None,
-            "topk_weights": topk_weights,
-            "topk_ids": topk_ids,
-            "experts_start": layer._experts_start,
-            "topk": layer.moe_config.experts_per_token,
-            "activation": activation_str,
-            "rhs_quant_dtype": getattr(layer, "_rhs_quant_dtype", jnp.int4),
-        }
-        if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
-
-        return fused_moe_gmm(**kwargs)
+        gmm_fn = (
+            pipelined_fused_moe_gmm
+            if enable_pipelined_collective_and_compute()
+            else fused_moe_gmm
+        )
+        return gmm_fn(
+            hidden_states=x,
+            w1=layer.w13_weight_packed,
+            w2=layer.w2_weight_packed,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w1_bias=None,
+            w2_bias=None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=layer._experts_start,
+            topk=layer.moe_config.experts_per_token,
+            activation=activation_str,
+            rhs_quant_dtype=getattr(layer, "_rhs_quant_dtype", jnp.int4),
+        )
