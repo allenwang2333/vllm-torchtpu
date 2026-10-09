@@ -22,6 +22,12 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.sparse_core import core_map_helper
 
+_COMPILER_PARAMS = pltpu.CompilerParams(
+    use_tc_tiling_on_sc=True,
+    disable_bounds_checks=True,
+)
+_DMA_SEM_2 = pltpu.SemaphoreType.DMA((2,))
+
 
 def main_kernel(
     # Inputs.
@@ -51,6 +57,11 @@ def main_kernel(
     num_cores = jax.lax.axis_size((core_axis_name, subcore_axis_name))
     block_size = num_simd_lanes * num_cores
 
+    dtype = out_hbm_ref.dtype
+    dtype_bits = jax.dtypes.itemsize_bits(dtype)
+    packing = 32 // dtype_bits
+    bit_mask = (1 << dtype_bits) - 1
+
     recv_sem = sem_ref.at[0]
     send_sem = sem_ref.at[1]
 
@@ -72,31 +83,24 @@ def main_kernel(
 
         @pl.when(col_id == 0)
         def _():
-            dma_list = []
-            dma_list.append(
-                pltpu.make_async_copy(
-                    src_indices_hbm_ref.at[pl.ds(row_tile_start, num_simd_lanes)],
-                    src_indices_vmem_ref,
-                    recv_sem,
-                )
+            src_dma = pltpu.make_async_copy(
+                src_indices_hbm_ref.at[pl.ds(row_tile_start, num_simd_lanes)],
+                src_indices_vmem_ref,
+                recv_sem,
             )
-            dma_list.append(
-                pltpu.make_async_copy(
-                    dst_indices_hbm_ref.at[pl.ds(row_tile_start, num_simd_lanes)],
-                    dst_indices_vmem_ref,
-                    recv_sem,
-                )
+            dst_dma = pltpu.make_async_copy(
+                dst_indices_hbm_ref.at[pl.ds(row_tile_start, num_simd_lanes)],
+                dst_indices_vmem_ref,
+                recv_sem,
             )
-            jax.tree.map(lambda x: x.start(), dma_list)
-            jax.tree.map(lambda x: x.wait(), dma_list)
+            src_dma.start()
+            dst_dma.start()
+            src_dma.wait()
+            dst_dma.wait()
 
         # HBM to VMEM transfer.
         src_indices = src_indices_vmem_ref[...]
         dst_indices = dst_indices_vmem_ref[...]
-
-        dtype = out_hbm_ref.dtype
-        dtype_bits = jax.dtypes.itemsize_bits(dtype)
-        packing = 32 // dtype_bits
 
         # To fetch only one sublane at a time, we need to use (packing, 128) layout.
         # But, the inputs are in (8, 128) layout and thus we need to perform
@@ -160,7 +164,7 @@ def main_kernel(
                         # Right shift to make first n bits stores target data.
                         data = jnp.bitwise_right_shift(data, rightshift_bits)
                         # Mask out unwanted bits.
-                        data = jnp.bitwise_and(data, 2**dtype_bits - 1)
+                        data = jnp.bitwise_and(data, bit_mask)
                         # Left shift data into the target bit location.
                         data = jnp.bitwise_left_shift(data, leftshift_bits)
                         row_hbm = dst_indices[row_src] // packing
@@ -210,13 +214,16 @@ def main_kernel(
                 # If the current row is out of bounds, we just repeat the last valid
                 # write to avoid valid data in hbm being overwritten.
                 merged_data_vmem_row = (row_vmem // packing) * packing + packing - 1
+                merge_with_next = jnp.logical_and(
+                    row_hbm == next_row_hbm, next_row_valid
+                )
                 src_row_vmem = jnp.where(
-                    jnp.logical_and(row_hbm == next_row_hbm, next_row_valid),
+                    merge_with_next,
                     merged_data_vmem_row,
                     jnp.where(row_valid, row_vmem, last_valid_row_vmem),
                 )
                 dst_row_hbm = jnp.where(
-                    jnp.logical_and(row_hbm == next_row_hbm, next_row_valid),
+                    merge_with_next,
                     row_hbm,
                     jnp.where(row_valid, row_hbm, last_valid_row_hbm),
                 )
@@ -279,10 +286,8 @@ def calculate_col_size(hidden_size: int) -> int:
             target_bytes = (128 * 1024) * 0.8
 
     base_bytes = num_simd_lanes * hidden_size * (32 // 8)
-    num_cols = 1
-
-    while pl.cdiv(base_bytes, num_cols * num_lanes) * num_lanes > target_bytes:
-        num_cols += 1
+    max_col_bytes = int(target_bytes // num_lanes) * num_lanes
+    num_cols = max(1, pl.cdiv(base_bytes, max_col_bytes))
     return pl.cdiv(hidden_size, (num_cols * num_lanes)) * num_lanes
 
 
@@ -320,15 +325,12 @@ def _preprocess_indices(
     src_indices = jnp.where(
         jnp.logical_and(indices >= start, indices < end), indices, -1
     )
-    src_indices = jnp.pad(src_indices, ((0, out_pad_size)), constant_values=-1)
+    if out_pad_size:
+        src_indices = jnp.pad(src_indices, ((0, out_pad_size)), constant_values=-1)
     src_indices = src_indices.reshape(-1, packing)
     is_valid_src_row = src_indices != -1
-    num_sublanes = src_indices.shape[0]
     num_valid_src_rows_per_dst_sublane = jnp.sum(
-        is_valid_src_row, axis=-1, keepdims=False
-    )
-    num_valid_src_rows_per_dst_sublane = jnp.broadcast_to(
-        num_valid_src_rows_per_dst_sublane[:, None], (num_sublanes, packing)
+        is_valid_src_row, axis=-1, keepdims=True
     )
     # For each destination sublane that has more than one valid writes, we
     # consider all writes to that sublane as valid so that total number of
@@ -339,9 +341,12 @@ def _preprocess_indices(
         jnp.where(is_valid_src_row, 1, 0),
     ).reshape(-1)
     sorted_by_cnts = jnp.argsort(cnts, descending=True, stable=True)
-    src_indices = (jnp.pad(indices, ((0, out_pad_size)), constant_values=0))[
-        sorted_by_cnts
-    ]
+    padded_indices = (
+        jnp.pad(indices, ((0, out_pad_size)), constant_values=0)
+        if out_pad_size
+        else indices
+    )
+    src_indices = padded_indices[sorted_by_cnts]
     dst_indices = sorted_by_cnts
 
     # Due to possible considering more source rows as valid, the total number of
@@ -396,7 +401,7 @@ def ragged_scatter(
     dtype_bytes = dtype_bits // 8
 
     # Heuristic threshold on whether to fallback to xla gather.
-    if jnp.size(x) * dtype_bytes * 2 < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6:
+    if x.size * dtype_bytes * 2 < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6:
         # For small {input + output}, it's likely that both can be put in TC VMEM,
         # so it's likely faster to run TC-based gather on it than going through SC,
         # without data movement to/from HBM.
@@ -424,7 +429,7 @@ def ragged_scatter(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    return core_map_helper.kernel(
+    out = core_map_helper.kernel(
         functools.partial(
             main_kernel,
             core_axis_name=vector_mesh.core_axis_name,
@@ -433,17 +438,17 @@ def ragged_scatter(
         out_type=jax.ShapeDtypeStruct(
             (out_size + out_pad_size, aligned_hidden_size), dtype
         ),
-        compiler_params=pltpu.CompilerParams(
-            use_tc_tiling_on_sc=True,
-            disable_bounds_checks=True,
-        ),
+        compiler_params=_COMPILER_PARAMS,
         scratch_types=dict(
             total_num_rows_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
             out_vmem_ref=pltpu.VMEM((num_simd_lanes, col_size), jnp.uint32),
             src_indices_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
             dst_indices_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
-            sem_ref=pltpu.SemaphoreType.DMA((2,)),
+            sem_ref=_DMA_SEM_2,
         ),
         mesh=vector_mesh,
         name="sc_ragged_scatter",
-    )(total_num_rows, x, src_indices, dst_indices)[:out_size, :hidden_size]
+    )(total_num_rows, x, src_indices, dst_indices)
+    if out_pad_size == 0 and aligned_hidden_size == hidden_size:
+        return out
+    return out[:out_size, :hidden_size]

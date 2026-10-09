@@ -31,6 +31,7 @@ the pool in place (`input_output_aliases`); the unwritten complement is
 preserved via the HBM alias, with no read-modify-write.
 """
 
+import functools
 import math
 
 import jax
@@ -41,6 +42,9 @@ from vllm import envs
 
 from vllm_torchtpu.kernels import typed_ldst
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_v3_config
+
+_HBM_BLOCK_SPEC = pl.BlockSpec(memory_space=pltpu.HBM)
+_ALIAS_2_TO_0 = {2: 0}
 
 
 def is_seq_along_lane_pool() -> bool:
@@ -58,6 +62,7 @@ def _pool_geometry(pool):
     return pool.shape[1], tuple(pool.shape[2:-1]), pool.shape[-1]
 
 
+@functools.cache
 def _bitcast_payload(payload: tuple[int, ...], pool_dtype, out_dtype):
     """Payload dims of a region block after an in-kernel bitcast.
 
@@ -75,6 +80,7 @@ def _bitcast_payload(payload: tuple[int, ...], pool_dtype, out_dtype):
     return payload[:-1] + (last // elem_out,)
 
 
+@functools.cache
 def _rescale_rows(rows: int, pool_dtype, out_dtype) -> int:
     elem_in = jnp.dtype(pool_dtype).itemsize
     elem_out = jnp.dtype(out_dtype).itemsize
@@ -84,10 +90,7 @@ def _rescale_rows(rows: int, pool_dtype, out_dtype) -> int:
 
 
 def _out_rows(payload: tuple[int, ...], ntok: int) -> int:
-    rows = ntok
-    for dim in payload:
-        rows *= dim
-    return rows
+    return ntok * math.prod(payload) if payload else ntok
 
 
 def gather_region(
@@ -180,7 +183,7 @@ def gather_region(
             pool_ref.at[0], view_dtype=out_dtype, lane_split=lane_split
         )[None]
 
-    return pl.pallas_call(
+    out = pl.pallas_call(
         _kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
@@ -194,7 +197,8 @@ def gather_region(
             out_specs=pl.BlockSpec((1, out_rows, o_lanes), lambda p, s: (p, 0, 0)),
         ),
         out_shape=jax.ShapeDtypeStruct((na * chunks, out_rows, o_lanes), out_dtype),
-    )(state_indices, pool).reshape(na, chunks * out_rows, o_lanes)
+    )(state_indices, pool)
+    return out if chunks == 1 else out.reshape(na, chunks * out_rows, o_lanes)
 
 
 def _gather_window(
@@ -320,7 +324,7 @@ def _scatter_window(pool, vals, mgr_indices, *, split: int, kb0: int, nblocks: i
             ),
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
-        input_output_aliases={2: 0},
+        input_output_aliases=_ALIAS_2_TO_0,
     )(mgr_indices, vals, pool)
 
 
@@ -388,6 +392,7 @@ def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int, split: in
         # written; the complement is preserved via the HBM alias.
         typed_ldst.store_typed(pool_out_ref.at[0], val_ref[0], lane_split=lane_split)
 
+    vals_in = vals if chunks == 1 else vals.reshape(na * chunks, v_rows, v_lanes)
     return pl.pallas_call(
         _kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -396,7 +401,7 @@ def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int, split: in
             in_specs=[
                 pl.BlockSpec((1, v_rows, v_lanes), lambda p, s: (p, 0, 0)),
                 # Aliased with the output; never read, so leave it in HBM.
-                pl.BlockSpec(memory_space=pltpu.HBM),
+                _HBM_BLOCK_SPEC,
             ],
             out_specs=pl.BlockSpec(
                 (1, g) + payload + (lanes,),
@@ -404,8 +409,8 @@ def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int, split: in
             ),
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
-        input_output_aliases={2: 0},
-    )(state_indices, vals.reshape(na * chunks, v_rows, v_lanes), pool)
+        input_output_aliases=_ALIAS_2_TO_0,
+    )(state_indices, vals_in, pool)
 
 
 def copy_blocks(pool, src_indices, dst_indices):
@@ -432,10 +437,11 @@ def copy_blocks(pool, src_indices, dst_indices):
             out_specs=pl.BlockSpec(block_shape, lambda i, s, d: (d[i],) + pad),
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
-        input_output_aliases={2: 0},
+        input_output_aliases=_ALIAS_2_TO_0,
     )(src_indices, dst_indices, pool)
 
 
+@functools.cache
 def _conv_qk_pair_rows_perm(
     taps: int, conv_dim: int, n_v: int, d_v: int, lanes: int
 ) -> tuple[int, ...] | None:
@@ -513,10 +519,12 @@ def v3_state_source(
     independent of ``num_speculative_tokens``.
     """
     block_size, payload, lanes = _pool_geometry(pool)
-    if is_seq_along_lane_pool():
-        tok_bytes = math.prod(payload) * jnp.dtype(pool.dtype).itemsize
+    seq_along_lane = is_seq_along_lane_pool()
+    pool_itemsize = jnp.dtype(pool.dtype).itemsize
+    if seq_along_lane:
+        tok_bytes = math.prod(payload) * pool_itemsize
     else:
-        tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
+        tok_bytes = math.prod(payload) * lanes * pool_itemsize
     recurrent_state_dtype = jnp.dtype(recurrent_state_dtype)
 
     ssm_rows = n_v * d_k
@@ -608,5 +616,5 @@ def v3_state_source(
         stride=split,
         conv=conv,
         recurrent=ssm,
-        whole_block_dma=is_seq_along_lane_pool(),
+        whole_block_dma=seq_along_lane,
     )

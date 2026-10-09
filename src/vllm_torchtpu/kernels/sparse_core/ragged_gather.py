@@ -22,6 +22,12 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.sparse_core import core_map_helper
 
+_COMPILER_PARAMS = pltpu.CompilerParams(
+    use_tc_tiling_on_sc=True,
+    disable_bounds_checks=True,
+)
+_DMA_SEM_2 = pltpu.SemaphoreType.DMA((2,))
+
 
 def main_kernel(
     # Inputs.
@@ -51,18 +57,21 @@ def main_kernel(
     num_cores = jax.lax.axis_size((core_axis_name, subcore_axis_name))
     block_size = num_simd_lanes * num_cores
 
+    dtype = out_hbm_ref.dtype
+    dtype_bits = jax.dtypes.itemsize_bits(dtype)
+    packing = 32 // dtype_bits
+    bit_mask = (1 << dtype_bits) - 1
+
     recv_sem = sem_ref.at[0]
     send_sem = sem_ref.at[1]
 
     # Read start and end tensor values.
-    dma_list = []
-    dma = pltpu.make_async_copy(start_ref, start_vmem_ref.at[:1], recv_sem)
-    dma_list.append(dma)
-    dma = pltpu.make_async_copy(end_ref, end_vmem_ref.at[:1], recv_sem)
-    dma_list.append(dma)
-
-    jax.tree.map(lambda x: x.start(), dma_list)
-    jax.tree.map(lambda x: x.wait(), dma_list)
+    dma_start = pltpu.make_async_copy(start_ref, start_vmem_ref.at[:1], recv_sem)
+    dma_end = pltpu.make_async_copy(end_ref, end_vmem_ref.at[:1], recv_sem)
+    dma_start.start()
+    dma_end.start()
+    dma_start.wait()
+    dma_end.wait()
 
     # Calculate number of tiles to visit using start and end arrays.
     start = start_vmem_ref[...][0]
@@ -101,10 +110,6 @@ def main_kernel(
 
         # HBM to VMEM transfer.
         indices = indices_vmem_ref[...]
-
-        dtype = out_hbm_ref.dtype
-        dtype_bits = jax.dtypes.itemsize_bits(dtype)
-        packing = 32 // dtype_bits
 
         # To fetch only one sublane at a time, we need to use (packing, 128) layout.
         # But, the inputs are in (8, 128) layout and thus we need to perform
@@ -168,7 +173,7 @@ def main_kernel(
                         # Right shift to make first n bits stores target data.
                         data = jnp.bitwise_right_shift(data, rightshift_bits)
                         # Mask out unwanted bits.
-                        data = jnp.bitwise_and(data, 2**dtype_bits - 1)
+                        data = jnp.bitwise_and(data, bit_mask)
                         # Left shift data into the target bit location.
                         data = jnp.bitwise_left_shift(data, leftshift_bits)
 
@@ -227,10 +232,8 @@ def calculate_col_size(hidden_size: int) -> int:
             target_bytes = (128 * 1024) * 0.8
 
     base_bytes = num_simd_lanes * hidden_size * (32 // 8)
-    num_cols = 1
-
-    while pl.cdiv(base_bytes, num_cols * num_lanes) * num_lanes > target_bytes:
-        num_cols += 1
+    max_col_bytes = int(target_bytes // num_lanes) * num_lanes
+    num_cols = max(1, pl.cdiv(base_bytes, max_col_bytes))
     return pl.cdiv(hidden_size, (num_cols * num_lanes)) * num_lanes
 
 
@@ -265,7 +268,8 @@ def ragged_gather(
 
     # Pad to align to the block size.
     out_pad_size = pl.cdiv(out_size, block_size) * block_size - out_size
-    indices = jnp.pad(indices, ((0, out_pad_size)))
+    if out_pad_size:
+        indices = jnp.pad(indices, ((0, out_pad_size)))
 
     aligned_hidden_size = pl.cdiv(hidden_size, col_size) * col_size
 
@@ -275,7 +279,7 @@ def ragged_gather(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    return core_map_helper.kernel(
+    out = core_map_helper.kernel(
         functools.partial(
             main_kernel,
             core_axis_name=vector_mesh.core_axis_name,
@@ -284,17 +288,17 @@ def ragged_gather(
         out_type=jax.ShapeDtypeStruct(
             (out_size + out_pad_size, aligned_hidden_size), dtype
         ),
-        compiler_params=pltpu.CompilerParams(
-            use_tc_tiling_on_sc=True,
-            disable_bounds_checks=True,
-        ),
+        compiler_params=_COMPILER_PARAMS,
         scratch_types=dict(
             start_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
             end_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
             out_vmem_ref=pltpu.VMEM((num_simd_lanes, col_size), jnp.uint32),
             indices_vmem_ref=pltpu.VMEM((num_simd_lanes,), jnp.int32),
-            sem_ref=pltpu.SemaphoreType.DMA((2,)),
+            sem_ref=_DMA_SEM_2,
         ),
         mesh=vector_mesh,
         name="sc_ragged_gather",
-    )(start, end, x, indices)[:out_size, :hidden_size]
+    )(start, end, x, indices)
+    if out_pad_size == 0 and aligned_hidden_size == hidden_size:
+        return out
+    return out[:out_size, :hidden_size]

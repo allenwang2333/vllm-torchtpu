@@ -48,6 +48,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from torch_tpu._internal import pallas as torch_pallas
 
+_HBM_BLOCK_SPEC = pl.BlockSpec(memory_space=pltpu.HBM)
+_ALIAS_2_TO_0 = {2: 0}
+
 
 def _blockspec_kernel(_sidx_ref, vals_ref, _pool_in_ref, pool_out_ref):
     """One slot per grid step.
@@ -75,12 +78,12 @@ def _scatter_slots_nd(pool, indices, vals):
             in_specs=[
                 pl.BlockSpec(block, lambda i, s: (i,) + pad),
                 # Aliased with the output; never read, so leave it in HBM.
-                pl.BlockSpec(memory_space=pltpu.HBM),
+                _HBM_BLOCK_SPEC,
             ],
             out_specs=pl.BlockSpec(block, lambda i, s: (s[i],) + pad),
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
-        input_output_aliases={2: 0},
+        input_output_aliases=_ALIAS_2_TO_0,
     )(indices, vals, pool)
 
 
@@ -111,8 +114,9 @@ def _make_sublane_block_kernel(width: int, sublanes: int, num_updates: int):
         out = pool_in_ref[...]
         for j in range(num_updates):
             slot_j = sidx_ref[j]
-            in_block = (slot_j // sublanes) == my_block
-            dst = slot_j - (slot_j // sublanes) * sublanes
+            block_j = slot_j // sublanes
+            in_block = block_j == my_block
+            dst = slot_j - block_j * sublanes
             # Static j, so this is an ordinary unrolled index, not a dynamic
             # one; vals is resident whole so any row is reachable.
             row_j = vals_ref[j][None, :]
@@ -156,7 +160,7 @@ def _scatter_slots_2d(pool, indices, vals):
             ),
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
-        input_output_aliases={2: 0},
+        input_output_aliases=_ALIAS_2_TO_0,
     )(indices, vals, pool)
 
 
@@ -174,7 +178,8 @@ def pallas_scatter_slots(
             f"pool dtype {pool.dtype} != vals dtype {vals.dtype}; a cross-dtype "
             "view must be taken on the ref inside the kernel, never in XLA"
         )
-    indices = indices.astype(jnp.int32)
+    if indices.dtype != jnp.int32:
+        indices = indices.astype(jnp.int32)
     if pool.ndim >= 3:
         return _scatter_slots_nd(pool, indices, vals)
     if pool.ndim == 2:
@@ -219,6 +224,8 @@ def pallas_index_copy_(
     graph XLA folds it into the donation and it becomes a pointer alias --
     the same pattern as ``mamba_state_copy_op.copy_mamba_state_blocks``.
     """
-    new_cache, _ = _pallas_scatter_torch_op(cache, indices.to(torch.int32), updates)
+    if indices.dtype != torch.int32:
+        indices = indices.to(torch.int32)
+    new_cache, _ = _pallas_scatter_torch_op(cache, indices, updates)
     cache.copy_(new_cache)
     return cache
