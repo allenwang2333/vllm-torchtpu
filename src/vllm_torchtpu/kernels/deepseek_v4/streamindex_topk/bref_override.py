@@ -215,9 +215,10 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
 
     The HBM cache is `[total_pages, kv_sublane_groups, kv_packing, page_size]`,
     i.e. one page is a single contiguous block whose minor-most dimension is the
-    token (lane) dimension. Gathering `bkv_p` pages into one block therefore
-    means writing each page into a *lane* window of the VMEM buffer, instead of
-    the sublane window used by the HEAD_ALONG_SUBLANE layout.
+    token (lane) dimension. The VMEM block keeps one such slab per page,
+    `[seq_batch, bkv_p, kv_sublane_groups, kv_packing, page_size]`, so each page
+    moves as one contiguous copy. Placing pages side by side along lanes instead
+    would split every page into `kv_sublane_groups * kv_packing` short rows.
     """
 
     bkv_p: int = dataclasses.field(default=1, metadata=dict(static=True))
@@ -320,19 +321,11 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
             for i in range(self.bkv_p):
                 page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
                 safe_page = jnp.minimum(page_indices_ref[page_idx], max_hbm_pages - 1)
-                # One page is contiguous in HBM; it lands in lanes
-                # [i * page_size, (i + 1) * page_size) of the block. The offset is a
-                # compile-time constant and page_size is a multiple of the lane count,
-                # so the destination slice is always tile aligned.
-                dst_lane_start = i * self.page_size
+                # One page is contiguous in HBM and keeps that layout in its own
+                # slab of the block, so it moves as a single contiguous copy.
                 pltpu.make_async_copy(
                     cache_kv_hbm.at[safe_page],
-                    vmem_dst.at[  # pytype: disable=attribute-error
-                        batch_idx,
-                        :,
-                        :,
-                        pl.ds(dst_lane_start, self.page_size),
-                    ],
+                    vmem_dst.at[batch_idx, i],  # pytype: disable=attribute-error
                     sem,
                 ).start()
 
