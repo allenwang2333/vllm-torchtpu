@@ -370,7 +370,7 @@ def write_cache(cache, slots, values, valid, *, layout=None):
         page_size, page_stride, row_offset = layout.geometry
         elements, dtype = layout.elements, layout.dtype
         values = (values if values.dtype == dtype else values.to(dtype)).reshape(
-            slots.shape[0], elements
+            count, elements
         )
         if cache.device.type == "cpu":
             records = row_indices(
@@ -384,7 +384,11 @@ def write_cache(cache, slots, values, valid, *, layout=None):
         else:
             assert _write_values_op is not None
             slots_i32 = slots if slots.dtype == torch.int32 else slots.int()
-            cache.copy_(_write_values_op(cache, slots_i32, values, *layout.geometry))
+            cache.copy_(
+                _write_values_op(
+                    cache, slots_i32, values, page_size, page_stride, row_offset
+                )
+            )
         return
     if cache.device.type == "cpu":
         selected = slots[valid].long()
@@ -519,7 +523,7 @@ def cache_slots(
     if requests is None:
         requests = token_requests(metadata, positions, rows=rows)
     requests = requests.clamp(max=table.shape[0] - 1)
-    logical = positions // compress_ratio
+    logical = positions if compress_ratio == 1 else positions // compress_ratio
     columns = torch.zeros_like(logical) if ring else logical // rows_per_page
     blocks = table[requests, columns.clamp(max=table.shape[1] - 1).long()].long()
     slots = blocks * rows_per_page + logical % rows_per_page

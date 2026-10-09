@@ -15,6 +15,7 @@ from .deepseek_v41_cache import (
     NativeCacheBinding,
     cache_slots,
     read_cache,
+    row_indices,
     scatter_cache_words,
     token_requests,
     write_cache,
@@ -57,7 +58,7 @@ def save_compress_norm(
             state_layout.page_size if state_layout is not None else state_cache.shape[1]
         )
         cache = state_cache
-        rows = torch.arange(kv_score.shape[0], device=kv_score.device)
+        rows = torch.arange(count, device=kv_score.device)
         requests = token_to_req_indices.long().clamp(max=query_start_loc.numel() - 2)
         starts = query_start_loc[requests]
         ends = query_start_loc[requests + 1]
@@ -80,7 +81,7 @@ def save_compress_norm(
     elif ratio != 1:
         raise ValueError(f"V4.1 compression ratio must be 1 or 2, got {ratio}")
     result = rms_norm(values, norm_weight, eps)
-    latent.copy_(result.masked_fill(~valid[:, None], 0).to(latent.dtype))
+    latent.copy_(result.masked_fill(~valid[:, None], 0))
 
 
 def pack_csa_values(values: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -122,9 +123,7 @@ def write_csa_values(
 def write_compressed_cache(caches, slots, values, valid, num_states):
     nope, rope = caches
     records = (
-        (slots // num_states * nope.shape[1] + slots % num_states)
-        .masked_fill(~valid, -1)
-        .int()
+        row_indices(slots, num_states, nope.shape[1], 0).masked_fill(~valid, -1).int()
     )
     assert _write_op is not None
     updated_nope, updated_rope = _write_op(nope, rope, records, values)

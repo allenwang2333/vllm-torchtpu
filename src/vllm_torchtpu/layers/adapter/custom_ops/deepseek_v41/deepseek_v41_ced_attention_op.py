@@ -6,6 +6,10 @@ import jax
 import jax.numpy as jnp
 import torch
 
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
+    deepseek_v4_attention_op as attention_ops,
+)
+
 from .deepseek_v41_cache import gather_cache_values, masked_row_indices
 
 _attention_op = None
@@ -92,10 +96,6 @@ def ced_attention_jax(
     page_stride: int,
     row_offset: int,
 ) -> jax.Array:
-    from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
-        deepseek_v4_attention_op as attention_ops,
-    )
-
     swa_records = masked_row_indices(swa_slots, page_size, page_stride, row_offset)
     maximum, denominator, numerator = swa_attention_state(q, swa, swa_records, scale)
     if selected.shape[1] == 0:

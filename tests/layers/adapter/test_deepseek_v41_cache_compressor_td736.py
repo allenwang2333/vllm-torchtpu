@@ -503,7 +503,7 @@ def test_cache_slots_and_row_slots() -> None:
     assert int(s_auto[3]) == -1
 
     s_ring = cache_mod.cache_slots(
-        meta, positions, rows_per_page=2, ring=True, requests=reqs
+        meta, positions, rows_per_page=2, compress_ratio=2, ring=True, requests=reqs
     )
     assert int(s_ring[0]) == 20
 

@@ -542,7 +542,8 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         # Each cache must use its own layer's metadata: they are separate
         # groups with separate block tables, so borrowing another layer's
         # would scatter rows into that layer's pages.
-        state_prefix = self.state_cache.prefix
+        _state_cache_obj = self.state_cache
+        state_prefix = _state_cache_obj.prefix
         _k_cache_obj = getattr(self, "k_cache", None)
         k_cache_prefix = (
             getattr(_k_cache_obj, "prefix", None)
@@ -563,7 +564,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             return
 
         # For CSA the k_cache layer binds a `(nope, rope)` pair.
-        entry = getattr(self.k_cache, "kv_cache", None)
+        entry = getattr(_k_cache_obj, "kv_cache", None)
         main, rope = entry if isinstance(entry, tuple) else (entry, None)
         cache = self._as_kernel_cache_view(main)
         if cache is None:
@@ -586,7 +587,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                 )
         if self._separate_state:
             state_cache = self._as_kernel_cache_view(
-                getattr(self.state_cache, "kv_cache", None)
+                getattr(_state_cache_obj, "kv_cache", None)
             )
             if state_cache is None:
                 # `cache` is already real by here, so this is not the
