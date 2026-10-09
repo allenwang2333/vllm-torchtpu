@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -130,7 +132,7 @@ def _stitch_prefill_lane(
 
 
 def store_new_kv_lane(
-    vmem_ref: jax.Ref,
+    vmem_ref: Any,
     b_idx: int,
     stitch_result,
     *,
@@ -139,10 +141,11 @@ def store_new_kv_lane(
     """Stores the result of stitch_new_kv_lane back into memory."""
     v_len = cfgs.bkv_sz + 2 * cfgs.serve.page_size
     vmem_u32_ref = vmem_ref.at[b_idx].bitcast(jnp.uint32)
+    tpu_info = pltpu.get_tpu_info()
+    num_lanes = tpu_info.num_lanes
 
-    if cfgs.block.bq_sz <= pltpu.get_tpu_info().num_lanes:
+    if cfgs.block.bq_sz <= num_lanes:
         cols, outer_dim, lanes_per_col, merged = stitch_result
-        num_lanes = pltpu.get_tpu_info().num_lanes
         strided_vmem_ref = vmem_u32_ref.reshape(-1, num_lanes)
 
         k_rows = cfgs.serve.page_size // num_lanes
@@ -164,7 +167,7 @@ def store_new_kv_lane(
             * cfgs.aligned_kv_head_dim
             // cfgs.serve.packing_kv
         )
-        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        num_sublanes = tpu_info.num_sublanes
         words_per_sublane = total_head_words // num_sublanes
         vmem_u32_reshaped = vmem_u32_ref.reshape(words_per_sublane, num_sublanes, v_len)
 
@@ -173,7 +176,7 @@ def store_new_kv_lane(
 
 
 def stitch_new_kv_lane(
-    vmem_ref: jax.Ref,
+    vmem_ref: Any,
     b_idx: int,
     bkv_sz_frm_cache: jax.Array,
     new_kv_len_start: jax.Array,
@@ -186,22 +189,37 @@ def stitch_new_kv_lane(
     Expects vmem_ref shape: [batch, 2*kv, head_dim / packing, packing, bkv_sz + 2
     * page_size]
     """
-    bkv_sz_cache = bkv_sz_frm_cache.astype(jnp.int32)
-    new_tok_offset = new_kv_len_start.astype(jnp.int32) % cfgs.serve.page_size
+    bkv_sz_cache = (
+        bkv_sz_frm_cache
+        if bkv_sz_frm_cache.dtype == jnp.int32
+        else bkv_sz_frm_cache.astype(jnp.int32)
+    )
+    new_kv_start_i32 = (
+        new_kv_len_start
+        if new_kv_len_start.dtype == jnp.int32
+        else new_kv_len_start.astype(jnp.int32)
+    )
+    new_tok_offset = new_kv_start_i32 % cfgs.serve.page_size
     cache_pages = pl.cdiv(bkv_sz_cache, cfgs.serve.page_size)
 
     v_len = cfgs.bkv_sz + 2 * cfgs.serve.page_size
     vmem_u32_ref = vmem_ref.at[b_idx].bitcast(jnp.uint32)
+    num_lanes = pltpu.get_tpu_info().num_lanes
 
     # Up to num_lanes new kv tokens span at most two 128-lane registers, so they
     # can be rolled in place instead of rolling the entire bkv_sz.
-    if cfgs.block.bq_sz <= pltpu.get_tpu_info().num_lanes:
+    if cfgs.block.bq_sz <= num_lanes:
+        bkv_sz_new = (
+            bkv_sz_frm_new
+            if bkv_sz_frm_new.dtype == jnp.int32
+            else bkv_sz_frm_new.astype(jnp.int32)
+        )
         return _stitch_decode_lane(
             vmem_u32_ref,
             bkv_sz_cache,
             cache_pages,
             new_tok_offset,
-            bkv_sz_frm_new.astype(jnp.int32),
+            bkv_sz_new,
             v_len,
             cfgs=cfgs,
         )

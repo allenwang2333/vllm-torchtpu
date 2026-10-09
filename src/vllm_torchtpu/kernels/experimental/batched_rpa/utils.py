@@ -13,6 +13,8 @@
 # limitations under the License.
 """Utility functions for Ragged Paged Attention."""
 
+import functools
+
 import jax
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
@@ -53,10 +55,12 @@ def broadcast_minor(src, shape):
     return broadcasted[..., : shape[-1]]
 
 
+@functools.lru_cache(maxsize=64)
 def get_dtype_packing(dtype):
     return 32 // jax.dtypes.itemsize_bits(dtype)
 
 
+@functools.lru_cache(maxsize=64)
 def get_dtype_bits(dtype):
     return jax.dtypes.itemsize_bits(dtype)
 
@@ -145,6 +149,7 @@ def convert_to_target_bitwidth(val, target_bitwidth: int, kv_dtype: jnp.dtype):
         return left_out + right_out
 
 
+@functools.lru_cache(maxsize=64)
 def has_bank_conflicts(stride: int, distance=24, num_banks=32) -> bool:
     banks = set()
     for i in range(distance):

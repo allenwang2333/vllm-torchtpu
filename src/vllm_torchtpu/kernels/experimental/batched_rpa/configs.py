@@ -14,6 +14,7 @@
 
 import dataclasses
 import enum
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -23,7 +24,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.batched_rpa import utils
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class BlockSizes:
     """Tuning parameters for the RPA kernel."""
 
@@ -34,7 +35,7 @@ class BlockSizes:
     n_buffer: int
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class ModelConfigs:
     """Model config that will always stay constant."""
 
@@ -74,15 +75,11 @@ class KVLayout(enum.StrEnum):
     SEQ_ALONG_LANE = enum.auto()
 
     @property
-    def symbol(self):
-        match self:
-            case KVLayout.SEQ_ALONG_LANE:
-                return "snh"
-            case KVLayout.HEAD_ALONG_SUBLANE:
-                return "nhs"
+    def symbol(self) -> str:
+        return "snh" if self == KVLayout.SEQ_ALONG_LANE else "nhs"
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class ServingConfigs:
     """Serving config that can change depending on use cases."""
 
@@ -135,8 +132,8 @@ class ServingConfigs:
     def scale_channels(self) -> int:
         if self.per_token_scale:
             assert self.per_token_scale_dtype is not None
-            scale_bits = jax.dtypes.itemsize_bits(self.per_token_scale_dtype)
-            kv_bits = jax.dtypes.itemsize_bits(self.dtype_kv)
+            scale_bits = utils.get_dtype_bits(self.per_token_scale_dtype)
+            kv_bits = utils.get_dtype_bits(self.dtype_kv)
             return max(1, scale_bits // kv_bits)
         return 0
 
@@ -154,26 +151,22 @@ class RpaCase(enum.StrEnum):
     MIXED = enum.auto()
 
     @property
-    def symbol(self):
-        match self:
-            case RpaCase.DECODE:
-                return "d"
-            case RpaCase.PREFILL:
-                return "p"
-            case RpaCase.MIXED:
-                return "m"
+    def symbol(self) -> str:
+        if self == RpaCase.DECODE:
+            return "d"
+        if self == RpaCase.PREFILL:
+            return "p"
+        return "m"
 
     def get_range(
         self, distribution: jax.Array
     ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
         assert distribution.shape == (3,)
-        match self:
-            case RpaCase.DECODE:
-                return 0, distribution[0]
-            case RpaCase.PREFILL:
-                return distribution[0], distribution[1]
-            case RpaCase.MIXED:
-                return distribution[1], distribution[2]
+        if self == RpaCase.DECODE:
+            return 0, distribution[0]
+        if self == RpaCase.PREFILL:
+            return distribution[0], distribution[1]
+        return distribution[1], distribution[2]
 
 
 @dataclasses.dataclass(frozen=True, eq=True)
@@ -208,7 +201,7 @@ class RpaConfigs:
 
     # Define derived values.
 
-    @property
+    @functools.cached_property
     def max_steps_ub(self) -> int:
         """Get maximum upper bound of kernel steps based on SMEM limit."""
 
@@ -223,8 +216,9 @@ class RpaConfigs:
         word_size_bytes = 4
         fixed_bytes *= word_size_bytes
 
+        tpu_info = pltpu.get_tpu_info()
         smem_limit_bytes = (
-            pltpu.get_tpu_info().smem_capacity_bytes - 32 * 1024
+            tpu_info.smem_capacity_bytes - 32 * 1024
         ) * self.serve.smem_fraction_limit_for_schedule_generation
         available_bytes = smem_limit_bytes - fixed_bytes
 
@@ -244,21 +238,21 @@ class RpaConfigs:
 
         max_steps_ub = available_bytes // bytes_per_step
 
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes = tpu_info.num_lanes
         max_steps_ub = max(1, max_steps_ub // num_lanes) * num_lanes
         return int(max_steps_ub)
 
-    @property
+    @functools.cached_property
     def bkv_p(self) -> int:
         return pl.cdiv(self.block.bkv_sz, self.serve.page_size)
 
-    @property
+    @functools.cached_property
     def bkv_p_cache(self) -> int:
         if self.mode == RpaCase.PREFILL:
             return 0
         return self.bkv_p
 
-    @property
+    @functools.cached_property
     def bkv_p_new(self) -> int:
         if self.mode == RpaCase.DECODE or self.block.bq_sz == 1:
             return min(self.serve.max_decode_bkv_p_new, self.bkv_p)
@@ -266,7 +260,7 @@ class RpaConfigs:
             return self.bkv_p + 1
         return self.bkv_p
 
-    @property
+    @functools.cached_property
     def bkv_stride(self) -> int:
         bkv_stride = pl.cdiv(self.model.num_kv_heads * 2, self.serve.packing_kv)
 
@@ -274,16 +268,17 @@ class RpaConfigs:
             bkv_stride += 1
         return bkv_stride
 
-    @property
+    @functools.cached_property
     def aligned_q_head_dim(self) -> int:
         num_lanes = pltpu.get_tpu_info().num_lanes
         return utils.align_to(self.model.head_dim, num_lanes)
 
     # Actual head dimension used for compute, does not include scale factors.
-    @property
+    @functools.cached_property
     def compute_kv_head_dim(self) -> int:
-        num_lanes = pltpu.get_tpu_info().num_lanes
-        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        tpu_info = pltpu.get_tpu_info()
+        num_lanes = tpu_info.num_lanes
+        num_sublanes = tpu_info.num_sublanes
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return utils.align_to(self.model.head_dim, num_sublanes * kv_packing)
@@ -291,10 +286,11 @@ class RpaConfigs:
 
     # Head dimension used for storing kv in VMEM, includes scale factors if
     # per_token_scale is enabled.
-    @property
+    @functools.cached_property
     def aligned_kv_head_dim(self) -> int:
-        num_lanes = pltpu.get_tpu_info().num_lanes
-        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        tpu_info = pltpu.get_tpu_info()
+        num_lanes = tpu_info.num_lanes
+        num_sublanes = tpu_info.num_sublanes
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
 
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
@@ -310,19 +306,19 @@ class RpaConfigs:
 
         return utils.align_to(self.model.head_dim, num_lanes)
 
-    @property
+    @functools.cached_property
     def aligned_num_kv_heads_x2(self) -> int:
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return self.model.num_kv_heads * 2
         packing_kv = self.serve.packing_kv
         return utils.align_to(self.model.num_kv_heads * 2, packing_kv)
 
-    @property
+    @functools.cached_property
     def aligned_num_q_heads_per_kv_head(self) -> int:
         packing_q = self.serve.packing_q
         return utils.align_to(self.model.num_q_heads_per_kv_head, packing_q)
 
-    @property
+    @functools.cached_property
     def kv_hbm_stride(self) -> int:
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return self.model.num_kv_heads * 2
@@ -369,7 +365,7 @@ class RpaConfigs:
             >> 3
         )
 
-    @property
+    @functools.cached_property
     def q_vmem_shape(self):
         q_per_kv_packing = self.aligned_num_q_heads_per_kv_head // self.serve.packing_q
         return (
@@ -381,7 +377,7 @@ class RpaConfigs:
             self.aligned_q_head_dim,
         )
 
-    @property
+    @functools.cached_property
     def kv_vmem_shape(self):
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return (
