@@ -14,6 +14,9 @@ import pytest
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
+# Every test here runs the real Pallas kernel on a TPU.
+pytestmark = pytest.mark.usefixtures("requires_tpu")
+
 _LAYOUT = configs.KVLayout.SEQ_ALONG_LANE
 _PAGE_SIZE = 256
 _HEAD_DIM = 128

@@ -87,6 +87,12 @@ def _reset_warning_once():
 @pytest.fixture
 def vllm_config_context():
     """Run backend helpers with the same resolved layout as worker startup."""
+    from vllm_torchtpu.tpu_info import get_num_chips
+
+    if get_num_chips() == 0:
+        # VllmConfig() resolves DeviceConfig to torch.device("tpu"), which
+        # raises on a host with no TPU attached.
+        pytest.skip("requires an attached TPU chip")
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 

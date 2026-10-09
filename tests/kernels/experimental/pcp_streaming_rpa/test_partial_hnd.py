@@ -16,7 +16,11 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.multichip, pytest.mark.spawns_tpu_workers]
+pytestmark = [
+    pytest.mark.usefixtures("requires_tpu"),
+    pytest.mark.multichip,
+    pytest.mark.spawns_tpu_workers,
+]
 
 
 def _runtime_mesh_and_partition(torch, dist):

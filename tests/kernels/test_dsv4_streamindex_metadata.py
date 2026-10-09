@@ -66,6 +66,11 @@ class MetadataTest(parameterized.TestCase):
         max_pages_per_seq: int,
         expected_max_steps: int,
     ):
+        # Runs the real SparseCore metadata kernel.
+        from vllm_torchtpu.tpu_info import get_num_chips
+
+        if get_num_chips() == 0:
+            self.skipTest("requires an attached TPU chip")
         max_steps = metadata.generate_max_steps(
             num_seqs=num_seqs,
             max_pages_per_seq=max_pages_per_seq,

@@ -475,7 +475,7 @@ def test_build_streaming_kernel_registers_eight_tensor_custom_op(
 
 
 @pytest.fixture
-def hnd_vllm_config_context(monkeypatch):
+def hnd_vllm_config_context(monkeypatch, requires_tpu):
     vllm_envs.disable_envs_cache()
     monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
     config = VllmConfig(attention_config=AttentionConfig(backend="CUSTOM"))

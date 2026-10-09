@@ -23,6 +23,9 @@ import pytest
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
+# Every test here runs the real Pallas kernel on a TPU.
+pytestmark = pytest.mark.usefixtures("requires_tpu")
+
 _DECODE_BLOCKS = configs.BlockSizes(
     bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=8, n_buffer=3
 )

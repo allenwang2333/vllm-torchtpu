@@ -680,6 +680,12 @@ class TestStartStopPhasedProfiling:
 
 class TestTPURunner:
     def setup_method(self):
+        from vllm_torchtpu.tpu_info import get_num_chips
+
+        if get_num_chips() == 0:
+            # The VllmConfig built below resolves DeviceConfig to
+            # torch.device("tpu"), which raises on a host with no TPU.
+            pytest.skip("requires an attached TPU chip")
         self.mock_device = torch.device("cpu")
 
         model_config = ModelConfig(
