@@ -211,8 +211,9 @@ def resolve_block_major_pool_layout(
         kernel_block_size,
     )
     pool_indices = layer_to_pool_index(kv_cache_config)
-    num_pools = len(set(pool_indices.values()))
-    assert set(pool_indices.values()) == set(range(num_pools)), pool_indices
+    unique_pools = set(pool_indices.values())
+    num_pools = len(unique_pools)
+    assert unique_pools == set(range(num_pools)), pool_indices
     return BlockMajorPoolLayout(
         num_blocks=kv_cache_config.num_blocks,
         num_pools=num_pools,
@@ -354,6 +355,7 @@ def materialize_shared_attention_cache(
     spec = layer_specs[0][1]
     page_elements = tensor_size // (num_blocks * spec.dtype.itemsize)
     shapes = []
+    page_elems_by_layer = []
     for name, layer_spec in layer_specs:
         if (
             layer_spec.dtype != spec.dtype
@@ -370,15 +372,17 @@ def materialize_shared_attention_cache(
                 spec.dtype,
             )
         )
-        if page_elements % math.prod(shape[1:]):
+        shape_page_elems = math.prod(shape[1:])
+        if page_elements % shape_page_elems:
             raise ValueError(
                 f"Shared pool page must contain whole native pages for {name}"
             )
         shapes.append(shape)
+        page_elems_by_layer.append(shape_page_elems)
     pool_shape = shapes[0]
     if (
         any(shape != pool_shape for shape in shapes)
-        or math.prod(pool_shape[1:]) != page_elements
+        or page_elems_by_layer[0] != page_elements
     ):
         # Keep the packed dtype axis separate when reinterpreting head shapes.
         packing = 4 // spec.dtype.itemsize
@@ -468,6 +472,7 @@ def materialize_kv_cache_tensors(
         }
         region_caches: dict[tuple[int, int], torch.Tensor] = {}
         kv_caches: dict[str, LayerKVCache] = {}
+        num_blocks = kv_cache_config.num_blocks
         for group_list in attn_groups:
             for group in group_list:
                 gid = group.kv_cache_group_id
@@ -477,7 +482,6 @@ def materialize_kv_cache_tensors(
                     continue
                 assert isinstance(spec, AttentionSpec)
                 for layer_name in group.layer_names:
-                    num_blocks = kv_cache_config.num_blocks
                     region = placements[layer_name]
                     assert region[1] == spec.page_size_bytes, (
                         "Direct TPU attention caches require compact pages",

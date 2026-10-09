@@ -83,11 +83,15 @@ class _MtpFusedLoop(nn.Module):
                 last_hidden, hidden_states = out
             else:
                 last_hidden = hidden_states = out
+            next_ids = self.mtp.compute_logits(last_hidden).argmax(dim=-1)
             input_ids = (
-                self.mtp.compute_logits(last_hidden).argmax(dim=-1).to(torch.int32)
+                next_ids if next_ids.dtype == torch.int32 else next_ids.to(torch.int32)
             )
             tokens.append(input_ids)
         return tuple(tokens)
+
+
+_FUSED_LOOP_CLS_CACHE: dict[str, type[_MtpFusedLoop]] = {}
 
 
 def build_mtp_fused_loop(
@@ -101,7 +105,11 @@ def build_mtp_fused_loop(
     """Compile `_MtpFusedLoop` with the draft's own dynamic dims (Qwen3.5's
     MTP marks positions -1, DeepSeek's 0), so both programs specialise the
     token dimension the same way."""
-    cls = support_torch_compile(dynamic_arg_dims=dict(dynamic_arg_dims))(
-        type("MtpFusedLoop", (_MtpFusedLoop,), {})
-    )
+    key = repr(sorted(dynamic_arg_dims.items()))
+    cls = _FUSED_LOOP_CLS_CACHE.get(key)
+    if cls is None:
+        cls = support_torch_compile(dynamic_arg_dims=dict(dynamic_arg_dims))(
+            type("MtpFusedLoop", (_MtpFusedLoop,), {})
+        )
+        _FUSED_LOOP_CLS_CACHE[key] = cls
     return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp, num_steps=num_steps)
