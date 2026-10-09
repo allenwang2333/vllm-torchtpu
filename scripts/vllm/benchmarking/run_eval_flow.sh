@@ -115,6 +115,15 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Eval datasets go in the shared model cache, so each downloads once rather
+# than once per run. Kube shares only $HF_HOME/hub between pods (bare metal
+# mounts all of HF_HOME), so both caches live under it. Without this, evalscope
+# keeps MMMU-Pro (~100s to fetch) in $MODELSCOPE_CACHE/datasets inside the
+# container, and on kube lm-eval re-prepares MMLU in every pod.
+EVAL_CACHE_ROOT="${HF_HOME:-$HOME/.cache/huggingface}/hub"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$EVAL_CACHE_ROOT/datasets}"
+export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-$EVAL_CACHE_ROOT/modelscope}"
+
 # Register cleanup trap
 if [ "$START_SERVER" = "1" ]; then
     trap 'echo "Executing cleanup..."; bash "$SCRIPT_DIR/cleanup_server.sh"' EXIT INT TERM
