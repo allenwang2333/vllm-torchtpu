@@ -390,8 +390,8 @@ class TpuNgramHashState(nn.Module):
 
 _CPU_ENGRAM_WEIGHTS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 _NEXT_ENGRAM_TABLE_ID = 0
-# Double-buffered pinned CPU output pre-sized for max_num_batched_tokens=4096.
-_OUT_CPU_BUFS: list[torch.Tensor | None] = [None, None]
+# 32-slot CPU output ring pre-sized for max_num_batched_tokens=4096.
+_OUT_CPU_BUFS: list[torch.Tensor | None] = [None] * 32
 _OUT_CPU_SLOT: int = 0
 _OUT_CPU_MIN_TOKENS = 4096
 _PIN_HOST_BUFS: bool = True
@@ -583,7 +583,7 @@ class _EngramTableSlices:
 def _next_host_buf(nbytes: int, row_span: int) -> torch.Tensor:
     global _OUT_CPU_SLOT, _PIN_HOST_BUFS
     slot = _OUT_CPU_SLOT
-    _OUT_CPU_SLOT = (slot + 1) & 1
+    _OUT_CPU_SLOT = (slot + 1) & 31
     buf = _OUT_CPU_BUFS[slot]
     needed = max(nbytes, _OUT_CPU_MIN_TOKENS * row_span) + 512
     if buf is None or buf.numel() < needed:
@@ -947,25 +947,35 @@ def take_prefetched_engram_hashes(
     if n_real < target_tokens:
         rows[n_real:].zero_()
     if out_1d_i32_buf is not None:
-        # P2 D3: upload only the active bucket into the static buffer. The
-        # compiled stage reads rows [:max(t_local, 32)] (_EngramTableSlices),
-        # and the host buffers hold >= _OUT_CPU_MIN_TOKENS rows, so uploading
-        # the whole static buffer moved static_rows * row_bytes every step
-        # (decode included) and doubled with max_num_batched_tokens.
         if out_1d_i32_buf.ndim == 2:
-            pad_rows = min(max(target_tokens, 32), out_1d_i32_buf.shape[0])
-            pad_bytes = pad_rows * row_bytes
-            if pf["buf"].numel() >= pad_bytes:
+            static_rows, static_cols = out_1d_i32_buf.shape
+            static_bytes = static_rows * static_cols
+            pad_rows = min(max(target_tokens, 32), static_rows)
+            if envs.VLLM_DSV41_ENGRAM_H2D_PREFIX and 2 * pad_rows <= static_rows:
+                # H2D only the rows the model reads; pad on device to the static shape.
                 if n_real < pad_rows:
-                    pf["buf"][n_real * row_bytes : pad_bytes].zero_()
-                out_1d_i32_buf[:pad_rows].copy_(
-                    pf["buf"][:pad_bytes].view(pad_rows, row_bytes), non_blocking=True
+                    pf["buf"][n_real * row_bytes : pad_rows * row_bytes].zero_()
+                head = (
+                    pf["buf"][: pad_rows * static_cols]
+                    .view(pad_rows, static_cols)
+                    .to(device, non_blocking=True)
                 )
-                return out_1d_i32_buf
+                return torch.nn.functional.pad(head, (0, 0, 0, static_rows - pad_rows))
+            if pf["buf"].numel() >= static_bytes:
+                if n_real < pad_rows:
+                    pf["buf"][n_real * row_bytes : pad_rows * row_bytes].zero_()
+                return (
+                    pf["buf"][:static_bytes]
+                    .view(static_rows, static_cols)
+                    .to(device, non_blocking=True)
+                )
             out_1d_i32_buf[:target_tokens].copy_(rows, non_blocking=True)
             if target_tokens < pad_rows:
                 out_1d_i32_buf[target_tokens:pad_rows].zero_()
             return out_1d_i32_buf
+        static_bytes = out_1d_i32_buf.numel()
+        if pf["buf"].numel() >= static_bytes:
+            return pf["buf"][:static_bytes].to(device, non_blocking=True)
         out_1d_i32_buf[:total_bytes].copy_(rows.reshape(-1), non_blocking=True)
         return out_1d_i32_buf
     return rows.view(num_tokens, -1, packed_dim).to(device, non_blocking=True)
