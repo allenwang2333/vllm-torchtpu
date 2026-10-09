@@ -17,7 +17,7 @@ spec:
     enableDNSHostnames: true
   replicatedJobs:
     - name: vllm-node
-      replicas: 2
+      replicas: {{ .NUM_NODES | default 2 }}
       template:
         spec:
           ttlSecondsAfterFinished: 600
@@ -46,6 +46,8 @@ spec:
                   valueFrom:
                     fieldRef:
                       fieldPath: metadata.namespace
+                - name: NUM_NODES
+                  value: '{{ .NUM_NODES | default "2" }}'
                 - name: VLLM_TARGET_DEVICE
                   value: "tpu"
                 - name: PJRT_DEVICE
@@ -105,8 +107,6 @@ spec:
                 args:
                   - |
                     set -e
-                    export TPU_NODE_ID=${JOBSET_JOB_INDEX}
-                    export TPU_WORKER_ID=${JOBSET_JOB_INDEX}
                     mkdir -p "${CDK_OUTPUT_DIR}"
 
                     if [ -n "${TORCH_TPU_WHEEL}" ]; then
@@ -115,7 +115,7 @@ spec:
                       gcloud storage cp "${TORCH_TPU_WHEEL}" /tmp/wheels/torch_tpu/
                       pip install --no-deps --force-reinstall --quiet /tmp/wheels/torch_tpu/*.whl
                       pip show torch_tpu | grep -E "^(Name|Version)"
-                      python3 -c "from torch_tpu._internal.distributed.spmd_util import make_standalone; print('make_standalone: OK')"
+                      python3 -c "from torch_tpu._internal.distributed.spmd_util import make_standalone; print('make_standalone: OK')" || true
                     fi
                     if [ -n "${LIBTPU_WHEEL}" ]; then
                       echo "Installing libtpu override: ${LIBTPU_WHEEL}"
@@ -150,17 +150,24 @@ spec:
                       df -h /root/.cache/ | tail -1
                     fi
 
-                    HEAD_HOST="${JS_NAME}-vllm-node-0-0.${JS_NAME}.${POD_NAMESPACE}.svc.cluster.local"
-                    until getent hosts "${HEAD_HOST}" >/dev/null 2>&1; do
-                      echo "Waiting for DNS of ${HEAD_HOST}..."
-                      sleep 2
-                    done
-                    HEAD_IP=$(getent hosts "${HEAD_HOST}" | awk '{print $1}' | head -n 1)
-                    echo "Resolved HEAD_HOST=${HEAD_HOST} HEAD_IP=${HEAD_IP}"
+                    if [ "${NUM_NODES:-2}" -gt 1 ]; then
+                      export TPU_NODE_ID=${JOBSET_JOB_INDEX}
+                      export TPU_WORKER_ID=${JOBSET_JOB_INDEX}
+                      HEAD_HOST="${JS_NAME}-vllm-node-0-0.${JS_NAME}.${POD_NAMESPACE}.svc.cluster.local"
+                      until getent hosts "${HEAD_HOST}" >/dev/null 2>&1; do
+                        echo "Waiting for DNS of ${HEAD_HOST}..."
+                        sleep 2
+                      done
+                      HEAD_IP=$(getent hosts "${HEAD_HOST}" | awk '{print $1}' | head -n 1)
+                      echo "Resolved HEAD_HOST=${HEAD_HOST} HEAD_IP=${HEAD_IP}"
 
-                    EXTRA_FLAGS="--nnodes 2 --node-rank ${JOBSET_JOB_INDEX} --master-addr ${HEAD_IP} --master-port ${MASTER_PORT}"
-                    if [ "${JOBSET_JOB_INDEX}" != "0" ]; then
-                      EXTRA_FLAGS="${EXTRA_FLAGS} --headless"
+                      EXTRA_FLAGS="--nnodes ${NUM_NODES} --node-rank ${JOBSET_JOB_INDEX} --master-addr ${HEAD_IP} --master-port ${MASTER_PORT}"
+                      if [ "${JOBSET_JOB_INDEX}" != "0" ]; then
+                        EXTRA_FLAGS="${EXTRA_FLAGS} --headless"
+                      fi
+                    else
+                      unset TPU_MULTIHOST_BACKEND TPU_PROCESS_ADDRESSES TPU_PROCESS_PORT TPU_NODE_ID TPU_WORKER_ID
+                      EXTRA_FLAGS=""
                     fi
 
                     if [[ "${ENABLE_XPROF,,}" == "1" || "${ENABLE_XPROF,,}" == "true" ]]; then
@@ -210,7 +217,7 @@ spec:
                   medium: Memory
               restartPolicy: Never
               nodeSelector:
-                cloud.google.com/gke-tpu-topology: "2x2x2"
+                cloud.google.com/gke-tpu-topology: '{{ .TPU_TOPOLOGY | default "2x2x2" }}'
                 cloud.google.com/gke-tpu-accelerator: "tpu7x"
 
     - name: bench

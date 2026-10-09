@@ -84,12 +84,14 @@ case "${JOB_NAME}" in
     ;;
 
   pp4-tp2-1node)
-    # 2a. Single-host PP4 x TP2 Pure TP (8 cores, 2 chips per stage, no --ep) - GSM8K + prefill/serving sweep
+    # 2a. Single-host PP4 x TP2 Pure TP (8 cores, 1 megachip / 2 cores per stage, no --ep) - GSM8K + prefill/serving sweep
     run_or_print cdk job create \
-      vllm-torchtpu-generic-bench \
+      vllm-torchtpu-pp-tp-two-node-mp-bench \
+      NUM_NODES=1 \
+      TPU_TOPOLOGY=2x2x1 \
       DOCKER_IMAGE="${DOCKER_IMAGE}" \
       MODEL_ID="${MODEL_ID}" \
-      ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
+      ENV_VARS="${COMMON_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
       SERVER_ARGS="--pipeline-parallel-size 4 --tensor-parallel-size 2 --prefill-context-parallel-size 1 --no-async-scheduling --max-model-len 36864 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
       BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
       RUN_EVAL="true" \
@@ -100,12 +102,14 @@ case "${JOB_NAME}" in
     ;;
 
   pp4-tp2-ep2-1node)
-    # 2b. Single-host PP4 x TP2 + EP2 (8 cores, 2 chips per stage, --enable-expert-parallel) - GSM8K + prefill/serving sweep
+    # 2b. Single-host PP4 x TP2 + EP2 (8 cores, 1 megachip / 2 cores per stage, --enable-expert-parallel) - GSM8K + prefill/serving sweep
     run_or_print cdk job create \
-      vllm-torchtpu-generic-bench \
+      vllm-torchtpu-pp-tp-two-node-mp-bench \
+      NUM_NODES=1 \
+      TPU_TOPOLOGY=2x2x1 \
       DOCKER_IMAGE="${DOCKER_IMAGE}" \
       MODEL_ID="${MODEL_ID}" \
-      ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
+      ENV_VARS="${COMMON_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
       SERVER_ARGS="--pipeline-parallel-size 4 --tensor-parallel-size 2 --prefill-context-parallel-size 1 --enable-expert-parallel --no-async-scheduling --max-model-len 36864 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
       BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
       RUN_EVAL="true" \
@@ -118,7 +122,9 @@ case "${JOB_NAME}" in
   pp8-1node)
     # 3. Single-host PP8 baseline (8 cores, 1 core per stage) - GSM8K + prefill/serving sweep
     run_or_print cdk job create \
-      vllm-torchtpu-generic-bench \
+      vllm-torchtpu-pp-tp-two-node-mp-bench \
+      NUM_NODES=1 \
+      TPU_TOPOLOGY=2x2x1 \
       DOCKER_IMAGE="${DOCKER_IMAGE}" \
       MODEL_ID="${MODEL_ID}" \
       ENV_VARS="${COMMON_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
@@ -134,7 +140,9 @@ case "${JOB_NAME}" in
   pp4-pcp2-1node)
     # 4. Single-host PP4 x PCP2 baseline (8 cores, 2 chips per stage) - GSM8K + prefill/serving sweep
     run_or_print cdk job create \
-      vllm-torchtpu-generic-bench \
+      vllm-torchtpu-pp-tp-two-node-mp-bench \
+      NUM_NODES=1 \
+      TPU_TOPOLOGY=2x2x1 \
       DOCKER_IMAGE="${DOCKER_IMAGE}" \
       MODEL_ID="${MODEL_ID}" \
       ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=1 MOE_FUSED_EP_KERNEL_IMPL=v2" \
@@ -150,7 +158,9 @@ case "${JOB_NAME}" in
   tp8-1node)
     # 5. Single-host TP8 EP baseline (8 cores, 1 stage) - GSM8K + prefill/serving sweep
     run_or_print cdk job create \
-      vllm-torchtpu-generic-bench \
+      vllm-torchtpu-pp-tp-two-node-mp-bench \
+      NUM_NODES=1 \
+      TPU_TOPOLOGY=2x2x1 \
       DOCKER_IMAGE="${DOCKER_IMAGE}" \
       MODEL_ID="${MODEL_ID}" \
       ENV_VARS="TPU_QWEN35_AUTO_DEFAULTS=0 USE_MOE_FUSED_EP_KERNEL=1 VLLM_DISABLE_COMPILE_CACHE=1 VLLM_LOGGING_LEVEL=INFO" \
@@ -164,12 +174,12 @@ case "${JOB_NAME}" in
     ;;
 
   pp8-tp2-2node)
-    # 6a. Multi-host PP8 x TP2 Pure TP (16 cores across 2 hosts, 2 chips per stage, no --ep) - GSM8K + prefill/serving sweep
+    # 6a. Multi-host PP8 x TP2 Pure TP (16 cores across 2 hosts, 1 megachip / 2 cores per stage, no --ep) - GSM8K + prefill/serving sweep
     run_or_print cdk job create \
       vllm-torchtpu-pp-tp-two-node-mp-bench \
       DOCKER_IMAGE="${DOCKER_IMAGE}" \
       MODEL_ID="${MODEL_ID}" \
-      ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
+      ENV_VARS="${COMMON_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
       SERVER_ARGS="--pipeline-parallel-size 8 --tensor-parallel-size 2 --prefill-context-parallel-size 1 --no-async-scheduling --max-model-len 65536 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
       BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;64000,1,1,8;64000,1,4,16;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
       RUN_EVAL="true" \
@@ -180,12 +190,12 @@ case "${JOB_NAME}" in
     ;;
 
   pp8-tp2-ep2-2node)
-    # 6b. Multi-host PP8 x TP2 + EP2 (16 cores across 2 hosts, 2 chips per stage, --enable-expert-parallel) - GSM8K + prefill/serving sweep
+    # 6b. Multi-host PP8 x TP2 + EP2 (16 cores across 2 hosts, 1 megachip / 2 cores per stage, --enable-expert-parallel) - GSM8K + prefill/serving sweep
     run_or_print cdk job create \
       vllm-torchtpu-pp-tp-two-node-mp-bench \
       DOCKER_IMAGE="${DOCKER_IMAGE}" \
       MODEL_ID="${MODEL_ID}" \
-      ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
+      ENV_VARS="${COMMON_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
       SERVER_ARGS="--pipeline-parallel-size 8 --tensor-parallel-size 2 --prefill-context-parallel-size 1 --enable-expert-parallel --no-async-scheduling --max-model-len 65536 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
       BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;64000,1,1,8;64000,1,4,16;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
       RUN_EVAL="true" \
