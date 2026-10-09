@@ -53,6 +53,7 @@ def test_startup_accepts_the_knob_unset(
 
 def test_qwen35_dcp_cli_defaults_set_moe_v2_and_disable_reassociate(monkeypatch):
     import sys
+
     from vllm_torchtpu import env_override
 
     monkeypatch.setattr(
@@ -76,3 +77,20 @@ def test_qwen35_dcp_cli_defaults_set_moe_v2_and_disable_reassociate(monkeypatch)
         == "0"
     )
     assert env_override.os.environ["MOE_FUSED_EP_KERNEL_IMPL"] == "v2"
+
+
+def test_qwen35_serve_cli_defaults_ignores_vllm_bench_serve(monkeypatch):
+    import sys
+
+    from vllm_torchtpu import env_override
+
+    orig_argv = [
+        "vllm",
+        "bench",
+        "serve",
+        "--model",
+        "Qwen/Qwen3.5-397B-A17B-FP8",
+    ]
+    monkeypatch.setattr(sys, "argv", list(orig_argv))
+    env_override._apply_qwen35_serve_cli_defaults()
+    assert sys.argv == orig_argv
