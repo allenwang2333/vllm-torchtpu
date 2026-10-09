@@ -64,6 +64,7 @@ logger = init_logger(__name__)
 _DONE_SENTINEL = "_TORCH_TPU_MP_MULTIHOST_ENV_PREPARED"
 _DP_DONE_SENTINEL = "_TORCH_TPU_MP_MULTIHOST_DP_ENV_PREPARED"
 _RENDEZVOUS_TIMEOUT_S = 300
+_RENDEZVOUS_TIMEOUT = timedelta(seconds=_RENDEZVOUS_TIMEOUT_S)
 
 # The master's TCPStore server thread stops as soon as the TCPStore object is
 # garbage-collected. Other hosts may still be reading keys from it after this
@@ -95,21 +96,22 @@ def _rendezvous_host_ips(
         port=port,
         world_size=num_peers,
         is_master=is_master,
-        timeout=timedelta(seconds=_RENDEZVOUS_TIMEOUT_S),
+        timeout=_RENDEZVOUS_TIMEOUT,
     )
     if is_master:
         # Keep the server thread alive; see module-level comment.
         _keepalive_stores.append(store)
 
     store.set(f"{key_prefix}_ip_{peer_index}", get_ip())
+    xprof_key = f"{key_prefix}_xprof_session_id"
     if is_master:
-        store.set(f"{key_prefix}_xprof_session_id", str(time.time_ns()))
+        store.set(xprof_key, str(time.time_ns()))
 
     ip_keys = [f"{key_prefix}_ip_{i}" for i in range(num_peers)]
-    wait_keys = ip_keys + [f"{key_prefix}_xprof_session_id"]
-    store.wait(wait_keys, timedelta(seconds=_RENDEZVOUS_TIMEOUT_S))
+    wait_keys = [*ip_keys, xprof_key]
+    store.wait(wait_keys, _RENDEZVOUS_TIMEOUT)
     host_ips = [store.get(key).decode() for key in ip_keys]
-    xprof_session_id = store.get(f"{key_prefix}_xprof_session_id").decode()
+    xprof_session_id = store.get(xprof_key).decode()
     return host_ips, xprof_session_id
 
 
@@ -125,17 +127,19 @@ def prepare_mp_multihost_env(parallel_config) -> None:
     if nnodes <= 1:
         return
 
-    if os.environ.get(_DONE_SENTINEL) == str(nnodes):
+    nnodes_str = str(nnodes)
+    if os.environ.get(_DONE_SENTINEL) == nnodes_str:
         return
 
+    env = os.environ
     node_rank = parallel_config.node_rank
     local_world_size = parallel_config.local_world_size
     total_chips = local_world_size * nnodes
     master_addr = parallel_config.master_addr
     # Native PjRt validates this endpoint independently of vLLM's c10d
     # FileStore. Every host already agrees on the configured master pair.
-    os.environ.setdefault("MASTER_ADDR", master_addr)
-    os.environ.setdefault("MASTER_PORT", str(parallel_config.master_port))
+    env.setdefault("MASTER_ADDR", master_addr)
+    env.setdefault("MASTER_PORT", str(parallel_config.master_port))
     rendezvous_port = _rendezvous_port(parallel_config.master_port)
 
     logger.info(
@@ -159,12 +163,12 @@ def prepare_mp_multihost_env(parallel_config) -> None:
     # Same construction as ray_distributed_executor.py: one address per chip,
     # ordered by (host, local_rank), spanning every host in the slice.
     base_port = envs.TORCH_TPU_BASE_PORT
-    sb_addresses = [
+    sb_addresses_str = ",".join(
         f"{ip}:{base_port + local_rank}"
         for ip in host_ips
         for local_rank in range(local_world_size)
-    ]
-    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(sb_addresses)
+    )
+    env["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = sb_addresses_str
 
     # Lazy import: tpu_platform.py imports this module from inside
     # check_and_update_config to avoid a top-level circular import. Mirrors
@@ -172,18 +176,18 @@ def prepare_mp_multihost_env(parallel_config) -> None:
     from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
 
     topology = get_tpu_multihost_topology(total_chips)
-    os.environ["TORCH_TPU_TOPOLOGY"] = topology
-    os.environ["TPU_NUM_HOSTS"] = str(nnodes)
-    os.environ["NODE_RANK"] = str(node_rank)
-    os.environ["TORCH_TPU_XPROF_SESSION_ID"] = xprof_session_id
-    os.environ[_DONE_SENTINEL] = str(nnodes)
+    env["TORCH_TPU_TOPOLOGY"] = topology
+    env["TPU_NUM_HOSTS"] = nnodes_str
+    env["NODE_RANK"] = str(node_rank)
+    env["TORCH_TPU_XPROF_SESSION_ID"] = xprof_session_id
+    env[_DONE_SENTINEL] = nnodes_str
 
     logger.info(
         "TPU mp multihost: node_rank=%d host_ips=%s "
         "TORCH_TPU_SLICEBUILDER_ADDRESSES=%s TORCH_TPU_TOPOLOGY=%s",
         node_rank,
         host_ips,
-        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"],
+        sb_addresses_str,
         topology,
     )
 
@@ -223,14 +227,20 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     # Work around it by overwriting the list with ports computed identically
     # on every host from data_parallel_rpc_port (already CLI-identical), so
     # every host agrees without needing coordination of its own.
-    dp_rpc_port = parallel_config.data_parallel_rpc_port
+    base_dp_port = parallel_config.data_parallel_rpc_port + 100
     parallel_config._data_parallel_master_port_list = [
-        dp_rpc_port + 100 + i for i in range(5)
+        base_dp_port,
+        base_dp_port + 1,
+        base_dp_port + 2,
+        base_dp_port + 3,
+        base_dp_port + 4,
     ]
 
-    if os.environ.get(_DP_DONE_SENTINEL) == str(dp_size):
+    dp_size_str = str(dp_size)
+    if os.environ.get(_DP_DONE_SENTINEL) == dp_size_str:
         return True
 
+    env = os.environ
     num_hosts = dp_size // dp_size_local
     # data_parallel_rank on this top-level config is data_parallel_start_rank
     # (0 on the head node, --data-parallel-start-rank on secondary nodes),
@@ -265,26 +275,26 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     world_size = parallel_config.world_size
     local_chip_count = world_size * dp_size_local
     base_port = envs.TORCH_TPU_BASE_PORT
-    sb_addresses = [
+    sb_addresses_str = ",".join(
         f"{ip}:{base_port + local_slot}"
         for ip in host_ips
         for local_slot in range(local_chip_count)
-    ]
-    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(sb_addresses)
+    )
+    env["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = sb_addresses_str
 
     from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
 
     topology = get_tpu_multihost_topology(total_chips)
-    os.environ["TORCH_TPU_TOPOLOGY"] = topology
-    os.environ["TORCH_TPU_XPROF_SESSION_ID"] = xprof_session_id
-    os.environ[_DP_DONE_SENTINEL] = str(dp_size)
+    env["TORCH_TPU_TOPOLOGY"] = topology
+    env["TORCH_TPU_XPROF_SESSION_ID"] = xprof_session_id
+    env[_DP_DONE_SENTINEL] = dp_size_str
 
     logger.info(
         "TPU mp multihost DP: node_index=%d host_ips=%s "
         "TORCH_TPU_SLICEBUILDER_ADDRESSES=%s TORCH_TPU_TOPOLOGY=%s",
         node_index,
         host_ips,
-        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"],
+        sb_addresses_str,
         topology,
     )
     return True

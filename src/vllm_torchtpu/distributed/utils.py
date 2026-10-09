@@ -167,17 +167,22 @@ def get_kv_shm_pool_gb() -> float:
     return envs.TPU_KV_SHM_POOL_GB
 
 
+_NAMESPACE_CACHE: tuple[str, str] = ("", "")
+
+
 def _get_kv_transfer_namespace() -> str:
+    global _NAMESPACE_CACHE
     namespace = envs.TPU_KV_TRANSFER_NAMESPACE
     if not namespace:
         return ""
-    safe_chars = []
-    for char in namespace:
-        if char.isalnum() or char in ("_", "-"):
-            safe_chars.append(char)
-        else:
-            safe_chars.append("_")
-    return "".join(safe_chars)
+    cached_raw, cached_safe = _NAMESPACE_CACHE
+    if namespace == cached_raw:
+        return cached_safe
+    safe = "".join(
+        char if (char.isalnum() or char in ("_", "-")) else "_" for char in namespace
+    )
+    _NAMESPACE_CACHE = (namespace, safe)
+    return safe
 
 
 def get_ipc_socket_path(node_id: int, dp_rank: int = 0) -> str:

@@ -34,7 +34,7 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CpGroupLayout:
     """A CP process group's rank order plus the matching TPU device ids."""
 
@@ -117,20 +117,28 @@ def get_cp_group_layout(group: Any | None) -> CpGroupLayout:
     global_rank = _get_current_global_rank()
     device_id = _get_tpu_global_device_id()
     if group is None or int(group.world_size) == 1:
-        return CpGroupLayout(
+        single_key = (global_rank, (global_rank,), 0, device_id)
+        cached = _LAYOUT_CACHE.get(single_key)
+        if cached is not None:
+            return cached
+        layout = CpGroupLayout(
             ranks=(global_rank,),
             device_ids=(device_id,),
             rank_in_group=0,
             world_size=1,
         )
+        _LAYOUT_CACHE[single_key] = layout
+        return layout
 
-    ranks = tuple(int(rank) for rank in group.ranks)
+    raw_ranks = group.ranks
+    ranks = raw_ranks if isinstance(raw_ranks, tuple) else tuple(raw_ranks)
     rank_in_group = int(group.rank_in_group)
     cache_key = (global_rank, ranks, rank_in_group, device_id)
     cached = _LAYOUT_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
+    ranks = tuple(int(rank) for rank in ranks)
     rank_to_device_id = _collect_rank_to_device_id(group, global_rank, device_id)
     missing = [rank for rank in ranks if rank not in rank_to_device_id]
     if missing:
@@ -145,7 +153,7 @@ def get_cp_group_layout(group: Any | None) -> CpGroupLayout:
         rank_in_group=rank_in_group,
         world_size=int(group.world_size),
     )
-    _LAYOUT_CACHE[cache_key] = layout
+    _LAYOUT_CACHE[(global_rank, ranks, rank_in_group, device_id)] = layout
     return layout
 
 

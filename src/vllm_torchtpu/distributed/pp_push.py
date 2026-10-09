@@ -54,6 +54,16 @@ logger = init_logger(__name__)
 class _WaveState:
     """One executor's count of the steps it dispatched to the pipeline."""
 
+    __slots__ = (
+        "stages",
+        "steps",
+        "last_step",
+        "real_steps",
+        "open",
+        "pushes",
+        "settles",
+    )
+
     def __init__(self, stages: int):
         self.stages = stages
         # Steps with tokens dispatched since startup, pushes included, and
@@ -69,11 +79,12 @@ class _WaveState:
 
     def dispatched(self) -> int:
         """Records a scheduler step and returns its number."""
-        self.steps += 1
-        self.last_step = self.steps
+        step = self.steps + 1
+        self.steps = step
+        self.last_step = step
         self.real_steps += 1
         self.open = True
-        return self.steps
+        return step
 
     def before_waiting(self, executor: Any, step: int, real_step: int) -> None:
         """Send what carries ``step`` to the last stage before the engine
@@ -109,10 +120,10 @@ class _WaveState:
                 step,
                 self.steps,
             )
+        collective_rpc = executor.collective_rpc
+        output_rank = executor.output_rank
         for _ in range(need):
-            executor.collective_rpc(
-                "pp_push", non_block=True, unique_reply_rank=executor.output_rank
-            )
+            collective_rpc("pp_push", non_block=True, unique_reply_rank=output_rank)
         self.steps += need
 
 
@@ -124,6 +135,8 @@ class _PushFuture(Future):
     step to the last stage: the settle when nothing else is in flight,
     pushes otherwise.
     """
+
+    __slots__ = ("_inner", "_executor", "_wave", "_step", "_real_step")
 
     def __init__(
         self, inner: Future, executor: Any, wave: _WaveState, step: int, real_step: int
