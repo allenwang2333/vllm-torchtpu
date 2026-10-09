@@ -1151,6 +1151,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
 
         if fused_moe_ep_v3_supported(self):
             return fused_moe_ep_v3(self, layer, x, router_logits)
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3_tp import (
+            fused_moe_ep_v3_tp_forward,
+            fused_moe_ep_v3_tp_supported,
+        )
+
+        if fused_moe_ep_v3_tp_supported(self):
+            return fused_moe_ep_v3_tp_forward(self, layer, x, router_logits)
 
         # `score_bias_operand` is not optional, and omitting it is silent on
         # every model that does not have one. `prebuild_fused_moe_ep` builds

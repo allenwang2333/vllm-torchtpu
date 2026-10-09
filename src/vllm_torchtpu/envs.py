@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
+    MOE_FUSED_EP_V3_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
@@ -670,6 +671,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # arming everything. Below the threshold the grouped-matmul path serves.
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS": lambda: int(
         os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=v3 under tensor-parallel attention over the EP
+    # group (fused_moe_ep_v3_tp): steps of at least this many tokens take v3,
+    # smaller ones production's EP path in the same op. The token count is
+    # static per exported program, so this is a per-step choice.
+    "MOE_FUSED_EP_V3_MIN_TOKENS": lambda: int(
+        os.getenv("MOE_FUSED_EP_V3_MIN_TOKENS", "1024")
     ),
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.

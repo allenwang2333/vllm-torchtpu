@@ -203,8 +203,9 @@ def fused_moe_ep_v3(owner: Any, layer, x: torch.Tensor, router_logits: torch.Ten
     )
 
 
-def _check_deployment(layer) -> None:
-    """Raise on a deployment v3 cannot serve at all.
+def _check_deployment(layer) -> bool:
+    """Raise on a deployment v3 cannot serve at all; True for tensor-parallel
+    attention over the EP group, whose layers fused_moe_ep_v3_tp arms at load.
 
     The operator selected v3 explicitly, so these are errors rather than a
     silent fallback to the grouped-matmul path.
@@ -219,6 +220,12 @@ def _check_deployment(layer) -> None:
     # rewrites the group coordinator to width 1.
     tp = get_current_vllm_config().parallel_config.tensor_parallel_size
     if tp > 1:
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3_tp import (
+            tp_attention_over_ep,
+        )
+
+        if tp_attention_over_ep():
+            return True
         raise NotImplementedError(
             f"MOE_FUSED_EP_KERNEL_IMPL=v3 serves data parallelism with expert "
             f"parallelism only; tensor_parallel_size={tp} replicates every "
@@ -243,6 +250,7 @@ def _check_deployment(layer) -> None:
             "(TPU_MOE_COLLECTION_CHUNK_SIZE) both claim the expert-parallel "
             "exchange; enable one of them."
         )
+    return False
 
 
 def prebuild_fused_moe_ep_v3(layer, activation: str):
@@ -253,7 +261,12 @@ def prebuild_fused_moe_ep_v3(layer, activation: str):
     ranks to devices is a collective and a `Mesh` cannot survive Dynamo's
     tracing. Raises on a deployment v3 cannot serve.
     """
-    _check_deployment(layer)
+    if _check_deployment(layer):
+        logger.info_once(
+            "Fused EP MoE v3: tensor-parallel attention over the EP group; "
+            "fused_moe_ep_v3_tp arms the layers at load"
+        )
+        return None
     mesh = build_ep_mesh()
     if mesh is None:
         logger.info_once("Fused EP MoE v3 declined: no EP group")
