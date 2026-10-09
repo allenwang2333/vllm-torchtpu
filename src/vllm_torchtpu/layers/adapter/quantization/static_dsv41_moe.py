@@ -137,6 +137,9 @@ def _stream_grouped_shards(
             requests.append(FileChunks(layer, path, meta.offset, meta.read_sizes))
             tensor_names.append(meta.tensors_metadata)
         fs.stream_files(requests, credentials=None, device="cpu", is_distributed=False)
+        file_streamer = getattr(fs, "file_streamer", fs)
+        active = getattr(file_streamer, "active_request", None)
+        retain_buffers = active is not None and len(active.files) == len(requests)
         # Run:AI may use distributed collectives during setup. Prime this
         # generator on the worker thread, then consume chunks after the
         # ordinary model weights have loaded.
@@ -149,7 +152,10 @@ def _stream_grouped_shards(
                 raise ValueError(
                     f"Duplicate static MoE tensor: {paths[layer]}:{meta.name}"
                 )
-            tensors[meta.name] = sp.create_torch_tensor(buffer, meta).clone()
+            tensor = sp.create_torch_tensor(buffer, meta)
+            # One request retains all chunk buffers until this stream closes.
+            # Split requests reuse buffers, so their tensors need a copy.
+            tensors[meta.name] = tensor if retain_buffers else tensor.clone()
             if len(tensors) == len(names):
                 yield layer, pending.pop(layer)
         if pending:
