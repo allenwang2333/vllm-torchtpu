@@ -19,7 +19,7 @@ REPO_DIR="/home/shriharim_google_com/vllm-torchtpu-pp-tp"
 CDK_DIR="/home/shriharim_google_com/cloud-devkit"
 
 COMMON_ENV="TPU_QWEN35_AUTO_DEFAULTS=0 TPU_SMALL_ALL_REDUCE=0 TPU_MOE_LOWTOK=0 TPU_MOE_SEQUENCE_PARALLEL=0 VLLM_DISABLE_COMPILE_CACHE=1 VLLM_LOGGING_LEVEL=INFO"
-TWO_CHIP_ENV="${COMMON_ENV} VLLM_TPU_DEVICE_ORDER=0,4,1,5,2,6,3,7"
+TWO_CHIP_ENV="${COMMON_ENV} VLLM_TPU_DEVICE_ORDER=0,2,1,3,4,6,5,7"
 
 run_or_print() {
   echo "================================================================================"
@@ -48,19 +48,35 @@ case "${JOB_NAME}" in
     ;;
 
   pp4-tp2-1node)
-    # 2. Single-host PP4 x TP2 (8 cores, 2 chips per stage) - GSM8K + prefill/serving sweep
+    # 2a. Single-host PP4 x TP2 Pure TP (8 cores, 2 chips per stage, no --ep) - GSM8K + prefill/serving sweep
     run_or_print cdk job create --project="${PROJECT}" --zone="${ZONE}" \
       vllm-torchtpu-generic-bench \
       --set DOCKER_IMAGE="${DOCKER_IMAGE}" \
       --set MODEL_ID="${MODEL_ID}" \
       --set ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
-      --set SERVER_ARGS="--pipeline-parallel-size 4 --tensor-parallel-size 2 --prefill-context-parallel-size 1 --no-async-scheduling --max-model-len 36864 --max-num-batched-tokens 16384 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
+      --set SERVER_ARGS="--pipeline-parallel-size 4 --tensor-parallel-size 2 --prefill-context-parallel-size 1 --no-async-scheduling --max-model-len 36864 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
       --set BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
       --set RUN_EVAL="true" \
       --set EVAL_TASK="gsm8k" \
       --set EVAL_ARGS="--num_fewshot 5" \
       --map-dir "${REPO_DIR}:*:/workspace/vllm-torchtpu" \
-      --note "qwen35-397b-fp8: PP4xTP2 (1-host) GSM8K + sweep"
+      --note "qwen35-397b-fp8: PP4xTP2 Pure-TP (1-host) GSM8K + sweep"
+    ;;
+
+  pp4-tp2-ep2-1node)
+    # 2b. Single-host PP4 x TP2 + EP2 (8 cores, 2 chips per stage, --enable-expert-parallel) - GSM8K + prefill/serving sweep
+    run_or_print cdk job create --project="${PROJECT}" --zone="${ZONE}" \
+      vllm-torchtpu-generic-bench \
+      --set DOCKER_IMAGE="${DOCKER_IMAGE}" \
+      --set MODEL_ID="${MODEL_ID}" \
+      --set ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
+      --set SERVER_ARGS="--pipeline-parallel-size 4 --tensor-parallel-size 2 --prefill-context-parallel-size 1 --enable-expert-parallel --no-async-scheduling --max-model-len 36864 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
+      --set BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
+      --set RUN_EVAL="true" \
+      --set EVAL_TASK="gsm8k" \
+      --set EVAL_ARGS="--num_fewshot 5" \
+      --map-dir "${REPO_DIR}:*:/workspace/vllm-torchtpu" \
+      --note "qwen35-397b-fp8: PP4xTP2+EP2 (1-host) GSM8K + sweep"
     ;;
 
   pp8-1node)
@@ -70,7 +86,7 @@ case "${JOB_NAME}" in
       --set DOCKER_IMAGE="${DOCKER_IMAGE}" \
       --set MODEL_ID="${MODEL_ID}" \
       --set ENV_VARS="${COMMON_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
-      --set SERVER_ARGS="--pipeline-parallel-size 8 --tensor-parallel-size 1 --prefill-context-parallel-size 1 --no-async-scheduling --max-model-len 36864 --max-num-batched-tokens 16384 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
+      --set SERVER_ARGS="--pipeline-parallel-size 8 --tensor-parallel-size 1 --prefill-context-parallel-size 1 --no-async-scheduling --max-model-len 36864 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
       --set BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
       --set RUN_EVAL="true" \
       --set EVAL_TASK="gsm8k" \
@@ -85,8 +101,8 @@ case "${JOB_NAME}" in
       vllm-torchtpu-generic-bench \
       --set DOCKER_IMAGE="${DOCKER_IMAGE}" \
       --set MODEL_ID="${MODEL_ID}" \
-      --set ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=1" \
-      --set SERVER_ARGS="--pipeline-parallel-size 4 --tensor-parallel-size 1 --prefill-context-parallel-size 2 --enable-expert-parallel --no-async-scheduling --max-model-len 36864 --max-num-batched-tokens 16384 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
+      --set ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=1 MOE_FUSED_EP_KERNEL_IMPL=v2" \
+      --set SERVER_ARGS="--pipeline-parallel-size 4 --tensor-parallel-size 1 --prefill-context-parallel-size 2 --enable-expert-parallel --no-async-scheduling --max-model-len 36864 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
       --set BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
       --set RUN_EVAL="true" \
       --set EVAL_TASK="gsm8k" \
@@ -112,19 +128,35 @@ case "${JOB_NAME}" in
     ;;
 
   pp8-tp2-2node)
-    # 6. Multi-host PP8 x TP2 (16 cores across 2 hosts, 2 chips per stage) - GSM8K + prefill/serving sweep
+    # 6a. Multi-host PP8 x TP2 Pure TP (16 cores across 2 hosts, 2 chips per stage, no --ep) - GSM8K + prefill/serving sweep
     run_or_print cdk job create --project="${PROJECT}" --zone="${ZONE}" \
       "${REPO_DIR}/scripts/pp_tp_qwen35/multihost-mp-generic-bench.yaml" \
       --set DOCKER_IMAGE="${DOCKER_IMAGE}" \
       --set MODEL_ID="${MODEL_ID}" \
       --set ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
-      --set SERVER_ARGS="--pipeline-parallel-size 8 --tensor-parallel-size 2 --prefill-context-parallel-size 1 --no-async-scheduling --max-model-len 65536 --max-num-batched-tokens 16384 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
+      --set SERVER_ARGS="--pipeline-parallel-size 8 --tensor-parallel-size 2 --prefill-context-parallel-size 1 --no-async-scheduling --max-model-len 65536 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
       --set BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;64000,1,1,8;64000,1,4,16;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
       --set RUN_EVAL="true" \
       --set EVAL_TASK="gsm8k" \
       --set EVAL_ARGS="--num_fewshot 5" \
       --map-dir "${REPO_DIR}:*:/workspace/vllm-torchtpu" \
-      --note "qwen35-397b-fp8: PP8xTP2 (2-host 2x2x2) GSM8K + sweep"
+      --note "qwen35-397b-fp8: PP8xTP2 Pure-TP (2-host 2x2x2) GSM8K + sweep"
+    ;;
+
+  pp8-tp2-ep2-2node)
+    # 6b. Multi-host PP8 x TP2 + EP2 (16 cores across 2 hosts, 2 chips per stage, --enable-expert-parallel) - GSM8K + prefill/serving sweep
+    run_or_print cdk job create --project="${PROJECT}" --zone="${ZONE}" \
+      "${REPO_DIR}/scripts/pp_tp_qwen35/multihost-mp-generic-bench.yaml" \
+      --set DOCKER_IMAGE="${DOCKER_IMAGE}" \
+      --set MODEL_ID="${MODEL_ID}" \
+      --set ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
+      --set SERVER_ARGS="--pipeline-parallel-size 8 --tensor-parallel-size 2 --prefill-context-parallel-size 1 --enable-expert-parallel --no-async-scheduling --max-model-len 65536 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
+      --set BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;64000,1,1,8;64000,1,4,16;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
+      --set RUN_EVAL="true" \
+      --set EVAL_TASK="gsm8k" \
+      --set EVAL_ARGS="--num_fewshot 5" \
+      --map-dir "${REPO_DIR}:*:/workspace/vllm-torchtpu" \
+      --note "qwen35-397b-fp8: PP8xTP2+EP2 (2-host 2x2x2) GSM8K + sweep"
     ;;
 
   pp8-pcp2-2node)
@@ -133,8 +165,8 @@ case "${JOB_NAME}" in
       "${REPO_DIR}/scripts/pp_tp_qwen35/multihost-mp-generic-bench.yaml" \
       --set DOCKER_IMAGE="${DOCKER_IMAGE}" \
       --set MODEL_ID="${MODEL_ID}" \
-      --set ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=1" \
-      --set SERVER_ARGS="--pipeline-parallel-size 8 --tensor-parallel-size 1 --prefill-context-parallel-size 2 --enable-expert-parallel --no-async-scheduling --max-model-len 65536 --max-num-batched-tokens 16384 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
+      --set ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=1 MOE_FUSED_EP_KERNEL_IMPL=v2" \
+      --set SERVER_ARGS="--pipeline-parallel-size 8 --tensor-parallel-size 1 --prefill-context-parallel-size 2 --enable-expert-parallel --no-async-scheduling --max-model-len 65536 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
       --set BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;64000,1,1,8;64000,1,4,16;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
       --set RUN_EVAL="true" \
       --set EVAL_TASK="gsm8k" \
@@ -145,12 +177,14 @@ case "${JOB_NAME}" in
 
   *)
     echo "Available jobs:"
-    echo "  ut-1node        - TPU unit tests (2x2x1)"
-    echo "  pp4-tp2-1node   - PP4 x TP2 on 1 host (2x2x1): GSM8K + prefill & serving sweep"
-    echo "  pp8-1node       - PP8 baseline on 1 host (2x2x1): GSM8K + prefill & serving sweep"
-    echo "  pp4-pcp2-1node  - PP4 x PCP2 baseline on 1 host (2x2x1): GSM8K + prefill & serving sweep"
-    echo "  tp8-1node       - TP8 EP baseline on 1 host (2x2x1): GSM8K + prefill & serving sweep"
-    echo "  pp8-tp2-2node   - PP8 x TP2 on 2 hosts (2x2x2): GSM8K + prefill & serving sweep"
-    echo "  pp8-pcp2-2node  - PP8 x PCP2 baseline on 2 hosts (2x2x2): GSM8K + prefill & serving sweep"
+    echo "  ut-1node          - TPU unit tests (2x2x1)"
+    echo "  pp4-tp2-1node     - PP4 x TP2 Pure-TP on 1 host (2x2x1): GSM8K + prefill & serving sweep"
+    echo "  pp4-tp2-ep2-1node - PP4 x TP2 + EP2 on 1 host (2x2x1): GSM8K + prefill & serving sweep"
+    echo "  pp8-1node         - PP8 baseline on 1 host (2x2x1): GSM8K + prefill & serving sweep"
+    echo "  pp4-pcp2-1node    - PP4 x PCP2 baseline on 1 host (2x2x1): GSM8K + prefill & serving sweep"
+    echo "  tp8-1node         - TP8 EP baseline on 1 host (2x2x1): GSM8K + prefill & serving sweep"
+    echo "  pp8-tp2-2node     - PP8 x TP2 Pure-TP on 2 hosts (2x2x2): GSM8K + prefill & serving sweep"
+    echo "  pp8-tp2-ep2-2node - PP8 x TP2 + EP2 on 2 hosts (2x2x2): GSM8K + prefill & serving sweep"
+    echo "  pp8-pcp2-2node    - PP8 x PCP2 baseline on 2 hosts (2x2x2): GSM8K + prefill & serving sweep"
     ;;
 esac
