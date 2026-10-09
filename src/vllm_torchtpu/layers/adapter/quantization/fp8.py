@@ -72,6 +72,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_decode_layer,
     fused_moe_gmm,
+    prebuild_fused_moe_decode_layer,
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
@@ -1001,6 +1002,25 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
+        if envs.TPU_MOE_FUSED_DECODE_LAYER:
+            # Built here, outside Dynamo tracing, like the fused MoE op. The
+            # runner's routed_scaling_factor (stashed on this layer when the
+            # runner was built) becomes a persistent device operand, so the op
+            # key needs no model constant.
+            prebuild_fused_moe_decode_layer(
+                topk=layer.moe_config.experts_per_token,
+                activation=activation_str,
+                use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            )
+            scale = float(getattr(layer, "_tpu_runner_routed_scale", 1.0))
+            layer._tpu_routed_scale_value = scale
+            layer.register_buffer(
+                "_tpu_routed_scale",
+                torch.full(
+                    (1,), scale, dtype=torch.float32, device=layer.w13_weight.device
+                ),
+                persistent=False,
+            )
         # Resolve the EP mesh here, not on the first forward: it maps ranks to
         # TPU device ids with an all_gather_object, and Dynamo cannot trace a
         # collective inside the compiled graph. The result is recorded on this
@@ -1033,7 +1053,11 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             register_score_bias_buffer(layer)
 
     def tpu_fused_decode_shared_operands(
-        self, layer: RoutedExperts, x: torch.Tensor, shared_mlp: torch.nn.Module
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        shared_mlp: torch.nn.Module,
+        routed_scale: float = 1.0,
     ) -> tuple[torch.Tensor, ...] | None:
         """TPU_MOE_FUSED_DECODE_LAYER gate, decided before the MoE runs.
 
@@ -1050,6 +1074,11 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 
         if fused_moe_ep_supported(self):
+            return None
+        # The prebuilt routed-scale operand must hold this runner's factor.
+        if getattr(layer, "_tpu_routed_scale", None) is None or (
+            layer._tpu_routed_scale_value != float(routed_scale)
+        ):
             return None
         shared = _fused_decode_shared_weights(shared_mlp)
         if shared is None:
@@ -1161,7 +1190,6 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # skipped the separate shared expert; it is run inside the kernel.
         fused_decode = getattr(layer, "_tpu_fused_decode_layer", None)
         if fused_decode is not None:
-            shared, routed_scale = fused_decode
             return fused_moe_decode_layer(
                 x,
                 layer.w13_weight,
@@ -1173,10 +1201,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 topk_weights,
                 topk_ids,
                 layer._experts_start,
-                shared,
+                fused_decode,
+                layer._tpu_routed_scale,
                 topk=layer.moe_config.experts_per_token,
                 activation=activation_str,
-                routed_scale=routed_scale,
             )
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an

@@ -199,7 +199,7 @@ def _candidate(x, routed, weights, ids, offset, shared, rsf):
         ids,
         jnp.int32(offset),
         shared,
-        routed_scale=rsf,  # the runner skips its own scaling on this path
+        jnp.full((1,), rsf, jnp.float32),  # traced; the runner skips its own scaling
     )
     return np.asarray(out, np.float32)
 
@@ -530,12 +530,14 @@ def test_runner_patch_skips_shared_only_when_admitted(monkeypatch):
         routed_experts=routed,
         routed_scaling_factor=2.5,
         _quant_method=SimpleNamespace(
-            tpu_fused_decode_shared_operands=lambda layer, x, mlp: admit["value"]
+            tpu_fused_decode_shared_operands=lambda layer, x, mlp, rsf: (
+                admit["value"] if rsf == 2.5 else None
+            )
         ),
     )
     shared_out, fused_out = cls._apply_quant_method(fake, hs, hs, hs)
     assert shared_out is None and torch.equal(fused_out, hs + 1)
-    assert seen["during"] == (admit["value"], 2.5)
+    assert seen["during"] == admit["value"]
     assert routed._tpu_fused_decode_layer is None
     assert "upstream_apply" not in rec.calls
     assert cls._maybe_combine(fake, None, fused_out)[0] is None
@@ -561,3 +563,25 @@ def test_runner_patch_not_installed_when_flag_off(monkeypatch):
     monkeypatch.delenv("TPU_MOE_FUSED_DECODE_LAYER", raising=False)
     vllm_torchtpu._patch_moe_runner_fused_decode_layer()
     assert cls.__dict__.get("_apply_quant_method") is before
+
+
+def test_decode_layer_op_is_never_built_in_the_forward():
+    """The forward only looks the op up; an unprebuilt key fails loudly
+    instead of building pallas.jax_op under Dynamo tracing."""
+    pytest.importorskip("vllm")
+    pytest.importorskip("torch_tpu")
+    from vllm_torchtpu.layers.adapter import fused_moe as adapter
+
+    config = dict(
+        topk=7,
+        activation="silu",
+        use_ep=True,
+        rhs_quant_dtype=None,
+        skip_padded_tokens=False,
+    )
+    with pytest.raises(RuntimeError, match="not prebuilt"):
+        adapter._get_fused_decode_layer_op(**config)
+    adapter.prebuild_fused_moe_decode_layer(**config)
+    op = adapter._get_fused_decode_layer_op(**config)
+    adapter.prebuild_fused_moe_decode_layer(**config)
+    assert adapter._get_fused_decode_layer_op(**config) is op

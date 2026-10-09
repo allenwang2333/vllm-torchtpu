@@ -819,7 +819,6 @@ def fused_decode_layer_admits(
         "use_ep",
         "rhs_quant_dtype",
         "skip_padded_tokens",
-        "routed_scale",
     ),
 )
 def fused_moe_decode_layer_func(
@@ -837,12 +836,12 @@ def fused_moe_decode_layer_func(
     shared_w13_scale: jax.Array,
     shared_w2: jax.Array,
     shared_w2_scale: jax.Array,
+    routed_scale: jax.Array,
     topk: int = 1,
     activation: str = "silu",
     use_ep: bool = False,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
-    routed_scale: float = 1.0,
 ) -> jax.Array:
     """Routed experts + one shared expert in one dense-expert kernel.
 
@@ -850,8 +849,8 @@ def fused_moe_decode_layer_func(
     ``experts_start`` traced, weights pinned to the hidden dtype -- but the EP
     remap, coefficient build and the per-channel FP8 shared expert
     (``shared_w13`` [H, 2*Is] gate|up, ``shared_w2`` [Is, H], 1-D scales) run
-    inside the kernel. ``routed_scale`` is the MoE runner's
-    routed_scaling_factor, applied to the routed FP32 sum before the shared
+    inside the kernel. ``routed_scale`` (f32, traced, one element) is the MoE
+    runner's routed_scaling_factor, applied to the routed FP32 sum before the shared
     add; the caller must then not scale the output again. Only callable for
     batches ``fused_decode_layer_admits`` accepts.
     """

@@ -33,7 +33,7 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
-_fused_decode_layer_cache: dict[tuple[int, str, bool, Any, bool, float], Callable] = {}
+_fused_decode_layer_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
@@ -296,24 +296,34 @@ def fused_moe_gmm(
     )
 
 
-def _get_fused_decode_layer_op(
+def _fused_decode_layer_key(
+    topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens
+):
+    if skip_padded_tokens is None:
+        skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
+    return (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+
+
+def prebuild_fused_moe_decode_layer(
     *,
     topk: int,
     activation: str,
     use_ep: bool,
-    rhs_quant_dtype,
-    skip_padded_tokens: bool,
-    routed_scale: float,
-) -> Callable:
-    """One custom op per static configuration, like the fused MoE op.
+    rhs_quant_dtype=None,
+    skip_padded_tokens: bool | None = None,
+) -> None:
+    """Build the TPU_MOE_FUSED_DECODE_LAYER op at weight load, outside tracing.
 
-    ``routed_scale`` is a model constant (identical on every rank), so binding
-    it into the closure keeps every EP rank's program identical.
+    ``pallas.jax_op`` inspects the wrapped function's signature, which Dynamo
+    cannot trace, so the forward must only ever hit this cache -- the same
+    reason ``prebuild_fused_moe_kernel`` exists for the fused MoE op.
     """
-    key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens, routed_scale)
-    op = _fused_decode_layer_cache.get(key)
-    if op is not None:
-        return op
+    key = _fused_decode_layer_key(
+        topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens
+    )
+    if key in _fused_decode_layer_cache:
+        return
+    topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens = key
     op = pallas.jax_op(
         f"pallas::fused_moe_decode_layer_{_allocate_kernel_instance_id()}",
         functools.partial(
@@ -323,7 +333,6 @@ def _get_fused_decode_layer_op(
             use_ep=use_ep,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
-            routed_scale=routed_scale,
         ),
     )
 
@@ -332,6 +341,18 @@ def _get_fused_decode_layer_op(
 
     op.register_fake(_fake)
     _fused_decode_layer_cache[key] = op
+
+
+def _get_fused_decode_layer_op(**config) -> Callable:
+    """Cache lookup only; building under Dynamo tracing would fail obscurely."""
+    key = _fused_decode_layer_key(**config)
+    op = _fused_decode_layer_cache.get(key)
+    if op is None:
+        raise RuntimeError(
+            "TPU_MOE_FUSED_DECODE_LAYER op was not prebuilt for "
+            f"(topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)={key}; "
+            "call prebuild_fused_moe_decode_layer at weight load."
+        )
     return op
 
 
@@ -347,21 +368,20 @@ def fused_moe_decode_layer(
     topk_ids: torch.Tensor,
     experts_start: torch.Tensor | None,
     shared: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    routed_scale: torch.Tensor,
     topk: int,
     activation: str,
-    routed_scale: float = 1.0,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
 ) -> torch.Tensor:
     """TPU_MOE_FUSED_DECODE_LAYER: routed + shared expert in one kernel.
 
     Same operands as fused_moe_gmm plus the shared expert's
-    (w13 [H, 2*Is], w13_scale [2*Is], w2 [Is, H], w2_scale [H]). The output
-    already contains the shared expert and ``routed_scale``; only the
-    all-reduce is left to the caller.
+    (w13 [H, 2*Is], w13_scale [2*Is], w2 [Is, H], w2_scale [H]) and
+    ``routed_scale``, a persistent one-element f32 tensor holding the runner's
+    routed_scaling_factor. The output already contains the shared expert and
+    the routed scale; only the all-reduce is left to the caller.
     """
-    if skip_padded_tokens is None:
-        skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
     use_ep = experts_start is not None
     op = _get_fused_decode_layer_op(
         topk=topk,
@@ -369,7 +389,6 @@ def fused_moe_decode_layer(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
-        routed_scale=float(routed_scale),
     )
     if experts_start is None:
         experts_start = torch.zeros((), dtype=torch.int32, device=hidden_states.device)
@@ -385,4 +404,5 @@ def fused_moe_decode_layer(
         topk_ids,
         experts_start,
         *shared,
+        routed_scale,
     )
