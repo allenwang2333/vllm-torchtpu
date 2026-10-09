@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render a static-MoE replay from the successful PR #1734 Falcon baseline.
+"""Render a direct-load static-MoE replay from PR #1734's Falcon baseline.
 
 Input is the JSON from `falcon exp get exp-5iekivkfrn --output json`.
 The rendered JSON is accepted by Falcon's YAML experiment submit command.
@@ -140,41 +140,22 @@ disk_monitor_pid=$!
     setup_marker = 'echo "REPRO_SETUP $(date -Is)"'
     if command.count(setup_marker) != 1:
         raise ValueError("Baseline setup marker changed")
-    stage = f"""(
-set -euo pipefail
-static_stage=/tmp/tpu_logs/static-moe
-mkdir -p "$static_stage"
-echo "STATIC_MOE_STAGE_START $(date -Is)"
-cp {MODEL_MOUNT}/config.json {MODEL_MOUNT}/STATIC_MOE_READY.json \\
-  {MODEL_MOUNT}/tpu-static-moe.json "$static_stage/"
-mkdir -p "$static_stage/prepared-weights"
-find {MODEL_MOUNT}/prepared-weights -maxdepth 1 -type f -name '*.fp4' -print0 | \\
-  xargs -0 -r -P 16 -I '{{}}' cp '{{}}' "$static_stage/prepared-weights/"
-expected_files=$(python3 -c \\
-  'import json,sys; print(json.load(open(sys.argv[1]))["static_files"])' \\
-  "$static_stage/STATIC_MOE_READY.json")
-staged_files=$(find "$static_stage/prepared-weights" -maxdepth 1 \\
-  -type f -name '*.fp4' | wc -l)
-[[ "$staged_files" -eq "$expected_files" ]] || {{
-  echo "Static MoE staging incomplete: $staged_files/$expected_files files" >&2
-  exit 1
-}}
-staged_bytes=$(du -sb "$static_stage/prepared-weights" | cut -f1)
-echo "STATIC_MOE_STAGE_END $(date -Is) files=$staged_files bytes=$staged_bytes"
-) &
-static_stage_pid=$!
+    ready_check = f"""python3 - <<'STATIC_MOE_CHECK'
+import json
+from pathlib import Path
+root = Path('{MODEL_MOUNT}')
+ready = json.loads((root / 'STATIC_MOE_READY.json').read_text())
+assert ready['schema'] == 'dsv41.static-moe.ep8.v2', ready
+assert ready['static_files'] == 320, ready
+print('STATIC_MOE_DIRECT_READY', ready['static_files'], flush=True)
+STATIC_MOE_CHECK
 """
-    command = command.replace(setup_marker, setup_marker + "\n" + stage)
+    command = command.replace(setup_marker, setup_marker + "\n" + ready_check)
     launch_marker = (
         "bash /tmp/tpu_logs/repro/run-c1-prefill.sh /workspace/vllm-torchtpu"
     )
     if command.count(launch_marker) != 1:
         raise ValueError("Baseline benchmark launch marker changed")
-    command = command.replace(
-        launch_marker,
-        'wait "$static_stage_pid"\n'
-        "export TPU_DSV41_STATIC_MOE_DIR=/tmp/tpu_logs/static-moe\n" + launch_marker,
-    )
     task["command"] = command
     return {
         "name": f"dsv41-100k-prefill-c1-static-moe-{source_commit[:10]}",
@@ -192,7 +173,7 @@ static_stage_pid=$!
                 "concurrency": 1,
                 "compile_sizes": [2048, 8192],
                 "static_moe": True,
-                "static_moe_stage": "/tmp/tpu_logs/static-moe",
+                "static_moe_format": "dsv41.static-moe.ep8.v2",
                 "dense_online_requant": True,
             }
         ),

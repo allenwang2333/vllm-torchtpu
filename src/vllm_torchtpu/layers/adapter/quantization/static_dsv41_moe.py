@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from safetensors import safe_open  # pyrefly: ignore[missing-import]
+from safetensors.torch import load  # pyrefly: ignore[missing-import]
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
 
@@ -24,13 +25,15 @@ def _index(root: str) -> dict[str, dict]:
     directory = Path(root)
     ready = json.loads((directory / "STATIC_MOE_READY.json").read_text())
     manifest_path = directory / "tpu-static-moe.json"
-    if ready.get("schema") != "dsv41.static-moe.v1":
+    if ready.get("schema") not in ("dsv41.static-moe.v1", "dsv41.static-moe.ep8.v2"):
         raise ValueError("Unknown DeepSeek V4.1 static MoE schema")
     if _sha256(manifest_path) != ready["static_manifest_sha256"]:
         raise ValueError("Static MoE manifest checksum mismatch")
     if _sha256(directory / "config.json") != ready["source_config_sha256"]:
         raise ValueError("Static MoE model config checksum mismatch")
     manifest = json.loads(manifest_path.read_text())
+    if manifest.get("schema") != ready["schema"]:
+        raise ValueError("Static MoE manifest schema mismatch")
     if manifest["quantization"] != {
         "dtype": "float4_e2m1fn_x2",
         "block": 512,
@@ -40,6 +43,33 @@ def _index(root: str) -> dict[str, dict]:
         raise ValueError("Static MoE quantization format mismatch")
     if manifest["source_expert_count"] != 384:
         raise ValueError("Static MoE expert count mismatch")
+    if ready["schema"] == "dsv41.static-moe.ep8.v2":
+        if (
+            manifest.get("ep_size") != 8
+            or manifest.get("layers") != 40
+            or ready.get("static_files") != 320
+            or _sha256(directory / "model.safetensors.index.json")
+            != ready["model_index_sha256"]
+        ):
+            raise ValueError("Static MoE EP8 model metadata mismatch")
+        files = {}
+        for item in manifest["files"]:
+            layer, rank = item["layer"], item["rank"]
+            filename = Path(item["file"])
+            if (
+                not 0 <= layer < 40
+                or not 0 <= rank < 8
+                or (layer, rank) in files
+                or filename.is_absolute()
+                or ".." in filename.parts
+                or item["expert_ids"] != list(range(rank * 48, (rank + 1) * 48))
+                or item["bytes"] <= 0
+            ):
+                raise ValueError(f"Invalid static MoE EP8 file entry: {item}")
+            files[layer, rank] = item
+        if len(files) != 320:
+            raise ValueError("Incomplete static MoE EP8 files")
+        return {"__ep8__": files}
     files = {item["file"] for item in manifest["files"]}
     for filename in files:
         if Path(filename).is_absolute() or ".." in Path(filename).parts:
@@ -55,6 +85,58 @@ def _index(root: str) -> dict[str, dict]:
     if len(result) != 40 * 384 * 3 * 2:
         raise ValueError(f"Incomplete static MoE manifest: {len(result)} tensors")
     return result
+
+
+def _load_ep8_layer(
+    root: Path,
+    files: dict[tuple[int, int], dict],
+    layer_id: int,
+    experts: list[int],
+    layer: RoutedExperts,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    rank = min(experts) // 48
+    if set(experts) != set(range(rank * 48, (rank + 1) * 48)):
+        raise ValueError("Static MoE EP8 shard does not match local experts")
+    item = files[layer_id, rank]
+    path = root / item["file"]
+    if path.stat().st_size != item["bytes"]:
+        raise ValueError(f"Static MoE EP8 shard size mismatch: {path}")
+    tensors = load(path.read_bytes())
+    shapes = {
+        "w13": (48, 5120, 2560),
+        "w2": (48, 2560, 2560),
+        "s13": (48, 10, 1, 5120),
+        "s2": (48, 5, 1, 2560),
+    }
+    if set(tensors) != set(shapes):
+        raise ValueError(f"Unexpected static MoE EP8 tensors: {path}")
+    for name, shape in shapes.items():
+        dtype = torch.uint8 if name.startswith("w") else torch.float32
+        if tuple(tensors[name].shape) != shape or tensors[name].dtype != dtype:
+            raise ValueError(f"Static MoE EP8 tensor shape/dtype mismatch: {name}")
+    order: list[int | None] = [None] * 48
+    for expert in experts:
+        slot = layer.expert_map_manager.map_global_to_local(expert)
+        if slot < 0 or slot >= 48 or order[slot] is not None:
+            raise ValueError("Invalid static MoE EP8 expert slot mapping")
+        order[slot] = expert - rank * 48
+    if any(slot is None for slot in order):
+        raise ValueError("Incomplete static MoE EP8 expert slots")
+    if order != list(range(48)):
+        indices = torch.tensor(
+            [slot for slot in order if slot is not None], dtype=torch.int64
+        )
+        tensors = {
+            name: value.index_select(0, indices) for name, value in tensors.items()
+        }
+    native = torch.float4_e2m1fn_x2
+    return (
+        tensors["w13"].view(native).to(device),
+        tensors["w2"].view(native).to(device),
+        tensors["s13"].to(device),
+        tensors["s2"].to(device),
+    )
 
 
 def _read_tensors(
@@ -91,6 +173,10 @@ def load_layer(
     experts = layer.expert_map_manager.get_local_expert_ids()
     if not experts or len(experts) != layer.local_num_experts:
         raise ValueError("Static MoE local expert map mismatch")
+    if "__ep8__" in index:
+        return _load_ep8_layer(
+            directory, index["__ep8__"], layer_id, experts, layer, device
+        )
     keys = []
     for global_id in experts:
         for projection in (1, 2, 3):
