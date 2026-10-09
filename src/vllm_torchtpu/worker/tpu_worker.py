@@ -41,6 +41,11 @@ from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
 logger = init_logger(__name__)
 
+_PROFILER_ACTIVITIES = (
+    torch.profiler.ProfilerActivity.CPU,
+    torch.profiler.ProfilerActivity.PrivateUse1,
+)
+
 
 def _get_kv_connector_handshake_metadata_key(metadata=None) -> tuple[int, int]:
     transfer_rank = getattr(metadata, "transfer_rank", None)
@@ -110,7 +115,7 @@ class TPUWorker(WorkerBase):
 
         # TPU-specific extras not in WorkerBase.
         self.devices = devices if devices is not None else []
-        self.device_ranks = set(device.id for device in self.devices)
+        self.device_ranks = {device.id for device in self.devices}
 
         if self.cache_config.cache_dtype == "auto":
             model_dtype = self.model_config.dtype
@@ -516,11 +521,12 @@ class TPUWorker(WorkerBase):
         )
         available = budget.available - kv_connector_hbm_reserve
 
-        total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
-        total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)
-        total_hbm_used_gb = round(budget.total_used / utils.GBYTES, 2)
-        kv_connector_hbm_reserve_gb = round(kv_connector_hbm_reserve / utils.GBYTES, 2)
-        total_hbm_avail_gb = round(available / utils.GBYTES, 2)
+        inv_gbytes = 1.0 / utils.GBYTES
+        total_hbm_limit_gb = round(budget.total_limit * inv_gbytes, 2)
+        total_hbm_limit_cap_gb = round(budget.cap * inv_gbytes, 2)
+        total_hbm_used_gb = round(budget.total_used * inv_gbytes, 2)
+        kv_connector_hbm_reserve_gb = round(kv_connector_hbm_reserve * inv_gbytes, 2)
+        total_hbm_avail_gb = round(available * inv_gbytes, 2)
         logger.info(
             "Memory statistics | "
             "total_hbm_limit_gb=%rGiB | "
@@ -641,10 +647,7 @@ class TPUWorker(WorkerBase):
                 experimental_options=advanced_opts,
             )
             self.profile_context = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.PrivateUse1,
-                ],
+                activities=_PROFILER_ACTIVITIES,
                 on_trace_ready=handler,
                 experimental_config=config,
             )
@@ -764,8 +767,7 @@ class TPUWorker(WorkerBase):
         ip = dist_utils.get_host_ip()
         tp_size = self.parallel_config.tensor_parallel_size
         n_cfg = dist_utils.get_transfer_channel_number()
-        n_channels = tp_size if n_cfg <= 0 else min(n_cfg, tp_size)
-        n_channels = max(1, n_channels)
+        n_channels = max(1, tp_size if n_cfg <= 0 else min(n_cfg, tp_size))
         base_port = int(dist_utils.get_kv_transfer_port()) + node_id * n_channels
         return (node_id, ip, base_port)
 

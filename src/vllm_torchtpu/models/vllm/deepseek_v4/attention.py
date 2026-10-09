@@ -35,7 +35,7 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 
-if TYPE_CHECKING:
+if TYPE_CHECKING:  # pragma: no cover
     from vllm.model_executor.layers.attention_layer_base import AttentionBackend
 
 from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
@@ -129,6 +129,9 @@ def _name_float(value: float) -> str:
     return f"{value:.6g}".replace(".", "p").replace("-", "m").replace("+", "")
 
 
+_KERNEL_CACHE_DTYPES = (torch.uint8, torch.int32)
+
+
 # `Any`, not `object`: without torch stubs, isinstance cannot narrow `object`.
 def _live_cache(entry: Any) -> torch.Tensor | None:
     """The array bound to a layer, or None while it has none.
@@ -137,6 +140,27 @@ def _live_cache(entry: Any) -> torch.Tensor | None:
     empty array is reported as absent rather than handed to a kernel.
     """
     return entry if isinstance(entry, torch.Tensor) and entry.numel() > 0 else None
+
+
+def _extract_attn_meta_fields(
+    meta: Any,
+) -> tuple[Any, Any, Any, Any]:
+    """Extract attention metadata fields in one pass."""
+    if meta is None:
+        return None, None, None, None
+    if isinstance(meta, dict):
+        return (
+            meta.get("seq_lens"),
+            meta.get("block_tables"),
+            meta.get("query_start_loc"),
+            meta.get("request_distribution"),
+        )
+    return (
+        getattr(meta, "seq_lens", None),
+        getattr(meta, "block_tables", None),
+        getattr(meta, "query_start_loc", None),
+        getattr(meta, "request_distribution", None),
+    )
 
 
 class DeepseekTPUAttentionMixin:
@@ -151,7 +175,7 @@ class DeepseekTPUAttentionMixin:
     n_local_heads: int
     n_local_groups: int
     o_lora_rank: int
-    attn_sink: torch.Tensor
+    attn_sink: Any
     swa_cache_layer: Any
     wo_a: Any
     rotary_emb: Any
@@ -196,8 +220,9 @@ class DeepseekTPUAttentionMixin:
         vllm_context = get_vllm_model_wrapper_context()
         mesh = vllm_context.mesh
 
-        swa_only = self.attention_kind == "swa"
-        is_csa = self.attention_kind == "csa"
+        kind = self.attention_kind
+        swa_only = kind == "swa"
+        is_csa = kind == "csa"
 
         swa_cache = getattr(self, "swa_cache_layer", None)
         if swa_cache is None:
@@ -284,8 +309,9 @@ class DeepseekTPUAttentionMixin:
             f"{'' if built_from_real_caches else '_prof'}"
         )
 
-        if op_name in _pallas_op_cache:
-            return _pallas_op_cache[op_name], built_from_real_caches
+        cached_op = _pallas_op_cache.get(op_name)
+        if cached_op is not None:
+            return cached_op, built_from_real_caches
 
         logger.info(
             "[ATTN_BUILD] %s: building %s logical_page_size=%s window=%s "
@@ -376,7 +402,7 @@ class DeepseekTPUAttentionMixin:
         """Bitcast 1-byte cache allocations to uint8 required by Pallas kernels."""
         if cache is None:
             return None
-        if cache.dtype not in (torch.uint8, torch.int32):
+        if cache.dtype not in _KERNEL_CACHE_DTYPES:
             return cache.view(torch.uint8)
         return cache
 
@@ -404,13 +430,6 @@ class DeepseekTPUAttentionMixin:
             self.main_cache_layer, "prefix", getattr(self, "custom_prefix", "")
         )
 
-        def _get_field(meta, field_name):
-            if meta is None:
-                return None
-            if isinstance(meta, dict):
-                return meta.get(field_name)
-            return getattr(meta, field_name, None)
-
         if isinstance(attn_ctx, dict):
             swa_cache_layer = getattr(self, "swa_cache_layer", None)
             swa_layer_name = getattr(swa_cache_layer, "prefix", None)
@@ -433,41 +452,39 @@ class DeepseekTPUAttentionMixin:
                 (0, 1, 1, self.head_dim), dtype=torch.uint8, device=q.device
             )
 
-        swa_only = self.attention_kind == "swa"
-        is_csa = self.attention_kind == "csa"
+        kind = self.attention_kind
+        swa_only = kind == "swa"
+        is_csa = kind == "csa"
 
         # A CSA layer's KV entry is a `(nope, rope)` pair.
         kv_entry = getattr(self.main_cache_layer, "kv_cache", None)
         nope_entry, rope_entry = (
             kv_entry if isinstance(kv_entry, tuple) else (kv_entry, None)
         )
+        nope_live = _live_cache(nope_entry)
 
-        if swa_attn_metadata is not None:
-            swa_seq_lens = _get_field(swa_attn_metadata, "seq_lens")
-            swa_block_tables = _get_field(swa_attn_metadata, "block_tables")
-            swa_query_start_loc = _get_field(swa_attn_metadata, "query_start_loc")
-            swa_request_distribution = _get_field(
-                swa_attn_metadata, "request_distribution"
-            )
-        else:
-            swa_seq_lens = None
-            swa_block_tables = None
-            swa_query_start_loc = None
-            swa_request_distribution = None
+        (
+            swa_seq_lens,
+            swa_block_tables,
+            swa_query_start_loc,
+            swa_request_distribution,
+        ) = _extract_attn_meta_fields(swa_attn_metadata)
 
         if not swa_only and main_attn_metadata is not None:
-            main_cache_kv = self._as_kernel_cache_view(_live_cache(nope_entry))
+            main_cache_kv = self._as_kernel_cache_view(nope_live)
             if main_cache_kv is None:
                 # Clone tensor handle so XLA traces distinct operands for
                 # signature matching.
                 main_cache_kv = sw_cache.clone()
-            m_seq_lens = _get_field(main_attn_metadata, "seq_lens")
+            (
+                m_seq_lens,
+                main_page_indices,
+                main_cu_q_lens,
+                main_distribution,
+            ) = _extract_attn_meta_fields(main_attn_metadata)
             main_kv_lens = (
                 m_seq_lens // self.compress_ratio if m_seq_lens is not None else None
             )
-            main_page_indices = _get_field(main_attn_metadata, "block_tables")
-            main_cu_q_lens = _get_field(main_attn_metadata, "query_start_loc")
-            main_distribution = _get_field(main_attn_metadata, "request_distribution")
         else:
             main_cache_kv = sw_cache.clone()
             main_kv_lens = swa_seq_lens.clone() if swa_seq_lens is not None else None
@@ -508,7 +525,7 @@ class DeepseekTPUAttentionMixin:
         if is_csa:
             main_cache_rope = self._as_kernel_cache_view(_live_cache(rope_entry))
             if main_cache_rope is None:
-                if _live_cache(nope_entry) is not None:
+                if nope_live is not None:
                     # Not the profiling pass -- the compressed-KV array is
                     # live, so the companion must be too. Falling through
                     # would hand the kernel the NoPE array as its RoPE
@@ -646,6 +663,8 @@ class VllmDeepseekV4MLAAttention(
 ):
     """Sparse MLA attention on TPU, over the SWA and compressed-KV caches."""
 
+    backend_cls = DeepseekV4TPUAttentionBackend
+
     # Set with object.__setattr__ in __init__ to avoid registering a submodule.
     mla_attn: VllmDeepseekV4MLAAttention
     # Set to True on DSpark draft layers; read with getattr(..., False).
@@ -717,6 +736,7 @@ class VllmDeepseekV4MLAAttention(
             self, "attn_out_dim", hf_config.num_attention_heads * hf_config.head_dim
         )
         self.num_layers = hf_config.num_hidden_layers
+        self._qr_kv_split_sizes = [self.q_lora_rank, self.head_dim]
 
         # Register submodules into static forward context for torch.compile tracking.
         compilation_config = vllm_config.compilation_config
@@ -855,25 +875,22 @@ class VllmDeepseekV4MLAAttention(
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Execute indexing, state compression, and kernel attention dispatch."""
-        q = self.wq_b(qr).view(
-            qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
-        )
+        mla_attn = self.mla_attn
+        q = self.wq_b(qr).view(qr.shape[0], mla_attn.n_local_heads, mla_attn.head_dim)
         q = self.qnorm_rope(q, positions)
         kv = self.kv_rope(kv, positions)
 
         topk_indices = None
-        compressor = getattr(self.mla_attn, "compressor", None)
+        compressor = getattr(mla_attn, "compressor", None)
         if self.indexer is not None:
-            indexer_emb = getattr(
-                self.mla_attn,
-                "indexer_rotary_emb",
-                getattr(self.mla_attn, "rotary_emb", None),
-            )
+            indexer_emb = getattr(mla_attn, "indexer_rotary_emb", None)
+            if indexer_emb is None:
+                indexer_emb = getattr(mla_attn, "rotary_emb", None)
             topk_indices = self.indexer(
                 hidden_states, qr, indexer_weights, positions, indexer_emb
             )
         if compressor is not None:
-            compressor(hidden_states, positions, self.mla_attn.rotary_emb)
+            compressor(hidden_states, positions, mla_attn.rotary_emb)
 
         res = self.forward_mqa(
             q,
@@ -921,9 +938,10 @@ class VllmDeepseekV4MLAAttention(
 
         qr_kv, indexer_weights = self.attn_gemm(hidden_states)
 
-        qr, kv = qr_kv.split(
-            [self.mla_attn.q_lora_rank, self.mla_attn.head_dim], dim=-1
-        )
+        split_sizes = self.__dict__.get("_qr_kv_split_sizes")
+        if split_sizes is None:
+            split_sizes = [self.mla_attn.q_lora_rank, self.mla_attn.head_dim]
+        qr, kv = qr_kv.split(split_sizes, dim=-1)
         qr = self.q_norm(qr)
         kv = self.kv_norm(kv)
 
