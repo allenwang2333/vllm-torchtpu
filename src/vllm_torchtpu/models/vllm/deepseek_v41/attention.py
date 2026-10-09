@@ -945,7 +945,6 @@ class VllmDeepseekV41MLAAttention(
         token_sharded: bool,
         ced_global_from_encoder: bool | None = None,
     ) -> bool:
-        del ced_global_from_encoder
         if not envs.VLLM_DSV41_FUSED_SEAM_QUANT:
             return False
         w_s = getattr(self.fused_wqa_wkv, "weight_scale", None)
@@ -965,7 +964,20 @@ class VllmDeepseekV41MLAAttention(
             and getattr(self.indexer, "use_tp_indexer", None) is not None
             and self.indexer.use_tp_indexer(num_tokens)
         )
-        return num_tokens % tp_size == 0 and (self.indexer is None or use_tp_idx)
+        eff_ced_global = (
+            self._ced_global_from_encoder
+            if ced_global_from_encoder is None
+            else ced_global_from_encoder
+        )
+        return (
+            num_tokens % tp_size == 0
+            and (
+                self.compressor is None
+                or bool(eff_ced_global)
+                or self._in_encoder_stage
+            )
+            and (self.indexer is None or use_tp_idx)
+        )
 
     def _apply_fused_wqa_wkv(
         self,
@@ -1254,6 +1266,7 @@ class VllmDeepseekV41MLAAttention(
             input_is_token_sharded
             and tp_size > 1
             and num_tokens % tp_size == 0
+            and (compressor is None or use_tp_attn)
             and (self.indexer is None or use_tp_idx)
         )
         use_qkv_prequant = (
