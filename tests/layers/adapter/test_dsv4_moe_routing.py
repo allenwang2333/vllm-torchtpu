@@ -225,6 +225,8 @@ def test_dsv4_forward_lets_vllm_runner_apply_gate_once():
     torch.nn.Module.__init__(model)
     model.gate = Gate(2, 2, bias=False)
     model.gate.weight.data.copy_(torch.tensor([[2.0, 0.0], [0.0, 3.0]]))
+    # Derived in __init__ from the gate's hash table (skipped by __new__).
+    model._is_hash_moe = model.gate.tid2eid is not None
     config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     moe_config = SimpleNamespace(
         hidden_dim=2,

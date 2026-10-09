@@ -281,44 +281,50 @@ class TestTunedBlockSizesHd64:
         )
 
     def test_get_tuned_block_sizes_branches(self, monkeypatch):
+        # `get_tuned_block_sizes` is lru-cached on its arguments, and the
+        # scenarios below reuse arguments while patching the device, so each
+        # device switch starts from an empty cache (and leaves none behind).
+        def use_device(version, name=None):
+            monkeypatch.setattr(TBS64, "get_tpu_version", lambda: version)
+            if name is not None:
+                monkeypatch.setattr(TBS64, "get_device_name", lambda: name)
+            TBS64.get_tuned_block_sizes.cache_clear()
+
         # 1. Version < 4 raises NotImplementedError
-        monkeypatch.setattr(TBS64, "get_tpu_version", lambda: 3)
+        use_device(3)
         with pytest.raises(NotImplementedError, match="TPU version must be 4"):
             TBS64.get_tuned_block_sizes(
                 jnp.bfloat16, jnp.bfloat16, 8, 2, 64, 128, 4096, 32
             )
 
         # 2. Case 4 (fallback KeyError)
-        monkeypatch.setattr(TBS64, "get_tpu_version", lambda: 4)
-        monkeypatch.setattr(TBS64, "get_device_name", lambda: "TPU v4")
+        use_device(4, "TPU v4")
         bkv_p, bq = TBS64.get_tuned_block_sizes(
             jnp.bfloat16, jnp.bfloat16, 8, 2, 64, 128, 4096, 32
         )
         assert (bkv_p, bq) == (512 // 128, 32)
 
         # 3. Case 7 (found in table)
-        monkeypatch.setattr(TBS64, "get_tpu_version", lambda: 7)
-        monkeypatch.setattr(TBS64, "get_device_name", lambda: "TPU v7")
+        use_device(7, "TPU v7")
         bkv_p, bq = TBS64.get_tuned_block_sizes(
             jnp.bfloat16, jnp.bfloat16, 8, 2, 64, 128, 4096, 32
         )
         assert (bkv_p, bq) == (32, 16)
 
         # 4. Default case (TPU v6e, found in table)
-        monkeypatch.setattr(TBS64, "get_tpu_version", lambda: 6)
-        monkeypatch.setattr(TBS64, "get_device_name", lambda: "TPU v6e")
+        use_device(6, "TPU v6e")
         bkv_p, bq = TBS64.get_tuned_block_sizes(
             jnp.bfloat16, jnp.bfloat16, 8, 2, 64, 128, 4096, 32
         )
         assert (bkv_p, bq) == (32, 32)
 
         # 5. Clamps: pages_per_seq < bkv_p and max_num_tokens < bq
-        monkeypatch.setattr(TBS64, "get_tpu_version", lambda: 5)
-        monkeypatch.setattr(TBS64, "get_device_name", lambda: "TPU v5e")
+        use_device(5, "TPU v5e")
         bkv_p, bq = TBS64.get_tuned_block_sizes(
             jnp.bfloat16, jnp.bfloat16, 8, 2, 64, 128, 10, 2
         )
         assert (bkv_p, bq) == (1, 10)
+        TBS64.get_tuned_block_sizes.cache_clear()
 
 
 # ==============================================================================
