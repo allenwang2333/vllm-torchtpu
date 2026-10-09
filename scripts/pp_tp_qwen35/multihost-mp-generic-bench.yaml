@@ -83,14 +83,12 @@ spec:
                     mkdir -p "${CDK_OUTPUT_DIR}"
 
                     if [ -d "/workspace/vllm-torchtpu/src/vllm_torchtpu" ]; then
-                      echo "Overlaying /workspace/vllm-torchtpu/src/vllm_torchtpu..."
-                      for d in /root/torchtpu-vllm/src /root/cloud-devkit/vllm-torchtpu/src; do
-                        if [ -d "$d" ]; then
-                          rm -rf "$d/vllm_torchtpu"
-                          cp -r /workspace/vllm-torchtpu/src/vllm_torchtpu "$d/"
-                        fi
-                      done
+                      # The mapped checkout shadows the image's install via
+                      # PYTHONPATH; do not rm/cp into /root/torchtpu-vllm, which
+                      # can alias /workspace/vllm-torchtpu in this image.
                       export PYTHONPATH="/workspace/vllm-torchtpu/src:${PYTHONPATH:-}"
+                      echo "Using mapped vllm_torchtpu from /workspace/vllm-torchtpu/src"
+                      (cd /workspace/vllm-torchtpu && git log -n1 --oneline 2>/dev/null) || true
                     fi
 
                     if [ -n "${ENV_VARS}" ]; then
