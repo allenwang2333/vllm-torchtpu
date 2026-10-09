@@ -1247,6 +1247,47 @@ _NATIVE_SEGIDS_STATIC_ARGNAMES = [
 ]
 
 
+_ANY_BLOCK_SPEC = pl.BlockSpec(memory_space=pl.ANY)
+_COMPILER_PARAMS_DEFAULT = pltpu.CompilerParams(
+    dimension_semantics=("parallel", "parallel", "arbitrary"),
+    disable_bounds_checks=True,
+    vmem_limit_bytes=None,
+)
+_COMPILER_PARAMS_MB_GT4 = pltpu.CompilerParams(
+    dimension_semantics=("parallel", "parallel", "arbitrary"),
+    disable_bounds_checks=True,
+    vmem_limit_bytes=60 * 1024 * 1024,
+)
+
+
+def _h0_map(h, b, c, *refs):
+    return (0, h, b, 0, 0)
+
+
+def _out_map(h, b, c, *refs):
+    return (h, b, c, 0)
+
+
+def _out_chunk_map(h, b, c, *refs):
+    return (h, b, c, 0, 0)
+
+
+def _alog_map(h, b, c, *refs):
+    return (h, 0, 0, 0)
+
+
+def _o_batch_first_map(h, b, c, *refs):
+    return (b, c, h, 0)
+
+
+def _beta_batch_first_map(h, b, c, *refs):
+    return (b, c, 0, h)
+
+
+def _beta_head_first_map(h, b, c, *refs):
+    return (h, b, c, 0, 0)
+
+
 def _chunk_kda_fwd_native_segids_impl(
     q: jax.Array,
     k: jax.Array,
@@ -1340,18 +1381,10 @@ def _chunk_kda_fwd_native_segids_impl(
             segment_ids, ((0, 0), (0, T_PAD_S - segment_ids.shape[-1]))
         )
 
-    # Rebuild metadata with padded T (chunk_size still BT, but more chunks now
-    # due to padding)
     # Metadata arrays need last dim >= 128 or == array dim. Pad NT to 128 if needed.
-    NT_meta = T // BT  # original number of chunks
+    NT_meta = NT  # original number of chunks
     NT_meta_PAD = max(int(align_up(NT_meta, 128)), 128)  # at least 128
-    chunk_kind_padded = jnp.pad(
-        chunk_kind,
-        ((0, 0), (0, NT_meta_PAD - NT_meta)),
-        constant_values=CHUNK_KIND_ALL_PAD,
-    )
-    seg_first_padded = jnp.pad(seg_first, ((0, 0), (0, NT_meta_PAD - NT_meta)))
-    seg_last_padded = jnp.pad(seg_last, ((0, 0), (0, NT_meta_PAD - NT_meta)))
+    meta_pad = NT_meta_PAD - NT_meta
 
     env_mini_batch = envs.KDA_FWD_MB if only_fwd else None
     if mini_batch is None and env_mini_batch is not None:
@@ -1421,11 +1454,12 @@ def _chunk_kda_fwd_native_segids_impl(
         # Pass ALL N_max initial states for per-segment loading
         # h0: [B, N_max, H, K, V] -> [N_max, H, B, K, V] -> pad ->
         #     [N_max, H, B, K_PAD, V_ALIGNED]
-        h0 = h0[:, :, :, :, :].transpose(1, 2, 0, 3, 4)  # [N_max, H, B, K, V]
-        if K_PAD > K:
-            h0 = jnp.pad(h0, ((0, 0), (0, 0), (0, 0), (0, K_PAD - K), (0, 0)))
-        if V_ALIGNED > V:
-            h0 = jnp.pad(h0, ((0, 0), (0, 0), (0, 0), (0, 0), (0, V_ALIGNED - V)))
+        h0 = h0.transpose(1, 2, 0, 3, 4)  # [N_max, H, B, K, V]
+        if K_PAD > K or V_ALIGNED > V:
+            h0 = jnp.pad(
+                h0,
+                ((0, 0), (0, 0), (0, 0), (0, K_PAD - K), (0, V_ALIGNED - V)),
+            )
         h0_in = h0.astype(jnp.float32)  # [N_max, H, B, K_PAD, V_ALIGNED]
     else:
         h0_in = None
@@ -1467,49 +1501,32 @@ def _chunk_kda_fwd_native_segids_impl(
         block_128 = (c * BT) // 128
         return (0, block_128)
 
-    def _in_map(h, b, c, *refs):
-        return (b, c, h, 0) if batch_first else (h, b, c, 0)
-
-    def _h0_map(h, b, c, *refs):
-        return (0, h, b, 0, 0)
-
-    def _out_map(h, b, c, *refs):
-        return (h, b, c, 0)
-
-    def _out_chunk_map(h, b, c, *refs):
-        return (h, b, c, 0, 0)
-
-    def _beta_map(h, b, c, *refs):
-        return (b, c, 0, h) if beta_batch_first else (h, b, c, 0, 0)
-
-    def _ht_map(h, b, c, *refs):
-        return (0, h, b, 0, 0)
-
+    in_map = _o_batch_first_map if batch_first else _out_map
     seg_spec = pl.BlockSpec([B, 128], index_map=_seg_map)
     q_spec = pl.BlockSpec(
         [1, BT, MB, K_PAD] if batch_first else [MB, 1, BT, K_PAD],
-        index_map=_in_map,
+        index_map=in_map,
     )
     k_spec = pl.BlockSpec(
         [1, BT, MB, K_PAD] if batch_first else [MB, 1, BT, K_PAD],
-        index_map=_in_map,
+        index_map=in_map,
     )
     v_spec = pl.BlockSpec(
         [1, BT, MB, V_ALIGNED] if batch_first else [MB, 1, BT, V_ALIGNED],
-        index_map=_in_map,
+        index_map=in_map,
     )
     g_spec = pl.BlockSpec(
         [1, BT, MB, K_PAD] if batch_first else [MB, 1, BT, K_PAD],
-        index_map=_in_map,
+        index_map=in_map,
     )
     beta_spec = (
-        pl.BlockSpec([1, 1, BT, MB], index_map=_beta_map)
+        pl.BlockSpec([1, 1, BT, MB], index_map=_beta_batch_first_map)
         if beta_batch_first
-        else pl.BlockSpec([MB, 1, 1, 1, BT], index_map=_beta_map)
+        else pl.BlockSpec([MB, 1, 1, 1, BT], index_map=_beta_head_first_map)
     )
     h0_spec = (
         (
-            pl.BlockSpec(memory_space=pl.ANY)
+            _ANY_BLOCK_SPEC
             if manual_h0_dma
             else pl.BlockSpec(
                 [N_max, MB, 1, K_PAD, V_ALIGNED],
@@ -1520,20 +1537,10 @@ def _chunk_kda_fwd_native_segids_impl(
         else None
     )
 
-    def _alog_map(h, b, c, *refs):
-        return (h, 0, 0, 0)
-
-    def _dtbias_map(h, b, c, *refs):
-        return (h, 0, 0, 0)
-
     alog_spec = pl.BlockSpec([MB, 1, 1, 1], index_map=_alog_map)
-    dtbias_spec = pl.BlockSpec([MB, 1, 1, K_PAD], index_map=_dtbias_map)
+    dtbias_spec = pl.BlockSpec([MB, 1, 1, K_PAD], index_map=_alog_map)
     if batch_first:
-
-        def _o_map(h, b, c, *refs):
-            return (b, c, h, 0)
-
-        o_spec = pl.BlockSpec([1, BT, MB, V_ALIGNED], index_map=_o_map)
+        o_spec = pl.BlockSpec([1, BT, MB, V_ALIGNED], index_map=_o_batch_first_map)
     else:
         o_spec = pl.BlockSpec([MB, 1, BT, V_ALIGNED], index_map=_out_map)
     store_final_state = output_final_state or store_h
@@ -1545,11 +1552,11 @@ def _chunk_kda_fwd_native_segids_impl(
     )
     ht_spec = (
         (
-            pl.BlockSpec(memory_space=pl.ANY)
+            _ANY_BLOCK_SPEC
             if manual_ht_dma
             else pl.BlockSpec(
                 [N_max, MB, 1, K_PAD, V_ALIGNED],
-                index_map=_ht_map,
+                index_map=_h0_map,
             )
         )
         if store_final_state
@@ -1582,7 +1589,7 @@ def _chunk_kda_fwd_native_segids_impl(
     chunk_h_spec = (
         pl.BlockSpec(
             [MB, 1, 1, K_PAD, V_ALIGNED],
-            index_map=lambda h, b, c, *r: (h, b, c, 0, 0),
+            index_map=_out_chunk_map,
         )
         if store_chunk_h
         else None
@@ -1619,14 +1626,32 @@ def _chunk_kda_fwd_native_segids_impl(
         native_kernel = _fwd_mega_kernel_native_segids_packed
         scalar_prefetch_count = 1
         packed_meta = (
-            chunk_kind_padded.astype(jnp.int32)
-            | (seg_first_padded.astype(jnp.int32) << jnp.int32(3))
-            | (seg_last_padded.astype(jnp.int32) << jnp.int32(17))
+            chunk_kind.astype(jnp.int32)
+            | (seg_first.astype(jnp.int32) << jnp.int32(3))
+            | (seg_last.astype(jnp.int32) << jnp.int32(17))
         )
+        if meta_pad > 0:
+            packed_meta = jnp.pad(
+                packed_meta,
+                ((0, 0), (0, meta_pad)),
+                constant_values=CHUNK_KIND_ALL_PAD,
+            )
         scalar_inputs = (packed_meta,)
     else:
         native_kernel = _fwd_mega_kernel_native_segids
         scalar_prefetch_count = 3
+        if meta_pad > 0:
+            chunk_kind_padded = jnp.pad(
+                chunk_kind,
+                ((0, 0), (0, meta_pad)),
+                constant_values=CHUNK_KIND_ALL_PAD,
+            )
+            seg_first_padded = jnp.pad(seg_first, ((0, 0), (0, meta_pad)))
+            seg_last_padded = jnp.pad(seg_last, ((0, 0), (0, meta_pad)))
+        else:
+            chunk_kind_padded = chunk_kind
+            seg_first_padded = seg_first
+            seg_last_padded = seg_last
         scalar_inputs = (
             chunk_kind_padded,
             seg_first_padded,
@@ -1711,11 +1736,7 @@ def _chunk_kda_fwd_native_segids_impl(
                 pltpu.SemaphoreType.DMA,
             ],
         ),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "parallel", "arbitrary"),
-            disable_bounds_checks=True,
-            vmem_limit_bytes=(60 * 1024 * 1024) if MB > 4 else None,
-        ),
+        compiler_params=_COMPILER_PARAMS_MB_GT4 if MB > 4 else _COMPILER_PARAMS_DEFAULT,
     )(
         *scalar_inputs,
         segment_ids,
@@ -1730,10 +1751,13 @@ def _chunk_kda_fwd_native_segids_impl(
     )
 
     # Match the selected contract: [B, T, H, V] or [H, B, T, V].
-    o_out = o_out[..., :V]
+    if V_ALIGNED > V:
+        o_out = o_out[..., :V]
     # ht_out: [1, H, B, K_PAD, V_ALIGNED] -> [B, 1, H, K, V]
     if ht_out is not None:
-        ht_out = ht_out[:, :, :, :K, :V].transpose(2, 0, 1, 3, 4)  # [B, N_max, H, K, V]
+        if K_PAD > K or V_ALIGNED > V:
+            ht_out = ht_out[:, :, :, :K, :V]
+        ht_out = ht_out.transpose(2, 0, 1, 3, 4)  # [B, N_max, H, K, V]
 
     final_state = ht_out if store_final_state else None
 
@@ -1741,7 +1765,7 @@ def _chunk_kda_fwd_native_segids_impl(
     if g_cumsum_out is not None and K_PAD > K:
         g_cumsum_out = g_cumsum_out[:, :, :, :K]
 
-    if chunk_h_out is not None:
+    if chunk_h_out is not None and (K_PAD > K or V_ALIGNED > V):
         chunk_h_out = chunk_h_out[:, :, :, :K, :V]
     return (
         o_out,
