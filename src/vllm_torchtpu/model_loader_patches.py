@@ -193,6 +193,8 @@ def _sharded_runai_weights_iterator(
     hf_weights_files: list[str],
     local_expert_ids: set[int],
     use_tqdm_on_load: bool,
+    static_root: str = "",
+    static_uri: str = "",
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Stream only this rank's tensors from the safetensors files.
 
@@ -303,6 +305,12 @@ def _sharded_runai_weights_iterator(
         )
 
         fs.stream_files(requests, credentials=None, device="cpu", is_distributed=False)
+        if static_uri:
+            from vllm_torchtpu.layers.adapter.quantization.static_dsv41_moe import (
+                start_grouped_prefetch,
+            )
+
+            start_grouped_prefetch(static_root, static_uri, local_expert_ids)
 
         # Under torch-tpu's deferred eager mode, weight_loader's device
         # copies queue up and keep their HOST source tensors referenced
@@ -420,18 +428,17 @@ def patch_runai_sharded_expert_streaming() -> None:
                 "plans; streaming per rank instead."
             )
         hf_weights_files = self._prepare_weights(model_or_path, revision)
-        if static_root := envs.TPU_DSV41_STATIC_MOE_DIR:
+        static_root = envs.TPU_DSV41_STATIC_MOE_DIR
+        if static_root:
             hf_weights_files = _indexed_model_weights_only(
                 hf_weights_files, static_root
             )
-            if static_uri := envs.TPU_DSV41_STATIC_MOE_URI:
-                from vllm_torchtpu.layers.adapter.quantization.static_dsv41_moe import (
-                    start_grouped_prefetch,
-                )
-
-                start_grouped_prefetch(static_root, static_uri, local_expert_ids)
         return _sharded_runai_weights_iterator(
-            hf_weights_files, local_expert_ids, self.load_config.use_tqdm_on_load
+            hf_weights_files,
+            local_expert_ids,
+            self.load_config.use_tqdm_on_load,
+            static_root,
+            envs.TPU_DSV41_STATIC_MOE_URI if static_root else "",
         )
 
     rsl.RunaiModelStreamerLoader._get_weights_iterator = _get_weights_iterator
