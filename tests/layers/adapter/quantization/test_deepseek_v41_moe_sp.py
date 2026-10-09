@@ -63,6 +63,54 @@ def test_hash_ids_follow_sp_dispatch(monkeypatch, sp, hash_table, naive, gathere
         assert seen["ids"] is ids
 
 
+def test_deepseek_v41_moe_mega_gate_metadata_dual_compat(monkeypatch):
+    """Test mega_gate_metadata dual-compatibility on v0.30 and v0.31 runtimes."""
+    ep = Mock()
+    monkeypatch.setattr(mod, "get_ep_group", lambda: ep)
+    moe = _moe(sp=False, hash_table=None, naive=True)
+    hidden = torch.ones(2, 3)
+    ids = torch.tensor([1, 2])
+    meta = {"mock": "metadata"}
+
+    # Case 1: mega_gate_metadata is None -> calls super().forward(hidden, ids)
+    seen = {}
+
+    def forward_v030(self, hidden_states, input_ids):
+        seen["args"] = (hidden_states, input_ids)
+        return hidden_states
+
+    monkeypatch.setattr(mod.DeepseekV4MoE, "forward", forward_v030)
+    assert moe.forward(hidden, ids, None) is hidden
+    assert seen["args"] == (hidden, ids)
+
+    # Case 2: mega_gate_metadata is not None and upstream accepts it (v0.31)
+    seen_v031 = {}
+
+    def forward_v031(self, hidden_states, input_ids, mega_gate_metadata):
+        seen_v031["args"] = (hidden_states, input_ids, mega_gate_metadata)
+        return hidden_states
+
+    monkeypatch.setattr(mod.DeepseekV4MoE, "forward", forward_v031)
+    assert moe.forward(hidden, ids, meta) is hidden
+    assert seen_v031["args"] == (hidden, ids, meta)
+
+    # Case 3: mega_gate_metadata is not None but upstream raises
+    # TypeError (v0.30 runtime)
+    seen_fallback = {}
+
+    def forward_raise_typeerror(
+        self, hidden_states, input_ids, mega_gate_metadata=None
+    ):
+        if mega_gate_metadata is not None:
+            raise TypeError("forward() takes 2 positional arguments but 3 were given")
+        seen_fallback["called"] = True
+        return hidden_states
+
+    monkeypatch.setattr(mod.DeepseekV4MoE, "forward", forward_raise_typeerror)
+    assert moe.forward(hidden, ids, meta) is hidden
+    assert seen_fallback.get("called") is True
+
+
 def _make_non_sp_ep_moe(
     *,
     sp: bool = False,
