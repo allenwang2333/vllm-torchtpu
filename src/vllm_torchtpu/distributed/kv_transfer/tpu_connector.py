@@ -114,6 +114,8 @@ __all__ = [
 
 
 class _DoneFuture:
+    __slots__ = ()
+
     def wait(self) -> None:
         return
 
@@ -170,7 +172,7 @@ def _select_committed_mamba_blocks(
     return committed_blocks
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _Stage3TransferGroup:
     """One paged KV cache group Stage 3 moves, and the size of its pages.
 
@@ -330,7 +332,7 @@ def _stage3_transfer_groups(
     return groups
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _Stage3Dsv4Pool:
     """One tag in the DSv4 transfer plan, and the geometry to move it."""
 
@@ -348,7 +350,7 @@ class _Stage3Dsv4Pool:
     row_bytes: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _Stage3Dsv4GroupPages:
     """One cache group's transferable pages, and the tokens they hold.
 
@@ -360,7 +362,7 @@ class _Stage3Dsv4GroupPages:
     num_tokens: int
 
 
-@dataclass
+@dataclass(slots=True)
 class _Stage3LoadMeta:
     """Decode-local declaration for one controller-driven FA transfer.
 
@@ -403,7 +405,7 @@ class _Stage3LoadMeta:
     fail_only: bool = False
 
 
-@dataclass
+@dataclass(slots=True)
 class _Stage3PendingSubmit:
     """One consumer load parked because the producer's request-block
     registrations were not yet visible at the source controller.
@@ -434,7 +436,7 @@ class _Stage3PendingSubmit:
     task: Any = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _Stage3SubmitTask:
     """One staged source-controller coordination call.
 
@@ -454,7 +456,7 @@ class _Stage3SubmitTask:
     retry_inline: bool
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _Stage3SubmitOutcome:
     """Result of one coordination RPC, applied on the model-runner thread."""
 
@@ -465,7 +467,7 @@ class _Stage3SubmitOutcome:
     attempted_at: float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _Stage3RegisteredSend:
     """Worker-local D5 registration retained until terminal send state."""
 
@@ -520,10 +522,13 @@ def _as_str(value: Any) -> str | None:
 def _as_int_list(value: Any) -> list[int] | None:
     if not isinstance(value, (list, tuple)):
         return None
-    ints = [_as_int(item) for item in value]
-    if any(item is None for item in ints):
-        return None
-    return ints  # type: ignore[return-value]
+    ints: list[int] = []
+    for item in value:
+        parsed = _as_int(item)
+        if parsed is None:
+            return None
+        ints.append(parsed)
+    return ints
 
 
 def stage3_fa_raiden_id_fields(

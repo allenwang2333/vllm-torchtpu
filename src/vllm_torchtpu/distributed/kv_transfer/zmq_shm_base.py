@@ -139,7 +139,7 @@ _IPC_DROP = b"DROP"  # coord -> worker: (uuid,)  -- failure/timeout
 
 
 # ---- Rank-0 bookkeeping (TP>1 coordinator-mode only) -------------------
-@dataclass
+@dataclass(slots=True)
 class _CoordSendEntry:
     req_id: ReqId
     slot_idx: int
@@ -173,7 +173,7 @@ class _CoordSendEntry:
             self.staged_events = [threading.Event() for _ in range(self.tp_size)]
 
 
-@dataclass
+@dataclass(slots=True)
 class _CoordRecvEntry:
     req_id: ReqId
     uuid: int
@@ -196,7 +196,7 @@ class _CoordRecvEntry:
     reported_done: bool = False
 
 
-@dataclass
+@dataclass(slots=True)
 class _StageInFlight:
     """A pending async D2H batch waiting on its PjRt future.
 
@@ -227,6 +227,8 @@ class _LatencyTracker:
     record() updates n/total/min/max under a lock; the first record() after
     log_interval seconds triggers a summary line. Per-sample lines are up
     to the caller (they often carry req-specific context we'd lose here)."""
+
+    __slots__ = ("_who", "_log_interval_s", "_lock", "_stats", "_last_log")
 
     def __init__(self, who: str, log_interval_s: float = 30.0):
         self._who = who
@@ -1219,13 +1221,8 @@ class ZmqShmKvConnectorBase:
         # (deadline, entry, py_future); list ordering is not load-bearing.
         in_flight: list[tuple[float, _StageInFlight, Any]] = []
         while not self._stop_event.is_set():
-            got_entry = True
             try:
                 entry = self._stage_pending_q.get(timeout=0.05)
-            except queue.Empty:
-                got_entry = False
-                entry = None
-            if got_entry:
                 if entry is None:
                     # Shutdown sentinel from _coord_teardown.
                     return
@@ -1233,6 +1230,8 @@ class ZmqShmKvConnectorBase:
                     self._coord_stage_wait_worker, entry
                 )
                 in_flight.append((time.monotonic() + timeout_s, entry, py_fut))
+            except queue.Empty:
+                pass
             if in_flight:
                 now = time.monotonic()
                 kept: list[tuple[float, _StageInFlight, Any]] = []
@@ -2650,8 +2649,7 @@ class ZmqShmKvConnectorBase:
         with self._coord_lock:
             # Producer: pull_acked → done_sending; scheduler unioning means
             # we only need to report once.
-            for uuid in list(self._coord_send.keys()):
-                entry = self._coord_send[uuid]
+            for uuid, entry in list(self._coord_send.items()):
                 if entry.pull_acked:
                     done_sending.add(entry.req_id)
                     del self._coord_send[uuid]
@@ -2769,13 +2767,11 @@ class ZmqShmKvConnectorBase:
 def _try_remove_ipc_endpoint(ipc_path: str) -> None:
     """ZMQ's ipc:// backs onto a filesystem path; a stale file from a
     previous crashed rank-0 makes bind() fail. Remove it best-effort."""
-    import os as _os
-
     if not ipc_path.startswith("ipc://"):
         return
     path = ipc_path[len("ipc://") :]
     try:
-        _os.unlink(path)
+        os.unlink(path)
     except FileNotFoundError:
         pass
     except OSError as e:

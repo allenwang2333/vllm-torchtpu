@@ -84,7 +84,7 @@ class ManifestError(ValueError):
     """The live materialization cannot be described as a pool manifest."""
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class RegionSpec:
     """Mirror of raiden's RegionSpec (kept local so deviceless tests do not
     need the raiden extension)."""
@@ -112,10 +112,17 @@ class RegionSpec:
         )
 
     def to_dict(self) -> dict[str, int | str]:
-        return dataclasses.asdict(self)
+        return {
+            "name": self.name,
+            "offset_bytes": self.offset_bytes,
+            "stride_bytes": self.stride_bytes,
+            "unit_bytes": self.unit_bytes,
+            "num_units": self.num_units,
+            "units_per_stride": self.units_per_stride,
+        }
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class PoolEntry:
     tag: str
     layer_name: str
@@ -143,7 +150,7 @@ class PoolEntry:
         }
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class PoolManifest:
     binding: str
     storages: list[Any]
@@ -227,7 +234,7 @@ def _dtype_tag(tensor: Any) -> str:
     return text.removeprefix("torch.")
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class _PooledView:
     """Tensor-like metadata for one logical cache inside a unified pool.
 
@@ -258,13 +265,12 @@ def _raw_index_for(tensor: Any, raw_tensors: Sequence[Any]) -> int | None:
     for idx, raw in enumerate(raw_tensors):
         if raw is tensor:
             return idx
-        raw_ptr = _storage_ptr(raw)
-        if tensor_ptr is not None and raw_ptr is not None and tensor_ptr == raw_ptr:
+        if tensor_ptr is not None and _storage_ptr(raw) == tensor_ptr:
             return idx
     return None
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class _RegionPlacement:
     """Byte placement of a single layer region within the merged block-major pool.
 
@@ -316,7 +322,7 @@ def layer_index_from_name(layer_name: str) -> int | None:
 # ---------------------------------------------------------------------------
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class GdnHeadGeometry:
     """Per-rank linear-attention geometry (already TP/PCP-divided)."""
 
@@ -1047,17 +1053,15 @@ def build_kimi_k3_pool_manifest(
     return _bind_pool_manifest(entries, raw_tensors)
 
 
+def _layer_sort_key(name: str) -> tuple[bool, int, str]:
+    idx = layer_index_from_name(name)
+    return (idx is None, idx or 0, str(name))
+
+
 def _ordered_layers(named_kv_caches: Mapping[str, Any]) -> list[str]:
     if not named_kv_caches:
         raise ManifestError("named_kv_caches is empty")
-    return sorted(
-        named_kv_caches,
-        key=lambda name: (
-            layer_index_from_name(name) is None,
-            layer_index_from_name(name) or 0,
-            str(name),
-        ),
-    )
+    return sorted(named_kv_caches, key=_layer_sort_key)
 
 
 def _state_tag_suffix(layer_name: str, group_ordinals: Mapping[str, int] | None) -> str:
