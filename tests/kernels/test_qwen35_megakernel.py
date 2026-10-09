@@ -745,3 +745,27 @@ def test_tp16_config_packing_and_gdn_pool_geometry():
     )
 
 
+def test_build_tp_rank_mesh_preserves_rank_order(monkeypatch) -> None:
+    """Verify `_build_tp_rank_mesh` preserves `tpu7x` rank order."""
+    import sys
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from vllm_torchtpu.kernels.qwen35_megakernel.vllm_adapter import (
+        _build_tp_rank_mesh,
+    )
+
+    tpu7x_order = [0, 1, 4, 5, 6, 7, 2, 3]
+    fake_devices = np.array(
+        [SimpleNamespace(id=d) for d in tpu7x_order], dtype=object
+    )
+    fake_mesh = SimpleNamespace(devices=fake_devices, axis_names=("tp",))
+    fake_pallas = SimpleNamespace(get_pallas_mesh=lambda axis_names: fake_mesh)
+    monkeypatch.setitem(sys.modules, "torch_tpu._internal.pallas", fake_pallas)
+
+    mesh = _build_tp_rank_mesh(8)
+    assert mesh is fake_mesh
+    assert [int(d.id) for d in mesh.devices.flat] == tpu7x_order
+
+

@@ -46,13 +46,13 @@ from jax.sharding import PartitionSpec as P
 from vllm.forward_context import get_forward_context
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.logger import init_logger
 
 from . import megakernel as K
 from . import pool_io
 from .vllm_adapter import (
+    _build_tp_rank_mesh,
     _get_routed_experts,
     _need,
     _unwrap,
@@ -247,9 +247,7 @@ class Qwen35MtpMegakernel:
             )
 
         if mesh is None:
-            mesh = build_ep_mesh(axis_name="tp")
-        if mesh is None:
-            mesh = jax.sharding.Mesh(jax.devices()[: self.tp_size], ("tp",))
+            mesh = _build_tp_rank_mesh(self.tp_size)
         self.mesh = mesh
         self.layer = layer
         self.base_cfg = base_cfg
