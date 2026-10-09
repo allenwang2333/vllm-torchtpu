@@ -87,7 +87,8 @@ def kernel_view(pool):
     blocks along dim 0. Operates on both JAX and PyTorch tensors and compiles
     to a zero-copy bitcast on the donated buffer.
     """
-    return pool.reshape((pool.shape[0] * pool.shape[1],) + tuple(pool.shape[2:]))
+    shape = pool.shape
+    return pool.reshape((shape[0] * shape[1], *shape[2:]))
 
 
 def flat_manager_ids(
@@ -113,5 +114,4 @@ def flat_kernel_ids(
         return ids
     if split == 1:
         return ids * num_pools + pool_index
-    manager = ids // split
-    return (manager * num_pools + pool_index) * split + (ids - manager * split)
+    return ids + (ids // split) * ((num_pools - 1) * split) + (pool_index * split)

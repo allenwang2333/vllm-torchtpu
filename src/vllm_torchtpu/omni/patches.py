@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """TPU runtime patches for vLLM-Omni diffusion models."""
 
+import os
 from functools import cache as run_once
 from typing import Any
 
@@ -33,8 +34,6 @@ def apply_omni_tpu_patches() -> None:
     #    (torch.tpu.synchronize()) to ensure execution completes before COMPUTE_DONE.
     # 2. AOT compilation caching stabilizes startup compile times.
     # -------------------------------------------------------------------------
-    import os
-
     os.environ.setdefault("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", "1800.0")
     logger.info("Applied TPU patch: extended VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT to 1800s.")
 
@@ -62,7 +61,7 @@ def apply_omni_tpu_patches() -> None:
         *args: Any,
         **kwargs: Any,
     ) -> torch.Tensor:
-        if input.device.type == "tpu" and mode == "linear":
+        if mode == "linear" and input.device.type == "tpu":
             return orig_interpolate(
                 input.cpu(), size, scale_factor, mode, *args, **kwargs
             ).to(input.device)

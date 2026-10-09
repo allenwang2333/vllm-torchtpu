@@ -8,7 +8,10 @@ from torch_tpu._internal.utils import hardware
 from vllm.logger import init_logger
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
-from vllm_torchtpu.omni.patches import apply_omni_tpu_patches
+from vllm_torchtpu.omni.patches import (
+    apply_omni_model_specific_patches,
+    apply_omni_tpu_patches,
+)
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 logger = init_logger(__name__)
@@ -39,8 +42,6 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         head_size: int,
         allow_trtllm_default: bool = False,
     ) -> str:
-        from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
-
         apply_omni_model_specific_patches()
         logger.info_once(
             "Using TpuSDPABackend for diffusion attention (requested: %s).",

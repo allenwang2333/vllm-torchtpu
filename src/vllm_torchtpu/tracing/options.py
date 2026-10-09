@@ -112,12 +112,10 @@ def resolve_profile_dir_and_opts(
     profile_dir = base_dir
 
     effective_prefix = profile_prefix
-    if (
-        not effective_prefix
-        and profiler_kwargs
-        and isinstance(profiler_kwargs.get("profile_prefix"), str)
-    ):
-        effective_prefix = profiler_kwargs["profile_prefix"]
+    if not effective_prefix and profiler_kwargs:
+        kw_prefix = profiler_kwargs.get("profile_prefix")
+        if isinstance(kw_prefix, str):
+            effective_prefix = kw_prefix
 
     if effective_prefix:
         if ":" in effective_prefix or ";" in effective_prefix:

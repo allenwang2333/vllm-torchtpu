@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 from dataclasses import dataclass
 
 # Architectures whose recurrent layers read and write their state through the
@@ -43,7 +44,13 @@ POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(
 # importable without torch.
 DEFAULT_POOLED_GDN_CONV_STATE_DTYPE = "torch.bfloat16"
 DEFAULT_POOLED_GDN_SSM_STATE_DTYPE = "torch.float32"
-_ITEMSIZE_BY_DTYPE = {"torch.bfloat16": 2, "torch.float32": 4}
+_ITEMSIZE_BY_DTYPE = {
+    "torch.bfloat16": 2,
+    "bfloat16": 2,
+    "torch.float32": 4,
+    "float32": 4,
+}
+_CONV_STATE_ITEMSIZE = _ITEMSIZE_BY_DTYPE[DEFAULT_POOLED_GDN_CONV_STATE_DTYPE]
 
 
 def pooled_gdn_state_dtypes(
@@ -54,9 +61,7 @@ def pooled_gdn_state_dtypes(
 
 
 def pooled_gdn_state_itemsize(dtype: object) -> int:
-    name = str(dtype)
-    if not name.startswith("torch."):
-        name = f"torch.{name}"
+    name = dtype if isinstance(dtype, str) else str(dtype)
     try:
         return _ITEMSIZE_BY_DTYPE[name]
     except KeyError as exc:
@@ -83,11 +88,7 @@ def pooled_gdn_conv_state_bytes(*, kernel_size: int, conv_dim: int) -> int:
     """Live bytes of one slot's conv region: (kernel_size - 1) dense bf16
     rows of conv_dim channels. The kernel keeps no spec-decode widening in
     the pool (verify windows roll back via per-slot checkpoints instead)."""
-    return (
-        (kernel_size - 1)
-        * conv_dim
-        * pooled_gdn_state_itemsize(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE)
-    )
+    return (kernel_size - 1) * conv_dim * _CONV_STATE_ITEMSIZE
 
 
 def pooled_gdn_ssm_state_bytes(
@@ -118,6 +119,7 @@ class PooledGDNStateLayout:
         return self.required_tokens * self.token_bytes
 
 
+@functools.lru_cache(maxsize=64)
 def derive_pooled_gdn_state_layout(
     *,
     ssm_bytes: int,
@@ -133,9 +135,8 @@ def derive_pooled_gdn_state_layout(
         raise ValueError("pooled GDN byte sizes must be positive")
 
     ssm_tokens = (ssm_bytes + token_bytes - 1) // token_bytes
-    conv_tokens = 1
-    while conv_tokens * token_bytes < conv_bytes:
-        conv_tokens *= 2
+    min_conv_tokens = (conv_bytes + token_bytes - 1) // token_bytes
+    conv_tokens = 1 << (min_conv_tokens - 1).bit_length()
 
     return PooledGDNStateLayout(
         ssm_bytes=ssm_bytes,
