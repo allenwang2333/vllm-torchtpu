@@ -29,6 +29,7 @@ logger = init_logger(__name__)
 AXIS = "pp"
 _MESH: Mesh | None = None
 _POS_OF_RANK: tuple[int, ...] = ()
+_MESH_DEVICE_IDS: dict[int, tuple[int, ...]] = {}
 _OPS: dict[tuple, object] = {}
 
 
@@ -51,7 +52,9 @@ def get_or_create_pp_mesh() -> Mesh:
     devices_by_id = {int(device.id): device for device in jax.devices()}
     device_ids = sorted(rank_to_device[rank] for rank in ranks)
     _MESH = Mesh(np.asarray([devices_by_id[d] for d in device_ids]), axis_names=(AXIS,))
-    _POS_OF_RANK = tuple(device_ids.index(rank_to_device[rank]) for rank in ranks)
+    _MESH_DEVICE_IDS[id(_MESH)] = tuple(device_ids)
+    pos_by_dev = {d: i for i, d in enumerate(device_ids)}
+    _POS_OF_RANK = tuple(pos_by_dev[rank_to_device[rank]] for rank in ranks)
     logger.info(
         "PP hand-off mesh (device order): %s",
         ", ".join(
@@ -81,7 +84,11 @@ def pp_permute_op(mesh: Mesh, num_tensors: int = 1):
     """
     if num_tensors < 1:
         raise ValueError(f"a hand-off carries at least one tensor; got {num_tensors}")
-    key = ("permute", int(num_tensors)) + tuple(int(d.id) for d in mesh.devices)
+    dev_ids = _MESH_DEVICE_IDS.get(id(mesh))
+    if dev_ids is None:
+        dev_ids = tuple(int(d.id) for d in mesh.devices)
+        _MESH_DEVICE_IDS[id(mesh)] = dev_ids
+    key = ("permute", int(num_tensors), *dev_ids)
     op = _OPS.get(key)
     if op is not None:
         return op

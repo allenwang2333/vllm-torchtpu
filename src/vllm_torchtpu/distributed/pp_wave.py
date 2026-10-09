@@ -110,7 +110,10 @@ def _launch_now(op, carried: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ..
 
     sync.synchronize(None, wait=False)
     out = op(*carried)
-    out = (out,) if isinstance(out, torch.Tensor) else tuple(out)
+    if isinstance(out, torch.Tensor):
+        out = (out,)
+    elif not isinstance(out, tuple):
+        out = tuple(out)
     sync.synchronize(list(out), wait=False)
     return out
 
@@ -144,6 +147,7 @@ class PPWave:
         # passes on unchanged. Every stage builds from the same template,
         # so the order matches across stages.
         self.carried = (HIDDEN_STATES, *extras)
+        self._carried_tail = self.carried[1:]
         self.max_rows = int(max_rows)
         self.op = pp_permute_op(get_or_create_pp_mesh(), num_tensors=len(self.carried))
         self.zeros = tuple(
@@ -256,7 +260,11 @@ class PPWave:
             )
         # Summed in the model dtype; see the module docstring.
         total = tensors[HIDDEN_STATES] + tensors[RESIDUAL]
-        outgoing = (total, *(tensors[key] for key in self.carried[1:]))
+        outgoing = (
+            (total, *(tensors[key] for key in self._carried_tail))
+            if self._carried_tail
+            else (total,)
+        )
         padded = self._pad(outgoing, rows)
         if self.rank == 0:
             self._launch(padded)
