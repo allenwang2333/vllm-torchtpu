@@ -862,6 +862,9 @@ def test_low_expert_dense_limit_and_bijective_scatter(monkeypatch):
         rng.integers(-1, 48, size=(num_tokens_big, topk)), dtype=jnp.int32
     )
     wts_big = jnp.ones((num_tokens_big, topk), dtype=jnp.float32) / topk
+    monkeypatch.setattr(
+        fused_moe_gmm, "ragged_gather_v2", lambda h, idx, s, e, *a, **kw: h[idx]
+    )
     _, _, revert_big, _, _, tok_sorted_big = fused_moe_gmm.prepare_routed_gmm_inputs(
         x_big,
         ids_big,

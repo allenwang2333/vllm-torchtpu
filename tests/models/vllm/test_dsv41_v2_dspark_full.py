@@ -1955,3 +1955,21 @@ def test_embed_draft_blocks_full_coverage():
             torch.zeros(2, dtype=torch.int32),
             torch.zeros(2, 4),
         )
+
+
+def test_compute_draft_logits_local():
+    """Verify compute_draft_logits_local invokes logits_processor with
+    skip_gather=True.
+    """
+    instance = SimpleNamespace(
+        lm_head=torch.nn.Linear(8, 16),
+        model=SimpleNamespace(norm=lambda h: h * 2.0),
+        logits_processor=lambda head, h, skip_gather: (head, h, skip_gather),
+    )
+    h = torch.randn(2, 8)
+    head_res, h_res, skip = (
+        v2_dspark.DSparkDeepseekV41ForCausalLM.compute_draft_logits_local(instance, h)
+    )
+    assert head_res is instance.lm_head
+    assert torch.equal(h_res, h * 2.0)
+    assert skip is True

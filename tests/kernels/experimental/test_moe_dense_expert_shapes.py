@@ -619,8 +619,11 @@ def test_packing_factor_and_activation_edge_cases(monkeypatch):
     }
 
 
-def test_apply_activation_swigluoai_and_blockwise_s2():
+def test_apply_activation_swigluoai_and_blockwise_s2(monkeypatch):
     """Cover _apply_activation swigluoai + invalid activation and multi-block s2."""
+    import functools
+    from types import SimpleNamespace
+
     import vllm_torchtpu.kernels.experimental.moe_dense_expert as moe_dense_expert
 
     gate = jnp.ones((8, 128), jnp.bfloat16)
@@ -629,6 +632,17 @@ def test_apply_activation_swigluoai_and_blockwise_s2():
     assert out.shape == (8, 128)
     with pytest.raises(NotImplementedError, match="Unsupported activation"):
         moe_dense_expert._apply_activation(gate, up, "unsupported_act")
+
+    monkeypatch.setattr(
+        moe_dense_expert.pl,
+        "pallas_call",
+        functools.partial(moe_dense_expert.pl.pallas_call, interpret=True),
+    )
+    monkeypatch.setattr(
+        moe_dense_expert.pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(vmem_capacity_bytes=64 * 1024**2),
+    )
 
     # Exercise s2_blocks > 1 (i = 1024 -> 2 blocks of 512)
     h, i, m = 512, 1024, 32
@@ -639,5 +653,43 @@ def test_apply_activation_swigluoai_and_blockwise_s2():
     s2 = jnp.ones((2, 2, 1, h), jnp.float32)
     weights = jnp.full((m, 1), 1.0, jnp.bfloat16)
     ids = jnp.zeros((m, 1), jnp.int32)
-    res = moe_dense_expert.dense_expert_moe(x, w1, w2, s1, s2, weights, ids)
+    moe_dense_expert.dense_expert_moe.clear_cache()
+    try:
+        res = moe_dense_expert.dense_expert_moe(x, w1, w2, s1, s2, weights, ids)
+    finally:
+        moe_dense_expert.dense_expert_moe.clear_cache()
+    assert res.shape == (m, h)
+
+
+def test_dense_expert_moe_unpadded_m_and_experts(monkeypatch):
+    """Cover pad_m == 0 and pad_e == 0 branch in dense_expert_moe."""
+    import functools
+    from types import SimpleNamespace
+
+    import vllm_torchtpu.kernels.experimental.moe_dense_expert as moe_dense_expert
+
+    monkeypatch.setattr(
+        moe_dense_expert.pl,
+        "pallas_call",
+        functools.partial(moe_dense_expert.pl.pallas_call, interpret=True),
+    )
+    monkeypatch.setattr(
+        moe_dense_expert.pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(vmem_capacity_bytes=64 * 1024**2),
+    )
+    m, h, i = 16, 512, 512
+    experts = 128
+    x = jnp.ones((m, h), jnp.bfloat16) * 0.1
+    w1 = jnp.ones((experts, h, 2 * i), jnp.float8_e4m3fn) * 0.1
+    w2 = jnp.ones((experts, i, h), jnp.float8_e4m3fn) * 0.1
+    s1 = jnp.ones((experts, 1, 1, 2 * i), jnp.float32)
+    s2 = jnp.ones((experts, 1, 1, h), jnp.float32)
+    weights = jnp.full((m, 1), 1.0, jnp.bfloat16)
+    ids = jnp.zeros((m, 1), jnp.int32)
+    moe_dense_expert.dense_expert_moe.clear_cache()
+    try:
+        res = moe_dense_expert.dense_expert_moe(x, w1, w2, s1, s2, weights, ids)
+    finally:
+        moe_dense_expert.dense_expert_moe.clear_cache()
     assert res.shape == (m, h)
