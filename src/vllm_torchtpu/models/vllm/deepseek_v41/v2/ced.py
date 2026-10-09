@@ -1,5 +1,6 @@
 """Host planning for decoder SWA bounded replay across scheduled chunks."""
 
+import functools
 from dataclasses import dataclass
 
 import torch
@@ -12,6 +13,24 @@ class DecoderReplayPlan:
     replay_starts: tuple[int, ...]
     padded_num_tokens: int
     is_identity: bool = False
+
+
+@functools.lru_cache(maxsize=64)
+def _identity_indices(kept: int) -> tuple[int, ...]:
+    return tuple(range(kept))
+
+
+@functools.lru_cache(maxsize=256)
+def _padded_bucket(kept: int, num_tokens: int, compile_sizes: tuple) -> int:
+    """Smallest compile size in ``[kept, num_tokens)``, else ``num_tokens``."""
+    if kept == 0:
+        return 0
+    padded = num_tokens
+    for size in compile_sizes:
+        n = int(size)
+        if kept <= n < padded:
+            padded = n
+    return padded
 
 
 def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
@@ -51,7 +70,7 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
             any_skipped = True
     if not any_skipped:
         kept = bounds_list[-1]
-        indices_tuple = tuple(range(kept))
+        indices_tuple = _identity_indices(kept)
         output_bounds_tuple = tuple(bounds_list)
     else:
         indices = []
@@ -68,14 +87,9 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
         output_bounds_tuple = tuple(output_bounds)
     # Each stage dispatches by its own token bucket. Never introduce a second,
     # independent symbolic token dimension into vLLM's guard-free full graph.
-    if kept == 0:
-        padded = 0
-    else:
-        padded = int(num_tokens)
-        for size in compile_sizes:
-            n = int(size)
-            if kept <= n < padded:
-                padded = n
+    if not isinstance(compile_sizes, tuple):
+        compile_sizes = tuple(compile_sizes)
+    padded = _padded_bucket(kept, int(num_tokens), compile_sizes)
     is_identity = kept > 0 and kept == bounds_list[-1] and padded == num_tokens
     return DecoderReplayPlan(
         indices_tuple,

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -25,6 +25,11 @@ class TokenPaddingState:
     """Track token padding."""
 
     local_padding_mask: torch.Tensor
+    # Host mirror of ``local_padding_mask`` and the ``(start, stop)`` padding
+    # range it holds; ``None`` until the first ``update`` writes the device mask.
+    _host_cache: tuple[torch.Tensor, tuple[int, int]] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
@@ -34,11 +39,27 @@ class TokenPaddingState:
         return cls(local_padding_mask=local_padding_mask)
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
-        """Write this rank's token padding mask."""
-        host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
-        host[local_valid_tokens:local_padded_tokens] = True
-        # Synchronous copy since the host tensor is temporary.
+        """Write this rank's token padding mask.
+
+        Steady-state steps repeat the previous padding range; they skip the
+        synchronous host-to-device copy.
+        """
+        rows = range(self.local_padding_mask.shape[0])[
+            local_valid_tokens:local_padded_tokens
+        ]
+        padding_range = (rows.start, rows.stop) if rows else (0, 0)
+        cached = self._host_cache
+        if cached is None:
+            host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
+        elif cached[1] == padding_range:
+            return
+        else:
+            host, (start, stop) = cached
+            host[start:stop] = False
+        host[padding_range[0] : padding_range[1]] = True
+        # Synchronous copy: ``host`` is rewritten by the next cache miss.
         self.local_padding_mask.copy_(host)
+        self._host_cache = (host, padding_range)
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]
@@ -91,7 +112,4 @@ def zero_routing_weights_for_padding(
             is_padding = gathered_padding.ne(0)
         else:
             is_padding = _padding_state.get_local_padding_mask(num_tokens)
-    topk_weights = torch.where(
-        is_padding[:, None], torch.zeros_like(topk_weights), topk_weights
-    )
-    return topk_ids, topk_weights
+    return topk_ids, topk_weights.masked_fill(is_padding[:, None], 0)
