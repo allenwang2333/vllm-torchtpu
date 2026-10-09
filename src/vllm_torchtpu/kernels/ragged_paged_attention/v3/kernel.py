@@ -38,6 +38,10 @@ from vllm_torchtpu.kernels.ragged_paged_attention.v3.util import (
     next_power_of_2,
 )
 
+_HBM_BLOCK_SPEC = pl.BlockSpec(memory_space=pltpu.HBM)
+_HBM_IN_SPECS_3 = [_HBM_BLOCK_SPEC] * 3
+_HBM_OUT_SPECS_2 = [_HBM_BLOCK_SPEC] * 2
+
 
 class RpaCase(Enum):
     """Represents the different cases for Ragged Paged Attention.
@@ -99,7 +103,7 @@ def ref_ragged_paged_attention(
 
     if mask_value is None:
         # We do not set to -inf directly because (-inf) - (-inf) is nan.
-        mask_value = jnp.finfo(out_dtype).min
+        mask_value = float(jnp.finfo(out_dtype).min)
     dynamic_validate_inputs(
         queries,
         keys,
@@ -353,7 +357,7 @@ def _ragged_paged_attention_kernel_loop(
     sm_scale: float,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
-    mask_value: float | None = None,
+    mask_value: Any = None,
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
@@ -1149,23 +1153,23 @@ def merge_kv(
     num_kv_heads_x2 = align_to(actual_num_kv_heads_x2, kv_packing)
 
     head_dim = align_to(actual_head_dim, 128)
-    kv = jnp.pad(
-        jnp.concat([k, v], axis=-1).reshape(
-            max_num_tokens, actual_num_kv_heads_x2, actual_head_dim
-        ),
-        (
-            (0, 0),
-            (0, num_kv_heads_x2 - actual_num_kv_heads_x2),
-            (0, head_dim - actual_head_dim),
-        ),
-        constant_values=0,
-    ).reshape(
+    kv = jnp.concat([k, v], axis=-1)
+    if num_kv_heads_x2 != actual_num_kv_heads_x2 or head_dim != actual_head_dim:
+        kv = jnp.pad(
+            kv.reshape(max_num_tokens, actual_num_kv_heads_x2, actual_head_dim),
+            (
+                (0, 0),
+                (0, num_kv_heads_x2 - actual_num_kv_heads_x2),
+                (0, head_dim - actual_head_dim),
+            ),
+            constant_values=0,
+        )
+    return kv.reshape(
         max_num_tokens,
         num_kv_heads_x2 // kv_packing,
         kv_packing,
         head_dim,
     )
-    return kv
 
 
 def prepare_inputs(
@@ -1184,27 +1188,39 @@ def prepare_inputs(
     q_packing = get_dtype_packing(q.dtype)
     num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head, q_packing)
     head_dim = align_to(actual_head_dim, 128)
-    q_reshaped = jnp.pad(
-        q.reshape(
+    if (
+        num_q_heads_per_kv_head == actual_num_q_heads_per_kv_head
+        and head_dim == actual_head_dim
+    ):
+        q_reshaped = q.reshape(
             max_num_tokens,
             actual_num_kv_heads,
-            actual_num_q_heads_per_kv_head,
-            actual_head_dim,
-        ),
-        (
-            (0, 0),
-            (0, 0),
-            (0, num_q_heads_per_kv_head - actual_num_q_heads_per_kv_head),
-            (0, head_dim - actual_head_dim),
-        ),
-        constant_values=0,
-    ).reshape(
-        max_num_tokens,
-        actual_num_kv_heads,
-        num_q_heads_per_kv_head // q_packing,
-        q_packing,
-        head_dim,
-    )
+            num_q_heads_per_kv_head // q_packing,
+            q_packing,
+            head_dim,
+        )
+    else:
+        q_reshaped = jnp.pad(
+            q.reshape(
+                max_num_tokens,
+                actual_num_kv_heads,
+                actual_num_q_heads_per_kv_head,
+                actual_head_dim,
+            ),
+            (
+                (0, 0),
+                (0, 0),
+                (0, num_q_heads_per_kv_head - actual_num_q_heads_per_kv_head),
+                (0, head_dim - actual_head_dim),
+            ),
+            constant_values=0,
+        ).reshape(
+            max_num_tokens,
+            actual_num_kv_heads,
+            num_q_heads_per_kv_head // q_packing,
+            q_packing,
+            head_dim,
+        )
     if not fuse_non_tiling_axis_swap:  # noqa: SIM108 (one comment per path)
         # Legacy path: Separate query axis swap emitting
         # xlu.transpose (Transpose::Execute).
@@ -1231,42 +1247,29 @@ def prepare_outputs(
     if fuse_non_tiling_axis_swap is None:
         fuse_non_tiling_axis_swap = envs.USE_RPA_PIPELINED_DMA_STAGING
     if not fuse_non_tiling_axis_swap:
-        (
-            actual_num_kv_heads,
-            max_num_tokens,
-            num_q_heads_per_kv_head_per_q_packing,
-            q_packing,
-            head_dim,
-        ) = out.shape
-        actual_num_q_heads = actual_num_q_heads_per_kv_head * actual_num_kv_heads
-        return (
-            out.swapaxes(0, 1)
-            .reshape(
-                max_num_tokens,
-                actual_num_kv_heads,
-                num_q_heads_per_kv_head_per_q_packing * q_packing,
-                head_dim,
-            )[:, :, :actual_num_q_heads_per_kv_head, :actual_head_dim]
-            .reshape(max_num_tokens, actual_num_q_heads, actual_head_dim)
-        )
-    else:
-        # Direct reshape without redundant inverse axis swap
-        (
-            max_num_tokens,
-            actual_num_kv_heads,
-            num_q_heads_per_kv_head_per_q_packing,
-            q_packing,
-            head_dim,
-        ) = out.shape
-        actual_num_q_heads = actual_num_q_heads_per_kv_head * actual_num_kv_heads
-        return out.reshape(
-            max_num_tokens,
-            actual_num_kv_heads,
-            num_q_heads_per_kv_head_per_q_packing * q_packing,
-            head_dim,
-        )[:, :, :actual_num_q_heads_per_kv_head, :actual_head_dim].reshape(
-            max_num_tokens, actual_num_q_heads, actual_head_dim
-        )
+        out = out.swapaxes(0, 1)
+    (
+        max_num_tokens,
+        actual_num_kv_heads,
+        num_q_heads_per_kv_head_per_q_packing,
+        q_packing,
+        head_dim,
+    ) = out.shape
+    actual_num_q_heads = actual_num_q_heads_per_kv_head * actual_num_kv_heads
+    num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_q_packing * q_packing
+    if (
+        num_q_heads_per_kv_head == actual_num_q_heads_per_kv_head
+        and head_dim == actual_head_dim
+    ):
+        return out.reshape(max_num_tokens, actual_num_q_heads, actual_head_dim)
+    return out.reshape(
+        max_num_tokens,
+        actual_num_kv_heads,
+        num_q_heads_per_kv_head,
+        head_dim,
+    )[:, :, :actual_num_q_heads_per_kv_head, :actual_head_dim].reshape(
+        max_num_tokens, actual_num_q_heads, actual_head_dim
+    )
 
 
 # Expect to run this validation during runtime.
@@ -1538,6 +1541,7 @@ def static_validate_inputs(
     del v_scale
 
 
+@functools.lru_cache(maxsize=128)
 def get_default_block_sizes(
     q_dtype,
     kv_dtype,
@@ -1717,7 +1721,7 @@ def ragged_paged_attention(
 
     if mask_value is None:
         # We do not set to -inf directly because (-inf) - (-inf) is nan.
-        mask_value = jnp.finfo(out_dtype).min
+        mask_value = float(jnp.finfo(out_dtype).min)
 
     if vmem_limit_bytes is None:
         # TODO(jevinjiang, jacobplatin): change this to use
@@ -1790,16 +1794,8 @@ def ragged_paged_attention(
         static_q_len=None,
         case: RpaCase = RpaCase.MIXED,
     ):
-        in_specs = [
-            pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.HBM),
-        ]
-
-        out_specs = [
-            pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.HBM),
-        ]
+        in_specs = _HBM_IN_SPECS_3
+        out_specs = _HBM_OUT_SPECS_2
 
         bkv_stride = num_kv_heads_x2_per_kv_packing
         if has_bank_conflicts(bkv_stride):

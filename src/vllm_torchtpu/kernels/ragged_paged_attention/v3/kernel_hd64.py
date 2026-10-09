@@ -24,6 +24,17 @@ DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
+_HBM_BLOCK_SPEC = pl.BlockSpec(memory_space=pltpu.HBM)
+_VMEM_BLOCK_SPEC = pl.BlockSpec(memory_space=pltpu.VMEM)
+_HD64_IN_SPECS_NO_SINK = [_HBM_BLOCK_SPEC, _HBM_BLOCK_SPEC, _HBM_BLOCK_SPEC, None]
+_HD64_IN_SPECS_WITH_SINK = [
+    _HBM_BLOCK_SPEC,
+    _HBM_BLOCK_SPEC,
+    _HBM_BLOCK_SPEC,
+    _VMEM_BLOCK_SPEC,
+]
+_HD64_OUT_SPECS = [_HBM_BLOCK_SPEC, _HBM_BLOCK_SPEC]
+
 
 # TODO(chengjiyao): refactor this hd64 variant and the original kernel to make
 # sure most of the code is shared.
@@ -1011,21 +1022,23 @@ def merge_kv(
     max_num_tokens, actual_num_kv_heads, actual_head_dim = k.shape
     kv_packing = get_dtype_packing(k.dtype)
     num_kv_heads = align_to(actual_num_kv_heads, kv_packing)
-    kv = jnp.pad(
-        jnp.concat([k, v], axis=-1),
-        (
-            (0, 0),
-            (0, num_kv_heads - actual_num_kv_heads),
-            (0, 0),
-        ),
-        constant_values=0,
-    ).reshape(
+    kv = jnp.concat([k, v], axis=-1)
+    if num_kv_heads != actual_num_kv_heads:
+        kv = jnp.pad(
+            kv,
+            (
+                (0, 0),
+                (0, num_kv_heads - actual_num_kv_heads),
+                (0, 0),
+            ),
+            constant_values=0,
+        )
+    return kv.reshape(
         max_num_tokens,
         num_kv_heads // kv_packing,
         kv_packing,
         actual_head_dim * 2,
     )
-    return kv
 
 
 def prepare_inputs(
@@ -1492,17 +1505,10 @@ def ragged_paged_attention_hd64(
         vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
     grid = (distribution[2],)
 
-    in_specs = [
-        pl.BlockSpec(memory_space=pltpu.HBM),
-        pl.BlockSpec(memory_space=pltpu.HBM),
-        pl.BlockSpec(memory_space=pltpu.HBM),
-        None if attention_sink is None else pl.BlockSpec(memory_space=pltpu.VMEM),
-    ]
-
-    out_specs = [
-        pl.BlockSpec(memory_space=pltpu.HBM),
-        pl.BlockSpec(memory_space=pltpu.HBM),
-    ]
+    in_specs = (
+        _HD64_IN_SPECS_NO_SINK if attention_sink is None else _HD64_IN_SPECS_WITH_SINK
+    )
+    out_specs = _HD64_OUT_SPECS
 
     bkv_double_buf = pltpu.VMEM(
         (2, bkv_sz, *kv_cache.shape[2:]),
