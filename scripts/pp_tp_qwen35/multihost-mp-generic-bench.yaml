@@ -306,55 +306,8 @@ spec:
                     done
 
                     if [[ "${RUN_EVAL,,}" == "true" ]]; then
-                      mkdir -p /tmp/infx_tasks "${CDK_OUTPUT_DIR}/eval_suite_a" "${CDK_OUTPUT_DIR}/eval_suite_b1"
-                      cat << 'EOF_YAML' > /tmp/infx_tasks/gsm8k_infx.yaml
-                    tag:
-                      - math_word_problems
-                    task: gsm8k_infx
-                    dataset_path: openai/gsm8k
-                    dataset_name: main
-                    output_type: generate_until
-                    training_split: train
-                    fewshot_split: train
-                    test_split: test
-                    doc_to_text: "Question: {{question}}\nEnd your response with the answer on the last line, formatted as: #### [number]\nAnswer:"
-                    doc_to_target: "{{answer}}"
-                    metric_list:
-                      - metric: exact_match
-                        aggregation: mean
-                        higher_is_better: true
-                        ignore_case: true
-                        ignore_punctuation: false
-                        regexes_to_ignore:
-                          - ","
-                          - "\\$"
-                          - "(?s).*#### "
-                          - "\\.$"
-                    generation_kwargs:
-                      until:
-                        - "</s>"
-                        - "<|im_end|>"
-                      do_sample: false
-                      temperature: 0.0
-                    repeats: 1
-                    num_fewshot: 5
-                    filter_list:
-                      - name: "strict-match"
-                        filter:
-                          - function: "regex"
-                            group_select: -1
-                            regex_pattern: "#### (\\-?[0-9\\.\\,]+)"
-                          - function: "take_first"
-                      - name: "flexible-extract"
-                        filter:
-                          - function: "regex"
-                            group_select: -1
-                            regex_pattern: "(-?[$0-9.,]{2,})|(-?[0-9]+)"
-                          - function: "take_first"
-                    metadata:
-                      version: 3.0
-                    EOF_YAML
-                      sed -i 's/^                    //' /tmp/infx_tasks/gsm8k_infx.yaml
+                      mkdir -p /tmp/infx_tasks "${CDK_OUTPUT_DIR:-/tmp}/eval_suite_a" "${CDK_OUTPUT_DIR:-/tmp}/eval_suite_b1"
+                      cp /workspace/vllm-torchtpu/scripts/pp_tp_qwen35/gsm8k_infx.yaml /tmp/infx_tasks/gsm8k_infx.yaml
 
                       echo "=== Suite A: InferenceX Official GSM8K (gsm8k_infx, local-chat-completions) ==="
                       lm_eval --model local-chat-completions --apply_chat_template \
@@ -362,13 +315,13 @@ spec:
                         --tasks gsm8k_infx \
                         --model_args "model=${MODEL_ID},base_url=http://${VLLM_SERVER_DNS}:${SERVER_PORT}/v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=16,timeout=1800,tokenized_requests=False,max_length=9472" \
                         --gen_kwargs max_tokens=5376,temperature=0,top_p=1 \
-                        --output_path "${CDK_OUTPUT_DIR}/eval_suite_a" || true
+                        --output_path "${CDK_OUTPUT_DIR:-/tmp}/eval_suite_a" || true
 
                       echo "=== Suite B1: Standard lm_eval GSM8K (local-chat-completions --apply_chat_template) ==="
                       lm_eval --model local-chat-completions --apply_chat_template \
                         --model_args "model=${MODEL_ID},base_url=http://${VLLM_SERVER_DNS}:${SERVER_PORT}/v1/chat/completions,num_concurrent=16,max_retries=5,timeout=1800" \
                         --tasks gsm8k \
-                        --output_path "${CDK_OUTPUT_DIR}/eval_suite_b1" || true
+                        --output_path "${CDK_OUTPUT_DIR:-/tmp}/eval_suite_b1" || true
                     fi
                 volumeMounts:
                 - name: dshm
