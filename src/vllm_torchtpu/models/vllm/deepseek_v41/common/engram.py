@@ -13,10 +13,17 @@ import torch
 from vllm.distributed import get_engram_dp_group, get_engram_dp_size
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.models.deepseek_v41.common import engram as upstream
-from vllm.models.deepseek_v41.nvidia.engram import (
-    engram_gathered_num_tokens,
-    engram_head_shard_rank,
-)
+
+try:
+    from vllm.models.deepseek_v41.common.engram import (
+        engram_gathered_num_tokens,
+        engram_head_shard_rank,
+    )
+except ImportError:
+    from vllm.models.deepseek_v41.nvidia.engram import (
+        engram_gathered_num_tokens,
+        engram_head_shard_rank,
+    )
 
 if not hasattr(upstream, "gather_engram_hashes"):
     try:
