@@ -17,7 +17,7 @@ spec:
     enableDNSHostnames: true
   replicatedJobs:
     - name: vllm-node
-      replicas: {{ .NUM_NODES | default 2 }}
+      replicas: {{ .NUM_NODES | default "2" }}
       template:
         spec:
           ttlSecondsAfterFinished: 600

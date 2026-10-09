@@ -29,7 +29,8 @@ run_or_print() {
   echo "================================================================================"
   if [[ "${MODE}" == "--execute" ]]; then
     local out
-    out=$("$@" 2>&1 | tee /dev/stderr)
+    out=$("$@" 2>&1)
+    echo "${out}"
     local job_id
     job_id=$(echo "${out}" | grep -oE 'j-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}' | tail -n 1)
     if [[ -n "${job_id}" && "${KUEUE_BUMP_PRIORITY:-0}" == "1" ]]; then
