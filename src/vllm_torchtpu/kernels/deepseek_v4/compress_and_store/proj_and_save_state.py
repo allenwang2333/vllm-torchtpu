@@ -78,8 +78,11 @@ def load_from_acc_ref(ref, dtype=None):
     ref_flat = ref.reshape(-1, num_lanes)
 
     # Gather the chunks into the original head dimension.
-    chunks = [ref_flat[pl.ds(m, tile_n, num_chunks)] for m in range(num_chunks)]
-    vec = jnp.concat(chunks, axis=1)
+    if num_chunks == 1:
+        vec = ref_flat[pl.ds(0, tile_n, 1)]
+    else:
+        chunks = [ref_flat[pl.ds(m, tile_n, num_chunks)] for m in range(num_chunks)]
+        vec = jnp.concat(chunks, axis=1)
     if dtype is not None:
         return pltpu.bitcast(vec, dtype)
     return vec
@@ -122,6 +125,12 @@ def kernel(
     """Inner kernel executing matmul, APE addition, and paged writes."""
     tile_m = cfgs.tile_sizes.tile_m
     tile_n = cfgs.tile_sizes.tile_n
+    num_m = cfgs.num_m
+    num_k = cfgs.num_k
+    num_n = cfgs.num_n
+    state_width = cfgs.dims.size_m // 2
+    compress_ratio = cfgs.dims.compress_ratio
+    page_size_tokens = cfgs.token_page_size
     last_dim = acc_ref.shape[-1]
     slots_per_m_tile = tile_m // last_dim
     acc_ref_u8 = acc_ref.bitcast(jnp.uint8)
@@ -151,7 +160,6 @@ def kernel(
 
             # Guard index calculations to avoid out-of-bounds even for size 0
             safe_slot_idx = lax.select(valid, global_slot_idx, 0)
-            page_size_tokens = cfgs.token_page_size
             p = safe_slot_idx // page_size_tokens
             start_slot_token = safe_slot_idx % page_size_tokens
             start_slot = start_slot_token + slot_offset
@@ -172,11 +180,9 @@ def kernel(
         m_idx = pl.program_id(1)
         k_idx = pl.program_id(2)
         tile_idx = (
-            n_idx * cfgs.num_m + m_idx
+            n_idx * num_m + m_idx
         )  # omit k_idx because we write to the same buffer, double buffer on k
         buf_idx = tile_idx % 2
-
-        state_width = cfgs.dims.size_m // 2
 
         def _matmul():
             lhs = tiled_hidden_states_ref[...]
@@ -191,7 +197,7 @@ def kernel(
 
         def _add_ape():
             tile_positions = tiled_positions_ref[...]
-            ape_rows = tile_positions % cfgs.dims.compress_ratio
+            ape_rows = tile_positions % compress_ratio
             ape_val = ape[...].astype(jnp.float32)
             # Gather Path: doesn't work for compiler reasons?
             # gather_indices = jnp.broadcast_to(
@@ -199,9 +205,9 @@ def kernel(
             # )
             # ape_selected = jnp.take_along_axis(ape_val, gather_indices, axis=0)
             # matmul path
-            one_hot = (
-                ape_rows[:, None] == jnp.arange(cfgs.dims.compress_ratio)[None, :]
-            ).astype(jnp.float32)
+            one_hot = (ape_rows[:, None] == jnp.arange(compress_ratio)[None, :]).astype(
+                jnp.float32
+            )
             ape_selected = jnp.matmul(
                 one_hot, ape_val, precision=lax.Precision.HIGHEST
             )  #  (tile_n, state_width)
@@ -247,7 +253,6 @@ def kernel(
                 _add_ape()
 
         # Select and execute
-        num_k = cfgs.num_k
         is_last_k = k_idx == (num_k - 1)
         is_score = m_idx * tile_m >= state_width
 
@@ -275,24 +280,24 @@ def kernel(
             process(False, True)
 
     wkv_spec = pl.BlockSpec(
-        (cfgs.tile_sizes.tile_k, cfgs.tile_sizes.tile_m),
+        (cfgs.tile_sizes.tile_k, tile_m),
         lambda n, m, k: (k, m),
         memory_space=pltpu.VMEM,
     )
     hidden_states_spec = pl.BlockSpec(
-        (cfgs.tile_sizes.tile_n, cfgs.tile_sizes.tile_k),
+        (tile_n, cfgs.tile_sizes.tile_k),
         lambda n, m, k: (n, k),
         memory_space=pltpu.VMEM,
     )
     positions_spec = pl.BlockSpec(
-        (cfgs.tile_sizes.tile_n,),
+        (tile_n,),
         lambda n, m, k: (n,),
         memory_space=pltpu.VMEM,
     )
 
     pipeline_fn = pltpu.emit_pipeline(
         inner_kernel,
-        grid=(cfgs.num_n, cfgs.num_m, cfgs.num_k),
+        grid=(num_n, num_m, num_k),
         in_specs=(
             wkv_spec,
             hidden_states_spec,
@@ -307,13 +312,11 @@ def kernel(
     )
 
     # Epilogue: launch DMA for the last tile and wait for all outstanding DMAs
-    last_tile_idx = cfgs.num_n * cfgs.num_m - 1
-    last_n_idx = last_tile_idx // cfgs.num_m
-    last_m_idx = last_tile_idx % cfgs.num_m
+    last_tile_idx = num_n * num_m - 1
+    last_n_idx = num_n - 1
+    last_m_idx = num_m - 1
     last_buf_idx = last_tile_idx % 2
-
-    if last_tile_idx >= 0:
-        _dma_copy_out(last_n_idx, last_m_idx, last_buf_idx)
+    _dma_copy_out(last_n_idx, last_m_idx, last_buf_idx)
 
     for b in range(2):
         count = write_counts_ref[b][...]
@@ -323,6 +326,7 @@ def kernel(
             pl.semaphore_wait(sem_ref.at[b], count)
 
 
+@functools.lru_cache(maxsize=64)
 def _select_tile_k(size_k: int, cap: int = 3584, align: int = 128) -> int:
     """Largest 128-aligned k tile that *divides* ``size_k``."""
     cap = max(align, (min(cap, size_k) // align) * align)
@@ -330,6 +334,17 @@ def _select_tile_k(size_k: int, cap: int = 3584, align: int = 128) -> int:
         if size_k % cand == 0:
             return cand
     raise AssertionError(f"Cannot find a tile_k that divides size_k={size_k}")
+
+
+_PROJ_IN_SPECS = [
+    pl.BlockSpec(memory_space=pltpu.HBM),  # positions
+    pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states
+    pl.BlockSpec(memory_space=pltpu.HBM),  # wkv_wgate
+    pl.BlockSpec(memory_space=pltpu.VMEM),  # ape (prefetch to VMEM)
+    pl.BlockSpec(memory_space=pltpu.HBM),  # cache
+]
+_PROJ_OUT_SPEC = pl.BlockSpec(memory_space=pltpu.HBM)
+_PROJ_COMPILER_PARAMS = pltpu.CompilerParams(disable_bounds_checks=True)
 
 
 @functools.partial(
@@ -414,20 +429,12 @@ def proj_and_save_state(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             grid=(),
-            in_specs=[
-                pl.BlockSpec(memory_space=pltpu.HBM),  # positions
-                pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states
-                pl.BlockSpec(memory_space=pltpu.HBM),  # wkv_wgate
-                pl.BlockSpec(memory_space=pltpu.VMEM),  # ape (prefetch to VMEM)
-                pl.BlockSpec(memory_space=pltpu.HBM),  # cache
-            ],
-            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            in_specs=_PROJ_IN_SPECS,
+            out_specs=_PROJ_OUT_SPEC,
             scratch_shapes=scratch_shapes,
         ),
         input_output_aliases={5: 0},  # Alias output to cache (index 5)
-        compiler_params=pltpu.CompilerParams(
-            disable_bounds_checks=True,
-        ),
+        compiler_params=_PROJ_COMPILER_PARAMS,
         interpret=interpret,
         name="proj_and_save_state",
     )(slot_mapping, positions, hidden_states, wkv_wgate, ape, cache)

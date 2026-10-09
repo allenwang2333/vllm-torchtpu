@@ -56,13 +56,11 @@ def ref_wkv_proj_and_save_state(
     )
 
     # 3. Unpack inline
-    cache_reshaped = cache.reshape(num_pages, tokens_per_page, slots_per_token, d1, d2)
-    cache_t = cache_reshaped.transpose(0, 1, 2, 4, 3)
-    cache_bitcast_shape = cache_t.reshape(
-        num_pages, tokens_per_page, slots_per_token, (d2 * d1) // 4, 4
-    )
-    f32_flat = jax.lax.bitcast_convert_type(cache_bitcast_shape, jnp.float32)
-    flat = f32_flat.reshape(num_pages * tokens_per_page, state_dim)
+    cache_t = cache.reshape(
+        num_pages, tokens_per_page, slots_per_token, d1, d2
+    ).transpose(0, 1, 2, 4, 3)
+    cache_bitcast_shape = cache_t.reshape(num_pages * tokens_per_page, state_dim, 4)
+    flat = jax.lax.bitcast_convert_type(cache_bitcast_shape, jnp.float32)
 
     # 4. Scatter
     num_tokens_flat = num_pages * tokens_per_page
@@ -73,14 +71,8 @@ def ref_wkv_proj_and_save_state(
     flat = flat_padded[:-1]
 
     # 5. Pack inline back
-    chunk = flat.reshape(num_pages, tokens_per_page, slots_per_token, f32_per_slot, 1)
-    chunk_bytes = jax.lax.bitcast_convert_type(chunk, jnp.uint8)
-    chunk_bytes_reshaped = chunk_bytes.reshape(
+    chunk_bytes = jax.lax.bitcast_convert_type(flat, jnp.uint8)
+    chunk_bytes_t = chunk_bytes.reshape(
         num_pages, tokens_per_page, slots_per_token, d2, d1
-    )
-    chunk_bytes_t = chunk_bytes_reshaped.transpose(0, 1, 2, 4, 3)
-    cache_view = cache.reshape(num_pages, tokens_per_page, slots_per_token, d1, d2)
-    cache_view = cache_view.at[:].set(chunk_bytes_t)
-    new_cache = cache_view.reshape(num_pages, page_size, d1, d2)
-
-    return new_cache
+    ).transpose(0, 1, 2, 4, 3)
+    return chunk_bytes_t.reshape(num_pages, page_size, d1, d2)

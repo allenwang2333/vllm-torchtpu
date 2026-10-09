@@ -17,14 +17,15 @@ import jax.numpy as jnp
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 
+_FP8_E4M3_MAX = float(jnp.finfo(jnp.float8_e4m3fn).max)
+
 
 def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
     """Block fp8 quantization with UE8M0 (power-of-two) block scales."""
-    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
     *lead, dim = x.shape
     blocked = x.reshape(*lead, dim // block_size, block_size)
     amax = jnp.clip(jnp.max(jnp.abs(blocked), axis=-1, keepdims=True), 1e-4, None)
-    scale = jnp.exp2(jnp.ceil(jnp.log2(amax / fp8_max)))
+    scale = jnp.exp2(jnp.ceil(jnp.log2(amax / _FP8_E4M3_MAX)))
     q = (blocked * (1.0 / scale)).astype(jnp.float8_e4m3fn).reshape(x.shape)
     scale = jnp.squeeze(scale, -1).astype(jnp.float8_e8m0fnu)
     return q, scale
@@ -36,13 +37,12 @@ def quantize_fp8_lane_periodic(x: jax.Array, period: int, nope_dim: int):
     Group j is ``{d < nope_dim : d % period == j}``; see
     ``compute.quantize_fp8_lane_periodic``.
     """
-    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
     dim = x.shape[-1]
     kept = jnp.where(jnp.arange(dim) < nope_dim, jnp.abs(x), 0.0)
     amax = jnp.clip(
         jnp.max(kept.reshape(*x.shape[:-1], dim // period, period), axis=-2), 1e-4, None
     )
-    scale = jnp.exp2(jnp.ceil(jnp.log2(amax / fp8_max)))
+    scale = jnp.exp2(jnp.ceil(jnp.log2(amax / _FP8_E4M3_MAX)))
     q = (x / jnp.tile(scale, dim // period)).astype(jnp.float8_e4m3fn)
     return q, scale.astype(jnp.float8_e8m0fnu)
 
@@ -358,7 +358,8 @@ def ref_compress_norm_rope_store(
             f"packed NOPE record {nope_record.shape[-1]}B exceeds cache width"
             f" {nope_width}B"
         )
-    nope_record = jnp.pad(nope_record, ((0, 0), (0, nope_pad)))
+    if nope_pad > 0:
+        nope_record = jnp.pad(nope_record, ((0, 0), (0, nope_pad)))
 
     # Split nope_record for multi-slot write if slots_per_part_out > 1
     nope_record_split = nope_record.reshape(
@@ -366,16 +367,16 @@ def ref_compress_norm_rope_store(
     )
 
     # 6. Scatter NOPE into cache
-    logical_slots_factor = 1
     page_size_physical = cache_for_unpack.shape[1]
-    page_size_logical = page_size_physical * logical_slots_factor
-    nope_num_slots_logical = num_pages * page_size_logical
     nope_num_slots_physical = num_pages * page_size_physical
 
-    dest_logical = _boundary_dest(
-        positions, slot_mapping, kv_slot_mapping, compress_ratio, nope_num_slots_logical
+    dest_nope_physical = _boundary_dest(
+        positions,
+        slot_mapping,
+        kv_slot_mapping,
+        compress_ratio,
+        nope_num_slots_physical,
     )
-    dest_nope_physical = dest_logical // logical_slots_factor
 
     flat_nope = cache_for_unpack.reshape(
         nope_num_slots_physical, slot_size_bytes := slot_bytes

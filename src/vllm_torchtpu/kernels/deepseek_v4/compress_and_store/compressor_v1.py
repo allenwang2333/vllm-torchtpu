@@ -117,11 +117,17 @@ def derive_metadata(
 
     block_table_stride = block_table_row_stride(block_table, batch_size)
     kv_block_table_stride = block_table_row_stride(kv_block_table, batch_size)
+    req_state_base = req * block_table_stride
+    req_kv_base = (
+        req_state_base
+        if kv_block_table_stride == block_table_stride
+        else req * kv_block_table_stride
+    )
 
     # 3. State Cache Slot Mapping (Virtual -> Physical)
     state_page_idx = positions // state_block_size
     state_page_offset = positions % state_block_size
-    state_page_numbers = block_table[req * block_table_stride + state_page_idx]
+    state_page_numbers = block_table[req_state_base + state_page_idx]
     slot_mapping_slots = (
         state_page_numbers * page_size + state_page_offset * state_rows_per_token
     )
@@ -131,7 +137,7 @@ def derive_metadata(
     kv_page_idx = kv_idx // kv_block_size
     kv_page_offset = kv_idx % kv_block_size
 
-    kv_page_number = kv_block_table[req * kv_block_table_stride + kv_page_idx]
+    kv_page_number = kv_block_table[req_kv_base + kv_page_idx]
 
     kv_slot_mapping = kv_page_number * kv_page_stride + kv_page_offset * kv_stride
 
@@ -174,11 +180,13 @@ def prepare_boundary_batch(
     # 1. Get packing indices for all boundary tokens
     safe, valid = _get_packing_indices(is_boundary, packed_size)
 
-    # 2. Pack inputs and the decode mask
-    pos = _pack_array(positions, safe, valid, 0)
-    req = _pack_array(token_to_req_indices, safe, valid, 0)
+    # 2. Pack inputs and the decode mask.
+    # Invalid slots map to dest == output_size (dropped by scatter), so pos/req
+    # only need gather without a redundant jnp.where(valid, ..., 0).
+    pos = positions[safe]
+    req = token_to_req_indices[safe]
     kv = _pack_array(kv_slot_mapping, safe, valid, -1)
-    is_decode = _pack_array(is_decode_token, safe, valid, False)
+    is_decode = valid & is_decode_token[safe]
 
     valid_token = kv >= 0
     is_prefill = valid_token & ~is_decode
@@ -247,6 +255,7 @@ def compressor_forward(
     num_tokens = positions.shape[0]
     num_reqs = query_start_loc.shape[0] - 1
     shares_buffer = state_cache is None
+    bt_stride = block_table_row_stride(block_table, num_reqs)
 
     token_to_req_indices, slot_mapping_slots, kv_slot_mapping = derive_metadata(
         positions=positions,
@@ -300,7 +309,7 @@ def compressor_forward(
         boundary_req,
         boundary_kv_slot,
         norm_weight,
-        block_table_stride=block_table_row_stride(block_table, num_reqs),
+        block_table_stride=bt_stride,
         state_block_size=state_block_size,
         state_cache=state_cache,
         rope_cache=rope_cache,
