@@ -236,6 +236,11 @@ where = ["src"]
 include = ["vllm_torchtpu*"]
 
 [tool.setuptools_scm]
+# Only release tags (`v<digit>...`) name a version. The default describe
+# matches any tag containing a digit, so workflow tags such as
+# `backup/opt-3-td7102` or `qwen38-1p1d-test-20261008` would be picked up
+# and fail to parse, breaking every editable install / `uv sync`.
+git_describe_command = "git describe --dirty --tags --long --match 'v[0-9]*'"
 
 [tool.uv]
 keyring-provider = "subprocess"
