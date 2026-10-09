@@ -240,6 +240,9 @@ local xprofDir = '${CDK_OUTPUT_DIR:-/tmp/cdk_output}/xprof';
 // ~82M lines (16.5 GB) per server pod in j-c80b896b-f1c0-4534-955d. Opt in with e.g.
 // TPU_VMODULE=tpu_pjrt_client=1,pjrt_stream_executor_client=1,tpu_pjrt_compiler_utils=1
 local tpuVmodule = cdk.var('TPU_VMODULE', '');
+// PyTorch logging for the server and its Ray workers, e.g. TORCH_LOGS=recompiles to log why a
+// torch.compile'd function recompiles while serving. Empty leaves it unset.
+local torchLogs = cdk.var('TORCH_LOGS', '');
 // Seconds between "hostmem:" lines in each server pod's log (see the server script); 0 turns the
 // sampler off. Added after j-191aa11f-389d-43cb-bc1d was OOM-killed at the 900Gi host limit at the
 // end of startup with nothing in the log saying what held the memory.
@@ -651,6 +654,7 @@ local serverJob = cdk.job(
         RAY_DEDUP_LOGS: '0',
         TPU_STDERR_LOG_LEVEL: '0',
         [if tpuVmodule != '' then 'TPU_VMODULE']: tpuVmodule,
+        [if torchLogs != '' then 'TORCH_LOGS']: torchLogs,
 
         MOE_REQUANTIZE_WEIGHT_DTYPE: moeRequantizeWeightDtype,
         MOE_REQUANTIZE_BLOCK_SIZE: moeRequantizeBlockSize,
@@ -684,7 +688,7 @@ local serverJob = cdk.job(
           'USE_PHASED_PROFILER',
           'VLLM_TPU_MOST_MODEL_LEN',
           'VLLM_SERVER_DEV_MODE',
-        ]),
+        ] + (if torchLogs != '' then ['TORCH_LOGS'] else [])),
         TORCH_DIST_TIMEOUT: '1200',
         VLLM_RPC_TIMEOUT: '1200000',
         VLLM_SHM_BROADCAST_TIMEOUT_S: '1200',
