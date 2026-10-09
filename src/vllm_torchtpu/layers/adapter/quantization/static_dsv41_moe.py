@@ -6,7 +6,6 @@ import hashlib
 import json
 import re
 from collections.abc import Iterator
-from concurrent.futures import Future, ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 
@@ -19,15 +18,10 @@ from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm_torchtpu import envs
 
 _GroupTensors = dict[str, torch.Tensor]
-_GroupStream = Iterator[tuple[int, _GroupTensors]]
+_GroupStream = Iterator[tuple[int, _GroupTensors] | None]
 _GROUPED_STREAMS: dict[tuple[str, int], _GroupStream] = {}
 _GROUPED_PENDING: dict[tuple[str, int], dict[int, _GroupTensors]] = {}
 _GROUPED_LOADED: dict[tuple[str, int], set[int]] = {}
-_PREFETCH_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dsv41-moe")
-_GROUPED_PREFETCH: dict[
-    tuple[str, int],
-    Future[tuple[_GroupStream, int, _GroupTensors]],
-] = {}
 
 
 def _sha256(path: Path) -> str:
@@ -120,7 +114,7 @@ def _select_grouped_experts(
 
 def _stream_grouped_shards(
     uri: str, group: int, files: dict[tuple[int, int], dict]
-) -> Iterator[tuple[int, dict[str, torch.Tensor]]]:
+) -> _GroupStream:
     import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
     from runai_model_streamer.file_streamer import FileChunks
     from runai_model_streamer.safetensors_streamer.safetensors_streamer import (
@@ -141,6 +135,10 @@ def _stream_grouped_shards(
             requests.append(FileChunks(layer, path, meta.offset, meta.read_sizes))
             tensor_names.append(meta.tensors_metadata)
         fs.stream_files(requests, credentials=None, device="cpu", is_distributed=False)
+        # Run:AI may use distributed collectives during setup. Prime this
+        # generator on the worker thread, then consume chunks after the
+        # ordinary model weights have loaded.
+        yield None
         pending: dict[int, dict[str, torch.Tensor]] = {}
         for layer, chunk, buffer in fs.get_chunks():
             meta = tensor_names[layer][chunk]
@@ -156,12 +154,12 @@ def _stream_grouped_shards(
             raise ValueError(f"Incomplete static MoE stream: {sorted(pending)}")
 
 
-def _prime_group_stream(
+def _open_group_stream(
     uri: str, group: int, files: dict[tuple[int, int], dict]
-) -> tuple[_GroupStream, int, _GroupTensors]:
+) -> _GroupStream:
     stream = _stream_grouped_shards(uri, group, files)
-    layer, tensors = next(stream)
-    return stream, layer, tensors
+    assert next(stream) is None
+    return stream
 
 
 def start_grouped_prefetch(root: str, uri: str, local_experts: set[int]) -> None:
@@ -174,10 +172,10 @@ def start_grouped_prefetch(root: str, uri: str, local_experts: set[int]) -> None
     if "__ep8__" not in index:
         return
     key = (uri, group)
-    if key not in _GROUPED_PREFETCH:
-        _GROUPED_PREFETCH[key] = _PREFETCH_POOL.submit(
-            _prime_group_stream, uri, group, index["__ep8__"]
-        )
+    if key not in _GROUPED_STREAMS:
+        _GROUPED_STREAMS[key] = _open_group_stream(uri, group, index["__ep8__"])
+        _GROUPED_PENDING[key] = {}
+        _GROUPED_LOADED[key] = set()
 
 
 def _streamed_group(
@@ -185,20 +183,17 @@ def _streamed_group(
 ) -> dict[str, torch.Tensor]:
     key = (uri, group)
     if key not in _GROUPED_STREAMS:
-        if future := _GROUPED_PREFETCH.pop(key, None):
-            stream, first_layer, first_tensors = future.result()
-            _GROUPED_STREAMS[key] = stream
-            _GROUPED_PENDING[key] = {first_layer: first_tensors}
-        else:
-            _GROUPED_STREAMS[key] = _stream_grouped_shards(uri, group, files)
-            _GROUPED_PENDING[key] = {}
+        _GROUPED_STREAMS[key] = _open_group_stream(uri, group, files)
+        _GROUPED_PENDING[key] = {}
         _GROUPED_LOADED[key] = set()
     pending = _GROUPED_PENDING[key]
     while layer not in pending:
         try:
-            next_layer, tensors = next(_GROUPED_STREAMS[key])
+            item = next(_GROUPED_STREAMS[key])
         except StopIteration as error:
             raise ValueError(f"Static MoE layer {layer} missing from stream") from error
+        assert item is not None
+        next_layer, tensors = item
         pending[next_layer] = tensors
     tensors = pending.pop(layer)
     loaded = _GROUPED_LOADED[key]
