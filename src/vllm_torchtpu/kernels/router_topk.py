@@ -168,7 +168,7 @@ def select(
             out_shape=out_shape,
             interpret=interpret,
         )(scores)
-    bias_2d = jnp.reshape(bias, (1, n))
+    bias_2d = bias if bias.shape == (1, n) else jnp.reshape(bias, (1, n))
     return pl.pallas_call(
         functools.partial(
             _select_biased_kernel, topk=topk, n=n, renormalize=renormalize

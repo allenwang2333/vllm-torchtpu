@@ -71,11 +71,12 @@ def rowmax_select(
         raise ValueError(
             f"router top-k kernel expects [rows, experts], got {scores.shape}"
         )
+    scores_f32 = scores if scores.dtype == torch.float32 else scores.float()
     if bias is not None:
-        return _biased_op(
-            scores.float(),
-            bias.float().view(1, scores.shape[1]),
-            topk,
-            renormalize,
+        bias_f32 = bias if bias.dtype == torch.float32 else bias.float()
+        target_shape = (1, scores.shape[1])
+        bias_2d = (
+            bias_f32 if bias_f32.shape == target_shape else bias_f32.view(target_shape)
         )
-    return _op(scores.float(), topk, renormalize)
+        return _biased_op(scores_f32, bias_2d, topk, renormalize)
+    return _op(scores_f32, topk, renormalize)

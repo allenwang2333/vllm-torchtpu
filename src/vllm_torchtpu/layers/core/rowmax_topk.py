@@ -51,11 +51,15 @@ def rowmax_topk(
     if k > n:
         raise ValueError(f"topk k={k} exceeds the expert count {n}")
     iota = torch.arange(n, device=scores.device, dtype=torch.int32)
-    choice = (
-        scores
-        if bias is None
-        else scores + bias.to(scores.dtype).view([1] * (scores.dim() - 1) + [n])
-    )
+    if bias is None:
+        choice = scores
+    else:
+        bias_cast = bias if bias.dtype == scores.dtype else bias.to(scores.dtype)
+        if scores.dim() == 2:
+            bias_view = bias_cast if bias_cast.shape == (1, n) else bias_cast.view(1, n)
+        else:
+            bias_view = bias_cast.view([1] * (scores.dim() - 1) + [n])
+        choice = scores + bias_view
     masked = torch.finfo(choice.dtype).min
 
     cur = torch.where(choice > NEG, choice, NEG)
