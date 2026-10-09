@@ -449,11 +449,10 @@ class DSparkDeepseekV41Model(nn.Module):
                 kv_rotated = layers[0].attn._rotate(kv_normed, positions)
                 assert v2_attn._active_stage_attn_cache is not None
                 v2_attn._active_stage_attn_cache["context_kv_pre_rotated"] = True
+                kv_by_layer = kv_rotated.transpose(0, 1).contiguous()
                 for i, layer in enumerate(layers):
                     layer_md = None if metadata is None else metadata[i]
-                    _insert_context_kv(
-                        layer.attn, kv_rotated[:, i], positions, layer_md
-                    )
+                    _insert_context_kv(layer.attn, kv_by_layer[i], positions, layer_md)
             else:
                 for i, layer in enumerate(layers):
                     attn = layer.attn

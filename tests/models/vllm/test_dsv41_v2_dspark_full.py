@@ -675,7 +675,9 @@ def test_dspark_deepseek_v41_for_causal_lm_forward_and_hooks(
     monkeypatch.setattr(
         v2_dspark,
         "_insert_context_kv",
-        lambda attn, kv, pos, md: inserted_calls.append((kv.shape, md)),
+        lambda attn, kv, pos, md: inserted_calls.append(
+            (kv.shape, md, kv.is_contiguous())
+        ),
     )
     main_x1 = draft_lm.precompute_and_store_context_kv(
         raw_aux, positions, metadata=None
@@ -683,6 +685,7 @@ def test_dspark_deepseek_v41_for_causal_lm_forward_and_hooks(
     assert main_x1.shape == (4, 16)
     assert len(inserted_calls) == 2
     assert inserted_calls[0][1] is None
+    assert all(c[2] for c in inserted_calls)
 
     inserted_calls.clear()
     main_x2 = draft_lm.precompute_and_store_context_kv(
@@ -690,6 +693,7 @@ def test_dspark_deepseek_v41_for_causal_lm_forward_and_hooks(
     )
     assert torch.equal(main_x2, combined)
     assert [c[1] for c in inserted_calls] == ["md0", "md1"]
+    assert all(c[2] for c in inserted_calls)
 
     # Forward both with inputs_embeds=None and inputs_embeds provided
     out_from_ids = draft_lm(input_ids, positions)
@@ -844,6 +848,43 @@ def test_dspark_deepseek_v41_model_edge_cases(monkeypatch: pytest.MonkeyPatch):
     # compute_confidence raises AssertionError when confidence_head is None
     with pytest.raises(AssertionError):
         draft_lm.compute_confidence(torch.randn(4, 16), torch.randn(4, 8))
+
+    # _embed_draft_blocks with block > 1 (exact blocks and non-empty tail)
+    embed_fn = nn.Embedding(32, 16)
+    ids_exact = torch.tensor([3, 7, 7, 5, 7, 9], dtype=torch.long)
+    out_exact = v2_dspark._embed_draft_blocks(embed_fn, ids_exact, block=3)
+    assert out_exact.shape == (6, 16)
+    assert torch.isnan(out_exact[5]).all()
+    ids_tail = torch.tensor([3, 7, 7, 7, 8], dtype=torch.long)
+    out_tail = v2_dspark._embed_draft_blocks(embed_fn, ids_tail, block=3)
+    assert out_tail.shape == (5, 16)
+    assert torch.isnan(out_tail[4]).all()
+
+    # hc_attn_fn_broadcast non-None branch in DSparkDeepseekV41Model.forward
+    draft_lm.model.layers[0].hc_attn_fn_broadcast = True
+
+    def _dummy_layer(h, pos, ids, pre, post, res, residual):
+        n = h.shape[0]
+        return (
+            torch.zeros(n, 16),
+            torch.zeros(n, 4, 16),
+            torch.ones(n, 4),
+            torch.ones(n, 4, 4),
+            torch.ones(n, 4),
+            None,
+        )
+
+    monkeypatch.setattr(draft_lm.model, "layers", nn.ModuleList([]))
+    layer_mock = nn.Module()
+    layer_mock.hc_attn_fn_broadcast = True
+    layer_mock.forward = _dummy_layer  # type: ignore[method-assign]
+    draft_lm.model.layers.append(layer_mock)
+    out_bcast = draft_lm.model(
+        torch.tensor([1, 2], dtype=torch.long),
+        torch.tensor([0, 1], dtype=torch.long),
+        inputs_embeds=torch.zeros(2, 4, 16),
+    )
+    assert out_bcast.shape == (2, 16)
 
     # _remap_dspark_name returns None for confidence_head when disabled
     assert draft_lm._remap_dspark_name("mtp.0.confidence_head.w1.weight") is None
@@ -1901,3 +1942,16 @@ def test_embed_draft_blocks_full_coverage():
         assert bad.tolist() == [i == bad_row for i in range(18)]
         keep = ~bad
         assert torch.equal(out[keep], weight[ids.long()][keep])
+
+    # 4. Null residual path hits line 492 AssertionError
+    empty_model = SimpleNamespace(
+        layers=[lambda *a: (torch.zeros(2, 4), None, None, None, None, None)],
+        hc_mult=1,
+    )
+    with pytest.raises(AssertionError):
+        v2_dspark.DSparkDeepseekV41Model.forward(
+            empty_model,
+            torch.zeros(2, dtype=torch.int32),
+            torch.zeros(2, dtype=torch.int32),
+            torch.zeros(2, 4),
+        )
