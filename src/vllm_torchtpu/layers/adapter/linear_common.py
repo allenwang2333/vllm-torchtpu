@@ -316,6 +316,7 @@ def slice_sharded_tensor_for_concatenation(
         n_shards: num of shards.
     """
     new_shape = sharded_tensor.shape[:-1] + (n_shards, -1)
+    out_shape = sharded_tensor.shape[:-1] + (-1,)
     # New shape ensures each sharded_tensor[:, i] maps to a tensor in ith shards
     sharded_tensor = sharded_tensor.reshape(new_shape)
 
@@ -328,7 +329,7 @@ def slice_sharded_tensor_for_concatenation(
         # Because we are slicing over last dim, sharding dim remains intact.
         # Therefore, splitting happens locally.
         split_tensor = sharded_tensor[..., start_offset:end_offset]
-        split_tensors.append(split_tensor.reshape(new_shape[:-2] + (-1,)))
+        split_tensors.append(split_tensor.reshape(out_shape))
         start_offset = end_offset
 
     return split_tensors

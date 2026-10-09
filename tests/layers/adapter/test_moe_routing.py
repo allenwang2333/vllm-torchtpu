@@ -327,6 +327,7 @@ def test_router_topk_fake_and_tpu_dispatch_branches(monkeypatch):
         def __init__(self, t: torch.Tensor):
             self._t = t
             self.shape = t.shape
+            self.dtype = t.dtype
 
         def dim(self) -> int:
             return self._t.dim()

@@ -44,10 +44,19 @@ class TokenPaddingState:
         Steady-state steps repeat the previous padding range; they skip the
         synchronous host-to-device copy.
         """
-        rows = range(self.local_padding_mask.shape[0])[
-            local_valid_tokens:local_padded_tokens
-        ]
-        padding_range = (rows.start, rows.stop) if rows else (0, 0)
+        # Same bounds as ``range(n)[valid:padded]``. The runner always passes
+        # 0 <= valid <= padded <= n, so take that case with plain compares and
+        # only build the range for negative or out-of-range bounds (CPython:
+        # ~100 ns vs ~240 ns for the range slice; pure min/max clamping is
+        # slower than the range slice, ~480 ns).
+        n = self.local_padding_mask.shape[0]
+        if 0 <= local_valid_tokens < local_padded_tokens <= n:
+            padding_range = (local_valid_tokens, local_padded_tokens)
+        elif 0 <= local_padded_tokens <= local_valid_tokens:
+            padding_range = (0, 0)
+        else:
+            rows = range(n)[local_valid_tokens:local_padded_tokens]
+            padding_range = (rows.start, rows.stop) if rows else (0, 0)
         cached = self._host_cache
         if cached is None:
             host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
