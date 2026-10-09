@@ -10,6 +10,13 @@
 # cp312 wheels only. Moving off it needs raiden to ship the newer ABI first.
 FROM python:3.12-slim-bookworm AS base
 
+# Every layer from here on is reused from the CI layer cache while its inputs
+# are unchanged (see docker/build_image.sh --cache-from). CACHE_EPOCH changes
+# weekly in CI, so apt packages, unpinned transitive Python dependencies and
+# everything built on them are still rebuilt that often rather than frozen at
+# whatever the cache first held.
+ARG CACHE_EPOCH=
+
 # curl for health checks, git so uv can clone the vllm source dependency, the
 # toolchain for packages that build from source, and libgoogle-perftools4 for
 # the tcmalloc allocator enabled below. build-essential already pulls in gcc,

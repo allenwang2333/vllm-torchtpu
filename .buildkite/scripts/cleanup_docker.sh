@@ -26,6 +26,11 @@ set -euo pipefail
 # A resource that is already being removed is the outcome we wanted.
 # TODO: after 11/31/2026, remove torchtpu-vllm and torchtpu-vllm-local
 TARGET_IMAGES=("vllm-torchtpu" "torchtpu-vllm" "vllm-torchtpu-local" "torchtpu-vllm-local")
+# An image to leave in place (run_in_docker.sh passes the one it just pulled).
+KEEP_ID=""
+if [[ -n "${1:-}" ]]; then
+  KEEP_ID=$(docker images -q "$1" 2>/dev/null | head -1)
+fi
 
 echo "=== Starting Docker resource cleanup ==="
 echo "Target images: ${TARGET_IMAGES[*]}"
@@ -38,7 +43,7 @@ for IMG in "${TARGET_IMAGES[@]}"; do
 
   # Get image IDs matching either exact name or registry repository name
   # e.g., "vllm-torchtpu" or ".../.../vllm-torchtpu"
-  OLD_IMAGES=$(docker images --format '{{.Repository}} {{.ID}}' | awk -v img="${IMG}" '$1 == img || $1 ~ "/"img"$" {print $2}' | sort -u)
+  OLD_IMAGES=$(docker images --format '{{.Repository}} {{.ID}}' | awk -v img="${IMG}" '$1 == img || $1 ~ "/"img"$" {print $2}' | grep -vx "${KEEP_ID:-none}" | sort -u || true)
 
   if [[ -n "$OLD_IMAGES" ]]; then
     echo "Found matching images. Checking for dependent containers..."

@@ -11,6 +11,9 @@ Options:
   -t, --image-tag TAG      Tag for the built image (default: vllm-torchtpu-local)
   -s, --vllm-source DIR    Local vLLM source tree to install in editable mode
       --target TARGET      Dockerfile stage to build: prod, dev, ci, or omni (default: prod)
+      --cache-from REF     Image to reuse unchanged layers from (BuildKit inline cache)
+      --cache-epoch EPOCH  Value that, when it changes, rebuilds every layer from the
+                           first apt install on (CI passes the ISO week)
   -h, --help               Show this help and exit
 
 Examples:
@@ -30,6 +33,8 @@ IMAGE_TAG="vllm-torchtpu-local"
 VLLM_SOURCE=""
 VLLM_COMMIT_HASH=""
 TARGET="prod"
+CACHE_FROM=""
+CACHE_EPOCH=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -48,6 +53,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --target)
       TARGET="$2"
+      shift 2
+      ;;
+    --cache-from)
+      CACHE_FROM="$2"
+      shift 2
+      ;;
+    --cache-epoch)
+      CACHE_EPOCH="$2"
       shift 2
       ;;
     -h|--help)
@@ -163,6 +176,16 @@ DOCKER_ARGS=(
 
 if [ -n "${ACCESS_TOKEN:-}" ]; then
   DOCKER_ARGS+=(--secret "id=gcloud_token,env=ACCESS_TOKEN")
+fi
+
+# Embed BuildKit's cache metadata in every image, so any image can later serve
+# as a --cache-from source. A few KB in the image config.
+DOCKER_ARGS+=(--build-arg BUILDKIT_INLINE_CACHE=1)
+if [ -n "${CACHE_FROM}" ]; then
+  DOCKER_ARGS+=(--cache-from "${CACHE_FROM}")
+fi
+if [ -n "${CACHE_EPOCH}" ]; then
+  DOCKER_ARGS+=(--build-arg CACHE_EPOCH="${CACHE_EPOCH}")
 fi
 
 # Run docker build

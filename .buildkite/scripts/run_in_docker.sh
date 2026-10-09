@@ -55,12 +55,17 @@ fi
 # (collapsed *and* de-emphasized, so consecutive ones fold into a single
 # expander row), and the only `+++` we ever emit is the failure summary at the
 # very end. Without that, a red job opened on `docker rmi` output.
-echo "~~~ Cleaning up old Docker images and cache"
-bash "${SCRIPT_DIR}/cleanup_docker.sh"
-
+# Pull before cleaning up, and keep the image afterwards: layers this build
+# shares with the last one (all but the per-commit ones, see
+# docker/build_image.sh --cache-from) are then already on disk, so the pull
+# fetches only what changed. Cleaning up first deleted them and made every job
+# download the whole image.
 # -q: the layer-by-layer pull progress is ~600 lines of a ~2000-line job log.
 echo "~~~ Pulling Docker Image: ${IMAGE_TAG}"
 docker pull -q "${IMAGE_TAG}"
+
+echo "~~~ Cleaning up old Docker images and cache"
+bash "${SCRIPT_DIR}/cleanup_docker.sh" "${IMAGE_TAG}"
 
 HOST_CACHE_ROOT="/mnt/disks/persist"
 if [[ "${CPU_ONLY:-0}" == "1" ]]; then
@@ -185,8 +190,8 @@ find perf_eval_results/ -type l ! -exec test -e {} \; -delete 2>/dev/null || tru
 
 echo "[INFO] Docker finished with exit code ${DOCKER_EXIT_CODE}."
 
-echo "~~~ Cleaning up pulled Docker image"
-docker rmi "${IMAGE_TAG}" >/dev/null 2>&1 || true
+# The pulled image stays: the next job's cleanup removes it after that job's
+# own pull, by which point its shared layers have been reused.
 
 # Must be the last thing printed: `+++` is expanded by default, and its mere
 # presence stops Buildkite from expanding the trailing cleanup group instead.

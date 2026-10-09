@@ -40,15 +40,42 @@ fi
 # Include vLLM commit SHA in the image tag for registry isolation
 IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}-${VLLM_COMMIT_HASH}${IMAGE_SUFFIX}"
 
+# Layer cache: every build reuses the layers of the latest main build's image
+# whose inputs are unchanged, so usually only the layers from `COPY . .` on are
+# rebuilt, pushed and pulled. Only main post-merge builds move the tag (below),
+# so a PR's layers never become every other build's cache.
+CACHE_REF="${IMAGE_REPO}:buildcache${IMAGE_SUFFIX}"
+# DOCKER_CACHE_FROM (build env) reads the layers from another image instead,
+# e.g. an earlier build's, to try the cache on a branch without moving the tag.
+CACHE_FROM="${DOCKER_CACHE_FROM:-${CACHE_REF}}"
+CACHE_ARGS=(--cache-epoch "$(date -u +%G-W%V)")
+if docker manifest inspect "${CACHE_FROM}" >/dev/null 2>&1; then
+  CACHE_ARGS+=(--cache-from "${CACHE_FROM}")
+else
+  echo "No ${CACHE_FROM} yet; building without the layer cache."
+fi
+
 echo "--- Building Docker Image: ${IMAGE_TAG} (target: ${TARGET})"
 # Run build_image.sh and pass VLLM_COMMIT_HASH directly as a build argument
-./docker/build_image.sh --target "${TARGET}" -t "${IMAGE_TAG}" -c "${VLLM_COMMIT_HASH}"
+./docker/build_image.sh --target "${TARGET}" -t "${IMAGE_TAG}" -c "${VLLM_COMMIT_HASH}" "${CACHE_ARGS[@]}"
 
 # Publish image tag metadata for downstream test steps
 buildkite-agent meta-data set "CI_IMAGE_TAG${IMAGE_SUFFIX:-}" "${IMAGE_TAG}"
 
 echo "--- Pushing Docker Image to Registry"
 docker push "${IMAGE_TAG}"
+
+# The integration pipeline also builds main, but against vLLM HEAD; its layers
+# would make the next pinned build miss from the dependency install on.
+if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "vllm-torchtpu-ci" \
+      && "${BUILDKITE_BRANCH:-}" == "main" \
+      && "${BUILDKITE_PULL_REQUEST:-false}" == "false" \
+      && -z "${VLLM_COMMIT_HASH_OVERRIDE:-}" ]]; then
+  echo "--- Moving ${CACHE_REF} to this image"
+  docker tag "${IMAGE_TAG}" "${CACHE_REF}"
+  docker push "${CACHE_REF}"
+  docker rmi "${CACHE_REF}" >/dev/null 2>&1 || true
+fi
 
 echo "--- Cleaning up local built image"
 docker rmi "${IMAGE_TAG}" || true
