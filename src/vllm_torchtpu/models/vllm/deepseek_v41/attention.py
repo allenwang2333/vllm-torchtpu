@@ -947,11 +947,11 @@ class VllmDeepseekV41MLAAttention(
     ) -> bool:
         if not envs.VLLM_DSV41_FUSED_SEAM_QUANT:
             return False
-        w_s = getattr(self.fused_wqa_wkv, "weight_scale", None)
+        w_s = self.fused_wqa_wkv._parameters.get("weight_scale", None)
         if (
             w_s is None
             or w_s.ndim != 1
-            or getattr(self.fused_wqa_wkv, "bias", None) is not None
+            or self.fused_wqa_wkv._parameters.get("bias", None) is not None
         ):
             return False
         if not token_sharded:
@@ -984,16 +984,21 @@ class VllmDeepseekV41MLAAttention(
         hidden_states: torch.Tensor,
         hidden_states_fp8: torch.Tensor | None,
         hidden_states_scale: torch.Tensor | None,
+        w_wqa: torch.Tensor | None = None,
+        ws_wqa: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        weight = self.fused_wqa_wkv.weight if w_wqa is None else w_wqa
+        weight_scale = (
+            self.fused_wqa_wkv.weight_scale if ws_wqa is None else ws_wqa
+        )
         if hidden_states_fp8 is not None and hidden_states_scale is not None:
-            weight = self.fused_wqa_wkv.weight
             if getattr(self.fused_wqa_wkv, KEEP_VLLM_LAYOUT_ATTR, False):
                 weight = weight.transpose(0, 1)
             return quantized_matmul_prequant(
                 hidden_states_fp8,
                 hidden_states_scale,
                 weight,
-                self.fused_wqa_wkv.weight_scale,
+                weight_scale,
             )
         return self.fused_wqa_wkv(hidden_states)[0]
 
@@ -1238,12 +1243,19 @@ class VllmDeepseekV41MLAAttention(
             and (not self._tp_attn_encoder_only or self._in_encoder_stage)
             and self._tp_attn_ready(num_tokens, tp_size)
         )
-        wq_b_s = getattr(self.wq_b, "weight_scale", None)
+        w_wqa = self.fused_wqa_wkv.weight
+        ws_wqa = self.fused_wqa_wkv._parameters.get("weight_scale", None)
+        w_qnorm = self.q_norm.weight
+        w_kvnorm = self.kv_norm.weight
+        w_wqb = self.wq_b.weight
+        ws_wqb = self.wq_b._parameters.get("weight_scale", None)
+        wq_b_s = ws_wqb
+        has_wqb_bias = self.wq_b._parameters.get("bias", None) is not None
         if use_tp_attn:
             use_fused_q_rope = bool(
                 envs.VLLM_DSV41_FUSED_Q_ROPE
                 and self._tp_attn_wq_b_s.ndim == 1
-                and getattr(self.wq_b, "bias", None) is None
+                and not has_wqb_bias
                 and (self.n_local_heads * tp_size) % 8 == 0
             )
         else:
@@ -1251,7 +1263,7 @@ class VllmDeepseekV41MLAAttention(
                 envs.VLLM_DSV41_FUSED_Q_ROPE
                 and wq_b_s is not None
                 and wq_b_s.ndim == 1
-                and getattr(self.wq_b, "bias", None) is None
+                and not has_wqb_bias
                 and self.n_local_heads % 8 == 0
             )
         rank_idx = (
@@ -1272,7 +1284,7 @@ class VllmDeepseekV41MLAAttention(
         use_qkv_prequant = (
             use_fused_q_rope
             and (not token_sharded_qkv or use_tp_attn)
-            and getattr(self.q_norm, "weight", None) is not None
+            and ("weight" in self.q_norm._parameters)
             and (
                 self.indexer is None
                 or getattr(self.indexer, "can_accept_prequant_query", lambda: False)()
@@ -1283,13 +1295,17 @@ class VllmDeepseekV41MLAAttention(
                 tp_rank = get_tensor_model_parallel_rank()
                 positions_local = tp_shard_slice(positions, tp_size, tp_rank, rank_idx)
             qr_kv_local = self._apply_fused_wqa_wkv(
-                hidden_states, hidden_states_fp8, hidden_states_scale
+                hidden_states,
+                hidden_states_fp8,
+                hidden_states_scale,
+                w_wqa=w_wqa,
+                ws_wqa=ws_wqa,
             )
             if use_qkv_prequant:
                 qr_q_fp8, qr_q_scale, kv_local = self.qkv_norm_rope_quant_op(
                     qr_kv_local,
-                    self.q_norm.weight,
-                    self.kv_norm.weight,
+                    w_qnorm,
+                    w_kvnorm,
                     positions_local,
                     cos_sin,
                 )
@@ -1303,7 +1319,7 @@ class VllmDeepseekV41MLAAttention(
                 )
                 qr_local = self.q_norm(qr_local)
                 kv_local = self.kvnorm_rope_op(
-                    kv_local, self.kv_norm.weight, positions_local, cos_sin
+                    kv_local, w_kvnorm, positions_local, cos_sin
                 )
                 if use_tp_idx:
                     qr_for_indexer = qr_local
@@ -1324,13 +1340,17 @@ class VllmDeepseekV41MLAAttention(
                 hidden_states_fp8 = None
                 hidden_states_scale = None
             qr_kv = self._apply_fused_wqa_wkv(
-                hidden_states, hidden_states_fp8, hidden_states_scale
+                hidden_states,
+                hidden_states_fp8,
+                hidden_states_scale,
+                w_wqa=w_wqa,
+                ws_wqa=ws_wqa,
             )
             if use_qkv_prequant:
                 qr_fp8, qr_scale, kv = self.qkv_norm_rope_quant_op(
                     qr_kv,
-                    self.q_norm.weight,
-                    self.kv_norm.weight,
+                    w_qnorm,
+                    w_kvnorm,
                     positions,
                     cos_sin,
                 )
@@ -1351,7 +1371,7 @@ class VllmDeepseekV41MLAAttention(
             else:
                 qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
                 qr = self.q_norm(qr)
-                kv = self.kvnorm_rope_op(kv, self.kv_norm.weight, positions, cos_sin)
+                kv = self.kvnorm_rope_op(kv, w_kvnorm, positions, cos_sin)
 
         if use_tp_attn:
             if qr_q_fp8 is not None and qr_q_scale is not None:
@@ -1385,7 +1405,7 @@ class VllmDeepseekV41MLAAttention(
                     q = self.q_rope_op(q, positions_local, cos_sin)
         else:
             if qr_q_fp8 is not None and qr_q_scale is not None:
-                wq_b_w = self.wq_b.weight
+                wq_b_w = w_wqb
                 if getattr(self.wq_b, KEEP_VLLM_LAYOUT_ATTR, False):
                     wq_b_w = wq_b_w.transpose(0, 1)
                 assert wq_b_s is not None
@@ -1399,7 +1419,7 @@ class VllmDeepseekV41MLAAttention(
                 )
             elif use_fused_q_rope:
                 assert qr is not None and wq_b_s is not None
-                wq_b_w = self.wq_b.weight
+                wq_b_w = w_wqb
                 if getattr(self.wq_b, KEEP_VLLM_LAYOUT_ATTR, False):
                     wq_b_w = wq_b_w.transpose(0, 1)
                 q = self.wq_b_q_rope_op(

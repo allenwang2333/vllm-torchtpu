@@ -98,11 +98,11 @@ class DeepseekV4MLP(nn.Module):
     def can_accept_prequant_hidden(self, *, token_sharded: bool = False) -> bool:
         if not envs.VLLM_DSV41_FUSED_SEAM_QUANT:
             return False
-        w_s = getattr(self.gate_up_proj, "weight_scale", None)
+        w_s = self.gate_up_proj._parameters.get("weight_scale", None)
         ok = (
             w_s is not None
             and w_s.ndim == 1
-            and getattr(self.gate_up_proj, "bias", None) is None
+            and self.gate_up_proj._parameters.get("bias", None) is None
         )
         return ok and not token_sharded
 

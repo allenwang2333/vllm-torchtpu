@@ -580,11 +580,11 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         kv_cache.copy_(new_kv_cache)
 
     def can_accept_prequant_query(self) -> bool:
-        w_s = getattr(self.wq_b, "weight_scale", None)
+        w_s = self.wq_b._parameters.get("weight_scale", None)
         return (
             w_s is not None
             and w_s.ndim == 1
-            and getattr(self.wq_b, "bias", None) is None
+            and self.wq_b._parameters.get("bias", None) is None
         )
 
     def _apply_wq_b(

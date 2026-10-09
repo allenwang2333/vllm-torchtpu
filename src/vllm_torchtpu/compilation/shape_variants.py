@@ -156,7 +156,9 @@ def _signature(graph: fx.GraphModule) -> tuple:
         value = node.meta.get("example_value", node.meta.get("val"))
         if value is not None:
             tgt = str(node.target)
-            sig.append((tgt if tgt.startswith("L_self_") else None, shape(value)))
+            sig.append(
+                (tgt if tgt.lower().startswith("l_self_") else None, shape(value))
+            )
     return tuple(sig)
 
 
@@ -197,15 +199,19 @@ class BucketExecutables:
         if found is None:
             return None
         runnable, signature = found
-        if signature != _signature(graph):
-            raise ShapeSpecializationError(
-                f"{key} was compiled by another trace of this model whose "
-                f"inputs differ ({signature} vs {_signature(graph)}). The "
-                "graph is split, so its subgraph boundaries move with the "
-                "specialization and a bucket cannot be handed between traces; "
-                "unset TPU_KERNEL_ITER_MODE to serve this model."
-            )
-        return runnable
+        caller_sig = _signature(graph)
+        if signature == caller_sig:
+            return runnable
+        if (
+            len(signature) == len(caller_sig)
+            and len(set(signature)) == len(signature)
+            and set(signature) == set(caller_sig)
+        ):
+            pos_in_caller = {item: idx for idx, item in enumerate(caller_sig)}
+            perm = tuple(pos_in_caller[item] for item in signature)
+            orig_runnable = runnable
+            return lambda *args: orig_runnable(*(args[i] for i in perm))
+        return None
 
     def put(
         self,

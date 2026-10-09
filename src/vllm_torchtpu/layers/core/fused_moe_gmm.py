@@ -344,7 +344,12 @@ def prepare_routed_gmm_inputs(
         onehot = jax.nn.one_hot(
             token_indices_sorted, num_tokens_local, dtype=hidden_states_local.dtype
         )
-        x = onehot @ hidden_states_local
+        if skip_padded_tokens:
+            active_rows = (topk_weights_local != 0).any(axis=-1, keepdims=True)
+            hidden_states_clean = jnp.where(active_rows, hidden_states_local, 0)
+        else:
+            hidden_states_clean = hidden_states_local
+        x = onehot @ hidden_states_clean
         return (
             x,
             group_sizes_local,
