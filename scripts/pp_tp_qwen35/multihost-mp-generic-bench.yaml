@@ -303,6 +303,13 @@ spec:
                     done
 
                     if [[ "${RUN_EVAL,,}" == "true" ]]; then
+                      rm -rf "${SITEDIR}"
+                      unset PYTHONPATH
+                      export VLLM_PLUGINS=""
+                      export VLLM_TARGET_DEVICE=empty
+                      export JAX_PLATFORMS=cpu
+                      export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+
                       mkdir -p /tmp/infx_tasks "${CDK_OUTPUT_DIR:-/tmp}/eval_suite_a" "${CDK_OUTPUT_DIR:-/tmp}/eval_suite_b1"
                       cp /workspace/vllm-torchtpu/scripts/pp_tp_qwen35/gsm8k_infx.yaml /tmp/infx_tasks/gsm8k_infx.yaml
 
@@ -316,7 +323,7 @@ spec:
 
                       echo "=== Suite B1: Standard lm_eval GSM8K (local-chat-completions --apply_chat_template) ==="
                       lm_eval --model local-chat-completions --apply_chat_template \
-                        --model_args "model=${MODEL_ID},base_url=http://${VLLM_SERVER_DNS}:${SERVER_PORT}/v1/chat/completions,num_concurrent=16,max_retries=5,timeout=1800" \
+                        --model_args "model=${MODEL_ID},base_url=http://${VLLM_SERVER_DNS}:${SERVER_PORT}/v1/chat/completions,num_concurrent=16,max_retries=5,timeout=1800,tokenized_requests=False" \
                         --tasks gsm8k \
                         --output_path "${CDK_OUTPUT_DIR:-/tmp}/eval_suite_b1" || true
                     fi
