@@ -53,6 +53,10 @@ from vllm_torchtpu.kernels.deepseek_v41.streamindex_topk import (
     compute_indexer_step_metadata_jax,
     compute_meta_buf_len,
 )
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    quantized_matmul_prequant,
+)
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
@@ -186,10 +190,16 @@ class VllmDeepseekV41Compressor(dsv41_compressor.DeepseekCompressor):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        num_tokens = positions.shape[0]
         if not self.has_gate:
-            return self.norm(self.fused_wkv_wgate(hidden_states))
+            latent = self.norm(self.fused_wkv_wgate(hidden_states))
+            if latent.shape[0] != num_tokens:
+                latent = tp_all_gather(latent, dim=0)
+            return latent
 
         wkv_wgate = self.fused_wkv_wgate(hidden_states.float())
+        if wkv_wgate.shape[0] != num_tokens:
+            wkv_wgate = tp_all_gather(wkv_wgate, dim=0)
         assert self.state_cache is not None
         attn_ctx = get_forward_context().attn_metadata
         state_entry = getattr(self.state_cache, "kv_cache", None)
@@ -569,10 +579,39 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         )
         kv_cache.copy_(new_kv_cache)
 
+    def can_accept_prequant_query(self) -> bool:
+        w_s = getattr(self.wq_b, "weight_scale", None)
+        return (
+            w_s is not None
+            and w_s.ndim == 1
+            and getattr(self.wq_b, "bias", None) is None
+        )
+
+    def _apply_wq_b(
+        self,
+        query: torch.Tensor | None,
+        query_fp8: torch.Tensor | None = None,
+        query_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if query_fp8 is not None and query_scale is not None:
+            weight = self.wq_b.weight
+            if getattr(self.wq_b, KEEP_VLLM_LAYOUT_ATTR, False):
+                weight = weight.transpose(0, 1)
+            if query_scale.ndim == 2 and query_scale.shape[1] > 1:
+                query_scale = query_scale[:, :1]
+            return quantized_matmul_prequant(
+                query_fp8,
+                query_scale,
+                weight,
+                self.wq_b.weight_scale,
+            )
+        assert query is not None
+        return self.wq_b(query)[0]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
-        query: torch.Tensor,
+        query: torch.Tensor | None,
         indexer_weights: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
@@ -581,12 +620,14 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         step_metadata_fn: Any = None,
         tp_rank_idx: torch.Tensor | None = None,
         keep_topk_local: bool = False,
+        query_fp8: torch.Tensor | None = None,
+        query_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del hidden_states
         num_tokens = positions.shape[0]
         kv_cache = _as_kernel_cache_view(getattr(self.k_cache, "kv_cache", None))
         if kv_cache is None:
-            return query.new_zeros((num_tokens, self.topk_tokens), dtype=torch.int32)
+            return positions.new_zeros((num_tokens, self.topk_tokens), dtype=torch.int32)
 
         attn_ctx = get_forward_context().attn_metadata
         assert isinstance(attn_ctx, dict)
@@ -609,9 +650,21 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
             def local(x: torch.Tensor) -> torch.Tensor:
                 if x.shape[0] == t_local:
                     return x
+                if x.element_size() == 1:
+                    return tp_shard_slice(
+                        x.view(torch.uint8), tp_size, tp_rank, rank_idx
+                    ).view(x.dtype)
                 return tp_shard_slice(x, tp_size, tp_rank, rank_idx)
 
-            q_proj = self.wq_b(local(query))[0].view(-1, self.n_head, self.head_dim)
+            if query_fp8 is not None and query_scale is not None:
+                q_proj = self._apply_wq_b(
+                    None, local(query_fp8), local(query_scale)
+                ).view(-1, self.n_head, self.head_dim)
+            else:
+                assert query is not None
+                q_proj = self._apply_wq_b(local(query)).view(
+                    -1, self.n_head, self.head_dim
+                )
             op_args = (
                 rank_idx.to(torch.int32),
                 q_proj,
@@ -637,7 +690,9 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         else:
             # wq_b / weights_proj are replicated, so every rank scores all heads
             # and all tokens against its replicated K cache.
-            q_proj = self.wq_b(query)[0].view(-1, self.n_head, self.head_dim)
+            q_proj = self._apply_wq_b(query, query_fp8, query_scale).view(
+                -1, self.n_head, self.head_dim
+            )
             if step_metadata is None and step_metadata_fn is not None:
                 step_metadata = step_metadata_fn()
             meta_args: tuple[torch.Tensor, ...] = ()

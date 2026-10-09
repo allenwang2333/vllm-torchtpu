@@ -636,3 +636,80 @@ def fused_wq_b_q_rope_projection(
             name=name,
         )(qr_fp8, wq_b, w_s_2d, cos_sin, lhs_s_128)
     return out[:num_tokens] if pad_t > 0 else out
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("head_dim", "cap_t", "name"),
+)
+def fused_wq_b_q_rope_prequant_projection(
+    qr_fp8: jax.Array,  # [T, K] fp8_e4m3fn
+    qr_s_128: jax.Array,  # [T, LANE] float32
+    positions: jax.Array,  # [T] int32
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    wq_b: jax.Array,  # [K, H_q * head_dim] fp8
+    wq_b_scale: jax.Array,  # [H_q * head_dim] float32
+    *,
+    head_dim: int,
+    cap_t: int = 512,
+    name: str = "wq_b_q_rope_prequant_projection",
+) -> jax.Array:
+    """Fused wq_b projection + forward RoPE consuming pre-quantized (qr_fp8, qr_s_128)."""
+    assert qr_fp8.ndim == 2 and qr_fp8.dtype == jnp.float8_e4m3fn
+    assert wq_b.ndim == 2
+    num_tokens, k_dim = qr_fp8.shape
+    wq_k, out_features = wq_b.shape
+    assert k_dim == wq_k
+    assert out_features % head_dim == 0
+    num_heads = out_features // head_dim
+    heads_per_group = SUBLANE
+    assert num_heads % heads_per_group == 0
+    num_groups = num_heads // heads_per_group
+    cols_per_g = heads_per_group * head_dim
+
+    pad_t = (SUBLANE - (num_tokens % SUBLANE)) % SUBLANE
+    if pad_t > 0:
+        qr_fp8 = jnp.pad(qr_fp8, ((0, pad_t), (0, 0)))
+        qr_s_128 = jnp.pad(qr_s_128, ((0, pad_t), (0, 0)), constant_values=1.0)
+        positions = jnp.pad(positions, (0, pad_t))
+    t_pad = qr_fp8.shape[0]
+    eff_cap_t = 1024 if (num_heads >= 64 and t_pad >= 1024 and cap_t == 512) else cap_t
+    tile_t = SUBLANE * _largest_divisor(t_pad // SUBLANE, cap=eff_cap_t // SUBLANE)
+    sub_t = SUBLANE * _largest_divisor(tile_t // SUBLANE, cap=128 // SUBLANE)
+    num_t_tiles = t_pad // tile_t
+
+    cos_sin = gather_cos_sin(
+        positions,
+        cos_sin_cache,
+        inverse=False,
+        name=f"{name}_gather_cos_sin",
+    )
+    w_s_2d = wq_b_scale.reshape(1, out_features).astype(jnp.float32)
+
+    out = pl.pallas_call(
+        functools.partial(
+            _wq_b_q_rope_kernel,
+            tile_t=tile_t,
+            num_sub_t=tile_t // sub_t,
+            heads_per_group=heads_per_group,
+            head_dim=head_dim,
+        ),
+        out_shape=jax.ShapeDtypeStruct((t_pad, num_heads, head_dim), jnp.bfloat16),
+        grid=(num_groups, num_t_tiles),
+        in_specs=[
+            pl.BlockSpec((tile_t, k_dim), lambda g, t: (t, 0)),
+            pl.BlockSpec((k_dim, cols_per_g), lambda g, t: (0, g)),
+            pl.BlockSpec((1, cols_per_g), lambda g, t: (0, g)),
+            pl.BlockSpec((tile_t, 2 * LANE), lambda g, t: (t, 0)),
+            pl.BlockSpec((tile_t, LANE), lambda g, t: (t, 0)),
+        ],
+        out_specs=pl.BlockSpec(
+            (tile_t, heads_per_group, head_dim), lambda g, t: (t, g, 0)
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+    )(qr_fp8, wq_b, w_s_2d, cos_sin, qr_s_128)
+    return out[:num_tokens] if pad_t > 0 else out

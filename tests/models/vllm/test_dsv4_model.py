@@ -373,3 +373,93 @@ def test_dsv4_mlp_and_moe_prequant_forwarding(monkeypatch):
     assert len(prequant_calls) == 2
     assert mlp._prequant == [None, None]
     torch.testing.assert_close(out_moe, out_direct)
+
+
+@pytest.mark.cpu_test
+def test_dsv41_attention_qkv_prequant_and_compressor_token_sharded(monkeypatch):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41 import (
+        deepseek_v41_flash_compressor as comp_mod,
+    )
+    from vllm_torchtpu.models.vllm.deepseek_v41 import attention as attn_mod
+
+    prequant_calls = []
+
+    def fake_prequant(x_q, x_s, w_q, w_s):
+        prequant_calls.append((x_q, x_s, w_q, w_s))
+        return (x_q.float() * x_s) @ w_q.float() * w_s
+
+    monkeypatch.setattr(comp_mod, "quantized_matmul_prequant", fake_prequant)
+    monkeypatch.setattr(envs, "VLLM_DSV41_FUSED_SEAM_QUANT", True)
+
+    idx = comp_mod.VllmDeepseekV41Indexer.__new__(
+        comp_mod.VllmDeepseekV41Indexer
+    )
+    nn.Module.__init__(idx)
+    idx.wq_b = nn.Module()
+    idx.wq_b.weight = nn.Parameter(torch.ones(8, 16))
+    idx.wq_b.weight_scale = nn.Parameter(torch.full((16,), 0.5))
+    idx.wq_b.bias = None
+    assert idx.can_accept_prequant_query() is True
+
+    q_fp8 = torch.full((4, 8), 2.0)
+    q_s = torch.full((4, 128), 0.25)
+    out_idx = idx._apply_wq_b(None, q_fp8, q_s)
+    assert len(prequant_calls) == 1
+    assert prequant_calls[0][1].shape == (4, 1)
+    assert out_idx.shape == (4, 16)
+
+    monkeypatch.setattr(
+        attn_mod, "get_tensor_model_parallel_world_size", lambda: 8
+    )
+    attn = attn_mod.VllmDeepseekV41MLAAttention.__new__(
+        attn_mod.VllmDeepseekV41MLAAttention
+    )
+    nn.Module.__init__(attn)
+    attn.fused_wqa_wkv = nn.Module()
+    attn.fused_wqa_wkv.weight = nn.Parameter(torch.ones(16, 8))
+    attn.fused_wqa_wkv.weight_scale = nn.Parameter(torch.ones(8))
+    attn.fused_wqa_wkv.bias = None
+    attn.compressor = nn.Module()
+    attn.indexer = SimpleNamespace(use_tp_indexer=lambda n: n % 8 == 0)
+    attn._ced_global_from_encoder = False
+
+    # Token-sharded prequant is accepted even on compressor layers (0 & 20).
+    assert attn.can_accept_prequant_hidden(64, token_sharded=True) is True
+    assert attn.can_accept_prequant_hidden(60, token_sharded=True) is False
+
+    qr_kv = torch.zeros((4, 2048), dtype=torch.bfloat16)
+    q_w = torch.ones((1536,), dtype=torch.bfloat16)
+    kv_w = torch.ones((512,), dtype=torch.bfloat16)
+    pos = torch.arange(4, dtype=torch.int32)
+    cs = torch.zeros((16, 64), dtype=torch.float32)
+    f_q_fp8, f_q_s, f_kv = attn_mod._fake_qkv_norm_rope_quant(
+        qr_kv, q_w, kv_w, pos, cs
+    )
+    assert f_q_fp8.shape == (4, 1536) and f_q_fp8.dtype == torch.float8_e4m3fn
+    assert f_q_s.shape == (4, 128) and f_q_s.dtype == torch.float32
+    assert f_kv.shape == (4, 512) and f_kv.dtype == torch.bfloat16
+
+    wq_b = torch.zeros((1536, 4096), dtype=torch.float8_e4m3fn)
+    wq_b_s = torch.ones((4096,), dtype=torch.float32)
+    f_q = attn_mod._fake_wq_b_q_rope_prequant(
+        f_q_fp8, f_q_s, pos, cs, wq_b, wq_b_s, head_dim=512
+    )
+    assert f_q.shape == (4, 8, 512) and f_q.dtype == torch.bfloat16
+
+    gathered = []
+    monkeypatch.setattr(
+        comp_mod,
+        "tp_all_gather",
+        lambda x, dim=0: (gathered.append(x.shape), x.repeat(2, 1))[1],
+    )
+    comp = comp_mod.VllmDeepseekV41Compressor.__new__(
+        comp_mod.VllmDeepseekV41Compressor
+    )
+    nn.Module.__init__(comp)
+    comp.has_gate = False
+    comp.fused_wkv_wgate = lambda h: h[:, :4]
+    comp.norm = lambda z: z * 2.0
+    lat = comp(torch.ones((2, 8)), torch.arange(4))
+    assert gathered == [torch.Size([2, 4])]
+    assert lat.shape == (4, 4)

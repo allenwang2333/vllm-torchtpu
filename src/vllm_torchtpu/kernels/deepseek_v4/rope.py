@@ -20,11 +20,12 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.layers.core.quantization import dtype_max
+from vllm_torchtpu.layers.core.quantization import FP8_E4M3_MAX, dtype_max
 from vllm_torchtpu.utils import largest_divisor
 
 # Native lane count; the roped channels are the tail of the last lane block.
 LANE = 128
+SUBLANE = 8
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
@@ -784,3 +785,125 @@ def rmsnorm_rope(
         ),
         name=name,
     )(x, w_reshaped, cos_sin)
+
+
+def _qkv_norm_rope_quant_body(
+    qr_kv_ref: jax.Ref,
+    q_w_ref: jax.Ref,
+    kv_w_ref: jax.Ref,
+    cos_sin_ref: jax.Ref,
+    qr_fp8_ref: jax.Ref,
+    qr_s_ref: jax.Ref,
+    kv_out_ref: jax.Ref,
+    *,
+    q_dim: int,
+    q_eps: float,
+    kv_eps: float,
+    out_dtype: jnp.dtype,
+) -> None:
+    """Fused q_norm + FP8 dynamic quant + kv_norm + RoPE on a (tile_n, q_dim + kv_dim) chunk."""
+    qr_kv = qr_kv_ref[...]
+    q_x = qr_kv[:, :q_dim].astype(jnp.float32)
+    kv_x = qr_kv[:, q_dim:].astype(jnp.float32)
+
+    q_rms = jax.lax.rsqrt(jnp.mean(q_x * q_x, axis=-1, keepdims=True) + q_eps)
+    qr_normed = (q_x * q_rms).astype(out_dtype) * q_w_ref[...]
+    qr_f32 = qr_normed.astype(jnp.float32)
+    abs_max = jnp.max(jnp.abs(qr_f32), axis=-1, keepdims=True)
+    lhs_s = abs_max / FP8_E4M3_MAX
+    lhs_s_safe = jnp.where(lhs_s == 0.0, 1.0, lhs_s)
+    qr_fp8_ref[...] = jnp.clip(
+        qr_f32 / lhs_s_safe, -FP8_E4M3_MAX, FP8_E4M3_MAX
+    ).astype(jnp.float8_e4m3fn)
+    qr_s_ref[...] = jnp.broadcast_to(lhs_s_safe, (qr_kv.shape[0], LANE))
+
+    kv_rms = jax.lax.rsqrt(jnp.mean(kv_x * kv_x, axis=-1, keepdims=True) + kv_eps)
+    kv_normed = (kv_x * kv_rms).astype(out_dtype) * kv_w_ref[...]
+    tail = kv_normed[:, -LANE:].astype(jnp.float32)
+    cs = cos_sin_ref[...]
+    cos = cs[:, :LANE]
+    sin = cs[:, LANE:]
+    roped = (tail * cos + _rotate_gptj(tail) * sin).astype(out_dtype)
+    kv_out_ref[...] = jnp.concatenate([kv_normed[:, :-LANE], roped], axis=-1)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("eps", "q_eps", "kv_eps", "inverse", "name"),
+)
+def qkv_norm_rope_quant(
+    qr_kv: jax.Array,  # [num_tokens, q_dim + kv_dim]
+    q_weight: jax.Array,  # [q_dim]
+    kv_weight: jax.Array,  # [kv_dim]
+    positions: jax.Array,  # [num_tokens] int
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    *,
+    eps: float = 1e-6,
+    q_eps: float | None = None,
+    kv_eps: float | None = None,
+    inverse: bool = False,
+    name: str = "qkv_norm_rope_quant",
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Fused q_norm + qr FP8 quant + kv_norm + RoPE in a single Pallas kernel."""
+    assert qr_kv.ndim == 2
+    num_tokens, total_dim = qr_kv.shape
+    q_dim = q_weight.shape[0]
+    kv_dim = kv_weight.shape[0]
+    assert total_dim == q_dim + kv_dim
+    assert q_dim % LANE == 0 and kv_dim % LANE == 0
+    assert positions.ndim == 1 and positions.shape[0] == num_tokens
+
+    pad_t = (SUBLANE - (num_tokens % SUBLANE)) % SUBLANE
+    if pad_t > 0:
+        qr_kv = jnp.pad(qr_kv, ((0, pad_t), (0, 0)))
+        positions = jnp.pad(positions, (0, pad_t))
+    t_pad = qr_kv.shape[0]
+    if t_pad <= 64:
+        cap_n = 32
+    elif t_pad in (128, 512):
+        cap_n = 64
+    elif t_pad in (256, 2048):
+        cap_n = 128
+    else:
+        cap_n = 256
+    tile_n = SUBLANE * largest_divisor(t_pad // SUBLANE, cap=cap_n // SUBLANE)
+    cos_sin = _expand_cos_sin(positions, cos_sin_cache, inverse=inverse)
+    q_w_2d = q_weight.astype(qr_kv.dtype).reshape(1, q_dim)
+    kv_w_2d = kv_weight.astype(qr_kv.dtype).reshape(1, kv_dim)
+    eff_q_eps = eps if q_eps is None else q_eps
+    eff_kv_eps = eps if kv_eps is None else kv_eps
+
+    qr_fp8, qr_s_128, kv_out = pl.pallas_call(
+        functools.partial(
+            _qkv_norm_rope_quant_body,
+            q_dim=q_dim,
+            q_eps=eff_q_eps,
+            kv_eps=eff_kv_eps,
+            out_dtype=qr_kv.dtype,
+        ),
+        out_shape=(
+            jax.ShapeDtypeStruct((t_pad, q_dim), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((t_pad, LANE), jnp.float32),
+            jax.ShapeDtypeStruct((t_pad, kv_dim), qr_kv.dtype),
+        ),
+        grid=(t_pad // tile_n,),
+        in_specs=[
+            pl.BlockSpec((tile_n, total_dim), lambda i: (i, 0)),
+            pl.BlockSpec((1, q_dim), lambda i: (0, 0)),
+            pl.BlockSpec((1, kv_dim), lambda i: (0, 0)),
+            pl.BlockSpec((tile_n, 2 * LANE), lambda i: (i, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((tile_n, q_dim), lambda i: (i, 0)),
+            pl.BlockSpec((tile_n, LANE), lambda i: (i, 0)),
+            pl.BlockSpec((tile_n, kv_dim), lambda i: (i, 0)),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+    )(qr_kv, q_w_2d, kv_w_2d, cos_sin)
+    if pad_t > 0:
+        return qr_fp8[:num_tokens], qr_s_128[:num_tokens], kv_out[:num_tokens]
+    return qr_fp8, qr_s_128, kv_out
