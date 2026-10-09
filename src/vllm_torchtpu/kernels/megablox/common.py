@@ -40,15 +40,21 @@ def tpu_generation() -> int:
     raise NotImplementedError("only TPU devices are supported")
 
 
+_GMM_SCALAR_DTYPES = (
+    jnp.bfloat16,
+    jnp.float32,
+    jnp.float8_e4m3fn,
+    jnp.float8_e5m2,
+    jnp.int8,
+    jnp.int4,
+    jnp.float4_e2m1fn,
+    jnp.uint4,
+)
+_SUPPORTED_GMM_DTYPES = frozenset(
+    (*_GMM_SCALAR_DTYPES, *(jnp.dtype(dt) for dt in _GMM_SCALAR_DTYPES))
+)
+
+
 def assert_is_supported_dtype(dtype: jnp.dtype) -> None:
-    if dtype not in [
-        jnp.bfloat16,
-        jnp.float32,
-        jnp.float8_e4m3fn,
-        jnp.float8_e5m2,
-        jnp.int8,
-        jnp.int4,
-        jnp.float4_e2m1fn,
-        jnp.uint4,
-    ]:
+    if dtype not in _SUPPORTED_GMM_DTYPES:
         raise ValueError(f"No support for {dtype=}.")

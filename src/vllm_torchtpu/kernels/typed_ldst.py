@@ -32,8 +32,9 @@ import jax.numpy as jnp
 
 def _typed_view(block_ref, view_dtype, lane_split: int):
     """Raw block ref as a ``(rows, lanes // lane_split)`` view_dtype ref."""
-    if jnp.dtype(block_ref.dtype) != jnp.dtype(view_dtype):
-        block_ref = block_ref.bitcast(jnp.dtype(view_dtype))
+    target_dtype = jnp.dtype(view_dtype)
+    if jnp.dtype(block_ref.dtype) != target_dtype:
+        block_ref = block_ref.bitcast(target_dtype)
     return block_ref.reshape(-1, block_ref.shape[-1] // lane_split)
 
 
