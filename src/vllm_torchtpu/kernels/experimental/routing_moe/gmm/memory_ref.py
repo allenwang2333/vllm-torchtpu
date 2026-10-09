@@ -231,7 +231,12 @@ class CustomBufferedRef(pltpu.BufferedRef):
       idx_ref=None,
       **kwargs,
   ):
-    standard_ref = pltpu.BufferedRef.create(*args, **kwargs)
+    orig_post_init = pltpu.BufferedRef.__post_init__
+    try:
+      pltpu.BufferedRef.__post_init__ = lambda self: None
+      standard_ref = pltpu.BufferedRef.create(*args, **kwargs)
+    finally:
+      pltpu.BufferedRef.__post_init__ = orig_post_init
     return cls(
         metadata_ref=metadata,
         src_ref=src_ref,
