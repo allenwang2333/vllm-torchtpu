@@ -31,6 +31,7 @@ class StepTimingLog:
         self._bucket: int | None = None
         self._periods: dict[int, list[float]] = defaultdict(list)
         self._sync_s: list[float] = []
+        self._result_wait_s: list[float] = []
         self._steps = 0
 
     def step_start(self) -> None:
@@ -49,6 +50,11 @@ class StepTimingLog:
         if self._steps % self._every == 0:
             self._flush()
 
+    def result_wait(self, seconds: float) -> None:
+        # Host time blocked on the previous step's sampled-token copy: near
+        # zero means the host, not the device, sets the step period.
+        self._result_wait_s.append(seconds)
+
     def _flush(self) -> None:
         total = sum(len(v) for v in self._periods.values())
         if total == 0:
@@ -63,16 +69,20 @@ class StepTimingLog:
                 f"p90={np.percentile(p, 90):.1f}"
             )
         sync = np.asarray(self._sync_s) * 1e3
+        wait = np.asarray(self._result_wait_s or [0.0]) * 1e3
         logger.info(
             "step timing rank=%d steps=%d period_ms mean=%.1f p50=%.1f | "
-            "dp_sync_ms mean=%.2f p90=%.2f | %s",
+            "dp_sync_ms mean=%.2f p90=%.2f | result_wait_ms mean=%.2f p10=%.2f | %s",
             self._rank,
             total,
             all_periods.mean() * 1e3,
             np.median(all_periods) * 1e3,
             sync.mean(),
             np.percentile(sync, 90),
+            wait.mean(),
+            np.percentile(wait, 10),
             " | ".join(parts),
         )
         self._periods.clear()
         self._sync_s.clear()
+        self._result_wait_s.clear()

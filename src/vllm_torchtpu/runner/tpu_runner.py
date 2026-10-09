@@ -2478,7 +2478,10 @@ class TPUModelRunner(GPUModelRunner):
 
         if not pre_request_seq_lens:
             return
+        wait_start = time.perf_counter()
         pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
+        if self._step_timing_log is not None:
+            self._step_timing_log.result_wait(time.perf_counter() - wait_start)
         assert pre_next_tokens_cpu is not None
 
         pre_next_tokens_cpu = pre_next_tokens_cpu[: len(pre_req_ids)]
