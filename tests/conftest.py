@@ -150,3 +150,24 @@ def pytest_collection_finish(session):
         "the module: bisect with `pytest --collect-only <subset>` and check "
         "`jax._src.xla_bridge.backends_are_initialized()` after each."
     )
+
+
+def pytest_terminal_summary(terminalreporter):
+    """Report the size of the TorchTPU compilation cache, when one is set.
+
+    The PR TPU steps put it on the pod's or container's own disk (see
+    .buildkite/pipeline_tests*.yml), where too large a cache gets the pod
+    evicted; this line is how to see a step approaching that.
+    """
+    root = os.environ.get("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT")
+    if not root or not os.path.isdir(root):
+        return
+    count = size = 0
+    for dirpath, _, filenames in os.walk(root):
+        for name in filenames:
+            count += 1
+            size += os.path.getsize(os.path.join(dirpath, name))
+    terminalreporter.write_line(
+        f"TorchTPU compilation cache: {count} programs, {size / 2**30:.2f} GiB "
+        f"in {root}"
+    )

@@ -78,6 +78,9 @@ FORWARD=(
   # vLLM's compile caches default to ~/.cache/vllm, on the pod's ephemeral
   # storage. A step that compiles a large model points them at /cache/jax.
   VLLM_CACHE_ROOT VLLM_XLA_CACHE_PATH
+  # TorchTPU's on-disk cache of compiled programs. The unit-test steps point it
+  # at the pod's /tmp, so every later engine boot in the same pod reuses them.
+  TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT
   SERVED_MODEL_NAME RUN_ROOT VLLM_ENGINE_READY_TIMEOUT_S
   TPU_ACCELERATOR_TYPE TPU_MULTIHOST_BACKEND TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
   USE_MOE_SPARSE_CORE P4D2_BIND_HOST PROXY_PORT

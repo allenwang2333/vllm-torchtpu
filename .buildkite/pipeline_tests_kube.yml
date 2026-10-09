@@ -65,6 +65,13 @@ x-tests-plugin-defaults: &tests_plugin_defaults
   install-client: false
   oidc-lifetime: 7200
 
+# TorchTPU's on-disk cache of compiled programs, for the PR TPU steps. On the
+# pod's /tmp, so it lives and dies with the job: an engine that boots the same
+# model config as an earlier test in the pod loads the programs instead of
+# compiling them, and nothing carries over between builds. The nightly steps
+# leave it off; their DSv4 runs write tens of GB of artifacts.
+x-tier3-cache-root: &tier3_cache_root "/tmp/torch_tpu_tier3"
+
 # Overridable to run on idle v6e, but only to prove the plumbing reaches a
 # chip: several hundred kernel tests call pytest.fail rather than skip there,
 # so a v6e run is red for reasons that say nothing about this lane.
@@ -123,6 +130,7 @@ steps:
         parallelism: 3
         env:
           SHAPE: *shape_single
+          TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: *tier3_cache_root
         plugins:
           - *kube_plugin
           - tests#v1.0.0:
@@ -136,6 +144,7 @@ steps:
         if: 'build.env("NIGHTLY") != "1"'
         env:
           SHAPE: *shape_multi
+          TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: *tier3_cache_root
         plugins:
           - *kube_plugin
           - tests#v1.0.0:
@@ -153,6 +162,7 @@ steps:
         parallelism: 3
         env:
           SHAPE: *shape_single
+          TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: *tier3_cache_root
           # bktec splits over a plain `pytest --collect-only`, which does not
           # see the `-m` filter in test-cmd, so without this the nightly-only
           # cases are planned into shards carrying their long timings and then
@@ -172,6 +182,7 @@ steps:
         if: 'build.env("NIGHTLY") != "1"'
         env:
           SHAPE: *shape_multi
+          TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: *tier3_cache_root
         plugins:
           - *kube_plugin
           - tests#v1.0.0:

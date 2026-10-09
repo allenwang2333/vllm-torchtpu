@@ -25,6 +25,14 @@ x-cpu-unit-test-defaults: &cpu_unit_test_defaults
   env:
     CPU_ONLY: "1"
 
+# TorchTPU's on-disk cache of compiled programs, for the PR TPU steps. Inside
+# the container, so it lives and dies with the job: an engine that boots the
+# same model config as an earlier test in the shard (reference then spec-decode
+# engine, the same test file booting one model several times) loads the programs
+# instead of compiling them, and nothing carries over between builds. The
+# nightly steps leave it off; their DSv4 runs write tens of GB of artifacts.
+x-tier3-cache-root: &tier3_cache_root "/tmp/torch_tpu_tier3"
+
 x-tests-plugin-defaults: &tests_plugin_defaults
   # Resolved relative to the Buildkite org running the build.
   suite-slug: tpu-ci
@@ -86,6 +94,8 @@ steps:
         key: "unit_tests_general_pr"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") != "1"'
+        env:
+          TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: *tier3_cache_root
         parallelism: 3
         agents:
           queue: "tpu_v7x_2_queue"
@@ -99,6 +109,8 @@ steps:
         key: "unit_tests_multichip_pr"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") != "1"'
+        env:
+          TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: *tier3_cache_root
         agents:
           queue: "tpu_v7x_8_queue"
         plugins:
@@ -125,6 +137,7 @@ steps:
           # as well as to the run, which keeps the split over what PR
           # actually executes. run_in_docker.sh forwards it into the container.
           PYTEST_ADDOPTS: "-m 'not nightly and not multichip'"
+          TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: *tier3_cache_root
         agents:
           queue: "tpu_v7x_2_queue"
         plugins:
@@ -138,6 +151,8 @@ steps:
         key: "unit_tests_spec_decode_multichip_pr"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") != "1"'
+        env:
+          TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: *tier3_cache_root
         agents:
           queue: "tpu_v7x_8_queue"
         artifact_paths:
