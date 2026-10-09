@@ -647,6 +647,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self.conv_weight_fused = out
         self._pack_prefill_projection()
 
+    _PACKED_PREFILL_EXPECTED_SHAPES = ((7168, 1155), (7168, 384), (7168, 128))
+    _PACKED_PREFILL_SPLIT_SIZES = (1152, 128, 384, 128)
+
     def _pack_prefill_projection(self):
         """Cache BF16 KDA input weights after the normal checkpoint loaders."""
         self.packed_prefill_weight = None
@@ -658,9 +661,8 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         ):
             return
         projections = (self.fused_qkvb_proj, self.g_proj, self.f_a_proj)
-        expected = ((7168, 1155), (7168, 384), (7168, 128))
         weights = []
-        for projection, shape in zip(projections, expected):
+        for projection, shape in zip(projections, self._PACKED_PREFILL_EXPECTED_SHAPES):
             weight = getattr(projection, "weight", None)
             if (
                 weight is None
@@ -697,18 +699,16 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                     hidden_states = group.all_gather(hidden_states, dim=0)
                 packed = hidden_states @ self.packed_prefill_weight
             mixed_qkv, beta_pad, output_gate, f_a = packed.split(
-                [1152, 128, 384, 128], dim=-1
+                self._PACKED_PREFILL_SPLIT_SIZES, dim=-1
             )
             beta = beta_pad[:, : self.num_heads]
-            query = mixed_qkv[:, : self.local_projection_size]
         else:
             if sequence_parallel:
                 hidden_states = group.all_gather(hidden_states, dim=0)
             projected, _ = self.fused_qkvb_proj(hidden_states)
-            query, key, value, beta = projected.split(
-                [self.local_projection_size] * 3 + [self.num_heads], dim=-1
+            mixed_qkv, beta = projected.split(
+                (3 * self.local_projection_size, self.num_heads), dim=-1
             )
-            mixed_qkv = torch.cat((query, key, value), dim=-1)
             if self.use_full_rank_gate:
                 assert self.f_a_proj is not None
                 f_a, _ = self.f_a_proj(hidden_states)
@@ -718,7 +718,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 assert self.fused_fa_ga_proj is not None
                 gate_inputs, _ = self.fused_fa_ga_proj(hidden_states)
                 f_a, gate_input = gate_inputs.split(
-                    [self.head_dim, self.head_dim], dim=-1
+                    (self.head_dim, self.head_dim), dim=-1
                 )
         raw_gate, _ = self.f_b_proj(f_a)
         if not self.use_full_rank_gate:
@@ -727,7 +727,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
 
         metadata = self._metadata()
         if metadata is None or self.kv_cache is None or self.kv_cache[0].numel() == 0:
-            output = torch.zeros_like(query)
+            output = torch.zeros_like(mixed_qkv[:, : self.local_projection_size])
         elif len(self.kv_cache) == 1:
             # Unified pool: the single attention-shaped buffer carries both
             # KDA state regions.

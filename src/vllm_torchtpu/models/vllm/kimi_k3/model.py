@@ -62,6 +62,12 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+from vllm.v1.worker.encoder_cudagraph_defs import (
+    EncoderCudaGraphCaptureInputs,
+    EncoderCudaGraphConfig,
+    EncoderCudaGraphReplayBuffers,
+    EncoderItemSpec,
+)
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
@@ -124,6 +130,10 @@ class KimiDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
         self.attn_res_block_size = config.attn_res_block_size
+        self._starts_attn_res_block = (
+            self.attn_res_block_size is not None
+            and self.layer_idx % self.attn_res_block_size == 0
+        )
         if self.attn_res_block_size is not None:
             self.self_attention_res = AttentionResidual(
                 config.hidden_size,
@@ -166,7 +176,7 @@ class KimiDecoderLayer(nn.Module):
         prefix_sum = hidden_states
         if block_residuals.shape[-2] > 0:
             hidden_states = self.self_attention_res(prefix_sum, block_residuals)
-        if self.layer_idx % self.attn_res_block_size == 0:
+        if self._starts_attn_res_block:
             block_residuals = torch.cat(
                 (block_residuals, prefix_sum.unsqueeze(-2)), dim=-2
             )
@@ -280,28 +290,39 @@ class KimiModel(nn.Module):
         )
         assert hidden_states is not None
 
+        aux_layers = self.aux_hidden_state_layers
         aux_hidden_states: list[torch.Tensor] = []
-        if 0 in self.aux_hidden_state_layers:
-            aux_hidden_states.append(hidden_states)
-
-        for layer_idx, layer in enumerate(self.layers):
-            hidden_states, block_residuals = layer(
-                positions,
-                hidden_states,
-                block_residuals,
-                sequence_parallel=sequence_parallel,
-            )
-            if layer_idx + 1 in self.aux_hidden_state_layers:
+        if not aux_layers:
+            for layer in self.layers:
+                hidden_states, block_residuals = layer(
+                    positions,
+                    hidden_states,
+                    block_residuals,
+                    sequence_parallel=sequence_parallel,
+                )
+        else:
+            if 0 in aux_layers:
                 aux_hidden_states.append(hidden_states)
+            for layer_idx, layer in enumerate(self.layers, start=1):
+                hidden_states, block_residuals = layer(
+                    positions,
+                    hidden_states,
+                    block_residuals,
+                    sequence_parallel=sequence_parallel,
+                )
+                if layer_idx in aux_layers:
+                    aux_hidden_states.append(hidden_states)
 
         if block_residuals is not None:
             hidden_states = self.output_attn_res(hidden_states, block_residuals)
         hidden_states = self.norm(hidden_states)
         if sequence_parallel:
             hidden_states = self.sp_group.all_gather(hidden_states, dim=0)
-            aux_hidden_states = [
-                self.sp_group.all_gather(state, dim=0) for state in aux_hidden_states
-            ]
+            if aux_hidden_states:
+                aux_hidden_states = [
+                    self.sp_group.all_gather(state, dim=0)
+                    for state in aux_hidden_states
+                ]
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -334,6 +355,8 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
             ".kv_a_proj_with_mqa.": (".fused_qkv_a_proj.", 1),
         },
     )
+    _SKIPPED_VISION_PREFIXES = ("vision_tower.", "mm_projector.")
+    _TIED_LM_HEAD_SKIP_MAPPER = WeightsMapper(orig_to_new_prefix={"lm_head.": None})
     fused_attention_params_mapping = (
         (".self_attn.q_proj.", ".self_attn.fused_qkvb_proj.", 0),
         (".self_attn.k_proj.", ".self_attn.fused_qkvb_proj.", 1),
@@ -445,7 +468,7 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 num_experts=self.config.num_experts,
             )
             if self.config.num_experts is not None
-            else []
+            else ()
         )
         params_dict = dict(self.named_parameters())
         experts_use_weight = not any(
@@ -465,52 +488,54 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         # tensor as soon as its parameter is loaded.
         def _ordinary_weights():
             for name, loaded_weight in mapper.apply(weights):
-                if name.startswith(("vision_tower.", "mm_projector.")):
+                if name.startswith(self._SKIPPED_VISION_PREFIXES):
                     continue
                 if experts_use_weight and name.endswith(".weight_packed"):
                     name = name.replace(".weight_packed", ".weight")
 
-                for (
-                    weight_name,
-                    param_name,
-                    shard_id,
-                ) in self.fused_attention_params_mapping:
-                    if weight_name not in name:
-                        continue
-                    candidate = name.replace(weight_name, param_name)
-                    if candidate not in params_dict:
-                        continue
-                    name = candidate
-                    loaded_weight.shard_id = shard_id
-                    break
+                if ".self_attn." in name:
+                    for (
+                        weight_name,
+                        param_name,
+                        shard_id,
+                    ) in self.fused_attention_params_mapping:
+                        if weight_name not in name:
+                            continue
+                        candidate = name.replace(weight_name, param_name)
+                        if candidate not in params_dict:
+                            continue
+                        name = candidate
+                        loaded_weight.shard_id = shard_id
+                        break
 
-                for (
-                    param_name,
-                    weight_name,
-                    expert_id,
-                    expert_shard_id,
-                ) in expert_params_mapping:
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    parameter = params_dict[name]
-                    parameter.weight_loader(
-                        parameter,
-                        loaded_weight,
-                        name,
-                        expert_id=expert_id,
-                        shard_id=expert_shard_id,
-                    )
-                    loaded_experts.add(name)
-                    break
+                if "experts." in name:
+                    for (
+                        param_name,
+                        weight_name,
+                        expert_id,
+                        expert_shard_id,
+                    ) in expert_params_mapping:
+                        if weight_name not in name:
+                            continue
+                        name = name.replace(weight_name, param_name)
+                        parameter = params_dict[name]
+                        parameter.weight_loader(
+                            parameter,
+                            loaded_weight,
+                            name,
+                            expert_id=expert_id,
+                            shard_id=expert_shard_id,
+                        )
+                        loaded_experts.add(name)
+                        break
+                    else:
+                        yield name, loaded_weight
                 else:
                     yield name, loaded_weight
 
         loader = AutoWeightsLoader(self)
         skip_mapper = (
-            WeightsMapper(orig_to_new_prefix={"lm_head.": None})
-            if self.config.tie_word_embeddings
-            else None
+            self._TIED_LM_HEAD_SKIP_MAPPER if self.config.tie_word_embeddings else None
         )
         # load_weights fully consumes the generator before returning, so
         # loaded_experts is complete when the union is taken.
@@ -689,8 +714,6 @@ class KimiK3ForConditionalGeneration(
     supports_encoder_cudagraph = True
 
     def get_encoder_cudagraph_config(self):
-        from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
-
         return EncoderCudaGraphConfig(
             modalities=["image"],
             buffer_keys=[
@@ -732,8 +755,6 @@ class KimiK3ForConditionalGeneration(
         return cast(list[list[int]], grid_thws)
 
     def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, object]):
-        from vllm.v1.worker.encoder_cudagraph_defs import EncoderItemSpec
-
         merge_h, merge_w = self.vision_tower.merge_kernel_size
         grid_thw_list = self._grid_thw_list(mm_kwargs["grid_thws"])
         return [
@@ -759,10 +780,11 @@ class KimiK3ForConditionalGeneration(
                 "grid_thws": grid_thws[:0],
             }
 
-        patches_per_item = [t * h * w for t, h, w in grid_thw_list]
         cum = [0]
-        for p in patches_per_item:
-            cum.append(cum[-1] + p)
+        running = 0
+        for t, h, w in grid_thw_list:
+            running += t * h * w
+            cum.append(running)
         selected_pv = torch.cat([pixel_values[cum[i] : cum[i + 1]] for i in indices])
         return {
             "pixel_values": selected_pv,
@@ -778,8 +800,6 @@ class KimiK3ForConditionalGeneration(
         dtype: torch.dtype,
         path: str = "default",
     ):
-        from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphCaptureInputs
-
         del max_frames_per_batch  # image-only modality
 
         merge_h, merge_w = self.vision_tower.merge_kernel_size
@@ -794,7 +814,8 @@ class KimiK3ForConditionalGeneration(
         rope = self.vision_tower.encoder.rope_2d
         out_w = min(per_item_output, rope.max_width // merge_w)
         out_h = (per_item_output + out_w - 1) // out_w
-        if out_h * merge_h > rope.max_height:
+        patch_rows = out_h * merge_h
+        if patch_rows > rope.max_height:
             raise ValueError(
                 f"Encoder cudagraph budget {token_budget} over "
                 f"{max_batch_size} items needs {per_item_output} tokens per "
@@ -803,16 +824,16 @@ class KimiK3ForConditionalGeneration(
                 "lower max_num_batched_tokens or raise "
                 "encoder_cudagraph_max_vision_items_per_batch."
             )
-        grid_config = [
-            [1, out_h * merge_h, out_w * merge_w] for _ in range(max_batch_size)
-        ]
+        patch_cols = out_w * merge_w
+        grid_config = [[1, patch_rows, patch_cols] for _ in range(max_batch_size)]
 
         # vision_tower.patch_size is the raw (unnormalized, often a plain
         # int) HF config value; patch_embed.patch_size is always the
         # normalized (h, w) tuple.
         patch_h, patch_w = self.vision_tower.patch_embed.patch_size
         in_channels = self.vision_tower.patch_embed.proj.in_channels
-        total_patches = sum(t * h * w for t, h, w in grid_config)
+        patches_per_item = patch_rows * patch_cols
+        total_patches = max_batch_size * patches_per_item
         dummy_pixel_values = torch.randn(
             total_patches, in_channels, patch_h, patch_w, device=device, dtype=dtype
         )
@@ -827,7 +848,7 @@ class KimiK3ForConditionalGeneration(
             max_batch_size=max_batch_size,
             max_seqlen_override=max(
                 token_budget * merge_h * merge_w,
-                out_h * merge_h * out_w * merge_w,
+                patches_per_item,
             ),
             device=device,
         )
@@ -842,8 +863,6 @@ class KimiK3ForConditionalGeneration(
         max_frames_per_batch: int,
         path: str = "default",
     ):
-        from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphReplayBuffers
-
         del max_frames_per_batch
         pixel_values = cast(torch.Tensor, mm_kwargs["pixel_values"])
         grid_thw_list = self._grid_thw_list(mm_kwargs["grid_thws"])
