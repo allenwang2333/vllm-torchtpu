@@ -54,11 +54,11 @@ def test_select_ragged_gather_reduce():
 def test_resolve_onehot_permute_threshold(monkeypatch):
     """Verify resolve_onehot_permute_threshold across env and TPU info branches."""
     # 1. Explicit positive threshold
-    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", 64)
+    monkeypatch.setitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", 64)
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 64
 
     # 2. Explicit negative threshold falls through
-    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", -1)
+    monkeypatch.setitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", -1)
     with patch(
         "jax.experimental.pallas.tpu.get_tpu_info",
         side_effect=ValueError("Unsupported"),
@@ -66,7 +66,7 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
         assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
 
     # 3. Env unset, unsupported device kind (ValueError on CPU)
-    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None)
+    monkeypatch.setitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", None)
     with patch(
         "jax.experimental.pallas.tpu.get_tpu_info",
         side_effect=ValueError("Unsupported"),
@@ -417,7 +417,7 @@ def test_moe_gmm(monkeypatch):
         assert out1.shape == (num_tokens, hidden_size)
 
         # Branch 2a: EP + SC, size <= 2304 (zero_init_gmm2=True), owner_output == "off"
-        monkeypatch.setattr(envs, "TPU_MOE_OWNER_OUTPUT_MODE", "off")
+        monkeypatch.setitem(vars(envs), "TPU_MOE_OWNER_OUTPUT_MODE", "off")
         out2 = fused_moe_gmm.moe_gmm(
             x,
             w1,
@@ -495,7 +495,7 @@ def test_moe_gmm(monkeypatch):
         assert out2b.shape == (n_tok_hi, hidden_size)
 
         # Branch 3: EP + SC, size <= threshold, owner_output == "on", blockwise
-        monkeypatch.setattr(envs, "TPU_MOE_OWNER_OUTPUT_MODE", "on")
+        monkeypatch.setitem(vars(envs), "TPU_MOE_OWNER_OUTPUT_MODE", "on")
         with (
             patch.object(
                 fused_moe_gmm,

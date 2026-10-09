@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter import fused_moe as fm_adapter
 from vllm_torchtpu.layers.core import fused_moe_gmm as fm_core
 
@@ -382,6 +383,9 @@ def test_moe_gmm_and_fused_moe_func_all_branches(monkeypatch):
 
 def test_remaining_fused_moe_gmm_branches(monkeypatch):
     # 1. resolve_onehot_permute_threshold branches (lines 85, 91-97).
+    # Drop any value another test pinned on the lazy `envs` module, so the
+    # environment variable below is what `envs.__getattr__` reads.
+    monkeypatch.delitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", raising=False)
     monkeypatch.setenv("ONEHOT_MOE_PERMUTE_THRESHOLD", "64")
     assert fm_core.resolve_onehot_permute_threshold() == 64
 

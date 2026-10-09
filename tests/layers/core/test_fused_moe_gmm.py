@@ -924,13 +924,13 @@ def test_onehot_threshold_explicit_env_skips_tpu_info(monkeypatch):
         raise AssertionError("get_tpu_info must not be called")
 
     monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", _fail)
-    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", 0, raising=False)
+    monkeypatch.setitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", 0)
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
 
 
 @pytest.mark.parametrize("explicit", [None, -1])
 def test_onehot_threshold_auto_is_one_below_real_blocks(monkeypatch, explicit):
-    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", explicit, raising=False)
+    monkeypatch.setitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", explicit)
     # 16 lanes x 2 cores x 16 subcores = 512-row block (v7x geometry) resolves
     # to min(8 * 512 - 1, 4096) = 4095, and a 256-row block (v6e) resolves to
     # min(2 * 256 - 1, 4096) = 511. None and -1 both select auto.
@@ -947,7 +947,7 @@ def test_onehot_threshold_auto_is_one_below_real_blocks(monkeypatch, explicit):
 
 
 def test_onehot_threshold_auto_caps_oversized_block(monkeypatch):
-    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
+    monkeypatch.setitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", None)
     # A hypothetical 1024-row block exceeds the cap, so the cap wins.
     monkeypatch.setattr(
         fused_moe_gmm.pltpu,
@@ -973,7 +973,6 @@ def test_moe_gmm_tiling_selects_32_for_sparse_decode_and_keeps_default_otherwise
         (48, 3456),
         (16, 1728),
         (48, 4608),
-        (48, 8064),
         (48, 48 * bound),
     ):
         decode_dims = types.SimpleNamespace(
@@ -986,6 +985,8 @@ def test_moe_gmm_tiling_selects_32_for_sparse_decode_and_keeps_default_otherwise
         types.SimpleNamespace(size_group=1, size_m=576, size_lhs_sublane=8),
         types.SimpleNamespace(size_group=48, size_m=16, size_lhs_sublane=8),
         types.SimpleNamespace(size_group=48, size_m=48 * bound + 1, size_lhs_sublane=8),
+        # T = 1344 under EP8 (M = 8064 > 48 * 144) keeps the 64-row tiling.
+        types.SimpleNamespace(size_group=48, size_m=8064, size_lhs_sublane=8),
         types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=12),
     ):
         assert (
@@ -995,7 +996,7 @@ def test_moe_gmm_tiling_selects_32_for_sparse_decode_and_keeps_default_otherwise
 
 
 def test_onehot_threshold_auto_zero_without_sparse_core(monkeypatch):
-    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
+    monkeypatch.setitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", None)
     monkeypatch.setattr(
         fused_moe_gmm.pltpu, "get_tpu_info", lambda: _fake_tpu_info(None)
     )
@@ -1003,7 +1004,7 @@ def test_onehot_threshold_auto_zero_without_sparse_core(monkeypatch):
 
 
 def test_onehot_threshold_auto_zero_on_non_tpu_host(monkeypatch):
-    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
+    monkeypatch.setitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", None)
 
     def _raise():
         raise ValueError("Unsupported TPU device kind: cpu")
@@ -1280,18 +1281,24 @@ def test_moe_gmm_onehot_combine_keeps_operand_dtype(monkeypatch):
 def test_moe_gmm_onehot_combine_zeroes_uncomputed_rows(monkeypatch):
     # gmm output rows past the valid prefix (non-local experts under EP, or
     # skipped padded tokens) are never written and may hold NaN; the one-hot
-    # combine must zero them before the matmul, without any flag, or they
-    # would spread to every token in the batch.
+    # combine must not let them spread to every token in the batch. For the
+    # small one-hot shapes the second GMM is asked to zero-initialize those
+    # rows (`zero_init_gmm2`, b48ec6313), so the fake GMM below honors that
+    # contract: unwritten rows are zero when requested and NaN otherwise.
     kwargs = _small_moe_gmm_kwargs()
     rows = kwargs["argsort_revert_indices"].size
     valid_rows = rows - 2
     monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *args, **kwargs: 1)
-    gmm2 = jnp.ones((rows, 8), dtype=jnp.bfloat16)
-    gmm2 = gmm2.at[valid_rows:].set(jnp.nan)
-    outputs = iter([jnp.ones((rows, 8), dtype=jnp.bfloat16), gmm2])
-    monkeypatch.setattr(
-        fused_moe_gmm, "gmm_wrapper", lambda *args, **kwargs: next(outputs)
-    )
+    zero_init_requests = []
+
+    def fake_gmm(*args, zero_initialize=False, **kwargs):
+        zero_init_requests.append(zero_initialize)
+        out = jnp.ones((rows, 8), dtype=jnp.bfloat16)
+        if len(zero_init_requests) == 2:  # gmm2: tail rows are never written
+            out = out.at[valid_rows:].set(0 if zero_initialize else jnp.nan)
+        return out
+
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", fake_gmm)
     # Mark the slots whose routed rows fall in the NaN tail as invalid, as
     # prepare_routed_gmm_inputs does for padded tokens.
     revert = kwargs["argsort_revert_indices"]
@@ -1305,4 +1312,5 @@ def test_moe_gmm_onehot_combine_zeroes_uncomputed_rows(monkeypatch):
         }
     )
 
+    assert zero_init_requests[1] is True
     assert bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))

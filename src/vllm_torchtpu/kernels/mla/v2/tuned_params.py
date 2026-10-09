@@ -1346,8 +1346,11 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
 
 
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
-    if tuning_key in tuned_params_mapping:
-        return tuned_params_mapping[tuning_key]
+    # One probe: the frozen dataclass key re-hashes all of its fields on
+    # every lookup, so `in` followed by `[]` paid for it twice.
+    tuned = tuned_params_mapping.get(tuning_key)
+    if tuned is not None:
+        return tuned
     else:
         logger.warning(
             "No tuned parameters found for the given tuning key: %s, "
