@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
+    TPU_MHC_GATES_PALLAS: bool = True
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
     TPU_RAIDEN_KIMIK3_ADMISSION: bool = False
@@ -383,6 +384,9 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 environment_variables: dict[str, Callable[[], Any]] = {
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
+    # mHC gates (sigmoid / softmax / Sinkhorn) as one Pallas kernel instead of
+    # ~100 tiny XLA ops per call; 0 restores the jnp reference.
+    "TPU_MHC_GATES_PALLAS": env_bool("TPU_MHC_GATES_PALLAS", default=True),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many
     # top-k slots per token instead of all `topk`; tokens owning more are
     # recomputed exactly in-kernel over all their windows
