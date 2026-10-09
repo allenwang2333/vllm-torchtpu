@@ -437,6 +437,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         "gk": pltpu.VMEM((GKR, 128), I32), "gmk": pltpu.VMEM((128, 128), I32),
         "oslot": pltpu.VMEM((KR_, 128), I32),
         "cand_s": pltpu.SMEM((TMAX * KR_, 128), I32), "oslot_s": pltpu.SMEM((KR_, 128), I32),
+        "cand_v": pltpu.VMEM((TMAX, KR_, 128), I32),
         "own_s": pltpu.SMEM((TMAX * KR_, 128), I32), "own_v": pltpu.VMEM((TMAX, KR_, 128), I32),
         "nown_s": pltpu.SMEM((TMAX,), I32),
         # per-request union of the rows' owned winners (+ per-row membership over it)
@@ -1189,6 +1190,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 return c
             lax.fori_loop(0, T, per_row, 0)
 
+            pi.mark("I_union")
+
             def per_req_u(b, off):
                 return lax.cond(qmeta[b, 3] > 0, lambda: build_union(b, off), lambda: off)
             lax.fori_loop(0, B, per_req_u, jnp.int32(0))
@@ -1286,6 +1289,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                     nval = (L_ // G_) * ILV + jnp.clip(L_ % G_ - ILV * me, 0, ILV)
                     topk2.local_topk(scr["keys"].at[qq], nval, KT, scr["cidx"], scr["ksend"].at[t_],
                                      scr["kpre"], scr["tk_acc"], scr["tk_cc"], kc=tiles.topk_kc)
+                    scr["cand_v"][t_] = scr["cidx"][...]
                     cp = pltpu.make_async_copy(scr["cidx"], scr["cand_s"].at[pl.ds(t_ * KR_, KR_)],
                                                scr["misc_sem"])
                     cp.start()
@@ -1354,28 +1358,17 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 scr["gk"][s_ * KR_:(s_ + 1) * KR_, :] = scr["kall"][s_, t_]
             if GKR > R * KR_:
                 scr["gk"][R * KR_:GKR, :] = jnp.full((GKR - R * KR_, 128), INT_MIN, I32)
+            # owned winners' local indices compacted by the vector extraction itself (payload = the
+            # candidate's local index): no per-entry scalar gather (a rank owning most winners was a
+            # multi-ms straggler, PHASES.draft1.md)
             n_own = topk2.global_owned(scr["gk"], me, KT, scr["oslot"], scr["kpre"],
                                        scr["tk_acc"].at[pl.ds(0, min(tiles.topk_kc_global, KT))],
-                                       scr["tk_cc"], scr["gmk"], kc=tiles.topk_kc_global)
-            cp = pltpu.make_async_copy(scr["oslot"], scr["oslot_s"], scr["misc_sem"])
-            cp.start()
-            cp.wait()
-
-            def mp(k, c):
-                s_ = scr["oslot_s"][k >> 7, k & 127]
-                scr["own_s"][t_ * KR_ + (k >> 7), k & 127] = scr["cand_s"][t_ * KR_ + (s_ >> 7), s_ & 127]
-                return c
-            lax.fori_loop(0, n_own, mp, 0)
-            if debug:                                # dbg_own exports -1 past n_own
-
-                def pad(k, c):
-                    scr["own_s"][t_ * KR_ + (k >> 7), k & 127] = jnp.int32(-1)
-                    return c
-                lax.fori_loop(n_own, KT, pad, 0)
-
-            # own_s past n_own is never read (gather loops run to n; attention masks rows >= n)
+                                       scr["tk_cc"], scr["gmk"], kc=tiles.topk_kc_global,
+                                       pay_ref=scr["cand_v"].at[t_], pay_out=scr["own_v"].at[t_])
+            kio = (lax.broadcasted_iota(I32, (KR_, 128), 0) * 128 + lax.broadcasted_iota(I32, (KR_, 128), 1))
+            scr["own_v"][t_] = jnp.where(kio < n_own, scr["own_v"][t_], -1)
             scr["nown_s"][t_] = n_own
-            cp = pltpu.make_async_copy(scr["own_s"].at[pl.ds(t_ * KR_, KR_)], scr["own_v"].at[t_],
+            cp = pltpu.make_async_copy(scr["own_v"].at[t_], scr["own_s"].at[pl.ds(t_ * KR_, KR_)],
                                        scr["misc_sem"])
             cp.start()
             cp.wait()
