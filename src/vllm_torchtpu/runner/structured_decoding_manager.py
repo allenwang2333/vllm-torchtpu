@@ -79,6 +79,16 @@ class StructuredDecodingManager:
                 device="cpu",
                 pin_memory=PIN_MEMORY,
             )
+            self.device_all_false_require_target = torch.zeros(
+                (max_target_rows, 1),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            self.device_dummy_bitmask_target = torch.zeros(
+                (max_target_rows, num_words),
+                dtype=torch.int32,
+                device=self.device,
+            )
 
     def prepare_structured_decoding_input(
         self,
@@ -167,6 +177,41 @@ class StructuredDecodingManager:
         is None.
         """
         padded_bonus_rows = bonus_logits.shape[0]
+        req_id_to_index = self.runner.input_batch.req_id_to_index
+        bitmask = grammar_output.grammar_bitmask
+
+        local_entries: list[tuple[str, int, int, int]] = []
+        mask_row = 0
+        for req_id in grammar_output.structured_output_request_ids:
+            num_drafts = len(scheduled_spec_decode_tokens.get(req_id, ()))
+            batch_index = req_id_to_index.get(req_id)
+            if batch_index is not None and cur_start_idx <= batch_index < cur_end_idx:
+                local_entries.append(
+                    (req_id, batch_index - cur_start_idx, num_drafts, mask_row)
+                )
+            mask_row += 1 + num_drafts
+
+        # Fast path: No structured requests in this chunk.
+        # Bypass CPU buffer zeroing and all host-to-device transfers by
+        # returning pre-allocated device-resident zero tensors.
+        if not local_entries:
+            if target_logits is not None:
+                padded_target_rows = target_logits.shape[0]
+                require_target = self.device_all_false_require_target[
+                    :padded_target_rows
+                ]
+                target_bitmask = self.device_dummy_bitmask_target[:padded_target_rows]
+            else:
+                require_target = None
+                target_bitmask = None
+            return (
+                require_target,
+                target_bitmask,
+                self.device_all_false_require[:padded_bonus_rows],
+                self.device_dummy_bitmask[:padded_bonus_rows],
+                self.structured_decode_arange,
+            )
+
         self.grammar_bitmask_cpu[:padded_bonus_rows].zero_()
         self.require_structured_out_cpu[:padded_bonus_rows].zero_()
 
@@ -181,16 +226,7 @@ class StructuredDecodingManager:
             target_row_starts = np.zeros(len(draft_lengths_cpu) + 1, dtype=np.int64)
             np.cumsum(draft_lengths_cpu, out=target_row_starts[1:])
 
-        req_id_to_index = self.runner.input_batch.req_id_to_index
-        bitmask = grammar_output.grammar_bitmask
-        mask_row = 0
-        for req_id in grammar_output.structured_output_request_ids:
-            num_drafts = len(scheduled_spec_decode_tokens.get(req_id, ()))
-            batch_index = req_id_to_index.get(req_id)
-            if batch_index is None or not cur_start_idx <= batch_index < cur_end_idx:
-                mask_row += 1 + num_drafts
-                continue
-            local_index = batch_index - cur_start_idx
+        for req_id, local_index, num_drafts, mask_row in local_entries:
             if num_drafts:
                 assert target_row_starts is not None, (
                     f"chunk without target_logits scheduled drafts for request {req_id}"
@@ -212,7 +248,6 @@ class StructuredDecodingManager:
                 bitmask[mask_row + num_drafts]
             )
             self.require_structured_out_cpu[local_index] = True
-            mask_row += 1 + num_drafts
 
         if target_logits is not None:
             require_target = self.require_structured_out_target_cpu[

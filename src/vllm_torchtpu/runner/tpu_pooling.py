@@ -100,26 +100,33 @@ class TPUMeanPool(SequencePoolingMethod):
 
             for start in range(0, hidden_states.shape[0], chunk_size):
                 end = min(start + chunk_size, hidden_states.shape[0])
+                chunk = hidden_states[start:end]
+                if chunk.dtype != torch.float32:
+                    chunk = chunk.to(dtype=torch.float32)
                 segment_sums.index_add_(
                     0,
                     segment_ids[start:end],
-                    hidden_states[start:end].to(dtype=torch.float32),
+                    chunk,
                 )
 
             return segment_sums / prompt_lens.unsqueeze(1)
 
         # Chunked prefill online accumulation on TPU in FP32
         num_scheduled_cpu = pooling_cursor.num_scheduled_tokens_cpu.tolist()
-        hidden_states_lst = list(torch.split(hidden_states, num_scheduled_cpu))
         finished_mask = pooling_cursor.is_finished().tolist()
         pooling_states = pooling_metadata.pooling_states
 
         output_list: list[torch.Tensor | None] = []
         for hs_chunk, p, finished in zip(
-            hidden_states_lst, pooling_states, finished_mask
+            torch.split(hidden_states, num_scheduled_cpu), pooling_states, finished_mask
         ):
             # Accumulate on-device in FP32 to prevent numerical cancellation/underflow
-            chunk_sum = hs_chunk.to(dtype=torch.float32).sum(dim=0)
+            chunk_fp32 = (
+                hs_chunk
+                if hs_chunk.dtype == torch.float32
+                else hs_chunk.to(dtype=torch.float32)
+            )
+            chunk_sum = chunk_fp32.sum(dim=0)
             chunk_count = hs_chunk.shape[0]
 
             if not hasattr(p, "mean_pool_sum") or p.mean_pool_sum is None:
@@ -130,7 +137,9 @@ class TPUMeanPool(SequencePoolingMethod):
                 p.mean_pool_count = p.mean_pool_count + chunk_count
 
             if finished:
-                mean_emb = (p.mean_pool_sum / p.mean_pool_count).to(hidden_states.dtype)
+                mean_emb = p.mean_pool_sum / p.mean_pool_count
+                if mean_emb.dtype != hidden_states.dtype:
+                    mean_emb = mean_emb.to(hidden_states.dtype)
                 output_list.append(mean_emb)
                 # Cleanup state to prevent leaks in CachedRequestState
                 p.mean_pool_sum = None
