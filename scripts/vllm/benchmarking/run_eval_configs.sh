@@ -27,6 +27,16 @@ save_tpu_logs() {
     echo "Saved ${#files[@]} libtpu log files to $dest/tpu_logs.tar.gz"
 }
 
+# libtpu cannot start a TPU session while the chips are still resetting after
+# the previous engine exits: on GKE the session goes through the TPU device
+# plugin's vBAR socket, and one engine process gets START_SESSION failed while
+# the rest wait out the session barrier. Matches the logs of the config whose
+# results directory is $1.
+tpu_session_failed() {
+    grep -rqsE --include='*.log' \
+        'START_SESSION failed|POST_START_SESSION_BARRIER|PjRtClient is not initialized' "$1"
+}
+
 fail=0
 for (( i = 0; i < ${#configs[@]}; i++ )); do
     # Select configs where (index % job_count) == job_index
@@ -71,6 +81,17 @@ for (( i = 0; i < ${#configs[@]}; i++ )); do
 
     started="$(mktemp)"
     if ! bash ./scripts/vllm/benchmarking/run_eval_flow.sh "${eval_args[@]}"; then
+        # The device recovers on its own; a fresh engine a minute later starts.
+        if tpu_session_failed "$results_dir"; then
+            echo "TPU session start failed for $config_name; rerunning it once in 60s"
+            save_tpu_logs "$started" "$results_dir/session_failure"
+            sleep 60
+            touch "$started"
+            if bash ./scripts/vllm/benchmarking/run_eval_flow.sh "${eval_args[@]}"; then
+                rm -f "$started"
+                continue
+            fi
+        fi
         echo "::error::Perf/Eval failed for config: $config_name"
         fail=1
         save_tpu_logs "$started" "$results_dir"

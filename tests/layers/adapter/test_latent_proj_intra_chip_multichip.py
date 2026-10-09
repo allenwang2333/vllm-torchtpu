@@ -27,7 +27,6 @@ import os
 import signal
 import subprocess
 import sys
-import time
 import traceback
 from pathlib import Path
 
@@ -251,21 +250,19 @@ def _run_worker_group_once(result_dir: Path) -> subprocess.CompletedProcess[str]
 
 
 def _run_worker_group(result_dir: Path) -> subprocess.CompletedProcess[str]:
-    """Run the workers, retrying through the device-teardown race.
+    """Run the workers, relaunching while they cannot get their TPU session.
 
-    In the full CI session an in-process engine test runs before this file,
-    and its workers release the TPUs asynchronously. Spawned too soon after,
-    this test's workers fail init_process_group with "PjRtClient is not
-    initialized" (CI build 3112). That is a transient resource race, not a
-    code defect, so wait for the devices to drain and try again.
+    Spawned right after another worker group, the workers can find the chips
+    still resetting and fail init_process_group with "PjRtClient is not
+    initialized" (CI builds 3112, 4179). A fresh group a minute later starts.
     """
-    completed = _run_worker_group_once(result_dir)
-    attempts = 1
-    while "PjRtClient is not initialized" in (completed.stdout or "") and attempts < 3:
-        attempts += 1
-        time.sleep(60)
-        completed = _run_worker_group_once(result_dir)
-    return completed
+    from tests.distributed.tpu_test_utils import run_worker_group_with_retry
+
+    return run_worker_group_with_retry(
+        lambda: _run_worker_group_once(result_dir),
+        attempts=3,
+        before_retry=lambda: [p.unlink() for p in result_dir.glob("rank_*.json")],
+    )
 
 
 def test_intra_chip_gather_matches_the_replicated_projection(tmp_path):

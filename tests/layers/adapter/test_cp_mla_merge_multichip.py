@@ -441,13 +441,21 @@ def assert_merge_results(results: list[dict]) -> None:
                 )
 
 
+# One launch can sit about eight minutes before a failed TPU session start
+# surfaces, so the default per-test timeout leaves no room to relaunch.
+@pytest.mark.timeout(2 * LAUNCH_TIMEOUT_SECONDS + 120)
 def test_all_to_all_merge_on_real_collectives(tmp_path):
+    from tests.distributed.tpu_test_utils import run_worker_group_with_retry
+
     result_dir = tmp_path / "dcp_merge"
     result_dir.mkdir()
     extra = []
     if os.environ.get("DCP_MERGE_BENCH_TOKENS"):
         extra = ["--bench-tokens", os.environ["DCP_MERGE_BENCH_TOKENS"]]
-    completed = _launch(result_dir, extra)
+    completed = run_worker_group_with_retry(
+        lambda: _launch(result_dir, extra),
+        before_retry=lambda: [p.unlink() for p in result_dir.glob("rank_*.json")],
+    )
     results = _results(result_dir, WORLD_SIZE)
     for line in (completed.stdout or "").splitlines():
         if line.startswith("BENCH "):
