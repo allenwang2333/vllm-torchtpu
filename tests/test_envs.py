@@ -94,3 +94,20 @@ def test_qwen35_serve_cli_defaults_ignores_vllm_bench_serve(monkeypatch):
     monkeypatch.setattr(sys, "argv", list(orig_argv))
     env_override._apply_qwen35_serve_cli_defaults()
     assert sys.argv == orig_argv
+
+
+def test_restored_qwen35_sampling_and_draft_defaults(monkeypatch):
+    import vllm_torchtpu.envs as envs
+
+    for key in (
+        "TPU_GREEDY_TOP_TOKENS",
+        "TPU_SAMPLER_TOPK_CANDIDATES",
+        "VLLM_TPU_FUSED_DRAFT_LOOP",
+        "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    assert envs.environment_variables["TPU_GREEDY_TOP_TOKENS"]() is True
+    assert envs.environment_variables["TPU_SAMPLER_TOPK_CANDIDATES"]() == 64
+    assert envs.environment_variables["VLLM_TPU_FUSED_DRAFT_LOOP"]() is True
+    assert envs.environment_variables["VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP"]() is True

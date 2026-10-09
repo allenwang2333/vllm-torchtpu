@@ -807,20 +807,26 @@ def patched_sparse_moe_forward(
         hidden_states=hidden_states,
         router_logits=router_logits,
     )
-    # When Fused EP v3 owns dispatch (`USE_MOE_FUSED_EP_KERNEL=1`),
-    # `_apply_owning_dispatch_v3` already performs `ep.combine` (all-reduce for
-    # SP=0, or in-kernel combine for SP=1). When `USE_MOE_FUSED_EP_KERNEL=0` and
-    # `se_is_replicated=False`, `skip_final_all_reduce=True` leaves
-    # `final_hidden_states` unreduced across EP/TP so it can be all-reduced
-    # together with `shared_output`.
+    # When Fused EP (v3 or v2) owns dispatch (`USE_MOE_FUSED_EP_KERNEL=1`),
+    # `self.experts(...)` already returns `final_hidden_states` reduced across
+    # EP/TP (`_apply_owning_dispatch_v3` or `fused_moe_ep` v2). When
+    # `USE_MOE_FUSED_EP_KERNEL=0` and `se_is_replicated=False`,
+    # `skip_final_all_reduce=True` leaves `final_hidden_states` unreduced across
+    # EP/TP so it can be all-reduced together with `shared_output`.
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+        fused_moe_ep_supported as fused_moe_ep_v2_supported,
+    )
     from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
         fused_moe_ep_supported as fused_moe_ep_v3_supported,
     )
 
     routed_experts = getattr(self.experts, "routed_experts", self.experts)
-    v3_owns_combine = envs.USE_MOE_FUSED_EP_KERNEL and (
+    qm = getattr(routed_experts, "quant_method", None)
+    fused_ep_owns_combine = envs.USE_MOE_FUSED_EP_KERNEL and (
         fused_moe_ep_v3_supported(routed_experts)
-        or fused_moe_ep_v3_supported(getattr(routed_experts, "quant_method", None))
+        or fused_moe_ep_v3_supported(qm)
+        or fused_moe_ep_v2_supported(routed_experts)
+        or fused_moe_ep_v2_supported(qm)
     )
     se_is_replicated = bool(
         getattr(self, "_fused_se_is_replicated", False)
@@ -830,7 +836,7 @@ def patched_sparse_moe_forward(
     if se_is_replicated:
         final_hidden_states = final_hidden_states + shared_output
     else:
-        if tp_size > 1 and v3_owns_combine:
+        if tp_size > 1 and fused_ep_owns_combine:
             shared_output = tensor_model_parallel_all_reduce(shared_output)
             final_hidden_states = final_hidden_states + shared_output
         else:

@@ -615,9 +615,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_LOWTOK": env_bool("TPU_MOE_LOWTOK", default=True),
     "TPU_MOE_LOWTOK_FROM_SCORES": env_bool("TPU_MOE_LOWTOK_FROM_SCORES", default=True),
     "TPU_MOE_LOWTOK_IDS": env_bool("TPU_MOE_LOWTOK_IDS", default=True),
-    "TPU_MOE_LOWTOK_MAX_TOKENS": env_nonnegative_int(
-        "TPU_MOE_LOWTOK_MAX_TOKENS", 256
-    ),
+    "TPU_MOE_LOWTOK_MAX_TOKENS": env_nonnegative_int("TPU_MOE_LOWTOK_MAX_TOKENS", 256),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
@@ -640,7 +638,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_KERNEL_RELOAD_MODULES": lambda: os.getenv("TPU_KERNEL_RELOAD_MODULES", ""),
     # Greedy steps without logprobs or grammar take the vocabulary-parallel
     # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
-    "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
+    "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS", default=True),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.
@@ -1011,7 +1009,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
-        "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", default=False
+        "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", default=True
     ),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
@@ -1050,13 +1048,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_TPU_FAST_TOKEN_SUBSTITUTION", default=True
     ),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
-    # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
+    # (spec_decode/mtp_fused_loop.py).
     # TODO: support the two cases that still take the per-step loop:
     #   - GLM-5.2 / Gemma-4 MTP: IndexShare's per-chunk top-k restore, and a
     #     KV-sharing draft's fixed positions and seq_lens.
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
-    "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP", default=True),
     # Gather last-token rows immediately after self_attn.attn(q, k, v) on MTP
     # draft step 0 so gate, o_proj, post-attention norm, MoE, and final RMSNorm
     # execute on p = pad(num_reqs) rows instead of all T verify rows.
@@ -1068,7 +1066,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 searches the full vocab. Used only when every active request has
     # 1 <= top_k <= value // 2 and no grammar mask applies.
     "TPU_SAMPLER_TOPK_CANDIDATES": env_nonnegative_int(
-        "TPU_SAMPLER_TOPK_CANDIDATES", 0
+        "TPU_SAMPLER_TOPK_CANDIDATES", 64
     ),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
@@ -1095,9 +1093,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS": env_nonnegative_int(
         "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS", 64
     ),
-    "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": env_int(
-        "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 64
-    ),
+    "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": env_int("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 64),
     "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "512")),
     "TPU_SP_FP8_GATHER": env_bool("TPU_SP_FP8_GATHER", default=True),
     # --- PrefixAwareScheduler SRPF & cold-prefill chunk capping ---
@@ -1106,24 +1102,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Max prefill tokens per step for a cold prefill (remaining > threshold)
     # when num_decoding >= TPU_SCHED_COLD_MIN_DECODERS or (in `running`) when
     # `waiting` is non-empty. 0 disables capping.
-    "TPU_SCHED_COLD_CHUNK_CAP": env_nonnegative_int(
-        "TPU_SCHED_COLD_CHUNK_CAP", 2048
-    ),
+    "TPU_SCHED_COLD_CHUNK_CAP": env_nonnegative_int("TPU_SCHED_COLD_CHUNK_CAP", 2048),
     # Remaining uncached prompt tokens threshold defining a cold prefill.
-    "TPU_SCHED_COLD_THRESHOLD": env_nonnegative_int(
-        "TPU_SCHED_COLD_THRESHOLD", 8192
-    ),
+    "TPU_SCHED_COLD_THRESHOLD": env_nonnegative_int("TPU_SCHED_COLD_THRESHOLD", 8192),
     # Minimum active decoding requests before cold-prefill chunk capping
     # activates when `waiting` is empty.
     "TPU_SCHED_COLD_MIN_DECODERS": env_nonnegative_int(
         "TPU_SCHED_COLD_MIN_DECODERS", 12
     ),
-    "TPU_SCHED_STEP_TOTAL_CAP": env_nonnegative_int(
-        "TPU_SCHED_STEP_TOTAL_CAP", 4096
-    ),
-    "TPU_SCHED_WARM_STREAK": env_nonnegative_int(
-        "TPU_SCHED_WARM_STREAK", 0
-    ),
+    "TPU_SCHED_STEP_TOTAL_CAP": env_nonnegative_int("TPU_SCHED_STEP_TOTAL_CAP", 4096),
+    "TPU_SCHED_WARM_STREAK": env_nonnegative_int("TPU_SCHED_WARM_STREAK", 0),
     "TPU_SCHED_WARM_MIN_DECODERS": env_nonnegative_int(
         "TPU_SCHED_WARM_MIN_DECODERS", 24
     ),
