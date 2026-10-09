@@ -531,6 +531,8 @@ class TestPagedCacheRows:
         paged = v2_cache.PagedCacheRows(raw, layout)
 
         assert paged.numel() == 16 * 4 * 128
+        # Upstream Engram.ensure_cache reads kv_cache.device (eager KV_SHARD).
+        assert paged.device == raw.device
         slots = torch.tensor([0, 1, 4, 7])
         # row_offset = 512 // 256 = 2, page_stride = 1024 // 256 = 4
         # slots // 4 * 4 + slots % 4 + 2 -> slot + 2

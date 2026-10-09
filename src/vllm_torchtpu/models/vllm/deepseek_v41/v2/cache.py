@@ -451,6 +451,12 @@ class PagedCacheRows:
     def numel(self):
         return math.prod(self.shape)
 
+    @property
+    def device(self):
+        # Upstream Engram.ensure_cache allocates its slot cache on
+        # ``kv_cache.device``; eager KV_SHARD returns this view, not a tensor.
+        return self.raw.device
+
     def row_indices(self, slots):
         if not self.sharded and self.page_stride == self.shape[1]:
             return slots if self.row_offset == 0 else self.row_offset + slots
