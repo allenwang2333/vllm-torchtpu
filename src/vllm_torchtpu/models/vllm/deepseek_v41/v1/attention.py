@@ -121,14 +121,15 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
 
     @property
     def kv_cache(self):
-        raw = getattr(self, "_tpu_raw_cache", None)
-        if raw is not None:
-            return raw.view(self._tpu_kernel_shape), self._bound_cache[1]
+        viewed = getattr(self, "_tpu_viewed_cache", None)
+        if viewed is not None:
+            return viewed
         return self._bound_cache
 
     @kv_cache.setter
     def kv_cache(self, cache):
         self._bound_cache = cache
+        self._tpu_viewed_cache = None
 
     def bind_kv_cache(self, cache, *, raw_cache=None, layout=None):
         if not isinstance(cache, tuple) or len(cache) != 2:
@@ -141,6 +142,11 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
         self.kv_cache = cache
         self._tpu_raw_cache = raw_cache
         self._tpu_kernel_shape = tuple(cache[0].shape)
+        self._tpu_viewed_cache = (
+            (raw_cache.view(self._tpu_kernel_shape), cache[1])
+            if raw_cache is not None
+            else None
+        )
         self.cache_num_states = layout.shape[1]
 
     def get_kv_cache_spec(self, vllm_config):
@@ -399,6 +405,19 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
             )
         return selected
 
+    def _get_window_offsets(self, device: torch.device) -> torch.Tensor:
+        offsets = getattr(self, "_window_offsets", None)
+        if (
+            offsets is None
+            or offsets.device != device
+            or offsets.shape[1] != self.window_size
+        ):
+            offsets = torch.arange(
+                1 - self.window_size, 1, device=device, dtype=torch.int64
+            )[None, :]
+            self._window_offsets = offsets
+        return offsets
+
     def forward_mqa(self, q, kv, positions, output, *, topk_indices=None):
         if not self._ced_decoder:
             output.copy_(
@@ -419,12 +438,7 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
         requests = cache_ops.token_requests(swa, positions).clamp(
             max=table.shape[0] - 1
         )
-        logical = (
-            positions[:, None]
-            - self.window_size
-            + 1
-            + torch.arange(self.window_size, device=positions.device)[None]
-        )
+        logical = positions[:, None] + self._get_window_offsets(positions.device)
         replay_starts = get_forward_context().additional_kwargs[
             "deepseek_v41_replay_starts"
         ]
