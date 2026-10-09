@@ -18,6 +18,7 @@ predicate, and the construction of the byte-range request plan from
 safetensors metadata. No TPU, no network: the Run:AI streamer is faked.
 """
 
+import json
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -26,6 +27,7 @@ import pytest
 
 from vllm_torchtpu.model_loader_patches import (
     _compute_local_expert_ids,
+    _indexed_model_weights_only,
     _sharded_runai_weights_iterator,
     _should_skip,
 )
@@ -35,6 +37,22 @@ from vllm_torchtpu.model_loader_patches import (
 # ---------------------------------------------------------------------------
 
 _LOCAL = {0, 1, 27}
+
+
+def test_static_moe_sidecars_are_not_streamed_as_model_weights(tmp_path):
+    (tmp_path / "STATIC_MOE_READY.json").write_text(
+        json.dumps({"schema": "dsv41.static-moe.ep8.v2"})
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a": "model-00001.safetensors"}})
+    )
+    files = [
+        "gs://bucket/model/static-moe/layer-00-rank-0.safetensors",
+        "gs://bucket/model/model-00001.safetensors",
+    ]
+    assert _indexed_model_weights_only(files, str(tmp_path)) == [files[1]]
+    with pytest.raises(ValueError, match="model shards differ"):
+        _indexed_model_weights_only(files[:1], str(tmp_path))
 
 
 def test_local_expert_ids_use_loader_ownership_mapping():

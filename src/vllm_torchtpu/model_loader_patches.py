@@ -58,6 +58,7 @@ import threading
 import time
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import torch
 
@@ -354,6 +355,28 @@ def _sharded_runai_weights_iterator(
             _device_sync()
 
 
+def _indexed_model_weights_only(files: list[str], static_root: str) -> list[str]:
+    """Keep v2 static MoE sidecars out of the ordinary Run:AI weight stream."""
+    root = Path(static_root)
+    ready = json.loads((root / "STATIC_MOE_READY.json").read_text())
+    if ready.get("schema") != "dsv41.static-moe.ep8.v2":
+        return files
+    index = json.loads((root / "model.safetensors.index.json").read_text())
+    expected = set(index["weight_map"].values())
+    selected = [file for file in files if Path(file).name in expected]
+    if {Path(file).name for file in selected} != expected or len(selected) != len(
+        expected
+    ):
+        raise ValueError("Run:AI model shards differ from the static MoE model index")
+    logger.info(
+        "[sharded-ep-load] selected %d indexed model shards; excluded %d "
+        "static MoE sidecar files",
+        len(selected),
+        len(files) - len(selected),
+    )
+    return selected
+
+
 def patch_runai_sharded_expert_streaming() -> None:
     """Make ``RunaiModelStreamerLoader`` fetch only this rank's tensors.
 
@@ -397,6 +420,10 @@ def patch_runai_sharded_expert_streaming() -> None:
                 "plans; streaming per rank instead."
             )
         hf_weights_files = self._prepare_weights(model_or_path, revision)
+        if static_root := envs.TPU_DSV41_STATIC_MOE_DIR:
+            hf_weights_files = _indexed_model_weights_only(
+                hf_weights_files, static_root
+            )
         return _sharded_runai_weights_iterator(
             hf_weights_files, local_expert_ids, self.load_config.use_tqdm_on_load
         )
