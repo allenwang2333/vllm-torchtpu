@@ -801,6 +801,22 @@ class TestRopeHelpersAndBody:
         assert out_ref.arr.shape == (2, 4, 256)
         assert np.isfinite(out_ref.arr).all()
 
+        # Test _cos_sin_body
+        cs_in_ref = MockArrayRef(np.ones((2, 64), dtype=np.float32))
+        cs_out_ref = MockArrayRef(np.zeros((2, 2 * rope.LANE), dtype=np.float32))
+        rope._cos_sin_body(
+            cs_in_ref,
+            cs_out_ref,
+            rotary_dim=64,
+            inverse=False,
+            out_dtype=jnp.float32,
+        )
+        assert cs_out_ref.arr.shape == (2, 2 * rope.LANE)
+        np.testing.assert_array_equal(cs_out_ref.arr[:, :64], 1.0)
+        np.testing.assert_array_equal(
+            cs_out_ref.arr[:, rope.LANE : rope.LANE + 64], 0.0
+        )
+
     def test_kernel_wiring_branches(self):
         # Test _kernel with 3D block shape (len == 3, line 221) and quant_dtype=None
         def fake_emit(pipeline_fn, grid=None, in_specs=None, out_specs=None):
@@ -832,7 +848,21 @@ class TestRopeHelpersAndBody:
             ),
             patch.object(rope.pltpu.BufferedRef, "input", return_value=mock_alloc),
             patch.object(rope.pltpu.BufferedRef, "output", return_value=mock_alloc),
+            patch.object(rope.CosSinRef, "create", return_value=mock_alloc),
         ):
+            # Test _cos_sin_kernel (covers lines 190-229)
+            rope._cos_sin_kernel(
+                MockArrayRef(np.zeros((16,), dtype=np.int32)),
+                MockArrayRef(np.zeros((100, 64), dtype=np.float32)),
+                MockArrayRef(np.zeros((16, 2 * rope.LANE), dtype=np.float32)),
+                num_tiles=1,
+                tile_n=16,
+                rotary_dim=64,
+                inverse=False,
+                cos_sin_dtype=jnp.float32,
+                out_dtype=jnp.float32,
+            )
+
             # 3D block shape, quant_dtype=None (covers lines 221-222, 238-246)
             # *out_hbm_refs is passed positionally after cos_sin_hbm_ref
             cs_ref = MockArrayRef(np.zeros((16, 2 * rope.LANE), dtype=np.float32))

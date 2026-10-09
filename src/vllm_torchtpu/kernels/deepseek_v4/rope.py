@@ -29,6 +29,25 @@ LANE = 128
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
 
+_BUFFERED_REF_FIELD_NAMES: tuple[str, ...] = tuple(
+    f.name for f in dataclasses.fields(pltpu.BufferedRef)
+)
+_HBM_BLOCK_SPEC = pl.BlockSpec(memory_space=pltpu.HBM)
+_HBM_IN_SPECS_1 = (_HBM_BLOCK_SPEC,)
+_HBM_IN_SPECS_2 = (_HBM_BLOCK_SPEC, _HBM_BLOCK_SPEC)
+_PREFETCH_1_GRID_SPEC = pltpu.PrefetchScalarGridSpec(
+    num_scalar_prefetch=1,
+    in_specs=_HBM_IN_SPECS_1,
+    out_specs=_HBM_BLOCK_SPEC,
+)
+_ALIAS_0_TO_0 = {0: 0}
+_EMPTY_ALIASES: dict[int, int] = {}
+_COMPILER_PARAMS = pltpu.CompilerParams(
+    vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+    disable_bounds_checks=True,
+)
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class CosSinRef(pltpu.BufferedRef):
@@ -50,10 +69,7 @@ class CosSinRef(pltpu.BufferedRef):
         )
         return cls(
             tile_n=tile_n,
-            **{
-                f.name: getattr(standard_ref, f.name)
-                for f in dataclasses.fields(pltpu.BufferedRef)
-            },
+            **{name: getattr(standard_ref, name) for name in _BUFFERED_REF_FIELD_NAMES},
         )
 
     def copy_in(
@@ -64,14 +80,15 @@ class CosSinRef(pltpu.BufferedRef):
         cos_sin_cache_ref, positions_ref = src_ref
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
-        pid = grid_indices[0]
+        tile_n = self.tile_n
+        base_idx = grid_indices[0] * tile_n
 
         dest_ref = self.window_ref.at[slot]  # (tile_n, rotary_dim)
         width = self.window_ref.shape[-1]
 
-        @pl.loop(0, self.tile_n, unroll=True)
+        @pl.loop(0, tile_n, unroll=True)
         def _(i):
-            position = positions_ref[pid * self.tile_n + i]
+            position = positions_ref[base_idx + i]
             src = cos_sin_cache_ref.at[position, pl.ds(0, width)]
             pltpu.make_async_copy(src, dest_ref.at[i, :], sem).start()
 
@@ -86,15 +103,10 @@ class CosSinRef(pltpu.BufferedRef):
         pltpu.make_async_copy(vmem_ref, vmem_ref, self.sem_recvs.at[slot]).wait()
 
 
-def _lane_gather(operand: jax.Array, indices: jax.Array) -> jax.Array:
-    """``out[b..., i] = operand[b..., indices[i]]`` over the last axis.
-
-    The leading axes come along as batch dimensions. ``indices`` is a constant
-    1-D array.
-    """
-    rank = operand.ndim
-    lanes = indices.shape[0]
-    coords = jnp.broadcast_to(indices, (*operand.shape[:-1], lanes))[..., None]
+@functools.lru_cache(maxsize=4)
+def _lane_gather_spec(
+    rank: int,
+) -> tuple[jax.lax.GatherDimensionNumbers, tuple[int, ...]]:
     batching = tuple(range(rank - 1))
     dimension_numbers = jax.lax.GatherDimensionNumbers(
         offset_dims=(),
@@ -103,11 +115,23 @@ def _lane_gather(operand: jax.Array, indices: jax.Array) -> jax.Array:
         operand_batching_dims=batching,
         start_indices_batching_dims=batching,
     )
+    return dimension_numbers, (1,) * rank
+
+
+def _lane_gather(operand: jax.Array, indices: jax.Array) -> jax.Array:
+    """``out[b..., i] = operand[b..., indices[i]]`` over the last axis.
+
+    The leading axes come along as batch dimensions. ``indices`` is a constant
+    1-D array.
+    """
+    lanes = indices.shape[0]
+    coords = jnp.broadcast_to(indices, (*operand.shape[:-1], lanes))[..., None]
+    dimension_numbers, slice_sizes = _lane_gather_spec(operand.ndim)
     return jax.lax.gather(
         operand,
         coords,
         dimension_numbers=dimension_numbers,
-        slice_sizes=(1,) * rank,
+        slice_sizes=slice_sizes,
         unique_indices=False,
         mode=jax.lax.GatherScatterMode.PROMISE_IN_BOUNDS,
     )
@@ -270,15 +294,8 @@ def gather_cos_sin(
             out_dtype=out_dtype,
         ),
         out_shape=jax.ShapeDtypeStruct((num_tokens, 2 * LANE), out_dtype),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
-            in_specs=(pl.BlockSpec(memory_space=pltpu.HBM),),
-            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-        ),
-        compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
-            disable_bounds_checks=True,
-        ),
+        grid_spec=_PREFETCH_1_GRID_SPEC,
+        compiler_params=_COMPILER_PARAMS,
         name=name,
     )(positions, cos_sin_cache)
 
@@ -370,21 +387,16 @@ def _kernel(
         q_hbm_ref, scale_hbm_ref = out_hbm_refs
         x_ref_args = (x_hbm_ref,)
         out_ref_args = (q_hbm_ref, scale_hbm_ref)
-        q_spec = pl.BlockSpec(
-            block_shape=x_block_shape,
-            memory_space=pltpu.VMEM,
-            index_map=x_index_map,
-        )
         scale_spec = pl.BlockSpec(
             block_shape=scale_block_shape,
             memory_space=pltpu.VMEM,
             # Same block as ``q``, minus the channel axis it reduces away.
             index_map=lambda i: x_index_map(i)[:-1],
         )
-        out_specs = [q_spec, scale_spec]
+        out_specs = [x_spec, scale_spec]
         x_alloc = pltpu.BufferedRef.input(x_spec, in_dtype, buffer_count=2)
         out_allocs = (
-            pltpu.BufferedRef.output(q_spec, quant_dtype, buffer_count=2),
+            pltpu.BufferedRef.output(x_spec, quant_dtype, buffer_count=2),
             pltpu.BufferedRef.output(scale_spec, jnp.float32, buffer_count=2),
         )
 
@@ -550,32 +562,23 @@ def _rope_call(
 
     if quant_dtype is None:
         out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
-        out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
-        input_output_aliases = {0: 0}  # x -> out
+        out_specs = _HBM_BLOCK_SPEC
+        input_output_aliases = _ALIAS_0_TO_0  # x -> out
     else:
         out_shape = (
             jax.ShapeDtypeStruct(x.shape, quant_dtype),
             jax.ShapeDtypeStruct(x.shape[:-1], jnp.float32),
         )
-        out_specs = (
-            pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.HBM),
-        )
-        input_output_aliases = {}
+        out_specs = _HBM_IN_SPECS_2
+        input_output_aliases = _EMPTY_ALIASES
 
     return pl.pallas_call(
         kernel,
         out_shape=out_shape,
-        in_specs=(
-            pl.BlockSpec(memory_space=pltpu.HBM),  # x
-            pl.BlockSpec(memory_space=pltpu.HBM),  # cos_sin table
-        ),
+        in_specs=_HBM_IN_SPECS_2,  # (x, cos_sin table)
         out_specs=out_specs,
         input_output_aliases=input_output_aliases,
-        compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
-            disable_bounds_checks=True,
-        ),
+        compiler_params=_COMPILER_PARAMS,
         name=name,
     )(x, _rope_cos_sin(positions, cos_sin_cache, inverse=inverse))
 
@@ -658,16 +661,10 @@ def qnorm_rope(
     return pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-        in_specs=(
-            pl.BlockSpec(memory_space=pltpu.HBM),  # x
-            pl.BlockSpec(memory_space=pltpu.HBM),  # cos_sin table
-        ),
-        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-        input_output_aliases={0: 0},  # x -> out
-        compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
-            disable_bounds_checks=True,
-        ),
+        in_specs=_HBM_IN_SPECS_2,  # (x, cos_sin table)
+        out_specs=_HBM_BLOCK_SPEC,
+        input_output_aliases=_ALIAS_0_TO_0,  # x -> out
+        compiler_params=_COMPILER_PARAMS,
         name=name,
     )(x, _rope_cos_sin(positions, cos_sin_cache, inverse=inverse))
 
