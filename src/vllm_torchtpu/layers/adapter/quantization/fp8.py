@@ -112,12 +112,15 @@ logger = init_logger(__name__)
 
 _MOE_REQUANT_WEIGHT_DTYPES = {
     "float8_e4m3fn": torch.float8_e4m3fn,
+    "float8_e5m2": torch.float8_e5m2,
     "int8": torch.int8,
 }
-if hasattr(torch, "float8_e5m2"):
-    _MOE_REQUANT_WEIGHT_DTYPES["float8_e5m2"] = torch.float8_e5m2
 
 LinearQuantConfig = tuple[str, torch.dtype, int | None, bool]
+
+
+def _noop_init_fp8_linear_kernel(*args, **kwargs) -> None:
+    return None
 
 
 def _dequantize_fp8_linear(
@@ -184,9 +187,7 @@ def _get_moe_quant_config(
 
     requant_block_size = None
     if requant_block_size_from_env := envs.MOE_REQUANTIZE_BLOCK_SIZE:
-        requant_block_size = (
-            int(requant_block_size_from_env) if requant_block_size_from_env else None
-        )
+        requant_block_size = int(requant_block_size_from_env)
 
     requant_dtype = _MOE_REQUANT_WEIGHT_DTYPES.get(desired_quant_dtype)
     if requant_dtype is None:
@@ -387,11 +388,10 @@ def _quantize_and_format_single_moe_weight(
     # contiguous device buffer with `torch.empty + .copy_` to break the
     # view chain so the persistent storage is a plain 4D buffer that PJRT
     # ships to the kernel with row-major layout.
-    if w_scale is not None:
-        s = w_scale.transpose(1, 2).contiguous().to(torch.float32)
-        w_scale = torch.empty(
-            s.shape[0], s.shape[1], 1, s.shape[2], dtype=s.dtype, device=s.device
-        ).copy_(s.unsqueeze(2))
+    s = w_scale.to(torch.float32).transpose(1, 2)
+    w_scale = torch.empty(
+        s.shape[0], s.shape[1], 1, s.shape[2], dtype=s.dtype, device=s.device
+    ).copy_(s.unsqueeze(2))
 
     return w, w_scale
 
@@ -407,7 +407,7 @@ def _requantize_expert_chunks(
     dequantize: Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor],
     zero_padding: Callable[[torch.Tensor], None] | None,
     **format_kwargs,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Dequantize, requantize and format ``weight`` a few experts at a time.
 
     The float32 copy of a whole expert tensor can be several times the
@@ -433,44 +433,12 @@ def _requantize_expert_chunks(
         w, w_scale = _quantize_and_format_single_moe_weight(fp32, **format_kwargs)
         del fp32
         if per_chunk < num_experts and w.device.type == "tpu":
-            synchronize_tensors([w] if w_scale is None else [w, w_scale])
+            synchronize_tensors([w, w_scale])
         weights.append(w)
         scales.append(w_scale)
     if len(weights) == 1:
         return weights[0], scales[0]
-    w = torch.cat(weights, dim=0)
-    w_scale = None if scales[0] is None else torch.cat(scales, dim=0)
-    return w, w_scale
-
-
-def _quantize_and_format_moe_weights(
-    w13: torch.Tensor,
-    w2: torch.Tensor,
-    *,
-    quant_dtype: torch.dtype,
-    block_size: int | None,
-    activation: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize float32 MoE weights to FP8 and format for the GMM kernel.
-
-    Handles block alignment validation, quantization, swigluoai
-    deinterleaving, transpose, and scale reshaping.
-    """
-    w13, w13_scale = _quantize_and_format_single_moe_weight(
-        w13,
-        name="w13",
-        quant_dtype=quant_dtype,
-        block_size=block_size,
-        activation=activation,
-    )
-    w2, w2_scale = _quantize_and_format_single_moe_weight(
-        w2,
-        name="w2",
-        quant_dtype=quant_dtype,
-        block_size=block_size,
-        activation=activation,
-    )
-    return w13, w13_scale, w2, w2_scale
+    return torch.cat(weights, dim=0), torch.cat(scales, dim=0)
 
 
 def _process_fp8_moe_weights(
@@ -559,7 +527,7 @@ def _process_fp8_moe_weights(
             if s13.ndim == 2 and s13.shape[1] == 2:
                 half = w_q.shape[1] // 2
                 s13 = s13.repeat_interleave(half, dim=1).unsqueeze(-1)
-            elif s13.ndim == 2 and s13.shape[1] == w_q.shape[1]:
+            elif s13.ndim == 2:
                 s13 = s13.unsqueeze(-1)
             elif s13.ndim == 1:
                 s13 = s13.view(-1, 1, 1)
@@ -571,7 +539,7 @@ def _process_fp8_moe_weights(
             assert scale is not None
             w_q = w_q.to(torch.float32)
             s2 = scale.to(torch.float32)
-            if s2.ndim == 2 and s2.shape[1] == w_q.shape[1]:
+            if s2.ndim == 2:
                 s2 = s2.unsqueeze(-1)
             elif s2.ndim == 1:
                 s2 = s2.view(-1, 1, 1)
@@ -1201,7 +1169,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         self.weight_quant_key = None
         self.input_dtype = torch.get_default_dtype()
         self.out_dtype = torch.get_default_dtype()
-        vllm_fp8.init_fp8_linear_kernel = lambda *args, **kwargs: None
+        vllm_fp8.init_fp8_linear_kernel = _noop_init_fp8_linear_kernel
         self.linear_config = linear_config
 
         if quant_config.is_checkpoint_fp8_serialized:

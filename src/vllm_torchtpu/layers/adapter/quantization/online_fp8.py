@@ -38,7 +38,13 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-@dataclass
+_VALID_ONLINE_FP8_FIELDS = frozenset(
+    ("enabled", "weight_scheme", "weight_block_size", "targets", "exclude")
+)
+_VALID_ONLINE_FP8_SCHEMES = frozenset(("per_channel", "per_tensor", "per_block"))
+
+
+@dataclass(slots=True)
 class OnlineFp8Policy:
     targets: list[str]
     exclude: list[str]
@@ -53,13 +59,7 @@ class OnlineFp8Policy:
             return None
         if not isinstance(value, dict):
             raise ValueError("tpu_online_fp8 must be an object")
-        unknown = set(value) - {
-            "enabled",
-            "weight_scheme",
-            "weight_block_size",
-            "targets",
-            "exclude",
-        }
+        unknown = set(value) - _VALID_ONLINE_FP8_FIELDS
         if unknown:
             raise ValueError(f"Unknown tpu_online_fp8 fields: {sorted(unknown)}")
         enabled = value.get("enabled", False)
@@ -68,7 +68,7 @@ class OnlineFp8Policy:
         if not enabled:
             return None
         scheme = value.get("weight_scheme", "per_channel")
-        if scheme not in ("per_channel", "per_tensor", "per_block"):
+        if scheme not in _VALID_ONLINE_FP8_SCHEMES:
             raise ValueError(
                 "tpu_online_fp8.weight_scheme must be "
                 "per_channel, per_tensor, or per_block"
@@ -124,9 +124,12 @@ class OnlineFp8Policy:
         for alias in aliases:
             names = (prefix, alias)
             hits = {p for p in self.targets if any(fnmatchcase(n, p) for n in names)}
-            self.matched.update(hits)
-            excluded = any(fnmatchcase(n, p) for n in names for p in self.exclude)
-            choices.append(bool(hits) and not excluded)
+            if hits:
+                self.matched.update(hits)
+                excluded = any(fnmatchcase(n, p) for n in names for p in self.exclude)
+                choices.append(not excluded)
+            else:
+                choices.append(False)
         if any(choices) and not all(choices):
             raise ValueError(
                 f"Partial fused-layer online FP8 selection: {prefix}; "

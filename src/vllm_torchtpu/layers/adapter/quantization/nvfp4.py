@@ -122,8 +122,7 @@ def _fresh(t: torch.Tensor) -> torch.Tensor:
 def _to_kernel_scale(scale_f32: torch.Tensor) -> torch.Tensor:
     """[*, out, num_blocks] fp32 -> [*, num_blocks, 1, out] fp32 (gmm_v2 rhs
     scale layout), as a fresh contiguous buffer."""
-    s = scale_f32.transpose(-1, -2).contiguous()  # [*, num_blocks, out]
-    return _fresh(s.unsqueeze(-2))  # [*, num_blocks, 1, out]
+    return _fresh(scale_f32.transpose(-1, -2).unsqueeze(-2))
 
 
 def _requant_moe_w4a8(
@@ -171,7 +170,7 @@ def _requant_moe_w4a8(
     w2_out = pack_fp4_indices(w2_idx)  # [E, H, I_pad/2]
     w2_scale_4d = _to_kernel_scale(w2_s.to(torch.float32))
 
-    return (_fresh(w13_out), _fresh(w13_scale_4d), _fresh(w2_out), _fresh(w2_scale_4d))
+    return (_fresh(w13_out), w13_scale_4d, _fresh(w2_out), w2_scale_4d)
 
 
 def _prepare_moe_weights(layer, w13_scale_f, w2_scale_f, requant_block):

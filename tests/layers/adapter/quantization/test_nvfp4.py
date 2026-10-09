@@ -192,13 +192,17 @@ class TestNvfp4Config:
         assert isinstance(method, VllmNvfp4MoEMethod)
         assert method.quant_config is cfg
 
-    def test_get_quant_method_moe_excluded(self, vllm_config_context):
+    def test_get_quant_method_moe_excluded(self):
+        from vllm.config import set_current_vllm_config
+
         cfg = VllmNvfp4Config.from_config({"quant_algo": "NVFP4"})
         cfg.vllm_config = MagicMock()
         cfg.vllm_config.parallel_config.enable_expert_parallel = False
+        cfg.vllm_config.compilation_config.custom_ops = ["all"]
         cfg.exclude_modules = ["model.layers.0.skip_moe"]
         layer = FakeRoutedExperts()
-        method = cfg.get_quant_method(layer, "model.layers.0.skip_moe")
+        with set_current_vllm_config(cfg.vllm_config):
+            method = cfg.get_quant_method(layer, "model.layers.0.skip_moe")
         assert isinstance(method, VllmUnquantizedFusedMoEMethod)
 
     def test_get_quant_method_attention_returns_none(self):

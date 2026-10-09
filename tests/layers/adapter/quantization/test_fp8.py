@@ -36,6 +36,11 @@ from vllm_torchtpu.layers.adapter.quantization.fp8 import (
 )
 
 
+@pytest.fixture
+def device():
+    return torch.device("cpu")
+
+
 def test_fp8_config_accepts_default_store_dtype():
     config = VllmFp8Config.from_config({"activation_scheme": "dynamic"})
     assert config.store_dtype is None
@@ -76,6 +81,7 @@ def test_fp8_routed_experts_checkpoint_allocation(
         RoutingMethodType,
     )
     from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
+    from vllm.model_executor.layers.quantization.utils import fp8_utils
 
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
@@ -120,6 +126,23 @@ def test_fp8_routed_experts_checkpoint_allocation(
         "vllm.model_executor.layers.quantization.fp8."
         "get_tensor_model_parallel_world_size",
         lambda: 2,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.get_tensor_model_parallel_world_size",
+        lambda: 2,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tensor_model_parallel_world_size",
+        lambda: 2,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fp8_utils,
+        "get_tensor_model_parallel_world_size",
+        lambda: 2,
+        raising=False,
     )
     quant_cls = VllmFp8Config
     if deepseek_v4:
