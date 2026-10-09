@@ -130,6 +130,86 @@ class DeepseekV41DecoderStage(_StageBase):
 
 
 class DeepseekV41Model(upstream.DeepseekV4Model):
+    def _engram_modules(self) -> tuple:
+        """Cached tuple of active Engram modules in `[start_layer, end_layer)`."""
+        layers = getattr(self, "layers", ())
+        start = getattr(self, "start_layer", 0)
+        end = getattr(self, "end_layer", len(layers))
+        key = (id(layers), len(layers), start, end)
+        cached = getattr(self, "_engram_modules_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        engrams = tuple(
+            engram
+            for layer in islice(layers, start, end)
+            if (engram := getattr(layer, "engram", None)) is not None
+        )
+        self._engram_modules_cache = (key, engrams)
+        return engrams
+
+    def _get_ced_replay_starts(
+        self, replay_starts_seq, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Cached device tensor for CED `replay_starts`."""
+        replay_tuple = tuple(replay_starts_seq)
+        replay_key = (replay_tuple, positions.dtype, positions.device)
+        cached_replay = getattr(self, "_ced_replay_starts_cache", None)
+        if cached_replay is not None and cached_replay[0] == replay_key:
+            return cached_replay[1]
+        replay_starts = (
+            torch.tensor(
+                replay_tuple,
+                dtype=positions.dtype,
+                device=positions.device,
+            )
+            if any(replay_tuple)
+            else positions.new_zeros(len(replay_tuple))
+        )
+        self._ced_replay_starts_cache = (replay_key, replay_starts)
+        return replay_starts
+
+    def _get_ced_padding_mask(
+        self, total_tokens: int, valid_tokens: int, device: torch.device
+    ) -> torch.Tensor:
+        """Cached boolean padding mask `[total_tokens]` with `>= valid_tokens` True."""
+        pad_key = (total_tokens, valid_tokens, device)
+        cached_pad = getattr(self, "_ced_padding_mask_cache", None)
+        if cached_pad is not None and cached_pad[0] == pad_key:
+            return cached_pad[1]
+        decoder_padding = torch.arange(total_tokens, device=device) >= valid_tokens
+        self._ced_padding_mask_cache = (pad_key, decoder_padding)
+        return decoder_padding
+
+    def _get_ced_non_identity_tensors(
+        self, plan, num_positions: int, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Cached `(indices, gather, bounds)` for CED replay."""
+        indices_tuple = tuple(plan.indices)
+        qsl_tuple = tuple(plan.query_start_loc)
+        cache_key = (
+            indices_tuple,
+            qsl_tuple,
+            plan.padded_num_tokens,
+            num_positions,
+            positions.device,
+        )
+        cached = getattr(self, "_ced_non_identity_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+        # The extra output row absorbs padded scatter writes. Reusing row
+        # zero for padding would overwrite a real request's first result.
+        indices = torch.tensor(
+            indices_tuple
+            + (num_positions,) * (plan.padded_num_tokens - len(indices_tuple)),
+            dtype=torch.int64,
+            device=positions.device,
+        )
+        gather = indices.clamp(max=num_positions - 1)
+        bounds = torch.tensor(qsl_tuple, dtype=torch.int32, device=positions.device)
+        result = (indices, gather, bounds)
+        self._ced_non_identity_cache = (cache_key, result)
+        return result
+
     def forward(
         self,
         input_ids,
@@ -181,39 +261,41 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             replay_starts = positions.new_zeros(requests)
             indices = None
             decoder_padding = (
-                torch.arange(positions.shape[0], device=positions.device)
-                >= first.query_start_loc[-1]
+                DeepseekV41Model._get_ced_padding_mask(
+                    self,
+                    positions.shape[0],
+                    int(first.query_start_loc[-1]),
+                    positions.device,
+                )
                 if first is not None
                 else torch.zeros_like(positions, dtype=torch.bool)
             )
         else:
-            # The extra output row absorbs padded scatter writes. Reusing row
-            # zero for padding would overwrite a real request's first result.
-            indices = torch.tensor(
-                plan.indices
-                + (positions.shape[0],) * (plan.padded_num_tokens - len(plan.indices)),
-                dtype=torch.int64,
-                device=positions.device,
+            indices, gather, bounds = DeepseekV41Model._get_ced_non_identity_tensors(
+                self, plan, positions.shape[0], positions
             )
-            gather = indices.clamp(max=positions.shape[0] - 1)
             decoder_positions = positions[gather]
             decoder_ids = input_ids[gather] if input_ids is not None else None
             decoder_hidden, decoder_mix = hidden[gather], pre_mix[gather]
-            bounds = torch.tensor(
-                plan.query_start_loc, dtype=torch.int32, device=positions.device
+            replay_starts = DeepseekV41Model._get_ced_replay_starts(
+                self, plan.replay_starts, positions
             )
-            replay_starts = torch.tensor(
-                plan.replay_starts, dtype=positions.dtype, device=positions.device
+            replaced_by_id: dict[int, object] = {}
+            decoder_metadata = {}
+            for key, value in metadata.items():
+                vid = id(value)
+                rep = replaced_by_id.get(vid)
+                if rep is None:
+                    rep = replace(
+                        value,
+                        input_positions=decoder_positions,
+                        query_start_loc=bounds,
+                    )
+                    replaced_by_id[vid] = rep
+                decoder_metadata[key] = rep
+            decoder_padding = DeepseekV41Model._get_ced_padding_mask(
+                self, plan.padded_num_tokens, len(plan.indices), positions.device
             )
-            decoder_metadata = {
-                key: replace(
-                    value, input_positions=decoder_positions, query_start_loc=bounds
-                )
-                for key, value in metadata.items()
-            }
-            decoder_padding = torch.arange(
-                plan.padded_num_tokens, device=positions.device
-            ) >= len(plan.indices)
         decoder_context = replace(
             context,
             attn_metadata=decoder_metadata,
@@ -324,12 +406,10 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 gathered_hashes = upstream.gather_engram_hashes(
                     engram_hashes, dp_shared_memory=self.engram_dp_shared_memory
                 )
-                for layer in islice(self.layers, self.start_layer, self.end_layer):
-                    engram = getattr(layer, "engram", None)
-                    if engram is not None:
-                        engram.prepare_embeddings(
-                            gathered_hashes[:, engram.layer_hash_index]
-                        )
+                for engram in DeepseekV41Model._engram_modules(self):
+                    engram.prepare_embeddings(
+                        gathered_hashes[:, engram.layer_hash_index]
+                    )
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
