@@ -26,6 +26,8 @@ from vllm_torchtpu.kernels.kimi_k3.collectives import (  # isort: skip
 )
 
 _OPS: dict[tuple, Any] = {}
+_RING_COLLECTIVE_WIDTHS = frozenset((2176, 3584, 7168))
+_MLA_PREPROCESS_OUT_WIDTHS = (1536, 512, 64, 384)
 
 
 def _build_mla_ops(mesh, owners, layer, eps):
@@ -36,8 +38,9 @@ def _build_mla_ops(mesh, owners, layer, eps):
         tuple(d.id for d in mesh.devices.flat),
         tuple(owners),
     )
-    if key in _OPS:
-        return _OPS[key]
+    cached = _OPS.get(key)
+    if cached is not None:
+        return cached
     pairs, _, _ = mla_chip_layout(list(mesh.devices.flat), owners)
 
     def pack(weight: jax.Array) -> jax.Array:
@@ -82,7 +85,7 @@ def _build_mla_ops(mesh, owners, layer, eps):
 
     def fake(x, weight, packed_gate, qnorm, kvnorm, sequence_parallel):
         rows = x.shape[0] * 32 if sequence_parallel else x.shape[0]
-        return tuple(x.new_empty((rows, width)) for width in (1536, 512, 64, 384))
+        return tuple(x.new_empty((rows, width)) for width in _MLA_PREPROCESS_OUT_WIDTHS)
 
     op.register_fake(fake)
     _OPS[key] = pack_op, op
@@ -94,10 +97,11 @@ def _build_moe_gather_op(mesh, tables, collective_id):
         "moe_gather",
         collective_id,
         tuple(d.id for d in mesh.devices.flat),
-        tuple(tables.ravel()),
+        tables.tobytes(),
     )
-    if key in _OPS:
-        return _OPS[key]
+    cached = _OPS.get(key)
+    if cached is not None:
+        return cached
 
     def gather(
         x: jax.Array, weights: jax.Array, ids: jax.Array
@@ -115,8 +119,10 @@ def _build_moe_gather_op(mesh, tables, collective_id):
     )
 
     def fake(x, weights, ids):
-        return tuple(
-            a.new_empty((a.shape[0] * 32, a.shape[1])) for a in (x, weights, ids)
+        return (
+            x.new_empty((x.shape[0] * 32, x.shape[1])),
+            weights.new_empty((weights.shape[0] * 32, weights.shape[1])),
+            ids.new_empty((ids.shape[0] * 32, ids.shape[1])),
         )
 
     op.register_fake(fake)
@@ -129,10 +135,11 @@ def _build_op(mesh, tables, gather, collective_id):
         gather,
         collective_id,
         tuple(d.id for d in mesh.devices.flat),
-        tuple(tables.ravel()),
+        tables.tobytes(),
     )
-    if key in _OPS:
-        return _OPS[key]
+    cached = _OPS.get(key)
+    if cached is not None:
+        return cached
 
     def collective(x: jax.Array) -> jax.Array:
         # The bridge assigns a partitioned global shape to this rank's input.
@@ -166,10 +173,11 @@ def _build_project_op(mesh, tables, collective_id):
         "project",
         collective_id,
         tuple(d.id for d in mesh.devices.flat),
-        tuple(tables.ravel()),
+        tables.tobytes(),
     )
-    if key in _OPS:
-        return _OPS[key]
+    cached = _OPS.get(key)
+    if cached is not None:
+        return cached
 
     def project(x: jax.Array, w: jax.Array) -> jax.Array:
         return project_reduce_scatter(
@@ -203,10 +211,11 @@ def _build_gather_project_op(mesh, tables, collective_id):
         "gather_project",
         collective_id,
         tuple(d.id for d in mesh.devices.flat),
-        tuple(tables.ravel()),
+        tables.tobytes(),
     )
-    if key in _OPS:
-        return _OPS[key]
+    cached = _OPS.get(key)
+    if cached is not None:
+        return cached
 
     def project(x: jax.Array, w: jax.Array) -> jax.Array:
         result = gather_project(
@@ -325,10 +334,17 @@ class FusedPrefillCollectives:
 
     def gather_moe_inputs(self, latent, weights, ids, *, num_experts):
         """Gather token activations and routes, packing compatible BF16 inputs."""
-        weights, ids = weights.to(latent.dtype), ids.to(torch.int32)
+        if weights.dtype != latent.dtype:
+            weights = weights.to(latent.dtype)
+        if ids.dtype != torch.int32:
+            ids = ids.to(torch.int32)
         if num_experts <= 32768 and weights.dtype == torch.bfloat16:
             return self._moe_gather_op(latent, weights, ids)
-        return tuple(self.all_gather(x, dim=0) for x in (latent, weights, ids))
+        return (
+            self.all_gather(latent, dim=0),
+            self.all_gather(weights, dim=0),
+            self.all_gather(ids, dim=0),
+        )
 
     def mla_ops(self, eps):
         mesh, _ = _mesh_and_tables()
@@ -339,7 +355,7 @@ class FusedPrefillCollectives:
             dim == 0
             and x.ndim == 2
             and x.shape[0] > 0
-            and x.shape[1] in (2176, 3584, 7168)
+            and x.shape[1] in _RING_COLLECTIVE_WIDTHS
             and x.dtype == torch.bfloat16
         ):
             return self.ag(x)
@@ -351,7 +367,7 @@ class FusedPrefillCollectives:
             and x.ndim == 2
             and x.shape[0] > 0
             and x.shape[0] % 32 == 0
-            and x.shape[1] in (2176, 3584, 7168)
+            and x.shape[1] in _RING_COLLECTIVE_WIDTHS
             and x.dtype == torch.bfloat16
         ):
             return self.rs(x)

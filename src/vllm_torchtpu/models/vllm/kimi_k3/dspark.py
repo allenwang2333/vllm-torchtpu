@@ -28,6 +28,9 @@ from vllm_torchtpu.layers.core.quantization import quantize_kv
 from .attention import MultiHeadLatentAttention
 from .layers import KimiMLP
 
+_KV_A_PROJ_MARKER = ".self_attn.kv_a_proj_with_mqa."
+_SKIPPED_WEIGHT_PARTS = ("confidence_head", "embed_tokens", "lm_head")
+
 
 def _duplicate_context_kv_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
@@ -36,11 +39,9 @@ def _duplicate_context_kv_weights(
     """Also load every layer's KV-A projection into one fused projection."""
     for name, weight in weights:
         yield name, weight
-        layer_prefix, marker, param_name = name.partition(
-            ".self_attn.kv_a_proj_with_mqa."
-        )
-        if not marker:
+        if _KV_A_PROJ_MARKER not in name:
             continue
+        layer_prefix, _, param_name = name.partition(_KV_A_PROJ_MARKER)
         layer_idx_text = layer_prefix.rsplit(".", 1)[-1]
         if not layer_idx_text.isdecimal():
             continue
@@ -131,11 +132,15 @@ class K3DSparkModel(nn.Module):
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
         )
-
-        kv_width = self.config.kv_lora_rank + self.config.qk_rope_head_dim
+        self._draft_attn_causal: tuple[bool, ...] = (False,) * len(self.layers)
+        self._kv_split_sizes = (
+            self.config.kv_lora_rank,
+            self.config.qk_rope_head_dim,
+        )
+        self.kv_width = self.config.kv_lora_rank + self.config.qk_rope_head_dim
         self.context_kv_proj = MergedColumnParallelLinear(
             self.config.hidden_size,
-            [kv_width] * self.config.num_hidden_layers,
+            [self.kv_width] * self.config.num_hidden_layers,
             bias=False,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "context_kv_proj"),
@@ -158,7 +163,7 @@ class K3DSparkModel(nn.Module):
         return self.context_norm(hidden_states)
 
     def get_draft_attn_causal(self) -> list[bool]:
-        return [False] * len(self.layers)
+        return list(self._draft_attn_causal)
 
     def precompute_and_store_context_kv(
         self,
@@ -171,25 +176,30 @@ class K3DSparkModel(nn.Module):
         all_kv, _ = self.context_kv_proj(context)
         num_tokens = context.shape[0]
         num_layers = len(self.layers)
-        kv_width = self.config.kv_lora_rank + self.config.qk_rope_head_dim
-        all_kv = all_kv.view(num_tokens, num_layers, kv_width)
+        all_kv = all_kv.view(num_tokens, num_layers, self.kv_width)
+        kv_split_sizes = self._kv_split_sizes
+        dummy_q_pe: torch.Tensor | None = None
+        ql_nope: torch.Tensor | None = None
 
         for layer_idx, layer in enumerate(self.layers):
             wrapper = layer.self_attn.mla_attn
             core = wrapper.mla_attn
             kv_lora = all_kv[:, layer_idx]
-            kv_c, k_pe = kv_lora.split(
-                [self.config.kv_lora_rank, self.config.qk_rope_head_dim],
-                dim=-1,
-            )
+            kv_c, k_pe = kv_lora.split(kv_split_sizes, dim=-1)
             kv_c = wrapper.kv_a_layernorm(kv_c)
             k_pe = k_pe.unsqueeze(1)
             assert wrapper.rotary_emb is not None
-            dummy_q_pe = torch.zeros(
-                (num_tokens, wrapper.num_heads, self.config.qk_rope_head_dim),
-                dtype=context.dtype,
-                device=context.device,
-            )
+            if dummy_q_pe is None:
+                dummy_q_pe = torch.zeros(
+                    (num_tokens, wrapper.num_heads, self.config.qk_rope_head_dim),
+                    dtype=context.dtype,
+                    device=context.device,
+                )
+                ql_nope = torch.zeros(
+                    (num_tokens, wrapper.num_heads, self.config.kv_lora_rank),
+                    dtype=context.dtype,
+                    device=context.device,
+                )
             _, k_pe = wrapper.rotary_emb(positions, dummy_q_pe, k_pe)
             # This context path bypasses the regular MLA forward, so mirror
             # its cache quantization here.  RoPE may also promote k_pe to
@@ -203,21 +213,17 @@ class K3DSparkModel(nn.Module):
             else:
                 kv_c = kv_c.to(dtype=core.kv_cache.dtype)
                 k_pe = k_pe.to(dtype=core.kv_cache.dtype)
-            ql_nope = torch.zeros(
-                (num_tokens, wrapper.num_heads, self.config.kv_lora_rank),
-                dtype=context.dtype,
-                device=context.device,
-            )
+            layer_meta = metadata[layer_idx]
             core.mla_op(
                 core.kv_cache,
                 ql_nope,
                 dummy_q_pe,
                 kv_c,
                 k_pe.squeeze(1),
-                metadata[layer_idx].seq_lens,
-                metadata[layer_idx].block_tables,
-                metadata[layer_idx].query_start_loc,
-                metadata[layer_idx].request_distribution,
+                layer_meta.seq_lens,
+                layer_meta.block_tables,
+                layer_meta.query_start_loc,
+                layer_meta.request_distribution,
             )
         return context
 
@@ -263,6 +269,9 @@ class K3DSparkForCausalLM(nn.Module):
             start_layer_id=target_layers,
             prefix=maybe_prefix(prefix, "model"),
         )
+        self._draft_kv_cache_layer_names: tuple[str, ...] = tuple(
+            layer.self_attn.mla_attn.mla_attn.layer_name for layer in self.model.layers
+        )
         self.lm_head: nn.Module | None = None
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size,
@@ -279,9 +288,7 @@ class K3DSparkForCausalLM(nn.Module):
         return self.model.get_draft_attn_causal()
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
-        return [
-            layer.self_attn.mla_attn.mla_attn.layer_name for layer in self.model.layers
-        ]
+        return list(self._draft_kv_cache_layer_names)
 
     def tpu_precompute_and_store_context_kv(
         self,
@@ -323,10 +330,7 @@ class K3DSparkForCausalLM(nn.Module):
     ) -> set[str]:
         def filtered_weights():
             for name, weight in weights:
-                if any(
-                    part in name
-                    for part in ("confidence_head", "embed_tokens", "lm_head")
-                ):
+                if any(part in name for part in _SKIPPED_WEIGHT_PARTS):
                     continue
                 yield name, weight
 

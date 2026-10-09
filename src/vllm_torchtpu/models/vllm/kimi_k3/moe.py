@@ -246,7 +246,6 @@ class KimiMoE(nn.Module):
         if sequence_parallel or self.shared_group is not None:
             return self._forward_expert_parallel(hidden_states, sequence_parallel)
         num_tokens, hidden_size = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_size)
         router_logits, _ = self.gate(hidden_states)
         output = self.experts(hidden_states=hidden_states, router_logits=router_logits)
         return output.view(num_tokens, hidden_size)

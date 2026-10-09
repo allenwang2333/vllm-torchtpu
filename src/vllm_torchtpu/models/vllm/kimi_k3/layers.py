@@ -129,21 +129,22 @@ class KimiMLP(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, sequence_parallel: bool = False
     ) -> torch.Tensor:
-        group = self.tp_group
         if sequence_parallel:
-            group = self.sp_group or group or get_tp_group()
+            group = self.sp_group or self.tp_group or get_tp_group()
             hidden_states = group.all_gather(hidden_states, dim=0)
-        hidden_states, _ = self.gate_up_proj(hidden_states)
-        hidden_states = self.act_fn(hidden_states)
-        if sequence_parallel or self.tp_group is not None:
+            hidden_states, _ = self.gate_up_proj(hidden_states)
+            hidden_states = self.act_fn(hidden_states)
             # Input features already match this rank's row-parallel shard.
             hidden_states = self.down_proj.quant_method.apply(
                 self.down_proj, hidden_states, None
             )
-            if sequence_parallel:
-                assert group is not None
-                return group.reduce_scatter(hidden_states, dim=0)
-            assert self.tp_group is not None
+            return group.reduce_scatter(hidden_states, dim=0)
+        hidden_states, _ = self.gate_up_proj(hidden_states)
+        hidden_states = self.act_fn(hidden_states)
+        if self.tp_group is not None:
+            hidden_states = self.down_proj.quant_method.apply(
+                self.down_proj, hidden_states, None
+            )
             return self.tp_group.all_reduce(hidden_states)
         hidden_states, _ = self.down_proj(hidden_states)
         return hidden_states
@@ -197,14 +198,14 @@ class AttentionResidual(nn.Module):
             values = torch.cat(
                 (block_residuals, prefix_sum.unsqueeze(-2)), dim=-2
             ).float()  # [1, K, hidden]
-            inv = torch.rsqrt(values.pow(2).mean(-1) + self.eps)
+            inv = torch.rsqrt(values.square().mean(-1) + self.eps)
             probabilities = ((values * w).sum(-1) * inv).softmax(dim=-1)
             out = (probabilities.unsqueeze(-1) * values).sum(dim=-2)
             return out.to(block_residuals.dtype)
         v_blocks = block_residuals.float()
         v_prefix = prefix_sum.float()
-        inv_blocks = torch.rsqrt(v_blocks.pow(2).mean(-1) + self.eps)
-        inv_prefix = torch.rsqrt(v_prefix.pow(2).mean(-1) + self.eps)
+        inv_blocks = torch.rsqrt(v_blocks.square().mean(-1) + self.eps)
+        inv_prefix = torch.rsqrt(v_prefix.square().mean(-1) + self.eps)
         scores = torch.cat(
             (
                 (v_blocks * w).sum(-1) * inv_blocks,
