@@ -174,13 +174,16 @@ def dequant_fp8_rows_jax(
     """
     values = (
         jax.lax.bitcast_convert_type(raw, jnp.float8_e4m3fn)
-        .reshape(raw.shape[0], -1)
+        .reshape(raw.shape[0], scale.shape[1], block_size)
         .astype(jnp.float32)
     )
     power = jax.lax.bitcast_convert_type(scale.astype(jnp.int32) << 23, jnp.float32)
-    power = jnp.repeat(power, block_size, axis=-1)
-    invalid = jnp.repeat(scale == invalid_scale, block_size, axis=-1)
-    return jnp.where(invalid, 0.0, values * power).astype(jnp.bfloat16)
+    invalid = (scale == invalid_scale)[..., None]
+    return (
+        jnp.where(invalid, 0.0, values * power[..., None])
+        .reshape(raw.shape[0], -1)
+        .astype(jnp.bfloat16)
+    )
 
 
 def lookup_and_dequant_rows_jax(

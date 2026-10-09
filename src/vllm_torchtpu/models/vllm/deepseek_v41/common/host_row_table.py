@@ -23,6 +23,7 @@ embedded into the compiled graph as constants.
 
 import functools
 import inspect
+from typing import Any
 
 import jax
 import torch
@@ -200,10 +201,13 @@ class HostRowTable:
             del staged, packed
         # Registered here, outside tracing: Dynamo cannot trace `jax_op`.
         self._op = _gather_op(len(self.chunks), self.row_bytes)
+        self._lookup_ops: dict[int, Any] = {}
 
     def gather(self, row_ids: torch.Tensor) -> torch.Tensor:
         """``int32[n]`` in-range row ids -> ``uint8[n, row_bytes]`` on device."""
-        return self._op(row_ids.to(torch.int32), *self.chunks).view(torch.uint8)
+        if row_ids.dtype != torch.int32:
+            row_ids = row_ids.to(torch.int32)
+        return self._op(row_ids, *self.chunks).view(torch.uint8)
 
     def lookup_and_dequant(
         self,
@@ -213,10 +217,17 @@ class HostRowTable:
         block_size: int,
     ) -> torch.Tensor:
         """Gather ``row_ids`` from ``pinned_host`` chunks and dequantize to bf16."""
-        op = _lookup_and_dequant_op(len(self.chunks), self.row_bytes, block_size)
+        op = self._lookup_ops.get(block_size)
+        if op is None:
+            op = _lookup_and_dequant_op(len(self.chunks), self.row_bytes, block_size)
+            self._lookup_ops[block_size] = op
+        if row_ids.dtype != torch.int32:
+            row_ids = row_ids.to(torch.int32)
+        if valid.dtype != torch.bool:
+            valid = valid.to(torch.bool)
         return op(
-            row_ids.to(torch.int32),
-            valid.to(torch.bool),
+            row_ids,
+            valid,
             weight_scale_inv,
             *self.chunks,
         )
