@@ -160,46 +160,42 @@ class NgramHashState(upstream.NgramHashState):
         pos_np = np.asarray(positions, dtype=np.int64)
         qsl_np = np.asarray(query_start_loc)
         dead_np = np.asarray(dead_mask, dtype=np.bool_)
-        lb_np = np.asarray(lookback_token_ids)[:, :depth]
-        lb_dead_np = np.asarray(lookback_dead_mask, dtype=np.bool_)[:, :depth]
-        rows = np.arange(count, dtype=np.int64)
+        max_req_rows = max(1, qsl_np.shape[0] - (1 if int(qsl_np[-1]) >= count else 0))
+        active_reqs = min(int(lookback_token_ids.shape[0]), max_req_rows)
+        lb_np = np.asarray(lookback_token_ids)[:active_reqs, :depth]
+        lb_dead_np = np.asarray(
+            lookback_dead_mask[:active_reqs, :depth], dtype=np.bool_
+        )
+        hashed, rows, padded, batch, terms = tables._ensure_scratch(count)
         reqs = np.minimum(
             np.searchsorted(qsl_np[1:], rows, side="right"),
-            lb_np.shape[0] - 1,
+            active_reqs - 1,
         )
         starts = np.minimum(qsl_np[reqs], count - 1)
         # Offset of each token from its request's first chunk position; the
         # n-gram source `shift` back is in the chunk iff shift <= offset.
         offset = pos_np - pos_np[starts]
         shifts = tables.shifts
-        in_chunk = shifts <= offset[None, :]
-        # In-chunk sources: batch[s, t] = mapped[max(t - s, 0)], as a strided
-        # window over a front-padded copy instead of a gather.
-        mapped = np.where(dead_np, upstream.DEAD_ID, tables.token_map[ids_np])
-        padded = np.concatenate(
-            (np.full(ngram - 1, mapped[0], dtype=mapped.dtype), mapped)
-        )
-        batch = np.lib.stride_tricks.sliding_window_view(padded, count)[::-1]
-        # Lookback sources, resolved once per request: column `c` of
+        # In-chunk sources: batch[s, t] = mapped[max(t - s, 0)], as a cached
+        # strided window over `padded` instead of a fresh allocation/gather.
+        mapped = padded[ngram - 1 :]
+        np.take(tables.token_map, ids_np, out=mapped)
+        mapped[dead_np] = upstream.DEAD_ID
+        padded[: ngram - 1] = mapped[0]
+        # Lookback sources, resolved once per active request: column `c` of
         # `window_table` is the mapped id `c + 1` positions before the chunk
         # (pad_id when unknown), and column `depth` is pad_id for sources
         # beyond the window. Source `shift` of a token at chunk offset `o`
         # reads column shift - o - 1.
-        known = lb_np >= 0
-        window_table = np.full(
-            (lb_np.shape[0], depth + 1), pad_id, dtype=tables.token_map.dtype
-        )
-        window_table[:, :depth] = np.where(
-            known,
-            np.where(
-                lb_dead_np,
-                upstream.DEAD_ID,
-                tables.token_map[np.where(known, lb_np, 0)],
-            ),
-            pad_id,
-        )
-        cols = shifts - offset[None, :] - 1
-        cols = np.where((cols >= 0) & (cols < depth), cols, depth)
+        window_table = np.empty((active_reqs, depth + 1), dtype=tables.token_map.dtype)
+        wt_cols = window_table[:, :depth]
+        np.take(tables.token_map, lb_np, out=wt_cols, mode="clip")
+        wt_cols[lb_dead_np] = upstream.DEAD_ID
+        wt_cols[lb_np < 0] = pad_id
+        window_table[:, depth] = pad_id
+        cols = shifts - (offset[None, :] + 1)
+        in_chunk = cols < 0
+        np.clip(cols, 0, depth, out=cols)
         window = np.take(window_table.reshape(-1), reqs[None, :] * (depth + 1) + cols)
         source = np.where(in_chunk, batch, window)
         # A dead or pre-sequence source blocks every longer n-gram.
@@ -207,7 +203,7 @@ class NgramHashState(upstream.NgramHashState):
         for shift in range(1, ngram):
             blocked[shift] |= blocked[shift - 1]
         source = np.where(blocked, pad_id, source)
-        terms = tables.multipliers[:, :, None] * source[None, :, :]
+        np.multiply(tables.multipliers[:, :, None], source[None, :, :], out=terms)
         rolled = terms[:, 1:]
         np.bitwise_xor(terms[:, 0], rolled[:, 0], out=rolled[:, 0])
         for shift in range(2, ngram):
@@ -216,7 +212,6 @@ class NgramHashState(upstream.NgramHashState):
             )
         # The int64 bucket ids reuse one scratch buffer: a fresh array of this
         # size is page-faulted in on every call otherwise.
-        hashed = tables.scratch(count)
         np.remainder(rolled[:, :, None, :], tables.primes, out=hashed)
         hashed += tables.offsets
         # Back to the device path's [T, layers, heads] layout in one
@@ -322,11 +317,28 @@ class _HostHashTables:
             shifts=np.arange(multipliers.shape[1], dtype=np.int64)[:, None],
         )
 
+    def _ensure_scratch(
+        self, count: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if not self._scratch or self._scratch[0].shape[-1] != count:
+            layers, ngram = self.multipliers.shape
+            hashed = np.empty((*self.primes.shape[:3], count), dtype=np.int64)
+            rows = np.arange(count, dtype=np.int64)
+            padded = np.empty(count + ngram - 1, dtype=self.token_map.dtype)
+            batch = np.lib.stride_tricks.sliding_window_view(padded, count)[::-1]
+            terms = np.empty((layers, ngram, count), dtype=np.int64)
+            self._scratch[:] = [hashed, rows, padded, batch, terms]
+        return (
+            self._scratch[0],
+            self._scratch[1],
+            self._scratch[2],
+            self._scratch[3],
+            self._scratch[4],
+        )
+
     def scratch(self, count: int) -> np.ndarray:
         """``[layers, ngram - 1, heads, count]`` int64 work buffer, reused."""
-        if not self._scratch or self._scratch[0].shape[-1] != count:
-            self._scratch[:] = [np.empty((*self.primes.shape[:3], count), np.int64)]
-        return self._scratch[0]
+        return self._ensure_scratch(count)[0]
 
 
 def _load_local_rows(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
@@ -500,13 +512,13 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         """``_select_local_heads`` for host (NumPy) hash ids."""
         start = min(self.head_start, self.n_hash_cols)
         end = min(self.head_start + self.part_n_hash_cols, self.n_hash_cols)
-        selected = indices[:, start:end].astype(np.int64)
-        valid = (selected >= self.vocab_start_idx) & (selected < self.vocab_end_idx)
+        selected = indices[:, start:end] - np.int64(self.vocab_start_idx)
+        valid = selected.view(np.uint64) < (self.vocab_end_idx - self.vocab_start_idx)
         pad = self.part_n_hash_cols - (end - start)
         if pad:
             selected = np.pad(selected, ((0, 0), (0, pad)))
             valid = np.pad(valid, ((0, 0), (0, pad)))
-        rows = np.clip(selected - self.vocab_start_idx, 0, self.part_num_embeddings - 1)
+        rows = np.clip(selected, 0, self.part_num_embeddings - 1)
         return rows, valid
 
     def gather_raw(self, indices, raw_out, scale_out):
@@ -539,10 +551,10 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             out=raw_out.view(-1, self.dim),
         )
         blocks = self.dim // self.block_size
-        scale_dst = np.asarray(scale_out.view(-1, blocks))
-        np.take(np.asarray(scales), flat, axis=0, out=scale_dst)
+        scale_dst = np.asarray(scale_out)
+        np.take(np.asarray(scales), flat, axis=0, out=scale_dst.reshape(-1, blocks))
         if not valid.all():
-            scale_dst.reshape(*valid.shape, blocks)[~valid] = _INVALID_SCALE
+            scale_dst[~valid] = _INVALID_SCALE
 
 
 # E8M0 scale byte for 2**0. Scale bytes encode 2**(byte - 127).
@@ -732,6 +744,18 @@ class Engram(upstream.Engram):
         self._staged_by_tokens: dict[int, torch.Tensor] = {}
         self._staged_views_by_tokens: dict[int, torch.Tensor] = {}
         self._staged_rows_by_tokens: dict[int, torch.Tensor] = {}
+        self._host_pack_by_tokens: dict[
+            int,
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                np.ndarray,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                tuple[int, int],
+            ],
+        ] = {}
         if getattr(self.embed_tokens, "cpu_offload", False) and (
             getattr(self.embed_tokens, "host_dma", False) is not True
         ):
@@ -750,6 +774,7 @@ class Engram(upstream.Engram):
             raw_words_per_tok = (cols * head_dim) // 4
             scale_words_per_tok = -(-(cols * blocks) // 4)
             words_per_tok = raw_words_per_tok + scale_words_per_tok
+            self._scale_blocks = blocks
             self._host_packed_buf = torch.zeros(
                 dp_tokens * words_per_tok * 4, dtype=torch.uint8, device="cpu"
             )
@@ -757,27 +782,47 @@ class Engram(upstream.Engram):
                 : dp_tokens * raw_words_per_tok * 4
             ].view(dp_tokens, cols, head_dim)
             scale_bytes = dp_tokens * cols * blocks
-            self._host_scale_buf = torch.full(
+            self._raw_scale_buf = torch.full(
                 (dp_tokens * scale_words_per_tok * 4,),
                 _INVALID_SCALE,
                 dtype=torch.uint8,
                 device="cpu",
             )
-            self._host_scale = self._host_scale_buf[:scale_bytes].view(
+            self._raw_scale_view = self._raw_scale_buf[:scale_bytes].view(
                 dp_tokens, cols, blocks
             )
+            self._pending_scale_sync: tuple[int, int] | None = None
             self._staged_raw = torch.zeros(dp_tokens * words_per_tok, dtype=torch.int32)
             # -1 is four `_INVALID_SCALE` bytes, matching `_host_scale_buf`.
             self._staged_raw[dp_tokens * raw_words_per_tok :].fill_(-1)
             self._staged_by_tokens[dp_tokens] = self._staged_raw
             self._active_raw = self._staged_views(dp_tokens)
 
+    def _sync_host_scale_buf(self) -> torch.Tensor:
+        pending = getattr(self, "_pending_scale_sync", None)
+        if pending is not None:
+            raw_bytes, scale_word_bytes = pending
+            np.asarray(self._raw_scale_buf)[:scale_word_bytes] = np.asarray(
+                self._host_packed_buf
+            )[raw_bytes : raw_bytes + scale_word_bytes]
+            self._pending_scale_sync = None
+        return self._raw_scale_buf
+
+    @property
+    def _host_scale_buf(self) -> torch.Tensor:
+        return self._sync_host_scale_buf()
+
+    @property
+    def _host_scale(self) -> torch.Tensor:
+        self._sync_host_scale_buf()
+        return self._raw_scale_view
+
     def _staged_tensors(self, num_tokens: int) -> torch.Tensor:
         assert self._staged_raw is not None
         staged = self._staged_by_tokens.get(num_tokens)
         if staged is None:
             _, cols, head_dim = self._host_raw.shape
-            blocks = self._host_scale.shape[-1]
+            blocks = self._scale_blocks
             raw_words = num_tokens * ((cols * head_dim) // 4)
             scale_words = num_tokens * (-(-(cols * blocks) // 4))
             dev = self._staged_raw.device
@@ -790,7 +835,7 @@ class Engram(upstream.Engram):
         view = self._staged_views_by_tokens.get(num_tokens)
         if view is None:
             _, cols, head_dim = self._host_raw.shape
-            blocks = self._host_scale.shape[-1]
+            blocks = self._scale_blocks
             raw_words_per_tok = (cols * head_dim) // 4
             scale_words_per_tok = -(-(cols * blocks) // 4)
             staged = self._staged_tensors(num_tokens)
@@ -810,36 +855,79 @@ class Engram(upstream.Engram):
             self._staged_rows_by_tokens[num_tokens] = rows
         return rows
 
+    def _host_pack_bundle(
+        self, num_tokens: int
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        np.ndarray,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        tuple[int, int],
+    ]:
+        bundle = self._host_pack_by_tokens.get(num_tokens)
+        if bundle is None:
+            _, cols, head_dim = self._host_raw.shape
+            blocks = self._scale_blocks
+            raw_words = num_tokens * ((cols * head_dim) // 4)
+            raw_bytes = raw_words * 4
+            scale_bytes = num_tokens * cols * blocks
+            scale_words = num_tokens * (-(-(cols * blocks) // 4))
+            scale_word_bytes = scale_words * 4
+            raw_slice = self._host_raw[:num_tokens]
+            scale_dst = self._host_packed_buf[raw_bytes : raw_bytes + scale_bytes].view(
+                num_tokens, cols, blocks
+            )
+            pad_slice = np.asarray(self._host_packed_buf)[
+                raw_bytes + scale_bytes : raw_bytes + scale_word_bytes
+            ]
+            host_words_slice = self._host_packed_buf.view(torch.int32)[
+                : raw_words + scale_words
+            ]
+            staged = self._staged_tensors(num_tokens)
+            active_raw = self._staged_views(num_tokens)
+            bundle = (
+                raw_slice,
+                scale_dst,
+                pad_slice,
+                host_words_slice,
+                staged,
+                active_raw,
+                (raw_bytes, scale_word_bytes),
+            )
+            self._host_pack_by_tokens[num_tokens] = bundle
+        return bundle
+
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
+        embed = self.embed_tokens
         if (
-            getattr(self.embed_tokens, "host_dma", False) is True
-            and getattr(self.embed_tokens, "_host_rows", None) is not None
+            getattr(embed, "host_dma", False) is True
+            and getattr(embed, "_host_rows", None) is not None
         ):
             rows = self._host_dma_rows(hash_ids.shape[0])
-            self.embed_tokens.lookup(hash_ids, rows)
+            embed.lookup(hash_ids, rows)
             self._active_rows = rows
             return
         if (
             self._staged_raw is not None
             and hash_ids.shape[0] <= self._host_raw.shape[0]
         ):
-            num_tokens = hash_ids.shape[0]
-            self.embed_tokens.gather_raw(
-                hash_ids, self._host_raw[:num_tokens], self._host_scale[:num_tokens]
-            )
-            _, cols, head_dim = self._host_raw.shape
-            blocks = self._host_scale.shape[-1]
-            raw_words = num_tokens * ((cols * head_dim) // 4)
-            scale_bytes = num_tokens * cols * blocks
-            scale_words = num_tokens * (-(-(cols * blocks) // 4))
-            # Pack the scale bytes right behind the raw bytes (a NumPy memmove;
-            # the torch CPU fill_/copy_ pair cost more than the 32 KB moved).
-            scale_src = np.asarray(self._host_scale_buf)
-            scale_src[scale_bytes : scale_words * 4] = _INVALID_SCALE
-            raw_bytes = raw_words * 4
-            np.asarray(self._host_packed_buf)[
-                raw_bytes : raw_bytes + scale_words * 4
-            ] = scale_src[: scale_words * 4]
+            (
+                raw_slice,
+                scale_dst,
+                pad_slice,
+                host_words_slice,
+                staged,
+                active_raw,
+                pending_sync,
+            ) = self._host_pack_bundle(hash_ids.shape[0])
+            # Gather scale bytes directly behind the active raw slice in
+            # `_host_packed_buf`, avoiding an intermediate `_host_scale_buf`
+            # memmove across all 4 Engram layers on every step.
+            embed.gather_raw(hash_ids, raw_slice, scale_dst)
+            pad_slice[:] = _INVALID_SCALE
+            self._pending_scale_sync = pending_sync
             # On TorchTPU, `copy_()` into a slice/view of a materialized device
             # tensor allocates a fresh buffer per call instead of overwriting in
             # place, whereas a whole-tensor `copy_()` overwrites in place (see
@@ -848,10 +936,8 @@ class Engram(upstream.Engram):
             # so each Engram layer issues a single fast 1-D H2D transfer, while
             # exposing a 2-D `[num_tokens, words_per_tok]` dynamic-dim0 view to
             # `torch.compile` (`create_concrete_args`).
-            host_words = self._host_packed_buf.view(torch.int32)
-            staged = self._staged_tensors(num_tokens)
-            staged.copy_(host_words[: raw_words + scale_words], non_blocking=True)
-            self._active_raw = self._staged_views(num_tokens)
+            staged.copy_(host_words_slice, non_blocking=True)
+            self._active_raw = active_raw
             return
         super().prepare_embeddings(hash_ids)
         if _embed_dp_size(self) > 1:
@@ -878,7 +964,7 @@ class Engram(upstream.Engram):
                 return _dp_gather_engram_rows(staged, num_tokens)
             return super()._ready_rows(num_tokens)
         _, cols, head_dim = self._host_raw.shape
-        blocks = self._host_scale.shape[-1]
+        blocks = self._scale_blocks
         raw_words_per_tok = (cols * head_dim) // 4
         scale_words_per_tok = -(-(cols * blocks) // 4)
         assert self._active_raw is not None

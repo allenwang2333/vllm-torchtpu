@@ -733,3 +733,77 @@ def test_ngram_hash_state_forward_reuses_mapped_batch():
     out = state.forward(ids, pos, qsl, dead, lookback, dead_lb, slots, block_table)
     assert out.shape == (2, 2, 8)
     assert state.token_map.calls == 2
+
+
+def test_td714_hash_on_host_active_lookback_and_direct_scale_pack(monkeypatch):
+    state = object.__new__(common_engram.NgramHashState)
+    torch.nn.Module.__init__(state)
+    state.token_map = torch.arange(1, 101, dtype=torch.int64)
+    state.multipliers = torch.tensor([[3, 5, 7], [11, 13, 17]], dtype=torch.int64)
+    state.primes = torch.full((2, 2, 4), 97, dtype=torch.int64)
+    state.offsets = torch.arange(16, dtype=torch.int64).reshape(2, 8)
+    state.lookback_depth = 4
+    state.pad_id = 0
+
+    ids = torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.int32)
+    pos = torch.tensor([0, 1, 10, 11, 20, 21], dtype=torch.int64)
+    qsl = torch.tensor([0, 2, 4, 6], dtype=torch.int32)
+    dead = torch.zeros(6, dtype=torch.bool)
+    lb_small = torch.tensor(
+        [[10, 11, -1, 13], [20, 21, 22, -1], [30, -1, 32, 33]], dtype=torch.int32
+    )
+    lb_dead_small = torch.tensor(
+        [
+            [False, True, False, False],
+            [False, False, False, False],
+            [True, False, False, False],
+        ],
+        dtype=torch.bool,
+    )
+    lb_large = torch.full((1024, 4), 99, dtype=torch.int32)
+    lb_large[:3] = lb_small
+    lb_dead_large = torch.ones((1024, 4), dtype=torch.bool)
+    lb_dead_large[:3] = lb_dead_small
+
+    out_small = state.hash_on_host(ids, pos, qsl, dead, lb_small, lb_dead_small)
+    tables = state._host_tables
+    scratch_6 = tables._ensure_scratch(6)
+    out_large = state.hash_on_host(ids, pos, qsl, dead, lb_large, lb_dead_large)
+    assert torch.equal(out_small, out_large)
+    assert all(
+        a is b for a, b in zip(scratch_6, tables._ensure_scratch(6), strict=True)
+    )
+
+    # Padded tail (`qsl[-1] < count`) includes row `qsl.shape[0] - 1` (`index 3`)
+    # while still ignoring inactive rows `4..1023`.
+    qsl_padded = torch.tensor([0, 2, 4, 4], dtype=torch.int32)
+    lb_large_4 = lb_large.clone()
+    lb_large_4[3] = torch.tensor([40, 41, 42, 43], dtype=torch.int32)
+    lb_dead_4 = lb_dead_large.clone()
+    lb_dead_4[3] = False
+    out_pad_4 = state.hash_on_host(
+        ids, pos, qsl_padded, dead, lb_large_4[:4], lb_dead_4[:4]
+    )
+    out_pad_1024 = state.hash_on_host(ids, pos, qsl_padded, dead, lb_large_4, lb_dead_4)
+    assert torch.equal(out_pad_4, out_pad_1024)
+
+    # Direct scale gather into `_host_packed_buf` keeps `_pending_scale_sync`
+    # deferred through `_ready_rows` until `_host_scale` / `_host_scale_buf` is read.
+    emb = _embedding(monkeypatch, 1, 0, (16, 16), dim=64)
+    emb.host_dma = False
+    engram = object.__new__(common_engram.Engram)
+    torch.nn.Module.__init__(engram)
+    engram.embed_tokens = emb
+    engram._init_staging(max_tokens=8, head_dim=64)
+    engram._raw_scale_buf.fill_(111)
+    hashes = torch.tensor([[0, 16], [5, 999], [15, 20]], dtype=torch.int32)
+    engram.prepare_embeddings(hashes)
+    assert engram._pending_scale_sync is not None
+    assert torch.all(engram._raw_scale_buf == 111)
+    ready = engram._ready_rows(3)
+    assert ready.shape == (3, 2, 64)
+    assert engram._pending_scale_sync is not None
+    # Reading `_host_scale` triggers the lazy sync of the active scale words.
+    assert torch.all(engram._host_scale[1, 1] == common_engram._INVALID_SCALE)
+    assert engram._pending_scale_sync is None
+    assert torch.all(engram._host_scale[3:] == 111)
