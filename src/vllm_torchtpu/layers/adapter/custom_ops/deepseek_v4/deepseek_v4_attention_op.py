@@ -172,7 +172,7 @@ def _attention_hca(
         swa_m=swa_m,
         sm_scale=sm_scale,
         # The following parameters are tuned based on microbenchmark results.
-        num_kv_pages_per_block=(32, 32, 32),
+        num_kv_pages_per_block=(32, 64, 64),
         num_queries_per_block=(1, 32, 32),
         chunk_prefill_size=verify_q_len,
     )
