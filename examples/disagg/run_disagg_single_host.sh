@@ -89,6 +89,11 @@ INPUT_LEN=${INPUT_LEN:=512}
 OUTPUT_LEN=${OUTPUT_LEN:=128}
 NUM_PROMPTS=${NUM_PROMPTS:=200}
 REQUEST_RATE=${REQUEST_RATE:=4}
+# Extra `vllm serve` flags per role, word-split. Empty by default; CI uses them
+# to stop each role compiling shapes this benchmark never runs (see the
+# disagg-single-host step in .buildkite/pipeline_integration*.yml).
+PREFILL_EXTRA_ARGS=${PREFILL_EXTRA_ARGS:-}
+DECODE_EXTRA_ARGS=${DECODE_EXTRA_ARGS:-}
 
 NUM_PREFILL_INSTANCES=1
 NUM_DECODE_INSTANCES=1
@@ -135,6 +140,7 @@ for i in $(seq 0 $((NUM_PREFILL_INSTANCES-1))); do
     --gpu-memory-utilization 0.2 \
     --tensor-parallel-size $PREFILLER_TP_SIZE \
     --attention-backend CUSTOM \
+    $PREFILL_EXTRA_ARGS \
     --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_producer\"}" \
     > $LOG_DIR/prefill_$i.txt 2>&1 &
 
@@ -166,6 +172,7 @@ for i in $(seq 0 $((NUM_DECODE_INSTANCES-1))); do
     --gpu-memory-utilization 0.2 \
     --tensor-parallel-size $DECODER_TP_SIZE \
     --attention-backend CUSTOM \
+    $DECODE_EXTRA_ARGS \
     --kv-transfer-config "{\"kv_connector\":\"TPUConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"kv_consumer\"}" \
     > $LOG_DIR/decode_$i.txt 2>&1 &
 

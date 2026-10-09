@@ -7,6 +7,9 @@ DATA_PARALLELISM=1
 ENABLE_EP=false
 ISL_OSL_CONFIGS="1024:1024"
 CONCURRENCY_OPTIONS="8"
+# The most this config ever runs at once is lm-eval's 128 concurrent requests,
+# so the 256 and 512 sequence buckets the default of 512 adds go unused.
+MAX_NUM_SEQS=128
 RANDOM_RANGE_RATIO="0.8"
 GPU_MEMORY_UTILIZATION=0.9
 ATTENTION_BACKEND="CUSTOM"

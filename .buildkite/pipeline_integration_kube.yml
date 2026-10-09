@@ -85,12 +85,19 @@ steps:
         # here. That guards a persistent agent, whose environment carries
         # across steps and out of /etc/environment; a pod starts from the image
         # and the launcher's --env list, and none of the three is in either.
+        # Each role compiles only what this benchmark runs: 512-token prompts at
+        # 4 req/s, prefill-only on P (at most 4 prompts in a 2048-token step),
+        # one recomputed token per request on D, whose running set peaked at
+        # 72. The defaults compile request buckets up to 256 on both and token
+        # buckets up to 2048 on D.
         commands:
           - >-
             .buildkite/kubernetes/run.sh
             env
             TPU_KV_RESHARD_TRANSPORT=zmq
             LOG_DIR=perf_eval_results/disagg_single_host
+            PREFILL_EXTRA_ARGS="--max-num-seqs 8"
+            DECODE_EXTRA_ARGS="--max-num-batched-tokens 128 --max-num-seqs 128"
             bash ./examples/disagg/run_disagg_single_host.sh
 
       - label: ":kubernetes: Integration: qwen35-apc-correctness"
@@ -225,6 +232,11 @@ steps:
       queue: "kube"
     plugins:
       - *kube_plugin
+    # 32 short prompts with a 256-token budget: decode steps carry at most
+    # 32 tokens and pad to 64, prefill steps fill at most the budget, so
+    # [64, 256] is every token bucket a step can use and 64 sequences hold
+    # them all at once. The defaults compile 16..256 and request buckets
+    # up to 256.
     commands:
       - >-
         .buildkite/kubernetes/run_multihost.sh --topology 2x2x2
@@ -233,6 +245,8 @@ steps:
         --tensor-parallel-size 16
         --max-model-len 256
         --max-num-batched-tokens 256
+        --max-num-seqs 64
+        --compilation-config '{"compile_sizes":[64,256]}'
         --max-tokens 32
 
   # The role-per-host tests. Each holds two hosts - two engines of eight
