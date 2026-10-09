@@ -66,13 +66,13 @@ def lse_weighted_combine(
     """
     m = torch.maximum(lse_a, lse_b)
     m_finite = torch.isfinite(m)
-    m_safe = torch.where(m_finite, m, torch.zeros_like(m))
+    m_safe = torch.where(m_finite, m, 0.0)
     ea = torch.exp(lse_a - m_safe)
     eb = torch.exp(lse_b - m_safe)
     norm = ea + eb
     out_a = torch.nan_to_num(out_a, nan=0.0, posinf=0.0, neginf=0.0)
     out_b = torch.nan_to_num(out_b, nan=0.0, posinf=0.0, neginf=0.0)
-    norm_safe = torch.where(norm > 0, norm, torch.ones_like(norm))
+    norm_safe = torch.where(norm > 0, norm, 1.0)
     out = (ea.unsqueeze(-1) * out_a + eb.unsqueeze(-1) * out_b) / norm_safe.unsqueeze(
         -1
     )
@@ -96,6 +96,8 @@ def dcp_allgather_lse_combine(
     Returns:
         (combined_out [T, H, D], combined_lse [T, H]) after folding all ranks.
     """
+    if dcp_world_size <= 1:
+        return output, lse
     # [T, H, D] -> [dcp_world_size * T, H, D]
     all_outputs = dcp_group.all_gather(output, dim=0)
     # [T, H]   -> [dcp_world_size * T, H]

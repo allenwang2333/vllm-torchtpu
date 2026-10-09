@@ -160,8 +160,7 @@ def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch
     shift = torch.where(finite, gathered, -float("inf")).amax(dim=0)
     # A token with no contributor on any rank would give inf - inf; pin the
     # shift to 0 there and let the zero denominator carry the result to zero.
-    empty = ~torch.isfinite(shift)
-    shift = torch.where(empty, 0.0, shift)
+    shift = torch.where(torch.isfinite(shift), shift, 0.0)
 
     weights = torch.where(finite, torch.exp(gathered - shift.unsqueeze(0)), 0.0)
     denom = weights.sum(dim=0)
