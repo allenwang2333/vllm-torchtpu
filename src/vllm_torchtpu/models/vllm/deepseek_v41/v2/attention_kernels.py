@@ -48,7 +48,9 @@ def _attend(q, pool, records, state, scale, tile=64):
     width = records.shape[1]
     if not width:
         return state
-    records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
+    pad = -width % tile
+    if pad:
+        records = jnp.pad(records, ((0, 0), (0, pad)), constant_values=-1)
 
     # Gather BF16 rows once outside; keep FP32 scratch tiled. Rows and q use
     # the split element order (no per-element unpack gather), as stacked
@@ -2014,18 +2016,28 @@ def _has_hi_bank(cache) -> bool:
     return "raw_hi" in getattr(cache, "__dict__", {}) and cache.raw_hi is not None
 
 
+def _as_int32(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor if tensor.dtype == torch.int32 else tensor.int()
+
+
+def _as_int32_1d(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.ndim != 1:
+        tensor = tensor.reshape(-1)
+    return tensor if tensor.dtype == torch.int32 else tensor.int()
+
+
 def _resolve_fp8_pages(main, main_records, tokens):
     page_size = main.shape[1]
     if not _has_hi_bank(main):
         page_size = main.raw.shape[0]
-        pages = main_records.new_zeros((1, 1))
+        pages = main_records.new_zeros((1, 1), dtype=torch.int32)
     else:
         page_size = math.gcd(main.raw.shape[0], main.raw_hi.shape[0])
         total_pages = main.total_rows // page_size
         pages = torch.arange(
             total_pages, device=main_records.device, dtype=torch.int32
         ).unsqueeze(0)
-    starts = main_records.new_tensor([0, tokens])
+    starts = main_records.new_tensor([0, tokens], dtype=torch.int32)
     return page_size, pages, starts
 
 
@@ -2086,18 +2098,18 @@ def sparse_fp8_attention_qo(
             main, main_records, positions.shape[0]
         )
     tail_args = (
-        swa_records.int(),
-        main_records.int(),
-        pages.int(),
-        starts.int(),
+        _as_int32(swa_records),
+        _as_int32(main_records),
+        _as_int32(pages),
+        _as_int32(starts),
         sink,
         full_sink,
-        tp_rank.reshape(1).int(),
+        _as_int32_1d(tp_rank),
         wo_a,
         wo_a_scale.reshape(-1),
         wo_a_full,
         wo_a_full_scale.reshape(-1),
-        valid.int(),
+        _as_int32(valid),
         scale,
         page_size,
         max_requests,
@@ -2178,10 +2190,10 @@ def paged_attention(
     if tp_rank is None:
         tp_rank = swa_records.new_zeros((1,), dtype=torch.int32)
     else:
-        tp_rank = tp_rank.reshape(1).int()
+        tp_rank = _as_int32_1d(tp_rank)
     tail_args = (
-        swa_records.int(),
-        main_records.int(),
+        _as_int32(swa_records),
+        _as_int32(main_records),
         sink,
         full_sink,
         tp_rank,
@@ -2254,12 +2266,12 @@ def sparse_fp8_attention(
     if tp_rank is None:
         tp_rank = main_records.new_zeros((1,), dtype=torch.int32)
     else:
-        tp_rank = tp_rank.reshape(1).int()
+        tp_rank = _as_int32_1d(tp_rank)
     tail_args = (
-        swa_records.int(),
-        main_records.int(),
-        pages.int(),
-        starts.int(),
+        _as_int32(swa_records),
+        _as_int32(main_records),
+        _as_int32(pages),
+        _as_int32(starts),
         sink,
         full_sink,
         tp_rank,
@@ -2690,15 +2702,13 @@ def select_indices_jax(
     ] * block_size < width:
         blocks = (width + block_size - 1) // block_size
         if candidate_write:
-            block_scores = (
-                jnp.pad(
-                    scores,
-                    ((0, 0), (0, blocks * block_size - width)),
-                    constant_values=-jnp.inf,
-                )
-                .reshape(count, blocks, block_size)
-                .max(-1)
+            pad = blocks * block_size - width
+            padded_scores = (
+                jnp.pad(scores, ((0, 0), (0, pad)), constant_values=-jnp.inf)
+                if pad
+                else scores
             )
+            block_scores = padded_scores.reshape(count, blocks, block_size).max(-1)
             last = (lengths - 1) // block_size
             block_scores = jnp.where(
                 jnp.arange(blocks)[None] == last[:, None], jnp.inf, block_scores
@@ -2774,7 +2784,9 @@ def paged_indexer_jax(
             and (page_records * q.shape[-1] // 2) % ROW_WORDS == 0
         ):
             page_valid = jnp.take(records[:, ::page_records] >= 0, requests, axis=0)
-            row_valid = jnp.repeat(page_valid, page_records, axis=1)[:, :width]
+            row_valid = jnp.broadcast_to(
+                page_valid[..., None], (*page_valid.shape, page_records)
+            ).reshape(page_valid.shape[0], -1)[:, :width]
         else:
             row_valid = jnp.take(records >= 0, requests, axis=0)
         scores = jnp.where(row_valid, scores, -jnp.inf)
@@ -2808,11 +2820,13 @@ def paged_indexer_jax(
             (jnp.ones_like(ids[:, :1], dtype=jnp.bool_), ids[:, 1:] != ids[:, :-1]),
             axis=-1,
         )
-        logical = (ids[..., None] * block_size + jnp.arange(block_size)).reshape(
-            q.shape[0], -1
-        )
-        valid = logical < jnp.minimum(lengths[:, None], width)
-        valid &= jnp.repeat(unique & (ids < blocks), block_size, axis=-1)
+        unique_valid = unique & (ids < blocks)
+        logical_3d = ids[..., None] * block_size + jnp.arange(block_size)
+        valid = (
+            (logical_3d < jnp.minimum(lengths, width)[:, None, None])
+            & unique_valid[..., None]
+        ).reshape(q.shape[0], -1)
+        logical = logical_3d.reshape(q.shape[0], -1)
         # This bounds both key reads and QK work by the candidate pool size;
         # zero-length padding rows do not trigger key reads.
         compact_lengths = jnp.where(lengths > 0, logical.shape[1], 0)
@@ -2838,9 +2852,10 @@ def paged_indexer_jax(
             seg_records = seg_table[
                 requests[:, None], jnp.minimum(seg_ids, seg_table.shape[1] - 1)
             ]
-            seg_valid = jnp.repeat(unique & (ids < blocks), per_block, axis=-1) & (
-                seg_records >= 0
-            )
+            seg_valid = (
+                unique_valid[..., None]
+                & (seg_records.reshape(*ids.shape, per_block) >= 0)
+            ).reshape(q.shape[0], -1)
             first_records = jnp.where(
                 seg_valid & (seg_ids * segment < jnp.minimum(lengths[:, None], width)),
                 seg_records,
@@ -2856,7 +2871,11 @@ def paged_indexer_jax(
                 prestrided_pages=True,
             )
             scores = jnp.where(
-                valid & jnp.repeat(seg_valid, segment, axis=-1), scores, -jnp.inf
+                (
+                    valid.reshape(*seg_valid.shape, segment) & seg_valid[..., None]
+                ).reshape(q.shape[0], -1),
+                scores,
+                -jnp.inf,
             )
         else:
             # Gather only the candidate columns: per-token copies of whole
@@ -2885,8 +2904,9 @@ def paged_indexer_jax(
                 candidates,
             )
         padding = max(0, output_width - scores.shape[1])
-        scores = jnp.pad(scores, ((0, 0), (0, padding)), constant_values=-jnp.inf)
-        logical = jnp.pad(logical, ((0, 0), (0, padding)), constant_values=width)
+        if padding:
+            scores = jnp.pad(scores, ((0, 0), (0, padding)), constant_values=-jnp.inf)
+            logical = jnp.pad(logical, ((0, 0), (0, padding)), constant_values=width)
         values, indices = jax.lax.top_k(scores, output_width)
         selected = jnp.take_along_axis(logical, indices, axis=1)
         selected_valid = values > -jnp.inf
@@ -3154,14 +3174,14 @@ def paged_indexer(
     if batch_max is None:
         batch_max = lengths.max()
     tail_args = (
-        records.int(),
+        _as_int32(records),
         weights,
-        lengths.flatten().int(),
-        candidates.int(),
-        write_records.int(),
+        _as_int32_1d(lengths),
+        _as_int32(candidates),
+        _as_int32(write_records),
         keys,
-        requests.int(),
-        batch_max.reshape(1).int(),
+        _as_int32(requests),
+        _as_int32_1d(batch_max),
         topk,
         block_size,
         candidate_write,
