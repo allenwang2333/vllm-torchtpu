@@ -4,6 +4,7 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import functools
 import os
 import time
 from typing import TYPE_CHECKING, Protocol, Union, cast
@@ -155,7 +156,7 @@ def get_tpu_multihost_topology(
     env_val = os.environ.get("TORCH_TPU_TOPOLOGY")
     if env_val:
         # Automatically normalize standard 'AxBxC' syntax to PyTorch/XLA 'A,B,C'
-        return env_val.replace("x", ",")
+        return env_val.replace("x", ",") if "x" in env_val else env_val
 
     if device_name is None:
         try:
@@ -164,11 +165,11 @@ def get_tpu_multihost_topology(
             device_name = ""
 
     device_name = device_name.lower()
-    if any(gen in device_name for gen in _TPU_2D_TORUS_GENERATIONS):
+    if "v5e" in device_name or "v6e" in device_name:
         topo_map = TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP
-    elif any(gen in device_name for gen in _TPU_8I_GENERATIONS):
+    elif "v8i" in device_name or "tpu8i" in device_name:
         topo_map = TPU_8I_MULTIHOST_TOPOLOGY_MAP
-    elif any(gen in device_name for gen in _TPU_DUAL_DEVICE_GENERATIONS):
+    elif "v7" in device_name or "tpu7x" in device_name:
         topo_map = TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP
     else:
         topo_map = TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP
@@ -197,8 +198,48 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
     ("vllm.utils.deep_gemm", "per_block_cast_to_fp8"),
 ]
 
+_TPU_KV_CONNECTOR_SPECS: tuple[tuple[str, str], ...] = (
+    ("TPURaidenConnector", "vllm_torchtpu.distributed.kv_transfer.tpu_connector"),
+    (
+        "TPUMultiConnector",
+        "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector",
+    ),
+    ("TPURaidenOffloadingConnector", "vllm_torchtpu.offload.raiden_connector"),
+)
+
+_TPU_SUPPORTED_KV_CONNECTORS: frozenset[str] = frozenset(
+    (
+        "DecodeBenchConnector",
+        "TPUConnector",
+        "TPURaidenConnector",
+        "TPUMultiConnector",
+        "TPURaidenOffloadingConnector",
+    )
+)
+
+_TPU_SUPPORTED_KV_CACHE_DTYPES: frozenset[str] = frozenset(
+    ("auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2")
+)
+
+_KERNEL_ITER_SPLITTING_OPS: tuple[str, ...] = tuple(
+    f"pallas::{prefix}_{i}"
+    for prefix in ("rpa_kernel", "rpa_kernel_batched")
+    for i in range(64)
+)
+
 _dynamic_compile_unwrapped = False
 _tpu_kv_connectors_registered = False
+
+
+@functools.lru_cache(maxsize=8)
+def _parse_visible_chips(device_control_env: str) -> tuple[int, ...]:
+    return tuple(int(s.strip()) for s in device_control_env.split(",") if s.strip())
+
+
+@functools.lru_cache(maxsize=16)
+def _get_infinity_values_cached(dtype: torch.dtype) -> tuple[float, float]:
+    finfo = torch.finfo(dtype)
+    return finfo.min, finfo.max
 
 
 def _configure_torchtpu_eager_mode() -> None:
@@ -348,14 +389,7 @@ def _register_tpu_kv_connectors() -> None:
 
     from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 
-    for name, module_path in (
-        ("TPURaidenConnector", "vllm_torchtpu.distributed.kv_transfer.tpu_connector"),
-        (
-            "TPUMultiConnector",
-            "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector",
-        ),
-        ("TPURaidenOffloadingConnector", "vllm_torchtpu.offload.raiden_connector"),
-    ):
+    for name, module_path in _TPU_KV_CONNECTOR_SPECS:
         KVConnectorFactory.register_connector(name, module_path, name)
 
 
@@ -424,9 +458,9 @@ class TpuPlatform(Platform):
         """
         device_control_env = os.environ.get(cls.device_control_env_var, "")
         if device_control_env:
-            device_ids = [s.strip() for s in device_control_env.split(",") if s.strip()]
+            device_ids = _parse_visible_chips(device_control_env)
             if device_ids:
-                return int(device_ids[device_id % len(device_ids)])
+                return device_ids[device_id % len(device_ids)]
         return int(device_id % max(1, cls.device_count()))
 
     @classmethod
@@ -486,7 +520,7 @@ class TpuPlatform(Platform):
             os.environ["MASTER_PORT"] = str(portpicker.pick_unused_port())
 
         sb_addresses = os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES")
-        sb_count = len(sb_addresses.split(",")) if sb_addresses else 0
+        sb_count = sb_addresses.count(",") + 1 if sb_addresses else 0
         if sb_count != world_size:
             sb_ports = [portpicker.pick_unused_port() for _ in range(world_size)]
             os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
@@ -530,11 +564,11 @@ class TpuPlatform(Platform):
         if attn_selector_config.use_mla:
             selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
 
-        supported_backends = [
+        supported_backends = (
             AttentionBackendEnum.FLASH_ATTN,
             AttentionBackendEnum.CUSTOM,
             AttentionBackendEnum.FLASH_ATTN_MLA,
-        ]
+        )
         if selected_backend not in supported_backends:
             logger.info(
                 "Cannot use %s backend on TPU. Setting to FLASH_ATTN.", selected_backend
@@ -577,7 +611,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def get_infinity_values(cls, dtype) -> tuple[float, float]:
-        return torch.finfo(dtype).min, torch.finfo(dtype).max
+        return _get_infinity_values_cached(dtype)
 
     @classmethod
     def can_update_inplace(cls):
@@ -627,9 +661,8 @@ class TpuPlatform(Platform):
                 "nothing. Unset it; the fused expert-parallel MoE kernel is "
                 "USE_MOE_FUSED_EP_KERNEL=1."
             )
-        patch_registry.apply(
-            "platform_activation", model_config=vllm_config.model_config
-        )
+        model_config = vllm_config.model_config
+        patch_registry.apply("platform_activation", model_config=model_config)
         _register_tpu_kv_connectors()
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
@@ -639,6 +672,7 @@ class TpuPlatform(Platform):
             )
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
+        cache_config = vllm_config.cache_config
         # TPU's page geometry and block-size selection depend on layout while
         # loading the model, before engine-core's post-load resolution. Resolve
         # explicitly here through vLLM's API and publish the same CacheConfig
@@ -660,18 +694,19 @@ class TpuPlatform(Platform):
             if vllm_config.attention_config.backend == AttentionBackendEnum.CUSTOM
             else PallasAttentionBackend
         )
-        supported = [layout.name for layout in backend.supported_kv_cache_layouts()]
         if (
-            vllm_config.model_config is not None
-            and "DeepseekV4ForCausalLM" in vllm_config.model_config.architectures
+            model_config is not None
+            and "DeepseekV4ForCausalLM" in model_config.architectures
         ):
             supported = ["BLHNC"]
+        else:
+            supported = [layout.name for layout in backend.supported_kv_cache_layouts()]
         layout = resolve_kv_cache_layout(vllm_config, [supported])
         # The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND.
         if (
             layout is VllmKVCacheLayout.LBHNC
-            and vllm_config.model_config is not None
-            and vllm_config.model_config.get_head_size() == 64
+            and model_config is not None
+            and model_config.get_head_size() == 64
         ):
             raise NotImplementedError(
                 "VLLM_KV_CACHE_LAYOUT=HND selects the SEQ_ALONG_LANE KV cache "
@@ -690,7 +725,7 @@ class TpuPlatform(Platform):
                 "represented as a JAX mesh axis."
             )
         validate_pipeline_parallel_config(vllm_config)
-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+        if parallel_config.pipeline_parallel_size > 1:
             # Engines built in this process (VLLM_ENABLE_V1_MULTIPROCESSING=0)
             # get the hand-off push here; engine-core processes install it
             # again on their side.
@@ -709,8 +744,6 @@ class TpuPlatform(Platform):
             compilation_config.mode = CompilationMode.VLLM_COMPILE
 
         # No graph splitting — TPU handles the full graph including
-        compilation_config.splitting_ops = []
-
         # Kernel-iteration mode splits the compiled graph at the Pallas RPA
         # custom ops so they execute eagerly outside the compiled pieces.
         # Together with the cache-key scoping in tpu_compiler.py this lets a
@@ -718,24 +751,21 @@ class TpuPlatform(Platform):
         # /reload_kernel swap the kernel in a running server. Op instance ids
         # are allocated at model build, so list every id the registry could
         # plausibly allocate (should_split does exact name matching).
-        if envs.TPU_KERNEL_ITER_MODE:
-            compilation_config.splitting_ops = [
-                f"pallas::{prefix}_{i}"
-                for prefix in ("rpa_kernel", "rpa_kernel_batched")
-                for i in range(64)
-            ]
+        compilation_config.splitting_ops = (
+            list(_KERNEL_ITER_SPLITTING_OPS) if envs.TPU_KERNEL_ITER_MODE else []
+        )
 
         # Disable inductor-specific fusion passes (only available on CUDA).
-        compilation_config.pass_config.fuse_norm_quant = False
-        compilation_config.pass_config.fuse_act_quant = False
-        compilation_config.pass_config.fuse_attn_quant = False
-        compilation_config.pass_config.eliminate_noops = False
+        pass_config = compilation_config.pass_config
+        pass_config.fuse_norm_quant = False
+        pass_config.fuse_act_quant = False
+        pass_config.fuse_attn_quant = False
+        pass_config.eliminate_noops = False
 
         # Set compile_sizes to match the token padding buckets used by
         # TPUModelRunner. These are the exact shapes PiecewiseBackend
         # will compile for.
         if compilation_config.compile_sizes is None:
-            scheduler_config = vllm_config.scheduler_config
             compilation_config.compile_sizes = cast(
                 list[int | str],
                 _get_token_paddings(
@@ -767,8 +797,6 @@ class TpuPlatform(Platform):
                 "backed_size_oblivious dynamic shapes."
             )
 
-        model_config = vllm_config.model_config
-
         if model_config is not None and model_config.dtype in (
             torch.float16,
             torch.float32,
@@ -780,16 +808,11 @@ class TpuPlatform(Platform):
             )
             model_config.dtype = torch.bfloat16
 
-        scheduler_config = vllm_config.scheduler_config
-        cache_config = vllm_config.cache_config
-
         is_hybrid = model_config.is_hybrid if model_config is not None else False
-        if (
-            vllm_config.speculative_config is not None
-            and scheduler_config.async_scheduling
-        ):
-            method = vllm_config.speculative_config.method
-            if not vllm_config.speculative_config.use_eagle():
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None and scheduler_config.async_scheduling:
+            method = speculative_config.method
+            if not speculative_config.use_eagle():
                 # Ngram needs the sampled tokens on the host, which async defers.
                 raise NotImplementedError(
                     f"Async scheduling with speculative method '{method}' is "
@@ -819,7 +842,6 @@ class TpuPlatform(Platform):
                     "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0."
                 )
 
-        parallel_config = vllm_config.parallel_config
         parallel_config.worker_cls = "vllm_torchtpu.worker.tpu_worker.TPUWorker"
 
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
@@ -975,29 +997,21 @@ class TpuPlatform(Platform):
                     parallel_config.data_parallel_size,
                 )
 
-        kv_transfer_config = vllm_config.kv_transfer_config
-        if kv_transfer_config is not None:
-            _TPU_SUPPORTED_KV_CONNECTORS = {
-                "DecodeBenchConnector",
-                "TPUConnector",
-                "TPURaidenConnector",
-                "TPUMultiConnector",
-                "TPURaidenOffloadingConnector",
-            }
-            assert kv_transfer_config.kv_connector in _TPU_SUPPORTED_KV_CONNECTORS, (
+        if transfer_config is not None:
+            assert transfer_config.kv_connector in _TPU_SUPPORTED_KV_CONNECTORS, (
                 f"TPU only supports the following KV connectors: "
                 f"{_TPU_SUPPORTED_KV_CONNECTORS}, but got "
-                f"'{kv_transfer_config.kv_connector}'."
+                f"'{transfer_config.kv_connector}'."
             )
             is_hybrid_offloading = (
-                kv_transfer_config.kv_connector == "TPURaidenOffloadingConnector"
+                transfer_config.kv_connector == "TPURaidenOffloadingConnector"
                 and is_hybrid
             )
             if is_hybrid_offloading and not unified_kv_layout_enabled(vllm_config):
                 # Hybrid model offloading transfers uniform pool rows; the non-unified
                 # typed-view layout lacks a common per-block stride for DMA copies.
                 raise ValueError(
-                    f"CPU offloading ({kv_transfer_config.kv_connector}) "
+                    f"CPU offloading ({transfer_config.kv_connector}) "
                     "on hybrid attention+Mamba models requires the unified "
                     "block pool; set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1"
                 )
@@ -1005,9 +1019,16 @@ class TpuPlatform(Platform):
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
         cache_config = vllm_config.cache_config
-        if "DeepseekV41ForCausalLM" in (
-            vllm_config.model_config.hf_config.architectures or []
-        ):
+        model_config = vllm_config.model_config
+        architectures = (
+            getattr(
+                getattr(model_config, "hf_config", None),
+                "architectures",
+                None,
+            )
+            or ()
+        )
+        if "DeepseekV41ForCausalLM" in architectures:
             # V4.1 uses upstream cache geometry; its TPU kernels currently
             # accept 16-token pages rather than the dense RPA page constraint.
             if not cache_config.user_specified_block_size:
@@ -1027,14 +1048,6 @@ class TpuPlatform(Platform):
         from vllm.config.vllm import set_current_vllm_config
 
         with set_current_vllm_config(vllm_config):
-            architectures = (
-                getattr(
-                    getattr(vllm_config.model_config, "hf_config", None),
-                    "architectures",
-                    None,
-                )
-                or []
-            )
             is_ds_v4 = any("DeepseekV4ForCausalLM" in a for a in architectures)
 
             if is_ds_v4 and not cache_config.user_specified_block_size:
@@ -1049,7 +1062,7 @@ class TpuPlatform(Platform):
                     PallasMLAttentionBackend.get_page_size(vllm_config)
                 )
             else:
-                is_hybrid = vllm_config.model_config.is_hybrid
+                is_hybrid = model_config.is_hybrid
                 if not is_hybrid and not cache_config.user_specified_block_size:
                     default = backend_cls.get_page_size(vllm_config)
                     cache_config.block_size = (  # type: ignore[assignment]
@@ -1113,8 +1126,7 @@ class TpuPlatform(Platform):
     def is_kv_cache_dtype_supported(
         cls, kv_cache_dtype: str, _model_config: ModelConfig
     ) -> bool:
-        supported = {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"}
-        return kv_cache_dtype in supported
+        return kv_cache_dtype in _TPU_SUPPORTED_KV_CACHE_DTYPES
 
     @classmethod
     def use_sync_weight_loader(cls) -> bool:
