@@ -597,7 +597,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         self._token_parallel_attn = self._fp8_kv
         self._indexer_weight_scale = (
             (self.indexer.head_dim * self.indexer.n_head) ** -0.5
-            if self.indexer is not None
+            if getattr(self, "indexer", None) is not None
             else 1.0
         )
         object.__setattr__(self, "mla_attn", self)
@@ -1252,11 +1252,28 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             else positions.new_empty((count, 0), dtype=torch.int32)
         )
         pages = starts = None
-        owner_layout = getattr(swa, "owner_token_layout", None)
-        owner_perm = getattr(swa, "owner_perm", getattr(owner_layout, "perm", None))
-        owner_inv = getattr(swa, "owner_inv", getattr(owner_layout, "inv", None))
-        owner_q_loc = getattr(
-            swa, "owner_q_loc", getattr(owner_layout, "query_start_loc", None)
+        swa_is_sharded = bool(
+            getattr(swa_cache, "sharded", False)
+            and getattr(swa_cache, "replicated_blocks", 0) == 0
+        )
+        use_owner_layout = bool(self.compress_ratio or swa_is_sharded)
+        owner_layout = (
+            getattr(swa, "owner_token_layout", None) if use_owner_layout else None
+        )
+        owner_perm = (
+            getattr(swa, "owner_perm", getattr(owner_layout, "perm", None))
+            if use_owner_layout
+            else None
+        )
+        owner_inv = (
+            getattr(swa, "owner_inv", getattr(owner_layout, "inv", None))
+            if use_owner_layout
+            else None
+        )
+        owner_q_loc = (
+            getattr(swa, "owner_q_loc", getattr(owner_layout, "query_start_loc", None))
+            if use_owner_layout
+            else None
         )
         segmented_main = False
         if self.compress_ratio:
@@ -1642,6 +1659,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     **owner_kwargs,
                 )
             else:
+                main_is_sharded = bool(
+                    getattr(main_cache, "sharded", False)
+                    and (
+                        self.compress_ratio
+                        or getattr(main_cache, "replicated_blocks", 0) == 0
+                    )
+                )
                 result = paged_attention(
                     q,
                     swa_cache,
@@ -1652,9 +1676,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     self.scale,
                     getattr(self, "query_block_size", 1) if non_causal else 1,
                     token_parallel=bool(
-                        envs.TPU_DEEPSEEK_V41_KV_SHARD
-                        or getattr(main_cache, "sharded", False)
-                        or getattr(swa_cache, "sharded", False)
+                        main_is_sharded or swa_is_sharded or owner_perm is not None
                     ),
                     full_sink=self._full_attn_sink,
                     tp_rank=tp_rank_1d,

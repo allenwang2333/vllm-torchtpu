@@ -397,12 +397,34 @@ class OwnerAffineBlockPool(BlockPool):
         self.pending_replicated_blocks = 0
         self._request_owner: dict[str, int] = {}
         self._owner_num_requests = [0] * layout.num_owners
+        self._step_owner_budget: list[int] | None = None
+        self._step_req_tokens: dict[str, int] = {}
         logger.info(
             "Owner-sharded KV block pool: %d replicated blocks + %d owners x %d",
             layout.num_replicated,
             layout.num_owners,
             layout.blocks_per_owner,
         )
+
+    def begin_step(self, per_owner_budget: int) -> None:
+        self._step_owner_budget = [per_owner_budget] * self.layout.num_owners
+        self._step_req_tokens.clear()
+
+    def end_step(self) -> None:
+        self._step_owner_budget = None
+        self._step_req_tokens.clear()
+
+    def step_owner_budget(self, owner: int) -> int | None:
+        if self._step_owner_budget is None:
+            return None
+        return self._step_owner_budget[owner]
+
+    def record_step_tokens(self, request_id: str, owner: int, num_tokens: int) -> None:
+        if self._step_owner_budget is not None and num_tokens > 0:
+            self._step_owner_budget[owner] -= num_tokens
+            self._step_req_tokens[request_id] = (
+                self._step_req_tokens.get(request_id, 0) + num_tokens
+            )
 
     def get_num_free_blocks(self) -> int:
         region = self.region_free_queue.scoped_region()
@@ -434,8 +456,14 @@ class OwnerAffineBlockPool(BlockPool):
         """
         req_counts = self._owner_num_requests
         owner_queues = self._owner_queues
+        budget = self._step_owner_budget
+        owners = (
+            range(self.layout.num_owners)
+            if budget is None
+            else (o for o in range(self.layout.num_owners) if budget[o] > 0)
+        )
         return sorted(
-            range(self.layout.num_owners),
+            owners,
             key=lambda o: (req_counts[o], -owner_queues[o].num_free_blocks, o),
         )
 
@@ -449,6 +477,9 @@ class OwnerAffineBlockPool(BlockPool):
         owner = self._request_owner.pop(request_id, None)
         if owner is not None:
             self._owner_num_requests[owner] -= 1
+            restored = self._step_req_tokens.pop(request_id, 0)
+            if restored and self._step_owner_budget is not None:
+                self._step_owner_budget[owner] += restored
 
 
 def validate_config(vllm_config: VllmConfig) -> None:
@@ -598,18 +629,58 @@ def _queue_same_owner_victim(
 
 
 def _steer_preemption(scheduler: Any) -> None:
-    """Make ``scheduler``'s FCFS preemption evict requests of the right owner.
-
-    The scheduler evicts ``running[-1]`` whenever ``allocate_slots`` fails for
-    a running request, so a failed allocation reorders ``scheduler.running``
-    first. The list is read at call time, as the scheduler rebinds it every
-    step. The priority policy picks victims by priority, not position, and is
-    left alone.
+    """Make ``scheduler``'s FCFS preemption evict requests of the right owner
+    and cap each owner's scheduled tokens per step to ``1 / num_owners`` of the
+    step token budget so ``owner_perm`` fits within the step's compile bucket.
     """
     manager = scheduler.kv_cache_manager
     pool = manager.block_pool
     if not isinstance(pool, OwnerAffineBlockPool):
         return
+    if (
+        hasattr(scheduler, "schedule")
+        and hasattr(scheduler, "_reserve_prefill_lookahead")
+        and isinstance(getattr(scheduler, "max_num_scheduled_tokens", None), int)
+    ):
+        orig_schedule = scheduler.schedule
+        orig_reserve = scheduler._reserve_prefill_lookahead
+
+        @functools.wraps(orig_schedule)
+        def budgeted_schedule(*args: Any, **kwargs: Any) -> Any:
+            per_owner = max(
+                1, scheduler.max_num_scheduled_tokens // pool.layout.num_owners
+            )
+            pool.begin_step(per_owner)
+            try:
+                return orig_schedule(*args, **kwargs)
+            finally:
+                pool.end_step()
+
+        @functools.wraps(orig_reserve)
+        def budgeted_reserve_prefill_lookahead(
+            request: Request, num_computed_tokens: int, num_new_tokens: int
+        ) -> int:
+            owner = pool.owner_of(request.request_id)
+            if owner is not None:
+                owner_budget = pool.step_owner_budget(owner)
+            else:
+                candidates = pool.owner_candidates()
+                owner_budget = (
+                    pool.step_owner_budget(candidates[0]) if candidates else 0
+                )
+            if owner_budget is not None and num_new_tokens > owner_budget:
+                if (
+                    request not in scheduler.running
+                    and request.num_tokens - num_computed_tokens == 1
+                    and num_new_tokens > 1
+                ):
+                    return 0
+                num_new_tokens = max(0, owner_budget)
+            return orig_reserve(request, num_computed_tokens, num_new_tokens)
+
+        scheduler.schedule = budgeted_schedule
+        scheduler._reserve_prefill_lookahead = budgeted_reserve_prefill_lookahead
+
     if scheduler.policy != SchedulingPolicy.FCFS:
         return
     allocate_slots = manager.allocate_slots
@@ -678,18 +749,30 @@ def install() -> None:
         pool = self.block_pool
         if not isinstance(pool, OwnerAffineBlockPool):
             return orig_allocate_slots(self, request, *args, **kwargs)
+        num_new_tokens = (
+            int(_arg(args, kwargs, "num_new_tokens", 0))
+            if (args or "num_new_tokens" in kwargs)
+            else 0
+        )
         owner = pool.owner_of(request.request_id)
         if owner is not None:
             with owner_scope(owner):
-                return orig_allocate_slots(self, request, *args, **kwargs)
+                blocks = orig_allocate_slots(self, request, *args, **kwargs)
+            if blocks is not None:
+                pool.record_step_tokens(request.request_id, owner, num_new_tokens)
+            return blocks
         # A request without an owner holds no blocks, and a failed attempt
         # returns before allocating anything, so trying owners in turn has
         # no side effects.
         for owner in pool.owner_candidates():
+            owner_budget = pool.step_owner_budget(owner)
+            if owner_budget is not None and owner_budget < num_new_tokens:
+                continue
             with owner_scope(owner):
                 blocks = orig_allocate_slots(self, request, *args, **kwargs)
             if blocks is not None:
                 pool.bind(request.request_id, owner)
+                pool.record_step_tokens(request.request_id, owner, num_new_tokens)
                 return blocks
         return None
 

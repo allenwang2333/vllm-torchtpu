@@ -591,3 +591,78 @@ def test_patch_installs_only_with_kv_shard(monkeypatch):
     monkeypatch.setenv("TPU_DEEPSEEK_V41_KV_SHARD", "1")
     vllm_torchtpu._patch_vllm_owner_affine_block_pool()
     assert calls == [True]
+
+
+def test_step_owner_budget_balances_prefill_and_restores_on_release(installed):
+    manager = _manager(specs=(FULL,))
+    pool = manager.block_pool
+    assert pool.step_owner_budget(0) is None
+    # Outside a step, record_step_tokens is a no-op.
+    pool.record_step_tokens("noop", 0, 16)
+
+    scheduled_calls = []
+
+    def fake_schedule():
+        r0 = _request("r0", 64)
+        r1 = _request("r1", 64)
+        # Bound request r0 within budget (8 <= 16) is unchanged; > 16 gets capped to 16.
+        pool.bind("r0", 0)
+        scheduler.running = [r0]
+        assert scheduler._reserve_prefill_lookahead(r0, 0, 8) == 8
+        capped_r0 = scheduler._reserve_prefill_lookahead(r0, 0, 64)
+        assert capped_r0 == 16
+        assert manager.allocate_slots(r0, capped_r0) is not None
+        assert pool.step_owner_budget(0) == 0
+        # Owner 0 is now excluded from owner_candidates() for this step.
+        assert 0 not in pool.owner_candidates()
+        # A second running request on owner 0 gets 0 tokens this step.
+        r0_extra = _request("r0_extra", 32)
+        pool.bind("r0_extra", 0)
+        scheduler.running.append(r0_extra)
+        assert scheduler._reserve_prefill_lookahead(r0_extra, 0, 32) == 0
+
+        # Unbound waiting request r1 gets capped to candidate owner 1's budget (16).
+        capped_r1 = scheduler._reserve_prefill_lookahead(r1, 0, 64)
+        assert capped_r1 == 16
+        assert manager.allocate_slots(r1, num_new_tokens=capped_r1) is not None
+        assert pool.owner_of("r1") == 1
+        assert pool.step_owner_budget(1) == 0
+
+        # Spec-padded 1-token waiting request (num_tokens - computed == 1, new > 1)
+        # when candidate owner has insufficient budget (< 5) returns 0 to defer.
+        pool._step_owner_budget[2] = 3
+        r_spec = _request("r_spec", 1)
+        assert scheduler._reserve_prefill_lookahead(r_spec, 0, 5) == 0
+
+        # Unbound request requesting 16 tokens skips owner 2 (budget=3 < 16)
+        # and binds owner 3.
+        r3 = _request("r3", 16)
+        assert manager.allocate_slots(r3, 16) is not None
+        assert pool.owner_of("r3") == 3
+        assert pool.step_owner_budget(3) == 0
+
+        # Releasing r1 mid-step (e.g., preemption) restores owner 1's step budget.
+        manager.free(r1)
+        assert pool.step_owner_budget(1) == 16
+
+        # Exhaust all owners' budgets -> candidates is empty -> reserve returns 0.
+        for o in range(OWNERS):
+            pool._step_owner_budget[o] = 0
+        assert pool.owner_candidates() == []
+        r_none = _request("r_none", 16)
+        assert scheduler._reserve_prefill_lookahead(r_none, 0, 16) == 0
+        scheduled_calls.append(True)
+        return "done"
+
+    scheduler = SimpleNamespace(
+        kv_cache_manager=manager,
+        policy=SchedulingPolicy.FCFS,
+        running=[],
+        max_num_scheduled_tokens=OWNERS * 16,
+        schedule=fake_schedule,
+        _reserve_prefill_lookahead=lambda req, comp, new: new,
+    )
+    oab._steer_preemption(scheduler)
+    assert scheduler.schedule() == "done"
+    assert scheduled_calls == [True]
+    assert pool.step_owner_budget(0) is None

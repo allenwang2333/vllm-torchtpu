@@ -596,3 +596,102 @@ def test_attach_step_owner_token_layout_and_tpu_runner_build_metadata(monkeypatc
         num_tokens=6, num_reqs=3, num_tokens_padded=8, num_reqs_padded=4
     )
     assert getattr(built_off["attn.full.0"], "owner_perm", None) is None
+
+    # 6. step_owner_required_tokens & AllSequenceLayoutPlanner.prepare_real
+    from vllm_torchtpu.layers.core.sequence_layout import AllSequenceLayoutPlanner
+    from vllm_torchtpu.runner.owner_token_layout import step_owner_required_tokens
+
+    planner = AllSequenceLayoutPlanner()
+    runner.num_tokens_paddings = [4, 8, 16]
+    runner._dp_target_bucket = None
+    assert step_owner_required_tokens(runner, 0, 3, [2, 1, 3]) == 0
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_KV_SHARD", "1")
+    assert step_owner_required_tokens(runner, 0, 0, []) == 0
+    runner_no_cfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=1)
+    )
+    assert step_owner_required_tokens(runner_no_cfg, 0, 1, [1]) == 0
+    runner._kv_shard_owner_layout = None
+    # Requests 0 and 2 are on owner 1 (2 + 3 = 5 tokens), request 1 on owner 0 (1 token)
+    # -> required_tokens = tp_size(2) * 5 = 10 -> selects bucket 16 instead of 8!
+    assert step_owner_required_tokens(runner, 0, 3, [2, 1, 3]) == 10
+    plan_real = planner.prepare_real(
+        runner=runner,
+        scheduler_output=None,
+        start_index=0,
+        num_reqs=3,
+        num_scheduled_tokens_per_req=np.array([2, 1, 3], dtype=np.int32),
+        total_num_scheduled_tokens=6,
+        use_max_model_len=True,
+        target_num_reqs=4,
+        padded_num_reqs=4,
+    )
+    assert plan_real.global_padded_num_tokens == 16
+
+    # Fallback when block_table.np is used or block_id is unallocated (< num_replicated)
+    block_tables[2] = SimpleNamespace(block_table=SimpleNamespace(np=sharded_ids))
+    assert step_owner_required_tokens(runner, 0, 3, [2, 1, 3]) == 10
+    assert step_owner_required_tokens(runner, 3, 1, [1]) == 0
+
+
+def test_ced_non_identity_replay_with_owner_token_layout():
+    """Verify plan_decoder_replay and _get_ced_decoder_owner_kwargs under KV_SHARD."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.ced import plan_decoder_replay
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import DeepseekV41Model
+    from vllm_torchtpu.runner.owner_token_layout import (
+        attach_owner_token_layout,
+        build_owner_token_layout,
+    )
+
+    # 2 requests both owned by rank 1: prompt=100, window=4, scheduled=[8, 4]
+    # Encoder runs at num_tokens=16 (tp=2, segment=8).
+    # Decoder replay keeps 4 tokens of req 0 and 4 tokens of req 1 -> kept=8,
+    # but both belong to owner 1 -> owner_kept=[0, 8] -> required_kept = 2 * 8 = 16!
+    enc_layout = build_owner_token_layout(
+        [1, 1],
+        [4, 4],
+        tp_size=2,
+        token_paddings=[8, 16],
+        num_padded_tokens=16,
+        num_reqs_padded=2,
+    )
+    meta = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+        query_start_loc_cpu=[0, 4, 8],
+        seq_lens_cpu=[100, 100],
+        prompt_lens_cpu=[100, 100],
+    )
+    attach_owner_token_layout(meta, enc_layout)
+    plan = plan_decoder_replay(meta, window=2, num_tokens=16, compile_sizes=(8, 16))
+    # kept = 2 + 2 = 4, but both requests are on owner 1 -> required_kept = 2 * 4 = 8!
+    assert len(plan.indices) == 4
+    assert plan.padded_num_tokens == 8
+    assert not plan.is_identity
+
+    bounds = torch.tensor(plan.query_start_loc, dtype=torch.int32)
+    kw = DeepseekV41Model._get_ced_decoder_owner_kwargs(meta, plan, bounds)
+    assert kw["owner_perm"].shape == (8,)
+    assert kw["owner_inv"].shape == (8,)
+    assert kw["owner_q_loc"].shape == (2, 3)
+
+    # Empty indices (dummy DP sync replay) uses _positional_layout
+    empty_plan = SimpleNamespace(
+        indices=(),
+        query_start_loc=(0, 0, 0),
+        padded_num_tokens=8,
+    )
+    kw_empty = DeepseekV41Model._get_ced_decoder_owner_kwargs(
+        meta, empty_plan, torch.zeros(3, dtype=torch.int32)
+    )
+    assert kw_empty["owner_token_layout"] is None
+    assert kw_empty["owner_perm"].shape == (8,)
+    assert (
+        DeepseekV41Model._get_ced_decoder_owner_kwargs(None, empty_plan, bounds) == {}
+    )
+    from vllm_torchtpu.runner.owner_token_layout import _mark_token_dim_dynamic
+
+    _mark_token_dim_dynamic(torch.zeros(1, dtype=torch.int32))

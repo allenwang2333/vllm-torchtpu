@@ -55,6 +55,7 @@ class OwnerTokenLayout:
     inv: np.ndarray
     query_start_loc: np.ndarray
     owner_tokens: np.ndarray
+    owners: np.ndarray | None = None
 
 
 def build_owner_token_layout(
@@ -181,6 +182,7 @@ def build_owner_token_layout(
         inv=inv,
         query_start_loc=query_start_loc,
         owner_tokens=owner_tokens.copy(),
+        owners=owners.astype(np.int32, copy=True),
     )
 
 
@@ -505,6 +507,48 @@ def _sharded_group_id(runner: Any) -> int:
     return int(cached[1])
 
 
+def step_owner_required_tokens(
+    runner: Any,
+    start_index: int,
+    num_reqs: int,
+    num_scheduled_tokens_per_req: Any,
+) -> int:
+    """Minimum padded batch tokens ``tp_size * max(owner_tokens)`` required so
+    the step's ``owner_perm`` length matches the selected token bucket."""
+    if not envs.TPU_DEEPSEEK_V41_KV_SHARD or num_reqs <= 0:
+        return 0
+    parallel_cfg = getattr(runner, "parallel_config", None)
+    tp_size = int(getattr(parallel_cfg, "tensor_parallel_size", 1))
+    if (
+        tp_size <= 1
+        or getattr(runner, "kv_cache_config", None) is None
+        or getattr(runner, "input_batch", None) is None
+    ):
+        return 0
+    owner_layout = getattr(runner, "_kv_shard_owner_layout", None)
+    if owner_layout is None:
+        from vllm_torchtpu.core.owner_affine_block_pool import worker_owner_layout
+
+        owner_layout = worker_owner_layout(runner.vllm_config, runner.kv_cache_config)
+        runner._kv_shard_owner_layout = owner_layout
+    table = runner.input_batch.block_table.block_tables[_sharded_group_id(runner)]
+    block_ids = getattr(table, "_bt_cpu_np", None)
+    if block_ids is None:
+        block_ids = table.block_table.np
+    first_blocks = np.asarray(
+        block_ids[start_index : start_index + num_reqs, 0], dtype=np.int64
+    )
+    if (
+        (first_blocks < owner_layout.num_replicated)
+        | (first_blocks >= owner_layout.num_blocks)
+    ).any():
+        return 0
+    owners = _owners_from_first_blocks(first_blocks, owner_layout)
+    scheduled = np.asarray(num_scheduled_tokens_per_req, dtype=np.int64)
+    per_owner = np.bincount(owners, weights=scheduled, minlength=tp_size)
+    return int(tp_size * int(per_owner.max()))
+
+
 def attach_step_owner_token_layout(
     runner: Any,
     per_layer_attn_metadata: dict[str, Any],
@@ -601,11 +645,14 @@ def attach_step_owner_token_layout(
         return layout
     owners = _owners_from_first_blocks(first_blocks, owner_layout)
     scheduled = q_loc_np[1 : ctx.num_reqs + 1] - q_loc_np[: ctx.num_reqs]
+    step_paddings = (
+        tuple(p for p in paddings_tuple if p >= padded_tokens) or paddings_tuple
+    )
     layout = build_owner_token_layout(
         owners,
         scheduled,
         tp_size,
-        paddings_tuple,
+        step_paddings,
         num_padded_tokens=padded_tokens,
         num_reqs_padded=num_reqs_padded,
         scale_paddings=True,

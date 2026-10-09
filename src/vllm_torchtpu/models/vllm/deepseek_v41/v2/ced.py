@@ -89,7 +89,20 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
     # independent symbolic token dimension into vLLM's guard-free full graph.
     if not isinstance(compile_sizes, tuple):
         compile_sizes = tuple(compile_sizes)
-    padded = _padded_bucket(kept, int(num_tokens), compile_sizes)
+    required_kept = kept
+    owner_layout = getattr(metadata, "owner_token_layout", None)
+    req_owners = getattr(owner_layout, "owners", None)
+    if kept > 0 and owner_layout is not None and req_owners is not None:
+        num_reqs = min(len(req_owners), len(output_bounds_tuple) - 1)
+        if num_reqs > 0:
+            tp_size = int(owner_layout.query_start_loc.shape[0])
+            owner_kept = [0] * tp_size
+            for req_idx in range(num_reqs):
+                owner_kept[int(req_owners[req_idx])] += (
+                    output_bounds_tuple[req_idx + 1] - output_bounds_tuple[req_idx]
+                )
+            required_kept = max(kept, tp_size * max(owner_kept))
+    padded = _padded_bucket(required_kept, int(num_tokens), compile_sizes)
     is_identity = kept > 0 and kept == bounds_list[-1] and padded == num_tokens
     return DecoderReplayPlan(
         indices_tuple,

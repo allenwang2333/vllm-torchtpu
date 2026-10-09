@@ -8,6 +8,7 @@ from typing import Any, Protocol
 import numpy as np
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import all_reduce_sum as _pcp_all_reduce_sum
 
 
@@ -312,16 +313,26 @@ class AllSequenceLayoutPlanner:
     ) -> SequenceLayoutPlan:
         del (
             scheduler_output,
-            start_index,
-            num_reqs,
-            num_scheduled_tokens_per_req,
             use_max_model_len,
             target_num_reqs,
             padded_num_reqs,
         )
-        padded_num_tokens = _first_ge(
-            runner.num_tokens_paddings, int(total_num_scheduled_tokens)
-        )
+        required_tokens = int(total_num_scheduled_tokens)
+        if envs.TPU_DEEPSEEK_V41_KV_SHARD:
+            from vllm_torchtpu.runner.owner_token_layout import (
+                step_owner_required_tokens,
+            )
+
+            required_tokens = max(
+                required_tokens,
+                step_owner_required_tokens(
+                    runner,
+                    start_index,
+                    num_reqs,
+                    num_scheduled_tokens_per_req,
+                ),
+            )
+        padded_num_tokens = _first_ge(runner.num_tokens_paddings, required_tokens)
         dp_target_bucket = runner._dp_target_bucket
         if dp_target_bucket is not None and dp_target_bucket > padded_num_tokens:
             padded_num_tokens = int(dp_target_bucket)

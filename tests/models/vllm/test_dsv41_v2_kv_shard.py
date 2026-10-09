@@ -2449,6 +2449,7 @@ class TestS62AndS65OwnerComposition:
 
         def fake_paged_attn(q, sc, mc, sr, mr, snk, scl, blk, **kw):
             captured_bf16["mr"] = mr
+            captured_bf16["blk"] = blk
             captured_bf16["kw"] = kw
             return torch.ones_like(q)
 
@@ -2457,6 +2458,29 @@ class TestS62AndS65OwnerComposition:
         assert captured_bf16["kw"]["token_parallel"] is True
         assert captured_bf16["kw"]["main_records_segmented"] is True
         assert captured_bf16["mr"].shape == (2, 4)
+
+        # Case 2b: SWA-only / DSpark layer (compress_ratio=0) with replicated_blocks > 0
+        # runs head-parallel (token_parallel=False, no owner_perm), whereas R=0 runs
+        # token_parallel=True.
+        attn.compress_ratio = 0
+        attn.non_causal_multi_token_decode = True
+        attn.query_block_size = 5
+        swa_meta.owner_token_layout = owner_token_layout
+        swa_cache.replicated_blocks = 1
+        captured_bf16.clear()
+        attn._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+        assert captured_bf16["blk"] == 5
+        assert captured_bf16["kw"]["token_parallel"] is False
+        assert "owner_perm" not in captured_bf16["kw"]
+        assert captured_bf16["mr"].shape == (3, 0)
+
+        swa_cache.replicated_blocks = 0
+        captured_bf16.clear()
+        attn._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+        assert captured_bf16["kw"]["token_parallel"] is True
+        assert captured_bf16["kw"]["owner_perm"] is owner_perm
+        attn.compress_ratio = 2
+        attn.non_causal_multi_token_decode = False
 
         # Case 3: Non-tiled with compress_ratio > 0 & KV_SHARD=True raises error
         attn.window_size = 32

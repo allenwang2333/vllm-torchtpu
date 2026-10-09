@@ -1286,8 +1286,8 @@ def initialize_paged_attention():
                 main_records = _permute_owner_tokens_jax(main_records, owner_perm, -1)
         tokens = q.shape[0]
         want_token_parallel = (
-            token_parallel or envs.TPU_DEEPSEEK_V41_KV_SHARD
-        ) and tp_size > 1
+            bool(token_parallel or owner_perm is not None) and tp_size > 1
+        )
         use_token_parallel = (
             want_token_parallel
             and tokens >= tp_size
