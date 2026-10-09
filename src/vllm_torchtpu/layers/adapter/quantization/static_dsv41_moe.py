@@ -87,7 +87,23 @@ def _index(root: str) -> dict[str, dict]:
     return result
 
 
-def _load_ep8_layer(
+def _select_grouped_experts(
+    groups: dict[int, dict[str, torch.Tensor]], ordered_experts: list[int]
+) -> dict[str, torch.Tensor]:
+    first_group = ordered_experts[0] // 48
+    if len(groups) == 1 and ordered_experts == list(
+        range(first_group * 48, (first_group + 1) * 48)
+    ):
+        return groups[first_group]
+    return {
+        name: torch.stack(
+            [groups[expert // 48][name][expert % 48] for expert in ordered_experts]
+        )
+        for name in ("w13", "w2", "s13", "s2")
+    }
+
+
+def _load_grouped_layer(
     root: Path,
     files: dict[tuple[int, int], dict],
     layer_id: int,
@@ -95,41 +111,40 @@ def _load_ep8_layer(
     layer: RoutedExperts,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    rank = min(experts) // 48
-    if set(experts) != set(range(rank * 48, (rank + 1) * 48)):
-        raise ValueError("Static MoE EP8 shard does not match local experts")
-    item = files[layer_id, rank]
-    path = root / item["file"]
-    if path.stat().st_size != item["bytes"]:
-        raise ValueError(f"Static MoE EP8 shard size mismatch: {path}")
-    tensors = load(path.read_bytes())
+    if any(expert < 0 or expert >= 384 for expert in experts):
+        raise ValueError("Static MoE expert ID out of range")
+    ordered_experts: list[int | None] = [None] * len(experts)
+    for expert in experts:
+        slot = layer.expert_map_manager.map_global_to_local(expert)
+        if slot < 0 or slot >= len(experts) or ordered_experts[slot] is not None:
+            raise ValueError("Invalid static MoE expert slot mapping")
+        ordered_experts[slot] = expert
+    if any(expert is None for expert in ordered_experts):
+        raise ValueError("Incomplete static MoE expert slots")
+
     shapes = {
         "w13": (48, 5120, 2560),
         "w2": (48, 2560, 2560),
         "s13": (48, 10, 1, 5120),
         "s2": (48, 5, 1, 5120),
     }
-    if set(tensors) != set(shapes):
-        raise ValueError(f"Unexpected static MoE EP8 tensors: {path}")
-    for name, shape in shapes.items():
-        dtype = torch.uint8 if name.startswith("w") else torch.float32
-        if tuple(tensors[name].shape) != shape or tensors[name].dtype != dtype:
-            raise ValueError(f"Static MoE EP8 tensor shape/dtype mismatch: {name}")
-    order: list[int | None] = [None] * 48
-    for expert in experts:
-        slot = layer.expert_map_manager.map_global_to_local(expert)
-        if slot < 0 or slot >= 48 or order[slot] is not None:
-            raise ValueError("Invalid static MoE EP8 expert slot mapping")
-        order[slot] = expert - rank * 48
-    if any(slot is None for slot in order):
-        raise ValueError("Incomplete static MoE EP8 expert slots")
-    if order != list(range(48)):
-        indices = torch.tensor(
-            [slot for slot in order if slot is not None], dtype=torch.int64
-        )
-        tensors = {
-            name: value.index_select(0, indices) for name, value in tensors.items()
-        }
+    groups = {}
+    for group in sorted({expert // 48 for expert in experts}):
+        item = files[layer_id, group]
+        path = root / item["file"]
+        if path.stat().st_size != item["bytes"]:
+            raise ValueError(f"Static MoE shard size mismatch: {path}")
+        tensors = load(path.read_bytes())
+        if set(tensors) != set(shapes):
+            raise ValueError(f"Unexpected static MoE tensors: {path}")
+        for name, shape in shapes.items():
+            dtype = torch.uint8 if name.startswith("w") else torch.float32
+            if tuple(tensors[name].shape) != shape or tensors[name].dtype != dtype:
+                raise ValueError(f"Static MoE tensor shape/dtype mismatch: {name}")
+        groups[group] = tensors
+    tensors = _select_grouped_experts(
+        groups, [expert for expert in ordered_experts if expert is not None]
+    )
     native = torch.float4_e2m1fn_x2
     return (
         tensors["w13"].view(native).to(device),
@@ -174,7 +189,7 @@ def load_layer(
     if not experts or len(experts) != layer.local_num_experts:
         raise ValueError("Static MoE local expert map mismatch")
     if "__ep8__" in index:
-        return _load_ep8_layer(
+        return _load_grouped_layer(
             directory, index["__ep8__"], layer_id, experts, layer, device
         )
     keys = []
