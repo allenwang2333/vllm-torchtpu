@@ -60,8 +60,8 @@ def _make_paged_cache_mock(
     else:
         if hasattr(c, "row_offset"):
             delattr(c, "row_offset")
-    c.row_indices = lambda slots, ro=(row_offset or 0): ro + (
-        slots // rows_per_page * page_stride + slots % rows_per_page
+    c.row_indices = lambda slots, ro=(row_offset or 0): (
+        ro + (slots // rows_per_page * page_stride + slots % rows_per_page)
     )
     c.pages.return_value = pages_tensor
     return c
@@ -180,7 +180,15 @@ class TestCachePiecesAndPackBf16:
 
         from jax.experimental import pallas as pl
 
-        monkeypatch.setattr(pl, "pallas_call", lambda *a, **kw: lambda r, w, c: c)
+        # 1-bank call: (records, words, cache) -> cache; fused 2-bank call
+        # (_scatter_rows_2bank): (records, words, lo, hi) -> (lo, hi).
+        monkeypatch.setattr(
+            pl,
+            "pallas_call",
+            lambda *a, **kw: (
+                lambda r, w, *banks: banks[0] if len(banks) == 1 else banks
+            ),
+        )
         monkeypatch.setattr(v2_cache, "_pack_bf16_words", mock_pack)
         monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
 
@@ -1148,10 +1156,8 @@ class TestCompressedAttentionAndQuerySplitCaching:
             ),
         )
         attn_tiled_bf16._project_index_q = lambda q, p: torch.zeros((count, 2, 8))
-        attn_tiled_bf16._select_indices = (
-            lambda scores, lengths, logical, c: torch.zeros(
-                (count, 2), dtype=torch.int32
-            )
+        attn_tiled_bf16._select_indices = lambda scores, lengths, logical, c: (
+            torch.zeros((count, 2), dtype=torch.int32)
         )
         attn_tiled_bf16._select_paged_indices = lambda *a, **kw: torch.zeros(
             (count, 2), dtype=torch.int32
