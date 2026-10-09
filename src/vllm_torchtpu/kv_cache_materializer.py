@@ -22,7 +22,7 @@ _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 type LayerKVCache = torch.Tensor | list[torch.Tensor]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MaterializedKVCache:
     kv_caches: dict[str, LayerKVCache]
     raw_tensors: list[torch.Tensor]
@@ -55,11 +55,12 @@ def _tensor_layout_summary(
     raw_tensors: Sequence[torch.Tensor],
 ) -> str:
     raw_idx = _raw_tensor_index(tensor, raw_tensors)
-    storage_offset_bytes = tensor.storage_offset() * tensor.element_size()
+    storage_offset = tensor.storage_offset()
+    storage_offset_bytes = storage_offset * tensor.element_size()
     return (
         f"shape={tuple(tensor.shape)} stride={tuple(tensor.stride())} "
         f"dtype={tensor.dtype} contiguous={tensor.is_contiguous()} "
-        f"storage_offset={tensor.storage_offset()} "
+        f"storage_offset={storage_offset} "
         f"storage_offset_bytes={storage_offset_bytes} "
         f"numel={tensor.numel()} nbytes={tensor.nbytes} raw_idx={raw_idx}"
     )

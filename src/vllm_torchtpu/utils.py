@@ -296,7 +296,7 @@ def tpu_bind_kv_cache(
     for layer_name in kv_caches:
         index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
 
-    for layer_index in sorted(index2name.keys()):
+    for layer_index in sorted(index2name):
         for layer_name in sorted(index2name[layer_index]):
             cache = kv_caches[layer_name]
             if isinstance(cache, (list, tuple)):

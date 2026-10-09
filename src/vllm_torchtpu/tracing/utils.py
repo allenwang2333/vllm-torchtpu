@@ -19,7 +19,6 @@ def trim_request_id_suffix(request_id: str) -> str:
 def extract_request_ids_for_tracing(
     req_ids: list[Any], start_index: int = 0, num_reqs: int = -1
 ) -> dict[str, str]:
-    req_id_kwargs = {}
     try:
         active_ids = (
             req_ids[start_index : start_index + num_reqs] if num_reqs != -1 else req_ids
@@ -27,12 +26,10 @@ def extract_request_ids_for_tracing(
         trimmed_req_ids = [
             trim_request_id_suffix(str(rid)) for rid in active_ids if rid is not None
         ]
-        for i, rid in enumerate(trimmed_req_ids):
-            req_id_kwargs[f"request_id{i + 1}"] = rid
+        return {f"request_id{i}": rid for i, rid in enumerate(trimmed_req_ids, start=1)}
     except Exception as e:
         logger.warning("Failed to extract request IDs for tracing: %s", e)
-
-    return req_id_kwargs
+        return {}
 
 
 def extract_kv_lens_for_tracing(

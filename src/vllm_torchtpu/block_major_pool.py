@@ -57,7 +57,7 @@ def unified_block_major_enabled(vllm_config: VllmConfig) -> bool:
     return unified_kv_layout_enabled(vllm_config) and vllm_config.model_config.is_hybrid
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BlockMajorPoolLayout:
     """Geometry of the merged block-major unified pool.
 

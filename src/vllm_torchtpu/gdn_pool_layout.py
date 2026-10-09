@@ -102,7 +102,7 @@ def pooled_gdn_ssm_state_bytes(
     return num_v_heads * head_k_dim * head_v_dim * pooled_gdn_state_itemsize(dtype)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PooledGDNStateLayout:
     ssm_bytes: int
     conv_bytes: int

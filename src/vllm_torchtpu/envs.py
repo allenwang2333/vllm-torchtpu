@@ -214,10 +214,10 @@ def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
 
     def _get_bool_env() -> bool:
         value = os.getenv(env_name)
-        if value is None or value.strip() == "":
+        if value is None or (stripped := value.strip()) == "":
             return default
 
-        value_lower = value.strip().lower()
+        value_lower = stripped.lower()
         if value_lower in _TRUE_STRINGS:
             return True
         if value_lower in _FALSE_STRINGS:

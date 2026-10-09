@@ -170,7 +170,7 @@ def merge_rank_capture(
                 # Mind the two spellings of the same idea: the capture
                 # sandbox is `rank_<N>` (see `rank_capture_dir`), the merged
                 # filename is `rank<N>_`.
-                new_fname = f"{rank_prefix}{fname}" if rank_prefix else fname
+                new_fname = f"{rank_prefix}{fname}"
                 shutil.move(
                     os.path.join(src_ts_dir, fname),
                     os.path.join(dst_ts_dir, new_fname),

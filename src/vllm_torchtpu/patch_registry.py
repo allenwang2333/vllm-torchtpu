@@ -25,7 +25,7 @@ Stage = Literal[
 ]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Patch:
     """Declares a patch's lifecycle and optional binding refresh."""
 

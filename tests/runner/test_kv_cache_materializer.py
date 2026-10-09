@@ -557,7 +557,12 @@ def test_native_placements_preserve_pool_budget_and_aliases(hybrid):
     num_blocks = 4
     budget = 2 * num_blocks * attention.page_size_bytes
     config = get_kv_cache_config_from_groups(
-        SimpleNamespace(cache_config=cache_config), groups, budget
+        SimpleNamespace(
+            cache_config=cache_config,
+            attention_config=SimpleNamespace(hisparse_config=None),
+        ),
+        groups,
+        budget,
     )
     assert config.num_blocks == num_blocks
     assert all(tensor.size == budget for tensor in config.kv_cache_tensors)

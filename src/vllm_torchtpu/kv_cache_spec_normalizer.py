@@ -33,7 +33,7 @@ def normalize_kv_cache_specs_for_tpu(
     `exempt_layers` pass through untouched: their packed, compressed layout is
     not modelled by the page-size formulas here (`is_cache_for_ds_v4`).
     """
-    exempt = exempt_layers or set()
+    exempt = exempt_layers or ()
     normalized: dict[str, KVCacheSpec] = {}
     for layer_name, spec in kv_cache_specs.items():
         if layer_name in exempt:

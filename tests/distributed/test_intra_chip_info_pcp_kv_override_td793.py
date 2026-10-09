@@ -20,7 +20,7 @@ import requests
 import torch
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu import envs, tpu_info
+from vllm_torchtpu import tpu_info
 from vllm_torchtpu.distributed import dcp, intra_chip, tpu_communicator
 from vllm_torchtpu.executors import kv_block_override
 from vllm_torchtpu.platforms import pcp_validation
@@ -180,6 +180,7 @@ def test_dcp_module_all_paths(monkeypatch):
 
     fake_grp = SimpleNamespace(rank_in_group=3, world_size=4)
     monkeypatch.setattr(ps, "get_dcp_group", lambda: fake_grp, raising=False)
+    monkeypatch.setattr(dcp, "_vllm_get_dcp_group_resolved", False)
     assert dcp.get_dcp_group() is fake_grp
     assert dcp.get_dcp_rank() == 3
     assert dcp.get_dcp_world_size() == 4
@@ -197,6 +198,7 @@ def test_dcp_module_all_paths(monkeypatch):
         raise AssertionError("not initialized")
 
     monkeypatch.setattr(ps, "get_dcp_group", _raise_assert, raising=False)
+    monkeypatch.setattr(dcp, "_vllm_get_dcp_group_resolved", False)
     assert dcp.get_dcp_group() is None
     assert dcp.get_dcp_rank() == 0
     assert dcp.get_dcp_world_size() == 1
@@ -227,11 +229,11 @@ def test_tpu_info_all_paths(monkeypatch):
     assert tpu_info.get_tpu_metadata("accelerator-type") is None
 
     # 2. get_tpu_type & get_num_cores_per_chip
-    monkeypatch.setattr(envs, "TPU_ACCELERATOR_TYPE", "v6e-8", raising=False)
+    monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "v6e-8")
     assert tpu_info.get_tpu_type() == "v6e-8"
     assert tpu_info.get_num_cores_per_chip() == 1
 
-    monkeypatch.setattr(envs, "TPU_ACCELERATOR_TYPE", None, raising=False)
+    monkeypatch.delenv("TPU_ACCELERATOR_TYPE", raising=False)
     monkeypatch.setattr(tpu_info, "get_tpu_metadata", lambda key="": "tpu7x-16")
     assert tpu_info.get_tpu_type() == "tpu7x-16"
     assert tpu_info.get_num_cores_per_chip() == 2
@@ -244,15 +246,15 @@ def test_tpu_info_all_paths(monkeypatch):
     tpu_info.get_chip_version.cache_clear()
 
     # 4. get_node_name & get_node_worker_id
-    monkeypatch.setattr(envs, "TPU_NAME", "node-env", raising=False)
+    monkeypatch.setenv("TPU_NAME", "node-env")
     assert tpu_info.get_node_name() == "node-env"
-    monkeypatch.setattr(envs, "TPU_NAME", "", raising=False)
+    monkeypatch.setenv("TPU_NAME", "")
     monkeypatch.setattr(tpu_info, "get_tpu_metadata", lambda key="": "node-meta")
     assert tpu_info.get_node_name() == "node-meta"
 
-    monkeypatch.setattr(envs, "TPU_WORKER_ID", "3", raising=False)
+    monkeypatch.setenv("TPU_WORKER_ID", "3")
     assert tpu_info.get_node_worker_id() == 3
-    monkeypatch.setattr(envs, "TPU_WORKER_ID", None, raising=False)
+    monkeypatch.delenv("TPU_WORKER_ID", raising=False)
     monkeypatch.setattr(tpu_info, "get_tpu_metadata", lambda key="": "2")
     assert tpu_info.get_node_worker_id() == 2
     monkeypatch.setattr(tpu_info, "get_tpu_metadata", lambda key="": None)

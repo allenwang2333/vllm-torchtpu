@@ -595,8 +595,9 @@ def _evict_checkpoint_page_cache(files: list[str]) -> None:
     max_workers = min(len(files), os.cpu_count() or 32)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         sizes = list(executor.map(_evict_one_checkpoint_file, files))
-    evicted_count = sum(s is not None for s in sizes)
-    evicted_gb = sum(s for s in sizes if s is not None)
+    valid_sizes = [s for s in sizes if s is not None]
+    evicted_count = len(valid_sizes)
+    evicted_gb = sum(valid_sizes)
     gc.collect()
     logger.info(
         "[tpu-model-loader] Evicted %d weight files (%.2f GB) from host page cache.",
