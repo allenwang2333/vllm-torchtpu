@@ -1282,6 +1282,12 @@ def scatter_cache_values(
     if isinstance(cache, tuple):
         cache_lo, cache_hi = cache
         bank_records = cache_lo.shape[0] * ROW_WORDS // words.shape[1]
+        if (
+            jax.default_backend() == "tpu"
+            and words.shape[1] >= ROW_WORDS
+            and words.shape[1] % ROW_WORDS == 0
+        ):
+            return cast(Any, _scatter_rows_2bank(cache_lo, cache_hi, records, words))
         records_lo = jnp.where(records < bank_records, records, -1)
         records_hi = jnp.where(records >= bank_records, records - bank_records, -1)
         return cast(
@@ -1365,3 +1371,84 @@ def scatter_cache_values(
         # Flatten only the small update batch. A partial DMA from a tiled 2D
         # source can straddle its padded minor dimension; the cache stays 2D.
     )(records, words.reshape(-1), cache)
+
+
+def _scatter_rows_2bank(
+    cache_lo: jax.Array,
+    cache_hi: jax.Array,
+    records: jax.Array,
+    words: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Full-row 2-bank write in one Pallas call.
+
+    Equivalent to splitting ``records`` per bank and calling the 1-bank
+    kernel twice, but issues a single launch: each record's row DMAs go to
+    the bank that owns it, and out-of-range or negative records are dropped.
+    """
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    for bank in (cache_lo, cache_hi):
+        assert bank.dtype == jnp.int32 and bank.ndim == 2
+        assert bank.shape[1] == ROW_WORDS
+    chunks = words.shape[1] // ROW_WORDS
+    lo_records = cache_lo.shape[0] // chunks
+    hi_records = cache_hi.shape[0] // chunks
+    block = 64
+    count = records.shape[0]
+    records = jnp.pad(records, (0, -count % block), constant_values=-1)
+
+    def kernel(record_ref, values_ref, _lo_ref, _hi_ref, out_lo, out_hi, sem):
+        def issue(copy, enabled, method):
+            @pl.when(enabled)
+            def _():
+                getattr(copy, method)()
+
+        def body(method):
+            def step(index, carry):
+                token = pl.program_id(0) * block + index
+                record = record_ref[token]
+                in_lo = (record >= 0) & (record < lo_records)
+                in_hi = (record >= lo_records) & (record < lo_records + hi_records)
+                hi_record = record - lo_records
+                for chunk in range(chunks):
+                    src = values_ref.at[
+                        pl.ds((token * chunks + chunk) * ROW_WORDS, ROW_WORDS)
+                    ]
+                    issue(
+                        pltpu.make_async_copy(
+                            src, out_lo.at[record * chunks + chunk, :], sem
+                        ),
+                        in_lo,
+                        method,
+                    )
+                    issue(
+                        pltpu.make_async_copy(
+                            src, out_hi.at[hi_record * chunks + chunk, :], sem
+                        ),
+                        in_hi,
+                        method,
+                    )
+                return carry
+
+            jax.lax.fori_loop(0, block, step, 0)
+
+        body("start")
+        body("wait")
+
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(records.shape[0] // block,),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 3,
+            out_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 2,
+            scratch_shapes=[pltpu.SemaphoreType.DMA],
+        ),
+        out_shape=(
+            jax.ShapeDtypeStruct(cache_lo.shape, cache_lo.dtype),
+            jax.ShapeDtypeStruct(cache_hi.shape, cache_hi.dtype),
+        ),
+        input_output_aliases={2: 0, 3: 1},
+    )(records, words.reshape(-1), cache_lo, cache_hi)
