@@ -511,11 +511,13 @@ def _kpool_index_jax(
 
 
 # (decode, prefill, mixed). The kernel needs `rows_per_page * pages` to be a
-# multiple of 128; at block 256 a page holds 64 pool rows, so the page counts
-# are even. Untuned starting point taken from DeepSeek-V4's indexer
-# (`deepseek_v4_indexer.py`, (3, 2, 2) on its larger pages).
-_STREAMINDEX_KV_PAGES_PER_BLOCK = (4, 2, 2)
-_STREAMINDEX_QUERIES_PER_BLOCK = (1, 128, 128)
+# multiple of 128 (at block 256 a page holds 64 pool rows). Swept on one
+# TPU7x core at block 256 (`tools/sweep_streamindex.py`): 16 pages x 512
+# queries is best or within 2% at every point measured -- 8K prefill 2.79 ms,
+# 120K prefill 12.4 ms (19.3 ms at DeepSeek-V4's (2, 128)), 120K decode of
+# 4 sequences 0.107 ms (0.182 ms at 2 pages).
+_STREAMINDEX_KV_PAGES_PER_BLOCK = (16, 16, 16)
+_STREAMINDEX_QUERIES_PER_BLOCK = (1, 512, 512)
 
 
 def _pool_key_records(keys: jax.Array, record_width: int) -> jax.Array:
