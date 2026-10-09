@@ -1804,27 +1804,38 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
         # ---------------- MTP drafter glue (draft=True; WHITEBOARD.v4) ----------------
         def index_share():
-            """Pass 1's rows (one per request) take pass 0's owned lists of row P_i (IndexShare); the
-            union's gather sources resolve with pass 0's request geometry (its staged rows stay in
-            wrow: passes 1-2 stage nothing). In place, ascending: P_j >= j, so a source is never
-            overwritten before it is read."""
+            """Pass 1's rows (one per request) take pass 0's owned lists of row P_i (IndexShare), as
+            vector row copies; each request's union is its one row, resolved to gather sources with
+            vector ops in an aligned KR_-row region (old entries first: the lists ascend in local
+            index), then one VMEM -> SMEM copy for the issue loop. In place, ascending: P_j >= j, so
+            a source row is never overwritten before it is read. No per-entry scalar loop (the
+            scalar copy + build_union made the rank owning most winners a 10 ms straggler)."""
+            kio = (lax.broadcasted_iota(I32, (KR_, 128), 0) * 128 + lax.broadcasted_iota(I32, (KR_, 128), 1))
+
             def cp(i, c):
                 src = dmeta[0, i]
                 n = scr["nown_s"][src]
-
-                @pl.when(src != i)
-                def _():
-                    def e(k, c2):
-                        scr["own_s"][i * KR_ + (k >> 7), k & 127] = scr["own_s"][src * KR_ + (k >> 7), k & 127]
-                        return c2
-                    lax.fori_loop(0, n, e, 0)
-                if debug:                                # dbg_own exports -1 past n
-
-                    def pad(k, c2):
-                        scr["own_s"][i * KR_ + (k >> 7), k & 127] = jnp.int32(-1)
-                        return c2
-                    lax.fori_loop(n, KT, pad, 0)
+                scr["own_v"][i] = scr["own_v"][src]
                 scr["nown_s"][i] = n
+                t0r, _, p0r, noldr = req_new(i, lambda r_, k_: qmeta_a[r_, k_])
+                lo = scr["own_v"][i]                                          # [KR_, 128] local idx
+                valid = kio < n
+                old_ = jnp.logical_and(valid, lo < noldr)
+                pidx = jnp.where(old_, lo >> lg_pg, 0)
+                npg = (noldr + pg - 1) // pg + 1                              # live local pages
+
+                def pg_body(j, pv):
+                    return jnp.where(pidx == j, bt[i, j], pv)
+                page = lax.fori_loop(0, jnp.minimum(npg, max_pages), pg_body, jnp.zeros((KR_, 128), I32))
+                g = (lo // ILV) * G_ + me * ILV + lo % ILV
+                t2 = jnp.clip(t0r + (g - p0r), 0, TMAX - 1)
+                srcv = jnp.where(old_, shl(page, 8) | (lo & (pg - 1)), shl(t2, 2) | (lo & 3))
+                r0 = pl.multiple_of(i * KR_, 8)
+                scr["own_uv"][pl.ds(r0, KR_), :] = jnp.where(valid, srcv, 0)
+                scr["memb_v"][pl.ds(r0, KR_), :] = jnp.where(valid, 1, 0)
+                scr["nu_s"][i] = n
+                scr["uo_s"][i] = i * KR_
+                scr["nuo_s"][i] = jnp.sum(old_.astype(I32))
                 return c
             lax.fori_loop(0, B, cp, 0)
 
@@ -1832,23 +1843,9 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 scr["nown_s"][t_] = jnp.int32(0)
                 return c
             lax.fori_loop(B, TMAX, zr, 0)
-            for t_ in range(TMAX):                       # own_v (debug view) row by row
-                c_ = pltpu.make_async_copy(scr["own_s"].at[pl.ds(t_ * KR_, KR_)], scr["own_v"].at[t_],
-                                           scr["misc_sem"])
-                c_.start()
-                c_.wait()
-
-            def per_req_u(b, off):
-                return lax.cond(qmeta[b, 3] > 0,
-                                lambda: build_union(b, off, rn=req_new(b, lambda r_, k_: qmeta_a[r_, k_])),
-                                lambda: off)
-            lax.fori_loop(0, B, per_req_u, jnp.int32(0))
-            cpu = [pltpu.make_async_copy(scr["own_u"], scr["own_uv"], scr["misc_sem"]),
-                   pltpu.make_async_copy(scr["memb"], scr["memb_v"], scr["misc_sem"])]
-            for c_ in cpu:
-                c_.start()
-            for c_ in cpu:
-                c_.wait()
+            c_ = pltpu.make_async_copy(scr["own_uv"], scr["own_u"], scr["misc_sem"])
+            c_.start()
+            c_.wait()
 
         def hbm_tile(src):
             c_ = pltpu.make_async_copy(src, scr["lmb"], scr["lm_sem"])
