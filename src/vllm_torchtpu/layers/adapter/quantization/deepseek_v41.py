@@ -12,6 +12,10 @@ from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
 from vllm_torchtpu.layers.adapter.upstream_bindings import device_hooks
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
 
+# Marks a layer whose gate-slice plan has not been resolved yet; ``None`` is a
+# valid cached plan meaning "never slice".
+_UNRESOLVED = object()
+
 
 @register_quantization_config("tpu-deepseek_v41_fp8")
 class VllmDeepseekV41Fp8Config(VllmDeepseekV4Fp8Config):
@@ -46,33 +50,51 @@ class DeepseekV41MoE(DeepseekV4MoE):
         ):
             super().__init__(vllm_config, *args, **kwargs)
 
-    def _maybe_slice_gate_input(self, hidden_states):
-        if self.use_sequence_parallel:
-            return hidden_states
+    def _resolve_gate_slice_plan(self):
+        """Return ``(group_size, rank)`` for gate slicing, or ``None``.
+
+        Everything checked here is fixed once the layer and the process
+        groups are built, so the answer is cached per layer by the caller.
+        """
         experts = getattr(self, "experts", None)
         moe_config = getattr(experts, "moe_config", None)
         if getattr(moe_config, "pcp_size", 1) > 1 or not getattr(
             getattr(moe_config, "moe_parallel_config", None), "use_ep", False
         ):
-            return hidden_states
+            return None
         routed_experts = getattr(experts, "routed_experts", None)
         quant_method = getattr(routed_experts, "quant_method", None)
         if (
             not getattr(quant_method, "is_monolithic", False)
             or getattr(quant_method, "supports_internal_mk", False)
             or getattr(routed_experts, "custom_routing_function", None) is not None
-            or moe_routing._SIMULATION_STRATEGY is not None
         ):
-            return hidden_states
+            return None
         slice_group = (
             get_tp_group() if getattr(moe_config, "dp_size", 1) > 1 else get_ep_group()
         )
         group_size = slice_group.world_size
+        if group_size <= 1:
+            return None
+        return group_size, slice_group.rank_in_group
+
+    def _maybe_slice_gate_input(self, hidden_states):
+        # use_sequence_parallel and the simulation strategy can be toggled at
+        # runtime (tests, simulation harness), so they stay per-call checks.
+        if self.use_sequence_parallel or moe_routing._SIMULATION_STRATEGY is not None:
+            return hidden_states
+        # Bypass nn.Module.__getattr__/__setattr__: the plan is a plain cache.
+        state = self.__dict__
+        plan = state.get("_gate_slice_plan", _UNRESOLVED)
+        if plan is _UNRESOLVED:
+            plan = state["_gate_slice_plan"] = self._resolve_gate_slice_plan()
+        if plan is None:
+            return hidden_states
+        group_size, rank = plan
         num_tokens = hidden_states.shape[0]
-        if group_size <= 1 or num_tokens % group_size != 0:
+        if num_tokens % group_size != 0:
             return hidden_states
         chunk = num_tokens // group_size
-        rank = slice_group.rank_in_group
         return hidden_states[rank * chunk : (rank + 1) * chunk]
 
     def _forward_fused_moe(self, hidden_states, input_ids=None):
