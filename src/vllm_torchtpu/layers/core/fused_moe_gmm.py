@@ -369,13 +369,12 @@ def _prepare_routed_gmm_inputs(
     else:
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
+    total_routed = token_indices_flat.shape[0]
     # The keys take only `local_num_experts + 1` values, so a counting sort
     # gives the positions and `group_sizes` without a second comparison sort.
     # Ragged permute only: under the one-hot permute these positions break MTP.
     ragged_permute = (
-        use_ep
-        and use_sparse_core
-        and token_indices_flat.shape[0] > onehot_moe_permute_threshold
+        use_ep and use_sparse_core and total_routed > onehot_moe_permute_threshold
     )
     # The one-hot permute path is the small-M decode path. There a pairwise
     # rank gives the same stable order and permuted tokens as the comparison
@@ -384,7 +383,7 @@ def _prepare_routed_gmm_inputs(
         use_ep
         and use_sparse_core
         and not ragged_permute
-        and token_indices_flat.shape[0] <= _ONEHOT_AUTO_CAP
+        and total_routed <= _ONEHOT_AUTO_CAP
     )
     token_indices_sorted = None
     topk_weights_sorted = None
@@ -405,7 +404,7 @@ def _prepare_routed_gmm_inputs(
     token_bits = max(1, (num_tokens_local - 1).bit_length())
     packable = (
         local_num_experts + 1
-    ).bit_length() + token_bits < 31 and token_indices_flat.shape[0] <= 6912
+    ).bit_length() + token_bits < 31 and total_routed <= 6912
     if bucket_counts is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
     else:
@@ -740,7 +739,7 @@ def fused_moe_func(
     # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
     # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
     # regime from the block size: block-16 -> W4A16, block >= MXU -> W4A8.
-    _, padded_hidden_size, _ = w1.shape
+    local_num_experts, padded_hidden_size, _ = w1.shape
     packing_factor = get_packing_factor(w1.dtype, rhs_quant_dtype)
     padded_hidden_size *= packing_factor
 
@@ -754,7 +753,7 @@ def fused_moe_func(
 
     if use_ep and experts_start is not None:
         local_ids = topk_ids - experts_start
-        valid = (local_ids >= 0) & (local_ids < w1.shape[0])
+        valid = (local_ids >= 0) & (local_ids < local_num_experts)
         topk_weights = jnp.where(valid, topk_weights, 0)
         topk_ids = jnp.where(valid, local_ids, -1)
 
@@ -762,7 +761,7 @@ def fused_moe_func(
     # threshold before kernel admission so those buckets retain routed GMM.
     dense_expert_limit = (
         _DENSE_EXPERT_THRESHOLD
-        if _DENSE_EXPERT_THRESHOLD > 0 or w1.shape[0] > 2
+        if _DENSE_EXPERT_THRESHOLD > 0 or local_num_experts > 2
         else _DENSE_EXPERT_LOW_EXPERT_MAX_TOKENS
     )
     if 0 < num_tokens <= dense_expert_limit and can_use_dense_expert(
@@ -802,7 +801,7 @@ def fused_moe_func(
         hidden_states,
         topk_ids,
         topk_weights,
-        local_num_experts=w1.shape[0],
+        local_num_experts=local_num_experts,
         topk=topk,
         use_ep=use_ep,
         use_sparse_core=use_sparse_core,

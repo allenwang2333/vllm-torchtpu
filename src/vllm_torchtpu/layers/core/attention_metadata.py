@@ -523,6 +523,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets = None
             mamba_request_distribution = None
 
+        seq_layout_desc = ctx.sequence_layout_descriptor
         metadata = AttentionMetadata(
             input_positions=input_positions,
             block_tables=block_tables_dev,
@@ -533,9 +534,9 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets=mamba_slot_read_offsets,
             mamba_ckpt_indices=mamba_ckpt_indices,
             mamba_request_distribution=mamba_request_distribution,
-            sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
-            sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
-            sequence_layout_version=ctx.sequence_layout_descriptor.version,
+            sequence_layout_kind=seq_layout_desc.kind.value,
+            sequence_layout_protocol=seq_layout_desc.protocol,
+            sequence_layout_version=seq_layout_desc.version,
         )
         metadata.query_start_loc_cpu = ctx.query_start_loc_cpu
         metadata.seq_lens_cpu = ctx.seq_lens_cpu

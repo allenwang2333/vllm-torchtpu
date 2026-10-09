@@ -431,26 +431,33 @@ class BlockTableDeltaStager:
     ) -> None:
         """Remember a full upload so the next walk can send a delta."""
         start, num_reqs = ctx.start_index, ctx.num_reqs
+        end = start + num_reqs
         states: list[_EntryState] = []
         unique_geoms: list[tuple[Any, int, _EntryState]] = []
-        seen_geoms: set[tuple[int, bool, int]] = set()
+        seen_geoms: dict[tuple[int, bool, int], int] = {}
         offset = 0
         for builder, (_, bt, tnb) in zip(builders, entries, strict=True):
+            ac_key = (builder.target_block_size, builder.is_mamba_group, tnb)
+            is_new_geom = ac_key not in seen_geoms
+            active_cols = (
+                builder._active_block_table_columns(ctx, tnb)
+                if is_new_geom
+                else seen_geoms[ac_key]
+            )
             st = _EntryState(
                 offset,
                 tnb,
-                builder._active_block_table_columns(ctx, tnb),
+                active_cols,
                 num_reqs,
-                bt._row_rewrite[start : start + num_reqs].copy(),
-                bt.num_blocks_per_row[start : start + num_reqs].copy(),
+                bt._row_rewrite[start:end].copy(),
+                bt.num_blocks_per_row[start:end].copy(),
                 bt._bt_mutations,
                 bt._bt_rewrites,
                 bt,
             )
             states.append(st)
-            ac_key = (builder.target_block_size, builder.is_mamba_group, tnb)
-            if ac_key not in seen_geoms:
-                seen_geoms.add(ac_key)
+            if is_new_geom:
+                seen_geoms[ac_key] = active_cols
                 unique_geoms.append((builder, tnb, st))
             offset += num_reqs_padded * tnb
         if staged_dev.device.type == "cpu":
