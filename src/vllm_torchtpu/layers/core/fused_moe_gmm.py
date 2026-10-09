@@ -539,7 +539,9 @@ def moe_gmm(
         rhs_quant_dtype=rhs_quant_dtype,
     )
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
-    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
+    w2_in_dim = w2.shape[1] * packing_factor
+    if gmm1_res.shape[1] != w2_in_dim:
+        gmm1_res = gmm1_res[:, :w2_in_dim]
 
     zero_init_gmm2 = (
         use_ep
@@ -752,8 +754,8 @@ def fused_moe_func(
     if use_ep and experts_start is not None:
         local_ids = topk_ids - experts_start
         valid = (local_ids >= 0) & (local_ids < w1.shape[0])
-        topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
-        topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+        topk_weights = jnp.where(valid, topk_weights, 0)
+        topk_ids = jnp.where(valid, local_ids, -1)
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
@@ -801,7 +803,8 @@ def fused_moe_func(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
     )
-    x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+    if padded_hidden_size != hidden_size:
+        x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
         x,
         w1,
@@ -824,4 +827,4 @@ def fused_moe_func(
         rhs_quant_dtype=rhs_quant_dtype,
         topk_weights_sorted=topk_weights_sorted,
     )
-    return x[:num_tokens, :hidden_size]
+    return x if x.shape == (num_tokens, hidden_size) else x[:num_tokens, :hidden_size]

@@ -35,6 +35,9 @@ _fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
+_zero_experts_start_cache: dict[torch.device, torch.Tensor] = {}
+_DEFAULT_SKIP_PADDED_TOKENS: bool = envs.TPU_MOE_SKIP_PADDED_TOKENS
+_ENVS_DICT = envs.__dict__
 
 
 def _resolve_activation_name(activation: Any) -> str:
@@ -206,7 +209,9 @@ def _get_fused_moe_custom_op(
     skip_padded_tokens: bool | None = None,
 ):
     if skip_padded_tokens is None:
-        skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
+        skip_padded_tokens = bool(
+            _ENVS_DICT.get("TPU_MOE_SKIP_PADDED_TOKENS", _DEFAULT_SKIP_PADDED_TOKENS)
+        )
     cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
@@ -278,7 +283,11 @@ def fused_moe_gmm(
         # The compiled program for use_ep=False never reads this operand
         # (see the `if use_ep:` guard in fused_moe_func), but the custom op
         # still needs a concrete tensor to call with a fixed arity.
-        experts_start = torch.zeros((), dtype=torch.int32, device=hidden_states.device)
+        dev = hidden_states.device
+        experts_start = _zero_experts_start_cache.get(dev)
+        if experts_start is None:
+            experts_start = torch.zeros((), dtype=torch.int32, device=dev)
+            _zero_experts_start_cache[dev] = experts_start
     return fused_moe(
         hidden_states,
         w1,
