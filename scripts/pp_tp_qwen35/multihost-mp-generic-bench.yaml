@@ -1,0 +1,271 @@
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: torchtpu-vllm-two-node-mp-bench
+spec:
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - bench
+  failurePolicy:
+    maxRestarts: 0
+  network:
+    enableDNSHostnames: true
+  replicatedJobs:
+    - name: vllm-node
+      replicas: 2
+      template:
+        spec:
+          ttlSecondsAfterFinished: 600
+          backoffLimit: 0
+          template:
+            metadata:
+              annotations:
+                gke-gcsfuse/volumes: "true"
+              labels:
+                app: torchtpu-vllm-two-node-mp-bench
+            spec:
+              containers:
+              - name: vllm-node
+                image: {{ .DOCKER_IMAGE | default "us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev@sha256:58530632039b112295db7ba6c44f423684bdd1283dd58d57d53e72fd1f469851" }}
+                imagePullPolicy: Always
+                env:
+                - name: JS_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+                - name: JOBSET_JOB_INDEX
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                - name: VLLM_TARGET_DEVICE
+                  value: "tpu"
+                - name: PJRT_DEVICE
+                  value: "TPU"
+                - name: TPU_MULTIHOST_BACKEND
+                  value: "mp"
+                - name: TPU_PROCESS_ADDRESSES
+                  value: "$(JS_NAME)-vllm-node-0-0.$(JS_NAME).$(POD_NAMESPACE).svc.cluster.local:8476,$(JS_NAME)-vllm-node-1-0.$(JS_NAME).$(POD_NAMESPACE).svc.cluster.local:8476"
+                - name: TPU_PROCESS_PORT
+                  value: "8476"
+                - name: MEGASCALE_NUM_SLICES
+                  value: ""
+                - name: MEGASCALE_SLICE_ID
+                  value: ""
+                - name: MEGASCALE_COORDINATOR_ADDRESS
+                  value: ""
+                - name: MEGASCALE_PORT
+                  value: ""
+                - name: MODEL_ID
+                  value: '{{ .MODEL_ID | default "Qwen/Qwen3.5-397B-A17B-FP8" }}'
+                - name: MODEL_GCS_PREFIX
+                  value: '{{ .MODEL_GCS_PREFIX | default "gs://cloud-devkit/ckpt/hf" }}'
+                - name: ENV_VARS
+                  value: '{{ .ENV_VARS | default "" }}'
+                - name: SERVER_ARGS
+                  value: '{{ .SERVER_ARGS | default "" }}'
+                - name: SERVER_PORT
+                  value: '{{ .SERVER_PORT | default "8000" }}'
+                - name: MASTER_PORT
+                  value: '{{ .MASTER_PORT | default "29500" }}'
+                - name: ENABLE_XPROF
+                  value: '{{ .ENABLE_XPROF | default "0" }}'
+                command: ["/bin/bash", "-c"]
+                args:
+                  - |
+                    set -e
+                    export TPU_NODE_ID=${JOBSET_JOB_INDEX}
+                    export TPU_WORKER_ID=${JOBSET_JOB_INDEX}
+                    mkdir -p "${CDK_OUTPUT_DIR}"
+
+                    if [ -d "/workspace/vllm-torchtpu/src/vllm_torchtpu" ]; then
+                      echo "Overlaying /workspace/vllm-torchtpu/src/vllm_torchtpu..."
+                      for d in /root/torchtpu-vllm/src /root/cloud-devkit/vllm-torchtpu/src; do
+                        if [ -d "$d" ]; then
+                          rm -rf "$d/vllm_torchtpu"
+                          cp -r /workspace/vllm-torchtpu/src/vllm_torchtpu "$d/"
+                        fi
+                      done
+                      export PYTHONPATH="/workspace/vllm-torchtpu/src:${PYTHONPATH:-}"
+                    fi
+
+                    if [ -n "${ENV_VARS}" ]; then
+                      echo "Exporting ENV_VARS: ${ENV_VARS}"
+                      export ${ENV_VARS}
+                    fi
+
+                    export MODEL_PATH="${MODEL_ID}"
+                    if [ -n "${MODEL_ID}" ]; then
+                      MODEL_PATH="/root/.cache/ckpt/${MODEL_ID}"
+                      export MODEL_PATH
+                      mkdir -p "${MODEL_PATH}"
+                      echo "trace-start-event: name=copy-ckpt ts=$(date +%s.%N) pid=vllm tid=vllm"
+                      gcloud storage rsync -r "${MODEL_GCS_PREFIX}/${MODEL_ID}" "${MODEL_PATH}"
+                      echo "trace-end-event: name=copy-ckpt ts=$(date +%s.%N) pid=vllm tid=vllm"
+                      df -h /root/.cache/ | tail -1
+                    fi
+
+                    HEAD_HOST="${JS_NAME}-vllm-node-0-0.${JS_NAME}.${POD_NAMESPACE}.svc.cluster.local"
+                    until getent hosts "${HEAD_HOST}" >/dev/null 2>&1; do
+                      echo "Waiting for DNS of ${HEAD_HOST}..."
+                      sleep 2
+                    done
+                    HEAD_IP=$(getent hosts "${HEAD_HOST}" | awk '{print $1}' | head -n 1)
+                    echo "Resolved HEAD_HOST=${HEAD_HOST} HEAD_IP=${HEAD_IP}"
+
+                    EXTRA_FLAGS="--nnodes 2 --node-rank ${JOBSET_JOB_INDEX} --master-addr ${HEAD_IP} --master-port ${MASTER_PORT}"
+                    if [ "${JOBSET_JOB_INDEX}" != "0" ]; then
+                      EXTRA_FLAGS="${EXTRA_FLAGS} --headless"
+                    fi
+
+                    if [[ "${ENABLE_XPROF,,}" == "1" || "${ENABLE_XPROF,,}" == "true" ]]; then
+                      export USE_PHASED_PROFILER=true
+                      EXTRA_FLAGS="${EXTRA_FLAGS} --profiler-config.profiler=torch --profiler-config.torch_profiler_dir=${CDK_OUTPUT_DIR} --profiler-config.max_iterations=5 --profiler-config.ignore_frontend=true"
+                    fi
+
+                    CMD="vllm serve ${MODEL_PATH} --served-model-name ${MODEL_ID} --port ${SERVER_PORT} ${SERVER_ARGS} ${EXTRA_FLAGS}"
+                    echo "Launching: ${CMD}"
+                    eval "${CMD}"
+                volumeMounts:
+                - name: hf-token-volume
+                  mountPath: /root/.cache/huggingface/token
+                  subPath: token
+                  readOnly: true
+                - name: cache-storage
+                  mountPath: /root/.cache/
+                - name: dshm
+                  mountPath: /dev/shm
+                resources:
+                  limits:
+                    memory: 900Gi
+                    cpu: "32"
+                    google.com/tpu: 4
+                  requests:
+                    memory: 900Gi
+                    cpu: "32"
+                    google.com/tpu: 4
+              volumes:
+              - name: hf-token-volume
+                secret:
+                  secretName: vllm-hf-token
+                  items:
+                  - key: HF_TOKEN
+                    path: token
+              - name: cache-storage
+                ephemeral:
+                  volumeClaimTemplate:
+                    spec:
+                      storageClassName: "premium-rwo"
+                      accessModes: [ "ReadWriteOnce" ]
+                      resources:
+                        requests:
+                          storage: 1024Gi
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: "2x2x2"
+                cloud.google.com/gke-tpu-accelerator: "tpu7x"
+
+    - name: bench
+      replicas: 1
+      template:
+        spec:
+          ttlSecondsAfterFinished: 600
+          backoffLimit: 0
+          template:
+            spec:
+              containers:
+              - name: bench
+                image: {{ .DOCKER_IMAGE | default "us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev@sha256:58530632039b112295db7ba6c44f423684bdd1283dd58d57d53e72fd1f469851" }}
+                imagePullPolicy: Always
+                env:
+                - name: MODEL_ID
+                  value: '{{ .MODEL_ID | default "Qwen/Qwen3.5-397B-A17B-FP8" }}'
+                - name: SERVER_PORT
+                  value: '{{ .SERVER_PORT | default "8000" }}'
+                - name: SERVER_WAIT_TIMEOUT
+                  value: '{{ .SERVER_WAIT_TIMEOUT | default "7200" }}'
+                - name: BENCH_SWEEP
+                  value: '{{ .BENCH_SWEEP | default "8192,1,1,8;8192,1,8,32;8192,1,16,64;16384,1,1,8;16384,1,8,32;32768,1,1,8;32768,1,8,32;65536,1,1,4" }}'
+                - name: RUN_EVAL
+                  value: '{{ .RUN_EVAL | default "false" }}'
+                - name: EVAL_TASK
+                  value: '{{ .EVAL_TASK | default "gsm8k" }}'
+                - name: EVAL_ARGS
+                  value: '{{ .EVAL_ARGS | default "--num_fewshot 5" }}'
+                - name: JS_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+                command: ["/bin/bash", "-c"]
+                args:
+                  - |
+                    set -e
+                    VLLM_SERVER_DNS="${JS_NAME}-vllm-node-0-0.${JS_NAME}"
+                    elapsed=0
+                    echo "Waiting for vllm-server at http://${VLLM_SERVER_DNS}:${SERVER_PORT}/health ..."
+                    until curl -sf "http://${VLLM_SERVER_DNS}:${SERVER_PORT}/health" > /dev/null; do
+                      if [ "${elapsed}" -ge "${SERVER_WAIT_TIMEOUT}" ]; then
+                        echo "ERROR: vllm-server did not become healthy within ${SERVER_WAIT_TIMEOUT}s" >&2
+                        exit 1
+                      fi
+                      sleep 5
+                      elapsed=$((elapsed + 5))
+                    done
+                    echo "vllm-server is up after ${elapsed}s!"
+
+                    SITEDIR=/tmp/torchtpu-bench-sitecustomize
+                    mkdir -p "${SITEDIR}"
+                    printf "from torch_tpu import _loader\n_loader._init_device_impl(\"tpu\")\n" > "${SITEDIR}/sitecustomize.py"
+                    export PYTHONPATH="${SITEDIR}:${PYTHONPATH:-}"
+
+                    if [ -f "/workspace/vllm-torchtpu/scripts/pp_tp_qwen35/run_qwen35_probes.py" ]; then
+                      echo "Running deterministic greedy needle & reasoning probes..."
+                      python3 /workspace/vllm-torchtpu/scripts/pp_tp_qwen35/run_qwen35_probes.py \
+                        --host "${VLLM_SERVER_DNS}" \
+                        --port "${SERVER_PORT}" \
+                        --model "${MODEL_ID}"
+                    fi
+
+                    IFS=';' read -ra POINTS <<< "${BENCH_SWEEP}"
+                    for pt in "${POINTS[@]}"; do
+                      [ -z "${pt}" ] && continue
+                      IFS=',' read -r IN_LEN OUT_LEN CONC PROMPTS <<< "${pt}"
+                      echo "=== Benchmark: in=${IN_LEN} out=${OUT_LEN} conc=${CONC} prompts=${PROMPTS} ==="
+                      vllm bench serve \
+                        --backend vllm \
+                        --host "${VLLM_SERVER_DNS}" \
+                        --port "${SERVER_PORT}" \
+                        --model "${MODEL_ID}" \
+                        --dataset-name random \
+                        --random-input-len "${IN_LEN}" \
+                        --random-output-len "${OUT_LEN}" \
+                        --random-range-ratio 0 \
+                        --num-prompts "${PROMPTS}" \
+                        --max-concurrency "${CONC}" \
+                        --request-rate inf \
+                        --ignore-eos \
+                        --percentile-metrics ttft,tpot,itl,e2el
+                    done
+
+                    if [[ "${RUN_EVAL,,}" == "true" ]]; then
+                      echo "=== Running lm_eval (${EVAL_TASK}) ==="
+                      lm_eval --model local-completions \
+                        --model_args "base_url=http://${VLLM_SERVER_DNS}:${SERVER_PORT}/v1/completions,model=${MODEL_ID},tokenized_requests=False,num_concurrent=64,max_retries=3,timeout=600" \
+                        --tasks "${EVAL_TASK}" \
+                        ${EVAL_ARGS}
+                    fi
+                volumeMounts:
+                - name: dshm
+                  mountPath: /dev/shm
+              volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+              restartPolicy: Never
