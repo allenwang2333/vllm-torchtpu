@@ -39,18 +39,17 @@ def _kv_cache_update_kernel(
 ):
     block_idx = pl.program_id(0)
     num_slices_per_block = scratch.shape[0]
+    num_slices = num_slices_ref[0]
+    base_offset = block_idx * num_slices_per_block
 
     if not pipelined_dma:
         async_copies = []
         # Copy from new_kv_hbm_ref to scratch
         for i in range(num_slices_per_block):
-            offset_i = i + block_idx * num_slices_per_block
-            new_kv_start = jax.lax.select(
-                offset_i < num_slices_ref[0], slices_ref[1, offset_i], 0
-            )
-            length = jax.lax.select(
-                offset_i < num_slices_ref[0], slices_ref[2, offset_i], 0
-            )
+            offset_i = i + base_offset
+            in_bounds = offset_i < num_slices
+            new_kv_start = jax.lax.select(in_bounds, slices_ref[1, offset_i], 0)
+            length = jax.lax.select(in_bounds, slices_ref[2, offset_i], 0)
             async_copy = pltpu.make_async_copy(
                 new_kv_hbm_ref.at[pl.ds(new_kv_start, length), ...],
                 scratch.at[i, pl.ds(0, length), ...],
@@ -65,13 +64,10 @@ def _kv_cache_update_kernel(
         # Copy from scratch to kv_cache_hbm_ref
         async_copies.clear()
         for i in range(num_slices_per_block):
-            offset_i = i + block_idx * num_slices_per_block
-            kv_cache_start = jax.lax.select(
-                offset_i < num_slices_ref[0], slices_ref[0, offset_i], 0
-            )
-            length = jax.lax.select(
-                offset_i < num_slices_ref[0], slices_ref[2, offset_i], 0
-            )
+            offset_i = i + base_offset
+            in_bounds = offset_i < num_slices
+            kv_cache_start = jax.lax.select(in_bounds, slices_ref[0, offset_i], 0)
+            length = jax.lax.select(in_bounds, slices_ref[2, offset_i], 0)
             async_copy = pltpu.make_async_copy(
                 scratch.at[i, pl.ds(0, length), ...],
                 kv_cache_hbm_ref.at[pl.ds(kv_cache_start, length), ...],
@@ -84,11 +80,10 @@ def _kv_cache_update_kernel(
     else:
         # Pipelined double-buffering: overlap reading slice i+1 with
         # writing slice i to HBM
-        offset_0 = block_idx * num_slices_per_block
-        new_kv_start_0 = jax.lax.select(
-            offset_0 < num_slices_ref[0], slices_ref[1, offset_0], 0
-        )
-        len_0 = jax.lax.select(offset_0 < num_slices_ref[0], slices_ref[2, offset_0], 0)
+        offset_0 = base_offset
+        in_bounds_0 = offset_0 < num_slices
+        new_kv_start_0 = jax.lax.select(in_bounds_0, slices_ref[1, offset_0], 0)
+        len_0 = jax.lax.select(in_bounds_0, slices_ref[2, offset_0], 0)
         read_copy = pltpu.make_async_copy(
             new_kv_hbm_ref.at[pl.ds(new_kv_start_0, len_0), ...],
             scratch.at[0, pl.ds(0, len_0), ...],
@@ -105,13 +100,10 @@ def _kv_cache_update_kernel(
             if write_copy is not None:
                 write_copy.wait()
 
-            offset_i = i + block_idx * num_slices_per_block
-            kv_cache_start_i = jax.lax.select(
-                offset_i < num_slices_ref[0], slices_ref[0, offset_i], 0
-            )
-            len_i = jax.lax.select(
-                offset_i < num_slices_ref[0], slices_ref[2, offset_i], 0
-            )
+            offset_i = i + base_offset
+            in_bounds_i = offset_i < num_slices
+            kv_cache_start_i = jax.lax.select(in_bounds_i, slices_ref[0, offset_i], 0)
+            len_i = jax.lax.select(in_bounds_i, slices_ref[2, offset_i], 0)
             write_copy = pltpu.make_async_copy(
                 scratch.at[curr_buf_idx, pl.ds(0, len_i), ...],
                 kv_cache_hbm_ref.at[pl.ds(kv_cache_start_i, len_i), ...],
@@ -120,13 +112,12 @@ def _kv_cache_update_kernel(
             write_copy.start()
 
             if i + 1 < num_slices_per_block:
-                offset_next = (i + 1) + block_idx * num_slices_per_block
+                offset_next = (i + 1) + base_offset
+                in_bounds_next = offset_next < num_slices
                 new_kv_start_next = jax.lax.select(
-                    offset_next < num_slices_ref[0], slices_ref[1, offset_next], 0
+                    in_bounds_next, slices_ref[1, offset_next], 0
                 )
-                len_next = jax.lax.select(
-                    offset_next < num_slices_ref[0], slices_ref[2, offset_next], 0
-                )
+                len_next = jax.lax.select(in_bounds_next, slices_ref[2, offset_next], 0)
                 read_copy = pltpu.make_async_copy(
                     new_kv_hbm_ref.at[pl.ds(new_kv_start_next, len_next), ...],
                     scratch.at[next_buf_idx, pl.ds(0, len_next), ...],

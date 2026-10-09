@@ -57,11 +57,7 @@ class RpaCase(Enum):
 
     @property
     def symbol(self):
-        return {
-            RpaCase.DECODE: "d",
-            RpaCase.PREFILL: "p",
-            RpaCase.MIXED: "m",
-        }[self]
+        return _RPA_CASE_SYMBOLS[self]
 
     def get_range(self, distribution):
         assert distribution.shape == (3,)
@@ -73,6 +69,13 @@ class RpaCase(Enum):
             return distribution[1], distribution[2]
         else:
             raise ValueError(f"Unsupported RPA case: {self}")
+
+
+_RPA_CASE_SYMBOLS = {
+    RpaCase.DECODE: "d",
+    RpaCase.PREFILL: "p",
+    RpaCase.MIXED: "m",
+}
 
 
 def ref_ragged_paged_attention(
@@ -885,12 +888,14 @@ def _ragged_paged_attention_kernel_loop(
         if src.shape == shape:
             return src
         assert src.shape[:-1] == shape[:-1]
-        assert src.shape[-1] % 128 == 0
-        target_minor = align_to(shape[-1], src.shape[-1])
+        src_minor = src.shape[-1]
+        assert src_minor % 128 == 0
+        target_end = shape[-1]
+        target_minor = align_to(target_end, src_minor)
         # no-op concatenation.
         return jnp.concatenate(
-            [src for _ in range(target_minor // src.shape[-1])], axis=-1
-        )[..., : shape[-1]]
+            [src for _ in range(target_minor // src_minor)], axis=-1
+        )[..., :target_end]
 
     def mask_and(mask, new_mask):
         if mask is None:

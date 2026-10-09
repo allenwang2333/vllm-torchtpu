@@ -151,6 +151,8 @@ def select(
     """
     rows, n = scores.shape
     block = min(MAX_BLOCK_ROWS, rows)
+    grid = (pl.cdiv(rows, block),)
+    scores_spec = pl.BlockSpec((block, n), lambda i: (i, 0))
     out_specs = [
         pl.BlockSpec((block, topk), lambda i: (i, 0)),
         pl.BlockSpec((block, topk), lambda i: (i, 0)),
@@ -162,8 +164,8 @@ def select(
     if bias is None:
         return pl.pallas_call(
             functools.partial(_select_kernel, topk=topk, n=n, renormalize=renormalize),
-            grid=(pl.cdiv(rows, block),),
-            in_specs=[pl.BlockSpec((block, n), lambda i: (i, 0))],
+            grid=grid,
+            in_specs=[scores_spec],
             out_specs=out_specs,
             out_shape=out_shape,
             interpret=interpret,
@@ -173,9 +175,9 @@ def select(
         functools.partial(
             _select_biased_kernel, topk=topk, n=n, renormalize=renormalize
         ),
-        grid=(pl.cdiv(rows, block),),
+        grid=grid,
         in_specs=[
-            pl.BlockSpec((block, n), lambda i: (i, 0)),
+            scores_spec,
             pl.BlockSpec((1, n), lambda i: (0, 0)),
         ],
         out_specs=out_specs,
