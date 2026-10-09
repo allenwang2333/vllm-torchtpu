@@ -357,8 +357,11 @@ def _kpool_index_jax(
     offset = jnp.minimum(visible, select_k) * kpool  # [tokens]
     col = jnp.arange(width, dtype=jnp.int32)[None, :]
     in_tail = col - offset[:, None]
-    tail_at_col = jnp.take_along_axis(
-        tail, jnp.clip(in_tail, 0, kpool - 2), axis=-1)
+    # `tail[t, c]` is just `visible[t] * kpool + c`, so compute it in place.
+    # A `take_along_axis` from the `[tokens, kpool - 1]` table lowers to one
+    # gather per output element: 17M of them, 179 ms, for an 8K prefill.
+    tail_at_col = (visible * kpool)[:, None] + in_tail
+    tail_at_col = jnp.where(tail_at_col <= pos[:, None], tail_at_col, -1)
     pool_at_col = jnp.pad(token_ids,
                           ((0, 0), (0, max(0, width - token_ids.shape[-1]))),
                           constant_values=-1)[:, :width]

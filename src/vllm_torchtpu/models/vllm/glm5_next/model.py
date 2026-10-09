@@ -231,10 +231,15 @@ class Glm5NextModel(nn.Module):
         if not dense_dsa_fallback() and getattr(config, "index_topk", 0):
             width = config.index_topk + (config.index_kpool - 1 if getattr(
                 config, "index_kpool_always_select_tail", False) else 0)
-            # The sparse MLA kernel packs indices four at a time on the
-            # SparseCore. Rows are left-packed and the indexer -1-fills the
-            # whole row before writing, so the padding columns read as unused.
-            width = -(-width // 4) * 4
+            # Pad to a multiple of 256. The sparse MLA kernel needs a multiple
+            # of 4 at minimum, but its SparseCore gather runs in batches of
+            # 16384 indices: at 2052 a 64-token prefill chunk (131328 indices)
+            # is padded to 147456 = 64 * 2304 and then sliced back, which is a
+            # full copy of the gathered KV (~110 ms of an 8K prefill). At 2304
+            # nothing is padded or sliced, and the SparseCore cache layout's
+            # divisibility rule is met as well. Rows are left-packed, so the
+            # extra columns are -1 and masked out.
+            width = -(-width // 256) * 256
             self.topk_indices_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 width,
