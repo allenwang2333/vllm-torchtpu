@@ -390,10 +390,18 @@ class TpuPlatform(Platform):
         "TPU_KERNEL_ITER_MODE",
         "TPU_KERNEL_RELOAD_MODULES",
         "TPU_MOE_ROUTER_TOPK",
+        "TPU_DEEPSEEK_V41_ENGRAM_DEBUG_VERIFY",
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
         "VLLM_DSV41_CED",
+        "VLLM_DSV41_FUSED_SEAM_QUANT",
+        "VLLM_DSV41_FUSED_Q_ROPE",
+        "VLLM_DSV41_TP_ATTN",
+        "VLLM_DSV41_TP_ATTN_MIN_TOKENS",
+        "VLLM_DSV41_TP_INDEXER",
+        "VLLM_DSV41_TP_INDEXER_MIN_TOKENS",
+        "VLLM_DSV41_TP_ATTN_LOCAL_TOPK",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

@@ -161,12 +161,25 @@ def kernel(
                 "nd,dm->nm", rows, bkv, preferred_element_type=jnp.float32
             )
 
-        if n_tok <= 8:
+        if n_tok < 8:
             st = qk(bq_rows).reshape(n_tok, num_q_heads, -1)
             return (jnp.maximum(st, 0.0) * w[:, :, None]).sum(axis=1)
 
-        # n_tok > 8 only in the MIXED pass, whose q is pre-transposed into q_hm_ref.
+        # n_tok >= 8 only in the MIXED pass, whose q is pre-transposed into q_hm_ref.
         rows_hm = bq_rows.reshape(num_q_heads, n_tok, head_dim)
+        if n_tok == 8:
+            head_group = min(32, num_q_heads)
+            acc = None
+            for g in range(0, num_q_heads, head_group):
+                grp = min(head_group, num_q_heads - g)
+                st_g = qk(
+                    rows_hm[g : g + grp].reshape(grp * n_tok, head_dim)
+                ).reshape(grp, n_tok, -1)
+                for h in range(grp):
+                    term = jnp.maximum(st_g[h], 0.0) * w[:, g + h : g + h + 1]
+                    acc = term if acc is None else acc + term
+            return acc
+
         head_group = min(8, num_q_heads)
         acc = None
         w_bf16 = w.astype(jnp.bfloat16)
@@ -302,7 +315,7 @@ def kernel(
 
         pl.run_scoped(_run_pipeline, final_allocs=allocs)
 
-    if seq_batch_size == 1 and bq_sz > 8:
+    if seq_batch_size == 1 and bq_sz >= 8:
         pl.run_scoped(
             _run_all, pltpu.VMEM((num_q_heads * bq_sz, head_dim), q_hbm_ref.dtype)
         )
@@ -320,16 +333,47 @@ def _smem_budget_bytes() -> int:
         return 1024 * 1024 - 64 * 1024
 
 
-def compute_meta_buf_len(max_num_seqs: int, pages_per_seq: int) -> int:
+def compute_meta_buf_len(
+    max_num_seqs: int,
+    pages_per_seq: int,
+    max_num_tokens: int | None = None,
+) -> int:
     """Static upper bound on `max_steps` across all 3 StreamIndex passes."""
     smem_budget_bytes = _smem_budget_bytes()
     prefetch_bytes = (
         max_num_seqs * 4 + (max_num_seqs + 1) * 4 + max_num_seqs * pages_per_seq * 4
     )
     step_meta_bytes = (len(MetadataRef.__annotations__) - 1) * 4
-    return max(
+    smem_max = max(
         1024, ((smem_budget_bytes - prefetch_bytes) // step_meta_bytes // 1024) * 1024
     )
+    if not isinstance(max_num_tokens, int):
+        return smem_max
+    num_chunks, chunk_len, bq_mixed, bkv_p = _chunk_and_bq_config(max_num_tokens)
+    eff_max_seqs = min(max_num_seqs, max(8, align_to(max_num_tokens, 8)))
+    chunked = num_chunks > 1
+    req_max = max(
+        _max_steps_for_pass(
+            max_num_seqs=eff_max_seqs,
+            pages_per_seq=pages_per_seq,
+            page_size=1,
+            max_num_tokens=max_num_tokens,
+            bq_sz=bq_sz,
+            bkv_sz=bkv_p_r,
+            static_q_len=static_q_len,
+            seq_batch_size=seq_batch_size,
+            num_chunks=num_chunks,
+            chunked=chunked,
+            chunk_tokens=chunk_len,
+        )
+        for bkv_p_r in (bkv_p, bkv_p * 2)
+        for seq_batch_size, bq_sz, static_q_len in (
+            (4, 1, 1),
+            (1, 1, 1),
+            (1, bq_mixed, None),
+        )
+    )
+    return min(smem_max, req_max)
 
 
 def _max_steps_for_pass(
@@ -472,25 +516,71 @@ def _compute_metadata(
         else:
             num_bq = s_num_bq[None, :]
 
-        seg_num_bkv = jnp.tile(s_num_bkv, num_chunks)
-        seg_seq_tiles = jnp.tile(all_seq_tiles, num_chunks)
-        seg_num_steps = num_bq.reshape(-1) * seg_num_bkv
-        seg_start_step_id = jnp.cumulative_sum(seg_num_steps, include_initial=True)
+        seg_num_steps_2d = num_bq * s_num_bkv[None, :]
+        chunk_num_steps = jnp.sum(seg_num_steps_2d, axis=1)
+        if num_chunks > 1 and num_chunks * max_seq_tiles >= 4096:
+            # 2-level chunk -> tile lookup avoids materializing (num_chunks * max_seq_tiles, max_steps).
+            chunk_ends = jnp.cumulative_sum(chunk_num_steps)
+            valid_step = all_steps < chunk_ends[-1]
+            c_le = chunk_ends[:, None] <= all_steps[None, :]
+            c_start_step = jnp.max(jnp.where(c_le, chunk_ends[:, None], 0), axis=0)
+            step_in_chunk = all_steps - c_start_step
+            c_idx = jnp.minimum(
+                jnp.sum(c_le, axis=0, dtype=jnp.int32), num_chunks - 1
+            )
+            chunk_hit = (
+                jnp.arange(num_chunks, dtype=jnp.int32)[:, None] == c_idx[None, :]
+            )
+            tile_cum = jnp.cumulative_sum(seg_num_steps_2d, axis=1)
+            lh = jnp.einsum(
+                "ct,cs->ts",
+                jnp.concatenate([tile_cum & 0xFF, tile_cum >> 8], axis=1).astype(
+                    jnp.bfloat16
+                ),
+                chunk_hit.astype(jnp.bfloat16),
+                preferred_element_type=jnp.float32,
+            ).astype(jnp.int32)
+            step_tile_ends = lh[:max_seq_tiles] | (lh[max_seq_tiles:] << 8)
+            t_le = step_tile_ends <= step_in_chunk[None, :]
+            seg_tile = jnp.minimum(
+                jnp.sum(t_le, axis=0, dtype=jnp.int32), max_seq_tiles - 1
+            )
+            tile_start_in_chunk = jnp.max(
+                jnp.where(t_le, step_tile_ends, 0), axis=0
+            )
+            start_step_id_repeat = jnp.where(
+                valid_step, c_start_step + tile_start_in_chunk, 0
+            )
+            tile_step_id = all_steps - start_step_id_repeat
+        else:
+            seg_num_steps = seg_num_steps_2d.reshape(-1)
+            seg_start_step_id = jnp.cumulative_sum(
+                seg_num_steps, include_initial=True
+            )
+            valid_step = all_steps < seg_start_step_id[-1]
+            # Gather-free step -> segment lookup. seg_start_step_id is non-decreasing,
+            # so counting segment ends <= step equals searchsorted(side="right"); the
+            # default scan method ran ~log2(num_segs) serialized max_steps-wide gathers.
+            ends = seg_start_step_id[1:, None]
+            le = ends <= all_steps[None, :]
+            seg_idx = jnp.minimum(
+                jnp.sum(le, axis=0, dtype=jnp.int32), seg_num_steps.shape[0] - 1
+            )
+            seg_tile = seg_idx % max_seq_tiles  # segments are chunk-major over tiles
+            start_step_id_repeat = jnp.where(
+                valid_step, jnp.max(jnp.where(le, ends, 0), axis=0), 0
+            )
+            tile_step_id = all_steps - start_step_id_repeat
 
-        valid_step = all_steps < seg_start_step_id[-1]
-        seg_idx = jnp.minimum(
-            jnp.searchsorted(seg_start_step_id[1:], all_steps, side="right"),
-            seg_num_steps.shape[0] - 1,
+        repeat_seq_tiles = jnp.where(valid_step, seg_tile, 0)
+        batch_tile_idx = repeat_seq_tiles * seq_batch_size
+        tile_hit = all_seq_tiles[:, None] == seg_tile[None, :]
+        nbkv_per_step_id = jnp.where(
+            valid_step, jnp.sum(jnp.where(tile_hit, s_num_bkv[:, None], 0), axis=0), 0
         )
 
-        repeat_seq_tiles = jnp.where(valid_step, seg_seq_tiles[seg_idx], 0)
-        batch_tile_idx = repeat_seq_tiles * seq_batch_size
-        start_step_id_repeat = jnp.where(valid_step, seg_start_step_id[seg_idx], 0)
-        tile_step_id = all_steps - start_step_id_repeat
-        nbkv_per_step_id = jnp.where(valid_step, seg_num_bkv[seg_idx], 0)
-
         return MetadataRef.create(
-            num_steps=jnp.sum(seg_num_steps.reshape(num_chunks, max_seq_tiles), axis=1),
+            num_steps=chunk_num_steps,
             batch_tile_idx=batch_tile_idx,
             bq_idx=jnp.maximum(0, tile_step_id // jnp.maximum(1, nbkv_per_step_id)),
             bkv_idx=jnp.maximum(0, tile_step_id % jnp.maximum(1, nbkv_per_step_id)),
@@ -501,6 +591,31 @@ def _compute_metadata(
         _empty_schedule,
         _compute_schedule,
     )
+
+
+def _chunk_and_bq_config(max_num_tokens: int) -> tuple[int, int, int, int]:
+    is_decode_or_verify = max_num_tokens <= 512
+    bq_mixed_in = 8 if is_decode_or_verify else 128
+    bkv_p = 16 if is_decode_or_verify else 8
+    chunk_tokens = (
+        256
+        if max_num_tokens >= 1024 and max_num_tokens % 256 == 0
+        else {
+            512: 128,
+            384: 96,
+            256: 64,
+            192: 96,
+            128: 64,
+            96: 48,
+            64: 32,
+            16: 8,
+        }.get(max_num_tokens, 512)
+    )
+    if chunk_tokens is None or max_num_tokens % chunk_tokens:
+        num_chunks, chunk_len = 1, max_num_tokens
+    else:
+        num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
+    return num_chunks, chunk_len, min(bq_mixed_in, chunk_len), bkv_p
 
 
 @functools.partial(
@@ -538,33 +653,12 @@ def compute_indexer_step_metadata_jax(
     )
     pages_per_seq = idx_page_indices.shape[0] // max_num_seqs
     eff_meta_buf_len = (
-        compute_meta_buf_len(max_num_seqs, pages_per_seq)
+        compute_meta_buf_len(max_num_seqs, pages_per_seq, max_num_tokens)
         if meta_buf_len is None
         else meta_buf_len
     )
 
-    is_decode_or_verify = max_num_tokens <= 512
-    bq_mixed_in = 8 if is_decode_or_verify else 128
-    bkv_p = 16 if is_decode_or_verify else 8
-    chunk_tokens = (
-        256
-        if max_num_tokens >= 1024 and max_num_tokens % 256 == 0
-        else {
-            512: 128,
-            384: 96,
-            256: 64,
-            192: 96,
-            128: 64,
-            96: 48,
-            64: 32,
-            16: 8,
-        }.get(max_num_tokens, 512)
-    )
-    if chunk_tokens is None or max_num_tokens % chunk_tokens:
-        num_chunks, chunk_len = 1, max_num_tokens
-    else:
-        num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
-    bq_mixed = min(bq_mixed_in, chunk_len)
+    num_chunks, chunk_len, bq_mixed, bkv_p = _chunk_and_bq_config(max_num_tokens)
 
     eff_max_seqs = min(max_num_seqs, max(8, align_to(max_num_tokens, 8)))
     if eff_max_seqs < max_num_seqs:
@@ -572,6 +666,9 @@ def compute_indexer_step_metadata_jax(
         cu_q_lens = cu_q_lens[: eff_max_seqs + 1]
         distribution = jnp.minimum(distribution, eff_max_seqs)
     num_seqs = distribution[2]
+    seq_lens = jnp.where(
+        jnp.arange(eff_max_seqs, dtype=jnp.int32) < num_seqs, seq_lens, 0
+    )
     token_ids = jnp.arange(max_num_tokens, dtype=jnp.int32)
     seq_mask = token_ids[:, None] >= cu_q_lens[None, 1 : eff_max_seqs + 1]
     seq_mask = jnp.where(jnp.arange(eff_max_seqs)[None, :] < num_seqs, seq_mask, False)
@@ -583,7 +680,8 @@ def compute_indexer_step_metadata_jax(
     valid_tok = token_ids < cu_q_lens[num_seqs]
 
     def _eff_rl(comp_ratio: int, page_size: int) -> jax.Array:
-        num_sublanes_total = align_to(pages_per_seq, bkv_p) * page_size // 128
+        bkv_p_c = bkv_p * max(1, comp_ratio)
+        num_sublanes_total = align_to(pages_per_seq, bkv_p_c) * page_size // 128
         visible = jnp.minimum(seq_len // comp_ratio, (token_pos + 1) // comp_ratio)
         return jnp.where(
             valid_tok,
@@ -607,35 +705,39 @@ def compute_indexer_step_metadata_jax(
 
     num_steps_rows = []
     sched_rows = []
-    for spec in pass_specs:
-        pm = _compute_metadata(
-            seq_lens=seq_lens,
-            cu_q_lens=cu_q_lens,
-            start_seq_idx=spec[0],
-            end_seq_idx=spec[1],
-            bq_sz=spec[3],
-            bkv_sz=bkv_p * page_size_r1,
-            pages_per_seq=pages_per_seq,
-            page_size=page_size_r1,
-            max_num_tokens=max_num_tokens,
-            compression_ratio=1,
-            static_q_len=1 if spec[4] is MlaCase.DECODE else None,
-            seq_batch_size=spec[2],
-            chunk_starts=chunk_starts,
-            chunk_tokens=chunk_len,
-        )
-        ns = pm.num_steps
-        if ns.shape[0] < max_chunks:
-            ns = jnp.pad(ns, (0, max_chunks - ns.shape[0]))
-        else:
-            ns = ns[:max_chunks]
-        num_steps_rows.append(ns)
-        for arr in (pm.batch_tile_idx, pm.bq_idx, pm.bkv_idx):
-            if arr.shape[0] < eff_meta_buf_len:
-                arr = jnp.pad(arr, (0, eff_meta_buf_len - arr.shape[0]))
+    for comp_r, ps_r, bkv_p_r in (
+        (1, page_size_r1, bkv_p),
+        (2, page_size_r2, bkv_p * 2),
+    ):
+        for spec in pass_specs:
+            pm = _compute_metadata(
+                seq_lens=seq_lens,
+                cu_q_lens=cu_q_lens,
+                start_seq_idx=spec[0],
+                end_seq_idx=spec[1],
+                bq_sz=spec[3],
+                bkv_sz=bkv_p_r * ps_r,
+                pages_per_seq=pages_per_seq,
+                page_size=ps_r,
+                max_num_tokens=max_num_tokens,
+                compression_ratio=comp_r,
+                static_q_len=1 if spec[4] is MlaCase.DECODE else None,
+                seq_batch_size=spec[2],
+                chunk_starts=chunk_starts,
+                chunk_tokens=chunk_len,
+            )
+            ns = pm.num_steps
+            if ns.shape[0] < max_chunks:
+                ns = jnp.pad(ns, (0, max_chunks - ns.shape[0]))
             else:
-                arr = arr[:eff_meta_buf_len]
-            sched_rows.append(arr)
+                ns = ns[:max_chunks]
+            num_steps_rows.append(ns)
+            for arr in (pm.batch_tile_idx, pm.bq_idx, pm.bkv_idx):
+                if arr.shape[0] < eff_meta_buf_len:
+                    arr = jnp.pad(arr, (0, eff_meta_buf_len - arr.shape[0]))
+                else:
+                    arr = arr[:eff_meta_buf_len]
+                sched_rows.append(arr)
 
     pass_num_steps = jnp.stack(num_steps_rows, axis=0)
     pass_schedules = jnp.stack(sched_rows, axis=0)
@@ -698,6 +800,9 @@ def streamindex_topk(
         cu_q_lens = cu_q_lens[: eff_max_seqs + 1]
         distribution = jnp.minimum(distribution, eff_max_seqs)
         max_num_seqs = eff_max_seqs
+    seq_lens = jnp.where(
+        jnp.arange(max_num_seqs, dtype=jnp.int32) < distribution[2], seq_lens, 0
+    )
     if chunk_tokens is None or max_num_tokens % chunk_tokens:
         num_chunks, chunk_len = 1, max_num_tokens
     else:
@@ -780,7 +885,9 @@ def streamindex_topk(
 
     bq_mixed = min(num_queries_per_block, chunk_len)
     decode_req_batch_size = 4
-    decode_batch_end = distribution[0] // decode_req_batch_size * decode_req_batch_size
+    decode_batch_end = (
+        distribution[0] // decode_req_batch_size * decode_req_batch_size
+    )
     # Rows: (start_seq, end_seq, seq_batch_size, bq_sz, case).
     pass_specs = (
         (jnp.array(0), decode_batch_end, decode_req_batch_size, 1, MlaCase.DECODE),
@@ -865,6 +972,11 @@ def streamindex_topk(
         precomputed_pass_num_steps is not None
         and precomputed_pass_schedules is not None
     ):
+        r_off = (
+            3
+            if compression_ratio == 2 and precomputed_pass_num_steps.shape[0] >= 6
+            else 0
+        )
         passes = []
         for i, spec in enumerate(pass_specs):
             max_steps_i = min(
@@ -883,6 +995,7 @@ def streamindex_topk(
                 ),
                 precomputed_pass_schedules.shape[1],
             )
+            idx = r_off + i
             passes.append(
                 (
                     (
@@ -896,10 +1009,16 @@ def streamindex_topk(
                         spec[4],
                     ),
                     MetadataRef.create(
-                        num_steps=precomputed_pass_num_steps[i, :num_chunks],
-                        batch_tile_idx=precomputed_pass_schedules[3 * i, :max_steps_i],
-                        bq_idx=precomputed_pass_schedules[3 * i + 1, :max_steps_i],
-                        bkv_idx=precomputed_pass_schedules[3 * i + 2, :max_steps_i],
+                        num_steps=precomputed_pass_num_steps[idx, :num_chunks],
+                        batch_tile_idx=precomputed_pass_schedules[
+                            3 * idx, :max_steps_i
+                        ],
+                        bq_idx=precomputed_pass_schedules[
+                            3 * idx + 1, :max_steps_i
+                        ],
+                        bkv_idx=precomputed_pass_schedules[
+                            3 * idx + 2, :max_steps_i
+                        ],
                     ),
                 )
             )
@@ -946,13 +1065,29 @@ def streamindex_topk(
 
         state = None
         for slice_spec, pass_meta in passes:
+            if (
+                state is not None
+                and not need_smem_split
+                and slice_spec[7] is MlaCase.DECODE
+                and start >= max_num_seqs
+            ):
+                continue
             run = functools.partial(
                 _run_scores_slice, *slice_spec, pass_meta, m, tc_group
             )
             if state is None:
                 state = run((None, None))
+            elif not need_smem_split and slice_spec[7] is MlaCase.DECODE:
+                pred = slice_spec[3] < slice_spec[4]
+                if start > 0:
+                    pred = pred & (slice_spec[4] > start)
+                if start + chunk_len < max_num_seqs:
+                    pred = pred & (slice_spec[3] < start + chunk_len)
+                state = lax.cond(pred, run, lambda s: s, state)
             else:
-                state = lax.cond(slice_spec[3] < slice_spec[4], run, lambda s: s, state)
+                state = lax.cond(
+                    slice_spec[3] < slice_spec[4], run, lambda s: s, state
+                )
         assert state is not None
         scores, blk_scores = state
         assert scores is not None

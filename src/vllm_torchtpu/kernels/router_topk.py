@@ -63,6 +63,23 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
     w_ref[...] = jnp.where(w_ref[:, :1] <= NEG, jnp.nan, w_ref[...])
 
 
+def _select_with_raw_kernel(x_ref, s_ref, w_ref, i_ref, *, topk: int, n: int):
+    """Top ``topk`` selection on ``x_ref`` (biased choice scores), writing
+    unbiased weights from ``s_ref`` directly to ``w_ref`` without a post-kernel
+    3D gather."""
+    x = jnp.where(x_ref[...] > NEG, x_ref[...], NEG)
+    s = s_ref[...]
+    masked = jnp.finfo(x.dtype).min
+    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
+    for j in range(topk):
+        m = jnp.max(x, axis=1, keepdims=True)
+        idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=1)
+        sel = iota == idx[:, None]
+        w_ref[:, j] = jnp.sum(jnp.where(sel, s, 0.0), axis=1)
+        i_ref[:, j] = idx.astype(jnp.int32)
+        x = jnp.where(sel, masked, x)
+
+
 def select(
     scores: jax.Array, topk: int, interpret: bool = False
 ) -> tuple[jax.Array, jax.Array]:
@@ -95,6 +112,41 @@ def select(
     )(scores)
 
 
+def select_with_raw(
+    scores: jax.Array,
+    raw_scores: jax.Array,
+    topk: int,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """Top-k over biased ``scores``, returning unbiased ``raw_scores`` weights."""
+    rows, n = scores.shape
+    block = min(MAX_BLOCK_ROWS, rows)
+    return pl.pallas_call(
+        functools.partial(_select_with_raw_kernel, topk=topk, n=n),
+        grid=(pl.cdiv(rows, block),),
+        in_specs=[
+            pl.BlockSpec((block, n), lambda i: (i, 0)),
+            pl.BlockSpec((block, n), lambda i: (i, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((rows, topk), jnp.float32),
+            jax.ShapeDtypeStruct((rows, topk), jnp.int32),
+        ],
+        interpret=interpret,
+    )(scores, raw_scores)
+
+
 def router_topk(scores: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:
     """``select`` with a jax_op-compatible signature (arrays, then statics)."""
     return select(scores, topk)
+
+
+def router_topk_with_raw(
+    scores: jax.Array, raw_scores: jax.Array, topk: int
+) -> tuple[jax.Array, jax.Array]:
+    """``select_with_raw`` with a jax_op-compatible signature."""
+    return select_with_raw(scores, raw_scores, topk)

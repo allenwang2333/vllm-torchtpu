@@ -14,16 +14,23 @@
 """DeepSeek-V4.1 Single-Pass Delayed mHC custom ops on TPU."""
 
 import functools
+from typing import Any, NamedTuple
 
 import torch
 
 from vllm_torchtpu.kernels.deepseek_v4.mhc.post_kernel import mhc_post
 from vllm_torchtpu.kernels.deepseek_v41.mhc import (
+    engram_gate_pallas,
+    mhc_final_collapse_norm_v41,
+    mhc_fused_post_engram_pre_quant_v41,
+    mhc_fused_post_engram_pre_v41,
+    mhc_fused_post_pre_quant_v41,
     mhc_fused_post_pre_v41,
+    mhc_post_collapse_norm_v41,
+    mhc_pre_quant_v41,
     mhc_pre_v41,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (
-    MHCOps,
     _fake_mhc_post,
     _fake_pre_outputs,
 )
@@ -32,7 +39,16 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_flash_com
     _name_float,
 )
 
-MHCOpsV41 = MHCOps
+
+class MHCOpsV41(NamedTuple):
+    pre: Any
+    fused: Any
+    post: Any
+    pre_quant: Any = None
+    fused_quant: Any = None
+    engram_gate: Any = None
+    fused_engram: Any = None
+    fused_engram_quant: Any = None
 
 
 def _fake_mhc_pre_v41(residual, *args):
@@ -40,8 +56,42 @@ def _fake_mhc_pre_v41(residual, *args):
     return (*_fake_pre_outputs(residual), next_pre_mix)
 
 
+def _fake_mhc_pre_quant_v41(residual, *args):
+    *outer_shape, _, hidden_size = residual.shape
+    normed_fp8 = residual.new_empty(
+        (*outer_shape, hidden_size), dtype=torch.float8_e4m3fn
+    )
+    normed_scale = residual.new_empty((*outer_shape, 1), dtype=torch.float32)
+    return (*_fake_mhc_pre_v41(residual), normed_fp8, normed_scale)
+
+
 def _fake_mhc_fused_post_pre_v41(x, residual, *args):
     return (torch.empty_like(residual), *_fake_mhc_pre_v41(residual))
+
+
+def _fake_mhc_fused_post_pre_quant_v41(x, residual, *args):
+    return (torch.empty_like(residual), *_fake_mhc_pre_quant_v41(residual))
+
+
+def _fake_engram_gate_v41(residual, kv, qk_weight, *args):
+    return torch.empty_like(residual)
+
+
+def _fake_mhc_post_collapse_norm_v41(x, residual, *args):
+    return (torch.empty_like(residual), torch.empty_like(x))
+
+
+def _fake_mhc_final_collapse_norm_v41(x, residual, *args):
+    return torch.empty_like(x)
+
+
+def get_engram_gate_v41_op(rms_eps: float = 1e-6):
+    return _get_or_register_op(
+        f"pallas::deepseek_v41_engram_gate_e{_name_float(rms_eps)}",
+        functools.partial(engram_gate_pallas, eps=rms_eps),
+        3,
+        _fake_engram_gate_v41,
+    )
 
 
 def get_mhc_post_v41_op():
@@ -50,6 +100,24 @@ def get_mhc_post_v41_op():
         mhc_post,
         4,
         _fake_mhc_post,
+    )
+
+
+def get_mhc_post_collapse_norm_v41_op(rms_eps: float = 1e-6):
+    return _get_or_register_op(
+        f"pallas::deepseek_v41_mhc_post_collapse_norm_e{_name_float(rms_eps)}",
+        functools.partial(mhc_post_collapse_norm_v41, rms_eps=rms_eps),
+        6,
+        _fake_mhc_post_collapse_norm_v41,
+    )
+
+
+def get_mhc_final_collapse_norm_v41_op(rms_eps: float = 1e-6):
+    return _get_or_register_op(
+        f"pallas::deepseek_v41_mhc_final_collapse_norm_e{_name_float(rms_eps)}",
+        functools.partial(mhc_final_collapse_norm_v41, rms_eps=rms_eps),
+        6,
+        _fake_mhc_final_collapse_norm_v41,
     )
 
 
@@ -97,4 +165,29 @@ def get_mhc_ops_v41(
             _fake_mhc_fused_post_pre_v41,
         ),
         post=get_mhc_post_v41_op(),
+        pre_quant=_get_or_register_op(
+            f"pallas::deepseek_v41_mhc_pre_quant_s{int(use_stream0)}{suffix}",
+            functools.partial(mhc_pre_quant_v41, **kw, use_stream0=use_stream0),
+            6,
+            _fake_mhc_pre_quant_v41,
+        ),
+        fused_quant=_get_or_register_op(
+            f"pallas::deepseek_v41_mhc_fused_post_pre_quant{suffix}",
+            functools.partial(mhc_fused_post_pre_quant_v41, **kw),
+            9,
+            _fake_mhc_fused_post_pre_quant_v41,
+        ),
+        engram_gate=get_engram_gate_v41_op(rms_eps),
+        fused_engram=_get_or_register_op(
+            f"pallas::deepseek_v41_mhc_fused_post_engram_pre{suffix}",
+            functools.partial(mhc_fused_post_engram_pre_v41, **kw),
+            11,
+            _fake_mhc_fused_post_pre_v41,
+        ),
+        fused_engram_quant=_get_or_register_op(
+            f"pallas::deepseek_v41_mhc_fused_post_engram_pre_quant{suffix}",
+            functools.partial(mhc_fused_post_engram_pre_quant_v41, **kw),
+            11,
+            _fake_mhc_fused_post_pre_quant_v41,
+        ),
     )

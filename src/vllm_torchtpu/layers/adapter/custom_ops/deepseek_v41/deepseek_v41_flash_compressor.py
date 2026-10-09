@@ -14,13 +14,19 @@
 """TPU Compressor and Indexer custom ops and layers for DeepSeek-V4.1."""
 
 import functools
+import inspect
 from typing import Any
 
+import jax
 import torch
 from jax.sharding import PartitionSpec as P
 from torch import nn
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.models.deepseek_v41 import attention as dsv41_attention
@@ -31,11 +37,15 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
 )
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.tp_collectives import tp_all_gather, tp_shard_slice
 from vllm_torchtpu.kernels.deepseek_v41.compressor import (
     compress_r2_pool_norm_jax,
     compressor_insert_cache_jax,
     indexer_produce_k_jax,
     indexer_v41_jax,
+    indexer_v41_tp_jax,
+    indexer_v41_tp_write_jax,
     indexer_v41_write_jax,
 )
 from vllm_torchtpu.kernels.deepseek_v41.streamindex_topk import (
@@ -246,6 +256,62 @@ class VllmDeepseekV41IndexerCache(dsv41_attention.DeepseekV4IndexerCache):
         )
 
 
+def _indexer_v41_tp_op_fn(
+    rank: jax.Array,
+    q: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    indexer_weights: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    cache_kv: jax.Array,
+    main_page_indices: jax.Array,
+    candidates: jax.Array | None = None,
+    *,
+    tp_size: int,
+    k: int,
+    compression_ratio: int,
+    softmax_scale: float,
+    n_head: int,
+    cand_mode: str | None = None,
+    cand_blocks: int = 0,
+    cand_block_size: int = 0,
+) -> jax.Array:
+    return indexer_v41_tp_jax(
+        rank,
+        q,
+        positions,
+        cos_sin_cache,
+        indexer_weights,
+        cache_kv,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        main_page_indices,
+        candidates,
+        tp_size=tp_size,
+        k=k,
+        compression_ratio=compression_ratio,
+        softmax_scale=softmax_scale,
+        n_head=n_head,
+        cand_mode=cand_mode,
+        cand_blocks=cand_blocks,
+        cand_block_size=cand_block_size,
+    )
+
+
+def _indexer_v41_tp_write_op_fn(*args, **kwargs) -> tuple[jax.Array, jax.Array]:
+    return _indexer_v41_tp_op_fn(*args, **kwargs)  # type: ignore[return-value]
+
+
+_indexer_v41_tp_write_op_fn.__signature__ = inspect.signature(  # type: ignore[attr-defined]
+    _indexer_v41_tp_op_fn
+).replace(return_annotation=tuple[jax.Array, jax.Array])
+
+
 class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
     """TPU DeepSeek-V4.1 Indexer; returns full index_topk indices on every TP rank."""
 
@@ -272,6 +338,13 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         object.__setattr__(
             self, "indexer_op_hm", self._build_indexer_op(use_step_meta=True)
         )
+        if envs.VLLM_DSV41_TP_INDEXER and get_tensor_model_parallel_world_size() > 1:
+            self.register_buffer(
+                "_tp_rank_idx",
+                torch.tensor([get_tensor_model_parallel_rank()], dtype=torch.int64),
+                persistent=False,
+            )
+            object.__setattr__(self, "indexer_op_tp", self._build_tp_indexer_op())
         if self.owns_k:
             object.__setattr__(self, "produce_k_op", self._get_produce_k_op())
         bs = int(
@@ -325,6 +398,61 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
             _fake_indexer,
         )
 
+    def _build_tp_indexer_op(self):
+        tp_size = get_tensor_model_parallel_world_size()
+        op_name = (
+            f"pallas::deepseek_v41_indexer_tp{tp_size}_k{self.topk_tokens}"
+            f"_c{self.compress_ratio}_h{self.n_head}"
+            f"_s{_name_float(self.softmax_scale)}"
+        )
+        if self.cand_mode is not None:
+            op_name += (
+                f"_cand{self.cand_mode}_b{self.cand_blocks}x{self.cand_block_size}"
+            )
+
+        def _fake_tp_indexer(rank, q, *args, **kwargs):
+            topk = q.new_empty((q.shape[0], self.topk_tokens), dtype=torch.int32)
+            if self.cand_mode == "write":
+                cands = q.new_empty((q.shape[0], self.cand_blocks), dtype=torch.int32)
+                return topk, cands
+            return topk
+
+        jax_fn = (
+            _indexer_v41_tp_write_op_fn
+            if self.cand_mode == "write"
+            else _indexer_v41_tp_op_fn
+        )
+        return _get_or_register_op(
+            op_name,
+            functools.partial(
+                jax_fn,
+                tp_size=tp_size,
+                k=self.topk_tokens,
+                compression_ratio=self.compress_ratio,
+                softmax_scale=self.softmax_scale,
+                n_head=self.n_head,
+                cand_mode=self.cand_mode,
+                cand_blocks=self.cand_blocks,
+                cand_block_size=self.cand_block_size,
+            ),
+            12 if self.cand_mode == "read" else 11,
+            _fake_tp_indexer,
+        )
+
+    def use_tp_indexer(self, num_tokens: int) -> bool:
+        """Token-parallel indexer for this batch size (static, per bucket)."""
+        if "indexer_op_tp" not in self.__dict__:
+            return False
+        tp_size = get_tensor_model_parallel_world_size()
+        t_l = num_tokens // tp_size
+        return (
+            num_tokens % tp_size == 0
+            # 2 or 4 rows per rank (and t_l % 8 != 0, e.g. 10 at T=80) run padded
+            # to a multiple of 8 inside indexer_v41_tp_jax.
+            and (t_l in (2, 4) or t_l >= 8)
+            and num_tokens >= envs.VLLM_DSV41_TP_INDEXER_MIN_TOKENS
+        )
+
     def _get_step_metadata_op(self, page_size: int):
         if (
             self.__dict__.get("_step_metadata_page_size") == page_size
@@ -344,14 +472,18 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
             max_num_seqs = int(seq_lens.shape[0])
             max_blocks_per_seq = int(page_indices.numel()) // max_num_seqs
             pages_per_seq = (max_blocks_per_seq + block_stride - 1) // block_stride
-            meta_buf_len = compute_meta_buf_len(max_num_seqs, pages_per_seq)
+            meta_buf_len = compute_meta_buf_len(
+                max_num_seqs,
+                pages_per_seq,
+                None if isinstance(t, torch.SymInt) else int(t),
+            )
             idx_pages_len = max_num_seqs * pages_per_seq
             return (
                 pos.new_empty((t,), dtype=torch.int32),
                 pos.new_empty((t,), dtype=torch.int32),
                 pos.new_empty((idx_pages_len,), dtype=torch.int32),
-                pos.new_empty((3, MAX_INDEXER_CHUNKS), dtype=torch.int32),
-                pos.new_empty((9, meta_buf_len), dtype=torch.int32),
+                pos.new_empty((6, MAX_INDEXER_CHUNKS), dtype=torch.int32),
+                pos.new_empty((18, meta_buf_len), dtype=torch.int32),
             )
 
         op = _get_or_register_op(
@@ -446,13 +578,12 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         rotary_emb: nn.Module,
         latent: torch.Tensor | None = None,
         step_metadata: tuple[torch.Tensor, ...] | None = None,
+        step_metadata_fn: Any = None,
+        tp_rank_idx: torch.Tensor | None = None,
+        keep_topk_local: bool = False,
     ) -> torch.Tensor:
         del hidden_states
         num_tokens = positions.shape[0]
-        # wq_b / weights_proj are replicated, so every rank scores all heads and
-        # all tokens against its replicated K cache.
-        q_proj = self.wq_b(query)[0].view(-1, self.n_head, self.head_dim)
-
         kv_cache = _as_kernel_cache_view(getattr(self.k_cache, "kv_cache", None))
         if kv_cache is None:
             return query.new_zeros((num_tokens, self.topk_tokens), dtype=torch.int32)
@@ -466,34 +597,79 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
             self.write_k_cache(latent, positions, rotary_emb)
 
         main_metadata = attn_ctx[prefix_key.removesuffix(".indexer.k_cache")]
-        meta_args: tuple[torch.Tensor, ...] = ()
-        if step_metadata is not None:
-            eff_rl_r2, eff_rl_r1, idx_page_indices, pass_num_steps, pass_schedules = (
-                step_metadata
-            )
-            eff_rl = eff_rl_r2 if self.compress_ratio == 2 else eff_rl_r1
-            meta_args = (eff_rl, idx_page_indices, pass_num_steps, pass_schedules)
-        idx_op = self.indexer_op_hm if step_metadata is not None else self.indexer_op
+        if self.use_tp_indexer(num_tokens):
+            # Token-parallel: this rank projects and scores tokens
+            # [rank * T/tp, (rank + 1) * T/tp) against the replicated K cache,
+            # then the top-k indices are all-gathered in rank order.
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            rank_idx = tp_rank_idx if tp_rank_idx is not None else self._tp_rank_idx
+            t_local = num_tokens // tp_size
 
-        op_args = (
-            q_proj,
-            positions.to(torch.int32),
-            rotary_emb.cos_sin_cache,
-            indexer_weights,
-            kv_cache,
-            attn_metadata.seq_lens,
-            attn_metadata.block_tables,
-            attn_metadata.query_start_loc,
-            attn_metadata.request_distribution,
-            main_metadata.block_tables,
-        )
-        if self.cand_mode == "write":
-            topk, cands = idx_op(*op_args, *meta_args)
-            self._cand_buf[:num_tokens].copy_(cands)
-        elif self.cand_mode == "read":
-            topk = idx_op(*op_args, self._cand_buf[:num_tokens], *meta_args)
+            def local(x: torch.Tensor) -> torch.Tensor:
+                if x.shape[0] == t_local:
+                    return x
+                return tp_shard_slice(x, tp_size, tp_rank, rank_idx)
+
+            q_proj = self.wq_b(local(query))[0].view(-1, self.n_head, self.head_dim)
+            op_args = (
+                rank_idx.to(torch.int32),
+                q_proj,
+                local(positions.to(torch.int32)),
+                rotary_emb.cos_sin_cache,
+                local(indexer_weights),
+                attn_metadata.seq_lens,
+                attn_metadata.block_tables,
+                attn_metadata.query_start_loc,
+                attn_metadata.request_distribution,
+                kv_cache,
+                main_metadata.block_tables,
+            )
+            if self.cand_mode == "write":
+                topk, cands = self.indexer_op_tp(*op_args)
+                self._cand_buf[:t_local].copy_(cands)
+            elif self.cand_mode == "read":
+                topk = self.indexer_op_tp(*op_args, self._cand_buf[:t_local])
+            else:
+                topk = self.indexer_op_tp(*op_args)
+            if not keep_topk_local:
+                topk = tp_all_gather(topk, dim=0)
         else:
-            topk = idx_op(*op_args, *meta_args)
+            # wq_b / weights_proj are replicated, so every rank scores all heads
+            # and all tokens against its replicated K cache.
+            q_proj = self.wq_b(query)[0].view(-1, self.n_head, self.head_dim)
+            if step_metadata is None and step_metadata_fn is not None:
+                step_metadata = step_metadata_fn()
+            meta_args: tuple[torch.Tensor, ...] = ()
+            if step_metadata is not None:
+                eff_rl_r2, eff_rl_r1, idx_page_indices, pass_num_steps, pass_schedules = (
+                    step_metadata
+                )
+                eff_rl = eff_rl_r2 if self.compress_ratio == 2 else eff_rl_r1
+                meta_args = (eff_rl, idx_page_indices, pass_num_steps, pass_schedules)
+            idx_op = self.indexer_op_hm if step_metadata is not None else self.indexer_op
+
+            op_args = (
+                q_proj,
+                positions.to(torch.int32),
+                rotary_emb.cos_sin_cache,
+                indexer_weights,
+                kv_cache,
+                attn_metadata.seq_lens,
+                attn_metadata.block_tables,
+                attn_metadata.query_start_loc,
+                attn_metadata.request_distribution,
+                main_metadata.block_tables,
+            )
+            if self.cand_mode == "write":
+                topk, cands = idx_op(*op_args, *meta_args)
+                self._cand_buf[:num_tokens].copy_(cands)
+            elif self.cand_mode == "read":
+                topk = idx_op(*op_args, self._cand_buf[:num_tokens], *meta_args)
+            else:
+                topk = idx_op(*op_args, *meta_args)
         if self.topk_indices_buffer is not None:
-            self.topk_indices_buffer[:num_tokens].copy_(topk[:num_tokens])
+            n_tk = min(num_tokens, int(topk.shape[0]))
+            self.topk_indices_buffer[:n_tk].copy_(topk[:n_tk])
         return topk
+

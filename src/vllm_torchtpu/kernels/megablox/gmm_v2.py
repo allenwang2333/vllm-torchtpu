@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
@@ -393,6 +394,26 @@ def generate_block_specs(
 # Define kernels.
 
 
+def _quantize_lhs_block(
+    block_lhs: jax.Array, lhs_q_dtype: jnp.dtype, dtype_max: float
+) -> tuple[jax.Array, jax.Array]:
+    """Quantizes every row of block_lhs with its own scale.
+
+    Shared by inner_kernel and quantize_lhs_rows, so lhs quantized ahead of the
+    kernel is bit-identical to lhs quantized inside it.
+    """
+    block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
+    block_scale = block_abs_max / dtype_max
+
+    # If block_scale=0, it will cause division by zero and return either
+    # NaN or Inf. Since this can cause numeric issue when downcasting to
+    # quantized value, we convert them into 0.
+    block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
+    # Convert lhs into quantized dtype.
+    block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
+    return block_lhs_q, block_scale
+
+
 def inner_kernel(
     # In
     tiled_lhs_ref: jax.Array,
@@ -428,6 +449,11 @@ def inner_kernel(
         cfgs: GmmConfigs.
     """
 
+    # Pre-quantized lhs arrives with its scales (see gmm_v2's lhs_scale).
+    tiled_lhs_scale_ref = None
+    if isinstance(tiled_lhs_ref, tuple):
+        tiled_lhs_ref, tiled_lhs_scale_ref = tiled_lhs_ref
+
     gm_id = pl.program_id(1)
     m_start = metadata_ref.gm_id_to_m_offset[gm_id]
     m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
@@ -443,6 +469,10 @@ def inner_kernel(
         # Step 1: Input pre-processing.
         tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
         tiled_rhs = tiled_rhs_ref.get_weight()
+        if tiled_lhs_scale_ref is not None:
+            tiled_lhs_scale = tiled_lhs_scale_ref.reshape(
+                -1, tiled_lhs_scale_ref.shape[-1]
+            )[:bucket_m]
 
         # This should only be taken in the case where we don't requantize
         # the scales and thus we need to dequantize inside VMEM to avoid small
@@ -522,18 +552,28 @@ def inner_kernel(
                     block_lhs = tiled_lhs[:, start_k:end_k]
                     block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
 
-                    # Perform lhs quantization. Note that for every block_lhs,
-                    # same computation will be performed tiles_n//mxu_size times.
-                    # But we can let compiler perform CSE and avoid recomputation.
-                    block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
-                    block_scale = block_abs_max / dtype_max
-
-                    # If block_scale=0, it will cause division by zero and return either
-                    # NaN or Inf. Since this can cause numeric issue when downcasting to
-                    # quantized value, we convert them into 0.
-                    block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
-                    # Convert lhs into quantized dtype.
-                    block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
+                    if tiled_lhs_scale_ref is None:
+                        # Perform lhs quantization. Note that for every block_lhs,
+                        # same computation will be performed tiles_n//mxu_size times.
+                        # But we can let compiler perform CSE and avoid recomputation.
+                        block_lhs_q, block_scale = _quantize_lhs_block(
+                            block_lhs, lhs_q_dtype, dtype_max
+                        )
+                    else:
+                        # Already quantized by _quantize_lhs_block. Select this
+                        # block's scale column; scales are >= 0, so the masked
+                        # lane max returns it unchanged.
+                        block_lhs_q = block_lhs
+                        lane = lax.broadcasted_iota(
+                            jnp.int32, tiled_lhs_scale.shape, 1
+                        )
+                        block_scale = jnp.max(
+                            jnp.where(
+                                lane == start_k // q_block_size, tiled_lhs_scale, 0
+                            ),
+                            axis=1,
+                            keepdims=True,
+                        )
 
                     # Unlike unquantized path, compiler may not perform implicit type
                     # conversion due to numeric concerns. As this can cause unsupported
@@ -891,6 +931,17 @@ def kernel_main(
 
     (lhs_spec, rhs_spec), out_spec = generate_block_specs(metadata_ref, cfgs)
 
+    lhs_scale_ref = None
+    if isinstance(lhs_ref, tuple):
+        # Pre-quantized lhs: its scales ride along with its rows. gmm_v2 allows
+        # only a single k tile here, so the lhs index map fits the scales too.
+        lhs_ref, lhs_scale_ref = lhs_ref
+        lhs_scale_spec = pl.BlockSpec(
+            (*lhs_spec.block_shape[:2], lhs_scale_ref.shape[-1]),
+            lhs_spec.index_map,
+        )
+        lhs_spec = (lhs_spec, lhs_scale_spec)
+
     if cfgs.fuse_act is not None:
         rhs_up_ref = jax.tree.map(lambda x: x.at[..., cfgs.out_size_n :], rhs_ref)
         rhs_ref = FusedWeightsRef(gate=rhs_ref, up=rhs_up_ref)
@@ -911,6 +962,13 @@ def kernel_main(
     # Bounded slice requires second last dim to be aligned to the sublane size.
     # rhs_ref uses static tiling thus reshape is not needed.
     lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
+    if lhs_scale_ref is not None:
+        lhs_in = (
+            lhs_in,
+            lhs_scale_ref.reshape(
+                -1, cfgs.dims.size_lhs_sublane, lhs_scale_ref.shape[-1]
+            ),
+        )
     out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
     scratches = [partial_out_ref, acc_ref, metadata_ref]
     pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
@@ -943,6 +1001,11 @@ def calculate_tiling(
     tile_m = bf16_bf16_tile_m // rhs_mod
     if lhs_cfgs.should_quantize:
         tile_m *= 2
+    small_group_batch = (
+        dims.size_group >= 16 and dims.size_m // dims.size_group <= 64
+    )
+    if small_group_batch:
+        tile_m = max(dims.size_lhs_sublane, 32)
     tile_m = min(tile_m, dims.size_m)
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
@@ -1038,7 +1101,9 @@ def calculate_tiling(
 
     # TODO(alynie, kyuyeunk): max number of bucket was choosen empiirically.
     # Revisit the value to be based on number of instruction memory size.
-    max_num_buckets = 4
+    max_num_buckets = (
+        (2 if dims.size_m <= 768 else 4) if small_group_batch else 4
+    )
     bucket_base = tile_m
     for _ in range(1, max_num_buckets):
         new_tile_m = tile_m + bucket_base
@@ -1290,6 +1355,7 @@ def gmm_v2(
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     rhs_quant_dtype: jnp.dtype | None = None,
+    lhs_scale: jax.Array | None = None,  # [size_m, size_k // 512]
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1315,6 +1381,10 @@ def gmm_v2(
         fuse_act: Activation function to fuse with GMM, None if no fusion.
         rhs_quant_dtype: Quantized dtype encoded by a pre-packed RHS carrier.
             Packed along k-axis
+        lhs_scale: Optional. Marks lhs as already quantized by
+            quantize_lhs_rows, which also returns these scales. The result is
+            bit-identical to passing the unquantized lhs, whose dtype is
+            lhs_scale.dtype.
 
     Returns:
         Output of shape [size_m, size_n].
@@ -1327,6 +1397,9 @@ def gmm_v2(
     # sliced back off the output below.
     size_m = lhs.shape[0]
     size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
+    if lhs_scale is not None:
+        # Pre-quantized rows are DMA'd in their own full sublane tiling.
+        size_lhs_sublane = pltpu.get_tpu_info().get_sublane_tiling(lhs.dtype)
     padded_size_m = align_to(size_m, size_lhs_sublane)
     if padded_size_m != size_m:
         lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
@@ -1341,7 +1414,8 @@ def gmm_v2(
         vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
 
     cfgs = make_gmm_configs(
-        lhs,
+        # Pre-quantized lhs: configure for the unquantized lhs it replaces.
+        lhs if lhs_scale is None else jax.ShapeDtypeStruct(lhs.shape, lhs_scale.dtype),
         rhs,
         rhs_scale,
         rhs_bias,
@@ -1356,6 +1430,22 @@ def gmm_v2(
         fuse_act=fuse_act,
         rhs_quant_dtype=rhs_quant_dtype,
     )
+    lhs_in = lhs
+    lhs_in_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    if lhs_scale is not None:
+        cfgs = _prequantized_lhs_configs(cfgs, lhs.dtype, size_lhs_sublane)
+        num_blocks = cfgs.dims.size_k // cfgs.lhs_cfgs.quant_block_size
+        assert lhs_scale.shape == (size_m, num_blocks), lhs_scale.shape
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        lhs_scale = jnp.pad(
+            lhs_scale,
+            (
+                (0, padded_size_m - size_m),
+                (0, align_to(num_blocks, num_lanes) - num_blocks),
+            ),
+        )
+        lhs_in = (lhs, lhs_scale)
+        lhs_in_spec = (lhs_in_spec, pl.BlockSpec(memory_space=pltpu.HBM))
     dims = cfgs.dims
     tiles = cfgs.tiles
 
@@ -1419,7 +1509,7 @@ def gmm_v2(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             in_specs=[
-                pl.BlockSpec(memory_space=pltpu.HBM),
+                lhs_in_spec,
                 WeightsRef(
                     weight=pl.BlockSpec(memory_space=pltpu.HBM),
                     scale=rhs_scale_spec,
@@ -1433,7 +1523,93 @@ def gmm_v2(
             vmem_limit_bytes=vmem_limit_bytes,
             disable_bounds_checks=True,
         ),
-        name=get_scope_name(cfgs),
+        name=get_scope_name(cfgs) + ("" if lhs_scale is None else "-prequant_lhs"),
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
-    )(group_sizes, group_offset, lhs, rhs_weights)[:size_m, : cfgs.out_size_n]
+    )(group_sizes, group_offset, lhs_in, rhs_weights)[:size_m, : cfgs.out_size_n]
+
+
+def _prequantized_lhs_configs(
+    cfgs: GmmConfigs, lhs_dtype: jnp.dtype, size_lhs_sublane: int
+) -> GmmConfigs:
+    """Checks that a pre-quantized lhs reproduces the in-kernel quantization.
+
+    cfgs were made for the unquantized lhs. Its tiles and accumulation order are
+    kept; only the lhs sublane block grows to the quantized dtype's tiling.
+    """
+    lhs_cfgs, dims, tiles = cfgs.lhs_cfgs, cfgs.dims, cfgs.tiles
+    if lhs_cfgs.quant_dtype != lhs_dtype:
+        raise ValueError(
+            f"gmm_v2 would quantize lhs to {lhs_cfgs.quant_dtype}, but lhs was "
+            f"pre-quantized to {lhs_dtype}."
+        )
+    # One k tile keeps the scale blocks aligned to k = 0 and the accumulation
+    # order equal to the in-kernel path's.
+    if dims.size_k % lhs_cfgs.quant_block_size != 0 or tiles.tile_k != dims.size_k:
+        raise ValueError(
+            f"Pre-quantized lhs needs a single k tile divisible by "
+            f"{lhs_cfgs.quant_block_size}, got {dims.size_k=} {tiles.tile_k=}."
+        )
+    if tiles.tile_m % size_lhs_sublane or tiles.bucket_base % size_lhs_sublane:
+        raise ValueError(f"{tiles=} not aligned to {size_lhs_sublane=}.")
+    dims = dataclasses.replace(dims, size_lhs_sublane=size_lhs_sublane)
+    return dataclasses.replace(cfgs, dims=dims)
+
+
+def _quantize_lhs_rows_kernel(lhs_ref, lhs_q_ref, lhs_scale_ref, *, block_size):
+    dtype_max = float(jnp.finfo(lhs_q_ref.dtype).max)
+    lane = lax.broadcasted_iota(jnp.int32, lhs_scale_ref.shape, 1)
+    scale = jnp.zeros(lhs_scale_ref.shape, lhs_scale_ref.dtype)
+    for b, start in enumerate(range(0, lhs_ref.shape[1], block_size)):
+        block_lhs_q, block_scale = _quantize_lhs_block(
+            lhs_ref[:, start : start + block_size], lhs_q_ref.dtype, dtype_max
+        )
+        lhs_q_ref[:, start : start + block_size] = block_lhs_q
+        scale = jnp.where(lane == b, block_scale, scale)
+    lhs_scale_ref[...] = scale
+
+
+@jax.jit(static_argnames=["quant_dtype", "block_size"])
+def quantize_lhs_rows(
+    lhs: jax.Array,  # [size_m, size_k]
+    *,
+    quant_dtype: jnp.dtype = jnp.float8_e4m3fn,
+    block_size: int = 512,
+) -> tuple[jax.Array, jax.Array]:
+    """Quantizes lhs the way gmm_v2 does inside its kernel, ahead of time.
+
+    Rows are independent, so the result may be moved (e.g. all-gathered or
+    permuted) before gmm_v2(lhs_q, ..., lhs_scale=lhs_scale). That call is
+    bit-identical to gmm_v2(lhs, ...); gmm_v2 checks at trace time that it
+    would have quantized lhs with this quant_dtype and block_size.
+
+    Returns:
+        lhs_q [size_m, size_k] in quant_dtype and lhs_scale
+        [size_m, size_k // block_size] in lhs.dtype.
+    """
+    size_m, size_k = lhs.shape
+    assert size_k % block_size == 0, (size_k, block_size)
+    num_blocks = size_k // block_size
+    tpu_info = pltpu.get_tpu_info()
+    padded_size_m = align_to(size_m, tpu_info.get_sublane_tiling(quant_dtype))
+    tile_m = math.gcd(padded_size_m, 256)
+    scale_cols = align_to(num_blocks, tpu_info.num_lanes)
+    if padded_size_m != size_m:
+        lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
+
+    lhs_q, lhs_scale = pl.pallas_call(
+        functools.partial(_quantize_lhs_rows_kernel, block_size=block_size),
+        out_shape=(
+            jax.ShapeDtypeStruct((padded_size_m, size_k), quant_dtype),
+            jax.ShapeDtypeStruct((padded_size_m, scale_cols), lhs.dtype),
+        ),
+        grid=(padded_size_m // tile_m,),
+        in_specs=[pl.BlockSpec((tile_m, size_k), lambda i: (i, 0))],
+        out_specs=(
+            pl.BlockSpec((tile_m, size_k), lambda i: (i, 0)),
+            pl.BlockSpec((tile_m, scale_cols), lambda i: (i, 0)),
+        ),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        name=f"quantize_lhs_rows-m_{padded_size_m}-k_{size_k}-b_{block_size}",
+    )(lhs)
+    return lhs_q[:size_m], lhs_scale[:size_m, :num_blocks]

@@ -261,6 +261,9 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
             logger.warning(
                 "Skipping TPU compile environment variable %s: %s", name, exc
             )
+    if factors.get("VLLM_DSV41_SINGLE_BACKBONE_COND"):
+        factors["VLLM_DSV41_CED"] = True
+        factors["VLLM_DSV41_PURE_20L_PREFILL"] = False
     return factors
 
 

@@ -56,8 +56,13 @@ def plan_decoder_replay(
         if seq_lens_dev is not None
         else (len(lengths) if lengths is not None else 1)
     )
+    force_ced = dp_ced_decoder_bucket is not None and dp_ced_decoder_bucket < 0
+    if force_ced:
+        dp_ced_decoder_bucket = -dp_ced_decoder_bucket
     if bounds is None or lengths is None or prompts is None:
-        if dp_ced_decoder_bucket is None or dp_ced_decoder_bucket == num_tokens:
+        if not force_ced and (
+            dp_ced_decoder_bucket is None or dp_ced_decoder_bucket == num_tokens
+        ):
             return DecoderReplayPlan(
                 indices=(),
                 query_start_loc=_EMPTY_I32,
@@ -102,8 +107,23 @@ def plan_decoder_replay(
     all_decode_so_far = True
     active_seq_end = 0
 
+    total_sched = bounds[-1]
+    num_active = len(lengths)
+    while (
+        num_active > 0
+        and bounds[num_active - 1] == total_sched
+        and lengths[num_active - 1] == 0
+        and prompts[num_active - 1] == 0
+    ):
+        num_active -= 1
+
     for req_idx, (start, end, length, prompt) in enumerate(
-        zip(bounds, bounds[1:], lengths, prompts)
+        zip(
+            bounds[:num_active],
+            bounds[1 : num_active + 1],
+            lengths[:num_active],
+            prompts[:num_active],
+        )
     ):
         count = end - start
         if count < 0 or length < count or prompt < 0:
@@ -130,7 +150,9 @@ def plan_decoder_replay(
         buckets = sorted({num_tokens, *(int(n) for n in compile_sizes if int(n) > 0)})
         padded = next(n for n in buckets if n >= kept) if kept else 0
 
-    passthrough = bool(kept > 0 and kept == bounds[-1] and padded == num_tokens)
+    passthrough = bool(
+        not force_ced and kept > 0 and kept == bounds[-1] and padded == num_tokens
+    )
     if passthrough:
         return DecoderReplayPlan(
             indices=tuple(indices),
@@ -161,7 +183,8 @@ def plan_decoder_replay(
     scatter_tensor = torch.full((num_tokens,), -1, dtype=torch.int64)
     if kept > 0 and padded >= kept:
         idx_t = torch.tensor(indices, dtype=torch.int64)
-        gather_tensor[:kept] = idx_t
+        # Spread padded rows across kept indices instead of repeating idx 0
+        gather_tensor[:] = idx_t[torch.arange(padded, dtype=torch.int64) % kept]
         scatter_tensor[idx_t] = torch.arange(kept, dtype=torch.int64)
 
     return DecoderReplayPlan(

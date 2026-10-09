@@ -21,11 +21,26 @@ elsewhere as the identical plain-torch algorithm in
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.router_topk import router_topk
+from vllm_torchtpu.kernels.router_topk import router_topk, router_topk_with_raw
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
+
+# Above 256 rows, the Pallas custom-call barrier forces the [rows, experts]
+# score tensor(s) through HBM between the gate epilogue and renormalization;
+# plain-torch rowmax_topk lets XLA fuse the entire router in registers.
+PALLAS_MAX_ROWS = 256
 
 
 def _fake_router_topk(scores: torch.Tensor, topk: int):
+    rows = scores.shape[0]
+    return (
+        torch.empty((rows, topk), dtype=torch.float32, device=scores.device),
+        torch.empty((rows, topk), dtype=torch.int32, device=scores.device),
+    )
+
+
+def _fake_router_topk_with_raw(
+    scores: torch.Tensor, raw_scores: torch.Tensor, topk: int
+):
     rows = scores.shape[0]
     return (
         torch.empty((rows, topk), dtype=torch.float32, device=scores.device),
@@ -38,13 +53,28 @@ def _fake_router_topk(scores: torch.Tensor, topk: int):
 _op = pallas.jax_op("pallas::moe_router_topk", router_topk)
 _op.register_fake(_fake_router_topk)
 
+_op_with_raw = pallas.jax_op(
+    "pallas::moe_router_topk_with_raw", router_topk_with_raw
+)
+_op_with_raw.register_fake(_fake_router_topk_with_raw)
 
-def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
+
+def rowmax_select(
+    scores: torch.Tensor,
+    topk: int,
+    raw_scores: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Sort-free ``topk`` over the expert axis of ``[rows, experts]`` scores."""
     if scores.device.type != "tpu":
-        return rowmax_topk(scores, topk)
+        return rowmax_topk(scores, topk, raw_scores=raw_scores)
     if scores.dim() != 2:
         raise ValueError(
             f"router top-k kernel expects [rows, experts], got {scores.shape}"
         )
-    return _op(scores.float(), topk)
+    scores_f32 = scores.float()
+    raw_f32 = raw_scores.float() if raw_scores is not None else None
+    if scores_f32.shape[0] > PALLAS_MAX_ROWS:
+        return rowmax_topk(scores_f32, topk, raw_scores=raw_f32)
+    if raw_f32 is not None:
+        return _op_with_raw(scores_f32, raw_f32, topk)
+    return _op(scores_f32, topk)

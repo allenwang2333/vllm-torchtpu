@@ -23,7 +23,11 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
-from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    get_packing_factor,
+    gmm_v2,
+    quantize_lhs_rows,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -61,6 +65,7 @@ def _select_ragged_gather_reduce(version: str):
 ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
 
 _ONEHOT_AUTO_CAP = 512
+_FAST_ONEHOT_AUTO_THRESHOLD = 3072
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 
@@ -190,6 +195,7 @@ def gmm_wrapper(
     fuse_act=None,
     preferred_element_type=None,
     rhs_quant_dtype=None,
+    lhs_scale=None,
 ):
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
@@ -210,12 +216,13 @@ def gmm_wrapper(
         preferred_element_type=preferred_element_type,
         maybe_quantize_lhs=not is_fp4_weight,
         rhs_quant_dtype=rhs_quant_dtype,
+        lhs_scale=lhs_scale,
     )
 
 
 # Rows per block of the rank contraction: the triangular matmul is B x B, so this
 # trades that against the number of blocks.
-_COUNTING_SORT_BLOCK = 512
+_COUNTING_SORT_BLOCK = 256
 
 
 def _counting_sort_positions(
@@ -246,21 +253,16 @@ def _counting_sort_positions(
     onehot = jax.nn.one_hot(
         sort_keys.reshape(-1, block), num_buckets, dtype=jnp.bfloat16
     )
-    # The histogram rides along as one more row of the contraction the rank
-    # matmul already performs. Exact: 0/1 summands, at most `block` of them.
-    lower = jnp.concatenate(
-        [
-            jnp.ones((1, block), jnp.bfloat16),
-            jnp.tril(jnp.ones((block, block), jnp.bfloat16), -1),
-        ],
-        axis=0,
-    )
-    both = jnp.einsum("ij,bje->bie", lower, onehot, preferred_element_type=jnp.float32)
-    hist = both[:, 0, :]
-    rank = both[:, 1:, :]
+    # Compute block histogram and fuse `(rank + base[:, None, :]) * onehot`
+    # into a single reduction so XLA fuses it directly into the einsum kOutput
+    # fusion without materializing the 3D tensor to HBM.
+    ones = jnp.ones((block,), jnp.bfloat16)
+    hist = jnp.einsum("j,bje->be", ones, onehot, preferred_element_type=jnp.float32)
     counts = hist.sum(axis=0)
     base = (jnp.cumsum(hist, axis=0) - hist) + (jnp.cumsum(counts) - counts)
-    pos = ((base[:, None, :] + rank) * onehot).sum(axis=2)
+    lower = jnp.tril(jnp.ones((block, block), jnp.bfloat16), -1)
+    rank = jnp.einsum("ij,bje->bie", lower, onehot, preferred_element_type=jnp.float32)
+    pos = ((rank + base[:, None, :]) * onehot).sum(axis=2).astype(jnp.int32)
     return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
 
 
@@ -275,7 +277,9 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    return_sorted_indices: bool = False,
+    return_onehot_combine: bool = False,
+):
     """Prepare the local-only routing layout using already-local expert ids.
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
@@ -298,6 +302,61 @@ def prepare_routed_gmm_inputs(
     else:
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
+    m = sort_keys.shape[0]
+    token_bits = max(1, (num_tokens_local - 1).bit_length())
+
+    fast_onehot = (
+        return_onehot_combine
+        and use_ep
+        and use_sparse_core
+        and m <= onehot_moe_permute_threshold
+        and hidden_states_local.dtype == jnp.bfloat16
+        and topk_weights_flat.dtype == jnp.bfloat16
+        and (local_num_experts + 1).bit_length() + token_bits <= 15
+        and envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() != "on"
+    )
+    if fast_onehot:
+        # Pack (sort_key, token_idx, bf16_weight) into a single int32 so one
+        # radix sort yields both `token_indices_sorted` and `w_sorted` without
+        # a second sort, integer division by `topk`, or dynamic 1D gathers.
+        group_sizes_local = (
+            jax.nn.one_hot(sort_keys, local_num_experts, dtype=jnp.float32)
+            .sum(axis=0)
+            .astype(jnp.int32)
+        )
+        w_masked = jnp.where(
+            valid_mask, topk_weights_flat, jnp.zeros_like(topk_weights_flat)
+        )
+        w_u16 = jax.lax.bitcast_convert_type(w_masked, jnp.uint16).astype(jnp.int32)
+        packed = jax.lax.sort(
+            jnp.left_shift(sort_keys, 16 + token_bits)
+            | jnp.left_shift(token_indices_flat, 16)
+            | w_u16,
+            is_stable=False,
+        )
+        token_indices_sorted = jnp.bitwise_and(
+            jnp.right_shift(packed, 16), (1 << token_bits) - 1
+        )
+        w_sorted = jax.lax.bitcast_convert_type(
+            jnp.bitwise_and(packed, 0xFFFF).astype(jnp.uint16),
+            jnp.bfloat16,
+        )
+        onehot = jax.nn.one_hot(
+            token_indices_sorted, num_tokens_local, dtype=hidden_states_local.dtype
+        )
+        x = onehot @ hidden_states_local
+        return (
+            x,
+            group_sizes_local,
+            token_indices_sorted,
+            topk_weights_flat,
+            valid_mask,
+            token_indices_sorted,
+            None,
+            onehot,
+            w_sorted,
+        )
+
     # The keys take only `local_num_experts + 1` values, so a counting sort
     # gives the positions and `group_sizes` without a second comparison sort.
     # Ragged permute only: under the one-hot permute these positions break MTP.
@@ -311,25 +370,40 @@ def prepare_routed_gmm_inputs(
         if ragged_permute
         else (None, None)
     )
-    token_bits = max(1, (num_tokens_local - 1).bit_length())
     packable = (local_num_experts + 1).bit_length() + token_bits < 31
-    sorted_indices = (
-        jnp.argsort(sort_keys)
-        if argsort_revert_indices is None or not packable
-        else None
+    idx_bits = max(1, (m - 1).bit_length())
+    # The second packed sort shifts indices < 2**idx_bits by idx_bits.
+    idx_packable = (
+        (local_num_experts + 1).bit_length() + idx_bits < 31 and 2 * idx_bits < 31
     )
 
     if argsort_revert_indices is not None:
+        sorted_indices = jnp.argsort(sort_keys) if not packable else None
         group_sizes_local = bucket_counts[:local_num_experts]
     else:
-        argsort_revert_indices = jnp.argsort(sorted_indices)
+        if idx_packable:
+            idx_mask = (1 << idx_bits) - 1
+            iota = jnp.arange(m, dtype=jnp.int32)
+            packed1 = jax.lax.sort(
+                jnp.left_shift(sort_keys, idx_bits) | iota, is_stable=False
+            )
+            sorted_indices = jnp.bitwise_and(packed1, idx_mask)
+            packed2 = jax.lax.sort(
+                jnp.left_shift(sorted_indices, idx_bits) | iota, is_stable=False
+            )
+            argsort_revert_indices = jnp.bitwise_and(packed2, idx_mask)
+        else:
+            sorted_indices = jnp.argsort(sort_keys)
+            argsort_revert_indices = jnp.argsort(sorted_indices)
         topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
         group_sizes_local = jax.nn.one_hot(
             topk_indices_for_count, local_num_experts, dtype=jnp.int32
         ) * valid_mask[:, None].astype(jnp.int32)
         group_sizes_local = group_sizes_local.sum(axis=0)
 
-    if packable:
+    if sorted_indices is not None:
+        token_indices_sorted = sorted_indices // topk
+    elif packable:
         # Packing (key, token) into one int32 keeps the payload out of the sort
         # and drops the follow-up gather. Equal packed values carry the same
         # token id, so their order cannot matter.
@@ -340,6 +414,7 @@ def prepare_routed_gmm_inputs(
     else:
         token_indices_sorted = token_indices_flat[sorted_indices]
 
+    onehot = None
     if use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
             # Use one-hot matmul for permutation, which can be faster
@@ -361,6 +436,28 @@ def prepare_routed_gmm_inputs(
             )
     else:
         x = hidden_states_local[token_indices_sorted]
+    if return_onehot_combine:
+        return (
+            x,
+            group_sizes_local,
+            argsort_revert_indices,
+            topk_weights_flat,
+            valid_mask,
+            token_indices_sorted,
+            sorted_indices,
+            onehot,
+            None,
+        )
+    if return_sorted_indices:
+        return (
+            x,
+            group_sizes_local,
+            argsort_revert_indices,
+            topk_weights_flat,
+            valid_mask,
+            token_indices_sorted,
+            sorted_indices,
+        )
     return (
         x,
         group_sizes_local,
@@ -392,14 +489,21 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    sorted_indices: jax.Array | None = None,
+    lhs_scale: jax.Array | None = None,
+    onehot_permute: jax.Array | None = None,
+    w_sorted: jax.Array | None = None,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
     The valid-mask gating below is a no-op for non-EP runs (mask is all
     True) and keeps the single code path uniform for both EP and non-EP.
     EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
+    With `lhs_scale`, `x` holds rows pre-quantized by quantize_lhs_rows and the
+    output keeps the unquantized dtype, `lhs_scale.dtype`.
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
+    out_dtype = x.dtype if lhs_scale is None else lhs_scale.dtype
 
     gmm1_res = gmm_wrapper(
         x,
@@ -411,12 +515,10 @@ def moe_gmm(
         zero_initialize=False,
         fuse_act=activation,
         rhs_quant_dtype=rhs_quant_dtype,
+        lhs_scale=lhs_scale,
     )
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
-
-    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
-    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
     gmm2_res = gmm_wrapper(
         gmm1_res,
@@ -426,7 +528,7 @@ def moe_gmm(
         group_sizes,
         group_offset,
         zero_initialize=False,
-        preferred_element_type=x.dtype,
+        preferred_element_type=out_dtype,
         rhs_quant_dtype=rhs_quant_dtype,
     )
     # The destination-major kernel packs source indices into 20 bits and
@@ -472,18 +574,34 @@ def moe_gmm(
                     topk_weights_flat,
                     valid_mask_flat,
                     reduce_group_size=topk,
-                ).astype(x.dtype)
+                ).astype(out_dtype)
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
+            if onehot_permute is not None and w_sorted is not None:
+                computed = jnp.arange(
+                    gmm2_res.shape[0], dtype=jnp.int32
+                ) < group_sizes.sum(dtype=jnp.int32)
+                gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
+                combine = onehot_permute.T * w_sorted.astype(gmm2_res.dtype)[None, :]
+                return (combine @ gmm2_res).astype(out_dtype)
             # Use onehot + matmul for unpermutation, which can be faster
             # for small batch size.
             # `argsort_revert_indices` is the inverse of the sort, so scattering
             # through it is the gather by the (unmaterialised) forward one.
-            topk_weights_sorted = (
-                jnp.zeros_like(topk_weights_flat)
-                .at[argsort_revert_indices]
-                .set(topk_weights_flat)
-            )
+            if sorted_indices is not None:
+                topk_weights_sorted = topk_weights_flat[sorted_indices]
+                valid_mask_sorted = valid_mask_flat[sorted_indices]
+            else:
+                topk_weights_sorted = (
+                    jnp.zeros_like(topk_weights_flat)
+                    .at[argsort_revert_indices]
+                    .set(topk_weights_flat)
+                )
+                valid_mask_sorted = (
+                    jnp.zeros_like(valid_mask_flat)
+                    .at[argsort_revert_indices]
+                    .set(valid_mask_flat)
+                )
             valid_count = group_sizes.sum(dtype=jnp.int32)[None]
             if (
                 envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() == "on"
@@ -508,7 +626,7 @@ def moe_gmm(
                     topk_weights_sorted,
                     valid_count,
                     num_tokens=num_tokens,
-                ).astype(x.dtype)
+                ).astype(out_dtype)
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
@@ -516,28 +634,37 @@ def moe_gmm(
                 dtype=jnp.int32
             )
             gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
-            revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
-            onehot = jax.nn.one_hot(
-                revert_indices, argsort_revert_indices.size, dtype=gmm2_res.dtype
+            w_sorted = jnp.where(
+                valid_mask_sorted,
+                topk_weights_sorted.astype(gmm2_res.dtype),
+                0,
             )
-            combine = (onehot * topk_weights[..., None] * valid_mask[..., None]).sum(
-                axis=1
+            onehot = (
+                onehot_permute
+                if onehot_permute is not None
+                and onehot_permute.dtype == gmm2_res.dtype
+                else jax.nn.one_hot(
+                    token_indices_sorted, num_tokens, dtype=gmm2_res.dtype
+                )
             )
-            return (combine @ gmm2_res).astype(x.dtype)
+            combine = onehot.T * w_sorted[None, :]
+            return (combine @ gmm2_res).astype(out_dtype)
         return ragged_gather_reduce(
             gmm2_res,
             argsort_revert_indices,
             topk_weights_flat,
             valid_mask_flat,
             reduce_group_size=topk,
-        ).astype(x.dtype)
+        ).astype(out_dtype)
 
+    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
+    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
     token_hidden = gmm2_res[argsort_revert_indices]
     token_topk_hidden = token_hidden.reshape((num_tokens, topk, gmm2_res.shape[-1]))
     token_topk_hidden = token_topk_hidden * jnp.expand_dims(topk_weights, axis=-1)
     token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
     # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
-    return token_topk_hidden.sum(axis=1).astype(x.dtype)
+    return token_topk_hidden.sum(axis=1).astype(out_dtype)
 
 
 @functools.partial(
@@ -615,30 +742,54 @@ def fused_moe_func(
     # callers return FP32 weights and would otherwise promote downstream.
     topk_weights = topk_weights.astype(hidden_states.dtype)
 
+    # Decode services also compile large prefill buckets. Apply the token
+    # threshold before kernel admission so those buckets retain routed GMM.
+    use_dense_expert = (
+        0 < num_tokens <= _DENSE_EXPERT_THRESHOLD
+        and can_use_dense_expert(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens,
+        )
+    )
+    if not use_dense_expert:
+        # Flatten `(num_tokens, topk)` -> `(num_tokens * topk,)` before the EP
+        # range filter so it executes in 1D `{0:T(1024)}` without 2D minor-dim=6
+        # lane padding (`95.3%` waste) and 2D-to-1D slice/concat relayouts.
+        topk_ids = topk_ids.reshape(-1)
+        topk_weights = topk_weights.reshape(-1)
+
     if use_ep and experts_start is not None:
         local_ids = topk_ids - experts_start
         valid = (local_ids >= 0) & (local_ids < w1.shape[0])
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
-    # Decode services also compile large prefill buckets. Apply the token
-    # threshold before kernel admission so those buckets retain routed GMM.
-    if 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD and can_use_dense_expert(
-        hidden_states,
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        w1_bias,
-        w2_bias,
-        activation=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-    ):
+    if use_dense_expert:
         logger.info_once("Selected experimental dense-expert decode MoE")
         return dense_expert_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
         )
+
+    effective_onehot_threshold = (
+        _FAST_ONEHOT_AUTO_THRESHOLD
+        if (
+            onehot_moe_permute_threshold == _ONEHOT_AUTO_CAP - 1
+            and (
+                envs.ONEHOT_MOE_PERMUTE_THRESHOLD is None
+                or envs.ONEHOT_MOE_PERMUTE_THRESHOLD < 0
+            )
+            and hidden_states.dtype == jnp.bfloat16
+        )
+        else onehot_moe_permute_threshold
+    )
 
     (
         x,
@@ -647,6 +798,9 @@ def fused_moe_func(
         topk_weights_flat,
         valid_mask,
         token_indices_sorted,
+        sorted_indices,
+        onehot_permute,
+        w_sorted,
     ) = prepare_routed_gmm_inputs(
         hidden_states,
         topk_ids,
@@ -655,8 +809,10 @@ def fused_moe_func(
         topk=topk,
         use_ep=use_ep,
         use_sparse_core=use_sparse_core,
-        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        onehot_moe_permute_threshold=effective_onehot_threshold,
         skip_padded_tokens=skip_padded_tokens,
+        return_sorted_indices=True,
+        return_onehot_combine=True,
     )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
@@ -677,7 +833,154 @@ def fused_moe_func(
         topk=topk,
         use_ep=use_ep,
         use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=effective_onehot_threshold,
+        rhs_quant_dtype=rhs_quant_dtype,
+        sorted_indices=sorted_indices,
+        onehot_permute=onehot_permute,
+        w_sorted=w_sorted,
+    )
+    return x[:num_tokens, :hidden_size]
+
+
+# Column block of gmm_v2's lhs quantization (make_gmm_configs); gmm_v2 rejects
+# pre-quantized lhs whose blocks differ.
+MOE_FP8_DISPATCH_BLOCK = 512
+
+
+def quantize_moe_dispatch_rows(
+    hidden_states: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Quantizes MoE inputs before dispatch exactly as the routed gmm1 would.
+
+    Returns int8 rows [T, H] holding the float8_e4m3fn bits and the flat
+    per-block scales [T * H // MOE_FP8_DISPATCH_BLOCK] in hidden_states.dtype:
+    collective-friendly dtypes and layouts for a dim-0 all-gather. Consumed by
+    fused_moe_func_fp8_dispatch.
+    """
+    hidden_q, hidden_scale = quantize_lhs_rows(
+        hidden_states, block_size=MOE_FP8_DISPATCH_BLOCK
+    )
+    return (
+        jax.lax.bitcast_convert_type(hidden_q, jnp.int8),
+        hidden_scale.reshape(-1),
+    )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "topk",
+        "activation",
+        "use_ep",
+        "use_sparse_core",
+        "onehot_moe_permute_threshold",
+        "rhs_quant_dtype",
+        "skip_padded_tokens",
+    ),
+)
+def fused_moe_func_fp8_dispatch(
+    hidden_q: jax.Array,
+    hidden_scale: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2_bias: jax.Array | None,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    experts_start: jax.Array | None = None,
+    topk: int = 1,
+    activation: str = "silu",
+    use_ep: bool = False,
+    use_sparse_core: bool = True,
+    onehot_moe_permute_threshold: int = 0,
+    rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
+) -> jax.Array:
+    """fused_moe_func on rows pre-quantized by quantize_moe_dispatch_rows.
+
+    Bit-identical to fused_moe_func on the unquantized rows: routing is
+    unchanged and gmm1 consumes exactly the fp8 rows and scales it would
+    otherwise compute in-kernel. Returns [T, H] in hidden_scale.dtype.
+    """
+    if w1_scale is not None and w1_scale.ndim == 3:
+        w1_scale = jnp.expand_dims(w1_scale, 2)
+    if w2_scale is not None and w2_scale.ndim == 3:
+        w2_scale = jnp.expand_dims(w2_scale, 2)
+
+    num_tokens, hidden_size = hidden_q.shape
+    act_dtype = hidden_scale.dtype
+    hidden_scale = hidden_scale.reshape(num_tokens, -1)
+    padded_hidden_size = w1.shape[1] * get_packing_factor(w1.dtype, rhs_quant_dtype)
+    if padded_hidden_size != hidden_size:
+        raise NotImplementedError("fp8 MoE dispatch needs an unpadded hidden size.")
+    if 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD and can_use_dense_expert(
+        jax.ShapeDtypeStruct((num_tokens, hidden_size), act_dtype),
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        activation=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+    ):
+        raise NotImplementedError("fp8 MoE dispatch has no dense-expert path.")
+    assert topk_weights.shape == (num_tokens, topk)
+    assert topk_ids.shape == (num_tokens, topk)
+
+    # Same routing as fused_moe_func (whose EP remap is elementwise).
+    topk_weights = topk_weights.astype(act_dtype).reshape(-1)
+    topk_ids = topk_ids.reshape(-1)
+    if use_ep and experts_start is not None:
+        local_ids = topk_ids - experts_start
+        valid = (local_ids >= 0) & (local_ids < w1.shape[0])
+        topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
+        topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+
+    (
+        x,
+        group_sizes,
+        argsort_revert_indices,
+        topk_weights_flat,
+        valid_mask,
+        token_indices_sorted,
+        sorted_indices,
+    ) = prepare_routed_gmm_inputs(
+        hidden_q,
+        topk_ids,
+        topk_weights,
+        local_num_experts=w1.shape[0],
+        topk=topk,
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        skip_padded_tokens=skip_padded_tokens,
+        return_sorted_indices=True,
+    )
+    x = moe_gmm(
+        jax.lax.bitcast_convert_type(x, jnp.float8_e4m3fn),
+        w1,
+        w1_scale,
+        w1_bias,
+        w2,
+        w2_scale,
+        w2_bias,
+        group_sizes,
+        argsort_revert_indices,
+        topk_weights_flat,
+        valid_mask,
+        token_indices_sorted,
+        activation=activation,
+        num_tokens=num_tokens,
+        topk=topk,
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        sorted_indices=sorted_indices,
+        lhs_scale=hidden_scale[token_indices_sorted],
     )
     return x[:num_tokens, :hidden_size]

@@ -23,7 +23,13 @@ from vllm.distributed.parallel_state import get_dp_group
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.pcp import get_pcp_group
-from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
+from vllm_torchtpu.layers.adapter.fused_moe import (
+    fused_moe_gmm,
+    fused_moe_gmm_fp8_dispatch,
+    moe_fp8_dispatch_enabled,
+    quantize_moe_dispatch,
+)
+from vllm_torchtpu.layers.core.fused_moe_gmm import MOE_FP8_DISPATCH_BLOCK
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -41,6 +47,22 @@ def enable_pipelined_collective_and_compute() -> bool:
 
 # Alias for alternative naming convention
 enable_pipeline_collective_and_compute = enable_pipelined_collective_and_compute
+
+
+def _all_gather_hidden(collective_group, hidden_states):
+    """All-gathers MoE inputs: a tensor or an fp8 dispatch (rows, scales) pair."""
+    if isinstance(hidden_states, tuple):
+        return tuple(collective_group.all_gather(t, dim=0) for t in hidden_states)
+    return collective_group.all_gather(hidden_states, dim=0)
+
+
+def _slice_hidden(hidden_states, start: int, end: int):
+    """Token slice of MoE inputs: a tensor or an fp8 dispatch (rows, scales) pair."""
+    if isinstance(hidden_states, tuple):
+        rows, scales = hidden_states
+        per_token = rows.shape[-1] // MOE_FP8_DISPATCH_BLOCK  # flat scales
+        return rows[start:end], scales[start * per_token : end * per_token]
+    return hidden_states[start:end]
 
 
 def calculate_moe_chunks(
@@ -173,9 +195,16 @@ def pipelined_fused_moe_gmm(
         seq_len, parallel_size, chunk_size
     )
 
+    # Independent of the token count, so every bucket traces the same inputs.
+    moe_fn = fused_moe_gmm
+    if parallel_size > 1 and moe_fp8_dispatch_enabled(w1, w1_scale, rhs_quant_dtype):
+        # Quantize before the all-gather instead of inside the routed GMM.
+        hidden_states = quantize_moe_dispatch(hidden_states)
+        moe_fn = fused_moe_gmm_fp8_dispatch
+
     if num_chunks == 1 or parallel_size == 1:
         if parallel_size > 1:
-            ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
+            ag_hidden_states = _all_gather_hidden(collective_group, hidden_states)
             ag_topk_weights = (
                 collective_group.all_gather(topk_weights, dim=0)
                 if topk_weights is not None
@@ -191,7 +220,7 @@ def pipelined_fused_moe_gmm(
             ag_topk_weights = topk_weights
             ag_topk_ids = topk_ids
 
-        out = fused_moe_gmm(
+        out = moe_fn(
             hidden_states=ag_hidden_states,
             w1=w1,
             w2=w2,
@@ -216,7 +245,9 @@ def pipelined_fused_moe_gmm(
 
     # Slice local inputs into num_chunks chunks along dim 0
     hs_slices = [
-        hidden_states[i * chunk_size_local : (i + 1) * chunk_size_local]
+        _slice_hidden(
+            hidden_states, i * chunk_size_local, (i + 1) * chunk_size_local
+        )
         for i in range(num_chunks)
     ]
     weights_slices = (
@@ -237,7 +268,7 @@ def pipelined_fused_moe_gmm(
     )
 
     # Prime pipeline with initial all-gather for chunk 0
-    ag_hs_curr = collective_group.all_gather(hs_slices[0], dim=0)
+    ag_hs_curr = _all_gather_hidden(collective_group, hs_slices[0])
     ag_tw_curr = (
         collective_group.all_gather(weights_slices[0], dim=0)
         if weights_slices[0] is not None
@@ -254,7 +285,7 @@ def pipelined_fused_moe_gmm(
     for i in range(num_chunks):
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
-            ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
+            ag_hs_next = _all_gather_hidden(collective_group, hs_slices[i + 1])
             ag_tw_next = (
                 collective_group.all_gather(weights_slices[i + 1], dim=0)
                 if weights_slices[i + 1] is not None
@@ -267,7 +298,7 @@ def pipelined_fused_moe_gmm(
             )
 
         # Compute MoE kernel for current gathered chunk
-        out_i = fused_moe_gmm(
+        out_i = moe_fn(
             hidden_states=ag_hs_curr,
             w1=w1,
             w2=w2,

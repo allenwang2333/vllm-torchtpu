@@ -570,12 +570,71 @@ def qnorm_rope(
     )(positions, x, cos_sin_cache)
 
 
+def _expand_cos_sin(
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    inverse: bool = False,
+) -> jax.Array:
+    """Expand ``cos_sin_cache[positions]`` to ``[T, 2 * LANE]`` in XLA so it CSEs across kernels/layers."""
+    num_tokens = positions.shape[0]
+    rotary_dim = cos_sin_cache.shape[1]
+    half = rotary_dim // 2
+    cs = cos_sin_cache[positions]
+    c = jnp.repeat(cs[:, :half], 2, axis=-1)
+    s = jnp.repeat(cs[:, half:], 2, axis=-1)
+    if inverse:
+        s = -s
+    pad_w = LANE - rotary_dim
+    if pad_w > 0:
+        ones = jnp.ones((num_tokens, pad_w), dtype=cs.dtype)
+        zeros = jnp.zeros((num_tokens, pad_w), dtype=cs.dtype)
+        return jnp.concatenate([ones, c, zeros, s], axis=-1).astype(jnp.float32)
+    return jnp.concatenate([c, s], axis=-1).astype(jnp.float32)
+
+
+def _rope_quant_body(
+    x_ref: jax.Ref,
+    cos_sin_ref: jax.Ref,
+    *rest_refs: jax.Ref,
+    quant_dtype: jnp.dtype,
+    has_w_scale: bool = False,
+) -> None:
+    """Process one ``(tile_n, [num_heads,] LANE)`` chunk with optional w_scale."""
+    x_raw = x_ref[...]
+    if has_w_scale:
+        w_ref, q_ref, scale_ref = rest_refs
+        x_raw = (x_raw.astype(jnp.float32) * w_ref[...][..., None]).astype(
+            x_raw.dtype
+        )
+    else:
+        q_ref, scale_ref = rest_refs
+    x = x_raw.astype(jnp.float32)
+    cs = cos_sin_ref[...]
+    cos = cs[:, :LANE]
+    sin = cs[:, LANE:]
+    if x.ndim == 3:
+        cos = cos[:, None, :]
+        sin = sin[:, None, :]
+
+    rotated = _rotate_gptj(x)
+    y = x * cos + rotated * sin
+
+    qmax = dtype_max(quant_dtype)
+    abs_max = jnp.max(jnp.abs(y), axis=-1, keepdims=True)
+    scale = abs_max / qmax
+    scale_inv = jnp.where(abs_max == 0.0, 0.0, 1.0 / scale)
+    q_ref[...] = (y * scale_inv).astype(quant_dtype)
+    scale_ref[...] = scale.reshape(scale_ref.shape)
+
+
 @functools.partial(jax.jit, static_argnames=("inverse", "quant_dtype", "name"))
 def rope_quant(
     x: jax.Array,  # [num_tokens, head_dim] | [num_tokens, num_heads, head_dim]
     positions: jax.Array,  # [num_tokens] int
     cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
     *,
+    w_scale: jax.Array | None = None,
     inverse: bool = False,
     quant_dtype: jnp.dtype = jnp.float8_e4m3fn,
     name: str = "rope_quant",
@@ -583,16 +642,61 @@ def rope_quant(
     """RoPE fused with per-row dynamic quantization of the rotated values.
 
     Same rotation as ``rope``, but the result is quantized to ``quant_dtype``
-    inside the kernel.
+    inside the kernel. Optional ``w_scale`` (shape ``x.shape[:-1]``) is multiplied
+    into ``x`` in VMEM before RoPE rotation.
     """
-    return _rope_call(
-        x,
-        positions,
-        cos_sin_cache,
-        inverse=inverse,
-        quant_dtype=quant_dtype,
+    if x.ndim not in (2, 3):
+        raise ValueError(f"x must be rank 2 or 3, got {x.shape}")
+    assert positions.ndim == 1 and positions.shape[0] == x.shape[0]
+    assert cos_sin_cache.ndim == 2
+
+    num_tokens = x.shape[0]
+    head_dim = x.shape[-1]
+    rows_per_token = x.shape[1] if x.ndim == 3 else 1
+    rotary_dim = cos_sin_cache.shape[1]
+    assert rotary_dim % 2 == 0 and rotary_dim <= LANE
+    if head_dim != LANE:
+        raise ValueError(f"quantization requires head_dim == {LANE}, got {head_dim}")
+
+    cap_n = (64 if num_tokens <= 1024 else 128) if x.ndim == 3 else 512
+    tile_n = largest_divisor(num_tokens, cap=cap_n)
+    x_block_shape = (tile_n, rows_per_token, LANE) if x.ndim == 3 else (tile_n, LANE)
+    scale_block_shape = x_block_shape[:-1]
+    x_idx_map = (lambda i: (i, 0, 0)) if x.ndim == 3 else (lambda i: (i, 0))
+    s_idx_map = (lambda i: (i, 0)) if x.ndim == 3 else (lambda i: (i,))
+
+    cos_sin = _expand_cos_sin(positions, cos_sin_cache, inverse=inverse)
+    in_specs = [
+        pl.BlockSpec(x_block_shape, x_idx_map),
+        pl.BlockSpec((tile_n, 2 * LANE), lambda i: (i, 0)),
+    ]
+    in_args = [x, cos_sin]
+    if w_scale is not None:
+        in_specs.append(pl.BlockSpec(scale_block_shape, s_idx_map))
+        in_args.append(w_scale)
+
+    return pl.pallas_call(
+        functools.partial(
+            _rope_quant_body,
+            quant_dtype=quant_dtype,
+            has_w_scale=(w_scale is not None),
+        ),
+        out_shape=(
+            jax.ShapeDtypeStruct(x.shape, quant_dtype),
+            jax.ShapeDtypeStruct(x.shape[:-1], jnp.float32),
+        ),
+        grid=(num_tokens // tile_n,),
+        in_specs=in_specs,
+        out_specs=[
+            pl.BlockSpec(x_block_shape, x_idx_map),
+            pl.BlockSpec(scale_block_shape, s_idx_map),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
         name=name,
-    )
+    )(*in_args)
 
 
 def _rmsnorm_rope_body(
@@ -601,9 +705,7 @@ def _rmsnorm_rope_body(
     cos_sin_ref: jax.Ref,
     out_ref: jax.Ref,
     *,
-    rotary_dim: int,
     eps: float,
-    inverse: bool,
     out_dtype: jnp.dtype,
 ) -> None:
     """Process one ``(tile_n, head_dim)`` chunk: weighted RMSNorm + RoPE."""
@@ -612,85 +714,15 @@ def _rmsnorm_rope_body(
     normed = (x * rms).astype(out_dtype) * w_ref[...]
 
     tail = normed[..., -LANE:].astype(jnp.float32)
-    cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
+    cs = cos_sin_ref[...]
+    cos = cs[:, :LANE]
+    sin = cs[:, LANE:]
     if tail.ndim == 3:
         cos = cos[:, None, :]
         sin = sin[:, None, :]
     roped = (tail * cos + _rotate_gptj(tail) * sin).astype(out_dtype)
 
     out_ref[...] = jnp.concatenate([normed[..., :-LANE], roped], axis=-1)
-
-
-def _rmsnorm_rope_kernel(
-    positions_ref: jax.Ref,
-    x_hbm_ref: jax.Ref,
-    w_hbm_ref: jax.Ref,
-    cos_sin_cache_hbm_ref: jax.Ref,
-    out_hbm_ref: jax.Ref,
-    *,
-    num_tiles: int,
-    tile_n: int,
-    x_block_shape: tuple[int, ...],
-    rotary_dim: int,
-    eps: float,
-    inverse: bool,
-    in_dtype: jnp.dtype,
-    cos_sin_dtype: jnp.dtype,
-) -> None:
-    x_spec = pl.BlockSpec(
-        block_shape=x_block_shape,
-        memory_space=pltpu.VMEM,
-        index_map=(lambda i: (i, 0, 0))
-        if len(x_block_shape) == 3
-        else (lambda i: (i, 0)),
-    )
-    w_block_shape = (1,) * (len(x_block_shape) - 1) + (x_block_shape[-1],)
-    w_spec = pl.BlockSpec(
-        block_shape=w_block_shape,
-        memory_space=pltpu.VMEM,
-        index_map=(
-            (lambda i: (0, 0, 0)) if len(x_block_shape) == 3 else (lambda i: (0, 0))
-        ),
-    )
-    cos_sin_spec = pl.BlockSpec(
-        block_shape=(tile_n, rotary_dim),
-        memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, 0),
-    )
-    cos_sin_alloc = CosSinRef.create(
-        spec=cos_sin_spec, dtype=cos_sin_dtype, buffer_count=2, tile_n=tile_n
-    )
-
-    pipeline = pltpu.emit_pipeline(
-        functools.partial(
-            _rmsnorm_rope_body,
-            rotary_dim=rotary_dim,
-            eps=eps,
-            inverse=inverse,
-            out_dtype=in_dtype,
-        ),
-        grid=(num_tiles,),
-        in_specs=[x_spec, w_spec, cos_sin_spec],
-        out_specs=[x_spec],
-    )
-    allocations = (
-        pltpu.BufferedRef.input(x_spec, in_dtype, buffer_count=2),
-        pltpu.BufferedRef.input(w_spec, in_dtype, buffer_count=1),
-        cos_sin_alloc,
-        pltpu.BufferedRef.output(x_spec, in_dtype, buffer_count=2),
-    )
-
-    @pl.with_scoped(allocations=allocations)
-    def _run(allocations):
-        pipeline(
-            x_hbm_ref,
-            w_hbm_ref,
-            (cos_sin_cache_hbm_ref, positions_ref),
-            out_hbm_ref,
-            allocations=allocations,
-        )
-
-    _run()
 
 
 @functools.partial(
@@ -717,39 +749,38 @@ def rmsnorm_rope(
     rotary_dim = cos_sin_cache.shape[1]
     assert head_dim % LANE == 0
     assert rotary_dim % 2 == 0 and rotary_dim <= LANE
-    tile_n = largest_divisor(num_tokens, cap=64)
+    cap_n = 1024 if x.ndim == 2 else 256
+    tile_n = largest_divisor(num_tokens, cap=cap_n)
 
     x_block_shape = (tile_n, *x.shape[1:])
     w_reshaped = weight.astype(x.dtype).reshape((1,) * (x.ndim - 1) + (head_dim,))
-    kernel = functools.partial(
-        _rmsnorm_rope_kernel,
-        num_tiles=num_tokens // tile_n,
-        tile_n=tile_n,
-        x_block_shape=x_block_shape,
-        rotary_dim=rotary_dim,
-        eps=eps,
-        inverse=inverse,
-        in_dtype=x.dtype,
-        cos_sin_dtype=cos_sin_cache.dtype,
-    )
+    w_block_shape = (1,) * (len(x_block_shape) - 1) + (x_block_shape[-1],)
+    cos_sin = _expand_cos_sin(positions, cos_sin_cache, inverse=inverse)
 
-    grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=1,
-        in_specs=(
-            pl.BlockSpec(memory_space=pltpu.HBM),  # x
-            pl.BlockSpec(memory_space=pltpu.HBM),  # w_reshaped
-            pl.BlockSpec(memory_space=pltpu.HBM),  # cos_sin_cache
-        ),
-        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+    x_idx_map = (
+        (lambda i: (i, 0, 0)) if len(x_block_shape) == 3 else (lambda i: (i, 0))
+    )
+    w_idx_map = (
+        (lambda i: (0, 0, 0)) if len(x_block_shape) == 3 else (lambda i: (0, 0))
     )
 
     return pl.pallas_call(
-        kernel,
+        functools.partial(
+            _rmsnorm_rope_body,
+            eps=eps,
+            out_dtype=x.dtype,
+        ),
         out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-        grid_spec=grid_spec,
+        grid=(num_tokens // tile_n,),
+        in_specs=[
+            pl.BlockSpec(x_block_shape, x_idx_map),
+            pl.BlockSpec(w_block_shape, w_idx_map),
+            pl.BlockSpec((tile_n, 2 * LANE), lambda i: (i, 0)),
+        ],
+        out_specs=pl.BlockSpec(x_block_shape, x_idx_map),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
             disable_bounds_checks=True,
         ),
         name=name,
-    )(positions, x, w_reshaped, cos_sin_cache)
+    )(x, w_reshaped, cos_sin)

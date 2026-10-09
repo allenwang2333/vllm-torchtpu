@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     SPEC_WARMUP: bool = True
     RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
     RAIDEN_SHM_KEY: str = ""
+    VLLM_TPU_MOE_FP8_DISPATCH: bool = False
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     VLLM_TORCHTPU_IPC_KEY: str = ""
@@ -139,7 +140,19 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
+    TPU_DEEPSEEK_V41_ENGRAM_DEBUG_VERIFY: bool = False
     VLLM_DSV41_CED: bool = False
+    VLLM_DSV41_HYBRID_CED_DECODE: bool = False
+    VLLM_DSV41_PURE_20L_PREFILL: bool = False
+    VLLM_DSV41_CSA_UNION: bool = True
+    VLLM_DSV41_FUSED_SEAM_QUANT: bool = False
+    VLLM_DSV41_FUSED_Q_ROPE: bool = False
+    VLLM_DSV41_TP_ATTN: bool = False
+    VLLM_DSV41_TP_ATTN_MIN_TOKENS: int = 0
+    VLLM_DSV41_TP_INDEXER: bool = False
+    VLLM_DSV41_TP_INDEXER_MIN_TOKENS: int = 64
+    VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS: int = 0
+    VLLM_DSV41_TP_ATTN_LOCAL_TOPK: bool = False
 
 
 def env_with_choices(
@@ -594,6 +607,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    "VLLM_TPU_MOE_FP8_DISPATCH": env_bool("VLLM_TPU_MOE_FP8_DISPATCH"),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
@@ -855,7 +869,48 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
         "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
     ),
+    "TPU_DEEPSEEK_V41_ENGRAM_DEBUG_VERIFY": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_DEBUG_VERIFY", False
+    ),
     "VLLM_DSV41_CED": env_bool("VLLM_DSV41_CED", False),
+    "VLLM_DSV41_HYBRID_CED_DECODE": lambda: bool(
+        int(os.getenv("VLLM_DSV41_HYBRID_CED_DECODE", "0"))
+    ),
+    "VLLM_DSV41_PURE_20L_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_DSV41_PURE_20L_PREFILL", "0"))
+    ),
+    # 0 = exact per-token sparse kernel for every CSA prefill token instead of
+    # the 32-query candidate union (which drops rows past m_union = 3 * topk).
+    "VLLM_DSV41_CSA_UNION": env_bool("VLLM_DSV41_CSA_UNION", True),
+    "VLLM_DSV41_SINGLE_BACKBONE_COND": lambda: bool(
+        int(os.getenv("VLLM_DSV41_SINGLE_BACKBONE_COND", "0"))
+    ),
+    "VLLM_DSV41_FUSED_SEAM_QUANT": env_bool("VLLM_DSV41_FUSED_SEAM_QUANT", False),
+    "VLLM_DSV41_FUSED_Q_ROPE": env_bool("VLLM_DSV41_FUSED_Q_ROPE", False),
+    # Token-parallel attention core at TP>1: each rank attends with all heads
+    # for its T/tp token slice (replicated wq_b/wo_a/wo_b, no attention
+    # reduce-scatter). Used for token-sharded, non-CED steps with
+    # T >= MIN_TOKENS (0 = every bucket; a threshold above the smallest
+    # bucket splits the trace and fails the shape_variants hand-over).
+    "VLLM_DSV41_TP_ATTN": env_bool("VLLM_DSV41_TP_ATTN", False),
+    "VLLM_DSV41_TP_ATTN_MIN_TOKENS": env_int("VLLM_DSV41_TP_ATTN_MIN_TOKENS", 0),
+    # Token-parallel indexer at TP>1: each rank scores T/tp tokens, then the
+    # top-k indices are all-gathered. Used when T >= MIN_TOKENS and T/tp >= 8.
+    "VLLM_DSV41_TP_INDEXER": env_bool("VLLM_DSV41_TP_INDEXER", False),
+    "VLLM_DSV41_TP_INDEXER_MIN_TOKENS": env_int(
+        "VLLM_DSV41_TP_INDEXER_MIN_TOKENS", 64
+    ),
+    # L12: steps with fewer tokens keep the mHC residual replicated over TP
+    # (all-reduce) instead of token-sharded (reduce-scatter + all-gathers).
+    # tp_collectives.tp_token_shard_ok is the one predicate for the Engram
+    # prefetch, prelude, DecoderStage and zeros fallback. 0 = always shard.
+    "VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS": env_int(
+        "VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS", 0
+    ),
+    # Keep the token-parallel indexer's top-k rows rank-local (no all-gather)
+    # when the indexer layer and every layer reusing its top-k rows run
+    # token-parallel attention, which reads only this rank's T/tp rows.
+    "VLLM_DSV41_TP_ATTN_LOCAL_TOPK": env_bool("VLLM_DSV41_TP_ATTN_LOCAL_TOPK", False),
 }
 
 

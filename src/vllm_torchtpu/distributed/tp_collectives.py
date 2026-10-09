@@ -18,6 +18,7 @@ import functools
 import torch
 from vllm.distributed import get_tp_group
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.utils import synchronize_tensors
 
 
@@ -43,6 +44,22 @@ def tp_shard_slice(
         tp_rank_idx = _get_tp_rank_tensor(tp_rank, x.device)
     shape_tail = tuple(x.size(i) for i in range(1, x.ndim))
     return x.reshape(tp_size, -1, *shape_tail).index_select(0, tp_rank_idx).squeeze(0)
+
+
+
+def tp_token_shard_ok(num_tokens: int, tp_size: int) -> bool:
+    """Whether a step of ``num_tokens`` tokens runs token-sharded over TP.
+
+    The single predicate for every per-step token-sharding decision (Engram CPU
+    prefetch, prelude/stage mHC residual, Engram shard, zeros fallback), so the
+    host rows and the compiled slicing always agree. Steps below
+    VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS stay replicated; <= 0 skips the
+    comparison, which leaves the traced guards unchanged.
+    """
+    if not (tp_size > 1 and num_tokens > 0 and num_tokens % tp_size == 0):
+        return False
+    min_tokens = envs.VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS
+    return min_tokens <= 0 or num_tokens >= min_tokens
 
 
 def tp_all_gather(x: torch.Tensor, dim: int = 0) -> torch.Tensor:

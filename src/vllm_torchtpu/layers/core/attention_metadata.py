@@ -158,6 +158,44 @@ class AttentionMetadataBuilderContext:
     staged_mamba_products: dict | None = None
 
 
+_STAGE_BT_ROW_BUCKETS: tuple[int, ...] = (8, 16, 32, 64, 128, 256, 512)
+# Shared column divisors corresponding to context buckets (8k, 16k, 32k, 64k,
+# 128k, 256k, 512k at max_model_len=524288): cols_g = cdiv(tnb, col_div).
+_STAGE_BT_COL_DIVS: tuple[int, ...] = (64, 32, 16, 8, 4, 2, 1)
+
+
+def _select_stage_row_bucket(num_reqs: int, num_reqs_padded: int) -> int:
+    for rb in _STAGE_BT_ROW_BUCKETS:
+        if rb >= num_reqs and rb < num_reqs_padded:
+            return rb
+    return num_reqs_padded
+
+
+def _select_stage_col_div(
+    entries: list[tuple[int, Any, int]],
+    ctx: AttentionMetadataBuilderContext,
+) -> int:
+    if ctx.position_ids_override is not None or ctx.num_reqs <= 0:
+        return 1
+    needs: list[tuple[int, int]] = []
+    for _, block_table_obj, tnb in entries:
+        nbpr = getattr(block_table_obj, "num_blocks_per_row", None)
+        if nbpr is None:
+            return 1
+        row_slice = nbpr[ctx.start_index : ctx.start_index + ctx.num_reqs]
+        need_g = min(
+            tnb, max(1, int(row_slice.max()) if len(row_slice) > 0 else 1)
+        )
+        needs.append((need_g, tnb))
+    for col_div in _STAGE_BT_COL_DIVS:
+        if all(
+            min(tnb, max(1, cdiv(tnb, col_div))) >= need_g
+            for need_g, tnb in needs
+        ):
+            return col_div
+    return 1
+
+
 def _staged_walk_products(
     staged_dev: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -165,18 +203,33 @@ def _staged_walk_products(
     mamba_geom: tuple,
     ckpt_window: int,
 ) -> tuple:
-    """Splits the staged flat block-table buffer into per-group tables and
-    derives unified-pool mamba state and checkpoint indices."""
+    """Splits and zero-pads the staged flat block-table buffer into per-group
+    tables `[num_reqs_padded * target_num_blocks]` and derives unified-pool
+    mamba state and checkpoint indices."""
     outs = []
-    for off, n, t in table_geom:
-        outs.append(staged_dev[off : off + n * t].clone())
+    tables_2d = []
+    for geom in table_geom:
+        if len(geom) == 3:
+            off, n_pad, t_pad = geom
+            r_up, c_up = n_pad, t_pad
+        else:
+            off, r_up, c_up, n_pad, t_pad = geom
+        sub = staged_dev[off : off + r_up * c_up].view(r_up, c_up)
+        if r_up == n_pad and c_up == t_pad:
+            tbl_2d = sub
+            outs.append(sub.reshape(n_pad * t_pad).clone())
+        else:
+            tbl_2d = torch.nn.functional.pad(
+                sub, (0, t_pad - c_up, 0, n_pad - r_up)
+            )
+            outs.append(tbl_2d.reshape(n_pad * t_pad))
+        tables_2d.append(tbl_2d)
     states = []
     ckpts = []
     if mamba_geom:
         active = seq_lens > 0
         for ti, t, bs in mamba_geom:
-            off, n, _ = table_geom[ti]
-            tbl = staged_dev[off : off + n * t].view(n, t)
+            tbl = tables_2d[ti]
             state_offsets = torch.clamp((seq_lens - 1) // bs, min=0, max=t - 1).to(
                 torch.int64
             )
@@ -201,11 +254,12 @@ def _staged_walk_products_compiled(
     ckpt_window: int,
 ) -> tuple:
     """One device program for everything the metadata walk consumes:
-    per-group block-table splits (graph outputs are distinct buffers, so no
-    per-group eager clone) plus the unified-pool mamba state/checkpoint
-    gathers. `table_geom` is `((offset, num_reqs, num_blocks), ...)` in walk
-    order; `mamba_geom` is `((table_geom_index, num_blocks, block_size),
-    ...)`; both are static per padding bucket. Returns `tables... +
+    per-group block-table splits and 2D zero-padding (graph outputs are distinct
+    buffers, so no per-group eager clone) plus the unified-pool mamba
+    state/checkpoint gathers. `table_geom` is
+    `((offset, row_bucket, cols_g, num_reqs_padded, target_num_blocks), ...)` in
+    walk order; `mamba_geom` is `((table_geom_index, num_blocks, block_size),
+    ...)`; both are static per (row_bucket, col_div) bucket. Returns `tables... +
     states... + (ckpts... if ckpt_window > 1)`. Issued for every staged walk
     (dummy runs included) so warmup and lockstep ranks dispatch the same
     program sequence.
@@ -508,11 +562,22 @@ def stage_block_table_uploads(
         )
         return
 
-    total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
+    if ctx.position_ids_override is None and ctx.num_reqs > 0:
+        row_bucket = _select_stage_row_bucket(ctx.num_reqs, num_reqs_padded)
+        col_div = _select_stage_col_div(entries, ctx)
+    else:
+        row_bucket = num_reqs_padded
+        col_div = 1
+
+    upload_cols = [
+        min(tnb, max(1, cdiv(tnb, col_div))) for _, _, tnb in entries
+    ]
+    total = sum(row_bucket * cols_g for cols_g in upload_cols)
+    full_total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
     scratch = runner._block_table_stage_cpu
-    if scratch is None or scratch.numel() < total:
+    if scratch is None or scratch.numel() < full_total:
         scratch = torch.zeros(
-            (total,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
+            (full_total,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
         )
         runner._block_table_stage_cpu = scratch
     flat = scratch[:total]
@@ -520,27 +585,29 @@ def stage_block_table_uploads(
 
     if ctx.position_ids_override is None:
         offset = 0
-        for _, block_table_obj, target_num_blocks in entries:
-            rows = flat[offset : offset + num_reqs_padded * target_num_blocks].view(
-                num_reqs_padded, target_num_blocks
+        for (_, block_table_obj, _), cols_g in zip(entries, upload_cols):
+            rows = flat[offset : offset + row_bucket * cols_g].view(
+                row_bucket, cols_g
             )
             source = block_table_obj.get_cpu_tensor()
             rows[: ctx.num_reqs] = source[
-                ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
+                ctx.start_index : ctx.start_index + ctx.num_reqs, :cols_g
             ]
-            offset += num_reqs_padded * target_num_blocks
+            offset += row_bucket * cols_g
     # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
 
     staged_dev = flat.to(runner.device, non_blocking=True)
 
-    # One compiled program splits the staged tensor into per-group tables
-    # and derives every unified-pool mamba group's state/checkpoint indices
-    # (replaces one micro-program per group per step).
-    table_geom: list[tuple[int, int, int]] = []
+    # One compiled program splits and zero-pads the staged tensor into static
+    # per-group `[num_reqs_padded * target_num_blocks]` tables and derives
+    # every unified-pool mamba group's state/checkpoint indices.
+    table_geom: list[tuple[int, int, int, int, int]] = []
     offset = 0
-    for _, _, target_num_blocks in entries:
-        table_geom.append((offset, num_reqs_padded, target_num_blocks))
-        offset += num_reqs_padded * target_num_blocks
+    for (_, _, target_num_blocks), cols_g in zip(entries, upload_cols):
+        table_geom.append(
+            (offset, row_bucket, cols_g, num_reqs_padded, target_num_blocks)
+        )
+        offset += row_bucket * cols_g
 
     # Mirror of build()'s branch order: the compact path
     # (ctx.mamba_state_indices) wins, otherwise the unified layout derives
@@ -550,13 +617,18 @@ def stage_block_table_uploads(
     if unified_mamba:
         for i, builder in enumerate(entry_builders):
             if builder.is_mamba_group:
-                mamba_geom.append((i, table_geom[i][2], builder.target_block_size))
+                mamba_geom.append((i, entries[i][2], builder.target_block_size))
                 mamba_entry_indices.append(i)
 
-    if len(entries) == 1 and not mamba_geom:
-        # Exactly one group with no mamba derivation: the flat upload is
-        # already the complete table view; avoid launching an unnecessary
-        # device clone program.
+    if (
+        len(entries) == 1
+        and not mamba_geom
+        and row_bucket == num_reqs_padded
+        and upload_cols[0] == entries[0][2]
+    ):
+        # Exactly one group with no mamba derivation and no 2D compaction:
+        # the flat upload is already the complete table view; avoid launching
+        # an unnecessary device clone program.
         gid, _, target_num_blocks = entries[0]
         length = num_reqs_padded * target_num_blocks
         ctx.staged_block_tables = {gid: staged_dev[:length]}
@@ -607,3 +679,108 @@ def stage_block_table_uploads(
         runner._cached_staged_block_tables = ctx.staged_block_tables
         runner._cached_staged_mamba_products = ctx.staged_mamba_products
         runner._block_tables_dirty = False
+
+
+@torch.no_grad()
+def precompile_staged_block_table_uploads(runner: Any) -> None:
+    """Warm `_staged_walk_products_compiled` across all 2D `(row_bucket, col_div)`
+    variants under `no_grad` so no serving-time recompile occurs inside
+    `execute_model`."""
+    if not runner.attn_groups or runner.device.type != "tpu":
+        return
+    from vllm_torchtpu.utils import synchronize_tensors
+
+    modes = [True]
+    if runner.most_model_len is not None:
+        modes.append(False)
+
+    for use_max_model_len in modes:
+        num_reqs_padded = (
+            runner.num_reqs_max_model_len
+            if use_max_model_len
+            else runner.num_reqs_most_model_len
+        )
+        assert num_reqs_padded is not None
+        dummy_seq_lens = torch.zeros(
+            (num_reqs_padded,), dtype=torch.int32, device=runner.device
+        )
+        dummy_ctx = AttentionMetadataBuilderContext(
+            num_reqs=num_reqs_padded,
+            start_index=0,
+            use_max_model_len=use_max_model_len,
+            seq_lens=dummy_seq_lens,
+            query_start_loc=torch.zeros(
+                (num_reqs_padded + 1,), dtype=torch.int32, device=runner.device
+            ),
+            request_distribution=torch.zeros(
+                (3,), dtype=torch.int32, device=runner.device
+            ),
+            mamba_ckpt_window=runner._mamba_ckpt_window,
+        )
+        entries: list[tuple[int, Any, int]] = []
+        entry_builders: list[Any] = []
+        seen: set[int] = set()
+        for group_list in runner.attn_groups:
+            for group in group_list:
+                builder = group.metadata_builders[0]
+                gid = builder.kv_cache_group_id
+                if gid in seen:
+                    continue
+                seen.add(gid)
+                block_table_obj, tnb = builder._block_table_geometry(dummy_ctx)
+                entries.append((gid, block_table_obj, tnb))
+                entry_builders.append(builder)
+        if not entries:
+            continue
+
+        unified_mamba = (
+            not runner._has_mamba_state and runner._unified_kv_layout
+        )
+        mamba_geom: list[tuple[int, int, int]] = []
+        if unified_mamba:
+            for i, builder in enumerate(entry_builders):
+                if builder.is_mamba_group:
+                    mamba_geom.append((i, entries[i][2], builder.target_block_size))
+
+        row_buckets = sorted(
+            {
+                *(rb for rb in _STAGE_BT_ROW_BUCKETS if rb < num_reqs_padded),
+                num_reqs_padded,
+            }
+        )
+        seen_shapes: set[tuple[int, tuple[int, ...]]] = set()
+        for rb in row_buckets:
+            for col_div in _STAGE_BT_COL_DIVS:
+                upload_cols = tuple(
+                    min(tnb, max(1, cdiv(tnb, col_div)))
+                    for _, _, tnb in entries
+                )
+                shape_key = (rb, upload_cols)
+                if shape_key in seen_shapes:
+                    continue
+                seen_shapes.add(shape_key)
+                if (
+                    len(entries) == 1
+                    and not mamba_geom
+                    and rb == num_reqs_padded
+                    and upload_cols[0] == entries[0][2]
+                ):
+                    continue
+                table_geom: list[tuple[int, int, int, int, int]] = []
+                offset = 0
+                for (_, _, tnb), cols_g in zip(entries, upload_cols):
+                    table_geom.append(
+                        (offset, rb, cols_g, num_reqs_padded, tnb)
+                    )
+                    offset += rb * cols_g
+                dummy_staged = torch.zeros(
+                    (offset,), dtype=torch.int32, device=runner.device
+                )
+                products = _staged_walk_products_compiled(
+                    dummy_staged,
+                    dummy_seq_lens,
+                    tuple(table_geom),
+                    tuple(mamba_geom),
+                    runner._mamba_ckpt_window,
+                )
+                synchronize_tensors(list(products))

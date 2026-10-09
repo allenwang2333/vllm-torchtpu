@@ -103,6 +103,7 @@ from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilderContext,
+    precompile_staged_block_table_uploads,
     stage_block_table_uploads,
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
@@ -2448,6 +2449,16 @@ class TPUModelRunner(GPUModelRunner):
         for i in pre_discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
 
+        debug_verify = envs.TPU_DEEPSEEK_V41_ENGRAM_DEBUG_VERIFY
+        debug_pending = (
+            getattr(self, "_engram_debug_pending", None) if debug_verify else None
+        )
+        debug_resolved = (
+            (getattr(self, "_engram_debug_tok0_out", None) or {})
+            if debug_pending
+            else None
+        )
+
         for pre_req_idx, req_state, seq_len, req_id in pre_request_seq_lens:
             sampled_ids = valid_sampled_token_ids[pre_req_idx]
             if not sampled_ids:
@@ -2494,6 +2505,33 @@ class TPUModelRunner(GPUModelRunner):
                 f"{self.input_batch.token_ids_cpu.shape[1]}"
             )
             self.input_batch.token_ids_cpu[req_idx, target_slice] = sampled_ids
+            if debug_pending:
+                stats = getattr(self, "_engram_debug_stats", None)
+                if stats is None:
+                    stats = {"checked": 0, "mismatch": 0, "steps": 0}
+                    self._engram_debug_stats = stats
+                for j, committed_tok in enumerate(sampled_ids):
+                    entry = debug_pending.pop((req_id, start_idx + j), None)
+                    if entry is not None:
+                        tok_i, fallback_tok = entry
+                        hashed_tok = debug_resolved.get(tok_i, fallback_tok)
+                        stats["checked"] += 1
+                        if int(hashed_tok) != int(committed_tok):
+                            stats["mismatch"] += 1
+
+        if debug_verify:
+            stats = getattr(self, "_engram_debug_stats", None)
+            if stats is not None and stats["checked"] > 0:
+                stats["steps"] += 1
+                if stats["steps"] == 1 or stats["steps"] % 32 == 0:
+                    logger.warning(
+                        "[ENGRAM_DEBUG_VERIFY] step=%d decode_checked=%d "
+                        "decode_mismatch=%d (%.2f%%)",
+                        stats["steps"],
+                        stats["checked"],
+                        stats["mismatch"],
+                        100.0 * stats["mismatch"] / max(1, stats["checked"]),
+                    )
 
     def _update_placeholder(
         self,
@@ -2675,6 +2713,29 @@ class TPUModelRunner(GPUModelRunner):
             num_draft_per_req,
         )
 
+    def _record_engram_debug_tokens(
+        self, req_indices: np.ndarray, positions_np: np.ndarray, known: np.ndarray
+    ) -> dict[int, int]:
+        pending = self.__dict__.get("_engram_debug_pending")
+        if pending is None:
+            pending = {}
+            self._engram_debug_pending = pending
+        tok0_out: dict[int, int] = {}
+        self._engram_debug_tok0_out = tok0_out
+        num_prompt = self.input_batch.num_prompt_tokens
+        dec_idx = np.flatnonzero(known & (positions_np >= num_prompt[req_indices]))
+        if dec_idx.size == 0:
+            return tok0_out
+        req_ids = self.input_batch.req_ids
+        tok_cpu = self.input_batch.token_ids_cpu
+        for tok_i in dec_idx.tolist():
+            r_idx = int(req_indices[tok_i])
+            pos_i = int(positions_np[tok_i])
+            r_id = req_ids[r_idx]
+            if r_id is not None:
+                pending[(r_id, pos_i)] = (tok_i, int(tok_cpu[r_idx, pos_i]))
+        return tok0_out
+
     def _maybe_prefetch_engram(
         self, layout_plan, req_indices: np.ndarray, positions_np: np.ndarray
     ) -> None:
@@ -2686,15 +2747,77 @@ class TPUModelRunner(GPUModelRunner):
             self._engram_prefetch_fn = fn
         if fn is None:
             return
-        known = positions_np < self.input_batch.num_prompt_tokens[req_indices]
+        max_len = self.input_batch.token_ids_cpu.shape[1]
+        known = (positions_np >= 0) & (positions_np < max_len)
+        pre_async = (
+            self._pre_async_results
+            if self.scheduler_config.async_scheduling
+            else None
+        )
+        async_subst: tuple[np.ndarray, np.ndarray] | None = None
         if layout_plan.kind is not SequenceLayoutKind.ALL:
             known[:] = False
+            pre_async = None
+        elif known.any():
+            sched_ids = self.input_ids_cpu[: len(positions_np)].numpy()
+            dec_mask = known & (
+                positions_np >= self.input_batch.num_prompt_tokens[req_indices]
+            )
+            if self.speculative_config is not None and dec_mask.any():
+                known[dec_mask] = False
+                if known.any():
+                    self.input_batch.token_ids_cpu[
+                        req_indices[known], positions_np[known]
+                    ] = sched_ids[known]
+                pre_async = None
+            elif (
+                pre_async is not None
+                and pre_async.req_id_to_index_copy
+                and dec_mask.any()
+            ):
+                req_ids = self.input_batch.req_ids
+                req_id_map = pre_async.req_id_to_index_copy
+                req_pre_idx = np.array(
+                    [
+                        req_id_map.get(req_ids[r], -1)
+                        if req_ids[r] is not None
+                        else -1
+                        for r in range(self.input_batch.num_reqs)
+                    ],
+                    dtype=np.int32,
+                )
+                tok_pre_idx = np.where(dec_mask, req_pre_idx[req_indices], -1)
+                subst_tok_idx = np.flatnonzero(tok_pre_idx >= 0).astype(np.int32)
+                write_mask = known & (tok_pre_idx < 0)
+                if write_mask.any():
+                    self.input_batch.token_ids_cpu[
+                        req_indices[write_mask], positions_np[write_mask]
+                    ] = sched_ids[write_mask]
+                if subst_tok_idx.size > 0:
+                    async_subst = (subst_tok_idx, tok_pre_idx[subst_tok_idx])
+                else:
+                    pre_async = None
+            else:
+                self.input_batch.token_ids_cpu[
+                    req_indices[known], positions_np[known]
+                ] = sched_ids[known]
+                pre_async = None
+        else:
+            pre_async = None
+        debug_tok0_out = (
+            self._record_engram_debug_tokens(req_indices, positions_np, known)
+            if envs.TPU_DEEPSEEK_V41_ENGRAM_DEBUG_VERIFY
+            else None
+        )
         fn(
             self.input_batch.token_ids_cpu,
             req_indices,
             positions_np,
             known,
             layout_plan.global_padded_num_tokens,
+            pre_async=pre_async,
+            async_subst=async_subst,
+            debug_tok0_out=debug_tok0_out,
         )
 
     def _prepare_inputs(
@@ -3357,12 +3480,16 @@ class TPUModelRunner(GPUModelRunner):
         # model forward below receives this result explicitly as
         # num_tokens_across_dp, so set_forward_context does not run a second
         # DP synchronization.
+        local_skipped = (
+            1 if (local_num_tokens > 0 and local_ced_tokens < local_num_tokens) else 0
+        )
         t = torch.tensor(
             [
                 int(local_num_tokens),
                 int(local_num_chunks),
                 int(local_num_reqs),
                 int(local_ced_tokens),
+                int(local_skipped),
             ],
             dtype=torch.int64,
             device="cpu",
@@ -3378,15 +3505,25 @@ class TPUModelRunner(GPUModelRunner):
         # second collective.
         self._dp_step_max_reqs = int(t[2].item())
         ced_raw = int(t[3].item())
+        any_skipped = int(t[4].item()) > 0
         if num_chunks > 1:
-            self._dp_ced_decoder_bucket = bucket
+            dec_bucket = bucket
         elif ced_raw <= 0:
-            self._dp_ced_decoder_bucket = 0
+            dec_bucket = 0
         else:
-            self._dp_ced_decoder_bucket = min(
+            dec_bucket = min(
                 bucket,
                 _get_padded_token_len(self.num_tokens_paddings, ced_raw),
             )
+        hybrid_ced = (
+            inner is not None
+            and getattr(inner, "full_stage", None) is not None
+            and getattr(inner, "encoder_stage", None) is not None
+        )
+        if hybrid_ced and dec_bucket > 0 and (any_skipped or num_chunks > 1):
+            self._dp_ced_decoder_bucket = -dec_bucket
+        else:
+            self._dp_ced_decoder_bucket = dec_bucket
         if inner is not None:
             inner._dp_ced_decoder_bucket = self._dp_ced_decoder_bucket
         return bucket, num_chunks
@@ -5434,6 +5571,7 @@ class TPUModelRunner(GPUModelRunner):
             dtype=self._hidden_states_dtype,
         ).to(self.device)
 
+    @torch.no_grad()
     def _precompile_compute_selected_logits(self) -> None:
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_selected_logits"):
@@ -5452,6 +5590,7 @@ class TPUModelRunner(GPUModelRunner):
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
 
+    @torch.no_grad()
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_logits_from_hidden_states"):
@@ -5508,12 +5647,13 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_sample_from_logits(self) -> None:
         with self._precompile_timed("sample_from_logits"):
+            sampling_generator = self._get_sampling_generator()
             for num_reqs in self.num_reqs_paddings:
                 dummy_logits = self._dummy_logits(num_reqs)
                 dummy_temperatures = torch.ones(
                     (num_reqs, 1), dtype=self._hidden_states_dtype
                 ).to(self.device)
-                dummy_u = torch.rand_like(dummy_logits)
+                dummy_u = torch.rand_like(dummy_logits, generator=sampling_generator)
                 dummy_top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(
                     self.device
                 )
@@ -5531,6 +5671,8 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
+            sampling_generator.manual_seed(int(self.model_config.seed or 0))
+            synchronize_device()
 
     def _precompile_gather_logprobs(self) -> None:
         with self._precompile_timed("gather_logprobs"):
@@ -5580,6 +5722,7 @@ class TPUModelRunner(GPUModelRunner):
                 out = self.gather_logprobs(self._dummy_logits(num_tokens), row_tokens)
                 synchronize_tensors(out.logprobs)
 
+    @torch.no_grad()
     def _precompile_substitute_placeholder_token(self) -> None:
         if not self.scheduler_config.async_scheduling:
             return
@@ -5785,6 +5928,8 @@ class TPUModelRunner(GPUModelRunner):
         with self.maybe_setup_dummy_loras(self.lora_config):
             with self._precompile_timed("model backbone"):
                 self._precompile_backbone()
+            with self._precompile_timed("staged block-table uploads"):
+                precompile_staged_block_table_uploads(self)
             inner_model = getattr(self.model, "model", None)
             if hasattr(inner_model, "precompile_ced_helpers"):
                 with self._precompile_timed("CED gather/scatter helpers"):
@@ -5926,24 +6071,39 @@ class TPUModelRunner(GPUModelRunner):
         one executable per bucket either way (see
         vllm_torchtpu.compilation.shape_variants).
         """
+        inner = getattr(self.model, "model", None)
+        hybrid_ced = (
+            inner is not None
+            and getattr(inner, "full_stage", None) is not None
+            and getattr(inner, "encoder_stage", None) is not None
+        )
         with shape_variants.warmup() as buckets:
             for num_tokens in self.num_tokens_paddings:
                 logger.info("  -- num_tokens: %d", num_tokens)
                 if buckets.needs_retrace(num_tokens):
                     shape_variants.retrace(self.model, self.vllm_config)
-                self._dummy_run(
-                    num_tokens,
-                    self.num_reqs_max_model_len,
-                    self.max_num_blocks_per_req,
-                    use_max_model_len=True,
-                )
-                if self.most_model_len is not None:
-                    self._dummy_run(
-                        num_tokens,
-                        self.num_reqs_most_model_len,
-                        self.num_blocks_per_most_len_req,
-                        use_max_model_len=False,
-                    )
+                hide_full_steps = (True, False) if hybrid_ced else (False,)
+                saved_full_stage = getattr(inner, "full_stage", None)
+                for hide_full in hide_full_steps:
+                    if hide_full and inner is not None:
+                        inner.full_stage = None
+                    try:
+                        self._dummy_run(
+                            num_tokens,
+                            self.num_reqs_max_model_len,
+                            self.max_num_blocks_per_req,
+                            use_max_model_len=True,
+                        )
+                        if self.most_model_len is not None:
+                            self._dummy_run(
+                                num_tokens,
+                                self.num_reqs_most_model_len,
+                                self.num_blocks_per_most_len_req,
+                                use_max_model_len=False,
+                            )
+                    finally:
+                        if inner is not None and saved_full_stage is not None:
+                            inner.full_stage = saved_full_stage
             if buckets.refused:
                 # A refusal that no trace picked up leaves a raising closure in
                 # the live graph, which would surface as a failed request. Fail
