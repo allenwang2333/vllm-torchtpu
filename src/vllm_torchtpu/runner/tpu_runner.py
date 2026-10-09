@@ -2323,6 +2323,11 @@ class TPUModelRunner(GPUModelRunner):
             return
         current_req_ids = set(self.input_batch.req_ids[: self.input_batch.num_reqs])
         previous_req_ids = self._pre_async_results.req_id_to_index_copy
+        if not previous_req_ids:
+            # The previous step sampled nothing (only partial prefill chunks),
+            # so there is nothing to commit and no reason to block on its copy.
+            self._pre_async_results = None
+            return
         if any(req_id in current_req_ids for req_id in previous_req_ids):
             return
         self._modify_prev_results()
@@ -2462,6 +2467,8 @@ class TPUModelRunner(GPUModelRunner):
         # below. None/absent -> 0 drafts (non-spec or a non-spec mixed chunk).
         pre_num_draft_per_req = self._pre_async_results.num_draft_per_req
 
+        if not pre_request_seq_lens:
+            return
         pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
         assert pre_next_tokens_cpu is not None
 
