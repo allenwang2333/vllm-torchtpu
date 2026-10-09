@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_IMPL: str = "v1"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DSV41_STATIC_MOE_DIR: str = ""
+    TPU_DSV41_STATIC_MOE_URI: str = ""
     TPU_DEEPSEEK_V41_SP: bool = False
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
     TPU_K3_SP_PREFILL: bool = False
@@ -376,6 +377,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Model directory containing the offline native-FP4 MoE cache.
     "TPU_DSV41_STATIC_MOE_DIR": env_str("TPU_DSV41_STATIC_MOE_DIR", ""),
+    "TPU_DSV41_STATIC_MOE_URI": env_str("TPU_DSV41_STATIC_MOE_URI", ""),
     # Under V4.1 SP token-parallel FP8 attention, project q only for this
     # rank's token shard with an all-gathered wq_b and run wo_a for every
     # o_group on that shard, shrinking both attention all_to_alls.

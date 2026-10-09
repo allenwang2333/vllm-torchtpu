@@ -101,7 +101,10 @@ PATCH_RUNAI_GCS
 """
     command = command.replace(
         marker,
-        f"{runai_patch}export TPU_DSV41_STATIC_MOE_DIR={MODEL_MOUNT}\n{marker}",
+        (
+            f"{runai_patch}export TPU_DSV41_STATIC_MOE_DIR={MODEL_MOUNT}\n"
+            f"export TPU_DSV41_STATIC_MOE_URI={model_uri.rstrip('/')}\n{marker}"
+        ),
     )
     config_marker = "TENSOR_PARALLELISM=8"
     if command.count(config_marker) != 1:

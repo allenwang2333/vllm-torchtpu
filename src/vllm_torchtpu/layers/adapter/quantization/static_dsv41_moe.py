@@ -14,6 +14,8 @@ from safetensors import safe_open  # pyrefly: ignore[missing-import]
 from safetensors.torch import load  # pyrefly: ignore[missing-import]
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
+from vllm_torchtpu import envs
+
 
 def _sha256(path: Path) -> str:
     with path.open("rb") as stream:
@@ -134,7 +136,15 @@ def _load_grouped_layer(
         path = root / item["file"]
         if path.stat().st_size != item["bytes"]:
             raise ValueError(f"Static MoE shard size mismatch: {path}")
-        tensors = load(path.read_bytes())
+        if static_uri := envs.TPU_DSV41_STATIC_MOE_URI:
+            from vllm_torchtpu.model_loader_patches import (
+                _sharded_runai_weights_iterator,
+            )
+
+            uri = static_uri.rstrip("/") + "/" + item["file"]
+            tensors = dict(_sharded_runai_weights_iterator([uri], set(), False))
+        else:
+            tensors = load(path.read_bytes())
         if set(tensors) != set(shapes):
             raise ValueError(f"Unexpected static MoE tensors: {path}")
         for name, shape in shapes.items():
