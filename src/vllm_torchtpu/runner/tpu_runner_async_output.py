@@ -28,7 +28,9 @@ def parse_sampled_token_ids_cpu(
         rows = selected_token_ids.tolist()
         return rows, [1] * len(rows)
     rows = [
-        [t for t in row if t != INVALID_TOKEN_ID] if INVALID_TOKEN_ID in row else row
+        [t for t in row if t != INVALID_TOKEN_ID]
+        if (row[-1] == INVALID_TOKEN_ID or INVALID_TOKEN_ID in row)
+        else row
         for row in selected_token_ids.tolist()
     ]
     return rows, [len(row) for row in rows]
@@ -159,18 +161,25 @@ class AsyncTPUCopyState:
         length on the host (no device recompile).
         """
         if self._sampled_token_ids_cpu is None:
-            if self.chunk_shapes is not None:
-                trimmed = [
-                    (t.reshape(s) if t.shape != s else t)[:n]
-                    for t, s, n in zip(
-                        self.chunks_cpu, self.chunk_shapes, self.chunk_real_lens
-                    )
-                ]
+            if len(self.chunks_cpu) == 1:
+                t = self.chunks_cpu[0]
+                if self.chunk_shapes is not None:
+                    s = self.chunk_shapes[0]
+                    if t.shape != s:
+                        t = t.reshape(s)
+                self._sampled_token_ids_cpu = t[: self.chunk_real_lens[0]]
             else:
-                trimmed = [t[:n] for t, n in zip(self.chunks_cpu, self.chunk_real_lens)]
-            if len(trimmed) == 1:
-                self._sampled_token_ids_cpu = trimmed[0]
-            else:
+                if self.chunk_shapes is not None:
+                    trimmed = [
+                        (t.reshape(s) if t.shape != s else t)[:n]
+                        for t, s, n in zip(
+                            self.chunks_cpu, self.chunk_shapes, self.chunk_real_lens
+                        )
+                    ]
+                else:
+                    trimmed = [
+                        t[:n] for t, n in zip(self.chunks_cpu, self.chunk_real_lens)
+                    ]
                 self._sampled_token_ids_cpu = torch.cat(trimmed, dim=0)
         return self._sampled_token_ids_cpu
 

@@ -282,38 +282,74 @@ class SpeculativeDecodingManager:
                 group_indices=self._meta_cache.group_indices,
             )
 
-        # [num_reqs]
-        num_sampled_tokens = num_draft_tokens + 1
-
-        # Step 1. cu_num_sampled_tokens
-        cu_num_sampled_tokens = np.cumsum(num_sampled_tokens, dtype=np.int32)
-        cu_sampled_starts = cu_num_sampled_tokens - num_sampled_tokens
-
+        num_reqs = int(num_draft_tokens.shape[0])
         arange_cpu_np = self.runner.arange_np
 
-        rep_sampled_starts = np.repeat(cu_sampled_starts, num_sampled_tokens)
-        arange = arange_cpu_np[: rep_sampled_starts.shape[0]] - rep_sampled_starts
+        if num_reqs > 0 and (
+            num_reqs == 1
+            or (
+                num_draft_tokens[0] == num_draft_tokens[-1]
+                and bool((num_draft_tokens == num_draft_tokens[0]).all())
+            )
+        ):
+            k = int(num_draft_tokens[0])
+            s = np.int32(k + 1)
+            req_arange = arange_cpu_np[:num_reqs]
+            cu_sampled_starts = req_arange * s
+            cu_num_sampled_tokens = cu_sampled_starts + s
+            bonus_logits_indices = cu_num_sampled_tokens - np.int32(1)
+            logits_indices = (
+                (cu_num_scheduled_tokens - s)[:, None] + arange_cpu_np[: int(s)]
+            ).reshape(-1)
+            if k > 0:
+                slot_k = arange_cpu_np[:k]
+                group_indices = np.broadcast_to(slot_k, (num_reqs, k)).reshape(-1)
+                target_logits_indices = (cu_sampled_starts[:, None] + slot_k).reshape(
+                    -1
+                )
+                segment_ids = np.broadcast_to(
+                    req_arange.astype(np.int64)[:, None], (num_reqs, k)
+                ).reshape(-1)
+            else:
+                group_indices = np.empty(0, dtype=np.int32)
+                target_logits_indices = np.empty(0, dtype=np.int32)
+                segment_ids = np.empty(0, dtype=np.int64)
+        else:
+            # [num_reqs]
+            num_sampled_tokens = num_draft_tokens + 1
 
-        # Step 2. logits_indices for all tokens (draft + target)
-        logits_indices = np.repeat(
-            cu_num_scheduled_tokens - num_sampled_tokens, num_sampled_tokens
-        )
+            # Step 1. cu_num_sampled_tokens
+            cu_num_sampled_tokens = np.cumsum(num_sampled_tokens, dtype=np.int32)
+            cu_sampled_starts = cu_num_sampled_tokens - num_sampled_tokens
 
-        # Step 3. actual indices in the input batch
-        logits_indices += arange
+            rep_sampled_starts = np.repeat(cu_sampled_starts, num_sampled_tokens)
+            arange = arange_cpu_np[: rep_sampled_starts.shape[0]] - rep_sampled_starts
 
-        # Compute the bonus logits indices.
-        bonus_logits_indices = cu_num_sampled_tokens - 1
+            # Step 2. logits_indices for all tokens (draft + target)
+            logits_indices = np.repeat(
+                cu_num_scheduled_tokens - num_sampled_tokens, num_sampled_tokens
+            )
 
-        # Compute the target logits indices and within-segment group indices.
-        cu_draft_tokens = np.cumsum(num_draft_tokens, dtype=np.int32)
-        rep_draft_starts = np.repeat(
-            cu_draft_tokens - num_draft_tokens, num_draft_tokens
-        )
-        group_indices = arange_cpu_np[: rep_draft_starts.shape[0]] - rep_draft_starts
-        target_logits_indices = (
-            np.repeat(cu_sampled_starts, num_draft_tokens) + group_indices
-        )
+            # Step 3. actual indices in the input batch
+            logits_indices += arange
+
+            # Compute the bonus logits indices.
+            bonus_logits_indices = cu_num_sampled_tokens - 1
+
+            # Compute the target logits indices and within-segment group indices.
+            cu_draft_tokens = np.cumsum(num_draft_tokens, dtype=np.int32)
+            rep_draft_starts = np.repeat(
+                cu_draft_tokens - num_draft_tokens, num_draft_tokens
+            )
+            group_indices = (
+                arange_cpu_np[: rep_draft_starts.shape[0]] - rep_draft_starts
+            )
+            target_logits_indices = (
+                np.repeat(cu_sampled_starts, num_draft_tokens) + group_indices
+            )
+            segment_ids = np.repeat(
+                np.arange(num_reqs, dtype=np.int64), num_draft_tokens
+            )
 
         # The host indexing just below and the async device path both read
         # logits_indices[target_logits_indices + 1], the bonus slot must stay
@@ -337,72 +373,71 @@ class SpeculativeDecodingManager:
             self.runner.num_tokens_paddings, logits_indices.shape[0]
         )
 
-        padded_logits_indices = np.zeros(padded_logits_length, dtype=np.int32)
-        padded_logits_indices[: logits_indices.shape[0]] = logits_indices
-
-        padded_bonus_logits_indices = np.zeros(padded_num_reqs, dtype=np.int32)
-        padded_bonus_logits_indices[: bonus_logits_indices.shape[0]] = (
-            bonus_logits_indices
-        )
-
-        padded_num_draft_tokens = np.zeros(padded_num_reqs, dtype=np.int32)
-        padded_num_draft_tokens[: num_draft_tokens.shape[0]] = num_draft_tokens
-
-        padded_draft_token_ids = np.zeros(padded_logits_length, dtype=np.int32)
-        padded_draft_token_ids[: draft_token_ids.shape[0]] = draft_token_ids
-
-        padded_target_logits_indices = np.zeros(padded_logits_length, dtype=np.int32)
-        padded_target_logits_indices[: target_logits_indices.shape[0]] = (
+        # Pack all 6 int32 metadata arrays into a single contiguous 1D buffer
+        # so cache misses issue 1 int32 H2D transfer instead of 6.
+        l_len = padded_logits_length
+        r_len = padded_num_reqs
+        packed_int32 = np.zeros(4 * l_len + 2 * r_len, dtype=np.int32)
+        packed_int32[: draft_token_ids.shape[0]] = draft_token_ids
+        packed_int32[l_len : l_len + num_reqs] = num_draft_tokens
+        packed_int32[l_len + r_len : l_len + r_len + target_logits_indices.shape[0]] = (
             target_logits_indices
         )
+        packed_int32[
+            2 * l_len + r_len : 2 * l_len + r_len + bonus_logits_indices.shape[0]
+        ] = bonus_logits_indices
+        packed_int32[
+            2 * l_len + 2 * r_len : 2 * l_len + 2 * r_len + logits_indices.shape[0]
+        ] = logits_indices
+        packed_int32[
+            3 * l_len + 2 * r_len : 3 * l_len + 2 * r_len + group_indices.shape[0]
+        ] = group_indices
 
-        segment_ids = np.repeat(
-            np.arange(num_draft_tokens.shape[0], dtype=np.int64), num_draft_tokens
-        )
-
-        padded_segment_ids = np.full(
-            padded_logits_length, num_draft_tokens.shape[0], dtype=np.int64
-        )
+        padded_segment_ids = np.full(padded_logits_length, num_reqs, dtype=np.int64)
         padded_segment_ids[: segment_ids.shape[0]] = segment_ids
-
-        padded_group_indices = np.zeros(padded_logits_length, dtype=np.int32)
-        padded_group_indices[: group_indices.shape[0]] = group_indices
 
         # CPU -> TPU copy.
         device = self.runner.device
-
-        metadata = SpecDecodeMetadata(
-            draft_token_ids=torch.from_numpy(padded_draft_token_ids).to(
-                device, non_blocking=True
-            ),
-            draft_lengths=torch.from_numpy(padded_num_draft_tokens).to(
-                device, non_blocking=True
-            ),
-            draft_lengths_cpu=num_draft_tokens,
-            target_logits_indices=torch.from_numpy(padded_target_logits_indices).to(
-                device, non_blocking=True
-            ),
-            bonus_logits_indices=torch.from_numpy(padded_bonus_logits_indices).to(
-                device, non_blocking=True
-            ),
-            final_logits_indices=torch.from_numpy(padded_logits_indices).to(
-                device, non_blocking=True
-            ),
-            segment_ids=torch.from_numpy(padded_segment_ids).to(
-                device, non_blocking=True
-            ),
-            group_indices=torch.from_numpy(padded_group_indices).to(
-                device, non_blocking=True
-            ),
+        packed_dev = torch.from_numpy(packed_int32).to(device, non_blocking=True)
+        draft_token_ids_dev = packed_dev[:l_len]
+        draft_lengths_dev = packed_dev[l_len : l_len + r_len]
+        target_logits_indices_dev = packed_dev[l_len + r_len : 2 * l_len + r_len]
+        bonus_logits_indices_dev = packed_dev[2 * l_len + r_len : 2 * l_len + 2 * r_len]
+        final_logits_indices_dev = packed_dev[
+            2 * l_len + 2 * r_len : 3 * l_len + 2 * r_len
+        ]
+        group_indices_dev = packed_dev[3 * l_len + 2 * r_len :]
+        segment_ids_dev = torch.from_numpy(padded_segment_ids).to(
+            device, non_blocking=True
         )
-        # draft_lengths_cpu aliases the caller's array; copy so a later caller
-        # mutation can't diverge the cache from its key.
-        metadata.draft_lengths_cpu = num_draft_tokens.copy()
+
+        # Copy draft_lengths_cpu and store a separate SpecDecodeMetadata in
+        # _meta_cache so caller mutations (e.g. execute_model overwriting
+        # metadata.draft_token_ids) cannot corrupt the cached metadata.
+        cached_draft_lengths_cpu = num_draft_tokens.copy()
         self._meta_cache_key = cache_key
-        self._meta_cache = metadata
+        self._meta_cache = SpecDecodeMetadata(
+            draft_token_ids=draft_token_ids_dev,
+            draft_lengths=draft_lengths_dev,
+            draft_lengths_cpu=cached_draft_lengths_cpu,
+            target_logits_indices=target_logits_indices_dev,
+            bonus_logits_indices=bonus_logits_indices_dev,
+            final_logits_indices=final_logits_indices_dev,
+            segment_ids=segment_ids_dev,
+            group_indices=group_indices_dev,
+        )
         self._meta_cache_np = (
             logits_indices,
             target_logits_indices,
             padded_logits_length,
         )
-        return metadata
+        return SpecDecodeMetadata(
+            draft_token_ids=draft_token_ids_dev,
+            draft_lengths=draft_lengths_dev,
+            draft_lengths_cpu=cached_draft_lengths_cpu,
+            target_logits_indices=target_logits_indices_dev,
+            bonus_logits_indices=bonus_logits_indices_dev,
+            final_logits_indices=final_logits_indices_dev,
+            segment_ids=segment_ids_dev,
+            group_indices=group_indices_dev,
+        )
