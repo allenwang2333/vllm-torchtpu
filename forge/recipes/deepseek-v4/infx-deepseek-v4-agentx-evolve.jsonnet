@@ -64,6 +64,12 @@ local kvOffloadingSize = cdk.var('KV_OFFLOADING_SIZE', '24');
 local offloadControllerPort = cdk.numVar('OFFLOAD_CONTROLLER_PORT', 27801);
 local globalRegistryPort = cdk.numVar('GLOBAL_REGISTRY_PORT', 27800);
 local raidenJobName = cdk.var('RAIDEN_JOB_NAME', 'dsv4-offload-probe');
+// What vLLM does when a host-DRAM KV load fails (vLLM's default is fail). A Raiden load fails when a
+// block it matched is evicted before the load pins it; with fail the request ends with no output, and
+// since its blocks are never recomputed and re-offloaded, every later turn of that conversation fails
+// the same way: 54 of j-f0249689-77e1-4eed-ad7e's 72 empty responses were one conversation from turn 7
+// on. recompute reschedules the request to prefill the lost blocks.
+local kvLoadFailurePolicy = cdk.var('KV_LOAD_FAILURE_POLICY', 'recompute');
 
 // --- Routing -----------------------------------------------------------------
 // none is the default. vllm-router's consistent hash ignores load: in j-40fc278f-1b0e-474d-8e54 it
@@ -327,14 +333,14 @@ local offloadSetup = if !kvOffload then 'echo "Starting vLLM server (offload=OFF
     fi
     RAIDEN_CONTROLLER_PORT="@CONTROLLER_PORT@"
     export PYTHONHASHSEED=0
-    KVT='{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":'"${CPU_BYTES}"',"raiden_controller_port":'"${RAIDEN_CONTROLLER_PORT}"',"store_server_ip":"'"${HEAD_ADDR}"'","raiden_job_name":"@RAIDEN_JOB_NAME@"}}'
+    KVT='{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_load_failure_policy":"@KV_LOAD_FAILURE_POLICY@","kv_connector_extra_config":{"cpu_bytes_to_use":'"${CPU_BYTES}"',"raiden_controller_port":'"${RAIDEN_CONTROLLER_PORT}"',"store_server_ip":"'"${HEAD_ADDR}"'","raiden_job_name":"@RAIDEN_JOB_NAME@"}}'
     OFFLOAD_ARGS=(
       --enable-prompt-tokens-details
       --kv-transfer-config "$KVT"
     )
     echo "Starting vLLM server with TPURaidenOffloadingConnector enabled (cpu_bytes_to_use=${CPU_BYTES} per DP rank, controller_port=${RAIDEN_CONTROLLER_PORT}, head=${HEAD_ADDR})..."
   |||,
-  { SIZE: kvOffloadingSize, CONTROLLER_PORT: offloadControllerPort, GLOBAL_REGISTRY_PORT: globalRegistryPort, RAIDEN_JOB_NAME: raidenJobName }
+  { SIZE: kvOffloadingSize, CONTROLLER_PORT: offloadControllerPort, GLOBAL_REGISTRY_PORT: globalRegistryPort, RAIDEN_JOB_NAME: raidenJobName, KV_LOAD_FAILURE_POLICY: kvLoadFailurePolicy }
 );
 
 local serveArgs = [
