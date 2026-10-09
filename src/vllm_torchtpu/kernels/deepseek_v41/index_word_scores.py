@@ -25,6 +25,8 @@ ROW_WORDS = 128
 DIM = 128  # BF16 elements per key: two keys per word row
 SLOTS = ROW_WORDS // (DIM // 2)
 MAX_BLOCK_ROWS = 4096
+# Frozen dataclass: one instance is shared by every trace.
+_COMPILER_PARAMS = pltpu.CompilerParams(dimension_semantics=("parallel", "parallel"))
 
 
 def _bf16(bits: jax.Array) -> jax.Array:
@@ -98,9 +100,7 @@ def score_word_rows(
         out_specs=pl.BlockSpec((group_tokens, 1, keys), lambda i, j: (i, 0, j)),
         out_shape=jax.ShapeDtypeStruct((tokens, 1, SLOTS * rows), jnp.float32),
         scratch_shapes=[pltpu.VMEM((keys, ROW_WORDS), jnp.int32)],
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "parallel")
-        ),
+        compiler_params=_COMPILER_PARAMS,
         interpret=interpret,
         name="dsv41_index_word_scores",
     )(q, weights, words).reshape(tokens, SLOTS * rows)

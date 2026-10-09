@@ -25,6 +25,14 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 
+# Frozen dataclass: one instance is shared by every trace. Untiled operands
+# (`use_tc_tiling_on_sc=False`) let the gather request 32-word rope rows.
+_COMPILER_PARAMS = pltpu.CompilerParams(
+    use_tc_tiling_on_sc=False,
+    needs_layout_passes=True,
+    disable_bounds_checks=True,
+)
+
 
 def main_kernel(
     nope_in_hbm_ref: Any,
@@ -256,12 +264,11 @@ def csa_gather(
     num_cores = sc_info.num_cores * sc_info.num_subcores
     row_subchunk_size = num_simd_lanes
 
-    if num_valid_indices is None:
-        valid_indices = jnp.full((row_subchunk_size,), out_size, dtype=jnp.int32)
-    else:
-        valid_indices = jnp.full(
-            (row_subchunk_size,), num_valid_indices, dtype=jnp.int32
-        )
+    valid_indices = jnp.full(
+        (row_subchunk_size,),
+        out_size if num_valid_indices is None else num_valid_indices,
+        dtype=jnp.int32,
+    )
 
     # `num_streams` independent `pl.Indirect` gathers are issued per
     # pipeline step to keep multiple gather DMAs in flight.
@@ -315,11 +322,7 @@ def csa_gather(
         # One DMA semaphore per stream for the direct nope gather-buffer -> HBM
         # copies issued in `main_kernel`.
         scratch_types=(pltpu.SemaphoreType.DMA((num_streams,)),),
-        compiler_params=pltpu.CompilerParams(
-            use_tc_tiling_on_sc=False,
-            needs_layout_passes=True,
-            disable_bounds_checks=True,
-        ),
+        compiler_params=_COMPILER_PARAMS,
         mesh=vector_mesh,
         name="sc_csa_gather",
     )(nope_cache, rope_cache, indices, valid_indices)

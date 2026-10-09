@@ -300,7 +300,7 @@ def get_tuned_block_sizes(
             max_model_len
         ]
     except KeyError:
-        print("Couldn`t find tuned sizes for the RPA v3 kernel with %s", keys)
+        logger.warning("Couldn't find tuned sizes for the RPA v3 kernel with %s", keys)
 
     return (min(pages_per_seq, bkv_p), min(max_num_tokens, bq))
 
@@ -315,6 +315,8 @@ def get_lookup_keys(
     max_model_len,
 ):
     """Get the lookup keys for tuned block sizes."""
+    # `get_simplified_raw_key` already rounds page_size and max_model_len to
+    # powers of two, and `next_power_of_2` is idempotent on them.
     (
         page_size,
         q_dtype_name,
@@ -335,10 +337,10 @@ def get_lookup_keys(
 
     return (
         get_device_name(),
-        next_power_of_2(page_size),
+        page_size,
         f"q_{q_dtype_name}_kv_{kv_dtype_name}",
         f"q_head-{num_q_heads}_kv_head-{num_kv_heads}_head-{head_dim}",
-        next_power_of_2(max_model_len),
+        max_model_len,
     )
 
 
