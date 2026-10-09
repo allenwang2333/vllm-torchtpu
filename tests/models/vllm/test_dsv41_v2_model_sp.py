@@ -196,16 +196,16 @@ def test_has_cpu_offloaded_engram():
         layers=[
             SimpleNamespace(engram=None),
             SimpleNamespace(
-                engram=SimpleNamespace(embed_tokens=SimpleNamespace(cpu_offload=False))
+                engram=SimpleNamespace(embed_tokens=SimpleNamespace(host_offload=False))
             ),
             SimpleNamespace(
-                engram=SimpleNamespace(embed_tokens=SimpleNamespace(cpu_offload=True))
+                engram=SimpleNamespace(embed_tokens=SimpleNamespace(host_offload=True))
             ),
         ],
     )
     assert v2_model.DeepseekV41Model._has_cpu_offloaded_engram(model) is True
 
-    model.layers[2].engram.embed_tokens.cpu_offload = False
+    model.layers[2].engram.embed_tokens.host_offload = False
     assert v2_model.DeepseekV41Model._has_cpu_offloaded_engram(model) is False
 
 
@@ -410,7 +410,7 @@ def test_model_forward_full_and_ced_paths(monkeypatch: pytest.MonkeyPatch):
     class _FakeModel:
         def __init__(self):
             self._ced_enabled = False
-            self.use_mega_moe = False
+            self.use_native_mega_moe = False
             self.use_sequence_parallel = False
             self.config = SimpleNamespace(hidden_size=16)
             self._ced_window = 4
@@ -444,9 +444,9 @@ def test_model_forward_full_and_ced_paths(monkeypatch: pytest.MonkeyPatch):
     ids = torch.arange(4, dtype=torch.int32)
     pos = torch.arange(4, dtype=torch.int32)
 
-    # 1. offload_engram = True with use_mega_moe = True
+    # 1. offload_engram = True with use_native_mega_moe = True
     model._has_cpu_offloaded_engram = lambda: True
-    model.use_mega_moe = True
+    model.use_native_mega_moe = True
     out_full = v2_model.DeepseekV41Model.forward(model, ids, pos)
     assert out_full.shape == (4, 16)
 
@@ -517,9 +517,9 @@ def test_model_forward_full_and_ced_paths(monkeypatch: pytest.MonkeyPatch):
     assert out_cpu.shape == (4, 16)
     assert len(synced) == 0
 
-    # 6. offload_engram = False with use_mega_moe = False
+    # 6. offload_engram = False with use_native_mega_moe = False
     model._has_cpu_offloaded_engram = lambda: False
-    model.use_mega_moe = False
+    model.use_native_mega_moe = False
     out_no_offload = v2_model.DeepseekV41Model.forward(model, ids, pos)
     assert out_no_offload.shape == (4, 16)
 
@@ -556,7 +556,7 @@ def test_forward_stage_decoder_and_encoder_paths(monkeypatch: pytest.MonkeyPatch
         start_layer=0,
         end_layer=4,
         _stage_uses_sequence_parallel=lambda stage: False,
-        use_mega_moe=False,
+        use_native_mega_moe=False,
         _prepare_engram=lambda *a, **kw: (None, None),
         aux_hidden_state_layers=set(),
         layers=[_FakeCallableLayer() for _ in range(4)],
@@ -672,7 +672,7 @@ def test_forward_stage_pipeline_parallel_and_aux_hidden_states(
         start_layer=0,
         end_layer=2,
         _stage_uses_sequence_parallel=lambda stage: True,
-        use_mega_moe=True,
+        use_native_mega_moe=True,
         _prepare_engram=lambda *a, **kw: (None, None),
         aux_hidden_state_layers={1, 2},
         layers=[_FakeAuxLayer(), _FakeAuxLayer()],

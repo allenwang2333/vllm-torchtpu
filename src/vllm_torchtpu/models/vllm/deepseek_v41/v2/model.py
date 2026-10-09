@@ -302,16 +302,23 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         last_embed = engrams[-1].embed_tokens
         key = (
             engrams,
-            getattr(first_embed, "cpu_offload", False),
+            getattr(
+                first_embed, "host_offload", getattr(first_embed, "cpu_offload", False)
+            ),
             getattr(first_embed, "host_dma", False),
-            getattr(last_embed, "cpu_offload", False),
+            getattr(
+                last_embed, "host_offload", getattr(last_embed, "cpu_offload", False)
+            ),
             getattr(last_embed, "host_dma", False),
         )
         cached = getattr(self, "_engram_offload_flags_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
         has_cpu_offload = any(
-            getattr(engram.embed_tokens, "cpu_offload", False)
+            (
+                getattr(engram.embed_tokens, "host_offload", False)
+                or getattr(engram.embed_tokens, "cpu_offload", False)
+            )
             and getattr(engram.embed_tokens, "host_dma", False) is not True
             for engram in engrams
         )
@@ -632,7 +639,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         if offload_engram:
             input_ids_prep = (
                 input_ids.to(torch.int64)
-                if self.use_mega_moe
+                if getattr(
+                    self, "use_native_mega_moe", getattr(self, "use_mega_moe", False)
+                )
                 and input_ids is not None
                 and input_ids.device.type == "cpu"
                 else input_ids
@@ -848,7 +857,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        if self.use_mega_moe:
+        if getattr(self, "use_native_mega_moe", getattr(self, "use_mega_moe", False)):
             input_ids = input_ids.to(torch.int64)
 
         skip_lookup = getattr(self, "_engram_prepared_outside_stage", False) or (

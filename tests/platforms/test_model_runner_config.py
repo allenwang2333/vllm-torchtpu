@@ -25,9 +25,11 @@ def _config(device="tpu", method=None, pcp=1):
         enable_batch_sharded_sampling=False,
         enable_dbo=False,
         enable_elastic_ep=False,
+        use_ubatching=False,
     )
     config.cache_config = CacheConfig()
     config.compilation_config = CompilationConfig(mode=CompilationMode.NONE)
+    config.attention_config = SimpleNamespace(hisparse_config=None)
     config.speculative_config = (
         None
         if method is None
@@ -74,7 +76,7 @@ def test_native_v1_validation_uses_tpu_capabilities(device, method, pcp, reason)
     "feature,reason",
     [
         ("adaptive", "adaptive draft verification"),
-        ("dflash2", "dflash2 drafts"),
+        ("dflash2", r"(?:dflash2 drafts|DFlash candidate-head drafts)"),
         ("diffusion", "diffusion models"),
         ("batch_sharded", "batch-sharded sampling"),
     ],

@@ -386,7 +386,7 @@ class TestParallelEngramEmbedding:
             kwargs["cpu_offload"] = init_arg
 
         emb = common_engram.ParallelEngramEmbedding(100, 32, (10, 10), **kwargs)
-        assert emb.cpu_offload is expected_offload
+        assert emb.host_offload is expected_offload
         assert getattr(emb.weight, "dummy_weight_value", None) == 1.0
         if emb.weight_scale_inv is not None:
             assert getattr(emb.weight_scale_inv, "dummy_weight_value", None) == 127
@@ -600,14 +600,14 @@ class TestEngramModule:
         )
 
         # 1. cpu_offload is False
-        engram.embed_tokens = SimpleNamespace(cpu_offload=False)
+        engram.embed_tokens = SimpleNamespace(host_offload=False)
         common_engram.Engram._init_staging(engram, 16, 32)
         mock_super_init.assert_called_once_with(16, 32)
         assert engram._staged_raw is None
 
         # 2. cpu_offload is True
         engram.embed_tokens = SimpleNamespace(
-            cpu_offload=True, part_n_hash_cols=2, block_size=16
+            host_offload=True, part_n_hash_cols=2, block_size=16
         )
         common_engram.Engram._init_staging(engram, 16, 32)
         assert engram._staged_raw is not None
@@ -620,7 +620,7 @@ class TestEngramModule:
         def make_engram(cpu_offload: bool):
             engram = object.__new__(common_engram.Engram)
             mock_emb = MagicMock()
-            mock_emb.cpu_offload = cpu_offload
+            mock_emb.host_offload = cpu_offload
             mock_emb.part_n_hash_cols = cols
             mock_emb.block_size = block_size
             mock_emb.dim = dim
@@ -695,7 +695,7 @@ class TestEngramModule:
 
         # 2. staged -> unpacks and dequants
         mock_emb = MagicMock()
-        mock_emb.cpu_offload = True
+        mock_emb.host_offload = True
         mock_emb.part_n_hash_cols = cols
         mock_emb.block_size = block_size
         mock_emb.dim = dim
@@ -1048,3 +1048,35 @@ class TestV2Engram:
         assert set(v2_engram.__all__) == expected_exports
         for name in expected_exports:
             assert hasattr(v2_engram, name)
+
+
+def test_common_engram_v030_v031_import_fallback():
+    """Verify common/engram.py imports engram symbols under both runtimes.
+
+    Supports v0.31 (common.engram) and v0.30 (nvidia.engram).
+    """
+    import importlib
+    import sys
+    from types import ModuleType
+
+    # 1. v0.31 runtime scenario: common.engram exports symbols
+    mock_common = ModuleType("vllm.models.deepseek_v41.common.engram")
+    mock_common.engram_gathered_num_tokens = "mock_gathered_tokens_v031"
+    mock_common.engram_head_shard_rank = "mock_shard_rank_v031"
+    orig_common = sys.modules.get("vllm.models.deepseek_v41.common.engram")
+    sys.modules["vllm.models.deepseek_v41.common.engram"] = mock_common
+    try:
+        importlib.reload(common_engram)
+        assert common_engram.engram_gathered_num_tokens == "mock_gathered_tokens_v031"
+        assert common_engram.engram_head_shard_rank == "mock_shard_rank_v031"
+    finally:
+        if orig_common is not None:
+            sys.modules["vllm.models.deepseek_v41.common.engram"] = orig_common
+        else:
+            sys.modules.pop("vllm.models.deepseek_v41.common.engram", None)
+
+    # 2. v0.30 runtime scenario: restore normal environment and reload
+    # (nvidia.engram fallback)
+    importlib.reload(common_engram)
+    assert hasattr(common_engram, "engram_gathered_num_tokens")
+    assert hasattr(common_engram, "engram_head_shard_rank")

@@ -343,6 +343,7 @@ def test_all_env_builders_and_caching_100pct(monkeypatch):
     for fn in envs.environment_variables.values():
         fn()
     assert "TPU_DEEPSEEK_V41_FUSED_SWA" in dir(envs)
+    assert "TPU_RECLAIM_COMPILE_MEMORY" in dir(envs)
     with pytest.raises(AttributeError):
         _ = envs.NON_EXISTENT_ENV_KNOB
 
@@ -350,5 +351,6 @@ def test_all_env_builders_and_caching_100pct(monkeypatch):
     try:
         envs.enable_envs_cache()
         assert envs.TPU_DEEPSEEK_V41_FUSED_SWA is True
+        assert envs.TPU_RECLAIM_COMPILE_MEMORY is False
     finally:
         envs.__getattr__ = orig_getattr

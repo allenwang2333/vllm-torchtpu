@@ -856,7 +856,7 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         )
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         if (
             get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
             is VllmKVCacheLayout.LBHNC

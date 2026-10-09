@@ -51,9 +51,11 @@ class TpuDpScheduler(AsyncScheduler):
         elif not self._drain_prefill:
             return self._schedule_paused_new()
 
-        if self._drain_prefill and not (self.waiting or self.skipped_waiting):
+        waiting_drain = self.waiting or getattr(
+            self, "kv_holding_waiting", getattr(self, "skipped_waiting", None)
+        )
+        if not waiting_drain:
             # In drain mode until all accumulated prefills are scheduled.
             self._drain_prefill = False
-        if self._drain_prefill:
-            return super().schedule(False)
-        return self._schedule_paused_new()
+            return self._schedule_paused_new()
+        return super().schedule(False)

@@ -346,7 +346,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        if self.use_mega_moe:
+        if getattr(self, "use_native_mega_moe", getattr(self, "use_mega_moe", False)):
             input_ids = input_ids.to(torch.int64)
 
         # Engram n-gram hashes for the whole (flattened) batch, computed once
