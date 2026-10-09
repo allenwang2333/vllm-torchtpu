@@ -130,7 +130,7 @@ case "${JOB_NAME}" in
   pp8-tp2-2node)
     # 6a. Multi-host PP8 x TP2 Pure TP (16 cores across 2 hosts, 2 chips per stage, no --ep) - GSM8K + prefill/serving sweep
     run_or_print cdk job create \
-      "${REPO_DIR}/scripts/pp_tp_qwen35/multihost-mp-generic-bench.yaml" \
+      vllm-torchtpu-pp-tp-two-node-mp-bench \
       DOCKER_IMAGE="${DOCKER_IMAGE}" \
       MODEL_ID="${MODEL_ID}" \
       ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
@@ -146,7 +146,7 @@ case "${JOB_NAME}" in
   pp8-tp2-ep2-2node)
     # 6b. Multi-host PP8 x TP2 + EP2 (16 cores across 2 hosts, 2 chips per stage, --enable-expert-parallel) - GSM8K + prefill/serving sweep
     run_or_print cdk job create \
-      "${REPO_DIR}/scripts/pp_tp_qwen35/multihost-mp-generic-bench.yaml" \
+      vllm-torchtpu-pp-tp-two-node-mp-bench \
       DOCKER_IMAGE="${DOCKER_IMAGE}" \
       MODEL_ID="${MODEL_ID}" \
       ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
@@ -162,7 +162,7 @@ case "${JOB_NAME}" in
   pp8-pcp2-2node)
     # 7. Multi-host PP8 x PCP2 baseline (16 cores across 2 hosts, 2 chips per stage) - GSM8K + prefill/serving sweep
     run_or_print cdk job create \
-      "${REPO_DIR}/scripts/pp_tp_qwen35/multihost-mp-generic-bench.yaml" \
+      vllm-torchtpu-pp-tp-two-node-mp-bench \
       DOCKER_IMAGE="${DOCKER_IMAGE}" \
       MODEL_ID="${MODEL_ID}" \
       ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=1 MOE_FUSED_EP_KERNEL_IMPL=v2" \
