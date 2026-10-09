@@ -268,12 +268,10 @@ spec:
                     done
                     echo "vllm-server is up after ${elapsed}s!"
 
-                    # Run bench container in pure CPU client mode without loading torchtpu/libtpu
-                    unset PYTHONPATH
-                    export VLLM_PLUGINS=""
-                    export VLLM_TARGET_DEVICE=empty
-                    export JAX_PLATFORMS=cpu
-                    export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+                    SITEDIR=/tmp/torchtpu-bench-sitecustomize
+                    mkdir -p "${SITEDIR}"
+                    printf "from torch_tpu import _loader\n_loader._init_device_impl(\"tpu\")\n" > "${SITEDIR}/sitecustomize.py"
+                    export PYTHONPATH="${SITEDIR}:${PYTHONPATH:-}"
 
                     if [ -f "/workspace/vllm-torchtpu/scripts/pp_tp_qwen35/run_qwen35_probes.py" ]; then
                       echo "Running deterministic greedy needle & reasoning probes..."
@@ -301,7 +299,6 @@ spec:
                         --max-concurrency "${CONC}" \
                         --request-rate inf \
                         --ignore-eos \
-                        --temperature=0 \
                         --percentile-metrics ttft,tpot,itl,e2el
                     done
 
