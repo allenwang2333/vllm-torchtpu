@@ -245,3 +245,84 @@ def test_shards_when_everything_lines_up(monkeypatch):
 
     assert mod.shard_group_or_none(3584) is group
     assert mod.shard_group_or_none(7168) is group
+
+
+def test_warn_once_and_make_latent_projection_and_forward(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
+
+    # Exercise _warn_once both when _warned is False and when _warned is True.
+    monkeypatch.setattr(mod, "_warned", False)
+    mod._warn_once("first warning %d", 1)
+    assert mod._warned is True
+    mod._warn_once("second warning %d", 2)
+
+    # Stub ColumnParallelLinear.__init__ and ReplicatedLinear.__init__ for CPU tests.
+    def _fake_col_init(
+        self,
+        input_size,
+        output_size,
+        *,
+        bias=True,
+        gather_output=False,
+        quant_config=None,
+        prefix="",
+        return_bias=True,
+        tp_rank=0,
+        tp_size=1,
+    ):
+        torch.nn.Module.__init__(self)
+        self.input_size = input_size
+        self.output_size = output_size
+        self.output_size_per_partition = output_size // tp_size
+        self.tp_size = tp_size
+        self.bias = torch.nn.Parameter(torch.ones(self.output_size_per_partition))
+        self.skip_bias_add = False
+        self.quant_method = SimpleNamespace(
+            apply=lambda layer, x, b: x[:, : layer.output_size_per_partition]
+            + (0.0 if b is None else b)
+        )
+
+    def _fake_rep_init(
+        self, input_size, output_size, *, bias=True, quant_config=None, prefix=""
+    ):
+        torch.nn.Module.__init__(self)
+        self.input_size = input_size
+        self.output_size = output_size
+
+    monkeypatch.setattr(mod.ColumnParallelLinear, "__init__", _fake_col_init)
+    monkeypatch.setattr(mod.ReplicatedLinear, "__init__", _fake_rep_init)
+
+    # 1. make_latent_projection falls back to ReplicatedLinear when flag is False.
+    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_INTRA_CHIP_TP", False)
+    rep_layer = mod.make_latent_projection(
+        16, 8, bias=False, quant_config=None, prefix="rep"
+    )
+    assert isinstance(rep_layer, mod.ReplicatedLinear)
+
+    # 2. make_latent_projection builds IntraChipColumnParallelLinear when sharded.
+    class _GatherGroup(_FakeGroup):
+        def all_gather(self, tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
+            return torch.cat([tensor, tensor], dim=dim)
+
+    group = _GatherGroup(2, rank_in_group=0)
+    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_INTRA_CHIP_TP", True)
+    monkeypatch.setattr(mod, "get_intra_chip_group", lambda: group)
+
+    intra_layer = mod.make_latent_projection(
+        16, 8, bias=True, quant_config=None, prefix="intra"
+    )
+    assert isinstance(intra_layer, mod.IntraChipColumnParallelLinear)
+    assert "chip_tp_size=2" in intra_layer.extra_repr()
+
+    x = torch.zeros(3, 16)
+    out, out_bias = intra_layer.forward(x)
+    assert out.shape == (3, 8)
+    assert out_bias is None
+
+    intra_layer.skip_bias_add = True
+    out2, out_bias2 = intra_layer.forward(x)
+    assert out2.shape == (3, 8)
+    assert out_bias2 is intra_layer.bias

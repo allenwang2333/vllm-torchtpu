@@ -33,6 +33,9 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+_DEFAULT_LATENT_PROJ_INTRA_CHIP_TP: bool = envs.TPU_LATENT_PROJ_INTRA_CHIP_TP
+_ENVS_DICT = envs.__dict__
+
 _warned = False
 
 
@@ -106,7 +109,9 @@ def shard_group_or_none(output_size: int):
     off, the chip topology is unreadable, there is one core per chip, or the
     output does not divide evenly across the cores.
     """
-    if not envs.TPU_LATENT_PROJ_INTRA_CHIP_TP:
+    if not _ENVS_DICT.get(
+        "TPU_LATENT_PROJ_INTRA_CHIP_TP", _DEFAULT_LATENT_PROJ_INTRA_CHIP_TP
+    ):
         return None
 
     group = get_intra_chip_group()

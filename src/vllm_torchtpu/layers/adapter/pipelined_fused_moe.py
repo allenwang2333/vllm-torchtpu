@@ -28,6 +28,9 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+_DEFAULT_MOE_COLLECTION_CHUNK_SIZE: int = envs.TPU_MOE_COLLECTION_CHUNK_SIZE
+_ENVS_DICT = envs.__dict__
+
 
 def enable_pipelined_collective_and_compute() -> bool:
     """Check whether collective communication and compute pipelining is enabled.
@@ -36,7 +39,12 @@ def enable_pipelined_collective_and_compute() -> bool:
         bool: True if `envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0`, False otherwise.
 
     """
-    return envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0
+    return (
+        _ENVS_DICT.get(
+            "TPU_MOE_COLLECTION_CHUNK_SIZE", _DEFAULT_MOE_COLLECTION_CHUNK_SIZE
+        )
+        > 0
+    )
 
 
 # Alias for alternative naming convention
@@ -106,7 +114,9 @@ def _log_active_chunk_pipeline() -> None:
         "MoE multi-chunk pipeline branch active: group=%s, world_size=%d, threshold=%d",
         collective_kind,
         parallel_size,
-        envs.TPU_MOE_COLLECTION_CHUNK_SIZE,
+        _ENVS_DICT.get(
+            "TPU_MOE_COLLECTION_CHUNK_SIZE", _DEFAULT_MOE_COLLECTION_CHUNK_SIZE
+        ),
     )
 
 
@@ -162,7 +172,9 @@ def pipelined_fused_moe_gmm(
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
     """
-    chunk_size = envs.TPU_MOE_COLLECTION_CHUNK_SIZE
+    chunk_size = _ENVS_DICT.get(
+        "TPU_MOE_COLLECTION_CHUNK_SIZE", _DEFAULT_MOE_COLLECTION_CHUNK_SIZE
+    )
     collective_group, _ = _get_moe_collective_group()
 
     seq_len = hidden_states.shape[0]
@@ -229,7 +241,7 @@ def pipelined_fused_moe_gmm(
             for i in range(num_chunks)
         ]
         if topk_weights is not None
-        else [None] * num_chunks
+        else None
     )
     ids_slices = (
         [
@@ -237,19 +249,19 @@ def pipelined_fused_moe_gmm(
             for i in range(num_chunks)
         ]
         if topk_ids is not None
-        else [None] * num_chunks
+        else None
     )
 
     # Prime pipeline with initial all-gather for chunk 0
     ag_hs_curr = collective_group.all_gather(hs_slices[0], dim=0)
     ag_tw_curr = (
         collective_group.all_gather(weights_slices[0], dim=0)
-        if weights_slices[0] is not None
+        if weights_slices is not None
         else None
     )
     ag_ti_curr = (
         collective_group.all_gather(ids_slices[0], dim=0)
-        if ids_slices[0] is not None
+        if ids_slices is not None
         else None
     )
 
@@ -260,17 +272,14 @@ def pipelined_fused_moe_gmm(
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
             ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
-            # Locals let the None checks below narrow; subscripts do not.
-            weights_next = weights_slices[i + 1]
             ag_tw_next = (
-                collective_group.all_gather(weights_next, dim=0)
-                if weights_next is not None
+                collective_group.all_gather(weights_slices[i + 1], dim=0)
+                if weights_slices is not None
                 else None
             )
-            ids_next = ids_slices[i + 1]
             ag_ti_next = (
-                collective_group.all_gather(ids_next, dim=0)
-                if ids_next is not None
+                collective_group.all_gather(ids_slices[i + 1], dim=0)
+                if ids_slices is not None
                 else None
             )
 

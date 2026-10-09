@@ -896,3 +896,25 @@ def test_pipelined_moe_four_stage_pipeline():
     assert len(ag_calls) == 12
     # 4 reduce_scatter calls
     assert len(rs_calls) == 4
+
+
+def test_simultaneous_pcp_and_dp_raises_not_implemented():
+    """Verify _get_moe_collective_group raises when both PCP and DP > 1."""
+    from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+        _get_moe_collective_group,
+    )
+
+    pcp_group = _MockCollectiveGroup(world_size=2, rank=0)
+    dp_group = _MockCollectiveGroup(world_size=2, rank=0)
+    with (
+        patch(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_pcp_group",
+            return_value=pcp_group,
+        ),
+        patch(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_dp_group",
+            return_value=dp_group,
+        ),
+        pytest.raises(NotImplementedError, match="simultaneous PCP"),
+    ):
+        _get_moe_collective_group()
