@@ -2,7 +2,7 @@
 """Normalize Qwen2.5-VL inputs on the vLLM 0.29 encoder graph paths."""
 
 from functools import wraps
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -16,6 +16,8 @@ def maybe_patch_qwen2_5_vl(model_config: "ModelConfig | None" = None) -> bool | 
 
     model_cls = Qwen2_5_VLForConditionalGeneration
     graph_forward = model_cls.encoder_cudagraph_forward
+    if getattr(graph_forward, "_tpu_qwen2_5_vl_norm_patch", False):
+        return None
     eager_forward = model_cls.encoder_eager_forward
 
     # vLLM 0.29 moves normalization from the processor to input_norm in
@@ -28,6 +30,8 @@ def maybe_patch_qwen2_5_vl(model_config: "ModelConfig | None" = None) -> bool | 
             "pixel_values": self.input_norm(values["pixel_values"], self.visual.dtype),
         }
         return graph_forward(self, values, path=path)
+
+    cast(Any, normalized_graph_forward)._tpu_qwen2_5_vl_norm_patch = True
 
     @wraps(eager_forward)
     def normalized_eager_forward(self, mm_kwargs, path="default"):

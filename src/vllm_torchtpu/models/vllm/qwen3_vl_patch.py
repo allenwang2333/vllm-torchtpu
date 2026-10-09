@@ -25,6 +25,7 @@ _torch_ops_lock = threading.RLock()
 _INT_CPU_FALLBACK_DTYPES = frozenset(
     {torch.int64, torch.int32, torch.int16, torch.bool}
 )
+_TPU_INT_BOOL_DTYPES = _INT_CPU_FALLBACK_DTYPES
 
 
 def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:
@@ -59,9 +60,10 @@ def _patched_masked_scatter_(
                 f"number of selected elements in mask ({num_indices})"
             )
         res = flat_self.clone()
-        res[indices] = flat_source[:num_indices].to(
-            dtype=self.dtype, device=self.device
-        )
+        src_slice = flat_source[:num_indices]
+        if src_slice.dtype != self.dtype or src_slice.device != self.device:
+            src_slice = src_slice.to(dtype=self.dtype, device=self.device)
+        res[indices] = src_slice
         self.copy_(res.reshape(self.shape))
         return self
     orig_fn = _orig_torch_ops.get(
@@ -87,9 +89,10 @@ def _patched_masked_scatter(
                 f"number of selected elements in mask ({num_indices})"
             )
         res = flat_input.clone()
-        res[indices] = flat_source[:num_indices].to(
-            dtype=input.dtype, device=input.device
-        )
+        src_slice = flat_source[:num_indices]
+        if src_slice.dtype != input.dtype or src_slice.device != input.device:
+            src_slice = src_slice.to(dtype=input.dtype, device=input.device)
+        res[indices] = src_slice
         return res.reshape(broadcast_input.shape)
     orig_fn = _orig_torch_ops.get("masked_scatter", torch.masked_scatter)
     return orig_fn(input, mask, source)
@@ -257,19 +260,22 @@ def _patch_qwen3_vl_get_rope_index(modeling) -> None:
                 bound.arguments[param_name] = fix_grid(bound.arguments[param_name])
 
         target_device_box = [None]
-        for k, v in list(bound.arguments.items()):
+        for k, v in bound.arguments.items():
             if k == "self":
                 continue
             bound.arguments[k] = to_cpu(v, target_device_box)
 
         call_args = bound.args[1:]
-        call_kwargs = {k: v for k, v in bound.kwargs.items() if k != "self"}
+        call_kwargs = (
+            {k: v for k, v in bound.kwargs.items() if k != "self"}
+            if "self" in bound.kwargs
+            else bound.kwargs
+        )
 
         with _scoped_qwen3_vl_torch_ops():
             res = _orig_get_rope_index(self, *call_args, **call_kwargs)
 
-        if target_device_box[0] is not None:
-            res = to_device(res, target_device_box[0])
+        res = to_device(res, target_device_box[0])
         return res
 
     patched_get_rope_index._tpu_qwen3_vl_rope_index_patch = True
@@ -383,10 +389,14 @@ def maybe_patch_qwen3_vl(model_config: Optional["ModelConfig"] = None) -> bool |
     try:
         import transformers.models.qwen3_vl.modeling_qwen3_vl as modeling
     except ImportError as e:
-        for mod_name, mod in sys.modules.items():
-            if "qwen3_vl" in mod_name and hasattr(mod, "Qwen3VLModel"):
-                modeling = mod
-                break
+        for mod_name, mod in list(sys.modules.items()):
+            if "qwen3_vl" in mod_name:
+                try:
+                    if hasattr(mod, "Qwen3VLModel"):
+                        modeling = mod
+                        break
+                except (AttributeError, ImportError):
+                    continue
         if modeling is None:
             logger.warning(
                 "Qwen3-VL model detected but transformers.models.qwen3_vl "

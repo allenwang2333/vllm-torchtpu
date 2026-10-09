@@ -77,7 +77,7 @@ _METADATA_PLANE = "/host:metadata"
 _HOST_CPU_PLANE = "/host:CPU"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Capture:
     """One worker's trace file."""
 
@@ -95,7 +95,7 @@ class Capture:
         return f"rank {self.rank}" if self.rank is not None else (f"file {self.slot}")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Session:
     """One capture session: every rank's trace from a single profile window."""
 
@@ -134,7 +134,8 @@ class Session:
         rank_set = {c.rank for c in self.captures if c.rank is not None}
         if not rank_set:
             return []
-        return [r for r in range(max(rank_set)) if r not in rank_set]
+        max_rank = max(rank_set)
+        return [r for r in range(max_rank) if r not in rank_set]
 
 
 def _varint(value: int) -> bytes:
@@ -158,7 +159,11 @@ def _delimited(field_number: int, payload: bytes) -> bytes:
     `_delimited(_XSPACE_PLANES_FIELD, plane.SerializeToString())` once per
     plane builds a valid XSpace without ever materialising one.
     """
-    tag = _varint((field_number << 3) | _WIRE_TYPE_LENGTH_DELIMITED)
+    tag = (
+        bytes([(field_number << 3) | _WIRE_TYPE_LENGTH_DELIMITED])
+        if field_number < 16
+        else _varint((field_number << 3) | _WIRE_TYPE_LENGTH_DELIMITED)
+    )
     return tag + _varint(len(payload)) + payload
 
 
