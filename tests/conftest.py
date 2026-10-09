@@ -14,6 +14,7 @@
 """Shared pytest configuration for all tests."""
 
 import os
+import shutil
 import sys
 
 # Keep TP collectives compiled in-graph (no graph break) for fullgraph TP.
@@ -152,22 +153,47 @@ def pytest_collection_finish(session):
     )
 
 
-def pytest_terminal_summary(terminalreporter):
-    """Report the size of the TorchTPU compilation cache, when one is set.
-
-    The PR TPU steps put it on the pod's or container's own disk (see
-    .buildkite/pipeline_tests*.yml), where too large a cache gets the pod
-    evicted; this line is how to see a step approaching that.
-    """
-    root = os.environ.get("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT")
-    if not root or not os.path.isdir(root):
-        return
-    count = size = 0
+def _cache_usage(root):
+    """(file count, total bytes, largest file bytes) under root."""
+    count = size = largest = 0
     for dirpath, _, filenames in os.walk(root):
         for name in filenames:
+            try:
+                nbytes = os.path.getsize(os.path.join(dirpath, name))
+            except OSError:  # removed while walking
+                continue
             count += 1
-            size += os.path.getsize(os.path.join(dirpath, name))
-    terminalreporter.write_line(
-        f"TorchTPU compilation cache: {count} programs, {size / 2**30:.2f} GiB "
-        f"in {root}"
-    )
+            size += nbytes
+            largest = max(largest, nbytes)
+    return count, size, largest
+
+
+def pytest_terminal_summary(terminalreporter):
+    """Report TorchTPU's compilation caches, when the step turns them on.
+
+    The PR TPU steps point the Tier-3 cache at the pod's or container's own
+    disk (see .buildkite/pipeline_tests*.yml), and TorchTPU then also keeps
+    every program in its Tier-2 cache under /dev/shm, which is memory. A cache
+    too large for either gets the pod evicted; these lines show how close a
+    step comes.
+    """
+    tier3 = os.environ.get("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT")
+    if not tier3:
+        return
+    gib, mib = 2**30, 2**20
+    for label, root in (
+        ("Tier-3, disk", tier3),
+        ("Tier-2, memory", "/dev/shm/torch_tpu_cache"),
+    ):
+        if not os.path.isdir(root):
+            terminalreporter.write_line(
+                f"TorchTPU compilation cache ({label}): none at {root}"
+            )
+            continue
+        count, size, largest = _cache_usage(root)
+        free = shutil.disk_usage(root).free
+        terminalreporter.write_line(
+            f"TorchTPU compilation cache ({label}): {count} programs, "
+            f"{size / gib:.2f} GiB, largest {largest / mib:.1f} MiB, "
+            f"{free / gib:.1f} GiB free on its filesystem ({root})"
+        )
