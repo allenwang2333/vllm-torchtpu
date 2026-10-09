@@ -790,3 +790,240 @@ def test_dsv41_cached_gate_slice_plan_and_nvfp4_unaligned_w4a8(monkeypatch):
         moe_config=SimpleNamespace(moe_parallel_config=SimpleNamespace(use_ep=True)),
     )
     assert nvfp4._prebuild_w4a8(nv_layer, "silu", 0) == (None, 0)
+
+
+def test_quantization_configs_base_methods():
+    from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
+
+    with pytest.raises(NotImplementedError, match="Subclasses must implement get_name"):
+        VllmQuantConfig.get_name()
+    cfg = VllmQuantConfig()
+    assert cfg.mesh is None
+
+
+def test_deepseek_v41_quant_and_moe_init(monkeypatch):
+    from vllm.models.deepseek_v4.nvidia import model as v4_upstream
+
+    from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import (
+        DeepseekV41MoE,
+        VllmDeepseekV41Fp8Config,
+    )
+
+    assert VllmDeepseekV41Fp8Config.get_name() == "deepseek_v41_fp8"
+
+    # 1. EPLB raises
+    vllm_cfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(enable_eplb=True),
+        kernel_config=SimpleNamespace(moe_backend="native"),
+    )
+    with pytest.raises(NotImplementedError, match="does not support EPLB"):
+        DeepseekV41MoE(vllm_cfg)
+
+    # 2. Mega MoE backend raises
+    vllm_cfg.parallel_config.enable_eplb = False
+    vllm_cfg.kernel_config.moe_backend = list(v4_upstream.MEGA_MOE_BACKENDS)[0]
+    with pytest.raises(NotImplementedError, match="requires the native V4 MoE backend"):
+        DeepseekV41MoE(vllm_cfg)
+
+    # 3. Successful init with v4_factory hook
+    vllm_cfg.kernel_config.moe_backend = "native"
+    created = []
+    monkeypatch.setattr(v4_upstream, "FusedMoEFactory", lambda **kw: created.append(kw))
+
+    from vllm.models.deepseek_v41.nvidia.model import DeepseekV4MoE as V41UpstreamMoE
+
+    def fake_super_init(self, cfg, *a, **kw):
+        torch.nn.Module.__init__(self)
+        v4_upstream.FusedMoEFactory(test=True)
+
+    monkeypatch.setattr(V41UpstreamMoE, "__init__", fake_super_init)
+    DeepseekV41MoE(vllm_cfg)
+    assert len(created) == 1
+    assert created[0]["apply_routed_scale_to_output"] is True
+    assert created[0]["gate"] is None
+
+
+def test_fp8_linear_and_moe_remaining_branches(monkeypatch):
+    # 1. fp8.py line 1301->1303: linear_quant_config is not None
+    cfg_non_ser = fp8.VllmFp8Config(is_checkpoint_fp8_serialized=False)
+    method_non_ser = fp8.VllmFp8LinearMethodTPU(cfg_non_ser)
+    method_non_ser._linear_quant_config = (
+        "float8_e4m3fn",
+        torch.float8_e4m3fn,
+        None,
+        False,
+    )
+    lyr = torch.nn.Module()
+    lyr.weight = torch.nn.Parameter(
+        torch.ones(16, 32, dtype=torch.bfloat16), requires_grad=False
+    )
+    method_non_ser.process_weights_after_loading(lyr)
+    assert lyr.weight.dtype == torch.float8_e4m3fn
+
+    # 2. fp8.py line 956->966: layer.w13_weight on CPU skips synchronize_tensors
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+        VllmFp8MoEMethodTPU,
+    )
+
+    moe_cfg = SimpleNamespace(
+        has_bias=False,
+        experts_per_token=2,
+        moe_parallel_config=SimpleNamespace(use_ep=False),
+    )
+    cfg_fp8 = fp8.VllmFp8Config(is_checkpoint_fp8_serialized=False)
+    method_moe = VllmFp8MoEMethodTPU(cfg_fp8, moe_cfg)
+    routed = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(routed)
+    routed.moe_config = moe_cfg
+    routed.activation = SimpleNamespace(value="silu")
+    routed.renormalize = True
+    routed.w13_weight = torch.nn.Parameter(
+        torch.ones(2, 64, 32, dtype=torch.bfloat16), requires_grad=False
+    )
+    routed.w2_weight = torch.nn.Parameter(
+        torch.ones(2, 32, 32, dtype=torch.bfloat16), requires_grad=False
+    )
+    monkeypatch.setattr(method_moe, "_prebuild_moe_ops", lambda *a, **k: None)
+    monkeypatch.setattr(
+        fp8.moe_routing, "register_experts_start_buffer", lambda *a, **k: None
+    )
+    # Ensure torch.nn.Parameter is the real one, so w13_weight is on CPU
+    monkeypatch.setattr(torch.nn, "Parameter", torch.nn.parameter.Parameter)
+    sync_called = []
+    monkeypatch.setattr(fp8, "synchronize_tensors", sync_called.append)
+    method_moe.process_weights_after_loading(routed)
+    assert len(sync_called) == 0  # skipped because CPU device != "tpu"
+
+
+def test_nvfp4_adaptive_fused_moe_branches(monkeypatch):
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    from vllm_torchtpu.layers.adapter.quantization import nvfp4
+    from vllm_torchtpu.layers.adapter.quantization.nvfp4 import (
+        VllmNvfp4MoEMethod,
+    )
+
+    class _LocalFakeRoutedExperts(RoutedExperts):
+        def __init__(self, num_experts=2, activation="silu", use_ep=False):
+            torch.nn.Module.__init__(self)
+            self.num_experts = num_experts
+            self.moe_config = SimpleNamespace(
+                has_bias=False,
+                is_act_and_mul=True,
+                experts_per_token=2,
+                moe_parallel_config=SimpleNamespace(use_ep=use_ep),
+            )
+            self.activation = SimpleNamespace(value=activation)
+
+    E, two_i, H, group_size = 2, 64, 64, 16
+    inter = two_i // 2
+    layer = _LocalFakeRoutedExperts(num_experts=E, activation="silu", use_ep=False)
+    layer.w13_weight = torch.nn.Parameter(
+        torch.randint(0, 256, (E, two_i, H // 2), dtype=torch.uint8),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.randint(0, 256, (E, H, inter // 2), dtype=torch.uint8),
+        requires_grad=False,
+    )
+    layer.w13_weight_scale = torch.nn.Parameter(
+        torch.ones(E, two_i, H // group_size, dtype=torch.float32),
+        requires_grad=False,
+    )
+    layer.w13_weight_scale_2 = torch.nn.Parameter(
+        torch.tensor([[2.0, 3.0], [4.0, 5.0]], dtype=torch.float32),
+        requires_grad=False,
+    )
+    layer.w2_weight_scale = torch.nn.Parameter(
+        torch.ones(E, H, inter // group_size, dtype=torch.float32),
+        requires_grad=False,
+    )
+    layer.w2_weight_scale_2 = torch.nn.Parameter(
+        torch.tensor([2.0, 4.0], dtype=torch.float32), requires_grad=False
+    )
+
+    method = VllmNvfp4MoEMethod(
+        SimpleNamespace(group_size=group_size),
+        SimpleNamespace(has_bias=False, is_act_and_mul=True),
+    )
+    monkeypatch.setattr(nvfp4.envs, "MOE_FUSED_EP_KERNEL_IMPL", "adaptive")
+
+    # 1. Reason is not None with adaptive moe raises ValueError (nvfp4.py line 428)
+    monkeypatch.setattr(
+        nvfp4.adaptive_moe,
+        "fused_moe_ep_unsupported_reason",
+        lambda *a, **kw: "invalid layout",
+    )
+
+    def fake_op(*a, **kw):
+        return None
+
+    monkeypatch.setattr(
+        nvfp4.adaptive_moe,
+        "prebuild_adaptive_nvfp4",
+        lambda *a, **kw: (fake_op, 32),
+    )
+    monkeypatch.setattr(
+        nvfp4,
+        "load_kmajor_fp4",
+        lambda t: torch.zeros(
+            t.shape[0], t.shape[-1] * 2, t.shape[1], dtype=torch.uint8
+        ),
+    )
+    monkeypatch.setattr(
+        nvfp4,
+        "requant_load_kmajor_fp4",
+        lambda w, s, b: (
+            torch.zeros(E, 64, 64, dtype=torch.uint8),
+            torch.zeros(E, 2, 1, 64, dtype=torch.float32),
+        ),
+    )
+    monkeypatch.setattr(
+        nvfp4,
+        "prebuild_fused_moe_kernel",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(
+        nvfp4,
+        "_prebuild_w4a8",
+        lambda *a: (fake_op, 32),
+    )
+    with pytest.raises(
+        ValueError, match="adaptive NVFP4 prepared weights: invalid layout"
+    ):
+        method.process_weights_after_loading(layer)
+
+    # 2. Reason is None with adaptive moe and op is not None (lines 429, 478, 482-494)
+    monkeypatch.setattr(
+        nvfp4.adaptive_moe,
+        "fused_moe_ep_unsupported_reason",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(
+        nvfp4.moe_routing,
+        "register_experts_start_buffer",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(
+        nvfp4.fused_moe_ep_bridge,
+        "register_score_bias_buffer",
+        lambda *a, **kw: None,
+    )
+    method.process_weights_after_loading(layer)
+    assert method._adaptive_fused_moe_op is fake_op
+    assert hasattr(layer, "_tpu_fused_w13_scale")
+    assert hasattr(layer, "_tpu_fused_w2_scale")
+
+    # 3. apply_monolithic with adaptive moe (nvfp4.py line 513)
+    ran_adaptive = []
+    monkeypatch.setattr(
+        nvfp4.adaptive_moe,
+        "run_adaptive_fused_moe",
+        lambda *a, **kw: ran_adaptive.append(a),
+    )
+    x = torch.randn(4, H)
+    logits = torch.randn(4, E)
+    method.apply_monolithic(layer, x, logits)
+    assert len(ran_adaptive) == 1
