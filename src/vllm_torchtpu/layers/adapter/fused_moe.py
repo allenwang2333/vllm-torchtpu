@@ -41,6 +41,8 @@ _ENVS_DICT = envs.__dict__
 
 
 def _resolve_activation_name(activation: Any) -> str:
+    if isinstance(activation, str):
+        return activation
     if isinstance(activation, enum.Enum):
         return activation.value
     return activation.value if hasattr(activation, "value") else str(activation)

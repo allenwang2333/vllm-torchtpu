@@ -180,6 +180,24 @@ def _tp(monkeypatch, world_size, rank):
 
     monkeypatch.setattr(vd, "get_tensor_model_parallel_world_size", lambda: world_size)
     monkeypatch.setattr(vd, "get_tensor_model_parallel_rank", lambda: rank)
+    monkeypatch.setattr(
+        moe_hierarchical, "get_tensor_model_parallel_world_size", lambda: world_size
+    )
+    monkeypatch.setattr(
+        moe_hierarchical, "get_tensor_model_parallel_rank", lambda: rank
+    )
+
+
+def test_hash_select_3d_scores_and_int32_input_ids() -> None:
+    scores = torch.rand(2, 3, 16, dtype=torch.float32)
+    table = torch.randint(0, 16, (32, 4), dtype=torch.int32)
+    ids32 = torch.randint(0, 32, (2, 3), dtype=torch.int32)
+    w, idx = moe_routing._hash_moe_select(
+        scores, table, ids32, renormalize=False, routed_scaling_factor=1.0
+    )
+    assert w.shape == (2, 3, 4)
+    assert idx.shape == (2, 3, 4)
+    assert idx.dtype == torch.int32
 
 
 def test_split_none_when_single_rank(monkeypatch) -> None:

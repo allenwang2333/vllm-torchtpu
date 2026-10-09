@@ -14,6 +14,7 @@
 """Routing helpers for TPU local MoE kernels."""
 
 import torch
+import torch.nn.functional as F
 import vllm.envs as vllm_envs
 
 import vllm_torchtpu.envs as envs
@@ -40,7 +41,7 @@ def _topk(
             return rowmax_select(scores, k)
         return rowmax_select(scores, k, bias=bias, renormalize=renormalize)
     if bias is not None:
-        bias_shape = [1] * (scores.dim() - 1) + [-1]
+        bias_shape = (1,) * (scores.dim() - 1) + (-1,)
         scores_for_choice = scores + bias.float().view(bias_shape)
         _, topk_ids = torch.topk(scores_for_choice, k=k, dim=-1)
         topk_weights = _gather_expert_scores(scores, topk_ids)
@@ -261,14 +262,14 @@ def route(
         else:
             group = get_dp_group()
         local_input_ids = input_ids
-        if (
-            input_ids is not None
-            and input_ids.numel() > local_t
-            and input_ids.numel() % local_t == 0
-        ):
-            shards = input_ids.numel() // local_t
-            rank = group.rank_in_group % shards
-            local_input_ids = input_ids.flatten()[rank * local_t : (rank + 1) * local_t]
+        if input_ids is not None:
+            n_ids = input_ids.numel()
+            if n_ids > local_t and n_ids % local_t == 0:
+                shards = n_ids // local_t
+                rank = group.rank_in_group % shards
+                local_input_ids = input_ids.flatten()[
+                    rank * local_t : (rank + 1) * local_t
+                ]
         local_weights, local_ids = select_experts(
             hidden_states=hidden_states[:local_t],
             router_logits=router_logits,
@@ -297,8 +298,6 @@ def _apply_scoring_fn(scoring_fn: str, router_logits: torch.Tensor) -> torch.Ten
     if scoring_fn == "sigmoid":
         return scores.sigmoid()
     if scoring_fn == "sqrtsoftplus":
-        import torch.nn.functional as F
-
         return torch.sqrt(F.softplus(scores))
     raise NotImplementedError(
         f"FusedMoE does not support {scoring_fn} scoring function for TPU."
@@ -317,12 +316,13 @@ def _hash_moe_select(
     Routes tokens to experts based on precomputed hash_indices_table lookup indexed by
     flat input_ids rather than dynamic gating logits.
     """
-    flat_input_ids = input_ids.long().flatten()
+    flat_input_ids = (
+        input_ids if input_ids.dtype == torch.int64 else input_ids.long()
+    ).flatten()
     # Keep the table's dtype (int32 for DeepSeek-V4); callers cast to int32.
     topk_ids = hash_indices_table[flat_input_ids]
-    target_shape = list(scores.shape)
-    target_shape[-1] = topk_ids.shape[-1]
-    topk_ids = topk_ids.reshape(target_shape)
+    if scores.ndim != 2:
+        topk_ids = topk_ids.reshape(*scores.shape[:-1], topk_ids.shape[-1])
     topk_weights = _gather_expert_scores(scores, topk_ids)
 
     if renormalize:
@@ -365,7 +365,7 @@ def select_experts(
         getattr(layer, "hash_indices_table", None) if layer is not None else None
     )
     if hash_indices_table is not None and input_ids is not None:
-        scores = _apply_scoring_fn(scoring_fn, router_logits.float())
+        scores = _apply_scoring_fn(scoring_fn, router_logits)
         # hash_indices_table is only set when layer is not None.
         assert layer is not None
         routed_scaling_factor = layer.routed_scaling_factor
@@ -403,7 +403,7 @@ def select_experts(
         )
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
-    scores = _apply_scoring_fn(scoring_fn, router_logits.float())
+    scores = _apply_scoring_fn(scoring_fn, router_logits)
     e_score_correction_bias = (
         layer.e_score_correction_bias if layer is not None else None
     )

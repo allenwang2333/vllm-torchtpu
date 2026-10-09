@@ -126,9 +126,11 @@ def test_copy_blocks_writes_every_pool(monkeypatch) -> None:
 
 def test_row_copy_run_writes_back(monkeypatch) -> None:
     names = []
+    captured_fns = []
 
     def fake_jax_op(name, fn, **kwargs):
         names.append((name, kwargs))
+        captured_fns.append(fn)
         return lambda pool, src, dst: (pool + 1, src[0])
 
     monkeypatch.setattr(mamba.pallas, "jax_op", fake_jax_op)
@@ -138,6 +140,25 @@ def test_row_copy_run_writes_back(monkeypatch) -> None:
     marker = run._torchdynamo_orig_callable(pool, torch.tensor([4]), torch.tensor([0]))
     assert torch.equal(pool, torch.ones(2, 6, 1))
     assert int(marker) == 4
+
+    # Exercise the inner _rows_fn closure (lines 115-121 of mamba_state_copy_op.py)
+    copy_calls = []
+
+    def fake_copy_blocks(view, src_steps, dst_steps):
+        copy_calls.append((view.shape, np.asarray(src_steps), np.asarray(dst_steps)))
+        return view + 2
+
+    monkeypatch.setattr(mamba.pool_adapters, "copy_blocks", fake_copy_blocks)
+    jpool = jnp.zeros((4, 6, 2), dtype=jnp.float32)
+    jsrc = jnp.array([2, 0], dtype=jnp.int32)
+    jdst = jnp.array([1, 3], dtype=jnp.int32)
+    out_pool, out_marker = captured_fns[0](jpool, jsrc, jdst)
+    assert out_pool.shape == (4, 6, 2)
+    assert int(out_marker) == 2
+    assert len(copy_calls) == 1
+    assert copy_calls[0][0] == (12, 2, 2)
+    np.testing.assert_array_equal(copy_calls[0][1], np.array([6, 7, 8, 0, 1, 2]))
+    np.testing.assert_array_equal(copy_calls[0][2], np.array([3, 4, 5, 9, 10, 11]))
 
 
 # ---------------------------------------------------------------------------

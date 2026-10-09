@@ -65,7 +65,7 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
       on every rank. Returned unchanged without a DCP group.
     """
     group = get_dcp_group()
-    if group is None or int(group.world_size) == 1:
+    if group is None or group.world_size == 1:
         return q
     q_hm = q.transpose(0, 1).contiguous()
     gathered_hm = group.all_gather(q_hm, dim=0)
@@ -89,9 +89,9 @@ def all_gather_q_nope_pe_heads(
          in a single materialization pass.
     """
     group = get_dcp_group()
-    if group is None or int(group.world_size) == 1:
+    if group is None or group.world_size == 1:
         return ql_nope, q_pe
-    q_cat_hm = torch.cat([ql_nope.transpose(0, 1), q_pe.transpose(0, 1)], dim=-1)
+    q_cat_hm = torch.cat((ql_nope.transpose(0, 1), q_pe.transpose(0, 1)), dim=-1)
     q_dcp_hm = group.all_gather(q_cat_hm, dim=0)
     ql_nope_dcp = q_dcp_hm[..., :kv_lora_rank].transpose(0, 1).contiguous()
     q_pe_dcp = q_dcp_hm[..., kv_lora_rank:].transpose(0, 1).contiguous()
@@ -132,7 +132,7 @@ def merge_lse_partials_scatter_heads(
       head-major `[tp_local_num_heads, num_tokens, kv_lora_rank]` storage).
     """
     group = get_dcp_group()
-    if group is None or int(group.world_size) == 1:
+    if group is None or group.world_size == 1:
         return output
 
     weighted_hm = _weight_by_lse(output, lse, group)

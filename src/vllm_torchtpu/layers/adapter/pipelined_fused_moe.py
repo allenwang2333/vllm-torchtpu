@@ -231,26 +231,11 @@ def pipelined_fused_moe_gmm(
     assert collective_group is not None
 
     # Slice local inputs into num_chunks chunks along dim 0
-    hs_slices = [
-        hidden_states[i * chunk_size_local : (i + 1) * chunk_size_local]
-        for i in range(num_chunks)
-    ]
+    hs_slices = hidden_states.chunk(num_chunks, dim=0)
     weights_slices = (
-        [
-            topk_weights[i * chunk_size_local : (i + 1) * chunk_size_local]
-            for i in range(num_chunks)
-        ]
-        if topk_weights is not None
-        else None
+        topk_weights.chunk(num_chunks, dim=0) if topk_weights is not None else None
     )
-    ids_slices = (
-        [
-            topk_ids[i * chunk_size_local : (i + 1) * chunk_size_local]
-            for i in range(num_chunks)
-        ]
-        if topk_ids is not None
-        else None
-    )
+    ids_slices = topk_ids.chunk(num_chunks, dim=0) if topk_ids is not None else None
 
     # Prime pipeline with initial all-gather for chunk 0
     ag_hs_curr = collective_group.all_gather(hs_slices[0], dim=0)

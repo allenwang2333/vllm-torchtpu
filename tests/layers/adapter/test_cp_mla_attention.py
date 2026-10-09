@@ -154,7 +154,7 @@ def test_a_token_no_rank_owns_is_zero_not_nan(monkeypatch):
 
 
 class _HeadGatherGroup:
-    """Serves only `all_gather(dim=1)`, from a stack of per-rank head slices."""
+    """Serves only `all_gather(dim=0)`, from a stack of per-rank head slices."""
 
     def __init__(self, per_rank, rank):
         self.world_size = len(per_rank)
@@ -162,9 +162,10 @@ class _HeadGatherGroup:
         self._per_rank = per_rank
 
     def all_gather(self, tensor, dim=0):
-        assert dim == 1
-        assert tensor.shape == self._per_rank[self.rank_in_group].shape
-        return torch.cat(list(self._per_rank), dim=1)
+        assert dim == 0
+        expected = self._per_rank[self.rank_in_group].transpose(0, 1).contiguous()
+        assert tensor.shape == expected.shape
+        return torch.cat([r.transpose(0, 1) for r in self._per_rank], dim=0)
 
 
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
