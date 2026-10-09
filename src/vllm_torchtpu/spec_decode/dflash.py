@@ -569,7 +569,12 @@ class DFlashProposer:
                 ),
             ):
                 draft_tokens_chunk, _ = self._dflash_forward_and_sample(
-                    input_ids, positions, block_size
+                    input_ids,
+                    positions,
+                    block_size,
+                    *self._draft_sample_inputs(
+                        padded_len // block_size, chunk.start_index, chunk.num_reqs
+                    ),
                 )
 
             draft_logits_per_chunk.append(draft_tokens_chunk)
@@ -799,7 +804,10 @@ class DFlashProposer:
             ),
         ):
             draft_tokens_chunk, _ = self._dflash_forward_and_sample(
-                input_ids, positions, block_size
+                input_ids,
+                positions,
+                block_size,
+                *self._draft_sample_inputs(num_tokens // block_size),
             )
             synchronize_tensors(draft_tokens_chunk, wait=sync)
 
@@ -972,6 +980,15 @@ class DFlashProposer:
             )
 
         return hidden_states
+
+    def _draft_sample_inputs(
+        self, padded_num_reqs: int, start_index: int = 0, num_reqs: int = 0
+    ) -> tuple[torch.Tensor, ...]:
+        """Extra device inputs `_dflash_forward_and_sample` samples drafts
+        with, for the chunk's requests [start_index, start_index + num_reqs)
+        padded to `padded_num_reqs` rows; num_reqs=0 for dummy forwards.
+        Greedy drafting needs none."""
+        return ()
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(

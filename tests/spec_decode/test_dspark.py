@@ -91,7 +91,6 @@ def test_bonus_anchor_keeps_dflash_layout():
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("draft_sample_method", "probabilistic"),
         ("enable_adaptive_verification", True),
         ("dspark_draft_topk", 8),
     ],
@@ -108,16 +107,63 @@ def test_rejects_unsupported_drafting_options(field, value):
         )
 
 
-def test_block_size_guard():
-    with pytest.raises(ValueError, match="block size"):
+def test_k_need_not_match_checkpoint_block():
+    # Upstream DSparkSpeculator drafts any K from a checkpoint trained at one
+    # block length; the query block follows K.
+    p = _make_proposer(
+        {"dspark_noise_token_id": 7, "dspark_block_size": 5, **_LAYER_IDS},
+        num_speculative_tokens=6,
+    )
+    assert p.block_size == 6
+
+
+def test_probabilistic_requires_synthetic_rejection():
+    hf = {"dspark_noise_token_id": 7, "vocab_size": 32, **_LAYER_IDS}
+    with pytest.raises(ValueError, match="synthetic"):
         _make_proposer(
-            {
-                "dspark_noise_token_id": 7,
-                "dspark_block_size": 7,
-                **_LAYER_IDS,
-            },
-            num_speculative_tokens=4,
+            hf,
+            draft_sample_method="probabilistic",
+            rejection_sample_method="standard",
         )
+    p = _make_proposer(
+        hf,
+        draft_sample_method="probabilistic",
+        rejection_sample_method="synthetic",
+    )
+    assert p._probabilistic
+    assert p._draft_vocab_size == 32
+
+
+def test_probabilistic_sample_inputs_shapes():
+    hf = {"dspark_noise_token_id": 7, "vocab_size": 32, **_LAYER_IDS}
+    p = _make_proposer(
+        hf,
+        num_speculative_tokens=4,
+        draft_sample_method="probabilistic",
+        rejection_sample_method="synthetic",
+    )
+    p.runner.input_batch.temperature_cpu_tensor = torch.tensor([0.0, 0.7, 1.0])
+    temps, noise = p._draft_sample_inputs(4, start_index=1, num_reqs=2)
+    assert temps.tolist() == pytest.approx([0.7, 1.0, 0.0, 0.0])
+    assert noise.shape == (4, 4, 32)
+    dummy_temps, dummy_noise = p._draft_sample_inputs(4)
+    assert dummy_temps.tolist() == [0.0] * 4
+    assert dummy_noise.shape == (4, 4, 32)
+    assert _make_proposer(hf)._draft_sample_inputs(4) == ()
+
+
+def test_sample_draft_greedy_rows_and_gumbel_distribution():
+    torch.manual_seed(0)
+    logits = torch.log(torch.tensor([0.1, 0.2, 0.7]))
+    n = 20000
+    rows = logits.expand(n, 3)
+    temps = torch.ones(n)
+    temps[:10] = 0.0
+    tokens = DSparkProposer._sample_draft(rows, temps, torch.rand(n, 3))
+    assert (tokens[:10] == 2).all()
+    freq = torch.bincount(tokens[10:], minlength=3).float() / (n - 10)
+    assert freq.tolist() == pytest.approx([0.1, 0.2, 0.7], abs=0.015)
+    assert (DSparkProposer._sample_draft(rows, None, None) == 2).all()
 
 
 def test_missing_noise_token():
