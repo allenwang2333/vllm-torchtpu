@@ -23,8 +23,11 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
 
 _MAX_EXPERT_BUFFERS = 3
 _SUPPORTED_ACTIVATIONS = ("silu", "silu_and_mul_with_clamp", "swigluoai")
+_VMEM_SPEC = pl.BlockSpec(memory_space=pltpu.VMEM)
+_HBM_SPEC = pl.BlockSpec(memory_space=pltpu.HBM)
 
 
+@functools.lru_cache(maxsize=64)
 def _select_expert_buffers(
     m,
     h,
@@ -356,7 +359,9 @@ def dense_expert_moe(
     active = jnp.any(coeff != 0, axis=0).astype(jnp.int32)
     if pad_m:
         hidden = jnp.pad(hidden, ((0, pad_m), (0, 0)))
-    coeff = jnp.pad(coeff, ((0, pad_m), (0, (-experts) % 128)))
+    pad_e = (-experts) % 128
+    if pad_m or pad_e:
+        coeff = jnp.pad(coeff, ((0, pad_m), (0, pad_e)))
     s1_scratch_shape = (
         (num_buffers, 1, 2 * i)
         if s1_blocks == 1
@@ -383,11 +388,14 @@ def dense_expert_moe(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             in_specs=[
-                pl.BlockSpec(memory_space=pltpu.VMEM),
-                pl.BlockSpec(memory_space=pltpu.VMEM),
-                *[pl.BlockSpec(memory_space=pltpu.HBM)] * 4,
+                _VMEM_SPEC,
+                _VMEM_SPEC,
+                _HBM_SPEC,
+                _HBM_SPEC,
+                _HBM_SPEC,
+                _HBM_SPEC,
             ],
-            out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+            out_specs=_VMEM_SPEC,
             scratch_shapes=[
                 pltpu.VMEM((num_buffers, h // packing_factor, 2 * i), w1.dtype),
                 pltpu.VMEM((num_buffers, i // packing_factor, h), w2.dtype),
@@ -406,4 +414,4 @@ def dense_expert_moe(
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_capacity_bytes),
         name=(f"dense_expert_moe-e_{experts}-m_{m}-h_{h}-i_{i}-buffers_{num_buffers}"),
     )(active, hidden, coeff, w1, w2, s1, s2)
-    return out[:orig_m]
+    return out[:orig_m] if pad_m else out

@@ -23,6 +23,13 @@ CYCLES = (
     (0, 1, 2, 3, 7, 6, 14, 15, 11, 10, 9, 8, 12, 13, 5, 4),
 )
 
+_HBM_SPEC = pl.BlockSpec(memory_space=pltpu.HBM)
+_GATHER_PROJECT_REGIONS = tuple(
+    (direction * 64, 64, col, width)
+    for col, width in ((0, 2432), (2432, 2432), (4864, 2304))
+    for direction in (0, 1)
+)
+
 
 def mla_chip_layout(devices, owners):
     """Physical pairs and same-core groups, ordered by Torch token ownership."""
@@ -123,7 +130,8 @@ def gather_moe_inputs(x, weights, ids, mesh, tables, *, collective_id):
         low = (ids & 255).astype(jnp.bfloat16)
         high = ((ids >> 8) & 255).astype(jnp.bfloat16)
         payload = jnp.concatenate((x, weights, low, high), axis=1)
-        return jnp.pad(payload, ((0, 0), (0, (-payload.shape[1]) % 128)))
+        pad = (-payload.shape[1]) % 128
+        return jnp.pad(payload, ((0, 0), (0, pad))) if pad else payload
 
     packed = jax.shard_map(
         pack,
@@ -171,6 +179,7 @@ def ring_tables(devices, token_ranks):
     return np.asarray(result, np.int32)
 
 
+@functools.lru_cache(maxsize=64)
 def _regions(rows, width):
     if rows % 64 or width % 128 or width < 384:
         raise ValueError("K3 rings need 64-row ownership and 128-column alignment")
@@ -511,8 +520,8 @@ def ring_collective(x, mesh, tables, *, gather, collective_id):
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=1,
                 grid=(1, 32),
-                in_specs=(pl.BlockSpec(memory_space=pltpu.HBM),),
-                out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+                in_specs=(_HBM_SPEC,),
+                out_specs=_HBM_SPEC,
                 scratch_shapes=scratch,
             ),
             compiler_params=pltpu.CompilerParams(
@@ -706,7 +715,6 @@ def project_reduce_scatter(x, w, mesh, tables, *, collective_id):
     def local(x, w):
         x = x.reshape(tokens, 384)
         w = w.reshape(384, 7168)
-        hbm = pl.BlockSpec(memory_space=pltpu.HBM)
         scratch = (
             pltpu.SemaphoreType.DMA((streams,)),
             pltpu.SemaphoreType.DMA((streams,)),
@@ -725,8 +733,8 @@ def project_reduce_scatter(x, w, mesh, tables, *, collective_id):
             out_shape=jax.ShapeDtypeStruct((rows, 7168), jnp.bfloat16),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=1,
-                in_specs=(hbm, hbm),
-                out_specs=hbm,
+                in_specs=(_HBM_SPEC, _HBM_SPEC),
+                out_specs=_HBM_SPEC,
                 scratch_shapes=scratch,
                 grid=(1, 32),
             ),
@@ -904,11 +912,6 @@ def _gather_project_kernel(
 def _gather_project(x, w, tables, collective_id):
     assert x.shape[0] % 128 == 0 and x.shape[1] == 7168 and w.shape == (7168, 1792)
     streams = 6
-    regions = tuple(
-        (direction * 64, 64, col, width)
-        for col, width in [(0, 2432), (2432, 2432), (4864, 2304)]
-        for direction in (0, 1)
-    )
     scratch = (
         pltpu.SemaphoreType.DMA((streams,)),
         pltpu.SemaphoreType.DMA((streams,)),
@@ -922,14 +925,13 @@ def _gather_project(x, w, tables, collective_id):
         pltpu.SemaphoreType.DMA,
         pltpu.SemaphoreType.DMA((2,)),
     )
-    hb = pl.BlockSpec(memory_space=pltpu.HBM)
     partials = pl.pallas_call(
-        functools.partial(_gather_project_kernel, regions=regions),
+        functools.partial(_gather_project_kernel, regions=_GATHER_PROJECT_REGIONS),
         out_shape=jax.ShapeDtypeStruct((32 * x.shape[0], 1792), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            in_specs=(hb, hb),
-            out_specs=hb,
+            in_specs=(_HBM_SPEC, _HBM_SPEC),
+            out_specs=_HBM_SPEC,
             scratch_shapes=scratch,
             grid=(x.shape[0] // 128, 32),
         ),
