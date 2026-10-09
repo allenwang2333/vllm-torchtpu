@@ -23,6 +23,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+if not hasattr(pltpu, "annotate"):
+  pltpu.annotate = lambda ref, **kwargs: ref
+
 TPB = 128  # tokens per batch
 TILE = 16  # tokens per reduction tile (multiple of 16)
 LANES = 128

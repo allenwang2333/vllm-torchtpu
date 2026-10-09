@@ -20,6 +20,9 @@ import jax.numpy as jnp
 from jax.experimental import hijax
 from jax.experimental.pallas import tpu as pltpu
 
+if not hasattr(pltpu, "annotate"):
+  pltpu.annotate = lambda ref, **kwargs: ref
+
 
 def create_tensorcore_mesh(axis_name: str = "core", num_cores: int = 1):
   """Compat helper for TensorCoreMesh across different JAX versions."""
