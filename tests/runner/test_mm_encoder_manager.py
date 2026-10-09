@@ -22,6 +22,7 @@ def manager(compile_mock):
     model = Mock()
     model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
         padding_logics={},
+        capture_axes=(),
         paths={
             "global": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False),
             "local": SimpleNamespace(min_token_budget=8, allow_zero_tokens=True),
@@ -381,3 +382,102 @@ def test_factory_requires_enabled_and_supported(monkeypatch, enabled, supported)
         constructor.assert_not_called()
     if not enabled:
         supports.assert_not_called()
+
+
+def test_pack_encoder_items_bisect_and_invalid_counts():
+    assert mm._pack_encoder_items([], [4, 8, 16], max_items=2) == []
+    assert mm._pack_encoder_items([5, 2, 10], [4, 8, 16], max_items=2) == [
+        ([1, 0], 8),
+        ([2], 16),
+    ]
+    with pytest.raises(ValueError, match="got 0 tokens"):
+        mm._pack_encoder_items([0], [4, 8], max_items=2)
+    with pytest.raises(ValueError, match="got 12 tokens, maximum 8"):
+        mm._pack_encoder_items([12], [4, 8], max_items=2)
+
+
+@pytest.mark.parametrize(
+    "use_dp_attr, tp_size, expected_dp",
+    [(True, 2, True), (True, 1, False), (False, 2, False), (None, 2, False)],
+)
+def test_initialization_use_data_parallel_branches(
+    compile_mock, use_dp_attr, tp_size, expected_dp
+):
+    model = Mock()
+    model.use_data_parallel = use_dp_attr
+    model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
+        padding_logics={},
+        capture_axes=(),
+        paths={
+            "default": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False),
+        },
+    )
+    model.prepare_encoder_cudagraph_capture_inputs.side_effect = (
+        lambda budget, *args, path: SimpleNamespace(
+            values={"pixels": torch.zeros(budget, 2)}
+        )
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.float32,
+            multimodal_config=SimpleNamespace(
+                get_limit_per_prompt=lambda _: 0, mm_encoder_tp_mode="weights"
+            ),
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
+        compilation_config=SimpleNamespace(
+            cudagraph_mm_encoder=True,
+            encoder_cudagraph_token_budgets=[4],
+            encoder_cudagraph_max_vision_items_per_batch=1,
+            encoder_cudagraph_max_frames_per_batch=0,
+        ),
+    )
+    mgr = mm.MMEncoderManager(config, torch.device("cpu"), model)
+    assert mgr.use_dp is expected_dp
+
+
+def test_pad_to_template_cross_device_scalar_and_exact_shape(manager):
+    class _CrossDeviceScalar:
+        ndim = 0
+        device = torch.device("meta")
+
+        def to(self, *, device):
+            return torch.tensor(42, device=device)
+
+    class _CrossDeviceExact:
+        ndim = 2
+        shape = torch.Size([4, 2])
+        device = torch.device("meta")
+
+        def to(self, *, device):
+            return torch.full((4, 2), 5.0, device=device)
+
+    result = manager._pad_to_template(
+        {"scalar": _CrossDeviceScalar(), "pixels": _CrossDeviceExact()},
+        4,
+        "global",
+    )
+    assert int(result["scalar"].item()) == 42
+    torch.testing.assert_close(result["pixels"], torch.full((4, 2), 5.0))
+
+
+def test_coordinated_encoder_rejects_multi_path(manager):
+    with pytest.raises(
+        ValueError, match="Coordinated encoding requires a single default encoder path"
+    ):
+        manager.execute_dp_coordinated({"tokens": [4]})
+
+
+def test_coordinated_encoder_local_pack_error(coordinated_manager, monkeypatch):
+    monkeypatch.setattr(
+        parallel_state,
+        "get_dp_group",
+        lambda: SimpleNamespace(world_size=1, cpu_group=None),
+    )
+
+    def gather(plans, local, *, group):
+        plans[:] = [local]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    with pytest.raises(ValueError, match="Invalid coordinated encoder inputs"):
+        coordinated_manager.execute_dp_coordinated({"tokens": [99]})

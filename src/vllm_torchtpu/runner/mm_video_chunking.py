@@ -203,6 +203,14 @@ def embed_multimodal_chunked(
         max_patches,
     )
 
+    stacked_keys = tuple(
+        key
+        for key, val in mm_kwargs.items()
+        if key not in (pixel_key, grid_key, "timestamps")
+        and (shape := getattr(val, "shape", None))
+        and len(shape) >= 1
+        and shape[0] == num_items
+    )
     outputs = []
     row = 0
     for i, num_patches in enumerate(per_item_patches):
@@ -212,12 +220,8 @@ def embed_multimodal_chunked(
         if timestamps is not None:
             item_kwargs["timestamps"] = _select_item_timestamps(timestamps, i)
         # Index any other stacked per-item field (shape[0] == num_items).
-        for key, val in mm_kwargs.items():
-            if key in (pixel_key, grid_key, "timestamps"):
-                continue
-            shape = getattr(val, "shape", None)
-            if shape and len(shape) >= 1 and shape[0] == num_items:
-                item_kwargs[key] = val[i : i + 1]
+        for key in stacked_keys:
+            item_kwargs[key] = mm_kwargs[key][i : i + 1]
         outputs.append(
             _encode_video_item(embed_fn, pixel_key, grid_key, item_kwargs, max_patches)
         )

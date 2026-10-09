@@ -449,3 +449,40 @@ class TestSliceTimestamps:
         per_item = [torch.arange(3), torch.arange(4)]
         assert torch.equal(select_fn(per_item, 1), per_item[1])
         assert select_fn(None, 1) is None
+
+    def test_class_method_embed_multimodal_restored_and_stacked_keys_without_timestamps(
+        self,
+    ):
+        """Covers class-level embed_multimodal restoration (previous is _UNSET),
+        stacked per-item extra fields, and chunking when timestamps is None."""
+        calls = []
+
+        class _BoundMethodModel(torch.nn.Module):
+            def embed_multimodal(self, **mm_kwargs):
+                calls.append(mm_kwargs)
+                chunk_t = int(mm_kwargs["video_grid_thw"].tolist()[0][0])
+                return (torch.zeros((chunk_t * 4, 6), dtype=torch.float32),)
+
+        model = _BoundMethodModel()
+        assert "embed_multimodal" not in model.__dict__
+
+        specs = [(4, 2, 2), (4, 2, 2)]
+        kwargs, _, _ = _make_multi_video_kwargs(specs)
+        kwargs.pop("timestamps")
+        kwargs["extra_stacked"] = torch.tensor([[10, 11], [20, 21]])
+        kwargs["extra_unstacked"] = torch.tensor([1, 2, 3])
+        kwargs["extra_scalar"] = 7
+
+        with (
+            patch.dict(os.environ, {"MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": "8"}),
+            mvc.chunked_video_encoding(model, SimpleNamespace(multimodal_config=None)),
+        ):
+            assert "embed_multimodal" in model.__dict__
+            out = model.embed_multimodal(**kwargs)
+
+        assert "embed_multimodal" not in model.__dict__
+        assert len(out) == 2
+        assert len(calls) == 4
+        assert torch.equal(calls[0]["extra_stacked"], torch.tensor([[10, 11]]))
+        assert torch.equal(calls[2]["extra_stacked"], torch.tensor([[20, 21]]))
+        assert "timestamps" not in calls[0]

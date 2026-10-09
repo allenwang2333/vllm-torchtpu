@@ -1,3 +1,4 @@
+import bisect
 from typing import Any, cast
 
 import torch
@@ -17,20 +18,21 @@ def _pack_encoder_items(
     batches: list[tuple[list[int], int]] = []
     indices: list[int] = []
     total = 0
+    max_budget = budgets[-1]
     for index in sorted(range(len(tokens)), key=tokens.__getitem__):
         count = tokens[index]
-        if not 0 < count <= budgets[-1]:
+        if not 0 < count <= max_budget:
             raise ValueError(
                 f"Coordinated encoding requires each image to fit "
-                f"an encoder graph bucket; got {count} tokens, maximum {budgets[-1]}"
+                f"an encoder graph bucket; got {count} tokens, maximum {max_budget}"
             )
-        if indices and (len(indices) == max_items or total + count > budgets[-1]):
-            batches.append((indices, next(b for b in budgets if b >= total)))
+        if indices and (len(indices) == max_items or total + count > max_budget):
+            batches.append((indices, budgets[bisect.bisect_left(budgets, total)]))
             indices, total = [], 0
         indices.append(index)
         total += count
     if indices:
-        batches.append((indices, next(b for b in budgets if b >= total)))
+        batches.append((indices, budgets[bisect.bisect_left(budgets, total)]))
     return batches
 
 
@@ -131,6 +133,8 @@ class MMEncoderManager(EncoderCudaGraphManager):
         """Zero-pads dynamic multimodal inputs up to the static budget template."""
         template = self.budget_templates[path][budget]
         padded: dict[str, torch.Tensor] = {}
+        padding_logics = self.config.padding_logics
+        default_pad = self._copy_padded_buffer
 
         for key, tmpl in template.items():
             src = replay_values.get(key)
@@ -140,18 +144,20 @@ class MMEncoderManager(EncoderCudaGraphManager):
 
             if not hasattr(src, "shape") or src.ndim == 0:
                 # Only scalar values, copy directly to template
-                tmpl.copy_(src.to(device=tmpl.device))
+                if src.device != tmpl.device:
+                    src = src.to(device=tmpl.device)
+                tmpl.copy_(src)
                 padded[key] = tmpl
                 continue
 
             if src.shape == tmpl.shape:
                 # Already perfectly bucket-sized
-                padded[key] = src.to(device=tmpl.device)
+                padded[key] = (
+                    src if src.device == tmpl.device else src.to(device=tmpl.device)
+                )
                 continue
 
-            padding_logic = self.config.padding_logics.get(
-                key, self._copy_padded_buffer
-            )
+            padding_logic = padding_logics.get(key, default_pad)
             padding_logic(tmpl, src)
             padded[key] = tmpl
 
@@ -183,10 +189,12 @@ class MMEncoderManager(EncoderCudaGraphManager):
         mm_kwargs: dict[str, Any],
         token_budget: int,
         path: str = "default",
+        axis_keys: tuple[Any, ...] = (),
         *,
         allow_eager_fallback: bool = True,
     ) -> torch.Tensor | None:
         """Pads actual inputs and runs the compiled XLA graph."""
+        del axis_keys
         num_items = len(self._get_item_specs(mm_kwargs))
         if (
             path not in self.budget_templates
@@ -271,7 +279,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
             if step < len(batches):
                 assert mm_kwargs is not None
                 indices, _ = batches[step]
-                kwargs = self._select_items(mm_kwargs, indices)
+                kwargs, _ = self._select_items(mm_kwargs, indices)
                 output = self._run_budget_graph(
                     kwargs, budget, allow_eager_fallback=False
                 )
