@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 
@@ -17,11 +18,16 @@ from vllm.model_executor.layers.fused_moe import RoutedExperts
 
 from vllm_torchtpu import envs
 
-_GROUPED_STREAMS: dict[
-    tuple[str, int], Iterator[tuple[int, dict[str, torch.Tensor]]]
-] = {}
-_GROUPED_PENDING: dict[tuple[str, int], dict[int, dict[str, torch.Tensor]]] = {}
+_GroupTensors = dict[str, torch.Tensor]
+_GroupStream = Iterator[tuple[int, _GroupTensors]]
+_GROUPED_STREAMS: dict[tuple[str, int], _GroupStream] = {}
+_GROUPED_PENDING: dict[tuple[str, int], dict[int, _GroupTensors]] = {}
 _GROUPED_LOADED: dict[tuple[str, int], set[int]] = {}
+_PREFETCH_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dsv41-moe")
+_GROUPED_PREFETCH: dict[
+    tuple[str, int],
+    Future[tuple[_GroupStream, int, _GroupTensors]],
+] = {}
 
 
 def _sha256(path: Path) -> str:
@@ -150,13 +156,42 @@ def _stream_grouped_shards(
             raise ValueError(f"Incomplete static MoE stream: {sorted(pending)}")
 
 
+def _prime_group_stream(
+    uri: str, group: int, files: dict[tuple[int, int], dict]
+) -> tuple[_GroupStream, int, _GroupTensors]:
+    stream = _stream_grouped_shards(uri, group, files)
+    layer, tensors = next(stream)
+    return stream, layer, tensors
+
+
+def start_grouped_prefetch(root: str, uri: str, local_experts: set[int]) -> None:
+    if len(local_experts) != 48:
+        return
+    group = min(local_experts) // 48
+    if local_experts != set(range(group * 48, (group + 1) * 48)):
+        return
+    index = _index(str(Path(root).resolve()))
+    if "__ep8__" not in index:
+        return
+    key = (uri, group)
+    if key not in _GROUPED_PREFETCH:
+        _GROUPED_PREFETCH[key] = _PREFETCH_POOL.submit(
+            _prime_group_stream, uri, group, index["__ep8__"]
+        )
+
+
 def _streamed_group(
     uri: str, group: int, layer: int, files: dict[tuple[int, int], dict]
 ) -> dict[str, torch.Tensor]:
     key = (uri, group)
     if key not in _GROUPED_STREAMS:
-        _GROUPED_STREAMS[key] = _stream_grouped_shards(uri, group, files)
-        _GROUPED_PENDING[key] = {}
+        if future := _GROUPED_PREFETCH.pop(key, None):
+            stream, first_layer, first_tensors = future.result()
+            _GROUPED_STREAMS[key] = stream
+            _GROUPED_PENDING[key] = {first_layer: first_tensors}
+        else:
+            _GROUPED_STREAMS[key] = _stream_grouped_shards(uri, group, files)
+            _GROUPED_PENDING[key] = {}
         _GROUPED_LOADED[key] = set()
     pending = _GROUPED_PENDING[key]
     while layer not in pending:

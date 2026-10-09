@@ -424,6 +424,12 @@ def patch_runai_sharded_expert_streaming() -> None:
             hf_weights_files = _indexed_model_weights_only(
                 hf_weights_files, static_root
             )
+            if static_uri := envs.TPU_DSV41_STATIC_MOE_URI:
+                from vllm_torchtpu.layers.adapter.quantization.static_dsv41_moe import (
+                    start_grouped_prefetch,
+                )
+
+                start_grouped_prefetch(static_root, static_uri, local_expert_ids)
         return _sharded_runai_weights_iterator(
             hf_weights_files, local_expert_ids, self.load_config.use_tqdm_on_load
         )
