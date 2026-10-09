@@ -1016,6 +1016,53 @@ class TestModelForward:
             assert res.shape == (2, 64)
             assert torch.all(res == 3.0)
 
+    def test_forward_ced_non_identity_applies_owner_kwargs_once_per_meta(
+        self,
+    ) -> None:
+        import contextlib
+
+        model = self._create_model(ced_enabled=True, sp_enabled=False)
+        model.encoder_stage = MagicMock(
+            return_value=(torch.ones((4, 64)), torch.zeros((4, 64)))
+        )
+        model.decoder_stage = MagicMock(return_value=torch.zeros((4, 64)))
+        plan = DecoderReplayPlan(
+            indices=(1, 3),
+            padded_num_tokens=4,
+            query_start_loc=[0, 2],
+            replay_starts=[0, 1],
+        )
+        meta_entry = _FakeAttnMeta(seq_lens=torch.tensor([2, 2]))
+        mock_ctx = _FakeForwardCtx(
+            attn_metadata={"layer_0": meta_entry, "layer_1": meta_entry}
+        )
+        owner_perm = torch.tensor([1, 0, 3, 2])
+        seen = []
+
+        @contextlib.contextmanager
+        def _capture(ctx):
+            seen.append(ctx)
+            yield
+
+        mod = "vllm_torchtpu.models.vllm.deepseek_v41.v2.model"
+        with (
+            patch(f"{mod}.upstream.get_forward_context", return_value=mock_ctx),
+            patch(f"{mod}.plan_decoder_replay", return_value=plan),
+            patch(f"{mod}.override_forward_context", side_effect=_capture),
+            patch.object(
+                DeepseekV41Model,
+                "_get_ced_decoder_owner_kwargs",
+                return_value={"owner_perm": owner_perm},
+            ),
+        ):
+            model.forward(None, torch.tensor([0, 1, 2, 3]))
+        dec_meta = seen[-1].attn_metadata
+        # Shared metadata objects are replaced once and stay shared.
+        assert dec_meta["layer_0"] is dec_meta["layer_1"]
+        assert dec_meta["layer_0"] is not meta_entry
+        assert dec_meta["layer_0"].owner_perm is owner_perm
+        assert not hasattr(meta_entry, "owner_perm")
+
     def test_forward_ced_with_active_replay_plan_and_scatter(self) -> None:
         model = self._create_model(ced_enabled=True, sp_enabled=True)
         hidden = torch.ones((4, 64))
