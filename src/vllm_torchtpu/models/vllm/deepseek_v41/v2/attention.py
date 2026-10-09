@@ -752,12 +752,17 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     def _get_stage_rope_cache(self, stage_cache: dict[Any, Any] | None = None):
         rope_cache = self._tpu_rope_cache
         if stage_cache is not None and isinstance(rope_cache, torch.Tensor):
+            # Same shape/dtype does not mean same values: compressed layers use
+            # compress_rope_theta (upstream deepseek_v41/common/rope.py), so the
+            # key must carry the rope config or layers read the wrong cos/sin.
             return stage_cache.setdefault(
                 (
                     "stage_tpu_rope_cache",
                     rope_cache.device,
                     rope_cache.shape,
                     rope_cache.dtype,
+                    bool(self.compress_ratio),
+                    getattr(self.rotary_emb, "base", None),
                 ),
                 rope_cache,
             )

@@ -1204,7 +1204,20 @@ class TestTd78StageInvariantHoistingAndFullCoverage:
         assert r1d_cast.shape == (1,) and r1d_cast.dtype == torch.int32
         assert int(r1d_cast.item()) == 3
 
+        attn.compress_ratio = 0
+        attn.rotary_emb = SimpleNamespace(base=10000.0)
         assert attn._get_stage_rope_cache(stage_cache) is rope_t
+        assert attn._get_stage_rope_cache(stage_cache) is rope_t
+
+        # A compressed layer (compress_rope_theta) has a same-shape cache with
+        # different values; it must not reuse the uncompressed layer's table.
+        other: Any = object.__new__(v2_attn.DeepseekV41Attention)
+        torch.nn.Module.__init__(other)
+        other_rope = torch.full((16, 8), 2.0, dtype=torch.bfloat16)
+        other._tpu_rope_cache = other_rope
+        other.compress_ratio = 4
+        other.rotary_emb = SimpleNamespace(base=160000.0)
+        assert other._get_stage_rope_cache(stage_cache) is other_rope
         assert attn._get_stage_rope_cache(stage_cache) is rope_t
 
     def test_non_causal_swa_and_int32_pages_starts_hoisting(self, monkeypatch):
