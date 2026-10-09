@@ -395,7 +395,10 @@ class Glm5MKD:
         cfg = self.cfg
         build_kw = dict(nb=self.nb, max_pages=self.max_pages, bmax=cfg.TMAX,
                         stack_w=self.stack_w, stack_c=self.stack_c)
-        call, info = K.build(cfg, axis_name=AXIS, **build_kw)
+        # GLM5_MKD_DEBUG=1: also return the per-layer owner rows (dbg_h) and owned winner lists
+        # (dbg_own) per rank -> self.last_dbg (parity diagnostics only)
+        self.debug = os.environ.get("GLM5_MKD_DEBUG", "0") == "1"
+        call, info = K.build(cfg, axis_name=AXIS, debug=self.debug, dbg_part=False, **build_kw)
         writer, winfo = K.build_writer(cfg, axis_name=AXIS, nb=self.nb, max_pages=self.max_pages,
                                        bmax=cfg.TMAX, stack_c=build_kw["stack_c"])
         assert list(info["w_names"]) == self.w_names, "weight operand order"
@@ -404,7 +407,8 @@ class Glm5MKD:
         n_w, n_c = len(self.weights), len(self.caches)
         rep = P()
         in_specs = (rep,) * 7 + (P(AXIS),) + tuple(self.w_specs) + tuple(self.c_specs)
-        out_specs = (P(AXIS),) + tuple(self.c_specs)
+        n_dbg = 2 if self.debug else 0
+        out_specs = (P(AXIS),) + tuple(self.c_specs) + (P(AXIS),) * n_dbg
 
         def body(*a):
             scal, rmeta, qmeta, bt, rvec, h0, tab, smalls = a[:8]
@@ -412,7 +416,7 @@ class Glm5MKD:
             outs = call(*a)
             out, nrow, rrow, irec = outs[:4]
             new = writer(scal, rmeta, bt, nrow, rrow, irec, *caches)
-            return (out, *new)
+            return (out, *new, *outs[4:4 + n_dbg])
 
         smap = jax.shard_map(body, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs,
                              check_vma=False)
@@ -439,8 +443,11 @@ class Glm5MKD:
         @op.register_fake
         def _(scal, rmeta, qmeta, bt, rvec, h0, tab, smalls, weights, caches):
             M = info["M"]
+            dbg = ([torch.empty((cfg.L, 2, cfg.RPR, cfg.H), dtype=torch.float32, device=h0.device),
+                    torch.empty((cfg.L, cfg.TMAX, cfg.KT // 128, 128), dtype=torch.int32, device=h0.device)]
+                   if n_dbg else [])
             return ([torch.empty((M, cfg.H), dtype=torch.bfloat16, device=h0.device)]
-                    + [torch.empty_like(c) for c in caches])
+                    + [torch.empty_like(c) for c in caches] + dbg)
 
         TMAX, M, DR = cfg.TMAX, info["M"], cfg.DR
         BMAX = cfg.TMAX
@@ -494,9 +501,10 @@ class Glm5MKD:
             tab[:, TMAX:, :] = torch.tensor([1.0, 0.0, 1.0, 0.0], device=dev)[:, None, None]
             h0 = self.backbone.embed_tokens(fit(ids, TMAX)).float()
             outs = op(scal, rmeta, qmeta, bt_b, rvec, h0, tab, smalls, list(weights), list(caches))
-            for dst, src in zip(caches, outs[1:]):
+            n_c_ = len(caches)
+            for dst, src in zip(caches, outs[1:1 + n_c_]):
                 dst.copy_(src)
-            return outs[0][:TMAX]
+            return (outs[0][:TMAX], *outs[1 + n_c_:])
 
         return torch.compile(step, backend="tpu", fullgraph=True, dynamic=False)
 
@@ -534,8 +542,11 @@ class Glm5MKD:
         if self._step is None:               # capture_model was skipped (e.g. a microbenchmark)
             self.bind_caches(runner)
         md = self._metadata()
-        out = self._step(input_ids, positions, md.query_start_loc, md.seq_lens, md.block_tables,
+        res = self._step(input_ids, positions, md.query_start_loc, md.seq_lens, md.block_tables,
                          self.cos_sin, self.smalls, self.weights, self.caches)
+        out = res[0]
+        if len(res) > 1:
+            self.last_dbg = tuple(res[1:])
         n = input_ids.shape[0]
         if n <= out.shape[0]:
             return out[:n]
@@ -555,7 +566,7 @@ class Glm5MKD:
         seq = torch.tensor([T] + [0] * (cfg.TMAX - 1), dtype=torch.int32, device=dev)
         bt = torch.zeros(cfg.TMAX * self.max_pages, dtype=torch.int32, device=dev)
         t0 = time.monotonic()
-        out = self._step(ids, pos, qsl, seq, bt, self.cos_sin, self.smalls, self.weights, self.caches)
+        out = self._step(ids, pos, qsl, seq, bt, self.cos_sin, self.smalls, self.weights, self.caches)[0]
         synchronize_tensors([out])
         logger.info("GLM-5.2 TPxDCP megakernel compiled and warmed in %.1f s (%d weight operands)",
                     time.monotonic() - t0, len(self.weights))
