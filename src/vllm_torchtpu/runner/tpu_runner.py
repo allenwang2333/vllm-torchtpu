@@ -8,6 +8,7 @@ import bisect
 import contextlib
 import copy
 import dataclasses
+import functools
 import math
 import os
 import time
@@ -525,6 +526,32 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
             f"{shapes}; the pipeline hand-off carries one per stage"
         )
     return next(iter(found.values()))
+
+
+@functools.lru_cache(maxsize=64)
+def _cached_identity_map(n: int) -> dict[int, int]:
+    r = range(n)
+    return dict(zip(r, r))
+
+
+@functools.lru_cache(maxsize=128)
+def _cached_uniform_draft_map(n: int, k: int) -> dict[int, int]:
+    return dict.fromkeys(range(n), k)
+
+
+def _uniform_placeholder_count(
+    num_draft_per_req: dict[int, int] | None, n_reqs: int
+) -> int | None:
+    if not num_draft_per_req:
+        return 1
+    if len(num_draft_per_req) == n_reqs and 0 in num_draft_per_req:
+        k0 = num_draft_per_req[0]
+        if num_draft_per_req is _cached_uniform_draft_map(n_reqs, k0) or (
+            (n_reqs - 1) in num_draft_per_req
+            and len(set(num_draft_per_req.values())) == 1
+        ):
+            return 1 + k0
+    return None
 
 
 # Recompilation-avoidance contract:
@@ -2519,24 +2546,26 @@ class TPUModelRunner(GPUModelRunner):
         return
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
-        invalidated_req_ids = (
-            scheduler_output.finished_req_ids
-            | (scheduler_output.preempted_req_ids or set())
-            | scheduler_output.scheduled_cached_reqs.resumed_req_ids
-        )
-        for req_id in invalidated_req_ids:
-            self._mamba_state_pos.pop(req_id, None)
-        self._mamba_offset_seeded.difference_update(invalidated_req_ids)
-        if self._pre_async_results is not None and invalidated_req_ids:
-            # These results belong to freed KV state, including a finished ID
-            # resubmitted in this step. Other requests retain their source rows.
+        finished_req_ids = scheduler_output.finished_req_ids
+        preempted_req_ids = scheduler_output.preempted_req_ids
+        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        if finished_req_ids or preempted_req_ids or resumed_req_ids:
+            invalidated_req_ids = (
+                finished_req_ids | (preempted_req_ids or set()) | resumed_req_ids
+            )
             for req_id in invalidated_req_ids:
-                self._pre_async_results.req_id_to_index_copy.pop(req_id, None)
-            self._pre_async_results.request_seq_lens = [
-                record
-                for record in self._pre_async_results.request_seq_lens
-                if record[3] not in invalidated_req_ids
-            ]
+                self._mamba_state_pos.pop(req_id, None)
+            self._mamba_offset_seeded.difference_update(invalidated_req_ids)
+            if self._pre_async_results is not None:
+                # These results belong to freed KV state, including a finished ID
+                # resubmitted in this step. Other requests retain their source rows.
+                for req_id in invalidated_req_ids:
+                    self._pre_async_results.req_id_to_index_copy.pop(req_id, None)
+                self._pre_async_results.request_seq_lens = [
+                    record
+                    for record in self._pre_async_results.request_seq_lens
+                    if record[3] not in invalidated_req_ids
+                ]
         # Disable vLLM's native GPU async spec-decode num_computed_tokens
         # correction. The TPU runner does its own async rejection correction,
         # so letting the base also correct would double-count.
@@ -2615,6 +2644,7 @@ class TPUModelRunner(GPUModelRunner):
         max_model_len = token_ids_cpu.shape[1]
         get_draft = pre_num_draft_per_req.get if pre_num_draft_per_req else None
         n_reqs = len(pre_request_seq_lens)
+        batch_req_ids = getattr(self.input_batch, "req_ids", None)
         if (
             not pre_discard_sampled_tokens_req_indices
             and n_reqs > 1
@@ -2625,33 +2655,46 @@ class TPUModelRunner(GPUModelRunner):
             and pre_request_seq_lens[-1][0] == n_reqs - 1
             and len(gen_lens) == n_reqs
             and all(gen_lens)
-            and [req_id_to_index.get(r[3]) for r in pre_request_seq_lens]
-            == list(range(n_reqs))
-        ):
-            first_placeholder = 1 + (get_draft(0, 0) if get_draft is not None else 0)
-            same_placeholder = True
-            placeholder_list = []
-            for pre_req_idx, req_state, _seq_len, req_id in pre_request_seq_lens:
-                sampled_ids = valid_sampled_token_ids[pre_req_idx]
-                n_placeholder = 1 + (
-                    get_draft(pre_req_idx, 0) if get_draft is not None else 0
+            and (
+                (
+                    batch_req_ids is not None
+                    and len(req_id_to_index) >= n_reqs
+                    and batch_req_ids[:n_reqs] == pre_req_ids
                 )
-                if n_placeholder != first_placeholder:
-                    same_placeholder = False
-                placeholder_list.append(n_placeholder)
-                assert len(sampled_ids) <= n_placeholder, (
-                    f"req {req_id}: sampled {len(sampled_ids)} tokens > "
-                    f"{n_placeholder} optimistic placeholders -- output_token_ids "
-                    "rollback would drop the wrong elements"
-                )
-                req_state.output_token_ids[-n_placeholder:] = sampled_ids
-
-            end_idx = num_tokens_no_spec[:n_reqs]
-            start_idx = end_idx - (
-                first_placeholder
-                if same_placeholder
-                else np.asarray(placeholder_list, dtype=end_idx.dtype)
+                or [req_id_to_index.get(r[3]) for r in pre_request_seq_lens]
+                == list(range(n_reqs))
             )
+        ):
+            uniform_placeholder = _uniform_placeholder_count(
+                pre_num_draft_per_req, n_reqs
+            )
+            if uniform_placeholder is not None:
+                neg_placeholder = -uniform_placeholder
+                for pre_req_idx, req_state, _seq_len, req_id in pre_request_seq_lens:
+                    sampled_ids = valid_sampled_token_ids[pre_req_idx]
+                    assert len(sampled_ids) <= uniform_placeholder, (
+                        f"req {req_id}: sampled {len(sampled_ids)} tokens > "
+                        f"{uniform_placeholder} optimistic placeholders -- "
+                        "output_token_ids rollback would drop the wrong elements"
+                    )
+                    req_state.output_token_ids[neg_placeholder:] = sampled_ids
+                end_idx = num_tokens_no_spec[:n_reqs]
+                start_idx = end_idx - uniform_placeholder
+            else:
+                assert get_draft is not None
+                placeholder_list = []
+                for pre_req_idx, req_state, _seq_len, req_id in pre_request_seq_lens:
+                    sampled_ids = valid_sampled_token_ids[pre_req_idx]
+                    n_placeholder = 1 + get_draft(pre_req_idx, 0)
+                    placeholder_list.append(n_placeholder)
+                    assert len(sampled_ids) <= n_placeholder, (
+                        f"req {req_id}: sampled {len(sampled_ids)} tokens > "
+                        f"{n_placeholder} optimistic placeholders -- output_token_ids "
+                        "rollback would drop the wrong elements"
+                    )
+                    req_state.output_token_ids[-n_placeholder:] = sampled_ids
+                end_idx = num_tokens_no_spec[:n_reqs]
+                start_idx = end_idx - np.asarray(placeholder_list, dtype=end_idx.dtype)
             lens_arr = np.asarray(gen_lens, dtype=end_idx.dtype)
             end_tok_idx = start_idx + lens_arr
             assert int(end_tok_idx.max()) <= max_model_len, (
@@ -2661,10 +2704,15 @@ class TPUModelRunner(GPUModelRunner):
             num_tokens_no_spec[:n_reqs] = end_tok_idx
             sampled_np = pre_next_tokens_cpu[:n_reqs].numpy()
             w = sampled_np.shape[1]
-            flat_idx = (np.arange(n_reqs, dtype=np.intp) * max_model_len + start_idx)[
-                :, None
-            ] + np.arange(w, dtype=np.intp)
-            col_mask = np.arange(w, dtype=np.int32) < lens_arr[:, None]
+            arange_np: Any = getattr(self, "arange_np", None)
+            if isinstance(arange_np, np.ndarray) and arange_np.size >= max(n_reqs, w):
+                req_arange = arange_np[:n_reqs]
+                col_arange = arange_np[:w]
+            else:
+                req_arange = np.arange(n_reqs, dtype=np.intp)
+                col_arange = np.arange(w, dtype=np.intp)
+            flat_idx = (req_arange * max_model_len + start_idx)[:, None] + col_arange
+            col_mask = col_arange < lens_arr[:, None]
             val_mask = sampled_np != INVALID_TOKEN_ID
             token_ids_cpu.ravel()[flat_idx[col_mask]] = sampled_np[val_mask]
             return
@@ -2737,25 +2785,32 @@ class TPUModelRunner(GPUModelRunner):
             and request_seq_lens[0][0] == 0
             and request_seq_lens[-1][0] == n_reqs - 1
         ):
-            if not num_draft_per_req:
-                num_tokens_no_spec[:n_reqs] += 1
-                one_zero = (0,)
+            uniform_n_new = _uniform_placeholder_count(num_draft_per_req, n_reqs)
+            if uniform_n_new is not None:
+                num_tokens_no_spec[:n_reqs] += uniform_n_new
+                zeros = (0,) * uniform_n_new
+                if (
+                    next_token_indices is _cached_identity_map(n_reqs)
+                    and len(req_id_to_index) == n_reqs
+                ):
+                    for req_idx, req_state, _seq_len, req_id in request_seq_lens:
+                        assert req_id_to_index[req_id] == req_idx
+                        req_state.output_token_ids.extend(zeros)
+                    return req_id_to_index.copy()
                 for req_idx, req_state, _seq_len, req_id in request_seq_lens:
                     assert req_id_to_index[req_id] == req_idx
-                    req_state.output_token_ids.extend(one_zero)
+                    req_state.output_token_ids.extend(zeros)
                     placeholder_req_id_to_index[req_state.req_id] = next_token_indices[
                         req_idx
                     ]
                 return placeholder_req_id_to_index
+            assert num_draft_per_req is not None
             first_n_new = 1 + num_draft_per_req.get(0, 0)
             first_zeros = (0,) * first_n_new
-            same_n_new = True
             n_new_list = []
             for req_idx, req_state, _seq_len, req_id in request_seq_lens:
                 assert req_id_to_index[req_id] == req_idx
                 n_new = 1 + num_draft_per_req.get(req_idx, 0)
-                if n_new != first_n_new:
-                    same_n_new = False
                 n_new_list.append(n_new)
                 req_state.output_token_ids.extend(
                     first_zeros if n_new == first_n_new else (0,) * n_new
@@ -2763,12 +2818,9 @@ class TPUModelRunner(GPUModelRunner):
                 placeholder_req_id_to_index[req_state.req_id] = next_token_indices[
                     req_idx
                 ]
-            if same_n_new:
-                num_tokens_no_spec[:n_reqs] += first_n_new
-            else:
-                num_tokens_no_spec[:n_reqs] += np.asarray(
-                    n_new_list, dtype=num_tokens_no_spec.dtype
-                )
+            num_tokens_no_spec[:n_reqs] += np.asarray(
+                n_new_list, dtype=num_tokens_no_spec.dtype
+            )
             return placeholder_req_id_to_index
 
         for req_idx, req_state, _seq_len, req_id in request_seq_lens:
@@ -2857,10 +2909,10 @@ class TPUModelRunner(GPUModelRunner):
         num_rejected_chunks: list[torch.Tensor] = []
         num_draft_per_req: dict[int, int] = {}
         req_offset = 0
+        is_single_chunk = len(next_tokens_per_chunk) == 1
         single_chunk_pad_reqs = (
             getattr(self, "max_num_reqs", None)
-            if len(next_tokens_per_chunk) == 1
-            and getattr(self, "speculative_config", None) is not None
+            if is_single_chunk and getattr(self, "speculative_config", None) is not None
             else None
         )
         single_chunk_pad_src = (
@@ -2886,16 +2938,25 @@ class TPUModelRunner(GPUModelRunner):
             )
             num_rejected_chunks.append(num_rejected)
             if md is not None:
-                num_draft_per_req.update(
-                    zip(
-                        range(req_offset, req_offset + num_reqs),
-                        md.draft_lengths_cpu[:num_reqs].tolist(),
+                draft_lens_list = md.draft_lengths_cpu[:num_reqs].tolist()
+                if (
+                    is_single_chunk
+                    and num_reqs > 0
+                    and draft_lens_list.count(draft_lens_list[0]) == num_reqs
+                ):
+                    num_draft_per_req = _cached_uniform_draft_map(
+                        num_reqs, draft_lens_list[0]
                     )
-                )
+                else:
+                    num_draft_per_req.update(
+                        zip(
+                            range(req_offset, req_offset + num_reqs),
+                            draft_lens_list,
+                        )
+                    )
             next_tokens_tpu_chunks.append(src)
             req_offset += num_reqs
-        req_range = range(req_offset)
-        next_token_indices = dict(zip(req_range, req_range))
+        next_token_indices = _cached_identity_map(req_offset)
         spec_num_rejected = (
             num_rejected_chunks[0]
             if len(num_rejected_chunks) == 1
@@ -2935,9 +2996,8 @@ class TPUModelRunner(GPUModelRunner):
             req_offset += n
         # These drafts belong to the NEXT step. The current prefill sampled one
         # token and has only one output placeholder.
-        req_range = range(req_offset)
-        next_token_indices = dict(zip(req_range, req_range))
-        num_draft_per_req = dict.fromkeys(req_range, 0)
+        next_token_indices = _cached_identity_map(req_offset)
+        num_draft_per_req = _cached_uniform_draft_map(req_offset, 0)
         max_reqs = getattr(self, "max_num_reqs", None)
         rejected_len = max(req_offset, max_reqs) if max_reqs is not None else req_offset
         spec_num_rejected = (
