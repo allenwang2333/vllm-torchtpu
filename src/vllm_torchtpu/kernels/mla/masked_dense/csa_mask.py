@@ -54,6 +54,7 @@ def mask_kernel(
         mask_out_vmem_ref[pl.ds(0, 1), pl.ds(0, max_kv_len)] = jnp.zeros(
             (1, max_kv_len), dtype=jnp.int32
         )
+        one_i32 = jnp.ones((1,), dtype=jnp.int32)
 
         if topk % 8 == 0:
             # Read 8 indices per SIMD load; `unroll=8` keeps the scatter
@@ -64,9 +65,7 @@ def mask_kernel(
                     idx = vec_idx[lane]
 
                     def write_fn(i=idx):
-                        mask_out_vmem_ref[0, pl.ds(i, 1)] = jnp.ones(
-                            (1,), dtype=jnp.int32
-                        )
+                        mask_out_vmem_ref[0, pl.ds(i, 1)] = one_i32
 
                     jax.lax.cond(
                         (idx >= 0) & (idx < max_kv_len), write_fn, lambda: None
@@ -79,7 +78,7 @@ def mask_kernel(
                 idx = topk_indices_vmem_ref[0, pl.ds(k, 1)][0]
 
                 def write_fn(i=idx):
-                    mask_out_vmem_ref[0, pl.ds(i, 1)] = jnp.ones((1,), dtype=jnp.int32)
+                    mask_out_vmem_ref[0, pl.ds(i, 1)] = one_i32
 
                 jax.lax.cond((idx >= 0) & (idx < max_kv_len), write_fn, lambda: None)
 
@@ -123,8 +122,10 @@ def generate_mask_sc(
     # The grid stripes rows across subcores, so the row count must divide
     # evenly; `-1` rows produce an all-zero mask row and are then dropped.
     pad_size = (num_cores - (chunk_size % num_cores)) % num_cores
-    padded_topk_indices = jnp.pad(
-        topk_indices, ((0, pad_size), (0, 0)), constant_values=-1
+    padded_topk_indices = (
+        jnp.pad(topk_indices, ((0, pad_size), (0, 0)), constant_values=-1)
+        if pad_size
+        else topk_indices
     )
     padded_chunk_size = chunk_size + pad_size
 
@@ -152,4 +153,4 @@ def generate_mask_sc(
         name="sc_mask_generate",
     )(padded_topk_indices)
 
-    return out[:chunk_size, :]
+    return out[:chunk_size, :] if pad_size else out

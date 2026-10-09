@@ -19,6 +19,7 @@ NOTE: Currently designed for 8-bit / FP8 KV caches (1 byte per element). We use
 
 import dataclasses
 import enum
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -62,15 +63,22 @@ _LAYOUT_DTYPES = {
     KVCacheLayout.SPARSECORE: jnp.uint32,
 }
 
+_LAYOUT_TORCH_DTYPES = {
+    KVCacheLayout.TENSORCORE: pallas.JAX_TO_TORCH_DTYPE_MAP[jnp.dtype(jnp.uint8)],
+    KVCacheLayout.SPARSECORE: pallas.JAX_TO_TORCH_DTYPE_MAP[jnp.dtype(jnp.uint32)],
+}
+
 
 def align_to(x: int, a: int) -> int:
     return (x + a - 1) // a * a
 
 
+@functools.cache
 def get_dtype_bitwidth(dtype: jnp.dtype) -> int:
     return jax.dtypes.itemsize_bits(dtype)
 
 
+@functools.cache
 def get_dtype_packing(dtype: jnp.dtype) -> int:
     bits = get_dtype_bitwidth(dtype)
     return 32 // bits
@@ -152,7 +160,7 @@ class SparseMLAKVCacheSpec:
 
     @property
     def torch_dtype(self) -> torch.dtype:
-        return pallas.JAX_TO_TORCH_DTYPE_MAP[jnp.dtype(self.jax_dtype)]
+        return _LAYOUT_TORCH_DTYPES[self.layout]
 
     @property
     def token_bytes(self) -> int:
@@ -184,7 +192,13 @@ class SparseMLAKVCacheSpec:
 
 def as_token_bytes(values: jax.Array, token_bytes: int) -> jax.Array:
     """`[num_tokens, n]` -> `[num_tokens, token_bytes]` uint8, zero-padded."""
-    u8 = jax.lax.bitcast_convert_type(values, jnp.uint8).reshape(values.shape[0], -1)
+    u8 = (
+        values
+        if values.dtype == jnp.uint8 and values.ndim == 2
+        else jax.lax.bitcast_convert_type(values, jnp.uint8).reshape(
+            values.shape[0], -1
+        )
+    )
     assert u8.shape[-1] <= token_bytes, (
         f"token is {u8.shape[-1]}B, more than the {token_bytes}B reserved for it"
     )

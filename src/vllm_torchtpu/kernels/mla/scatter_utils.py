@@ -53,6 +53,7 @@ class Plan(NamedTuple):
         return self.steps_per_core * self.blocks_per_round * self.lanes_per_block
 
 
+@functools.cache
 def split_plan(num_tokens: int, num_lanes: int, num_cores: int) -> Plan:
     """Choose the token -> subcore mapping for a step of ``num_tokens``."""
     assert num_tokens > 0, f"num_tokens must be positive (got {num_tokens})"
@@ -93,11 +94,15 @@ def _scatter_kernel(
         cache_words = cache_ref
     num_rows = cache_words.shape[0]
 
-    block_slot = core_index // plan.cores_per_block
-    lane_group = lax.rem(core_index, plan.cores_per_block)
+    cores_per_block = plan.cores_per_block
+    blocks_per_round = plan.blocks_per_round
+    lanes_per_core = plan.lanes_per_core
+    multi_core_block = cores_per_block > 1
+    block_slot = core_index // cores_per_block
+    lane_group = lax.rem(core_index, cores_per_block)
 
     def block_index(step):
-        return step * plan.blocks_per_round + block_slot
+        return step * blocks_per_round + block_slot
 
     def body(dst_ref, src_buf):
         dst_rows = dst_ref[...]
@@ -105,8 +110,8 @@ def _scatter_kernel(
         for i in range(plan.lanes_per_block):
             dst = dst_rows[i]
             write = jnp.logical_and(dst >= 0, dst < num_rows)
-            if plan.cores_per_block > 1:
-                write = jnp.logical_and(write, lane_group == i // plan.lanes_per_core)
+            if multi_core_block:
+                write = jnp.logical_and(write, lane_group == i // lanes_per_core)
             row = jnp.clip(dst, 0, num_rows - 1)
             copy = pltpu.make_async_copy(
                 src_buf.at[pl.ds(i, 1)],
@@ -142,6 +147,9 @@ def _scatter_kernel(
     )(dst_hbm_ref, src_words)
 
 
+_TC_ROW_BYTES = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
+
+
 def scatter_rows(
     cache: jax.Array,
     src: jax.Array,
@@ -171,10 +179,9 @@ def scatter_rows(
     assert tc_tiled or cache.dtype == jnp.uint32, (
         f"cache must be uint8 (TensorCore) or uint32 (SparseCore), got {cache.dtype}"
     )
-    tc_row_bytes = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
-    assert not tc_tiled or src.shape[-1] == tc_row_bytes, (
+    assert not tc_tiled or src.shape[-1] == _TC_ROW_BYTES, (
         f"TensorCore tiling folds exactly {kv_cache_utils.WORD_BYTES} rows, so a"
-        f" token must be {tc_row_bytes}B (got {src.shape[-1]}B)"
+        f" token must be {_TC_ROW_BYTES}B (got {src.shape[-1]}B)"
     )
 
     sc_info = pltpu.get_tpu_info().sparse_core
@@ -192,6 +199,7 @@ def scatter_rows(
     # A TC-tiled token is WORD_BYTES uint8 rows the kernel folds back into one.
     row_width = kv_cache_utils.TILE_LANE_BYTES if tc_tiled else src.shape[-1]
     cache_ref = jax.new_ref(cache.reshape(-1, row_width))
+    src_rows = src.reshape(-1, row_width) if tc_tiled else src
 
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
@@ -216,6 +224,6 @@ def scatter_rows(
         ),
         mesh=vector_mesh,
         name=name,
-    )(dst_rows, src.reshape(-1, row_width), cache_ref)
+    )(dst_rows, src_rows, cache_ref)
 
     return jax.freeze(cache_ref).reshape(cache.shape)

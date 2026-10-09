@@ -138,6 +138,9 @@ def matches_glm52_tpu7x_profile(
     )
 
 
+_UNAVAILABLE_COST = jnp.iinfo(jnp.int32).max
+
+
 def applies(
     ql_nope: jax.Array,
     q_pe: jax.Array,
@@ -152,15 +155,16 @@ def applies(
     compiles exactly the original sparse graph. The layer asks only when
     `admit_layer` admitted it.
     """
+    if (
+        cache_layout != sparse_kernel.TENSORCORE_CACHE_LAYOUT
+        or ql_nope.shape[0] < MASKED_DENSE_MIN_TOKEN_BUCKET
+    ):
+        return False
     query = jax.ShapeDtypeStruct(
         (*ql_nope.shape[:-1], ql_nope.shape[-1] + q_pe.shape[-1]), ql_nope.dtype
     )
-    return bool(
-        cache_layout == sparse_kernel.TENSORCORE_CACHE_LAYOUT
-        and query.shape[0] >= MASKED_DENSE_MIN_TOKEN_BUCKET
-        and matches_glm52_tpu7x_profile(
-            query, kv_cache_nope, kv_cache_rope, topk_indices
-        )
+    return matches_glm52_tpu7x_profile(
+        query, kv_cache_nope, kv_cache_rope, topk_indices
     )
 
 
@@ -168,6 +172,7 @@ def split_point(
     seq_lens: jax.Array,
     request_distribution: jax.Array,
     limit: int,
+    _precomputed: tuple[jax.Array, jax.Array, jax.Array] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Splits a step into a sparse prefix and a masked-dense suffix.
 
@@ -175,9 +180,13 @@ def split_point(
     exceeds `limit`. Returns `(split_seq, contiguous)`: the split is usable
     only when `contiguous`, i.e. those requests are exactly `[0, split_seq)`.
     """
-    seq_ids = jnp.arange(seq_lens.shape[0])
-    active = seq_ids < request_distribution[2]
-    in_prefix = active & ((seq_ids < request_distribution[0]) | (seq_lens > limit))
+    if _precomputed is None:
+        seq_ids = jnp.arange(seq_lens.shape[0])
+        active = seq_ids < request_distribution[2]
+        is_decode = seq_ids < request_distribution[0]
+    else:
+        seq_ids, active, is_decode = _precomputed
+    in_prefix = active & (is_decode | (seq_lens > limit))
     split_seq = jnp.sum(in_prefix).astype(jnp.int32)
     contiguous = jnp.all(~active | (in_prefix == (seq_ids < split_seq)))
     return split_seq, contiguous
@@ -200,24 +209,29 @@ def select_tier(
     """
     if cost_model is None:
         cost_model = MASKED_DENSE_PREFILL_COST_MODEL
-    unavailable = jnp.iinfo(jnp.int32).max
+    unavailable = _UNAVAILABLE_COST
     max_num_seqs = seq_lens.shape[0]
     num_seqs = request_distribution[2]
     seq_ids = jnp.arange(max_num_seqs)
     active = seq_ids < num_seqs
+    is_decode = seq_ids < request_distribution[0]
+    precomputed_split = (seq_ids, active, is_decode)
     q_lens = query_start_loc[1 : max_num_seqs + 1] - query_start_loc[:max_num_seqs]
     kv_blocks = (jnp.where(active, seq_lens, 0) + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
     q_blocks = (q_lens + QUERY_BLOCK_SIZE - 1) // QUERY_BLOCK_SIZE
+    q_kv_blocks = q_blocks * kv_blocks
     num_tokens = query_start_loc[num_seqs]
 
     def masked_dense_cost(limit, fixed_ns, token_ns, bitmap):
         if limit == 0:
             return jnp.array(unavailable, jnp.int32)
-        split_seq, contiguous = split_point(seq_lens, request_distribution, limit)
+        split_seq, contiguous = split_point(
+            seq_lens, request_distribution, limit, _precomputed=precomputed_split
+        )
         split_token = query_start_loc[split_seq]
         suffix_tokens = num_tokens - split_token
         suffix = active & (seq_ids >= split_seq)
-        suffix_grid = jnp.sum(jnp.where(suffix, q_blocks * kv_blocks, 0))
+        suffix_grid = jnp.sum(jnp.where(suffix, q_kv_blocks, 0))
         # The CSA bitmap is generated for every query row, prefix included.
         dense_tokens = num_tokens if bitmap else suffix_tokens
         cost = (
@@ -415,14 +429,11 @@ def configuration_rejection(vllm_config) -> str | None:
         or GLM52_ARCHITECTURE not in architectures
     ):
         return "the model is not GLM-5.2"
-    geometry = tuple(
-        getattr(hf_config, name, None)
-        for name in (
-            "num_attention_heads",
-            "kv_lora_rank",
-            "qk_rope_head_dim",
-            "index_topk",
-        )
+    geometry = (
+        getattr(hf_config, "num_attention_heads", None),
+        getattr(hf_config, "kv_lora_rank", None),
+        getattr(hf_config, "qk_rope_head_dim", None),
+        getattr(hf_config, "index_topk", None),
     )
     if geometry != (GLM52_NUM_HEADS, GLM52_NOPE_DIM, GLM52_ROPE_DIM, GLM52_INDEX_TOPK):
         return f"model geometry {geometry} is not the calibrated GLM-5.2 profile"
@@ -469,9 +480,8 @@ def layer_rejection(attn_module, kv_cache_specs, page_size: int) -> str | None:
     the shared buffer; a layer that states neither is rejected.
     """
     impl = getattr(attn_module, "impl", None)
-    if any(
-        getattr(module, "non_causal_multi_token_decode", False)
-        for module in (attn_module, impl)
+    if getattr(attn_module, "non_causal_multi_token_decode", False) or getattr(
+        impl, "non_causal_multi_token_decode", False
     ):
         return "non-causal attention"
     if not kv_cache_specs or any(
@@ -479,9 +489,10 @@ def layer_rejection(attn_module, kv_cache_specs, page_size: int) -> str | None:
         for spec in kv_cache_specs
     ):
         return "the KV caches are not in the TensorCore layout"
-    geometry = tuple(
-        getattr(attn_module, name, None)
-        for name in ("num_heads", "kv_lora_rank", "qk_rope_head_dim")
+    geometry = (
+        getattr(attn_module, "num_heads", None),
+        getattr(attn_module, "kv_lora_rank", None),
+        getattr(attn_module, "qk_rope_head_dim", None),
     )
     if geometry != (GLM52_NUM_HEADS, GLM52_NOPE_DIM, GLM52_ROPE_DIM):
         return f"layer geometry {geometry} is not the calibrated GLM-5.2 profile"
@@ -549,25 +560,30 @@ def order_prefills_by_kv_len(
     affects performance only. Ties keep their current order, and
     `swap_states` moves every request-associated buffer with its request.
     """
+    if end - start <= 1:
+        return
+    input_batch = runner.input_batch
+    req_ids = input_batch.req_ids
+    num_computed_cpu = input_batch.num_computed_tokens_cpu
+    num_scheduled = scheduler_output.num_scheduled_tokens
+    swap_states = input_batch.swap_states
     tail: list[str] = []
     kv_lens: dict[str, int] = {}
     position: dict[str, int] = {}
     for i in range(start, end):
-        req_id = runner.input_batch.req_ids[i]
+        req_id = req_ids[i]
         assert req_id is not None
         tail.append(req_id)
-        kv_lens[req_id] = int(runner.input_batch.num_computed_tokens_cpu[i]) + int(
-            scheduler_output.num_scheduled_tokens[req_id]
-        )
+        kv_lens[req_id] = int(num_computed_cpu[i]) + int(num_scheduled[req_id])
         position[req_id] = i
     for dst, req_id in enumerate(
         sorted(tail, key=kv_lens.__getitem__, reverse=True), start
     ):
         src = position[req_id]
         if src != dst:
-            displaced = runner.input_batch.req_ids[dst]
+            displaced = req_ids[dst]
             assert displaced is not None
-            runner.input_batch.swap_states(dst, src)
+            swap_states(dst, src)
             position[displaced] = src
             position[req_id] = dst
 
