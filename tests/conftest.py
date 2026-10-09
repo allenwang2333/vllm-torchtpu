@@ -106,6 +106,12 @@ def device(request):
     """
     use_tpu = request.config.getoption("--use-tpu")
     if use_tpu:
+        from vllm_torchtpu.tpu_info import get_num_chips
+
+        if get_num_chips() == 0:
+            # `--use-tpu` defaults on; a host with no TPU attached skips
+            # rather than erroring every device-parametrized test.
+            pytest.skip("requires an attached TPU chip")
         try:
             import torch_tpu  # noqa: F401
 
@@ -115,6 +121,20 @@ def device(request):
         except Exception as e:
             pytest.fail(f"TPU requested but failed to initialize: {e}")
     return torch.device("cpu")
+
+
+@pytest.fixture
+def requires_tpu():
+    """Skip at setup when no TPU chip is attached.
+
+    A fixture, not a module-level `skipif`, so nothing probes the accelerator
+    during collection (see `pytest_collection_finish`). `get_num_chips` only
+    inspects /dev, so it never builds a PJRT client.
+    """
+    from vllm_torchtpu.tpu_info import get_num_chips
+
+    if get_num_chips() == 0:
+        pytest.skip("requires an attached TPU chip")
 
 
 def pytest_collection_finish(session):

@@ -318,6 +318,7 @@ def _require_tpu() -> None:
         "t300-k10-h5120",
     ],
 )
+@pytest.mark.usefixtures("requires_tpu")
 def test_moe_gmm_non_ep_prefill_ragged_combine_matches_reference(
     monkeypatch, masked, num_tokens, topk, hidden, uses_v3
 ):
@@ -541,6 +542,7 @@ def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
     assert call.kwargs == {"num_tokens": 2}
 
 
+@pytest.mark.usefixtures("requires_tpu")
 def test_fused_moe_local_routing_matches_reference():
     _require_tpu()
 
@@ -705,6 +707,7 @@ def _make_ep_inputs(num_local_experts, seed=0):
         (20, 60),  # rank 3 of 8-way EP (Qwen3-480B-FP8 shape: 160 / 8 = 20 local)
     ],
 )
+@pytest.mark.usefixtures("requires_tpu")
 def test_fused_moe_global_id_remap_matches_local(num_local_experts, experts_start):
     """Global ids + experts_start must produce the same output as local ids."""
     _require_tpu()
@@ -746,6 +749,7 @@ def test_fused_moe_global_id_remap_matches_local(num_local_experts, experts_star
     )
 
 
+@pytest.mark.usefixtures("requires_tpu")
 def test_fused_moe_global_id_remap_masks_out_of_range():
     """Non-local global ids must contribute zero (range check + jnp.where)."""
     _require_tpu()
@@ -793,6 +797,7 @@ def test_fused_moe_global_id_remap_masks_out_of_range():
     )
 
 
+@pytest.mark.usefixtures("requires_tpu")
 def test_fused_moe_func_int4_packed_matches_reference():
     _require_tpu()
 

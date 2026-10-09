@@ -43,6 +43,7 @@ def _target_group_sizes() -> np.ndarray:
 
 
 @pytest.mark.nightly
+@pytest.mark.usefixtures("requires_tpu")
 def test_qwen35_target_shape_single_device_smoke() -> None:
     device = _require_tpu()
     route_capacity = 2560
