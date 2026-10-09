@@ -8,6 +8,7 @@ pipeline. Each shape bucket gets its own compiled executable.
 
 import copy
 import dataclasses
+import functools
 import hashlib
 import importlib.util
 import json
@@ -21,6 +22,7 @@ from typing import Any
 import torch
 import torch._guards
 import torch.fx as fx
+from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch_tpu._internal.compile._backend import TpuBackend
 from vllm.compilation.compiler_interface import CompilerInterface
@@ -29,9 +31,23 @@ from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    config as _streamindex_topk_config,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_ORIG_METADATA_VERSION = importlib_metadata.version
+_CACHED_METADATA_VERSION = functools.lru_cache(maxsize=16)(_ORIG_METADATA_VERSION)
+
+
+def _pkg_version(name: str) -> str:
+    version_fn = importlib_metadata.version
+    if version_fn is _ORIG_METADATA_VERSION:
+        return _CACHED_METADATA_VERSION(name)
+    return version_fn(name)
 
 
 @dataclasses.dataclass
@@ -272,10 +288,10 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     spec = vllm_config.speculative_config
     factors = {
         "torch": torch.__version__,
-        "torch_tpu": importlib_metadata.version("torch-tpu"),
-        "jax": importlib_metadata.version("jax"),
-        "jaxlib": importlib_metadata.version("jaxlib"),
-        "libtpu": importlib_metadata.version("libtpu"),
+        "torch_tpu": _pkg_version("torch-tpu"),
+        "jax": _pkg_version("jax"),
+        "jaxlib": _pkg_version("jaxlib"),
+        "libtpu": _pkg_version("libtpu"),
         "env": _tpu_compile_env_factors(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
         "parallel": {
@@ -315,7 +331,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "param_layouts": {"rope_tables": "row_major"},
     }
 
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = _REPO_ROOT
     hash_obj = hashlib.sha256(
         json.dumps(factors, sort_keys=True, separators=(",", ":")).encode()
     )
@@ -430,8 +446,6 @@ class TpuCompilerAdaptor(CompilerInterface):
         # bypasses with "No shape env" when the tracing context has none, which
         # is fatal for these static graphs. An (empty) ShapeEnv yields empty
         # guards -- correct for static shapes -- and lets the artifact cache work.
-        from torch._subclasses.fake_tensor import FakeTensor
-
         fake_mode = next(
             (t.fake_mode for t in example_inputs if isinstance(t, FakeTensor)), None
         )
@@ -445,9 +459,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # not depend on what this process compiled before: every rank then
         # builds the same key for a bucket and can hit an executable another
         # rank already put in the Tier-2 cache.
-        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
-
-        config.reset_scheduling_group_ids()
+        _streamindex_topk_config.reset_scheduling_group_ids()
         with torch._guards.tracing(tracing_ctx):
             compiled_fn = _tpu_backend(graph, example_inputs)
 
@@ -523,23 +535,24 @@ class TpuCompilerAdaptor(CompilerInterface):
             reason = f"unexpected payload type {type(payload).__name__}"
         elif payload.entry is None:
             reason = "no bundled entry"
-        elif payload.signature != shape_variants.graph_signature(graph):
-            # Not what makes the bundled entry safe -- that comes from wrapper
-            # and executable being one object, with no lookup left to drift.
-            # This is the same check BucketExecutables.get already applies to
-            # the in-memory hand-over, extended across processes, and it earns
-            # its place because nothing else validates the entry against the
-            # graph: torch_tpu injects a synthetic cache_info and stubs out
-            # generate_guards_expression, and replaying a pickle we wrote
-            # ourselves never goes through AOTAutogradCache.try_load.
-            # Placeholders only, so a changed graph *body* still passes -- that
-            # is compute_tpu_compilation_hash's job, not this one.
-            reason = (
-                f"graph signature changed ({payload.signature} vs "
-                f"{shape_variants.graph_signature(graph)})"
-            )
-        elif payload.was_wrapped != was_wrapped:
-            reason = "output-tuple wrapping differs from the saved graph"
+        else:
+            current_sig = shape_variants.graph_signature(graph)
+            if payload.signature != current_sig:
+                # Not what makes the bundled entry safe -- that comes from wrapper
+                # and executable being one object, with no lookup left to drift.
+                # This is the same check BucketExecutables.get already applies to
+                # the in-memory hand-over, extended across processes, and it earns
+                # its place because nothing else validates the entry against the
+                # graph: torch_tpu injects a synthetic cache_info and stubs out
+                # generate_guards_expression, and replaying a pickle we wrote
+                # ourselves never goes through AOTAutogradCache.try_load.
+                # Placeholders only, so a changed graph *body* still passes -- that
+                # is compute_tpu_compilation_hash's job, not this one.
+                reason = (
+                    f"graph signature changed ({payload.signature} vs {current_sig})"
+                )
+            elif payload.was_wrapped != was_wrapped:
+                reason = "output-tuple wrapping differs from the saved graph"
         if reason is not None:
             logger.warning(
                 "[TpuCompilerAdaptor] Ignoring artifact %s: %s", path, reason

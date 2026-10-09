@@ -115,31 +115,32 @@ def ensure_runai_aux_files(model_config) -> None:
         return
 
     tokenizer = model_config.tokenizer
-    if rewritten and tokenizer == model_config.model:
+    if rewritten and tokenizer == model:
         # Upstream pulled the tokenizer into the model dir; ask it to do
         # the same here.
         tokenizer = uri
 
     with get_lock(uri):
-        if rewritten and _is_complete(model_config.model):
+        if rewritten and _is_complete(model):
             _report_tokenizer_gap(model_config)
             return
         logger.info(
             "[runai-repull] pulling aux files for %s on this host "
             "(model_config.model=%s)",
             uri,
-            model_config.model,
+            model,
         )
         # Upstream treats a set model_weights as "already pulled".
         model_config.model_weights = None
         if rewritten:
-            os.makedirs(model_config.model, exist_ok=True)
-            _touch(os.path.join(model_config.model, PULLING_SENTINEL), uri)
+            os.makedirs(model, exist_ok=True)
+            _touch(os.path.join(model, PULLING_SENTINEL), uri)
         model_config.maybe_pull_model_tokenizer_for_runai(uri, tokenizer)
+        pulled_dir = model_config.model
         # Without the V2 rewrite the dir is only known after the pull.
         if not rewritten:
-            _touch(os.path.join(model_config.model, PULLING_SENTINEL), uri)
-        _touch(os.path.join(model_config.model, COMPLETE_SENTINEL), uri)
+            _touch(os.path.join(pulled_dir, PULLING_SENTINEL), uri)
+        _touch(os.path.join(pulled_dir, COMPLETE_SENTINEL), uri)
         _report_tokenizer_gap(model_config)
 
 

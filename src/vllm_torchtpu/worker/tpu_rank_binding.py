@@ -60,13 +60,16 @@ _SLICE_BINDING_ENV_VARS = (
 
 
 def _get_int_env(env: Mapping[str, str], name: str, default: int) -> int:
+    raw = env.get(name)
+    if not raw:
+        return default
     try:
-        return int(env.get(name, "") or default)
+        return int(raw)
     except ValueError:
         return default
 
 
-@dataclass
+@dataclass(slots=True)
 class TpuWorkerBinding:
     rank: int
     local_rank: int
@@ -138,10 +141,14 @@ def _slice_binding_from_env(
     local_rank_offset: int,
 ) -> TpuWorkerBinding | None:
     """Return the executor-assigned binding, or None when none was supplied."""
-    missing = [name for name in _SLICE_BINDING_ENV_VARS if not env.get(name)]
-    if missing:
-        if len(missing) == len(_SLICE_BINDING_ENV_VARS):
-            return None
+    s_rank = env.get(SLICE_RANK_ENV)
+    s_local_rank = env.get(SLICE_LOCAL_RANK_ENV)
+    s_world = env.get(SLICE_WORLD_SIZE_ENV)
+    s_local_world = env.get(SLICE_LOCAL_WORLD_SIZE_ENV)
+    if not (s_rank or s_local_rank or s_world or s_local_world):
+        return None
+    if not (s_rank and s_local_rank and s_world and s_local_world):
+        missing = [name for name in _SLICE_BINDING_ENV_VARS if not env.get(name)]
         raise ValueError(
             "Executor-assigned TPU slice binding is incomplete: missing "
             f"{missing}. Set all of {list(_SLICE_BINDING_ENV_VARS)} or none."
@@ -153,10 +160,10 @@ def _slice_binding_from_env(
         )
 
     world_size = parallel_config.world_size
-    slice_rank = int(env[SLICE_RANK_ENV])
-    slice_local_rank = int(env[SLICE_LOCAL_RANK_ENV])
-    slice_world = int(env[SLICE_WORLD_SIZE_ENV])
-    slice_local_world = int(env[SLICE_LOCAL_WORLD_SIZE_ENV])
+    slice_rank = int(s_rank)
+    slice_local_rank = int(s_local_rank)
+    slice_world = int(s_world)
+    slice_local_world = int(s_local_world)
 
     expected_world = world_size * dp_size
     if slice_world != expected_world:

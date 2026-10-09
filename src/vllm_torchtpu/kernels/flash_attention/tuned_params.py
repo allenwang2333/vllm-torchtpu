@@ -20,7 +20,7 @@ from dataclasses import dataclass
 import jax
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TuningKey:
     """Static inputs which can change the best flash-attention tiling."""
 
@@ -39,7 +39,7 @@ class TuningKey:
     vmem_limit_bytes: int | None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TunableParams:
     block_q: int
     block_k_major: int

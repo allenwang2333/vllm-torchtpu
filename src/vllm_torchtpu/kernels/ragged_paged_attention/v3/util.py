@@ -1,5 +1,7 @@
 """Utility functions for ragged paged attention."""
 
+import functools
+
 import jax
 from jax._src import dtypes
 
@@ -13,10 +15,12 @@ def align_to(x, a):
     return cdiv(x, a) * a
 
 
+@functools.lru_cache(maxsize=64)
 def get_dtype_bitwidth(dtype):
     return dtypes.itemsize_bits(dtype)
 
 
+@functools.lru_cache(maxsize=64)
 def get_dtype_packing(dtype):
     bits = get_dtype_bitwidth(dtype)
     return 32 // bits

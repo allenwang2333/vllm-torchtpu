@@ -198,6 +198,16 @@ def _dynamic_validate_inputs(
             )
 
 
+_IO_ALIASES = {3: 0}
+_PIPELINED_KERNEL_FN = functools.partial(_kv_cache_update_kernel, pipelined_dma=True)
+
+
+@functools.lru_cache(maxsize=1)
+def _get_kv_update_specs() -> tuple[list[pl.BlockSpec], list[pl.BlockSpec]]:
+    any_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY)
+    return [any_spec, any_spec], [any_spec]
+
+
 def _kv_cache_update(
     new_kv: jax.Array,  # [total_num_token, num_combined_kv_heads, head_dim]
     slices: jax.Array,  # [3, slices], list of (kv_cache_start, new_kv_start,
@@ -220,12 +230,7 @@ def _kv_cache_update(
             slices, new_token_num, kv_cache.shape[0], page_size, num_slices
         )
 
-    in_specs = [
-        pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
-        pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
-    ]
-
-    out_specs = [pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY)]
+    in_specs, out_specs = _get_kv_update_specs()
     out_shape = [jax.ShapeDtypeStruct(kv_cache.shape, dtype=kv_cache.dtype)]
 
     scalar_prefetches = [slices, num_slices]
@@ -239,23 +244,19 @@ def _kv_cache_update(
         pltpu.SemaphoreType.DMA,
     ]
 
-    kernel_fn = (
-        functools.partial(_kv_cache_update_kernel, pipelined_dma=True)
-        if pipelined_dma
-        else _kv_cache_update_kernel
-    )
+    kernel_fn = _PIPELINED_KERNEL_FN if pipelined_dma else _kv_cache_update_kernel
 
     kernel = pl.pallas_call(
         kernel_fn,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=len(scalar_prefetches),
+            num_scalar_prefetch=2,
             in_specs=in_specs,
             out_specs=out_specs,
             grid=(_ceil_div(num_slices[0], num_slices_per_block),),
             scratch_shapes=scratch_shapes,
         ),
         out_shape=out_shape,
-        input_output_aliases={len(scalar_prefetches) + 1: 0},
+        input_output_aliases=_IO_ALIASES,
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=vmem_limit_bytes,
         ),
