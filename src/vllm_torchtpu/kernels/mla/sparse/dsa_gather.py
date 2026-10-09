@@ -263,7 +263,8 @@ def dsa_gather(
     row_chunk_size = row_subchunk_size * num_row_subchunks
     block_size = row_chunk_size * num_cores
     out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size
-    indices = jnp.pad(indices, ((0, out_pad_size)))
+    if out_pad_size:
+        indices = jnp.pad(indices, ((0, out_pad_size),))
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
         num_subcores=sc_info.num_subcores,
@@ -296,7 +297,7 @@ def dsa_gather(
         mesh=vector_mesh,
         name="sc_dsa_gather",
     )(nope_cache, rope_cache, indices, valid_indices)
-    return (
-        nope_out.reshape(-1, word_bytes, tile_lane_bytes)[:out_size],
-        rope_out[:out_size],
-    )
+    nope_reshaped = nope_out.reshape(-1, word_bytes, tile_lane_bytes)
+    if out_pad_size:
+        return nope_reshaped[:out_size], rope_out[:out_size]
+    return nope_reshaped, rope_out

@@ -94,6 +94,8 @@ def _kernel(
                 for copy in nope_copies:
                     copy.wait()
 
+            low_16 = jnp.uint32(0x0000FFFF)
+            low_byte_each_half = jnp.uint32(0x00FF00FF)
             for row in range(QUADS_PER_ATOM):
                 data = []
                 for token_slot in range(ROPE_PACKING):
@@ -104,8 +106,6 @@ def _kernel(
                         rope_inputs[input_stream][pl.ds(input_lane, 1), pl.ds(0, 32)]
                     )
 
-                low_16 = jnp.uint32(0x0000FFFF)
-                low_byte_each_half = jnp.uint32(0x00FF00FF)
                 data[0], data[2] = _delta_swap(data[0], data[2], 16, low_16)
                 data[1], data[3] = _delta_swap(data[1], data[3], 16, low_16)
                 data[0], data[1] = _delta_swap(data[0], data[1], 8, low_byte_each_half)

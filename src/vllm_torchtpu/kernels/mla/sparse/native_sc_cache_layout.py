@@ -20,6 +20,8 @@ cache immediately before attention would defeat the layout's purpose.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 NOPE_SUBROWS = 4
@@ -144,8 +146,8 @@ def source_bytes_per_token(
     nope_i32: np.ndarray, rope_i32: np.ndarray
 ) -> tuple[int, int]:
     """Return the logical allocation bytes per token for both caches."""
-    nope_tokens = np.prod(nope_i32.shape[:-1], dtype=np.int64)
-    rope_tokens = np.prod(rope_i32.shape[:-1], dtype=np.int64) * NOPE_SUBROWS
+    nope_tokens = math.prod(nope_i32.shape[:-1])
+    rope_tokens = math.prod(rope_i32.shape[:-1]) * NOPE_SUBROWS
     if nope_tokens != rope_tokens:
         raise ValueError(f"cache token counts differ: {nope_tokens} vs {rope_tokens}")
-    return (nope_i32.nbytes // int(nope_tokens), rope_i32.nbytes // int(rope_tokens))
+    return (nope_i32.nbytes // nope_tokens, rope_i32.nbytes // rope_tokens)

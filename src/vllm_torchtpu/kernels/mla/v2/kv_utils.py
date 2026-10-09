@@ -13,8 +13,6 @@
 # limitations under the License.
 """Utility functions for the KV cache fusion in MLA."""
 
-import math
-
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -22,34 +20,34 @@ from jax.experimental.pallas import tpu as pltpu
 
 
 def unsigned_mod(a, b):
-    exponent = int(math.log2(b))
-    if b == int(math.pow(2, exponent)):
+    b_int = int(b)
+    if b_int > 0 and (b_int & (b_int - 1)) == 0:
         # Use bitmask instead of modulo for efficiency.
-        return a & (b - 1)
+        return a & (b_int - 1)
     return a % b
 
 
 def unsigned_cdiv(a, b):
-    exponent = int(math.log2(b))
-    if b == int(math.pow(2, exponent)):
+    b_int = int(b)
+    if b_int > 0 and (b_int & (b_int - 1)) == 0:
         # Use bit shift instead of division for efficiency.
-        return (a + b - 1) >> exponent
+        return (a + b_int - 1) >> (b_int.bit_length() - 1)
     return (a + b - 1) // b
 
 
 def unsigned_floor_div(a, b):
-    exponent = int(math.log2(b))
-    if b == int(math.pow(2, exponent)):
+    b_int = int(b)
+    if b_int > 0 and (b_int & (b_int - 1)) == 0:
         # Use bit shift instead of division for efficiency.
-        return a >> exponent
+        return a >> (b_int.bit_length() - 1)
     return a // b
 
 
 def unsigned_align_to(a, b):
-    exponent = int(math.log2(b))
-    if b == int(math.pow(2, exponent)):
+    b_int = int(b)
+    if b_int > 0 and (b_int & (b_int - 1)) == 0:
         # Use bitmask instead of division and multiply for efficiency.
-        return (a + b - 1) & (-int(b))
+        return (a + b_int - 1) & (-b_int)
 
     return unsigned_cdiv(a, b) * b
 
@@ -76,10 +74,8 @@ def pack_new_kv(
 
     num_sublanes_for_kv_packing = kv_packing // get_dtype_packing(bkvc_vmem_ref.dtype)
 
-    update_kv_packing_iters = unsigned_cdiv(
-        unsigned_mod(offset, kv_packing) + update_sz, kv_packing
-    )
     kv_packing_offset = unsigned_mod(offset, kv_packing)
+    update_kv_packing_iters = unsigned_cdiv(kv_packing_offset + update_sz, kv_packing)
     new_kv_len_start = q_end - kv_len + offset
     new_kv_packing_offset = unsigned_mod(new_kv_len_start, kv_packing)
 
@@ -124,6 +120,12 @@ def pack_new_kv(
             next_kvc_reg,
             next_kpe_reg,
         ) = vals
+        kvc_iota = lax.broadcasted_iota(
+            dtype=jnp.int32, shape=[kv_packing, lkv_dim], dimension=0
+        )
+        kpe_iota = lax.broadcasted_iota(
+            dtype=jnp.int32, shape=[kv_packing, r_dim], dimension=0
+        )
         if num_sublanes_for_kv_packing == 1:
             curr_kvc_reg_u32 = pltpu.bitcast(curr_kvc_reg, jnp.uint32)
             curr_kpe_reg_u32 = pltpu.bitcast(curr_kpe_reg, jnp.uint32)
@@ -152,12 +154,7 @@ def pack_new_kv(
             rolled_kvc = pltpu.bitcast(rotated_kvc_u32, next_kvc_reg.dtype)
             rolled_kpe = pltpu.bitcast(rotated_kpe_u32, next_kpe_reg.dtype)
         else:
-            kvc_cur_cond = (
-                lax.broadcasted_iota(
-                    dtype=jnp.int32, shape=[kv_packing, lkv_dim], dimension=0
-                )
-                < roll_amount
-            )
+            kvc_cur_cond = kvc_iota < roll_amount
             dtype = curr_kvc_reg.dtype
 
             def shift_roll(reg, roll_rolling_amount, roll_shift_bits):
@@ -175,12 +172,7 @@ def pack_new_kv(
                 shift_roll(curr_kvc_reg, roll_rolling_amount, roll_shift_bits),
                 shift_roll(next_kvc_reg, roll_rolling_amount, roll_shift_bits),
             )
-            kpe_cur_cond = (
-                lax.broadcasted_iota(
-                    dtype=jnp.int32, shape=[kv_packing, r_dim], dimension=0
-                )
-                < roll_amount
-            )
+            kpe_cur_cond = kpe_iota < roll_amount
             rolled_kpe = lax.select(
                 kpe_cur_cond,
                 shift_roll(curr_kpe_reg, roll_rolling_amount, roll_shift_bits),
@@ -189,9 +181,7 @@ def pack_new_kv(
             rolled_kvc = lax.select(roll_amount == 0, curr_kvc_reg, rolled_kvc)
             rolled_kpe = lax.select(roll_amount == 0, curr_kpe_reg, rolled_kpe)
 
-        offset_in_word = i * kv_packing + lax.broadcasted_iota(
-            dtype=jnp.int32, shape=[kv_packing, lkv_dim], dimension=0
-        )
+        offset_in_word = i * kv_packing + kvc_iota
         kvc_mask = jnp.logical_and(
             offset_in_word >= kv_packing_offset,
             offset_in_word < kv_packing_offset + update_sz,
@@ -201,9 +191,7 @@ def pack_new_kv(
             rolled_kvc,
             bkvc_vmem_ref[kv_packing_idx, :, :],
         )
-        offset_in_word_pe = i * kv_packing + lax.broadcasted_iota(
-            dtype=jnp.int32, shape=[kv_packing, r_dim], dimension=0
-        )
+        offset_in_word_pe = i * kv_packing + kpe_iota
         kpe_mask = jnp.logical_and(
             offset_in_word_pe >= kv_packing_offset,
             offset_in_word_pe < kv_packing_offset + update_sz,
@@ -255,10 +243,8 @@ def pack_new_kv_reference(
     _, kv_packing, lkv_dim = bkvc_vmem_ref.shape
     _, _, r_dim = bkvpe_vmem_ref.shape
 
-    update_kv_packing_iters = unsigned_cdiv(
-        unsigned_mod(offset, kv_packing) + update_sz, kv_packing
-    )
     kv_packing_offset = unsigned_mod(offset, kv_packing)
+    update_kv_packing_iters = unsigned_cdiv(kv_packing_offset + update_sz, kv_packing)
     new_kv_len_start = q_end - kv_len + offset
     new_kv_packing_offset = unsigned_mod(new_kv_len_start, kv_packing)
 
@@ -293,12 +279,13 @@ def pack_new_kv_reference(
             next_kvc_reg,
             next_kpe_reg,
         ) = vals
-        kvc_cur_cond = (
-            lax.broadcasted_iota(
-                dtype=jnp.int32, shape=[kv_packing, lkv_dim], dimension=0
-            )
-            < roll_amount
+        kvc_iota = lax.broadcasted_iota(
+            dtype=jnp.int32, shape=[kv_packing, lkv_dim], dimension=0
         )
+        kpe_iota = lax.broadcasted_iota(
+            dtype=jnp.int32, shape=[kv_packing, r_dim], dimension=0
+        )
+        kvc_cur_cond = kvc_iota < roll_amount
         dtype = curr_kvc_reg.dtype
         rolled_kvc = lax.select(
             kvc_cur_cond,
@@ -309,12 +296,7 @@ def pack_new_kv_reference(
                 next_kvc_reg.astype(jnp.float32), shift=roll_amount, axis=0
             ).astype(dtype),
         )
-        kpe_cur_cond = (
-            lax.broadcasted_iota(
-                dtype=jnp.int32, shape=[kv_packing, r_dim], dimension=0
-            )
-            < roll_amount
-        )
+        kpe_cur_cond = kpe_iota < roll_amount
         rolled_kpe = lax.select(
             kpe_cur_cond,
             pltpu.roll(
@@ -327,9 +309,7 @@ def pack_new_kv_reference(
         rolled_kvc = lax.select(roll_amount == 0, curr_kvc_reg, rolled_kvc)
         rolled_kpe = lax.select(roll_amount == 0, curr_kpe_reg, rolled_kpe)
 
-        offset_in_word = i * kv_packing + lax.broadcasted_iota(
-            dtype=jnp.int32, shape=[kv_packing, lkv_dim], dimension=0
-        )
+        offset_in_word = i * kv_packing + kvc_iota
         kvc_mask = jnp.logical_and(
             offset_in_word >= kv_packing_offset,
             offset_in_word < kv_packing_offset + update_sz,
@@ -339,9 +319,7 @@ def pack_new_kv_reference(
             rolled_kvc,
             bkvc_vmem_ref[kv_packing_idx, :, :],
         )
-        offset_in_word_pe = i * kv_packing + lax.broadcasted_iota(
-            dtype=jnp.int32, shape=[kv_packing, r_dim], dimension=0
-        )
+        offset_in_word_pe = i * kv_packing + kpe_iota
         kpe_mask = jnp.logical_and(
             offset_in_word_pe >= kv_packing_offset,
             offset_in_word_pe < kv_packing_offset + update_sz,

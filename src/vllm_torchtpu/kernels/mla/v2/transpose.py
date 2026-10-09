@@ -40,8 +40,8 @@ def xpose_full(input, *, transpose_axes):
     transposed_shape = tuple(input.shape[i] for i in transpose_axes)
 
     output_shape = [jax.ShapeDtypeStruct(shape=transposed_shape, dtype=input.dtype)]
-    shape_str = "x".join([str(i) for i in input.shape])
-    transpose_str = "x".join([str(i) for i in transpose_axes])
+    shape_str = "x".join(map(str, input.shape))
+    transpose_str = "x".join(map(str, transpose_axes))
     scope_name = f"xpose_full_shape_{shape_str}_xpose_{transpose_str}"
     return pl.pallas_call(
         xpose_kernel,
@@ -75,6 +75,9 @@ def prev_closest_valid_divisor(number: int, divider: int, multiple_of: int = 1) 
             )
         # number <= divider and number < multiple_of: tile equals full dim.
         return number
+
+    if number % bound == 0 and bound % multiple_of == 0:
+        return bound
 
     all_divisors = divisors(number)
     valid = [d for d in all_divisors if d <= divider and d % multiple_of == 0]
@@ -272,8 +275,8 @@ def xpose_pipeline(
             memory_space=pltpu.VMEM,
         )
     ]
-    shape_str = "x".join([str(i) for i in input.shape])
-    transpose_str = "x".join([str(i) for i in transpose_axes])
+    shape_str = "x".join(map(str, input.shape))
+    transpose_str = "x".join(map(str, transpose_axes))
     scope_name = (
         f"xpose_pipeline_shape_{shape_str}_xpose_{transpose_str}_n_tile_{n_tile}"
         f"_m_tile_{m_tile}_pa_{parallel_axis}_pi_{pipeline_axis}"
