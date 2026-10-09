@@ -117,3 +117,20 @@ def test_invalid_ep_rows_or_alignment_are_rejected():
         TokenReplicaLayout.create(ep=4, input_rows=16, row_alignment=0)
     with pytest.raises(ValueError, match="power of two"):
         TokenReplicaLayout.create(ep=4, input_rows=16, row_alignment=3)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("rows", [16, 13])
+def test_split_selects_each_rank_slice_with_and_without_padding(rows):
+    # Runs on one device: split() is a pure pad + dynamic slice. rows=16
+    # divides evenly across the 4-wide groups (no pad); rows=13 pads to 16.
+    groups = ((3, 1, 0, 2), (7, 5, 4, 6))
+    layout = TokenReplicaLayout.create(ep=8, input_rows=rows, groups=groups)
+    assert layout.local_rows == 4
+    values = jnp.arange(rows * 2, dtype=jnp.float32).reshape(rows, 2)
+    padded = np.full((16, 2), -1.0, np.float32)
+    padded[:rows] = np.asarray(values)
+    for group in groups:
+        for slot, rank in enumerate(group):
+            piece = layout.split(values, jnp.int32(rank), fill_value=-1.0)
+            np.testing.assert_array_equal(piece, padded[slot * 4 : slot * 4 + 4])
