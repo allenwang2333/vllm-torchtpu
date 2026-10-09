@@ -211,8 +211,8 @@ def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
 # plan is long enough to pay for it.
 AGQ_MIN_LOCAL_TOKENS = 1024
 
-# Per-config cache of the shard_map'd MoE callable; a fresh shard_map
-# body would re-trace the whole kernel for every hidden layer.
+# Per-config cache of the shard_map'd MoE callable and its jit; a fresh
+# shard_map body would re-trace the whole kernel for every hidden layer.
 _LAYER_SM_CACHE = {}
 _LAYER_SM_CACHE_LOCK = threading.Lock()
 
@@ -684,11 +684,11 @@ def adaptive_fused_moe(
         has_w1_bias and w1_bias.dtype,
         has_w2_bias and w2_bias.dtype,
     )
-    sm = _LAYER_SM_CACHE.get(key)
-    if sm is None:
+    cached = _LAYER_SM_CACHE.get(key)
+    if cached is None:
         with _LAYER_SM_CACHE_LOCK:
-            sm = _LAYER_SM_CACHE.get(key)
-            if sm is None:
+            cached = _LAYER_SM_CACHE.get(key)
+            if cached is None:
                 sm = jax.shard_map(
                     local_fn,
                     mesh=mesh,
@@ -696,5 +696,14 @@ def adaptive_fused_moe(
                     out_specs=P(ax),
                     check_vma=False,
                 )
-                _LAYER_SM_CACHE[key] = sm
-    return sm(*args)
+                cached = (sm, jax.jit(sm))
+                _LAYER_SM_CACHE[key] = cached
+    sm, sm_jit = cached
+    # Under an outer trace -- torch_tpu's export of the op, or a caller's jit --
+    # the shard_map is traced into that program, so it is called as is and the
+    # program stays what it was. Called eagerly, as the device tests do, a bare
+    # shard_map runs op by op and compiles every op again on every call; its
+    # jit compiles once per key.
+    if any(isinstance(a, jax.core.Tracer) for a in args):
+        return sm(*args)
+    return sm_jit(*args)
