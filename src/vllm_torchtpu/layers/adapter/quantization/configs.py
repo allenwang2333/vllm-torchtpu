@@ -75,11 +75,21 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+_QUANTIZE_ON_LOAD_CACHE: tuple[tuple[str, ...], tuple[str, ...]] = ((), ())
+
+
 def should_quantize_on_load(prefix: str) -> bool:
     """Return True if prefix matches any dot-bounded pattern in
     QUANTIZE_ON_LOAD_PREFIXES."""
+    prefixes = envs.QUANTIZE_ON_LOAD_PREFIXES
+    if not prefixes:
+        return False
+    global _QUANTIZE_ON_LOAD_CACHE
+    key = tuple(prefixes)
+    if _QUANTIZE_ON_LOAD_CACHE[0] != key:
+        _QUANTIZE_ON_LOAD_CACHE = (key, tuple(f".{p.strip('.')}." for p in key))
     padded = f".{prefix}."
-    return any(f".{p.strip('.')}." in padded for p in envs.QUANTIZE_ON_LOAD_PREFIXES)
+    return any(pat in padded for pat in _QUANTIZE_ON_LOAD_CACHE[1])
 
 
 class VllmQuantLinearConfig:

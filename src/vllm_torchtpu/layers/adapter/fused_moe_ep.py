@@ -366,17 +366,42 @@ def fused_moe_ep(
     answer.
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
-    if w1.dtype == torch.float4_e2m1fn_x2:
+    if w1.dtype != torch.float4_e2m1fn_x2:
         # FP4 scales are already [E, K/block, N]. Even a single block must
         # retain its axis; the per-channel helper would incorrectly drop it.
-        scales = (w1_scale, w2_scale)
-    else:
-        scales = (
-            _squeeze_channel_scale_checked(w1_scale),
-            _squeeze_channel_scale_checked(w2_scale),
+        w1_scale = _squeeze_channel_scale_checked(w1_scale)
+        w2_scale = _squeeze_channel_scale_checked(w2_scale)
+    if score_bias is not None:
+        return op(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            router_logits,
+            _RANK_BUFFER,
+            score_bias,
         )
-    extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
-    return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
+    if hash_ids is not None:
+        return op(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            router_logits,
+            _RANK_BUFFER,
+            hash_ids,
+        )
+    return op(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        router_logits,
+        _RANK_BUFFER,
+    )
 
 
 # The buffer `register_score_bias_buffer` stages the bias operand under, and
@@ -427,7 +452,11 @@ def hash_topk_ids_operand(layer, input_ids: torch.Tensor | None) -> torch.Tensor
             "the fused EP MoE kernel is armed for a hash-routed layer, which "
             "selects its experts from input_ids, and none were supplied"
         )
-    return table[input_ids.long().flatten()].to(torch.int32)
+    idx = input_ids if input_ids.dtype == torch.int64 else input_ids.long()
+    if idx.ndim != 1:
+        idx = idx.flatten()
+    selected = table[idx]
+    return selected if selected.dtype == torch.int32 else selected.to(torch.int32)
 
 
 def _mesh_expert_order(ep: int) -> tuple[int, ...] | None:
