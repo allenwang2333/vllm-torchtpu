@@ -273,7 +273,10 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         stager.flush(param)
 
     def __init__(self, *args, cpu_offload: bool | None = None, **kwargs):
-        self.cpu_offload = (
+        # Upstream's own `cpu_offload` means a pinned table read through UVA
+        # (CUDA only) and it resets the attribute in `__init__`; keep it False
+        # and track the TPU host table separately.
+        self.host_offload = (
             bool(envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD)
             if cpu_offload is None
             else bool(cpu_offload)
@@ -284,7 +287,7 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             torch.cuda,
             get_device_properties=lambda _: SimpleNamespace(multi_processor_count=0),
         ):
-            super().__init__(*args, **kwargs)
+            super().__init__(*args, cpu_offload=False, **kwargs)
         upstream.set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
         if self.weight_scale_inv is not None:
             upstream.set_weight_attrs(
@@ -292,7 +295,7 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             )
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self.cpu_offload:
+        if not self.host_offload:
             return super()._allocate_weights()
         return (
             torch.empty(
@@ -459,7 +462,7 @@ class Engram(upstream.Engram):
         self._active_raw: torch.Tensor | None = None
         self._staged_by_tokens: dict[int, torch.Tensor] = {}
         self._staged_views_by_tokens: dict[int, torch.Tensor] = {}
-        if getattr(self.embed_tokens, "cpu_offload", False):
+        if getattr(self.embed_tokens, "host_offload", False):
             # Host DRAM tables: the host only gathers raw FP8 bytes and scale
             # bytes (a memcpy-bound index_select); dequantization runs inside
             # the compiled graph (`_ready_rows`). Dequantizing on the host cost

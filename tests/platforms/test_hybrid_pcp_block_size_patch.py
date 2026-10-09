@@ -262,7 +262,7 @@ def test_hybrid_pcp_coordinator_patch_keeps_non_mamba_scope():
         ],
     )
 
-    with pytest.raises(AssertionError, match="PCP not support hybrid"):
+    with pytest.raises(AssertionError, match="PCP only supports full attention"):
         get_kv_cache_coordinator(
             kv_cache_config=kv_cache_config,
             max_model_len=4096,
