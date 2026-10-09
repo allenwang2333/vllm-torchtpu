@@ -9,16 +9,20 @@ What moves into the kernel:
 
 * the EP global->local remap, the per-(row, local expert) coefficients and
   the compact active-expert list. Top-k ids, top-k weights and the local
-  expert offset are scalar-prefetched to SMEM; the active list is built with
-  scalar SMEM loops and each expert's coefficient column with vector ops over
-  the [tokens, top-k] tile, so no XLA prep runs between router and kernel;
-* the first routed-expert DMAs (and the shared-expert weight DMA) are issued
-  before the activation quantization instead of after it;
+  expert offset are scalar-prefetched to SMEM (their only operand path); the
+  active list is built with scalar SMEM loops and the [M, E] coefficient
+  table with vector ops in the prologue, so no XLA prep runs between router
+  and kernel;
+* the first routed-expert DMAs are issued before the activation quantization
+  instead of after it;
 * optionally, one per-channel FP8 shared expert ([H, 2*Is] gate|up and
-  [Is, H] down) with the numerics of ``xla_quantized_matmul`` (per-token
-  full-K activation quantization), whose BF16 output is added to the routed
-  FP32 accumulator (coefficient 1) before the single BF16 output.
+  [Is, H] down, VMEM operands so XLA can stage them early) with the numerics
+  of ``xla_quantized_matmul`` (per-token full-K activation quantization),
+  whose BF16 output is added to the routed FP32 accumulator (coefficient 1)
+  before the single BF16 output.
 
+The scoped VMEM limit is the computed need plus margin, not the capacity, so
+XLA can keep the neighbouring ops' operands VMEM-resident across the call.
 The caller still owns the router and the TP/EP all-reduce.
 """
 
@@ -49,16 +53,50 @@ def _shared_fixed_bytes(m, h, shared_i):
     return weights + scales + acts
 
 
-def _select_expert_buffers(m, h, i, experts, topk, shared_i, vmem_capacity_bytes):
-    """The incumbent's slot heuristic plus the shared expert's fixed bytes."""
-    expert_bytes = 3 * h * i + 4 * (2 * i + h)
+def _expert_bytes(h, i):
+    return 3 * h * i + 4 * (2 * i + h)
+
+
+def _fixed_bytes(m, h, i, experts, shared_i):
+    """Explicit VMEM inputs, output and scratch besides the expert ring."""
     fixed_bytes = m * h * (2 + 2 + 1 + 4)
     fixed_bytes += m * i * (2 + 1) + (h // 512 + i // 512) * m * 128 * 2
-    # Top-k ids and weights tiles (lane-padded) replace the [M, E] coeff.
-    fixed_bytes += 2 * m * pl.cdiv(topk, 128) * 128 * 4
-    fixed_bytes += _shared_fixed_bytes(m, h, shared_i)
+    # The in-kernel coefficient table [M, E padded to 128] (FP32).
+    fixed_bytes += m * pl.cdiv(experts, 128) * 128 * 4
+    return fixed_bytes + _shared_fixed_bytes(m, h, shared_i)
+
+
+def _select_expert_buffers(m, h, i, experts, topk, shared_i, vmem_capacity_bytes):
+    """The incumbent's slot heuristic plus the shared expert's fixed bytes."""
+    del topk
+    fixed_bytes = _fixed_bytes(m, h, i, experts, shared_i)
     budget = vmem_capacity_bytes * 4 // 5
-    return max(1, min(_MAX_EXPERT_BUFFERS, (budget - fixed_bytes) // expert_bytes))
+    return max(
+        1, min(_MAX_EXPERT_BUFFERS, (budget - fixed_bytes) // _expert_bytes(h, i))
+    )
+
+
+def _vmem_limit_bytes(m, h, i, experts, shared_i, num_buffers, vmem_capacity_bytes):
+    """The kernel's computed need plus margin, not the whole VMEM.
+
+    Claiming all of VMEM (the incumbent's limit) leaves XLA's memory-space
+    assignment nothing to keep resident across the call, so the neighbours
+    lose their VMEM prefetches (WHITEBOARD.v2). 10% + 2 MiB covers Mosaic's
+    internal scratch and tile padding of the small buffers.
+    """
+    need = num_buffers * _expert_bytes(h, i) + _fixed_bytes(m, h, i, experts, shared_i)
+    limit = need * 11 // 10 + 2 * 1024**2
+    limit = -(-limit // 1024**2) * 1024**2
+    return min(vmem_capacity_bytes, limit)
+
+
+def _pin_vmem(x):
+    """Ask XLA to keep a small kernel operand VMEM-resident. Only while tracing
+    for TPU: the constraint annotates a pallas_call operand and cannot run
+    eagerly (as fp8_skinny's HBM pin), and the CPU interpreter has no VMEM."""
+    if isinstance(x, jax.core.Tracer) and jax.default_backend() == "tpu":
+        return pltpu.with_memory_space_constraint(x, pltpu.VMEM)
+    return x
 
 
 def can_use_fused_shared(hidden, ws13, ws13_scale, ws2, ws2_scale):
@@ -122,12 +160,10 @@ def can_use_dense_expert_fused(
 def _kernel(
     # Scalar prefetch (SMEM).
     ids_smem,
-    wbits_smem,
+    w_smem,
     offset_smem,
     # Inputs.
     x_ref,
-    ids_ref,
-    w_ref,
     w1_hbm,
     w2_hbm,
     s1_hbm,
@@ -143,7 +179,7 @@ def _kernel(
     routed_scale,
 ):
     if shared_i:
-        ws13_hbm, ss13_ref, ws2_hbm, ss2_ref = rest[:4]
+        sw13_ref, ss13_ref, sw2_ref, ss2_ref = rest[:4]
         rest = rest[4:]
     out_ref = rest[0]
     (
@@ -157,21 +193,17 @@ def _kernel(
         aq_ref,
         asc_ref,
         owner_ref,
+        coeff_ref,
         flags_ref,
         active_ids_ref,
         sem_ref,
-    ) = rest[1:14]
+    ) = rest[1:15]
     if shared_i:
-        sw13_ref, sw2_ref, sh_ref, sgu_ref, shared_sem = rest[14:19]
+        sh_ref, sgu_ref = rest[15:17]
 
-    # 1. Routing-independent shared weights go first.
-    if shared_i:
-        shared_copies = (
-            pltpu.make_async_copy(ws13_hbm, sw13_ref, shared_sem.at[0]),
-            pltpu.make_async_copy(ws2_hbm, sw2_ref, shared_sem.at[1]),
-        )
-        for copy in shared_copies:
-            copy.start()
+    # 1. The shared weights are VMEM operands: XLA stages them before the call
+    #    (routing-independent, so memory-space assignment can prefetch them
+    #    early, as it did for the separate shared expert's gate/up weight).
 
     # 2. EP remap + active flags from the top-k ids/weights, scalar SMEM only.
     #    A route marks its local expert when it is local and its weight is not
@@ -188,7 +220,7 @@ def _kernel(
     def mark(t, carry):
         row, col = t // topk, t % topk
         local = ids_smem[row, col] - offset
-        nonzero = (wbits_smem[row, col] & jnp.int32(0x7FFFFFFF)) != 0
+        nonzero = w_smem[row, col] != 0.0
 
         @pl.when((local >= 0) & (local < experts) & nonzero)
         def _():
@@ -229,6 +261,22 @@ def _kernel(
             for copy in transfers(jnp.int32(initial)):
                 copy.start()
 
+    # 3b. Coefficient table [M, E (lane padded)] from the SMEM routes, the
+    #     incumbent's XLA coeff build in-kernel: each element sums its routes
+    #     in top-k order starting from 0, so the values are bit-identical.
+    rows = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 0)
+    cols = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
+
+    def scatter(t, table):
+        row, col = t // topk, t % topk
+        local = ids_smem[row, col] - offset
+        hit = (rows == row) & (cols == local) & (local >= 0) & (local < experts)
+        return table + jnp.where(hit, w_smem[row, col], 0.0)
+
+    coeff_ref[...] = lax.fori_loop(
+        0, m * topk, scatter, jnp.zeros(coeff_ref.shape, jnp.float32)
+    )
+
     # 4. Activation quantization (incumbent numerics) while the DMAs fly.
     owner_ref[...] = jnp.zeros((m, h), jnp.float32)
     _quantize(x_ref[...], xq_ref, xs_ref)
@@ -239,8 +287,6 @@ def _kernel(
     if shared_i:
         xq_s, xsc_s = quantize_block(x_ref[...], axis=1, target_dtype=jnp.float8_e4m3fn)
         xsc_s = xsc_s.astype(jnp.float32)
-        for copy in shared_copies:
-            copy.wait()
         gu = jnp.zeros((m, 2 * shared_i), jnp.float32)
         for k in range(0, h, 512):
             gu += jnp.matmul(
@@ -268,16 +314,9 @@ def _kernel(
                 jnp.bfloat16
             )
 
-    local_ids = ids_ref[...] - offset
-
     def compute(e, w1_ref, w2_ref, s1_ref, s2_ref):
-        # Same values, same FP32 summation order over routes as the
-        # incumbent's XLA coeff build: sum_k (local_id_k == e) * w_k.
-        coeff = jnp.zeros((m, 1), jnp.float32)
-        for k in range(topk):
-            coeff = coeff + jnp.where(
-                local_ids[:, k : k + 1] == e, w_ref[:, k : k + 1], 0.0
-            )
+        # The incumbent's column extraction, unchanged.
+        coeff = jnp.sum(jnp.where(cols == e, coeff_ref[...], 0), axis=1, keepdims=True)
         for n in range(0, i, 128):
             acc = jnp.zeros((m, 256), jnp.bfloat16)
             scale = jnp.concatenate(
@@ -392,10 +431,10 @@ def dense_expert_moe_fused(
         m, h, i, experts, topk, shared_i, vmem_capacity_bytes
     )
     ids = topk_ids.astype(jnp.int32)
+    # Rounded to the hidden dtype as fused_moe_func does; one operand path
+    # (2D SMEM scalar prefetch, as paged attention's page table), no
+    # VMEM duplicate and no bitcast.
     weights = topk_weights.astype(hidden.dtype).astype(jnp.float32)
-    # A bitcast only (no reshape: a [M, K] -> [M*K] reshape is a relayout
-    # copy on TPU); 2D SMEM scalar prefetch as paged attention's page table.
-    wbits = lax.bitcast_convert_type(weights, jnp.int32)
     if experts_start is None:
         offset = jnp.zeros((1,), jnp.int32)
     else:
@@ -403,12 +442,9 @@ def dense_expert_moe_fused(
 
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.VMEM),
-        pl.BlockSpec(memory_space=pltpu.VMEM),
-        pl.BlockSpec(memory_space=pltpu.VMEM),
         *[pl.BlockSpec(memory_space=pltpu.HBM)] * 4,
     ]
-    operands = [ids, wbits, offset, hidden, ids, weights]
-    operands += [w1, w2, s1, s2]
+    operands = [ids, weights, offset, _pin_vmem(hidden), w1, w2, s1, s2]
     scratch = [
         pltpu.VMEM((num_buffers, h, 2 * i), jnp.float8_e4m3fn),
         pltpu.VMEM((num_buffers, i, h), jnp.float8_e4m3fn),
@@ -420,30 +456,23 @@ def dense_expert_moe_fused(
         pltpu.VMEM((m, i), jnp.float8_e4m3fn),
         pltpu.VMEM((i // 512, m, 128), jnp.bfloat16),
         pltpu.VMEM((m, h), jnp.float32),
+        pltpu.VMEM((m, pl.cdiv(experts, 128) * 128), jnp.float32),
         pltpu.SMEM((experts,), jnp.int32),
         pltpu.SMEM((experts,), jnp.int32),
         pltpu.SemaphoreType.DMA((num_buffers, 4)),
     ]
     if shared_i:
         ws13, ws13_scale, ws2, ws2_scale = shared
-        in_specs += [
-            pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.VMEM),
-            pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.VMEM),
-        ]
+        in_specs += [pl.BlockSpec(memory_space=pltpu.VMEM)] * 4
         operands += [
-            ws13,
-            ws13_scale.reshape(1, 2 * shared_i),
-            ws2,
-            ws2_scale.reshape(1, h),
+            _pin_vmem(ws13),
+            _pin_vmem(ws13_scale.reshape(1, 2 * shared_i)),
+            _pin_vmem(ws2),
+            _pin_vmem(ws2_scale.reshape(1, h)),
         ]
         scratch += [
-            pltpu.VMEM((h, 2 * shared_i), jnp.float8_e4m3fn),
-            pltpu.VMEM((shared_i, h), jnp.float8_e4m3fn),
             pltpu.VMEM((m, h), jnp.bfloat16),
             pltpu.VMEM((m, 2 * shared_i), jnp.bfloat16),
-            pltpu.SemaphoreType.DMA((2,)),
         ]
     return pl.pallas_call(
         functools.partial(
@@ -464,7 +493,11 @@ def dense_expert_moe_fused(
             out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
             scratch_shapes=scratch,
         ),
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_capacity_bytes),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=_vmem_limit_bytes(
+                m, h, i, experts, shared_i, num_buffers, vmem_capacity_bytes
+            )
+        ),
         name=(
             f"dense_expert_moe_fused-e_{experts}-m_{m}-h_{h}-i_{i}-k_{topk}"
             f"-s_{shared_i}-buffers_{num_buffers}"

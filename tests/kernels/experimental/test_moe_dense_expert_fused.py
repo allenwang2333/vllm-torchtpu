@@ -430,6 +430,17 @@ def test_shared_admission_rejects_blockwise_scales_and_wrong_layout():
     )
 
 
+@pytest.mark.parametrize("si", [128, 256])
+def test_vmem_limit_is_the_need_not_the_capacity(si):
+    cap = 64 * 1024**2
+    buffers = fused._select_expert_buffers(16, 6144, 512, 64, 8, si, cap)
+    limit = fused._vmem_limit_bytes(16, 6144, 512, 64, si, buffers, cap)
+    need = buffers * fused._expert_bytes(6144, 512) + fused._fixed_bytes(
+        16, 6144, 512, 64, si
+    )
+    assert need < limit < cap * 2 // 3, (need, limit)
+
+
 def test_buffers_at_served_shape_stay_three():
     for si in (128, 256):
         assert fused._select_expert_buffers(16, 6144, 512, 64, 8, si, 64 * 1024**2) == 3
