@@ -49,7 +49,8 @@ NT = (((1,), (1,)), ((), ()))
 NN = (((1,), (0,)), ((), ()))
 COLLECTIVE_ID = int(os.environ.get("MKD_COLLECTIVE_ID", "39"))
 GATHER_UNROLL = int(os.environ.get("MKD_GUNROLL", "8"))
-ABLATIONS = ("weights", "gather", "index", "attn", "experts", "coll")
+ABLATIONS = ("weights", "gather", "index", "attn", "experts", "coll",
+             "d_lm", "d_eh", "d_emb", "d_ishare", "d_glue")   # d_*: drafter glue (timing only)
 
 
 # ------------------------------------------------------------------------------------------
@@ -939,7 +940,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 rvalid = (rvec[:, 0:1] > 0).astype(F32)
                 rpos = rvec[:, 1:2]
 
-                @pl.when(l == 1)
+                @pl.when(jnp.logical_and(l == 1, "d_ishare" not in skip))
                 def _():
                     index_share()
             ph = Phases(tiles.trace)
@@ -1102,7 +1103,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                     d_.start()
                 for d_ in dcs:
                     d_.wait()
-            if draft:
+            if draft and "d_glue" not in skip:
                 draft_glue(l, slot)
             return carry
 
@@ -1854,7 +1855,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             embed: the owning vocab shard DMAs the row, RS sums the (one-hot) partials onto owners,
             AG to all ranks; eh_proj: this rank's H/R output columns, RS of the column blocks."""
             scr["demb"][...] = jnp.zeros((1, M, H // 2), U32)
-            for t_ in range(TMAX):
+            for t_ in (range(TMAX) if "d_emb" not in skip else ()):
                 tok = tok_of(t_)
 
                 @pl.when(jnp.logical_and(valid_of(t_), tok // VR == me))
@@ -1870,13 +1871,13 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             en = rmsnorm(E, sm(slot, "enorm"), cfg.eps).astype(BF16)
             hn_ = rmsnorm(prev, sm(slot, "hnorm"), cfg.eps).astype(BF16)
             ys = []
-            for c in range(DH // 128):
+            for c in (range(DH // 128) if "d_eh" not in skip else ()):
                 w0 = hbm_tile(eht_h.at[0, pl.ds(c * 128, 128)])
                 a = lax.dot_general(en, w0, NT, preferred_element_type=F32)
                 w1 = hbm_tile(eht_h.at[1, pl.ds(c * 128, 128)])
                 a = a + lax.dot_general(hn_, w1, NT, preferred_element_type=F32)
                 ys.append(bf(a))
-            y = jnp.concatenate(ys, axis=1)                                      # [M, DH]
+            y = jnp.concatenate(ys, axis=1) if ys else jnp.zeros((M, DH), F32)  # [M, DH]
             col = lax.broadcasted_iota(I32, (M, H), 1) // DH
             yfull = jnp.where(col == me, jnp.concatenate([y] * R, axis=1), 0.0)
             h_own = reduce_scatter_rows(yfull, "rsm_send", "rsm_recv")
@@ -1910,7 +1911,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 ti = jnp.min(jnp.where(lg == tv, gi, 3e7), axis=1, keepdims=True)
                 take_ = tv > bv
                 return jnp.where(take_, tv, bv), jnp.where(take_, ti, bi)
-            bv, bi = lax.fori_loop(0, VRP // 128, lm_body,
+            bv, bi = lax.fori_loop(0, 0 if "d_lm" in skip else VRP // 128, lm_body,
                                    (jnp.full((XR, 1), -jnp.inf, F32), jnp.zeros((XR, 1), F32)))
             lane_x = lax.broadcasted_iota(I32, (XR, 128), 1)
             pay = jnp.where(lane_x == 0, jnp.broadcast_to(bv, (XR, 128)),
