@@ -119,6 +119,24 @@ def _launch_now(op, carried: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ..
 
 
 class PPWave:
+    __slots__ = (
+        "rank",
+        "size",
+        "last",
+        "carried",
+        "_carried_tail",
+        "max_rows",
+        "op",
+        "zeros",
+        "zero",
+        "launches",
+        "bursts",
+        "burst_open",
+        "burst_launches",
+        "forwards",
+        "pending",
+    )
+
     def __init__(
         self,
         device: torch.device,
@@ -187,7 +205,7 @@ class PPWave:
     ) -> tuple[torch.Tensor, ...]:
         if rows == self.max_rows:
             return carried
-        return tuple(torch.cat([t, z[rows:]]) for t, z in zip(carried, self.zeros))
+        return tuple(torch.cat((t, z[rows:])) for t, z in zip(carried, self.zeros))
 
     def warmup(self) -> None:
         """One launch outside any burst on every stage, carrying a known
@@ -252,8 +270,8 @@ class PPWave:
             self._check_count()
             return
         assert tensors is not None
-        missing = [key for key in self.carried if key not in tensors]
-        if missing:
+        if any(key not in tensors for key in self.carried):
+            missing = [key for key in self.carried if key not in tensors]
             raise RuntimeError(
                 f"PP wave rank {self.rank}: the forward produced no "
                 f"{missing} to hand on"

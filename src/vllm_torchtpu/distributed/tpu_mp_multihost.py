@@ -108,10 +108,10 @@ def _rendezvous_host_ips(
         store.set(xprof_key, str(time.time_ns()))
 
     ip_keys = [f"{key_prefix}_ip_{i}" for i in range(num_peers)]
-    wait_keys = [*ip_keys, xprof_key]
-    store.wait(wait_keys, _RENDEZVOUS_TIMEOUT)
-    host_ips = [store.get(key).decode() for key in ip_keys]
-    xprof_session_id = store.get(xprof_key).decode()
+    store.wait([*ip_keys, xprof_key], _RENDEZVOUS_TIMEOUT)
+    store_get = store.get
+    host_ips = [store_get(key).decode() for key in ip_keys]
+    xprof_session_id = store_get(xprof_key).decode()
     return host_ips, xprof_session_id
 
 

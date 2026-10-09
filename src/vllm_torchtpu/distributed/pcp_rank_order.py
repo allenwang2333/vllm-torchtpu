@@ -134,14 +134,10 @@ def resolve_pcp_topology_order(vllm_config) -> dict[str, list[list[int]]] | None
     # axis it is building. A ring is mesh[d, :, t] -- reading down the pcp
     # axis, hence the swap. A lane is mesh[d, p, :] -- along it, already
     # memory order. int() because these reach torch.distributed.new_group.
+    mesh_arr = numpy.asarray(mesh, dtype=int)
     group_ranks_by_name = {
-        "pcp": [
-            [int(r) for r in ring]
-            for ring in numpy.swapaxes(mesh, 1, 2).reshape(-1, pcp_size)
-        ],
-        "tp": [
-            [int(r) for r in lane] for lane in numpy.asarray(mesh).reshape(-1, tp_size)
-        ],
+        "pcp": numpy.swapaxes(mesh_arr, 1, 2).reshape(-1, pcp_size).tolist(),
+        "tp": mesh_arr.reshape(-1, tp_size).tolist(),
     }
 
     # topology_aware_mesh promises a permutation of the global ranks. If it is

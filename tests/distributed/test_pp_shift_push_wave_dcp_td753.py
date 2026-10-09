@@ -15,6 +15,7 @@ def test_dcp_full_coverage(monkeypatch):
     from vllm.distributed import parallel_state
 
     fake_group = SimpleNamespace(ranks=[0, 1], world_size=2, rank_in_group=1)
+    monkeypatch.setattr(dcp, "_vllm_get_dcp_group_resolved", False)
     monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: fake_group)
     assert dcp.get_dcp_group() is fake_group
     assert dcp.get_dcp_rank() == 1
@@ -23,6 +24,7 @@ def test_dcp_full_coverage(monkeypatch):
     def _raise_assertion():
         raise AssertionError("DCP group not initialized")
 
+    monkeypatch.setattr(dcp, "_vllm_get_dcp_group_resolved", False)
     monkeypatch.setattr(parallel_state, "get_dcp_group", _raise_assertion)
     assert dcp.get_dcp_group() is None
     assert dcp.get_dcp_rank() == 0
@@ -71,6 +73,9 @@ def test_pp_shift_full_coverage(monkeypatch):
 
     monkeypatch.setattr(pp_shift, "Mesh", _FakeMesh)
 
+    # Calling pp_positions() when _MESH is None initializes _MESH first
+    assert pp_shift.pp_positions() == (1, 0, 2)
+    monkeypatch.setattr(pp_shift, "_MESH", None)
     # First call builds _MESH and populates _POS_OF_RANK + _MESH_DEVICE_IDS
     mesh = pp_shift.get_or_create_pp_mesh()
     assert isinstance(mesh, _FakeMesh)

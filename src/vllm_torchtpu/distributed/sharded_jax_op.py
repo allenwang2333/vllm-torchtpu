@@ -59,12 +59,13 @@ def _sharded_output_placeholders(lowered, mesh):
     even though it reports ``out_avals`` as replicated; where it does not, fall
     back to the aval, which is what stock would have used anyway.
     """
+    out_avals = lowered.out_avals
     shardings = getattr(lowered, "_out_named_shardings", None)
-    if shardings is None or len(shardings) != len(lowered.out_avals):
-        shardings = (None,) * len(lowered.out_avals)
+    if shardings is None or len(shardings) != len(out_avals):
+        return [pallas_impl.torch_placeholder(aval, mesh=mesh) for aval in out_avals]
     return [
         _placeholder(aval, getattr(sharding, "spec", None), mesh)
-        for aval, sharding in zip(lowered.out_avals, shardings)
+        for aval, sharding in zip(out_avals, shardings)
     ]
 
 

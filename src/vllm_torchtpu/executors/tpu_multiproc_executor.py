@@ -42,8 +42,9 @@ class TpuMultiprocExecutor(MultiprocExecutor):
         # Per-shape H2D prewarm: each shape is its own collective_rpc call with
         # its own 60-second shm_broadcast window.  Workers that have no KV
         # offload spec return [] from get_kv_prewarm_shapes() — a no-op.
-        shapes = self.collective_rpc("get_kv_prewarm_shapes")
+        collective_rpc = self.collective_rpc
+        shapes = collective_rpc("get_kv_prewarm_shapes")
         if not shapes or not shapes[0]:
             return
         for p in shapes[0]:
-            self.collective_rpc("prewarm_kv_offload_shape", args=(p,))
+            collective_rpc("prewarm_kv_offload_shape", args=(p,))

@@ -51,7 +51,9 @@ def all_gather_equal_tokens(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
     gathered = group.all_gather(tensor, dim=dim)
     if isinstance(gathered, torch.Tensor):
         return gathered
-    return torch.cat(list(gathered), dim=dim)
+    return torch.cat(
+        gathered if isinstance(gathered, (list, tuple)) else list(gathered), dim=dim
+    )
 
 
 def all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
@@ -110,8 +112,9 @@ def get_or_create_pcp_mesh(
         layout.device_ids,
         () if tp_group is None else tuple(tp_group.ranks),
     )
-    if cache_key in _MESH_CACHE:
-        return _MESH_CACHE[cache_key]
+    cached = _MESH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     if group is None:
         import jax
         import numpy as np

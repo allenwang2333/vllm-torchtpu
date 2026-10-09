@@ -115,11 +115,7 @@ def ep_token_replica_groups(
 def get_ep_group() -> Any | None:
     """vLLM's expert-parallel group, or None when EP is off."""
     try:
-        from vllm.distributed.parallel_state import get_ep_group as _get
-    except ImportError:
-        return None
-    try:
-        group = _get()
+        group = parallel_state.get_ep_group()
     except (AssertionError, AttributeError, RuntimeError):
         return None
     return group if group is not None and int(group.world_size) > 1 else None

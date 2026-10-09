@@ -13,7 +13,7 @@ from typing import Any
 
 import jax
 import numpy as np
-from jax.experimental.shard_map import shard_map
+from jax import shard_map
 from jax.sharding import Mesh, PartitionSpec
 
 from vllm_torchtpu.distributed.mesh_utils import (
@@ -67,7 +67,8 @@ def get_or_create_pp_mesh() -> Mesh:
 
 def pp_positions() -> tuple[int, ...]:
     """Mesh position of each pipeline rank, in rank order."""
-    get_or_create_pp_mesh()
+    if _MESH is None:
+        get_or_create_pp_mesh()
     return _POS_OF_RANK
 
 

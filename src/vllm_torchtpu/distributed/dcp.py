@@ -86,6 +86,7 @@ def get_or_create_dcp_mesh(axis_name: str | None = DCP_AXIS_NAME) -> Any:
     constant from here, so a caller that overrides it has to override it in
     both places or the mesh and the partition specs will not agree.
     """
-    if axis_name is None:
-        axis_name = DCP_AXIS_NAME
-    return get_or_create_cp_mesh(axis_name=axis_name, group=get_dcp_group())
+    return get_or_create_cp_mesh(
+        axis_name=DCP_AXIS_NAME if axis_name is None else axis_name,
+        group=get_dcp_group(),
+    )

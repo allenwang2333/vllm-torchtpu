@@ -15,6 +15,14 @@ logger = init_logger(__name__)
 class ChipTopology:
     """The chip/chiplet grouping of the devices this process can see."""
 
+    __slots__ = (
+        "chips",
+        "device_ids",
+        "num_chips",
+        "cores_per_chip",
+        "_device_to_chip",
+    )
+
     def __init__(self, chips: list[list[int]], device_ids: list[int]) -> None:
         self.chips = chips  # chip index -> device ids on it, sorted
         self.device_ids = device_ids  # global device order
@@ -70,6 +78,7 @@ def get_chip_topology() -> ChipTopology | None:
         return None
 
     grouped: dict[tuple, list[int]] = collections.defaultdict(list)
+    device_ids: list[int] = []
     for device in devices:
         coords = getattr(device, "coords", None)
         if coords is None:
@@ -78,7 +87,9 @@ def get_chip_topology() -> ChipTopology | None:
                 "hierarchical MoE parallelism cannot be enabled."
             )
             return None
-        grouped[tuple(coords)].append(int(device.id))
+        dev_id = int(device.id)
+        device_ids.append(dev_id)
+        grouped[tuple(coords)].append(dev_id)
 
     # Order chips by their mesh coordinates so the grouping is deterministic
     # across ranks -- every rank must agree on which chip is EP rank 0, and
@@ -94,7 +105,7 @@ def get_chip_topology() -> ChipTopology | None:
         )
         return None
 
-    topology = ChipTopology(chips, [int(d.id) for d in devices])
+    topology = ChipTopology(chips, device_ids)
     logger.info("Chip topology: %s", topology.describe())
     return topology
 

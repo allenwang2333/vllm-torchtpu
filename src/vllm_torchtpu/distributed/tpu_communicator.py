@@ -90,10 +90,12 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         group = self._token_group(is_sequence_parallel)
         if group.world_size == 1:
             return hidden_states, topk_weights, topk_ids
-        hidden_states = group.all_gather(hidden_states, dim=0)
-        topk_weights = group.all_gather(topk_weights, dim=0)
-        topk_ids = group.all_gather(topk_ids, dim=0)
-        return hidden_states, topk_weights, topk_ids
+        all_gather = group.all_gather
+        return (
+            all_gather(hidden_states, dim=0),
+            all_gather(topk_weights, dim=0),
+            all_gather(topk_ids, dim=0),
+        )
 
     def combine(
         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
