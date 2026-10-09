@@ -15,7 +15,7 @@ def _legacy_ray_executor() -> bool:
     )
 
 
-_FULL_ATTENTION_LAYER_TYPES = ["full_attention", "deepseek_sparse_attention"]
+_FULL_ATTENTION_LAYER_TYPES = frozenset({"full_attention", "deepseek_sparse_attention"})
 
 
 def _stage_without_full_attention(vllm_config: Any) -> str | None:

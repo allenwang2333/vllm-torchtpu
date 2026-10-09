@@ -133,16 +133,18 @@ def _pool_row_tokens(vllm_config: VllmConfig, backend_cls) -> int:
     the page stays flat until p tokens and doubles by 2p.
     """
     p = 1
-    while _tpu_attention_slot_size_bytes(
-        vllm_config, backend_cls, 2 * p
-    ) != 2 * _tpu_attention_slot_size_bytes(vllm_config, backend_cls, p):
+    slot_p = _tpu_attention_slot_size_bytes(vllm_config, backend_cls, p)
+    while True:
+        slot_2p = _tpu_attention_slot_size_bytes(vllm_config, backend_cls, 2 * p)
+        if slot_2p == 2 * slot_p:
+            return p
         p *= 2
         if p > 128:
             raise ValueError(
                 "TPU FA page is not token-linear: page size does not settle "
                 "into a linear regime within 256 tokens"
             )
-    return p
+        slot_p = slot_2p
 
 
 def _localize_gdn_state_shapes_for_pcp(
@@ -297,9 +299,7 @@ def _hybrid_mamba_state_layout(
 
 def _tpu_attention_raw_payload_bytes_per_token(vllm_config: VllmConfig) -> int:
     model_config = vllm_config.model_config
-    dtype_size = torch.empty(
-        (), dtype=_resolve_tpu_cache_dtype(vllm_config)
-    ).element_size()
+    dtype_size = _resolve_tpu_cache_dtype(vllm_config).itemsize
     return (
         model_config.get_num_kv_heads(vllm_config.parallel_config)
         * 2
