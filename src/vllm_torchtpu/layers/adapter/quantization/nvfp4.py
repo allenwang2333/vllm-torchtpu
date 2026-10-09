@@ -45,7 +45,11 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEMethodBase,
+    FusedMoeWeightScaleSupported,
+    RoutedExperts,
+)
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import (
     QuantizationMethods,
@@ -61,12 +65,14 @@ from vllm.model_executor.layers.quantization.modelopt import (
     Shapes,
     resolve,
 )
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
+from vllm_torchtpu.kernels.fused_moe.v2.host import PACK4, U32_SUBLANE_TILE
+from vllm_torchtpu.layers.adapter import fused_moe_ep as fused_moe_ep_bridge
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
@@ -192,15 +198,12 @@ def _prepare_moe_weights(layer, w13_scale_f, w2_scale_f, requant_block):
 
 def _prebuild_w4a8(layer, activation, configured_block):
     """Admit the proposed runtime layout while checkpoint weights are intact."""
-    from vllm_torchtpu.layers.adapter.fused_moe_ep import prebuild_fused_moe_ep
-
     if not (
         envs.USE_MOE_FUSED_EP_KERNEL
         and envs.MOE_FUSED_EP_ENABLE_W4A8
         and layer.moe_config.moe_parallel_config.use_ep
     ):
         return None, configured_block
-    from vllm_torchtpu.kernels.fused_moe.v2.host import PACK4, U32_SUBLANE_TILE
 
     block = U32_SUBLANE_TILE * PACK4 if configured_block is None else configured_block
     hidden = layer.w13_weight.shape[-1] * 2
@@ -231,7 +234,7 @@ def _prebuild_w4a8(layer, activation, configured_block):
             (experts, inter // block, 1, hidden), dtype=torch.float32, device="meta"
         ),
     )
-    op = prebuild_fused_moe_ep(
+    op = fused_moe_ep_bridge.prebuild_fused_moe_ep(
         layer,
         topk=layer.moe_config.experts_per_token,
         renormalize=layer.renormalize,
@@ -319,11 +322,9 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
     def supports_internal_mk(self) -> bool:
         # We need to take control of collective communication (AllGather/ReduceScatter)
         # to pipeline them with MoE computation when chunking is enabled.
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
-
         return (
             enable_pipelined_collective_and_compute()
-            or fused_moe_ep_supported(self)
+            or fused_moe_ep_bridge.fused_moe_ep_supported(self)
             or adaptive_moe.adaptive_fused_moe_supported(self)
         )
 
@@ -352,9 +353,6 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         # Upstream registers the scale params before updating extra_weight_attrs
         # with `quant_method`, so vLLM's MoE weight loader does not see it on the
         # scales and rejects the load. Set them explicitly.
-        from vllm.model_executor.layers.fused_moe import FusedMoeWeightScaleSupported
-        from vllm.model_executor.utils import set_weight_attrs
-
         for name in ("w13_weight_scale", "w2_weight_scale"):
             set_weight_attrs(
                 getattr(layer, name),
@@ -400,12 +398,6 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         g2 = layer.w2_weight_scale_2.data.to(torch.float32)  # [E]
         w2_scale_f = w2_scale.to(torch.float32) * g2.view(-1, 1, 1)
 
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-            FUSED_MOE_EP_OP_ATTR,
-            fused_moe_ep_unsupported_reason,
-            register_score_bias_buffer,
-        )
-
         # Preserve main's explicit requantization recipe for the GMM path.
         # Automatic requantization is committed only for an admitted W4A8 op.
         configured_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
@@ -422,7 +414,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             validate_prepared = (
                 adaptive_moe.fused_moe_ep_unsupported_reason
                 if self._use_adaptive_fused_moe
-                else fused_moe_ep_unsupported_reason
+                else fused_moe_ep_bridge.fused_moe_ep_unsupported_reason
             )
             reason = validate_prepared(
                 layer,
@@ -486,9 +478,9 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = op
         else:
-            setattr(self, FUSED_MOE_EP_OP_ATTR, op)
+            setattr(self, fused_moe_ep_bridge.FUSED_MOE_EP_OP_ATTR, op)
         if op is not None:
-            register_score_bias_buffer(layer)
+            fused_moe_ep_bridge.register_score_bias_buffer(layer)
             # Do the scale layout conversion once, outside compiled forward.
             layer.register_buffer(
                 "_tpu_fused_w13_scale",
@@ -528,14 +520,8 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 layer._tpu_fused_w2_scale,
                 router_logits,
             )
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-            fused_moe_ep,
-            fused_moe_ep_supported,
-            score_bias_operand,
-        )
-
-        if fused_moe_ep_supported(self):
-            return fused_moe_ep(
+        if fused_moe_ep_bridge.fused_moe_ep_supported(self):
+            return fused_moe_ep_bridge.fused_moe_ep(
                 self,
                 x,
                 layer.w13_weight,
@@ -543,7 +529,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 layer._tpu_fused_w13_scale,
                 layer._tpu_fused_w2_scale,
                 router_logits,
-                score_bias_operand(layer),
+                fused_moe_ep_bridge.score_bias_operand(layer),
             )
 
         # Quantization-independent routing decision (simulation override ->
