@@ -359,11 +359,26 @@ def owner_layout_tensors(
     packed_np[n_perm + total_real : n_perm + n_inv] = -1
     packed_np[n_perm + n_inv :] = q_loc_flat
     packed = torch.from_numpy(packed_np).to(device=target_device)
+    perm = packed[:n_perm]
+    inv = packed[n_perm : n_perm + n_inv]
+    _mark_token_dim_dynamic(perm, inv)
     return (
-        packed[:n_perm],
-        packed[n_perm : n_perm + n_inv],
+        perm,
+        inv,
         packed[n_perm + n_inv :].reshape(layout.query_start_loc.shape),
     )
+
+
+def _mark_token_dim_dynamic(*tensors: torch.Tensor) -> None:
+    """Keep owner perm/inv token dims symbolic under torch.compile.
+
+    Left static, the first traced bucket's length (e.g. 288) unifies with the
+    dynamic ``input_ids`` dim through ``_unpermute_owner_tokens_torch`` and
+    dynamo raises ConstraintViolationError (KV_SHARD 40L, c7x8 Job 1250).
+    """
+    for tensor in tensors:
+        if tensor.shape[0] >= 2:
+            torch._dynamo.mark_dynamic(tensor, 0)
 
 
 def attach_owner_token_layout(
@@ -470,6 +485,7 @@ def _positional_layout(
     inv = torch.arange(num_padded_tokens, dtype=torch.int32, device=device)
     starts = torch.arange(tp_size, dtype=torch.int32, device=device) * segment
     q_loc = (query_start_loc[None, :] - starts[:, None]).clamp(0, segment)
+    _mark_token_dim_dynamic(perm, inv)
     return perm, inv, q_loc
 
 
