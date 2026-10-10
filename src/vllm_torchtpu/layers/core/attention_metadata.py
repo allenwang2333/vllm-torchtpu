@@ -45,7 +45,12 @@ from vllm_torchtpu.layers.core.sequence_layout import (
         "sequence_layout_protocol",
         "sequence_layout_version",
     ],
-    drop_fields=["query_start_loc_cpu", "seq_lens_cpu", "prompt_lens_cpu"],
+    drop_fields=[
+        "query_start_loc_cpu",
+        "seq_lens_cpu",
+        "prompt_lens_cpu",
+        "replay_starts_cpu",
+    ],
 )
 @dataclass
 class AttentionMetadata:
@@ -99,6 +104,9 @@ class AttentionMetadata:
     query_start_loc_cpu: tuple[int, ...] | None = field(default=None, init=False)
     seq_lens_cpu: tuple[int, ...] | None = field(default=None, init=False)
     prompt_lens_cpu: tuple[int, ...] | None = field(default=None, init=False)
+    # First position each request holds sliding-window KV for (DeepSeek-V4.1
+    # SWA bounded replay); 0 when nothing replays.
+    replay_starts_cpu: tuple[int, ...] | None = field(default=None, init=False)
 
     def with_block_tables(self, block_tables: Any) -> AttentionMetadata:
         clone = object.__new__(AttentionMetadata)
@@ -130,6 +138,7 @@ class AttentionMetadataBuilderContext:
     seq_lens_cpu: tuple[int, ...] | torch.Tensor | None = None
     prompt_lens_cpu: tuple[int, ...] | None = None
     max_active_seq_len: int | None = None
+    replay_starts_cpu: tuple[int, ...] | None = None
     # Compact-mamba per-request recurrent-slot ids (device int32, length =
     # target_num_reqs). Only the mamba group's builder reads it; None when the
     # model has no mamba layers. See AttentionMetadata.mamba_state_indices.
@@ -541,6 +550,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         metadata.query_start_loc_cpu = ctx.query_start_loc_cpu
         metadata.seq_lens_cpu = ctx.seq_lens_cpu
         metadata.prompt_lens_cpu = ctx.prompt_lens_cpu
+        metadata.replay_starts_cpu = ctx.replay_starts_cpu
         if not self.is_mamba_group and staged is not None:
             ctx.base_attn_metadata = metadata
         return metadata

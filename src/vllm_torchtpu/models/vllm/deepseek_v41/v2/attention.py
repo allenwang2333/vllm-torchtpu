@@ -29,6 +29,7 @@ from .attention_kernels import (
     sparse_fp8_attention_qo,
 )
 from .cache import ROW_BYTES, NativeCacheView, PagedCacheRows, write_cache
+from .ced import prefix_replay_enabled
 from .ops import device_hooks, rms_norm, rotary, round_fp8_activation
 
 _active_stage_attn_cache: dict[Any, Any] | None = None
@@ -139,6 +140,18 @@ def _token_requests(metadata, positions):
     rows = torch.arange(positions.shape[0], device=positions.device)
     ends = metadata.query_start_loc[1:]
     return (rows.unsqueeze(1) >= ends.unsqueeze(0)).sum(-1)
+
+
+def _window_starts():
+    """Per-request first position holding SWA KV, or None (SWA bounded replay)."""
+    return get_forward_context().additional_kwargs.get("deepseek_v41_window_starts")
+
+
+def _replayed(metadata, positions, starts, window):
+    """Tokens a prefix hit replays: their prefix-cached KV must stay as is."""
+    requests = _token_requests(metadata, positions).clamp(max=starts.shape[0] - 1)
+    start = starts[requests]
+    return (start > 0) & (positions >= start) & (positions < start + window)
 
 
 def _cache_slots(cache, metadata, positions, *, compress_ratio=1, ring=False):
@@ -338,6 +351,9 @@ class AttentionBackend(compressor_upstream.CompressorBackend):
 class SWACache(NativeCacheView, DeepseekV4SWACache):
     def __init__(self, *args, **kwargs):
         kwargs["block_size"] = kwargs["cache_config"].block_size
+        # Upstream ties bounded replay to its V2 model runner; the TPU model
+        # implements the replay itself (see `prefix_replay_enabled`).
+        kwargs["bounded_replay"] = prefix_replay_enabled(get_current_vllm_config())
         # FP8 applies to the compressed main KV only; SWA rows stay BF16.
         kwargs["dtype"] = torch.bfloat16
         kwargs["backend_cls"] = AttentionBackend
@@ -893,6 +909,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 positions,
                 compress_ratio=idx_ratio,
             )
+        starts = _window_starts()
+        if starts is not None:
+            # Shared prefix rows must survive replay unchanged in both paths.
+            valid = valid & ~_replayed(kv_meta, positions, starts, self.window_size)
         _insert(
             self.kv_cache,
             compressed_slots,
@@ -1029,6 +1049,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     ]
                     base_valid_window = base_valid_window & (
                         logical >= replay_starts[requests, None]
+                    )
+                elif (starts := _window_starts()) is not None:
+                    base_valid_window = base_valid_window & (
+                        logical >= starts[requests.clamp(max=starts.shape[0] - 1), None]
                     )
                 if use_3page_swa:
                     safe = logical.clamp(
@@ -1181,6 +1205,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     "deepseek_v41_replay_starts"
                 ]
                 valid_window = valid_window & (logical >= replay_starts[requests, None])
+            elif (starts := _window_starts()) is not None:
+                valid_window = valid_window & (
+                    logical >= starts[requests.clamp(max=starts.shape[0] - 1), None]
+                )
             invalid_window = ~valid_window
             raw_row_slots = (
                 _row_slots(swa_cache, swa_table, requests, logical) if tiled else None
@@ -1193,12 +1221,20 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 and rows_per_page is not None
                 else raw_row_slots
             )
+        if not self._ced_decoder and (starts := _window_starts()) is not None:
+            # Apply before records are built, including the tiled/local-Q path.
+            valid_window = valid_window & (
+                logical >= starts[requests.clamp(max=starts.shape[0] - 1), None]
+            )
+            invalid_window = ~valid_window
         if swa_row_slots is None:
             records = None
         elif has_fast_swa_offset and rows_per_page is not None:
             records = (
                 swa_row_slots_masked
-                if swa_cache.row_offset == 0 and swa_row_slots_masked is not None
+                if swa_cache.row_offset == 0
+                and swa_row_slots_masked is not None
+                and starts is None
                 else (
                     swa_row_slots
                     if swa_cache.row_offset == 0

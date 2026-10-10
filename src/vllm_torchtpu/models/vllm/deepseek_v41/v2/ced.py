@@ -5,6 +5,25 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm_torchtpu import envs
+
+
+def prefix_replay_enabled(vllm_config) -> bool:
+    """Whether CED runs with prefix caching through SWA bounded replay.
+
+    Upstream's contract: the SWA group leaves prefix caching, and the
+    scheduler resumes each hit one window early so replay rebuilds it. CED
+    requires unsharded token rows, so prefill context parallelism stays out.
+    """
+    cache_config = getattr(vllm_config, "cache_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    return bool(
+        envs.TPU_DEEPSEEK_V41_CED
+        and getattr(cache_config, "enable_prefix_caching", False)
+        and getattr(cache_config, "swa_bounded_replay", False)
+        and getattr(parallel_config, "prefill_context_parallel_size", 1) == 1
+    )
+
 
 @dataclass(frozen=True)
 class DecoderReplayPlan:
@@ -37,8 +56,9 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
     """Keep the same prompt-tail window across every chunk and later decode.
 
     The encoder publishes global KV for the complete chunk before this plan
-    narrows the decoder batch. Prefix caching must be disabled: a cached prefix
-    may not contain the encoder outputs required to rebuild decoder SWA.
+    narrows the decoder batch. With prefix caching, the cache holds no SWA
+    rows, so the scheduler resumes a hit at its replay start (SWA bounded
+    replay): the decoder window starts no earlier than that.
     """
     bounds = metadata.query_start_loc_cpu
     lengths = metadata.seq_lens_cpu
@@ -48,23 +68,31 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
     bounds_list = bounds.tolist() if isinstance(bounds, torch.Tensor) else bounds
     lengths_list = lengths.tolist() if isinstance(lengths, torch.Tensor) else lengths
     prompts_list = prompts.tolist() if isinstance(prompts, torch.Tensor) else prompts
+    hits = getattr(metadata, "replay_starts_cpu", None)
+    if hits is None:
+        hits_list = [0] * len(lengths_list)
+    elif isinstance(hits, torch.Tensor):
+        hits_list = hits.tolist()
+    else:
+        hits_list = list(hits)
     if (
         window < 1
         or len(bounds_list) != len(lengths_list) + 1
         or len(prompts_list) != len(lengths_list)
+        or len(hits_list) != len(lengths_list)
     ):
         raise ValueError("Invalid decoder replay scheduling metadata")
     if bounds_list[0] != 0 or bounds_list[-1] > num_tokens:
         raise ValueError("Query boundaries exceed the input token bucket")
     replay_starts = []
     any_skipped = False
-    for start, end, length, prompt in zip(
-        bounds_list, bounds_list[1:], lengths_list, prompts_list
+    for start, end, length, prompt, hit in zip(
+        bounds_list, bounds_list[1:], lengths_list, prompts_list, hits_list
     ):
         count = end - start
         if count < 0 or length < count or prompt < 0:
             raise ValueError("Invalid scheduled query or prompt length")
-        replay_start = prompt - window if prompt > window else 0
+        replay_start = max(0, prompt - window, hit)
         replay_starts.append(replay_start)
         if replay_start > length - count and count > 0:
             any_skipped = True

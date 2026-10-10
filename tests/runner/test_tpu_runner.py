@@ -1925,10 +1925,8 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
         requests={},
     )
     calls = []
-    runner.input_batch.update_req_spec_token_ids = (
-        lambda request, scheduled: calls.append(
-            (request.req_id, list(scheduled[request.req_id]))
-        )
+    runner.input_batch.update_req_spec_token_ids = lambda request, scheduled: (
+        calls.append((request.req_id, list(scheduled[request.req_id])))
     )
     TPUModelRunner._install_spec_token_room_guard(runner)
 
@@ -2448,6 +2446,7 @@ def test_prepare_inputs_single_req_fast_path_matches_general_path(
 
         return SimpleNamespace(
             reorder_batch_threshold=1,
+            _replay_starts={},
             sequence_layout_planner=AllSequenceLayoutPlanner(),
             _dp_target_bucket=None,
             input_batch=SimpleNamespace(
@@ -2724,6 +2723,7 @@ def test_prepare_inputs_uniform_multi_token_and_reject_subtract_cache():
         mamba_slot_read_offsets=None,
         _mamba_ckpt_window=1,
         _unified_kv_layout=False,
+        _replay_starts={},
         empty_slot_mappings=None,
         _build_attention_metadata=lambda **kw: ({}, None),
         lora_config=None,
