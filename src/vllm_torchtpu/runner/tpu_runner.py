@@ -5929,7 +5929,18 @@ class TPUModelRunner(GPUModelRunner):
                 if row_tokens is None:
                     continue
                 synchronize_tensors(row_tokens)
-                out = self.gather_logprobs(self._dummy_logits(num_tokens), row_tokens)
+                if getattr(self.model, "lm_head", None) is not None and getattr(self.model, "logits_processor", None) is not None:
+                    k_eff = max(int(self.model_config.max_logprobs), 1)
+                    out = self.gather_logprobs(
+                        torch.zeros(
+                            (num_tokens, 2 + 2 * k_eff),
+                            dtype=torch.int32,
+                            device=self.device,
+                        ),
+                        row_tokens,
+                    )
+                else:
+                    out = self.gather_logprobs(self._dummy_logits(num_tokens), row_tokens)
                 synchronize_tensors(out.logprobs)
 
     @torch.no_grad()
@@ -5984,12 +5995,14 @@ class TPUModelRunner(GPUModelRunner):
             for num_tokens in self.num_tokens_paddings:
                 if num_tokens > max_logits_len:
                     break
-                # padded_logits_length-shaped inputs; dtypes mirror
-                # get_spec_decode_metadata so the graph is byte-identical.
-                dummy_logits = torch.zeros(
-                    (num_tokens, self.vocab_size),
-                    dtype=self._hidden_states_dtype,
-                ).to(self.device)
+                dummy_logits = (
+                    None
+                    if has_tp_local
+                    else torch.zeros(
+                        (num_tokens, self.vocab_size),
+                        dtype=self._hidden_states_dtype,
+                    ).to(self.device)
+                )
                 dummy_argmax = torch.zeros(
                     num_tokens,
                     dtype=torch.int32,
@@ -6007,7 +6020,6 @@ class TPUModelRunner(GPUModelRunner):
                 for num_reqs in self.num_reqs_paddings:
                     if not self._spec_verify_bucket_reachable(num_tokens, num_reqs):
                         continue
-                    # padded_num_reqs-shaped inputs.
                     draft_lengths = torch.zeros(num_reqs, dtype=torch.int32).to(
                         self.device
                     )
@@ -6030,6 +6042,14 @@ class TPUModelRunner(GPUModelRunner):
                             else None,
                         )
                         synchronize_tensors(out_1d)
+                        logger.info(
+                            "  -- padded_logits_length: %d, num_seqs: %d",
+                            num_tokens,
+                            num_reqs,
+                        )
+                        if num_reqs >= min(num_tokens, self.max_num_reqs):
+                            break
+                        continue
                     # --- greedy verify path (do_sampling=False) ---
                     bonus_token_ids, target_logits_warm = (
                         self.spec_bonus_and_target_logits(
