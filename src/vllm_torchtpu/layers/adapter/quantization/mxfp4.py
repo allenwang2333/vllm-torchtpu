@@ -688,36 +688,61 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             register_score_bias_buffer,
         )
 
-        (
-            w13_weight_padded,
-            w2_weight_padded,
-            w13_bias_padded,
-            w2_bias_padded,
-            orig_intermediate,
-        ) = self._dequantize_and_pad(layer)
-        self._release_source_weights(layer)
-        # Decided before the quantization, not after: the two paths differ
-        # only in whether the fp4 pairs cross the bridge packed, and that is
-        # an argument to the quantizer.
-        op = self._prebuild_w4a8(
-            layer,
-            activation_str,
-            w13_weight_padded,
-            w2_weight_padded,
-            orig_intermediate,
-        )
-        (
-            w13_weight_processed,
-            w2_weight_processed,
-            w13_weight_scale,
-            w2_weight_scale,
-        ) = self._requantize_native_fp4(
-            w13_weight_padded,
-            w2_weight_padded,
-            orig_intermediate,
-            device,
-            pack=False,
-        )
+        import hashlib
+        _raw_sig = layer.w13_weight.data.cpu().reshape(-1)[:4096].contiguous().view(torch.uint8).numpy().tobytes()
+        _bundle_key = hashlib.md5(_raw_sig + f"_{tuple(layer.w13_weight.shape)}".encode()).hexdigest()[:16]
+        _bundle_path = f"/dev/shm/dsv41_fp4_cache/bundle_{_bundle_key}.pt"
+        if os.path.exists(_bundle_path + ".done"):
+            self._release_source_weights(layer)
+            _b = torch.load(_bundle_path, map_location="cpu", weights_only=True)
+            op = None
+            w13_weight_processed = _b["w13_u8"].view(torch.float4_e2m1fn_x2).to(device)
+            w2_weight_processed = _b["w2_u8"].view(torch.float4_e2m1fn_x2).to(device)
+            w13_weight_scale = _b["w13_s"].to(device)
+            w2_weight_scale = _b["w2_s"].to(device)
+            w13_bias_padded = _b["w13_b"]
+            w2_bias_padded = _b["w2_b"]
+            w13_weight_padded = w2_weight_padded = None
+            del _b
+        else:
+            (
+                w13_weight_padded,
+                w2_weight_padded,
+                w13_bias_padded,
+                w2_bias_padded,
+                orig_intermediate,
+            ) = self._dequantize_and_pad(layer)
+            self._release_source_weights(layer)
+            op = self._prebuild_w4a8(
+                layer,
+                activation_str,
+                w13_weight_padded,
+                w2_weight_padded,
+                orig_intermediate,
+            )
+            (
+                w13_weight_processed,
+                w2_weight_processed,
+                w13_weight_scale,
+                w2_weight_scale,
+            ) = self._requantize_native_fp4(
+                w13_weight_padded,
+                w2_weight_padded,
+                orig_intermediate,
+                device,
+                pack=False,
+            )
+            _tmp_b = _bundle_path + f".tmp.{os.getpid()}"
+            torch.save({
+                "w13_u8": w13_weight_processed.view(torch.uint8).cpu(),
+                "w2_u8": w2_weight_processed.view(torch.uint8).cpu(),
+                "w13_s": w13_weight_scale.cpu(),
+                "w2_s": w2_weight_scale.cpu(),
+                "w13_b": w13_bias_padded.cpu() if w13_bias_padded is not None else None,
+                "w2_b": w2_bias_padded.cpu() if w2_bias_padded is not None else None,
+            }, _tmp_b)
+            os.replace(_tmp_b, _bundle_path)
+            open(_bundle_path + ".done", "w").close()
 
         layer.w13_weight = torch.nn.Parameter(w13_weight_processed, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight_processed, requires_grad=False)
