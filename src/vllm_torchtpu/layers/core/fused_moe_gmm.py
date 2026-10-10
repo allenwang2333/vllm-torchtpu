@@ -247,13 +247,6 @@ def _moe_gmm_tiling(
                 tile_n=tiles.tile_n,
                 bucket_base=64,
             )
-        if dims.size_m >= 32768 and 256 % dims.size_lhs_sublane == 0:
-            return TileSizes(
-                tile_m=512,
-                tile_k=tiles.tile_k,
-                tile_n=tiles.tile_n,
-                bucket_base=256,
-            )
     if (
         dims.size_group > 1
         and 32 <= dims.size_m <= dims.size_group * 40
@@ -937,7 +930,7 @@ def fused_moe_func(
         w2_scale = jnp.expand_dims(w2_scale, 2)
 
     orig_num_tokens, hidden_size = hidden_states.shape
-    pad_t = -orig_num_tokens % 8
+    pad_t = -orig_num_tokens % 8 if (orig_num_tokens * topk) % 8 != 0 else 0
     if pad_t:
         hidden_states = jnp.pad(hidden_states, ((0, pad_t), (0, 0)))
         topk_weights = jnp.pad(topk_weights, ((0, pad_t), (0, 0)), constant_values=0)

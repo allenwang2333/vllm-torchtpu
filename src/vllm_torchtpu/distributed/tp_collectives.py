@@ -73,7 +73,12 @@ def tp_all_gather(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
     shape_tail = tuple(int(x_contig.size(i)) for i in range(1, x_contig.ndim))
     if dim == 0 and shape_tail and shape_tail[-1] % 128 != 0:
         pad_cols = 128 - (shape_tail[-1] % 128)
-        x_padded = torch.nn.functional.pad(x_contig, (0, pad_cols))
+        pad_zeros = torch.zeros(
+            (*x_contig.shape[:-1], pad_cols),
+            dtype=x_contig.dtype,
+            device=x_contig.device,
+        )
+        x_padded = torch.cat((x_contig, pad_zeros), dim=-1)
         pad_tail = (*shape_tail[:-1], shape_tail[-1] + pad_cols)
         out_padded = torch.empty_like(
             x_padded.unsqueeze(0).expand(world_size, *((-1,) * x_padded.ndim)),
