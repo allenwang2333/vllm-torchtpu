@@ -853,16 +853,16 @@ def test_tpu_worker_init_device_all_branches(
 
     cfg_pcp = _make_worker_vllm_config(pcp_size=2, dcp_size=2)
     w_pcp = TPUWorker(cfg_pcp, 0, 0, "tcp://127.0.0.1:12345")
-    monkeypatch.setattr(worker_mod.envs, "TPU_LOCAL_RANK_OFFSET", 2)
+    monkeypatch.setitem(vars(worker_mod.envs), "TPU_LOCAL_RANK_OFFSET", 2)
     w_pcp.init_device()
 
-    monkeypatch.setattr(worker_mod.envs, "TPU_LOCAL_RANK_OFFSET", 0)
-    monkeypatch.setattr(worker_mod.envs, "DEBUG_TPU_LOCAL_RANK_OFFSET", 4)
+    monkeypatch.setitem(vars(worker_mod.envs), "TPU_LOCAL_RANK_OFFSET", 0)
+    monkeypatch.setitem(vars(worker_mod.envs), "DEBUG_TPU_LOCAL_RANK_OFFSET", 4)
     cfg_file = _make_worker_vllm_config(pcp_size=1)
     w_file = TPUWorker(cfg_file, 0, 0, "file:///tmp/vllm_store")
     w_file.init_device()
 
-    monkeypatch.setattr(worker_mod.envs, "DEBUG_TPU_LOCAL_RANK_OFFSET", 0)
+    monkeypatch.setitem(vars(worker_mod.envs), "DEBUG_TPU_LOCAL_RANK_OFFSET", 0)
     w_file.init_device()
 
     w_bad = TPUWorker(cfg_file, 0, 0, "invalid://method")
@@ -884,16 +884,16 @@ def test_tpu_worker_memory_execution_profiling_and_methods(
     worker.model_runner = MagicMock()
     worker.model_runner.max_num_tokens = 128
 
-    monkeypatch.setattr(worker_mod.envs, "TPU_DEEPSEEK_V41_IMPL", "v1")
+    monkeypatch.setitem(vars(worker_mod.envs), "TPU_DEEPSEEK_V41_IMPL", "v1")
     assert worker.determine_available_memory() == 1024
 
-    monkeypatch.setattr(worker_mod.envs, "TPU_DEEPSEEK_V41_IMPL", "v2")
+    monkeypatch.setitem(vars(worker_mod.envs), "TPU_DEEPSEEK_V41_IMPL", "v2")
     monkeypatch.setattr(
         "vllm_torchtpu.models.vllm.deepseek_v41.v2.cache.reserve_rope_companion",
         lambda vcfg, avail: avail - 256,
     )
     assert worker.determine_available_memory() == 768
-    monkeypatch.setattr(worker_mod.envs, "TPU_DEEPSEEK_V41_IMPL", "v1")
+    monkeypatch.setitem(vars(worker_mod.envs), "TPU_DEEPSEEK_V41_IMPL", "v1")
 
     worker.cache_config.kv_cache_memory_bytes = None
     monkeypatch.setattr(
@@ -944,7 +944,7 @@ def test_tpu_worker_memory_execution_profiling_and_methods(
     worker.model_runner._run_dp_idle_pairing.assert_called_once_with(32, 2)
 
     # 3. Phased & standard profiling
-    monkeypatch.setattr(worker_mod.envs, "USE_PHASED_PROFILER", True)
+    monkeypatch.setitem(vars(worker_mod.envs), "USE_PHASED_PROFILER", True)
     worker.profile(is_start=True, profile_prefix="p1")
     worker.model_runner.start_phased_profiling.assert_called_once_with(
         "p1", profiler_kwargs=None
@@ -952,7 +952,7 @@ def test_tpu_worker_memory_execution_profiling_and_methods(
     worker.profile(is_start=False)
     worker.model_runner.stop_phased_profiling.assert_called_once()
 
-    monkeypatch.setattr(worker_mod.envs, "USE_PHASED_PROFILER", False)
+    monkeypatch.setitem(vars(worker_mod.envs), "USE_PHASED_PROFILER", False)
     worker.profile_dir = None
     worker.profile(is_start=True)  # logs warning & returns
 
@@ -1040,13 +1040,13 @@ def test_tpu_worker_memory_execution_profiling_and_methods(
     assert ct.encoder == 0.0
     worker.model_runner.capture_model.assert_called_once()
 
-    monkeypatch.setattr(worker_mod.envs, "TPU_KERNEL_ITER_MODE", False)
+    monkeypatch.setitem(vars(worker_mod.envs), "TPU_KERNEL_ITER_MODE", False)
     with pytest.raises(
         RuntimeError, match="reload_kernels requires TPU_KERNEL_ITER_MODE=1"
     ):
         worker.reload_kernels()
 
-    monkeypatch.setattr(worker_mod.envs, "TPU_KERNEL_ITER_MODE", True)
+    monkeypatch.setitem(vars(worker_mod.envs), "TPU_KERNEL_ITER_MODE", True)
     monkeypatch.setattr(
         "vllm_torchtpu.compilation.kernel_reload.reload_kernels",
         lambda mods: {"reloaded": mods or ["all"]},

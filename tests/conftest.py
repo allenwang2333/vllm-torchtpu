@@ -84,6 +84,27 @@ def _reset_warning_once():
     vllm.logger._print_warning_once.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def _drop_pinned_lazy_envs():
+    """Undo env knobs a test pinned onto `vllm_torchtpu.envs` by accident.
+
+    `envs` resolves knobs through a module `__getattr__`, so a knob normally
+    has no module attribute. `monkeypatch.setattr(envs, KNOB, v)` reads the
+    old value through `__getattr__` and, on undo, writes it back as a real
+    attribute, which then shadows every later `setenv` for the rest of the
+    session. Drop any knob attribute that did not exist before the test
+    (this fixture is set up before `monkeypatch`, so it tears down after).
+    """
+    import vllm_torchtpu.envs as tpu_envs
+
+    namespace = vars(tpu_envs)
+    before = {name for name in tpu_envs.environment_variables if name in namespace}
+    yield
+    for name in tpu_envs.environment_variables:
+        if name in namespace and name not in before:
+            del namespace[name]
+
+
 @pytest.fixture
 def vllm_config_context():
     """Run backend helpers with the same resolved layout as worker startup."""
