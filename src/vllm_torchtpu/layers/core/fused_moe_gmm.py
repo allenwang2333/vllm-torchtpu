@@ -719,7 +719,14 @@ def moe_gmm(
         and jax.dtypes.itemsize_bits(w2.dtype) == 4
     )
     if (is_w2_fp4 or rhs_quant_dtype == jnp.float4_e2m1fn) and lhs_scale is not None:
-        x = (x.astype(jnp.float32) * lhs_scale).astype(lhs_scale.dtype)
+        if lhs_scale.shape[1] == 1:
+            x = (x.astype(jnp.float32) * lhs_scale).astype(lhs_scale.dtype)
+        else:
+            nb = lhs_scale.shape[1]
+            x = (
+                x.reshape(x.shape[0], nb, x.shape[1] // nb).astype(jnp.float32)
+                * lhs_scale[:, :, None]
+            ).reshape(x.shape).astype(lhs_scale.dtype)
         lhs_scale = None
     fuse_gmm1_fp8 = not is_w2_fp4 and inter_dim == 512
     gmm1_res = gmm_wrapper(
