@@ -266,14 +266,14 @@ def _need_devices(dcp_size):
         pytest.skip(f"needs {dcp_size} devices, have {n}")
 
 
-def _dcp_case(dcp_size, seed):
+def _dcp_case(dcp_size, seed, q_len=Q_LEN):
     """Records plus the positional args and kwargs of one sharded DCP call."""
     rec = _global_records(KV_LEN)
     kq, kw = jax.random.split(jax.random.key(seed))
-    q = (jax.random.normal(kq, (Q_LEN, H_IDX, D_IDX), jnp.float32) * 0.5).astype(
+    q = (jax.random.normal(kq, (q_len, H_IDX, D_IDX), jnp.float32) * 0.5).astype(
         jnp.float8_e4m3fn
     )
-    weights = jax.random.normal(kw, (Q_LEN, H_IDX), jnp.float32).astype(jnp.bfloat16)
+    weights = jax.random.normal(kw, (q_len, H_IDX), jnp.float32).astype(jnp.bfloat16)
 
     # interleave_size=1: global position g lives on rank g % dcp_size at local
     # index g // dcp_size, so the shards are a strided de-interleave.
@@ -294,7 +294,7 @@ def _dcp_case(dcp_size, seed):
         shards,
         jnp.array([KV_LEN], jnp.int32),
         jnp.arange(vpages, dtype=jnp.int32),
-        jnp.array([0, Q_LEN], jnp.int32),
+        jnp.array([0, q_len], jnp.int32),
         jnp.array([0, 0, 1], jnp.int32),
     )
     kwargs = dict(
@@ -592,3 +592,70 @@ def test_dcp_append_and_topk_match_across_xla_has_and_sal(dcp_size):
 
     np.testing.assert_array_equal(topk_has, topk_xla)
     np.testing.assert_array_equal(topk_sal, topk_xla)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+@pytest.mark.parametrize("q_len", [16, Q_LEN])
+def test_dcp_fused_payload_is_bit_identical(q_len, dcp_size):
+    """`fused_payload` is accepted and changes nothing.
+
+    On this tree the SparseCore top-k is single-stage and the all-gather merge
+    resolves owned winners inside `sparsecore_topk_dcp_merge`, so there is no
+    gather left for the flag to fold: the lowered program and the output are
+    those of the default call.
+    """
+    _need_devices(dcp_size)
+    _, args, kwargs = _dcp_case(dcp_size, 5, q_len=q_len)
+
+    def text(**kw):
+        return streamindex_topk_dcp.lower(*args, **kwargs, **kw).as_text()
+
+    assert text(fused_payload=True) == text()
+    want = np.asarray(streamindex_topk_dcp(*args, **kwargs))
+    got = np.asarray(streamindex_topk_dcp(*args, **kwargs, fused_payload=True))
+    np.testing.assert_array_equal(got, want)
+    assert (got >= 0).any()
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 8])
+@pytest.mark.parametrize("q_len", [16, Q_LEN])
+@pytest.mark.parametrize("fused_payload", [False, True])
+@pytest.mark.parametrize("chunk_tokens", [None, 64])
+# KV_LEN // 4: every row fits the first stage-1 slice (the single-call path);
+# KV_LEN: rows overflow it (the two-stage fallback inside the conditional).
+@pytest.mark.parametrize("seq_len", [KV_LEN // 4, KV_LEN])
+def test_dcp_single_slice_is_bit_identical(
+    seq_len, chunk_tokens, fused_payload, q_len, dcp_size
+):
+    """`single_slice` skips the local stage-2 merge and changes no output."""
+    _need_devices(dcp_size)
+    _, args, kwargs = _dcp_case(dcp_size, 7, q_len=q_len)
+    args = args[:3] + (jnp.array([seq_len], jnp.int32),) + args[4:]
+    kwargs = dict(kwargs, fused_payload=fused_payload, chunk_tokens=chunk_tokens)
+    want = np.asarray(streamindex_topk_dcp(*args, **kwargs))
+    got = np.asarray(streamindex_topk_dcp(*args, **kwargs, single_slice=True))
+    np.testing.assert_array_equal(got, want)
+    assert (got >= 0).any()
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 8])
+@pytest.mark.parametrize("q_len", [16, Q_LEN])
+@pytest.mark.parametrize("fused_payload", [False, True])
+@pytest.mark.parametrize("partition", [(None, 1), (4, 1), (2, 4)])
+def test_dcp_topk_partition_is_bit_identical(partition, fused_payload, q_len, dcp_size):
+    """Forced local / merge partition factors change no output."""
+    _need_devices(dcp_size)
+    _, args, kwargs = _dcp_case(dcp_size, 9, q_len=q_len)
+    kwargs = dict(kwargs, fused_payload=fused_payload, single_slice=True)
+    want = np.asarray(streamindex_topk_dcp(*args, **kwargs))
+    local, merge = partition
+    got = np.asarray(
+        streamindex_topk_dcp(
+            *args, **kwargs, local_topk_partition=local, global_topk_partition=merge
+        )
+    )
+    np.testing.assert_array_equal(got, want)
+    assert (got >= 0).any()

@@ -1063,6 +1063,10 @@ def _effective_row_lengths(
         "cp_size",
         "interleave_size",
         "return_scores",
+        "fused_payload",
+        "single_slice",
+        "skip_empty_decode",
+        "topk_partition",
     ),
 )
 def streamindex_topk(
@@ -1091,6 +1095,10 @@ def streamindex_topk(
     cp_rank: jax.Array | int = 0,
     interleave_size: int = 1,
     return_scores: bool = False,
+    fused_payload: bool = False,
+    single_slice: bool = False,
+    skip_empty_decode: bool = False,
+    topk_partition: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1150,12 +1158,27 @@ def streamindex_topk(
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
         the DCP attention kernels need an LSE output.
+      fused_payload: accepted for compatibility; a no-op. The SparseCore
+        top-k is single-stage, so there is no candidate-to-column gather left
+        to fold into it.
+      single_slice: forwarded to `sparsecore_topk`; when every row's visible
+        length fits the first of its P slices, one subcore per row reads that
+        slice in place instead of a cooperative P-subcore group. Same result.
+      topk_partition: forwarded to `sparsecore_topk` as ``partition``; forces
+        its subcore partition factor. Same result.
+      skip_empty_decode: when the batch has no decode (q_len 1) sequence --
+        every step under speculative decoding, whose decode rows have q_len
+        gamma + 1 and go to the MIXED pass -- branch at runtime around the two
+        DECODE passes, which would launch over an empty range. Unchunked calls
+        only. The MIXED pass writes the same rows either way, so the result is
+        identical.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
       when `cp_size == 1`), or `(indices, scores)` if `return_scores`. Unfilled
       slots are `-1` with score `-inf`.
     """
+    del fused_payload  # see the docstring: nothing left to fuse
     # Scale factors for the FP8 index cache format are packed directly inside
     # `cache_kv`, keeping HBM transactions fused.
 
@@ -1550,14 +1573,30 @@ def streamindex_topk(
             sc_group = None if m == num_chunks - 1 else group_base + m
 
             start = m * chunk_len
-            scores = _scores_for_chunk(
-                passes,
-                m,
-                chunk_starts[m],
-                chunk_len,
-                out_dtype,
-                tc_group,
+            scores_for = functools.partial(
+                _scores_for_chunk,
+                chunk_idx=m,
+                chunk_token_start=chunk_starts[m],
+                chunk_tokens=chunk_len,
+                out_dtype=out_dtype,
+                scheduling_group_id=tc_group,
             )
+            if skip_empty_decode and num_chunks == 1:
+                # The DECODE passes (one or two: the batched one is dropped
+                # when max_num_seqs < decode_req_batch_size) cover
+                # [0, distribution[1]); with it empty, the MIXED pass alone
+                # allocates the buffer and writes every row it would have
+                # written behind them.
+                non_decode = tuple(
+                    p for p in passes if p[0]["case"] is not MlaCase.DECODE
+                )
+                scores = jax.lax.cond(
+                    distribution[1] > 0,
+                    lambda f=scores_for: f(passes),
+                    lambda f=scores_for, rest=non_decode: f(rest),
+                )
+            else:
+                scores = scores_for(passes)
             scores = scores.reshape(chunk_len, -1)
             if scores.shape[1] < k:
                 scores = jnp.pad(
@@ -1574,6 +1613,8 @@ def streamindex_topk(
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=True,
+                    single_slice=single_slice,
+                    partition=topk_partition,
                 )
                 topk_scores_list.append(chunk_topk_scores)
             else:
@@ -1584,6 +1625,8 @@ def streamindex_topk(
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=False,
+                    single_slice=single_slice,
+                    partition=topk_partition,
                 )
             topk_idxs.append(chunk_topk_idxs)
 
@@ -1653,6 +1696,11 @@ def streamindex_topk(
         "chunk_tokens",
         "dcp_axis_name",
         "a2a_merge",
+        "fused_payload",
+        "single_slice",
+        "skip_empty_decode",
+        "local_topk_partition",
+        "global_topk_partition",
     ),
 )
 def streamindex_topk_dcp(
@@ -1678,6 +1726,11 @@ def streamindex_topk_dcp(
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
     a2a_merge: bool = False,
+    fused_payload: bool = False,
+    single_slice: bool = False,
+    skip_empty_decode: bool = False,
+    local_topk_partition: int | None = None,
+    global_topk_partition: int | None = None,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1746,6 +1799,17 @@ def streamindex_topk_dcp(
       dcp_axis_name: name of the DCP mesh axis.
       a2a_merge: merge over the token axis with an `all_to_all` instead of over
         the candidate axis with an `all_gather`; see above. Same result.
+      fused_payload: accepted for compatibility; a no-op. The SparseCore
+        top-k is single-stage (no candidate-to-column gather to fold) and the
+        all-gather merge resolves owned winners inside
+        `sparsecore_topk_dcp_merge`, so no separate gather is left to fuse.
+      single_slice: forwarded to the per-rank `sparsecore_topk`; see there.
+      skip_empty_decode: forwarded to `streamindex_topk`; see there.
+      local_topk_partition / global_topk_partition: the ``partition`` of the
+        per-rank and the all-to-all merge's `sparsecore_topk` calls (None =
+        its heuristic). The all-gather merge (`sparsecore_topk_dcp_merge`) is
+        always one P = 1 call, so ``global_topk_partition`` does not apply to
+        it. Same result.
 
     Returns:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1758,6 +1822,7 @@ def streamindex_topk_dcp(
       gathers the full width pays `dcp_size`x more than it needs to; the
       attention side should bound its gather by the per-row count.
     """
+    del fused_payload  # see the docstring: nothing left to fuse
     if dcp_size <= 1:
         raise ValueError(
             f"streamindex_topk_dcp requires dcp_size > 1, got {dcp_size}; "
@@ -1809,6 +1874,9 @@ def streamindex_topk_dcp(
             cp_rank=dcp_rank,
             interleave_size=interleave_size,
             return_scores=True,
+            single_slice=single_slice,
+            skip_empty_decode=skip_empty_decode,
+            topk_partition=local_topk_partition,
         )
 
         if a2a_merge:
@@ -1827,6 +1895,7 @@ def streamindex_topk_dcp(
                     (scores.shape[0],), scores.shape[1], dtype=jnp.int32
                 ),
                 write_empty_rows=True,
+                partition=global_topk_partition,
             )
             # Stage 3. Every rank's merged block back, in token order: [T, k]
             # slots. A slot names its source rank and that rank's own list, so

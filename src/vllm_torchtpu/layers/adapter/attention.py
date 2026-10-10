@@ -2467,15 +2467,17 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 )
                 # The scatter undoes the head all-gather above.
                 #
-                # Only the backbone may use the all-to-all merge. The merge
-                # picks it by comparing the token count to
-                # TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS at trace time, and only
+                # Only the backbone may pick the merge by token count. The
+                # merge compares the token count to
+                # TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS (and
+                # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS) at trace time, and only
                 # the backbone is traced multiple times, once per bucket
                 # group (`_precompile_backbone`). The MTP drafter (model_tag
-                # "eagle_head") is traced once for every bucket: the
-                # comparison would pin its graph to the first size, and the
-                # large buckets fail with ShapeSpecializationError. So the
-                # drafter keeps the reduce-scatter, as with the flag off.
+                # "eagle_head") is traced once for every bucket: a comparison
+                # would pin its graph to the first size, and the large
+                # buckets fail with ShapeSpecializationError. So the drafter
+                # never compares it: with TPU_DCP_LSE_MERGE_A2A it takes the
+                # all-to-all at every size, otherwise the reduce-scatter.
                 outputs = merge_lse_partials_scatter_heads(
                     partial,
                     lse,

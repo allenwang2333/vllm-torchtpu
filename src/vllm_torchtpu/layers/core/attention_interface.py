@@ -1170,7 +1170,8 @@ def sparse_mla_attention_dcp(
         # Split q: the kernel joins q_nope and q_pe in VMEM (no padded
         # [T, H, 640] concat). The merge below needs the lse, so it also comes
         # out lane-dense as f32[T, H] rather than f32[T, H, 1].
-        if envs.TPU_MLA_SPARSE_SPLIT_Q:
+        # TPU_DCP_MLA_SPLIT_Q_LSE is the DCP-only spelling of the same switch.
+        if envs.TPU_MLA_SPARSE_SPLIT_Q or envs.TPU_DCP_MLA_SPLIT_Q_LSE:
             q, split_kwargs = ql_nope, {"q_pe": q_pe, "lse_lane_dense": True}
         else:
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
@@ -1191,6 +1192,12 @@ def sparse_mla_attention_dcp(
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
         local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
+        # Decode-sized chunks: query tokens per attention grid step.
+        small_chunk_batch = envs.TPU_DCP_MLA_SMALL_CHUNK_BATCH
+        if small_chunk_batch < 1:
+            raise ValueError(
+                f"TPU_DCP_MLA_SMALL_CHUNK_BATCH must be >= 1, got {small_chunk_batch}"
+            )
         output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -1204,9 +1211,15 @@ def sparse_mla_attention_dcp(
             return_lse=True,
             # The kernel defaults to tensorcore; the caches follow the spec.
             cache_layout=cache_layout,
-            # Ranks own ~topk/dcp of each row: a static top-k width with an
-            # exact in-kernel overflow pass for the rows that need more.
+            # Ranks own ~topk/dcp of each row: gather and attend those only
+            # (opt-in; takes the decode-sized chunks ahead of the cap).
+            packed_gather=envs.TPU_DCP_MLA_PACKED_GATHER,
+            # The rest: a static top-k width with an exact in-kernel overflow
+            # pass for the rows that need more. Its window-major index prep
+            # is the kernel default (TPU_DCP_MLA_CAPPED_PREP is a no-op).
             topk_cap=topk_cap,
+            # Decode chunks: tokens per grid step (1 = kernel default).
+            small_chunk_batch_size=small_chunk_batch,
             **chunk_kwargs,
             **split_kwargs,
         )

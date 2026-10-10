@@ -94,8 +94,15 @@ def _topk_body(
     write_empty: bool,
     return_scores: bool,
     local_idxs_hbm: Any = None,
+    row_stride: int = 1,
 ):
+    # ``row_stride > 1`` (P = 1, no DCP merge): ``scores_hbm`` holds ``b`` rows
+    # of ``row_stride * slice_len`` words and each subcore DMAs only the first
+    # ``slice_len`` of its row, in place -- the first of ``row_stride`` equal
+    # slices. Rows past ``b`` re-read row ``b - 1`` instead of an out-of-bounds
+    # block; they are inactive and emit nothing.
     dcp_merge = local_idxs_hbm is not None
+    assert row_stride == 1 or (p == 1 and not dcp_merge)
     num_subcores = 16
     num_sc_cores = 2
     core = lax.axis_index("core")
@@ -564,6 +571,12 @@ def _topk_body(
                 (slice_len,),
                 lambda w: (w * cores_per_chip + flat,),
                 pipeline_mode=pl.Buffered(buf_count),
+            )
+            if row_stride == 1
+            else pl.BlockSpec(
+                (slice_len,),
+                lambda w: (jnp.minimum(w * cores_per_chip + flat, b - 1) * row_stride,),
+                pipeline_mode=pl.Buffered(buf_count),
             ),
             pl.BlockSpec(
                 (LANES,),
@@ -656,6 +669,7 @@ def _sc_topk_direct(
     write_empty: bool = True,
     return_scores: bool = True,
     scheduling_group_id: int | None = None,
+    row_stride: int = 1,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Single-stage SparseCore top-k on 32 subcores.
 
@@ -663,10 +677,20 @@ def _sc_topk_direct(
     When ``p > 1``, groups of ``p`` subcores on the same SparseCore cooperatively
     process a row using a shared global histogram in ``VMEM_SHARED``.
 
+    With ``row_stride > 1`` (``p == 1`` only, no ``local_idxs``) each row is
+    read only over its first ``n // row_stride`` columns, in place (no slice
+    copy), and indices are relative to that slice: top-k of
+    ``scores[:, : n // row_stride]``.
+
     ``scores`` may be f32 or the same values already bitcast to i32; the kernel
     compares raw bits either way.
     """
-    b, n = scores.shape
+    b, n_full = scores.shape
+    if row_stride > 1 and (p != 1 or local_idxs is not None):
+        raise ValueError("row_stride needs p == 1 and no local_idxs")
+    if n_full % row_stride or (n_full // row_stride) % LANES:
+        raise ValueError(f"{n_full=} not {row_stride} slices of LANES multiples")
+    n = n_full // row_stride
     info = pltpu.get_tpu_info()
     sc = info.sparse_core
     if sc is None:
@@ -683,7 +707,7 @@ def _sc_topk_direct(
     padded_b = num_waves * groups_per_chip
     pad_b = padded_b - b
     pad_n = slice_len * p - n
-    if pad_b > 0 or pad_n > 0:
+    if row_stride == 1 and (pad_b > 0 or pad_n > 0):
         words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
 
     lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
@@ -742,6 +766,7 @@ def _sc_topk_direct(
         num_waves=num_waves,
         write_empty=write_empty,
         return_scores=return_scores,
+        row_stride=row_stride,
     )
     if local_idxs is not None:
         orig_body = body_fn
@@ -757,7 +782,10 @@ def _sc_topk_direct(
         ),
         scratch_types=scratch_types,
         mesh=mesh,
-        name=f"sc_topk_direct_b{b}_n{n}_k{k}_p{p}",
+        name=(
+            f"sc_topk_direct_b{b}_n{n}_k{k}_p{p}"
+            + (f"_s{row_stride}" if row_stride > 1 else "")
+        ),
     )(words.reshape(-1), lengths_2d.reshape(-1), *extra_inputs)
     if scheduling_group_id is not None:
         out = xla_metadata.set_xla_metadata(
@@ -774,10 +802,15 @@ def _sc_topk_direct(
     return slots_2d
 
 
-def _pick_partition(b: int, n: int, k: int) -> int:
+def _pick_partition(b: int, n: int, k: int, override: int | None = None) -> int:
     """Picks the power-of-two partition factor P (1..16) per row to maximize
 
     subcore utilization across subcores while fitting in VMEM and VMEM_SHARED.
+
+    ``override`` forces P instead (a power of two of at most 16 dividing ``n``
+    into slices of at least ``LANES`` words); it is raised to the smallest P
+    whose slice fits tile memory. P may exceed ``32 // b``: the cooperative
+    groups then run in several waves.
     """
     # A cooperative group must fit on one SparseCore's 16 subcores; past that,
     # slices grow beyond MAX_SLICE_WORDS and run single-buffered (~5% slower).
@@ -785,6 +818,15 @@ def _pick_partition(b: int, n: int, k: int) -> int:
     p = 1
     while p < p_min:
         p *= 2
+    if override is not None:
+        if override < 1 or override & (override - 1):
+            raise ValueError(f"partition {override=} must be a power of two")
+        q = max(override, p)
+        if q > 16:
+            raise ValueError(f"partition {q} exceeds one SparseCore's 16 subcores")
+        if n % q or n // q < LANES:
+            raise ValueError(f"partition {q} does not divide {n=} into slices")
+        return q
 
     max_p = min(16, 32 // b) if b < 32 else 1
     while p * 2 <= max_p:
@@ -796,6 +838,36 @@ def _pick_partition(b: int, n: int, k: int) -> int:
     return p
 
 
+# What `TPU_SC_TOPK_PARTITION_OVERRIDE=1` means: the indexer's cross-rank merge
+# as one P = 1 SparseCore call. The all-gather DCP merge
+# (`sparsecore_topk_dcp_merge`) is always that; the override still applies to
+# the all-to-all merge's `sparsecore_topk`. The local top-k keeps its heuristic.
+DEFAULT_PARTITION_OVERRIDE = "global:1"
+
+
+def parse_partition_override(spec: str) -> tuple[int | None, int | None]:
+    """``"local:P,global:P"`` (either part optional) -> ``(local, global)``.
+
+    Empty / ``0`` / ``off`` means no override; ``1`` / ``on`` /
+    ``true`` means `DEFAULT_PARTITION_OVERRIDE`.
+    """
+    spec = (spec or "").strip().lower()
+    if spec in ("", "0", "off", "false", "no"):
+        return None, None
+    if spec in ("1", "on", "true", "yes"):
+        spec = DEFAULT_PARTITION_OVERRIDE
+    out: dict[str, int | None] = {"local": None, "global": None}
+    for part in spec.split(","):
+        key, sep, val = part.strip().partition(":")
+        if not sep or key not in out:
+            raise ValueError(f"bad partition override {spec!r}: want local:P,global:P")
+        p = int(val)
+        if p < 1 or p & (p - 1):
+            raise ValueError(f"bad partition override {spec!r}: P must be 2**i")
+        out[key] = p
+    return out["local"], out["global"]
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -803,6 +875,8 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         "write_empty_rows",
         "scheduling_group_id",
         "return_scores",
+        "single_slice",
+        "partition",
     ),
 )
 def sparsecore_topk(
@@ -813,6 +887,8 @@ def sparsecore_topk(
     write_empty_rows: bool = True,
     scheduling_group_id: int | None = None,
     return_scores: bool = False,
+    single_slice: bool = False,
+    partition: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
 
@@ -823,6 +899,19 @@ def sparsecore_topk(
 
     ``scores`` may be f32 or i32 holding those f32 bits; the comparison is on
     raw bits either way.
+
+    ``single_slice`` targets rows much wider than their real length (a score
+    row sized for ``max_model_len``). When P > 1 and every row length fits the
+    first of the P slices, the answer is the top-k of that slice alone, so one
+    subcore per row reads it in place (``row_stride=P``, no cooperative group,
+    no ``VMEM_SHARED`` exchange); an ``lax.cond`` falls back to the
+    cooperative call when any row overflows the slice. Identical arrays either
+    way. The common path's call stays outside the conditional, so it keeps its
+    scheduling group.
+
+    ``partition`` forces the partition factor P (see `_pick_partition`)
+    instead of the utilisation heuristic. With ``single_slice`` it also sets
+    the in-place read window to ``n // P``. The returned arrays do not change.
     """
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
@@ -839,7 +928,34 @@ def sparsecore_topk(
     else:
         row_lengths = row_lengths.astype(jnp.int32)
 
-    p = _pick_partition(b, n, k)
+    p = _pick_partition(b, n, k, partition)
+    n_p = n // p
+    if single_slice and p > 1 and n % p == 0 and n_p % LANES == 0 and k <= n_p:
+        first = _sc_topk_direct(
+            scores,
+            k,
+            row_lengths,
+            p=1,
+            write_empty=write_empty_rows,
+            return_scores=return_scores,
+            scheduling_group_id=scheduling_group_id,
+            row_stride=p,
+        )
+        # The overflow branch runs inside a conditional, where XLA scheduling
+        # groups cannot pair it with work outside; it drops them.
+        return lax.cond(
+            jnp.max(row_lengths) > n_p,
+            lambda s: _sc_topk_direct(
+                s,
+                k,
+                row_lengths,
+                p=p,
+                write_empty=write_empty_rows,
+                return_scores=return_scores,
+            ),
+            lambda _: first,
+            scores,
+        )
     return _sc_topk_direct(
         scores,
         k,

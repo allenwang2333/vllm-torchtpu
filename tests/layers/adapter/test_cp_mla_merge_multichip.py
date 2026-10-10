@@ -17,6 +17,11 @@ threaded stand-in for the exchange; this pins what only hardware can answer:
      nothing -- and the same check fails when the send blocks are rotated by
      one rank (the positive control).
 
+  3. The chunked and head-major reduce-scatter merges
+     (`TPU_DCP_MERGE_CHUNKED`, `TPU_DCP_MERGE_HEAD_MAJOR`) change no per-row
+     arithmetic: they are reported bit for bit against today's merge compiled
+     the same way, and must be no less exact.
+
 Run on one host (4 chips x 2 cores = 8 ranks). `--bench` adds a per-merge
 timing of every path at decode and mixed-step token counts.
 """
@@ -41,10 +46,45 @@ VDIM = 512
 CHECK_TOKENS = 64
 LAUNCH_TIMEOUT_SECONDS = 900
 
-# name -> TPU_DCP_LSE_MERGE_A2A
+_ARM_DEFAULTS = {
+    "TPU_DCP_LSE_MERGE_A2A": False,
+    "TPU_DCP_LSE_MERGE_RS_BF16": False,
+    "TPU_DCP_MERGE_CHUNKED": 0,
+    "TPU_DCP_MERGE_CHUNKED_LSE_ONCE": False,
+    "TPU_DCP_MERGE_HEAD_MAJOR": False,
+}
+# name -> the env overrides of `_ARM_DEFAULTS` that make the arm.
 ARMS = {
-    "today": False,
-    "a2a": True,
+    "today": {},
+    "a2a": {"TPU_DCP_LSE_MERGE_A2A": True},
+    "rs_bf16": {"TPU_DCP_LSE_MERGE_RS_BF16": True},
+    "chunk2": {"TPU_DCP_MERGE_CHUNKED": 2},
+    "chunk4": {"TPU_DCP_MERGE_CHUNKED": 4},
+    "chunk4_lse_once": {
+        "TPU_DCP_MERGE_CHUNKED": 4,
+        "TPU_DCP_MERGE_CHUNKED_LSE_ONCE": True,
+    },
+    "head_major": {"TPU_DCP_MERGE_HEAD_MAJOR": True},
+    "chunk4_head_major": {"TPU_DCP_MERGE_CHUNKED": 4, "TPU_DCP_MERGE_HEAD_MAJOR": True},
+}
+# Arms that must return today's merge: same per-row arithmetic, other schedule.
+SPLIT_ARMS = ("chunk2", "chunk4", "chunk4_lse_once", "head_major", "chunk4_head_major")
+# Timed beside today (and the lse all-reduce diagnostic) at `--bench-tokens`.
+BENCH_ARMS = (
+    "today",
+    "head_major",
+    "chunk2",
+    "chunk4",
+    "chunk8",
+    "chunk4_lse_once",
+    "chunk4_head_major",
+    "chunk4_lse_once_head_major",
+)
+ARMS["chunk8"] = {"TPU_DCP_MERGE_CHUNKED": 8}
+ARMS["chunk4_lse_once_head_major"] = {
+    "TPU_DCP_MERGE_CHUNKED": 4,
+    "TPU_DCP_MERGE_CHUNKED_LSE_ONCE": True,
+    "TPU_DCP_MERGE_HEAD_MAJOR": True,
 }
 
 
@@ -177,8 +217,27 @@ MERGE_VARIANTS = {"a2a_reduce_sum": _merge_reduce_sum, "a2a_unrolled": _merge_un
 
 
 def _set_arm(cp_mla, arm):
-    cp_mla.envs.TPU_DCP_LSE_MERGE_A2A = ARMS[arm]
+    for name, value in {**_ARM_DEFAULTS, **ARMS[arm]}.items():
+        setattr(cp_mla.envs, name, value)
     cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS = 1 << 30
+    cp_mla.envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS = 0
+
+
+def _lse_weights_all_reduce(lse, group):
+    """Diagnostic: `_lse_weights` from two all-reduces (max, then the
+    denominator's sum) instead of an all-gather of every rank's lse. Same
+    math; the denominator is summed in the collective's order."""
+    import torch
+    from torch.distributed import _functional_collectives as funcol
+
+    lse_f32 = lse.to(torch.float32).contiguous()
+    finite = torch.isfinite(lse_f32)
+    masked = torch.where(finite, lse_f32, torch.full_like(lse_f32, float("-inf")))
+    shift = funcol.wait_tensor(funcol.all_reduce(masked, "max", group.device_group))
+    shift = torch.where(torch.isfinite(shift), shift, torch.zeros_like(shift))
+    mine = torch.where(finite, torch.exp(lse_f32 - shift), torch.zeros_like(lse_f32))
+    denom = funcol.wait_tensor(funcol.all_reduce(mine, "sum", group.device_group))
+    return mine / torch.where(denom > 0, denom, torch.ones_like(denom))
 
 
 def _compile(fn):
@@ -201,7 +260,8 @@ def _check(rank, world, group, cp_mla):
     l_dev = lses[rank].to("tpu")
     merge = cp_mla.merge_lse_partials_scatter_heads
     report = {}
-    for arm in ARMS:
+    got_today = {}
+    for arm in ("today", *[a for a in ARMS if a != "today"]):
         _set_arm(cp_mla, arm)
         for how in ("eager", "compiled"):
             try:
@@ -212,9 +272,34 @@ def _check(rank, world, group, cp_mla):
                     "dtype": str(got.dtype),
                     **_error_stats(got, ref),
                 }
+                if arm == "today":
+                    got_today[how] = got
+                elif how in got_today and got.shape == got_today[how].shape:
+                    same = got.view(torch.int16) == got_today[how].view(torch.int16)
+                    report[f"{arm}/{how}"]["frac_bitwise_vs_today"] = float(
+                        same.float().mean()
+                    )
             except Exception as exc:  # noqa: BLE001 - reported to the parent
                 traceback.print_exc()
                 report[f"{arm}/{how}"] = {"error": repr(exc)[:400]}
+    # Diagnostic, reported but not asserted: the lse all-reduce variant.
+    real_weights = cp_mla._lse_weights
+    _set_arm(cp_mla, "today")
+    cp_mla._lse_weights = _lse_weights_all_reduce
+    try:
+        for how in ("eager", "compiled"):
+            fn = merge if how == "eager" else _compile(merge)
+            got = fn(o_dev, l_dev).cpu()
+            stats = _error_stats(got, ref)
+            if how in got_today:
+                same = got.view(torch.int16) == got_today[how].view(torch.int16)
+                stats["frac_bitwise_vs_today"] = float(same.float().mean())
+            report[f"diag/lse_all_reduce/{how}"] = stats
+    except Exception as exc:  # noqa: BLE001 - reported to the parent
+        traceback.print_exc()
+        report["diag/lse_all_reduce"] = {"error": repr(exc)[:400]}
+    finally:
+        cp_mla._lse_weights = real_weights
 
     # Diagnostics, reported but not asserted: the compiled local merge with an
     # explicit per-rank f32 accumulation, and under HIGHEST op precision. They
@@ -285,9 +370,18 @@ def _bench(rank, cp_mla, tokens_list, reps=10):
         o = torch.randn(tokens, HEADS, VDIM).to(torch.bfloat16).to("tpu")
         lse = (torch.randn(tokens, HEADS) * 3).to("tpu")
         real_merge = cp_mla._merge_received
-        for arm in ("today", "a2a", *MERGE_VARIANTS):
-            _set_arm(cp_mla, "a2a" if arm in MERGE_VARIANTS else arm)
+        real_weights = cp_mla._lse_weights
+        arms = (*BENCH_ARMS, "diag_lse_all_reduce", "diag_chunk4_lse_all_reduce")
+        if tokens <= 256:
+            arms = ("today", "a2a", *MERGE_VARIANTS)
+        for arm in arms:
+            base_arm = arm.removeprefix("diag_").removesuffix("_lse_all_reduce")
+            if arm == "diag_lse_all_reduce":
+                base_arm = "today"
+            _set_arm(cp_mla, "a2a" if arm in MERGE_VARIANTS else base_arm)
             cp_mla._merge_received = MERGE_VARIANTS.get(arm, real_merge)
+            if arm.endswith("_lse_all_reduce"):
+                cp_mla._lse_weights = _lse_weights_all_reduce
             try:
                 times = {}
                 for k in (1, 1 + reps):
@@ -310,12 +404,21 @@ def _bench(rank, cp_mla, tokens_list, reps=10):
                 out[f"{arm}@{tokens}"] = {"error": repr(exc)[:400]}
             finally:
                 cp_mla._merge_received = real_merge
+                cp_mla._lse_weights = real_weights
             if rank == 0:
                 print(f"BENCH T={tokens} {arm}: {out[f'{arm}@{tokens}']}", flush=True)
     return out
 
 
 def _run_worker(result_dir: Path, bench_tokens: list[int]) -> None:
+    # Optional: rank 0 dumps its optimized HLO (the TPU schedule is the order
+    # of the entry computation), to show what overlaps the reduce-scatter.
+    dump_dir = os.environ.get("DCP_MERGE_HLO_DUMP")
+    if dump_dir and os.environ.get("RANK") == "0":
+        os.environ["LIBTPU_INIT_ARGS"] = (
+            os.environ.get("LIBTPU_INIT_ARGS", "")
+            + f" --xla_dump_to={dump_dir} --xla_dump_hlo_as_text"
+        )
     import torch
     import torch_tpu  # noqa: F401
     from torch import distributed as dist
@@ -428,6 +531,16 @@ def assert_merge_results(results: list[dict]) -> None:
                 a2a["frac_over_1ulp"] <= today["frac_over_1ulp"]
                 and a2a["max_abs_err"] <= today["max_abs_err"]
             ), (r["rank"], how, today, a2a)
+        for arm in SPLIT_ARMS:
+            for how in ("eager", "compiled"):
+                today, split = check[f"today/{how}"], check[f"{arm}/{how}"]
+                assert "error" not in split, (r["rank"], arm, how, split)
+                assert split["dtype"] == "torch.bfloat16", (r["rank"], arm, how)
+                # Same per-row arithmetic: no less exact than today's merge.
+                assert split["within_1ulp"] or (
+                    split["frac_over_1ulp"] <= today["frac_over_1ulp"]
+                    and split["max_abs_err"] <= today["max_abs_err"]
+                ), (r["rank"], arm, how, today, split)
         for arm in ("a2a",):
             for how in ("eager", "compiled"):
                 c = check[f"control_rotated/{arm}/{how}"]

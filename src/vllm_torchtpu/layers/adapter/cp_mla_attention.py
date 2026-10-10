@@ -94,8 +94,15 @@ def merge_lse_partials_scatter_heads(
       2. reduce-scatter the weighted outputs
 
     With TPU_DCP_LSE_MERGE_A2A set, the backbone's steps of at most
-    TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS tokens instead take
+    TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS tokens, and every step of a caller that is
+    not traced per bucket (the MTP drafter), instead take
     `merge_lse_partials_all_to_all`, which gives the same result.
+
+    Opt-in variants of the reduce-scatter, same weights as `cp_lse_ag_out_rs`:
+    TPU_DCP_MERGE_CHUNKED splits a large backbone bucket into token chunks
+    (`_merge_chunked`), TPU_DCP_MERGE_HEAD_MAJOR weights the transposed
+    partial, and TPU_DCP_LSE_MERGE_RS_BF16 (experimental) reduce-scatters in
+    bf16. With none set the merge is exactly `cp_lse_ag_out_rs`.
 
     Args:
       output: `[num_tokens, tp_local_num_heads * dcp_size, kv_lora_rank]`,
@@ -106,10 +113,11 @@ def merge_lse_partials_scatter_heads(
         `kv_len >= 1`) and its output must not be weighted in.
       is_backbone: True if the caller is the backbone, the only model that is
         traced separately per token bucket. Only then may the merge compare
-        the token count to TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS, since that
-        comparison is fixed at trace time. Pass False from the MTP drafter,
-        which is traced once for every bucket: it always takes the
-        reduce-scatter, exactly as with TPU_DCP_LSE_MERGE_A2A unset.
+        the token count to TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS (or
+        TPU_DCP_MERGE_CHUNKED_MIN_TOKENS), since that comparison is fixed at
+        trace time. Pass False from the MTP drafter, which is traced once for
+        every bucket: with TPU_DCP_LSE_MERGE_A2A it takes the all-to-all at
+        every size, otherwise the unsplit reduce-scatter.
 
     Returns:
       `[num_tokens, tp_local_num_heads, kv_lora_rank]` in `output.dtype` --
@@ -124,16 +132,104 @@ def merge_lse_partials_scatter_heads(
     # by size: the all-to-all wins at decode sizes, the reduce-scatter above
     # because it sums in the network. The MTP drafter has one graph for every
     # bucket; comparing its token count would pin that graph to the first
-    # size traced. `is_backbone` is checked before the token count, so the
-    # drafter never compares it.
-    if (
-        envs.TPU_DCP_LSE_MERGE_A2A
-        and is_backbone
-        and output.shape[0] <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
+    # size traced, so it takes the exchange everywhere, which costs it only
+    # its rare large buckets. `is_backbone` is checked before the token count,
+    # so the drafter never compares it.
+    if envs.TPU_DCP_LSE_MERGE_A2A and (
+        not is_backbone or output.shape[0] <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
     ):
         return merge_lse_partials_all_to_all(output, lse, group)
 
+    chunks = _merge_chunks(output.shape[0]) if is_backbone else 1
+    if chunks > 1:
+        return _merge_chunked(output, lse, group, chunks)
+    if envs.TPU_DCP_MERGE_HEAD_MAJOR or envs.TPU_DCP_LSE_MERGE_RS_BF16:
+        return _reduce_weighted(output, _lse_weights(lse, group), group)
     return cp_lse_ag_out_rs(output, lse, group)
+
+
+def _merge_chunks(num_tokens: int) -> int:
+    """How many token chunks `TPU_DCP_MERGE_CHUNKED` splits this bucket's
+    merge into: 1 (unsplit) unless the bucket reaches
+    `TPU_DCP_MERGE_CHUNKED_MIN_TOKENS` and splits into equal chunks whose
+    length is a multiple of 8 (the f32 sublane tile)."""
+    chunks = envs.TPU_DCP_MERGE_CHUNKED
+    if (
+        chunks <= 1
+        or num_tokens < envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS
+        or num_tokens % (8 * chunks)
+    ):
+        return 1
+    return chunks
+
+
+def _merge_chunked(
+    output: torch.Tensor, lse: torch.Tensor, group: Any, chunks: int
+) -> torch.Tensor:
+    """The reduce-scatter merge over `chunks` independent token chunks.
+
+    Every token's merge depends on its own row alone, so splitting the token
+    axis changes no per-row arithmetic: each chunk gathers its own rows' lse
+    (or slices one whole-step gather, `TPU_DCP_MERGE_CHUNKED_LSE_ONCE`), weights
+    them and reduce-scatters them exactly as the unsplit merge does. What
+    changes is the schedule. The f32 reduce-scatter is a SparseCore-offloaded
+    async collective while the lse gather and the weight multiply are
+    TensorCore work, so chunk `k`'s reduce-scatter can run under chunk
+    `k + 1`'s gather and multiply instead of after all of them.
+    """
+    step = output.shape[0] // chunks
+    mine = _lse_weights(lse, group) if envs.TPU_DCP_MERGE_CHUNKED_LSE_ONCE else None
+    pieces = []
+    for c in range(chunks):
+        rows = slice(c * step, (c + 1) * step)
+        weights = mine[rows] if mine is not None else _lse_weights(lse[rows], group)
+        pieces.append(_reduce_weighted(output[rows], weights, group))
+    return torch.cat(pieces, dim=0)
+
+
+def _lse_weights(lse: torch.Tensor, group: Any) -> torch.Tensor:
+    """This rank's `[T, H]` f32 merge weights `exp(lse_r - logsumexp_r lse)`,
+    computed exactly as `cp_lse_ag_out_rs` computes them."""
+    lse = lse.to(torch.float32)
+    lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
+    if not isinstance(lses, torch.Tensor):
+        lses = torch.cat(list(lses), dim=0)
+    return torch.exp(lse - torch.logsumexp(lses, dim=0))
+
+
+def _reduce_weighted(
+    output: torch.Tensor, mine: torch.Tensor, group: Any
+) -> torch.Tensor:
+    """Weight this rank's partial by its `[T, H]` f32 merge weights and
+    reduce-scatter the heads: `[T, H, V]` -> this rank's `[T, H / D, V]`.
+
+    As in `cp_lse_ag_out_rs`, a zero-weight partial is zeroed with `where`
+    rather than multiplied (it may be NaN)."""
+    if envs.TPU_DCP_MERGE_HEAD_MAJOR:
+        # The reduce-scatter scatters its leading axis, so a `[T, H, V]` term
+        # is transposed to `[H, T, V]` before it (an f32 relayout of the whole
+        # term, offloaded to SparseCore on the mixed step). Weighting the
+        # transposed partial instead writes the term head-major in the
+        # multiply itself; the elementwise products are the same.
+        weight = mine.transpose(0, 1).unsqueeze(-1)
+        weighted = output.transpose(0, 1).to(torch.float32) * weight
+        weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
+        weighted = weighted.contiguous()
+        if envs.TPU_DCP_LSE_MERGE_RS_BF16:
+            weighted = weighted.to(output.dtype)
+        return (
+            group.reduce_scatter(weighted, dim=0)
+            .to(output.dtype)
+            .transpose(0, 1)
+            .contiguous()
+        )
+    weight = mine.unsqueeze(-1)
+    weighted = output.to(torch.float32) * weight
+    weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
+    weighted = weighted.contiguous()
+    if envs.TPU_DCP_LSE_MERGE_RS_BF16:
+        weighted = weighted.to(output.dtype)
+    return group.reduce_scatter(weighted, dim=1).to(output.dtype)
 
 
 def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
