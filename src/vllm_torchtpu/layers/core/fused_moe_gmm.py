@@ -240,7 +240,7 @@ def _moe_gmm_tiling(
             )
         return tiles
     if dims.size_k <= 512 and dims.size_group > 1:
-        if dims.size_m <= 1024 and 128 % dims.size_lhs_sublane == 0:
+        if 512 <= dims.size_m <= 1024 and 128 % dims.size_lhs_sublane == 0:
             return TileSizes(
                 tile_m=128,
                 tile_k=tiles.tile_k,
@@ -882,7 +882,7 @@ def moe_gmm(
     if (
         sorted_indices is not None
         and argsort_revert_indices is sorted_indices
-        and sorted_indices.size <= min(onehot_moe_permute_threshold, 768)
+        and sorted_indices.size <= max(onehot_moe_permute_threshold, 768)
     ):
         inv_onehot = jax.nn.one_hot(
             sorted_indices, sorted_indices.size, dtype=gmm2_res.dtype

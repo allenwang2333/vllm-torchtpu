@@ -1433,7 +1433,6 @@ class VllmDeepseekV41MLAAttention(
         token_sharded: bool,
         ced_global_from_encoder: bool | None = None,
     ) -> bool:
-        del ced_global_from_encoder
         if (
             not _FUSED_SEAM_QUANT
             or self.indexer is not None

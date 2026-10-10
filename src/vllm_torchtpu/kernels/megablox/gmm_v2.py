@@ -534,7 +534,7 @@ def inner_kernel(
         acc_list = []
         if not cfgs.lhs_cfgs.should_quantize:
             # Unquantized / VMEM-dequantized matmul path.
-            if rhs_qbs >= cfgs.tiles.tile_k:
+            if cfgs.dims.size_k <= rhs_qbs:
                 acc = jnp.matmul(
                     tiled_lhs,
                     tiled_rhs,
@@ -581,7 +581,7 @@ def inner_kernel(
                 dtype_max = float(jnp.iinfo(lhs_q_dtype).max)
                 preferred_element_type = jnp.int32
 
-            if cfgs.tiles.tile_k <= min(q_block_size, rhs_qbs):
+            if cfgs.dims.size_k <= min(q_block_size, rhs_qbs):
                 # Single-K-block fast path (e.g. gmm2 size_k == 512): quantize
                 # lhs once, cast rhs once, issue a single contiguous MXU matmul,
                 # and apply row/col scales across the tile without 40-56 slices
