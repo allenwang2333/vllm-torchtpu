@@ -17,6 +17,7 @@ from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
+from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
@@ -48,20 +49,26 @@ class VllmMoERunner(MoERunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._take_over_moe_quant_config_init()
-        self._host_reduce: Callable | None = None
+        self._host_reduce = self._init_host_reduce()
+
+    def _init_host_reduce(self) -> Callable | None:
         if (
-            self.moe_config.tp_size == 32
+            self.moe_config.tp_size == 1
             and self.moe_config.ep_size == 32
             and self.moe_config.pcp_size == 1
             and not self.moe_config.is_sequence_parallel
             and not self.moe_config.skip_final_all_reduce
             and dist.get_world_size() == 32
+            and get_tp_group().world_size == 32
         ):
             from vllm_torchtpu.distributed.host_hierarchical_reduce import (
                 get_serving_host_reduce,
             )
 
-            self._host_reduce = get_serving_host_reduce()
+            # EP collapses the expert TP dimension to one; the final sum
+            # still spans the model's original TP process group.
+            return get_serving_host_reduce()
+        return None
 
     def _maybe_reduce_final_output(
         self,

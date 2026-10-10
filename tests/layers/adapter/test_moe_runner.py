@@ -22,6 +22,7 @@ from vllm.model_executor.layers.fused_moe.runner import moe_runner as moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.adapter.custom_ops import moe_runner as tpu_moe_runner_mod
 from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
 from vllm_torchtpu.layers.adapter.fused_moe_ep import FUSED_MOE_EP_OP_ATTR
 
@@ -117,6 +118,37 @@ def test_direct_forward_entry():
 
     runner._shared_experts = SimpleNamespace()
     assert runner._select_forward() is moe_runner_mod._moe_forward_shared
+
+
+@pytest.mark.parametrize(
+    "expert_tp,model_tp,enabled", [(1, 32, True), (1, 1, False), (2, 32, False)]
+)
+def test_host_reduce_uses_model_tp_after_ep_collapses_expert_tp(
+    expert_tp, model_tp, enabled
+):
+    runner = VllmMoERunner.__new__(VllmMoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.moe_config = SimpleNamespace(
+        tp_size=expert_tp,
+        ep_size=32,
+        pcp_size=1,
+        is_sequence_parallel=False,
+        skip_final_all_reduce=False,
+    )
+    with (
+        patch.object(tpu_moe_runner_mod.dist, "get_world_size", return_value=32),
+        patch.object(
+            tpu_moe_runner_mod,
+            "get_tp_group",
+            return_value=SimpleNamespace(world_size=model_tp),
+        ),
+        patch(
+            "vllm_torchtpu.distributed.host_hierarchical_reduce.get_serving_host_reduce",
+            return_value="candidate",
+        ) as build,
+    ):
+        assert runner._init_host_reduce() == ("candidate" if enabled else None)
+        assert build.call_count == int(enabled)
 
 
 @pytest.mark.parametrize(
