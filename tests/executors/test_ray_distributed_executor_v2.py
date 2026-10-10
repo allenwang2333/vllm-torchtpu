@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -72,7 +73,17 @@ class MockVllmConfig:
 @patch("vllm_torchtpu.executors.ray_distributed_executor_v2._wait_until_pg_ready")
 class TestTpuRayDistributedExecutorV2:
     @pytest.fixture(autouse=True)
-    def setup(self):
+    def setup(self, monkeypatch):
+        for key in (
+            "TORCH_TPU_DP_SIZE",
+            "TORCH_TPU_DP_MASTER_ADDR",
+            "TORCH_TPU_DP_MASTER_PORT",
+            "TORCH_TPU_BASE_PORT",
+        ):
+            if key not in os.environ:
+                monkeypatch.setenv(key, "")
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setattr(RayDistributedExecutorV2, "shutdown", lambda self: None)
         self.vllm_config = MockVllmConfig()
         self.parallel_config = self.vllm_config.parallel_config
 

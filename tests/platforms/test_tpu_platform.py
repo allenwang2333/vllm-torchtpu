@@ -48,6 +48,23 @@ from vllm_torchtpu.platforms.tpu_platform import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _preserve_tpu_platform_env(monkeypatch):
+    for key in (
+        "TORCH_TPU_DP_SIZE",
+        "TORCH_TPU_DP_MASTER_ADDR",
+        "TORCH_TPU_DP_MASTER_PORT",
+    ):
+        if key not in os.environ:
+            monkeypatch.setenv(key, "")
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, os.environ[key])
+    monkeypatch.setattr(
+        TpuPlatform, "device_control_env_var", TpuPlatform.device_control_env_var
+    )
+
+
 def test_grouped_topk_dynamic_compile_wrapper_is_unwrapped(monkeypatch):
     target = "vllm.model_executor.layers.fused_moe.router.grouped_topk_router"
 

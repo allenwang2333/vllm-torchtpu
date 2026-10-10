@@ -22,9 +22,43 @@ from vllm_torchtpu.omni.platform import OmniTpuPlatform
 pytestmark = [pytest.mark.cpu_test, pytest.mark.omni]
 
 
-@pytest.fixture(scope="module", autouse=True)
-def cleanup_mock_omni():
+@pytest.fixture(autouse=True)
+def cleanup_mock_omni(monkeypatch):
+    mock_modules = {
+        "vllm_omni": vllm_omni_mock,
+        "vllm_omni.platforms": vllm_omni_mock.platforms,
+        "vllm_omni.platforms.interface": vllm_omni_mock.platforms.interface,
+        "vllm_omni.diffusion": vllm_omni_mock.diffusion,
+        "vllm_omni.diffusion.ipc": vllm_omni_mock.diffusion.ipc,
+        "vllm_omni.diffusion.diffusion_engine": (
+            vllm_omni_mock.diffusion.diffusion_engine
+        ),
+        "vllm_omni.diffusion.attention": vllm_omni_mock.diffusion.attention,
+        "vllm_omni.diffusion.attention.backends": (
+            vllm_omni_mock.diffusion.attention.backends
+        ),
+        "vllm_omni.diffusion.attention.backends.registry": (
+            vllm_omni_mock.diffusion.attention.backends.registry
+        ),
+        "vllm_omni.diffusion.attention.backends.sdpa": (
+            vllm_omni_mock.diffusion.attention.backends.sdpa
+        ),
+        "vllm_omni.diffusion.models": vllm_omni_mock.diffusion.models,
+        "vllm_omni.diffusion.models.ltx2": vllm_omni_mock.diffusion.models.ltx2,
+        "vllm_omni.diffusion.models.ltx2.ltx2_runtime": (
+            vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime
+        ),
+    }
+    for mod_name, mod_obj in mock_modules.items():
+        monkeypatch.setitem(sys.modules, mod_name, mod_obj)
+    monkeypatch.setattr(
+        ltx2_runtime.LTXRuntime,
+        "_decode_output",
+        ltx2_runtime.LTXRuntime._decode_output,
+    )
+    apply_omni_model_specific_patches.cache_clear()
     yield
+    apply_omni_model_specific_patches.cache_clear()
     for mod_name in list(sys.modules.keys()):
         if mod_name == "vllm_omni" or mod_name.startswith("vllm_omni."):
             del sys.modules[mod_name]
