@@ -436,7 +436,6 @@ class DSparkDeepseekV41Model(nn.Module):
                 pre_mix,
                 previous_post_mix,
                 previous_res_mix,
-                _,
             ) = layer(
                 positions,
                 hidden_states,
