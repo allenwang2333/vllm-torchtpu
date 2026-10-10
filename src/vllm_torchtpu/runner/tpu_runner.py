@@ -2909,17 +2909,42 @@ class TPUModelRunner(GPUModelRunner):
             if envs.TPU_DEEPSEEK_V41_ENGRAM_DEBUG_VERIFY
             else None
         )
-        fn(
-            self.input_batch.token_ids_cpu,
-            req_indices,
-            positions_np,
-            known,
-            layout_plan.global_padded_num_tokens,
-            pre_async=pre_async,
-            async_subst=async_subst,
-            spec_async_subst=spec_async_subst,
-            debug_tok0_out=debug_tok0_out,
-        )
+        try:
+            fn(
+                self.input_batch.token_ids_cpu,
+                req_indices,
+                positions_np,
+                known,
+                layout_plan.global_padded_num_tokens,
+                pre_async=pre_async,
+                async_subst=async_subst,
+                spec_async_subst=spec_async_subst,
+                debug_tok0_out=debug_tok0_out,
+            )
+        except TypeError:
+            model_inner = getattr(self.model, "model", None)
+            if (
+                model_inner is not None
+                and getattr(model_inner, "engram_hash", None) is not None
+            ):
+                from vllm_torchtpu.models.vllm.deepseek_v41.engram import (
+                    engram_prefetch_prefill,
+                )
+
+                engram_prefetch_prefill(
+                    model_inner.engram_hash,
+                    model_inner._engram_table_ids,
+                    model_inner._engram_packed_dim,
+                    self.input_batch.token_ids_cpu,
+                    req_indices,
+                    positions_np,
+                    known,
+                    padded_num_tokens=layout_plan.global_padded_num_tokens,
+                    pre_async=pre_async,
+                    async_subst=async_subst,
+                    spec_async_subst=spec_async_subst,
+                    debug_tok0_out=debug_tok0_out,
+                )
 
     def _prepare_inputs(
         self,
@@ -6671,7 +6696,8 @@ class TPUModelRunner(GPUModelRunner):
                             inner.full_stage = saved_full_stage
             if buckets.refused:
                 logger.warning(
-                    "warmup left unused stage buckets uncompiled: %s",
+                    "warmup left token buckets uncompiled (hybrid_ced=%s): %s",
+                    hybrid_ced,
                     sorted(buckets.refused),
                 )
         if self._pp_wave is not None:
@@ -7724,9 +7750,29 @@ class TPUModelRunner(GPUModelRunner):
         src = torch.cat([bonus.to(drafts_chunk.dtype), drafts_chunk], dim=1).reshape(-1)
         rej = (draft_lengths[:rows] - num_valid + 1).clamp(min=0).to(torch.int32)
         if src.shape[0] < bound:
-            src = torch.cat((src, torch.zeros((bound - src.shape[0],), dtype=src.dtype, device=src.device)), dim=0)
+            src = torch.cat(
+                (
+                    src,
+                    torch.zeros(
+                        (bound - src.shape[0],),
+                        dtype=src.dtype,
+                        device=src.device,
+                    ),
+                ),
+                dim=0,
+            )
         if rej.shape[0] < max_num_reqs:
-            rej = torch.cat((rej, torch.zeros((max_num_reqs - rej.shape[0],), dtype=rej.dtype, device=rej.device)), dim=0)
+            rej = torch.cat(
+                (
+                    rej,
+                    torch.zeros(
+                        (max_num_reqs - rej.shape[0],),
+                        dtype=rej.dtype,
+                        device=rej.device,
+                    ),
+                ),
+                dim=0,
+            )
         return src, rej
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -7759,10 +7805,10 @@ class TPUModelRunner(GPUModelRunner):
         off7 = off6 + 6
         off8 = off7 + t_pad
 
+        zero = prev_num_rejected.new_zeros(())
         input_ids = pack[0:off1]
         positions = pack[off1:off2]
         seq_lens = pack[off2:off3]
-        zero = prev_num_rejected.new_zeros(())
         seq_idx = pack[off3:off4]
         pos_idx = pack[off4:off5]
         query_start_loc = pack[off5:off6] + zero
@@ -7770,6 +7816,7 @@ class TPUModelRunner(GPUModelRunner):
         mamba_request_distribution = pack[off6 + 3 : off7] + zero
         pre_idx = pack[off7:off8]
         temps_and_seeds = pack[off8:] + zero
+
         seq_sub = torch.where(
             seq_idx >= 0, prev_num_rejected[seq_idx.clamp(min=0)], zero
         )
