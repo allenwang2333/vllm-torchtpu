@@ -223,7 +223,7 @@ def _greedy_rejection_sample_with_segment(
     draft_token_ids = draft_token_ids.to(torch.int32)
 
     # Fast zero-scatter 2D block path when every request has fixed max_draft_tokens slots
-    if total_tokens > 0 and total_tokens == batch_size * max_draft_tokens:
+    if batch_size >= 8 and total_tokens > 0 and total_tokens == batch_size * max_draft_tokens:
         target_2d = target_logits_argmax.view(batch_size, max_draft_tokens)
         draft_2d = draft_token_ids.view(batch_size, max_draft_tokens)
         col_idx = torch.arange(
@@ -473,7 +473,7 @@ def _random_rejection_sample_with_segment(
         safe_draft_token_ids.to(torch.int32),
     )
 
-    if total_tokens > 0 and total_tokens == batch_size * max_draft_tokens:
+    if batch_size >= 8 and total_tokens > 0 and total_tokens == batch_size * max_draft_tokens:
         draft_2d = draft_token_ids.to(torch.int32).view(batch_size, max_draft_tokens)
         rec_2d = recovered_token_ids.view(batch_size, max_draft_tokens)
         accepted_2d = accepted.view(batch_size, max_draft_tokens)

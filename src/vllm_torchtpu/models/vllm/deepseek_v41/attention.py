@@ -569,6 +569,10 @@ class VllmDeepseekV41MLAAttention(
         if op is not None:
             return op
         _ = self.kvnorm_rope_op
+        _ = self.o_proj_op
+        _ = self.q_rope_op
+        _ = getattr(self, "qkv_norm_rope_op", None)
+        _ = getattr(self, "qkv_norm_rope_and_quant_op", None)
         if self.non_causal_multi_token_decode and not torch.compiler.is_compiling():
             _ = self.kv_rope_op
             _ = self.context_kv_attn_op
