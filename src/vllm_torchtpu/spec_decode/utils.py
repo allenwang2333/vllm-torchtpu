@@ -9,6 +9,7 @@ from torch.nn import Parameter
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
+from vllm_torchtpu.distributed.tp_collectives import tp_all_gather
 from vllm_torchtpu.layers.core.sequence_layout import (
     AllSequenceLayoutPlanner,
     SequenceLayoutPlan,
@@ -17,6 +18,40 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
+
+
+def tp_local_argmax_logits(
+    logits_processor,
+    lm_head: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    bias_local: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute global argmax across TP-sharded lm_head without all-gathering full vocab."""
+    tp_size = getattr(lm_head, "tp_size", 1)
+    if tp_size <= 1:
+        logits = logits_processor(lm_head, hidden_states)
+        if bias_local is not None:
+            logits = logits + bias_local
+        return logits.argmax(dim=-1)
+
+    logits_local = logits_processor._get_logits(
+        hidden_states, lm_head, None, skip_gather=True
+    )
+    if bias_local is not None:
+        logits_local = logits_local + bias_local
+    local_val, local_idx = logits_local.max(dim=-1)
+    start_idx = int(lm_head.shard_indices.org_vocab_start_index)
+    global_idx = local_idx.to(torch.int32) + start_idx
+    packed = torch.stack(
+        [local_val.to(torch.float32).view(torch.int32), global_idx], dim=-1
+    )
+    gathered = tp_all_gather(packed, dim=0).view(
+        tp_size, packed.shape[0], 2
+    )
+    all_vals = gathered[..., 0].view(torch.float32)
+    all_idxs = gathered[..., 1]
+    best_rank = all_vals.argmax(dim=0, keepdim=True)
+    return all_idxs.gather(0, best_rank).squeeze(0).to(torch.int64)
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.core.attention_metadata import (

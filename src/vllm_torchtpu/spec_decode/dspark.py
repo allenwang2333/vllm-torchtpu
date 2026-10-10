@@ -164,6 +164,12 @@ class DSparkProposer(DFlashProposer):
             padded_num_reqs, block_size
         )
         prev = ids_3d[:, 0]
+        if hasattr(self.draft_model, "sample_draft_tokens"):
+            draft_tokens_chunk = self.draft_model.sample_draft_tokens(
+                pred_hidden, prev, num_pred
+            )
+            return draft_tokens_chunk, hidden
+
         # Hoist initial step-0 Markov embedding + projection so XLA overlaps it
         # with compute_draft_logits(pred_hidden).
         bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))

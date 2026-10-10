@@ -339,6 +339,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         # Aliased to the target's lm_head by the proposer's sharing utility.
         self.lm_head: nn.Module | None = None
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        self._markov_w2_shard: torch.Tensor | None = None
 
     # --- Hooks consumed by DFlashProposer / DSparkProposer -----------------
 
@@ -380,6 +381,79 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Full-vocab draft: base logits, no d2t scatter.
         return self.compute_logits(hidden_states)
+
+    def sample_draft_tokens(
+        self,
+        pred_hidden: torch.Tensor,
+        prev_init: torch.Tensor,
+        num_pred: int,
+    ) -> torch.Tensor:
+        """Shard-local K-step Markov greedy sampler avoiding [B*K, V] ICI all-gather."""
+        assert self.lm_head is not None
+        tp_size = getattr(self.lm_head, "tp_size", 1)
+        markov_w2 = self.model.markov_head.markov_w2
+        if (
+            tp_size <= 1
+            or getattr(self.logits_processor, "_gather_logits", None) is not None
+            and tp_size == 1
+        ):
+            prev = prev_init
+            bias = self.markov_bias(self.markov_embed(prev))
+            logits = self.compute_draft_logits(pred_hidden)
+            logits_3d = logits.view(prev_init.shape[0], num_pred, logits.shape[-1])
+            draft_tokens = []
+            for idx in range(num_pred):
+                if idx > 0:
+                    bias = self.markov_bias(self.markov_embed(prev))
+                step = self.map_draft_to_target(
+                    (logits_3d[:, idx] + bias).argmax(dim=-1)
+                )
+                draft_tokens.append(step)
+                prev = step
+            return torch.stack(draft_tokens, dim=1)
+
+        from vllm_torchtpu.distributed.tp_collectives import tp_all_gather
+
+        start_idx = int(self.lm_head.shard_indices.org_vocab_start_index)
+        end_idx = int(self.lm_head.shard_indices.org_vocab_end_index)
+        if self._markov_w2_shard is None:
+            self._markov_w2_shard = markov_w2.weight[start_idx:end_idx].contiguous()
+
+        prev = prev_init
+        # Overlap step-0 local Markov bias ([B, r] @ [r, V_shard]) with local lm_head
+        bias_local = torch.nn.functional.linear(
+            self.markov_embed(prev), self._markov_w2_shard
+        )
+        logits_local = self.logits_processor._get_logits(
+            self.model.norm(pred_hidden), self.lm_head, None, skip_gather=True
+        )
+        batch_size = prev_init.shape[0]
+        logits_local_3d = logits_local.view(batch_size, num_pred, -1)
+
+        draft_tokens = []
+        for idx in range(num_pred):
+            if idx > 0:
+                bias_local = torch.nn.functional.linear(
+                    self.markov_embed(prev), self._markov_w2_shard
+                )
+            local_val, local_idx = (
+                logits_local_3d[:, idx] + bias_local
+            ).max(dim=-1)
+            global_idx = local_idx.to(torch.int32) + start_idx
+            packed = torch.stack(
+                [local_val.to(torch.float32).view(torch.int32), global_idx],
+                dim=-1,
+            )
+            gathered = tp_all_gather(packed, dim=0).view(tp_size, batch_size, 2)
+            all_vals = gathered[..., 0].view(torch.float32)
+            all_idxs = gathered[..., 1]
+            best_rank = all_vals.argmax(dim=0, keepdim=True)
+            step = self.map_draft_to_target(
+                all_idxs.gather(0, best_rank).squeeze(0).to(torch.int64)
+            )
+            draft_tokens.append(step)
+            prev = step
+        return torch.stack(draft_tokens, dim=1)
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids

@@ -1048,6 +1048,22 @@ class DFlashProposer:
         draft_hidden = hidden_reshaped[:, 1:, :].reshape(-1, hidden.shape[-1])
 
         # 4. Compute draft logits and run greedy argmax sampling inside the XLA graph
+        lm_head = getattr(self.draft_model, "lm_head", None)
+        lp = getattr(self.draft_model, "logits_processor", None)
+        norm_fn = getattr(getattr(self.draft_model, "model", None), "norm", None)
+        if (
+            lm_head is not None
+            and lp is not None
+            and norm_fn is not None
+            and getattr(lm_head, "tp_size", 1) > 1
+        ):
+            from vllm_torchtpu.spec_decode.utils import tp_local_argmax_logits
+
+            draft_tokens_chunk = tp_local_argmax_logits(
+                lp, lm_head, norm_fn(draft_hidden)
+            ).view(padded_num_reqs, block_size - 1)
+            return draft_tokens_chunk, hidden
+
         logits = self.draft_model.compute_logits(draft_hidden)
         logits_3d = logits.view(padded_num_reqs, block_size - 1, logits.shape[-1])
         draft_tokens_chunk = logits_3d.argmax(dim=-1)
