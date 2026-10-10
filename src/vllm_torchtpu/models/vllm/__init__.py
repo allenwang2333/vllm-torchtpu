@@ -18,6 +18,14 @@ def register_models() -> None:
     from vllm.model_executor.models import ModelRegistry
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 
+    from vllm_torchtpu.models.vllm.deepseek_v41_config import (
+        register_deepseek_v41_config,
+    )
+
+    # The pinned vLLM / Transformers do not know ``model_type: deepseek_v41``;
+    # register the HF config class before any ModelConfig is built.
+    register_deepseek_v41_config()
+
     ModelRegistry.register_model("KimiLinearForCausalLM", _KIMI_MODEL)
     ModelRegistry.register_model("KimiK3ForConditionalGeneration", _KIMI_K3_MODEL)
     ModelRegistry.register_model("DeepseekV4ForCausalLM", _DSV4_MODEL)
