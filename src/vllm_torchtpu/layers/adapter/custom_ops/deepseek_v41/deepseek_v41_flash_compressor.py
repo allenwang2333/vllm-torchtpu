@@ -182,10 +182,23 @@ class VllmDeepseekV41Compressor(dsv41_compressor.DeepseekCompressor):
         return op
 
     def _build_compressor_op(self):
-        for k in ("_r2_pool_op", "_insert_cache_op"):
+        for k in (
+            "_r2_pool_op",
+            "_insert_cache_op",
+            "_fused_r2_insert_produce_k_op",
+            "_fused_r2_insert_produce_k_q_op",
+            "_fused_insert_produce_k_op",
+            "_fused_insert_produce_k_q_op",
+        ):
             self.__dict__.pop(k, None)
         r2_pool = self._get_r2_pool_op() if self.has_gate else None
-        return (r2_pool, self._get_insert_cache_op())
+        insert_op = self._get_insert_cache_op()
+        for _qwk in (False, True):
+            if self.has_gate:
+                self._get_fused_compress_insert_produce_k_op(1e-6, quantized_wk=_qwk)
+            else:
+                self._get_fused_insert_produce_k_op(1e-6, quantized_wk=_qwk)
+        return (r2_pool, insert_op)
 
     compressor_op = property(_build_compressor_op)
 

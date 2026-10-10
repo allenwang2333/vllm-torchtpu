@@ -1075,6 +1075,42 @@ class VllmDeepseekV41MLAAttention(
                 idx_kv = _live_cache(getattr(self.indexer.k_cache, "kv_cache", None))
                 if idx_kv is not None:
                     _ = self.indexer._get_step_metadata_op(int(idx_kv.shape[3]))
+                if (
+                    getattr(self, "compressor", None) is not None
+                    and getattr(self.indexer, "owns_k", False)
+                ):
+                    _idx_eps = float(
+                        getattr(self.indexer.k_norm, "variance_epsilon", 1e-6)
+                    )
+                    for _qwk in (False, True):
+                        if self.compressor.has_gate:
+                            _ = self.compressor._get_fused_compress_insert_produce_k_op(
+                                _idx_eps, quantized_wk=_qwk
+                            )
+                        else:
+                            _ = self.compressor._get_fused_insert_produce_k_op(
+                                _idx_eps, quantized_wk=_qwk
+                            )
+            if (
+                _CSA_UNION
+                and self.compress_ratio > 0
+            ):
+                _main_e = getattr(self._kv_source_module(), "kv_cache", None)
+                _main_c = _live_cache(
+                    _main_e[0] if isinstance(_main_e, tuple) else _main_e
+                )
+                if _main_c is not None and _main_c.shape[0] > 0:
+                    _tot_rows = int(_main_c.shape[0] * _main_c.shape[1])
+                    _tk = int(getattr(self, "topk", 512))
+                    for _bq in {8, _CSA_UNION_BQ}:
+                        if _bq > 0:
+                            for _mult in (2, 3):
+                                _mu = (
+                                    min(envs.VLLM_DSV41_CSA_UNION_M, _bq * _tk)
+                                    if envs.VLLM_DSV41_CSA_UNION_M > 0
+                                    else ((_mult * _tk + 127) & ~127)
+                                )
+                                _ = self._get_csa_union_op(_tot_rows, _mu, b_q=_bq)
             tp_size = get_tensor_model_parallel_world_size()
             if (
                 _TP_ATTN
@@ -2299,12 +2335,15 @@ class VllmDeepseekV41MLAAttention(
                     else local_tokens
                 )
                 b_q, m_union = (
-                    resolve_csa_union_params(
-                        local_tokens,
-                        int(topk_indices.shape[1]),
-                        max_num_seqs,
-                        ced_decoder=eff_ced_decoder,
-                        num_q_heads=int(q.shape[1]),
+                    (
+                        resolve_csa_union_params(
+                            local_tokens,
+                            int(topk_indices.shape[1]),
+                            max_num_seqs,
+                            ced_decoder=eff_ced_decoder,
+                            num_q_heads=int(q.shape[1]),
+                        )
+                        or (0, 0)
                     )
                     if main_cache_kv.shape[0] > 0
                     and topk_indices is not None
