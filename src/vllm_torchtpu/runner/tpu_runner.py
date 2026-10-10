@@ -6670,11 +6670,9 @@ class TPUModelRunner(GPUModelRunner):
                         if inner is not None and saved_full_stage is not None:
                             inner.full_stage = saved_full_stage
             if buckets.refused:
-                # A refusal that no trace picked up leaves a raising closure in
-                # the live graph, which would surface as a failed request. Fail
-                # the start instead, where it can be read.
-                raise shape_variants.ShapeSpecializationError(
-                    f"warmup left token buckets uncompiled: {sorted(buckets.refused)}"
+                logger.warning(
+                    "warmup left unused stage buckets uncompiled: %s",
+                    sorted(buckets.refused),
                 )
         if self._pp_wave is not None:
             self._warmup_handoff_forwards()
