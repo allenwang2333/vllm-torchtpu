@@ -1351,10 +1351,7 @@ class VllmDeepseekV41MLAAttention(
                 )
                 if t is not None
             ]
-        elif (
-            envs.VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS > 0
-            and "_tp_attn_wo_b_w" in self._buffers
-        ):
+        elif "_tp_attn_wo_b_w" in self._buffers:
             _ = [
                 torch.ops.aten.alias.default(t)
                 for t in (
@@ -1747,17 +1744,15 @@ class VllmDeepseekV41MLAAttention(
         )
         if return_token_sharded and tp_size > 1:
             if (
-                num_tokens <= 2048
+                num_tokens <= 512
                 and num_tokens % tp_size == 0
                 and "_tp_attn_wo_b_w" in self._buffers
-                and not getattr(self, "_in_full_stage", False)
-                and isinstance(z.shape[0], int)
             ):
                 z_a2a = tp_all_to_all(z)
                 z_local = (
-                    z_a2a.view(tp_size, num_tokens // tp_size, z.shape[1])
+                    z_a2a.view(tp_size, -1, int(z.shape[1]))
                     .transpose(0, 1)
-                    .reshape(num_tokens // tp_size, -1)
+                    .reshape(-1, tp_size * int(z.shape[1]))
                 )
                 return quantized_matmul(
                     z_local, self._tp_attn_wo_b_w, self._tp_attn_wo_b_s
