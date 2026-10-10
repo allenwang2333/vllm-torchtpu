@@ -700,7 +700,11 @@ def test_tpu_worker_helpers_and_init(monkeypatch: pytest.MonkeyPatch) -> None:
     ) == (3, 7)
 
     for env_key in ("RANK", "LOCAL_RANK", "LOCAL_WORLD_SIZE", "WORLD_SIZE"):
-        monkeypatch.delenv(env_key, raising=False)
+        # setenv first so monkeypatch records the key even when it is absent;
+        # delenv(raising=False) alone records nothing for an absent key, and
+        # the RANK/WORLD_SIZE written by the code under test then leak.
+        monkeypatch.setenv(env_key, "")
+        monkeypatch.delenv(env_key)
     _configure_tpu_process_env(1, 0, 4, 2)
     assert os.environ["RANK"] == "1"
     assert os.environ["WORLD_SIZE"] == "4"
@@ -785,7 +789,10 @@ def test_tpu_worker_init_device_all_branches(
         "MASTER_PORT",
         "TORCH_TPU_SLICEBUILDER_ADDRESSES",
     ):
-        monkeypatch.delenv(env_key, raising=False)
+        # Record absent keys too (see test above), so init_device's writes
+        # are rolled back at teardown.
+        monkeypatch.setenv(env_key, "")
+        monkeypatch.delenv(env_key)
     _patch_worker_base_init(monkeypatch, set_device_attr=True)
 
     fake_binding = SimpleNamespace(
