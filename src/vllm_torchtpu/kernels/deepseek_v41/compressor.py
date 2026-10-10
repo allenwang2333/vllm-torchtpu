@@ -987,7 +987,7 @@ def _indexer_v41_impl(
     n_cfg = q.shape[0] if cfg_num_tokens is None else cfg_num_tokens
     # DSpark decode/verify batches (<= 512 tokens) run in MIXED; bq=8 avoids 16x
     # query padding and fits 2x larger KV blocks. 96/384 buckets use multiples of 48.
-    is_decode_or_verify = n_cfg <= 1536 and n_cfg != 1024
+    is_decode_or_verify = n_cfg <= 1536
     bq_mixed = 8 if is_decode_or_verify else 128
     bkv_pages = (16 if is_decode_or_verify else 8) * max(1, compression_ratio)
     chunk_tokens = (
@@ -995,11 +995,16 @@ def _indexer_v41_impl(
         if (not is_decode_or_verify and q.shape[0] >= 512 and q.shape[0] % 512 == 0)
         else {
             1536: 512,
+            1280: 640,
+            1024: 512,
             768: 384,
+            640: 320,
             512: 512,
             384: 384,
+            320: 320,
             256: 256,
             192: 192,
+            160: 160,
             128: 128,
             96: 96,
             64: 64,

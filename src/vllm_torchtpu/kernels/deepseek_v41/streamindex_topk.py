@@ -595,7 +595,7 @@ def _compute_metadata(
 
 
 def _chunk_and_bq_config(max_num_tokens: int) -> tuple[int, int, int, int]:
-    is_decode_or_verify = max_num_tokens <= 1536 and max_num_tokens != 1024
+    is_decode_or_verify = max_num_tokens <= 1536
     bq_mixed_in = 8 if is_decode_or_verify else 128
     bkv_p = 16 if is_decode_or_verify else 8
     chunk_tokens = (
@@ -603,11 +603,16 @@ def _chunk_and_bq_config(max_num_tokens: int) -> tuple[int, int, int, int]:
         if (not is_decode_or_verify and max_num_tokens >= 512 and max_num_tokens % 512 == 0)
         else {
             1536: 512,
+            1280: 640,
+            1024: 512,
             768: 384,
+            640: 320,
             512: 512,
             384: 384,
+            320: 320,
             256: 256,
             192: 192,
+            160: 160,
             128: 128,
             96: 96,
             64: 64,
