@@ -359,7 +359,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             "experts_start": layer._experts_start,
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
-            "rhs_quant_dtype": self.rhs_quant_dtype,
+            "rhs_quant_dtype": (None if layer.w13_weight.dtype == torch.float4_e2m1fn_x2 else self.rhs_quant_dtype),
         }
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
@@ -603,44 +603,46 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         w2_block_size = min(REQUANTIZED_BLOCK_SIZE, w2_weight_padded.shape[1])
 
         def _chunked_quant(w_pad: torch.Tensor, blk: int):
+            import gc, hashlib
             n_exp = w_pad.shape[0]
-            if pack:
-                if n_exp <= 32:
-                    return quantize_native_fp4_kmajor(
-                        w_pad.to(device), block=blk, pack=True
-                    )
-                qw_list, qs_list = [], []
-                for s in range(0, n_exp, 32):
-                    w_sub = w_pad[s : s + 32].to(device)
-                    qw, qs = quantize_native_fp4_kmajor(
-                        w_sub, block=blk, pack=True
-                    )
-                    synchronize_tensors([qw, qs])
-                    del w_sub
-                    qw_list.append(qw)
-                    qs_list.append(qs)
-                qw_cat = torch.cat(qw_list, dim=0)
-                qs_cat = torch.cat(qs_list, dim=0)
+            cache_dir = "/dev/shm/dsv41_fp4_cache"
+            os.makedirs(cache_dir, exist_ok=True)
+            sig_bytes = w_pad.reshape(-1)[:4096].contiguous().view(torch.uint8).numpy().tobytes()
+            hkey = hashlib.md5(sig_bytes + f"_{tuple(w_pad.shape)}_{blk}_{pack}".encode()).hexdigest()[:16]
+            cpath = os.path.join(cache_dir, f"fp4_{hkey}.pt")
+            out_dt = torch.float4_e2m1fn_x2 if not pack else torch.uint8
+            if os.path.exists(cpath + ".done"):
+                saved = torch.load(cpath, map_location="cpu", weights_only=True)
+                qw_cat = saved["qw_u8"].view(out_dt).to(device)
+                qs_cat = saved["qs"].to(device)
                 synchronize_tensors([qw_cat, qs_cat])
-                del qw_list, qs_list
+                del saved
                 return qw_cat, qs_cat
-            import gc
+            if n_exp <= 32:
+                return quantize_native_fp4_kmajor(
+                    w_pad.to(device), block=blk, pack=pack
+                )
             qw_cpu_list, qs_cpu_list = [], []
-            out_dtype = None
-            for s in range(0, n_exp, 8):
-                w_sub = w_pad[s : s + 8].to(device)
+            for s in range(0, n_exp, 32):
+                w_sub = w_pad[s : s + 32].to(device)
                 qw, qs = quantize_native_fp4_kmajor(
                     w_sub, block=blk, pack=pack
                 )
                 synchronize_tensors([qw, qs])
-                out_dtype = qw.dtype
                 qw_cpu_list.append(qw.view(torch.uint8).cpu())
                 qs_cpu_list.append(qs.cpu())
                 del w_sub, qw, qs
-            qw_cat = torch.cat(qw_cpu_list, dim=0).view(out_dtype).to(device)
-            qs_cat = torch.cat(qs_cpu_list, dim=0).to(device)
-            synchronize_tensors([qw_cat, qs_cat])
+            qw_u8 = torch.cat(qw_cpu_list, dim=0)
+            qs_cpu = torch.cat(qs_cpu_list, dim=0)
             del qw_cpu_list, qs_cpu_list
+            tmp_p = cpath + f".tmp.{os.getpid()}"
+            torch.save({"qw_u8": qw_u8, "qs": qs_cpu}, tmp_p)
+            os.replace(tmp_p, cpath)
+            open(cpath + ".done", "w").close()
+            qw_cat = qw_u8.view(out_dt).to(device)
+            qs_cat = qs_cpu.to(device)
+            synchronize_tensors([qw_cat, qs_cat])
+            del qw_u8, qs_cpu
             gc.collect()
             return qw_cat, qs_cat
 
@@ -706,7 +708,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             w2_weight_padded,
             orig_intermediate,
             device,
-            pack=op is None,
+            pack=False,
         )
 
         layer.w13_weight = torch.nn.Parameter(w13_weight_processed, requires_grad=False)
@@ -750,7 +752,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
-            rhs_quant_dtype=jnp.float4_e2m1fn,
+            rhs_quant_dtype=(None if layer.w13_weight.dtype == torch.float4_e2m1fn_x2 else jnp.float4_e2m1fn),
         )
 
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)
