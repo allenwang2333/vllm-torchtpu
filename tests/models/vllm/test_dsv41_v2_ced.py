@@ -314,3 +314,63 @@ def test_sync_decoder_replay_plan_branches() -> None:
                 is_identity=True,
             )
         )
+
+
+def test_td8241_plan_decoder_replay_owner_tokens_and_zero_hits() -> None:
+    """TD8.241: Verify owner_tokens fast path in plan_decoder_replay and _zero_hits
+    fast path in DeepseekV41Model._get_ced_replay_starts."""
+    import numpy as np
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.ced import _zero_hits
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import DeepseekV41Model
+
+    # 1. Steady-state decode (not any_skipped) with owner_tokens vs fallback
+    owner_layout_fast = SimpleNamespace(
+        owners=np.array([0, 0, 1], dtype=np.int32),
+        owner_tokens=np.array([12, 6, 0, 0, 0, 0, 0, 0], dtype=np.int32),
+        query_start_loc=np.zeros((8, 4), dtype=np.int32),
+    )
+    owner_layout_no_tokens = SimpleNamespace(
+        owners=np.array([0, 0, 1], dtype=np.int32),
+        owner_tokens=None,
+        query_start_loc=np.zeros((8, 4), dtype=np.int32),
+    )
+    meta_fast = SimpleNamespace(
+        query_start_loc_cpu=(0, 6, 12, 18),
+        seq_lens_cpu=(1024, 1024, 1024),
+        prompt_lens_cpu=(512, 512, 512),
+        owner_token_layout=owner_layout_fast,
+    )
+    meta_fallback = SimpleNamespace(
+        query_start_loc_cpu=(0, 6, 12, 18),
+        seq_lens_cpu=(1024, 1024, 1024),
+        prompt_lens_cpu=(512, 512, 512),
+        owner_token_layout=owner_layout_no_tokens,
+    )
+    plan_fast = plan_decoder_replay(meta_fast, 512, 128, (32, 64, 96, 128))
+    plan_fallback = plan_decoder_replay(meta_fallback, 512, 128, (32, 64, 96, 128))
+    assert plan_fast == plan_fallback
+    # kept = 18, max owner_tokens = 12, tp_size = 8 -> required_kept = 96
+    assert plan_fast is not None and plan_fast.padded_num_tokens == 96
+
+    # 2. Partial skip (any_skipped=True) falls back to per-request sum
+    meta_skip = SimpleNamespace(
+        query_start_loc_cpu=(0, 6, 12, 18),
+        seq_lens_cpu=(514, 1024, 1024),
+        prompt_lens_cpu=(1024, 512, 512),
+        owner_token_layout=owner_layout_fast,
+    )
+    plan_skip = plan_decoder_replay(meta_skip, 512, 128, (32, 64, 96, 128))
+    # Req 0 keeps 2 tokens, Req 1 keeps 6 tokens (owner 0 total=8 -> 8*8=64)
+    assert plan_skip is not None and plan_skip.padded_num_tokens == 64
+
+    # 3. _get_ced_replay_starts with _zero_hits and non-cached zero list
+    dummy_model = SimpleNamespace()
+    positions = torch.arange(16, dtype=torch.int32)
+    z1 = DeepseekV41Model._get_ced_replay_starts(dummy_model, _zero_hits(8), positions)
+    z2 = DeepseekV41Model._get_ced_replay_starts(dummy_model, _zero_hits(8), positions)
+    assert z1 is z2 and torch.equal(z1, torch.zeros(8, dtype=torch.int32))
+    z_fresh = DeepseekV41Model._get_ced_replay_starts(
+        dummy_model, [0, 0, 0, 0], positions, cache_attr="_alt_cache"
+    )
+    assert torch.equal(z_fresh, torch.zeros(4, dtype=torch.int32))

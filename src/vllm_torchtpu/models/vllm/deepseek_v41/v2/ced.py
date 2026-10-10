@@ -132,16 +132,20 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
     owner_layout = getattr(metadata, "owner_token_layout", None)
     req_owners = getattr(owner_layout, "owners", None)
     if kept > 0 and owner_layout is not None and req_owners is not None:
-        owners_list = (
-            req_owners.tolist() if hasattr(req_owners, "tolist") else req_owners
-        )
         tp_size = int(owner_layout.query_start_loc.shape[0])
-        owner_kept = [0] * tp_size
-        for owner, start, end in zip(
-            owners_list, output_bounds_tuple, output_bounds_tuple[1:]
-        ):
-            owner_kept[owner] += end - start
-        required_kept = max(kept, tp_size * max(owner_kept))
+        owner_tokens = getattr(owner_layout, "owner_tokens", None)
+        if not any_skipped and owner_tokens is not None:
+            required_kept = max(kept, tp_size * int(owner_tokens.max()))
+        else:
+            owners_list = (
+                req_owners.tolist() if hasattr(req_owners, "tolist") else req_owners
+            )
+            owner_kept = [0] * tp_size
+            for owner, start, end in zip(
+                owners_list, output_bounds_tuple, output_bounds_tuple[1:]
+            ):
+                owner_kept[owner] += end - start
+            required_kept = max(kept, tp_size * max(owner_kept))
     padded = _padded_bucket(required_kept, int(num_tokens), compile_sizes)
     is_identity = kept > 0 and kept == bounds_list[-1] and padded == num_tokens
     return DecoderReplayPlan(

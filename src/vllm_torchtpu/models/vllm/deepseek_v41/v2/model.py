@@ -34,7 +34,12 @@ from .attention import (
 )
 from .attention_kernels import initialize_indexer, initialize_paged_attention
 from .cache import initialize_cache_ops
-from .ced import plan_decoder_replay, prefix_replay_enabled, sync_decoder_replay_plan
+from .ced import (
+    _zero_hits,
+    plan_decoder_replay,
+    prefix_replay_enabled,
+    sync_decoder_replay_plan,
+)
 from .engram import Engram, NgramHashState
 from .host_engram import (
     HOST_ENGRAM_KEY,
@@ -533,13 +538,13 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         if cached_replay is not None and cached_replay[0] == replay_key:
             return cached_replay[1]
         replay_starts = (
-            torch.tensor(
+            positions.new_zeros(len(replay_tuple))
+            if replay_tuple is _zero_hits(len(replay_tuple)) or not any(replay_tuple)
+            else torch.tensor(
                 replay_tuple,
                 dtype=positions.dtype,
                 device=positions.device,
             )
-            if any(replay_tuple)
-            else positions.new_zeros(len(replay_tuple))
         )
         setattr(self, cache_attr, (replay_key, replay_starts))
         return replay_starts
@@ -716,7 +721,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
             window_starts = DeepseekV41Model._get_ced_replay_starts(
                 self,
-                hits + (0,) * (requests - len(hits)),
+                _zero_hits(requests)
+                if not hits
+                else hits + _zero_hits(requests - len(hits)),
                 positions,
                 cache_attr="_ced_window_starts_cache",
             )
