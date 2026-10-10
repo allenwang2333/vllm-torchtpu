@@ -277,3 +277,529 @@ class SparseMlaAttentionLayoutValidationTest(parameterized.TestCase):
                 NOPE_SPEC,
                 ROPE_SC_SPEC,
             )
+
+
+class AttentionInterfaceWrappersTest(parameterized.TestCase):
+    """CPU unit tests for the sharded wrapper glue in `attention_interface.py`."""
+
+    def _mesh(self, axis_name="model"):
+        return jax.sharding.Mesh(np.array(jax.local_devices()[:1]), (axis_name,))
+
+    def test_sharded_flash_and_paged_and_splash_wrappers(self):
+        from unittest import mock
+
+        mesh = self._mesh("model")
+        q4 = jnp.ones((1, 2, 4, 8), dtype=jnp.float32)
+        seg = jnp.zeros((1, 4), dtype=jnp.int32)
+
+        with mock.patch.object(
+            attention_interface,
+            "flash_attention",
+            side_effect=lambda q, k, v, **kw: q + k + v,
+        ):
+            fn = attention_interface.sharded_flash_attention(
+                mesh, causal=False, sm_scale=0.5, vmem_limit_bytes=1024
+            )
+            out = fn(q4, q4, q4, seg)
+            self.assertEqual(out.shape, q4.shape)
+
+        q3 = jnp.ones((2, 2, 8), dtype=jnp.float32)
+        kv_pages = jnp.ones((2, 4, 32, 8), dtype=jnp.float32)
+        lengths = jnp.ones((2,), dtype=jnp.int32)
+        page_indices = jnp.zeros((2, 2), dtype=jnp.int32)
+
+        with (
+            mock.patch.object(
+                attention_interface,
+                "paged_attention",
+                side_effect=lambda q, k, v, lens, p, **kw: q + 1.0,
+            ),
+            mock.patch.object(attention_interface, "get_megacore", return_value=True),
+        ):
+            paged_fn = attention_interface.sharded_paged_attention(
+                mesh, attn_logits_soft_cap=30.0
+            )
+            out3 = paged_fn(q3, kv_pages, kv_pages, lengths, page_indices)
+            self.assertEqual(out3.shape, q3.shape)
+
+            oversized = jnp.zeros(
+                (1, attention_interface.MAX_ALLOWED_PAGE_INDICES_N + 1),
+                dtype=jnp.int32,
+            )
+            with self.assertRaisesRegex(ValueError, "smem OOM"):
+                paged_fn(q3[:1], kv_pages, kv_pages, lengths[:1], oversized)
+
+        with (
+            mock.patch.object(
+                attention_interface.splash.BlockSizes,
+                "get_default",
+                return_value="bs",
+            ),
+            mock.patch.object(
+                attention_interface.splash,
+                "make_splash_mqa_single_device",
+                side_effect=lambda mask, **kw: lambda q, k, v, s: q + 2.0,
+            ),
+            mock.patch.object(
+                attention_interface.splash,
+                "make_splash_mha_single_device",
+                side_effect=lambda mask, **kw: lambda q, k, v, s: q + 3.0,
+            ),
+        ):
+            mqa_fn = attention_interface.sharded_splash_attention(
+                mesh, window_size=4, attn_logits_soft_cap=10.0, is_mqa=True
+            )
+            mha_fn = attention_interface.sharded_splash_attention(
+                mesh, window_size=4, attn_logits_soft_cap=None, is_mqa=False
+            )
+            np.testing.assert_allclose(mqa_fn(q4, q4, q4), q4 + 2.0)
+            np.testing.assert_allclose(mha_fn(q4, q4, q4), q4 + 3.0)
+
+    def test_sharded_rpa_and_attention_and_bundled_and_mla(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from vllm_torchtpu.kernels.experimental.batched_rpa import (
+            configs as batched_rpa_configs,
+        )
+        from vllm_torchtpu.kernels.ragged_paged_attention.v3 import (
+            kernel as rpa_v3_kernel,
+        )
+        from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+
+        mesh = self._mesh("model")
+        q = jnp.ones((4, 2, 128), dtype=jnp.bfloat16)
+        k = jnp.ones((4, 2, 128), dtype=jnp.bfloat16)
+        v = jnp.ones((4, 2, 128), dtype=jnp.bfloat16)
+        kv_cache = jnp.zeros((4, 16, 2, 2, 128), dtype=jnp.bfloat16)
+        md = AttentionMetadata(
+            input_positions=jnp.arange(4, dtype=jnp.int32),
+            block_tables=jnp.arange(4, dtype=jnp.int32),
+            seq_lens=jnp.array([4], dtype=jnp.int32),
+            query_start_loc=jnp.array([0, 4], dtype=jnp.int32),
+            request_distribution=jnp.array([0, 0, 1], dtype=jnp.int32),
+        )
+
+        def fake_rpa(*args, **kwargs):
+            return args[0], args[3]
+
+        # 1. shard=True with HEAD_ALONG_SUBLANE and SEQ_ALONG_LANE
+        new_kv, out = attention_interface.attention(
+            kv_cache,
+            q,
+            k,
+            v,
+            md,
+            mesh,
+            head_dim_original=None,
+            sm_scale=None,
+            rpa_func=fake_rpa,
+            kv_layout=batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+        )
+        self.assertEqual(out.shape, q.shape)
+        self.assertEqual(new_kv.shape, kv_cache.shape)
+
+        kv_cache_sal = jnp.zeros((4, 2, 2, 128, 16), dtype=jnp.bfloat16)
+        new_kv2, out2 = attention_interface.attention(
+            kv_cache_sal,
+            q,
+            k,
+            v,
+            md,
+            mesh,
+            head_dim_original=128,
+            sm_scale=0.125,
+            rpa_func=fake_rpa,
+            kv_layout=batched_rpa_configs.KVLayout.SEQ_ALONG_LANE,
+        )
+        self.assertEqual(out2.shape, q.shape)
+        self.assertEqual(new_kv2.shape, kv_cache_sal.shape)
+
+        # 2. shard=False with kv_block_cap (both with and without attention_chunk_size)
+        with mock.patch.object(
+            attention_interface.rpa_default,
+            "get_default_block_sizes",
+            return_value={"bq_sz": 16, "bkv_sz": 64, "bq_csz": 8, "bkv_csz": 32},
+        ):
+            out_local, _ = attention_interface.sharded_ragged_paged_attention(
+                mesh,
+                q,
+                k,
+                v,
+                kv_cache,
+                md.seq_lens,
+                md.block_tables,
+                md.query_start_loc,
+                md.request_distribution,
+                None,
+                sm_scale=0.125,
+                attention_chunk_size=64,
+                rpa_func=fake_rpa,
+                shard=False,
+                kv_block_cap=32,
+            )
+            self.assertEqual(out_local.shape, q.shape)
+            out_local2, _ = attention_interface.sharded_ragged_paged_attention(
+                mesh,
+                q,
+                k,
+                v,
+                kv_cache,
+                md.seq_lens,
+                md.block_tables,
+                md.query_start_loc,
+                md.request_distribution,
+                None,
+                sm_scale=0.125,
+                attention_chunk_size=None,
+                rpa_func=fake_rpa,
+                shard=False,
+                kv_block_cap=32,
+            )
+            self.assertEqual(out_local2.shape, q.shape)
+
+        # 3. head_dim == 64 with attention_sink
+        q64 = jnp.ones((4, 2, 64), dtype=jnp.bfloat16)
+        sink = jnp.ones((2,), dtype=jnp.float32)
+        with mock.patch.object(
+            attention_interface,
+            "ragged_paged_attention_hd64",
+            side_effect=fake_rpa,
+        ):
+            out_hd64, _ = attention_interface.sharded_ragged_paged_attention(
+                mesh,
+                q64,
+                q64,
+                q64,
+                kv_cache,
+                md.seq_lens,
+                md.block_tables,
+                md.query_start_loc,
+                md.request_distribution,
+                sink,
+                sm_scale=0.125,
+                shard=True,
+            )
+            self.assertEqual(out_hd64.shape, q64.shape)
+
+        # 4. attention_bundled
+        bundle = jnp.zeros((4, 2, 16, 2, 2, 128), dtype=jnp.bfloat16)
+        with mock.patch.object(
+            rpa_v3_kernel,
+            "ragged_paged_attention_bundled",
+            side_effect=lambda q, k, v, b, *a, **kw: (q, b),
+        ):
+            b_out, q_out = attention_interface.attention_bundled(
+                bundle,
+                jnp.int32(0),
+                q,
+                k,
+                v,
+                md,
+                mesh,
+                head_dim_original=None,
+                sm_scale=None,
+            )
+            self.assertEqual(b_out.shape, bundle.shape)
+            self.assertEqual(q_out.shape, q.shape)
+            b_out2, q_out2 = attention_interface.attention_bundled(
+                bundle,
+                jnp.int32(1),
+                q,
+                k,
+                v,
+                md,
+                mesh,
+                head_dim_original=128,
+                sm_scale=0.125,
+            )
+            self.assertEqual(b_out2.shape, bundle.shape)
+            self.assertEqual(q_out2.shape, q.shape)
+
+        # 5. mla_attention (bf16 and fp8 cache)
+        q_tna = jnp.ones((4, 2, 512), dtype=jnp.bfloat16)
+        q_rope = jnp.ones((4, 2, 64), dtype=jnp.bfloat16)
+        k_sa = jnp.ones((4, 512), dtype=jnp.bfloat16)
+        k_rope = jnp.ones((4, 64), dtype=jnp.bfloat16)
+        mla_cache_bf16 = jnp.zeros((4, 8, 2, 640), dtype=jnp.bfloat16)
+        mla_cache_fp8 = jnp.zeros((4, 8, 4, 640), dtype=jnp.float8_e4m3fn)
+        fake_tuned = SimpleNamespace(
+            num_kv_pages_per_block=1,
+            num_queries_per_block=16,
+            vmem_limit_bytes=1024,
+            decode_batch_size=1,
+            q_split=1,
+        )
+        with (
+            mock.patch.object(
+                attention_interface, "get_tuned_params", return_value=fake_tuned
+            ),
+            mock.patch.object(
+                attention_interface,
+                "mla_ragged_paged_attention",
+                side_effect=lambda q_hm, qr, ks, kr, c, *a, **kw: (q_hm, c),
+            ),
+        ):
+            c1, o1 = attention_interface.mla_attention(
+                q_tna,
+                q_rope,
+                k_sa,
+                k_rope,
+                mla_cache_bf16,
+                md,
+                mesh,
+                num_attention_heads=2,
+                qk_nope_head_dim=512,
+                sm_scale=None,
+            )
+            self.assertEqual(o1.shape, q_tna.shape)
+            self.assertEqual(c1.shape, mla_cache_bf16.shape)
+            c2, o2 = attention_interface.mla_attention(
+                q_tna,
+                q_rope,
+                k_sa,
+                k_rope,
+                mla_cache_fp8,
+                md,
+                mesh,
+                num_attention_heads=2,
+                qk_nope_head_dim=512,
+                sm_scale=0.5,
+            )
+            self.assertEqual(o2.shape, q_tna.shape)
+            self.assertEqual(c2.shape, mla_cache_fp8.shape)
+
+    def test_sparse_mla_and_dcp_cpu_execution(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        mesh = self._mesh("x")
+        ql_nope = jnp.zeros((2, 2, LKV_DIM), jnp.bfloat16)
+        q_pe = jnp.zeros((2, 2, ROPE_DIM), jnp.bfloat16)
+        kv_c = jnp.zeros((2, LKV_DIM), jnp.float8_e4m3fn)
+        k_pe = jnp.zeros((2, ROPE_DIM), jnp.float8_e4m3fn)
+        nope_cache = jnp.zeros(NOPE_SPEC.shape, NOPE_SPEC.jax_dtype)
+        rope_cache = jnp.zeros(ROPE_SPEC.shape, ROPE_SPEC.jax_dtype)
+        topk_idx = jnp.zeros((2, 4), jnp.int32)
+        seq_lens = jnp.array([2], jnp.int32)
+        block_tables = jnp.zeros((4,), jnp.int32)
+        query_start_loc = jnp.array([0, 2], jnp.int32)
+        dist = jnp.array([0, 1, 1], jnp.int32)
+
+        with (
+            mock.patch.object(
+                attention_interface,
+                "update_sparse_mla_kv_cache",
+                side_effect=lambda nc, rc, *a, **kw: (nc, rc),
+            ),
+            mock.patch.object(
+                attention_interface.mla_dispatch,
+                "applies",
+                return_value=True,
+            ),
+            mock.patch.object(
+                attention_interface.mla_dispatch,
+                "attention_from_parts",
+                side_effect=lambda qn, *a, **kw: qn,
+            ),
+            mock.patch.object(
+                attention_interface,
+                "sparse_mla_ragged_paged_attention",
+                side_effect=lambda q, *a, **kw: q,
+            ),
+        ):
+            _, _, out_md = attention_interface.sparse_mla_attention(
+                ql_nope,
+                q_pe,
+                kv_c,
+                k_pe,
+                nope_cache,
+                rope_cache,
+                topk_idx,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                dist,
+                mesh,
+                NOPE_SPEC,
+                ROPE_SPEC,
+                allow_masked_dense=True,
+            )
+            self.assertEqual(out_md.shape, ql_nope.shape)
+
+            _, _, out_sp = attention_interface.sparse_mla_attention(
+                ql_nope,
+                q_pe,
+                kv_c,
+                k_pe,
+                nope_cache,
+                rope_cache,
+                topk_idx,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                dist,
+                mesh,
+                NOPE_SPEC,
+                ROPE_SPEC,
+                k_scale=1.5,
+                allow_masked_dense=False,
+            )
+            self.assertEqual(out_sp.shape, ql_nope.shape)
+
+        # DCP validation and body execution on CPU via fake 2-rank mesh + stub shard_map
+        fake_dcp_mesh = SimpleNamespace(
+            axis_names=("dcp",),
+            shape={"dcp": 2},
+        )
+        with self.assertRaisesRegex(ValueError, "dcp_size > 1"):
+            attention_interface.sparse_mla_attention_dcp(
+                ql_nope,
+                q_pe,
+                kv_c,
+                k_pe,
+                nope_cache,
+                rope_cache,
+                jnp.zeros((2, 4), jnp.int32),
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                dist,
+                mesh=fake_dcp_mesh,
+                nope_spec=NOPE_SPEC,
+                rope_spec=ROPE_SPEC,
+                dcp_size=1,
+                interleave_size=1,
+            )
+        with self.assertRaisesRegex(ValueError, "requires a mesh"):
+            attention_interface.sparse_mla_attention_dcp(
+                ql_nope,
+                q_pe,
+                kv_c,
+                k_pe,
+                nope_cache,
+                rope_cache,
+                jnp.zeros((4, 4), jnp.int32),
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                dist,
+                mesh=SimpleNamespace(axis_names=("x",), shape={"x": 2}),
+                nope_spec=NOPE_SPEC,
+                rope_spec=ROPE_SPEC,
+                dcp_size=2,
+                interleave_size=1,
+            )
+        with self.assertRaisesRegex(ValueError, "does not match mesh axis"):
+            attention_interface.sparse_mla_attention_dcp(
+                ql_nope,
+                q_pe,
+                kv_c,
+                k_pe,
+                nope_cache,
+                rope_cache,
+                jnp.zeros((8, 4), jnp.int32),
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                dist,
+                mesh=fake_dcp_mesh,
+                nope_spec=NOPE_SPEC,
+                rope_spec=ROPE_SPEC,
+                dcp_size=4,
+                interleave_size=1,
+            )
+        with self.assertRaisesRegex(ValueError, "one row per"):
+            attention_interface.sparse_mla_attention_dcp(
+                ql_nope,
+                q_pe,
+                kv_c,
+                k_pe,
+                nope_cache,
+                rope_cache,
+                jnp.zeros((3, 4), jnp.int32),
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                dist,
+                mesh=fake_dcp_mesh,
+                nope_spec=NOPE_SPEC,
+                rope_spec=ROPE_SPEC,
+                dcp_size=2,
+                interleave_size=1,
+            )
+
+        with self.assertRaisesRegex(ValueError, "matching NoPE and RoPE layouts"):
+            attention_interface.sparse_mla_attention_dcp(
+                ql_nope,
+                q_pe,
+                kv_c,
+                k_pe,
+                nope_cache,
+                rope_cache,
+                jnp.zeros((4, 4), jnp.int32),
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                dist,
+                mesh=fake_dcp_mesh,
+                nope_spec=NOPE_SPEC,
+                rope_spec=ROPE_SC_SPEC,
+                dcp_size=2,
+                interleave_size=1,
+            )
+
+        with (
+            mock.patch.object(
+                attention_interface.shard_map,
+                "shard_map",
+                side_effect=lambda fn, **kw: (
+                    lambda ql, qp, kvc, kpe, nc, rc, topk, *rest: fn(
+                        ql, qp, kvc, kpe, nc, rc, topk[: ql.shape[0]], *rest
+                    )
+                ),
+            ),
+            mock.patch.object(
+                attention_interface.streamindex_topk,
+                "cp_rank_as_data",
+                return_value=jnp.int32(0),
+            ),
+            mock.patch.object(
+                attention_interface,
+                "update_sparse_mla_kv_cache_dcp",
+                side_effect=lambda nc, rc, *a, **kw: (nc, rc),
+            ),
+            mock.patch.object(
+                attention_interface.sparse_mla_kernel,
+                "sparse_ragged_paged_attention",
+                side_effect=lambda q, *a, **kw: (
+                    q,
+                    jnp.zeros((q.shape[0], q.shape[1]), jnp.float32),
+                ),
+            ),
+        ):
+            nc_out, rc_out, dcp_out, lse_out = (
+                attention_interface.sparse_mla_attention_dcp(
+                    ql_nope,
+                    q_pe,
+                    kv_c,
+                    k_pe,
+                    nope_cache,
+                    rope_cache,
+                    jnp.array([[0, -1], [-1, -1], [1, -1], [-1, -1]], jnp.int32),
+                    seq_lens,
+                    block_tables,
+                    query_start_loc,
+                    dist,
+                    mesh=fake_dcp_mesh,
+                    nope_spec=NOPE_SPEC,
+                    rope_spec=ROPE_SPEC,
+                    k_scale=1.5,
+                    dcp_size=2,
+                    interleave_size=1,
+                )
+            )
+            self.assertEqual(dcp_out.shape, ql_nope.shape)
+            self.assertEqual(lse_out.shape, (2, 2))
+            self.assertEqual(nc_out.shape, nope_cache.shape)
+            self.assertEqual(rc_out.shape, rope_cache.shape)

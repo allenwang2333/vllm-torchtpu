@@ -1027,3 +1027,597 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         rtol=tolerance,
         atol=tolerance,
     )
+
+
+def test_gdn_attention_cpu_helpers_and_validation(monkeypatch):
+    from vllm_torchtpu.layers.core import gdn_attention as ga
+
+    mesh_pcp = SimpleNamespace(axis_names=("pcp",), shape={"pcp": 2})
+    mesh_pcp_tp = SimpleNamespace(axis_names=("pcp", "tp"), shape={"pcp": 2, "tp": 2})
+    assert ga._gdn_tp_axis_name(mesh_pcp) is None
+    assert ga._gdn_tp_axis_name(mesh_pcp_tp) == "tp"
+    assert ga._gdn_pcp_tp_state_axis("pcp", None) == "pcp"
+    assert ga._gdn_pcp_tp_state_axis("pcp", "tp") == ("tp", "pcp")
+
+    monkeypatch.setattr(
+        jax.lax,
+        "all_to_all",
+        lambda x, *, axis_name, split_axis, concat_axis, tiled: x,
+    )
+    t2d = jnp.ones((4, 6), dtype=jnp.float32)
+    assert ga._exchange_pcp_token_shards_for_head_shards(
+        t2d, "pcp", 2, head_axis=-1
+    ).shape == (4, 6)
+    assert ga._exchange_pcp_token_shards_for_head_shards(
+        t2d, "pcp", 2, head_axis=1
+    ).shape == (4, 6)
+    assert ga._select_replicated_shard_for_pcp_rank(t2d, "pcp", 2, axis=-1).shape == (
+        4,
+        3,
+    )
+
+    geometry = derive_gdn_head_geometry(2, 2, 2)
+    with pytest.raises(ValueError, match="Expected concatenated QKV width"):
+        ga._reorder_gdn_qkv_for_pcp(
+            jnp.ones((2, 5), dtype=jnp.float32), geometry, d_k=2, d_v=2, axis=-1
+        )
+    reordered = ga._reorder_gdn_qkv_for_pcp(
+        jnp.ones((2, 12), dtype=jnp.float32), geometry, d_k=2, d_v=2, axis=-1
+    )
+    assert reordered.shape == (2, 12)
+    reordered_axis0 = ga._reorder_gdn_qkv_for_pcp(
+        jnp.ones((12, 2), dtype=jnp.float32), geometry, d_k=2, d_v=2, axis=0
+    )
+    assert reordered_axis0.shape == (12, 2)
+
+    with pytest.raises(ValueError, match="query_start_loc must be one-dimensional"):
+        ga._derive_pcp_rank_major_reorder_indices(
+            jnp.zeros((1, 2), dtype=jnp.int32),
+            jnp.zeros((1,), dtype=jnp.int32),
+            pcp_size=2,
+            interleave_size=2,
+            local_padded_num_tokens=4,
+        )
+    with pytest.raises(
+        ValueError, match="q_lens and token_owner_starts must have equal shape"
+    ):
+        ga._derive_pcp_rank_major_reorder_indices(
+            jnp.array([0, 4], dtype=jnp.int32),
+            jnp.zeros((2,), dtype=jnp.int32),
+            pcp_size=2,
+            interleave_size=2,
+            local_padded_num_tokens=4,
+        )
+
+    monkeypatch.setattr(ga.pltpu, "get_tpu_info", lambda: SimpleNamespace(generation=7))
+    monkeypatch.setattr(ga, "with_layout_constraint", lambda x, layout: x)
+    monkeypatch.setattr(
+        jax.lax,
+        "ragged_all_to_all",
+        lambda operand, output, *args, **kw: output,
+    )
+    desc = jnp.zeros((2, 3), dtype=jnp.int32)
+    send_sizes = jnp.zeros((2, 2), dtype=jnp.int32)
+    with pytest.raises(ValueError, match="expects a rank-2 tensor"):
+        ga._ragged_exchange_pcp_token_shards_for_head_shards(
+            jnp.ones((2, 4, 2)), "pcp", 2, desc, send_sizes
+        )
+    with pytest.raises(ValueError, match="requires a sharded last dim"):
+        ga._ragged_exchange_pcp_token_shards_for_head_shards(
+            jnp.ones((2, 5)), "pcp", 2, desc, send_sizes
+        )
+    with pytest.raises(ValueError, match="requires an even shard width"):
+        ga._ragged_exchange_pcp_token_shards_for_head_shards(
+            jnp.ones((2, 6)), "pcp", 2, desc, send_sizes
+        )
+    exchanged = ga._ragged_exchange_pcp_token_shards_for_head_shards(
+        jnp.ones((2, 8), dtype=jnp.bfloat16), "pcp", 2, desc, send_sizes
+    )
+    assert exchanged.shape == (4, 4)
+
+
+def test_gdn_attention_cpu_entrypoints_and_pool_plan(monkeypatch):
+    from vllm_torchtpu.layers.core import gdn_attention as ga
+
+    monkeypatch.setattr(jax, "shard_map", lambda fn, **kw: fn)
+    monkeypatch.setattr(ga, "get_mesh_shape_product", lambda mesh, axis: 1)
+    monkeypatch.setattr(
+        ga.gdn_v3_wrapper,
+        "fused_conv1d_gdn",
+        lambda qkv, b, a, conv_s, rec_s, *args, **kw: (
+            (
+                kw["state_source"]
+                if kw.get("state_source") is not None
+                else (conv_s, rec_s)
+            ),
+            jnp.zeros((qkv.shape[0], kw["n_v"] * kw["d_v"]), dtype=qkv.dtype),
+        ),
+    )
+
+    qkv = jnp.zeros((4, 12), dtype=jnp.bfloat16)
+    b = jnp.zeros((4, 2), dtype=jnp.bfloat16)
+    a = jnp.zeros((4, 2), dtype=jnp.bfloat16)
+    conv_s = jnp.zeros((2, 3, 12), dtype=jnp.bfloat16)
+    rec_s = jnp.zeros((2, 2, 2, 2), dtype=jnp.float32)
+    conv_w = jnp.zeros((12, 1, 4), dtype=jnp.bfloat16)
+    conv_b = jnp.zeros((12,), dtype=jnp.bfloat16)
+    a_log = jnp.zeros((2,), dtype=jnp.float32)
+    dt_b = jnp.zeros((2,), dtype=jnp.float32)
+    state_idx = jnp.array([0, 1], dtype=jnp.int32)
+    q_start = jnp.array([0, 2, 4], dtype=jnp.int32)
+    dist = jnp.array([0, 2, 2], dtype=jnp.int32)
+    seq_lens = jnp.array([2, 2], dtype=jnp.int32)
+    slot_offsets = jnp.array([0, 0], dtype=jnp.int32)
+    ckpt_idx = jnp.zeros((2, 2), dtype=jnp.int32)
+    mesh = SimpleNamespace(axis_names=("model",), shape={"model": 1})
+
+    (nc, nr), out = ga.run_jax_gdn_attention(
+        qkv,
+        b,
+        a,
+        conv_s,
+        rec_s,
+        conv_w,
+        None,
+        a_log,
+        dt_b,
+        state_idx,
+        q_start,
+        dist,
+        seq_lens,
+        None,
+        n_kq=2,
+        n_v=2,
+        d_k=2,
+        d_v=2,
+        kernel_size=4,
+        mesh=mesh,
+    )
+    assert out.shape == (4, 4)
+    (nc, nr), out = ga.run_jax_gdn_attention(
+        qkv,
+        b,
+        a,
+        conv_s,
+        rec_s,
+        conv_w,
+        conv_b,
+        a_log,
+        dt_b,
+        state_idx,
+        q_start,
+        dist,
+        seq_lens,
+        slot_offsets,
+        n_kq=2,
+        n_v=2,
+        d_k=2,
+        d_v=2,
+        kernel_size=4,
+        mesh=mesh,
+    )
+    assert out.shape == (4, 4)
+
+    monkeypatch.setattr(
+        ga.pool_adapters, "_pool_geometry", lambda pool: (16, (4,), 128)
+    )
+    monkeypatch.setattr(ga.pool_adapters, "v3_state_source", lambda pool, **kw: kw)
+    pool = jnp.zeros((4, 16, 4, 128), dtype=jnp.bfloat16)
+
+    with pytest.raises(ValueError, match="Manager block size must be divisible"):
+        ga._build_v3_pool_state_plan(
+            pool,
+            conv_dim=12,
+            n_v=2,
+            d_k=2,
+            d_v=2,
+            kernel_size=4,
+            pool_block_tokens=24,
+            qk_pair_layout=False,
+        )
+
+    monkeypatch.setattr(ga.pool_adapters, "is_seq_along_lane_pool", lambda: True)
+    with pytest.raises(ValueError, match="GDN state does not fit"):
+        ga._build_v3_pool_state_plan(
+            pool,
+            conv_dim=128,
+            n_v=32,
+            d_k=128,
+            d_v=128,
+            kernel_size=4,
+            pool_block_tokens=16,
+            qk_pair_layout=False,
+        )
+
+    monkeypatch.setattr(ga.pool_adapters, "is_seq_along_lane_pool", lambda: False)
+    plan = ga._build_v3_pool_state_plan(
+        pool,
+        conv_dim=12,
+        n_v=2,
+        d_k=2,
+        d_v=2,
+        kernel_size=4,
+        pool_block_tokens=32,
+        qk_pair_layout=False,
+    )
+    assert plan["split"] == 2
+
+    new_pool, out_pooled = ga.run_jax_gdn_attention_pooled(
+        qkv,
+        b,
+        a,
+        pool,
+        conv_w,
+        None,
+        a_log,
+        dt_b,
+        state_idx,
+        q_start,
+        dist,
+        seq_lens,
+        None,
+        None,
+        n_kq=2,
+        n_v=2,
+        d_k=2,
+        d_v=2,
+        kernel_size=4,
+        pool_block_tokens=32,
+        mesh=mesh,
+    )
+    assert out_pooled.shape == (4, 4)
+
+    new_pool, out_pooled = ga.run_jax_gdn_attention_pooled(
+        qkv,
+        b,
+        a,
+        pool,
+        conv_w,
+        conv_b,
+        a_log,
+        dt_b,
+        state_idx,
+        q_start,
+        dist,
+        seq_lens,
+        slot_offsets,
+        ckpt_idx,
+        n_kq=2,
+        n_v=2,
+        d_k=2,
+        d_v=2,
+        kernel_size=4,
+        pool_block_tokens=32,
+        mesh=mesh,
+    )
+    assert out_pooled.shape == (4, 4)
+
+
+def test_gdn_attention_cpu_pcp_prefill_paths(monkeypatch):
+    from vllm_torchtpu.layers.core import gdn_attention as ga
+
+    def _fake_all_to_all(x, *, axis_name, split_axis, concat_axis, tiled):
+        if split_axis == concat_axis:
+            return x
+        shape = list(x.shape)
+        shape[split_axis] //= 2
+        shape[concat_axis] *= 2
+        return jnp.zeros(shape, dtype=x.dtype)
+
+    monkeypatch.setattr(jax, "shard_map", lambda fn, **kw: fn)
+    monkeypatch.setattr(jax.lax, "all_to_all", _fake_all_to_all)
+    monkeypatch.setattr(
+        ga,
+        "_ragged_exchange_pcp_token_shards_for_head_shards",
+        lambda tensor, pcp_axis, pcp_size, desc, sizes: jnp.zeros(
+            (tensor.shape[0] * pcp_size, tensor.shape[1] // pcp_size),
+            dtype=tensor.dtype,
+        ),
+    )
+    monkeypatch.setattr(
+        ga.gdn_v3_wrapper,
+        "fused_conv1d_gdn",
+        lambda qkv, b, a, conv_s, rec_s, *args, **kw: (
+            (
+                kw["state_source"]
+                if kw.get("state_source") is not None
+                else (conv_s, rec_s)
+            ),
+            jnp.zeros((qkv.shape[0], kw["n_v"] * kw["d_v"]), dtype=qkv.dtype),
+        ),
+    )
+    monkeypatch.setattr(
+        ga.gdn_v3_pcp_wrapper,
+        "fused_qkvz_projection_pcp_gdn",
+        lambda hidden, w, scale, b_s, a_s, pool_, *args, **kw: (
+            pool_,
+            jnp.zeros((hidden.shape[0], 2), dtype=hidden.dtype),
+            jnp.zeros((hidden.shape[0], 2), dtype=hidden.dtype),
+        ),
+    )
+    monkeypatch.setattr(
+        ga.pool_adapters, "_pool_geometry", lambda pool: (16, (4,), 128)
+    )
+    monkeypatch.setattr(ga.pool_adapters, "is_seq_along_lane_pool", lambda: False)
+    monkeypatch.setattr(ga.pool_adapters, "v3_state_source", lambda pool, **kw: kw)
+
+    bad_mesh = SimpleNamespace(axis_names=("tp",), shape={"tp": 2})
+    mismatch_mesh = SimpleNamespace(axis_names=("pcp",), shape={"pcp": 4})
+    pcp_only_mesh = SimpleNamespace(axis_names=("pcp",), shape={"pcp": 2})
+    good_mesh = SimpleNamespace(axis_names=("pcp", "tp"), shape={"pcp": 2, "tp": 1})
+
+    qkv = jnp.zeros((2, 12), dtype=jnp.bfloat16)
+    b = jnp.zeros((2, 2), dtype=jnp.bfloat16)
+    a = jnp.zeros((2, 2), dtype=jnp.bfloat16)
+    conv_s = jnp.zeros((2, 3, 6), dtype=jnp.bfloat16)
+    rec_s = jnp.zeros((2, 1, 2, 2), dtype=jnp.float32)
+    conv_w = jnp.zeros((12, 1, 4), dtype=jnp.bfloat16)
+    conv_b = jnp.zeros((12,), dtype=jnp.bfloat16)
+    a_log = jnp.zeros((2,), dtype=jnp.float32)
+    dt_b = jnp.zeros((2,), dtype=jnp.float32)
+    state_idx = jnp.array([0, 1], dtype=jnp.int32)
+    q_start = jnp.array([0, 2, 4], dtype=jnp.int32)
+    dist = jnp.array([0, 2, 2], dtype=jnp.int32)
+    seq_lens = jnp.array([2, 2], dtype=jnp.int32)
+    pool = jnp.zeros((4, 16, 4, 128), dtype=jnp.bfloat16)
+
+    for fn in (
+        ga.run_jax_gdn_attention_pcp_tp_prefill,
+        ga.run_jax_gdn_attention_pooled_pcp_prefill,
+    ):
+        state_args = (
+            (conv_s, rec_s)
+            if fn is ga.run_jax_gdn_attention_pcp_tp_prefill
+            else (pool,)
+        )
+        extra_kw = (
+            {}
+            if fn is ga.run_jax_gdn_attention_pcp_tp_prefill
+            else {"pool_block_tokens": 32}
+        )
+        with pytest.raises(NotImplementedError, match="requires a pcp mesh axis"):
+            fn(
+                qkv,
+                b,
+                a,
+                *state_args,
+                conv_w,
+                None,
+                a_log,
+                dt_b,
+                state_idx,
+                q_start,
+                dist,
+                seq_lens,
+                n_kq=2,
+                n_v=2,
+                d_k=2,
+                d_v=2,
+                kernel_size=4,
+                pcp_size=2,
+                interleave_size=2,
+                mesh=bad_mesh,
+                **extra_kw,
+            )
+        with pytest.raises(ValueError, match="does not match mesh axis size"):
+            fn(
+                qkv,
+                b,
+                a,
+                *state_args,
+                conv_w,
+                None,
+                a_log,
+                dt_b,
+                state_idx,
+                q_start,
+                dist,
+                seq_lens,
+                n_kq=2,
+                n_v=2,
+                d_k=2,
+                d_v=2,
+                kernel_size=4,
+                pcp_size=2,
+                interleave_size=2,
+                mesh=mismatch_mesh,
+                **extra_kw,
+            )
+
+        for bias_arg, mesh_arg in ((None, pcp_only_mesh), (conv_b, good_mesh)):
+            res = fn(
+                qkv,
+                b,
+                a,
+                *state_args,
+                conv_w,
+                bias_arg,
+                a_log,
+                dt_b,
+                state_idx,
+                q_start,
+                dist,
+                seq_lens,
+                n_kq=2,
+                n_v=2,
+                d_k=2,
+                d_v=2,
+                kernel_size=4,
+                pcp_size=2,
+                interleave_size=2,
+                mesh=mesh_arg,
+                **extra_kw,
+            )
+            assert res[1].shape == (2, 2, 2)
+
+    with pytest.raises(ValueError, match="conv_state must be PCP-local"):
+        ga.run_jax_gdn_attention_pcp_tp_prefill(
+            qkv,
+            b,
+            a,
+            jnp.zeros((2, 3, 12), dtype=jnp.bfloat16),
+            rec_s,
+            conv_w,
+            None,
+            a_log,
+            dt_b,
+            state_idx,
+            q_start,
+            dist,
+            seq_lens,
+            n_kq=2,
+            n_v=2,
+            d_k=2,
+            d_v=2,
+            kernel_size=4,
+            pcp_size=2,
+            interleave_size=2,
+            mesh=good_mesh,
+        )
+    with pytest.raises(ValueError, match="recurrent_state must be PCP-local"):
+        ga.run_jax_gdn_attention_pcp_tp_prefill(
+            qkv,
+            b,
+            a,
+            conv_s,
+            jnp.zeros((2, 2, 2, 2), dtype=jnp.float32),
+            conv_w,
+            None,
+            a_log,
+            dt_b,
+            state_idx,
+            q_start,
+            dist,
+            seq_lens,
+            n_kq=2,
+            n_v=2,
+            d_k=2,
+            d_v=2,
+            kernel_size=4,
+            pcp_size=2,
+            interleave_size=2,
+            mesh=good_mesh,
+        )
+
+    hidden = jnp.zeros((2, 8), dtype=jnp.bfloat16)
+    qkvz_w = jnp.zeros((16, 8), dtype=jnp.bfloat16)
+    qkvz_scale = jnp.ones((16,), dtype=jnp.float32)
+
+    with pytest.raises(NotImplementedError, match="requires a pcp mesh axis"):
+        ga.run_jax_gdn_attention_pooled_pcp_prefill_projection(
+            hidden,
+            qkvz_w,
+            None,
+            b,
+            a,
+            pool,
+            conv_w,
+            None,
+            a_log,
+            dt_b,
+            state_idx,
+            q_start,
+            dist,
+            seq_lens,
+            n_kq=2,
+            n_v=2,
+            d_k=2,
+            d_v=2,
+            kernel_size=4,
+            pool_block_tokens=32,
+            pcp_size=2,
+            interleave_size=2,
+            mesh=bad_mesh,
+        )
+    with pytest.raises(ValueError, match="does not match mesh axis size"):
+        ga.run_jax_gdn_attention_pooled_pcp_prefill_projection(
+            hidden,
+            qkvz_w,
+            None,
+            b,
+            a,
+            pool,
+            conv_w,
+            None,
+            a_log,
+            dt_b,
+            state_idx,
+            q_start,
+            dist,
+            seq_lens,
+            n_kq=2,
+            n_v=2,
+            d_k=2,
+            d_v=2,
+            kernel_size=4,
+            pool_block_tokens=32,
+            pcp_size=2,
+            interleave_size=2,
+            mesh=mismatch_mesh,
+        )
+
+    for bias_arg, scale_arg, mesh_arg in (
+        (None, None, pcp_only_mesh),
+        (conv_b, qkvz_scale, good_mesh),
+    ):
+        new_p, out_p, z_p = ga.run_jax_gdn_attention_pooled_pcp_prefill_projection(
+            hidden,
+            qkvz_w,
+            scale_arg,
+            b,
+            a,
+            pool,
+            conv_w,
+            bias_arg,
+            a_log,
+            dt_b,
+            state_idx,
+            q_start,
+            dist,
+            seq_lens,
+            n_kq=2,
+            n_v=2,
+            d_k=2,
+            d_v=2,
+            kernel_size=4,
+            pool_block_tokens=32,
+            pcp_size=2,
+            interleave_size=2,
+            mesh=mesh_arg,
+        )
+        assert out_p.shape == (2, 2)
+        assert z_p.shape == (2, 2)
+
+    monkeypatch.setattr(
+        ga,
+        "_select_replicated_shard_for_pcp_rank",
+        lambda tensor, pcp_axis, pcp_size, *, axis: tensor,
+    )
+    with pytest.raises(
+        ValueError, match="conv weights must be PCP-local after selection"
+    ):
+        ga.run_jax_gdn_attention_pooled_pcp_prefill_projection(
+            hidden,
+            qkvz_w,
+            None,
+            b,
+            a,
+            pool,
+            conv_w,
+            None,
+            a_log,
+            dt_b,
+            state_idx,
+            q_start,
+            dist,
+            seq_lens,
+            n_kq=2,
+            n_v=2,
+            d_k=2,
+            d_v=2,
+            kernel_size=4,
+            pool_block_tokens=32,
+            pcp_size=2,
+            interleave_size=2,
+            mesh=good_mesh,
+        )

@@ -267,13 +267,14 @@ def apply_splash(q, k, v, window_size, attn_logits_soft_cap, is_mqa) -> jax.Arra
     kv_seq_len = k.shape[2]
     assert kv_seq_len >= q_seq_len
 
-    masks = [
-        mask_lib.LocalMask(
-            (q_seq_len, kv_seq_len), (window_size, 0), kv_seq_len - q_seq_len
+    mask = mask_lib.MultiHeadMask(
+        tuple(
+            mask_lib.LocalMask(
+                (q_seq_len, kv_seq_len), (window_size, 0), kv_seq_len - q_seq_len
+            )
+            for _ in range(num_heads)
         )
-        for _ in range(num_heads)
-    ]
-    mask = mask_lib.MultiHeadMask(tuple(m for m in masks))
+    )
     block_sizes = splash.BlockSizes.get_default()
 
     if is_mqa:
@@ -717,9 +718,10 @@ def mla_attention(
     ):
         max_num_tokens = q.shape[0]  # q is in token-major sequence format (T, N, A)
         actual_r_dim = q_rope.shape[2]
+        cache_dtype_str = str(cache.dtype).lower()
         kv_dtype_str = (
             "float8_e4m3fn"
-            if any(x in str(cache.dtype).lower() for x in ("fp8", "e4m3"))
+            if ("fp8" in cache_dtype_str or "e4m3" in cache_dtype_str)
             else "bfloat16"
         )
 

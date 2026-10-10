@@ -1131,26 +1131,24 @@ class KVCacheManager:
                 tuple(materialized.raw_tensors[0].shape),
                 materialized.raw_tensors[0].dtype,
             )
-        if self.runner._unified_kv_layout:
-            self.runner._build_mamba_copy_plan(
-                kv_cache_config, materialized.layer_to_raw, materialized.bm_pool_layout
-            )
+        self.runner._build_mamba_copy_plan(
+            kv_cache_config, materialized.layer_to_raw, materialized.bm_pool_layout
+        )
 
         for layer_name, target_layer_name in self.runner.shared_kv_cache_layers.items():
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
-        if self.runner._unified_kv_layout:
-            # Flush the pool zero-fill before any compiled execution. PJRT
-            # only donates quiescent buffers: a pending write at enqueue time
-            # makes every donated pool parameter fall back to a fresh
-            # pool-sized output copy (a 2x-pool transient that OOMs at high
-            # gpu_memory_utilization).
-            if self.runner.kv_cache_raw_tensors:
-                synchronize_tensors(self.runner.kv_cache_raw_tensors)
-            # Same rule for the seed-copy program: compile it while the pools
-            # are quiescent, before any dummy forward leaves writes pending.
-            self.runner._precompile_mamba_state_seed_copies()
+        # Flush the pool zero-fill before any compiled execution. PJRT
+        # only donates quiescent buffers: a pending write at enqueue time
+        # makes every donated pool parameter fall back to a fresh
+        # pool-sized output copy (a 2x-pool transient that OOMs at high
+        # gpu_memory_utilization).
+        if self.runner.kv_cache_raw_tensors:
+            synchronize_tensors(self.runner.kv_cache_raw_tensors)
+        # Same rule for the seed-copy program: compile it while the pools
+        # are quiescent, before any dummy forward leaves writes pending.
+        self.runner._precompile_mamba_state_seed_copies()
 
         logger.info(
             "%s",
@@ -1189,8 +1187,7 @@ class KVCacheManager:
         # block through the align-mode seed copies (see
         # `_collect_mamba_state_seed_copies`).
         if (
-            self.runner._unified_kv_layout
-            and kv_cache_config.has_mamba_layers
+            kv_cache_config.has_mamba_layers
             and self.runner.speculative_config is not None
         ):
             self.runner.mamba_slot_read_offsets = torch.zeros(
@@ -1419,10 +1416,7 @@ class KVCacheManager:
         allocated_mamba_num_blocks: int | None = None
 
         def _per_layer_spec(layer_name: str) -> KVCacheSpec:
-            spec = layer_name_to_spec[layer_name]
-            if isinstance(spec, UniformTypeKVCacheSpecs):
-                return spec.kv_cache_specs[layer_name]
-            return spec
+            return layer_name_to_spec[layer_name]
 
         # DSv4's packed layout and cache overlays are handled entirely in
         # `_initialize_ds_v4_kv_cache`, so the loop below stays DSv4-free.
@@ -1797,12 +1791,6 @@ class KVCacheManager:
         # these per-layer caches (same gate as the runtime path); compile
         # before any forward runs.
         self.runner._precompile_dense_kv_cache_block_copies()
-
-        if self.runner.use_spmd:
-            # Shard KV Cache
-            for cache in self.runner.kv_caches:
-                continue
-                # xs.mark_sharding(cache, self.mesh, (None, "x", None, None))
 
         if has_kv_transfer_group():
             kv_connector = get_kv_transfer_group()

@@ -60,6 +60,25 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.tpu_worker import TPUWorker
 
 
+@pytest.fixture(autouse=True)
+def _cpu_tpu_device_fallback(monkeypatch):
+    from vllm_torchtpu.tpu_info import get_num_chips
+
+    if get_num_chips() == 0:
+        import vllm.config.device as vllm_device_mod
+
+        orig_device = torch.device
+        monkeypatch.setattr(
+            vllm_device_mod.torch,
+            "device",
+            lambda dev, *args, **kwargs: (
+                orig_device("cpu")
+                if dev == "tpu"
+                else orig_device(dev, *args, **kwargs)
+            ),
+        )
+
+
 def _attention_layer_mock():
     """An `Attention` mock whose `get_attn_backend()` returns a real backend.
 
@@ -2051,3 +2070,1009 @@ class TestUpdateAttentionPageSizePadded:
                 256, 2, 256, torch.bfloat16
             )
         )
+
+
+class TestKVCacheManagerFullCoverage(TestKVCacheManager):
+    def test_is_cache_for_ds_v4_and_cover_block_ids_skips(self):
+        from vllm_torchtpu.runner.kv_cache_manager import is_cache_for_ds_v4
+
+        native_mod = SimpleNamespace(tpu_native_kv=True)
+        assert not is_cache_for_ds_v4(native_mod)
+
+        mamba_spec = MambaSpec(
+            block_size=16,
+            shapes=[(4, 128)],
+            dtypes=[torch.bfloat16],
+        )
+        mla_spec = MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
+        tensor = KVCacheTensor(
+            size=4096,
+            layers=["mamba.0", "mla.0"],
+            layer_stride=2048,
+            block_stride=256,
+        )
+        check_kv_caches_cover_block_ids(
+            {},
+            [tensor],
+            4,
+            {"mamba.0": mamba_spec, "mla.0": mla_spec}.__getitem__,
+        )
+
+    @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
+    def test_get_kv_cache_spec_all_layer_branches_and_drafter(self, mock_get_layers):
+        from vllm.model_executor.layers.attention import ChunkedLocalAttention
+        from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+        from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+
+        # 1. No attention layers (has_attention=False) and Mamba returning None
+        mamba_none = MagicMock(spec=MambaBase)
+        mamba_none.get_kv_cache_spec.return_value = None
+        dsv4_none = SimpleNamespace(
+            tpu_native_kv=True, get_kv_cache_spec=lambda cfg: None
+        )
+        dsv4_some = SimpleNamespace(
+            tpu_native_kv=True,
+            get_kv_cache_spec=lambda cfg: MLAAttentionSpec(
+                block_size=16, num_kv_heads=1, head_size=128, dtype=torch.uint8
+            ),
+        )
+        indexer = MagicMock(spec=DeepseekV32IndexerCache)
+        indexer.tpu_native_kv = False
+        indexer.get_kv_cache_spec.return_value = MLAAttentionSpec(
+            block_size=16, num_kv_heads=1, head_size=128, dtype=torch.uint8
+        )
+        other_layer = MagicMock(spec=AttentionLayerBase)
+        other_layer.tpu_native_kv = False
+
+        mock_get_layers.return_value = {
+            "mamba.none": mamba_none,
+            "dsv4.none": dsv4_none,
+            "dsv4.some": dsv4_some,
+            "indexer.0": indexer,
+            "other.0": other_layer,
+        }
+        specs = self.runner.get_kv_cache_spec()
+        assert "dsv4.some" in specs
+        assert "indexer.0" in specs
+        assert "mamba.none" not in specs
+        assert "dsv4.none" not in specs
+
+        # 2. Shared KV target error branches
+        bad_missing = _attention_layer_mock()
+        bad_missing.num_kv_heads = 2
+        bad_missing.head_size = 128
+        bad_missing.kv_sharing_target_layer_name = "nonexistent"
+        mock_get_layers.return_value = {"attn.0": bad_missing}
+        with pytest.raises(ValueError, match="missing target layer"):
+            self.runner.get_kv_cache_spec()
+
+        bad_non_attn = _attention_layer_mock()
+        bad_non_attn.num_kv_heads = 2
+        bad_non_attn.head_size = 128
+        bad_non_attn.kv_sharing_target_layer_name = "mamba.0"
+        mock_get_layers.return_value = {
+            "mamba.0": DummyMamba(),
+            "attn.0": bad_non_attn,
+        }
+        with (
+            patch.object(
+                self.runner.kv_cache_manager, "_update_mamba_page_size_padded"
+            ),
+            pytest.raises(ValueError, match="non-attention target layer"),
+        ):
+            self.runner.get_kv_cache_spec()
+
+        chained_target = _attention_layer_mock()
+        chained_target.num_kv_heads = 2
+        chained_target.head_size = 128
+        chained_target.kv_sharing_target_layer_name = "attn.root"
+        chained_leaf = _attention_layer_mock()
+        chained_leaf.num_kv_heads = 2
+        chained_leaf.head_size = 128
+        chained_leaf.kv_sharing_target_layer_name = "attn.mid"
+        mock_get_layers.return_value = {
+            "attn.leaf": chained_leaf,
+            "attn.mid": chained_target,
+        }
+        with pytest.raises(ValueError, match="itself a shared KV layer"):
+            self.runner.get_kv_cache_spec()
+
+        # 3. ChunkedLocalAttention, SlidingWindow, ENCODER, ENCODER_DECODER,
+        # unknown attn_type, duplicate MLA
+        chunked = MagicMock(spec=ChunkedLocalAttention)
+        chunked.tpu_native_kv = False
+        chunked.kv_sharing_target_layer_name = None
+        chunked.attn_type = AttentionType.DECODER
+        chunked.num_kv_heads = 2
+        chunked.head_size = 128
+        chunked.sliding_window = 256
+
+        enc_attn = _attention_layer_mock()
+        enc_attn.kv_sharing_target_layer_name = None
+        enc_attn.attn_type = AttentionType.ENCODER
+        enc_attn.num_kv_heads = 2
+        enc_attn.head_size = 128
+
+        mla_mod = MagicMock(spec=MLAAttention)
+        mla_mod.tpu_native_kv = False
+        mla_mod.head_size = 576
+
+        class _DupItemsDict(dict):
+            def items(self):
+                base = list(super().items())
+                return base + [("mla.0", mla_mod)]
+
+        dup_layers = _DupItemsDict(
+            {
+                "chunked.0": chunked,
+                "enc.0": enc_attn,
+                "mla.0": mla_mod,
+            }
+        )
+        self.runner._unified_kv_layout = True
+        self.runner._is_async_drafter = True
+        draft_layer_0 = SimpleNamespace(self_attn=None)
+        draft_layer_1 = SimpleNamespace(
+            self_attn=SimpleNamespace(
+                attn=SimpleNamespace(kv_sharing_target_layer_name="chunked.0")
+            )
+        )
+        self.runner.drafter = SimpleNamespace(
+            draft_model=SimpleNamespace(
+                model=SimpleNamespace(layers=[draft_layer_0, draft_layer_1])
+            )
+        )
+        self.runner.shared_kv_cache_layers = {
+            "draft_model.layers.1.self_attn.attn": "chunked.0"
+        }
+        mock_get_layers.return_value = dup_layers
+        with patch(
+            "vllm_torchtpu.runner.kv_cache_manager.normalize_kv_cache_specs_for_tpu",
+            side_effect=lambda s, *a, **kw: s,
+        ):
+            specs = self.runner.get_kv_cache_spec()
+        assert isinstance(specs["chunked.0"], SlidingWindowSpec)
+        assert isinstance(specs["mla.0"], MLAAttentionSpec)
+        assert "enc.0" not in specs
+
+        # Async drafter error: unregistered shared layer
+        self.runner.shared_kv_cache_layers = {}
+        with pytest.raises(RuntimeError, match="was not registered as a shared layer"):
+            self.runner.get_kv_cache_spec()
+
+        # Async drafter error: draft layer still has its own KVCacheSpec
+        self.runner.shared_kv_cache_layers = {
+            "draft_model.layers.1.self_attn.attn": "chunked.0"
+        }
+        dup_layers["draft_model.layers.1.self_attn.attn"] = dsv4_some
+        with pytest.raises(RuntimeError, match="still has its own KVCacheSpec"):
+            self.runner.get_kv_cache_spec()
+
+        # ENCODER_DECODER and unknown attn_type
+        self.runner._is_async_drafter = False
+        enc_dec = _attention_layer_mock()
+        enc_dec.kv_sharing_target_layer_name = None
+        enc_dec.attn_type = AttentionType.ENCODER_DECODER
+        enc_dec.num_kv_heads = 2
+        enc_dec.head_size = 128
+        mock_get_layers.return_value = {"ed.0": enc_dec}
+        with pytest.raises(NotImplementedError):
+            self.runner.get_kv_cache_spec()
+
+        unknown_attn = _attention_layer_mock()
+        unknown_attn.kv_sharing_target_layer_name = None
+        unknown_attn.attn_type = "invalid_type"
+        unknown_attn.num_kv_heads = 2
+        unknown_attn.head_size = 128
+        mock_get_layers.return_value = {"unk.0": unknown_attn}
+        with pytest.raises(ValueError, match="Unknown attention type"):
+            self.runner.get_kv_cache_spec()
+
+    def test_pad_native_attention_regions_and_shared_aliases_and_sizing(self):
+        mgr = self.runner.kv_cache_manager
+
+        # _pad_native_attention_regions with len(groups) <= 1 and len(native_pages) <= 1
+        spec_a = FullAttentionSpec(
+            block_size=16, num_kv_heads=2, head_size=128, dtype=torch.bfloat16
+        )
+        spec_mla = MLAAttentionSpec(
+            block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+        )
+        with (
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.can_share_attention_cache",
+                return_value=False,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.get_kv_cache_groups",
+                return_value=[SimpleNamespace(kv_cache_spec=spec_a)],
+            ),
+        ):
+            assert mgr._pad_native_attention_regions(
+                {"a": spec_a}, PallasAttentionBackend
+            ) == {"a": spec_a}
+
+        with (
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.can_share_attention_cache",
+                return_value=False,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.get_kv_cache_groups",
+                return_value=[
+                    SimpleNamespace(kv_cache_spec=spec_mla),
+                    SimpleNamespace(kv_cache_spec=spec_mla),
+                ],
+            ),
+        ):
+            assert mgr._pad_native_attention_regions(
+                {"m0": spec_mla, "m1": spec_mla}, PallasAttentionBackend
+            ) == {"m0": spec_mla, "m1": spec_mla}
+
+        # _add_shared_kv_cache_aliases errors
+        self.runner.shared_kv_cache_layers = {"shared.0": "target.0"}
+        with pytest.raises(ValueError, match="was allocated its own KV cache"):
+            mgr._add_shared_kv_cache_aliases({"shared.0": torch.empty(1)})
+        with pytest.raises(ValueError, match="target cache was not allocated"):
+            mgr._add_shared_kv_cache_aliases({})
+
+        # _update_attention_page_size_padded empty and MLAAttention
+        mgr._update_attention_page_size_padded({}, 16)
+        mla_mod = MagicMock(spec=MLAAttention)
+        mla_mod.head_size = 576
+        mgr._update_attention_page_size_padded(
+            {"mla.0": mla_mod, "mamba.0": DummyMamba()}, 16
+        )
+
+        # _update_mamba_page_size_padded with no attn, and with attn but no mamba
+        mgr._update_mamba_page_size_padded({"mamba.0": DummyMamba()})
+        attn_mod = _attention_layer_mock()
+        attn_mod.num_kv_heads = 2
+        attn_mod.head_size = 128
+        mgr._update_mamba_page_size_padded({"attn.0": attn_mod})
+
+        # _available_kv_cache_hbm with explicit kv_cache_memory_bytes
+        self.runner.cache_config.kv_cache_memory_bytes = 65536
+        assert mgr._available_kv_cache_hbm() == 65536
+
+        # _maybe_set_compact_mamba_num_blocks_override early returns & error
+        self.runner._uniform_mamba_layout = True
+        mgr._maybe_set_compact_mamba_num_blocks_override(4096, 1024, 1, 1, 1)
+        self.runner._uniform_mamba_layout = False
+        self.runner.cache_config.num_gpu_blocks_override = 10
+        mgr._maybe_set_compact_mamba_num_blocks_override(4096, 1024, 1, 1, 1)
+        self.runner.cache_config.num_gpu_blocks_override = None
+        mgr._maybe_set_compact_mamba_num_blocks_override(4096, 1024, 1, 1, 0)
+        self.runner.cache_config.kv_cache_memory_bytes = -1
+        mgr._maybe_set_compact_mamba_num_blocks_override(4096, 1024, 1, 1, 1)
+        self.runner.cache_config.kv_cache_memory_bytes = 17 * 1024 + 100
+        with pytest.raises(ValueError, match="no attention blocks remain"):
+            mgr._maybe_set_compact_mamba_num_blocks_override(4096, 1024, 1, 1, 1)
+
+        # _maybe_set_num_blocks_override branches and fallback
+        self.runner.cache_config.num_gpu_blocks_override = 10
+        mgr._maybe_set_num_blocks_override(4096, 8192, 1)
+        self.runner.cache_config.num_gpu_blocks_override = None
+        self.runner.cache_config.kv_cache_memory_bytes = -1
+        mgr._maybe_set_num_blocks_override(4096, 8192, 1)
+        self.runner.cache_config.kv_cache_memory_bytes = 100
+        mgr._maybe_set_num_blocks_override(4096, 8192, 1)
+        self.runner.cache_config.kv_cache_memory_bytes = 4096
+        mgr._maybe_set_num_blocks_override(4096, 8192, 1)
+        self.runner.cache_config.kv_cache_memory_bytes = 100 * 1024 * 1024
+        self.runner._uniform_mamba_layout = True
+        self.runner._mamba_num_blocks = None
+        mgr._update_mamba_page_size_padded(
+            {"attn.0": attn_mod, "mamba.0": DummyMamba()}
+        )
+        assert self.runner.cache_config.num_gpu_blocks_override is not None
+
+    def test_prewarm_and_owner_token_layout_helpers(self):
+        mgr = self.runner.kv_cache_manager
+        with patch(
+            "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+            return_value=False,
+        ):
+            assert mgr.get_kv_prewarm_shapes() == []
+            mgr.prewarm_kv_offload_shape(16)
+
+        prewarmed = []
+        fake_conn_empty = SimpleNamespace(connector_worker=None)
+        fake_conn_full = SimpleNamespace(
+            connector_worker=SimpleNamespace(
+                spec=SimpleNamespace(
+                    prewarm_shapes=[16, 32],
+                    prewarm_shape=lambda p: prewarmed.append(p),
+                )
+            )
+        )
+        with (
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.get_kv_transfer_group",
+                return_value=fake_conn_empty,
+            ),
+        ):
+            assert mgr.get_kv_prewarm_shapes() == []
+            mgr.prewarm_kv_offload_shape(16)
+
+        with (
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.get_kv_transfer_group",
+                return_value=fake_conn_full,
+            ),
+        ):
+            assert mgr.get_kv_prewarm_shapes() == [16, 32]
+            mgr.prewarm_kv_offload_shape(64)
+            assert prewarmed == [64]
+
+        self.runner._kv_shard_owner_layout = None
+        assert mgr.prepare_owner_token_layout({}, [4]) is None
+
+        self.runner._kv_shard_owner_layout = SimpleNamespace()
+        self.runner.num_tokens_paddings = (8,)
+        with patch(
+            "vllm_torchtpu.runner.owner_token_layout.prepare_kv_shard_owner_token_layout",
+            return_value="layout_ok",
+        ) as mock_prep:
+            assert mgr.prepare_owner_token_layout({}, [4]) == "layout_ok"
+            assert (
+                mgr.prepare_owner_token_layout({}, [4], token_paddings=(16,))
+                == "layout_ok"
+            )
+            assert mock_prep.call_count == 2
+
+    def test_unified_kv_cache_and_block_major_pool_methods(self):
+        from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+        from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
+            VllmGatedDeltaNetAttention,
+        )
+
+        mgr = self.runner.kv_cache_manager
+
+        # _check_block_major_pool_supported branches
+        self.runner.speculative_config = SimpleNamespace()
+        with pytest.raises(NotImplementedError, match="speculative decoding"):
+            mgr._check_block_major_pool_supported()
+        self.runner.speculative_config = None
+
+        self.runner.parallel_config = SimpleNamespace(
+            decode_context_parallel_size=2,
+            pipeline_parallel_size=1,
+            tensor_parallel_size=1,
+        )
+        with pytest.raises(NotImplementedError, match="decode context parallelism"):
+            mgr._check_block_major_pool_supported()
+
+        self.runner.parallel_config.decode_context_parallel_size = 1
+        self.runner.parallel_config.pipeline_parallel_size = 2
+        with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+            mgr._check_block_major_pool_supported()
+
+        self.runner.parallel_config.pipeline_parallel_size = 1
+        self.runner.use_spmd = True
+        with pytest.raises(NotImplementedError, match="SPMD"):
+            mgr._check_block_major_pool_supported()
+        self.runner.use_spmd = False
+        mgr._check_block_major_pool_supported()
+
+        # _bind_block_major_pool_layers branches
+        gdn_layer = MagicMock(spec=VllmGatedDeltaNetAttention)
+        pallas_impl = MagicMock(spec=PallasAttentionBackendImpl)
+        attn_layer = SimpleNamespace(impl=pallas_impl)
+        bad_layer = SimpleNamespace(impl=SimpleNamespace())
+        self.runner.shared_kv_cache_layers = {"attn.shared": "attn.0"}
+        bm_layout = SimpleNamespace(pool_index_by_layer={"gdn.0": 0, "attn.0": 1})
+        with patch(
+            "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
+            return_value={
+                "gdn.0": gdn_layer,
+                "attn.0": attn_layer,
+                "attn.shared": attn_layer,
+            },
+        ):
+            mgr._bind_block_major_pool_layers(bm_layout)
+        gdn_layer.set_block_major_pool.assert_called_once_with(0, bm_layout)
+        assert pallas_impl.set_block_major_pool.call_count == 2
+
+        self.runner.shared_kv_cache_layers = {}
+        with (
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
+                return_value={"bad.0": bad_layer},
+            ),
+            pytest.raises(
+                NotImplementedError, match="cannot address the block-major unified pool"
+            ),
+        ):
+            mgr._bind_block_major_pool_layers(
+                SimpleNamespace(pool_index_by_layer={"bad.0": 0})
+            )
+
+        # _initialize_unified_kv_cache via initialize_kv_cache
+        full_spec = FullAttentionSpec(
+            block_size=16, num_kv_heads=2, head_size=128, dtype=torch.bfloat16
+        )
+        sw_spec = SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=64,
+        )
+        mamba_spec = MambaSpec(
+            block_size=16,
+            shapes=[(4, 128)],
+            dtypes=[torch.bfloat16],
+        )
+        kv_cache_config = KVCacheConfig(
+            num_blocks=8,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=4096,
+                    layers=["attn.0", "sw.0", "mamba.0"],
+                    layer_stride=1024,
+                    block_stride=512,
+                )
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=full_spec),
+                KVCacheGroupSpec(layer_names=["sw.0"], kv_cache_spec=sw_spec),
+                KVCacheGroupSpec(layer_names=["mamba.0"], kv_cache_spec=mamba_spec),
+            ],
+        )
+        self.runner._unified_kv_layout = True
+        self.runner.use_spmd = True
+        self.runner.shared_kv_cache_layers = {"attn.shared": "attn.0"}
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+        mock_bt = MagicMock()
+        mock_bt.get_cpu_tensor.return_value = torch.zeros((1, 1), dtype=torch.int32)
+        self.runner.input_batch = SimpleNamespace(block_table=[mock_bt] * 3)
+        self.runner._resolve_tpu_group_backend.return_value = PallasAttentionBackend
+
+        raw_tensor = torch.zeros((8, 16, 4, 128), dtype=torch.bfloat16)
+        bm_pool = SimpleNamespace(
+            num_pools=2,
+            split=1,
+            pool_index_by_layer={"attn.0": 0},
+        )
+        mat_with_bm = SimpleNamespace(
+            kv_caches={
+                "attn.0": raw_tensor,
+                "sw.0": raw_tensor,
+                "mamba.0": raw_tensor,
+            },
+            raw_tensors=[raw_tensor],
+            bm_pool_layout=bm_pool,
+            layer_to_raw={"attn.0": 0, "sw.0": 0, "mamba.0": 0},
+        )
+        fake_conn_full = SimpleNamespace(
+            register_kv_caches=MagicMock(),
+            set_host_xfer_buffer_ops=MagicMock(),
+            register_runner=MagicMock(),
+        )
+        fake_conn_min = SimpleNamespace(register_kv_caches=MagicMock())
+
+        with (
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.prepare_kernel_block_sizes",
+                return_value=[16, 16, None],
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.build_kernel_block_size_by_group_id",
+                return_value={0: 16, 1: 16, 2: None},
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.unified_block_major_enabled",
+                return_value=True,
+            ),
+            patch.object(mgr, "_check_block_major_pool_supported"),
+            patch.object(mgr, "_bind_block_major_pool_layers"),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.materialize_kv_cache_tensors",
+                return_value=mat_with_bm,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.format_kv_cache_layout_summary",
+                return_value="summary",
+            ),
+            patch("vllm_torchtpu.utils.tpu_bind_kv_cache"),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.get_kv_transfer_group",
+                return_value=fake_conn_full,
+            ),
+            patch.object(
+                mgr,
+                "_maybe_add_kv_sharing_layers_to_kv_cache_groups",
+            ),
+        ):
+            self.runner.speculative_config = SimpleNamespace()
+            self.runner.enforce_eager = False
+            self.runner.initialize_kv_cache(kv_cache_config)
+            assert self.runner._attention_kernel_block_size == 16
+            fake_conn_full.register_kv_caches.assert_called_once()
+            fake_conn_full.set_host_xfer_buffer_ops.assert_called_once()
+            fake_conn_full.register_runner.assert_called_once()
+
+        # Second pass: block_major=False, bm_pool_layout=None, empty raw_tensors,
+        # minimal connector, enforce_eager=True
+        mat_no_bm = SimpleNamespace(
+            kv_caches={
+                "attn.0": raw_tensor,
+                "sw.0": raw_tensor,
+                "mamba.0": raw_tensor,
+            },
+            raw_tensors=[],
+            bm_pool_layout=None,
+            layer_to_raw={},
+        )
+        with (
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.prepare_kernel_block_sizes",
+                return_value=[None, None, None],
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.build_kernel_block_size_by_group_id",
+                return_value={},
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.unified_block_major_enabled",
+                return_value=False,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.materialize_kv_cache_tensors",
+                return_value=mat_no_bm,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.format_kv_cache_layout_summary",
+                return_value="summary",
+            ),
+            patch("vllm_torchtpu.utils.tpu_bind_kv_cache"),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.get_kv_transfer_group",
+                return_value=fake_conn_min,
+            ),
+            patch.object(
+                mgr,
+                "_maybe_add_kv_sharing_layers_to_kv_cache_groups",
+            ),
+        ):
+            self.runner.use_spmd = False
+            self.runner.speculative_config = None
+            self.runner.enforce_eager = True
+            self.runner.initialize_kv_cache(kv_cache_config)
+            fake_conn_min.register_kv_caches.assert_called_once()
+
+        with (
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.prepare_kernel_block_sizes",
+                return_value=[None, None, None],
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.build_kernel_block_size_by_group_id",
+                return_value={},
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.unified_block_major_enabled",
+                return_value=False,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.materialize_kv_cache_tensors",
+                return_value=mat_no_bm,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.format_kv_cache_layout_summary",
+                return_value="summary",
+            ),
+            patch("vllm_torchtpu.utils.tpu_bind_kv_cache"),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+                return_value=False,
+            ),
+            patch.object(
+                mgr,
+                "_maybe_add_kv_sharing_layers_to_kv_cache_groups",
+            ),
+        ):
+            self.runner.initialize_kv_cache(kv_cache_config)
+
+    def test_initialize_kv_cache_remaining_branches(self, monkeypatch):
+        from vllm.v1.kv_cache_interface import (
+            KVCacheSpec,
+            UniformTypeKVCacheSpecs,
+        )
+
+        from vllm_torchtpu import envs
+        from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+
+        mgr = self.runner.kv_cache_manager
+        self.runner._unified_kv_layout = False
+        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+        mock_bt = MagicMock()
+        mock_bt.get_cpu_tensor.return_value = torch.zeros((1, 1), dtype=torch.int32)
+
+        # 1. Unsupported spec in >1 kv_cache_groups
+        circ_spec = MagicMock(spec=KVCacheSpec, block_size=16)
+        full_spec = FullAttentionSpec(
+            block_size=16, num_kv_heads=2, head_size=128, dtype=torch.bfloat16
+        )
+        bad_multi_cfg = KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(layer_names=["c.0"], kv_cache_spec=circ_spec),
+                KVCacheGroupSpec(layer_names=["a.0"], kv_cache_spec=full_spec),
+            ],
+        )
+        with pytest.raises(
+            NotImplementedError,
+            match="Only AttentionSpec and MambaSpec are supported",
+        ):
+            mgr.initialize_kv_cache(bad_multi_cfg)
+
+        # 2. Unsupported spec in single group (line 1734)
+        self.runner.input_batch = SimpleNamespace(block_table=[mock_bt])
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        bad_single_cfg = KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=4096,
+                    layers=["c.0"],
+                    layer_stride=4096,
+                    block_stride=1024,
+                )
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(layer_names=["c.0"], kv_cache_spec=circ_spec),
+            ],
+        )
+        with pytest.raises(NotImplementedError):
+            mgr.initialize_kv_cache(bad_single_cfg)
+
+        # 3. Upstream allocator + UniformTypeKVCacheSpecs
+        uni_spec = UniformTypeKVCacheSpecs(
+            block_size=16,
+            kv_cache_specs={"a.0": full_spec},
+        )
+        up_cfg = KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=4096,
+                    layers=["a.0"],
+                    layer_stride=4096,
+                    block_stride=1024,
+                )
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(layer_names=["a.0"], kv_cache_spec=uni_spec),
+            ],
+        )
+        self.runner.vllm_config.compilation_config.static_forward_context = {
+            "a.0": SimpleNamespace(tpu_native_kv=True)
+        }
+        fake_mat = SimpleNamespace(
+            kv_caches={"a.0": torch.zeros((4, 16, 2, 1, 128))},
+            raw_tensors=[torch.zeros((4, 16), dtype=torch.uint8)],
+            rope_pools="rope_pools",
+            native_raw_cache="raw_cache",
+            native_cache_layouts="layouts",
+        )
+        for impl_val, shard_val in (("v2", True), ("v2", False), ("v1", False)):
+            monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_IMPL", impl_val)
+            monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_KV_SHARD", shard_val)
+            with (
+                patch(
+                    "vllm_torchtpu.models.vllm.deepseek_v41.v2.cache.resolve_worker_owner_layout",
+                    return_value=SimpleNamespace(num_replicated=1, num_blocks=4),
+                ),
+                patch(
+                    "vllm_torchtpu.models.vllm.deepseek_v41.v2.cache.materialize_upstream_kv_cache",
+                    return_value=fake_mat,
+                ),
+                patch.object(mgr.ds_v4, "initialize_v41", return_value=fake_mat),
+                patch("vllm_torchtpu.utils.tpu_bind_kv_cache"),
+                patch(
+                    "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+                    return_value=False,
+                ),
+            ):
+                mgr.initialize_kv_cache(up_cfg)
+
+        # 4. Block-major KV cache unsupported topology checks (lines 1453-1502)
+        monkeypatch.setitem(vars(envs), "VLLM_TPU_BLOCK_MAJOR_KV", True)
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        self.runner.parallel_config = SimpleNamespace(
+            prefill_context_parallel_size=1,
+            pipeline_parallel_size=1,
+            tensor_parallel_size=1,
+        )
+
+        for attr, val, match_str in (
+            ("use_spmd", True, "SPMD"),
+            ("speculative_config", SimpleNamespace(), "speculative decoding"),
+        ):
+            setattr(self.runner, attr, val)
+            with pytest.raises(NotImplementedError, match=match_str):
+                mgr.initialize_kv_cache(up_cfg)
+            setattr(
+                self.runner,
+                attr,
+                False if attr == "use_spmd" else None,
+            )
+
+        from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+
+        self.runner.vllm_config.compilation_config.static_forward_context = {
+            "a.0": MagicMock(spec=DeepseekV4Attention, tpu_native_kv=False)
+        }
+        with pytest.raises(NotImplementedError, match="DSv4 packed KV layout"):
+            mgr.initialize_kv_cache(up_cfg)
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+
+        self.runner.parallel_config.prefill_context_parallel_size = 2
+        with pytest.raises(NotImplementedError, match="prefill context parallelism"):
+            mgr.initialize_kv_cache(up_cfg)
+        self.runner.parallel_config.prefill_context_parallel_size = 1
+
+        self.runner.parallel_config.pipeline_parallel_size = 2
+        with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+            mgr.initialize_kv_cache(up_cfg)
+        self.runner.parallel_config.pipeline_parallel_size = 1
+
+        with (
+            patch.object(self.runner.model_config, "get_head_size", return_value=64),
+            pytest.raises(NotImplementedError, match="head_size=64"),
+        ):
+            mgr.initialize_kv_cache(up_cfg)
+
+        # Heterogeneous attention specs in block-major
+        full_spec_256 = FullAttentionSpec(
+            block_size=16, num_kv_heads=2, head_size=256, dtype=torch.bfloat16
+        )
+        het_cfg = KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=8192,
+                    layers=["a.0", "a.1"],
+                    layer_stride=4096,
+                    block_stride=1024,
+                )
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=["a.0", "a.1"],
+                    kv_cache_spec=UniformTypeKVCacheSpecs(
+                        block_size=16,
+                        kv_cache_specs={"a.0": full_spec, "a.1": full_spec_256},
+                    ),
+                )
+            ],
+        )
+        with pytest.raises(NotImplementedError, match="heterogeneous attention specs"):
+            mgr.initialize_kv_cache(het_cfg)
+
+        # Non-attention layer in kv_cache_tensor under block-major
+        mamba_spec = MambaSpec(
+            block_size=16, shapes=[(4, 128)], dtypes=[torch.bfloat16]
+        )
+        non_attn_spec = MagicMock(spec=KVCacheSpec, block_size=16, page_size_bytes=1024)
+        non_attn_tensor_cfg = KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=8192,
+                    layers=["a.0", "m.0"],
+                    layer_stride=4096,
+                    block_stride=1024,
+                )
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=["a.0", "m.0"],
+                    kv_cache_spec=UniformTypeKVCacheSpecs(
+                        block_size=16,
+                        kv_cache_specs={"a.0": full_spec, "m.0": non_attn_spec},
+                    ),
+                )
+            ],
+        )
+        with pytest.raises(
+            NotImplementedError, match="containing non-attention layers"
+        ):
+            mgr.initialize_kv_cache(non_attn_tensor_cfg)
+
+        # Multiple groups under block-major
+        multi_grp_bm_cfg = KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=8192,
+                    layers=["a.0", "a.1"],
+                    layer_stride=4096,
+                    block_stride=1024,
+                )
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(layer_names=["a.0"], kv_cache_spec=full_spec),
+                KVCacheGroupSpec(layer_names=["a.1"], kv_cache_spec=full_spec),
+            ],
+        )
+        self.runner.input_batch = SimpleNamespace(block_table=[mock_bt, mock_bt])
+        with pytest.raises(NotImplementedError, match="single uniform attention group"):
+            mgr.initialize_kv_cache(multi_grp_bm_cfg)
+
+        # Block-major with eligible PallasAttentionBackendImpl layer (lines 1782-1791)
+        self.runner.input_batch = SimpleNamespace(block_table=[mock_bt])
+        self.runner.mesh = None
+        pallas_impl = MagicMock(spec=PallasAttentionBackendImpl)
+        eligible_attn = SimpleNamespace(impl=pallas_impl)
+        with (
+            patch(
+                "vllm_torchtpu.offload.block_major_layout.block_major_layer_indices",
+                return_value={"a.0": 0},
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
+                return_value={"a.0": eligible_attn},
+            ),
+            patch("vllm_torchtpu.utils.tpu_bind_kv_cache"),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+                return_value=False,
+            ),
+        ):
+            mgr.initialize_kv_cache(up_cfg)
+            pallas_impl.setup_bundled.assert_called_once()
+        monkeypatch.setitem(vars(envs), "VLLM_TPU_BLOCK_MAJOR_KV", False)
+
+        # 5. _is_ds_v4=True in initialize_kv_cache (line 1536)
+        self.runner.vllm_config.compilation_config.static_forward_context = {
+            "a.0": MagicMock(spec=DeepseekV4Attention, tpu_native_kv=False)
+        }
+        with (
+            patch.object(mgr.ds_v4, "_initialize_ds_v4_kv_cache") as mock_dsv4_init,
+            patch("vllm_torchtpu.utils.tpu_bind_kv_cache"),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+                return_value=False,
+            ),
+        ):
+            mgr.initialize_kv_cache(up_cfg)
+            mock_dsv4_init.assert_called_once()
+
+        # 6. Sparse/dense MLAAttentionSpec + SPMD + KV transfer + mamba spec decode
+        mla_spec = MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+            page_size_padded=65536,
+        )
+        sparse_mod = SimpleNamespace(use_sparse=True, tpu_native_kv=False)
+        dense_mod = SimpleNamespace(use_sparse=False, tpu_native_kv=False)
+        self.runner.vllm_config.compilation_config.static_forward_context = {
+            "mla.sparse": sparse_mod,
+            "mla.dense0": dense_mod,
+            "mla.dense1": dense_mod,
+        }
+        mla_cfg = KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=65536 * 4,
+                    layers=["mla.sparse", "mla.dense0"],
+                    layer_stride=0,
+                    block_stride=65536,
+                ),
+                KVCacheTensor(
+                    size=65536 * 4,
+                    layers=["mla.dense1"],
+                    layer_stride=0,
+                    block_stride=65536,
+                ),
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=["mla.sparse", "mla.dense0", "mla.dense1"],
+                    kv_cache_spec=mla_spec,
+                ),
+            ],
+        )
+        fake_sparse_spec = SimpleNamespace(shape=(4, 16, 128), torch_dtype=torch.int32)
+        fake_conn_full = SimpleNamespace(
+            register_kv_caches=MagicMock(),
+            set_host_xfer_buffer_ops=MagicMock(),
+            register_runner=MagicMock(),
+        )
+        with (
+            patch.object(
+                PallasMLAttentionBackend,
+                "get_sparse_kv_cache_specs",
+                return_value=(fake_sparse_spec, fake_sparse_spec),
+            ),
+            patch.object(
+                PallasMLAttentionBackend,
+                "get_kv_cache_shape",
+                return_value=(4, 16, 1, 128),
+            ),
+            patch("vllm_torchtpu.runner.kv_cache_manager.mla_dispatch.admit_layer"),
+            patch("vllm_torchtpu.utils.tpu_bind_kv_cache"),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.get_kv_transfer_group",
+                return_value=fake_conn_full,
+            ),
+        ):
+            mgr.initialize_kv_cache(mla_cfg)
+            fake_conn_full.register_kv_caches.assert_called_once()
+            fake_conn_full.set_host_xfer_buffer_ops.assert_called_once()
+            fake_conn_full.register_runner.assert_called_once()
+
+        # SPMD AttentionSpec + minimal connector + mamba speculative decoding
+        self.runner.use_spmd = True
+        self.runner.speculative_config = SimpleNamespace()
+        self.runner._uniform_mamba_layout = True
+        self.runner.input_batch = SimpleNamespace(block_table=[mock_bt, mock_bt])
+        hybrid_cfg = KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=65536,
+                    layers=["a.0", "m.0"],
+                    layer_stride=32768,
+                    block_stride=8192,
+                )
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(layer_names=["a.0"], kv_cache_spec=full_spec),
+                KVCacheGroupSpec(layer_names=["m.0"], kv_cache_spec=mamba_spec),
+            ],
+        )
+        fake_conn_min = SimpleNamespace(register_kv_caches=MagicMock())
+        with (
+            patch("vllm_torchtpu.utils.tpu_bind_kv_cache"),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.get_kv_transfer_group",
+                return_value=fake_conn_min,
+            ),
+        ):
+            with pytest.raises(
+                NotImplementedError, match="requires the compact mamba slot layout"
+            ):
+                mgr.initialize_kv_cache(hybrid_cfg)
+
+            self.runner._uniform_mamba_layout = False
+            self.runner.enforce_eager = True
+            mgr.initialize_kv_cache(hybrid_cfg)
+            assert self.runner.mamba_slot_read_offsets.shape == (4,)

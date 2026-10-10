@@ -45,7 +45,7 @@ _GDN_TP_AXIS_NAME = "tp"
 
 def _gdn_tp_axis_name(mesh: jax.sharding.Mesh) -> str | None:
     """Return the optional TP axis used by an op-local PCP mesh."""
-    return _GDN_TP_AXIS_NAME if _GDN_TP_AXIS_NAME in tuple(mesh.axis_names) else None
+    return _GDN_TP_AXIS_NAME if _GDN_TP_AXIS_NAME in mesh.axis_names else None
 
 
 def _gdn_pcp_tp_state_axis(pcp_axis: str, tp_axis: str | None) -> str | tuple[str, str]:
@@ -630,7 +630,7 @@ def run_jax_gdn_attention_pcp_tp_prefill(
         )
         valid_mask = full_reorder >= 0
         scatter_indices = jnp.where(valid_mask, full_reorder, full_reorder.size)
-        gather_indices = jnp.where(valid_mask, full_reorder, full_reorder.size)
+        gather_indices = scatter_indices
 
         (input_starts_by_rank, send_sizes_by_rank, output_starts_by_rank) = (
             _derive_pcp_ragged_exchange_descriptors(
@@ -1388,7 +1388,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
         )
         valid_mask = full_reorder >= 0
         scatter_indices = jnp.where(valid_mask, full_reorder, full_reorder.size)
-        gather_indices = jnp.where(valid_mask, full_reorder, full_reorder.size)
+        gather_indices = scatter_indices
 
         (input_starts_by_rank, send_sizes_by_rank, output_starts_by_rank) = (
             _derive_pcp_ragged_exchange_descriptors(
