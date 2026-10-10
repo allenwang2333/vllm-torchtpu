@@ -231,3 +231,92 @@ def test_plan_blocks_only_oversized_experts():
         assert mtp.plan_blocked(6144, 128, 128, *args) is None
         ib, nb, rows = mtp.plan_blocked(6144, 2048, 128, *args)
         assert 2048 % ib == 0 and nb >= 2 and rows % tile_m == 0 and rows >= tile_m
+
+
+GLM_SCALE = 2.5
+
+
+def oracle_glm(c, n_valid=None, scale_shared=False):
+    """GLM-5.2 with the kernel off: routed * routed_scaling_factor + ungated
+    shared expert. scale_shared=True is the wrong placement (scaled sum)."""
+    no_shared = dict(c, w2s=jnp.zeros_like(c["w2s"]))
+    routed = oracle(no_shared, n_valid)  # the gate only multiplies a zero row
+    f = _f64
+    x = f(c["x"])
+
+    def ffn(xx, w1, w2):
+        h = xx @ w1
+        i = w1.shape[1] // 2
+        return (h[:, :i] / (1 + np.exp(-h[:, :i])) * h[:, i:]) @ w2
+
+    shared = ffn(x, f(c["w1s"]) * f(c["s1s"])[None], f(c["w2s"]) * f(c["s2s"])[None])
+    if n_valid is not None:
+        shared[n_valid:] = 0
+    out = GLM_SCALE * routed + (GLM_SCALE if scale_shared else 1.0) * shared
+    return out
+
+
+GLM_CASES = [  # (T, INTER, i_block, chunk_rows, n_valid)
+    (256, 512, 128, 128, None),  # 64-token multiple: sparse combine kernel
+    (200, 512, 256, 128, None),  # XLA combine
+    (512, 256, 128, 128, 300),
+]
+
+
+@pytest.mark.parametrize("T,INTER,i_block,chunk_rows,n_valid", GLM_CASES)
+def test_glm_semantics_ungated_shared_routed_scale(
+    T, INTER, i_block, chunk_rows, n_valid
+):
+    """GLM-5.2 semantics in the blocked mode: no shared-expert gate, routed
+    scale 2.5 on the routed routes only, against the kernel-off composition,
+    with the wrong-placement and gated-shared must-fail controls."""
+    c = make_case(T, 8, 256, INTER, 3, skew=True)
+    y = run_kernel(
+        dict(c, wg=None),
+        n_valid=n_valid,
+        i_block=i_block,
+        chunk_rows=chunk_rows,
+        routed_scale=GLM_SCALE,
+    )
+    y = np.asarray(y.astype(jnp.float32))
+    nv = T if n_valid is None else n_valid
+    assert row_err(y[:nv], oracle_glm(c, n_valid)[:nv]) < 8e-2
+    assert np.all(y[nv:] == 0)
+    assert row_err(y[:nv], oracle_glm(c, n_valid, scale_shared=True)[:nv]) > 8e-2
+    assert row_err(y[:nv], oracle(c, n_valid)[:nv]) > 8e-2  # gated, unscaled
+
+
+def test_glm_semantics_expert_parallel_ranks_sum():
+    """Two EP ranks, ungated shared expert TP-sliced, routed scale 2.5: the
+    per-rank partials sum to the kernel-off layer."""
+    T, E, H, INTER, K, ranks = 512, 8, 256, 512, 3, 2
+    c = make_case(T, E, H, INTER, K, skew=True)
+    e_loc, i_sh = E // ranks, INTER // ranks
+    total = 0
+    for r in range(ranks):
+        ex, sh = slice(r * e_loc, (r + 1) * e_loc), slice(r * i_sh, (r + 1) * i_sh)
+        gate_up = jnp.concatenate(
+            [c["w1s"][:, :INTER][:, sh], c["w1s"][:, INTER:][:, sh]], axis=1
+        )
+        scale_up = jnp.concatenate([c["s1s"][:INTER][sh], c["s1s"][INTER:][sh]])
+        rank_case = dict(
+            c,
+            w1=c["w1"][ex],
+            w2=c["w2"][ex],
+            s1=c["s1"][ex],
+            s2=c["s2"][ex],
+            w1s=gate_up,
+            s1s=scale_up,
+            w2s=c["w2s"][sh],
+            wg=None,
+        )
+        y = run_kernel(
+            rank_case,
+            expert_start=r * e_loc,
+            i_block=128,
+            chunk_rows=128,
+            routed_scale=GLM_SCALE,
+        )
+        total = total + np.asarray(y.astype(jnp.float32))
+    assert row_err(total, oracle_glm(c)) < 8e-2
+    assert row_err(total, oracle_glm(c, scale_shared=True)) > 8e-2
