@@ -1381,3 +1381,54 @@ def test_prepare_dflash_inputs_no_num_reqs_specialization_and_slice_bounds(devic
 
     assert compile_calls["next_tokens"] == 1
     assert compile_calls["seed"] == 1
+
+
+def test_td8236_host_prep_fast_paths(device):
+    proposer = _make_proposer(draft_tp=1)
+    proposer.runner = SimpleNamespace(
+        device=device,
+        num_tokens_paddings=[8, 16, 32],
+        _attn_metadata_builder_ctx=None,
+        build_attention_metadata_for_layers=lambda names, n: {k: "ok" for k in names},
+    )
+
+    # 1. _get_padded_len memoization cache hit and out-of-range fallback
+    assert proposer._get_padded_len(10) == 16
+    assert proposer._draft_paddings_cache[2][10] == 16
+    assert proposer._get_padded_len(10) == 16
+    assert proposer._get_padded_len(64) == 64
+    assert proposer._draft_paddings_cache[2][64] == 64
+
+    # 2. Multi-layer _build_draft_layer_metadata itemgetter fast path + cache hit
+    l0 = SimpleNamespace(
+        self_attn=SimpleNamespace(attn=SimpleNamespace(layer_name="d0"))
+    )
+    l1 = SimpleNamespace(
+        self_attn=SimpleNamespace(attn=SimpleNamespace(layer_name="d1"))
+    )
+    proposer.draft_model = SimpleNamespace(model=SimpleNamespace(layers=[l0, l1]))
+    md = {"t0": "target_md", "d0": "md0", "d1": "md1"}
+    assert proposer._build_draft_layer_metadata(md) == ("md0", "md1")
+    assert proposer._build_draft_layer_metadata(md) == ("md0", "md1")
+
+    # 3. _build_draft_attn_metadata with exact-length seq_lens_cpu tuple (no slice copy)
+    proposer._draft_attn_layer_names = {"d0", "d1"}
+    captured_ctxs = []
+
+    def capture_build(names, padded_num_reqs):
+        captured_ctxs.append(proposer.runner._attn_metadata_builder_ctx)
+        return {"d0": "md0", "d1": "md1"}
+
+    proposer.runner.build_attention_metadata_for_layers = capture_build
+    chunk = _make_chunk(
+        num_reqs=2,
+        start_index=0,
+        device=device,
+        query_start_loc_np=np.array([0, 2, 4], dtype=np.int32),
+        position_ids=torch.zeros(4, dtype=torch.int32, device=device),
+    )
+    chunk.attn_ctx.seq_lens_cpu = (120, 240)
+    proposer._build_draft_attn_metadata(
+        chunk, num_tokens_padded=10, seq_lens=torch.tensor([125, 245], device=device)
+    )
+    assert captured_ctxs[-1].max_active_seq_len == 240 + proposer.block_size

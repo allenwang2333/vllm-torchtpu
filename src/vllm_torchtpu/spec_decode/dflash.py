@@ -4,6 +4,7 @@ from __future__ import annotations
 import bisect
 import contextlib
 import copy
+import operator
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -90,16 +91,17 @@ class DFlashProposer:
         )
 
         self._max_model_len = vllm_config.model_config.max_model_len
-        self.draft_model = None
+        self.draft_model: Any = None
         self._draft_has_moe_cache: bool | None = None
         self._draft_attn_layer_names: set[str] | None = None
         self._draft_layer_names_frozen_cache: (
-            tuple[tuple[int, int], frozenset[str]] | None
+            tuple[set[str], int, frozenset[str]] | None
         ) = None
-        self._draft_group_builders_cache: tuple[Any, tuple[Any, ...]] | None = None
+        self._draft_group_builders_cache: tuple[Any, ...] | None = None
         self._draft_kv_layer_names_cache: (
-            tuple[tuple[int, int, int], tuple[str | None, ...]] | None
+            tuple[Any, Any, int, tuple[str | None, ...]] | None
         ) = None
+        self._draft_kv_layer_getter: Any = None
         self.draft_chunks: list[DraftChunkInputs] | None = None
         self._static_attn_tensors_cache: dict[
             int, tuple[torch.Tensor, torch.Tensor]
@@ -117,8 +119,11 @@ class DFlashProposer:
         # Keyed by the chunk's padded request count; the all-zero
         # `draft_lengths` a chunk without spec metadata routes on.
         self._zero_draft_lengths_cache: dict[int, torch.Tensor] = {}
-        # (runner bucket list it was derived from, draft-forward buckets).
-        self._draft_paddings_cache: tuple[list[int], list[int]] | None = None
+        # (runner bucket list it was derived from, draft-forward buckets,
+        # target_len -> padded_len lookup map).
+        self._draft_paddings_cache: (
+            tuple[list[int], list[int], dict[int, int]] | None
+        ) = None
 
     @property
     def block_size(self) -> int:
@@ -281,51 +286,65 @@ class DFlashProposer:
             if p % verify_rows == 0
         }
         draft = sorted(set(paddings) | {d for d in extra if d >= block})
-        self._draft_paddings_cache = (paddings, draft)
+        self._draft_paddings_cache = (paddings, draft, {})
         return draft
 
     def _get_padded_len(self, target_len: int) -> int:
         paddings = self._draft_tokens_paddings()
+        lookup = self._draft_paddings_cache[2]  # type: ignore[index]
+        res = lookup.get(target_len)
+        if res is not None:
+            return res
         idx = bisect.bisect_left(paddings, target_len)
-        return paddings[idx] if idx < len(paddings) else target_len
+        res = paddings[idx] if idx < len(paddings) else target_len
+        lookup[target_len] = res
+        return res
 
     def _get_frozen_draft_attn_layer_names(self) -> frozenset[str]:
         names = self._draft_attn_layer_names
         assert names is not None, (
             "load_model() must run before draft attention metadata is built"
         )
-        key = (id(names), len(names))
         cached = self._draft_layer_names_frozen_cache
-        if cached is not None and cached[0] == key:
-            return cached[1]
+        if cached is not None and cached[0] is names and cached[1] == len(names):
+            return cached[2]
         frozen = frozenset(names)
         hash(frozen)
-        self._draft_layer_names_frozen_cache = (key, frozen)
+        self._draft_layer_names_frozen_cache = (names, len(names), frozen)
         return frozen
 
     def _get_draft_group_builders(self, attn_groups) -> tuple[Any, ...]:
         frozen_names = self._get_frozen_draft_attn_layer_names()
         g0 = attn_groups[0]
         g_last = attn_groups[-1]
-        key = (
-            id(attn_groups),
-            len(attn_groups),
-            id(g0),
-            len(g0),
-            id(g_last),
-            len(g_last),
-            frozen_names,
-        )
         cached = self._draft_group_builders_cache
-        if cached is not None and cached[0] == key:
-            return cached[1]
+        if (
+            cached is not None
+            and cached[0] is attn_groups
+            and cached[6] is frozen_names
+            and cached[2] is g0
+            and cached[4] is g_last
+            and cached[1] == len(attn_groups)
+            and cached[3] == len(g0)
+            and cached[5] == len(g_last)
+        ):
+            return cached[7]
         builders = tuple(
             group.metadata_builders[0]
             for group_list in attn_groups
             for group in group_list
             if any(name in frozen_names for name in group.layer_names)
         )
-        self._draft_group_builders_cache = (key, builders)
+        self._draft_group_builders_cache = (
+            attn_groups,
+            len(attn_groups),
+            g0,
+            len(g0),
+            g_last,
+            len(g_last),
+            frozen_names,
+            builders,
+        )
         return builders
 
     def _can_reuse_staged_block_tables(
@@ -336,15 +355,11 @@ class DFlashProposer:
     ) -> dict[int, torch.Tensor] | None:
         """Return `chunk_ctx.staged_block_tables` when its draft-group tables
         already match `padded_num_reqs` and `draft_ctx`'s active column bound."""
+        if chunk_ctx is None or chunk_ctx.position_ids_override is not None:
+            return None
         staged_tables = getattr(chunk_ctx, "staged_block_tables", None)
         attn_groups = getattr(self.runner, "attn_groups", None)
-        if (
-            chunk_ctx is None
-            or not staged_tables
-            or chunk_ctx.position_ids_override is not None
-            or not attn_groups
-            or not self._draft_attn_layer_names
-        ):
+        if not staged_tables or not attn_groups or not self._draft_attn_layer_names:
             return None
         builders = self._get_draft_group_builders(attn_groups)
         if not builders:
@@ -397,13 +412,13 @@ class DFlashProposer:
         frozen_layer_names = self._get_frozen_draft_attn_layer_names()
         saved_ctx = runner._attn_metadata_builder_ctx
         draft_ctx = AttentionMetadataBuilderContext(
-            num_reqs=num_reqs,
-            start_index=start_index,
-            use_max_model_len=use_max_model_len,
-            seq_lens=seq_lens,
-            query_start_loc=query_start_loc,
-            request_distribution=request_distribution,
-            position_ids_override=position_ids_override,
+            num_reqs,
+            start_index,
+            use_max_model_len,
+            seq_lens,
+            query_start_loc,
+            request_distribution,
+            position_ids_override,
             seq_lens_cpu=seq_lens_cpu,
             max_active_seq_len=max_active_seq_len,
         )
@@ -445,7 +460,11 @@ class DFlashProposer:
             and chunk_seq_lens_cpu is not None
             and chunk.num_reqs > 0
         ):
-            active = chunk_seq_lens_cpu[: chunk.num_reqs]
+            active = (
+                chunk_seq_lens_cpu
+                if len(chunk_seq_lens_cpu) == chunk.num_reqs
+                else chunk_seq_lens_cpu[: chunk.num_reqs]
+            )
             chunk_max_seq_len = (
                 int(active.max().item())
                 if isinstance(active, torch.Tensor)
@@ -571,24 +590,35 @@ class DFlashProposer:
     def _get_draft_kv_cache_layer_names(self) -> tuple[str | None, ...]:
         """Cached draft KV-cache layer names in layer order."""
         draft_model = self.draft_model
-        if hasattr(draft_model, "get_draft_kv_cache_layer_names"):
-            cache_key = (id(draft_model), 0, -1)
-            cached = self._draft_kv_layer_names_cache
-            if cached is not None and cached[0] == cache_key:
-                return cached[1]
-            names = tuple(draft_model.get_draft_kv_cache_layer_names())
-            self._draft_kv_layer_names_cache = (cache_key, names)
-            return names
-        assert draft_model is not None
-        layers = draft_model.model.layers
-        cache_key = (id(draft_model), id(layers), len(layers))
         cached = self._draft_kv_layer_names_cache
-        if cached is not None and cached[0] == cache_key:
-            return cached[1]
-        names = tuple(
-            getattr(layer.self_attn.attn, "layer_name", None) for layer in layers
-        )
-        self._draft_kv_layer_names_cache = (cache_key, names)
+        if cached is not None and cached[0] is draft_model:
+            layers = cached[1]
+            if layers is None or (
+                draft_model.model.layers is layers and len(layers) == cached[2]
+            ):
+                return cached[3]
+        if hasattr(draft_model, "get_draft_kv_cache_layer_names"):
+            names = tuple(draft_model.get_draft_kv_cache_layer_names())
+            self._draft_kv_layer_names_cache = (draft_model, None, -1, names)
+        else:
+            assert draft_model is not None
+            layers = draft_model.model.layers
+            names = tuple(
+                getattr(layer.self_attn.attn, "layer_name", None) for layer in layers
+            )
+            self._draft_kv_layer_names_cache = (
+                draft_model,
+                layers,
+                len(layers),
+                names,
+            )
+        n_layers = len(names)
+        if n_layers > 1:
+            self._draft_kv_layer_getter = operator.itemgetter(*names)
+        elif n_layers == 1:
+            self._draft_kv_layer_getter = lambda md, k=names[0]: (md[k],)
+        else:
+            self._draft_kv_layer_getter = lambda _md: ()
         return names
 
     def _build_draft_layer_metadata(
@@ -604,18 +634,14 @@ class DFlashProposer:
         the draft's KV through it would corrupt the cache silently instead of
         failing.
         """
-        layer_names = self._get_draft_kv_cache_layer_names()
-        get_md = attn_metadata.get
-        draft_md_list = []
-        for layer_name in layer_names:
-            md = get_md(layer_name) if layer_name else None
-            if md is None:
-                raise RuntimeError(
-                    f"No attention metadata for draft layer {layer_name!r}; "
-                    "the draft layers must own a KV cache group of their own."
-                )
-            draft_md_list.append(md)
-        return tuple(draft_md_list)
+        self._get_draft_kv_cache_layer_names()
+        try:
+            return self._draft_kv_layer_getter(attn_metadata)
+        except KeyError as exc:
+            raise RuntimeError(
+                f"No attention metadata for draft layer {exc.args[0]!r}; "
+                "the draft layers must own a KV cache group of their own."
+            ) from None
 
     def _update_draft_kv_cache_from_target(self, chunk) -> None:
         """

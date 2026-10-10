@@ -99,10 +99,10 @@ SUBSYSTEM_COVERAGE_INVENTORY: dict[str, tuple[int, int, int, str]] = {
     ),
     "spec_decode": (
         7,
-        1685,
-        542,
+        1691,
+        546,
         "TD8.72 / TD8.91 / TD8.129 / TD8.146 / TD8.160 / TD8.195 / TD8.207"
-        " / TD8.213 / TD8.220",
+        " / TD8.213 / TD8.220 / TD8.236",
     ),
     "tools": (3, 319, 102, "TD8.142 / TD8.146 / TD8.160 / TD8.163"),
     "tracing": (4, 138, 52, "TD8.86 / TD8.142 / TD8.146 / TD8.160 / TD8.163"),
