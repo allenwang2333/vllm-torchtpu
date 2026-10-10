@@ -213,6 +213,7 @@ class DeepseekV4MoE(nn.Module):
         run_local_shared = (
             input_is_token_sharded
             and return_token_sharded
+            and hidden_states.shape[0] % 8 == 0
             and self.tp_size > 1
             and getattr(
                 getattr(self.experts, "moe_config", None),

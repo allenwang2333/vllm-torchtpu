@@ -1758,7 +1758,7 @@ class VllmDeepseekV41MLAAttention(
         if return_token_sharded and tp_size > 1:
             if (
                 num_tokens <= 512
-                and num_tokens % tp_size == 0
+                and num_tokens % (8 * tp_size) == 0
                 and "_tp_attn_wo_b_w" in self._buffers
             ):
                 z_a2a = tp_all_to_all(z)
