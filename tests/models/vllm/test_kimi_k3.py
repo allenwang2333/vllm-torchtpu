@@ -52,8 +52,12 @@ def _cpu_model_tests(monkeypatch):
     # nothing for Dynamo to query, so there is nothing to stub either.
     tpu = getattr(torch, "tpu", None)
     if tpu is None:
-        monkeypatch.setattr(current_platform, "uses_host_device_handling", lambda: True)
-        monkeypatch.setattr(current_platform, "check_and_update_config", lambda _: None)
+        monkeypatch.setitem(
+            vars(current_platform), "uses_host_device_handling", lambda: True
+        )
+        monkeypatch.setitem(
+            vars(current_platform), "check_and_update_config", lambda _: None
+        )
         return
     monkeypatch.setattr(tpu, "is_available", lambda: False)
     monkeypatch.setattr(tpu, "current_device", lambda: 0)
@@ -568,7 +572,9 @@ def test_kimi_linear_mla_keeps_its_checkpoint_layout(
     # This unit test does not have a model_config, so skip the platform-level
     # normalization that requires one. The layer still gets a complete
     # VllmConfig, including the compilation config used by RMSNorm.
-    monkeypatch.setattr(current_platform, "check_and_update_config", lambda _: None)
+    monkeypatch.setitem(
+        vars(current_platform), "check_and_update_config", lambda _: None
+    )
     vllm_config = VllmConfig()
     with set_current_vllm_config(vllm_config):
         layer = MultiHeadLatentAttention(
@@ -631,7 +637,9 @@ def test_mla_fuses_output_gate_with_lora_a_projections(
         mla_use_nope=True,
         mla_use_output_gate=True,
     )
-    monkeypatch.setattr(current_platform, "check_and_update_config", lambda _: None)
+    monkeypatch.setitem(
+        vars(current_platform), "check_and_update_config", lambda _: None
+    )
     vllm_config = VllmConfig()
     with set_current_vllm_config(vllm_config):
         layer = MultiHeadLatentAttention(
@@ -701,7 +709,9 @@ def _mla_config(**overrides) -> KimiLinearConfig:
 def test_mla_requires_nope(monkeypatch: pytest.MonkeyPatch) -> None:
     """The TPU MLA layer only implements the NoPE variant. A config that
     asks for the RoPE-inside-MLA variant is rejected up front."""
-    monkeypatch.setattr(current_platform, "check_and_update_config", lambda _: None)
+    monkeypatch.setitem(
+        vars(current_platform), "check_and_update_config", lambda _: None
+    )
     config = _mla_config(mla_use_nope=False)
     with pytest.raises(ValueError, match="NoPE MLA only"):
         MultiHeadLatentAttention(config, VllmConfig(), prefix="a")
@@ -711,7 +721,9 @@ def test_mla_rejects_incomplete_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """All four MLA head dimensions must be set. Leaving one as `None`
     produces an error that lists every field, so the user can see which
     one is missing."""
-    monkeypatch.setattr(current_platform, "check_and_update_config", lambda _: None)
+    monkeypatch.setitem(
+        vars(current_platform), "check_and_update_config", lambda _: None
+    )
     config = _mla_config(kv_lora_rank=None)
     with pytest.raises(ValueError, match="Incomplete Kimi K3 MLA config"):
         MultiHeadLatentAttention(config, VllmConfig(), prefix="b")
@@ -720,7 +732,9 @@ def test_mla_rejects_incomplete_config(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_mla_rejects_heads_not_divisible_by_tp(monkeypatch: pytest.MonkeyPatch) -> None:
     """Attention heads are split evenly across tensor-parallel ranks, so
     4 heads cannot be spread over 3 ranks."""
-    monkeypatch.setattr(current_platform, "check_and_update_config", lambda _: None)
+    monkeypatch.setitem(
+        vars(current_platform), "check_and_update_config", lambda _: None
+    )
     monkeypatch.setattr(
         kimi_attention, "get_tensor_model_parallel_world_size", lambda: 3
     )
