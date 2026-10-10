@@ -254,7 +254,7 @@ class DeepseekV4MoE(nn.Module):
             else x_local.shape[0]
         )
         router_logits = hidden_states
-        defer_shared_to_rs = run_local_shared and num_tokens_global > 2048
+        defer_shared_to_rs = run_local_shared
         routed = getattr(self.experts, "routed_experts", None)
         qm = getattr(routed, "quant_method", None)
         use_fp8_tp_dispatch = (
