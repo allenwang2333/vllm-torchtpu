@@ -519,15 +519,22 @@ class TestFusedSwaHelpers:
         assert jnp.array_equal(kv[0, :2], natural)
         assert not jnp.array_equal(split_halves(natural), natural)
 
-    def test_fused_swa_inputs_two_banks_and_wide_window(self):
+    @pytest.mark.parametrize("tokens", [50, 96, 144])
+    def test_fused_swa_inputs_two_banks_and_wide_window(self, tokens):
         dim = 256
         pool = jnp.arange(32 * 128, dtype=jnp.int32).reshape(32, 128)
         banks = (pool[:16], pool[16:])
-        records = jnp.full((50, 200), 20, jnp.int32)
-        kv, bias = attention_kernels.fused_swa_inputs(banks, records, dim)
-        assert kv.shape == (50, 256, dim)
-        assert bias.shape == (50, 2, 128)
-        flat = bias.reshape(50, 256)
+        records = jnp.full((tokens, 200), 20, jnp.int32)
+        with mock.patch.object(
+            attention_kernels,
+            "gather_cache_values",
+            wraps=attention_kernels.gather_cache_values,
+        ) as spy_gather:
+            kv, bias = attention_kernels.fused_swa_inputs(banks, records, dim)
+        assert spy_gather.call_args.args[1].shape == (tokens * 200,)
+        assert kv.shape == (tokens, 256, dim)
+        assert bias.shape == (tokens, 2, 128)
+        flat = bias.reshape(tokens, 256)
         assert jnp.all(flat[:, :200] == 0)
         assert jnp.all(flat[:, 200:] == jnp.finfo(jnp.float32).min)
         assert jnp.all(kv[:, 200:] == 0)
