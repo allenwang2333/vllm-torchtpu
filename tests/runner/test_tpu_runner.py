@@ -2814,6 +2814,7 @@ def test_prepare_inputs_single_req_fast_path_matches_general_path(
 
         return SimpleNamespace(
             reorder_batch_threshold=1,
+            _replay_starts={},
             sequence_layout_planner=AllSequenceLayoutPlanner(),
             _dp_target_bucket=None,
             input_batch=SimpleNamespace(
