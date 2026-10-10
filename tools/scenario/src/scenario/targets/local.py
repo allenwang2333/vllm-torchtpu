@@ -19,6 +19,7 @@ reserves no env and has no after-tasks, so a local run uploads nothing
 """
 
 import dataclasses
+import os
 import pathlib
 import subprocess
 from collections.abc import Mapping
@@ -59,3 +60,8 @@ class LocalTarget:
         if resolved is not None:
             options = dataclasses.replace(options, resolved=resolved)
         return driver.run(plan, options)
+
+
+def make_target(repo_root: pathlib.Path) -> LocalTarget:
+    """The local target as `--target local` names it: this host, this env."""
+    return LocalTarget(driver.RunOptions(env=dict(os.environ), repo_root=repo_root))
