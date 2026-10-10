@@ -174,7 +174,14 @@ class Glm5MKD:
             H=hf.hidden_size, NH=hf.num_attention_heads, QL=hf.q_lora_rank,
             idx_freq=hf.index_topk_freq, idx_skip=hf.index_skip_topk_offset,
             rope_theta=float(rp.get("rope_theta", FULL.rope_theta)), eps=hf.rms_norm_eps,
-            routed_scale=float(hf.routed_scaling_factor), QMAX=qmax)
+            routed_scale=float(hf.routed_scaling_factor), QMAX=qmax,
+            RPR=int(os.environ.get("GLM5_MKD_RPR", "1")))
+        # GLM5_MKD_RPR: rows per rank -> TMAX = R * RPR rows a step (MTP 3: conc 4 / 8 / 16 at RPR 1 / 2 / 4).
+        # VMEM fit per RPR at R=16, L=78 (AOT): ring banks 11 / 9 / 4, chunked key AG at RPR 4.
+        _need(cfg.RPR in (1, 2, 4), f"GLM5_MKD_RPR={cfg.RPR}")
+        nbank, kch = {1: (11, 0), 2: (9, 0), 4: (4, 8)}[cfg.RPR]
+        self.tiles = K.Tiles(nbank=int(os.environ.get("GLM5_MKD_NBANK", nbank)),
+                             kch=int(os.environ.get("GLM5_MKD_KCH", kch)))
         for got, want, what in (
                 (hf.kv_lora_rank, cfg.KL, "kv_lora_rank"), (hf.qk_nope_head_dim, cfg.DN, "qk_nope"),
                 (hf.qk_rope_head_dim, cfg.DR, "qk_rope"), (hf.v_head_dim, cfg.DV, "v_head_dim"),
@@ -398,7 +405,8 @@ class Glm5MKD:
         # GLM5_MKD_DEBUG=1: also return the per-layer owner rows (dbg_h) and owned winner lists
         # (dbg_own) per rank -> self.last_dbg (parity diagnostics only)
         self.debug = os.environ.get("GLM5_MKD_DEBUG", "0") == "1"
-        call, info = K.build(cfg, axis_name=AXIS, debug=self.debug, dbg_part=False, **build_kw)
+        call, info = K.build(cfg, axis_name=AXIS, debug=self.debug, dbg_part=False, tiles=self.tiles,
+                             **build_kw)
         writer, winfo = K.build_writer(cfg, axis_name=AXIS, nb=self.nb, max_pages=self.max_pages,
                                        bmax=cfg.TMAX, stack_c=build_kw["stack_c"])
         assert list(info["w_names"]) == self.w_names, "weight operand order"
