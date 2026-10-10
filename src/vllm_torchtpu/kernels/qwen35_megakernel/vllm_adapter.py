@@ -25,6 +25,9 @@ Pallas megakernel (`megakernel.py` + `pool_io.py`):
   diagnostic table) and per-expert `es` scales.
 - Sub-bucket compilation (`VLLM_TPU_QWEN35_MK_BUCKETS`, default `"8,16,32"`)
   over `sharded_jax_callable` with in-place donated raw pool updates.
+- Fused pool I/O (`VLLM_TPU_QWEN35_MK_FUSED_POOL_IO`, default on): the kernel
+  gathers / scatters the GDN and KV states in `raw[0..14]` itself (one custom
+  call per step instead of gather -> kernel -> scatter).
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import jax
+import numpy as np
 import jax.numpy as jnp
 import torch
 import torch.nn.functional as F
@@ -53,9 +57,31 @@ from . import pool_io
 logger = init_logger(__name__)
 
 _DEFAULT_BUCKETS = (8, 16, 32)
-# MTP=3 verify rows (4 per sequence). Above 8 sequences the stock path was at
-# or past parity in the per-bucket A/B, so larger batches stay on stock.
-_DEFAULT_VERIFY_BUCKETS = (4, 8, 12, 16, 20, 24, 32)
+# MTP=3 verify rows (4 per sequence). Up to v15.3 batches above 8 sequences
+# stayed on stock (the per-bucket A/B had the 3-stage pool I/O at or past
+# parity there). With fused pool I/O the 40- and 48-row buckets (9..12
+# sequences) fit VMEM (53.3 / 55.7 MiB of 62) and replace ~13.5 ms stock
+# steps; `VLLM_TPU_QWEN35_MK_VERIFY_48=0` restores the v15.3 bucket list.
+_DEFAULT_VERIFY_BUCKETS_32 = (4, 8, 12, 16, 20, 24, 32)
+_DEFAULT_VERIFY_BUCKETS_48 = (4, 8, 12, 16, 20, 24, 32, 40, 48)
+# 56- and 64-row buckets (13..16 sequences at K=3): fits within the 62 MiB v7x
+# VMEM ceiling at nbd=7 (~59.3 / 61.5 MiB) so pure decode up to 16 concurrent
+# sequences stays on the megakernel instead of falling back to stock_t4.
+# `VLLM_TPU_QWEN35_MK_VERIFY_64=0` restores the 48-row list.
+_DEFAULT_VERIFY_BUCKETS_64 = (4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64)
+
+
+def _env_off(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("0", "false", "no", "off")
+
+
+_DEFAULT_VERIFY_BUCKETS = (
+    _DEFAULT_VERIFY_BUCKETS_32
+    if _env_off("VLLM_TPU_QWEN35_MK_VERIFY_48")
+    else _DEFAULT_VERIFY_BUCKETS_48
+    if _env_off("VLLM_TPU_QWEN35_MK_VERIFY_64")
+    else _DEFAULT_VERIFY_BUCKETS_64
+)
 
 
 def _need(cond: bool, msg: str) -> None:
@@ -194,6 +220,96 @@ def select_bucket(num_tokens: int, buckets: Sequence[int] = _DEFAULT_BUCKETS) ->
     raise ValueError(f"num_tokens={num_tokens} exceeds max bucket in {buckets}")
 
 
+def _env_flag(name: str, default: str, env_val: str | None = None) -> bool:
+    raw = env_val if env_val is not None else os.environ.get(name, default)
+    return raw.strip().lower() not in ("0", "false", "no", "off", "none")
+
+
+def parse_mk_fused_pool_io(env_val: str | None = None) -> bool:
+    """`VLLM_TPU_QWEN35_MK_FUSED_POOL_IO` (default on): gather / scatter the GDN
+    and KV states inside the megakernel instead of the 3-stage
+    `gather_gdn_states` -> kernel -> `scatter_pool_states` pipeline."""
+    return _env_flag("VLLM_TPU_QWEN35_MK_FUSED_POOL_IO", "1", env_val)
+
+
+def parse_mk_fused_pool_io_max_b(env_val: str | None = None) -> int:
+    """`VLLM_TPU_QWEN35_MK_FUSED_POOL_IO_MAX_B` (default 24): largest bucket built
+    with fused pool I/O; larger buckets keep the 3-stage pipeline. On v7x-8
+    (L=60, T=4, seq_len=32768, with route_vec + dense_acc_pair) fused pool I/O
+    is -121/-167/-364/-332/-417/-523 us at B=4..24 but +100 us at B=32 and
+    +75 us at B=40 against the 3-stage pipeline."""
+    raw = (
+        env_val
+        if env_val is not None
+        else os.environ.get("VLLM_TPU_QWEN35_MK_FUSED_POOL_IO_MAX_B", "24")
+    )
+    return int(raw.strip())
+
+
+def parse_mk_fused_pool_io_min_b_hi(env_val: str | None = None) -> int:
+    """`VLLM_TPU_QWEN35_MK_FUSED_POOL_IO_MIN_B_HI` (default 56): buckets at or
+    above this row count are also built with fused pool I/O (0 = off). The
+    3-stage pipeline's XLA temp (gathered input states plus per-token output
+    states of 45 GatedDeltaNet layers) is 848 / 969 MiB of HBM per device at
+    B=56 / 64 against ~1 MiB fused. On v7x (L=60, T=4, ~98.6k-token
+    sequences, random routing) fused is bit-exact there and +0.14 / +0.06 ms."""
+    raw = (
+        env_val
+        if env_val is not None
+        else os.environ.get("VLLM_TPU_QWEN35_MK_FUSED_POOL_IO_MIN_B_HI", "56")
+    )
+    return int(raw.strip())
+
+
+def parse_mk_zero_copy(env_val: str | None = None) -> bool:
+    """`VLLM_TPU_QWEN35_MK_ZERO_COPY` (default off): rebind the pool tensors to
+    the donated step outputs (`dst.set_(src)`) instead of copying them back
+    (`dst.copy_(src)`). Saves the 15-pool HBM copy per step, but aliases the
+    pool storage under any connector views of the pools (re-synced best effort
+    in `_sync_raiden_pool_storages`); kept off until that path is gated."""
+    return _env_flag("VLLM_TPU_QWEN35_MK_ZERO_COPY", "0", env_val)
+
+
+# Per-flag kernel switches for bisecting the v16 megakernel defaults without a
+# code change. Unset = keep `megakernel.default_tiles(c)`.
+_MK_TILE_ENV_BOOL = {
+    "VLLM_TPU_QWEN35_MK_ROUTE_VEC": "route_vec",
+    "VLLM_TPU_QWEN35_MK_DENSE_ACC": "dense_acc_pair",
+    "VLLM_TPU_QWEN35_MK_R2_DIRECT": "r2_direct_store",
+}
+_MK_TILE_ENV_INT = {
+    "VLLM_TPU_QWEN35_MK_AMASK": "amask",
+    "VLLM_TPU_QWEN35_MK_ECOPY_OPT": "ecopy_opt",
+}
+
+
+def apply_mk_tile_env_overrides(tiles: K.Tiles, bucket_t: int) -> K.Tiles:
+    """Apply `VLLM_TPU_QWEN35_MK_{ROUTE_VEC,DENSE_ACC,R2_DIRECT}` (0/1),
+    `VLLM_TPU_QWEN35_MK_{AMASK,ECOPY_OPT}` (int) and
+    `VLLM_TPU_QWEN35_MK_NBE_SMALL` (expert ring slots for B <= 8; `12` restores
+    the v15.3 ring + PIPE_EP there) on top of `tiles`."""
+    overrides: dict[str, Any] = {}
+    for env_name, field in _MK_TILE_ENV_BOOL.items():
+        raw = os.environ.get(env_name)
+        if raw is not None and raw.strip() != "":
+            overrides[field] = _env_flag(env_name, "0", raw)
+    for env_name, field in _MK_TILE_ENV_INT.items():
+        raw = os.environ.get(env_name)
+        if raw is not None and raw.strip() != "":
+            overrides[field] = int(raw.strip())
+    raw = os.environ.get("VLLM_TPU_QWEN35_MK_NBE_SMALL")
+    if raw is not None and raw.strip() != "" and bucket_t <= 8:
+        overrides["nbe"] = int(raw.strip())
+    if overrides:
+        tiles = dataclasses.replace(tiles, **overrides)
+    return tiles
+
+
+# ---------------------------------------------------------------------------
+# Weight Extraction & Packing Helpers
+# ---------------------------------------------------------------------------
+
+
 def parse_mk_ab_enabled(env_val: str | None = None) -> bool:
     """Return True if per-bucket MK vs stock A/B latency calibration is enabled."""
     raw = (
@@ -206,17 +322,6 @@ def parse_mk_ab_enabled(env_val: str | None = None) -> bool:
     return os.path.exists(
         os.path.join(os.path.dirname(__file__), ".mk_ab_enabled")
     )
-
-
-def parse_mk_fused_pool_io(env_val: str | None = None) -> bool:
-    """Return True if fused P1+P2 pool I/O inside the megakernel is enabled (default True)."""
-    raw = (
-        env_val
-        if env_val is not None
-        else os.environ.get("VLLM_TPU_QWEN35_MK_FUSED_POOL_IO", "1")
-    )
-    return raw.strip().lower() not in ("0", "false", "no", "off", "none")
-
 
 
 def _percentile(sorted_vals: list[float], q: float) -> float:
@@ -1584,6 +1689,7 @@ class Qwen35Megakernel:
         verify_buckets: Sequence[int] = (),
         mesh: jax.sharding.Mesh | None = None,
         fused_pool_io: bool | None = None,
+        zero_copy: bool | None = None,
     ) -> None:
         _need(mode in ("ep", "tp"), f"unsupported VLLM_TPU_QWEN35_MK_MODE={mode!r}")
         self.mode = mode
@@ -1592,11 +1698,14 @@ class Qwen35Megakernel:
         self.max_bucket = max(self.buckets) if self.buckets else 0
         self.max_verify_bucket = max(self.verify_buckets) if self.verify_buckets else 0
         self.fused_pool_io = (
-            parse_mk_fused_pool_io()
-            if fused_pool_io is None
-            else bool(fused_pool_io)
+            parse_mk_fused_pool_io() if fused_pool_io is None else bool(fused_pool_io)
         )
+        self.fused_pool_io_max_b = parse_mk_fused_pool_io_max_b()
+        self.fused_pool_io_min_b_hi = parse_mk_fused_pool_io_min_b_hi()
         self._hlo_checked = False
+        self.zero_copy = parse_mk_zero_copy() if zero_copy is None else bool(zero_copy)
+        self._runner_ref: Any = runner
+        self._raiden_sync_views: list[tuple[int, torch.Tensor, tuple[int, ...]]] = []
         self.backbone = _find_backbone(runner.model)
         self.embed_tokens = self.backbone.embed_tokens
 
@@ -1695,6 +1804,8 @@ class Qwen35Megakernel:
         self._bucket_steps: dict[Any, Any] = {}
         self._bucket_out_rows: dict[tuple[int, int], int] = {}
         self._bucket_ops: dict[Any, Any] = {}
+        self._bucket_fused: dict[tuple[int, int], bool] = {}
+        self._prep_steps: dict[Any, Any] = {}
         self._bound = False
         self._zero_roff_1d: torch.Tensor | None = None
         self._ckpt_window: int = 1
@@ -1712,12 +1823,16 @@ class Qwen35Megakernel:
 
         logger.info(
             "Qwen3.5 megakernel initialized: mode=%s, e_slots=%d, decode_buckets=%s, "
-            "verify_buckets=%s, fused_pool_io=%s, ab_enabled=%s, %d weight tensors (tp_rank=%d/%d)",
+            "verify_buckets=%s, fused_pool_io=%s (B<=%d or B>=%d), zero_copy=%s, ab_enabled=%s, "
+            "%d weight tensors (tp_rank=%d/%d)",
             self.mode,
             self.base_cfg.EW,
             self.buckets,
             self.verify_buckets,
             self.fused_pool_io,
+            self.fused_pool_io_max_b,
+            self.fused_pool_io_min_b_hi,
+            self.zero_copy,
             self.ab_enabled,
             len(self.w_flat),
             self.tp_rank,
@@ -1801,14 +1916,8 @@ class Qwen35Megakernel:
             int(x) for x in getattr(runner, "num_tokens_paddings", ())
         )
 
-        def _runner_out_rows(b: int, m_rows: int) -> int:
-            # The runner pads a b-row step to its first token bucket >= b and
-            # takes back exactly that many hidden rows, which may be fewer
-            # than the kernel's 16-row-aligned m_rows (e.g. 24 vs 32).
-            for p in runner_token_paddings:
-                if p >= b:
-                    return p
-            return m_rows
+        if self.zero_copy:
+            self._discover_raiden_sync_views(runner)
 
         self._runner_token_paddings = runner_token_paddings
         self._build_all_buckets()
@@ -1816,7 +1925,8 @@ class Qwen35Megakernel:
         self._bound = True
         logger.info(
             "Qwen3.5 megakernel bound to %d unified pools (num_pages=%d, "
-            "page_size=%d, max_pages_per_seq=%d, decode_buckets=%s, verify_buckets=%s, fused_pool_io=%s)",
+            "page_size=%d, max_pages_per_seq=%d, decode_buckets=%s, verify_buckets=%s, "
+            "fused_pool_io=%s (B<=%d or B>=%d), zero_copy=%s)",
             len(self.raw_pools),
             self.num_pages,
             self.page_size,
@@ -1824,6 +1934,9 @@ class Qwen35Megakernel:
             self.buckets,
             self.verify_buckets,
             self.fused_pool_io,
+            self.fused_pool_io_max_b,
+            self.fused_pool_io_min_b_hi,
+            self.zero_copy,
         )
 
     def _runner_out_rows(self, b: int, m_rows: int) -> int:
@@ -1835,26 +1948,30 @@ class Qwen35Megakernel:
                 return p
         return m_rows
 
-    def _build_all_buckets(self) -> None:
-        self._bucket_steps.clear()
-        self._bucket_ops.clear()
-        self._bucket_out_rows.clear()
-        for b in self.buckets:
+    def _build_all_buckets(self, only_fused: bool = False) -> None:
+        """Build the decode `(1, B)` and MTP-verify `(4, B)` bucket steps.
+
+        `only_fused` (after a fused pool I/O fallback): rebuild only the
+        buckets that were built with fused pool I/O; the 3-stage buckets keep
+        their steps and their (unchanged) `_3stage` op names.
+        """
+        keys = [(1, b) for b in self.buckets] + [(4, b) for b in self.verify_buckets]
+        if only_fused:
+            keys = [k for k in keys if self._bucket_fused.get(k, False)]
+        else:
+            self._bucket_steps.clear()
+            self._bucket_ops.clear()
+            self._bucket_out_rows.clear()
+            self._bucket_fused.clear()
+            self._prep_steps.clear()
+        for T, b in keys:
             m_rows = max(16, K.rup(b, 16))
             out_rows = self._runner_out_rows(b, m_rows)
-            step_1 = self._build_bucket_op(
-                b, tokens_per_seq=1, out_pad_rows=out_rows
-            )
-            self._bucket_steps[(1, b)] = step_1
-            self._bucket_steps[b] = step_1
-            self._bucket_out_rows[(1, b)] = out_rows
-        for b in self.verify_buckets:
-            m_rows = max(16, K.rup(b, 16))
-            out_rows = self._runner_out_rows(b, m_rows)
-            self._bucket_steps[(4, b)] = self._build_bucket_op(
-                b, tokens_per_seq=4, out_pad_rows=out_rows
-            )
-            self._bucket_out_rows[(4, b)] = out_rows
+            step = self._build_bucket_op(b, tokens_per_seq=T, out_pad_rows=out_rows)
+            self._bucket_steps[(T, b)] = step
+            if T == 1:
+                self._bucket_steps[b] = step
+            self._bucket_out_rows[(T, b)] = out_rows
 
     def _verify_fused_pool_hlo(
         self,
@@ -1920,6 +2037,67 @@ class Qwen35Megakernel:
         except Exception as exc:  # noqa: BLE001
             return False, f"HLO check exception: {exc}"
 
+    def _discover_raiden_sync_views(self, runner: Any = None) -> None:
+        """Zero-copy only: find connector tensors aliasing `raw_pools` so that
+        `dst.set_(src)` rebinds them too (`_sync_raiden_pool_storages`)."""
+        r_obj = runner if runner is not None else self._runner_ref
+        if r_obj is None or not self.raw_pools:
+            return
+        ptr_to_idx: dict[int, int] = {}
+        for idx, p in enumerate(self.raw_pools):
+            try:
+                ptr_to_idx[int(p.untyped_storage().data_ptr())] = idx
+            except Exception:  # noqa: BLE001
+                pass
+        if not ptr_to_idx:
+            return
+        views: list[tuple[int, torch.Tensor, tuple[int, ...]]] = []
+        seen_ids: set[int] = {id(p) for p in self.raw_pools}
+
+        def _check_tensor(t: Any) -> None:
+            if not isinstance(t, torch.Tensor) or id(t) in seen_ids:
+                return
+            try:
+                p_idx = ptr_to_idx.get(int(t.untyped_storage().data_ptr()))
+            except Exception:  # noqa: BLE001
+                p_idx = None
+            if p_idx is not None:
+                seen_ids.add(id(t))
+                views.append((p_idx, t, tuple(int(d) for d in t.shape)))
+
+        for attr in ("kv_connector", "_kv_connector"):
+            conn = getattr(r_obj, attr, None)
+            if conn is None:
+                continue
+            for v in getattr(conn, "_pool_sync_tensors", ()) or ():
+                _check_tensor(v)
+            cw = getattr(conn, "connector_worker", None)
+            mgr = getattr(cw, "worker", None) if cw is not None else None
+            for grp in getattr(mgr, "_device_tensors", ()) or ():
+                if isinstance(grp, (list, tuple)):
+                    for v in grp:
+                        _check_tensor(v)
+                else:
+                    _check_tensor(grp)
+        self._raiden_sync_views = views
+        if views:
+            logger.info(
+                "Qwen3.5 megakernel: zero_copy re-syncs %d connector views of the pools",
+                len(views),
+            )
+
+    def _sync_raiden_pool_storages(self, pools: Sequence[torch.Tensor]) -> None:
+        """Rebind connector views to each pool's current storage after `dst.set_(src)`."""
+        for pool_idx, view_t, view_shape in self._raiden_sync_views:
+            st = pools[pool_idx].untyped_storage()
+            if view_t.untyped_storage().data_ptr() != st.data_ptr():
+                view_t.set_(st, 0, view_shape)
+
+    def _bucket_is_fused(self, bucket_t: int) -> bool:
+        """Fused pool I/O for B <= FUSED_POOL_IO_MAX_B and B >= FUSED_POOL_IO_MIN_B_HI."""
+        hi = self.fused_pool_io_min_b_hi
+        return bucket_t <= self.fused_pool_io_max_b or (hi > 0 and bucket_t >= hi)
+
     def _build_bucket_op(
         self,
         bucket_t: int,
@@ -1927,14 +2105,29 @@ class Qwen35Megakernel:
         out_pad_rows: int | None = None,
     ) -> Any:
         """Build the `sharded_jax_callable` custom op and fused `torch.compile` step for `(tokens_per_seq, bucket_t)`."""
-        bucket_fused = bool(self.fused_pool_io and bucket_t <= 32)
+        bucket_fused = bool(
+            self.fused_pool_io and self._bucket_is_fused(bucket_t)
+        )
         c = dataclasses.replace(
-            self.base_cfg,
-            B=bucket_t,
-            T=tokens_per_seq,
-            fused_pool_io=bucket_fused,
+            self.base_cfg, B=bucket_t, T=tokens_per_seq, fused_pool_io=bucket_fused
         )
         tiles = K.default_tiles(c)
+        tiles = apply_mk_tile_env_overrides(tiles, bucket_t)
+        logger.info(
+            "Qwen3.5 megakernel: building bucket (T=%d, B=%d) pool_io=%s nbe=%d nbd=%d "
+            "hier=%d amask=%d ecopy_opt=%d r2_direct=%s route_vec=%s dense_acc_pair=%s",
+            tokens_per_seq,
+            bucket_t,
+            "fused" if bucket_fused else "3stage",
+            tiles.nbe,
+            tiles.nbd,
+            tiles.hier,
+            tiles.amask,
+            tiles.ecopy_opt,
+            tiles.r2_direct_store,
+            tiles.route_vec,
+            tiles.dense_acc_pair,
+        )
 
         if hasattr(pool_io, "make_flat_pooled_step"):
             step_fn, in_specs, out_specs, donate_argnums = (
@@ -1957,6 +2150,7 @@ class Qwen35Megakernel:
                     self.base_cfg = dataclasses.replace(
                         self.base_cfg, fused_pool_io=False
                     )
+                    bucket_fused = False
                     c = dataclasses.replace(c, fused_pool_io=False)
                     step_fn, in_specs, out_specs, donate_argnums = (
                         pool_io.make_flat_pooled_step(
@@ -1979,12 +2173,15 @@ class Qwen35Megakernel:
                 in_specs = (P("tp"),) * (2 + n_w + n_p + 3)
                 out_specs = (P("tp"),) * (1 + n_p)
                 donate_argnums = tuple(range(2 + n_w, 2 + n_w + n_p))
+        self._bucket_fused[(tokens_per_seq, bucket_t)] = bucket_fused
 
         n_p = len(self.raw_pools)
         n_in = len(in_specs)
         args = [f"x{i}" for i in range(n_in)]
         ret = "tuple[" + ", ".join(["jax.Array"] * len(out_specs)) + "]"
-        io_tag = "" if self.fused_pool_io else "_3stage"
+        # Distinct op / trace names per pool-I/O mode so the two kernels never
+        # share a compilation-cache key.
+        io_tag = "" if bucket_fused else "_3stage"
         fn_name = f"qwen35_mk_step_t{tokens_per_seq}_b{bucket_t}_{self.mode}{io_tag}"
         src = (
             f"def {fn_name}({', '.join(a + ': jax.Array' for a in args)}) -> {ret}:\n"
@@ -2051,7 +2248,7 @@ class Qwen35Megakernel:
         m_rows = c.M
         target_out_rows = int(out_pad_rows or m_rows)
 
-        def step(
+        def prep_only(
             input_ids: torch.Tensor,
             positions: torch.Tensor,
             block_tables: torch.Tensor,
@@ -2062,9 +2259,9 @@ class Qwen35Megakernel:
             s2: torch.Tensor,
             c2: torch.Tensor,
             roff: torch.Tensor,
-            weights: list[torch.Tensor],
-            pools: list[torch.Tensor],
-        ) -> torch.Tensor:
+        ) -> tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+        ]:
             bt = block_tables
             if bt.ndim == 1:
                 if bt.numel() % max_pages == 0:
@@ -2134,6 +2331,77 @@ class Qwen35Megakernel:
             h0 = self.embed_tokens(ids_b)
             if h0.shape[0] < m_rows:
                 h0 = F.pad(h0, (0, 0, 0, m_rows - h0.shape[0]))
+            return pos_b, h0, pt_b, ckpt_b, roff_b
+
+        def _fit_out_rows(h_out: torch.Tensor) -> torch.Tensor:
+            if h_out.shape[0] > target_out_rows:
+                # clone(): an output aliasing an intermediate is regenerated as
+                # a view outside the compiled program.
+                return h_out[:target_out_rows].clone()
+            if h_out.shape[0] < target_out_rows:
+                return F.pad(h_out, (0, 0, 0, target_out_rows - h_out.shape[0]))
+            return h_out
+
+        if self.zero_copy:
+            # `dst.set_(src)` cannot live inside the compiled graph: compile the
+            # input preparation alone and rebind the pools eagerly around the
+            # sharded callable (the donated pool inputs come back as outputs).
+            prep_only.__code__ = prep_only.__code__.replace(
+                co_name=f"prep_t{tokens_per_seq}_b{bucket_t}"
+            )
+            compiled_prep = torch.compile(
+                prep_only, backend="tpu", fullgraph=True, dynamic=False
+            )
+            self._prep_steps[(T, B)] = compiled_prep
+            if T == 1:
+                self._prep_steps[B] = compiled_prep
+
+            def zero_copy_step(
+                input_ids: torch.Tensor,
+                positions: torch.Tensor,
+                block_tables: torch.Tensor,
+                s0: torch.Tensor,
+                c0: torch.Tensor,
+                s1: torch.Tensor,
+                c1: torch.Tensor,
+                s2: torch.Tensor,
+                c2: torch.Tensor,
+                roff: torch.Tensor,
+                weights: list[torch.Tensor],
+                pools: list[torch.Tensor],
+            ) -> torch.Tensor:
+                prep_fn = self._prep_steps[(T, B)]
+                pos_b, h0, pt_b, ckpt_b, roff_b = prep_fn(
+                    input_ids, positions, block_tables, s0, c0, s1, c1, s2, c2, roff
+                )
+                outs = flat_callable(
+                    pos_b, h0, *weights, *pools, pt_b, ckpt_b, roff_b
+                )
+                for dst, src in zip(pools, outs[1 : 1 + n_p]):
+                    dst.set_(src)
+                if self._raiden_sync_views:
+                    self._sync_raiden_pool_storages(pools)
+                return _fit_out_rows(outs[0])
+
+            return zero_copy_step
+
+        def step(
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            block_tables: torch.Tensor,
+            s0: torch.Tensor,
+            c0: torch.Tensor,
+            s1: torch.Tensor,
+            c1: torch.Tensor,
+            s2: torch.Tensor,
+            c2: torch.Tensor,
+            roff: torch.Tensor,
+            weights: list[torch.Tensor],
+            pools: list[torch.Tensor],
+        ) -> torch.Tensor:
+            pos_b, h0, pt_b, ckpt_b, roff_b = prep_only(
+                input_ids, positions, block_tables, s0, c0, s1, c1, s2, c2, roff
+            )
             outs = op(
                 pos_b,
                 h0,
@@ -2145,15 +2413,9 @@ class Qwen35Megakernel:
             )
             for dst, src in zip(pools, outs[1 : 1 + n_p]):
                 dst.copy_(src)
-            h_out = outs[0]
-            if h_out.shape[0] > target_out_rows:
-                # clone(): an output aliasing an intermediate is regenerated as
-                # a view outside the compiled program.
-                h_out = h_out[:target_out_rows].clone()
-            elif h_out.shape[0] < target_out_rows:
-                h_out = F.pad(h_out, (0, 0, 0, target_out_rows - h_out.shape[0]))
-            return h_out
+            return _fit_out_rows(outs[0])
 
+        step.__code__ = step.__code__.replace(co_name=f"step_t{tokens_per_seq}_b{bucket_t}")
         return torch.compile(step, backend="tpu", fullgraph=True, dynamic=False)
 
     def reset_stats(self) -> None:
@@ -2168,19 +2430,20 @@ class Qwen35Megakernel:
         if os.environ.get("QX_AOT_SKIP_GUARD_CHECK", "1") != "1":
             return 0
         promoted = 0
-        for key, fn in list(self._bucket_steps.items()):
-            st = getattr(fn, "_qx_fast_state", None)
-            if isinstance(st, dict):
-                entries = st.get("entries")
-                entry = st.get("entry")
-                if (
-                    isinstance(entry, tuple)
-                    and len(entry) == 3
-                    and callable(entry[1])
-                    and (not isinstance(entries, list) or len(entries) <= 1)
-                ):
-                    self._bucket_steps[key] = entry[1]
-                    promoted += 1
+        for table in (self._bucket_steps, self._prep_steps):
+            for key, fn in list(table.items()):
+                st = getattr(fn, "_qx_fast_state", None)
+                if isinstance(st, dict):
+                    entries = st.get("entries")
+                    entry = st.get("entry")
+                    if (
+                        isinstance(entry, tuple)
+                        and len(entry) == 3
+                        and callable(entry[1])
+                        and (not isinstance(entries, list) or len(entries) <= 1)
+                    ):
+                        table[key] = entry[1]
+                        promoted += 1
         if promoted > 0:
             logger.info(
                 "Qwen3.5 megakernel: promoted %d bucket step callables to zero-guard direct dispatch",
@@ -2188,17 +2451,143 @@ class Qwen35Megakernel:
             )
         return promoted
 
+    def nan_page_self_test(self) -> bool:
+        """Startup guard (`VLLM_TPU_QWEN35_MK_SELFTEST`, default on): run the
+        production B=4 / T=4 kernel configuration on a 32-page scratch pool whose
+        KV pages beyond `plen` (and the padded page 0) hold the fp8 NaN bit
+        pattern 0xFF, and require a finite hidden output.
+
+        This is the production situation a zero-filled microbenchmark never
+        reaches: the block table pads a sequence's last 2048-token block with
+        page 0 (the unified pool's GDN null block, bf16 bytes) and stale pages
+        hold arbitrary bytes; an attention variant that does not mask V beyond
+        `plen` (amask=3/4) turns p=0 * NaN into NaN hidden states. Returns True
+        when the check passed, False when it could not run (logged); raises
+        RuntimeError on a non-finite output.
+        """
+        if not _env_flag("VLLM_TPU_QWEN35_MK_SELFTEST", "1"):
+            return False
+        if not self._bound or not self.raw_pools:
+            return False
+        dev = self.raw_pools[0].device
+        if dev.type != "tpu":
+            return False
+        t0 = time.monotonic()
+        try:
+            T, B, NP, MPS = 4, 4, 32, 32
+            bucket_fused = bool(self.fused_pool_io and self._bucket_is_fused(B))
+            c = dataclasses.replace(
+                self.base_cfg,
+                B=B,
+                T=T,
+                num_pages=NP,
+                max_pages_per_seq=MPS,
+                fused_pool_io=bucket_fused,
+            )
+            tiles = apply_mk_tile_env_overrides(K.default_tiles(c), B)
+            step_fn, in_specs, out_specs, donate_argnums = pool_io.make_flat_pooled_step(
+                self.mesh, c, tiles, fused_pool_io=bucket_fused
+            )
+            n_in = len(in_specs)
+            args = [f"x{i}" for i in range(n_in)]
+            ret = "tuple[" + ", ".join(["jax.Array"] * len(out_specs)) + "]"
+            io_tag = "" if bucket_fused else "_3stage"
+            fn_name = f"qwen35_mk_selftest_t{T}_b{B}_{self.mode}{io_tag}"
+            src = (
+                f"def {fn_name}({', '.join(a + ': jax.Array' for a in args)}) -> {ret}:\n"
+                f"    return _step_fn({', '.join(args)})\n"
+            )
+            ns: dict[str, Any] = {"jax": jax, "_step_fn": step_fn}
+            exec(compile(src, f"<{fn_name}>", "exec"), ns)  # noqa: S102
+            flat_callable = sharded_jax_callable(
+                f"qwen35_megakernel::selftest_t{T}_b{B}_{self.mode}{io_tag}",
+                ns[fn_name],
+                mesh=self.mesh,
+                input_partition_specs=in_specs,
+                output_partition_specs=out_specs,
+                donate_argnums=donate_argnums,
+            )
+
+            # One sequence with plen = 10 cached tokens on page 25; pages 26..27
+            # complete its first 2048-token KV block together with the padded
+            # page 0. Checkpoint slots 1..4 (pages 5..24 at R=8) hold zero GDN
+            # states.
+            kv_page, ckpt0 = 25, 1
+            gp = c.gdn_pages
+            u8 = np.full((NP, 2, 64, 4, self.page_size), 0xFF, dtype=np.uint8)
+            u8[ckpt0 * gp:(ckpt0 + T) * gp] = 0
+            u8[kv_page] = 0
+            pools = [
+                torch.from_numpy(u8.copy()).view(torch.float8_e4m3fn).to(dev)
+                for _ in range(len(self.raw_pools))
+            ]
+            pos = torch.arange(10, 10 + T, dtype=torch.int32, device=dev)
+            ids = torch.zeros((B,), dtype=torch.int32, device=dev)
+            with torch.no_grad():
+                h0 = self.embed_tokens(ids)
+                if h0.shape[0] < c.M:
+                    h0 = F.pad(h0, (0, 0, 0, c.M - h0.shape[0]))
+            pt = torch.zeros((1, MPS), dtype=torch.int32, device=dev)
+            pt[0, 0] = kv_page
+            pt[0, 1] = kv_page + 1
+            pt[0, 2] = kv_page + 2
+            ckpt = (
+                torch.arange(ckpt0, ckpt0 + T, dtype=torch.int32)
+                .reshape(1, 1, T)
+                .expand(3, 1, T)
+                .contiguous()
+                .to(dev)
+            )
+            roff = torch.zeros((3, 1), dtype=torch.int32, device=dev)
+            with torch.no_grad():
+                outs = flat_callable(pos, h0, *self.w_flat, *pools, pt, ckpt, roff)
+            hid = outs[0][:B].float().cpu()
+            finite = bool(torch.isfinite(hid).all())
+            n_bad = int((~torch.isfinite(hid)).sum())
+            dt = time.monotonic() - t0
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Qwen3.5 megakernel: NaN-page self-test could not run (%s: %s); "
+                "set VLLM_TPU_QWEN35_MK_SELFTEST=0 to silence",
+                type(exc).__name__,
+                exc,
+            )
+            return False
+        if not finite:
+            raise RuntimeError(
+                "Qwen3.5 megakernel NaN-page self-test FAILED: "
+                f"{n_bad} non-finite hidden values for B={B}, T={T} "
+                f"(pool_io={'fused' if bucket_fused else '3stage'}, amask={tiles.amask}, "
+                f"route_vec={tiles.route_vec}, dense_acc_pair={tiles.dense_acc_pair}); "
+                "KV columns beyond plen are not masked out of the attention V product"
+            )
+        logger.info(
+            "Qwen3.5 megakernel: NaN-page self-test passed (B=%d, T=%d, pool_io=%s, "
+            "amask=%d, %.1fs)",
+            B,
+            T,
+            "fused" if bucket_fused else "3stage",
+            tiles.amask,
+            dt,
+        )
+        return True
+
     def warmup(self, runner: Any) -> None:
         """Pre-compile and warm up all configured decode and MTP-verify buckets."""
         if not self._bound:
             return
+        self.nan_page_self_test()
         dev = self.raw_pools[0].device
         all_keys = [(1, b) for b in self.buckets] + [(4, b) for b in self.verify_buckets]
         if not all_keys:
             return
         logger.info("Qwen3.5 megakernel: warming up (T, B) buckets %s ...", all_keys)
         max_t = max(T for T, _ in all_keys)
-        n_save = min(self.num_pages, max(5, 5 * (max_t + 1)))
+        # Fused pool I/O sentinel pages: KV page 0 and the rec pages of GDN
+        # checkpoint slot 1 (pages 5..8 at R=8).
+        gp = self.base_cfg.gdn_pages
+        gdn_sent = slice(gp, gp + self.base_cfg.rec_pages)
+        n_save = min(self.num_pages, max(gp, gp * (max_t + 1)))
         # Never slice-clone or slice-write raw_pools on TPU (PyTorch/XLA lowers
         # slice writes on a 2.30 GiB pool to as_strided_copy_inverse, allocating
         # a full 2.30 GiB temporary buffer per pool).
@@ -2246,7 +2635,8 @@ class Qwen35Megakernel:
                         do_sentinel = (
                             self.fused_pool_io
                             and not sentinel_checked
-                            and self.num_pages >= 5 * (T + 1)
+                            and self._bucket_fused.get((T, b), False)
+                            and self.num_pages >= gp * (T + 1)
                         )
                         if dev.type == "tpu" and runner_tok_pads and runner_req_pads:
                             tok_pad = next(
@@ -2303,7 +2693,7 @@ class Qwen35Megakernel:
                                         .clone()
                                     )
                                     sent_gdn = (
-                                        self.raw_pools[0][5:9]
+                                        self.raw_pools[0][gdn_sent]
                                         .view(torch.uint8)
                                         .cpu()
                                         .clone()
@@ -2352,7 +2742,7 @@ class Qwen35Megakernel:
                                         sent_kv,
                                     )
                                     gdn_ok = not torch.equal(
-                                        self.raw_pools[0][5:9]
+                                        self.raw_pools[0][gdn_sent]
                                         .view(torch.uint8)
                                         .cpu(),
                                         sent_gdn,
@@ -2403,7 +2793,7 @@ class Qwen35Megakernel:
                             if do_sentinel:
                                 if dev.type != "tpu":
                                     self.raw_pools[0][0].view(torch.uint8).fill_(0x5A)
-                                    self.raw_pools[0][5:9].view(torch.uint8).fill_(0x5A)
+                                    self.raw_pools[0][gdn_sent].view(torch.uint8).fill_(0x5A)
                                 sent_kv = (
                                     self.raw_pools[0][0]
                                     .view(torch.uint8)
@@ -2411,7 +2801,7 @@ class Qwen35Megakernel:
                                     .clone()
                                 )
                                 sent_gdn = (
-                                    self.raw_pools[0][5:9]
+                                    self.raw_pools[0][gdn_sent]
                                     .view(torch.uint8)
                                     .cpu()
                                     .clone()
@@ -2457,7 +2847,7 @@ class Qwen35Megakernel:
                                     sent_kv,
                                 )
                                 gdn_ok = not torch.equal(
-                                    self.raw_pools[0][5:9].view(torch.uint8).cpu(),
+                                    self.raw_pools[0][gdn_sent].view(torch.uint8).cpu(),
                                     sent_gdn,
                                 )
                                 if saved_pages is not None:
@@ -2489,7 +2879,7 @@ class Qwen35Megakernel:
                         self.base_cfg = dataclasses.replace(
                             self.base_cfg, fused_pool_io=False
                         )
-                        self._build_all_buckets()
+                        self._build_all_buckets(only_fused=True)
                         continue
                     break
                 self.promote_fast_callables()
@@ -2498,7 +2888,6 @@ class Qwen35Megakernel:
                 with torch.no_grad():
                     for p, sv in zip(self.raw_pools, saved_pages):
                         p[:n_save].copy_(sv)
-
 
     def _inspect_step_detail(
         self,
