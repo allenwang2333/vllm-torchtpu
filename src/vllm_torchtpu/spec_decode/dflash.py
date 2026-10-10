@@ -359,9 +359,10 @@ class DFlashProposer:
         )
         reusable_tables = self._get_reusable_draft_block_tables(chunk, padded_num_reqs)
         if reusable_tables is not None:
+            _, _, pos_buf, _ = self._get_static_prep_bufs()
             return {
                 layer_name: AttentionMetadata(
-                    input_positions=self.runner.position_ids,
+                    input_positions=pos_buf,
                     block_tables=tbl,
                     seq_lens=seq_lens,
                     query_start_loc=query_start_loc,
@@ -643,14 +644,30 @@ class DFlashProposer:
                 and self._get_reusable_draft_block_tables(chunk, padded_num_reqs)
                 is not None
             ):
+                next_buf, qsl_buf, pos_buf, dl_buf = self._get_static_prep_bufs()
+                next_buf.fill_(INVALID_TOKEN_ID)
+                n_r = min(next_tokens_device.shape[0], next_buf.shape[0])
+                next_buf[:n_r].copy_(next_tokens_device[:n_r])
+
+                qsl_src = chunk.attn_ctx.query_start_loc
+                qsl_buf.zero_()
+                n_q = min(qsl_src.shape[0], qsl_buf.shape[0])
+                qsl_buf[:n_q].copy_(qsl_src[:n_q])
+                if n_q < qsl_buf.shape[0]:
+                    qsl_buf[n_q:].fill_(qsl_src[n_q - 1])
+
                 position_ids_device = chunk.position_ids
                 if position_ids_device.dim() > 1:
                     position_ids_device = position_ids_device[0]
-                draft_lengths = (
-                    chunk.draft_lengths
-                    if chunk.draft_lengths is not None
-                    else self._zero_draft_lengths(chunk.num_reqs)
-                )
+                pos_buf.zero_()
+                n_p = min(position_ids_device.shape[0], pos_buf.shape[0])
+                pos_buf[:n_p].copy_(position_ids_device[:n_p])
+
+                dl_buf.zero_()
+                if chunk.draft_lengths is not None:
+                    n_d = min(chunk.draft_lengths.shape[0], dl_buf.shape[0])
+                    dl_buf[:n_d].copy_(chunk.draft_lengths[:n_d])
+
                 seq_lens_buf = self._seq_lens_buf_cache.get(padded_num_reqs)
                 if seq_lens_buf is None:
                     seq_lens_buf = torch.zeros(
@@ -674,10 +691,10 @@ class DFlashProposer:
                     ),
                 ):
                     draft_tokens_chunk, _ = self._dflash_prep_forward_and_sample(
-                        next_tokens_device,
-                        chunk.attn_ctx.query_start_loc,
-                        position_ids_device,
-                        draft_lengths,
+                        next_buf,
+                        qsl_buf,
+                        pos_buf,
+                        dl_buf,
                         seq_lens_buf,
                         block_size,
                         padded_len,
@@ -936,34 +953,13 @@ class DFlashProposer:
                 input_ids, positions, block_size
             )
             synchronize_tensors(draft_tokens_chunk, wait=sync)
-            if sync and not self._dp_lockstep_sharded():
-                target_reqs = (
-                    runner.num_reqs_max_model_len
-                    if use_max_model_len
-                    else runner.num_reqs_most_model_len
-                )
-                assert target_reqs is not None
-                k_spec = self.speculative_config.num_speculative_tokens
-                pos_buf = runner.position_ids
-                if pos_buf.dim() > 1:
-                    pos_buf = pos_buf[0]
-                dummy_next = torch.full(
-                    (target_reqs, k_spec + 1),
-                    INVALID_TOKEN_ID,
-                    dtype=torch.int32,
-                    device=runner.device,
-                )
-                dummy_qsl = torch.zeros(
-                    (target_reqs + 1,), dtype=torch.int32, device=runner.device
-                )
-                dummy_dl = torch.zeros(
-                    (target_reqs,), dtype=torch.int32, device=runner.device
-                )
+            if sync and use_max_model_len and not self._dp_lockstep_sharded():
+                next_buf, qsl_buf, pos_buf, dl_buf = self._get_static_prep_bufs()
                 fused_chunk, _ = self._dflash_prep_forward_and_sample(
-                    dummy_next,
-                    dummy_qsl,
+                    next_buf,
+                    qsl_buf,
                     pos_buf,
-                    dummy_dl,
+                    dl_buf,
                     seq_lens,
                     block_size,
                     num_tokens,
@@ -971,6 +967,29 @@ class DFlashProposer:
                     INVALID_TOKEN_ID,
                 )
                 synchronize_tensors(fused_chunk, wait=True)
+
+    def _get_static_prep_bufs(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        bufs = getattr(self, "_static_prep_bufs", None)
+        if bufs is None or bufs[0].device != self.runner.device:
+            max_reqs = int(self.runner.max_num_reqs)
+            max_toks = int(self.runner.max_num_tokens)
+            k_spec = int(self.speculative_config.num_speculative_tokens)
+            dev = self.runner.device
+            bufs = (
+                torch.full(
+                    (max_reqs, k_spec + 1),
+                    INVALID_TOKEN_ID,
+                    dtype=torch.int32,
+                    device=dev,
+                ),
+                torch.zeros((max_reqs + 1,), dtype=torch.int32, device=dev),
+                torch.zeros((max_toks,), dtype=torch.int32, device=dev),
+                torch.zeros((max_reqs,), dtype=torch.int32, device=dev),
+            )
+            self._static_prep_bufs = bufs
+        return bufs
 
     def _dp_draft_bucket(self) -> int:
         """Draft-forward token bucket every lockstep rank runs this step."""
