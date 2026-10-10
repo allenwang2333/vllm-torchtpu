@@ -145,6 +145,8 @@ if TYPE_CHECKING:
     VLLM_DSV41_HYBRID_CED_DECODE: bool = False
     VLLM_DSV41_PURE_20L_PREFILL: bool = False
     VLLM_DSV41_CSA_UNION: bool = True
+    VLLM_DSV41_CSA_UNION_M: int = 0
+    VLLM_DSV41_CSA_UNION_BQ: int = 32
     VLLM_DSV41_FUSED_SEAM_QUANT: bool = False
     VLLM_DSV41_FUSED_Q_ROPE: bool = False
     VLLM_DSV41_TP_ATTN: bool = False
@@ -883,6 +885,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 = exact per-token sparse kernel for every CSA prefill token instead of
     # the 32-query candidate union (which drops rows past m_union = 3 * topk).
     "VLLM_DSV41_CSA_UNION": env_bool("VLLM_DSV41_CSA_UNION", True),
+    "VLLM_DSV41_CSA_UNION_M": env_int("VLLM_DSV41_CSA_UNION_M", 0),
+    "VLLM_DSV41_CSA_UNION_BQ": env_int("VLLM_DSV41_CSA_UNION_BQ", 32),
     "VLLM_DSV41_SINGLE_BACKBONE_COND": lambda: bool(
         int(os.getenv("VLLM_DSV41_SINGLE_BACKBONE_COND", "0"))
     ),
