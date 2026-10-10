@@ -14,15 +14,17 @@
 """DeepSeek V4 CSA attention with the sliding window folded in.
 
 One kernel attends each query token to its gathered top-k compressed KV rows
-and to its own `sliding_window` raw KV rows under a single softmax, and writes
-the step's new raw KV rows to the SWA cache. It replaces the SWA kernel plus
-the SparseMLA kernel pair, whose unnormalized SWA partials made an HBM round
-trip between them.
+and to its own `sliding_window` raw KV rows under a single softmax. It replaces
+the SWA kernel plus the SparseMLA kernel pair, whose unnormalized SWA partials
+made an HBM round trip between them. A small kernel writes the step's new raw
+KV rows to the SWA cache first, so the attention kernels only read the cache
+and every chunk's SparseCore gather can start before the first attention
+kernel, as it does after the SWA kernel.
 
 Window rows before a sequence's first new token come from the SWA cache, the
-rest straight from `new_kv`, so the kernel never reads a row it writes. A batch
-of tokens that are consecutive positions of one sequence shares one window
-span; any other batch fetches a window per token.
+rest straight from `new_kv`. A batch of tokens that are consecutive positions
+of one sequence shares one window span; any other batch fetches a window per
+token.
 """
 
 import functools
@@ -41,8 +43,154 @@ DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 ATTENTION_KERNEL_BATCH_SIZE = 16
 # Query tokens per SparseCore gather call.
 GATHER_AND_ATTENTION_CHUNK_SIZE = 128
+# New KV rows staged in VMEM per grid step of the cache-write kernel.
+WRITE_BLOCK_TOKENS = 256
 
 cdiv = sparse_mla.cdiv
+
+
+def _sw_rows(sw_cache_ref, token_rows: int):
+    """The SWA cache as one `[token_rows, lanes]` uint8 row per token slot."""
+    slabs = csa_cache_layout.as_u8_slabs(sw_cache_ref)
+    num_pages, page_rows, kv_packing, lanes = slabs.shape
+    tokens_per_page = page_rows // (token_rows // kv_packing)
+    rows = slabs.reshape(num_pages * tokens_per_page, token_rows, lanes)
+    return rows, tokens_per_page
+
+
+def _is_span(win_pos_ref, win_base_ref, t0, n: int):
+    """Whether tokens [t0, t0 + n) are consecutive positions of one sequence."""
+    t1 = jnp.minimum(t0 + n - 1, win_pos_ref.shape[0] - 1)
+    p0 = win_pos_ref[t0]
+    return (
+        (p0 >= 0)
+        & (win_pos_ref[t1] - p0 == n - 1)
+        & (win_base_ref[t1] == win_base_ref[t0])
+    )
+
+
+def _write_new_rows_kernel(
+    # Prefetch
+    num_valid_ref,  # [1] valid tokens
+    win_pos_ref,  # [max_num_tokens] position in the SWA page table; -1 = none
+    win_base_ref,  # [max_num_tokens] the sequence's first SWA page-table entry
+    win_pages_ref,  # [max_num_seqs * window_pages] SWA page table
+    # Input
+    new_kv_hbm_ref,  # uint8[max_num_tokens, token_rows, 128]
+    sw_cache_hbm_ref,  # SWA cache, int32 or uint8 slabs
+    # Output
+    updated_sw_cache_hbm_ref,  # aliased with sw_cache_hbm_ref
+    # Scratch
+    buf_ref,  # uint8[block, token_rows, 128]
+    sems,  # DMA [2] (fetch, write)
+    *,
+    logical_page_size: int,
+    batch_size: int,
+):
+    """Writes each valid token's new KV row to its SWA cache slot."""
+    del sw_cache_hbm_ref
+    block, token_rows, _ = buf_ref.shape
+    sw_rows, tokens_per_page = _sw_rows(updated_sw_cache_hbm_ref, token_rows)
+    num_win_pages = win_pages_ref.shape[0]
+    page = logical_page_size
+    own_span_pages = cdiv(batch_size, page) + 1
+    t_blk = pl.program_id(0) * block
+    t_end = t_blk + jnp.clip(num_valid_ref[0] - t_blk, 0, block)
+    staged = buf_ref.at[pl.ds(0, t_end - t_blk)]
+
+    def write_rows(t, lo, n, num_pages):
+        """Writes the staged rows of tokens [t, t + n) to positions [lo, lo + n)."""
+        first_page = lo // page
+        for i in range(num_pages):
+            p_start = (first_page + i) * page
+            seg_lo = jnp.clip(lo, p_start, p_start + page)
+            seg_hi = jnp.clip(lo + n, p_start, p_start + page)
+            sz = jnp.maximum(seg_hi - seg_lo, 0)
+            idx = jnp.minimum(win_base_ref[t] + first_page + i, num_win_pages - 1)
+            dst = win_pages_ref[idx] * tokens_per_page
+            # Zero-size copies get in-range offsets: they still issue.
+            dst = jnp.where(sz > 0, dst + seg_lo - p_start, 0)
+            src = jnp.where(sz > 0, t - t_blk + seg_lo - lo, 0)
+            pltpu.make_async_copy(
+                buf_ref.at[pl.ds(src, sz)], sw_rows.at[pl.ds(dst, sz)], sems.at[1]
+            ).start()
+
+    def write_batch(b, carry):
+        t0 = t_blk + b * batch_size
+
+        # Tokens past t_end have position -1, so a span lies inside the block.
+        @pl.when(_is_span(win_pos_ref, win_base_ref, t0, batch_size))
+        def _():
+            write_rows(t0, win_pos_ref[t0], batch_size, own_span_pages)
+
+        @pl.when(jnp.logical_not(_is_span(win_pos_ref, win_base_ref, t0, batch_size)))
+        def _():
+            def token(t, c):
+                write_rows(t, win_pos_ref[t], 1, 1)
+                return c
+
+            lax.fori_loop(t0, jnp.minimum(t0 + batch_size, t_end), token, 0)
+
+        return carry
+
+    @pl.when(t_end > t_blk)
+    def _():
+        fetch = pltpu.make_async_copy(
+            new_kv_hbm_ref.at[pl.ds(t_blk, t_end - t_blk)], staged, sems.at[0]
+        )
+        fetch.start()
+        fetch.wait()
+        lax.fori_loop(0, cdiv(t_end - t_blk, batch_size), write_batch, 0)
+        # Every staged row is written exactly once.
+        pltpu.make_async_copy(staged, staged, sems.at[1]).wait()
+
+
+def write_new_rows(
+    new_kv: jax.Array,  # uint8[max_num_tokens, token_rows, 128]
+    sw_cache: jax.Array,
+    win_pos: jax.Array,
+    win_base: jax.Array,
+    win_pages: jax.Array,
+    num_valid_tokens: jax.Array,
+    *,
+    logical_page_size: int,
+    batch_size: int,
+) -> jax.Array:
+    """Writes the step's new KV rows to the SWA cache; returns the cache."""
+    num_tokens, token_rows, lanes = new_kv.shape
+    block = min(WRITE_BLOCK_TOKENS, num_tokens)
+    scalar_prefetches = (
+        jnp.reshape(num_valid_tokens, (1,)).astype(jnp.int32),
+        win_pos,
+        win_base,
+        win_pages,
+    )
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    n = len(scalar_prefetches)
+    return pl.pallas_call(
+        functools.partial(
+            _write_new_rows_kernel,
+            logical_page_size=logical_page_size,
+            batch_size=batch_size,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=n,
+            in_specs=[hbm, hbm],
+            out_specs=hbm,
+            grid=(cdiv(num_tokens, block),),
+            scratch_shapes=[
+                pltpu.VMEM((block, token_rows, lanes), jnp.uint8),
+                pltpu.SemaphoreType.DMA((2,)),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            disable_bounds_checks=True,
+        ),
+        out_shape=jax.ShapeDtypeStruct(sw_cache.shape, sw_cache.dtype),
+        input_output_aliases={n + 1: 0},
+        name="SWA-write-new-rows",
+    )(*scalar_prefetches, new_kv, sw_cache)
 
 
 def _fused_attention_kernel(
@@ -61,18 +209,17 @@ def _fused_attention_kernel(
     cache_kv_nope_hbm_ref,  # int32[chunk_size, topk, 128]
     cache_kv_rope_hbm_ref,  # int32[chunk_size, topk // 4, 128]
     new_kv_hbm_ref,  # uint8[max_num_tokens, token_rows, 128]
-    sw_cache_hbm_ref,  # SWA cache, int32 or uint8 slabs
+    sw_cache_hbm_ref,  # SWA cache, int32 or uint8 slabs; read only
     # Output
     o_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-    updated_sw_cache_hbm_ref,  # aliased with sw_cache_hbm_ref
     # Scratch
     bkv_nope_x2_ref,  # [2, batch_size, topk * 4, 128]
     bkv_rope_x2_ref,  # [2, batch_size, topk // 2, rope_dim * 2]
     bq_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
     bo_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
     bwin_x2_ref,  # uint8[2, batch_size * sliding_window, token_rows, 128]
-    win_state_ref,  # SMEM i32[3, 2] (span flag, rows fetched, rows written)
-    sems,  # DMA [6, 2] (nope, q, o, window fetch, window write, rope)
+    win_state_ref,  # SMEM i32[2, 2] (span flag, rows fetched)
+    sems,  # DMA [5, 2] (nope, q, o, window fetch, rope)
     *,
     sm_scale: float,
     batch_size: int,
@@ -86,18 +233,8 @@ def _fused_attention_kernel(
     q_dtype = q_hbm_ref.dtype
     assert head_dim % 128 == 0
 
-    # The SWA cache as one row of `token_rows` uint8 sub-rows per token.
-    sw_cache = csa_cache_layout.as_u8_slabs(sw_cache_hbm_ref)
-    updated_sw_cache = csa_cache_layout.as_u8_slabs(updated_sw_cache_hbm_ref)
-    total_num_pages, page_rows, kv_packing, lanes = sw_cache.shape
     _, token_rows, _ = new_kv_hbm_ref.shape
-    phys_tokens_per_page = page_rows // (token_rows // kv_packing)
-    sw_rows = sw_cache.reshape(
-        total_num_pages * phys_tokens_per_page, token_rows, lanes
-    )
-    updated_sw_rows = updated_sw_cache.reshape(
-        total_num_pages * phys_tokens_per_page, token_rows, lanes
-    )
+    sw_rows, phys_tokens_per_page = _sw_rows(sw_cache_hbm_ref, token_rows)
     num_win_pages = win_pages_ref.shape[0]
     window = sliding_window
     page = logical_page_size
@@ -105,7 +242,6 @@ def _fused_attention_kernel(
     span_rows = window - 1 + batch_size
     span_pages = cdiv(span_rows, page) + 1
     token_pages = cdiv(window, page) + 1
-    own_span_pages = cdiv(batch_size, page) + 1
 
     start_seq_idx = start_end_seq_idx_ref[0]
     end_seq_idx = start_end_seq_idx_ref[1]
@@ -154,33 +290,10 @@ def _fused_attention_kernel(
         )
         return jnp.maximum(hi - lo, 0)
 
-    def _write_rows(t, lo, n, buf, src_row, sem, num_pages):
-        """Writes buf[src_row:src_row + n] to positions [lo, lo + n) of t's seq."""
-        first_page = lo // page
-        for i in range(num_pages):
-            p_start = (first_page + i) * page
-            seg_lo = jnp.clip(lo, p_start, p_start + page)
-            seg_hi = jnp.clip(lo + n, p_start, p_start + page)
-            sz = jnp.maximum(seg_hi - seg_lo, 0)
-            dst = _page_id(t, first_page + i) * phys_tokens_per_page
-            dst = jnp.where(sz > 0, dst + seg_lo - p_start, 0)
-            src = jnp.where(sz > 0, src_row + seg_lo - lo, 0)
-            _async_copy(buf.at[pl.ds(src, sz)], updated_sw_rows.at[pl.ds(dst, sz)], sem)
-
-    def _is_span(t0):
-        """Whether batch [t0, t0 + batch_size) is consecutive positions of a seq."""
-        t1 = t0 + batch_size - 1
-        p0 = win_pos_ref[t0]
-        return (
-            (p0 >= 0)
-            & (win_pos_ref[t1] - p0 == batch_size - 1)
-            & (win_base_ref[t1] == win_base_ref[t0])
-        )
-
     def start_fetch_window(t0, sem_idx):
         sem = sems.at[3, sem_idx]
         buf = bwin_x2_ref.at[sem_idx]
-        is_span = _is_span(t0)
+        is_span = _is_span(win_pos_ref, win_base_ref, t0, batch_size)
         win_state_ref[0, sem_idx] = is_span.astype(jnp.int32)
 
         # Span row r holds position p0 - window + 1 + r, so token j's window is
@@ -213,47 +326,12 @@ def _fused_attention_kernel(
         rows = buf.at[pl.ds(0, win_state_ref[1, sem_idx])]
         _async_copy(rows, rows, sems.at[3, sem_idx], wait=True)
 
-    def start_write_new_rows(t0, sem_idx):
-        """Writes the batch's own KV rows from the window buffer to the cache."""
-        sem = sems.at[4, sem_idx]
-        buf = bwin_x2_ref.at[sem_idx]
-        is_span = win_state_ref[0, sem_idx] == 1
-
-        @pl.when(is_span)
-        def _():
-            _write_rows(
-                t0, win_pos_ref[t0], batch_size, buf, window - 1, sem, own_span_pages
-            )
-            win_state_ref[2, sem_idx] = batch_size
-
-        @pl.when(jnp.logical_not(is_span))
-        def _():
-            def body(j, rows):
-                t = t0 + j
-                p = win_pos_ref[t]
-                n = (p >= 0).astype(jnp.int32)
-                _write_rows(
-                    t, jnp.maximum(p, 0), n, buf, j * window + window - 1, sem, 1
-                )
-                return rows + n
-
-            win_state_ref[2, sem_idx] = lax.fori_loop(0, batch_size, body, jnp.int32(0))
-
-    def wait_write_new_rows(sem_idx):
-        n = win_state_ref[2, sem_idx]
-
-        @pl.when(n > 0)
-        def _():
-            rows = bwin_x2_ref.at[sem_idx, pl.ds(0, n)]
-            _async_copy(rows, rows, sems.at[4, sem_idx], wait=True)
-            win_state_ref[2, sem_idx] = 0
-
     def _fetch_bkv_batch(t0, sem_idx, *, wait=False):
         nope_vmem = bkv_nope_x2_ref.at[sem_idx]
         rope_vmem = bkv_rope_x2_ref.at[sem_idx]
         if wait:
             _async_copy(nope_vmem, nope_vmem, sems.at[0, sem_idx], wait=True)
-            _async_copy(rope_vmem, rope_vmem, sems.at[5, sem_idx], wait=True)
+            _async_copy(rope_vmem, rope_vmem, sems.at[4, sem_idx], wait=True)
         else:
             # The gathered rows are indexed relative to the current chunk.
             idx = t0 - start_seq_idx
@@ -265,7 +343,7 @@ def _fused_attention_kernel(
             _async_copy(
                 cache_kv_rope_hbm_ref.at[pl.ds(idx, batch_size)],
                 rope_vmem,
-                sems.at[5, sem_idx],
+                sems.at[4, sem_idx],
             )
 
     def _fetch_bq_batch(t0, sem_idx, *, wait=False):
@@ -295,9 +373,6 @@ def _fused_attention_kernel(
             _send_bo_batch(old_t0, sem_idx, wait=True)
 
     def start_fetch_batch(t0, sem_idx):
-        # The window buffer may still be the source of the cache write issued
-        # when this slot was last used.
-        wait_write_new_rows(sem_idx)
         _fetch_bq_batch(t0, sem_idx)
         start_fetch_window(t0, sem_idx)
         _fetch_bkv_batch(t0, sem_idx)
@@ -375,7 +450,6 @@ def _fused_attention_kernel(
 
         _fetch_bq_batch(batch_start, bi_sem_idx, wait=True)
         wait_fetch_window(bi_sem_idx)
-        start_write_new_rows(batch_start, bi_sem_idx)
         _fetch_bkv_batch(batch_start, bi_sem_idx, wait=True)
 
         @pl.when(pl.program_id(0) >= 2)
@@ -407,8 +481,6 @@ def _fused_attention_kernel(
 
     @pl.when(batch_start == start_seq_idx)
     def prologue():
-        win_state_ref[2, 0] = 0
-        win_state_ref[2, 1] = 0
         start_fetch_batch(batch_start, 0)
 
     process()
@@ -416,8 +488,6 @@ def _fused_attention_kernel(
     @pl.when(batch_last == end_seq_idx - 1)
     def epilogue():
         wait_send_bo_batch(0)
-        wait_write_new_rows(0)
-        wait_write_new_rows(1)
 
         @pl.when(pl.num_programs(0) >= 2)
         def _():
@@ -531,6 +601,16 @@ def sparse_swa_ragged_paged_attention(
     win_pos, win_start, win_base = _window_metadata(
         num_tokens, swa_kv_lens, swa_cu_q_lens, swa_distribution, window_pages
     )
+    sw_cache = write_new_rows(
+        new_kv,
+        sw_cache,
+        win_pos,
+        win_base,
+        swa_page_indices,
+        swa_cu_q_lens[swa_distribution[2]],
+        logical_page_size=logical_page_size,
+        batch_size=batch,
+    )
 
     kv_lens, gather_indices = sparse_mla.csa_gather_indices(
         topk_indices,
@@ -554,8 +634,8 @@ def sparse_swa_ragged_paged_attention(
             pltpu.VMEM((2, b, num_q_heads, head_dim), q.dtype),  # bq
             pltpu.VMEM((2, b, num_q_heads, head_dim), q.dtype),  # bo
             pltpu.VMEM((2, b * sliding_window, token_rows, lanes), jnp.uint8),
-            pltpu.SMEM((3, 2), jnp.int32),
-            pltpu.SemaphoreType.DMA((6, 2)),
+            pltpu.SMEM((2, 2), jnp.int32),
+            pltpu.SemaphoreType.DMA((5, 2)),
         ]
         scalar_prefetches = (
             kv_lens,
@@ -581,7 +661,7 @@ def sparse_swa_ragged_paged_attention(
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=n,
                 in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] + [hbm] * 5,
-                out_specs=[hbm, hbm],
+                out_specs=hbm,
                 grid=grid,
                 scratch_shapes=scratch_shapes,
             ),
@@ -590,11 +670,8 @@ def sparse_swa_ragged_paged_attention(
                 vmem_limit_bytes=vmem_limit_bytes,
                 disable_bounds_checks=True,
             ),
-            out_shape=[
-                jax.ShapeDtypeStruct(q.shape, q.dtype),
-                jax.ShapeDtypeStruct(sw_cache.shape, sw_cache.dtype),
-            ],
-            input_output_aliases={n + 1: 0, n + 5: 1},
+            out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
+            input_output_aliases={n + 1: 0},
             name=scope_name,
         )
         return jax.named_scope(scope_name)(kernel)(
@@ -618,7 +695,7 @@ def sparse_swa_ragged_paged_attention(
     ):
         nope = sw_cache if nope_is_sw_cache else cache_kv_nope
         gathered_nope, gathered_rope = chunk.gather(nope, cache_kv_rope)
-        q, sw_cache = run_kernel(q, sw_cache, gathered_nope, gathered_rope, chunk)
+        q = run_kernel(q, sw_cache, gathered_nope, gathered_rope, chunk)
 
     out = sparse_mla.prepare_outputs(q, actual_num_q_heads, actual_head_dim)
     return out, sw_cache
