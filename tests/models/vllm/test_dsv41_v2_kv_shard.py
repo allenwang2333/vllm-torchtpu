@@ -565,29 +565,33 @@ class TestAttentionKvShard:
             for blk_off in (0, 16):
                 for row_off_bytes in (0, 4096):
                     for window_size in (64, 128):
-                        for idx_sharded in (False, True):
+                        for is_sharded in (False, True):
                             swa_layout = (
                                 (20, 16, 128),
                                 torch.bfloat16,
                                 16 * 256 * 2,
                                 row_off_bytes,
-                                blk_off,
-                                True,
-                                rep,
+                                blk_off if is_sharded else 0,
+                                is_sharded,
+                                rep if is_sharded else 0,
                             )
                             idx_layout = (
                                 (20, 16, 64),
                                 torch.bfloat16,
                                 16 * 128 * 2,
                                 row_off_bytes,
-                                blk_off if idx_sharded else 0,
-                                idx_sharded,
-                                rep if idx_sharded else 0,
+                                blk_off if is_sharded else 0,
+                                is_sharded,
+                                rep if is_sharded else 0,
                             )
                             swa_cache = PagedCacheRows(raw_pool, swa_layout)
                             idx_cache = PagedCacheRows(raw_pool, idx_layout)
-                            assert v2_attn._has_fast_cache_offset(swa_cache)
-                            assert v2_attn._has_fast_cache_offset(idx_cache)
+                            assert v2_attn._has_fast_cache_offset(swa_cache) is (
+                                not is_sharded
+                            )
+                            assert v2_attn._has_fast_cache_offset(idx_cache) is (
+                                not is_sharded
+                            )
 
                             # Compute reference SWA and Indexer records via row_indices
                             requests = v2_attn._token_requests(meta, positions).clamp(
@@ -706,20 +710,19 @@ class TestAttentionKvShard:
                                 attn._prepare_tpu(
                                     None, qr, kv, None, None, idx_w, positions, out
                                 )
-                            assert swa_ri_calls == 0
-                            assert seen_swa[0].dtype == torch.int32
                             assert torch.equal(seen_swa[0], ref_swa_recs)
-                            assert seen_swa[0] is seen_swa[1]
                             assert torch.equal(seen_idx[0], ref_idx_recs)
-                            if idx_sharded:
-                                # TD8.232: sharded index_cache computes per-layer
-                                # index_records via row_indices on stage-cached
-                                # prestrided cached_idx_req
+                            if is_sharded:
+                                assert swa_ri_calls == 2
                                 assert idx_ri_calls == 2
+                                assert seen_swa[0] is not seen_swa[1]
                                 assert seen_idx[0] is not seen_idx[1]
                             else:
+                                assert swa_ri_calls == 0
                                 assert idx_ri_calls == 0
+                                assert seen_swa[0].dtype == torch.int32
                                 assert seen_idx[0].dtype == torch.int32
+                                assert seen_swa[0] is seen_swa[1]
                                 assert seen_idx[0] is seen_idx[1]
 
                             # 2. Outside stage_attention_cache_scope
@@ -728,14 +731,15 @@ class TestAttentionKvShard:
                             attn._prepare_tpu(
                                 None, qr, kv, None, None, idx_w, positions, out
                             )
-                            assert swa_ri_calls == 0
-                            assert seen_swa[0].dtype == torch.int32
                             assert torch.equal(seen_swa[0], ref_swa_recs)
                             assert torch.equal(seen_idx[0], ref_idx_recs)
-                            if idx_sharded:
+                            if is_sharded:
+                                assert swa_ri_calls == 3
                                 assert idx_ri_calls == 3
                             else:
+                                assert swa_ri_calls == 0
                                 assert idx_ri_calls == 0
+                                assert seen_swa[0].dtype == torch.int32
                                 assert seen_idx[0].dtype == torch.int32
 
     def test_td8226_stage_cached_candidates_part_parity(
@@ -1232,6 +1236,75 @@ class TestAttentionKvShard:
                 logical_width=lw,
             )
             assert f_sel2.shape == (4, 16)
+
+    def test_td8233_subpage_segment_candidate_context_parity(self):
+        """TD8.233: Verify paged_indexer_jax candidate_context with
+        prestrided_pages=True when segment = gcd(block_size, page_records) <
+        page_records (DeepSeek-V4.1-Flash block_size=8, page_records=16 ->
+        segment=8, segs_per_page=2) and in the non-segment fallback branch
+        (block_size=4, page_records=16)."""
+        rng = np.random.default_rng(8233)
+        pool_j = jnp.asarray(
+            rng.integers(-(2**31), 2**31, (256, ROW_WORDS)), dtype=jnp.int32
+        ) & jnp.int32(0x3FFF3FFF)
+        page_rec = 16
+        logical_w = 240  # 15 pages = 30 blocks of size 8
+        records_np = np.zeros((2, logical_w), dtype=np.int32)
+        for r in range(2):
+            for p in range(0, logical_w, page_rec):
+                base = int(rng.integers(0, 128) * 2)
+                records_np[r, p : p + page_rec] = base + np.arange(page_rec)
+        # Mark page 2 (blocks 4, 5 at block_size=8) and page 14 (blocks 28, 29) invalid
+        records_np[0, 2 * page_rec : 3 * page_rec] = -1
+        records_np[0, -page_rec:] = -1
+        records_full_j = jnp.asarray(records_np)
+        records_page_j = records_full_j[:, ::page_rec]
+
+        n_tok = 6
+        q_j = jnp.asarray(rng.standard_normal((n_tok, 2, 128)), jnp.bfloat16)
+        w_j = jnp.asarray(rng.standard_normal((n_tok, 2)), jnp.float32)
+        len_j = jnp.full((n_tok,), 200, dtype=jnp.int32)
+        req_j = jnp.arange(n_tok, dtype=jnp.int32) % 2
+        # Include both even and odd half-page candidate blocks and invalid (-1) pages
+        cands_j = jnp.asarray([[0, 1, 3, 4, 5, 7, 29, -1]] * n_tok, dtype=jnp.int32)
+
+        for blk_sz in (8, 4, 1):
+            # blk_sz=8/4 -> segment=8/4 < page_records=16 (segs_per_page=2/4)
+            # blk_sz=1 -> segment=1, (1 * 128 // 2) % 128 != 0 -> fallback else branch
+            sel_ref, pub_ref = attention_kernels.paged_indexer_jax(
+                q_j,
+                pool_j,
+                records_full_j,
+                w_j,
+                len_j,
+                cands_j,
+                req_j,
+                topk=16,
+                block_size=blk_sz,
+                candidate_write=False,
+                candidate_filter=True,
+                unordered=False,
+                page_records=page_rec,
+            )
+            sel_pre, pub_pre = attention_kernels.paged_indexer_jax(
+                q_j,
+                pool_j,
+                records_page_j,
+                w_j,
+                len_j,
+                cands_j,
+                req_j,
+                topk=16,
+                block_size=blk_sz,
+                candidate_write=False,
+                candidate_filter=True,
+                unordered=False,
+                page_records=page_rec,
+                prestrided_pages=True,
+                logical_width=logical_w,
+            )
+            np.testing.assert_array_equal(np.asarray(sel_pre), np.asarray(sel_ref))
+            np.testing.assert_array_equal(np.asarray(pub_pre), np.asarray(pub_ref))
 
 
 # ==============================================================================

@@ -2902,14 +2902,27 @@ def paged_indexer_jax(
                     q.shape[0], -1
                 )
             )
-            seg_table = (
-                records
-                if (prestrided_pages and segment == page_records)
-                else records[:, ::segment]
-            )
-            seg_records = seg_table[
-                requests[:, None], jnp.minimum(seg_ids, seg_table.shape[1] - 1)
-            ]
+            if prestrided_pages and page_records:
+                segs_per_page = page_records // segment
+                clamped_seg = jnp.minimum(seg_ids, (width + segment - 1) // segment - 1)
+                page_bases = records[
+                    requests[:, None],
+                    jnp.minimum(clamped_seg // segs_per_page, records.shape[1] - 1),
+                ]
+                seg_records = (
+                    page_bases
+                    if segs_per_page == 1
+                    else jnp.where(
+                        page_bases >= 0,
+                        page_bases + (clamped_seg % segs_per_page) * segment,
+                        -1,
+                    )
+                )
+            else:
+                seg_table = records[:, ::segment]
+                seg_records = seg_table[
+                    requests[:, None], jnp.minimum(seg_ids, seg_table.shape[1] - 1)
+                ]
             seg_valid = (
                 unique_valid[..., None]
                 & (seg_records.reshape(*ids.shape, per_block) >= 0)
@@ -2938,7 +2951,19 @@ def paged_indexer_jax(
         else:
             # Gather only the candidate columns: per-token copies of whole
             # records rows ([tokens, width]) cost more than the candidates.
-            compact = records[requests[:, None], jnp.minimum(logical, width - 1)]
+            clamped_logical = jnp.minimum(logical, width - 1)
+            if prestrided_pages and page_records:
+                page_bases = records[
+                    requests[:, None],
+                    jnp.minimum(clamped_logical // page_records, records.shape[1] - 1),
+                ]
+                compact = jnp.where(
+                    page_bases >= 0,
+                    page_bases + (clamped_logical % page_records),
+                    -1,
+                )
+            else:
+                compact = records[requests[:, None], clamped_logical]
             compact = jnp.where(valid, compact, -1)
             scores = paged_index_scores_jax(
                 q, pool, compact, weights, compact_lengths, page_records=segment

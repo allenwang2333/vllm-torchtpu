@@ -165,7 +165,7 @@ def test_write_global_kv_deferred_records_parity(
         records2, _ = attn._write_global_kv(torch.ones(COUNT, 10), positions)
         kv_slots2 = inserted[-1]
 
-    assert records1.dtype == torch.int32
+    assert records1.dtype == (torch.long if cache_kind == "sharded" else torch.int32)
     assert torch.equal(records1.long(), ref_records.long())
     assert torch.equal(records2, records1)
     assert torch.equal(kv_slots1.long(), ref_kv_slots.long())

@@ -76,10 +76,13 @@ def _mock_cache(rows, geometry, *, offset_pages=None):
     return cache
 
 
-def _replay_parity(call):
+def _replay_parity(call, *, expect_records: bool = True):
     """Replay one captured insert into fresh pools with and without records."""
     cache, slots, _, valid, records = call
-    assert records is not None
+    if expect_records:
+        assert records is not None
+    else:
+        assert records is None
     real = cache.real if hasattr(cache, "real") else cache
     total_rows = real.raw.shape[0]
     ref = PagedCacheRows(
@@ -234,10 +237,11 @@ def test_write_global_kv_records_parity(monkeypatch, geometry, with_starts):
         call_b = calls[-1]
     assert torch.equal(call_a[1].long(), uncached_slots.long())
     assert call_b[1] is call_a[1]  # stage-shared slots
-    raw_a = _replay_parity(call_a)
-    _replay_parity(call_b)
+    expect_rec = geometry != "sharded"
+    raw_a = _replay_parity(call_a, expect_records=expect_rec)
+    _replay_parity(call_b, expect_records=expect_rec)
     assert raw_a.any()
-    if with_starts:
+    if with_starts and expect_rec:
         # Replayed prefix rows are masked out of the records too.
         assert (call_a[4][~call_a[3][:KV_COUNT]] == -1).all()
 
@@ -326,9 +330,10 @@ def test_prepare_tpu_swa_records_parity(monkeypatch, geometry):
         call_b = calls[-1]
     assert torch.equal(call_a[1].long(), uncached_slots.long())
     assert call_b[1] is call_a[1]
-    raw_a = _replay_parity(call_a)
-    _replay_parity(call_b)
-    if geometry != "sharded":
+    expect_rec = geometry != "sharded"
+    raw_a = _replay_parity(call_a, expect_records=expect_rec)
+    _replay_parity(call_b, expect_records=expect_rec)
+    if expect_rec:
         assert raw_a.any()
 
 
@@ -389,10 +394,11 @@ def test_dspark_context_kv_records_parity(monkeypatch, geometry):
     layer_a = _dspark_layer(_real_cache(rows, geometry))
     layer_b = _dspark_layer(_real_cache(rows, geometry, offset_pages=3))
 
-    # Without a stage the rows are still pre-mapped (one call, no reuse).
+    # Without a stage the rows are still pre-mapped when fast_offset is True.
+    expect_rec = geometry != "sharded"
     v2_dspark._insert_context_kv(layer_a, kv, positions, meta)
     uncached = calls[-1]
-    _replay_parity(uncached)
+    _replay_parity(uncached, expect_records=expect_rec)
 
     with v2_attn.stage_attention_cache_scope():
         v2_dspark._insert_context_kv(layer_a, kv, positions, meta)
@@ -407,9 +413,9 @@ def test_dspark_context_kv_records_parity(monkeypatch, geometry):
     assert torch.equal(call_a[3], uncached[3])
     assert call_b[1] is call_a[1]
     assert call_c[1] is not call_a[1]
-    raw_a = _replay_parity(call_a)
-    _replay_parity(call_b)
-    _replay_parity(call_c)
+    raw_a = _replay_parity(call_a, expect_records=expect_rec)
+    _replay_parity(call_b, expect_records=expect_rec)
+    _replay_parity(call_c, expect_records=expect_rec)
     assert raw_a.any()
 
 

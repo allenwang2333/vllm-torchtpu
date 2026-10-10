@@ -507,26 +507,13 @@ def _query_split(count, ranks, *, kv_shard: bool = False):
 
 
 def _has_fast_cache_offset(cache) -> bool:
-    return isinstance(getattr(cache, "row_offset", None), int) and (
-        not getattr(cache, "sharded", False)
-        or (
-            isinstance(getattr(cache, "block_offset", None), int)
-            and isinstance(getattr(cache, "replicated_blocks", None), int)
-        )
+    return isinstance(getattr(cache, "row_offset", None), int) and not getattr(
+        cache, "sharded", False
     )
 
 
 def _fast_cache_offset_key(cache):
-    return (
-        (
-            cache.page_stride,
-            cache.block_offset,
-            cache.replicated_blocks,
-            cache.shape[0],
-        )
-        if getattr(cache, "sharded", False)
-        else cache.page_stride
-    )
+    return cache.page_stride
 
 
 def _map_cache_blocks(cache, blocks):
@@ -561,7 +548,7 @@ def _request_row_slots(cache, block_table, width, page_records: int = 0):
     (``[requests, num_pages]``).
     """
     rows_per_page = cache.shape[1]
-    fast_offset = _has_fast_cache_offset(cache) and not getattr(cache, "sharded", False)
+    fast_offset = _has_fast_cache_offset(cache)
     table_blocks = block_table.to(torch.int32) if fast_offset else block_table.long()
     page_bases = table_blocks * (cache.page_stride if fast_offset else rows_per_page)
     if page_records > 1 and rows_per_page == page_records:
@@ -1670,9 +1657,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             # Rows are row_indices of _row_slots(..., logical),
                             # computed per request: [requests, capacity]. The
                             # indexer shares each request's key tiles.
-                            has_fast_idx_offset = _has_fast_cache_offset(
-                                index_cache
-                            ) and not getattr(index_cache, "sharded", False)
+                            has_fast_idx_offset = _has_fast_cache_offset(index_cache)
                             idx_page_records = _index_page_records(index_cache)
                             idx_req_key = self._stage_cache_key(
                                 "index_req_slots",
