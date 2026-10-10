@@ -430,6 +430,7 @@ class TestCLIAndGitSha:
 class TestLaunchAndAggregation:
     def test_prepare_worker_env(self, monkeypatch):
         monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "4")
+        monkeypatch.delenv("TORCH_TPU_XPROF_SESSION_ID", raising=False)
         args_no_prof = argparse.Namespace(profile=None)
         with patch(
             "torch_tpu._internal.distributed.launchers.singlehost_wrapper"

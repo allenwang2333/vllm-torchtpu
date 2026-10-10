@@ -630,6 +630,16 @@ class TestBenchDecodeAttention:
 
 
 class TestBenchDecodeIndexerSplit:
+    @pytest.fixture(autouse=True)
+    def _restore_ak_indexer_state(self):
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as ak
+
+        saved = (ak._INDEX_KEYS_PER_ITER, ak._INDEX_MAX_TILE, ak._visible_top_k)
+        try:
+            yield
+        finally:
+            ak._INDEX_KEYS_PER_ITER, ak._INDEX_MAX_TILE, ak._visible_top_k = saved
+
     def test_constants_and_split_part(self):
         assert bdis.SUBOPS == ("candidate_write", "candidate_filter", "full_context")
         assert bdis.SPLITS == ("pad16", "balanced", "ceil")

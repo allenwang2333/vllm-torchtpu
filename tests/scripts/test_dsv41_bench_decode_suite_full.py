@@ -445,6 +445,7 @@ class TestLaunchAndAggregation:
         # Asserts the PJRT_DEVICE default, so drop any value an earlier test
         # module exported (test_td857 sets PJRT_DEVICE=cpu at import time).
         monkeypatch.delenv("PJRT_DEVICE", raising=False)
+        monkeypatch.delenv("TORCH_TPU_XPROF_SESSION_ID", raising=False)
         args_no_prof = argparse.Namespace(profile=None)
         with patch(
             "torch_tpu._internal.distributed.launchers.singlehost_wrapper"
