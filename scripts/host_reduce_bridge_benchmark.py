@@ -76,7 +76,7 @@ def worker(local_rank: int, args: argparse.Namespace) -> None:
         pass
     dist.barrier(group=cpu_group)
     results = []
-    for batch in [8, 64, 256]:
+    for batch in args.batches:
         torch.manual_seed(1900 + rank + batch)
         x_cpu = (torch.randn(batch, 8192) * 0.02).to(torch.bfloat16)
         want = x_cpu.float()
@@ -163,6 +163,7 @@ def main() -> None:
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--inner", type=int, default=30)
     p.add_argument("--repeats", type=int, default=11)
+    p.add_argument("--batches", type=int, nargs="+", default=[8, 64, 256])
     p.add_argument("--reverse", action="store_true")
     p.add_argument("--profile", action="store_true")
     p.add_argument("--tag", default="bridge")

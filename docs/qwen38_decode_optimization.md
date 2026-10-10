@@ -59,5 +59,28 @@ capture a trace, verify completed token counts and actual batch/acceptance.
 Raw logs and traces remain on the remote hosts.
 
 Prior unmodified-collective runs measured 966.62 and 963.46 output tokens/s,
-with near-zero dummy MTP acceptance. UT gains are not end-to-end gains;
-the matched service comparison is pending.
+with near-zero dummy MTP acceptance. The matched comparison on October 10
+measured 965.89/964.66 output tokens/s for the original collective and
+972.16/971.51 for the candidate: mean improvement **0.68%**, not the UT-derived
+3.6% projection. Both variants completed all 64 x 1024 outputs. Cold rounds
+without a full 64-client overlap window were excluded. Prefix caching was
+configured and identical prompts prewarmed; the client does not expose exact
+cache hit counts.
+
+The candidate trace confirms 64 requests / 256 verification tokens and 92
+host AllGather calls. Main-forward median is 58.13 ms. In one complete
+forward, AllReduce time falls from 17.58 to 11.48 ms, but host ReduceScatter
+waits and AllGather consume about 3.35 and 2.12 ms. The AllGather label uses
+an underscore (`all_gather`), so counting only `all-gather` understates
+communication. After including it, synchronous communication savings are
+about 0.6 ms, consistent with the modest whole-service gain. Async operation
+lifetimes overlap and are not additive device execution times.
+
+At 70% accepted/proposed MTP tokens and K=3, the illustrative multiplier is
+3.1 tokens/iteration: candidate throughput about 3013 tokens/s and amortized
+TPOT about 21.2 ms. These are estimates, not real-weight measurements.
+
+A follow-up concurrency sweep covers 64, 80, 96, 112, 128 and 256 requests.
+New B and 4B collective shapes must pass the standalone 32-process bridge
+checks before enabling their serving dispatch. Larger-batch results are
+pending.
