@@ -437,6 +437,9 @@ class TestFusedSwaHelpers:
             (24, 192, 48, True),  # decode verify batch, tokens < 128
             (200, 128, 48, True),  # not a 64 multiple
             (192, 128, None, True),  # DSpark verify multiple of 6 without bound
+            (128, 192, None, True),  # power-of-two multi-request verify shard (w!=128)
+            (256, 192, None, True),  # B=2048 multi-request verify shard (w!=128)
+            (256, 128, None, False),  # 2048-token prefill chunk keeps shared union
             (192, 128, 48, False),  # prefill tile with bound: shared union
             (128, 64, 48, False),
             (24, 96, 48, True),  # width not a 64 multiple still falls back
@@ -455,6 +458,8 @@ class TestFusedSwaHelpers:
             (24, 192, 48),
             (128, 64, 48),
             (192, 128, None),
+            (256, 192, None),
+            (256, 128, None),
             (128, 512, 4),
         ]:
             q = jnp.zeros((tokens, 1, 64), jnp.bfloat16)
@@ -488,7 +493,7 @@ class TestFusedSwaHelpers:
         rows = jnp.asarray(rng.standard_normal((40, dim)), jnp.bfloat16)
         # Poison the rows a -1 record may read (clamped or wrapped index).
         rows = rows.at[0].set(jnp.nan).at[-1].set(jnp.nan)
-        # Pack BF16 pairs into int32 words: element 2i low, 2i + 1 high.
+        # Pack BF16 pairs into int32 words: element 2i low, element 2i + 1 high.
         bits = jax.lax.bitcast_convert_type(rows, jnp.uint16).astype(jnp.uint32)
         pool = (bits[:, 0::2] | (bits[:, 1::2] << 16)).astype(jnp.int32)
         records = jnp.asarray(
@@ -518,11 +523,11 @@ class TestFusedSwaHelpers:
         dim = 256
         pool = jnp.arange(32 * 128, dtype=jnp.int32).reshape(32, 128)
         banks = (pool[:16], pool[16:])
-        records = jnp.full((3, 200), 20, jnp.int32)
+        records = jnp.full((50, 200), 20, jnp.int32)
         kv, bias = attention_kernels.fused_swa_inputs(banks, records, dim)
-        assert kv.shape == (3, 256, dim)
-        assert bias.shape == (3, 2, 128)
-        flat = bias.reshape(3, 256)
+        assert kv.shape == (50, 256, dim)
+        assert bias.shape == (50, 2, 128)
+        flat = bias.reshape(50, 256)
         assert jnp.all(flat[:, :200] == 0)
         assert jnp.all(flat[:, 200:] == jnp.finfo(jnp.float32).min)
         assert jnp.all(kv[:, 200:] == 0)
