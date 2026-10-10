@@ -1216,11 +1216,21 @@ class DeepseekV41Model(nn.Module):
         )
         self.engram_layout = EngramLayout.from_config(config)
         self.candidate_block_buffer: torch.Tensor | None = None
-        cand_blocks = getattr(config, "candidate_topk_blocks", 0)
-        if getattr(config, "candidate_source_layer_id", -1) >= 0 and cand_blocks:
+        cand_blocks = getattr(config, "candidate_topk_blocks", 0) or (
+            2048
+            if os.environ.get("VLLM_DSV41_ENCODER_CAND_MODE", "1") == "1"
+            else 0
+        )
+        if (
+            getattr(config, "candidate_source_layer_id", -1) >= 0
+            or os.environ.get("VLLM_DSV41_ENCODER_CAND_MODE", "1") == "1"
+        ) and cand_blocks:
             self.candidate_block_buffer = torch.full(
                 (max_tokens, cand_blocks), -1, dtype=torch.int32
             )
+        object.__setattr__(
+            config, "_tpu_candidate_block_buffer", self.candidate_block_buffer
+        )
 
         total_layers = int(config.num_hidden_layers)
         ced_boundary = total_layers // 2
