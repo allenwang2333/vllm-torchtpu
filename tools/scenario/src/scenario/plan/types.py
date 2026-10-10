@@ -47,6 +47,7 @@ RefKind = Literal[
     "pulled_model_dir",
     "server_log",
     "image",
+    "libtpu_block",
 ]
 Backend = Literal["single", "mp", "ray"]
 
@@ -64,6 +65,8 @@ class Ref:
     config.json. server_log: the driver host's own server log.
     image: the image the pods run, as the target set it, else the Plan's;
     empty when neither names one.
+    libtpu_block: the tool's directory whose libtpu cannot be imported,
+    ahead of the inherited PYTHONPATH.
     """
 
     kind: RefKind

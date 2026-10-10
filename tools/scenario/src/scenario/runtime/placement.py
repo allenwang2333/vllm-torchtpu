@@ -20,6 +20,7 @@ runs the same on VMs and under any target that sets those names.
 """
 
 import json
+import os
 import pathlib
 import subprocess
 from collections.abc import Callable, Iterable, Mapping
@@ -42,6 +43,10 @@ ENV_IMAGE = "SCENARIO_IMAGE"
 ENV_TARGET_DATA = "SCENARIO_TARGET_DATA"
 
 LOOPBACK = "127.0.0.1"
+# Its libtpu cannot be imported; first on a chipless driver's PYTHONPATH.
+LIBTPU_BLOCK = pathlib.Path(__file__).resolve().parent / "libtpu_block"
+# Read only to be extended: the libtpu block goes in front of it.
+ENV_PYTHONPATH = "PYTHONPATH"
 
 
 @dataclass(frozen=True)
@@ -264,6 +269,7 @@ class Refs:
         self.server_log = server_log
         self._resolve = resolve
         self._image = env.get(ENV_IMAGE) or plan.image or ""
+        self._pythonpath = env.get(ENV_PYTHONPATH, "")
         self._pulled_dir = pulled_dir or (
             lambda: pulled_model_dir(plan.model_path, env)
         )
@@ -321,6 +327,9 @@ class Refs:
             return self._pulled_model_dir(ref)
         if ref.kind == "image":
             return self._image
+        if ref.kind == "libtpu_block":
+            parts = [str(LIBTPU_BLOCK), self._pythonpath]
+            return os.pathsep.join(part for part in parts if part)
         raise RunError(USAGE, f"this runtime cannot fill a {ref.kind} Ref")
 
     def _head_ip(self) -> str:

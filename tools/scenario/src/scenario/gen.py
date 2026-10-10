@@ -503,6 +503,8 @@ def _ref_rows() -> Iterator[tuple[str, str]]:
         "pulled_model_dir": "an object-storage model's pulled directory, or a fallback",
         "server_log": "the driver host's own server log",
         "image": "the image the pods run, as the target set it, else the Plan's",
+        "libtpu_block": "the tool's directory with a libtpu that cannot be "
+        "imported, then the inherited PYTHONPATH",
     }
     for kind in get_args(plan_types.RefKind):
         yield f"`{kind}`", meanings[kind]

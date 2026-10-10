@@ -459,7 +459,16 @@ def env_names_read() -> list[str]:
     return found
 
 
+# Read to be extended, never for placement: a chipless driver's PYTHONPATH
+# gets the libtpu block in front of the inherited one (P-18).
+EXTENDED = {"PYTHONPATH"}
+
+
 def test_the_runtime_reads_only_scenario_env() -> None:
     names = env_names_read()
     assert "SCENARIO_PLAN" in names
-    assert [name for name in names if not name.startswith("SCENARIO_")] == []
+    assert [
+        name
+        for name in names
+        if not name.startswith("SCENARIO_") and name not in EXTENDED
+    ] == []
