@@ -120,6 +120,61 @@ def test_direct_forward_entry():
 
 
 @pytest.mark.parametrize(
+    "batch,dtype,reduced",
+    [
+        (64, torch.bfloat16, False),
+        (256, torch.bfloat16, False),
+        (8, torch.bfloat16, False),
+        (64, torch.float32, False),
+        (64, torch.bfloat16, True),
+    ],
+)
+def test_host_reduce_preserves_reduction_and_truncation(batch, dtype, reduced):
+    runner = VllmMoERunner.__new__(VllmMoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.moe_config = SimpleNamespace(
+        is_sequence_parallel=False,
+        skip_final_all_reduce=False,
+        tp_size=32,
+        ep_size=32,
+    )
+    calls = []
+
+    def host_reduce(x):
+        calls.append("host")
+        return x * 32
+
+    def native_reduce(x):
+        calls.append("native")
+        return x * 32
+
+    runner._host_reduce = host_reduce
+    x = torch.ones(batch, 8192, dtype=dtype)
+    with patch.object(
+        moe_runner_mod, "tensor_model_parallel_all_reduce", native_reduce
+    ):
+        got = runner._maybe_reduce_final_output(x, 8000, reduced)
+    torch.testing.assert_close(got, x[:, :8000] * (1 if reduced else 32))
+    expected = (
+        []
+        if reduced
+        else ["host" if batch in (64, 256) and dtype == torch.bfloat16 else "native"]
+    )
+    assert calls == expected
+    calls.clear()
+    with patch.object(
+        moe_runner_mod, "tensor_model_parallel_all_reduce", native_reduce
+    ):
+        compiled = torch.compile(
+            lambda value: runner._maybe_reduce_final_output(value, 8000, reduced),
+            backend="eager",
+            fullgraph=True,
+        )
+        torch.testing.assert_close(compiled(x), got)
+    assert calls == expected
+
+
+@pytest.mark.parametrize(
     ("fused_ep_kernel", "armed", "expected"),
     [
         (False, False, False),

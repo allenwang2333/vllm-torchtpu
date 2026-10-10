@@ -15,6 +15,8 @@
 
 from collections.abc import Callable
 
+import torch
+import torch.distributed as dist
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
@@ -46,6 +48,44 @@ class VllmMoERunner(MoERunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._take_over_moe_quant_config_init()
+        self._host_reduce: Callable | None = None
+        if (
+            self.moe_config.tp_size == 32
+            and self.moe_config.ep_size == 32
+            and self.moe_config.pcp_size == 1
+            and not self.moe_config.is_sequence_parallel
+            and not self.moe_config.skip_final_all_reduce
+            and dist.get_world_size() == 32
+        ):
+            from vllm_torchtpu.distributed.host_hierarchical_reduce import (
+                get_serving_host_reduce,
+            )
+
+            self._host_reduce = get_serving_host_reduce()
+
+    def _maybe_reduce_final_output(
+        self,
+        states: torch.Tensor,
+        trunc_size: int | None,
+        output_is_reduced: bool | None = None,
+    ) -> torch.Tensor:
+        reduced = (
+            self._fused_output_is_reduced
+            if output_is_reduced is None
+            else output_is_reduced
+        )
+        # Restrict the candidate to the shapes and dtype validated by the UT.
+        if (
+            self._host_reduce is not None
+            and not reduced
+            and states.ndim == 2
+            and states.shape[0] in (64, 256)
+            and states.shape[1] == 8192
+            and states.dtype == torch.bfloat16
+        ):
+            states = self._host_reduce(states)
+            reduced = True
+        return super()._maybe_reduce_final_output(states, trunc_size, reduced)
 
     def _take_over_moe_quant_config_init(self) -> None:
         routed_experts = self.routed_experts
