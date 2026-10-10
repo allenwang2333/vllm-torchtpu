@@ -1,0 +1,23 @@
+{
+  "isl1024_osl1024_c64": {
+    "completed": 320,
+    "median_tpot_ms": 28.596782990276182,
+    "num_prompts": 320,
+    "output_token_throughput": 2110.5144365553924,
+    "total_token_throughput": 4219.906110696252
+  },
+  "isl1024_osl8192_c64": {
+    "completed": 320,
+    "median_tpot_ms": 26.7753138162695,
+    "num_prompts": 320,
+    "output_token_throughput": 2240.8021487228266,
+    "total_token_throughput": 2520.869184965272
+  },
+  "isl8192_osl1024_c64": {
+    "completed": 320,
+    "median_tpot_ms": 53.36636206247191,
+    "num_prompts": 320,
+    "output_token_throughput": 1133.613461421795,
+    "total_token_throughput": 10193.96299938773
+  }
+}
