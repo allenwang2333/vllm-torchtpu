@@ -92,12 +92,12 @@ def padding_mask_for(
     num_tokens: int, is_local_tensor: bool = False
 ) -> torch.Tensor | None:
     """The padded-row mask for a [num_tokens, ...] tensor, or None when no padding state is set; gathered
-    across the DP ranks unless the tensor is local."""
+    across the DP/PCP ranks unless the tensor is local."""
     if _padding_state is None:
         return None
     if is_local_tensor:
         return _padding_state.get_local_padding_mask(num_tokens)
-    from vllm.distributed.parallel_state import get_dp_group
+    from vllm.distributed.parallel_state import get_dp_group, get_pcp_group
 
     dp_group = get_dp_group()
     dp_size = dp_group.world_size
@@ -105,6 +105,12 @@ def padding_mask_for(
         local_padding = _padding_state.get_local_padding_mask(num_tokens // dp_size)
         # TPU collectives may not support bool, so encode the mask as int8.
         gathered_padding = dp_group.all_gather(local_padding.to(torch.int8), dim=0)
+        return gathered_padding.ne(0)
+    pcp_group = get_pcp_group()
+    pcp_size = pcp_group.world_size
+    if pcp_size > 1:
+        local_padding = _padding_state.get_local_padding_mask(num_tokens // pcp_size)
+        gathered_padding = pcp_group.all_gather(local_padding.to(torch.int8), dim=0)
         return gathered_padding.ne(0)
     return _padding_state.get_local_padding_mask(num_tokens)
 
@@ -144,29 +150,15 @@ def zero_routing_weights_for_padding(
         topk_ids: Selected expert IDs for each token.
         topk_weights: Routing weights for each token.
         is_local_tensor: Whether topk_ids and topk_weights are local tensors
-            (i.e. not gathered across DP ranks). If True, skips DP all_gather.
+            (i.e. not gathered across DP/PCP ranks). If True, skips all_gather.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor]: The (topk_ids, topk_weights) tensors
             with routing weights zeroed for padded tokens.
     """
-    if _padding_state is None:
+    is_padding = padding_mask_for(topk_ids.shape[0], is_local_tensor)
+    if is_padding is None:
         return topk_ids, topk_weights
-    num_tokens = topk_ids.shape[0]
-    if is_local_tensor:
-        is_padding = _padding_state.get_local_padding_mask(num_tokens)
-    else:
-        from vllm.distributed.parallel_state import get_dp_group
-
-        dp_group = get_dp_group()
-        dp_size = dp_group.world_size
-        if dp_size > 1:
-            local_padding = _padding_state.get_local_padding_mask(num_tokens // dp_size)
-            # TPU collectives may not support bool, so encode the mask as int8.
-            gathered_padding = dp_group.all_gather(local_padding.to(torch.int8), dim=0)
-            is_padding = gathered_padding.ne(0)
-        else:
-            is_padding = _padding_state.get_local_padding_mask(num_tokens)
     topk_weights = torch.where(
         is_padding[:, None], torch.zeros_like(topk_weights), topk_weights
     )

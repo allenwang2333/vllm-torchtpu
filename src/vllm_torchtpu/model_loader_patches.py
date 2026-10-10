@@ -665,7 +665,7 @@ class ExpertWriteTracker:
 
 
 # Host bytes per device upload of a staged parameter.
-_UPLOAD_CHUNK_BYTES = 256 << 20
+_UPLOAD_CHUNK_BYTES = 1024 << 20
 # Parameters staged at once before the oldest is written early.
 _MAX_STAGED = 32
 
