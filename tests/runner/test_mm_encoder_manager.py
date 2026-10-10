@@ -552,5 +552,4 @@ def test_mm_encoder_manager_use_dp_logic(compile_mock):
         ),
     )
     mgr_tp1 = mm.MMEncoderManager(config_tp1, torch.device("cpu"), model)
-    assert mgr_tp1.use_dp is False 
-    
+    assert mgr_tp1.use_dp is False
