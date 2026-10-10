@@ -467,7 +467,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         # MoE
         "wloc": pltpu.VMEM((M, 128), F32), "routed": pltpu.VMEM((M, H), F32),
         "shared": pltpu.VMEM((M, H), F32),
-        "sxb": pltpu.VMEM((NBLK13, M, 128), F32), "sxb2": pltpu.VMEM((NBLK2, M, 128), F32), "xqm": pltpu.VMEM((M, H), FP8),
+        "sxb": pltpu.VMEM((NBLK13, M, 128), F32), "sxb2": pltpu.VMEM((NBLK2, M, 128), F32), "xqm": pltpu.VMEM((M, H), FP8), "sxr": pltpu.VMEM((M, 128), F32),
         "hitv": pltpu.VMEM((8, 128), I32), "hits": pltpu.SMEM((8, 128), I32),
         "es13": pltpu.VMEM((cfg.ER + cfg.KREP, 2 * cfg.I), F32),
         "es2": pltpu.VMEM((cfg.ER + cfg.KREP, H), F32),
@@ -805,6 +805,16 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 out.append(q)
             return jnp.concatenate(out, axis=1)
 
+
+        def blk_quant_xbf(nblk, sname):
+            """blk_quant(xbf) -> scr['xqm'], block row scales -> scr[sname], in RQ-row chunks."""
+            def f(rs):
+                x = scr["xbf"][rs, :].astype(F32)
+                for b in range(nblk):
+                    q, s_ = quant_block_gmm(x[:, b * cfg.QB:(b + 1) * cfg.QB])
+                    scr[sname][b, rs, :] = jnp.broadcast_to(s_, (RQ, 128))
+                    scr["xqm"][rs, b * cfg.QB:(b + 1) * cfg.QB] = q
+            rowwise(f, RQ)
         def sm(slot, name):
             o, n = lay[name]
             return scr["sm"][slot, :, o:o + n]
@@ -861,7 +871,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             return jnp.concatenate(rows, axis=0).astype(F32)
 
         def reduce_scatter_rows(part_bf16, ss, rs):
-            """part [M, H] (bf16 values) -> sum over ranks of this rank's owned rows (RPR, H) f32."""
+            """part [M, H] (bf16 values; a value or a VMEM ref) -> sum over ranks of this rank's owned
+            rows (RPR, H) f32."""
             for d in range(R):
                 scr["psend"][d] = jnp.concatenate(
                     [part_bf16[d + R * k_:d + R * k_ + 1, :] for k_ in range(RPR)], axis=0).astype(BF16)
@@ -871,6 +882,43 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             for s_ in range(1, R):
                 a = a + scr["rsrecv"][s_].astype(F32)
             return a                                                 # (RPR, H) f32
+
+        # H-wide [M, H] work in row chunks through VMEM refs: a whole-M value spills (8.7 MiB of
+        # register-allocator spill slots at TMAX 64, AOT). RQ: fp8 sublane tile (32 rows).
+        RQ = 32 if M % 32 == 0 else M
+        RF = 16 if M % 16 == 0 else M
+
+        def rowwise(fn, rc):
+            def body(c, cc):
+                fn(pl.ds(pl.multiple_of(c * rc, rc), rc))
+                return cc
+            lax.fori_loop(0, M // rc, body, 0)
+
+        def gather_rows_xbf(x_own_f32, ss, rs):
+            """gather_rows_all, written straight into scr['xbf'] (bf16, all rows in t order)."""
+            scr["hsend"][...] = x_own_f32[0:RPR].astype(BF16)
+            scr["xall"][me] = scr["hsend"][...]
+            exchange(lambda d: scr["hsend"], scr["xall"], ss, rs)
+            for k_ in range(RPR):
+                for s_ in range(R):
+                    t_ = s_ + R * k_
+                    scr["xbf"][t_:t_ + 1, :] = scr["xall"][s_, k_:k_ + 1, :]
+            if M > TMAX:
+                scr["xbf"][TMAX:M, :] = jnp.zeros((M - TMAX, H), BF16)
+
+        def quant_xbf():
+            """quant_rows(xbf) -> scr['xq'][:, :H], row scales -> scr['sxr'] (lane-broadcast)."""
+            def f(rs):
+                q, s_ = quant_rows(scr["xbf"][rs, :].astype(F32))
+                scr["xq"][rs, :H] = q
+                scr["sxr"][rs, :] = jnp.broadcast_to(s_, (RQ, 128))
+            rowwise(f, RQ)
+
+        def part_from_acc(scale_row):
+            """scr['part'] = bf(acc[:, :H] * sxr * scale_row), in row chunks."""
+            def f(rs):
+                scr["part"][rs, :] = bf(scr["acc"][rs, 0:H] * scr["sxr"][rs, 0:1] * scale_row)
+            rowwise(f, RF)
 
         def own_rows_pad(x):
             """(RPR, H) -> (RO8, H)."""
@@ -972,13 +1020,12 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             x = scr["h"][...] + scr["res"][...]                          # f32 sum, unrounded
             scr["res"][...] = bf(x)
             hn = rmsnorm(x, sm(slot, "in_ln"), cfg.eps) * own_valid()
-            X = gather_rows_all(hn, "ag_send", "ag_recv")                  # [M, H] f32
-            scr["xbf"][...] = X.astype(BF16)
+            gather_rows_xbf(hn, "ag_send", "ag_recv")                      # -> xbf [M, H]
 
             # 3: replicated fused_qkv_a, norms, k_pe rope
             ph.mark("L_qkva")
-            xq, sx = quant_rows(X)
-            scr["xq"][:, :H] = xq
+            quant_xbf()
+            sx = scr["sxr"][:, 0:1]
             a = matmul("qkv_a", l, scr["xq"], H, rup(cfg.QKVA))
             o_s, _ = lay["qkv_a_s"]
             qkv_s = scr["sm"][slot, :, o_s:o_s + rup(cfg.QKVA)]
@@ -1060,42 +1107,43 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             give("w_uv")
             xq, sx = quant_rows(scr["orow"][...])
             scr["xq"][:, :KRO] = xq
-            a = matmul("o_proj", l, scr["xq"], KRO, H)
-            part = bf(a * sx * sm(slot, "o_proj_s"))
+            scr["sxr"][...] = jnp.broadcast_to(sx, (M, 128))
+            matmul("o_proj", l, scr["xq"], KRO, H)
+            part_from_acc(sm(slot, "o_proj_s"))
             ph.mark("L_rs_attn")
-            attn = reduce_scatter_rows(part, "rso_send", "rso_recv")         # (RPR, H)
+            attn = reduce_scatter_rows(scr["part"], "rso_send", "rso_recv")  # (RPR, H)
             ph.mark("L_ag_post")
 
             # 13: owner post norm, AG
             x = own_rows_pad(bf(attn)) + scr["res"][...]
             scr["res"][...] = bf(x)
             hn = rmsnorm(x, sm(slot, "post_ln"), cfg.eps) * own_valid()
-            X = gather_rows_all(hn, "ag_send", "ag_recv")
-            scr["xbf"][...] = X.astype(BF16)
+            gather_rows_xbf(hn, "ag_send", "ag_recv")
 
             ph.mark("L_mlp")
 
             if cfg.first_dense > 0:                     # a dense layer exists (not in the drafter)
                 @pl.when(jnp.logical_not(is_moe))
                 def _dense():
-                    xq, sx = quant_rows(X)
-                    scr["xq"][:, :H] = xq
+                    quant_xbf()
+                    sx = scr["sxr"][:, 0:1]
                     a = matmul("w13", l, scr["xq"], H, 2 * cfg.IDR)
                     gu = bf(a * sx * sm(slot, "w13_s"))
                     mid = bf(gu[:, :cfg.IDR] * jax.nn.sigmoid(gu[:, :cfg.IDR]))
                     mid = bf(mid * gu[:, cfg.IDR:])
                     xq, sx = quant_rows(mid)
                     scr["xq"][:, :cfg.IDR] = xq
-                    a = matmul("w2", l, scr["xq"], cfg.IDR, H)
-                    scr["part"][...] = bf(a * sx * sm(slot, "w2_s"))
+                    scr["sxr"][...] = jnp.broadcast_to(sx, (M, 128))
+                    matmul("w2", l, scr["xq"], cfg.IDR, H)
+                    part_from_acc(sm(slot, "w2_s"))
 
             if cfg.first_dense < L:                     # a MoE layer exists (not in a dense-only build)
                 @pl.when(is_moe)
                 def _moe():
-                    moe(l, slot, X)
+                    moe(l, slot)
 
             ph.mark("L_rs_mlp")
-            mlp = reduce_scatter_rows(scr["part"][...], "rsm_send", "rsm_recv")
+            mlp = reduce_scatter_rows(scr["part"], "rsm_send", "rsm_recv")
             scr["h"][...] = own_rows_pad(bf(mlp))
             if draft:
                 pl.when(l == 0)(lambda: stage_wait(l))
@@ -1649,7 +1697,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             return [scr["oh"][hh] for hh in range(HR)]
 
         # ---------------- MoE ----------------
-        def moe(l, slot, X):
+        def moe(l, slot):
             ER = cfg.ER
             pm = Phases(tiles.trace)
             pm.mark("M_sw13")
@@ -1664,8 +1712,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             if KREP:
                 wsel("rs13", l, lambda r: pltpu.make_async_copy(r, es_dst("es13", True), scr["es_sem"].at[0]).start())
                 wsel("rs2", l, lambda r: pltpu.make_async_copy(r, es_dst("es2", True), scr["es_sem"].at[1]).start())
-            xq, sx = quant_rows(X)
-            scr["xq"][:, :H] = xq
+            quant_xbf()
+            sx = scr["sxr"][:, 0:1]
             # shared expert gate_up (TP slice)
             a = matmul("sw13", l, scr["xq"], H, 2 * cfg.ISR)
             gu = bf(a * sx * sm(slot, "sw13_s"))
@@ -1803,8 +1851,13 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             # shared down (local K, per-rank scale), the routed tiles stream under it
             xq2, sx2 = quant_rows(mid)
             scr["xq"][:, :cfg.ISR] = xq2
-            a = matmul("sw2", l, scr["xq"], cfg.ISR, H)
-            scr["shared"][...] = bf(a * sx2 * sm(slot, "sw2_s"))
+            scr["sxr"][...] = jnp.broadcast_to(sx2, (M, 128))
+            matmul("sw2", l, scr["xq"], cfg.ISR, H)
+            sw2_s = sm(slot, "sw2_s")
+
+            def sh_rows(rs):
+                scr["shared"][rs, :] = bf(scr["acc"][rs, 0:H] * scr["sxr"][rs, 0:1] * sw2_s)
+            rowwise(sh_rows, RF)
             pm.mark("M_exp")
             # routed experts
             pltpu.make_async_copy(es_dst("es13", False), es_dst("es13", False), scr["es_sem"].at[0]).wait()
@@ -1812,7 +1865,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             if KREP:
                 pltpu.make_async_copy(es_dst("es13", True), es_dst("es13", True), scr["es_sem"].at[0]).wait()
                 pltpu.make_async_copy(es_dst("es2", True), es_dst("es2", True), scr["es_sem"].at[1]).wait()
-            scr["xqm"][...] = blk_quant(X, NBLK13, "sxb")
+            blk_quant_xbf(NBLK13, "sxb")
             scr["routed"][...] = jnp.zeros((M, H), F32)
 
             def ebody(i, c):
@@ -1822,14 +1875,20 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 mid_ = bf(gu[:, :cfg.I] * jax.nn.sigmoid(gu[:, :cfg.I]))
                 mid_ = bf(mid_ * gu[:, cfg.I:])
                 scr["xq"][:, :cfg.I] = blk_quant(mid_, NBLK2, "sxb2")
-                a = matmul_blk("ew2", l, scr["xq"], cfg.I, H, j, "sxb2")
-                y_ = bf(a * scr["es2"][pl.ds(j, 1), :])
-                wcol = jnp.sum(jnp.where(lane128 == j, scr["wloc"][...], 0.0), axis=1, keepdims=True)
-                scr["routed"][...] += y_ * wcol
+                matmul_blk("ew2", l, scr["xq"], cfg.I, H, j, "sxb2")
+                es2_j = scr["es2"][pl.ds(j, 1), :]
+
+                def r_rows(rs):
+                    y_ = bf(scr["acc"][rs, 0:H] * es2_j)
+                    wcol = jnp.sum(jnp.where(lane128 == j, scr["wloc"][rs, :], 0.0), axis=1, keepdims=True)
+                    scr["routed"][rs, :] += y_ * wcol
+                r_rows(pl.ds(0, M))
                 return c
             lax.fori_loop(0, n_hit, ebody, 0)
-            routed = bf(bf(scr["routed"][...]) * cfg.routed_scale)
-            scr["part"][...] = bf(scr["shared"][...] + routed)
+            def comb_rows(rs):
+                routed = bf(bf(scr["routed"][rs, :]) * cfg.routed_scale)
+                scr["part"][rs, :] = bf(scr["shared"][rs, :] + routed)
+            rowwise(comb_rows, RF)
             pm.end()
 
         # ---------------- MTP drafter glue (draft=True; WHITEBOARD.v4) ----------------
