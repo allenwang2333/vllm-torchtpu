@@ -439,3 +439,37 @@ def test_dspark_context_kv_without_fast_offset_keeps_plain_insert(monkeypatch):
         )
     assert calls[-1][4] is None and calls[-2][4] is None
     assert calls[-1][1] is calls[-2][1]
+
+
+@pytest.mark.parametrize("geometry", sorted(GEOMETRIES))
+def test_td8243_dspark_context_kv_int32_slots_match_int64(monkeypatch, geometry):
+    """TD8.243: int32 block/slot math equals the former int64 math bitwise."""
+    rows = 4
+    calls: list[Any] = []
+    monkeypatch.setattr(v2_dspark, "_insert", _capture(calls))
+    table = torch.tensor([[1, 2, 5], [3, 4, -1]], dtype=torch.int32)
+    meta = SimpleNamespace(
+        seq_lens=torch.tensor([9, 6], dtype=torch.int32),
+        block_tables=table,
+        query_start_loc=torch.tensor([0, 5, 9], dtype=torch.int32),
+    )
+    positions = torch.tensor([2, 4, 6, 7, 8, 1, 3, 5, 9, 0], dtype=torch.int32)
+    cache = _real_cache(rows, geometry)
+    v2_dspark._insert_context_kv(
+        _dspark_layer(cache), torch.ones(10, 8), positions, meta
+    )
+    _, slots, _, valid, records = calls[-1]
+    assert slots.dtype == torch.int32
+
+    # The pre-TD8.243 int64 formula.
+    requests = v2_attn._token_requests(meta, positions).clamp(max=1)
+    pos_col = (positions // rows).clamp(max=table.shape[1] - 1).long()
+    blocks64 = table[requests, pos_col].long()
+    valid_token = torch.arange(10) < meta.query_start_loc[-1]
+    slots64 = (blocks64 * rows + positions % rows).masked_fill(~valid_token, -1)
+    assert torch.equal(slots.long(), slots64)
+    if records is not None:
+        write64 = v2_attn._fast_swa_row_slots(
+            cache, blocks64, positions % rows, ~valid | (slots64 < 0)
+        )
+        assert torch.equal(records, v2_attn._offset_records(cache, *write64))

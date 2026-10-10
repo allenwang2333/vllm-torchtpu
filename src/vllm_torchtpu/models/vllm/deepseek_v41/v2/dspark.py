@@ -210,7 +210,11 @@ def _insert_context_kv(
                 if table is None:
                     table = _block_table(metadata)
                 requests, pos_col, pos_rem, valid_token, valid_in_window = addr
-                blocks = table[requests, pos_col].long()
+                # int32 block / slot math (block tables and positions are
+                # int32; slots fit int32 like every PagedCacheRows record):
+                # TPU emulates int64 multiplies and adds. Only the gather
+                # indices (requests, pos_col) stay int64.
+                blocks = table[requests, pos_col].int()
                 swa_slots = (blocks * rows_per_page + pos_rem).masked_fill(
                     ~valid_token, -1
                 )
