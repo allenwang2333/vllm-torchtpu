@@ -919,3 +919,125 @@ def test_replay_starts_and_owner_token_layout_step_caches(monkeypatch):
     )
     assert pair3 is pair4
     assert pair3[1].tolist() == list(range(6, 12)) + list(range(0, 6))
+
+
+def test_td8235_fast_update_states_and_count_input_chunks():
+    """Verify TD8.235 steady-state _try_fast_update_states and _count_input_chunks."""
+    runner = object.__new__(TPUModelRunner)
+    runner._mamba_state_pos = {}
+    runner._mamba_offset_seeded = set()
+    runner._pre_async_results = None
+    runner._pp_is_last = True
+    runner.speculative_config = None
+    runner.use_async_spec_decode = True
+    runner.prev_num_draft_tokens = SimpleNamespace(np=np.ones(4, dtype=np.int32))
+    runner.is_unified_pool_used = lambda: False
+    runner._dense_kv_copy_supported = lambda: False
+
+    # 1) Early return when input_batch is None
+    so_base = SimpleNamespace(
+        finished_req_ids=set(),
+        preempted_req_ids=None,
+        scheduled_new_reqs=[],
+        new_block_ids_to_zero=[],
+        free_encoder_mm_hashes=[],
+        kv_cache_block_copies=None,
+        num_scheduled_tokens={"r0": 3, "r1": 3},
+        scheduled_spec_decode_tokens={"r0": [101, 102], "r1": [201, 202]},
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["r0", "r1"],
+            resumed_req_ids=set(),
+            num_computed_tokens=[10, 20],
+            num_output_tokens=[1, 2],
+            new_block_ids=[([5],), None],
+        ),
+    )
+    assert runner._try_fast_update_states(so_base) is False
+
+    # 2) Build lightweight InputBatch stub
+    appended_rows: list[tuple[object, int]] = []
+    refreshed: list[bool] = []
+    fallback_spec_calls: list[str] = []
+    runner.requests = {
+        "r0": SimpleNamespace(
+            req_id="r0",
+            num_computed_tokens=8,
+            output_token_ids=[11, 99, 99],
+            block_ids=([1],),
+            prev_num_draft_len=2,
+        ),
+        "r1": SimpleNamespace(
+            req_id="r1",
+            num_computed_tokens=18,
+            output_token_ids=[21, 22],
+            block_ids=([2],),
+            prev_num_draft_len=2,
+        ),
+    }
+    runner.input_batch = SimpleNamespace(
+        num_reqs=2,
+        req_ids=["r0", "r1"],
+        req_id_to_index={"r0": 0, "r1": 1},
+        num_computed_tokens_cpu=np.zeros(4, dtype=np.int32),
+        num_prompt_tokens=np.array([5, 10, 0, 0], dtype=np.int32),
+        num_tokens_no_spec=np.array([8, 12, 0, 0], dtype=np.int32),
+        token_ids_cpu=np.zeros((4, 32), dtype=np.int32),
+        is_token_ids=np.zeros((4, 32), dtype=bool),
+        spec_token_ids=[[9], [8], [], []],
+        block_table=SimpleNamespace(
+            append_row=lambda nb, idx: appended_rows.append((nb, idx))
+        ),
+        update_req_spec_token_ids=lambda req, _sched: fallback_spec_calls.append(
+            req.req_id
+        ),
+        refresh_metadata=lambda: refreshed.append(True),
+    )
+
+    # 3) Early return when use_ngram_gpu() is True
+    runner.speculative_config = SimpleNamespace(use_ngram_gpu=lambda: True)
+    assert runner._try_fast_update_states(so_base) is False
+    runner.speculative_config = SimpleNamespace(use_ngram_gpu=lambda: False)
+
+    # 4) Early return when n_reqs != input_batch.num_reqs
+    runner.input_batch.num_reqs = 3
+    assert runner._try_fast_update_states(so_base) is False
+    runner.input_batch.num_reqs = 2
+
+    # 5) Steady-state uniform spec-decode fast path via _update_states
+    assert runner._update_states(so_base) is None
+    assert runner.prev_num_draft_tokens.np.tolist() == [0, 0, 0, 0]
+    assert runner.input_batch.num_computed_tokens_cpu[:2].tolist() == [10, 20]
+    # r0 output_token_ids trimmed from len 3 -> 1, num_tokens_no_spec[0] = 5 + 1 = 6
+    assert runner.requests["r0"].output_token_ids == [11]
+    assert int(runner.input_batch.num_tokens_no_spec[0]) == 6
+    assert runner.requests["r0"].block_ids == ([1, 5],)
+    assert appended_rows == [(([5],), 0)]
+    # Spec tokens staged at [0, 6:8] and [1, 12:14]
+    assert runner.input_batch.token_ids_cpu[0, 6:8].tolist() == [101, 102]
+    assert runner.input_batch.token_ids_cpu[1, 12:14].tolist() == [201, 202]
+    assert runner.input_batch.is_token_ids[0, 6:8].tolist() == [True, True]
+    assert runner.input_batch.spec_token_ids[:2] == [[101, 102], [201, 202]]
+    assert runner.requests["r0"].prev_num_draft_len == 2
+    assert runner.requests["r1"].prev_num_draft_len == 2
+    assert len(refreshed) == 1
+
+    # 6) Non-uniform / empty spec tokens fallback + use_async_spec_decode=False
+    runner.use_async_spec_decode = False
+    so_base.scheduled_spec_decode_tokens = {"r0": [101], "r1": []}
+    assert runner._update_states(so_base) is None
+    assert fallback_spec_calls == ["r0", "r1"]
+
+    # 7) Empty scheduled_spec_decode_tokens clears spec_token_ids
+    so_base.scheduled_spec_decode_tokens = {}
+    assert runner._update_states(so_base) is None
+    assert runner.input_batch.spec_token_ids[:2] == [[], []]
+
+    # 8) _count_input_chunks: total_tokens > most_model_len, each req <= most_model_len
+    runner.most_model_len = 4
+    runner.num_reqs_most_model_len = 2
+    runner.num_reqs_max_model_len = 1
+    so_chunks = SimpleNamespace(
+        total_num_scheduled_tokens=6,
+        num_scheduled_tokens={"r0": 3, "r1": 3},
+    )
+    assert runner._count_input_chunks(so_chunks) == (1, 2)

@@ -9,6 +9,7 @@ import contextlib
 import copy
 import dataclasses
 import functools
+import itertools
 import math
 import os
 import time
@@ -593,6 +594,10 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
             f"{shapes}; the pipeline hand-off carries one per stage"
         )
     return next(iter(found.values()))
+
+
+_ORIG_GPU_UPDATE_STATES = GPUModelRunner._update_states
+_ARANGE_INTP: np.ndarray = np.arange(4096, dtype=np.intp)
 
 
 @functools.lru_cache(maxsize=64)
@@ -2699,6 +2704,97 @@ class TPUModelRunner(GPUModelRunner):
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
         return
 
+    def _try_fast_update_states(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Steady-state cached batch update bypassing set diffs and row slices."""
+        input_batch = getattr(self, "input_batch", None)
+        req_data = scheduler_output.scheduled_cached_reqs
+        req_ids = getattr(req_data, "req_ids", None)
+        if (
+            input_batch is None
+            or not req_ids
+            or GPUModelRunner._update_states is not _ORIG_GPU_UPDATE_STATES
+            or not getattr(self, "_pp_is_last", True)
+            or getattr(scheduler_output, "scheduled_new_reqs", None)
+            or getattr(scheduler_output, "new_block_ids_to_zero", None)
+            or getattr(scheduler_output, "free_encoder_mm_hashes", None)
+        ):
+            return False
+        spec_cfg = getattr(self, "speculative_config", None)
+        if spec_cfg is not None and getattr(spec_cfg, "use_ngram_gpu", lambda: False)():
+            return False
+        n_reqs = len(req_ids)
+        if (
+            not (0 < n_reqs == input_batch.num_reqs <= _ARANGE_INTP.size)
+            or len(scheduler_output.num_scheduled_tokens) != n_reqs
+            or req_ids != input_batch.req_ids[:n_reqs]
+        ):
+            return False
+
+        if getattr(self, "use_async_spec_decode", False):
+            self.prev_num_draft_tokens.np.fill(0)
+
+        num_computed_list = req_data.num_computed_tokens
+        input_batch.num_computed_tokens_cpu[:n_reqs] = num_computed_list
+        requests = self.requests
+        num_prompt_tokens = input_batch.num_prompt_tokens
+        num_tokens_no_spec = input_batch.num_tokens_no_spec
+        append_row = input_batch.block_table.append_row
+        for i, (req_id, num_comp, num_out, new_blocks) in enumerate(
+            zip(
+                req_ids,
+                num_computed_list,
+                req_data.num_output_tokens,
+                req_data.new_block_ids,
+            )
+        ):
+            req_state = requests[req_id]
+            req_state.num_computed_tokens = num_comp
+            if num_out < len(req_state.output_token_ids):
+                del req_state.output_token_ids[num_out:]
+                num_tokens_no_spec[i] = num_prompt_tokens[i] + num_out
+            if new_blocks is not None:
+                for block_ids, new_ids in zip(req_state.block_ids, new_blocks):
+                    block_ids.extend(new_ids)
+                append_row(new_blocks, i)
+
+        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if not scheduled_spec_tokens:
+            for spec_ids in input_batch.spec_token_ids[:n_reqs]:
+                spec_ids.clear()
+        else:
+            spec_list = [scheduled_spec_tokens.get(rid) for rid in req_ids]
+            first_spec = spec_list[0]
+            k = len(first_spec) if first_spec else 0
+            starts = num_tokens_no_spec[:n_reqs]
+            max_len = input_batch.token_ids_cpu.shape[1]
+            if (
+                0 < k <= _ARANGE_INTP.size
+                and all(ids is not None and len(ids) == k for ids in spec_list)
+                and int(starts.max()) + k <= max_len
+            ):
+                spec_np = np.fromiter(
+                    itertools.chain.from_iterable(spec_list),
+                    dtype=np.int32,
+                    count=n_reqs * k,
+                )
+                rows = _ARANGE_INTP[:n_reqs]
+                k_off = _ARANGE_INTP[:k]
+                flat_idx = ((rows * max_len + starts)[:, None] + k_off).ravel()
+                input_batch.token_ids_cpu.ravel()[flat_idx] = spec_np
+                input_batch.is_token_ids.ravel()[flat_idx] = True
+                for req_id, cur_spec, ids in zip(
+                    req_ids, input_batch.spec_token_ids[:n_reqs], spec_list
+                ):
+                    cur_spec[:] = ids
+                    requests[req_id].prev_num_draft_len = k
+            else:
+                update_spec = input_batch.update_req_spec_token_ids
+                for req_id in req_ids:
+                    update_spec(requests[req_id], scheduled_spec_tokens)
+
+        input_batch.refresh_metadata()
+        return True
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
         finished_req_ids = scheduler_output.finished_req_ids
         preempted_req_ids = scheduler_output.preempted_req_ids
@@ -2730,6 +2826,10 @@ class TPUModelRunner(GPUModelRunner):
             req_state.prev_num_draft_len = 0
         self._install_spec_token_room_guard()
         copies = scheduler_output.kv_cache_block_copies
+        if not (
+            finished_req_ids or preempted_req_ids or resumed_req_ids or copies
+        ) and self._try_fast_update_states(scheduler_output):
+            return None
         use_page_local_copy = bool(copies and self.is_unified_pool_used())
         # Per-layer (non-pooled) attention caches, e.g. DCP fine-grained
         # prefix hits on an MLA model: copy with the same donating program.
@@ -3870,7 +3970,8 @@ class TPUModelRunner(GPUModelRunner):
         to num_reqs_most_model_len requests, which can exceed
         num_reqs_max_model_len, so no batch-level clamp is a safe substitute.
         """
-        if scheduler_output.total_num_scheduled_tokens == 0:
+        total_tokens = scheduler_output.total_num_scheduled_tokens
+        if total_tokens == 0:
             return 0, 0
 
         num_reqs = self.input_batch.num_reqs
@@ -3881,9 +3982,12 @@ class TPUModelRunner(GPUModelRunner):
         num_chunks = 0
         max_chunk_reqs = 0
         while start_index < num_reqs:
-            use_max_model_len = most_model_len is None or any(
-                num_scheduled_tokens[req_ids[i]] > most_model_len
-                for i in range(start_index, num_reqs)
+            use_max_model_len = most_model_len is None or (
+                total_tokens > most_model_len
+                and any(
+                    num_scheduled_tokens[req_ids[i]] > most_model_len
+                    for i in range(start_index, num_reqs)
+                )
             )
             if use_max_model_len:
                 chunk_reqs = self.num_reqs_max_model_len
