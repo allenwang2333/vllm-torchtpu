@@ -467,6 +467,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         small_bucket_bkvp = envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP
         small_bucket_tokens = envs.TPU_STREAMIDX_SMALL_BUCKET_TOKENS
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
+        skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -537,6 +538,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_kv_pages_per_block=kv_pages_per_block,
                 num_queries_per_block=queries_per_block,
                 skip_empty_decode=skip_empty_decode,
+                skip_empty_decode_chunked=skip_empty_decode_chunked,
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
@@ -585,6 +587,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         small_bucket_bkvp = envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP
         small_bucket_tokens = envs.TPU_STREAMIDX_SMALL_BUCKET_TOKENS
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
+        skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
 
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -636,6 +639,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_queries_per_block=queries_per_block,
                 kv_layout=kv_layout,
                 skip_empty_decode=skip_empty_decode,
+                skip_empty_decode_chunked=skip_empty_decode_chunked,
                 chunk_tokens=chunk_tokens,
                 a2a_merge=_dcp_indexer_a2a_for_bucket(
                     q.shape[0], a2a_merge, a2a_min_tokens
