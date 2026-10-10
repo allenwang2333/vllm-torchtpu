@@ -110,7 +110,6 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     logical_page_size: int,
     unnormalized_output: bool,
     non_causal_block: bool,
-    block_anchored_window: bool,
     q_compute_block_size: int | None,
     bkv_p,
     bq_sz,
@@ -153,9 +152,6 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     # Static upper bound on the number of bkv blocks any (seq, bq) block can
     # need
     max_bkv_blocks = cdiv(bq_sz + sliding_window - 1, bkv_sz)
-    if non_causal_block and block_anchored_window:
-        # The shared window starts one key before the first query's own window.
-        max_bkv_blocks = cdiv(bq_sz + sliding_window, bkv_sz)
     single_bkv_block = max_bkv_blocks == 1
 
     start_seq_idx = start_end_seq_idx_ref[0]
@@ -225,10 +221,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             qc = q_mat[start_row : start_row + chunk_size]
             q_span = q_sub_iota if c == 0 else (q_sub_iota + c * chunk_sz)
             keep = (q_span - k_span).astype(jnp.uint32) < jnp.uint32(sliding_window)
-            if non_causal_block and block_anchored_window:
-                # Every block query sees [kv_len - q_len - sliding_window, kv_len).
-                keep = (k_span >= (kv_len - q_len - sliding_window)) & (k_span < kv_len)
-            elif non_causal_block:
+            if non_causal_block:
                 keep = keep | ((k_span >= kv_len - q_len) & (k_span < kv_len))
             s = jnp.einsum("nd,md->nm", qc, kv, preferred_element_type=jnp.float32)
             s *= sm_scale
@@ -306,11 +299,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                     keep_short = (q_span_short - k_span).astype(
                         jnp.uint32
                     ) < jnp.uint32(sliding_window)
-                    if non_causal_block and block_anchored_window:
-                        keep_short = (
-                            k_span >= (kv_len - q_len - sliding_window)
-                        ) & (k_span < kv_len)
-                    elif non_causal_block:
+                    if non_causal_block:
                         keep_short = keep_short | (
                             (k_span >= kv_len - q_len) & (k_span < kv_len)
                         )
@@ -427,11 +416,6 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         )
 
     def _start_offset(seq_idx, bq_idx):
-        if non_causal_block and block_anchored_window:
-            return jnp.maximum(
-                _get_kv_len(seq_idx) - _get_q_len(seq_idx) - sliding_window,
-                0,
-            )
         # Exact start of the sliding window for this (seq, bq) block, in tokens.
         # The first query row of this bq block sits at position
         #   q_pos_min = kv_len - q_len + bq_idx * bq_sz
@@ -1606,7 +1590,6 @@ def run_mla_batched_decode_kernel(
         "logical_page_size",
         "unnormalized_output",
         "non_causal_block",
-        "block_anchored_window",
         "q_compute_block_size",
         "decode_seq_batch_size",
         "ced_decoder",
@@ -1640,8 +1623,6 @@ def mla_sliding_window_ragged_paged_attention(
     # sequence attend bidirectionally within themselves (window still bounds
     # context keys). Requires q_len <= sliding_window.
     non_causal_block: bool = False,
-    # V4.1 draft blocks: each query sees the block and sliding_window keys before it.
-    block_anchored_window: bool = False,
     decode_seq_batch_size: int = 32,
     ced_decoder: bool = False,
 ) -> tuple[
@@ -1818,11 +1799,7 @@ def mla_sliding_window_ragged_paged_attention(
         )
         bm_double_buf = bl_double_buf
 
-        single_bkv = (
-            cdiv(bq_sz + sliding_window, bkv_sz) == 1
-            if (non_causal_block and block_anchored_window)
-            else cdiv(bq_sz + sliding_window - 1, bkv_sz) == 1
-        )
+        single_bkv = cdiv(bq_sz + sliding_window - 1, bkv_sz) == 1
         scratch_rows = 128 if single_bkv else bq_sz * num_q_heads
         l_scratch = pltpu.VMEM(
             (scratch_rows,),
@@ -1880,7 +1857,6 @@ def mla_sliding_window_ragged_paged_attention(
                     logical_page_size=logical_page_size,
                     unnormalized_output=unnormalized_output,
                     non_causal_block=non_causal_block,
-                    block_anchored_window=block_anchored_window,
                     q_compute_block_size=q_compute_block_size,
                     ced_decoder=ced_decoder,
                 ),

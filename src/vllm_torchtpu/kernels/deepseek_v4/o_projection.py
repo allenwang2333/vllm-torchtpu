@@ -568,10 +568,7 @@ def fused_wq_b_q_rope_projection(
         positions = jnp.pad(positions, (0, pad_t))
     t_pad = qr.shape[0]
     eff_cap_t = 1024 if (num_heads >= 64 and t_pad >= 1024 and cap_t == 512) else cap_t
-    fp8_row_align = 4 * SUBLANE if t_pad % (4 * SUBLANE) == 0 else t_pad
-    tile_t = fp8_row_align * _largest_divisor(
-        t_pad // fp8_row_align, cap=max(1, eff_cap_t // fp8_row_align)
-    )
+    tile_t = SUBLANE * _largest_divisor(t_pad // SUBLANE, cap=eff_cap_t // SUBLANE)
     sub_t = SUBLANE * _largest_divisor(tile_t // SUBLANE, cap=128 // SUBLANE)
     num_t_tiles = t_pad // tile_t
 
