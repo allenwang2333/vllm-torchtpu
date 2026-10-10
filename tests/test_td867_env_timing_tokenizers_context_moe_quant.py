@@ -32,6 +32,7 @@ from vllm_torchtpu.runner import stage_timing
 def _set_env(monkeypatch, name: str, value: str | None) -> None:
     envs.__dict__.pop(name, None)
     if value is None:
+        monkeypatch.setenv(name, "")
         monkeypatch.delenv(name, raising=False)
     else:
         monkeypatch.setenv(name, value)
@@ -44,8 +45,9 @@ def test_env_override_all_branches(monkeypatch):
         "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE",
         "TPU_PREMAPPED_BUFFER_SIZE",
         "TPU_GDN_CONV_QK_PAIR_LAYOUT",
+        "LIBTPU_INIT_ARGS",
     ):
-        monkeypatch.delenv(var, raising=False)
+        _set_env(monkeypatch, var, None)
     with patch("vllm_torchtpu.patch_registry.apply"):
         # 1. Reload with Tier-3 cache set, Raiden enabled with degree >= 8,
         #    and empty LIBTPU_INIT_ARGS + TPU_ACCELERATOR_TYPE="tpu7x-8"
