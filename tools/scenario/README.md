@@ -231,7 +231,7 @@ target's, else `./scenario-results/<name>-<UTC stamp>`.
 | 2 | usage, scenario, Plan or placement error |
 | 3 | bring-up failed (a name, a taken port, the Ray cluster, a driver that never answered) |
 | 4 | the server was not ready: it died starting, or the wait ran out |
-| 5 | the server died after it was ready |
+| 5 | a server or the router died after it was ready |
 | 6 | a fatal after-task failed while every task passed |
 | 7 | the driver aborted or was lost (hosts that wait on a driver) |
 | 130, 143 | SIGINT, SIGTERM |
@@ -263,8 +263,25 @@ driver is done, 7 when it aborted or has not answered for 20 s, and 4 or 5
 when its own server dies (before or after the driver was serving). It
 writes its `summary.json` and `server.log` under `<run dir>/<role>-<index>`.
 
-This version runs scenarios of one role, on one host or over several with
-mp or Ray. Several roles come next.
+A scenario of several roles runs `scenario run --role ROLE` on every host,
+with every role's hosts in `--role-hosts` (or `SCENARIO_ROLE_HOSTS`), the
+chipless `client` included when the scenario has one:
+
+```
+scenario run FILE --role decode --host-index 0 --advertise-ip 10.0.0.2 \
+  --role-hosts 'prefill=p0;decode=d0;client=c0'
+```
+
+The driver is the part `tasks.driver` names: a role's first host, or the
+client, a host without chips that runs no server. After its own server it
+waits for each other role's head (`GET /health` on its API port, for that
+role's readiness wait plus 1800 s from the driver's start, since its host
+may start later), then starts the router and gives it 120 s to answer its
+health check. A router that dies stops the tasks with exit 5. A chipless
+driver's router and tasks get `VLLM_PLUGINS` empty,
+`TORCH_DEVICE_BACKEND_AUTOLOAD=0` and the tool's libtpu blocker first on
+`PYTHONPATH`, so vLLM's CLI from the TPU image finds no TPU on that host.
+The other roles' hosts follow the driver as a multi-host role's do.
 
 ## Usage
 

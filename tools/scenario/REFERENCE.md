@@ -724,3 +724,6 @@ apply, the first of these wins: a signal, 4 or 5, 3, 7, 1, 6.
 | after an abort, at most | 3 s |
 | a Ray worker probes the head's port every 10 s, gives up after | 1800 s |
 | the Ray head counts nodes with TPUs every 15 s, gives up after | 1800 s |
+| the driver asks the other roles' heads for readiness every | 5 s |
+| and waits their readiness wait from its own start, plus | 1800 s |
+| the router answers its health check from its start within | 120 s |

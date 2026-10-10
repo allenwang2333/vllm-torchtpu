@@ -14,21 +14,24 @@
 """One host's part of a run.
 
 Every host of a run runs the same Plan and finds its part from its
-placement: a role and an index. One part drives: the first host of the
-role. The others follow it (runtime/control.py). This version runs plans of
-one role over any number of mp or Ray hosts, and the task verbs against a
-server at a URL.
+placement: a role and an index, or the chipless client. One part drives:
+the first host of the only role, or the part tasks.driver names (a role's
+first host, or the client). The others follow it (runtime/control.py).
+The task verbs run against a server at a URL instead.
 
 A part runs its pre commands (ray start, the remote-code warm), then
-starts its server if it has one; a Ray worker has none. The driver serves
-its status to the followers, waits for its server to be ready (on an mp
-head, that means every host has joined; a Ray head starts its server only
-once every host is a node), runs the tasks in Plan order and tears down,
-`ray stop --force` last. A follower starts at once, without waiting on the
-driver, and leaves as the driver's status says.
+starts its server if it has one; a Ray worker and the client have none.
+The driver serves its status to the followers and waits for its own server
+(on an mp head, every host has joined; a Ray head starts its server only
+once every host is a node), then for the heads of the other roles, then
+starts the router and waits for it. It runs the tasks in Plan order and
+tears down: the router, its server, `ray stop --force`. A follower starts
+at once, without waiting on the driver, and leaves as the driver's status
+says.
 
 Tasks run in the Plan's order. A failed task does not stop the next one; a
-dead server does (exit 5), and so does a custom task's skip_rest_if_exit_ge.
+dead server or router does (exit 5), and so does a custom task's
+skip_rest_if_exit_ge.
 At its end the driver says done, with its exit code, before it stops its
 server, so a follower whose engine dies with the head's still leaves with
 0. SIGTERM or SIGINT says aborted, stops every child (20 s, then SIGKILL)
@@ -45,13 +48,13 @@ import pathlib
 import signal
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from scenario import __version__
 from scenario.plan import codec
-from scenario.plan.types import CLIENT_ROLE, Command, HostPlan, Plan, RolePlan
+from scenario.plan.types import CLIENT_ROLE, Command, HostPlan, Plan, Ref, RolePlan
 from scenario.runtime import (
     bringup,
     control,
@@ -63,7 +66,9 @@ from scenario.runtime import (
     results,
 )
 from scenario.runtime.context import (
+    Every,
     Liveness,
+    LocalRouter,
     LocalServer,
     RemoteServer,
     ServerDied,
@@ -205,6 +210,7 @@ class Host:
         self.options = options
         self.placement = placement
         self.started = now()
+        self.begun = time.monotonic()
         self.log = Log(placement.part, codec.digest(plan), __version__)
         self.summary: results.Summary | None = None
         self.server: Proc | None = None
@@ -349,12 +355,14 @@ class Host:
         if self.summary is not None:
             self.summary.command_failed()
 
-    def _stop_part(self) -> None:
-        if self.server is None and self.ray is None:
+    def _stop_part(self, first: Sequence[Proc] = ()) -> None:
+        """Stop `first`, then this host's server, then its Ray node."""
+        procs = [*first, *([self.server] if self.server is not None else [])]
+        if not procs and self.ray is None:
             return
         self.log.phase("stopping")
-        if self.server is not None:
-            self.server.stop()
+        for proc in procs:
+            proc.stop()
         if self.ray is not None:
             bringup.stop_ray(
                 self.ray, env=self.host_env, cwd=self.options.repo_root, log=self.log
@@ -383,6 +391,7 @@ class Driver(Host):
         self.liveness: Liveness = Liveness()
         self.publisher: Publisher | None = None
         self.status: StatusServer | None = None
+        self.router: Proc | None = None
 
     def run(self) -> int:
         code = exits.OK
@@ -491,8 +500,9 @@ class Driver(Host):
 
     def _bring_up(self) -> None:
         self._bring_up_part()
+        parts: list[Liveness] = []
         if self.server is not None and self.role is not None:
-            self.liveness = LocalServer(self.server, self.log, self.run_dir)
+            parts.append(LocalServer(self.server, self.log, self.run_dir))
             bringup.wait_ready(
                 self.server,
                 self.role.readiness,
@@ -501,6 +511,37 @@ class Driver(Host):
                 note=self._silent,
             )
             self._phase("ready")
+        others = [r for r in self.plan.roles if r.name != self.placement.role]
+        for role in others:
+            head = self.refs.ref(Ref("role_head", role=role.name))
+            readiness = role.readiness
+            bringup.wait_remote(
+                role.name,
+                f"http://{head}:{readiness.port}{readiness.path}",
+                deadline=self.begun + net.RESOLVE_TIMEOUT_S + readiness.timeout_s,
+                own=self.server,
+                log=self.log,
+                note=self._silent,
+            )
+        if others:
+            self._phase("roles-ready")
+        router = self.plan.driver.router
+        if router is not None:
+            self.router = bringup.start_router(
+                self.refs.argv(router.argv),
+                env={**self.host_env, **self.task_added},
+                added={"env": self.task_added},
+                cwd=self.options.repo_root,
+                log_path=self.run_dir / results.ROUTER_LOG,
+                log=self.log,
+            )
+            bringup.wait_router(
+                self.router, router.port, router.health_path, log=self.log
+            )
+            parts.append(LocalRouter(self.router, self.log))
+            self._phase("router-ready")
+        if parts:
+            self.liveness = parts[0] if len(parts) == 1 else Every(*parts)
         self._serving()
 
     def _serving(self) -> None:
@@ -521,18 +562,24 @@ class Driver(Host):
         self.summary.set(state="serving")
 
     def _serve(self) -> None:
-        """Serve until the server exits (exit 5) or a signal asks to stop."""
-        assert self.server is not None and self.role is not None
-        port = self.role.readiness.port
+        """Serve until the server or router exits (exit 5) or a signal stops it."""
+        driver = self.plan.driver
+        host = self.refs.value(driver.endpoint_host)
         self.log.say(
-            f"Serving {self.plan.model_name} at http://127.0.0.1:{port}; "
-            "SIGINT or SIGTERM stops it"
+            f"Serving {self.plan.model_name} at http://{host}:"
+            f"{driver.endpoint_port}; SIGINT or SIGTERM stops it"
         )
         try:
             while True:
-                code = self.server.wait(1.0)
-                if code is not None:
+                if self.server is None:
+                    time.sleep(1.0)
+                elif (code := self.server.wait(1.0)) is not None:
                     raise ServerDied(f"the server exited (exit {code})")
+                code = self.router.poll() if self.router is not None else None
+                if code is not None:
+                    raise ServerDied(
+                        f"the router exited (exit {code})", "the router died"
+                    )
         except Interrupted as stop:
             self.signals.consume()
             self.log.say(f"Stopping on signal {signal.Signals(stop.signum).name}")
@@ -583,9 +630,7 @@ class Driver(Host):
                 ctx.alive()
                 outcome = executor(ctx, task, entry)
             except (ServerDied, Interrupted) as stop:
-                why = (
-                    "the server died" if isinstance(stop, ServerDied) else "interrupted"
-                )
+                why = stop.reason if isinstance(stop, ServerDied) else "interrupted"
                 entry.update(status="failed", ended=summary.elapsed(), reason=why)
                 for _, rest in entries[position + 1 :]:
                     rest.update(status="skipped", reason=why)
@@ -609,7 +654,7 @@ class Driver(Host):
             self.status.set("aborted" if aborted else "done", code)
 
     def _teardown(self) -> None:
-        self._stop_part()
+        self._stop_part([self.router] if self.router is not None else [])
 
     def _end(self, code: int) -> int:
         """The target's end after-tasks, on normal and failure exits alike.
@@ -741,12 +786,6 @@ class Follower(Host):
             self.summary.set(state="serving")
 
 
-def _unsupported(plan: Plan) -> str | None:
-    if len(plan.roles) != 1 or plan.driver.chipless:
-        return "this version runs plans of one role; several roles come next"
-    return None
-
-
 def run(
     plan: Plan,
     options: RunOptions,
@@ -758,9 +797,6 @@ def run(
         return Driver(plan, options, at, executors).run()
     try:
         placement = place(plan, options.flags, options.env)
-        problem = _unsupported(plan)
-        if problem is not None:
-            raise RunError(exits.USAGE, problem)
     except RunError as error:
         log = Log("?", codec.digest(plan), __version__)
         log.error(error.message)

@@ -485,6 +485,18 @@ def reference() -> str:
                 f"{bringup.RAY_CLUSTER_POLL_S:g} s, gives up after",
                 f"{bringup.RAY_CLUSTER_TIMEOUT_S:g} s",
             ),
+            (
+                "the driver asks the other roles' heads for readiness every",
+                f"{bringup.REMOTE_POLL_S:g} s",
+            ),
+            (
+                "and waits their readiness wait from its own start, plus",
+                f"{net.RESOLVE_TIMEOUT_S} s",
+            ),
+            (
+                "the router answers its health check from its start within",
+                f"{bringup.ROUTER_READY_S:g} s",
+            ),
         ],
     )
     while lines[-1] == "":

@@ -39,6 +39,7 @@ CONFIG = "config.json"
 SCENARIO_RUN = "scenario_run.json"
 SUMMARY = "summary.json"
 SERVER_LOG = "server.log"
+ROUTER_LOG = "router.log"
 
 
 def results_root(

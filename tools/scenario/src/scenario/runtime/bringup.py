@@ -27,7 +27,11 @@ stops what is left of the group.
 
 The readiness wait is Readiness.timeout_s from the spawn, the number `show`
 prints: the engine's own startup timeout plus a margin, so a slow start
-fails with vLLM's message rather than the wait's.
+fails with vLLM's message rather than the wait's. A driver waits for the
+heads of the other roles as long, plus the names' budget, counted from its
+own start: their hosts may start later than its own. The router starts
+once every head is ready, so it never forwards to a head that cannot yet
+answer, and has ROUTER_READY_S to answer its own health check.
 """
 
 import contextlib
@@ -55,6 +59,10 @@ RAY_CLUSTER_POLL_S = 15.0
 RAY_CLUSTER_TIMEOUT_S = 1800.0
 # A Ray query, `ray status` and `ray stop` each give up after this long.
 RAY_COMMAND_TIMEOUT_S = 120.0
+# The heads of other roles are asked this often.
+REMOTE_POLL_S = 5.0
+# The router has this long from its spawn to answer its health check.
+ROUTER_READY_S = 120.0
 # Lines of the server's output repeated in a failure report; all of it was
 # streamed above.
 FAILURE_TAIL = 50
@@ -394,8 +402,100 @@ def wait_ready(
     )
 
 
-def report_tail(server: Proc, log: Log, count: int = FAILURE_TAIL) -> None:
-    lines = server.tail(count)
-    log.say(f"========== Last {len(lines)} lines of server.log ==========")
+def wait_remote(
+    role: str,
+    url: str,
+    *,
+    deadline: float,
+    own: Proc | None,
+    log: Log,
+    note: Callable[[], str] = lambda: "",
+) -> None:
+    """Wait for another role's head to answer `url`.
+
+    Raises:
+        RunError: exit 4, this host's own server died meanwhile, or the
+            deadline passed.
+    """
+    log.say(f"Waiting for role {role} at {url}")
+    started = time.monotonic()
+    outcome = net.wait_http(
+        url,
+        deadline=deadline,
+        proc=own,
+        interval_s=REMOTE_POLL_S,
+        progress=lambda waited: log.say(
+            f"Waiting for role {role}... ({waited:.0f}s elapsed){note()}"
+        ),
+    )
+    waited = time.monotonic() - started
+    if outcome == "ready":
+        log.say(f"Role {role} is ready ({waited:.0f}s)")
+        return
+    if outcome == "died":
+        assert own is not None
+        report_tail(own, log)
+        raise RunError(
+            NOT_READY,
+            f"this host's server died (exit {own.poll()}) while waiting for "
+            f"role {role}",
+        )
+    raise RunError(NOT_READY, f"role {role} was not ready at {url} in time")
+
+
+def start_router(
+    argv: Sequence[str],
+    *,
+    env: Mapping[str, str],
+    added: Mapping[str, Mapping[str, str]],
+    cwd: pathlib.Path,
+    log_path: pathlib.Path,
+    log: Log,
+) -> Proc:
+    """Spawn the router; its output goes to the log, prefixed, and `log_path`.
+
+    Raises:
+        RunError: exit 3, it cannot be run.
+    """
+    log.spawn("router", argv, added)
+    try:
+        return Proc(argv, env=env, cwd=cwd, log=log_path, prefix="[router] ").start()
+    except OSError as error:
+        raise RunError(BRINGUP, f"cannot run the router: {error}") from None
+
+
+def wait_router(router: Proc, port: int, path: str, *, log: Log) -> None:
+    """Wait ROUTER_READY_S for the router's health check.
+
+    Raises:
+        RunError: exit 4, it died or did not answer in time.
+    """
+    started = time.monotonic()
+    outcome = net.wait_http(
+        f"http://{LOOPBACK}:{port}{path}",
+        deadline=started + ROUTER_READY_S,
+        proc=router,
+        interval_s=POLL_INTERVAL_S,
+    )
+    if outcome == "ready":
+        log.say(f"Router ready on port {port} ({time.monotonic() - started:.0f}s)")
+        return
+    report_tail(router, log, "router.log")
+    if outcome == "died":
+        raise RunError(
+            NOT_READY, f"the router died while starting (exit {router.poll()})"
+        )
+    raise RunError(
+        NOT_READY,
+        f"the router was not ready within {ROUTER_READY_S:.0f}s (GET {path} on "
+        f"port {port})",
+    )
+
+
+def report_tail(
+    proc: Proc, log: Log, name: str = "server.log", count: int = FAILURE_TAIL
+) -> None:
+    lines = proc.tail(count)
+    log.say(f"========== Last {len(lines)} lines of {name} ==========")
     log.say("\n".join(lines))
     log.say("=" * 51)

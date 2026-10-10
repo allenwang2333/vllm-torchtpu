@@ -338,11 +338,12 @@ def _ready(url: str) -> bool:
     return net.http_status(f"{url}/health") == 200
 
 
-def test_several_roles_wait_for_a_later_version(
-    tmp_path: pathlib.Path, variants: dict[str, Data]
+def test_a_host_of_another_role_needs_the_role_hosts(
+    tmp_path: pathlib.Path, variants: dict[str, Data], capsys: Any
 ) -> None:
     env = stub_env(tmp_path)
     plan = build(variants["pd"])
     flags = PlacementFlags(role="prefill")
     assert run(plan, options(tmp_path, env, flags=flags), {}) == exits.USAGE
+    assert "set SCENARIO_ROLE_HOSTS or pass --role-hosts" in capsys.readouterr().out
     assert not (tmp_path / "results").exists()

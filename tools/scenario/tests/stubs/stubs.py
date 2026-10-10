@@ -78,7 +78,14 @@ module in the site directory reads the same state. Knobs:
     STUB_RAY_TPU=N             TPUs a node advertises (default 4)
     STUB_RAY_START_EXIT=N      `ray start` exits N at once
 
-`python3` runs the real interpreter for anything but `-m infx...`.
+`python3 examples/disagg/toy_proxy_server.py` is the router: /healthcheck,
+and every other request sent to the prefiller (POSTs only) and then the
+decoder, whose answer it returns. Knobs:
+
+    STUB_ROUTER_EXIT=N         exit N at once
+    STUB_ROUTER_DIE_AFTER=S    crash S seconds after start
+
+`python3` runs the real interpreter for anything else but `-m infx...`.
 """
 
 import contextlib
@@ -555,9 +562,80 @@ INFX: dict[str, Callable[[list[str]], int]] = {
 }
 
 
+# Router ------------------------------------------------------------------------
+
+
+def router(args: list[str]) -> int:
+    record("router", args)
+    if "STUB_ROUTER_EXIT" in os.environ:
+        print("ERROR stub router: failed to start", flush=True)
+        return int(os.environ["STUB_ROUTER_EXIT"])
+    port = int(flag(args, "--port", "8000") or 8000)
+    prefiller = (flag(args, "--prefiller-hosts"), int(flag(args, "--prefiller-ports")))
+    decoder = (flag(args, "--decoder-hosts"), int(flag(args, "--decoder-ports")))
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path == "/healthcheck":
+                body = b'{"status": "ok"}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.forward("GET", [decoder])
+
+        def do_POST(self) -> None:
+            self.forward("POST", [prefiller, decoder])
+
+        def forward(self, method: str, targets: list[tuple[Any, int]]) -> None:
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            status, data = 502, b"{}"
+            for host, target_port in targets:
+                conn = http.client.HTTPConnection(host, target_port, timeout=30)
+                try:
+                    conn.request(method, self.path, body=body or None)
+                    response = conn.getresponse()
+                    status, data = response.status, response.read()
+                except OSError:
+                    status, data = 502, b"{}"
+                finally:
+                    conn.close()
+                if status != 200:
+                    break
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, fmt: str, *values: Any) -> None:
+            print(f"INFO stub router: {fmt % values}", flush=True)
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    print(
+        f"INFO stub router: on {port}, prefill {prefiller}, decode {decoder}",
+        flush=True,
+    )
+    die_after = number("STUB_ROUTER_DIE_AFTER")
+    if die_after:
+
+        def crash() -> None:
+            time.sleep(die_after)
+            print("ERROR stub router: crashed", flush=True)
+            os._exit(1)
+
+        threading.Thread(target=crash, daemon=True).start()
+    signal.signal(signal.SIGTERM, lambda signum, frame: os._exit(0))
+    httpd.serve_forever()
+    return 0
+
+
 def python3(args: list[str]) -> int:
     if len(args) >= 2 and args[0] == "-m" and args[1] in INFX:
         return INFX[args[1]](args[2:])
+    if args and args[0].endswith("toy_proxy_server.py"):
+        return router(args[1:])
     os.execv(sys.executable, [sys.executable, *args])
     return 1
 

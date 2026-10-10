@@ -32,7 +32,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from scenario.plan import codec
-from scenario.plan.types import Command, Plan
+from scenario.plan.types import Command, Concat, Plan, Readiness, Ref
 
 STUBS = pathlib.Path(__file__).resolve().parent / "stubs" / "stubs.py"
 # `scenario` with runtime constants replaced from $STUB_PATCH.
@@ -210,6 +210,56 @@ def replace_program(plan: Plan, old: str, new: str) -> Plan:
     return walk(plan)
 
 
+def move_api_port(plan: Plan, role: str, port: int) -> Plan:
+    """`plan` with `role` serving its API on `port`, so roles share a machine.
+
+    The role's readiness and its first host's --port change, and so does
+    every port that follows a Ref to its head: the router's
+    --prefiller-ports or --decoder-ports, and the :port of a URL.
+    """
+    old = str(plan.role(role).readiness.port)
+    head = Ref("role_head", role=role)
+
+    def values(items: tuple[Any, ...]) -> tuple[Any, ...]:
+        found = list(items)
+        for index, item in enumerate(found):
+            after_head = index >= 2 and found[index - 2] == head
+            after_port = index >= 1 and found[index - 1] == "--port"
+            url_port = (
+                isinstance(item, str)
+                and item.startswith(f":{old}")
+                and index >= 1
+                and found[index - 1] == head
+            )
+            if item == old and (after_head or (after_port and in_role)):
+                found[index] = str(port)
+            elif url_port:
+                found[index] = f":{port}" + item[len(old) + 1 :]
+        return tuple(found)
+
+    def walk(value: Any) -> Any:
+        if isinstance(value, Concat):
+            return Concat(values(value.parts))
+        if isinstance(value, Readiness) and in_role:
+            return dataclasses.replace(value, port=port)
+        if isinstance(value, tuple):
+            return values(tuple(walk(item) for item in value))
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            changes = {
+                f.name: walk(getattr(value, f.name)) for f in dataclasses.fields(value)
+            }
+            return dataclasses.replace(value, **changes)
+        return value
+
+    in_role = False
+    roles = []
+    for found in plan.roles:
+        in_role = found.name == role
+        roles.append(walk(found))
+    in_role = False
+    return dataclasses.replace(plan, roles=tuple(roles), driver=walk(plan.driver))
+
+
 def signal_when_serving(summary: pathlib.Path, signum: int) -> threading.Thread:
     """Send `signum` to this process once the run's summary says it serves."""
 
@@ -241,6 +291,7 @@ FAST: dict[str, Any] = {
     "scenario.runtime.control.ABORT_LINGER_S": 0.5,
     "scenario.runtime.driver.OWN_SERVER_CHECK_S": 0.05,
     "scenario.runtime.bringup.POLL_INTERVAL_S": 0.05,
+    "scenario.runtime.bringup.REMOTE_POLL_S": 0.05,
     "scenario.runtime.proc.CHECK_EVERY_S": 0.05,
 }
 
