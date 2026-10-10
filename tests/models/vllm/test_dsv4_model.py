@@ -173,21 +173,25 @@ def dist_ctx():
         ensure_model_parallel_initialized,
         init_distributed_environment,
     )
+    from vllm.platforms import current_platform
 
-    if not dist.is_initialized():
-        import portpicker
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(current_platform, "device_name", "cpu")
+        mp.setattr(current_platform, "device_type", "cpu")
+        if not dist.is_initialized():
+            import portpicker
 
-        port = portpicker.pick_unused_port()
-        init_distributed_environment(
-            world_size=1,
-            rank=0,
-            local_rank=0,
-            distributed_init_method=f"tcp://127.0.0.1:{port}",
-            backend="gloo",
-        )
-    # GroupCoordinator construction consults the current vLLM config.
-    with set_current_vllm_config(VllmConfig()):
-        ensure_model_parallel_initialized(1, 1)
+            port = portpicker.pick_unused_port()
+            init_distributed_environment(
+                world_size=1,
+                rank=0,
+                local_rank=0,
+                distributed_init_method=f"tcp://127.0.0.1:{port}",
+                backend="gloo",
+            )
+        # GroupCoordinator construction consults the current vLLM config.
+        with set_current_vllm_config(VllmConfig()):
+            ensure_model_parallel_initialized(1, 1)
     yield
 
 
@@ -252,6 +256,10 @@ def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio
 @pytest.fixture()
 def tiny_fc(dist_ctx, monkeypatch):
     """A real DeepseekV4ForCausalLM at toy scale, kernels stubbed."""
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_name", "cpu")
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
     monkeypatch.setattr(model_mod, "DeepseekV4DecoderLayer", _StubDecoderLayer)
     monkeypatch.setattr(model_mod, "mhc_collapse_head", _fake_collapse_head)
     vllm_config = VllmConfig()
