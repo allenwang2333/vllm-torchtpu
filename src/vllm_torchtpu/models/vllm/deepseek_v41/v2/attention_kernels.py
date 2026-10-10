@@ -188,7 +188,7 @@ def _attend_window(
     if (
         tokens % tile
         or tokens < 2 * tile
-        or (max_requests is None and tokens % 6 == 0)
+        or (max_requests is None and (tokens % 6 == 0 or width != 128))
         or width % 64
         or width > 512
     ):
@@ -975,7 +975,7 @@ def fused_swa_eligible(tokens: int, width: int, max_requests: int | None) -> boo
     per_token = (
         tokens % 64 != 0
         or tokens < 128
-        or (max_requests is None and tokens % 6 == 0)
+        or (max_requests is None and (tokens % 6 == 0 or width != 128))
         or width % 64 != 0
         or width > 512
     )
@@ -990,28 +990,39 @@ def fused_swa_inputs(
     """Window rows in natural BF16 order and their additive score bias.
 
     Returns ``(kv [tokens, width128, dim], bias [tokens, width128 // 128,
-    128])`` with ``width`` padded to a 128 multiple by ``-1`` records. The
-    gather reads the split element order (one SparseCore gather, as
-    `_attend`) and restores natural order with the MXU permutation
-    `merge_halves`, so the kernel can sum window and top-k PV products in one
-    head-dim order. Dead records read arbitrary pool rows (possibly NaN);
-    their probability is exactly 0, so the rows are zeroed here to keep
-    ``0 * NaN`` out of the PV product. ``bias`` is ``finfo.min`` for them,
-    laid out as one 128-lane row per 128 window columns so the kernel's
-    per-batch DMA slices an untiled token axis.
+    128])`` with ``width`` padded to a 128 multiple by ``-1`` records. When
+    ``pad > 0`` and ``48 < tokens <= 96``, the gather reads only the unpadded
+    ``width`` columns in split element order, restores natural order with the
+    MXU permutation `merge_halves`, zeroes dead ``< 0`` records to keep
+    ``0 * NaN`` out of the PV product, and zero/min-pads the trailing
+    ``padded - width`` columns afterward. ``bias`` is ``finfo.min`` for
+    invalid/padded columns, laid out as one 128-lane row per 128 window
+    columns so the kernel's per-batch DMA slices an untiled token axis.
     """
     tokens, width = swa_records.shape
     padded = max(128, -(-width // 128) * 128)
-    swa_records = jnp.pad(
-        swa_records, ((0, 0), (0, padded - width)), constant_values=-1
-    )
-    live = swa_records >= 0
-    rows = gather_cache_values(
-        cast(Any, swa_pool), swa_records.reshape(-1), dim, split=True
-    )
-    kv = merge_halves(rows).reshape(tokens, padded, dim)
-    kv = jnp.where(live[..., None], kv, jnp.zeros((), kv.dtype))
-    bias = jnp.where(live, 0.0, jnp.finfo(jnp.float32).min).astype(jnp.float32)
+    pad = padded - width
+    if pad and 48 < tokens <= 96:
+        live = swa_records >= 0
+        rows = gather_cache_values(
+            cast(Any, swa_pool), swa_records.reshape(-1), dim, split=True
+        )
+        kv = merge_halves(rows).reshape(tokens, width, dim)
+        kv = jnp.where(live[..., None], kv, jnp.zeros((), kv.dtype))
+        bias = jnp.where(live, 0.0, jnp.finfo(jnp.float32).min).astype(jnp.float32)
+        kv = jnp.pad(kv, ((0, 0), (0, pad), (0, 0)))
+        bias = jnp.pad(
+            bias, ((0, 0), (0, pad)), constant_values=jnp.finfo(jnp.float32).min
+        )
+    else:
+        swa_records = jnp.pad(swa_records, ((0, 0), (0, pad)), constant_values=-1)
+        live = swa_records >= 0
+        rows = gather_cache_values(
+            cast(Any, swa_pool), swa_records.reshape(-1), dim, split=True
+        )
+        kv = merge_halves(rows).reshape(tokens, padded, dim)
+        kv = jnp.where(live[..., None], kv, jnp.zeros((), kv.dtype))
+        bias = jnp.where(live, 0.0, jnp.finfo(jnp.float32).min).astype(jnp.float32)
     return kv, bias.reshape(tokens, padded // 128, 128)
 
 
