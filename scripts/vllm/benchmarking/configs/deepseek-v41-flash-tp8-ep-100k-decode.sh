@@ -10,7 +10,14 @@ MODEL="${DEEPSEEK_V41_MODEL:-deepseek-ai/DeepSeek-V4.1-Flash}"
 TENSOR_PARALLELISM=8
 DATA_PARALLELISM=1
 ENABLE_EP=true
-ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-true}"
+if [[ "${TPU_DEEPSEEK_V41_KV_SHARD:-0}" == "1" ]]; then
+  # OwnerAffineBlockPool.validate_config rejects prefix caching under KV_SHARD,
+  # and without swa_bounded_replay it also turns CED off (Job 1294 stalled in
+  # warmup compiling the full stage for every layout).
+  ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-false}"
+else
+  ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-true}"
+fi
 MAX_MODEL_LEN=103424
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2048}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"

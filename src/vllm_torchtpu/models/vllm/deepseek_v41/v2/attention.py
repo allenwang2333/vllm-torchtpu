@@ -325,8 +325,24 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
                         ring_rem,
                         valid_token,
                     ) = cached_state
-                blocks = table[clamped_requests, 0].long()
-                slots = (blocks * state_rows + ring_rem).masked_fill(~valid_token, -1)
+                # Every compressed layer (L2/8/14/20) of a stage gathers the
+                # same block-table column for the same tokens: share the slots
+                # while the stage keeps the same block_tables tensor.
+                slot_key = _memo_stage_cache_key(
+                    self, "compressor_write_slots", table.shape, state_rows
+                )
+                cached_slots = stage_cache.get(slot_key)
+                if (
+                    cached_slots is not None
+                    and cached_slots[0] is state_metadata.block_tables
+                ):
+                    slots = cached_slots[1]
+                else:
+                    blocks = table[clamped_requests, 0].long()
+                    slots = (blocks * state_rows + ring_rem).masked_fill(
+                        ~valid_token, -1
+                    )
+                    stage_cache[slot_key] = (state_metadata.block_tables, slots)
             else:
                 slots = _cache_slots(state_cache, state_metadata, positions, ring=True)
                 query_start_loc = state_metadata.query_start_loc
@@ -967,15 +983,67 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     valid_group,
                     group_positions,
                 ) = cached_addr
-            kv_blocks = kv_table[requests, kv_col].long()
-            compressed_slots = (kv_blocks * kv_rows + kv_rem).masked_fill(
-                ~valid_token, -1
+            # L2/8/14/20 all write the same token rows through the same block
+            # tables: compute their addresses (and the deferred index-cache
+            # write rows) once per stage while the block_tables are unchanged.
+            fast_idx = _has_fast_cache_offset(index_cache)
+            write_key = self._stage_cache_key(
+                "global_kv_write_slots",
+                slot_key,
+                _fast_cache_offset_key(index_cache) if fast_idx else None,
             )
-            valid = (compressed_slots >= 0) & valid_group
-            idx_blocks = idx_table[requests, idx_col].long()
-            index_slots = (idx_blocks * idx_rows + idx_rem).masked_fill(
-                ~valid_token, -1
-            )
+            kv_tables = kv_meta.block_tables
+            idx_tables = idx_meta.block_tables
+            cached_write = stage_cache.get(write_key)
+            if (
+                cached_write is not None
+                and cached_write[0] is kv_tables
+                and cached_write[1] is idx_tables
+            ):
+                (
+                    _,
+                    _,
+                    compressed_slots,
+                    valid,
+                    index_slots,
+                    idx_write_slots,
+                    idx_write_invalid,
+                ) = cached_write
+            else:
+                kv_blocks = kv_table[requests, kv_col].long()
+                compressed_slots = (kv_blocks * kv_rows + kv_rem).masked_fill(
+                    ~valid_token, -1
+                )
+                valid = (compressed_slots >= 0) & valid_group
+                if (
+                    idx_col is kv_col
+                    and idx_tables is kv_tables
+                    and idx_rows == kv_rows
+                ):
+                    # Same table, column and remainder: the index cache's slots
+                    # are the compressed KV slots (no second 2-D gather).
+                    idx_blocks = kv_blocks
+                    index_slots = compressed_slots
+                else:
+                    idx_blocks = idx_table[requests, idx_col].long()
+                    index_slots = (idx_blocks * idx_rows + idx_rem).masked_fill(
+                        ~valid_token, -1
+                    )
+                idx_write_slots = idx_write_invalid = None
+                if fast_idx:
+                    # index_cache.row_indices without the per-layer divmod.
+                    idx_write_slots, idx_write_invalid = _fast_swa_row_slots(
+                        index_cache, idx_blocks, idx_rem, ~valid | (index_slots < 0)
+                    )
+                stage_cache[write_key] = (
+                    kv_tables,
+                    idx_tables,
+                    compressed_slots,
+                    valid,
+                    index_slots,
+                    idx_write_slots,
+                    idx_write_invalid,
+                )
         else:
             compressed_slots = _cache_slots(
                 self.kv_cache,
@@ -993,10 +1061,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 positions,
                 compress_ratio=idx_ratio,
             )
+            idx_write_slots = idx_write_invalid = None
         starts = _window_starts()
         if starts is not None:
             # Shared prefix rows must survive replay unchanged in both paths.
             valid = valid & ~_replayed(kv_meta, positions, starts, self.window_size)
+            if idx_write_invalid is not None:
+                idx_write_invalid = idx_write_invalid | ~valid
         _insert(
             self.kv_cache,
             compressed_slots,
@@ -1011,6 +1082,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and self.window_size % 64 == 0
             and not self._all_indices_fit
         ):
+            if idx_write_slots is not None and idx_write_invalid is not None:
+                offset = index_cache.row_offset
+                records = idx_write_slots if offset == 0 else offset + idx_write_slots
+                return records.masked_fill(idx_write_invalid, -1), keys
             records = index_cache.row_indices(index_slots.clamp(min=0))
             return records.masked_fill(~valid | (index_slots < 0), -1), keys
         _insert(index_cache, index_slots, keys, valid)
