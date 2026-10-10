@@ -205,7 +205,8 @@ uploads. It cannot change what runs. Tests enforce this:
 |---|---|
 | `tools/scenario/` | the CLI, its own Python project (`pyproject.toml`, `uv.lock`) |
 | `.buildkite/kubernetes/scenarios/` | the CI scenarios, which people edit, and `defaults.yaml` |
-| `.buildkite/kubernetes/scenario/tests/` | checks over the CI scenarios |
+| `.buildkite/kubernetes/scenario/tests/` | checks over the CI scenarios and the CI fleet target |
+| `.buildkite/kubernetes/scenario/tpu_ci.py` | the CI fleet target, which pipelines name in `SCENARIO_TARGET` |
 | `.buildkite/kubernetes/scenario/golden/` | the golden check, which is temporary |
 
 The tool's root is the directory that holds `scenarios/defaults.yaml`; for
