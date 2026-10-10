@@ -109,12 +109,26 @@ def _build_op(
         """Above MAX_DECODE_TOKENS: expert kernel + combine + chunked psum."""
         from vllm_torchtpu.kernels.experimental.moe_tp_prefill import (
             default_combine_chunks,
+            default_tile_m,
             moe_tp_prefill,
+            plan_blocked,
         )
 
         # Trace-time, once per token bucket: the evidence that the prefill
-        # kernel, not the GMM branch, serves this shape.
-        logger.info("Fused TP MoE prefill kernel traced for %d tokens", x.shape[0])
+        # kernel, not the GMM branch, serves this shape, and in which mode.
+
+        n = x.shape[0]
+        blocked = plan_blocked(
+            x.shape[1], w2.shape[1], w2s.shape[0], 3, default_tile_m(n), 2,
+            None, None, None,
+        )  # fmt: skip
+        logger.info(
+            "Fused TP MoE prefill kernel traced for %d tokens (%s)",
+            n,
+            "whole experts"
+            if blocked is None
+            else "blocked ib={} ring={} chunk_rows={}".format(*blocked),
+        )
         return moe_tp_prefill(
             x,
             w1,
@@ -139,6 +153,17 @@ def _build_op(
         start = rank[0, 1] if expert_parallel else None
         if x.shape[0] > MAX_DECODE_TOKENS:
             return prefill(x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, start)
+        from vllm_torchtpu.kernels.experimental.moe_fused_tp import plan_weight_ring
+
+        m = x.shape[0] + (-x.shape[0]) % 16
+        ib, nb = plan_weight_ring(m, x.shape[1], w2.shape[1], w2s.shape[0], n_ranks)
+        # Trace-time, once per token bucket (the kernel's name carries ib too).
+        logger.info(
+            "Fused TP MoE decode kernel traced for %d tokens (%s, ring %d)",
+            x.shape[0],
+            "whole experts" if ib is None else f"blocked ib={ib}",
+            nb,
+        )
         return _kernel_body(
             rank[0, :1],
             x,
