@@ -140,6 +140,7 @@ from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     normalize_draft_config,
     tp_local_argmax_logits,
+    tp_local_random_spec_verify_logits,
     tp_local_topk_logits,
 )
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
@@ -2144,6 +2145,32 @@ class TPUModelRunner(GPUModelRunner):
         ):
             stride = 1 + self.speculative_config.num_speculative_tokens
 
+        # Fast vectorized NumPy path for standard ALL layout (zero nested per-token Python loops).
+        if layout_plan is None or layout_plan.kind is SequenceLayoutKind.ALL:
+            req_slice = self.input_batch.req_ids[start_index : start_index + num_reqs]
+            id_map = self._pre_async_results.req_id_to_index_copy
+            pre_pos = np.fromiter(
+                (id_map.get(r, -1) for r in req_slice),
+                dtype=np.int32,
+                count=num_reqs,
+            )
+            valid_mask = pre_pos >= 0
+            if not valid_mask.any():
+                return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+            req_starts = np.cumsum(num_scheduled_tokens_per_req) - num_scheduled_tokens_per_req
+            valid_n = num_scheduled_tokens_per_req[valid_mask]
+            total_valid = int(valid_n.sum())
+            within = self.arange_np[:total_valid] - np.repeat(
+                np.cumsum(valid_n) - valid_n, valid_n
+            )
+            cur_idx = (np.repeat(req_starts[valid_mask], valid_n) + within).astype(
+                np.int32, copy=False
+            )
+            pre_idx = (
+                np.repeat(pre_pos[valid_mask] * stride, valid_n) + within
+            ).astype(np.int32, copy=False)
+            return cur_idx, pre_idx
+
         for i in range(num_reqs):
             req_id = self.input_batch.req_ids[start_index + i]
             n_sched = int(num_scheduled_tokens_per_req[i])
@@ -2184,6 +2211,9 @@ class TPUModelRunner(GPUModelRunner):
         token_in_tpu_pre_next_tokens_indices: np.ndarray,
     ) -> torch.Tensor:
         """Apply async token substitution if needed."""
+        if getattr(self, "_step_meta_fused_unpacked", False):
+            self._step_meta_fused_unpacked = False
+            return input_ids
         if len(token_in_tpu_cur_input_indices) == 0:
             return input_ids
 
@@ -2961,6 +2991,15 @@ class TPUModelRunner(GPUModelRunner):
         if self.uses_mrope:
             self._calc_mrope_positions(scheduler_output)
 
+        # Prepare the attention metadata upfront so within-request arange is 1 vectorized broadcast subtract.
+        self.query_start_loc_np[0] = 0
+        np.cumsum(
+            num_scheduled_tokens_per_req, out=self.query_start_loc_np[1 : num_reqs + 1]
+        )
+        # Keep padded entries equal to the last valid location so padded
+        # requests have zero length instead of a negative q_len.
+        self.query_start_loc_np[num_reqs + 1 :] = self.query_start_loc_np[num_reqs]
+
         # Fast path for decode-only: all requests have exactly 1 token.
         if max_num_scheduled_tokens_all_reqs == 1:
             # Pure decode: each request schedules exactly 1 token.
@@ -2985,17 +3024,13 @@ class TPUModelRunner(GPUModelRunner):
                 out=self.input_ids_cpu[:num_reqs],
             )
         else:
-            # General path: mixed prefill + decode.
-            # Get request indices.
+            # General path: mixed prefill + decode (100% vectorized, 0 list-comp np.concatenate).
             req_indices = np.repeat(
                 self.arange_np[start_index : start_index + num_reqs],
                 num_scheduled_tokens_per_req,
             )
-
-            # Get batched arange.
-            # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-            arange = np.concatenate(
-                [self.arange_np[:n] for n in num_scheduled_tokens_per_req]
+            arange = self.arange_np[:total_num_scheduled_tokens] - np.repeat(
+                self.query_start_loc_np[:num_reqs], num_scheduled_tokens_per_req
             )
 
             # Get positions.
@@ -3017,15 +3052,6 @@ class TPUModelRunner(GPUModelRunner):
                 torch.from_numpy(token_indices),
                 out=self.input_ids_cpu[:total_num_scheduled_tokens],
             )
-
-        # Prepare the attention metadata.
-        self.query_start_loc_np[0] = 0
-        np.cumsum(
-            num_scheduled_tokens_per_req, out=self.query_start_loc_np[1 : num_reqs + 1]
-        )
-        # Keep padded entries equal to the last valid location so padded
-        # requests have zero length instead of a negative q_len.
-        self.query_start_loc_np[num_reqs + 1 :] = self.query_start_loc_np[num_reqs]
 
         self.seq_lens_np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[
@@ -3086,92 +3112,20 @@ class TPUModelRunner(GPUModelRunner):
         local_total_num_scheduled_tokens = layout_plan.local_num_tokens
         local_padded_total_num_scheduled_tokens = layout_plan.local_padded_num_tokens
         local_token_slice = layout_plan.token_slice
-        if layout_plan.kind is SequenceLayoutKind.ALL:
-            # Zero out to avoid spurious values from prev iteration.
-            self.input_ids_cpu[
-                total_num_scheduled_tokens:padded_total_num_scheduled_tokens
-            ] = 0
-        self.input_ids = self.input_ids_cpu[local_token_slice].to(
-            self.device, non_blocking=True
-        )
-        if self.uses_mrope:
-            if layout_plan.kind is SequenceLayoutKind.ALL:
-                self.mrope_positions.cpu[
-                    :, total_num_scheduled_tokens:padded_total_num_scheduled_tokens
-                ] = 0
-            self.position_ids = self.mrope_positions.cpu[:, local_token_slice].to(
-                self.device, non_blocking=True
-            )
-        else:
-            self.position_ids = self.positions_cpu[local_token_slice].to(
-                self.device, non_blocking=True
-            )
-        if use_max_model_len:
-            seq_lens = self.seq_lens_cpu[: self.num_reqs_max_model_len].to(
-                self.device, non_blocking=True
-            )
-            target_num_reqs = self.num_reqs_max_model_len
-        else:
-            assert self.num_reqs_most_model_len is not None
-            seq_lens = self.seq_lens_cpu[: self.num_reqs_most_model_len].to(
-                self.device, non_blocking=True
-            )
-            target_num_reqs = self.num_reqs_most_model_len
 
-        # Async spec: seq_lens/positions were advanced optimistically (every
-        # draft from the previous step assumed accepted). Subtract the real
-        # per-request rejected count on-device, keyed by req position.
-        if (
-            self.scheduler_config.async_scheduling
-            and self.speculative_config
-            and self._pre_async_results is not None
-            and self._pre_async_results.spec_decode_num_rejected_tokens is not None
-        ):
-            from vllm_torchtpu.runner.tpu_runner_async_output import (
-                subtract_num_rejected_tokens,
-            )
-
-            seq_idx_np = np.full(target_num_reqs, -1, dtype=np.int32)
-            pos_idx_np = np.full(padded_total_num_scheduled_tokens, -1, dtype=np.int32)
-            acc = 0
-            for i in range(num_reqs):
-                req_id = self.input_batch.req_ids[start_index + i]
-                n_sched = int(num_scheduled_tokens_per_req[i])
-                pos = self._pre_async_results.req_id_to_index_copy.get(req_id)
-                if pos is not None:
-                    seq_idx_np[i] = pos
-                    pos_idx_np[acc : acc + n_sched] = pos
-                acc += n_sched
-            seq_lens, self.position_ids = subtract_num_rejected_tokens(
-                seq_lens,
-                self.position_ids,
-                self._pre_async_results.spec_decode_num_rejected_tokens,
-                torch.from_numpy(seq_idx_np).to(self.device, non_blocking=True),
-                torch.from_numpy(pos_idx_np).to(self.device, non_blocking=True),
-            )
-
-        # For decode-only case, cache constant device tensors to skip H2D.
-        # query_start_loc, logits_indices, and request_distribution don't
-        # change between decode steps for a given (num_reqs, padded_num_reqs).
-        is_decode_only = max_num_scheduled_tokens_all_reqs == 1
-        decode_cache_key = (
-            num_reqs,
-            padded_num_reqs,
-            use_max_model_len,
-            layout_plan.descriptor.cache_key,
-        )
-
-        # Speculative decoding metadata.
+        # Speculative decoding metadata built upfront so steady-state async spec steps
+        # pack ALL per-step int32 arrays into ONE pinned H2D DMA + ONE fused XLA unpack!
         spec_decode_metadata = None
         if self.speculative_config:
-            num_draft_tokens = np.array(
-                [
+            num_draft_tokens = np.fromiter(
+                (
                     len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
                     for req_id in self.input_batch.req_ids[
                         start_index : start_index + num_reqs
                     ]
-                ],
+                ),
                 dtype=np.int32,
+                count=num_reqs,
             )
             if num_draft_tokens.any():
                 spec_decode_metadata = (
@@ -3182,67 +3136,253 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 )
 
-        # Default decode layouts keep logits_indices stable for a fixed
-        # (num_reqs, padded_num_reqs) bucket. PCP streaming layouts provide
-        # explicit rank-major logits indices that can change as q_start crosses
-        # an interleave/rank boundary, so they must not reuse a stale cached
-        # logits_indices tensor.
-        can_cache_decode_metadata = (
-            is_decode_only
-            and spec_decode_metadata is None
-            and layout_plan.logits_indices_cpu is None
+        self._step_meta_fused_unpacked = False
+        can_fused_single_h2d_pack = (
+            layout_plan.kind is SequenceLayoutKind.ALL
+            and not self.uses_mrope
+            and not (self._pcp_enabled and self._mtp_enabled)
+            and self.scheduler_config.async_scheduling
+            and self._pre_async_results is not None
+            and self._pre_async_results.next_tokens_tpu is not None
+            and self._pre_async_results.spec_decode_num_rejected_tokens is not None
+            and spec_decode_metadata is not None
         )
 
-        if (
-            can_cache_decode_metadata
-            and decode_cache_key == self._decode_device_cache_key
-        ):
-            # Reuse cached device tensors — skip 3 H2D copies.
-            query_start_loc = self._cached_query_start_loc
-            logits_indices = self._cached_logits_indices
-            request_distribution = self._cached_request_distribution
-        else:
-            # Compute and copy to device (first call or shape changed).
-            if use_max_model_len:
-                query_start_loc = self.query_start_loc_cpu[
-                    : self.num_reqs_max_model_len + 1
-                ].to(self.device, non_blocking=True)
-            else:
-                query_start_loc = self.query_start_loc_cpu[
-                    : self.num_reqs_most_model_len + 1
-                ].to(self.device, non_blocking=True)
+        if can_fused_single_h2d_pack:
+            t_pad = local_padded_total_num_scheduled_tokens
+            off1 = t_pad
+            off2 = 2 * t_pad
+            off3 = off2 + target_num_reqs
+            off4 = off3 + target_num_reqs
+            off5 = off4 + t_pad
+            off6 = off5 + target_num_reqs + 1
+            off7 = off6 + 6
+            total_ints = off7 + t_pad
 
-            if spec_decode_metadata is not None:
-                logits_indices = spec_decode_metadata.final_logits_indices
-            elif layout_plan.logits_indices_cpu is not None:
-                logits_indices = layout_plan.logits_indices_cpu.to(
+            packed_cpu = getattr(self, "_packed_step_meta_cpu", None)
+            if packed_cpu is None or packed_cpu.shape[0] < total_ints:
+                cap = max(16384, total_ints * 2)
+                packed_cpu = torch.zeros(cap, dtype=torch.int32, pin_memory=PIN_MEMORY)
+                self._packed_step_meta_cpu = packed_cpu
+                self._packed_step_meta_np = packed_cpu.numpy()
+            pack_np = self._packed_step_meta_np
+
+            self.input_ids_cpu[
+                total_num_scheduled_tokens:padded_total_num_scheduled_tokens
+            ] = 0
+            pack_np[0:off1] = self.input_ids_cpu[:t_pad].numpy()
+            pack_np[off1 : off1 + total_num_scheduled_tokens] = positions_np
+            pack_np[off1 + total_num_scheduled_tokens : off2] = 0
+            pack_np[off2:off3] = self.seq_lens_np[:target_num_reqs]
+
+            req_slice = self.input_batch.req_ids[start_index : start_index + num_reqs]
+            id_map = self._pre_async_results.req_id_to_index_copy
+            pre_pos = np.fromiter(
+                (id_map.get(r, -1) for r in req_slice),
+                dtype=np.int32,
+                count=num_reqs,
+            )
+            pack_np[off3 : off3 + num_reqs] = pre_pos
+            pack_np[off3 + num_reqs : off4] = -1
+            pack_np[off4 : off4 + total_num_scheduled_tokens] = np.repeat(
+                pre_pos, num_scheduled_tokens_per_req
+            )
+            pack_np[off4 + total_num_scheduled_tokens : off5] = -1
+            pack_np[off5:off6] = self.query_start_loc_np[: target_num_reqs + 1]
+
+            chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
+            chunk_num_windowed = (
+                max(0, min(num_windowed_reqs - start_index, num_reqs))
+                if self.mamba_slot_read_offsets is not None
+                else chunk_num_decode
+            )
+            comb_view = pack_np[off6:off7]
+            comb_view[0] = chunk_num_decode
+            comb_view[1] = chunk_num_decode
+            comb_view[2] = num_reqs
+            comb_view[3] = chunk_num_windowed
+            comb_view[4] = chunk_num_windowed
+            comb_view[5] = num_reqs
+
+            stride = 1 + self.speculative_config.num_speculative_tokens
+            within_all = (
+                self.arange_np[:total_num_scheduled_tokens]
+                - np.repeat(
+                    self.query_start_loc_np[:num_reqs], num_scheduled_tokens_per_req
+                )
+            )
+            pre_sub_np = pack_np[off7:total_ints]
+            pre_sub_np[:total_num_scheduled_tokens] = np.where(
+                np.repeat(pre_pos >= 0, num_scheduled_tokens_per_req),
+                np.repeat(pre_pos * stride, num_scheduled_tokens_per_req) + within_all,
+                -1,
+            )
+            pre_sub_np[total_num_scheduled_tokens:] = -1
+
+            dev_pack = packed_cpu[:total_ints].to(self.device, non_blocking=True)
+            (
+                self.input_ids,
+                self.position_ids,
+                seq_lens,
+                query_start_loc,
+                request_distribution,
+                mamba_request_distribution,
+                spec_decode_metadata.draft_token_ids,
+            ) = self._unpack_and_prepare_step_meta(
+                dev_pack,
+                self._pre_async_results.next_tokens_tpu,
+                self._pre_async_results.spec_decode_num_rejected_tokens,
+                spec_decode_metadata.final_logits_indices,
+                spec_decode_metadata.target_logits_indices,
+                t_pad,
+                target_num_reqs,
+            )
+            if self.mamba_slot_read_offsets is None:
+                mamba_request_distribution = None
+            logits_indices = spec_decode_metadata.final_logits_indices
+            self._step_meta_fused_unpacked = True
+        else:
+            if layout_plan.kind is SequenceLayoutKind.ALL:
+                # Zero out to avoid spurious values from prev iteration.
+                self.input_ids_cpu[
+                    total_num_scheduled_tokens:padded_total_num_scheduled_tokens
+                ] = 0
+            self.input_ids = self.input_ids_cpu[local_token_slice].to(
+                self.device, non_blocking=True
+            )
+            if self.uses_mrope:
+                if layout_plan.kind is SequenceLayoutKind.ALL:
+                    self.mrope_positions.cpu[
+                        :, total_num_scheduled_tokens:padded_total_num_scheduled_tokens
+                    ] = 0
+                self.position_ids = self.mrope_positions.cpu[:, local_token_slice].to(
                     self.device, non_blocking=True
                 )
             else:
-                # Indices at which we sample (positions of last token in the
-                # sequence). Padded to avoid recompiling when `num_reqs` varies.
-                logits_indices = (
-                    self.query_start_loc_cpu[1 : padded_num_reqs + 1] - 1
-                ).to(self.device, non_blocking=True)
-
-            # For the V3 kernel, request_distribution is
-            # [decode_end, prefill_end, mixed_end]. We put decode requests first,
-            # no dedicated prefill-only bucket, and all remaining requests in
-            # mixed mode.
-            chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
-            self._request_distribution_cpu[0] = chunk_num_decode
-            self._request_distribution_cpu[1] = chunk_num_decode
-            self._request_distribution_cpu[2] = num_reqs
-            request_distribution = self._request_distribution_cpu.to(
+                self.position_ids = self.positions_cpu[local_token_slice].to(
+                    self.device, non_blocking=True
+                )
+            seq_lens = self.seq_lens_cpu[:target_num_reqs].to(
                 self.device, non_blocking=True
             )
 
-            if can_cache_decode_metadata:
-                # Cache for future decode steps.
-                self._decode_device_cache_key = decode_cache_key
-                self._cached_query_start_loc = query_start_loc
-                self._cached_logits_indices = logits_indices
-                self._cached_request_distribution = request_distribution
+            # Async spec: seq_lens/positions were advanced optimistically (every
+            # draft from the previous step assumed accepted). Subtract the real
+            # per-request rejected count on-device, keyed by req position.
+            if (
+                self.scheduler_config.async_scheduling
+                and self.speculative_config
+                and self._pre_async_results is not None
+                and self._pre_async_results.spec_decode_num_rejected_tokens is not None
+            ):
+                from vllm_torchtpu.runner.tpu_runner_async_output import (
+                    subtract_num_rejected_tokens,
+                )
+
+                req_slice = self.input_batch.req_ids[start_index : start_index + num_reqs]
+                id_map = self._pre_async_results.req_id_to_index_copy
+                pre_pos = np.fromiter(
+                    (id_map.get(r, -1) for r in req_slice),
+                    dtype=np.int32,
+                    count=num_reqs,
+                )
+                seq_idx_np = np.full(target_num_reqs, -1, dtype=np.int32)
+                seq_idx_np[:num_reqs] = pre_pos
+                pos_idx_np = np.full(
+                    padded_total_num_scheduled_tokens, -1, dtype=np.int32
+                )
+                pos_idx_np[:total_num_scheduled_tokens] = np.repeat(
+                    pre_pos, num_scheduled_tokens_per_req
+                )
+                seq_lens, self.position_ids = subtract_num_rejected_tokens(
+                    seq_lens,
+                    self.position_ids,
+                    self._pre_async_results.spec_decode_num_rejected_tokens,
+                    torch.from_numpy(seq_idx_np).to(self.device, non_blocking=True),
+                    torch.from_numpy(pos_idx_np).to(self.device, non_blocking=True),
+                )
+
+            is_decode_only = max_num_scheduled_tokens_all_reqs == 1
+            decode_cache_key = (
+                num_reqs,
+                padded_num_reqs,
+                use_max_model_len,
+                layout_plan.descriptor.cache_key,
+            )
+            can_cache_decode_metadata = (
+                is_decode_only
+                and spec_decode_metadata is None
+                and layout_plan.logits_indices_cpu is None
+            )
+
+            if (
+                can_cache_decode_metadata
+                and decode_cache_key == self._decode_device_cache_key
+            ):
+                query_start_loc = self._cached_query_start_loc
+                logits_indices = self._cached_logits_indices
+                request_distribution = self._cached_request_distribution
+            else:
+                query_start_loc = self.query_start_loc_cpu[: target_num_reqs + 1].to(
+                    self.device, non_blocking=True
+                )
+                if spec_decode_metadata is not None:
+                    logits_indices = spec_decode_metadata.final_logits_indices
+                elif layout_plan.logits_indices_cpu is not None:
+                    logits_indices = layout_plan.logits_indices_cpu.to(
+                        self.device, non_blocking=True
+                    )
+                else:
+                    logits_indices = (
+                        self.query_start_loc_cpu[1 : padded_num_reqs + 1] - 1
+                    ).to(self.device, non_blocking=True)
+
+                chunk_num_decode = max(
+                    0, min(rpa_num_decode_reqs - start_index, num_reqs)
+                )
+                self._request_distribution_cpu[0] = chunk_num_decode
+                self._request_distribution_cpu[1] = chunk_num_decode
+                self._request_distribution_cpu[2] = num_reqs
+                request_distribution = self._request_distribution_cpu.to(
+                    self.device, non_blocking=True
+                )
+
+                if can_cache_decode_metadata:
+                    self._decode_device_cache_key = decode_cache_key
+                    self._cached_query_start_loc = query_start_loc
+                    self._cached_logits_indices = logits_indices
+                    self._cached_request_distribution = request_distribution
+
+            mamba_request_distribution = None
+            if self.mamba_slot_read_offsets is not None:
+                chunk_num_windowed = max(
+                    0, min(num_windowed_reqs - start_index, num_reqs)
+                )
+                chunk_num_decode = max(
+                    0, min(rpa_num_decode_reqs - start_index, num_reqs)
+                )
+                combined = self._combined_request_distribution_cpu
+                combined[0] = chunk_num_decode
+                combined[1] = chunk_num_decode
+                combined[2] = num_reqs
+                combined[3] = chunk_num_windowed
+                combined[4] = chunk_num_windowed
+                combined[5] = num_reqs
+                if getattr(self, "_fast_token_substitution", False):
+                    chunk_comb_key = (chunk_num_decode, chunk_num_windowed, num_reqs)
+                    if (
+                        not hasattr(self, "_cached_comb_dev")
+                        or getattr(self, "_cached_comb_key", None) != chunk_comb_key
+                    ):
+                        self._cached_comb_dev = combined.to(
+                            self.device, non_blocking=True
+                        )
+                        self._cached_comb_key = chunk_comb_key
+                    combined_device = self._cached_comb_dev
+                else:
+                    combined_device = combined.to(self.device, non_blocking=True)
+                request_distribution = combined_device[0:3]
+                mamba_request_distribution = combined_device[3:6]
 
         # Compact-mamba: per-request recurrent-slot ids for this chunk. Only
         # built for hybrid models (slot pool initialized in
@@ -3253,39 +3393,6 @@ class TPUModelRunner(GPUModelRunner):
             if self._has_mamba_state
             else None
         )
-
-        # Spec decode with mamba layers: the GDN kernel's windowed segment
-        # covers 1-token decodes AND speculative verify windows (the batch is
-        # ordered [decode][verify][prefill/mixed] by _reorder_batch_for_rpa),
-        # while RPA includes verify only when its decode tile supports it.
-        mamba_request_distribution = None
-        if self.mamba_slot_read_offsets is not None:
-            chunk_num_windowed = max(0, min(num_windowed_reqs - start_index, num_reqs))
-            chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
-            # One H2D copy, two views (see the staging tensor's comment for
-            # why these must not be independent device tensors). Overrides
-            # the RPA tensor built above so both fields always come from the
-            # same base tensor, matching the traced graph structure.
-            combined = self._combined_request_distribution_cpu
-            combined[0] = chunk_num_decode
-            combined[1] = chunk_num_decode
-            combined[2] = num_reqs
-            combined[3] = chunk_num_windowed
-            combined[4] = chunk_num_windowed
-            combined[5] = num_reqs
-            if getattr(self, "_fast_token_substitution", False):
-                chunk_comb_key = (chunk_num_decode, chunk_num_windowed, num_reqs)
-                if (
-                    not hasattr(self, "_cached_comb_dev")
-                    or getattr(self, "_cached_comb_key", None) != chunk_comb_key
-                ):
-                    self._cached_comb_dev = combined.to(self.device, non_blocking=True)
-                    self._cached_comb_key = chunk_comb_key
-                combined_device = self._cached_comb_dev
-            else:
-                combined_device = combined.to(self.device, non_blocking=True)
-            request_distribution = combined_device[0:3]
-            mamba_request_distribution = combined_device[3:6]
 
         is_all_layout = layout_plan.kind is SequenceLayoutKind.ALL
         pad_reqs = target_num_reqs - num_reqs
@@ -3820,26 +3927,30 @@ class TPUModelRunner(GPUModelRunner):
             # offset; clear it before this chunk's forward gathers it.
             self._reset_read_offsets_for_new_requests(start_index, num_reqs)
 
-            input_ids = self._apply_async_token_substitution(
-                self.input_ids, cur_input_indices, pre_next_tokens_indices
-            )
-            # Async spec: the drafts the target verifies live in the substituted
-            # input_ids (host input_ids_cpu holds placeholders), so re-source the
-            # rejection sampler's draft_token_ids from the device.
-            if (
-                self.scheduler_config.async_scheduling
-                and spec_decode_metadata is not None
-                and len(cur_input_indices) > 0
-            ):
-                from vllm_torchtpu.runner.tpu_runner_async_output import (
-                    extract_draft_token_ids,
+            if getattr(self, "_step_meta_fused_unpacked", False):
+                self._step_meta_fused_unpacked = False
+                input_ids = self.input_ids
+            else:
+                input_ids = self._apply_async_token_substitution(
+                    self.input_ids, cur_input_indices, pre_next_tokens_indices
                 )
+                # Async spec: the drafts the target verifies live in the substituted
+                # input_ids (host input_ids_cpu holds placeholders), so re-source the
+                # rejection sampler's draft_token_ids from the device.
+                if (
+                    self.scheduler_config.async_scheduling
+                    and spec_decode_metadata is not None
+                    and len(cur_input_indices) > 0
+                ):
+                    from vllm_torchtpu.runner.tpu_runner_async_output import (
+                        extract_draft_token_ids,
+                    )
 
-                spec_decode_metadata.draft_token_ids = extract_draft_token_ids(
-                    input_ids,
-                    spec_decode_metadata.final_logits_indices,
-                    spec_decode_metadata.target_logits_indices,
-                )
+                    spec_decode_metadata.draft_token_ids = extract_draft_token_ids(
+                        input_ids,
+                        spec_decode_metadata.final_logits_indices,
+                        spec_decode_metadata.target_logits_indices,
+                    )
             draft_input_ids_src = input_ids
 
             # Slice the per-chunk multimodal mask/embeddings (the chunk
@@ -4045,7 +4156,74 @@ class TPUModelRunner(GPUModelRunner):
                         and spec_decode_metadata is None
                         and not scheduler_output.has_structured_output_requests
                     )
-                    if sample_hidden_states is None:
+                    can_tp_local_random_spec = (
+                        has_lm_head
+                        and not self.input_batch.all_greedy
+                        and self.input_batch.max_num_logprobs is None
+                        and self.input_batch.no_top_k
+                        and self.input_batch.no_top_p
+                        and not scheduler_output.has_structured_output_requests
+                        and spec_decode_metadata is not None
+                        and not self.rejection_sampler.synthetic_mode
+                    )
+                    if can_tp_local_random_spec:
+                        padded_r = spec_decode_metadata.draft_lengths.shape[0]
+                        temps_cpu = torch.ones(padded_r, dtype=torch.float32)
+                        temps_cpu[:num_reqs].copy_(
+                            self.input_batch.temperature_cpu_tensor[
+                                start_index : start_index + num_reqs
+                            ]
+                        )
+                        req_temperatures = temps_cpu.unsqueeze(1).to(
+                            self.device, non_blocking=True
+                        )
+                        n_tok = spec_decode_metadata.draft_token_ids.shape[0]
+                        shard_vocab = self.model.lm_head.weight.shape[0]
+                        sampling_gen = getattr(
+                            self.input_batch.sampling_metadata,
+                            "sampling_generator",
+                            None,
+                        )
+                        u_local = torch.empty(
+                            (n_tok, shard_vocab),
+                            dtype=torch.float32,
+                            device=self.device,
+                        ).uniform_(1e-4, 1.0 - 1e-4, generator=sampling_gen)
+                        accept_u = torch.empty(
+                            (n_tok,), dtype=torch.float32, device=self.device
+                        ).uniform_(0.0, 1.0, generator=sampling_gen)
+                        if sample_hidden_states is None:
+                            hidden_states = (
+                                sequence_layout_planner.finalize_hidden_states(
+                                    hidden_states,
+                                    layout_plan,
+                                )
+                            )
+                            logits = self.compute_and_verify_spec_random(
+                                hidden_states,
+                                logits_indices,
+                                spec_decode_metadata.bonus_logits_indices,
+                                spec_decode_metadata.target_logits_indices,
+                                spec_decode_metadata.draft_token_ids,
+                                spec_decode_metadata.draft_lengths,
+                                req_temperatures,
+                                u_local,
+                                accept_u,
+                                self.speculative_config.num_speculative_tokens,
+                            )
+                        else:
+                            logits = self.compute_and_verify_spec_random_from_hidden(
+                                sample_hidden_states,
+                                spec_decode_metadata.bonus_logits_indices,
+                                spec_decode_metadata.target_logits_indices,
+                                spec_decode_metadata.draft_token_ids,
+                                spec_decode_metadata.draft_lengths,
+                                req_temperatures,
+                                u_local,
+                                accept_u,
+                                self.speculative_config.num_speculative_tokens,
+                            )
+                    elif sample_hidden_states is None:
                         hidden_states = sequence_layout_planner.finalize_hidden_states(
                             hidden_states,
                             layout_plan,
@@ -6050,9 +6228,42 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 synchronize_tensors([src_warm, rej_warm])
             hsize = self.model_config.get_hidden_size()
+            target_r_warm = self.num_reqs_max_model_len
+            dummy_prev_nt = torch.zeros(bound, dtype=torch.int64, device=self.device)
+            dummy_prev_rej = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
+            shard_vocab = (
+                self.model.lm_head.weight.shape[0] if has_tp_local else 1
+            )
             for num_tokens in self.num_tokens_paddings:
                 if num_tokens > max_logits_len:
                     break
+                pack_len = (
+                    2 * num_tokens
+                    + 2 * target_r_warm
+                    + num_tokens
+                    + target_r_warm
+                    + 1
+                    + 6
+                    + num_tokens
+                )
+                dummy_pack = torch.zeros(
+                    pack_len, dtype=torch.int32, device=self.device
+                )
+                dummy_idx_t = torch.zeros(
+                    num_tokens, dtype=torch.int32, device=self.device
+                )
+                u_res = self._unpack_and_prepare_step_meta(
+                    dummy_pack,
+                    dummy_prev_nt,
+                    dummy_prev_rej,
+                    dummy_idx_t,
+                    dummy_idx_t,
+                    num_tokens,
+                    target_r_warm,
+                )
+                synchronize_tensors(list(u_res))
                 dummy_logits = (
                     None
                     if has_tp_local
@@ -6118,7 +6329,28 @@ class TPUModelRunner(GPUModelRunner):
                                 draft_lengths,
                                 k,
                             )
-                            synchronize_tensors(out_fused)
+                            dummy_temps = torch.ones(
+                                (num_reqs, 1), dtype=torch.float32, device=self.device
+                            )
+                            dummy_u_local = torch.full(
+                                (num_tokens, shard_vocab),
+                                0.5,
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                            out_rand = self.compute_and_verify_spec_random(
+                                dummy_hidden,
+                                target_logits_indices,
+                                bonus_logits_indices,
+                                target_logits_indices,
+                                draft_token_ids,
+                                draft_lengths,
+                                dummy_temps,
+                                dummy_u_local,
+                                warm_accept_u,
+                                k,
+                            )
+                            synchronize_tensors([out_fused, out_rand])
                         logger.info(
                             "  -- padded_logits_length: %d, num_seqs: %d",
                             num_tokens,
@@ -7466,6 +7698,227 @@ class TPUModelRunner(GPUModelRunner):
         if rej.shape[0] < max_num_reqs:
             rej = torch.nn.functional.pad(rej, (0, max_num_reqs - rej.shape[0]))
         return src, rej
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _unpack_and_prepare_step_meta(
+        self,
+        pack: torch.Tensor,
+        prev_next_tokens: torch.Tensor,
+        prev_num_rejected: torch.Tensor,
+        final_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        t_pad: int,
+        target_num_reqs: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Single XLA graph unpacking packed step int32 metadata + reject subtraction + async substitution."""
+        off1 = t_pad
+        off2 = 2 * t_pad
+        off3 = off2 + target_num_reqs
+        off4 = off3 + target_num_reqs
+        off5 = off4 + t_pad
+        off6 = off5 + target_num_reqs + 1
+        off7 = off6 + 6
+        off8 = off7 + t_pad
+
+        input_ids = pack[0:off1]
+        positions = pack[off1:off2]
+        seq_lens = pack[off2:off3]
+        seq_idx = pack[off3:off4]
+        pos_idx = pack[off4:off5]
+        query_start_loc = pack[off5:off6]
+        request_distribution = pack[off6 : off6 + 3]
+        mamba_request_distribution = pack[off6 + 3 : off7]
+        pre_idx = pack[off7:off8]
+
+        zero = prev_num_rejected.new_zeros(())
+        seq_sub = torch.where(
+            seq_idx >= 0, prev_num_rejected[seq_idx.clamp(min=0)], zero
+        )
+        pos_sub = torch.where(
+            pos_idx >= 0, prev_num_rejected[pos_idx.clamp(min=0)], zero
+        )
+        seq_lens = seq_lens - seq_sub
+        positions = positions - pos_sub
+
+        input_ids = torch.where(
+            pre_idx >= 0,
+            prev_next_tokens[
+                pre_idx.clamp(min=0, max=prev_next_tokens.shape[0] - 1)
+            ].to(input_ids.dtype),
+            input_ids,
+        )
+        draft_token_ids = input_ids[final_logits_indices[target_logits_indices + 1]]
+        return (
+            input_ids,
+            positions,
+            seq_lens,
+            query_start_loc,
+            request_distribution,
+            mamba_request_distribution,
+            draft_token_ids,
+        )
+
+    def _spec_random_verify_body(
+        self,
+        sample_hidden_states: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        num_draft_tokens: torch.Tensor,
+        req_temperatures: torch.Tensor,
+        u_local: torch.Tensor,
+        accept_u: torch.Tensor,
+        max_draft_tokens: int,
+    ) -> torch.Tensor:
+        batch_size = num_draft_tokens.shape[0]
+        total_tokens = draft_token_ids.shape[0]
+        device = sample_hidden_states.device
+        num_draft_i32 = num_draft_tokens.to(torch.int32)
+        row_start = (torch.cumsum(num_draft_i32, dim=0) - num_draft_i32).unsqueeze(1)
+        col_idx = torch.arange(
+            max_draft_tokens, dtype=torch.int32, device=device
+        ).unsqueeze(0)
+        flat_slot = (row_start + col_idx).clamp(0, max(total_tokens - 1, 0)).view(-1)
+
+        draft_2d = (
+            torch.index_select(draft_token_ids.to(torch.int32), 0, flat_slot)
+            .view(batch_size, max_draft_tokens)
+        )
+        target_idx_1d = torch.index_select(target_logits_indices, 0, flat_slot)
+
+        row_draft_ids = torch.full(
+            (total_tokens,), -1, dtype=torch.int32, device=device
+        )
+        row_draft_ids.scatter_(0, target_idx_1d.to(torch.int64), draft_2d.view(-1))
+        req_idx_per_draft = torch.arange(
+            batch_size, dtype=torch.int64, device=device
+        ).unsqueeze(1).expand(batch_size, max_draft_tokens).reshape(-1)
+        row_req_idx = torch.zeros(
+            (total_tokens,), dtype=torch.int64, device=device
+        )
+        row_req_idx.scatter_(0, target_idx_1d.to(torch.int64), req_idx_per_draft)
+        row_req_idx.scatter_(
+            0,
+            bonus_logits_indices.to(torch.int64),
+            torch.arange(batch_size, dtype=torch.int64, device=device),
+        )
+        inv_temps = torch.reciprocal(
+            req_temperatures.to(torch.float32)[row_req_idx] + 1e-5
+        )
+
+        global_lse, global_draft_logit, sampled_ids = tp_local_random_spec_verify_logits(
+            self.model.logits_processor,
+            self.model.lm_head,
+            sample_hidden_states,
+            inv_temps,
+            row_draft_ids.unsqueeze(1),
+            u_local,
+        )
+
+        draft_lse_2d = torch.index_select(global_lse, 0, target_idx_1d).view(
+            batch_size, max_draft_tokens
+        )
+        draft_logit_2d = torch.index_select(global_draft_logit, 0, target_idx_1d).view(
+            batch_size, max_draft_tokens
+        )
+        target_prob_2d = torch.exp(draft_logit_2d - draft_lse_2d)
+        u_acc_2d = torch.index_select(accept_u, 0, flat_slot).view(
+            batch_size, max_draft_tokens
+        )
+        valid_2d = col_idx < num_draft_i32.unsqueeze(1)
+        accepted_2d = (target_prob_2d >= u_acc_2d) & (draft_2d >= 0)
+        rec_2d = torch.index_select(sampled_ids, 0, target_idx_1d).view(
+            batch_size, max_draft_tokens
+        )
+        bonus_token_ids = torch.index_select(sampled_ids, 0, bonus_logits_indices)
+
+        emitted_2d = torch.where(accepted_2d, draft_2d, rec_2d)
+        slot_ok = torch.where(valid_2d, accepted_2d, torch.ones_like(accepted_2d))
+        prefix_all = torch.cumprod(slot_ok.to(torch.int32), dim=1).to(torch.bool)
+        keep_2d = torch.cat(
+            [
+                torch.ones((batch_size, 1), dtype=torch.bool, device=device),
+                prefix_all[:, :-1],
+            ],
+            dim=1,
+        )
+        main_2d = torch.where(valid_2d & keep_2d, emitted_2d, -1)
+        full_out = torch.cat(
+            [
+                main_2d,
+                torch.full(
+                    (batch_size, 1), -1, dtype=torch.int32, device=device
+                ),
+            ],
+            dim=1,
+        )
+        out_col = torch.arange(
+            max_draft_tokens + 1, dtype=torch.int32, device=device
+        ).unsqueeze(0)
+        bonus_pos = (out_col == num_draft_i32.unsqueeze(1)) & prefix_all[:, -1:]
+        return torch.where(bonus_pos, bonus_token_ids.unsqueeze(1), full_out)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_and_verify_spec_random(
+        self,
+        hidden_states: torch.Tensor,
+        indices_do_sample: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        num_draft_tokens: torch.Tensor,
+        req_temperatures: torch.Tensor,
+        u_local: torch.Tensor,
+        accept_u: torch.Tensor,
+        max_draft_tokens: int,
+    ) -> torch.Tensor:
+        """Single fused XLA graph: gather hidden states + TP-local sharded Leviathan/Gumbel random spec verify."""
+        selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        return self._spec_random_verify_body(
+            selected,
+            bonus_logits_indices,
+            target_logits_indices,
+            draft_token_ids,
+            num_draft_tokens,
+            req_temperatures,
+            u_local,
+            accept_u,
+            max_draft_tokens,
+        )
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_and_verify_spec_random_from_hidden(
+        self,
+        sample_hidden_states: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        num_draft_tokens: torch.Tensor,
+        req_temperatures: torch.Tensor,
+        u_local: torch.Tensor,
+        accept_u: torch.Tensor,
+        max_draft_tokens: int,
+    ) -> torch.Tensor:
+        """Single fused XLA graph: TP-local sharded Leviathan/Gumbel random spec verify from selected hidden states."""
+        return self._spec_random_verify_body(
+            sample_hidden_states,
+            bonus_logits_indices,
+            target_logits_indices,
+            draft_token_ids,
+            num_draft_tokens,
+            req_temperatures,
+            u_local,
+            accept_u,
+            max_draft_tokens,
+        )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_bonus_and_target_logits(

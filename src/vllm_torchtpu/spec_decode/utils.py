@@ -84,6 +84,118 @@ def tp_local_argmax_logits(
     return all_idxs.gather(0, best_rank).squeeze(0).to(torch.int64)
 
 
+def tp_local_random_spec_verify_logits(
+    logits_processor,
+    lm_head: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    inv_temperatures_per_tok: torch.Tensor,
+    row_draft_token_ids: torch.Tensor,
+    u_local: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute exact global logsumexp, draft logit, and Gumbel-sampled token IDs across TP shards.
+
+    Avoids materializing or AllGathering full-vocabulary [N, V] logits across TP ranks by reducing
+    each rank's local vocab shard [N, V_shard] to 4 int32-bitcast scalars per row ([N, 4], padded
+    to 128-lane alignment) before tp_all_gather.
+    """
+    tp_size = getattr(lm_head, "tp_size", 1)
+    if tp_size <= 1:
+        logits_full = (
+            logits_processor(lm_head, hidden_states).to(torch.float32)
+            * inv_temperatures_per_tok
+        )
+        global_lse = torch.logsumexp(logits_full, dim=-1)
+        safe_d = row_draft_token_ids.clamp(min=0, max=logits_full.shape[-1] - 1)
+        draft_logit = torch.where(
+            row_draft_token_ids.squeeze(-1) >= 0,
+            logits_full.gather(-1, safe_d.to(torch.int64)).squeeze(-1),
+            torch.full(
+                (logits_full.shape[0],),
+                -1e30,
+                dtype=torch.float32,
+                device=logits_full.device,
+            ),
+        )
+        v_cols = torch.arange(
+            logits_full.shape[-1], dtype=torch.int32, device=logits_full.device
+        ).unsqueeze(0)
+        gumbel_noise = -torch.log(-torch.log(u_local) + 1e-30)
+        scores = torch.where(
+            v_cols == row_draft_token_ids,
+            torch.full_like(logits_full, -1e30),
+            logits_full + gumbel_noise,
+        )
+        sampled_ids = scores.argmax(dim=-1).to(torch.int32)
+        return global_lse, draft_logit, sampled_ids
+
+    logits_local = (
+        logits_processor._get_logits(
+            hidden_states, lm_head, None, skip_gather=True
+        ).to(torch.float32)
+        * inv_temperatures_per_tok
+    )
+    start_t, valid_t = _get_shard_meta_tensors(lm_head, logits_local.device)
+    shard_cols = torch.arange(
+        logits_local.shape[-1], dtype=torch.int32, device=logits_local.device
+    )
+    col_mask = shard_cols >= valid_t
+    logits_local = logits_local.masked_fill(col_mask, float("-inf"))
+    local_lse = torch.logsumexp(logits_local, dim=-1, keepdim=True)
+
+    global_cols = shard_cols.unsqueeze(0) + start_t
+    in_shard = (row_draft_token_ids >= start_t) & (
+        row_draft_token_ids < (start_t + valid_t)
+    )
+    local_draft_idx = (row_draft_token_ids - start_t).clamp(
+        min=0, max=logits_local.shape[-1] - 1
+    )
+    local_draft_logit = torch.where(
+        in_shard,
+        logits_local.gather(-1, local_draft_idx.to(torch.int64)),
+        torch.full(
+            (logits_local.shape[0], 1),
+            -1e30,
+            dtype=torch.float32,
+            device=logits_local.device,
+        ),
+    )
+
+    gumbel_noise = -torch.log(-torch.log(u_local) + 1e-30)
+    gumbel_scores = torch.where(
+        global_cols == row_draft_token_ids,
+        torch.full_like(logits_local, -1e30),
+        logits_local + gumbel_noise,
+    )
+    local_best_score, local_best_idx = gumbel_scores.max(dim=-1, keepdim=True)
+    global_idx = local_best_idx.to(torch.int32) + start_t
+
+    packed = torch.cat(
+        [
+            local_lse.view(torch.int32),
+            local_draft_logit.view(torch.int32),
+            local_best_score.view(torch.int32),
+            global_idx,
+        ],
+        dim=-1,
+    )
+    n_rows, raw_width = packed.shape[0], packed.shape[1]
+    pad_width = ((raw_width + 127) // 128) * 128
+    packed_aligned = (
+        torch.nn.functional.pad(packed, (0, pad_width - raw_width))
+        if pad_width > raw_width
+        else packed
+    )
+    gathered = tp_all_gather(packed_aligned, dim=0).view(
+        tp_size, n_rows, pad_width
+    )[..., :raw_width]
+
+    global_lse = torch.logsumexp(gathered[..., 0].view(torch.float32), dim=0)
+    global_draft_logit = gathered[..., 1].view(torch.float32).max(dim=0).values
+    winner_rank = gathered[..., 2].view(torch.float32).argmax(dim=0, keepdim=True)
+    sampled_ids = gathered[..., 3].gather(0, winner_rank).squeeze(0).to(torch.int32)
+    return global_lse, global_draft_logit, sampled_ids
+
+
 def tp_local_topk_logits(
     logits_processor,
     lm_head: torch.nn.Module,

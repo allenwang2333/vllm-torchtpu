@@ -247,28 +247,6 @@ def _moe_gmm_tiling(
                 tile_n=tiles.tile_n,
                 bucket_base=64,
             )
-        if (
-            dims.size_group <= 48
-            and 4096 <= dims.size_m <= 12288
-            and 64 % dims.size_lhs_sublane == 0
-        ):
-            return TileSizes(
-                tile_m=64,
-                tile_k=tiles.tile_k,
-                tile_n=tiles.tile_n,
-                bucket_base=64,
-            )
-        if (
-            dims.size_group <= 48
-            and 12288 < dims.size_m <= 28672
-            and 128 % dims.size_lhs_sublane == 0
-        ):
-            return TileSizes(
-                tile_m=256,
-                tile_k=tiles.tile_k,
-                tile_n=tiles.tile_n,
-                bucket_base=128,
-            )
         if dims.size_m >= 32768 and 256 % dims.size_lhs_sublane == 0:
             return TileSizes(
                 tile_m=512,
