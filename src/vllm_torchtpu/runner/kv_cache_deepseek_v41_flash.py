@@ -154,12 +154,17 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
                 )
             return hosts[position]
 
+        import os
+        _pure_prefill = os.environ.get("VLLM_DSV41_PURE_20L_PREFILL", "0") == "1"
         overlay_hosts = list(csa_nope_hosts)
         for group_swa_layers in swa_layer_groups:
             for position, layer_name in enumerate(group_swa_layers):
-                kv_caches[layer_name] = _host_at(
-                    overlay_hosts, position, swa_overflow_shape
-                )
+                if _pure_prefill:
+                    kv_caches[layer_name] = overlay_hosts[position % len(overlay_hosts)]
+                else:
+                    kv_caches[layer_name] = _host_at(
+                        overlay_hosts, position, swa_overflow_shape
+                    )
 
         for position, layer_name in enumerate(state_layer_names):
             kv_layer_name = self._ds_v4_compressed_kv_layer_name(layer_name)
@@ -167,7 +172,8 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
                 raise ValueError(f"State cache {layer_name} missing KV {kv_layer_name}")
             kv_caches[layer_name] = kv_caches[kv_layer_name]
 
-        self._validate_ds_v4_overlay(kv_cache_config, kv_caches)
+        if not _pure_prefill:
+            self._validate_ds_v4_overlay(kv_cache_config, kv_caches)
 
         model = getattr(runner, "model", None)
         draft_model = getattr(getattr(runner, "drafter", None), "draft_model", None)
