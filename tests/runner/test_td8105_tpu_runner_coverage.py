@@ -1403,6 +1403,7 @@ def test_load_model_and_initialize_kernels():
     fake_loader.load_model.return_value = fake_model
 
     with (
+        patch.object(tr_mod.torch, "device", return_value=torch.device("cpu")),
         patch.object(tr_mod, "get_tpu_quantization_config", return_value="qcfg"),
         patch.object(tr_mod, "get_model_loader", return_value=fake_loader),
         patch.object(tr_mod, "validate_online_fp8"),
@@ -2997,6 +2998,7 @@ def test_remaining_load_dummy_attention_and_top_tokens():
     fake_loader = MagicMock()
     fake_loader.load_model.return_value = fake_model
     with (
+        patch.object(tr_mod.torch, "device", return_value=torch.device("cpu")),
         patch.object(tr_mod, "get_tpu_quantization_config", return_value="qcfg"),
         patch.object(tr_mod, "get_model_loader", return_value=fake_loader),
         patch.object(tr_mod, "validate_online_fp8"),
@@ -3446,6 +3448,7 @@ def test_remaining_branch_completions():
     fake_loader = MagicMock()
     fake_loader.load_model.return_value = torch.nn.Linear(2, 2)
     with (
+        patch.object(tr_mod.torch, "device", return_value=torch.device("cpu")),
         patch.object(tr_mod, "get_tpu_quantization_config", return_value="qcfg"),
         patch.object(tr_mod, "get_model_loader", return_value=fake_loader),
         patch.object(tr_mod, "validate_online_fp8"),

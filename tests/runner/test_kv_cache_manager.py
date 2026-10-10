@@ -62,21 +62,14 @@ from vllm_torchtpu.worker.tpu_worker import TPUWorker
 
 @pytest.fixture(autouse=True)
 def _cpu_tpu_device_fallback(monkeypatch):
+    from vllm.platforms import current_platform
+
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
     from vllm_torchtpu.tpu_info import get_num_chips
 
     if get_num_chips() == 0:
-        import vllm.config.device as vllm_device_mod
-
-        orig_device = torch.device
-        monkeypatch.setattr(
-            vllm_device_mod.torch,
-            "device",
-            lambda dev, *args, **kwargs: (
-                orig_device("cpu")
-                if dev == "tpu"
-                else orig_device(dev, *args, **kwargs)
-            ),
-        )
+        monkeypatch.setattr(TpuPlatform, "device_type", "cpu")
+        monkeypatch.setattr(current_platform, "device_type", "cpu")
 
 
 def _attention_layer_mock():

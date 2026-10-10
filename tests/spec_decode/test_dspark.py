@@ -629,10 +629,7 @@ class _CompiledDraft:
         return ids
 
 
-@pytest.mark.skipif(
-    not torch.accelerator.is_available(),
-    reason="torch.compile(backend='tpu') requires a physical TPU accelerator",
-)
+@pytest.mark.usefixtures("requires_tpu")
 @pytest.mark.parametrize("sharded_tp", [1, 2])
 def test_dflash_forward_and_sample_compiled_branches(sharded_tp, monkeypatch):
     import torch._dynamo
