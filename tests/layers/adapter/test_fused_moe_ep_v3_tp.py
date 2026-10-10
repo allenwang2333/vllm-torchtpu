@@ -208,6 +208,7 @@ def harness(monkeypatch):
     h = _Harness()
     monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
     monkeypatch.setenv("MOE_FUSED_EP_V3_MIN_TOKENS", "512")
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "v3")
     monkeypatch.setattr(
         pltpu,
         "get_tpu_info",
@@ -334,8 +335,9 @@ def test_armed_runner_with_skip_final_all_reduce_is_not_reduced(harness):
     [(False, False, False), (True, False, True), (True, True, False)],
 )
 def test_fused_output_is_reduced_under_torch_compile(
-    armed, skip_final_all_reduce, expected
+    monkeypatch, armed, skip_final_all_reduce, expected
 ):
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "v3")
     quant_method = SimpleNamespace(moe_kernel=None)
     if armed:
         setattr(quant_method, fused_moe_ep_v3_tp._OP_ATTR, "op")

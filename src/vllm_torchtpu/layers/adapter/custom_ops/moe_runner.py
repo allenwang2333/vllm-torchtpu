@@ -23,9 +23,6 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
 from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
-from vllm_torchtpu.layers.adapter.fused_moe_ep_v3_tp import (
-    fused_moe_ep_v3_tp_supported,
-)
 
 # Taken once at import, outside any trace: the MoE forward is traced by
 # torch.compile, and reading the upstream property from inside the trace does
@@ -105,10 +102,16 @@ class VllmMoERunner(MoERunner):
         # reads that as truthy, and the routed output then skips its TP
         # all-reduce.
         # A layer armed by fused_moe_ep_v3_tp reduces shared + routed in its op.
-        if fused_moe_ep_v3_tp_supported(self._quant_method) and not getattr(
-            self.moe_config, "skip_final_all_reduce", False
-        ):
-            return True
+        # Imported only under v3, so other runs do not load the v3 package.
+        if envs.MOE_FUSED_EP_KERNEL_IMPL == "v3":
+            from vllm_torchtpu.layers.adapter.fused_moe_ep_v3_tp import (
+                fused_moe_ep_v3_tp_supported,
+            )
+
+            if fused_moe_ep_v3_tp_supported(self._quant_method) and not getattr(
+                self.moe_config, "skip_final_all_reduce", False
+            ):
+                return True
         if not envs.USE_MOE_FUSED_EP_KERNEL or getattr(
             self.moe_config, "skip_final_all_reduce", False
         ):

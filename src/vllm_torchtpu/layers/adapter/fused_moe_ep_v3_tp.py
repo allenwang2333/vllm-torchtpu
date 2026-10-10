@@ -557,6 +557,10 @@ def _get_op(topo: _Topology, statics: _OpStatics):
         return op
     fn, specs = _build_fn(topo, statics)
     name = "pallas::fused_moe_ep_v3_tp" + (f"_{len(_OPS)}" if _OPS else "")
+    # torch_tpu's jax_op stub types the specs as tuple[tuple[str, ...], ...],
+    # but they go to NamedSharding, which needs a PartitionSpec (as in
+    # fused_moe_ep_v3.py).
+    # pyrefly: ignore[no-matching-overload]
     op = jax_op(
         name,
         fn,
