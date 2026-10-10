@@ -42,7 +42,11 @@ export TPU_DEEPSEEK_V41_FUSED_SWA="${TPU_DEEPSEEK_V41_FUSED_SWA:-1}"
 # 16 x the 1280 MiB single-request budget of deepseek-v41-flash-tp8-ep-100k.
 # On CDK, 16 x 100k requests peaked at 25% of it.
 KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-21474836480}"
-COMPILE_SIZES="${COMPILE_SIZES:-[4,8,16,2048]}"
+if [[ "${MAX_NUM_SEQS:-16}" -gt 16 ]]; then
+  COMPILE_SIZES="${COMPILE_SIZES:-[4,8,16,32,48,64,96,128,192,224,2048]}"
+else
+  COMPILE_SIZES="${COMPILE_SIZES:-[4,8,16,2048]}"
+fi
 EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--enable-ep-weight-filter --safetensors-load-strategy=prefetch --safetensors-prefetch-num-threads=8 --block-size=16 --kv-cache-memory-bytes=${KV_CACHE_MEMORY_BYTES} --compilation-config={\"compile_sizes\":${COMPILE_SIZES}}"
 
 # Keep the v7x Engram gather on the runtime default path.
