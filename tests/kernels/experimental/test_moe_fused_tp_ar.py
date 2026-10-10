@@ -150,3 +150,91 @@ def test_matches_decomposed_layer(setup, m, padded, ep):
     # In EP mode the local id of expert ids[0, 0] is only that on its owner rank.
     broken = run(functools.partial(_reference, skip_expert=int(ids[0, 0]) % E, ep=ep))
     assert max_rel(got[0], broken[0]) > 0.08
+
+
+def _fused_blocked(rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, ep, ib):
+    return kernel.fused_moe_tp_ar(
+        rank.reshape(-1),
+        x,
+        w1,
+        w2,
+        s1,
+        s2,
+        w1s,
+        s1s,
+        w2s,
+        s2s,
+        wg,
+        tw,
+        ti,
+        n_ranks=N,
+        expert_start=rank.reshape(()) * E if ep else None,
+        i_block=ib,
+    )
+
+
+@pytest.mark.parametrize("m", [8, 32])
+@pytest.mark.parametrize("ep", [False, True])
+@pytest.mark.parametrize("ib", [128, 256])
+def test_blocked_matches_decomposed_layer(setup, m, ep, ib):
+    """Experts streamed in intermediate blocks (the mode GLM-5.2's EP experts
+    take because whole-expert slots do not fit VMEM), forced here by i_block
+    at a small shape: ib 128 is two blocks per expert, ib 256 one."""
+    mesh, sh, rank, weights, wg = setup
+    rng = np.random.default_rng(100 + m)
+    x = rng.normal(size=(m, H)).astype(np.float32)
+    n_global = N * E if ep else E
+    ids = np.stack(
+        [rng.choice(n_global, TOPK, replace=False) for _ in range(m)]
+    ).astype(np.int32)
+    tw = rng.dirichlet(np.ones(TOPK), size=m).astype(np.float32)
+    tw[m - 3 :] = 0
+    args = (
+        rank,
+        jax.device_put(jnp.tile(jnp.asarray(x, jnp.bfloat16), (N, 1)), sh),
+        *weights,
+        wg,
+        jax.device_put(jnp.tile(jnp.asarray(tw, jnp.bfloat16), (N, 1)), sh),
+        jax.device_put(jnp.tile(jnp.asarray(ids), (N, 1)), sh),
+    )
+    specs = (P("d"),) * 10 + (P(), P("d"), P("d"))
+
+    def run(fn):
+        out = jax.jit(
+            jax.shard_map(
+                fn, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False
+            )
+        )(*args)
+        return np.asarray(out.astype(jnp.float32)).reshape(N, m, H)
+
+    def max_rel(a, ref):
+        return (
+            np.linalg.norm(a - ref, axis=1)
+            / np.maximum(np.linalg.norm(ref, axis=1), 1e-30)
+        ).max()
+
+    got = run(functools.partial(_fused_blocked, ep=ep, ib=ib))
+    ref = run(functools.partial(_reference, ep=ep))
+    assert all(np.array_equal(got[0], got[r]) for r in range(N)), "ranks disagree"
+    assert np.isfinite(got).all()
+    assert max_rel(got[0], ref[0]) < 0.08
+    # Positive control: drop row 0's heaviest route (Dirichlet weights can make
+    # an arbitrary route too light for the bound to see).
+    heavy = int(ids[0, int(np.argmax(tw[0]))]) % E
+    broken = run(functools.partial(_reference, skip_expert=heavy, ep=ep))
+    assert max_rel(got[0], broken[0]) > 0.08
+
+
+def test_ring_plan_blocks_only_oversized_experts():
+    """Whole-expert slots wherever three of them fit (Qwen3.5-397B at TP8 and
+    EP8, GLM-5.2 at TP16, up to the 128-token decode cap and beyond); blocks
+    only for GLM-5.2's whole EP experts."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("reads the TPU's VMEM capacity")
+    for m in (16, 128, 256):
+        assert kernel.plan_weight_ring(m, 4096, 128, 128, 8)[0] is None
+        assert kernel.plan_weight_ring(m, 4096, 1024, 128, 8)[0] is None
+        assert kernel.plan_weight_ring(m, 6144, 128, 128, 16)[0] is None
+        ib, nb = kernel.plan_weight_ring(m, 6144, 2048, 128, 16)
+        assert ib is not None and 2048 % ib == 0 and nb >= 3
+    assert kernel.plan_weight_ring(16, 4096, 1024, 128, 8, i_block=256)[0] == 256
