@@ -611,12 +611,19 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                     )
                 qw_list, qs_list = [], []
                 for s in range(0, n_exp, 32):
+                    w_sub = w_pad[s : s + 32].to(device)
                     qw, qs = quantize_native_fp4_kmajor(
-                        w_pad[s : s + 32].to(device), block=blk, pack=True
+                        w_sub, block=blk, pack=True
                     )
+                    synchronize_tensors([qw, qs])
+                    del w_sub
                     qw_list.append(qw)
                     qs_list.append(qs)
-                return torch.cat(qw_list, dim=0), torch.cat(qs_list, dim=0)
+                qw_cat = torch.cat(qw_list, dim=0)
+                qs_cat = torch.cat(qs_list, dim=0)
+                synchronize_tensors([qw_cat, qs_cat])
+                del qw_list, qs_list
+                return qw_cat, qs_cat
             import gc
             qw_cpu_list, qs_cpu_list = [], []
             out_dtype = None
