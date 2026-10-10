@@ -132,6 +132,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     # are keyed by shape inside the same cache.
     "TPU_PP_DYNAMIC_CHUNKS",
     "TPU_PP_CHUNK_SLACK",
+    "TPU_TOKEN_BUCKET_HALF_STEPS",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, the raiden offload storage tier, offload retry and drain
     # limits, a weight-load sync cadence, a debug log switch, and the
@@ -159,6 +160,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Scheduler prefix-cache hit length / retention only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
     "TPU_HYBRID_RETENTION_MAX_CONVS",
+    "TPU_HYBRID_RETENTION_MAX_PINNED_BLOCKS",
+    "TPU_HYBRID_RETENTION_SMART_FORK",
+    "TPU_HYBRID_RETENTION_SAFE_TAIL_OFFSET",
     "TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS",
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
@@ -172,6 +176,14 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_SCHED_COLD_MIN_DECODERS",
     "TPU_SCHED_COLD_THRESHOLD",
     "TPU_SCHED_SRPF_RUNNING",
+    "TPU_SCHED_STEP_TOTAL_CAP",
+    "TPU_SCHED_WARM_STREAK",
+    "TPU_SCHED_WARM_MIN_DECODERS",
+    "TPU_SCHED_MK_MAX_RUNNING",
+    "TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP",
+    "TPU_EVICT_WEIGHTS_PAGE_CACHE",
+    "TPU_OFFLOAD_MIN_HBM_USAGE",
+    "TPU_HYBRID_RETENTION_KEEP_PRIOR_TURNS",
     "TPU_MTP_STEP0_POST_ATTN_GATHER",
 }
 
