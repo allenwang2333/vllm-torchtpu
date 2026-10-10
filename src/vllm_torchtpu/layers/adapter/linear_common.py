@@ -151,7 +151,7 @@ def quantized_matmul(
     x_2d = x.reshape(-1, x.shape[-1])
     m_orig = x_2d.shape[0]
     if m_orig % 8 != 0:
-        x_2d = torch.nn.functional.pad(x_2d, (0, 0, 0, ((m_orig + 7) & ~7) - m_orig))
+        x_2d = torch.cat((x_2d, torch.zeros((((m_orig + 7) & ~7) - m_orig, x_2d.shape[1]), dtype=x_2d.dtype, device=x_2d.device)), dim=0)
     out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s)
     if m_orig % 8 != 0:
         out_2d = out_2d[:m_orig]
@@ -233,8 +233,8 @@ def quantized_matmul_prequant(
     m_orig = x_q_2d.shape[0]
     if m_orig % 8 != 0:
         pad_rows = ((m_orig + 7) & ~7) - m_orig
-        x_q_2d = torch.nn.functional.pad(x_q_2d, (0, 0, 0, pad_rows))
-        x_scale_2d = torch.nn.functional.pad(x_scale_2d, (0, 0, 0, pad_rows))
+        x_q_2d = torch.cat((x_q_2d, torch.zeros((pad_rows, x_q_2d.shape[1]), dtype=x_q_2d.dtype, device=x_q_2d.device)), dim=0)
+        x_scale_2d = torch.cat((x_scale_2d, torch.zeros((pad_rows, x_scale_2d.shape[1]), dtype=x_scale_2d.dtype, device=x_scale_2d.device)), dim=0)
     out_2d = _get_quantized_matmul_prequant_op()(x_q_2d, x_scale_2d, w_q, w_s)
     if m_orig % 8 != 0:
         out_2d = out_2d[:m_orig]
@@ -427,7 +427,7 @@ def quantized_mlp(
     x_2d = x.reshape(-1, x.shape[-1])
     m_orig = x_2d.shape[0]
     if m_orig % 8 != 0:
-        x_2d = torch.nn.functional.pad(x_2d, (0, 0, 0, ((m_orig + 7) & ~7) - m_orig))
+        x_2d = torch.cat((x_2d, torch.zeros((((m_orig + 7) & ~7) - m_orig, x_2d.shape[1]), dtype=x_2d.dtype, device=x_2d.device)), dim=0)
     out_2d = _get_quantized_mlp_op(swiglu_limit)(x_2d, w_gu, s_gu, w_dn, s_dn)
     if m_orig % 8 != 0:
         out_2d = out_2d[:m_orig]
@@ -451,8 +451,8 @@ def quantized_mlp_prequant(
     m_orig = x_q_2d.shape[0]
     if m_orig % 8 != 0:
         pad_rows = ((m_orig + 7) & ~7) - m_orig
-        x_q_2d = torch.nn.functional.pad(x_q_2d, (0, 0, 0, pad_rows))
-        x_scale_2d = torch.nn.functional.pad(x_scale_2d, (0, 0, 0, pad_rows))
+        x_q_2d = torch.cat((x_q_2d, torch.zeros((pad_rows, x_q_2d.shape[1]), dtype=x_q_2d.dtype, device=x_q_2d.device)), dim=0)
+        x_scale_2d = torch.cat((x_scale_2d, torch.zeros((pad_rows, x_scale_2d.shape[1]), dtype=x_scale_2d.dtype, device=x_scale_2d.device)), dim=0)
     out_2d = _get_quantized_mlp_prequant_op(swiglu_limit)(
         x_q_2d, x_scale_2d, w_gu, s_gu, w_dn, s_dn
     )

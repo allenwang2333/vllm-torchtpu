@@ -175,8 +175,8 @@ def pack_topk_s32(
     k = topk_ids.shape[-1]
     pad_k = (k + 7) & ~7
     if pad_k > k:
-        topk_weights = torch.nn.functional.pad(topk_weights, (0, pad_k - k))
-        topk_ids = torch.nn.functional.pad(topk_ids, (0, pad_k - k))
+        topk_weights = torch.cat((topk_weights, torch.zeros((*topk_weights.shape[:-1], pad_k - k), dtype=topk_weights.dtype, device=topk_weights.device)), dim=-1)
+        topk_ids = torch.cat((topk_ids, torch.zeros((*topk_ids.shape[:-1], pad_k - k), dtype=topk_ids.dtype, device=topk_ids.device)), dim=-1)
     w_bits = topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
     return (topk_ids.to(torch.int32) & 0xFFFF) | (w_bits << 16)
 

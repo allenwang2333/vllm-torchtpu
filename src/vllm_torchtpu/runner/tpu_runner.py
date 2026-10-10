@@ -7711,9 +7711,9 @@ class TPUModelRunner(GPUModelRunner):
         src = torch.cat([bonus.to(drafts_chunk.dtype), drafts_chunk], dim=1).reshape(-1)
         rej = (draft_lengths[:rows] - num_valid + 1).clamp(min=0).to(torch.int32)
         if src.shape[0] < bound:
-            src = torch.nn.functional.pad(src, (0, bound - src.shape[0]))
+            src = torch.cat((src, torch.zeros((bound - src.shape[0],), dtype=src.dtype, device=src.device)), dim=0)
         if rej.shape[0] < max_num_reqs:
-            rej = torch.nn.functional.pad(rej, (0, max_num_reqs - rej.shape[0]))
+            rej = torch.cat((rej, torch.zeros((max_num_reqs - rej.shape[0],), dtype=rej.dtype, device=rej.device)), dim=0)
         return src, rej
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)

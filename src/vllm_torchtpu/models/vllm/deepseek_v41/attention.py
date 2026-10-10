@@ -1557,7 +1557,7 @@ class VllmDeepseekV41MLAAttention(
             if store_op is not None:
                 m_pad = (kv.shape[0] + 7) & ~7
                 kv_store = (
-                    torch.nn.functional.pad(kv, (0, 0, 0, m_pad - kv.shape[0]))
+                    torch.cat((kv, torch.zeros((m_pad - kv.shape[0], kv.shape[1]), dtype=kv.dtype, device=kv.device)), dim=0)
                     if m_pad > kv.shape[0]
                     else kv
                 )

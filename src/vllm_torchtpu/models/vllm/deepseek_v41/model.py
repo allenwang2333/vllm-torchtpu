@@ -99,7 +99,7 @@ def _ced_scatter_output_impl(
     decoder_out: torch.Tensor,
     scatter_idx: torch.Tensor,
 ) -> torch.Tensor:
-    padded_out = torch.nn.functional.pad(decoder_out, (0, 0, 0, 1))
+    padded_out = torch.cat((decoder_out, torch.zeros((1, decoder_out.shape[1]), dtype=decoder_out.dtype, device=decoder_out.device)), dim=0)
     safe_idx = torch.where(
         scatter_idx >= 0,
         scatter_idx,

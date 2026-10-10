@@ -215,7 +215,7 @@ def tp_local_random_spec_verify_logits(
     n_rows, raw_width = packed.shape[0], packed.shape[1]
     pad_width = ((raw_width + 127) // 128) * 128
     packed_aligned = (
-        torch.nn.functional.pad(packed, (0, pad_width - raw_width))
+        torch.cat((packed, torch.zeros((*packed.shape[:-1], pad_width - raw_width), dtype=packed.dtype, device=packed.device)), dim=-1)
         if pad_width > raw_width
         else packed
     )
@@ -282,7 +282,7 @@ def tp_local_topk_logits(
     n_rows, raw_width = packed.shape[0], packed.shape[1]
     pad_width = ((raw_width + 127) // 128) * 128
     packed_aligned = (
-        torch.nn.functional.pad(packed, (0, pad_width - raw_width))
+        torch.cat((packed, torch.zeros((*packed.shape[:-1], pad_width - raw_width), dtype=packed.dtype, device=packed.device)), dim=-1)
         if pad_width > raw_width
         else packed
     )
