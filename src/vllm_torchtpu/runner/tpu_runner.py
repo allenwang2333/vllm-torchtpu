@@ -126,7 +126,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
-from vllm_torchtpu.runner import greedy_top_tokens
+from vllm_torchtpu.runner import greedy_top_tokens, spec_precompile_shapes
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
@@ -5786,6 +5786,47 @@ class TPUModelRunner(GPUModelRunner):
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
 
+    def _precompile_spec_selected_logits(self) -> None:
+        """Warm compute_selected_logits at spec-verify index lengths.
+
+        A spec step gathers ``final_logits_indices`` (``padded_logits_length``
+        rows, a num-tokens bucket) rather than ``padded_num_reqs`` rows, so the
+        sweep above misses it, and the spec real warmup only reaches it on
+        decode-only batches. A mixed step (prefill chunk + drafted decodes)
+        then compiles ``(chunk bucket, padded_logits_length)`` on the serving
+        path. See spec_precompile_shapes. Opt-in: TPU_PRECOMPILE_SPEC_MIXED.
+        """
+        if not envs.TPU_PRECOMPILE_SPEC_MIXED or self.speculative_config is None:
+            return
+        pairs = spec_precompile_shapes.spec_selected_logits_pairs(
+            self.num_tokens_paddings,
+            self.num_reqs_paddings,
+            self.max_num_reqs,
+            self.speculative_config.num_speculative_tokens,
+        )
+        if not pairs:
+            return
+        hsize = self.model_config.get_hidden_size()
+        top_tokens = self._greedy_head_owner is not None
+        with self._precompile_timed("spec compute_selected_logits"):
+            for num_tokens, logits_len in pairs:
+                dummy_hidden = torch.zeros(
+                    (num_tokens, hsize),
+                    dtype=self._hidden_states_dtype,
+                ).to(self.device)
+                # final_logits_indices is int32 (get_spec_decode_metadata).
+                indices = torch.zeros(logits_len, dtype=torch.int32).to(self.device)
+                out = self.compute_selected_logits(dummy_hidden, indices)
+                synchronize_tensors(out)
+                if top_tokens:
+                    out = self.compute_selected_top_tokens(dummy_hidden, indices)
+                    synchronize_tensors(out)
+                logger.info(
+                    "  -- num_tokens: %d, padded_logits_length: %d",
+                    num_tokens,
+                    logits_len,
+                )
+
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_logits_from_hidden_states"):
@@ -5983,12 +6024,21 @@ class TPUModelRunner(GPUModelRunner):
         # buckets (non-spec / pure-async), plus the bounded stride-(1+K) span
         # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
         # substitute doesn't recompile per real num_reqs.
-        next_lens = list(self.num_reqs_paddings)
+        next_variants = [(n, torch.int64) for n in self.num_reqs_paddings]
         if self._is_async_drafter:
             assert self.speculative_config is not None
-            next_lens.append(
-                self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
+            spec_span = self.max_num_reqs * (
+                1 + self.speculative_config.num_speculative_tokens
             )
+            next_variants.append((spec_span, torch.int64))
+            if envs.TPU_PRECOMPILE_SPEC_MIXED:
+                # The async spec source is assembled in the drafts' dtype
+                # (assemble_spec_next_tokens / _assemble_async_prefill_bootstrap:
+                # torch.cat([bonus.to(drafts.dtype), drafts])), and eagle3
+                # proposes int32 -- so the int64 span above never matches a
+                # real call, and every mixed step's token bucket compiled
+                # on the serving path instead.
+                next_variants.append((spec_span, torch.int32))
         with self._precompile_timed("substitute_placeholder_token"):
             for num_tokens in self.num_tokens_paddings:
                 input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
@@ -6000,8 +6050,8 @@ class TPUModelRunner(GPUModelRunner):
                 pre_next_tokens_indices = torch.full(
                     (num_tokens,), -1, dtype=torch.int32
                 ).to(self.device)
-                for nlen in next_lens:
-                    next_tokens = torch.zeros(nlen, dtype=torch.int64).to(self.device)
+                for nlen, next_dtype in next_variants:
+                    next_tokens = torch.zeros(nlen, dtype=next_dtype).to(self.device)
                     out = _substitute_placeholder_token(
                         input_ids,
                         cur_input_indices,
@@ -6279,6 +6329,7 @@ class TPUModelRunner(GPUModelRunner):
             # Only the last stage holds the lm_head and samples.
             return
         self._precompile_compute_selected_logits()
+        self._precompile_spec_selected_logits()
         if _get_sequence_layout_planner_for_runner(
             self
         ).uses_selected_logits_hidden_states:
