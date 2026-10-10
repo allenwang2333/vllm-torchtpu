@@ -498,11 +498,18 @@ class TestParallelEngramEmbedding:
         emb.gather_raw(mock_indices, raw_out, scale_out)
         mock_indices.to.assert_called_once_with(weight.device)
 
-    def test_dequant_fp8_rows_and_unpack_bytes(self):
+    def test_dequant_fp8_rows_and_unpack_bytes(self, monkeypatch: pytest.MonkeyPatch):
         # 1. dequant_fp8_rows with valid scale (127 -> 1.0, 128 -> 2.0)
         raw_val = torch.tensor([1.0], dtype=torch.float8_e4m3fn).view(torch.uint8)
         raw = raw_val.repeat(4).unsqueeze(0)  # [1, 4]
         scale = torch.tensor([[127, 128]], dtype=torch.uint8)  # [1, 2]
+        monkeypatch.setattr(
+            torch.Tensor,
+            "repeat_interleave",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                AssertionError("repeat_interleave gather_offload must not be called")
+            ),
+        )
         dequant = common_engram.dequant_fp8_rows(raw, scale, block_size=2)
         assert dequant.dtype == torch.bfloat16
         assert torch.isclose(
@@ -512,14 +519,15 @@ class TestParallelEngramEmbedding:
             dequant[0, 2:].float(), torch.tensor([2.0, 2.0]), atol=1e-3
         ).all()
 
-        # 2. _INVALID_SCALE (255) maps to +0.0
-        scale_invalid = torch.tensor(
-            [[common_engram._INVALID_SCALE, common_engram._INVALID_SCALE]],
-            dtype=torch.uint8,
+        # 2. _INVALID_SCALE (255) maps to +0.0 even on FP8 NaN byte 0x7F at B=672
+        raw_nan = torch.full((672, 3, 256), 0x7F, dtype=torch.uint8)
+        scale_invalid = torch.full(
+            (672, 3, 8), common_engram._INVALID_SCALE, dtype=torch.uint8
         )
         dequant_invalid = common_engram.dequant_fp8_rows(
-            raw, scale_invalid, block_size=2
+            raw_nan, scale_invalid, block_size=32
         )
+        assert dequant_invalid.shape == (672, 3, 256)
         assert torch.all(dequant_invalid == 0.0)
 
         # 3. _unpack_bytes
@@ -828,12 +836,27 @@ class TestEngramModule:
         engram.prepare_embeddings(torch.zeros((4, 1), dtype=torch.int32))
         rows_staged = engram._ready_rows(2)
         assert rows_staged.shape == (2, 2, 16)
+        monkeypatch.setattr(common_engram, "get_engram_dp_group", lambda: None)
+        rows_staged_no_grp = engram._ready_rows(2)
+        assert rows_staged_no_grp.shape == (2, 1, 16)
+        monkeypatch.setattr(
+            common_engram, "get_engram_dp_group", lambda: fake_dp_aligned
+        )
 
         # 4c. unstaged (OFFLOAD=0) with dp_size=2
         engram._staged_raw = None
         monkeypatch.setattr(common_engram, "engram_gathered_num_tokens", lambda: 2)
         rows_unstaged = engram._ready_rows(1)
         assert rows_unstaged.shape == (1, 2, 16)
+        monkeypatch.setattr(
+            common_engram.upstream.Engram,
+            "prepare_embeddings",
+            lambda self, hids: None,
+        )
+        engram.prepare_embeddings(torch.zeros((4, 1), dtype=torch.int32))
+        assert engram._dp_staged.shape == (4, 1, 16)
+        rows_unstaged_cached = engram._ready_rows(1)
+        assert rows_unstaged_cached.shape == (1, 2, 16)
 
     @pytest.mark.parametrize("num_tokens", [6, 7])
     @pytest.mark.parametrize("tp_size", [1, 2])

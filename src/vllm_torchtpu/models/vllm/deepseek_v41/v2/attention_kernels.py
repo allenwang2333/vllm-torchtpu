@@ -2370,7 +2370,7 @@ def paged_index_scores_jax(
     # over 16.9K rows).
     eff_tokens = (
         min(tokens // 6, _INDEX_KEYS_PER_ITER // _INDEX_MAX_TILE)
-        if (tokens // 6 <= records.shape[0] and 6 <= tokens <= 192 and tokens % 6 == 0)
+        if (tokens // 6 <= records.shape[0] and 6 <= tokens <= 768 and tokens % 6 == 0)
         else tokens
     )
     budget = min(

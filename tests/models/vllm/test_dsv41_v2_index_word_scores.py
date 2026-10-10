@@ -231,7 +231,9 @@ def test_score_word_rows_wrapper_mesh_and_standalone():
     np.testing.assert_allclose(np.asarray(sharded), reference, rtol=1e-6, atol=1e-5)
 
 
-@pytest.mark.parametrize("tokens", [36, 72, 96, 144, 168, 192])
+@pytest.mark.parametrize(
+    "tokens", [36, 72, 84, 96, 144, 168, 192, 288, 336, 384, 576, 672, 768]
+)
 def test_paged_index_scores_single_16k_tile_for_candidate_and_verify(tokens):
     width = 12928
     pool = jnp.zeros((64, ROW_WORDS), jnp.int32)
@@ -250,5 +252,20 @@ def test_paged_index_scores_single_16k_tile_for_candidate_and_verify(tokens):
 
     with mock.patch.object(ak, "_score_word_rows", side_effect=_fake_score_word_rows):
         out = ak.paged_index_scores_jax(q, pool, records, weights, lengths, None, 8)
+        prestrided = jnp.zeros((tokens, 16384 // PAGE), jnp.int32)
+        out_cand = ak.paged_index_scores_jax(
+            q,
+            pool,
+            prestrided,
+            weights,
+            jnp.full((tokens,), 16384, jnp.int32),
+            None,
+            PAGE,
+            prestrided_pages=True,
+        )
     assert out.shape == (tokens, width)
-    assert observed_word_shapes == [(tokens, 8192, ROW_WORDS)]
+    assert out_cand.shape == (tokens, 16384)
+    assert observed_word_shapes == [
+        (tokens, 8192, ROW_WORDS),
+        (tokens, 8192, ROW_WORDS),
+    ]

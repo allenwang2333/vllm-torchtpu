@@ -132,6 +132,12 @@ def _eval_config(script_name: str, env_overrides: dict[str, str]) -> dict[str, s
             {},
             "[8,16,24,32,48,64,96,144,192,288,384,576,768,1152,1344,1536,2048]",
         ),
+        # PR #1794 dedicated C=64 DSpark offload wrapper
+        (
+            "deepseek-v41-flash-tp8-ep-100k-decode-c64-dspark-offload.sh",
+            {},
+            "[64,384,8192]",
+        ),
         # Custom user override preserved across every wrapper
         (
             "deepseek-v41-flash-tp8-ep-100k-decode-dspark.sh",

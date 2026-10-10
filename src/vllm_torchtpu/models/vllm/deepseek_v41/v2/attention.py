@@ -1010,7 +1010,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             else self.window_size
         )
         swa_row_slots_masked = None
-        starts = None
         swa_slots_key = None
         if (
             stage_cache is not None

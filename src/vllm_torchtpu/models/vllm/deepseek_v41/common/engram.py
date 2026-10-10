@@ -530,13 +530,14 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         if indices.device != work_device:
             indices = indices.to(work_device)
         rows, valid = self._select_local_heads(indices)
-        values = weight[rows].float()
-        scale = (
-            (scales[rows].to(torch.int32) << 23)
-            .view(torch.float32)
-            .repeat_interleave(self.block_size, -1)
+        values = weight[rows].unflatten(-1, (-1, self.block_size)).float()
+        scale = (scales[rows].to(torch.int32) << 23).view(torch.float32).unsqueeze(-1)
+        out.copy_(
+            (values * scale)
+            .flatten(-2)
+            .masked_fill(~valid[:, :, None], 0)
+            .to(out.dtype)
         )
-        out.copy_((values * scale).masked_fill(~valid[:, :, None], 0).to(out.dtype))
 
     def _select_local_heads_np(
         self, indices: np.ndarray
@@ -608,11 +609,11 @@ def dequant_fp8_rows(raw, scale, block_size):
     Byte 255 (``_INVALID_SCALE``) yields +0 whatever the raw bytes are,
     including FP8 NaN.
     """
-    values = raw.view(torch.float8_e4m3fn).float()
-    power = (scale.to(torch.int32) << 23).view(torch.float32)
-    power = power.repeat_interleave(block_size, -1)
-    invalid = (scale == _INVALID_SCALE).repeat_interleave(block_size, -1)
-    return torch.where(invalid, 0.0, values * power).to(torch.bfloat16)
+    values = raw.view(torch.float8_e4m3fn).unflatten(-1, (-1, block_size)).float()
+    power = (scale.to(torch.int32) << 23).view(torch.float32).unsqueeze(-1)
+    invalid = (scale == _INVALID_SCALE).unsqueeze(-1)
+    dequant = torch.where(invalid, 0.0, values * power).flatten(-2)
+    return dequant.to(torch.bfloat16)
 
 
 def _unpack_bytes(words, num_bytes):
