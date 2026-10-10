@@ -128,7 +128,7 @@ error.
 | `custom` | any command, given the server URLs and a results directory |
 
 Perf and lm_eval baselines sit next to the task they gate, and `scenario
-calibrate` (M2) rewrites them from a run. AgentX and InferenceX evals have no
+calibrate` rewrites them from runs. AgentX and InferenceX evals have no
 baseline: InferenceX checks them itself.
 
 AgentX follows InferenceX's own runs. `tasks.inferencex` is the deployment's
@@ -257,6 +257,7 @@ uv run --project tools/scenario scenario run --dry-run --role server --host-inde
 uv run --project tools/scenario scenario run .buildkite/kubernetes/scenarios/qwen3-0.6b/tp1.yaml --results-dir /tmp/runs
 uv run --project tools/scenario scenario up .buildkite/kubernetes/scenarios/qwen3-0.6b/tp1.yaml
 uv run --project tools/scenario scenario perf .buildkite/kubernetes/scenarios/qwen3-0.6b/tp1.yaml --url http://127.0.0.1:8000
+uv run --project tools/scenario scenario calibrate .buildkite/kubernetes/scenarios/glm-5.2/fp8-dp16-ep.yaml run1/glm-5.2-fp8-dp16-ep run2/glm-5.2-fp8-dp16-ep --write
 ```
 
 What each command does:
@@ -273,6 +274,11 @@ What each command does:
 - **`up`:** serves the scenario until SIGINT or SIGTERM, running no task.
 - **`perf` / `eval`:** run one task against a server that is already up at
   `--url`.
+- **`calibrate`:** computes new baselines from run directories with
+  `check_regression.py`'s calibration (medians over the runs) and prints the
+  change. `--write` rewrites only those baseline entries in the file; every
+  other line, comments included, stays. A baseline that is `from:` another
+  scenario is refused.
 
 ## Development
 

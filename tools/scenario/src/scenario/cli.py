@@ -31,6 +31,7 @@ from typing import Any, NoReturn
 import click
 
 from scenario import PLAN_FORMAT, __version__, gen
+from scenario import calibrate as calibration
 from scenario.errors import Diagnostic, DiagnosticError
 from scenario.keycheck import check_keys
 from scenario.model.scenario import Scenario
@@ -42,6 +43,7 @@ from scenario.plan.types import CLIENT_ROLE, Plan
 from scenario.resolve import DEFAULTS_FILE, Resolved, Resolver, find_root
 from scenario.runtime import driver, exits, init
 from scenario.runtime.exits import RunError
+from scenario.runtime.gate import GateError
 from scenario.runtime.placement import ENV_PLAN, PlacementFlags, decode_plan
 from scenario.show import describe, render_plan, render_resolved, render_why
 from scenario.targets.local import LocalTarget
@@ -617,6 +619,61 @@ def eval_(
 ) -> None:
     """Run a scenario's eval task against a server that is already up."""
     _against("eval", file, url, sets, point, results_dir, root, lm_eval_cache)
+
+
+# calibrate ----------------------------------------------------------------
+
+
+@main.command()
+@click.argument("file", type=FileArg)
+@click.argument(
+    "results",
+    nargs=-1,
+    required=True,
+    type=click.Path(path_type=pathlib.Path, file_okay=False, exists=True),
+)
+@click.option("--point", help="The sweep point to calibrate.")
+@click.option("--write", is_flag=True, help="Write the new baselines into FILE.")
+@RootOption
+def calibrate(
+    file: pathlib.Path,
+    results: tuple[pathlib.Path, ...],
+    point: str | None,
+    write: bool,
+    root: pathlib.Path | None,
+) -> None:
+    """New baselines from run directories: print the change, or --write it.
+
+    RESULTS are run directories of FILE's scenario, e.g. downloaded
+    artifacts of several runs. The values are check_regression.py's
+    calibration, the medians over the runs. --write rewrites only the
+    baseline entries it has values for; every other byte of FILE stays,
+    comments included. A baseline that is `from:` another scenario is
+    refused: calibrate that one.
+    """
+    points = _resolve(file, (), root, point)
+    resolved = _select(points, point)
+    try:
+        proposals = calibration.propose(resolved, results, pathlib.Path.cwd())
+    except (calibration.CalibrateError, GateError) as error:
+        _fail(str(error), EXIT_PROBLEMS)
+    click.echo(calibration.render(proposals), nl=False)
+    if not write:
+        return
+    original = file.read_text()
+    try:
+        changed = calibration.write(file, resolved.point, proposals)
+        _resolve(file, (), root, point)
+    except calibration.CalibrateError as error:
+        _fail(str(error), EXIT_PROBLEMS)
+    except SystemExit:
+        file.write_text(original)
+        _fail(
+            f"the rewritten {file} does not resolve; it is left as it was",
+            EXIT_PROBLEMS,
+        )
+    entries = f"{changed} baseline entr{'y' if changed == 1 else 'ies'}"
+    click.echo(f"wrote {entries} to {file}" if changed else "baselines unchanged")
 
 
 # dev --------------------------------------------------------------------

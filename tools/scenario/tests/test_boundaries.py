@@ -75,6 +75,7 @@ RULES: list[tuple[str, tuple[str, ...]]] = [
         ),
     ),
     ("scenario.show", SCENARIO_CODE),
+    ("scenario.calibrate", (*SCENARIO_CODE, "scenario.runtime.gate")),
     ("scenario.gen", (*SCENARIO_CODE, "scenario.show", "scenario.runtime")),
     ("scenario.cli", ANYTHING),
     ("scenario.__main__", ("scenario.cli",)),
