@@ -111,7 +111,7 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
             _m_lid = re.search(r"\.layers\.(\d+)\.", layer_name)
             _lid = int(_m_lid.group(1)) if _m_lid else 0
             if layer_name.endswith(self._DS_V4_INDEXER_CACHE_SUFFIX):
-                if _pure_prefill and _lid > 20 and page_size in _idx_host_by_ps:
+                if _pure_prefill and _lid >= 20 and page_size in _idx_host_by_ps:
                     kv_caches[layer_name] = _idx_host_by_ps[page_size]
                 else:
                     shape = (num_blocks, spec.head_size // packing, packing, page_size)
@@ -120,7 +120,7 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
                     )
                     _idx_host_by_ps[page_size] = kv_caches[layer_name]
             else:
-                if _pure_prefill and _lid > 20 and page_size in _mla_host_by_ps:
+                if _pure_prefill and _lid >= 20 and page_size in _mla_host_by_ps:
                     kv_caches[layer_name] = _mla_host_by_ps[page_size]
                 else:
                     nope = _create_cache(

@@ -326,7 +326,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
                 experts_start=layer._experts_start,
                 topk=layer.moe_config.experts_per_token,
                 activation=activation_str,
-                rhs_quant_dtype=self.rhs_quant_dtype,
+                rhs_quant_dtype=(None if layer.w13_weight.dtype == torch.float4_e2m1fn_x2 else self.rhs_quant_dtype),
             )
 
         # Step 1: Routing

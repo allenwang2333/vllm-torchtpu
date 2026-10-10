@@ -94,6 +94,7 @@ def can_use_dense_expert(
     hidden, w1, w2, s1, s2, b1, b2, *, activation, rhs_quant_dtype, skip_padded_tokens
 ):
     """Check arithmetic/layout support; the compiler owns resource limits."""
+    return False
     if (
         w1.dtype != jnp.float8_e4m3fn
         or w2.dtype != jnp.float8_e4m3fn
