@@ -100,6 +100,13 @@ def fake_emit_pipeline(fn=None, **kwargs):
 # ==============================================================================
 
 
+@pytest.fixture(autouse=True)
+def _clear_tuned_block_sizes_cache():
+    tbs.get_tuned_block_sizes.cache_clear()
+    yield
+    tbs.get_tuned_block_sizes.cache_clear()
+
+
 def test_tpu_version_below_4_raises():
     """TPU versions < 4 must raise NotImplementedError."""
     with (
