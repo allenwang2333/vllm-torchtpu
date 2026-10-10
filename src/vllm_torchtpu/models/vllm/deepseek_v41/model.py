@@ -598,11 +598,14 @@ class DeepseekV41DecoderLayer(nn.Module):
         return self.ffn(hidden_states), residual, ffn_pre, ffn_post, ffn_comb
 
 
-def _clear_stage_caches(layers: Iterable[nn.Module]) -> None:
+def _clear_stage_caches(
+    layers: Iterable[nn.Module], *, keep_indexer_metadata: bool = False
+) -> None:
     for layer in layers:
         attn = getattr(layer, "attn", None)
         if attn is not None:
-            attn._step_indexer_metadata = None
+            if not keep_indexer_metadata:
+                attn._step_indexer_metadata = None
             attn._step_csa_union = None
             attn._step_swa_metadata = None
             attn._step_tp_swa_metadata = None
@@ -751,7 +754,7 @@ def _run_engram_prelude_and_layers(
                 previous_x = None
                 previous_post_mix = None
                 previous_res_mix = None
-            _clear_stage_caches(layers)
+            _clear_stage_caches(layers, keep_indexer_metadata=True)
             engram_hashes_flat = torch.ops.tpu.engram_cpu_lookup_all(
                 engram_hashes_raw,
                 engram_table_ids,

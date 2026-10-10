@@ -336,7 +336,6 @@ class DeepseekV4MLP(nn.Module):
         if (
             input_is_token_sharded
             and return_token_sharded
-            and x.shape[0] % 8 == 0
             and self.has_tp_local_weights()
         ):
             return self.forward_tp_local(

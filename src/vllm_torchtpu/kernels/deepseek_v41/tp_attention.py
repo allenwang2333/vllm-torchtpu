@@ -740,7 +740,11 @@ def attention_tp_local(
         and n_unique is not None
     )
 
-    if swa_store_dst is not None and swa_store_blk_meta is not None:
+    if (
+        swa_store_dst is not None
+        and swa_store_blk_meta is not None
+        and new_kv.shape[0] >= 64
+    ):
         swa_cu, swa_kv, swa_pages, swa_dist = (
             swa_cu_q_lens,
             swa_kv_lens,

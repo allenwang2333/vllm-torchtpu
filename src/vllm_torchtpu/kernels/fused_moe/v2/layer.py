@@ -257,6 +257,7 @@ def fused_ep_moe_v2(
     scoring_fn="softmax",
     score_bias=None,
     hash_topk_ids=None,
+    topk_weights_override=None,
     routed_scaling_factor=1.0,
     token_replica_groups=None,
 ):
@@ -378,7 +379,7 @@ def fused_ep_moe_v2(
                 f"range({ep}); got {mesh_ep_ranks}"
             )
     g_local = e_total // ep
-    if T % ep or gating.shape != (T, e_total):
+    if T % ep or (gating is not None and gating.shape != (T, e_total)):
         raise ValueError(
             "input and gating rows must agree and partition evenly over EP"
         )
@@ -391,6 +392,7 @@ def fused_ep_moe_v2(
     t_local = token_layout.local_rows
     T = ep * t_local
     P = jax.sharding.PartitionSpec
+    capacity = min(int(capacity), 128) if capacity is not None else 128
     stride_bound = ragged_stride_bound(T, topk, e_total, capacity)
     if ragged_stride is None:
         ragged_stride = stride_bound
@@ -411,6 +413,11 @@ def fused_ep_moe_v2(
     has_w2_bias = w2_bias is not None
     has_score_bias = score_bias is not None
     has_hash_ids = hash_topk_ids is not None
+    has_topk_weights_override = topk_weights_override is not None
+    if gating is None and not (has_hash_ids and has_topk_weights_override):
+        raise ValueError(
+            "gating may be None only when both hash_topk_ids and topk_weights_override are supplied"
+        )
     if scoring_fn not in SCORING_FNS:
         raise ValueError(f"scoring_fn must be one of {SCORING_FNS}; got {scoring_fn!r}")
     if has_score_bias and score_bias.shape != (e_total,):
@@ -429,6 +436,12 @@ def fused_ep_moe_v2(
                 "hash_topk_ids are expert ids and must be an integer dtype; "
                 f"got {jnp.dtype(hash_topk_ids.dtype).name}"
             )
+    if has_topk_weights_override:
+        if topk_weights_override.shape != (x.shape[0], topk):
+            raise ValueError(
+                f"topk_weights_override must be one weight per token slot, "
+                f"[{x.shape[0]}, {topk}]; got {tuple(topk_weights_override.shape)}"
+            )
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -445,34 +458,27 @@ def fused_ep_moe_v2(
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
-        # The scales come before the gating logits and the biases after
-        # them, which is the operand order the scaled formats have always
-        # had: a format that supplies no scales drops them out of the middle
-        # rather than moving anything that stayed.
         operands = iter(scales_gating_biases)
         w1s_l = next(operands) if form.has_scales else None
         w2s_l = next(operands) if form.has_scales else None
-        gate_l = next(operands)
+        gate_l = next(operands) if gating is not None else None
         hash_l = next(operands) if has_hash_ids else None
+        topk_w_l = next(operands) if has_topk_weights_override else None
         score_bias_l = next(operands) if has_score_bias else None
-        # This shard's index arrives as data, not from `lax.axis_index`: that
-        # lowers to `partition-id`, which the SPMD partitioner rejects when
-        # torch_tpu recompiles this module through its jax.export bridge.
         me = rank_l[0, 0]
         x_l = token_layout.split(x_l, me)
-        gate_l = token_layout.split(gate_l, me, fill_value=-jnp.inf)
+        if gate_l is not None:
+            gate_l = token_layout.split(gate_l, me, fill_value=-jnp.inf)
         if hash_l is not None:
             hash_l = token_layout.split(hash_l, me)
+        if topk_w_l is not None:
+            topk_w_l = token_layout.split(topk_w_l, me)
         if len(token_layout.groups[0]) > 1 and form.quantized_activations:
-            # Slicing fused into rowquant changes BF16 rounding on TPU.
-            # Keep this boundary only for quantized replicated inputs.
             x_l = lax.optimization_barrier(x_l)
         rows_bf16 = x_l.astype(jnp.bfloat16)
         if form.quantized_activations:
             q_l, row_scale_l = rowquant_fp8(rows_bf16)
         else:
-            # The rows go on the wire as they arrived. There is no scale to
-            # carry, so nothing downstream builds or ships one.
             q_l, row_scale_l = rows_bf16, None
         q_g = lax.all_gather(
             q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK),
@@ -481,49 +487,46 @@ def fused_ep_moe_v2(
             tiled=True,
         )
 
-        scores = _apply_scoring_fn(gate_l, scoring_fn)
-        select_rows = MAX_ROUTING_BLOCK
-        while t_local % select_rows:
-            select_rows //= 2
-        if hash_l is not None:
-            # The selection was made by the caller's table, so the selector
-            # does not run at all; the weights are still the scores at the
-            # selected ids, which is the only thing the selector would have
-            # contributed here.
-            topk_idx = hash_l.astype(jnp.int32)
-            topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
-        elif score_bias_l is None:
-            topk_weights, topk_idx = pallas_select(
-                scores, topk=topk, block_rows=select_rows
+        if topk_w_l is not None and hash_l is not None:
+            spread_ids = (
+                jnp.arange(t_local, dtype=jnp.int32)[:, None] * topk
+                + jnp.arange(topk, dtype=jnp.int32)[None, :]
+            ) % e_total
+            valid_route = (hash_l >= 0) & (hash_l < e_total) & (topk_w_l != 0.0)
+            safe_ids = jnp.where(valid_route, hash_l.astype(jnp.int32), spread_ids)
+            topk_idx = _relabel_expert_ids_to_mesh_order(
+                safe_ids, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
             )
+            topk_weights = jnp.where(valid_route, topk_w_l.astype(jnp.float32), 0.0)
         else:
-            # Selection is based on (scores + score_bias_l); the weights come
-            # from the scores.
-            topk_weights, topk_idx = pallas_select(
-                scores + score_bias_l.astype(jnp.float32)[None, :],
-                topk=topk,
-                block_rows=select_rows,
-                weight_scores=scores,
+            scores = _apply_scoring_fn(gate_l, scoring_fn)
+            select_rows = MAX_ROUTING_BLOCK
+            while t_local % select_rows:
+                select_rows //= 2
+            if hash_l is not None:
+                topk_idx = hash_l.astype(jnp.int32)
+                topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
+            elif score_bias_l is None:
+                topk_weights, topk_idx = pallas_select(
+                    scores, topk=topk, block_rows=select_rows
+                )
+            else:
+                topk_weights, topk_idx = pallas_select(
+                    scores + score_bias_l.astype(jnp.float32)[None, :],
+                    topk=topk,
+                    block_rows=select_rows,
+                    weight_scores=scores,
+                )
+            topk_idx = _relabel_expert_ids_to_mesh_order(
+                topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
             )
-        topk_idx = _relabel_expert_ids_to_mesh_order(
-            topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
-        )
-        # A row of scores carrying no real value routes nowhere. It was
-        # dropped by arithmetic accident: the selector gives every slot of
-        # such a row a large negative sentinel, and the renormalization below
-        # divided by their sum, which OVERFLOWED float32 to -inf and so
-        # returned exactly zero. That outcome is a property of the
-        # accumulation dtype and the association order, not of the design --
-        # a wider accumulator, a reassociating compiler pass, or a different
-        # renormalization would silently turn such a row from dropped into
-        # routed at full weight to expert zero. Mask it explicitly instead.
-        row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True)
-        if renormalize:
-            denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True), 1e-20)
-            topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
-        if routed_scaling_factor != 1.0:
-            topk_weights = topk_weights * jnp.float32(routed_scaling_factor)
-        topk_weights = jnp.where(row_routes, topk_weights, 0.0)
+            row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True)
+            if renormalize:
+                denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True), 1e-20)
+                topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
+            if routed_scaling_factor != 1.0:
+                topk_weights = topk_weights * jnp.float32(routed_scaling_factor)
+            topk_weights = jnp.where(row_routes, topk_weights, 0.0)
         # A count of the masked rows would be the other half of this: an
         # incident today is degraded output against a completely clean log.
         # It is not added here because the only in-trace channel for it,
@@ -717,18 +720,28 @@ def fused_ep_moe_v2(
     # expert set, so `P()` hands each shard the whole [e_total] vector.
     # Sharding it would give each shard a 1/ep slice of the experts and
     # silently bias the wrong ones.
+    gating_args = (gating,) if gating is not None else ()
     score_bias_args = (score_bias,) if has_score_bias else ()
     hash_args = (hash_topk_ids,) if has_hash_ids else ()
+    topk_w_args = (topk_weights_override,) if has_topk_weights_override else ()
     in_specs = (
-        (P(ax),) * (5 + len(scale_args) + len(hash_args))
+        (P(ax),)
+        * (
+            4
+            + len(scale_args)
+            + len(gating_args)
+            + len(hash_args)
+            + len(topk_w_args)
+        )
         + (P(),) * len(score_bias_args)
         + (P(ax),) * len(bias_args)
     )
     args = (
         (x, rank, w1, w2)
         + scale_args
-        + (gating,)
+        + gating_args
         + hash_args
+        + topk_w_args
         + score_bias_args
         + bias_args
     )
@@ -757,12 +770,13 @@ def fused_ep_moe_v2(
         w1.dtype,
         w2.dtype,
         form.has_scales and w1_scale.dtype,
-        gating.dtype,
+        gating.dtype if gating is not None else None,
         has_w1_bias and w1_bias.dtype,
         has_w2_bias and w2_bias.dtype,
         scoring_fn,
         has_score_bias and score_bias.dtype,
         has_hash_ids and hash_topk_ids.dtype,
+        has_topk_weights_override and topk_weights_override.dtype,
         float(routed_scaling_factor),
     )
     sm = _LAYER_SM_CACHE.get(key)

@@ -216,9 +216,33 @@ def _run_swa(
         ced_decoder=ced_decoder,
         keep_lm_aligned=not swa_only,
         skip_kv_update=token_parallel,
-        verify_q_len=6 if q.shape[0] <= 1536 and q.shape[0] % 6 == 0 else 0,
+        verify_q_len=_resolve_verify_q_len(q.shape[0], non_causal_block),
         non_causal_block=non_causal_block,
     )
+
+
+def _resolve_verify_q_len(q_tokens: int, non_causal_block: bool) -> int:
+    if q_tokens > 1536:
+        return 0
+    try:
+        from vllm_torchtpu.layers.adapter.utils import (
+            get_vllm_model_wrapper_context,
+        )
+
+        vllm_cfg = getattr(get_vllm_model_wrapper_context(), "vllm_config", None)
+        spec_cfg = getattr(vllm_cfg, "speculative_config", None)
+        num_spec = getattr(spec_cfg, "num_speculative_tokens", None)
+        if isinstance(num_spec, int) and num_spec >= 1:
+            expected_q = num_spec if non_causal_block else (num_spec + 1)
+            if 2 <= expected_q <= 8 and q_tokens % expected_q == 0:
+                return expected_q
+    except Exception:
+        pass
+    candidates = (5, 3, 4) if non_causal_block else (6, 5, 4)
+    for cand in candidates:
+        if q_tokens % cand == 0:
+            return cand
+    return 0
 
 
 # Module-level so pallas.jax_op can trace and register it as a torch op.

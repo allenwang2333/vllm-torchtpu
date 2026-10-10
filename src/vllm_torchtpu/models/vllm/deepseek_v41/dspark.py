@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import os
+
 try:
     import jax
 except ImportError:
@@ -377,7 +379,10 @@ class DSparkDeepseekV41Model(nn.Module):
         total_tokens = positions.shape[0]
         if tp_size > 1:
             _ = torch.ops.aten.alias.default(self.tp_rank_idx)
-        use_token_shard = tp_token_shard_ok(total_tokens, tp_size)
+        use_token_shard = (
+            os.environ.get("VLLM_DSV41_DSPARK_SHARDED_CTX_KV", "1") == "1"
+            and tp_token_shard_ok(total_tokens, tp_size)
+        )
         if use_token_shard:
             tp_rank = get_tensor_model_parallel_rank()
             if isinstance(target_hidden_states, (list, tuple)):

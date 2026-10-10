@@ -335,7 +335,6 @@ def _make_chunk(
             query_start_loc=query_start_loc,
             use_max_model_len=True,
             position_ids_override=None,
-            staged_block_tables=None,
         ),
         start_index=start_index,
         num_reqs=num_reqs,
@@ -356,8 +355,6 @@ def test_prepare_dflash_inputs(device):
     proposer.runner = SimpleNamespace(
         device=device,
         num_tokens_paddings=[8, 16, 32],
-        num_reqs_max_model_len=8,
-        num_reqs_most_model_len=None,
         max_num_reqs=8,
         _dp_lockstep_enabled=lambda: False,
     )
@@ -553,8 +550,6 @@ def test_prepare_dflash_inputs_dp_lockstep(device):
     proposer.runner = SimpleNamespace(
         device=device,
         num_tokens_paddings=[8, 16, 32],
-        num_reqs_max_model_len=8,
-        num_reqs_most_model_len=None,
         _dp_lockstep_enabled=lambda: True,
         _dp_step_max_reqs=4,
         max_num_reqs=8,

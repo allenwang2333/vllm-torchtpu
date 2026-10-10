@@ -1627,6 +1627,7 @@ def _mla_batched_verify_kernel(
     static_q_len: int,
     ced_decoder: bool,
     skip_kv_update: bool,
+    non_causal_block: bool = False,
 ):
     def async_copy(src, dst, sem, wait=False):
         cp = pltpu.make_async_copy(src, dst, sem)
@@ -1778,7 +1779,12 @@ def _mla_batched_verify_kernel(
             )
             kv_pad = jnp.pad(kv_all, ((0, 0), (0, 128 - static_q_len), (0, 0)))
             k_iota_128 = lax.broadcasted_iota(jnp.int32, (1, 128), 1)
-            keep_mask = (k_iota_128 < static_q_len) & (q_idx_vec >= k_iota_128)
+            if non_causal_block:
+                keep_mask = jnp.broadcast_to(
+                    k_iota_128 < static_q_len, (static_q_len * num_q_heads, 128)
+                )
+            else:
+                keep_mask = (k_iota_128 < static_q_len) & (q_idx_vec >= k_iota_128)
             s_all = (
                 jnp.einsum(
                     "snd,smd->snm",
@@ -1836,6 +1842,8 @@ def _mla_batched_verify_kernel(
             k_span = start_offset + m_vec_1d
             q_span = (kv_len - static_q_len) + q_idx_vec
             keep = (q_span - k_span).astype(jnp.uint32) < jnp.uint32(sliding_window)
+            if non_causal_block:
+                keep = keep | ((k_span >= kv_len - static_q_len) & (k_span < kv_len))
             valid_kv = m_vec_1d.T < (bkv_sz_u + static_q_len)
             bkv_w = jnp.where(valid_kv, bkv_s, 0)
             q_s = q_batch_x2_vmem[
@@ -2014,9 +2022,10 @@ def run_mla_batched_verify_kernel(
     static_q_len: int,
     ced_decoder: bool,
     skip_kv_update: bool,
+    non_causal_block: bool = False,
 ):
     num_tokens, num_q_heads, head_dim = q.shape
-    max_seqs_cap = num_tokens // static_q_len
+    max_seqs_cap = max(1, num_tokens // static_q_len)
     seq_batch_sz = min(max_seqs_cap, 16 if num_q_heads <= 16 else 8)
     bkv_p = (
         1
@@ -2042,7 +2051,11 @@ def run_mla_batched_verify_kernel(
     nkv_vmem = pltpu.VMEM((2, tok_b) + new_kv.shape[1:], new_kv.dtype)
     sems = pltpu.SemaphoreType.DMA((2, 7))
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    scope_name = f"SWA-v-bq_{static_q_len}-bkvp_{bkv_p}{'-ced' if ced_decoder else ''}"
+    scope_name = (
+        f"SWA-v-bq_{static_q_len}-bkvp_{bkv_p}"
+        f"{'-ced' if ced_decoder else ''}"
+        f"{'-ncb' if non_causal_block else ''}"
+    )
     return jax.named_scope(scope_name)(
         pl.pallas_call(
             functools.partial(
@@ -2056,6 +2069,7 @@ def run_mla_batched_verify_kernel(
                 static_q_len=static_q_len,
                 ced_decoder=ced_decoder,
                 skip_kv_update=skip_kv_update,
+                non_causal_block=non_causal_block,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=4,
@@ -2478,17 +2492,28 @@ def mla_sliding_window_ragged_paged_attention(
             (out_a, kv_a, l_a, m_a),
         )
 
+    eff_verify_q_len = verify_q_len
     if (
-        2 <= verify_q_len <= 8
-        and not non_causal_block
+        eff_verify_q_len == 0
+        and non_causal_block
         and chunk_prefill_size is None
-        and q.shape[0] % verify_q_len == 0
+        and q.shape[0] <= 1536
+    ):
+        for _cand in (5, 3, 4):
+            if q.shape[0] % _cand == 0:
+                eff_verify_q_len = _cand
+                break
+
+    if (
+        2 <= eff_verify_q_len <= 8
+        and chunk_prefill_size is None
+        and q.shape[0] % eff_verify_q_len == 0
     ):
         is_uniform_verify = (
             (distribution[0] == 0)
             & (distribution[1] == 0)
             & (distribution[2] > 0)
-            & (cu_q_lens[distribution[2]] == distribution[2] * verify_q_len)
+            & (cu_q_lens[distribution[2]] == distribution[2] * eff_verify_q_len)
         )
 
         def _run_uniform_verify(kv_in):
@@ -2507,9 +2532,10 @@ def mla_sliding_window_ragged_paged_attention(
                 logical_page_size=logical_page_size,
                 vmem_limit_bytes=vmem_limit_bytes,
                 unnormalized_output=unnormalized_output,
-                static_q_len=verify_q_len,
+                static_q_len=eff_verify_q_len,
                 ced_decoder=ced_decoder,
                 skip_kv_update=skip_kv_update,
+                non_causal_block=non_causal_block,
             )
 
         output, updated_kv, out_l, out_m = lax.cond(

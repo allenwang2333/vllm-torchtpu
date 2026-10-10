@@ -857,8 +857,7 @@ _CSA_UNION_MAX_TOKENS: int = int(
 def resolve_csa_union_u_chunk(
     b_q: int, m_union: int, topk: int = 512
 ) -> int:
-    if b_q in (5, 6) and topk == 512 and m_union % 1024 == 0:
-        return min(1024, m_union)
+    del b_q, topk
     return min(512, m_union)
 
 
@@ -1103,7 +1102,7 @@ def _grouped_attention_kernel(
     n_uniq = n_unique_ref[g]
     act_chunks = jnp.clip(pl.cdiv(n_uniq, u_chunk), 1, num_u_chunks)
 
-    q_heads_per_tile = _largest_divisor(b_q, max(1, 1024 // num_q_heads))
+    q_heads_per_tile = _largest_divisor(b_q, max(1, 384 // num_q_heads))
     q_sub = q_heads_per_tile * num_q_heads
     num_q_tiles = n_qh // q_sub
 
@@ -1240,7 +1239,6 @@ def _grouped_attention_kernel(
                 (q_sub, u_chunk),
                 (1,),
             )
-            bkv_01 = jnp.concatenate([bkv_0, bkv_1], axis=0)
 
             s1_cur = _masked_qk(0, bkv_1, bits_1)
             for qt in range(num_q_tiles):
@@ -1256,25 +1254,26 @@ def _grouped_attention_kernel(
                 if b_q < 8:
                     m_new = jnp.maximum(swa_m_t, max_s01)
                     exp_swa = jnp.exp(swa_m_t - m_new)
-                    p01 = jnp.concatenate(
-                        [
-                            jnp.exp(s0_t - m_new[:, None]),
-                            jnp.exp(s1_cur - m_new[:, None]),
-                        ],
-                        axis=1,
-                    )
+                    p0 = jnp.exp(s0_t - m_new[:, None])
+                    p1 = jnp.exp(s1_cur - m_new[:, None])
                     s1_nxt = (
                         _masked_qk(qt + 1, bkv_1, bits_1)
                         if qt + 1 < num_q_tiles
                         else None
                     )
                     l_new = (
-                        exp_swa * swa_l_t + jnp.sum(p01, axis=1)
+                        exp_swa * swa_l_t
+                        + (jnp.sum(p0, axis=1) + jnp.sum(p1, axis=1))
                     ) + jnp.exp(sinks_t - m_new)
                     pv = jnp.einsum(
                         "nm,md->nd",
-                        p01,
-                        bkv_01,
+                        p0,
+                        bkv_0,
+                        preferred_element_type=jnp.float32,
+                    ) + jnp.einsum(
+                        "nm,md->nd",
+                        p1,
+                        bkv_1,
                         preferred_element_type=jnp.float32,
                     )
                     acc_new = exp_swa[:, None] * swa_acc_t + pv
@@ -1284,23 +1283,25 @@ def _grouped_attention_kernel(
                     l_init = exp_swa * swa_l_t + jnp.exp(sinks_t - m_init)
                     m_new = jnp.maximum(m_init, max_s01)
                     alpha = jnp.exp(m_init - m_new)
-                    p01 = jnp.concatenate(
-                        [
-                            jnp.exp(s0_t - m_new[:, None]),
-                            jnp.exp(s1_cur - m_new[:, None]),
-                        ],
-                        axis=1,
-                    )
+                    p0 = jnp.exp(s0_t - m_new[:, None])
+                    p1 = jnp.exp(s1_cur - m_new[:, None])
                     s1_nxt = (
                         _masked_qk(qt + 1, bkv_1, bits_1)
                         if qt + 1 < num_q_tiles
                         else None
                     )
-                    l_new = alpha * l_init + jnp.sum(p01, axis=1)
+                    l_new = alpha * l_init + (
+                        jnp.sum(p0, axis=1) + jnp.sum(p1, axis=1)
+                    )
                     pv = jnp.einsum(
                         "nm,md->nd",
-                        p01,
-                        bkv_01,
+                        p0,
+                        bkv_0,
+                        preferred_element_type=jnp.float32,
+                    ) + jnp.einsum(
+                        "nm,md->nd",
+                        p1,
+                        bkv_1,
                         preferred_element_type=jnp.float32,
                     )
                     acc_new = (alpha * exp_swa)[:, None] * swa_acc_t + pv
@@ -1587,16 +1588,24 @@ def _run_chunked_fallback(
         eff_chunk_size = 256
         eff_batch_size = attention_kernel_batch_size
     else:
-        target_chunk = 256 if num_q_heads == 64 else 512
+        target_chunk = (
+            4096 if (num_q_heads > 64 and q.shape[0] >= 8192) else 2048
+        )
         eff_chunk_size = max(
             gather_and_attention_chunk_size, min(q.shape[0], target_chunk)
         )
-        eff_batch_size = attention_kernel_batch_size
+        eff_batch_size = max(
+            attention_kernel_batch_size,
+            64
+            if (num_q_heads <= 16 and q.shape[0] <= 4096)
+            else (32 if num_q_heads <= 64 else 16),
+        )
 
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     in_specs = [pl.BlockSpec(memory_space=pltpu.VMEM)] + [hbm] * 6
+    num_chunks = cdiv(q.shape[0], eff_chunk_size)
 
-    for i in range(cdiv(q.shape[0], eff_chunk_size)):
+    def _gather_chunk(i: int):
         start_pos = i * eff_chunk_size
         end_pos = min(start_pos + eff_chunk_size, q.shape[0])
         chunk_size = end_pos - start_pos
@@ -1618,11 +1627,33 @@ def _run_chunked_fallback(
         )
         gathered_nope = gathered_nope.reshape(chunk_size, topk, -1)
         gathered_rope = gathered_rope.reshape(chunk_size, topk // 4, -1)
+        return (
+            gathered_nope,
+            gathered_rope,
+            start_pos,
+            chunk_size,
+            batch_size,
+            batch_end,
+        )
+
+    cur_chunk = _gather_chunk(0)
+    for i in range(num_chunks):
+        nxt_chunk = _gather_chunk(i + 1) if i + 1 < num_chunks else None
+        (
+            gathered_nope,
+            gathered_rope,
+            start_pos,
+            chunk_size,
+            batch_size,
+            batch_end,
+        ) = cur_chunk
         lanes = gathered_nope.shape[-1]
         end_seq_idx = jnp.maximum(start_pos, batch_end)
         grid = (cdiv(end_seq_idx - start_pos, batch_size),)
         bq_buf = pltpu.VMEM((2, batch_size, num_q_heads, head_dim), q.dtype)
-        bl_buf = pltpu.VMEM((2, batch_size, align_to(num_q_heads, 128)), jnp.float32)
+        bl_buf = pltpu.VMEM(
+            (2, batch_size, align_to(num_q_heads, 128)), jnp.float32
+        )
         scratch_shapes = [
             pltpu.VMEM((2, batch_size, topk * 4, lanes), jnp.uint8),
             pltpu.VMEM((2, batch_size, (topk // 4) * 2, lanes), jnp.bfloat16),
@@ -1671,6 +1702,7 @@ def _run_chunked_fallback(
             swa_l,
             swa_m,
         )
+        cur_chunk = nxt_chunk
     return q
 
 
@@ -1987,7 +2019,7 @@ def sparse_ragged_paged_attention(
         grp_iota = jnp.arange(num_groups, dtype=jnp.int32)
         active_grp_mask = (grp_iota >= start_group) & (grp_iota < num_active_groups)
         max_group_unique = (
-            u_chunk
+            min(512, m_union)
             if (num_q_heads >= 64 and b_q >= 8 and m_union <= 2048)
             else m_union
         )
@@ -2067,7 +2099,7 @@ def sparse_ragged_paged_attention(
             )
             g_batch = (
                 _largest_divisor(num_groups, target_gb)
-                if (b_q < 8 and num_u_chunks == 1 and num_q_heads <= 64)
+                if (b_q < 8 and m_union <= 1024 and num_q_heads <= 64)
                 else 1
             )
             if g_batch >= 2:
@@ -2080,13 +2112,13 @@ def sparse_ragged_paged_attention(
                     num_sb, g_batch * n_qh, head_dim
                 )
                 nope_sb = gathered_nope.reshape(
-                    num_sb, g_batch * u_chunk, lanes
+                    num_sb, g_batch * m_union, lanes
                 )
                 rope_sb = gathered_rope.reshape(
-                    num_sb, g_batch * (u_chunk // 4), lanes
+                    num_sb, g_batch * (m_union // 4), lanes
                 )
                 bits_sb = cand_bits_tiled.reshape(
-                    num_sb, g_batch * (u_chunk // 128), 128
+                    num_sb, g_batch * (m_union // 128), 128
                 )
                 swa_l_sb = swa_l_flat.reshape(
                     num_sb, g_batch * l_sublanes, 128
@@ -2102,10 +2134,10 @@ def sparse_ragged_paged_attention(
                 )
                 sb_scratch = [
                     pltpu.VMEM(
-                        (2, g_batch * u_chunk * 4, lanes), jnp.uint8
+                        (2, g_batch * m_union * 4, lanes), jnp.uint8
                     ),
                     pltpu.VMEM(
-                        (2, g_batch * (u_chunk // 2), lanes), jnp.bfloat16
+                        (2, g_batch * (m_union // 2), lanes), jnp.bfloat16
                     ),
                     bq_sb_buf,
                     bq_sb_buf,
@@ -2113,7 +2145,7 @@ def sparse_ragged_paged_attention(
                     bl_sb_buf,
                     bq_sb_buf,
                     pltpu.VMEM(
-                        (2, g_batch * (u_chunk // 128), 128), jnp.int32
+                        (2, g_batch * (m_union // 128), 128), jnp.int32
                     ),
                     pltpu.SemaphoreType.DMA((8, 2)),
                 ]
@@ -2124,7 +2156,7 @@ def sparse_ragged_paged_attention(
                     jnp.full((2,), -1, jnp.int32),
                 )
                 sb_scope = (
-                    f"SparseMLA-BatchedGrouped-bq_{b_q}-gb_{g_batch}-uc_{u_chunk}"
+                    f"SparseMLA-BatchedGrouped-bq_{b_q}-gb_{g_batch}-mu_{m_union}"
                 )
                 out_sb = jax.named_scope(sb_scope)(
                     pl.pallas_call(
@@ -2132,7 +2164,7 @@ def sparse_ragged_paged_attention(
                             _batched_grouped_attention_kernel,
                             sm_scale=sm_scale,
                             b_q=b_q,
-                            u_chunk=u_chunk,
+                            u_chunk=m_union,
                             g_batch=g_batch,
                             l_sublanes=l_sublanes,
                         ),

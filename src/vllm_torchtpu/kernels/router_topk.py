@@ -424,7 +424,7 @@ def _grouped_select_epilogue(
         else _apply_scoring_fn_jax(raw_logits.astype(jnp.float32), scoring_fn)
     )
     has_bias = bias_2d is not None
-    x_choice = (s + bias_2d.astype(jnp.float32)) if has_bias else s
+    x_choice = (s + bias_2d[:1, :].astype(jnp.float32)) if has_bias else s
 
     iota = jax.lax.broadcasted_iota(jnp.int32, x_choice.shape, 1)
     per_group = n // num_expert_group
@@ -653,7 +653,7 @@ def select_grouped_with_bias(
     if pad_r:
         router_logits = jnp.pad(router_logits, ((0, pad_r), (0, 0)))
     rows = orig_rows + pad_r
-    bias_2d = bias.reshape(1, n)
+    bias_2d = jnp.broadcast_to(bias.reshape(1, n), (8, n))
     block = _resolve_grouped_block_rows(rows, interpret=interpret)
     w, idx = pl.pallas_call(
         functools.partial(
@@ -669,7 +669,7 @@ def select_grouped_with_bias(
         grid=(pl.cdiv(rows, block),),
         in_specs=[
             pl.BlockSpec((block, n), lambda i: (i, 0)),
-            pl.BlockSpec((1, n), lambda i: (0, 0)),
+            pl.BlockSpec((8, n), lambda i: (0, 0)),
         ],
         out_specs=[
             pl.BlockSpec((block, topk), lambda i: (i, 0)),
@@ -704,8 +704,24 @@ def fused_gate_select_grouped_with_bias(
     if pad_r:
         hidden_states = jnp.pad(hidden_states, ((0, pad_r), (0, 0)))
     rows = orig_rows + pad_r
+    if rows > MAX_BLOCK_ROWS and not interpret:
+        logits = jnp.dot(
+            hidden_states, gate_weight, preferred_element_type=jnp.float32
+        )
+        w, idx = select_grouped_with_bias(
+            logits,
+            bias,
+            topk,
+            num_expert_group,
+            topk_group,
+            interpret=False,
+            scoring_fn=scoring_fn,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+        return (w[:orig_rows], idx[:orig_rows]) if pad_r else (w, idx)
     _, n = gate_weight.shape
-    bias_2d = bias.reshape(1, n)
+    bias_2d = jnp.broadcast_to(bias.reshape(1, n), (8, n))
     block = min(MAX_BLOCK_ROWS, rows)
     w, idx = pl.pallas_call(
         functools.partial(
@@ -722,7 +738,7 @@ def fused_gate_select_grouped_with_bias(
         in_specs=[
             pl.BlockSpec((block, h), lambda i: (i, 0)),
             pl.BlockSpec((h, n), lambda i: (0, 0)),
-            pl.BlockSpec((1, n), lambda i: (0, 0)),
+            pl.BlockSpec((8, n), lambda i: (0, 0)),
         ],
         out_specs=[
             pl.BlockSpec((block, topk), lambda i: (i, 0)),

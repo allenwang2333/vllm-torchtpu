@@ -42,6 +42,10 @@ from vllm_torchtpu.distributed.tp_collectives import tp_all_gather, tp_shard_sli
 from vllm_torchtpu.kernels.deepseek_v41.compressor import (
     compress_r2_pool_norm_jax,
     compressor_insert_cache_jax,
+    fused_compress_r2_insert_produce_k_jax,
+    fused_indexer_produce_k_jax,
+    fused_indexer_wq_b_rope_quant_jax,
+    fused_insert_produce_k_jax,
     indexer_produce_k_jax,
     indexer_v41_jax,
     indexer_v41_tp_jax,
@@ -97,30 +101,6 @@ def _as_kernel_cache_view(cache: torch.Tensor | None) -> torch.Tensor | None:
     return (
         cache if cache.dtype in (torch.uint8, torch.int32) else cache.view(torch.uint8)
     )
-
-
-def _fp32_linear_jax(x: jax.Array, weight: jax.Array) -> jax.Array:
-    rhs_dim = 0 if weight.shape[0] == x.shape[1] else 1
-    return jax.lax.dot_general(
-        x,
-        weight,
-        (((1,), (rhs_dim,)), ((), ())),
-        preferred_element_type=jax.numpy.float32,
-    )
-
-
-def _fake_fp32_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    out_dim = weight.shape[1] if weight.shape[0] == x.shape[1] else weight.shape[0]
-    return x.new_empty((x.shape[0], out_dim), dtype=torch.float32)
-
-
-_fp32_linear_op = pallas.jax_op(
-    "pallas::deepseek_v41_fp32_linear",
-    _fp32_linear_jax,
-    mesh=None,
-    input_partition_specs=(_R, _R),
-)
-_fp32_linear_op.register_fake(_fake_fp32_linear)
 
 
 class VllmCompressorV41StateCache(dsv41_compressor.CompressorStateCache):
@@ -217,12 +197,7 @@ class VllmDeepseekV41Compressor(dsv41_compressor.DeepseekCompressor):
             if latent.shape[0] != num_tokens:
                 latent = tp_all_gather(latent, dim=0)
             return latent
-        weight = self.fused_wkv_wgate.weight
-        wkv_wgate = (
-            _fp32_linear_op(hidden_states, weight)
-            if hidden_states.device.type == "tpu"
-            else self.fused_wkv_wgate(hidden_states.float())
-        )
+        wkv_wgate = self.fused_wkv_wgate(hidden_states.float())
         if wkv_wgate.shape[0] != num_tokens:
             wkv_wgate = tp_all_gather(wkv_wgate, dim=0)
         return wkv_wgate
@@ -293,6 +268,200 @@ class VllmDeepseekV41Compressor(dsv41_compressor.DeepseekCompressor):
         )
         nope_cache.copy_(new_nope)
         rope_cache.copy_(new_rope)
+
+    def _get_fused_insert_produce_k_op(
+        self, idx_rms_eps: float, quantized_wk: bool = False
+    ):
+        attr = (
+            "_fused_insert_produce_k_q_op"
+            if quantized_wk
+            else "_fused_insert_produce_k_op"
+        )
+        if (op := self.__dict__.get(attr)) is not None:
+            return op
+        suffix = "_q" if quantized_wk else ""
+        op = _get_or_register_op(
+            f"pallas::deepseek_v41_fused_insert_produce_k_r{self.compress_ratio}_e{_name_float(idx_rms_eps)}{suffix}",
+            functools.partial(
+                fused_insert_produce_k_jax,
+                compress_ratio=self.compress_ratio,
+                idx_rms_eps=idx_rms_eps,
+            ),
+            14 if quantized_wk else 13,
+            lambda *args: (
+                torch.empty_like(args[10]),
+                torch.empty_like(args[11]),
+                torch.empty_like(args[12]),
+            ),
+            donate_argnums=(10, 11, 12),
+        )
+        if not torch.compiler.is_compiling():
+            object.__setattr__(self, attr, op)
+        return op
+
+    def _get_fused_compress_insert_produce_k_op(
+        self, idx_rms_eps: float, quantized_wk: bool = False
+    ):
+        attr = (
+            "_fused_r2_insert_produce_k_q_op"
+            if quantized_wk
+            else "_fused_r2_insert_produce_k_op"
+        )
+        if (op := self.__dict__.get(attr)) is not None:
+            return op
+        assert self.state_cache is not None
+        sb = self.state_cache.block_size
+        suffix = "_q" if quantized_wk else ""
+        op = _get_or_register_op(
+            f"pallas::deepseek_v41_fused_r2_insert_produce_k_sb{sb}_r{self.compress_ratio}_e{_name_float(self.rms_norm_eps)}_ie{_name_float(idx_rms_eps)}{suffix}",
+            functools.partial(
+                fused_compress_r2_insert_produce_k_jax,
+                state_block_size=sb,
+                compress_ratio=self.compress_ratio,
+                comp_rms_eps=float(self.rms_norm_eps),
+                idx_rms_eps=idx_rms_eps,
+            ),
+            17 if quantized_wk else 16,
+            lambda *args: (
+                torch.empty_like(args[12]),
+                torch.empty_like(args[13]),
+                torch.empty_like(args[14]),
+                torch.empty_like(args[15]),
+            ),
+            donate_argnums=(12, 13, 14, 15),
+        )
+        if not torch.compiler.is_compiling():
+            object.__setattr__(self, attr, op)
+        return op
+
+    def forward_insert_and_produce_k(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb: nn.Module,
+        indexer: Any,
+        indexer_rotary_emb: nn.Module | None,
+        pregathered_proj: torch.Tensor | None = None,
+    ) -> None:
+        num_tokens = positions.shape[0]
+        has_owns_k = indexer is not None and getattr(indexer, "owns_k", False)
+        attn_ctx = get_forward_context().attn_metadata
+        k_cache_obj = self._static_forward_context.get(self.k_cache_prefix)
+        entry = getattr(k_cache_obj, "kv_cache", None)
+        nope_cache = (
+            _as_kernel_cache_view(entry[0]) if isinstance(entry, tuple) else None
+        )
+        rope_cache = (
+            _as_kernel_cache_view(entry[1]) if isinstance(entry, tuple) else None
+        )
+        idx_k_cache = (
+            _as_kernel_cache_view(getattr(indexer.k_cache, "kv_cache", None))
+            if has_owns_k
+            else None
+        )
+        if (
+            has_owns_k
+            and isinstance(attn_ctx, dict)
+            and nope_cache is not None
+            and rope_cache is not None
+            and idx_k_cache is not None
+            and indexer_rotary_emb is not None
+        ):
+            wk_bias = getattr(indexer.wk, "bias", None)
+            wk_scale = getattr(indexer.wk, "weight_scale", None)
+            idx_meta = attn_ctx.get(indexer.k_cache.prefix)
+            kv_meta = attn_ctx.get(self.k_cache_prefix)
+            if (
+                wk_bias is None
+                and (wk_scale is None or wk_scale.ndim == 1)
+                and idx_meta is not None
+                and kv_meta is not None
+            ):
+                wk_w = (
+                    indexer.wk.weight.transpose(0, 1)
+                    if getattr(indexer.wk, KEEP_VLLM_LAYOUT_ATTR, False)
+                    else indexer.wk.weight
+                )
+                idx_eps = float(getattr(indexer.k_norm, "variance_epsilon", 1e-6))
+                extra = (wk_scale,) if wk_scale is not None else ()
+                pos_i32 = positions.to(torch.int32)
+                if self.has_gate:
+                    assert self.state_cache is not None
+                    state_entry = getattr(self.state_cache, "kv_cache", None)
+                    state_raw = (
+                        state_entry[0]
+                        if isinstance(state_entry, tuple)
+                        else state_entry
+                    )
+                    state_cache = _as_kernel_cache_view(state_raw)
+                    state_meta = attn_ctx.get(self.state_cache.prefix)
+                    if state_cache is not None and state_meta is not None:
+                        wkv_wgate = (
+                            pregathered_proj
+                            if pregathered_proj is not None
+                            else self.project_wkv_wgate(hidden_states, num_tokens)
+                        )
+                        op = self._get_fused_compress_insert_produce_k_op(
+                            idx_eps, quantized_wk=wk_scale is not None
+                        )
+                        new_state, new_nope, new_rope, new_k = op(
+                            wkv_wgate,
+                            self.norm.weight,
+                            wk_w,
+                            indexer.k_norm.weight,
+                            rotary_emb.cos_sin_cache,
+                            indexer_rotary_emb.cos_sin_cache,
+                            pos_i32,
+                            state_meta.block_tables.reshape(-1),
+                            kv_meta.block_tables.reshape(-1),
+                            idx_meta.block_tables.reshape(-1),
+                            kv_meta.query_start_loc,
+                            kv_meta.request_distribution,
+                            state_cache,
+                            nope_cache,
+                            rope_cache,
+                            idx_k_cache,
+                            *extra,
+                        )
+                        state_cache.copy_(new_state)
+                        nope_cache.copy_(new_nope)
+                        rope_cache.copy_(new_rope)
+                        idx_k_cache.copy_(new_k)
+                        return
+                else:
+                    latent = (
+                        pregathered_proj
+                        if pregathered_proj is not None
+                        else self.project_wkv_wgate(hidden_states, num_tokens)
+                    )
+                    op = self._get_fused_insert_produce_k_op(
+                        idx_eps, quantized_wk=wk_scale is not None
+                    )
+                    new_nope, new_rope, new_k = op(
+                        latent,
+                        wk_w,
+                        indexer.k_norm.weight,
+                        rotary_emb.cos_sin_cache,
+                        indexer_rotary_emb.cos_sin_cache,
+                        pos_i32,
+                        kv_meta.block_tables.reshape(-1),
+                        idx_meta.block_tables.reshape(-1),
+                        kv_meta.query_start_loc,
+                        kv_meta.request_distribution,
+                        nope_cache,
+                        rope_cache,
+                        idx_k_cache,
+                        *extra,
+                    )
+                    nope_cache.copy_(new_nope)
+                    rope_cache.copy_(new_rope)
+                    idx_k_cache.copy_(new_k)
+                    return
+
+        latent = self(hidden_states, positions, pregathered_proj=pregathered_proj)
+        self.insert_cache(latent, positions, rotary_emb)
+        if has_owns_k and indexer_rotary_emb is not None:
+            indexer.write_k_cache(latent, positions, indexer_rotary_emb)
 
 
 class VllmDeepseekV41IndexerCache(dsv41_attention.DeepseekV4IndexerCache):
@@ -392,6 +561,17 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         object.__setattr__(
             self, "indexer_op_hm", self._build_indexer_op(use_step_meta=True)
         )
+        object.__setattr__(
+            self, "indexer_op_pq", self._build_indexer_op(prequant_q=True)
+        )
+        object.__setattr__(
+            self,
+            "indexer_op_hm_pq",
+            self._build_indexer_op(use_step_meta=True, prequant_q=True),
+        )
+        object.__setattr__(
+            self, "fused_wqb_rope_quant_op", self._build_fused_wqb_rope_quant_op()
+        )
         if get_tensor_model_parallel_world_size() > 1 and (
             envs.VLLM_DSV41_TP_INDEXER or self.owns_k
         ):
@@ -404,6 +584,11 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
                 object.__setattr__(
                     self, "indexer_op_tp", self._build_tp_indexer_op()
                 )
+                object.__setattr__(
+                    self,
+                    "indexer_op_tp_pq",
+                    self._build_tp_indexer_op(prequant_q=True),
+                )
         if self.owns_k:
             object.__setattr__(self, "produce_k_op", self._get_produce_k_op())
         bs = int(
@@ -415,7 +600,34 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         )
         object.__setattr__(self, "_step_metadata_page_size", num_states)
 
-    def _build_indexer_op(self, use_step_meta: bool = False):
+    def _build_fused_wqb_rope_quant_op(self):
+        op_name = (
+            f"pallas::deepseek_v41_fused_indexer_wqb_rope_quant"
+            f"_h{self.n_head}_d{self.head_dim}_s{_name_float(self.softmax_scale)}"
+        )
+
+        def _fake_fused_wqb_rq(q_fp8, *args, **kwargs):
+            t = q_fp8.shape[0]
+            return (
+                q_fp8.new_empty((t, self.n_head, self.head_dim), dtype=torch.float8_e4m3fn),
+                q_fp8.new_empty((t, self.n_head), dtype=torch.float32),
+            )
+
+        return _get_or_register_op(
+            op_name,
+            functools.partial(
+                fused_indexer_wq_b_rope_quant_jax,
+                softmax_scale=self.softmax_scale,
+                n_head=self.n_head,
+                head_dim=self.head_dim,
+            ),
+            7,
+            _fake_fused_wqb_rq,
+        )
+
+    def _build_indexer_op(
+        self, use_step_meta: bool = False, prequant_q: bool = False
+    ):
         op_name = (
             f"pallas::deepseek_v41_indexer_k{self.topk_tokens}"
             f"_c{self.compress_ratio}_h{self.n_head}"
@@ -427,6 +639,8 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
             )
         if use_step_meta:
             op_name += "_hm"
+        if prequant_q:
+            op_name += "_pq"
 
         def _fake_indexer(q, *args, **kwargs):
             topk = q.new_empty((q.shape[0], self.topk_tokens), dtype=torch.int32)
@@ -452,12 +666,13 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
                 cand_blocks=self.cand_blocks,
                 cand_block_size=self.cand_block_size,
                 has_precomputed_meta=use_step_meta,
+                q_is_prequant=prequant_q,
             ),
             n_inputs,
             _fake_indexer,
         )
 
-    def _build_tp_indexer_op(self):
+    def _build_tp_indexer_op(self, prequant_q: bool = False):
         tp_size = get_tensor_model_parallel_world_size()
         op_name = (
             f"pallas::deepseek_v41_indexer_tp{tp_size}_k{self.topk_tokens}"
@@ -468,6 +683,8 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
             op_name += (
                 f"_cand{self.cand_mode}_b{self.cand_blocks}x{self.cand_block_size}"
             )
+        if prequant_q:
+            op_name += "_pq"
 
         def _fake_tp_indexer(rank, q, *args, **kwargs):
             topk = q.new_empty((q.shape[0], self.topk_tokens), dtype=torch.int32)
@@ -493,6 +710,7 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
                 cand_mode=self.cand_mode,
                 cand_blocks=self.cand_blocks,
                 cand_block_size=self.cand_block_size,
+                q_is_prequant=prequant_q,
             ),
             12 if self.cand_mode == "read" else 11,
             _fake_tp_indexer,
@@ -600,6 +818,27 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         object.__setattr__(self, "produce_k_op", op)
         return op
 
+    def _get_fused_produce_k_op(self, quantized_wk: bool = False):
+        attr = "fused_produce_k_q_op" if quantized_wk else "fused_produce_k_op"
+        if (op := self.__dict__.get(attr)) is not None:
+            return op
+        eps = float(getattr(self.k_norm, "variance_epsilon", 1e-6))
+        suffix = "_q" if quantized_wk else ""
+        op = _get_or_register_op(
+            f"pallas::deepseek_v41_fused_indexer_produce_k_r{self.compress_ratio}_e{_name_float(eps)}{suffix}",
+            functools.partial(
+                fused_indexer_produce_k_jax,
+                compress_ratio=self.compress_ratio,
+                rms_eps=eps,
+            ),
+            10 if quantized_wk else 9,
+            lambda *args: torch.empty_like(args[8]),
+            donate_argnums=(8,),
+        )
+        if not torch.compiler.is_compiling():
+            object.__setattr__(self, attr, op)
+        return op
+
     def write_k_cache(
         self,
         latent: torch.Tensor | None,
@@ -617,6 +856,31 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         attn_metadata = attn_ctx.get(self.k_cache.prefix)
         if attn_metadata is None:
             return
+        wk_bias = getattr(self.wk, "bias", None)
+        wk_scale = getattr(self.wk, "weight_scale", None)
+        if wk_bias is None and (wk_scale is None or wk_scale.ndim == 1):
+            wk_w = (
+                self.wk.weight.transpose(0, 1)
+                if getattr(self.wk, KEEP_VLLM_LAYOUT_ATTR, False)
+                else self.wk.weight
+            )
+            op = self._get_fused_produce_k_op(quantized_wk=wk_scale is not None)
+            extra = (wk_scale,) if wk_scale is not None else ()
+            new_kv_cache = op(
+                latent,
+                wk_w,
+                self.k_norm.weight,
+                rotary_emb.cos_sin_cache,
+                positions.to(torch.int32),
+                attn_metadata.block_tables.reshape(-1),
+                attn_metadata.query_start_loc,
+                attn_metadata.request_distribution,
+                kv_cache,
+                *extra,
+            )
+            kv_cache.copy_(new_kv_cache)
+            return
+
         num_tokens = latent.shape[0]
         tp_size = get_tensor_model_parallel_world_size()
         rank_idx = getattr(self, "_tp_rank_idx", None)
@@ -673,6 +937,29 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         assert query is not None
         return self.wq_b(query)[0]
 
+    def _apply_fused_wqb_rope_quant(
+        self,
+        query_fp8: torch.Tensor,
+        query_scale: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        indexer_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = self.wq_b.weight
+        if getattr(self.wq_b, KEEP_VLLM_LAYOUT_ATTR, False):
+            weight = weight.transpose(0, 1)
+        if query_scale.ndim == 2 and query_scale.shape[1] > 1:
+            query_scale = query_scale[:, :1]
+        return self.fused_wqb_rope_quant_op(
+            query_fp8,
+            query_scale,
+            weight,
+            self.wq_b.weight_scale,
+            positions.to(torch.int32),
+            cos_sin_cache,
+            indexer_weights,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -702,6 +989,11 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         if self.owns_k and latent is not None:
             self.write_k_cache(latent, positions, rotary_emb)
 
+        use_fused_pq = (
+            query_fp8 is not None
+            and query_scale is not None
+            and self.can_accept_prequant_query()
+        )
         main_metadata = attn_ctx[prefix_key.removesuffix(".indexer.k_cache")]
         if self.use_tp_indexer(num_tokens):
             # Token-parallel: this rank projects and scores tokens
@@ -721,21 +1013,36 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
                     ).view(x.dtype)
                 return tp_shard_slice(x, tp_size, tp_rank, rank_idx)
 
-            if query_fp8 is not None and query_scale is not None:
-                q_proj = self._apply_wq_b(
-                    None, local(query_fp8), local(query_scale)
-                ).view(-1, self.n_head, self.head_dim)
-            else:
-                assert query is not None
-                q_proj = self._apply_wq_b(local(query)).view(
-                    -1, self.n_head, self.head_dim
+            pos_local = local(positions.to(torch.int32))
+            iw_local = local(indexer_weights)
+            if use_fused_pq:
+                assert query_fp8 is not None and query_scale is not None
+                q_arg, w_arg = self._apply_fused_wqb_rope_quant(
+                    local(query_fp8),
+                    local(query_scale),
+                    pos_local,
+                    rotary_emb.cos_sin_cache,
+                    iw_local,
                 )
+                tp_op = self.indexer_op_tp_pq
+            else:
+                if query_fp8 is not None and query_scale is not None:
+                    q_arg = self._apply_wq_b(
+                        None, local(query_fp8), local(query_scale)
+                    ).view(-1, self.n_head, self.head_dim)
+                else:
+                    assert query is not None
+                    q_arg = self._apply_wq_b(local(query)).view(
+                        -1, self.n_head, self.head_dim
+                    )
+                w_arg = iw_local
+                tp_op = self.indexer_op_tp
             op_args = (
                 rank_idx.to(torch.int32),
-                q_proj,
-                local(positions.to(torch.int32)),
+                q_arg,
+                pos_local,
                 rotary_emb.cos_sin_cache,
-                local(indexer_weights),
+                w_arg,
                 attn_metadata.seq_lens,
                 attn_metadata.block_tables,
                 attn_metadata.query_start_loc,
@@ -744,20 +1051,18 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
                 main_metadata.block_tables,
             )
             if self.cand_mode == "write":
-                topk, cands = self.indexer_op_tp(*op_args)
+                topk, cands = tp_op(*op_args)
                 self._cand_buf[:t_local].copy_(cands)
             elif self.cand_mode == "read":
-                topk = self.indexer_op_tp(*op_args, self._cand_buf[:t_local])
+                topk = tp_op(*op_args, self._cand_buf[:t_local])
             else:
-                topk = self.indexer_op_tp(*op_args)
+                topk = tp_op(*op_args)
             if not keep_topk_local:
                 topk = tp_all_gather(topk, dim=0)
         else:
             # wq_b / weights_proj are replicated, so every rank scores all heads
             # and all tokens against its replicated K cache.
-            q_proj = self._apply_wq_b(query, query_fp8, query_scale).view(
-                -1, self.n_head, self.head_dim
-            )
+            pos_i32 = positions.to(torch.int32)
             if step_metadata is None and step_metadata_fn is not None:
                 step_metadata = step_metadata_fn()
             meta_args: tuple[torch.Tensor, ...] = ()
@@ -767,13 +1072,36 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
                 )
                 eff_rl = eff_rl_r2 if self.compress_ratio == 2 else eff_rl_r1
                 meta_args = (eff_rl, idx_page_indices, pass_num_steps, pass_schedules)
-            idx_op = self.indexer_op_hm if step_metadata is not None else self.indexer_op
+            if use_fused_pq:
+                assert query_fp8 is not None and query_scale is not None
+                q_arg, w_arg = self._apply_fused_wqb_rope_quant(
+                    query_fp8,
+                    query_scale,
+                    pos_i32,
+                    rotary_emb.cos_sin_cache,
+                    indexer_weights,
+                )
+                idx_op = (
+                    self.indexer_op_hm_pq
+                    if step_metadata is not None
+                    else self.indexer_op_pq
+                )
+            else:
+                q_arg = self._apply_wq_b(query, query_fp8, query_scale).view(
+                    -1, self.n_head, self.head_dim
+                )
+                w_arg = indexer_weights
+                idx_op = (
+                    self.indexer_op_hm
+                    if step_metadata is not None
+                    else self.indexer_op
+                )
 
             op_args = (
-                q_proj,
-                positions.to(torch.int32),
+                q_arg,
+                pos_i32,
                 rotary_emb.cos_sin_cache,
-                indexer_weights,
+                w_arg,
                 kv_cache,
                 attn_metadata.seq_lens,
                 attn_metadata.block_tables,

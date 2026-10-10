@@ -257,6 +257,101 @@ class DeepseekV4MoE(nn.Module):
         defer_shared_to_rs = run_local_shared
         routed = getattr(self.experts, "routed_experts", None)
         qm = getattr(routed, "quant_method", None)
+        if (
+            not self.experts.do_naive_dispatch_combine
+            and routed is not None
+            and qm is not None
+        ):
+            if input_is_token_sharded:
+                x_shard = x_local
+                ids_shard = (
+                    input_ids[
+                        self.tp_rank * x_shard.shape[0] : (self.tp_rank + 1)
+                        * x_shard.shape[0]
+                    ]
+                    if (
+                        input_ids is not None
+                        and input_ids.shape[0] != x_shard.shape[0]
+                    )
+                    else input_ids
+                )
+                gate_out = self.gate(x_shard)
+                local_logits = (
+                    gate_out[0] if isinstance(gate_out, tuple) else gate_out
+                )
+                routed_out = qm.apply_monolithic(
+                    routed, x_shard, local_logits, input_ids=ids_shard
+                )
+                if self.shared_experts is not None:
+                    if self.shared_experts.has_tp_local_weights():
+                        shared_out = self.shared_experts.forward_tp_local(
+                            x_shard,
+                            hidden_states_fp8=hidden_states_fp8,
+                            hidden_states_scale=hidden_states_scale,
+                        )
+                    else:
+                        shared_out = self.shared_experts(x_shard)
+                    routed_out = routed_out + shared_out.view_as(routed_out)
+                if return_token_sharded or self.tp_size <= 1:
+                    return routed_out.view(-1, *org_shape[1:])
+                return tp_all_gather(routed_out, dim=0).view(-1, *org_shape[1:])
+            if self.tp_size > 1:
+                t_orig = x_local.shape[0]
+                t_pad = (t_orig + self.tp_size - 1) // self.tp_size * self.tp_size
+                if t_pad > t_orig:
+                    x_pad = torch.cat(
+                        [
+                            x_local,
+                            x_local.new_zeros((t_pad - t_orig, x_local.shape[1])),
+                        ],
+                        dim=0,
+                    )
+                    ids_pad = (
+                        torch.cat(
+                            [
+                                input_ids,
+                                input_ids.new_full((t_pad - t_orig,), -1),
+                            ],
+                            dim=0,
+                        )
+                        if input_ids is not None
+                        else None
+                    )
+                else:
+                    x_pad = x_local
+                    ids_pad = input_ids
+                t_per_rank = t_pad // self.tp_size
+                s_idx = self.tp_rank * t_per_rank
+                e_idx = s_idx + t_per_rank
+                x_shard = x_pad[s_idx:e_idx]
+                ids_shard = ids_pad[s_idx:e_idx] if ids_pad is not None else None
+                gate_out = self.gate(x_shard)
+                local_logits = (
+                    gate_out[0] if isinstance(gate_out, tuple) else gate_out
+                )
+                if t_pad > t_orig:
+                    pad_rows = (
+                        torch.arange(s_idx, e_idx, device=x_shard.device) >= t_orig
+                    )
+                    local_logits = torch.where(
+                        pad_rows[:, None],
+                        local_logits.new_full((), -float("inf")),
+                        local_logits,
+                    )
+                routed_out = qm.apply_monolithic(
+                    routed, x_shard, local_logits, input_ids=ids_shard
+                )
+                if self.shared_experts is not None:
+                    if self.shared_experts.has_tp_local_weights():
+                        shared_out = self.shared_experts.forward_tp_local(x_shard)
+                    else:
+                        shared_out = self.shared_experts(x_shard)
+                    routed_out = routed_out + shared_out.view_as(routed_out)
+                if return_token_sharded:
+                    return routed_out.view(-1, *org_shape[1:])
+                return (
+                    tp_all_gather(routed_out, dim=0)[:t_orig].view(-1, *org_shape[1:])
+                )
         use_fp8_tp_dispatch = (
             input_is_token_sharded
             and self.tp_size > 1

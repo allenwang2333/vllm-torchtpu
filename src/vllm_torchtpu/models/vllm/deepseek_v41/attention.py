@@ -1294,11 +1294,15 @@ class VllmDeepseekV41MLAAttention(
         indexer = self._tp_attn_topk_indexer()
         return indexer is not None and indexer.use_tp_indexer(num_tokens)
 
-    def _get_tp_attn_op(self, has_union: bool = False):
+    def _get_tp_attn_op(
+        self, has_union: bool = False, ced_decoder: bool | None = None
+    ):
         """Token-parallel attention op: all heads for this rank's T/tp tokens."""
+        eff_ced = self._ced_decoder if ced_decoder is None else ced_decoder
+        ced_tag = "_ced" if eff_ced else ""
         is_csa = self.compress_ratio > 0
         u_tag = "_u1" if (is_csa and has_union) else ""
-        attr_name = f"_tp_attn_op{u_tag}"
+        attr_name = f"_tp_attn_op{ced_tag}{u_tag}"
         op = self.__dict__.get(attr_name)
         if op is not None:
             return op
@@ -1324,12 +1328,14 @@ class VllmDeepseekV41MLAAttention(
             sm_scale=self.scale,
             sliding_window=self.window_size,
             logical_page_size=logical_page_size,
+            ced_decoder=eff_ced,
             token_parallel=True,
             page_indices_ring_mapped=True,
             **({"two_caches_same_buffer": two_caches_same_buffer} if is_csa else {}),
         )
         op_name = (
             f"pallas::deepseek_v41_attention_{'csa' if is_csa else 'swa'}"
+            f"{ced_tag}"
             f"_tpattn{get_tensor_model_parallel_world_size()}"
             f"_p{logical_page_size}"
             f"{'_aliased' if two_caches_same_buffer else ''}"
@@ -1775,10 +1781,6 @@ class VllmDeepseekV41MLAAttention(
             _TP_ATTN
             and not self.non_causal_multi_token_decode
             and get_tensor_model_parallel_world_size() > 1
-            and not (
-                self._tp_attn_encoder_only
-                and getattr(self, "_supports_ced_decoder", False)
-            )
         ):
             self._build_tp_attn_weights()
         elif get_tensor_model_parallel_world_size() > 1:
@@ -1834,18 +1836,15 @@ class VllmDeepseekV41MLAAttention(
         if positions.ndim > 1:
             positions = positions.flatten()
         compressor = getattr(self, "compressor", None)
-        latent = (
-            compressor(
-                hidden_states, positions, pregathered_proj=None
+        if compressor is not None:
+            compressor.forward_insert_and_produce_k(
+                hidden_states,
+                positions,
+                self.rotary_emb,
+                self.indexer,
+                self.indexer_rotary_emb,
+                pregathered_proj=None,
             )
-            if compressor is not None
-            else None
-        )
-        if compressor is not None and latent is not None:
-            compressor.insert_cache(latent, positions, self.rotary_emb)
-        if self.indexer is not None and self.indexer.owns_k:
-            assert latent is not None
-            self.indexer.write_k_cache(latent, positions, self.indexer_rotary_emb)
 
     def forward(
         self,
@@ -1875,17 +1874,7 @@ class VllmDeepseekV41MLAAttention(
             None if eff_ced_global_from_encoder else getattr(self, "compressor", None)
         )
         cos_sin = self.rotary_emb.cos_sin_cache
-        if (
-            _TOKEN_SHARD_MIN_TOKENS > 0
-            and "_tp_attn_wq_b_w" in self._buffers
-            and not eff_ced_decoder
-            and (not self._tp_attn_encoder_only or self._in_encoder_stage)
-        ):
-            # VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS splits this module's bucket
-            # ladder into head-parallel (replicated) and TP_ATTN (token-sharded)
-            # shape_variants traces. Lift both branches' module tensors here in a
-            # fixed order so their FX placeholder signatures agree (unused
-            # aliases are DCE'd), as in l3b_min_tokens_shape_variants_fix.
+        if _TOKEN_SHARD_MIN_TOKENS > 0 and "_tp_attn_wq_b_w" in self._buffers:
             _ = self._tp_attn_ready(num_tokens, tp_size)
             _ = [
                 torch.ops.aten.alias.default(t)
@@ -1932,12 +1921,11 @@ class VllmDeepseekV41MLAAttention(
         qr_scale_for_indexer: torch.Tensor | None = None
         qr_q_fp8: torch.Tensor | None = None
         qr_q_scale: torch.Tensor | None = None
-        # Token-parallel attention: all heads for this rank's T/tp tokens.
+        # Token-parallel attention across EncoderStage, DecoderStage, and FullStage for T >= 64.
         use_tp_attn = (
             input_is_token_sharded
             and return_token_sharded
-            and not eff_ced_decoder
-            and (not self._tp_attn_encoder_only or self._in_encoder_stage)
+            and num_tokens >= max(64, _TP_ATTN_MIN_TOKENS)
             and self._tp_attn_ready(num_tokens, tp_size)
         )
         w_wqa = self.fused_wqa_wkv.weight
@@ -2199,19 +2187,17 @@ class VllmDeepseekV41MLAAttention(
                 q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
                 q = self.q_rope_op(q, positions, cos_sin)
 
-        latent = (
-            compressor(
-                hidden_states, positions, pregathered_proj=pre_comp_proj
+        if compressor is not None:
+            compressor.forward_insert_and_produce_k(
+                hidden_states,
+                positions,
+                self.rotary_emb,
+                self.indexer,
+                self.indexer_rotary_emb,
+                pregathered_proj=pre_comp_proj,
             )
-            if compressor is not None
-            else None
-        )
         topk_local = use_tp_attn and self._keep_topk_local(num_tokens)
         if self.indexer is not None:
-            if self.indexer.owns_k and latent is not None:
-                self.indexer.write_k_cache(
-                    latent, positions, self.indexer_rotary_emb
-                )
             assert pre_idx_weights is not None
             topk_indices = self.indexer(
                 hidden_states,
@@ -2235,9 +2221,6 @@ class VllmDeepseekV41MLAAttention(
             ]
         else:
             topk_indices = None
-
-        if compressor is not None and latent is not None:
-            compressor.insert_cache(latent, positions, self.rotary_emb)
 
         attn_ctx = get_forward_context().attn_metadata
         kv_holder = self._kv_source_module()
@@ -2332,7 +2315,9 @@ class VllmDeepseekV41MLAAttention(
                     )
                     tp_union_operands = tuple(cached_u)
                     tp_has_union = True
-            attn_output, new_sw_cache = self._get_tp_attn_op(tp_has_union)(
+            attn_output, new_sw_cache = self._get_tp_attn_op(
+                tp_has_union, ced_decoder=eff_ced_decoder
+            )(
                 q,
                 kv,
                 sw_cache,
