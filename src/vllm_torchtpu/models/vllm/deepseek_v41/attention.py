@@ -447,6 +447,23 @@ def _unpack_meta(meta: Any) -> tuple[Any, Any, Any, Any]:
     )
 
 
+@torch.compiler.disable
+def _resolve_two_caches_same_buffer(
+    mod: torch.nn.Module,
+    orig_main_cache_kv: torch.Tensor | None,
+    orig_sw_cache: torch.Tensor | None,
+) -> bool:
+    cached = mod.__dict__.get("_two_caches_same_buffer_resolved")
+    if cached is not None:
+        return cached
+    if orig_main_cache_kv is None or orig_sw_cache is None:
+        return False
+    res = bool(orig_main_cache_kv.data_ptr() == orig_sw_cache.data_ptr())
+    mod.__dict__["_two_caches_same_buffer_resolved"] = res
+    mod._two_caches_same_buffer = res
+    return res
+
+
 class VllmDeepseekV41SWACache(VllmDeepseekV4SWACache):
     """SWA cache wrapper accepting DeepSeek-V4.1's extra constructor kwargs."""
 
@@ -939,7 +956,11 @@ class VllmDeepseekV41MLAAttention(
         return
 
     def _get_csa_union_op(
-        self, total_cache_rows: int, m_union: int, b_q: int | None = None
+        self,
+        total_cache_rows: int,
+        m_union: int,
+        b_q: int | None = None,
+        ced_decoder: bool | None = None,
     ):
         b_q = _CSA_UNION_BQ if b_q is None else b_q
         u_chunk = resolve_csa_union_u_chunk(b_q, m_union, int(getattr(self, "topk", 512)))
@@ -1088,7 +1109,7 @@ class VllmDeepseekV41MLAAttention(
                 if _main_c is not None and _main_c.shape[0] > 0:
                     _tot_rows = int(_main_c.shape[0] * _main_c.shape[1])
                     _tk = int(getattr(self, "topk", 512))
-                    for _bq in {6, 8, _CSA_UNION_BQ}:
+                    for _bq in {6, 8, 16, 32, _CSA_UNION_BQ}:
                         if _bq > 0:
                             for _mult in (2, 3):
                                 _mu = (
@@ -1096,7 +1117,10 @@ class VllmDeepseekV41MLAAttention(
                                     if envs.VLLM_DSV41_CSA_UNION_M > 0
                                     else ((_mult * _tk + 127) & ~127)
                                 )
-                                _ = self._get_csa_union_op(_tot_rows, _mu, b_q=_bq)
+                                _ = self._get_csa_union_op(_tot_rows, _mu, b_q=_bq, ced_decoder=False)
+                                _ = self._get_csa_union_op(_tot_rows, _mu, b_q=_bq, ced_decoder=True)
+                    _ = self._get_attn_op(True, ced_decoder=False)
+                    _ = self._get_attn_op(True, ced_decoder=True)
             tp_size = get_tensor_model_parallel_world_size()
             if (
                 _TP_ATTN
@@ -2333,7 +2357,8 @@ class VllmDeepseekV41MLAAttention(
                         )
                         or (0, 0)
                     )
-                    if main_cache_kv.shape[0] > 0
+                    if orig_main_cache_kv is not None
+                    and orig_main_cache_kv.shape[0] > 0
                     and topk_indices is not None
                     and topk_indices.shape[0] == local_tokens
                     and topk_indices.shape[1] % 128 == 0
@@ -2341,7 +2366,7 @@ class VllmDeepseekV41MLAAttention(
                 )
                 if b_q > 0 and m_union > 0:
                     total_cache_rows = int(
-                        main_cache_kv.shape[0] * main_cache_kv.shape[1]
+                        orig_main_cache_kv.shape[0] * orig_main_cache_kv.shape[1]
                     )
                     cached_u = self._get_or_compute_csa_union(
                         topk_indices,
@@ -2423,6 +2448,43 @@ class VllmDeepseekV41MLAAttention(
             tail_operands += (
                 dummy_main if main_cache_rope is None else main_cache_rope,
             )
+            if (
+                _CSA_UNION
+                and orig_main_cache_kv is not None
+                and orig_main_cache_kv.shape[0] > 0
+                and topk_indices is not None
+                and topk_indices.shape[0] == int(q.shape[0])
+                and topk_indices.shape[1] % 128 == 0
+            ):
+                local_q_tokens = int(q.shape[0])
+                max_num_seqs = (
+                    int(main_q_loc.shape[0]) - 1
+                    if main_q_loc is not None
+                    else local_q_tokens
+                )
+                b_q, m_union = (
+                    resolve_csa_union_params(
+                        local_q_tokens,
+                        int(topk_indices.shape[1]),
+                        max_num_seqs,
+                        ced_decoder=eff_ced_decoder,
+                        num_q_heads=int(q.shape[1]),
+                    )
+                    or (0, 0)
+                )
+                if b_q > 0 and m_union > 0:
+                    total_cache_rows = int(
+                        orig_main_cache_kv.shape[0] * orig_main_cache_kv.shape[1]
+                    )
+                    cached_u = self._get_or_compute_csa_union(
+                        topk_indices,
+                        total_cache_rows,
+                        m_union,
+                        b_q,
+                        ced_decoder=eff_ced_decoder,
+                    )
+                    tail_operands += tuple(cached_u)
+                    has_union = True
 
         attn_output, new_sw_cache = self._get_attn_op(
             has_union, ced_decoder=eff_ced_decoder
