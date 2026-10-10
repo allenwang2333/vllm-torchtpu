@@ -175,6 +175,10 @@ spec:
                       EXTRA_FLAGS="${EXTRA_FLAGS} --profiler-config.profiler=torch --profiler-config.torch_profiler_dir=${CDK_OUTPUT_DIR} --profiler-config.max_iterations=5 --profiler-config.ignore_frontend=true"
                     fi
 
+                    if [[ "${SERVER_ARGS}" == *"--prefill-context-parallel-size 2"* ]] && [[ "${SERVER_ARGS}" != *"--compilation-config"* ]]; then
+                      EXTRA_FLAGS="${EXTRA_FLAGS} --cp-kv-cache-interleave-size 256 --compilation-config '{\"compile_sizes\":[512,1024,2048,4096]}'"
+                    fi
+
                     CMD="vllm serve ${MODEL_PATH} --served-model-name ${MODEL_ID} --port ${SERVER_PORT} --default-chat-template-kwargs '{\"enable_thinking\":false}' ${SERVER_ARGS} ${EXTRA_FLAGS}"
                     echo "Launching: ${CMD}"
                     eval "${CMD}"
