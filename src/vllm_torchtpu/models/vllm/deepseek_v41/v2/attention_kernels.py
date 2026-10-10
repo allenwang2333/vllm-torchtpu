@@ -2392,7 +2392,6 @@ def paged_index_scores_jax(
     )
     tile = 1 << (budget.bit_length() - 1)
     padded_width = width + (-width % tile)
-    scores = jnp.full((tokens, padded_width), -jnp.inf, jnp.float32)
     q = split_halves(q)  # keys are read in the split element order
     weights = weights.astype(jnp.float32)[:, :, None]
 
@@ -2462,6 +2461,7 @@ def paged_index_scores_jax(
             )
             return jax.lax.fori_loop(0, trips, step, result)
 
+        scores = jnp.full((tokens, padded_width), -jnp.inf, jnp.float32)
         return jax.lax.fori_loop(0, records.shape[0], row_step, scores)[:, :width]
 
     trips = jnp.minimum(
@@ -2483,6 +2483,12 @@ def paged_index_scores_jax(
         def _run_word_loop(page_rec):
             page_rec = jnp.pad(page_rec, ((0, 0), (0, page_pad)), constant_values=-1)
             n_rows = page_rec.shape[0]
+            if padded_width == tile:
+                words = gather_cache_page_words(pool, page_rec, page, dim)
+                values = _score_word_rows(
+                    q, weights, words.reshape(n_rows, rows, ROW_WORDS)
+                )[:, :width]
+                return jnp.where(trips > 0, values, -jnp.inf)
 
             def word_step(index, result):
                 first_records = jax.lax.dynamic_slice_in_dim(
@@ -2496,6 +2502,7 @@ def paged_index_scores_jax(
                     result, values, index * tile, axis=1
                 )
 
+            scores = jnp.full((tokens, padded_width), -jnp.inf, jnp.float32)
             return jax.lax.fori_loop(0, trips, word_step, scores)[:, :width]
 
         if requests is not None and tokens >= 6 and tokens % 6 == 0:
@@ -2539,6 +2546,7 @@ def paged_index_scores_jax(
             result, head_sum(logits), index * tile, axis=1
         )
 
+    scores = jnp.full((tokens, padded_width), -jnp.inf, jnp.float32)
     return jax.lax.fori_loop(0, trips, step, scores)[:, :width]
 
 

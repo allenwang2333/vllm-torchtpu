@@ -1306,6 +1306,106 @@ class TestAttentionKvShard:
             np.testing.assert_array_equal(np.asarray(sel_pre), np.asarray(sel_ref))
             np.testing.assert_array_equal(np.asarray(pub_pre), np.asarray(pub_ref))
 
+    def test_td8238_paged_index_scores_single_vs_multi_tile_parity(self):
+        """TD8.238: Verify single-tile (padded_width == tile) fast path and
+        multi-tile (padded_width > tile) fallback in paged_index_scores_jax
+        _run_word_loop, including trips == 0 (-inf)."""
+        rng = np.random.default_rng(8238)
+        pool_j = jnp.asarray(
+            rng.integers(-(2**31), 2**31, (256, ROW_WORDS)), dtype=jnp.int32
+        ) & jnp.int32(0x3FFF3FFF)
+        page_rec = 16
+
+        # 1. Single-tile (width=128 <= tile=512 -> padded_width == tile)
+        logical_w = 128
+        records_np = np.zeros((2, logical_w), dtype=np.int32)
+        for r in range(2):
+            for p in range(0, logical_w, page_rec):
+                base = int(rng.integers(0, 120) * 2)
+                records_np[r, p : p + page_rec] = base + np.arange(page_rec)
+        records_full_j = jnp.asarray(records_np)
+        records_page_j = records_full_j[:, ::page_rec]
+
+        n_tok = 6
+        q_j = jnp.asarray(rng.standard_normal((n_tok, 64, 128)), jnp.bfloat16)
+        w_j = jnp.asarray(rng.standard_normal((n_tok, 64)), jnp.float32)
+        req_j = jnp.repeat(jnp.arange(1, dtype=jnp.int32), n_tok)
+
+        for max_len in (logical_w, 0):
+            len_j = jnp.full((n_tok,), max_len, dtype=jnp.int32)
+            scores_fast = attention_kernels.paged_index_scores_jax(
+                q_j,
+                pool_j,
+                records_page_j,
+                w_j,
+                len_j,
+                requests=req_j,
+                page_records=page_rec,
+                prestrided_pages=True,
+                logical_width=logical_w,
+            )
+            scores_ref = attention_kernels.paged_index_scores_jax(
+                q_j,
+                pool_j,
+                records_full_j,
+                w_j,
+                len_j,
+                requests=req_j,
+                page_records=None,
+            )
+            if max_len == 0:
+                assert bool(jnp.all(scores_fast == -jnp.inf))
+                np.testing.assert_array_equal(
+                    np.asarray(scores_fast), np.asarray(scores_ref)
+                )
+            else:
+                np.testing.assert_allclose(
+                    np.asarray(scores_fast),
+                    np.asarray(scores_ref),
+                    rtol=1e-5,
+                    atol=1e-4,
+                )
+
+        # 2. Multi-tile (n_tok=64 -> tile=512, width=1024 -> padded_width=1024 > tile)
+        logical_w_multi = 1024
+        records_multi_np = np.zeros((2, logical_w_multi), dtype=np.int32)
+        for r in range(2):
+            for p in range(0, logical_w_multi, page_rec):
+                base = int(rng.integers(0, 120) * 2)
+                records_multi_np[r, p : p + page_rec] = base + np.arange(page_rec)
+        records_multi_full_j = jnp.asarray(records_multi_np)
+        records_multi_page_j = records_multi_full_j[:, ::page_rec]
+        q_multi_j = jnp.asarray(rng.standard_normal((64, 64, 128)), jnp.bfloat16)
+        w_multi_j = jnp.asarray(rng.standard_normal((64, 64)), jnp.float32)
+        len_multi_j = jnp.full((64,), logical_w_multi, dtype=jnp.int32)
+        req_multi_j = jnp.arange(64, dtype=jnp.int32) % 2
+        scores_multi = attention_kernels.paged_index_scores_jax(
+            q_multi_j,
+            pool_j,
+            records_multi_page_j,
+            w_multi_j,
+            len_multi_j,
+            requests=req_multi_j,
+            page_records=page_rec,
+            prestrided_pages=True,
+            logical_width=logical_w_multi,
+        )
+        scores_multi_ref = attention_kernels.paged_index_scores_jax(
+            q_multi_j,
+            pool_j,
+            records_multi_full_j,
+            w_multi_j,
+            len_multi_j,
+            requests=req_multi_j,
+            page_records=None,
+        )
+        np.testing.assert_allclose(
+            np.asarray(scores_multi),
+            np.asarray(scores_multi_ref),
+            rtol=1e-5,
+            atol=1e-4,
+        )
+
 
 # ==============================================================================
 # 4. v2/attention_kernels.py: Token-Parallel Thresholds & Padding under KV Shard
