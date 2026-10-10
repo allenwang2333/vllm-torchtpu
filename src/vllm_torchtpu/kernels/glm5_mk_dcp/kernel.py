@@ -335,6 +335,10 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     NPR = pg // 128                                      # key rows per page
     KT = cfg.KT
     KR_ = KT // 128                                      # candidate rows
+    # own_u entries: gather source (page << 8 | slot, or staging row << 2 | seg) | row bitmask << MB_SH
+    MB_SH = 27
+    SRC_MASK = (1 << MB_SH) - 1
+    assert nb < (1 << (MB_SH - 8)) and cfg.QMAX <= 4, (nb, cfg.QMAX)
     KCH = tiles.kch if 0 < tiles.kch < cfg.TMAX else cfg.TMAX    # candidate-key AG chunk (rows)
     assert cfg.TMAX % KCH == 0, (cfg.TMAX, KCH)
     NKS = 1 if KCH == cfg.TMAX else 2                    # kall slots (double-buffered when chunked)
@@ -447,7 +451,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         "nown_s": pltpu.SMEM((TMAX,), I32),
         # per-request union of the rows' owned winners (+ per-row membership over it)
         "own_u": pltpu.SMEM((UR_, 128), I32), "own_uv": pltpu.VMEM((UR_, 128), I32),
-        "memb": pltpu.SMEM((UR_, 128), I32), "memb_v": pltpu.VMEM((UR_, 128), I32),
+        
         "nu_s": pltpu.SMEM((BMAX,), I32), "uo_s": pltpu.SMEM((BMAX,), I32), "nuo_s": pltpu.SMEM((BMAX,), I32),
         "misc_sem": pltpu.SemaphoreType.DMA(()),
         # attention
@@ -1262,8 +1266,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 return lax.cond(qmeta[b, 3] > 0, lambda: build_union(b, off), lambda: off)
             lax.fori_loop(0, B, per_req_u, jnp.int32(0))
             pi.mark("I_udma")
-            cpu = [pltpu.make_async_copy(scr["own_u"], scr["own_uv"], scr["misc_sem"]),
-                   pltpu.make_async_copy(scr["memb"], scr["memb_v"], scr["misc_sem"])]
+            cpu = [pltpu.make_async_copy(scr["own_u"], scr["own_uv"], scr["misc_sem"])]
             for c_ in cpu:
                 c_.start()
             for c_ in cpu:
@@ -1415,8 +1418,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 src = jnp.where(old_, (bt[b, jnp.where(old_, m, 0) >> lg_pg] << 8) | (m & (pg - 1)),
                                 (t2 << 2) | (m & 3))
                 p = off * 128 + k
-                scr["own_u"][p >> 7, p & 127] = src
-                scr["memb"][p >> 7, p & 127] = bits
+                scr["own_u"][p >> 7, p & 127] = src | shl(bits, MB_SH)       # row bits packed high
                 took = bits & 1
                 for qq in range(1, QM):
                     took = took + ((bits >> qq) & 1)
@@ -1467,7 +1469,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             def go(rn, rr):
                 def obody(k, c2):
                     p = base + k
-                    v = scr["own_u"][p >> 7, p & 127]
+                    v = scr["own_u"][p >> 7, p & 127] & SRC_MASK
                     page, sl = v >> 8, v & 255
                     pltpu.make_async_copy(rn.at[page, pl.ds(sl, 1)], scr["g_nope"].at[buf, pl.ds(k, 1)],
                                           scr["g_sem"].at[buf, 0]).start()
@@ -1478,7 +1480,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
                 def nbody(k, c2):
                     p = base + k
-                    t2 = scr["own_u"][p >> 7, p & 127] >> 2
+                    t2 = (scr["own_u"][p >> 7, p & 127] & SRC_MASK) >> 2
                     pltpu.make_async_copy(scr["wrow"].at[pl.ds(t2, 1)], scr["g_nope"].at[buf, pl.ds(k, 1)],
                                           scr["g_sem"].at[buf, 0]).start()
                     pltpu.make_async_copy(scr["rwrow"].at[pl.ds(t2, 1)], scr["g_rope"].at[buf, pl.ds(k, 1)],
@@ -1571,7 +1573,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                               + lax.dot_general(scr["q1b"][sg], B1, NT, preferred_element_type=F32))
                         s = s + jnp.where(seg == sg, ss, 0.0)
                     s = s * sm_scale
-                    bits = scr["memb_v"][pl.ds(urow + ci, 1), :]             # [1, 128] row bits
+                    bits = shr(iv, MB_SH) & 15                                # [1, 128] row bits
                     kk = base + ci * 128 + lax.broadcasted_iota(I32, (1, 128), 1)
                     mask = jnp.logical_and(((bits >> row_q) & 1) == 1, kk < nu)   # [QN, 128]
                     s = jnp.where(mask, s, NEG)
@@ -1920,8 +1922,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 t2 = jnp.clip(t0r + (g - p0r), 0, TMAX - 1)
                 srcv = jnp.where(old_, shl(page, 8) | (lo & (pg - 1)), shl(t2, 2) | (lo & 3))
                 r0 = pl.multiple_of(i * KR_, 8)
-                scr["own_uv"][pl.ds(r0, KR_), :] = jnp.where(valid, srcv, 0)
-                scr["memb_v"][pl.ds(r0, KR_), :] = jnp.where(valid, 1, 0)
+                scr["own_uv"][pl.ds(r0, KR_), :] = jnp.where(valid, srcv | (1 << MB_SH), 0)
                 scr["nu_s"][i] = n
                 scr["uo_s"][i] = i * KR_
                 scr["nuo_s"][i] = jnp.sum(old_.astype(I32))
@@ -2054,7 +2055,6 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         scr["osend"][...] = jnp.zeros(scr["osend"].shape, U32)
         scr["own_v"][...] = jnp.full(scr["own_v"].shape, -1, I32)
         scr["own_uv"][...] = jnp.full(scr["own_uv"].shape, -1, I32)
-        scr["memb_v"][...] = jnp.zeros(scr["memb_v"].shape, I32)
 
         def zn(t_, c):
             scr["nown_s"][t_] = jnp.int32(0)
