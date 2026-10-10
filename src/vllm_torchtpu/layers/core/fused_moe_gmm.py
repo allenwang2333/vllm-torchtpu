@@ -371,6 +371,65 @@ def prepare_routed_gmm_inputs(
     m = sort_keys.shape[0]
     token_bits = max(1, (num_tokens_local - 1).bit_length())
 
+    if (
+        not use_ep
+        and m <= max(onehot_moe_permute_threshold, 768)
+        and hidden_states_local.dtype == jnp.bfloat16
+        and not skip_padded_tokens
+    ):
+        # Single uint32 packed radix sort + MXU one-hot permute avoids the
+        # second inverse sort and dynamic 2D gathers while preserving exact
+        # route-order BF16 combine bit-for-bit.
+        idx_bits = max(1, (m - 1).bit_length())
+        idx_mask = (1 << idx_bits) - 1
+        iota = jnp.arange(m, dtype=jnp.int32)
+        packed = jax.lax.sort(
+            jnp.left_shift(topk_indices_flat.astype(jnp.uint32), idx_bits)
+            | iota.astype(jnp.uint32),
+            is_stable=False,
+        )
+        sorted_indices = jnp.bitwise_and(packed, idx_mask).astype(jnp.int32)
+        token_indices_sorted = sorted_indices // topk
+        group_sizes_local = (
+            jax.nn.one_hot(topk_indices_flat, local_num_experts, dtype=jnp.float32)
+            .sum(axis=0)
+            .astype(jnp.int32)
+        )
+        onehot = jax.nn.one_hot(
+            token_indices_sorted, num_tokens_local, dtype=hidden_states_local.dtype
+        )
+        x = onehot @ hidden_states_local
+        if return_onehot_combine:
+            return (
+                x,
+                group_sizes_local,
+                sorted_indices,
+                topk_weights_flat,
+                valid_mask,
+                token_indices_sorted,
+                sorted_indices,
+                None,
+                None,
+            )
+        if return_sorted_indices:
+            return (
+                x,
+                group_sizes_local,
+                sorted_indices,
+                topk_weights_flat,
+                valid_mask,
+                token_indices_sorted,
+                sorted_indices,
+            )
+        return (
+            x,
+            group_sizes_local,
+            sorted_indices,
+            topk_weights_flat,
+            valid_mask,
+            token_indices_sorted,
+        )
+
     fast_onehot = (
         return_onehot_combine
         and use_ep
@@ -761,7 +820,17 @@ def moe_gmm(
 
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
-    token_hidden = gmm2_res[argsort_revert_indices]
+    if (
+        sorted_indices is not None
+        and argsort_revert_indices is sorted_indices
+        and sorted_indices.size <= max(onehot_moe_permute_threshold, 768)
+    ):
+        inv_onehot = jax.nn.one_hot(
+            sorted_indices, sorted_indices.size, dtype=gmm2_res.dtype
+        )
+        token_hidden = inv_onehot.T @ gmm2_res
+    else:
+        token_hidden = gmm2_res[argsort_revert_indices]
     token_topk_hidden = token_hidden.reshape((num_tokens, topk, gmm2_res.shape[-1]))
     token_topk_hidden = token_topk_hidden * jnp.expand_dims(topk_weights, axis=-1)
     token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
@@ -846,8 +915,21 @@ def fused_moe_func(
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
+    # Under EP with narrow intermediate size (I <= 512, e.g. DSV4.1), auto-enable
+    # up to 96 tokens when TPU_MOE_DENSE_EXPERT_THRESHOLD is unset (0) to skip
+    # empty expert groups via scalar SMEM compaction with zero HBM permute/combine.
+    effective_dense_threshold = (
+        96
+        if (
+            _DENSE_EXPERT_THRESHOLD == 0
+            and use_ep
+            and num_tokens >= 16
+            and w2.shape[1] * packing_factor <= 512
+        )
+        else _DENSE_EXPERT_THRESHOLD
+    )
     use_dense_expert = (
-        0 < num_tokens <= _DENSE_EXPERT_THRESHOLD
+        0 < num_tokens <= effective_dense_threshold
         and can_use_dense_expert(
             hidden_states,
             w1,
@@ -877,13 +959,21 @@ def fused_moe_func(
     if use_dense_expert:
         logger.info_once("Selected experimental dense-expert decode MoE")
         return dense_expert_moe(
-            hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
         )
 
     effective_onehot_threshold = (
         _FAST_ONEHOT_AUTO_THRESHOLD
         if (
-            onehot_moe_permute_threshold >= _ONEHOT_AUTO_CAP - 1
+            onehot_moe_permute_threshold >= 511
             and (
                 envs.ONEHOT_MOE_PERMUTE_THRESHOLD is None
                 or envs.ONEHOT_MOE_PERMUTE_THRESHOLD < 0

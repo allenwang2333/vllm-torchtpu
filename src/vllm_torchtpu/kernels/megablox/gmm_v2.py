@@ -381,10 +381,19 @@ def generate_block_specs(
     rhs_cols = (
         2 * cfgs.tiles.tile_n if cfgs.contiguous_fuse_act else cfgs.tiles.tile_n
     )
+    rhs_bits = jax.dtypes.itemsize_bits(
+        cfgs.rhs_cfgs.quant_dtype or cfgs.rhs_cfgs.dtype
+    )
+    rhs_3buf_bytes = 3 * cfgs.tiles.tile_k * rhs_cols * rhs_bits // 8
+    rhs_buf_count = (
+        2
+        if rhs_3buf_bytes > int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.85)
+        else 3
+    )
     rhs_weight_spec = pl.BlockSpec(
         (None, cfgs.tiles.tile_k, rhs_cols),
         index_map.rhs_weight_index_map,
-        pipeline_mode=pl.Buffered(buffer_count=3),
+        pipeline_mode=pl.Buffered(buffer_count=rhs_buf_count),
     )
     rhs_scale_block_spec = rhs_bias_block_spec = None
     if cfgs.rhs_cfgs.has_bias:
@@ -1104,8 +1113,14 @@ def calculate_tiling(
         rhs_bias_vmem = 0
         if rhs_cfgs.has_bias:
             rhs_bias_vmem = tn * 4
+        rhs_buf_count = (
+            2
+            if fuse_act_factor * 3 * rhs_weight_vmem
+            > int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.85)
+            else 3
+        )
         rhs_vmem = fuse_act_factor * (
-            3 * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem
+            rhs_buf_count * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem
         )
 
         # 3. Accumulator
@@ -1119,12 +1134,14 @@ def calculate_tiling(
 
         return lhs_vmem + rhs_vmem + acc_vmem + out_vmem
 
-    # Multiple k tiles will introduce accumulation overhead. Thus, we first try
-    # to fit the tensors into vmem by only adjusting tile_n.
+    eff_vmem_limit = max(
+        vmem_limit_bytes,
+        int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.95),
+    )
 
     # Decrease tile_n until total memory fits in vmem limit.
     while (
-        _gmm_vmem_estimate(tile_m, tile_n, tile_k) > vmem_limit_bytes
+        _gmm_vmem_estimate(tile_m, tile_n, tile_k) > eff_vmem_limit
         and tile_n > tile_n_limit
     ):
         num_n_tiles += 1
@@ -1137,7 +1154,7 @@ def calculate_tiling(
 
         # Decrease tile_k until total memory fits in vmem limit and tile_k is valid.
         while (
-            _gmm_vmem_estimate(tile_m, tile_n, tile_k) > vmem_limit_bytes
+            _gmm_vmem_estimate(tile_m, tile_n, tile_k) > eff_vmem_limit
             or not _is_tile_k_quant_block_compatible(tile_k)
         ) and tile_k > num_lanes:
             num_k_tiles += 1
@@ -1462,7 +1479,7 @@ def gmm_v2(
             group_offset = group_offset[None]
 
     if vmem_limit_bytes is None:
-        vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+        vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.95)
 
     cfgs = make_gmm_configs(
         # Pre-quantized lhs: configure for the unquantized lhs it replaces.

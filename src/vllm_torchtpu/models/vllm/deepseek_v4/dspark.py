@@ -73,19 +73,39 @@ def _rewrite_dspark_name(name: str, mapper: WeightsMapper) -> str | None:
     return mapped.removeprefix("model.")
 
 
+_DSPARK_INSERT_KV_OP_CACHE: dict[int, object] = {}
+
+
+def _get_dspark_swa_store_op(logical_page_size: int):
+    op = _DSPARK_INSERT_KV_OP_CACHE.get(logical_page_size)
+    if op is None:
+        import functools
+
+        from torch_tpu import pallas
+        from vllm_torchtpu.kernels.deepseek_v41.tp_attention import (
+            swa_store_all_pallas,
+        )
+        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+            get_vllm_model_wrapper_context,
+        )
+
+        op = pallas.jax_op(
+            f"pallas::dspark_swa_store_ps{logical_page_size}",
+            functools.partial(
+                swa_store_all_pallas, logical_page_size=logical_page_size
+            ),
+            mesh=get_vllm_model_wrapper_context().mesh,
+            donate_argnums=(0,),
+        )
+        op.register_fake(lambda sw_cache, *_: torch.empty_like(sw_cache))
+        _DSPARK_INSERT_KV_OP_CACHE[logical_page_size] = op
+    return op
+
+
 def _insert_context_kv(
     attn, kv: torch.Tensor, positions: torch.Tensor, metadata
 ) -> None:
-    """Insert the context KV of verified tokens into one draft layer's cache.
-
-    ``attn`` is one draft layer's attention module, ``kv`` that layer's
-    already-normalised latent K/V for the verified tokens, ``positions``
-    their absolute positions, and ``metadata`` this layer's sliding-window
-    attention metadata, built by the proposer from the target's verify batch.
-    The DSV4 Pallas attention op is the only KV-write path on this backend,
-    so the insert runs the op with a zero query and discards the attention
-    output.
-    """
+    """Insert the context KV of verified tokens into one draft layer's cache."""
     orig_sw_cache = attn._get_active_sw_cache()
     if orig_sw_cache is None:
         return
@@ -96,13 +116,26 @@ def _insert_context_kv(
     )
 
     kv = attn.kv_rope(kv, positions)
+    if orig_sw_cache.device.type == "tpu":
+        store_op = _get_dspark_swa_store_op(int(attn.swa_cache_layer.block_size))
+        new_sw_cache = store_op(
+            orig_sw_cache,
+            kv,
+            metadata.seq_lens,
+            metadata.block_tables,
+            metadata.query_start_loc,
+            metadata.request_distribution,
+        )
+        if new_sw_cache is not None and new_sw_cache.numel() > 0:
+            orig_sw_cache.copy_(new_sw_cache)
+        return
+
     num_tokens = kv.shape[0]
     dummy_q = torch.zeros(
         (num_tokens, attn.mla_attn.n_local_heads, attn.mla_attn.head_dim),
         dtype=kv.dtype,
         device=kv.device,
     )
-    # only writes the SWA cache, and the clones keep the traced signature.
     operands = (
         dummy_q,
         kv,
@@ -119,10 +152,6 @@ def _insert_context_kv(
         metadata.request_distribution.clone(),
         attn.attn_sink,
     )
-    # TODO: this runs the full attention op to write the K/V rows into
-    # the SWA cache and throws the attention output away. Replace with
-    # a dedicated paged-cache insert kernel (like RPA's
-    # ragged_kv_cache_update) once one exists for the DSV4 SWA layout.
     _, new_sw_cache = attn.attn_op(*operands)
     if new_sw_cache is not None and new_sw_cache.numel() > 0:
         orig_sw_cache.copy_(new_sw_cache)

@@ -21,8 +21,6 @@ Gumbel-coupled sampling is not implemented.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import torch
 from vllm.config import VllmConfig
 
@@ -51,11 +49,11 @@ class DSparkProposer(DFlashProposer):
         self.sample_from_anchor = bool(hf_dict.get("sample_from_anchor", True))
         block = hf_dict.get("dspark_block_size") or hf_dict.get("block_size")
         K = self.speculative_config.num_speculative_tokens
-        if block is not None and int(block) < K:
+        if block is not None and int(block) != K:
             raise ValueError(
-                f"num_speculative_tokens={K} exceeds the DSpark "
+                f"num_speculative_tokens={K} does not match the DSpark "
                 f"checkpoint's block size {block}; the block/Markov-head "
-                "machinery supports at most that block length."
+                "machinery is trained for exactly that block length."
             )
         # vLLM 0.29 drafting options this proposer does not implement yet.
         spec = self.speculative_config
@@ -71,10 +69,6 @@ class DSparkProposer(DFlashProposer):
                 f"{spec.dspark_draft_topk}; only greedy drafting of a fixed "
                 "block is implemented."
             )
-        # DeepSeek-V4.1 captures each target layer's entry stream, so its
-        # target layer ids are used unshifted.
-        if getattr(hf_config, "model_type", None) == "deepseek_v41":
-            self._aux_layer_shift = 0
         logger.info("DSpark: sample_from_anchor=%s, K=%d.", self.sample_from_anchor, K)
 
     # A reduced-vocab DSpark checkpoint carries its own lm_head
@@ -89,54 +83,6 @@ class DSparkProposer(DFlashProposer):
         # predicts the next token. Speculators-format checkpoints keep the
         # DFlash 1 + K layout.
         return K if self.sample_from_anchor else K + 1
-
-    def _get_draft_token_paddings(self) -> list[int]:
-        # Request-aligned buckets pad less than the generic token buckets.
-        max_chunk_reqs = max(
-            self.runner.num_reqs_max_model_len, self.runner.num_reqs_most_model_len or 0
-        )
-        if self.block_size in (4, 5):
-            b = self.block_size
-            if max_chunk_reqs == 64:
-                return [16, 16 * b, 32 * b, 48 * b, 64 * b]
-            if max_chunk_reqs > 64:
-                max_draft_tokens = max_chunk_reqs * b
-                base = [
-                    16,
-                    8 * b,
-                    16 * b,
-                    32 * b,
-                    48 * b,
-                    64 * b,
-                    80 * b,
-                    128 * b,
-                    256 * b,
-                    512 * b,
-                ]
-                buckets = [p for p in base if p <= max_draft_tokens]
-                if buckets and buckets[-1] < max_draft_tokens:
-                    buckets.append((max_draft_tokens + 7) & ~7)
-                if buckets:
-                    return buckets
-        return super()._get_draft_token_paddings()
-
-    def _draft_kv_num_blocks(self, use_max_model_len: bool) -> int:
-        # The draft's KV group (e.g. DeepSeek-V4.1's sliding-window cache) can
-        # be narrower than group 0, so size the dummies from its own builder.
-        runner = self.runner
-        get_names = getattr(self.draft_model, "get_draft_kv_cache_layer_names", None)
-        if get_names is not None:
-            first_layer = get_names()[0]
-            for group_list in runner.attn_groups:
-                for group in group_list:
-                    if first_layer in group.layer_names:
-                        ctx = SimpleNamespace(
-                            use_max_model_len=use_max_model_len,
-                            mamba_ckpt_window=runner._mamba_ckpt_window,
-                        )
-                        builder = group.metadata_builders[0]
-                        return builder._block_table_geometry(ctx)[1]
-        return super()._draft_kv_num_blocks(use_max_model_len)
 
     def load_model(self, target_model) -> None:
         super().load_model(target_model)
@@ -177,22 +123,31 @@ class DSparkProposer(DFlashProposer):
 
         padded_num_reqs = hidden.shape[0] // block_size
         valid_hidden = hidden[: padded_num_reqs * block_size]
-
-        # Draft-vocab logits for every slot; the Markov bias is added in
-        # draft space and ids are remapped to target vocab after argmax.
-        logits = self.draft_model.compute_draft_logits(valid_hidden)
-        logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
+        sample_start = 0 if self.sample_from_anchor else 1
+        num_pred = block_size - sample_start
+        if sample_start > 0:
+            pred_hidden = valid_hidden.view(
+                padded_num_reqs, block_size, hidden.shape[-1]
+            )[:, sample_start:].reshape(-1, hidden.shape[-1])
+        else:
+            pred_hidden = valid_hidden
 
         ids_3d = input_ids[: padded_num_reqs * block_size].view(
             padded_num_reqs, block_size
         )
         prev = ids_3d[:, 0]
+        # Hoist initial step-0 Markov embedding + projection so XLA overlaps it
+        # with compute_draft_logits(pred_hidden).
+        bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
+        logits = self.draft_model.compute_draft_logits(pred_hidden)
+        logits_3d = logits.view(padded_num_reqs, num_pred, logits.shape[-1])
+
         draft_tokens = []
-        sample_start = 0 if self.sample_from_anchor else 1
-        for i in range(sample_start, block_size):
-            bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
+        for idx in range(num_pred):
+            if idx > 0:
+                bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
             step = self.draft_model.map_draft_to_target(
-                (logits_3d[:, i] + bias).argmax(dim=-1)
+                (logits_3d[:, idx] + bias).argmax(dim=-1)
             )
             draft_tokens.append(step)
             prev = step

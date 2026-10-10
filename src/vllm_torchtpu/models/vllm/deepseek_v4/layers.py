@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -36,8 +39,12 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     WEIGHT_FLIPPED_ATTR,
     _get_quantized_matmul_op,
     _get_quantized_matmul_prequant_op,
+    _get_quantized_mlp_op,
+    _get_quantized_mlp_prequant_op,
     quantized_matmul,
     quantized_matmul_prequant,
+    quantized_mlp,
+    quantized_mlp_prequant,
 )
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -54,10 +61,10 @@ def mhc_collapse_head(
 ) -> torch.Tensor:
     """Collapse multi-stream residual manifold into a single vector before LM head."""
     residual_flat = hidden_states.flatten(-2).float()
-    residual_norm = residual_flat * torch.rsqrt(
+    rstd = torch.rsqrt(
         residual_flat.square().mean(dim=-1, keepdim=True) + rms_norm_eps
     )
-    pre_mix = torch.nn.functional.linear(residual_norm, hc_fn)
+    pre_mix = torch.nn.functional.linear(residual_flat, hc_fn) * rstd
     pre_mix = torch.sigmoid(pre_mix * hc_scale + hc_base) + hc_eps
     return torch.sum(pre_mix.unsqueeze(-1) * hidden_states.float(), dim=-2).to(
         hidden_states.dtype
@@ -80,6 +87,7 @@ class DeepseekV4MLP(nn.Module):
     ) -> None:
         super().__init__()
         self._prequant: list[torch.Tensor | None] = [None, None]
+        self.swiglu_limit = swiglu_limit
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -198,6 +206,8 @@ class DeepseekV4MLP(nn.Module):
             synchronize_tensors(list(buffers.values()), wait=True)
             _ = _get_quantized_matmul_op()
             _ = _get_quantized_matmul_prequant_op()
+            _ = _get_quantized_mlp_op(self.swiglu_limit)
+            _ = _get_quantized_mlp_prequant_op(self.swiglu_limit)
         for name, tensor in buffers.items():
             self.register_buffer(name, tensor, persistent=False)
 
@@ -223,9 +233,9 @@ class DeepseekV4MLP(nn.Module):
                 torch.ops.aten.alias.default(t)
                 for t in (
                     self.gate_up_proj.weight,
-                    self.gate_up_proj._parameters.get("weight_scale"),
+                    getattr(self.gate_up_proj, "weight_scale", None),
                     self.down_proj.weight,
-                    self.down_proj._parameters.get("weight_scale"),
+                    getattr(self.down_proj, "weight_scale", None),
                     self._tp_gate_up_w,
                     self._tp_gate_up_s,
                     self._tp_down_w,
@@ -237,11 +247,11 @@ class DeepseekV4MLP(nn.Module):
     def can_accept_prequant_hidden(self, *, token_sharded: bool = False) -> bool:
         if not envs.VLLM_DSV41_FUSED_SEAM_QUANT:
             return False
-        w_s = self.gate_up_proj._parameters.get("weight_scale")
+        w_s = getattr(self.gate_up_proj, "weight_scale", None)
         ok = (
             w_s is not None
             and w_s.ndim == 1
-            and self.gate_up_proj._parameters.get("bias") is None
+            and getattr(self.gate_up_proj, "bias", None) is None
         )
         return ok and (not token_sharded or self.has_tp_local_weights())
 
@@ -271,6 +281,16 @@ class DeepseekV4MLP(nn.Module):
             )
         return self.gate_up_proj(x)[0]
 
+    def _can_fuse_quantized_mlp(self) -> bool:
+        gu_s = getattr(self.gate_up_proj, "weight_scale", None)
+        dn_s = getattr(self.down_proj, "weight_scale", None)
+        return (
+            gu_s is not None
+            and dn_s is not None
+            and getattr(self.gate_up_proj, "bias", None) is None
+            and getattr(self.down_proj, "bias", None) is None
+        )
+
     def forward_tp_local(
         self,
         x: torch.Tensor,
@@ -279,20 +299,23 @@ class DeepseekV4MLP(nn.Module):
     ) -> torch.Tensor:
         self._lift_tp_shape_variant_tensors()
         if hidden_states_fp8 is not None and hidden_states_scale is not None:
-            gate_up = quantized_matmul_prequant(
+            return quantized_mlp_prequant(
                 hidden_states_fp8,
                 hidden_states_scale,
                 self._tp_gate_up_w,
                 self._tp_gate_up_s,
+                self._tp_down_w,
+                self._tp_down_s,
+                swiglu_limit=self.swiglu_limit,
             )
-        else:
-            gate_up = quantized_matmul(
-                x,
-                self._tp_gate_up_w,
-                self._tp_gate_up_s,
-            )
-        act = self.act_fn(gate_up)
-        return quantized_matmul(act, self._tp_down_w, self._tp_down_s)
+        return quantized_mlp(
+            x,
+            self._tp_gate_up_w,
+            self._tp_gate_up_s,
+            self._tp_down_w,
+            self._tp_down_s,
+            swiglu_limit=self.swiglu_limit,
+        )
 
     def forward(
         self,
@@ -323,6 +346,43 @@ class DeepseekV4MLP(nn.Module):
             x = tp_all_gather(x, dim=0)
             hidden_states_fp8 = None
             hidden_states_scale = None
+        if self._can_fuse_quantized_mlp():
+            gu_w = self.gate_up_proj.weight
+            if getattr(self.gate_up_proj, KEEP_VLLM_LAYOUT_ATTR, False):
+                gu_w = gu_w.transpose(0, 1)
+            dn_w = self.down_proj.weight
+            if getattr(self.down_proj, KEEP_VLLM_LAYOUT_ATTR, False):
+                dn_w = dn_w.transpose(0, 1)
+            if hidden_states_fp8 is not None and hidden_states_scale is not None:
+                x = quantized_mlp_prequant(
+                    hidden_states_fp8,
+                    hidden_states_scale,
+                    gu_w,
+                    self.gate_up_proj.weight_scale,
+                    dn_w,
+                    self.down_proj.weight_scale,
+                    swiglu_limit=self.swiglu_limit,
+                )
+            else:
+                x = quantized_mlp(
+                    x,
+                    gu_w,
+                    self.gate_up_proj.weight_scale,
+                    dn_w,
+                    self.down_proj.weight_scale,
+                    swiglu_limit=self.swiglu_limit,
+                )
+            if (
+                getattr(self.down_proj, "reduce_results", False)
+                and not getattr(self.down_proj, "disable_tp", False)
+                and get_tensor_model_parallel_world_size() > 1
+            ):
+                x = tensor_model_parallel_all_reduce(x)
+            if return_token_sharded:
+                if getattr(self.down_proj, "reduce_results", False):
+                    return tp_shard_slice(x, dim=0)
+                return tp_reduce_scatter(x, dim=0)
+            return x
         gate_up = self._apply_gate_up_proj(
             x, hidden_states_fp8, hidden_states_scale
         )
