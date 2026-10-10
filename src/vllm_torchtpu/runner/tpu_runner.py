@@ -2630,16 +2630,19 @@ class TPUModelRunner(GPUModelRunner):
         request at the replay start, so a resumed request (sent without the
         field under the V1 runner) starts at its computed-token count.
         """
-        if not self._prefix_replay_tokens():
+        new_reqs = getattr(scheduler_output, "scheduled_new_reqs", None) or ()
+        cached = scheduler_output.scheduled_cached_reqs
+        resumed_req_ids = cached.resumed_req_ids
+        if (not new_reqs and not resumed_req_ids) or not self._prefix_replay_tokens():
             return
-        for new_req in scheduler_output.scheduled_new_reqs:
+        for new_req in new_reqs:
             if new_req.replay_start:
                 assert new_req.replay_start == new_req.num_computed_tokens
                 self._replay_starts[new_req.req_id] = new_req.replay_start
-        cached = scheduler_output.scheduled_cached_reqs
-        for req_id, num_computed in zip(cached.req_ids, cached.num_computed_tokens):
-            if req_id in cached.resumed_req_ids and num_computed:
-                self._replay_starts[req_id] = num_computed
+        if resumed_req_ids:
+            for req_id, num_computed in zip(cached.req_ids, cached.num_computed_tokens):
+                if req_id in resumed_req_ids and num_computed:
+                    self._replay_starts[req_id] = num_computed
 
     def _prepare_lookback_token_ids(self, num_reqs: int) -> torch.Tensor:
         """Upstream's lookback gather, widened on a replayed admission step.
@@ -2657,10 +2660,11 @@ class TPUModelRunner(GPUModelRunner):
             starts = self.input_batch.num_computed_tokens_cpu[:num_reqs, None]
             pos = starts - np.arange(1, depth + 1)
             limit = self.input_batch.num_prompt_tokens[:num_reqs, None].copy()
-            replay_starts = getattr(self, "_replay_starts", {})
-            for row, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-                if replay_starts.get(req_id) == starts[row, 0]:
-                    limit[row, 0] = self.input_batch.num_tokens_no_spec[row]
+            replay_starts = getattr(self, "_replay_starts", None)
+            if replay_starts:
+                for row, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                    if replay_starts.get(req_id) == starts[row, 0]:
+                        limit[row, 0] = self.input_batch.num_tokens_no_spec[row]
             valid = (pos >= 0) & (pos < limit)
             rows = np.arange(num_reqs)[:, None]
             ids = self.input_batch.token_ids_cpu[rows, np.clip(pos, 0, None)]
@@ -2678,10 +2682,11 @@ class TPUModelRunner(GPUModelRunner):
             invalidated_req_ids = (
                 finished_req_ids | (preempted_req_ids or set()) | resumed_req_ids
             )
-            replay_starts = getattr(self, "_replay_starts", {})
+            replay_starts = getattr(self, "_replay_starts", None)
             for req_id in invalidated_req_ids:
                 self._mamba_state_pos.pop(req_id, None)
-                replay_starts.pop(req_id, None)
+                if replay_starts:
+                    replay_starts.pop(req_id, None)
             self._mamba_offset_seeded.difference_update(invalidated_req_ids)
             if self._pre_async_results is not None:
                 # These results belong to freed KV state, including a finished ID
@@ -3658,14 +3663,31 @@ class TPUModelRunner(GPUModelRunner):
                 self._cached_prompt_lens_cpu = prompt_lens_cpu
             replay_starts = getattr(self, "_replay_starts", None)
             if replay_starts:
-                replay_starts_cpu = tuple(
-                    replay_starts.get(req_id, 0)
-                    for req_id in self.input_batch.req_ids[
-                        start_index : start_index + num_reqs
-                    ]
-                ) + (0,) * (target_num_reqs - num_reqs)
+                replay_key = (
+                    start_index,
+                    num_reqs,
+                    target_num_reqs,
+                    tuple(
+                        self.input_batch.req_ids[start_index : start_index + num_reqs]
+                    ),
+                    tuple(replay_starts.items()),
+                )
+                if getattr(self, "_cached_replay_starts_key", None) == replay_key:
+                    replay_starts_cpu = self._cached_replay_starts_cpu
+                else:
+                    replay_starts_cpu = tuple(
+                        replay_starts.get(req_id, 0) for req_id in replay_key[3]
+                    ) + (0,) * (target_num_reqs - num_reqs)
+                    self._cached_replay_starts_key = replay_key
+                    self._cached_replay_starts_cpu = replay_starts_cpu
+            elif (
+                getattr(self, "_cached_zero_replay_starts_len", None) == target_num_reqs
+            ):
+                replay_starts_cpu = self._cached_zero_replay_starts_cpu
             else:
                 replay_starts_cpu = (0,) * target_num_reqs
+                self._cached_zero_replay_starts_len = target_num_reqs
+                self._cached_zero_replay_starts_cpu = replay_starts_cpu
         else:
             query_start_loc_cpu = None
             seq_lens_cpu = None

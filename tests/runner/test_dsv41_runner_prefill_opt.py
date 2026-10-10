@@ -658,3 +658,228 @@ def test_sample_tokens_logprobs_and_chunks():
     # 3. Discard all (covers 4478 false branch when request_seq_lens empty)
     out3 = _run_sample(num_chunks=1, needs_logprobs=True, discard_all=True)
     assert out3.copy_state is None
+
+
+def test_replay_starts_and_owner_token_layout_step_caches(monkeypatch):
+    """Verify _record_replay_starts, _prepare_lookback_token_ids, _prepare_inputs
+    replay_starts_cpu caching, and step_owner_required_tokens /
+    attach_step_owner_token_layout owner cache reuse."""
+    runner = object.__new__(TPUModelRunner)
+    spec = SimpleNamespace(prefix_replay_tokens=128)
+    runner.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+    )
+    runner._replay_starts = {}
+
+    def _sched_out(new=(), cached=(), resumed=()):
+        return SimpleNamespace(
+            scheduled_new_reqs=[
+                SimpleNamespace(req_id=r, replay_start=s, num_computed_tokens=s)
+                for r, s in new
+            ],
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=[r for r, _ in cached],
+                num_computed_tokens=[n for _, n in cached],
+                resumed_req_ids=set(resumed),
+            ),
+        )
+
+    # 1. Steady-state decode fast-exit (no new_reqs and no resumed_req_ids)
+    runner._record_replay_starts(_sched_out(cached=[("running", 900)]))
+    assert runner._replay_starts == {}
+
+    # 2. Only new_reqs (resumed_req_ids empty -> skips cached loop)
+    runner._record_replay_starts(
+        _sched_out(new=[("hit", 512), ("cold", 0)], cached=[("running", 900)])
+    )
+    assert runner._replay_starts == {"hit": 512}
+
+    # 3. Both new_reqs and resumed_req_ids
+    runner._record_replay_starts(
+        _sched_out(
+            new=[("hit2", 256)],
+            cached=[("running", 900), ("resumed", 768), ("resumed_cold", 0)],
+            resumed=["resumed", "resumed_cold"],
+        )
+    )
+    assert runner._replay_starts == {"hit": 512, "hit2": 256, "resumed": 768}
+
+    # 4. Disabled when prefix_replay_tokens == 0
+    spec.prefix_replay_tokens = 0
+    runner._record_replay_starts(_sched_out(new=[("ignored", 512)]))
+    assert "ignored" not in runner._replay_starts
+    spec.prefix_replay_tokens = 128
+
+    # 5. _prepare_lookback_token_ids: num_reqs == 0, empty _replay_starts, and non-empty
+    class _LookbackBuf:
+        def __init__(self, rows, depth):
+            self.np = np.zeros((rows, depth), dtype=np.int64)
+
+        def copy_to_gpu(self):
+            return torch.from_numpy(self.np.copy())
+
+    runner.lookback_token_ids = _LookbackBuf(rows=3, depth=2)
+    tokens = np.arange(1000, dtype=np.int64)[None, :].repeat(3, axis=0)
+    runner.input_batch = SimpleNamespace(
+        req_ids=["resumed", "later", "fresh"],
+        num_computed_tokens_cpu=np.array([768, 800, 512]),
+        num_prompt_tokens=np.array([256, 256, 1024]),
+        num_tokens_no_spec=np.array([1000, 1000, 1024]),
+        token_ids_cpu=tokens,
+    )
+    assert torch.all(runner._prepare_lookback_token_ids(0) == -1)
+
+    runner._replay_starts = {}
+    ids_no_replay = runner._prepare_lookback_token_ids(3)
+    assert ids_no_replay[0].tolist() == [-1, -1]
+    assert ids_no_replay[2].tolist() == [511, 510]
+
+    runner._replay_starts = {"resumed": 768, "later": 768, "fresh": 512}
+    ids_replay = runner._prepare_lookback_token_ids(3)
+    assert ids_replay[0].tolist() == [767, 766]
+    assert ids_replay[1].tolist() == [-1, -1]
+    assert ids_replay[2].tolist() == [511, 510]
+
+    # 6. _update_states pops invalidated req_id from non-empty _replay_starts
+    runner._mamba_state_pos = {"resumed": 1}
+    runner._mamba_offset_seeded = {"resumed"}
+    runner._pre_async_results = None
+    runner.requests = {}
+    runner._install_spec_token_room_guard = lambda: None
+    runner.is_unified_pool_used = lambda: False
+    runner._dense_kv_copy_supported = lambda: False
+    so_finish = SimpleNamespace(
+        finished_req_ids={"resumed"},
+        preempted_req_ids=None,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[], num_computed_tokens=[], resumed_req_ids=set()
+        ),
+        kv_cache_block_copies=None,
+    )
+    with patch.object(TPUModelRunner.__bases__[0], "_update_states", return_value="ok"):
+        assert runner._update_states(so_finish) == "ok"
+    assert "resumed" not in runner._replay_starts
+
+    # 7. _prepare_inputs replay_starts_cpu caching (empty and non-empty _replay_starts)
+    from vllm_torchtpu.layers.core.sequence_layout import AllSequenceLayoutPlanner
+
+    max_num_reqs = 4
+    max_model_len = 128
+    token_ids_copy = np.arange(max_num_reqs * max_model_len, dtype=np.int32).reshape(
+        max_num_reqs, max_model_len
+    )
+    positions_cpu = torch.full((max_model_len,), -1, dtype=torch.int32)
+    query_start_loc_cpu = torch.zeros(max_num_reqs + 1, dtype=torch.int32)
+    seq_lens_cpu = torch.zeros(max_num_reqs, dtype=torch.int32)
+    fake_runner = SimpleNamespace(
+        reorder_batch_threshold=1,
+        _replay_starts={},
+        sequence_layout_planner=AllSequenceLayoutPlanner(),
+        _dp_target_bucket=None,
+        input_batch=SimpleNamespace(
+            num_reqs=2,
+            req_ids=[f"req-{i}" for i in range(max_num_reqs)],
+            num_computed_tokens_cpu=np.array([4, 11, 9, 3], dtype=np.int32),
+            token_ids_cpu=token_ids_copy,
+            token_ids_cpu_tensor=torch.from_numpy(token_ids_copy),
+            num_prompt_tokens=np.full(max_num_reqs, 64, dtype=np.int32),
+        ),
+        _wait_input_staging_fence=lambda: None,
+        most_model_len=None,
+        num_reqs_max_model_len=max_num_reqs,
+        num_reqs_most_model_len=max_num_reqs,
+        max_num_reqs=max_num_reqs,
+        uses_mrope=False,
+        arange_np=np.arange(max_model_len, dtype=np.int32),
+        positions_cpu=positions_cpu,
+        positions_np=positions_cpu.numpy(),
+        input_ids_cpu=torch.full((max_model_len,), -1, dtype=torch.int32),
+        query_start_loc_cpu=query_start_loc_cpu,
+        query_start_loc_np=query_start_loc_cpu.numpy(),
+        seq_lens_cpu=seq_lens_cpu,
+        seq_lens_np=seq_lens_cpu.numpy(),
+        _check_attention_schedule=lambda *a: None,
+        _pcp_enabled=False,
+        _mtp_enabled=False,
+        device=torch.device("cpu"),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        speculative_config=None,
+        _pre_async_results=None,
+        _decode_device_cache_key=None,
+        _request_distribution_cpu=torch.zeros(3, dtype=torch.int32),
+        _has_mamba_state=False,
+        mamba_slot_read_offsets=None,
+        _mamba_ckpt_window=1,
+        _unified_kv_layout=False,
+        empty_slot_mappings=None,
+        _build_attention_metadata=lambda **kw: ({}, None),
+        lora_config=None,
+        _prepare_async_token_substitution_indices=lambda *a: (
+            np.array([], dtype=np.int32),
+            np.array([], dtype=np.int32),
+        ),
+        _collect_mamba_state_seed_copies=lambda *a: None,
+        num_tokens_paddings=[16, 64, 128],
+        pcp_size=1,
+        dcp_size=1,
+    )
+    sched_two = SimpleNamespace(
+        total_num_scheduled_tokens=2,
+        num_scheduled_tokens={"req-0": 1, "req-1": 1},
+    )
+    TPUModelRunner._prepare_inputs(fake_runner, sched_two, 0, 2)
+    assert fake_runner._attn_metadata_builder_ctx.replay_starts_cpu == (0, 0, 0, 0)
+    TPUModelRunner._prepare_inputs(fake_runner, sched_two, 0, 2)
+    assert fake_runner._attn_metadata_builder_ctx.replay_starts_cpu is (
+        fake_runner._cached_zero_replay_starts_cpu
+    )
+
+    fake_runner._replay_starts = {"req-0": 512}
+    TPUModelRunner._prepare_inputs(fake_runner, sched_two, 0, 2)
+    assert fake_runner._attn_metadata_builder_ctx.replay_starts_cpu == (512, 0, 0, 0)
+    TPUModelRunner._prepare_inputs(fake_runner, sched_two, 0, 2)
+    assert fake_runner._attn_metadata_builder_ctx.replay_starts_cpu is (
+        fake_runner._cached_replay_starts_cpu
+    )
+
+    # 8. step_owner_required_tokens cache hit and _kv_shard_owners_cache reuse
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.core.owner_affine_block_pool import OwnerLayout
+    from vllm_torchtpu.runner.owner_token_layout import (
+        attach_step_owner_token_layout,
+        step_owner_required_tokens,
+    )
+
+    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_KV_SHARD", True, raising=False)
+    owner_layout = OwnerLayout(num_replicated=8, num_owners=4, blocks_per_owner=14)
+    bt_arr = np.array([[10], [24]], dtype=np.int32)
+    kv_runner = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=4),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace())]
+        ),
+        _kv_shard_group_cache=(None, 0),
+        _kv_shard_owner_layout=owner_layout,
+        input_batch=SimpleNamespace(
+            block_table=SimpleNamespace(
+                block_tables=[SimpleNamespace(_bt_cpu_np=bt_arr)]
+            )
+        ),
+        num_tokens_padded=16,
+        num_tokens_paddings=[16, 32],
+        _attn_metadata_builder_ctx=SimpleNamespace(
+            num_reqs=2,
+            start_index=0,
+            req_indices=None,
+            position_ids_override=None,
+            query_start_loc_cpu=np.array([0, 1, 2], dtype=np.int64),
+        ),
+    )
+    kv_runner._kv_shard_group_cache = (id(kv_runner.kv_cache_config), 0)
+    req1 = step_owner_required_tokens(kv_runner, 0, 2, [1, 1])
+    req2 = step_owner_required_tokens(kv_runner, 0, 2, [1, 1])
+    assert req1 == req2 == 4
+    meta = SimpleNamespace(query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32))
+    layout = attach_step_owner_token_layout(kv_runner, {"l0": meta})
+    assert layout is not None

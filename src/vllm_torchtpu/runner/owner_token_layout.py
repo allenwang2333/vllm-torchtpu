@@ -524,18 +524,33 @@ def step_owner_required_tokens(
     block_ids = getattr(table, "_bt_cpu_np", None)
     if block_ids is None:
         block_ids = table.block_table.np
-    first_blocks = np.asarray(
-        block_ids[start_index : start_index + num_reqs, 0], dtype=np.int64
+    raw_first_blocks = block_ids[start_index : start_index + num_reqs, 0]
+    scheduled_arr = np.asarray(num_scheduled_tokens_per_req)
+    req_key = (
+        tp_size,
+        owner_layout,
+        start_index,
+        num_reqs,
+        np.asarray(raw_first_blocks).tobytes(),
+        scheduled_arr.tobytes(),
     )
+    cached_req = getattr(runner, "_kv_shard_required_tokens_cache", None)
+    if cached_req is not None and cached_req[0] == req_key:
+        return cached_req[1]
+    first_blocks = np.asarray(raw_first_blocks, dtype=np.int64)
     if (
         (first_blocks < owner_layout.num_replicated)
         | (first_blocks >= owner_layout.num_blocks)
     ).any():
+        runner._kv_shard_required_tokens_cache = (req_key, 0)
         return 0
     owners = _owners_from_first_blocks(first_blocks, owner_layout)
-    scheduled = np.asarray(num_scheduled_tokens_per_req, dtype=np.int64)
+    runner._kv_shard_owners_cache = (owner_layout, req_key[4], owners)
+    scheduled = np.asarray(scheduled_arr, dtype=np.int64)
     per_owner = np.bincount(owners, weights=scheduled, minlength=tp_size)
-    return int(tp_size * int(per_owner.max()))
+    required = int(tp_size * int(per_owner.max()))
+    runner._kv_shard_required_tokens_cache = (req_key, required)
+    return required
 
 
 def attach_step_owner_token_layout(
@@ -612,6 +627,7 @@ def attach_step_owner_token_layout(
         else np.asarray(raw_q_loc, dtype=np.int64)
     )
     first_blocks = block_ids[rows, 0]
+    first_blocks_bytes = np.asarray(first_blocks).tobytes()
     num_reqs_padded = int(first.query_start_loc.shape[0]) - 1
     step_key = (
         tp_size,
@@ -620,7 +636,7 @@ def attach_step_owner_token_layout(
         first.query_start_loc.device,
         owner_layout,
         paddings_tuple,
-        first_blocks.tobytes(),
+        first_blocks_bytes,
         q_loc_np[: ctx.num_reqs + 1].tobytes(),
     )
     cached_step = getattr(runner, "_kv_shard_step_layout_cache", None)
@@ -632,7 +648,16 @@ def attach_step_owner_token_layout(
             meta.owner_inv = inv_t
             meta.owner_q_loc = q_loc_t
         return layout
-    owners = _owners_from_first_blocks(first_blocks, owner_layout)
+    owners_cache = getattr(runner, "_kv_shard_owners_cache", None)
+    if (
+        owners_cache is not None
+        and owners_cache[0] == owner_layout
+        and owners_cache[1] == first_blocks_bytes
+    ):
+        owners = owners_cache[2]
+    else:
+        owners = _owners_from_first_blocks(first_blocks, owner_layout)
+        runner._kv_shard_owners_cache = (owner_layout, first_blocks_bytes, owners)
     scheduled = q_loc_np[1 : ctx.num_reqs + 1] - q_loc_np[: ctx.num_reqs]
     step_paddings = (
         tuple(p for p in paddings_tuple if p >= padded_tokens) or paddings_tuple
