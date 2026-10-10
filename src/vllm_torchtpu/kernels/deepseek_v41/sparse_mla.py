@@ -309,7 +309,7 @@ def _build_candidate_union_and_bitmask(
         and topk % 16 == 0
         and m_union % 16 == 0
         and m_union <= 2048
-        and max(5, (total_cache_rows - 1).bit_length() - 14) <= 6
+        and max(5, (total_cache_rows - 1).bit_length() - 14) <= 8
         and hasattr(pltpu.get_tpu_info(), "sparse_core")
     ):
         from jax.experimental.pallas import tpu_sc as plsc

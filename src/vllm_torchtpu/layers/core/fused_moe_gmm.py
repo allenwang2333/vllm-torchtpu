@@ -714,7 +714,7 @@ def moe_gmm(
 
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     inter_dim = w2.shape[1] * packing_factor
-    is_w2_fp4 = (
+    is_w2_fp4 = rhs_quant_dtype == jnp.float4_e2m1fn or (
         jnp.issubdtype(w2.dtype, jnp.floating)
         and jax.dtypes.itemsize_bits(w2.dtype) == 4
     )
