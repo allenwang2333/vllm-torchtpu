@@ -561,17 +561,11 @@ def _request_row_slots(cache, block_table, width, page_records: int = 0):
     (``[requests, num_pages]``).
     """
     rows_per_page = cache.shape[1]
-    fast_offset = _has_fast_cache_offset(cache)
+    fast_offset = _has_fast_cache_offset(cache) and not getattr(cache, "sharded", False)
     table_blocks = block_table.to(torch.int32) if fast_offset else block_table.long()
-    page_bases, unowned_pages = (
-        _map_cache_blocks(cache, table_blocks)
-        if fast_offset
-        else (table_blocks * rows_per_page, None)
-    )
+    page_bases = table_blocks * (cache.page_stride if fast_offset else rows_per_page)
     if page_records > 1 and rows_per_page == page_records:
         num_pages = (width + rows_per_page - 1) // rows_per_page
-        if unowned_pages is not None:
-            page_bases = page_bases.masked_fill(unowned_pages, -1)
         if num_pages > page_bases.shape[1]:
             page_bases = torch.cat(
                 (
@@ -581,8 +575,6 @@ def _request_row_slots(cache, block_table, width, page_records: int = 0):
                 dim=1,
             )
         return page_bases[:, :num_pages]
-    if unowned_pages is not None:
-        page_bases = page_bases.masked_fill(unowned_pages, -rows_per_page)
     # Logical row r lives in table column r // rows_per_page, so repeating each
     # column rows_per_page times lines blocks up with rows 0..width-1 without
     # a full-width gather (16-40x slower on TPU, see _row_slots).
@@ -602,8 +594,7 @@ def _request_row_slots(cache, block_table, width, page_records: int = 0):
         bases = torch.cat(
             (bases, bases[:, -1:].expand(-1, width - bases.shape[1])), dim=1
         )
-    slots = bases[:, :width] + offsets
-    return slots.clamp(min=-1) if unowned_pages is not None else slots
+    return bases[:, :width] + offsets
 
 
 def _read_rows(cache, block_table, requests, logical):
@@ -1679,7 +1670,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             # Rows are row_indices of _row_slots(..., logical),
                             # computed per request: [requests, capacity]. The
                             # indexer shares each request's key tiles.
-                            has_fast_idx_offset = _has_fast_cache_offset(index_cache)
+                            has_fast_idx_offset = _has_fast_cache_offset(
+                                index_cache
+                            ) and not getattr(index_cache, "sharded", False)
                             idx_page_records = _index_page_records(index_cache)
                             idx_req_key = self._stage_cache_key(
                                 "index_req_slots",
@@ -1729,13 +1722,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                                     index_records = (
                                         cached_idx_req
                                         if index_cache.row_offset == 0
-                                        else (
-                                            (
-                                                index_cache.row_offset + cached_idx_req
-                                            ).masked_fill(cached_idx_req < 0, -1)
-                                            if getattr(index_cache, "sharded", False)
-                                            else index_cache.row_offset + cached_idx_req
-                                        )
+                                        else index_cache.row_offset + cached_idx_req
                                     )
                                     if stage_cache is not None:
                                         stage_cache[idx_rec_key] = index_records
