@@ -408,6 +408,139 @@ def test_merge_picks_the_all_to_all(
 
 
 # ===================================================================== #
+# The token-chunked reduce-scatter merge (`TPU_DCP_MERGE_CHUNKED`).
+# ===================================================================== #
+
+
+class _CollectiveGroup:
+    """Lockstep `all_gather`/`reduce_scatter` between threads, one per rank,
+    over whatever tensor each rank actually passes. The reduce-scatter sums in
+    rank order, so two merges that hand it the same terms agree bitwise."""
+
+    def __init__(self, hub, rank):
+        self.world_size = hub.world
+        self.rank_in_group = rank
+        self._hub = hub
+
+    def _exchange(self, x):
+        hub = self._hub
+        hub.slots[self.rank_in_group] = x
+        hub.barrier.wait()
+        got = list(hub.slots)
+        hub.barrier.wait()
+        return got
+
+    def all_gather(self, tensor, dim=0):
+        return torch.cat(self._exchange(tensor), dim=dim)
+
+    def reduce_scatter(self, tensor, dim=-1):
+        terms = self._exchange(tensor)
+        total = terms[0]
+        for term in terms[1:]:
+            total = total + term
+        width = total.shape[dim] // self.world_size
+        return total.narrow(dim, self.rank_in_group * width, width).contiguous()
+
+
+def _rs_merge_whole(outputs, lses, monkeypatch, **env):
+    """Every rank's reduce-scatter merge under `env`, run in lockstep,
+    reassembled over heads."""
+    defaults = {
+        "TPU_DCP_LSE_MERGE_A2A": False,
+        "TPU_DCP_MERGE_CHUNKED": 0,
+        "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": 0,
+    }
+    for name, value in {**defaults, **env}.items():
+        monkeypatch.setattr(cp_mla.envs, name, value, raising=False)
+    world = outputs.shape[0]
+    hub = _ExchangeHub(world)
+    groups = [_CollectiveGroup(hub, rank) for rank in range(world)]
+    monkeypatch.setattr(
+        cp_mla,
+        "get_dcp_group",
+        lambda: groups[int(threading.current_thread().name.rsplit("_", 1)[-1])],
+    )
+
+    def run(rank):
+        threading.current_thread().name = f"dcp_rank_{rank}"
+        return cp_mla.merge_lse_partials_scatter_heads(outputs[rank], lses[rank])
+
+    with concurrent.futures.ThreadPoolExecutor(world) as pool:
+        blocks = list(pool.map(run, range(world)))
+    return torch.cat(blocks, dim=1)
+
+
+@pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
+@pytest.mark.parametrize("chunks", [2, 4])
+def test_chunked_merge_is_bitwise_the_unchunked_merge(dcp_size, chunks, monkeypatch):
+    """Chunking the token axis changes no per-row arithmetic, so it returns
+    the unchunked merge bit for bit -- and that merge meets the f64
+    reference, `-inf` rules included."""
+    outputs, lses = _hard_partials(np.random.default_rng(31), dcp_size, tokens=32)
+    calls = []
+    real = cp_mla._merge_chunked
+    monkeypatch.setattr(
+        cp_mla, "_merge_chunked", lambda *a: calls.append(a[-1]) or real(*a)
+    )
+    today = _rs_merge_whole(outputs, lses, monkeypatch)
+    assert calls == []
+    got = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MERGE_CHUNKED=chunks)
+    assert calls == [chunks] * dcp_size
+    assert got.dtype == torch.bfloat16 and got.shape == outputs.shape[1:]
+    torch.testing.assert_close(got, today, rtol=0, atol=0)
+    assert _bf16_close(got, _reference_merge(outputs.float(), lses))
+    torch.testing.assert_close(got[2], outputs[0, 2], rtol=0, atol=0)
+    assert (got[3] == 0).all()
+
+
+def test_positive_control_misaligned_chunk_weights_are_caught(monkeypatch):
+    """The checks above must fail when a chunk is weighted with lse rows that
+    are not its own (lse shifted by one row inside every chunk)."""
+    real = cp_mla.cp_lse_ag_out_rs
+    monkeypatch.setattr(
+        cp_mla,
+        "cp_lse_ag_out_rs",
+        lambda o, lse, g: real(o, torch.roll(lse, 1, dims=0), g),
+    )
+    outputs, lses = _hard_partials(np.random.default_rng(37), 4, tokens=32)
+    got = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MERGE_CHUNKED=4)
+    assert not _bf16_close(got, _reference_merge(outputs.float(), lses))
+
+
+@pytest.mark.parametrize(
+    "chunks,min_tokens,tokens,is_backbone,expect",
+    [
+        (0, 0, 4096, True, 1),
+        (1, 0, 4096, True, 1),
+        (4, 1024, 4096, True, 4),
+        (4, 1024, 1024, True, 4),
+        (4, 1024, 512, True, 1),  # below the bucket floor
+        (4, 0, 48, True, 1),  # 12-row chunks: not a multiple of 8
+        (2, 0, 48, True, 2),
+        (4, 1024, 4096, False, 1),  # single-trace caller (the MTP drafter)
+    ],
+)
+def test_merge_chunks_per_bucket(
+    chunks, min_tokens, tokens, is_backbone, expect, monkeypatch
+):
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", False, raising=False)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_MERGE_CHUNKED", chunks, raising=False)
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS", min_tokens, raising=False
+    )
+    calls = []
+    monkeypatch.setattr(
+        cp_mla, "_merge_chunked", lambda o, lse, g, n: calls.append(n) or o[:, :2]
+    )
+    outputs, lses = _partials(np.random.default_rng(3), 2, tokens=tokens, vdim=4)
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: _FakeGroup(outputs, lses, 0))
+    cp_mla.merge_lse_partials_scatter_heads(
+        outputs[0], lses[0], is_backbone=is_backbone
+    )
+    assert calls == ([expect] if expect > 1 else [])
+
+
+# ===================================================================== #
 # Position ownership tests.
 # ===================================================================== #
 
