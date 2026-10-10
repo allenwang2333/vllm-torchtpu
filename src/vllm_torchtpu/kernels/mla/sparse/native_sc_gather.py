@@ -265,6 +265,7 @@ def live_vec_geometry(out_size: int, atoms_per_batch: int) -> tuple[int, ...]:
         "serve_pipelined",
         "live_multiple",
         "linear_indices",
+        "live_vec_offset",
     ),
 )
 def dsa_gather_native_sc(
@@ -280,6 +281,7 @@ def dsa_gather_native_sc(
     live_multiple: int = 1,
     live_vec: jax.Array | None = None,
     linear_indices: bool = False,
+    live_vec_offset: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
@@ -305,6 +307,12 @@ def dsa_gather_native_sc(
     linearly, which is the SparseCore operand layout, and a 128-lane 2-D
     [n, 128] producer output reshapes to it as a bitcast; the 4-D reshape
     otherwise costs two relayout copies (T(4,128), then linear). Same rows.
+
+    ``live_vec_offset`` (static, with ``linear_indices``; exclusive with the
+    other live forms): ``live_vec`` is read from the flat ``indices`` operand
+    itself, at ``[live_vec_offset, live_vec_offset + 2 * NUM_LANES)``, past
+    the ``out_size`` gathered indices -- the layout
+    `prepare_capped_window_fused` writes, so its single output carries both.
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
@@ -314,18 +322,31 @@ def dsa_gather_native_sc(
         raise ValueError("native-SC ROPE must be quarter-major uint32[...,128]")
     if indices.dtype != jnp.int32 or indices.ndim != 2:
         raise ValueError("indices must be int32[query, topk]")
-    if indices.size != out_size:
-        raise ValueError(f"indices has {indices.size} values, expected {out_size}")
+    if live_vec_offset is None:
+        if indices.size != out_size:
+            raise ValueError(f"indices has {indices.size} values, expected {out_size}")
+    else:
+        if not linear_indices:
+            raise ValueError("live_vec_offset requires linear_indices")
+        if live_vec_offset < out_size or indices.size < live_vec_offset + 2 * NUM_LANES:
+            raise ValueError(
+                f"live_vec_offset ({live_vec_offset}) must place the live vector "
+                f"past the {out_size} indices, inside {indices.size} values"
+            )
 
-    if num_live_indices is not None and live_vec is not None:
-        raise ValueError("pass num_live_indices or live_vec, not both")
+    if sum(x is not None for x in (num_live_indices, live_vec, live_vec_offset)) > 1:
+        raise ValueError("pass one of num_live_indices, live_vec, live_vec_offset")
     num_cores, num_subcores, atoms_per_batch, occurrences_per_batch, num_batches = (
         live_vec_geometry(out_size, atoms_per_batch)
     )
     num_owners = num_cores * num_subcores
     owner_batch_size = num_owners * occurrences_per_batch
     batches_per_owner = num_batches // num_owners
-    live = num_live_indices is not None or live_vec is not None
+    live = (
+        num_live_indices is not None
+        or live_vec is not None
+        or live_vec_offset is not None
+    )
     scratch_types = {"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,))}
     operands = [
         nope_cache.reshape(-1, 128),
@@ -337,7 +358,11 @@ def dsa_gather_native_sc(
         ),
     ]
     guard_tail = False
-    if live_vec is not None:
+    if live_vec_offset is not None:
+        scratch_types["live_vmem_ref"] = pltpu.VMEM((2 * NUM_LANES,), jnp.int32)
+        scratch_types["live_sem_ref"] = pltpu.SemaphoreType.DMA((1,))
+        guard_tail = live_multiple % owner_batch_size != 0
+    elif live_vec is not None:
         if live_vec.shape != (2 * NUM_LANES,) or live_vec.dtype != jnp.int32:
             raise ValueError(f"live_vec must be int32[{2 * NUM_LANES}]")
         operands.append(live_vec)
@@ -387,7 +412,14 @@ def dsa_gather_native_sc(
         guard_tail=guard_tail,
         linear_indices=linear_indices,
     )
-    if live:
+    if live_vec_offset is not None:
+        inner = body
+
+        def body(nope, rope, idx, nope_o, rope_o, **scr):
+            live_hbm = idx.at[pl.ds(live_vec_offset, 2 * NUM_LANES)]
+            return inner(nope, rope, idx, nope_o, rope_o, live_hbm_ref=live_hbm, **scr)
+
+    elif live:
         inner = body
 
         def body(nope, rope, idx, live_hbm, nope_o, rope_o, **scr):

@@ -983,7 +983,8 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
     @parameterized.parameters((16, 4, 1), (32, 4, 1), (32, 16, 16))
     def test_fused_window_prep_matches_reference(self, num_tokens, bz, atoms):
         """`prepare_capped_window_fused` rows == `prepare_capped_window_indices`
-        on every live window, and its live vector == the gather's own bound."""
+        on every live window, and the live vector in its trailing tile == the
+        gather's own bound."""
         if jax.devices()[0].platform != "tpu":
             self.skipTest("Mosaic kernel requires a TPU")
         from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
@@ -1002,12 +1003,10 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                 np.where(np.arange(topk)[None] < counts[:, None], logical, -1),
                 jnp.int32,
             )
-            kv = jnp.sum(topk_idx != -1, axis=-1)
-            rows, live_vec = sparse_mla.prepare_capped_window_fused(
+            rows = sparse_mla.prepare_capped_window_fused(
                 topk_idx,
                 page_table,
                 cu_q_lens,
-                kv,
                 jnp.int32(token_end),
                 topk_cap=cap,
                 page_size=page_size,
@@ -1029,7 +1028,11 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                 page_size=page_size,
                 total_num_pages=total_pages,
             )
-            got = np.asarray(rows).reshape(4, num_tokens, cap)[:lw]
+            window_rows = 4 * num_tokens * cap // 128
+            self.assertEqual(
+                rows.shape, (window_rows + sparse_mla.FUSED_PREP_META_ROWS, 128)
+            )
+            got = np.asarray(rows)[:window_rows].reshape(4, num_tokens, cap)[:lw]
             np.testing.assert_array_equal(
                 got, np.asarray(want).reshape(4, num_tokens, cap)[:lw]
             )
@@ -1038,8 +1041,9 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             )
             num_live = (lw - 1) * num_tokens * cap + grid * cap
             live_b = min(-(-num_live // occ), nb)
+            live_vec = np.asarray(rows).reshape(-1)[num_tokens * topk :][:32]
             np.testing.assert_array_equal(
-                np.asarray(live_vec), [live_b] * 16 + [-(-live_b // 32)] * 16
+                live_vec, [live_b] * 16 + [-(-live_b // 32)] * 16
             )
 
     @parameterized.parameters((16, (4, 4)), (512, (4, 4, 492)))
