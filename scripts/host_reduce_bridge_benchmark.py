@@ -86,6 +86,9 @@ def worker(local_rank: int, args: argparse.Namespace) -> None:
         if args.reverse:
             paths.reverse()
         for name, fn in paths:
+            # Each shape is an independent compile; do not exhaust Dynamo's
+            # per-code-object recompile limit during a long shape sweep.
+            torch._dynamo.reset()
 
             def forward(x, fn=fn):
                 return fn(x)

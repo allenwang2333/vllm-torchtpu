@@ -155,13 +155,23 @@ def test_host_reduce_uses_model_tp_after_ep_collapses_expert_tp(
     "batch,dtype,reduced",
     [
         (64, torch.bfloat16, False),
+        (80, torch.bfloat16, False),
+        (96, torch.bfloat16, False),
+        (112, torch.bfloat16, False),
+        (128, torch.bfloat16, False),
         (256, torch.bfloat16, False),
+        (320, torch.bfloat16, False),
+        (384, torch.bfloat16, False),
+        (448, torch.bfloat16, False),
+        (512, torch.bfloat16, False),
+        (1024, torch.bfloat16, False),
         (8, torch.bfloat16, False),
         (64, torch.float32, False),
         (64, torch.bfloat16, True),
     ],
 )
 def test_host_reduce_preserves_reduction_and_truncation(batch, dtype, reduced):
+    torch._dynamo.reset()
     runner = VllmMoERunner.__new__(VllmMoERunner)
     torch.nn.Module.__init__(runner)
     runner.moe_config = SimpleNamespace(
@@ -190,7 +200,12 @@ def test_host_reduce_preserves_reduction_and_truncation(batch, dtype, reduced):
     expected = (
         []
         if reduced
-        else ["host" if batch in (64, 256) and dtype == torch.bfloat16 else "native"]
+        else [
+            "host"
+            if batch in (64, 80, 96, 112, 128, 256, 320, 384, 448, 512)
+            and dtype == torch.bfloat16
+            else "native"
+        ]
     )
     assert calls == expected
     calls.clear()

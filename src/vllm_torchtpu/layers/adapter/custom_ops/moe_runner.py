@@ -82,11 +82,12 @@ class VllmMoERunner(MoERunner):
             else output_is_reduced
         )
         # Restrict the candidate to the shapes and dtype validated by the UT.
+        # The tested 1024-token shape is slower and retains native AllReduce.
         if (
             self._host_reduce is not None
             and not reduced
             and states.ndim == 2
-            and states.shape[0] in (64, 256)
+            and states.shape[0] in (64, 80, 96, 112, 128, 256, 320, 384, 448, 512)
             and states.shape[1] == 8192
             and states.dtype == torch.bfloat16
         ):

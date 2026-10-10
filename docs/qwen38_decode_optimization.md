@@ -21,8 +21,10 @@ upstream final-output method still controls truncation and already-reduced
 outputs. Shared-expert partials already included in that sum remain included.
 
 The tested envelope is a whole-world TP32/EP32 group on four hosts with eight
-cores each, PCP1, no sequence parallelism, BF16 tensors shaped `[64,8192]`
-or `[256,8192]`. Other shapes retain the original collective. The optimization
+cores each, PCP1, no sequence parallelism, BF16 tensors with hidden8192 and
+token counts 64, 80, 96, 112, 128, 256, 320, 384, 448 or 512. Other shapes
+retain the original collective. The tested 1024-token case is slower and
+also retains the original collective. The optimization
 does not replace attention collectives or change GMM, routing, or weights.
 
 ## UT evidence
@@ -84,3 +86,29 @@ A follow-up concurrency sweep covers 64, 80, 96, 112, 128 and 256 requests.
 New B and 4B collective shapes must pass the standalone 32-process bridge
 checks before enabling their serving dispatch. Larger-batch results are
 pending.
+
+
+### Extended collective shape sweep
+
+32 TorchTPU processes, exact rank-stripe correctness plus random BF16 versus
+CPU FP32, 30 dependent calls per timed sample, 11 repetitions. All shapes
+pass; maximum relative L2 is below 0.44% and maximum absolute error below
+0.0052. Resetting Dynamo between independent cases avoids its default
+per-code-object recompile limit; reset/compilation are outside timing.
+
+| Tokens | Native median us | Host reduction median us |
+| ---: | ---: | ---: |
+| 80 | 137.51 | 87.19 |
+| 96 | 137.63 | 89.13 |
+| 112 | 139.60 | 95.16 |
+| 128 | 139.81 | 95.13 |
+| 320 | 147.80 | 128.03 |
+| 384 | 156.81 | 142.90 |
+| 448 | 164.96 | 156.96 |
+| 512 | 175.32 | 170.37 |
+| 1024 | 266.95 | 292.89 |
+
+The dispatcher therefore keeps native AllReduce at 1024 tokens. A batch256
+MTP run uses host reduction for its 256-token draft path and native reduction
+for its 1024-token target verification path. UT wall-time outliers remain;
+these medians do not establish better tail latency.
