@@ -35,7 +35,14 @@ from typing import Any, Literal
 from scenario import __version__
 from scenario.plan import codec
 from scenario.plan.types import CLIENT_ROLE, Plan
-from scenario.runtime import bringup, exec_eval, exec_perf, exits, results
+from scenario.runtime import (
+    bringup,
+    exec_custom,
+    exec_eval,
+    exec_perf,
+    exits,
+    results,
+)
 from scenario.runtime.context import (
     Liveness,
     LocalServer,
@@ -139,6 +146,8 @@ class Signals:
 Executor = Callable[[TaskContext, Any, dict[str, Any]], TaskOutcome]
 EXECUTORS: dict[str, Executor] = {
     "perf": exec_perf.run_perf,
+    "agentx": exec_custom.run_agentx,
+    "custom": exec_custom.run_custom,
     "eval": exec_eval.run_eval,
 }
 

@@ -52,6 +52,15 @@ exits. Knobs:
     STUB_IX_EVAL_EXIT=N        the eval client's exit code
     STUB_IX_FLOOR_EXIT=N       the score validation's exit code
 
+InferenceX's AgentX replay (`-m infx.bench agentic`) writes
+$RESULT_DIR/$RESULT_FILENAME.json and aiperf's export under
+$RESULT_DIR/aiperf_artifacts. Knobs:
+
+    STUB_AGENTX_SLEEP=S        take S seconds
+    STUB_AGENTX_EXIT=N         exit N
+    STUB_AGENTX_RESULT=0       write no result
+    STUB_AGENTX_VALID=false    aiperf's submission_valid (default true)
+
 `python3` runs the real interpreter for anything but `-m infx...`.
 """
 
@@ -326,6 +335,20 @@ def infx_bench(args: list[str]) -> int:
         (stage / "meta_env.json").write_text(json.dumps(meta))
         (stage / "results_gsm8k.json").write_text(json.dumps({"score": 0.9}))
         return int(os.environ.get("STUB_IX_EVAL_EXIT", 0))
+    if args[:1] == ["agentic"]:
+        record("infx agentic", args[1:])
+        time.sleep(number("STUB_AGENTX_SLEEP"))
+        if os.environ.get("STUB_AGENTX_RESULT") != "0":
+            directory = pathlib.Path(os.environ["RESULT_DIR"])
+            row = {"conc": int(os.environ["CONC"]), "output_tput_per_gpu": 12.5}
+            name = os.environ["RESULT_FILENAME"] + ".json"
+            (directory / name).write_text(json.dumps(row))
+            artifacts = directory / "aiperf_artifacts"
+            artifacts.mkdir(exist_ok=True)
+            valid = os.environ.get("STUB_AGENTX_VALID", "true") == "true"
+            export = {"metadata": {"submission_valid": valid}}
+            (artifacts / "profile_export_aiperf.json").write_text(json.dumps(export))
+        return int(os.environ.get("STUB_AGENTX_EXIT", 0))
     record("infx bench", args)
     return 2
 
