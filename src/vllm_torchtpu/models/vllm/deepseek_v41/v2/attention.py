@@ -1889,10 +1889,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # selections. Every rank still writes all index keys (replicated cache).
         # Contiguous parts of `_query_split` rows, computed rather than branched
         # on the token count, which would freeze the traced bucket's choice
-        # (compilation/shape_variants.py). A static pad (never empty: a
-        # zero-size pad guards on the count since torch.cat skips empty
-        # inputs) covers the last part; padding rows have zero length and
-        # select nothing.
+        # (compilation/shape_variants.py). Out-of-range rows in the last part
+        # are clamped for `index_select` and masked with `invalid_mine`; padding
+        # rows have zero length and select nothing.
         # A 16-row-aligned part (SparseCore top-k row tile) put a whole decode
         # batch of ``count <= 16`` on rank 0 while the other ranks scored only
         # padding (split change alone at C=16: L20 3.20 -> 1.48 ms,
@@ -1926,40 +1925,43 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
                 if owner_perm is not None:
                     part = owner_perm.shape[0] // ranks
-                    padding = 1
-                    seg_perm = (
+                    mine = (
                         owner_perm[: ranks * part]
                         .reshape(ranks, part)
                         .index_select(0, self._get_stage_tp_rank_1d(stage_cache))
                         .squeeze(0)
+                        .to(torch.int32)
                     )
-                    mine = torch.where(seg_perm >= 0, seg_perm, count).to(torch.int32)
                 else:
-                    part, padding = _query_split(count, ranks, kv_shard=kv_shard)
+                    part, _ = _query_split(count, ranks, kv_shard=kv_shard)
                     mine = tp_rank * part + torch.arange(
                         part, dtype=torch.int32, device=qr.device
                     )
+                invalid_mine, clamped_mine = (
+                    (mine < 0) | (mine >= count),
+                    mine.clamp(min=0, max=count - 1),
+                )
+                invalid_mine_2d = invalid_mine[:, None]
                 positions_part, lengths_part, requests_part = (
-                    torch.cat(
-                        (x, x.new_full((padding, *x.shape[1:]), fill))
-                    ).index_select(0, mine)
-                    for x, fill in (
-                        (positions, 0),
-                        (active_lengths, 0),
-                        (requests, 0),
-                    )
+                    positions.index_select(0, clamped_mine).masked_fill(
+                        invalid_mine, 0
+                    ),
+                    active_lengths.index_select(0, clamped_mine).masked_fill(
+                        invalid_mine.reshape(-1, *([1] * (active_lengths.ndim - 1))), 0
+                    ),
+                    requests.index_select(0, clamped_mine).masked_fill(invalid_mine, 0),
                 )
             else:
-                padding = 0
-                mine = None
+                clamped_mine = None
+                invalid_mine_2d = None
                 positions_part = positions
                 lengths_part = active_lengths
                 requests_part = requests
             cached_query_split = (
                 active_lengths,
                 batch_max,
-                padding,
-                mine,
+                clamped_mine,
+                invalid_mine_2d,
                 positions_part,
                 lengths_part,
                 requests_part,
@@ -1970,18 +1972,16 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             (
                 active_lengths,
                 batch_max,
-                padding,
-                mine,
+                clamped_mine,
+                invalid_mine_2d,
                 positions_part,
                 lengths_part,
                 requests_part,
             ) = cached_query_split
         if split:
             qr_part, weights_part = (
-                torch.cat((x, x.new_full((padding, *x.shape[1:]), fill))).index_select(
-                    0, mine
-                )
-                for x, fill in ((qr, 0), (weights, 0))
+                qr.index_select(0, clamped_mine).masked_fill(invalid_mine_2d, 0),
+                weights.index_select(0, clamped_mine).masked_fill(invalid_mine_2d, 0),
             )
             if owner_perm is not None:
                 candidates_part = (
@@ -1990,12 +1990,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     else swa_slots.new_empty((qr_part.shape[0], 0), dtype=torch.int32)
                 )
             else:
-                candidates_part = torch.cat(
-                    (
-                        candidates,
-                        candidates.new_full((padding, *candidates.shape[1:]), -1),
-                    )
-                ).index_select(0, mine)
+                candidates_part = candidates.index_select(0, clamped_mine).masked_fill(
+                    invalid_mine_2d, -1
+                )
         else:
             qr_part, weights_part, candidates_part = qr, weights, candidates
         q_part = self._project_index_q(qr_part, positions_part)

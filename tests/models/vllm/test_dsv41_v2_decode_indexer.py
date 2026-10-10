@@ -1110,3 +1110,138 @@ class TestAttentionSelectPagedIndicesDecode:
                 np.testing.assert_array_equal(
                     np.asarray(pub_paged), np.asarray(pub_ref)
                 )
+
+    @pytest.mark.parametrize("use_owner_perm", [False, True])
+    def test_td8221_select_paged_indices_clamped_mine_parity_and_no_cat(
+        self, monkeypatch, use_owner_perm
+    ):
+        """TD8.221: clamped_mine + masked_fill matches reference without torch.cat."""
+        orig_cat = torch.cat
+        ranks = 4
+        count = 10
+        tp_rank = 2
+        attn = self._setup_mock_attn(
+            monkeypatch, ranks=ranks, tp_rank=tp_rank, candidate_write=False
+        )
+        attn._tp_rank_1d = torch.tensor([tp_rank], dtype=torch.int32)
+        attn.candidate_block_buffer = torch.arange(128 * 8, dtype=torch.int32).reshape(
+            128, 8
+        )
+        captured_parts: list[tuple[torch.Tensor, ...]] = []
+
+        def capture_project_q(q_part, pos_part):
+            captured_parts.append((q_part, pos_part))
+            return q_part
+
+        attn._project_index_q = capture_project_q
+        captured_indexer: list[tuple[torch.Tensor, ...]] = []
+
+        def fake_paged_indexer(
+            q_part,
+            index_cache,
+            records,
+            weights_part,
+            lengths_part,
+            candidates_part,
+            write_records,
+            write_keys,
+            requests_part,
+            *args,
+            **kwargs,
+        ):
+            captured_indexer.append(
+                (weights_part, lengths_part, candidates_part, requests_part)
+            )
+            return (
+                index_cache.raw,
+                torch.zeros(q_part.shape[0], 4, dtype=torch.int32),
+                candidates_part,
+            )
+
+        monkeypatch.setattr(v2_attn, "paged_indexer", fake_paged_indexer)
+        monkeypatch.setattr(
+            v2_attn, "_gather_query_rows", lambda s: s.repeat(ranks, 1)[:count]
+        )
+
+        cat_calls: list[int] = []
+
+        def spy_cat(tensors, *args, **kwargs):
+            cat_calls.append(len(tensors))
+            return orig_cat(tensors, *args, **kwargs)
+
+        monkeypatch.setattr(torch, "cat", spy_cat)
+
+        raw = torch.zeros((64, ROW_WORDS), dtype=torch.int32)
+        index_cache_mock = SimpleNamespace(raw=raw)
+        qr = torch.arange(count * 16, dtype=torch.float32).reshape(count, 16) + 1.0
+        positions = torch.arange(100, 100 + count, dtype=torch.int32)
+        records = torch.zeros(count, 32, dtype=torch.int32)
+        requests = torch.arange(20, 20 + count, dtype=torch.int32)
+        weights = torch.arange(count * 2, dtype=torch.float32).reshape(count, 2) + 0.5
+        lengths = torch.arange(1, count + 1, dtype=torch.int32)[:, None]
+        swa_slots = torch.arange(count, dtype=torch.int32)
+        swa_slots[1] = -1
+
+        if use_owner_perm:
+            owner_perm = torch.tensor(
+                [0, 1, 2, -1, 3, 4, -1, 5, 9, -1, 0, 1, 6, 7, 8, -1],
+                dtype=torch.int32,
+            )
+            part = 4
+            padding = 1
+            ref_mine = torch.tensor([9, count, 0, 1], dtype=torch.int32)
+        else:
+            owner_perm = None
+            part, padding = v2_attn._query_split(count, ranks, kv_shard=False)
+            ref_mine = tp_rank * part + torch.arange(part, dtype=torch.int32)
+
+        active_lengths = lengths.masked_fill(swa_slots[:, None] < 0, 0)
+        ref_qr = orig_cat((qr, qr.new_full((padding, 16), 0))).index_select(0, ref_mine)
+        ref_pos = orig_cat((positions, positions.new_full((padding,), 0))).index_select(
+            0, ref_mine
+        )
+        ref_w = orig_cat((weights, weights.new_full((padding, 2), 0))).index_select(
+            0, ref_mine
+        )
+        ref_l = orig_cat(
+            (active_lengths, active_lengths.new_full((padding, 1), 0))
+        ).index_select(0, ref_mine)
+        ref_req = orig_cat((requests, requests.new_full((padding,), 0))).index_select(
+            0, ref_mine
+        )
+        candidates = attn.candidate_block_buffer[:count]
+        ref_cand = (
+            attn.candidate_block_buffer[:part]
+            if use_owner_perm
+            else orig_cat(
+                (candidates, candidates.new_full((padding, 8), -1))
+            ).index_select(0, ref_mine)
+        )
+        cat_calls.clear()
+
+        with v2_attn.stage_attention_cache_scope():
+            for _ in range(2):
+                attn._select_paged_indices(
+                    qr,
+                    positions,
+                    index_cache_mock,
+                    records,
+                    requests,
+                    weights,
+                    lengths,
+                    swa_slots,
+                    None,
+                    owner_perm=owner_perm,
+                )
+
+        assert cat_calls == []
+        assert len(captured_parts) == 2
+        for (q_p, pos_p), (w_p, l_p, c_p, req_p) in zip(
+            captured_parts, captured_indexer, strict=True
+        ):
+            assert torch.equal(q_p, ref_qr)
+            assert torch.equal(pos_p, ref_pos)
+            assert torch.equal(w_p, ref_w)
+            assert torch.equal(l_p, ref_l)
+            assert torch.equal(c_p, ref_cand)
+            assert torch.equal(req_p, ref_req)
