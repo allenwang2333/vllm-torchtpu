@@ -13,6 +13,24 @@ def register_layers() -> None:
     _maybe_install_frontend_tokcache()
     _maybe_install_frontend_fix()
     _maybe_install_detok_prompt_tail()
+    _maybe_install_ttft_stage_tracker()
+
+
+def _maybe_install_ttft_stage_tracker() -> None:
+    from vllm_torchtpu import envs
+
+    if envs.QX_TTFT_STAGE_LOG_PERIOD_S <= 0:
+        return
+    try:
+        from vllm_torchtpu.frontend_fix import maybe_install_ttft_stage_tracker
+
+        maybe_install_ttft_stage_tracker()
+    except Exception as e:  # never break startup
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "[QX_TTFT_STAGES] install failed: %r", e
+        )
 
 
 def _maybe_install_detok_prompt_tail() -> None:

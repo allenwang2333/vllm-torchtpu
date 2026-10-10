@@ -193,6 +193,10 @@ if TYPE_CHECKING:
     TPU_SCHED_MK_MAX_RUNNING: int = 0
     TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP: bool = False
     TPU_SCHED_SINGLE_STEP_PREFILL: bool = True
+    TPU_SCHED_FINISH_DECODE_STEPS: int = 32
+    TPU_SCHED_FINISH_DECODE_MAX_DEFERRAL_STEPS: int = 64
+    TPU_SCHED_FINISH_DECODE_PREFILL_MIN_TOKENS: int = 6144
+    QX_TTFT_STAGE_LOG_PERIOD_S: float = 0.0
 
 
 def env_with_choices(
@@ -1161,6 +1165,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SCHED_SINGLE_STEP_PREFILL": env_bool(
         "TPU_SCHED_SINGLE_STEP_PREFILL", default=True
     ),
+    # Near-finish decode protection: when >=1 decoding request has remaining
+    # output tokens <= TPU_SCHED_FINISH_DECODE_STEPS * (1 + num_spec_tokens) and
+    # scheduling a prefill would add >= TPU_SCHED_FINISH_DECODE_PREFILL_MIN_TOKENS
+    # tokens, defer that prefill for up to TPU_SCHED_FINISH_DECODE_MAX_DEFERRAL_STEPS
+    # consecutive steps. 0 disables.
+    "TPU_SCHED_FINISH_DECODE_STEPS": env_nonnegative_int(
+        "TPU_SCHED_FINISH_DECODE_STEPS", 32
+    ),
+    "TPU_SCHED_FINISH_DECODE_MAX_DEFERRAL_STEPS": env_nonnegative_int(
+        "TPU_SCHED_FINISH_DECODE_MAX_DEFERRAL_STEPS", 64
+    ),
+    "TPU_SCHED_FINISH_DECODE_PREFILL_MIN_TOKENS": env_nonnegative_int(
+        "TPU_SCHED_FINISH_DECODE_PREFILL_MIN_TOKENS", 6144
+    ),
+    # Host-side 5-point TTFT stage telemetry periodic summary interval in
+    # seconds; 0 disables (default, zero overhead).
+    "QX_TTFT_STAGE_LOG_PERIOD_S": env_float("QX_TTFT_STAGE_LOG_PERIOD_S", 0.0),
     "TPU_HYBRID_RETENTION_MAX_CONVS": env_nonnegative_int(
         "TPU_HYBRID_RETENTION_MAX_CONVS", 96
     ),

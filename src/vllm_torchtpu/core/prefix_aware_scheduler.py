@@ -62,6 +62,31 @@ def _remaining_prefill_tokens(request: Request) -> int:
     )
 
 
+def _remaining_output_tokens(request: Request) -> int | None:
+    max_toks = getattr(request, "max_tokens", None)
+    if max_toks is None:
+        sp = getattr(request, "sampling_params", None)
+        max_toks = getattr(sp, "max_tokens", None) if sp is not None else None
+    if max_toks is None:
+        return None
+    try:
+        max_toks_i = int(max_toks)
+    except (TypeError, ValueError):
+        return None
+    if max_toks_i <= 0:
+        return None
+    out_toks = getattr(request, "num_output_tokens", None)
+    if out_toks is None:
+        all_ids = getattr(request, "all_token_ids", None)
+        prompt_toks = int(getattr(request, "num_prompt_tokens", 0) or 0)
+        if all_ids is not None and prompt_toks > 0:
+            out_toks = max(len(all_ids) - prompt_toks, 0)
+        else:
+            comp_toks = int(getattr(request, "num_computed_tokens", 0) or 0)
+            out_toks = max(comp_toks - prompt_toks, 0)
+    return max_toks_i - int(out_toks)
+
+
 def _env_on(name: str, default: str = "1") -> bool:
     return os.environ.get(name, default).strip().lower() not in (
         "0",
@@ -162,6 +187,16 @@ class PrefixAwareScheduler(AsyncScheduler):
         )
         self._warm_streak: int = int(envs.TPU_SCHED_WARM_STREAK)
         self._warm_min_decoders: int = int(envs.TPU_SCHED_WARM_MIN_DECODERS)
+        self._finish_decode_steps: int = int(envs.TPU_SCHED_FINISH_DECODE_STEPS)
+        self._finish_decode_max_deferral_steps: int = int(
+            envs.TPU_SCHED_FINISH_DECODE_MAX_DEFERRAL_STEPS
+        )
+        self._finish_decode_prefill_min_tokens: int = int(
+            envs.TPU_SCHED_FINISH_DECODE_PREFILL_MIN_TOKENS
+        )
+        self._finish_decode_defer_streak: int = 0
+        self._step_has_near_finish_decoder: bool | None = None
+        self._step_finish_decode_deferred: bool = False
         self._skip_midblock_align_stop: bool = bool(
             envs.TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP
         )
@@ -194,12 +229,16 @@ class PrefixAwareScheduler(AsyncScheduler):
 
         logger.info(
             "PrefixAwareScheduler ACTIVE (window=%d, decoders first, "
-            "srpf_running=%s, cold_chunk_cap=%d, cold_threshold=%d, "
+            "srpf_running=%s, finish_decode_steps=%d@%d(min_toks=%d), "
+            "cold_chunk_cap=%d, cold_threshold=%d, "
             "cold_min_decoders=%d, step_total_cap=%d, mk_max_running=%d, "
             "warm_streak=%d@%d, hybrid_state_retention=%s, memo_xstep=%s, "
             "skip_midblock_align_stop=%s, single_step_prefill=%s)",
             self.WINDOW,
             self._srpf_running,
+            self._finish_decode_steps,
+            self._finish_decode_max_deferral_steps,
+            self._finish_decode_prefill_min_tokens,
             self._cold_chunk_cap,
             self._cold_threshold,
             self._cold_min_decoders,
@@ -400,6 +439,34 @@ class PrefixAwareScheduler(AsyncScheduler):
             warm_min_dec = int(envs.TPU_SCHED_WARM_MIN_DECODERS)
         return step_cap, warm_streak, warm_min_dec
 
+    def _get_finish_decode_knobs(self) -> tuple[int, int, int]:
+        steps = getattr(self, "_finish_decode_steps", None)
+        if steps is None:
+            steps = int(envs.TPU_SCHED_FINISH_DECODE_STEPS)
+        max_defer = getattr(self, "_finish_decode_max_deferral_steps", None)
+        if max_defer is None:
+            max_defer = int(envs.TPU_SCHED_FINISH_DECODE_MAX_DEFERRAL_STEPS)
+        min_toks = getattr(self, "_finish_decode_prefill_min_tokens", None)
+        if min_toks is None:
+            min_toks = int(envs.TPU_SCHED_FINISH_DECODE_PREFILL_MIN_TOKENS)
+        return steps, max_defer, min_toks
+
+    def _has_near_finish_decoder(self, finish_decode_steps: int) -> bool:
+        if finish_decode_steps <= 0:
+            return False
+        step_flag = getattr(self, "_step_has_near_finish_decoder", None)
+        if step_flag is not None:
+            return bool(step_flag)
+        tokens_per_dec = 1 + max(int(getattr(self, "num_spec_tokens", 3) or 0), 0)
+        threshold = finish_decode_steps * tokens_per_dec
+        for r in getattr(self, "running", ()):
+            if not _is_decoding(r):
+                continue
+            rem_out = _remaining_output_tokens(r)
+            if rem_out is not None and 1 <= rem_out <= threshold:
+                return True
+        return False
+
     def _retention_failed(self) -> None:
         logger.exception(
             "PrefixAwareScheduler: hybrid state retention failed; disabling it."
@@ -503,6 +570,22 @@ class PrefixAwareScheduler(AsyncScheduler):
             )
             for r in decoding
         )
+        finish_steps, _, _ = self._get_finish_decode_knobs()
+        if finish_steps > 0 and decoding:
+            tokens_per_dec = 1 + max(
+                int(getattr(self, "num_spec_tokens", 3) or 0), 0
+            )
+            finish_thresh = finish_steps * tokens_per_dec
+            self._step_has_near_finish_decoder = any(
+                (rem_out := _remaining_output_tokens(r)) is not None
+                and 1 <= rem_out <= finish_thresh
+                for r in decoding
+            )
+        else:
+            self._step_has_near_finish_decoder = False
+        if not self._step_has_near_finish_decoder:
+            self._finish_decode_defer_streak = 0
+        self._step_finish_decode_deferred = False
         self._step_running_prefill_ids = {id(r) for r in prefilling}
         self._step_prefill_tokens_by_req = {}
         if getattr(self, "_memo_xstep", False):
@@ -535,17 +618,23 @@ class PrefixAwareScheduler(AsyncScheduler):
                     self._n_single_step_reqs += len(cuts)
             if any(v > 0 for v in self._step_prefill_tokens_by_req.values()):
                 self._pure_decode_streak = 0
+                self._finish_decode_defer_streak = 0
             else:
                 self._pure_decode_streak = (
                     getattr(self, "_pure_decode_streak", 999999) + 1
                 )
+                if getattr(self, "_step_finish_decode_deferred", False):
+                    self._finish_decode_defer_streak = (
+                        int(getattr(self, "_finish_decode_defer_streak", 0) or 0)
+                        + 1
+                    )
             now = time.monotonic()
             if now - getattr(self, "_last_sched_log_t", 0.0) >= 60.0:
                 self._last_sched_log_t = now
                 logger.info(
                     "prefix-scheduler telemetry: running=%d waiting=%d decoding=%d "
                     "prefilling=%d free_blocks=%s sched_tokens=%d pure_decode_streak=%d "
-                    "midblock_stops_skipped=%d single_step_reqs=%d",
+                    "finish_defer_streak=%d midblock_stops_skipped=%d single_step_reqs=%d",
                     len(self.running),
                     len(getattr(self, "waiting", ())),
                     len(decoding),
@@ -553,6 +642,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                     self._get_num_free_blocks(),
                     getattr(out, "total_num_scheduled_tokens", 0),
                     self._pure_decode_streak,
+                    getattr(self, "_finish_decode_defer_streak", 0),
                     getattr(self, "_n_midblock_stops_skipped", 0),
                     getattr(self, "_n_single_step_reqs", 0),
                 )
@@ -573,6 +663,8 @@ class PrefixAwareScheduler(AsyncScheduler):
                 self.max_num_running_reqs = orig_max_running
             self._step_running_prefill_ids = set()
             self._step_prefill_tokens_by_req = None
+            self._step_has_near_finish_decoder = None
+            self._step_finish_decode_deferred = False
 
     def _cap_cold_prefill_tokens(
         self,
@@ -635,6 +727,27 @@ class PrefixAwareScheduler(AsyncScheduler):
             has_prior_prefill = False
         already_scheduled = decode_tokens + prior_prefill_tokens
 
+        finish_steps, finish_max_defer, finish_min_toks = (
+            self._get_finish_decode_knobs()
+        )
+        if finish_steps > 0:
+            if self._has_near_finish_decoder(finish_steps):
+                if (prior_prefill_tokens + num_new_tokens) >= finish_min_toks:
+                    defer_streak = int(
+                        getattr(self, "_finish_decode_defer_streak", 0) or 0
+                    )
+                    if defer_streak < finish_max_defer:
+                        self._step_finish_decode_deferred = True
+                        if sched_map is None:
+                            self._finish_decode_defer_streak = defer_streak + 1
+                        else:
+                            sched_map[req_key] = 0
+                        return 0
+                    self._finish_decode_defer_streak = 0
+                    self._step_finish_decode_deferred = False
+            elif sched_map is None:
+                self._finish_decode_defer_streak = 0
+
         if (
             step_total_cap > 0
             and has_prior_prefill
@@ -695,6 +808,8 @@ class PrefixAwareScheduler(AsyncScheduler):
         num_new_tokens = self._cap_cold_prefill_tokens(
             request, start, num_new_tokens
         )
+        if num_new_tokens <= 0:
+            return 0
         retention = getattr(self, "_retention", None)
         if retention is not None:
             try:

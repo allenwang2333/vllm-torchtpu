@@ -558,3 +558,91 @@ def test_mk_max_running_caps_running_seqs_when_megakernel_active(monkeypatch):
     assert s._resolve_mk_max_running() == 0
 
 
+def test_near_finish_decode_protection_defers_large_prefill_with_starvation_cap():
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s.block_size = 640
+    s.num_spec_tokens = 3  # tokens_per_dec = 4
+    s._step_num_decoding = 4
+    s._step_decode_tokens = 16
+    s._finish_decode_steps = 2  # threshold = 2 * 4 = 8 remaining output tokens
+    s._finish_decode_max_deferral_steps = 2
+    s._finish_decode_prefill_min_tokens = 2048
+    s._finish_decode_defer_streak = 0
+    s.waiting = []
+    s.skipped_waiting = []
+
+    near_done = _running_request("d_near", prompt=1000, computed=1094)
+    near_done.max_tokens = 100
+    near_done.num_output_tokens = 94  # remaining = 6 <= 8
+    far_from_done = _running_request("d_far", prompt=1000, computed=1050)
+    far_from_done.max_tokens = 100
+    far_from_done.num_output_tokens = 50  # remaining = 50 > 8
+    s.running = [near_done, far_from_done]
+
+    cold = _running_request("cold", prompt=20_000, computed=0)
+    warm_small = _running_request("warm_small", prompt=2000, computed=1500)
+
+    # Small warm prefill (500 < 2048) is NOT deferred even when near_done is active:
+    assert s._cap_cold_prefill_tokens(warm_small, 1500, 500) == 500
+    assert s._finish_decode_defer_streak == 0
+
+    # Large prefill (4096 >= 2048) is deferred for up to max_deferral_steps (2) steps:
+    assert s._cap_cold_prefill_tokens(cold, 0, 4096) == 0
+    assert s._finish_decode_defer_streak == 1
+    assert s._cap_cold_prefill_tokens(cold, 0, 4096) == 0
+    assert s._finish_decode_defer_streak == 2
+
+    # On the 3rd consecutive attempt (streak == 2 == max_deferral_steps), starvation cap
+    # allows the prefill through and resets the streak to 0:
+    assert s._cap_cold_prefill_tokens(cold, 0, 4096) == 4096
+    assert s._finish_decode_defer_streak == 0
+
+    # When no decoder is within threshold, prefill is not deferred:
+    s.running = [far_from_done]
+    assert s._cap_cold_prefill_tokens(cold, 0, 4096) == 4096
+    assert s._finish_decode_defer_streak == 0
+
+
+def test_near_finish_decode_protection_in_schedule_loop(monkeypatch):
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s.block_size = 640
+    s.num_spec_tokens = 3
+    s._finish_decode_steps = 2
+    s._finish_decode_max_deferral_steps = 2
+    s._finish_decode_prefill_min_tokens = 2048
+    s._finish_decode_defer_streak = 0
+    s.waiting = []
+    s.skipped_waiting = []
+
+    near_done = _running_request("d_near", prompt=1000, computed=1095)
+    near_done.max_tokens = 100
+    near_done.num_output_tokens = 95  # remaining = 5 <= 8
+    cold = _running_request("cold", prompt=20_000, computed=0)
+    s.running = [near_done, cold]
+
+    scheduled_chunks = []
+
+    def fake_schedule(self, *args, **kwargs):
+        toks = self._cap_cold_prefill_tokens(cold, 0, 4096)
+        scheduled_chunks.append(toks)
+        return "out"
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", fake_schedule, raising=False)
+
+    # Step 1: deferred (streak becomes 1)
+    s.schedule()
+    assert scheduled_chunks[-1] == 0
+    assert s._finish_decode_defer_streak == 1
+
+    # Step 2: deferred (streak becomes 2)
+    s.schedule()
+    assert scheduled_chunks[-1] == 0
+    assert s._finish_decode_defer_streak == 2
+
+    # Step 3: starvation cap reached -> allowed through, streak resets to 0
+    s.schedule()
+    assert scheduled_chunks[-1] == 4096
+    assert s._finish_decode_defer_streak == 0
+
+
+

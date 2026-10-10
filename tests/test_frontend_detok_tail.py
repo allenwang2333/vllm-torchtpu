@@ -163,3 +163,83 @@ def test_kill_switch(monkeypatch):
     monkeypatch.setenv("QX_DETOK_PROMPT_TAIL", "0")
     monkeypatch.setattr(ff, "_DETOK_INSTALLED", False)
     assert ff.maybe_install_detok_prompt_tail() is False
+
+
+def test_ttft_stage_tracker_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("QX_TTFT_STAGE_LOG_PERIOD_S", raising=False)
+    monkeypatch.setattr(ff, "_TTFT_INSTALLED", False)
+    assert ff.maybe_install_ttft_stage_tracker() is False
+
+
+def test_ttft_stage_tracker_records_and_logs_summary():
+    ff._TTFTStageStats.log_period_s = 60.0
+    ff._TTFTStageStats.reset(now=100.0)
+
+    # First 3 samples before log period expires: no summary returned yet
+    assert ff._TTFTStageStats.record(1.0, 2.0, 0.5, True, now=110.0) is None
+    assert ff._TTFTStageStats.record(3.0, 4.0, 1.5, False, now=120.0) is None
+    assert ff._TTFTStageStats.record(5.0, 6.0, 2.5, True, now=159.0) is None
+    assert ff._TTFTStageStats.n == 3
+    assert ff._TTFTStageStats.tok_cache_hits == 2
+
+    # Sample at t=160.0 (>= 100.0 + 60.0) triggers summary log and resets window
+    summary = ff._TTFTStageStats.record(7.0, 8.0, 3.5, True, now=160.0)
+    assert summary is not None
+    assert summary.startswith("[QX_TTFT_STAGES] n=4 tok_cache_hit=3/75.0%")
+    assert "render_ms p50/p90=" in summary
+    assert "tokenize_ms p50/p90=" in summary
+    assert "ipc_ms p50/p90=" in summary
+    assert ff._TTFTStageStats.n == 0
+    assert ff._TTFTStageStats.tok_cache_hits == 0
+
+
+def test_ttft_stage_tracker_installs_and_tracks_pipeline(monkeypatch):
+    rbase = pytest.importorskip("vllm.renderers.base")
+    async_llm_mod = pytest.importorskip("vllm.v1.engine.async_llm")
+    import asyncio
+
+    orig_rc_async = rbase.BaseRenderer.render_chat_async
+    orig_rc = rbase.BaseRenderer.render_chat
+    orig_rcmpl_async = rbase.BaseRenderer.render_cmpl_async
+    orig_rcmpl = rbase.BaseRenderer.render_cmpl
+    orig_add_req = async_llm_mod.AsyncLLM.add_request
+
+    monkeypatch.setenv("QX_TTFT_STAGE_LOG_PERIOD_S", "60")
+    monkeypatch.setattr(ff, "_TTFT_INSTALLED", False)
+    try:
+        assert ff.maybe_install_ttft_stage_tracker() is True
+        assert getattr(
+            rbase.BaseRenderer.render_chat_async, "__qx_ttft_stages__", False
+        )
+        assert getattr(
+            async_llm_mod.AsyncLLM.add_request, "__qx_ttft_stages__", False
+        )
+
+        # Simulate put_pending from render stage followed by AsyncLLM.add_request
+        ff._TTFTStageStats.reset(now=1000.0)
+        fake_prompt = {"type": "tokens", "arrival_time": 1234.5}
+        ff._TTFTStageStats.put_pending(
+            fake_prompt,
+            t_tok_done=ff.time.perf_counter() - 0.002,
+            render_ms=1.25,
+            tokenize_ms=0.75,
+            tok_hit=True,
+        )
+
+        async def _fake_orig_add_request(self, request_id, prompt, params, *a, **kw):
+            return "collector"
+
+        async_llm_mod.AsyncLLM.add_request.__wrapped__ = _fake_orig_add_request
+        # Replace inner orig_add_request closure target via put_pending/pop_pending test:
+        popped = ff._TTFTStageStats.pop_pending(fake_prompt)
+        assert popped is not None
+        _, r_ms, t_ms, hit = popped
+        assert r_ms == 1.25 and t_ms == 0.75 and hit is True
+    finally:
+        rbase.BaseRenderer.render_chat_async = orig_rc_async
+        rbase.BaseRenderer.render_chat = orig_rc
+        rbase.BaseRenderer.render_cmpl_async = orig_rcmpl_async
+        rbase.BaseRenderer.render_cmpl = orig_rcmpl
+        async_llm_mod.AsyncLLM.add_request = orig_add_req
+        ff._TTFT_INSTALLED = False
+
