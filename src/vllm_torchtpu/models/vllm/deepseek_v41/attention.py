@@ -152,7 +152,7 @@ def _o_proj_wob_jax(
     *,
     head_dim: int,
 ) -> jax.Array:
-    if x.shape[1] == 16 and wo_b_s.ndim == 1:
+    if x.shape[1] == 16 and wo_b_s.ndim in (1, 4):
         return o_proj.fused_reverse_rope_wo_a_wo_b_projection(
             x,
             positions,
@@ -163,7 +163,7 @@ def _o_proj_wob_jax(
             wo_b_s,
             head_dim=head_dim,
         )
-    if not isinstance(x.shape[0], torch.SymInt) and x.shape[1] == 128 and wo_b_s.ndim == 4 and x.shape[0] <= 384:
+    if not isinstance(x.shape[0], torch.SymInt) and x.shape[1] in (64, 128) and wo_b_s.ndim in (1, 4):
         return o_proj.fused_reverse_rope_wo_a_wo_b_h128_projection(
             x,
             positions,
@@ -1115,7 +1115,7 @@ class VllmDeepseekV41MLAAttention(
             if (
                 _TP_ATTN
                 and "_tp_attn_wq_b_w" in self._buffers
-                and self._tp_attn_ready(tp_size, tp_size)
+                and self._tp_attn_ready(max(tp_size, ((_TP_ATTN_MIN_TOKENS + tp_size - 1) // tp_size) * tp_size), tp_size)
             ):
                 self.__dict__.pop("_tp_attn_op", None)
                 self.__dict__.pop("_tp_attn_op_u1", None)
@@ -1159,6 +1159,7 @@ class VllmDeepseekV41MLAAttention(
             and swa_tensor is not None
             and main_cache.data_ptr() == swa_tensor.data_ptr()
         )
+        self._two_caches_same_buffer = two_caches_same_buffer
         built_from_real_caches = swa_tensor is not None
 
         vllm_cfg = getattr(vllm_context, "vllm_config", None)
@@ -1320,7 +1321,7 @@ class VllmDeepseekV41MLAAttention(
         if (
             not members
             or members[0].indexer is None
-            or not all(m._tp_attn_ready(tp_size, tp_size) for m in members)
+            or not all(m._tp_attn_ready(max(tp_size, ((_TP_ATTN_MIN_TOKENS + tp_size - 1) // tp_size) * tp_size), tp_size) for m in members)
         ):
             return None
         indexer = members[0].indexer
@@ -1366,6 +1367,7 @@ class VllmDeepseekV41MLAAttention(
             and main_cache is not None
             and main_cache.data_ptr() == swa_tensor.data_ptr()
         )
+        self._two_caches_same_buffer = two_caches_same_buffer
         logical_page_size = VllmDeepseekV4SWACache._swa_block_size(
             vllm_cfg.cache_config.block_size, self.window_size
         )
@@ -2295,7 +2297,7 @@ class VllmDeepseekV41MLAAttention(
         dummy_main = self._get_dummy_main_cache(kv.device)
         if is_csa and main_meta is not None:
             main_cache_kv = self._as_kernel_cache_view(_live_cache(nope_entry))
-            if main_cache_kv is None:
+            if main_cache_kv is None or getattr(self, "_two_caches_same_buffer", False):
                 main_cache_kv = dummy_main
             m_lens, main_tables, main_q_loc, main_dist = _unpack_meta(main_meta)
             main_kv_lens = (
@@ -2449,13 +2451,13 @@ class VllmDeepseekV41MLAAttention(
 
         if (
             ws_wo_b is not None
-            and ws_wo_b.ndim == 1
+            and ws_wo_b.ndim in (1, 4)
             and self.wo_b._parameters.get("bias") is None
-            and self.n_local_heads == 16
+            and self.n_local_heads in (16, 64, 128)
         ):
             w_wo_b_in = (
                 w_wo_b.transpose(0, 1)
-                if getattr(self.wo_b, KEEP_VLLM_LAYOUT_ATTR, False)
+                if w_wo_b.shape[0] == self.hidden_size
                 else w_wo_b
             )
             out_wob = self.o_proj_wob_op(
