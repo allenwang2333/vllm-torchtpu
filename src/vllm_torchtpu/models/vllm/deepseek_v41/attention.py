@@ -1102,7 +1102,7 @@ class VllmDeepseekV41MLAAttention(
                 if _main_c is not None and _main_c.shape[0] > 0:
                     _tot_rows = int(_main_c.shape[0] * _main_c.shape[1])
                     _tk = int(getattr(self, "topk", 512))
-                    for _bq in {8, _CSA_UNION_BQ}:
+                    for _bq in {6, 8, _CSA_UNION_BQ}:
                         if _bq > 0:
                             for _mult in (2, 3):
                                 _mu = (

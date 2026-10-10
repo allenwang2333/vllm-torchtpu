@@ -7,6 +7,14 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+try:
+    import torch
+    from torch_tpu._internal import pallas as _pallas_mod
+
+    _pallas_mod.jax_op = torch._dynamo.disable(_pallas_mod.jax_op)
+except Exception:
+    pass
+
 
 def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
     """Backport hybrid KV cache load failure recovery from vLLM #50388.

@@ -32,27 +32,18 @@ def _get_tp_rank_tensor(tp_rank: int, device: torch.device) -> torch.Tensor:
 
 def tp_shard_slice(
     x: torch.Tensor,
-    tp_size: int | None = None,
-    tp_rank: int | None = None,
+    tp_size: int,
+    tp_rank: int,
     tp_rank_idx: torch.Tensor | None = None,
-    *,
-    dim: int = 0,
 ) -> torch.Tensor:
-    if tp_size is None:
-        tp_size = get_tp_group().world_size
-    if tp_rank is None:
-        tp_rank = get_tp_group().rank_in_group
     if (
         tp_rank_idx is None
         or tp_rank_idx.device != x.device
         or not torch.compiler.is_compiling()
     ):
         tp_rank_idx = _get_tp_rank_tensor(tp_rank, x.device)
-    if dim != 0:
-        x = x.movedim(dim, 0)
     shape_tail = tuple(x.size(i) for i in range(1, x.ndim))
-    out = x.reshape(tp_size, -1, *shape_tail).index_select(0, tp_rank_idx).squeeze(0)
-    return out.movedim(0, dim) if dim != 0 else out
+    return x.reshape(tp_size, -1, *shape_tail).index_select(0, tp_rank_idx).squeeze(0)
 
 
 

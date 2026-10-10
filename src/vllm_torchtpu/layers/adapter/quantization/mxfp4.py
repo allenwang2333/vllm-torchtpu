@@ -45,6 +45,7 @@ scaling.
    - Returns output tensor
 """
 
+import os
 from typing import Any
 
 import jax.numpy as jnp
@@ -438,6 +439,9 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 (experts, inter // block, 1, hidden), dtype=torch.float32, device="meta"
             ),
         )
+        _use_all39_ep_v2 = (
+            os.environ.get("VLLM_DSV41_MOE_EP_V2_ALL39", "1") == "1"
+        )
         return prebuild_fused_moe_ep(
             layer,
             topk=layer.moe_config.experts_per_token,
@@ -447,6 +451,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             rhs_qb=block,
             weights=weights,
             supplies_hash_ids=True,
+            precomputed_routing=_use_all39_ep_v2,
         )
 
     def _resolve_tpu_activation(self, layer) -> str:

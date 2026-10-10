@@ -39,8 +39,10 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import 
     prepare_q_inputs,
 )
 from vllm_torchtpu.kernels.deepseek_v41.sparsecore_topk import (
+    sc_build_cand_page_table,
     sc_cand_gather_topk,
     sc_cand_pregathered_topk,
+    sc_gather_cand_kv_blocks,
     sc_write_cand_and_topk,
     sparsecore_topk,
 )
@@ -928,10 +930,30 @@ def streamindex_topk(
             0,
         )
 
-    if candidates is not None and not produce_blk and max_num_tokens >= 32:
-        bkv_p = max(1, min(bkv_p, 4))
-        num_sublanes_total = align_to(pages_per_seq, bkv_p) * page_size // 128
-        num_blk_sublanes_total = num_sublanes_total // 8
+    cand_rank_map = None
+    cand_p_pad = 0
+    blk_per_page = page_size // 8
+    if candidates is not None and not produce_blk and pages_per_seq > 160:
+        page_indices, cand_rank_map, n_active_pages, cand_p_pad = (
+            sc_build_cand_page_table(
+                candidates,
+                page_indices,
+                cu_q_lens,
+                num_seqs_all,
+                max_num_seqs=max_num_seqs,
+                pages_per_seq=pages_per_seq,
+                blk_per_page=blk_per_page,
+            )
+        )
+        seq_q_lens = cu_q_lens[1 : max_num_seqs + 1] - cu_q_lens[:max_num_seqs]
+        seq_lens = jnp.where(
+            jnp.arange(max_num_seqs, dtype=jnp.int32) < num_seqs_all,
+            n_active_pages * page_size * compression_ratio
+            + jnp.maximum(seq_q_lens - 1, 0) * compression_ratio,
+            0,
+        )
+        precomputed_pass_num_steps = None
+        precomputed_pass_schedules = None
 
     group_base = reserve_scheduling_group_ids(num_chunks - 1) if num_chunks > 1 else 0
     chunk_starts = (
@@ -1133,6 +1155,11 @@ def streamindex_topk(
                 rl_m,
                 k=k,
                 scheduling_group_id=sc_group,
+                rank_map=cand_rank_map,
+                seq_ids=seq_ids_all[start : start + chunk_len],
+                p_pad=cand_p_pad,
+                blk_per_page=blk_per_page,
+                page_size=page_size,
             )
         else:
             chunk_topk_idxs = sparsecore_topk(
