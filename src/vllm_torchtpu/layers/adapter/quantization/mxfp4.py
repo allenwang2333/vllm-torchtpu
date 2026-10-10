@@ -621,7 +621,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 qw_cpu_list.append(qw.view(torch.uint8).cpu())
                 qs_cpu_list.append(qs.cpu())
                 del w_sub, qw, qs
-                gc.collect()
             qw_cat = (
                 torch.cat(qw_cpu_list, dim=0)
                 .view(out_dtype)
