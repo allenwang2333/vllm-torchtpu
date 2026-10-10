@@ -59,7 +59,7 @@ def _need(cond: bool, why: str) -> None:
 
 
 def enabled() -> bool:
-    return os.environ.get("GLM5_MKD", "0") == "1"
+    return os.environ.get("GLM5_MKD", "1") == "1"      # -on image: megakernel by default (served recipes have no env hook)
 
 
 def _unwrap(x):
@@ -175,7 +175,7 @@ class Glm5MKD:
             idx_freq=hf.index_topk_freq, idx_skip=hf.index_skip_topk_offset,
             rope_theta=float(rp.get("rope_theta", FULL.rope_theta)), eps=hf.rms_norm_eps,
             routed_scale=float(hf.routed_scaling_factor), QMAX=qmax,
-            RPR=int(os.environ.get("GLM5_MKD_RPR", "1")))
+            RPR=int(os.environ.get("GLM5_MKD_RPR", "2")))   # -on2 image: TMAX 32 = max-num-seqs 8 x MTP 4
         # GLM5_MKD_RPR: rows per rank -> TMAX = R * RPR rows a step (MTP 3: conc 4 / 8 / 16 at RPR 1 / 2 / 4).
         # VMEM fit per RPR at R=16, L=78 (AOT): ring banks 11 / 9 / 4, chunked key AG at RPR 4.
         _need(cfg.RPR in (1, 2, 4), f"GLM5_MKD_RPR={cfg.RPR}")
