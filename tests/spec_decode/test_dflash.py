@@ -1273,3 +1273,111 @@ def test_tpu_precompute_and_forward_sample_remaining_branches(device):
     )
     assert tokens.shape == (2, 3)
     assert hidden_out.shape == (8, 8)
+
+
+def test_prepare_dflash_inputs_no_num_reqs_specialization_and_slice_bounds(device):
+    proposer = _make_proposer(draft_tp=8, target_tp=8)
+    proposer.speculative_config.num_speculative_tokens = 5
+    proposer._query_block_size = lambda K: K
+    proposer.runner = SimpleNamespace(
+        device=device,
+        num_tokens_paddings=[384, 768, 1152, 4096],
+        max_num_reqs=192,
+        _dp_lockstep_enabled=lambda: False,
+    )
+    assert proposer._draft_tokens_paddings() == [320, 384, 640, 768, 960, 1152, 4096]
+
+    # Exercise device_seed < padded_num_reqs (F.pad) and >= padded_num_reqs (slice)
+    qsl_pad8 = np.array([0, 2, 4, 4, 4, 4, 4, 4, 4], dtype=np.int32)
+    pos_buf = torch.arange(100, 100 + 384, dtype=torch.int32, device=device)
+    chunk_seed_small = _make_chunk(
+        num_reqs=2,
+        start_index=0,
+        device=device,
+        query_start_loc_np=qsl_pad8,
+        position_ids=pos_buf,
+    )
+    ids_seed_pad, pos_seed_pad, sl_seed_pad = proposer._prepare_dflash_inputs(
+        chunk_seed_small,
+        device_seed=torch.tensor([11, 22], dtype=torch.int32, device=device),
+    )
+    assert ids_seed_pad.shape == (320,)
+    assert ids_seed_pad[0].item() == 11 and ids_seed_pad[5].item() == 22
+    assert pos_seed_pad[:10].tolist() == [
+        102,
+        103,
+        104,
+        105,
+        106,
+        104,
+        105,
+        106,
+        107,
+        108,
+    ]
+    assert sl_seed_pad[:3].tolist() == [107, 109, 5]
+
+    ids_seed_slice, _, _ = proposer._prepare_dflash_inputs(
+        chunk_seed_small,
+        device_seed=torch.arange(128, dtype=torch.int32, device=device),
+    )
+    assert ids_seed_slice.shape == (320,)
+
+    # Target compile bucket 384 with block_size=5 gives padded_num_reqs=76 while
+    # target padded_num_reqs=128; verify clean slicing without negative F.pad and
+    # zero per-num_reqs Dynamo recompilations across num_reqs=65..76.
+    torch._dynamo.reset()
+    compile_calls = {"next_tokens": 0, "seed": 0}
+
+    def counting_next_tokens_backend(gm, _example_inputs):
+        compile_calls["next_tokens"] += 1
+        return gm.forward
+
+    def counting_seed_backend(gm, _example_inputs):
+        compile_calls["seed"] += 1
+        return gm.forward
+
+    raw_nt = DFlashProposer._tpu_build_dflash_inputs_next_tokens.__wrapped__
+    raw_sd = DFlashProposer._tpu_build_dflash_inputs_seed.__wrapped__
+    proposer._tpu_build_dflash_inputs_next_tokens = torch.compile(
+        raw_nt.__get__(proposer, DFlashProposer),
+        backend=counting_next_tokens_backend,
+        fullgraph=True,
+        dynamic=False,
+    )
+    proposer._tpu_build_dflash_inputs_seed = torch.compile(
+        raw_sd.__get__(proposer, DFlashProposer),
+        backend=counting_seed_backend,
+        fullgraph=True,
+        dynamic=False,
+    )
+
+    for n_reqs in (65, 70, 76):
+        qsl = np.zeros(129, dtype=np.int32)
+        qsl[1 : n_reqs + 1] = np.arange(1, n_reqs + 1, dtype=np.int32) * 2
+        qsl[n_reqs + 1 :] = qsl[n_reqs]
+        chunk_n = _make_chunk(
+            num_reqs=n_reqs,
+            start_index=0,
+            device=device,
+            query_start_loc_np=qsl,
+            position_ids=pos_buf,
+        )
+        next_tokens_128 = torch.full((128, 6), -1, dtype=torch.int32, device=device)
+        next_tokens_128[:n_reqs, 0] = 500
+        ids_n, pos_n, sl_n = proposer._prepare_dflash_inputs(
+            chunk_n, next_tokens_device=next_tokens_128
+        )
+        assert ids_n.shape == (384,)
+        assert pos_n.shape == (384,)
+        assert sl_n.shape == (76,)
+        # Live rows have seq_len > block_size; padded rows clamp to block_size=5
+        assert int((sl_n > 5).sum().item()) == n_reqs
+
+        seed_128 = torch.ones(128, dtype=torch.int32, device=device) * 7
+        ids_s, _, sl_s = proposer._prepare_dflash_inputs(chunk_n, device_seed=seed_128)
+        assert ids_s.shape == (384,)
+        assert int((sl_s > 5).sum().item()) == n_reqs
+
+    assert compile_calls["next_tokens"] == 1
+    assert compile_calls["seed"] == 1
