@@ -810,6 +810,95 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             np.array_equal(np.asarray(bad_lse)[row], np.asarray(ref_lse)[row])
         )
 
+    @parameterized.product(
+        seq_q=((4,) * 5, (4,) * 7, (4,) * 8, (4, 4, 4, 4, 13)),
+        topk_cap=(512, None),
+    )
+    def test_decode_bucket_32_small_chunk_matches_large_chunk(self, seq_q, topk_cap):
+        """The 32-token MTP decode bucket on the small-chunk path.
+
+        TPU_DCP_MLA_SMALL_CHUNK_TOKENS=32 (`small_chunk_tokens=32`) moves the
+        bucket of 5-8 decode requests x 4 tokens from the large-chunk path
+        (bz 16, full-atom gather) onto the decode path (bz =
+        small_chunk_batch_size, one-atom live-bounded gather). Production
+        arguments (DCP split q / lane-dense lse, capped windows, chunk 256,
+        small_chunk_batch_size 4). Every real row must match the incumbent
+        (`small_chunk_tokens=16`) and the DCP empty-row contract must hold.
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        query_tokens = 32
+        rng = np.random.default_rng(20261010)
+        problem, topk_idx, owns, counts, page_table, cu_q_lens, distribution = (
+            self._split_q_lse_case(query_tokens, seq_q, rng)
+        )
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+        real_tokens = int(sum(seq_q))
+
+        def run(topk_in, small_chunk_tokens):
+            out, lse = sparse_mla.sparse_ragged_paged_attention(
+                q_nope,
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_in,
+                page_table,
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                topk_cap=topk_cap,
+                q_pe=q_pe,
+                lse_lane_dense=True,
+                small_chunk_tokens=small_chunk_tokens,
+                small_chunk_batch_size=4,
+            )
+            lse = jnp.where(owns[:, None], lse, -jnp.inf)
+            return out[..., :NOPE_DIM], lse
+
+        # The bucket takes the bz-4 kernel at 32 and the bz-16 one at 16.
+        small_jaxpr = str(jax.make_jaxpr(lambda: run(topk_idx, 32))())
+        large_jaxpr = str(jax.make_jaxpr(lambda: run(topk_idx, 16))())
+        self.assertIn("-bz_4-", small_jaxpr)
+        self.assertNotIn("-bz_16-", small_jaxpr)
+        self.assertIn("-bz_16-", large_jaxpr)
+
+        (ref, ref_lse), (out, lse) = jax.block_until_ready(
+            (run(topk_idx, 16), run(topk_idx, 32))
+        )
+        real_out = np.asarray(out, np.float32)[:real_tokens]
+        np.testing.assert_allclose(
+            real_out,
+            np.asarray(ref, np.float32)[:real_tokens],
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        np.testing.assert_allclose(
+            np.asarray(lse)[:real_tokens],
+            np.asarray(ref_lse)[:real_tokens],
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        empty = ~np.asarray(owns)[:real_tokens]
+        self.assertTrue(empty.any())
+        self.assertTrue(np.all(np.asarray(lse)[:real_tokens][empty] == -np.inf))
+        self.assertTrue(np.isfinite(real_out[empty]).all())
+        # Positive controls: the output is attention, not the aliased q_nope ...
+        self.assertGreater(
+            np.abs(real_out - np.asarray(q_nope, np.float32)[:real_tokens]).max(),
+            2e-2,
+        )
+        # ... and one moved live entry of an overflow row moves that row.
+        row = int(np.argmax(counts[:real_tokens]))
+        moved = topk_idx.at[row, 0].set((topk_idx[row, 0] + 1) % 8192)
+        _, bad_lse = jax.block_until_ready(run(moved, 32))
+        self.assertGreater(
+            np.abs(np.asarray(bad_lse)[row] - np.asarray(ref_lse)[row]).max(), 1e-4
+        )
+
     @parameterized.parameters((16, (4, 4)), (512, (4, 4, 492)))
     def test_split_q_lse_bit_identical_tensorcore(self, query_tokens, seq_q):
         """The same flag on the TensorCore cache layout (dsa_gather path)."""
