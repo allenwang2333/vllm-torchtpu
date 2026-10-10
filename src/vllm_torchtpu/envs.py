@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 1
+    TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 16
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -443,6 +444,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # grids `cdiv(real tokens, step)` steps, so up to N-1 padding rows are
     # attended (outputs don't-care). 1 = the kernel default (unchanged).
     "TPU_DCP_MLA_SMALL_CHUNK_BATCH": env_int("TPU_DCP_MLA_SMALL_CHUNK_BATCH", 1),
+    # DCP sparse MLA: chunks of at most this many query tokens take the
+    # decode-sized (small-chunk) path -- TPU_DCP_MLA_SMALL_CHUNK_BATCH tokens
+    # per grid step and the one-atom live-bounded SparseCore gather
+    # (`sparse_ragged_paged_attention(small_chunk_tokens=...)`). 16 = the
+    # kernel default (unchanged); 32 also puts the 32-token MTP decode bucket
+    # (5-8 running requests x 4 tokens) on that path. 0 disables it.
+    "TPU_DCP_MLA_SMALL_CHUNK_TOKENS": env_int("TPU_DCP_MLA_SMALL_CHUNK_TOKENS", 16),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per

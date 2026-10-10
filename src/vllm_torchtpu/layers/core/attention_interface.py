@@ -1184,6 +1184,11 @@ def sparse_mla_attention_dcp(
             raise ValueError(
                 f"TPU_DCP_MLA_SMALL_CHUNK_BATCH must be >= 1, got {small_chunk_batch}"
             )
+        small_chunk_tokens = envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS
+        if small_chunk_tokens < 0:
+            raise ValueError(
+                f"TPU_DCP_MLA_SMALL_CHUNK_TOKENS must be >= 0, got {small_chunk_tokens}"
+            )
         output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -1202,6 +1207,9 @@ def sparse_mla_attention_dcp(
             topk_cap=topk_cap,
             # Decode chunks: tokens per grid step (1 = kernel default).
             small_chunk_batch_size=small_chunk_batch,
+            # Largest chunk (tokens) that takes the small-chunk path (16 =
+            # kernel default).
+            small_chunk_tokens=small_chunk_tokens,
             **chunk_kwargs,
             **split_kwargs,
         )
