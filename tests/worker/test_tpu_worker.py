@@ -30,6 +30,8 @@ from vllm_torchtpu.worker.tpu_worker import TPUWorker, _configure_tpu_process_en
 
 
 def test_configure_tpu_process_env_sets_world_size_only_for_multiple_ranks(monkeypatch):
+    for key in ("RANK", "LOCAL_RANK", "LOCAL_WORLD_SIZE"):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("WORLD_SIZE", "8")
 
     _configure_tpu_process_env(rank=0, local_rank=0, world_size=1, local_world_size=1)

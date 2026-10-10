@@ -43,7 +43,17 @@ def _sample_upstream_fn(x: int, y: int = 2, *, z: int = 3) -> int:
     return _sample_helper(x) * y + z
 
 
-def test_upstream_bindings_device_hooks_and_bind_device_ops() -> None:
+def test_upstream_bindings_device_hooks_and_bind_device_ops(monkeypatch) -> None:
+    import vllm_torchtpu.layers as layers_mod
+
+    called: list[str] = []
+    monkeypatch.setattr(layers_mod, "register_models", lambda: called.append("models"))
+    monkeypatch.setattr(
+        layers_mod, "register_tokenizers", lambda: called.append("tokenizers")
+    )
+    layers_mod.register_layers()
+    assert called == ["models", "tokenizers"]
+
     target = SimpleNamespace(op_a=10, op_b=20)
 
     # Empty replacements (0 loop iterations)

@@ -6,36 +6,40 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-import vllm.distributed as distributed_mod
-from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
-from vllm.model_executor import parameter as parameter_mod
-from vllm.model_executor.layers import linear as linear_mod
-from vllm.model_executor.layers.mamba.gdn import base as gdn_base
-from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-    QwenGatedDeltaNetAttention,
-)
-from vllm.model_executor.model_loader import weight_utils
-from vllm.platforms import current_platform
-
-from vllm_torchtpu.layers.adapter.custom_ops import gdn_attention_op
-from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
-    VllmGatedDeltaNetAttention,
-)
-from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
-from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-    set_vllm_model_wrapper_context,
-)
 
 
 @pytest.fixture(autouse=True)
 def _empty_shared_gdn_ops(monkeypatch):
     """Keep an op built from one test's mocks out of every other test."""
+    from vllm_torchtpu.layers.adapter.custom_ops import gdn_attention_op
+
     monkeypatch.setattr(gdn_attention_op, "_shared_gdn_ops", {})
 
 
 @pytest.fixture
 def make_gdn_attention(monkeypatch):
     """Keep construction/loading real while avoiding accelerator ownership."""
+    import vllm.distributed as distributed_mod
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.model_executor import parameter as parameter_mod
+    from vllm.model_executor.layers import linear as linear_mod
+    from vllm.model_executor.layers.mamba.gdn import base as gdn_base
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+    )
+    from vllm.model_executor.layers.quantization import fp8
+    from vllm.model_executor.model_loader import weight_utils
+    from vllm.platforms import current_platform
+
+    from vllm_torchtpu.layers.adapter.custom_ops import gdn_attention_op
+    from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
+        VllmGatedDeltaNetAttention,
+    )
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
     monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
     monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "SD")
     monkeypatch.setattr(current_platform, "current_device", lambda: torch.device("cpu"))
@@ -44,8 +48,6 @@ def make_gdn_attention(monkeypatch):
     # TPU's FP8 method changes this module-level kernel factory in __init__.
     # Restore it at teardown so the test does not leak that production side
     # effect into other test modules.
-    from vllm.model_executor.layers.quantization import fp8
-
     monkeypatch.setattr(fp8, "init_fp8_linear_kernel", fp8.init_fp8_linear_kernel)
 
     def make(

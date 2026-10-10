@@ -8,9 +8,12 @@ from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
     VllmCompressedTensorsW4ANMxfp4MoEMethod,
 )
+from vllm_torchtpu.tpu_info import get_num_chips
 
 
 def _has_tpu_device() -> bool:
+    if get_num_chips() == 0:
+        return False
     try:
         torch.empty(0, device="tpu")
         return True

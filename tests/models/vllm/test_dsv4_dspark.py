@@ -133,6 +133,8 @@ def _tiny_vllm_config():
 def dist_ctx():
     import torch.distributed as dist
     from vllm.distributed import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
         ensure_model_parallel_initialized,
         init_distributed_environment,
     )
@@ -151,7 +153,11 @@ def dist_ctx():
     # GroupCoordinator construction consults the current vLLM config.
     with set_current_vllm_config(VllmConfig()):
         ensure_model_parallel_initialized(1, 1)
-    yield
+    try:
+        yield
+    finally:
+        destroy_model_parallel()
+        destroy_distributed_environment()
 
 
 def _use_cpu_platform(monkeypatch, request):

@@ -30,9 +30,6 @@ import pytest
 import torch
 import torch.nn as nn
 
-# Ensure CPU execution for all tests
-os.environ["MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE"] = "1"
-
 from vllm_torchtpu.kernels.fused_moe.v2 import (
     AXIS,
     WeightFormat,
@@ -112,6 +109,12 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
     install_host_engram_inputs,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import DeepseekV41Model
+
+
+@pytest.fixture(autouse=True)
+def _set_moe_height_rungs_override(monkeypatch):
+    monkeypatch.setenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "1")
+
 
 # ==============================================================================
 # Helper Mock Objects

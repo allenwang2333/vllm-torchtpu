@@ -95,17 +95,29 @@ def _drop_pinned_lazy_envs():
     session. Drop any knob attribute that did not exist before the test
     (this fixture is set up before `monkeypatch`, so it tears down after).
     """
+    import sys
+
     import vllm_torchtpu.envs as tpu_envs
 
     before_env = dict(os.environ)
     namespace = vars(tpu_envs)
     before = {name for name in tpu_envs.environment_variables if name in namespace}
+    vllm_platforms = sys.modules.get("vllm.platforms")
+    cur_plat = getattr(vllm_platforms, "_current_platform", None)
+    before_plat = set(vars(cur_plat)) if cur_plat is not None else set()
     yield
     os.environ.clear()
     os.environ.update(before_env)
     for name in tpu_envs.environment_variables:
         if name in namespace and name not in before:
             del namespace[name]
+    vllm_platforms = sys.modules.get("vllm.platforms")
+    cur_plat = getattr(vllm_platforms, "_current_platform", None)
+    if cur_plat is not None:
+        plat_ns = vars(cur_plat)
+        for name in list(plat_ns):
+            if name not in before_plat:
+                del plat_ns[name]
 
 
 @pytest.fixture
