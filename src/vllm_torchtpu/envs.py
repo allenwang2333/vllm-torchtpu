@@ -111,6 +111,8 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 16
     TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = False
+    TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED: bool = False
+    TPU_SC_TOPK_ROW_CAP: bool = False
     TPU_INDEXER_TOPK_SHARED_READ: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
@@ -902,6 +904,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_SKIP_EMPTY_DECODE": env_bool(
         "TPU_STREAMIDX_SKIP_EMPTY_DECODE", default=False
     ),
+    # Chunked StreamIndex top-k: drop the two DECODE (q_len 1) passes from
+    # every chunk that starts at or past `max_num_seqs` tokens (decode rows sit
+    # first on the token axis, one token each, so those chunks hold none), and
+    # branch around them in chunk 0 when the batch has no q_len-1 sequence.
+    # Exact.
+    "TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED": env_bool(
+        "TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED", default=False
+    ),
+    # SparseCore top-k over 32+ rows of a 32K..64K-word bucket: one row per
+    # subcore (P=1, all 32 busy) instead of P=2, reading each row only up to
+    # its length. Bitwise identical output.
+    "TPU_SC_TOPK_ROW_CAP": env_bool("TPU_SC_TOPK_ROW_CAP", default=False),
     # The indexed layer's own attention reads its rows back from the updated
     # shared table, the same `table[:num_tokens]` expression the following
     # skip_topk layers read, instead of the fresh rows. One expression lets XLA
