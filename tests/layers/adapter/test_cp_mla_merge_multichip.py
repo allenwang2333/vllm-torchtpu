@@ -16,6 +16,10 @@ threaded stand-in for the exchange; this pins what only hardware can answer:
      merge to within one bf16 ulp, including `-inf` rows and a rank that owns
      nothing -- and the same check fails when the send blocks are rotated by
      one rank (the positive control).
+  3. The token-chunked reduce-scatter merge (`TPU_DCP_MERGE_CHUNKED`) changes
+     no per-row arithmetic: it is reported bit for bit against the unchunked
+     merge compiled the same way, must be no less exact, and the same check
+     fails when every chunk is weighted with its neighbour row's lse.
 
 Run on one host (4 chips x 2 cores = 8 ranks). `--bench` adds a per-merge
 timing of every path at decode and mixed-step token counts.
@@ -41,11 +45,20 @@ VDIM = 512
 CHECK_TOKENS = 64
 LAUNCH_TIMEOUT_SECONDS = 900
 
-# name -> TPU_DCP_LSE_MERGE_A2A
-ARMS = {
-    "today": False,
-    "a2a": True,
+_ARM_DEFAULTS = {
+    "TPU_DCP_LSE_MERGE_A2A": False,
+    "TPU_DCP_MERGE_CHUNKED": 0,
 }
+# name -> the env overrides of `_ARM_DEFAULTS` that make the arm.
+ARMS = {
+    "today": {},
+    "a2a": {"TPU_DCP_LSE_MERGE_A2A": True},
+    "chunk2": {"TPU_DCP_MERGE_CHUNKED": 2},
+    "chunk4": {"TPU_DCP_MERGE_CHUNKED": 4},
+    "chunk8": {"TPU_DCP_MERGE_CHUNKED": 8},
+}
+# Arms that must return today's merge: same per-row arithmetic, other schedule.
+CHUNK_ARMS = ("chunk2", "chunk4", "chunk8")
 
 
 def _worker_command(result_dir: Path, extra: list[str]) -> list[str]:
@@ -177,8 +190,10 @@ MERGE_VARIANTS = {"a2a_reduce_sum": _merge_reduce_sum, "a2a_unrolled": _merge_un
 
 
 def _set_arm(cp_mla, arm):
-    cp_mla.envs.TPU_DCP_LSE_MERGE_A2A = ARMS[arm]
+    for name, value in {**_ARM_DEFAULTS, **ARMS[arm]}.items():
+        setattr(cp_mla.envs, name, value)
     cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS = 1 << 30
+    cp_mla.envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS = 0
 
 
 def _compile(fn):
@@ -201,7 +216,8 @@ def _check(rank, world, group, cp_mla):
     l_dev = lses[rank].to("tpu")
     merge = cp_mla.merge_lse_partials_scatter_heads
     report = {}
-    for arm in ARMS:
+    got_today = {}
+    for arm in ARMS:  # "today" first
         _set_arm(cp_mla, arm)
         for how in ("eager", "compiled"):
             try:
@@ -212,6 +228,13 @@ def _check(rank, world, group, cp_mla):
                     "dtype": str(got.dtype),
                     **_error_stats(got, ref),
                 }
+                if arm == "today":
+                    got_today[how] = got
+                elif how in got_today and got.shape == got_today[how].shape:
+                    same = got.view(torch.int16) == got_today[how].view(torch.int16)
+                    report[f"{arm}/{how}"]["frac_bitwise_vs_today"] = float(
+                        same.float().mean()
+                    )
             except Exception as exc:  # noqa: BLE001 - reported to the parent
                 traceback.print_exc()
                 report[f"{arm}/{how}"] = {"error": repr(exc)[:400]}
@@ -258,6 +281,23 @@ def _check(rank, world, group, cp_mla):
                     report[f"control_rotated/{arm}/{how}"] = {"error": repr(exc)[:400]}
     finally:
         cp_mla._all_to_all = real
+
+    # Positive control for the chunked merge: every chunk weighted with its
+    # neighbour row's lse. The same check must now fail.
+    real_rs = cp_mla.cp_lse_ag_out_rs
+    cp_mla.cp_lse_ag_out_rs = lambda o, lse, g: real_rs(o, torch.roll(lse, 1, 0), g)
+    try:
+        _set_arm(cp_mla, "chunk4")
+        for how in ("eager", "compiled"):
+            try:
+                fn = merge if how == "eager" else _compile(merge)
+                got = fn(o_dev, l_dev).cpu()
+                report[f"control_misaligned/chunk4/{how}"] = _error_stats(got, ref)
+            except Exception as exc:  # noqa: BLE001 - reported to the parent
+                traceback.print_exc()
+                report[f"control_misaligned/chunk4/{how}"] = {"error": repr(exc)[:400]}
+    finally:
+        cp_mla.cp_lse_ag_out_rs = real_rs
     return report
 
 
@@ -285,7 +325,10 @@ def _bench(rank, cp_mla, tokens_list, reps=10):
         o = torch.randn(tokens, HEADS, VDIM).to(torch.bfloat16).to("tpu")
         lse = (torch.randn(tokens, HEADS) * 3).to("tpu")
         real_merge = cp_mla._merge_received
-        for arm in ("today", "a2a", *MERGE_VARIANTS):
+        arms = ("today", "a2a", *MERGE_VARIANTS)
+        if tokens > 256:
+            arms = ("today", *CHUNK_ARMS)
+        for arm in arms:
             _set_arm(cp_mla, "a2a" if arm in MERGE_VARIANTS else arm)
             cp_mla._merge_received = MERGE_VARIANTS.get(arm, real_merge)
             try:
@@ -428,6 +471,25 @@ def assert_merge_results(results: list[dict]) -> None:
                 a2a["frac_over_1ulp"] <= today["frac_over_1ulp"]
                 and a2a["max_abs_err"] <= today["max_abs_err"]
             ), (r["rank"], how, today, a2a)
+        for arm in CHUNK_ARMS:
+            for how in ("eager", "compiled"):
+                today, split = check[f"today/{how}"], check[f"{arm}/{how}"]
+                assert "error" not in split, (r["rank"], arm, how, split)
+                assert split["dtype"] == "torch.bfloat16", (r["rank"], arm, how)
+                # Same per-row arithmetic: no less exact than today's merge.
+                assert split["within_1ulp"] or (
+                    split["frac_over_1ulp"] <= today["frac_over_1ulp"]
+                    and split["max_abs_err"] <= today["max_abs_err"]
+                ), (r["rank"], arm, how, today, split)
+        for how in ("eager", "compiled"):
+            c = check[f"control_misaligned/chunk4/{how}"]
+            assert "error" not in c, (r["rank"], how, c)
+            assert not c["within_1ulp"], (
+                "positive control: misaligned chunk lse must fail the check",
+                r["rank"],
+                how,
+                c,
+            )
         for arm in ("a2a",):
             for how in ("eager", "compiled"):
                 c = check[f"control_rotated/{arm}/{how}"]

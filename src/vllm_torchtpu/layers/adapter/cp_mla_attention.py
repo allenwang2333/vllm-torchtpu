@@ -95,7 +95,10 @@ def merge_lse_partials_scatter_heads(
 
     With TPU_DCP_LSE_MERGE_A2A set, the backbone's steps of at most
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS tokens instead take
-    `merge_lse_partials_all_to_all`, which gives the same result.
+    `merge_lse_partials_all_to_all`, which gives the same result. With
+    TPU_DCP_MERGE_CHUNKED=n, the backbone's steps of at least
+    TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens run the reduce-scatter merge as n
+    token chunks (`_merge_chunked`), which gives the same per-row result.
 
     Args:
       output: `[num_tokens, tp_local_num_heads * dcp_size, kv_lora_rank]`,
@@ -106,8 +109,9 @@ def merge_lse_partials_scatter_heads(
         `kv_len >= 1`) and its output must not be weighted in.
       is_backbone: True if the caller is the backbone, the only model that is
         traced separately per token bucket. Only then may the merge compare
-        the token count to TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS, since that
-        comparison is fixed at trace time. Pass False from the MTP drafter,
+        the token count to TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS (or
+        TPU_DCP_MERGE_CHUNKED_MIN_TOKENS), since that comparison is fixed at
+        trace time. Pass False from the MTP drafter,
         which is traced once for every bucket: it always takes the
         reduce-scatter, exactly as with TPU_DCP_LSE_MERGE_A2A unset.
 
@@ -133,7 +137,51 @@ def merge_lse_partials_scatter_heads(
     ):
         return merge_lse_partials_all_to_all(output, lse, group)
 
+    # Same trace-time rule as above: only the backbone may split by size.
+    chunks = _merge_chunks(output.shape[0]) if is_backbone else 1
+    if chunks > 1:
+        return _merge_chunked(output, lse, group, chunks)
     return cp_lse_ag_out_rs(output, lse, group)
+
+
+def _merge_chunks(num_tokens: int) -> int:
+    """How many token chunks `TPU_DCP_MERGE_CHUNKED` splits this bucket's
+    merge into: 1 (unsplit) unless the bucket reaches
+    `TPU_DCP_MERGE_CHUNKED_MIN_TOKENS` and splits into equal chunks whose
+    length is a multiple of 8 (the f32 sublane tile)."""
+    chunks = envs.TPU_DCP_MERGE_CHUNKED
+    if (
+        chunks <= 1
+        or num_tokens < envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS
+        or num_tokens % (8 * chunks)
+    ):
+        return 1
+    return chunks
+
+
+def _merge_chunked(
+    output: torch.Tensor, lse: torch.Tensor, group: Any, chunks: int
+) -> torch.Tensor:
+    """The reduce-scatter merge (`cp_lse_ag_out_rs`) over `chunks`
+    independent token chunks.
+
+    Every token's merge depends on its own row alone (the lse all-gather,
+    logsumexp, weight and reduce-scatter sum all run per token), so splitting
+    the token axis changes no per-row arithmetic: each chunk gathers its own
+    rows' lse, weights them and reduce-scatters them exactly as the unsplit
+    merge does. What changes is the schedule. The f32 reduce-scatter is a
+    SparseCore-offloaded async collective while the lse gather and the weight
+    multiply are TensorCore work, so chunk `k`'s reduce-scatter can run under
+    chunk `k + 1`'s gather and multiply instead of after all of them.
+    """
+    step = output.shape[0] // chunks
+    pieces = [
+        cp_lse_ag_out_rs(
+            output[c * step : (c + 1) * step], lse[c * step : (c + 1) * step], group
+        )
+        for c in range(chunks)
+    ]
+    return torch.cat(pieces, dim=0)
 
 
 def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
