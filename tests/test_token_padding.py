@@ -32,9 +32,7 @@ def test_zero_routing_weights_for_padding_zeroes_weights_keeps_ids(monkeypatch):
     class _FakeGroup:
         world_size = 1
 
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_dp_group", lambda: _FakeGroup()
-    )
+    monkeypatch.setattr(token_padding, "get_dp_group", lambda: _FakeGroup())
     try:
         provider.update(1, 4)
         ids = torch.arange(8, dtype=torch.int32).reshape(4, 2)
@@ -64,9 +62,7 @@ def test_zero_routing_weights_for_padding_dp_gather_rank_order(monkeypatch):
             other = torch.tensor([1, 0], dtype=t.dtype)
             return torch.cat([t, other], dim=dim)
 
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_dp_group", lambda: _FakeGroup()
-    )
+    monkeypatch.setattr(token_padding, "get_dp_group", lambda: _FakeGroup())
     try:
         ids = torch.arange(8, dtype=torch.int32).reshape(4, 2)
         weights = torch.full((4, 2), 0.5)
@@ -94,9 +90,7 @@ def test_zero_routing_weights_for_padding_is_local_tensor(monkeypatch):
                 "all_gather should not be called when is_local_tensor=True"
             )
 
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_dp_group", lambda: _FakeGroup()
-    )
+    monkeypatch.setattr(token_padding, "get_dp_group", lambda: _FakeGroup())
     try:
         ids = torch.arange(4, dtype=torch.int32).reshape(2, 2)
         weights = torch.full((2, 2), 0.5)

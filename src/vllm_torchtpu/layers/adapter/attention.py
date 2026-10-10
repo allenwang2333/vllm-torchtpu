@@ -1018,11 +1018,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
         cp_kv_cache_interleave_size: int = 0,
         block_major: bool = False,
     ):
-        ctx = get_vllm_model_wrapper_context()
-        vllm_config = ctx.vllm_config
         max_model_len = (
             vllm_config.model_config.max_model_len
-            if use_pcp_streaming and vllm_config is not None
+            if use_pcp_streaming
+            and (vllm_config := get_vllm_model_wrapper_context().vllm_config)
+            is not None
             else None
         )
         pcp_kv_layout = (
@@ -1047,6 +1047,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         if existing is not None:
             return existing
 
+        ctx = get_vllm_model_wrapper_context()
         # Reuse an existing custom op if one with the same config already exists.
         # `_kernel_op_prefix` is included so subclasses (e.g. the batched RPA
         # variant) don't collide with the base impl in the shared registry.

@@ -7,6 +7,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Torch custom-op bridge for Kimi KDA on the fused conv1d + GDN v3 kernel."""
 
+import functools
 import math
 from collections.abc import Callable
 from typing import TypeVar
@@ -29,6 +30,10 @@ from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_wrapper
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+_POOLED_CONV_DTYPE_NAME = DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix("torch.")
+_POOLED_CONV_DTYPE = jnp.dtype(_POOLED_CONV_DTYPE_NAME)
+_POOLED_CONV_ELEM_BYTES = pooled_gdn_state_itemsize(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE)
 
 _VerifyWindowResult = TypeVar("_VerifyWindowResult")
 
@@ -311,6 +316,7 @@ def _check_kda_abi(
     return num_tokens, num_sequences, num_heads, head_dim
 
 
+@functools.cache
 def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: int = 0):
     """The same op, on the fused conv1d + GDN v3 kernel.
 
@@ -545,8 +551,8 @@ def _pooled_kda_core(
     # The pool dtype is the attention KV dtype. The state regions keep the
     # dtypes gdn_pool_layout fixes for every reader of pool bytes (block
     # sizing, the Raiden manifest), so an fp8 pool still holds bf16 conv rows.
-    conv_dtype = jnp.dtype(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix("torch."))
-    conv_elem_bytes = pooled_gdn_state_itemsize(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE)
+    conv_dtype = _POOLED_CONV_DTYPE
+    conv_elem_bytes = _POOLED_CONV_ELEM_BYTES
     tok_bytes = math.prod(pool.shape[2:]) * jnp.dtype(pool.dtype).itemsize
     layout = derive_pooled_gdn_state_layout(
         ssm_bytes=num_heads * head_dim * head_dim * 4,
@@ -775,7 +781,7 @@ def build_kimi_pooled_kda_op(
     # build_kimi_dispatched_kda_op). A pooled program cached from the unfused
     # era would otherwise be served stale.
     op_name = f"pallas::kimi_pooled_kda_fused_{prefix.replace('.', '_')}"
-    op_name += f"_conv_{DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix('torch.')}"
+    op_name += f"_conv_{_POOLED_CONV_DTYPE_NAME}"
     if conv_shard_heads is not None:
         # Stored state order is part of the compiled program, including for
         # decode-local requests and prefix-cache seeds, not just PD loads.

@@ -168,12 +168,39 @@ def test_context_manager_is_a_noop_when_the_flag_is_off(monkeypatch) -> None:
     from vllm_torchtpu import envs
     from vllm_torchtpu.layers.adapter import moe_hierarchical
 
-    monkeypatch.setattr(envs, "TPU_MOE_HIERARCHICAL_EP", False)
+    monkeypatch.setitem(vars(envs), "TPU_MOE_HIERARCHICAL_EP", False)
     original = FusedMoEParallelConfig.make
     with moe_hierarchical.hierarchical_moe_parallel_config() as split:
         assert split is None
         assert FusedMoEParallelConfig.make is original
     assert FusedMoEParallelConfig.make is original
+
+
+def test_hierarchical_split_or_none_and_align_noop(monkeypatch) -> None:
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    monkeypatch.setattr(moe_hierarchical, "_filter_patched", False)
+    monkeypatch.setitem(vars(envs), "TPU_MOE_HIERARCHICAL_EP", True)
+
+    monkeypatch.setattr(
+        moe_hierarchical, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    assert moe_hierarchical.hierarchical_split_or_none() is None
+    moe_hierarchical.align_ep_weight_filter(None)
+    assert moe_hierarchical._filter_patched is False
+
+    monkeypatch.setattr(
+        moe_hierarchical, "get_tensor_model_parallel_world_size", lambda: 8
+    )
+    monkeypatch.setattr(moe_hierarchical, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(moe_hierarchical, "hierarchical_moe_split", lambda w, r: None)
+    assert moe_hierarchical.hierarchical_split_or_none() is None
+
+    monkeypatch.setattr(
+        moe_hierarchical, "hierarchical_moe_split", lambda w, r: (4, 0, 2, r)
+    )
+    assert moe_hierarchical.hierarchical_split_or_none() == (4, 0, 2, 1)
 
 
 def test_patch_is_reverted_even_when_construction_raises(monkeypatch) -> None:

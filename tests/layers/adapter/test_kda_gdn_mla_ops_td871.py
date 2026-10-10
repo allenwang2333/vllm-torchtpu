@@ -104,6 +104,11 @@ def test_short_conv_scan_start_seq_and_4d_state():
     out_all, state_all = kda.kimi_short_conv_scan(
         x, conv_state, weight, qsl, idx, seq_lens
     )
+    out_3d, state_3d = kda.kimi_short_conv_scan(
+        x, conv_state.squeeze(2), weight, qsl, idx, seq_lens
+    )
+    np.testing.assert_allclose(np.asarray(out_3d), np.asarray(out_all))
+    np.testing.assert_allclose(np.asarray(state_3d), np.asarray(state_all.squeeze(2)))
     out_tail, state_tail = kda.kimi_short_conv_scan(
         x, conv_state, weight, qsl, idx, seq_lens, start_seq=1
     )
@@ -161,6 +166,15 @@ def test_fused_core_verify_requires_read_offsets(monkeypatch):
     core = kda._build_fused_core(None, 1e-6, num_spec_tokens=2)
     with pytest.raises(ValueError, match="slot_read_offsets"):
         core(*_core_args(ops, conv_state))
+    read_offsets = jnp.zeros((N + 1,), jnp.int32)
+    win_dist = jnp.array([1, 1, N], jnp.int32)
+    out_spec, new_conv_spec, new_rec_spec = core(
+        *_core_args(ops, conv_state),
+        window_distribution=win_dist,
+        slot_read_offsets=read_offsets,
+    )
+    assert out_spec.shape == (T, H, D) and new_conv_spec.shape == conv_state.shape
+    assert new_rec_spec.shape == ops["recurrent_state"].shape
     out, new_conv, new_rec = kda._build_fused_core(None, 1e-6)(
         *_core_args(ops, conv_state)
     )

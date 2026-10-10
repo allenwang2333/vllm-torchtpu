@@ -541,15 +541,14 @@ class VllmTPUIndexer(Indexer):
             q, torch.float8_e4m3fn, axis=-1, use_ue8m0=False
         )
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
+        q_scale = q_scale.view(-1, self.n_head)
 
         # q_scale is fp32, so fold it in and cast back: the kernel expects the
         # weights in the activation dtype.
         weights_dtype = weights.dtype
-        weights = (
-            weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
+        weights = (weights * q_scale * self.softmax_scale * self.n_head**-0.5).to(
+            weights_dtype
         )
-        weights = weights.squeeze(-1).to(weights_dtype)
 
         return self.indexer_op(hidden_states, q_fp8, k, weights)
 
