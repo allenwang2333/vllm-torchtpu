@@ -375,3 +375,113 @@ class TestV2AttentionTD756:
             )
         # Also test segmented_main outside stage_attention_cache_scope
         attn_idx_zero_1._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
+
+    def test_high_conc_c64_c96_c128_metadata_and_swa_cache_hit_rates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """TD8.171: Profile and verify host-side metadata and SWA record
+        preparation and stage_cache reuse across an 18-layer decoder stage at
+        high concurrency C=64 / 96 / 128 (DSpark K=5, B=384 / 576 / 768)."""
+        orig_req_row_slots = v2_attn._request_row_slots
+        req_slot_calls = 0
+
+        def _counted_req_row_slots(*args, **kwargs):
+            nonlocal req_slot_calls
+            req_slot_calls += 1
+            return orig_req_row_slots(*args, **kwargs)
+
+        monkeypatch.setattr(v2_attn, "_request_row_slots", _counted_req_row_slots)
+        monkeypatch.setattr(v2_attn, "_insert", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            v2_attn,
+            "sparse_fp8_attention",
+            lambda q, *a, **kw: torch.zeros_like(q),
+        )
+
+        for c_reqs in (64, 96, 128):
+            tokens = c_reqs * 6
+            positions = torch.arange(tokens, dtype=torch.int32)
+            table = torch.arange(c_reqs * 4, dtype=torch.int32).reshape(c_reqs, 4)
+            qsl = torch.arange(0, (c_reqs + 1) * 6, 6, dtype=torch.int32)
+            seq_lens = torch.full((c_reqs,), 64, dtype=torch.int32)
+            meta = SimpleNamespace(
+                seq_lens=seq_lens,
+                block_tables=table,
+                query_start_loc=qsl,
+            )
+            metadata = {
+                "swa_pfx": meta,
+                "src_pfx": meta,
+                "idx_pfx": meta,
+            }
+            forward_ctx = SimpleNamespace(attn_metadata=metadata, additional_kwargs={})
+            monkeypatch.setattr(
+                v2_attn,
+                "get_forward_context",
+                lambda ctx=forward_ctx: ctx,
+            )
+
+            qr = torch.ones((tokens, 16), dtype=torch.bfloat16)
+            kv = torch.ones((tokens, 8), dtype=torch.bfloat16)
+            idx_w = torch.ones((tokens, 2), dtype=torch.bfloat16)
+            out = torch.zeros((tokens, 2, 8), dtype=torch.bfloat16)
+
+            swa_l0 = _make_paged_cache_mock(
+                table, row_offset=0, rows_per_page=16, page_stride=32
+            )
+            swa_l1 = _make_paged_cache_mock(
+                table, row_offset=64, rows_per_page=16, page_stride=32
+            )
+            idx_l0 = _make_paged_cache_mock(
+                table, row_offset=0, rows_per_page=16, page_stride=48
+            )
+            idx_l1 = _make_paged_cache_mock(
+                table, row_offset=128, rows_per_page=16, page_stride=48
+            )
+
+            attn_src0 = _make_attn(swa_cache=swa_l0, idx_cache=idx_l0)
+            attn_src0.non_causal_multi_token_decode = True
+            attn_src1 = _make_attn(swa_cache=swa_l1, idx_cache=idx_l1)
+            attn_src1.non_causal_multi_token_decode = True
+            attn_reuse = _make_attn(
+                swa_cache=swa_l1, idx_cache=idx_l1, has_indexer=False
+            )
+            attn_reuse.non_causal_multi_token_decode = True
+
+            seen_records: list[torch.Tensor] = []
+
+            def _select_stub(
+                _qr,
+                _pos,
+                _ic,
+                idx_recs,
+                *a,
+                _seen=seen_records,
+                _tokens=tokens,
+                **kw,
+            ):
+                _seen.append(idx_recs)
+                return torch.zeros((_tokens, 2), dtype=torch.int32)
+
+            attn_src0._select_paged_indices = _select_stub
+            attn_src1._select_paged_indices = _select_stub
+
+            req_slot_calls = 0
+            with v2_attn.stage_attention_cache_scope():
+                attn_src0._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
+                attn_src1._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
+                attn_reuse._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+                assert req_slot_calls == 1
+                stage_cache = v2_attn._active_stage_attn_cache
+                assert stage_cache is not None
+                key_kinds = {k[0] for k in stage_cache if isinstance(k, tuple)}
+                assert {
+                    "swa_token_addr",
+                    "swa_token_slots",
+                    "compressed_inputs",
+                    "index_req_slots",
+                    "index_records",
+                    "compressed_pages",
+                    "compressed_attn",
+                }.issubset(key_kinds)
+            assert torch.equal(seen_records[1], seen_records[0] + 128)

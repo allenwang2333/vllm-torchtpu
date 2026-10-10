@@ -563,10 +563,17 @@ def test_qwen3_vl_maybe_patch_top_level(monkeypatch):
         hf_config=SimpleNamespace(model_type="qwen3_vl"), model="qwen3_vl"
     )
 
-    # 2. ImportError and no sys.modules match
-    class _FakeImportFail:
-        pass
+    # 2. ImportError, broken qwen3_vl module in sys.modules (lines 398-399)
+    for mod_key in [k for k in list(sys.modules) if "qwen3_vl" in k]:
+        monkeypatch.delitem(sys.modules, mod_key, raising=False)
 
+    class _BrokenQwen3VLMod(ModuleType):
+        def __getattr__(self, name: str) -> Any:
+            raise ImportError(name)
+
+    monkeypatch.setitem(
+        sys.modules, "broken_qwen3_vl_mod", _BrokenQwen3VLMod("broken_qwen3_vl_mod")
+    )
     monkeypatch.setitem(
         sys.modules, "transformers.models.qwen3_vl.modeling_qwen3_vl", None
     )

@@ -1852,7 +1852,7 @@ class TestBenchmarkingConfigs:
         assert cfg_offload["CONCURRENCY_OPTIONS"] == "16 24 32 48 64 96"
         assert "--kv-cache-memory-bytes=42949672960" in cfg_offload["EXTRA_SERVE_ARGS"]
         assert (
-            '--compilation-config={"compile_sizes":[4,8,16,24,32,48,64,96,144,192,288,384,576,2048]}'
+            '--compilation-config={"compile_sizes":[4,8,16,24,32,48,64,96,144,192,288,384,576,672,2048]}'
             in cfg_offload["EXTRA_SERVE_ARGS"]
         )
         assert (
