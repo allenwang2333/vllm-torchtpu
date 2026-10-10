@@ -384,6 +384,13 @@ def _get_quantized_mlp_prequant_op(swiglu_limit: float | None = None) -> Callabl
     return _init_quantized_mlp_prequant_op(swiglu_limit)
 
 
+_get_quantized_matmul_op()
+_init_quantized_matmul_prequant_op()
+for _preload_lim in (None, 7.0):
+    _init_quantized_mlp_op(_preload_lim)
+    _init_quantized_mlp_prequant_op(_preload_lim)
+
+
 def quantized_mlp(
     x: torch.Tensor,
     w_gu: torch.Tensor,

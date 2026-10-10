@@ -418,7 +418,7 @@ class VllmDeepseekV41MLAAttention(
 
     def _csa_kv_group_bounds(
         self, ced_decoder: bool | None = None
-    ) -> tuple[Any, int]:
+    ) -> tuple[int, int]:
         eff_ced = self._ced_decoder if ced_decoder is None else ced_decoder
         cache_attr = (
             "_cached_csa_kv_group_bounds_ced"
@@ -438,7 +438,6 @@ class VllmDeepseekV41MLAAttention(
         ced_boundary = len(attn_mods) // 2
         min_lid = my_lid
         max_lid = my_lid
-        first_consumer: Any = self
         for mod in attn_mods:
             if mod.compress_ratio > 0 and mod._kv_source_module() is kv_holder:
                 lid = extract_layer_index(mod.prefix)
@@ -446,10 +445,9 @@ class VllmDeepseekV41MLAAttention(
                     continue
                 if lid < min_lid:
                     min_lid = lid
-                    first_consumer = mod
                 if lid > max_lid:
                     max_lid = lid
-        res = (first_consumer, max_lid)
+        res = (int(min_lid), int(max_lid))
         if not torch.compiler.is_compiling():
             object.__setattr__(self, cache_attr, res)
         return res
@@ -464,12 +462,12 @@ class VllmDeepseekV41MLAAttention(
         ced_decoder: bool | None = None,
     ) -> tuple[torch.Tensor, ...]:
         kv_holder = self._kv_source_module()
-        first_consumer, last_lid = self._csa_kv_group_bounds(ced_decoder)
+        first_lid, last_lid = self._csa_kv_group_bounds(ced_decoder)
         my_lid = extract_layer_index(self.prefix)
         cached_entry = getattr(kv_holder, "_step_csa_union", None)
         if (
             self.indexer is not None
-            or my_lid == extract_layer_index(first_consumer.prefix)
+            or my_lid == first_lid
             or cached_entry is None
             or cached_entry[0] != b_q
             or cached_entry[1] != m_union
@@ -623,9 +621,19 @@ class VllmDeepseekV41MLAAttention(
                         if envs.VLLM_DSV41_CSA_UNION_M > 0
                         else ((2 * int(self.topk_indices_buffer.shape[1]) + 127) // 128) * 128
                     )
+                    m_u_k3 = (
+                        envs.VLLM_DSV41_CSA_UNION_M
+                        if envs.VLLM_DSV41_CSA_UNION_M > 0
+                        else ((4 * int(self.topk_indices_buffer.shape[1]) + 127) // 128) * 128
+                    )
                     _ = self._get_csa_union_op(total_r, m_u)
                     _ = self._get_csa_union_op(total_r, m_u_v, b_q=6)
                     _ = self._get_csa_union_op(total_r, m_u_v, b_q=5)
+                    _ = self._get_csa_union_op(total_r, m_u_k3, b_q=5)
+                    _ = self._get_csa_union_op(total_r, m_u_k3, b_q=4)
+                    if not torch.compiler.is_compiling():
+                        self._csa_kv_group_bounds(False)
+                        self._csa_kv_group_bounds(True)
             if self.indexer is not None:
                 idx_kv = _live_cache(getattr(self.indexer.k_cache, "kv_cache", None))
                 if idx_kv is not None:

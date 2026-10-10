@@ -1177,7 +1177,10 @@ def calculate_tiling(
         new_tile_m = tile_m + bucket_base
         if new_tile_m > dims.size_m:
             break
-        if _gmm_vmem_estimate(new_tile_m, tile_n, tile_k) > vmem_limit_bytes:
+        if (
+            dims.size_m == 512
+            and _gmm_vmem_estimate(new_tile_m, tile_n, tile_k) > int(vmem_limit_bytes * 0.90)
+        ):
             break
         tile_m = new_tile_m
 
