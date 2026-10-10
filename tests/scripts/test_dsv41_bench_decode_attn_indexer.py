@@ -684,7 +684,10 @@ class TestBenchDecodeIndexerSplit:
         )
         assert inp2["records"].shape == (4, 64)
 
-        # 3. rank_slice: part=2, rank=1, tp=4 -> count=4, padding = 2*4 - 4 = 4
+        # 3. expand_tokens and rank_slice: part=2, rank=1, tp=4
+        expanded = bdis.expand_tokens(inp1, tokens=2)
+        assert expanded["q"].shape == (8, 8, 64)
+        assert expanded["requests"].tolist() == [0, 0, 1, 1, 2, 2, 3, 3]
         sliced = bdis.rank_slice(inp1, part=2, rank=1, tp=4)
         assert sliced["q"].shape == (2, 8, 64)
         assert sliced["lengths"].shape == (2,)
@@ -794,14 +797,14 @@ class TestBenchDecodeIndexerSplit:
                     assert res["max_tile"] == 4096
                     assert res["per_rep_median_ms"] == 5.0
 
-                # Test legacy=True configuration
+                # Test legacy=True configuration + tokens_per_seq > 1
                 args_legacy = argparse.Namespace(
                     subop="candidate_write",
                     stage="all",
                     split="balanced",
                     reps=1,
                     num_seqs=4,
-                    tokens_per_seq=1,
+                    tokens_per_seq=2,
                     kv_len=64,
                     pool_rows=256,
                     layout_page=16,
