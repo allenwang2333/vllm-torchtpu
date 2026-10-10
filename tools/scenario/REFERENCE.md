@@ -671,7 +671,7 @@ Refs:
 | Ref | Filled with |
 |---|---|
 | `self_ip` | this host's advertise address |
-| `head_ip` | the role's first host, as IPv4 |
+| `head_ip` | the role's first host as IPv4; its own address on that host |
 | `host_index` | this host's index in its role |
 | `role_head` | the first host of a role by name; 127.0.0.1 on that host |
 | `role_ips` | every host of a role as IPv4, joined by commas |
@@ -720,3 +720,4 @@ apply, the first of these wins: a signal, 4 or 5, 3, 7, 1, 6.
 | such a host leaves (exit 7) once the driver has not answered for | 20 s |
 | such a host gives up (exit 3) without a first answer after | 1800 s |
 | after its end, the driver waits for every such host to ask, at most | 10 s |
+| after an abort, at most | 3 s |

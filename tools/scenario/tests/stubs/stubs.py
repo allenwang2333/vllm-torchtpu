@@ -21,13 +21,19 @@ core-file limit.
 `vllm serve` is a small OpenAI-compatible HTTP server: /health,
 /v1/models, /v1/completions, /v1/chat/completions and /metrics, plus
 /stub/die, which ends it as a crash would. It forks one child that stands in
-for an engine core. Knobs, all env:
+for an engine core. As the first host of vLLM's multi-node DP (its
+--data-parallel-size-local below --data-parallel-size) it also listens on
+--data-parallel-address:--data-parallel-rpc-port, and /health answers 200
+only once every other host has joined there. With --headless it serves no
+HTTP: it joins that address, and exits 1 when the head goes away, as an
+engine does when it loses its DP group. Knobs, all env:
 
     STUB_SERVE_EXIT=N     exit N at once, before serving
     STUB_READY_AFTER=S    /health answers 503 for S seconds
     STUB_NEVER_READY=1    /health never answers 200
     STUB_DIE_AFTER=S      crash S seconds after start
     STUB_PULL=1           fill $STUB_PULLED_DIR as runai pulls a model
+    STUB_JOIN_TIMEOUT=S   a headless host gives up joining after S seconds
 
 `vllm bench serve` and InferenceX's benchmark_serving (`python3 -m
 infx.bench_serving.benchmark_serving`) ask the server for /v1/models and
@@ -65,6 +71,7 @@ $RESULT_DIR/aiperf_artifacts. Knobs:
 `python3` runs the real interpreter for anything but `-m infx...`.
 """
 
+import contextlib
 import http.client
 import http.server
 import json
@@ -72,6 +79,7 @@ import os
 import pathlib
 import resource
 import signal
+import socket
 import sys
 import threading
 import time
@@ -117,6 +125,82 @@ def number(name: str, default: float = 0.0) -> float:
 # vllm serve -----------------------------------------------------------------
 
 
+def _crash_later(engine: int) -> None:
+    """Crash STUB_DIE_AFTER seconds from now, when it is set."""
+    die_after = number("STUB_DIE_AFTER")
+    if not die_after:
+        return
+
+    def crash() -> None:
+        time.sleep(die_after)
+        print("ERROR stub: engine core died", flush=True)
+        os.kill(engine, signal.SIGKILL)
+        os._exit(1)
+
+    threading.Thread(target=crash, daemon=True).start()
+
+
+def _dp_address(args: list[str]) -> tuple[str, int] | None:
+    rpc_port = flag(args, "--data-parallel-rpc-port")
+    if rpc_port is None:
+        return None
+    return flag(args, "--data-parallel-address", "127.0.0.1") or "", int(rpc_port)
+
+
+def _dp_head(args: list[str]) -> Callable[[], bool]:
+    """Listen for the other hosts of a multi-node DP; whether all have joined."""
+    size = int(flag(args, "--data-parallel-size", "1") or 1)
+    local = int(flag(args, "--data-parallel-size-local", str(size)) or size)
+    address = _dp_address(args)
+    if address is None or local >= size:
+        return lambda: True
+    expected = size // local - 1
+    joined: list[socket.socket] = []
+    listener = socket.create_server(address)
+
+    def accept() -> None:
+        while True:
+            conn, _ = listener.accept()
+            joined.append(conn)
+            print(f"INFO stub: a host joined ({len(joined)}/{expected})", flush=True)
+
+    threading.Thread(target=accept, daemon=True).start()
+    return lambda: len(joined) >= expected
+
+
+def _headless(args: list[str], engine: int) -> int:
+    """Join the DP head and stay until it goes away."""
+    address = _dp_address(args)
+    assert address is not None, "--headless without --data-parallel-rpc-port"
+
+    def stop(signum: int, frame: Any) -> None:
+        print("INFO stub: shutting down", flush=True)
+        os.kill(engine, signal.SIGTERM)
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    print(f"INFO stub: joining the data-parallel head at {address}", flush=True)
+    deadline = time.monotonic() + number("STUB_JOIN_TIMEOUT", 30)
+    while True:
+        try:
+            conn = socket.create_connection(address, timeout=1)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                print(f"ERROR stub: no data-parallel head at {address}", flush=True)
+                os.kill(engine, signal.SIGKILL)
+                return 1
+            time.sleep(0.05)
+    print(f"INFO stub: joined the data-parallel head at {address}", flush=True)
+    _crash_later(engine)
+    conn.settimeout(None)
+    with contextlib.suppress(OSError):
+        conn.recv(1)
+    print("ERROR stub: lost the data-parallel head", flush=True)
+    os.kill(engine, signal.SIGKILL)
+    return 1
+
+
 def serve(args: list[str]) -> int:
     if "STUB_SERVE_EXIT" in os.environ:
         print("ERROR stub: engine failed to start", flush=True)
@@ -134,6 +218,9 @@ def serve(args: list[str]) -> int:
         while True:
             time.sleep(60)
     record("vllm serve", args, engine_pid=engine)
+    if "--headless" in args:
+        return _headless(args, engine)
+    all_joined = _dp_head(args)
     if os.environ.get("STUB_PULL") == "1":
         pulled = pathlib.Path(os.environ["STUB_PULLED_DIR"])
         pulled.mkdir(parents=True, exist_ok=True)
@@ -150,7 +237,11 @@ def serve(args: list[str]) -> int:
 
         def do_GET(self) -> None:
             if self.path == "/health":
-                ready = not never_ready and time.monotonic() - started >= ready_after
+                ready = (
+                    not never_ready
+                    and time.monotonic() - started >= ready_after
+                    and all_joined()
+                )
                 self.reply(200 if ready else 503, {})
             elif self.path == "/v1/models":
                 card = {"id": served, "object": "model", "max_model_len": max_len}
@@ -181,16 +272,7 @@ def serve(args: list[str]) -> int:
 
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"INFO stub: serving {served} on port {port}", flush=True)
-    die_after = number("STUB_DIE_AFTER")
-    if die_after:
-
-        def crash() -> None:
-            time.sleep(die_after)
-            print("ERROR stub: engine core died", flush=True)
-            os.kill(engine, signal.SIGKILL)
-            os._exit(1)
-
-        threading.Thread(target=crash, daemon=True).start()
+    _crash_later(engine)
 
     def stop(signum: int, frame: Any) -> None:
         print("INFO stub: shutting down", flush=True)

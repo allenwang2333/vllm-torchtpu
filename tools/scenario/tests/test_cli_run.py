@@ -206,7 +206,7 @@ def test_pod_usage(
 def test_several_roles_wait_for_the_next_version(env: dict[str, str]) -> None:
     result = invoke("run", K3_PD, "--role", "prefill", "--host-index", "0")
     assert result.exit_code == exits.USAGE
-    assert "this version runs single-host, single-role plans" in result.output
+    assert "this version runs plans of one role" in result.output
 
 
 def test_up_serves_until_stopped(tmp_path: pathlib.Path, env: dict[str, str]) -> None:

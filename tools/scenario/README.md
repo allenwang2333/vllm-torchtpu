@@ -242,8 +242,25 @@ its placement from `SCENARIO_HOST_INDEX`, `SCENARIO_HEAD_ADDRESS`,
 names win. `SCENARIO_TARGET_DATA` carries the target's after-tasks (uploads)
 and its lm_eval request cache root; a local run has neither.
 
-This version runs single-host, single-role scenarios. Hosts that wait on a
-driver (multi-host, multi-role) come next.
+A scenario over several hosts runs `scenario run` on every host, with the
+same Plan:
+
+```
+host-a$ scenario run FILE --host-index 0 --head-address host-a --advertise-ip 10.0.0.1
+host-b$ scenario run FILE --host-index 1 --head-address host-a --advertise-ip 10.0.0.2
+```
+
+The first host of the role drives. It serves its status on port 8090, waits
+for its server (on an mp head, that is every host joining), runs the tasks
+and says how the run ended. Every other host starts its own part at once:
+the remote-code warm when the Plan has it, then its `--headless` server.
+It asks for the driver's status every 2 s and leaves with 0 when the
+driver is done, 7 when it aborted or has not answered for 20 s, and 4 or 5
+when its own server dies (before or after the driver was serving). It
+writes its `summary.json` and `server.log` under `<run dir>/<role>-<index>`.
+
+This version runs scenarios of one role, single-host or mp. Ray and
+several roles come next.
 
 ## Usage
 

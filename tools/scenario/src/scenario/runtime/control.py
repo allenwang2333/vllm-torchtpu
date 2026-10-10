@@ -68,6 +68,10 @@ REQUEST_TIMEOUT_S = 5.0
 # After its end, the driver waits at most this long for every follower to
 # have asked once more.
 LINGER_S = 10.0
+# After an abort it waits less: its stop grace (20 s) and this fit in the
+# usual 30 s a signalled host gets. Long enough for a follower whose engine
+# died with the driver's to ask once more and learn of the abort.
+ABORT_LINGER_S = 3.0
 
 State = Literal["starting", "serving", "done", "aborted"]
 STATES: tuple[State, ...] = ("starting", "serving", "done", "aborted")

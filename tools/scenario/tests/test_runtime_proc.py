@@ -191,6 +191,23 @@ def test_an_interrupted_run_stops_its_child(tmp_path: pathlib.Path) -> None:
     assert gone(read_pid(pidfile))
 
 
+def test_a_check_that_raises_stops_the_command(tmp_path: pathlib.Path) -> None:
+    pidfile = tmp_path / "pid"
+    calls: list[int] = []
+
+    def check() -> None:
+        calls.append(1)
+        if pidfile.exists():
+            raise RuntimeError("stop")
+
+    with pytest.raises(RuntimeError):
+        proc.run(
+            ["sh", "-c", f"echo $$ > {pidfile}; exec sleep 60"], env=ENV, check=check
+        )
+    assert calls
+    assert gone(read_pid(pidfile))
+
+
 def test_exit_status_names_signals() -> None:
     assert proc.exit_status(0) == 0
     assert proc.exit_status(3) == 3

@@ -471,6 +471,10 @@ def reference() -> str:
                 "after its end, the driver waits for every such host to ask, at most",
                 f"{control.LINGER_S:g} s",
             ),
+            (
+                "after an abort, at most",
+                f"{control.ABORT_LINGER_S:g} s",
+            ),
         ],
     )
     while lines[-1] == "":
@@ -481,7 +485,7 @@ def reference() -> str:
 def _ref_rows() -> Iterator[tuple[str, str]]:
     meanings = {
         "self_ip": "this host's advertise address",
-        "head_ip": "the role's first host, as IPv4",
+        "head_ip": "the role's first host as IPv4; its own address on that host",
         "host_index": "this host's index in its role",
         "role_head": "the first host of a role by name; 127.0.0.1 on that host",
         "role_ips": "every host of a role as IPv4, joined by commas",

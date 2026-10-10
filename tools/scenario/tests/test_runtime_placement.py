@@ -262,6 +262,23 @@ def test_every_ref_kind(k3_pd: Plan, tmp_path: pathlib.Path) -> None:
     assert refs.value(concat) == "http://p0.wl:8000"
 
 
+def test_the_head_is_its_own_dp_address(k3_pd: Plan, tmp_path: pathlib.Path) -> None:
+    at = Placement("decode", 0, "d0.wl", "10.9.9.9", HOSTS)
+    refs, resolver = refs_for(k3_pd, at, tmp_path)
+    assert refs.ref(Ref("head_ip")) == "10.9.9.9"
+    assert resolver.calls == []
+
+
+def test_the_head_address_falls_back_to_the_role_hosts(
+    k3_pd: Plan, tmp_path: pathlib.Path
+) -> None:
+    refs, resolver = refs_for(
+        k3_pd, Placement("decode", 3, None, None, HOSTS), tmp_path
+    )
+    assert refs.ref(Ref("head_ip")) == "10.0.1.0"
+    assert resolver.calls == ["d0.wl"]
+
+
 def test_the_head_is_loopback_to_itself(k3_pd: Plan, tmp_path: pathlib.Path) -> None:
     refs, _ = refs_for(k3_pd, Placement("prefill", 0, None, None, {}), tmp_path)
     assert refs.ref(Ref("role_head", role="prefill")) == "127.0.0.1"
