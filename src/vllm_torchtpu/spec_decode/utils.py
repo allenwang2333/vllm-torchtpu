@@ -20,6 +20,32 @@ from vllm_torchtpu.utils import synchronize_tensors
 logger = init_logger(__name__)
 
 
+def _get_shard_meta_tensors(
+    lm_head: torch.nn.Module, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cached = getattr(lm_head, "_tp_shard_meta_dev", None)
+    if cached is not None and cached[0].device == device:
+        return cached
+    start_t = torch.tensor(
+        [int(lm_head.shard_indices.org_vocab_start_index)],
+        dtype=torch.int32,
+        device=device,
+    )
+    valid_t = torch.tensor(
+        [
+            int(
+                lm_head.shard_indices.org_vocab_end_index
+                - lm_head.shard_indices.org_vocab_start_index
+            )
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    pair = (start_t, valid_t)
+    object.__setattr__(lm_head, "_tp_shard_meta_dev", pair)
+    return pair
+
+
 def tp_local_argmax_logits(
     logits_processor,
     lm_head: torch.nn.Module,
@@ -39,19 +65,13 @@ def tp_local_argmax_logits(
     )
     if bias_local is not None:
         logits_local = logits_local + bias_local
-    valid_cols = int(
-        lm_head.shard_indices.org_vocab_end_index
-        - lm_head.shard_indices.org_vocab_start_index
+    start_t, valid_t = _get_shard_meta_tensors(lm_head, logits_local.device)
+    col_mask = (
+        torch.arange(logits_local.shape[-1], device=logits_local.device) >= valid_t
     )
-    if valid_cols < logits_local.shape[-1]:
-        col_mask = (
-            torch.arange(logits_local.shape[-1], device=logits_local.device)
-            >= valid_cols
-        )
-        logits_local = logits_local.masked_fill(col_mask, float("-inf"))
+    logits_local = logits_local.masked_fill(col_mask, float("-inf"))
     local_val, local_idx = logits_local.max(dim=-1)
-    start_idx = int(lm_head.shard_indices.org_vocab_start_index)
-    global_idx = local_idx.to(torch.int32) + start_idx
+    global_idx = local_idx.to(torch.int32) + start_t
     packed = torch.stack(
         [local_val.to(torch.float32).view(torch.int32), global_idx], dim=-1
     )
@@ -93,23 +113,17 @@ def tp_local_topk_logits(
     logits_local = logits_processor._get_logits(
         hidden_states, lm_head, None, skip_gather=True
     )
-    valid_cols = int(
-        lm_head.shard_indices.org_vocab_end_index
-        - lm_head.shard_indices.org_vocab_start_index
+    start_t, valid_t = _get_shard_meta_tensors(lm_head, logits_local.device)
+    col_mask = (
+        torch.arange(logits_local.shape[-1], device=logits_local.device) >= valid_t
     )
-    if valid_cols < logits_local.shape[-1]:
-        col_mask = (
-            torch.arange(logits_local.shape[-1], device=logits_local.device)
-            >= valid_cols
-        )
-        logits_local = logits_local.masked_fill(col_mask, float("-inf"))
+    logits_local = logits_local.masked_fill(col_mask, float("-inf"))
     local_lse = torch.logsumexp(logits_local.to(torch.float32), dim=-1, keepdim=True)
     local_v, local_i = torch.topk(logits_local, k_eff, dim=-1)
     local_ties = (logits_local >= local_v[:, 0:1]).sum(
         dim=-1, keepdim=True, dtype=torch.int32
     )
-    start_idx = int(lm_head.shard_indices.org_vocab_start_index)
-    global_i = local_i.to(torch.int32) + start_idx
+    global_i = local_i.to(torch.int32) + start_t
     packed = torch.cat(
         [
             local_lse.view(torch.int32),

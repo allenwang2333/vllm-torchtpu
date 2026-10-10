@@ -577,32 +577,53 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
                 prev = step
             return torch.stack(draft_tokens, dim=1)
 
-        start_idx = int(shard_indices.org_vocab_start_index)
-        end_idx = int(shard_indices.org_vocab_end_index)
-        valid_vocab = end_idx - start_idx
-        w2_shard = markov_w2.weight[start_idx:end_idx]
+        shard_cols = int(lm_head.weight.shape[0])
+        meta = getattr(self, "_tp_markov_meta", None)
+        if meta is None or meta[0].device != pred_hidden.device:
+            start_idx = int(shard_indices.org_vocab_start_index)
+            end_idx = int(shard_indices.org_vocab_end_index)
+            valid_vocab = end_idx - start_idx
+            w2_raw = markov_w2.weight[start_idx:end_idx]
+            w2_pad = (
+                torch.nn.functional.pad(w2_raw, (0, 0, 0, shard_cols - valid_vocab))
+                if valid_vocab < shard_cols
+                else w2_raw.contiguous()
+            )
+            pad_bias = torch.zeros(
+                (1, shard_cols), dtype=w2_raw.dtype, device=pred_hidden.device
+            )
+            if valid_vocab < shard_cols:
+                pad_bias[:, valid_vocab:] = float("-inf")
+            start_t = torch.tensor(
+                [start_idx], dtype=torch.int32, device=pred_hidden.device
+            )
+            meta = (w2_pad, pad_bias, start_t)
+            object.__setattr__(self, "_tp_markov_meta", meta)
+        w2_pad, pad_bias, start_t = meta
 
         prev = prev_init
-        # Overlap step-0 local Markov bias ([B, r] @ [r, V_shard]) with local lm_head
-        bias_local = torch.nn.functional.linear(self.markov_embed(prev), w2_shard)
+        bias_local = (
+            torch.nn.functional.linear(self.markov_embed(prev), w2_pad) + pad_bias
+        )
         logits_local = self.logits_processor._get_logits(
             pred_hidden, lm_head, None, skip_gather=True
         )
         assert logits_local is not None
         logits_local_3d = logits_local.view(
-            padded_num_reqs, num_pred, logits_local.shape[-1]
-        )[..., :valid_vocab]
+            padded_num_reqs, num_pred, shard_cols
+        )
 
         draft_tokens = []
         for idx in range(num_pred):
             if idx > 0:
-                bias_local = torch.nn.functional.linear(
-                    self.markov_embed(prev), w2_shard
+                bias_local = (
+                    torch.nn.functional.linear(self.markov_embed(prev), w2_pad)
+                    + pad_bias
                 )
             local_val, local_idx = (
                 logits_local_3d[:, idx] + bias_local
             ).max(dim=-1, keepdim=True)
-            global_idx = local_idx.to(torch.int32) + start_idx
+            global_idx = local_idx.to(torch.int32) + start_t
             all_vals = tp_all_gather(local_val, dim=-1)
             all_idxs = tp_all_gather(global_idx, dim=-1)
             best_shard = all_vals.argmax(dim=-1, keepdim=True)
