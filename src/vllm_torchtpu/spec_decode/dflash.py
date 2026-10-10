@@ -41,11 +41,15 @@ logger = init_logger(__name__)
 
 def _pad_or_slice_rows(t: torch.Tensor, n: int, value: int = 0) -> torch.Tensor:
     """Exactly n rows of t; inputs may arrive padded past the draft bucket."""
-    return (
-        t[:n]
-        if t.shape[0] >= n
-        else F.pad(t, (0, 0) * (t.dim() - 1) + (0, n - t.shape[0]), value=value)
+    if t.shape[0] >= n:
+        return t[:n]
+    pad_shape = (n - t.shape[0], *t.shape[1:])
+    pad_tensor = (
+        torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
+        if value == 0
+        else torch.full(pad_shape, value, dtype=t.dtype, device=t.device)
     )
+    return torch.cat((t, pad_tensor), dim=0)
 
 
 class DFlashProposer:
@@ -1402,18 +1406,44 @@ class DFlashProposer:
             device=device,
         )
         blocks_2d = torch.cat([base_tokens.unsqueeze(1), mask_cols], dim=1)
-        input_ids = F.pad(
-            blocks_2d.reshape(-1),
-            (0, padded_len - padded_num_reqs * block_size),
-            value=mask_token_id,
+        blocks_flat = blocks_2d.reshape(-1)
+        pad_ids = padded_len - padded_num_reqs * block_size
+        input_ids = (
+            torch.cat(
+                (
+                    blocks_flat,
+                    torch.full(
+                        (pad_ids,),
+                        mask_token_id,
+                        dtype=blocks_flat.dtype,
+                        device=blocks_flat.device,
+                    ),
+                ),
+                dim=0,
+            )
+            if pad_ids > 0
+            else blocks_flat
         )
 
         offsets = torch.arange(
             0, block_size, dtype=torch.int32, device=device
         ).unsqueeze(0)
         positions_unpadded = (base_pos + offsets).flatten()
-        positions = F.pad(
-            positions_unpadded, (0, padded_len - positions_unpadded.shape[0]), value=0
+        pad_pos = padded_len - positions_unpadded.shape[0]
+        positions = (
+            torch.cat(
+                (
+                    positions_unpadded,
+                    torch.zeros(
+                        (pad_pos,),
+                        dtype=positions_unpadded.dtype,
+                        device=positions_unpadded.device,
+                    ),
+                ),
+                dim=0,
+            )
+            if pad_pos > 0
+            else positions_unpadded
         )
         # Clamp to max_model_len to prevent out-of-bounds RoPE and kernel indexing.
         positions = torch.clamp(positions, max=self._max_model_len - 1)

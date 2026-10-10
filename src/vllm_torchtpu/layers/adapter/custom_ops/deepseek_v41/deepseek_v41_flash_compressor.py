@@ -218,8 +218,6 @@ class VllmDeepseekV41Compressor(dsv41_compressor.DeepseekCompressor):
                 latent = tp_all_gather(latent, dim=0)
             return latent
         weight = self.fused_wkv_wgate.weight
-        if getattr(self.fused_wkv_wgate, KEEP_VLLM_LAYOUT_ATTR, False):
-            weight = weight.transpose(0, 1)
         wkv_wgate = (
             _fp32_linear_op(hidden_states, weight)
             if hidden_states.device.type == "tpu"

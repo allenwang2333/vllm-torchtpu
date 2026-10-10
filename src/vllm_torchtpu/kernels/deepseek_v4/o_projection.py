@@ -719,3 +719,426 @@ def fused_wq_b_q_rope_prequant_projection(
         name=name,
     )(qr_fp8, wq_b, w_s_2d, cos_sin, qr_s_128)
     return out[:num_tokens] if pad_t > 0 else out
+
+def _wo_a_wo_b_fused_g2_kernel(
+    x_ref: jax.Ref,      # VMEM (tile_t, 16, head_dim) bf16
+    wa_ref: jax.Ref,     # VMEM (D, 2 * R) fp8
+    sa_ref: jax.Ref,     # VMEM (1, 2 * R) f32
+    wb_ref: jax.Ref,     # VMEM (2 * R, H_out) fp8
+    sb_ref: jax.Ref,     # VMEM (1, H_out) f32
+    cs_ref: jax.Ref,     # VMEM (tile_t, 2 * LANE) f32
+    out_ref: jax.Ref,    # VMEM (tile_t, H_out) bf16
+    *,
+    tile_t: int,
+    num_sub_t: int,
+    lora_rank: int,
+    head_dim: int,
+    inverse: bool = True,
+) -> None:
+    wb = wb_ref[...]
+    sb = sb_ref[...]
+    cos_sin = cs_ref[...]
+    sub_t = tile_t // num_sub_t
+    lane = jnp.arange(LANE)
+    lane_perm = lane ^ 1
+    sign = jnp.where(lane % 2 == 0, -1.0, 1.0).astype(jnp.float32)
+
+    for s in range(num_sub_t):
+        rows = slice(s * sub_t, (s + 1) * sub_t)
+        cs = cos_sin[rows]
+        sin_val = -cs[:, LANE:] if inverse else cs[:, LANE:]
+        z_blocks = []
+        for g in range(2):
+            x_2d = x_ref[rows, g * SUBLANE : (g + 1) * SUBLANE, :].reshape(
+                sub_t, SUBLANE * head_dim
+            )
+            x_roped = _rope_heads_2d(
+                x_2d,
+                cs[:, :LANE],
+                sin_val,
+                heads_per_group=SUBLANE,
+                head_dim=head_dim,
+                lane_perm=lane_perm,
+                sign=sign,
+                out_dtype=jnp.bfloat16,
+            )
+            amax = jnp.max(jnp.abs(x_roped), axis=1, keepdims=True)
+            inv = (FP8_E4M3_MAX / jnp.maximum(amax, jnp.bfloat16(1e-30))).astype(
+                jnp.bfloat16
+            )
+            lhs = (x_roped * inv).astype(jnp.float8_e4m3fn)
+            rhs = wa_ref[:, g * lora_rank : (g + 1) * lora_rank]
+            scale = sa_ref[:, g * lora_rank : (g + 1) * lora_rank]
+            partial = jax.lax.dot_general(
+                lhs, rhs, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+            )
+            partial = partial * (1.0 / inv.astype(jnp.float32))
+            z_blocks.append((partial * scale).astype(jnp.bfloat16))
+        z_row = jnp.concatenate(z_blocks, axis=1)
+        z_amax = jnp.max(jnp.abs(z_row), axis=1, keepdims=True)
+        z_sc = jnp.where(
+            z_amax == 0,
+            jnp.bfloat16(1.0),
+            z_amax / jnp.bfloat16(FP8_E4M3_MAX),
+        )
+        z_q = (z_row / z_sc).clip(-FP8_E4M3_MAX, FP8_E4M3_MAX).astype(jnp.float8_e4m3fn)
+        out_f32 = jax.lax.dot_general(
+            z_q, wb, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+        )
+        out_ref[rows] = (out_f32 * z_sc.astype(jnp.float32) * sb).astype(jnp.bfloat16)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("head_dim", "inverse", "name"),
+)
+def fused_reverse_rope_wo_a_wo_b_projection(
+    x: jax.Array,           # [T, 16, head_dim] bf16
+    positions: jax.Array,   # [T] int32
+    cos_sin_cache: jax.Array,
+    wo_a: jax.Array,        # [D, 2 * R] fp8
+    wo_a_scale: jax.Array,  # [2 * R] f32
+    wo_b: jax.Array,        # [2 * R, H_out] fp8
+    wo_b_scale: jax.Array,  # [H_out] f32
+    *,
+    head_dim: int,
+    inverse: bool = True,
+    name: str = "fused_wo_a_wo_b",
+) -> jax.Array:
+    """Single-kernel fused reverse-RoPE + wo_a + VMEM quantize + wo_b for H=16 (G=2)."""
+    num_tokens, num_heads, _ = x.shape
+    pad_t = ((num_tokens + 7) & ~7) - num_tokens
+    if pad_t > 0:
+        x = jnp.pad(x, ((0, pad_t), (0, 0), (0, 0)))
+        positions = jnp.pad(positions, (0, pad_t))
+    t_pad = x.shape[0]
+    reduction, out_features = wo_a.shape
+    _, hidden_dim = wo_b.shape
+    lora_rank = out_features // 2
+    tile_t = SUBLANE * _largest_divisor(t_pad // SUBLANE, cap=512 // SUBLANE)
+    sub_t = SUBLANE * _largest_divisor(tile_t // SUBLANE, cap=128 // SUBLANE)
+    cos_sin = gather_cos_sin(
+        positions, cos_sin_cache, inverse=False, name=f"{name}_gather_cos_sin"
+    )
+    out = pl.pallas_call(
+        functools.partial(
+            _wo_a_wo_b_fused_g2_kernel,
+            tile_t=tile_t,
+            num_sub_t=tile_t // sub_t,
+            lora_rank=lora_rank,
+            head_dim=head_dim,
+            inverse=True,
+        ),
+        out_shape=jax.ShapeDtypeStruct((t_pad, hidden_dim), jnp.bfloat16),
+        grid=(t_pad // tile_t,),
+        in_specs=[
+            pl.BlockSpec((tile_t, num_heads, head_dim), lambda t: (t, 0, 0)),
+            pl.BlockSpec((reduction, out_features), lambda t: (0, 0)),
+            pl.BlockSpec((1, out_features), lambda t: (0, 0)),
+            pl.BlockSpec((out_features, hidden_dim), lambda t: (0, 0)),
+            pl.BlockSpec((1, hidden_dim), lambda t: (0, 0)),
+            pl.BlockSpec((tile_t, 2 * LANE), lambda t: (t, 0)),
+        ],
+        out_specs=pl.BlockSpec((tile_t, hidden_dim), lambda t: (t, 0)),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+    )(
+        x,
+        wo_a,
+        wo_a_scale.reshape(1, out_features),
+        wo_b,
+        wo_b_scale.reshape(1, hidden_dim),
+        cos_sin,
+    )
+    return out[:num_tokens] if pad_t > 0 else out
+
+
+def _wo_a_wo_b_h128_vmem_acc_kernel(
+    x_ref: jax.Ref,      # VMEM (sub_t, 16, head_dim) bf16
+    wa_ref: jax.Ref,     # VMEM (D, 2048) fp8
+    sa_ref: jax.Ref,     # VMEM (1, 2048) f32
+    wb_ref: jax.Ref,     # VMEM (2048, 5120) fp8
+    sb_ref: jax.Ref,     # VMEM (1, 1, 1, 5120) f32
+    cs_ref: jax.Ref,     # VMEM (sub_t, 2 * LANE) f32
+    out_ref: jax.Ref,    # VMEM (sub_t, 5120) bf16
+    acc_vmem: jax.Ref,   # VMEM scratch (tile_t, 5120) f32
+    *,
+    sub_t: int,
+    num_sub_t: int,
+    lora_rank: int,
+    head_dim: int,
+    inverse: bool = True,
+) -> None:
+    b = pl.program_id(1)
+    s = pl.program_id(2)
+    cs = cs_ref[...]
+    sin_val = -cs[:, LANE:] if inverse else cs[:, LANE:]
+    lane = jnp.arange(LANE)
+    lane_perm = lane ^ 1
+    sign = jnp.where(lane % 2 == 0, -1.0, 1.0).astype(jnp.float32)
+
+    x_2d_0 = x_ref[:, :SUBLANE, :].reshape(sub_t, SUBLANE * head_dim)
+    x_r0 = _rope_heads_2d(
+        x_2d_0,
+        cs[:, :LANE],
+        sin_val,
+        heads_per_group=SUBLANE,
+        head_dim=head_dim,
+        lane_perm=lane_perm,
+        sign=sign,
+        out_dtype=jnp.bfloat16,
+    )
+    inv0 = (
+        FP8_E4M3_MAX / jnp.maximum(jnp.max(jnp.abs(x_r0), axis=1, keepdims=True), jnp.bfloat16(1e-30))
+    ).astype(jnp.bfloat16)
+    lhs0 = (x_r0 * inv0).astype(jnp.float8_e4m3fn)
+    p0 = jax.lax.dot_general(
+        lhs0, wa_ref[:, :lora_rank], (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+    )
+
+    x_2d_1 = x_ref[:, SUBLANE:, :].reshape(sub_t, SUBLANE * head_dim)
+    x_r1 = _rope_heads_2d(
+        x_2d_1,
+        cs[:, :LANE],
+        sin_val,
+        heads_per_group=SUBLANE,
+        head_dim=head_dim,
+        lane_perm=lane_perm,
+        sign=sign,
+        out_dtype=jnp.bfloat16,
+    )
+    inv1 = (
+        FP8_E4M3_MAX / jnp.maximum(jnp.max(jnp.abs(x_r1), axis=1, keepdims=True), jnp.bfloat16(1e-30))
+    ).astype(jnp.bfloat16)
+    lhs1 = (x_r1 * inv1).astype(jnp.float8_e4m3fn)
+    z0 = ((p0 * (1.0 / inv0.astype(jnp.float32))) * sa_ref[:, :lora_rank]).astype(jnp.bfloat16)
+    p1 = jax.lax.dot_general(
+        lhs1, wa_ref[:, lora_rank:], (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+    )
+    z1 = ((p1 * (1.0 / inv1.astype(jnp.float32))) * sa_ref[:, lora_rank:]).astype(jnp.bfloat16)
+
+    z_b = jnp.concatenate([z0, z1], axis=1)
+    zb_inv = (
+        FP8_E4M3_MAX / jnp.maximum(jnp.max(jnp.abs(z_b), axis=1, keepdims=True), jnp.bfloat16(1e-30))
+    ).astype(jnp.bfloat16)
+    zb_q = (z_b * zb_inv).astype(jnp.float8_e4m3fn)
+    dot_b = jax.lax.dot_general(
+        zb_q, wb_ref[...], (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+    )
+    step_out = dot_b * (1.0 / zb_inv.astype(jnp.float32)) * sb_ref[0, 0, :, :]
+
+    for s_const in range(num_sub_t):
+        @pl.when(s == s_const)
+        def _upd():
+            rows = slice(s_const * sub_t, (s_const + 1) * sub_t)
+            prev = jnp.where(
+                b == 0,
+                jnp.zeros((sub_t, wb_ref.shape[1]), dtype=jnp.float32),
+                acc_vmem[rows],
+            )
+            nxt = prev + step_out
+            acc_vmem[rows] = nxt
+            @pl.when(b == 7)
+            def _emit():
+                out_ref[...] = nxt.astype(jnp.bfloat16)
+
+
+def _wo_a_wo_b_h128_weight_outer_kernel(
+    x_ref: jax.Ref,        # VMEM (tile_t, 16, head_dim) bf16
+    wa_ref: jax.Ref,       # VMEM (D, 2048) fp8
+    sa_ref: jax.Ref,       # VMEM (1, 2048) f32
+    wb_ref: jax.Ref,       # VMEM (2048, 5120) fp8
+    sb_ref: jax.Ref,       # VMEM (1, 1, 1, 5120) f32
+    cs_ref: jax.Ref,       # VMEM (tile_t, 2 * LANE) f32
+    acc_in_ref: jax.Ref,   # VMEM (tile_t, 5120) bf16 (aliased)
+    acc_out_ref: jax.Ref,  # VMEM (tile_t, 5120) bf16 (aliased)
+    *,
+    tile_t: int,
+    num_sub_t: int,
+    lora_rank: int,
+    head_dim: int,
+    inverse: bool = True,
+) -> None:
+    b = pl.program_id(0)
+    wa = wa_ref[...]
+    wb = wb_ref[...]
+    sb = sb_ref[0, 0, :, :]
+    cos_sin = cs_ref[...]
+    sub_t = tile_t // num_sub_t
+    lane = jnp.arange(LANE)
+    lane_perm = lane ^ 1
+    sign = jnp.where(lane % 2 == 0, -1.0, 1.0).astype(jnp.float32)
+
+    for s in range(num_sub_t):
+        rows = slice(s * sub_t, (s + 1) * sub_t)
+        cs = cos_sin[rows]
+        sin_val = -cs[:, LANE:] if inverse else cs[:, LANE:]
+        x0 = _rope_heads_2d(
+            x_ref[rows, :SUBLANE, :].reshape(sub_t, SUBLANE * head_dim),
+            cs[:, :LANE],
+            sin_val,
+            heads_per_group=SUBLANE,
+            head_dim=head_dim,
+            lane_perm=lane_perm,
+            sign=sign,
+            out_dtype=jnp.bfloat16,
+        )
+        inv0 = (
+            FP8_E4M3_MAX / jnp.maximum(jnp.max(jnp.abs(x0), axis=1, keepdims=True), jnp.bfloat16(1e-30))
+        ).astype(jnp.bfloat16)
+        lhs0 = (x0 * inv0).astype(jnp.float8_e4m3fn)
+        p0 = jax.lax.dot_general(
+            lhs0, wa[:, :lora_rank], (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+        )
+
+        x1 = _rope_heads_2d(
+            x_ref[rows, SUBLANE:, :].reshape(sub_t, SUBLANE * head_dim),
+            cs[:, :LANE],
+            sin_val,
+            heads_per_group=SUBLANE,
+            head_dim=head_dim,
+            lane_perm=lane_perm,
+            sign=sign,
+            out_dtype=jnp.bfloat16,
+        )
+        inv1 = (
+            FP8_E4M3_MAX / jnp.maximum(jnp.max(jnp.abs(x1), axis=1, keepdims=True), jnp.bfloat16(1e-30))
+        ).astype(jnp.bfloat16)
+        lhs1 = (x1 * inv1).astype(jnp.float8_e4m3fn)
+        z0 = ((p0 * (1.0 / inv0.astype(jnp.float32))) * sa_ref[:, :lora_rank]).astype(jnp.bfloat16)
+        p1 = jax.lax.dot_general(
+            lhs1, wa[:, lora_rank:], (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+        )
+        z1 = ((p1 * (1.0 / inv1.astype(jnp.float32))) * sa_ref[:, lora_rank:]).astype(jnp.bfloat16)
+
+        z_b = jnp.concatenate([z0, z1], axis=1)
+        zb_inv = (
+            FP8_E4M3_MAX / jnp.maximum(jnp.max(jnp.abs(z_b), axis=1, keepdims=True), jnp.bfloat16(1e-30))
+        ).astype(jnp.bfloat16)
+        zb_q = (z_b * zb_inv).astype(jnp.float8_e4m3fn)
+        dot_b = jax.lax.dot_general(
+            zb_q, wb, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+        )
+        step_out = dot_b * (1.0 / zb_inv.astype(jnp.float32)) * sb
+        prev = jnp.where(
+            b == 0,
+            jnp.zeros((sub_t, wb.shape[1]), dtype=jnp.float32),
+            acc_in_ref[rows].astype(jnp.float32),
+        )
+        acc_out_ref[rows] = (prev + step_out).astype(jnp.bfloat16)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("head_dim", "inverse", "name"),
+)
+def fused_reverse_rope_wo_a_wo_b_h128_projection(
+    x: jax.Array,           # [T, 128, head_dim] bf16
+    positions: jax.Array,   # [T] int32
+    cos_sin_cache: jax.Array,
+    wo_a: jax.Array,        # [D, 16384] fp8
+    wo_a_scale: jax.Array,  # [16384] f32
+    wo_b: jax.Array,        # [16384, 5120] fp8
+    wo_b_scale: jax.Array,  # [5120] or [1, 8, 1, 5120] f32
+    *,
+    head_dim: int,
+    inverse: bool = True,
+    name: str = "fused_wo_a_wo_b_h128",
+) -> jax.Array:
+    """Streaming VMEM block-accumulating reverse-RoPE + wo_a + quant + wo_b for H=128.
+
+    Eliminates 100% of the intermediate [T, 16384] bfloat16 tensor z from HBM:
+    - For t_pad <= 384: keeps the entire float32 [t_pad, 5120] accumulator 100%
+      resident in TPU v7x VMEM (<= 50.25 MiB <= 63.94 MiB hardware VMEM).
+    - For t_pad > 384: runs Weight-Outer 2D grid (8, num_t_tiles) with tile_t = 256
+      (54.50 MiB VMEM), loading weights only ONCE total across all T tokens and
+      aliasing bfloat16 output directly in-place with zero extra kernel launches.
+    """
+    num_tokens, _, _ = x.shape
+    pad_t = ((num_tokens + 7) & ~7) - num_tokens
+    if pad_t > 0:
+        x = jnp.pad(x, ((0, pad_t), (0, 0), (0, 0)))
+        positions = jnp.pad(positions, (0, pad_t))
+    t_pad = x.shape[0]
+    reduction, out_features = wo_a.shape
+    _, hidden_dim = wo_b.shape
+    lora_rank = out_features // 16
+
+    cos_sin = gather_cos_sin(
+        positions, cos_sin_cache, inverse=False, name=f"{name}_gather_cos_sin"
+    )
+    if wo_b_scale.ndim == 1:
+        sb_4d = jnp.broadcast_to(
+            wo_b_scale.reshape(1, 1, 1, hidden_dim), (1, 8, 1, hidden_dim)
+        )
+    else:
+        sb_4d = wo_b_scale
+
+    if t_pad <= 384:
+        sub_t = t_pad if t_pad <= 256 else SUBLANE * _largest_divisor(t_pad // SUBLANE, cap=128 // SUBLANE)
+        num_sub_t = t_pad // sub_t
+        out = pl.pallas_call(
+            functools.partial(
+                _wo_a_wo_b_h128_vmem_acc_kernel,
+                sub_t=sub_t,
+                num_sub_t=num_sub_t,
+                lora_rank=lora_rank,
+                head_dim=head_dim,
+                inverse=inverse,
+            ),
+            out_shape=jax.ShapeDtypeStruct((t_pad, hidden_dim), jnp.bfloat16),
+            scratch_shapes=[pltpu.VMEM((t_pad, hidden_dim), jnp.float32)],
+            grid=(1, 8, num_sub_t),
+            in_specs=[
+                pl.BlockSpec((sub_t, 16, head_dim), lambda t, b, s: (s, b, 0)),
+                pl.BlockSpec((reduction, 2048), lambda t, b, s: (0, b)),
+                pl.BlockSpec((1, 2048), lambda t, b, s: (0, b)),
+                pl.BlockSpec((2048, hidden_dim), lambda t, b, s: (b, 0)),
+                pl.BlockSpec((1, 1, 1, hidden_dim), lambda t, b, s: (0, b, 0, 0)),
+                pl.BlockSpec((sub_t, 2 * LANE), lambda t, b, s: (s, 0)),
+            ],
+            out_specs=pl.BlockSpec((sub_t, hidden_dim), lambda t, b, s: (s, 0)),
+            compiler_params=pltpu.CompilerParams(
+                vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+                disable_bounds_checks=True,
+                dimension_semantics=("parallel", "arbitrary", "arbitrary"),
+            ),
+            name=f"{name}_vmem",
+        )(x, wo_a, wo_a_scale.reshape(1, out_features), wo_b, sb_4d, cos_sin)
+        return out[:num_tokens] if pad_t > 0 else out
+
+    tile_t = SUBLANE * _largest_divisor(t_pad // SUBLANE, cap=256 // SUBLANE)
+    out_init = jax.lax.empty((t_pad, hidden_dim), dtype=jnp.bfloat16)
+    out = pl.pallas_call(
+        functools.partial(
+            _wo_a_wo_b_h128_weight_outer_kernel,
+            tile_t=tile_t,
+            num_sub_t=1,
+            lora_rank=lora_rank,
+            head_dim=head_dim,
+            inverse=inverse,
+        ),
+        out_shape=jax.ShapeDtypeStruct((t_pad, hidden_dim), jnp.bfloat16),
+        grid=(8, t_pad // tile_t),
+        in_specs=[
+            pl.BlockSpec((tile_t, 16, head_dim), lambda b, t: (t, b, 0)),
+            pl.BlockSpec((reduction, 2048), lambda b, t: (0, b)),
+            pl.BlockSpec((1, 2048), lambda b, t: (0, b)),
+            pl.BlockSpec((2048, hidden_dim), lambda b, t: (b, 0)),
+            pl.BlockSpec((1, 1, 1, hidden_dim), lambda b, t: (0, b, 0, 0)),
+            pl.BlockSpec((tile_t, 2 * LANE), lambda b, t: (t, 0)),
+            pl.BlockSpec((tile_t, hidden_dim), lambda b, t: (t, 0)),
+        ],
+        out_specs=pl.BlockSpec((tile_t, hidden_dim), lambda b, t: (t, 0)),
+        input_output_aliases={6: 0},
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+            dimension_semantics=("arbitrary", "parallel"),
+        ),
+        name=f"{name}_wouter",
+    )(x, wo_a, wo_a_scale.reshape(1, out_features), wo_b, sb_4d, cos_sin, out_init)
+    return out[:num_tokens] if pad_t > 0 else out

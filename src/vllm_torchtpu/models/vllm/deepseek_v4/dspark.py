@@ -1,3 +1,8 @@
+
+try:
+    import jax
+except ImportError:
+    pass
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -130,7 +135,7 @@ def _insert_context_kv(
         if store_op is not None:
             m_pad = (kv.shape[0] + 7) & ~7
             kv_store = (
-                torch.nn.functional.pad(kv, (0, 0, 0, m_pad - kv.shape[0]))
+                torch.cat((kv, torch.zeros((m_pad - kv.shape[0], *kv.shape[1:]), dtype=kv.dtype, device=kv.device)), dim=0)
                 if m_pad > kv.shape[0]
                 else kv
             )

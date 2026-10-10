@@ -215,6 +215,8 @@ def _run_swa(
         unnormalized_output=not swa_only or sliding_window == 1,
         ced_decoder=ced_decoder,
         keep_lm_aligned=not swa_only,
+        skip_kv_update=token_parallel,
+        verify_q_len=6 if q.shape[0] <= 1536 and q.shape[0] % 6 == 0 else 0,
         non_causal_block=non_causal_block,
     )
 
@@ -346,7 +348,9 @@ def _attention_csa(
         swa_m=swa_m,
         precomputed_union=eff_union,
         sm_scale=sm_scale,
-        gather_and_attention_chunk_size=min(q.shape[0], 1024),
+        gather_and_attention_chunk_size=min(
+            q.shape[0], 256 if q.shape[1] == 64 else 512
+        ),
         ced_decoder=ced_decoder,
     )
     return output, updated_sw_cache

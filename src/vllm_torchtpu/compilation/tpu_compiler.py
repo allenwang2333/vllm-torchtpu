@@ -1,3 +1,7 @@
+try:
+    import jax
+except ImportError:
+    pass
 # SPDX-License-Identifier: Apache-2.0
 """TPU compiler adaptor for vLLM's VLLM_COMPILE mode.
 

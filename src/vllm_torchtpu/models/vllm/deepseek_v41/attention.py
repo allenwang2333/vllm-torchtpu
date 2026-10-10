@@ -53,6 +53,7 @@ except ImportError:
 from vllm_torchtpu.kernels.deepseek_v41.sparse_mla import (
     precompute_csa_union_and_bitmask,
     resolve_csa_union_params,
+    resolve_csa_union_u_chunk,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
     deepseek_v4_attention_op as _dsv4_attn_op,
@@ -131,6 +132,80 @@ def _get_dspark_swa_store_op(logical_page_size: int):
         op.register_fake(lambda sw_cache, *_: torch.empty_like(sw_cache))
         _pallas_op_cache[op_name] = op
     return op
+
+
+_O_PROJ_WOB_SPECS = (P(), P(), P(), P(), P(), P(), P())
+
+
+def _o_proj_wob_jax(
+    x: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    wo_a: jax.Array,
+    wo_a_scale: jax.Array,
+    wo_b_w: jax.Array,
+    wo_b_s: jax.Array,
+    *,
+    head_dim: int,
+) -> jax.Array:
+    if x.shape[1] == 16 and wo_b_s.ndim == 1:
+        return o_proj.fused_reverse_rope_wo_a_wo_b_projection(
+            x,
+            positions,
+            cos_sin_cache,
+            wo_a,
+            wo_a_scale,
+            wo_b_w,
+            wo_b_s,
+            head_dim=head_dim,
+        )
+    if not isinstance(x.shape[0], torch.SymInt) and x.shape[1] == 128 and wo_b_s.ndim == 4 and x.shape[0] <= 384:
+        return o_proj.fused_reverse_rope_wo_a_wo_b_h128_projection(
+            x,
+            positions,
+            cos_sin_cache,
+            wo_a,
+            wo_a_scale,
+            wo_b_w,
+            wo_b_s,
+            head_dim=head_dim,
+        )
+    orig_m = x.shape[0]
+    m_pad = 64 if orig_m == 48 else ((orig_m + 7) & ~7)
+    pad_t = m_pad - orig_m
+    x_p = jax.numpy.pad(x, ((0, pad_t), (0, 0), (0, 0))) if pad_t > 0 else x
+    p_p = jax.numpy.pad(positions, (0, pad_t)) if pad_t > 0 else positions
+    z = o_proj.fused_reverse_rope_wo_a_projection(
+        x_p, p_p, cos_sin_cache, wo_a, wo_a_scale, head_dim=head_dim
+    )
+    z = z[:orig_m] if pad_t > 0 else z
+    if wo_b_s.ndim == 4:
+        from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+        return gmm_v2(
+            lhs=z,
+            rhs=wo_b_w[None],
+            group_sizes=jax.numpy.array([z.shape[0]], dtype=jax.numpy.int32),
+            rhs_scale=wo_b_s,
+            group_offset=jax.numpy.array([0], dtype=jax.numpy.int32),
+            preferred_element_type=jax.numpy.bfloat16,
+            maybe_quantize_lhs=True,
+            zero_initialize=True,
+        )
+    from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+    return xla_quantized_matmul(z, wo_b_w, wo_b_s)
+
+
+def _fake_o_proj_wob(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    wo_a: torch.Tensor,
+    wo_a_scale: torch.Tensor,
+    wo_b_w: torch.Tensor,
+    wo_b_s: torch.Tensor,
+) -> torch.Tensor:
+    del positions, cos_sin_cache, wo_a, wo_a_scale, wo_b_s
+    return x.new_empty((x.shape[0], wo_b_w.shape[1]))
 
 
 _WQ_B_Q_ROPE_SPECS = (P(), P(), P(), P(), P())
@@ -710,7 +785,12 @@ class VllmDeepseekV41MLAAttention(
             kv, swa_kv_lens, swa_page_indices, swa_cu_q_lens, swa_distribution, rank
         ):
             del rank
-            t = kv.shape[0]
+            w = self.window_size
+            t = (
+                (kv.shape[0] - tp_size * w) * tp_size
+                if (w > 0 and kv.shape[0] > tp_size * w)
+                else kv.shape[0]
+            )
             return (
                 swa_kv_lens.new_empty((t,), dtype=torch.int32),
                 swa_kv_lens.new_empty((t, 5), dtype=torch.int32),
@@ -730,10 +810,24 @@ class VllmDeepseekV41MLAAttention(
             phys_tokens_per_page=phys_tokens_per_page,
             logical_page_size=logical_page_size,
             tp_size=tp_size,
+            sliding_window=self.window_size,
+            kv_is_sharded=True,
         )
         if not torch.compiler.is_compiling():
             object.__setattr__(self, "_tp_swa_step_meta_op", op)
         return op
+
+    def _gather_tp_kv(self, kv_local: torch.Tensor) -> torch.Tensor:
+        w = self.window_size
+        local_t = kv_local.shape[0]
+        if (
+            not isinstance(local_t, torch.SymInt)
+            and w > 0
+            and local_t >= w
+        ):
+            halo_all = tp_all_gather(kv_local[-w:].contiguous(), dim=0)
+            return torch.cat([kv_local, halo_all], dim=0)
+        return tp_all_gather(kv_local, dim=0)
 
     def _get_or_compute_tp_swa_step_metadata(
         self,
@@ -858,7 +952,7 @@ class VllmDeepseekV41MLAAttention(
         self, total_cache_rows: int, m_union: int, b_q: int | None = None
     ):
         b_q = _CSA_UNION_BQ if b_q is None else b_q
-        u_chunk = min(512, m_union)
+        u_chunk = resolve_csa_union_u_chunk(b_q, m_union, int(getattr(self, "topk", 512)))
         op_name = f"pallas::deepseek_v41_csa_union_r{total_cache_rows}_bq{b_q}_m{m_union}_uc{u_chunk}"
         if (op := self.__dict__.get(op_name)) is not None:
             return op
@@ -938,21 +1032,23 @@ class VllmDeepseekV41MLAAttention(
         op = self.__dict__.get(attr_name)
         if op is not None:
             return op
-        _ = self.q_rope_op
-        _ = self.kvnorm_rope_op
-        _ = self.qkv_norm_rope_quant_op
-        _ = self.qkv_norm_rope_op
-        _ = self.qkv_norm_rope_and_quant_op
-        _ = self.o_proj_op
-        _ = self.wq_b_q_rope_op
-        _ = self.wq_b_q_rope_prequant_op
-        if self.non_causal_multi_token_decode and not torch.compiler.is_compiling():
-            _ = self.kv_rope_op
-            _ = self.context_kv_attn_op
-        _ = _get_quantized_matmul_prequant_op()
-        if "_tp_attn_wo_b_w" in self._buffers:
-            _ = _get_quantized_matmul_op()
         if not torch.compiler.is_compiling():
+            _ = _get_quantized_matmul_prequant_op()
+            _ = self.q_rope_op
+            _ = self.kvnorm_rope_op
+            _ = self.qkv_norm_rope_quant_op
+            _ = self.qkv_norm_rope_op
+            getattr(self, "qkv_norm_rope_split_op", None)
+            _ = self.qkv_norm_rope_and_quant_op
+            _ = self.o_proj_op
+            _ = self.o_proj_wob_op
+            _ = self.wq_b_q_rope_op
+            _ = self.wq_b_q_rope_prequant_op
+            if self.non_causal_multi_token_decode:
+                _ = self.kv_rope_op
+                _ = self.context_kv_attn_op
+            if "_tp_attn_wo_b_w" in self._buffers:
+                _ = _get_quantized_matmul_op()
             _ = self._swa_group_bounds(eff_ced)
             if self.indexer is not None:
                 _ = self._leader_group_bounds(eff_ced)
@@ -1247,9 +1343,17 @@ class VllmDeepseekV41MLAAttention(
             op = pallas.jax_op(
                 op_name,
                 functools.partial(
-                    tp_attention.attention_tp_local,
+                    tp_attention.attention_tp_local_csa_union_op
+                    if (is_csa and has_union)
+                    else (
+                        tp_attention.attention_tp_local_csa_op
+                        if is_csa
+                        else tp_attention.attention_tp_local_swa_op
+                    ),
                     base_fn=base_fn,
                     logical_page_size=logical_page_size,
+                    sliding_window=self.window_size,
+                    tp_size=get_tensor_model_parallel_world_size(),
                 ),
                 mesh=vllm_context.mesh,
                 donate_argnums=(2,),
@@ -1407,6 +1511,18 @@ class VllmDeepseekV41MLAAttention(
         )
 
     @property
+    def o_proj_wob_op(self):
+        head_dim = int(self.head_dim)
+        return _get_or_register_op(
+            self,
+            f"pallas::deepseek_v4_o_proj_wob_d{head_dim}",
+            _o_proj_wob_jax,
+            _O_PROJ_WOB_SPECS,
+            _fake_o_proj_wob,
+            head_dim=head_dim,
+        )
+
+    @property
     def wq_b_q_rope_op(self):
         head_dim = int(self.head_dim)
         return _get_or_register_op(
@@ -1557,7 +1673,7 @@ class VllmDeepseekV41MLAAttention(
             if store_op is not None:
                 m_pad = (kv.shape[0] + 7) & ~7
                 kv_store = (
-                    torch.cat((kv, torch.zeros((m_pad - kv.shape[0], kv.shape[1]), dtype=kv.dtype, device=kv.device)), dim=0)
+                    torch.cat((kv, torch.zeros((m_pad - kv.shape[0], *kv.shape[1:]), dtype=kv.dtype, device=kv.device)), dim=0)
                     if m_pad > kv.shape[0]
                     else kv
                 )
@@ -1674,6 +1790,10 @@ class VllmDeepseekV41MLAAttention(
             )
             if not self.non_causal_multi_token_decode:
                 self._build_tp_wo_b_weights()
+
+        if not torch.compiler.is_compiling():
+            for _op_name in ("q_rope_op", "kvnorm_rope_op", "qkv_norm_rope_quant_op", "qkv_norm_rope_op", "qkv_norm_rope_split_op", "qkv_norm_rope_and_quant_op", "o_proj_op", "o_proj_wob_op", "wq_b_q_rope_op", "wq_b_q_rope_prequant_op"):
+                getattr(self, _op_name, None)
 
     def _build_tp_wo_b_weights(self) -> None:
         """Replicates wo_b across TP ranks for token-sharded AllToAll wo_b."""
@@ -1861,7 +1981,7 @@ class VllmDeepseekV41MLAAttention(
         use_qkv_prequant = (
             use_fused_q_rope
             and (not token_sharded_qkv or use_tp_attn)
-            and getattr(self.q_norm, "weight", None) is not None
+            and w_qnorm is not None
             and self.indexer is None
         )
         if token_sharded_qkv:
@@ -1886,40 +2006,60 @@ class VllmDeepseekV41MLAAttention(
                 if use_tp_idx:
                     qr_fp8_for_indexer = qr_q_fp8
                     qr_scale_for_indexer = qr_q_scale
-                kv = tp_all_gather(kv_local, dim=0)
-            elif (
-                not use_tp_attn
-                and use_fused_q_rope
-                and getattr(self.q_norm, "weight", None) is not None
-            ):
-                if use_tp_idx and getattr(
-                    self.indexer, "can_accept_prequant_query", lambda: False
-                )():
+                kv = self._gather_tp_kv(kv_local) if use_tp_attn else tp_all_gather(kv_local, dim=0)
+            elif w_qnorm is not None:
+                if (
+                    use_tp_idx
+                    and use_fused_q_rope
+                    and getattr(
+                        self.indexer, "can_accept_prequant_query", lambda: False
+                    )()
+                ):
                     (
                         qr_kv_normed_local,
                         qr_fp8_for_indexer,
                         qr_scale_for_indexer,
                     ) = self.qkv_norm_rope_and_quant_op(
                         qr_kv_local,
-                        self.q_norm.weight,
-                        self.kv_norm.weight,
+                        w_qnorm,
+                        w_kvnorm,
                         positions_local,
                         cos_sin,
                     )
+                    if use_tp_attn:
+                        qr_q_fp8 = qr_fp8_for_indexer
+                        qr_q_scale = qr_scale_for_indexer
+                        kv = self._gather_tp_kv(qr_kv_normed_local[:, self.q_lora_rank :])
+                    else:
+                        qr_kv_normed = tp_all_gather(qr_kv_normed_local, dim=0)
+                        qr, kv = qr_kv_normed.split(
+                            [self.q_lora_rank, self.head_dim], dim=-1
+                        )
+                elif use_tp_attn:
+                    qr, kv_local = self.qkv_norm_rope_split_op(
+                        qr_kv_local,
+                        w_qnorm,
+                        w_kvnorm,
+                        positions_local,
+                        cos_sin,
+                    )
+                    if use_tp_idx:
+                        qr_for_indexer = qr
+                    kv = self._gather_tp_kv(kv_local)
                 else:
                     qr_kv_normed_local = self.qkv_norm_rope_op(
                         qr_kv_local,
-                        self.q_norm.weight,
-                        self.kv_norm.weight,
+                        w_qnorm,
+                        w_kvnorm,
                         positions_local,
                         cos_sin,
                     )
                     if use_tp_idx:
                         qr_for_indexer = qr_kv_normed_local[:, : self.q_lora_rank]
-                qr_kv_normed = tp_all_gather(qr_kv_normed_local, dim=0)
-                qr, kv = qr_kv_normed.split(
-                    [self.q_lora_rank, self.head_dim], dim=-1
-                )
+                    qr_kv_normed = tp_all_gather(qr_kv_normed_local, dim=0)
+                    qr, kv = qr_kv_normed.split(
+                        [self.q_lora_rank, self.head_dim], dim=-1
+                    )
             else:
                 qr_local, kv_local = qr_kv_local.split(
                     [self.q_lora_rank, self.head_dim], dim=-1
@@ -1931,9 +2071,8 @@ class VllmDeepseekV41MLAAttention(
                 if use_tp_idx:
                     qr_for_indexer = qr_local
                 if use_tp_attn:
-                    # qr stays local; only the normed, roped kv is gathered.
                     qr = qr_local
-                    kv = tp_all_gather(kv_local, dim=0)
+                    kv = self._gather_tp_kv(kv_local)
                 else:
                     qr_kv_normed = tp_all_gather(
                         torch.cat([qr_local, kv_local], dim=-1), dim=0
@@ -2159,7 +2298,7 @@ class VllmDeepseekV41MLAAttention(
             )
             tp_has_union = False
             tp_union_operands: tuple = ()
-            if is_csa:
+            if is_csa and _CSA_UNION:
                 local_tokens = int(q.shape[0])
                 max_num_seqs = (
                     int(main_q_loc.shape[0]) - 1
@@ -2174,8 +2313,7 @@ class VllmDeepseekV41MLAAttention(
                         ced_decoder=eff_ced_decoder,
                         num_q_heads=int(q.shape[1]),
                     )
-                    if _CSA_UNION
-                    and main_cache_kv.shape[0] > 0
+                    if main_cache_kv.shape[0] > 0
                     and topk_indices is not None
                     and topk_indices.shape[0] == local_tokens
                     and topk_indices.shape[1] % 128 == 0
@@ -2220,14 +2358,15 @@ class VllmDeepseekV41MLAAttention(
                 swa_store_blk_meta,
             )
             orig_sw_cache.copy_(new_sw_cache)
-            z = self.o_proj_op(
+            return self.o_proj_wob_op(
                 attn_output,
                 positions_local,
                 cos_sin,
                 self._tp_attn_wo_a_w,
                 self._tp_attn_wo_a_s,
+                self._tp_attn_wo_b_w,
+                self._tp_attn_wo_b_s,
             )
-            return quantized_matmul(z, self._tp_attn_wo_b_w, self._tp_attn_wo_b_s)
         if (
             orig_sw_cache is not None
             and swa_tables is not None
@@ -2269,28 +2408,34 @@ class VllmDeepseekV41MLAAttention(
         if orig_sw_cache is not None:
             orig_sw_cache.copy_(new_sw_cache)
 
-        z = self.o_proj_op(
-            attn_output,
-            positions,
-            cos_sin,
-            self.wo_a.weight,
-            self.wo_a.weight_scale,
-        )
+        w_wo_a = self.wo_a.weight
+        ws_wo_a = self.wo_a._parameters.get("weight_scale")
+        w_wo_b = self.wo_b.weight
+        ws_wo_b = self.wo_b._parameters.get("weight_scale")
+
+        if (
+            ws_wo_b is not None
+            and ws_wo_b.ndim == 1
+            and self.wo_b._parameters.get("bias") is None
+            and self.n_local_heads == 16
+        ):
+            w_wo_b_in = (
+                w_wo_b.transpose(0, 1)
+                if getattr(self.wo_b, KEEP_VLLM_LAYOUT_ATTR, False)
+                else w_wo_b
+            )
+            out_wob = self.o_proj_wob_op(
+                attn_output, positions, cos_sin, w_wo_a, ws_wo_a, w_wo_b_in, ws_wo_b
+            )
+            if tp_size > 1:
+                return (
+                    tp_reduce_scatter(out_wob, dim=0)
+                    if return_token_sharded
+                    else tp_all_reduce(out_wob)
+                )
+            return out_wob
+        z = self.o_proj_op(attn_output, positions, cos_sin, w_wo_a, ws_wo_a)
         if return_token_sharded and tp_size > 1:
-            if (
-                num_tokens <= 2048
-                and num_tokens % (8 * tp_size) == 0
-                and "_tp_attn_wo_b_w" in self._buffers
-            ):
-                z_a2a = tp_all_to_all(z)
-                z_local = (
-                    z_a2a.view(tp_size, -1, int(z.shape[1]))
-                    .transpose(0, 1)
-                    .reshape(-1, tp_size * int(z.shape[1]))
-                )
-                return quantized_matmul(
-                    z_local, self._tp_attn_wo_b_w, self._tp_attn_wo_b_s
-                )
             out_parallel = self.wo_b.quant_method.apply(self.wo_b, z, None)
             return tp_reduce_scatter(out_parallel, dim=0)
         return self.wo_b(z)

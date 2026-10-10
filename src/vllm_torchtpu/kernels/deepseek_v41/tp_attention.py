@@ -420,8 +420,58 @@ def _compute_swa_store_coalesced_metadata(
     return dst, blk_meta
 
 
+def _compute_tp_swa_halo_metadata(
+    kv_lens: jax.Array,
+    table: jax.Array,
+    cu_q_lens: jax.Array,
+    rank: jax.Array,
+    *,
+    num_tokens: int,
+    local_tokens: int,
+    sliding_window: int,
+    num_cache_pages: int,
+    phys_tokens_per_page: int,
+    logical_page_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    total_rows = num_cache_pages * phys_tokens_per_page
+    w = sliding_window
+    blk_sz = 64 if (2 * w) % 64 == 0 else (16 if (2 * w) % 16 == 0 else 1)
+    num_halo_blks = (2 * w) // blk_sz
+    iota_w = jnp.arange(w, dtype=jnp.int32)
+    r = rank[0]
+    t_prev = jnp.maximum(r, 1) * local_tokens - w + iota_w
+    t_last = (num_tokens - w) + iota_w
+    t_halo = jnp.concatenate([t_prev, t_last], axis=0)
+    _, pos_halo, rows_halo = _swa_token_rows_for_indices(
+        t_halo,
+        kv_lens,
+        table,
+        cu_q_lens,
+        jnp.int32(num_tokens),
+        num_cache_pages=num_cache_pages,
+        phys_tokens_per_page=phys_tokens_per_page,
+        logical_page_size=logical_page_size,
+        table_ring_mapped=True,
+    )
+    rows_2d = rows_halo.reshape(num_halo_blks, blk_sz)
+    pos_2d = pos_halo.reshape(num_halo_blks, blk_sz)
+    b_idx = jnp.arange(num_halo_blks, dtype=jnp.int32)
+    blk_active = (r > 0) | (b_idx >= (w // blk_sz))
+    pos0 = pos_2d[:, 0]
+    rem_in_page = logical_page_size - (pos0 % logical_page_size)
+    can_split2 = blk_active & (pos0 >= 0) & (blk_sz <= logical_page_size)
+    len0 = jnp.where(can_split2, jnp.minimum(blk_sz, rem_in_page), 0)
+    row0 = rows_2d[:, 0]
+    len1 = jnp.where(can_split2, blk_sz - len0, 0)
+    row1 = rows_2d[:, -1] - len1 + 1
+    has_rem = (~can_split2 & blk_active).astype(jnp.int32)
+    blk_meta_halo = jnp.stack([len0, row0, len1, row1, has_rem], axis=1)
+    dst_halo = _pack_blk_run_len_fast(rows_2d, total_rows).reshape(2 * w)
+    return dst_halo, blk_meta_halo
+
+
 def prepare_tp_swa_step_metadata(
-    new_kv: jax.Array,  # bf16 [T, head_dim]
+    new_kv: jax.Array,  # bf16 [T, head_dim] or sharded [T / tp, head_dim]
     kv_lens: jax.Array,
     page_indices: jax.Array,
     cu_q_lens: jax.Array,
@@ -432,9 +482,21 @@ def prepare_tp_swa_step_metadata(
     phys_tokens_per_page: int,
     logical_page_size: int,
     tp_size: int,
+    sliding_window: int = 0,
+    kv_is_sharded: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Precomputes stage-invariant SWA coalesced store and token-slice metadata."""
-    T = new_kv.shape[0]
+    kv_has_packed_halo = (
+        kv_is_sharded
+        and tp_size > 1
+        and sliding_window > 0
+        and new_kv.shape[0] > tp_size * sliding_window
+    )
+    T = (
+        (new_kv.shape[0] - tp_size * sliding_window) * tp_size
+        if kv_has_packed_halo
+        else new_kv.shape[0]
+    )
     local_tokens = T // tp_size
     token_start = rank[0] * local_tokens
     num_seq_slots = kv_lens.shape[0]
@@ -443,19 +505,56 @@ def prepare_tp_swa_step_metadata(
         table = jnp.where(
             table > 0, ((table - 1) % (num_cache_pages - 1)) + 1, 0
         )
-    dst, blk_meta = _compute_swa_store_coalesced_metadata(
-        kv_lens,
-        table,
-        cu_q_lens,
-        distribution,
-        num_tokens=T,
-        num_cache_pages=num_cache_pages,
-        phys_tokens_per_page=phys_tokens_per_page,
-        logical_page_size=logical_page_size,
-        table_ring_mapped=True,
-    )
-    if blk_meta.shape[0] < T:
-        blk_meta = jnp.pad(blk_meta, ((0, T - blk_meta.shape[0]), (0, 0)))
+
+    def _full_meta(_):
+        d, bm = _compute_swa_store_coalesced_metadata(
+            kv_lens,
+            table,
+            cu_q_lens,
+            distribution,
+            num_tokens=T,
+            num_cache_pages=num_cache_pages,
+            phys_tokens_per_page=phys_tokens_per_page,
+            logical_page_size=logical_page_size,
+            table_ring_mapped=True,
+        )
+        if bm.shape[0] < T:
+            bm = jnp.pad(bm, ((0, T - bm.shape[0]), (0, 0)))
+        return d, bm
+
+    if kv_has_packed_halo and local_tokens >= sliding_window and (2 * sliding_window) <= T:
+        single_req = (distribution[2] == 1) & (cu_q_lens[1] == T)
+
+        def _halo_meta(_):
+            d_h, bm_h = _compute_tp_swa_halo_metadata(
+                kv_lens,
+                table,
+                cu_q_lens,
+                rank,
+                num_tokens=T,
+                local_tokens=local_tokens,
+                sliding_window=sliding_window,
+                num_cache_pages=num_cache_pages,
+                phys_tokens_per_page=phys_tokens_per_page,
+                logical_page_size=logical_page_size,
+            )
+            d_pad = (
+                jnp.pad(d_h, (0, T - d_h.shape[0]))
+                if d_h.shape[0] < T
+                else d_h
+            )
+            bm_pad = (
+                jnp.pad(bm_h, ((0, T - bm_h.shape[0]), (0, 0)))
+                if bm_h.shape[0] < T
+                else bm_h
+            )
+            bm_pad = bm_pad.at[-1, 0].set(jnp.int32(1))
+            return d_pad, bm_pad
+
+        dst, blk_meta = lax.cond(single_req, _halo_meta, _full_meta, None)
+    else:
+        dst, blk_meta = _full_meta(None)
+
     swa_cu, swa_kv, swa_pages, swa_dist = rebase_token_slice(
         cu_q_lens,
         kv_lens,
@@ -544,7 +643,7 @@ def swa_store_all_pallas(
 
 def attention_tp_local(
     q: jax.Array,  # [T / tp, H, D]: all heads of this rank's token slice
-    new_kv: jax.Array,  # [T, D]: every token's normed, roped KV
+    new_kv: jax.Array,  # [T, D] full gathered or [local_tokens + tp_size * w, D] packed halo
     sw_cache: jax.Array,
     swa_kv_lens: jax.Array,
     swa_page_indices: jax.Array,
@@ -552,23 +651,29 @@ def attention_tp_local(
     swa_distribution: jax.Array,
     main_cache_kv: jax.Array,
     main_kv_lens: jax.Array,
-    extra: jax.Array,  # [T, ...]: CSA top-k rows (positions + 1 for SWA, unused)
+    extra: jax.Array,
     main_page_indices: jax.Array,
     main_cu_q_lens: jax.Array,
     main_distribution: jax.Array,
     attention_sinks: jax.Array,  # [H]
     rank: jax.Array,  # i32[1]
-    *trailing_args: jax.Array,
+    a0: jax.Array | None = None,
+    a1: jax.Array | None = None,
+    a2: jax.Array | None = None,
+    a3: jax.Array | None = None,
+    a4: jax.Array | None = None,
+    a5: jax.Array | None = None,
+    *,
     base_fn: Callable,
     logical_page_size: int,
     store_fn: Callable = swa_store_all_pallas,
+    sliding_window: int = 0,
+    tp_size: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
-    """Stores all T SWA rows, then runs `base_fn` on this rank's token slice.
-
-    `base_fn` is `_attention_swa` / `_attention_csa` with static kwargs bound.
-    The CSA kernel reads only the main cu_q_lens / distribution (its top-k rows
-    are absolute cache rows), so main kv_lens and page indices pass through.
-    """
+    """Stores SWA rows needed across ranks, then runs `base_fn` on this rank's slice."""
+    trailing_args = tuple(
+        x for x in (a0, a1, a2, a3, a4, a5) if x is not None
+    )
     main_cache_rope: jax.Array | None = None
     union_gather_indices: jax.Array | None = None
     cand_bits_tiled: jax.Array | None = None
@@ -602,34 +707,12 @@ def attention_tp_local(
 
     local_tokens = q.shape[0]
     token_start = rank[0] * local_tokens
-    if swa_store_dst is not None and swa_store_blk_meta is not None:
-        sw_cache = swa_store_all_pallas_precomputed(
-            sw_cache, new_kv, swa_store_dst, swa_store_blk_meta
-        )
-        swa_cu, swa_kv, swa_pages, swa_dist = (
-            swa_cu_q_lens,
-            swa_kv_lens,
-            swa_page_indices,
-            swa_distribution,
-        )
-    else:
-        sw_cache = store_fn(
-            sw_cache,
-            new_kv,
-            swa_kv_lens,
-            swa_page_indices,
-            swa_cu_q_lens,
-            swa_distribution,
-            logical_page_size=logical_page_size,
-        )
-        swa_cu, swa_kv, swa_pages, swa_dist = rebase_token_slice(
-            swa_cu_q_lens,
-            swa_kv_lens,
-            swa_page_indices,
-            swa_distribution,
-            token_start,
-            local_tokens=local_tokens,
-        )
+    w = sliding_window
+    is_packed_halo = (
+        tp_size > 1
+        and w > 0
+        and new_kv.shape[0] == local_tokens + tp_size * w
+    )
     is_csa = main_cache_rope is not None
     if is_csa:
         main_cu, _, _, main_dist = rebase_token_slice(
@@ -648,15 +731,113 @@ def attention_tp_local(
             return x
         return lax.dynamic_slice_in_dim(x, token_start, local_tokens, axis=0)
 
+    my_local_kv = new_kv[:local_tokens] if is_packed_halo else local(new_kv)
+
     has_union = (
         is_csa
         and union_gather_indices is not None
         and cand_bits_tiled is not None
         and n_unique is not None
     )
+
+    if swa_store_dst is not None and swa_store_blk_meta is not None:
+        swa_cu, swa_kv, swa_pages, swa_dist = (
+            swa_cu_q_lens,
+            swa_kv_lens,
+            swa_page_indices,
+            swa_distribution,
+        )
+
+        def _invoke_base(sw_c: jax.Array) -> tuple[jax.Array, jax.Array]:
+            return base_fn(
+                q,
+                my_local_kv,
+                sw_c,
+                swa_kv,
+                swa_pages,
+                swa_cu,
+                swa_dist,
+                main_cache_kv,
+                main_kv_lens,
+                local(extra) if is_csa else extra,
+                main_page_indices,
+                main_cu,
+                main_dist,
+                attention_sinks,
+                *((main_cache_rope,) if is_csa else ()),
+                *(
+                    (union_gather_indices, cand_bits_tiled, n_unique)
+                    if has_union
+                    else ()
+                ),
+            )
+
+        if is_packed_halo:
+            T = local_tokens * tp_size
+            kv_tails = new_kv[local_tokens:]
+            num_pages, _, _, _ = csa_cache_layout.u8_slab_shape(
+                sw_cache.shape, sw_cache.dtype
+            )
+            ring_wraps = (num_pages > 1) and (
+                (num_pages - 1) * logical_page_size < T
+            )
+            r_prev = jnp.maximum(rank[0] - 1, 0)
+            halo_prev = lax.dynamic_slice_in_dim(
+                kv_tails, r_prev * w, w, axis=0
+            )
+            halo_last = lax.dynamic_slice_in_dim(
+                kv_tails, (tp_size - 1) * w, w, axis=0
+            )
+            if not ring_wraps:
+                halo_kv = jnp.concatenate([halo_prev, halo_last], axis=0)
+                sw_c = swa_store_all_pallas_precomputed(
+                    sw_cache, halo_kv, swa_store_dst[: 2 * w], swa_store_blk_meta
+                )
+                return _invoke_base(sw_c)
+            blk_sz_w = (
+                64 if (2 * w) % 64 == 0 else (16 if (2 * w) % 16 == 0 else 1)
+            )
+            w_blks = w // blk_sz_w
+            sw_c = swa_store_all_pallas_precomputed(
+                sw_cache,
+                halo_prev,
+                swa_store_dst[:w],
+                swa_store_blk_meta[:w_blks],
+            )
+            out, sw_c = _invoke_base(sw_c)
+            sw_c = swa_store_all_pallas_precomputed(
+                sw_c,
+                halo_last,
+                swa_store_dst[w : 2 * w],
+                swa_store_blk_meta[w_blks : 2 * w_blks],
+            )
+            return out, sw_c
+
+        sw_cache = swa_store_all_pallas_precomputed(
+            sw_cache, new_kv, swa_store_dst, swa_store_blk_meta
+        )
+        return _invoke_base(sw_cache)
+
+    sw_cache = store_fn(
+        sw_cache,
+        new_kv,
+        swa_kv_lens,
+        swa_page_indices,
+        swa_cu_q_lens,
+        swa_distribution,
+        logical_page_size=logical_page_size,
+    )
+    swa_cu, swa_kv, swa_pages, swa_dist = rebase_token_slice(
+        swa_cu_q_lens,
+        swa_kv_lens,
+        swa_page_indices,
+        swa_distribution,
+        token_start,
+        local_tokens=local_tokens,
+    )
     return base_fn(
         q,
-        local(new_kv),
+        my_local_kv,
         sw_cache,
         swa_kv,
         swa_pages,
@@ -671,4 +852,161 @@ def attention_tp_local(
         attention_sinks,
         *((main_cache_rope,) if is_csa else ()),
         *((union_gather_indices, cand_bits_tiled, n_unique) if has_union else ()),
+    )
+
+
+def attention_tp_local_swa_op(
+    q: jax.Array,
+    new_kv: jax.Array,
+    sw_cache: jax.Array,
+    swa_kv_lens: jax.Array,
+    swa_page_indices: jax.Array,
+    swa_cu_q_lens: jax.Array,
+    swa_distribution: jax.Array,
+    main_cache_kv: jax.Array,
+    main_kv_lens: jax.Array,
+    extra: jax.Array,
+    main_page_indices: jax.Array,
+    main_cu_q_lens: jax.Array,
+    main_distribution: jax.Array,
+    attention_sinks: jax.Array,
+    rank: jax.Array,
+    swa_store_dst: jax.Array,
+    swa_store_blk_meta: jax.Array,
+    *,
+    base_fn: Callable,
+    logical_page_size: int,
+    sliding_window: int = 0,
+    tp_size: int = 1,
+) -> tuple[jax.Array, jax.Array]:
+    return attention_tp_local(
+        q,
+        new_kv,
+        sw_cache,
+        swa_kv_lens,
+        swa_page_indices,
+        swa_cu_q_lens,
+        swa_distribution,
+        main_cache_kv,
+        main_kv_lens,
+        extra,
+        main_page_indices,
+        main_cu_q_lens,
+        main_distribution,
+        attention_sinks,
+        rank,
+        swa_store_dst,
+        swa_store_blk_meta,
+        base_fn=base_fn,
+        logical_page_size=logical_page_size,
+        sliding_window=sliding_window,
+        tp_size=tp_size,
+    )
+
+
+def attention_tp_local_csa_op(
+    q: jax.Array,
+    new_kv: jax.Array,
+    sw_cache: jax.Array,
+    swa_kv_lens: jax.Array,
+    swa_page_indices: jax.Array,
+    swa_cu_q_lens: jax.Array,
+    swa_distribution: jax.Array,
+    main_cache_kv: jax.Array,
+    main_kv_lens: jax.Array,
+    extra: jax.Array,
+    main_page_indices: jax.Array,
+    main_cu_q_lens: jax.Array,
+    main_distribution: jax.Array,
+    attention_sinks: jax.Array,
+    rank: jax.Array,
+    main_cache_rope: jax.Array,
+    swa_store_dst: jax.Array,
+    swa_store_blk_meta: jax.Array,
+    *,
+    base_fn: Callable,
+    logical_page_size: int,
+    sliding_window: int = 0,
+    tp_size: int = 1,
+) -> tuple[jax.Array, jax.Array]:
+    return attention_tp_local(
+        q,
+        new_kv,
+        sw_cache,
+        swa_kv_lens,
+        swa_page_indices,
+        swa_cu_q_lens,
+        swa_distribution,
+        main_cache_kv,
+        main_kv_lens,
+        extra,
+        main_page_indices,
+        main_cu_q_lens,
+        main_distribution,
+        attention_sinks,
+        rank,
+        main_cache_rope,
+        swa_store_dst,
+        swa_store_blk_meta,
+        base_fn=base_fn,
+        logical_page_size=logical_page_size,
+        sliding_window=sliding_window,
+        tp_size=tp_size,
+    )
+
+
+def attention_tp_local_csa_union_op(
+    q: jax.Array,
+    new_kv: jax.Array,
+    sw_cache: jax.Array,
+    swa_kv_lens: jax.Array,
+    swa_page_indices: jax.Array,
+    swa_cu_q_lens: jax.Array,
+    swa_distribution: jax.Array,
+    main_cache_kv: jax.Array,
+    main_kv_lens: jax.Array,
+    extra: jax.Array,
+    main_page_indices: jax.Array,
+    main_cu_q_lens: jax.Array,
+    main_distribution: jax.Array,
+    attention_sinks: jax.Array,
+    rank: jax.Array,
+    main_cache_rope: jax.Array,
+    union_gather_indices: jax.Array,
+    cand_bits_tiled: jax.Array,
+    n_unique: jax.Array,
+    swa_store_dst: jax.Array,
+    swa_store_blk_meta: jax.Array,
+    *,
+    base_fn: Callable,
+    logical_page_size: int,
+    sliding_window: int = 0,
+    tp_size: int = 1,
+) -> tuple[jax.Array, jax.Array]:
+    return attention_tp_local(
+        q,
+        new_kv,
+        sw_cache,
+        swa_kv_lens,
+        swa_page_indices,
+        swa_cu_q_lens,
+        swa_distribution,
+        main_cache_kv,
+        main_kv_lens,
+        extra,
+        main_page_indices,
+        main_cu_q_lens,
+        main_distribution,
+        attention_sinks,
+        rank,
+        main_cache_rope,
+        union_gather_indices,
+        cand_bits_tiled,
+        n_unique,
+        swa_store_dst,
+        swa_store_blk_meta,
+        base_fn=base_fn,
+        logical_page_size=logical_page_size,
+        sliding_window=sliding_window,
+        tp_size=tp_size,
     )

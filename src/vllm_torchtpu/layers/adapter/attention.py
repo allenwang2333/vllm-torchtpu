@@ -1470,9 +1470,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pool_head_dim = kv_cache.shape[-1]
         if pool_head_dim > self.head_size:
             pad_size = pool_head_dim - self.head_size
-            query = torch.nn.functional.pad(query, (0, pad_size))
-            key = torch.nn.functional.pad(key, (0, pad_size))
-            value = torch.nn.functional.pad(value, (0, pad_size))
+            query = torch.cat((query, torch.zeros((*query.shape[:-1], pad_size), dtype=query.dtype, device=query.device)), dim=-1)
+            key = torch.cat((key, torch.zeros((*key.shape[:-1], pad_size), dtype=key.dtype, device=key.device)), dim=-1)
+            value = torch.cat((value, torch.zeros((*value.shape[:-1], pad_size), dtype=value.dtype, device=value.device)), dim=-1)
         if self.kv_cache_quantized_dtype:
             k_scale_value = layer._k_scale_float
             v_scale_value = layer._v_scale_float

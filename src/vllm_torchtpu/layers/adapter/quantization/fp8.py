@@ -39,6 +39,11 @@ the blockwise Pallas kernel path instead.
 
 from __future__ import annotations
 
+try:
+    import jax
+except ImportError:
+    pass
+
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 

@@ -361,9 +361,15 @@ class StructuredDecodingManager:
             :, : self.vocab_size
         ]
         if target_dim > self.vocab_size:
-            unpacked_bitmask = torch.nn.functional.pad(
-                unpacked_bitmask,
-                (0, target_dim - self.vocab_size),
-                value=True,
+            unpacked_bitmask = torch.cat(
+                (
+                    unpacked_bitmask,
+                    torch.ones(
+                        (*unpacked_bitmask.shape[:-1], target_dim - self.vocab_size),
+                        dtype=unpacked_bitmask.dtype,
+                        device=unpacked_bitmask.device,
+                    ),
+                ),
+                dim=-1,
             )
         return torch.where(unpacked_bitmask, float("-inf"), logits)

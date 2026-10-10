@@ -219,9 +219,33 @@ def _staged_walk_products(
             tbl_2d = sub
             outs.append(sub.reshape(n_pad * t_pad).clone())
         else:
-            tbl_2d = torch.nn.functional.pad(
-                sub, (0, t_pad - c_up, 0, n_pad - r_up)
+            tbl_2d = (
+                torch.cat(
+                    (
+                        sub,
+                        torch.zeros(
+                            (r_up, t_pad - c_up),
+                            dtype=sub.dtype,
+                            device=sub.device,
+                        ),
+                    ),
+                    dim=1,
+                )
+                if t_pad > c_up
+                else sub
             )
+            if n_pad > r_up:
+                tbl_2d = torch.cat(
+                    (
+                        tbl_2d,
+                        torch.zeros(
+                            (n_pad - r_up, t_pad),
+                            dtype=tbl_2d.dtype,
+                            device=tbl_2d.device,
+                        ),
+                    ),
+                    dim=0,
+                )
             outs.append(tbl_2d.reshape(n_pad * t_pad))
         tables_2d.append(tbl_2d)
     states = []

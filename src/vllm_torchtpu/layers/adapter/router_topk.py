@@ -1,3 +1,8 @@
+
+try:
+    import jax
+except ImportError:
+    pass
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -266,7 +271,7 @@ def _pad_rows_to_8(x: torch.Tensor) -> tuple[torch.Tensor, int, int]:
     orig_rows = x.shape[0]
     pad_r = (-orig_rows) & 7
     if pad_r:
-        x = torch.cat((x, torch.zeros((pad_r, x.shape[1]), dtype=x.dtype, device=x.device)), dim=0)
+        x = torch.cat((x, torch.zeros((pad_r, *x.shape[1:]), dtype=x.dtype, device=x.device)), dim=0)
     return x, orig_rows, pad_r
 
 

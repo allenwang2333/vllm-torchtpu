@@ -15,6 +15,11 @@
 
 from __future__ import annotations
 
+try:
+    import jax
+except ImportError:
+    pass
+
 import re
 import typing
 from collections.abc import Callable, Iterable
@@ -57,13 +62,8 @@ logger = init_logger(__name__)
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
-try:
-    import jax
-except ImportError:
-    jax = None  # type: ignore[assignment]
-
-
 def _init_dspark_qmm_ops() -> tuple[Callable, Callable]:
+    import jax
     import jax.numpy as jnp
     from torch_tpu._internal import pallas
 
@@ -710,7 +710,7 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         valid_vocab = end_idx - start_idx
         w2_raw = markov_w2.weight[start_idx:end_idx]
         w2_pad = (
-            torch.nn.functional.pad(w2_raw, (0, 0, 0, shard_cols - valid_vocab))
+            torch.cat((w2_raw, torch.zeros((shard_cols - valid_vocab, w2_raw.shape[1]), dtype=w2_raw.dtype, device=w2_raw.device)), dim=0)
             if valid_vocab < shard_cols
             else w2_raw.clone().contiguous()
         ).to(device=dev)

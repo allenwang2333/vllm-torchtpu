@@ -831,7 +831,7 @@ def _qkv_norm_rope_quant_body(
 
 
 def _qkv_tile_n(t_pad: int) -> int:
-    cap_n = 32 if t_pad <= 64 else (128 if t_pad <= 384 else 256)
+    cap_n = 32 if t_pad <= 64 else (128 if t_pad <= 256 else 1024)
     return SUBLANE * largest_divisor(t_pad // SUBLANE, cap=cap_n // SUBLANE)
 
 
@@ -1140,6 +1140,37 @@ def qkv_norm_rope_split_cos_sin(
     if pad_t > 0:
         return qr_out[:num_tokens], kv_out[:num_tokens]
     return qr_out, kv_out
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("eps", "q_eps", "kv_eps", "inverse", "name"),
+)
+def qkv_norm_rope_split(
+    qr_kv: jax.Array,
+    q_weight: jax.Array,
+    kv_weight: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    eps: float = 1e-6,
+    q_eps: float | None = None,
+    kv_eps: float | None = None,
+    inverse: bool = False,
+    name: str = "qkv_norm_rope_split",
+) -> tuple[jax.Array, jax.Array]:
+    """Fused q_norm + kv_norm + RoPE writing separate contiguous (qr, kv) outputs."""
+    cos_sin = _expand_cos_sin(positions, cos_sin_cache, inverse=inverse)
+    return qkv_norm_rope_split_cos_sin(
+        qr_kv,
+        q_weight,
+        kv_weight,
+        cos_sin,
+        eps=eps,
+        q_eps=q_eps,
+        kv_eps=kv_eps,
+        name=name,
+    )
 
 
 def _qkv_norm_rope_and_quant_body(

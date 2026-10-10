@@ -5122,17 +5122,32 @@ class TPUModelRunner(GPUModelRunner):
                         1 + self.speculative_config.num_speculative_tokens
                     )
                     if spec_num_rejected.shape[0] < self.max_num_reqs:
-                        spec_num_rejected = torch.nn.functional.pad(
-                            spec_num_rejected,
-                            (0, self.max_num_reqs - spec_num_rejected.shape[0]),
+                        spec_num_rejected = torch.cat(
+                            (
+                                spec_num_rejected,
+                                torch.zeros(
+                                    (self.max_num_reqs - spec_num_rejected.shape[0],),
+                                    dtype=spec_num_rejected.dtype,
+                                    device=spec_num_rejected.device,
+                                ),
+                            ),
+                            dim=0,
                         )
                 else:
                     bound = _get_padded_num_reqs_with_upper_limit(
                         next_tokens_tpu.shape[0], self.max_num_reqs
                     )
                 if next_tokens_tpu.shape[0] < bound:
-                    next_tokens_tpu = torch.nn.functional.pad(
-                        next_tokens_tpu, (0, bound - next_tokens_tpu.shape[0])
+                    next_tokens_tpu = torch.cat(
+                        (
+                            next_tokens_tpu,
+                            torch.zeros(
+                                (bound - next_tokens_tpu.shape[0],),
+                                dtype=next_tokens_tpu.dtype,
+                                device=next_tokens_tpu.device,
+                            ),
+                        ),
+                        dim=0,
                     )
                 next_tokens_cpu = None
                 next_tokens_ready_event = None
