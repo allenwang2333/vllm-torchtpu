@@ -21,23 +21,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-try:
-    from google3.experimental.users.hwanginho.deepseek_v4.streamindex_topk.streamindex_topk import (  # noqa: E501
-        KVLayout,
-        convert_cache_to_seq_along_lane,
-        streamindex_topk,
-    )
-except ImportError:
-    # `convert_cache_to_seq_along_lane` is not re-exported by the package's
-    # `__init__`, and the package attribute `streamindex_topk` is the jitted
-    # function rather than the submodule, so it is imported by name here.
-    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-        KVLayout,
-        streamindex_topk,
-    )
-    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
-        convert_cache_to_seq_along_lane,
-    )
+# `convert_cache_to_seq_along_lane` is not re-exported by the package's
+# `__init__`, and the package attribute `streamindex_topk` is the jitted
+# function rather than the submodule, so it is imported by name here.
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    KVLayout,
+    streamindex_topk,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+    convert_cache_to_seq_along_lane,
+)
 
 
 # =====================================================================
@@ -317,7 +310,11 @@ def test_streamindex_topk_shape(
         ),
     ],
 )
+# Cases 2 and 6 have q_len-1 rows (the DECODE passes run); the rest have none
+# (they are branched around), so both sides of the skip cond are checked.
+@pytest.mark.parametrize("skip_empty_decode", [False, True])
 def test_streamindex_topk_numerical_correctness(
+    skip_empty_decode,
     B,
     T_list,
     S_list,
@@ -434,6 +431,7 @@ def test_streamindex_topk_numerical_correctness(
         compression_ratio=comp_ratio,
         num_kv_pages_per_block=bkv_p,
         num_queries_per_block=bq_sz,
+        skip_empty_decode=skip_empty_decode,
     )
 
     actual_topk_np = np.array(actual_topk)

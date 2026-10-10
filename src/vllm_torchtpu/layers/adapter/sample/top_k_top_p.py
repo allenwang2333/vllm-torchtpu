@@ -22,12 +22,20 @@ from collections.abc import Callable, Sequence
 import torch
 
 MASKED_LOGIT_VALUE = -1e12
+# 128 matches the native TPU (8, 128) vector tile / 128-element lane width
+# and evenly divides standard padded vocabs (e.g. 248,320 = 1,940 * 128;
+# 152,064 = 1,188 * 128; 128,256 = 1,002 * 128), ensuring per-block amax
+# and gathers run without tail padding. At 64 blocks, candidate bisection
+# evaluates 8,192 logits instead of 248,320.
+CANDIDATE_BLOCK = 128
 
 
 def _int32_bsearch(
     batch_shape: Sequence[int],
     predicate: Callable[[torch.Tensor], torch.Tensor],
     device: torch.device,
+    radix_bits: int = 1,
+    skip_bits: int = 0,
 ) -> torch.Tensor:
     """Batched binary search over int32 values.
 
@@ -43,6 +51,14 @@ def _int32_bsearch(
         then return True for all numbers > that threshold. The threshold may be
         different for different elements of the batch.
       device: device to allocate the search state on.
+      radix_bits: bits resolved per predicate round. Above 1, each round
+        evaluates the predicate on all 2**radix_bits - 1 candidates of the next
+        digit at once (a leading candidate axis on the threshold), and the
+        digit is the number of candidates that return False. Monotonicity makes
+        that the same digit the 1-bit search picks, in 1/radix_bits the rounds
+        (each round is one pass over the predicate's input).
+      skip_bits: mask of bits 30..0 the caller has proven the 1-bit search
+        never sets (radix_bits == 1 only); their rounds are not run.
 
     Returns:
       For each element of the batch, the largest int32 for which the predicate
@@ -56,8 +72,31 @@ def _int32_bsearch(
     # bits.
     current_bits = current_bits | torch.where(predicate(current_bits), sign_bit, zero)
 
+    if radix_bits > 1:
+        # Bits 30..0 in digits of up to radix_bits bits, high digit first.
+        # Within a fixed sign bit, int32 order is the order of the low 31 bits,
+        # so candidate j of a digit at `shift` is current | (j << shift).
+        hi = 31
+        while hi > 0:
+            width = min(radix_bits, hi)
+            shift = hi - width
+            num_cand = (1 << width) - 1
+            cand = (
+                torch.arange(1, num_cand + 1, dtype=torch.int32, device=device) << shift
+            ).view((num_cand,) + (1,) * len(batch_shape))
+            candidates = current_bits.unsqueeze(0) | cand
+            # False for candidates 1..digit, True above (monotonic predicate).
+            digit = torch.sum(
+                (~predicate(candidates)).to(torch.int32), dim=0, dtype=torch.int32
+            )
+            current_bits = current_bits | (digit << shift)
+            hi = shift
+        return current_bits
+
     for i in range(31):
         bit = 1 << (30 - i)
+        if skip_bits & bit:
+            continue
         bit_t = torch.full_like(current_bits, bit)
         midpoint = current_bits | bit
         current_bits = current_bits | torch.where(predicate(midpoint), zero, bit_t)
@@ -114,6 +153,8 @@ def _float32_bsearch(
     batch_shape: Sequence[int],
     predicate: Callable[[torch.Tensor], torch.Tensor],
     device: torch.device,
+    radix_bits: int = 1,
+    skip_bits: int = 0,
 ) -> torch.Tensor:
     """Binary search on finite float32 numbers.
 
@@ -152,12 +193,15 @@ def _float32_bsearch(
 
     # We search over bit patterns, which requires bit shifting and ordering of
     # bit patterns. This is natively supported on int32 but not on float32.
-    result = _int32_bsearch(batch_shape, int32_predicate, device)
+    result = _int32_bsearch(batch_shape, int32_predicate, device, radix_bits, skip_bits)
     return _monotonic_int32_to_float32(result)
 
 
 def topk_mask(
-    logits: torch.Tensor, k: torch.Tensor, replace_val: float = MASKED_LOGIT_VALUE
+    logits: torch.Tensor,
+    k: torch.Tensor,
+    replace_val: float = MASKED_LOGIT_VALUE,
+    radix_bits: int = 1,
 ) -> torch.Tensor:
     """Sets everything to replace_val, except the top k values per batch element.
 
@@ -188,14 +232,68 @@ def topk_mask(
         count_gt = torch.sum((logits > neg_threshold).to(torch.int32), dim=-1)
         return count_gt >= k
 
-    cutoff = -_float32_bsearch(logits.shape[:-1], predicate, logits.device)
+    cutoff = -_float32_bsearch(logits.shape[:-1], predicate, logits.device, radix_bits)
     cutoff = cutoff.unsqueeze(-1)
     replace_tensor = torch.full_like(logits, replace_val)
     return torch.where(logits >= cutoff, logits, replace_tensor)
 
 
+def _topp_bisect_threshold(
+    probs: torch.Tensor, p: torch.Tensor, radix_bits: int, fast: bool = False
+):
+    """The top-p threshold bisection; ``fast`` skips the provably idle steps.
+
+    The predicate depends on a threshold t only through the set
+    {probs >= t}, and is monotonic, so the search returns the largest value
+    of probs at which it is False (``_float32_bsearch`` sets a bit iff the
+    predicate at ``current | bit`` is False). With ``fast``:
+
+    * bit 30 is never set: its midpoint is 2.0 (or below -2.0 on the
+      all-True sign branch), where mass(probs >= 2.0) = 0 < p since softmax
+      probs <= 1 and top_p > 0 (and below -2.0 the set is that of 0.0, True on
+      that branch). So that step is skipped.
+    * for bf16 probs on the positive branch, bits 15..0 are never set: the
+      answer is a bf16 value v (low 16 bits zero), and every midpoint v | bit
+      lies strictly between v and the next bf16 value, where {probs >= t} is
+      the set at that next value, at which the predicate is True. 16 steps
+      skipped. On the sign branch (predicate True at 0.0, so at every finite
+      t <= 0) the full search walks to the last nonfinite pattern, -inf; the
+      shortened one stops inside the negative NaNs, so NaN is mapped to -inf
+      (the positive branch only ever yields finite values in [0, 1]).
+
+    Same predicate evaluations at every step that runs, so the same threshold
+    bit for bit: bf16 rows 15 evaluations instead of 32, f32 rows 31.
+    """
+    zero_val = torch.zeros_like(probs)
+
+    def predicate(threshold: torch.Tensor) -> torch.Tensor:
+        threshold = threshold.unsqueeze(-1)
+        probability_mass = torch.sum(
+            torch.where(probs >= threshold, probs, zero_val),
+            dim=-1,
+        )
+        return probability_mass < p
+
+    if fast and radix_bits == 1:
+        lattice = probs.dtype == torch.bfloat16
+        skip = (1 << 30) | ((1 << 16) - 1 if lattice else 0)
+        result = _float32_bsearch(
+            probs.shape[:-1], predicate, probs.device, 1, skip_bits=skip
+        )
+        if lattice:
+            result = torch.where(
+                torch.isnan(result), torch.full_like(result, -torch.inf), result
+            )
+        return result
+    return _float32_bsearch(probs.shape[:-1], predicate, probs.device, radix_bits)
+
+
 def topp_mask(
-    logits: torch.Tensor, p: torch.Tensor, replace_val: float = MASKED_LOGIT_VALUE
+    logits: torch.Tensor,
+    p: torch.Tensor,
+    replace_val: float = MASKED_LOGIT_VALUE,
+    radix_bits: int = 1,
+    fast_top_p: bool = False,
 ) -> torch.Tensor:
     """Applies top-p masking to logits.
 
@@ -217,35 +315,106 @@ def topp_mask(
       logits: Logits before masking. [batch..., vocab_size]
       p: Minimum probability mass requested. [batch..., 1]
       replace_val: For the masked values of logits, what to overwrite them with.
+      fast_top_p: skip the bisection steps proven idle for softmax probs
+        (bit 30; bits 15..0 for bf16) -- same threshold bit for bit, see
+        _topp_bisect_threshold. Needs top_p > 0.
 
     Returns:
       masked version of logits. [batch..., vocab_size]
     """
-    p = p.squeeze(-1)
     probs = torch.softmax(logits, dim=-1)
-    zero_val = torch.zeros_like(probs)
     replace_tensor = torch.full_like(logits, replace_val)
+    threshold = _topp_bisect_threshold(
+        probs, p.squeeze(-1), radix_bits, fast_top_p
+    ).unsqueeze(-1)
 
-    def predicate(threshold: torch.Tensor) -> torch.Tensor:
-        threshold = threshold.unsqueeze(-1)
-        probability_mass = torch.sum(
-            torch.where(probs >= threshold, probs, zero_val),
-            dim=-1,
-        )
-        return probability_mass < p
-
-    threshold = _float32_bsearch(logits.shape[:-1], predicate, logits.device)
-    threshold = threshold.unsqueeze(-1)
     return torch.where(probs >= threshold, logits, replace_tensor)
 
 
 def apply_top_k_top_p(
-    logits: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor
+    logits: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    need_top_k: bool = True,
+    need_top_p: bool = True,
+    radix_bits: int = 1,
+    fast_top_p: bool = False,
+    topk_candidates: int = 0,
 ) -> torch.Tensor:
-    should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
-    topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE)
-    masked_logits = torch.where(should_apply_topk, topk_masked, logits)
+    """Top-k then top-p masking, per row.
 
+    topk_candidates > 0 searches only that many candidate vocab blocks (see
+    `apply_top_k_top_p_candidates`); the static flags below then do not apply.
+    need_top_k / need_top_p are static (trace-time) promises from the caller
+    that some row has top_k > 0 / top_p < 1. When False, every row's
+    torch.where below would select the unmasked input, so the mask is skipped
+    whole: bit-identical output, minus 32-33 full-vocab reduction passes.
+    fast_top_p (static, see topp_mask) runs the same top-p bisection minus
+    its provably idle steps: 15 vocab passes instead of 32 on bf16 rows.
+    """
+    if topk_candidates > 0:
+        return apply_top_k_top_p_candidates(logits, top_k, top_p, topk_candidates)
+    masked_logits = logits
+    if need_top_k:
+        should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
+        topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE, radix_bits)
+        masked_logits = torch.where(should_apply_topk, topk_masked, logits)
+
+    if not need_top_p:
+        return masked_logits
     should_apply_topp = (top_p < 1.0).expand(-1, masked_logits.shape[-1])
-    topp_masked = topp_mask(masked_logits, top_p, MASKED_LOGIT_VALUE)
+    topp_masked = topp_mask(
+        masked_logits, top_p, MASKED_LOGIT_VALUE, radix_bits, fast_top_p
+    )
     return torch.where(should_apply_topp, topp_masked, masked_logits)
+
+
+def apply_top_k_top_p_candidates(
+    logits: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    num_blocks: int,
+) -> torch.Tensor:
+    """Applies top-k then top-p using only the blocks with the largest maxima.
+
+    Splits the vocab into blocks of CANDIDATE_BLOCK logits, runs
+    `apply_top_k_top_p` on the `num_blocks` blocks with the largest maxima,
+    and masks the full row below the smallest kept logit. Matches
+    `apply_top_k_top_p` unless more than `num_blocks - k + 1` logits tie at
+    the k-th largest value; float32 sums run in a different order, so a top-p
+    boundary within rounding can flip. Caller must ensure active rows have
+    1 <= top_k <= num_blocks // 2; rows with top_k <= 0 (padded slots) are
+    returned unmasked.
+
+    Args:
+      logits: [batch, vocab_size], vocab_size a multiple of CANDIDATE_BLOCK.
+      top_k: [batch, 1] integer.
+      top_p: [batch, 1] float.
+      num_blocks: Candidate blocks, at most vocab_size // CANDIDATE_BLOCK.
+
+    Returns:
+      Masked logits. [batch, vocab_size]
+    """
+    if (
+        not torch.compiler.is_compiling()
+        and top_p is not None
+        and bool(((top_k <= 0) & (top_p < 1.0)).any())
+    ):
+        raise ValueError(
+            "apply_top_k_top_p_candidates needs top_k >= 1 on every row; "
+            "rows with top_k <= 0 would skip top_p. Use apply_top_k_top_p."
+        )
+    rows, vocab_size = logits.shape
+    blocks = logits.reshape(rows, vocab_size // CANDIDATE_BLOCK, CANDIDATE_BLOCK)
+    block_max = blocks.amax(dim=-1)
+    block_ids = torch.topk(block_max, num_blocks, dim=-1, sorted=False).indices
+    candidates = torch.gather(
+        blocks, 1, block_ids.unsqueeze(-1).expand(-1, -1, CANDIDATE_BLOCK)
+    ).reshape(rows, num_blocks * CANDIDATE_BLOCK)
+    kept = apply_top_k_top_p(candidates, top_k, top_p) > MASKED_LOGIT_VALUE
+    inf = torch.full_like(candidates, float("inf"))
+    cutoff = torch.where(kept, candidates, inf).amin(dim=-1, keepdim=True)
+    masked = torch.where(
+        logits >= cutoff, logits, torch.full_like(logits, MASKED_LOGIT_VALUE)
+    )
+    return torch.where(top_k > 0, masked, logits)

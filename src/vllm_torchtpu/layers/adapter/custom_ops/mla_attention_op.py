@@ -32,12 +32,14 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding.common import rotate_gptj, rotate_neox
 from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
     DeepseekScalingRotaryEmbedding,
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache, Indexer
+from vllm.model_executor.utils import replace_parameter
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
@@ -46,7 +48,13 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group, get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
+    KVLayout,
+    coalesced_kv_append,
+    coalesced_kv_append_dcp,
     cp_rank_as_data,
+    get_kv_cache_shape,
+    indexer_kv_layout,
+    kv_cache_append,
     streamindex_topk,
     streamindex_topk_dcp,
 )
@@ -59,11 +67,18 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasMLAttentionBackendImpl,
     VllmTPUDeepseekV32IndexerBackend,
 )
-from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.layers.adapter.linear_common import (
+    FP8_PALLAS_SCALE,
+    FP8_PALLAS_WEIGHT,
+    WEIGHT_FLIPPED_ATTR,
+)
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
+
+logger = init_logger(__name__)
 
 # Skip indexer scoring when every sequence in the batch is shorter than
 # `index_topk`, where the top-k is the identity and the scores decide nothing.
@@ -71,6 +86,232 @@ from vllm_torchtpu.utils import synchronize_tensors
 # traffic and not at all once any request in the batch is past `index_topk`
 # tokens.
 STREAMIDX_ENABLE_EARLY_EXIT = True
+# Token buckets at or below this size take `TPU_STREAMIDX_SMALL_BUCKET_BQ`
+# (and `TPU_STREAMIDX_SMALL_BUCKET_BKVP`) as the MIXED-pass block sizes.
+STREAMIDX_SMALL_BUCKET_TOKENS = 16
+# MIXED-pass KV pages per block for small buckets when only the bq knob is set.
+# Picked by a DCP16 per-rank sweep (GLM-5.2, 32 indexer heads, 4/8 real rows in
+# a 16-token bucket, 5k/18k KV per rank): bq 4 with bkvp 8 was fastest at every
+# decode shape, and bkvp 8 alone cut the 18k-KV call by a further 30-45% over
+# bkvp 2 at bq 4. The recommended pairing is TPU_STREAMIDX_SMALL_BUCKET_BQ=4.
+STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP = 8
+# Block sizes outside the small-bucket path ("tuned based on microbenchmark
+# results"), as (decode, prefill, MIXED).
+STREAMIDX_KV_PAGES_PER_BLOCK = (2, 2, 2)
+STREAMIDX_QUERIES_PER_BLOCK = (1, 128, 128)
+
+
+def _streamidx_block_sizes(
+    num_tokens: int, small_bucket_bq: int | None, small_bucket_bkvp: int | None
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """(num_kv_pages_per_block, num_queries_per_block) for a token bucket.
+
+    `num_tokens` is the static padded bucket size, so this picks one kernel
+    variant per compiled shape. Under MTP every decode request has
+    q_len = gamma + 1 and runs in the MIXED pass; for small buckets that pass
+    takes the knob's query block instead of 128 rows of mostly padding.
+    """
+    if small_bucket_bq is None or num_tokens > STREAMIDX_SMALL_BUCKET_TOKENS:
+        return STREAMIDX_KV_PAGES_PER_BLOCK, STREAMIDX_QUERIES_PER_BLOCK
+    bkvp = small_bucket_bkvp or STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
+    return (
+        STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (bkvp,),
+        STREAMIDX_QUERIES_PER_BLOCK[:2] + (small_bucket_bq,),
+    )
+
+
+_INDEXER_KV_CACHE_FALLBACK_LOGGED: set[tuple[str, str]] = set()
+_INDEXER_KV_CACHE_INFO_LOGGED: set[tuple[str, str, str, tuple[int, ...]]] = set()
+
+
+def _warn_indexer_kv_cache_fallback_once(mode: str, reason: str) -> None:
+    key = (mode, reason)
+    if key in _INDEXER_KV_CACHE_FALLBACK_LOGGED:
+        return
+    _INDEXER_KV_CACHE_FALLBACK_LOGGED.add(key)
+    logger.warning(
+        "VLLM_TPU_INDEXER_KV_CACHE_MODE=%r falling back to 'xla': %s",
+        mode,
+        reason,
+    )
+
+
+def _log_indexer_kv_cache_once(
+    mode: str,
+    writer: str,
+    kv_layout: KVLayout,
+    cache_shape: tuple[int, ...],
+) -> None:
+    layout_tag = "SAL" if kv_layout == KVLayout.SEQ_ALONG_LANE else "HAS"
+    shape_tuple = tuple(int(d) for d in cache_shape)
+    key = (mode, writer, layout_tag, shape_tuple)
+    if key in _INDEXER_KV_CACHE_INFO_LOGGED:
+        return
+    _INDEXER_KV_CACHE_INFO_LOGGED.add(key)
+    logger.info(
+        "indexer kv cache: mode=%s writer=%s layout=%s cache_shape=%s",
+        mode,
+        writer,
+        layout_tag,
+        shape_tuple,
+    )
+
+
+def _unsupported_indexer_kv_cache_reason(
+    cache_kv: jax.Array,
+    k_packed: jax.Array,
+    kv_layout: KVLayout,
+) -> str | None:
+    """Returns a human-readable reason if `cache_kv`/`k_packed` cannot use Pallas."""
+    backend = jax.default_backend()
+    if backend != "tpu":
+        return f"backend={backend!r} is not 'tpu'"
+    try:
+        kv_cache_append.check_scatter_rows_supported(cache_kv, k_packed, kv_layout)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+def _resolve_indexer_kv_cache_mode(
+    cache_kv: jax.Array,
+    k_packed: jax.Array,
+    *,
+    mode: str | None = None,
+) -> tuple[str, KVLayout]:
+    """Resolves the indexer K-cache `(writer, kv_layout)` for `cache_kv` and `k_packed`.
+
+    Layout is decided once by `indexer_kv_layout(block_size, mode=...)` and
+    validated against `get_kv_cache_shape`. `writer` is `'pallas'` for `'has'`
+    and `'sal'`, or `'xla'` for `'xla'`. XLA fallback is only permitted when
+    `kv_layout == KVLayout.HEAD_ALONG_SUBLANE`; `SEQ_ALONG_LANE` on a non-TPU
+    backend or unsupported geometry raises `ValueError`.
+    """
+    raw_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE if mode is None else mode
+    resolved = raw_mode.strip().lower()
+    if resolved not in ("xla", "has", "sal"):
+        raise ValueError(
+            f"Invalid VLLM_TPU_INDEXER_KV_CACHE_MODE={raw_mode!r}; "
+            "expected one of ('xla', 'has', 'sal')."
+        )
+    if cache_kv.ndim != 4:
+        raise ValueError(
+            f"Expected 4-D cache_kv, got {cache_kv.ndim}-D shape {cache_kv.shape}."
+        )
+    if k_packed.ndim != 2:
+        raise ValueError(
+            f"Expected 2-D k_packed, got {k_packed.ndim}-D shape {k_packed.shape}."
+        )
+
+    raw_width = int(k_packed.shape[-1])
+    actual_head_dim = (
+        raw_width - max(1, raw_width // 128) if raw_width % 64 != 0 else raw_width
+    )
+    sal_sublane_groups = ((actual_head_dim + 127) // 128) * 128 // 4 + 1
+    block_size = (
+        int(cache_kv.shape[3])
+        if int(cache_kv.shape[1]) == sal_sublane_groups
+        else int(cache_kv.shape[1]) * 4
+    )
+    kv_layout = indexer_kv_layout(block_size, mode=mode)
+    effective_mode = (
+        "has"
+        if resolved == "sal" and kv_layout == KVLayout.HEAD_ALONG_SUBLANE
+        else resolved
+    )
+    expected_shape = get_kv_cache_shape(
+        int(cache_kv.shape[0]),
+        block_size,
+        actual_head_dim,
+        kv_layout,
+    )
+    if tuple(int(d) for d in cache_kv.shape) != expected_shape:
+        raise ValueError(
+            f"cache_kv shape {tuple(cache_kv.shape)} does not match expected "
+            f"{kv_layout.name} shape {expected_shape} for "
+            f"VLLM_TPU_INDEXER_KV_CACHE_MODE={resolved!r}."
+        )
+
+    if effective_mode == "xla":
+        _log_indexer_kv_cache_once(effective_mode, "xla", kv_layout, cache_kv.shape)
+        return "xla", kv_layout
+
+    reason = _unsupported_indexer_kv_cache_reason(cache_kv, k_packed, kv_layout)
+    if reason is not None:
+        if kv_layout == KVLayout.SEQ_ALONG_LANE:
+            raise ValueError(
+                f"VLLM_TPU_INDEXER_KV_CACHE_MODE={resolved!r} with layout "
+                f"{kv_layout.name} cannot fall back to 'xla': {reason}"
+            )
+        _warn_indexer_kv_cache_fallback_once(effective_mode, reason)
+        _log_indexer_kv_cache_once(effective_mode, "xla", kv_layout, cache_kv.shape)
+        return "xla", kv_layout
+
+    _log_indexer_kv_cache_once(effective_mode, "pallas", kv_layout, cache_kv.shape)
+    return "pallas", kv_layout
+
+
+def _dcp_indexer_a2a_for_bucket(
+    num_tokens: int, enabled: bool, min_tokens: int
+) -> bool:
+    """Whether the DCP indexer merge for this token bucket uses the all-to-all.
+
+    `num_tokens` is the static padded bucket, so this picks one merge per
+    compiled variant: decode-sized buckets keep the all-gather merge and
+    prefill-sized ones (>= `min_tokens`) take the all-to-all.
+    """
+    return enabled and num_tokens >= min_tokens
+
+
+def _topk_rows_update_jax(buf: jax.Array, rows: jax.Array) -> jax.Array:
+    """`buf[:rows.shape[0]] = rows` as one row update of a donated buffer."""
+    return jax.lax.dynamic_update_slice(buf, rows.astype(buf.dtype), (0, 0))
+
+
+# The shared top-k table's row update, donating the table.
+#
+# `buf[:n] = rows` on the module buffer reaches XLA as a graph input that is
+# mutated but not donated -- aot_autograd returns the new value and writes it
+# back after the graph -- plus a view write lowered as two row updates of the
+# same base. Both force a full `[max_num_batched_tokens, width]` copy of the
+# table in every indexed layer. Routing the write through a donating op with a
+# `copy_` writeback (the KV-cache pattern) marks the table a buffer donor, so
+# XLA updates it in place. Built at import, not lazily: dynamo cannot trace the
+# op's construction from inside a compiled forward.
+_TOPK_ROWS_UPDATE_OP = pallas.jax_op(
+    "pallas::indexer_topk_rows_update", _topk_rows_update_jax, donate_argnums=(0,)
+)
+
+
+# torch.compile traces the forward with fake tensors (shape and dtype, no data),
+# so it can't run the JAX function to learn what this op returns. This fake
+# tells it: a tensor shaped like `buf`, i.e. the whole updated table, which the
+# caller copies back into `buf`. The real `_topk_rows_update_jax` runs only
+# when the compiled graph executes.
+def _fake_topk_rows_update(buf: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+    del rows
+    return torch.empty_like(buf)
+
+
+_TOPK_ROWS_UPDATE_OP.register_fake(_fake_topk_rows_update)
+
+
+def _topk_rows(
+    buf: torch.Tensor, topk_tokens: int, num_tokens: int, topk_indices: torch.Tensor
+) -> torch.Tensor:
+    """The `[num_tokens, buf.shape[1]]` rows the -1 fill plus partial write
+    would leave at the top of `buf`: the top-k, then -1, clamped to `buf`.
+
+    The top-k kernels return one row per query token, so only the columns
+    ever need -1 padding.
+    """
+    num_tokens = min(num_tokens, buf.shape[0])
+    rows = topk_indices[:num_tokens, :topk_tokens].to(buf.dtype)
+    assert rows.shape[0] == num_tokens, (rows.shape, num_tokens)
+    pad_cols = buf.shape[1] - rows.shape[1]
+    if pad_cols:
+        rows = torch.nn.functional.pad(rows, (0, pad_cols), value=-1)
+    return rows
 
 
 def _cp_scatter_indexer_k(
@@ -84,6 +325,8 @@ def _cp_scatter_indexer_k(
     cp_size: int,
     interleave_size: int,
     axis_name: str = DCP_AXIS_NAME,
+    writer: str = "xla",
+    kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
 ) -> jax.Array:
     """Scatter this step's indexer K rows into the DCP-sharded K cache.
 
@@ -100,9 +343,28 @@ def _cp_scatter_indexer_k(
 
     `axis_name`/`cp_size` name the axis the cache is split over.
     """
+    if writer not in ("xla", "pallas"):
+        raise ValueError(f"Expected writer in ('xla', 'pallas'), got {writer!r}.")
+    if writer == "xla" and kv_layout != KVLayout.HEAD_ALONG_SUBLANE:
+        raise ValueError(
+            f"writer='xla' only supports HEAD_ALONG_SUBLANE, got {kv_layout}."
+        )
 
     def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens):
         rank = cp_rank_as_data(axis_name, cp_size)
+        if writer == "pallas":
+            return coalesced_kv_append_dcp(
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                rank,
+                dcp_size=cp_size,
+                interleave_size=interleave_size,
+                kv_layout=kv_layout,
+            )
+
         _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
         page_size = block_size_per_kv_packing * kv_packing
         # The latent cache is guarded on its own page size in
@@ -194,6 +456,14 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # None means unchunked. The kernel falls back to a single unpipelined
         # pass when `max_num_tokens` is not a multiple of the chunk.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        kv_cache_mode = (
+            envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
+            if envs.is_indexer_kv_cache_mode_explicit()
+            else None
+        )
+        small_bucket_bq = envs.TPU_STREAMIDX_SMALL_BUCKET_BQ
+        small_bucket_bkvp = envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP
+        skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -207,30 +477,50 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
             distribution: jax.Array,  # i32 [3]
         ) -> tuple[jax.Array, jax.Array]:
-            _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
-            block_size = block_size_per_kv_packing * kv_packing
-            # Cache rows are padded to the 128-lane HBM width; pad the packed
-            # fp8+scale rows to match before scattering.
-            k_packed = jnp.pad(k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
+            writer, kv_layout = _resolve_indexer_kv_cache_mode(
+                cache_kv, k_packed, mode=kv_cache_mode
+            )
+            if writer == "xla":
+                _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
+                block_size = block_size_per_kv_packing * kv_packing
+                # Cache rows are padded to the 128-lane HBM width; pad the packed
+                # fp8+scale rows to match before scattering.
+                k_packed = jnp.pad(
+                    k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1]))
+                )
 
-            # Insert this step's K rows into the KV cache.
-            tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
-            seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(
-                jnp.int32
-            )
-            q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
-            pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
-            page = jnp.where(
-                tok < cu_q_lens[-1],
-                page_indices.reshape(seq_lens.shape[0], -1)[seq_id, pos // block_size],
-                jnp.int32(2**30),
-            )
-            slot = pos % block_size
-            cache_kv = cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(
-                k_packed
-            )
+                # Insert this step's K rows into the KV cache.
+                tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
+                seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(
+                    jnp.int32
+                )
+                q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
+                pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
+                page = jnp.where(
+                    tok < cu_q_lens[-1],
+                    page_indices.reshape(seq_lens.shape[0], -1)[
+                        seq_id, pos // block_size
+                    ],
+                    jnp.int32(2**30),
+                )
+                slot = pos % block_size
+                cache_kv = cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(
+                    k_packed
+                )
+            else:
+                cache_kv = coalesced_kv_append(
+                    cache_kv,
+                    k_packed,
+                    seq_lens,
+                    page_indices,
+                    cu_q_lens,
+                    kv_layout=kv_layout,
+                )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+            kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
+                q.shape[0], small_bucket_bq, small_bucket_bkvp
+            )
             topk_indices = streamindex_topk(
                 q,
                 weights,
@@ -241,11 +531,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
                 k=topk,
                 compression_ratio=1,
-                # The following parameters are tuned based on microbenchmark
-                # results.
-                num_kv_pages_per_block=(2, 2, 2),
-                num_queries_per_block=(1, 128, 128),
+                num_kv_pages_per_block=kv_pages_per_block,
+                num_queries_per_block=queries_per_block,
+                skip_empty_decode=skip_empty_decode,
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
+                kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
             )
             return cache_kv, topk_indices
@@ -281,6 +571,16 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Chunking cuts the replicated query-token axis, which is orthogonal to
         # the KV axis DCP shards, so the same knob applies here unchanged.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        a2a_merge = envs.TPU_DCP_INDEXER_A2A_MERGE
+        a2a_min_tokens = envs.TPU_DCP_INDEXER_A2A_MIN_TOKENS
+        kv_cache_mode = (
+            envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
+            if envs.is_indexer_kv_cache_mode_explicit()
+            else None
+        )
+        small_bucket_bq = envs.TPU_STREAMIDX_SMALL_BUCKET_BQ
+        small_bucket_bkvp = envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP
+        skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
 
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -292,8 +592,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens: jax.Array,
             distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
+            writer, kv_layout = _resolve_indexer_kv_cache_mode(
+                cache_kv, k_packed, mode=kv_cache_mode
+            )
             # `_cp_scatter_indexer_k` pads the packed fp8+scale rows out to
-            # the cache's 128-lane width itself.
+            # the cache's record width itself.
             cache_kv = _cp_scatter_indexer_k(
                 cache_kv,
                 k_packed,
@@ -304,9 +607,14 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 cp_size=dcp_size,
                 interleave_size=interleave_size,
                 axis_name=DCP_AXIS_NAME,
+                writer=writer,
+                kv_layout=kv_layout,
             )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+            kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
+                q.shape[0], small_bucket_bq, small_bucket_bkvp
+            )
             local_topk = streamindex_topk_dcp(
                 q,
                 weights,
@@ -320,9 +628,14 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 compression_ratio=1,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
-                num_kv_pages_per_block=(2, 2, 2),
-                num_queries_per_block=(1, 128, 128),
+                num_kv_pages_per_block=kv_pages_per_block,
+                num_queries_per_block=queries_per_block,
+                kv_layout=kv_layout,
+                skip_empty_decode=skip_empty_decode,
                 chunk_tokens=chunk_tokens,
+                a2a_merge=_dcp_indexer_a2a_for_bucket(
+                    q.shape[0], a2a_merge, a2a_min_tokens
+                ),
             )
             return cache_kv, local_topk
 
@@ -459,12 +772,29 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
             )
 
-        self.topk_indices_buffer[: hidden_states.shape[0]] = -1
-        num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])
-        # Both branches return `topk_tokens`-wide rows.
-        topk = self.topk_tokens
-        self.topk_indices_buffer[:num_out, :topk] = topk_indices[:num_out]
-        return self.topk_indices_buffer
+        rows = self._write_topk_rows(hidden_states.shape[0], topk_indices)
+        if envs.TPU_INDEXER_TOPK_SHARED_READ:
+            # Read back what the skip_topk layers will read, so the attention
+            # index prep is one CSE class across them.
+            return self.topk_indices_buffer
+        return rows
+
+    def _write_topk_rows(
+        self, num_tokens: int, topk_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """The rows the -1 fill plus partial write would leave, in one update.
+
+        Writes the `_topk_rows` with a single row update through a donating op
+        (see `_TOPK_ROWS_UPDATE_OP`), so XLA updates the table in place: same
+        contents, no full-table copy per indexed layer. Returns those rows
+        rather than the buffer, so attention reads them instead of a whole
+        `[max_num_batched_tokens, width]` buffer version. The buffer still gets
+        the same contents for the layers that reuse it.
+        """
+        buf = self.topk_indices_buffer
+        rows = _topk_rows(buf, self.topk_tokens, num_tokens, topk_indices)
+        buf.copy_(_TOPK_ROWS_UPDATE_OP(buf, rows))
+        return rows
 
 
 class VllmTPUIndexerCache(DeepseekV32IndexerCache):
@@ -505,35 +835,87 @@ class VllmTPUIndexer(Indexer):
         )
         return cast("VllmTPUIndexer", indexer)
 
+    def permute_rope_to_half_split(self) -> None:
+        """TPU_INDEXER_ROPE_NEOX_PERMUTE: put each head's rope columns of
+        `wq_b`, the k rope columns of `wk_weights_proj` and the matching
+        `k_norm` affine entries in half-split order (see
+        `mla_rope_half_split_perm`); `forward` then runs the rope NeoX-style.
+
+        The rope part is the first `rope_dim` channels of each `head_dim` head
+        (q) and of k. `k_norm` is a LayerNorm over all `head_dim` k channels:
+        its mean / variance do not depend on channel order, so permuting its
+        per-channel weight and bias with the same index keeps it exact. q and
+        k are fp8-quantized per `head_dim` row (one block), whose amax is order
+        independent, and the cache stores P k consistently. Runs on the
+        processed runtime weights; idempotent.
+        """
+        if getattr(self, "_rope_neox_permuted", False):
+            return
+        rope, hd, nh = self.rope_dim, self.head_dim, self.n_head
+        permute_linear_output_channels(
+            self.wq_b, mla_rope_output_index(nh * hd, rope, hd, 0, nh)
+        )
+        kw = self.wk_weights_proj
+        flipped = getattr(kw, WEIGHT_FLIPPED_ATTR, False)
+        kw_n_out = kw.weight.shape[1 if flipped else 0]
+        assert kw_n_out == hd + nh, (kw_n_out, hd, nh)
+        permute_linear_output_channels(
+            kw, mla_rope_output_index(kw_n_out, rope, 0, 0, 1)
+        )
+        norm_index = mla_rope_output_index(hd, rope, 0, 0, 1)
+        updated = []
+        for name, param in list(self.k_norm.named_parameters(recurse=False)):
+            if param.ndim != 1 or param.shape[0] != hd:
+                raise NotImplementedError(
+                    f"indexer rope permutation: k_norm.{name} "
+                    f"{tuple(param.shape)} is not per k channel"
+                )
+            new = _index_select_bits(param.data, 0, norm_index)
+            replace_parameter(self.k_norm, name, Parameter(new, requires_grad=False))
+            updated.append(getattr(self.k_norm, name))
+        if updated and updated[0].device.type == "tpu":
+            synchronize_tensors(updated)
+        self._rope_neox_permuted = True
+
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
         # Fused wk + weights_proj: one GEMM, then split
         kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
         weights = kw[:, self.head_dim :]
 
         k = self.k_norm(k)
-        k_pe, k_nope = torch.split(
-            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
+        permuted = getattr(self, "_rope_neox_permuted", False)
+        if permuted and rope_half_split_leading_supported(rotary_emb):
+            # Half-split columns: rope the whole head in place, no split/cat.
+            q = rope_half_split_leading(rotary_emb, positions, q, self.rope_dim)
+            k = rope_half_split_leading(rotary_emb, positions, k, self.rope_dim)
+        else:
+            q_pe, q_nope = torch.split(
+                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            )
+            k_pe, k_nope = torch.split(
+                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            )
+            if permuted:
+                q_pe, k_pe = rope_half_split(
+                    rotary_emb, positions, q_pe, k_pe.unsqueeze(1)
+                )
+            else:
+                q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+            # Note: RoPE (NeoX) can introduce extra leading dimensions during
+            # compilation so we need to reshape back to token-flattened shapes
+            q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
+            k_pe = k_pe.reshape(-1, 1, self.rope_dim)
 
-        q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
-        # Note: RoPE (NeoX) can introduce extra leading dimensions during
-        # compilation so we need to reshape back to token-flattened shapes
-        q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
-        k_pe = k_pe.reshape(-1, 1, self.rope_dim)
-
-        # `rotary_emb` is shape-preserving; `q_pe` is already
-        # [num_tokens, n_head, rope_dim].
-        q = torch.cat([q_pe, q_nope], dim=-1)
-        # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
-        k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
+            # `rotary_emb` is shape-preserving; `q_pe` is already
+            # [num_tokens, n_head, rope_dim].
+            q = torch.cat([q_pe, q_nope], dim=-1)
+            # `k_pe` is [num_tokens, 1, rope_dim] (MQA).
+            k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
 
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)
@@ -558,6 +940,161 @@ def _fresh(t: torch.Tensor) -> torch.Tensor:
     """Allocate a fresh contiguous device buffer (breaks view/stride chains so
     the torch_tpu pallas boundary ships a plain row-major buffer)."""
     return torch.empty(t.shape, dtype=t.dtype, device=t.device).copy_(t)
+
+
+# --- MLA rope in half-split order (TPU_MLA_ROPE_NEOX_PERMUTE) ---------------
+#
+# GPT-J (interleaved) rope pairs channels (2i, 2i+1); NeoX rope pairs
+# (i, i + d/2). With P = [0, 2, ..., d-2, 1, 3, ..., d-1] and new[j] = old[P[j]],
+# neox(P x) = P gptj(x) elementwise-exactly, and (P q).(P k) = q.k. So permuting
+# the rope output columns of the q projection and of the k_pe projection by
+# the same P, and running the rope NeoX-style, leaves every attention score
+# unchanged while the KV cache holds P k_pe consistently. The win is layout:
+# the `x[..., ::2]` split forces a tokens-minor relayout of q on TPU.
+
+
+def mla_rope_half_split_perm(rope_dim: int) -> torch.Tensor:
+    """`P` above: the old channel each new channel reads (evens, then odds)."""
+    assert rope_dim % 2 == 0, f"rope dim {rope_dim} must be even"
+    return torch.cat([torch.arange(0, rope_dim, 2), torch.arange(1, rope_dim, 2)])
+
+
+def mla_rope_output_index(
+    n_out: int, rope_dim: int, period: int, offset: int, count: int
+) -> torch.Tensor:
+    """A gather index over `n_out` output channels that applies `P` to `count`
+    rope segments at `offset + i * period`, identity elsewhere."""
+    index = torch.arange(n_out)
+    perm = mla_rope_half_split_perm(rope_dim)
+    for i in range(count):
+        start = offset + i * period
+        assert start + rope_dim <= n_out, (start, rope_dim, n_out)
+        index[start : start + rope_dim] = start + perm
+    return index
+
+
+_SAME_WIDTH_INT = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def _index_select_bits(t: torch.Tensor, axis: int, index: torch.Tensor):
+    """`index_select` that moves raw bits, so fp8 / bf16 / fp32 are all exact
+    and no dtype-specific gather support is needed on the device."""
+    as_int = t.view(_SAME_WIDTH_INT[t.element_size()])
+    out = torch.index_select(as_int, axis, index.to(t.device))
+    return _fresh(out.view(t.dtype))
+
+
+def permute_linear_output_channels(layer: torch.nn.Module, index: torch.Tensor):
+    """Reorder a processed linear layer's output channels: `out'[j] = out[index[j]]`.
+
+    Runs after the quant method's `process_weights_after_loading`, so it reads
+    the runtime layout: `weight` is `[n_in, n_out]` when flipped
+    (`WEIGHT_FLIPPED_ATTR`) and `[n_out, n_in]` otherwise; any other parameter
+    (FP8 `weight_scale` `[1, n_blocks, 1, n_out]` / `[n_out]`, a bias) is
+    per output channel on its last axis, else on axis 0, else a per-tensor
+    scalar. Anything else is a layout this does not know and raises.
+    """
+    n_out = index.numel()
+    flipped = getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+    updated = []
+    for name, param in list(layer.named_parameters(recurse=False)):
+        t = param.data
+        if name in (FP8_PALLAS_WEIGHT, FP8_PALLAS_SCALE):
+            # TPU_FP8_LINEAR_PALLAS's zero-padded [.., n_pad] kernel copy: permute
+            # the real channels, leave the pad channels where they are.
+            pad = torch.arange(n_out, t.shape[-1], dtype=index.dtype)
+            new = _index_select_bits(t, t.ndim - 1, torch.cat([index, pad]))
+            replace_parameter(layer, name, Parameter(new, requires_grad=False))
+            updated.append(getattr(layer, name))
+            continue
+        if name == "weight":
+            axis = 1 if flipped else 0
+            if t.ndim != 2 or t.shape[axis] != n_out:
+                raise NotImplementedError(
+                    f"rope permutation: weight {tuple(t.shape)} (flipped="
+                    f"{flipped}) has no {n_out}-wide output axis"
+                )
+        elif t.ndim >= 1 and t.shape[-1] == n_out:
+            axis = t.ndim - 1
+        elif t.ndim >= 1 and t.shape[0] == n_out:
+            axis = 0
+        elif t.numel() == 1:
+            continue
+        else:
+            raise NotImplementedError(
+                f"rope permutation: parameter {name} {tuple(t.shape)} is not "
+                f"per output channel of a {n_out}-wide layer"
+            )
+        new = _index_select_bits(t, axis, index)
+        replace_parameter(layer, name, Parameter(new, requires_grad=False))
+        updated.append(getattr(layer, name))
+    if updated and updated[0].device.type == "tpu":
+        synchronize_tensors(updated)
+
+
+def rope_half_split(rotary_emb, positions, query, key):
+    """`rotary_emb`'s own arithmetic, NeoX-style, without touching the module
+    (`get_rope` shares one instance across every layer that asks for it)."""
+    if isinstance(rotary_emb, DeepseekScalingRotaryEmbedding):
+        return VllmDeepseekScalingRotaryEmbedding.apply_rope(
+            rotary_emb, positions, query, key, is_neox_style=True
+        )
+    return RotaryEmbedding.forward_static(
+        positions,
+        query,
+        key,
+        rotary_emb.head_size,
+        rotary_emb.rotary_dim,
+        rotary_emb._match_cos_sin_cache_dtype(query),
+        True,
+    )
+
+
+def rope_half_split_leading(
+    rotary_emb, positions: torch.Tensor, x: torch.Tensor, rope_dim: int
+) -> torch.Tensor:
+    """NeoX rope on the leading `rope_dim` channels of `x` `[T, ..., D]`, the
+    other `D - rope_dim` channels passed through, as ONE full-width
+    elementwise expression: `x * C + rot(x) * S` with
+    `C = [cos, cos, 1...]`, `S = [-sin, sin, 0...]` and
+    `rot(x) = [x[h:2h], x[:h], x[2h:]]` (h = rope_dim / 2).
+
+    Same products and the same add per channel as `rope_half_split`
+    (`x1 * cos - x2 * sin == x1 * cos + x2 * (-sin)`, pass-through is
+    `x * 1 + y * 0`), but no split / cat of the head: XLA sees a single
+    D-wide fusion instead of half-width rope pieces it has to lay out and
+    copy back. Only for a plain `RotaryEmbedding` (cache in `x`'s dtype)."""
+    t, d, h = x.shape[0], x.shape[-1], rope_dim // 2
+    cos_sin = rotary_emb._match_cos_sin_cache_dtype(x).index_select(
+        0, positions.flatten()
+    )
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    parts_c, parts_s = [cos, cos], [-sin, sin]
+    if d > rope_dim:
+        parts_c.append(cos.new_ones(t, d - rope_dim))
+        parts_s.append(sin.new_zeros(t, d - rope_dim))
+    bcast = (t,) + (1,) * (x.ndim - 2) + (d,)
+    c = torch.cat(parts_c, dim=-1).view(bcast)
+    s_ = torch.cat(parts_s, dim=-1).view(bcast)
+    rot = torch.cat([x[..., h:rope_dim], x[..., :h], x[..., rope_dim:]], dim=-1)
+    return x * c + rot * s_
+
+
+def rope_half_split_leading_supported(rotary_emb) -> bool:
+    return not isinstance(rotary_emb, DeepseekScalingRotaryEmbedding) and isinstance(
+        rotary_emb, RotaryEmbedding
+    )
+
+
+def rope_half_split_supported(rotary_emb, rope_dim: int) -> bool:
+    if rotary_emb is None or getattr(rotary_emb, "is_neox_style", True):
+        return False
+    if rotary_emb.rotary_dim != rope_dim or rotary_emb.head_size != rope_dim:
+        return False
+    return isinstance(rotary_emb, DeepseekScalingRotaryEmbedding) or (
+        isinstance(rotary_emb, RotaryEmbedding)
+        and type(rotary_emb).forward_native is RotaryEmbedding.forward_native
+    )
 
 
 class TPUDummyMLAPrefillBackend:
@@ -760,6 +1297,12 @@ class VllmTPUMLAAttention(MLAAttention):
                 self, dcp_size, impl.dcp_interleave_size
             )
 
+        # Post-load work the owning wrapper registered: it holds the q / kv_a
+        # projections, but is not itself visited by the loader's attention
+        # pass, which runs after every linear has been quantized and flipped.
+        for hook in getattr(self, "post_load_hooks", ()):
+            hook()
+
     def forward(
         self,
         q: tuple[torch.Tensor, torch.Tensor],
@@ -883,6 +1426,69 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
         self.prefix = prefix
 
+        # TPU_MLA_ROPE_NEOX_PERMUTE: set once the q / k_pe projection columns
+        # are in half-split order, which is what switches `forward` to NeoX
+        # rope -- the two can never disagree.
+        self._rope_neox_permuted = False
+        if envs.TPU_MLA_ROPE_NEOX_PERMUTE:
+            if not rope_half_split_supported(self.rotary_emb, self.qk_rope_head_dim):
+                raise NotImplementedError(
+                    "TPU_MLA_ROPE_NEOX_PERMUTE needs a GPT-J-style "
+                    f"RotaryEmbedding over the whole {self.qk_rope_head_dim}-dim "
+                    f"rope head; got {type(self.rotary_emb).__name__}"
+                )
+            hooks = self.mla_attn.__dict__.setdefault("post_load_hooks", [])
+            hooks.append(self.permute_rope_to_half_split)
+        if envs.TPU_INDEXER_ROPE_NEOX_PERMUTE and self.indexer is not None:
+            if not rope_half_split_supported(
+                self.indexer_rope_emb, self.indexer.rope_dim
+            ):
+                neox = getattr(self.indexer_rope_emb, "is_neox_style", None)
+                raise NotImplementedError(
+                    "TPU_INDEXER_ROPE_NEOX_PERMUTE needs a GPT-J-style "
+                    f"RotaryEmbedding over the whole {self.indexer.rope_dim}-dim "
+                    "indexer rope head (indexer_rope_interleave); got "
+                    f"{type(self.indexer_rope_emb).__name__} is_neox_style={neox}"
+                )
+            hooks = self.mla_attn.__dict__.setdefault("post_load_hooks", [])
+            hooks.append(self.indexer.permute_rope_to_half_split)
+
+    def permute_rope_to_half_split(self) -> None:
+        """Put the q and k_pe rope columns in half-split order (see
+        `mla_rope_half_split_perm`). Runs on the processed runtime weights."""
+        if self._rope_neox_permuted:
+            return
+        if self.kimi_preprocess is not None:
+            raise NotImplementedError(
+                "TPU_MLA_ROPE_NEOX_PERMUTE: the Kimi fused preprocess reads "
+                "fused_qkv_a_proj raw"
+            )
+        rope = self.qk_rope_head_dim
+        q_layer = self._q_proj_layer()
+        q_heads = self.num_heads * self.dcp_group_size
+        q_index = mla_rope_output_index(
+            q_heads * self.qk_head_dim,
+            rope,
+            period=self.qk_head_dim,
+            offset=self.qk_nope_head_dim,
+            count=q_heads,
+        )
+        if self.q_lora_rank is not None:
+            kv_layer, kv_offset = (
+                self.fused_qkv_a_proj,
+                self.q_lora_rank + self.kv_lora_rank,
+            )
+        else:
+            kv_layer, kv_offset = self.kv_a_proj_with_mqa, self.kv_lora_rank
+        weight = kv_layer.weight
+        kv_n_out = weight.shape[
+            1 if getattr(kv_layer, WEIGHT_FLIPPED_ATTR, False) else 0
+        ]
+        kv_index = mla_rope_output_index(kv_n_out, rope, 0, kv_offset, 1)
+        permute_linear_output_channels(q_layer, q_index)
+        permute_linear_output_channels(kv_layer, kv_index)
+        self._rope_neox_permuted = True
+
     def _q_proj_layer(self):
         """The projection that produces `q`, whichever of the two is wired."""
         return self.q_b_proj if self.q_lora_rank is not None else self.q_proj
@@ -920,46 +1526,45 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 prefill_group is not None,
             )
             q = self.q_b_proj(q_c)[0]
-        elif self.q_lora_rank is not None:
-            assert self.fused_qkv_a_proj is not None, (
-                "fused_qkv_a_proj is required when q_lora_rank is not None"
-            )
-            assert self.q_a_layernorm is not None, (
-                "q_a_layernorm is required when q_lora_rank is not None"
-            )
-            assert self.q_b_proj is not None, (
-                "q_b_proj is required when q_lora_rank is not None"
-            )
-
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-            if self.gate_is_fused:
-                q_c, kv_lora, output_gate = qkv_lora.split(
-                    [
-                        self.q_lora_rank,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                        self.num_heads * self.v_head_dim,
-                    ],
-                    dim=-1,
-                )
-            else:
-                q_c, kv_lora = qkv_lora.split(
-                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                    dim=-1,
-                )
-            q_c = self.q_a_layernorm(q_c)
-            q = self.q_b_proj(q_c)[0]
         else:
-            assert self.kv_a_proj_with_mqa is not None, (
-                "kv_a_proj_with_mqa is required when q_lora_rank is None"
-            )
-            assert self.q_proj is not None, (
-                "q_proj is required when q_lora_rank is None"
-            )
-            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
-            q = self.q_proj(hidden_states)[0]
+            if self.q_lora_rank is not None:
+                assert self.fused_qkv_a_proj is not None, (
+                    "fused_qkv_a_proj is required when q_lora_rank is not None"
+                )
+                assert self.q_a_layernorm is not None, (
+                    "q_a_layernorm is required when q_lora_rank is not None"
+                )
+                assert self.q_b_proj is not None, (
+                    "q_b_proj is required when q_lora_rank is not None"
+                )
 
-        if self.kimi_preprocess is None:
-            # Set by the earlier `kimi_preprocess is None` branch.
+                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+                if self.gate_is_fused:
+                    q_c, kv_lora, output_gate = qkv_lora.split(
+                        [
+                            self.q_lora_rank,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                            self.num_heads * self.v_head_dim,
+                        ],
+                        dim=-1,
+                    )
+                else:
+                    q_c, kv_lora = qkv_lora.split(
+                        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                        dim=-1,
+                    )
+                q_c = self.q_a_layernorm(q_c)
+                q = self.q_b_proj(q_c)[0]
+            else:
+                assert self.kv_a_proj_with_mqa is not None, (
+                    "kv_a_proj_with_mqa is required when q_lora_rank is None"
+                )
+                assert self.q_proj is not None, (
+                    "q_proj is required when q_lora_rank is None"
+                )
+                kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+                q = self.q_proj(hidden_states)[0]
+
             assert kv_lora is not None
             kv_c, k_pe = kv_lora.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
@@ -977,7 +1582,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if self.rotary_emb is not None:
             q_pe_dtype = q_pe.dtype
             k_pe_dtype = k_pe.dtype
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            if getattr(self, "_rope_neox_permuted", False):
+                q_pe, k_pe = rope_half_split(self.rotary_emb, positions, q_pe, k_pe)
+            else:
+                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
             # RoPE caches/frequencies can be fp32 and promote the rotated
             # tensors.  Dense MLA requires new KV values to exactly match the
             # cache dtype, and queries should remain in the activation dtype.
@@ -1045,30 +1653,41 @@ class VllmDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
         key: torch.Tensor | None = None,
         offsets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self.apply_rope(
+            self, positions, query, key, offsets, is_neox_style=self.is_neox_style
+        )
+
+    @staticmethod
+    def apply_rope(
+        rope: DeepseekScalingRotaryEmbedding,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        offsets: torch.Tensor | None = None,
+        *,
+        is_neox_style: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert key is not None
-        query_rot = query[..., : self.rotary_dim]
-        key_rot = key[..., : self.rotary_dim]
-        if self.rotary_dim < self.head_size:
-            query_pass = query[..., self.rotary_dim :]
-            key_pass = key[..., self.rotary_dim :]
+        query_rot = query[..., : rope.rotary_dim]
+        key_rot = key[..., : rope.rotary_dim]
 
         pos = torch.add(positions, offsets) if offsets is not None else positions
-        cos_sin = self.cos_sin_cache.index_select(0, pos)
+        cos_sin = rope.cos_sin_cache.index_select(0, pos)
         cos, sin = cos_sin.chunk(2, dim=-1)
-        if self.is_neox_style:
+        if is_neox_style:
             cos = torch.cat((cos, cos), dim=-1).unsqueeze(-2)
             sin = torch.cat((sin, sin), dim=-1).unsqueeze(-2)
         else:
             cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
             sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
 
-        rotate_fn = rotate_neox if self.is_neox_style else rotate_gptj
+        rotate_fn = rotate_neox if is_neox_style else rotate_gptj
         query_rot = query_rot * cos + rotate_fn(query_rot) * sin
         key_rot = key_rot * cos + rotate_fn(key_rot) * sin
 
-        if self.rotary_dim < self.head_size:
-            query = torch.cat((query_rot, query_pass), dim=-1)
-            key = torch.cat((key_rot, key_pass), dim=-1)
+        if rope.rotary_dim < rope.head_size:
+            query = torch.cat((query_rot, query[..., rope.rotary_dim :]), dim=-1)
+            key = torch.cat((key_rot, key[..., rope.rotary_dim :]), dim=-1)
         else:
             query = query_rot
             key = key_rot

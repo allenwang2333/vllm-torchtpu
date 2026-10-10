@@ -75,6 +75,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
+from vllm_torchtpu.kernels.quantized_matmul.fp8_skinny import TUNED, padded_n
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
@@ -82,9 +83,14 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
+    FP8_PALLAS_N_ATTR,
+    FP8_PALLAS_SCALE,
+    FP8_PALLAS_WEIGHT,
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    get_fp8_linear_pallas_op,
     quantized_matmul,
+    quantized_matmul_pallas,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -794,11 +800,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
 
         vLLM brackets `apply_monolithic` with an all-gather and a
         reduce-scatter unless the method claims them
-        (`MoERunner.do_naive_dispatch_combine`). Two independent paths claim
-        them, and either one alone has to suppress vLLM's pair:
+        (`MoERunner.do_naive_dispatch_combine`). Three independent paths claim
+        them, and any one alone has to suppress vLLM's pair:
 
         - chunk pipelining stages the same two collectives itself so they
           overlap the compute;
+        - fp8 all-gather quantizes the activations before the gather, which
+          is only ours to do if we are the one issuing it;
         - the fused EP kernel does the exchange inside its own program.
 
         The fused half asks `fused_moe_ep_supported` about this method, not
@@ -815,6 +823,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             enable_pipelined_collective_and_compute()
             or fused_moe_ep_supported(self)
             or adaptive_moe.adaptive_fused_moe_supported(self)
+            or envs.TPU_MOE_FP8_ALL_GATHER
         )
 
     def maybe_roundup_sizes(
@@ -1160,11 +1169,18 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
 
+        # Either reason to take the collectives from vLLM leaves the routing
+        # tensors local here, still holding this rank's own tokens. (The third
+        # reason, the fused EP kernel, returned above.)
+        owns_collectives = (
+            enable_pipelined_collective_and_compute() or envs.TPU_MOE_FP8_ALL_GATHER
+        )
+
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                 topk_ids,
                 topk_weights,
-                is_local_tensor=enable_pipelined_collective_and_compute(),
+                is_local_tensor=owns_collectives,
             )
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
@@ -1183,7 +1199,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }
-        if enable_pipelined_collective_and_compute():
+        if owns_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
 
         from vllm_torchtpu.layers.adapter.fused_moe_tp_ar import (
@@ -1314,6 +1330,40 @@ def _wrap_block_scale_weight_loader(weight_loader: Callable) -> Callable:
 
     _wrapped._tpu_block_scale_wrapped = True  # type: ignore[attr-defined]
     return _wrapped
+
+
+def _fp8_linear_pallas_selected(prefix: str) -> bool:
+    """TPU_FP8_LINEAR_PALLAS is on and `prefix` ends with a listed site, "."-bounded."""
+    if not envs.TPU_FP8_LINEAR_PALLAS or not prefix:
+        return False
+    for site in envs.TPU_FP8_LINEAR_PALLAS_SITES.split(","):
+        site = site.strip()
+        if site and (prefix == site or prefix.endswith("." + site)):
+            return True
+    return False
+
+
+def _set_fp8_pallas_copy(layer: torch.nn.Module) -> None:
+    """(Re)build the kernel's zero-padded K-major copy of a flipped `[n_in, n_out]`
+    weight whose width is not a lane multiple (q_a + kv_a: 2624 -> 2688), moving raw
+    bytes so no fp8-specific pad support is needed on the device. The original
+    weight stays for the M > 16 XLA path, which is fast only on its own layout
+    (fp8-gemm probe 05: +14% / +78% at M=4096 on the padded N- / K-major forms)."""
+    weight, scale = layer.weight.data, layer.weight_scale.data
+    n_in, n_out = weight.shape
+    n_pad = padded_n(n_out)
+    raw = torch.zeros(n_in, n_pad, dtype=torch.uint8, device=weight.device)
+    raw[:, :n_out].copy_(weight.contiguous().view(torch.uint8))
+    pad_scale = torch.ones(n_pad, dtype=scale.dtype, device=scale.device)
+    pad_scale[:n_out].copy_(scale)
+    for name, t in (
+        (FP8_PALLAS_WEIGHT, raw.view(weight.dtype)),
+        (FP8_PALLAS_SCALE, pad_scale),
+    ):
+        if hasattr(layer, name):
+            replace_parameter(layer, name, torch.nn.Parameter(t, requires_grad=False))
+        else:
+            layer.register_parameter(name, torch.nn.Parameter(t, requires_grad=False))
 
 
 @register_weight_loader_v2_supported_method
@@ -1577,6 +1627,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         # Layers whose weight is read raw by code expecting vLLM's
         # [n_out, n_in] keep that layout; `apply` below contracts accordingly.
         if getattr(layer, WEIGHT_FLIPPED_ATTR, False):
+            if hasattr(layer, FP8_PALLAS_WEIGHT):
+                _set_fp8_pallas_copy(layer)  # keep the kernel copy in step on reload
             return  # already flipped; reload paths re-enter this hook
         keep_vllm_layout = getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
         if not keep_vllm_layout:
@@ -1602,6 +1654,24 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if hasattr(layer, "weight_scale_inv"):
             delattr(layer, "weight_scale_inv")
         replace_parameter(layer, "weight_scale", weight_scale)
+
+        # TPU_FP8_LINEAR_PALLAS: decode rows of a selected per-channel FP8 layer go to
+        # the weight-streaming kernel (kernels/quantized_matmul/fp8_skinny.py).
+        if (
+            not keep_vllm_layout
+            and weight_scale.ndim == 1
+            and weight_scale.shape[0] == ckpt_n_out  # per output channel
+            and weight.dtype == torch.float8_e4m3fn
+            and (ckpt_n_in, padded_n(ckpt_n_out)) in TUNED  # measured shapes only
+            and _fp8_linear_pallas_selected(getattr(layer, "prefix", "") or self.prefix)
+        ):
+            setattr(layer, FP8_PALLAS_N_ATTR, ckpt_n_out)
+            padded_copy = padded_n(ckpt_n_out) != ckpt_n_out
+            if padded_copy:
+                _set_fp8_pallas_copy(layer)
+            get_fp8_linear_pallas_op(
+                padded_copy
+            )  # build now: Dynamo cannot trace its Lock
         # Derive weight_block_size explicitly from weight_scale layout when
         # requant_block_size is unspecified.
         # Setting (1, weight.shape[1]) vs (weight.shape[0], 1) guarantees downstream
@@ -1622,7 +1692,14 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             layer.weight_block_size = requant_block_size
 
         if layer.weight.device.type == "tpu":
-            synchronize_tensors([layer.weight, layer.weight_scale])
+            synchronize_tensors(
+                [layer.weight, layer.weight_scale]
+                + [
+                    getattr(layer, n)
+                    for n in (FP8_PALLAS_WEIGHT, FP8_PALLAS_SCALE)
+                    if hasattr(layer, n)
+                ]
+            )
 
         if self.online_fp8:
             layer._tpu_online_fp8_processed = True
@@ -1647,7 +1724,16 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
             # takes the canonical (k, n), so flip the view for the contraction.
             weight = weight.transpose(0, 1)
-        out = quantized_matmul(x, weight, layer.weight_scale)
+        if getattr(layer, FP8_PALLAS_N_ATTR, None) is not None:
+            out = quantized_matmul_pallas(
+                x,
+                weight,
+                layer.weight_scale,
+                getattr(layer, FP8_PALLAS_WEIGHT, None),
+                getattr(layer, FP8_PALLAS_SCALE, None),
+            )
+        else:
+            out = quantized_matmul(x, weight, layer.weight_scale)
         if bias is not None:
             out = out + bias
         return out

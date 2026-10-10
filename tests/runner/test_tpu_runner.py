@@ -1991,10 +1991,8 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
         requests={},
     )
     calls = []
-    runner.input_batch.update_req_spec_token_ids = (
-        lambda request, scheduled: calls.append(
-            (request.req_id, list(scheduled[request.req_id]))
-        )
+    runner.input_batch.update_req_spec_token_ids = lambda request, scheduled: (
+        calls.append((request.req_id, list(scheduled[request.req_id])))
     )
     TPUModelRunner._install_spec_token_room_guard(runner)
 
@@ -2464,3 +2462,65 @@ def test_upload_unless_unchanged_reuses_only_identical_values(device):
     assert zf is not z and zf.dtype == torch.float32
     z22 = upload("z", torch.zeros(2, 2, dtype=torch.float32))
     assert z22 is not zf and tuple(z22.shape) == (2, 2)
+
+
+def test_relayout_tables_reaches_the_draft_model(monkeypatch):
+    """The draft shares the target's cached Pallas ops, which are traced
+    against the target's relayouted tables; the draft's own tables must get
+    the same layout (a column-major draft rope cache fails the shared op
+    with RuntimeProgramInputMismatch while precompiling the draft buckets).
+    """
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", True)
+    monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", True)
+    seen = []
+    monkeypatch.setattr(
+        runner_utils_module,
+        "relayout_rope_caches",
+        lambda model: seen.append(("rope", model)),
+    )
+    monkeypatch.setattr(
+        runner_utils_module,
+        "relayout_hash_tables",
+        lambda model: seen.append(("hash", model)),
+    )
+    runner = MagicMock(spec=TPUModelRunner)
+    draft_model = object()
+
+    TPUModelRunner._relayout_tables(runner, draft_model)
+    assert seen == [("rope", draft_model), ("hash", draft_model)]
+
+    # No draft (ngram) or flags off: nothing to relayout.
+    seen.clear()
+    TPUModelRunner._relayout_tables(runner, None)
+    monkeypatch.setattr(envs, "TPU_ROPE_CACHE_ROW_MAJOR", False)
+    monkeypatch.setattr(envs, "TPU_MOE_HASH_TABLE_ROW_MAJOR", False)
+    TPUModelRunner._relayout_tables(runner, draft_model)
+    assert seen == []
+
+
+def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):
+    from vllm_torchtpu.runner.tpu_runner import _torch_tpu_wrapper
+
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 42)
+    monkeypatch.setattr(torch.accelerator, "set_device_index", lambda d: f"set_{d}")
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
+    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 8)
+    fake_stream = object()
+    monkeypatch.setattr(
+        torch.accelerator, "current_stream", lambda dev=None: fake_stream
+    )
+    monkeypatch.setattr(torch.accelerator, "set_stream", lambda s: f"set_stream_{s}")
+    monkeypatch.setattr(
+        torch.accelerator, "synchronize", lambda dev=None: "synchronized"
+    )
+
+    with _torch_tpu_wrapper():
+        assert torch.cuda.current_device() == 42
+        assert torch.cuda.set_device(0) == "set_0"
+        assert torch.cuda.is_available() is True
+        assert torch.cuda.device_count() == 8
+        assert torch.cuda.current_stream() is fake_stream
+        assert torch.cuda.set_stream(fake_stream) == "set_stream_" + str(fake_stream)
+        assert torch.cuda.synchronize() == "synchronized"

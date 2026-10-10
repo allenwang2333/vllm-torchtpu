@@ -19,7 +19,9 @@ from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase,
     DeviceCommunicatorBase,
 )
-from vllm.distributed.parallel_state import get_dp_group
+from vllm.distributed.parallel_state import get_dp_group, get_ep_group
+
+from vllm_torchtpu.layers.adapter import small_all_reduce_op
 
 
 class TpuNullAll2AllManager(All2AllManagerBase):
@@ -36,8 +38,14 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
 
-    def _dp_gather(self, x: torch.Tensor) -> torch.Tensor:
-        return get_dp_group().all_gather(x, dim=0)
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        # Every TP all-reduce (row-parallel output projections, GDN out-proj,
+        # vocab embedding, MoE reduce_results) comes through here.
+        return small_all_reduce_op.all_reduce_or(input_, self.ranks, super().all_reduce)
+
+    def _moe_group(self, is_sequence_parallel: bool):
+        group = get_ep_group() if is_sequence_parallel else get_dp_group()
+        return group if group.world_size > 1 else None
 
     def dispatch_router_logits(
         self,
@@ -50,11 +58,11 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             raise NotImplementedError(
                 "extra_tensors is not supported by TpuDeviceCommunicator"
             )
-        dp = get_dp_group()
-        if dp.world_size == 1:
+        group = self._moe_group(is_sequence_parallel)
+        if group is None:
             return hidden_states, router_logits
-        hidden_states = self._dp_gather(hidden_states)
-        router_logits = self._dp_gather(router_logits)
+        hidden_states = group.all_gather(hidden_states, dim=0)
+        router_logits = group.all_gather(router_logits, dim=0)
         return hidden_states, router_logits
 
     def dispatch(
@@ -69,18 +77,23 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             raise NotImplementedError(
                 "extra_tensors is not supported by TpuDeviceCommunicator"
             )
-        dp = get_dp_group()
-        if dp.world_size == 1:
+        group = self._moe_group(is_sequence_parallel)
+        if group is None:
             return hidden_states, topk_weights, topk_ids
-        hidden_states = self._dp_gather(hidden_states)
-        topk_weights = self._dp_gather(topk_weights)
-        topk_ids = self._dp_gather(topk_ids)
+        hidden_states = group.all_gather(hidden_states, dim=0)
+        topk_weights = group.all_gather(topk_weights, dim=0)
+        topk_ids = group.all_gather(topk_ids, dim=0)
         return hidden_states, topk_weights, topk_ids
 
     def combine(
         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
     ) -> torch.Tensor:
-        dp = get_dp_group()
-        if dp.world_size == 1:
+        group = self._moe_group(is_sequence_parallel)
+        if group is None:
             return hidden_states
-        return dp.reduce_scatter(hidden_states, dim=0)
+        if is_sequence_parallel:
+            return group.reduce_scatter(hidden_states, dim=0)
+        # The small-block kernel only covers the DP combine.
+        return small_all_reduce_op.dp_combine_or(
+            hidden_states, lambda x: group.reduce_scatter(x, dim=0)
+        )

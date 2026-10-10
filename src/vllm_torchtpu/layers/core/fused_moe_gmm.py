@@ -63,6 +63,11 @@ ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VE
 _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
+# Fixed at import: build the MoE permutation from one packed sort.
+_SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
+# Above 2,048 routed rows, the inverse-permutation scatter costs more than
+# the two sorts it replaces when `ragged_permute` is off (e.g. non-EP prefill).
+_SINGLE_SORT_MAX_ROWS = 2048
 
 
 def resolve_onehot_permute_threshold() -> int:
@@ -264,6 +269,55 @@ def _counting_sort_positions(
     return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
 
 
+def _single_sort_permutation(
+    sort_keys: jax.Array, topk: int, flat_bits: int
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Returns the stable argsort of `sort_keys`, its inverse, and token ids.
+
+    Packing (key, flat position) into one int32 makes a single unstable sort
+    order entries like a stable argsort. The inverse is a scatter, and flat
+    position p belongs to token p // topk.
+    """
+    pos = jnp.arange(sort_keys.shape[0], dtype=jnp.int32)
+    packed = jax.lax.sort(jnp.left_shift(sort_keys, flat_bits) | pos, is_stable=False)
+    sorted_indices = jnp.bitwise_and(packed, (1 << flat_bits) - 1)
+    revert = jnp.zeros_like(pos).at[sorted_indices].set(pos, unique_indices=True)
+    return sorted_indices, revert, sorted_indices // topk
+
+
+# Largest routed-row count the sort-free one-hot prep handles: it does two M x M
+# int32 compare-and-count passes, so its VPU work grows as M^2 while the sorts it
+# replaces grow as M log M. Above this the comparison sorts are kept.
+_ONEHOT_SORTFREE_MAX_ROWS = 1024
+
+
+def _sortfree_onehot_routing(
+    sort_keys: jax.Array, token_indices_flat: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+    """Stable-sort positions and permuted token ids without a sort.
+
+    Row ``i`` lands at ``pos[i] = #{j : (key_j, j) < (key_i, i)}`` -- exactly
+    ``argsort(argsort(keys))`` for a stable argsort -- and slot ``p`` holds the
+    token of the row with ``pos == p``. ``token_indices_flat`` is nondecreasing
+    in the row index, so ordering a bucket by row orders it by token id, which
+    makes the result identical to the packed (key, token) value sort as well.
+    Everything is int32 compare-and-count on the VPU: no float rank matmul, so
+    there is no rounding or miscompile region for the positions to fall into.
+    """
+    m = sort_keys.shape[0]
+    rows = jnp.arange(m, dtype=jnp.int32)
+    # (key, row) packed into one int32 is unique per row, so "<" on it is the
+    # lexicographic order of a stable sort. The caller bounds m * buckets.
+    composite = sort_keys * m + rows
+    pos = jnp.sum(composite[None, :] < composite[:, None], axis=1, dtype=jnp.int32)
+    token_indices_sorted = jnp.sum(
+        jnp.where(pos[None, :] == rows[:, None], token_indices_flat[None, :], 0),
+        axis=1,
+        dtype=jnp.int32,
+    )
+    return pos, token_indices_sorted
+
+
 def prepare_routed_gmm_inputs(
     hidden_states_local: jax.Array,
     topk_indices_local: jax.Array,
@@ -275,6 +329,7 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
+    onehot_sortfree: bool | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
@@ -284,6 +339,10 @@ def prepare_routed_gmm_inputs(
     (inside this JIT) and marks non-local entries with a negative id which
     the mask filters out. Always running the masked branch keeps a single
     code path.
+
+    ``onehot_sortfree`` (None reads ``TPU_MOE_ONEHOT_SORTFREE``) replaces the
+    one-hot permute's comparison sorts with `_sortfree_onehot_routing`; every
+    output is bit-identical to the sorted form.
     """
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
@@ -306,6 +365,40 @@ def prepare_routed_gmm_inputs(
         and use_sparse_core
         and token_indices_flat.shape[0] > onehot_moe_permute_threshold
     )
+    if onehot_sortfree is None:
+        onehot_sortfree = envs.TPU_MOE_ONEHOT_SORTFREE
+    num_rows = token_indices_flat.shape[0]
+    if (
+        onehot_sortfree
+        and use_ep
+        and use_sparse_core
+        and not ragged_permute
+        and num_rows <= _ONEHOT_SORTFREE_MAX_ROWS
+        and (local_num_experts + 1) * num_rows < 2**31
+    ):
+        argsort_revert_indices, token_indices_sorted = _sortfree_onehot_routing(
+            sort_keys, token_indices_flat
+        )
+        # Same histogram as the sorted form below, so group_sizes match exactly.
+        group_sizes_local = (
+            jax.nn.one_hot(
+                jnp.where(valid_mask, topk_indices_flat, 0),
+                local_num_experts,
+                dtype=jnp.int32,
+            )
+            * valid_mask[:, None].astype(jnp.int32)
+        ).sum(axis=0)
+        onehot = jax.nn.one_hot(
+            token_indices_sorted, num_tokens_local, dtype=hidden_states_local.dtype
+        )
+        return (
+            onehot @ hidden_states_local,
+            group_sizes_local,
+            argsort_revert_indices,
+            topk_weights_flat,
+            valid_mask,
+            token_indices_sorted,
+        )
     argsort_revert_indices, bucket_counts = (
         _counting_sort_positions(sort_keys, local_num_experts + 1)
         if ragged_permute
@@ -313,32 +406,48 @@ def prepare_routed_gmm_inputs(
     )
     token_bits = max(1, (num_tokens_local - 1).bit_length())
     packable = (local_num_experts + 1).bit_length() + token_bits < 31
+    flat_bits = max(1, (token_indices_flat.shape[0] - 1).bit_length())
+    single_sort = (
+        _SINGLE_SORT
+        and not ragged_permute
+        and token_indices_flat.shape[0] <= _SINGLE_SORT_MAX_ROWS
+        and (local_num_experts + 1).bit_length() + flat_bits < 31
+    )
     sorted_indices = (
         jnp.argsort(sort_keys)
-        if argsort_revert_indices is None or not packable
+        if not single_sort and (argsort_revert_indices is None or not packable)
         else None
     )
+    token_indices_sorted: jax.Array | None = None
 
     if argsort_revert_indices is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
     else:
-        argsort_revert_indices = jnp.argsort(sorted_indices)
+        if single_sort:
+            logger.info_once("MoE permutation runs as one packed sort.")
+            sorted_indices, argsort_revert_indices, token_indices_sorted = (
+                _single_sort_permutation(sort_keys, topk, flat_bits)
+            )
+        else:
+            argsort_revert_indices = jnp.argsort(sorted_indices)
         topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
         group_sizes_local = jax.nn.one_hot(
             topk_indices_for_count, local_num_experts, dtype=jnp.int32
         ) * valid_mask[:, None].astype(jnp.int32)
         group_sizes_local = group_sizes_local.sum(axis=0)
 
-    if packable:
-        # Packing (key, token) into one int32 keeps the payload out of the sort
-        # and drops the follow-up gather. Equal packed values carry the same
-        # token id, so their order cannot matter.
-        packed = jax.lax.sort(
-            jnp.left_shift(sort_keys, token_bits) | token_indices_flat, is_stable=False
-        )
-        token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
-    else:
-        token_indices_sorted = token_indices_flat[sorted_indices]
+    if token_indices_sorted is None:
+        if packable:
+            # Packing (key, token) into one int32 keeps the payload out of the sort
+            # and drops the follow-up gather. Equal packed values carry the same
+            # token id, so their order cannot matter.
+            packed = jax.lax.sort(
+                jnp.left_shift(sort_keys, token_bits) | token_indices_flat,
+                is_stable=False,
+            )
+            token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
+        else:
+            token_indices_sorted = token_indices_flat[sorted_indices]
 
     if use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
@@ -550,6 +659,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "onehot_sortfree",
     ),
 )
 def fused_moe_func(
@@ -570,6 +680,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    onehot_sortfree: bool | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -657,6 +768,7 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
+        onehot_sortfree=onehot_sortfree,
     )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
