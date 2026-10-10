@@ -714,20 +714,10 @@ def moe_gmm(
 
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     inter_dim = w2.shape[1] * packing_factor
-    is_w2_fp4 = rhs_quant_dtype == jnp.float4_e2m1fn or (
+    is_w2_fp4 = (
         jnp.issubdtype(w2.dtype, jnp.floating)
         and jax.dtypes.itemsize_bits(w2.dtype) == 4
     )
-    if (is_w2_fp4 or rhs_quant_dtype == jnp.float4_e2m1fn) and lhs_scale is not None:
-        if lhs_scale.shape[1] == 1:
-            x = (x.astype(jnp.float32) * lhs_scale).astype(lhs_scale.dtype)
-        else:
-            nb = lhs_scale.shape[1]
-            x = (
-                x.reshape(x.shape[0], nb, x.shape[1] // nb).astype(jnp.float32)
-                * lhs_scale[:, :, None]
-            ).reshape(x.shape).astype(lhs_scale.dtype)
-        lhs_scale = None
     fuse_gmm1_fp8 = not is_w2_fp4 and inter_dim == 512
     gmm1_res = gmm_wrapper(
         x,
@@ -748,7 +738,12 @@ def moe_gmm(
         )
         gmm1_in = jnp.concatenate([u8_pair[..., 0], u8_pair[..., 1]], axis=1)
         gmm1_scale = gmm1_res[:, inter_dim // 2 : inter_dim // 2 + 1]
-    elif not is_w2_fp4 and w2_scale is not None and inter_dim % 128 == 0:
+    elif (
+        not is_w2_fp4
+        and w2_scale is not None
+        and inter_dim % 128 == 0
+        and gmm1_res.shape[0] <= 4608
+    ):
         gmm1_in, gmm1_scale = quantize_lhs_rows(gmm1_res[:, :inter_dim])
     else:
         gmm1_in = gmm1_res[:, :inter_dim]

@@ -15,6 +15,7 @@
 
 import functools
 import inspect
+import os
 from typing import Any
 
 import jax
@@ -67,6 +68,9 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 from vllm_torchtpu.utils import align_to
 
 _pallas_op_cache: dict[str, Any] = {}
+_DECODER_TP_ATTN_VERIFY: bool = (
+    os.environ.get("VLLM_DSV41_DECODER_TP_ATTN_VERIFY", "1") == "1"
+)
 _R = P()
 
 
@@ -554,14 +558,39 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
     """TPU DeepSeek-V4.1 Indexer; returns full index_topk indices on every TP rank."""
 
     def __init__(self, *args, **kwargs) -> None:
+        cfg = kwargs.get("config") or (args[1] if len(args) > 1 else None)
+        prefix_arg = kwargs.get("prefix", "")
         cand_buf = kwargs.get("candidate_block_buffer")
+        cand_write = bool(kwargs.get("candidate_write"))
+        cand_blk_sz = int(kwargs.get("candidate_block_size") or 0)
+        if (
+            cand_buf is None
+            and cfg is not None
+            and os.environ.get("VLLM_DSV41_ENCODER_CAND_MODE", "1") == "1"
+        ):
+            enc_buf = getattr(cfg, "_tpu_candidate_block_buffer", None)
+            enc_boundary = int(getattr(cfg, "num_hidden_layers", 40)) // 2
+            enc_idx_lids = sorted(
+                s
+                for s in (getattr(cfg, "index_source_layer_ids", None) or ())
+                if s < enc_boundary
+            )
+            lid = (
+                int(prefix_arg.split(".layers.")[1].split(".")[0])
+                if ".layers." in prefix_arg
+                else -1
+            )
+            if enc_buf is not None and len(enc_idx_lids) >= 2 and lid in enc_idx_lids:
+                cand_buf = enc_buf
+                cand_write = lid == enc_idx_lids[0]
+                cand_blk_sz = int(getattr(cfg, "candidate_block_size", 0) or 8)
         object.__setattr__(self, "_cand_buf", cand_buf)
         self.cand_mode = (
             None
             if cand_buf is None
-            else ("write" if kwargs.get("candidate_write") else "read")
+            else ("write" if cand_write else "read")
         )
-        self.cand_block_size = int(kwargs.get("candidate_block_size") or 0)
+        self.cand_block_size = cand_blk_sz
         self.cand_blocks = 0 if cand_buf is None else int(cand_buf.shape[1])
         orig_sparse_attn = dsv41_attention.SparseAttnIndexer
         orig_sparse_mqa = dsv41_attention.SparseMQAIndexer
@@ -733,18 +762,27 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
             _fake_tp_indexer,
         )
 
-    def use_tp_indexer(self, num_tokens: int) -> bool:
+    def use_tp_indexer(
+        self, num_tokens: int, *, ced_decoder: bool = False
+    ) -> bool:
         """Token-parallel indexer for this batch size (static, per bucket)."""
         if "indexer_op_tp" not in self.__dict__:
             return False
         tp_size = get_tensor_model_parallel_world_size()
         t_l = num_tokens // tp_size
+        dec_tp_ok = (
+            _DECODER_TP_ATTN_VERIFY
+            and ced_decoder
+            and tp_size > 1
+            and num_tokens >= int(os.environ.get("VLLM_DSV41_DECODER_TP_ATTN_MIN_TOKENS", "1024"))
+            and num_tokens % tp_size == 0
+        )
         return (
             num_tokens % tp_size == 0
             # 2 or 4 rows per rank (and t_l % 8 != 0, e.g. 10 at T=80) run padded
             # to a multiple of 8 inside indexer_v41_tp_jax.
             and (t_l in (2, 4) or t_l >= 8)
-            and num_tokens >= envs.VLLM_DSV41_TP_INDEXER_MIN_TOKENS
+            and (dec_tp_ok or num_tokens >= envs.VLLM_DSV41_TP_INDEXER_MIN_TOKENS)
         )
 
     def _get_step_metadata_op(self, page_size: int):
@@ -991,6 +1029,7 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         keep_topk_local: bool = False,
         query_fp8: torch.Tensor | None = None,
         query_scale: torch.Tensor | None = None,
+        ced_decoder: bool = False,
     ) -> torch.Tensor:
         del hidden_states
         num_tokens = positions.shape[0]
@@ -1012,7 +1051,7 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
             and self.can_accept_prequant_query()
         )
         main_metadata = attn_ctx[prefix_key.removesuffix(".indexer.k_cache")]
-        if self.use_tp_indexer(num_tokens):
+        if self.use_tp_indexer(num_tokens, ced_decoder=ced_decoder):
             # Token-parallel: this rank projects and scores tokens
             # [rank * T/tp, (rank + 1) * T/tp) against the replicated K cache,
             # then the top-k indices are all-gathered in rank order.
@@ -1134,6 +1173,6 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
             else:
                 topk = idx_op(*op_args, *meta_args)
         if self.topk_indices_buffer is not None:
-            n_tk = num_tokens // get_tensor_model_parallel_world_size() if (self.use_tp_indexer(num_tokens) and keep_topk_local) else num_tokens
-            self.topk_indices_buffer[:n_tk].copy_(topk[:n_tk])
+            n_topk = topk.shape[0]
+            self.topk_indices_buffer[:n_topk].copy_(topk[:n_topk])
         return topk
