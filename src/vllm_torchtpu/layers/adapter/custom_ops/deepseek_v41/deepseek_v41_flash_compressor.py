@@ -100,16 +100,18 @@ def _as_kernel_cache_view(cache: torch.Tensor | None) -> torch.Tensor | None:
 
 
 def _fp32_linear_jax(x: jax.Array, weight: jax.Array) -> jax.Array:
+    rhs_dim = 0 if weight.shape[0] == x.shape[1] else 1
     return jax.lax.dot_general(
         x,
         weight,
-        (((1,), (0,)), ((), ())),
+        (((1,), (rhs_dim,)), ((), ())),
         preferred_element_type=jax.numpy.float32,
     )
 
 
 def _fake_fp32_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return x.new_empty((x.shape[0], weight.shape[1]), dtype=torch.float32)
+    out_dim = weight.shape[1] if weight.shape[0] == x.shape[1] else weight.shape[0]
+    return x.new_empty((x.shape[0], out_dim), dtype=torch.float32)
 
 
 _fp32_linear_op = pallas.jax_op(

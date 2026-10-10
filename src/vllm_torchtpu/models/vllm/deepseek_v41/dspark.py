@@ -712,7 +712,7 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         w2_pad = (
             torch.nn.functional.pad(w2_raw, (0, 0, 0, shard_cols - valid_vocab))
             if valid_vocab < shard_cols
-            else w2_raw.contiguous()
+            else w2_raw.clone().contiguous()
         ).to(device=dev)
         pad_mask = (
             torch.arange(shard_cols, dtype=torch.int32, device=dev) >= valid_vocab

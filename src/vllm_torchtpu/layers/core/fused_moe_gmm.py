@@ -938,7 +938,13 @@ def _fused_moe_single_chunk(
     if w2_scale is not None and w2_scale.ndim == 3:
         w2_scale = jnp.expand_dims(w2_scale, 2)
 
-    num_tokens, hidden_size = hidden_states.shape
+    orig_num_tokens, hidden_size = hidden_states.shape
+    pad_t = -orig_num_tokens % 8
+    if pad_t:
+        hidden_states = jnp.pad(hidden_states, ((0, pad_t), (0, 0)))
+        topk_weights = jnp.pad(topk_weights, ((0, pad_t), (0, 0)), constant_values=0)
+        topk_ids = jnp.pad(topk_ids, ((0, pad_t), (0, 0)), constant_values=-1)
+    num_tokens = hidden_states.shape[0]
 
     # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
     # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
@@ -1008,7 +1014,7 @@ def _fused_moe_single_chunk(
             topk_ids,
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
-        )
+        )[:orig_num_tokens, :hidden_size]
 
     effective_onehot_threshold = (
         _FAST_ONEHOT_AUTO_THRESHOLD
@@ -1030,7 +1036,7 @@ def _fused_moe_single_chunk(
     can_prequant_lhs = (
         w1_scale is not None
         and not is_fp4_weight
-        and num_tokens >= 128
+        and num_tokens >= 1024
         and (num_tokens * topk) % 32 == 0
         and hidden_size == padded_hidden_size
         and hidden_size % MOE_FP8_DISPATCH_BLOCK == 0
@@ -1099,7 +1105,7 @@ def _fused_moe_single_chunk(
         w_sorted=w_sorted,
         lhs_scale=lhs_scale,
     )
-    return x[:num_tokens, :hidden_size]
+    return x[:orig_num_tokens, :hidden_size]
 
 
 @functools.partial(
@@ -1291,7 +1297,14 @@ def _fused_moe_fp8_dispatch_single_chunk(
     if w2_scale is not None and w2_scale.ndim == 3:
         w2_scale = jnp.expand_dims(w2_scale, 2)
 
-    num_tokens, hidden_size = hidden_q.shape
+    orig_num_tokens, hidden_size = hidden_q.shape
+    pad_t = -orig_num_tokens % 32
+    if pad_t:
+        hidden_q = jnp.pad(hidden_q, ((0, pad_t), (0, 0)))
+        hidden_scale = jnp.pad(hidden_scale, ((0, pad_t), (0, 0)))
+        topk_weights = jnp.pad(topk_weights, ((0, pad_t), (0, 0)), constant_values=0)
+        topk_ids = jnp.pad(topk_ids, ((0, pad_t), (0, 0)), constant_values=-1)
+    num_tokens = hidden_q.shape[0]
     act_dtype = hidden_scale.dtype
     packing_factor = get_packing_factor(w1.dtype, rhs_quant_dtype)
     effective_dense_threshold = (
@@ -1349,7 +1362,7 @@ def _fused_moe_fp8_dispatch_single_chunk(
             topk_ids,
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
-        )
+        )[:orig_num_tokens, :hidden_size]
 
     effective_onehot_threshold = (
         _FAST_ONEHOT_AUTO_THRESHOLD
@@ -1412,7 +1425,7 @@ def _fused_moe_fp8_dispatch_single_chunk(
         w_sorted=w_sorted,
         lhs_scale=hidden_scale[token_indices_sorted],
     )
-    return x[:num_tokens, :hidden_size]
+    return x[:orig_num_tokens, :hidden_size]
 
 
 @functools.partial(
