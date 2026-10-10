@@ -27,7 +27,7 @@ import numpy as np
 import torch
 from jax.sharding import PartitionSpec as P
 from torch import nn
-from torch_tpu import pallas
+from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,

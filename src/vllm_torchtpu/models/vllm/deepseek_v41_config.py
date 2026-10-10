@@ -86,14 +86,25 @@ class DeepseekV41Config(PreTrainedConfig):
 
 
 def register_deepseek_v41_config() -> None:
-    """Make vLLM resolve ``model_type: deepseek_v41`` to :class:`DeepseekV41Config`.
+    """Make vLLM resolve ``model_type: deepseek_v41`` to a ``DeepseekV41Config``.
 
-    No-op when the installed vLLM already ships its own entry.
+    Prefers the class shipped by the installed vLLM (so upstream model code and
+    this plugin agree on one type); falls back to the ported class above. No-op
+    when vLLM's registry already has an entry.
     """
     from vllm.transformers_utils.config import _CONFIG_REGISTRY
 
     if DEEPSEEK_V41_MODEL_TYPE in _CONFIG_REGISTRY:
         return
+    config_cls: type[PreTrainedConfig] = DeepseekV41Config
+    try:
+        from vllm.transformers_utils.configs.deepseek_v41 import (
+            DeepseekV41Config as _UpstreamDeepseekV41Config,
+        )
+
+        config_cls = _UpstreamDeepseekV41Config
+    except ImportError:
+        pass
     # LazyConfigDict returns concrete classes as-is, so inserting the type is
     # enough; vLLM registers it with transformers' AutoConfig on first use.
-    _CONFIG_REGISTRY[DEEPSEEK_V41_MODEL_TYPE] = DeepseekV41Config
+    _CONFIG_REGISTRY[DEEPSEEK_V41_MODEL_TYPE] = config_cls
