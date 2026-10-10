@@ -45,6 +45,7 @@ LANE = 128
 TUNED = {  # (k, n) -> (split, tile, nbuf)
     (6144, 2688): ("k", 1024, 3),  # q_a + kv_a (padded copy of 2624)
     (2048, 16384): ("n", 1024, 4),  # q_b
+    (2048, 8192): ("n", 1024, 4),  # q_b at half the heads (scaled microbenchmark twin), not tuned
     (1024, 6144): ("n", 2048, 3),  # o_proj
     (6144, 1536): ("k", 1536, 3),  # dense gate_up
 }
