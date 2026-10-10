@@ -603,15 +603,16 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         w2_block_size = min(REQUANTIZED_BLOCK_SIZE, w2_weight_padded.shape[1])
 
         def _chunked_quant(w_pad: torch.Tensor, blk: int):
+            import gc
             n_exp = w_pad.shape[0]
-            if n_exp <= 16:
+            if n_exp <= 8:
                 return quantize_native_fp4_kmajor(
                     w_pad.to(device), block=blk, pack=pack
                 )
             qw_cpu_list, qs_cpu_list = [], []
             out_dtype = None
-            for s in range(0, n_exp, 16):
-                w_sub = w_pad[s : s + 16].to(device)
+            for s in range(0, n_exp, 8):
+                w_sub = w_pad[s : s + 8].to(device)
                 qw, qs = quantize_native_fp4_kmajor(
                     w_sub, block=blk, pack=pack
                 )
@@ -620,6 +621,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 qw_cpu_list.append(qw.view(torch.uint8).cpu())
                 qs_cpu_list.append(qs.cpu())
                 del w_sub, qw, qs
+                gc.collect()
             qw_cat = (
                 torch.cat(qw_cpu_list, dim=0)
                 .view(out_dtype)
@@ -628,6 +630,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             qs_cat = torch.cat(qs_cpu_list, dim=0).to(device)
             synchronize_tensors([qw_cat, qs_cat])
             del qw_cpu_list, qs_cpu_list
+            gc.collect()
             return qw_cat, qs_cat
 
         w13_weight_processed, w13_weight_scale = _chunked_quant(
