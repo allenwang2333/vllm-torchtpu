@@ -117,6 +117,31 @@ def _patch_tpu_device_to_cpu(monkeypatch):
 
 
 class TestSmokeE2E:
+    @pytest.fixture(autouse=True)
+    def _restore_smoke_hooks(self):
+        import vllm.model_executor.model_loader.dummy_loader as dummy_loader
+        import vllm.model_executor.model_loader.weight_utils as weight_utils
+
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+        orig_wu_dummy = weight_utils.initialize_single_dummy_weight
+        orig_dl_dummy = dummy_loader.initialize_single_dummy_weight
+        orig_from = TPUModelRunner.compute_logits_from_hidden_states
+        orig_sel = TPUModelRunner.compute_selected_logits
+        had_hooked = hasattr(TPUModelRunner, "_dsv41_smoke_logits_hooked")
+        orig_hooked = getattr(TPUModelRunner, "_dsv41_smoke_logits_hooked", None)
+        try:
+            yield
+        finally:
+            weight_utils.initialize_single_dummy_weight = orig_wu_dummy
+            dummy_loader.initialize_single_dummy_weight = orig_dl_dummy
+            TPUModelRunner.compute_logits_from_hidden_states = orig_from
+            TPUModelRunner.compute_selected_logits = orig_sel
+            if had_hooked:
+                TPUModelRunner._dsv41_smoke_logits_hooked = orig_hooked
+            elif hasattr(TPUModelRunner, "_dsv41_smoke_logits_hooked"):
+                delattr(TPUModelRunner, "_dsv41_smoke_logits_hooked")
+
     def test_deterministic_single_dummy_weight_branches(self):
         smoke._install_deterministic_dummy_weights()
         import vllm.model_executor.model_loader.weight_utils as wu

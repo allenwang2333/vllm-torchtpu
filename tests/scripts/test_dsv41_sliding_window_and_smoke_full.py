@@ -90,6 +90,31 @@ def _write_fake_meta_dir(meta_dir: pathlib.Path) -> None:
 class TestSmokeE2EDsv41:
     """Covers 100% lines & branches of smoke_e2e_dsv41_tp8.py."""
 
+    @pytest.fixture(autouse=True)
+    def _restore_smoke_hooks(self):
+        import vllm.model_executor.model_loader.dummy_loader as dummy_loader
+        import vllm.model_executor.model_loader.weight_utils as weight_utils
+
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+        orig_wu_dummy = weight_utils.initialize_single_dummy_weight
+        orig_dl_dummy = dummy_loader.initialize_single_dummy_weight
+        orig_from = TPUModelRunner.compute_logits_from_hidden_states
+        orig_sel = TPUModelRunner.compute_selected_logits
+        had_hooked = hasattr(TPUModelRunner, "_dsv41_smoke_logits_hooked")
+        orig_hooked = getattr(TPUModelRunner, "_dsv41_smoke_logits_hooked", None)
+        try:
+            yield
+        finally:
+            weight_utils.initialize_single_dummy_weight = orig_wu_dummy
+            dummy_loader.initialize_single_dummy_weight = orig_dl_dummy
+            TPUModelRunner.compute_logits_from_hidden_states = orig_from
+            TPUModelRunner.compute_selected_logits = orig_sel
+            if had_hooked:
+                TPUModelRunner._dsv41_smoke_logits_hooked = orig_hooked
+            elif hasattr(TPUModelRunner, "_dsv41_smoke_logits_hooked"):
+                delattr(TPUModelRunner, "_dsv41_smoke_logits_hooked")
+
     def test_sys_path_insert_branch(self):
         repo_root_str = str(_SCRIPT_SMOKE.resolve().parent)
         orig_path = list(sys.path)

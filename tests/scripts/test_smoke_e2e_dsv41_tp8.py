@@ -147,18 +147,25 @@ def test_build_operator_shape_ledger():
 
 
 def test_deterministic_single_dummy_weight_handles_requires_grad_parameter():
+    import vllm.model_executor.model_loader.dummy_loader as dummy_loader
     import vllm.model_executor.model_loader.weight_utils as weight_utils
 
-    smoke._install_deterministic_dummy_weights()
-    p = torch.nn.Parameter(torch.empty((8, 16), dtype=torch.bfloat16))
-    assert p.requires_grad
-    weight_utils.initialize_single_dummy_weight(p)
-    assert torch.isfinite(p).all()
+    orig_wu = weight_utils.initialize_single_dummy_weight
+    orig_dl = dummy_loader.initialize_single_dummy_weight
+    try:
+        smoke._install_deterministic_dummy_weights()
+        p = torch.nn.Parameter(torch.empty((8, 16), dtype=torch.bfloat16))
+        assert p.requires_grad
+        weight_utils.initialize_single_dummy_weight(p)
+        assert torch.isfinite(p).all()
 
-    p_val = torch.nn.Parameter(torch.empty((4, 4), dtype=torch.float32))
-    p_val.dummy_weight_value = 0.25
-    weight_utils.initialize_single_dummy_weight(p_val)
-    assert torch.all(p_val == 0.25)
+        p_val = torch.nn.Parameter(torch.empty((4, 4), dtype=torch.float32))
+        p_val.dummy_weight_value = 0.25
+        weight_utils.initialize_single_dummy_weight(p_val)
+        assert torch.all(p_val == 0.25)
+    finally:
+        weight_utils.initialize_single_dummy_weight = orig_wu
+        dummy_loader.initialize_single_dummy_weight = orig_dl
 
 
 def test_extract_top_logprobs_truncates_extra_sampled_token_and_loads_non_zero_steps(
