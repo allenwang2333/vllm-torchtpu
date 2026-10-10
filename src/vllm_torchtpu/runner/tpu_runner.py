@@ -6542,6 +6542,16 @@ class TPUModelRunner(GPUModelRunner):
         assert self.speculative_config is not None
         assert self.kv_cache_config is not None
         K = self.speculative_config.num_speculative_tokens
+        if R * (1 + K) > self.max_num_tokens:
+            # No serving step can carry R verify windows: the token budget caps it.
+            logger.info(
+                "skip spec-decode warmup R=%d: %d verify tokens exceed the "
+                "%d-token bucket",
+                R,
+                R * (1 + K),
+                self.max_num_tokens,
+            )
+            return
         room = self.max_model_len - P
         n_decode = min(max(5, K + 2), max(0, room // (1 + K) - 1))
         max_pos = min(self.max_model_len, P + n_decode * (1 + K))
@@ -6619,8 +6629,6 @@ class TPUModelRunner(GPUModelRunner):
                 self.sample_tokens(None)
                 self.take_draft_token_ids()
                 nct = [x + 1 for x in nct]
-        except Exception:
-            logger.exception("spec-decode warmup R=%d failed; continuing", R)
         finally:
             self._warmup_spec_decode_cleanup(rids)
 
