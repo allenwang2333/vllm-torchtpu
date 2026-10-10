@@ -21,6 +21,8 @@ reserves no env and has no after-tasks, so a local run uploads nothing
 import dataclasses
 import pathlib
 import subprocess
+from collections.abc import Mapping
+from typing import Any
 
 from scenario.plan.types import Plan
 from scenario.runtime import driver
@@ -52,6 +54,8 @@ class LocalTarget:
     def reserved_env(self) -> EnvNames:
         return EnvNames(frozenset())
 
-    def submit(self, plan: Plan) -> int:
+    def submit(self, plan: Plan, resolved: Mapping[str, Any] | None = None) -> int:
         options = dataclasses.replace(self.options, target=TargetData(self.info()))
+        if resolved is not None:
+            options = dataclasses.replace(options, resolved=resolved)
         return driver.run(plan, options)
