@@ -370,22 +370,25 @@ def _unit_bytes(h, width):
 def plan_weight_ring(m, h, i, i_s, n_ranks, i_block=None, num_buffers=None):
     """(ib, nb) for the decode kernel at these shapes, chosen at trace time.
 
-    ib is None (whole experts, unchanged layout) whenever a ring of three
-    whole-expert slots fits VMEM beside the token-side buffers; depth then
-    follows _weight_ring_depth. Otherwise (or when i_block is given) each
-    expert streams in blocks of ib intermediate columns, ib the first of
-    _I_BLOCKS dividing i whose ring of at least three units fits, the ring
-    as deep as fits up to _NUM_BUFFERS.
+    ib is None (whole experts, unchanged layout) whenever three whole-expert
+    slots alone fit VMEM, whatever the token count: the decision depends on the
+    expert's size only, so a layer whose experts are small (Qwen3.5, GLM-5.2 at
+    TP) never switches into blocked mode at a large bucket; depth then follows
+    _weight_ring_depth. Otherwise (or when i_block is given) each expert
+    streams in blocks of ib intermediate columns, ib the first of _I_BLOCKS
+    dividing i whose ring of at least three units fits, the ring as deep as
+    fits up to _NUM_BUFFERS. No block width narrower than i: whole experts.
     """
     capacity = pltpu.get_tpu_info().vmem_capacity_bytes
     cap = capacity - _VMEM_RESERVE
     if i_block is None:
-        # Against the whole capacity, not cap: every shape whose whole-expert
-        # build could have compiled keeps it.
-        whole = 3 * _unit_bytes(h, i) + _token_side_bytes(m, h, 2 * i, i_s, n_ranks)
-        if whole <= capacity:
+        # Against the whole capacity, not cap, and the weight slots only: every
+        # expert whose whole-expert build could ever have compiled keeps it.
+        if 3 * _unit_bytes(h, i) <= capacity:
             return None, num_buffers or _weight_ring_depth(h, i)
         widths = [w for w in _I_BLOCKS if w < i and i % w == 0]
+        if not widths:
+            return None, num_buffers or _weight_ring_depth(h, i)
     else:
         if i % i_block or i_block % 128:
             raise ValueError(f"i_block {i_block} must divide i={i} in lanes of 128")
@@ -422,7 +425,7 @@ def can_use_fused_tp_ar(hidden, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, *, n_ran
         and w2s.dtype == _F8
         and s1s.dtype == jnp.float32
         and s2s.dtype == jnp.float32
-        and wg.shape == (h, 1)
+        and (wg is None or wg.shape == (h, 1))
     )
 
 
@@ -445,6 +448,7 @@ def fused_moe_tp_ar(
     num_buffers=None,
     expert_start=None,
     i_block=None,
+    routed_scale=1.0,
 ):
     """Per-rank body; call inside shard_map over the TP mesh.
 
@@ -453,7 +457,14 @@ def fused_moe_tp_ar(
     int32 array of one element (partition-id cannot be exported through
     torch_tpu). w1s [H, 2i] / w2s [i, H] FP8 with s1s [1, 2i] / s2s [1, H]
     FP32 are this rank's shared-expert slice; wg [H, 1] is the replicated
-    shared_expert_gate.
+    shared_expert_gate, scaling the shared expert by sigmoid(x . wg) (Qwen),
+    or None for an ungated shared expert (coefficient 1, GLM-5.2 / DeepSeek).
+
+    routed_scale multiplies the routed experts' sum only, never the shared
+    expert: vLLM's MoERunner applies routed_scaling_factor to the routed
+    output before adding the shared one (GLM-5.2: 2.5). It is folded into the
+    routed coefficients after they are rounded to the activation dtype, as
+    the GMM path rounds its routing weights.
 
     With expert parallelism the rank holds experts [expert_start,
     expert_start + E) of the global routing (topk_ids are global); routes to
@@ -477,16 +488,21 @@ def fused_moe_tp_ar(
         topk_ids = topk_ids - expert_start
     expert_ids = jnp.arange(experts, dtype=jnp.int32)[None, :]
     weights = topk_weights.astype(hidden.dtype).astype(jnp.float32)
+    if routed_scale != 1.0:
+        weights = weights * jnp.float32(routed_scale)
     coeff = jnp.zeros((m, experts), jnp.float32)
     for route in range(topk_ids.shape[1]):
         selected = topk_ids[:, route : route + 1] == expert_ids
         coeff = coeff + selected.astype(jnp.float32) * weights[:, route : route + 1]
     active = jnp.any(coeff != 0, axis=0).astype(jnp.int32)
     coeff = jnp.pad(coeff, ((0, 0), (0, (-experts) % 128)))
-    shared_gate = jax.nn.sigmoid(
-        jnp.dot(hidden, wg.astype(hidden.dtype), preferred_element_type=jnp.float32)
-    )
-    shared_gate = jnp.broadcast_to(shared_gate, (m, 128))
+    if wg is None:
+        shared_gate = jnp.ones((m, 128), jnp.float32)
+    else:
+        shared_gate = jax.nn.sigmoid(
+            jnp.dot(hidden, wg.astype(hidden.dtype), preferred_element_type=jnp.float32)
+        )
+        shared_gate = jnp.broadcast_to(shared_gate, (m, 128))
     i_s = w2s.shape[0]
     ib, nb = plan_weight_ring(m, h, i, i_s, n_ranks, i_block, num_buffers)
     chunk = h // n_ranks

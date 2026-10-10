@@ -917,6 +917,8 @@ def plan_blocked(
         prefs = [(1024, 2)] if tile_m >= 256 else []
         prefs += [(512, 3), (256, 3), (128, 3)]
         cands = [(w, n) for w, n in prefs if w < inter and inter % w == 0]
+        if not cands:  # no block width narrower than the expert: keep it whole
+            return None
     else:
         if inter % i_block or i_block % LANES:
             raise ValueError(f"i_block {i_block} must divide inter={inter} in lanes")
@@ -1210,13 +1212,18 @@ def moe_tp_prefill(
     i_block=None,
     chunk_rows=None,
     block_nbuf=None,
+    routed_scale=1.0,
 ):
     """One rank's routed + shared MoE output for prefill-sized token counts.
 
     x [T, H] bf16 (replicated), w1 [E, H, 2I] fp8, w2 [E, I, H] fp8,
     s1 [E, 2I]-shaped per-channel f32 (any of [E,2I], [E,1,2I], [E,1,1,2I]),
     s2 likewise [E, H]; shared w1_sh [H, 2I], w2_sh [I, H], s1_sh [2I],
-    s2_sh [H], gate wg_sh [H, 1]. topk_weights / topk_ids [T, K].
+    s2_sh [H], gate wg_sh [H, 1] (the shared row weighs sigmoid(x . wg_sh)),
+    or wg_sh None for an ungated shared expert (weight 1).
+    topk_weights / topk_ids [T, K]; routed_scale multiplies the routed routes'
+    weights only (vLLM's routed_scaling_factor, applied to the routed output
+    before the shared expert is added).
 
     With expert parallelism the rank holds experts [expert_start,
     expert_start + E) of the global routing (topk_ids are global); routes to
@@ -1319,10 +1326,15 @@ def moe_tp_prefill(
     )
 
     # ---- combine: topk routed rows + the gated shared row per token ----
-    gate = jax.nn.sigmoid(
-        jnp.dot(x, wg_sh, preferred_element_type=jnp.float32)
-    )  # [T,1]
+    if wg_sh is None:
+        gate = jnp.ones((n_tok, 1), jnp.float32)
+    else:
+        gate = jax.nn.sigmoid(
+            jnp.dot(x, wg_sh, preferred_element_type=jnp.float32)
+        )  # [T,1]
     coef = topk_weights.astype(jnp.float32)
+    if routed_scale != 1.0:
+        coef = coef * jnp.float32(routed_scale)
     shared_pos = n_routes + jnp.arange(n_tok, dtype=jnp.int32)[:, None]
     # Unvisited slab rows are never written; point dead routes at a written
     # row so coef 0 never meets uninitialized memory.

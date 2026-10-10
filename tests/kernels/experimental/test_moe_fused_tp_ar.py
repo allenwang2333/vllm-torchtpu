@@ -238,3 +238,106 @@ def test_ring_plan_blocks_only_oversized_experts():
         ib, nb = kernel.plan_weight_ring(m, 6144, 2048, 128, 16)
         assert ib is not None and 2048 % ib == 0 and nb >= 3
     assert kernel.plan_weight_ring(16, 4096, 1024, 128, 8, i_block=256)[0] == 256
+
+
+def _reference_glm(
+    rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, scale_shared=False
+):
+    """GLM-5.2's layer with the kernel off: vLLM's MoERunner scales the routed
+    output by routed_scaling_factor (2.5), adds the ungated shared expert, then
+    all-reduces. scale_shared=True is the wrong placement (scaling the sum)."""
+    ti = ti - rank.reshape(()) * E
+    xf = x.astype(jnp.float32)
+    shared = _ffn(xf, w1s, s1s, w2s, s2s)
+    routed = GLM_SCALE * _routed(xf, w1, w2, s1, s2, tw, ti)
+    total = GLM_SCALE * shared + routed if scale_shared else shared + routed
+    return jax.lax.psum(total, "d").astype(x.dtype)
+
+
+GLM_SCALE = 2.5
+
+
+def _fused_glm(rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti, ib):
+    del wg  # GLM-5.2's shared expert has no gate
+    return kernel.fused_moe_tp_ar(
+        rank.reshape(-1),
+        x,
+        w1,
+        w2,
+        s1,
+        s2,
+        w1s,
+        s1s,
+        w2s,
+        s2s,
+        None,
+        tw,
+        ti,
+        n_ranks=N,
+        expert_start=rank.reshape(()) * E,
+        i_block=ib,
+        routed_scale=GLM_SCALE,
+    )
+
+
+@pytest.mark.parametrize("m", [16, 32])
+@pytest.mark.parametrize("ib", [None, 128])
+def test_glm_semantics_ungated_shared_routed_scale(setup, m, ib):
+    """GLM-5.2 semantics under EP: no shared-expert gate (coefficient 1) and
+    routed_scaling_factor 2.5 on the routed experts only, in the blocked mode
+    (ib 128 = two blocks per expert) and the default plan, against the
+    kernel-off composition. Must-fail controls: the scale applied to the
+    shared expert too, and a sigmoid-gated shared expert (Qwen's convention)."""
+    mesh, sh, rank, weights, wg = setup
+    rng = np.random.default_rng(200 + m)
+    x = rng.normal(size=(m, H)).astype(np.float32)
+    ids = np.stack(
+        [rng.choice(N * E, TOPK, replace=False) for _ in range(m)]
+    ).astype(np.int32)
+    tw = rng.dirichlet(np.ones(TOPK), size=m).astype(np.float32)
+    tw[m - 2 :] = 0  # padded bucket rows: zero routing weight
+    args = (
+        rank,
+        jax.device_put(jnp.tile(jnp.asarray(x, jnp.bfloat16), (N, 1)), sh),
+        *weights,
+        wg,
+        jax.device_put(jnp.tile(jnp.asarray(tw, jnp.bfloat16), (N, 1)), sh),
+        jax.device_put(jnp.tile(jnp.asarray(ids), (N, 1)), sh),
+    )
+    specs = (P("d"),) * 10 + (P(), P("d"), P("d"))
+
+    def run(fn):
+        out = jax.jit(
+            jax.shard_map(
+                fn, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False
+            )
+        )(*args)
+        return np.asarray(out.astype(jnp.float32)).reshape(N, m, H)
+
+    def max_rel(a, ref):
+        return (
+            np.linalg.norm(a - ref, axis=1)
+            / np.maximum(np.linalg.norm(ref, axis=1), 1e-30)
+        ).max()
+
+    got = run(functools.partial(_fused_glm, ib=ib))
+    ref = run(_reference_glm)
+    assert all(np.array_equal(got[0], got[r]) for r in range(N)), "ranks disagree"
+    assert np.isfinite(got).all()
+    assert max_rel(got[0], ref[0]) < 0.08
+    wrong_scale = run(functools.partial(_reference_glm, scale_shared=True))
+    assert max_rel(got[0], wrong_scale[0]) > 0.08
+    gated = run(functools.partial(_reference, ep=True))  # gated, unscaled
+    assert max_rel(got[0], gated[0]) > 0.08
+
+
+def test_ring_plan_never_asserts_and_gates_on_expert_size():
+    """No block width narrower than i (Qwen3.5 TP8, i 128) keeps whole experts
+    at every token count instead of raising; small experts stay whole even
+    when the token-side buffers alone would not fit."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("reads the TPU's VMEM capacity")
+    for m in (2048, 4096, 8192):
+        assert kernel.plan_weight_ring(m, 4096, 128, 128, 8)[0] is None
+        assert kernel.plan_weight_ring(m, 4096, 1024, 128, 8)[0] is None
+        assert kernel.plan_weight_ring(m, 6144, 128, 128, 16)[0] is None
