@@ -346,9 +346,9 @@ def _build_candidate_union_and_bitmask(
         max_total_blks = min(align_to(max(m_union, n_cols // 8), lanes), 2048)
         num_blks = cdiv(total_cache_rows, blk_size)
         num_blk_vecs = cdiv(num_blks, lanes)
-        blk_buf_size = num_blk_vecs * lanes
         vecs_per_super = 32
         num_supers = cdiv(num_blk_vecs, vecs_per_super)
+        blk_buf_size = num_supers * vecs_per_super * lanes
         num_super_vecs = cdiv(num_supers, lanes)
         super_buf_size = max(lanes, num_super_vecs * lanes)
         super_shift = blk_shift + 9
