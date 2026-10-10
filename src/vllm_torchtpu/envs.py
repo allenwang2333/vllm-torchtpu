@@ -915,6 +915,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # when the indexer layer and every layer reusing its top-k rows run
     # token-parallel attention, which reads only this rank's T/tp rows.
     "VLLM_DSV41_TP_ATTN_LOCAL_TOPK": env_bool("VLLM_DSV41_TP_ATTN_LOCAL_TOPK", False),
+    "VLLM_DSV41_ENGRAM_H2D_PREFIX": env_bool("VLLM_DSV41_ENGRAM_H2D_PREFIX", True),
 }
 
 

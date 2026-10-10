@@ -371,9 +371,28 @@ class DSparkDeepseekV41Model(nn.Module):
         positions: torch.Tensor,
         metadata: tuple,
     ) -> torch.Tensor:
-        main_x = self.combine_hidden_states(target_hidden_states)
         if positions.ndim > 1:
             positions = positions.flatten()
+        tp_size = get_tensor_model_parallel_world_size()
+        total_tokens = positions.shape[0]
+        if tp_size > 1:
+            _ = torch.ops.aten.alias.default(self.tp_rank_idx)
+        use_token_shard = tp_token_shard_ok(total_tokens, tp_size)
+        if use_token_shard:
+            tp_rank = get_tensor_model_parallel_rank()
+            if isinstance(target_hidden_states, (list, tuple)):
+                sharded_inputs: torch.Tensor | tuple[torch.Tensor, ...] = tuple(
+                    tp_shard_slice(h, tp_size, tp_rank, self.tp_rank_idx)
+                    for h in target_hidden_states
+                )
+            else:
+                sharded_inputs = tp_shard_slice(
+                    target_hidden_states, tp_size, tp_rank, self.tp_rank_idx
+                )
+            main_x = self.combine_hidden_states(sharded_inputs)
+        else:
+            main_x = self.combine_hidden_states(target_hidden_states)
+
         fused_wkv = self._fused_ctx_wkv_weight
         fused_scale = self._fused_ctx_wkv_scale
         if fused_wkv is not None:
@@ -388,11 +407,26 @@ class DSparkDeepseekV41Model(nn.Module):
             else:
                 kv_all = None
             if kv_all is not None:
-                for layer_idx, layer in enumerate(self.layers):
-                    attn = layer.attn
-                    kv = attn.kv_norm(kv_all[:, layer_idx])
-                    attn.store_context_kv(kv, positions, metadata[layer_idx])
+                normed_layers = [
+                    layer.attn.kv_norm(kv_all[:, layer_idx])
+                    for layer_idx, layer in enumerate(self.layers)
+                ]
+                if use_token_shard:
+                    kv_packed = tp_all_gather(
+                        torch.cat(normed_layers, dim=-1), dim=0
+                    ).view(total_tokens, len(self.layers), -1)
+                    for layer_idx, layer in enumerate(self.layers):
+                        layer.attn.store_context_kv(
+                            kv_packed[:, layer_idx], positions, metadata[layer_idx]
+                        )
+                else:
+                    for layer_idx, layer in enumerate(self.layers):
+                        layer.attn.store_context_kv(
+                            normed_layers[layer_idx], positions, metadata[layer_idx]
+                        )
                 return main_x
+        if use_token_shard:
+            main_x = tp_all_gather(main_x, dim=0)
         for layer_idx, layer in enumerate(self.layers):
             attn = layer.attn
             kv = attn.project_wkv(main_x)
@@ -701,30 +735,68 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             or tp_size <= 1
         ):
             self._tp_markov_meta = None
+            self._tp_lm_w_pad = None
             return
         dev = lm_head.weight.device
         shard_cols = int(lm_head.weight.shape[0])
+        shard_pad = ((shard_cols + 127) // 128) * 128
         start_idx = int(shard_indices.org_vocab_start_index)
         end_idx = int(shard_indices.org_vocab_end_index)
         valid_vocab = end_idx - start_idx
         w2_raw = markov_w2.weight[start_idx:end_idx]
         w2_pad = (
-            torch.cat((w2_raw, torch.zeros((shard_cols - valid_vocab, w2_raw.shape[1]), dtype=w2_raw.dtype, device=w2_raw.device)), dim=0)
-            if valid_vocab < shard_cols
+            torch.cat(
+                (
+                    w2_raw,
+                    torch.zeros(
+                        (shard_pad - valid_vocab, w2_raw.shape[1]),
+                        dtype=w2_raw.dtype,
+                        device=w2_raw.device,
+                    ),
+                ),
+                dim=0,
+            )
+            if valid_vocab < shard_pad
             else w2_raw.clone().contiguous()
         ).to(device=dev)
         pad_mask = (
-            torch.arange(shard_cols, dtype=torch.int32, device=dev) >= valid_vocab
-        ).view(1, shard_cols)
+            torch.arange(shard_pad, dtype=torch.int32, device=dev) >= valid_vocab
+        ).view(1, shard_pad)
         pad_bias = torch.where(
             pad_mask,
-            torch.full((1, shard_cols), float("-inf"), dtype=w2_raw.dtype, device=dev),
-            torch.zeros((1, shard_cols), dtype=w2_raw.dtype, device=dev),
+            torch.full((1, shard_pad), float("-inf"), dtype=w2_raw.dtype, device=dev),
+            torch.zeros((1, shard_pad), dtype=w2_raw.dtype, device=dev),
         )
+        lm_w = lm_head.weight
+        lm_w_pad: torch.Tensor | None = None
+        if (
+            getattr(lm_head, "weight_scale", None) is None
+            and lm_w.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and lm_w.ndim == 2
+        ):
+            lm_w_pad = (
+                torch.cat(
+                    (
+                        lm_w,
+                        torch.zeros(
+                            (shard_pad - shard_cols, lm_w.shape[1]),
+                            dtype=lm_w.dtype,
+                            device=dev,
+                        ),
+                    ),
+                    dim=0,
+                ).contiguous()
+                if shard_pad > shard_cols
+                else lm_w.contiguous()
+            )
         start_t = torch.tensor([start_idx], dtype=torch.int32, device=dev)
         if dev.type == "tpu":
-            synchronize_tensors([w2_pad, pad_bias, start_t], wait=True)
+            sync_list = [w2_pad, pad_bias, start_t]
+            if lm_w_pad is not None:
+                sync_list.append(lm_w_pad)
+            synchronize_tensors(sync_list, wait=True)
         self._tp_markov_meta = (w2_pad, pad_bias, start_t)
+        self._tp_lm_w_pad = lm_w_pad
 
     def sample_draft_tokens(
         self,
@@ -737,17 +809,20 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         markov_w2 = getattr(self.model.markov_head, "markov_w2", None)
         tp_size = int(getattr(lm_head, "tp_size", 1))
         meta = self._tp_markov_meta
+        pred_kcb = (
+            pred_hidden.view(padded_num_reqs, num_pred, -1)
+            .transpose(0, 1)
+            .contiguous()
+            .view(num_pred * padded_num_reqs, -1)
+        )
         if (
             lm_head is None
             or markov_w2 is None
             or tp_size <= 1
             or meta is None
         ):
-            logits = self.compute_draft_logits(pred_hidden)
-            logits_kbv = (
-                logits.view(padded_num_reqs, num_pred, logits.shape[-1])
-                .transpose(0, 1)
-                .contiguous()
+            logits_kbv = self.compute_draft_logits(pred_kcb).view(
+                num_pred, padded_num_reqs, -1
             )
             draft_tokens = []
             prev = prev_init
@@ -762,25 +837,38 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
 
         shard_cols = int(lm_head.weight.shape[0])
         w2_pad, pad_bias, start_t = meta
-
-        logits_local = self.logits_processor._get_logits(
-            pred_hidden, lm_head, None, skip_gather=True
-        )
-        assert logits_local is not None
-        logits_kbv = (
-            logits_local.view(padded_num_reqs, num_pred, shard_cols)
-            .transpose(0, 1)
-            .add(pad_bias.unsqueeze(0))
-            .contiguous()
-        )
+        lm_w_pad = getattr(self, "_tp_lm_w_pad", None)
+        shard_pad = int(w2_pad.shape[0])
+        if lm_w_pad is not None:
+            logits_kbv = torch.nn.functional.linear(pred_kcb, lm_w_pad).view(
+                num_pred, padded_num_reqs, shard_pad
+            )
+        else:
+            logits_local = self.logits_processor._get_logits(
+                pred_kcb, lm_head, None, skip_gather=True
+            )
+            assert logits_local is not None
+            if shard_pad > shard_cols:
+                logits_local = torch.cat(
+                    (
+                        logits_local,
+                        torch.zeros(
+                            (logits_local.shape[0], shard_pad - shard_cols),
+                            dtype=logits_local.dtype,
+                            device=logits_local.device,
+                        ),
+                    ),
+                    dim=-1,
+                )
+            logits_kbv = logits_local.view(num_pred, padded_num_reqs, shard_pad)
 
         draft_tokens = []
         prev = prev_init
         for idx in range(num_pred):
             bias_local = torch.nn.functional.linear(self.markov_embed(prev), w2_pad)
-            local_val, local_idx = (logits_kbv[idx] + bias_local).max(
-                dim=-1, keepdim=True
-            )
+            local_val, local_idx = (
+                logits_kbv[idx] + bias_local + pad_bias
+            ).max(dim=-1, keepdim=True)
             packed_local = torch.cat(
                 [
                     local_val.to(torch.float32).view(torch.int32),
