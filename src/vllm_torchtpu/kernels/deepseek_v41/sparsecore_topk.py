@@ -40,6 +40,11 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
 )
 
 
+NUM_BUCKETS_11 = 2048
+L0_SHIFT_11 = 21
+REFINEMENT_LEVELS_11 = ((10, 0x7FF), (0, 0x3FF))
+
+
 def _vec_at(ref, idx):
     return ref[pl.ds(idx, LANES)][0]
 
@@ -94,34 +99,40 @@ def _radix_select_and_emit(
     fill_fn,
     fill_unroll: int,
     emit_fn,
+    num_buckets: int = NUM_BUCKETS,
+    l0_shift: int = L0_SHIFT,
+    refinement_levels: tuple[tuple[int, int], ...] = REFINEMENT_LEVELS,
 ):
-    """4-level 8-bit radix select over VMEM followed by compressed emission."""
+    """Multi-level radix select over VMEM followed by compressed emission."""
     neg_inf_key = jnp.int32(KEY_NEG_INF)
+    hist_chunks = num_buckets // LANES
+    half_buckets = num_buckets // 2
 
     def hist0_body(i):
         key = _monotone_key(scores_vmem[pl.ds(i * LANES, LANES)])
         scores_vmem[pl.ds(i * LANES, LANES)] = key
-        bucket = jnp.right_shift(key, L0_SHIFT) + jnp.int32(NUM_BUCKETS // 2)
+        bucket = jnp.right_shift(key, l0_shift) + jnp.int32(half_buckets)
         _hist_add(glob_vmem, bucket, key > neg_inf_key)
 
     plsc.parallel_loop(0, walk_chunks, unroll=SCAN_UNROLL)(hist0_body)
 
-    total = _scan_glob(glob_vmem, NUM_BUCKETS // LANES)
+    total = _scan_glob(glob_vmem, hist_chunks)
     keep_all = total <= target_k
 
-    b_star = _find_bucket(glob_vmem, NUM_BUCKETS // LANES, total - target_k)
+    b_star = _find_bucket(glob_vmem, hist_chunks, total - target_k)
     cum_at = _vec_at(glob_vmem, b_star)
     cum_lo = jnp.where(b_star > 0, _vec_at(glob_vmem, jnp.maximum(b_star - 1, 0)), 0)
     c_hi = total - cum_at
     cnt = cum_at - cum_lo
     quota = target_k - c_hi
 
-    prefix = b_star - jnp.int32(NUM_BUCKETS // 2)
-    shift = jnp.int32(L0_SHIFT)
+    prefix = b_star - jnp.int32(half_buckets)
+    shift = jnp.int32(l0_shift)
     done = keep_all | (quota == cnt)
 
-    for lvl_shift, lvl_mask in REFINEMENT_LEVELS:
-        hist_bound = jnp.where(done, 0, NUM_BUCKETS // LANES)
+    for lvl_shift, lvl_mask in refinement_levels:
+        lvl_chunks = (lvl_mask + 1) // LANES
+        hist_bound = jnp.where(done, 0, lvl_chunks)
         _zero_hist(glob_vmem, hist_bound)
         active_walk = jnp.where(done, 0, walk_chunks)
         lo_excl, hi_incl = _key_window(prefix, shift)
@@ -219,6 +230,11 @@ def _topk_body(
         out_hbm, glob_vmem, rowbuf_vmem = rest
         in_slots_hbm = keys_hbm = keybuf_vmem = None
 
+    use_11bit = slice_len >= 32768
+    nb = NUM_BUCKETS_11 if use_11bit else NUM_BUCKETS
+    l0_sh = L0_SHIFT_11 if use_11bit else L0_SHIFT
+    ref_lvls = REFINEMENT_LEVELS_11 if use_11bit else REFINEMENT_LEVELS
+
     cores_per_chip = 32
     flat = lax.axis_index("core") * 16 + lax.axis_index("subcore")
     b_tokens = b // p
@@ -265,7 +281,7 @@ def _topk_body(
 
         @pl.when(i_hi > 0)
         def _nonempty():
-            _zero_hist(glob_vmem, NUM_BUCKETS // LANES)
+            _zero_hist(glob_vmem, nb // LANES)
             tail = (walk_chunks - 1) * LANES
             scores_vmem[pl.ds(tail, LANES)] = jnp.where(
                 tail + lane_iota < i_hi,
@@ -301,6 +317,9 @@ def _topk_body(
                 fill_fn=fill_body,
                 fill_unroll=4,
                 emit_fn=emit,
+                num_buckets=nb,
+                l0_shift=l0_sh,
+                refinement_levels=ref_lvls,
             )
 
             def copy_out(i):
@@ -410,15 +429,16 @@ def _sc_topk_direct(
     aw_vec = jnp.full((LANES,), active_waves if use_dyn else num_waves, dtype=jnp.int32)
 
     out_type = (slot_type, slot_type) if return_keys else slot_type
+    nb = NUM_BUCKETS_11 if slice_len >= 32768 else NUM_BUCKETS
     scratch_types = (
         (
-            pltpu.VMEM((NUM_BUCKETS + LANES,), jnp.int32),
+            pltpu.VMEM((nb + LANES,), jnp.int32),
             pltpu.VMEM((k + LANES,), jnp.int32),
             pltpu.VMEM((k + LANES,), jnp.int32),
         )
         if return_keys
         else (
-            pltpu.VMEM((NUM_BUCKETS + LANES,), jnp.int32),
+            pltpu.VMEM((nb + LANES,), jnp.int32),
             pltpu.VMEM((k + LANES,), jnp.int32),
         )
     )

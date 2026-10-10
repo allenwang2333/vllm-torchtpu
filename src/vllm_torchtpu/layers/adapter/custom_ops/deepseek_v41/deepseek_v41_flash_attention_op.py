@@ -41,6 +41,29 @@ def prepare_swa_page_indices_jax(
     return swa_page_indices
 
 
+def prepare_swa_metadata_jax(
+    swa_kv_lens: jax.Array,
+    swa_page_indices: jax.Array,
+    swa_cu_q_lens: jax.Array,
+    *,
+    num_tokens: int,
+    sw_cache_num_pages: int,
+    sliding_window: int,
+    logical_page_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Slices SWA page table to reachable window pages and ring-maps once per stage."""
+    return _prepare_swa_metadata(
+        swa_kv_lens,
+        swa_page_indices,
+        swa_cu_q_lens,
+        num_tokens=num_tokens,
+        sw_cache_num_pages=sw_cache_num_pages,
+        sliding_window=sliding_window,
+        logical_page_size=logical_page_size,
+        page_indices_ring_mapped=False,
+    )
+
+
 def _prepare_swa_metadata(
     swa_kv_lens: jax.Array,
     swa_page_indices: jax.Array,
@@ -54,16 +77,16 @@ def _prepare_swa_metadata(
 ) -> tuple[jax.Array, jax.Array]:
     max_num_seqs = swa_kv_lens.shape[0]
     pages_per_seq = swa_page_indices.size // max_num_seqs
-    # The kernel prefetches the page table into SMEM beside its other scalar
-    # inputs, so a large table is cut to the pages the window can reach.
-    if swa_page_indices.nbytes > pltpu.get_tpu_info().smem_capacity_bytes * 3 // 4:
-        window_pages = min(
-            pages_per_seq,
-            align_to(
-                (num_tokens + sliding_window) // logical_page_size + 8,
-                64,
-            ),
-        )
+    window_pages = min(
+        pages_per_seq,
+        align_to(
+            (num_tokens + sliding_window) // logical_page_size + 2,
+            16,
+        ),
+    )
+    # Trim oversized page tables BEFORE ring-mapping so scalar prefetch into
+    # SMEM and modulo mapping operate on ~16 pages/seq instead of 2048.
+    if pages_per_seq > window_pages * 2:
         q_lens = swa_cu_q_lens[1:] - swa_cu_q_lens[:-1]
         base_pages = (
             jnp.maximum(0, swa_kv_lens - q_lens - sliding_window) // logical_page_size
@@ -180,8 +203,6 @@ def _run_swa(
             if (q.shape[1] > 64 and q.shape[0] > 384)
             else (16 if q.shape[1] > 32 else (32 if q.shape[1] > 8 else 64))
         ),
-        # DP=8 (64/128 heads per rank) and token-parallel attention (all 64 heads
-        # per rank, T/tp > 128 tokens) run out of VMEM at compile with 32.
         decode_seq_batch_size=(
             8
             if q.shape[0] <= 16
@@ -193,6 +214,7 @@ def _run_swa(
         ),
         unnormalized_output=not swa_only or sliding_window == 1,
         ced_decoder=ced_decoder,
+        keep_lm_aligned=not swa_only,
         non_causal_block=non_causal_block,
     )
 

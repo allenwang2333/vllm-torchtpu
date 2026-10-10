@@ -35,6 +35,9 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+_TPU_MOE_COLLECTION_CHUNK_SIZE: int = int(envs.TPU_MOE_COLLECTION_CHUNK_SIZE)
+
+
 def enable_pipelined_collective_and_compute() -> bool:
     """Check whether collective communication and compute pipelining is enabled.
 
@@ -42,7 +45,7 @@ def enable_pipelined_collective_and_compute() -> bool:
         bool: True if `envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0`, False otherwise.
 
     """
-    return envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0
+    return _TPU_MOE_COLLECTION_CHUNK_SIZE > 0
 
 
 # Alias for alternative naming convention
@@ -184,7 +187,7 @@ def pipelined_fused_moe_gmm(
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
     """
-    chunk_size = envs.TPU_MOE_COLLECTION_CHUNK_SIZE
+    chunk_size = _TPU_MOE_COLLECTION_CHUNK_SIZE
     collective_group, _ = _get_moe_collective_group()
 
     seq_len = hidden_states.shape[0]

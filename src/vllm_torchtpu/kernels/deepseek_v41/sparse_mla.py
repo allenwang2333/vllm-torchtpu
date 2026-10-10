@@ -850,8 +850,14 @@ def precompute_csa_union_and_bitmask(
     )
 
 
+_CSA_UNION: bool = bool(envs.VLLM_DSV41_CSA_UNION)
+_CSA_UNION_M: int = int(envs.VLLM_DSV41_CSA_UNION_M)
+_CSA_UNION_BQ: int = int(envs.VLLM_DSV41_CSA_UNION_BQ)
 _CSA_UNION_VERIFY_BQ: int = int(
     os.environ.get("VLLM_DSV41_CSA_UNION_VERIFY_BQ", "0")
+)
+_CSA_UNION_MAX_TOKENS: int = int(
+    os.environ.get("VLLM_DSV41_CSA_UNION_MAX_TOKENS", "2048")
 )
 
 
@@ -863,36 +869,38 @@ def resolve_csa_union_params(
     num_q_heads: int = 16,
 ) -> tuple[int, int] | None:
     """Returns `(b_q, m_union)` when LxL Candidate Union is enabled, else `None`."""
-    if not envs.VLLM_DSV41_CSA_UNION or topk % 128 != 0:
-        return None
-    vbq = _CSA_UNION_VERIFY_BQ
     if (
-        vbq > 0
-        and num_tokens >= vbq
-        and num_tokens % vbq == 0
-        and (num_tokens < 4096 or ced_decoder)
+        not _CSA_UNION
+        or topk % 128 != 0
+        or num_tokens > _CSA_UNION_MAX_TOKENS
     ):
-        m_u_vbq = (
-            envs.VLLM_DSV41_CSA_UNION_M
-            if envs.VLLM_DSV41_CSA_UNION_M > 0
-            else align_to(4 * topk, 128)
+        return None
+    if (
+        _CSA_UNION_VERIFY_BQ > 0
+        and num_tokens >= _CSA_UNION_VERIFY_BQ
+        and num_tokens % _CSA_UNION_VERIFY_BQ == 0
+    ):
+        m_u = (
+            _CSA_UNION_M
+            if _CSA_UNION_M > 0
+            else align_to(2 * topk, 128)
         )
-        return vbq, m_u_vbq
+        return _CSA_UNION_VERIFY_BQ, m_u
     if num_tokens >= 6 and num_tokens % 6 == 0:
         m_u = (
-            envs.VLLM_DSV41_CSA_UNION_M
-            if envs.VLLM_DSV41_CSA_UNION_M > 0
+            _CSA_UNION_M
+            if _CSA_UNION_M > 0
             else align_to(2 * topk, 128)
         )
         return 6, m_u
     if num_tokens >= 5 and num_tokens % 5 == 0 and num_tokens % 512 != 0:
         m_u = (
-            envs.VLLM_DSV41_CSA_UNION_M
-            if envs.VLLM_DSV41_CSA_UNION_M > 0
+            _CSA_UNION_M
+            if _CSA_UNION_M > 0
             else align_to(2 * topk, 128)
         )
         return 5, m_u
-    b_q = 8 if num_q_heads >= 64 else envs.VLLM_DSV41_CSA_UNION_BQ
+    b_q = 8 if num_q_heads >= 64 else _CSA_UNION_BQ
     if (
         not ced_decoder
         and num_tokens > max_num_seqs
@@ -900,8 +908,8 @@ def resolve_csa_union_params(
         and num_tokens % b_q == 0
     ):
         m_u = (
-            envs.VLLM_DSV41_CSA_UNION_M
-            if envs.VLLM_DSV41_CSA_UNION_M > 0
+            _CSA_UNION_M
+            if _CSA_UNION_M > 0
             else align_to(3 * topk, 128)
         )
         return b_q, m_u
@@ -938,13 +946,14 @@ def _grouped_attention_kernel(
     u_chunk: int,
     l_stride: int,
 ):
-    """Fused LxL Block-Grouped Candidate Union Attention Kernel with dynamic 512-row chunking."""
-    _, num_q_heads, head_dim = q_hbm_ref.shape
-    b_q_vmem = bq_x2_ref.shape[1]
-    n_qh = b_q_vmem * num_q_heads
+    """Fused LxL Block-Grouped Candidate Union Attention Kernel with exact [b_q * H, D] packing."""
+    _, n_qh, head_dim = q_hbm_ref.shape
+    num_q_heads = n_qh // b_q
     q_dtype = q_hbm_ref.dtype
     num_u_chunks = m_union // u_chunk
-    max_exact_chunks = min(num_u_chunks, 2 if num_q_heads > 64 else 3)
+    max_exact_chunks = min(
+        num_u_chunks, 2 if (num_q_heads > 64 and n_qh > 768) else 3
+    )
     cache_kv_nope_hbm_ref = cache_kv_nope_hbm_ref.bitcast(jnp.uint8)
     cache_kv_rope_hbm_ref = cache_kv_rope_hbm_ref.bitcast(jnp.bfloat16)
 
@@ -963,18 +972,17 @@ def _grouped_attention_kernel(
             cp.start()
 
     def _fetch_q_inputs(grp_idx, sem_idx, *, wait=False):
-        tok_start = grp_idx * b_q_vmem
         q_dst = bq_x2_ref.at[sem_idx]
         acc_dst = swa_acc_x2_ref.at[sem_idx]
         if not wait:
             _async_copy(
-                q_hbm_ref.at[pl.ds(tok_start, b_q_vmem)],
+                q_hbm_ref.at[grp_idx],
                 q_dst,
                 sems.at[1, sem_idx],
                 False,
             )
             _async_copy(
-                swa_accumution_hbm_ref.at[pl.ds(tok_start, b_q_vmem)],
+                swa_accumution_hbm_ref.at[grp_idx],
                 acc_dst,
                 sems.at[3, sem_idx],
                 False,
@@ -1029,14 +1037,13 @@ def _grouped_attention_kernel(
                 _async_copy(src=ref, dst=ref, sem=sems.at[s_id, sem_idx], wait=True)
 
     def _send_output(grp_idx, sem_idx, *, wait=False):
-        tok_start = grp_idx * b_q_vmem
         vmem_ref = bo_x2_ref.at[sem_idx]
         sem = sems.at[2, sem_idx]
         if not wait:
             bo_ids_ref[sem_idx] = grp_idx
             _async_copy(
                 vmem_ref,
-                o_hbm_ref.at[pl.ds(tok_start, b_q_vmem)],
+                o_hbm_ref.at[grp_idx],
                 sem,
                 False,
             )
@@ -1094,9 +1101,9 @@ def _grouped_attention_kernel(
     n_uniq = n_unique_ref[g]
     act_chunks = jnp.clip(pl.cdiv(n_uniq, u_chunk), 1, num_u_chunks)
 
-    q_sub = min(1024, n_qh)
+    q_heads_per_tile = _largest_divisor(b_q, max(1, 1024 // num_q_heads))
+    q_sub = q_heads_per_tile * num_q_heads
     num_q_tiles = n_qh // q_sub
-    q_heads_per_tile = q_sub // num_q_heads
 
     bq_tiles = bq_x2_ref.at[bi_sem_idx][...].reshape(
         num_q_tiles, q_sub, head_dim
@@ -1207,9 +1214,7 @@ def _grouped_attention_kernel(
                     q_dtype
                 )
             )
-            bo_x2_ref.at[
-                bo_sem_idx, pl.ds(qt * q_heads_per_tile, q_heads_per_tile)
-            ][...] = out_t.reshape(q_heads_per_tile, num_q_heads, head_dim)
+            bo_x2_ref.at[bo_sem_idx, pl.ds(qt * q_sub, q_sub)][...] = out_t
             s_cur = s_nxt
 
     if max_exact_chunks >= 2:
@@ -1306,9 +1311,7 @@ def _grouped_attention_kernel(
                         acc_new * pl.reciprocal(l_new_2d, approx=True)
                     ).astype(q_dtype)
                 )
-                bo_x2_ref.at[
-                    bo_sem_idx, pl.ds(qt * q_heads_per_tile, q_heads_per_tile)
-                ][...] = out_t.reshape(q_heads_per_tile, num_q_heads, head_dim)
+                bo_x2_ref.at[bo_sem_idx, pl.ds(qt * q_sub, q_sub)][...] = out_t
                 s1_cur = s1_nxt
 
     if max_exact_chunks >= 3:
@@ -1426,9 +1429,7 @@ def _grouped_attention_kernel(
                         acc_new * pl.reciprocal(l_new_2d, approx=True)
                     ).astype(q_dtype)
                 )
-                bo_x2_ref.at[
-                    bo_sem_idx, pl.ds(qt * q_heads_per_tile, q_heads_per_tile)
-                ][...] = out_t.reshape(q_heads_per_tile, num_q_heads, head_dim)
+                bo_x2_ref.at[bo_sem_idx, pl.ds(qt * q_sub, q_sub)][...] = out_t
                 s2_cur = s2_nxt
 
     if num_u_chunks > max_exact_chunks:
@@ -1454,10 +1455,8 @@ def _grouped_attention_kernel(
                     "nm,md->nd", p0, bkv_0, preferred_element_type=jnp.float32
                 )
                 acc0 = exp_swa[:, None] * swa_acc_tiles[qt] + pv0
-                bo_x2_ref.at[
-                    bo_sem_idx, pl.ds(qt * q_heads_per_tile, q_heads_per_tile)
-                ][...] = acc0.astype(q_dtype).reshape(
-                    q_heads_per_tile, num_q_heads, head_dim
+                bo_x2_ref.at[bo_sem_idx, pl.ds(qt * q_sub, q_sub)][...] = (
+                    acc0.astype(q_dtype)
                 )
                 m0_list.append(m0)
                 l0_list.append(l0)
@@ -1504,15 +1503,11 @@ def _grouped_attention_kernel(
                         "nm,md->nd", pc, bkv_c, preferred_element_type=jnp.float32
                     )
                     acc_prev = bo_x2_ref.at[
-                        bo_sem_idx,
-                        pl.ds(qt * q_heads_per_tile, q_heads_per_tile),
-                    ][...].reshape(q_sub, head_dim)
+                        bo_sem_idx, pl.ds(qt * q_sub, q_sub)
+                    ][...]
                     accn = alpha[:, None] * acc_prev + pvc
-                    bo_x2_ref.at[
-                        bo_sem_idx,
-                        pl.ds(qt * q_heads_per_tile, q_heads_per_tile),
-                    ][...] = accn.astype(q_dtype).reshape(
-                        q_heads_per_tile, num_q_heads, head_dim
+                    bo_x2_ref.at[bo_sem_idx, pl.ds(qt * q_sub, q_sub)][...] = (
+                        accn.astype(q_dtype)
                     )
                     m_list.append(mn)
                     l_list.append(ln)
@@ -1527,9 +1522,9 @@ def _grouped_attention_kernel(
             )
             for qt in range(num_q_tiles):
                 l2d = l_fin_all[qt][:, None]
-                acc_fin = bo_x2_ref.at[
-                    bo_sem_idx, pl.ds(qt * q_heads_per_tile, q_heads_per_tile)
-                ][...].reshape(q_sub, head_dim)
+                acc_fin = bo_x2_ref.at[bo_sem_idx, pl.ds(qt * q_sub, q_sub)][
+                    ...
+                ]
                 out_t = (
                     lax.div(acc_fin, l2d)
                     if q_dtype == jnp.float32
@@ -1537,9 +1532,7 @@ def _grouped_attention_kernel(
                         acc_fin * pl.reciprocal(l2d, approx=True)
                     ).astype(q_dtype)
                 )
-                bo_x2_ref.at[
-                    bo_sem_idx, pl.ds(qt * q_heads_per_tile, q_heads_per_tile)
-                ][...] = out_t.reshape(q_heads_per_tile, num_q_heads, head_dim)
+                bo_x2_ref.at[bo_sem_idx, pl.ds(qt * q_sub, q_sub)][...] = out_t
 
     _send_output(g, bo_sem_idx, wait=False)
 
@@ -1571,17 +1564,17 @@ def _run_chunked_fallback(
     _, num_q_heads, head_dim = q.shape
     topk = topk_indices.shape[-1]
     kv_lens = jnp.sum(topk_indices >= 0, axis=-1)
-    gather_indices = jnp.where(topk_indices < 0, ~topk_indices, topk_indices).ravel()
+    gather_indices = topk_indices.ravel()
 
-    # For decode / verify (<= 384 tokens), process the entire batch in 1 launch with
-    # batch_size tuned so grid >= 2 for B=16 (8) and 16 for B>=64. For 512-1024 tokens,
-    # use 256-token chunks (gcz_256) so SparseCore csa_gather overlaps TensorCore attention.
+    # For decode / verify (<= 384 tokens), process the entire batch in 1 launch
+    # while clamping negative padding indices directly on SparseCore in csa_gather
+    # so SparseCore launches immediately in parallel with kv_lens on TensorCore.
     if q.shape[0] <= 384:
         eff_chunk_size = q.shape[0]
         if q.shape[0] <= 32 or (q.shape[0] == 96 and num_q_heads > 64):
             eff_batch_size = 8
         elif (q.shape[0] == 384 and 32 <= num_q_heads <= 64) or (
-            q.shape[0] == 64 and num_q_heads <= 16
+            64 <= q.shape[0] <= 256 and num_q_heads <= 16
         ):
             eff_batch_size = 32
         else:
@@ -1589,11 +1582,11 @@ def _run_chunked_fallback(
     elif q.shape[0] <= 1024:
         eff_chunk_size = 256
         eff_batch_size = attention_kernel_batch_size
-    elif q.shape[0] <= 2048 and num_q_heads > 64:
-        eff_chunk_size = 512
-        eff_batch_size = attention_kernel_batch_size
     else:
-        eff_chunk_size = max(gather_and_attention_chunk_size, min(q.shape[0], 1024))
+        target_chunk = 256 if num_q_heads == 64 else 512
+        eff_chunk_size = max(
+            gather_and_attention_chunk_size, min(q.shape[0], target_chunk)
+        )
         eff_batch_size = attention_kernel_batch_size
 
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
@@ -1807,13 +1800,16 @@ def sparse_ragged_paged_attention(
                 )
             else:
                 swa_acc_grp = swa_accumution
-            if swa_l.shape[1] != num_q_heads:
+            if swa_l.shape[1] < num_q_heads:
                 swa_l_qh = jnp.pad(
-                    swa_l, ((0, 0), (0, num_q_heads - actual_num_q_heads))
+                    swa_l, ((0, 0), (0, num_q_heads - swa_l.shape[1]))
                 )
                 swa_m_qh = jnp.pad(
-                    swa_m, ((0, 0), (0, num_q_heads - actual_num_q_heads))
+                    swa_m, ((0, 0), (0, num_q_heads - swa_m.shape[1]))
                 )
+            elif swa_l.shape[1] > num_q_heads:
+                swa_l_qh = swa_l[:, :num_q_heads]
+                swa_m_qh = swa_m[:, :num_q_heads]
             else:
                 swa_l_qh = swa_l
                 swa_m_qh = swa_m
@@ -1848,11 +1844,7 @@ def sparse_ragged_paged_attention(
                 )
 
                 def _run_decode_tc(q_in):
-                    dec_indices = jnp.where(
-                        topk_indices[:decode_cap] < 0,
-                        ~topk_indices[:decode_cap],
-                        topk_indices[:decode_cap],
-                    ).ravel()
+                    dec_indices = topk_indices[:decode_cap].ravel()
                     dec_nope, dec_rope = csa_gather.csa_gather(
                         cache_kv_nope,
                         cache_kv_rope,
@@ -1946,12 +1938,10 @@ def sparse_ragged_paged_attention(
             else:
                 q_curr = q_orig
 
-            b_q_vmem = align_to(b_q, 8)
-            n_qh_raw = b_q * num_q_heads
-            n_qh_vmem = b_q_vmem * num_q_heads
-            l_stride = align_to(n_qh_vmem, 1024)
+            n_qh = b_q * num_q_heads
+            l_stride = align_to(n_qh, 128)
             l_sublanes = l_stride // 128
-            if l_stride == n_qh_raw:
+            if l_stride == n_qh:
                 swa_l_flat = swa_l_qh.reshape(num_groups, l_sublanes, 128)
                 swa_m_flat = swa_m_qh.reshape(num_groups, l_sublanes, 128)
                 sinks_flat = jnp.tile(attention_sinks, (b_q,)).reshape(
@@ -1959,23 +1949,21 @@ def sparse_ragged_paged_attention(
                 )
             else:
                 swa_l_flat = jnp.pad(
-                    swa_l_qh.reshape(num_groups, n_qh_raw),
-                    ((0, 0), (0, l_stride - n_qh_raw)),
+                    swa_l_qh.reshape(num_groups, n_qh),
+                    ((0, 0), (0, l_stride - n_qh)),
                 ).reshape(num_groups, l_sublanes, 128)
                 swa_m_flat = jnp.pad(
-                    swa_m_qh.reshape(num_groups, n_qh_raw),
-                    ((0, 0), (0, l_stride - n_qh_raw)),
+                    swa_m_qh.reshape(num_groups, n_qh),
+                    ((0, 0), (0, l_stride - n_qh)),
                 ).reshape(num_groups, l_sublanes, 128)
                 sinks_flat = jnp.pad(
-                    jnp.tile(attention_sinks, (b_q_vmem,)),
-                    (0, l_stride - n_qh_vmem),
+                    jnp.tile(attention_sinks, (b_q,)),
+                    (0, l_stride - n_qh),
                 ).reshape(l_sublanes, 128)
             lanes = gathered_nope.shape[-1]
             hbm = pl.BlockSpec(memory_space=pltpu.HBM)
             in_specs = [pl.BlockSpec(memory_space=pltpu.VMEM)] + [hbm] * 7
-            bq_buf = pltpu.VMEM(
-                (2, b_q_vmem, num_q_heads, head_dim), q_curr.dtype
-            )
+            bq_buf = pltpu.VMEM((2, n_qh, head_dim), q_curr.dtype)
             bl_buf = pltpu.VMEM((2, l_sublanes, 128), jnp.float32)
             scratch_shapes = [
                 pltpu.VMEM((2, u_chunk * 4, lanes), jnp.uint8),
@@ -1997,19 +1985,8 @@ def sparse_ragged_paged_attention(
                 jnp.zeros((3,), jnp.int32),
                 jnp.full((2,), -1, jnp.int32),
             )
-            if b_q < b_q_vmem:
-                pad_q = b_q_vmem - b_q
-                q_in_grp = jnp.pad(
-                    q_curr.reshape(num_groups, b_q, num_q_heads, head_dim),
-                    ((0, 0), (0, pad_q), (0, 0), (0, 0)),
-                ).reshape(num_groups * b_q_vmem, num_q_heads, head_dim)
-                swa_in_grp = jnp.pad(
-                    swa_acc_grp.reshape(num_groups, b_q, num_q_heads, head_dim),
-                    ((0, 0), (0, pad_q), (0, 0), (0, 0)),
-                ).reshape(num_groups * b_q_vmem, num_q_heads, head_dim)
-            else:
-                q_in_grp = q_curr
-                swa_in_grp = swa_acc_grp
+            q_in_grp = q_curr.reshape(num_groups, n_qh, head_dim)
+            swa_in_grp = swa_acc_grp.reshape(num_groups, n_qh, head_dim)
             scope_name = f"SparseMLA-Grouped-bq_{b_q}-mu_{m_union}-uc_{u_chunk}"
             out_grp = jax.named_scope(scope_name)(
                 pl.pallas_call(
@@ -2050,13 +2027,7 @@ def sparse_ragged_paged_attention(
                 swa_l_flat,
                 swa_m_flat,
             )
-            if b_q < b_q_vmem:
-                return (
-                    out_grp.reshape(num_groups, b_q_vmem, num_q_heads, head_dim)[
-                        :, :b_q, :, :
-                    ].reshape(num_tokens, num_q_heads, head_dim)
-                )
-            return out_grp
+            return out_grp.reshape(num_tokens, num_q_heads, head_dim)
 
         q = lax.cond(
             all_groups_fit, _run_grouped_branch, _run_fallback_branch, q

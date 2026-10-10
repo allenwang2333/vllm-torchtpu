@@ -188,30 +188,14 @@ class BucketExecutables:
     """
 
     def __init__(self) -> None:
-        self._runnables: dict[tuple[str, str], tuple[Callable[..., Any], tuple]] = {}
+        self._runnables: dict[tuple[str, str, tuple], Callable[..., Any]] = {}
         self.refused: set[int] = set()
         self.traces = 0
 
     def get(
         self, cache_dir: str, key: str, graph: fx.GraphModule
     ) -> Callable[..., Any] | None:
-        found = self._runnables.get((cache_dir, key))
-        if found is None:
-            return None
-        runnable, signature = found
-        caller_sig = _signature(graph)
-        if signature == caller_sig:
-            return runnable
-        if (
-            len(signature) == len(caller_sig)
-            and len(set(signature)) == len(signature)
-            and set(signature) == set(caller_sig)
-        ):
-            pos_in_caller = {item: idx for idx, item in enumerate(caller_sig)}
-            perm = tuple(pos_in_caller[item] for item in signature)
-            orig_runnable = runnable
-            return lambda *args: orig_runnable(*(args[i] for i in perm))
-        return None
+        return self._runnables.get((cache_dir, key, _signature(graph)))
 
     def put(
         self,
@@ -220,7 +204,7 @@ class BucketExecutables:
         graph: fx.GraphModule,
         runnable: Callable[..., Any],
     ) -> None:
-        self._runnables[(cache_dir, key)] = (runnable, _signature(graph))
+        self._runnables[(cache_dir, key, _signature(graph))] = runnable
 
     def needs_retrace(self, size: int) -> bool:
         """Whether a graph refused this bucket and no trace has built it yet.

@@ -106,13 +106,14 @@ def rebase_token_slice(
 def _swa_token_rows_for_indices(
     t: jax.Array,  # i32[K]
     kv_lens: jax.Array,  # i32[S]
-    table: jax.Array,  # i32[S, P], raw (un-ringed) page ids
+    table: jax.Array,  # i32[S, P], raw (un-ringed) or pre-ringed page ids
     cu_q_lens: jax.Array,  # i32[S + 1]
     n_valid_tokens: jax.Array,  # i32[]
     *,
     num_cache_pages: int,
     phys_tokens_per_page: int,
     logical_page_size: int,
+    table_ring_mapped: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     num_seq_slots = kv_lens.shape[0]
     req = jnp.searchsorted(cu_q_lens[1:], t, side="right", method="compare_all")
@@ -120,7 +121,7 @@ def _swa_token_rows_for_indices(
     pos = kv_lens[req] - (cu_q_lens[req + 1] - t)
     col = jnp.clip(pos // logical_page_size, 0, table.shape[1] - 1)
     page = table[req, col]
-    if num_cache_pages > 1:
+    if num_cache_pages > 1 and not table_ring_mapped:
         page = jnp.where(page > 0, ((page - 1) % (num_cache_pages - 1)) + 1, 0)
     row = page * phys_tokens_per_page + pos % logical_page_size
     valid = t < n_valid_tokens
@@ -321,34 +322,21 @@ def _pack_blk_run_len_fast(rows_batch: jax.Array, total_rows: int) -> jax.Array:
     return (run_len << 24) | (rows_batch & 0xFFFFFF)
 
 
-def swa_store_all_pallas(
-    sw_cache: jax.Array,  # int32 [N, rows, 128] or uint8 [N, rows, packing, 128]
-    new_kv: jax.Array,  # bf16 [T, head_dim]
+def _compute_swa_store_coalesced_metadata(
     kv_lens: jax.Array,
-    page_indices: jax.Array,
+    table: jax.Array,
     cu_q_lens: jax.Array,
     distribution: jax.Array,
     *,
+    num_tokens: int,
+    num_cache_pages: int,
+    phys_tokens_per_page: int,
     logical_page_size: int,
-) -> jax.Array:
-    """Writes every new token's SWA row in-place via page-coalesced Pallas HBM->HBM DMA."""
-    num_pages, rows, kv_packing, lanes = csa_cache_layout.u8_slab_shape(
-        sw_cache.shape, sw_cache.dtype
-    )
-    slots_per_token = new_kv.shape[1] * 2 // (kv_packing * lanes)
-    phys_tokens_per_page = rows // slots_per_token
-    total_rows = num_pages * phys_tokens_per_page
-    if total_rows == 0:
-        return sw_cache
-    T = new_kv.shape[0]
-    num_seq_slots = kv_lens.shape[0]
-    table = page_indices.reshape(num_seq_slots, -1)
-
-    tok = _pack_kv_words(new_kv, sw_cache.dtype, slots_per_token, kv_packing, lanes)
-    flat = sw_cache.reshape(total_rows, *tok.shape[1:])
-
-    blk_sz = 64 if T % 64 == 0 else (16 if T % 16 == 0 else 1)
-    num_blks = T // blk_sz
+    table_ring_mapped: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    total_rows = num_cache_pages * phys_tokens_per_page
+    blk_sz = 64 if num_tokens % 64 == 0 else (16 if num_tokens % 16 == 0 else 1)
+    num_blks = num_tokens // blk_sz
     b_idx = jnp.arange(num_blks, dtype=jnp.int32)
     n_valid_tokens = cu_q_lens[distribution[2]]
     n_blk = jnp.clip(n_valid_tokens - b_idx * blk_sz, 0, blk_sz)
@@ -363,9 +351,10 @@ def swa_store_all_pallas(
         table,
         cu_q_lens,
         n_valid_tokens,
-        num_cache_pages=num_pages,
+        num_cache_pages=num_cache_pages,
         phys_tokens_per_page=phys_tokens_per_page,
         logical_page_size=logical_page_size,
+        table_ring_mapped=table_ring_mapped,
     )
     req_ends = req_flat.reshape(num_blks, 2)
     pos_ends = pos_flat.reshape(num_blks, 2)
@@ -410,9 +399,10 @@ def swa_store_all_pallas(
             table,
             cu_q_lens,
             n_valid_tokens,
-            num_cache_pages=num_pages,
+            num_cache_pages=num_cache_pages,
             phys_tokens_per_page=phys_tokens_per_page,
             logical_page_size=logical_page_size,
+            table_ring_mapped=table_ring_mapped,
         )
         rows_batch = rows_batch.reshape(B_BATCH, blk_sz)
         packed_batch = _pack_blk_run_len_fast(rows_batch, total_rows)
@@ -426,8 +416,77 @@ def swa_store_all_pallas(
         rem_body,
         (jnp.int32(0), init_dst),
     )
-    dst = dst_2d.reshape(T)
+    dst = dst_2d.reshape(num_tokens)
+    return dst, blk_meta
 
+
+def prepare_tp_swa_step_metadata(
+    new_kv: jax.Array,  # bf16 [T, head_dim]
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    rank: jax.Array,
+    *,
+    num_cache_pages: int,
+    phys_tokens_per_page: int,
+    logical_page_size: int,
+    tp_size: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Precomputes stage-invariant SWA coalesced store and token-slice metadata."""
+    T = new_kv.shape[0]
+    local_tokens = T // tp_size
+    token_start = rank[0] * local_tokens
+    num_seq_slots = kv_lens.shape[0]
+    table = page_indices.reshape(num_seq_slots, -1)
+    if num_cache_pages > 1:
+        table = jnp.where(
+            table > 0, ((table - 1) % (num_cache_pages - 1)) + 1, 0
+        )
+    dst, blk_meta = _compute_swa_store_coalesced_metadata(
+        kv_lens,
+        table,
+        cu_q_lens,
+        distribution,
+        num_tokens=T,
+        num_cache_pages=num_cache_pages,
+        phys_tokens_per_page=phys_tokens_per_page,
+        logical_page_size=logical_page_size,
+        table_ring_mapped=True,
+    )
+    if blk_meta.shape[0] < T:
+        blk_meta = jnp.pad(blk_meta, ((0, T - blk_meta.shape[0]), (0, 0)))
+    swa_cu, swa_kv, swa_pages, swa_dist = rebase_token_slice(
+        cu_q_lens,
+        kv_lens,
+        table.reshape(page_indices.shape),
+        distribution,
+        token_start,
+        local_tokens=local_tokens,
+    )
+    return dst, blk_meta, swa_kv, swa_pages, swa_cu, swa_dist
+
+
+def swa_store_all_pallas_precomputed(
+    sw_cache: jax.Array,
+    new_kv: jax.Array,
+    dst: jax.Array,
+    blk_meta: jax.Array,
+) -> jax.Array:
+    """Writes every new token's SWA row using precomputed (dst, blk_meta)."""
+    num_pages, rows, kv_packing, lanes = csa_cache_layout.u8_slab_shape(
+        sw_cache.shape, sw_cache.dtype
+    )
+    slots_per_token = new_kv.shape[1] * 2 // (kv_packing * lanes)
+    phys_tokens_per_page = rows // slots_per_token
+    total_rows = num_pages * phys_tokens_per_page
+    if total_rows == 0:
+        return sw_cache
+    T = new_kv.shape[0]
+    blk_sz = 64 if T % 64 == 0 else (16 if T % 16 == 0 else 1)
+    num_blks = T // blk_sz
+    tok = _pack_kv_words(new_kv, sw_cache.dtype, slots_per_token, kv_packing, lanes)
+    flat = sw_cache.reshape(total_rows, *tok.shape[1:])
     out_flat = pl.pallas_call(
         _swa_store_pallas_coalesced_kernel,
         out_shape=jax.ShapeDtypeStruct(flat.shape, flat.dtype),
@@ -444,8 +503,43 @@ def swa_store_all_pallas(
         input_output_aliases={2: 0},
         compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
         name="swa_store_all_pallas",
-    )(dst, blk_meta, flat, tok)
+    )(dst, blk_meta[:num_blks], flat, tok)
     return out_flat.reshape(sw_cache.shape)
+
+
+def swa_store_all_pallas(
+    sw_cache: jax.Array,  # int32 [N, rows, 128] or uint8 [N, rows, packing, 128]
+    new_kv: jax.Array,  # bf16 [T, head_dim]
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    logical_page_size: int,
+) -> jax.Array:
+    """Writes every new token's SWA row in-place via page-coalesced Pallas HBM->HBM DMA."""
+    num_pages, rows, kv_packing, lanes = csa_cache_layout.u8_slab_shape(
+        sw_cache.shape, sw_cache.dtype
+    )
+    slots_per_token = new_kv.shape[1] * 2 // (kv_packing * lanes)
+    phys_tokens_per_page = rows // slots_per_token
+    total_rows = num_pages * phys_tokens_per_page
+    if total_rows == 0:
+        return sw_cache
+    T = new_kv.shape[0]
+    num_seq_slots = kv_lens.shape[0]
+    table = page_indices.reshape(num_seq_slots, -1)
+    dst, blk_meta = _compute_swa_store_coalesced_metadata(
+        kv_lens,
+        table,
+        cu_q_lens,
+        distribution,
+        num_tokens=T,
+        num_cache_pages=num_pages,
+        phys_tokens_per_page=phys_tokens_per_page,
+        logical_page_size=logical_page_size,
+    )
+    return swa_store_all_pallas_precomputed(sw_cache, new_kv, dst, blk_meta)
 
 
 def attention_tp_local(
@@ -464,8 +558,7 @@ def attention_tp_local(
     main_distribution: jax.Array,
     attention_sinks: jax.Array,  # [H]
     rank: jax.Array,  # i32[1]
-    main_cache_rope: jax.Array | None = None,  # CSA layers only
-    *,
+    *trailing_args: jax.Array,
     base_fn: Callable,
     logical_page_size: int,
     store_fn: Callable = swa_store_all_pallas,
@@ -476,25 +569,67 @@ def attention_tp_local(
     The CSA kernel reads only the main cu_q_lens / distribution (its top-k rows
     are absolute cache rows), so main kv_lens and page indices pass through.
     """
+    main_cache_rope: jax.Array | None = None
+    union_gather_indices: jax.Array | None = None
+    cand_bits_tiled: jax.Array | None = None
+    n_unique: jax.Array | None = None
+    swa_store_dst: jax.Array | None = None
+    swa_store_blk_meta: jax.Array | None = None
+    if len(trailing_args) == 1:
+        (main_cache_rope,) = trailing_args
+    elif len(trailing_args) == 2:
+        swa_store_dst, swa_store_blk_meta = trailing_args
+    elif len(trailing_args) == 3:
+        main_cache_rope, swa_store_dst, swa_store_blk_meta = trailing_args
+    elif len(trailing_args) == 4:
+        (
+            main_cache_rope,
+            union_gather_indices,
+            cand_bits_tiled,
+            n_unique,
+        ) = trailing_args
+    elif len(trailing_args) == 6:
+        (
+            main_cache_rope,
+            union_gather_indices,
+            cand_bits_tiled,
+            n_unique,
+            swa_store_dst,
+            swa_store_blk_meta,
+        ) = trailing_args
+    elif len(trailing_args) != 0:
+        raise ValueError(f"Unexpected trailing_args count: {len(trailing_args)}")
+
     local_tokens = q.shape[0]
     token_start = rank[0] * local_tokens
-    sw_cache = store_fn(
-        sw_cache,
-        new_kv,
-        swa_kv_lens,
-        swa_page_indices,
-        swa_cu_q_lens,
-        swa_distribution,
-        logical_page_size=logical_page_size,
-    )
-    swa_cu, swa_kv, swa_pages, swa_dist = rebase_token_slice(
-        swa_cu_q_lens,
-        swa_kv_lens,
-        swa_page_indices,
-        swa_distribution,
-        token_start,
-        local_tokens=local_tokens,
-    )
+    if swa_store_dst is not None and swa_store_blk_meta is not None:
+        sw_cache = swa_store_all_pallas_precomputed(
+            sw_cache, new_kv, swa_store_dst, swa_store_blk_meta
+        )
+        swa_cu, swa_kv, swa_pages, swa_dist = (
+            swa_cu_q_lens,
+            swa_kv_lens,
+            swa_page_indices,
+            swa_distribution,
+        )
+    else:
+        sw_cache = store_fn(
+            sw_cache,
+            new_kv,
+            swa_kv_lens,
+            swa_page_indices,
+            swa_cu_q_lens,
+            swa_distribution,
+            logical_page_size=logical_page_size,
+        )
+        swa_cu, swa_kv, swa_pages, swa_dist = rebase_token_slice(
+            swa_cu_q_lens,
+            swa_kv_lens,
+            swa_page_indices,
+            swa_distribution,
+            token_start,
+            local_tokens=local_tokens,
+        )
     is_csa = main_cache_rope is not None
     if is_csa:
         main_cu, _, _, main_dist = rebase_token_slice(
@@ -513,6 +648,12 @@ def attention_tp_local(
             return x
         return lax.dynamic_slice_in_dim(x, token_start, local_tokens, axis=0)
 
+    has_union = (
+        is_csa
+        and union_gather_indices is not None
+        and cand_bits_tiled is not None
+        and n_unique is not None
+    )
     return base_fn(
         q,
         local(new_kv),
@@ -523,10 +664,11 @@ def attention_tp_local(
         swa_dist,
         main_cache_kv,
         main_kv_lens,
-        local(extra),
+        local(extra) if is_csa else extra,
         main_page_indices,
         main_cu,
         main_dist,
         attention_sinks,
         *((main_cache_rope,) if is_csa else ()),
+        *((union_gather_indices, cand_bits_tiled, n_unique) if has_union else ()),
     )

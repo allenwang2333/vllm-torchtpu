@@ -968,14 +968,14 @@ def combine_split_kv_tp8(
     # Global max m = max_r m_r ([B, 64])
     m_global = jnp.max(m_all, axis=0)
 
-    # Rescale this rank's unnormalized output O_r in float32 for exact cross-rank reduction
+    # Rescale this rank's unnormalized output O_r in float32, then cast to bf16 before ICI psum_scatter
     alpha_r = jnp.where(m_r > _MIN_F32, jnp.exp(m_r - m_global), 0.0)
-    o_scaled = o_r * alpha_r[:, :, None]
+    o_scaled = (o_r * alpha_r[:, :, None]).astype(out_dtype)
 
     # Hardware ICI ring reduce-scatter along heads: [B, 64, 512] -> [B, 8, 512]
     o_num_local = lax.psum_scatter(
         o_scaled, axis_name=axis_name, scatter_dimension=1, tiled=True
-    )
+    ).astype(jnp.float32)
 
     # Compute local denominator for this rank's 8 heads: sum_r l_r * exp(m_r - m) + exp(sink - m)
     m_local = lax.dynamic_slice_in_dim(m_global, tp_rank * h_local, h_local, axis=1)

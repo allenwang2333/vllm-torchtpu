@@ -81,7 +81,10 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
                 f"Input hidden dim {k_dim} must be divisible by block scale "
                 f"count {sharded_num_blocks}."
             )
-        return gmm_v2(
+        m_orig = x.shape[0]
+        if m_orig % 8 != 0:
+            x = jnp.pad(x, ((0, ((m_orig + 7) & ~7) - m_orig), (0, 0)))
+        out = gmm_v2(
             lhs=x,
             rhs=w_q[None],  # [n_in, n_out] -> [1, n_in, n_out]
             group_sizes=jnp.array([x.shape[0]], dtype=jnp.int32),
@@ -91,7 +94,12 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
             maybe_quantize_lhs=True,
             zero_initialize=True,
         )
-    return xla_quantized_matmul(x, w_q, w_s)
+        return out[:m_orig] if m_orig % 8 != 0 else out
+    m_orig = x.shape[0]
+    if m_orig % 8 != 0:
+        x = jnp.pad(x, ((0, ((m_orig + 7) & ~7) - m_orig), (0, 0)))
+    out = xla_quantized_matmul(x, w_q, w_s)
+    return out[:m_orig] if m_orig % 8 != 0 else out
 
 
 _quantized_matmul_kernel_op: Callable | None = None
@@ -141,7 +149,12 @@ def quantized_matmul(
 
     orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
+    m_orig = x_2d.shape[0]
+    if m_orig % 8 != 0:
+        x_2d = torch.nn.functional.pad(x_2d, (0, 0, 0, ((m_orig + 7) & ~7) - m_orig))
     out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s)
+    if m_orig % 8 != 0:
+        out_2d = out_2d[:m_orig]
     return out_2d.reshape(orig_out_shape)
 
 
@@ -149,6 +162,11 @@ def _prequant_matmul_jax(
     x_q: jax.Array, x_scale: jax.Array, w_q: jax.Array, w_s: jax.Array
 ) -> jax.Array:
     """FP8 dense matmul consuming pre-quantized `(x_q, x_scale)` on (k, n) weights."""
+    m_orig = x_q.shape[0]
+    if m_orig % 8 != 0:
+        pad_rows = ((m_orig + 7) & ~7) - m_orig
+        x_q = jnp.pad(x_q, ((0, pad_rows), (0, 0)))
+        x_scale = jnp.pad(x_scale, ((0, pad_rows), (0, 0)))
     out = jax.lax.dot_general(
         x_q,
         w_q,
@@ -157,7 +175,8 @@ def _prequant_matmul_jax(
     ).astype(jnp.float32)
     out *= x_scale
     out *= jnp.expand_dims(w_s, 0)
-    return out.astype(jnp.bfloat16)
+    out = out.astype(jnp.bfloat16)
+    return out[:m_orig] if m_orig % 8 != 0 else out
 
 
 _quantized_matmul_prequant_op: Callable | None = None
@@ -211,7 +230,14 @@ def quantized_matmul_prequant(
     orig_out_shape = (*x_q.shape[:-1], w_q.shape[-1])
     x_q_2d = x_q.reshape(-1, x_q.shape[-1])
     x_scale_2d = x_scale.reshape(-1, 1)
+    m_orig = x_q_2d.shape[0]
+    if m_orig % 8 != 0:
+        pad_rows = ((m_orig + 7) & ~7) - m_orig
+        x_q_2d = torch.nn.functional.pad(x_q_2d, (0, 0, 0, pad_rows))
+        x_scale_2d = torch.nn.functional.pad(x_scale_2d, (0, 0, 0, pad_rows))
     out_2d = _get_quantized_matmul_prequant_op()(x_q_2d, x_scale_2d, w_q, w_s)
+    if m_orig % 8 != 0:
+        out_2d = out_2d[:m_orig]
     return out_2d.reshape(orig_out_shape)
 
 
@@ -375,7 +401,7 @@ def _init_quantized_mlp_prequant_op(swiglu_limit: float | None) -> Callable:
 
 
 _init_quantized_matmul_prequant_op()
-for _default_lim in (None, 7.0):
+for _default_lim in (None, 7.0, 20.0):
     _init_quantized_mlp_op(_default_lim)
     _init_quantized_mlp_prequant_op(_default_lim)
 
@@ -385,13 +411,6 @@ def _get_quantized_mlp_prequant_op(swiglu_limit: float | None = None) -> Callabl
     if op is not None:
         return op
     return _init_quantized_mlp_prequant_op(swiglu_limit)
-
-
-_get_quantized_matmul_op()
-_init_quantized_matmul_prequant_op()
-for _preload_lim in (None, 7.0):
-    _init_quantized_mlp_op(_preload_lim)
-    _init_quantized_mlp_prequant_op(_preload_lim)
 
 
 def quantized_mlp(
@@ -406,7 +425,12 @@ def quantized_mlp(
     """Torch entry point for fused gate_up + SiluAndMul[WithClamp] + down."""
     orig_out_shape = (*x.shape[:-1], w_dn.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
+    m_orig = x_2d.shape[0]
+    if m_orig % 8 != 0:
+        x_2d = torch.nn.functional.pad(x_2d, (0, 0, 0, ((m_orig + 7) & ~7) - m_orig))
     out_2d = _get_quantized_mlp_op(swiglu_limit)(x_2d, w_gu, s_gu, w_dn, s_dn)
+    if m_orig % 8 != 0:
+        out_2d = out_2d[:m_orig]
     return out_2d.reshape(orig_out_shape)
 
 
@@ -424,9 +448,16 @@ def quantized_mlp_prequant(
     orig_out_shape = (*x_q.shape[:-1], w_dn.shape[-1])
     x_q_2d = x_q.reshape(-1, x_q.shape[-1])
     x_scale_2d = x_scale.reshape(-1, 1)
+    m_orig = x_q_2d.shape[0]
+    if m_orig % 8 != 0:
+        pad_rows = ((m_orig + 7) & ~7) - m_orig
+        x_q_2d = torch.nn.functional.pad(x_q_2d, (0, 0, 0, pad_rows))
+        x_scale_2d = torch.nn.functional.pad(x_scale_2d, (0, 0, 0, pad_rows))
     out_2d = _get_quantized_mlp_prequant_op(swiglu_limit)(
         x_q_2d, x_scale_2d, w_gu, s_gu, w_dn, s_dn
     )
+    if m_orig % 8 != 0:
+        out_2d = out_2d[:m_orig]
     return out_2d.reshape(orig_out_shape)
 
 
@@ -651,6 +682,6 @@ def get_model_matmul_fusion_assignment(
 
 _get_quantized_matmul_op()
 _init_quantized_matmul_prequant_op()
-for _preload_lim in (None, 7.0):
+for _preload_lim in (None, 7.0, 20.0):
     _init_quantized_mlp_op(_preload_lim)
     _init_quantized_mlp_prequant_op(_preload_lim)

@@ -645,28 +645,31 @@ class DFlashProposer:
                 is not None
             ):
                 next_buf, qsl_buf, pos_buf, dl_buf = self._get_static_prep_bufs()
-                next_buf.fill_(INVALID_TOKEN_ID)
                 n_r = min(next_tokens_device.shape[0], next_buf.shape[0])
                 next_buf[:n_r].copy_(next_tokens_device[:n_r])
 
                 qsl_src = chunk.attn_ctx.query_start_loc
-                qsl_buf.zero_()
                 n_q = min(qsl_src.shape[0], qsl_buf.shape[0])
                 qsl_buf[:n_q].copy_(qsl_src[:n_q])
-                if n_q < qsl_buf.shape[0]:
-                    qsl_buf[n_q:].fill_(qsl_src[n_q - 1])
 
                 position_ids_device = chunk.position_ids
                 if position_ids_device.dim() > 1:
                     position_ids_device = position_ids_device[0]
-                pos_buf.zero_()
                 n_p = min(position_ids_device.shape[0], pos_buf.shape[0])
                 pos_buf[:n_p].copy_(position_ids_device[:n_p])
 
-                dl_buf.zero_()
                 if chunk.draft_lengths is not None:
                     n_d = min(chunk.draft_lengths.shape[0], dl_buf.shape[0])
                     dl_buf[:n_d].copy_(chunk.draft_lengths[:n_d])
+                else:
+                    dl_buf.zero_()
+
+                num_reqs_t = self._num_reqs_tensor_cache.get(chunk.num_reqs)
+                if num_reqs_t is None:
+                    num_reqs_t = torch.tensor(
+                        chunk.num_reqs, dtype=torch.int32, device=runner.device
+                    )
+                    self._num_reqs_tensor_cache[chunk.num_reqs] = num_reqs_t
 
                 seq_lens_buf = self._seq_lens_buf_cache.get(padded_num_reqs)
                 if seq_lens_buf is None:
@@ -696,6 +699,7 @@ class DFlashProposer:
                         pos_buf,
                         dl_buf,
                         seq_lens_buf,
+                        num_reqs_t,
                         block_size,
                         padded_len,
                         self.mask_token_id,
@@ -955,12 +959,19 @@ class DFlashProposer:
             synchronize_tensors(draft_tokens_chunk, wait=sync)
             if sync and use_max_model_len and not self._dp_lockstep_sharded():
                 next_buf, qsl_buf, pos_buf, dl_buf = self._get_static_prep_bufs()
+                dummy_nr_t = self._num_reqs_tensor_cache.get(1)
+                if dummy_nr_t is None:
+                    dummy_nr_t = torch.tensor(
+                        1, dtype=torch.int32, device=runner.device
+                    )
+                    self._num_reqs_tensor_cache[1] = dummy_nr_t
                 fused_chunk, _ = self._dflash_prep_forward_and_sample(
                     next_buf,
                     qsl_buf,
                     pos_buf,
                     dl_buf,
                     seq_lens,
+                    dummy_nr_t,
                     block_size,
                     num_tokens,
                     self.mask_token_id,
@@ -1299,26 +1310,26 @@ class DFlashProposer:
         position_ids: torch.Tensor,
         draft_lengths: torch.Tensor,
         seq_lens_buf: torch.Tensor,
+        num_reqs_t: torch.Tensor,
         block_size: int,
         padded_len: int,
         mask_token_id: int,
         invalid_token_id: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Single-graph fused DFlash/DSpark input layout + forward + sample with zero num_reqs specialization."""
+        """Single-graph fused DFlash/DSpark input layout + forward + sample with zero host sync or fill overhead."""
         padded_num_reqs = padded_len // block_size
-        next_tokens_padded = _pad_or_slice_rows(
-            next_tokens_device, padded_num_reqs, invalid_token_id
-        ).to(torch.int32)
-
         req_indices = torch.arange(
             padded_num_reqs, dtype=torch.int32, device=query_start_loc.device
         )
-        num_reqs_dev = (query_start_loc[1:] > query_start_loc[:-1]).sum(
-            dtype=torch.int32
-        )
+        num_reqs_dev = num_reqs_t.reshape(())
         safe_max = torch.clamp(num_reqs_dev - 1, min=0)
         safe_req_indices = torch.minimum(req_indices, safe_max)
         valid_mask = (req_indices < num_reqs_dev).unsqueeze(1).to(torch.int32)
+        next_tokens_padded = torch.where(
+            valid_mask.bool(),
+            next_tokens_device[safe_req_indices].to(torch.int32),
+            invalid_token_id,
+        )
 
         start_positions = position_ids[query_start_loc[safe_req_indices]].unsqueeze(1)
         end_indices = torch.clamp(query_start_loc[safe_req_indices + 1] - 1, min=0)

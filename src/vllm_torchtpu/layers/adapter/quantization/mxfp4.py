@@ -70,6 +70,7 @@ from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
+    fused_moe_gmm_fp8_dispatch,
     prebuild_fused_moe_kernel,
     quantize_native_fp4_kmajor,
 )
@@ -84,6 +85,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
+_SKIP_PADDED_TOKENS = envs.TPU_MOE_SKIP_PADDED_TOKENS
 
 
 @register_quantization_config(get_tpu_quant_method(MXFP4))
@@ -299,6 +301,23 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             "[moe] process_weights_after_loading did not run for this layer"
         )
 
+        if x.dtype == torch.int8:
+            return fused_moe_gmm_fp8_dispatch(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                w1_bias=getattr(layer, "w13_bias", None),
+                w2_bias=getattr(layer, "w2_bias", None),
+                topk_weights=router_logits,
+                topk_ids=router_logits,
+                experts_start=layer._experts_start,
+                topk=layer.moe_config.experts_per_token,
+                activation=activation_str,
+                rhs_quant_dtype=self.rhs_quant_dtype,
+            )
+
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
@@ -309,7 +328,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             layer, x, router_logits, input_ids=input_ids
         )
 
-        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+        if _SKIP_PADDED_TOKENS:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                 topk_ids,
                 topk_weights,

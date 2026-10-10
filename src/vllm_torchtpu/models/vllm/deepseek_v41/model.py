@@ -399,17 +399,33 @@ class DeepseekV41DecoderLayer(nn.Module):
                         token_sharded=token_sharded,
                     )
                 )
-                if not engram_sharded:
-                    if use_prequant_attn:
-                        (
-                            residual,
-                            attn_post,
-                            attn_comb,
-                            hidden_states,
-                            attn_pre,
-                            hidden_states_fp8,
-                            hidden_states_scale,
-                        ) = ops.fused_engram_quant(
+                if engram_sharded:
+                    engram_kv = tp_all_gather(engram_kv, dim=0)
+                if use_prequant_attn:
+                    (
+                        residual,
+                        attn_post,
+                        attn_comb,
+                        hidden_states,
+                        attn_pre,
+                        hidden_states_fp8,
+                        hidden_states_scale,
+                    ) = ops.fused_engram_quant(
+                        previous_x,
+                        residual,
+                        previous_post_mix,
+                        previous_res_mix,
+                        pre_mix,
+                        engram_kv,
+                        engram_qk_w,
+                        self.attn_norm.weight,
+                        hc_attn_fn,
+                        hc_attn_scale,
+                        hc_attn_base,
+                    )
+                else:
+                    residual, attn_post, attn_comb, hidden_states, attn_pre = (
+                        ops.fused_engram(
                             previous_x,
                             residual,
                             previous_post_mix,
@@ -422,23 +438,8 @@ class DeepseekV41DecoderLayer(nn.Module):
                             hc_attn_scale,
                             hc_attn_base,
                         )
-                    else:
-                        residual, attn_post, attn_comb, hidden_states, attn_pre = (
-                            ops.fused_engram(
-                                previous_x,
-                                residual,
-                                previous_post_mix,
-                                previous_res_mix,
-                                pre_mix,
-                                engram_kv,
-                                engram_qk_w,
-                                self.attn_norm.weight,
-                                hc_attn_fn,
-                                hc_attn_scale,
-                                hc_attn_base,
-                            )
-                        )
-                    engram_fused_done = True
+                    )
+                engram_fused_done = True
             if not engram_fused_done:
                 if previous_x is not None:
                     assert (
@@ -488,6 +489,11 @@ class DeepseekV41DecoderLayer(nn.Module):
         else:
             assert previous_post_mix is not None and previous_res_mix is not None
             if use_prequant_attn:
+                seam_a_op = (
+                    ops.fused_quant_fp8_only
+                    if getattr(ops, "fused_quant_fp8_only", None) is not None
+                    else ops.fused_quant
+                )
                 (
                     residual,
                     attn_post,
@@ -496,7 +502,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                     attn_pre,
                     hidden_states_fp8,
                     hidden_states_scale,
-                ) = ops.fused_quant(
+                ) = seam_a_op(
                     previous_x,
                     residual,
                     previous_post_mix,
@@ -618,6 +624,10 @@ def _clear_stage_caches(layers: Iterable[nn.Module]) -> None:
         if attn is not None:
             attn._step_indexer_metadata = None
             attn._step_csa_union = None
+            attn._step_swa_metadata = None
+            attn._step_tp_swa_metadata = None
+            attn._step_cos_sin = None
+            attn._step_cos_sin_local = None
 
 
 def _gather_aux_hidden_states(

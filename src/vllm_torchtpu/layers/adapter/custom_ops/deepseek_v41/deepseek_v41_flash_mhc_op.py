@@ -49,6 +49,7 @@ class MHCOpsV41(NamedTuple):
     engram_gate: Any = None
     fused_engram: Any = None
     fused_engram_quant: Any = None
+    fused_quant_fp8_only: Any = None
 
 
 def _fake_mhc_pre_v41(residual, *args):
@@ -71,6 +72,24 @@ def _fake_mhc_fused_post_pre_v41(x, residual, *args):
 
 def _fake_mhc_fused_post_pre_quant_v41(x, residual, *args):
     return (torch.empty_like(residual), *_fake_mhc_pre_quant_v41(residual))
+
+
+def _fake_mhc_fused_post_pre_quant_fp8_only_v41(x, residual, *args):
+    *outer_shape, _, hidden_size = residual.shape
+    normed_w = hidden_size if x.numel() // hidden_size <= 256 else 128
+    post_mix, comb_mix, _, next_pre_mix, normed_fp8, normed_scale = (
+        _fake_mhc_pre_quant_v41(residual)
+    )
+    normed_stub = residual.new_empty((*outer_shape, normed_w), dtype=residual.dtype)
+    return (
+        torch.empty_like(residual),
+        post_mix,
+        comb_mix,
+        normed_stub,
+        next_pre_mix,
+        normed_fp8,
+        normed_scale,
+    )
 
 
 def _fake_engram_gate_v41(residual, kv, qk_weight, *args):
@@ -173,7 +192,7 @@ def get_mhc_ops_v41(
         ),
         fused_quant=_get_or_register_op(
             f"pallas::deepseek_v41_mhc_fused_post_pre_quant{suffix}",
-            functools.partial(mhc_fused_post_pre_quant_v41, **kw),
+            functools.partial(mhc_fused_post_pre_quant_v41, **kw, write_bf16=True),
             9,
             _fake_mhc_fused_post_pre_quant_v41,
         ),
@@ -189,5 +208,11 @@ def get_mhc_ops_v41(
             functools.partial(mhc_fused_post_engram_pre_quant_v41, **kw),
             11,
             _fake_mhc_fused_post_pre_quant_v41,
+        ),
+        fused_quant_fp8_only=_get_or_register_op(
+            f"pallas::deepseek_v41_mhc_fused_post_pre_quant_fp8_only{suffix}",
+            functools.partial(mhc_fused_post_pre_quant_v41, **kw, write_bf16=False),
+            9,
+            _fake_mhc_fused_post_pre_quant_fp8_only_v41,
         ),
     )

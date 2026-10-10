@@ -31,15 +31,36 @@ from vllm_torchtpu.distributed.tp_collectives import (
     tp_all_gather,
     tp_reduce_scatter,
 )
+from vllm_torchtpu.layers.adapter import moe_routing
+from vllm_torchtpu.layers.adapter.fused_moe import (
+    moe_fp8_dispatch_enabled,
+    quantize_moe_dispatch,
+)
+from vllm_torchtpu.layers.adapter.router_topk import (
+    fused_gate_grouped_rowmax_select,
+)
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
+
+_TOKEN_SHARD_MIN_TOKENS = envs.VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS
 
 
 class _DeepseekV4MoERunner(MoERunner):
-    """MoERunner that can skip shared_experts when computed on the local TP shard."""
+    """MoERunner that can skip shared_experts and/or gate when computed on the local TP shard."""
 
     def __init__(self, *args, **kwargs) -> None:
         self._skip_shared: list[bool] = [False]
+        self._skip_gate: list[bool] = [False]
         super().__init__(*args, **kwargs)
+
+    @property
+    def gate(self):
+        if self._skip_gate[0]:
+            return None
+        return self._modules.get("_gate_mod")
+
+    @gate.setter
+    def gate(self, value) -> None:
+        self._modules["_gate_mod"] = value
 
     @property
     def _shared_experts(self):
@@ -202,8 +223,9 @@ class DeepseekV4MoE(nn.Module):
 
         org_shape = hidden_states.shape
         skip_shared = getattr(self.experts, "_skip_shared", None)
+        skip_gate = getattr(self.experts, "_skip_gate", None)
         if (
-            envs.VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS > 0
+            _TOKEN_SHARD_MIN_TOKENS > 0
             and self.tp_size > 1
             and self.shared_experts is not None
             and "_tp_gate_up_w" in self.shared_experts._buffers
@@ -213,7 +235,6 @@ class DeepseekV4MoE(nn.Module):
         run_local_shared = (
             input_is_token_sharded
             and return_token_sharded
-            and hidden_states.shape[0] % 8 == 0
             and self.tp_size > 1
             and getattr(
                 getattr(self.experts, "moe_config", None),
@@ -225,17 +246,130 @@ class DeepseekV4MoE(nn.Module):
             and self.shared_experts.has_tp_local_weights()
         )
         x_local = hidden_states
-        if input_is_token_sharded:
-            hidden_states = tp_all_gather(hidden_states, dim=0)
+        num_tokens_global = (
+            x_local.shape[0] * self.tp_size
+            if input_is_token_sharded
+            else x_local.shape[0]
+        )
+        router_logits = hidden_states
+        defer_shared_to_rs = run_local_shared and num_tokens_global > 2048
+        routed = getattr(self.experts, "routed_experts", None)
+        qm = getattr(routed, "quant_method", None)
+        use_fp8_tp_dispatch = (
+            input_is_token_sharded
+            and self.tp_size > 1
+            and run_local_shared
+            and routed is not None
+            and qm is not None
+            and getattr(routed, "w13_weight", None) is not None
+            and moe_fp8_dispatch_enabled(
+                routed.w13_weight,
+                getattr(routed, "w13_weight_scale", None),
+                getattr(qm, "rhs_quant_dtype", None),
+            )
+        )
+        if use_fp8_tp_dispatch:
+            assert routed is not None
+            if (
+                self.gate.tid2eid is None
+                and routed.use_grouped_topk
+                and routed.num_expert_group > 1
+                and routed.topk_group < routed.num_expert_group
+                and routed.e_score_correction_bias is not None
+                and getattr(self.gate, "is_unquantized", False)
+            ):
+                w_f32, local_topk_ids = fused_gate_grouped_rowmax_select(
+                    x_local,
+                    self.gate.weight,
+                    routed.e_score_correction_bias,
+                    topk=routed.moe_config.experts_per_token,
+                    num_expert_group=routed.num_expert_group,
+                    topk_group=routed.topk_group,
+                    scoring_fn=routed.scoring_func,
+                    renormalize=routed.renormalize,
+                    routed_scaling_factor=float(routed.routed_scaling_factor),
+                )
+                local_topk_w = w_f32.to(x_local.dtype)
+            else:
+                if self.gate.tid2eid is None:
+                    local_gate_out = self.gate(x_local)
+                    local_logits = (
+                        local_gate_out[0]
+                        if isinstance(local_gate_out, tuple)
+                        else local_gate_out
+                    )
+                else:
+                    local_logits = x_local[:0]
+                local_input_ids = (
+                    input_ids[
+                        self.tp_rank * x_local.shape[0] : (self.tp_rank + 1)
+                        * x_local.shape[0]
+                    ]
+                    if input_ids is not None
+                    else None
+                )
+                local_topk_w, local_topk_ids = moe_routing.route(
+                    routed, x_local, local_logits, input_ids=local_input_ids
+                )
+            packed_local = quantize_moe_dispatch(
+                x_local, local_topk_w, local_topk_ids
+            )
+            hidden_states = tp_all_gather(packed_local, dim=0)
+            router_logits = x_local[:0]
+        elif input_is_token_sharded:
+            hidden_states = tp_all_gather(x_local, dim=0)
+            if (
+                self.tp_size > 1
+                and self.gate.tid2eid is None
+                and routed is not None
+                and skip_gate is not None
+            ):
+                if (
+                    routed.use_grouped_topk
+                    and routed.num_expert_group > 1
+                    and routed.topk_group < routed.num_expert_group
+                    and routed.e_score_correction_bias is not None
+                    and getattr(self.gate, "is_unquantized", False)
+                ):
+                    w_f32, local_topk_ids = fused_gate_grouped_rowmax_select(
+                        x_local,
+                        self.gate.weight,
+                        routed.e_score_correction_bias,
+                        topk=routed.moe_config.experts_per_token,
+                        num_expert_group=routed.num_expert_group,
+                        topk_group=routed.topk_group,
+                        scoring_fn=routed.scoring_func,
+                        renormalize=routed.renormalize,
+                        routed_scaling_factor=float(routed.routed_scaling_factor),
+                    )
+                    local_topk_w = w_f32.to(x_local.dtype)
+                else:
+                    local_gate_out = self.gate(x_local)
+                    local_logits = (
+                        local_gate_out[0]
+                        if isinstance(local_gate_out, tuple)
+                        else local_gate_out
+                    )
+                    local_topk_w, local_topk_ids = moe_routing.route(
+                        routed, x_local, local_logits, input_ids=None
+                    )
+                router_logits = moe_routing.all_gather_packed_topk_s32(
+                    local_topk_w,
+                    local_topk_ids,
+                    all_gather_fn=tp_all_gather,
+                    num_tokens_global=num_tokens_global,
+                )
+                skip_gate[0] = True
         shared_local_out: torch.Tensor | None = None
         if run_local_shared:
             assert self.shared_experts is not None and skip_shared is not None
             skip_shared[0] = True
-            shared_local_out = self.shared_experts.forward_tp_local(
-                x_local,
-                hidden_states_fp8=hidden_states_fp8,
-                hidden_states_scale=hidden_states_scale,
-            )
+            if not defer_shared_to_rs:
+                shared_local_out = self.shared_experts.forward_tp_local(
+                    x_local,
+                    hidden_states_fp8=hidden_states_fp8,
+                    hidden_states_scale=hidden_states_scale,
+                )
         elif (
             self.shared_experts is not None
             and hidden_states_fp8 is not None
@@ -245,20 +379,44 @@ class DeepseekV4MoE(nn.Module):
                 hidden_states_fp8, hidden_states_scale
             )
         try:
-            # FusedMoEFactory gives the runner our gate, so it computes the logits.
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=hidden_states,
-                input_ids=input_ids,
-            )
+            if use_fp8_tp_dispatch:
+                assert routed is not None and qm is not None
+                final_hidden_states = qm.apply_monolithic(
+                    routed, hidden_states, router_logits
+                )
+            else:
+                # FusedMoEFactory gives the runner our gate, so it computes the logits.
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
         finally:
             if skip_shared is not None:
                 skip_shared[0] = False
+            if skip_gate is not None:
+                skip_gate[0] = False
             if self.shared_experts is not None and hidden_states_fp8 is not None:
                 self.shared_experts.set_prequant_hidden(None, None)
         if self.experts.moe_config.skip_final_all_reduce and self.tp_size > 1:
             if return_token_sharded:
-                final_hidden_states = tp_reduce_scatter(final_hidden_states, dim=0)
+                if defer_shared_to_rs and self.shared_experts is not None:
+                    xla_ops = getattr(torch.ops, "xla", None)
+                    opt_barrier = getattr(xla_ops, "optimization_barrier_", None)
+                    if opt_barrier is not None:
+                        opt_barrier([final_hidden_states, x_local])
+                    final_hidden_states = tp_reduce_scatter(
+                        final_hidden_states, dim=0
+                    )
+                    shared_local_out = self.shared_experts.forward_tp_local(
+                        x_local,
+                        hidden_states_fp8=hidden_states_fp8,
+                        hidden_states_scale=hidden_states_scale,
+                    )
+                else:
+                    final_hidden_states = tp_reduce_scatter(
+                        final_hidden_states, dim=0
+                    )
                 if shared_local_out is not None:
                     final_hidden_states = (
                         final_hidden_states

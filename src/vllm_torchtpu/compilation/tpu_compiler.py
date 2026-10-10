@@ -366,65 +366,6 @@ def _single_size(compile_range: Range) -> int | None:
     return compile_range.start if compile_range.is_single_size() else None
 
 
-def _concretize_symint(val: torch.SymInt, size: int) -> int | torch.SymInt:
-    """Substitute the static bucket size into a SymInt expression."""
-    sym_node = getattr(val, "node", None)
-    expr = getattr(sym_node, "expr", None)
-    if expr is None:
-        return val
-    try:
-        sub = {s: size for s in expr.free_symbols}
-        return int(expr.subs(sub))
-    except Exception:
-        return val
-
-
-def _concretize_graph_symints(graph: fx.GraphModule, size: int) -> None:
-    """Replace SymInt uses and literal SymInt args in a deep-copied FX graph.
-
-    Placeholder nodes and their `example_value` metadata are left intact so
-    `shape_variants.graph_signature(graph)` and input arity are unchanged.
-    """
-    dead_nodes: list[fx.Node] = []
-    for node in list(graph.graph.nodes):
-        val = node.meta.get("example_value", node.meta.get("val"))
-        if isinstance(val, torch.SymInt):
-            c_val = _concretize_symint(val, size)
-            if isinstance(c_val, int):
-                node.replace_all_uses_with(c_val)
-                if node.op != "placeholder" and len(node.users) == 0:
-                    dead_nodes.append(node)
-                continue
-        if node.op != "placeholder":
-            node.args = fx.node.map_aggregate(
-                node.args,
-                lambda x: _concretize_symint(x, size)
-                if isinstance(x, torch.SymInt)
-                else x,
-            )
-            node.kwargs = fx.node.map_aggregate(
-                node.kwargs,
-                lambda x: _concretize_symint(x, size)
-                if isinstance(x, torch.SymInt)
-                else x,
-            )
-    for node in reversed(dead_nodes):
-        if len(node.users) == 0:
-            graph.graph.erase_node(node)
-    graph.recompile()
-
-
-def _concretize_example_inputs(
-    example_inputs: list[Any], size: int | None
-) -> list[Any]:
-    if size is None:
-        return example_inputs
-    return [
-        _concretize_symint(x, size) if isinstance(x, torch.SymInt) else x
-        for x in example_inputs
-    ]
-
-
 class TpuCompilerAdaptor(CompilerInterface):
     """CompilerInterface implementation for TPU.
 
@@ -642,13 +583,9 @@ class TpuCompilerAdaptor(CompilerInterface):
         # and vLLM keeps its own reference to `graph`. Only the output node
         # moves, so the placeholder signature is unaffected.
         graph = copy.deepcopy(graph)
-        if size is not None:
-            _concretize_graph_symints(graph, size)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
-        compiled_fn, entry = self._run_backend(
-            graph, _concretize_example_inputs(example_inputs, size)
-        )
+        compiled_fn, entry = self._run_backend(graph, example_inputs)
 
         if was_wrapped:
             # Undo _ensure_tuple_output on the result side, so callers see the
@@ -726,15 +663,11 @@ class TpuCompilerAdaptor(CompilerInterface):
         # Same deepcopy + output-tuple rewrite as `compile`, so the graph the
         # artifact is checked against is shaped the way it was when saved.
         graph = copy.deepcopy(graph)
-        if size is not None:
-            _concretize_graph_symints(graph, size)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         compiled_fn = self._replay(path, graph, was_wrapped)
         if compiled_fn is None:
-            compiled_fn, entry = self._run_backend(
-                graph, _concretize_example_inputs(example_inputs, size)
-            )
+            compiled_fn, entry = self._run_backend(graph, example_inputs)
             # Self-heal: overwrite the artifact vLLM will hand us again next
             # run. Without this a single stale entry recompiles forever.
             if (

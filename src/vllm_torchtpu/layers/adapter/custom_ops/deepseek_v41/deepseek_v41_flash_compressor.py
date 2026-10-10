@@ -99,6 +99,28 @@ def _as_kernel_cache_view(cache: torch.Tensor | None) -> torch.Tensor | None:
     )
 
 
+def _fp32_linear_jax(x: jax.Array, weight: jax.Array) -> jax.Array:
+    return jax.lax.dot_general(
+        x,
+        weight,
+        (((1,), (0,)), ((), ())),
+        preferred_element_type=jax.numpy.float32,
+    )
+
+
+def _fake_fp32_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[1]), dtype=torch.float32)
+
+
+_fp32_linear_op = pallas.jax_op(
+    "pallas::deepseek_v41_fp32_linear",
+    _fp32_linear_jax,
+    mesh=None,
+    input_partition_specs=(_R, _R),
+)
+_fp32_linear_op.register_fake(_fake_fp32_linear)
+
+
 class VllmCompressorV41StateCache(dsv41_compressor.CompressorStateCache):
     """TPU state cache for DeepSeek-V4.1 ratio-2 compressor."""
 
@@ -185,21 +207,43 @@ class VllmDeepseekV41Compressor(dsv41_compressor.DeepseekCompressor):
 
     compressor_op = property(_build_compressor_op)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
+    def project_wkv_wgate(
+        self, hidden_states: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:
-        num_tokens = positions.shape[0]
         if not self.has_gate:
             latent = self.norm(self.fused_wkv_wgate(hidden_states))
             if latent.shape[0] != num_tokens:
                 latent = tp_all_gather(latent, dim=0)
             return latent
-
-        wkv_wgate = self.fused_wkv_wgate(hidden_states.float())
+        weight = self.fused_wkv_wgate.weight
+        if getattr(self.fused_wkv_wgate, KEEP_VLLM_LAYOUT_ATTR, False):
+            weight = weight.transpose(0, 1)
+        wkv_wgate = (
+            _fp32_linear_op(hidden_states, weight)
+            if hidden_states.device.type == "tpu"
+            else self.fused_wkv_wgate(hidden_states.float())
+        )
         if wkv_wgate.shape[0] != num_tokens:
             wkv_wgate = tp_all_gather(wkv_wgate, dim=0)
+        return wkv_wgate
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        pregathered_proj: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        num_tokens = positions.shape[0]
+        if not self.has_gate:
+            if pregathered_proj is not None:
+                return pregathered_proj
+            return self.project_wkv_wgate(hidden_states, num_tokens)
+
+        wkv_wgate = (
+            pregathered_proj
+            if pregathered_proj is not None
+            else self.project_wkv_wgate(hidden_states, num_tokens)
+        )
         assert self.state_cache is not None
         attn_ctx = get_forward_context().attn_metadata
         state_entry = getattr(self.state_cache, "kv_cache", None)
@@ -348,13 +392,18 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         object.__setattr__(
             self, "indexer_op_hm", self._build_indexer_op(use_step_meta=True)
         )
-        if envs.VLLM_DSV41_TP_INDEXER and get_tensor_model_parallel_world_size() > 1:
+        if get_tensor_model_parallel_world_size() > 1 and (
+            envs.VLLM_DSV41_TP_INDEXER or self.owns_k
+        ):
             self.register_buffer(
                 "_tp_rank_idx",
                 torch.tensor([get_tensor_model_parallel_rank()], dtype=torch.int64),
                 persistent=False,
             )
-            object.__setattr__(self, "indexer_op_tp", self._build_tp_indexer_op())
+            if envs.VLLM_DSV41_TP_INDEXER:
+                object.__setattr__(
+                    self, "indexer_op_tp", self._build_tp_indexer_op()
+                )
         if self.owns_k:
             object.__setattr__(self, "produce_k_op", self._get_produce_k_op())
         bs = int(
@@ -568,8 +617,24 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         attn_metadata = attn_ctx.get(self.k_cache.prefix)
         if attn_metadata is None:
             return
+        num_tokens = latent.shape[0]
+        tp_size = get_tensor_model_parallel_world_size()
+        rank_idx = getattr(self, "_tp_rank_idx", None)
+        if (
+            tp_size > 1
+            and rank_idx is not None
+            and num_tokens >= 64
+            and num_tokens % tp_size == 0
+        ):
+            tp_rank = get_tensor_model_parallel_rank()
+            latent_local = tp_shard_slice(latent, tp_size, tp_rank, rank_idx)
+            k_normed = tp_all_gather(
+                self.k_norm(self.wk(latent_local)[0]), dim=0
+            )
+        else:
+            k_normed = self.k_norm(self.wk(latent)[0])
         new_kv_cache = self.produce_k_op(
-            self.k_norm(self.wk(latent)[0]),
+            k_normed,
             rotary_emb.cos_sin_cache,
             positions.to(torch.int32),
             attn_metadata.block_tables.reshape(-1),
@@ -580,11 +645,11 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         kv_cache.copy_(new_kv_cache)
 
     def can_accept_prequant_query(self) -> bool:
-        w_s = self.wq_b._parameters.get("weight_scale", None)
+        w_s = getattr(self.wq_b, "weight_scale", None)
         return (
             w_s is not None
             and w_s.ndim == 1
-            and self.wq_b._parameters.get("bias", None) is None
+            and getattr(self.wq_b, "bias", None) is None
         )
 
     def _apply_wq_b(
@@ -727,4 +792,3 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
             n_tk = min(num_tokens, int(topk.shape[0]))
             self.topk_indices_buffer[:n_tk].copy_(topk[:n_tk])
         return topk
-

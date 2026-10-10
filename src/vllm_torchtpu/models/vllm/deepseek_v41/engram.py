@@ -1275,7 +1275,9 @@ class TpuParallelEngramEmbedding(nn.Module):
             s_u8 = torch.full((2, self.scale_dim), 127, dtype=torch.uint8, device="cpu")
             _CPU_ENGRAM_WEIGHTS[self.table_id] = (w_u8, s_u8)
 
-    def forward(self, packed: torch.Tensor | _EngramTableSlice) -> torch.Tensor:
+    def forward(
+        self, packed: torch.Tensor | _EngramTableSlice
+    ) -> torch.Tensor:
         """Dequantize 2D [T_pad, table_bytes] or 3D [T, n_hash_cols, packed_dim] FP8+E8M0 rows to BF16."""
         if isinstance(packed, _EngramTableSlice) or packed.ndim == 2:
             if isinstance(packed, _EngramTableSlice):
@@ -1284,16 +1286,16 @@ class TpuParallelEngramEmbedding(nn.Module):
             else:
                 table_2d = packed
                 t_local = table_2d.shape[0]
-            val_f32 = (
+            val_bf16 = (
                 table_2d[:, : self.val_bytes]
                 .view(torch.float8_e4m3fn)
-                .to(torch.float32)
+                .to(torch.bfloat16)
             )
             scl_bf16 = e8m0_to_fp32(
                 table_2d[:, self.val_bytes : self.val_bytes + self.scl_pad_bytes]
             ).to(torch.bfloat16)
             if t_local < table_2d.shape[0]:
-                val_f32 = val_f32[:t_local]
+                val_bf16 = val_bf16[:t_local]
                 scl_bf16 = scl_bf16[:t_local]
             expand_2d = _get_scale_expand_mat(
                 self.scl_pad_bytes,
@@ -1301,20 +1303,15 @@ class TpuParallelEngramEmbedding(nn.Module):
                 self.block_size,
                 table_2d.device,
             )
-            if table_2d.device.type == "cpu":
-                scales_f32 = torch.matmul(scl_bf16.float(), expand_2d.float())
-            else:
-                scales_f32 = torch.matmul(scl_bf16, expand_2d).to(torch.float32)
-            return (
-                (val_f32 * scales_f32)
-                .to(torch.bfloat16)
-                .view(t_local, self.n_hash_cols, self.dim)
+            scales_bf16 = torch.matmul(scl_bf16, expand_2d)
+            return (val_bf16 * scales_bf16).view(
+                t_local, self.n_hash_cols, self.dim
             )
 
         if packed.shape[1] != self.n_hash_cols:
             packed = packed[:, : self.n_hash_cols]
         values = packed[..., : self.dim].view(torch.float8_e4m3fn)
-        scales_f32 = e8m0_to_fp32(packed[..., self.dim :])
+        scales_bf16 = e8m0_to_fp32(packed[..., self.dim :]).to(torch.bfloat16)
         if packed.device.type != "cpu":
             expand_3d = _get_scale_expand_mat(
                 self.scale_dim,
@@ -1322,20 +1319,14 @@ class TpuParallelEngramEmbedding(nn.Module):
                 self.block_size,
                 packed.device,
             )
-            scales_expanded = torch.matmul(scales_f32.to(torch.bfloat16), expand_3d).to(
-                torch.float32
-            )
-            return (values.to(torch.float32) * scales_expanded).to(torch.bfloat16)
+            scales_expanded = torch.matmul(scales_bf16, expand_3d)
+            return values.to(torch.bfloat16) * scales_expanded
         return (
-            (
-                values.to(torch.float32).unflatten(
-                    -1, (self.scale_dim, self.block_size)
-                )
-                * scales_f32.unsqueeze(-1)
+            values.to(torch.bfloat16).unflatten(
+                -1, (self.scale_dim, self.block_size)
             )
-            .flatten(-2)
-            .to(torch.bfloat16)
-        )
+            * scales_bf16.unsqueeze(-1)
+        ).flatten(-2)
 
 
 class TpuEngram(nn.Module):
