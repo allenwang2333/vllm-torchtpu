@@ -1319,7 +1319,7 @@ class DeepseekV41Model(nn.Module):
             ["hidden_states", "pre_mix"], config.hidden_size
         )
 
-        self._single_backbone_cond = bool(envs.VLLM_DSV41_SINGLE_BACKBONE_COND)
+        self._single_backbone_cond = bool(envs.VLLM_DSV41_SINGLE_BACKBONE_COND) and not pure_20l
         self.full_stage: nn.Module | None
         if self._single_backbone_cond:
             from vllm_torchtpu.models.vllm.deepseek_v41.cond_backbone import (
