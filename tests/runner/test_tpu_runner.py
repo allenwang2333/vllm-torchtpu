@@ -58,6 +58,11 @@ from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 
+try:
+    torch.device("tpu")
+except RuntimeError:
+    torch.utils.rename_privateuse1_backend("tpu")
+
 
 def test_idle_dp_rank_encodes_before_decoder_pairing():
     order = []
@@ -795,6 +800,7 @@ class TestTPURunner:
                 side_effect=lambda: contextlib.nullcontext(),
             ),
             patch("vllm_torchtpu.runner.tpu_runner._validate_libtpu_version"),
+            patch("vllm_torchtpu.runner.tpu_runner.RunnerStageTiming"),
             patch.object(
                 TPUModelRunner, "_create_mesh_for_parallelism", return_value=MagicMock()
             ),

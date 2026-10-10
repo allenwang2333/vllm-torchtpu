@@ -72,7 +72,7 @@ class TPUMeanPool(SequencePoolingMethod):
         if not pooling_cursor.is_partial_prefill():
             prompt_lens_cpu = pooling_cursor.prompt_lens_cpu
             num_seqs = prompt_lens_cpu.numel()
-            hidden_size = hidden_states.shape[-1]
+            num_tokens, hidden_size = hidden_states.shape
 
             if num_seqs == 0:
                 return hidden_states.new_empty((0, hidden_size), dtype=torch.float32)
@@ -98,8 +98,8 @@ class TPUMeanPool(SequencePoolingMethod):
             bytes_per_token = hidden_size * torch.finfo(torch.float32).bits // 8
             chunk_size = max(1, _MEAN_POOL_ACCUMULATION_CHUNK_BYTES // bytes_per_token)
 
-            for start in range(0, hidden_states.shape[0], chunk_size):
-                end = min(start + chunk_size, hidden_states.shape[0])
+            for start in range(0, num_tokens, chunk_size):
+                end = min(start + chunk_size, num_tokens)
                 chunk = hidden_states[start:end]
                 if chunk.dtype != torch.float32:
                     chunk = chunk.to(dtype=torch.float32)
@@ -222,6 +222,19 @@ def _install_tpu_pooling_patches_locked() -> None:
     PoolingMetadata._get_prompt_token_ids = safe_get_prompt_token_ids
 
 
+def _extract_prompt_len(r) -> int:
+    val = getattr(r, "prompt_token_ids_len", None)
+    if isinstance(val, int):
+        return val
+    val = getattr(r, "num_prompt_tokens", None)
+    if isinstance(val, int):
+        return val
+    p_tokens = getattr(r, "prompt_token_ids", None)
+    if p_tokens is not None and hasattr(p_tokens, "__len__"):
+        return len(p_tokens)
+    return 0
+
+
 def build_pooling_metadata(
     batch, runner_requests: dict | None = None
 ) -> PoolingMetadata:
@@ -247,18 +260,6 @@ def build_pooling_metadata(
             if hasattr(r, "pooling_states"):
                 r.pooling_states = p_state
         pooling_states.append(p_state)
-
-    def _extract_prompt_len(r):
-        val = getattr(r, "prompt_token_ids_len", None)
-        if isinstance(val, int):
-            return val
-        val = getattr(r, "num_prompt_tokens", None)
-        if isinstance(val, int):
-            return val
-        p_tokens = getattr(r, "prompt_token_ids", None)
-        if p_tokens is not None and hasattr(p_tokens, "__len__"):
-            return len(p_tokens)
-        return 0
 
     prompt_lens = torch.tensor(
         [_extract_prompt_len(r) for r in reqs], dtype=torch.int32

@@ -1201,9 +1201,15 @@ class Eagle3Proposer:
             # Per-chunk rejected count padded to kernel_num_reqs so the loop's
             # seq_lens subtraction is full-length (constant) — no per-num_reqs
             # recompile. Sync pads on the host (free, reused across the K-1 loop
-            # steps); async pads the device tensor.
+            # steps); async pads the device tensor. Loop-step query_start_loc
+            # and request_distribution also depend only on num_reqs (not the
+            # step), so build them in the same per-chunk pass instead of
+            # iterating chunks twice or rebuilding on every one of the K-1 steps.
             rejected_dev_per_chunk = []
+            loop_qsl_per_chunk = []
+            loop_reqdist_per_chunk = []
             for c, nr in zip(chunks, rejected_per_chunk):
+                c_num_reqs = c.num_reqs
                 knr = (
                     runner.num_reqs_max_model_len
                     if c.attn_ctx.use_max_model_len
@@ -1216,29 +1222,17 @@ class Eagle3Proposer:
                     )
                 elif nr is not None and np.any(nr):
                     padded_nr = np.zeros(knr, dtype=np.int32)
-                    padded_nr[: c.num_reqs] = nr.astype(np.int32, copy=False)
+                    padded_nr[:c_num_reqs] = nr.astype(np.int32, copy=False)
                     rejected_dev_per_chunk.append(
                         torch.from_numpy(padded_nr).to(runner.device)
                     )
                 else:
                     rejected_dev_per_chunk.append(None)
-            # Loop-step query_start_loc and request_distribution depend only on
-            # num_reqs (not the step), so build them once per chunk instead of
-            # rebuilding (with an H2D) on every one of the K-1 steps.
-            loop_qsl_per_chunk = []
-            loop_reqdist_per_chunk = []
-            for c in chunks:
-                knr = (
-                    runner.num_reqs_max_model_len
-                    if c.attn_ctx.use_max_model_len
-                    else runner.num_reqs_most_model_len
-                )
-                assert knr is not None
-                qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), c.num_reqs)
+                qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), c_num_reqs)
                 loop_qsl_per_chunk.append(torch.from_numpy(qsl_np).to(runner.device))
                 loop_reqdist_per_chunk.append(
                     torch.tensor(
-                        [c.num_reqs] * 3, dtype=torch.int32, device=runner.device
+                        [c_num_reqs] * 3, dtype=torch.int32, device=runner.device
                     )
                 )
 

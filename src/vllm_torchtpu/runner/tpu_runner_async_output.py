@@ -36,7 +36,7 @@ def parse_sampled_token_ids_cpu(
     return rows, [len(row) for row in rows]
 
 
-@dataclass
+@dataclass(slots=True)
 class SpecLogprobsChunk:
     """One chunk's logprobs in a spec-decode step, one row per logits row.
 
@@ -89,7 +89,7 @@ def spec_logprobs_lists(
     )
 
 
-@dataclass
+@dataclass(slots=True)
 class AsyncTPUCopyState:
     """Async D2H copy state for sampled tokens.
 
@@ -212,7 +212,7 @@ class AsyncTPUCopyState:
         return rows, gen_lens
 
 
-@dataclass
+@dataclass(slots=True)
 class AsyncPreResults:
     req_ids: list[str]
     next_tokens_tpu: torch.Tensor

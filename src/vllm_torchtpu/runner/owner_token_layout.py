@@ -30,7 +30,7 @@ import torch
 from vllm_torchtpu import envs
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class OwnerTokenLayout:
     """Owner-major order of one step's tokens.
 
@@ -301,15 +301,12 @@ def extract_request_owners_from_block_table(
     tables = tuple(_to_2d_numpy(t) for t in raw_tables)
     if not tables:
         raise ValueError("Expected at least one block table")
-    total_reqs = tables[0].shape[0] - start_index if num_reqs is None else int(num_reqs)
-    if (
-        total_reqs < 0
-        or start_index < 0
-        or start_index + total_reqs > tables[0].shape[0]
-    ):
+    num_table_rows = tables[0].shape[0]
+    total_reqs = num_table_rows - start_index if num_reqs is None else int(num_reqs)
+    if total_reqs < 0 or start_index < 0 or start_index + total_reqs > num_table_rows:
         raise ValueError(
             f"Invalid request slice [{start_index}, {start_index + total_reqs}) "
-            f"for block table with {tables[0].shape[0]} rows"
+            f"for block table with {num_table_rows} rows"
         )
     limits = (
         None if blocks_per_req is None else np.asarray(blocks_per_req, dtype=np.int64)

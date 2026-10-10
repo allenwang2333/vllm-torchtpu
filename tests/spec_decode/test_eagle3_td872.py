@@ -976,3 +976,468 @@ def test_dummy_draft_eagle3_plain_combine(monkeypatch):
     proposer._draft_propose_token = lambda h: torch.zeros(h.shape[0], dtype=torch.int32)
     proposer.run_dp_dummy_draft(2)
     assert draft.combined == [(8, HID), (8, HID)]
+
+
+# --------------------------------------------------------------------------
+# TD8.105: Full 100% statement & branch coverage for eagle3.py
+# --------------------------------------------------------------------------
+
+
+def test_static_shape_args_unmarks_dynamo_dynamic_indices():
+    @e3._static_shape_args
+    def fn(a, b, *, c=None, d=None):
+        return a, b, c, d
+
+    t_marked = torch.tensor([1, 2, 3])
+    t_marked._dynamo_dynamic_indices = {0}
+    t_plain = torch.tensor([4, 5])
+    kw_marked = torch.tensor([6, 7])
+    kw_marked._dynamo_dynamic_indices = {0}
+    ra, rb, rc, rd = fn(t_marked, t_plain, c=kw_marked, d="not_a_tensor")
+    assert ra is not t_marked and torch.equal(ra, t_marked)
+    assert getattr(ra, "_dynamo_dynamic_indices", None) is None
+    assert rb is t_plain
+    assert rc is not kw_marked and torch.equal(rc, kw_marked)
+    assert rd == "not_a_tensor"
+
+
+def test_collect_topk_indices_buffers_deduplicates():
+    buf1 = torch.zeros(4, 2, dtype=torch.int32)
+    buf2 = torch.zeros(4, 2, dtype=torch.int32)
+    l0 = SimpleNamespace(
+        mtp_block=SimpleNamespace(
+            self_attn=SimpleNamespace(
+                mla_attn=SimpleNamespace(topk_indices_buffer=buf1)
+            )
+        )
+    )
+    l1 = SimpleNamespace(
+        mtp_block=SimpleNamespace(
+            self_attn=SimpleNamespace(
+                mla_attn=SimpleNamespace(topk_indices_buffer=buf1)
+            )
+        )
+    )
+    l2 = SimpleNamespace(
+        mtp_block=SimpleNamespace(
+            self_attn=SimpleNamespace(
+                mla_attn=SimpleNamespace(topk_indices_buffer=buf2)
+            )
+        )
+    )
+    l3 = SimpleNamespace(
+        mtp_block=SimpleNamespace(
+            self_attn=SimpleNamespace(
+                mla_attn=SimpleNamespace(topk_indices_buffer=None)
+            )
+        )
+    )
+    mtp_model = SimpleNamespace(layers={"0": l0, "1": l1, "2": l2, "3": l3})
+    res = e3._collect_topk_indices_buffers(mtp_model)
+    assert len(res) == 2 and res[0] is buf1 and res[1] is buf2
+
+
+def test_proposer_init_default_and_invalid_draft_tp():
+    p = _proposer("eagle3", draft_tp=None, target_tp=4)
+    assert p.speculative_config.draft_tensor_parallel_size == 4
+    assert p._draft_replicated is False
+    assert p._draft_tp_matches_target is True
+    with pytest.raises(ValueError, match="unsupported on TPU"):
+        _proposer("eagle3", draft_tp=2, target_tp=4)
+
+
+def test_validate_mtp_layer_count_multi_layer(monkeypatch):
+    p = _proposer("mtp")
+    p.draft_model = SimpleNamespace(model=SimpleNamespace(num_mtp_layers=2))
+    monkeypatch.setattr(e3, "iter_mtp_shared_heads", lambda _m: iter([]))
+    p._validate_mtp_layer_count()
+    monkeypatch.setattr(e3, "iter_mtp_shared_heads", lambda _m: iter(["h0", "h1"]))
+    with pytest.raises(NotImplementedError, match="num_nextn_predict_layers=2"):
+        p._validate_mtp_layer_count()
+
+
+def test_init_mtp_index_sharing_disabled_and_buffer_sizing():
+    p = _proposer("mtp")
+    p.speculative_config.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(index_share_for_mtp_iteration=False)
+    )
+    p._init_mtp_index_sharing()
+    assert p._share_mtp_indices is False
+
+    small_buf = torch.zeros((2, 4), dtype=torch.int32)
+    l0 = SimpleNamespace(
+        mtp_block=SimpleNamespace(
+            self_attn=SimpleNamespace(
+                mla_attn=SimpleNamespace(topk_indices_buffer=small_buf)
+            )
+        )
+    )
+    p2 = _index_share_proposer(
+        SimpleNamespace(set_skip_topk=lambda _s: None, layers={"0": l0})
+    )
+    p2.vllm_config.scheduler_config = SimpleNamespace(max_num_batched_tokens=2)
+    with pytest.raises(RuntimeError, match="topk_indices_buffer holds 2 rows"):
+        p2._init_mtp_index_sharing()
+
+    good_buf = torch.zeros((8, 4), dtype=torch.int32)
+    l1 = SimpleNamespace(
+        mtp_block=SimpleNamespace(
+            self_attn=SimpleNamespace(
+                mla_attn=SimpleNamespace(topk_indices_buffer=good_buf)
+            )
+        )
+    )
+    p3 = _index_share_proposer(
+        SimpleNamespace(set_skip_topk=lambda _s: None, layers={"0": l1})
+    )
+    p3._init_mtp_index_sharing()
+    assert p3._share_mtp_indices is True
+    assert torch.all(good_buf == -1)
+
+
+def test_build_mtp_loop_model_and_step_helpers(monkeypatch):
+    import vllm_torchtpu.spec_decode.mtp_loop_model as mlm
+
+    _null_contexts(monkeypatch)
+    p = _proposer("mtp")
+    p._share_mtp_indices = True
+    p._mtp_topk_buffers = [torch.zeros((4, 2), dtype=torch.int32)]
+    p.draft_model = SimpleNamespace(_dynamic_arg_dims={"bad": 99})
+    p._build_mtp_loop_model()
+    assert p._share_mtp_indices is False
+    assert p._mtp_topk_buffers == []
+    assert p._mtp_loop_model is None
+
+    monkeypatch.setattr(mlm, "MtpLoopStepModel", lambda **kw: ("loop_prog", kw))
+    for dims in (None, dict(mlm.MTP_DYNAMIC_ARG_DIMS)):
+        p._share_mtp_indices = True
+        p._mtp_topk_buffers = [torch.zeros((4, 2), dtype=torch.int32)]
+        p.draft_model = SimpleNamespace(
+            _dynamic_arg_dims=dims,
+            model=SimpleNamespace(set_skip_topk=lambda s: None),
+        )
+        p._build_mtp_loop_model()
+        assert p._mtp_loop_model[0] == "loop_prog"
+        assert p._mtp_loop_model_warm is False
+
+    skips = []
+    compacted = []
+    buf = torch.arange(8, dtype=torch.int32).view(4, 2)
+    p._mtp_topk_buffers = [buf]
+    p.draft_model = SimpleNamespace(
+        model=SimpleNamespace(
+            set_skip_topk=skips.append,
+            compact_topk_indices=lambda g: compacted.append(g.tolist()),
+        )
+    )
+    assert p._draft_model_for_step(0) is p.draft_model
+    assert p._draft_model_for_step(1) == p._mtp_loop_model
+    assert skips == [False, True]
+    p._share_mtp_indices = False
+    p._mtp_set_skip_topk(True)
+    assert skips == [False, True]
+    p._share_mtp_indices = True
+    saved = p._mtp_compact_and_save(torch.tensor([0, 2]))
+    assert compacted == [[0, 2]]
+    assert saved[0].tolist() == [[0, 1], [2, 3]]
+    buf.zero_()
+    p._mtp_restore_topk([torch.tensor([[9, 8], [7, 6]], dtype=torch.int32)])
+    assert buf[:2].tolist() == [[9, 8], [7, 6]]
+
+
+def test_validate_and_setup_gemma4_kv_sharing_branches(monkeypatch):
+    p = _proposer("mtp")
+    monkeypatch.setitem(vars(envs), "VLLM_TPU_BLOCK_MAJOR_KV", True)
+    with pytest.raises(NotImplementedError, match="VLLM_TPU_BLOCK_MAJOR_KV"):
+        p._validate_kv_sharing_supported()
+
+    monkeypatch.setitem(vars(envs), "VLLM_TPU_BLOCK_MAJOR_KV", False)
+    monkeypatch.setattr(
+        e3.PcpStaticSupportValidator,
+        "from_vllm_config",
+        classmethod(lambda cls, _cfg: SimpleNamespace(enabled=True)),
+    )
+    with pytest.raises(NotImplementedError, match="PCP streaming attention"):
+        p._validate_kv_sharing_supported()
+
+    monkeypatch.setattr(
+        e3.PcpStaticSupportValidator,
+        "from_vllm_config",
+        classmethod(lambda cls, _cfg: SimpleNamespace(enabled=False)),
+    )
+    p._validate_kv_sharing_supported()
+
+    p.draft_model = SimpleNamespace()
+    p._setup_gemma4_kv_sharing("target", set())
+    assert p._draft_kv_shared is False
+
+    p.draft_model = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(self_attn=SimpleNamespace(is_kv_shared_layer=False))
+            ]
+        )
+    )
+    p._setup_gemma4_kv_sharing("target", set())
+    assert p._draft_kv_shared is False
+
+    target = SimpleNamespace(
+        config=SimpleNamespace(
+            get_text_config=lambda: SimpleNamespace(layer_types=["full_attention"])
+        )
+    )
+    p.draft_model = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    self_attn=SimpleNamespace(is_kv_shared_layer=True, attn=None)
+                )
+            ]
+        ),
+        config=SimpleNamespace(
+            get_text_config=lambda: SimpleNamespace(layer_types=["full_attention"])
+        ),
+    )
+    with pytest.raises(RuntimeError, match="exposes no self_attn.attn"):
+        p._setup_gemma4_kv_sharing(
+            target, {"language_model.model.layers.0.self_attn.attn"}
+        )
+
+    p.draft_model = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    self_attn=SimpleNamespace(
+                        is_kv_shared_layer=True,
+                        attn=SimpleNamespace(impl=SimpleNamespace()),
+                    )
+                )
+            ]
+        ),
+        config=SimpleNamespace(
+            get_text_config=lambda: SimpleNamespace(layer_types=["sliding_attention"])
+        ),
+    )
+    with pytest.raises(
+        RuntimeError, match="No target layer of type 'sliding_attention'"
+    ):
+        p._setup_gemma4_kv_sharing(
+            target, {"language_model.model.layers.0.self_attn.attn"}
+        )
+
+    p.draft_model = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    self_attn=SimpleNamespace(
+                        is_kv_shared_layer=True,
+                        attn=SimpleNamespace(impl=None),
+                    )
+                )
+            ]
+        ),
+        config=SimpleNamespace(
+            get_text_config=lambda: SimpleNamespace(layer_types=["full_attention"])
+        ),
+    )
+    with pytest.raises(RuntimeError, match="has no `impl`"):
+        p._setup_gemma4_kv_sharing(
+            target, {"language_model.model.layers.0.self_attn.attn"}
+        )
+
+
+def test_load_draft_model_and_pcp_dsa_validators(monkeypatch):
+    _null_contexts(monkeypatch)
+    loaded = []
+    monkeypatch.setattr(
+        e3,
+        "get_model_loader",
+        lambda _cfg: SimpleNamespace(
+            load_model=lambda **kw: (loaded.append(kw), "loaded_draft")[1]
+        ),
+    )
+    monkeypatch.setattr(e3, "_force_draft_tp1", contextlib.nullcontext)
+    for draft_tp, target_tp in ((1, 1), (2, 2)):
+        p = _proposer("eagle3", draft_tp=draft_tp, target_tp=target_tp)
+        p.vllm_config.load_config = "load_cfg"
+        p.vllm_config.compilation_config = SimpleNamespace(inductor_compile_config={})
+        p.speculative_config.draft_model_config = SimpleNamespace(runner_type="other")
+        p._load_draft_model()
+        assert p.draft_model == "loaded_draft"
+        assert (
+            p.draft_vllm_config.compilation_config.inductor_compile_config[
+                "_vllm_model_tag"
+            ]
+            == "eagle_head"
+        )
+        assert loaded[-1]["model_config"].runner_type == "draft"
+
+    # _validate_pcp_draft_model
+    p_pcp = _proposer("mtp")
+    full_spec = e3.FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.bfloat16
+    )
+    p_pcp.runner.get_kv_cache_spec = lambda: {"d.0": full_spec}
+    p_pcp._validate_pcp_draft_model({"d.0"})
+    p_pcp.runner.get_kv_cache_spec = lambda: {"d.0": "not_full_spec"}
+    with pytest.raises(NotImplementedError, match="requires FullAttentionSpec"):
+        p_pcp._validate_pcp_draft_model({"d.0"})
+
+    # _split_dsa_draft_layers and _validate_dsa_draft
+    class FakeMLA:
+        pass
+
+    class FakeIndexer:
+        pass
+
+    fake_mla_mod = types.ModuleType(
+        "vllm.model_executor.layers.attention.mla_attention"
+    )
+    fake_mla_mod.MLAAttention = FakeMLA
+    fake_ds_mod = types.ModuleType("vllm.model_executor.models.deepseek_v2")
+    fake_ds_mod.DeepseekV32IndexerCache = FakeIndexer
+    monkeypatch.setitem(
+        sys.modules, "vllm.model_executor.layers.attention.mla_attention", fake_mla_mod
+    )
+    monkeypatch.setitem(
+        sys.modules, "vllm.model_executor.models.deepseek_v2", fake_ds_mod
+    )
+
+    # No indexer -> returns early
+    p_dsa = _proposer("mtp", draft_tp=2, target_tp=2)
+    p_dsa._validate_dsa_draft({"d.mla": FakeMLA()}, {"d.mla"})
+
+    # Indexer without MLA -> raises RuntimeError
+    with pytest.raises(RuntimeError, match="no MLA attention layer"):
+        p_dsa._validate_dsa_draft({"d.idx": FakeIndexer()}, {"d.idx"})
+
+    # Replicated DSA draft when target_tp > 1 -> raises NotImplementedError
+    p_rep = _proposer("mtp", draft_tp=1, target_tp=2)
+    with pytest.raises(NotImplementedError, match="cannot run replicated"):
+        p_rep._validate_dsa_draft(
+            {"d.idx": FakeIndexer(), "d.mla": FakeMLA()}, {"d.idx", "d.mla"}
+        )
+
+    # Unregistered KV cache spec -> raises RuntimeError
+    p_dsa.runner.get_kv_cache_spec = lambda: {"d.mla": full_spec}
+    with pytest.raises(RuntimeError, match="got no KVCacheSpec"):
+        p_dsa._validate_dsa_draft(
+            {"d.idx": FakeIndexer(), "d.mla": FakeMLA()}, {"d.idx", "d.mla"}
+        )
+
+    # All registered -> succeeds
+    p_dsa.runner.get_kv_cache_spec = lambda: {"d.mla": full_spec, "d.idx": full_spec}
+    p_dsa._validate_dsa_draft(
+        {"d.idx": FakeIndexer(), "d.mla": FakeMLA()}, {"d.idx", "d.mla"}
+    )
+
+
+def test_propose_zero_reqs_and_index_share_and_forward_loop_model(monkeypatch):
+    _null_contexts(monkeypatch)
+    p = _proposer("mtp")
+    p.runner.input_batch.num_reqs = 0
+    assert p.propose(None, [], None, None) == []
+
+    # propose with _share_mtp_indices=True
+    proposer, _ = _propose_harness(
+        "mtp", K=2, sizes=(2,), uses_aux=False, rejected=lambda nr: None
+    )
+    proposer._share_mtp_indices = True
+    compacted = []
+    restored = []
+    proposer._mtp_compact_and_save = lambda idx: (
+        compacted.append(idx.tolist()),
+        ["saved_rows"],
+    )[1]
+    proposer._mtp_restore_topk = restored.append
+    out = proposer.propose([[0]] * 2, [], None, None)
+    assert out == _expected((2,), 2)
+    assert len(compacted) == 1
+    assert restored == [["saved_rows"]]
+
+    # _forward_draft with method="mtp" and _mtp_loop_model warm-up
+    p_fwd = _proposer("mtp")
+    p_fwd._build_draft_attn_metadata = lambda **_k: {}
+    loop_calls = []
+
+    def loop_model(**kw):
+        loop_calls.append(kw)
+        return kw["hidden_states"] + 1
+
+    p_fwd.draft_model = SimpleNamespace(
+        model=SimpleNamespace(set_skip_topk=lambda _s: None)
+    )
+    p_fwd._mtp_loop_model = loop_model
+    p_fwd._mtp_loop_model_warm = False
+    last, carry = p_fwd._forward_draft(
+        chunk=None,
+        input_ids=torch.zeros(2),
+        positions=torch.zeros(2),
+        target_hidden_states=torch.ones(2, 3),
+        step_idx=1,
+        seq_lens_delta=1,
+        num_rejected_np=None,
+    )
+    assert len(loop_calls) == 2  # first warms, second runs
+    assert loop_calls[0]["spec_step_idx"] == 1
+    assert p_fwd._mtp_loop_model_warm is True
+    torch.testing.assert_close(last, torch.full((2, 3), 2.0))
+    assert carry is last
+
+    # Second call when already warm runs once
+    loop_calls.clear()
+    p_fwd._forward_draft(
+        chunk=None,
+        input_ids=torch.zeros(2),
+        positions=torch.zeros(2),
+        target_hidden_states=torch.ones(2, 3),
+        step_idx=1,
+        seq_lens_delta=1,
+        num_rejected_np=None,
+    )
+    assert len(loop_calls) == 1
+
+
+def test_draft_has_moe_and_dummy_draft_aux_and_mtp(monkeypatch):
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda *a: None)
+    p = _proposer("eagle3")
+    assert p._draft_has_moe() is False  # draft_model is None -> False (not cached)
+
+    import vllm.model_executor.models.interfaces as interfaces
+
+    monkeypatch.setattr(interfaces, "is_mixture_of_experts", lambda _m: True)
+    p.draft_model = SimpleNamespace()
+    assert p._draft_has_moe() is True
+    assert p._draft_has_moe() is True  # second call hits _draft_has_moe_cache
+
+    # run_dp_dummy_draft with uses_aux=True
+    p_aux = _proposer("eagle3", draft_tp=2, target_tp=2, K=2)
+    p_aux.runner._dp_lockstep_enabled = lambda: True
+    p_aux.runner._dp_target_bucket = 8
+    draft_aux = _Draft(uses_aux=True)
+    draft_aux.model.fc_input_size = 3 * HID
+    draft_aux.config = SimpleNamespace(hidden_size=HID)
+    p_aux.draft_model = draft_aux
+    _eager(p_aux)
+    p_aux._forward_draft = lambda **kw: (
+        torch.zeros(kw["num_tokens_padded"], HID),
+        None,
+    )
+    p_aux._draft_propose_token = lambda h: torch.zeros(h.shape[0], dtype=torch.int32)
+    p_aux.run_dp_dummy_draft(1)
+    assert draft_aux.combined == [(8, 3 * HID)]
+
+    # run_dp_dummy_draft with method="mtp" (neither uses_aux nor combines_plain) +
+    # uses_mrope=True
+    p_mtp = _proposer("mtp", draft_tp=2, target_tp=2, K=2, uses_mrope=True)
+    p_mtp.runner._dp_lockstep_enabled = lambda: True
+    p_mtp.runner._dp_target_bucket = 8
+    p_mtp.draft_model = SimpleNamespace(config=SimpleNamespace(hidden_size=HID))
+    fwd_shapes = []
+    p_mtp._forward_draft = lambda **kw: (
+        fwd_shapes.append(tuple(kw["positions"].shape)),
+        (torch.zeros(kw["num_tokens_padded"], HID), None),
+    )[1]
+    p_mtp._draft_propose_token = lambda h: torch.zeros(h.shape[0], dtype=torch.int32)
+    p_mtp.run_dp_dummy_draft(1)
+    assert fwd_shapes == [(3, 8), (3, 4)]

@@ -5183,8 +5183,6 @@ class TPUModelRunner(GPUModelRunner):
             final_output = async_output.get_output()
             if not self.is_pooling_model:
                 for i, req_state, seq_len, req_id in request_seq_lens:
-                    if i in discard_sampled_tokens_req_indices:
-                        continue
                     valid_tokens = final_output.sampled_token_ids[i]
                     if not valid_tokens:
                         continue
@@ -7143,7 +7141,10 @@ class TPUModelRunner(GPUModelRunner):
         kwargs = {}
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
-        if self._is_deepseek_v41 and self.lookback_token_ids is not None:
+        if (
+            getattr(self, "_is_deepseek_v41", False) is True
+            and getattr(self, "lookback_token_ids", None) is not None
+        ):
             # Request-sized history retains its fixed shape across token buckets.
             kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(
                 self.input_batch.num_reqs
