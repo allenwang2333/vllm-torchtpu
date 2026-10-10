@@ -624,7 +624,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 )
             qw_cpu_list, qs_cpu_list = [], []
             for s in range(0, n_exp, 6):
-                w_sub = w_pad[s : s + 32].to(device)
+                w_sub = w_pad[s : s + 6].to(device)
                 qw, qs = quantize_native_fp4_kmajor(
                     w_sub, block=blk, pack=pack
                 )
