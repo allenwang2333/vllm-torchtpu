@@ -235,6 +235,11 @@ def _attention_csa(
     if two_caches_same_buffer:
         main_cache_kv = updated_sw_cache
 
+    # First use of the top-k after the SWA pass: the indexer's SparseCore
+    # top-k then completes behind the q projection and SWA, which do not need
+    # it, instead of stalling the TensorCore before them.
+    extra, swa_output = jax.lax.optimization_barrier((extra, swa_output))
+
     output = sparse_ragged_paged_attention(
         q=q,
         cache_kv_nope=main_cache_kv,
