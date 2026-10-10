@@ -671,9 +671,13 @@ def prebuild_fused_moe_ep(
             _SMEM_OVERHEAD_BYTES,
         )
         return None
+    _param_dev = next(
+        (p.device for p in layer.parameters() if p.device.type != "meta"),
+        torch.device("tpu"),
+    )
     global _RANK_BUFFER
     _RANK_BUFFER = torch.tensor(
-        [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
+        [[ep_mesh_index()]], dtype=torch.int32, device=_param_dev
     )
     mesh_expert_order = _mesh_expert_order(ep)
 
