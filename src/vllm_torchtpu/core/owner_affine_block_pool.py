@@ -299,12 +299,13 @@ class RegionFreeQueue(FreeKVCacheBlockQueue):
     ) -> None:
         super().__init__([])
         self.layout = layout
+        self._num_owners = layout.num_owners
         self.queues = [FreeKVCacheBlockQueue(blocks) for blocks in region_blocks]
         self.num_free_blocks = sum(len(blocks) for blocks in region_blocks)
 
     def scoped_region(self) -> int | None:
         if _IN_REPLICATED.get():
-            return self.layout.num_owners
+            return self._num_owners
         return _CURRENT_OWNER.get()
 
     def scoped_queue(self) -> FreeKVCacheBlockQueue:
@@ -319,9 +320,15 @@ class RegionFreeQueue(FreeKVCacheBlockQueue):
 
     def _by_region(self, blocks: list[KVCacheBlock]) -> dict[int, list[KVCacheBlock]]:
         # Group before touching any queue, so that a bad id changes nothing.
+        region_of = self.layout.region_of
         groups: dict[int, list[KVCacheBlock]] = {}
         for block in blocks:
-            groups.setdefault(self.layout.region_of(block.block_id), []).append(block)
+            region = region_of(block.block_id)
+            group = groups.get(region)
+            if group is None:
+                groups[region] = [block]
+            else:
+                group.append(block)
         return groups
 
     def popleft(self) -> KVCacheBlock:
@@ -391,6 +398,7 @@ class OwnerAffineBlockPool(BlockPool):
         self.layout = layout
         self.region_free_queue = RegionFreeQueue(layout, regions)
         self.free_block_queue = self.region_free_queue
+        self._all_owners = tuple(range(layout.num_owners))
         self._owner_queues = tuple(self.region_free_queue.queues[: layout.num_owners])
         self._replicated_queue = self.region_free_queue.queues[layout.num_owners]
         # Replicated-group blocks counted by the admission check in progress.
@@ -427,10 +435,12 @@ class OwnerAffineBlockPool(BlockPool):
             )
 
     def get_num_free_blocks(self) -> int:
-        region = self.region_free_queue.scoped_region()
-        if region is None:
+        if _IN_REPLICATED.get():
+            return self._replicated_queue.num_free_blocks
+        owner = _CURRENT_OWNER.get()
+        if owner is None:
             return self.region_free_queue.num_free_blocks
-        return self.region_free_queue.queues[region].num_free_blocks
+        return self._owner_queues[owner].num_free_blocks
 
     def get_usage(self) -> float:
         # The total over all regions: the base version would report one
@@ -447,6 +457,30 @@ class OwnerAffineBlockPool(BlockPool):
     def owner_of(self, request_id: str) -> int | None:
         return self._request_owner.get(request_id)
 
+    def best_owner_candidate(self) -> int | None:
+        """Single best candidate owner for a new request, or ``None`` if every
+        owner's step token budget is exhausted."""
+        req_counts = self._owner_num_requests
+        owner_queues = self._owner_queues
+        budget = self._step_owner_budget
+        best_owner: int | None = None
+        best_reqs = 0
+        best_free = -1
+        for o in self._all_owners:
+            if budget is not None and budget[o] <= 0:
+                continue
+            reqs = req_counts[o]
+            free = owner_queues[o].num_free_blocks
+            if (
+                best_owner is None
+                or reqs < best_reqs
+                or (reqs == best_reqs and free > best_free)
+            ):
+                best_owner = o
+                best_reqs = reqs
+                best_free = free
+        return best_owner
+
     def owner_candidates(self) -> list[int]:
         """Owners to try for a new request, best first.
 
@@ -458,13 +492,13 @@ class OwnerAffineBlockPool(BlockPool):
         owner_queues = self._owner_queues
         budget = self._step_owner_budget
         owners = (
-            range(self.layout.num_owners)
+            self._all_owners
             if budget is None
-            else (o for o in range(self.layout.num_owners) if budget[o] > 0)
+            else [o for o in self._all_owners if budget[o] > 0]
         )
         return sorted(
             owners,
-            key=lambda o: (req_counts[o], -owner_queues[o].num_free_blocks, o),
+            key=lambda o: (req_counts[o], -owner_queues[o].num_free_blocks),
         )
 
     def bind(self, request_id: str, owner: int) -> None:
@@ -511,8 +545,11 @@ def validate_config(vllm_config: VllmConfig) -> None:
 def _in_replicated_scope(method: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(method)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        with replicated_scope():
+        token = _IN_REPLICATED.set(True)
+        try:
             return method(*args, **kwargs)
+        finally:
+            _IN_REPLICATED.reset(token)
 
     return wrapper
 
@@ -660,19 +697,17 @@ def _steer_preemption(scheduler: Any) -> None:
         def budgeted_reserve_prefill_lookahead(
             request: Request, num_computed_tokens: int, num_new_tokens: int
         ) -> int:
-            owner = pool.owner_of(request.request_id)
+            owner = pool._request_owner.get(request.request_id)
             if owner is not None:
                 owner_budget = pool.step_owner_budget(owner)
             else:
-                candidates = pool.owner_candidates()
-                owner_budget = (
-                    pool.step_owner_budget(candidates[0]) if candidates else 0
-                )
+                best = pool.best_owner_candidate()
+                owner_budget = pool.step_owner_budget(best) if best is not None else 0
             if owner_budget is not None and num_new_tokens > owner_budget:
                 if (
-                    request not in scheduler.running
+                    num_new_tokens > 1
                     and request.num_tokens - num_computed_tokens == 1
-                    and num_new_tokens > 1
+                    and request not in scheduler.running
                 ):
                     return 0
                 num_new_tokens = max(0, owner_budget)
@@ -747,46 +782,69 @@ def install() -> None:
     @functools.wraps(orig_allocate_slots)
     def allocate_slots(self, request, *args, **kwargs):
         pool = self.block_pool
-        if not isinstance(pool, OwnerAffineBlockPool):
+        if type(pool) is not OwnerAffineBlockPool and not isinstance(
+            pool, OwnerAffineBlockPool
+        ):
             return orig_allocate_slots(self, request, *args, **kwargs)
-        num_new_tokens = (
-            int(_arg(args, kwargs, "num_new_tokens", 0))
-            if (args or "num_new_tokens" in kwargs)
-            else 0
-        )
-        owner = pool.owner_of(request.request_id)
+        num_new_tokens = int(args[0]) if args else int(kwargs.get("num_new_tokens", 0))
+        req_id = request.request_id
+        owner = pool._request_owner.get(req_id)
         if owner is not None:
-            with owner_scope(owner):
+            token = _CURRENT_OWNER.set(owner)
+            try:
                 blocks = orig_allocate_slots(self, request, *args, **kwargs)
+            finally:
+                _CURRENT_OWNER.reset(token)
             if blocks is not None:
-                pool.record_step_tokens(request.request_id, owner, num_new_tokens)
+                pool.record_step_tokens(req_id, owner, num_new_tokens)
             return blocks
         # A request without an owner holds no blocks, and a failed attempt
         # returns before allocating anything, so trying owners in turn has
-        # no side effects.
+        # no side effects. Try the single best candidate before sorting all.
+        best = pool.best_owner_candidate()
+        if best is None:
+            return None
+        best_budget = pool.step_owner_budget(best)
+        if best_budget is None or best_budget >= num_new_tokens:
+            token = _CURRENT_OWNER.set(best)
+            try:
+                blocks = orig_allocate_slots(self, request, *args, **kwargs)
+            finally:
+                _CURRENT_OWNER.reset(token)
+            if blocks is not None:
+                pool.bind(req_id, best)
+                pool.record_step_tokens(req_id, best, num_new_tokens)
+                return blocks
         for owner in pool.owner_candidates():
+            if owner == best:
+                continue
             owner_budget = pool.step_owner_budget(owner)
             if owner_budget is not None and owner_budget < num_new_tokens:
                 continue
-            with owner_scope(owner):
+            token = _CURRENT_OWNER.set(owner)
+            try:
                 blocks = orig_allocate_slots(self, request, *args, **kwargs)
+            finally:
+                _CURRENT_OWNER.reset(token)
             if blocks is not None:
-                pool.bind(request.request_id, owner)
-                pool.record_step_tokens(request.request_id, owner, num_new_tokens)
+                pool.bind(req_id, owner)
+                pool.record_step_tokens(req_id, owner, num_new_tokens)
                 return blocks
         return None
 
     @functools.wraps(orig_free)
     def free(self, request):
         orig_free(self, request)
-        if isinstance(self.block_pool, OwnerAffineBlockPool):
-            self.block_pool.release(request.request_id)
+        pool = self.block_pool
+        if type(pool) is OwnerAffineBlockPool or isinstance(pool, OwnerAffineBlockPool):
+            pool.release(request.request_id)
 
     @functools.wraps(orig_pop_blocks_for_free)
     def pop_blocks_for_free(self, request):
         blocks = orig_pop_blocks_for_free(self, request)
-        if isinstance(self.block_pool, OwnerAffineBlockPool):
-            self.block_pool.release(request.request_id)
+        pool = self.block_pool
+        if type(pool) is OwnerAffineBlockPool or isinstance(pool, OwnerAffineBlockPool):
+            pool.release(request.request_id)
         return blocks
 
     Scheduler.__init__ = scheduler_init

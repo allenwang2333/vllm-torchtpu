@@ -634,26 +634,31 @@ def test_step_owner_budget_balances_prefill_and_restores_on_release(installed):
         # Spec-padded 1-token waiting request (num_tokens - computed == 1, new > 1)
         # when candidate owner has insufficient budget (< 5) returns 0 to defer.
         pool._step_owner_budget[2] = 3
+        pool._step_owner_budget[3] = 5
         r_spec = _request("r_spec", 1)
         assert scheduler._reserve_prefill_lookahead(r_spec, 0, 5) == 0
 
-        # Unbound request requesting 16 tokens skips owner 2 (budget=3 < 16)
-        # and binds owner 3.
-        r3 = _request("r3", 16)
-        assert manager.allocate_slots(r3, 16) is not None
-        assert pool.owner_of("r3") == 3
-        assert pool.step_owner_budget(3) == 0
+        # Unbound request requesting 16 tokens skips best candidate owner 2
+        # (budget=3 < 16) and fallback candidate owner 3 (budget=5 < 16),
+        # binding owner 4.
+        r4 = _request("r4", 16)
+        assert manager.allocate_slots(r4, 16) is not None
+        assert pool.owner_of("r4") == 4
+        assert pool.step_owner_budget(4) == 0
 
         # Releasing r1 mid-step (e.g., preemption) restores owner 1's step budget.
         manager.free(r1)
         assert pool.step_owner_budget(1) == 16
 
-        # Exhaust all owners' budgets -> candidates is empty -> reserve returns 0.
+        # Exhaust all owners' budgets -> candidates is empty -> reserve returns 0
+        # and allocate_slots returns None immediately.
         for o in range(OWNERS):
             pool._step_owner_budget[o] = 0
         assert pool.owner_candidates() == []
+        assert pool.best_owner_candidate() is None
         r_none = _request("r_none", 16)
         assert scheduler._reserve_prefill_lookahead(r_none, 0, 16) == 0
+        assert manager.allocate_slots(r_none, 16) is None
         scheduled_calls.append(True)
         return "done"
 
@@ -669,3 +674,79 @@ def test_step_owner_budget_balances_prefill_and_restores_on_release(installed):
     assert scheduler.schedule() == "done"
     assert scheduled_calls == [True]
     assert pool.step_owner_budget(0) is None
+
+
+def test_best_owner_candidate_and_high_concurrency_scaling(installed):
+    # 1. Verify best_owner_candidate() matches owner_candidates()[0] across tie-breaks.
+    big_layout = OwnerLayout(
+        num_replicated=512, num_owners=OWNERS, blocks_per_owner=256
+    )
+    with oab.layout_scope(big_layout):
+        manager = KVCacheManager(
+            _kv_config(big_layout.num_blocks, (FULL, SWA, RING)),
+            max_model_len=2048,
+            scheduler_block_size=BLOCK_SIZE,
+            hash_block_size=BLOCK_SIZE,
+            enable_caching=False,
+            watermark=0.0,
+        )
+    pool = manager.block_pool
+    assert isinstance(pool, OwnerAffineBlockPool)
+    assert pool.best_owner_candidate() == pool.owner_candidates()[0] == 0
+
+    # Reduce free blocks on owner 0 so owner 1 wins the free-block tie-break.
+    with owner_scope(0):
+        b0 = pool.get_new_blocks(2)
+    assert pool.best_owner_candidate() == pool.owner_candidates()[0] == 1
+    pool.free_blocks(b0)
+
+    # 2. Verify budgeted_reserve_prefill_lookahead short-circuits O(1) checks
+    # before scanning scheduler.running when num_tokens - num_computed_tokens != 1.
+    class _ForbiddenContainsList(list):
+        def __contains__(self, item):
+            raise AssertionError("scheduler.running should not be scanned")
+
+    scheduler = SimpleNamespace(
+        kv_cache_manager=manager,
+        policy=SchedulingPolicy.FCFS,
+        running=_ForbiddenContainsList(),
+        max_num_scheduled_tokens=OWNERS * 96,
+        schedule=lambda: None,
+        _reserve_prefill_lookahead=lambda req, comp, new: new,
+    )
+    oab._steer_preemption(scheduler)
+    pool.begin_step(96)
+    r_chunk = _request("r_chunk", 256)
+    assert scheduler._reserve_prefill_lookahead(r_chunk, 0, 256) == 96
+    pool.end_step()
+
+    # 3. Verify C=96 and C=128 balanced admission and DSpark K=5 (6 tok/step) decode.
+    for concurrency in (96, 128):
+        scheduler.running = []
+        per_owner_reqs = concurrency // OWNERS
+        per_owner_budget = per_owner_reqs * 16
+        pool.begin_step(per_owner_budget)
+        requests = [_request(f"c{concurrency}_{i}", 16) for i in range(concurrency)]
+        for req in requests:
+            n = scheduler._reserve_prefill_lookahead(req, 0, 16)
+            assert n == 16
+            assert manager.allocate_slots(req, n) is not None
+            req.num_computed_tokens = 16
+            scheduler.running.append(req)
+        pool.end_step()
+        assert pool._owner_num_requests == [per_owner_reqs] * OWNERS
+
+        # Run a DSpark K=5 decode step (6 tok/req -> crosses block boundary 16 -> 22).
+        decode_budget = per_owner_reqs * 6
+        pool.begin_step(decode_budget)
+        for req in requests:
+            n = scheduler._reserve_prefill_lookahead(req, req.num_computed_tokens, 6)
+            assert n == 6
+            assert manager.allocate_slots(req, n) is not None
+            req.num_computed_tokens += 6
+        assert [pool.step_owner_budget(o) for o in range(OWNERS)] == [0] * OWNERS
+        pool.end_step()
+
+        for req in requests:
+            manager.free(req)
+        assert pool._owner_num_requests == [0] * OWNERS
