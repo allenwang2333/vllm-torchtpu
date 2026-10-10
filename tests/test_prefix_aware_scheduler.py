@@ -522,3 +522,39 @@ def test_warm_streak_cadence_gating_defers_prefills_until_k_decode_steps():
     s._pure_decode_streak = 2
     assert s._cap_cold_prefill_tokens(warm, 18_000, 2000) == 2000
 
+
+def test_mk_max_running_caps_running_seqs_when_megakernel_active(monkeypatch):
+    seen = {}
+
+    def fake_schedule(self, *args, **kwargs):
+        seen["max_running"] = self.max_num_running_reqs
+        return "out"
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", fake_schedule, raising=False)
+    monkeypatch.setenv("VLLM_TPU_QWEN35_MEGAKERNEL", "1")
+    # Auto mode is opt-in (the default 0 leaves max_num_running_reqs alone).
+    monkeypatch.setenv("TPU_SCHED_MK_MAX_RUNNING", "-1")
+
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s.running = [_running_request(f"d{i}", 100, 100) for i in range(16)]
+    s.max_num_scheduled_tokens = 8192
+    s.max_num_running_reqs = 32
+    s.dcp_world_size = 1
+    s.num_spec_tokens = 3
+
+    assert s._resolve_mk_max_running() == 16
+    assert s.schedule() == "out"
+    assert seen["max_running"] == 16
+    # Restored after schedule() returns
+    assert s.max_num_running_reqs == 32
+
+    # TPU_SCHED_MK_MAX_RUNNING=0 (also the default) preserves max_num_running_reqs=32
+    monkeypatch.setenv("TPU_SCHED_MK_MAX_RUNNING", "0")
+    s._mk_max_running = None
+    assert s.schedule() == "out"
+    assert seen["max_running"] == 32
+    monkeypatch.delenv("TPU_SCHED_MK_MAX_RUNNING")
+    s._mk_max_running = None
+    assert s._resolve_mk_max_running() == 0
+
+
