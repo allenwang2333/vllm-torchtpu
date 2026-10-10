@@ -1,4 +1,3 @@
-import os
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -43,6 +42,7 @@ even at decode. The 35B proxy predicts the opposite (TPOT +3.9%), which is the
 usual story for anything that scales with hidden size.
 """
 
+import os
 from typing import Any
 
 import jax

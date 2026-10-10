@@ -1083,8 +1083,14 @@ class VllmDeepseekV41MLAAttention(
             ):
                 self.__dict__.pop("_tp_attn_op", None)
                 self.__dict__.pop("_tp_attn_op_u1", None)
+                self.__dict__.pop("_tp_attn_op_ced", None)
+                self.__dict__.pop("_tp_attn_op_ced_u1", None)
                 self.__dict__.pop("_tp_swa_step_meta_op", None)
-                _ = self._get_tp_attn_op(False)
+                _ = self._get_tp_attn_op(False, ced_decoder=False)
+                _ = self._get_tp_attn_op(False, ced_decoder=True)
+                if self.compress_ratio > 0:
+                    _ = self._get_tp_attn_op(True, ced_decoder=False)
+                    _ = self._get_tp_attn_op(True, ced_decoder=True)
                 _ = self._get_tp_swa_step_metadata_op()
                 if _TP_ATTN_LOCAL_TOPK and self.compress_ratio > 0:
                     _ = self._tp_attn_topk_indexer()
