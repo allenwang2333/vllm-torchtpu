@@ -336,9 +336,15 @@ def test_base_init_accepts_every_unitary_init_parameter():
     assert set(unitary) <= set(base.parameters)
 
 
-def test_patch_is_idempotent():
+def test_patch_is_idempotent(monkeypatch):
+    import sys
+
     resolve = kv_cache_utils.resolve_kv_cache_block_sizes
     init = kv_cache_coordinator.UnitaryKVCacheCoordinator.__init__
     _patch_vllm_dcp_fine_prefix_hits()
     assert kv_cache_utils.resolve_kv_cache_block_sizes is resolve
     assert kv_cache_coordinator.UnitaryKVCacheCoordinator.__init__ is init
+
+    monkeypatch.setitem(sys.modules, "vllm.v1.kv_offload.base", None)
+    _patch_vllm_dcp_fine_prefix_hits()
+    assert kv_cache_utils.resolve_kv_cache_block_sizes is resolve

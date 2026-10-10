@@ -97,9 +97,12 @@ def _drop_pinned_lazy_envs():
     """
     import vllm_torchtpu.envs as tpu_envs
 
+    before_env = dict(os.environ)
     namespace = vars(tpu_envs)
     before = {name for name in tpu_envs.environment_variables if name in namespace}
     yield
+    os.environ.clear()
+    os.environ.update(before_env)
     for name in tpu_envs.environment_variables:
         if name in namespace and name not in before:
             del namespace[name]
