@@ -32,7 +32,12 @@ BENCH_ROOT = REPO_ROOT / "scripts" / "dsv41_bench"
 
 # Subsystem -> (expected_files, expected_stmts, expected_branches, track_ids)
 SUBSYSTEM_COVERAGE_INVENTORY: dict[str, tuple[int, int, int, str]] = {
-    "<root>": (14, 2155, 698, "TD8.67 / TD8.86 / TD8.135 / TD8.142 / TD8.163"),
+    "<root>": (
+        14,
+        2189,
+        712,
+        "TD8.67 / TD8.86 / TD8.135 / TD8.142 / TD8.163 / TD8.234",
+    ),
     "compilation": (5, 463, 132, "TD8.80 / TD8.147 / TD8.157 / TD8.163"),
     "core": (
         6,

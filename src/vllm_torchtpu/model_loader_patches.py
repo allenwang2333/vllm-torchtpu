@@ -48,6 +48,7 @@ tensors (ModelOpt NVFP4, needed globally by FlashInfer backends) are not
 in the allowlist and stay unfiltered.
 """
 
+import contextlib
 import copy
 import functools
 import gc
@@ -57,7 +58,7 @@ import os
 import struct
 import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -459,27 +460,38 @@ def patch_default_loader_ep_weight_filter() -> None:
         local_expert_ids=None,
         **kwargs,
     ):
+        stop_event = None
         if safetensors_load_strategy == "prefetch" and local_expert_ids is not None:
-            _start_ep_range_prefetch(
-                sorted(hf_weights_files, key=weight_utils._natural_sort_key),
-                local_expert_ids,
-                kwargs.get(
-                    "safetensors_prefetch_num_threads",
-                    weight_utils.DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
-                ),
-                kwargs.get(
-                    "safetensors_prefetch_block_size",
-                    weight_utils.DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
-                ),
-            )
+            # A draft model (e.g. DSpark reading the target checkpoint with
+            # every expert local under _force_draft_tp1) loads in under a
+            # second; a background prefetch of every file would keep reading
+            # for minutes after the runner evicted the page cache.
+            if len(hf_weights_files) > 1 and not _loading_draft_model():
+                stop_event = threading.Event()
+                _start_ep_range_prefetch(
+                    sorted(hf_weights_files, key=weight_utils._natural_sort_key),
+                    local_expert_ids,
+                    kwargs.get(
+                        "safetensors_prefetch_num_threads",
+                        weight_utils.DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
+                    ),
+                    kwargs.get(
+                        "safetensors_prefetch_block_size",
+                        weight_utils.DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
+                    ),
+                    stop_event=stop_event,
+                )
             safetensors_load_strategy = "lazy"
-        return original_iterator(
+        iterator = original_iterator(
             hf_weights_files,
             use_tqdm_on_load,
             safetensors_load_strategy,
             local_expert_ids,
             **kwargs,
         )
+        if stop_event is None:
+            return iterator
+        return _stop_prefetch_on_exit(iterator, stop_event)
 
     weight_utils.safetensors_weights_iterator = safetensors_weights_iterator
     default_loader.safetensors_weights_iterator = safetensors_weights_iterator
@@ -489,6 +501,33 @@ def patch_default_loader_ep_weight_filter() -> None:
         ".weight_packed/.weight_scale/.scale, and prefetch reads only "
         "local tensors (DefaultModelLoader)."
     )
+
+
+def _loading_draft_model() -> bool:
+    """Whether the model being loaded is a speculative draft model.
+
+    ``DFlashProposer``/``Eagle3Proposer`` load the draft under
+    ``set_current_vllm_config`` with ``model_config.runner_type == "draft"``.
+    """
+    from vllm.config import get_current_vllm_config
+
+    model_config = getattr(get_current_vllm_config(), "model_config", None)
+    return getattr(model_config, "runner_type", None) == "draft"
+
+
+# Stop events of background range prefetches still running, set (and the
+# list cleared) by evict_loaded_weights_page_cache.
+_active_prefetch_stop_events: list[threading.Event] = []
+
+
+def _stop_prefetch_on_exit(
+    iterator: Iterator[tuple[str, torch.Tensor]], stop_event: threading.Event
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield from ``iterator``; stop its prefetch once it ends or is closed."""
+    try:
+        yield from iterator
+    finally:
+        stop_event.set()
 
 
 def _local_tensor_ranges(
@@ -513,19 +552,37 @@ def _local_tensor_ranges(
     return merged
 
 
+def _pread_job(
+    job: tuple[int, int, int], stop_event: threading.Event | None = None
+) -> int:
+    """Read one ``(fd, offset, size)`` prefetch chunk; skip it once stopped."""
+    if stop_event is not None and stop_event.is_set():
+        return 0
+    fd, offset, size = job
+    return len(os.pread(fd, size, offset))
+
+
 def _start_ep_range_prefetch(
     sorted_files: list[str],
     local_expert_ids: set[int],
     num_threads: int,
     block_size: int,
+    stop_event: threading.Event | None = None,
 ) -> None:
     """Read this rank's tensors into the page cache in a background thread.
 
     Reads go in the iterator's file order, in ``block_size`` chunks over
     ``num_threads`` threads, so the lazy safetensors iterator that follows
     finds its pages cached. Dense tensors are kept by every rank; ranks on
-    one host share those pages.
+    one host share those pages. Once ``stop_event`` is set, the remaining
+    reads are skipped.
     """
+    if stop_event is not None:
+        _active_prefetch_stop_events.append(stop_event)
+    read = functools.partial(_pread_job, stop_event=stop_event)
+
+    def stopped() -> bool:
+        return stop_event is not None and stop_event.is_set()
 
     def run() -> None:
         start = time.perf_counter()
@@ -533,6 +590,8 @@ def _start_ep_range_prefetch(
         jobs: list[tuple[int, int, int]] = []
         try:
             for path in sorted_files:
+                if stopped():
+                    break
                 fd = os.open(path, os.O_RDONLY)
                 fds.append(fd)
                 for lo, hi in _local_tensor_ranges(path, local_expert_ids):
@@ -541,13 +600,12 @@ def _start_ep_range_prefetch(
                         for off in range(lo, hi, block_size)
                     )
             with ThreadPoolExecutor(max_workers=num_threads) as executor:
-                total = sum(
-                    executor.map(lambda j: len(os.pread(j[0], j[2], j[1])), jobs)
-                )
+                total = sum(executor.map(read, jobs))
             elapsed = time.perf_counter() - start
             logger.info(
-                "[ep-prefetch] read %.1f GiB of local tensors from %d files in "
+                "[ep-prefetch] %s %.1f GiB of local tensors from %d files in "
                 "%.1f s (%.2f GiB/s)",
+                "stopped after" if stopped() else "read",
                 total / 2**30,
                 len(sorted_files),
                 elapsed,
@@ -558,6 +616,10 @@ def _start_ep_range_prefetch(
         finally:
             for fd in fds:
                 os.close(fd)
+            if stop_event is not None:
+                # Already gone if evict_loaded_weights_page_cache cleared it.
+                with contextlib.suppress(ValueError):
+                    _active_prefetch_stop_events.remove(stop_event)
 
     logger.info(
         "[ep-prefetch] started: %d files, %d local experts, num_threads=%d, "
@@ -663,7 +725,12 @@ def evict_loaded_weights_page_cache() -> None:
     """Evict host page cache for every weight file loaded so far.
 
     Called by the runner after the target and any draft model are loaded.
+    First stops every background range prefetch still running, so it cannot
+    read the evicted files back into the page cache.
     """
+    for stop_event in _active_prefetch_stop_events:
+        stop_event.set()
+    _active_prefetch_stop_events.clear()
     if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE or not _loaded_weight_files:
         return
     files = list(_loaded_weight_files)

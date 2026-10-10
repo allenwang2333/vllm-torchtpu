@@ -295,9 +295,14 @@ def test_range_prefetch_reads_only_local_ranges(tmp_path, monkeypatch):
 
 
 def test_prefetch_strategy_under_filter_switches_to_lazy(tmp_path, monkeypatch):
+    import shutil
+
     from vllm.model_executor.model_loader import ep_weight_filter, weight_utils
 
     shard = _save_shard(tmp_path)
+    # Two files: a single-file checkpoint skips the range prefetch (TD8.234).
+    shard2 = str(tmp_path / "model-00002.safetensors")
+    shutil.copy(shard, shard2)
     monkeypatch.setattr(
         weight_utils, "should_skip_weight", weight_utils.should_skip_weight
     )
@@ -321,20 +326,24 @@ def test_prefetch_strategy_under_filter_switches_to_lazy(tmp_path, monkeypatch):
     monkeypatch.setattr(
         model_loader_patches,
         "_start_ep_range_prefetch",
-        lambda files, ids, threads, block: prefetches.append((files, ids)),
+        lambda files, ids, threads, block, **kw: prefetches.append((files, ids)),
     )
+    monkeypatch.setattr(model_loader_patches, "_loading_draft_model", lambda: False)
     patch_default_loader_ep_weight_filter()
     iterator = weight_utils.safetensors_weights_iterator
 
     names = {
-        name for name, _ in iterator([shard], False, "prefetch", local_expert_ids={0})
+        name
+        for name, _ in iterator(
+            [shard2, shard], False, "prefetch", local_expert_ids={0}
+        )
     }
     assert strategies == ["lazy"]
-    assert prefetches == [([shard], {0})]
+    assert prefetches == [([shard, shard2], {0})]
     assert f"{_E}.0.w1.scale" in names
     assert f"{_E}.7.w1.scale" not in names
 
     # Filter off: upstream prefetch runs unchanged.
-    list(iterator([shard], False, "prefetch", local_expert_ids=None))
+    list(iterator([shard, shard2], False, "prefetch", local_expert_ids=None))
     assert strategies == ["lazy", "prefetch"]
     assert len(prefetches) == 1
