@@ -608,7 +608,7 @@ class TestAttentionKvShard:
                         raw_idx_slots = v2_attn._request_row_slots(
                             plain_cache, table, capacity
                         )
-                        ref_idx_recs = idx_cache.row_indices(raw_idx_slots)
+                        ref_idx_recs = idx_cache.row_indices(raw_idx_slots)[:, ::16]
 
                         seen_swa: list[torch.Tensor] = []
                         seen_idx: list[torch.Tensor] = []
@@ -936,6 +936,290 @@ class TestAttentionKvShard:
             # Only 1 _gather_query_rows call per layer (selected), 0 for published
             expected_staged_gathers = 4 if (ranks > 1 and not use_owner_perm) else 0
             assert len(gather_calls) == expected_staged_gathers
+
+    def test_td8229_prestrided_page_base_indexer_records_parity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """TD8.229: Verify prestrided [requests, num_pages] indexer records across
+        _request_row_slots, _prepare_tpu, _select_paged_indices, paged_index_scores_jax,
+        paged_indexer_jax, update_and_select_jax/2bank, and initialize_indexer."""
+        raw_pool = torch.zeros((4096, ROW_WORDS), dtype=torch.int32)
+        table = torch.tensor(
+            [[0, 2, 16, 1], [3, 5, 19, 4]],
+            dtype=torch.int32,
+        )
+        for sharded in (False, True):
+            layout = (
+                (16, 16, 128),
+                torch.bfloat16,
+                32 * 128 * 2,
+                8 * 128 * 2,
+                0,
+                sharded,
+                16 if sharded else 0,
+            )
+            cache = PagedCacheRows(raw_pool, layout)
+            assert v2_attn._index_page_records(cache) == 16
+            # Both num_pages <= table.shape[1] (width=40 -> 3 pages <= 4)
+            # and num_pages > table.shape[1] (width=96 -> 6 pages > 4)
+            for width in (40, 96):
+                full_slots = v2_attn._request_row_slots(cache, table, width)
+                page_slots = v2_attn._request_row_slots(
+                    cache, table, width, page_records=16
+                )
+                num_pages = (width + 15) // 16
+                assert page_slots.shape == (2, num_pages)
+                valid_pages = min(num_pages, table.shape[1])
+                assert torch.equal(
+                    page_slots[:, :valid_pages],
+                    full_slots[:, : valid_pages * 16 : 16],
+                )
+                if num_pages > valid_pages:
+                    assert torch.equal(
+                        page_slots[:, valid_pages:],
+                        page_slots[:, valid_pages - 1 : valid_pages].expand(
+                            -1, num_pages - valid_pages
+                        ),
+                    )
+                # Non-matching page_records falls back to full width
+                fallback_slots = v2_attn._request_row_slots(
+                    cache, table, width, page_records=8
+                )
+                assert torch.equal(fallback_slots, full_slots)
+
+        # End-to-end _select_paged_indices prestrided vs non-prestrided
+        seen_pi_kwargs: list[dict[str, Any]] = []
+
+        def _spy_pi(q_part, ic, rec, *a, _seen=seen_pi_kwargs, **kw):
+            _seen.append({"rec_shape": tuple(rec.shape), **kw})
+            return (
+                ic.raw,
+                torch.zeros((q_part.shape[0], 4), dtype=torch.int32),
+                torch.zeros((q_part.shape[0], 0), dtype=torch.int32),
+            )
+
+        monkeypatch.setattr(v2_attn, "paged_indexer", _spy_pi)
+        monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: 1)
+
+        idx_cache = PagedCacheRows(
+            raw_pool, ((16, 16, 128), torch.bfloat16, 32 * 128 * 2, 0)
+        )
+        attn_mod: Any = object.__new__(v2_attn.DeepseekV41Attention)
+        torch.nn.Module.__init__(attn_mod)
+        attn_mod.compress_ratio = 2
+        attn_mod._max_model_len = 128  # capacity = 64
+        attn_mod._tp_rank = 0
+        attn_mod._fp8_kv = True
+        attn_mod._config = {"index_topk": 4}
+        attn_mod.candidate_block_size = 16
+        attn_mod.candidate_block_buffer = torch.full((16, 4), -1, dtype=torch.int32)
+        attn_mod.indexer = SimpleNamespace(
+            head_dim=128,
+            n_head=2,
+            indexer_op=SimpleNamespace(candidate_blocks=None, candidate_write=False),
+        )
+        attn_mod._project_index_q = lambda q, p: q
+
+        qr = torch.zeros((4, 128), dtype=torch.bfloat16)
+        pos = torch.arange(4, dtype=torch.int32)
+        req = torch.tensor([0, 0, 1, 1], dtype=torch.int32)
+        w = torch.ones((4, 2), dtype=torch.float32)
+        lengths = torch.full((4, 1), 32, dtype=torch.int32)
+        swa_slots = torch.zeros((4, 1), dtype=torch.int32)
+
+        # Prestrided records (shape[1] = 4 < capacity = 64)
+        attn_mod._select_paged_indices(
+            qr,
+            pos,
+            idx_cache,
+            torch.zeros((2, 4), dtype=torch.int32),
+            req,
+            w,
+            lengths,
+            swa_slots,
+            None,
+        )
+        assert seen_pi_kwargs[-1]["prestrided_pages"] is True
+        assert seen_pi_kwargs[-1]["logical_width"] == 64
+
+        # Full-width records (shape[1] = 64 == capacity = 64) -> no prestrided_pages kw
+        attn_mod._select_paged_indices(
+            qr,
+            pos,
+            idx_cache,
+            torch.zeros((2, 64), dtype=torch.int32),
+            req,
+            w,
+            lengths,
+            swa_slots,
+            None,
+        )
+        assert "prestrided_pages" not in seen_pi_kwargs[-1]
+
+        # JAX kernel parity: paged_index_scores_jax (decode & prefill row_step)
+        # and paged_indexer_jax (full_context & candidate_context)
+        rng = np.random.default_rng(8229)
+        pool_j = jnp.asarray(
+            rng.integers(-(2**31), 2**31, (256, ROW_WORDS)), dtype=jnp.int32
+        ) & jnp.int32(0x3FFF3FFF)
+        page_rec = 16
+        logical_w = 240  # 15 pages, not a power of 2
+        records_np = np.zeros((2, logical_w), dtype=np.int32)
+        for r in range(2):
+            for p in range(0, logical_w, page_rec):
+                base = int(rng.integers(0, 128) * 2)
+                records_np[r, p : p + page_rec] = base + np.arange(page_rec)
+        records_np[0, -page_rec:] = -1
+        records_full_j = jnp.asarray(records_np)
+        records_page_j = records_full_j[:, ::page_rec]
+
+        for n_tok in (6, 4):
+            # n_tok=6 -> decode (eff_tokens=1 <= 2); n_tok=4 -> prefill row_step (4 > 2)
+            q_j = jnp.asarray(rng.standard_normal((n_tok, 2, 128)), jnp.bfloat16)
+            w_j = jnp.asarray(rng.standard_normal((n_tok, 2)), jnp.float32)
+            len_j = jnp.full((n_tok,), 200, dtype=jnp.int32)
+            req_j = jnp.arange(n_tok, dtype=jnp.int32) % 2
+            sc_ref = attention_kernels.paged_index_scores_jax(
+                q_j,
+                pool_j,
+                records_full_j,
+                w_j,
+                len_j,
+                requests=req_j,
+                page_records=page_rec,
+            )
+            sc_pre = attention_kernels.paged_index_scores_jax(
+                q_j,
+                pool_j,
+                records_page_j,
+                w_j,
+                len_j,
+                requests=req_j,
+                page_records=page_rec,
+                prestrided_pages=True,
+                logical_width=logical_w,
+            )
+            np.testing.assert_array_equal(np.asarray(sc_pre), np.asarray(sc_ref))
+
+            for cand_filter in (False, True):
+                cands_j = jnp.asarray([[0, 2, 5, -1]] * n_tok, dtype=jnp.int32)
+                sel_ref, pub_ref = attention_kernels.paged_indexer_jax(
+                    q_j,
+                    pool_j,
+                    records_full_j,
+                    w_j,
+                    len_j,
+                    cands_j,
+                    req_j,
+                    topk=32,
+                    block_size=32,
+                    candidate_write=not cand_filter,
+                    candidate_filter=cand_filter,
+                    unordered=False,
+                    page_records=page_rec,
+                )
+                sel_pre, pub_pre = attention_kernels.paged_indexer_jax(
+                    q_j,
+                    pool_j,
+                    records_page_j,
+                    w_j,
+                    len_j,
+                    cands_j,
+                    req_j,
+                    topk=32,
+                    block_size=32,
+                    candidate_write=not cand_filter,
+                    candidate_filter=cand_filter,
+                    unordered=False,
+                    page_records=page_rec,
+                    prestrided_pages=True,
+                    logical_width=logical_w,
+                )
+                np.testing.assert_array_equal(np.asarray(sel_pre), np.asarray(sel_ref))
+                np.testing.assert_array_equal(np.asarray(pub_pre), np.asarray(pub_ref))
+
+        # update_and_select_2bank_jax + initialize_indexer fake + paged_indexer
+        wrec_j = jnp.zeros((0,), dtype=jnp.int32)
+        wkeys_j = jnp.zeros((0, 128), dtype=jnp.bfloat16)
+        bmax_j = jnp.array(200, dtype=jnp.int32)
+        _, _, sel_2b, _ = attention_kernels.update_and_select_2bank_jax(
+            q_j,
+            pool_j[:128],
+            pool_j[128:],
+            records_page_j,
+            w_j,
+            len_j,
+            jnp.zeros((n_tok, 4), dtype=jnp.int32),
+            wrec_j,
+            wkeys_j,
+            req_j,
+            bmax_j,
+            32,
+            32,
+            False,
+            False,
+            False,
+            page_rec,
+            True,
+            logical_w,
+        )
+        assert sel_2b.shape == (n_tok, 32)
+
+        mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
+        with set_vllm_model_wrapper_context(mesh=mesh):
+            attention_kernels._indexer_op = None
+            attention_kernels.initialize_indexer()
+        q_m = torch.empty((4, 2, 128), dtype=torch.bfloat16, device="meta")
+        pool_m = torch.empty((64, ROW_WORDS), dtype=torch.int32, device="meta")
+        rec_m = torch.empty((2, 4), dtype=torch.int32, device="meta")
+        w_m = torch.empty((4, 2), dtype=torch.float32, device="meta")
+        len_m = torch.empty((4,), dtype=torch.int32, device="meta")
+        cand_m = torch.empty((4, 2), dtype=torch.int32, device="meta")
+        wrec_m = torch.empty((0,), dtype=torch.int32, device="meta")
+        keys_m = torch.empty((0, 128), dtype=torch.bfloat16, device="meta")
+        req_m = torch.empty((4,), dtype=torch.int32, device="meta")
+        bmax_m = torch.empty((1,), dtype=torch.int32, device="meta")
+        for lw in (0, 64):
+            _, f_sel1, _ = attention_kernels.paged_indexer(
+                q_m,
+                SimpleNamespace(raw=pool_m, raw_hi=None),
+                rec_m,
+                w_m,
+                len_m,
+                cand_m,
+                wrec_m,
+                keys_m,
+                req_m,
+                topk=16,
+                block_size=16,
+                candidate_write=False,
+                candidate_filter=False,
+                batch_max=bmax_m,
+                page_records=16,
+                prestrided_pages=True,
+                logical_width=lw,
+            )
+            assert f_sel1.shape == (4, 16)
+            _, f_sel2, _ = attention_kernels.paged_indexer(
+                q_m,
+                SimpleNamespace(raw=pool_m, raw_hi=pool_m),
+                rec_m,
+                w_m,
+                len_m,
+                cand_m,
+                wrec_m,
+                keys_m,
+                req_m,
+                topk=16,
+                block_size=16,
+                candidate_write=False,
+                candidate_filter=False,
+                batch_max=bmax_m,
+                page_records=16,
+                prestrided_pages=True,
+                logical_width=lw,
+            )
+            assert f_sel2.shape == (4, 16)
 
 
 # ==============================================================================

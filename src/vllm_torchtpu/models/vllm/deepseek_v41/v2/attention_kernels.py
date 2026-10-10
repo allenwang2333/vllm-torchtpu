@@ -2345,6 +2345,7 @@ def paged_index_scores_jax(
     requests: jax.Array | None = None,
     page_records: int | None = None,
     prestrided_pages: bool = False,
+    logical_width: int = 0,
 ) -> jax.Array:
     """Index scores ``[tokens, width]``.
 
@@ -2356,13 +2357,18 @@ def paged_index_scores_jax(
     (`_request_row_slots` layout); score tiles, shared or per-token, then
     gather whole pages (see `gather_cache_page_values`).
     ``prestrided_pages``: when True, ``records`` already holds one first-record
-    slot per ``page_records`` segment (shape ``[tokens, width // page_records]``).
+    slot per ``page_records`` segment (shape ``[rows, num_pages]``) and
+    ``logical_width`` (if > 0) overrides ``records.shape[1] * page_records``.
     """
     tokens, dim = q.shape[0], q.shape[-1]
     width = (
-        records.shape[1] * page_records
-        if prestrided_pages and page_records is not None
-        else records.shape[1]
+        logical_width
+        if prestrided_pages and logical_width > 0
+        else (
+            records.shape[1] * page_records
+            if prestrided_pages and page_records is not None
+            else records.shape[1]
+        )
     )
     # Keep about `_INDEX_KEYS_PER_ITER` keys per iteration: small (decode)
     # batches otherwise run many latency-bound tiny gathers. Prefill batches use
@@ -2370,7 +2376,7 @@ def paged_index_scores_jax(
     # over 16.9K rows).
     eff_tokens = (
         (tokens // 6, min(tokens // 6, _INDEX_KEYS_PER_ITER // _INDEX_MAX_TILE))[
-            bool(prestrided_pages and page_records is not None)
+            bool(requests is None and prestrided_pages and page_records is not None)
         ]
         if (
             (requests is not None or (prestrided_pages and page_records is not None))
@@ -2406,7 +2412,14 @@ def paged_index_scores_jax(
         # all tokens score the row's shared key tile, and only that row's
         # tokens keep the result. Rows without tokens (padding) run no tiles,
         # so work scales with active requests, not the padded row count.
-        records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
+        rec_stride = (
+            page_records
+            if (pages and prestrided_pages and page_records is not None)
+            else 1
+        )
+        rec_tile = tile // rec_stride
+        rec_pad = padded_width // rec_stride - records.shape[1]
+        records = jnp.pad(records, ((0, 0), (0, rec_pad)), constant_values=-1)
         row_lengths = (
             jnp.zeros((records.shape[0],), jnp.int32)
             .at[requests]
@@ -2418,11 +2431,14 @@ def paged_index_scores_jax(
 
             def step(index, result):
                 addresses = jax.lax.dynamic_slice(
-                    records, (row, index * tile), (1, tile)
+                    records, (row, index * rec_tile), (1, rec_tile)
                 ).reshape(-1)
                 if pages:
                     keys = gather_cache_page_values(
-                        pool, addresses[::page_records], page_records, dim
+                        pool,
+                        addresses if prestrided_pages else addresses[::page_records],
+                        page_records,
+                        dim,
                     )
                 else:
                     keys = gather_cache_values(pool, addresses, dim, split=True)
@@ -2784,24 +2800,45 @@ def paged_indexer_jax(
     unordered: bool = False,
     batch_max: jax.Array | None = None,
     page_records: int | None = None,
+    prestrided_pages: bool = False,
+    logical_width: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
-    """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows.
+    """``records`` is ``[requests, width]`` (or ``[requests, num_pages]`` when
+    ``prestrided_pages=True``); ``requests`` maps tokens to rows.
 
     ``batch_max``: see `select_indices_jax`. ``page_records``: see
     `paged_index_scores_jax`; candidate scoring gathers runs of
     ``gcd(block_size, page_records)`` records (a block lies in one page).
     """
+    width = (
+        logical_width
+        if prestrided_pages and logical_width > 0
+        else (
+            records.shape[1] * page_records
+            if prestrided_pages and page_records is not None
+            else records.shape[1]
+        )
+    )
 
     def full_context(_):
         scores = paged_index_scores_jax(
-            q, pool, records, weights, lengths, requests, page_records
+            q,
+            pool,
+            records,
+            weights,
+            lengths,
+            requests,
+            page_records,
+            prestrided_pages=prestrided_pages,
+            logical_width=width,
         )
         if (
             page_records is not None
             and 512 % page_records == 0
             and (page_records * q.shape[-1] // 2) % ROW_WORDS == 0
         ):
-            page_valid = jnp.take(records[:, ::page_records] >= 0, requests, axis=0)
+            page_rec = records if prestrided_pages else records[:, ::page_records]
+            page_valid = jnp.take(page_rec >= 0, requests, axis=0)
             row_valid = jnp.broadcast_to(
                 page_valid[..., None], (*page_valid.shape, page_records)
             ).reshape(page_valid.shape[0], -1)[:, :width]
@@ -2820,7 +2857,6 @@ def paged_indexer_jax(
             batch_max,
         )
 
-    width = records.shape[1]
     if not candidate_filter or candidates.shape[1] * block_size >= width:
         return full_context(None)
 
@@ -2866,7 +2902,11 @@ def paged_indexer_jax(
                     q.shape[0], -1
                 )
             )
-            seg_table = records[:, ::segment]
+            seg_table = (
+                records
+                if (prestrided_pages and segment == page_records)
+                else records[:, ::segment]
+            )
             seg_records = seg_table[
                 requests[:, None], jnp.minimum(seg_ids, seg_table.shape[1] - 1)
             ]
@@ -3013,6 +3053,8 @@ def update_and_select_jax(
     candidate_filter: bool,
     unordered: bool,
     page_records: int = 0,
+    prestrided_pages: bool = False,
+    logical_width: int = 0,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``page_records`` 0 disables page gathers (see `paged_indexer_jax`)."""
     updated = write_index_keys(pool, write_records, keys)
@@ -3031,6 +3073,8 @@ def update_and_select_jax(
         unordered,
         batch_max,
         page_records or None,
+        prestrided_pages=prestrided_pages,
+        logical_width=logical_width,
     )
     return updated, selected, published
 
@@ -3053,6 +3097,8 @@ def update_and_select_2bank_jax(
     candidate_filter: bool,
     unordered: bool,
     page_records: int = 0,
+    prestrided_pages: bool = False,
+    logical_width: int = 0,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     (updated_lo, updated_hi), selected, published = cast(
         Any,
@@ -3073,6 +3119,8 @@ def update_and_select_2bank_jax(
             candidate_filter,
             unordered,
             page_records,
+            prestrided_pages,
+            logical_width,
         ),
     )
     return updated_lo, updated_hi, selected, published
@@ -3094,7 +3142,7 @@ def initialize_indexer():
         update_and_select_jax,
         donate_argnums=(1,),
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 10 + (None,) * 6,
+        input_partition_specs=(P(),) * 10 + (None,) * 8,
     )
 
     def fake(
@@ -3114,12 +3162,21 @@ def initialize_indexer():
         candidate_filter,
         unordered,
         page_records=0,
+        prestrided_pages=False,
+        logical_width=0,
     ):
+        width = (
+            logical_width
+            if prestrided_pages and logical_width > 0
+            else (
+                records.shape[1] * page_records
+                if prestrided_pages and page_records
+                else records.shape[1]
+            )
+        )
         return (
             torch.empty_like(pool),
-            records.new_empty(
-                (q.shape[0], min(topk, records.shape[1])), dtype=torch.int32
-            ),
+            records.new_empty((q.shape[0], min(topk, width)), dtype=torch.int32),
             torch.empty_like(candidates),
         )
 
@@ -3129,7 +3186,7 @@ def initialize_indexer():
         update_and_select_2bank_jax,
         donate_argnums=(1, 2),
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 11 + (None,) * 6,
+        input_partition_specs=(P(),) * 11 + (None,) * 8,
     )
 
     def fake_2bank(
@@ -3150,13 +3207,22 @@ def initialize_indexer():
         candidate_filter,
         unordered,
         page_records=0,
+        prestrided_pages=False,
+        logical_width=0,
     ):
+        width = (
+            logical_width
+            if prestrided_pages and logical_width > 0
+            else (
+                records.shape[1] * page_records
+                if prestrided_pages and page_records
+                else records.shape[1]
+            )
+        )
         return (
             torch.empty_like(pool_lo),
             torch.empty_like(pool_hi),
-            records.new_empty(
-                (q.shape[0], min(topk, records.shape[1])), dtype=torch.int32
-            ),
+            records.new_empty((q.shape[0], min(topk, width)), dtype=torch.int32),
             torch.empty_like(candidates),
         )
 
@@ -3181,8 +3247,11 @@ def paged_indexer(
     unordered=False,
     batch_max=None,
     page_records=None,
+    prestrided_pages=False,
+    logical_width=0,
 ):
-    """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows.
+    """``records`` is ``[requests, width]`` (or ``[requests, num_pages]`` when
+    ``prestrided_pages=True``); ``requests`` maps tokens to rows.
 
     ``batch_max`` (default ``lengths.max()``) is the longest length of the
     whole batch when the queries are only part of it. ``page_records``: see
@@ -3206,6 +3275,11 @@ def paged_indexer(
         candidate_filter,
         unordered,
         page_records or 0,
+        *(
+            (bool(prestrided_pages), int(logical_width))
+            if (prestrided_pages or logical_width)
+            else ()
+        ),
     )
     if _has_hi_bank(cache):
         assert _indexer_2bank_op is not None

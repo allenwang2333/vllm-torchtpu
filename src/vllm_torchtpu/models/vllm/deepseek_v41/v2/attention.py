@@ -545,11 +545,13 @@ def _fast_swa_row_slots(swa_cache, blocks, rem, invalid_window):
     )
 
 
-def _request_row_slots(cache, block_table, width):
+def _request_row_slots(cache, block_table, width, page_records: int = 0):
     """Slots of logical rows ``0..width-1`` for every request: ``[requests, width]``.
 
     Every token of a request scans the same capacity-wide rows, so address
-    them once per request instead of once per token.
+    them once per request instead of once per token. When ``page_records``
+    matches ``cache.shape[1]`` (> 1), returns one first-record slot per page
+    (``[requests, num_pages]``).
     """
     rows_per_page = cache.shape[1]
     fast_offset = _has_fast_cache_offset(cache)
@@ -559,6 +561,19 @@ def _request_row_slots(cache, block_table, width):
         if fast_offset
         else (table_blocks * rows_per_page, None)
     )
+    if page_records > 1 and rows_per_page == page_records:
+        num_pages = (width + rows_per_page - 1) // rows_per_page
+        if unowned_pages is not None:
+            page_bases = page_bases.masked_fill(unowned_pages, -1)
+        if num_pages > page_bases.shape[1]:
+            page_bases = torch.cat(
+                (
+                    page_bases,
+                    page_bases[:, -1:].expand(-1, num_pages - page_bases.shape[1]),
+                ),
+                dim=1,
+            )
+        return page_bases[:, :num_pages]
     if unowned_pages is not None:
         page_bases = page_bases.masked_fill(unowned_pages, -rows_per_page)
     # Logical row r lives in table column r // rows_per_page, so repeating each
@@ -1611,6 +1626,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             # computed per request: [requests, capacity]. The
                             # indexer shares each request's key tiles.
                             has_fast_idx_offset = _has_fast_cache_offset(index_cache)
+                            idx_page_records = _index_page_records(index_cache)
                             idx_req_key = self._stage_cache_key(
                                 "index_req_slots",
                                 indexer.k_cache.prefix,
@@ -1621,6 +1637,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                                     else None
                                 ),
                                 capacity,
+                                idx_page_records,
                             )
                             cached_idx_req = (
                                 stage_cache.get(idx_req_key)
@@ -1628,8 +1645,18 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                                 else None
                             )
                             if cached_idx_req is None:
-                                cached_idx_req = _request_row_slots(
-                                    index_cache, _block_table(keys_meta), capacity
+                                idx_table = _block_table(keys_meta)
+                                cached_idx_req = (
+                                    _request_row_slots(
+                                        index_cache,
+                                        idx_table,
+                                        capacity,
+                                        idx_page_records,
+                                    )
+                                    if idx_page_records > 1
+                                    else _request_row_slots(
+                                        index_cache, idx_table, capacity
+                                    )
                                 )
                                 if stage_cache is not None:
                                     stage_cache[idx_req_key] = cached_idx_req
@@ -2148,6 +2175,22 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             if stage_cache is not None and not candidate_write:
                 stage_cache[cand_key] = candidates_part
         q_part = self._project_index_q(qr_part, positions_part)
+        page_records = _index_page_records(index_cache)
+        max_model_len = getattr(self, "_max_model_len", 0)
+        compress_ratio = getattr(self, "compress_ratio", 0)
+        capacity = (
+            max(1, max_model_len // compress_ratio)
+            if (
+                isinstance(max_model_len, int)
+                and isinstance(compress_ratio, int)
+                and max_model_len > 0
+                and compress_ratio > 0
+            )
+            else 0
+        )
+        prestrided = bool(
+            page_records > 1 and capacity > 0 and records.shape[1] < capacity
+        )
         updated_cache, selected, published = paged_indexer(
             q_part,
             index_cache,
@@ -2167,7 +2210,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             batch_max=batch_max,
             # Score tiles gather whole pages: one index per 512-byte pool row
             # instead of one per record.
-            page_records=_index_page_records(index_cache),
+            page_records=page_records,
+            **(
+                {"prestrided_pages": True, "logical_width": capacity}
+                if prestrided
+                else {}
+            ),
         )
         if split and owner_perm is None:
             selected = _gather_query_rows(selected)[:count]
