@@ -962,6 +962,11 @@ class TestAttentionHelperFunctions:
                 swa_cache, cache_config=SimpleNamespace(block_size=32)
             )
             mock_super_swa.assert_called_once()
+            with patch.object(v2_attn, "prefix_replay_enabled", return_value=True):
+                v2_attn.SWACache.__init__(
+                    swa_cache, cache_config=SimpleNamespace(block_size=32)
+                )
+            assert mock_super_swa.call_args.kwargs.get("bounded_replay") is True
 
         # 5. IndexerCache
         idx_cache = object.__new__(v2_attn.IndexerCache)

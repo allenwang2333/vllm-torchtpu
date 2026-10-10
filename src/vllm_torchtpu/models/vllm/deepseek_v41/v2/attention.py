@@ -353,7 +353,8 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
         kwargs["block_size"] = kwargs["cache_config"].block_size
         # Upstream ties bounded replay to its V2 model runner; the TPU model
         # implements the replay itself (see `prefix_replay_enabled`).
-        kwargs["bounded_replay"] = prefix_replay_enabled(get_current_vllm_config())
+        if prefix_replay_enabled(get_current_vllm_config()):
+            kwargs["bounded_replay"] = True
         # FP8 applies to the compressed main KV only; SWA rows stay BF16.
         kwargs["dtype"] = torch.bfloat16
         kwargs["backend_cls"] = AttentionBackend
@@ -983,6 +984,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             else self.window_size
         )
         swa_row_slots_masked = None
+        starts = None
         if (
             stage_cache is not None
             and rows_per_page is not None

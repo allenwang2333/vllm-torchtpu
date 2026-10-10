@@ -2612,12 +2612,12 @@ class TPUModelRunner(GPUModelRunner):
         input_batch._tpu_spec_room_guard = True
 
     def _prefix_replay_tokens(self) -> int:
-        config = self.kv_cache_config
+        config = getattr(self, "kv_cache_config", None)
         if config is None:
             return 0
         return max(
             (
-                group.kv_cache_spec.prefix_replay_tokens
+                getattr(group.kv_cache_spec, "prefix_replay_tokens", 0)
                 for group in config.kv_cache_groups
             ),
             default=0,
@@ -2657,8 +2657,9 @@ class TPUModelRunner(GPUModelRunner):
             starts = self.input_batch.num_computed_tokens_cpu[:num_reqs, None]
             pos = starts - np.arange(1, depth + 1)
             limit = self.input_batch.num_prompt_tokens[:num_reqs, None].copy()
+            replay_starts = getattr(self, "_replay_starts", {})
             for row, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-                if self._replay_starts.get(req_id) == starts[row, 0]:
+                if replay_starts.get(req_id) == starts[row, 0]:
                     limit[row, 0] = self.input_batch.num_tokens_no_spec[row]
             valid = (pos >= 0) & (pos < limit)
             rows = np.arange(num_reqs)[:, None]
@@ -2677,9 +2678,10 @@ class TPUModelRunner(GPUModelRunner):
             invalidated_req_ids = (
                 finished_req_ids | (preempted_req_ids or set()) | resumed_req_ids
             )
+            replay_starts = getattr(self, "_replay_starts", {})
             for req_id in invalidated_req_ids:
                 self._mamba_state_pos.pop(req_id, None)
-                self._replay_starts.pop(req_id, None)
+                replay_starts.pop(req_id, None)
             self._mamba_offset_seeded.difference_update(invalidated_req_ids)
             if self._pre_async_results is not None:
                 # These results belong to freed KV state, including a finished ID
