@@ -1136,7 +1136,13 @@ def patched_model_forward(
     sp = self.use_sequence_parallel and _rows_are_sequence_parallel(full_num_tokens)
     if sp:
         _check_tokens_divide_by_tp(full_num_tokens)
-        hidden_states = _sp_chunk(self.layers[self.start_layer], hidden_states)
+        if get_pp_group().is_first_rank:
+            hidden_states = _sp_chunk(self.layers[self.start_layer], hidden_states)
+        else:
+            sp_rows = full_num_tokens // get_tensor_model_parallel_world_size()
+            hidden_states = hidden_states.narrow(0, 0, sp_rows)
+            assert isinstance(residual, torch.Tensor)
+            residual = residual.narrow(0, 0, sp_rows)
 
     aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
     for layer_idx, layer in enumerate(
@@ -1208,7 +1214,13 @@ def patched_mtp_forward(
     )
     if sp:
         _check_tokens_divide_by_tp(full_num_tokens)
-        hidden_states = _sp_chunk(mtp_layer, hidden_states)
+        if get_pp_group().is_first_rank:
+            hidden_states = _sp_chunk(mtp_layer, hidden_states)
+        else:
+            sp_rows = full_num_tokens // get_tensor_model_parallel_world_size()
+            hidden_states = hidden_states.narrow(0, 0, sp_rows)
+            assert isinstance(residual, torch.Tensor)
+            residual = residual.narrow(0, 0, sp_rows)
 
     hidden_states, residual = mtp_layer(
         positions=positions,

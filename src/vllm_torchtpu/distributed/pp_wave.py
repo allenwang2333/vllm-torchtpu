@@ -248,9 +248,11 @@ class PPWave:
     def _pad(
         self, carried: tuple[torch.Tensor, ...], rows: int
     ) -> tuple[torch.Tensor, ...]:
-        if rows == self.max_rows:
-            return carried
-        return tuple(torch.cat([t, z[rows:]]) for t, z in zip(carried, self.zeros))
+        del rows
+        return tuple(
+            t if t.shape[0] == self.max_rows else torch.cat([t, z[t.shape[0] :]])
+            for t, z in zip(carried, self.zeros)
+        )
 
     def warmup(self) -> None:
         """One launch outside any burst on every device, carrying a value

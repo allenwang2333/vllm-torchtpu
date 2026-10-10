@@ -1477,11 +1477,6 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
             "TPU_MOE_SEQUENCE_PARALLEL=1 is validated only for Qwen3.5 MoE, "
             f"got {archs}."
         )
-    if parallel_config.pipeline_parallel_size > 1:
-        raise ValueError(
-            "TPU_MOE_SEQUENCE_PARALLEL=1 does not support pipeline parallelism "
-            f"(pipeline_parallel_size={parallel_config.pipeline_parallel_size})."
-        )
     if not envs.USE_MOE_FUSED_EP_KERNEL:
         logger.warning(
             "TPU_MOE_SEQUENCE_PARALLEL=1 without USE_MOE_FUSED_EP_KERNEL=1 "

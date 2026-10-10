@@ -314,6 +314,22 @@ def test_profile_and_install_merges_every_stage(monkeypatch):
     assert scheduler._cost.schedule == (13980, 256, 256)
 
 
+def test_profile_and_install_groups_tp_workers_by_pp_rank(monkeypatch):
+    monkeypatch.setattr(pp_chunk_scheduler.envs, "TPU_PP_CHUNK_SLACK", 0.1)
+    # Stage 0 TP rank 0 waited 50 ms on its TP peer; TP rank 1 ran in 10 ms.
+    # Stage 1 TP rank 0 ran in 20 ms; TP rank 1 waited 40 ms on its TP peer.
+    r0_tp0 = {**_report(60.0), "pp_rank": 0}
+    r0_tp1 = {**_report(10.0), "pp_rank": 0}
+    r1_tp0 = {**_report(20.0), "pp_rank": 1}
+    r1_tp1 = {**_report(60.0), "pp_rank": 1}
+    executor = _Executor([r0_tp0, r0_tp1, r1_tp0, r1_tp1])
+    scheduler = _scheduler()
+    profile_and_install_cost_model(scheduler, executor)
+    # Within stage 0 min is 10.0; within stage 1 min is 20.0; across stages max is 20.0.
+    assert scheduler._cost.linear_ms[16384] == pytest.approx(20.0 + 163.84)
+    assert scheduler._cost.target_ms == pytest.approx(1.1 * (20.0 + 163.84))
+
+
 def test_profile_and_install_skips_other_schedulers(monkeypatch):
     executor = _Executor([])
     profile_and_install_cost_model(object(), executor)

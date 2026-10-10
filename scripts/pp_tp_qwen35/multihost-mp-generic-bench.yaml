@@ -173,6 +173,7 @@ spec:
                     if [[ "${ENABLE_XPROF,,}" == "1" || "${ENABLE_XPROF,,}" == "true" ]]; then
                       export USE_PHASED_PROFILER=true
                       EXTRA_FLAGS="${EXTRA_FLAGS} --profiler-config.profiler=torch --profiler-config.torch_profiler_dir=${CDK_OUTPUT_DIR} --profiler-config.max_iterations=5 --profiler-config.ignore_frontend=true"
+                      python3 /workspace/vllm-torchtpu/scripts/pp_tp_qwen35/analyze_xprof_pp_tp.py --serve 8099 &
                     fi
 
                     if [[ "${SERVER_ARGS}" == *"--prefill-context-parallel-size 2"* ]] && [[ "${SERVER_ARGS}" != *"--compilation-config"* ]]; then
@@ -251,6 +252,10 @@ spec:
                   value: '{{ .EVAL_TASK | default "gsm8k" }}'
                 - name: EVAL_ARGS
                   value: '{{ .EVAL_ARGS | default "--num_fewshot 5" }}'
+                - name: ENABLE_XPROF
+                  value: '{{ .ENABLE_XPROF | default "0" }}'
+                - name: NUM_NODES
+                  value: '{{ .NUM_NODES | default "2" }}'
                 - name: JS_NAME
                   valueFrom:
                     fieldRef:
@@ -285,11 +290,36 @@ spec:
                         --model "${MODEL_ID}" || echo "[WARNING] Probe check returned non-zero; continuing to benchmark and lm_eval"
                     fi
 
+                    if [[ "${ENABLE_XPROF,,}" == "1" || "${ENABLE_XPROF,,}" == "true" ]]; then
+                      echo "=== Running unprofiled warmup before XProf capture ==="
+                      vllm bench serve \
+                        --backend vllm \
+                        --host "${VLLM_SERVER_DNS}" \
+                        --port "${SERVER_PORT}" \
+                        --model "${MODEL_ID}" \
+                        --dataset-name random \
+                        --random-input-len 8192 \
+                        --random-output-len 1 \
+                        --random-range-ratio 0 \
+                        --num-prompts 2 \
+                        --max-concurrency 1 \
+                        --request-rate inf \
+                        --ignore-eos \
+                        --percentile-metrics ttft,tpot,itl,e2el || true
+                    fi
+
                     IFS=';' read -ra POINTS <<< "${BENCH_SWEEP}"
                     for pt in "${POINTS[@]}"; do
                       [ -z "${pt}" ] && continue
                       IFS=',' read -r IN_LEN OUT_LEN CONC PROMPTS <<< "${pt}"
                       echo "=== Benchmark: in=${IN_LEN} out=${OUT_LEN} conc=${CONC} prompts=${PROMPTS} ==="
+                      if [[ "${ENABLE_XPROF,,}" == "1" || "${ENABLE_XPROF,,}" == "true" ]]; then
+                        PROF_PREFIX="in${IN_LEN}_out${OUT_LEN}_c${CONC}"
+                        echo "Starting XProf capture for ${PROF_PREFIX}..."
+                        curl -sf -X POST "http://${VLLM_SERVER_DNS}:${SERVER_PORT}/start_profile" \
+                          -H "Content-Type: application/json" \
+                          -d "{\"profile_prefix\": \"${PROF_PREFIX}\"}" || true
+                      fi
                       vllm bench serve \
                         --backend vllm \
                         --host "${VLLM_SERVER_DNS}" \
@@ -304,7 +334,20 @@ spec:
                         --request-rate inf \
                         --ignore-eos \
                         --percentile-metrics ttft,tpot,itl,e2el
+                      if [[ "${ENABLE_XPROF,,}" == "1" || "${ENABLE_XPROF,,}" == "true" ]]; then
+                        echo "Stopping XProf capture for ${PROF_PREFIX}..."
+                        curl -sf -X POST "http://${VLLM_SERVER_DNS}:${SERVER_PORT}/stop_profile" || true
+                        sleep 3
+                      fi
                     done
+
+                    if [[ "${ENABLE_XPROF,,}" == "1" || "${ENABLE_XPROF,,}" == "true" ]]; then
+                      for nid in $(seq 0 $(( ${NUM_NODES:-1} - 1 ))); do
+                        NODE_DNS="${JS_NAME}-vllm-node-${nid}-0.${JS_NAME}"
+                        echo "=== Triggering XProf analysis & GCS upload on ${NODE_DNS}:8099 ==="
+                        curl -sf --max-time 600 "http://${NODE_DNS}:8099/analyze" || true
+                      done
+                    fi
 
                     if [[ "${RUN_EVAL,,}" == "true" ]]; then
                       rm -rf "${SITEDIR}"

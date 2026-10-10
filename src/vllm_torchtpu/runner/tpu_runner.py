@@ -7136,6 +7136,7 @@ class TPUModelRunner(GPUModelRunner):
         assert granularity is not None
         return {
             "granularity": int(granularity),
+            "pp_rank": int(get_pp_group().rank_in_group),
             "samples": samples,
             "schedule": schedule,
         }

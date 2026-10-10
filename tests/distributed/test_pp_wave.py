@@ -401,3 +401,17 @@ def test_pipeline_permutation_forms_one_cycle_per_column():
     ]
     assert sorted(s for s, _ in perm) == sorted(t for _, t in perm)
 
+
+def test_sequence_parallel_sliced_outgoing_tensors_pad_to_max_rows(monkeypatch):
+    _, waves = _build_stages(monkeypatch, _template(False), size=2)
+    w0 = waves[0]
+    sp_rows = 16
+    full_rows = 32
+    h = torch.ones(sp_rows, HIDDEN)
+    r = torch.full((sp_rows, HIDDEN), 2.0)
+    padded = w0._pad((h + r,), full_rows)
+    assert padded[0].shape == (MAX_ROWS, HIDDEN)
+    assert torch.equal(padded[0][:sp_rows], torch.full((sp_rows, HIDDEN), 3.0))
+    assert torch.equal(padded[0][sp_rows:], torch.zeros(MAX_ROWS - sp_rows, HIDDEN))
+
+

@@ -195,8 +195,14 @@ def profile_and_install_cost_model(scheduler: Any, executor: Any) -> None:
         for report in reports
         if report.get("schedule") is not None
     ]
+    by_stage: dict[int, list[tuple[int, int, float]]] = {}
+    for idx, report in enumerate(reports):
+        pp_rank = int(report.get("pp_rank", idx))
+        by_stage.setdefault(pp_rank, []).extend(
+            tuple(s) for s in report["samples"]
+        )
     model = StepCostModel.fit(
-        [[tuple(s) for s in report["samples"]] for report in reports],
+        [by_stage[r] for r in sorted(by_stage)],
         envs.TPU_PP_CHUNK_SLACK,
         granularity,
         # Each worker reports its kernel schedule as (pairs, bq, bkv).

@@ -403,6 +403,120 @@ def test_patched_mtp_forward_sequence_parallel(monkeypatch, with_step0_gather):
     assert out.shape == (num_tokens, 4)
 
 
+def test_patched_model_forward_sequence_parallel_pipeline_stages(monkeypatch):
+    """Under PP + SP, stage 0 chunks embeddings to T//tp and returns T//tp
+    IntermediateTensors; non-first stages narrow the [T, H] PPWave buffer's
+    [:T//tp] rows; the last stage all-gathers back to [T, H]."""
+    from vllm.sequence import IntermediateTensors
+    from vllm_torchtpu.models.vllm.qwen3_next_patch import patched_model_forward
+
+    tp = 2
+    num_tokens = 8
+    sp_rows = num_tokens // tp
+    hidden_size = 4
+    _fake_tp_collectives(monkeypatch, tp)
+    _sequence_parallel(monkeypatch, min_rows=0)
+    monkeypatch.setattr(
+        patch_mod.qwen3_next,
+        "sequence_parallel_chunk",
+        lambda x: x.narrow(0, 0, x.shape[0] // tp),
+    )
+
+    class StageLayer:
+        def __call__(self, positions, hidden_states, residual):
+            assert hidden_states.shape == (sp_rows, hidden_size)
+            if residual is None:
+                return hidden_states + 1.0, hidden_states.clone()
+            assert residual.shape == (sp_rows, hidden_size)
+            return hidden_states + 1.0, residual + 0.5
+
+    def make_stage(start_layer: int, end_layer: int):
+        layers = [
+            StageLayer() if start_layer <= i < end_layer else None for i in range(3)
+        ]
+        return SimpleNamespace(
+            use_sequence_parallel=True,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            layers=layers,
+            embed_input_ids=lambda ids: torch.ones(ids.shape[0], hidden_size),
+            norm=lambda h, r: (h + r, None),
+            _maybe_add_hidden_state=lambda aux, idx, h, r: aux,
+        )
+
+    positions = torch.arange(num_tokens)
+
+    # Stage 0 (is_first_rank=True, is_last_rank=False)
+    monkeypatch.setattr(
+        patch_mod,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=False),
+    )
+    out0 = patched_model_forward(
+        make_stage(0, 1),
+        input_ids=torch.zeros(num_tokens, dtype=torch.long),
+        positions=positions,
+    )
+    assert isinstance(out0, IntermediateTensors)
+    assert out0["hidden_states"].shape == (sp_rows, hidden_size)
+    assert out0["residual"].shape == (sp_rows, hidden_size)
+
+    # Simulate PPWave padding [sp_rows, H] sum into [num_tokens, H] hand-off buffer
+    padded_h0 = torch.cat(
+        [
+            out0["hidden_states"] + out0["residual"],
+            torch.zeros(num_tokens - sp_rows, hidden_size),
+        ],
+        dim=0,
+    )
+    padded_r0 = torch.zeros(num_tokens, hidden_size)
+
+    # Stage 1 (intermediate: is_first_rank=False, is_last_rank=False)
+    monkeypatch.setattr(
+        patch_mod,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=False, is_last_rank=False),
+    )
+    out1 = patched_model_forward(
+        make_stage(1, 2),
+        input_ids=None,
+        positions=positions,
+        intermediate_tensors=IntermediateTensors(
+            {"hidden_states": padded_h0, "residual": padded_r0}
+        ),
+    )
+    assert isinstance(out1, IntermediateTensors)
+    assert out1["hidden_states"].shape == (sp_rows, hidden_size)
+    assert out1["residual"].shape == (sp_rows, hidden_size)
+
+    # Stage 2 (last: is_first_rank=False, is_last_rank=True)
+    padded_h1 = torch.cat(
+        [
+            out1["hidden_states"] + out1["residual"],
+            torch.zeros(num_tokens - sp_rows, hidden_size),
+        ],
+        dim=0,
+    )
+    padded_r1 = torch.zeros(num_tokens, hidden_size)
+    monkeypatch.setattr(
+        patch_mod,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=False, is_last_rank=True),
+    )
+    out2 = patched_model_forward(
+        make_stage(2, 3),
+        input_ids=None,
+        positions=positions,
+        intermediate_tensors=IntermediateTensors(
+            {"hidden_states": padded_h1, "residual": padded_r1}
+        ),
+    )
+    assert isinstance(out2, torch.Tensor)
+    assert out2.shape == (num_tokens, hidden_size)
+    torch.testing.assert_close(out2, torch.full((num_tokens, hidden_size), 6.0))
+
+
+
 def test_check_tokens_divide_by_tp():
     """Divisibility check passes when divisible, raises RuntimeError when not."""
     patch_target = (

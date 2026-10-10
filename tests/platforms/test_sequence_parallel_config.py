@@ -161,21 +161,19 @@ def test_sequence_parallel_rejects_non_mtp_speculative(configure_sp_moe, method)
         configure_sp_moe(vllm_config)
 
 
-def test_sequence_parallel_rejects_pipeline_parallel(configure_sp_moe):
+def test_sequence_parallel_admits_pipeline_parallel(configure_sp_moe):
     parallel_config = SimpleNamespace(
         use_sequence_parallel_moe=True,
-        tensor_parallel_size=8,
-        pipeline_parallel_size=2,
+        tensor_parallel_size=2,
+        pipeline_parallel_size=4,
     )
     model_config = SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"])
     vllm_config = SimpleNamespace(
         parallel_config=parallel_config,
         model_config=model_config,
-        compilation_config=SimpleNamespace(compile_sizes=[16, 32, 64]),
+        compilation_config=SimpleNamespace(compile_sizes=[4, 8, 16, 32, 64]),
         speculative_config=None,
     )
-    with pytest.raises(
-        ValueError,
-        match="does not support pipeline parallelism",
-    ):
-        configure_sp_moe(vllm_config)
+    configure_sp_moe(vllm_config)
+    assert vllm_config.compilation_config.compile_sizes == [4, 8, 16, 32, 64]
+
