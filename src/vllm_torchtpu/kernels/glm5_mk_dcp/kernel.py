@@ -460,7 +460,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         "att_acc": pltpu.VMEM((cfg.QMAX * NH, KL), F32),
         "m_s": pltpu.VMEM((cfg.QMAX * NH, 1), F32), "l_s": pltpu.VMEM((cfg.QMAX * NH, 1), F32),
         "osend": pltpu.VMEM((R, TMAX, OW), U32), "orecv": pltpu.VMEM((R, TMAX, OW), U32),
-        "orow": pltpu.VMEM((M, KRO), F32),
+        "orow": pltpu.VMEM((M, KRO), F32), "oh": pltpu.VMEM((HR, M, KL), F32), "mvalid": pltpu.VMEM((M, 128), F32),
         # reduce-scatter
         "part": pltpu.VMEM((M, H), F32),
         "psend": pltpu.VMEM((R, RPR, H), BF16), "rsrecv": pltpu.VMEM((R, RPR, H), BF16),
@@ -1602,39 +1602,51 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         def merge():
             """LSE merge of the R partials of this rank's HR heads, main's formula
             (cp_mla_attention.py:148-186): shift = max finite lse; w_r = exp(l_r - shift) / sum;
-            o = sum f32(o_r) * bf16(w_r) + sum f32(o_r) * (w_r - bf16(w_r)), then bf16."""
-            os_, lr = [], []
-            for s_ in range(R):
-                blk = scr["orecv"][s_]                                       # [TMAX, OW] u32
-                os_.append(jnp.concatenate([unpack_lo(blk[:, :OH]), unpack_hi(blk[:, :OH])], axis=1))
-                lr.append(lax.bitcast_convert_type(blk[:, OH:OH + 128], F32))  # lanes hh
-            fin = [jnp.isfinite(x_) for x_ in lr]
-            shift = jnp.full((TMAX, 128), -jnp.inf, F32)
-            for x_, f_ in zip(lr, fin):
-                shift = jnp.maximum(shift, jnp.where(f_, x_, -jnp.inf))
-            shift = jnp.where(jnp.isfinite(shift), shift, 0.0)
-            ws = [jnp.where(f_, jnp.exp(x_ - shift), 0.0) for x_, f_ in zip(lr, fin)]
-            tot = ws[0]
-            for w_ in ws[1:]:
-                tot = tot + w_
-            tot = jnp.where(tot > 0, tot, 1.0)
-            ws = [w_ / tot for w_ in ws]
-            valid_t = rvalid[0:TMAX]
-            outs = []
-            for hh in range(HR):
-                hi = jnp.zeros((TMAX, KL), F32)
-                lo = jnp.zeros((TMAX, KL), F32)
+            o = sum f32(o_r) * bf16(w_r) + sum f32(o_r) * (w_r - bf16(w_r)), then bf16.
+            In MCH-row chunks, two passes (lse lanes, then one partial at a time): the live set is
+            O(MCH * HR * KL), not O(R * TMAX * HR * KL) (~8 MiB of Mosaic temporaries at TMAX 64)."""
+            MCH = min(TMAX, 16)
+            scr["mvalid"][...] = jnp.broadcast_to(rvalid, (M, 128))
+
+            def body(c, cc):
+                r0 = pl.multiple_of(c * MCH, MCH)
+
+                def lse_of(s_):
+                    return lax.bitcast_convert_type(scr["orecv"][s_, pl.ds(r0, MCH), OH:OH + 128], F32)
+                shift = jnp.full((MCH, 128), -jnp.inf, F32)
                 for s_ in range(R):
-                    o_ = os_[s_][:, hh * KL:(hh + 1) * KL]                   # [TMAX, KL]
-                    w_ = ws[s_][:, hh:hh + 1]
-                    wh = bf(w_)
-                    hi = hi + o_ * wh
-                    lo = lo + o_ * (w_ - wh)
-                o = bf(hi + lo) * valid_t
-                if M > TMAX:
-                    o = jnp.concatenate([o, jnp.zeros((M - TMAX, KL), F32)], axis=0)
-                outs.append(o)
-            return outs
+                    x_ = lse_of(s_)
+                    shift = jnp.maximum(shift, jnp.where(jnp.isfinite(x_), x_, -jnp.inf))
+                shift = jnp.where(jnp.isfinite(shift), shift, 0.0)
+
+                def w_of(s_):
+                    x_ = lse_of(s_)
+                    return jnp.where(jnp.isfinite(x_), jnp.exp(x_ - shift), 0.0)
+                tot = w_of(0)
+                for s_ in range(1, R):
+                    tot = tot + w_of(s_)
+                tot = jnp.where(tot > 0, tot, 1.0)
+                hi = [jnp.zeros((MCH, KL), F32) for _ in range(HR)]
+                lo = [jnp.zeros((MCH, KL), F32) for _ in range(HR)]
+                for s_ in range(R):
+                    blk = scr["orecv"][s_, pl.ds(r0, MCH), 0:OH]                 # [MCH, OH] u32
+                    o_all = jnp.concatenate([unpack_lo(blk), unpack_hi(blk)], axis=1)
+                    w_s = w_of(s_) / tot
+                    for hh in range(HR):
+                        o_ = o_all[:, hh * KL:(hh + 1) * KL]
+                        w_ = w_s[:, hh:hh + 1]
+                        wh = bf(w_)
+                        hi[hh] = hi[hh] + o_ * wh
+                        lo[hh] = lo[hh] + o_ * (w_ - wh)
+                valid_t = scr["mvalid"][pl.ds(r0, MCH), 0:1]
+                for hh in range(HR):
+                    scr["oh"][hh, pl.ds(r0, MCH), :] = bf(hi[hh] + lo[hh]) * valid_t
+                return cc
+            lax.fori_loop(0, TMAX // MCH, body, 0)
+            if M > TMAX:
+                for hh in range(HR):
+                    scr["oh"][hh, TMAX:M, :] = jnp.zeros((M - TMAX, KL), F32)
+            return [scr["oh"][hh] for hh in range(HR)]
 
         # ---------------- MoE ----------------
         def moe(l, slot, X):
