@@ -152,9 +152,8 @@ def kernel(
     def transpose_to_head_major(bq_rows, n_tok):
         return bq_rows.transpose(1, 0, 2).reshape(num_q_heads * n_tok, head_dim)
 
-    def reduce_heads(bq_rows, bkv, bq_weights):
+    def reduce_heads(bq_rows, bkv, bq_weights, w_pre_folded: bool = False):
         n_tok = bq_weights.shape[0]
-        w = bq_weights.astype(jnp.float32)
 
         def qk(rows):
             return jnp.einsum(
@@ -162,21 +161,31 @@ def kernel(
             )
 
         if n_tok < 8:
+            w = bq_weights.astype(jnp.float32)
             st = jnp.maximum(qk(bq_rows), 0.0).reshape(n_tok, num_q_heads, -1)
             return (st * w[:, :, None]).sum(axis=1)
 
-        # n_tok >= 8 only in the MIXED pass, whose q is pre-transposed into q_hm_ref.
+        # n_tok >= 8 only in the MIXED pass, whose q is pre-transposed & pre-weighted into q_hm_ref at bkv_idx == 0.
         rows_hm = bq_rows.reshape(num_q_heads, n_tok, head_dim)
-        head_group = min(32 if n_tok == 8 else 8, num_q_heads)
+        head_group = min(64 if n_tok == 8 else 16, num_q_heads)
         acc = None
+        if w_pre_folded:
+            for g in range(0, num_q_heads, head_group):
+                grp = min(head_group, num_q_heads - g)
+                st_g = jnp.maximum(
+                    qk(rows_hm[g : g + grp].reshape(grp * n_tok, head_dim)), 0.0
+                ).reshape(grp, n_tok, -1)
+                term = st_g.sum(axis=0)
+                acc = term if acc is None else acc + term
+            return acc * bq_weights
+        w_hm = bq_weights.astype(jnp.float32).T[:, :, None]
         for g in range(0, num_q_heads, head_group):
             grp = min(head_group, num_q_heads - g)
             st_g = jnp.maximum(
                 qk(rows_hm[g : g + grp].reshape(grp * n_tok, head_dim)), 0.0
             ).reshape(grp, n_tok, -1)
-            for h in range(grp):
-                term = st_g[h] * w[:, g + h : g + h + 1]
-                acc = term if acc is None else acc + term
+            term = (st_g * w_hm[g : g + grp]).sum(axis=0)
+            acc = term if acc is None else acc + term
         return acc
 
     def step_body(
@@ -187,18 +196,24 @@ def kernel(
         bq_idx = bq_block(p_id)
         bkv_idx = bkv_block(p_id)
 
+        w_data = weights_vmem[...].reshape(seq_batch_size, -1, num_q_heads)
+        w_pre_folded = q_hm_ref is not None
         if q_hm_ref is not None:
+            w_f32 = w_data[0].astype(jnp.float32)
+            w_max = jnp.max(w_f32, axis=-1, keepdims=True)
+            bq_weights_vec = [w_max]
 
             @pl.when(bkv_idx == 0)
             def _():
-                q_hm_ref[...] = transpose_to_head_major(q_vmem[...], bq_sz)
+                rel_w = jnp.where(w_max > 0.0, w_f32 / w_max, 0.0)[:, :, None]
+                q_scaled = (q_vmem[...].astype(jnp.float32) * rel_w).astype(q_vmem.dtype)
+                q_hm_ref[...] = transpose_to_head_major(q_scaled, bq_sz)
 
             bq_vec = [q_hm_ref[...]]
         else:
             q_data = q_vmem[...].reshape(seq_batch_size, -1, head_dim)
             bq_vec = [q_data[i] for i in range(seq_batch_size)]
-        w_data = weights_vmem[...].reshape(seq_batch_size, -1, num_q_heads)
-        bq_weights_vec = [w_data[i] for i in range(seq_batch_size)]
+            bq_weights_vec = [w_data[i] for i in range(seq_batch_size)]
 
         chunk_start = start_end_seq_idx_ref[2]
         q_iota = jnp.arange(bq_sz, dtype=jnp.int32)
@@ -235,7 +250,7 @@ def kernel(
         for batch_idx in range(seq_batch_size):
             bq = bq_vec[batch_idx].reshape(-1, head_dim)
             s_summed = (
-                reduce_heads(bq, bkvs[batch_idx], bq_weights_vec[batch_idx])
+                reduce_heads(bq, bkvs[batch_idx], bq_weights_vec[batch_idx], w_pre_folded=w_pre_folded)
                 * bkv_scales[batch_idx]
             )
             kv_len = seq_lens_ref[batch_start_seq_idx + batch_idx] >> shift_comp
@@ -580,21 +595,23 @@ def _compute_metadata(
 
 
 def _chunk_and_bq_config(max_num_tokens: int) -> tuple[int, int, int, int]:
-    is_decode_or_verify = max_num_tokens <= 512
+    is_decode_or_verify = max_num_tokens <= 1536 and max_num_tokens != 1024
     bq_mixed_in = 8 if is_decode_or_verify else 128
     bkv_p = 16 if is_decode_or_verify else 8
     chunk_tokens = (
-        256
-        if max_num_tokens >= 1024 and max_num_tokens % 256 == 0
+        512
+        if (not is_decode_or_verify and max_num_tokens >= 512 and max_num_tokens % 512 == 0)
         else {
-            512: 128,
-            384: 96,
-            256: 64,
-            192: 96,
-            128: 64,
-            96: 48,
-            64: 32,
-            16: 8,
+            1536: 512,
+            768: 384,
+            512: 512,
+            384: 384,
+            256: 256,
+            192: 192,
+            128: 128,
+            96: 96,
+            64: 64,
+            16: 16,
         }.get(max_num_tokens, 512)
     )
     if chunk_tokens is None or max_num_tokens % chunk_tokens:
@@ -1049,8 +1066,13 @@ def streamindex_topk(
         sc2_group = None if m >= num_chunks - 2 else group_base + m + 1
         start = m * chunk_len
 
+        ordered_passes = (
+            (*passes[2:], *passes[:2])
+            if not need_smem_split and len(passes) == 3
+            else passes
+        )
         state = None
-        for slice_spec, pass_meta in passes:
+        for slice_spec, pass_meta in ordered_passes:
             if (
                 state is not None
                 and not need_smem_split
