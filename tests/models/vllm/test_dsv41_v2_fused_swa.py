@@ -519,7 +519,7 @@ class TestFusedSwaHelpers:
         assert jnp.array_equal(kv[0, :2], natural)
         assert not jnp.array_equal(split_halves(natural), natural)
 
-    @pytest.mark.parametrize("tokens", [50, 96, 144])
+    @pytest.mark.parametrize("tokens", [50, 96, 144, 192])
     def test_fused_swa_inputs_two_banks_and_wide_window(self, tokens):
         dim = 256
         pool = jnp.arange(32 * 128, dtype=jnp.int32).reshape(32, 128)

@@ -819,11 +819,11 @@ def test_forward_unsharded_bypasses_sp_gathers(monkeypatch):
     assert attn_fn_mock.called
 
 
-@pytest.mark.parametrize("batch_size", [384, 576, 672])
+@pytest.mark.parametrize("batch_size", [384, 576, 672, 768, 1152, 1536])
 def test_td8196_high_conc_b384_576_672_ep8_routing_and_dispatch_parity(
     monkeypatch, batch_size: int
 ):
-    """Verify TD8.196 EP=8 partitioned routing and _maybe_dispatch at B=384/576/672."""
+    """Verify EP=8 partitioned routing and _maybe_dispatch at B=384..1536."""
     import vllm.distributed.parallel_state as ps
 
     ep_size = 8

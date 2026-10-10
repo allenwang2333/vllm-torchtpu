@@ -232,7 +232,8 @@ def test_score_word_rows_wrapper_mesh_and_standalone():
 
 
 @pytest.mark.parametrize(
-    "tokens", [36, 72, 84, 96, 144, 168, 192, 288, 336, 384, 576, 672, 768, 1152]
+    "tokens",
+    [36, 72, 84, 96, 144, 168, 192, 288, 336, 384, 576, 672, 768, 1152, 1536],
 )
 def test_paged_index_scores_single_16k_tile_for_candidate_and_verify(tokens):
     width = 12928

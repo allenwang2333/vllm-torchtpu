@@ -991,7 +991,7 @@ def fused_swa_inputs(
 
     Returns ``(kv [tokens, width128, dim], bias [tokens, width128 // 128,
     128])`` with ``width`` padded to a 128 multiple by ``-1`` records. When
-    ``pad > 0`` and ``48 < tokens <= 144``, the gather reads only the unpadded
+    ``pad > 0`` and ``48 < tokens <= 192``, the gather reads only the unpadded
     ``width`` columns in split element order, restores natural order with the
     MXU permutation `merge_halves`, zeroes dead ``< 0`` records to keep
     ``0 * NaN`` out of the PV product, and zero/min-pads the trailing
@@ -1002,7 +1002,7 @@ def fused_swa_inputs(
     tokens, width = swa_records.shape
     padded = max(128, -(-width // 128) * 128)
     pad = padded - width
-    if pad and 48 < tokens <= 144:
+    if pad and 48 < tokens <= 192:
         live = swa_records >= 0
         rows = gather_cache_values(
             cast(Any, swa_pool), swa_records.reshape(-1), dim, split=True
@@ -2370,7 +2370,7 @@ def paged_index_scores_jax(
     # over 16.9K rows).
     eff_tokens = (
         min(tokens // 6, _INDEX_KEYS_PER_ITER // _INDEX_MAX_TILE)
-        if (tokens // 6 <= records.shape[0] and 6 <= tokens <= 1152 and tokens % 6 == 0)
+        if (tokens // 6 <= records.shape[0] and 6 <= tokens <= 1536 and tokens % 6 == 0)
         else tokens
     )
     budget = min(
