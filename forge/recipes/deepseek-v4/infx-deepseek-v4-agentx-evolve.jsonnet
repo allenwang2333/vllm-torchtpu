@@ -152,9 +152,12 @@ local setRetentionInterval =
        && (blockSize == 0 || std.parseInt(prefixCacheRetentionInterval) % blockSize == 0) then true
   else error 'PREFIX_CACHE_RETENTION_INTERVAL must be none or a multiple of BLOCK_SIZE=%d, got "%s"'
              % [blockSize, prefixCacheRetentionInterval];
-// Empty drops --scheduler-cls (vLLM's default scheduler). To opt back in:
+// Shortest-remaining-prefill-first: decodes first, then prefill chunks and waiting requests by remaining
+// prompt tokens (vllm_torchtpu/core/srpt_prefill_scheduler.py). j-4fdda261-648a-4891-96f2 vs
+// j-f0249689-77e1-4eed-ad7e (same tree otherwise): 164,297 vs 154,663 total tok/s, mean TTFT 10.5 vs 14.9 s.
+// SCHEDULER_CLS=none drops --scheduler-cls (vLLM's default scheduler). Others:
 // SCHEDULER_CLS=vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
-local schedulerCls = cdk.var('SCHEDULER_CLS', '');
+local schedulerCls = cdk.var('SCHEDULER_CLS', 'vllm_torchtpu.core.srpt_prefill_scheduler.SrptPrefillScheduler');
 // With SCHEDULER_CLS=vllm_torchtpu.core.dp_prefill_gate.DpPrefillGateScheduler (needs a VLLM_TORCHTPU_SRC
 // that has it), each EngineCore_DPn logs "DP prefill gate:" counts of why throttled steps carried prefill
 // every TPU_PREFILL_GATE_LOG_STEPS steps (vllm-torchtpu default 1000). TPU_PREFILL_GATE_MIN_CADENCES=N>=1
@@ -371,7 +374,7 @@ local serveArgs = [
   '--gpu-memory-utilization=%s' % gpuMemoryUtilization,
   '"${OFFLOAD_ARGS[@]}"',
 ]
-+ (if schedulerCls != '' then ['--scheduler-cls %s' % schedulerCls] else [])
++ (if schedulerCls != 'none' then ['--scheduler-cls %s' % schedulerCls] else [])
 + (if prefillScheduleInterval != 0 then ['--prefill-schedule-interval=%d' % prefillScheduleInterval] else [])
 + (if longPrefillTokenThreshold != 0 then ['--long-prefill-token-threshold=%d' % longPrefillTokenThreshold] else [])
 + (if toolCallParser != '' then ['--tool-call-parser=%s' % toolCallParser] else [])
