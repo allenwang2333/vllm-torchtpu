@@ -100,33 +100,47 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
             )
             return cache
 
+        import os, re
+        _pure_prefill = os.environ.get("VLLM_DSV41_PURE_20L_PREFILL", "0") == "1"
+        _idx_host_by_ps: dict[int, torch.Tensor] = {}
+        _mla_host_by_ps: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         csa_nope_hosts: list[torch.Tensor] = []
         for layer_name in mla_layer_names:
             spec = per_layer_spec(layer_name)
             page_size = spec.num_states
+            _m_lid = re.search(r"\.layers\.(\d+)\.", layer_name)
+            _lid = int(_m_lid.group(1)) if _m_lid else 0
             if layer_name.endswith(self._DS_V4_INDEXER_CACHE_SUFFIX):
-                shape = (num_blocks, spec.head_size // packing, packing, page_size)
-                kv_caches[layer_name] = _create_cache(
-                    shape, layer_name, scale_idx=(32, 0, slice(None))
-                )
+                if _pure_prefill and _lid > 20 and page_size in _idx_host_by_ps:
+                    kv_caches[layer_name] = _idx_host_by_ps[page_size]
+                else:
+                    shape = (num_blocks, spec.head_size // packing, packing, page_size)
+                    kv_caches[layer_name] = _create_cache(
+                        shape, layer_name, scale_idx=(32, 0, slice(None))
+                    )
+                    _idx_host_by_ps[page_size] = kv_caches[layer_name]
             else:
-                nope = _create_cache(
-                    (num_blocks, page_size, csa_cache_layout.ROW_WORDS),
-                    layer_name,
-                    torch.int32,
-                    (slice(None), slice(64, 128)),
-                )
-                rope = _create_cache(
-                    (
-                        num_blocks,
-                        page_size // csa_cache_layout.ROPE_TOKENS_PER_ROW,
-                        csa_cache_layout.ROW_WORDS,
-                    ),
-                    f"{layer_name}{self._DS_V4_ROPE_CACHE_SUFFIX}",
-                    torch.int32,
-                )
-                kv_caches[layer_name] = (nope, rope)
-                csa_nope_hosts.append(nope)
+                if _pure_prefill and _lid > 20 and page_size in _mla_host_by_ps:
+                    kv_caches[layer_name] = _mla_host_by_ps[page_size]
+                else:
+                    nope = _create_cache(
+                        (num_blocks, page_size, csa_cache_layout.ROW_WORDS),
+                        layer_name,
+                        torch.int32,
+                        (slice(None), slice(64, 128)),
+                    )
+                    rope = _create_cache(
+                        (
+                            num_blocks,
+                            page_size // csa_cache_layout.ROPE_TOKENS_PER_ROW,
+                            csa_cache_layout.ROW_WORDS,
+                        ),
+                        f"{layer_name}{self._DS_V4_ROPE_CACHE_SUFFIX}",
+                        torch.int32,
+                    )
+                    kv_caches[layer_name] = (nope, rope)
+                    _mla_host_by_ps[page_size] = (nope, rope)
+                    csa_nope_hosts.append(nope)
 
         if not csa_nope_hosts:
             raise ValueError(f"No CSA layer in MLA layers: {mla_layer_names}")
