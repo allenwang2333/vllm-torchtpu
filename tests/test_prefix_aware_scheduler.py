@@ -222,6 +222,13 @@ def test_init_and_edge_branches():
     ):
         assert s._select_waiting_queue_for_scheduling() is None
 
+    # schedule() delegates to queue selection and super().schedule()
+    with patch.object(
+        AsyncScheduler, "schedule", return_value="scheduled_output"
+    ) as mock_super_schedule:
+        assert s.schedule("arg1", kw="val1") == "scheduled_output"
+        mock_super_schedule.assert_called_once_with("arg1", kw="val1")
+
     # Non-FCFS policy is a no-op
     now = time.time()
     r1 = _make_request("r1", num_tokens=1000, arrival_time=now - 15)
