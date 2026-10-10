@@ -525,10 +525,13 @@ def _routing_plan(topk_ids, route_valid, experts, row_scale):
     """Expert-major slab order for the routed rows, with no scatter or gather
     over the routes.
 
-    One key/value sort orders the routes by expert, carrying each route's id
-    and its token's activation scale; a second sort of that permutation gives
-    its inverse (each route's slab row). Routes where route_valid [T, K] is
-    False get the sentinel expert E, sort last and are never visited.
+    One sort orders the routes by expert, carrying each route's id and its
+    token's activation scale; a second sort of that permutation gives its
+    inverse (each route's slab row). While the ids fit, each is a single
+    unstable sort of packed uint32 keys: the keys are distinct, so it gives
+    the stable key/value sort's permutation, at a lower cost. Routes where
+    route_valid [T, K] is False get the sentinel expert E, sort last and are
+    never visited.
 
     Returns the token of each slab row [R], the slab row of each route [T, K],
     the activation scale of each slab row [R], the visit tables (expert, first
@@ -541,10 +544,24 @@ def _routing_plan(topk_ids, route_valid, experts, row_scale):
     )
     iota = jnp.arange(routes, dtype=jnp.int32)
     route_scale = jnp.broadcast_to(row_scale[:, None], (tokens, topk)).reshape(-1)
-    _, order, sorted_scale = lax.sort(
-        (route_expert, iota, route_scale), num_keys=1, is_stable=True
-    )
-    _, slab_row = lax.sort((order, iota), num_keys=1, is_stable=False)
+    if routes < 1 << 20 and experts < 1 << 11:
+        # One sort on (expert << 20) | route (expert ids up to E < 2^11, route
+        # ids < 2^20): the route id breaks ties within an expert, so this is
+        # the stable expert order.
+        key = (route_expert.astype(jnp.uint32) << 20) | iota.astype(jnp.uint32)
+        key, sorted_scale = lax.sort((key, route_scale), num_keys=1, is_stable=False)
+        order = (key & ((1 << 20) - 1)).astype(jnp.int32)
+    else:
+        _, order, sorted_scale = lax.sort(
+            (route_expert, iota, route_scale), num_keys=1, is_stable=True
+        )
+    if routes <= 1 << 16:
+        # One sort on (route << 16) | slab row, the route being order[slab row]:
+        # entry r ends up holding route r's slab row in its low 16 bits.
+        key = (order.astype(jnp.uint32) << 16) | iota.astype(jnp.uint32)
+        slab_row = (lax.sort(key, is_stable=False) & 0xFFFF).astype(jnp.int32)
+    else:
+        _, slab_row = lax.sort((order, iota), num_keys=1, is_stable=False)
     counts = jnp.sum(
         route_expert[None, :] == jnp.arange(experts, dtype=jnp.int32)[:, None],
         axis=1,
