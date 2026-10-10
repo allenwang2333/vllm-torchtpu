@@ -527,13 +527,204 @@ class TestAttentionKvShard:
                 idx_w = torch.ones((count, 2), dtype=torch.bfloat16)
                 attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
 
-            # When sharded=True, row_indices must be called for both SWA and Indexer!
+            # When sharded=True on a mock without int block_offset/replicated_blocks,
+            # row_indices fallback is exercised for both SWA and Indexer!
             if is_sharded:
                 assert len(swa_calls) >= 1
                 assert len(idx_calls) >= 1
             else:
                 assert len(swa_calls) == 0
                 assert len(idx_calls) == 0
+
+    def test_td8223_sharded_fast_swa_and_idx_offset_parity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """TD8.223: Verify real PagedCacheRows with sharded=True uses the fast
+        SWA and Indexer offset path (0 row_indices calls) and matches row_indices
+        bitwise across replicated_blocks=0/>0, row_offset=0/>0, and 3-page/non-3page."""
+        count = 4
+        capacity = 40
+        positions = torch.tensor([0, 17, 35, 63], dtype=torch.int32)
+        table = torch.tensor([[0, 2, 16, 18], [3, 5, 19, 25]], dtype=torch.int32)
+        meta = SimpleNamespace(
+            seq_lens=torch.tensor([18, 64], dtype=torch.int32),
+            block_tables=table,
+            query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+        )
+        forward_ctx = SimpleNamespace(
+            attn_metadata={"src_pfx": meta, "idx_pfx": meta},
+            additional_kwargs={},
+        )
+        monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
+        monkeypatch.setattr(v2_attn, "_insert", lambda *a, **kw: None)
+
+        raw_pool = torch.zeros((4096, 128), dtype=torch.int32)
+        plain_cache = torch.empty((1, 16))
+
+        for rep in (0, 4):
+            for blk_off in (0, 16):
+                for row_off_bytes in (0, 4096):
+                    for window_size in (64, 128):
+                        swa_layout = (
+                            (20, 16, 128),
+                            torch.bfloat16,
+                            16 * 256 * 2,
+                            row_off_bytes,
+                            blk_off,
+                            True,
+                            rep,
+                        )
+                        idx_layout = (
+                            (20, 16, 64),
+                            torch.bfloat16,
+                            16 * 128 * 2,
+                            row_off_bytes,
+                            blk_off,
+                            True,
+                            rep,
+                        )
+                        swa_cache = PagedCacheRows(raw_pool, swa_layout)
+                        idx_cache = PagedCacheRows(raw_pool, idx_layout)
+                        assert v2_attn._has_fast_cache_offset(swa_cache)
+                        assert v2_attn._has_fast_cache_offset(idx_cache)
+
+                        # Compute reference SWA and Indexer records via row_indices
+                        requests = v2_attn._token_requests(meta, positions).clamp(
+                            max=table.shape[0] - 1
+                        )
+                        logical = (
+                            positions[:, None]
+                            - window_size
+                            + 1
+                            + torch.arange(window_size)[None, :]
+                        )
+                        valid_win = logical >= 0
+                        raw_swa_slots = v2_attn._row_slots(
+                            plain_cache, table, requests, logical
+                        )
+                        ref_swa_recs = swa_cache.row_indices(raw_swa_slots).masked_fill(
+                            ~valid_win, -1
+                        )
+                        raw_idx_slots = v2_attn._request_row_slots(
+                            plain_cache, table, capacity
+                        )
+                        ref_idx_recs = idx_cache.row_indices(raw_idx_slots)
+
+                        seen_swa: list[torch.Tensor] = []
+                        seen_idx: list[torch.Tensor] = []
+                        monkeypatch.setattr(
+                            v2_attn,
+                            "sparse_fp8_attention",
+                            lambda q, _sc, _mc, s_rec, *a, _s=seen_swa, **kw: (
+                                _s.append(s_rec) or torch.zeros_like(q)
+                            ),
+                        )
+
+                        swa_ri_calls = 0
+                        idx_ri_calls = 0
+                        orig_swa_ri = swa_cache.row_indices
+                        orig_idx_ri = idx_cache.row_indices
+
+                        def _spy_swa_ri(s, _orig=orig_swa_ri):
+                            nonlocal swa_ri_calls
+                            swa_ri_calls += 1
+                            return _orig(s)
+
+                        def _spy_idx_ri(s, _orig=orig_idx_ri):
+                            nonlocal idx_ri_calls
+                            idx_ri_calls += 1
+                            return _orig(s)
+
+                        monkeypatch.setattr(swa_cache, "row_indices", _spy_swa_ri)
+                        monkeypatch.setattr(idx_cache, "row_indices", _spy_idx_ri)
+
+                        attn = object.__new__(v2_attn.DeepseekV41Attention)
+                        torch.nn.Module.__init__(attn)
+                        attn.prefix = "src_pfx"
+                        attn.compressed_cache_prefix = "src_pfx"
+                        attn.index_source_layer_id = 0
+                        attn.window_size = window_size
+                        attn.compress_ratio = 2
+                        attn._max_model_len = capacity * 2
+                        attn._config = {"index_topk": 2}
+                        attn._fp8_kv = True
+                        attn._ced_decoder = False
+                        attn._ced_global_from_encoder = False
+                        attn._local_q_attn = False
+                        attn.n_local_heads = 2
+                        attn.head_dim = 8
+                        attn.scale = 0.25
+                        attn.attn_sink = torch.zeros(2)
+                        attn._swa_max_requests = None
+                        attn._precompact_records = True
+                        attn._token_parallel_attn = True
+                        attn._full_attn_sink = torch.zeros(2)
+                        attn._tp_rank_1d = torch.tensor([0], dtype=torch.int32)
+                        attn.topk_indices_buffer = torch.full(
+                            (16, 4), -1, dtype=torch.int32
+                        )
+                        attn._rotate = lambda x, p: x
+                        attn.wq_b = lambda qr: qr
+                        attn.compressor = None
+                        attn.swa_cache_layer = SimpleNamespace(
+                            prefix="src_pfx", kv_cache=swa_cache
+                        )
+                        attn.kv_cache = swa_cache
+                        attn._static_forward_context = {
+                            "src_pfx": SimpleNamespace(kv_cache=swa_cache)
+                        }
+                        attn.indexer = SimpleNamespace(
+                            head_dim=8,
+                            n_head=2,
+                            wk=lambda lat: lat,
+                            k_norm=lambda k: k,
+                            k_cache=SimpleNamespace(
+                                prefix="idx_pfx",
+                                compress_ratio=2,
+                                kv_cache=idx_cache,
+                            ),
+                        )
+                        attn._select_paged_indices = (
+                            lambda _qr, _pos, _ic, i_rec, *a, _i=seen_idx, **kw: (
+                                _i.append(i_rec)
+                                or torch.zeros((count, 2), dtype=torch.int32)
+                            )
+                        )
+
+                        out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
+                        qr = torch.ones((count, 16), dtype=torch.bfloat16)
+                        kv = torch.ones((count, 8), dtype=torch.bfloat16)
+                        idx_w = torch.ones((count, 2), dtype=torch.bfloat16)
+
+                        # 1. Inside stage_attention_cache_scope (3-page at w=64,
+                        #    non-3page at w=128 since 6 * 16 = 96 < 128)
+                        with v2_attn.stage_attention_cache_scope():
+                            attn._prepare_tpu(
+                                None, qr, kv, None, None, idx_w, positions, out
+                            )
+                            attn._prepare_tpu(
+                                None, qr, kv, None, None, idx_w, positions, out
+                            )
+                        assert swa_ri_calls == 0
+                        assert idx_ri_calls == 0
+                        assert seen_swa[0].dtype == torch.int32
+                        assert seen_idx[0].dtype == torch.int32
+                        assert torch.equal(seen_swa[0], ref_swa_recs)
+                        assert seen_swa[0] is seen_swa[1]
+                        assert torch.equal(seen_idx[0], ref_idx_recs)
+                        assert seen_idx[0] is seen_idx[1]
+
+                        # 2. Outside stage_attention_cache_scope
+                        seen_swa.clear()
+                        seen_idx.clear()
+                        attn._prepare_tpu(
+                            None, qr, kv, None, None, idx_w, positions, out
+                        )
+                        assert idx_ri_calls == 0
+                        assert seen_swa[0].dtype == torch.int32
+                        assert seen_idx[0].dtype == torch.int32
+                        assert torch.equal(seen_swa[0], ref_swa_recs)
+                        assert torch.equal(seen_idx[0], ref_idx_recs)
 
 
 # ==============================================================================

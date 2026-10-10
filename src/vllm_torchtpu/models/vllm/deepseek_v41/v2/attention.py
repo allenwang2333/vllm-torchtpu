@@ -483,6 +483,52 @@ def _query_split(count, ranks, *, kv_shard: bool = False):
     return (count + 2 * ranks - 1) // (2 * ranks) * 2, 2 * ranks
 
 
+def _has_fast_cache_offset(cache) -> bool:
+    return isinstance(getattr(cache, "row_offset", None), int) and (
+        not getattr(cache, "sharded", False)
+        or (
+            isinstance(getattr(cache, "block_offset", None), int)
+            and isinstance(getattr(cache, "replicated_blocks", None), int)
+        )
+    )
+
+
+def _fast_cache_offset_key(cache):
+    return (
+        (
+            cache.page_stride,
+            cache.block_offset,
+            cache.replicated_blocks,
+            cache.shape[0],
+        )
+        if getattr(cache, "sharded", False)
+        else cache.page_stride
+    )
+
+
+def _map_cache_blocks(cache, blocks):
+    if not getattr(cache, "sharded", False):
+        return blocks * cache.page_stride, None
+    rep = cache.replicated_blocks
+    sharded_blocks = cache.shape[0] - rep
+    sharded_local = blocks - cache.block_offset
+    in_rep = (blocks >= 0) & (blocks < rep)
+    in_sharded = (sharded_local >= 0) & (sharded_local < sharded_blocks)
+    owned = (blocks >= 0) & (in_rep | in_sharded)
+    local_blocks = torch.where(in_rep, blocks, rep + sharded_local).clamp(
+        min=0, max=max(cache.shape[0] - 1, 0)
+    )
+    return local_blocks * cache.page_stride, ~owned
+
+
+def _fast_swa_row_slots(swa_cache, blocks, rem, invalid_window):
+    mapped_blocks, swa_unowned = _map_cache_blocks(swa_cache, blocks)
+    return (
+        (mapped_blocks + rem).int(),
+        invalid_window if swa_unowned is None else invalid_window | swa_unowned,
+    )
+
+
 def _request_row_slots(cache, block_table, width):
     """Slots of logical rows ``0..width-1`` for every request: ``[requests, width]``.
 
@@ -490,25 +536,36 @@ def _request_row_slots(cache, block_table, width):
     them once per request instead of once per token.
     """
     rows_per_page = cache.shape[1]
+    fast_offset = _has_fast_cache_offset(cache)
+    table_blocks = block_table.to(torch.int32) if fast_offset else block_table.long()
+    page_bases, unowned_pages = (
+        _map_cache_blocks(cache, table_blocks)
+        if fast_offset
+        else (table_blocks * rows_per_page, None)
+    )
+    if unowned_pages is not None:
+        page_bases = page_bases.masked_fill(unowned_pages, -rows_per_page)
     # Logical row r lives in table column r // rows_per_page, so repeating each
     # column rows_per_page times lines blocks up with rows 0..width-1 without
     # a full-width gather (16-40x slower on TPU, see _row_slots).
-    blocks = (
-        block_table[:, :, None]
+    bases = (
+        page_bases[:, :, None]
         .expand(-1, -1, rows_per_page)
         .reshape(block_table.shape[0], -1)
-        .long()
     )
     offsets = (
-        torch.arange(width, device=block_table.device).clamp(max=blocks.shape[1] - 1)
+        torch.arange(width, dtype=bases.dtype, device=block_table.device).clamp(
+            max=bases.shape[1] - 1
+        )
         % rows_per_page
     )
-    if width > blocks.shape[1]:
+    if width > bases.shape[1]:
         # Match _row_slots' clamp to the table's last row.
-        blocks = torch.cat(
-            (blocks, blocks[:, -1:].expand(-1, width - blocks.shape[1])), dim=1
+        bases = torch.cat(
+            (bases, bases[:, -1:].expand(-1, width - bases.shape[1])), dim=1
         )
-    return blocks[:, :width] * rows_per_page + offsets
+    slots = bases[:, :width] + offsets
+    return slots.clamp(min=-1) if unowned_pages is not None else slots
 
 
 def _read_rows(cache, block_table, requests, logical):
@@ -993,9 +1050,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         swa_cache = self.swa_cache_layer.kv_cache
         swa_table = _block_table(swa)
         tiled = isinstance(swa_cache, PagedCacheRows) and self.window_size % 64 == 0
-        has_fast_swa_offset = isinstance(
-            getattr(swa_cache, "row_offset", None), int
-        ) and not getattr(swa_cache, "sharded", False)
+        has_fast_swa_offset = _has_fast_cache_offset(swa_cache)
         stage_cache = _active_stage_attn_cache
         rows_per_page = (
             swa_cache.shape[1]
@@ -1023,7 +1078,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 "swa_token_addr",
                 swa_table.shape,
                 rows_per_page,
-                swa_cache.page_stride if has_fast_swa_offset else None,
+                _fast_cache_offset_key(swa_cache) if has_fast_swa_offset else None,
                 self.window_size,
                 self._ced_decoder,
                 use_3page_swa,
@@ -1155,10 +1210,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         b_col = swa_table[requests, col].long()[:, None]
                         swa_blocks = torch.where(is_col, b_col, swa_blocks)
                     swa_blocks = torch.where(is_c_last, b_last[:, None], swa_blocks)
-                    swa_row_slots = (
-                        swa_blocks * swa_cache.page_stride + swa_page_rem
+                    swa_row_slots, invalid_window = (
+                        _fast_swa_row_slots(
+                            swa_cache, swa_blocks, swa_page_rem, invalid_window
+                        )
                         if has_fast_swa_offset
-                        else swa_blocks * rows_per_page + swa_page_rem
+                        else (swa_blocks * rows_per_page + swa_page_rem, invalid_window)
                     )
                 else:
                     raw_row_slots = (
@@ -1166,11 +1223,15 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         if tiled
                         else None
                     )
-                    swa_row_slots = (
-                        raw_row_slots // rows_per_page * swa_cache.page_stride
-                        + raw_row_slots % rows_per_page
+                    swa_row_slots, invalid_window = (
+                        _fast_swa_row_slots(
+                            swa_cache,
+                            raw_row_slots // rows_per_page,
+                            raw_row_slots % rows_per_page,
+                            invalid_window,
+                        )
                         if raw_row_slots is not None and has_fast_swa_offset
-                        else raw_row_slots
+                        else (raw_row_slots, invalid_window)
                     )
                 swa_row_slots_masked = (
                     swa_row_slots.masked_fill(invalid_window, -1)
@@ -1243,13 +1304,17 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             raw_row_slots = (
                 _row_slots(swa_cache, swa_table, requests, logical) if tiled else None
             )
-            swa_row_slots = (
-                raw_row_slots // rows_per_page * swa_cache.page_stride
-                + raw_row_slots % rows_per_page
+            swa_row_slots, invalid_window = (
+                _fast_swa_row_slots(
+                    swa_cache,
+                    raw_row_slots // rows_per_page,
+                    raw_row_slots % rows_per_page,
+                    invalid_window,
+                )
                 if raw_row_slots is not None
                 and has_fast_swa_offset
                 and rows_per_page is not None
-                else raw_row_slots
+                else (raw_row_slots, invalid_window)
             )
         if swa_row_slots is None:
             records = None
@@ -1470,15 +1535,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             # Rows are row_indices of _row_slots(..., logical),
                             # computed per request: [requests, capacity]. The
                             # indexer shares each request's key tiles.
-                            has_fast_idx_offset = isinstance(
-                                getattr(index_cache, "row_offset", None), int
-                            ) and not getattr(index_cache, "sharded", False)
+                            has_fast_idx_offset = _has_fast_cache_offset(index_cache)
                             idx_req_key = self._stage_cache_key(
                                 "index_req_slots",
                                 indexer.k_cache.prefix,
                                 index_cache.shape[1] if has_fast_idx_offset else None,
                                 (
-                                    index_cache.page_stride
+                                    _fast_cache_offset_key(index_cache)
                                     if has_fast_idx_offset
                                     else None
                                 ),
@@ -1490,16 +1553,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                                 else None
                             )
                             if cached_idx_req is None:
-                                req_slots = _request_row_slots(
+                                cached_idx_req = _request_row_slots(
                                     index_cache, _block_table(keys_meta), capacity
-                                )
-                                cached_idx_req = (
-                                    req_slots
-                                    // index_cache.shape[1]
-                                    * index_cache.page_stride
-                                    + req_slots % index_cache.shape[1]
-                                    if has_fast_idx_offset
-                                    else req_slots
                                 )
                                 if stage_cache is not None:
                                     stage_cache[idx_req_key] = cached_idx_req
@@ -1518,7 +1573,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                                     index_records = (
                                         cached_idx_req
                                         if index_cache.row_offset == 0
-                                        else index_cache.row_offset + cached_idx_req
+                                        else (
+                                            (
+                                                index_cache.row_offset + cached_idx_req
+                                            ).masked_fill(cached_idx_req < 0, -1)
+                                            if getattr(index_cache, "sharded", False)
+                                            else index_cache.row_offset + cached_idx_req
+                                        )
                                     )
                                     if stage_cache is not None:
                                         stage_cache[idx_rec_key] = index_records
