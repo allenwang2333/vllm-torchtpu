@@ -78,6 +78,8 @@ def attention_block_table_width(
         "mamba_slot_read_offsets",
         "mamba_ckpt_indices",
         "mamba_request_distribution",
+        "mamba_seg_bounds",
+        "mamba_seg_state_indices",
     ],
     meta_fields=[
         "sequence_layout_kind",
@@ -129,6 +131,12 @@ class AttentionMetadata:
     # the first two groups. None unless the model has mamba layers and spec
     # decoding is enabled.
     mamba_request_distribution: jax.Array | torch.Tensor | None = None
+    # Single-step warm prefill (TPU_SCHED_SINGLE_STEP_PREFILL) only, else
+    # None: `(num_reqs, 2)` int32 in-chunk state checkpoint offsets (query
+    # offsets, 0 = none) and this group's `(num_reqs, 2)` destination blocks.
+    # See `fused_conv1d_gdn(seg_bounds=..., seg_state_indices=...)`.
+    mamba_seg_bounds: jax.Array | None = None
+    mamba_seg_state_indices: jax.Array | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -200,6 +208,15 @@ class AttentionMetadataBuilderContext:
     # every active request's state block column `(seq_len - 1) // block_size` is
     # invariant across `[seq_lens_hi - max_rejected, seq_lens_hi]`.
     mamba_seq_lens_bounds: tuple[Any, int] | None = None
+    # Single-step warm prefill: emit `mamba_seg_*` on the mamba groups. Set
+    # only by the target-model paths (real and dummy runs), so drafter
+    # metadata keeps its signature. `mamba_seg_packed` is the chunk's one
+    # `(1 + num_mamba_groups, num_reqs, 2)` int32 device tensor: row 0 the
+    # shared `seg_bounds`, row `1 + slot` each mamba group's
+    # `seg_state_indices` (see `TPUModelRunner._mamba_seg_slot`); None ->
+    # the builder uses a cached all-zero tensor of the same layout (no cuts).
+    mamba_seg_enabled: bool = False
+    mamba_seg_packed: torch.Tensor | None = None
 
 
 def _staged_walk_products(
@@ -483,6 +500,16 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets = None
             mamba_request_distribution = None
 
+        mamba_seg_bounds = mamba_seg_state_indices = None
+        if (
+            self.is_mamba_group
+            and getattr(ctx, "mamba_seg_enabled", False)
+            and mamba_state_indices is not None
+        ):
+            mamba_seg_bounds, mamba_seg_state_indices = _seg_fields(
+                runner, ctx, self.kv_cache_group_id, mamba_state_indices.shape[0]
+            )
+
         return AttentionMetadata(
             input_positions=input_positions,
             block_tables=block_tables_dev,
@@ -493,10 +520,126 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets=mamba_slot_read_offsets,
             mamba_ckpt_indices=mamba_ckpt_indices,
             mamba_request_distribution=mamba_request_distribution,
+            mamba_seg_bounds=mamba_seg_bounds,
+            mamba_seg_state_indices=mamba_seg_state_indices,
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,
         )
+
+
+def _seg_fields(
+    runner: Any, ctx: AttentionMetadataBuilderContext, gid: int, num_reqs: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(`mamba_seg_bounds`, `mamba_seg_state_indices`) for mamba group `gid`.
+
+    Both are fixed slices of ONE packed device tensor, on cut-free steps as
+    on steps with cuts, never separate (possibly equal-valued) tensors:
+    torch-tpu's lazy tracing CSEs equal device tensors and dynamo then folds
+    them into a single graph input (see
+    TPUModelRunner._combined_request_distribution_cpu). A program traced on
+    a cut-free step, where every seg tensor is zeros, would then feed the
+    seg_bounds query offsets to the GDN kernel as checkpoint block ids on
+    steps with cuts, overwriting other requests' blocks.
+    """
+    packed = ctx.mamba_seg_packed
+    if packed is None:
+        packed = _seg_zeros(runner, num_reqs)
+    assert tuple(packed.shape) == (1 + len(runner._mamba_seg_gids()), num_reqs, 2), (
+        tuple(packed.shape),
+        num_reqs,
+    )
+    return packed[0], packed[1 + runner._mamba_seg_slot(gid)]
+
+
+def _seg_zeros(runner: Any, num_reqs: int) -> torch.Tensor:
+    """Cached device all-zero `mamba_seg_packed` (no in-chunk checkpoints):
+    `(1 + num_mamba_groups, num_reqs, 2)` int32, the same layout real cuts
+    use so both trace the same program."""
+    cache = runner.__dict__.setdefault("_mamba_seg_zeros", {})
+    zeros = cache.get(num_reqs)
+    if zeros is None:
+        rows = 1 + len(runner._mamba_seg_gids())
+        zeros = torch.zeros((rows, num_reqs, 2), dtype=torch.int32).to(runner.device)
+        cache[num_reqs] = zeros
+    return zeros
+
+
+def _get_block_table_version(block_table_obj: Any, runner: Any) -> int | None:
+    """Read block table version if supported by the block table or runner."""
+    ver = getattr(block_table_obj, "_version", None)
+    if isinstance(ver, int):
+        return ver
+    input_batch = getattr(runner, "input_batch", None)
+    if input_batch is not None:
+        ib_ver = getattr(input_batch, "_block_table_version", None)
+        if isinstance(ib_ver, int):
+            return ib_ver
+    runner_ver = getattr(runner, "_block_table_version", None)
+    if isinstance(runner_ver, int):
+        return runner_ver
+    return None
+
+
+def _patch_block_table_versioning() -> None:
+    """Patch vLLM's BlockTable to maintain a monotonic _version counter on mutations."""
+    try:
+        from vllm.v1.worker.block_table import BlockTable
+    except ImportError:
+        return
+
+    if getattr(BlockTable, "_versioning_patched", False):
+        return
+
+    orig_init = BlockTable.__init__
+    orig_append = BlockTable.append_row
+    orig_add = BlockTable.add_row
+    orig_clear_row = BlockTable.clear_row
+    orig_move = BlockTable.move_row
+    orig_swap = BlockTable.swap_row
+    orig_clear = BlockTable.clear
+
+    def __init__(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        self._version = 0
+
+    def append_row(self, block_ids: list[int], row_idx: int) -> None:
+        if block_ids:
+            self._version += 1
+        orig_append(self, block_ids, row_idx)
+
+    def add_row(self, block_ids: list[int], row_idx: int) -> None:
+        self._version += 1
+        orig_add(self, block_ids, row_idx)
+
+    def clear_row(self, row_idx: int) -> None:
+        if self.num_blocks_per_row[row_idx] > 0:
+            self._version += 1
+        orig_clear_row(self, row_idx)
+
+    def move_row(self, src: int, tgt: int) -> None:
+        self._version += 1
+        orig_move(self, src, tgt)
+
+    def swap_row(self, src: int, tgt: int) -> None:
+        self._version += 1
+        orig_swap(self, src, tgt)
+
+    def clear(self) -> None:
+        self._version += 1
+        orig_clear(self)
+
+    BlockTable.__init__ = __init__
+    BlockTable.append_row = append_row
+    BlockTable.add_row = add_row
+    BlockTable.clear_row = clear_row
+    BlockTable.move_row = move_row
+    BlockTable.swap_row = swap_row
+    BlockTable.clear = clear
+    BlockTable._versioning_patched = True
+
+
+_patch_block_table_versioning()
 
 
 def stage_block_table_uploads(

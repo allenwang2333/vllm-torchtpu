@@ -431,12 +431,20 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 128,
+    seg_bounds: jax.Array | None = None,  # [num_seqs, 2]
+    seg_state_indices: jax.Array | None = None,  # [num_seqs, 2]
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Execute depthwise causal Conv1d, SiLU activation, L2 normalization, and
     recurrent Gated DeltaNet state update in a single fused Pallas kernel.
 
     Supports variable-length prefill chunks, speculative decode verification
     windows, and single-token decode steps over pooled conv and SSM state caches.
+
+    `seg_bounds` / `seg_state_indices` (optional, prefill/mixed sequences
+    only) store up to two extra state checkpoints inside a sequence's chunk:
+    the state after query offset `seg_bounds[s, k]` is written to
+    `seg_state_indices[s, k]`. See
+    `metadata.compute_per_seq_segment_metadata`.
     """
     # TODO(kyuyeunk): Support bf16
     act_out_dtype = qkv.dtype
@@ -507,6 +515,16 @@ def fused_conv1d_gdn(
             num_spec_tokens,
         )
         ckpt_indices = ckpt_indices.astype(jnp.int32)
+    if seg_bounds is not None:
+        assert seg_state_indices is not None
+        assert seg_bounds.shape == (num_seqs, 2), seg_bounds.shape
+        assert seg_state_indices.shape == (num_seqs, 2), seg_state_indices.shape
+        # A pooled source without speculative decoding addresses checkpoint 0
+        # through state_indices alone; segments need separate read and write
+        # blocks, so give PER_SEQ a one-column checkpoint table.
+        seg_ckpt_indices = ckpt_indices
+        if pooled and seg_ckpt_indices is None:
+            seg_ckpt_indices = state_indices.astype(jnp.int32)[:, None]
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
@@ -710,16 +728,30 @@ def fused_conv1d_gdn(
                 ckpt_indices=ckpt_indices,
             )
         else:
-            metadata_obj = metadata.compute_per_seq_metadata(
-                cfg=cfg,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-                state_indices=state_indices,
-                read_offsets=read_offsets,
-                start_seq=distribution[0],
-                end_seq=distribution[-1],
-                ckpt_indices=ckpt_indices,
-            )
+            if seg_bounds is not None:
+                metadata_obj = metadata.compute_per_seq_segment_metadata(
+                    cfg=cfg,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                    state_indices=state_indices,
+                    read_offsets=read_offsets,
+                    start_seq=distribution[0],
+                    end_seq=distribution[-1],
+                    seg_bounds=seg_bounds,
+                    seg_state_indices=seg_state_indices,
+                    ckpt_indices=seg_ckpt_indices,
+                )
+            else:
+                metadata_obj = metadata.compute_per_seq_metadata(
+                    cfg=cfg,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                    state_indices=state_indices,
+                    read_offsets=read_offsets,
+                    start_seq=distribution[0],
+                    end_seq=distribution[-1],
+                    ckpt_indices=ckpt_indices,
+                )
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
 
