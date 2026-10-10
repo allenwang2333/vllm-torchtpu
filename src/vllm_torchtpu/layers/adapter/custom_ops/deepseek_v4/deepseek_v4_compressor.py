@@ -27,12 +27,14 @@ from vllm.models.deepseek_v4 import compressor as dsv4_compressor
 from vllm.models.deepseek_v4.compressor import CompressorStateCache, DeepseekCompressor
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     config as compressor_config,
 )
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store.compressor_v1 import (
     compressor_forward,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import KVLayout
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
@@ -45,6 +47,16 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _compressor_op_cache = {}
+
+
+def indexer_kv_layout_name() -> str:
+    """The DeepSeek-V4 indexer K cache record layout the env selects; the
+    compressor that writes the records and the indexer that reads them must
+    agree, so both ask here."""
+    return {"has": "head_along_sublane", "sal": "seq_along_lane"}[
+        envs.VLLM_TPU_DSV4_INDEXER_KV_LAYOUT
+    ]
+
 
 # The mesh has no batch axis today, so every batch-axis spec resolves to None.
 # TODO(patemotter): name it here once the DP-attention PR adds the axis.
@@ -72,6 +84,7 @@ def _run_compressor(
     overlap: bool,
     rms_eps: float,
     quant_block: int,
+    record_layout: str = "head_along_sublane",
 ) -> tuple[jax.Array, jax.Array | None, jax.Array | None]:
     """Shared body of the three op variants, for CSA compressor, HCA compressor,
     and CSA indexer compressor respectively."""
@@ -95,6 +108,7 @@ def _run_compressor(
         overlap=overlap,
         rms_eps=rms_eps,
         quant_block=quant_block,
+        record_layout=KVLayout.parse(record_layout),
     )
 
 
@@ -219,6 +233,7 @@ def _compressor_jax_indexer(
     overlap: bool,
     rms_eps: float,
     quant_block: int,
+    record_layout: str,
 ) -> jax.Array:
     """Lightning indexer: one array holds the records and the state."""
     if cache.shape[0] == 0:
@@ -243,6 +258,7 @@ def _compressor_jax_indexer(
         overlap=overlap,
         rms_eps=rms_eps,
         quant_block=quant_block,
+        record_layout=record_layout,
     )
     return new_cache
 
@@ -414,6 +430,9 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         else:
             variant, jax_fn = "indexer", _compressor_jax_indexer
 
+        layout_kw = {}
+        if variant == "indexer":
+            layout_kw["record_layout"] = indexer_kv_layout_name()
         wrapped_fn = functools.partial(
             jax_fn,
             state_block_size=self.state_cache.block_size,
@@ -422,12 +441,14 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             overlap=self.overlap,
             rms_eps=self.rms_norm_eps,
             quant_block=self._quant_block,
+            **layout_kw,
         )
 
         op_name = (
             f"pallas::deepseek_v4_compressor_{variant}"
             f"_{self.head_dim}_{self.compress_ratio}"
             f"_{self.state_cache.block_size}"
+            f"{'_' + layout_kw['record_layout'] if layout_kw else ''}"
         )
 
         global _compressor_op_cache

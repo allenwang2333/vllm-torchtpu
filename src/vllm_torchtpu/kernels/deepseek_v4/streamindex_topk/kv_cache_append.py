@@ -91,8 +91,17 @@ def _align_to(x: int, a: int) -> int:
     return (x + a - 1) // a * a
 
 
-def cache_page_size(cache_kv: jax.Array, kv_layout: KVLayout | str | None) -> int:
-    """Validates `cache_kv` against `kv_layout` and returns its page size."""
+def cache_page_size(
+    cache_kv: jax.Array,
+    kv_layout: KVLayout | str | None,
+    record_groups: int | None = None,
+) -> int:
+    """Validates `cache_kv` against `kv_layout` and returns its page size.
+
+    `record_groups` (SEQ_ALONG_LANE only) declares pages wider than the record:
+    the record is each page's leading `record_groups` sublane groups and the
+    rest are not this writer's. None means the record fills the page.
+    """
     layout = KVLayout.parse(kv_layout)
     if cache_kv.ndim != 4:
         raise ValueError(
@@ -104,7 +113,13 @@ def cache_page_size(cache_kv: jax.Array, kv_layout: KVLayout | str | None) -> in
         )
     if layout == KVLayout.SEQ_ALONG_LANE:
         _, sublane_groups, _, page_size = cache_kv.shape
-        if sublane_groups >= 64 and sublane_groups % _KV_PACKING == 0:
+        if record_groups is not None:
+            if not 0 < record_groups <= sublane_groups:
+                raise ValueError(
+                    f"record_groups={record_groups} does not fit cache_kv shape"
+                    f" {cache_kv.shape} (dim 1 is the page's sublane groups)."
+                )
+        elif sublane_groups >= 64 and sublane_groups % _KV_PACKING == 0:
             raise ValueError(
                 f"cache_kv shape {cache_kv.shape} looks like HEAD_ALONG_SUBLANE"
                 f" (dim 1 == {sublane_groups}) but kv_layout=SEQ_ALONG_LANE. Pass"
@@ -128,10 +143,39 @@ def cache_page_size(cache_kv: jax.Array, kv_layout: KVLayout | str | None) -> in
     return page_size
 
 
-def _format_rows(src: jax.Array, cache_kv: jax.Array, layout: KVLayout) -> jax.Array:
+def check_seq_along_lane_in_quad_pages(cache_shape: tuple[int, ...], head_dim: int):
+    """Raises unless SEQ_ALONG_LANE records fit pages allocated for
+    HEAD_ALONG_SUBLANE, `[pages, tokens // 4, 4, record_bytes]`.
+
+    Reading that array as `[pages, groups, 4, page_size]` keeps a page's token
+    count only when `page_size == groups * 4`, and the record needs the
+    leading `head_dim // 4 + 1` groups.
+    """
+    _, groups, packing, page_size = cache_shape
+    record_groups = head_dim // _KV_PACKING + 1
+    if (
+        packing != _KV_PACKING
+        or page_size != groups * _KV_PACKING
+        or page_size % _LANES != 0
+        or groups < record_groups
+    ):
+        raise ValueError(
+            f"SEQ_ALONG_LANE cannot reuse cache pages of shape {cache_shape}:"
+            f" needs [pages, G, {_KV_PACKING}, P] with P == {_KV_PACKING} * G"
+            f" tokens a page, P % {_LANES} == 0 and G >= {record_groups}"
+            f" (head_dim={head_dim})."
+        )
+
+
+def _format_rows(
+    src: jax.Array,
+    cache_kv: jax.Array,
+    layout: KVLayout,
+    record_groups: int | None = None,
+) -> jax.Array:
     """Pads or truncates `src` rows to the cache's per-token record width."""
     if layout == KVLayout.SEQ_ALONG_LANE:
-        sublane_groups = cache_kv.shape[1]
+        sublane_groups = record_groups or cache_kv.shape[1]
         head_dim = (sublane_groups - 1) * _KV_PACKING
         rec_dim = sublane_groups * _KV_PACKING
         width = src.shape[-1]
@@ -239,8 +283,9 @@ class _SalTiles:
         *,
         ensure_blocks_transposed=None,
         short_run_fast_path: bool = True,
+        record_groups: int | None = None,
     ):
-        _, self.sublane_groups, _, _ = cache_ref.shape
+        self.sublane_groups = record_groups or cache_ref.shape[1]
         self.cache = cache_ref
         self.k = k_ref
         self.rmw = rmw_ref
@@ -253,7 +298,9 @@ class _SalTiles:
     def _cache_lanes(self, row, n):
         """Lanes `[row, row + n)` of the cache; `row` is 128-aligned."""
         slot = pl.multiple_of(row % self.page_size, _LANES)
-        return self.cache.at[row // self.page_size, :, :, pl.ds(slot, n)]
+        return self.cache.at[
+            row // self.page_size, pl.ds(0, self.sublane_groups), :, pl.ds(slot, n)
+        ]
 
     def _src_tile(self, src_ref, tok_aligned):
         if self.short_run_fast_path and self.padded_tokens == _LANES:
@@ -517,9 +564,10 @@ def _sal_kernel(
     wave: int,
     mask_scale_tail: bool = False,
     short_run_fast_path: bool = True,
+    record_groups: int | None = None,
 ) -> None:
     del cache_in_ref
-    sublane_groups = cache_ref.shape[1]
+    sublane_groups = record_groups or cache_ref.shape[1]
 
     # Transpose the token-major `(128, W)` blocks into the cache layout
     # `(sublane_groups, 4, 128)`, so every later step is lane-indexed by token.
@@ -545,6 +593,7 @@ def _sal_kernel(
             rmw_ref,
             page_size,
             short_run_fast_path=False,
+            record_groups=sublane_groups,
         )
         num_runs = _find_runs(
             ops,
@@ -583,6 +632,7 @@ def _sal_kernel(
         page_size,
         ensure_blocks_transposed=_ensure_blocks_transposed,
         short_run_fast_path=True,
+        record_groups=sublane_groups,
     )
     num_runs = _find_runs(
         ops,
@@ -655,10 +705,11 @@ def _sal_launch(
     page_size: int,
     wave: int,
     short_run_fast_path: bool = True,
+    record_groups: int | None = None,
 ):
     """`SEQ_ALONG_LANE`: `(staged source, kernel, scratch shapes)`."""
     num_tokens, width = rows.shape
-    sublane_groups = cache_kv.shape[1]
+    sublane_groups = record_groups or cache_kv.shape[1]
     head_dim = (sublane_groups - 1) * _KV_PACKING
     rec_dim = sublane_groups * _KV_PACKING
     transpose_width = _align_to(rec_dim, _LANES)
@@ -693,6 +744,7 @@ def _sal_launch(
         wave=wave,
         mask_scale_tail=mask_scale_tail,
         short_run_fast_path=short_run_fast_path,
+        record_groups=sublane_groups,
     )
     tokens_shape = (sublane_groups, _KV_PACKING, padded_tokens)
     scratch_shapes = _run_table_shapes(num_tokens) + [
@@ -708,6 +760,7 @@ def check_scatter_rows_supported(
     cache_kv: jax.Array,
     src: jax.Array,
     kv_layout: KVLayout | str | None = KVLayout.HEAD_ALONG_SUBLANE,
+    record_groups: int | None = None,
 ) -> None:
     """Validates `cache_kv` and `src` geometry and VMEM budget in pure Python."""
     layout = KVLayout.parse(kv_layout)
@@ -716,7 +769,7 @@ def check_scatter_rows_supported(
             f"cache_kv dtype={cache_kv.dtype} and 2-D src dtype={src.dtype} "
             f"must be uint8, got src.shape={src.shape}."
         )
-    cache_page_size(cache_kv, layout)
+    cache_page_size(cache_kv, layout, record_groups)
     num_tokens = int(src.shape[0])
     if num_tokens > _MAX_TOKENS:
         raise ValueError(
@@ -727,7 +780,7 @@ def check_scatter_rows_supported(
         return
     wave = min(num_tokens, _MAX_WAVE)
     if layout == KVLayout.SEQ_ALONG_LANE:
-        sublane_groups = int(cache_kv.shape[1])
+        sublane_groups = int(record_groups or cache_kv.shape[1])
         head_dim = (sublane_groups - 1) * _KV_PACKING
         if head_dim <= 0 or head_dim % 64 != 0:
             raise ValueError(
@@ -765,6 +818,7 @@ def scatter_rows(
     *,
     interpret: bool = False,
     short_run_fast_path: bool = True,
+    record_groups: int | None = None,
 ) -> jax.Array:
     """Writes `src[i]` into flat cache row `dst_rows[i]` of `cache_kv` in place.
 
@@ -781,12 +835,14 @@ def scatter_rows(
         to `scatter_rows_reference` after argument and VMEM validation.
       short_run_fast_path: When True (default), enables the SAL short-run and
         on-demand transpose fast path.
+      record_groups: SEQ_ALONG_LANE pages wider than the record; see
+        `cache_page_size`. Groups past the record are left untouched.
 
     Returns:
       The updated `cache_kv`.
     """
     layout = KVLayout.parse(kv_layout)
-    page_size = cache_page_size(cache_kv, layout)
+    page_size = cache_page_size(cache_kv, layout, record_groups)
     num_tokens = src.shape[0]
     if dst_rows.shape != (num_tokens,):
         raise ValueError(
@@ -805,10 +861,13 @@ def scatter_rows(
     if layout == KVLayout.SEQ_ALONG_LANE:
         k_in, kernel, scratch_shapes = _sal_launch(
             cache_kv,
-            src if short_run_fast_path else _format_rows(src, cache_kv, layout),
+            src
+            if short_run_fast_path
+            else _format_rows(src, cache_kv, layout, record_groups),
             page_size=page_size,
             wave=wave,
             short_run_fast_path=short_run_fast_path,
+            record_groups=record_groups,
         )
     else:
         k_in, kernel, scratch_shapes = _has_launch(
@@ -818,7 +877,7 @@ def scatter_rows(
             wave=wave,
         )
     if interpret or jax.default_backend() != "tpu":
-        return scatter_rows_reference(cache_kv, src, dst_rows, layout)
+        return scatter_rows_reference(cache_kv, src, dst_rows, layout, record_groups)
 
     return pl.pallas_call(
         kernel,
@@ -949,18 +1008,20 @@ def scatter_rows_reference(
     src: jax.Array,
     dst_rows: jax.Array,
     kv_layout: KVLayout | str | None = KVLayout.HEAD_ALONG_SUBLANE,
+    record_groups: int | None = None,
 ) -> jax.Array:
     """Pure-XLA `scatter_rows` (same arguments and contract); the test golden."""
     layout = KVLayout.parse(kv_layout)
-    page_size = cache_page_size(cache_kv, layout)
+    page_size = cache_page_size(cache_kv, layout, record_groups)
     num_rows = cache_kv.shape[0] * page_size
-    rows = _format_rows(src, cache_kv, layout)
+    rows = _format_rows(src, cache_kv, layout, record_groups)
     valid = (dst_rows >= 0) & (dst_rows < num_rows)
     if layout == KVLayout.SEQ_ALONG_LANE:
+        groups = record_groups or cache_kv.shape[1]
         page = jnp.where(valid, dst_rows // page_size, kv_cache_utils.OOB_PAGE)
         slot = jnp.where(valid, dst_rows % page_size, 0)
-        return cache_kv.at[page, :, :, slot].set(
-            rows.reshape(-1, cache_kv.shape[1], _KV_PACKING), mode="drop"
+        return cache_kv.at[page, :groups, :, slot].set(
+            rows.reshape(-1, groups, _KV_PACKING), mode="drop"
         )
     # `[pages, page_size // 4, 4, lkv_dim]` is row-major in `page * page_size +
     # slot`, so it is a plain `[num_rows, lkv_dim]` table.

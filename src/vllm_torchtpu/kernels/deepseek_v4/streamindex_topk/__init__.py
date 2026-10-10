@@ -28,6 +28,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.kv_cache_append import (
     cache_page_size,
     check_scatter_rows_supported,
+    check_seq_along_lane_in_quad_pages,
     coalesced_kv_append,
     coalesced_kv_append_dcp,
     scatter_rows,
@@ -66,6 +67,7 @@ __all__ = [
     "DCP_AXIS_NAME",
     "cache_page_size",
     "check_scatter_rows_supported",
+    "check_seq_along_lane_in_quad_pages",
     "coalesced_kv_append",
     "coalesced_kv_append_dcp",
     "convert_cache_to_seq_along_lane",

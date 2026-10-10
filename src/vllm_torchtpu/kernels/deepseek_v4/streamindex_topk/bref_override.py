@@ -325,8 +325,10 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
                 # compile-time constant and page_size is a multiple of the lane count,
                 # so the destination slice is always tile aligned.
                 dst_lane_start = i * self.page_size
+                # Only the record's leading groups: a page may carry spare ones.
+                record_groups = vmem_dst.shape[1]  # pytype: disable=attribute-error
                 pltpu.make_async_copy(
-                    cache_kv_hbm.at[safe_page],
+                    cache_kv_hbm.at[safe_page, pl.ds(0, record_groups)],
                     vmem_dst.at[  # pytype: disable=attribute-error
                         batch_idx,
                         :,

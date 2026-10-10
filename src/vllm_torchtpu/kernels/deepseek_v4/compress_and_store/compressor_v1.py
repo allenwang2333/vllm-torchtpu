@@ -13,12 +13,18 @@
 # limitations under the License.
 """DeepSeek V4 Compressor Layer forward pass implementation."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.config as config
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.kernel as compress_kernel
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.proj_and_save_state as proj_kernel  # noqa: E501
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    KVLayout,
+    kv_cache_append,
+)
 
 
 def block_table_row_stride(block_table: jax.Array, num_reqs: int) -> int:
@@ -222,6 +228,33 @@ def prepare_boundary_batch(
     )
 
 
+def _store_records_seq_along_lane(store, cache, kv_slots, head_dim):
+    """`store` the records into a scratch quad-layout array, then scatter them
+    into `cache` in the SEQ_ALONG_LANE layout.
+
+    The compress kernel writes 4-token quads; the scratch array keeps that
+    path and the state reads (from `cache`) as they are. Record `i` lands in
+    scratch slot `i`, which is then row `i` of the flattened scratch.
+    """
+    num_records = kv_slots.shape[0]
+    page_size = cache.shape[3]
+    scratch = jnp.zeros(
+        (-(-num_records // page_size), *cache.shape[1:]), dtype=cache.dtype
+    )
+    scratch_slots = jnp.where(
+        kv_slots >= 0, jnp.arange(num_records, dtype=kv_slots.dtype), -1
+    )
+    scratch, _ = store(scratch, kv_slot_mapping=scratch_slots, state_cache=cache)
+    rows = scratch.reshape(-1, cache.shape[-1])[:num_records]
+    return kv_cache_append.scatter_rows(
+        cache,
+        rows,
+        kv_slots,
+        KVLayout.SEQ_ALONG_LANE,
+        record_groups=head_dim // 4 + 1,
+    )
+
+
 def compressor_forward(
     hidden_states: jax.Array,  # [num_tokens, hidden_size] fp32
     wkv_wgate: jax.Array,  # [2*coff*head_dim, hidden_size] fp32
@@ -242,11 +275,25 @@ def compressor_forward(
     rms_eps: float,
     quant_block: int,
     state_cache: jax.Array | None = None,  # [num_pages, state_page_size, 4, 128] uint8
+    record_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Projects, saves state, then compresses and stores the boundary records."""
+    """Projects, saves state, then compresses and stores the boundary records.
+
+    `record_layout=SEQ_ALONG_LANE` (lightning-indexer records only) stores each
+    page's records in its leading `head_dim // 4 + 1` sublane groups, token
+    along lanes, instead of one 4-token quad per row; the page geometry, and so
+    the state that shares the array, is unchanged.
+    """
     num_tokens = positions.shape[0]
     num_reqs = query_start_loc.shape[0] - 1
     shares_buffer = state_cache is None
+    if record_layout == KVLayout.SEQ_ALONG_LANE:
+        if not shares_buffer or rope_cache is not None:
+            raise ValueError(
+                "SEQ_ALONG_LANE records are for the lightning indexer's array"
+                " (state on the same buffer, no RoPE array) only."
+            )
+        kv_cache_append.check_seq_along_lane_in_quad_pages(cache.shape, head_dim)
 
     token_to_req_indices, slot_mapping_slots, kv_slot_mapping = derive_metadata(
         positions=positions,
@@ -293,22 +340,26 @@ def compressor_forward(
         num_reqs=num_reqs,
     )
 
-    cache, rope_cache = compress_kernel.compress_norm_rope_store(
-        cache,
-        boundary_positions,
-        block_table,
-        boundary_req,
-        boundary_kv_slot,
-        norm_weight,
+    store = functools.partial(
+        compress_kernel.compress_norm_rope_store,
+        positions=boundary_positions,
+        block_table=block_table,
+        token_to_req_indices=boundary_req,
+        rms_weight=norm_weight,
         block_table_stride=block_table_row_stride(block_table, num_reqs),
         state_block_size=state_block_size,
-        state_cache=state_cache,
         rope_cache=rope_cache,
         cos_sin_cache=cos_sin_cache,
         compress_ratio=compress_ratio,
         overlap=overlap,
         quant_block=quant_block,
         rms_eps=rms_eps,
+    )
+    if record_layout == KVLayout.SEQ_ALONG_LANE:
+        cache = _store_records_seq_along_lane(store, cache, boundary_kv_slot, head_dim)
+        return cache, rope_cache, cache
+    cache, rope_cache = store(
+        cache, kv_slot_mapping=boundary_kv_slot, state_cache=state_cache
     )
 
     if shares_buffer:

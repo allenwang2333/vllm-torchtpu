@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
+    VLLM_TPU_DSV4_INDEXER_KV_LAYOUT: str = "has"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
@@ -766,6 +767,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         )()
         or DEFAULT_INDEXER_KV_CACHE_MODE
     ).lower(),
+    # DeepSeek-V4 lightning-indexer K cache record layout, within unchanged
+    # page geometry (the indexer array also hosts the compressor state).
+    #   "has": HEAD_ALONG_SUBLANE, 4 tokens per row, 256 B read per token.
+    #   "sal": SEQ_ALONG_LANE in each page's leading 33 sublane groups,
+    #          token along lanes, 132 B read per token.
+    "VLLM_TPU_DSV4_INDEXER_KV_LAYOUT": env_with_choices(
+        "VLLM_TPU_DSV4_INDEXER_KV_LAYOUT", "has", ["has", "sal"]
+    ),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
     ),

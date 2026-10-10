@@ -1651,6 +1651,89 @@ class CoalescedKvAppendTest(parameterized.TestCase):
             )
 
     # ---------------------------------------------------------------------------
+    # SEQ_ALONG_LANE records inside pages allocated for HEAD_ALONG_SUBLANE.
+    # ---------------------------------------------------------------------------
+
+    def test_sal_records_in_quad_pages_leave_spare_groups(self):
+        """`record_groups` writes each page's leading groups, nothing else."""
+        rng = np.random.default_rng(17)
+        num_pages, page_size = 8, 256
+        quad_pages = _random_cache(rng, num_pages, page_size)  # [8, 64, 4, 256]
+        dst = jnp.asarray(
+            np.concatenate(
+                [
+                    3 * page_size + np.arange(5, 140),
+                    [-1],
+                    6 * page_size + 247 + np.arange(9),
+                ]
+            ),
+            jnp.int32,
+        )
+        src = _random_rows(rng, dst.shape[0])
+        actual = jax.jit(
+            functools.partial(
+                kv_cache_append.scatter_rows, kv_layout=_SAL, record_groups=33
+            ),
+            donate_argnums=0,
+        )(jnp.copy(quad_pages), src, dst)
+        record_only = kv_cache_append.scatter_rows_reference(
+            quad_pages[:, :33], src, dst, _SAL
+        )
+        np.testing.assert_array_equal(np.asarray(actual[:, :33]), record_only)
+        np.testing.assert_array_equal(
+            np.asarray(actual[:, 33:]), np.asarray(quad_pages[:, 33:])
+        )
+
+    def test_reader_topk_ignores_spare_groups(self):
+        """Top-k off `[pages, 64, 4, 256]` with junk spare groups equals top-k
+        off the bare `[pages, 33, 4, 256]` SEQ_ALONG_LANE cache, order included."""
+        if jax.default_backend() != "tpu":
+            self.skipTest("streamindex_topk Pallas kernel requires TPU backend")
+        rng = np.random.default_rng(29)
+        page_size, max_seqs, pages_per_seq, topk = 256, 4, 8, 128
+        num_pages = max_seqs * pages_per_seq
+        q_lens = [1, 1, 7, 50]
+        seq_lens = jnp.asarray([700, 2048, 1500, 1900], jnp.int32)
+        cu_q_lens = _cu_q_lens(q_lens)
+        cache_has = _random_cache(rng, num_pages, page_size, quantized=True)
+        cache_sal = _in_layout(cache_has, _SAL)
+        quad = np.array(_random_cache(rng, num_pages, page_size))
+        quad[:, :33] = np.asarray(cache_sal)
+        num_tokens = sum(q_lens)
+        q = jnp.asarray(rng.standard_normal((num_tokens, 64, 128)), jnp.bfloat16)
+        w = jnp.asarray(rng.standard_normal((num_tokens, 64)), jnp.bfloat16)
+        page_indices = jnp.asarray(rng.permutation(num_pages), jnp.int32)
+        score = functools.partial(
+            st_lib.streamindex_topk,
+            q,
+            w,
+            seq_lens=seq_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=jnp.asarray([2, 2, 4], jnp.int32),
+            k=topk,
+            compression_ratio=1,
+            num_kv_pages_per_block=(4, 4, 2),
+            num_queries_per_block=(1, 64, 64),
+            kv_layout=_SAL,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(score(cache_kv=jnp.asarray(quad))),
+            np.asarray(score(cache_kv=cache_sal)),
+        )
+
+    def test_check_seq_along_lane_in_quad_pages(self):
+        check = kv_cache_append.check_seq_along_lane_in_quad_pages
+        check((4, 64, 4, 256), 128)  # block_size 1024: 256 tokens a page.
+        for shape in (
+            (4, 128, 4, 256),  # 512 tokens a page: lanes would hold 256.
+            (4, 32, 4, 128),  # 128 tokens a page: 32 groups < 33.
+            (4, 48, 4, 192),  # 192 lanes: not a multiple of 128.
+        ):
+            with self.assertRaisesRegex(ValueError, "cannot reuse"):
+                check(shape, 128)
+
+    # ---------------------------------------------------------------------------
     # Argument validation.
     # ---------------------------------------------------------------------------
 

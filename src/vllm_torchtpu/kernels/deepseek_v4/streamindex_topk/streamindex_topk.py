@@ -219,9 +219,11 @@ def kernel(
     if seq_along_lane:
         # [total_num_pages, kv_sublane_groups, kv_packing, page_size] where the
         # leading `head_dim` sublane rows hold the FP8 key bytes and the next row
-        # holds the per-token UE8M0 scale.
-        (_, kv_sublane_groups, kv_packing, page_size) = cache_kv_hbm_ref.shape
+        # holds the per-token UE8M0 scale. A page may carry spare groups after
+        # those (see `streamindex_topk`); only the record's groups are read.
+        (_, _, kv_packing, page_size) = cache_kv_hbm_ref.shape
         kv_head_dim_groups = head_dim // kv_packing
+        kv_sublane_groups = kv_head_dim_groups + 1
         page_size_per_kv_packing = page_size // kv_packing
     else:
         (
@@ -1234,22 +1236,23 @@ def streamindex_topk(
 
     prepared_indexer_weights = prepare_index_weights(indexer_weights, original_dtype)
     q = prepare_q_inputs(q)
-    head_dim = q.shape[-1]
 
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
         total_num_pages, kv_sublane_groups, kv_packing, page_size = cache_kv.shape
         expected_shape = get_kv_cache_shape(
             total_num_pages, page_size, actual_head_dim, kv_layout
         )
-        if cache_kv.shape != expected_shape:
+        # Pages may be wider than the record (dim 1 >= the record's groups):
+        # DeepSeek-V4 keeps its HEAD_ALONG_SUBLANE page geometry and stores the
+        # SEQ_ALONG_LANE record in each page's leading groups.
+        if (
+            cache_kv.shape[0] != expected_shape[0]
+            or cache_kv.shape[2:] != expected_shape[2:]
+            or kv_sublane_groups < expected_shape[1]
+        ):
             raise ValueError(
                 "SEQ_ALONG_LANE expects cache_kv of shape"
-                f" {expected_shape}, got {cache_kv.shape}."
-            )
-        if kv_sublane_groups * kv_packing != head_dim + kv_packing:
-            raise ValueError(
-                f"Inconsistent SEQ_ALONG_LANE cache: {kv_sublane_groups=},"
-                f" {kv_packing=} does not match {head_dim=}."
+                f" {expected_shape} (dim 1 may be larger), got {cache_kv.shape}."
             )
     else:
         _, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape

@@ -22,7 +22,9 @@ from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmCompressorStateCache,
     VllmDeepseekCompressor,
+    indexer_kv_layout_name,
 )
+from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 
 def _state_cache(compress_ratio: int, head_dim: int = 512):
@@ -125,3 +127,16 @@ def test_compressor_op_is_built_lazily_and_cached():
         assert compressor.compressor_op is sentinel
         assert compressor.compressor_op is sentinel
     build.assert_called_once()
+
+
+def test_indexer_kv_layout_knob(monkeypatch):
+    """Writer and reader share one knob: HAS unless asked, no silent values."""
+    name = "VLLM_TPU_DSV4_INDEXER_KV_LAYOUT"
+    assert name in TpuPlatform.additional_env_vars
+    monkeypatch.delenv(name, raising=False)
+    assert indexer_kv_layout_name() == "head_along_sublane"
+    monkeypatch.setenv(name, "sal")
+    assert indexer_kv_layout_name() == "seq_along_lane"
+    monkeypatch.setenv(name, "bogus")
+    with pytest.raises(ValueError, match=name):
+        indexer_kv_layout_name()

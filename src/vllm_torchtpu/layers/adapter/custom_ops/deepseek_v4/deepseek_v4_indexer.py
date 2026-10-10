@@ -28,9 +28,13 @@ from vllm.models.deepseek_v4.attention import DeepseekV4Indexer, DeepseekV4Index
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    check_seq_along_lane_in_quad_pages,
+    streamindex_topk,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,
+    indexer_kv_layout_name,
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -44,6 +48,15 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _indexer_op_cache = {}
+
+# (decode, verify window, mixed) KV pages per block for each K cache record
+# layout. Tuned on tpu7x at max-model-len 1M (256 compressed tokens a page):
+# large KV blocks, and decode sequences scored one at a time rather than in
+# batches of 4.
+_KV_PAGES_PER_BLOCK = {
+    "head_along_sublane": (16, 32, 8),
+    "seq_along_lane": (32, 32, 16),
+}
 
 BATCH_AXIS = None
 
@@ -65,11 +78,14 @@ def _indexer_jax(
     softmax_scale: float,
     n_head: int,
     uniform_q_len: int | None,
+    kv_layout: str,
 ) -> jax.Array:
     if cache_kv.shape[0] == 0:
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
         # the compiled signature because torch_tpu jits with keep_unused=True.
         return jnp.zeros((q.shape[0], k), dtype=jnp.int32)
+    if kv_layout == "seq_along_lane":
+        check_seq_along_lane_in_quad_pages(cache_kv.shape, q.shape[-1])
 
     def _indexer_local(
         q,
@@ -103,13 +119,11 @@ def _indexer_jax(
             distribution=distribution,
             k=k,
             compression_ratio=compression_ratio,
-            # Tuned on tpu7x at max-model-len 1M: large KV blocks (the middle
-            # entry sizes the speculative verify pass), and decode sequences
-            # scored one at a time rather than in batches of 4.
-            num_kv_pages_per_block=(16, 32, 8),
+            num_kv_pages_per_block=_KV_PAGES_PER_BLOCK[kv_layout],
             num_queries_per_block=(1, 128, 128),
             decode_req_batch_size=1,
             uniform_q_len=uniform_q_len,
+            kv_layout=kv_layout,
         )
 
     return _indexer_local(
@@ -162,6 +176,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         # them in `[distribution[0], distribution[1])`.
         spec = get_current_vllm_config().speculative_config
         uniform_q_len = None if spec is None else spec.num_speculative_tokens + 1
+        kv_layout = indexer_kv_layout_name()
 
         wrapped_fn = functools.partial(
             _indexer_jax,
@@ -170,6 +185,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             softmax_scale=self.softmax_scale,
             n_head=self.n_head,
             uniform_q_len=uniform_q_len,
+            kv_layout=kv_layout,
         )
 
         _scale = (
@@ -181,6 +197,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             f"pallas::deepseek_v4_indexer_k{self.topk_tokens}"
             f"_c{self.compress_ratio}_h{self.n_head}_s{_scale}"
             f"{'' if uniform_q_len is None else f'_u{uniform_q_len}'}"
+            f"_{kv_layout}"
         )
         global _indexer_op_cache
         if op_name in _indexer_op_cache:
