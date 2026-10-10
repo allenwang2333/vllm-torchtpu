@@ -17,6 +17,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
     TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
+    TPU_DCP_MERGE_CHUNKED: int = 0
+    TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -430,6 +432,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Backbone MLA merge: reduce-scatter the weighted outputs in the output's
     # precision (bf16), half f32's bytes. MTP drafter stays f32; 0 = f32.
     "TPU_DCP_RS_OUT_PRECISION": env_bool("TPU_DCP_RS_OUT_PRECISION", default=True),
+    # The reduce-scatter merge of a backbone bucket of at least
+    # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens, split into this many equal token
+    # chunks (0/1 = unsplit; a bucket that does not split into multiples of 8
+    # rows stays unsplit). Per-row arithmetic is unchanged; chunk k's
+    # SparseCore reduce-scatter can overlap chunk k+1's TensorCore lse gather
+    # and weight multiply. The MTP drafter (one trace for every bucket) never
+    # splits.
+    "TPU_DCP_MERGE_CHUNKED": env_int("TPU_DCP_MERGE_CHUNKED", 0),
+    "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": env_int(
+        "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS", 1024
+    ),
     # DCP sparse MLA attention grid step for decode-sized chunks
     # (`sparse_ragged_paged_attention(small_chunk_batch_size=...)`): attend
     # this many query tokens per kernel grid step instead of one, so the
