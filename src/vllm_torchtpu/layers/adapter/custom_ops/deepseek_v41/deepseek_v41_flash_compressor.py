@@ -259,15 +259,21 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         )
         self.cand_block_size = int(kwargs.get("candidate_block_size") or 0)
         self.cand_blocks = 0 if cand_buf is None else int(cand_buf.shape[1])
-        orig_sparse_attn = dsv41_attention.SparseAttnIndexer
-        orig_sparse_mqa = dsv41_attention.SparseMQAIndexer
-        dsv41_attention.SparseAttnIndexer = lambda *a, **kw: None
-        dsv41_attention.SparseMQAIndexer = lambda *a, **kw: None
+        # Upstream constructs GPU indexer kernels in __init__; stub out whichever
+        # of them the installed vLLM exposes (SparseMQAIndexer only exists in
+        # newer releases) and restore them afterwards.
+        stubbed = {
+            name: getattr(dsv41_attention, name)
+            for name in ("SparseAttnIndexer", "SparseMQAIndexer")
+            if hasattr(dsv41_attention, name)
+        }
+        for name in stubbed:
+            setattr(dsv41_attention, name, lambda *a, **kw: None)
         try:
             super().__init__(*args, **kwargs)
         finally:
-            dsv41_attention.SparseAttnIndexer = orig_sparse_attn
-            dsv41_attention.SparseMQAIndexer = orig_sparse_mqa
+            for name, orig in stubbed.items():
+                setattr(dsv41_attention, name, orig)
         object.__setattr__(self, "indexer_op", self._build_indexer_op())
         object.__setattr__(
             self, "indexer_op_hm", self._build_indexer_op(use_step_meta=True)
