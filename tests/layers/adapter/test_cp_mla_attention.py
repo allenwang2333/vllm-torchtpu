@@ -371,6 +371,52 @@ def test_positive_control_dropped_lse_shift_is_caught(monkeypatch):
     assert not _bf16_close(got, _reference_merge(outputs.float(), lses))
 
 
+def _nan_where_unowned(outputs, lses):
+    """The partials a rank returns for rows it owns no position of: the kernel ran
+    on a dummy key and its output there may be NaN (mla-dec `edge_short_rank5`)."""
+    poisoned = outputs.clone()
+    poisoned[~torch.isfinite(lses)] = float("nan")
+    return poisoned
+
+
+@pytest.mark.parametrize("dcp_size", [2, 8])
+def test_all_to_all_merge_ignores_nan_zero_weight_partials(dcp_size, monkeypatch):
+    """A NaN partial of weight 0 changes nothing: the merge equals, bit for bit,
+    the merge of the same partials with finite values there."""
+    outputs, lses = _hard_partials(np.random.default_rng(20261010), dcp_size)
+    clean = _a2a_merge_whole(outputs, lses, monkeypatch)
+    got = _a2a_merge_whole(_nan_where_unowned(outputs, lses), lses, monkeypatch)
+    assert torch.isfinite(got.float()).all()
+    assert torch.equal(got.view(torch.int16), clean.view(torch.int16))
+    assert _bf16_close(got, _reference_merge(outputs.float(), lses))
+    assert (got[3] == 0).all()
+
+
+def test_positive_control_unguarded_merge_is_poisoned_by_nan(monkeypatch):
+    """Without the guard the same input comes back NaN (the a2a bug)."""
+    outputs, lses = _hard_partials(np.random.default_rng(20261010), 8)
+    monkeypatch.setattr(cp_mla, "_zero_nan", lambda o: o)
+    got = _a2a_merge_whole(_nan_where_unowned(outputs, lses), lses, monkeypatch)
+    assert not torch.isfinite(got.float()).all()
+    assert not _bf16_close(got, _reference_merge(outputs.float(), lses))
+
+
+@pytest.mark.parametrize("seed", [7, 13, 20261002])
+def test_nan_guard_is_bit_identical_on_finite_partials(seed, monkeypatch):
+    """On finite partials the guard changes no bit of any row some rank owns,
+    including the partly `-inf` and underflowing-weight rows. A row nobody owns
+    is zero either way; only the sign of that zero may differ (the unguarded sum
+    of `o * 0` is -0 where every partial is negative)."""
+    outputs, lses = _hard_partials(np.random.default_rng(seed), 8)
+    got = _a2a_merge_whole(outputs, lses, monkeypatch)
+    monkeypatch.setattr(cp_mla, "_zero_nan", lambda o: o)
+    old = _a2a_merge_whole(outputs, lses, monkeypatch)
+    owned = torch.isfinite(lses).any(dim=0)  # [T, H]
+    assert owned.any() and not owned.all()
+    assert torch.equal(got[owned].view(torch.int16), old[owned].view(torch.int16))
+    assert (got[~owned] == 0).all() and (old[~owned] == 0).all()
+
+
 @pytest.mark.parametrize(
     "enabled,tokens,is_backbone,expect_a2a",
     [

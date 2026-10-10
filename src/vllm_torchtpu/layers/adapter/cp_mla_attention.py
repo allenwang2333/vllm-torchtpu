@@ -212,6 +212,19 @@ def merge_lse_partials_all_to_all(
     return _merge_received(o_recv, l_recv).to(output.dtype)
 
 
+def _zero_nan(o_f32: torch.Tensor) -> torch.Tensor:
+    """Zero NaN entries of the received partials.
+
+    A rank that owns no position of a row ran its kernel on a dummy key and may
+    return NaN there; the merge gives it weight 0, but NaN * 0 = NaN. Selecting
+    on the partial's own value (not on a weight or lse mask) keeps the select
+    inside the merge's existing fusion: the decode HLO gains no op. Finite
+    partials are untouched, bit for bit. A NaN partial of nonzero weight (never
+    produced by an owning rank) would also be zeroed rather than propagated.
+    """
+    return torch.where(torch.isnan(o_f32), torch.zeros_like(o_f32), o_f32)
+
+
 def _merge_received(o_recv: torch.Tensor, l_recv: torch.Tensor) -> torch.Tensor:
     """`[R, T, h, V]` partials and `[R, T, h]` lse -> the f32 `[T, h, V]` merge."""
     finite = torch.isfinite(l_recv)
@@ -226,7 +239,7 @@ def _merge_received(o_recv: torch.Tensor, l_recv: torch.Tensor) -> torch.Tensor:
     weights = weights / torch.where(denom > 0, denom, torch.ones_like(denom))
     # The compiler lowers multiply-then-sum to a dot that rounds f32 operands to
     # bf16. Splitting the weights into a bf16 part and a residual keeps it exact.
-    o_f32 = o_recv.to(torch.float32)
+    o_f32 = _zero_nan(o_recv.to(torch.float32))
     w_hi = weights.to(torch.bfloat16).to(torch.float32)
     w_lo = weights - w_hi
     return (o_f32 * w_hi.unsqueeze(-1)).sum(dim=0) + (o_f32 * w_lo.unsqueeze(-1)).sum(

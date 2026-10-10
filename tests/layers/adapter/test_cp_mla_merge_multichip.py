@@ -16,7 +16,12 @@ threaded stand-in for the exchange; this pins what only hardware can answer:
      merge to within one bf16 ulp, including `-inf` rows and a rank that owns
      nothing -- and the same check fails when the send blocks are rotated by
      one rank (the positive control).
-  3. The token-chunked reduce-scatter merge (`TPU_DCP_MERGE_CHUNKED`) changes
+  3. A NaN partial of weight 0 (a rank that owns no position of a row ran on a
+     dummy key) leaves the a2a merge finite and bit-identical to the merge of
+     the same partials with finite values there; the guard changes no bit of an
+     owned row on finite partials; and without the NaN zeroing (the
+     positive control) the merge comes back NaN.
+  4. The token-chunked reduce-scatter merge (`TPU_DCP_MERGE_CHUNKED`) changes
      no per-row arithmetic: it is reported bit for bit against the unchunked
      merge compiled the same way, must be no less exact, and the same check
      fails when every chunk is weighted with its neighbour row's lse.
@@ -185,6 +190,48 @@ def _merge_unrolled(o_recv, l_recv):
     return acc
 
 
+def _nan_check(rank, world, cp_mla, merge, ref, outputs, lses, local):
+    """The zero-weight NaN guard on hardware, a2a arm, eager and compiled."""
+    import torch
+
+    poisoned = outputs.clone()
+    poisoned[~torch.isfinite(lses)] = float("nan")
+    o_dev = outputs[rank].to("tpu")
+    p_dev = poisoned[rank].to("tpu")
+    l_dev = lses[rank].to("tpu")
+    owned = torch.isfinite(lses[:, :, rank * local : (rank + 1) * local]).any(dim=0)
+    report = {}
+    real_guard = cp_mla._zero_nan
+    _set_arm(cp_mla, "a2a")
+    for how in ("eager", "compiled"):
+        try:
+            fn = merge if how == "eager" else _compile(merge)
+            clean = fn(o_dev, l_dev).cpu()
+            got = (merge if how == "eager" else _compile(merge))(p_dev, l_dev).cpu()
+            c = _error_stats(got, ref)
+            c["bitwise_vs_finite_input"] = bool(
+                torch.equal(got.view(torch.int16), clean.view(torch.int16))
+            )
+            cp_mla._zero_nan = lambda o: o
+            try:
+                old = (merge if how == "eager" else _compile(merge))(o_dev, l_dev).cpu()
+                ctl = (merge if how == "eager" else _compile(merge))(p_dev, l_dev).cpu()
+            finally:
+                cp_mla._zero_nan = real_guard
+            same = clean.view(torch.int16) == old.view(torch.int16)
+            c["owned_rows_bitwise_vs_unguarded"] = bool(same[owned].all())
+            c["frac_bitwise_vs_unguarded"] = float(same.float().mean())
+            c["unowned_rows_zero"] = bool((clean[~owned] == 0).all())
+            report[f"nan/a2a/{how}"] = c
+            report[f"control_unguarded_nan/a2a/{how}"] = _error_stats(ctl, ref)
+        except Exception as exc:  # noqa: BLE001 - reported to the parent
+            traceback.print_exc()
+            report[f"nan/a2a/{how}"] = {"error": repr(exc)[:400]}
+        finally:
+            cp_mla._zero_nan = real_guard
+    return report
+
+
 # Local-merge variants measured and checked beside the production one.
 MERGE_VARIANTS = {"a2a_reduce_sum": _merge_reduce_sum, "a2a_unrolled": _merge_unrolled}
 
@@ -263,6 +310,8 @@ def _check(rank, world, group, cp_mla):
         report["diag/a2a_highest/compiled"] = _error_stats(got, ref)
     except Exception as exc:  # noqa: BLE001 - reported to the parent
         report["diag/a2a_highest/compiled"] = {"error": repr(exc)[:400]}
+
+    report.update(_nan_check(rank, world, cp_mla, merge, ref, outputs, lses, local))
 
     # Positive control: rotate the send blocks by one rank, so rank d merges
     # the heads meant for rank d-1. The same check must now fail.
@@ -481,6 +530,19 @@ def assert_merge_results(results: list[dict]) -> None:
                     split["frac_over_1ulp"] <= today["frac_over_1ulp"]
                     and split["max_abs_err"] <= today["max_abs_err"]
                 ), (r["rank"], arm, how, today, split)
+        for how in ("eager", "compiled"):
+            c = check[f"nan/a2a/{how}"]
+            assert "error" not in c, (r["rank"], how, c)
+            assert c["finite"] and c["bitwise_vs_finite_input"], (r["rank"], how, c)
+            assert c["owned_rows_bitwise_vs_unguarded"], (r["rank"], how, c)
+            assert c["unowned_rows_zero"], (r["rank"], how, c)
+            ctl = check[f"control_unguarded_nan/a2a/{how}"]
+            assert not ctl["finite"], (
+                "positive control: the unguarded merge must return NaN",
+                r["rank"],
+                how,
+                ctl,
+            )
         for how in ("eager", "compiled"):
             c = check[f"control_misaligned/chunk4/{how}"]
             assert "error" not in c, (r["rank"], how, c)
