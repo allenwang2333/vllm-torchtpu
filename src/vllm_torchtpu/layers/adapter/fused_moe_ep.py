@@ -307,8 +307,6 @@ def _build_op(
         )
         if fp4_max_t >= 0 and weight_format == "fp4":
             use_path_c = T_global <= fp4_max_t
-        elif weight_format == "fp4":
-            use_path_c = T_global <= 16 or T_global in (192, 384)
         else:
             use_path_c = T_global <= 512
         if use_path_c and weight_format in ("fp8", "fp4"):
@@ -369,7 +367,7 @@ def _build_op(
                     rhs_quant_dtype=rhs_qdtype,
                     use_sparse_core=True,
                     onehot_moe_permute_threshold=onehot_thr,
-                    skip_padded_tokens=False,
+                    skip_padded_tokens=(T_global > 16),
                 )
                 return lax.psum_scatter(
                     out_g.astype(x_l.dtype), ax, scatter_dimension=0, tiled=True
@@ -419,7 +417,7 @@ def _build_op(
             )
 
         _max_v2_t_local = int(
-            os.environ.get("VLLM_DSV41_MOE_EP_V2_MAX_LOCAL_TOKENS", "8192")
+            os.environ.get("VLLM_DSV41_MOE_EP_V2_MAX_LOCAL_TOKENS", "16384")
         )
         if t_local <= _max_v2_t_local:
             return _run_v2(x, topk_ids, topk_weights)
