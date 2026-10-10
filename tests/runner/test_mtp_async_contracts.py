@@ -18,6 +18,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.worker import gpu_model_runner
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
+from vllm_torchtpu.runner import tpu_runner as tpu_runner_mod
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncPreResults,
@@ -26,8 +27,30 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 
 
 @pytest.fixture
-def device():
+def device(monkeypatch):
     # Do not initialize the accelerator during test collection.
+    from vllm_torchtpu.tpu_info import get_num_chips
+
+    if get_num_chips() == 0:
+
+        def fake_event():
+            return SimpleNamespace(record=lambda: None, synchronize=lambda: None)
+
+        if getattr(torch, "tpu", None) is None:
+            monkeypatch.setattr(
+                torch,
+                "tpu",
+                SimpleNamespace(Event=fake_event, is_available=lambda: False),
+                raising=False,
+            )
+        else:
+            monkeypatch.setattr(torch.tpu, "Event", fake_event)
+        monkeypatch.setattr(
+            tpu_runner_mod,
+            "_substitute_placeholder_token",
+            tpu_runner_mod._substitute_placeholder_token.__wrapped__,
+        )
+        return torch.device("cpu")
     result = torch.device("tpu")
     probe = torch.tensor([17], dtype=torch.int32, device=result)
     assert probe.cpu().tolist() == [17]

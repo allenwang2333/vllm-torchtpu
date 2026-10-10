@@ -40,6 +40,10 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 
 @pytest.fixture
 def device():
+    from vllm_torchtpu.tpu_info import get_num_chips
+
+    if get_num_chips() == 0:
+        return torch.device("cpu")
     try:
         import torch_tpu  # noqa: F401
 

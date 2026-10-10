@@ -579,3 +579,57 @@ def test_merge_profile_directories_multiworker(tmp_path):
         ).read_text() == f"rank_{rank}_xplane"
         rank_dir = phase_dir / f"rank_{rank}"
         assert not (rank_dir / "plugins").exists()
+
+
+def test_stage_timing_all_branches():
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.runner import stage_timing
+
+    class _FakeTpuEvent:
+        def record(self):
+            return None
+
+        def synchronize(self):
+            return None
+
+    with patch.object(stage_timing, "TpuEvent", _FakeTpuEvent):
+        timer = stage_timing.RunnerStageTiming(rank=0)
+        with timer.host_stage("host_op"):
+            pass
+
+        with timer.stage("device_op"):
+            pass
+
+        with pytest.raises(ValueError, match="stage error"), timer.stage("failing_op"):
+            raise ValueError("stage error")
+
+        deadline = stage_timing.time.perf_counter() + 2.0
+        while (
+            len(timer._device_samples) < 2
+            and stage_timing.time.perf_counter() < deadline
+        ):
+            stage_timing.time.sleep(0.005)
+
+        with (
+            patch.object(timer._slots, "acquire", return_value=False),
+            timer.stage("fallback_host_op"),
+        ):
+            pass
+
+        cpu_samples, dev_samples = timer.take_samples()
+        assert len(cpu_samples) == 4
+        assert len(dev_samples) == 2
+
+        timer._slots.acquire(blocking=False)
+        one_item = stage_timing._PendingTiming(
+            "direct_op", _FakeTpuEvent(), _FakeTpuEvent()
+        )
+        one_item.end_recorded.set()
+        timer._pending = SimpleNamespace(  # type: ignore[assignment]
+            get=MagicMock(side_effect=[one_item, StopIteration("done")])
+        )
+        with pytest.raises(StopIteration, match="done"):
+            timer._collect_device_time()
+        _, direct_dev = timer.take_samples()
+        assert len(direct_dev) == 1

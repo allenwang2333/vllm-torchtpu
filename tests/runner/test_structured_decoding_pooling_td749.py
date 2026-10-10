@@ -589,4 +589,5 @@ class TestTPUPoolingTD749:
         )
         meta_runner = build_pooling_metadata(batch_runner, {"r_tok": r_tokens_only})
         assert meta_runner.prompt_lens.tolist() == [2]
+        install_tpu_pooling_patches()
         assert methods.MeanPool.forward == TPUMeanPool.forward
