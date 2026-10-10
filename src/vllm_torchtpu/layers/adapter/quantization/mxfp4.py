@@ -603,8 +603,20 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         w2_block_size = min(REQUANTIZED_BLOCK_SIZE, w2_weight_padded.shape[1])
 
         def _chunked_quant(w_pad: torch.Tensor, blk: int):
-            import gc
+            import gc, hashlib
             n_exp = w_pad.shape[0]
+            cache_dir = "/dev/shm/dsv41_fp4_cache"
+            os.makedirs(cache_dir, exist_ok=True)
+            sig_bytes = w_pad.reshape(-1)[:4096].contiguous().view(torch.uint8).numpy().tobytes()
+            hkey = hashlib.md5(sig_bytes + f"_{tuple(w_pad.shape)}_{blk}_{pack}".encode()).hexdigest()[:16]
+            cpath = os.path.join(cache_dir, f"fp4_{hkey}.pt")
+            if os.path.exists(cpath + ".done"):
+                saved = torch.load(cpath, map_location="cpu", weights_only=True)
+                qw_cat = saved["qw_u8"].view(torch.float4_e2m1fn_x2 if not pack else torch.uint8).to(device)
+                qs_cat = saved["qs"].to(device)
+                synchronize_tensors([qw_cat, qs_cat])
+                del saved
+                return qw_cat, qs_cat
             if n_exp <= 8:
                 return quantize_native_fp4_kmajor(
                     w_pad.to(device), block=blk, pack=pack
@@ -621,14 +633,17 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 qw_cpu_list.append(qw.view(torch.uint8).cpu())
                 qs_cpu_list.append(qs.cpu())
                 del w_sub, qw, qs
-            qw_cat = (
-                torch.cat(qw_cpu_list, dim=0)
-                .view(out_dtype)
-                .to(device)
-            )
-            qs_cat = torch.cat(qs_cpu_list, dim=0).to(device)
-            synchronize_tensors([qw_cat, qs_cat])
+            qw_u8 = torch.cat(qw_cpu_list, dim=0)
+            qs_cpu = torch.cat(qs_cpu_list, dim=0)
             del qw_cpu_list, qs_cpu_list
+            tmp_p = cpath + f".tmp.{os.getpid()}"
+            torch.save({"qw_u8": qw_u8, "qs": qs_cpu}, tmp_p)
+            os.replace(tmp_p, cpath)
+            open(cpath + ".done", "w").close()
+            qw_cat = qw_u8.view(out_dtype).to(device)
+            qs_cat = qs_cpu.to(device)
+            synchronize_tensors([qw_cat, qs_cat])
+            del qw_u8, qs_cpu
             gc.collect()
             return qw_cat, qs_cat
 
