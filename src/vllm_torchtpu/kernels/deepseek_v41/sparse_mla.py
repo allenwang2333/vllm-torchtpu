@@ -2060,10 +2060,13 @@ def sparse_ragged_paged_attention(
             lanes = gathered_nope.shape[-1]
             hbm = pl.BlockSpec(memory_space=pltpu.HBM)
 
+            target_gb = (
+                (4 if num_q_heads <= 16 else 2)
+                if m_union <= 768
+                else (2 if num_q_heads <= 64 else 1)
+            )
             g_batch = (
-                _largest_divisor(
-                    num_groups, 4 if num_q_heads <= 16 else 2
-                )
+                _largest_divisor(num_groups, target_gb)
                 if (b_q < 8 and num_u_chunks == 1 and num_q_heads <= 64)
                 else 1
             )
