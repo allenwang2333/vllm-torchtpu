@@ -106,7 +106,14 @@ class TpuPipelineChunkScheduler(Scheduler):
             return None
         pending = 0
         for request in self.running:
-            pending += max(_prefill_end(request) - request.num_computed_tokens, 0)
+            end = _prefill_end(request)
+            if end > request.num_computed_tokens:
+                # Earlier chunks of an in-flight prefill are still traversing
+                # the pipeline stages, so size the spread against the request's
+                # full uncached prefill work rather than shrinking the step
+                # limit as each chunk enters stage 0.
+                cached = getattr(request, "num_cached_tokens", 0) or 0
+                pending += max(end - cached, end - request.num_computed_tokens)
         for request in self.waiting:
             pending += max(_prefill_end(request) - request.num_computed_tokens, 0)
         if pending == 0:

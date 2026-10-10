@@ -988,12 +988,16 @@ def _check_tokens_divide_by_tp(num_tokens: int) -> None:
 def _rows_are_sequence_parallel(num_tokens: int) -> bool:
     """Whether a sequence-parallel layer slices this step's rows over TP.
 
-    A step below `sequence_parallel.min_rows()` keeps its rows replicated, and
+    A step below `sequence_parallel.min_rows()` (or above
+    `sequence_parallel.max_rows()` when positive) keeps its rows replicated, and
     so does the MTP step-0 post-attention gather, whose rows shrink mid-layer.
     The runner records the same decision with `sequence_parallel.set_active`
     for the MoE dispatch and combine.
     """
-    return _step0_gather_indices is None and num_tokens >= sequence_parallel.min_rows()
+    if _step0_gather_indices is not None or num_tokens < sequence_parallel.min_rows():
+        return False
+    cap = sequence_parallel.max_rows()
+    return cap <= 0 or num_tokens <= cap
 
 
 def _sp_chunk(layer: Any, x: torch.Tensor) -> torch.Tensor:

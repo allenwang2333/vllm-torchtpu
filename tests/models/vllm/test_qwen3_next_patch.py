@@ -96,8 +96,11 @@ def restore_forwards(monkeypatch):
     return monkeypatch
 
 
-def _sequence_parallel(monkeypatch, *, min_rows: int = 0, fp8_gather: bool = False):
+def _sequence_parallel(
+    monkeypatch, *, min_rows: int = 0, max_rows: int = 0, fp8_gather: bool = False
+):
     monkeypatch.setattr(patch_mod.sequence_parallel, "min_rows", lambda: min_rows)
+    monkeypatch.setattr(patch_mod.sequence_parallel, "max_rows", lambda: max_rows)
     monkeypatch.setattr(patch_mod.sequence_parallel, "fp8_gather", lambda: fp8_gather)
 
 
@@ -273,6 +276,33 @@ def test_patched_decoder_layer_forward_replicated_below_min_rows(monkeypatch):
     mlp_kwargs: list[dict[str, object]] = []
     layer = _sp_dummy_layer(attn_calls, mlp_kwargs)
     num_tokens = 8
+    hidden = torch.randn(num_tokens, 64)
+    residual = torch.randn(num_tokens, 64)
+    positions = torch.arange(num_tokens)
+
+    patched_h, patched_r = patched_decoder_layer_forward(
+        layer, hidden, residual, positions
+    )
+
+    attn_out = (hidden * 1.05 + 1.0) * tp
+    torch.testing.assert_close(patched_h, attn_out * 1.1 * 2.0)
+    torch.testing.assert_close(patched_r, residual + hidden * 0.05 + attn_out * 0.1)
+    assert len(all_reduced) == 1
+    assert mlp_kwargs == [{"already_sequence_parallel": True}]
+
+
+def test_patched_decoder_layer_forward_replicated_above_max_rows(monkeypatch):
+    """A step above max_rows keeps its rows and all-reduces the attention out."""
+
+    tp = 2
+    all_reduced: list[torch.Tensor] = []
+    _fake_tp_collectives(monkeypatch, tp, all_reduced)
+    _sequence_parallel(monkeypatch, min_rows=4, max_rows=8)
+
+    attn_calls: list[dict[str, object]] = []
+    mlp_kwargs: list[dict[str, object]] = []
+    layer = _sp_dummy_layer(attn_calls, mlp_kwargs)
+    num_tokens = 16
     hidden = torch.randn(num_tokens, 64)
     residual = torch.randn(num_tokens, 64)
     positions = torch.arange(num_tokens)

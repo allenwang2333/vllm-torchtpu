@@ -1090,6 +1090,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 64
     ),
     "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "512")),
+    "TPU_SP_MAX_ROWS": lambda: int(os.getenv("TPU_SP_MAX_ROWS", "0")),
     "TPU_SP_FP8_GATHER": env_bool("TPU_SP_FP8_GATHER", default=True),
     # --- PrefixAwareScheduler SRPF & cold-prefill chunk capping ---
     # Sort prefilling requests in `running` by fewest remaining prompt tokens.

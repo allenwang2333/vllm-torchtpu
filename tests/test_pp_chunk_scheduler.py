@@ -253,6 +253,28 @@ def test_the_step_limit_keeps_a_prompt_whole_when_halves_are_no_faster():
         assert scheduler._step_limit == 8192
 
 
+def test_the_step_limit_does_not_shrink_chunks_for_in_flight_prefills():
+    buckets = [1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192]
+    linear = {b: 14.0 + 0.0085 * b for b in buckets}
+    model = StepCostModel(buckets, linear, 1.5e-7, 100.0, 1024)
+    # On PP=4, a lone 16K prompt spreads into four 4K chunks; as earlier chunks
+    # enter the pipeline and num_computed_tokens advances (4096, 8192, 12288),
+    # the step limit must remain 4096 rather than shrinking to 3072/2048/1024.
+    for computed in (0, 4096, 8192, 12288):
+        scheduler = _scheduler(cost=model, running=[_request(computed, 16384)])
+        scheduler._pp_size = 4
+        with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+            scheduler.schedule()
+        assert scheduler._step_limit == 4096
+    # On PP=8, a lone 16K prompt spreads into eight 2K chunks across all 8 steps.
+    for computed in range(0, 16384, 2048):
+        scheduler = _scheduler(cost=model, running=[_request(computed, 16384)])
+        scheduler._pp_size = 8
+        with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+            scheduler.schedule()
+        assert scheduler._step_limit == 2048
+
+
 def test_schedule_resets_the_step_accounting():
     scheduler = _scheduler(cost=_model())
     scheduler._step_tokens = 5

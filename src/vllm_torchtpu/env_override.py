@@ -313,6 +313,7 @@ if _pp_active:
     os.environ["TORCH_TPU_TIER2_COMPILATION_CACHE"] = "disabled"
     os.environ["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] = "disabled"
     os.environ.setdefault("TPU_EXPERT_PLACEMENT", "")
+    os.environ.setdefault("TPU_SP_MAX_ROWS", "2048")
 
 for _default_flag, _default_val in (
     ("--xla_tpu_use_dynamic_smem_negotiation", "true"),
@@ -383,6 +384,8 @@ def _apply_qwen35_serve_cli_defaults() -> None:
             _set_env("TPU_MOE_LOWTOK", "0")
         if "TPU_EXPERT_PLACEMENT" not in os.environ:
             _set_env("TPU_EXPERT_PLACEMENT", "")
+        if "TPU_SP_MAX_ROWS" not in os.environ:
+            _set_env("TPU_SP_MAX_ROWS", "2048")
     # <=64-row decode/MTP-draft buckets use half VMEM (32 MiB on v7x) so XLA
     # prefetches next layers' weights across batched RPA, while 128-row c=32
     # MTP=3 target verification keeps full VMEM.

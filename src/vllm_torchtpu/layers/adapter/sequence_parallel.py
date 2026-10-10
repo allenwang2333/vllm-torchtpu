@@ -28,6 +28,10 @@ def min_rows() -> int:
     return int(envs.TPU_SP_MIN_ROWS or (257 if envs.TPU_MOE_SEQUENCE_PARALLEL else 0))
 
 
+def max_rows() -> int:
+    return int(getattr(envs, "TPU_SP_MAX_ROWS", 0) or 0)
+
+
 def enabled() -> bool:
     """Whether sequence-parallel MoE is on at all (main #1463's switch).
 
@@ -43,7 +47,13 @@ def fp8_gather() -> bool:
 
 
 def step_is_sequence_parallel(full_num_tokens: int) -> bool:
-    return enabled() and int(full_num_tokens) >= min_rows()
+    if not enabled():
+        return False
+    n = int(full_num_tokens)
+    if n < min_rows():
+        return False
+    cap = max_rows()
+    return cap <= 0 or n <= cap
 
 
 def set_active(active: bool) -> None:
@@ -67,14 +77,19 @@ def rows_are_sliced(is_sequence_parallel: bool) -> bool:
 
 def rows_are_replicated(is_sequence_parallel: bool) -> bool:
     """Whether a sequence-parallel MoE layer sees the step's rows replicated
-    on every rank (a step below min_rows)."""
+    on every rank (a step below min_rows or above max_rows)."""
     return is_sequence_parallel and not _ACTIVE
 
 
 def check_buckets(compile_sizes: Sequence[int], tp_size: int) -> None:
     """Raise unless every sequence-parallel bucket splits evenly over TP."""
     threshold = min_rows()
-    uneven = [n for n in compile_sizes if n >= threshold and n % tp_size]
+    cap = max_rows()
+    uneven = [
+        n
+        for n in compile_sizes
+        if n >= threshold and (cap <= 0 or n <= cap) and n % tp_size
+    ]
     if uneven:
         raise NotImplementedError(
             f"TPU_MOE_SEQUENCE_PARALLEL splits token buckets >= {threshold} "
