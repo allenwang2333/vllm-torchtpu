@@ -209,12 +209,15 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             for i in self.discard_sampled_tokens_req_indices:
                 valid_sampled_token_ids[i].clear()
         else:
-            valid_mask = selected_token_ids != INVALID_TOKEN_ID
-            gen_lens = valid_mask.sum(dim=1).tolist()
+            raw_rows = selected_token_ids.tolist()
             valid_sampled_token_ids = [
-                seq.tolist() for seq in selected_token_ids[valid_mask].split(gen_lens)
+                row[: row.index(INVALID_TOKEN_ID)]
+                if row[-1] == INVALID_TOKEN_ID
+                else row
+                for row in raw_rows
             ]
             if self.copy_state.spec_logprobs:
+                gen_lens = [len(seq) for seq in valid_sampled_token_ids]
                 self._model_runner_output.logprobs = spec_logprobs_lists(
                     self.copy_state.spec_logprobs, gen_lens
                 )

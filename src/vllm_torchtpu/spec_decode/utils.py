@@ -84,19 +84,39 @@ def tp_local_argmax_logits(
     return all_idxs.gather(0, best_rank).squeeze(0).to(torch.int64)
 
 
+def _stateless_counter_uniform_u(
+    row_indices: torch.Tensor,
+    col_indices: torch.Tensor,
+    seed_i32: torch.Tensor,
+    min_val: float = 1e-4,
+    span: float = 0.9998,
+) -> torch.Tensor:
+    """Zero-HBM 3-round bijective 32-bit counter hash in pure s32 VPU ALU."""
+    h = (
+        row_indices.to(torch.int32) * 0x5BD1E995
+        ^ (col_indices.to(torch.int32) * 0x27D4EB2F)
+        ^ seed_i32.to(torch.int32)
+    )
+    h = (h ^ ((h >> 16) & 0xFFFF)) * 0x7FEB352D
+    h = (h ^ ((h >> 15) & 0x1FFFF)) * 0x165667B1
+    h = h ^ ((h >> 16) & 0xFFFF)
+    return ((h & 0x007FFFFF).to(torch.float32) + 0.5) * (span / 8388608.0) + min_val
+
+
 def tp_local_random_spec_verify_logits(
     logits_processor,
     lm_head: torch.nn.Module,
     hidden_states: torch.Tensor,
     inv_temperatures_per_tok: torch.Tensor,
     row_draft_token_ids: torch.Tensor,
-    u_local: torch.Tensor,
+    seed_lo: torch.Tensor,
+    u_local: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute exact global logsumexp, draft logit, and Gumbel-sampled token IDs across TP shards.
 
-    Avoids materializing or AllGathering full-vocabulary [N, V] logits across TP ranks by reducing
-    each rank's local vocab shard [N, V_shard] to 4 int32-bitcast scalars per row ([N, 4], padded
-    to 128-lane alignment) before tp_all_gather.
+    Avoids materializing or AllGathering full-vocabulary [N, V] logits OR [N, V_shard] float32 uniform
+    tensors in HBM by generating stateless counter-hash uniform variates in VPU registers when u_local
+    is None and reducing each local shard to [N, 4] int32-bitcast scalars before tp_all_gather.
     """
     tp_size = getattr(lm_head, "tp_size", 1)
     if tp_size <= 1:
@@ -119,7 +139,14 @@ def tp_local_random_spec_verify_logits(
         v_cols = torch.arange(
             logits_full.shape[-1], dtype=torch.int32, device=logits_full.device
         ).unsqueeze(0)
-        gumbel_noise = -torch.log(-torch.log(u_local) + 1e-30)
+        if u_local is None:
+            row_idx = torch.arange(
+                logits_full.shape[0], dtype=torch.int32, device=logits_full.device
+            ).unsqueeze(1)
+            u_eff = _stateless_counter_uniform_u(row_idx, v_cols, seed_lo)
+        else:
+            u_eff = u_local
+        gumbel_noise = -torch.log(-torch.log(u_eff) + 1e-30)
         scores = torch.where(
             v_cols == row_draft_token_ids,
             torch.full_like(logits_full, -1e30),
@@ -160,7 +187,14 @@ def tp_local_random_spec_verify_logits(
         ),
     )
 
-    gumbel_noise = -torch.log(-torch.log(u_local) + 1e-30)
+    if u_local is None:
+        row_idx = torch.arange(
+            logits_local.shape[0], dtype=torch.int32, device=logits_local.device
+        ).unsqueeze(1)
+        u_eff = _stateless_counter_uniform_u(row_idx, global_cols, seed_lo)
+    else:
+        u_eff = u_local
+    gumbel_noise = -torch.log(-torch.log(u_eff) + 1e-30)
     gumbel_scores = torch.where(
         global_cols == row_draft_token_ids,
         torch.full_like(logits_local, -1e30),
