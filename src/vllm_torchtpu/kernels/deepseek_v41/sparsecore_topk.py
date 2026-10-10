@@ -876,6 +876,150 @@ def sc_cand_gather_topk(
     return out.reshape(padded_b, k)[:b]
 
 
+def sc_cand_pregathered_topk(
+    cand_scores: jax.Array,
+    candidates: jax.Array,
+    row_lengths: jax.Array,
+    *,
+    k: int = 512,
+    scheduling_group_id: int | None = None,
+) -> jax.Array:
+    """SparseCore top-k over pre-scored [b, cb * 8] contiguous candidate slots."""
+    cand_scores = _as_i32_bits(cand_scores)
+    b, cand_len = cand_scores.shape
+    cb = candidates.shape[1]
+    vecs_per_cand = cand_len // LANES
+    num_subcores = _get_sc_subcores()
+    num_waves = _cdiv(b, num_subcores)
+    padded_b = num_waves * num_subcores
+    if padded_b > b:
+        cand_scores = jnp.pad(
+            cand_scores, ((0, padded_b - b), (0, 0)), constant_values=BITS_NEG_INF
+        )
+        candidates = jnp.pad(
+            candidates, ((0, padded_b - b), (0, 0)), constant_values=-1
+        )
+    rl_pad = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b + LANES))
+
+    def _pregathered_body(
+        cand_scores_flat_hbm,
+        cands_hbm,
+        row_lens_hbm,
+        out_hbm,
+        cands_vmem,
+        idx_vmem,
+        scores_vmem,
+        glob_vmem,
+        rowbuf_vmem,
+        state_vmem,
+        sem_ref,
+    ):
+        sc = pltpu.get_tpu_info().sparse_core
+        sub_stride = 16 if sc is None else sc.num_subcores
+        flat = lax.axis_index("core") * sub_stride + lax.axis_index("subcore")
+        rl_dma = pltpu.make_async_copy(
+            src_ref=row_lens_hbm.at[pl.ds(0, padded_b + LANES)],
+            dst_ref=state_vmem,
+            sem=sem_ref.at[0],
+        )
+        rl_dma.start()
+        rl_dma.wait()
+
+        def fill_body(i):
+            rowbuf_vmem[pl.ds(i * LANES, LANES)] = jnp.full((LANES,), -1, jnp.int32)
+
+        def write_row(row):
+            o_dma = pltpu.make_async_copy(
+                src_ref=rowbuf_vmem.at[pl.ds(0, k)],
+                dst_ref=out_hbm.at[pl.ds(row * k, k)],
+                sem=sem_ref.at[0],
+            )
+            o_dma.start()
+            o_dma.wait()
+
+        @pl.loop(0, num_waves)
+        def _wave(w):
+            row = w * num_subcores + flat
+            active = row < b
+            row_len = jnp.where(active, _vec_at(state_vmem, row), 0)
+
+            @pl.when(row_len == 0)
+            def _empty():
+                @pl.when(active)
+                def _w():
+                    plsc.parallel_loop(0, k // LANES, unroll=8)(fill_body)
+                    write_row(row)
+
+            @pl.when(row_len > 0)
+            def _nonempty():
+                c_dma = pltpu.make_async_copy(
+                    src_ref=cands_hbm.at[pl.ds(row * cb, cb)],
+                    dst_ref=cands_vmem,
+                    sem=sem_ref.at[0],
+                )
+                s_dma = pltpu.make_async_copy(
+                    src_ref=cand_scores_flat_hbm.at[pl.ds(row * cand_len, cand_len)],
+                    dst_ref=scores_vmem,
+                    sem=sem_ref.at[1],
+                )
+                c_dma.start()
+                s_dma.start()
+                _zero_hist(glob_vmem, NUM_BUCKETS // LANES)
+                c_dma.wait()
+
+                def expand_idx(j):
+                    blk = cands_vmem[pl.ds(j * LANES, LANES)]
+                    blk_ok = blk >= 0
+                    tok0 = jnp.left_shift(blk, 3)
+                    for s in range(8):
+                        off = (j * 8 + s) * LANES
+                        idx_vmem[pl.ds(off, LANES)] = jnp.where(
+                            blk_ok & (tok0 + s < row_len), tok0 + s, -1
+                        )
+
+                plsc.parallel_loop(0, cb // LANES, unroll=4)(expand_idx)
+                s_dma.wait()
+
+                def emit(i, woff, _key, sel):
+                    plsc.store_compressed(
+                        rowbuf_vmem.at[pl.ds(woff, LANES)],
+                        idx_vmem[pl.ds(i * LANES, LANES)],
+                        mask=sel,
+                    )
+                    return woff + plsc.all_reduce_population_count(sel)[0]
+
+                _radix_select_and_emit(
+                    scores_vmem,
+                    glob_vmem,
+                    vecs_per_cand,
+                    k,
+                    fill_fn=fill_body,
+                    fill_unroll=8,
+                    emit_fn=emit,
+                )
+                write_row(row)
+
+    out = _run_sc_kernel(
+        _pregathered_body,
+        jax.ShapeDtypeStruct((padded_b * k,), jnp.int32),
+        (
+            pltpu.VMEM((cb,), jnp.int32),
+            pltpu.VMEM((cand_len,), jnp.int32),
+            pltpu.VMEM((cand_len,), jnp.int32),
+            pltpu.VMEM((NUM_BUCKETS + LANES,), jnp.int32),
+            pltpu.VMEM((k + LANES,), jnp.int32),
+            pltpu.VMEM((padded_b + LANES,), jnp.int32),
+            pltpu.SemaphoreType.DMA((2,)),
+        ),
+        f"sc_cand_pregathered_topk_b{b}_cb{cb}_k{k}",
+        scheduling_group_id,
+        cand_scores.reshape(-1),
+        candidates.reshape(-1),
+        rl_pad,
+    )
+    return out.reshape(padded_b, k)[:b]
+
+
 def _sc_write_cand_and_topk_body(
     blk_scores_flat_hbm,
     scores_flat_hbm,

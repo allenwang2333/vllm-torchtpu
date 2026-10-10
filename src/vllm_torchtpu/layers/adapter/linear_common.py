@@ -10,7 +10,10 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    quantize_tensor,
+    xla_quantized_matmul,
+)
 
 # Some layers have their `.weight` read raw -- bypassing the linear method's
 # `apply` -- by code that assumes vLLM's `[n_out, n_in]` layout. Flipping those
@@ -254,6 +257,15 @@ def _apply_mlp_act_exact(
     return _exact_bf16(silu_gate * up)
 
 
+def _fused_swiglu_fp8_quant_xla(
+    gu: jax.Array, swiglu_limit: float | None = None
+) -> tuple[jax.Array, jax.Array]:
+    """Fuse SwiGLU + dynamic row-wise FP8 quantization directly in VMEM S(1)."""
+    return quantize_tensor(
+        _apply_mlp_act_exact(gu, swiglu_limit), jnp.float8_e4m3fn
+    )
+
+
 def _quantized_mlp_jax(
     x: jax.Array,
     w_gu: jax.Array,
@@ -265,6 +277,9 @@ def _quantized_mlp_jax(
 ) -> jax.Array:
     """Fused bit-exact gate_up + SiluAndMul[WithClamp] + down quantized matmul."""
     gu = _exact_bf16(_quantized_matmul_jax(x, w_gu, s_gu))
+    if len(s_dn.shape) == 1 and w_dn.dtype == jnp.float8_e4m3fn:
+        act_q, act_scale = _fused_swiglu_fp8_quant_xla(gu, swiglu_limit)
+        return _prequant_matmul_jax(act_q, act_scale, w_dn, s_dn)
     act = _apply_mlp_act_exact(gu, swiglu_limit)
     return _quantized_matmul_jax(act, w_dn, s_dn)
 
@@ -281,6 +296,9 @@ def _quantized_mlp_prequant_jax(
 ) -> jax.Array:
     """Fused bit-exact prequant gate_up + SiluAndMul[WithClamp] + down matmul."""
     gu = _exact_bf16(_prequant_matmul_jax(x_q, x_scale, w_gu, s_gu))
+    if len(s_dn.shape) == 1 and w_dn.dtype == jnp.float8_e4m3fn:
+        act_q, act_scale = _fused_swiglu_fp8_quant_xla(gu, swiglu_limit)
+        return _prequant_matmul_jax(act_q, act_scale, w_dn, s_dn)
     act = _apply_mlp_act_exact(gu, swiglu_limit)
     return _quantized_matmul_jax(act, w_dn, s_dn)
 

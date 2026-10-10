@@ -928,101 +928,10 @@ def streamindex_topk(
             0,
         )
 
-    if candidates is not None and not produce_blk:
-        cb = candidates.shape[1]
-        total_num_pages, kv_sublane_groups, kv_packing, page_size = cache_kv.shape
-        head_dim = q.shape[2]
-        kv_head_dim_groups = head_dim // kv_packing
-        blocks_per_page = page_size // 8
-        kv_blks_flat = cache_kv.transpose(0, 3, 1, 2).reshape(
-            -1, 8, kv_sublane_groups, kv_packing
-        )
-        sub_b = min(chunk_len, 64)
-        group_base = (
-            reserve_scheduling_group_ids(num_chunks - 1) if num_chunks > 1 else 0
-        )
-        topk_idxs = []
-        for m in range(num_chunks):
-            sc_group = None if m == num_chunks - 1 else group_base + m
-            s_tok = m * chunk_len
-            e_tok = s_tok + chunk_len
-            cands_m = candidates[s_tok:e_tok]
-            rl_m = eff_row_lengths[s_tok:e_tok]
-            cand_scores_parts = []
-            for sb in range(s_tok, e_tok, sub_b):
-                eb = min(sb + sub_b, e_tok)
-                bl = eb - sb
-                cands_sub = candidates[sb:eb]
-                seq_ids_sub = seq_ids_all[sb:eb]
-                rl_sub = eff_row_lengths[sb:eb]
-                safe_blk = jnp.maximum(cands_sub, 0)
-                page_in_seq = jnp.minimum(safe_blk // blocks_per_page, pages_per_seq - 1)
-                blk_in_page = safe_blk % blocks_per_page
-                phys_page = page_indices[
-                    seq_ids_sub[:, None] * pages_per_seq + page_in_seq
-                ]
-                phys_blk = (
-                    jnp.clip(phys_page, 0, total_num_pages - 1) * blocks_per_page
-                    + blk_in_page
-                )
-                kv_blks = kv_blks_flat[phys_blk]
-                kv_slots = (
-                    kv_blks.reshape(bl, cb // 8, 8, 8, kv_sublane_groups, kv_packing)
-                    .transpose(0, 1, 3, 2, 4, 5)
-                    .reshape(bl, cb * 8, kv_sublane_groups, kv_packing)
-                )
-                k_fp8 = lax.bitcast_convert_type(
-                    kv_slots[:, :, :kv_head_dim_groups, :].reshape(
-                        bl, cb * 8, head_dim
-                    ),
-                    jnp.float8_e4m3fn,
-                )
-                k_scale = lax.bitcast_convert_type(
-                    kv_slots[:, :, kv_head_dim_groups, 0], jnp.float8_e8m0fnu
-                ).astype(jnp.float32)
-                qk = jnp.einsum(
-                    "bhd,bmd->bhm",
-                    q[sb:eb],
-                    k_fp8,
-                    preferred_element_type=jnp.float32,
-                )
-                raw_scores = (
-                    jnp.sum(
-                        jnp.maximum(qk, 0.0)
-                        * prepared_indexer_weights[sb:eb, :, None],
-                        axis=1,
-                    )
-                    * k_scale
-                )
-                c_grid = cands_sub.reshape(bl, cb // 8, 1, 8)
-                tok_pos = (
-                    jnp.left_shift(c_grid, 3)
-                    + jnp.arange(8, dtype=jnp.int32)[None, None, :, None]
-                ).reshape(bl, cb * 8)
-                valid_slot = (
-                    jnp.broadcast_to(c_grid >= 0, (bl, cb // 8, 8, 8)).reshape(
-                        bl, cb * 8
-                    )
-                    & (tok_pos < rl_sub[:, None])
-                )
-                cand_scores_parts.append(
-                    jnp.where(valid_slot, raw_scores, -jnp.inf).astype(jnp.float32)
-                )
-            cand_scores = (
-                cand_scores_parts[0]
-                if len(cand_scores_parts) == 1
-                else jnp.concatenate(cand_scores_parts, axis=0)
-            )
-            topk_idxs.append(
-                sc_cand_pregathered_topk(
-                    cand_scores,
-                    cands_m,
-                    rl_m,
-                    k=k,
-                    scheduling_group_id=sc_group,
-                )
-            )
-        return jnp.concatenate(topk_idxs, axis=0)[:max_num_tokens, :k]
+    if candidates is not None and not produce_blk and max_num_tokens >= 32:
+        bkv_p = max(1, min(bkv_p, 4))
+        num_sublanes_total = align_to(pages_per_seq, bkv_p) * page_size // 128
+        num_blk_sublanes_total = num_sublanes_total // 8
 
     group_base = reserve_scheduling_group_ids(num_chunks - 1) if num_chunks > 1 else 0
     chunk_starts = (

@@ -838,7 +838,12 @@ def _qkv_norm_rope_quant_body(
 
 def _qkv_tile_n(t_pad: int) -> int:
     cap_n = 32 if t_pad <= 64 else (128 if t_pad <= 384 else 256)
-    return SUBLANE * largest_divisor(t_pad // SUBLANE, cap=cap_n // SUBLANE)
+    fp8_row_align = 4 * SUBLANE
+    if t_pad % fp8_row_align == 0:
+        return fp8_row_align * largest_divisor(
+            t_pad // fp8_row_align, cap=max(1, cap_n // fp8_row_align)
+        )
+    return t_pad
 
 
 @functools.partial(

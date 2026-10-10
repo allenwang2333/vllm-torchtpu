@@ -26,6 +26,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce as tp_all_reduce,
 )
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -41,7 +42,10 @@ from vllm_torchtpu.distributed.tp_collectives import (
     tp_reduce_scatter,
     tp_shard_slice,
 )
-from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
+from vllm_torchtpu.kernels.deepseek_v4 import (
+    o_projection as o_proj,
+    rope as rope_kernel,
+)
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     fused_wq_b_q_rope_prequant_projection,
     fused_wq_b_q_rope_projection,
@@ -1079,12 +1083,8 @@ class VllmDeepseekV41MLAAttention(
             ):
                 self.__dict__.pop("_tp_attn_op", None)
                 self.__dict__.pop("_tp_attn_op_u1", None)
-                self.__dict__.pop("_tp_attn_op_ced", None)
-                self.__dict__.pop("_tp_attn_op_ced_u1", None)
                 self.__dict__.pop("_tp_swa_step_meta_op", None)
-                _ = self._get_tp_attn_op(False, ced_decoder=eff_ced)
-                if self.compress_ratio > 0:
-                    _ = self._get_tp_attn_op(True, ced_decoder=eff_ced)
+                _ = self._get_tp_attn_op(False)
                 _ = self._get_tp_swa_step_metadata_op()
                 if _TP_ATTN_LOCAL_TOPK and self.compress_ratio > 0:
                     _ = self._tp_attn_topk_indexer()
@@ -1303,8 +1303,8 @@ class VllmDeepseekV41MLAAttention(
     ):
         """Token-parallel attention op: all heads for this rank's T/tp tokens."""
         eff_ced = self._ced_decoder if ced_decoder is None else ced_decoder
-        is_csa = self.compress_ratio > 0
         ced_tag = "_ced" if eff_ced else ""
+        is_csa = self.compress_ratio > 0
         u_tag = "_u1" if (is_csa and has_union) else ""
         attr_name = f"_tp_attn_op{ced_tag}{u_tag}"
         op = self.__dict__.get(attr_name)
@@ -1339,8 +1339,8 @@ class VllmDeepseekV41MLAAttention(
         )
         op_name = (
             f"pallas::deepseek_v41_attention_{'csa' if is_csa else 'swa'}"
-            f"_tpattn{get_tensor_model_parallel_world_size()}"
             f"{ced_tag}"
+            f"_tpattn{get_tensor_model_parallel_world_size()}"
             f"_p{logical_page_size}"
             f"{'_aliased' if two_caches_same_buffer else ''}"
             f"{u_tag}"
@@ -1364,7 +1364,6 @@ class VllmDeepseekV41MLAAttention(
                     logical_page_size=logical_page_size,
                     sliding_window=self.window_size,
                     tp_size=get_tensor_model_parallel_world_size(),
-                    ced_decoder=eff_ced,
                 ),
                 mesh=vllm_context.mesh,
                 donate_argnums=(2,),
@@ -1879,17 +1878,7 @@ class VllmDeepseekV41MLAAttention(
             None if eff_ced_global_from_encoder else getattr(self, "compressor", None)
         )
         cos_sin = self.rotary_emb.cos_sin_cache
-        if (
-            "_tp_attn_wq_b_w" in self._buffers
-            and (
-                not self._tp_attn_encoder_only
-                or self._in_encoder_stage
-                or eff_ced_decoder
-            )
-        ):
-            # Lift both head-parallel (replicated) and TP_ATTN (token-sharded)
-            # module tensors here in a fixed order so their FX placeholder
-            # signatures agree across all buckets (unused aliases are DCE'd).
+        if _TOKEN_SHARD_MIN_TOKENS > 0 and "_tp_attn_wq_b_w" in self._buffers:
             _ = self._tp_attn_ready(num_tokens, tp_size)
             _ = [
                 torch.ops.aten.alias.default(t)
@@ -1910,9 +1899,6 @@ class VllmDeepseekV41MLAAttention(
                     self._tp_attn_sink,
                     self._tp_attn_rank_idx,
                     self._tp_attn_rank_i32,
-                    getattr(self.indexer, "_tp_rank_idx", None)
-                    if self.indexer is not None
-                    else None,
                 )
                 if t is not None
             ]
@@ -1939,20 +1925,11 @@ class VllmDeepseekV41MLAAttention(
         qr_scale_for_indexer: torch.Tensor | None = None
         qr_q_fp8: torch.Tensor | None = None
         qr_q_scale: torch.Tensor | None = None
-        tp_attn_ced_ok = (
-            not eff_ced_decoder
-            or (num_tokens <= 1536 and num_tokens % (tp_size * 6) == 0)
-        )
-        # Token-parallel attention: all heads for this rank's T/tp tokens.
+        # Token-parallel attention across EncoderStage, DecoderStage, and FullStage for T >= 64.
         use_tp_attn = (
             input_is_token_sharded
             and return_token_sharded
-            and tp_attn_ced_ok
-            and (
-                not self._tp_attn_encoder_only
-                or self._in_encoder_stage
-                or eff_ced_decoder
-            )
+            and num_tokens >= max(64, _TP_ATTN_MIN_TOKENS)
             and self._tp_attn_ready(num_tokens, tp_size)
         )
         w_wqa = self.fused_wqa_wkv.weight

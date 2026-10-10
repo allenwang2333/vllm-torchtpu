@@ -501,6 +501,7 @@ def _indexer_v41_tp_op_fn(
     cand_mode: str | None = None,
     cand_blocks: int = 0,
     cand_block_size: int = 0,
+    q_is_prequant: bool = False,
 ) -> jax.Array:
     return indexer_v41_tp_jax(
         rank,
@@ -523,6 +524,7 @@ def _indexer_v41_tp_op_fn(
         cand_mode=cand_mode,
         cand_blocks=cand_blocks,
         cand_block_size=cand_block_size,
+        q_is_prequant=q_is_prequant,
     )
 
 
@@ -1117,5 +1119,6 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
             else:
                 topk = idx_op(*op_args, *meta_args)
         if self.topk_indices_buffer is not None:
-            self.topk_indices_buffer[: topk.shape[0]].copy_(topk)
+            n_topk_rows = topk.shape[0]
+            self.topk_indices_buffer[:n_topk_rows].copy_(topk[:n_topk_rows])
         return topk

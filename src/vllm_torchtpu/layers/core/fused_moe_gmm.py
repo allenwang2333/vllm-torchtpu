@@ -738,7 +738,12 @@ def moe_gmm(
         )
         gmm1_in = jnp.concatenate([u8_pair[..., 0], u8_pair[..., 1]], axis=1)
         gmm1_scale = gmm1_res[:, inter_dim // 2 : inter_dim // 2 + 1]
-    elif not is_w2_fp4 and w2_scale is not None and inter_dim % 128 == 0:
+    elif (
+        not is_w2_fp4
+        and w2_scale is not None
+        and inter_dim % 128 == 0
+        and gmm1_res.shape[0] <= 4608
+    ):
         gmm1_in, gmm1_scale = quantize_lhs_rows(gmm1_res[:, :inter_dim])
     else:
         gmm1_in = gmm1_res[:, :inter_dim]
@@ -1365,12 +1370,6 @@ def fused_moe_func_fp8_dispatch(
         sorted_indices=sorted_indices,
         onehot_permute=onehot_permute,
         w_sorted=w_sorted,
-        lhs_scale=(
-            (onehot_permute @ hidden_scale.astype(jnp.bfloat16)).astype(
-                hidden_scale.dtype
-            )
-            if onehot_permute is not None
-            else hidden_scale[token_indices_sorted]
-        ),
+        lhs_scale=hidden_scale[token_indices_sorted],
     )
     return x[:orig_num_tokens, :hidden_size]

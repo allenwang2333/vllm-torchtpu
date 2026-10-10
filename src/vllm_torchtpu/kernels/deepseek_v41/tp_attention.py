@@ -669,7 +669,6 @@ def attention_tp_local(
     store_fn: Callable = swa_store_all_pallas,
     sliding_window: int = 0,
     tp_size: int = 1,
-    ced_decoder: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Stores SWA rows needed across ranks, then runs `base_fn` on this rank's slice."""
     trailing_args = tuple(
@@ -740,38 +739,6 @@ def attention_tp_local(
         and cand_bits_tiled is not None
         and n_unique is not None
     )
-
-    if ced_decoder:
-        swa_cu, swa_kv, swa_pages, swa_dist = rebase_token_slice(
-            swa_cu_q_lens,
-            swa_kv_lens,
-            swa_page_indices,
-            swa_distribution,
-            token_start,
-            local_tokens=local_tokens,
-        )
-        return base_fn(
-            q,
-            my_local_kv,
-            sw_cache,
-            swa_kv,
-            swa_pages,
-            swa_cu,
-            swa_dist,
-            main_cache_kv,
-            main_kv_lens,
-            local(extra) if is_csa else extra,
-            main_page_indices,
-            main_cu,
-            main_dist,
-            attention_sinks,
-            *((main_cache_rope,) if is_csa else ()),
-            *(
-                (union_gather_indices, cand_bits_tiled, n_unique)
-                if has_union
-                else ()
-            ),
-        )
 
     if (
         swa_store_dst is not None
@@ -915,7 +882,6 @@ def attention_tp_local_swa_op(
     logical_page_size: int,
     sliding_window: int = 0,
     tp_size: int = 1,
-    ced_decoder: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     return attention_tp_local(
         q,
@@ -939,7 +905,6 @@ def attention_tp_local_swa_op(
         logical_page_size=logical_page_size,
         sliding_window=sliding_window,
         tp_size=tp_size,
-        ced_decoder=ced_decoder,
     )
 
 
@@ -967,7 +932,6 @@ def attention_tp_local_csa_op(
     logical_page_size: int,
     sliding_window: int = 0,
     tp_size: int = 1,
-    ced_decoder: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     return attention_tp_local(
         q,
@@ -992,7 +956,6 @@ def attention_tp_local_csa_op(
         logical_page_size=logical_page_size,
         sliding_window=sliding_window,
         tp_size=tp_size,
-        ced_decoder=ced_decoder,
     )
 
 
@@ -1023,7 +986,6 @@ def attention_tp_local_csa_union_op(
     logical_page_size: int,
     sliding_window: int = 0,
     tp_size: int = 1,
-    ced_decoder: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     return attention_tp_local(
         q,
@@ -1051,5 +1013,4 @@ def attention_tp_local_csa_union_op(
         logical_page_size=logical_page_size,
         sliding_window=sliding_window,
         tp_size=tp_size,
-        ced_decoder=ced_decoder,
     )
