@@ -212,6 +212,13 @@ def test_swa_cache_init_sets_bounded_replay_only_when_enabled(monkeypatch):
 
 
 def test_window_starts_stage_cache_and_attention_paths(monkeypatch):
+    import pathlib
+    import sys
+
+    repo_root = pathlib.Path(__file__).resolve().parents[3]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
     from tests.models.vllm.test_dsv41_v2_attention_td756 import (
         _make_attn,
         _make_paged_cache_mock,
