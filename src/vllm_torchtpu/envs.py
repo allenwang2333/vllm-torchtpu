@@ -161,6 +161,7 @@ if TYPE_CHECKING:
     TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: str = ""
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: int | None = None
     SPEC_WARMUP: bool = True
+    TPU_PRECOMPILE_SPEC_MIXED: bool = False
     RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
     RAIDEN_SHM_KEY: str = ""
     RAIDEN_STORAGE_PATH: str = ""
@@ -1066,6 +1067,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run the real spec-decode dispatch once at startup so the first request
     # does not pay for those compiles. Off skips that warmup.
     "SPEC_WARMUP": env_bool("SPEC_WARMUP", default=True),
+    # Startup precompile of the spec-decode mixed-step shapes the sweeps above
+    # miss: compute_selected_logits at (token bucket, padded_logits_length) and
+    # the async substitution at the int32 stride-(1+K) source. Without it a
+    # prefill chunk sharing a step with drafted decodes compiles them on the
+    # serving path (GLM-5.2: ~1.5 s per LM-head shape). Off by default.
+    "TPU_PRECOMPILE_SPEC_MIXED": env_bool("TPU_PRECOMPILE_SPEC_MIXED", default=False),
     # Raiden library switch, on by default. The TPU offloading connector
     # cannot run next to the raiden singleton worker, so it rejects an
     # explicit off and exports the variable as on for the raiden library.
