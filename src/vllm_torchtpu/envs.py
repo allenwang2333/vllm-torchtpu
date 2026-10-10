@@ -193,6 +193,7 @@ if TYPE_CHECKING:
     TPU_SCHED_MK_MAX_RUNNING: int = 0
     TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP: bool = False
     TPU_SCHED_SINGLE_STEP_PREFILL: bool = True
+    QX_TTFT_STAGE_LOG_PERIOD_S: float = 0.0
 
 
 def env_with_choices(
@@ -1161,6 +1162,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SCHED_SINGLE_STEP_PREFILL": env_bool(
         "TPU_SCHED_SINGLE_STEP_PREFILL", default=True
     ),
+    # Host-side 5-point TTFT stage telemetry periodic summary interval in
+    # seconds; 0 disables (default, zero overhead).
+    "QX_TTFT_STAGE_LOG_PERIOD_S": env_float("QX_TTFT_STAGE_LOG_PERIOD_S", 0.0),
     "TPU_HYBRID_RETENTION_MAX_CONVS": env_nonnegative_int(
         "TPU_HYBRID_RETENTION_MAX_CONVS", 96
     ),

@@ -293,3 +293,377 @@ def maybe_install_detok_prompt_tail() -> bool:
     logger.warning("%s installed FastIncrementalDetokenizer prompt-tail priming "
                    "(tail=%d, pid %d, %s)", _DT, tail_n, os.getpid(), pname)
     return True
+
+
+# ---------------------------------------------------------------------------
+# 5-Point Host TTFT Stage Instrumentation (QX_TTFT_STAGE_LOG_PERIOD_S).
+#
+# Tracks per-request host-path latencies across:
+#   t0 (arrival / render start) -> t1 (render done / tokenize start)
+#   -> t2 (tokenize done, recording PrefixTokenCache hit/miss)
+#   -> t3 (process_for_engine done / AsyncLLM.add_request start)
+#   -> t4 (EngineCore add_request_async dispatch complete)
+# When QX_TTFT_STAGE_LOG_PERIOD_S <= 0 (default 0), no hooks are installed and
+# runtime overhead is strictly zero.
+# ---------------------------------------------------------------------------
+
+_TTFT_P = "[QX_TTFT_STAGES]"
+_TTFT_INSTALLED = False
+
+
+def _p50_p90(values: list[float]) -> tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+    s = sorted(values)
+    k = len(s)
+    p50 = s[min(int(0.50 * (k - 1)), k - 1)]
+    p90 = s[min(int(0.90 * (k - 1)), k - 1)]
+    return p50, p90
+
+
+class _TTFTStageStats:
+    n: int = 0
+    tok_cache_hits: int = 0
+    render_ms: list[float] = []
+    tokenize_ms: list[float] = []
+    ipc_ms: list[float] = []
+    last_log: float = 0.0
+    log_period_s: float = 0.0
+    MAX_SAMPLES: int = 8192
+    MAX_PENDING: int = 1024
+    pending_by_id: dict[int, tuple[float, float, float, bool]] = {}
+    pending_by_arrival: dict[float, tuple[float, float, float, bool]] = {}
+
+    @classmethod
+    def reset(cls, now: float | None = None) -> None:
+        cls.n = 0
+        cls.tok_cache_hits = 0
+        cls.render_ms = []
+        cls.tokenize_ms = []
+        cls.ipc_ms = []
+        cls.last_log = time.monotonic() if now is None else now
+        cls.pending_by_id = {}
+        cls.pending_by_arrival = {}
+
+    @classmethod
+    def put_pending(
+        cls,
+        eng_prompt,
+        t_tok_done: float,
+        render_ms: float,
+        tokenize_ms: float,
+        tok_hit: bool,
+    ) -> None:
+        if len(cls.pending_by_id) >= cls.MAX_PENDING:
+            cls.pending_by_id.clear()
+        if len(cls.pending_by_arrival) >= cls.MAX_PENDING:
+            cls.pending_by_arrival.clear()
+        entry = (t_tok_done, render_ms, tokenize_ms, tok_hit)
+        cls.pending_by_id[id(eng_prompt)] = entry
+        if isinstance(eng_prompt, dict):
+            arr = eng_prompt.get("arrival_time")
+            if isinstance(arr, (int, float)):
+                cls.pending_by_arrival[float(arr)] = entry
+
+    @classmethod
+    def pop_pending(
+        cls, prompt, arrival_time: float | None = None
+    ) -> tuple[float, float, float, bool] | None:
+        entry = cls.pending_by_id.pop(id(prompt), None)
+        arr = arrival_time
+        if arr is None and isinstance(prompt, dict):
+            arr = prompt.get("arrival_time")
+        if isinstance(arr, (int, float)):
+            arr_entry = cls.pending_by_arrival.pop(float(arr), None)
+            if entry is None:
+                entry = arr_entry
+        return entry
+
+    @classmethod
+    def format_summary(cls) -> str:
+        hit_pct = (100.0 * cls.tok_cache_hits / cls.n) if cls.n > 0 else 0.0
+        r50, r90 = _p50_p90(cls.render_ms)
+        t50, t90 = _p50_p90(cls.tokenize_ms)
+        i50, i90 = _p50_p90(cls.ipc_ms)
+        return (
+            f"{_TTFT_P} n={cls.n} "
+            f"tok_cache_hit={cls.tok_cache_hits}/{hit_pct:.1f}% "
+            f"render_ms p50/p90={r50:.2f}/{r90:.2f} "
+            f"tokenize_ms p50/p90={t50:.2f}/{t90:.2f} "
+            f"ipc_ms p50/p90={i50:.2f}/{i90:.2f}"
+        )
+
+    @classmethod
+    def record(
+        cls,
+        render_ms: float,
+        tokenize_ms: float,
+        ipc_ms: float,
+        tok_cache_hit: bool,
+        *,
+        now: float | None = None,
+    ) -> str | None:
+        cls.n += 1
+        if tok_cache_hit:
+            cls.tok_cache_hits += 1
+        if len(cls.render_ms) < cls.MAX_SAMPLES:
+            cls.render_ms.append(float(render_ms))
+            cls.tokenize_ms.append(float(tokenize_ms))
+            cls.ipc_ms.append(float(ipc_ms))
+        t_now = time.monotonic() if now is None else now
+        if cls.log_period_s > 0 and (t_now - cls.last_log) >= cls.log_period_s:
+            summary = cls.format_summary()
+            logger.warning("%s", summary)
+            cls.n = 0
+            cls.tok_cache_hits = 0
+            cls.render_ms.clear()
+            cls.tokenize_ms.clear()
+            cls.ipc_ms.clear()
+            cls.last_log = t_now
+            return summary
+        return None
+
+
+def _get_tokcache_hits() -> int:
+    try:
+        from vllm_torchtpu import frontend_tokcache as _tokcache_mod
+
+        cache = getattr(_tokcache_mod, "_CACHE", None)
+        return int(getattr(cache, "hits", 0) or 0) if cache is not None else 0
+    except Exception:
+        return 0
+
+
+def maybe_install_ttft_stage_tracker() -> bool:
+    global _TTFT_INSTALLED
+    if _TTFT_INSTALLED:
+        return False
+    from vllm_torchtpu import envs
+
+    period_s = float(envs.QX_TTFT_STAGE_LOG_PERIOD_S)
+    if period_s <= 0:
+        return False
+    pname = multiprocessing.current_process().name
+    if not (pname == "MainProcess" or pname.startswith("ApiServer")):
+        return False
+    try:
+        import asyncio
+        from vllm.renderers import base as rbase
+        from vllm.v1.engine.async_llm import AsyncLLM
+    except Exception as e:
+        logger.warning("%s cannot import vLLM frontend classes (%r); not enabled",
+                       _TTFT_P, e)
+        return False
+
+    _TTFTStageStats.log_period_s = period_s
+    _TTFTStageStats.reset(time.monotonic())
+
+    orig_render_chat_async = rbase.BaseRenderer.render_chat_async
+    orig_render_chat = rbase.BaseRenderer.render_chat
+    orig_render_cmpl_async = rbase.BaseRenderer.render_cmpl_async
+    orig_render_cmpl = rbase.BaseRenderer.render_cmpl
+    orig_add_request = AsyncLLM.add_request
+
+    async def render_chat_async(
+        self,
+        conversations,
+        chat_params,
+        tok_params=None,
+        *,
+        prompt_extras=None,
+        skip_mm_cache: bool = False,
+    ):
+        arrival_time = time.time()
+        t0 = time.perf_counter()
+        if tok_params is None:
+            tok_params = self.default_chat_tok_params
+        rendered = [
+            self.render_messages_async(conversation, chat_params)
+            for conversation in conversations
+        ]
+        out_conversations = []
+        dict_prompts = []
+        for conv, prompt in await asyncio.gather(*rendered):
+            out_conversations.append(conv)
+            dict_prompts.append(prompt)
+        t1 = time.perf_counter()
+        hits0 = _get_tokcache_hits()
+        tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
+        t2 = time.perf_counter()
+        tok_hit = _get_tokcache_hits() > hits0
+        self._apply_prompt_extras(tok_prompts, prompt_extras)
+        eng_prompts = await asyncio.gather(
+            *(
+                self.process_for_engine_async(
+                    p, arrival_time, skip_mm_cache=skip_mm_cache
+                )
+                for p in tok_prompts
+            )
+        )
+        render_ms = (t1 - t0) * 1000.0
+        tokenize_ms = (t2 - t1) * 1000.0
+        for ep in eng_prompts:
+            _TTFTStageStats.put_pending(ep, t2, render_ms, tokenize_ms, tok_hit)
+        return out_conversations, eng_prompts
+
+    def render_chat(
+        self,
+        conversations,
+        chat_params,
+        tok_params=None,
+        *,
+        prompt_extras=None,
+        skip_mm_cache: bool = False,
+    ):
+        arrival_time = time.time()
+        t0 = time.perf_counter()
+        if tok_params is None:
+            tok_params = self.default_chat_tok_params
+        rendered = [
+            self.render_messages(conversation, chat_params)
+            for conversation in conversations
+        ]
+        out_conversations = []
+        dict_prompts = []
+        for conv, prompt in rendered:
+            out_conversations.append(conv)
+            dict_prompts.append(prompt)
+        t1 = time.perf_counter()
+        hits0 = _get_tokcache_hits()
+        tok_prompts = self.tokenize_prompts(dict_prompts, tok_params)
+        t2 = time.perf_counter()
+        tok_hit = _get_tokcache_hits() > hits0
+        self._apply_prompt_extras(tok_prompts, prompt_extras)
+        eng_prompts = [
+            self.process_for_engine(
+                prompt, arrival_time, skip_mm_cache=skip_mm_cache
+            )
+            for prompt in tok_prompts
+        ]
+        render_ms = (t1 - t0) * 1000.0
+        tokenize_ms = (t2 - t1) * 1000.0
+        for ep in eng_prompts:
+            _TTFTStageStats.put_pending(ep, t2, render_ms, tokenize_ms, tok_hit)
+        return out_conversations, eng_prompts
+
+    async def render_cmpl_async(
+        self,
+        prompts,
+        tok_params=None,
+        *,
+        prompt_extras=None,
+        skip_mm_cache: bool = False,
+    ):
+        arrival_time = time.time()
+        t0 = time.perf_counter()
+        if tok_params is None:
+            tok_params = self.default_cmpl_tok_params
+        dict_prompts = await self.render_prompts_async(prompts)
+        t1 = time.perf_counter()
+        hits0 = _get_tokcache_hits()
+        tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
+        t2 = time.perf_counter()
+        tok_hit = _get_tokcache_hits() > hits0
+        self._apply_prompt_extras(tok_prompts, prompt_extras)
+        eng_prompts = await asyncio.gather(
+            *(
+                self.process_for_engine_async(
+                    p, arrival_time, skip_mm_cache=skip_mm_cache
+                )
+                for p in tok_prompts
+            )
+        )
+        render_ms = (t1 - t0) * 1000.0
+        tokenize_ms = (t2 - t1) * 1000.0
+        for ep in eng_prompts:
+            _TTFTStageStats.put_pending(ep, t2, render_ms, tokenize_ms, tok_hit)
+        return eng_prompts
+
+    def render_cmpl(
+        self,
+        prompts,
+        tok_params=None,
+        *,
+        prompt_extras=None,
+        skip_mm_cache: bool = False,
+    ):
+        arrival_time = time.time()
+        t0 = time.perf_counter()
+        if tok_params is None:
+            tok_params = self.default_cmpl_tok_params
+        dict_prompts = self.render_prompts(prompts)
+        t1 = time.perf_counter()
+        hits0 = _get_tokcache_hits()
+        tok_prompts = self.tokenize_prompts(dict_prompts, tok_params)
+        t2 = time.perf_counter()
+        tok_hit = _get_tokcache_hits() > hits0
+        self._apply_prompt_extras(tok_prompts, prompt_extras)
+        eng_prompts = [
+            self.process_for_engine(
+                prompt, arrival_time, skip_mm_cache=skip_mm_cache
+            )
+            for prompt in tok_prompts
+        ]
+        render_ms = (t1 - t0) * 1000.0
+        tokenize_ms = (t2 - t1) * 1000.0
+        for ep in eng_prompts:
+            _TTFTStageStats.put_pending(ep, t2, render_ms, tokenize_ms, tok_hit)
+        return eng_prompts
+
+    async def add_request(
+        self,
+        request_id: str,
+        prompt,
+        params,
+        *args,
+        **kwargs,
+    ):
+        t_add_start = time.perf_counter()
+        arrival_time = kwargs.get(
+            "arrival_time", args[0] if len(args) > 0 else None
+        )
+        pending = _TTFTStageStats.pop_pending(prompt, arrival_time=arrival_time)
+        out = await orig_add_request(
+            self, request_id, prompt, params, *args, **kwargs
+        )
+        t_add_done = time.perf_counter()
+        try:
+            if pending is not None:
+                t_tok_done, render_ms, tokenize_ms, tok_hit = pending
+                ipc_ms = max((t_add_done - t_tok_done) * 1000.0, 0.0)
+            else:
+                render_ms = 0.0
+                tokenize_ms = 0.0
+                tok_hit = False
+                ipc_ms = max((t_add_done - t_add_start) * 1000.0, 0.0)
+            _TTFTStageStats.record(render_ms, tokenize_ms, ipc_ms, tok_hit)
+        except Exception:
+            pass
+        return out
+
+    render_chat_async.__qx_ttft_stages__ = True
+    render_chat_async.__wrapped__ = orig_render_chat_async
+    render_chat.__qx_ttft_stages__ = True
+    render_chat.__wrapped__ = orig_render_chat
+    render_cmpl_async.__qx_ttft_stages__ = True
+    render_cmpl_async.__wrapped__ = orig_render_cmpl_async
+    render_cmpl.__qx_ttft_stages__ = True
+    render_cmpl.__wrapped__ = orig_render_cmpl
+    add_request.__qx_ttft_stages__ = True
+    add_request.__wrapped__ = orig_add_request
+
+    rbase.BaseRenderer.render_chat_async = render_chat_async
+    rbase.BaseRenderer.render_chat = render_chat
+    rbase.BaseRenderer.render_cmpl_async = render_cmpl_async
+    rbase.BaseRenderer.render_cmpl = render_cmpl
+    AsyncLLM.add_request = add_request
+    _TTFT_INSTALLED = True
+    logger.warning(
+        "%s installed 5-point host TTFT stage tracker (period=%.1fs, pid %d, %s)",
+        _TTFT_P,
+        period_s,
+        os.getpid(),
+        pname,
+    )
+    return True
+
