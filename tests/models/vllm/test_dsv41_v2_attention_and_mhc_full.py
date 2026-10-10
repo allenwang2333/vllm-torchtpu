@@ -955,9 +955,20 @@ class TestAttentionHelperFunctions:
 
         # 4. SWACache
         swa_cache = object.__new__(v2_attn.SWACache)
-        with patch(
-            "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention.DeepseekV4SWACache.__init__"
-        ) as mock_super_swa:
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention.get_current_vllm_config",
+                return_value=SimpleNamespace(
+                    cache_config=SimpleNamespace(
+                        enable_prefix_caching=False, swa_bounded_replay=False
+                    ),
+                    parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+                ),
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention.DeepseekV4SWACache.__init__"
+            ) as mock_super_swa,
+        ):
             v2_attn.SWACache.__init__(
                 swa_cache, cache_config=SimpleNamespace(block_size=32)
             )

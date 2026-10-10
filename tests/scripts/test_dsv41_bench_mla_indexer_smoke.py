@@ -1726,7 +1726,7 @@ class TestBenchmarkingConfigs:
         assert cfg["TPU_DEEPSEEK_V41_CED"] == "1"
 
         extra_args = cfg["EXTRA_SERVE_ARGS"]
-        assert "--no-enable-prefix-caching" in extra_args
+        assert "--no-enable-prefix-caching" not in extra_args
         assert "--enable-ep-weight-filter" in extra_args
         assert "--safetensors-load-strategy=prefetch" in extra_args
         assert "--safetensors-prefetch-num-threads=8" in extra_args
@@ -1805,7 +1805,7 @@ class TestBenchmarkingConfigs:
         assert cfg["TPU_DEEPSEEK_V41_CED"] == "1"
 
         extra_args = cfg["EXTRA_SERVE_ARGS"]
-        assert "--no-enable-prefix-caching" in extra_args
+        assert "--no-enable-prefix-caching" not in extra_args
         assert "--enable-ep-weight-filter" in extra_args
         assert "--safetensors-load-strategy=prefetch" in extra_args
         assert "--safetensors-prefetch-num-threads=8" in extra_args
