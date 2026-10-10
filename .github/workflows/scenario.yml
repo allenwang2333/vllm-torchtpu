@@ -1,5 +1,5 @@
-# Presubmit for the scenario tool (tools/scenario): the lock check and the
-# tool's tests on both supported Pythons.
+# Presubmit for the scenario tool (tools/scenario): the lock check, the tool's
+# tests on both supported Pythons and the generated-files check.
 #
 # Path filter: it runs only for changes to the tool, the CI scenarios
 # (.buildkite/kubernetes/scenarios/), the checks over them
@@ -49,3 +49,5 @@ jobs:
         run: >-
           uv run --project tools/scenario --frozen --python 3.13
           pytest -c tools/scenario/pyproject.toml tools/scenario/tests
+      - name: Generated schemas and REFERENCE.md are current
+        run: uv run --project tools/scenario --frozen --no-dev scenario dev regen --check

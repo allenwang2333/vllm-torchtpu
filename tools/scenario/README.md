@@ -78,6 +78,17 @@ tasks:
     tolerance: 0.025
 ```
 
+[REFERENCE.md](REFERENCE.md) lists every field with its type, default and
+description, and the validation rules and reserved names. It and the JSON
+schemas in `schema/` are generated from the models. For completion and errors
+in an editor that uses the YAML language server, start a scenario file with
+this line, the path relative to the file (`defaults.yaml` takes
+`defaults.schema.json`):
+
+```yaml
+# yaml-language-server: $schema=<path>/tools/scenario/schema/scenario.schema.json
+```
+
 ### Server
 
 `image` is a full image URI. Left unset, the target supplies the image: the CI

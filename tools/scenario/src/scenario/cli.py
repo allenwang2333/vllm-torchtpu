@@ -13,9 +13,15 @@
 # limitations under the License.
 """The `scenario` command line."""
 
+import sys
+from typing import NoReturn
+
 import click
 
-from scenario import PLAN_FORMAT, __version__
+from scenario import PLAN_FORMAT, __version__, gen
+
+EXIT_PROBLEMS = 1
+EXIT_USAGE = 2
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -27,3 +33,35 @@ from scenario import PLAN_FORMAT, __version__
 )
 def main() -> None:
     """Validate, show, render and run vLLM server scenarios."""
+
+
+def _fail(message: str, code: int = EXIT_USAGE) -> NoReturn:
+    click.echo(f"error: {message}", err=True)
+    sys.exit(code)
+
+
+# dev --------------------------------------------------------------------
+
+
+@main.group()
+def dev() -> None:
+    """Commands for working on the tool itself."""
+
+
+@dev.command()
+@click.option(
+    "--check", is_flag=True, help="Write nothing; fail when a generated file is stale."
+)
+def regen(check: bool) -> None:
+    """Regenerate the JSON schemas and REFERENCE.md from the models."""
+    try:
+        root = gen.tool_dir()
+    except FileNotFoundError as error:
+        _fail(str(error))
+    if check:
+        names = gen.stale(root)
+        for name in names:
+            click.echo(f"stale: tools/scenario/{name}; run: {gen.REGEN}", err=True)
+        sys.exit(EXIT_PROBLEMS if names else 0)
+    for name in gen.write(root):
+        click.echo(f"wrote tools/scenario/{name}")
