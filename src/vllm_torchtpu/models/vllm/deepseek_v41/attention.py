@@ -447,7 +447,6 @@ def _unpack_meta(meta: Any) -> tuple[Any, Any, Any, Any]:
     )
 
 
-@torch.compiler.disable
 def _resolve_two_caches_same_buffer(
     mod: torch.nn.Module,
     orig_main_cache_kv: torch.Tensor | None,
