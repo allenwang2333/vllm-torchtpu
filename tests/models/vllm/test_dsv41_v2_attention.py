@@ -277,7 +277,7 @@ def test_prepare_tpu_indexer_all_indices_fit_masking(monkeypatch):
         "_row_slots",
         lambda cache, table, reqs, log: torch.zeros_like(log, dtype=torch.int64),
     )
-    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask: None)
+    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask, **kw: None)
     attn.wq_b = lambda qr: qr
     attn._rotate = lambda x, pos: x
 
@@ -417,7 +417,7 @@ def test_prepare_tpu_non_source_layer_buffer_reuse(monkeypatch):
         "_row_slots",
         lambda cache, table, reqs, log: torch.zeros_like(log, dtype=torch.int64),
     )
-    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask: None)
+    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask, **kw: None)
     attn.wq_b = lambda qr: qr
     attn._rotate = lambda x, pos: x
 
@@ -529,7 +529,7 @@ def test_prepare_tpu_tiled_paged_attention_dispatch_bfloat16(monkeypatch):
         "_row_slots",
         lambda cache, table, reqs, log: torch.zeros_like(log, dtype=torch.int64),
     )
-    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask: None)
+    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask, **kw: None)
     attn.wq_b = lambda qr: qr
     attn._rotate = lambda x, pos: x
 
@@ -621,7 +621,7 @@ def test_prepare_tpu_untiled_fp8_kv_raises_not_implemented(monkeypatch):
         "_read_rows",
         lambda cache, table, reqs, log: torch.zeros((count, log.shape[1], 16)),
     )
-    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask: None)
+    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask, **kw: None)
     attn.wq_b = lambda qr: qr
     attn._rotate = lambda x, pos: x
 
@@ -722,7 +722,7 @@ def test_prepare_tpu_indexer_not_all_indices_fit_both_branches(monkeypatch):
         "_row_slots",
         lambda cache, table, reqs, log: torch.zeros_like(log, dtype=torch.int64),
     )
-    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask: None)
+    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask, **kw: None)
     attn.wq_b = lambda qr: qr
     attn._rotate = lambda x, pos: x
     attn._quantize_indexer = lambda x: x

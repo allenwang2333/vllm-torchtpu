@@ -677,7 +677,7 @@ class TestPrepareTpuAssertQNotNone:
             "_read_rows",
             lambda cache, table, reqs, logical: torch.zeros((4, 64, 128)),
         )
-        monkeypatch.setattr(v2_attn, "_insert", lambda *args: None)
+        monkeypatch.setattr(v2_attn, "_insert", lambda *args, **kw: None)
         attn._rotate = lambda q, pos: q
         monkeypatch.setattr(
             v2_attn,
@@ -749,7 +749,7 @@ class TestPrepareTpuAssertQNotNone:
             "_read_rows",
             lambda cache, table, reqs, logical: torch.zeros((4, 64, 128)),
         )
-        monkeypatch.setattr(v2_attn, "_insert", lambda *args: None)
+        monkeypatch.setattr(v2_attn, "_insert", lambda *args, **kw: None)
         attn._rotate = lambda q, pos: q
         monkeypatch.setattr(
             v2_attn,

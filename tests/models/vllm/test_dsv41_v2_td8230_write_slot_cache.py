@@ -109,7 +109,7 @@ def _make_attn(monkeypatch, metadata, index_cache, inserted, *, starts=None):
     )
     monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
     monkeypatch.setattr(
-        v2_attn, "_insert", lambda cache, slots, val, mask: inserted.append(slots)
+        v2_attn, "_insert", lambda cache, slots, val, mask, **kw: inserted.append(slots)
     )
     attn: Any = object.__new__(v2_attn.DeepseekV41Attention)
     torch.nn.Module.__init__(attn)

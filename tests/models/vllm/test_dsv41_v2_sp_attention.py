@@ -654,7 +654,7 @@ def test_prepare_tpu_branches(monkeypatch):
         "_row_slots",
         lambda cache, table, reqs, log: torch.zeros_like(log, dtype=torch.int64),
     )
-    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask: None)
+    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask, **kw: None)
 
     sparse_fp8_called = []
     monkeypatch.setattr(

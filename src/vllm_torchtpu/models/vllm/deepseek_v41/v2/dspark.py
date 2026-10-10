@@ -156,25 +156,28 @@ def _insert_context_kv(
     stage_cache = v2_attn._active_stage_attn_cache
     if stage_cache is None or not stage_cache.get("context_kv_pre_rotated", False):
         kv = attn._rotate(kv, positions)
+    write = None
     if isinstance(metadata, torch.Tensor):
         swa_slots = metadata
         swa_valid = swa_slots >= 0
     else:
         rows_per_page = swa_cache.shape[1]
+        fast_offset = v2_attn._has_fast_cache_offset(swa_cache)
         slot_key = (
             "context_kv_slots",
             metadata.seq_lens.shape,
             rows_per_page,
             attn.window_size,
+            v2_attn._fast_cache_offset_key(swa_cache) if fast_offset else None,
         )
         block_tables = getattr(metadata, "block_tables", None)
         cached_slots = stage_cache.get(slot_key) if stage_cache is not None else None
         if cached_slots is not None and cached_slots[0] is block_tables:
-            _, swa_slots, swa_valid, _, _ = cached_slots
+            _, swa_slots, swa_valid, _, _, write = cached_slots
         else:
             table = None
             if cached_slots is not None:
-                _, _, _, in_window, addr = cached_slots
+                _, _, _, in_window, addr, _ = cached_slots
             elif metadata.seq_lens.numel() > 0:
                 requests = _token_requests(metadata, positions).clamp(
                     max=metadata.seq_lens.shape[0] - 1
@@ -212,6 +215,13 @@ def _insert_context_kv(
                     ~valid_token, -1
                 )
                 swa_valid = (blocks >= 0) & valid_in_window
+                # Offset-free write rows shared by every draft layer; each
+                # layer adds its row_offset instead of re-deriving the block
+                # and remainder from swa_slots in PagedCacheRows.write.
+                if fast_offset:
+                    write = v2_attn._fast_swa_row_slots(
+                        swa_cache, blocks, pos_rem, ~swa_valid | (swa_slots < 0)
+                    )
             else:
                 swa_slots = _cache_slots(swa_cache, metadata, positions)
                 swa_valid = (
@@ -226,8 +236,18 @@ def _insert_context_kv(
                     swa_valid,
                     in_window,
                     addr,
+                    write,
                 )
-    _insert(swa_cache, swa_slots, kv, swa_valid)
+    if write is not None:
+        _insert(
+            swa_cache,
+            swa_slots,
+            kv,
+            swa_valid,
+            records=v2_attn._offset_records(swa_cache, *write),
+        )
+    else:
+        _insert(swa_cache, swa_slots, kv, swa_valid)
 
 
 class DSparkDeepseekV41Model(nn.Module):

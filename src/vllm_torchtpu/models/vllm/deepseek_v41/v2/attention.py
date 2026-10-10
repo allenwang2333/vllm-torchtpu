@@ -419,8 +419,15 @@ def _value(output):
     return output[0] if isinstance(output, tuple) else output
 
 
-def _insert(cache, slots, values, valid):
-    write_cache(cache, slots, values, valid)
+def _insert(cache, slots, values, valid, *, records=None):
+    write_cache(cache, slots, values, valid, records=records)
+
+
+def _offset_records(cache, write_slots, write_invalid):
+    """Pool rows from stage-shared ``_fast_swa_row_slots`` output for ``cache``."""
+    offset = cache.row_offset
+    records = write_slots if offset == 0 else offset + write_slots
+    return records.masked_fill(write_invalid, -1)
 
 
 def _gather_query_rows(rows):
@@ -1002,10 +1009,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             # tables: compute their addresses (and the deferred index-cache
             # write rows) once per stage while the block_tables are unchanged.
             fast_idx = _has_fast_cache_offset(index_cache)
+            fast_kv = _has_fast_cache_offset(self.kv_cache)
             write_key = self._stage_cache_key(
                 "global_kv_write_slots",
                 slot_key,
                 _fast_cache_offset_key(index_cache) if fast_idx else None,
+                _fast_cache_offset_key(self.kv_cache) if fast_kv else None,
             )
             kv_tables = kv_meta.block_tables
             idx_tables = idx_meta.block_tables
@@ -1023,6 +1032,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     index_slots,
                     idx_write_slots,
                     idx_write_invalid,
+                    kv_write_slots,
+                    kv_write_invalid,
                 ) = cached_write
             else:
                 kv_blocks = kv_table[requests, kv_col].long()
@@ -1050,6 +1061,16 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     idx_write_slots, idx_write_invalid = _fast_swa_row_slots(
                         index_cache, idx_blocks, idx_rem, ~valid | (index_slots < 0)
                     )
+                kv_write_slots = kv_write_invalid = None
+                if fast_kv:
+                    # The kv_cache write rows, shared by L2/8/14/20 (each adds
+                    # its own row_offset) instead of a per-layer row_indices.
+                    kv_write_slots, kv_write_invalid = _fast_swa_row_slots(
+                        self.kv_cache,
+                        kv_blocks,
+                        kv_rem,
+                        ~valid | (compressed_slots < 0),
+                    )
                 stage_cache[write_key] = (
                     kv_tables,
                     idx_tables,
@@ -1058,6 +1079,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     index_slots,
                     idx_write_slots,
                     idx_write_invalid,
+                    kv_write_slots,
+                    kv_write_invalid,
                 )
         else:
             compressed_slots = _cache_slots(
@@ -1077,18 +1100,28 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 compress_ratio=idx_ratio,
             )
             idx_write_slots = idx_write_invalid = None
+            kv_write_slots = kv_write_invalid = None
         starts = _window_starts()
         if starts is not None:
             # Shared prefix rows must survive replay unchanged in both paths.
             valid = valid & ~_replayed(kv_meta, positions, starts, self.window_size)
             if idx_write_invalid is not None:
                 idx_write_invalid = idx_write_invalid | ~valid
-        _insert(
-            self.kv_cache,
-            compressed_slots,
-            self._rotate(latent, group_positions),
-            valid,
-        )
+            if kv_write_invalid is not None:
+                kv_write_invalid = kv_write_invalid | ~valid
+        rotated = self._rotate(latent, group_positions)
+        if kv_write_slots is not None and kv_write_invalid is not None:
+            _insert(
+                self.kv_cache,
+                compressed_slots,
+                rotated,
+                valid,
+                records=_offset_records(
+                    self.kv_cache, kv_write_slots, kv_write_invalid
+                ),
+            )
+        else:
+            _insert(self.kv_cache, compressed_slots, rotated, valid)
         keys = indexer.k_norm(_value(indexer.wk(latent)))
         keys = self._quantize_indexer(self._rotate(keys, group_positions))
         if (
@@ -1098,9 +1131,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and not self._all_indices_fit
         ):
             if idx_write_slots is not None and idx_write_invalid is not None:
-                offset = index_cache.row_offset
-                records = idx_write_slots if offset == 0 else offset + idx_write_slots
-                return records.masked_fill(idx_write_invalid, -1), keys
+                return (
+                    _offset_records(index_cache, idx_write_slots, idx_write_invalid),
+                    keys,
+                )
             records = index_cache.row_indices(index_slots.clamp(min=0))
             return records.masked_fill(~valid | (index_slots < 0), -1), keys
         _insert(index_cache, index_slots, keys, valid)
@@ -1328,6 +1362,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     if swa_row_slots is not None
                     else None
                 )
+                # The token write rows (b2, pos_rem) shared by every SWA layer;
+                # each layer adds its row_offset instead of re-deriving the
+                # block and remainder from swa_slots in PagedCacheRows.write.
+                swa_write = (
+                    _fast_swa_row_slots(swa_cache, b2, pos_rem, ~swa_valid)
+                    if has_fast_swa_offset
+                    else None
+                )
                 stage_cache[swa_slots_key] = (
                     swa.block_tables,
                     swa_slots,
@@ -1336,6 +1378,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     swa_invalid_3d,
                     valid_window,
                     invalid_window,
+                    swa_write,
                     swa_row_slots,
                     swa_row_slots_masked,
                 )
@@ -1348,10 +1391,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     swa_invalid_3d,
                     valid_window,
                     invalid_window,
+                    swa_write,
                     swa_row_slots,
                     swa_row_slots_masked,
                 ) = cached_swa_slots
         else:
+            swa_write = None
             swa_slots = _cache_slots(swa_cache, swa, positions)
             swa_valid = swa_slots >= 0
             swa_valid_int32 = swa_valid
@@ -1454,7 +1499,16 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # Match upstream's plain BF16 cache selected by this backend. Packed
         # FP8/NVFP4 cache numerics must not be imposed on BF16 cache rows.
         kv = self._rotate(kv, positions)
-        _insert(swa_cache, swa_slots, kv, swa_valid)
+        if swa_write is not None:
+            _insert(
+                swa_cache,
+                swa_slots,
+                kv,
+                swa_valid,
+                records=_offset_records(swa_cache, *swa_write),
+            )
+        else:
+            _insert(swa_cache, swa_slots, kv, swa_valid)
         weights = None
         pending_index_write = None
         if self.compressor is not None and not self._ced_global_from_encoder:

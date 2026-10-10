@@ -95,7 +95,7 @@ def test_remap_dspark_name():
 def test_insert_context_kv(monkeypatch: pytest.MonkeyPatch):
     inserted: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
-    def fake_insert(cache, slots, kv, valid):
+    def fake_insert(cache, slots, kv, valid, **kw):
         inserted.append((slots.clone(), kv.clone(), valid.clone()))
 
     monkeypatch.setattr(v2_dspark, "_insert", fake_insert)

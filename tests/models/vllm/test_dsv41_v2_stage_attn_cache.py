@@ -536,7 +536,7 @@ class TestCompressorStateAndGlobalKvAddressingCache:
         monkeypatch.setattr(
             v2_attn,
             "_insert",
-            lambda cache, slots, val, mask: inserted_slots.append(slots.clone()),
+            lambda cache, slots, val, mask, **kw: inserted_slots.append(slots.clone()),
         )
 
         attn: Any = object.__new__(v2_attn.DeepseekV41Attention)

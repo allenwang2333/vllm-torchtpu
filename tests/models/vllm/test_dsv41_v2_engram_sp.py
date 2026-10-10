@@ -935,7 +935,7 @@ def test_stage_attention_cache_scope_shares_addressing(monkeypatch):
     monkeypatch.setattr(
         v2_attn,
         "_insert",
-        lambda cache, slots, val, mask: captured_inserts.append(slots.clone()),
+        lambda cache, slots, val, mask, **kw: captured_inserts.append(slots.clone()),
     )
 
     def _fake_save_compress_norm(

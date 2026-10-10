@@ -106,7 +106,7 @@ def test_remap_dspark_name():
 def test_insert_context_kv(monkeypatch: pytest.MonkeyPatch):
     inserted: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
-    def fake_insert(cache, slots, kv, valid):
+    def fake_insert(cache, slots, kv, valid, **kw):
         inserted.append((slots.clone(), kv.clone(), valid.clone()))
 
     monkeypatch.setattr(v2_dspark, "_insert", fake_insert)
@@ -1556,7 +1556,7 @@ def test_insert_context_kv_stage_cache_and_pre_rotated(
     token_req_calls = 0
     orig_token_requests = v2_attn._token_requests
 
-    def fake_insert(cache, slots, kv, valid):
+    def fake_insert(cache, slots, kv, valid, **kw):
         inserted.append((slots.clone(), kv.clone(), valid.clone()))
 
     def fake_rotate(kv, pos):
@@ -1761,7 +1761,7 @@ def test_dspark_fused_context_kv_unquantized_and_fp8_parity(
     monkeypatch.setattr(
         v2_dspark,
         "_insert",
-        lambda cache, slots, kv, valid: unfused_inserts.append(kv.clone()),
+        lambda cache, slots, kv, valid, **kw: unfused_inserts.append(kv.clone()),
     )
     model.precompute_and_store_context_kv(main_x, positions, metadata=md)
     assert len(unfused_inserts) == 2
@@ -1781,7 +1781,7 @@ def test_dspark_fused_context_kv_unquantized_and_fp8_parity(
     monkeypatch.setattr(
         v2_dspark,
         "_insert",
-        lambda cache, slots, kv, valid: fused_inserts.append(kv.clone()),
+        lambda cache, slots, kv, valid, **kw: fused_inserts.append(kv.clone()),
     )
     model.precompute_and_store_context_kv(main_x, positions, metadata=md)
     assert len(fused_inserts) == 2
@@ -1812,7 +1812,7 @@ def test_dspark_fused_context_kv_unquantized_and_fp8_parity(
     monkeypatch.setattr(
         v2_dspark,
         "_insert",
-        lambda cache, slots, kv, valid: quant_inserts.append(kv.clone()),
+        lambda cache, slots, kv, valid, **kw: quant_inserts.append(kv.clone()),
     )
     model.precompute_and_store_context_kv(main_x, positions, metadata=md)
     assert len(q_matmul_calls) == 1

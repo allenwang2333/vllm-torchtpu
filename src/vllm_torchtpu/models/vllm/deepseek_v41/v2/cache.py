@@ -557,18 +557,26 @@ class PagedCacheRows:
             )
         return gathered.reshape(*records.shape, *self.shape[2:])
 
-    def write(self, slots, values, after=None):
-        """``after`` (optional) must be computed before the in-place write."""
-        if self.sharded:
-            records = self.row_indices(slots)
-        elif self.page_stride == self.shape[1]:
-            records = (
-                slots.clamp(min=-1)
-                if self.row_offset == 0
-                else torch.where(slots >= 0, self.row_offset + slots, -1)
-            )
-        else:
-            records = self.row_indices(slots.clamp(min=0)).masked_fill(slots < 0, -1)
+    def write(self, slots, values, after=None, *, records=None):
+        """``after`` (optional) must be computed before the in-place write.
+
+        ``records`` (optional): the pool rows of ``slots`` (``-1`` where
+        invalid), already mapped by the caller (e.g. once per stage via
+        ``_fast_swa_row_slots``); skips the per-call ``row_indices`` mapping.
+        """
+        if records is None:
+            if self.sharded:
+                records = self.row_indices(slots)
+            elif self.page_stride == self.shape[1]:
+                records = (
+                    slots.clamp(min=-1)
+                    if self.row_offset == 0
+                    else torch.where(slots >= 0, self.row_offset + slots, -1)
+                )
+            else:
+                records = self.row_indices(slots.clamp(min=0)).masked_fill(
+                    slots < 0, -1
+                )
         if self.dtype == torch.uint8:
             self._write_fp8(records, values)
             return
@@ -1163,16 +1171,20 @@ def initialize_cache_ops():
     )
 
 
-def write_cache(cache, slots, values, valid, after=None):
+def write_cache(cache, slots, values, valid, after=None, *, records=None):
     """Valid destinations must be unique; invalid rows have no side effects.
 
     ``after``: a value (e.g. rows read from ``cache``) to finish first.
+    ``records``: pre-mapped pool rows of ``slots`` for a ``PagedCacheRows``
+    cache (``-1`` where invalid); other caches ignore it.
     """
     count = values.shape[0]
     slots, valid = slots[:count], valid[:count]
     slots = slots.masked_fill(~valid, -1)
     if isinstance(cache, PagedCacheRows):
-        cache.write(slots, values, after)
+        if records is not None:
+            records = records[:count].masked_fill(~valid, -1)
+        cache.write(slots, values, after, records=records)
         return
     if cache.device.type == "cpu":
         selected = slots[valid].long()
