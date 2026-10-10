@@ -1138,11 +1138,15 @@ def patched_model_forward(
         _check_tokens_divide_by_tp(full_num_tokens)
         if get_pp_group().is_first_rank:
             hidden_states = _sp_chunk(self.layers[self.start_layer], hidden_states)
-        else:
-            sp_rows = full_num_tokens // get_tensor_model_parallel_world_size()
-            hidden_states = hidden_states.narrow(0, 0, sp_rows)
-            assert isinstance(residual, torch.Tensor)
-            residual = residual.narrow(0, 0, sp_rows)
+    if self.use_sequence_parallel and not get_pp_group().is_first_rank:
+        rows = (
+            full_num_tokens // get_tensor_model_parallel_world_size()
+            if sp
+            else full_num_tokens
+        )
+        hidden_states = hidden_states.narrow(0, 0, rows)
+        assert isinstance(residual, torch.Tensor)
+        residual = residual.narrow(0, 0, rows)
 
     aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
     for layer_idx, layer in enumerate(
@@ -1216,11 +1220,15 @@ def patched_mtp_forward(
         _check_tokens_divide_by_tp(full_num_tokens)
         if get_pp_group().is_first_rank:
             hidden_states = _sp_chunk(mtp_layer, hidden_states)
-        else:
-            sp_rows = full_num_tokens // get_tensor_model_parallel_world_size()
-            hidden_states = hidden_states.narrow(0, 0, sp_rows)
-            assert isinstance(residual, torch.Tensor)
-            residual = residual.narrow(0, 0, sp_rows)
+    if mtp_layer.use_attn_reduce_scatter_for_moe and not get_pp_group().is_first_rank:
+        rows = (
+            full_num_tokens // get_tensor_model_parallel_world_size()
+            if sp
+            else full_num_tokens
+        )
+        hidden_states = hidden_states.narrow(0, 0, rows)
+        assert isinstance(residual, torch.Tensor)
+        residual = residual.narrow(0, 0, rows)
 
     hidden_states, residual = mtp_layer(
         positions=positions,

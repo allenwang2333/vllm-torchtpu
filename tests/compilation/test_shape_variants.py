@@ -144,10 +144,11 @@ class FakeExecutable:
 
     rows: int
     waves: int
+    num_outputs: int = 1
 
     def __call__(self, *args):
         CALLS.append((self.rows, self.waves))
-        return (torch.zeros(self.rows, HIDDEN),)
+        return tuple(torch.zeros(self.rows, HIDDEN) for _ in range(self.num_outputs))
 
     def serialize(self):
         """Stand in for the bundled AOTAutograd entry.
@@ -179,8 +180,10 @@ class FakeTpuBackend:
     def __call__(self, graph: fx.GraphModule, example_inputs):
         rows = max(t.shape[0] for t in example_inputs if isinstance(t, torch.Tensor))
         waves = sum(1 for node in graph.graph.nodes if "wave" in str(node.target))
+        out_node = next(n for n in reversed(graph.graph.nodes) if n.op == "output")
+        num_outputs = len(out_node.args[0]) if isinstance(out_node.args[0], (tuple, list)) else 1
         self.compiled.append((rows, waves))
-        return FakeExecutable(rows, waves)
+        return FakeExecutable(rows, waves, num_outputs)
 
 
 @dataclasses.dataclass
@@ -734,3 +737,149 @@ def test_small_collective_row_fork_hands_buckets_over(tmp_path, model_name, reta
             retain,
         )
     )
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
+class NonFirstPPStageSPModel(nn.Module):
+    """Non-first PP stage running patched_model_forward and
+    patched_decoder_layer_forward across the SP row fork with splitting ops."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        self.use_sequence_parallel = True
+        self.start_layer = 0
+        self.end_layer = 2
+        self.layers = nn.ModuleList([self._make_layer(), self._make_layer()])
+
+    def norm(self, h, r):
+        return h + r, None
+
+    @staticmethod
+    def _make_layer() -> nn.Module:
+        from vllm_torchtpu.models.vllm import qwen3_next_patch as patch_mod
+
+        class _Layer(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.use_attn_reduce_scatter_for_moe = True
+                self.layer_type = "linear_attention"
+                self.layer_scale = False
+                self._tpu_sp_rank = torch.tensor([0], dtype=torch.int32)
+                self.ln1 = nn.LayerNorm(HIDDEN)
+                self.ln2 = nn.LayerNorm(HIDDEN)
+
+            def input_layernorm(self, h, r=None):
+                if r is None:
+                    return self.ln1(h)
+                r = h + r
+                return self.ln1(r), r
+
+            def linear_attn(self, hidden_states, **kw):
+                return WAVE(hidden_states)
+
+            def post_attention_layernorm(self, h, r):
+                r = h + r
+                return self.ln2(r), r
+
+            def mlp(self, h, already_sequence_parallel=False):
+                return h * 2.0
+
+            def forward(self, positions, hidden_states, residual):
+                return patch_mod.patched_decoder_layer_forward(
+                    self, hidden_states, residual, positions
+                )
+
+        return _Layer()
+
+    def _maybe_add_hidden_state(self, aux, idx, h, r):
+        return aux
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors=None,
+        inputs_embeds: torch.Tensor | None = None,
+    ):
+        from vllm_torchtpu.models.vllm.qwen3_next_patch import patched_model_forward
+
+        return patched_model_forward(
+            self,
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
+
+
+def _non_first_pp_stage_sp_fork_hands_buckets_over(cache_root, is_last_rank):
+    from vllm.sequence import IntermediateTensors
+    from vllm_torchtpu.models.vllm import qwen3_next_patch as patch_mod
+
+    class _FakePPGroup:
+        is_first_rank = False
+
+    _FakePPGroup.is_last_rank = is_last_rank
+    pp_group = _FakePPGroup()
+    config, backend = prepare(
+        cache_root, splitting_ops=["tpu_shape_variants_test::wave"]
+    )
+    with (
+        patch.multiple(
+            patch_mod,
+            get_pp_group=lambda: pp_group,
+            get_tensor_model_parallel_world_size=lambda: 2,
+            _check_tokens_divide_by_tp=lambda n: torch._check(n % 2 == 0),
+            _rows_are_sequence_parallel=lambda n: n >= 512,
+            tensor_model_parallel_all_gather=lambda x, dim=0: torch.cat(
+                [x, x], dim=dim
+            ),
+            tensor_model_parallel_reduce_scatter=lambda x, dim=0: x.reshape(
+                2, -1, x.shape[-1]
+            )[0],
+            tensor_model_parallel_all_reduce=lambda x: x,
+        ),
+        patch.object(patch_mod.sequence_parallel, "fp8_gather", lambda: False),
+    ):
+        model = build(NonFirstPPStageSPModel, config)
+        retraces = 0
+        with set_current_vllm_config(config), shape_variants.warmup() as tracked:
+            for num_tokens in BUCKETS:
+                if tracked.needs_retrace(num_tokens):
+                    shape_variants.retrace(model, config)
+                    retraces += 1
+                with set_forward_context({}, config):
+                    model(
+                        input_ids=None,
+                        positions=torch.zeros(3, num_tokens, dtype=torch.int64),
+                        intermediate_tensors=IntermediateTensors(
+                            {
+                                "hidden_states": torch.zeros(num_tokens, HIDDEN),
+                                "residual": torch.zeros(num_tokens, HIDDEN),
+                            }
+                        ),
+                    )
+    assert retraces == 1
+    # 3 subgraphs (2 splitting WAVE ops) x 3 buckets = 9 compiled executables.
+    assert len(backend.compiled) == 9
+
+
+@pytest.mark.parametrize("is_last_rank", [False, True], ids=["intermediate", "last"])
+def test_non_first_pp_stage_sp_row_fork_hands_buckets_over(tmp_path, is_last_rank):
+    """Non-first PP stages narrow intermediate_tensors on both sides of the SP
+    row fork so all subgraphs lift identical SymInt inputs across both traces."""
+    in_child(
+        partial(
+            _non_first_pp_stage_sp_fork_hands_buckets_over,
+            str(tmp_path),
+            is_last_rank,
+        )
+    )
+
