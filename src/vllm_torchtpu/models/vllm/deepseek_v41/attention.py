@@ -938,14 +938,18 @@ class VllmDeepseekV41MLAAttention(
         op = self.__dict__.get(attr_name)
         if op is not None:
             return op
+        _ = self.q_rope_op
         _ = self.kvnorm_rope_op
+        _ = self.qkv_norm_rope_quant_op
+        _ = self.qkv_norm_rope_op
+        _ = self.qkv_norm_rope_and_quant_op
+        _ = self.o_proj_op
+        _ = self.wq_b_q_rope_op
+        _ = self.wq_b_q_rope_prequant_op
         if self.non_causal_multi_token_decode and not torch.compiler.is_compiling():
             _ = self.kv_rope_op
             _ = self.context_kv_attn_op
-        if _FUSED_Q_ROPE:
-            _ = self.wq_b_q_rope_op
-        if _FUSED_SEAM_QUANT:
-            _ = _get_quantized_matmul_prequant_op()
+        _ = _get_quantized_matmul_prequant_op()
         if "_tp_attn_wo_b_w" in self._buffers:
             _ = _get_quantized_matmul_op()
         if not torch.compiler.is_compiling():

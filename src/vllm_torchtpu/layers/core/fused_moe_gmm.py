@@ -890,7 +890,7 @@ _MOE_TOKEN_CHUNK = 4096
         "skip_padded_tokens",
     ),
 )
-def _fused_moe_single_chunk(
+def fused_moe_func(
     hidden_states: jax.Array,
     w1: jax.Array,
     w2: jax.Array,
@@ -909,6 +909,26 @@ def _fused_moe_single_chunk(
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
 ) -> jax.Array:
+    """Run MoE with precomputed expert ids and weights.
+
+    For linear EP placement, ``experts_start`` is the first global expert id
+    owned by this shard, passed as a 0-d int32 array (real traced data, not a
+    Python int/compile-time constant -- every EP rank owns a different value,
+    and binding it as a constant would make each rank JIT-compile a
+    structurally different program under the same custom-op name, which
+    desyncs the in-graph EP collectives). The kernel remaps global ids to
+    local ids with an elementwise subtract and masks non-local experts.
+    ``use_ep`` is a static flag enabling EP routing (identical across ranks,
+    safe to bind as a compile-time constant); ``use_sparse_core`` is a static
+    flag selecting the #193 SparseCore ragged gather/gather-reduce (vs the
+    pre-#193 plain-JAX path).
+
+    For packed weights, `rhs_quant_dtype` is used to specify the logical dtype of the
+    weights. Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier
+    containers are supported. Weights must be packed along the contracting dimension
+    (K-axis) in LSB-first order.
+    """
+
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
     # expected by gmm_v2.
     if w1_scale is not None and w1_scale.ndim == 3:
@@ -1007,28 +1027,6 @@ def _fused_moe_single_chunk(
         else onehot_moe_permute_threshold
     )
 
-    is_fp4_weight = (
-        jnp.issubdtype(w1.dtype, jnp.floating)
-        and jax.dtypes.itemsize_bits(w1.dtype) == 4
-    )
-    can_prequant_lhs = (
-        w1_scale is not None
-        and not is_fp4_weight
-        and num_tokens >= 1024
-        and (num_tokens * topk) % 32 == 0
-        and hidden_size == padded_hidden_size
-        and hidden_size % MOE_FP8_DISPATCH_BLOCK == 0
-        and w1_scale.shape[1] * MOE_FP8_DISPATCH_BLOCK == hidden_size
-    )
-    if can_prequant_lhs:
-        hidden_q_fp8, hidden_scale = quantize_lhs_rows(
-            hidden_states, block_size=MOE_FP8_DISPATCH_BLOCK
-        )
-        permute_src = jax.lax.bitcast_convert_type(hidden_q_fp8, jnp.int8)
-    else:
-        permute_src = hidden_states
-        hidden_scale = None
-
     (
         x,
         group_sizes,
@@ -1040,7 +1038,7 @@ def _fused_moe_single_chunk(
         onehot_permute,
         w_sorted,
     ) = prepare_routed_gmm_inputs(
-        permute_src,
+        hidden_states,
         topk_ids,
         topk_weights,
         local_num_experts=w1.shape[0],
@@ -1052,14 +1050,9 @@ def _fused_moe_single_chunk(
         return_sorted_indices=True,
         return_onehot_combine=True,
     )
-    if can_prequant_lhs:
-        x_in = jax.lax.bitcast_convert_type(x, jnp.float8_e4m3fn)
-        lhs_scale = hidden_scale[token_indices_sorted]
-    else:
-        x_in = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
-        lhs_scale = None
+    x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
-        x_in,
+        x,
         w1,
         w1_scale,
         w1_bias,
@@ -1081,107 +1074,8 @@ def _fused_moe_single_chunk(
         sorted_indices=sorted_indices,
         onehot_permute=onehot_permute,
         w_sorted=w_sorted,
-        lhs_scale=lhs_scale,
     )
     return x[:orig_num_tokens, :hidden_size]
-
-
-@functools.partial(
-    jax.jit,
-    static_argnames=(
-        "topk",
-        "activation",
-        "use_ep",
-        "use_sparse_core",
-        "onehot_moe_permute_threshold",
-        "rhs_quant_dtype",
-        "skip_padded_tokens",
-    ),
-)
-def fused_moe_func(
-    hidden_states: jax.Array,
-    w1: jax.Array,
-    w2: jax.Array,
-    w1_scale: jax.Array | None,
-    w2_scale: jax.Array | None,
-    w1_bias: jax.Array | None,
-    w2_bias: jax.Array | None,
-    topk_weights: jax.Array,
-    topk_ids: jax.Array,
-    experts_start: jax.Array | None = None,
-    topk: int = 1,
-    activation: str = "silu",
-    use_ep: bool = False,
-    use_sparse_core: bool = True,
-    onehot_moe_permute_threshold: int = 0,
-    rhs_quant_dtype: jnp.dtype | None = None,
-    skip_padded_tokens: bool = False,
-) -> jax.Array:
-    """Run MoE with precomputed expert ids and weights.
-
-    For linear EP placement, ``experts_start`` is the first global expert id
-    owned by this shard, passed as a 0-d int32 array (real traced data, not a
-    Python int/compile-time constant -- every EP rank owns a different value,
-    and binding it as a constant would make each rank JIT-compile a
-    structurally different program under the same custom-op name, which
-    desyncs the in-graph EP collectives). The kernel remaps global ids to
-    local ids with an elementwise subtract and masks non-local experts.
-    ``use_ep`` is a static flag enabling EP routing (identical across ranks,
-    safe to bind as a compile-time constant); ``use_sparse_core`` is a static
-    flag selecting the #193 SparseCore ragged gather/gather-reduce (vs the
-    pre-#193 plain-JAX path).
-
-    For packed weights, `rhs_quant_dtype` is used to specify the logical dtype of the
-    weights. Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier
-    containers are supported. Weights must be packed along the contracting dimension
-    (K-axis) in LSB-first order.
-    """
-    num_tokens = hidden_states.shape[0]
-    if num_tokens <= _MOE_TOKEN_CHUNK:
-        return _fused_moe_single_chunk(
-            hidden_states,
-            w1,
-            w2,
-            w1_scale,
-            w2_scale,
-            w1_bias,
-            w2_bias,
-            topk_weights,
-            topk_ids,
-            experts_start=experts_start,
-            topk=topk,
-            activation=activation,
-            use_ep=use_ep,
-            use_sparse_core=use_sparse_core,
-            onehot_moe_permute_threshold=onehot_moe_permute_threshold,
-            rhs_quant_dtype=rhs_quant_dtype,
-            skip_padded_tokens=skip_padded_tokens,
-        )
-    parts = []
-    for start in range(0, num_tokens, _MOE_TOKEN_CHUNK):
-        end = min(num_tokens, start + _MOE_TOKEN_CHUNK)
-        parts.append(
-            _fused_moe_single_chunk(
-                hidden_states[start:end],
-                w1,
-                w2,
-                w1_scale,
-                w2_scale,
-                w1_bias,
-                w2_bias,
-                topk_weights[start:end],
-                topk_ids[start:end],
-                experts_start=experts_start,
-                topk=topk,
-                activation=activation,
-                use_ep=use_ep,
-                use_sparse_core=use_sparse_core,
-                onehot_moe_permute_threshold=onehot_moe_permute_threshold,
-                rhs_quant_dtype=rhs_quant_dtype,
-                skip_padded_tokens=skip_padded_tokens,
-            )
-        )
-    return jnp.concatenate(parts, axis=0)
 
 
 # Column block of gmm_v2's lhs quantization (make_gmm_configs); gmm_v2 rejects
@@ -1250,7 +1144,7 @@ def quantize_moe_dispatch_packed_rows(
         "skip_padded_tokens",
     ),
 )
-def _fused_moe_fp8_dispatch_single_chunk(
+def fused_moe_func_fp8_dispatch(
     hidden_q: jax.Array,
     hidden_scale: jax.Array,
     w1: jax.Array,
@@ -1270,12 +1164,45 @@ def _fused_moe_fp8_dispatch_single_chunk(
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
 ) -> jax.Array:
+    """fused_moe_func on rows pre-quantized by quantize_moe_dispatch_rows
+    or packed by quantize_moe_dispatch_packed_rows.
+
+    Bit-identical to fused_moe_func on the unquantized rows: routing is
+    unchanged and gmm1 consumes exactly the fp8 rows and scales it would
+    otherwise compute in-kernel. Returns [T, H] in hidden_scale.dtype.
+    """
     if w1_scale is not None and w1_scale.ndim == 3:
         w1_scale = jnp.expand_dims(w1_scale, 2)
     if w2_scale is not None and w2_scale.ndim == 3:
         w2_scale = jnp.expand_dims(w2_scale, 2)
 
-    orig_num_tokens, hidden_size = hidden_q.shape
+    orig_num_tokens = hidden_q.shape[0]
+    act_dtype = hidden_scale.dtype
+    padded_hidden_size = w1.shape[1] * get_packing_factor(w1.dtype, rhs_quant_dtype)
+    if hidden_q.shape[1] > padded_hidden_size:
+        packed = hidden_q
+        hidden_size = padded_hidden_size
+        hidden_q = packed[:, :hidden_size]
+        num_blocks = hidden_size // MOE_FP8_DISPATCH_BLOCK
+        itemsize = jnp.dtype(act_dtype).itemsize
+        scale_b = num_blocks * itemsize
+        tw_b = topk * itemsize
+        ti_b = topk * 4
+        off0 = hidden_size
+        off1 = off0 + scale_b
+        off2 = off1 + tw_b
+        off3 = off2 + ti_b
+        scale_i8 = packed[:, off0:off1].reshape(orig_num_tokens, num_blocks, itemsize)
+        hidden_scale = jax.lax.bitcast_convert_type(scale_i8, act_dtype)
+        tw_i8 = packed[:, off1:off2].reshape(orig_num_tokens, topk, itemsize)
+        topk_weights = jax.lax.bitcast_convert_type(tw_i8, act_dtype)
+        ti_i8 = packed[:, off2:off3].reshape(orig_num_tokens, topk, 4)
+        topk_ids = jax.lax.bitcast_convert_type(ti_i8, jnp.int32)
+    else:
+        hidden_size = hidden_q.shape[1]
+        hidden_scale = hidden_scale.reshape(orig_num_tokens, -1)
+    if padded_hidden_size != hidden_size:
+        raise NotImplementedError("fp8 MoE dispatch needs an unpadded hidden size.")
     pad_t = -orig_num_tokens % 32
     if pad_t:
         hidden_q = jnp.pad(hidden_q, ((0, pad_t), (0, 0)))
@@ -1283,7 +1210,6 @@ def _fused_moe_fp8_dispatch_single_chunk(
         topk_weights = jnp.pad(topk_weights, ((0, pad_t), (0, 0)), constant_values=0)
         topk_ids = jnp.pad(topk_ids, ((0, pad_t), (0, 0)), constant_values=-1)
     num_tokens = hidden_q.shape[0]
-    act_dtype = hidden_scale.dtype
     packing_factor = get_packing_factor(w1.dtype, rhs_quant_dtype)
     effective_dense_threshold = (
         (
@@ -1404,118 +1330,3 @@ def _fused_moe_fp8_dispatch_single_chunk(
         lhs_scale=hidden_scale[token_indices_sorted],
     )
     return x[:orig_num_tokens, :hidden_size]
-
-
-@functools.partial(
-    jax.jit,
-    static_argnames=(
-        "topk",
-        "activation",
-        "use_ep",
-        "use_sparse_core",
-        "onehot_moe_permute_threshold",
-        "rhs_quant_dtype",
-        "skip_padded_tokens",
-    ),
-)
-def fused_moe_func_fp8_dispatch(
-    hidden_q: jax.Array,
-    hidden_scale: jax.Array,
-    w1: jax.Array,
-    w2: jax.Array,
-    w1_scale: jax.Array | None,
-    w2_scale: jax.Array | None,
-    w1_bias: jax.Array | None,
-    w2_bias: jax.Array | None,
-    topk_weights: jax.Array,
-    topk_ids: jax.Array,
-    experts_start: jax.Array | None = None,
-    topk: int = 1,
-    activation: str = "silu",
-    use_ep: bool = False,
-    use_sparse_core: bool = True,
-    onehot_moe_permute_threshold: int = 0,
-    rhs_quant_dtype: jnp.dtype | None = None,
-    skip_padded_tokens: bool = False,
-) -> jax.Array:
-    """fused_moe_func on rows pre-quantized by quantize_moe_dispatch_rows
-    or packed by quantize_moe_dispatch_packed_rows.
-
-    Bit-identical to fused_moe_func on the unquantized rows: routing is
-    unchanged and gmm1 consumes exactly the fp8 rows and scales it would
-    otherwise compute in-kernel. Returns [T, H] in hidden_scale.dtype.
-    """
-    num_tokens = hidden_q.shape[0]
-    act_dtype = hidden_scale.dtype
-    padded_hidden_size = w1.shape[1] * get_packing_factor(w1.dtype, rhs_quant_dtype)
-    if hidden_q.shape[1] > padded_hidden_size:
-        packed = hidden_q
-        hidden_size = padded_hidden_size
-        hidden_q = packed[:, :hidden_size]
-        num_blocks = hidden_size // MOE_FP8_DISPATCH_BLOCK
-        itemsize = jnp.dtype(act_dtype).itemsize
-        scale_b = num_blocks * itemsize
-        tw_b = topk * itemsize
-        ti_b = topk * 4
-        off0 = hidden_size
-        off1 = off0 + scale_b
-        off2 = off1 + tw_b
-        off3 = off2 + ti_b
-        scale_i8 = packed[:, off0:off1].reshape(num_tokens, num_blocks, itemsize)
-        hidden_scale = jax.lax.bitcast_convert_type(scale_i8, act_dtype)
-        tw_i8 = packed[:, off1:off2].reshape(num_tokens, topk, itemsize)
-        topk_weights = jax.lax.bitcast_convert_type(tw_i8, act_dtype)
-        ti_i8 = packed[:, off2:off3].reshape(num_tokens, topk, 4)
-        topk_ids = jax.lax.bitcast_convert_type(ti_i8, jnp.int32)
-    else:
-        hidden_size = hidden_q.shape[1]
-        hidden_scale = hidden_scale.reshape(num_tokens, -1)
-    if padded_hidden_size != hidden_size:
-        raise NotImplementedError("fp8 MoE dispatch needs an unpadded hidden size.")
-    if num_tokens <= _MOE_TOKEN_CHUNK:
-        return _fused_moe_fp8_dispatch_single_chunk(
-            hidden_q,
-            hidden_scale,
-            w1,
-            w2,
-            w1_scale,
-            w2_scale,
-            w1_bias,
-            w2_bias,
-            topk_weights,
-            topk_ids,
-            experts_start=experts_start,
-            topk=topk,
-            activation=activation,
-            use_ep=use_ep,
-            use_sparse_core=use_sparse_core,
-            onehot_moe_permute_threshold=onehot_moe_permute_threshold,
-            rhs_quant_dtype=rhs_quant_dtype,
-            skip_padded_tokens=skip_padded_tokens,
-        )
-    parts = []
-    for start in range(0, num_tokens, _MOE_TOKEN_CHUNK):
-        end = min(num_tokens, start + _MOE_TOKEN_CHUNK)
-        parts.append(
-            _fused_moe_fp8_dispatch_single_chunk(
-                hidden_q[start:end],
-                hidden_scale[start:end],
-                w1,
-                w2,
-                w1_scale,
-                w2_scale,
-                w1_bias,
-                w2_bias,
-                topk_weights[start:end],
-                topk_ids[start:end],
-                experts_start=experts_start,
-                topk=topk,
-                activation=activation,
-                use_ep=use_ep,
-                use_sparse_core=use_sparse_core,
-                onehot_moe_permute_threshold=onehot_moe_permute_threshold,
-                rhs_quant_dtype=rhs_quant_dtype,
-                skip_padded_tokens=skip_padded_tokens,
-            )
-        )
-    return jnp.concatenate(parts, axis=0)
