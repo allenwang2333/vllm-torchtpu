@@ -302,7 +302,7 @@ def _build_op(
         e_total = w1.shape[0]
         g_local = e_total // ep
 
-        if T_global <= 384 and weight_format == "fp8":
+        if T_global <= 2048 and weight_format == "fp8":
             from jax import lax
             from vllm_torchtpu.layers.core.fused_moe_gmm import (
                 fused_moe_func_fp8_dispatch,
