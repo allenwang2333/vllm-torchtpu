@@ -422,9 +422,11 @@ class TpuNgramHashState(nn.Module):
 
 _CPU_ENGRAM_WEIGHTS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 _NEXT_ENGRAM_TABLE_ID = 0
-# 32-slot CPU output ring pre-sized for max_num_batched_tokens=4096.
+# 128-slot CPU output ring pre-sized for max_num_batched_tokens=4096.
 _OUT_CPU_BUFS: list[torch.Tensor | None] = [None] * 128
 _OUT_CPU_SLOT: int = 0
+_DEV_ENGRAM_RING: list[torch.Tensor] = []
+_DEV_ENGRAM_SLOT: int = 0
 _OUT_CPU_MIN_TOKENS = 4096
 _PIN_HOST_BUFS: bool = True
 _ENGRAM_PTRS_CACHE: dict[tuple[int, ...], tuple[Any, ...]] = {}
@@ -980,31 +982,33 @@ def take_prefetched_engram_hashes(
         rows[n_real:].zero_()
     if out_1d_i32_buf is not None:
         if out_1d_i32_buf.ndim == 2:
-            static_rows, static_cols = out_1d_i32_buf.shape
-            static_bytes = static_rows * static_cols
-            pad_rows = min(max(target_tokens, 32), static_rows)
-            if envs.VLLM_DSV41_ENGRAM_H2D_PREFIX and 2 * pad_rows <= static_rows:
-                # H2D only the rows the model reads; pad on device to the static shape.
+            global _DEV_ENGRAM_RING, _DEV_ENGRAM_SLOT
+            ring_len = 4 if out_1d_i32_buf.shape[0] >= 2048 else 8
+            if (
+                len(_DEV_ENGRAM_RING) != ring_len
+                or _DEV_ENGRAM_RING[0].shape != out_1d_i32_buf.shape
+                or _DEV_ENGRAM_RING[0].device != device
+            ):
+                _DEV_ENGRAM_RING = [
+                    torch.zeros_like(out_1d_i32_buf, device=device)
+                    for _ in range(ring_len)
+                ]
+                _DEV_ENGRAM_SLOT = 0
+            dev_buf = _DEV_ENGRAM_RING[_DEV_ENGRAM_SLOT]
+            _DEV_ENGRAM_SLOT = (_DEV_ENGRAM_SLOT + 1) % ring_len
+            pad_rows = min(max(target_tokens, 32), dev_buf.shape[0])
+            pad_bytes = pad_rows * row_bytes
+            if pf["buf"].numel() >= pad_bytes:
                 if n_real < pad_rows:
-                    pf["buf"][n_real * row_bytes : pad_rows * row_bytes].zero_()
-                head = (
-                    pf["buf"][: pad_rows * static_cols]
-                    .view(pad_rows, static_cols)
-                    .to(device, non_blocking=True)
+                    pf["buf"][n_real * row_bytes : pad_bytes].zero_()
+                dev_buf[:pad_rows].copy_(
+                    pf["buf"][:pad_bytes].view(pad_rows, row_bytes), non_blocking=True
                 )
-                return torch.nn.functional.pad(head, (0, 0, 0, static_rows - pad_rows))
-            if pf["buf"].numel() >= static_bytes:
-                if n_real < pad_rows:
-                    pf["buf"][n_real * row_bytes : pad_rows * row_bytes].zero_()
-                return (
-                    pf["buf"][:static_bytes]
-                    .view(static_rows, static_cols)
-                    .to(device, non_blocking=True)
-                )
-            out_1d_i32_buf[:target_tokens].copy_(rows, non_blocking=True)
+                return dev_buf
+            dev_buf[:target_tokens].copy_(rows, non_blocking=True)
             if target_tokens < pad_rows:
-                out_1d_i32_buf[target_tokens:pad_rows].zero_()
-            return out_1d_i32_buf
+                dev_buf[target_tokens:pad_rows].zero_()
+            return dev_buf
         static_bytes = out_1d_i32_buf.numel()
         if pf["buf"].numel() >= static_bytes:
             return pf["buf"][:static_bytes].to(device, non_blocking=True)
