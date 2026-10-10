@@ -172,8 +172,9 @@ class DSparkProposer(DFlashProposer):
         if head_dtype is not None:
             rows = rows.to(head_dtype)
         self._markov_w2_local = rows.contiguous().clone()
+        # int32: TPU emulates int64 adds; start < 2**24 (checked above).
         self._vocab_shard_offset = torch.tensor(
-            start, dtype=torch.int64, device=rows.device
+            start, dtype=torch.int32, device=rows.device
         )
         # Whether any shard carries vocab padding is a global property, so
         # the mask add is present in every rank's graph or in none.
@@ -235,12 +236,17 @@ class DSparkProposer(DFlashProposer):
     def _pack_local_candidate(
         scores: torch.Tensor, vocab_offset: torch.Tensor
     ) -> torch.Tensor:
-        """Per-row (max value, global token id) of a vocab shard as [B, 2] f32."""
+        """Per-row (max value, global token id) of a vocab shard as [B, 2] f32.
+
+        The id add runs in int32 (an int32 ``vocab_offset`` keeps it there):
+        ids stay below the exact float32 integer range, so it equals the
+        int64 add, without TPU's emulated 64-bit integer ops.
+        """
         local_max, local_idx = scores.max(dim=-1)
         return torch.stack(
             [
                 local_max.to(torch.float32),
-                (local_idx + vocab_offset).to(torch.float32),
+                (local_idx.to(torch.int32) + vocab_offset).to(torch.float32),
             ],
             dim=-1,
         )
@@ -289,16 +295,21 @@ class DSparkProposer(DFlashProposer):
             .view(padded_num_reqs * num_sampled_slots, valid_hidden.shape[-1])
         )
         logits = self.draft_model.compute_draft_logits_local(slot_major_hidden)
-        if self._vocab_shard_mask is not None:
-            logits = logits + self._vocab_shard_mask
         logits_slot_major = logits.view(
             num_sampled_slots, padded_num_reqs, logits.shape[-1]
         )
+        mask = self._vocab_shard_mask
 
         prev = ids_3d[:, 0]
         draft_tokens = []
         for i in range(num_sampled_slots):
-            scores = logits_slot_major[i] + self._markov_bias_local(prev)
+            # The padding mask is added per [B, W] slot, in the same order as
+            # before ((logits + mask) + bias), instead of materializing a
+            # masked copy of the whole [K * B, W] logits.
+            slot_logits = logits_slot_major[i]
+            if mask is not None:
+                slot_logits = slot_logits + mask
+            scores = slot_logits + self._markov_bias_local(prev)
             packed = self._pack_local_candidate(scores, self._vocab_shard_offset)
             gathered = tensor_model_parallel_all_gather(packed, dim=0)
             step = self.draft_model.map_draft_to_target(

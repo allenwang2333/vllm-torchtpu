@@ -179,15 +179,19 @@ def test_xla_path_matches_torch_reference(tokens, packed):
         (288, None, None),
         (320, None, None),
         (384, None, 96),
+        (400, None, 80),  # TD8.237: C=80 DSpark draft (C * K)
         (512, None, 64),
         (520, None, None),
+        (560, None, 80),  # TD8.237: C=112 DSpark draft
         (576, None, 96),
-        (640, None, 64),
+        (640, None, 64),  # tile 64 beat 80 here (Job 1314)
         (768, None, 96),
         (960, None, 96),
         (1024, 64, 64),
         (1056, None, 96),
+        (1152, 64, 96),  # TD8.237: C=192 verify, was 64 (18 -> 12 grid steps)
         (2048, 64, 64),
+        (4096, 64, 64),
     ],
 )
 def test_pallas_tile(tokens, pre_tile, post_tile):
@@ -208,9 +212,13 @@ def test_pallas_tile(tokens, pre_tile, post_tile):
         (576, 256),
         (960, 256),
         (1024, 256),
+        (400, 256),
+        (640, 256),
+        (1152, 256),
         (128, 5120),
         (384, 5120),
         (768, 5120),
+        (1152, 5120),
     ],
 )
 def test_pallas_path_matches_torch_reference(tokens, dim, packed):
@@ -218,6 +226,36 @@ def test_pallas_path_matches_torch_reference(tokens, dim, packed):
         pytest.skip("Pallas TPU kernel needs TPU hardware")
     _check(tokens, dim, packed)
     _check_post_pre(tokens, dim, packed)
+
+
+@pytest.mark.parametrize("tokens", [960, 1152])
+def test_fused_post_pre_tile_is_bitwise_invariant(tokens, monkeypatch):
+    """TD8.237: the fused pass gives the same bits at tiles 96, 80 and 64."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("Pallas TPU kernel needs TPU hardware")
+    residual, fn, scale, base, previous_pre = _inputs(tokens, 5120)
+    x, post_mix, comb_mix = _post_inputs(tokens, 5120)
+    args = (
+        _jax(x),
+        _jax(residual.flatten(1)),
+        _jax(post_mix),
+        _jax(comb_mix),
+        _jax(mhc.pack_mix_weight(fn)),
+        _jax(scale),
+        _jax(base),
+        _jax(previous_pre),
+        *CONSTANTS,
+    )
+    outs = []
+    for tile in (96, 80, 64):
+        if tokens % tile:
+            continue
+        monkeypatch.setattr(mhc, "_pallas_tile", lambda *a, t=tile, **k: t)
+        outs.append(mhc.delayed_post_pre_flat_jax(*args))
+    assert len(outs) >= 2
+    for got in outs[1:]:
+        for g, w in zip(got, outs[0]):
+            np.testing.assert_array_equal(_np(g), _np(w))
 
 
 @pytest.mark.cpu_test

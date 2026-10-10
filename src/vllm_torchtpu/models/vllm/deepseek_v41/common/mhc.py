@@ -305,12 +305,18 @@ def _pallas_tile(tokens: int, mixes: int, fused_post: bool = False) -> int | Non
     """Row tile for the flat Pallas passes, or None for the XLA path.
 
     Fixed sizes: 64, 96 and 128 (tile = tokens), 256 (tile 128), and
-    ``>= 1024`` multiples of 64 (tile 64). With ``fused_post``, DSpark verify
-    buckets ``>= _POST_PRE_PALLAS_MIN_TOKENS`` that are multiples of 96 or 64
-    (``C * (K + 1)``: 384, 576, 768, ...) also take Pallas. On the XLA path
-    they pay a ``T(4,128)`` relayout plus extra HBM passes over ``flat``. Tile
-    128 is not used for them: the fused kernel's VMEM overflows at T=384/768.
-    The kernels are row-independent, so the tile only affects speed.
+    ``>= 1024`` multiples of 64 (tile 64). With ``fused_post``, buckets
+    ``>= _POST_PRE_PALLAS_MIN_TOKENS`` that are multiples of 96, 64 or 80 (in
+    that order) take Pallas: DSpark verify ``C * (K + 1)`` (384, 576, 768,
+    1152, ...) and draft ``C * K`` (400, 560, 640, ...). This is checked before
+    the ``>= 1024`` tile-64 rule. Job 1314 (tpu7x, width 20480), median
+    µs per call: 1152: tile 64 378.4 -> 96 373.8; 400: XLA 349.3 -> tile 80
+    324.9; 560: XLA 365.6 -> 80 337.1; 640: tile 64 335.5 vs 80 346.6, so 80
+    only covers sizes 96 and 64 do not divide. On the XLA path they pay a
+    ``T(4,128)`` relayout plus extra HBM passes over ``flat``. Tile 128 is not
+    used for them: the fused kernel's VMEM overflows at T=384/768. The
+    kernels are row-independent (outputs were bitwise equal across tiles in
+    Job 1314), so the tile only affects speed.
     """
     if 3 * mixes > 128:
         return None
@@ -318,12 +324,12 @@ def _pallas_tile(tokens: int, mixes: int, fused_post: bool = False) -> int | Non
         return tokens
     if tokens == 256:
         return 128
-    if tokens >= 1024 and tokens % 64 == 0:
-        return 64
     if fused_post and tokens >= _POST_PRE_PALLAS_MIN_TOKENS:
-        for tile in (96, 64):
+        for tile in (96, 64, 80):
             if tokens % tile == 0:
                 return tile
+    if tokens >= 1024 and tokens % 64 == 0:
+        return 64
     return None
 
 

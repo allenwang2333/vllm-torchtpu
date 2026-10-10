@@ -491,6 +491,7 @@ def test_sharded_markov_padding_mask_and_w2_slice(monkeypatch):
         p._init_sharded_markov_sampling()
         width = padded // tp_size
         assert p._vocab_shard_offset.item() == rank * width
+        assert p._vocab_shard_offset.dtype == torch.int32  # TD8.237
         assert p._markov_w2_local.dtype == torch.bfloat16
         assert torch.equal(
             p._markov_w2_local,
@@ -592,6 +593,22 @@ def test_pack_local_candidate_adds_vocab_offset():
     packed = DSparkProposer._pack_local_candidate(scores, torch.tensor(10))
     assert packed.dtype == torch.float32
     assert packed.tolist() == [[4.0, 11.0], [0.5, 10.0]]
+
+
+def test_pack_local_candidate_int32_offset_matches_int64():
+    """TD8.237: the int32 id add equals the int64 one up to 2**24 ids."""
+    width = 4096
+    scores = torch.randn(6, width)
+    scores[:, -1] = 1e4  # argmax at the last column: the largest id
+    for offset in (0, 129_280 - width, (1 << 24) - width):
+        got = DSparkProposer._pack_local_candidate(
+            scores, torch.tensor(offset, dtype=torch.int32)
+        )
+        local_max, local_idx = scores.max(dim=-1)
+        want = torch.stack(
+            [local_max, (local_idx + torch.tensor(offset)).to(torch.float32)], dim=-1
+        )
+        assert torch.equal(got, want), offset
 
 
 class _CompiledDraft:
