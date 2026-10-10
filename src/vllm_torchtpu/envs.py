@@ -84,6 +84,9 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_TOKEN_BUCKET_HALF_STEPS: bool = False
+    TPU_OFFLOAD_MIN_HBM_USAGE: float = 0.0
+    TPU_EXPERT_PLACEMENT_MTP: bool = True
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
@@ -91,6 +94,8 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_GDN_FUSED_NORM_QUANT: bool = False
+    TPU_FUSE_PRE_ATTN_NORM_QUANT: bool = True
+    TPU_FUSE_POST_ATTN_NORM_MOE: bool = True
     TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS: int = 16
     TPU_FUSED_QK_NORM_ROPE: bool = False
     TPU_FUSED_QK_NORM_ROPE_MIN_ROWS: int = 0
@@ -155,7 +160,11 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
-    TPU_HYBRID_RETENTION_MAX_CONVS: int = 64
+    TPU_HYBRID_RETENTION_MAX_CONVS: int = 96
+    TPU_HYBRID_RETENTION_MAX_PINNED_BLOCKS: int = 360
+    TPU_HYBRID_RETENTION_KEEP_PRIOR_TURNS: int = 1
+    TPU_HYBRID_RETENTION_SMART_FORK: bool = True
+    TPU_HYBRID_RETENTION_SAFE_TAIL_OFFSET: int = 4
     TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS: int = 2
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
@@ -181,6 +190,9 @@ if TYPE_CHECKING:
     TPU_SCHED_STEP_TOTAL_CAP: int = 4096
     TPU_SCHED_WARM_STREAK: int = 0
     TPU_SCHED_WARM_MIN_DECODERS: int = 24
+    TPU_SCHED_MK_MAX_RUNNING: int = 0
+    TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP: bool = False
+    TPU_SCHED_SINGLE_STEP_PREFILL: bool = True
 
 
 def env_with_choices(
@@ -742,6 +754,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run a GDN layer's output gated RMS norm and its out_proj's per-token fp8
     # quantization as one kernel. Needs per-channel fp8 out_proj weights.
     "TPU_GDN_FUSED_NORM_QUANT": env_bool("TPU_GDN_FUSED_NORM_QUANT", default=True),
+    # Qwen3.5: compute the decoder input RMSNorm and the per-row FP8
+    # quantization feeding attention as one op (needs TPU_SP_FP8_GATHER; see
+    # models/vllm/qwen3_next_patch.py).
+    "TPU_FUSE_PRE_ATTN_NORM_QUANT": env_bool(
+        "TPU_FUSE_PRE_ATTN_NORM_QUANT", default=True
+    ),
+    # Qwen3.5: compute the post-attention RMSNorm, the FP8 router gate and the
+    # shared expert as one op ahead of the routed experts.
+    "TPU_FUSE_POST_ATTN_NORM_MOE": env_bool(
+        "TPU_FUSE_POST_ATTN_NORM_MOE", default=True
+    ),
     "TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS": env_nonnegative_int(
         "TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS", 16
     ),
@@ -758,6 +781,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
     ],
+    # Generate {2^k, 3 * 2^k} half-step token buckets from 8 up to budget.
+    "TPU_TOKEN_BUCKET_HALF_STEPS": env_bool("TPU_TOKEN_BUCKET_HALF_STEPS"),
     # Add linear token buckets above a quarter of the token budget, for
     # prompt-sized steps (platforms/tpu_platform.py _get_linear_token_paddings).
     "TPU_TOKEN_BUCKET_LINEAR": env_bool("TPU_TOKEN_BUCKET_LINEAR"),
@@ -1069,6 +1094,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run small decode-step TP all-reduces and DP MoE combines as Pallas
     # kernels (kernels/experimental/small_collectives) instead of XLA's.
     "TPU_SMALL_ALL_REDUCE": env_bool("TPU_SMALL_ALL_REDUCE", default=True),
+    "TPU_EXPERT_PLACEMENT_MTP": env_bool(
+        "TPU_EXPERT_PLACEMENT_MTP", default=True
+    ),
+    "TPU_OFFLOAD_MIN_HBM_USAGE": env_float(
+        "TPU_OFFLOAD_MIN_HBM_USAGE", 0.0
+    ),
     "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
         "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 128
     ),
@@ -1108,8 +1139,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SCHED_WARM_MIN_DECODERS": env_nonnegative_int(
         "TPU_SCHED_WARM_MIN_DECODERS", 24
     ),
+    # Cap active running sequences in PrefixAwareScheduler to the megakernel's
+    # verify capacity: 0 = disabled (default); -1 = auto, 64 //
+    # (1 + num_spec_tokens) when VLLM_TPU_QWEN35_MEGAKERNEL=1 and dcp == 1
+    # (16 at MTP=3, so requests beyond 16 queue); >0 = explicit cap.
+    "TPU_SCHED_MK_MAX_RUNNING": env_int(
+        "TPU_SCHED_MK_MAX_RUNNING", 0
+    ),
+    # Mamba "align" prefill split: let a chunk that starts mid-block (a
+    # 128-token partial-tail prefix hit) run past the next block boundary.
+    # Under sparse retention (prefix_cache_retention_interval=0) the state at
+    # that boundary is never hashed, so the stop only costs a step.
+    "TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP": env_bool(
+        "TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP", default=False
+    ),
+    # Single-step warm prefill (core/single_step_prefill.py): one prefill
+    # step writes the last-full-block and partial-tail GDN checkpoints inside
+    # the chunk instead of ending a chunk at each. Changes the stock GDN
+    # program signature, so it is part of the compile hash. Must be set for
+    # the engine core and every worker alike.
+    "TPU_SCHED_SINGLE_STEP_PREFILL": env_bool(
+        "TPU_SCHED_SINGLE_STEP_PREFILL", default=True
+    ),
     "TPU_HYBRID_RETENTION_MAX_CONVS": env_nonnegative_int(
-        "TPU_HYBRID_RETENTION_MAX_CONVS", 64
+        "TPU_HYBRID_RETENTION_MAX_CONVS", 96
+    ),
+    "TPU_HYBRID_RETENTION_MAX_PINNED_BLOCKS": env_nonnegative_int(
+        "TPU_HYBRID_RETENTION_MAX_PINNED_BLOCKS", 360
+    ),
+    "TPU_HYBRID_RETENTION_KEEP_PRIOR_TURNS": env_nonnegative_int(
+        "TPU_HYBRID_RETENTION_KEEP_PRIOR_TURNS", 1
+    ),
+    "TPU_HYBRID_RETENTION_SMART_FORK": env_bool(
+        "TPU_HYBRID_RETENTION_SMART_FORK", default=True
+    ),
+    "TPU_HYBRID_RETENTION_SAFE_TAIL_OFFSET": env_nonnegative_int(
+        "TPU_HYBRID_RETENTION_SAFE_TAIL_OFFSET", 4
     ),
     "TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS": env_nonnegative_int(
         "TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS", 2
