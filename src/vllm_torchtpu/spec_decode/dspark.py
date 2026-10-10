@@ -21,6 +21,8 @@ Gumbel-coupled sampling is not implemented.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 from vllm.config import VllmConfig
 
@@ -69,6 +71,10 @@ class DSparkProposer(DFlashProposer):
                 f"{spec.dspark_draft_topk}; only greedy drafting of a fixed "
                 "block is implemented."
             )
+        # DeepSeek-V4.1 captures each target layer's entry stream, so its
+        # target layer ids are used unshifted.
+        if getattr(hf_config, "model_type", None) == "deepseek_v41":
+            self._aux_layer_shift = 0
         logger.info("DSpark: sample_from_anchor=%s, K=%d.", self.sample_from_anchor, K)
 
     # A reduced-vocab DSpark checkpoint carries its own lm_head
@@ -85,6 +91,7 @@ class DSparkProposer(DFlashProposer):
         return K if self.sample_from_anchor else K + 1
 
     def _get_draft_token_paddings(self) -> list[int]:
+        # Request-aligned buckets pad less than the generic token buckets.
         max_chunk_reqs = max(
             self.runner.num_reqs_max_model_len, self.runner.num_reqs_most_model_len or 0
         )
@@ -109,8 +116,27 @@ class DSparkProposer(DFlashProposer):
                 buckets = [p for p in base if p <= max_draft_tokens]
                 if buckets and buckets[-1] < max_draft_tokens:
                     buckets.append((max_draft_tokens + 7) & ~7)
-                return sorted(set(buckets))
+                if buckets:
+                    return sorted(set(buckets))
         return super()._get_draft_token_paddings()
+
+    def _draft_kv_num_blocks(self, use_max_model_len: bool) -> int:
+        # The draft's KV group (e.g. DeepSeek-V4.1's sliding-window cache) can
+        # be narrower than group 0, so size the dummies from its own builder.
+        runner = self.runner
+        get_names = getattr(self.draft_model, "get_draft_kv_cache_layer_names", None)
+        if get_names is not None:
+            first_layer = get_names()[0]
+            for group_list in runner.attn_groups:
+                for group in group_list:
+                    if first_layer in group.layer_names:
+                        ctx = SimpleNamespace(
+                            use_max_model_len=use_max_model_len,
+                            mamba_ckpt_window=runner._mamba_ckpt_window,
+                        )
+                        builder = group.metadata_builders[0]
+                        return builder._block_table_geometry(ctx)[1]
+        return super()._draft_kv_num_blocks(use_max_model_len)
 
     def load_model(self, target_model) -> None:
         super().load_model(target_model)
@@ -127,6 +153,8 @@ class DSparkProposer(DFlashProposer):
                     f"DSpark draft model lacks {attr}(); expected a "
                     "Qwen3DSpark/Gemma4DSpark-family model."
                 )
+        if hasattr(self.draft_model, "init_tp_markov_meta"):
+            self.draft_model.init_tp_markov_meta()
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(

@@ -56,21 +56,23 @@ class _DeepseekV4MoERunner(MoERunner):
     def gate(self):
         if self._skip_gate[0]:
             return None
-        return self._modules.get("_gate_mod")
+        return self._modules.get("gate") or self._modules.get("_gate_mod")
 
     @gate.setter
     def gate(self, value) -> None:
-        self._modules["_gate_mod"] = value
+        self._modules["gate"] = value
 
     @property
     def _shared_experts(self):
         if self._skip_shared[0]:
             return None
-        return self._modules.get("_shared_experts_mod")
+        return self._modules.get("_shared_experts") or self._modules.get(
+            "_shared_experts_mod"
+        )
 
     @_shared_experts.setter
     def _shared_experts(self, value) -> None:
-        self._modules["_shared_experts_mod"] = value
+        self._modules["_shared_experts"] = value
 
 
 class DeepseekV4MoE(nn.Module):

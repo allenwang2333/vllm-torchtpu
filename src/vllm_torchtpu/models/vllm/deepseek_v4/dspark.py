@@ -262,6 +262,9 @@ class DSparkDeepseekV4Model(nn.Module):
             prefix=maybe_prefix(prefix, "markov_head"),
         )
         self._fused_ctx_wkv_weight: torch.Tensor | None = None
+        self._main_proj_w: torch.Tensor | None = None
+        self._main_proj_s: torch.Tensor | None = None
+        self._main_proj_bf16_splits: tuple[torch.Tensor, ...] | None = None
 
     # Borrowed from the target: the lazily built MHC post op, the expert
     # mapping, and the per-layer loader.
@@ -272,7 +275,35 @@ class DSparkDeepseekV4Model(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loaded = DeepseekV4Model.load_weights(self, weights)
         self._init_fused_ctx_wkv_weight()
+        self._init_split_main_proj_weights()
         return loaded
+
+    def _init_split_main_proj_weights(self) -> None:
+        from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+        from vllm_torchtpu.utils import synchronize_tensors
+
+        mp_w = getattr(self.main_proj, "weight", None)
+        mp_s = getattr(self.main_proj, "weight_scale", None)
+        n_chunks = len(self.target_layer_ids)
+        hidden = self.config.hidden_size
+        if mp_w is None or n_chunks != 3:
+            return
+        w_data = mp_w.data
+        if mp_s is not None:
+            if getattr(self.main_proj, KEEP_VLLM_LAYOUT_ATTR, False):
+                w_data = w_data.transpose(0, 1).contiguous()
+            self._main_proj_w = w_data
+            self._main_proj_s = mp_s.data.contiguous()
+            if w_data.device.type == "tpu":
+                synchronize_tensors([self._main_proj_w, self._main_proj_s], wait=True)
+        elif w_data.dtype in (torch.bfloat16, torch.float16, torch.float32):
+            if w_data.shape == (hidden, hidden * n_chunks):
+                splits = tuple(
+                    c.contiguous() for c in w_data.split(hidden, dim=1)
+                )
+                self._main_proj_bf16_splits = splits
+                if w_data.device.type == "tpu":
+                    synchronize_tensors(list(splits), wait=True)
 
     def _init_fused_ctx_wkv_weight(self) -> None:
         slices: list[torch.Tensor] = []
@@ -298,8 +329,43 @@ class DSparkDeepseekV4Model(nn.Module):
         assert self.embed_tokens is not None
         return self.embed_tokens(input_ids)
 
-    def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
+    def combine_hidden_states(
+        self,
+        aux_hidden_states: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
+    ) -> torch.Tensor:
         """main_x = main_norm(main_proj(concat of target aux states))."""
+        hidden = self.config.hidden_size
+        mp_w = self._main_proj_w
+        mp_s = self._main_proj_s
+        if mp_w is not None and mp_s is not None:
+            from vllm_torchtpu.models.vllm.deepseek_v41.dspark import (
+                _dspark_zero_cat_qmm_op,
+            )
+
+            if _dspark_zero_cat_qmm_op is not None:
+                if isinstance(aux_hidden_states, (list, tuple)):
+                    h0, h1, h2 = aux_hidden_states
+                else:
+                    h0, h1, h2 = aux_hidden_states.split(hidden, dim=-1)
+                proj = _dspark_zero_cat_qmm_op(h0, h1, h2, mp_w, mp_s)
+                return self.main_norm(proj)
+
+        bf16_splits = self._main_proj_bf16_splits
+        if bf16_splits is not None:
+            w0, w1, w2 = bf16_splits
+            if isinstance(aux_hidden_states, (list, tuple)):
+                h0, h1, h2 = aux_hidden_states
+            else:
+                h0, h1, h2 = aux_hidden_states.split(hidden, dim=-1)
+            proj = (
+                torch.nn.functional.linear(h0, w0)
+                + torch.nn.functional.linear(h1, w1)
+                + torch.nn.functional.linear(h2, w2)
+            )
+            return self.main_norm(proj)
+
+        if isinstance(aux_hidden_states, (list, tuple)):
+            aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
         return self.main_norm(self.main_proj(aux_hidden_states))
 
     def get_draft_attn_causal(self) -> list[bool]:
