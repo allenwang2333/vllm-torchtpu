@@ -9,6 +9,7 @@ fake module in `sys.modules`, and the store itself by `FakeKVCacheStore`.
 import socket
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -21,14 +22,19 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from tests.offload.test_raiden_store_offload import (
+from vllm_torchtpu.offload import raiden_store as rs
+
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from tests.offload.test_raiden_store_offload import (  # noqa: E402
     FAKE_STORE_TYPES,
     FakeKVCacheStore,
     _ctx,
     _key,
     make_manager,
 )
-from vllm_torchtpu.offload import raiden_store as rs
 
 _MOD = "vllm_torchtpu.offload.raiden_store"
 
