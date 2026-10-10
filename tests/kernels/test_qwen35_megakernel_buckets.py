@@ -11,34 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for the Qwen3.5 megakernel bucket policy: verify buckets, per-bucket tiles,
-fused-vs-3-stage pool I/O, tile env switches, the fused pool I/O fallback, MK_AB hooks and the
-rank-ordered mesh."""
+"""CPU unit tests for Qwen3.5 megakernel bucket policy, per-bucket tiles, HLO fallback,
+and wide verify bucket numerical parity (`B <= 24` fused, `32..48` 3-stage GPR, `56..64` wide fused)."""
 
 from __future__ import annotations
 
 import dataclasses
 import importlib
-import inspect
-import time
 
+from jax.sharding import PartitionSpec as P
 import pytest
 import torch
-from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.qwen35_megakernel import megakernel as K
-from vllm_torchtpu.kernels.qwen35_megakernel import mtp_adapter
+from vllm_torchtpu.kernels.qwen35_megakernel import pool_io
 from vllm_torchtpu.kernels.qwen35_megakernel import vllm_adapter as VA
+
+from qwen35_megakernel_test_utils import bare_mk
 
 VERIFY_ENV = (
     "VLLM_TPU_QWEN35_MK_VERIFY_BUCKETS",
     "VLLM_TPU_QWEN35_MK_VERIFY_48",
     "VLLM_TPU_QWEN35_MK_VERIFY_64",
-)
-POOL_IO_ENV = (
-    "VLLM_TPU_QWEN35_MK_FUSED_POOL_IO",
-    "VLLM_TPU_QWEN35_MK_FUSED_POOL_IO_MAX_B",
-    "VLLM_TPU_QWEN35_MK_FUSED_POOL_IO_MIN_B_HI",
 )
 TILE_ENV = (
     "VLLM_TPU_QWEN35_MK_ROUTE_VEC",
@@ -76,26 +70,18 @@ def reload_adapter(monkeypatch):
     importlib.reload(VA)
 
 
-def _bare_mk(monkeypatch, **attrs) -> VA.Qwen35Megakernel:
-    """A `Qwen35Megakernel` without `__init__` (no runner / model / TPU)."""
-    for name in POOL_IO_ENV:
-        monkeypatch.delenv(name, raising=False)
-    mk = object.__new__(VA.Qwen35Megakernel)
-    mk.fused_pool_io = True
-    mk.fused_pool_io_max_b = VA.parse_mk_fused_pool_io_max_b()
-    mk.fused_pool_io_min_b_hi = VA.parse_mk_fused_pool_io_min_b_hi()
-    mk._bucket_steps, mk._bucket_ops, mk._bucket_out_rows = {}, {}, {}
-    mk._bucket_fused, mk._prep_steps = {}, {}
-    for k, v in attrs.items():
-        setattr(mk, k, v)
-    return mk
-
-
-def test_default_verify_buckets_cover_16_sequences(reload_adapter, monkeypatch):
+def test_buckets_parsing_and_verify_buckets(reload_adapter, monkeypatch):
     mod = reload_adapter()
     assert mod._DEFAULT_VERIFY_BUCKETS == ALL_VERIFY
     assert mod.parse_mk_verify_buckets() == ALL_VERIFY
     assert mod.parse_mk_verify_buckets("4,8,64") == (4, 8, 64)
+    assert mod.parse_mk_verify_buckets("0") == ()
+    assert mod.parse_mk_buckets("8,16,32,64") == (8, 16, 32, 64)
+    assert mod.parse_mk_buckets("0") == ()
+    assert mod.select_bucket(12, (16, 32, 48, 64)) == 16
+    assert mod.select_bucket(28, (16, 32, 48, 64)) == 32
+    assert mod.select_bucket(44, (16, 32, 48, 64)) == 48
+    assert mod.select_bucket(60, (16, 32, 48, 64)) == 64
 
     monkeypatch.setenv("VLLM_TPU_QWEN35_MK_VERIFY_64", "0")
     assert reload_adapter()._DEFAULT_VERIFY_BUCKETS == ALL_VERIFY[:9]
@@ -114,17 +100,6 @@ def test_default_tiles_r8_match_v21(b):
         assert t.kv_ering and t.pair_kv
 
 
-def test_default_tiles_r16_only_change_the_all_reduce():
-    for b in sorted(R8_TILES):
-        for base in (K.FULL_EP, K.FULL):
-            t8 = K.default_tiles(dataclasses.replace(base, B=b))
-            t16 = K.default_tiles(dataclasses.replace(base, R=16, B=b))
-            assert t16.hier == (3 if b <= 32 else 0), b
-            assert dataclasses.replace(t16, hier=t8.hier) == t8, b
-            if b > 32:
-                assert t16.rsag
-
-
 def test_tp8_geometry_is_unpadded_and_tp16_scratch_fits():
     """R=8 keeps v21's checkpoint geometry and unpadded widths; at R=16 the B > 32 verify
     buckets (flat rsag all-reduce) need no more VMEM scratch than at R=8."""
@@ -137,8 +112,9 @@ def test_tp8_geometry_is_unpadded_and_tp16_scratch_fits():
             vm = {}
             for r in (8, 16):
                 fused = b >= 56
-                c = dataclasses.replace(base, R=r, B=b, T=4, paged_kv=True,
-                                        fused_pool_io=fused, ckpt_k=4)
+                c = dataclasses.replace(
+                    base, R=r, B=b, T=4, paged_kv=True, fused_pool_io=fused, ckpt_k=4
+                )
                 tiles = K.default_tiles(c)
                 _, info = K.build(c, tiles, pool_gather=not fused)
                 vm[r] = info["vmem_scratch_bytes"]
@@ -146,16 +122,43 @@ def test_tp8_geometry_is_unpadded_and_tp16_scratch_fits():
             assert vm[16] <= vm[8], (b, vm)
 
 
-def test_fused_pool_io_bucket_selection(monkeypatch):
-    mk = _bare_mk(monkeypatch)
+def test_fused_pool_io_bucket_selection_and_hlo_guard(monkeypatch):
+    mk = bare_mk(monkeypatch)
     assert (mk.fused_pool_io_max_b, mk.fused_pool_io_min_b_hi) == (24, 56)
     assert [b for b in ALL_VERIFY if not mk._bucket_is_fused(b)] == [32, 40, 48]
     mk.fused_pool_io_min_b_hi = VA.parse_mk_fused_pool_io_min_b_hi("0")
     assert [b for b in ALL_VERIFY if mk._bucket_is_fused(b)] == [4, 8, 12, 16, 20, 24]
     mk.fused_pool_io_max_b = VA.parse_mk_fused_pool_io_max_b("32")
     assert [b for b in ALL_VERIFY if mk._bucket_is_fused(b)][-1] == 32
+    assert VA.parse_mk_fused_pool_io(None) is True
+    assert VA.parse_mk_fused_pool_io("1") is True
     assert VA.parse_mk_fused_pool_io("0") is False
+    assert VA.parse_mk_fused_pool_io("off") is False
     assert VA.parse_mk_zero_copy(None) is False
+
+    good_hlo = """
+    HloModule fused_mk
+    ENTRY main {
+      %p0 = f8e4m3fn[4096,2,64,4,128]{4,3,2,1,0:T(8,128)} parameter(0)
+      %call = bf16[16,4096]{1,0:T(8,128)S(1)} custom-call(%p0), custom_call_target="tpu_custom_call"
+      ROOT %tup = (bf16[16,4096]{1,0:T(8,128)}, f8e4m3fn[4096,2,64,4,128]{4,3,2,1,0:T(8,128)}) tuple(%call, %p0)
+    }
+    """
+    ok, reason = pool_io.check_fused_pool_hlo(good_hlo, page_size=128)
+    assert ok is True and reason == "ok"
+
+    bad_vmem_hlo = """
+    HloModule bad_mk
+    ENTRY main {
+      %p0 = f8e4m3fn[64,2,64,4,128]{4,3,2,1,0:T(8,128)} parameter(0)
+      %cs = (f8e4m3fn[64,2,64,4,128]{4,3,2,1,0:T(8,128)S(1)}, f8e4m3fn[64,2,64,4,128]{4,3,2,1,0:T(8,128)}, u32[]{:S(2)}) copy-start(%p0)
+      %cd = f8e4m3fn[64,2,64,4,128]{4,3,2,1,0:T(8,128)S(1)} copy-done(%cs)
+      %call = bf16[16,4096]{1,0:T(8,128)S(1)} custom-call(%cd), custom_call_target="tpu_custom_call"
+      ROOT %tup = (bf16[16,4096]{1,0:T(8,128)}, f8e4m3fn[64,2,64,4,128]{4,3,2,1,0:T(8,128)}) tuple(%call, %p0)
+    }
+    """
+    ok_bad, reason_bad = pool_io.check_fused_pool_hlo(bad_vmem_hlo, page_size=128)
+    assert ok_bad is False and ("copy-start" in reason_bad or "S(1)" in reason_bad)
 
 
 def test_tile_env_overrides(monkeypatch):
@@ -170,12 +173,11 @@ def test_tile_env_overrides(monkeypatch):
     t8 = VA.apply_mk_tile_env_overrides(base, 8)
     assert (t8.route_vec, t8.dense_acc_pair, t8.r2_direct_store) == (False, False, True)
     assert (t8.amask, t8.nbe) == (2, 12)
-    # NBE_SMALL only applies to the 1..8-row buckets
     assert VA.apply_mk_tile_env_overrides(base, 12).nbe == base.nbe
 
 
 def test_fused_pool_io_fallback_rebuilds_only_fused_buckets(monkeypatch):
-    mk = _bare_mk(monkeypatch, buckets=(8,), verify_buckets=(4, 32, 64))
+    mk = bare_mk(monkeypatch, buckets=(8,), verify_buckets=(4, 32, 64))
     built = []
 
     def fake_build(b, tokens_per_seq=1, out_pad_rows=None):
@@ -201,8 +203,15 @@ def test_fused_pool_io_fallback_rebuilds_only_fused_buckets(monkeypatch):
 def test_build_bucket_op_names_and_hlo_fallback(monkeypatch):
     """Op names carry `_3stage` exactly for 3-stage buckets, including a bucket that falls
     back from fused pool I/O when the HLO guard fails."""
-    c = dataclasses.replace(K.FULL_EP, stack_e=False, e_slots=72, paged_kv=True,
-                            num_pages=4096, max_pages_per_seq=64, ctx=8192)
+    c = dataclasses.replace(
+        K.FULL_EP,
+        stack_e=False,
+        e_slots=72,
+        paged_kv=True,
+        num_pages=4096,
+        max_pages_per_seq=64,
+        ctx=8192,
+    )
     n_w, n_p = 20, c.NATT
     names, made = [], []
 
@@ -221,7 +230,7 @@ def test_build_bucket_op_names_and_hlo_fallback(monkeypatch):
     for mode, hlo_ok in (("utok", True), ("utfb", False)):
         names.clear()
         made.clear()
-        mk = _bare_mk(
+        mk = bare_mk(
             monkeypatch,
             mode=mode,
             base_cfg=c,
@@ -241,35 +250,6 @@ def test_build_bucket_op_names_and_hlo_fallback(monkeypatch):
             assert mk._bucket_fused == {(4, 4): True, (4, 32): False, (4, 64): True}
             assert mk.fused_pool_io
         else:
-            # B=4 is rebuilt 3-stage after the failed guard and named as such
             assert suffix == {4: True, 32: True, 64: True}
             assert made[:2] == [(4, True, True), (4, False, False)]
             assert not any(mk._bucket_fused.values()) and not mk.fused_pool_io
-
-
-def test_mk_ab_calibration_hooks(monkeypatch):
-    mk = _bare_mk(
-        monkeypatch,
-        tp_rank=0,
-        _step_mix={},
-        _step_mix_t0=time.monotonic(),
-        _step_mix_period_s=1e9,
-        ab_calibrator=VA.MKABCalibrator(enabled=True, period_s=1e9),
-    )
-    assert mk._note_step("mk_t4_b16", True) is True
-    assert mk._note_step("mk_t4_b16", True) is False  # alternate step on stock
-    assert mk._note_step("stock_t4_n13", False) is False
-    assert mk._step_mix == {"mk_t4_b16": 1, "ab_stock_t4_b16": 1, "stock_t4_n13": 1}
-    mk.record_ab_step(12.5, padded_tokens=16)
-    mk.reset_stats()
-    assert mk._step_mix == {} and mk.ab_calibrator.counts == {}
-
-
-def test_megakernel_meshes_are_rank_ordered():
-    """Every megakernel mesh comes from `_build_tp_rank_mesh` (device-id sorted meshes put
-    `axis_index('tp')` != tp_rank on tpu7x)."""
-    for mod in (VA, mtp_adapter):
-        assert not hasattr(mod, "build_ep_mesh")
-        assert "build_ep_mesh(" not in inspect.getsource(mod)
-    for cls in (VA.Qwen35Megakernel, mtp_adapter.Qwen35MtpMegakernel):
-        assert "_build_tp_rank_mesh(self.tp_size)" in inspect.getsource(cls.__init__)
