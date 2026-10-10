@@ -405,6 +405,8 @@ def _build_expert_kernel(
                 act = act_vmem[aslot, pl.ds(0, rows)].reshape(rows, h)
                 act_scale = _tile_row_scales(act_scale_vmem[aslot], start, rows)
                 acc2, mid_scale = expert_ffn_fp8(act, act_scale, w1, w2, w1_scale)
+                # expert_ffn_fp8 requantizes the intermediate, so it returns a scale.
+                assert mid_scale is not None
                 # Retile into the per-row slab layout while still f32 (8x8
                 # sublane blocks), then pack to bf16: cheaper than retiling the
                 # packed bf16 value.

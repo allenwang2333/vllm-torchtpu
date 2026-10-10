@@ -30,7 +30,7 @@ kernel (``layers/adapter/fused_moe_prefill.py``).
 """
 
 import functools
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -281,6 +281,9 @@ def _build_op(
         )
 
     name = "pallas::fused_moe_decode" + (f"_{len(_OPS)}" if _OPS else "")
+    # torch_tpu annotates the specs as tuples of axis names but passes each
+    # one to NamedSharding, which takes these PartitionSpecs.
+    # pyrefly: ignore[no-matching-overload]
     op = jax_op(
         name,
         fn,
@@ -471,7 +474,7 @@ def arm_fused_moe_decode(model: torch.nn.Module) -> int:
             _RANK_BUFFER = torch.tensor(
                 [[ep_mesh_index(), start]],
                 dtype=torch.int32,
-                device=layer.w13_weight.device,
+                device=cast(torch.Tensor, layer.w13_weight).device,
             )
             _RANK_BUFFER_START = start
         elif start != _RANK_BUFFER_START:
