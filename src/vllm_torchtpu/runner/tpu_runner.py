@@ -9128,7 +9128,10 @@ class TPUModelRunner(GPUModelRunner):
                 valid_tokens = num_tokens_padded
         tp_size = self.parallel_config.tensor_parallel_size
         if rows_sliced is None:
-            rows_sliced = sequence_parallel.step_is_sequence_parallel(num_tokens_padded)
+            rows_sliced = (
+                self.parallel_config.use_sequence_parallel_moe
+                and sequence_parallel.step_is_sequence_parallel(num_tokens_padded)
+            )
         if rows_sliced and tp_size > 1:
             from vllm.distributed import get_tensor_model_parallel_rank
 
@@ -9146,7 +9149,8 @@ class TPUModelRunner(GPUModelRunner):
         # supports torch.compile
         kwargs = {}
         sequence_parallel.set_active(
-            sequence_parallel.step_is_sequence_parallel(positions.shape[-1])
+            self.parallel_config.use_sequence_parallel_moe
+            and sequence_parallel.step_is_sequence_parallel(positions.shape[-1])
         )
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors

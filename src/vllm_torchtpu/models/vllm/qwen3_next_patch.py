@@ -1240,10 +1240,41 @@ def patched_mtp_forward(
     return hidden_states
 
 
+def _should_use_tpu_sequence_parallel(vllm_config: Any, layer: Any) -> bool:
+    if vllm_config is None:
+        return False
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if not getattr(parallel_config, "use_sequence_parallel_moe", False):
+        return False
+    if not isinstance(getattr(layer, "mlp", None), qwen3_next.Qwen3NextSparseMoeBlock):
+        return False
+    model_config = getattr(vllm_config, "model_config", None)
+    config = getattr(model_config, "hf_text_config", None) or getattr(
+        model_config, "hf_config", None
+    )
+    if config is not None:
+        if getattr(config, "mlp_only_layers", None):
+            return False
+        if getattr(config, "decoder_sparse_step", 1) != 1:
+            return False
+    return True
+
+
 def _with_rank_tensor(original_init: Callable) -> Callable:
     @functools.wraps(original_init)
     def __init__(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
+        vllm_config = args[0] if args else kwargs.get("vllm_config")
+        if _should_use_tpu_sequence_parallel(vllm_config, self):
+            self.use_attn_reduce_scatter_for_moe = True
+            if self.layer_type == "linear_attention" and hasattr(
+                self, "linear_attn"
+            ):
+                self.linear_attn.out_proj.reduce_results = False
+            elif self.layer_type == "full_attention" and hasattr(
+                self, "self_attn"
+            ):
+                self.self_attn.o_proj.reduce_results = False
         self._tpu_sp_rank = torch.tensor(
             [get_tensor_model_parallel_rank()],
             dtype=torch.int32,

@@ -565,6 +565,56 @@ def test_forward_patch_applied(restore_forwards, sequence_parallel):
     )
 
 
+def test_with_rank_tensor_enables_sp_under_pipeline_parallel(monkeypatch):
+    """_with_rank_tensor sets use_attn_reduce_scatter_for_moe=True and disables
+    attention output projection reduce_results when PP > 1 and SP MoE is active."""
+    from vllm_torchtpu.models.vllm.qwen3_next_patch import _with_rank_tensor
+
+    monkeypatch.setattr(patch_mod, "get_tensor_model_parallel_rank", lambda: 1)
+
+    class DummyMoe(qwen3_next.Qwen3NextSparseMoeBlock):
+        def __init__(self):
+            nn.Module.__init__(self)
+
+    for layer_type in ("linear_attention", "full_attention"):
+
+        class DummyDecoderLayer:
+            def __init__(self, vllm_config):
+                self.layer_type = layer_type
+                self.use_attn_reduce_scatter_for_moe = False
+                self.mlp = DummyMoe()
+                self.input_layernorm = SimpleNamespace(weight=torch.zeros(4))
+                if layer_type == "linear_attention":
+                    self.linear_attn = SimpleNamespace(
+                        out_proj=SimpleNamespace(reduce_results=True)
+                    )
+                else:
+                    self.self_attn = SimpleNamespace(
+                        o_proj=SimpleNamespace(reduce_results=True)
+                    )
+
+        DummyDecoderLayer.__init__ = _with_rank_tensor(DummyDecoderLayer.__init__)
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                use_sequence_parallel_moe=True,
+                pipeline_parallel_size=4,
+            ),
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(
+                    mlp_only_layers=[],
+                    decoder_sparse_step=1,
+                )
+            ),
+        )
+        layer = DummyDecoderLayer(vllm_config)
+        assert layer.use_attn_reduce_scatter_for_moe is True
+        if layer_type == "linear_attention":
+            assert layer.linear_attn.out_proj.reduce_results is False
+        else:
+            assert layer.self_attn.o_proj.reduce_results is False
+        assert int(layer._tpu_sp_rank.item()) == 1
+
+
 def test_pal_gate_q_interpreter_parity():
     """Verify pallas_sigmoid_gate_quant in Pallas CPU interpreter."""
     import jax.numpy as jnp
