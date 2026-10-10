@@ -1,71 +1,27 @@
-# Copyright 2026 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Trace-stable sequence-parallel forwards and FP8 fusions for Qwen3Next and
-Qwen3.5 MoE.
+# SPDX-License-Identifier: Apache-2.0
+"""Trace-stable sequence-parallel forward and FP8 fusions for Qwen3Next and Qwen3.5 MoE.
 
-vLLM's Qwen3.5 decoder layer and model inherit these forwards from the
-Qwen3Next classes, so the patch replaces them there.
-
-FP8 fusions, installed for every Qwen3Next / Qwen3.5 model:
-- Fused attention output sigmoid-gate + per-token FP8 quantization
-  (`pallas_sigmoid_gate_quant`) feeding the FP8 `o_proj`.
-- Pre-transposed GDN `in_proj_qkvz` FP8 weights
-  (`maybe_flip_gdn_in_proj_qkvz_weight`).
-- 256-column-aligned FP8 router gate + shared_expert weights
-  (`maybe_setup_fused_gate_se`).
-- In-place W8A8 FP8 quantization of `ParallelLMHead`.
-
-The sequence-parallel forwards, installed under TPU_MOE_SEQUENCE_PARALLEL=1,
-are copies of the upstream vLLM forwards restructured so torch.compile serves
-every bucket:
-- The model and the MTP drafter do not chunk their rows at entry. The first
-  decoder layer (residual None) runs attention on the step's replicated rows;
-  the reduce-scatter after attention leaves this rank's slice, and the
-  residual is sliced to match. Every later layer takes the slice, all-gathers
-  it into attention, reduce-scatters after attention and runs the MoE on the
-  slice. Only the final norm's output is gathered back to every row.
-- Every slice takes its size from a tensor (the reduce-scatter, or
-  reshape(tp, -1, H) of the residual), never from the step's token count, and
-  no all-gather is followed by a narrow. The token count is a SymInt graph
-  input; a row count derived from it ahead of an all-gather can stay symbolic
-  in the compiled graph, which torch_tpu fails to lower ("SymIntArrayRef
-  expected to contain only concrete integers" at the all-gather's
-  allocation). Main's model-entry chunk hit this at every SP bucket; this
-  structure (from bec1a1c91) compiles.
-- The pad before the reduce-scatter is eliminated: buckets divide by TP
-  (`sequence_parallel.check_buckets`).
-- A step shorter than `sequence_parallel.min_rows()` (TPU_SP_MIN_ROWS) keeps
-  its rows replicated and all-reduces the attention output instead.
-- With TPU_SP_FP8_GATHER, the attention-side all-gather carries FP8 rows and
-  their scales, which the attention projections consume as pre-quantized input.
-- The MTP drafter forward gathers its last-token rows right after attention on
-  speculative step 0 (`step0_post_attn_gather_context`).
+Includes:
+- Fused attention output sigmoid-gate + per-token FP8 quantization (`pallas_sigmoid_gate_quant`)
+- Pre-transposed GDN `in_proj_qkvz` FP8 weights (`maybe_flip_gdn_in_proj_qkvz_weight`)
+- 256-column-aligned FP8 router gate + shared_expert input quantization sharing
+- In-place W8A8 FP8 quantization of `ParallelLMHead`
+- Trace-stable sequence-parallel forwards when `TPU_MOE_SEQUENCE_PARALLEL=1`
 """
 
+from collections.abc import Callable
 import contextlib
 import functools
-import os
-from collections.abc import Callable
 from itertools import islice
+import os
 from typing import Any
 
 import jax
 import jax.numpy as jnp
-import torch
-import torch.nn.functional as F
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+import torch
+import torch.nn.functional as F
 from torch_tpu._internal import pallas
 from vllm.distributed import (
     get_pp_group,
@@ -81,11 +37,7 @@ from vllm.model_executor.models import qwen3_next, qwen3_next_mtp
 from vllm.sequence import IntermediateTensors
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.layers.adapter import (
-    linear_common,
-    sequence_parallel,
-    small_all_reduce_op,
-)
+from vllm_torchtpu.layers.adapter import linear_common
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -117,7 +69,7 @@ _mtp_megakernel: Any = None
 
 @contextlib.contextmanager
 def step0_post_attn_gather_context(indices: torch.Tensor | None):
-    """Gather last-token rows right after self_attn.attn(q, k, v) on MTP step 0."""
+    """Gather last-token rows immediately after self_attn.attn(q, k, v) on MTP step 0."""
     global _step0_gather_indices
     prev = _step0_gather_indices
     _step0_gather_indices = indices
@@ -322,9 +274,11 @@ def _is_fp8_per_channel_linear(proj: Any) -> bool:
         return False
     if not getattr(proj, WEIGHT_FLIPPED_ATTR, False):
         return False
-    return getattr(proj, "bias", None) is None or bool(
-        getattr(proj, "skip_bias_add", False)
-    )
+    if getattr(proj, "bias", None) is not None and not getattr(
+        proj, "skip_bias_add", False
+    ):
+        return False
+    return True
 
 
 def maybe_flip_gdn_in_proj_qkvz_weight(gdn_layer: Any) -> bool:
@@ -388,7 +342,9 @@ def _can_use_pal_gate_q(
             return False
     if attn_output.dtype != torch.bfloat16 or gate.dtype != torch.bfloat16:
         return False
-    return attn_output.shape == gate.shape and attn_output.shape[-1] % 128 == 0
+    if attn_output.shape != gate.shape or attn_output.shape[-1] % 128 != 0:
+        return False
+    return True
 
 
 def _apply_pal_gate_q_o_proj(
@@ -459,7 +415,7 @@ def _fp8_gate_and_se_jax(
     w_se_gate_bf16: jax.Array,
     w_down_fp8: jax.Array,
     s_down: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     x_f32 = hidden_states.astype(jnp.float32)
     amax = jnp.max(jnp.abs(x_f32), axis=-1, keepdims=True)
     h_scale = amax * jnp.float32(1.0 / 448.0)
@@ -499,7 +455,7 @@ def _fp8_gate_and_se_jax(
         preferred_element_type=jnp.float32,
     )
     se_out = (mm2 * (s_inter * s_down[None, :])).astype(jnp.bfloat16)
-    return router_logits, se_out
+    return router_logits, se_out, h_q, h_scale
 
 
 def _get_fp8_gate_and_se_op() -> Callable:
@@ -519,22 +475,233 @@ def _get_fp8_gate_and_se_op() -> Callable:
             s_down: torch.Tensor,
         ):
             del s_gate_gu, w_se_gate_bf16, s_down
+            n_tokens = hidden_states.shape[0]
             n_inter = int(w_down_fp8.shape[0])
             n_gate = int(w_gate_gu_fp8.shape[1]) - 2 * n_inter
             hidden_out = int(w_down_fp8.shape[1])
             return (
+                hidden_states.new_empty((n_tokens, n_gate), dtype=torch.bfloat16),
+                hidden_states.new_empty((n_tokens, hidden_out), dtype=torch.bfloat16),
                 hidden_states.new_empty(
-                    (hidden_states.shape[0], n_gate), dtype=torch.bfloat16
+                    (n_tokens, hidden_out), dtype=torch.float8_e4m3fn
                 ),
-                hidden_states.new_empty(
-                    (hidden_states.shape[0], hidden_out), dtype=torch.bfloat16
-                ),
+                hidden_states.new_empty((n_tokens, 1), dtype=torch.float32),
             )
 
         op.register_fake(_fake)
         _fp8_gate_and_se_op = op
 
     return _fp8_gate_and_se_op
+
+
+_norm_fp8_gate_and_se_prequant_ops: dict[float, Callable] = {}
+_norm_fp8_gate_and_se_bf16_ops: dict[float, Callable] = {}
+_norm_quantize_rows_with_res_ops: dict[float, Callable] = {}
+_norm_quantize_rows_no_res_ops: dict[float, Callable] = {}
+
+
+def _norm_quantize_rows_with_res_jax(
+    x: jax.Array,
+    residual: jax.Array,
+    norm_w_plus_one: jax.Array,
+    *,
+    eps: float,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    res_out = (x + residual.astype(x.dtype)).astype(jnp.bfloat16)
+    res_f32 = res_out.astype(jnp.float32)
+    var = jnp.mean(jnp.square(res_f32), axis=-1, keepdims=True)
+    h_f32 = (
+        res_f32
+        * jax.lax.rsqrt(var + jnp.float32(eps))
+        * norm_w_plus_one.astype(jnp.float32)
+    )
+    h_bf16 = h_f32.astype(jnp.bfloat16)
+    x_q, x_s = linear_common._quantize_rows_jax(h_bf16)
+    return x_q, x_s, res_out
+
+
+def _norm_quantize_rows_no_res_jax(
+    x: jax.Array,
+    norm_w_plus_one: jax.Array,
+    *,
+    eps: float,
+) -> tuple[jax.Array, jax.Array]:
+    x_f32 = x.astype(jnp.float32)
+    var = jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True)
+    h_f32 = (
+        x_f32
+        * jax.lax.rsqrt(var + jnp.float32(eps))
+        * norm_w_plus_one.astype(jnp.float32)
+    )
+    h_bf16 = h_f32.astype(jnp.bfloat16)
+    return linear_common._quantize_rows_jax(h_bf16)
+
+
+def _get_norm_quantize_rows_with_res_op(eps: float) -> Callable:
+    key = float(eps)
+    op = _norm_quantize_rows_with_res_ops.get(key)
+    if op is None:
+        tag = f"{key:.0e}".replace("-", "m").replace("+", "p").replace(".", "_")
+        fn = functools.partial(_norm_quantize_rows_with_res_jax, eps=key)
+        op = pallas.jax_op(f"pallas::qwen3_next_norm_quant_rows_res_{tag}", fn)
+
+        def _fake(
+            x: torch.Tensor,
+            residual: torch.Tensor,
+            norm_w_plus_one: torch.Tensor,
+        ):
+            del residual, norm_w_plus_one
+            return (
+                x.new_empty(x.shape, dtype=torch.float8_e4m3fn),
+                x.new_empty((x.shape[0], 1), dtype=torch.float32),
+                x.new_empty(x.shape, dtype=torch.bfloat16),
+            )
+
+        op.register_fake(_fake)
+        _norm_quantize_rows_with_res_ops[key] = op
+    return op
+
+
+def _get_norm_quantize_rows_no_res_op(eps: float) -> Callable:
+    key = float(eps)
+    op = _norm_quantize_rows_no_res_ops.get(key)
+    if op is None:
+        tag = f"{key:.0e}".replace("-", "m").replace("+", "p").replace(".", "_")
+        fn = functools.partial(_norm_quantize_rows_no_res_jax, eps=key)
+        op = pallas.jax_op(f"pallas::qwen3_next_norm_quant_rows_nores_{tag}", fn)
+
+        def _fake(
+            x: torch.Tensor,
+            norm_w_plus_one: torch.Tensor,
+        ):
+            del norm_w_plus_one
+            return (
+                x.new_empty(x.shape, dtype=torch.float8_e4m3fn),
+                x.new_empty((x.shape[0], 1), dtype=torch.float32),
+            )
+
+        op.register_fake(_fake)
+        _norm_quantize_rows_no_res_ops[key] = op
+    return op
+
+
+def _norm_fp8_gate_and_se_prequant_jax(
+    x: jax.Array,
+    residual: jax.Array,
+    norm_w_plus_one: jax.Array,
+    w_gate_gu_fp8: jax.Array,
+    s_gate_gu: jax.Array,
+    w_se_gate_bf16: jax.Array,
+    w_down_fp8: jax.Array,
+    s_down: jax.Array,
+    *,
+    eps: float,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    res_out = (x + residual.astype(x.dtype)).astype(jnp.bfloat16)
+    res_f32 = res_out.astype(jnp.float32)
+    var = jnp.mean(jnp.square(res_f32), axis=-1, keepdims=True)
+    h_f32 = res_f32 * jax.lax.rsqrt(var + jnp.float32(eps)) * norm_w_plus_one.astype(
+        jnp.float32
+    )
+    h_bf16 = h_f32.astype(jnp.bfloat16)
+    logits, se_out, h_q, h_scale = _fp8_gate_and_se_jax(
+        h_bf16, w_gate_gu_fp8, s_gate_gu, w_se_gate_bf16, w_down_fp8, s_down
+    )
+    return logits, se_out, h_q, h_scale, res_out
+
+
+def _norm_fp8_gate_and_se_bf16_jax(
+    x: jax.Array,
+    residual: jax.Array,
+    norm_w_plus_one: jax.Array,
+    w_gate_gu_fp8: jax.Array,
+    s_gate_gu: jax.Array,
+    w_se_gate_bf16: jax.Array,
+    w_down_fp8: jax.Array,
+    s_down: jax.Array,
+    *,
+    eps: float,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    res_out = (x + residual.astype(x.dtype)).astype(jnp.bfloat16)
+    res_f32 = res_out.astype(jnp.float32)
+    var = jnp.mean(jnp.square(res_f32), axis=-1, keepdims=True)
+    h_f32 = res_f32 * jax.lax.rsqrt(var + jnp.float32(eps)) * norm_w_plus_one.astype(
+        jnp.float32
+    )
+    h_bf16 = h_f32.astype(jnp.bfloat16)
+    logits, se_out, _, _ = _fp8_gate_and_se_jax(
+        h_bf16, w_gate_gu_fp8, s_gate_gu, w_se_gate_bf16, w_down_fp8, s_down
+    )
+    return logits, se_out, h_bf16, res_out
+
+
+def _get_norm_fp8_gate_and_se_prequant_op(eps: float) -> Callable:
+    key = float(eps)
+    op = _norm_fp8_gate_and_se_prequant_ops.get(key)
+    if op is None:
+        tag = f"{key:.0e}".replace("-", "m").replace("+", "p").replace(".", "_")
+        fn = functools.partial(_norm_fp8_gate_and_se_prequant_jax, eps=key)
+        op = pallas.jax_op(f"pallas::qwen3_next_norm_fp8_gate_se_pq_{tag}", fn)
+
+        def _fake(
+            x: torch.Tensor,
+            residual: torch.Tensor,
+            norm_w_plus_one: torch.Tensor,
+            w_gate_gu_fp8: torch.Tensor,
+            s_gate_gu: torch.Tensor,
+            w_se_gate_bf16: torch.Tensor,
+            w_down_fp8: torch.Tensor,
+            s_down: torch.Tensor,
+        ):
+            n_tokens = x.shape[0]
+            n_inter = int(w_down_fp8.shape[0])
+            n_gate = int(w_gate_gu_fp8.shape[1]) - 2 * n_inter
+            hidden_dim = int(w_down_fp8.shape[1])
+            return (
+                x.new_empty((n_tokens, n_gate), dtype=torch.bfloat16),
+                x.new_empty((n_tokens, hidden_dim), dtype=torch.bfloat16),
+                x.new_empty((n_tokens, hidden_dim), dtype=torch.float8_e4m3fn),
+                x.new_empty((n_tokens, 1), dtype=torch.float32),
+                x.new_empty((n_tokens, hidden_dim), dtype=torch.bfloat16),
+            )
+
+        op.register_fake(_fake)
+        _norm_fp8_gate_and_se_prequant_ops[key] = op
+    return op
+
+
+def _get_norm_fp8_gate_and_se_bf16_op(eps: float) -> Callable:
+    key = float(eps)
+    op = _norm_fp8_gate_and_se_bf16_ops.get(key)
+    if op is None:
+        tag = f"{key:.0e}".replace("-", "m").replace("+", "p").replace(".", "_")
+        fn = functools.partial(_norm_fp8_gate_and_se_bf16_jax, eps=key)
+        op = pallas.jax_op(f"pallas::qwen3_next_norm_fp8_gate_se_bf16_{tag}", fn)
+
+        def _fake(
+            x: torch.Tensor,
+            residual: torch.Tensor,
+            norm_w_plus_one: torch.Tensor,
+            w_gate_gu_fp8: torch.Tensor,
+            s_gate_gu: torch.Tensor,
+            w_se_gate_bf16: torch.Tensor,
+            w_down_fp8: torch.Tensor,
+            s_down: torch.Tensor,
+        ):
+            n_tokens = x.shape[0]
+            n_inter = int(w_down_fp8.shape[0])
+            n_gate = int(w_gate_gu_fp8.shape[1]) - 2 * n_inter
+            hidden_dim = int(w_down_fp8.shape[1])
+            return (
+                x.new_empty((n_tokens, n_gate), dtype=torch.bfloat16),
+                x.new_empty((n_tokens, hidden_dim), dtype=torch.bfloat16),
+                x.new_empty((n_tokens, hidden_dim), dtype=torch.bfloat16),
+                x.new_empty((n_tokens, hidden_dim), dtype=torch.bfloat16),
+            )
+
+        op.register_fake(_fake)
+        _norm_fp8_gate_and_se_bf16_ops[key] = op
+    return op
 
 
 def _cpu_fp8_gate_and_se(
@@ -590,7 +757,7 @@ def _clear_moe_experts_internal_se_and_gate(moe: Any) -> None:
                 moe, "_fused_se_is_replicated", False
             ):
                 moe_cfg.skip_final_all_reduce = True
-            if not envs.TPU_MOE_SEQUENCE_PARALLEL:
+            if not (envs.TPU_MOE_SEQUENCE_PARALLEL or envs.TPU_SP_MIN_ROWS > 0):
                 sp_prop = getattr(type(moe_cfg), "is_sequence_parallel", None)
                 if isinstance(sp_prop, property):
                     if sp_prop.fset is not None:
@@ -772,6 +939,8 @@ def maybe_setup_fused_gate_se(moe: Any) -> bool:
             ]
         )
     _get_fp8_gate_and_se_op()
+    _get_norm_fp8_gate_and_se_prequant_op(1e-6)
+    _get_norm_fp8_gate_and_se_bf16_op(1e-6)
     _clear_moe_experts_internal_se_and_gate(moe)
     logger.info_once(
         "Cat_FP8_256 fused [gate; shared_expert.gate_up_proj] into "
@@ -789,7 +958,7 @@ def compute_fused_gate_and_shared_expert(
     """Compute router_logits and shared_expert output from fused FP8 weights."""
     if hidden_states.device.type == "tpu":
         standalone_op = _get_fp8_gate_and_se_op()
-        return standalone_op(
+        logits, se_out, h_q, h_scale = standalone_op(
             hidden_states,
             moe._fused_gate_gu_fp8_weight,
             moe._fused_gate_gu_fp8_scale,
@@ -797,6 +966,14 @@ def compute_fused_gate_and_shared_expert(
             moe._fused_se_down_fp8_weight,
             moe._fused_se_down_fp8_scale,
         )
+        routed_experts = getattr(
+            getattr(moe, "experts", None),
+            "routed_experts",
+            getattr(moe, "experts", None),
+        )
+        if routed_experts is not None and hidden_states.shape[0] <= envs.TPU_MOE_LOWTOK_MAX_TOKENS:
+            routed_experts._prequant_x = (h_q, h_scale)
+        return logits, se_out
     return _cpu_fp8_gate_and_se(
         hidden_states,
         moe._fused_gate_gu_fp8_weight,
@@ -811,6 +988,8 @@ def patched_sparse_moe_forward(
     self: Any,
     hidden_states: torch.Tensor,
     already_sequence_parallel: bool = False,
+    *,
+    prenorm_outputs: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if (
         not getattr(self, "_fused_gate_se_checked", False)
@@ -827,22 +1006,25 @@ def patched_sparse_moe_forward(
     orig_shape = hidden_states.shape
     hidden_dim = hidden_states.shape[-1]
     hidden_states = hidden_states.view(-1, hidden_dim)
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
     is_sp = sequence_parallel.is_active()
     tp_size = getattr(self, "tp_size", 1)
 
-    router_logits, shared_output = compute_fused_gate_and_shared_expert(
-        self, hidden_states
-    )
+    if prenorm_outputs is not None:
+        router_logits, shared_output = prenorm_outputs
+    else:
+        router_logits, shared_output = compute_fused_gate_and_shared_expert(
+            self, hidden_states
+        )
     final_hidden_states = self.experts(
         hidden_states=hidden_states,
         router_logits=router_logits,
     )
-    # When Fused EP v3 owns dispatch (`USE_MOE_FUSED_EP_KERNEL=1`),
-    # `_apply_owning_dispatch_v3` already performs `ep.combine` (all-reduce for
-    # SP=0, or in-kernel combine for SP=1). When `USE_MOE_FUSED_EP_KERNEL=0` and
-    # `se_is_replicated=False`, `skip_final_all_reduce=True` leaves
-    # `final_hidden_states` unreduced across EP/TP so it can be all-reduced
-    # together with `shared_output`.
+    # When Fused EP v3 owns dispatch (`USE_MOE_FUSED_EP_KERNEL=1`), `_apply_owning_dispatch_v3`
+    # already performs `ep.combine` (all-reduce for SP=0, or in-kernel combine for SP=1).
+    # When `USE_MOE_FUSED_EP_KERNEL=0` and `se_is_replicated=False`, `skip_final_all_reduce=True`
+    # leaves `final_hidden_states` unreduced across EP/TP so it can be all-reduced together with `shared_output`.
     from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
         fused_moe_ep_supported as fused_moe_ep_v3_supported,
     )
@@ -899,15 +1081,8 @@ def _patched_gemma_rmsnorm_forward_native(
 
 
 def setup_qwen3_next_v6_after_loading(model: Any) -> None:
-    """Post-weight-load setup for fused router/shared-expert FP8 weights, Pallas
-    sigmoid-gate o_proj, GDN weight layout, and FP8 LM head."""
+    """Post-weight-load setup for fused router/shared-expert FP8 weights, Pallas sigmoid-gate o_proj, GDN weight layout, and FP8 LM head."""
     if not hasattr(model, "modules"):
-        return
-    # The loader hook sees every model; only Qwen3Next / Qwen3.5 take the setup.
-    if not any(
-        isinstance(module, qwen3_next.Qwen3NextDecoderLayer | qwen3_next.Qwen3NextModel)
-        for module in model.modules()
-    ):
         return
     is_mtp_wrapper = type(model).__name__ in (
         "Qwen3NextMTP",
@@ -922,6 +1097,9 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
         if isinstance(module, GemmaRMSNorm):
             w_plus_one = 1.0 + module.weight.data.float()
             module._tpu_weight_plus_one = w_plus_one
+            eps = float(getattr(module, "variance_epsilon", 1e-6))
+            _get_norm_quantize_rows_with_res_op(eps)
+            _get_norm_quantize_rows_no_res_op(eps)
             if w_plus_one.device.type == "tpu":
                 hoisted_norm_tensors.append(w_plus_one)
         if isinstance(module, qwen3_next.Qwen3NextSparseMoeBlock):
@@ -955,6 +1133,19 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
                 linear_attn = getattr(module, "linear_attn", None)
                 if linear_attn is not None:
                     maybe_flip_gdn_in_proj_qkvz_weight(linear_attn)
+                proj = getattr(linear_attn, "in_proj_qkvz", None)
+            else:
+                proj = getattr(getattr(module, "self_attn", None), "qkv_proj", None)
+            w = getattr(proj, "weight", None)
+            ws = getattr(proj, "weight_scale", None)
+            module._pre_norm_quant_eligible = bool(
+                isinstance(getattr(module, "input_layernorm", None), GemmaRMSNorm)
+                and isinstance(w, torch.Tensor)
+                and w.dtype == torch.float8_e4m3fn
+                and isinstance(ws, torch.Tensor)
+                and ws.ndim == 1
+                and hasattr(getattr(proj, "quant_method", None), "apply_prequant")
+            )
         elif hasattr(module, "in_proj_qkvz") and hasattr(
             module, "_pcp_streaming_configured"
         ):
@@ -969,11 +1160,12 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
             greedy_top_tokens.quantize_lm_head(module, mode="fp8", in_place=True)
     if hoisted_norm_tensors:
         synchronize_tensors(hoisted_norm_tensors)
+    import gc
+    gc.collect()
 
 
 def install_qwen3_next_v6_patches() -> None:
-    """Install post-load weight fusion hooks and Pallas kernel wrappers for
-    Qwen3Next / Qwen3.5."""
+    """Install post-load weight fusion hooks and Pallas kernel wrappers for Qwen3Next / Qwen3.5."""
     global _V6_PATCHES_INSTALLED
     if _V6_PATCHES_INSTALLED:
         return
@@ -1006,131 +1198,254 @@ def install_qwen3_next_v6_patches() -> None:
     _V6_PATCHES_INSTALLED = True
 
 
-def _rows_are_sequence_parallel(num_tokens: int) -> bool:
-    """Whether a sequence-parallel layer slices this step's rows over TP.
-
-    A step below `sequence_parallel.min_rows()` keeps its rows replicated, and
-    so does the MTP step-0 post-attention gather, whose rows shrink mid-layer.
-    The runner records the same decision with `sequence_parallel.set_active`
-    for the MoE dispatch and combine.
-    """
-    return _step0_gather_indices is None and num_tokens >= sequence_parallel.min_rows()
-
-
-def _sp_chunk(layer: Any, x: torch.Tensor) -> torch.Tensor:
-    """This TP rank's row slice of the replicated `x`, the rows the
-    reduce-scatter leaves on this rank.
-
-    Reads the rank from the layer's `_tpu_sp_rank` tensor when it has one, so
-    the traced graph takes the rank as data instead of baking in a constant.
-    The slice's size comes from `x`'s shape, not from the token count.
-    """
+def _sp_chunk(x: torch.Tensor, full_num_tokens: int) -> torch.Tensor:
     tp_size = get_tensor_model_parallel_world_size()
     if tp_size <= 1:
         return x
-    rank = getattr(layer, "_tpu_sp_rank", None)
-    if not isinstance(rank, torch.Tensor):
-        return qwen3_next.sequence_parallel_chunk(x)
-    return x.reshape(tp_size, -1, x.shape[-1]).index_select(0, rank).squeeze(0)
+    tp_rank = get_tensor_model_parallel_rank()
+    chunk = full_num_tokens // tp_size
+    return x.narrow(0, tp_rank * chunk, chunk)
 
 
-def _layer_scale(
-    self: Any, hidden_states: torch.Tensor, scale: torch.Tensor, cached_attr: str
-) -> torch.Tensor:
-    if len(hidden_states.shape) == 2:
-        s = getattr(self, cached_attr, None)
-        if s is None or s.dtype != hidden_states.dtype:
-            s = scale.to(hidden_states.dtype)[0] + 1
-        return hidden_states * s
-    if len(hidden_states.shape) != len(scale.shape):
-        raise RuntimeError(
-            f"shape must be the same {len(hidden_states.shape)}, {len(scale.shape)}"
-        )
-    return hidden_states * (scale.to(hidden_states.dtype) + 1)
+def _all_gather_hidden_and_residual(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    full_num_tokens: int,
+    hidden_size: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if residual is None:
+        hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+        hidden_states = hidden_states.narrow(0, 0, full_num_tokens)
+        return hidden_states, None
+
+    combined_states = torch.cat([hidden_states, residual], dim=-1)
+    combined_states = tensor_model_parallel_all_gather(combined_states, 0)
+    combined_states = combined_states.narrow(0, 0, full_num_tokens)
+    hidden_states, residual = combined_states.split([hidden_size, hidden_size], dim=-1)
+    return hidden_states, residual
 
 
 def patched_decoder_layer_forward(
     self,
     hidden_states: torch.Tensor,
     residual: torch.Tensor | None,
-    positions: torch.Tensor,
+    positions: torch.Tensor | None = None,
     **kwargs: object,
 ):
-    full_num_tokens = positions.shape[-1]
-    sp = self.use_attn_reduce_scatter_for_moe and _rows_are_sequence_parallel(
-        full_num_tokens
-    )
-    # The first layer (no residual yet) takes the step's rows replicated and
-    # slices them after attention; every later layer takes this rank's slice.
-    input_is_sliced = sp and residual is not None
+    from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+    from vllm_torchtpu.layers.adapter import small_all_reduce_op as _sar
 
-    # Rank tensors enter every layer's graph, so all layers trace alike.
-    sp_rank = getattr(self, "_tpu_sp_rank", None)
-    if isinstance(sp_rank, torch.Tensor):
-        positions = positions + (sp_rank * 0)[0]
-    if small_all_reduce_op._RANK is not None:
-        positions = positions + (small_all_reduce_op._RANK * 0)[0]
+    sp = False
+    if self.use_attn_reduce_scatter_for_moe and positions.shape[-1] >= _sp.min_rows():
+        sp = True
+    input_is_sequence_parallel = sp and residual is not None
 
-    if residual is None:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-    else:
-        hidden_states, residual = self.input_layernorm(hidden_states, residual)
+    if hasattr(self, "_tpu_sp_rank"):
+        positions = positions + (self._tpu_sp_rank * 0)[0]
+    if _sar._RANK is not None:
+        positions = positions + (_sar._RANK * 0)[0]
 
     prequant = None
-    if input_is_sliced and sequence_parallel.fp8_gather():
-        x_q, x_s = linear_common.quantize_rows(hidden_states)
-        x_q = tensor_model_parallel_all_gather(x_q, 0)
-        x_s = tensor_model_parallel_all_gather(x_s, 0)
+    can_fuse_pre_norm_quant = (
+        hidden_states.device.type == "tpu"
+        and getattr(self, "_pre_norm_quant_eligible", False)
+        and _sp.fp8_gather()
+        and os.environ.get("TPU_FUSE_PRE_ATTN_NORM_QUANT", "1").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
+    if can_fuse_pre_norm_quant:
+        orig_shape = hidden_states.shape
+        x_2d = hidden_states.reshape(-1, orig_shape[-1])
+        norm = self.input_layernorm
+        w_plus_one = getattr(norm, "_tpu_weight_plus_one", None)
+        if w_plus_one is None:
+            w_plus_one = 1.0 + norm.weight.float()
+        eps = float(getattr(norm, "variance_epsilon", 1e-6))
+        if residual is None:
+            residual = hidden_states
+            x_q, x_s = _get_norm_quantize_rows_no_res_op(eps)(x_2d, w_plus_one)
+        else:
+            res_2d = residual.reshape(-1, orig_shape[-1])
+            x_q, x_s, res_out = _get_norm_quantize_rows_with_res_op(eps)(
+                x_2d, res_2d, w_plus_one
+            )
+            residual = res_out.view(orig_shape)
+        if input_is_sequence_parallel:
+            x_q = tensor_model_parallel_all_gather(x_q, 0)
+            x_s = tensor_model_parallel_all_gather(x_s, 0)
         prequant = (x_q, x_s)
         hidden_states = x_q
-    elif input_is_sliced:
-        hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-    attn_kwargs: dict[str, Any] = {} if prequant is None else {"prequant": prequant}
+    else:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        if input_is_sequence_parallel and _sp.fp8_gather():
+            x_q, x_s = linear_common.quantize_rows(hidden_states)
+            x_q = tensor_model_parallel_all_gather(x_q, 0)
+            x_s = tensor_model_parallel_all_gather(x_s, 0)
+            prequant = (x_q, x_s)
+            hidden_states = x_q
+        elif input_is_sequence_parallel:
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
 
     if self.layer_type == "linear_attention":
-        hidden_states = self.linear_attn(hidden_states=hidden_states, **attn_kwargs)
+        hidden_states = self.linear_attn(
+            hidden_states=hidden_states,
+            prequant=prequant,
+        )
     elif self.layer_type == "full_attention":
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             positions=positions,
-            **attn_kwargs,
+            prequant=prequant,
         )
         gather_idx = _step0_gather_indices
         if gather_idx is not None:
             residual = torch.index_select(residual, 0, gather_idx)
+            sp = False
     else:
         raise ValueError("Invalid layer_type")
 
     if self.layer_scale:
-        hidden_states = _layer_scale(
-            self, hidden_states, self.attn_layer_scale, "_tpu_attn_layer_scale_2d"
-        )
+        if len(hidden_states.shape) == 2:
+            s_attn = getattr(self, "_tpu_attn_layer_scale_2d", None)
+            if s_attn is None or s_attn.dtype != hidden_states.dtype:
+                s_attn = self.attn_layer_scale.to(hidden_states.dtype)[0] + 1
+            hidden_states = hidden_states * s_attn
+        else:
+            hidden_states = hidden_states * (
+                self.attn_layer_scale.to(hidden_states.dtype) + 1
+            )
 
     if self.use_attn_reduce_scatter_for_moe:
         if sp:
             hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
-            if not input_is_sliced:
-                residual = _sp_chunk(self, residual)
+            if not input_is_sequence_parallel:
+                tp = get_tensor_model_parallel_world_size()
+                if hasattr(self, "_tpu_sp_rank"):
+                    residual = (
+                        residual.reshape(tp, -1, residual.shape[-1])
+                        .index_select(0, self._tpu_sp_rank)
+                        .squeeze(0)
+                    )
+                else:
+                    residual = _sp_chunk(residual, positions.shape[-1])
         else:
-            # o_proj leaves its TP partials unreduced for the reduce-scatter;
-            # a replicated step sums them here instead.
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
     # Fully Connected
-    hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-    if self.use_attn_reduce_scatter_for_moe:
-        hidden_states = self.mlp(
-            hidden_states,
-            already_sequence_parallel=True,
+    mlp = self.mlp
+    norm = self.post_attention_layernorm
+    sp_active = bool(self.use_attn_reduce_scatter_for_moe)
+    if (
+        not getattr(mlp, "_fused_gate_se_checked", False)
+        and not torch.compiler.is_compiling()
+        and isinstance(mlp, qwen3_next.Qwen3NextSparseMoeBlock)
+    ):
+        maybe_setup_fused_gate_se(mlp)
+    can_fuse_post_norm_moe = (
+        hidden_states.device.type == "tpu"
+        and residual is not None
+        and getattr(mlp, "_fused_gate_gu_fp8_weight", None) is not None
+        and isinstance(norm, GemmaRMSNorm)
+        and os.environ.get("TPU_FUSE_POST_ATTN_NORM_MOE", "1").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
+    if can_fuse_post_norm_moe:
+        orig_shape = hidden_states.shape
+        hidden_dim = orig_shape[-1]
+        x_2d = hidden_states.reshape(-1, hidden_dim)
+        res_2d = residual.reshape(-1, hidden_dim)
+        w_plus_one = getattr(norm, "_tpu_weight_plus_one", None)
+        if w_plus_one is None:
+            w_plus_one = 1.0 + norm.weight.float()
+        eps = float(getattr(norm, "variance_epsilon", 1e-6))
+        routed_experts = getattr(
+            getattr(mlp, "experts", None),
+            "routed_experts",
+            getattr(mlp, "experts", None),
         )
+        from vllm_torchtpu.layers.adapter import moe_routing
+
+        use_prequant_moe = (
+            not sp
+            and x_2d.shape[0] <= envs.TPU_MOE_LOWTOK_MAX_TOKENS
+            and routed_experts is not None
+            and getattr(
+                getattr(routed_experts, "quant_method", None),
+                "_moe_lowtok_scores_op",
+                None,
+            )
+            is not None
+            and not getattr(routed_experts, "enable_eplb", False)
+            and moe_routing._SIMULATION_STRATEGY is None
+        )
+        if use_prequant_moe:
+            op = _get_norm_fp8_gate_and_se_prequant_op(eps)
+            logits, se_out, h_q, h_scale, res_out = op(
+                x_2d,
+                res_2d,
+                w_plus_one,
+                mlp._fused_gate_gu_fp8_weight,
+                mlp._fused_gate_gu_fp8_scale,
+                mlp._fused_se_gate_weight,
+                mlp._fused_se_down_fp8_weight,
+                mlp._fused_se_down_fp8_scale,
+            )
+            routed_experts._prequant_x = (h_q, h_scale)
+            residual = res_out.view(orig_shape)
+            hidden_states = patched_sparse_moe_forward(
+                mlp,
+                res_out.view(orig_shape),
+                already_sequence_parallel=sp_active,
+                prenorm_outputs=(logits, se_out),
+            )
+        else:
+            op = _get_norm_fp8_gate_and_se_bf16_op(eps)
+            logits, se_out, h_bf16, res_out = op(
+                x_2d,
+                res_2d,
+                w_plus_one,
+                mlp._fused_gate_gu_fp8_weight,
+                mlp._fused_gate_gu_fp8_scale,
+                mlp._fused_se_gate_weight,
+                mlp._fused_se_down_fp8_weight,
+                mlp._fused_se_down_fp8_scale,
+            )
+            residual = res_out.view(orig_shape)
+            hidden_states = patched_sparse_moe_forward(
+                mlp,
+                h_bf16.view(orig_shape),
+                already_sequence_parallel=sp_active,
+                prenorm_outputs=(logits, se_out),
+            )
     else:
-        hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self.use_attn_reduce_scatter_for_moe:
+            hidden_states = self.mlp(
+                hidden_states,
+                already_sequence_parallel=True,
+            )
+        else:
+            hidden_states = self.mlp(hidden_states)
 
     if self.layer_scale:
-        hidden_states = _layer_scale(
-            self, hidden_states, self.ffn_layer_scale, "_tpu_ffn_layer_scale_2d"
-        )
+        if len(hidden_states.shape) == 2:
+            s_ffn = getattr(self, "_tpu_ffn_layer_scale_2d", None)
+            if s_ffn is None or s_ffn.dtype != hidden_states.dtype:
+                s_ffn = self.ffn_layer_scale.to(hidden_states.dtype)[0] + 1
+            hidden_states = hidden_states * s_ffn
+        else:
+            assert len(hidden_states.shape) == len(self.ffn_layer_scale.shape), (
+                f"shape must be the same {len(hidden_states.shape)}, "
+                f"{len(self.ffn_layer_scale.shape)}"
+            )
+            hidden_states = hidden_states * (
+                self.ffn_layer_scale.to(hidden_states.dtype) + 1
+            )
 
     return hidden_states, residual
 
@@ -1149,52 +1464,59 @@ def patched_model_forward(
             hidden_states = self.embed_input_ids(input_ids)
         residual = None
     else:
-        if intermediate_tensors is None:
-            raise RuntimeError(
-                "intermediate_tensors must not be None when "
-                "pipeline parallelism is active"
-            )
+        assert intermediate_tensors is not None
         hidden_states = intermediate_tensors["hidden_states"]
         residual = intermediate_tensors["residual"]
 
-    assert isinstance(hidden_states, torch.Tensor)
     full_num_tokens = positions.shape[-1]
-    sp = self.use_sequence_parallel and _rows_are_sequence_parallel(full_num_tokens)
+    from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
 
-    # The rows enter replicated; the first layer slices them after attention.
+    sp = positions.shape[-1] >= _sp.min_rows()
+
     aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-    if sp and residual is None and aux_hidden_states:
-        # Slice the embedding like the layer outputs for the final gather.
-        aux_hidden_states = [
-            _sp_chunk(self.layers[self.start_layer], aux_hidden_states[0])
-        ]
     for layer_idx, layer in enumerate(
         islice(self.layers, self.start_layer, self.end_layer),
         start=self.start_layer,
     ):
+        if (
+            sp
+            and residual is not None
+            and not layer.use_attn_reduce_scatter_for_moe
+        ):
+            hidden_states, residual = _all_gather_hidden_and_residual(
+                hidden_states,
+                residual,
+                full_num_tokens,
+                self.config.hidden_size,
+            )
         hidden_states, residual = layer(
             positions=positions,
             hidden_states=hidden_states,
             residual=residual,
         )
+        if (layer_idx + 1) in self.aux_hidden_state_layers and sp:
+            hidden_states, residual = _all_gather_hidden_and_residual(
+                hidden_states,
+                residual,
+                full_num_tokens,
+                self.config.hidden_size,
+            )
         self._maybe_add_hidden_state(
             aux_hidden_states, layer_idx + 1, hidden_states, residual
         )
 
     if not get_pp_group().is_last_rank:
-        assert isinstance(residual, torch.Tensor)
         return IntermediateTensors(
             {"hidden_states": hidden_states, "residual": residual}
         )
+    if sp and self.layers[self.end_layer - 1].use_attn_reduce_scatter_for_moe:
+        hidden_states, residual = _all_gather_hidden_and_residual(
+            hidden_states,
+            residual,
+            full_num_tokens,
+            self.config.hidden_size,
+        )
     hidden_states, _ = self.norm(hidden_states, residual)
-    if sp:
-        if aux_hidden_states:
-            hidden_size = hidden_states.shape[-1]
-            hidden_states = torch.cat([hidden_states, *aux_hidden_states], dim=-1)
-            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-            hidden_states, *aux_hidden_states = hidden_states.split(hidden_size, dim=-1)
-        else:
-            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
     if aux_hidden_states:
         return hidden_states, aux_hidden_states
     return hidden_states
@@ -1219,11 +1541,7 @@ def patched_mtp_forward(
         hidden_states = self.fc(hidden_states)
         residual = None
     else:
-        if intermediate_tensors is None:
-            raise RuntimeError(
-                "intermediate_tensors must not be None when "
-                "pipeline parallelism is active"
-            )
+        assert intermediate_tensors is not None
         hidden_states = intermediate_tensors["hidden_states"]
         residual = intermediate_tensors["residual"]
 
@@ -1234,11 +1552,14 @@ def patched_mtp_forward(
         return _mtp_megakernel.forward_layer(
             mtp_layer, hidden_states, _step0_gather_indices
         )
-    full_num_tokens = positions.shape[-1]
-    sp = mtp_layer.use_attn_reduce_scatter_for_moe and _rows_are_sequence_parallel(
-        full_num_tokens
+    from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+
+    sp = (
+        mtp_layer.use_attn_reduce_scatter_for_moe
+        and _step0_gather_indices is None
+        and positions.shape[-1] >= _sp.min_rows()
     )
-    # The layer takes the rows replicated and returns this rank's slice.
+
     hidden_states, residual = mtp_layer(
         positions=positions,
         hidden_states=hidden_states,
@@ -1250,64 +1571,60 @@ def patched_mtp_forward(
             {"hidden_states": hidden_states, "residual": residual}
         )
 
-    hidden_states, _ = self.norm(hidden_states, residual)
     if sp:
-        hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+        full_num_tokens = positions.shape[-1]
+        hidden_states, residual = _all_gather_hidden_and_residual(
+            hidden_states,
+            residual,
+            full_num_tokens,
+            self.config.hidden_size,
+        )
+    hidden_states, _ = self.norm(hidden_states, residual)
     return hidden_states
 
 
-def _with_rank_tensor(original_init: Callable) -> Callable:
-    @functools.wraps(original_init)
-    def __init__(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        self._tpu_sp_rank = torch.tensor(
-            [get_tensor_model_parallel_rank()],
-            dtype=torch.int32,
-            device=self.input_layernorm.weight.device,
-        )
-
-    __init__._tpu_sp_rank_init = True
-    return __init__
-
-
-def maybe_patch_qwen3_next(*args: object, **kwargs: object) -> None:
-    """Install the Qwen3Next / Qwen3.5 FP8 fusions, then the trace-stable
-    forwards when TPU_MOE_SEQUENCE_PARALLEL=1 or TPU_MTP_STEP0_POST_ATTN_GATHER=1.
-
-    Off sequence-parallel the patched forwards match upstream except for the
-    MTP step-0 post-attention gather.
-    """
+def maybe_patch_qwen3_next(*args: object, **kwargs: object) -> bool | None:
+    """Install Cat_FP8_256, PalGateQ, and GDN/LM-head weight hooks for Qwen3Next / Qwen3.5."""
     install_qwen3_next_v6_patches()
-    from vllm.model_executor.models import qwen3_5_mtp
+    from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
 
-    if envs.TPU_MOE_SEQUENCE_PARALLEL:
-        from vllm.model_executor.models import qwen3_5
+    if not _sp.enabled():
+        return False
 
-        if sequence_parallel.fp8_gather():
-            linear_common.prebuild_prequant_ops()
-        for layer_cls in (
-            qwen3_next.Qwen3NextDecoderLayer,
-            qwen3_5.Qwen3_5DecoderLayer,
+    if _sp.fp8_gather():
+        linear_common.prebuild_prequant_ops()
+        _get_norm_quantize_rows_with_res_op(1e-6)
+        _get_norm_quantize_rows_no_res_op(1e-6)
+
+    def _with_rank_buffer(original_init):
+        @functools.wraps(original_init)
+        def __init__(self, *a, **kw):
+            original_init(self, *a, **kw)
+            device = self.input_layernorm.weight.device
+            self._tpu_sp_rank = torch.tensor(
+                [get_tensor_model_parallel_rank()],
+                dtype=torch.int32,
+                device=device,
+            )
+
+        __init__._tpu_sp_rank_init = True
+        return __init__
+
+    from vllm.model_executor.models import qwen3_5 as _q35
+    from vllm.model_executor.models import qwen3_5_mtp as _q35_mtp
+
+    for layer_cls in (qwen3_next.Qwen3NextDecoderLayer, _q35.Qwen3_5DecoderLayer):
+        if "__init__" in vars(layer_cls) and not getattr(
+            layer_cls.__init__, "_tpu_sp_rank_init", False
         ):
-            if "__init__" in vars(layer_cls) and not getattr(
-                layer_cls.__init__, "_tpu_sp_rank_init", False
-            ):
-                layer_cls.__init__ = _with_rank_tensor(layer_cls.__init__)
-    elif not envs.TPU_MTP_STEP0_POST_ATTN_GATHER:
-        return None
+            layer_cls.__init__ = _with_rank_buffer(layer_cls.__init__)
 
-    # The model, layer and drafter forwards agree on which steps slice their
-    # rows, so they are installed together.
     qwen3_next.Qwen3NextDecoderLayer.forward = patched_decoder_layer_forward
     qwen3_next.Qwen3NextModel.forward = patched_model_forward
     qwen3_next_mtp.Qwen3NextMultiTokenPredictor.forward = patched_mtp_forward
-    qwen3_5_mtp.Qwen3_5MultiTokenPredictor.forward = patched_mtp_forward
-    if envs.TPU_MOE_SEQUENCE_PARALLEL:
-        logger.info(
-            "Applied TPU patch: Qwen3.5 MoE trace-stable sequence-parallel "
-            "forward (>= %d rows).",
-            sequence_parallel.min_rows(),
-        )
-    else:
-        logger.info("Applied TPU patch: Qwen3.5 MTP step-0 post-attention gather.")
+    _q35_mtp.Qwen3_5MultiTokenPredictor.forward = patched_mtp_forward
+    logger.info(
+        "Applied TPU patch: Qwen3Next row-gated sequence-parallel forward (>= %d rows).",
+        _sp.min_rows(),
+    )
     return None

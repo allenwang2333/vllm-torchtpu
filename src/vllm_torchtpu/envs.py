@@ -76,7 +76,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
-    USE_MOE_FUSED_EP_KERNEL: bool = False
+    USE_MOE_FUSED_EP_KERNEL: bool = True
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_TOKEN_BUCKET_HALF_STEPS: bool = False
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
@@ -154,8 +155,12 @@ if TYPE_CHECKING:
     EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK: bool = False
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
-    VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
-    TPU_HYBRID_RETENTION_MAX_CONVS: int = 64
+    VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = True
+    TPU_HYBRID_RETENTION_MAX_CONVS: int = 96
+    TPU_HYBRID_RETENTION_MAX_PINNED_BLOCKS: int = 360
+    TPU_HYBRID_RETENTION_KEEP_PRIOR_TURNS: int = 1
+    TPU_HYBRID_RETENTION_SMART_FORK: bool = True
+    TPU_HYBRID_RETENTION_SAFE_TAIL_OFFSET: int = 4
     TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS: int = 2
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
@@ -168,7 +173,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = True
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_MTP_STEP0_POST_ATTN_GATHER: bool = True
-    TPU_SAMPLER_TOPK_CANDIDATES: int = 0
+    TPU_SAMPLER_TOPK_CANDIDATES: int = 64
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
@@ -181,6 +186,9 @@ if TYPE_CHECKING:
     TPU_SCHED_STEP_TOTAL_CAP: int = 4096
     TPU_SCHED_WARM_STREAK: int = 0
     TPU_SCHED_WARM_MIN_DECODERS: int = 24
+    TPU_SCHED_MK_MAX_RUNNING: int = -1
+    TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP: bool = False
+    TPU_SCHED_SINGLE_STEP_PREFILL: bool = True
 
 
 def env_with_choices(
@@ -588,7 +596,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of all-reducing, the router, shared expert, and experts run on
     # T/tp tokens, and the next layer all-gathers. Qwen3.5 MoE with
     # EP and TP > 1 only.
-    "TPU_MOE_SEQUENCE_PARALLEL": env_bool("TPU_MOE_SEQUENCE_PARALLEL", default=False),
+    "TPU_MOE_SEQUENCE_PARALLEL": env_bool("TPU_MOE_SEQUENCE_PARALLEL", default=True),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes
@@ -600,11 +608,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # expert MoE. 0 disables it; larger shapes and unsupported layouts use
     # the original GMM path. This counts tokens, not tokens * topk.
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
-        "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
+        "TPU_MOE_DENSE_EXPERT_THRESHOLD", 256
     ),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
-    "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
+    "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", default=False),
     # Experimental small-batch MoE (kernels/experimental/moe_lowtok) for EP
     # calls of at most TPU_MOE_LOWTOK_MAX_TOKENS rows; the FP8 method also moves
     # a plain softmax top-k router into it. Can be tiered with dense expert MoE
@@ -613,13 +621,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_LOWTOK_FROM_SCORES": env_bool("TPU_MOE_LOWTOK_FROM_SCORES", default=True),
     "TPU_MOE_LOWTOK_IDS": env_bool("TPU_MOE_LOWTOK_IDS", default=True),
     "TPU_MOE_LOWTOK_MAX_TOKENS": env_nonnegative_int(
-        "TPU_MOE_LOWTOK_MAX_TOKENS", 256
+        "TPU_MOE_LOWTOK_MAX_TOKENS", 384
     ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
     "RAGGED_GATHER_REDUCE_VERSION": env_with_choices(
-        "RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2", "v3"]
+        "RAGGED_GATHER_REDUCE_VERSION", "v3", ["v1", "v2", "v3"]
     ),
     # Capture one trace per inference phase instead of one continuous trace.
     # The trace directory and iteration limits come from `profiler_config`;
@@ -637,7 +645,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_KERNEL_RELOAD_MODULES": lambda: os.getenv("TPU_KERNEL_RELOAD_MODULES", ""),
     # Greedy steps without logprobs or grammar take the vocabulary-parallel
     # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
-    "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
+    "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS", default=True),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.
@@ -672,7 +680,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     else None,
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
-    "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS", default=True),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
@@ -691,7 +699,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the reduce-scatter it replaces is otherwise fully exposed.
     "USE_MOE_FUSED_EP_KERNEL": lambda: (
         environment_variables["MOE_FUSED_EP_KERNEL_IMPL"]() is not None
-        or env_bool("USE_MOE_FUSED_EP_KERNEL")()
+        or env_bool("USE_MOE_FUSED_EP_KERNEL", default=True)()
     ),
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
@@ -700,7 +708,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_MOE_LOWTOK_MAX_TOKENS=256 and TPU_SP_MIN_ROWS=512, steps <= 256 run
     # moe_lowtok and steps >= 512 run SP + fused EP v3.
     "MOE_FUSED_EP_KERNEL_IMPL": env_with_choices(
-        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive", "v3"]
+        "MOE_FUSED_EP_KERNEL_IMPL", "v3", ["v2", "adaptive", "v3"]
     ),
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
@@ -731,10 +739,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_LATENT_PROJ_INTRA_CHIP_TP": env_bool("TPU_LATENT_PROJ_INTRA_CHIP_TP"),
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
-    "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE"),
+    "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE", default=True),
     # Materialize the rotary cos_sin caches with a row-major ({1,0}) device
     # layout at load, May cost more HBM due to padding.
-    "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=False),
+    "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=True),
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
@@ -743,7 +751,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # quantization as one kernel. Needs per-channel fp8 out_proj weights.
     "TPU_GDN_FUSED_NORM_QUANT": env_bool("TPU_GDN_FUSED_NORM_QUANT", default=True),
     "TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS": env_nonnegative_int(
-        "TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS", 16
+        "TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS", 0
     ),
     # Run the gated q split, q/k RMS norms and NeoX rope of Qwen3NextAttention
     # as one kernel on token buckets of up to 64 rows.
@@ -756,8 +764,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_RPA_DECODE_BATCHED": env_bool("TPU_RPA_DECODE_BATCHED"),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
-        int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
+        int(v)
+        for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",")
+        if v.strip()
     ],
+    # Generate {2^k, 3 * 2^k} half-step token buckets from 8 up to budget.
+    "TPU_TOKEN_BUCKET_HALF_STEPS": env_bool("TPU_TOKEN_BUCKET_HALF_STEPS"),
     # Add linear token buckets above a quarter of the token budget, for
     # prompt-sized steps (platforms/tpu_platform.py _get_linear_token_paddings).
     "TPU_TOKEN_BUCKET_LINEAR": env_bool("TPU_TOKEN_BUCKET_LINEAR"),
@@ -994,7 +1006,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
-        "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", default=False
+        "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", default=True
     ),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
@@ -1029,7 +1041,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
-    "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
+    "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION", default=True),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
@@ -1037,7 +1049,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #     KV-sharing draft's fixed positions and seq_lens.
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
-    "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP", default=True),
     # Gather last-token rows immediately after self_attn.attn(q, k, v) on MTP
     # draft step 0 so gate, o_proj, post-attention norm, MoE, and final RMSNorm
     # execute on p = pad(num_reqs) rows instead of all T verify rows.
@@ -1049,7 +1061,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 searches the full vocab. Used only when every active request has
     # 1 <= top_k <= value // 2 and no grammar mask applies.
     "TPU_SAMPLER_TOPK_CANDIDATES": env_nonnegative_int(
-        "TPU_SAMPLER_TOPK_CANDIDATES", 0
+        "TPU_SAMPLER_TOPK_CANDIDATES", 64
     ),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
@@ -1069,15 +1081,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run small decode-step TP all-reduces and DP MoE combines as Pallas
     # kernels (kernels/experimental/small_collectives) instead of XLA's.
     "TPU_SMALL_ALL_REDUCE": env_bool("TPU_SMALL_ALL_REDUCE", default=True),
+    "TPU_SMALL_ALL_REDUCE_EARLY_SIGNAL": env_bool(
+        "TPU_SMALL_ALL_REDUCE_EARLY_SIGNAL", default=True
+    ),
+    "TPU_PRE_MOE_RETURN_PREQUANT": env_bool(
+        "TPU_PRE_MOE_RETURN_PREQUANT", default=True
+    ),
+    "TPU_EXPERT_PLACEMENT_MTP": env_bool(
+        "TPU_EXPERT_PLACEMENT_MTP", default=True
+    ),
+    "TPU_OFFLOAD_MIN_HBM_USAGE": env_float(
+        "TPU_OFFLOAD_MIN_HBM_USAGE", 0.0
+    ),
     "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
-        "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 128
+        "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 384
     ),
     "TPU_ATTN_MOE_OVERLAP": env_bool("TPU_ATTN_MOE_OVERLAP", default=False),
     "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS": env_nonnegative_int(
         "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS", 64
     ),
     "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": env_int(
-        "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 64
+        "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 32
     ),
     "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "512")),
     "TPU_SP_FP8_GATHER": env_bool("TPU_SP_FP8_GATHER", default=True),
@@ -1108,8 +1132,41 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SCHED_WARM_MIN_DECODERS": env_nonnegative_int(
         "TPU_SCHED_WARM_MIN_DECODERS", 24
     ),
+    # Cap active running sequences in PrefixAwareScheduler to the megakernel's
+    # verify capacity (default -1 = auto: 64 // (1 + num_spec_tokens) when
+    # VLLM_TPU_QWEN35_MEGAKERNEL=1 and dcp == 1; 0 = disabled; >0 = explicit).
+    "TPU_SCHED_MK_MAX_RUNNING": env_int(
+        "TPU_SCHED_MK_MAX_RUNNING", -1
+    ),
+    # Mamba "align" prefill split: let a chunk that starts mid-block (a
+    # 128-token partial-tail prefix hit) run past the next block boundary.
+    # Under sparse retention (prefix_cache_retention_interval=0) the state at
+    # that boundary is never hashed, so the stop only costs a step.
+    "TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP": env_bool(
+        "TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP", default=False
+    ),
+    # Single-step warm prefill (core/single_step_prefill.py): one prefill
+    # step writes the last-full-block and partial-tail GDN checkpoints inside
+    # the chunk instead of ending a chunk at each. Changes the stock GDN
+    # program signature, so it is part of the compile hash. Must be set for
+    # the engine core and every worker alike.
+    "TPU_SCHED_SINGLE_STEP_PREFILL": env_bool(
+        "TPU_SCHED_SINGLE_STEP_PREFILL", default=True
+    ),
     "TPU_HYBRID_RETENTION_MAX_CONVS": env_nonnegative_int(
-        "TPU_HYBRID_RETENTION_MAX_CONVS", 64
+        "TPU_HYBRID_RETENTION_MAX_CONVS", 96
+    ),
+    "TPU_HYBRID_RETENTION_MAX_PINNED_BLOCKS": env_nonnegative_int(
+        "TPU_HYBRID_RETENTION_MAX_PINNED_BLOCKS", 360
+    ),
+    "TPU_HYBRID_RETENTION_KEEP_PRIOR_TURNS": env_nonnegative_int(
+        "TPU_HYBRID_RETENTION_KEEP_PRIOR_TURNS", 1
+    ),
+    "TPU_HYBRID_RETENTION_SMART_FORK": env_bool(
+        "TPU_HYBRID_RETENTION_SMART_FORK", default=True
+    ),
+    "TPU_HYBRID_RETENTION_SAFE_TAIL_OFFSET": env_nonnegative_int(
+        "TPU_HYBRID_RETENTION_SAFE_TAIL_OFFSET", 4
     ),
     "TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS": env_nonnegative_int(
         "TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS", 2

@@ -1376,7 +1376,6 @@ class TPUModelRunner(GPUModelRunner):
         self.mesh = self._create_mesh_for_parallelism()
         self.batch_counter = 0
         self._qwen35_mk: Any = None
-        self._qwen35_mtp_mk: Any = None
         self._in_precompile_backbone: bool = False
 
         # Pipeline parallelism: this worker runs one stage's layer slice.
@@ -2665,6 +2664,85 @@ class TPUModelRunner(GPUModelRunner):
         off = torch.where(new_owner_t, 0, off)
         return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
 
+    def _mamba_seg_enabled(self) -> bool:
+        """Single-step warm prefill: the stock GDN op takes in-chunk state
+        checkpoints (zeros when a step has none, so the program signature is
+        fixed). Unified pool, align mode, per-region pools only."""
+        cached = self.__dict__.get("_mamba_seg_enabled_cached")
+        if cached is None:
+            cached = bool(
+                envs.TPU_SCHED_SINGLE_STEP_PREFILL
+                and self._unified_kv_layout
+                and self.cache_config.mamba_cache_mode == "align"
+                and getattr(self, "bm_pool_layout", None) is None
+                and bool(getattr(self, "_mamba_copy_plan", None))
+            )
+            if getattr(self, "kv_cache_config", None) is not None:
+                self._mamba_seg_enabled_cached = cached
+        return cached
+
+    def _mamba_seg_gids(self) -> list[int]:
+        """Every mamba kv_cache_group_id, in group order: row `1 + i` of
+        `mamba_seg_packed` holds group `gids[i]`'s seg_state_indices."""
+        cached = self.__dict__.get("_mamba_seg_gids_cached")
+        if cached is None:
+            kv_cache_config = getattr(self, "kv_cache_config", None)
+            groups = kv_cache_config.kv_cache_groups if kv_cache_config else ()
+            cached = [
+                gid
+                for gid, group in enumerate(groups)
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            ]
+            if kv_cache_config is not None:
+                self._mamba_seg_gids_cached = cached
+        return cached
+
+    def _mamba_seg_slot(self, gid: int) -> int:
+        return self._mamba_seg_gids().index(gid)
+
+    def _build_mamba_seg_arrays(
+        self, scheduler_output, start_index: int, num_reqs: int, target_num_reqs: int
+    ):
+        """This chunk's device `mamba_seg_packed` (see
+        AttentionMetadataBuilderContext) from the scheduler's confirmed cuts,
+        or None without cuts. One upload, sliced per field by the builders."""
+        cuts = getattr(scheduler_output, "tpu_mamba_seg_cuts", None)
+        if not cuts:
+            return None
+        if not self._mamba_seg_enabled():
+            # The scheduler already hashed the checkpoint blocks: skipping
+            # the writes would leave stale states behind live cache entries.
+            raise RuntimeError(
+                "Scheduler sent single-step prefill cuts but this worker runs "
+                "without TPU_SCHED_SINGLE_STEP_PREFILL (or without the unified "
+                "per-region pool); set the env switch on every process."
+            )
+        from vllm_torchtpu.core.single_step_prefill import build_seg_arrays
+
+        block_tables = {
+            gid: self.input_batch.block_table[gid].get_cpu_tensor().numpy()
+            for gid, _ in self._mamba_copy_plan
+        }
+        bounds, per_gid = build_seg_arrays(
+            cuts,
+            self.input_batch.req_ids,
+            start_index,
+            num_reqs,
+            target_num_reqs,
+            self.input_batch.num_computed_tokens_cpu[start_index : start_index + num_reqs],
+            scheduler_output.num_scheduled_tokens,
+            block_tables,
+            self._mamba_state_block_size,
+        )
+        if bounds is None:
+            return None
+        gids = self._mamba_seg_gids()
+        packed = np.zeros((1 + len(gids), target_num_reqs, 2), np.int32)
+        packed[0] = bounds
+        for gid, v in per_gid.items():
+            packed[1 + gids.index(gid)] = v
+        return _h2d_temp(self, torch.from_numpy(packed))
+
     def _flush_mamba_state_seed_copies(self) -> None:
         if not self._pending_mamba_state_copies:
             return
@@ -2946,9 +3024,13 @@ class TPUModelRunner(GPUModelRunner):
 
         use_fast_slice = getattr(self, "_fast_token_substitution", False)
         use_subst_cache = use_fast_slice or self.device.type == "tpu"
-        if use_fast_slice:
+        if use_fast_slice and spec_decode_metadata is None:
             # Fast path 1: Direct device token slicing for 1:1 steady-state decode
-            # Bypasses the _substitute_placeholder_token kernel entirely when unpadded
+            # Bypasses the _substitute_placeholder_token kernel entirely when unpadded.
+            # Speculative verify steps must skip this path so they run the single
+            # fused _substitute_and_extract_draft_token_ids graph instead of
+            # returning an un-extracted as_strided slice view that triggers
+            # 3x tt_jit_execute_as_strided + _compiled_extract_draft_token_ids.
             n_subst = len(token_in_tpu_cur_input_indices)
             if (
                 n_subst == len(input_ids)
@@ -4057,10 +4139,8 @@ class TPUModelRunner(GPUModelRunner):
                 # transfer that runs after they are freed (e.g. behind a long
                 # step or a runtime compile) would pin garbage positions into
                 # the cache (same failure as the substitution-index cache).
-                # Upload two base tensors rather than slices of one packed
-                # buffer: a slice view is re-materialized by a
-                # tt_jit_execute_as_strided program on every compiled call
-                # that consumes it, while a miss is rare in steady state.
+                # Concatenate both 1-D int32 index arrays so a miss pays a
+                # single synchronous H2D transfer instead of two.
                 seq_idx_dev = torch.from_numpy(seq_idx_np).to(self.device)
                 pos_idx_dev = torch.from_numpy(pos_idx_np).to(self.device)
                 sub_cache[sub_key] = (seq_idx_dev, pos_idx_dev, qx_sub_mask)
@@ -4275,6 +4355,9 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_request_distribution = combined_device[3:6]
         assert request_distribution is not None
 
+        mamba_seg_packed = self._build_mamba_seg_arrays(
+            scheduler_output, start_index, num_reqs, target_num_reqs
+        )
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=start_index,
@@ -4286,6 +4369,8 @@ class TPUModelRunner(GPUModelRunner):
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
             mamba_ckpt_window=self._mamba_ckpt_window,
             mamba_request_distribution=mamba_request_distribution,
+            mamba_seg_enabled=self._mamba_seg_enabled(),
+            mamba_seg_packed=mamba_seg_packed,
             # Unified pool + spec decode: the mamba group builders append
             # their per-request state block ids here for the post-sampling
             # read-offset scatter.
@@ -4861,7 +4946,7 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 L = spec_decode_metadata.final_logits_indices.shape[0]
                 extract_input_ids = (
-                    input_ids[:L]
+                    input_ids[:L].clone()
                     if input_ids.shape[0] > L
                     and getattr(spec_decode_metadata, "max_draft_input_index", L) < L
                     else input_ids
@@ -6459,7 +6544,7 @@ class TPUModelRunner(GPUModelRunner):
 
         moe_lowtok_scores.log_summary()
         logger.info(
-            "[AgentX Opt Config] "
+            "[TPU Model Runner Opt Config] "
             "TPU_MOE_LOWTOK=%s (IDS=%s, MAX_TOKENS=%d) | "
             "TPU_MOE_DENSE_EXPERT_THRESHOLD=%d | "
             "TPU_MOE_ROUTER_TOPK=%s | TPU_MOE_SKIP_PADDED_TOKENS=%s | "
@@ -6505,14 +6590,6 @@ class TPUModelRunner(GPUModelRunner):
             from vllm_torchtpu.kernels.qwen35_megakernel import Qwen35Megakernel
 
             self._qwen35_mk = Qwen35Megakernel.maybe_create(self)
-        if os.environ.get("VLLM_TPU_QWEN35_MTP_MK", "0") == "1" and hasattr(
-            self.drafter, "attach_mtp_megakernel"
-        ):
-            from vllm_torchtpu.kernels.qwen35_megakernel import Qwen35MtpMegakernel
-
-            mtp_mk = Qwen35MtpMegakernel.maybe_create(self)
-            if mtp_mk is not None and self.drafter.attach_mtp_megakernel(mtp_mk):
-                self._qwen35_mtp_mk = mtp_mk
 
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
@@ -6801,6 +6878,7 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_ckpt_window=self._mamba_ckpt_window,
                 mamba_request_distribution=dummy_mamba_request_distribution,
                 sequence_layout_descriptor=dummy_layout_plan.descriptor,
+                mamba_seg_enabled=self._mamba_seg_enabled(),
             )
             slot_mappings = self.empty_slot_mappings
             per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = (
@@ -8083,16 +8161,6 @@ class TPUModelRunner(GPUModelRunner):
                 self._qwen35_mk.bind_caches(self)
                 if not self.enforce_eager:
                     self._qwen35_mk.warmup(self)
-        if self._qwen35_mtp_mk is not None:
-            try:
-                # Unbound, the drafter routes no step to it.
-                self._qwen35_mtp_mk.bind_caches(self)
-            except Exception:
-                logger.warning(
-                    "Qwen3.5 MTP megakernel disabled: could not bind the draft "
-                    "KV cache.",
-                    exc_info=True,
-                )
         if self.enforce_eager:
             return
         with self.maybe_setup_dummy_loras(self.lora_config):
@@ -8138,13 +8206,7 @@ class TPUModelRunner(GPUModelRunner):
         roots = [self.model]
         drafter = getattr(self, "drafter", None)
         if drafter is not None:
-            for attr in (
-                "draft_model",
-                "_mtp_loop_model",
-                "_mtp_fused_loop",
-                "_mtp_mk_step0",
-                "_mtp_fused_loop_mk",
-            ):
+            for attr in ("draft_model", "_mtp_loop_model", "_mtp_fused_loop"):
                 m = getattr(drafter, attr, None)
                 if m is not None:
                     roots.append(m)
@@ -8658,8 +8720,6 @@ class TPUModelRunner(GPUModelRunner):
                         self._warmup_spec_batch(int(R), P_small, greedy=True)
                         self._warmup_spec_batch(int(R), P_small, greedy=False)
         logger.info("spec-decode warmup compiled %d graphs", self.num_xla_graphs - n0)
-        if self._qwen35_mtp_mk is not None:
-            self.drafter.check_mtp_megakernel_warm()
 
     def _warmup_spec_batch(self, R: int, P: int, greedy: bool = True) -> None:
         """Warm an nr=R decode batch: prefill R synthetic requests then decode

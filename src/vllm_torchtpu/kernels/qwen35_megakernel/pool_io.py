@@ -91,6 +91,7 @@ def gather_gdn_states(
     active_seqs=None,
     *,
     interpret=False,
+    coal_rec_override: bool | None = None,
 ):
     """Gather initial `(conv, rec)` GDN states for `c.NS` sequences from `raw_pools`.
 
@@ -124,9 +125,6 @@ def gather_gdn_states(
     NS, B, T = c.NS, c.B, c.T
     vh, KD, VD, QKV = c.vh, c.KD, c.VD, c.QKV
     ssm_u32_rows = (vh * KD) // 2
-    REC_PAGES = c.rec_pages
-    GDN_PAGES = c.gdn_pages
-    SSM_U32_CAP = REC_PAGES * 128
     conv_rows = (3 * QKV) // 128
     conv_rows_pad = ((conv_rows + 15) // 16) * 16
     qkv_128 = QKV // 128
@@ -138,11 +136,15 @@ def gather_gdn_states(
     roff_is_2d = read_offsets.ndim == 2
     n_pairs = NS // 2
 
-    coal_rec = (G_PER_ATT > 0) and (NS * vh <= 128)
+    coal_rec = (
+        (G_PER_ATT > 0) and (NS * vh <= 128)
+        if coal_rec_override is None
+        else bool(coal_rec_override)
+    )
     rec_coal = max(1, G_PER_ATT) if coal_rec else 1
 
     scratch = {
-        "page_buf": pltpu.VMEM((2, GDN_PAGES, 2, 64, 4, c.page_size), FP8),
+        "page_buf": pltpu.VMEM((2, 5, 2, 64, 4, c.page_size), FP8),
         "rec_buf": pltpu.VMEM((2, rec_coal, *rec_shape[1:]), rec_dt),
         "conv_buf": pltpu.VMEM((2, max(1, G_PER_ATT), *conv_raw_shape[1:]), conv_raw_dt),
         "sem_in": pltpu.SemaphoreType.DMA((2,)),
@@ -184,17 +186,17 @@ def gather_gdn_states(
             roff = roff_ref[sub, s] if roff_is_2d else roff_ref[s]
             if ckpt_is_3d:
                 slot = ckpt_ref[sub, s, roff]
-                return slot * GDN_PAGES
+                return slot * 5
             else:
                 slot = ckpt_ref[s, roff]
-                return slot * (GDN_PAGES * G_PER_ATT) + sub * GDN_PAGES
+                return slot * 15 + sub * 5
 
         def start_page_read(raw_ref, sub, s, p_slot):
             @pl.when(is_active(s))
             def _():
                 pb = page_base_for(sub, s)
                 pltpu.make_async_copy(
-                    raw_ref.at[pl.ds(pb, GDN_PAGES)], page_buf.at[p_slot], sem_in.at[p_slot]
+                    raw_ref.at[pl.ds(pb, 5)], page_buf.at[p_slot], sem_in.at[p_slot]
                 ).start()
 
         def finish_page_read(raw_ref, sub, s, p_slot, g_slot, r_slot, r_sub):
@@ -202,14 +204,14 @@ def gather_gdn_states(
             def _():
                 pb = page_base_for(sub, s)
                 pltpu.make_async_copy(
-                    raw_ref.at[pl.ds(pb, GDN_PAGES)], page_buf.at[p_slot], sem_in.at[p_slot]
+                    raw_ref.at[pl.ds(pb, 5)], page_buf.at[p_slot], sem_in.at[p_slot]
                 ).wait()
 
-                # Unpack SSM state: pages 0..REC_PAGES-1 -> (ssm_u32_rows, 128) u32 -> (vh, KD, VD) bf16
+                # Unpack SSM state: pages 0..3 -> (ssm_u32_rows, 128) u32 -> (vh, KD, VD) bf16
                 u32_val = (
-                    page_buf.at[p_slot, pl.ds(0, REC_PAGES)]
+                    page_buf.at[p_slot, pl.ds(0, 4)]
                     .bitcast(U32)
-                    .reshape(SSM_U32_CAP, 128)[:ssm_u32_rows, :]
+                    .reshape(512, 128)[:ssm_u32_rows, :]
                 )
                 s_km = pltpu.bitcast(u32_val, BF16).reshape(vh, KD, VD)
                 h0 = s * vh if isinstance(s, int) else pl.multiple_of(s * vh, vh)
@@ -217,7 +219,7 @@ def gather_gdn_states(
 
                 if direct_conv:
                     raw_hr = (
-                        page_buf.at[p_slot, REC_PAGES]
+                        page_buf.at[p_slot, 4]
                         .bitcast(BF16)
                         .reshape(256, 128)[:hr_rows_128, :]
                         .reshape(c.HR, QKV)
@@ -225,14 +227,14 @@ def gather_gdn_states(
                     )
                     conv_buf[g_slot, sub, s] = jnp.where(conv_row_iota < 3, raw_hr, 0.0)
                 else:
-                    # Unpack Conv state: page REC_PAGES -> (conv_rows_pad, 128) bf16 (tile-aligned)
+                    # Unpack Conv state: page 4 -> (conv_rows_pad, 128) bf16 (tile-aligned)
                     c0 = (
                         s * conv_rows_pad
                         if isinstance(s, int)
                         else pl.multiple_of(s * conv_rows_pad, conv_rows_pad)
                     )
                     conv_buf[g_slot, sub, pl.ds(c0, conv_rows_pad), :] = (
-                        page_buf.at[p_slot, REC_PAGES]
+                        page_buf.at[p_slot, 4]
                         .bitcast(BF16)
                         .reshape(256, 128)[:conv_rows_pad, :]
                     )
@@ -477,8 +479,14 @@ def scatter_pool_states(
     active_seqs=None,
     *,
     interpret=False,
+    conv_partial=False,
 ):
     """In-place scatter of new FP8 KV tokens and per-token GDN states into `raw_pools`.
+
+    conv_partial: write only the leading conv_rows_pad bf16 rows (fp8 page-4 rows [0, 0:24],
+    12 KiB) of each checkpoint slot's conv page instead of the whole 64 KiB page. Every reader
+    (gather direct_conv, the fused and pool-gather megakernel paths) selects rows 0..2 of that
+    region (jnp.where / slices), so the untouched page tail is never read into values.
 
     Args:
       c: `MKConfig` geometry.
@@ -521,9 +529,6 @@ def scatter_pool_states(
     NS, B, T = c.NS, c.B, c.T
     vh, KD, VD, QKV, HD = c.vh, c.KD, c.VD, c.QKV, c.HD
     ssm_u32_rows = (vh * KD) // 2
-    REC_PAGES = c.rec_pages
-    GDN_PAGES = c.gdn_pages
-    SSM_U32_CAP = REC_PAGES * 128
     conv_rows = (3 * QKV) // 128
     conv_rows_pad = ((conv_rows + 15) // 16) * 16
     qkv_128 = QKV // 128
@@ -580,7 +585,7 @@ def scatter_pool_states(
         "vnew_buf": pltpu.VMEM((c.NATT, c.MR, HD), FP8),
     }
     if has_gdn:
-        scratch["page_buf"] = pltpu.VMEM((2, T * GDN_PAGES, 2, 64, 4, c.page_size), FP8)
+        scratch["page_buf"] = pltpu.VMEM((2, T * 5, 2, 64, 4, c.page_size), FP8)
         scratch["rec_buf"] = pltpu.VMEM((2, T * vh, KD, VD), rec.dtype)
         scratch["conv_buf"] = pltpu.VMEM(conv_buf_shape, conv_buf_dt)
     scratch["sem_kv_rd"] = pltpu.SemaphoreType.DMA((2,))
@@ -644,10 +649,10 @@ def scatter_pool_states(
         def pb_for(sub, s, t):
             if ckpt_is_3d:
                 slot = ckpt_ref[sub, s, t + ckpt_t_off]
-                return slot * GDN_PAGES
+                return slot * 5
             else:
                 slot = ckpt_ref[s, t + ckpt_t_off]
-                return slot * (GDN_PAGES * G_PER_ATT) + sub * GDN_PAGES
+                return slot * 15 + sub * 5
 
         def is_contig_ckpt(sub, s):
             if not ckpt_is_3d or T <= 1:
@@ -720,6 +725,21 @@ def scatter_pool_states(
                     sem_in.at[in_slot, 1],
                 ).wait()
 
+        # conv_partial: slot t = its 4 rec pages + the first CP_ROWS (4,128)-rows of its conv
+        # page, one contiguous range of the row-flattened page arrays (one DMA per slot)
+        CP_ROWS = conv_rows_pad // 2
+        SLOT_ROWS = 4 * 128 + CP_ROWS
+
+        def slot_copy(raw_out_ref, slot, t, pb_t):
+            src = page_buf.at[slot].reshape(T * 5 * 128, 4, c.page_size)
+            dst = raw_out_ref.reshape(c.num_pages * 128, 4, c.page_size)
+            r0 = pl.multiple_of(pb_t * 128, 128)
+            return pltpu.make_async_copy(
+                src.at[pl.ds(t * 5 * 128, SLOT_ROWS)],
+                dst.at[pl.ds(r0, SLOT_ROWS)],
+                sem_p.at[slot, t],
+            )
+
         def start_scatter_seq(raw_out_ref, sub, s, slot):
             @pl.when(is_active(s))
             def _():
@@ -729,14 +749,14 @@ def scatter_pool_states(
                     else None
                 )
                 for t in range(T):
-                    # Pack SSM state: (vh, KD, VD) bf16 -> (ssm_u32_rows, 128) u32 -> pages t*GDN_PAGES .. t*GDN_PAGES+REC_PAGES-1
+                    # Pack SSM state: (vh, KD, VD) bf16 -> (ssm_u32_rows, 128) u32 -> pages t*5 .. t*5+3
                     s_km = rec_buf[slot, pl.ds(t * vh, vh)]
                     u32_val = pltpu.bitcast(s_km.reshape(vh * KD, VD), U32)
-                    page_buf.at[slot, pl.ds(t * GDN_PAGES, REC_PAGES)].bitcast(U32).reshape(
-                        SSM_U32_CAP, 128
-                    )[:ssm_u32_rows, :] = u32_val
+                    page_buf.at[slot, pl.ds(t * 5, 4)].bitcast(U32).reshape(512, 128)[
+                        :ssm_u32_rows, :
+                    ] = u32_val
 
-                    # Pack Conv state: (conv_rows_pad, 128) bf16 -> page t*GDN_PAGES+REC_PAGES
+                    # Pack Conv state: (conv_rows_pad, 128) bf16 -> page t*5+4
                     if direct_conv:
                         if (4 * qkv_128) % 16 == 0:
                             w4 = jnp.where(
@@ -744,9 +764,9 @@ def scatter_pool_states(
                                 conv_bf16[1 + t : 5 + t, :],
                                 jnp.bfloat16(0.0),
                             )
-                            page_buf.at[slot, t * GDN_PAGES + REC_PAGES].bitcast(BF16).reshape(
-                                256, 128
-                            )[:conv_rows_pad, :] = w4.reshape(conv_rows_pad, 128)
+                            page_buf.at[slot, t * 5 + 4].bitcast(BF16).reshape(256, 128)[
+                                :conv_rows_pad, :
+                            ] = w4.reshape(conv_rows_pad, 128)
                         else:
                             taps_128 = (
                                 conv_buf[slot, 0, 1 + t : 4 + t, :]
@@ -758,21 +778,24 @@ def scatter_pool_states(
                                     taps_128,
                                     ((0, conv_rows_pad - conv_rows), (0, 0)),
                                 )
-                            page_buf.at[slot, t * GDN_PAGES + REC_PAGES].bitcast(BF16).reshape(
-                                256, 128
-                            )[:conv_rows_pad, :] = taps_128
+                            page_buf.at[slot, t * 5 + 4].bitcast(BF16).reshape(256, 128)[
+                                :conv_rows_pad, :
+                            ] = taps_128
                     else:
-                        page_buf.at[slot, t * GDN_PAGES + REC_PAGES].bitcast(BF16).reshape(
-                            256, 128
-                        )[:conv_rows_pad, :] = conv_buf[
+                        page_buf.at[slot, t * 5 + 4].bitcast(BF16).reshape(256, 128)[
+                            :conv_rows_pad, :
+                        ] = conv_buf[
                             slot, pl.ds(t * conv_rows_pad, conv_rows_pad), :
                         ]
 
-                if T == 1:
+                if conv_partial:
+                    for t in range(T):
+                        slot_copy(raw_out_ref, slot, t, pb_for(sub, s, t)).start()
+                elif T == 1:
                     pb0 = pb_for(sub, s, 0)
                     pltpu.make_async_copy(
                         page_buf.at[slot],
-                        raw_out_ref.at[pl.ds(pb0, GDN_PAGES)],
+                        raw_out_ref.at[pl.ds(pb0, 5)],
                         sem_p.at[slot, 0],
                     ).start()
                 else:
@@ -783,7 +806,7 @@ def scatter_pool_states(
                         pb0 = pb_for(sub, s, 0)
                         pltpu.make_async_copy(
                             page_buf.at[slot],
-                            raw_out_ref.at[pl.ds(pb0, GDN_PAGES * T)],
+                            raw_out_ref.at[pl.ds(pb0, 5 * T)],
                             sem_p.at[slot, 0],
                         ).start()
 
@@ -792,19 +815,22 @@ def scatter_pool_states(
                         for t in range(T):
                             pb_t = pb_for(sub, s, t)
                             pltpu.make_async_copy(
-                                page_buf.at[slot, pl.ds(t * GDN_PAGES, GDN_PAGES)],
-                                raw_out_ref.at[pl.ds(pb_t, GDN_PAGES)],
+                                page_buf.at[slot, pl.ds(t * 5, 5)],
+                                raw_out_ref.at[pl.ds(pb_t, 5)],
                                 sem_p.at[slot, t],
                             ).start()
 
         def wait_scatter_seq(raw_out_ref, sub, s, slot):
             @pl.when(is_active(s))
             def _():
-                if T == 1:
+                if conv_partial:
+                    for t in range(T):
+                        slot_copy(raw_out_ref, slot, t, pb_for(sub, s, t)).wait()
+                elif T == 1:
                     pb0 = pb_for(sub, s, 0)
                     pltpu.make_async_copy(
                         page_buf.at[slot],
-                        raw_out_ref.at[pl.ds(pb0, GDN_PAGES)],
+                        raw_out_ref.at[pl.ds(pb0, 5)],
                         sem_p.at[slot, 0],
                     ).wait()
                 else:
@@ -815,7 +841,7 @@ def scatter_pool_states(
                         pb0 = pb_for(sub, s, 0)
                         pltpu.make_async_copy(
                             page_buf.at[slot],
-                            raw_out_ref.at[pl.ds(pb0, GDN_PAGES * T)],
+                            raw_out_ref.at[pl.ds(pb0, 5 * T)],
                             sem_p.at[slot, 0],
                         ).wait()
 
@@ -824,8 +850,8 @@ def scatter_pool_states(
                         for t in range(T):
                             pb_t = pb_for(sub, s, t)
                             pltpu.make_async_copy(
-                                page_buf.at[slot, pl.ds(t * GDN_PAGES, GDN_PAGES)],
-                                raw_out_ref.at[pl.ds(pb_t, GDN_PAGES)],
+                                page_buf.at[slot, pl.ds(t * 5, 5)],
+                                raw_out_ref.at[pl.ds(pb_t, 5)],
                                 sem_p.at[slot, t],
                             ).wait()
 
@@ -844,15 +870,15 @@ def scatter_pool_states(
 
         if G_PER_ATT > 0:
             for slot in range(2):
-                if ssm_u32_rows < SSM_U32_CAP:
+                if ssm_u32_rows < 512:
                     for t in range(T):
-                        page_buf.at[slot, pl.ds(t * GDN_PAGES, REC_PAGES)].bitcast(U32).reshape(
-                            SSM_U32_CAP, 128
-                        )[...] = jnp.zeros((SSM_U32_CAP, 128), U32)
+                        page_buf.at[slot, pl.ds(t * 5, 4)].bitcast(U32).reshape(512, 128)[
+                            ...
+                        ] = jnp.zeros((512, 128), U32)
                 for t in range(T):
-                    page_buf.at[slot, t * GDN_PAGES + REC_PAGES].bitcast(BF16).reshape(
-                        256, 128
-                    )[...] = jnp.zeros((256, 128), BF16)
+                    page_buf.at[slot, t * 5 + 4].bitcast(BF16).reshape(256, 128)[...] = jnp.zeros(
+                        (256, 128), BF16
+                    )
 
         cp_knew.wait()
         cp_vnew.wait()
@@ -868,8 +894,9 @@ def scatter_pool_states(
             lp = lax.div(p, c.page_size)
             ln = lax.rem(p, c.page_size)
             kp = pt_ref[s_idx, lp]
-            mask_b = lane_iota == b_idx
             mask_ln = lane_iota == ln
+            # lane rotate (jnp.roll semantics) column b_idx onto lane ln
+            sh_b = lax.rem(ln + (c.page_size - lax.rem(b_idx, c.page_size)), c.page_size)
 
             pltpu.make_async_copy(
                 raw_out_refs[0].at[kp], kv_page.at[0], sem_kv_rd.at[0]
@@ -893,12 +920,8 @@ def scatter_pool_states(
 
                 k_cols = k_cols_buf[g] if NS > 1 else batch_to_i32_cols(knew_buf[g])
                 v_cols = v_cols_buf[g] if NS > 1 else batch_to_i32_cols(vnew_buf[g])
-                k_col = jnp.sum(
-                    jnp.where(mask_b, k_cols, jnp.int32(0)), axis=1, keepdims=True
-                )
-                v_col = jnp.sum(
-                    jnp.where(mask_b, v_cols, jnp.int32(0)), axis=1, keepdims=True
-                )
+                k_col = pltpu.roll(k_cols, sh_b, 1)
+                v_col = pltpu.roll(v_cols, sh_b, 1)
                 k_view = kv_page.at[k_slot, 0].bitcast(I32).reshape(64, c.page_size)
                 v_view = kv_page.at[k_slot, 1].bitcast(I32).reshape(64, c.page_size)
                 k_view[...] = jnp.where(mask_ln, k_col, k_view[...])
@@ -951,9 +974,12 @@ def scatter_pool_states(
                     @pl.when(same_page)
                     def _():
                         kp = pt_ref[s, lp0]
-                        mask_b_list = [lane_iota == (b0 + t) for t in range(T)]
-                        mask_ln_list = [
-                            lane_iota == lax.rem(pos_ref[b0 + t], c.page_size)
+                        ln_list = [lax.rem(pos_ref[b0 + t], c.page_size) for t in range(T)]
+                        mask_ln_list = [lane_iota == ln_list[t] for t in range(T)]
+                        # lane rotate (jnp.roll semantics) column b0+t onto lane ln_list[t]
+                        sh_list = [
+                            lax.rem(ln_list[t] + (c.page_size - lax.rem(b0 + t, c.page_size)),
+                                    c.page_size)
                             for t in range(T)
                         ]
 
@@ -1002,16 +1028,8 @@ def scatter_pool_states(
                             k_cur = k_view[...]
                             v_cur = v_view[...]
                             for t in range(T):
-                                k_col = jnp.sum(
-                                    jnp.where(mask_b_list[t], k_cols, jnp.int32(0)),
-                                    axis=1,
-                                    keepdims=True,
-                                )
-                                v_col = jnp.sum(
-                                    jnp.where(mask_b_list[t], v_cols, jnp.int32(0)),
-                                    axis=1,
-                                    keepdims=True,
-                                )
+                                k_col = pltpu.roll(k_cols, sh_list[t], 1)
+                                v_col = pltpu.roll(v_cols, sh_list[t], 1)
                                 k_cur = jnp.where(mask_ln_list[t], k_col, k_cur)
                                 v_cur = jnp.where(mask_ln_list[t], v_col, v_cur)
                             k_view[...] = k_cur
@@ -1307,6 +1325,7 @@ def make_flat_pooled_step(
     skip=frozenset(),
     scopes=False,
     fused_pool_io: bool | None = None,
+    coal_rec_override: bool | None = None,
 ):
     """Build a flat positional `shard_map` pooled step for `sharded_jax_callable` in `vllm_torchtpu`.
 
@@ -1331,6 +1350,18 @@ def make_flat_pooled_step(
         )
     else:
         c_paged = dataclasses.replace(c, paged_kv=True, fused_pool_io=False)
+    tiles_eff = tiles or default_tiles(c_paged)
+    use_gpr = (
+        not use_fused
+        and c_paged.T > 1
+        and c_paged.B > 16
+        and tiles_eff.gdn_rows > 0
+        and c_paged.NGDN > 0
+    )
+    if use_gpr:
+        c_paged = dataclasses.replace(
+            c_paged, act_mode="from_ckpt", ckpt_2d=False, roff_1d=False, ckpt_k=c.T
+        )
     call, info = build(
         c_paged,
         tiles,
@@ -1338,6 +1369,7 @@ def make_flat_pooled_step(
         forced_routing=False,
         skip=skip,
         scopes=scopes,
+        pool_gather=use_gpr,
     )
     tk = plan(c_paged, tiles or default_tiles(c_paged))["tk"]
     e13_shape_4d = (c_paged.EW, c_paged.H // tk["e13"], tk["e13"], 2 * c_paged.IR)
@@ -1391,17 +1423,23 @@ def make_flat_pooled_step(
             hid = out[0] if isinstance(out, (tuple, list)) else out
             return (hid, *raw_pools)
 
-        conv, rec = gather_gdn_states(
-            c_paged,
-            raw_pools,
-            ckpt_indices,
-            read_offsets,
-            active_seqs="from_ckpt",
-            interpret=interpret,
-        )
-        hid, conv_out, rec_out, knew, vnew = call(
-            pos, hidden, *w_grouped, conv, rec, raw_pools, page_table
-        )
+        if use_gpr:
+            hid, conv_out, rec_out, knew, vnew = call(
+                pos, hidden, *w_grouped, raw_pools, page_table, ckpt_indices, read_offsets
+            )
+        else:
+            conv, rec = gather_gdn_states(
+                c_paged,
+                raw_pools,
+                ckpt_indices,
+                read_offsets,
+                active_seqs="from_ckpt",
+                interpret=interpret,
+                coal_rec_override=coal_rec_override,
+            )
+            hid, conv_out, rec_out, knew, vnew = call(
+                pos, hidden, *w_grouped, conv, rec, raw_pools, page_table
+            )
         raw_out = scatter_pool_states(
             c_paged,
             raw_pools,
@@ -1414,6 +1452,7 @@ def make_flat_pooled_step(
             ckpt_indices,
             active_seqs="from_ckpt",
             interpret=interpret,
+            conv_partial=use_gpr,
         )
         return (hid, *raw_out)
 
@@ -1453,6 +1492,7 @@ def make_flat_attn_step(
         skip=skip,
         scopes=scopes,
         row_mask=True,
+        pool_gather=False,
     )
     tk = plan(c_paged, tiles or default_tiles(c_paged))["tk"]
     e13_shape_4d = (c_paged.EW, c_paged.H // tk["e13"], tk["e13"], 2 * c_paged.IR)
@@ -1524,6 +1564,7 @@ def make_pooled_step(
     skip=frozenset(),
     scopes=False,
     fused_pool_io: bool | None = None,
+    coal_rec_override: bool | None = None,
 ):
     """Build the `shard_map` decode/verify step over unified block pools `raw[0..14]`.
 
@@ -1547,6 +1588,7 @@ def make_pooled_step(
         forced_routing=forced_routing,
         skip=skip,
         scopes=scopes,
+        pool_gather=False,
     )
     tk = plan(c_paged, tiles or default_tiles(c_paged))["tk"]
     e13_shape_4d = (c_paged.EW, c_paged.H // tk["e13"], tk["e13"], 2 * c_paged.IR)
@@ -1624,7 +1666,13 @@ def make_pooled_step(
             return hid, raw_out
 
         conv, rec = gather_gdn_states(
-            c_paged, raw_in, ckpt_indices, read_offsets, active_seqs, interpret=interpret
+            c_paged,
+            raw_in,
+            ckpt_indices,
+            read_offsets,
+            active_seqs,
+            interpret=interpret,
+            coal_rec_override=coal_rec_override,
         )
         hid, conv_out, rec_out, knew, vnew = call(
             pos, hidden, *w, conv, rec, raw_in, page_table, *rb_tuple
@@ -1778,21 +1826,19 @@ def raw_page_to_kv(raw_page):
 
 
 def ssm_to_raw_pages(rec_slice):
-    """Pack key-major `(vh, KD, VD) bf16` into `rec_pages` raw pages `(rec_pages, 2, 64, 4, 128) fp8`."""
+    """Pack key-major `(vh, KD, VD) bf16` into 4 raw pages `(4, 2, 64, 4, 128) fp8`."""
     vh, KD, VD = rec_slice.shape
     ssm_u32_rows = (vh * KD) // 2
-    rec_pages = max(1, (ssm_u32_rows + 127) // 128)
-    ssm_u32_cap = rec_pages * 128
     s_t = np.asarray(rec_slice, dtype=jnp.dtype(BF16)).reshape(vh * KD, VD)
     # Bitcast pairs of bf16 along axis 0 into uint32 -> ((vh * KD) // 2, 128) u32
     u32_val = s_t.reshape(ssm_u32_rows, 2, 128).transpose(0, 2, 1).copy().view(np.uint32).reshape(
         ssm_u32_rows, 128
     )
-    if ssm_u32_rows < ssm_u32_cap:
-        u32_val = np.pad(u32_val, ((0, ssm_u32_cap - ssm_u32_rows), (0, 0)))
-    # View (ssm_u32_cap, 128) u32 as (rec_pages, 2, 64, 4, 128) fp8
-    fp8_p = u32_val.reshape(rec_pages, 2, 64, 128, 1).view(jnp.dtype(FP8)).transpose(0, 1, 2, 4, 3)
-    return jnp.asarray(fp8_p)
+    if ssm_u32_rows < 512:
+        u32_val = np.pad(u32_val, ((0, 512 - ssm_u32_rows), (0, 0)))
+    # View (512, 128) u32 as (4, 2, 64, 4, 128) fp8
+    fp8_4p = u32_val.reshape(4, 2, 64, 128, 1).view(jnp.dtype(FP8)).transpose(0, 1, 2, 4, 3)
+    return jnp.asarray(fp8_4p)
 
 
 def conv_to_raw_page(taps_3_qkv):
@@ -1814,12 +1860,11 @@ def default_pool_layout(c: MKConfig):
     `(G_PER_ATT, NS)`).
     """
     G_PER_ATT = max(1, c.att_every - 1)
-    gdn_pages = c.gdn_pages
     pages_per_seq = c.ctx // c.page_size
     kv_pages_total = c.NS * pages_per_seq
     n_ckpt_slots = G_PER_ATT * c.NS * c.T
-    base_slot = (kv_pages_total + gdn_pages - 1) // gdn_pages
-    min_num_pages = (base_slot + n_ckpt_slots) * gdn_pages
+    base_slot = (kv_pages_total + 4) // 5
+    min_num_pages = (base_slot + n_ckpt_slots) * 5
 
     pt = np.zeros((c.NS, max(c.max_pages_per_seq, pages_per_seq)), dtype=np.int32)
     for s in range(c.NS):
@@ -1840,8 +1885,6 @@ def states_to_pool(c: MKConfig, St, page_table, ckpt_indices, read_offsets=None)
     """
     AE = c.att_every
     G_PER_ATT = AE - 1
-    rec_pages = c.rec_pages
-    gdn_pages = c.gdn_pages
     pt = np.asarray(page_table)
     ckpt = np.asarray(ckpt_indices)
     ckpt_is_3d = ckpt.ndim == 3
@@ -1875,17 +1918,17 @@ def states_to_pool(c: MKConfig, St, page_table, ckpt_indices, read_offsets=None)
                     ro_val = int(roff[sub, s]) if roff_is_2d else int(roff[s])
                     if ckpt_is_3d:
                         slot = int(ckpt[sub, s, ro_val])
-                        page_base = slot * gdn_pages
+                        page_base = slot * 5
                     else:
                         slot = int(ckpt[s, ro_val])
-                        page_base = slot * (gdn_pages * G_PER_ATT) + sub * gdn_pages
+                        page_base = slot * 15 + sub * 5
                     rec_sl = St["rec"][r, o, s * c.vh:(s + 1) * c.vh]
-                    pool_g[r, page_base:page_base + rec_pages] = np.asarray(ssm_to_raw_pages(rec_sl))
+                    pool_g[r, page_base:page_base + 4] = np.asarray(ssm_to_raw_pages(rec_sl))
                     if c.T > 1:
                         taps = St["conv"][r, o, s, 0:3]
                     else:
                         taps = jnp.stack([St["conv"][r, o, j * c.B + s] for j in range(3)], axis=0)
-                    pool_g[r, page_base + rec_pages] = np.asarray(conv_to_raw_page(taps))
+                    pool_g[r, page_base + 4] = np.asarray(conv_to_raw_page(taps))
 
         raw_list.append(jnp.asarray(pool_g.reshape(c.R * c.num_pages, 2, 64, 4, c.page_size)))
     return tuple(raw_list)

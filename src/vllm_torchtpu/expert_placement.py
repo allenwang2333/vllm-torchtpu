@@ -90,15 +90,14 @@ def auto_table(dcp_size: int, max_num_seqs: int) -> str:
     given serving shape. Each replicated expert slot per rank trades 0.755 GB
     of device HBM (60 layers x one FP8 expert) for lower decode MoE imbalance
     in the few-token kernel: 128 total copies for small batches (max_num_seqs <= 8),
-    64 co-activation-solved copies for medium batches (max_num_seqs <= 16), and
-    32 co-activation-solved copies for larger batches or DCP > 1 to preserve
-    HBM KV cache headroom."""
+    64 copies for medium batches (max_num_seqs <= 16), and 32 copies for larger
+    batches or DCP > 1 to preserve HBM KV cache headroom."""
     if dcp_size <= 1 and max_num_seqs <= 8:
         name = "expert_placement_dp8_ep8_opt_copies128.json"
     elif dcp_size <= 1 and max_num_seqs <= 16:
-        name = "expert_placement_tp8_ep8_agentx_corr_c64_mk2p.json"
+        name = "expert_placement_dp8_ep8_opt_copies64.json"
     else:
-        name = "expert_placement_tp8_ep8_agentx_corr_c32.json"
+        name = "expert_placement_dp8_ep8_opt_copies32.json"
     return os.path.join(_TABLE_DIR, name)
 
 

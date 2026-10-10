@@ -16,9 +16,7 @@
 Provides fused all-gather, reduce-scatter, and row-gated linear wrappers for
 TP-sharded token sequences.
 """
-
 from collections.abc import Sequence
-
 from vllm_torchtpu import envs
 
 _ACTIVE = False
@@ -29,12 +27,7 @@ def min_rows() -> int:
 
 
 def enabled() -> bool:
-    """Whether sequence-parallel MoE is on at all (main #1463's switch).
-
-    TPU_SP_MIN_ROWS only sets the row threshold below which an SP step runs
-    replicated (see min_rows); it never turns SP on by itself.
-    """
-    return bool(envs.TPU_MOE_SEQUENCE_PARALLEL)
+    return bool(envs.TPU_MOE_SEQUENCE_PARALLEL or min_rows() > 0)
 
 
 def fp8_gather() -> bool:

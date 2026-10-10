@@ -93,7 +93,16 @@ def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, object]:
     except Exception as e:  # noqa: BLE001 - never block startup on the credit
         logger.warning("expert-slot KV credit unavailable (%s); using 0.", e)
         return 0, "?"
-    return (_QWEN35_SAFE_KV_SLOTS - slots) * layers * 3 * hidden * inter, slots
+    mtp_extra_slots = (
+        (slots - 64)
+        if (
+            expert_placement.enabled()
+            and os.environ.get("TPU_EXPERT_PLACEMENT_MTP", "1") != "0"
+            and slots > 64
+        )
+        else 0
+    )
+    return ((_QWEN35_SAFE_KV_SLOTS - slots) * layers - mtp_extra_slots) * 3 * hidden * inter, slots
 
 
 def _log_effective_config(vllm_config: VllmConfig) -> None:
@@ -843,6 +852,8 @@ class TpuPlatform(Platform):
             scheduler_config = vllm_config.scheduler_config
             budget = scheduler_config.max_num_batched_tokens
             extra_bucket_sizes = list(envs.TPU_TOKEN_BUCKET_EXTRA)
+            if envs.TPU_TOKEN_BUCKET_HALF_STEPS:
+                extra_bucket_sizes += _get_half_step_token_paddings(8, budget)
             if envs.TPU_TOKEN_BUCKET_LINEAR:
                 extra_bucket_sizes += _get_linear_token_paddings(
                     budget,
@@ -927,10 +938,7 @@ class TpuPlatform(Platform):
             dcp_size = int(
                 getattr(parallel_config, "decode_context_parallel_size", 1) or 1
             )
-            ep_size = int(parallel_config.tensor_parallel_size) * int(
-                parallel_config.data_parallel_size
-            )
-            if "TPU_EXPERT_PLACEMENT" not in os.environ and ep_size == 8:
+            if "TPU_EXPERT_PLACEMENT" not in os.environ:
                 from vllm_torchtpu import expert_placement
 
                 table = expert_placement.auto_table(
@@ -1348,6 +1356,28 @@ def _get_exponential_token_paddings(
     return paddings
 
 
+def _get_half_step_token_paddings(
+    min_token_size: int, max_token_size: int
+) -> list[int]:
+    """Generate the ``{2^k, 3 * 2^k}`` geometric half-step token bucket ladder
+    starting from ``min_token_size`` up to ``max_token_size``.
+
+    Half-steps above 4096 (e.g. 6144 at a 8192 step budget) are omitted to stay
+    within the 512 GiB host memory budget (~13 GB per compiled backbone + MTP
+    program per rank).
+    """
+    paddings: list[int] = []
+    p = max(1, min_token_size)
+    half_cap = min(max_token_size, 4096)
+    while p <= max_token_size:
+        paddings.append(p)
+        half = p + (p // 2)
+        if p < half <= half_cap:
+            paddings.append(half)
+        p *= 2
+    return sorted(set(paddings))
+
+
 # Linear buckets above a quarter of the token budget, every budget/32 rows:
 # 512 at the 16384 budget the TP8 Qwen3.5 recipes serve. A pass there pads by
 # at most 1/8 instead of up to 1/2 with doubling.
@@ -1446,14 +1476,9 @@ def _get_token_paddings(
 
 
 def _is_sequence_parallel_bucket(size: int, tp: int) -> bool:
-    from vllm_torchtpu.layers.adapter import sequence_parallel
-
-    # A bucket below min_rows runs replicated, so any size serves. From there
-    # each rank receives size // tp rows; require 8-token alignment or
+    # Each rank receives size // tp rows; require 8-token alignment or
     # validated power-of-two decode sizes (2, 4) with at least 2 rows per rank
     # to avoid single-token shape specialization in Dynamo.
-    if size < sequence_parallel.min_rows():
-        return True
     rows, rem = divmod(size, tp)
     return rem == 0 and (rows % 8 == 0 or rows in (2, 4))
 
@@ -1461,10 +1486,8 @@ def _is_sequence_parallel_bucket(size: int, tp: int) -> bool:
 def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
     """Validate architecture and filter compile buckets for sequence-parallel MoE.
 
-    Keeps compile sizes below sequence_parallel.min_rows(), which run
-    replicated, and from there on those where each tensor-parallel rank
-    receives an 8-token aligned shard or a validated power-of-two decode shard
-    (2, 4 rows).
+    Keeps compile sizes where each tensor-parallel rank receives an 8-token aligned
+    shard or a validated power-of-two decode shard (2, 4 rows).
     """
     parallel_config = vllm_config.parallel_config
     if not parallel_config.use_sequence_parallel_moe:

@@ -132,6 +132,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     # are keyed by shape inside the same cache.
     "TPU_PP_DYNAMIC_CHUNKS",
     "TPU_PP_CHUNK_SLACK",
+    "TPU_TOKEN_BUCKET_HALF_STEPS",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, the raiden offload storage tier, offload retry and drain
     # limits, a weight-load sync cadence, a debug log switch, and the
@@ -159,6 +160,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Scheduler prefix-cache hit length / retention only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
     "TPU_HYBRID_RETENTION_MAX_CONVS",
+    "TPU_HYBRID_RETENTION_MAX_PINNED_BLOCKS",
+    "TPU_HYBRID_RETENTION_SMART_FORK",
+    "TPU_HYBRID_RETENTION_SAFE_TAIL_OFFSET",
     "TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS",
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
@@ -172,6 +176,17 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_SCHED_COLD_MIN_DECODERS",
     "TPU_SCHED_COLD_THRESHOLD",
     "TPU_SCHED_SRPF_RUNNING",
+    "TPU_SCHED_STEP_TOTAL_CAP",
+    "TPU_SCHED_WARM_STREAK",
+    "TPU_SCHED_WARM_MIN_DECODERS",
+    "TPU_SCHED_MK_MAX_RUNNING",
+    "TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP",
+    "TPU_EVICT_WEIGHTS_PAGE_CACHE",
+    "TPU_DISABLE_CHUNKED_LOCAL_ATTN",
+    "TPU_OFFLOAD_MIN_HBM_USAGE",
+    "TPU_EXPERT_PLACEMENT_COPIES128_MAX_SEQS",
+    "TPU_HYBRID_RETENTION_KEEP_PRIOR_TURNS",
+    "TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS",
     "TPU_MTP_STEP0_POST_ATTN_GATHER",
 }
 
@@ -396,24 +411,6 @@ def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
 def _single_size(compile_range: Range) -> int | None:
     """The token bucket a compile range pins, or None for a size range."""
     return compile_range.start if compile_range.is_single_size() else None
-
-
-def _inline_int_placeholders(graph: fx.GraphModule, example_inputs: list[Any]) -> None:
-    """Bake a single-size compile's concrete ints into `graph` in place.
-
-    aot_autograd turns every int input back into a SymInt while a ShapeEnv is
-    live, so size arithmetic on the token count (`s // tp * tp` from the
-    sequence-parallel chunk and all-gather) reaches `torch.empty` symbolic and
-    fx_to_mlir rejects it. The placeholders stay, so the calling convention
-    and graph_signature are unchanged; only their uses see the constant.
-    """
-    inlined = False
-    for node, value in zip(shape_variants._placeholder_nodes(graph), example_inputs):
-        if type(value) is int and node.users:
-            node.replace_all_uses_with(value)
-            inlined = True
-    if inlined:
-        graph.recompile()
 
 
 class TpuCompilerAdaptor(CompilerInterface):
@@ -650,8 +647,6 @@ class TpuCompilerAdaptor(CompilerInterface):
         # and vLLM keeps its own reference to `graph`. Only the output node
         # moves, so the placeholder signature is unaffected.
         graph = copy.deepcopy(graph)
-        if size is not None:
-            _inline_int_placeholders(graph, example_inputs)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         compiled_fn, entry = self._run_backend(graph, example_inputs)
@@ -729,12 +724,9 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         logger.info("[TpuCompilerAdaptor] Loading compiled artifact from %s", path)
 
-        # Same deepcopy, int inlining and output-tuple rewrite as `compile`, so
-        # the graph the artifact is checked against is shaped the way it was
-        # when saved, and the fallback compile below sees static sizes too.
+        # Same deepcopy + output-tuple rewrite as `compile`, so the graph the
+        # artifact is checked against is shaped the way it was when saved.
         graph = copy.deepcopy(graph)
-        if size is not None:
-            _inline_int_placeholders(graph, example_inputs)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         compiled_fn = self._replay(path, graph, was_wrapped)

@@ -1,30 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""An MTP draft's loop steps 1..K-1 as one compiled program.
+"""Compiled single-graph multi-step MTP draft loop for Qwen3.5 speculative decoding.
 
-Each loop step used to be two host dispatches -- the draft forward and the
-lm-head + argmax -- plus a metadata build, so K=3 paid for four programs and
-two builds between step 0 and the verify. The steps differ only in values the
-device can derive itself: positions and attention seq_lens advance by one, and
-the input ids are the previous step's argmax. This program unrolls the steps
-and advances both on device, so the host builds step 1's metadata once and
-dispatches once.
-
-Built with ``propose_step0=True``, the program also takes over step 0's
-lm-head + argmax: it is handed step 0's gathered hidden carry instead of step
-0's token, proposes that token first, and returns the whole ``[p, K]`` draft
-block stacked, so nothing but the post-step-0 bridge runs between the step-0
-forward and this program.
-
-seq_lens reaches the attention kernel through the forward context, not as an
-argument, so the program is handed the same tensor the step-1 metadata holds
-and bumps it in place between steps; the traced attention then reads the
-bumped value. The caller must pass a tensor built for this call alone.
-
-This lives outside eagle3.py because that module uses postponed annotations,
-which ``support_torch_compile`` cannot read.
+Chains multiple MTP draft steps inside a single compiled XLA computation to
+eliminate per-draft-step host dispatch overhead.
 """
-
-from typing import Any, Protocol
 
 import torch
 from torch import nn
@@ -33,71 +12,43 @@ from vllm.config import VllmConfig
 from vllm.sequence import IntermediateTensors
 
 
-class MtpDraftModel(Protocol):
-    """What the loop calls on the MTP draft. The draft is an nn.Module, but
-    nn.Module types its attributes as Tensor | Module, so name the calls."""
-
-    def forward(self, *args: Any, **kwargs: Any) -> Any: ...
-
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor: ...
-
-
 class _MtpFusedLoop(nn.Module):
     def __init__(
         self,
         *,
         vllm_config: VllmConfig,
         prefix: str = "",
-        mtp: MtpDraftModel,
+        mtp: nn.Module,
         num_steps: int,
-        greedy_head_owner: Any = None,
-        propose_step0: bool = False,
+        greedy_head_owner: nn.Module | None = None,
     ) -> None:
-        """`greedy_head_owner`: a module with `logits_processor` and `lm_head`
-        (greedy_top_tokens.resolve_head_owner, or eagle3's draft head proxy)
-        whose `get_top_tokens` replaces compute_logits + argmax; None keeps
-        compute_logits + argmax. `propose_step0`: see the module docstring.
-        """
         super().__init__()
         # Own compile-cache folder, as in MtpLoopStepModel.
         self.prefix = prefix
         self.mtp = mtp
         self.num_steps = num_steps
         self.greedy_head_owner = greedy_head_owner
-        self.propose_step0 = propose_step0
-
-    def _propose(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """The greedy draft token of each row, [p] int32."""
-        owner = self.greedy_head_owner
-        if owner is not None:
-            return owner.logits_processor.get_top_tokens(
-                owner.lm_head, hidden_states
-            ).to(torch.int32)
-        return self.mtp.compute_logits(hidden_states).argmax(dim=-1).to(torch.int32)
 
     def forward(
         self,
-        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         seq_lens: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, ...] | torch.Tensor:
-        """`positions` and `seq_lens` are step 1's and `hidden_states` is step
-        0's carry [p, H].
-
-        Without `propose_step0`, `input_ids` is step 0's token and the result
-        is the K-1 draft tokens, one [p] int32 tensor per step. With it,
-        `input_ids` must be None, step 0's token is proposed from
-        `hidden_states`, and the result is the stacked [p, K] int32 drafts.
-        """
-        tokens = []
-        if self.propose_step0:
-            assert input_ids is None, "propose_step0 proposes step 0's token"
-            input_ids = self._propose(hidden_states)
-            tokens.append(input_ids)
-        assert input_ids is not None
+    ) -> torch.Tensor:
+        """`positions` and `seq_lens` are step 1's; `hidden_states` is step 0's
+        gathered carry [p, H]. Proposes step 0's token from `hidden_states` and
+        runs steps 1..K-1, returning the stacked [p, K] int32 draft tokens."""
+        if self.greedy_head_owner is not None:
+            input_ids = self.greedy_head_owner.logits_processor.get_top_tokens(
+                self.greedy_head_owner.lm_head, hidden_states
+            ).to(torch.int32)
+        else:
+            input_ids = (
+                self.mtp.compute_logits(hidden_states).argmax(dim=-1).to(torch.int32)
+            )
+        tokens = [input_ids]
         for i in range(self.num_steps):
             if i > 0:
                 positions = positions + 1
@@ -118,58 +69,35 @@ class _MtpFusedLoop(nn.Module):
                 last_hidden, hidden_states = out
             else:
                 last_hidden = hidden_states = out
-            input_ids = self._propose(last_hidden)
+            if self.greedy_head_owner is not None:
+                input_ids = self.greedy_head_owner.logits_processor.get_top_tokens(
+                    self.greedy_head_owner.lm_head, last_hidden
+                ).to(torch.int32)
+            else:
+                input_ids = (
+                    self.mtp.compute_logits(last_hidden).argmax(dim=-1).to(torch.int32)
+                )
             tokens.append(input_ids)
-        if self.propose_step0:
-            return torch.stack(tokens, dim=1)
-        return tuple(tokens)
-
-
-class _MtpMkFusedLoop(_MtpFusedLoop):
-    """The loop with the MTP layer on the megakernel, traced inside
-    `mtp_megakernel_context`. vLLM keys a compiled program by its forward's
-    code (Dynamo's cache, the AOT artifact path), so this one gets its own
-    rather than sharing the XLA loop's."""
-
-    def forward(
-        self,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        seq_lens: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, ...] | torch.Tensor:
-        return _MtpFusedLoop.forward(
-            self,
-            input_ids,
-            positions,
-            hidden_states,
-            seq_lens,
-            intermediate_tensors,
-            inputs_embeds,
-        )
+        return torch.stack(tokens, dim=1)
 
 
 def build_mtp_fused_loop(
     *,
     vllm_config: VllmConfig,
     prefix: str,
-    mtp: MtpDraftModel,
+    mtp: nn.Module,
     num_steps: int,
     dynamic_arg_dims: dict,
-    greedy_head_owner: Any = None,
-    propose_step0: bool = False,
-    megakernel: bool = False,
+    greedy_head_owner: nn.Module | None = None,
 ) -> nn.Module:
     """Compile `_MtpFusedLoop` with the draft's own dynamic dims (Qwen3.5's
     MTP marks positions -1, DeepSeek's 0), so both programs specialise the
-    token dimension the same way. vLLM's compile wrapper skips a None
-    argument's dims, so `input_ids=None` under `propose_step0` is fine.
-    `megakernel` compiles `_MtpMkFusedLoop`."""
-    base = _MtpMkFusedLoop if megakernel else _MtpFusedLoop
-    cls = support_torch_compile(dynamic_arg_dims=dict(dynamic_arg_dims))(
-        type("MtpFusedLoop", (base,), {})
+    token dimension the same way."""
+    loop_dims = {
+        k: v for k, v in dynamic_arg_dims.items() if k != "input_ids"
+    }
+    cls = support_torch_compile(dynamic_arg_dims=loop_dims)(
+        type("MtpFusedLoop", (_MtpFusedLoop,), {})
     )
     return cls(
         vllm_config=vllm_config,
@@ -177,5 +105,4 @@ def build_mtp_fused_loop(
         mtp=mtp,
         num_steps=num_steps,
         greedy_head_owner=greedy_head_owner,
-        propose_step0=propose_step0,
     )

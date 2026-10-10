@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
 
-"""Runtime environment configuration for TPU serving.
+"""Model-aware runtime environment configuration for Qwen3.5 serving on TPU.
 
-Sets compilation-cache and libtpu defaults. Model settings (speculative
-decoding, fused EP, batched RPA decode, single sort, the Qwen3.5 megakernel)
-are not forced here; pass them explicitly.
+Applies default kernel, scheduler, and compilation flags when serving
+Qwen3.5-397B-A17B unless explicitly overridden in the process environment.
 """
 
 import json
@@ -142,7 +141,7 @@ def _fetch_tpu_type_from_metadata() -> str | None:
         )
         if resp.status_code == 200 and resp.text:
             return resp.text
-    except Exception:  # noqa: S110
+    except Exception:
         pass
     return None
 
@@ -166,7 +165,7 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
     return None
 
 
-# Every rewrite below (recipe env, LIBTPU_INIT_ARGS) is recorded
+# Every rewrite below (recipe env, LIBTPU_INIT_ARGS, serve argv) is recorded
 # here as [kind, key, old, new] and exported once as VLLM_TORCHTPU_CONFIG_CHANGES
 # (first process wins: spawned children inherit the rewritten env and record
 # nothing), so TpuPlatform.check_and_update_config logs it in its
@@ -229,6 +228,8 @@ def _recipe_libtpu_args(args: str) -> str:
 
 _existing_libtpu_args = _recipe_libtpu_args(os.environ.get("LIBTPU_INIT_ARGS", ""))
 
+# The CDK recipe (infx-qwen35-agentx) exports stale fused-EP settings in the
+# pod spec: USE_MOE_FUSED_EP_KERNEL=0 and TPU_MOE_FUSED_EP_STEP_MIN_TOKENS=33.
 # When TPU_DISABLE_PR989_KERNELS=1 is set (for leave-one-out PR #989 ablation),
 # disable the PR #989 kernel/placement stack while keeping the main GMMv2
 # single-sort MoE path and all non-PR#989 runtime settings intact.
@@ -245,6 +246,10 @@ if os.environ.get("TPU_DISABLE_PR989_KERNELS", "0").strip().lower() in (
     _set_env("TPU_GDN_FUSED_NORM_QUANT", "0")
     _set_env("TPU_FUSED_QK_NORM_ROPE", "0")
     _set_env("TPU_EXPERT_PLACEMENT", "")
+else:
+    _set_env("USE_MOE_FUSED_EP_KERNEL", "1")
+    if os.environ.get("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS") in (None, "", "33"):
+        _set_env("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "32")
 
 
 def _user_has_flag(flag_name: str) -> bool:
@@ -287,6 +292,71 @@ if _libtpu_extra_args or _existing_libtpu_args:
     os.environ["LIBTPU_INIT_ARGS"] = _assembled
 
 
+def _has_cli_opt(argv: list[str], opt: str) -> bool:
+    return any(a == opt or a.startswith(opt + "=") for a in argv)
+
+
+def _get_cli_opt(argv: list[str], opt: str) -> str | None:
+    for i, a in enumerate(argv):
+        if a == opt and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(opt + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def _apply_qwen35_serve_cli_defaults() -> None:
+    """`vllm serve` of the Qwen3.5-397B checkpoint: MTP=3 speculative decoding
+    and 4 tokenizer renderer workers unless the command line sets them."""
+    import sys
+
+    argv = sys.argv
+    if "serve" not in argv[:3] or "qwen3.5-397b" not in " ".join(argv).lower():
+        return
+    for opt, val in (
+        ("--speculative-config", '{"method":"mtp","num_speculative_tokens":3}'),
+        ("--renderer-num-workers", "4"),
+    ):
+        if not _has_cli_opt(argv, opt):
+            argv.extend([opt, val])
+            CHANGES.append(["argv_add", opt, val])
+    # <=64-row decode/MTP-draft buckets use half VMEM (32 MiB on v7x) so XLA
+    # prefetches next layers' weights across batched RPA, while larger
+    # verification buckets keep full VMEM.
+    if "TPU_RPA_DECODE_BATCHED" not in os.environ:
+        _set_env("TPU_RPA_DECODE_BATCHED", "1")
+    # Pack MoE permutation into a single int32 radix sort (60 sorts/step vs
+    # 180 across 60 MoE layers) whenever steps route via fused_moe_gmm.
+    if "TPU_MOE_SINGLE_SORT" not in os.environ:
+        _set_env("TPU_MOE_SINGLE_SORT", "1")
+    if "TPU_TOKEN_BUCKET_HALF_STEPS" not in os.environ:
+        _set_env("TPU_TOKEN_BUCKET_HALF_STEPS", "1")
+    if "TPU_TOKEN_BUCKET_EXTRA" not in os.environ:
+        _set_env("TPU_TOKEN_BUCKET_EXTRA", "8,24,48,96,384,3072")
+    if "VLLM_TPU_QWEN35_MEGAKERNEL" not in os.environ:
+        try:
+            _mns = int(_get_cli_opt(argv, "--max-num-seqs") or os.environ.get("MAX_NUM_SEQS", "16"))
+        except ValueError:
+            _mns = 16
+        _set_env("VLLM_TPU_QWEN35_MEGAKERNEL", "1" if _mns <= 32 else "0")
+    if "VLLM_TPU_QWEN35_MK_MODE" not in os.environ:
+        _set_env("VLLM_TPU_QWEN35_MK_MODE", "ep")
+    if os.environ.get("TPU_DISABLE_PR989_KERNELS") != "1":
+        _set_env("USE_MOE_FUSED_EP_KERNEL", "1")
+        if os.environ.get("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS") in (None, "", "33"):
+            _set_env("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "32")
+    dcp = _get_cli_opt(argv, "--decode-context-parallel-size") or ""
+    if dcp.isdigit() and int(dcp) > 1:
+        if "TORCH_TPU_INTERNAL_ENABLE_REASSOCIATE_NORM_WEIGHTS" not in os.environ:
+            # torch_tpu's reassociate_norm_weights pass is the DCP>1 crash suspect.
+            _set_env("TORCH_TPU_INTERNAL_ENABLE_REASSOCIATE_NORM_WEIGHTS", "0")
+        if "MOE_FUSED_EP_KERNEL_IMPL" not in os.environ:
+            # Fused EP v3 triggers HBM OOM (E0101 -> E0200) under DCP>1 when
+            # combined with dual-pass DCP RPA graphs; use v2 for DCP>1.
+            _set_env("MOE_FUSED_EP_KERNEL_IMPL", "v2")
+
+
+_apply_qwen35_serve_cli_defaults()
 os.environ.setdefault(
     "VLLM_TORCHTPU_CONFIG_CHANGES", json.dumps(CHANGES, separators=(",", ":"))
 )

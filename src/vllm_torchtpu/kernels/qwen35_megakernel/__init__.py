@@ -28,7 +28,6 @@ from .megakernel import (
     build,
     default_tiles,
 )
-from .mtp_adapter import Qwen35MtpMegakernel
 from .pool_io import (
     gather_gdn_states,
     make_pooled_step,
@@ -60,7 +59,6 @@ __all__ = [
     "FULL_EP",
     "MKConfig",
     "Qwen35Megakernel",
-    "Qwen35MtpMegakernel",
     "TINY",
     "TINY_EP",
     "TINY_TILES",
