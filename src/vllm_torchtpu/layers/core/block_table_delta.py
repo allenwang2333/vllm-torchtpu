@@ -174,6 +174,7 @@ class _EntryState:
     mutations: int  # source table's total mutation count at upload
     total_rewrites: int = 0  # source table's total rewrite count at upload
     bt: Any = None
+    ac_key: tuple[int, bool, int] = (0, False, 0)
 
 
 @dataclass
@@ -192,6 +193,7 @@ class BlockTableDeltaStager:
         self._layouts: OrderedDict[tuple, _Layout] = OrderedDict()
         self._zero_update: dict[torch.device, torch.Tensor] = {}
         self._update_buf: np.ndarray | None = None
+        self._update_tensor: torch.Tensor | None = None
         self.num_full = 0
         self.num_delta = 0
         self.num_reuse = 0
@@ -246,6 +248,9 @@ class BlockTableDeltaStager:
         if update_buf is None or update_buf.shape[1] != cap:
             update_buf = np.empty((2, cap), dtype=np.int32)
             self._update_buf = update_buf
+            self._update_tensor = torch.from_numpy(update_buf)
+        update_tensor = self._update_tensor
+        assert update_tensor is not None
         idx_out = update_buf[0]
         val_out = update_buf[1]
         pos = 0
@@ -254,8 +259,8 @@ class BlockTableDeltaStager:
             tuple[
                 int,
                 int,
-                np.ndarray,
-                np.ndarray,
+                bytes,
+                bytes,
                 np.ndarray,
                 np.ndarray,
                 np.ndarray,
@@ -266,7 +271,7 @@ class BlockTableDeltaStager:
         for builder, (_, bt, tnb), st in zip(
             builders, entries, layout.entries, strict=True
         ):
-            ac_key = (builder.target_block_size, builder.is_mamba_group, tnb)
+            ac_key = st.ac_key
             active_cols = active_cols_cache.get(ac_key)
             if active_cols is None:
                 active_cols = builder._active_block_table_columns(ctx, tnb)
@@ -288,12 +293,14 @@ class BlockTableDeltaStager:
                 and rewrites == st.total_rewrites
             ):
                 cur_plan: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+                nblocks_bytes = nblocks.tobytes()
+                st_nblocks_bytes = st.nblocks.tobytes()
                 if (
                     prev_plan is not None
                     and prev_plan[0] == tnb
                     and prev_plan[1] == active_cols
-                    and np.array_equal(nblocks, prev_plan[2])
-                    and np.array_equal(st.nblocks, prev_plan[3])
+                    and nblocks_bytes == prev_plan[2]
+                    and st_nblocks_bytes == prev_plan[3]
                 ):
                     cur_plan = (prev_plan[4], prev_plan[5], prev_plan[6])
                 else:
@@ -312,8 +319,8 @@ class BlockTableDeltaStager:
                         prev_plan = (
                             tnb,
                             active_cols,
-                            nblocks,
-                            st.nblocks.copy(),
+                            nblocks_bytes,
+                            st_nblocks_bytes,
                             app_rows,
                             lo,
                             row_offsets,
@@ -325,12 +332,10 @@ class BlockTableDeltaStager:
                         if pos + k > cap:
                             del self._layouts[key]
                             return None
-                        mirror = layout.mirror[
-                            st.offset : st.offset + num_reqs_padded * tnb
-                        ].reshape(num_reqs_padded, tnb)
+                        flat_idx = st.offset + row_offsets
                         new_vals = source[app_rows, lo]
-                        mirror[app_rows, lo] = new_vals
-                        idx_out[pos : pos + k] = st.offset + row_offsets
+                        layout.mirror[flat_idx] = new_vals
+                        idx_out[pos : pos + k] = flat_idx
                         val_out[pos : pos + k] = new_vals
                         pos += k
                     st.nblocks[:] = nblocks
@@ -411,7 +416,7 @@ class BlockTableDeltaStager:
         if pos:
             idx_out[pos:] = idx_out[0]
             val_out[pos:] = val_out[0]
-            update_dev = torch.from_numpy(update_buf).to(layout.dev.device)
+            update_dev = update_tensor.to(layout.dev.device)
             layout.dev = apply_block_table_delta(layout.dev, update_dev)
             layout.tables = None
             self.num_delta += 1
@@ -454,6 +459,7 @@ class BlockTableDeltaStager:
                 bt._bt_mutations,
                 bt._bt_rewrites,
                 bt,
+                ac_key,
             )
             states.append(st)
             if is_new_geom:
