@@ -49,6 +49,40 @@ class TestV2AttentionKernelsTD745:
         assert num_u.shape == (2, 4, 128)
         assert jnp.all(den_u > 0)
 
+        # 4. steps > 8 (width=64, tile=4 -> steps=16 > 8) exercises fori_loop
+        max_f, den_f, num_f = ak._attend(
+            q, pool, records_aligned, state, scale=0.5, tile=4
+        )
+        assert num_f.shape == (2, 4, 128)
+        assert jnp.all(den_f > 0)
+
+        # 5. _attend_shared_block with full == tokens and full < tokens
+        shared_records_2 = jnp.broadcast_to(records_aligned[:1], (2, 64))
+        _, den_sb2, num_sb2 = ak._attend_shared_block(
+            q, pool, shared_records_2, state, scale=0.5, block=2, tile=64
+        )
+        assert num_sb2.shape == (2, 4, 128)
+        assert jnp.all(den_sb2 > 0)
+
+        q3 = jnp.ones((3, 4, 128), dtype=jnp.bfloat16)
+        state3 = ak._attention_state(q3)
+        shared_records_3 = jnp.concatenate(
+            [shared_records_2, records_aligned[:1]], axis=0
+        )
+        _, den_sb3, num_sb3 = ak._attend_shared_block(
+            q3, pool, shared_records_3, state3, scale=0.5, block=2, tile=64
+        )
+        assert num_sb3.shape == (3, 4, 128)
+        assert jnp.all(den_sb3 > 0)
+
+        # Also exercise paged_attention_jax with block > 1 and block <= tokens
+        sink = jnp.zeros((4,), dtype=jnp.float32)
+        empty_main = jnp.zeros((2, 0), dtype=jnp.int32)
+        out_pa_blk = ak.paged_attention_jax(
+            q, pool, pool, shared_records_2, empty_main, sink, scale=0.5, block=2
+        )
+        assert out_pa_blk.shape == (2, 4, 128)
+
     def test_select_indices_jax_candidate_write_pad_and_nopad(self):
         rng = np.random.default_rng(2)
         lengths = jnp.array([20, 22], dtype=jnp.int32)
