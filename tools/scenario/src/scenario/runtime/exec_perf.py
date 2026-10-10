@@ -19,6 +19,7 @@ executor fills Refs and runs them. File names are run_benchmarks.sh's:
 .log for each warmup pass; in cells mode the cell key is its label. A
 failed warmup skips its cell's measured run. A failed cell does not stop
 the next while the server lives; a dead server stops the task (exit 5).
+The perf gate runs once the cells are done.
 """
 
 import datetime
@@ -28,7 +29,7 @@ import time
 from typing import Any
 
 from scenario.plan.types import PerfCellPlan, PerfTaskPlan
-from scenario.runtime import results
+from scenario.runtime import gate, results
 from scenario.runtime.context import ServerDied, TaskContext, TaskOutcome
 
 BENCHMARK_LOG = "benchmark.log"
@@ -127,7 +128,25 @@ class PerfRun:
             with log_path.open("a") as log:
                 log.write(_end_block(1 if failed else 0))
             ctx.summary.save()
-        return TaskOutcome("failed" if failed else "passed")
+        verdict = gate.perf_gate(
+            repo_root=ctx.cwd,
+            run_dir=ctx.run_dir,
+            gate=self.task.gate,
+            cell_results=self._labeled_results() if self.task.mode == "cells" else None,
+            experiment=ctx.experiment,
+            log=ctx.log,
+        )
+        self.entry["gate"] = verdict.to_data()
+        return TaskOutcome("failed" if failed or verdict.failed else "passed")
+
+    def _labeled_results(self) -> dict[str, dict[str, Any]]:
+        """Cells mode's results by label, for the gate."""
+        found = {}
+        for cell in self.task.cells:
+            result = last_result(pathlib.Path(self.ctx.refs.value(cell.result_file)))
+            if result is not None:
+                found[cell.key] = result
+        return found
 
     def _cell(self, cell: PerfCellPlan, outcome: dict[str, Any]) -> str | None:
         """Run one cell into `outcome`; why the task stops after it, if it does."""

@@ -25,6 +25,7 @@ show nothing until then.
 
 import collections
 import contextlib
+import io
 import os
 import pathlib
 import re
@@ -33,7 +34,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import IO
 
@@ -48,7 +49,7 @@ MAX_LINE_BYTES = 1 << 20
 PUMP_JOIN_S = 5
 
 _BREAK = re.compile(rb"\r\n|\r|\n")
-_ECHO = threading.Lock()
+_ECHO = threading.RLock()
 
 
 def echo(line: str) -> None:
@@ -56,6 +57,18 @@ def echo(line: str) -> None:
     with _ECHO:
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
+
+
+@contextlib.contextmanager
+def capture_output() -> Iterator[io.StringIO]:
+    """What this thread prints, apart from the children's output.
+
+    sys.stdout is process-wide, so the output pumps wait on the echo lock
+    while it is redirected; a child's lines come out after, not inside.
+    """
+    buffer = io.StringIO()
+    with _ECHO, contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+        yield buffer
 
 
 def exit_status(returncode: int) -> int:
