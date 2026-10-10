@@ -21,7 +21,6 @@ if [[ "${TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:-0}" == "1" ]]; then
   MAX_NUM_SEQS="${MAX_NUM_SEQS:-96}"
   KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-42949672960}"
   CONCURRENCY_OPTIONS="${CONCURRENCY_OPTIONS:-16 32 48 64 96 128 192}"
-  COMPILE_SIZES="${COMPILE_SIZES:-[4,8,16,24,32,48,64,96,2048]}"
 fi
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
 ASYNC_SCHEDULING=true
@@ -50,7 +49,13 @@ export TPU_DEEPSEEK_V41_CED="${TPU_DEEPSEEK_V41_CED:-1}"
 # 20 GiB per rank (1-bank); with DP=2 x TP=4 each TP=4 replica holds its own
 # 20 GiB pool (~83 x 100k requests/replica = ~166 total across DP=2).
 KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-21474836480}"
-COMPILE_SIZES="${COMPILE_SIZES:-[4,8,16,2048]}"
+if [[ "${MAX_NUM_SEQS}" -gt 96 || "${TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:-0}" == "1" ]]; then
+  COMPILE_SIZES="${COMPILE_SIZES:-[4,8,16,24,32,48,64,96,128,192,224,2048]}"
+elif [[ "${MAX_NUM_SEQS}" -gt 16 ]]; then
+  COMPILE_SIZES="${COMPILE_SIZES:-[4,8,16,32,48,64,96,128,192,224,2048]}"
+else
+  COMPILE_SIZES="${COMPILE_SIZES:-[4,8,16,2048]}"
+fi
 EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--no-enable-prefix-caching --enable-ep-weight-filter --safetensors-load-strategy=prefetch --safetensors-prefetch-num-threads=8 --block-size=16 --kv-cache-memory-bytes=${KV_CACHE_MEMORY_BYTES} --compilation-config={\"compile_sizes\":${COMPILE_SIZES}}"
 
 # Keep the v7x Engram gather on the runtime default path.
