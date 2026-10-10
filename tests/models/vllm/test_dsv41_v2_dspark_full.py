@@ -266,10 +266,11 @@ def test_prepare_tpu_non_causal_dspark_swa(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_ced_aux_hidden_states_propagation(monkeypatch: pytest.MonkeyPatch):
-    # Verify _scatter_decoder_rows (with padded extra index at total_rows=4)
+    # Verify _scatter_decoder_rows: kept rows (1, 3) of 4, one padded row
     src = torch.tensor([[10.0, 20.0], [30.0, 40.0], [99.0, 99.0]])
-    idx_tensor = torch.tensor([1, 3, 4], dtype=torch.int64)
-    scattered = v2_model._scatter_decoder_rows(src, idx_tensor, 4)
+    inverse = v2_model._ced_inverse_rows((1, 3), 3, 4, "cpu")
+    assert inverse.tolist() == [3, 0, 3, 1]
+    scattered = v2_model._scatter_decoder_rows(src, inverse)
     expected = torch.tensor([[0.0, 0.0], [10.0, 20.0], [0.0, 0.0], [30.0, 40.0]])
     assert torch.equal(scattered, expected)
 

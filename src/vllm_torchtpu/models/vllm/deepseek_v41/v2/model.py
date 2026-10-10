@@ -68,11 +68,27 @@ def _ced_config(
     return ced_enabled, ced_boundary
 
 
-def _scatter_decoder_rows(
-    tensor: torch.Tensor, indices: torch.Tensor, total_rows: int
+def _ced_inverse_rows(
+    indices: tuple[int, ...], padded_rows: int, total_rows: int, device
 ) -> torch.Tensor:
-    result = tensor.new_zeros((total_rows + 1, tensor.shape[-1]))
-    return result.index_copy_(0, indices, tensor)[:-1]
+    """Row map for `_scatter_decoder_rows`: output row r reads decoder row
+    ``k`` when ``indices[k] == r``, else the appended zero row ``padded_rows``."""
+    inverse = [padded_rows] * total_rows
+    for k, r in enumerate(indices):
+        inverse[r] = k
+    return torch.tensor(inverse, dtype=torch.int64, device=device)
+
+
+def _scatter_decoder_rows(tensor: torch.Tensor, inverse: torch.Tensor) -> torch.Tensor:
+    """Place decoder rows back at their positions; other rows are zero.
+
+    A gather through the inverse row map rather than ``index_copy_`` with
+    padded duplicate indices: the duplicate-write scatter lowers to a
+    SparseCore scatter that halted the chip at a 576-row decoder bucket
+    (E0200 in ``tt_jit_index_copy``).
+    """
+    padded = torch.cat([tensor, tensor.new_zeros((1, tensor.shape[-1]))])
+    return padded.index_select(0, inverse)
 
 
 def _sum_hc_terms(terms: list[torch.Tensor]) -> torch.Tensor:
@@ -562,8 +578,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         cached = getattr(self, "_ced_non_identity_cache", None)
         if cached is not None and cached[0] == cache_key:
             return cached[1]
-        # The extra output row absorbs padded scatter writes. Reusing row
-        # zero for padding would overwrite a real request's first result.
+        # Padded decoder rows replay the last position; their outputs are
+        # dropped because no output row maps to them in `inverse`.
         indices = torch.tensor(
             indices_tuple
             + (num_positions,) * (plan.padded_num_tokens - len(indices_tuple)),
@@ -571,8 +587,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             device=positions.device,
         )
         gather = indices.clamp(max=num_positions - 1)
+        inverse = _ced_inverse_rows(
+            indices_tuple, plan.padded_num_tokens, num_positions, positions.device
+        )
         bounds = torch.tensor(qsl_tuple, dtype=torch.int32, device=positions.device)
-        result = (indices, gather, bounds)
+        result = (inverse, gather, bounds)
         self._ced_non_identity_cache = (cache_key, result)
         return result
 
@@ -830,25 +849,21 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             if encoder_aux:
                 return output, list(encoder_aux)
             return output
-        total_rows = positions.shape[0]
         if isinstance(output, (list, tuple)) and len(output) == 2:
             dec_hidden, dec_aux = output
             return (
-                _scatter_decoder_rows(dec_hidden, indices, total_rows),
+                _scatter_decoder_rows(dec_hidden, indices),
                 [
                     *encoder_aux,
-                    *[
-                        _scatter_decoder_rows(aux, indices, total_rows)
-                        for aux in dec_aux
-                    ],
+                    *[_scatter_decoder_rows(aux, indices) for aux in dec_aux],
                 ],
             )
         if encoder_aux:
             return (
-                _scatter_decoder_rows(output, indices, total_rows),
+                _scatter_decoder_rows(output, indices),
                 list(encoder_aux),
             )
-        return _scatter_decoder_rows(output, indices, total_rows)
+        return _scatter_decoder_rows(output, indices)
 
     def _stage_uses_sequence_parallel(self, stage: str) -> bool:
         # Under CED=1, encoder_stage (L0..L19) runs SP while decoder_stage
