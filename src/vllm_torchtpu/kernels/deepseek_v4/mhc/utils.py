@@ -144,11 +144,16 @@ def mhc_pre_gates(
 
     comb_logits = logits[:, 2 * hc_mult :].reshape(num_tokens, hc_mult, hc_mult)
     comb_mix = jax.nn.softmax(comb_logits, axis=-1) + hc_sinkhorn_eps
-    comb_mix = comb_mix / (jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps)
+    comb_mix = comb_mix * (
+        1.0 / (jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps)
+    )
 
-    def _sinkhorn_step(_, cm):
-        cm = cm / (jnp.sum(cm, axis=-1, keepdims=True) + hc_sinkhorn_eps)
-        return cm / (jnp.sum(cm, axis=-2, keepdims=True) + hc_sinkhorn_eps)
-
-    comb_mix = jax.lax.fori_loop(0, sinkhorn_repeat - 1, _sinkhorn_step, comb_mix)
+    for _ in range(sinkhorn_repeat - 1):
+        comb_mix = comb_mix * (
+            1.0 / (jnp.sum(comb_mix, axis=-1, keepdims=True) + hc_sinkhorn_eps)
+        )
+        comb_mix = comb_mix * (
+            1.0 / (jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps)
+        )
     return pre_mix, post_mix, comb_mix
+

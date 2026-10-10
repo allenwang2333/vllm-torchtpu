@@ -141,15 +141,26 @@ def _signature(graph: fx.GraphModule) -> tuple:
     in one variant and two in another -- does not.
     """
 
-    def shape(value: Any) -> Any:
+    def shape(node: fx.Node) -> Any:
+        value = node.meta.get("example_value")
+        tag = (
+            node.target
+            if isinstance(node.target, str)
+            and node.target.lower().startswith("l_self_")
+            else None
+        )
         if not isinstance(value, torch.Tensor):
-            return type(value).__name__
+            return (tag, type(value).__name__) if tag is not None else type(value).__name__
         dims = tuple(
             "?" if isinstance(d, torch.SymInt) else int(d) for d in value.shape
         )
-        return (str(value.dtype), dims)
+        return (tag, str(value.dtype), dims) if tag is not None else (str(value.dtype), dims)
 
-    return tuple(shape(value) for value in _placeholder_values(graph))
+    return tuple(
+        shape(node)
+        for node in graph.graph.nodes
+        if node.op == "placeholder"
+    )
 
 
 def graph_signature(graph: fx.GraphModule) -> tuple:
@@ -167,6 +178,19 @@ def graph_signature(graph: fx.GraphModule) -> tuple:
 # ---------------------------------------------------------------------------
 
 
+def _placeholder_keys(graph: fx.GraphModule) -> tuple:
+    keys = []
+    for node in graph.graph.nodes:
+        if node.op != "placeholder":
+            continue
+        value = node.meta.get("example_value")
+        if isinstance(value, torch.Tensor):
+            keys.append((str(node.target), str(value.dtype), int(value.ndim)))
+        else:
+            keys.append((str(node.target), type(value).__name__, -1))
+    return tuple(keys)
+
+
 class BucketExecutables:
     """What earlier traces of the model being warmed up already compiled.
 
@@ -178,7 +202,9 @@ class BucketExecutables:
     """
 
     def __init__(self) -> None:
-        self._runnables: dict[tuple[str, str], tuple[Callable[..., Any], tuple]] = {}
+        self._runnables: dict[
+            tuple[str, str], tuple[Callable[..., Any], tuple, tuple]
+        ] = {}
         self.refused: set[int] = set()
         self.traces = 0
 
@@ -188,16 +214,34 @@ class BucketExecutables:
         found = self._runnables.get((cache_dir, key))
         if found is None:
             return None
-        runnable, signature = found
-        if signature != _signature(graph):
-            raise ShapeSpecializationError(
-                f"{key} was compiled by another trace of this model whose "
-                f"inputs differ ({signature} vs {_signature(graph)}). The "
-                "graph is split, so its subgraph boundaries move with the "
-                "specialization and a bucket cannot be handed between traces; "
-                "unset TPU_KERNEL_ITER_MODE to serve this model."
+        runnable, signature, keys = found
+        caller_sig = _signature(graph)
+        if signature == caller_sig:
+            return runnable
+        caller_keys = _placeholder_keys(graph)
+        if (
+            len(keys) == len(caller_keys)
+            and len(set(keys)) == len(keys)
+            and set(keys) == set(caller_keys)
+        ):
+            pos_in_caller = {item: idx for idx, item in enumerate(caller_keys)}
+            perm = tuple(pos_in_caller[item] for item in keys)
+            n_swapped = sum(1 for i, p in enumerate(perm) if i != p)
+            logger.info(
+                "[shape-variants] %s remapping %d/%d permuted placeholder inputs to match earlier trace",
+                key,
+                n_swapped,
+                len(perm),
             )
-        return runnable
+            orig_runnable = runnable
+            return lambda *args: orig_runnable(*(args[i] for i in perm))
+        logger.info(
+            "[shape-variants] %s live placeholder set differs across traces (%d vs %d); compiling natively for active trace",
+            key,
+            len(keys),
+            len(caller_keys),
+        )
+        return None
 
     def put(
         self,
@@ -206,7 +250,11 @@ class BucketExecutables:
         graph: fx.GraphModule,
         runnable: Callable[..., Any],
     ) -> None:
-        self._runnables[(cache_dir, key)] = (runnable, _signature(graph))
+        self._runnables[(cache_dir, key)] = (
+            runnable,
+            _signature(graph),
+            _placeholder_keys(graph),
+        )
 
     def needs_retrace(self, size: int) -> bool:
         """Whether a graph refused this bucket and no trace has built it yet.

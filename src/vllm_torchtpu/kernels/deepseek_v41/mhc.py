@@ -63,8 +63,28 @@ def _v41_in_kernel_gates(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    exact_div: bool = False,
 ) -> None:
     """In-kernel mhc_pre_gates (sigmoid + softmax + Sinkhorn-Knopp) for hc_mult=4."""
+    if exact_div:
+        next_pre, post_3d, comb_3d = utils.mhc_pre_gates(
+            acc,
+            sqr,
+            hc_mult,
+            hidden_size,
+            scale_ref[...],
+            hb_ref[...],
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+        tb = acc.shape[0]
+        pre_out_ref[...] = next_pre.reshape(tb, hc_mult)
+        post_out_ref[...] = post_3d.reshape(tb, hc_mult)
+        comb_out_ref[...] = comb_3d.reshape(tb, hc_mult * hc_mult)
+        return
     mixes = acc * jax.lax.rsqrt(sqr / (hc_mult * hidden_size) + rms_eps)
     logits = mixes * scale_ref[...] + hb_ref[...]
 
@@ -99,10 +119,14 @@ def _v41_in_kernel_gates(
             c1 = v + _lane_gather(v, col_swap1)
             return c1 + _lane_gather(c1, col_swap2)
 
-        comb_mix = comb_mix / (_col_sum(comb_mix) + hc_sinkhorn_eps)
+        comb_mix = comb_mix * jax.lax.reciprocal(_col_sum(comb_mix) + hc_sinkhorn_eps)
         for _ in range(sinkhorn_repeat - 1):
-            comb_mix = comb_mix / (_row_sum(comb_mix) + hc_sinkhorn_eps)
-            comb_mix = comb_mix / (_col_sum(comb_mix) + hc_sinkhorn_eps)
+            comb_mix = comb_mix * jax.lax.reciprocal(
+                _row_sum(comb_mix) + hc_sinkhorn_eps
+            )
+            comb_mix = comb_mix * jax.lax.reciprocal(
+                _col_sum(comb_mix) + hc_sinkhorn_eps
+            )
 
         comb_out_ref[...] = comb_mix
         return
@@ -123,30 +147,37 @@ def _v41_in_kernel_gates(
     e2 = jnp.exp(c2 - m) * mask4
     e3 = jnp.exp(c3 - m) * mask4
     rs = (e0 + e1) + (e2 + e3)
-    inv_rs = jnp.where(mask4 > 0, 1.0 / rs, 0.0)
+    inv_rs = jnp.where(mask4 > 0, jax.lax.reciprocal(rs), 0.0)
     eps_v = hc_sinkhorn_eps * mask4
     c0 = e0 * inv_rs + eps_v
     c1 = e1 * inv_rs + eps_v
     c2 = e2 * inv_rs + eps_v
     c3 = e3 * inv_rs + eps_v
 
-    c0 = c0 / (jnp.sum(c0, axis=0, keepdims=True) + hc_sinkhorn_eps)
-    c1 = c1 / (jnp.sum(c1, axis=0, keepdims=True) + hc_sinkhorn_eps)
-    c2 = c2 / (jnp.sum(c2, axis=0, keepdims=True) + hc_sinkhorn_eps)
-    c3 = c3 / (jnp.sum(c3, axis=0, keepdims=True) + hc_sinkhorn_eps)
+    c0 = c0 * jax.lax.reciprocal(jnp.sum(c0, axis=0, keepdims=True) + hc_sinkhorn_eps)
+    c1 = c1 * jax.lax.reciprocal(jnp.sum(c1, axis=0, keepdims=True) + hc_sinkhorn_eps)
+    c2 = c2 * jax.lax.reciprocal(jnp.sum(c2, axis=0, keepdims=True) + hc_sinkhorn_eps)
+    c3 = c3 * jax.lax.reciprocal(jnp.sum(c3, axis=0, keepdims=True) + hc_sinkhorn_eps)
 
     for _ in range(sinkhorn_repeat - 1):
-        rs = ((c0 + c1) + (c2 + c3)) + hc_sinkhorn_eps
-        inv_rs = 1.0 / rs
+        inv_rs = jax.lax.reciprocal(((c0 + c1) + (c2 + c3)) + hc_sinkhorn_eps)
         c0 = c0 * inv_rs
         c1 = c1 * inv_rs
         c2 = c2 * inv_rs
         c3 = c3 * inv_rs
 
-        c0 = c0 / (jnp.sum(c0, axis=0, keepdims=True) + hc_sinkhorn_eps)
-        c1 = c1 / (jnp.sum(c1, axis=0, keepdims=True) + hc_sinkhorn_eps)
-        c2 = c2 / (jnp.sum(c2, axis=0, keepdims=True) + hc_sinkhorn_eps)
-        c3 = c3 / (jnp.sum(c3, axis=0, keepdims=True) + hc_sinkhorn_eps)
+        c0 = c0 * jax.lax.reciprocal(
+            jnp.sum(c0, axis=0, keepdims=True) + hc_sinkhorn_eps
+        )
+        c1 = c1 * jax.lax.reciprocal(
+            jnp.sum(c1, axis=0, keepdims=True) + hc_sinkhorn_eps
+        )
+        c2 = c2 * jax.lax.reciprocal(
+            jnp.sum(c2, axis=0, keepdims=True) + hc_sinkhorn_eps
+        )
+        c3 = c3 * jax.lax.reciprocal(
+            jnp.sum(c3, axis=0, keepdims=True) + hc_sinkhorn_eps
+        )
 
     out32 = jnp.transpose(jnp.concatenate([c0, c1, c2, c3], axis=0))
     perm_out = (idx16 & 3) * 8 + (idx16 >> 2)
@@ -174,21 +205,32 @@ def _v41_pre_kernel(
     sinkhorn_repeat: int,
     use_stream0: bool,
 ):
-    """mhc_pre: 1-pass packed mix GEMM + sqrsum + in-kernel Sinkhorn gates + RMSNorm."""
+    """mhc_pre: 1-pass packed mix GEMM + strip-tiled sqrsum + in-kernel Sinkhorn gates + RMSNorm."""
     mix_hc = hc_mult * (hc_mult + 2)
     x = res_ref[...]
     acc = _packed_mixes(x, fn_72_ref, mix_hc)
     pre_in = None if use_stream0 else pre_in_ref[...]
+    dh = 1280 if hidden_size % 1280 == 0 else hidden_size
+    num_strips = hidden_size // dh
     sqr = None
-    collapsed_f32 = None
-    for j in range(hc_mult):
-        xj_f32 = x[:, j * hidden_size : (j + 1) * hidden_size].astype(jnp.float32)
-        sj = jnp.sum(xj_f32 * xj_f32, axis=-1, keepdims=True)
-        sqr = sj if sqr is None else sqr + sj
-        if not use_stream0:
-            assert pre_in is not None
-            term = pre_in[:, j : j + 1] * xj_f32
-            collapsed_f32 = term if collapsed_f32 is None else collapsed_f32 + term
+    for s in range(num_strips):
+        s_lo = s * dh
+        s_hi = s_lo + dh
+        col_strip = None
+        for j in range(hc_mult):
+            lo = j * hidden_size + s_lo
+            xj_f32 = x[:, lo : lo + dh].astype(jnp.float32)
+            sj = jnp.sum(xj_f32 * xj_f32, axis=-1, keepdims=True)
+            sqr = sj if sqr is None else sqr + sj
+            if not use_stream0:
+                assert pre_in is not None
+                term = pre_in[:, j : j + 1] * xj_f32
+                col_strip = term if col_strip is None else col_strip + term
+        if use_stream0:
+            normed_ref[:, s_lo:s_hi] = x[:, s_lo:s_hi]
+        else:
+            assert col_strip is not None
+            normed_ref[:, s_lo:s_hi] = col_strip.astype(jnp.bfloat16)
 
     assert sqr is not None
     _v41_in_kernel_gates(
@@ -207,13 +249,7 @@ def _v41_pre_kernel(
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
     )
-
-    if use_stream0:
-        collapsed_bf16 = x[:, :hidden_size]
-    else:
-        assert collapsed_f32 is not None
-        collapsed_bf16 = collapsed_f32.astype(jnp.bfloat16)
-    _rms_norm_to_ref(collapsed_bf16, nw_ref, normed_ref, rms_eps)
+    _rms_norm_to_ref(normed_ref[...], nw_ref, normed_ref, rms_eps)
 
 
 def _v41_pre_mixes_kernel(
@@ -230,33 +266,39 @@ def _v41_pre_mixes_kernel(
     rms_eps: float,
     use_stream0: bool,
 ):
-    """mhc_pre (multi-block): 1-pass packed mix GEMM + sqrsum + RMSNorm."""
+    """mhc_pre (multi-block): 1-pass packed mix GEMM + strip-tiled sqrsum + RMSNorm."""
     mix_hc = hc_mult * (hc_mult + 2)
     x = res_ref[...]
     mixes_ref[...] = _packed_mixes(x, fn_72_ref, mix_hc)
     pre_in = None if use_stream0 else pre_in_ref[...]
+    dh = 1280 if hidden_size % 1280 == 0 else hidden_size
+    num_strips = hidden_size // dh
     sqr = None
-    collapsed_f32 = None
-    for j in range(hc_mult):
-        xj_f32 = x[:, j * hidden_size : (j + 1) * hidden_size].astype(jnp.float32)
-        sj = jnp.sum(xj_f32 * xj_f32, axis=-1, keepdims=True)
-        sqr = sj if sqr is None else sqr + sj
-        if not use_stream0:
-            assert pre_in is not None
-            term = pre_in[:, j : j + 1] * xj_f32
-            collapsed_f32 = term if collapsed_f32 is None else collapsed_f32 + term
+    for s in range(num_strips):
+        s_lo = s * dh
+        s_hi = s_lo + dh
+        col_strip = None
+        for j in range(hc_mult):
+            lo = j * hidden_size + s_lo
+            xj_f32 = x[:, lo : lo + dh].astype(jnp.float32)
+            sj = jnp.sum(xj_f32 * xj_f32, axis=-1, keepdims=True)
+            sqr = sj if sqr is None else sqr + sj
+            if not use_stream0:
+                assert pre_in is not None
+                term = pre_in[:, j : j + 1] * xj_f32
+                col_strip = term if col_strip is None else col_strip + term
+        if use_stream0:
+            normed_ref[:, s_lo:s_hi] = x[:, s_lo:s_hi]
+        else:
+            assert col_strip is not None
+            normed_ref[:, s_lo:s_hi] = col_strip.astype(jnp.bfloat16)
 
     assert sqr is not None
     sqr_ref[...] = sqr
-    if use_stream0:
-        collapsed_bf16 = x[:, :hidden_size]
-    else:
-        assert collapsed_f32 is not None
-        collapsed_bf16 = collapsed_f32.astype(jnp.bfloat16)
-    _rms_norm_to_ref(collapsed_bf16, nw_ref, normed_ref, rms_eps)
+    _rms_norm_to_ref(normed_ref[...], nw_ref, normed_ref, rms_eps)
 
 
-def _v41_fused_post_pre_1strip_kernel(
+def _v41_fused_post_pre_1strip_body(
     x_ref,
     res_ref,
     post_ref,
@@ -277,37 +319,56 @@ def _v41_fused_post_pre_1strip_kernel(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    write_bf16: bool = True,
 ):
-    """Seam kernel (num_tokens <= 64): 1-pass packed GEMM + in-kernel Sinkhorn."""
+    """Seam kernel (num_tokens <= 192): 1-pass packed GEMM + in-kernel Sinkhorn."""
     post = post_ref[...]
     comb = comb_ref[...]
     pre_in = pre_in_ref[...]
     hidden_size = x_ref.shape[1]
     hc_mult = post.shape[1]
     mix_hc = hc_mult * (hc_mult + 2)
-    x_bf = x_ref[...]
-    old_bf = [
-        res_ref[:, i * hidden_size : (i + 1) * hidden_size] for i in range(hc_mult)
+    x_f32 = x_ref[...].astype(jnp.float32)
+    old_f32 = [
+        res_ref[:, i * hidden_size : (i + 1) * hidden_size].astype(jnp.float32)
+        for i in range(hc_mult)
     ]
 
     streams_bf = []
     collapsed_f32 = None
     sqr = None
+    strip_exact = x_ref.shape[0] > 16 and hidden_size % 1280 == 0
+    dh = 1280 if strip_exact else hidden_size
+    num_strips = hidden_size // dh
+    nfs = []
     for j in range(hc_mult):
-        acc = post[:, j : j + 1] * x_bf.astype(jnp.float32)
+        acc = post[:, j : j + 1] * x_f32
         for i in range(hc_mult):
             k = i * hc_mult + j
-            acc = acc + comb[:, k : k + 1] * old_bf[i].astype(jnp.float32)
+            acc = acc + comb[:, k : k + 1] * old_f32[i]
         new_bf = acc.astype(jnp.bfloat16)
-        newres_ref[:, j * hidden_size : (j + 1) * hidden_size] = new_bf
         streams_bf.append(new_bf)
         nf = new_bf.astype(jnp.float32)
-        sj = jnp.sum(nf * nf, axis=-1, keepdims=True)
-        sqr = sj if sqr is None else sqr + sj
+        nfs.append(nf)
+        if not strip_exact:
+            sj = jnp.sum(nf * nf, axis=-1, keepdims=True)
+            sqr = sj if sqr is None else sqr + sj
         term = pre_in[:, j : j + 1] * nf
         collapsed_f32 = term if collapsed_f32 is None else collapsed_f32 + term
 
+    if strip_exact:
+        for s in range(num_strips):
+            s_lo, s_hi = s * dh, (s + 1) * dh
+            for j in range(hc_mult):
+                sj = jnp.sum(
+                    nfs[j][:, s_lo:s_hi] * nfs[j][:, s_lo:s_hi],
+                    axis=-1,
+                    keepdims=True,
+                )
+                sqr = sj if sqr is None else sqr + sj
+
     g_bf = jnp.concatenate(streams_bf, axis=1)
+    newres_ref[...] = g_bf
     acc = _packed_mixes(g_bf, fn_72_ref, mix_hc)
     assert sqr is not None
     _v41_in_kernel_gates(
@@ -327,7 +388,25 @@ def _v41_fused_post_pre_1strip_kernel(
         sinkhorn_repeat=sinkhorn_repeat,
     )
     assert collapsed_f32 is not None
-    _rms_norm_to_ref(collapsed_f32.astype(jnp.bfloat16), nw_ref, normed_ref, rms_eps)
+    cf32 = collapsed_f32.astype(jnp.bfloat16).astype(jnp.float32)
+    if strip_exact:
+        ns = None
+        for s in range(num_strips):
+            p = jnp.sum(
+                cf32[:, s * dh : (s + 1) * dh] ** 2, axis=-1, keepdims=True
+            )
+            ns = p if ns is None else ns + p
+        rstd = jax.lax.rsqrt(ns / hidden_size + rms_eps)
+    else:
+        rstd = jax.lax.rsqrt(jnp.mean(cf32 * cf32, axis=-1, keepdims=True) + rms_eps)
+    val_bf16 = (cf32 * rstd).astype(jnp.bfloat16) * nw_ref[...]
+    if write_bf16:
+        normed_ref[...] = val_bf16
+    return val_bf16
+
+
+def _v41_fused_post_pre_1strip_kernel(*args, **kwargs):
+    _v41_fused_post_pre_1strip_body(*args, **kwargs)
 
 
 def _v41_fused_post_pre_kernel(
@@ -362,7 +441,6 @@ def _v41_fused_post_pre_kernel(
     dh = 1280 if hidden_size % 1280 == 0 else hidden_size
     num_strips = hidden_size // dh
 
-    parts_acc = None
     sqr_acc = None
     norm_sqr_acc = None
     for s in range(num_strips):
@@ -383,13 +461,6 @@ def _v41_fused_post_pre_kernel(
             hi = lo + dh
             new_bf = accs[j].astype(jnp.bfloat16)
             newres_ref[:, lo:hi] = new_bf
-            p_js = jax.lax.dot_general(
-                new_bf,
-                fn_72_ref[:, lo:hi],
-                (((1,), (1,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
-            parts_acc = p_js if parts_acc is None else parts_acc + p_js
             nf = new_bf.astype(jnp.float32)
             sj = jnp.sum(nf * nf, axis=-1, keepdims=True)
             sqr_acc = sj if sqr_acc is None else sqr_acc + sj
@@ -402,12 +473,8 @@ def _v41_fused_post_pre_kernel(
         ns = jnp.sum(cf32 * cf32, axis=-1, keepdims=True)
         norm_sqr_acc = ns if norm_sqr_acc is None else norm_sqr_acc + ns
 
-    assert parts_acc is not None and sqr_acc is not None and norm_sqr_acc is not None
-    acc = (
-        parts_acc[:, :mix_hc]
-        + parts_acc[:, mix_hc : 2 * mix_hc]
-        + parts_acc[:, 2 * mix_hc : 3 * mix_hc]
-    )
+    assert sqr_acc is not None and norm_sqr_acc is not None
+    acc = _packed_mixes(newres_ref[...], fn_72_ref, mix_hc)
     _v41_in_kernel_gates(
         acc,
         sqr_acc,
@@ -449,7 +516,7 @@ def _v41_fused_post_pre_mixes_kernel(
     *,
     rms_eps: float,
 ):
-    """Seam kernel (multi-block): strip-tiled recombine + overlapped packed mix GEMM + RMSNorm."""
+    """Seam kernel (multi-block): full-width contiguous VPU recombine + packed mix GEMM + RMSNorm."""
     post = post_ref[...]
     comb = comb_ref[...]
     pre_in = pre_in_ref[...]
@@ -459,61 +526,49 @@ def _v41_fused_post_pre_mixes_kernel(
     dh = 1280 if hidden_size % 1280 == 0 else hidden_size
     num_strips = hidden_size // dh
 
-    parts_acc = None
+    x_f32 = x_ref[...].astype(jnp.float32)
+    old_f32 = [
+        res_ref[:, i * hidden_size : (i + 1) * hidden_size].astype(jnp.float32)
+        for i in range(hc_mult)
+    ]
+    streams_bf = []
+    nfs = []
+    collapsed_f32 = None
+    for j in range(hc_mult):
+        acc = post[:, j : j + 1] * x_f32
+        for i in range(hc_mult):
+            k = i * hc_mult + j
+            acc = acc + comb[:, k : k + 1] * old_f32[i]
+        new_bf = acc.astype(jnp.bfloat16)
+        streams_bf.append(new_bf)
+        nf = new_bf.astype(jnp.float32)
+        nfs.append(nf)
+        term = pre_in[:, j : j + 1] * nf
+        collapsed_f32 = term if collapsed_f32 is None else collapsed_f32 + term
+
+    assert collapsed_f32 is not None
+    cf32 = collapsed_f32.astype(jnp.bfloat16).astype(jnp.float32)
     sqr_acc = None
     norm_sqr_acc = None
     for s in range(num_strips):
-        s_lo = s * dh
-        s_hi = s_lo + dh
-        x_f32 = x_ref[:, s_lo:s_hi].astype(jnp.float32)
-        accs = [post[:, j : j + 1] * x_f32 for j in range(hc_mult)]
-        for i in range(hc_mult):
-            old_i = res_ref[
-                :, i * hidden_size + s_lo : i * hidden_size + s_hi
-            ].astype(jnp.float32)
-            for j in range(hc_mult):
-                k = i * hc_mult + j
-                accs[j] = accs[j] + comb[:, k : k + 1] * old_i
-        col_strip = None
+        s_lo, s_hi = s * dh, (s + 1) * dh
         for j in range(hc_mult):
-            lo = j * hidden_size + s_lo
-            hi = lo + dh
-            new_bf = accs[j].astype(jnp.bfloat16)
-            newres_ref[:, lo:hi] = new_bf
-            p_js = jax.lax.dot_general(
-                new_bf,
-                fn_72_ref[:, lo:hi],
-                (((1,), (1,)), ((), ())),
-                preferred_element_type=jnp.float32,
+            sj = jnp.sum(
+                nfs[j][:, s_lo:s_hi] * nfs[j][:, s_lo:s_hi],
+                axis=-1,
+                keepdims=True,
             )
-            parts_acc = p_js if parts_acc is None else parts_acc + p_js
-            nf = new_bf.astype(jnp.float32)
-            sj = jnp.sum(nf * nf, axis=-1, keepdims=True)
             sqr_acc = sj if sqr_acc is None else sqr_acc + sj
-            term = pre_in[:, j : j + 1] * nf
-            col_strip = term if col_strip is None else col_strip + term
-        assert col_strip is not None
-        col_bf = col_strip.astype(jnp.bfloat16)
-        normed_ref[:, s_lo:s_hi] = col_bf
-        cf32 = col_bf.astype(jnp.float32)
-        ns = jnp.sum(cf32 * cf32, axis=-1, keepdims=True)
+        ns = jnp.sum(cf32[:, s_lo:s_hi] ** 2, axis=-1, keepdims=True)
         norm_sqr_acc = ns if norm_sqr_acc is None else norm_sqr_acc + ns
 
-    assert parts_acc is not None and sqr_acc is not None and norm_sqr_acc is not None
-    mixes_ref[...] = (
-        parts_acc[:, :mix_hc]
-        + parts_acc[:, mix_hc : 2 * mix_hc]
-        + parts_acc[:, 2 * mix_hc : 3 * mix_hc]
-    )
+    assert sqr_acc is not None and norm_sqr_acc is not None
+    g_bf = jnp.concatenate(streams_bf, axis=1)
+    newres_ref[...] = g_bf
+    mixes_ref[...] = _packed_mixes(g_bf, fn_72_ref, mix_hc)
     sqr_ref[...] = sqr_acc
     rstd = jax.lax.rsqrt(norm_sqr_acc / hidden_size + rms_eps)
-    for s in range(num_strips):
-        s_lo = s * dh
-        s_hi = s_lo + dh
-        cf32_s = normed_ref[:, s_lo:s_hi].astype(jnp.float32)
-        normed_ref[:, s_lo:s_hi] = (
-            cf32_s * rstd
-        ).astype(jnp.bfloat16) * nw_ref[:, s_lo:s_hi]
+    normed_ref[...] = (cf32 * rstd).astype(jnp.bfloat16) * nw_ref[...]
 
 
 def _v41_mhc_pallas_call(
@@ -530,12 +585,15 @@ def _v41_mhc_pallas_call(
 ) -> tuple[jax.Array, ...]:
     """Run a V4.1 mHC kernel over token blocks with resident weights in VMEM."""
     num_tokens = token_inputs[0].shape[0]
-    max_tb = (
-        max(utils.SUBLANE, math.gcd(num_tokens, max_token_block))
-        if num_tokens % utils.SUBLANE == 0
-        else max_token_block
-    )
-    tb, padded_tokens = utils.select_token_block(num_tokens, max_tb)
+    has_fp8_out = any(dt == jnp.float8_e4m3fn for _, dt in out_widths_dtypes)
+    sublane = 32 if has_fp8_out else utils.SUBLANE
+    if num_tokens <= 64:
+        tb, padded_tokens = utils.select_token_block(num_tokens, 64)
+    else:
+        padded_tokens = ((num_tokens + sublane - 1) // sublane) * sublane
+        tb = min(max_token_block, padded_tokens)
+        while tb > sublane and padded_tokens % tb != 0:
+            tb -= sublane
     token_inputs = utils.pad_to(padded_tokens, *token_inputs)
     nw_2d = norm_weight.reshape(1, -1).astype(jnp.bfloat16)
 
@@ -575,7 +633,16 @@ def _v41_mhc_pallas_call(
             pl.BlockSpec((1, mix_hc), lambda i: (0, 0)),
         )
 
-    buf_mode = pl.Buffered(buffer_count=2)
+    buf_mode = pl.Buffered(buffer_count=1 if padded_tokens == tb else 2)
+    aliases = (
+        {1: 0}
+        if (
+            padded_tokens > num_tokens
+            and len(token_inputs) >= 2
+            and out_widths_dtypes[0][0] == token_inputs[1].shape[1]
+        )
+        else {}
+    )
     outs = pl.pallas_call(
         kernel,
         grid=(padded_tokens // tb,),
@@ -595,6 +662,7 @@ def _v41_mhc_pallas_call(
         out_shape=[
             jax.ShapeDtypeStruct((padded_tokens, w), dt) for w, dt in out_widths_dtypes
         ],
+        input_output_aliases=aliases,
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",),
             vmem_limit_bytes=utils.DEFAULT_VMEM_LIMIT_BYTES,
@@ -715,7 +783,7 @@ def mhc_fused_post_pre_v41(
     if num_tokens <= 256:
         seam_fn = (
             _v41_fused_post_pre_1strip_kernel
-            if num_tokens <= 16
+            if num_tokens <= 192
             else _v41_fused_post_pre_kernel
         )
         new_res2d, post_mix, comb_mix, normed, next_pre_mix = _v41_mhc_pallas_call(
@@ -746,7 +814,7 @@ def mhc_fused_post_pre_v41(
                 (hidden_size, jnp.bfloat16),
                 (hc_mult, jnp.float32),
             ),
-            max_token_block=64 if num_tokens <= 16 else 256,
+            max_token_block=192 if num_tokens <= 192 else 128,
         )
     else:
         mix_hc = hc_mult * (hc_mult + 2)
@@ -811,8 +879,9 @@ def _rms_norm_quant_to_refs(
     scale = abs_max / _FP8_E4M3_MAX
     scale = jnp.where(scale == 0, 1.0, scale)
     normed_scale_ref[...] = scale
+    inv_scale = 1.0 / scale
     normed_fp8_ref[...] = jnp.clip(
-        val_f32 / scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX
+        val_f32 * inv_scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX
     ).astype(jnp.float8_e4m3fn)
 
 
@@ -839,21 +908,32 @@ def _v41_pre_quant_kernel(
     sinkhorn_repeat: int,
     use_stream0: bool,
 ):
-    """mhc_pre + in-VMEM dynamic FP8 activation quantization."""
+    """mhc_pre + strip-tiled sqrsum + in-VMEM dynamic FP8 activation quantization."""
     mix_hc = hc_mult * (hc_mult + 2)
     x = res_ref[...]
     acc = _packed_mixes(x, fn_72_ref, mix_hc)
     pre_in = None if use_stream0 else pre_in_ref[...]
+    dh = 1280 if hidden_size % 1280 == 0 else hidden_size
+    num_strips = hidden_size // dh
     sqr = None
-    collapsed_f32 = None
-    for j in range(hc_mult):
-        xj_f32 = x[:, j * hidden_size : (j + 1) * hidden_size].astype(jnp.float32)
-        sj = jnp.sum(xj_f32 * xj_f32, axis=-1, keepdims=True)
-        sqr = sj if sqr is None else sqr + sj
-        if not use_stream0:
-            assert pre_in is not None
-            term = pre_in[:, j : j + 1] * xj_f32
-            collapsed_f32 = term if collapsed_f32 is None else collapsed_f32 + term
+    for s in range(num_strips):
+        s_lo = s * dh
+        s_hi = s_lo + dh
+        col_strip = None
+        for j in range(hc_mult):
+            lo = j * hidden_size + s_lo
+            xj_f32 = x[:, lo : lo + dh].astype(jnp.float32)
+            sj = jnp.sum(xj_f32 * xj_f32, axis=-1, keepdims=True)
+            sqr = sj if sqr is None else sqr + sj
+            if not use_stream0:
+                assert pre_in is not None
+                term = pre_in[:, j : j + 1] * xj_f32
+                col_strip = term if col_strip is None else col_strip + term
+        if use_stream0:
+            normed_ref[:, s_lo:s_hi] = x[:, s_lo:s_hi]
+        else:
+            assert col_strip is not None
+            normed_ref[:, s_lo:s_hi] = col_strip.astype(jnp.bfloat16)
 
     assert sqr is not None
     _v41_in_kernel_gates(
@@ -872,14 +952,8 @@ def _v41_pre_quant_kernel(
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
     )
-
-    if use_stream0:
-        collapsed_bf16 = x[:, :hidden_size]
-    else:
-        assert collapsed_f32 is not None
-        collapsed_bf16 = collapsed_f32.astype(jnp.bfloat16)
     _rms_norm_quant_to_refs(
-        collapsed_bf16, nw_ref, normed_ref, normed_fp8_ref, normed_scale_ref, rms_eps
+        normed_ref[...], nw_ref, normed_ref, normed_fp8_ref, normed_scale_ref, rms_eps
     )
 
 
@@ -899,31 +973,37 @@ def _v41_pre_quant_mixes_kernel(
     rms_eps: float,
     use_stream0: bool,
 ):
-    """mhc_pre (multi-block) + in-VMEM dynamic FP8 activation quantization."""
+    """mhc_pre (multi-block) + strip-tiled sqrsum + in-VMEM dynamic FP8 activation quantization."""
     mix_hc = hc_mult * (hc_mult + 2)
     x = res_ref[...]
     mixes_ref[...] = _packed_mixes(x, fn_72_ref, mix_hc)
     pre_in = None if use_stream0 else pre_in_ref[...]
+    dh = 1280 if hidden_size % 1280 == 0 else hidden_size
+    num_strips = hidden_size // dh
     sqr = None
-    collapsed_f32 = None
-    for j in range(hc_mult):
-        xj_f32 = x[:, j * hidden_size : (j + 1) * hidden_size].astype(jnp.float32)
-        sj = jnp.sum(xj_f32 * xj_f32, axis=-1, keepdims=True)
-        sqr = sj if sqr is None else sqr + sj
-        if not use_stream0:
-            assert pre_in is not None
-            term = pre_in[:, j : j + 1] * xj_f32
-            collapsed_f32 = term if collapsed_f32 is None else collapsed_f32 + term
+    for s in range(num_strips):
+        s_lo = s * dh
+        s_hi = s_lo + dh
+        col_strip = None
+        for j in range(hc_mult):
+            lo = j * hidden_size + s_lo
+            xj_f32 = x[:, lo : lo + dh].astype(jnp.float32)
+            sj = jnp.sum(xj_f32 * xj_f32, axis=-1, keepdims=True)
+            sqr = sj if sqr is None else sqr + sj
+            if not use_stream0:
+                assert pre_in is not None
+                term = pre_in[:, j : j + 1] * xj_f32
+                col_strip = term if col_strip is None else col_strip + term
+        if use_stream0:
+            normed_ref[:, s_lo:s_hi] = x[:, s_lo:s_hi]
+        else:
+            assert col_strip is not None
+            normed_ref[:, s_lo:s_hi] = col_strip.astype(jnp.bfloat16)
 
     assert sqr is not None
     sqr_ref[...] = sqr
-    if use_stream0:
-        collapsed_bf16 = x[:, :hidden_size]
-    else:
-        assert collapsed_f32 is not None
-        collapsed_bf16 = collapsed_f32.astype(jnp.bfloat16)
     _rms_norm_quant_to_refs(
-        collapsed_bf16, nw_ref, normed_ref, normed_fp8_ref, normed_scale_ref, rms_eps
+        normed_ref[...], nw_ref, normed_ref, normed_fp8_ref, normed_scale_ref, rms_eps
     )
 
 
@@ -961,10 +1041,10 @@ def _v41_fused_post_pre_quant_kernel(
     dh = 1280 if hidden_size % 1280 == 0 else hidden_size
     num_strips = hidden_size // dh
 
-    parts_acc = None
     sqr_acc = None
     norm_sqr_acc = None
-    stage_vmem = x_ref.shape[0] > 16
+    write_bf16 = normed_ref.shape[1] == hidden_size
+    stage_vmem = write_bf16 and x_ref.shape[0] > 16
     cf32_strips = []
     for s in range(num_strips):
         s_lo = s * dh
@@ -984,13 +1064,6 @@ def _v41_fused_post_pre_quant_kernel(
             hi = lo + dh
             new_bf = accs[j].astype(jnp.bfloat16)
             newres_ref[:, lo:hi] = new_bf
-            p_js = jax.lax.dot_general(
-                new_bf,
-                fn_72_ref[:, lo:hi],
-                (((1,), (1,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
-            parts_acc = p_js if parts_acc is None else parts_acc + p_js
             nf = new_bf.astype(jnp.float32)
             sj = jnp.sum(nf * nf, axis=-1, keepdims=True)
             sqr_acc = sj if sqr_acc is None else sqr_acc + sj
@@ -1006,12 +1079,8 @@ def _v41_fused_post_pre_quant_kernel(
         ns = jnp.sum(cf32 * cf32, axis=-1, keepdims=True)
         norm_sqr_acc = ns if norm_sqr_acc is None else norm_sqr_acc + ns
 
-    assert parts_acc is not None and sqr_acc is not None and norm_sqr_acc is not None
-    acc = (
-        parts_acc[:, :mix_hc]
-        + parts_acc[:, mix_hc : 2 * mix_hc]
-        + parts_acc[:, 2 * mix_hc : 3 * mix_hc]
-    )
+    assert sqr_acc is not None and norm_sqr_acc is not None
+    acc = _packed_mixes(newres_ref[...], fn_72_ref, mix_hc)
     _v41_in_kernel_gates(
         acc,
         sqr_acc,
@@ -1042,10 +1111,10 @@ def _v41_fused_post_pre_quant_kernel(
         val_bf16 = (
             cf32_s * rstd
         ).astype(jnp.bfloat16) * nw_ref[:, s_lo:s_hi]
-        normed_ref[:, s_lo:s_hi] = val_bf16
+        if write_bf16:
+            normed_ref[:, s_lo:s_hi] = val_bf16
         val_f32 = val_bf16.astype(jnp.float32)
-        if not stage_vmem:
-            val_strips.append(val_f32)
+        val_strips.append(val_f32)
         s_abs = jnp.max(jnp.abs(val_f32), axis=-1, keepdims=True)
         abs_max_acc = (
             s_abs if abs_max_acc is None else jnp.maximum(abs_max_acc, s_abs)
@@ -1054,16 +1123,12 @@ def _v41_fused_post_pre_quant_kernel(
     scale = abs_max_acc / _FP8_E4M3_MAX
     scale = jnp.where(scale == 0, 1.0, scale)
     normed_scale_ref[...] = scale
+    inv_scale = 1.0 / scale
     for s in range(num_strips):
         s_lo = s * dh
         s_hi = s_lo + dh
-        val_f32 = (
-            normed_ref[:, s_lo:s_hi].astype(jnp.float32)
-            if stage_vmem
-            else val_strips[s]
-        )
         normed_fp8_ref[:, s_lo:s_hi] = jnp.clip(
-            val_f32 / scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX
+            val_strips[s] * inv_scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX
         ).astype(jnp.float8_e4m3fn)
 
 
@@ -1083,8 +1148,9 @@ def _v41_fused_post_pre_quant_mixes_kernel(
     normed_scale_ref,
     *,
     rms_eps: float,
+    write_bf16: bool = True,
 ):
-    """Seam kernel (multi-block) + in-VMEM dynamic FP8 activation quantization."""
+    """Seam kernel (multi-block): full-width contiguous VPU recombine + dynamic FP8 quant."""
     post = post_ref[...]
     comb = comb_ref[...]
     pre_in = pre_in_ref[...]
@@ -1094,79 +1160,61 @@ def _v41_fused_post_pre_quant_mixes_kernel(
     dh = 1280 if hidden_size % 1280 == 0 else hidden_size
     num_strips = hidden_size // dh
 
-    parts_acc = None
+    x_f32 = x_ref[...].astype(jnp.float32)
+    old_f32 = [
+        res_ref[:, i * hidden_size : (i + 1) * hidden_size].astype(jnp.float32)
+        for i in range(hc_mult)
+    ]
+    streams_bf = []
+    nfs = []
+    collapsed_f32 = None
+    for j in range(hc_mult):
+        acc = post[:, j : j + 1] * x_f32
+        for i in range(hc_mult):
+            k = i * hc_mult + j
+            acc = acc + comb[:, k : k + 1] * old_f32[i]
+        new_bf = acc.astype(jnp.bfloat16)
+        streams_bf.append(new_bf)
+        nf = new_bf.astype(jnp.float32)
+        nfs.append(nf)
+        term = pre_in[:, j : j + 1] * nf
+        collapsed_f32 = term if collapsed_f32 is None else collapsed_f32 + term
+
+    assert collapsed_f32 is not None
+    cf32 = collapsed_f32.astype(jnp.bfloat16).astype(jnp.float32)
     sqr_acc = None
     norm_sqr_acc = None
     for s in range(num_strips):
-        s_lo = s * dh
-        s_hi = s_lo + dh
-        x_f32 = x_ref[:, s_lo:s_hi].astype(jnp.float32)
-        accs = [post[:, j : j + 1] * x_f32 for j in range(hc_mult)]
-        for i in range(hc_mult):
-            old_i = res_ref[
-                :, i * hidden_size + s_lo : i * hidden_size + s_hi
-            ].astype(jnp.float32)
-            for j in range(hc_mult):
-                k = i * hc_mult + j
-                accs[j] = accs[j] + comb[:, k : k + 1] * old_i
-        col_strip = None
+        s_lo, s_hi = s * dh, (s + 1) * dh
         for j in range(hc_mult):
-            lo = j * hidden_size + s_lo
-            hi = lo + dh
-            new_bf = accs[j].astype(jnp.bfloat16)
-            newres_ref[:, lo:hi] = new_bf
-            p_js = jax.lax.dot_general(
-                new_bf,
-                fn_72_ref[:, lo:hi],
-                (((1,), (1,)), ((), ())),
-                preferred_element_type=jnp.float32,
+            sj = jnp.sum(
+                nfs[j][:, s_lo:s_hi] * nfs[j][:, s_lo:s_hi],
+                axis=-1,
+                keepdims=True,
             )
-            parts_acc = p_js if parts_acc is None else parts_acc + p_js
-            nf = new_bf.astype(jnp.float32)
-            sj = jnp.sum(nf * nf, axis=-1, keepdims=True)
             sqr_acc = sj if sqr_acc is None else sqr_acc + sj
-            term = pre_in[:, j : j + 1] * nf
-            col_strip = term if col_strip is None else col_strip + term
-        assert col_strip is not None
-        col_bf = col_strip.astype(jnp.bfloat16)
-        normed_ref[:, s_lo:s_hi] = col_bf
-        cf32 = col_bf.astype(jnp.float32)
-        ns = jnp.sum(cf32 * cf32, axis=-1, keepdims=True)
+        ns = jnp.sum(cf32[:, s_lo:s_hi] ** 2, axis=-1, keepdims=True)
         norm_sqr_acc = ns if norm_sqr_acc is None else norm_sqr_acc + ns
 
-    assert parts_acc is not None and sqr_acc is not None and norm_sqr_acc is not None
-    mixes_ref[...] = (
-        parts_acc[:, :mix_hc]
-        + parts_acc[:, mix_hc : 2 * mix_hc]
-        + parts_acc[:, 2 * mix_hc : 3 * mix_hc]
-    )
+    assert sqr_acc is not None and norm_sqr_acc is not None
+    g_bf = jnp.concatenate(streams_bf, axis=1)
+    newres_ref[...] = g_bf
+    mixes_ref[...] = _packed_mixes(g_bf, fn_72_ref, mix_hc)
     sqr_ref[...] = sqr_acc
     rstd = jax.lax.rsqrt(norm_sqr_acc / hidden_size + rms_eps)
-    abs_max_acc = None
-    for s in range(num_strips):
-        s_lo = s * dh
-        s_hi = s_lo + dh
-        cf32_s = normed_ref[:, s_lo:s_hi].astype(jnp.float32)
-        val_bf16 = (
-            cf32_s * rstd
-        ).astype(jnp.bfloat16) * nw_ref[:, s_lo:s_hi]
-        normed_ref[:, s_lo:s_hi] = val_bf16
-        val_f32 = val_bf16.astype(jnp.float32)
-        s_abs = jnp.max(jnp.abs(val_f32), axis=-1, keepdims=True)
-        abs_max_acc = (
-            s_abs if abs_max_acc is None else jnp.maximum(abs_max_acc, s_abs)
-        )
-    assert abs_max_acc is not None
-    scale = abs_max_acc / _FP8_E4M3_MAX
+    val_bf16 = (cf32 * rstd).astype(jnp.bfloat16) * nw_ref[...]
+    if write_bf16:
+        normed_ref[...] = val_bf16
+    val_f32 = val_bf16.astype(jnp.float32)
+    abs_max = jnp.max(jnp.abs(val_f32), axis=-1, keepdims=True)
+    scale = abs_max / _FP8_E4M3_MAX
     scale = jnp.where(scale == 0, 1.0, scale)
     normed_scale_ref[...] = scale
-    for s in range(num_strips):
-        s_lo = s * dh
-        s_hi = s_lo + dh
-        val_f32 = normed_ref[:, s_lo:s_hi].astype(jnp.float32)
-        normed_fp8_ref[:, s_lo:s_hi] = jnp.clip(
-            val_f32 / scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX
-        ).astype(jnp.float8_e4m3fn)
+    normed_fp8_ref[...] = jnp.clip(
+        val_f32 * (1.0 / scale),
+        -_FP8_E4M3_MAX,
+        _FP8_E4M3_MAX,
+    ).astype(jnp.float8_e4m3fn)
 
 
 def mhc_pre_quant_v41(
@@ -1271,6 +1319,66 @@ def mhc_pre_quant_v41(
     )
 
 
+def _v41_fused_post_pre_quant_1strip_kernel(
+    x_ref,
+    res_ref,
+    post_ref,
+    comb_ref,
+    pre_in_ref,
+    nw_ref,
+    fn_72_ref,
+    scale_ref,
+    hb_ref,
+    newres_ref,
+    post_out_ref,
+    comb_out_ref,
+    normed_ref,
+    pre_out_ref,
+    normed_fp8_ref,
+    normed_scale_ref,
+    *,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    write_bf16: bool = True,
+):
+    """Seam kernel (num_tokens <= 192): 1-pass packed GEMM + Sinkhorn + contiguous FP8 quant."""
+    val_bf16 = _v41_fused_post_pre_1strip_body(
+        x_ref,
+        res_ref,
+        post_ref,
+        comb_ref,
+        pre_in_ref,
+        nw_ref,
+        fn_72_ref,
+        scale_ref,
+        hb_ref,
+        newres_ref,
+        post_out_ref,
+        comb_out_ref,
+        normed_ref,
+        pre_out_ref,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+        write_bf16=write_bf16,
+    )
+    val_f32 = val_bf16.astype(jnp.float32)
+    abs_max = jnp.max(jnp.abs(val_f32), axis=-1, keepdims=True)
+    scale = abs_max / _FP8_E4M3_MAX
+    scale = jnp.where(scale == 0, 1.0, scale)
+    normed_scale_ref[...] = scale
+    normed_fp8_ref[...] = jnp.clip(
+        val_f32 * (1.0 / scale),
+        -_FP8_E4M3_MAX,
+        _FP8_E4M3_MAX,
+    ).astype(jnp.float8_e4m3fn)
+
+
 def mhc_fused_post_pre_quant_v41(
     x: jax.Array,
     residual: jax.Array,
@@ -1287,6 +1395,7 @@ def mhc_fused_post_pre_quant_v41(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    write_bf16: bool = True,
 ) -> tuple[
     jax.Array,
     jax.Array,
@@ -1298,7 +1407,13 @@ def mhc_fused_post_pre_quant_v41(
 ]:
     *outer_shape, hc_mult, hidden_size = residual.shape
     num_tokens = x.size // hidden_size
+    normed_w = hidden_size
     if num_tokens <= 256:
+        seam_fn = (
+            _v41_fused_post_pre_quant_1strip_kernel
+            if num_tokens <= 192
+            else _v41_fused_post_pre_quant_kernel
+        )
         (
             new_res2d,
             post_mix,
@@ -1309,12 +1424,13 @@ def mhc_fused_post_pre_quant_v41(
             normed_scale,
         ) = _v41_mhc_pallas_call(
             functools.partial(
-                _v41_fused_post_pre_quant_kernel,
+                seam_fn,
                 rms_eps=rms_eps,
                 hc_pre_eps=hc_pre_eps,
                 hc_sinkhorn_eps=hc_sinkhorn_eps,
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
+                write_bf16=write_bf16,
             ),
             (
                 x.reshape(num_tokens, hidden_size).astype(jnp.bfloat16),
@@ -1332,12 +1448,12 @@ def mhc_fused_post_pre_quant_v41(
                 (hc_mult * hidden_size, jnp.bfloat16),
                 (hc_mult, jnp.float32),
                 (hc_mult * hc_mult, jnp.float32),
-                (hidden_size, jnp.bfloat16),
+                (normed_w, jnp.bfloat16),
                 (hc_mult, jnp.float32),
                 (hidden_size, jnp.float8_e4m3fn),
                 (1, jnp.float32),
             ),
-            max_token_block=256,
+            max_token_block=64 if num_tokens <= 64 else 128,
         )
     else:
         mix_hc = hc_mult * (hc_mult + 2)
@@ -1369,7 +1485,7 @@ def mhc_fused_post_pre_quant_v41(
                 (hc_mult * hidden_size, jnp.bfloat16),
                 (mix_hc, jnp.float32),
                 (1, jnp.float32),
-                (hidden_size, jnp.bfloat16),
+                (normed_w, jnp.bfloat16),
                 (hidden_size, jnp.float8_e4m3fn),
                 (1, jnp.float32),
             ),
@@ -1392,11 +1508,12 @@ def mhc_fused_post_pre_quant_v41(
         new_res2d.reshape(residual.shape),
         post_mix.reshape(*outer_shape, hc_mult, 1),
         comb_mix.reshape(*outer_shape, hc_mult, hc_mult),
-        normed.reshape(*outer_shape, hidden_size),
+        normed.reshape(*outer_shape, normed_w),
         next_pre_mix.reshape(*outer_shape, hc_mult),
         normed_fp8.reshape(*outer_shape, hidden_size),
         normed_scale.reshape(*outer_shape, 1),
     )
+
 
 def _engram_gate_in_vmem(
     streams_bf: list[jax.Array],
@@ -1464,7 +1581,12 @@ def engram_gate_pallas(
     """2D-tiled Pallas Engram gating without 3D T(4,128) relayouts or f32 HBM spills."""
     *outer_shape, hc_mult, hidden_size = residual.shape
     num_tokens = residual.size // (hc_mult * hidden_size)
-    tb, padded_tokens = utils.select_token_block(num_tokens, 64)
+    max_tb = (
+        128
+        if num_tokens % utils.SUBLANE == 0
+        else 128
+    )
+    tb, padded_tokens = utils.select_token_block(num_tokens, max_tb)
     res2d = residual.reshape(num_tokens, hc_mult * hidden_size).astype(jnp.bfloat16)
     kv2d = kv.reshape(num_tokens, (hc_mult + 1) * hidden_size).astype(jnp.bfloat16)
     res_pad, kv_pad = utils.pad_to(padded_tokens, res2d, kv2d)
@@ -1520,44 +1642,62 @@ def _v41_fused_post_engram_pre_1strip_kernel(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    exact_div: bool = False,
 ):
-    """Fused mhc_post + engram_gate + mhc_pre (num_tokens <= 64) in VMEM."""
+    """Fused mhc_post + engram_gate + mhc_pre (num_tokens <= 128) in VMEM."""
     post = post_ref[...]
     comb = comb_ref[...]
     pre_in = pre_in_ref[...]
     hidden_size = x_ref.shape[1]
     hc_mult = post.shape[1]
     mix_hc = hc_mult * (hc_mult + 2)
-    x_bf = x_ref[...]
-    old_bf = [
-        res_ref[:, i * hidden_size : (i + 1) * hidden_size] for i in range(hc_mult)
+    dh = 1280 if hidden_size % 1280 == 0 else hidden_size
+    num_strips = hidden_size // dh
+
+    for s in range(num_strips):
+        s_lo = s * dh
+        s_hi = s_lo + dh
+        x_f32 = x_ref[:, s_lo:s_hi].astype(jnp.float32)
+        old_s = [
+            res_ref[:, i * hidden_size + s_lo : i * hidden_size + s_hi].astype(
+                jnp.float32
+            )
+            for i in range(hc_mult)
+        ]
+        for j in range(hc_mult):
+            acc = post[:, j : j + 1] * x_f32
+            for i in range(hc_mult):
+                k = i * hc_mult + j
+                acc = acc + comb[:, k : k + 1] * old_s[i]
+            newres_ref[:, j * hidden_size + s_lo : j * hidden_size + s_hi] = (
+                acc.astype(jnp.bfloat16)
+            )
+
+    post_streams_bf = [
+        newres_ref[:, j * hidden_size : (j + 1) * hidden_size] for j in range(hc_mult)
     ]
-
-    post_streams_bf = []
-    for j in range(hc_mult):
-        acc = post[:, j : j + 1] * x_bf.astype(jnp.float32)
-        for i in range(hc_mult):
-            k = i * hc_mult + j
-            acc = acc + comb[:, k : k + 1] * old_bf[i].astype(jnp.float32)
-        post_streams_bf.append(acc.astype(jnp.bfloat16))
-
     gated_streams_bf = _engram_gate_in_vmem(
         post_streams_bf, kv_ref, qk_ref, hidden_size=hidden_size, eps=rms_eps
     )
-
-    collapsed_f32 = None
-    sqr = None
     for j in range(hc_mult):
-        new_bf = gated_streams_bf[j]
-        newres_ref[:, j * hidden_size : (j + 1) * hidden_size] = new_bf
-        nf = new_bf.astype(jnp.float32)
-        sj = jnp.sum(nf * nf, axis=-1, keepdims=True)
-        sqr = sj if sqr is None else sqr + sj
-        term = pre_in[:, j : j + 1] * nf
-        collapsed_f32 = term if collapsed_f32 is None else collapsed_f32 + term
+        newres_ref[:, j * hidden_size : (j + 1) * hidden_size] = gated_streams_bf[j]
 
-    g_bf = jnp.concatenate(gated_streams_bf, axis=1)
-    acc = _packed_mixes(g_bf, fn_72_ref, mix_hc)
+    sqr = None
+    for s in range(num_strips):
+        s_lo = s * dh
+        s_hi = s_lo + dh
+        col_strip = None
+        for j in range(hc_mult):
+            lo = j * hidden_size + s_lo
+            nf = newres_ref[:, lo : lo + dh].astype(jnp.float32)
+            sj = jnp.sum(nf * nf, axis=-1, keepdims=True)
+            sqr = sj if sqr is None else sqr + sj
+            term = pre_in[:, j : j + 1] * nf
+            col_strip = term if col_strip is None else col_strip + term
+        assert col_strip is not None
+        normed_ref[:, s_lo:s_hi] = col_strip.astype(jnp.bfloat16)
+
+    acc = _packed_mixes(newres_ref[...], fn_72_ref, mix_hc)
     assert sqr is not None
     _v41_in_kernel_gates(
         acc,
@@ -1574,9 +1714,9 @@ def _v41_fused_post_engram_pre_1strip_kernel(
         hc_sinkhorn_eps=hc_sinkhorn_eps,
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
+        exact_div=exact_div,
     )
-    assert collapsed_f32 is not None
-    _rms_norm_to_ref(collapsed_f32.astype(jnp.bfloat16), nw_ref, normed_ref, rms_eps)
+    _rms_norm_to_ref(normed_ref[...], nw_ref, normed_ref, rms_eps)
 
 
 def _v41_fused_post_engram_pre_mixes_kernel(
@@ -1603,40 +1743,56 @@ def _v41_fused_post_engram_pre_mixes_kernel(
     hidden_size = x_ref.shape[1]
     hc_mult = post.shape[1]
     mix_hc = hc_mult * (hc_mult + 2)
-    x_bf = x_ref[...]
-    old_bf = [
-        res_ref[:, i * hidden_size : (i + 1) * hidden_size] for i in range(hc_mult)
+    dh = 1280 if hidden_size % 1280 == 0 else hidden_size
+    num_strips = hidden_size // dh
+
+    for s in range(num_strips):
+        s_lo = s * dh
+        s_hi = s_lo + dh
+        x_f32 = x_ref[:, s_lo:s_hi].astype(jnp.float32)
+        old_s = [
+            res_ref[:, i * hidden_size + s_lo : i * hidden_size + s_hi].astype(
+                jnp.float32
+            )
+            for i in range(hc_mult)
+        ]
+        for j in range(hc_mult):
+            acc = post[:, j : j + 1] * x_f32
+            for i in range(hc_mult):
+                k = i * hc_mult + j
+                acc = acc + comb[:, k : k + 1] * old_s[i]
+            newres_ref[:, j * hidden_size + s_lo : j * hidden_size + s_hi] = (
+                acc.astype(jnp.bfloat16)
+            )
+
+    post_streams_bf = [
+        newres_ref[:, j * hidden_size : (j + 1) * hidden_size] for j in range(hc_mult)
     ]
-
-    post_streams_bf = []
-    for j in range(hc_mult):
-        acc = post[:, j : j + 1] * x_bf.astype(jnp.float32)
-        for i in range(hc_mult):
-            k = i * hc_mult + j
-            acc = acc + comb[:, k : k + 1] * old_bf[i].astype(jnp.float32)
-        post_streams_bf.append(acc.astype(jnp.bfloat16))
-
     gated_streams_bf = _engram_gate_in_vmem(
         post_streams_bf, kv_ref, qk_ref, hidden_size=hidden_size, eps=rms_eps
     )
-
-    collapsed_f32 = None
-    sqr = None
     for j in range(hc_mult):
-        new_bf = gated_streams_bf[j]
-        newres_ref[:, j * hidden_size : (j + 1) * hidden_size] = new_bf
-        nf = new_bf.astype(jnp.float32)
-        sj = jnp.sum(nf * nf, axis=-1, keepdims=True)
-        sqr = sj if sqr is None else sqr + sj
-        term = pre_in[:, j : j + 1] * nf
-        collapsed_f32 = term if collapsed_f32 is None else collapsed_f32 + term
+        newres_ref[:, j * hidden_size : (j + 1) * hidden_size] = gated_streams_bf[j]
 
-    g_bf = jnp.concatenate(gated_streams_bf, axis=1)
-    mixes_ref[...] = _packed_mixes(g_bf, fn_72_ref, mix_hc)
+    sqr = None
+    for s in range(num_strips):
+        s_lo = s * dh
+        s_hi = s_lo + dh
+        col_strip = None
+        for j in range(hc_mult):
+            lo = j * hidden_size + s_lo
+            nf = newres_ref[:, lo : lo + dh].astype(jnp.float32)
+            sj = jnp.sum(nf * nf, axis=-1, keepdims=True)
+            sqr = sj if sqr is None else sqr + sj
+            term = pre_in[:, j : j + 1] * nf
+            col_strip = term if col_strip is None else col_strip + term
+        assert col_strip is not None
+        normed_ref[:, s_lo:s_hi] = col_strip.astype(jnp.bfloat16)
+
+    mixes_ref[...] = _packed_mixes(newres_ref[...], fn_72_ref, mix_hc)
     assert sqr is not None
     sqr_ref[...] = sqr
-    assert collapsed_f32 is not None
-    _rms_norm_to_ref(collapsed_f32.astype(jnp.bfloat16), nw_ref, normed_ref, rms_eps)
+    _rms_norm_to_ref(normed_ref[...], nw_ref, normed_ref, rms_eps)
 
 
 def mhc_fused_post_engram_pre_v41(
@@ -1665,7 +1821,7 @@ def mhc_fused_post_engram_pre_v41(
         64
         if num_tokens <= 64
         else (
-            max(utils.SUBLANE, math.gcd(num_tokens, 128))
+            128
             if num_tokens % utils.SUBLANE == 0
             else 128
         )
@@ -1697,7 +1853,7 @@ def mhc_fused_post_engram_pre_v41(
         fn_72 = jnp.concatenate(utils.split_fn3(hc_fn), axis=0)
 
     buf_mode = pl.Buffered(buffer_count=2)
-    if num_tokens <= 64:
+    if num_tokens <= 128:
         if hc_scale.size == mix_hc:
             scale_vec = hc_scale.reshape(1, mix_hc).astype(jnp.float32)
         else:
@@ -1844,44 +2000,62 @@ def _v41_fused_post_engram_pre_quant_1strip_kernel(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    exact_div: bool = False,
 ):
-    """Fused mhc_post + engram_gate + mhc_pre_quant (num_tokens <= 64) in VMEM."""
+    """Fused mhc_post + engram_gate + mhc_pre_quant (num_tokens <= 128) in VMEM."""
     post = post_ref[...]
     comb = comb_ref[...]
     pre_in = pre_in_ref[...]
     hidden_size = x_ref.shape[1]
     hc_mult = post.shape[1]
     mix_hc = hc_mult * (hc_mult + 2)
-    x_bf = x_ref[...]
-    old_bf = [
-        res_ref[:, i * hidden_size : (i + 1) * hidden_size] for i in range(hc_mult)
+    dh = 1280 if hidden_size % 1280 == 0 else hidden_size
+    num_strips = hidden_size // dh
+
+    for s in range(num_strips):
+        s_lo = s * dh
+        s_hi = s_lo + dh
+        x_f32 = x_ref[:, s_lo:s_hi].astype(jnp.float32)
+        old_s = [
+            res_ref[:, i * hidden_size + s_lo : i * hidden_size + s_hi].astype(
+                jnp.float32
+            )
+            for i in range(hc_mult)
+        ]
+        for j in range(hc_mult):
+            acc = post[:, j : j + 1] * x_f32
+            for i in range(hc_mult):
+                k = i * hc_mult + j
+                acc = acc + comb[:, k : k + 1] * old_s[i]
+            newres_ref[:, j * hidden_size + s_lo : j * hidden_size + s_hi] = (
+                acc.astype(jnp.bfloat16)
+            )
+
+    post_streams_bf = [
+        newres_ref[:, j * hidden_size : (j + 1) * hidden_size] for j in range(hc_mult)
     ]
-
-    post_streams_bf = []
-    for j in range(hc_mult):
-        acc = post[:, j : j + 1] * x_bf.astype(jnp.float32)
-        for i in range(hc_mult):
-            k = i * hc_mult + j
-            acc = acc + comb[:, k : k + 1] * old_bf[i].astype(jnp.float32)
-        post_streams_bf.append(acc.astype(jnp.bfloat16))
-
     gated_streams_bf = _engram_gate_in_vmem(
         post_streams_bf, kv_ref, qk_ref, hidden_size=hidden_size, eps=rms_eps
     )
-
-    collapsed_f32 = None
-    sqr = None
     for j in range(hc_mult):
-        new_bf = gated_streams_bf[j]
-        newres_ref[:, j * hidden_size : (j + 1) * hidden_size] = new_bf
-        nf = new_bf.astype(jnp.float32)
-        sj = jnp.sum(nf * nf, axis=-1, keepdims=True)
-        sqr = sj if sqr is None else sqr + sj
-        term = pre_in[:, j : j + 1] * nf
-        collapsed_f32 = term if collapsed_f32 is None else collapsed_f32 + term
+        newres_ref[:, j * hidden_size : (j + 1) * hidden_size] = gated_streams_bf[j]
 
-    g_bf = jnp.concatenate(gated_streams_bf, axis=1)
-    acc = _packed_mixes(g_bf, fn_72_ref, mix_hc)
+    sqr = None
+    for s in range(num_strips):
+        s_lo = s * dh
+        s_hi = s_lo + dh
+        col_strip = None
+        for j in range(hc_mult):
+            lo = j * hidden_size + s_lo
+            nf = newres_ref[:, lo : lo + dh].astype(jnp.float32)
+            sj = jnp.sum(nf * nf, axis=-1, keepdims=True)
+            sqr = sj if sqr is None else sqr + sj
+            term = pre_in[:, j : j + 1] * nf
+            col_strip = term if col_strip is None else col_strip + term
+        assert col_strip is not None
+        normed_ref[:, s_lo:s_hi] = col_strip.astype(jnp.bfloat16)
+
+    acc = _packed_mixes(newres_ref[...], fn_72_ref, mix_hc)
     assert sqr is not None
     _v41_in_kernel_gates(
         acc,
@@ -1898,10 +2072,10 @@ def _v41_fused_post_engram_pre_quant_1strip_kernel(
         hc_sinkhorn_eps=hc_sinkhorn_eps,
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
+        exact_div=exact_div,
     )
-    assert collapsed_f32 is not None
     _rms_norm_quant_to_refs(
-        collapsed_f32.astype(jnp.bfloat16),
+        normed_ref[...],
         nw_ref,
         normed_ref,
         normed_fp8_ref,
@@ -1936,41 +2110,57 @@ def _v41_fused_post_engram_pre_quant_mixes_kernel(
     hidden_size = x_ref.shape[1]
     hc_mult = post.shape[1]
     mix_hc = hc_mult * (hc_mult + 2)
-    x_bf = x_ref[...]
-    old_bf = [
-        res_ref[:, i * hidden_size : (i + 1) * hidden_size] for i in range(hc_mult)
+    dh = 1280 if hidden_size % 1280 == 0 else hidden_size
+    num_strips = hidden_size // dh
+
+    for s in range(num_strips):
+        s_lo = s * dh
+        s_hi = s_lo + dh
+        x_f32 = x_ref[:, s_lo:s_hi].astype(jnp.float32)
+        old_s = [
+            res_ref[:, i * hidden_size + s_lo : i * hidden_size + s_hi].astype(
+                jnp.float32
+            )
+            for i in range(hc_mult)
+        ]
+        for j in range(hc_mult):
+            acc = post[:, j : j + 1] * x_f32
+            for i in range(hc_mult):
+                k = i * hc_mult + j
+                acc = acc + comb[:, k : k + 1] * old_s[i]
+            newres_ref[:, j * hidden_size + s_lo : j * hidden_size + s_hi] = (
+                acc.astype(jnp.bfloat16)
+            )
+
+    post_streams_bf = [
+        newres_ref[:, j * hidden_size : (j + 1) * hidden_size] for j in range(hc_mult)
     ]
-
-    post_streams_bf = []
-    for j in range(hc_mult):
-        acc = post[:, j : j + 1] * x_bf.astype(jnp.float32)
-        for i in range(hc_mult):
-            k = i * hc_mult + j
-            acc = acc + comb[:, k : k + 1] * old_bf[i].astype(jnp.float32)
-        post_streams_bf.append(acc.astype(jnp.bfloat16))
-
     gated_streams_bf = _engram_gate_in_vmem(
         post_streams_bf, kv_ref, qk_ref, hidden_size=hidden_size, eps=rms_eps
     )
-
-    collapsed_f32 = None
-    sqr = None
     for j in range(hc_mult):
-        new_bf = gated_streams_bf[j]
-        newres_ref[:, j * hidden_size : (j + 1) * hidden_size] = new_bf
-        nf = new_bf.astype(jnp.float32)
-        sj = jnp.sum(nf * nf, axis=-1, keepdims=True)
-        sqr = sj if sqr is None else sqr + sj
-        term = pre_in[:, j : j + 1] * nf
-        collapsed_f32 = term if collapsed_f32 is None else collapsed_f32 + term
+        newres_ref[:, j * hidden_size : (j + 1) * hidden_size] = gated_streams_bf[j]
 
-    g_bf = jnp.concatenate(gated_streams_bf, axis=1)
-    mixes_ref[...] = _packed_mixes(g_bf, fn_72_ref, mix_hc)
+    sqr = None
+    for s in range(num_strips):
+        s_lo = s * dh
+        s_hi = s_lo + dh
+        col_strip = None
+        for j in range(hc_mult):
+            lo = j * hidden_size + s_lo
+            nf = newres_ref[:, lo : lo + dh].astype(jnp.float32)
+            sj = jnp.sum(nf * nf, axis=-1, keepdims=True)
+            sqr = sj if sqr is None else sqr + sj
+            term = pre_in[:, j : j + 1] * nf
+            col_strip = term if col_strip is None else col_strip + term
+        assert col_strip is not None
+        normed_ref[:, s_lo:s_hi] = col_strip.astype(jnp.bfloat16)
+
+    mixes_ref[...] = _packed_mixes(newres_ref[...], fn_72_ref, mix_hc)
     assert sqr is not None
     sqr_ref[...] = sqr
-    assert collapsed_f32 is not None
     _rms_norm_quant_to_refs(
-        collapsed_f32.astype(jnp.bfloat16),
+        normed_ref[...],
         nw_ref,
         normed_ref,
         normed_fp8_ref,
@@ -2009,16 +2199,13 @@ def mhc_fused_post_engram_pre_quant_v41(
     """Single-pass fused mhc_post + Engram gate + mhc_pre_quant_v41 kernel."""
     *outer_shape, hc_mult, hidden_size = residual.shape
     num_tokens = x.size // hidden_size
-    max_tb = (
-        64
-        if num_tokens <= 64
-        else (
-            max(utils.SUBLANE, math.gcd(num_tokens, 128))
-            if num_tokens % utils.SUBLANE == 0
-            else 128
-        )
-    )
-    tb, padded_tokens = utils.select_token_block(num_tokens, max_tb)
+    if num_tokens <= 64:
+        tb, padded_tokens = utils.select_token_block(num_tokens, 64)
+    else:
+        padded_tokens = ((num_tokens + 31) // 32) * 32
+        tb = min(128, padded_tokens)
+        while tb > 32 and padded_tokens % tb != 0:
+            tb -= 32
     token_inputs = utils.pad_to(
         padded_tokens,
         x.reshape(num_tokens, hidden_size).astype(jnp.bfloat16),
@@ -2045,7 +2232,7 @@ def mhc_fused_post_engram_pre_quant_v41(
         fn_72 = jnp.concatenate(utils.split_fn3(hc_fn), axis=0)
 
     buf_mode = pl.Buffered(buffer_count=2)
-    if num_tokens <= 64:
+    if num_tokens <= 128:
         if hc_scale.size == mix_hc:
             scale_vec = hc_scale.reshape(1, mix_hc).astype(jnp.float32)
         else:
@@ -2193,29 +2380,37 @@ def _v41_post_collapse_norm_kernel(
     *,
     rms_eps: float,
 ):
-    """Stage-boundary kernel: mhc_post + mhc_collapse + RMSNorm (writes newres and normed)."""
+    """Stage-boundary kernel: strip-tiled mhc_post + mhc_collapse + RMSNorm."""
     post = post_ref[...]
     comb = comb_ref[...]
     pre_in = pre_in_ref[...]
     hidden_size = x_ref.shape[1]
     hc_mult = post.shape[1]
-    x_f32 = x_ref[...].astype(jnp.float32)
-    old_f32 = [
-        res_ref[:, i * hidden_size : (i + 1) * hidden_size].astype(jnp.float32)
-        for i in range(hc_mult)
-    ]
-    collapsed_f32 = None
-    for j in range(hc_mult):
-        acc = post[:, j : j + 1] * x_f32
-        for i in range(hc_mult):
-            k = i * hc_mult + j
-            acc = acc + comb[:, k : k + 1] * old_f32[i]
-        new_bf = acc.astype(jnp.bfloat16)
-        newres_ref[:, j * hidden_size : (j + 1) * hidden_size] = new_bf
-        term = pre_in[:, j : j + 1] * new_bf.astype(jnp.float32)
-        collapsed_f32 = term if collapsed_f32 is None else collapsed_f32 + term
-    assert collapsed_f32 is not None
-    _rms_norm_to_ref(collapsed_f32.astype(jnp.bfloat16), nw_ref, normed_ref, rms_eps)
+    dh = 1280 if hidden_size % 1280 == 0 else hidden_size
+    num_strips = hidden_size // dh
+    for s in range(num_strips):
+        s_lo = s * dh
+        s_hi = s_lo + dh
+        x_f32 = x_ref[:, s_lo:s_hi].astype(jnp.float32)
+        old_s = [
+            res_ref[:, i * hidden_size + s_lo : i * hidden_size + s_hi].astype(
+                jnp.float32
+            )
+            for i in range(hc_mult)
+        ]
+        col_strip = None
+        for j in range(hc_mult):
+            acc = post[:, j : j + 1] * x_f32
+            for i in range(hc_mult):
+                k = i * hc_mult + j
+                acc = acc + comb[:, k : k + 1] * old_s[i]
+            new_bf = acc.astype(jnp.bfloat16)
+            newres_ref[:, j * hidden_size + s_lo : j * hidden_size + s_hi] = new_bf
+            term = pre_in[:, j : j + 1] * new_bf.astype(jnp.float32)
+            col_strip = term if col_strip is None else col_strip + term
+        assert col_strip is not None
+        normed_ref[:, s_lo:s_hi] = col_strip.astype(jnp.bfloat16)
+    _rms_norm_to_ref(normed_ref[...], nw_ref, normed_ref, rms_eps)
 
 
 def _v41_final_collapse_norm_kernel(
@@ -2229,28 +2424,36 @@ def _v41_final_collapse_norm_kernel(
     *,
     rms_eps: float,
 ):
-    """Final stage-exit kernel: mhc_post + mhc_collapse + RMSNorm without writing dead residual."""
+    """Final stage-exit kernel: strip-tiled mhc_post + mhc_collapse + RMSNorm."""
     post = post_ref[...]
     comb = comb_ref[...]
     pre_in = pre_in_ref[...]
     hidden_size = x_ref.shape[1]
     hc_mult = post.shape[1]
-    x_f32 = x_ref[...].astype(jnp.float32)
-    old_f32 = [
-        res_ref[:, i * hidden_size : (i + 1) * hidden_size].astype(jnp.float32)
-        for i in range(hc_mult)
-    ]
-    collapsed_f32 = None
-    for j in range(hc_mult):
-        acc = post[:, j : j + 1] * x_f32
-        for i in range(hc_mult):
-            k = i * hc_mult + j
-            acc = acc + comb[:, k : k + 1] * old_f32[i]
-        new_bf = acc.astype(jnp.bfloat16)
-        term = pre_in[:, j : j + 1] * new_bf.astype(jnp.float32)
-        collapsed_f32 = term if collapsed_f32 is None else collapsed_f32 + term
-    assert collapsed_f32 is not None
-    _rms_norm_to_ref(collapsed_f32.astype(jnp.bfloat16), nw_ref, normed_ref, rms_eps)
+    dh = 1280 if hidden_size % 1280 == 0 else hidden_size
+    num_strips = hidden_size // dh
+    for s in range(num_strips):
+        s_lo = s * dh
+        s_hi = s_lo + dh
+        x_f32 = x_ref[:, s_lo:s_hi].astype(jnp.float32)
+        old_s = [
+            res_ref[:, i * hidden_size + s_lo : i * hidden_size + s_hi].astype(
+                jnp.float32
+            )
+            for i in range(hc_mult)
+        ]
+        col_strip = None
+        for j in range(hc_mult):
+            acc = post[:, j : j + 1] * x_f32
+            for i in range(hc_mult):
+                k = i * hc_mult + j
+                acc = acc + comb[:, k : k + 1] * old_s[i]
+            new_bf = acc.astype(jnp.bfloat16)
+            term = pre_in[:, j : j + 1] * new_bf.astype(jnp.float32)
+            col_strip = term if col_strip is None else col_strip + term
+        assert col_strip is not None
+        normed_ref[:, s_lo:s_hi] = col_strip.astype(jnp.bfloat16)
+    _rms_norm_to_ref(normed_ref[...], nw_ref, normed_ref, rms_eps)
 
 
 def mhc_post_collapse_norm_v41(
@@ -2267,7 +2470,7 @@ def mhc_post_collapse_norm_v41(
     *outer_shape, hc_mult, hidden_size = residual.shape
     num_tokens = x.size // hidden_size
     max_tb = (
-        max(utils.SUBLANE, math.gcd(num_tokens, 128))
+        128
         if num_tokens % utils.SUBLANE == 0
         else 128
     )
@@ -2333,7 +2536,7 @@ def mhc_final_collapse_norm_v41(
     *outer_shape, hc_mult, hidden_size = residual.shape
     num_tokens = x.size // hidden_size
     max_tb = (
-        max(utils.SUBLANE, math.gcd(num_tokens, 128))
+        128
         if num_tokens % utils.SUBLANE == 0
         else 128
     )

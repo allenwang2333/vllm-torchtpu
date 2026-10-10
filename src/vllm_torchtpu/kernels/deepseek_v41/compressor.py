@@ -23,7 +23,11 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import compute
-from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant
+from vllm_torchtpu.kernels.deepseek_v4.rope import (
+    _expand_cos_sin,
+    _lane_gather,
+    rope_quant,
+)
 from vllm_torchtpu.kernels.deepseek_v41.sparse_mla import (
     align_to,
     cdiv,
@@ -32,6 +36,7 @@ from vllm_torchtpu.kernels.deepseek_v41.sparse_mla import (
 from vllm_torchtpu.kernels.deepseek_v41.streamindex_topk import (
     streamindex_topk,
 )
+from vllm_torchtpu.utils import largest_divisor
 
 
 def _seq_ids_from_locs(
@@ -58,12 +63,15 @@ def _rope_block_start(
 ) -> jax.Array:
     """GPT-J RoPE on the trailing 64 channels at each token's block-start position."""
     x = x.astype(jnp.float32)
-    start = jnp.clip(
-        (pos // compress_ratio) * compress_ratio, 0, cos_sin_cache.shape[0] - 1
+    start = (
+        jnp.clip(pos, 0, cos_sin_cache.shape[0] - 1)
+        if compress_ratio == 1
+        else jnp.clip(
+            (pos // compress_ratio) * compress_ratio, 0, cos_sin_cache.shape[0] - 1
+        )
     )
-    cs = cos_sin_cache[start]
-    cos = jnp.repeat(cs[:, :32], 2, axis=-1)
-    sin = jnp.repeat(cs[:, 32:], 2, axis=-1)
+    cs = jnp.repeat(cos_sin_cache[start], 2, axis=-1)
+    cos, sin = cs[:, :64], cs[:, 64:]
     x_nope, x_rope = x[:, :64], x[:, 64:]
     x_rot = jnp.stack([-x_rope[:, 1::2], x_rope[:, 0::2]], axis=-1).reshape(
         x.shape[0], 64
@@ -142,16 +150,26 @@ def compress_r2_pool_norm_jax(
     ).reshape(eff_max_seqs, 1024)
 
     token_idx = jnp.arange(num_tokens, dtype=jnp.int32)
-    batch_prev = wkv_wgate[jnp.clip(token_idx - 1, 0, num_tokens - 1)]
-    if num_tokens >= 2048:
-        first_write_idx = jnp.where(seq_valid, first_tok_idx, num_tokens)
-        prev_kv_score = batch_prev.at[first_write_idx].set(seq_cache_prev, mode="drop")
-    else:
+    def _single_seq_prev():
+        return jnp.concatenate([seq_cache_prev[:1], wkv_wgate[:-1]], axis=0)
+
+    def _multi_seq_prev():
+        if num_tokens >= 384:
+            batch_prev = jnp.concatenate([wkv_wgate[:1], wkv_wgate[:-1]], axis=0)
+            first_write_idx = jnp.where(seq_valid, first_tok_idx, num_tokens)
+            return batch_prev.at[first_write_idx].set(seq_cache_prev, mode="drop")
+        batch_prev = wkv_wgate[jnp.clip(token_idx - 1, 0, num_tokens - 1)]
         req = _seq_ids_from_locs(query_start_loc, num_tokens, eff_max_seqs)
         in_batch_prev = token_idx > query_start_loc[req]
-        prev_kv_score = jnp.where(
+        return jnp.where(
             in_batch_prev[:, None], batch_prev, seq_cache_prev[req]
         )
+
+    prev_kv_score = jax.lax.cond(
+        distribution[2] <= 1,
+        _single_seq_prev,
+        _multi_seq_prev,
+    )
 
     last_tok_idx = jnp.clip(q_end - 1, 0, num_tokens - 1)
     last_pos = pos[last_tok_idx]
@@ -200,26 +218,34 @@ def compressor_insert_cache_jax(
     req = _seq_ids_from_locs(query_start_loc, num_tokens, eff_max_seqs)
     token_idx = jnp.arange(num_tokens, dtype=jnp.int32)
     valid = token_idx < query_start_loc[distribution[2]]
-    is_boundary = valid & (((pos + 1) % compress_ratio) == 0)
+    is_boundary = (
+        valid
+        if compress_ratio == 1
+        else (valid & (((pos + 1) % compress_ratio) == 0))
+    )
 
     use_pallas = num_tokens > 512 and page_size % 32 == 0
     M = num_tokens
     latent_work = latent
     pos_work = pos
-    if use_pallas and compress_ratio > 1:
+    if (use_pallas or num_tokens >= 384) and compress_ratio > 1:
+        max_odd_seqs = eff_max_seqs if use_pallas else min(eff_max_seqs, 64)
         M = min(
             num_tokens,
-            max(32, align_to((num_tokens + eff_max_seqs) // compress_ratio, 32)),
+            max(32, align_to((num_tokens + max_odd_seqs) // compress_ratio, 32)),
         )
         owned_idx = _compact_indices(is_boundary, M)
         safe_idx = jnp.maximum(owned_idx, 0)
         latent_work = latent[safe_idx]
         pos_work = pos[safe_idx]
         req = req[safe_idx]
-        token_idx = jnp.arange(M, dtype=jnp.int32)
         is_boundary = owned_idx >= 0
 
-    kv_idx = jnp.maximum(pos_work // compress_ratio, 0)
+    kv_idx = (
+        jnp.maximum(pos_work, 0)
+        if compress_ratio == 1
+        else jnp.maximum(pos_work // compress_ratio, 0)
+    )
     kv_page_idx = jnp.clip(kv_idx // page_size, 0, max_kv_blocks - 1)
     kv_page_off = kv_idx % page_size
     kv_page = kv_block_table[req * max_kv_blocks + kv_page_idx]
@@ -256,12 +282,15 @@ def compressor_insert_cache_jax(
         b0 | (b1 << 8) | (b2 << 16) | (b3 << 24), jnp.int32
     )
 
-    start = jnp.clip(
-        (pos_work // compress_ratio) * compress_ratio, 0, cos_sin_cache.shape[0] - 1
+    start = (
+        jnp.clip(pos_work, 0, cos_sin_cache.shape[0] - 1)
+        if compress_ratio == 1
+        else jnp.clip(
+            (pos_work // compress_ratio) * compress_ratio, 0, cos_sin_cache.shape[0] - 1
+        )
     )
-    cs = cos_sin_cache[start]
-    cos = jnp.repeat(cs[:, :32], 2, axis=-1)
-    sin = jnp.repeat(cs[:, 32:], 2, axis=-1)
+    cs = jnp.repeat(cos_sin_cache[start], 2, axis=-1)
+    cos, sin = cs[:, :64], cs[:, 64:]
     x_rot = jnp.stack([-x_rope[:, 1::2], x_rope[:, 0::2]], axis=-1).reshape(M, 64)
     y_rope = (x_rope * cos + x_rot * sin).astype(jnp.bfloat16)
     rope_records = csa_cache_layout.rope_words(y_rope)
@@ -274,29 +303,32 @@ def compressor_insert_cache_jax(
             .set(nope_records, mode="drop")
             .reshape(nope_cache.shape)
         )
+        eff_step = 1 if (num_tokens >= 384 and compress_ratio > 1) else compress_ratio
         rope_cache = _scatter_packed_4_jax(
             rope_cache.reshape(num_pages * (page_size // 4), csa_cache_layout.ROW_WORDS),
             rope_records,
             kv_slot,
             is_boundary,
-            compress_ratio,
+            eff_step,
         ).reshape(rope_cache.shape)
         return nope_cache, rope_cache
 
-    tile_k = 256 if (num_tokens >= 1024 and page_size % 256 == 0) else 32
+    tile_k = 256 if (num_tokens > 1536 and page_size % 256 == 0) else 32
     rope_tile = tile_k // 4
     tiles_per_page = page_size // tile_k
     tile_id = kv_slot // tile_k
     slot_off = kv_slot % tile_k
     valid_tile_id = jnp.where(is_boundary, tile_id, -1)
 
-    prev_idx = jnp.maximum(token_idx - 1, 0)
-    same_as_prev = (
-        (token_idx >= 1)
-        & is_boundary[prev_idx]
-        & (req[prev_idx] == req)
-        & (valid_tile_id[prev_idx] == valid_tile_id)
-        & (slot_off == slot_off[prev_idx] + 1)
+    same_as_prev = jnp.concatenate(
+        [
+            jnp.zeros((1,), dtype=jnp.bool_),
+            is_boundary[:-1]
+            & (req[:-1] == req[1:])
+            & (valid_tile_id[:-1] == valid_tile_id[1:])
+            & (slot_off[1:] == slot_off[:-1] + 1),
+        ],
+        axis=0,
     )
     is_first = is_boundary & (~same_as_prev)
 
@@ -331,6 +363,8 @@ def compressor_insert_cache_jax(
     nope_tiles = nope_padded.reshape(num_m_tiles + 1, tile_k, 128)
     rope_padded = jnp.pad(rope_records, ((0, pad_m), (0, 0)))
     rope_tiles = rope_padded.reshape(num_m_tiles + 1, rope_tile, 128)
+
+    ring_depth = 4 if num_tokens >= 2048 else 2
 
     def _pallas_kernel(
         tile_ids_ref,
@@ -415,26 +449,23 @@ def compressor_insert_cache_jax(
                 sem_ref.at[3, buf],
             ).wait()
 
-        @pl.when(n_tiles > 0)
-        def _prologue():
-            @pl.when(is_full_ref[0] == 0)
-            def _read0():
-                _start_read(0, 0)
+        @pl.loop(0, jnp.minimum(n_tiles, ring_depth))
+        def _prologue(p_i):
+            @pl.when(is_full_ref[p_i] == 0)
+            def _read_p():
+                _start_read(p_i, p_i)
 
         @pl.loop(0, n_tiles)
         def _step(i):
-            cur_buf = i & 1
-            nxt_buf = 1 - cur_buf
+            cur_buf = i % ring_depth
 
-            @pl.when(i + 1 < n_tiles)
-            def _prep_next():
-                @pl.when(i >= 1)
-                def _wait_prev_write_on_nxt():
-                    _wait_write(i - 1, nxt_buf)
+            @pl.when(i >= ring_depth)
+            def _wait_ring_write():
+                _wait_write(i - ring_depth, cur_buf)
 
-                @pl.when(is_full_ref[i + 1] == 0)
-                def _prefetch_next():
-                    _start_read(i + 1, nxt_buf)
+                @pl.when(is_full_ref[i] == 0)
+                def _issue_late_read():
+                    _start_read(i, cur_buf)
 
             tid = tile_ids_ref[i]
             t0 = safe_t0_ref[i]
@@ -446,47 +477,50 @@ def compressor_insert_cache_jax(
             m_off = t0 % tile_k
             shift = jnp.bitwise_and(l0 - m_off, tile_k - 1)
 
-            n0 = nope_tiles_vmem_ref[m_tile]
-            n1 = nope_tiles_vmem_ref[m_tile + 1]
-            comb_nope = jnp.where(sublanes_k >= m_off, n0, n1)
-            upd_nope = pltpu.roll(comb_nope, shift, axis=0)
+            @pl.when((full == 1) & (m_off == 0))
+            def _store_full_aligned():
+                vmem_nope_ref.at[cur_buf][...] = nope_tiles_vmem_ref[m_tile]
+                vmem_rope_ref.at[cur_buf][...] = rope_tiles_vmem_ref[m_tile]
 
-            r0 = rope_tiles_vmem_ref[m_tile]
-            r1 = rope_tiles_vmem_ref[m_tile + 1]
-            comb_rope = jnp.where(slot_rope >= m_off, r0, r1)
-            d_r = shift >> 2
-            d_q = jnp.bitwise_and(shift, 3)
-            lane_sh = pltpu.roll(comb_rope, d_q * 32, axis=1)
-            sh0 = pltpu.roll(lane_sh, d_r, axis=0)
-            sh1 = pltpu.roll(lane_sh, jnp.bitwise_and(d_r + 1, rope_tile - 1), axis=0)
-            upd_rope = jnp.where(q_iota < d_q, sh1, sh0)
+            @pl.when((full == 0) | (m_off != 0))
+            def _store_unaligned_or_partial():
+                n0 = nope_tiles_vmem_ref[m_tile]
+                n1 = nope_tiles_vmem_ref[m_tile + 1]
+                comb_nope = jnp.where(sublanes_k >= m_off, n0, n1)
+                upd_nope = pltpu.roll(comb_nope, shift, axis=0)
 
-            @pl.when(full == 1)
-            def _store_full():
-                vmem_nope_ref.at[cur_buf][...] = upd_nope
-                vmem_rope_ref.at[cur_buf][...] = upd_rope
+                r0 = rope_tiles_vmem_ref[m_tile]
+                r1 = rope_tiles_vmem_ref[m_tile + 1]
+                comb_rope = jnp.where(slot_rope >= m_off, r0, r1)
+                d_r = shift >> 2
+                d_q = jnp.bitwise_and(shift, 3)
+                lane_sh = pltpu.roll(comb_rope, d_q * 32, axis=1)
+                sh0 = pltpu.roll(lane_sh, d_r, axis=0)
+                sh1 = pltpu.roll(lane_sh, jnp.bitwise_and(d_r + 1, rope_tile - 1), axis=0)
+                upd_rope = jnp.where(q_iota < d_q, sh1, sh0)
 
-            @pl.when(full == 0)
-            def _store_partial():
-                valid_nope = (tid >= 0) & (sublanes_k >= l0) & (sublanes_k < l_end)
-                valid_rope = (tid >= 0) & (slot_rope >= l0) & (slot_rope < l_end)
-                _wait_read(i, cur_buf)
-                vmem_nope_ref.at[cur_buf][...] = jnp.where(
-                    valid_nope, upd_nope, vmem_nope_ref.at[cur_buf][...]
-                )
-                vmem_rope_ref.at[cur_buf][...] = jnp.where(
-                    valid_rope, upd_rope, vmem_rope_ref.at[cur_buf][...]
-                )
+                @pl.when(full == 1)
+                def _store_full():
+                    vmem_nope_ref.at[cur_buf][...] = upd_nope
+                    vmem_rope_ref.at[cur_buf][...] = upd_rope
+
+                @pl.when(full == 0)
+                def _store_partial():
+                    valid_nope = (tid >= 0) & (sublanes_k >= l0) & (sublanes_k < l_end)
+                    valid_rope = (tid >= 0) & (slot_rope >= l0) & (slot_rope < l_end)
+                    _wait_read(i, cur_buf)
+                    vmem_nope_ref.at[cur_buf][...] = jnp.where(
+                        valid_nope, upd_nope, vmem_nope_ref.at[cur_buf][...]
+                    )
+                    vmem_rope_ref.at[cur_buf][...] = jnp.where(
+                        valid_rope, upd_rope, vmem_rope_ref.at[cur_buf][...]
+                    )
 
             _start_write(i, cur_buf)
 
-        @pl.when(n_tiles >= 2)
-        def _epilogue_prev():
-            _wait_write(n_tiles - 2, (n_tiles - 2) & 1)
-
-        @pl.when(n_tiles >= 1)
-        def _epilogue_last():
-            _wait_write(n_tiles - 1, (n_tiles - 1) & 1)
+        @pl.loop(jnp.maximum(0, n_tiles - ring_depth), n_tiles)
+        def _epilogue(e_i):
+            _wait_write(e_i, e_i % ring_depth)
 
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
@@ -498,9 +532,9 @@ def compressor_insert_cache_jax(
             in_specs=[vmem_spec, vmem_spec, hbm_spec, hbm_spec],
             out_specs=[hbm_spec, hbm_spec],
             scratch_shapes=[
-                pltpu.VMEM((2, tile_k, 128), jnp.int32),
-                pltpu.VMEM((2, rope_tile, 128), jnp.int32),
-                pltpu.SemaphoreType.DMA((4, 2)),
+                pltpu.VMEM((ring_depth, tile_k, 128), jnp.int32),
+                pltpu.VMEM((ring_depth, rope_tile, 128), jnp.int32),
+                pltpu.SemaphoreType.DMA((4, ring_depth)),
             ],
         ),
         out_shape=(
@@ -533,27 +567,65 @@ def _scatter_packed_4_jax(
 ) -> jax.Array:
     """Scatter [num_tokens, 32] RoPE word records into [total_rows, 128]."""
     num_tokens, total_rows = records.shape[0], cache_2d.shape[0]
-    token_idx = jnp.arange(num_tokens, dtype=jnp.int32)
     row_id = kv_slot // 4
-    prev_idx = jnp.maximum(token_idx - step, 0)
-    same_as_prev = (
-        (token_idx >= step)
-        & is_boundary[prev_idx]
-        & ((kv_slot[prev_idx] // 4) == row_id)
-    )
-    write_row = jnp.where(is_boundary & (~same_as_prev), row_id, total_rows)
+    slot_mod = kv_slot % 4
+    if step < num_tokens:
+        prev_b = jnp.concatenate(
+            [jnp.zeros((step,), dtype=jnp.bool_), is_boundary[:-step]], axis=0
+        )
+        prev_r = jnp.concatenate(
+            [jnp.full((step,), -1, dtype=row_id.dtype), row_id[:-step]], axis=0
+        )
+        same_as_prev = prev_b & (prev_r == row_id)
+    else:
+        same_as_prev = jnp.zeros_like(is_boundary)
+    is_first = is_boundary & (~same_as_prev)
 
+    if num_tokens >= 192:
+        K = min(num_tokens, align_to(cdiv(num_tokens, 4 * step) + 96, 32))
+        if K < num_tokens:
+            first_idx = _compact_indices(is_first, K)
+            safe_f = jnp.maximum(first_idx, 0)
+            f_row = row_id[safe_f]
+            write_row = jnp.where(first_idx >= 0, f_row, total_rows)
+
+            pad_len = 3 * step
+            b_pad = jnp.pad(is_boundary, (0, pad_len), constant_values=False)
+            r_pad = jnp.pad(row_id, (0, pad_len), constant_values=-1)
+            m_pad = jnp.pad(slot_mod, (0, pad_len), constant_values=-1)
+            rec_pad = jnp.pad(records, ((0, pad_len), (0, 0)))
+
+            lane_q = (
+                jnp.arange(csa_cache_layout.ROW_WORDS, dtype=jnp.int32)
+                // csa_cache_layout.ROPE_WORDS
+            )[None, :]
+            tiles = cache_2d[jnp.clip(f_row, 0, total_rows - 1)]
+            for k in range(4):
+                idx_k = safe_f + k * step
+                valid_k = (first_idx >= 0) & b_pad[idx_k] & (r_pad[idx_k] == f_row)
+                mask_k = valid_k[:, None] & (m_pad[idx_k, None] == lane_q)
+                tiles = jnp.where(mask_k, jnp.tile(rec_pad[idx_k], (1, 4)), tiles)
+            return cache_2d.at[write_row].set(tiles, mode="drop")
+
+    write_row = jnp.where(is_first, row_id, total_rows)
+
+    pad_len = 3 * step
     records_128 = jnp.tile(records, (1, 4))
+    b_pad = jnp.pad(is_boundary, (0, pad_len), constant_values=False)
+    r_pad = jnp.pad(row_id, (0, pad_len), constant_values=-1)
+    m_pad = jnp.pad(slot_mod, (0, pad_len), constant_values=-1)
+    rec_pad = jnp.pad(records_128, ((0, pad_len), (0, 0)))
+
     lane_q = (
         jnp.arange(csa_cache_layout.ROW_WORDS, dtype=jnp.int32)
         // csa_cache_layout.ROPE_WORDS
     )[None, :]
     tiles = cache_2d[jnp.clip(row_id, 0, total_rows - 1)]
     for k in range(4):
-        idx = jnp.minimum(token_idx + k * step, num_tokens - 1)
-        valid_k = is_boundary[idx] & ((kv_slot[idx] // 4) == row_id)
-        mask_k = valid_k[:, None] & ((kv_slot[idx] % 4)[:, None] == lane_q)
-        tiles = jnp.where(mask_k, records_128[idx], tiles)
+        s = k * step
+        valid_k = b_pad[s : s + num_tokens] & (r_pad[s : s + num_tokens] == row_id)
+        mask_k = valid_k[:, None] & (m_pad[s : s + num_tokens, None] == lane_q)
+        tiles = jnp.where(mask_k, rec_pad[s : s + num_tokens], tiles)
     return cache_2d.at[write_row].set(tiles, mode="drop")
 
 
@@ -575,102 +647,126 @@ def indexer_produce_k_jax(
     max_kv_blocks = kv_block_table.shape[0] // max_num_seqs
     eff_max_seqs = min(max_num_seqs, max(8, align_to(num_tokens, 8)))
     num_pages, sublane_groups, pack, page_size = k_cache.shape
-    tiles_per_page = page_size // 128
+    tile_k = 256 if (num_tokens >= 1024 and page_size % 256 == 0) else 128
+    tiles_per_page = page_size // tile_k
     block_stride = max(1, (page_size * compress_ratio) // 1024)
 
     pos = positions.astype(jnp.int32)
     req = _seq_ids_from_locs(query_start_loc, num_tokens, eff_max_seqs)
     token_idx = jnp.arange(num_tokens, dtype=jnp.int32)
     valid = token_idx < query_start_loc[distribution[2]]
-    is_boundary = valid & (((pos + 1) % compress_ratio) == 0)
+    is_boundary = (
+        valid
+        if compress_ratio == 1
+        else (valid & (((pos + 1) % compress_ratio) == 0))
+    )
 
     pos_work = pos
     if compress_ratio > 1:
         # Compact to boundary tokens so the tile loop only visits written rows.
         M = min(
             num_tokens,
-            max(128, align_to((num_tokens + eff_max_seqs) // compress_ratio, 128)),
+            max(tile_k, align_to((num_tokens + eff_max_seqs) // compress_ratio, tile_k)),
         )
         owned_idx = _compact_indices(is_boundary, M)
         safe_idx = jnp.maximum(owned_idx, 0)
         k_normed = k_normed[safe_idx]
         pos_work = pos[safe_idx]
         req = req[safe_idx]
-        token_idx = jnp.arange(M, dtype=jnp.int32)
         is_boundary = owned_idx >= 0
 
-    kv_idx = jnp.maximum(pos_work // compress_ratio, 0)
+    kv_idx = (
+        jnp.maximum(pos_work, 0)
+        if compress_ratio == 1
+        else jnp.maximum(pos_work // compress_ratio, 0)
+    )
     kv_page_idx = jnp.clip((kv_idx // page_size) * block_stride, 0, max_kv_blocks - 1)
     kv_page_off = kv_idx % page_size
     kv_page = kv_block_table[req * max_kv_blocks + kv_page_idx]
 
     roped_f32 = _rope_block_start(k_normed, pos_work, cos_sin_cache, compress_ratio)
-    q, scale = compute.quantize_fp8_tiled(roped_f32[:, None, :], 128)
-    q_i32 = jax.lax.bitcast_convert_type(q.reshape(M, 32, 4), jnp.int32)
-    scale_i32 = (
-        jax.lax.bitcast_convert_type(scale, jnp.uint8).astype(jnp.int32).reshape(M, 1)
-    )
+    if num_tokens >= 96:
+        fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+        amax = jnp.clip(jnp.max(jnp.abs(roped_f32), axis=-1, keepdims=True), 1e-4, None)
+        scale = jnp.exp2(jnp.ceil(jnp.log2(amax / fp8_max)))
+        q = (roped_f32 * (1.0 / scale)).astype(jnp.float8_e4m3fn)
+        q_i32 = jax.lax.bitcast_convert_type(q.reshape(M, 32, 4), jnp.int32)
+        scale_i32 = (
+            (jax.lax.bitcast_convert_type(scale, jnp.uint32) >> 23) & 0xFF
+        ).astype(jnp.int32)
+    else:
+        q, scale = compute.quantize_fp8_tiled(roped_f32[:, None, :], 128)
+        q_i32 = jax.lax.bitcast_convert_type(q.reshape(M, 32, 4), jnp.int32)
+        scale_i32 = (
+            jax.lax.bitcast_convert_type(scale, jnp.uint8)
+            .astype(jnp.int32)
+            .reshape(M, 1)
+        )
     k_records_i32 = jnp.concatenate([q_i32, scale_i32], axis=1)
 
     kv_page = jnp.clip(kv_page, 0, num_pages - 1)
-    tile_id = kv_page * tiles_per_page + (kv_page_off // 128)
-    lane_off = kv_page_off % 128
+    tile_id = kv_page * tiles_per_page + (kv_page_off // tile_k)
+    lane_off = kv_page_off % tile_k
     valid_tile_id = jnp.where(is_boundary, tile_id, -1)
 
-    prev_idx = jnp.maximum(token_idx - 1, 0)
-    same_as_prev = (
-        (token_idx >= 1)
-        & is_boundary[prev_idx]
-        & (req[prev_idx] == req)
-        & (valid_tile_id[prev_idx] == valid_tile_id)
+    same_as_prev = jnp.concatenate(
+        [
+            jnp.zeros((1,), dtype=jnp.bool_),
+            is_boundary[:-1]
+            & (req[:-1] == req[1:])
+            & (valid_tile_id[:-1] == valid_tile_id[1:])
+            & (lane_off[1:] == lane_off[:-1] + 1),
+        ],
+        axis=0,
     )
     is_first = is_boundary & (~same_as_prev)
 
-    max_seqs_with_1 = min(eff_max_seqs, num_tokens)
-    max_seqs_with_2 = min(eff_max_seqs, num_tokens // (compress_ratio + 1))
+    max_seqs_with_1 = min(eff_max_seqs, M)
+    max_seqs_with_2 = min(eff_max_seqs, M // 2)
     max_tiles = min(
         M,
-        max_seqs_with_1 + max_seqs_with_2 + cdiv(num_tokens, 128 * compress_ratio),
+        max_seqs_with_1 + max_seqs_with_2 + cdiv(M, tile_k),
     )
     first_tok_idxs = _compact_indices(is_first, max_tiles)
+    num_valid_b = jnp.sum(is_boundary.astype(jnp.int32))
+    next_first = jnp.concatenate(
+        [first_tok_idxs[1:], jnp.asarray([-1], dtype=jnp.int32)]
+    )
+    last_tok_idxs = jnp.where(
+        first_tok_idxs >= 0,
+        jnp.where(next_first >= 0, next_first - 1, num_valid_b - 1),
+        -1,
+    )
     n_active_tiles = jnp.minimum(jnp.sum(is_first.astype(jnp.int32)), max_tiles)
 
     safe_t0 = jnp.maximum(first_tok_idxs, 0)
+    safe_t1 = jnp.maximum(last_tok_idxs, 0)
     tile_ids = jnp.where(first_tok_idxs >= 0, valid_tile_id[safe_t0], -1)
     lane0 = lane_off[safe_t0]
-    req0 = req[safe_t0]
+    lane_end = lane_off[safe_t1] + 1
+    is_full = jnp.where(
+        (first_tok_idxs >= 0) & (lane0 == 0) & (lane_end == tile_k), 1, 0
+    ).astype(jnp.int32)
 
-    padded_groups = align_to(sublane_groups + 3, 8)
-    pad_groups = padded_groups - (sublane_groups + 3)
-    tok_words = jnp.concatenate(
-        [
-            k_records_i32,
-            valid_tile_id[:, None],
-            req[:, None],
-            lane_off[:, None],
-            jnp.zeros((M, pad_groups), dtype=jnp.int32),
-        ],
-        axis=1,
-    )
-    num_m_tiles = cdiv(M, 128)
-    pad_m = (num_m_tiles + 1) * 128 - M
-    pad_row = jnp.asarray(
-        [0] * sublane_groups + [-1, -1, -1] + [0] * pad_groups, dtype=jnp.int32
-    )[None, :]
-    tok_words_padded = jnp.concatenate(
-        [tok_words, jnp.broadcast_to(pad_row, (pad_m, padded_groups))], axis=0
-    )
-    tok_tiles = tok_words_padded.reshape(num_m_tiles + 1, 128, padded_groups).transpose(
+    padded_groups = align_to(sublane_groups, 8)
+    pad_groups = padded_groups - sublane_groups
+    num_m_tiles = cdiv(M, tile_k)
+    pad_m = (num_m_tiles + 1) * tile_k - M
+    tok_words_padded = jnp.pad(k_records_i32, ((0, pad_m), (0, pad_groups)))
+    tok_tiles = tok_words_padded.reshape(num_m_tiles + 1, tile_k, padded_groups).transpose(
         0, 2, 1
     )
 
-    # SEQ_ALONG_LANE puts tokens on lanes, so each touched 128-token tile is
-    # read, merged with the in-VMEM rolled token records, and written back.
+    # SEQ_ALONG_LANE puts tokens on lanes, so each touched tile is either
+    # written directly when full or read-merged-written when partial.
+    ring_depth = 4 if num_tokens >= 2048 else 2
+
     def _pallas_kernel(
         tile_ids_ref,
         safe_t0_ref,
         lane0_ref,
-        req0_ref,
+        lane_end_ref,
+        is_full_ref,
         n_tiles_ref,
         tok_tiles_vmem_ref,
         cache_in_hbm_ref,
@@ -678,7 +774,7 @@ def indexer_produce_k_jax(
         vmem_cache_ref,
         sem_ref,
     ):
-        lanes_full = jax.lax.broadcasted_iota(jnp.int32, (padded_groups, 128), 1)
+        lanes_full = jax.lax.broadcasted_iota(jnp.int32, (padded_groups, tile_k), 1)
         lane_1d = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1)
         n_tiles = n_tiles_ref[0]
 
@@ -686,13 +782,13 @@ def indexer_produce_k_jax(
             tid = tile_ids_ref[idx]
             safe_tid = jnp.maximum(tid, 0)
             p = safe_tid // tiles_per_page
-            t_off = (safe_tid % tiles_per_page) * 128
+            t_off = (safe_tid % tiles_per_page) * tile_k
             return p, t_off
 
         def _start_read(idx, buf):
             p, t_off = _tile_hbm_slice(idx)
             pltpu.make_async_copy(
-                cache_in_hbm_ref.at[p, :, :, pl.ds(t_off, 128)],
+                cache_in_hbm_ref.at[p, :, :, pl.ds(t_off, tile_k)],
                 vmem_cache_ref.at[buf],
                 sem_ref.at[0, buf],
             ).start()
@@ -700,7 +796,7 @@ def indexer_produce_k_jax(
         def _wait_read(idx, buf):
             p, t_off = _tile_hbm_slice(idx)
             pltpu.make_async_copy(
-                cache_in_hbm_ref.at[p, :, :, pl.ds(t_off, 128)],
+                cache_in_hbm_ref.at[p, :, :, pl.ds(t_off, tile_k)],
                 vmem_cache_ref.at[buf],
                 sem_ref.at[0, buf],
             ).wait()
@@ -709,7 +805,7 @@ def indexer_produce_k_jax(
             p, t_off = _tile_hbm_slice(idx)
             pltpu.make_async_copy(
                 vmem_cache_ref.at[buf],
-                cache_out_hbm_ref.at[p, :, :, pl.ds(t_off, 128)],
+                cache_out_hbm_ref.at[p, :, :, pl.ds(t_off, tile_k)],
                 sem_ref.at[1, buf],
             ).start()
 
@@ -717,89 +813,1337 @@ def indexer_produce_k_jax(
             p, t_off = _tile_hbm_slice(idx)
             pltpu.make_async_copy(
                 vmem_cache_ref.at[buf],
-                cache_out_hbm_ref.at[p, :, :, pl.ds(t_off, 128)],
+                cache_out_hbm_ref.at[p, :, :, pl.ds(t_off, tile_k)],
                 sem_ref.at[1, buf],
             ).wait()
 
-        @pl.when(n_tiles > 0)
-        def _prologue():
-            _start_read(0, 0)
+        @pl.loop(0, jnp.minimum(n_tiles, ring_depth))
+        def _prologue(p_i):
+            @pl.when(is_full_ref[p_i] == 0)
+            def _read_p():
+                _start_read(p_i, p_i)
 
         @pl.loop(0, n_tiles)
         def _step(i):
-            cur_buf = i & 1
-            nxt_buf = 1 - cur_buf
+            cur_buf = i % ring_depth
 
-            @pl.when(i + 1 < n_tiles)
-            def _prefetch_next():
-                @pl.when(i >= 1)
-                def _wait_prev_write_on_nxt():
-                    _wait_write(i - 1, nxt_buf)
+            @pl.when(i >= ring_depth)
+            def _wait_ring_write():
+                _wait_write(i - ring_depth, cur_buf)
 
-                _start_read(i + 1, nxt_buf)
+                @pl.when(is_full_ref[i] == 0)
+                def _issue_late_read():
+                    _start_read(i, cur_buf)
 
             tid = tile_ids_ref[i]
             t0 = safe_t0_ref[i]
             l0 = lane0_ref[i]
-            r0 = req0_ref[i]
+            l_end = lane_end_ref[i]
+            full = is_full_ref[i]
 
-            m_tile = t0 // 128
-            m_off = t0 % 128
-            tile0 = tok_tiles_vmem_ref[m_tile]
-            tile1 = tok_tiles_vmem_ref[m_tile + 1]
-            combined = jnp.where(lanes_full >= m_off, tile0, tile1)
-            shift = jnp.bitwise_and(l0 - m_off, 127)
-            rolled = pltpu.roll(combined, shift, axis=1)
+            m_tile = t0 // tile_k
+            m_off = t0 % tile_k
+            shift = jnp.bitwise_and(l0 - m_off, tile_k - 1)
 
-            tok_tid = rolled[sublane_groups : sublane_groups + 1, :]
-            tok_req = rolled[sublane_groups + 1 : sublane_groups + 2, :]
-            tok_loff = rolled[sublane_groups + 2 : sublane_groups + 3, :]
-            valid_mask = (
-                (tid >= 0)
-                & (lane_1d >= l0)
-                & (tok_tid == tid)
-                & (tok_req == r0)
-                & (tok_loff == lane_1d)
-            )
-            upd_u8 = pltpu.bitcast(rolled[:sublane_groups, :], jnp.uint8).reshape(
-                sublane_groups, pack, 128
-            )
-            _wait_read(i, cur_buf)
-            vmem_cache_ref.at[cur_buf][...] = jnp.where(
-                valid_mask[:, None, :], upd_u8, vmem_cache_ref.at[cur_buf][...]
-            )
+            @pl.when((full == 1) & (m_off == 0))
+            def _store_full_aligned():
+                tile0 = tok_tiles_vmem_ref[m_tile]
+                vmem_cache_ref.at[cur_buf][...] = pltpu.bitcast(
+                    tile0[:sublane_groups, :], jnp.uint8
+                ).reshape(sublane_groups, pack, tile_k)
+
+            @pl.when((full == 0) | (m_off != 0))
+            def _store_unaligned_or_partial():
+                tile0 = tok_tiles_vmem_ref[m_tile]
+                tile1 = tok_tiles_vmem_ref[m_tile + 1]
+                combined = jnp.where(lanes_full >= m_off, tile0, tile1)
+                rolled = pltpu.roll(combined, shift, axis=1)
+                upd_u8 = pltpu.bitcast(rolled[:sublane_groups, :], jnp.uint8).reshape(
+                    sublane_groups, pack, tile_k
+                )
+
+                @pl.when(full == 1)
+                def _store_full():
+                    vmem_cache_ref.at[cur_buf][...] = upd_u8
+
+                @pl.when(full == 0)
+                def _store_partial():
+                    _wait_read(i, cur_buf)
+                    if tile_k == 128:
+                        valid_mask = (tid >= 0) & (lane_1d >= l0) & (lane_1d < l_end)
+                        vmem_cache_ref.at[cur_buf][...] = jnp.where(
+                            valid_mask[:, None, :], upd_u8, vmem_cache_ref.at[cur_buf][...]
+                        )
+                    else:
+                        valid0 = (tid >= 0) & (lane_1d >= l0) & (lane_1d < l_end)
+                        lane_hi = lane_1d + 128
+                        valid1 = (tid >= 0) & (lane_hi >= l0) & (lane_hi < l_end)
+                        cur0 = vmem_cache_ref.at[cur_buf, :, :, pl.ds(0, 128)][...]
+                        cur1 = vmem_cache_ref.at[cur_buf, :, :, pl.ds(128, 128)][...]
+                        vmem_cache_ref.at[cur_buf, :, :, pl.ds(0, 128)][...] = jnp.where(
+                            valid0[:, None, :], upd_u8[:, :, :128], cur0
+                        )
+                        vmem_cache_ref.at[cur_buf, :, :, pl.ds(128, 128)][...] = jnp.where(
+                            valid1[:, None, :], upd_u8[:, :, 128:], cur1
+                        )
+
             _start_write(i, cur_buf)
 
-        @pl.when(n_tiles >= 2)
-        def _epilogue_prev():
-            _wait_write(n_tiles - 2, (n_tiles - 2) & 1)
-
-        @pl.when(n_tiles >= 1)
-        def _epilogue_last():
-            _wait_write(n_tiles - 1, (n_tiles - 1) & 1)
+        @pl.loop(jnp.maximum(0, n_tiles - ring_depth), n_tiles)
+        def _epilogue(e_i):
+            _wait_write(e_i, e_i % ring_depth)
 
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
-    vmem_tile = pltpu.VMEM((2, sublane_groups, pack, 128), jnp.uint8)
+    vmem_tile = pltpu.VMEM((ring_depth, sublane_groups, pack, tile_k), jnp.uint8)
     return pl.pallas_call(
         _pallas_kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=5,
+            num_scalar_prefetch=6,
             grid=(1,),
             in_specs=[vmem_spec, hbm_spec],
             out_specs=hbm_spec,
-            scratch_shapes=[vmem_tile, pltpu.SemaphoreType.DMA((2, 2))],
+            scratch_shapes=[vmem_tile, pltpu.SemaphoreType.DMA((2, ring_depth))],
         ),
         out_shape=jax.ShapeDtypeStruct(k_cache.shape, k_cache.dtype),
-        input_output_aliases={6: 0},
+        input_output_aliases={7: 0},
+        compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
     )(
         tile_ids,
         safe_t0,
         lane0,
-        req0,
+        lane_end,
+        is_full,
         jnp.asarray([n_active_tiles], dtype=jnp.int32),
         tok_tiles,
         k_cache,
+    )
+
+
+def fused_indexer_produce_k_jax(
+    latent: jax.Array,  # [num_tokens, 512] bf16
+    wk_weight: jax.Array,  # [128, 512] or [512, 128] bf16 or fp8
+    knorm_weight: jax.Array,  # [128] bf16/f32
+    cos_sin_cache: jax.Array,  # [max_pos, 64] f32
+    positions: jax.Array,  # [num_tokens] i32
+    kv_block_table: jax.Array,  # [max_num_seqs * max_kv_blocks] i32
+    query_start_loc: jax.Array,  # [max_num_seqs + 1] i32
+    distribution: jax.Array,  # [3] i32
+    k_cache: jax.Array,  # [num_pages, 33, 4, page_size] u8 (donated)
+    wk_weight_scale: jax.Array | None = None,
+    *,
+    compress_ratio: int,
+    rms_eps: float = 1e-6,
+) -> jax.Array:
+    """Single fused custom op: wk + k_norm (RMSNorm) + indexer_produce_k_jax."""
+    rhs_dim = 1 if wk_weight.shape[0] == knorm_weight.shape[0] else 0
+    if wk_weight_scale is not None:
+        proj = jax.lax.dot_general(
+            latent.astype(wk_weight.dtype),
+            wk_weight,
+            (((1,), (rhs_dim,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        k_raw = jax.lax.optimization_barrier(
+            (proj * wk_weight_scale.reshape(1, -1)).astype(jnp.bfloat16)
+        )
+    else:
+        k_raw = jax.lax.optimization_barrier(
+            jax.lax.dot_general(
+                latent.astype(jnp.bfloat16),
+                wk_weight.astype(jnp.bfloat16),
+                (((1,), (rhs_dim,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            ).astype(jnp.bfloat16)
+        )
+    k_f32 = k_raw.astype(jnp.float32)
+    rstd = jax.lax.rsqrt(
+        jnp.mean(k_f32 * k_f32, axis=-1, keepdims=True) + rms_eps
+    )
+    k_normed = (k_f32 * rstd).astype(jnp.bfloat16) * knorm_weight.astype(
+        jnp.bfloat16
+    )
+    return indexer_produce_k_jax(
+        k_normed,
+        cos_sin_cache,
+        positions,
+        kv_block_table,
+        query_start_loc,
+        distribution,
+        k_cache,
+        compress_ratio=compress_ratio,
+    )
+
+
+def _fused_quant_pack_and_single_pallas_scatter(
+    latent: jax.Array,  # [num_tokens, 512] bf16
+    wk_weight: jax.Array,  # [128, 512] bf16/fp8
+    knorm_weight: jax.Array,  # [128] bf16
+    cos_sin_cache: jax.Array,  # [max_pos, 64] f32
+    idx_cos_sin_cache: jax.Array,  # [max_pos, 64] f32
+    positions: jax.Array,  # [num_tokens] i32
+    kv_block_table: jax.Array,  # [max_num_seqs * max_kv_blocks] i32
+    idx_block_table: jax.Array,  # [max_num_seqs * max_idx_blocks] i32
+    query_start_loc: jax.Array,  # [max_num_seqs + 1] i32
+    distribution: jax.Array,  # [3] i32
+    nope_cache: jax.Array,  # donated: [num_kv_pages, kv_page_size, 128] i32
+    rope_cache: jax.Array,  # donated: [num_kv_pages, kv_page_size // 4, 128] i32
+    k_cache: jax.Array,  # donated: [num_idx_pages, 33, 4, idx_page_size] u8
+    wk_weight_scale: jax.Array | None = None,
+    *,
+    compress_ratio: int,
+    idx_rms_eps: float = 1e-6,
+    state_slots_in: jax.Array | None = None,
+    st_write_slots: jax.Array | None = None,
+    st_should_write: jax.Array | None = None,
+    st_wkv_words: jax.Array | None = None,
+    n_st_writes: jax.Array | None = None,
+):
+    """Single XLA quant/pack prelude + single concurrent 3/4-cache Pallas async DMA kernel."""
+    num_tokens = latent.shape[0]
+    max_num_seqs = query_start_loc.shape[0] - 1
+    eff_max_seqs = min(max_num_seqs, max(8, align_to(num_tokens, 8)))
+    pos = positions.astype(jnp.int32)
+    token_idx = jnp.arange(num_tokens, dtype=jnp.int32)
+
+    rhs_dim = 1 if wk_weight.shape[0] == knorm_weight.shape[0] else 0
+    if wk_weight_scale is not None:
+        proj = jax.lax.dot_general(
+            latent.astype(wk_weight.dtype),
+            wk_weight,
+            (((1,), (rhs_dim,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        k_raw = jax.lax.optimization_barrier(
+            (proj * wk_weight_scale.reshape(1, -1)).astype(jnp.bfloat16)
+        )
+    else:
+        k_raw = jax.lax.optimization_barrier(
+            jax.lax.dot_general(
+                latent.astype(jnp.bfloat16),
+                wk_weight.astype(jnp.bfloat16),
+                (((1,), (rhs_dim,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            ).astype(jnp.bfloat16)
+        )
+    k_f32 = k_raw.astype(jnp.float32)
+    k_rstd = jax.lax.rsqrt(
+        jnp.mean(k_f32 * k_f32, axis=-1, keepdims=True) + idx_rms_eps
+    )
+    k_normed_all = (k_f32 * k_rstd).astype(jnp.bfloat16) * knorm_weight.astype(
+        jnp.bfloat16
+    )
+
+    valid = token_idx < query_start_loc[distribution[2]]
+    is_boundary_all = (
+        valid
+        if compress_ratio == 1
+        else (valid & (((pos + 1) % compress_ratio) == 0))
+    )
+
+    num_kv_pages, kv_page_size = nope_cache.shape[:2]
+    num_idx_pages, sublane_groups, pack, idx_page_size = k_cache.shape
+    max_kv_blocks = kv_block_table.shape[0] // max_num_seqs
+    max_idx_blocks = idx_block_table.shape[0] // max_num_seqs
+
+    tile_k = (
+        256
+        if (
+            num_tokens > 1536
+            and kv_page_size % 256 == 0
+            and idx_page_size % 256 == 0
+        )
+        else 128
+    )
+    use_narrow_nr = num_tokens <= 1536
+    nr_dma = 16
+    rope_dma = 16
+
+    M = (
+        num_tokens
+        if compress_ratio == 1
+        else min(
+            num_tokens,
+            max(tile_k, align_to((num_tokens + eff_max_seqs) // compress_ratio, tile_k)),
+        )
+    )
+
+    if compress_ratio == 2 and M == num_tokens // 2:
+        even_is_b = is_boundary_all[0]
+
+        def _fast_strided_idx():
+            base = jnp.arange(M, dtype=jnp.int32) * 2 + jnp.where(even_is_b, 0, 1)
+            return jnp.where(base < query_start_loc[distribution[2]], base, -1)
+
+        owned_idx = jax.lax.cond(
+            distribution[2] <= 1,
+            _fast_strided_idx,
+            lambda: _compact_indices(is_boundary_all, M),
+        )
+    elif compress_ratio > 1:
+        owned_idx = _compact_indices(is_boundary_all, M)
+    else:
+        owned_idx = token_idx
+
+    if compress_ratio > 1:
+        safe_idx = jnp.maximum(owned_idx, 0)
+        latent_work = latent[safe_idx]
+        k_normed = k_normed_all[safe_idx]
+        pos_work = pos[safe_idx]
+        req = jax.lax.cond(
+            distribution[2] <= 1,
+            lambda: jnp.zeros((M,), dtype=jnp.int32),
+            lambda: _seq_ids_from_locs(query_start_loc, num_tokens, eff_max_seqs)[
+                safe_idx
+            ],
+        )
+        is_boundary = owned_idx >= 0
+    else:
+        latent_work = latent
+        k_normed = k_normed_all
+        pos_work = pos
+        req = jax.lax.cond(
+            distribution[2] <= 1,
+            lambda: jnp.zeros((M,), dtype=jnp.int32),
+            lambda: _seq_ids_from_locs(query_start_loc, num_tokens, eff_max_seqs),
+        )
+        is_boundary = is_boundary_all
+
+    kv_idx = (
+        jnp.maximum(pos_work, 0)
+        if compress_ratio == 1
+        else jnp.maximum(pos_work // compress_ratio, 0)
+    )
+
+    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+    f32_work = latent_work.astype(jnp.float32)
+    r0, r1, r2 = f32_work[:, :128], f32_work[:, 128:256], f32_work[:, 256:384]
+    r3_nope, x_rope = f32_work[:, 384:448], f32_work[:, 448:512]
+    m012 = jnp.maximum(jnp.maximum(jnp.abs(r0), jnp.abs(r1)), jnp.abs(r2))
+    folded = jnp.maximum(jnp.maximum(m012[:, :64], m012[:, 64:]), jnp.abs(r3_nope))
+    amax = jnp.clip(folded, 1e-4, None)
+    scale = jnp.exp2(jnp.ceil(jnp.log2(amax / fp8_max)))
+    inv_s = 1.0 / scale
+    inv_s128 = jnp.concatenate([inv_s, inv_s], axis=-1)
+    b0 = jax.lax.bitcast_convert_type(
+        (r0 * inv_s128).astype(jnp.float8_e4m3fn), jnp.uint8
+    ).astype(jnp.uint32)
+    b1 = jax.lax.bitcast_convert_type(
+        (r1 * inv_s128).astype(jnp.float8_e4m3fn), jnp.uint8
+    ).astype(jnp.uint32)
+    b2 = jax.lax.bitcast_convert_type(
+        (r2 * inv_s128).astype(jnp.float8_e4m3fn), jnp.uint8
+    ).astype(jnp.uint32)
+    b3_lo = jax.lax.bitcast_convert_type(
+        (r3_nope * inv_s).astype(jnp.float8_e4m3fn), jnp.uint8
+    ).astype(jnp.uint32)
+    b3_hi = (jax.lax.bitcast_convert_type(scale, jnp.uint32) >> 23) & 0xFF
+    b3 = jnp.concatenate([b3_lo, b3_hi], axis=-1)
+    nope_records = jax.lax.bitcast_convert_type(
+        b0 | (b1 << 8) | (b2 << 16) | (b3 << 24), jnp.int32
+    )
+
+    start = (
+        jnp.clip(pos_work, 0, cos_sin_cache.shape[0] - 1)
+        if compress_ratio == 1
+        else jnp.clip(
+            (pos_work // compress_ratio) * compress_ratio, 0, cos_sin_cache.shape[0] - 1
+        )
+    )
+    cs = jnp.repeat(cos_sin_cache[start], 2, axis=-1)
+    cos, sin = cs[:, :64], cs[:, 64:]
+    x_rot = jnp.stack([-x_rope[:, 1::2], x_rope[:, 0::2]], axis=-1).reshape(M, 64)
+    y_rope = (x_rope * cos + x_rot * sin).astype(jnp.bfloat16)
+    rope_records = csa_cache_layout.rope_words(y_rope)
+
+    roped_f32 = _rope_block_start(k_normed, pos_work, idx_cos_sin_cache, compress_ratio)
+    if num_tokens >= 96:
+        k_amax = jnp.clip(
+            jnp.max(jnp.abs(roped_f32), axis=-1, keepdims=True), 1e-4, None
+        )
+        k_scale = jnp.exp2(jnp.ceil(jnp.log2(k_amax / fp8_max)))
+        k_q = (roped_f32 * (1.0 / k_scale)).astype(jnp.float8_e4m3fn)
+        q_i32 = jax.lax.bitcast_convert_type(k_q.reshape(M, 32, 4), jnp.int32)
+        scale_i32 = (
+            (jax.lax.bitcast_convert_type(k_scale, jnp.uint32) >> 23) & 0xFF
+        ).astype(jnp.int32)
+    else:
+        k_q, k_scale = compute.quantize_fp8_tiled(roped_f32[:, None, :], 128)
+        q_i32 = jax.lax.bitcast_convert_type(k_q.reshape(M, 32, 4), jnp.int32)
+        scale_i32 = (
+            jax.lax.bitcast_convert_type(k_scale, jnp.uint8)
+            .astype(jnp.int32)
+            .reshape(M, 1)
+        )
+    k_records_i32 = jnp.concatenate([q_i32, scale_i32], axis=1)
+
+    rope_tile = tile_k // 4
+    tiles_per_page = kv_page_size // tile_k
+    idx_block_stride = max(1, (idx_page_size * compress_ratio) // 1024)
+
+    kv_page_idx = jnp.clip(kv_idx // kv_page_size, 0, max_kv_blocks - 1)
+    kv_page_off = kv_idx % kv_page_size
+    kv_page = jnp.clip(
+        kv_block_table[req * max_kv_blocks + kv_page_idx], 0, num_kv_pages - 1
+    )
+
+    idx_page_idx = jnp.clip(
+        (kv_idx // idx_page_size) * idx_block_stride, 0, max_idx_blocks - 1
+    )
+    idx_page = jnp.clip(
+        idx_block_table[req * max_idx_blocks + idx_page_idx], 0, num_idx_pages - 1
+    )
+
+    tile_id = kv_page * tiles_per_page + (kv_page_off // tile_k)
+    lane_off = kv_page_off % tile_k
+    valid_tile_id = jnp.where(is_boundary, tile_id, -1)
+
+    same_as_prev = jnp.concatenate(
+        [
+            jnp.zeros((1,), dtype=jnp.bool_),
+            is_boundary[:-1]
+            & (req[:-1] == req[1:])
+            & (valid_tile_id[:-1] == valid_tile_id[1:])
+            & (idx_page[:-1] == idx_page[1:])
+            & (lane_off[1:] == lane_off[:-1] + 1),
+        ],
+        axis=0,
+    )
+    is_first = is_boundary & (~same_as_prev)
+
+    max_seqs_with_1 = min(eff_max_seqs, M)
+    max_seqs_with_2 = min(eff_max_seqs, M // 2)
+    max_tiles = min(M, max_seqs_with_1 + max_seqs_with_2 + cdiv(M, tile_k))
+
+    first_tok_idxs = _compact_indices(is_first, max_tiles)
+    num_valid_b = jnp.sum(is_boundary.astype(jnp.int32))
+    next_first = jnp.concatenate(
+        [first_tok_idxs[1:], jnp.asarray([-1], dtype=jnp.int32)]
+    )
+    last_tok_idxs = jnp.where(
+        first_tok_idxs >= 0,
+        jnp.where(next_first >= 0, next_first - 1, num_valid_b - 1),
+        -1,
+    )
+    n_active_tiles = jnp.minimum(jnp.sum(is_first.astype(jnp.int32)), max_tiles)
+
+    safe_t0 = jnp.maximum(first_tok_idxs, 0)
+    safe_t1 = jnp.maximum(last_tok_idxs, 0)
+    tile_ids = jnp.where(first_tok_idxs >= 0, valid_tile_id[safe_t0], -1)
+    idx_pages = jnp.where(first_tok_idxs >= 0, idx_page[safe_t0], 0)
+    lanes0 = lane_off[safe_t0]
+    lanes_end = lane_off[safe_t1] + 1
+    is_full = jnp.where(
+        (first_tok_idxs >= 0) & (lanes0 == 0) & (lanes_end == tile_k), 1, 0
+    ).astype(jnp.int32)
+
+    num_m_tiles = cdiv(M, tile_k)
+    pad_toks = (num_m_tiles + 1) * tile_k - M
+    nope_tiles = jnp.pad(nope_records, ((0, pad_toks), (0, 0))).reshape(
+        num_m_tiles + 1, tile_k, 128
+    )
+    rope_tiles = jnp.pad(rope_records, ((0, pad_toks), (0, 0))).reshape(
+        num_m_tiles + 1, rope_tile, 128
+    )
+
+    padded_groups = align_to(sublane_groups, 8)
+    pad_groups = padded_groups - sublane_groups
+    tok_words_padded = jnp.pad(k_records_i32, ((0, pad_toks), (0, pad_groups)))
+    k_tiles = tok_words_padded.reshape(
+        num_m_tiles + 1, tile_k, padded_groups
+    ).transpose(0, 2, 1)
+
+    has_state_cache = state_slots_in is not None
+    ring_depth = 4
+
+    def _single_cache_kernel(*args):
+        if has_state_cache:
+            (
+                tile_ids_ref,
+                idx_pages_ref,
+                safe_t0_ref,
+                lanes0_ref,
+                lanes_end_ref,
+                is_full_ref,
+                st_slots_ref,
+                st_should_ref,
+                n_tiles_ref,
+                st_words_vmem_ref,
+                nope_tiles_vmem_ref,
+                rope_tiles_vmem_ref,
+                k_tiles_vmem_ref,
+                st_in_hbm_ref,
+                nope_in_hbm_ref,
+                rope_in_hbm_ref,
+                k_in_hbm_ref,
+                st_out_hbm_ref,
+                nope_out_hbm_ref,
+                rope_out_hbm_ref,
+                k_out_hbm_ref,
+                vmem_nope_ref,
+                vmem_rope_ref,
+                vmem_k_ref,
+                sem_ref,
+                st_sem_ref,
+                *wide_scratch,
+            ) = args
+            n_st = n_tiles_ref[1]
+
+            @pl.loop(0, eff_max_seqs)
+            def _issue_state_writes(s_i):
+                @pl.when(st_should_ref[s_i] == 1)
+                def _do_st():
+                    slot = st_slots_ref[s_i]
+                    pltpu.make_async_copy(
+                        st_words_vmem_ref.at[s_i],
+                        st_out_hbm_ref.at[slot],
+                        st_sem_ref.at[0],
+                    ).start()
+        else:
+            (
+                tile_ids_ref,
+                idx_pages_ref,
+                safe_t0_ref,
+                lanes0_ref,
+                lanes_end_ref,
+                is_full_ref,
+                n_tiles_ref,
+                nope_tiles_vmem_ref,
+                rope_tiles_vmem_ref,
+                k_tiles_vmem_ref,
+                nope_in_hbm_ref,
+                rope_in_hbm_ref,
+                k_in_hbm_ref,
+                nope_out_hbm_ref,
+                rope_out_hbm_ref,
+                k_out_hbm_ref,
+                vmem_nope_ref,
+                vmem_rope_ref,
+                vmem_k_ref,
+                sem_ref,
+                *wide_scratch,
+            ) = args
+
+        if use_narrow_nr:
+            vmem_nope_wide_ref, vmem_rope_wide_ref, sem_wide_ref = wide_scratch
+
+        sublanes_nr = jax.lax.broadcasted_iota(jnp.int32, (tile_k, 128), 0)
+        row_r = jax.lax.broadcasted_iota(jnp.int32, (rope_tile, 128), 0)
+        q_iota = jax.lax.broadcasted_iota(jnp.int32, (rope_tile, 128), 1) // 32
+        slot_rope = row_r * 4 + q_iota
+        lanes_full = jax.lax.broadcasted_iota(jnp.int32, (padded_groups, tile_k), 1)
+        lane_1d = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1)
+        n_tiles = n_tiles_ref[0]
+
+        def _tile_hbm_slices(idx):
+            tid = jnp.maximum(tile_ids_ref[idx], 0)
+            p_kv = tid // tiles_per_page
+            p_rem = tid % tiles_per_page
+            p_idx = idx_pages_ref[idx]
+            k_off = p_rem * tile_k
+            r_tile_off = p_rem * rope_tile
+            l0_i = lanes0_ref[idx]
+            sub_off = jnp.minimum((l0_i // 8) * 8, tile_k - nr_dma)
+            r_sub_off = jnp.minimum((l0_i // 32) * 8, rope_tile - rope_dma)
+            is_nar = (lanes_end_ref[idx] - l0_i) <= 9
+            return (
+                p_kv,
+                p_idx,
+                k_off,
+                r_tile_off,
+                k_off + sub_off,
+                r_tile_off + r_sub_off,
+                sub_off,
+                r_sub_off,
+                is_nar,
+            )
+
+        def _start_read_all3(idx, buf):
+            (
+                p_kv,
+                p_idx,
+                k_off,
+                r_tile_off,
+                nope_nar_off,
+                rope_nar_off,
+                _,
+                _,
+                is_nar,
+            ) = _tile_hbm_slices(idx)
+
+            @pl.when(is_full_ref[idx] == 0)
+            def _rd():
+                if use_narrow_nr:
+                    @pl.when(is_nar)
+                    def _rd_nar():
+                        pltpu.make_async_copy(
+                            nope_in_hbm_ref.at[p_kv, pl.ds(nope_nar_off, nr_dma), :],
+                            vmem_nope_ref.at[buf],
+                            sem_ref.at[0, buf],
+                        ).start()
+                        pltpu.make_async_copy(
+                            rope_in_hbm_ref.at[p_kv, pl.ds(rope_nar_off, rope_dma), :],
+                            vmem_rope_ref.at[buf],
+                            sem_ref.at[1, buf],
+                        ).start()
+
+                    @pl.when(~is_nar)
+                    def _rd_wide():
+                        pltpu.make_async_copy(
+                            nope_in_hbm_ref.at[p_kv, pl.ds(k_off, tile_k), :],
+                            vmem_nope_wide_ref.at[buf],
+                            sem_wide_ref.at[0, buf],
+                        ).start()
+                        pltpu.make_async_copy(
+                            rope_in_hbm_ref.at[p_kv, pl.ds(r_tile_off, rope_tile), :],
+                            vmem_rope_wide_ref.at[buf],
+                            sem_wide_ref.at[1, buf],
+                        ).start()
+                else:
+                    pltpu.make_async_copy(
+                        nope_in_hbm_ref.at[p_kv, pl.ds(k_off, tile_k), :],
+                        vmem_nope_ref.at[buf],
+                        sem_ref.at[0, buf],
+                    ).start()
+                    pltpu.make_async_copy(
+                        rope_in_hbm_ref.at[p_kv, pl.ds(r_tile_off, rope_tile), :],
+                        vmem_rope_ref.at[buf],
+                        sem_ref.at[1, buf],
+                    ).start()
+                pltpu.make_async_copy(
+                    k_in_hbm_ref.at[p_idx, :, :, pl.ds(k_off, tile_k)],
+                    vmem_k_ref.at[buf],
+                    sem_ref.at[2, buf],
+                ).start()
+
+        def _wait_read_nr_nar(idx, buf):
+            p_kv, _, _, _, nope_nar_off, rope_nar_off, _, _, _ = _tile_hbm_slices(idx)
+            pltpu.make_async_copy(
+                nope_in_hbm_ref.at[p_kv, pl.ds(nope_nar_off, nr_dma), :],
+                vmem_nope_ref.at[buf],
+                sem_ref.at[0, buf],
+            ).wait()
+            pltpu.make_async_copy(
+                rope_in_hbm_ref.at[p_kv, pl.ds(rope_nar_off, rope_dma), :],
+                vmem_rope_ref.at[buf],
+                sem_ref.at[1, buf],
+            ).wait()
+
+        def _wait_read_nr_wide(idx, buf, n_buf_ref, r_buf_ref, s_ref):
+            p_kv, _, k_off, r_tile_off, _, _, _, _, _ = _tile_hbm_slices(idx)
+            pltpu.make_async_copy(
+                nope_in_hbm_ref.at[p_kv, pl.ds(k_off, tile_k), :],
+                n_buf_ref.at[buf],
+                s_ref.at[0, buf],
+            ).wait()
+            pltpu.make_async_copy(
+                rope_in_hbm_ref.at[p_kv, pl.ds(r_tile_off, rope_tile), :],
+                r_buf_ref.at[buf],
+                s_ref.at[1, buf],
+            ).wait()
+
+        def _wait_read_k(idx, buf):
+            _, p_idx, k_off, _, _, _, _, _, _ = _tile_hbm_slices(idx)
+            pltpu.make_async_copy(
+                k_in_hbm_ref.at[p_idx, :, :, pl.ds(k_off, tile_k)],
+                vmem_k_ref.at[buf],
+                sem_ref.at[2, buf],
+            ).wait()
+
+        def _start_write_all3(idx, buf):
+            (
+                p_kv,
+                p_idx,
+                k_off,
+                r_tile_off,
+                nope_nar_off,
+                rope_nar_off,
+                _,
+                _,
+                is_nar,
+            ) = _tile_hbm_slices(idx)
+            if use_narrow_nr:
+                @pl.when(is_nar)
+                def _wr_nar():
+                    pltpu.make_async_copy(
+                        vmem_nope_ref.at[buf],
+                        nope_out_hbm_ref.at[p_kv, pl.ds(nope_nar_off, nr_dma), :],
+                        sem_ref.at[3, buf],
+                    ).start()
+                    pltpu.make_async_copy(
+                        vmem_rope_ref.at[buf],
+                        rope_out_hbm_ref.at[p_kv, pl.ds(rope_nar_off, rope_dma), :],
+                        sem_ref.at[4, buf],
+                    ).start()
+
+                @pl.when(~is_nar)
+                def _wr_wide():
+                    pltpu.make_async_copy(
+                        vmem_nope_wide_ref.at[buf],
+                        nope_out_hbm_ref.at[p_kv, pl.ds(k_off, tile_k), :],
+                        sem_wide_ref.at[2, buf],
+                    ).start()
+                    pltpu.make_async_copy(
+                        vmem_rope_wide_ref.at[buf],
+                        rope_out_hbm_ref.at[p_kv, pl.ds(r_tile_off, rope_tile), :],
+                        sem_wide_ref.at[3, buf],
+                    ).start()
+            else:
+                pltpu.make_async_copy(
+                    vmem_nope_ref.at[buf],
+                    nope_out_hbm_ref.at[p_kv, pl.ds(k_off, tile_k), :],
+                    sem_ref.at[3, buf],
+                ).start()
+                pltpu.make_async_copy(
+                    vmem_rope_ref.at[buf],
+                    rope_out_hbm_ref.at[p_kv, pl.ds(r_tile_off, rope_tile), :],
+                    sem_ref.at[4, buf],
+                ).start()
+            pltpu.make_async_copy(
+                vmem_k_ref.at[buf],
+                k_out_hbm_ref.at[p_idx, :, :, pl.ds(k_off, tile_k)],
+                sem_ref.at[5, buf],
+            ).start()
+
+        def _wait_write_all3(idx, buf):
+            (
+                p_kv,
+                p_idx,
+                k_off,
+                r_tile_off,
+                nope_nar_off,
+                rope_nar_off,
+                _,
+                _,
+                is_nar,
+            ) = _tile_hbm_slices(idx)
+            if use_narrow_nr:
+                @pl.when(is_nar)
+                def _ww_nar():
+                    pltpu.make_async_copy(
+                        vmem_nope_ref.at[buf],
+                        nope_out_hbm_ref.at[p_kv, pl.ds(nope_nar_off, nr_dma), :],
+                        sem_ref.at[3, buf],
+                    ).wait()
+                    pltpu.make_async_copy(
+                        vmem_rope_ref.at[buf],
+                        rope_out_hbm_ref.at[p_kv, pl.ds(rope_nar_off, rope_dma), :],
+                        sem_ref.at[4, buf],
+                    ).wait()
+
+                @pl.when(~is_nar)
+                def _ww_wide():
+                    pltpu.make_async_copy(
+                        vmem_nope_wide_ref.at[buf],
+                        nope_out_hbm_ref.at[p_kv, pl.ds(k_off, tile_k), :],
+                        sem_wide_ref.at[2, buf],
+                    ).wait()
+                    pltpu.make_async_copy(
+                        vmem_rope_wide_ref.at[buf],
+                        rope_out_hbm_ref.at[p_kv, pl.ds(r_tile_off, rope_tile), :],
+                        sem_wide_ref.at[3, buf],
+                    ).wait()
+            else:
+                pltpu.make_async_copy(
+                    vmem_nope_ref.at[buf],
+                    nope_out_hbm_ref.at[p_kv, pl.ds(k_off, tile_k), :],
+                    sem_ref.at[3, buf],
+                ).wait()
+                pltpu.make_async_copy(
+                    vmem_rope_ref.at[buf],
+                    rope_out_hbm_ref.at[p_kv, pl.ds(r_tile_off, rope_tile), :],
+                    sem_ref.at[4, buf],
+                ).wait()
+            pltpu.make_async_copy(
+                vmem_k_ref.at[buf],
+                k_out_hbm_ref.at[p_idx, :, :, pl.ds(k_off, tile_k)],
+                sem_ref.at[5, buf],
+            ).wait()
+
+        @pl.loop(0, jnp.minimum(n_tiles, ring_depth))
+        def _prologue(p_i):
+            _start_read_all3(p_i, p_i)
+
+        @pl.loop(0, n_tiles)
+        def _step(i):
+            cur_buf = i % ring_depth
+
+            @pl.when(i >= ring_depth)
+            def _wait_ring_write():
+                _wait_write_all3(i - ring_depth, cur_buf)
+                _start_read_all3(i, cur_buf)
+
+            tid = tile_ids_ref[i]
+            t0 = safe_t0_ref[i]
+            l0 = lanes0_ref[i]
+            l_end = lanes_end_ref[i]
+            full = is_full_ref[i]
+            m_tile = t0 // tile_k
+            m_off = t0 % tile_k
+            shift_k = jnp.bitwise_and(l0 - m_off, tile_k - 1)
+
+            def _write_wide_tile(n_buf_ref, r_buf_ref, s_ref):
+                @pl.when((full == 1) & (m_off == 0))
+                def _store_aligned_full():
+                    n_buf_ref.at[cur_buf][...] = nope_tiles_vmem_ref[m_tile]
+                    r_buf_ref.at[cur_buf][...] = rope_tiles_vmem_ref[m_tile]
+                    kt0 = k_tiles_vmem_ref[m_tile]
+                    vmem_k_ref.at[cur_buf][...] = pltpu.bitcast(
+                        kt0[:sublane_groups, :], jnp.uint8
+                    ).reshape(sublane_groups, pack, tile_k)
+
+                @pl.when((full == 0) | (m_off != 0))
+                def _store_general():
+                    n0 = nope_tiles_vmem_ref[m_tile]
+                    n1 = nope_tiles_vmem_ref[m_tile + 1]
+                    comb_nope = jnp.where(sublanes_nr >= m_off, n0, n1)
+                    upd_nope = pltpu.roll(comb_nope, shift_k, axis=0)
+
+                    r0 = rope_tiles_vmem_ref[m_tile]
+                    r1 = rope_tiles_vmem_ref[m_tile + 1]
+                    comb_rope = jnp.where(slot_rope >= m_off, r0, r1)
+                    d_r = shift_k >> 2
+                    d_q = jnp.bitwise_and(shift_k, 3)
+                    lane_sh = pltpu.roll(comb_rope, d_q * 32, axis=1)
+                    sh0 = pltpu.roll(lane_sh, d_r, axis=0)
+                    sh1 = pltpu.roll(lane_sh, jnp.bitwise_and(d_r + 1, rope_tile - 1), axis=0)
+                    upd_rope = jnp.where(q_iota < d_q, sh1, sh0)
+
+                    kt0 = k_tiles_vmem_ref[m_tile]
+                    kt1 = k_tiles_vmem_ref[m_tile + 1]
+                    comb_k = jnp.where(lanes_full >= m_off, kt0, kt1)
+                    rolled_k = pltpu.roll(comb_k, shift_k, axis=1)
+                    upd_k = pltpu.bitcast(rolled_k[:sublane_groups, :], jnp.uint8).reshape(
+                        sublane_groups, pack, tile_k
+                    )
+
+                    @pl.when(full == 1)
+                    def _store_full():
+                        n_buf_ref.at[cur_buf][...] = upd_nope
+                        r_buf_ref.at[cur_buf][...] = upd_rope
+                        vmem_k_ref.at[cur_buf][...] = upd_k
+
+                    @pl.when(full == 0)
+                    def _store_partial():
+                        valid_nope = (tid >= 0) & (sublanes_nr >= l0) & (sublanes_nr < l_end)
+                        valid_rope = (tid >= 0) & (slot_rope >= l0) & (slot_rope < l_end)
+                        _wait_read_nr_wide(i, cur_buf, n_buf_ref, r_buf_ref, s_ref)
+                        _wait_read_k(i, cur_buf)
+                        n_buf_ref.at[cur_buf][...] = jnp.where(
+                            valid_nope, upd_nope, n_buf_ref.at[cur_buf][...]
+                        )
+                        r_buf_ref.at[cur_buf][...] = jnp.where(
+                            valid_rope, upd_rope, r_buf_ref.at[cur_buf][...]
+                        )
+                        if tile_k == 128:
+                            valid_k = (tid >= 0) & (lane_1d >= l0) & (lane_1d < l_end)
+                            vmem_k_ref.at[cur_buf][...] = jnp.where(
+                                valid_k[:, None, :], upd_k, vmem_k_ref.at[cur_buf][...]
+                            )
+                        else:
+                            valid0 = (tid >= 0) & (lane_1d >= l0) & (lane_1d < l_end)
+                            lane_hi = lane_1d + 128
+                            valid1 = (tid >= 0) & (lane_hi >= l0) & (lane_hi < l_end)
+                            cur0 = vmem_k_ref.at[cur_buf, :, :, pl.ds(0, 128)][...]
+                            cur1 = vmem_k_ref.at[cur_buf, :, :, pl.ds(128, 128)][...]
+                            vmem_k_ref.at[cur_buf, :, :, pl.ds(0, 128)][...] = jnp.where(
+                                valid0[:, None, :], upd_k[:, :, :128], cur0
+                            )
+                            vmem_k_ref.at[cur_buf, :, :, pl.ds(128, 128)][...] = jnp.where(
+                                valid1[:, None, :], upd_k[:, :, 128:], cur1
+                            )
+
+            if use_narrow_nr:
+                _, _, _, _, _, _, sub_off, r_sub_off, is_nar = _tile_hbm_slices(i)
+
+                @pl.when(is_nar)
+                def _store_nar_tile():
+                    shift_nope = jnp.bitwise_and((l0 - sub_off) - m_off, tile_k - 1)
+                    shift_rope = jnp.bitwise_and((l0 - r_sub_off * 4) - m_off, tile_k - 1)
+
+                    n0 = nope_tiles_vmem_ref[m_tile]
+                    n1 = nope_tiles_vmem_ref[m_tile + 1]
+                    comb_nope = jnp.where(sublanes_nr >= m_off, n0, n1)
+                    upd_nope_sub = pltpu.roll(comb_nope, shift_nope, axis=0)[:nr_dma]
+
+                    r0 = rope_tiles_vmem_ref[m_tile]
+                    r1 = rope_tiles_vmem_ref[m_tile + 1]
+                    comb_rope = jnp.where(slot_rope >= m_off, r0, r1)
+                    d_r = shift_rope >> 2
+                    d_q = jnp.bitwise_and(shift_rope, 3)
+                    lane_sh = pltpu.roll(comb_rope, d_q * 32, axis=1)
+                    sh0 = pltpu.roll(lane_sh, d_r, axis=0)
+                    sh1 = pltpu.roll(lane_sh, jnp.bitwise_and(d_r + 1, rope_tile - 1), axis=0)
+                    upd_rope_sub = jnp.where(q_iota < d_q, sh1, sh0)[:rope_dma]
+
+                    kt0 = k_tiles_vmem_ref[m_tile]
+                    kt1 = k_tiles_vmem_ref[m_tile + 1]
+                    comb_k = jnp.where(lanes_full >= m_off, kt0, kt1)
+                    rolled_k = pltpu.roll(comb_k, shift_k, axis=1)
+                    upd_k = pltpu.bitcast(rolled_k[:sublane_groups, :], jnp.uint8).reshape(
+                        sublane_groups, pack, tile_k
+                    )
+
+                    _wait_read_nr_nar(i, cur_buf)
+                    _wait_read_k(i, cur_buf)
+                    sub_nr_narrow = sublanes_nr[:nr_dma] + sub_off
+                    valid_nope = (tid >= 0) & (sub_nr_narrow >= l0) & (sub_nr_narrow < l_end)
+                    slot_rope_narrow = slot_rope[:rope_dma] + (r_sub_off * 4)
+                    valid_rope = (tid >= 0) & (slot_rope_narrow >= l0) & (slot_rope_narrow < l_end)
+                    valid_k = (tid >= 0) & (lane_1d >= l0) & (lane_1d < l_end)
+                    vmem_nope_ref.at[cur_buf][...] = jnp.where(
+                        valid_nope, upd_nope_sub, vmem_nope_ref.at[cur_buf][...]
+                    )
+                    vmem_rope_ref.at[cur_buf][...] = jnp.where(
+                        valid_rope, upd_rope_sub, vmem_rope_ref.at[cur_buf][...]
+                    )
+                    vmem_k_ref.at[cur_buf][...] = jnp.where(
+                        valid_k[:, None, :], upd_k, vmem_k_ref.at[cur_buf][...]
+                    )
+
+                @pl.when(~is_nar)
+                def _store_wide_fallback():
+                    _write_wide_tile(vmem_nope_wide_ref, vmem_rope_wide_ref, sem_wide_ref)
+            else:
+                _write_wide_tile(vmem_nope_ref, vmem_rope_ref, sem_ref)
+
+            _start_write_all3(i, cur_buf)
+
+        @pl.loop(jnp.maximum(0, n_tiles - ring_depth), n_tiles)
+        def _epilogue(e_i):
+            _wait_write_all3(e_i, e_i % ring_depth)
+
+        if has_state_cache:
+            @pl.when(n_st > 0)
+            def _wait_all_state_writes():
+                pltpu.make_async_copy(
+                    st_words_vmem_ref.at[pl.ds(0, n_st)],
+                    st_out_hbm_ref.at[pl.ds(0, n_st)],
+                    st_sem_ref.at[0],
+                ).wait()
+
+    hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
+    n_buf_rows = nr_dma if use_narrow_nr else tile_k
+    r_buf_rows = rope_dma if use_narrow_nr else rope_tile
+    scratch_list = [
+        pltpu.VMEM((ring_depth, n_buf_rows, 128), jnp.int32),
+        pltpu.VMEM((ring_depth, r_buf_rows, 128), jnp.int32),
+        pltpu.VMEM((ring_depth, sublane_groups, pack, tile_k), jnp.uint8),
+        pltpu.SemaphoreType.DMA((6, ring_depth)),
+    ]
+    if has_state_cache:
+        scratch_list.append(pltpu.SemaphoreType.DMA((1,)))
+    if use_narrow_nr:
+        scratch_list.extend(
+            [
+                pltpu.VMEM((ring_depth, tile_k, 128), jnp.int32),
+                pltpu.VMEM((ring_depth, rope_tile, 128), jnp.int32),
+                pltpu.SemaphoreType.DMA((4, ring_depth)),
+            ]
+        )
+
+    if has_state_cache:
+        assert (
+            state_slots_in is not None
+            and st_write_slots is not None
+            and st_should_write is not None
+            and st_wkv_words is not None
+            and n_st_writes is not None
+        )
+        return pl.pallas_call(
+            _single_cache_kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=9,
+                grid=(1,),
+                in_specs=[
+                    vmem_spec,
+                    vmem_spec,
+                    vmem_spec,
+                    vmem_spec,
+                    hbm_spec,
+                    hbm_spec,
+                    hbm_spec,
+                    hbm_spec,
+                ],
+                out_specs=[hbm_spec, hbm_spec, hbm_spec, hbm_spec],
+                scratch_shapes=scratch_list,
+            ),
+            out_shape=(
+                jax.ShapeDtypeStruct(state_slots_in.shape, state_slots_in.dtype),
+                jax.ShapeDtypeStruct(nope_cache.shape, nope_cache.dtype),
+                jax.ShapeDtypeStruct(rope_cache.shape, rope_cache.dtype),
+                jax.ShapeDtypeStruct(k_cache.shape, k_cache.dtype),
+            ),
+            input_output_aliases={13: 0, 14: 1, 15: 2, 16: 3},
+            compiler_params=pltpu.CompilerParams(
+                vmem_limit_bytes=100 * 1024 * 1024,
+                disable_bounds_checks=True,
+            ),
+            name=f"fused_single_pallas_4cache_r{compress_ratio}",
+        )(
+            tile_ids,
+            idx_pages,
+            safe_t0,
+            lanes0,
+            lanes_end,
+            is_full,
+            st_write_slots,
+            st_should_write,
+            jnp.asarray([n_active_tiles, n_st_writes], dtype=jnp.int32),
+            st_wkv_words,
+            nope_tiles,
+            rope_tiles,
+            k_tiles,
+            state_slots_in,
+            nope_cache,
+            rope_cache,
+            k_cache,
+        )
+
+    return pl.pallas_call(
+        _single_cache_kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=7,
+            grid=(1,),
+            in_specs=[
+                vmem_spec,
+                vmem_spec,
+                vmem_spec,
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+            ],
+            out_specs=[hbm_spec, hbm_spec, hbm_spec],
+            scratch_shapes=scratch_list,
+        ),
+        out_shape=(
+            jax.ShapeDtypeStruct(nope_cache.shape, nope_cache.dtype),
+            jax.ShapeDtypeStruct(rope_cache.shape, rope_cache.dtype),
+            jax.ShapeDtypeStruct(k_cache.shape, k_cache.dtype),
+        ),
+        input_output_aliases={10: 0, 11: 1, 12: 2},
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=100 * 1024 * 1024,
+            disable_bounds_checks=True,
+        ),
+        name=f"fused_single_pallas_3cache_r{compress_ratio}",
+    )(
+        tile_ids,
+        idx_pages,
+        safe_t0,
+        lanes0,
+        lanes_end,
+        is_full,
+        jnp.asarray([n_active_tiles], dtype=jnp.int32),
+        nope_tiles,
+        rope_tiles,
+        k_tiles,
+        nope_cache,
+        rope_cache,
+        k_cache,
+    )
+
+
+def fused_insert_produce_k_jax(
+    latent: jax.Array,  # [num_tokens, 512] bf16
+    wk_weight: jax.Array,  # [128, 512] bf16/fp8
+    knorm_weight: jax.Array,  # [128] bf16
+    cos_sin_cache: jax.Array,  # [max_pos, 64] f32
+    idx_cos_sin_cache: jax.Array,  # [max_pos, 64] f32
+    positions: jax.Array,  # [num_tokens] i32
+    kv_block_table: jax.Array,  # [max_num_seqs * max_kv_blocks] i32
+    idx_block_table: jax.Array,  # [max_num_seqs * max_idx_blocks] i32
+    query_start_loc: jax.Array,  # [max_num_seqs + 1] i32
+    distribution: jax.Array,  # [3] i32
+    nope_cache: jax.Array,  # donated (arg 10)
+    rope_cache: jax.Array,  # donated (arg 11)
+    k_cache: jax.Array,  # donated (arg 12)
+    wk_weight_scale: jax.Array | None = None,
+    *,
+    compress_ratio: int,
+    idx_rms_eps: float = 1e-6,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Single custom op with single concurrent 3-cache Pallas async DMA kernel."""
+    return _fused_quant_pack_and_single_pallas_scatter(
+        latent,
+        wk_weight,
+        knorm_weight,
+        cos_sin_cache,
+        idx_cos_sin_cache,
+        positions,
+        kv_block_table,
+        idx_block_table,
+        query_start_loc,
+        distribution,
+        nope_cache,
+        rope_cache,
+        k_cache,
+        wk_weight_scale,
+        compress_ratio=compress_ratio,
+        idx_rms_eps=idx_rms_eps,
+    )
+
+
+def fused_compress_r2_insert_produce_k_jax(
+    wkv_wgate: jax.Array,  # [num_tokens, 1024] f32
+    norm_weight: jax.Array,  # [512] bf16
+    wk_weight: jax.Array,  # [128, 512] bf16/fp8
+    knorm_weight: jax.Array,  # [128] bf16
+    cos_sin_cache: jax.Array,  # [max_pos, 64] f32
+    idx_cos_sin_cache: jax.Array,  # [max_pos, 64] f32
+    positions: jax.Array,  # [num_tokens] i32
+    state_block_table: jax.Array,  # [max_num_seqs * max_state_blocks] i32
+    kv_block_table: jax.Array,  # [max_num_seqs * max_kv_blocks] i32
+    idx_block_table: jax.Array,  # [max_num_seqs * max_idx_blocks] i32
+    query_start_loc: jax.Array,  # [max_num_seqs + 1] i32
+    distribution: jax.Array,  # [3] i32
+    state_cache: jax.Array,  # donated (arg 12)
+    nope_cache: jax.Array,  # donated (arg 13)
+    rope_cache: jax.Array,  # donated (arg 14)
+    k_cache: jax.Array,  # donated (arg 15)
+    wk_weight_scale: jax.Array | None = None,
+    *,
+    state_block_size: int,
+    compress_ratio: int,
+    comp_rms_eps: float = 1e-6,
+    idx_rms_eps: float = 1e-6,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Single custom op with single concurrent 4-cache Pallas async DMA kernel."""
+    head_dim = norm_weight.shape[0]
+    num_tokens = wkv_wgate.shape[0]
+    max_num_seqs = query_start_loc.shape[0] - 1
+    eff_max_seqs = min(max_num_seqs, max(8, align_to(num_tokens, 8)))
+
+    max_state_blocks = state_block_table.shape[0] // max_num_seqs
+    num_st_pages, st_page_size = state_cache.shape[:2]
+    states_per_page = st_page_size // 8
+    total_state_slots = num_st_pages * states_per_page
+    state_slots_in = state_cache.reshape((total_state_slots, 8, 128))
+
+    pos = positions.astype(jnp.int32)
+    seq_ids = jnp.arange(eff_max_seqs, dtype=jnp.int32)
+    q_start = query_start_loc[:eff_max_seqs]
+    q_end = query_start_loc[1 : eff_max_seqs + 1]
+    seq_valid = (seq_ids < distribution[2]) & (q_end > q_start)
+
+    def _state_slot_for(r: jax.Array, p: jax.Array) -> jax.Array:
+        page_idx = jnp.clip(p // state_block_size, 0, max_state_blocks - 1)
+        page = state_block_table[r * max_state_blocks + page_idx]
+        if num_st_pages > 1:
+            page = jnp.where(page > 0, ((page - 1) % (num_st_pages - 1)) + 1, 0)
+        return jnp.clip(
+            page * states_per_page + (p % state_block_size), 0, total_state_slots - 1
+        )
+
+    first_tok_idx = jnp.clip(q_start, 0, num_tokens - 1)
+    first_pos = pos[first_tok_idx]
+    seq_read_slots = _state_slot_for(seq_ids, jnp.maximum(first_pos - 1, 0))
+    seq_cache_prev = jax.lax.bitcast_convert_type(
+        state_slots_in[seq_read_slots], jnp.float32
+    ).reshape(eff_max_seqs, 1024)
+
+    token_idx = jnp.arange(num_tokens, dtype=jnp.int32)
+
+    def _single_seq_prev():
+        return jnp.concatenate([seq_cache_prev[:1], wkv_wgate[:-1]], axis=0)
+
+    def _multi_seq_prev():
+        if num_tokens >= 384:
+            batch_prev = jnp.concatenate([wkv_wgate[:1], wkv_wgate[:-1]], axis=0)
+            first_write_idx = jnp.where(seq_valid, first_tok_idx, num_tokens)
+            return batch_prev.at[first_write_idx].set(seq_cache_prev, mode="drop")
+        batch_prev = wkv_wgate[jnp.clip(token_idx - 1, 0, num_tokens - 1)]
+        r_m = _seq_ids_from_locs(query_start_loc, num_tokens, eff_max_seqs)
+        in_b = token_idx > query_start_loc[r_m]
+        return jnp.where(in_b[:, None], batch_prev, seq_cache_prev[r_m])
+
+    prev_kv_score = jax.lax.cond(
+        distribution[2] <= 1,
+        _single_seq_prev,
+        _multi_seq_prev,
+    )
+
+    last_tok_idx = jnp.clip(q_end - 1, 0, num_tokens - 1)
+    last_pos = pos[last_tok_idx]
+    st_should_write = (seq_valid & ((last_pos & 1) == 0)).astype(jnp.int32)
+    n_st_writes = jnp.sum(st_should_write).astype(jnp.int32)
+    st_write_slots = _state_slot_for(seq_ids, last_pos)
+    st_wkv_words = jax.lax.bitcast_convert_type(
+        wkv_wgate[last_tok_idx].reshape(eff_max_seqs, 8, 128), jnp.int32
+    )
+
+    kv0, score0 = prev_kv_score[:, :head_dim], prev_kv_score[:, head_dim:]
+    kv1, score1 = wkv_wgate[:, :head_dim], wkv_wgate[:, head_dim:]
+    max_s = jnp.maximum(score0, score1)
+    e0, e1 = jnp.exp(score0 - max_s), jnp.exp(score1 - max_s)
+    pf32 = ((e0 * kv0 + e1 * kv1) / (e0 + e1)).astype(jnp.bfloat16).astype(jnp.float32)
+    rstd = jax.lax.rsqrt(
+        jnp.mean(pf32 * pf32, axis=-1, keepdims=True) + comp_rms_eps
+    )
+    latent = jax.lax.optimization_barrier(
+        (pf32 * rstd).astype(jnp.bfloat16) * norm_weight.astype(jnp.bfloat16)
+    )
+
+    new_st_slots, new_nope, new_rope, new_k = _fused_quant_pack_and_single_pallas_scatter(
+        latent,
+        wk_weight,
+        knorm_weight,
+        cos_sin_cache,
+        idx_cos_sin_cache,
+        positions,
+        kv_block_table,
+        idx_block_table,
+        query_start_loc,
+        distribution,
+        nope_cache,
+        rope_cache,
+        k_cache,
+        wk_weight_scale,
+        compress_ratio=compress_ratio,
+        idx_rms_eps=idx_rms_eps,
+        state_slots_in=state_slots_in,
+        st_write_slots=st_write_slots,
+        st_should_write=st_should_write,
+        st_wkv_words=st_wkv_words,
+        n_st_writes=n_st_writes,
+    )
+    return new_st_slots.reshape(state_cache.shape), new_nope, new_rope, new_k
+
+
+def fused_indexer_wq_b_rope_quant_jax(
+    query_fp8: jax.Array,  # [num_tokens, q_lora_rank] f8
+    query_scale: jax.Array,  # [num_tokens, 1] f32
+    wq_b_weight: jax.Array,  # [q_lora_rank, n_head * head_dim] f8
+    wq_b_weight_scale: jax.Array,  # [n_head * head_dim] f32
+    positions: jax.Array,  # [num_tokens] i32
+    cos_sin_cache: jax.Array,  # [max_pos, 64] f32
+    indexer_weights: jax.Array,  # [num_tokens, n_head] bf16/f32
+    *,
+    softmax_scale: float,
+    n_head: int,
+    head_dim: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Single pipelined Pallas kernel: FP8 wq_b GEMM + w_scale + RoPE + FP8 quant in VMEM."""
+    num_tokens, k_dim = query_fp8.shape
+    out_features = n_head * head_dim
+    tile_n = largest_divisor(num_tokens, cap=128)
+    num_tiles = num_tokens // tile_n
+    cs_expanded = _expand_cos_sin(positions, cos_sin_cache)
+    w_scale_all = (
+        indexer_weights.astype(jnp.float32) * softmax_scale * (n_head**-0.5)
+    )
+
+    def _pallas_fused_kernel(
+        q_fp8_hbm_ref,
+        q_s_hbm_ref,
+        cs_hbm_ref,
+        w_s_hbm_ref,
+        wqb_w_vmem_ref,
+        wqb_s_vmem_ref,
+        q_out_hbm_ref,
+        s_out_hbm_ref,
+    ):
+        lane = jnp.arange(head_dim)
+        sign = jnp.where(lane % 2 == 0, -1.0, 1.0).astype(jnp.float32)
+        w_mat = wqb_w_vmem_ref[...]
+        ws_vec = wqb_s_vmem_ref[...][None, :]
+
+        def _pipe_step(q_ref, qs_ref, cs_ref, ws_ref, q_out_ref, s_out_ref):
+            proj = jnp.einsum(
+                "tk,kn->tn",
+                q_ref[...],
+                w_mat,
+                preferred_element_type=jnp.float32,
+            )
+            q_bf16 = (
+                (proj * qs_ref[...] * ws_vec)
+                .astype(jnp.bfloat16)
+                .reshape(tile_n, n_head, head_dim)
+            )
+            x = (
+                (q_bf16.astype(jnp.float32) * ws_ref[...][..., None])
+                .astype(jnp.bfloat16)
+                .astype(jnp.float32)
+            )
+            cs = cs_ref[...]
+            cos = cs[:, None, :head_dim]
+            sin = cs[:, None, head_dim:] * sign[None, None, :]
+            y = x * cos + _lane_gather(x, lane ^ 1) * sin
+            abs_max = jnp.max(jnp.abs(y), axis=-1, keepdims=True)
+            scale = abs_max / jnp.float32(448.0)
+            scale_inv = jnp.where(abs_max == 0.0, 0.0, 1.0 / scale)
+            q_out_ref[...] = (y * scale_inv).astype(jnp.float8_e4m3fn)
+            s_out_ref[...] = scale.reshape(tile_n, n_head)
+
+        q_in_spec = pl.BlockSpec(
+            (tile_n, k_dim), lambda i: (i, 0), memory_space=pltpu.VMEM
+        )
+        qs_in_spec = pl.BlockSpec(
+            (tile_n, 1), lambda i: (i, 0), memory_space=pltpu.VMEM
+        )
+        cs_in_spec = pl.BlockSpec(
+            (tile_n, 2 * head_dim), lambda i: (i, 0), memory_space=pltpu.VMEM
+        )
+        ws_in_spec = pl.BlockSpec(
+            (tile_n, n_head), lambda i: (i, 0), memory_space=pltpu.VMEM
+        )
+        q_out_spec = pl.BlockSpec(
+            (tile_n, n_head, head_dim), lambda i: (i, 0, 0), memory_space=pltpu.VMEM
+        )
+        s_out_spec = pl.BlockSpec(
+            (tile_n, n_head), lambda i: (i, 0), memory_space=pltpu.VMEM
+        )
+
+        pltpu.emit_pipeline(
+            _pipe_step,
+            grid=(num_tiles,),
+            in_specs=[q_in_spec, qs_in_spec, cs_in_spec, ws_in_spec],
+            out_specs=[q_out_spec, s_out_spec],
+        )(
+            q_fp8_hbm_ref,
+            q_s_hbm_ref,
+            cs_hbm_ref,
+            w_s_hbm_ref,
+            q_out_hbm_ref,
+            s_out_hbm_ref,
+        )
+
+    hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
+    return pl.pallas_call(
+        _pallas_fused_kernel,
+        out_shape=(
+            jax.ShapeDtypeStruct(
+                (num_tokens, n_head, head_dim), jnp.float8_e4m3fn
+            ),
+            jax.ShapeDtypeStruct((num_tokens, n_head), jnp.float32),
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            grid=(1,),
+            in_specs=[
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+                hbm_spec,
+                vmem_spec,
+                vmem_spec,
+            ],
+            out_specs=[hbm_spec, hbm_spec],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=100 * 1024 * 1024,
+            disable_bounds_checks=True,
+        ),
+        name="fused_indexer_wq_b_rope_quant",
+    )(
+        query_fp8,
+        query_scale,
+        cs_expanded,
+        w_scale_all,
+        wq_b_weight,
+        wq_b_weight_scale.reshape(1, out_features),
     )
 
 
@@ -828,6 +2172,7 @@ def _indexer_v41_impl(
     cand_blocks: int = 0,
     cand_block_size: int = 0,
     has_precomputed_meta: bool = False,
+    q_is_prequant: bool = False,
     cfg_num_tokens: int | None = None,
     use_candidates_override: jax.Array | None = None,
     token_start: jax.Array | int = 0,
@@ -854,13 +2199,17 @@ def _indexer_v41_impl(
         )
         candidates = None
 
-    w_scale = (
-        indexer_weights.astype(jnp.float32) * softmax_scale * (n_head**-0.5)
-    )
-    q_quant, q_scales = rope_quant(
-        q, positions, cos_sin_cache, w_scale=w_scale, quant_dtype=jnp.float8_e4m3fn
-    )
-    weights = q_scales
+    if q_is_prequant:
+        q_quant = q
+        weights = indexer_weights
+    else:
+        w_scale = (
+            indexer_weights.astype(jnp.float32) * softmax_scale * (n_head**-0.5)
+        )
+        q_quant, q_scales = rope_quant(
+            q, positions, cos_sin_cache, w_scale=w_scale, quant_dtype=jnp.float8_e4m3fn
+        )
+        weights = q_scales
     num_pages, _, _, page_size = cache_kv.shape
     block_stride = max(1, (page_size * compression_ratio) // 1024)
     if precomputed_idx_page_indices is not None:
@@ -874,21 +2223,28 @@ def _indexer_v41_impl(
     n_cfg = q.shape[0] if cfg_num_tokens is None else cfg_num_tokens
     # DSpark decode/verify batches (<= 512 tokens) run in MIXED; bq=8 avoids 16x
     # query padding and fits 2x larger KV blocks. 96/384 buckets use multiples of 48.
-    is_decode_or_verify = n_cfg <= 512
+    is_decode_or_verify = n_cfg <= 1536
     bq_mixed = 8 if is_decode_or_verify else 128
     bkv_pages = (16 if is_decode_or_verify else 8) * max(1, compression_ratio)
     chunk_tokens = (
-        256
-        if q.shape[0] >= 1024 and q.shape[0] % 256 == 0
+        512
+        if (not is_decode_or_verify and q.shape[0] >= 512 and q.shape[0] % 512 == 0)
         else {
-            512: 128,
-            384: 96,
-            256: 64,
-            192: 96,
-            128: 64,
-            96: 48,
-            64: 32,
-            16: 8,
+            1536: 512,
+            1280: 640,
+            1024: 512,
+            768: 384,
+            640: 320,
+            512: 512,
+            384: 384,
+            320: 320,
+            256: 256,
+            192: 192,
+            160: 160,
+            128: 128,
+            96: 96,
+            64: 64,
+            16: 16,
         }.get(q.shape[0], 512)
     )
     dense = functools.partial(
@@ -972,6 +2328,7 @@ def indexer_v41_jax(
     cand_blocks: int = 0,
     cand_block_size: int = 0,
     has_precomputed_meta: bool = False,
+    q_is_prequant: bool = False,
 ) -> jax.Array:
     """torch.library.custom_op-safe wrapper around _indexer_v41_impl."""
     return _indexer_v41_impl(
@@ -998,6 +2355,7 @@ def indexer_v41_jax(
         cand_blocks=cand_blocks,
         cand_block_size=cand_block_size,
         has_precomputed_meta=has_precomputed_meta,
+        q_is_prequant=q_is_prequant,
     )
 
 
@@ -1086,6 +2444,7 @@ def indexer_v41_tp_jax(
     cand_mode: str | None = None,
     cand_blocks: int = 0,
     cand_block_size: int = 0,
+    q_is_prequant: bool = False,
 ) -> jax.Array:
     """Token-parallel indexer: top-k for this rank's T/tp tokens only.
 
@@ -1146,6 +2505,7 @@ def indexer_v41_tp_jax(
         cand_mode=cand_mode,
         cand_blocks=cand_blocks,
         cand_block_size=cand_block_size,
+        q_is_prequant=q_is_prequant,
         cfg_num_tokens=t_l * tp_size,
         use_candidates_override=use_candidates,
         token_start=rank[0] * t_l,

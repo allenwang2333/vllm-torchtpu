@@ -81,7 +81,7 @@ def main_kernel(
     def outer_pipeline(idx_ref, valid_ref):
         valid_indices = valid_ref[pl.ds(0, row_subchunk_size)][0]
         b = pl.program_id(0)
-        out_row_base = (b * num_cores + core_index) * num_row_subchunks
+        out_row_base = (core_index * num_blocks + b) * num_row_subchunks
 
         # Subchunk handled by stream `s` at inner step `r`. `num_streams`
         # independent `pl.Indirect` gathers run concurrently per step, keeping
@@ -168,8 +168,9 @@ def main_kernel(
             (num_streams * rope_rows_per_stream, rope_out_cols), rope_out_block
         )
         core_start_idx = out_row_base * row_subchunk_size
+        first_idx = idx_ref[pl.ds(0, row_subchunk_size)][0]
 
-        @pl.when(core_start_idx < valid_indices)
+        @pl.when((core_start_idx < valid_indices) & (first_idx >= 0))
         def _run_gather():
             pltpu.emit_pipeline(
                 _body,
@@ -188,7 +189,7 @@ def main_kernel(
         in_specs=(
             pl.BlockSpec(
                 (row_chunk_size,),
-                lambda b: (b * num_cores + core_index,),
+                lambda b: (core_index * num_blocks + b,),
             ),
             pl.BlockSpec(
                 (row_subchunk_size,),
@@ -272,9 +273,7 @@ def csa_gather(
     block_size = row_chunk_size * num_cores
     out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size
     if out_pad_size:
-        # spread the padding to avoid hotspots
-        num_tokens = nope_cache.shape[0]
-        pad = (jnp.arange(out_pad_size, dtype=indices.dtype) * 104729) % num_tokens
+        pad = jnp.full((out_pad_size,), -1, dtype=indices.dtype)
         indices = jnp.concatenate([indices, pad])
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,

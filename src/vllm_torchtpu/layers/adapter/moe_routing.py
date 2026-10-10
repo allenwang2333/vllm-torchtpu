@@ -17,7 +17,10 @@ import torch
 import vllm.envs as vllm_envs
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.layers.adapter.router_topk import rowmax_select
+from vllm_torchtpu.layers.adapter.router_topk import (
+    grouped_rowmax_select,
+    rowmax_select,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -31,10 +34,15 @@ def _topk(
     scores: torch.Tensor,
     k: int,
     raw_scores: torch.Tensor | None = None,
+    *,
+    bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Top-k over the expert axis, by the configured implementation."""
     if _ROUTER_TOPK == "rowmax":
-        return rowmax_select(scores, k, raw_scores=raw_scores)
+        return rowmax_select(scores, k, raw_scores=raw_scores, bias=bias)
+    if bias is not None:
+        raw_scores = scores
+        scores = scores + bias
     topk_weights, topk_ids = torch.topk(scores, k=k, dim=-1)
     if raw_scores is not None:
         topk_weights = _gather_expert_scores(raw_scores, topk_ids)
@@ -53,8 +61,10 @@ def _gather_expert_scores(scores: torch.Tensor, topk_ids: torch.Tensor) -> torch
     is the sign of zero (-0.0 + 0.0 is +0.0), which the scoring functions
     here cannot produce: their scores are all >= +0.
     """
-    experts = torch.arange(scores.shape[-1], device=scores.device)
-    selected = topk_ids.long().unsqueeze(-1) == experts
+    experts = torch.arange(
+        scores.shape[-1], dtype=topk_ids.dtype, device=scores.device
+    )
+    selected = topk_ids.unsqueeze(-1) == experts
     return torch.where(selected, scores.unsqueeze(-2), 0).sum(dim=-1)
 
 
@@ -157,6 +167,55 @@ def maybe_simulate_routing(
     return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
 
+def pack_topk_s32(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Losslessly pack `(topk_weights [T_local, K], topk_ids [T_local, K])` into `int32 [T_local, pad_k]`."""
+    k = topk_ids.shape[-1]
+    pad_k = (k + 7) & ~7
+    if pad_k > k:
+        topk_weights = torch.cat((topk_weights, torch.zeros((*topk_weights.shape[:-1], pad_k - k), dtype=topk_weights.dtype, device=topk_weights.device)), dim=-1)
+        topk_ids = torch.cat((topk_ids, torch.zeros((*topk_ids.shape[:-1], pad_k - k), dtype=topk_ids.dtype, device=topk_ids.device)), dim=-1)
+    w_bits = topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
+    return (topk_ids.to(torch.int32) & 0xFFFF) | (w_bits << 16)
+
+
+def unpack_topk_s32(
+    packed: torch.Tensor,
+    topk: int,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unpack `(topk_weights [T, topk], topk_ids [T, topk])` from `int32 [T, pad_k]`."""
+    if packed.shape[-1] > topk:
+        packed = packed[:, :topk]
+    topk_ids = (packed & 0xFFFF).to(torch.int32)
+    topk_weights = (
+        (packed >> 16).to(torch.int16).view(torch.bfloat16).to(dtype)
+    )
+    return topk_weights, topk_ids
+
+
+def all_gather_packed_topk_s32(
+    topk_weights_local: torch.Tensor,
+    topk_ids_local: torch.Tensor,
+    *,
+    all_gather_fn,
+    num_tokens_global: int,
+) -> torch.Tensor:
+    """Bit-pack `(topk_weights_local, topk_ids_local)` into `s32` (`32 B/tok` for `topk <= 8`)
+    and `all_gather` along `dim=0`, reshaping to `[-1, 128]` when `numel() % 128 == 0` so TPU v7x
+    transfers exact `128`-lane tiles with zero sub-lane padding or reformat copies.
+    """
+    packed_local = pack_topk_s32(topk_weights_local, topk_ids_local)
+    pad_k = packed_local.shape[-1]
+    if packed_local.numel() % 128 == 0:
+        return all_gather_fn(packed_local.reshape(-1, 128), dim=0).reshape(
+            num_tokens_global, pad_k
+        )
+    return all_gather_fn(packed_local, dim=0)
+
+
 def route(
     layer,
     hidden_states: torch.Tensor,
@@ -174,6 +233,10 @@ def route(
     hook -- and any future routing-path change -- lives in exactly one place.
     """
     topk = layer.moe_config.experts_per_token
+    if router_logits.dtype == torch.int32:
+        return unpack_topk_s32(
+            router_logits, topk=topk, dtype=hidden_states.dtype
+        )
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:
         return simulated
@@ -224,7 +287,7 @@ def _hash_moe_select(
     flat input_ids rather than dynamic gating logits.
     """
     flat_input_ids = input_ids.long().flatten()
-    topk_ids = hash_indices_table[flat_input_ids].long()
+    topk_ids = hash_indices_table[flat_input_ids]
     target_shape = list(scores.shape)
     target_shape[-1] = topk_ids.shape[-1]
     topk_ids = topk_ids.reshape(target_shape)
@@ -288,6 +351,23 @@ def select_experts(
         and layer.topk_group < layer.num_expert_group
     )
     if use_grouped:
+        if (
+            _ROUTER_TOPK == "rowmax"
+            and router_logits.dim() == 2
+            and scoring_fn in ("sigmoid", "softmax", "sqrtsoftplus")
+        ):
+            topk_weights, topk_ids = grouped_rowmax_select(
+                router_logits,
+                topk=topk,
+                num_expert_group=layer.num_expert_group,
+                topk_group=layer.topk_group,
+                scoring_fn=scoring_fn,
+                renormalize=renormalize,
+                routed_scaling_factor=float(layer.routed_scaling_factor),
+                bias=layer.e_score_correction_bias,
+            )
+            return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+
         from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
             grouped_topk,
         )
@@ -305,18 +385,40 @@ def select_experts(
         )
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
-    scores = _apply_scoring_fn(scoring_fn, router_logits.float())
     e_score_correction_bias = (
         layer.e_score_correction_bias if layer is not None else None
     )
+    routed_scaling_factor = (
+        float(layer.routed_scaling_factor) if layer is not None else 1.0
+    )
+
+    if (
+        _ROUTER_TOPK == "rowmax"
+        and router_logits.dim() == 2
+        and scoring_fn in ("sqrtsoftplus", "sigmoid", "softmax")
+    ):
+        topk_weights, topk_ids = rowmax_select(
+            router_logits,
+            topk,
+            bias=e_score_correction_bias,
+            scoring_fn=scoring_fn,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+
+    scores = _apply_scoring_fn(scoring_fn, router_logits.float())
 
     if e_score_correction_bias is not None:
         bias_shape = [1] * (scores.dim() - 1) + [-1]
         bias = e_score_correction_bias.float().view(bias_shape)
-        scores_for_choice = scores + bias
-        topk_weights, topk_ids = _topk(
-            scores_for_choice, topk, raw_scores=scores
-        )
+        if _ROUTER_TOPK == "rowmax" and scores.dim() == 2:
+            topk_weights, topk_ids = _topk(scores, topk, bias=bias)
+        else:
+            scores_for_choice = scores + bias
+            topk_weights, topk_ids = _topk(
+                scores_for_choice, topk, raw_scores=scores
+            )
     else:
         topk_weights, topk_ids = _topk(scores, topk)
 
@@ -324,7 +426,6 @@ def select_experts(
         topk_weights = topk_weights / torch.clamp(
             topk_weights.sum(dim=-1, keepdim=True), min=1e-20
         )
-    routed_scaling_factor = layer.routed_scaling_factor if layer is not None else 1.0
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
 

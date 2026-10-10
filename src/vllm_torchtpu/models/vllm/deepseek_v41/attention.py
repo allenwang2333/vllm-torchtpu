@@ -18,6 +18,7 @@ import os
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
@@ -36,16 +37,23 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.tp_collectives import (
     tp_all_gather,
+    tp_all_to_all,
     tp_reduce_scatter,
     tp_shard_slice,
 )
 from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
+    fused_wq_b_q_rope_prequant_projection,
     fused_wq_b_q_rope_projection,
 )
-from vllm_torchtpu.kernels.deepseek_v41 import tp_attention
+try:
+    from vllm_torchtpu.kernels.deepseek_v41 import tp_attention
+except ImportError:
+    tp_attention = None  # type: ignore[assignment]
 from vllm_torchtpu.kernels.deepseek_v41.sparse_mla import (
     precompute_csa_union_and_bitmask,
+    resolve_csa_union_params,
+    resolve_csa_union_u_chunk,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
     deepseek_v4_attention_op as _dsv4_attn_op,
@@ -60,6 +68,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_flash_com
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
+    _get_quantized_matmul_op,
     _get_quantized_matmul_prequant_op,
     quantized_matmul,
     quantized_matmul_prequant,
@@ -81,15 +90,128 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 from vllm_torchtpu.utils import synchronize_tensors
 
 BATCH_AXIS = _dsv4_attn_op.BATCH_AXIS
+_FLASHMLA_TP8: bool = os.environ.get("VLLM_DSV41_FLASHMLA_TP8", "0") == "1"
+_CSA_UNION: bool = bool(envs.VLLM_DSV41_CSA_UNION)
+_CSA_UNION_M: int = int(envs.VLLM_DSV41_CSA_UNION_M)
+_CSA_UNION_BQ: int = int(envs.VLLM_DSV41_CSA_UNION_BQ)
+_TPU_ROPE_CACHE_TRUNCATE: bool = bool(envs.TPU_ROPE_CACHE_TRUNCATE)
+_FUSED_Q_ROPE: bool = bool(envs.VLLM_DSV41_FUSED_Q_ROPE)
+_FUSED_SEAM_QUANT: bool = bool(envs.VLLM_DSV41_FUSED_SEAM_QUANT)
+_TP_ATTN: bool = bool(envs.VLLM_DSV41_TP_ATTN)
+_TP_ATTN_LOCAL_TOPK: bool = bool(envs.VLLM_DSV41_TP_ATTN_LOCAL_TOPK)
+_TP_ATTN_MIN_TOKENS: int = int(envs.VLLM_DSV41_TP_ATTN_MIN_TOKENS)
+_TOKEN_SHARD_MIN_TOKENS: int = int(envs.VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS)
 VllmDeepseekV4SWACache = _dsv4_attn_op.VllmDeepseekV4SWACache
 _attention_csa = _deepseek_v41_flash_attn_op._attention_csa
 _attention_swa = _deepseek_v41_flash_attn_op._attention_swa
 get_packed_mla_head_size = _dsv4_attn_op.get_packed_mla_head_size
 _Q_ROPE_SPECS = (P(None, "model", None), P(), P())
 _KV_NORM_ROPE_SPECS = (P(), P(), P(), P())
+_QKV_NORM_ROPE_QUANT_SPECS = (P(), P(), P(), P(), P())
 _O_PROJ_SPECS = (P(None, "model", None), P(), P(), P(), P())
+_SWA_STORE_SPECS = (P(), P(), P(BATCH_AXIS), P(BATCH_AXIS), P(), P())
+
+
+def _get_dspark_swa_store_op(logical_page_size: int):
+    op_name = f"pallas::dspark_swa_store_ps{logical_page_size}"
+    op = _pallas_op_cache.get(op_name)
+    if op is None:
+        mesh = get_vllm_model_wrapper_context().mesh
+        if mesh is None:
+            return None
+        op = pallas.jax_op(
+            op_name,
+            functools.partial(
+                tp_attention.swa_store_all_pallas,
+                logical_page_size=logical_page_size,
+            ),
+            mesh=mesh,
+            donate_argnums=(0,),
+            input_partition_specs=_SWA_STORE_SPECS,
+        )
+        op.register_fake(lambda sw_cache, *_: torch.empty_like(sw_cache))
+        _pallas_op_cache[op_name] = op
+    return op
+
+
+_O_PROJ_WOB_SPECS = (P(), P(), P(), P(), P(), P(), P())
+
+
+def _o_proj_wob_jax(
+    x: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    wo_a: jax.Array,
+    wo_a_scale: jax.Array,
+    wo_b_w: jax.Array,
+    wo_b_s: jax.Array,
+    *,
+    head_dim: int,
+) -> jax.Array:
+    if x.shape[1] == 16 and wo_b_s.ndim == 1:
+        return o_proj.fused_reverse_rope_wo_a_wo_b_projection(
+            x,
+            positions,
+            cos_sin_cache,
+            wo_a,
+            wo_a_scale,
+            wo_b_w,
+            wo_b_s,
+            head_dim=head_dim,
+        )
+    if not isinstance(x.shape[0], torch.SymInt) and x.shape[1] == 128 and wo_b_s.ndim == 4 and x.shape[0] <= 384:
+        return o_proj.fused_reverse_rope_wo_a_wo_b_h128_projection(
+            x,
+            positions,
+            cos_sin_cache,
+            wo_a,
+            wo_a_scale,
+            wo_b_w,
+            wo_b_s,
+            head_dim=head_dim,
+        )
+    orig_m = x.shape[0]
+    m_pad = 64 if orig_m == 48 else ((orig_m + 7) & ~7)
+    pad_t = m_pad - orig_m
+    x_p = jax.numpy.pad(x, ((0, pad_t), (0, 0), (0, 0))) if pad_t > 0 else x
+    p_p = jax.numpy.pad(positions, (0, pad_t)) if pad_t > 0 else positions
+    z = o_proj.fused_reverse_rope_wo_a_projection(
+        x_p, p_p, cos_sin_cache, wo_a, wo_a_scale, head_dim=head_dim
+    )
+    z = z[:orig_m] if pad_t > 0 else z
+    if wo_b_s.ndim == 4:
+        from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+        return gmm_v2(
+            lhs=z,
+            rhs=wo_b_w[None],
+            group_sizes=jax.numpy.array([z.shape[0]], dtype=jax.numpy.int32),
+            rhs_scale=wo_b_s,
+            group_offset=jax.numpy.array([0], dtype=jax.numpy.int32),
+            preferred_element_type=jax.numpy.bfloat16,
+            maybe_quantize_lhs=True,
+            zero_initialize=True,
+        )
+    from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+    return xla_quantized_matmul(z, wo_b_w, wo_b_s)
+
+
+def _fake_o_proj_wob(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    wo_a: torch.Tensor,
+    wo_a_scale: torch.Tensor,
+    wo_b_w: torch.Tensor,
+    wo_b_s: torch.Tensor,
+) -> torch.Tensor:
+    del positions, cos_sin_cache, wo_a, wo_a_scale, wo_b_s
+    return x.new_empty((x.shape[0], wo_b_w.shape[1]))
+
+
 _WQ_B_Q_ROPE_SPECS = (P(), P(), P(), P(), P())
+_WQ_B_Q_ROPE_PREQUANT_SPECS = (P(), P(), P(), P(), P(), P())
 _CSA_UNION_SPECS = (P(BATCH_AXIS, None),)
+_FLASHMLA_TP8: bool = os.environ.get("VLLM_DSV41_FLASHMLA_TP8", "0") == "1"
 
 
 def _kvnorm_rope_jax(
@@ -101,6 +223,119 @@ def _kvnorm_rope_jax(
     eps: float,
 ) -> jax.Array:
     return rope_kernel.rmsnorm_rope(x, weight, positions, cos_sin_cache, eps=eps)
+
+
+def _qkv_norm_rope_quant_jax(
+    qr_kv: jax.Array,
+    q_weight: jax.Array,
+    kv_weight: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    q_eps: float,
+    kv_eps: float,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    return rope_kernel.qkv_norm_rope_quant(
+        qr_kv,
+        q_weight,
+        kv_weight,
+        positions,
+        cos_sin_cache,
+        q_eps=q_eps,
+        kv_eps=kv_eps,
+    )
+
+
+def _fake_qkv_norm_rope_quant(
+    qr_kv: torch.Tensor,
+    q_weight: torch.Tensor,
+    kv_weight: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del positions, cos_sin_cache
+    t = qr_kv.shape[0]
+    q_dim = q_weight.shape[0]
+    kv_dim = kv_weight.shape[0]
+    return (
+        torch.empty((t, q_dim), dtype=torch.float8_e4m3fn, device=qr_kv.device),
+        torch.empty((t, rope_kernel.LANE), dtype=torch.float32, device=qr_kv.device),
+        torch.empty((t, kv_dim), dtype=qr_kv.dtype, device=qr_kv.device),
+    )
+
+
+def _qkv_norm_rope_jax(
+    qr_kv: jax.Array,
+    q_weight: jax.Array,
+    kv_weight: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    q_eps: float,
+    kv_eps: float,
+) -> jax.Array:
+    return rope_kernel.qkv_norm_rope(
+        qr_kv,
+        q_weight,
+        kv_weight,
+        positions,
+        cos_sin_cache,
+        q_eps=q_eps,
+        kv_eps=kv_eps,
+    )
+
+
+def _fake_qkv_norm_rope(
+    qr_kv: torch.Tensor,
+    q_weight: torch.Tensor,
+    kv_weight: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+) -> torch.Tensor:
+    del q_weight, kv_weight, positions, cos_sin_cache
+    return torch.empty_like(qr_kv)
+
+
+def _qkv_norm_rope_and_quant_jax(
+    qr_kv: jax.Array,
+    q_weight: jax.Array,
+    kv_weight: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    q_eps: float,
+    kv_eps: float,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    return rope_kernel.qkv_norm_rope_and_quant(
+        qr_kv,
+        q_weight,
+        kv_weight,
+        positions,
+        cos_sin_cache,
+        q_eps=q_eps,
+        kv_eps=kv_eps,
+    )
+
+
+def _fake_qkv_norm_rope_and_quant(
+    qr_kv: torch.Tensor,
+    q_weight: torch.Tensor,
+    kv_weight: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del kv_weight, positions, cos_sin_cache
+    t = qr_kv.shape[0]
+    q_dim = q_weight.shape[0]
+    return (
+        torch.empty_like(qr_kv),
+        torch.empty(
+            (t, q_dim), dtype=torch.float8_e4m3fn, device=qr_kv.device
+        ),
+        torch.empty(
+            (t, rope_kernel.LANE), dtype=torch.float32, device=qr_kv.device
+        ),
+    )
 
 
 def _wq_b_q_rope_jax(
@@ -122,6 +357,27 @@ def _wq_b_q_rope_jax(
     )
 
 
+def _wq_b_q_rope_prequant_jax(
+    qr_fp8: jax.Array,
+    qr_scale: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    wq_b: jax.Array,
+    wq_b_scale: jax.Array,
+    *,
+    head_dim: int,
+) -> jax.Array:
+    return fused_wq_b_q_rope_prequant_projection(
+        qr_fp8,
+        qr_scale,
+        positions,
+        cos_sin_cache,
+        wq_b,
+        wq_b_scale.reshape(-1),
+        head_dim=head_dim,
+    )
+
+
 def _fake_wq_b_q_rope(
     qr: torch.Tensor,
     positions: torch.Tensor,
@@ -135,6 +391,25 @@ def _fake_wq_b_q_rope(
     num_heads = wq_b.shape[1] // head_dim
     return torch.empty(
         (qr.shape[0], num_heads, head_dim), dtype=qr.dtype, device=qr.device
+    )
+
+
+def _fake_wq_b_q_rope_prequant(
+    qr_fp8: torch.Tensor,
+    qr_scale: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    wq_b: torch.Tensor,
+    wq_b_scale: torch.Tensor,
+    *,
+    head_dim: int,
+) -> torch.Tensor:
+    del qr_scale, positions, cos_sin_cache, wq_b_scale
+    num_heads = wq_b.shape[1] // head_dim
+    return torch.empty(
+        (qr_fp8.shape[0], num_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=qr_fp8.device,
     )
 
 
@@ -235,17 +510,34 @@ class VllmDeepseekV41MLAAttention(
         self.attn_sink.weight_loader = sharded_weight_loader(0)
         self._step_indexer_metadata: tuple[torch.Tensor, ...] | None = None
         self._step_csa_union: tuple[torch.Tensor, ...] | None = None
+        self._step_swa_metadata: torch.Tensor | None = None
+        self._step_tp_swa_metadata: tuple[torch.Tensor, ...] | None = None
         self._ced_decoder: bool = False
         self._ced_global_from_encoder: bool = False
         self._in_encoder_stage: bool = False
         self._tp_attn_encoder_only: bool = False
+        self.non_causal_multi_token_decode: bool = bool(
+            self.layer_id >= vllm_config.model_config.hf_config.num_hidden_layers
+        )
 
         max_len = vllm_config.model_config.max_model_len
         cache = self.rotary_emb.cos_sin_cache
-        if envs.TPU_ROPE_CACHE_TRUNCATE and cache.shape[0] > max_len:
+        if _TPU_ROPE_CACHE_TRUNCATE and cache.shape[0] > max_len:
             self.rotary_emb.cos_sin_cache = cache[:max_len].clone(
                 memory_format=torch.contiguous_format
             )
+        for _op_name in (
+            "q_rope_op",
+            "kvnorm_rope_op",
+            "qkv_norm_rope_quant_op",
+            "o_proj_op",
+            "wq_b_q_rope_op",
+            "wq_b_q_rope_prequant_op",
+        ):
+            getattr(self, _op_name, None)
+        compressor_init = getattr(self, "compressor", None)
+        if compressor_init is not None:
+            _ = compressor_init.compressor_op
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -275,9 +567,7 @@ class VllmDeepseekV41MLAAttention(
             return self
         return self._static_forward_context[self.compressed_cache_prefix]
 
-    def _leader_group_bounds(
-        self, ced_decoder: bool | None = None
-    ) -> tuple[Any, int]:
+    def _leader_group_bounds(self, ced_decoder: bool | None = None) -> tuple[Any, int]:
         eff_ced = self._ced_decoder if ced_decoder is None else ced_decoder
         cache_attr = (
             "_cached_leader_group_bounds_ced"
@@ -292,6 +582,7 @@ class VllmDeepseekV41MLAAttention(
             mod
             for mod in self._static_forward_context.values()
             if isinstance(mod, VllmDeepseekV41MLAAttention)
+            and not getattr(mod, "non_causal_multi_token_decode", False)
         ]
         ced_boundary = len(attn_mods) // 2
         min_lid = my_lid
@@ -312,6 +603,261 @@ class VllmDeepseekV41MLAAttention(
             object.__setattr__(self, cache_attr, res)
         return res
 
+    def _swa_group_bounds(
+        self, ced_decoder: bool | None = None
+    ) -> tuple[Any, int]:
+        eff_ced = self._ced_decoder if ced_decoder is None else ced_decoder
+        cache_attr = (
+            "_cached_swa_group_bounds_ced"
+            if eff_ced
+            else "_cached_swa_group_bounds"
+        )
+        cached = self.__dict__.get(cache_attr)
+        if cached is not None:
+            return cached
+        my_lid = extract_layer_index(self.prefix)
+        is_csa = self.compress_ratio > 0
+        attn_mods = [
+            mod
+            for mod in self._static_forward_context.values()
+            if isinstance(mod, VllmDeepseekV41MLAAttention)
+        ]
+        ced_boundary = len(attn_mods) // 2
+        min_lid = my_lid
+        max_lid = my_lid
+        first_leader: Any = self
+        for mod in attn_mods:
+            if (
+                (mod.compress_ratio > 0) == is_csa
+                and mod.window_size == self.window_size
+            ):
+                lid = extract_layer_index(mod.prefix)
+                if eff_ced and lid < ced_boundary:
+                    continue
+                if lid < min_lid:
+                    min_lid = lid
+                    first_leader = mod
+                if lid > max_lid:
+                    max_lid = lid
+        res = (first_leader, max_lid)
+        if not torch.compiler.is_compiling():
+            object.__setattr__(self, cache_attr, res)
+        return res
+
+    def _get_swa_page_indices_op(self, sw_cache_num_pages: int):
+        op_name = f"pallas::deepseek_v41_swa_page_indices_n{sw_cache_num_pages}"
+        if (op := self.__dict__.get(op_name)) is not None:
+            return op
+        return _get_or_register_op(
+            self,
+            op_name,
+            _deepseek_v41_flash_attn_op.prepare_swa_page_indices_jax,
+            (P(BATCH_AXIS),),
+            lambda swa_tables: torch.empty_like(swa_tables),
+            sw_cache_num_pages=sw_cache_num_pages,
+        )
+
+    def _get_swa_metadata_op(
+        self,
+        num_tokens: int,
+        sw_cache_num_pages: int,
+        sliding_window: int,
+        logical_page_size: int,
+    ):
+        op_name = (
+            f"pallas::deepseek_v41_swa_meta_t{num_tokens}_n{sw_cache_num_pages}"
+            f"_w{sliding_window}_p{logical_page_size}"
+        )
+        if (op := self.__dict__.get(op_name)) is not None:
+            return op
+
+        def _abstract_swa_meta(swa_lens, swa_tables, swa_q_loc):
+            max_seqs = swa_lens.shape[0]
+            pages_per_seq = swa_tables.numel() // max_seqs
+            win_pages = min(
+                pages_per_seq,
+                ((num_tokens + sliding_window) // logical_page_size + 2 + 15)
+                & ~15,
+            )
+            out_pages = (
+                max_seqs * win_pages
+                if pages_per_seq > win_pages * 2
+                else swa_tables.numel()
+            )
+            return (
+                torch.empty_like(swa_lens),
+                swa_tables.new_empty((out_pages,)),
+            )
+
+        return _get_or_register_op(
+            self,
+            op_name,
+            _deepseek_v41_flash_attn_op.prepare_swa_metadata_jax,
+            (P(BATCH_AXIS), P(BATCH_AXIS), P(BATCH_AXIS)),
+            _abstract_swa_meta,
+            num_tokens=num_tokens,
+            sw_cache_num_pages=sw_cache_num_pages,
+            sliding_window=sliding_window,
+            logical_page_size=logical_page_size,
+        )
+
+    def _get_or_compute_swa_metadata(
+        self,
+        swa_lens: torch.Tensor,
+        swa_tables: torch.Tensor,
+        swa_q_loc: torch.Tensor,
+        *,
+        num_tokens: int,
+        sw_cache_num_pages: int,
+        sliding_window: int,
+        logical_page_size: int,
+        ced_decoder: bool | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        first_leader, last_lid = self._swa_group_bounds(ced_decoder)
+        my_lid = extract_layer_index(self.prefix)
+        cached = getattr(first_leader, "_step_swa_win_metadata", None)
+        if my_lid == extract_layer_index(first_leader.prefix) or cached is None:
+            mapped = self._get_swa_metadata_op(
+                num_tokens,
+                sw_cache_num_pages,
+                sliding_window,
+                logical_page_size,
+            )(swa_lens, swa_tables.reshape(-1), swa_q_loc)
+            if last_lid > my_lid:
+                first_leader._step_swa_win_metadata = mapped
+            return mapped
+        if my_lid == last_lid:
+            first_leader._step_swa_win_metadata = None
+        return cached
+
+    def _get_or_compute_swa_page_indices(
+        self,
+        swa_tables: torch.Tensor,
+        sw_cache_num_pages: int,
+        *,
+        ced_decoder: bool | None = None,
+    ) -> torch.Tensor:
+        first_leader, last_lid = self._swa_group_bounds(ced_decoder)
+        my_lid = extract_layer_index(self.prefix)
+        cached = getattr(first_leader, "_step_swa_metadata", None)
+        if my_lid == extract_layer_index(first_leader.prefix) or cached is None:
+            mapped = self._get_swa_page_indices_op(sw_cache_num_pages)(swa_tables)
+            if last_lid > my_lid:
+                first_leader._step_swa_metadata = mapped
+            return mapped
+        if my_lid == last_lid:
+            first_leader._step_swa_metadata = None
+        return cached
+
+    def _get_tp_swa_step_metadata_op(self):
+        if (op := self.__dict__.get("_tp_swa_step_meta_op")) is not None:
+            return op
+        vllm_context = get_vllm_model_wrapper_context()
+        vllm_cfg = getattr(vllm_context, "vllm_config", None)
+        assert vllm_cfg is not None
+        swa_tensor = self._as_kernel_cache_view(
+            _live_cache(getattr(self.swa_cache_layer, "kv_cache", None))
+        )
+        assert swa_tensor is not None
+        if swa_tensor.dtype == torch.int32:
+            num_pages, rows, kv_packing, lanes = (
+                int(swa_tensor.shape[0]),
+                int(swa_tensor.shape[1]),
+                4,
+                int(swa_tensor.shape[2]),
+            )
+        else:
+            num_pages, rows, kv_packing, lanes = (
+                int(d) for d in swa_tensor.shape
+            )
+        slots_per_token = self.head_dim * 2 // (kv_packing * lanes)
+        phys_tokens_per_page = rows // slots_per_token
+        logical_page_size = VllmDeepseekV4SWACache._swa_block_size(
+            vllm_cfg.cache_config.block_size, self.window_size
+        )
+        tp_size = get_tensor_model_parallel_world_size()
+        op_name = (
+            f"pallas::deepseek_v41_tp_swa_step_meta_tp{tp_size}"
+            f"_n{num_pages}_pt{phys_tokens_per_page}_p{logical_page_size}"
+        )
+
+        def _fake_tp_swa_step_meta(
+            kv, swa_kv_lens, swa_page_indices, swa_cu_q_lens, swa_distribution, rank
+        ):
+            del rank
+            w = self.window_size
+            t = (
+                (kv.shape[0] - tp_size * w) * tp_size
+                if (w > 0 and kv.shape[0] > tp_size * w)
+                else kv.shape[0]
+            )
+            return (
+                swa_kv_lens.new_empty((t,), dtype=torch.int32),
+                swa_kv_lens.new_empty((t, 5), dtype=torch.int32),
+                torch.empty_like(swa_kv_lens),
+                torch.empty_like(swa_page_indices),
+                torch.empty_like(swa_cu_q_lens),
+                torch.empty_like(swa_distribution),
+            )
+
+        op = _get_or_register_op(
+            self,
+            op_name,
+            tp_attention.prepare_tp_swa_step_metadata,
+            (P(),) * 6,
+            _fake_tp_swa_step_meta,
+            num_cache_pages=num_pages,
+            phys_tokens_per_page=phys_tokens_per_page,
+            logical_page_size=logical_page_size,
+            tp_size=tp_size,
+            sliding_window=self.window_size,
+            kv_is_sharded=True,
+        )
+        if not torch.compiler.is_compiling():
+            object.__setattr__(self, "_tp_swa_step_meta_op", op)
+        return op
+
+    def _gather_tp_kv(self, kv_local: torch.Tensor) -> torch.Tensor:
+        w = self.window_size
+        local_t = kv_local.shape[0]
+        if (
+            not isinstance(local_t, torch.SymInt)
+            and w > 0
+            and local_t >= w
+        ):
+            halo_all = tp_all_gather(kv_local[-w:].contiguous(), dim=0)
+            return torch.cat([kv_local, halo_all], dim=0)
+        return tp_all_gather(kv_local, dim=0)
+
+    def _get_or_compute_tp_swa_step_metadata(
+        self,
+        kv: torch.Tensor,
+        swa_lens: torch.Tensor,
+        swa_tables: torch.Tensor,
+        swa_q_loc: torch.Tensor,
+        swa_dist: torch.Tensor,
+        *,
+        ced_decoder: bool | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        first_leader, last_lid = self._swa_group_bounds(ced_decoder)
+        my_lid = extract_layer_index(self.prefix)
+        cached = getattr(first_leader, "_step_tp_swa_metadata", None)
+        if my_lid == extract_layer_index(first_leader.prefix) or cached is None:
+            meta = self._get_tp_swa_step_metadata_op()(
+                kv,
+                swa_lens,
+                swa_tables,
+                swa_q_loc,
+                swa_dist,
+                self._tp_attn_rank_i32,
+            )
+            if last_lid > my_lid:
+                first_leader._step_tp_swa_metadata = meta
+            return meta
+        if my_lid == last_lid:
+            first_leader._step_tp_swa_metadata = None
+        return cached
+
     def _get_or_compute_indexer_step_metadata(
         self, positions: torch.Tensor, *, ced_decoder: bool | None = None
     ) -> tuple[torch.Tensor, ...]:
@@ -329,13 +875,90 @@ class VllmDeepseekV41MLAAttention(
             first_leader._step_indexer_metadata = None
         return cached_meta
 
-    def _get_csa_union_op(self, total_cache_rows: int, m_union: int):
-        op_name = f"pallas::deepseek_v41_csa_union_r{total_cache_rows}_m{m_union}"
+    def _csa_kv_group_bounds(
+        self, ced_decoder: bool | None = None
+    ) -> tuple[Any, int]:
+        eff_ced = self._ced_decoder if ced_decoder is None else ced_decoder
+        cache_attr = (
+            "_cached_csa_kv_group_bounds_ced"
+            if eff_ced
+            else "_cached_csa_kv_group_bounds"
+        )
+        cached = self.__dict__.get(cache_attr)
+        if cached is not None:
+            return cached
+        kv_holder = self._kv_source_module()
+        my_lid = extract_layer_index(self.prefix)
+        attn_mods = [
+            mod
+            for mod in self._static_forward_context.values()
+            if isinstance(mod, VllmDeepseekV41MLAAttention)
+        ]
+        ced_boundary = len(attn_mods) // 2
+        min_lid = my_lid
+        max_lid = my_lid
+        first_consumer: Any = self
+        for mod in attn_mods:
+            if mod.compress_ratio > 0 and mod._kv_source_module() is kv_holder:
+                lid = extract_layer_index(mod.prefix)
+                if eff_ced and lid < ced_boundary:
+                    continue
+                if lid < min_lid:
+                    min_lid = lid
+                    first_consumer = mod
+                if lid > max_lid:
+                    max_lid = lid
+        res = (first_consumer, max_lid)
+        if not torch.compiler.is_compiling():
+            object.__setattr__(self, cache_attr, res)
+        return res
+
+    def _get_or_compute_csa_union(
+        self,
+        topk_indices: torch.Tensor,
+        total_cache_rows: int,
+        m_union: int,
+        b_q: int,
+        *,
+        ced_decoder: bool | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        kv_holder = self._kv_source_module()
+        first_consumer, last_lid = self._csa_kv_group_bounds(ced_decoder)
+        my_lid = extract_layer_index(self.prefix)
+        cached_entry = getattr(kv_holder, "_step_csa_union", None)
+        if (
+            self.indexer is not None
+            or my_lid == extract_layer_index(first_consumer.prefix)
+            or cached_entry is None
+            or cached_entry[0] != b_q
+            or cached_entry[1] != m_union
+        ):
+            cached_u = self._get_csa_union_op(
+                total_cache_rows, m_union, b_q=b_q
+            )(topk_indices)
+            if last_lid > my_lid:
+                kv_holder._step_csa_union = (b_q, m_union, cached_u)
+            else:
+                kv_holder._step_csa_union = None
+            return cached_u
+        if my_lid == last_lid:
+            kv_holder._step_csa_union = None
+        return cached_entry[2]
+
+    def prewarm_real_cache_ops(self) -> None:
+        return
+
+    def _get_csa_union_op(
+        self, total_cache_rows: int, m_union: int, b_q: int | None = None
+    ):
+        b_q = _CSA_UNION_BQ if b_q is None else b_q
+        u_chunk = resolve_csa_union_u_chunk(b_q, m_union, int(getattr(self, "topk", 512)))
+        op_name = f"pallas::deepseek_v41_csa_union_r{total_cache_rows}_bq{b_q}_m{m_union}_uc{u_chunk}"
         if (op := self.__dict__.get(op_name)) is not None:
             return op
 
         def _fake_union(topk_indices: torch.Tensor):
-            num_groups = topk_indices.shape[0] // 32
+            num_groups = topk_indices.shape[0] // b_q
             return (
                 torch.empty(
                     (num_groups * m_union,),
@@ -361,20 +984,46 @@ class VllmDeepseekV41MLAAttention(
             _CSA_UNION_SPECS,
             _fake_union,
             total_cache_rows=total_cache_rows,
-            b_q=32,
+            b_q=b_q,
             m_union=m_union,
+            u_chunk=u_chunk,
         )
 
     @property
     def attn_op(self):
         op = self._get_attn_op(False)
-        if getattr(self, "_supports_ced_decoder", False) and not torch.compiler.is_compiling():
+        if (
+            getattr(self, "_supports_ced_decoder", False)
+            and not torch.compiler.is_compiling()
+        ):
             _ = self._get_attn_op(False, ced_decoder=True)
+        if self.non_causal_multi_token_decode and not torch.compiler.is_compiling():
+            _ = self.context_kv_attn_op
+            _ = self.kv_rope_op
+            for _ps in (16, 32, 64, 128):
+                _ = _get_dspark_swa_store_op(_ps)
         return op
 
-    def _get_attn_op(
-        self, has_union: bool = False, ced_decoder: bool | None = None
-    ):
+    @property
+    def context_kv_attn_op(self):
+        op = self.__dict__.get("_ctx_kv_attn_op_instance")
+        if op is not None:
+            return op
+        _ = self.kv_rope_op
+        swa_tensor = _live_cache(getattr(self.swa_cache_layer, "kv_cache", None))
+        if swa_tensor is None:
+            prof_op = self.__dict__.get("_prof_ctx_kv_attn_op_instance")
+            if prof_op is None:
+                prof_op, _ = self._build_attn_op(non_causal_override=False)
+                object.__setattr__(self, "_prof_ctx_kv_attn_op_instance", prof_op)
+            return prof_op
+        op, is_real = self._build_attn_op(non_causal_override=False)
+        assert is_real
+        object.__setattr__(self, "_ctx_kv_attn_op_instance", op)
+        self.__dict__.pop("_prof_ctx_kv_attn_op_instance", None)
+        return op
+
+    def _get_attn_op(self, has_union: bool = False, ced_decoder: bool | None = None):
         eff_ced = self._ced_decoder if ced_decoder is None else ced_decoder
         ced_tag = "_ced" if eff_ced else ""
         u_tag = "_u1" if has_union else "_instance"
@@ -383,13 +1032,26 @@ class VllmDeepseekV41MLAAttention(
         op = self.__dict__.get(attr_name)
         if op is not None:
             return op
-        _ = self.kvnorm_rope_op
-        if envs.VLLM_DSV41_FUSED_Q_ROPE:
-            _ = self.wq_b_q_rope_op
-        if envs.VLLM_DSV41_FUSED_SEAM_QUANT:
+        if not torch.compiler.is_compiling():
             _ = _get_quantized_matmul_prequant_op()
-        if self.indexer is not None and not torch.compiler.is_compiling():
-            _ = self._leader_group_bounds(eff_ced)
+            _ = self.q_rope_op
+            _ = self.kvnorm_rope_op
+            _ = self.qkv_norm_rope_quant_op
+            _ = self.qkv_norm_rope_op
+            getattr(self, "qkv_norm_rope_split_op", None)
+            _ = self.qkv_norm_rope_and_quant_op
+            _ = self.o_proj_op
+            _ = self.o_proj_wob_op
+            _ = self.wq_b_q_rope_op
+            _ = self.wq_b_q_rope_prequant_op
+            if self.non_causal_multi_token_decode:
+                _ = self.kv_rope_op
+                _ = self.context_kv_attn_op
+            if "_tp_attn_wo_b_w" in self._buffers:
+                _ = _get_quantized_matmul_op()
+            _ = self._swa_group_bounds(eff_ced)
+            if self.indexer is not None:
+                _ = self._leader_group_bounds(eff_ced)
         swa_tensor = _live_cache(getattr(self.swa_cache_layer, "kv_cache", None))
         if swa_tensor is None:
             prof_op = self.__dict__.get(prof_attr)
@@ -398,46 +1060,49 @@ class VllmDeepseekV41MLAAttention(
                     has_union=has_union, ced_decoder=eff_ced
                 )
                 object.__setattr__(self, prof_attr, prof_op)
-            if not has_union and self.compress_ratio > 0 and not torch.compiler.is_compiling():
-                _ = self._get_attn_op(True, ced_decoder=eff_ced)
             return prof_op
         op, is_real = self._build_attn_op(has_union=has_union, ced_decoder=eff_ced)
         assert is_real
         object.__setattr__(self, attr_name, op)
         self.__dict__.pop(prof_attr, None)
         if not torch.compiler.is_compiling():
-            if not has_union and self.compress_ratio > 0:
-                _ = self._get_attn_op(True, ced_decoder=eff_ced)
-                kv_holder = self._kv_source_module()
-                main_entry = getattr(kv_holder, "kv_cache", None)
-                main_cache = _live_cache(
-                    main_entry[0] if isinstance(main_entry, tuple) else main_entry
-                )
-                if main_cache is not None and main_cache.shape[0] > 0:
-                    m_u = ((3 * int(self.topk_indices_buffer.shape[1]) + 127) // 128) * 128
-                    _ = self._get_csa_union_op(
-                        int(main_cache.shape[0] * main_cache.shape[1]), m_u
-                    )
+            _ = self._get_swa_page_indices_op(int(swa_tensor.shape[0]))
             if self.indexer is not None:
                 idx_kv = _live_cache(getattr(self.indexer.k_cache, "kv_cache", None))
                 if idx_kv is not None:
                     _ = self.indexer._get_step_metadata_op(int(idx_kv.shape[3]))
             tp_size = get_tensor_model_parallel_world_size()
             if (
-                envs.VLLM_DSV41_TP_ATTN
+                _TP_ATTN
                 and "_tp_attn_wq_b_w" in self._buffers
                 and self._tp_attn_ready(tp_size, tp_size)
             ):
                 self.__dict__.pop("_tp_attn_op", None)
-                _ = self._get_tp_attn_op()
-                if envs.VLLM_DSV41_TP_ATTN_LOCAL_TOPK and self.compress_ratio > 0:
+                self.__dict__.pop("_tp_attn_op_u1", None)
+                self.__dict__.pop("_tp_attn_op_ced", None)
+                self.__dict__.pop("_tp_attn_op_ced_u1", None)
+                self.__dict__.pop("_tp_swa_step_meta_op", None)
+                _ = self._get_tp_attn_op(False, ced_decoder=eff_ced)
+                if self.compress_ratio > 0:
+                    _ = self._get_tp_attn_op(True, ced_decoder=eff_ced)
+                _ = self._get_tp_swa_step_metadata_op()
+                if _TP_ATTN_LOCAL_TOPK and self.compress_ratio > 0:
                     _ = self._tp_attn_topk_indexer()
         return op
 
     def _build_attn_op(
-        self, has_union: bool = False, ced_decoder: bool | None = None
+        self,
+        has_union: bool = False,
+        ced_decoder: bool | None = None,
+        non_causal_override: bool | None = None,
     ):
         eff_ced = self._ced_decoder if ced_decoder is None else ced_decoder
+        non_causal = (
+            bool(getattr(self, "non_causal_multi_token_decode", False))
+            if non_causal_override is None
+            else non_causal_override
+        )
+        is_ctx_kv_only = non_causal_override is False
         vllm_context = get_vllm_model_wrapper_context()
         is_csa = self.compress_ratio > 0
         kv_holder = self._kv_source_module()
@@ -461,8 +1126,10 @@ class VllmDeepseekV41MLAAttention(
         )
 
         use_flashmla_tp8 = (
-            os.environ.get("VLLM_DSV41_FLASHMLA_TP8", "0") == "1"
+            _FLASHMLA_TP8
             and get_tensor_model_parallel_world_size() == 8
+            and not non_causal
+            and not is_ctx_kv_only
         )
         if use_flashmla_tp8:
             from vllm_torchtpu.kernels.deepseek_v41.flashmla_split_kv import (
@@ -471,19 +1138,31 @@ class VllmDeepseekV41MLAAttention(
             )
 
             attn_fn = (
-                flashmla_attention_csa_tp8
-                if is_csa
-                else flashmla_attention_swa_tp8
+                flashmla_attention_csa_tp8 if is_csa else flashmla_attention_swa_tp8
             )
         else:
             attn_fn = _attention_csa if is_csa else _attention_swa
+        extra_kw: dict[str, Any] = {}
+        if is_csa:
+            extra_kw["two_caches_same_buffer"] = two_caches_same_buffer
+        elif not use_flashmla_tp8:
+            extra_kw["non_causal_block"] = non_causal
         wrapped_fn = functools.partial(
             attn_fn,
             sm_scale=self.scale,
-            sliding_window=self.window_size,
+            sliding_window=1 if is_ctx_kv_only else self.window_size,
             logical_page_size=logical_page_size,
             ced_decoder=eff_ced,
-            **({"two_caches_same_buffer": two_caches_same_buffer} if is_csa else {}),
+            **(
+                {"page_indices_ring_mapped": built_from_real_caches}
+                if not use_flashmla_tp8
+                else {}
+            ),
+            **(
+                {"two_caches_same_buffer": two_caches_same_buffer}
+                if is_csa
+                else ({"non_causal_block": non_causal} if not use_flashmla_tp8 else {})
+            ),
         )
         op_type = "csa" if is_csa else "swa"
         op_name = (
@@ -492,6 +1171,8 @@ class VllmDeepseekV41MLAAttention(
             f"{'_ced' if eff_ced else ''}"
             f"_p{logical_page_size}"
             f"{'_aliased' if two_caches_same_buffer else ''}"
+            f"{'_ncb' if non_causal else ''}"
+            f"{'_ctxkv' if is_ctx_kv_only else ''}"
             f"{'_u1' if (is_csa and has_union) else ''}"
             f"{'' if built_from_real_caches else '_prof'}"
         )
@@ -541,7 +1222,8 @@ class VllmDeepseekV41MLAAttention(
     def _tp_attn_ready(self, num_tokens: int, tp_size: int) -> bool:
         """Whether VLLM_DSV41_TP_ATTN can run this step (CED is checked by the caller)."""
         if not (
-            envs.VLLM_DSV41_TP_ATTN
+            _TP_ATTN
+            and not self.non_causal_multi_token_decode
             and tp_size > 1
             and num_tokens % tp_size == 0
             # A token-count threshold splits the bucket ladder into traces
@@ -549,8 +1231,8 @@ class VllmDeepseekV41MLAAttention(
             # inputs then fail the bucket hand-over's signature check. <= 0
             # skips the comparison so no guard is recorded.
             and (
-                envs.VLLM_DSV41_TP_ATTN_MIN_TOKENS <= 0
-                or num_tokens >= envs.VLLM_DSV41_TP_ATTN_MIN_TOKENS
+                _TP_ATTN_MIN_TOKENS <= 0
+                or num_tokens >= _TP_ATTN_MIN_TOKENS
             )
             and "_tp_attn_wq_b_w" in self._buffers
             and _live_cache(getattr(self.swa_cache_layer, "kv_cache", None)) is not None
@@ -581,6 +1263,7 @@ class VllmDeepseekV41MLAAttention(
                 for mod in self._static_forward_context.values()
                 if isinstance(mod, VllmDeepseekV41MLAAttention)
                 and mod.compress_ratio > 0
+                and not getattr(mod, "non_causal_multi_token_decode", False)
             ),
             key=lambda item: item[0],
         )
@@ -610,20 +1293,26 @@ class VllmDeepseekV41MLAAttention(
         stage loop with the same token-sharding, CED and encoder-stage
         settings, so they all run it too.
         """
-        if not envs.VLLM_DSV41_TP_ATTN_LOCAL_TOPK or self.compress_ratio == 0:
+        if not _TP_ATTN_LOCAL_TOPK or self.compress_ratio == 0:
             return False
         indexer = self._tp_attn_topk_indexer()
         return indexer is not None and indexer.use_tp_indexer(num_tokens)
 
-    def _get_tp_attn_op(self):
+    def _get_tp_attn_op(
+        self, has_union: bool = False, ced_decoder: bool | None = None
+    ):
         """Token-parallel attention op: all heads for this rank's T/tp tokens."""
-        op = self.__dict__.get("_tp_attn_op")
+        eff_ced = self._ced_decoder if ced_decoder is None else ced_decoder
+        is_csa = self.compress_ratio > 0
+        ced_tag = "_ced" if eff_ced else ""
+        u_tag = "_u1" if (is_csa and has_union) else ""
+        attr_name = f"_tp_attn_op{ced_tag}{u_tag}"
+        op = self.__dict__.get(attr_name)
         if op is not None:
             return op
         vllm_context = get_vllm_model_wrapper_context()
         vllm_cfg = getattr(vllm_context, "vllm_config", None)
         assert vllm_cfg is not None
-        is_csa = self.compress_ratio > 0
         main_entry = getattr(self._kv_source_module(), "kv_cache", None)
         main_cache = _live_cache(
             main_entry[0] if isinstance(main_entry, tuple) else main_entry
@@ -643,30 +1332,50 @@ class VllmDeepseekV41MLAAttention(
             sm_scale=self.scale,
             sliding_window=self.window_size,
             logical_page_size=logical_page_size,
+            ced_decoder=eff_ced,
             token_parallel=True,
+            page_indices_ring_mapped=True,
             **({"two_caches_same_buffer": two_caches_same_buffer} if is_csa else {}),
         )
         op_name = (
             f"pallas::deepseek_v41_attention_{'csa' if is_csa else 'swa'}"
             f"_tpattn{get_tensor_model_parallel_world_size()}"
+            f"{ced_tag}"
             f"_p{logical_page_size}"
             f"{'_aliased' if two_caches_same_buffer else ''}"
+            f"{u_tag}"
         )
         op = _pallas_op_cache.get(op_name)
         if op is None:
             # Every operand but q is whole on each rank (q, the token slice,
             # differs per rank as in the head-parallel op).
+            b_ax = BATCH_AXIS
             op = pallas.jax_op(
                 op_name,
                 functools.partial(
-                    tp_attention.attention_tp_local,
+                    tp_attention.attention_tp_local_csa_union_op
+                    if (is_csa and has_union)
+                    else (
+                        tp_attention.attention_tp_local_csa_op
+                        if is_csa
+                        else tp_attention.attention_tp_local_swa_op
+                    ),
                     base_fn=base_fn,
                     logical_page_size=logical_page_size,
+                    sliding_window=self.window_size,
+                    tp_size=get_tensor_model_parallel_world_size(),
+                    ced_decoder=eff_ced,
                 ),
                 mesh=vllm_context.mesh,
                 donate_argnums=(2,),
                 input_partition_specs=(P(None, "model", None),)
-                + (P(),) * (15 if is_csa else 14),
+                + (P(),) * (15 if is_csa else 14)
+                + (
+                    (P(b_ax), P(b_ax, None, None), P(b_ax))
+                    if (is_csa and has_union)
+                    else ()
+                )
+                + (P(), P()),
             )
             op.register_fake(
                 lambda q, new_kv, sw_cache, *a, **kw: (
@@ -675,7 +1384,7 @@ class VllmDeepseekV41MLAAttention(
                 )
             )
             _pallas_op_cache[op_name] = op
-        object.__setattr__(self, "_tp_attn_op", op)
+        object.__setattr__(self, attr_name, op)
         return op
 
     def _build_tp_attn_weights(self) -> None:
@@ -750,6 +1459,57 @@ class VllmDeepseekV41MLAAttention(
         )
 
     @property
+    def qkv_norm_rope_quant_op(self):
+        q_eps = float(self.q_norm.variance_epsilon)
+        kv_eps = float(self.kv_norm.variance_epsilon)
+        return _get_or_register_op(
+            self,
+            (
+                f"pallas::deepseek_v41_qkv_norm_rope_quant_qe{_name_float(q_eps)}"
+                f"_kve{_name_float(kv_eps)}"
+            ),
+            _qkv_norm_rope_quant_jax,
+            _QKV_NORM_ROPE_QUANT_SPECS,
+            _fake_qkv_norm_rope_quant,
+            q_eps=q_eps,
+            kv_eps=kv_eps,
+        )
+
+    @property
+    def qkv_norm_rope_op(self):
+        q_eps = float(self.q_norm.variance_epsilon)
+        kv_eps = float(self.kv_norm.variance_epsilon)
+        return _get_or_register_op(
+            self,
+            (
+                f"pallas::deepseek_v41_qkv_norm_rope_qe{_name_float(q_eps)}"
+                f"_kve{_name_float(kv_eps)}"
+            ),
+            _qkv_norm_rope_jax,
+            _QKV_NORM_ROPE_QUANT_SPECS,
+            _fake_qkv_norm_rope,
+            q_eps=q_eps,
+            kv_eps=kv_eps,
+        )
+
+    @property
+    def qkv_norm_rope_and_quant_op(self):
+        q_eps = float(self.q_norm.variance_epsilon)
+        kv_eps = float(self.kv_norm.variance_epsilon)
+        return _get_or_register_op(
+            self,
+            (
+                f"pallas::deepseek_v41_qkv_norm_rope_and_quant_qe{_name_float(q_eps)}"
+                f"_kve{_name_float(kv_eps)}"
+            ),
+            _qkv_norm_rope_and_quant_jax,
+            _QKV_NORM_ROPE_QUANT_SPECS,
+            _fake_qkv_norm_rope_and_quant,
+            q_eps=q_eps,
+            kv_eps=kv_eps,
+        )
+
+    @property
     def o_proj_op(self):
         head_dim = int(self.head_dim)
         return _get_or_register_op(
@@ -758,6 +1518,18 @@ class VllmDeepseekV41MLAAttention(
             _o_proj_jax,
             _O_PROJ_SPECS,
             _fake_o_proj,
+            head_dim=head_dim,
+        )
+
+    @property
+    def o_proj_wob_op(self):
+        head_dim = int(self.head_dim)
+        return _get_or_register_op(
+            self,
+            f"pallas::deepseek_v4_o_proj_wob_d{head_dim}",
+            _o_proj_wob_jax,
+            _O_PROJ_WOB_SPECS,
+            _fake_o_proj_wob,
             head_dim=head_dim,
         )
 
@@ -773,6 +1545,18 @@ class VllmDeepseekV41MLAAttention(
             head_dim=head_dim,
         )
 
+    @property
+    def wq_b_q_rope_prequant_op(self):
+        head_dim = int(self.head_dim)
+        return _get_or_register_op(
+            self,
+            f"pallas::deepseek_v41_wq_b_q_rope_prequant_d{head_dim}",
+            _wq_b_q_rope_prequant_jax,
+            _WQ_B_Q_ROPE_PREQUANT_SPECS,
+            functools.partial(_fake_wq_b_q_rope_prequant, head_dim=head_dim),
+            head_dim=head_dim,
+        )
+
     def can_accept_prequant_hidden(
         self,
         num_tokens: int,
@@ -780,30 +1564,42 @@ class VllmDeepseekV41MLAAttention(
         token_sharded: bool,
         ced_global_from_encoder: bool | None = None,
     ) -> bool:
-        if not envs.VLLM_DSV41_FUSED_SEAM_QUANT:
+        if (
+            not _FUSED_SEAM_QUANT
+            or self.indexer is not None
+            or getattr(self, "compressor", None) is not None
+        ):
             return False
-        w_s = getattr(self.fused_wqa_wkv, "weight_scale", None)
-        if w_s is None or w_s.ndim != 1 or getattr(self.fused_wqa_wkv, "bias", None) is not None:
+        w_s = self.fused_wqa_wkv._parameters.get("weight_scale", None)
+        if (
+            w_s is None
+            or w_s.ndim != 1
+            or self.fused_wqa_wkv._parameters.get("bias", None) is not None
+        ):
             return False
         if not token_sharded:
             return True
         tp_size = get_tensor_model_parallel_world_size()
         if tp_size <= 1:
             return True
+        use_tp_idx = (
+            self.indexer is not None
+            and getattr(self.indexer, "use_tp_indexer", None) is not None
+            and self.indexer.use_tp_indexer(num_tokens)
+        )
         eff_ced_global = (
             self._ced_global_from_encoder
             if ced_global_from_encoder is None
             else ced_global_from_encoder
         )
         compressor = None if eff_ced_global else getattr(self, "compressor", None)
-        use_tp_idx = (
-            self.indexer is not None
-            and getattr(self.indexer, "use_tp_indexer", None) is not None
-            and self.indexer.use_tp_indexer(num_tokens)
+        use_tp_attn = (
+            envs.VLLM_DSV41_TP_ATTN
+            and num_tokens >= envs.VLLM_DSV41_TP_ATTN_MIN_TOKENS
         )
         return (
             num_tokens % tp_size == 0
-            and compressor is None
+            and (compressor is None or use_tp_attn)
             and (self.indexer is None or use_tp_idx)
         )
 
@@ -812,16 +1608,21 @@ class VllmDeepseekV41MLAAttention(
         hidden_states: torch.Tensor,
         hidden_states_fp8: torch.Tensor | None,
         hidden_states_scale: torch.Tensor | None,
+        w_wqa: torch.Tensor | None = None,
+        ws_wqa: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        weight = self.fused_wqa_wkv.weight if w_wqa is None else w_wqa
+        weight_scale = (
+            self.fused_wqa_wkv.weight_scale if ws_wqa is None else ws_wqa
+        )
         if hidden_states_fp8 is not None and hidden_states_scale is not None:
-            weight = self.fused_wqa_wkv.weight
             if getattr(self.fused_wqa_wkv, KEEP_VLLM_LAYOUT_ATTR, False):
                 weight = weight.transpose(0, 1)
             return quantized_matmul_prequant(
                 hidden_states_fp8,
                 hidden_states_scale,
                 weight,
-                self.fused_wqa_wkv.weight_scale,
+                weight_scale,
             )
         return self.fused_wqa_wkv(hidden_states)[0]
 
@@ -848,8 +1649,108 @@ class VllmDeepseekV41MLAAttention(
             object.__setattr__(self, "_dummy_main_cache_kv", dummy)
         return dummy
 
+    def project_wkv(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hasattr(self, "wkv_weight"):
+            return quantized_matmul(
+                hidden_states, self.wkv_weight, self.wkv_weight_scale
+            )
+        qr_kv = self.fused_wqa_wkv(hidden_states)[0]
+        _, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+        return kv
+
+    def store_context_kv(
+        self,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        swa_attn_metadata: Any,
+    ) -> torch.Tensor:
+        if positions.ndim > 1:
+            positions = positions.flatten()
+        kv = self.kv_rope_op(kv, positions, self.rotary_emb.cos_sin_cache)
+        orig_sw_cache = self._as_kernel_cache_view(
+            _live_cache(getattr(self.swa_cache_layer, "kv_cache", None))
+        )
+        swa_lens, swa_tables, swa_q_loc, swa_dist = _unpack_meta(swa_attn_metadata)
+        if orig_sw_cache is not None and orig_sw_cache.device.type == "tpu":
+            vllm_cfg = getattr(get_vllm_model_wrapper_context(), "vllm_config", None)
+            logical_page_size = (
+                VllmDeepseekV4SWACache._swa_block_size(
+                    vllm_cfg.cache_config.block_size, self.window_size
+                )
+                if vllm_cfg is not None
+                else int(self.swa_cache_layer.block_size)
+            )
+            store_op = _get_dspark_swa_store_op(logical_page_size)
+            if store_op is not None:
+                m_pad = (kv.shape[0] + 7) & ~7
+                kv_store = (
+                    torch.cat((kv, torch.zeros((m_pad - kv.shape[0], *kv.shape[1:]), dtype=kv.dtype, device=kv.device)), dim=0)
+                    if m_pad > kv.shape[0]
+                    else kv
+                )
+                new_sw_cache = store_op(
+                    orig_sw_cache,
+                    kv_store,
+                    swa_lens,
+                    swa_tables,
+                    swa_q_loc,
+                    swa_dist,
+                )
+                if new_sw_cache is not None and new_sw_cache.numel() > 0:
+                    orig_sw_cache.copy_(new_sw_cache)
+                return kv
+        sw_cache = (
+            orig_sw_cache
+            if orig_sw_cache is not None
+            else torch.zeros(
+                (0, 1, 1, self.head_dim), dtype=torch.uint8, device=kv.device
+            )
+        )
+        # Only the SWA cache write is needed; a 2-head dummy query with the
+        # sliding_window=1 op keeps the attention compute negligible.
+        out_tensor, new_sw_cache = self.context_kv_attn_op(
+            kv.new_zeros((kv.shape[0], 2, self.head_dim)),
+            kv,
+            sw_cache,
+            swa_lens,
+            swa_tables,
+            swa_q_loc,
+            swa_dist,
+            self._get_dummy_main_cache(kv.device),
+            swa_lens,
+            (positions + 1).to(torch.int32),
+            swa_tables,
+            swa_q_loc,
+            swa_dist,
+            self.attn_sink.new_zeros((2,), device=kv.device),
+        )
+        if (
+            orig_sw_cache is not None
+            and new_sw_cache is not None
+            and new_sw_cache.numel() > 0
+        ):
+            orig_sw_cache.copy_(new_sw_cache)
+        return out_tensor
+
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         del act_dtype
+        # Cache the wkv half of fused_wqa_wkv so DSpark skips the wq_a GEMM.
+        if self.non_causal_multi_token_decode and not hasattr(self, "wkv_weight"):
+            f_w = self.fused_wqa_wkv.weight
+            if getattr(self.fused_wqa_wkv, KEEP_VLLM_LAYOUT_ATTR, False):
+                f_w = f_w.transpose(0, 1)
+            f_s = getattr(self.fused_wqa_wkv, "weight_scale", None)
+            if f_s is not None and f_w.shape[1] == self.q_lora_rank + self.head_dim:
+                for attr, t in (
+                    ("wkv_weight", f_w[:, self.q_lora_rank :]),
+                    ("wkv_weight_scale", f_s[..., self.q_lora_rank :]),
+                ):
+                    buf = torch.empty(t.shape, dtype=t.dtype, device=t.device).copy_(t)
+                    setattr(self, attr, torch.nn.Parameter(buf, requires_grad=False))
+                if f_w.device.type == "tpu":
+                    synchronize_tensors(
+                        [self.wkv_weight, self.wkv_weight_scale], wait=True
+                    )
         for lin_mod, expected_shape, name in (
             (
                 self.wq_b,
@@ -882,12 +1783,9 @@ class VllmDeepseekV41MLAAttention(
                 out.copy_(weight.data.t())
                 lin_mod.weight = torch.nn.Parameter(out, requires_grad=False)
         if (
-            envs.VLLM_DSV41_TP_ATTN
+            _TP_ATTN
+            and not self.non_causal_multi_token_decode
             and get_tensor_model_parallel_world_size() > 1
-            and not (
-                self._tp_attn_encoder_only
-                and getattr(self, "_supports_ced_decoder", False)
-            )
         ):
             self._build_tp_attn_weights()
         elif get_tensor_model_parallel_world_size() > 1:
@@ -897,6 +1795,44 @@ class VllmDeepseekV41MLAAttention(
                 torch.tensor([rank], dtype=torch.int64, device=self.wq_b.weight.device),
                 persistent=False,
             )
+            if not self.non_causal_multi_token_decode:
+                self._build_tp_wo_b_weights()
+
+        if not torch.compiler.is_compiling():
+            for _op_name in ("q_rope_op", "kvnorm_rope_op", "qkv_norm_rope_quant_op", "qkv_norm_rope_op", "qkv_norm_rope_split_op", "qkv_norm_rope_and_quant_op", "o_proj_op", "o_proj_wob_op", "wq_b_q_rope_op", "wq_b_q_rope_prequant_op"):
+                getattr(self, _op_name, None)
+
+    def _build_tp_wo_b_weights(self) -> None:
+        """Replicates wo_b across TP ranks for token-sharded AllToAll wo_b."""
+        wo_b_scale = getattr(self.wo_b, "weight_scale", None)
+        if wo_b_scale is None:
+            return
+        wo_b_s = wo_b_scale.data
+        if wo_b_s.ndim not in (1, 4):
+            return
+        tp_size = get_tensor_model_parallel_world_size()
+
+        def gather(x: torch.Tensor, dim: int) -> torch.Tensor:
+            if x.element_size() == 1:
+                out = tp_all_gather(x.view(torch.uint8), dim).view(x.dtype)
+            else:
+                out = tp_all_gather(x, dim)
+            return out.clone(memory_format=torch.contiguous_format)
+
+        buffers = {
+            "_tp_attn_wo_b_w": gather(self.wo_b.weight.data, 0),
+            "_tp_attn_wo_b_s": (
+                gather(wo_b_s, 1)
+                if wo_b_s.ndim == 4
+                else gather(wo_b_s.unsqueeze(0), 0).view(1, tp_size, 1, -1)
+            ),
+        }
+        device = self.wo_b.weight.device
+        if device.type == "tpu":
+            synchronize_tensors(list(buffers.values()), wait=True)
+            _ = _get_quantized_matmul_op()
+        for name, tensor in buffers.items():
+            self.register_buffer(name, tensor, persistent=False)
 
     def write_encoder_global_kv(
         self, hidden_states: torch.Tensor, positions: torch.Tensor
@@ -905,14 +1841,15 @@ class VllmDeepseekV41MLAAttention(
         if positions.ndim > 1:
             positions = positions.flatten()
         compressor = getattr(self, "compressor", None)
-        latent = (
-            compressor(hidden_states, positions) if compressor is not None else None
-        )
-        if compressor is not None and latent is not None:
-            compressor.insert_cache(latent, positions, self.rotary_emb)
-        if self.indexer is not None and self.indexer.owns_k:
-            assert latent is not None
-            self.indexer.write_k_cache(latent, positions, self.indexer_rotary_emb)
+        if compressor is not None:
+            compressor.forward_insert_and_produce_k(
+                hidden_states,
+                positions,
+                self.rotary_emb,
+                self.indexer,
+                self.indexer_rotary_emb,
+                pregathered_proj=None,
+            )
 
     def forward(
         self,
@@ -932,31 +1869,27 @@ class VllmDeepseekV41MLAAttention(
         num_tokens = positions.shape[0]
         tp_size = get_tensor_model_parallel_world_size()
         is_csa = self.compress_ratio > 0
-        eff_ced_decoder = (
-            self._ced_decoder if ced_decoder is None else ced_decoder
-        )
+        eff_ced_decoder = self._ced_decoder if ced_decoder is None else ced_decoder
         eff_ced_global_from_encoder = (
             self._ced_global_from_encoder
             if ced_global_from_encoder is None
             else ced_global_from_encoder
         )
         compressor = (
-            None
-            if eff_ced_global_from_encoder
-            else getattr(self, "compressor", None)
+            None if eff_ced_global_from_encoder else getattr(self, "compressor", None)
         )
         cos_sin = self.rotary_emb.cos_sin_cache
         if (
-            envs.VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS > 0
-            and "_tp_attn_wq_b_w" in self._buffers
-            and not eff_ced_decoder
-            and (not self._tp_attn_encoder_only or self._in_encoder_stage)
+            "_tp_attn_wq_b_w" in self._buffers
+            and (
+                not self._tp_attn_encoder_only
+                or self._in_encoder_stage
+                or eff_ced_decoder
+            )
         ):
-            # VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS splits this module's bucket
-            # ladder into head-parallel (replicated) and TP_ATTN (token-sharded)
-            # shape_variants traces. Lift both branches' module tensors here in a
-            # fixed order so their FX placeholder signatures agree (unused
-            # aliases are DCE'd), as in l3b_min_tokens_shape_variants_fix.
+            # Lift both head-parallel (replicated) and TP_ATTN (token-sharded)
+            # module tensors here in a fixed order so their FX placeholder
+            # signatures agree across all buckets (unused aliases are DCE'd).
             _ = self._tp_attn_ready(num_tokens, tp_size)
             _ = [
                 torch.ops.aten.alias.default(t)
@@ -977,21 +1910,74 @@ class VllmDeepseekV41MLAAttention(
                     self._tp_attn_sink,
                     self._tp_attn_rank_idx,
                     self._tp_attn_rank_i32,
+                    getattr(self.indexer, "_tp_rank_idx", None)
+                    if self.indexer is not None
+                    else None,
+                )
+                if t is not None
+            ]
+        elif (
+            _TOKEN_SHARD_MIN_TOKENS > 0
+            and "_tp_attn_wo_b_w" in self._buffers
+        ):
+            _ = [
+                torch.ops.aten.alias.default(t)
+                for t in (
+                    self.wo_b.weight,
+                    getattr(self.wo_b, "weight_scale", None),
+                    self._tp_attn_wo_b_w,
+                    self._tp_attn_wo_b_s,
                 )
                 if t is not None
             ]
         use_tp_idx = (
             self.indexer is not None and self.indexer.use_tp_indexer(num_tokens)
         )
+        qr: torch.Tensor | None = None
         qr_for_indexer: torch.Tensor | None = None
+        qr_fp8_for_indexer: torch.Tensor | None = None
+        qr_scale_for_indexer: torch.Tensor | None = None
+        qr_q_fp8: torch.Tensor | None = None
+        qr_q_scale: torch.Tensor | None = None
+        tp_attn_ced_ok = (
+            not eff_ced_decoder
+            or (num_tokens <= 1536 and num_tokens % (tp_size * 6) == 0)
+        )
         # Token-parallel attention: all heads for this rank's T/tp tokens.
         use_tp_attn = (
             input_is_token_sharded
             and return_token_sharded
-            and not eff_ced_decoder
-            and (not self._tp_attn_encoder_only or self._in_encoder_stage)
+            and tp_attn_ced_ok
+            and (
+                not self._tp_attn_encoder_only
+                or self._in_encoder_stage
+                or eff_ced_decoder
+            )
             and self._tp_attn_ready(num_tokens, tp_size)
         )
+        w_wqa = self.fused_wqa_wkv.weight
+        ws_wqa = self.fused_wqa_wkv._parameters.get("weight_scale", None)
+        w_qnorm = self.q_norm.weight
+        w_kvnorm = self.kv_norm.weight
+        w_wqb = self.wq_b.weight
+        ws_wqb = self.wq_b._parameters.get("weight_scale", None)
+        wq_b_s = ws_wqb
+        has_wqb_bias = self.wq_b._parameters.get("bias", None) is not None
+        if use_tp_attn:
+            use_fused_q_rope = bool(
+                _FUSED_Q_ROPE
+                and self._tp_attn_wq_b_s.ndim == 1
+                and not has_wqb_bias
+                and (self.n_local_heads * tp_size) % 8 == 0
+            )
+        else:
+            use_fused_q_rope = bool(
+                _FUSED_Q_ROPE
+                and wq_b_s is not None
+                and wq_b_s.ndim == 1
+                and not has_wqb_bias
+                and self.n_local_heads % 8 == 0
+            )
         rank_idx = (
             tp_rank_idx
             if tp_rank_idx is not None
@@ -999,90 +1985,221 @@ class VllmDeepseekV41MLAAttention(
         )
         if use_tp_attn:
             tp_rank = get_tensor_model_parallel_rank()
-            positions_local = tp_shard_slice(
-                positions, tp_size, tp_rank, rank_idx
-            )
-        if (
+            positions_local = tp_shard_slice(positions, tp_size, tp_rank, rank_idx)
+        token_sharded_qkv = (
             input_is_token_sharded
             and tp_size > 1
             and num_tokens % tp_size == 0
-            and compressor is None
+            and (compressor is None or use_tp_attn)
             and (self.indexer is None or use_tp_idx)
-        ):
+        )
+        use_qkv_prequant = (
+            use_fused_q_rope
+            and (not token_sharded_qkv or use_tp_attn)
+            and w_qnorm is not None
+            and self.indexer is None
+        )
+        if token_sharded_qkv:
             if not use_tp_attn:
                 tp_rank = get_tensor_model_parallel_rank()
-                positions_local = tp_shard_slice(
-                    positions, tp_size, tp_rank, rank_idx
-                )
+                positions_local = tp_shard_slice(positions, tp_size, tp_rank, rank_idx)
             qr_kv_local = self._apply_fused_wqa_wkv(
-                hidden_states, hidden_states_fp8, hidden_states_scale
+                hidden_states,
+                hidden_states_fp8,
+                hidden_states_scale,
+                w_wqa=w_wqa,
+                ws_wqa=ws_wqa,
             )
-            qr_local, kv_local = qr_kv_local.split(
-                [self.q_lora_rank, self.head_dim], dim=-1
-            )
-            qr_local = self.q_norm(qr_local)
-            kv_local = self.kvnorm_rope_op(
-                kv_local, self.kv_norm.weight, positions_local, cos_sin
-            )
-            if use_tp_idx:
-                qr_for_indexer = qr_local
-            if use_tp_attn:
-                # qr stays local; only the normed, roped kv is gathered.
-                qr = qr_local
-                kv = tp_all_gather(kv_local, dim=0)
-            else:
-                qr_kv_normed = tp_all_gather(
-                    torch.cat([qr_local, kv_local], dim=-1), dim=0
+            if use_qkv_prequant:
+                qr_q_fp8, qr_q_scale, kv_local = self.qkv_norm_rope_quant_op(
+                    qr_kv_local,
+                    w_qnorm,
+                    w_kvnorm,
+                    positions_local,
+                    cos_sin,
                 )
-                qr, kv = qr_kv_normed.split(
+                if use_tp_idx:
+                    qr_fp8_for_indexer = qr_q_fp8
+                    qr_scale_for_indexer = qr_q_scale
+                kv = self._gather_tp_kv(kv_local) if use_tp_attn else tp_all_gather(kv_local, dim=0)
+            elif w_qnorm is not None:
+                if (
+                    use_tp_idx
+                    and use_fused_q_rope
+                    and getattr(
+                        self.indexer, "can_accept_prequant_query", lambda: False
+                    )()
+                ):
+                    (
+                        qr_kv_normed_local,
+                        qr_fp8_for_indexer,
+                        qr_scale_for_indexer,
+                    ) = self.qkv_norm_rope_and_quant_op(
+                        qr_kv_local,
+                        w_qnorm,
+                        w_kvnorm,
+                        positions_local,
+                        cos_sin,
+                    )
+                    if use_tp_attn:
+                        qr_q_fp8 = qr_fp8_for_indexer
+                        qr_q_scale = qr_scale_for_indexer
+                        kv = self._gather_tp_kv(qr_kv_normed_local[:, self.q_lora_rank :])
+                    else:
+                        qr_kv_normed = tp_all_gather(qr_kv_normed_local, dim=0)
+                        qr, kv = qr_kv_normed.split(
+                            [self.q_lora_rank, self.head_dim], dim=-1
+                        )
+                elif use_tp_attn:
+                    qr, kv_local = self.qkv_norm_rope_split_op(
+                        qr_kv_local,
+                        w_qnorm,
+                        w_kvnorm,
+                        positions_local,
+                        cos_sin,
+                    )
+                    if use_tp_idx:
+                        qr_for_indexer = qr
+                    kv = self._gather_tp_kv(kv_local)
+                else:
+                    qr_kv_normed_local = self.qkv_norm_rope_op(
+                        qr_kv_local,
+                        w_qnorm,
+                        w_kvnorm,
+                        positions_local,
+                        cos_sin,
+                    )
+                    if use_tp_idx:
+                        qr_for_indexer = qr_kv_normed_local[:, : self.q_lora_rank]
+                    qr_kv_normed = tp_all_gather(qr_kv_normed_local, dim=0)
+                    qr, kv = qr_kv_normed.split(
+                        [self.q_lora_rank, self.head_dim], dim=-1
+                    )
+            else:
+                qr_local, kv_local = qr_kv_local.split(
                     [self.q_lora_rank, self.head_dim], dim=-1
                 )
+                qr_local = self.q_norm(qr_local)
+                kv_local = self.kvnorm_rope_op(
+                    kv_local, w_kvnorm, positions_local, cos_sin
+                )
+                if use_tp_idx:
+                    qr_for_indexer = qr_local
+                if use_tp_attn:
+                    qr = qr_local
+                    kv = self._gather_tp_kv(kv_local)
+                else:
+                    qr_kv_normed = tp_all_gather(
+                        torch.cat([qr_local, kv_local], dim=-1), dim=0
+                    )
+                    qr, kv = qr_kv_normed.split(
+                        [self.q_lora_rank, self.head_dim], dim=-1
+                    )
         else:
+            x_local = hidden_states
             if input_is_token_sharded:
                 hidden_states = tp_all_gather(hidden_states, dim=0)
                 hidden_states_fp8 = None
                 hidden_states_scale = None
             qr_kv = self._apply_fused_wqa_wkv(
-                hidden_states, hidden_states_fp8, hidden_states_scale
+                hidden_states,
+                hidden_states_fp8,
+                hidden_states_scale,
+                w_wqa=w_wqa,
+                ws_wqa=ws_wqa,
             )
-            qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
-            qr = self.q_norm(qr)
-            kv = self.kvnorm_rope_op(kv, self.kv_norm.weight, positions, cos_sin)
+            if use_qkv_prequant:
+                qr_fp8, qr_scale, kv = self.qkv_norm_rope_quant_op(
+                    qr_kv,
+                    w_qnorm,
+                    w_kvnorm,
+                    positions,
+                    cos_sin,
+                )
+                if self.indexer is not None:
+                    qr_fp8_for_indexer = qr_fp8
+                    qr_scale_for_indexer = qr_scale
+                if use_tp_attn:
+                    qr_q_fp8 = tp_shard_slice(
+                        qr_fp8.view(torch.uint8),
+                        tp_size,
+                        tp_rank,
+                        rank_idx,
+                    ).view(qr_fp8.dtype)
+                    qr_q_scale = tp_shard_slice(qr_scale, tp_size, tp_rank, rank_idx)
+                else:
+                    qr_q_fp8 = qr_fp8
+                    qr_q_scale = qr_scale
+            else:
+                qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+                qr = self.q_norm(qr)
+                kv = self.kvnorm_rope_op(kv, w_kvnorm, positions, cos_sin)
+
+        if token_sharded_qkv:
+            x_local = hidden_states
+
+        pre_comp_proj = (
+            compressor.project_wkv_wgate(x_local, num_tokens)
+            if compressor is not None
+            else None
+        )
+        if self.indexer is not None:
+            idx_w = self.indexer.weights_proj(x_local)[0]
+            pre_idx_weights = (
+                tp_all_gather(idx_w, dim=0)
+                if idx_w.shape[0] != num_tokens and not use_tp_idx
+                else idx_w
+            )
+        else:
+            pre_idx_weights = None
 
         if use_tp_attn:
-            qr_q = (
-                qr
-                if qr.shape[0] != num_tokens
-                else tp_shard_slice(qr, tp_size, tp_rank, self._tp_attn_rank_idx)
-            )
-            if (
-                envs.VLLM_DSV41_FUSED_Q_ROPE
-                and self._tp_attn_wq_b_s.ndim == 1
-                and getattr(self.wq_b, "bias", None) is None
-                and (self.n_local_heads * tp_size) % 8 == 0
-            ):
-                q = self.wq_b_q_rope_op(
-                    qr_q,
+            if qr_q_fp8 is not None and qr_q_scale is not None:
+                q = self.wq_b_q_rope_prequant_op(
+                    qr_q_fp8,
+                    qr_q_scale,
                     positions_local,
                     cos_sin,
                     self._tp_attn_wq_b_w,
                     self._tp_attn_wq_b_s,
                 )
             else:
-                q = quantized_matmul(
-                    qr_q, self._tp_attn_wq_b_w, self._tp_attn_wq_b_s
-                ).view(-1, self.n_local_heads * tp_size, self.head_dim)
-                q = self.q_rope_op(q, positions_local, cos_sin)
+                assert qr is not None
+                qr_q = (
+                    qr
+                    if qr.shape[0] != num_tokens
+                    else tp_shard_slice(qr, tp_size, tp_rank, rank_idx)
+                )
+                if use_fused_q_rope:
+                    q = self.wq_b_q_rope_op(
+                        qr_q,
+                        positions_local,
+                        cos_sin,
+                        self._tp_attn_wq_b_w,
+                        self._tp_attn_wq_b_s,
+                    )
+                else:
+                    q = quantized_matmul(
+                        qr_q, self._tp_attn_wq_b_w, self._tp_attn_wq_b_s
+                    ).view(-1, self.n_local_heads * tp_size, self.head_dim)
+                    q = self.q_rope_op(q, positions_local, cos_sin)
         else:
-            wq_b_s = getattr(self.wq_b, "weight_scale", None)
-            if (
-                envs.VLLM_DSV41_FUSED_Q_ROPE
-                and wq_b_s is not None
-                and wq_b_s.ndim == 1
-                and getattr(self.wq_b, "bias", None) is None
-                and self.n_local_heads % 8 == 0
-            ):
-                wq_b_w = self.wq_b.weight
+            if qr_q_fp8 is not None and qr_q_scale is not None:
+                wq_b_w = w_wqb
+                if getattr(self.wq_b, KEEP_VLLM_LAYOUT_ATTR, False):
+                    wq_b_w = wq_b_w.transpose(0, 1)
+                assert wq_b_s is not None
+                q = self.wq_b_q_rope_prequant_op(
+                    qr_q_fp8,
+                    qr_q_scale,
+                    positions,
+                    cos_sin,
+                    wq_b_w,
+                    wq_b_s,
+                )
+            elif use_fused_q_rope:
+                assert qr is not None and wq_b_s is not None
+                wq_b_w = w_wqb
                 if getattr(self.wq_b, KEEP_VLLM_LAYOUT_ATTR, False):
                     wq_b_w = wq_b_w.transpose(0, 1)
                 q = self.wq_b_q_rope_op(
@@ -1093,23 +2210,26 @@ class VllmDeepseekV41MLAAttention(
                     wq_b_s,
                 )
             else:
+                assert qr is not None
                 q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
                 q = self.q_rope_op(q, positions, cos_sin)
 
-        latent = (
-            compressor(hidden_states, positions) if compressor is not None else None
-        )
+        if compressor is not None:
+            compressor.forward_insert_and_produce_k(
+                hidden_states,
+                positions,
+                self.rotary_emb,
+                self.indexer,
+                self.indexer_rotary_emb,
+                pregathered_proj=pre_comp_proj,
+            )
         topk_local = use_tp_attn and self._keep_topk_local(num_tokens)
         if self.indexer is not None:
-            if self.indexer.owns_k and latent is not None:
-                self.indexer.write_k_cache(
-                    latent, positions, self.indexer_rotary_emb
-                )
-            indexer_weights = self.indexer.weights_proj(hidden_states)[0]
+            assert pre_idx_weights is not None
             topk_indices = self.indexer(
                 hidden_states,
                 qr_for_indexer if qr_for_indexer is not None else qr,
-                indexer_weights,
+                pre_idx_weights,
                 positions,
                 self.indexer_rotary_emb,
                 latent=None,
@@ -1118,6 +2238,8 @@ class VllmDeepseekV41MLAAttention(
                 ),
                 tp_rank_idx=tp_rank_idx,
                 keep_topk_local=topk_local,
+                query_fp8=qr_fp8_for_indexer,
+                query_scale=qr_scale_for_indexer,
             )
         elif is_csa:
             assert self.topk_indices_buffer is not None
@@ -1126,9 +2248,6 @@ class VllmDeepseekV41MLAAttention(
             ]
         else:
             topk_indices = None
-
-        if compressor is not None and latent is not None:
-            compressor.insert_cache(latent, positions, self.rotary_emb)
 
         attn_ctx = get_forward_context().attn_metadata
         kv_holder = self._kv_source_module()
@@ -1145,7 +2264,7 @@ class VllmDeepseekV41MLAAttention(
             orig_sw_cache
             if orig_sw_cache is not None
             else torch.zeros(
-                (0, 1, 1, self.head_dim), dtype=torch.uint8, device=qr.device
+                (0, 1, 1, self.head_dim), dtype=torch.uint8, device=kv.device
             )
         )
         swa_lens, swa_tables, swa_q_loc, swa_dist = _unpack_meta(swa_meta)
@@ -1154,7 +2273,7 @@ class VllmDeepseekV41MLAAttention(
         nope_entry, rope_entry = (
             kv_entry if isinstance(kv_entry, tuple) else (kv_entry, None)
         )
-        dummy_main = self._get_dummy_main_cache(qr.device)
+        dummy_main = self._get_dummy_main_cache(kv.device)
         if is_csa and main_meta is not None:
             main_cache_kv = self._as_kernel_cache_view(_live_cache(nope_entry))
             if main_cache_kv is None:
@@ -1167,12 +2286,65 @@ class VllmDeepseekV41MLAAttention(
             main_cache_kv = dummy_main
             main_kv_lens, main_tables, main_q_loc, main_dist = _unpack_meta(swa_meta)
 
-        extra = topk_indices if is_csa else (positions + 1).to(torch.int32)
+        extra = topk_indices if is_csa else swa_lens
         if use_tp_attn:
+            (
+                swa_store_dst,
+                swa_store_blk_meta,
+                swa_lens,
+                swa_tables,
+                swa_q_loc,
+                swa_dist,
+            ) = self._get_or_compute_tp_swa_step_metadata(
+                kv,
+                swa_lens,
+                swa_tables,
+                swa_q_loc,
+                swa_dist,
+                ced_decoder=eff_ced_decoder,
+            )
             main_cache_rope = (
                 self._as_kernel_cache_view(_live_cache(rope_entry)) if is_csa else None
             )
-            attn_output, new_sw_cache = self._get_tp_attn_op()(
+            tp_has_union = False
+            tp_union_operands: tuple = ()
+            if is_csa and _CSA_UNION:
+                local_tokens = int(q.shape[0])
+                max_num_seqs = (
+                    int(main_q_loc.shape[0]) - 1
+                    if main_q_loc is not None
+                    else local_tokens
+                )
+                b_q, m_union = (
+                    resolve_csa_union_params(
+                        local_tokens,
+                        int(topk_indices.shape[1]),
+                        max_num_seqs,
+                        ced_decoder=eff_ced_decoder,
+                        num_q_heads=int(q.shape[1]),
+                    )
+                    if main_cache_kv.shape[0] > 0
+                    and topk_indices is not None
+                    and topk_indices.shape[0] == local_tokens
+                    and topk_indices.shape[1] % 128 == 0
+                    else (0, 0)
+                )
+                if b_q > 0 and m_union > 0:
+                    total_cache_rows = int(
+                        main_cache_kv.shape[0] * main_cache_kv.shape[1]
+                    )
+                    cached_u = self._get_or_compute_csa_union(
+                        topk_indices,
+                        total_cache_rows,
+                        m_union,
+                        b_q,
+                        ced_decoder=eff_ced_decoder,
+                    )
+                    tp_union_operands = tuple(cached_u)
+                    tp_has_union = True
+            attn_output, new_sw_cache = self._get_tp_attn_op(
+                tp_has_union, ced_decoder=eff_ced_decoder
+            )(
                 q,
                 kv,
                 sw_cache,
@@ -1193,16 +2365,33 @@ class VllmDeepseekV41MLAAttention(
                     if not is_csa
                     else (dummy_main if main_cache_rope is None else main_cache_rope,)
                 ),
+                *tp_union_operands,
+                swa_store_dst,
+                swa_store_blk_meta,
             )
             orig_sw_cache.copy_(new_sw_cache)
-            z = self.o_proj_op(
+            return self.o_proj_wob_op(
                 attn_output,
                 positions_local,
                 cos_sin,
                 self._tp_attn_wo_a_w,
                 self._tp_attn_wo_a_s,
+                self._tp_attn_wo_b_w,
+                self._tp_attn_wo_b_s,
             )
-            return quantized_matmul(z, self._tp_attn_wo_b_w, self._tp_attn_wo_b_s)
+        if (
+            orig_sw_cache is not None
+            and swa_tables is not None
+            and not (
+                _FLASHMLA_TP8
+                and tp_size == 8
+            )
+        ):
+            swa_tables = self._get_or_compute_swa_page_indices(
+                swa_tables,
+                int(orig_sw_cache.shape[0]),
+                ced_decoder=eff_ced_decoder,
+            )
         tail_operands: tuple = (
             kv,
             sw_cache,
@@ -1224,33 +2413,6 @@ class VllmDeepseekV41MLAAttention(
             tail_operands += (
                 dummy_main if main_cache_rope is None else main_cache_rope,
             )
-            max_num_seqs = (
-                int(main_q_loc.shape[0]) - 1
-                if main_q_loc is not None
-                else num_tokens
-            )
-            if (
-                envs.VLLM_DSV41_CSA_UNION
-                and main_cache_kv.shape[0] > 0
-                and not eff_ced_decoder
-                and num_tokens > max_num_seqs
-                and num_tokens >= 512
-                and num_tokens % 32 == 0
-                and topk_indices is not None
-                and topk_indices.shape[1] % 128 == 0
-            ):
-                total_cache_rows = int(
-                    main_cache_kv.shape[0] * main_cache_kv.shape[1]
-                )
-                m_union = ((3 * int(topk_indices.shape[1]) + 127) // 128) * 128
-                cached_u = getattr(kv_holder, "_step_csa_union", None)
-                if self.indexer is not None or cached_u is None:
-                    cached_u = self._get_csa_union_op(
-                        total_cache_rows, m_union
-                    )(topk_indices)
-                    kv_holder._step_csa_union = cached_u
-                tail_operands += tuple(cached_u)
-                has_union = True
 
         attn_output, new_sw_cache = self._get_attn_op(
             has_union, ced_decoder=eff_ced_decoder
@@ -1258,13 +2420,33 @@ class VllmDeepseekV41MLAAttention(
         if orig_sw_cache is not None:
             orig_sw_cache.copy_(new_sw_cache)
 
-        z = self.o_proj_op(
-            attn_output,
-            positions,
-            cos_sin,
-            self.wo_a.weight,
-            self.wo_a.weight_scale,
-        )
+        w_wo_a = self.wo_a.weight
+        ws_wo_a = self.wo_a._parameters.get("weight_scale")
+        w_wo_b = self.wo_b.weight
+        ws_wo_b = self.wo_b._parameters.get("weight_scale")
+
+        if (
+            ws_wo_b is not None
+            and ws_wo_b.ndim == 1
+            and self.wo_b._parameters.get("bias") is None
+            and self.n_local_heads == 16
+        ):
+            w_wo_b_in = (
+                w_wo_b.transpose(0, 1)
+                if getattr(self.wo_b, KEEP_VLLM_LAYOUT_ATTR, False)
+                else w_wo_b
+            )
+            out_wob = self.o_proj_wob_op(
+                attn_output, positions, cos_sin, w_wo_a, ws_wo_a, w_wo_b_in, ws_wo_b
+            )
+            if tp_size > 1:
+                return (
+                    tp_reduce_scatter(out_wob, dim=0)
+                    if return_token_sharded
+                    else tp_all_reduce(out_wob)
+                )
+            return out_wob
+        z = self.o_proj_op(attn_output, positions, cos_sin, w_wo_a, ws_wo_a)
         if return_token_sharded and tp_size > 1:
             out_parallel = self.wo_b.quant_method.apply(self.wo_b, z, None)
             return tp_reduce_scatter(out_parallel, dim=0)

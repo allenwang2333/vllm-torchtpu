@@ -39,6 +39,19 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _pad_or_slice_rows(t: torch.Tensor, n: int, value: int = 0) -> torch.Tensor:
+    """Exactly n rows of t; inputs may arrive padded past the draft bucket."""
+    if t.shape[0] >= n:
+        return t[:n]
+    pad_shape = (n - t.shape[0], *t.shape[1:])
+    pad_tensor = (
+        torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
+        if value == 0
+        else torch.full(pad_shape, value, dtype=t.dtype, device=t.device)
+    )
+    return torch.cat((t, pad_tensor), dim=0)
+
+
 class DFlashProposer:
     """DFlash draft proposer for TPU.
 
@@ -103,6 +116,8 @@ class DFlashProposer:
         # Keyed by the chunk's padded request count; the all-zero
         # `draft_lengths` a chunk without spec metadata routes on.
         self._zero_draft_lengths_cache: dict[int, torch.Tensor] = {}
+        self._num_reqs_tensor_cache: dict[int, torch.Tensor] = {}
+        self._seq_lens_buf_cache: dict[int, torch.Tensor] = {}
 
     @property
     def block_size(self) -> int:
@@ -138,10 +153,14 @@ class DFlashProposer:
         layout overrides this to K (the anchor is the first prediction)."""
         return K + 1
 
+    # Aux layer ids are target layer ids + 1 (layer i's output is layer
+    # i + 1's input). DSpark on DeepSeek-V4.1 uses the ids unshifted.
+    _aux_layer_shift = 1
+
     def load_model(self, target_model) -> None:
         """Load the draft model, share embeddings, and tag target layers."""
         # Tag the target model to extract aux hidden states
-        target_layers = [idx + 1 for idx in self._target_layer_ids]
+        target_layers = [idx + self._aux_layer_shift for idx in self._target_layer_ids]
         if hasattr(target_model, "set_aux_hidden_state_layers"):
             target_model.set_aux_hidden_state_layers(tuple(target_layers))
         elif hasattr(target_model, "model") and hasattr(
@@ -231,8 +250,27 @@ class DFlashProposer:
                 model_config=draft_model_config,
             )
 
+    def _get_draft_token_paddings(self) -> list[int]:
+        """Draft-forward token buckets. Context-KV updates allow short
+        chunks; a draft forward needs at least one full block."""
+        block_size = self.block_size
+        # A most-model-len chunk holds up to num_reqs_most_model_len
+        # requests (> num_reqs_max_model_len), and under EP-DP lockstep the
+        # coordinated bucket is sized from the DP-wide max chunk request
+        # count — so warm draft forwards up to the larger bound, or the
+        # first such step compiles XLA mid-serving.
+        max_chunk_reqs = max(
+            self.runner.num_reqs_max_model_len, self.runner.num_reqs_most_model_len or 0
+        )
+        paddings = self.runner.num_tokens_paddings
+        max_draft_tokens = next(
+            (p for p in paddings if p >= max_chunk_reqs * block_size),
+            max_chunk_reqs * block_size,
+        )
+        return [p for p in paddings if block_size <= p <= max_draft_tokens]
+
     def _get_padded_len(self, target_len: int) -> int:
-        for p in self.runner.num_tokens_paddings:
+        for p in (*self._get_draft_token_paddings(), *self.runner.num_tokens_paddings):
             if p >= target_len:
                 return p
         return target_len
@@ -248,6 +286,7 @@ class DFlashProposer:
         request_distribution: torch.Tensor,
         position_ids_override: torch.Tensor | None,
         padded_num_reqs: int,
+        staged_block_tables: dict | None = None,
     ) -> dict:
         """Build the draft layers' attention metadata. The real path and
         the dummies share this so they dispatch the identical programs.
@@ -265,6 +304,7 @@ class DFlashProposer:
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
             position_ids_override=position_ids_override,
+            staged_block_tables=staged_block_tables,
         )
         try:
             # Only the draft layers' KV cache groups. The full build walks
@@ -275,6 +315,35 @@ class DFlashProposer:
             )
         finally:
             runner._attn_metadata_builder_ctx = saved_ctx
+
+    def _get_reusable_draft_block_tables(
+        self, chunk: DraftChunkInputs, padded_num_reqs: int
+    ) -> dict[str, torch.Tensor] | None:
+        if (
+            chunk.attn_ctx.position_ids_override is not None
+            or not self._draft_attn_layer_names
+            or not isinstance(chunk.attn_metadata, dict)
+        ):
+            return None
+        tables: dict[str, torch.Tensor] = {}
+        for layer_name in self._draft_attn_layer_names:
+            md = chunk.attn_metadata.get(layer_name)
+            if (
+                md is None
+                or md.block_tables is None
+                or md.seq_lens is None
+                or md.seq_lens.shape[0] < padded_num_reqs
+            ):
+                return None
+            target_reqs = md.seq_lens.shape[0]
+            if target_reqs == padded_num_reqs:
+                tables[layer_name] = md.block_tables
+            else:
+                blocks_per_req = md.block_tables.shape[0] // target_reqs
+                tables[layer_name] = md.block_tables[
+                    : padded_num_reqs * blocks_per_req
+                ]
+        return tables
 
     def _build_draft_attn_metadata(
         self,
@@ -292,6 +361,37 @@ class DFlashProposer:
         query_start_loc, request_distribution = self._get_static_attn_tensors(
             padded_num_reqs
         )
+        reusable_tables = self._get_reusable_draft_block_tables(chunk, padded_num_reqs)
+        if reusable_tables is not None:
+            _, _, pos_buf, _ = self._get_static_prep_bufs()
+            return {
+                layer_name: AttentionMetadata(
+                    input_positions=pos_buf,
+                    block_tables=tbl,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                    request_distribution=request_distribution,
+                )
+                for layer_name, tbl in reusable_tables.items()
+            }
+        # Reuse the target chunk's staged block tables (sliced for smaller buckets).
+        staged_block_tables = None
+        if (
+            chunk_ctx.staged_block_tables is not None
+            and chunk_ctx.position_ids_override is None
+        ):
+            target_num_reqs = (
+                self.runner.num_reqs_max_model_len
+                if chunk_ctx.use_max_model_len
+                else self.runner.num_reqs_most_model_len
+            )
+            if padded_num_reqs == target_num_reqs:
+                staged_block_tables = chunk_ctx.staged_block_tables
+            elif target_num_reqs and padded_num_reqs < target_num_reqs:
+                staged_block_tables = {
+                    gid: tbl[: padded_num_reqs * (tbl.shape[0] // target_num_reqs)]
+                    for gid, tbl in chunk_ctx.staged_block_tables.items()
+                }
         # num_reqs must be the REAL request count: the staging walk copies
         # exactly ctx.num_reqs block-table rows, and rows beyond the live
         # batch hold departed requests' freed block ids. With the real
@@ -305,6 +405,7 @@ class DFlashProposer:
             request_distribution=request_distribution,
             position_ids_override=chunk_ctx.position_ids_override,
             padded_num_reqs=padded_num_reqs,
+            staged_block_tables=staged_block_tables,
         )
 
     def _prepare_dflash_inputs(
@@ -350,6 +451,13 @@ class DFlashProposer:
         if position_ids_device.dim() > 1:
             position_ids_device = position_ids_device[0]
 
+        # Pass num_reqs as a cached 0-D tensor to avoid retracing per request count.
+        num_reqs_t = self._num_reqs_tensor_cache.get(num_reqs)
+        if num_reqs_t is None:
+            num_reqs_t = torch.tensor(
+                num_reqs, dtype=torch.int32, device=self.runner.device
+            )
+            self._num_reqs_tensor_cache[num_reqs] = num_reqs_t
         # Route to the appropriate pre-compiled XLA Graph
         if next_tokens_device is not None:
             # No spec metadata means nothing was verified this step, so every
@@ -362,7 +470,7 @@ class DFlashProposer:
                 query_start_loc_device,
                 position_ids_device,
                 draft_lengths,
-                num_reqs,
+                num_reqs_t,
                 block_size,
                 padded_len,
                 self.mask_token_id,
@@ -373,7 +481,7 @@ class DFlashProposer:
                 device_seed,
                 query_start_loc_device,
                 position_ids_device,
-                num_reqs,
+                num_reqs_t,
                 block_size,
                 padded_len,
                 self.mask_token_id,
@@ -444,7 +552,7 @@ class DFlashProposer:
         It applies RoPE to the target's hidden states and scatters the tokens directly
         into the draft KV cache.
         """
-        if chunk.aux_hidden_states is None:
+        if not chunk.aux_hidden_states:
             return
 
         target_hidden = chunk.aux_hidden_states
@@ -508,6 +616,101 @@ class DFlashProposer:
         if self._dp_lockstep_sharded():
             extra_chunks = max(0, runner._dp_step_num_chunks - len(chunks))
 
+        # Fast single-graph fused path for single-chunk steady-state steps:
+        # Fuses context KV precompute/store + pure-device input prep + draft forward/sample
+        # into ONE XLA execution per step with ZERO eager .fill_()/.zero_()/.copy_() ops.
+        if (
+            len(chunks) == 1
+            and extra_chunks == 0
+            and not self._dp_lockstep_sharded()
+        ):
+            chunk = chunks[0]
+            next_tokens_device = (
+                next_tokens_per_chunk[0] if next_tokens_per_chunk else None
+            )
+            total_draft_tokens = chunk.num_reqs * block_size
+            padded_len = self._get_padded_len(total_draft_tokens)
+            padded_num_reqs = padded_len // block_size
+            if (
+                chunk.aux_hidden_states
+                and next_tokens_device is not None
+                and self._get_reusable_draft_block_tables(chunk, padded_num_reqs)
+                is not None
+            ):
+                target_hidden = chunk.aux_hidden_states
+                aux_first = (
+                    target_hidden[0]
+                    if isinstance(target_hidden, (list, tuple))
+                    else target_hidden
+                )
+                num_target_tokens = aux_first.shape[0]
+                position_ids_device = chunk.position_ids
+                if position_ids_device.dim() > 1:
+                    position_ids_device = position_ids_device[0]
+                ctx_positions = position_ids_device[:num_target_tokens]
+                ctx_md_tuple = self._build_draft_layer_metadata(chunk.attn_metadata)
+                draft_lengths_in = (
+                    chunk.draft_lengths.to(torch.int32)
+                    if chunk.draft_lengths is not None
+                    else self._zero_draft_lengths(chunk.num_reqs)
+                )
+                num_reqs_t = self._num_reqs_tensor_cache.get(chunk.num_reqs)
+                if num_reqs_t is None:
+                    num_reqs_t = torch.tensor(
+                        chunk.num_reqs, dtype=torch.int32, device=runner.device
+                    )
+                    self._num_reqs_tensor_cache[chunk.num_reqs] = num_reqs_t
+
+                seq_lens_buf = self._seq_lens_buf_cache.get(padded_num_reqs)
+                if seq_lens_buf is None:
+                    seq_lens_buf = torch.zeros(
+                        (padded_num_reqs,), dtype=torch.int32, device=runner.device
+                    )
+                    self._seq_lens_buf_cache[padded_num_reqs] = seq_lens_buf
+                draft_attn_metadata = self._build_draft_attn_metadata(
+                    chunk,
+                    padded_len,
+                    seq_lens_buf,
+                )
+                with (
+                    set_forward_context(
+                        draft_attn_metadata,
+                        self.vllm_config,
+                        num_tokens=padded_len,
+                        num_tokens_across_dp=runner._dp_num_tokens_across_dp(
+                            padded_len
+                        ),
+                    ),
+                    set_vllm_model_wrapper_context(
+                        mesh=self.runner.mesh, vllm_config=self.vllm_config
+                    ),
+                ):
+                    draft_tokens_chunk, _ = (
+                        self._dflash_full_precompute_prep_forward_and_sample(
+                            target_hidden,
+                            ctx_positions,
+                            ctx_md_tuple,
+                            next_tokens_device.to(torch.int32),
+                            draft_lengths_in,
+                            seq_lens_buf,
+                            num_reqs_t,
+                            block_size,
+                            padded_len,
+                            self.mask_token_id,
+                            INVALID_TOKEN_ID,
+                        )
+                    )
+                if return_device:
+                    from vllm_torchtpu.runner.tpu_runner import (
+                        _get_padded_num_reqs_with_upper_limit,
+                    )
+
+                    r_pad = _get_padded_num_reqs_with_upper_limit(
+                        chunk.num_reqs, self.runner.max_num_reqs
+                    )
+                    return _pad_or_slice_rows(draft_tokens_chunk, r_pad)
+                return draft_tokens_chunk.cpu().tolist()[: chunk.num_reqs]
+
         # 1. Hoist all KV cache updates across chunks to the top of propose
         for chunk in chunks:
             self._update_draft_kv_cache_from_target(chunk)
@@ -520,12 +723,79 @@ class DFlashProposer:
             next_tokens_device = (
                 next_tokens_per_chunk[i] if next_tokens_per_chunk else None
             )
-            # Slice seed tokens for this chunk's requests.
+            # Slice seed tokens for this chunk's requests. A single chunk keeps
+            # the full padded seed so the input builder does not recompile.
             chunk_seed = (
                 device_seed[chunk.start_index : chunk.start_index + chunk.num_reqs]
-                if device_seed is not None
-                else None
+                if device_seed is not None and len(chunks) > 1
+                else device_seed
             )
+            total_draft_tokens = chunk.num_reqs * block_size
+            padded_len = (
+                self._dp_draft_bucket()
+                if self._dp_lockstep_sharded()
+                else self._get_padded_len(total_draft_tokens)
+            )
+            padded_num_reqs = padded_len // block_size
+            if (
+                next_tokens_device is not None
+                and not self._dp_lockstep_sharded()
+                and self._get_reusable_draft_block_tables(chunk, padded_num_reqs)
+                is not None
+            ):
+                qsl_src = chunk.attn_ctx.query_start_loc
+                position_ids_device = chunk.position_ids
+                if position_ids_device.dim() > 1:
+                    position_ids_device = position_ids_device[0]
+                draft_lengths_in = (
+                    chunk.draft_lengths.to(torch.int32)
+                    if chunk.draft_lengths is not None
+                    else self._zero_draft_lengths(chunk.num_reqs)
+                )
+
+                num_reqs_t = self._num_reqs_tensor_cache.get(chunk.num_reqs)
+                if num_reqs_t is None:
+                    num_reqs_t = torch.tensor(
+                        chunk.num_reqs, dtype=torch.int32, device=runner.device
+                    )
+                    self._num_reqs_tensor_cache[chunk.num_reqs] = num_reqs_t
+
+                seq_lens_buf = self._seq_lens_buf_cache.get(padded_num_reqs)
+                if seq_lens_buf is None:
+                    seq_lens_buf = torch.zeros(
+                        (padded_num_reqs,), dtype=torch.int32, device=runner.device
+                    )
+                    self._seq_lens_buf_cache[padded_num_reqs] = seq_lens_buf
+                draft_attn_metadata = self._build_draft_attn_metadata(
+                    chunk,
+                    padded_len,
+                    seq_lens_buf,
+                )
+                with (
+                    set_forward_context(
+                        draft_attn_metadata,
+                        self.vllm_config,
+                        num_tokens=padded_len,
+                        num_tokens_across_dp=runner._dp_num_tokens_across_dp(padded_len),
+                    ),
+                    set_vllm_model_wrapper_context(
+                        mesh=self.runner.mesh, vllm_config=self.vllm_config
+                    ),
+                ):
+                    draft_tokens_chunk, _ = self._dflash_prep_forward_and_sample(
+                        next_tokens_device.to(torch.int32),
+                        qsl_src,
+                        position_ids_device,
+                        draft_lengths_in,
+                        seq_lens_buf,
+                        num_reqs_t,
+                        block_size,
+                        padded_len,
+                        self.mask_token_id,
+                        INVALID_TOKEN_ID,
+                    )
+                draft_logits_per_chunk.append(draft_tokens_chunk)
+                continue
             input_ids, positions, seq_lens = self._prepare_dflash_inputs(
                 chunk, next_tokens_device=next_tokens_device, device_seed=chunk_seed
             )
@@ -559,7 +829,15 @@ class DFlashProposer:
         # 3. Extract K tokens from logits
         if return_device:
             if len(draft_logits_per_chunk) == 1:
-                return draft_logits_per_chunk[0][: chunks[0].num_reqs]
+                # Padded rows keep the runner's async assembly at static shapes.
+                from vllm_torchtpu.runner.tpu_runner import (
+                    _get_padded_num_reqs_with_upper_limit,
+                )
+
+                r_pad = _get_padded_num_reqs_with_upper_limit(
+                    chunks[0].num_reqs, self.runner.max_num_reqs
+                )
+                return _pad_or_slice_rows(draft_logits_per_chunk[0], r_pad)
             sliced_chunks = [
                 logits
                 if logits.shape[0] == chunk.num_reqs
@@ -578,6 +856,13 @@ class DFlashProposer:
 
         return draft_tokens_list
 
+    def _draft_kv_num_blocks(self, use_max_model_len: bool) -> int:
+        """Block-table width the draft KV-update dummies are built with."""
+        if use_max_model_len:
+            return self.runner.max_num_blocks_per_req
+        assert self.runner.num_blocks_per_most_len_req is not None
+        return self.runner.num_blocks_per_most_len_req
+
     @torch.no_grad()
     def precompile(self) -> None:
         """Warm up the DFlash draft model across all padding buckets.
@@ -589,16 +874,6 @@ class DFlashProposer:
         logger.info("Precompiling DFlash draft model buckets...")
 
         runner = self.runner
-        block_size = self.block_size
-        # A most-model-len chunk holds up to num_reqs_most_model_len
-        # requests (> num_reqs_max_model_len), and under EP-DP lockstep the
-        # coordinated bucket is sized from the DP-wide max chunk request
-        # count — so warm draft forwards up to the larger bound, or the
-        # first such step compiles XLA mid-serving.
-        max_chunk_reqs = max(
-            runner.num_reqs_max_model_len, runner.num_reqs_most_model_len or 0
-        )
-        max_draft_tokens = self._get_padded_len(max_chunk_reqs * block_size)
 
         with runner._precompile_timed("drafter first pass"):
             for num_tokens in runner.num_tokens_paddings:
@@ -606,22 +881,18 @@ class DFlashProposer:
                 self._dummy_precompute_and_update_kv_cache(
                     num_tokens=num_tokens,
                     num_reqs=runner.num_reqs_max_model_len,
-                    num_blocks=runner.max_num_blocks_per_req,
+                    num_blocks=self._draft_kv_num_blocks(use_max_model_len=True),
                     sync=True,
                 )
                 if runner.most_model_len is not None:
                     self._dummy_precompute_and_update_kv_cache(
                         num_tokens=num_tokens,
                         num_reqs=runner.num_reqs_most_model_len,
-                        num_blocks=runner.num_blocks_per_most_len_req,
+                        num_blocks=self._draft_kv_num_blocks(use_max_model_len=False),
                         sync=True,
                     )
 
-                # Context-KV updates allow short chunks;
-                # draft forward needs a full block.
-                if not block_size <= num_tokens <= max_draft_tokens:
-                    continue
-
+            for num_tokens in self._get_draft_token_paddings():
                 self._dummy_draft_forward(
                     num_tokens=num_tokens, use_max_model_len=True, sync=True
                 )
@@ -775,6 +1046,71 @@ class DFlashProposer:
                 input_ids, positions, block_size
             )
             synchronize_tensors(draft_tokens_chunk, wait=sync)
+            if sync and use_max_model_len and not self._dp_lockstep_sharded():
+                from vllm_torchtpu.runner.tpu_runner import (
+                    _get_padded_num_reqs_with_upper_limit,
+                )
+
+                r_pad = _get_padded_num_reqs_with_upper_limit(
+                    actual_num_reqs, runner.max_num_reqs
+                )
+                dummy_hidden, dummy_ctx_md = self._dummy_kv_update_inputs(
+                    num_tokens=num_tokens,
+                    num_reqs=runner.num_reqs_max_model_len,
+                    num_blocks=self._draft_kv_num_blocks(use_max_model_len=True),
+                )
+                dummy_next_tokens = torch.full(
+                    (r_pad, block_size),
+                    INVALID_TOKEN_ID,
+                    dtype=torch.int32,
+                    device=runner.device,
+                )
+                dummy_draft_lengths = self._zero_draft_lengths(actual_num_reqs)
+                dummy_nr_t = self._num_reqs_tensor_cache.get(1)
+                if dummy_nr_t is None:
+                    dummy_nr_t = torch.tensor(
+                        1, dtype=torch.int32, device=runner.device
+                    )
+                    self._num_reqs_tensor_cache[1] = dummy_nr_t
+                full_chunk, _ = (
+                    self._dflash_full_precompute_prep_forward_and_sample(
+                        dummy_hidden,
+                        dummy_ctx_md.input_positions,
+                        tuple([dummy_ctx_md] * len(self.draft_model.model.layers)),
+                        dummy_next_tokens,
+                        dummy_draft_lengths,
+                        seq_lens,
+                        dummy_nr_t,
+                        block_size,
+                        num_tokens,
+                        self.mask_token_id,
+                        INVALID_TOKEN_ID,
+                    )
+                )
+                synchronize_tensors(full_chunk, wait=True)
+
+    def _get_static_prep_bufs(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        bufs = getattr(self, "_static_prep_bufs", None)
+        if bufs is None or bufs[0].device != self.runner.device:
+            max_reqs = int(self.runner.max_num_reqs)
+            max_toks = int(self.runner.max_num_tokens)
+            k_spec = int(self.speculative_config.num_speculative_tokens)
+            dev = self.runner.device
+            bufs = (
+                torch.full(
+                    (max_reqs, k_spec + 1),
+                    INVALID_TOKEN_ID,
+                    dtype=torch.int32,
+                    device=dev,
+                ),
+                torch.zeros((max_reqs + 1,), dtype=torch.int32, device=dev),
+                torch.zeros((max_toks,), dtype=torch.int32, device=dev),
+                torch.zeros((max_reqs,), dtype=torch.int32, device=dev),
+            )
+            self._static_prep_bufs = bufs
+        return bufs
 
     def _dp_draft_bucket(self) -> int:
         """Draft-forward token bucket every lockstep rank runs this step."""
@@ -791,7 +1127,7 @@ class DFlashProposer:
         self._dummy_precompute_and_update_kv_cache(
             num_tokens=bucket,
             num_reqs=runner.num_reqs_max_model_len,
-            num_blocks=runner.max_num_blocks_per_req,
+            num_blocks=self._draft_kv_num_blocks(use_max_model_len=True),
             sync=False,
         )
 
@@ -815,9 +1151,15 @@ class DFlashProposer:
         if self._draft_has_moe_cache is None:
             if self.draft_model is None:
                 return False
+            from vllm.model_executor.layers.fused_moe import RoutedExperts
             from vllm.model_executor.models.interfaces import is_mixture_of_experts
 
-            self._draft_has_moe_cache = bool(is_mixture_of_experts(self.draft_model))
+            # Drafts need not implement the MixtureOfExperts protocol, so
+            # also look for routed-expert layers directly.
+            self._draft_has_moe_cache = bool(
+                is_mixture_of_experts(self.draft_model)
+                or any(isinstance(m, RoutedExperts) for m in self.draft_model.modules())
+            )
         return self._draft_has_moe_cache
 
     @torch.no_grad()
@@ -836,30 +1178,18 @@ class DFlashProposer:
         for _ in range(num_chunks):
             self._dp_dummy_forward()
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def _tpu_precompute_and_update_kv_cache(
+    def _run_context_kv_precompute_in_graph(
         self,
         hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor] | torch.Tensor,
         positions: torch.Tensor,
         draft_md_tuple: tuple[AttentionMetadata, ...],
     ) -> torch.Tensor:
-        """
-        Projects target model hidden states directly into the draft model's KV space.
-
-        Instead of computing KV projections and RoPE iteratively per layer (which would
-        create L tiny, sequential XLA graphs), we project to a single massive flat
-        tensor for all layers at once using `_fused_kv_weight`. We then reshape and
-        compute RoPE across all layers simultaneously in a single vectorized operation.
-        """
         self_model = self.draft_model.model
-        if isinstance(hidden_states, (list, tuple)):
-            target_hidden = (
-                hidden_states[0]
-                if len(hidden_states) == 1
-                else torch.cat(hidden_states, dim=-1)
-            )
-        else:
-            target_hidden = hidden_states
+        raw_hidden = (
+            hidden_states[0]
+            if isinstance(hidden_states, (list, tuple)) and len(hidden_states) == 1
+            else hidden_states
+        )
 
         # Only opt into TPU-specific hooks; upstream methods with a similar
         # name may call GPU custom ops. Other drafts use the TPU path below.
@@ -867,11 +1197,17 @@ class DFlashProposer:
             self.draft_model, "tpu_precompute_and_store_context_kv", None
         )
         if callable(tpu_precompute):
-            return tpu_precompute(target_hidden, positions, draft_md_tuple)
+            return tpu_precompute(raw_hidden, positions, draft_md_tuple)
         if getattr(type(self.draft_model), "owns_context_kv", False):
             return self.draft_model.precompute_and_store_context_kv(
-                target_hidden, positions, draft_md_tuple
+                raw_hidden, positions, draft_md_tuple
             )
+
+        target_hidden = (
+            torch.cat(raw_hidden, dim=-1)
+            if isinstance(raw_hidden, (list, tuple))
+            else raw_hidden
+        )
 
         # Collapse the concatenated aux hidden states to the draft's width.
         # `combine_hidden_states` is the modern spelling; bare `fc` is what
@@ -948,19 +1284,22 @@ class DFlashProposer:
         return hidden_states
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def _dflash_forward_and_sample(
+    def _tpu_precompute_and_update_kv_cache(
+        self,
+        hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor] | torch.Tensor,
+        positions: torch.Tensor,
+        draft_md_tuple: tuple[AttentionMetadata, ...],
+    ) -> torch.Tensor:
+        return self._run_context_kv_precompute_in_graph(
+            hidden_states, positions, draft_md_tuple
+        )
+
+    def _dflash_forward_and_sample_body(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         block_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compiled XLA graph for DFlash backbone forward pass and greedy sampling.
-
-        Performs:
-          1. Backbone model forward pass on input_ids and positions.
-          2. Slices out the K mask tokens (skipping slot 0 base token).
-          3. Computes draft logits and performs greedy argmax sampling in-graph.
-        """
         # 1. Forward pass through draft model backbone
         hidden = self.draft_model.model(
             input_ids=input_ids,
@@ -979,17 +1318,50 @@ class DFlashProposer:
         draft_hidden = hidden_reshaped[:, 1:, :].reshape(-1, hidden.shape[-1])
 
         # 4. Compute draft logits and run greedy argmax sampling inside the XLA graph
+        sample_draft_fn = getattr(self.draft_model, "sample_draft_tokens", None)
+        if callable(sample_draft_fn):
+            prev_init = input_ids[: padded_num_reqs * block_size : block_size]
+            draft_tokens_chunk = sample_draft_fn(
+                draft_hidden, prev_init, block_size - 1
+            )
+            return draft_tokens_chunk, hidden
+
+        lm_head = getattr(self.draft_model, "lm_head", None)
+        lp = getattr(self.draft_model, "logits_processor", None)
+        norm_fn = getattr(getattr(self.draft_model, "model", None), "norm", None)
+        if (
+            lm_head is not None
+            and lp is not None
+            and norm_fn is not None
+            and getattr(lm_head, "tp_size", 1) > 1
+        ):
+            from vllm_torchtpu.spec_decode.utils import tp_local_argmax_logits
+
+            draft_tokens_chunk = tp_local_argmax_logits(
+                lp, lm_head, norm_fn(draft_hidden)
+            ).view(padded_num_reqs, block_size - 1)
+            return draft_tokens_chunk, hidden
+
         logits = self.draft_model.compute_logits(draft_hidden)
         logits_3d = logits.view(padded_num_reqs, block_size - 1, logits.shape[-1])
         draft_tokens_chunk = logits_3d.argmax(dim=-1)
 
         return draft_tokens_chunk, hidden
 
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _dflash_forward_and_sample(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._dflash_forward_and_sample_body(input_ids, positions, block_size)
+
     def _request_window_bounds(
         self,
         query_start_loc: torch.Tensor,
         position_ids: torch.Tensor,
-        num_reqs: int,
+        num_reqs: torch.Tensor,
         padded_num_reqs: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Per padded request row: the clamped request index, a
@@ -1000,7 +1372,8 @@ class DFlashProposer:
         req_indices = torch.arange(
             padded_num_reqs, dtype=torch.int32, device=query_start_loc.device
         )
-        safe_req_indices = torch.clamp(req_indices, max=max(num_reqs - 1, 0))
+        max_req_idx = torch.clamp(num_reqs - 1, min=0)
+        safe_req_indices = torch.minimum(req_indices, max_req_idx)
         valid_mask = (req_indices < num_reqs).unsqueeze(1).to(torch.int32)
         start_positions = position_ids[query_start_loc[safe_req_indices]].unsqueeze(1)
         end_indices = torch.clamp(query_start_loc[safe_req_indices + 1] - 1, min=0)
@@ -1025,25 +1398,52 @@ class DFlashProposer:
         device = base_tokens.device
         padded_num_reqs = base_tokens.shape[0]
 
-        # Format input_ids with base tokens and MASK placeholders
-        input_ids = torch.full(
-            (padded_len,), mask_token_id, dtype=torch.int32, device=device
-        )
-        scatter_indices = torch.arange(
-            0,
-            padded_num_reqs * block_size,
-            block_size,
+        # Format input_ids with base tokens and MASK placeholders without scatter
+        mask_cols = torch.full(
+            (padded_num_reqs, block_size - 1),
+            mask_token_id,
             dtype=torch.int32,
             device=device,
         )
-        input_ids.scatter_(0, scatter_indices, base_tokens)
+        blocks_2d = torch.cat([base_tokens.unsqueeze(1), mask_cols], dim=1)
+        blocks_flat = blocks_2d.reshape(-1)
+        pad_ids = padded_len - padded_num_reqs * block_size
+        input_ids = (
+            torch.cat(
+                (
+                    blocks_flat,
+                    torch.full(
+                        (pad_ids,),
+                        mask_token_id,
+                        dtype=blocks_flat.dtype,
+                        device=blocks_flat.device,
+                    ),
+                ),
+                dim=0,
+            )
+            if pad_ids > 0
+            else blocks_flat
+        )
 
         offsets = torch.arange(
             0, block_size, dtype=torch.int32, device=device
         ).unsqueeze(0)
         positions_unpadded = (base_pos + offsets).flatten()
-        positions = F.pad(
-            positions_unpadded, (0, padded_len - positions_unpadded.shape[0]), value=0
+        pad_pos = padded_len - positions_unpadded.shape[0]
+        positions = (
+            torch.cat(
+                (
+                    positions_unpadded,
+                    torch.zeros(
+                        (pad_pos,),
+                        dtype=positions_unpadded.dtype,
+                        device=positions_unpadded.device,
+                    ),
+                ),
+                dim=0,
+            )
+            if pad_pos > 0
+            else positions_unpadded
         )
         # Clamp to max_model_len to prevent out-of-bounds RoPE and kernel indexing.
         positions = torch.clamp(positions, max=self._max_model_len - 1)
@@ -1052,6 +1452,124 @@ class DFlashProposer:
         )
         return input_ids, positions, seq_lens
 
+    def _prep_forward_and_sample_body(
+        self,
+        next_tokens_device: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        position_ids: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        seq_lens_buf: torch.Tensor,
+        num_reqs_t: torch.Tensor,
+        block_size: int,
+        padded_len: int,
+        mask_token_id: int,
+        invalid_token_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        padded_num_reqs = padded_len // block_size
+        req_indices = torch.arange(
+            padded_num_reqs, dtype=torch.int32, device=query_start_loc.device
+        )
+        num_reqs_dev = num_reqs_t.reshape(())
+        safe_max = torch.clamp(num_reqs_dev - 1, min=0)
+        safe_req_indices = torch.minimum(req_indices, safe_max)
+        valid_mask = (req_indices < num_reqs_dev).unsqueeze(1).to(torch.int32)
+        next_tokens_padded = torch.where(
+            valid_mask.bool(),
+            next_tokens_device[safe_req_indices].to(torch.int32),
+            invalid_token_id,
+        )
+
+        start_positions = position_ids[query_start_loc[safe_req_indices]].unsqueeze(1)
+        end_indices = torch.clamp(query_start_loc[safe_req_indices + 1] - 1, min=0)
+        last_positions = position_ids[end_indices].unsqueeze(1)
+        start_positions_padded = (start_positions * valid_mask).to(torch.int32)
+
+        num_valid = (next_tokens_padded != invalid_token_id).sum(
+            dim=1, dtype=torch.int32
+        )
+        last_valid_col = torch.clamp(num_valid, min=1) - 1
+        base_tokens = next_tokens_padded.gather(1, last_valid_col.unsqueeze(1)).squeeze(
+            1
+        )
+        base_tokens = torch.where(
+            base_tokens == invalid_token_id,
+            torch.full_like(base_tokens, mask_token_id),
+            base_tokens,
+        )
+        num_accepted = num_valid.unsqueeze(1).to(torch.int32)
+
+        num_draft = draft_lengths[safe_req_indices].unsqueeze(1)
+        is_verify_window = (num_draft > 0).to(torch.int32)
+        verify_base = start_positions_padded + num_accepted
+        prompt_base = ((last_positions + 1) * valid_mask).to(torch.int32)
+        base_pos = is_verify_window * verify_base + (1 - is_verify_window) * prompt_base
+
+        input_ids, positions, seq_lens = self._layout_draft_block(
+            base_tokens, base_pos, block_size, padded_len, mask_token_id
+        )
+        seq_lens_buf.copy_(seq_lens)
+
+        return self._dflash_forward_and_sample_body(input_ids, positions, block_size)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _dflash_prep_forward_and_sample(
+        self,
+        next_tokens_device: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        position_ids: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        seq_lens_buf: torch.Tensor,
+        num_reqs_t: torch.Tensor,
+        block_size: int,
+        padded_len: int,
+        mask_token_id: int,
+        invalid_token_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._prep_forward_and_sample_body(
+            next_tokens_device,
+            query_start_loc,
+            position_ids,
+            draft_lengths,
+            seq_lens_buf,
+            num_reqs_t,
+            block_size,
+            padded_len,
+            mask_token_id,
+            invalid_token_id,
+        )
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _dflash_full_precompute_prep_forward_and_sample(
+        self,
+        target_hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor] | torch.Tensor,
+        ctx_positions: torch.Tensor,
+        ctx_md_tuple: tuple[AttentionMetadata, ...],
+        next_tokens_device: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        seq_lens_buf: torch.Tensor,
+        num_reqs_t: torch.Tensor,
+        block_size: int,
+        padded_len: int,
+        mask_token_id: int,
+        invalid_token_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single-graph fused DSpark context KV store + device prep + draft + sample."""
+        _ = self._run_context_kv_precompute_in_graph(
+            target_hidden_states, ctx_positions, ctx_md_tuple
+        )
+        return self._prep_forward_and_sample_body(
+            next_tokens_device,
+            ctx_md_tuple[0].query_start_loc,
+            ctx_positions,
+            draft_lengths,
+            seq_lens_buf,
+            num_reqs_t,
+            block_size,
+            padded_len,
+            mask_token_id,
+            invalid_token_id,
+        )
+
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _tpu_build_dflash_inputs_next_tokens(
         self,
@@ -1059,7 +1577,7 @@ class DFlashProposer:
         query_start_loc: torch.Tensor,
         position_ids: torch.Tensor,
         draft_lengths: torch.Tensor,
-        num_reqs: int,
+        num_reqs: torch.Tensor,
         block_size: int,
         padded_len: int,
         mask_token_id: int,
@@ -1095,10 +1613,8 @@ class DFlashProposer:
         padded_num_reqs = padded_len // block_size
 
         # Pad target output tokens to static shape on-device
-        next_tokens_device_padded = F.pad(
-            next_tokens_device,
-            (0, 0, 0, padded_num_reqs - next_tokens_device.shape[0]),
-            value=invalid_token_id,
+        next_tokens_device_padded = _pad_or_slice_rows(
+            next_tokens_device, padded_num_reqs, invalid_token_id
         ).to(torch.int32)
 
         (safe_req_indices, valid_mask, start_positions, last_positions) = (
@@ -1142,7 +1658,7 @@ class DFlashProposer:
         device_seed: torch.Tensor,
         query_start_loc: torch.Tensor,
         position_ids: torch.Tensor,
-        num_reqs: int,
+        num_reqs: torch.Tensor,
         block_size: int,
         padded_len: int,
         mask_token_id: int,
@@ -1173,14 +1689,13 @@ class DFlashProposer:
         padded_num_reqs = padded_len // block_size
 
         # Pad seed tokens to static shape on-device
-        base_tokens = F.pad(
-            device_seed, (0, padded_num_reqs - device_seed.shape[0]), value=0
-        ).to(torch.int32)
+        base_tokens = _pad_or_slice_rows(device_seed, padded_num_reqs).to(torch.int32)
 
         # Anchor one past the last prompt token in the chunk.
         _, valid_mask, _, last_positions = self._request_window_bounds(
             query_start_loc, position_ids, num_reqs, padded_num_reqs
         )
+        base_tokens = base_tokens * valid_mask.squeeze(1)
         base_pos = ((last_positions + 1) * valid_mask).to(torch.int32)
 
         return self._layout_draft_block(

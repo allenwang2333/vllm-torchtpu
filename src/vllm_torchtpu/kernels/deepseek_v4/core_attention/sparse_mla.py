@@ -454,12 +454,6 @@ def _attention_kernel(
             )
             bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
 
-        # In vLLM, multiple caches may overlay on the same KV Tensor. For example,
-        # compressor state cache write data in bfloat16 / float32 format, certain
-        # byte pattern are interpreted as NaN in FP8, e.g. float8_e8m0fnu byte 0xFF
-        # decodes to NaN.
-        # We need to mask out the data by the actual kv_len to avoid NaN propagting
-        # to the downstream computation.
         kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
         bkv = jnp.where(k_span_512 < kv_len, bkv, 0)
         return bkv
@@ -611,12 +605,12 @@ def prepare_swa_inputs(
             constant_values=0,
         )
     num_l_heads = align_to(num_q_heads, 128)
-    if num_l_heads != actual_num_q_heads:
+    if swa_l.shape[1] != num_l_heads:
         swa_l = jnp.pad(
             swa_l,
             (
                 (0, 0),
-                (0, num_l_heads - actual_num_q_heads),
+                (0, num_l_heads - swa_l.shape[1]),
             ),
             constant_values=0,
         )
@@ -624,7 +618,7 @@ def prepare_swa_inputs(
             swa_m,
             (
                 (0, 0),
-                (0, num_l_heads - actual_num_q_heads),
+                (0, num_l_heads - swa_m.shape[1]),
             ),
             constant_values=0,
         )

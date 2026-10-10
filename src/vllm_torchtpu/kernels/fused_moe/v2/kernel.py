@@ -554,6 +554,7 @@ def _build_fused_ep_moe_kernel(
     # -O` and PYTHONOPTIMIZE are ordinary things to find in a container
     # image, and under them an assert lets the illegal configuration build
     # and be cached.
+    capacity = min(int(capacity), HIDDEN_LANE_BLOCK)
     if capacity % ROWBLK:
         raise ValueError(
             f"tile height {capacity} is not a whole number of {ROWBLK}-row "

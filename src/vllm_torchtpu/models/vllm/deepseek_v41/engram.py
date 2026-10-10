@@ -45,6 +45,7 @@ from vllm.models.deepseek_v41.common.engram import (
     compute_hash_multipliers,
 )
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.tp_collectives import (
     tp_all_gather,
     tp_shard_slice,
@@ -59,18 +60,6 @@ logger = init_logger(__name__)
 
 _pallas_op_cache: dict[str, Any] = {}
 _R = P()
-
-
-def _prod_limbs_jax(tok: jax.Array, m_limbs: jax.Array) -> list[jax.Array]:
-    """Multiply 32-bit token IDs [T] by 9x7-bit multiplier limbs [L, 9] in int32."""
-    p = tok[:, None, None] * m_limbs[None, :, :]
-    out = []
-    carry = jnp.zeros_like(p[:, :, 0])
-    for k in range(9):
-        v = p[:, :, k] + carry
-        out.append(v & jnp.int32(0x7F))
-        carry = v >> 7
-    return out
 
 
 def _engram_hash_jax(
@@ -96,12 +85,14 @@ def _engram_hash_jax(
     num_slots = hash_cache.shape[0]
     num_pages = num_slots // swa_block_size
 
-    req = jnp.repeat(
-        jnp.arange(max_num_seqs, dtype=jnp.int32),
-        jnp.diff(query_start_loc),
-        total_repeat_length=num_tokens,
-    )
     token_idx = jnp.arange(num_tokens, dtype=jnp.int32)
+    eff_max_seqs = min(max_num_seqs, max(8, ((num_tokens + 7) // 8) * 8))
+    req = jnp.sum(
+        (token_idx[:, None] >= query_start_loc[1:eff_max_seqs][None, :]).astype(
+            jnp.int32
+        ),
+        axis=1,
+    )
     valid = token_idx < query_start_loc[distribution[2]]
     req_start_tok = query_start_loc[req]
     compressed = token_map[jnp.clip(input_ids, 0, token_map.shape[0] - 1)]
@@ -126,7 +117,13 @@ def _engram_hash_jax(
             lookback = pos - shift
             in_batch = (token_idx - shift) >= req_start_tok
             if shift < num_tokens:
-                batch_val = jnp.pad(compressed[: num_tokens - shift], (shift, 0))
+                batch_val = jnp.concatenate(
+                    [
+                        jnp.zeros((shift,), dtype=compressed.dtype),
+                        compressed[: num_tokens - shift],
+                    ],
+                    axis=0,
+                )
             else:
                 batch_val = jnp.zeros_like(compressed)
             c = jnp.clip(lookback, 0, max_pos)
@@ -144,31 +141,64 @@ def _engram_hash_jax(
         compressed, mode="drop"
     )
 
-    p_u32 = primes.astype(jnp.uint32)
-    w = jnp.ones_like(p_u32)
-    w_limbs = []
-    for _ in range(9):
-        w_limbs.append(w)
-        w = (w << np.uint32(7)) % p_u32
+    n_layers, n_orders, n_heads = primes.shape
+    lo_dim = n_layers * n_orders
+    if num_tokens >= 384:
+        p_u32_ht = primes.reshape(lo_dim, n_heads).T.astype(jnp.uint32)[:, :, None]
+        w_ht = jnp.ones_like(p_u32_ht)
+        tok_2d = jnp.stack(tokens, axis=0)
+        m_t = mult_limbs.transpose(2, 1, 0)[:, :, :, None]
+        p_all = m_t * tok_2d[None, :, None, :]
+        carry = jnp.zeros((max_ngram, n_layers, num_tokens), dtype=jnp.int32)
+        total_sum_ht = jnp.zeros((n_heads, lo_dim, num_tokens), dtype=jnp.uint32)
+        for k in range(9):
+            v = p_all[k] + carry
+            limb_k = v & jnp.int32(0x7F)
+            carry = v >> 7
+            roll = limb_k[0]
+            xor_orders = []
+            for i in range(1, max_ngram):
+                roll = jnp.bitwise_xor(roll, limb_k[i])
+                xor_orders.append(roll)
+            lk_ht = (
+                jnp.stack(xor_orders, axis=1)
+                .reshape(1, lo_dim, num_tokens)
+                .astype(jnp.uint32)
+            )
+            total_sum_ht = total_sum_ht + lk_ht * w_ht
+            w_ht = (w_ht << np.uint32(7)) % p_u32_ht
+        rem_ht = (total_sum_ht % p_u32_ht).astype(jnp.int32)
+        rem_tlh = rem_ht.transpose(2, 1, 0).reshape(
+            num_tokens, n_layers, n_orders * n_heads
+        )
+    else:
+        p_u32_3d = primes.reshape(1, lo_dim, n_heads).astype(jnp.uint32)
+        w_3d = jnp.ones_like(p_u32_3d)
+        tok_2d = jnp.stack(tokens, axis=1)
+        m_t = mult_limbs.transpose(2, 1, 0)[:, None, :, :]
+        p_all = tok_2d[None, :, :, None] * m_t
+        carry = jnp.zeros((num_tokens, max_ngram, n_layers), dtype=jnp.int32)
+        total_sum_3d = jnp.zeros((num_tokens, lo_dim, n_heads), dtype=jnp.uint32)
+        for k in range(9):
+            v = p_all[k] + carry
+            limb_k = v & jnp.int32(0x7F)
+            carry = v >> 7
+            roll = limb_k[:, 0, :]
+            xor_orders = []
+            for i in range(1, max_ngram):
+                roll = jnp.bitwise_xor(roll, limb_k[:, i, :])
+                xor_orders.append(roll)
+            lk = (
+                jnp.stack(xor_orders, axis=2)
+                .reshape(num_tokens, lo_dim, 1)
+                .astype(jnp.uint32)
+            )
+            total_sum_3d = total_sum_3d + lk * w_3d
+            w_3d = (w_3d << np.uint32(7)) % p_u32_3d
+        rem_3d = (total_sum_3d % p_u32_3d).astype(jnp.int32)
+        rem_tlh = rem_3d.reshape(num_tokens, n_layers, n_orders * n_heads)
 
-    roll_limbs = _prod_limbs_jax(tokens[0], mult_limbs[:, 0, :])
-    order_limbs = []
-    for i in range(1, max_ngram):
-        cur_limbs = _prod_limbs_jax(tokens[i], mult_limbs[:, i, :])
-        roll_limbs = [jnp.bitwise_xor(r, c) for r, c in zip(roll_limbs, cur_limbs)]
-        order_limbs.append(roll_limbs)
-
-    total_sum = jnp.zeros((num_tokens,) + primes.shape, dtype=jnp.uint32)
-    for k in range(9):
-        lk = jnp.stack(
-            [order_limbs[i][k] for i in range(max_ngram - 1)], axis=2
-        ).astype(jnp.uint32)
-        total_sum = total_sum + lk[:, :, :, None] * w_limbs[k][None, :, :, :]
-
-    rem_all = (total_sum % p_u32[None, :, :, :]).astype(jnp.int32)
-    out_hashes = (
-        rem_all.reshape(num_tokens, primes.shape[0], -1) + offsets[None, :, :]
-    )
+    out_hashes = rem_tlh + offsets[None, :, :]
     out_hashes = jnp.where(valid[:, None, None], out_hashes, jnp.int32(-1))
     return out_hashes, hash_cache
 
@@ -231,7 +261,13 @@ class TpuNgramHashState(nn.Module):
         self._offsets_np = layout.offsets.cpu().numpy().astype(np.int64)
 
     def cpu_hashes(
-        self, token_ids: np.ndarray, req_idx: np.ndarray, pos: np.ndarray
+        self,
+        token_ids: np.ndarray,
+        req_idx: np.ndarray,
+        pos: np.ndarray,
+        *,
+        span_start_by_req: np.ndarray | None = None,
+        span_tokens: np.ndarray | None = None,
     ) -> np.ndarray:
         """Compute _engram_hash_jax hashes on CPU from host prompt token history."""
         tm = self._token_map_np
@@ -240,9 +276,19 @@ class TpuNgramHashState(nn.Module):
         for shift in range(self.layout.max_ngram_size):
             lookback = pos - shift
             blocked |= lookback < 0
-            ids = np.clip(
-                token_ids[req_idx, np.maximum(lookback, 0)], 0, tm.shape[0] - 1
-            )
+            clipped_lb = np.maximum(lookback, 0)
+            ids = token_ids[req_idx, clipped_lb]
+            if span_start_by_req is not None and span_tokens is not None:
+                in_span = lookback >= span_start_by_req[req_idx]
+                if in_span.any():
+                    ids = ids.copy()
+                    rel = np.clip(
+                        lookback[in_span] - span_start_by_req[req_idx[in_span]],
+                        0,
+                        span_tokens.shape[1] - 1,
+                    )
+                    ids[in_span] = span_tokens[req_idx[in_span], rel]
+            ids = np.clip(ids, 0, tm.shape[0] - 1)
             toks.append(np.where(blocked, self.pad_id, tm[ids]))
         roll = toks[0][:, None] * self._mult_np[None, :, 0]
         out = []
@@ -279,11 +325,9 @@ class TpuNgramHashState(nn.Module):
         t_0 = np.where(pos < 0, self.pad_id, tm[clipped_0])
         term_0 = t_0[:, None, None] * self._mult_np[None, :, 0, None]
         rolled = term_0 ^ cum_xor
-        hashed = (
-            rolled[:, :, :, None] % self._primes_np[None, :, :, :]
-        ).reshape(pos.shape[0], self._mult_np.shape[0], -1) + self._offsets_np[
-            None, :, :
-        ]
+        hashed = (rolled[:, :, :, None] % self._primes_np[None, :, :, :]).reshape(
+            pos.shape[0], self._mult_np.shape[0], -1
+        ) + self._offsets_np[None, :, :]
         return hashed.astype(np.int32)
 
     @property
@@ -378,9 +422,11 @@ class TpuNgramHashState(nn.Module):
 
 _CPU_ENGRAM_WEIGHTS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 _NEXT_ENGRAM_TABLE_ID = 0
-# Double-buffered pinned CPU output pre-sized for max_num_batched_tokens=4096.
-_OUT_CPU_BUFS: list[torch.Tensor | None] = [None, None]
+# 128-slot CPU output ring pre-sized for max_num_batched_tokens=4096.
+_OUT_CPU_BUFS: list[torch.Tensor | None] = [None] * 128
 _OUT_CPU_SLOT: int = 0
+_DEV_ENGRAM_RING: list[torch.Tensor] = []
+_DEV_ENGRAM_SLOT: int = 0
 _OUT_CPU_MIN_TOKENS = 4096
 _PIN_HOST_BUFS: bool = True
 _ENGRAM_PTRS_CACHE: dict[tuple[int, ...], tuple[Any, ...]] = {}
@@ -555,9 +601,7 @@ class _EngramTableSlices:
 
     __slots__ = ("_buf_2d", "_num_tokens", "_table_bytes")
 
-    def __init__(
-        self, buf_2d: torch.Tensor, num_tokens: int, table_bytes: int
-    ) -> None:
+    def __init__(self, buf_2d: torch.Tensor, num_tokens: int, table_bytes: int) -> None:
         t_u8 = min(max(num_tokens, 32), buf_2d.shape[0])
         self._buf_2d = buf_2d[:t_u8]
         self._num_tokens = num_tokens
@@ -573,7 +617,7 @@ class _EngramTableSlices:
 def _next_host_buf(nbytes: int, row_span: int) -> torch.Tensor:
     global _OUT_CPU_SLOT, _PIN_HOST_BUFS
     slot = _OUT_CPU_SLOT
-    _OUT_CPU_SLOT = (slot + 1) & 1
+    _OUT_CPU_SLOT = (slot + 1) & 127
     buf = _OUT_CPU_BUFS[slot]
     needed = max(nbytes, _OUT_CPU_MIN_TOKENS * row_span) + 512
     if buf is None or buf.numel() < needed:
@@ -590,17 +634,11 @@ def _next_host_buf(nbytes: int, row_span: int) -> torch.Tensor:
     return buf
 
 
-def _gather_into(
-    lib: ctypes.CDLL,
-    hashes: np.ndarray,
-    table_ids: list[int],
-    packed_dim: int,
-    out: torch.Tensor,
-) -> None:
-    num_tokens, n_tables, n_hash_cols = hashes.shape
+def _ensure_engram_ptrs(table_ids: list[int]) -> tuple[Any, ...]:
     key = tuple(table_ids)
     cached = _ENGRAM_PTRS_CACHE.get(key)
     if cached is None:
+        n_tables = len(table_ids)
         w_ptrs = (ctypes.c_void_p * n_tables)()
         s_ptrs = (ctypes.c_void_p * n_tables)()
         max_rows = (ctypes.c_int64 * n_tables)()
@@ -615,7 +653,18 @@ def _gather_into(
         cached = (w_ptrs, s_ptrs, max_rows, val_dim, scl_dim)
         if all(p is not None for p in pairs):
             _ENGRAM_PTRS_CACHE[key] = cached
-    w_ptrs, s_ptrs, max_rows, val_dim, scl_dim = cached
+    return cached
+
+
+def _gather_into(
+    lib: ctypes.CDLL,
+    hashes: np.ndarray,
+    table_ids: list[int],
+    packed_dim: int,
+    out: torch.Tensor,
+) -> None:
+    num_tokens, n_tables, n_hash_cols = hashes.shape
+    w_ptrs, s_ptrs, max_rows, val_dim, scl_dim = _ensure_engram_ptrs(table_ids)
     lib.engram_gather_omp(
         hashes.ctypes.data,
         w_ptrs,
@@ -697,6 +746,7 @@ def engram_prefetch_prefill(
     padded_num_tokens: int,
     pre_async: Any = None,
     async_subst: tuple[np.ndarray, np.ndarray] | list[tuple[int, int]] | None = None,
+    spec_async_subst: tuple[list[tuple[int, int, int, int, int]], int] | None = None,
     debug_tok0_out: dict[int, int] | None = None,
 ) -> None:
     """Gather Engram rows for scheduled tokens on CPU during input preparation."""
@@ -735,9 +785,7 @@ def engram_prefetch_prefill(
             g_tok, g_pre = norm_subst
             in_slice = (g_tok >= t_start) & (g_tok < t_start + n_real_local)
             local_subst = (
-                (g_tok[in_slice] - t_start, g_pre[in_slice])
-                if in_slice.any()
-                else None
+                (g_tok[in_slice] - t_start, g_pre[in_slice]) if in_slice.any() else None
             )
         else:
             local_subst = None
@@ -769,6 +817,31 @@ def engram_prefetch_prefill(
             "row_bytes": row_bytes,
         }
 
+    # Resolve all PJRT / torch_tpu D2H copies and tensor data_ptrs synchronously
+    # on the main worker thread across all TP ranks before any n_real_local == 0
+    # early return so every TP rank drains pre_async D2H events symmetrically and
+    # background threads never race with PJRT's non-thread-safe C++ event lists.
+    _ensure_engram_ptrs(table_ids)
+    sampled_main_np: np.ndarray | None = None
+    pre_sampled_main_np: np.ndarray | None = None
+    next_main_np: np.ndarray | None = None
+    if pre_async is not None:
+        if spec_async_subst is not None:
+            pre_sampled_t = pre_async.wait_for_copy()
+            next_t_fn = getattr(pre_async, "wait_for_next_tokens_cpu", None)
+            next_t = next_t_fn() if callable(next_t_fn) else None
+            if next_t is None:
+                next_tpu: Any = getattr(pre_async, "next_tokens_tpu", None)
+                if isinstance(next_tpu, torch.Tensor):
+                    next_t = next_tpu.to("cpu")
+            if pre_sampled_t is not None and next_t is not None:
+                pre_sampled_main_np = pre_sampled_t.detach().to(torch.int64).numpy()
+                if pre_sampled_main_np.ndim == 1:
+                    pre_sampled_main_np = pre_sampled_main_np[:, None]
+                next_main_np = next_t.detach().reshape(-1).to(torch.int64).numpy()
+        elif norm_subst is not None:
+            sampled_main_np = _resolve_async_tokens_cpu(pre_async)
+
     if n_real_local == 0 and debug_tok0_out is None:
         _ENGRAM_PREFETCH = pf_meta
         return
@@ -796,7 +869,7 @@ def engram_prefetch_prefill(
             if local_subst is not None and pre_async is not None:
                 cum_xor = hash_state.cpu_hashes_tail(token_ids, req_k, pos_k)
                 ids_0_all = token_ids[req_slice, np.maximum(pos_slice, 0)].copy()
-                sampled = _resolve_async_tokens_cpu(pre_async)
+                sampled = sampled_main_np
                 if sampled is not None:
                     loc_tok, loc_pre = local_subst
                     valid_p = (loc_pre >= 0) & (loc_pre < sampled.shape[0])
@@ -806,23 +879,80 @@ def engram_prefetch_prefill(
                 hashes_s[known_slice] = hash_state.cpu_hashes_finish_tok0(
                     ids_0_all[known_slice], pos_k, cum_xor
                 )
+            elif spec_async_subst is not None and pre_async is not None:
+                spec_reqs, stride = spec_async_subst
+                if (
+                    pre_sampled_main_np is not None
+                    and next_main_np is not None
+                    and spec_reqs
+                ):
+                    pre_sampled_np = pre_sampled_main_np
+                    next_np = next_main_np
+                    max_r = max(
+                        int(token_ids.shape[0]) - 1,
+                        max(r for r, _, _, _, _ in spec_reqs),
+                    )
+                    max_sched = max((ns for _, _, _, _, ns in spec_reqs), default=0)
+                    num_rej_by_req = np.zeros(max_r + 1, dtype=np.int32)
+                    span_start_by_req = np.full(
+                        max_r + 1, token_ids.shape[1] + 100, dtype=np.int32
+                    )
+                    span_tokens = np.zeros(
+                        (max_r + 1, max(2 * stride + 2, stride + max_sched + 2)),
+                        dtype=token_ids.dtype,
+                    )
+                    for (
+                        r,
+                        pre_pos,
+                        end_idx_no_spec,
+                        n_placeholder,
+                        n_sched,
+                    ) in spec_reqs:
+                        if 0 <= pre_pos < pre_sampled_np.shape[0]:
+                            row = pre_sampled_np[pre_pos]
+                            sampled_r = row[row != -1]
+                            l_acc = max(1, int(sampled_r.shape[0]))
+                        else:
+                            sampled_r = np.zeros(1, dtype=np.int64)
+                            l_acc = 1
+                        n_rej = max(0, n_placeholder - l_acc)
+                        start_idx = end_idx_no_spec - n_placeholder
+                        src_off = pre_pos * stride
+                        src = next_np[src_off : src_off + n_sched]
+                        n_prev_acc = max(0, l_acc - 1)
+                        if n_prev_acc > 0:
+                            span_tokens[r, :n_prev_acc] = sampled_r[:n_prev_acc]
+                        if src.shape[0] > 0:
+                            span_tokens[r, n_prev_acc : n_prev_acc + src.shape[0]] = src
+                        num_rej_by_req[r] = n_rej
+                        span_start_by_req[r] = start_idx
+                    pos_k_adj = pos_k - num_rej_by_req[req_k]
+                    hashes_s[known_slice] = hash_state.cpu_hashes(
+                        token_ids,
+                        req_k,
+                        pos_k_adj,
+                        span_start_by_req=span_start_by_req,
+                        span_tokens=span_tokens,
+                    )
+                else:
+                    hashes_s[known_slice] = hash_state.cpu_hashes(
+                        token_ids, req_k, pos_k
+                    )
             else:
-                hashes_s[known_slice] = hash_state.cpu_hashes(
-                    token_ids, req_k, pos_k
-                )
+                hashes_s[known_slice] = hash_state.cpu_hashes(token_ids, req_k, pos_k)
                 if (
                     debug_tok0_out is not None
                     and norm_subst is not None
                     and pre_async is not None
                 ):
-                    _populate_debug(_resolve_async_tokens_cpu(pre_async))
+                    _populate_debug(sampled_main_np)
             _gather_into(lib, hashes_s, table_ids, packed_dim, buf)
         elif (
             debug_tok0_out is not None
             and norm_subst is not None
             and pre_async is not None
         ):
-            _populate_debug(_resolve_async_tokens_cpu(pre_async))
+            _populate_debug(sampled_main_np)
         return pf_meta
 
     _ENGRAM_PREFETCH_FUTURE = _ENGRAM_BG_POOL.submit(_bg_hash_and_gather)
@@ -851,25 +981,37 @@ def take_prefetched_engram_hashes(
     if n_real < target_tokens:
         rows[n_real:].zero_()
     if out_1d_i32_buf is not None:
-        # P2 D3: upload only the active bucket into the static buffer. The
-        # compiled stage reads rows [:max(t_local, 32)] (_EngramTableSlices),
-        # and the host buffers hold >= _OUT_CPU_MIN_TOKENS rows, so uploading
-        # the whole static buffer moved static_rows * row_bytes every step
-        # (decode included) and doubled with max_num_batched_tokens.
         if out_1d_i32_buf.ndim == 2:
-            pad_rows = min(max(target_tokens, 32), out_1d_i32_buf.shape[0])
+            global _DEV_ENGRAM_RING, _DEV_ENGRAM_SLOT
+            ring_len = 4 if out_1d_i32_buf.shape[0] >= 2048 else 8
+            if (
+                len(_DEV_ENGRAM_RING) != ring_len
+                or _DEV_ENGRAM_RING[0].shape != out_1d_i32_buf.shape
+                or _DEV_ENGRAM_RING[0].device != device
+            ):
+                _DEV_ENGRAM_RING = [
+                    torch.zeros_like(out_1d_i32_buf, device=device)
+                    for _ in range(ring_len)
+                ]
+                _DEV_ENGRAM_SLOT = 0
+            dev_buf = _DEV_ENGRAM_RING[_DEV_ENGRAM_SLOT]
+            _DEV_ENGRAM_SLOT = (_DEV_ENGRAM_SLOT + 1) % ring_len
+            pad_rows = min(max(target_tokens, 32), dev_buf.shape[0])
             pad_bytes = pad_rows * row_bytes
             if pf["buf"].numel() >= pad_bytes:
                 if n_real < pad_rows:
                     pf["buf"][n_real * row_bytes : pad_bytes].zero_()
-                out_1d_i32_buf[:pad_rows].copy_(
+                dev_buf[:pad_rows].copy_(
                     pf["buf"][:pad_bytes].view(pad_rows, row_bytes), non_blocking=True
                 )
-                return out_1d_i32_buf
-            out_1d_i32_buf[:target_tokens].copy_(rows, non_blocking=True)
+                return dev_buf
+            dev_buf[:target_tokens].copy_(rows, non_blocking=True)
             if target_tokens < pad_rows:
-                out_1d_i32_buf[target_tokens:pad_rows].zero_()
-            return out_1d_i32_buf
+                dev_buf[target_tokens:pad_rows].zero_()
+            return dev_buf
+        static_bytes = out_1d_i32_buf.numel()
+        if pf["buf"].numel() >= static_bytes:
+            return pf["buf"][:static_bytes].to(device, non_blocking=True)
         out_1d_i32_buf[:total_bytes].copy_(rows.reshape(-1), non_blocking=True)
         return out_1d_i32_buf
     return rows.view(num_tokens, -1, packed_dim).to(device, non_blocking=True)
@@ -1144,16 +1286,16 @@ class TpuParallelEngramEmbedding(nn.Module):
             else:
                 table_2d = packed
                 t_local = table_2d.shape[0]
-            val_f32 = (
+            val_bf16 = (
                 table_2d[:, : self.val_bytes]
                 .view(torch.float8_e4m3fn)
-                .to(torch.float32)
+                .to(torch.bfloat16)
             )
             scl_bf16 = e8m0_to_fp32(
                 table_2d[:, self.val_bytes : self.val_bytes + self.scl_pad_bytes]
             ).to(torch.bfloat16)
             if t_local < table_2d.shape[0]:
-                val_f32 = val_f32[:t_local]
+                val_bf16 = val_bf16[:t_local]
                 scl_bf16 = scl_bf16[:t_local]
             expand_2d = _get_scale_expand_mat(
                 self.scl_pad_bytes,
@@ -1161,20 +1303,15 @@ class TpuParallelEngramEmbedding(nn.Module):
                 self.block_size,
                 table_2d.device,
             )
-            if table_2d.device.type == "cpu":
-                scales_f32 = torch.matmul(scl_bf16.float(), expand_2d.float())
-            else:
-                scales_f32 = torch.matmul(scl_bf16, expand_2d).to(torch.float32)
-            return (
-                (val_f32 * scales_f32)
-                .to(torch.bfloat16)
-                .view(t_local, self.n_hash_cols, self.dim)
+            scales_bf16 = torch.matmul(scl_bf16, expand_2d)
+            return (val_bf16 * scales_bf16).view(
+                t_local, self.n_hash_cols, self.dim
             )
 
         if packed.shape[1] != self.n_hash_cols:
             packed = packed[:, : self.n_hash_cols]
         values = packed[..., : self.dim].view(torch.float8_e4m3fn)
-        scales_f32 = e8m0_to_fp32(packed[..., self.dim :])
+        scales_bf16 = e8m0_to_fp32(packed[..., self.dim :]).to(torch.bfloat16)
         if packed.device.type != "cpu":
             expand_3d = _get_scale_expand_mat(
                 self.scale_dim,
@@ -1182,20 +1319,14 @@ class TpuParallelEngramEmbedding(nn.Module):
                 self.block_size,
                 packed.device,
             )
-            scales_expanded = torch.matmul(
-                scales_f32.to(torch.bfloat16), expand_3d
-            ).to(torch.float32)
-            return (values.to(torch.float32) * scales_expanded).to(torch.bfloat16)
+            scales_expanded = torch.matmul(scales_bf16, expand_3d)
+            return values.to(torch.bfloat16) * scales_expanded
         return (
-            (
-                values.to(torch.float32).unflatten(
-                    -1, (self.scale_dim, self.block_size)
-                )
-                * scales_f32.unsqueeze(-1)
+            values.to(torch.bfloat16).unflatten(
+                -1, (self.scale_dim, self.block_size)
             )
-            .flatten(-2)
-            .to(torch.bfloat16)
-        )
+            * scales_bf16.unsqueeze(-1)
+        ).flatten(-2)
 
 
 class TpuEngram(nn.Module):

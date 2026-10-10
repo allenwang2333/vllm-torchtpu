@@ -39,6 +39,11 @@ the blockwise Pallas kernel path instead.
 
 from __future__ import annotations
 
+try:
+    import jax
+except ImportError:
+    pass
+
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -1069,7 +1074,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             score_bias_operand,
         )
 
-        if fused_moe_ep_supported(self):
+        _ep_dp_factor = max(
+            int(layer.moe_config.ep_size) // max(int(layer.moe_config.tp_size), 1), 1
+        )
+        if fused_moe_ep_supported(self) and x.shape[0] * _ep_dp_factor >= 512:
             return fused_moe_ep(
                 self,
                 x,

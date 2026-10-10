@@ -40,6 +40,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import 
 )
 from vllm_torchtpu.kernels.deepseek_v41.sparsecore_topk import (
     sc_cand_gather_topk,
+    sc_cand_pregathered_topk,
     sc_write_cand_and_topk,
     sparsecore_topk,
 )
@@ -152,9 +153,8 @@ def kernel(
     def transpose_to_head_major(bq_rows, n_tok):
         return bq_rows.transpose(1, 0, 2).reshape(num_q_heads * n_tok, head_dim)
 
-    def reduce_heads(bq_rows, bkv, bq_weights):
+    def reduce_heads(bq_rows, bkv, bq_weights, w_pre_folded: bool = False):
         n_tok = bq_weights.shape[0]
-        w = bq_weights.astype(jnp.float32)
 
         def qk(rows):
             return jnp.einsum(
@@ -162,42 +162,31 @@ def kernel(
             )
 
         if n_tok < 8:
-            st = qk(bq_rows).reshape(n_tok, num_q_heads, -1)
-            return (jnp.maximum(st, 0.0) * w[:, :, None]).sum(axis=1)
+            w = bq_weights.astype(jnp.float32)
+            st = jnp.maximum(qk(bq_rows), 0.0).reshape(n_tok, num_q_heads, -1)
+            return (st * w[:, :, None]).sum(axis=1)
 
-        # n_tok >= 8 only in the MIXED pass, whose q is pre-transposed into q_hm_ref.
+        # n_tok >= 8 only in the MIXED pass, whose q is pre-transposed & pre-weighted into q_hm_ref at bkv_idx == 0.
         rows_hm = bq_rows.reshape(num_q_heads, n_tok, head_dim)
-        if n_tok == 8:
-            head_group = min(32, num_q_heads)
-            acc = None
+        head_group = min(64 if n_tok == 8 else 16, num_q_heads)
+        acc = None
+        if w_pre_folded:
             for g in range(0, num_q_heads, head_group):
                 grp = min(head_group, num_q_heads - g)
-                st_g = qk(
-                    rows_hm[g : g + grp].reshape(grp * n_tok, head_dim)
+                st_g = jnp.maximum(
+                    qk(rows_hm[g : g + grp].reshape(grp * n_tok, head_dim)), 0.0
                 ).reshape(grp, n_tok, -1)
-                for h in range(grp):
-                    term = jnp.maximum(st_g[h], 0.0) * w[:, g + h : g + h + 1]
-                    acc = term if acc is None else acc + term
-            return acc
-
-        head_group = min(8, num_q_heads)
-        acc = None
-        w_bf16 = w.astype(jnp.bfloat16)
-        z_bf16 = jnp.bfloat16(0.0)
+                term = st_g.sum(axis=0)
+                acc = term if acc is None else acc + term
+            return acc * bq_weights
+        w_hm = bq_weights.astype(jnp.float32).T[:, :, None]
         for g in range(0, num_q_heads, head_group):
             grp = min(head_group, num_q_heads - g)
-            st_g = (
-                qk(rows_hm[g : g + grp].reshape(grp * n_tok, head_dim))
-                .astype(jnp.bfloat16)
-                .reshape(grp, n_tok, -1)
-            )
-            grp_acc = None
-            for h in range(grp):
-                term = jnp.maximum(st_g[h], z_bf16) * w_bf16[:, g + h : g + h + 1]
-                grp_acc = term if grp_acc is None else grp_acc + term
-            assert grp_acc is not None
-            grp_f32 = grp_acc.astype(jnp.float32)
-            acc = grp_f32 if acc is None else acc + grp_f32
+            st_g = jnp.maximum(
+                qk(rows_hm[g : g + grp].reshape(grp * n_tok, head_dim)), 0.0
+            ).reshape(grp, n_tok, -1)
+            term = (st_g * w_hm[g : g + grp]).sum(axis=0)
+            acc = term if acc is None else acc + term
         return acc
 
     def step_body(
@@ -208,20 +197,35 @@ def kernel(
         bq_idx = bq_block(p_id)
         bkv_idx = bkv_block(p_id)
 
+        w_data = weights_vmem[...].reshape(seq_batch_size, -1, num_q_heads)
+        w_pre_folded = q_hm_ref is not None
         if q_hm_ref is not None:
+            w_f32 = w_data[0].astype(jnp.float32)
+            w_max = jnp.max(w_f32, axis=-1, keepdims=True)
+            bq_weights_vec = [w_max]
 
             @pl.when(bkv_idx == 0)
             def _():
-                q_hm_ref[...] = transpose_to_head_major(q_vmem[...], bq_sz)
+                rel_w = jnp.where(w_max > 0.0, w_f32 / w_max, 0.0)[:, :, None]
+                q_scaled = (q_vmem[...].astype(jnp.float32) * rel_w).astype(q_vmem.dtype)
+                q_hm_ref[...] = transpose_to_head_major(q_scaled, bq_sz)
 
             bq_vec = [q_hm_ref[...]]
         else:
             q_data = q_vmem[...].reshape(seq_batch_size, -1, head_dim)
             bq_vec = [q_data[i] for i in range(seq_batch_size)]
-        w_data = weights_vmem[...].reshape(seq_batch_size, -1, num_q_heads)
-        bq_weights_vec = [w_data[i] for i in range(seq_batch_size)]
+            bq_weights_vec = [w_data[i] for i in range(seq_batch_size)]
 
         chunk_start = start_end_seq_idx_ref[2]
+        q_iota = jnp.arange(bq_sz, dtype=jnp.int32)
+        k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
+            jnp.int32, (bq_sz, bkv_sz), 1
+        )
+        lane_id = (
+            lax.broadcasted_iota(jnp.int32, (1, num_blk_sublanes_bkv, 128), 2)
+            if produce_blk_scores
+            else None
+        )
         bq_pos_compressed_vec, q_l_vec, bkvs, bkv_scales = [], [], [], []
         for batch_idx in range(seq_batch_size):
             s_l = seq_lens_ref[batch_start_seq_idx + batch_idx]
@@ -229,7 +233,7 @@ def kernel(
             q_l = cu_q_lens_ref[batch_start_seq_idx + batch_idx + 1] - q_s
             q_l_vec.append(q_l)
             block_start = bq_idx * bq_sz + jnp.maximum(0, chunk_start - q_s)
-            q_pos = s_l - q_l + block_start + jnp.arange(bq_sz, dtype=jnp.int32)
+            q_pos = s_l - q_l + block_start + q_iota
             bq_pos_compressed_vec.append(((q_pos + 1) >> shift_comp) - 1)
 
             key_bytes = bkv_vmem[batch_idx, :kv_head_dim_groups]
@@ -240,18 +244,15 @@ def kernel(
                 batch_idx, kv_head_dim_groups : kv_head_dim_groups + 1
             ].reshape(kv_packing, bkv_sz)[0:1]
             bkv_scales.append(
-                pltpu.bitcast(scale_bytes, jnp.float8_e8m0fnu).astype(jnp.bfloat16)
+                pltpu.bitcast(scale_bytes, jnp.float8_e8m0fnu).astype(jnp.float32)
             )
 
         ret, ret_blk = [], []
         for batch_idx in range(seq_batch_size):
             bq = bq_vec[batch_idx].reshape(-1, head_dim)
             s_summed = (
-                reduce_heads(bq, bkvs[batch_idx], bq_weights_vec[batch_idx])
+                reduce_heads(bq, bkvs[batch_idx], bq_weights_vec[batch_idx], w_pre_folded=w_pre_folded)
                 * bkv_scales[batch_idx]
-            )
-            k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
-                jnp.int32, s_summed.shape, 1
             )
             kv_len = seq_lens_ref[batch_start_seq_idx + batch_idx] >> shift_comp
             bq_pos_compressed = bq_pos_compressed_vec[batch_idx]
@@ -268,9 +269,6 @@ def kernel(
                     jnp.where(is_newest, jnp.inf, s_summed)
                     .astype(jnp.bfloat16)
                     .reshape(-1, num_sublanes_bkv, 128)
-                )
-                lane_id = lax.broadcasted_iota(
-                    jnp.int32, (1, num_blk_sublanes_bkv, 128), 2
                 )
                 nbs = num_blk_sublanes_bkv
                 chunks = [s_blk[:, i * nbs : (i + 1) * nbs, :] for i in range(8)]
@@ -323,7 +321,7 @@ def kernel(
         _run_all()
 
 
-MAX_INDEXER_CHUNKS = 64
+MAX_INDEXER_CHUNKS = 128
 
 
 def _smem_budget_bytes() -> int:
@@ -340,9 +338,13 @@ def compute_meta_buf_len(
 ) -> int:
     """Static upper bound on `max_steps` across all 3 StreamIndex passes."""
     smem_budget_bytes = _smem_budget_bytes()
-    prefetch_bytes = (
-        max_num_seqs * 4 + (max_num_seqs + 1) * 4 + max_num_seqs * pages_per_seq * 4
+    eff_s = (
+        min(max_num_seqs, max(8, align_to(max_num_tokens, 8)))
+        if isinstance(max_num_tokens, int)
+        else max_num_seqs
     )
+    eff_pages = min(131072, eff_s * pages_per_seq)
+    prefetch_bytes = eff_s * 4 + (eff_s + 1) * 4 + eff_pages * 4
     step_meta_bytes = (len(MetadataRef.__annotations__) - 1) * 4
     smem_max = max(
         1024, ((smem_budget_bytes - prefetch_bytes) // step_meta_bytes // 1024) * 1024
@@ -350,7 +352,7 @@ def compute_meta_buf_len(
     if not isinstance(max_num_tokens, int):
         return smem_max
     num_chunks, chunk_len, bq_mixed, bkv_p = _chunk_and_bq_config(max_num_tokens)
-    eff_max_seqs = min(max_num_seqs, max(8, align_to(max_num_tokens, 8)))
+    eff_max_seqs = eff_s
     chunked = num_chunks > 1
     req_max = max(
         _max_steps_for_pass(
@@ -594,21 +596,28 @@ def _compute_metadata(
 
 
 def _chunk_and_bq_config(max_num_tokens: int) -> tuple[int, int, int, int]:
-    is_decode_or_verify = max_num_tokens <= 512
+    is_decode_or_verify = max_num_tokens <= 1536
     bq_mixed_in = 8 if is_decode_or_verify else 128
     bkv_p = 16 if is_decode_or_verify else 8
     chunk_tokens = (
-        256
-        if max_num_tokens >= 1024 and max_num_tokens % 256 == 0
+        512
+        if (not is_decode_or_verify and max_num_tokens >= 512 and max_num_tokens % 512 == 0)
         else {
-            512: 128,
-            384: 96,
-            256: 64,
-            192: 96,
-            128: 64,
-            96: 48,
-            64: 32,
-            16: 8,
+            1536: 512,
+            1280: 640,
+            1024: 512,
+            768: 384,
+            640: 320,
+            512: 512,
+            384: 384,
+            320: 320,
+            256: 256,
+            192: 192,
+            160: 160,
+            128: 128,
+            96: 96,
+            64: 64,
+            16: 16,
         }.get(max_num_tokens, 512)
     )
     if chunk_tokens is None or max_num_tokens % chunk_tokens:
@@ -896,28 +905,124 @@ def streamindex_topk(
     )
 
     # Visible compressed KV positions per token row of the score matrix.
+    num_seqs_all = distribution[2]
+    token_ids_all = jnp.arange(max_num_tokens, dtype=jnp.int32)
+    seq_mask_all = token_ids_all[:, None] >= cu_q_lens[None, 1 : max_num_seqs + 1]
+    seq_mask_all = jnp.where(
+        jnp.arange(max_num_seqs)[None, :] < num_seqs_all, seq_mask_all, False
+    )
+    seq_ids_all = jnp.sum(seq_mask_all, axis=1)
     if precomputed_eff_row_lengths is not None:
         eff_row_lengths = precomputed_eff_row_lengths
     else:
-        num_seqs = distribution[2]
-        token_ids = jnp.arange(max_num_tokens, dtype=jnp.int32)
-        seq_mask = token_ids[:, None] >= cu_q_lens[None, 1 : max_num_seqs + 1]
-        seq_mask = jnp.where(
-            jnp.arange(max_num_seqs)[None, :] < num_seqs, seq_mask, False
-        )
-        seq_ids = jnp.sum(seq_mask, axis=1)
-        q_start = cu_q_lens[seq_ids]
-        q_len = cu_q_lens[seq_ids + 1] - q_start
-        seq_len = seq_lens[seq_ids]
-        token_pos = seq_len - q_len + (token_ids - q_start)
+        q_start = cu_q_lens[seq_ids_all]
+        q_len = cu_q_lens[seq_ids_all + 1] - q_start
+        seq_len = seq_lens[seq_ids_all]
+        token_pos = seq_len - q_len + (token_ids_all - q_start)
         visible = jnp.minimum(
             seq_len // compression_ratio, (token_pos + 1) // compression_ratio
         )
         eff_row_lengths = jnp.where(
-            token_ids < cu_q_lens[num_seqs],
+            token_ids_all < cu_q_lens[num_seqs_all],
             jnp.minimum(visible, max(num_sublanes_total * 128, k)),
             0,
         )
+
+    if candidates is not None and not produce_blk:
+        cb = candidates.shape[1]
+        total_num_pages, kv_sublane_groups, kv_packing, page_size = cache_kv.shape
+        head_dim = q.shape[2]
+        kv_head_dim_groups = head_dim // kv_packing
+        blocks_per_page = page_size // 8
+        kv_blks_flat = cache_kv.transpose(0, 3, 1, 2).reshape(
+            -1, 8, kv_sublane_groups, kv_packing
+        )
+        sub_b = min(chunk_len, 64)
+        group_base = (
+            reserve_scheduling_group_ids(num_chunks - 1) if num_chunks > 1 else 0
+        )
+        topk_idxs = []
+        for m in range(num_chunks):
+            sc_group = None if m == num_chunks - 1 else group_base + m
+            s_tok = m * chunk_len
+            e_tok = s_tok + chunk_len
+            cands_m = candidates[s_tok:e_tok]
+            rl_m = eff_row_lengths[s_tok:e_tok]
+            cand_scores_parts = []
+            for sb in range(s_tok, e_tok, sub_b):
+                eb = min(sb + sub_b, e_tok)
+                bl = eb - sb
+                cands_sub = candidates[sb:eb]
+                seq_ids_sub = seq_ids_all[sb:eb]
+                rl_sub = eff_row_lengths[sb:eb]
+                safe_blk = jnp.maximum(cands_sub, 0)
+                page_in_seq = jnp.minimum(safe_blk // blocks_per_page, pages_per_seq - 1)
+                blk_in_page = safe_blk % blocks_per_page
+                phys_page = page_indices[
+                    seq_ids_sub[:, None] * pages_per_seq + page_in_seq
+                ]
+                phys_blk = (
+                    jnp.clip(phys_page, 0, total_num_pages - 1) * blocks_per_page
+                    + blk_in_page
+                )
+                kv_blks = kv_blks_flat[phys_blk]
+                kv_slots = (
+                    kv_blks.reshape(bl, cb // 8, 8, 8, kv_sublane_groups, kv_packing)
+                    .transpose(0, 1, 3, 2, 4, 5)
+                    .reshape(bl, cb * 8, kv_sublane_groups, kv_packing)
+                )
+                k_fp8 = lax.bitcast_convert_type(
+                    kv_slots[:, :, :kv_head_dim_groups, :].reshape(
+                        bl, cb * 8, head_dim
+                    ),
+                    jnp.float8_e4m3fn,
+                )
+                k_scale = lax.bitcast_convert_type(
+                    kv_slots[:, :, kv_head_dim_groups, 0], jnp.float8_e8m0fnu
+                ).astype(jnp.float32)
+                qk = jnp.einsum(
+                    "bhd,bmd->bhm",
+                    q[sb:eb],
+                    k_fp8,
+                    preferred_element_type=jnp.float32,
+                )
+                raw_scores = (
+                    jnp.sum(
+                        jnp.maximum(qk, 0.0)
+                        * prepared_indexer_weights[sb:eb, :, None],
+                        axis=1,
+                    )
+                    * k_scale
+                )
+                c_grid = cands_sub.reshape(bl, cb // 8, 1, 8)
+                tok_pos = (
+                    jnp.left_shift(c_grid, 3)
+                    + jnp.arange(8, dtype=jnp.int32)[None, None, :, None]
+                ).reshape(bl, cb * 8)
+                valid_slot = (
+                    jnp.broadcast_to(c_grid >= 0, (bl, cb // 8, 8, 8)).reshape(
+                        bl, cb * 8
+                    )
+                    & (tok_pos < rl_sub[:, None])
+                )
+                cand_scores_parts.append(
+                    jnp.where(valid_slot, raw_scores, -jnp.inf).astype(jnp.float32)
+                )
+            cand_scores = (
+                cand_scores_parts[0]
+                if len(cand_scores_parts) == 1
+                else jnp.concatenate(cand_scores_parts, axis=0)
+            )
+            topk_idxs.append(
+                sc_cand_pregathered_topk(
+                    cand_scores,
+                    cands_m,
+                    rl_m,
+                    k=k,
+                    scheduling_group_id=sc_group,
+                )
+            )
+        return jnp.concatenate(topk_idxs, axis=0)[:max_num_tokens, :k]
 
     group_base = reserve_scheduling_group_ids(num_chunks - 1) if num_chunks > 1 else 0
     chunk_starts = (
@@ -1063,8 +1168,13 @@ def streamindex_topk(
         sc2_group = None if m >= num_chunks - 2 else group_base + m + 1
         start = m * chunk_len
 
+        ordered_passes = (
+            (*passes[2:], *passes[:2])
+            if not need_smem_split and len(passes) == 3
+            else passes
+        )
         state = None
-        for slice_spec, pass_meta in passes:
+        for slice_spec, pass_meta in ordered_passes:
             if (
                 state is not None
                 and not need_smem_split

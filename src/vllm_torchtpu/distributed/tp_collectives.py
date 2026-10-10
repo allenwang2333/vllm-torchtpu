@@ -71,6 +71,23 @@ def tp_all_gather(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
         dim += x.ndim
     x_contig = x.contiguous()
     shape_tail = tuple(int(x_contig.size(i)) for i in range(1, x_contig.ndim))
+    if dim == 0 and shape_tail and shape_tail[-1] % 128 != 0:
+        pad_cols = 128 - (shape_tail[-1] % 128)
+        pad_zeros = torch.zeros(
+            (*x_contig.shape[:-1], pad_cols),
+            dtype=x_contig.dtype,
+            device=x_contig.device,
+        )
+        x_padded = torch.cat((x_contig, pad_zeros), dim=-1)
+        pad_tail = (*shape_tail[:-1], shape_tail[-1] + pad_cols)
+        out_padded = torch.empty_like(
+            x_padded.unsqueeze(0).expand(world_size, *((-1,) * x_padded.ndim)),
+            memory_format=torch.contiguous_format,
+        ).view(-1, *pad_tail)
+        torch.distributed.all_gather_into_tensor(
+            out_padded, x_padded, group=tp_group.device_group
+        )
+        return out_padded[..., : shape_tail[-1]].contiguous()
     output_tensor = torch.empty_like(
         x_contig.unsqueeze(0).expand(world_size, *((-1,) * x_contig.ndim)),
         memory_format=torch.contiguous_format,
@@ -117,3 +134,18 @@ def tp_reduce_scatter(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
         output_tensor, input_tensor, group=tp_group.device_group
     )
     return output_tensor.movedim(0, dim).contiguous()
+
+
+def tp_all_to_all(x: torch.Tensor) -> torch.Tensor:
+    tp_group = get_tp_group()
+    world_size = tp_group.world_size
+    if world_size == 1:
+        return x
+    x_contig = x.contiguous()
+    output_tensor = torch.empty_like(
+        x_contig, memory_format=torch.contiguous_format
+    )
+    torch.distributed.all_to_all_single(
+        output_tensor, x_contig, group=tp_group.device_group
+    )
+    return output_tensor

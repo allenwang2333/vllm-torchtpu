@@ -56,6 +56,11 @@ BITS_NEG_INF = int(np.array(-np.inf, np.float32).view(np.int32))
 KEY_NEG_INF = int(np.int32(BITS_NEG_INF) ^ np.int32(0x7FFFFFFF))
 
 
+def _get_sc_subcores() -> int:
+    sc = pltpu.get_tpu_info().sparse_core
+    return 32 if sc is None else sc.num_cores * sc.num_subcores
+
+
 def _cdiv(a, b):
     return (a + b - 1) // b
 
@@ -88,8 +93,9 @@ def _topk_body(
     # slot for slot with out_hbm, so the caller need not gather the scores back.
     del write_empty
 
-    num_subcores = 16
-    num_sc_cores = 2
+    sc = pltpu.get_tpu_info().sparse_core
+    num_subcores = 16 if sc is None else sc.num_subcores
+    num_sc_cores = 2 if sc is None else sc.num_cores
     core = lax.axis_index("core")
     sub = lax.axis_index("subcore")
     flat = core * num_subcores + sub
@@ -415,8 +421,9 @@ def _sc_topk_direct(
         else jax.lax.bitcast_convert_type(scores, jnp.int32)
     )
     slice_len = _align_to(n, LANES)
-    num_waves = _cdiv(b, 32)
-    padded_b = num_waves * 32
+    num_subcores = sc.num_cores * sc.num_subcores
+    num_waves = _cdiv(b, num_subcores)
+    padded_b = num_waves * num_subcores
     pad_b = padded_b - b
     pad_n = slice_len - n
     if pad_b > 0 or pad_n > 0:

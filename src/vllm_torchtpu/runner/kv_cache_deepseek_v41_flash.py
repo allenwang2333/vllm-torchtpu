@@ -170,17 +170,20 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
         self._validate_ds_v4_overlay(kv_cache_config, kv_caches)
 
         model = getattr(runner, "model", None)
-        if model is not None:
+        draft_model = getattr(getattr(runner, "drafter", None), "draft_model", None)
+        roots = [m for m in (model, draft_model) if m is not None]
+        if roots:
             init_caches: list[torch.Tensor] = []
-            for mod in model.modules():
-                if hasattr(mod, "ensure_cache"):
-                    swa = getattr(mod, "swa_cache_module", None)
-                    if swa is not None and swa.prefix in kv_caches:
-                        swa.kv_cache = kv_caches[swa.prefix]
-                    if mod.ensure_cache():
-                        init_caches.append(mod._cache)
-                if hasattr(mod, "_get_dummy_main_cache"):
-                    init_caches.append(mod._get_dummy_main_cache(runner.device))
+            for root in roots:
+                for mod in root.modules():
+                    if hasattr(mod, "ensure_cache"):
+                        swa = getattr(mod, "swa_cache_module", None)
+                        if swa is not None and swa.prefix in kv_caches:
+                            swa.kv_cache = kv_caches[swa.prefix]
+                        if mod.ensure_cache():
+                            init_caches.append(mod._cache)
+                    if hasattr(mod, "_get_dummy_main_cache"):
+                        init_caches.append(mod._get_dummy_main_cache(runner.device))
             if init_caches:
                 synchronize_tensors(init_caches)
 

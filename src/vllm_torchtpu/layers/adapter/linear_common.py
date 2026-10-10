@@ -81,7 +81,11 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
                 f"Input hidden dim {k_dim} must be divisible by block scale "
                 f"count {sharded_num_blocks}."
             )
-        return gmm_v2(
+        m_orig = x.shape[0]
+        m_pad = 64 if m_orig == 48 else ((m_orig + 7) & ~7)
+        if m_orig != m_pad:
+            x = jnp.pad(x, ((0, m_pad - m_orig), (0, 0)))
+        out = gmm_v2(
             lhs=x,
             rhs=w_q[None],  # [n_in, n_out] -> [1, n_in, n_out]
             group_sizes=jnp.array([x.shape[0]], dtype=jnp.int32),
@@ -91,7 +95,12 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
             maybe_quantize_lhs=True,
             zero_initialize=True,
         )
-    return xla_quantized_matmul(x, w_q, w_s)
+        return out[:m_orig] if m_orig != m_pad else out
+    m_orig = x.shape[0]
+    if m_orig % 8 != 0:
+        x = jnp.pad(x, ((0, ((m_orig + 7) & ~7) - m_orig), (0, 0)))
+    out = xla_quantized_matmul(x, w_q, w_s)
+    return out[:m_orig] if m_orig % 8 != 0 else out
 
 
 _quantized_matmul_kernel_op: Callable | None = None
@@ -149,6 +158,11 @@ def _prequant_matmul_jax(
     x_q: jax.Array, x_scale: jax.Array, w_q: jax.Array, w_s: jax.Array
 ) -> jax.Array:
     """FP8 dense matmul consuming pre-quantized `(x_q, x_scale)` on (k, n) weights."""
+    m_orig = x_q.shape[0]
+    if m_orig % 8 != 0:
+        pad_rows = ((m_orig + 7) & ~7) - m_orig
+        x_q = jnp.pad(x_q, ((0, pad_rows), (0, 0)))
+        x_scale = jnp.pad(x_scale, ((0, pad_rows), (0, 0)))
     out = jax.lax.dot_general(
         x_q,
         w_q,
@@ -157,14 +171,14 @@ def _prequant_matmul_jax(
     ).astype(jnp.float32)
     out *= x_scale
     out *= jnp.expand_dims(w_s, 0)
-    return out.astype(jnp.bfloat16)
+    out = out.astype(jnp.bfloat16)
+    return out[:m_orig] if m_orig % 8 != 0 else out
 
 
 _quantized_matmul_prequant_op: Callable | None = None
 _quantized_matmul_prequant_op_lock = Lock()
 
 
-@torch.compiler.disable
 def _init_quantized_matmul_prequant_op() -> Callable:
     global _quantized_matmul_prequant_op
     with _quantized_matmul_prequant_op_lock:
@@ -213,6 +227,214 @@ def quantized_matmul_prequant(
     x_q_2d = x_q.reshape(-1, x_q.shape[-1])
     x_scale_2d = x_scale.reshape(-1, 1)
     out_2d = _get_quantized_matmul_prequant_op()(x_q_2d, x_scale_2d, w_q, w_s)
+    return out_2d.reshape(orig_out_shape)
+
+
+def _exact_bf16(x: jax.Array) -> jax.Array:
+    """Preserve exact BF16 intermediate rounding inside a single XLA fusion."""
+    return jax.lax.bitcast_convert_type(
+        jax.lax.bitcast_convert_type(x.astype(jnp.bfloat16), jnp.uint16),
+        jnp.bfloat16,
+    )
+
+
+def _apply_mlp_act_exact(
+    gu: jax.Array, swiglu_limit: float | None = None
+) -> jax.Array:
+    """Bit-exact JAX match for PyTorch SiluAndMul / SiluAndMulWithClamp."""
+    half = gu.shape[-1] // 2
+    gate = gu[..., :half]
+    up = gu[..., half:]
+    if swiglu_limit is not None:
+        gate = _exact_bf16(jnp.clip(gate, max=swiglu_limit))
+        up = _exact_bf16(jnp.clip(up, min=-swiglu_limit, max=swiglu_limit))
+    silu_gate = _exact_bf16(
+        gate.astype(jnp.float32) * jax.nn.sigmoid(gate.astype(jnp.float32))
+    )
+    return _exact_bf16(silu_gate * up)
+
+
+def _quantized_mlp_jax(
+    x: jax.Array,
+    w_gu: jax.Array,
+    s_gu: jax.Array,
+    w_dn: jax.Array,
+    s_dn: jax.Array,
+    *,
+    swiglu_limit: float | None = None,
+) -> jax.Array:
+    """Fused bit-exact gate_up + SiluAndMul[WithClamp] + down quantized matmul."""
+    gu = _exact_bf16(_quantized_matmul_jax(x, w_gu, s_gu))
+    act = _apply_mlp_act_exact(gu, swiglu_limit)
+    return _quantized_matmul_jax(act, w_dn, s_dn)
+
+
+def _quantized_mlp_prequant_jax(
+    x_q: jax.Array,
+    x_scale: jax.Array,
+    w_gu: jax.Array,
+    s_gu: jax.Array,
+    w_dn: jax.Array,
+    s_dn: jax.Array,
+    *,
+    swiglu_limit: float | None = None,
+) -> jax.Array:
+    """Fused bit-exact prequant gate_up + SiluAndMul[WithClamp] + down matmul."""
+    gu = _exact_bf16(_prequant_matmul_jax(x_q, x_scale, w_gu, s_gu))
+    act = _apply_mlp_act_exact(gu, swiglu_limit)
+    return _quantized_matmul_jax(act, w_dn, s_dn)
+
+
+_quantized_mlp_ops: dict[float | None, Callable] = {}
+_quantized_mlp_ops_lock = Lock()
+_quantized_mlp_prequant_ops: dict[float | None, Callable] = {}
+_quantized_mlp_prequant_ops_lock = Lock()
+
+
+def _format_limit_tag(swiglu_limit: float | None) -> str:
+    if swiglu_limit is None:
+        return "none"
+    return str(swiglu_limit).replace(".", "p").replace("-", "m")
+
+
+def _init_quantized_mlp_op(swiglu_limit: float | None) -> Callable:
+    with _quantized_mlp_ops_lock:
+        op = _quantized_mlp_ops.get(swiglu_limit)
+        if op is not None:
+            return op
+
+        def _impl(
+            x: jax.Array,
+            w_gu: jax.Array,
+            s_gu: jax.Array,
+            w_dn: jax.Array,
+            s_dn: jax.Array,
+        ) -> jax.Array:
+            return _quantized_mlp_jax(
+                x, w_gu, s_gu, w_dn, s_dn, swiglu_limit=swiglu_limit
+            )
+
+        tag = _format_limit_tag(swiglu_limit)
+        op = pallas.jax_op(f"pallas::quantized_mlp_kernel_{tag}", _impl)
+
+        def _fake_quantized_mlp(
+            x: torch.Tensor,
+            w_gu: torch.Tensor,
+            s_gu: torch.Tensor,
+            w_dn: torch.Tensor,
+            s_dn: torch.Tensor,
+        ):
+            del w_gu, s_gu, s_dn
+            return torch.empty(
+                x.shape[0], w_dn.shape[-1], dtype=x.dtype, device=x.device
+            )
+
+        op.register_fake(_fake_quantized_mlp)
+        _quantized_mlp_ops[swiglu_limit] = op
+        return op
+
+
+def _get_quantized_mlp_op(swiglu_limit: float | None = None) -> Callable:
+    op = _quantized_mlp_ops.get(swiglu_limit)
+    if op is not None:
+        return op
+    return _init_quantized_mlp_op(swiglu_limit)
+
+
+def _init_quantized_mlp_prequant_op(swiglu_limit: float | None) -> Callable:
+    with _quantized_mlp_prequant_ops_lock:
+        op = _quantized_mlp_prequant_ops.get(swiglu_limit)
+        if op is not None:
+            return op
+
+        def _impl(
+            x_q: jax.Array,
+            x_scale: jax.Array,
+            w_gu: jax.Array,
+            s_gu: jax.Array,
+            w_dn: jax.Array,
+            s_dn: jax.Array,
+        ) -> jax.Array:
+            return _quantized_mlp_prequant_jax(
+                x_q,
+                x_scale,
+                w_gu,
+                s_gu,
+                w_dn,
+                s_dn,
+                swiglu_limit=swiglu_limit,
+            )
+
+        tag = _format_limit_tag(swiglu_limit)
+        op = pallas.jax_op(f"pallas::quantized_mlp_prequant_kernel_{tag}", _impl)
+
+        def _fake_quantized_mlp_prequant(
+            x_q: torch.Tensor,
+            x_scale: torch.Tensor,
+            w_gu: torch.Tensor,
+            s_gu: torch.Tensor,
+            w_dn: torch.Tensor,
+            s_dn: torch.Tensor,
+        ):
+            del x_scale, w_gu, s_gu, s_dn
+            return torch.empty(
+                x_q.shape[0],
+                w_dn.shape[-1],
+                dtype=torch.bfloat16,
+                device=x_q.device,
+            )
+
+        op.register_fake(_fake_quantized_mlp_prequant)
+        _quantized_mlp_prequant_ops[swiglu_limit] = op
+        return op
+
+
+_init_quantized_matmul_prequant_op()
+for _default_lim in (None, 7.0, 20.0):
+    _init_quantized_mlp_op(_default_lim)
+    _init_quantized_mlp_prequant_op(_default_lim)
+
+
+def _get_quantized_mlp_prequant_op(swiglu_limit: float | None = None) -> Callable:
+    op = _quantized_mlp_prequant_ops.get(swiglu_limit)
+    if op is not None:
+        return op
+    return _init_quantized_mlp_prequant_op(swiglu_limit)
+
+
+def quantized_mlp(
+    x: torch.Tensor,
+    w_gu: torch.Tensor,
+    s_gu: torch.Tensor,
+    w_dn: torch.Tensor,
+    s_dn: torch.Tensor,
+    *,
+    swiglu_limit: float | None = None,
+) -> torch.Tensor:
+    """Torch entry point for fused gate_up + SiluAndMul[WithClamp] + down."""
+    orig_out_shape = (*x.shape[:-1], w_dn.shape[-1])
+    x_2d = x.reshape(-1, x.shape[-1])
+    out_2d = _get_quantized_mlp_op(swiglu_limit)(x_2d, w_gu, s_gu, w_dn, s_dn)
+    return out_2d.reshape(orig_out_shape)
+
+
+def quantized_mlp_prequant(
+    x_q: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_gu: torch.Tensor,
+    s_gu: torch.Tensor,
+    w_dn: torch.Tensor,
+    s_dn: torch.Tensor,
+    *,
+    swiglu_limit: float | None = None,
+) -> torch.Tensor:
+    """Torch entry point for fused prequant gate_up + SiluAndMul[WithClamp] + down."""
+    orig_out_shape = (*x_q.shape[:-1], w_dn.shape[-1])
+    x_q_2d = x_q.reshape(-1, x_q.shape[-1])
+    x_scale_2d = x_scale.reshape(-1, 1)
+    out_2d = _get_quantized_mlp_prequant_op(swiglu_limit)(
+        x_q_2d, x_scale_2d, w_gu, s_gu, w_dn, s_dn
+    )
     return out_2d.reshape(orig_out_shape)
 
 
@@ -434,3 +656,9 @@ def get_model_matmul_fusion_assignment(
 ):
     key = (model_name, batch_size, tp_size, layer_name)
     return MODEL_MATMUL_FUSION_TRUTH_TABLE.get(key, True)
+
+_get_quantized_matmul_op()
+_init_quantized_matmul_prequant_op()
+for _preload_lim in (None, 7.0, 20.0):
+    _init_quantized_mlp_op(_preload_lim)
+    _init_quantized_mlp_prequant_op(_preload_lim)
