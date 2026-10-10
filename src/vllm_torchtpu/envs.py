@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 1
     TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 16
+    TPU_DCP_MLA_MASK_IN_KERNEL: bool = False
+    TPU_DCP_MLA_FUSED_PREP: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -455,6 +457,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel default (unchanged); 32 also puts the 32-token MTP decode bucket
     # (5-8 running requests x 4 tokens) on that path. 0 disables it.
     "TPU_DCP_MLA_SMALL_CHUNK_TOKENS": env_int("TPU_DCP_MLA_SMALL_CHUNK_TOKENS", 16),
+    # DCP sparse MLA, decode buckets (<= 32 tokens): drop the per-layer
+    # owns mask / dummy key / lse select glue. The kernel takes each token's
+    # true kv_len (0 = this rank owns none of its top-k), attends nothing for
+    # such a token (finite out = 0) and writes its lse as -inf itself.
+    # Same merge result; also removes the NaN a dummy key read from an
+    # unwritten slot could put into an empty row's partial output.
+    "TPU_DCP_MLA_MASK_IN_KERNEL": env_bool(
+        "TPU_DCP_MLA_MASK_IN_KERNEL", default=False
+    ),
+    # With TPU_DCP_MLA_MASK_IN_KERNEL, decode buckets: build the capped
+    # window indices, the live-window bound and the SparseCore gather's
+    # live-count vector in ONE TensorCore Pallas call
+    # (`prepare_capped_window_fused`), handing the indices to the gather
+    # flat (a bitcast, no relayout copies). Same gathered rows.
+    "TPU_DCP_MLA_FUSED_PREP": env_bool("TPU_DCP_MLA_FUSED_PREP", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
