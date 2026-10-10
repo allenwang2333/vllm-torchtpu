@@ -122,12 +122,9 @@ steps:
       # own chips rather than serializing behind everything else; the general
       # steps exclude the file so it is not run twice.
       #
-      # Split by example, with each step's -m filter in PYTEST_ADDOPTS (see
-      # x-tests-plugin-defaults) so bktec plans over the tests that step
-      # runs. By file, a file's recorded duration includes its tests other
-      # steps run (multichip, nightly), so General's shards came out at
-      # 16/58/66 min. The cost is that a file sharing one engine across its
-      # tests starts it in each shard it lands in.
+      # Split by file, so a file that shares one engine across its tests starts
+      # it in one shard only. bktec's split-by-example would not change that
+      # here: it only divides files it considers slow.
       - label: ":kubernetes: Unit Tests - General (PR)"
         key: "unit_tests_general_pr"
         <<: *tpu_step
@@ -140,7 +137,6 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              split-by-example: true
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
 
       - label: ":kubernetes: Unit Tests - Multichip (PR)"
@@ -155,7 +151,6 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              split-by-example: true
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
 
       # Representative correctness cases run on PRs; the full parameter matrix
@@ -273,7 +268,6 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              split-by-example: true
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
 
       - label: ":kubernetes: Unit Tests - Multichip (Nightly)"
@@ -288,7 +282,6 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              split-by-example: true
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
 
       - label: ":kubernetes: Unit Tests - Omni (Nightly)"

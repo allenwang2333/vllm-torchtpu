@@ -87,13 +87,11 @@ steps:
       # its own agents instead of serializing behind everything else. The
       # general steps exclude the file to avoid running it twice.
       #
-      # General and Multichip split by example, with each step's -m filter in
-      # PYTEST_ADDOPTS (see x-tests-plugin-defaults) so bktec plans over the
-      # tests that step runs. By file, a file's recorded duration includes its
-      # tests other steps run (multichip, nightly), which left shards badly
-      # uneven. The cost is that a file sharing one engine across its tests
-      # (module-scoped fixtures, the Qwen2.5-VL engines in
-      # test_multi_modal_inference.py) starts it in each shard it lands in.
+      # bktec splits General and Multichip by file, so a file that shares one
+      # engine across its tests (module-scoped fixtures, the Qwen2.5-VL engines
+      # in test_multi_modal_inference.py) starts it in one shard only. Its
+      # split-by-example would not change that here: it only divides files it
+      # considers slow.
       - label: "Unit Tests - General (PR)"
         key: "unit_tests_general_pr"
         <<: *unit_test_defaults
@@ -106,7 +104,6 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              split-by-example: true
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
 
       - label: "Unit Tests - Multichip (PR)"
@@ -121,7 +118,6 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              split-by-example: true
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
 
       # Representative correctness cases run on PRs; the full parameter
@@ -229,7 +225,6 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              split-by-example: true
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
 
       - label: "Unit Tests - Multichip (Nightly)"
@@ -244,7 +239,6 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              split-by-example: true
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
 
       # Omni multimodal and diffusion models on TPU.
