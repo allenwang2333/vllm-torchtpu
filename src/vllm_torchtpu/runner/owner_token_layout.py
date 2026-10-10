@@ -90,18 +90,18 @@ def build_owner_token_layout(
             aligned bucket.
     """
     owners = (
-        owners
+        owners.astype(np.int32, copy=True)
         if isinstance(owners, np.ndarray)
         and owners.ndim == 1
         and np.issubdtype(owners.dtype, np.integer)
-        else np.asarray(owners, dtype=np.int64)
+        else np.asarray(owners, dtype=np.int32).copy()
     )
     tokens = (
-        num_scheduled_tokens
+        num_scheduled_tokens.astype(np.int32, copy=False)
         if isinstance(num_scheduled_tokens, np.ndarray)
         and num_scheduled_tokens.ndim == 1
         and np.issubdtype(num_scheduled_tokens.dtype, np.integer)
-        else np.asarray(num_scheduled_tokens, dtype=np.int64)
+        else np.asarray(num_scheduled_tokens, dtype=np.int32)
     )
     if owners.ndim != 1 or owners.shape != tokens.shape:
         raise ValueError(
@@ -114,11 +114,14 @@ def build_owner_token_layout(
             "must be positive"
         )
     num_reqs = owners.size
-    if num_reqs and (owners.min() < 0 or owners.max() >= tp_size):
+    if not num_reqs:
+        raise ValueError("The step has no scheduled tokens")
+    if int(owners.min()) < 0 or int(owners.max()) >= tp_size:
         raise ValueError(f"Owners must be in [0, {tp_size}): {owners}")
-    if num_reqs and tokens.min() < 0:
+    if int(tokens.min()) < 0:
         raise ValueError(f"Token counts must be non-negative: {tokens}")
-    total = int(tokens.sum())
+    batch_ends = np.cumsum(tokens, dtype=np.int32)
+    total = int(batch_ends[-1])
     if total < 1:
         raise ValueError("The step has no scheduled tokens")
     reqs_padded = num_reqs if num_reqs_padded is None else num_reqs_padded
@@ -129,12 +132,10 @@ def build_owner_token_layout(
 
     # Row o: exclusive prefix sums of owner o's token counts, in batch order.
     request_ids = np.arange(num_reqs, dtype=np.int32)
-    per_owner = np.zeros((tp_size, num_reqs), dtype=np.int32)
-    per_owner[owners, request_ids] = tokens
     query_start_loc = np.zeros((tp_size, reqs_padded + 1), dtype=np.int32)
-    np.cumsum(
-        per_owner, axis=1, dtype=np.int32, out=query_start_loc[:, 1 : num_reqs + 1]
-    )
+    q_active = query_start_loc[:, 1 : num_reqs + 1]
+    q_active[owners, request_ids] = tokens
+    np.cumsum(q_active, axis=1, dtype=np.int32, out=q_active)
     query_start_loc[:, num_reqs + 1 :] = query_start_loc[:, num_reqs, None]
     owner_tokens = query_start_loc[:, num_reqs]
 
@@ -154,27 +155,28 @@ def build_owner_token_layout(
         )
 
     # Request i starts at row owner * segment + (its start within the segment).
-    request_rows = owners * segment + query_start_loc[owners, request_ids]
-    token_request = np.repeat(request_ids, tokens)
-    batch_starts = np.cumsum(tokens) - tokens
-    rows = request_rows[token_request] + (
-        np.arange(total) - batch_starts[token_request]
+    token_idx = np.arange(total, dtype=np.int32)
+    request_offsets = (
+        owners * segment + query_start_loc[owners, request_ids] - (batch_ends - tokens)
     )
-    used = np.zeros(padded, dtype=bool)
-    used[rows] = True
-    pad_rows = np.flatnonzero(~used)
-
-    perm = np.empty(padded, dtype=np.int32)
-    perm[rows] = np.arange(total, dtype=np.int32)
-    # Pair padding rows with padding tokens. When their counts differ, repeat
-    # them; with none, use row/token 0. Either way the pairs are never read
-    # back, as padding is outside every request of every segment.
-    perm[pad_rows] = np.resize(
-        np.arange(total, padded_batch, dtype=np.int32), pad_rows.size
-    )
-    inv = np.empty(padded_batch, dtype=np.int32)
-    inv[:total] = rows
-    inv[total:] = np.resize(pad_rows, padded_batch - total)
+    rows = np.repeat(request_offsets, tokens) + token_idx
+    perm = np.zeros(padded, dtype=np.int32)
+    perm[rows] = token_idx
+    if padded_batch == total:
+        inv = rows
+    else:
+        used = np.zeros(padded, dtype=bool)
+        used[rows] = True
+        pad_rows = np.flatnonzero(~used)
+        # Pair padding rows with padding tokens. When their counts differ,
+        # repeat them; with none, use row/token 0. Either way the pairs are
+        # never read back, as padding is outside every request of every segment.
+        perm[pad_rows] = np.resize(
+            np.arange(total, padded_batch, dtype=np.int32), pad_rows.size
+        )
+        inv = np.empty(padded_batch, dtype=np.int32)
+        inv[:total] = rows
+        inv[total:] = np.resize(pad_rows, padded_batch - total)
     return OwnerTokenLayout(
         padded_tokens=padded,
         segment_tokens=segment,
@@ -182,7 +184,7 @@ def build_owner_token_layout(
         inv=inv,
         query_start_loc=query_start_loc,
         owner_tokens=owner_tokens.copy(),
-        owners=owners.astype(np.int32, copy=True),
+        owners=owners,
     )
 
 
@@ -343,16 +345,12 @@ def owner_layout_tensors(
     """Convert ``layout`` into ``(owner_perm, owner_inv, owner_q_loc)`` int32
     tensors with padding rows/tokens masked to ``-1``."""
     target_device = torch.device("cpu") if device is None else torch.device(device)
-    valid_perm = (
-        np.arange(layout.segment_tokens, dtype=np.int32)[None, :]
-        < layout.owner_tokens[:, None]
-    ).reshape(-1)
-    perm_np = np.empty(layout.padded_tokens, dtype=np.int32)
-    np.copyto(perm_np, layout.perm)
-    perm_np[~valid_perm] = -1
     total_real = int(layout.owner_tokens.sum())
-    inv_np = np.empty(layout.inv.shape[0], dtype=np.int32)
-    inv_np[:total_real] = layout.inv[:total_real]
+    perm_np = layout.perm.astype(np.int32, copy=True)
+    perm_2d = perm_np.reshape(-1, layout.segment_tokens)
+    for owner_idx, count in enumerate(layout.owner_tokens.tolist()):
+        perm_2d[owner_idx, count:] = -1
+    inv_np = layout.inv.astype(np.int32, copy=True)
     inv_np[total_real:] = -1
     q_loc_np = np.ascontiguousarray(layout.query_start_loc, dtype=np.int32)
     perm = torch.from_numpy(perm_np).to(device=target_device, non_blocking=True)
