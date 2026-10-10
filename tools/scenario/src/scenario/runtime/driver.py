@@ -20,7 +20,8 @@ wait on a driver elsewhere come with the driver status endpoint.
 Tasks run in the Plan's order. A failed task does not stop the next one; a
 dead server does (exit 5), and so does a custom task's skip_rest_if_exit_ge.
 SIGTERM or SIGINT stops every child (20 s, then SIGKILL) and exits 143 or
-130 without after-tasks.
+130 without after-tasks. Otherwise, after teardown, the target's end
+after-tasks run, and a fatal one that fails turns exit 0 into 6.
 """
 
 import datetime
@@ -66,6 +67,7 @@ from scenario.runtime.placement import (
     place,
 )
 from scenario.runtime.proc import Proc
+from scenario.runtime.publish import Publisher
 from scenario.target import TargetData, TargetInfo
 
 Mode = Literal["run", "up", "url"]
@@ -172,6 +174,7 @@ class Driver:
         self.summary: results.Summary | None = None
         self.server: Proc | None = None
         self.liveness: Liveness = Liveness()
+        self.publisher: Publisher | None = None
 
     def run(self) -> int:
         code = exits.OK
@@ -282,6 +285,18 @@ class Driver:
                 env, host, self.refs
             )
             self.host_added = {"scenario env": scenario_env, "tool env": tool_env}
+        self.task_added = self.refs.env(plan.driver.task_env)
+        self.publisher = Publisher(
+            self.target.after_tasks,
+            run_dir=self.run_dir,
+            image=self.image,
+            run_stamp=timestamp,
+            experiment=bool(plan.experiment),
+            env={**self.host_env, **self.task_added},
+            cwd=options.repo_root,
+            log=self.log,
+            summary=self.summary,
+        )
         self.log.phase("placement")
         self.summary.phase("placement")
 
@@ -363,18 +378,18 @@ class Driver:
 
     def _context(self) -> TaskContext:
         assert self.summary is not None
-        added = self.refs.env(self.plan.driver.task_env)
         return TaskContext(
             plan=self.plan,
             run_dir=self.run_dir,
             refs=self.refs,
-            env={**self.host_env, **added},
-            added=added,
+            env={**self.host_env, **self.task_added},
+            added=self.task_added,
             cwd=self.options.repo_root,
             log=self.log,
             summary=self.summary,
             liveness=self.liveness,
             lm_eval_cache=self.options.lm_eval_cache or self.target.lm_eval_cache_root,
+            publisher=self.publisher,
         )
 
     def _tasks(self) -> int:
@@ -436,7 +451,17 @@ class Driver:
         self.server.stop()
 
     def _end(self, code: int) -> int:
-        """Work after teardown, on normal and failure exits alike."""
+        """The target's end after-tasks, on normal and failure exits alike.
+
+        The summary says done first, so the files they hand on are final.
+        """
+        assert self.summary is not None
+        self.summary.set(state="done", exit=code)
+        if self.publisher is None:
+            return code
+        self.publisher.end()
+        if self.publisher.fatal_failed:
+            code = exits.worst(code, exits.AFTER_TASK)
         return code
 
     def _finish(self, code: int, aborted: bool) -> None:
