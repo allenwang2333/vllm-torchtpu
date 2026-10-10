@@ -65,6 +65,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
 )
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -402,6 +403,35 @@ def register_score_bias_buffer(layer) -> torch.Tensor | None:
     staged = bias.detach().to(torch.float32).contiguous()
     layer.register_buffer(FUSED_MOE_EP_SCORE_BIAS_ATTR, staged, persistent=False)
     return staged
+
+
+def register_fused_scale_buffers(layer) -> None:
+    """Stage the [E, K/block, N] expert scales the op reads, once, as copies.
+
+    `squeeze(2).contiguous()` does not do this: dropping a size-1 axis leaves
+    the tensor contiguous, so it returns a view of the 4-D parameter. A view
+    has no device layout for torch_tpu to pin when it compiles the forward,
+    so every forward re-materialized both views with an eager `as_strided`
+    program per layer -- ~3 ms of device idle per step on DeepSeek-V4. The
+    copies are synchronized here so they have a layout by the time the
+    forward compiles. The 4-D parameters become views of the copies so the
+    scales are not held in HBM twice; an armed layer's forward never reads
+    them.
+    """
+    staged = []
+    for param_name, buffer_name in (
+        ("w13_weight_scale", "_tpu_fused_w13_scale"),
+        ("w2_weight_scale", "_tpu_fused_w2_scale"),
+    ):
+        scale = getattr(layer, param_name).detach().squeeze(2).clone()
+        layer.register_buffer(buffer_name, scale, persistent=False)
+        setattr(
+            layer,
+            param_name,
+            torch.nn.Parameter(scale.unsqueeze(2), requires_grad=False),
+        )
+        staged.append(scale)
+    synchronize_tensors(staged)
 
 
 def score_bias_operand(layer) -> torch.Tensor | None:
