@@ -208,14 +208,12 @@ def _build_op(
     )
 
     def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
-        w1s = w1_scale.squeeze(-2) if w1_scale.ndim == 4 else w1_scale
-        w2s = w2_scale.squeeze(-2) if w2_scale.ndim == 4 else w2_scale
         return fused_ep_moe_v2(
             x,
             w1,
             w2,
-            w1s,
-            w2s,
+            w1_scale,
+            w2_scale,
             gating.astype(jnp.float32),
             rank=rank,
             topk=topk,
@@ -393,14 +391,12 @@ def _build_op(
             )
 
         def _run_v2(x_s, ids_s, w_s):
-            w1s = w1_scale.squeeze(-2) if w1_scale.ndim == 4 else w1_scale
-            w2s = w2_scale.squeeze(-2) if w2_scale.ndim == 4 else w2_scale
             return fused_ep_moe_v2(
                 x_s,
                 w1,
                 w2,
-                w1s,
-                w2s,
+                w1_scale,
+                w2_scale,
                 None,
                 rank=rank,
                 topk=topk,
