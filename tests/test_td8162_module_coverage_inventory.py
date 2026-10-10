@@ -36,9 +36,9 @@ SUBSYSTEM_COVERAGE_INVENTORY: dict[str, tuple[int, int, int, str]] = {
     "compilation": (5, 463, 132, "TD8.80 / TD8.147 / TD8.157 / TD8.163"),
     "core": (
         6,
-        811,
-        264,
-        "TD8.88 / TD8.120 / TD8.147 / TD8.157 / TD8.163 / TD8.178",
+        813,
+        262,
+        "TD8.88 / TD8.120 / TD8.147 / TD8.157 / TD8.163 / TD8.178 / TD8.212",
     ),
     "distributed": (31, 7003, 2576, "TD8.90 / TD8.93 / TD8.109 / TD8.143 / TD8.145"),
     "executors": (5, 623, 220, "TD8.74 / TD8.90 / TD8.146 / TD8.160 / TD8.163"),
@@ -87,10 +87,10 @@ SUBSYSTEM_COVERAGE_INVENTORY: dict[str, tuple[int, int, int, str]] = {
     "platforms": (5, 806, 270, "TD8.83 / TD8.122 / TD8.146 / TD8.152 / TD8.157"),
     "runner": (
         13,
-        5492,
-        2030,
+        5508,
+        2032,
         "TD8.83 / TD8.105 / TD8.130 / TD8.160 / TD8.163 / TD8.165 / TD8.195"
-        " / TD8.198 / TD8.207 / TD8.213",
+        " / TD8.198 / TD8.207 / TD8.212 / TD8.213",
     ),
     "spec_decode": (
         7,

@@ -2330,6 +2330,14 @@ class TPUModelRunner(GPUModelRunner):
             cached_prefix = getattr(self, "_last_async_seq_idx_prefix", None)
             if cached_prefix is not None and len(cached_prefix) == num_reqs:
                 pos_arr = cached_prefix
+                pos_bytes = (
+                    getattr(self, "_last_async_seq_idx_bytes", None)
+                    or pos_arr.tobytes()
+                )
+                sched_bytes = (
+                    getattr(self, "_last_sched_tokens_bytes", None)
+                    or num_scheduled_tokens_per_req.tobytes()
+                )
             else:
                 get_req_idx = self._pre_async_results.req_id_to_index_copy.get
                 req_ids = self.input_batch.req_ids
@@ -2341,6 +2349,11 @@ class TPUModelRunner(GPUModelRunner):
                     dtype=np.int32,
                     count=num_reqs,
                 )
+                pos_bytes = pos_arr.tobytes()
+                sched_bytes = num_scheduled_tokens_per_req.tobytes()
+            subst_idx_key = (stride, pos_bytes, sched_bytes)
+            if getattr(self, "_cached_async_subst_idx_key", None) == subst_idx_key:
+                return self._cached_async_subst_idx_pair
             valid_reqs = pos_arr >= 0
             if not valid_reqs.any():
                 return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
@@ -2376,7 +2389,10 @@ class TPUModelRunner(GPUModelRunner):
                         np.repeat(pos_arr * stride, num_scheduled_tokens_per_req)
                         + offsets
                     )
-                return cur_indices, pre_indices.astype(np.int32, copy=False)
+                res = cur_indices, pre_indices.astype(np.int32, copy=False)
+                self._cached_async_subst_idx_key = subst_idx_key
+                self._cached_async_subst_idx_pair = res
+                return res
 
         for i in range(num_reqs):
             req_id = self.input_batch.req_ids[start_index + i]
@@ -3173,9 +3189,9 @@ class TPUModelRunner(GPUModelRunner):
         # Get the number of scheduled tokens for each request.
         most_model_len = self.most_model_len
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        req_ids = cast(list[str], self.input_batch.req_ids)
         num_scheduled_tokens_per_req = [
-            num_scheduled_tokens[cast(str, req_id)]
-            for req_id in self.input_batch.req_ids[start_index:num_reqs]
+            num_scheduled_tokens[req_id] for req_id in req_ids[start_index:num_reqs]
         ]
         use_max_model_len = (
             most_model_len is None or max(num_scheduled_tokens_per_req) > most_model_len
@@ -3200,9 +3216,11 @@ class TPUModelRunner(GPUModelRunner):
         max_num_scheduled_tokens_all_reqs = max(num_scheduled_tokens_per_req)
         total_num_scheduled_tokens = sum(num_scheduled_tokens_per_req)
         num_reqs = len(num_scheduled_tokens_per_req)
+        chunk_req_ids = req_ids[start_index:end_index]
         num_scheduled_tokens_per_req = np.fromiter(
             num_scheduled_tokens_per_req, dtype=np.int32, count=num_reqs
         )
+        sched_tokens_bytes = num_scheduled_tokens_per_req.tobytes()
         assert max_num_scheduled_tokens_all_reqs > 0
 
         sequence_layout_planner = _get_sequence_layout_planner_for_runner(self)
@@ -3314,11 +3332,10 @@ class TPUModelRunner(GPUModelRunner):
         # requests have zero length instead of a negative q_len.
         self.query_start_loc_np[num_reqs + 1 :] = self.query_start_loc_np[num_reqs]
 
-        self.seq_lens_np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[
-                start_index : start_index + num_reqs
-            ]
-            + num_scheduled_tokens_per_req
+        np.add(
+            self.input_batch.num_computed_tokens_cpu[start_index:end_index],
+            num_scheduled_tokens_per_req,
+            out=self.seq_lens_np[:num_reqs],
         )
         self._check_attention_schedule(
             num_reqs,
@@ -3409,6 +3426,8 @@ class TPUModelRunner(GPUModelRunner):
         # draft from the previous step assumed accepted). Subtract the real
         # per-request rejected count on-device, keyed by req position.
         self._last_async_seq_idx_prefix = None
+        self._last_async_seq_idx_bytes = None
+        self._last_sched_tokens_bytes = sched_tokens_bytes
         if (
             self.scheduler_config.async_scheduling
             and self.speculative_config
@@ -3416,18 +3435,19 @@ class TPUModelRunner(GPUModelRunner):
             and self._pre_async_results.spec_decode_num_rejected_tokens is not None
         ):
             get_req_idx = self._pre_async_results.req_id_to_index_copy.get
-            req_ids = self.input_batch.req_ids
             seq_idx_prefix = np.fromiter(
-                (get_req_idx(req_ids[start_index + i], -1) for i in range(num_reqs)),
+                (get_req_idx(req_id, -1) for req_id in chunk_req_ids),
                 dtype=np.int32,
                 count=num_reqs,
             )
+            seq_idx_bytes = seq_idx_prefix.tobytes()
             self._last_async_seq_idx_prefix = seq_idx_prefix
+            self._last_async_seq_idx_bytes = seq_idx_bytes
             reject_subtract_key = (
                 target_num_reqs,
                 padded_total_num_scheduled_tokens,
-                seq_idx_prefix.tobytes(),
-                num_scheduled_tokens_per_req.tobytes(),
+                seq_idx_bytes,
+                sched_tokens_bytes,
             )
             if (
                 getattr(self, "_cached_reject_subtract_key", None)
@@ -3483,12 +3503,7 @@ class TPUModelRunner(GPUModelRunner):
             if sched_spec_tokens:
                 get_spec = sched_spec_tokens.get
                 num_draft_tokens = np.fromiter(
-                    (
-                        len(get_spec(req_id, ()))
-                        for req_id in self.input_batch.req_ids[
-                            start_index : start_index + num_reqs
-                        ]
-                    ),
+                    (len(get_spec(req_id, ())) for req_id in chunk_req_ids),
                     dtype=np.int32,
                     count=num_reqs,
                 )
@@ -3515,7 +3530,7 @@ class TPUModelRunner(GPUModelRunner):
             layout_plan.descriptor.cache_key,
             None
             if spec_decode_metadata is None
-            else (chunk_num_decode, num_scheduled_tokens_per_req.tobytes()),
+            else (chunk_num_decode, sched_tokens_bytes),
         )
 
         # Default decode layouts keep logits_indices stable for a fixed
@@ -3661,9 +3676,7 @@ class TPUModelRunner(GPUModelRunner):
                     start_index,
                     num_reqs,
                     target_num_reqs,
-                    tuple(
-                        self.input_batch.req_ids[start_index : start_index + num_reqs]
-                    ),
+                    tuple(chunk_req_ids),
                     tuple(replay_starts.items()),
                 )
                 if getattr(self, "_cached_replay_starts_key", None) == replay_key:

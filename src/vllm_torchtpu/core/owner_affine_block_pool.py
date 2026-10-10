@@ -303,13 +303,8 @@ class RegionFreeQueue(FreeKVCacheBlockQueue):
         self.queues = [FreeKVCacheBlockQueue(blocks) for blocks in region_blocks]
         self.num_free_blocks = sum(len(blocks) for blocks in region_blocks)
 
-    def scoped_region(self) -> int | None:
-        if _IN_REPLICATED.get():
-            return self._num_owners
-        return _CURRENT_OWNER.get()
-
     def scoped_queue(self) -> FreeKVCacheBlockQueue:
-        region = self.scoped_region()
+        region = self._num_owners if _IN_REPLICATED.get() else _CURRENT_OWNER.get()
         if region is None:
             raise RuntimeError(
                 "KV blocks were requested outside an owner scope. With "
@@ -428,11 +423,11 @@ class OwnerAffineBlockPool(BlockPool):
         return self._step_owner_budget[owner]
 
     def record_step_tokens(self, request_id: str, owner: int, num_tokens: int) -> None:
-        if self._step_owner_budget is not None and num_tokens > 0:
-            self._step_owner_budget[owner] -= num_tokens
-            self._step_req_tokens[request_id] = (
-                self._step_req_tokens.get(request_id, 0) + num_tokens
-            )
+        step_budget = self._step_owner_budget
+        if step_budget is not None and num_tokens > 0:
+            step_budget[owner] -= num_tokens
+            step_req = self._step_req_tokens
+            step_req[request_id] = step_req.get(request_id, 0) + num_tokens
 
     def get_num_free_blocks(self) -> int:
         if _IN_REPLICATED.get():
@@ -568,11 +563,13 @@ def _count_as_replicated(
 def _check_replicated(
     method: Callable[..., int], pool: OwnerAffineBlockPool
 ) -> Callable[..., int]:
+    replicated_queue = pool._replicated_queue
+
     @functools.wraps(method)
     def get_num_blocks_to_allocate(*args: Any, **kwargs: Any) -> int:
         pool.pending_replicated_blocks = 0
         num_blocks = method(*args, **kwargs)
-        if pool.pending_replicated_blocks > pool.num_free_replicated_blocks:
+        if pool.pending_replicated_blocks > replicated_queue.num_free_blocks:
             # More than any free count, so the request does not fit.
             return pool.num_gpu_blocks
         return num_blocks
@@ -681,12 +678,12 @@ def _steer_preemption(scheduler: Any) -> None:
     ):
         orig_schedule = scheduler.schedule
         orig_reserve = scheduler._reserve_prefill_lookahead
+        num_owners = pool.layout.num_owners
+        request_owner = pool._request_owner
 
         @functools.wraps(orig_schedule)
         def budgeted_schedule(*args: Any, **kwargs: Any) -> Any:
-            per_owner = max(
-                1, scheduler.max_num_scheduled_tokens // pool.layout.num_owners
-            )
+            per_owner = max(1, scheduler.max_num_scheduled_tokens // num_owners)
             pool.begin_step(per_owner)
             try:
                 return orig_schedule(*args, **kwargs)
@@ -697,12 +694,17 @@ def _steer_preemption(scheduler: Any) -> None:
         def budgeted_reserve_prefill_lookahead(
             request: Request, num_computed_tokens: int, num_new_tokens: int
         ) -> int:
-            owner = pool._request_owner.get(request.request_id)
+            step_budget = pool._step_owner_budget
+            owner = request_owner.get(request.request_id)
             if owner is not None:
-                owner_budget = pool.step_owner_budget(owner)
+                owner_budget = step_budget[owner] if step_budget is not None else None
             else:
                 best = pool.best_owner_candidate()
-                owner_budget = pool.step_owner_budget(best) if best is not None else 0
+                owner_budget = (
+                    (step_budget[best] if step_budget is not None else None)
+                    if best is not None
+                    else 0
+                )
             if owner_budget is not None and num_new_tokens > owner_budget:
                 if (
                     num_new_tokens > 1

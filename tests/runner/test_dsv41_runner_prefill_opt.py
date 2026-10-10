@@ -883,3 +883,39 @@ def test_replay_starts_and_owner_token_layout_step_caches(monkeypatch):
     meta = SimpleNamespace(query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32))
     layout = attach_step_owner_token_layout(kv_runner, {"l0": meta})
     assert layout is not None
+
+    # 9. _prepare_async_token_substitution_indices memoization hit & miss
+    async_runner = SimpleNamespace(
+        _pre_async_results=SimpleNamespace(
+            req_id_to_index_copy={"req-0": 0, "req-1": 1},
+            spec_decode_num_rejected_tokens=object(),
+        ),
+        speculative_config=SimpleNamespace(num_speculative_tokens=5),
+        _last_sequence_layout_plan=None,
+        input_batch=SimpleNamespace(req_ids=["req-0", "req-1"]),
+        arange_np=np.arange(64, dtype=np.int32),
+    )
+    sched_arr = np.array([6, 6], dtype=np.int32)
+    pair1 = TPUModelRunner._prepare_async_token_substitution_indices(
+        async_runner, 0, 2, sched_arr
+    )
+    pair2 = TPUModelRunner._prepare_async_token_substitution_indices(
+        async_runner, 0, 2, sched_arr
+    )
+    assert pair1 is pair2
+    assert pair1[0].tolist() == list(range(12))
+    assert pair1[1].tolist() == list(range(12))
+
+    # Also verify via _last_async_seq_idx_prefix / _last_async_seq_idx_bytes
+    pos_prefix = np.array([1, 0], dtype=np.int32)
+    async_runner._last_async_seq_idx_prefix = pos_prefix
+    async_runner._last_async_seq_idx_bytes = pos_prefix.tobytes()
+    async_runner._last_sched_tokens_bytes = sched_arr.tobytes()
+    pair3 = TPUModelRunner._prepare_async_token_substitution_indices(
+        async_runner, 0, 2, sched_arr
+    )
+    pair4 = TPUModelRunner._prepare_async_token_substitution_indices(
+        async_runner, 0, 2, sched_arr
+    )
+    assert pair3 is pair4
+    assert pair3[1].tolist() == list(range(6, 12)) + list(range(0, 6))
