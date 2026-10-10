@@ -27,8 +27,12 @@ from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.models.deepseek_v4.attention import DeepseekV4Indexer, DeepseekV4IndexerCache
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_torchtpu.kernels.deepseek_v4 import indexer_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    KVLayout,
+    streamindex_topk,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,
 )
@@ -64,6 +68,7 @@ def _indexer_jax(
     compression_ratio: int,
     softmax_scale: float,
     n_head: int,
+    kv_layout: KVLayout,
 ) -> jax.Array:
     if cache_kv.shape[0] == 0:
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
@@ -102,6 +107,7 @@ def _indexer_jax(
             distribution=distribution,
             k=k,
             compression_ratio=compression_ratio,
+            kv_layout=kv_layout,
             # The following parameters are tuned based on microbenchmark results.
             num_kv_pages_per_block=(16, 8, 8),
             num_queries_per_block=(1, 128, 128),
@@ -136,6 +142,15 @@ class VllmDeepseekV4IndexerCache(DeepseekV4IndexerCache):
             alignment=None,
         )
 
+    @property
+    def kv_layout(self) -> KVLayout:
+        """Layout the runner allocates this cache in; read once the block size
+        is final (it is not at construction)."""
+        block_size = self.cache_config.block_size
+        return indexer_cache_layout.select_layout(
+            block_size // min(self.compress_ratio, block_size)
+        )
+
 
 class VllmDeepseekV4Indexer(DeepseekV4Indexer):
     """TPU indexer: ranks compressed KV rows via the streamindex top-k kernel."""
@@ -150,11 +165,21 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         finally:
             dsv4_attention.DeepseekCompressor = orig_compressor
             dsv4_attention.DeepseekV4IndexerCache = orig_cache
-        object.__setattr__(self, "indexer_op", self._build_indexer_op())
         object.__setattr__(self.compressor, "k_cache", self.k_cache)
+
+    @property
+    def indexer_op(self):
+        """Built on first use, since the cache layout is baked in statically
+        and depends on the final block size."""
+        op = self.__dict__.get("_indexer_op_instance")
+        if op is None:
+            op = self._build_indexer_op()
+            object.__setattr__(self, "_indexer_op_instance", op)
+        return op
 
     def _build_indexer_op(self):
         mesh = get_pallas_op_mesh()
+        kv_layout = self.k_cache.kv_layout
 
         wrapped_fn = functools.partial(
             _indexer_jax,
@@ -162,6 +187,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             compression_ratio=self.compress_ratio,
             softmax_scale=self.softmax_scale,
             n_head=self.n_head,
+            kv_layout=kv_layout,
         )
 
         _scale = (
@@ -172,6 +198,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         op_name = (
             f"pallas::deepseek_v4_indexer_k{self.topk_tokens}"
             f"_c{self.compress_ratio}_h{self.n_head}_s{_scale}"
+            f"{'_sal' if kv_layout == KVLayout.SEQ_ALONG_LANE else ''}"
         )
         global _indexer_op_cache
         if op_name in _indexer_op_cache:

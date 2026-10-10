@@ -67,6 +67,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_MLA_MASKED_DENSE_ENABLED` | `False` | Enables the masked-dense MLA attention path for short KV lengths. |
 | `TPU_SPARSE_MLA_NOPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA non-positional (`nope`) KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
+| `VLLM_TPU_INDEXER_KV_CACHE_MODE` | `"sal"` | Sparse-attention indexer K cache layout and writer (GLM-5.2, DeepSeek-V4). `"sal"` stores tokens along lanes (`SEQ_ALONG_LANE`, 132 B/token for `head_dim=128`); `"has"` and `"xla"` store 4-token packed rows (`HEAD_ALONG_SUBLANE`, 256 B/token) with the Pallas or XLA writer. `"sal"` falls back to `"has"` when the page size does not fit it (DeepSeek-V4: anything but 256 compressed tokens per page, i.e. `--block-size 1024`) or under Raiden GLM / DSv4 admission, which raises instead if `"sal"` is set explicitly. |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
 
 ---

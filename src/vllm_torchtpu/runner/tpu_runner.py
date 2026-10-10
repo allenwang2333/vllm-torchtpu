@@ -5085,6 +5085,7 @@ class TPUModelRunner(GPUModelRunner):
                     if hasattr(module, "_build_indexer_op") and hasattr(
                         module, "indexer_op"
                     ):
+                        module.__dict__.pop("_indexer_op_instance", None)
                         _ = module.indexer_op
                         initialized_count += 1
                     for op_name in (

@@ -33,6 +33,7 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store.compressor_v1 import (
     compressor_forward,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import KVLayout
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
@@ -72,6 +73,7 @@ def _run_compressor(
     overlap: bool,
     rms_eps: float,
     quant_block: int,
+    kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
 ) -> tuple[jax.Array, jax.Array | None, jax.Array | None]:
     """Shared body of the three op variants, for CSA compressor, HCA compressor,
     and CSA indexer compressor respectively."""
@@ -95,6 +97,7 @@ def _run_compressor(
         overlap=overlap,
         rms_eps=rms_eps,
         quant_block=quant_block,
+        kv_layout=kv_layout,
     )
 
 
@@ -219,6 +222,7 @@ def _compressor_jax_indexer(
     overlap: bool,
     rms_eps: float,
     quant_block: int,
+    kv_layout: KVLayout,
 ) -> jax.Array:
     """Lightning indexer: one array holds the records and the state."""
     if cache.shape[0] == 0:
@@ -243,6 +247,7 @@ def _compressor_jax_indexer(
         overlap=overlap,
         rms_eps=rms_eps,
         quant_block=quant_block,
+        kv_layout=kv_layout,
     )
     return new_cache
 
@@ -412,6 +417,14 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         else:
             variant, jax_fn = "indexer", _compressor_jax_indexer
 
+        static_kwargs = {}
+        layout_tag = ""
+        if variant == "indexer":
+            # Write the records in the layout the indexer reads them in.
+            kv_layout = self.k_cache.kv_layout
+            static_kwargs["kv_layout"] = kv_layout
+            if kv_layout == KVLayout.SEQ_ALONG_LANE:
+                layout_tag = "_sal"
         wrapped_fn = functools.partial(
             jax_fn,
             state_block_size=self.state_cache.block_size,
@@ -420,12 +433,13 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             overlap=self.overlap,
             rms_eps=self.rms_norm_eps,
             quant_block=self._quant_block,
+            **static_kwargs,
         )
 
         op_name = (
             f"pallas::deepseek_v4_compressor_{variant}"
             f"_{self.head_dim}_{self.compress_ratio}"
-            f"_{self.state_cache.block_size}"
+            f"_{self.state_cache.block_size}{layout_tag}"
         )
 
         global _compressor_op_cache

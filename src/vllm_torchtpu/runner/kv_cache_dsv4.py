@@ -19,7 +19,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
 )
 
-from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout, indexer_cache_layout
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import attention_block_table_width
 from vllm_torchtpu.logger import init_logger
@@ -140,7 +140,10 @@ class DsV4KVCacheAllocator:
             CSA `*.attn`      NoPE int32 `(N, T, 128)`   512B/token
                               RoPE int32 `(N, T/4, 128)` 128B/token, in a
                                                          companion array
-            indexer k_cache   uint8 `(N, T/4, 4, 256)`   256B/token
+            indexer k_cache   uint8 `(N, T/4, 4, 256)`   256B/token, or
+                              uint8 `(N, 33, 4, T)`      132B/token
+                                                         (SEQ_ALONG_LANE, see
+                                                         `indexer_cache_layout`)
             HCA `*.attn`      uint8 `(N, T*2, 4, 128)`  1024B/token (raw bf16)
 
         The CSA arrays are int32 so the SparseCore gather can fetch a token's
@@ -190,8 +193,13 @@ class DsV4KVCacheAllocator:
             page_size = spec.num_states
             if layer_name.endswith(self._DS_V4_INDEXER_CACHE_SUFFIX):
                 # Lightning indexer: 128 fp8 values + 1 e8m0 scale per token,
-                # padded to a 256B record; 4 tokens per row.
-                shape = (num_blocks, page_size // packing, packing, 256)
+                # padded to a 256B record with 4 tokens per row, or one token
+                # per lane (SEQ_ALONG_LANE, 132B/token).
+                shape = indexer_cache_layout.cache_shape(
+                    num_blocks,
+                    page_size,
+                    indexer_cache_layout.select_layout(page_size),
+                )
                 kv_caches[layer_name] = _create_cache(shape, layer_name)
             elif spec.tokens_per_state == self._DS_V4_CSA_COMPRESS_RATIO:
                 # CSA is split across two arrays, for NoPE and RoPE.

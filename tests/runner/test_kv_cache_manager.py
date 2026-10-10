@@ -2015,6 +2015,69 @@ def test_dsv4_csa_allocates_int32_nope_and_rope_arrays():
     assert tuple(overflow.shape) == tuple(nope.shape)
 
 
+@pytest.mark.parametrize(
+    "mode, expected_shape",
+    [("sal", (3, 33, 4, 256)), ("has", (3, 64, 4, 256))],
+)
+def test_dsv4_indexer_array_follows_layout_mode(monkeypatch, mode, expected_shape):
+    """The indexer array is allocated in `indexer_cache_layout.select_layout`'s
+    layout, and its compressor state still rides on it."""
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", mode)
+
+    def mla(head_size):
+        return MLAAttentionSpec(
+            block_size=1024,
+            num_kv_heads=1,
+            head_size=head_size,
+            dtype=torch.uint8,
+            tokens_per_state=4,
+            alignment=None,
+        )
+
+    swa = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=2048,
+        dtype=torch.uint8,
+        sliding_window=128,
+        alignment=None,
+    )
+    specs = {
+        "m.layers.0.attn": mla(640),
+        "m.layers.0.attn.indexer.k_cache": mla(256),
+        "m.layers.0.attn.indexer.compressor.state_cache": swa,
+    }
+    groups = [
+        SimpleNamespace(
+            layer_names=["m.layers.0.attn", "m.layers.0.attn.indexer.k_cache"]
+        ),
+        SimpleNamespace(layer_names=["m.layers.0.attn.indexer.compressor.state_cache"]),
+    ]
+    for group in groups:
+        group.kv_cache_spec = specs[group.layer_names[0]]
+    runner = MagicMock()
+    runner.shared_kv_cache_layers = {}
+    runner.device = "cpu"
+    runner.max_num_reqs = 256
+    runner.max_num_tokens = 1024
+    runner.most_model_len = None
+    runner.input_batch.block_table = [
+        SimpleNamespace(max_num_blocks_per_req=pages) for pages in (1024, 8192)
+    ]
+    kv_caches: dict = {}
+
+    DsV4KVCacheAllocator(runner)._initialize_ds_v4_kv_cache(
+        SimpleNamespace(kv_cache_groups=groups), specs.__getitem__, kv_caches, 3
+    )
+
+    indexer = kv_caches["m.layers.0.attn.indexer.k_cache"]
+    assert indexer.dtype == torch.uint8
+    assert tuple(indexer.shape) == expected_shape
+    assert kv_caches["m.layers.0.attn.indexer.compressor.state_cache"] is indexer
+
+
 def test_dsv4_request_caps_match_runner_refresh():
     """DSv4's caps equal the runner's own refresh over its counted groups.
 

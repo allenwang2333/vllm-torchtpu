@@ -33,7 +33,8 @@ Modes:
     - State Bytes: 512 (dim) x 4 (bytes per fp32) = 2048 bytes
     - Head Dim:    128 fp8 + 1 scale = 129 bytes -> 256 bytes
     - Cache:       [num_pages, _, 4, 256] uint8 (where _ = state_block_size * 4
-    or kv_block_size // 4).
+    or kv_block_size // 4), or the SEQ_ALONG_LANE [num_pages, 33, 4, 256]
+    (see `indexer_cache_layout`), whose 33 rows host the state the same way.
 """
 
 import dataclasses
@@ -43,6 +44,8 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+
+from vllm_torchtpu.kernels.deepseek_v4 import indexer_cache_layout
 
 # --- physical layout constants ------------------------------------------------
 LANE = 128  # bytes per sub-slot / TPU lane width
@@ -107,8 +110,10 @@ def physical_page_size(
     # Compressed KV tokens per page (vLLM's ``spec.storage_block_size``).
     storage_block_size = kv_cache_block_size // compress_ratio
     if mode is Mode.CSA_INDEXER:
-        # (N, T // 4, 4, 256) u8
-        return storage_block_size // SLOT_PACK
+        # (N, T // 4, 4, 256) u8, or (N, 33, 4, T) u8 for SEQ_ALONG_LANE.
+        return indexer_cache_layout.page_rows(
+            storage_block_size, indexer_cache_layout.select_layout(storage_block_size)
+        )
     if mode is Mode.CSA:
         # (N, T, 4, 128) u8
         return storage_block_size

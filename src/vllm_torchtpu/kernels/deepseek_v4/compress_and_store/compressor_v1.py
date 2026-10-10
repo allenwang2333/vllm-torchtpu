@@ -15,10 +15,13 @@
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
 
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.config as config
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.kernel as compress_kernel
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.proj_and_save_state as proj_kernel  # noqa: E501
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import kv_cache_append
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import KVLayout
 
 
 def block_table_row_stride(block_table: jax.Array, num_reqs: int) -> int:
@@ -40,6 +43,7 @@ def derive_metadata(
     overlap: bool,
     cos_sin_cache: jax.Array | None,
     state_cache: jax.Array | None = None,
+    kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Derives token_to_req_indices, slot_mapping_slots, and kv_slot_mapping.
 
@@ -70,6 +74,11 @@ def derive_metadata(
       cos_sin_cache: [max_pos, rope_head_dim] or None. RoPE cos/sin cache.
       state_cache: [num_pages, state_page_size, 4, lanes] uint8, or None when the
         state shares ``cache``'s buffer. Only its shape is read here.
+      kv_layout: Layout of an indexer ``cache`` (see `indexer_cache_layout`).
+        For SEQ_ALONG_LANE a page holds ``cache.shape[-1]`` compressed tokens,
+        one per lane, so ``kv_slot_mapping`` is the flat lane row ``page *
+        page_size + slot``; the state rows are addressed as for the packed-row
+        layout.
     Returns:
       token_to_req_indices: [num_tokens]. Request index for each token.
       slot_mapping_slots: [num_tokens]. Physical row index in the state cache.
@@ -95,6 +104,12 @@ def derive_metadata(
     state_rows_per_token = cfgs.state_rows_per_token
     kv_block_size = cfgs.kv_block_size
     kv_stride = cfgs.kv_stride
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        assert cfgs.dims.mode == config.Mode.CSA_INDEXER, cfgs.dims.mode
+        # The state is still read and written as the kernels' (4, 256) rows.
+        assert tuple(cache.shape[2:]) == cfgs.cache_last_dims, cache.shape
+        kv_block_size = cache.shape[-1]
+        kv_stride = 1
     kv_page_stride = kv_block_size * kv_stride
 
     # The block tables are paged at vLLM's state-cache block size, and the
@@ -222,6 +237,74 @@ def prepare_boundary_batch(
     )
 
 
+def store_indexer_seq_along_lane(
+    cache: jax.Array,  # [num_pages, 33, 4, 256] u8, SEQ_ALONG_LANE + state
+    positions: jax.Array,
+    block_table: jax.Array,
+    token_to_req_indices: jax.Array,
+    kv_slot_mapping: jax.Array,
+    is_boundary: jax.Array,
+    norm_weight: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    num_reqs: int,
+    state_block_size: int,
+    compress_ratio: int,
+    overlap: bool,
+    rms_eps: float,
+    quant_block: int,
+) -> jax.Array:
+    """Compresses the boundary tokens into a SEQ_ALONG_LANE indexer cache.
+
+    A SEQ_ALONG_LANE token is one lane of a 128-lane tile, so one tile collects
+    the records of up to 32 steps of the compress kernel, which cannot
+    read-modify-write it: the pipeline prefetches step ``i + 1``'s output block
+    before step ``i``'s writeback lands. So the kernel writes the records, in
+    token order, into a packed-row staging array in which each step owns one
+    row, and `kv_cache_append.scatter_rows` places them into the cache.
+    The kernel reads the f32 state from the cache itself.
+    """
+    num_tokens = positions.shape[0]
+    tile_n = config.SLOT_PACK
+    # A request of q_len new tokens crosses at most q_len // ratio + 1
+    # compression boundaries.
+    max_boundary = min(num_tokens, num_tokens // compress_ratio + num_reqs + 1)
+    packed_size = pl.cdiv(max_boundary, tile_n) * tile_n
+
+    safe, valid = _get_packing_indices(is_boundary, packed_size)
+    pos = _pack_array(positions, safe, valid, 0)
+    req = _pack_array(token_to_req_indices, safe, valid, 0)
+    dst_rows = _pack_array(kv_slot_mapping, safe, valid, -1)
+    staging_slots = jnp.where(valid, jnp.arange(packed_size, dtype=jnp.int32), -1)
+
+    mode = config.Mode.CSA_INDEXER
+    staging = jnp.zeros(
+        (1, packed_size // config.SLOT_PACK, config.SLOT_PACK)
+        + (config.last_dim_size(mode),),
+        jnp.uint8,
+    )
+    staging, _ = compress_kernel.compress_norm_rope_store(
+        staging,
+        pos,
+        block_table,
+        req,
+        staging_slots,
+        norm_weight,
+        block_table_stride=block_table_row_stride(block_table, num_reqs),
+        state_block_size=state_block_size,
+        state_cache=cache,
+        cos_sin_cache=cos_sin_cache,
+        compress_ratio=compress_ratio,
+        overlap=overlap,
+        quant_block=quant_block,
+        rms_eps=rms_eps,
+    )
+    records = staging.reshape(packed_size, config.last_dim_size(mode))
+    return kv_cache_append.scatter_rows(
+        cache, records, dst_rows, KVLayout.SEQ_ALONG_LANE
+    )
+
+
 def compressor_forward(
     hidden_states: jax.Array,  # [num_tokens, hidden_size] fp32
     wkv_wgate: jax.Array,  # [2*coff*head_dim, hidden_size] fp32
@@ -242,11 +325,14 @@ def compressor_forward(
     rms_eps: float,
     quant_block: int,
     state_cache: jax.Array | None = None,  # [num_pages, state_page_size, 4, 128] uint8
+    kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,  # indexer cache only
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Projects, saves state, then compresses and stores the boundary records."""
     num_tokens = positions.shape[0]
     num_reqs = query_start_loc.shape[0] - 1
     shares_buffer = state_cache is None
+    seq_along_lane = kv_layout == KVLayout.SEQ_ALONG_LANE
+    assert not seq_along_lane or shares_buffer, "SEQ_ALONG_LANE is indexer-only"
 
     token_to_req_indices, slot_mapping_slots, kv_slot_mapping = derive_metadata(
         positions=positions,
@@ -260,6 +346,7 @@ def compressor_forward(
         overlap=overlap,
         cos_sin_cache=cos_sin_cache,
         state_cache=state_cache,
+        kv_layout=kv_layout,
     )
 
     token_index = jnp.arange(num_tokens)
@@ -280,8 +367,27 @@ def compressor_forward(
     else:
         state_cache = updated_state
 
-    is_decode_token = token_index < query_start_loc[distribution[0]]
     is_boundary = (kv_slot_mapping >= 0) & is_real_token
+    if seq_along_lane:
+        cache = store_indexer_seq_along_lane(
+            cache,
+            positions,
+            block_table,
+            token_to_req_indices,
+            kv_slot_mapping,
+            is_boundary,
+            norm_weight,
+            cos_sin_cache,
+            num_reqs=num_reqs,
+            state_block_size=state_block_size,
+            compress_ratio=compress_ratio,
+            overlap=overlap,
+            rms_eps=rms_eps,
+            quant_block=quant_block,
+        )
+        return cache, rope_cache, cache
+
+    is_decode_token = token_index < query_start_loc[distribution[0]]
 
     boundary_positions, boundary_req, boundary_kv_slot = prepare_boundary_batch(
         positions=positions,
