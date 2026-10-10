@@ -32,6 +32,7 @@ def main_kernel(
     valid_indices_ref: Any,
     nope_out_hbm_ref: Any,
     rope_out_hbm_ref: Any,
+    valid_vmem_ref: Any,
     idx_chunk_ref: Any,
     active_steps_ref: Any,
     nope_sem: Any,
@@ -72,10 +73,10 @@ def main_kernel(
     # consumer splits apart with a lane slice and a row concatenate.
     rope_out_cols = rope_out_hbm_ref.shape[1] // 2
     rope_rows_per_stream = row_subchunk_size // 2
-    valid_dma = pltpu.make_async_copy(valid_indices_ref, active_steps_ref, idx_sem)
+    valid_dma = pltpu.make_async_copy(valid_indices_ref, valid_vmem_ref, idx_sem)
     valid_dma.start()
     valid_dma.wait()
-    valid_indices = active_steps_ref[pl.ds(0, row_subchunk_size)][0]
+    valid_indices = valid_vmem_ref[pl.ds(0, row_subchunk_size)][0]
 
     def process_rope(gather_ref, out_ref, out_row_base=0):
         # bf16 output rows 2t and 2t + 1 are the low and high halves of int32
@@ -94,106 +95,110 @@ def main_kernel(
                 jnp.bitwise_and(odd, jnp.int32(-65536)),  # 0xFFFF0000
             )
 
-    for chunk_idx in range(num_chunks):
+    my_chunks = pl.cdiv(my_count_periods, max_chunk_periods)
+
+    def _chunk_body(chunk_idx, _):
         chunk_p_offset = chunk_idx * max_chunk_periods
         cur_periods = jnp.clip(my_count_periods - chunk_p_offset, 0, max_chunk_periods)
+        chunk_start_p = my_start_period + chunk_p_offset
+        dma_start_p = jnp.minimum(chunk_start_p, num_periods - max_chunk_periods)
+        p_shift = chunk_start_p - dma_start_p
+        base_step = dma_start_p * steps_per_period
 
-        @pl.when(cur_periods > 0)
-        def _run_chunk(chunk_p_offset=chunk_p_offset, cur_periods=cur_periods):
-            chunk_start_p = my_start_period + chunk_p_offset
-            dma_start_p = jnp.minimum(chunk_start_p, num_periods - max_chunk_periods)
-            p_shift = chunk_start_p - dma_start_p
-            base_step = dma_start_p * steps_per_period
+        idx_dma = pltpu.make_async_copy(
+            indices_hbm_ref.at[pl.ds(dma_start_p * top_k, max_chunk_periods * top_k)],
+            idx_chunk_ref,
+            idx_sem,
+        )
+        idx_dma.start()
+        idx_dma.wait()
 
-            idx_dma = pltpu.make_async_copy(
-                indices_hbm_ref.at[pl.ds(dma_start_p * top_k, max_chunk_periods * top_k)],
-                idx_chunk_ref,
-                idx_sem,
-            )
-            idx_dma.start()
-            idx_dma.wait()
+        def _compact_period(lp, n_act):
+            g_row = (chunk_start_p + lp) * top_k
+            first_idx = idx_chunk_ref[pl.ds((p_shift + lp) * top_k, row_subchunk_size)][0]
+            is_act = (g_row < valid_indices) & (first_idx >= 0)
+            base_s_rel = (p_shift + lp) * steps_per_period
+            for s_in_p in range(steps_per_period):
+                active_steps_ref[n_act] = base_s_rel + s_in_p
+                n_act = n_act + jnp.where(is_act, 1, 0)
+            return n_act
 
-            n_active = jnp.int32(0)
-            for lp in range(max_chunk_periods):
-                p_in_bounds = lp < cur_periods
-                g_row = (chunk_start_p + lp) * top_k
-                first_idx = idx_chunk_ref[pl.ds((p_shift + lp) * top_k, row_subchunk_size)][0]
-                is_act = p_in_bounds & (g_row < valid_indices) & (first_idx >= 0)
-                base_s_rel = (p_shift + lp) * steps_per_period
-                for s_in_p in range(steps_per_period):
-                    active_steps_ref[n_active] = base_s_rel + s_in_p
-                    n_active = n_active + jnp.where(is_act, 1, 0)
+        n_active = lax.fori_loop(0, cur_periods, _compact_period, jnp.int32(0))
 
-            def idx_window(r, s):
-                s_in_chunk = active_steps_ref[r]
-                return idx_chunk_ref[
-                    pl.ds(s_in_chunk * step_rows + s * row_subchunk_size, row_subchunk_size)
-                ]
+        def idx_window(r, s):
+            s_in_chunk = active_steps_ref[r]
+            return idx_chunk_ref[
+                pl.ds(s_in_chunk * step_rows + s * row_subchunk_size, row_subchunk_size)
+            ]
 
-            def rope_out_block(r):
-                s_in_chunk = active_steps_ref[r]
-                half, step = divmod(base_step + s_in_chunk, steps_per_half)
-                return (half // 2) * steps_per_half + step, half % 2
+        def rope_out_block(r):
+            s_in_chunk = active_steps_ref[r]
+            half, step = divmod(base_step + s_in_chunk, steps_per_half)
+            return (half // 2) * steps_per_half + step, half % 2
 
-            def _body(*refs):
-                r = pl.program_id(0)
-                s_in_chunk = active_steps_ref[r]
-                out_step = base_step + s_in_chunk
-                nope_g = refs[0 * num_streams : 1 * num_streams]
-                rope_g = refs[1 * num_streams : 2 * num_streams]
-                rope_o = refs[2 * num_streams]
+        def _body(*refs):
+            r = pl.program_id(0)
+            s_in_chunk = active_steps_ref[r]
+            out_step = base_step + s_in_chunk
+            nope_g = refs[0 * num_streams : 1 * num_streams]
+            rope_g = refs[1 * num_streams : 2 * num_streams]
+            rope_o = refs[2 * num_streams]
 
-                nope_copies = []
-                for s in range(num_streams):
-                    out_row = out_step * step_rows + s * row_subchunk_size
-                    copy = pltpu.make_async_copy(
-                        nope_g[s],
-                        nope_out_hbm_ref.at[pl.ds(out_row, row_subchunk_size)],
-                        nope_sem.at[s],
-                    )
-                    copy.start()
-                    nope_copies.append(copy)
-
-                for s in range(num_streams):
-                    process_rope(
-                        gather_ref=rope_g[s],
-                        out_ref=rope_o,
-                        out_row_base=s * rope_rows_per_stream,
-                    )
-
-                for copy in nope_copies:
-                    copy.wait()
-
-            nope_in_specs = tuple(
-                pl.BlockSpec(
-                    (pl.Indirect(row_subchunk_size), nope_in_cols),
-                    lambda r, s=s: (idx_window(r, s), 0),
+            nope_copies = []
+            for s in range(num_streams):
+                out_row = out_step * step_rows + s * row_subchunk_size
+                copy = pltpu.make_async_copy(
+                    nope_g[s],
+                    nope_out_hbm_ref.at[pl.ds(out_row, row_subchunk_size)],
+                    nope_sem.at[s],
                 )
-                for s in range(num_streams)
-            )
-            rope_in_specs = tuple(
-                pl.BlockSpec(
-                    (pl.Indirect(row_subchunk_size), rope_in_cols),
-                    lambda r, s=s: (idx_window(r, s), 0),
+                copy.start()
+                nope_copies.append(copy)
+
+            for s in range(num_streams):
+                process_rope(
+                    gather_ref=rope_g[s],
+                    out_ref=rope_o,
+                    out_row_base=s * rope_rows_per_stream,
                 )
-                for s in range(num_streams)
+
+            for copy in nope_copies:
+                copy.wait()
+
+        nope_in_specs = tuple(
+            pl.BlockSpec(
+                (pl.Indirect(row_subchunk_size), nope_in_cols),
+                lambda r, s=s: (idx_window(r, s), 0),
             )
-            rope_out_spec = pl.BlockSpec(
-                (num_streams * rope_rows_per_stream, rope_out_cols), rope_out_block
+            for s in range(num_streams)
+        )
+        rope_in_specs = tuple(
+            pl.BlockSpec(
+                (pl.Indirect(row_subchunk_size), rope_in_cols),
+                lambda r, s=s: (idx_window(r, s), 0),
+            )
+            for s in range(num_streams)
+        )
+        rope_out_spec = pl.BlockSpec(
+            (num_streams * rope_rows_per_stream, rope_out_cols), rope_out_block
+        )
+
+        @pl.when(n_active > 0)
+        def _run_gather():
+            pltpu.emit_pipeline(
+                _body,
+                grid=(n_active,),
+                in_specs=nope_in_specs + rope_in_specs,
+                out_specs=(rope_out_spec,),
+            )(
+                *([nope_in_hbm_ref] * num_streams),
+                *([rope_in_hbm_ref] * num_streams),
+                rope_out_hbm_ref,
             )
 
-            @pl.when(n_active > 0)
-            def _run_gather():
-                pltpu.emit_pipeline(
-                    _body,
-                    grid=(n_active,),
-                    in_specs=nope_in_specs + rope_in_specs,
-                    out_specs=(rope_out_spec,),
-                )(
-                    *([nope_in_hbm_ref] * num_streams),
-                    *([rope_in_hbm_ref] * num_streams),
-                    rope_out_hbm_ref,
-                )
+        return None
+
+    lax.fori_loop(0, my_chunks, _chunk_body, None)
 
 
 
@@ -271,7 +276,7 @@ def csa_gather(
     num_periods = out_size // top_k
     max_core_periods = (num_periods + num_cores - 1) // num_cores
     max_chunk_periods = min(
-        max(1, num_simd_lanes // steps_per_period), max_core_periods
+        16, max(1, num_simd_lanes // steps_per_period), max_core_periods
     )
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
@@ -298,8 +303,9 @@ def csa_gather(
             ),
         ),
         scratch_types=(
-            pltpu.VMEM((max_chunk_periods * top_k,), jnp.int32),
             pltpu.VMEM((num_simd_lanes,), jnp.int32),
+            pltpu.VMEM((max_chunk_periods * top_k,), jnp.int32),
+            pltpu.SMEM((num_simd_lanes,), jnp.int32),
             pltpu.SemaphoreType.DMA((num_streams,)),
             pltpu.SemaphoreType.DMA,
         ),
