@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -144,6 +144,13 @@ def _token_requests(metadata, positions):
 
 def _window_starts():
     """Per-request first position holding SWA KV, or None (SWA bounded replay)."""
+    stage_cache = _active_stage_attn_cache
+    if stage_cache is not None:
+        if "window_starts" not in stage_cache:
+            stage_cache["window_starts"] = get_forward_context().additional_kwargs.get(
+                "deepseek_v41_window_starts"
+            )
+        return stage_cache["window_starts"]
     return get_forward_context().additional_kwargs.get("deepseek_v41_window_starts")
 
 
@@ -369,7 +376,7 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
         kwargs["block_size"] = kwargs["cache_config"].block_size
         # Upstream ties bounded replay to its V2 model runner; the TPU model
         # implements the replay itself (see `prefix_replay_enabled`).
-        if prefix_replay_enabled(get_current_vllm_config()):
+        if prefix_replay_enabled(get_current_vllm_config_or_none()):
             kwargs["bounded_replay"] = True
         # FP8 applies to the compressed main KV only; SWA rows stay BF16.
         kwargs["dtype"] = torch.bfloat16
@@ -1072,9 +1079,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     base_valid_window = base_valid_window & (
                         logical >= replay_starts[requests, None]
                     )
-                elif (starts := _window_starts()) is not None:
+                elif (win_starts := _window_starts()) is not None:
                     base_valid_window = base_valid_window & (
-                        logical >= starts[requests.clamp(max=starts.shape[0] - 1), None]
+                        logical
+                        >= win_starts[requests.clamp(max=win_starts.shape[0] - 1), None]
                     )
                 if use_3page_swa:
                     safe = logical.clamp(
@@ -1227,9 +1235,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     "deepseek_v41_replay_starts"
                 ]
                 valid_window = valid_window & (logical >= replay_starts[requests, None])
-            elif (starts := _window_starts()) is not None:
+            elif (win_starts := _window_starts()) is not None:
                 valid_window = valid_window & (
-                    logical >= starts[requests.clamp(max=starts.shape[0] - 1), None]
+                    logical
+                    >= win_starts[requests.clamp(max=win_starts.shape[0] - 1), None]
                 )
             invalid_window = ~valid_window
             raw_row_slots = (

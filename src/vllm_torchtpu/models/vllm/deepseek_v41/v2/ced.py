@@ -39,6 +39,11 @@ def _identity_indices(kept: int) -> tuple[int, ...]:
     return tuple(range(kept))
 
 
+@functools.lru_cache(maxsize=64)
+def _zero_hits(count: int) -> tuple[int, ...]:
+    return (0,) * count
+
+
 @functools.lru_cache(maxsize=256)
 def _padded_bucket(kept: int, num_tokens: int, compile_sizes: tuple) -> int:
     """Smallest compile size in ``[kept, num_tokens)``, else ``num_tokens``."""
@@ -70,11 +75,11 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
     prompts_list = prompts.tolist() if isinstance(prompts, torch.Tensor) else prompts
     hits = getattr(metadata, "replay_starts_cpu", None)
     if hits is None:
-        hits_list = [0] * len(lengths_list)
+        hits_list = _zero_hits(len(lengths_list))
     elif isinstance(hits, torch.Tensor):
         hits_list = hits.tolist()
     else:
-        hits_list = list(hits)
+        hits_list = hits
     if (
         window < 1
         or len(bounds_list) != len(lengths_list) + 1
@@ -92,7 +97,9 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
         count = end - start
         if count < 0 or length < count or prompt < 0:
             raise ValueError("Invalid scheduled query or prompt length")
-        replay_start = max(0, prompt - window, hit)
+        replay_start = prompt - window if prompt > window else 0
+        if hit > replay_start:
+            replay_start = hit
         replay_starts.append(replay_start)
         if replay_start > length - count and count > 0:
             any_skipped = True

@@ -169,3 +169,147 @@ def test_lookback_reads_committed_tokens_on_a_replayed_admission():
     # Generated positions on later steps may hold async placeholders.
     assert ids[1].tolist() == [-1, -1]
     assert ids[2].tolist() == [511, 510]
+
+
+def test_plan_decoder_replay_accepts_tensor_hits():
+    metadata = SimpleNamespace(
+        query_start_loc_cpu=torch.tensor([0, 512], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([1024], dtype=torch.int32),
+        prompt_lens_cpu=torch.tensor([1024], dtype=torch.int32),
+        replay_starts_cpu=torch.tensor([512], dtype=torch.int32),
+    )
+    plan = plan_decoder_replay(metadata, WINDOW, 512, ())
+    assert plan is not None
+    assert plan.replay_starts == (1024 - WINDOW,)
+
+
+def test_swa_cache_init_sets_bounded_replay_only_when_enabled(monkeypatch):
+    captured = []
+
+    def fake_super_init(self, *args, **kwargs):
+        captured.append(dict(kwargs))
+
+    monkeypatch.setattr(v2_attn.DeepseekV4SWACache, "__init__", fake_super_init)
+    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_CED", True, raising=False)
+
+    # 1. When prefix_replay_enabled is False, bounded_replay is omitted.
+    monkeypatch.setattr(v2_attn, "get_current_vllm_config_or_none", lambda: None)
+    swa = object.__new__(v2_attn.SWACache)
+    v2_attn.SWACache.__init__(swa, cache_config=SimpleNamespace(block_size=32))
+    assert "bounded_replay" not in captured[-1]
+
+    # 2. When prefix_replay_enabled is True, bounded_replay=True is passed.
+    cfg = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=True, swa_bounded_replay=True
+        ),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+    )
+    monkeypatch.setattr(v2_attn, "get_current_vllm_config_or_none", lambda: cfg)
+    swa2 = object.__new__(v2_attn.SWACache)
+    v2_attn.SWACache.__init__(swa2, cache_config=SimpleNamespace(block_size=32))
+    assert captured[-1]["bounded_replay"] is True
+
+
+def test_window_starts_stage_cache_and_attention_paths(monkeypatch):
+    from tests.models.vllm.test_dsv41_v2_attention_td756 import (
+        _make_attn,
+        _make_paged_cache_mock,
+    )
+
+    pages = torch.zeros((16, 32, 512), dtype=torch.bfloat16)
+    swa_cache = _make_paged_cache_mock(pages, row_offset=0, rows_per_page=32)
+    main_cache = _make_paged_cache_mock(pages, row_offset=0, rows_per_page=32)
+    idx_cache = _make_paged_cache_mock(pages, row_offset=0, rows_per_page=32)
+    attn = _make_attn(
+        swa_cache=swa_cache,
+        main_cache=main_cache,
+        idx_cache=idx_cache,
+        has_indexer=True,
+    )
+    attn.compressor = lambda kv_score, pos: torch.zeros(
+        (pos.shape[0], 8), dtype=torch.bfloat16
+    )
+    attn._quantize_indexer = lambda k: k
+
+    meta = SimpleNamespace(
+        seq_lens=torch.tensor([300, 16], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+        block_tables=torch.arange(32, dtype=torch.int32).reshape(2, 16),
+    )
+    win_starts = torch.tensor([256, 0], dtype=torch.int32)
+    ctx = SimpleNamespace(
+        attn_metadata={"swa_pfx": meta, "src_pfx": meta, "idx_pfx": meta},
+        additional_kwargs={"deepseek_v41_window_starts": win_starts},
+    )
+    monkeypatch.setattr(v2_attn, "get_forward_context", lambda: ctx)
+    monkeypatch.setattr(v2_attn, "_insert", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        v2_attn,
+        "sparse_fp8_attention",
+        lambda q, *a, **kw: torch.zeros_like(q),
+    )
+
+    positions = torch.tensor([256, 257, 0, 1], dtype=torch.int32)
+    hidden = torch.zeros((4, 8), dtype=torch.bfloat16)
+    qr = torch.zeros((4, 16), dtype=torch.bfloat16)
+    kv = torch.zeros((4, 2, 8), dtype=torch.bfloat16)
+    kv_score = torch.zeros((4, 9), dtype=torch.float32)
+    idx_w = torch.zeros((4, 2), dtype=torch.bfloat16)
+    out = torch.zeros((4, 2, 8), dtype=torch.bfloat16)
+
+    # 1. Unscoped _prepare_tpu + _write_global_kv with window_starts != None
+    assert v2_attn._window_starts() is win_starts
+    attn._prepare_tpu(hidden, qr, kv, None, kv_score, idx_w, positions, out)
+
+    # 2. Stage-scoped _prepare_tpu across two calls (populates and reuses window_starts)
+    with v2_attn.stage_attention_cache_scope():
+        attn._prepare_tpu(hidden, qr, kv, None, kv_score, idx_w, positions, out)
+        assert v2_attn._active_stage_attn_cache["window_starts"] is win_starts
+        assert v2_attn._window_starts() is win_starts
+
+
+@pytest.mark.parametrize("concurrency", [64, 96, 112])
+def test_td8202_high_conc_c64_c96_c112_prefix_replay_hot_path(concurrency):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import DeepseekV41Model
+
+    b = concurrency * 6
+    qsl = tuple(range(0, b + 1, 6))
+    seq_lens = (4096,) * concurrency
+    prompts = (1024,) * concurrency
+    zero_hits = (0,) * concurrency
+
+    meta_none = SimpleNamespace(
+        query_start_loc_cpu=qsl,
+        seq_lens_cpu=seq_lens,
+        prompt_lens_cpu=prompts,
+        replay_starts_cpu=None,
+    )
+    meta_tuple = SimpleNamespace(
+        query_start_loc_cpu=qsl,
+        seq_lens_cpu=seq_lens,
+        prompt_lens_cpu=prompts,
+        replay_starts_cpu=zero_hits,
+    )
+    plan_none = plan_decoder_replay(meta_none, WINDOW, b, (b,))
+    plan_tuple = plan_decoder_replay(meta_tuple, WINDOW, b, (b,))
+    assert plan_none == plan_tuple
+    assert plan_none.is_identity is True
+    assert plan_none.padded_num_tokens == b
+
+    dummy_model = SimpleNamespace()
+    positions = torch.zeros(b, dtype=torch.int32)
+    w1 = DeepseekV41Model._get_ced_replay_starts(
+        dummy_model,
+        zero_hits,
+        positions,
+        cache_attr="_ced_window_starts_cache",
+    )
+    w2 = DeepseekV41Model._get_ced_replay_starts(
+        dummy_model,
+        zero_hits,
+        positions,
+        cache_attr="_ced_window_starts_cache",
+    )
+    assert w1 is w2
+    assert int(w1.sum().item()) == 0

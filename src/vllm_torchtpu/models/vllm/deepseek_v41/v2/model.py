@@ -500,16 +500,20 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         return engram_hashes, engram_mask
 
     def _get_ced_replay_starts(
-        self, replay_starts_seq, positions: torch.Tensor
+        self,
+        replay_starts_seq,
+        positions: torch.Tensor,
+        *,
+        cache_attr: str = "_ced_replay_starts_cache",
     ) -> torch.Tensor:
-        """Cached device tensor for CED `replay_starts`."""
+        """Cached device tensor for CED `replay_starts` / `window_starts`."""
         replay_tuple = (
             replay_starts_seq
             if isinstance(replay_starts_seq, tuple)
             else tuple(replay_starts_seq)
         )
         replay_key = (replay_tuple, positions.dtype, positions.device)
-        cached_replay = getattr(self, "_ced_replay_starts_cache", None)
+        cached_replay = getattr(self, cache_attr, None)
         if cached_replay is not None and cached_replay[0] == replay_key:
             return cached_replay[1]
         replay_starts = (
@@ -521,7 +525,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             if any(replay_tuple)
             else positions.new_zeros(len(replay_tuple))
         )
-        self._ced_replay_starts_cache = (replay_key, replay_starts)
+        setattr(self, cache_attr, (replay_key, replay_starts))
         return replay_starts
 
     def _get_ced_padding_mask(
@@ -691,10 +695,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             # depend on whether prefix caching is on.
             requests = first.seq_lens.shape[0] if first is not None else 1
             hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
-            window_starts = torch.tensor(
+            window_starts = DeepseekV41Model._get_ced_replay_starts(
+                self,
                 hits + (0,) * (requests - len(hits)),
-                dtype=positions.dtype,
-                device=positions.device,
+                positions,
+                cache_attr="_ced_window_starts_cache",
             )
             encoder_context = replace(
                 context,
