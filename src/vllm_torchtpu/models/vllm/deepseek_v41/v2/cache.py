@@ -465,16 +465,23 @@ class PagedCacheRows:
         if not self.sharded:
             base = blocks * self.page_stride + rem
             return base if self.row_offset == 0 else self.row_offset + base
-        sharded_blocks = self.shape[0] - self.replicated_blocks
-        sharded_local = blocks - self.block_offset
-        in_rep = (blocks >= 0) & (blocks < self.replicated_blocks)
-        in_sharded = (sharded_local >= 0) & (sharded_local < sharded_blocks)
-        owned = (slots >= 0) & (in_rep | in_sharded)
-        local_blocks = torch.where(
-            in_rep, blocks, self.replicated_blocks + sharded_local
-        )
+        if self.replicated_blocks == 0:
+            local_blocks = (
+                blocks if self.block_offset == 0 else blocks - self.block_offset
+            )
+            owned = (slots >= 0) & (local_blocks >= 0) & (local_blocks < self.shape[0])
+        else:
+            sharded_blocks = self.shape[0] - self.replicated_blocks
+            sharded_local = blocks - self.block_offset
+            in_rep = (blocks >= 0) & (blocks < self.replicated_blocks)
+            in_sharded = (sharded_local >= 0) & (sharded_local < sharded_blocks)
+            owned = (slots >= 0) & (in_rep | in_sharded)
+            local_blocks = torch.where(
+                in_rep, blocks, self.replicated_blocks + sharded_local
+            )
         safe_blocks = local_blocks.clamp(min=0, max=max(self.shape[0] - 1, 0))
-        indices = self.row_offset + safe_blocks * self.page_stride + rem
+        base = safe_blocks * self.page_stride + rem
+        indices = base if self.row_offset == 0 else self.row_offset + base
         return indices.masked_fill(~owned, -1)
 
     def pages(self, block_table):
@@ -490,14 +497,26 @@ class PagedCacheRows:
                 block_table if self.page_scale == 1 else block_table * self.page_scale
             )
             return pages if self.page_offset == 0 else pages + self.page_offset
-        sharded_blocks = self.shape[0] - self.replicated_blocks
-        sharded_local = block_table - self.block_offset
-        in_rep = (block_table >= 0) & (block_table < self.replicated_blocks)
-        in_sharded = (sharded_local >= 0) & (sharded_local < sharded_blocks)
-        owned = (block_table >= 0) & (in_rep | in_sharded)
-        local_blocks = torch.where(
-            in_rep, block_table, self.replicated_blocks + sharded_local
-        )
+        if self.replicated_blocks == 0:
+            local_blocks = (
+                block_table
+                if self.block_offset == 0
+                else block_table - self.block_offset
+            )
+            owned = (
+                (block_table >= 0)
+                & (local_blocks >= 0)
+                & (local_blocks < self.shape[0])
+            )
+        else:
+            sharded_blocks = self.shape[0] - self.replicated_blocks
+            sharded_local = block_table - self.block_offset
+            in_rep = (block_table >= 0) & (block_table < self.replicated_blocks)
+            in_sharded = (sharded_local >= 0) & (sharded_local < sharded_blocks)
+            owned = (block_table >= 0) & (in_rep | in_sharded)
+            local_blocks = torch.where(
+                in_rep, block_table, self.replicated_blocks + sharded_local
+            )
         safe_blocks = local_blocks.clamp(min=0, max=max(self.shape[0] - 1, 0))
         pages = safe_blocks if self.page_scale == 1 else safe_blocks * self.page_scale
         if self.page_offset != 0:

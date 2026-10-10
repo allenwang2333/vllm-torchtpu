@@ -3572,3 +3572,71 @@ class TestS62AndS65OwnerComposition:
                 np.asarray(sharded_out_j, dtype=np.float32)
             ).to(torch.bfloat16)
             assert torch.equal(sharded_out, ref_out)
+
+    def test_td8239_paged_cache_rows_pure_sharded_fast_path(self):
+        """TD8.239: Verify PagedCacheRows.row_indices and .pages pure-sharded
+        (replicated_blocks == 0) fast path and row_offset == 0 skip match the
+        general formula bitwise across all offset/stride combinations."""
+        raw = torch.zeros((2048, ROW_WORDS), dtype=torch.int32)
+        slots = torch.tensor(
+            [-16, -1, 0, 7, 16, 31, 64, 127, 128, 255, 256, 511], dtype=torch.int32
+        )
+        block_table = torch.tensor(
+            [[-2, -1, 0, 1, 3, 4, 7, 8, 15, 16, 31, 32]], dtype=torch.int32
+        )
+
+        for rep_blocks in (0, 4):
+            for block_offset in (0, 4, 8):
+                for stride_pages in (1, 2):
+                    for offset_pages in (0, 2):
+                        layout = (
+                            (8, 16, 128),
+                            torch.bfloat16,
+                            stride_pages * 16 * 128 * 2,
+                            offset_pages * 16 * 128 * 2,
+                            block_offset,
+                            True,
+                            rep_blocks,
+                        )
+                        cache = PagedCacheRows(raw, layout)
+
+                        # Reference row_indices calculation
+                        blocks = slots // cache.shape[1]
+                        rem = slots % cache.shape[1]
+                        sharded_blocks = cache.shape[0] - cache.replicated_blocks
+                        sharded_local = blocks - cache.block_offset
+                        in_rep = (blocks >= 0) & (blocks < cache.replicated_blocks)
+                        in_sharded = (sharded_local >= 0) & (
+                            sharded_local < sharded_blocks
+                        )
+                        owned = (slots >= 0) & (in_rep | in_sharded)
+                        local_blocks = torch.where(
+                            in_rep, blocks, cache.replicated_blocks + sharded_local
+                        )
+                        safe_blocks = local_blocks.clamp(
+                            min=0, max=max(cache.shape[0] - 1, 0)
+                        )
+                        ref_indices = (
+                            cache.row_offset + safe_blocks * cache.page_stride + rem
+                        ).masked_fill(~owned, -1)
+                        assert torch.equal(cache.row_indices(slots), ref_indices)
+
+                        # Reference pages calculation
+                        sharded_local_bt = block_table - cache.block_offset
+                        in_rep_bt = (block_table >= 0) & (
+                            block_table < cache.replicated_blocks
+                        )
+                        in_sharded_bt = (sharded_local_bt >= 0) & (
+                            sharded_local_bt < sharded_blocks
+                        )
+                        owned_bt = (block_table >= 0) & (in_rep_bt | in_sharded_bt)
+                        local_bt = torch.where(
+                            in_rep_bt,
+                            block_table,
+                            cache.replicated_blocks + sharded_local_bt,
+                        )
+                        safe_bt = local_bt.clamp(min=0, max=max(cache.shape[0] - 1, 0))
+                        ref_pages = (
+                            safe_bt * cache.page_scale + cache.page_offset
+                        ).masked_fill(~owned_bt, 0)
+                        assert torch.equal(cache.pages(block_table), ref_pages)
