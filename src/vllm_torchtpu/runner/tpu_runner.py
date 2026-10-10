@@ -4708,6 +4708,13 @@ class TPUModelRunner(GPUModelRunner):
                         return_device=is_async,
                         device_seed=device_seed,
                     )
+        elif (
+            self._is_async_drafter
+            and state.draft_chunks
+            and isinstance(self.drafter, DFlashProposer)
+        ):
+            for chunk in state.draft_chunks:
+                self.drafter._update_draft_kv_cache_from_target(chunk)
 
         # Save, poll and clear the KV connector only after the drafter. Its
         # forward above writes the draft layers' KV into the blocks the target
