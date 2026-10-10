@@ -738,12 +738,7 @@ def moe_gmm(
         )
         gmm1_in = jnp.concatenate([u8_pair[..., 0], u8_pair[..., 1]], axis=1)
         gmm1_scale = gmm1_res[:, inter_dim // 2 : inter_dim // 2 + 1]
-    elif (
-        not is_w2_fp4
-        and w2_scale is not None
-        and inter_dim % 128 == 0
-        and gmm1_res.shape[0] <= 4608
-    ):
+    elif w2_scale is not None and inter_dim % 128 == 0:
         gmm1_in, gmm1_scale = quantize_lhs_rows(gmm1_res[:, :inter_dim])
     else:
         gmm1_in = gmm1_res[:, :inter_dim]
