@@ -1290,18 +1290,18 @@ def moe_tp_prefill(
     tok, pos, s_sorted, visit_e, visit_base, visit_rows, n_rv = routing_plan(
         topk_ids, n_experts, x_s, route_valid=route_valid, n_valid=n_valid
     )
-    if blocked is not None:
-        # The kernel cuts the routed visits (and the shared rows) into chunks.
-        tables = (visit_e, visit_base, visit_rows, n_rv.reshape(1))
-    else:
+    if blocked is None:
         # The shared expert is one more visit over every token.
         visit_e = visit_e.at[n_rv].set(n_experts)
         visit_base = visit_base.at[n_rv].set(n_routes)
         visit_rows = visit_rows.at[n_rv].set(n_tok)
-        tables = (visit_e, visit_base, visit_rows, (n_rv + 1).reshape(1))
     ls = jnp.concatenate([s_sorted, x_s])
     ls = jnp.pad(ls, (0, dims["scale_rows"] * LANES - ls.shape[0])).reshape(-1, LANES)
     tok_pad = jnp.pad(tok, (0, dims["tok_rows"] - n_routes))
+    # Blocked: the kernel cuts the routed visits (and the shared rows) into
+    # chunks itself, so it takes the routed visit count.
+    n_visit = n_rv if blocked is not None else n_rv + 1
+    tables = (visit_e, visit_base, visit_rows, n_visit.reshape(1))
 
     part = call(
         *tables,
