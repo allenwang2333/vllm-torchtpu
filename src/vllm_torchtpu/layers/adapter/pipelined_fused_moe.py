@@ -197,24 +197,37 @@ def pipelined_fused_moe_gmm(
 
     # Independent of the token count, so every bucket traces the same inputs.
     moe_fn = fused_moe_gmm
+    packed_fp8 = False
     if parallel_size > 1 and moe_fp8_dispatch_enabled(w1, w1_scale, rhs_quant_dtype):
-        # Quantize before the all-gather instead of inside the routed GMM.
-        hidden_states = quantize_moe_dispatch(hidden_states)
+        # Quantize and pack (hidden_q, hidden_scale, topk_weights, topk_ids)
+        # before the all-gather so a single 2D 128-lane-aligned AllGather
+        # replaces 4 separate collectives per chunk.
+        if topk_weights is not None and topk_ids is not None:
+            hidden_states = quantize_moe_dispatch(
+                hidden_states, topk_weights, topk_ids
+            )
+        else:
+            hidden_states = quantize_moe_dispatch(hidden_states)
+        packed_fp8 = not isinstance(hidden_states, tuple)
         moe_fn = fused_moe_gmm_fp8_dispatch
 
     if num_chunks == 1 or parallel_size == 1:
         if parallel_size > 1:
             ag_hidden_states = _all_gather_hidden(collective_group, hidden_states)
-            ag_topk_weights = (
-                collective_group.all_gather(topk_weights, dim=0)
-                if topk_weights is not None
-                else None
-            )
-            ag_topk_ids = (
-                collective_group.all_gather(topk_ids, dim=0)
-                if topk_ids is not None
-                else None
-            )
+            if packed_fp8:
+                ag_topk_weights = topk_weights
+                ag_topk_ids = topk_ids
+            else:
+                ag_topk_weights = (
+                    collective_group.all_gather(topk_weights, dim=0)
+                    if topk_weights is not None
+                    else None
+                )
+                ag_topk_ids = (
+                    collective_group.all_gather(topk_ids, dim=0)
+                    if topk_ids is not None
+                    else None
+                )
         else:
             ag_hidden_states = hidden_states
             ag_topk_weights = topk_weights
@@ -250,35 +263,43 @@ def pipelined_fused_moe_gmm(
         )
         for i in range(num_chunks)
     ]
-    weights_slices = (
-        [
-            topk_weights[i * chunk_size_local : (i + 1) * chunk_size_local]
-            for i in range(num_chunks)
-        ]
-        if topk_weights is not None
-        else [None] * num_chunks
-    )
-    ids_slices = (
-        [
-            topk_ids[i * chunk_size_local : (i + 1) * chunk_size_local]
-            for i in range(num_chunks)
-        ]
-        if topk_ids is not None
-        else [None] * num_chunks
-    )
+    if packed_fp8:
+        weights_slices = [topk_weights] * num_chunks
+        ids_slices = [topk_ids] * num_chunks
+    else:
+        weights_slices = (
+            [
+                topk_weights[i * chunk_size_local : (i + 1) * chunk_size_local]
+                for i in range(num_chunks)
+            ]
+            if topk_weights is not None
+            else [None] * num_chunks
+        )
+        ids_slices = (
+            [
+                topk_ids[i * chunk_size_local : (i + 1) * chunk_size_local]
+                for i in range(num_chunks)
+            ]
+            if topk_ids is not None
+            else [None] * num_chunks
+        )
 
     # Prime pipeline with initial all-gather for chunk 0
     ag_hs_curr = _all_gather_hidden(collective_group, hs_slices[0])
-    ag_tw_curr = (
-        collective_group.all_gather(weights_slices[0], dim=0)
-        if weights_slices[0] is not None
-        else None
-    )
-    ag_ti_curr = (
-        collective_group.all_gather(ids_slices[0], dim=0)
-        if ids_slices[0] is not None
-        else None
-    )
+    if packed_fp8:
+        ag_tw_curr = weights_slices[0]
+        ag_ti_curr = ids_slices[0]
+    else:
+        ag_tw_curr = (
+            collective_group.all_gather(weights_slices[0], dim=0)
+            if weights_slices[0] is not None
+            else None
+        )
+        ag_ti_curr = (
+            collective_group.all_gather(ids_slices[0], dim=0)
+            if ids_slices[0] is not None
+            else None
+        )
 
     rs_outputs = []
 
@@ -286,16 +307,20 @@ def pipelined_fused_moe_gmm(
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
             ag_hs_next = _all_gather_hidden(collective_group, hs_slices[i + 1])
-            ag_tw_next = (
-                collective_group.all_gather(weights_slices[i + 1], dim=0)
-                if weights_slices[i + 1] is not None
-                else None
-            )
-            ag_ti_next = (
-                collective_group.all_gather(ids_slices[i + 1], dim=0)
-                if ids_slices[i + 1] is not None
-                else None
-            )
+            if packed_fp8:
+                ag_tw_next = weights_slices[i + 1]
+                ag_ti_next = ids_slices[i + 1]
+            else:
+                ag_tw_next = (
+                    collective_group.all_gather(weights_slices[i + 1], dim=0)
+                    if weights_slices[i + 1] is not None
+                    else None
+                )
+                ag_ti_next = (
+                    collective_group.all_gather(ids_slices[i + 1], dim=0)
+                    if ids_slices[i + 1] is not None
+                    else None
+                )
 
         # Compute MoE kernel for current gathered chunk
         out_i = moe_fn(

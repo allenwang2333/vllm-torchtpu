@@ -162,42 +162,21 @@ def kernel(
             )
 
         if n_tok < 8:
-            st = qk(bq_rows).reshape(n_tok, num_q_heads, -1)
-            return (jnp.maximum(st, 0.0) * w[:, :, None]).sum(axis=1)
+            st = jnp.maximum(qk(bq_rows), 0.0).reshape(n_tok, num_q_heads, -1)
+            return (st * w[:, :, None]).sum(axis=1)
 
         # n_tok >= 8 only in the MIXED pass, whose q is pre-transposed into q_hm_ref.
         rows_hm = bq_rows.reshape(num_q_heads, n_tok, head_dim)
-        if n_tok == 8:
-            head_group = min(32, num_q_heads)
-            acc = None
-            for g in range(0, num_q_heads, head_group):
-                grp = min(head_group, num_q_heads - g)
-                st_g = qk(
-                    rows_hm[g : g + grp].reshape(grp * n_tok, head_dim)
-                ).reshape(grp, n_tok, -1)
-                for h in range(grp):
-                    term = jnp.maximum(st_g[h], 0.0) * w[:, g + h : g + h + 1]
-                    acc = term if acc is None else acc + term
-            return acc
-
-        head_group = min(8, num_q_heads)
+        head_group = min(32 if n_tok == 8 else 8, num_q_heads)
         acc = None
-        w_bf16 = w.astype(jnp.bfloat16)
-        z_bf16 = jnp.bfloat16(0.0)
         for g in range(0, num_q_heads, head_group):
             grp = min(head_group, num_q_heads - g)
-            st_g = (
-                qk(rows_hm[g : g + grp].reshape(grp * n_tok, head_dim))
-                .astype(jnp.bfloat16)
-                .reshape(grp, n_tok, -1)
-            )
-            grp_acc = None
+            st_g = jnp.maximum(
+                qk(rows_hm[g : g + grp].reshape(grp * n_tok, head_dim)), 0.0
+            ).reshape(grp, n_tok, -1)
             for h in range(grp):
-                term = jnp.maximum(st_g[h], z_bf16) * w_bf16[:, g + h : g + h + 1]
-                grp_acc = term if grp_acc is None else grp_acc + term
-            assert grp_acc is not None
-            grp_f32 = grp_acc.astype(jnp.float32)
-            acc = grp_f32 if acc is None else acc + grp_f32
+                term = st_g[h] * w[:, g + h : g + h + 1]
+                acc = term if acc is None else acc + term
         return acc
 
     def step_body(
@@ -222,6 +201,15 @@ def kernel(
         bq_weights_vec = [w_data[i] for i in range(seq_batch_size)]
 
         chunk_start = start_end_seq_idx_ref[2]
+        q_iota = jnp.arange(bq_sz, dtype=jnp.int32)
+        k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
+            jnp.int32, (bq_sz, bkv_sz), 1
+        )
+        lane_id = (
+            lax.broadcasted_iota(jnp.int32, (1, num_blk_sublanes_bkv, 128), 2)
+            if produce_blk_scores
+            else None
+        )
         bq_pos_compressed_vec, q_l_vec, bkvs, bkv_scales = [], [], [], []
         for batch_idx in range(seq_batch_size):
             s_l = seq_lens_ref[batch_start_seq_idx + batch_idx]
@@ -229,7 +217,7 @@ def kernel(
             q_l = cu_q_lens_ref[batch_start_seq_idx + batch_idx + 1] - q_s
             q_l_vec.append(q_l)
             block_start = bq_idx * bq_sz + jnp.maximum(0, chunk_start - q_s)
-            q_pos = s_l - q_l + block_start + jnp.arange(bq_sz, dtype=jnp.int32)
+            q_pos = s_l - q_l + block_start + q_iota
             bq_pos_compressed_vec.append(((q_pos + 1) >> shift_comp) - 1)
 
             key_bytes = bkv_vmem[batch_idx, :kv_head_dim_groups]
@@ -240,7 +228,7 @@ def kernel(
                 batch_idx, kv_head_dim_groups : kv_head_dim_groups + 1
             ].reshape(kv_packing, bkv_sz)[0:1]
             bkv_scales.append(
-                pltpu.bitcast(scale_bytes, jnp.float8_e8m0fnu).astype(jnp.bfloat16)
+                pltpu.bitcast(scale_bytes, jnp.float8_e8m0fnu).astype(jnp.float32)
             )
 
         ret, ret_blk = [], []
@@ -249,9 +237,6 @@ def kernel(
             s_summed = (
                 reduce_heads(bq, bkvs[batch_idx], bq_weights_vec[batch_idx])
                 * bkv_scales[batch_idx]
-            )
-            k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
-                jnp.int32, s_summed.shape, 1
             )
             kv_len = seq_lens_ref[batch_start_seq_idx + batch_idx] >> shift_comp
             bq_pos_compressed = bq_pos_compressed_vec[batch_idx]
@@ -268,9 +253,6 @@ def kernel(
                     jnp.where(is_newest, jnp.inf, s_summed)
                     .astype(jnp.bfloat16)
                     .reshape(-1, num_sublanes_bkv, 128)
-                )
-                lane_id = lax.broadcasted_iota(
-                    jnp.int32, (1, num_blk_sublanes_bkv, 128), 2
                 )
                 nbs = num_blk_sublanes_bkv
                 chunks = [s_blk[:, i * nbs : (i + 1) * nbs, :] for i in range(8)]
@@ -323,7 +305,7 @@ def kernel(
         _run_all()
 
 
-MAX_INDEXER_CHUNKS = 64
+MAX_INDEXER_CHUNKS = 128
 
 
 def _smem_budget_bytes() -> int:
@@ -340,9 +322,13 @@ def compute_meta_buf_len(
 ) -> int:
     """Static upper bound on `max_steps` across all 3 StreamIndex passes."""
     smem_budget_bytes = _smem_budget_bytes()
-    prefetch_bytes = (
-        max_num_seqs * 4 + (max_num_seqs + 1) * 4 + max_num_seqs * pages_per_seq * 4
+    eff_s = (
+        min(max_num_seqs, max(8, align_to(max_num_tokens, 8)))
+        if isinstance(max_num_tokens, int)
+        else max_num_seqs
     )
+    eff_pages = min(131072, eff_s * pages_per_seq)
+    prefetch_bytes = eff_s * 4 + (eff_s + 1) * 4 + eff_pages * 4
     step_meta_bytes = (len(MetadataRef.__annotations__) - 1) * 4
     smem_max = max(
         1024, ((smem_budget_bytes - prefetch_bytes) // step_meta_bytes // 1024) * 1024
@@ -350,7 +336,7 @@ def compute_meta_buf_len(
     if not isinstance(max_num_tokens, int):
         return smem_max
     num_chunks, chunk_len, bq_mixed, bkv_p = _chunk_and_bq_config(max_num_tokens)
-    eff_max_seqs = min(max_num_seqs, max(8, align_to(max_num_tokens, 8)))
+    eff_max_seqs = eff_s
     chunked = num_chunks > 1
     req_max = max(
         _max_steps_for_pass(

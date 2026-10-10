@@ -117,3 +117,18 @@ def tp_reduce_scatter(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
         output_tensor, input_tensor, group=tp_group.device_group
     )
     return output_tensor.movedim(0, dim).contiguous()
+
+
+def tp_all_to_all(x: torch.Tensor) -> torch.Tensor:
+    tp_group = get_tp_group()
+    world_size = tp_group.world_size
+    if world_size == 1:
+        return x
+    x_contig = x.contiguous()
+    output_tensor = torch.empty_like(
+        x_contig, memory_format=torch.contiguous_format
+    )
+    torch.distributed.all_to_all_single(
+        output_tensor, x_contig, group=tp_group.device_group
+    )
+    return output_tensor

@@ -62,18 +62,6 @@ _pallas_op_cache: dict[str, Any] = {}
 _R = P()
 
 
-def _prod_limbs_jax(tok: jax.Array, m_limbs: jax.Array) -> list[jax.Array]:
-    """Multiply 32-bit token IDs [T] by 9x7-bit multiplier limbs [L, 9] in int32."""
-    p = tok[:, None, None] * m_limbs[None, :, :]
-    out = []
-    carry = jnp.zeros_like(p[:, :, 0])
-    for k in range(9):
-        v = p[:, :, k] + carry
-        out.append(v & jnp.int32(0x7F))
-        carry = v >> 7
-    return out
-
-
 def _engram_hash_jax(
     input_ids: jax.Array,  # i32[T]
     pos: jax.Array,  # i32[T]
@@ -97,12 +85,14 @@ def _engram_hash_jax(
     num_slots = hash_cache.shape[0]
     num_pages = num_slots // swa_block_size
 
-    req = jnp.repeat(
-        jnp.arange(max_num_seqs, dtype=jnp.int32),
-        jnp.diff(query_start_loc),
-        total_repeat_length=num_tokens,
-    )
     token_idx = jnp.arange(num_tokens, dtype=jnp.int32)
+    eff_max_seqs = min(max_num_seqs, max(8, ((num_tokens + 7) // 8) * 8))
+    req = jnp.sum(
+        (token_idx[:, None] >= query_start_loc[1:eff_max_seqs][None, :]).astype(
+            jnp.int32
+        ),
+        axis=1,
+    )
     valid = token_idx < query_start_loc[distribution[2]]
     req_start_tok = query_start_loc[req]
     compressed = token_map[jnp.clip(input_ids, 0, token_map.shape[0] - 1)]
@@ -127,7 +117,13 @@ def _engram_hash_jax(
             lookback = pos - shift
             in_batch = (token_idx - shift) >= req_start_tok
             if shift < num_tokens:
-                batch_val = jnp.pad(compressed[: num_tokens - shift], (shift, 0))
+                batch_val = jnp.concatenate(
+                    [
+                        jnp.zeros((shift,), dtype=compressed.dtype),
+                        compressed[: num_tokens - shift],
+                    ],
+                    axis=0,
+                )
             else:
                 batch_val = jnp.zeros_like(compressed)
             c = jnp.clip(lookback, 0, max_pos)
@@ -145,29 +141,64 @@ def _engram_hash_jax(
         compressed, mode="drop"
     )
 
-    p_u32 = primes.astype(jnp.uint32)
-    w = jnp.ones_like(p_u32)
-    w_limbs = []
-    for _ in range(9):
-        w_limbs.append(w)
-        w = (w << np.uint32(7)) % p_u32
+    n_layers, n_orders, n_heads = primes.shape
+    lo_dim = n_layers * n_orders
+    if num_tokens >= 384:
+        p_u32_ht = primes.reshape(lo_dim, n_heads).T.astype(jnp.uint32)[:, :, None]
+        w_ht = jnp.ones_like(p_u32_ht)
+        tok_2d = jnp.stack(tokens, axis=0)
+        m_t = mult_limbs.transpose(2, 1, 0)[:, :, :, None]
+        p_all = m_t * tok_2d[None, :, None, :]
+        carry = jnp.zeros((max_ngram, n_layers, num_tokens), dtype=jnp.int32)
+        total_sum_ht = jnp.zeros((n_heads, lo_dim, num_tokens), dtype=jnp.uint32)
+        for k in range(9):
+            v = p_all[k] + carry
+            limb_k = v & jnp.int32(0x7F)
+            carry = v >> 7
+            roll = limb_k[0]
+            xor_orders = []
+            for i in range(1, max_ngram):
+                roll = jnp.bitwise_xor(roll, limb_k[i])
+                xor_orders.append(roll)
+            lk_ht = (
+                jnp.stack(xor_orders, axis=1)
+                .reshape(1, lo_dim, num_tokens)
+                .astype(jnp.uint32)
+            )
+            total_sum_ht = total_sum_ht + lk_ht * w_ht
+            w_ht = (w_ht << np.uint32(7)) % p_u32_ht
+        rem_ht = (total_sum_ht % p_u32_ht).astype(jnp.int32)
+        rem_tlh = rem_ht.transpose(2, 1, 0).reshape(
+            num_tokens, n_layers, n_orders * n_heads
+        )
+    else:
+        p_u32_3d = primes.reshape(1, lo_dim, n_heads).astype(jnp.uint32)
+        w_3d = jnp.ones_like(p_u32_3d)
+        tok_2d = jnp.stack(tokens, axis=1)
+        m_t = mult_limbs.transpose(2, 1, 0)[:, None, :, :]
+        p_all = tok_2d[None, :, :, None] * m_t
+        carry = jnp.zeros((num_tokens, max_ngram, n_layers), dtype=jnp.int32)
+        total_sum_3d = jnp.zeros((num_tokens, lo_dim, n_heads), dtype=jnp.uint32)
+        for k in range(9):
+            v = p_all[k] + carry
+            limb_k = v & jnp.int32(0x7F)
+            carry = v >> 7
+            roll = limb_k[:, 0, :]
+            xor_orders = []
+            for i in range(1, max_ngram):
+                roll = jnp.bitwise_xor(roll, limb_k[:, i, :])
+                xor_orders.append(roll)
+            lk = (
+                jnp.stack(xor_orders, axis=2)
+                .reshape(num_tokens, lo_dim, 1)
+                .astype(jnp.uint32)
+            )
+            total_sum_3d = total_sum_3d + lk * w_3d
+            w_3d = (w_3d << np.uint32(7)) % p_u32_3d
+        rem_3d = (total_sum_3d % p_u32_3d).astype(jnp.int32)
+        rem_tlh = rem_3d.reshape(num_tokens, n_layers, n_orders * n_heads)
 
-    roll_limbs = _prod_limbs_jax(tokens[0], mult_limbs[:, 0, :])
-    order_limbs = []
-    for i in range(1, max_ngram):
-        cur_limbs = _prod_limbs_jax(tokens[i], mult_limbs[:, i, :])
-        roll_limbs = [jnp.bitwise_xor(r, c) for r, c in zip(roll_limbs, cur_limbs)]
-        order_limbs.append(roll_limbs)
-
-    total_sum = jnp.zeros((num_tokens,) + primes.shape, dtype=jnp.uint32)
-    for k in range(9):
-        lk = jnp.stack(
-            [order_limbs[i][k] for i in range(max_ngram - 1)], axis=2
-        ).astype(jnp.uint32)
-        total_sum = total_sum + lk[:, :, :, None] * w_limbs[k][None, :, :, :]
-
-    rem_all = (total_sum % p_u32[None, :, :, :]).astype(jnp.int32)
-    out_hashes = rem_all.reshape(num_tokens, primes.shape[0], -1) + offsets[None, :, :]
+    out_hashes = rem_tlh + offsets[None, :, :]
     out_hashes = jnp.where(valid[:, None, None], out_hashes, jnp.int32(-1))
     return out_hashes, hash_cache
 
@@ -392,7 +423,7 @@ class TpuNgramHashState(nn.Module):
 _CPU_ENGRAM_WEIGHTS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 _NEXT_ENGRAM_TABLE_ID = 0
 # 32-slot CPU output ring pre-sized for max_num_batched_tokens=4096.
-_OUT_CPU_BUFS: list[torch.Tensor | None] = [None] * 32
+_OUT_CPU_BUFS: list[torch.Tensor | None] = [None] * 128
 _OUT_CPU_SLOT: int = 0
 _OUT_CPU_MIN_TOKENS = 4096
 _PIN_HOST_BUFS: bool = True
@@ -584,7 +615,7 @@ class _EngramTableSlices:
 def _next_host_buf(nbytes: int, row_span: int) -> torch.Tensor:
     global _OUT_CPU_SLOT, _PIN_HOST_BUFS
     slot = _OUT_CPU_SLOT
-    _OUT_CPU_SLOT = (slot + 1) & 31
+    _OUT_CPU_SLOT = (slot + 1) & 127
     buf = _OUT_CPU_BUFS[slot]
     needed = max(nbytes, _OUT_CPU_MIN_TOKENS * row_span) + 512
     if buf is None or buf.numel() < needed:

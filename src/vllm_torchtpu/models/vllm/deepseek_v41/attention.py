@@ -36,6 +36,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.tp_collectives import (
     tp_all_gather,
+    tp_all_to_all,
     tp_reduce_scatter,
     tp_shard_slice,
 )
@@ -61,6 +62,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_flash_com
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
+    _get_quantized_matmul_op,
     _get_quantized_matmul_prequant_op,
     quantized_matmul,
     quantized_matmul_prequant,
@@ -500,6 +502,8 @@ class VllmDeepseekV41MLAAttention(
             _ = self.wq_b_q_rope_prequant_op
         if envs.VLLM_DSV41_FUSED_SEAM_QUANT or envs.VLLM_DSV41_FUSED_Q_ROPE:
             _ = _get_quantized_matmul_prequant_op()
+        if "_tp_attn_wo_b_w" in self._buffers:
+            _ = _get_quantized_matmul_op()
         if self.indexer is not None and not torch.compiler.is_compiling():
             _ = self._leader_group_bounds(eff_ced)
         swa_tensor = _live_cache(getattr(self.swa_cache_layer, "kv_cache", None))
@@ -969,13 +973,14 @@ class VllmDeepseekV41MLAAttention(
             if ced_global_from_encoder is None
             else ced_global_from_encoder
         )
+        compressor = None if eff_ced_global else getattr(self, "compressor", None)
+        use_tp_attn = (
+            envs.VLLM_DSV41_TP_ATTN
+            and num_tokens >= envs.VLLM_DSV41_TP_ATTN_MIN_TOKENS
+        )
         return (
             num_tokens % tp_size == 0
-            and (
-                self.compressor is None
-                or bool(eff_ced_global)
-                or self._in_encoder_stage
-            )
+            and (compressor is None or use_tp_attn)
             and (self.indexer is None or use_tp_idx)
         )
 
@@ -1147,6 +1152,40 @@ class VllmDeepseekV41MLAAttention(
                 torch.tensor([rank], dtype=torch.int64, device=self.wq_b.weight.device),
                 persistent=False,
             )
+            if not self.non_causal_multi_token_decode:
+                self._build_tp_wo_b_weights()
+
+    def _build_tp_wo_b_weights(self) -> None:
+        """Replicates wo_b across TP ranks for token-sharded AllToAll wo_b."""
+        wo_b_scale = getattr(self.wo_b, "weight_scale", None)
+        if wo_b_scale is None:
+            return
+        wo_b_s = wo_b_scale.data
+        if wo_b_s.ndim not in (1, 4):
+            return
+        tp_size = get_tensor_model_parallel_world_size()
+
+        def gather(x: torch.Tensor, dim: int) -> torch.Tensor:
+            if x.element_size() == 1:
+                out = tp_all_gather(x.view(torch.uint8), dim).view(x.dtype)
+            else:
+                out = tp_all_gather(x, dim)
+            return out.clone(memory_format=torch.contiguous_format)
+
+        buffers = {
+            "_tp_attn_wo_b_w": gather(self.wo_b.weight.data, 0),
+            "_tp_attn_wo_b_s": (
+                gather(wo_b_s, 1)
+                if wo_b_s.ndim == 4
+                else gather(wo_b_s.unsqueeze(0), 0).view(1, tp_size, 1, -1)
+            ),
+        }
+        device = self.wo_b.weight.device
+        if device.type == "tpu":
+            synchronize_tensors(list(buffers.values()), wait=True)
+            _ = _get_quantized_matmul_op()
+        for name, tensor in buffers.items():
+            self.register_buffer(name, tensor, persistent=False)
 
     def write_encoder_global_kv(
         self, hidden_states: torch.Tensor, positions: torch.Tensor
@@ -1226,6 +1265,24 @@ class VllmDeepseekV41MLAAttention(
                 )
                 if t is not None
             ]
+        elif (
+            envs.VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS > 0
+            and "_tp_attn_wo_b_w" in self._buffers
+        ):
+            _ = [
+                torch.ops.aten.alias.default(t)
+                for t in (
+                    self.wo_b.weight,
+                    (
+                        self.wo_b.weight_scale
+                        if "weight_scale" in self.wo_b._parameters
+                        else None
+                    ),
+                    self._tp_attn_wo_b_w,
+                    self._tp_attn_wo_b_s,
+                )
+                if t is not None
+            ]
         use_tp_idx = self.indexer is not None and self.indexer.use_tp_indexer(
             num_tokens
         )
@@ -1285,10 +1342,7 @@ class VllmDeepseekV41MLAAttention(
             use_fused_q_rope
             and (not token_sharded_qkv or use_tp_attn)
             and ("weight" in self.q_norm._parameters)
-            and (
-                self.indexer is None
-                or getattr(self.indexer, "can_accept_prequant_query", lambda: False)()
-            )
+            and self.indexer is None
         )
         if token_sharded_qkv:
             if not use_tp_attn:
@@ -1600,6 +1654,22 @@ class VllmDeepseekV41MLAAttention(
             self.wo_a.weight_scale,
         )
         if return_token_sharded and tp_size > 1:
+            if (
+                num_tokens <= 2048
+                and num_tokens % tp_size == 0
+                and "_tp_attn_wo_b_w" in self._buffers
+                and not getattr(self, "_in_full_stage", False)
+                and isinstance(z.shape[0], int)
+            ):
+                z_a2a = tp_all_to_all(z)
+                z_local = (
+                    z_a2a.view(tp_size, num_tokens // tp_size, z.shape[1])
+                    .transpose(0, 1)
+                    .reshape(num_tokens // tp_size, -1)
+                )
+                return quantized_matmul(
+                    z_local, self._tp_attn_wo_b_w, self._tp_attn_wo_b_s
+                )
             out_parallel = self.wo_b.quant_method.apply(self.wo_b, z, None)
             return tp_reduce_scatter(out_parallel, dim=0)
         return self.wo_b(z)

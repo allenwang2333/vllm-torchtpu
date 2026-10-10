@@ -27,6 +27,7 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
     MOE_FP8_DISPATCH_BLOCK,
     fused_moe_func,
     fused_moe_func_fp8_dispatch,
+    quantize_moe_dispatch_packed_rows,
     quantize_moe_dispatch_rows,
     quantize_to_native_fp4_kmajor,
     requant_unpack_kmajor,
@@ -45,6 +46,7 @@ _fused_moe_fp8_dispatch_cache: dict[tuple[int, str, bool, Any, bool], Callable] 
 # rhs_quant_dtype -> fp8 dispatch admitted; filled by prebuild_fused_moe_kernel.
 _moe_fp8_dispatch_rhs_dtypes: dict[Any, bool] = {}
 _moe_fp8_dispatch_quant_op = None
+_moe_fp8_dispatch_packed_quant_op = None
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
@@ -255,6 +257,7 @@ def prebuild_fused_moe_kernel(
         _moe_fp8_dispatch_rhs_dtypes[rhs_quant_dtype] = admitted
         if admitted:
             _get_moe_fp8_dispatch_quant_op()
+            _get_moe_fp8_dispatch_packed_quant_op()
             _get_fused_moe_fp8_dispatch_op(
                 topk=topk,
                 activation=activation,
@@ -284,6 +287,33 @@ def _get_moe_fp8_dispatch_quant_op():
         op.register_fake(_fake_quant)
         _moe_fp8_dispatch_quant_op = op
     return _moe_fp8_dispatch_quant_op
+
+
+def _get_moe_fp8_dispatch_packed_quant_op():
+    global _moe_fp8_dispatch_packed_quant_op
+    if _moe_fp8_dispatch_packed_quant_op is None:
+        op = pallas.jax_op(
+            "pallas::moe_fp8_dispatch_packed_quant",
+            quantize_moe_dispatch_packed_rows,
+        )
+
+        def _fake_packed_quant(hidden_states, topk_weights, topk_ids):
+            num_tokens, hidden_size = hidden_states.shape
+            topk = topk_weights.shape[1]
+            itemsize = hidden_states.element_size()
+            used_bytes = (
+                (hidden_size // MOE_FP8_DISPATCH_BLOCK) * itemsize
+                + topk * itemsize
+                + topk * 4
+            )
+            trailer_bytes = ((used_bytes + 127) // 128) * 128
+            return hidden_states.new_empty(
+                (num_tokens, hidden_size + trailer_bytes), dtype=torch.int8
+            )
+
+        op.register_fake(_fake_packed_quant)
+        _moe_fp8_dispatch_packed_quant_op = op
+    return _moe_fp8_dispatch_packed_quant_op
 
 
 def _get_fused_moe_fp8_dispatch_op(
@@ -316,8 +346,10 @@ def _get_fused_moe_fp8_dispatch_op(
         ),
     )
 
-    def _fake_fused_moe_fp8_dispatch(hidden_q, hidden_scale, *args, **kwargs):
-        return hidden_q.new_empty(hidden_q.shape, dtype=hidden_scale.dtype)
+    def _fake_fused_moe_fp8_dispatch(hidden_q, hidden_scale, w1, w2, *args, **kwargs):
+        return hidden_q.new_empty(
+            (hidden_q.shape[0], w2.shape[-1]), dtype=hidden_scale.dtype
+        )
 
     kernel.register_fake(_fake_fused_moe_fp8_dispatch)
     _fused_moe_fp8_dispatch_cache[cache_key] = kernel
@@ -399,17 +431,26 @@ def moe_fp8_dispatch_enabled(
 
 def quantize_moe_dispatch(
     hidden_states: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Quantizes local MoE inputs for the all-gather.
 
-    Returns (int8 rows [S, H], flat scales [S * H // 512]); see
-    quantize_moe_dispatch_rows.
+    When `topk_weights` and `topk_ids` are provided, returns a single packed
+    128-lane-aligned int8 tensor `[S, H + 128]` containing `hidden_q`,
+    `hidden_scale`, `topk_weights`, and `topk_ids`. Otherwise returns
+    `(int8 rows [S, H], flat scales [S * H // 512])`; see
+    `quantize_moe_dispatch_rows`.
     """
+    if topk_weights is not None and topk_ids is not None:
+        return _get_moe_fp8_dispatch_packed_quant_op()(
+            hidden_states, topk_weights, topk_ids
+        )
     return _get_moe_fp8_dispatch_quant_op()(hidden_states)
 
 
 def fused_moe_gmm_fp8_dispatch(
-    hidden_states: tuple[torch.Tensor, torch.Tensor],
+    hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     w1: torch.Tensor,
     w2: torch.Tensor,
     w1_scale: torch.Tensor | None,
@@ -428,7 +469,11 @@ def fused_moe_gmm_fp8_dispatch(
 
     Bit-identical to fused_moe_gmm on the unquantized rows.
     """
-    hidden_q, hidden_scale = hidden_states
+    if isinstance(hidden_states, tuple):
+        hidden_q, hidden_scale = hidden_states
+    else:
+        hidden_q = hidden_states
+        hidden_scale = topk_weights
     fused_moe = _get_fused_moe_fp8_dispatch_op(
         topk=topk,
         activation=activation,

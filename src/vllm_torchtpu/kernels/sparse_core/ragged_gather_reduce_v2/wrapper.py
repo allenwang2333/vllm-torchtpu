@@ -11,6 +11,10 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import (
     kernel,
     memory_ref,
 )
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
+    ragged_gather_reduce as ragged_gather_reduce_v3,
+    token_block_alignment,
+)
 
 
 def _fallback_implementation(
@@ -185,6 +189,20 @@ def ragged_gather_reduce_v2(
             x, indices, topk_weights, valid_rows_mask, reduce_group_size
         )
 
+    if (
+        x.dtype == jnp.bfloat16
+        and reduce_group_size >= 2
+        and x.shape[0] == cfg.input_size
+        and x.shape[0] <= (1 << 20)
+        and cfg.sc_info.num_lanes == 16
+        and cfg.hidden_size % cfg.tpu_info.num_lanes == 0
+    ):
+        alignment = token_block_alignment(cfg.hidden_size, cfg.tpu_info)
+        if cfg.output_size >= alignment and cfg.output_size % alignment == 0:
+            return ragged_gather_reduce_v3(
+                x, indices, topk_weights, valid_rows_mask, reduce_group_size
+            )
+
     # Step 3: Pre-process inputs (weights, padding, sort by validity).
     # Simplify topk gather by using fp32 and ensure data is always word aligned.
     topk_weights_f32 = topk_weights.astype(jnp.float32)
@@ -228,7 +246,6 @@ def ragged_gather_reduce_v2(
     )(scalar, x, topk_weights_f32)
 
     # Step 5: Post-process the output (drop padding, zero empty groups, cast).
-    out = out[: cfg.output_size, : cfg.hidden_size]
+    out = out[: cfg.output_size, : cfg.hidden_size].astype(x.dtype)
     # TODO(kyuyeunk): Use zero initialization instead of masking.
-    out = jnp.where(mask[: cfg.output_size, None], out, jnp.zeros_like(out))
-    return out.astype(x.dtype)
+    return jnp.where(mask[: cfg.output_size, None], out, 0)

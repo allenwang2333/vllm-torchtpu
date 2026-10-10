@@ -546,13 +546,9 @@ class DeepseekV41DecoderLayer(nn.Module):
                 hidden_states_scale=hidden_states_scale,
             )
 
-        use_prequant_ffn = (
-            ops.fused_quant is not None
-            and getattr(self.ffn, "can_accept_prequant_hidden", lambda **_: False)(
-                token_sharded=token_sharded
-            )
-            and not token_sharded
-        )
+        use_prequant_ffn = ops.fused_quant is not None and getattr(
+            self.ffn, "can_accept_prequant_hidden", lambda **_: False
+        )(token_sharded=token_sharded)
         if use_prequant_ffn:
             (
                 residual,
@@ -573,12 +569,22 @@ class DeepseekV41DecoderLayer(nn.Module):
                 hc_ffn_scale,
                 hc_ffn_base,
             )
-            return (
-                self.ffn(
+            if token_sharded:
+                ffn_out = self.ffn(
+                    hidden_states,
+                    return_token_sharded=True,
+                    hidden_states_fp8=ffn_fp8,
+                    hidden_states_scale=ffn_scale,
+                    input_is_token_sharded=True,
+                )
+            else:
+                ffn_out = self.ffn(
                     hidden_states,
                     hidden_states_fp8=ffn_fp8,
                     hidden_states_scale=ffn_scale,
-                ),
+                )
+            return (
+                ffn_out,
                 residual,
                 ffn_pre,
                 ffn_post,
@@ -597,8 +603,11 @@ class DeepseekV41DecoderLayer(nn.Module):
             hc_ffn_base,
         )
         if token_sharded:
-            hidden_states_ffn = tp_all_gather(hidden_states, dim=0)
-            ffn_out = self.ffn(hidden_states_ffn, return_token_sharded=True)
+            ffn_out = self.ffn(
+                hidden_states,
+                return_token_sharded=True,
+                input_is_token_sharded=True,
+            )
             return ffn_out, residual, ffn_pre, ffn_post, ffn_comb, entry_aux
         return self.ffn(hidden_states), residual, ffn_pre, ffn_post, ffn_comb, entry_aux
 
@@ -962,6 +971,8 @@ class DeepseekV41FullStage(nn.Module):
                 return out, aux_hidden_states
             return out
 
+        for layer in self.layers:
+            layer.attn._in_full_stage = True
         (
             positions,
             hidden_states,
@@ -987,6 +998,8 @@ class DeepseekV41FullStage(nn.Module):
             precomputed_engram_hashes=engram_hashes,
             aux_hidden_state_layers=self.aux_hidden_state_layers,
         )
+        for layer in self.layers:
+            layer.attn._in_full_stage = False
         _clear_stage_caches(self.layers)
         if not get_pp_group().is_last_rank:
             hidden_states = get_mhc_post_v41_op()(
@@ -1901,3 +1914,8 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
             engram_mod = getattr(layer, "engram", None)
             if engram_mod is not None:
                 engram_mod.process_weights_after_loading(allow_dummy=True)
+            ffn_mod = getattr(layer, "ffn", None)
+            if ffn_mod is not None and hasattr(
+                ffn_mod, "process_weights_after_loading"
+            ):
+                ffn_mod.process_weights_after_loading()

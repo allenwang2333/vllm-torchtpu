@@ -82,7 +82,9 @@ def deinterleave_lane(val: jax.Array) -> tuple[jax.Array, jax.Array]:
     return lhs, rhs
 
 
-def apply_act_fn(acc: jax.Array, fuse_act: str | None):
+def apply_act_fn(
+    acc: jax.Array, fuse_act: str | None, *, contiguous_halves: bool = False
+):
     """Applies a fused activation function to the accumulator.
 
     This function is used when an activation function is fused with the matrix
@@ -92,6 +94,8 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
     Args:
         acc: The accumulator array, with the last dimension being 2 * tile_n.
         fuse_act: The name of the activation function to apply.
+        contiguous_halves: If True, `acc` holds `[gate, up]` as two contiguous
+            halves along the last axis instead of lane-interleaved chunks.
 
     Returns:
         The result of applying the activation function.
@@ -103,7 +107,11 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
     if fuse_act is None:
         return acc
 
-    acc_gate, acc_up = deinterleave_lane(acc)
+    if contiguous_halves:
+        half = acc.shape[-1] // 2
+        acc_gate, acc_up = acc[..., :half], acc[..., half:]
+    else:
+        acc_gate, acc_up = deinterleave_lane(acc)
     match fuse_act:
         case "silu":
             return jax.nn.silu(acc_gate) * acc_up
@@ -295,6 +303,16 @@ class GmmConfigs:
         else:
             return self.dims.size_n // 2
 
+    @property
+    def contiguous_fuse_act(self) -> bool:
+        if self.fuse_act is None:
+            return False
+        mxu_size = pltpu.get_tpu_info().mxu_column_size
+        return (
+            self.tiles.tile_n == self.out_size_n
+            and self.tiles.tile_n % mxu_size == 0
+        )
+
 
 TileFn = Callable[[Dimensions, InputConfigs, InputConfigs, int, str | None], TileSizes]
 
@@ -360,20 +378,23 @@ def generate_block_specs(
         index_map.lhs_index_map,
     )
 
+    rhs_cols = (
+        2 * cfgs.tiles.tile_n if cfgs.contiguous_fuse_act else cfgs.tiles.tile_n
+    )
     rhs_weight_spec = pl.BlockSpec(
-        (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
+        (None, cfgs.tiles.tile_k, rhs_cols),
         index_map.rhs_weight_index_map,
         pipeline_mode=pl.Buffered(buffer_count=3),
     )
     rhs_scale_block_spec = rhs_bias_block_spec = None
     if cfgs.rhs_cfgs.has_bias:
         rhs_bias_block_spec = pl.BlockSpec(
-            (None, 1, cfgs.tiles.tile_n),
+            (None, 1, rhs_cols),
             index_map.rhs_bias_index_map,
         )
     if cfgs.rhs_cfgs.has_scale:
         rhs_scale_block_spec = pl.BlockSpec(
-            (None, cfgs.num_quant_blocks_per_tile_k, 1, cfgs.tiles.tile_n),
+            (None, cfgs.num_quant_blocks_per_tile_k, 1, rhs_cols),
             index_map.rhs_scale_index_map,
         )
 
@@ -500,29 +521,42 @@ def inner_kernel(
         acc_list = []
         if not cfgs.lhs_cfgs.should_quantize:
             # Unquantized matmul path.
-            for start_n in range(0, rhs_tile_n, mxu_size):
-                end_n = min(rhs_tile_n, start_n + mxu_size)
-                col_size = end_n - start_n
-
-                acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
-                for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):
-                    end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)
-
+            if (
+                rhs_qbs >= cfgs.tiles.tile_k
+                and not cfgs.rhs_cfgs.should_dequantize_after_matmul
+            ):
+                for start_n in range(0, rhs_tile_n, mxu_size):
+                    end_n = min(rhs_tile_n, start_n + mxu_size)
                     block_acc = jnp.matmul(
-                        tiled_lhs[:, start_k:end_k],
-                        tiled_rhs[start_k:end_k, start_n:end_n],
+                        tiled_lhs,
+                        tiled_rhs[:, start_n:end_n],
                         preferred_element_type=jnp.float32,
                     ).astype(acc_ref.dtype)
+                    acc_list.append(block_acc)
+            else:
+                for start_n in range(0, rhs_tile_n, mxu_size):
+                    end_n = min(rhs_tile_n, start_n + mxu_size)
+                    col_size = end_n - start_n
 
-                    if cfgs.rhs_cfgs.should_dequantize_after_matmul:
-                        b_id = start_k // rhs_qbs
-                        rhs_scale_replicated = tiled_rhs_ref.get_scale(
-                            replicate_size=bucket_m
-                        )[b_id, :, start_n : start_n + col_size]
-                        block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
+                    acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
+                    for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):
+                        end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)
 
-                    acc_n += block_acc
-                acc_list.append(acc_n)
+                        block_acc = jnp.matmul(
+                            tiled_lhs[:, start_k:end_k],
+                            tiled_rhs[start_k:end_k, start_n:end_n],
+                            preferred_element_type=jnp.float32,
+                        ).astype(acc_ref.dtype)
+
+                        if cfgs.rhs_cfgs.should_dequantize_after_matmul:
+                            b_id = start_k // rhs_qbs
+                            rhs_scale_replicated = tiled_rhs_ref.get_scale(
+                                replicate_size=bucket_m
+                            )[b_id, :, start_n : start_n + col_size]
+                            block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
+
+                        acc_n += block_acc
+                    acc_list.append(acc_n)
         else:
             # Quantized matmul path.
             lhs_q_dtype = cfgs.lhs_cfgs.quant_dtype
@@ -566,10 +600,10 @@ def inner_kernel(
                         block_lhs_q = block_lhs
                         lane = lax.broadcasted_iota(
                             jnp.int32, tiled_lhs_scale.shape, 1
-                        )
+                        ).astype(tiled_lhs_scale.dtype)
                         block_scale = jnp.max(
                             jnp.where(
-                                lane == start_k // q_block_size, tiled_lhs_scale, 0
+                                lane == float(start_k // q_block_size), tiled_lhs_scale, 0
                             ),
                             axis=1,
                             keepdims=True,
@@ -612,7 +646,9 @@ def inner_kernel(
                 tiled_rhs_bias = tiled_rhs_ref.get_bias()
                 acc += tiled_rhs_bias.astype(acc.dtype)
 
-            acc = apply_act_fn(acc, cfgs.fuse_act)
+            acc = apply_act_fn(
+                acc, cfgs.fuse_act, contiguous_halves=cfgs.contiguous_fuse_act
+            )
 
             # Mask out rows that does not belong to the current group.
             iota = lax.broadcasted_iota(jnp.int32, acc.shape, 0)
@@ -686,10 +722,25 @@ def inner_kernel(
             # partial m is only invoked at last matmul.
             lax.cond(is_first_k_step, matmul_first_last, matmul_last)
 
+    min_bucket_idx = (
+        max(0, 128 // cfgs.tiles.bucket_base - 1)
+        if (
+            cfgs.rhs_cfgs.should_dequantize_before_matmul
+            and cfgs.tiles.tile_m >= 128
+            and 128 % cfgs.tiles.bucket_base == 0
+        )
+        else 0
+    )
     branches = []
-    for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
+    for bucket_idx in range(
+        min_bucket_idx, cfgs.tiles.tile_m // cfgs.tiles.bucket_base
+    ):
         branches.append(functools.partial(run_matmul_step, bucket_idx=bucket_idx))
-    bucket_idx = m_end_local // cfgs.tiles.bucket_base
+    bucket_idx = jnp.clip(
+        pl.cdiv(m_end_local, cfgs.tiles.bucket_base) - 1 - min_bucket_idx,
+        0,
+        len(branches) - 1,
+    )
     lax.switch(bucket_idx, branches)
 
 
@@ -942,7 +993,7 @@ def kernel_main(
         )
         lhs_spec = (lhs_spec, lhs_scale_spec)
 
-    if cfgs.fuse_act is not None:
+    if cfgs.fuse_act is not None and not cfgs.contiguous_fuse_act:
         rhs_up_ref = jax.tree.map(lambda x: x.at[..., cfgs.out_size_n :], rhs_ref)
         rhs_ref = FusedWeightsRef(gate=rhs_ref, up=rhs_up_ref)
 
@@ -1102,7 +1153,7 @@ def calculate_tiling(
     # TODO(alynie, kyuyeunk): max number of bucket was choosen empiirically.
     # Revisit the value to be based on number of instruction memory size.
     max_num_buckets = (
-        (2 if dims.size_m <= 768 else 4) if small_group_batch else 4
+        (1 if dims.size_m <= 2048 else 4) if small_group_batch else 4
     )
     bucket_base = tile_m
     for _ in range(1, max_num_buckets):
@@ -1558,14 +1609,16 @@ def _prequantized_lhs_configs(
 
 def _quantize_lhs_rows_kernel(lhs_ref, lhs_q_ref, lhs_scale_ref, *, block_size):
     dtype_max = float(jnp.finfo(lhs_q_ref.dtype).max)
-    lane = lax.broadcasted_iota(jnp.int32, lhs_scale_ref.shape, 1)
+    lane = lax.broadcasted_iota(jnp.int32, lhs_scale_ref.shape, 1).astype(
+        lhs_scale_ref.dtype
+    )
     scale = jnp.zeros(lhs_scale_ref.shape, lhs_scale_ref.dtype)
     for b, start in enumerate(range(0, lhs_ref.shape[1], block_size)):
         block_lhs_q, block_scale = _quantize_lhs_block(
             lhs_ref[:, start : start + block_size], lhs_q_ref.dtype, dtype_max
         )
         lhs_q_ref[:, start : start + block_size] = block_lhs_q
-        scale = jnp.where(lane == b, block_scale, scale)
+        scale = jnp.where(lane == float(b), block_scale, scale)
     lhs_scale_ref[...] = scale
 
 

@@ -51,11 +51,11 @@ class DSparkProposer(DFlashProposer):
         self.sample_from_anchor = bool(hf_dict.get("sample_from_anchor", True))
         block = hf_dict.get("dspark_block_size") or hf_dict.get("block_size")
         K = self.speculative_config.num_speculative_tokens
-        if block is not None and int(block) != K:
+        if block is not None and int(block) < K:
             raise ValueError(
-                f"num_speculative_tokens={K} does not match the DSpark "
+                f"num_speculative_tokens={K} exceeds the DSpark "
                 f"checkpoint's block size {block}; the block/Markov-head "
-                "machinery is trained for exactly that block length."
+                "machinery supports at most that block length."
             )
         # vLLM 0.29 drafting options this proposer does not implement yet.
         spec = self.speculative_config
@@ -95,12 +95,24 @@ class DSparkProposer(DFlashProposer):
         max_chunk_reqs = max(
             self.runner.num_reqs_max_model_len, self.runner.num_reqs_most_model_len or 0
         )
-        if self.block_size == 5:
+        if self.block_size in (4, 5):
+            b = self.block_size
             if max_chunk_reqs == 64:
-                return [16, 80, 160, 240, 320]
+                return [16, 16 * b, 32 * b, 48 * b, 64 * b]
             if max_chunk_reqs > 64:
-                max_draft_tokens = max_chunk_reqs * 5
-                base = [16, 40, 80, 160, 240, 320, 400, 640, 1280, 2560]
+                max_draft_tokens = max_chunk_reqs * b
+                base = [
+                    16,
+                    8 * b,
+                    16 * b,
+                    32 * b,
+                    48 * b,
+                    64 * b,
+                    80 * b,
+                    128 * b,
+                    256 * b,
+                    512 * b,
+                ]
                 buckets = [p for p in base if p <= max_draft_tokens]
                 if buckets and buckets[-1] < max_draft_tokens:
                     buckets.append((max_draft_tokens + 7) & ~7)

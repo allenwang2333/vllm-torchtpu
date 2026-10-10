@@ -138,11 +138,13 @@ def gather_cos_sin(
 
     half = rotary_dim // 2
     cs = cos_sin_cache[positions]
+    pad_w = LANE - rotary_dim
+    if pad_w == 0 and not inverse:
+        return jnp.repeat(cs, 2, axis=-1).astype(out_dtype)
     c = jnp.repeat(cs[:, :half], 2, axis=-1)
     s = jnp.repeat(cs[:, half:], 2, axis=-1)
     if inverse:
         s = -s
-    pad_w = LANE - rotary_dim
     if pad_w > 0:
         ones = jnp.ones((num_tokens, pad_w), dtype=cs.dtype)
         zeros = jnp.zeros((num_tokens, pad_w), dtype=cs.dtype)
@@ -167,19 +169,20 @@ def _rope_heads_2d(
     *,
     heads_per_group: int,
     head_dim: int,
-    lane: jax.Array,
+    lane_perm: jax.Array,
     sign: jax.Array,
     out_dtype: jnp.dtype,
 ) -> jax.Array:
     """Apply RoPE directly on 2D ``(sub_t, heads_per_group * head_dim)``."""
     lo = head_dim - LANE
+    sin_signed = sin * sign
     pieces = []
     for h in range(heads_per_group):
         base_col = h * head_dim
         pieces.append(x_2d[:, base_col : base_col + lo])
         tail = x_2d[:, base_col + lo : base_col + head_dim].astype(jnp.float32)
-        rot = _lane_gather(tail, lane ^ 1) * sign
-        roped = (tail * cos + rot * sin).astype(out_dtype)
+        rot = _lane_gather(tail, lane_perm)
+        roped = (tail * cos + rot * sin_signed).astype(out_dtype)
         pieces.append(roped)
     return jnp.concatenate(pieces, axis=1)
 
@@ -205,6 +208,7 @@ def _kernel(
     sub_t = tile_t // num_sub_t
     out_dtype = x_ref.dtype
     lane = jnp.arange(LANE)
+    lane_perm = lane ^ 1
     sign = jnp.where(lane % 2 == 0, -1.0, 1.0).astype(jnp.float32)
 
     def _prep_lhs(s: int):
@@ -218,7 +222,7 @@ def _kernel(
             sin_val,
             heads_per_group=SUBLANE,
             head_dim=head_dim,
-            lane=lane,
+            lane_perm=lane_perm,
             sign=sign,
             out_dtype=out_dtype,
         )
@@ -431,6 +435,7 @@ def _wq_b_q_rope_kernel_inquant(
     cos_sin = cos_sin_ref[...]
     sub_t = tile_t // num_sub_t
     lane = jnp.arange(LANE)
+    lane_perm = lane ^ 1
     sign = jnp.where(lane % 2 == 0, -1.0, 1.0).astype(jnp.float32)
 
     def _prep_and_dot(s: int):
@@ -467,7 +472,7 @@ def _wq_b_q_rope_kernel_inquant(
             sin,
             heads_per_group=heads_per_group,
             head_dim=head_dim,
-            lane=lane,
+            lane_perm=lane_perm,
             sign=sign,
             out_dtype=jnp.bfloat16,
         )
@@ -494,6 +499,7 @@ def _wq_b_q_rope_kernel(
     lhs_s_all = lhs_s_ref[...]
     sub_t = tile_t // num_sub_t
     lane = jnp.arange(LANE)
+    lane_perm = lane ^ 1
     sign = jnp.where(lane % 2 == 0, -1.0, 1.0).astype(jnp.float32)
 
     def _dot(s: int):
@@ -520,7 +526,7 @@ def _wq_b_q_rope_kernel(
             sin,
             heads_per_group=heads_per_group,
             head_dim=head_dim,
-            lane=lane,
+            lane_perm=lane_perm,
             sign=sign,
             out_dtype=jnp.bfloat16,
         )
@@ -562,7 +568,10 @@ def fused_wq_b_q_rope_projection(
         positions = jnp.pad(positions, (0, pad_t))
     t_pad = qr.shape[0]
     eff_cap_t = 1024 if (num_heads >= 64 and t_pad >= 1024 and cap_t == 512) else cap_t
-    tile_t = SUBLANE * _largest_divisor(t_pad // SUBLANE, cap=eff_cap_t // SUBLANE)
+    fp8_row_align = 4 * SUBLANE if t_pad % (4 * SUBLANE) == 0 else t_pad
+    tile_t = fp8_row_align * _largest_divisor(
+        t_pad // fp8_row_align, cap=max(1, eff_cap_t // fp8_row_align)
+    )
     sub_t = SUBLANE * _largest_divisor(tile_t // SUBLANE, cap=128 // SUBLANE)
     num_t_tiles = t_pad // tile_t
 

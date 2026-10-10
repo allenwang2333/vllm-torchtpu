@@ -866,7 +866,10 @@ def qkv_norm_rope_quant(
         cap_n = 128
     else:
         cap_n = 256
-    tile_n = SUBLANE * largest_divisor(t_pad // SUBLANE, cap=cap_n // SUBLANE)
+    fp8_row_align = 4 * SUBLANE if t_pad % (4 * SUBLANE) == 0 else t_pad
+    tile_n = fp8_row_align * largest_divisor(
+        t_pad // fp8_row_align, cap=max(1, cap_n // fp8_row_align)
+    )
     cos_sin = _expand_cos_sin(positions, cos_sin_cache, inverse=inverse)
     q_w_2d = q_weight.astype(qr_kv.dtype).reshape(1, q_dim)
     kv_w_2d = kv_weight.astype(qr_kv.dtype).reshape(1, kv_dim)

@@ -26,6 +26,21 @@ from vllm_torchtpu.kernels.deepseek_v41.sparse_mla import (
 from vllm_torchtpu.utils import align_to
 
 
+def prepare_swa_page_indices_jax(
+    swa_page_indices: jax.Array,
+    *,
+    sw_cache_num_pages: int,
+) -> jax.Array:
+    """Maps raw SWA page table indices onto the physical ring-buffer once per stage."""
+    if sw_cache_num_pages > 1:
+        return jnp.where(
+            swa_page_indices > 0,
+            ((swa_page_indices - 1) % (sw_cache_num_pages - 1)) + 1,
+            0,
+        )
+    return swa_page_indices
+
+
 def _prepare_swa_metadata(
     swa_kv_lens: jax.Array,
     swa_page_indices: jax.Array,
@@ -35,6 +50,7 @@ def _prepare_swa_metadata(
     sw_cache_num_pages: int,
     sliding_window: int,
     logical_page_size: int,
+    page_indices_ring_mapped: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     max_num_seqs = swa_kv_lens.shape[0]
     pages_per_seq = swa_page_indices.size // max_num_seqs
@@ -66,7 +82,7 @@ def _prepare_swa_metadata(
         if pad_seqs > 0:
             gathered = gathered[:max_num_seqs]
         swa_page_indices = gathered.reshape(-1)
-    if sw_cache_num_pages > 1:
+    if sw_cache_num_pages > 1 and not page_indices_ring_mapped:
         swa_page_indices = jnp.where(
             swa_page_indices > 0,
             ((swa_page_indices - 1) % (sw_cache_num_pages - 1)) + 1,
@@ -92,6 +108,7 @@ def _run_swa(
     ced_decoder: bool = False,
     token_parallel: bool = False,
     non_causal_block: bool = False,
+    page_indices_ring_mapped: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """SWA pass; output stays unnormalized when CSA follows (folds swa_l/swa_m)."""
     if sw_cache.shape[0] == 0:
@@ -118,6 +135,12 @@ def _run_swa(
         sw_cache_num_pages=sw_cache.shape[0],
         sliding_window=sliding_window,
         logical_page_size=logical_page_size,
+        page_indices_ring_mapped=page_indices_ring_mapped,
+    )
+    bq_prefill = 64 if q.shape[1] > 64 else 128
+    bkv_p_decode = max(2, (sliding_window + logical_page_size - 1) // logical_page_size)
+    bkv_p_prefill = max(
+        2, (sliding_window + bq_prefill + logical_page_size - 1) // logical_page_size
     )
     return mla_sliding_window_ragged_paged_attention(
         q=q,
@@ -134,44 +157,38 @@ def _run_swa(
         # Tuned on TPU v7x:
         # - Decode (idx 0): bkv_p = cdiv(sliding_window, logical_page_size) so
         #   bkv_sz >= sliding_window activates run_mla_batched_decode_kernel.
-        # - Prefill/Mixed (idx 1, 2): bkv_p = cdiv(sliding_window + 128, logical_page_size)
-        #   (bkv_sz = 256 at logical_page_size in {16, 64}) covers the entire
-        #   (bq_sz + sliding_window - 1 <= 255) span in a single bkv block without
-        #   4x over-sizing bkv_sz to 1024 when logical_page_size = 64 in serving.
+        # - Prefill/Mixed (idx 1, 2): bkv_p = cdiv(sliding_window + bq_prefill,
+        #   logical_page_size) covers the entire (bq_sz + sliding_window - 1) span
+        #   in a single bkv block across H in {16, 64, 128} so acc_scratch is (1, D)
+        #   and never spills or OOMs VMEM.
         num_kv_pages_per_block=(
             (1, 1, 1)
             if sliding_window == 1
             else (
-                max(2, (sliding_window + logical_page_size - 1) // logical_page_size),
-                max(
-                    2,
-                    (sliding_window + 128 + logical_page_size - 1) // logical_page_size,
-                ),
-                max(
-                    2,
-                    (sliding_window + 128 + logical_page_size - 1) // logical_page_size,
-                ),
+                bkv_p_decode,
+                bkv_p_prefill,
+                bkv_p_prefill,
             )
         ),
-        # With L10 single_bkv=True (bkv_p=16 covers bq_sz=128 + sw=128 - 1 <= 256),
-        # acc_scratch is (1, 512) so bq_sz=128 fits in VMEM at H=64 and halves num_bq.
         num_queries_per_block=(
             1,
-            128,
-            8 if (ced_decoder or non_causal_block or sliding_window == 1) else 128,
+            bq_prefill,
+            8 if (ced_decoder or non_causal_block or sliding_window == 1) else bq_prefill,
         ),
         q_compute_block_size=(
-            16 if q.shape[1] > 32 else (32 if q.shape[1] > 8 else 64)
+            8
+            if (q.shape[1] > 64 and q.shape[0] > 384)
+            else (16 if q.shape[1] > 32 else (32 if q.shape[1] > 8 else 64))
         ),
-        # Token-parallel attention (all 64 heads per rank, T/tp > 128 tokens)
-        # runs out of VMEM at compile with 32.
+        # DP=8 (64/128 heads per rank) and token-parallel attention (all 64 heads
+        # per rank, T/tp > 128 tokens) run out of VMEM at compile with 32.
         decode_seq_batch_size=(
             8
             if q.shape[0] <= 16
             else (
                 16
                 if q.shape[0] <= 128
-                else (8 if token_parallel and q.shape[1] > 32 else 32)
+                else (8 if q.shape[1] > 32 else 32)
             )
         ),
         unnormalized_output=not swa_only or sliding_window == 1,
@@ -204,6 +221,7 @@ def _attention_swa(
     ced_decoder: bool = False,
     token_parallel: bool = False,
     non_causal_block: bool = False,
+    page_indices_ring_mapped: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """SWA-only layers; the main-cache inputs keep the CSA op's signature."""
     output, updated_sw_cache, _, _ = _run_swa(
@@ -222,6 +240,7 @@ def _attention_swa(
         ced_decoder=ced_decoder,
         token_parallel=token_parallel,
         non_causal_block=non_causal_block,
+        page_indices_ring_mapped=page_indices_ring_mapped,
     )
     return output, updated_sw_cache
 
@@ -246,13 +265,15 @@ def _attention_csa(
     cand_bits_tiled: jax.Array | None = None,
     n_unique: jax.Array | None = None,
     *,
-    precomputed_union: tuple[jax.Array, jax.Array, jax.Array] | None = None,
+    precomputed_union: tuple[jax.Array, jax.Array, jax.Array]
+    | None = None,
     sm_scale: float,
     sliding_window: int,
     logical_page_size: int,
     two_caches_same_buffer: bool,
     ced_decoder: bool = False,
     token_parallel: bool = False,
+    page_indices_ring_mapped: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: SWA pass, then sparse attention over the indexer's top-k rows."""
     if main_cache_kv.shape[0] == 0 or main_cache_rope.shape[0] == 0:
@@ -273,6 +294,7 @@ def _attention_csa(
         swa_only=False,
         ced_decoder=ced_decoder,
         token_parallel=token_parallel,
+        page_indices_ring_mapped=page_indices_ring_mapped,
     )
 
     # When both caches are one buffer, the CSA read must see the SWA kernel's

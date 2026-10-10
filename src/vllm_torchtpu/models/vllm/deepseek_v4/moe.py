@@ -23,10 +23,33 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.models.utils import extract_layer_index
 
-from vllm_torchtpu.distributed.tp_collectives import tp_reduce_scatter
+from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.tp_collectives import (
+    tp_all_gather,
+    tp_reduce_scatter,
+)
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
+
+
+class _DeepseekV4MoERunner(MoERunner):
+    """MoERunner that can skip shared_experts when computed on the local TP shard."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self._skip_shared: list[bool] = [False]
+        super().__init__(*args, **kwargs)
+
+    @property
+    def _shared_experts(self):
+        if self._skip_shared[0]:
+            return None
+        return self._modules.get("_shared_experts_mod")
+
+    @_shared_experts.setter
+    def _shared_experts(self, value) -> None:
+        self._modules["_shared_experts_mod"] = value
 
 
 class DeepseekV4MoE(nn.Module):
@@ -114,6 +137,7 @@ class DeepseekV4MoE(nn.Module):
             router_logits_dtype=torch.float32,
             apply_routed_scale_to_output=True,
             reduce_results=reduce_results,
+            runner_cls=_DeepseekV4MoERunner,
         )
 
         # The monolithic TPU MoE path never consults the router: MoERunner
@@ -141,12 +165,25 @@ class DeepseekV4MoE(nn.Module):
         """
         return self.experts.do_naive_dispatch_combine
 
+    def process_weights_after_loading(self) -> None:
+        if self.shared_experts is not None:
+            self.shared_experts.process_weights_after_loading()
+
     def can_accept_prequant_hidden(self, *, token_sharded: bool = False) -> bool:
-        return (
-            self.shared_experts is not None
-            and self.shared_experts.can_accept_prequant_hidden(
-                token_sharded=token_sharded
+        if self.shared_experts is None:
+            return False
+        if token_sharded and not (
+            self.tp_size > 1
+            and getattr(
+                getattr(self.experts, "moe_config", None),
+                "skip_final_all_reduce",
+                False,
             )
+            and getattr(self.experts, "_skip_shared", None) is not None
+        ):
+            return False
+        return self.shared_experts.can_accept_prequant_hidden(
+            token_sharded=token_sharded
         )
 
     def forward(
@@ -156,13 +193,49 @@ class DeepseekV4MoE(nn.Module):
         return_token_sharded: bool = False,
         hidden_states_fp8: torch.Tensor | None = None,
         hidden_states_scale: torch.Tensor | None = None,
+        *,
+        input_is_token_sharded: bool = False,
     ) -> torch.Tensor:
         """Forward pass executing router gate and fused expert computation."""
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 
         org_shape = hidden_states.shape
-        if self.shared_experts is not None:
+        skip_shared = getattr(self.experts, "_skip_shared", None)
+        if (
+            envs.VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS > 0
+            and self.tp_size > 1
+            and self.shared_experts is not None
+            and "_tp_gate_up_w" in self.shared_experts._buffers
+        ):
+            self.shared_experts._lift_tp_shape_variant_tensors()
+
+        run_local_shared = (
+            input_is_token_sharded
+            and return_token_sharded
+            and self.tp_size > 1
+            and getattr(
+                getattr(self.experts, "moe_config", None),
+                "skip_final_all_reduce",
+                False,
+            )
+            and skip_shared is not None
+            and self.shared_experts is not None
+            and self.shared_experts.has_tp_local_weights()
+        )
+        x_local = hidden_states
+        if input_is_token_sharded:
+            hidden_states = tp_all_gather(hidden_states, dim=0)
+        shared_local_out: torch.Tensor | None = None
+        if run_local_shared:
+            assert self.shared_experts is not None and skip_shared is not None
+            skip_shared[0] = True
+            shared_local_out = self.shared_experts.forward_tp_local(
+                x_local,
+                hidden_states_fp8=hidden_states_fp8,
+                hidden_states_scale=hidden_states_scale,
+            )
+        elif self.shared_experts is not None and not input_is_token_sharded:
             self.shared_experts.set_prequant_hidden(
                 hidden_states_fp8, hidden_states_scale
             )
@@ -174,11 +247,18 @@ class DeepseekV4MoE(nn.Module):
                 input_ids=input_ids,
             )
         finally:
+            if skip_shared is not None:
+                skip_shared[0] = False
             if self.shared_experts is not None:
                 self.shared_experts.set_prequant_hidden(None, None)
         if self.experts.moe_config.skip_final_all_reduce and self.tp_size > 1:
             if return_token_sharded:
                 final_hidden_states = tp_reduce_scatter(final_hidden_states, dim=0)
+                if shared_local_out is not None:
+                    final_hidden_states = (
+                        final_hidden_states
+                        + shared_local_out.view_as(final_hidden_states)
+                    )
                 return final_hidden_states.view(-1, *org_shape[1:])
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 

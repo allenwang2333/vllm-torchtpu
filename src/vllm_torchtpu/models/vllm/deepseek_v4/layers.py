@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -25,10 +26,20 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.tp_collectives import (
+    tp_all_gather,
+    tp_reduce_scatter,
+    tp_shard_slice,
+)
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+    _get_quantized_matmul_op,
+    _get_quantized_matmul_prequant_op,
+    quantized_matmul,
     quantized_matmul_prequant,
 )
+from vllm_torchtpu.utils import synchronize_tensors
 
 
 # Pure PyTorch head projection for MHC manifold collapse;
@@ -95,16 +106,144 @@ class DeepseekV4MLP(nn.Module):
         else:
             self.act_fn = SiluAndMul()
 
+    def _build_tp_weights(self) -> None:
+        if "_tp_gate_up_w" in self._buffers:
+            return
+        try:
+            tp_size = get_tensor_model_parallel_world_size()
+        except Exception:
+            return
+        if tp_size <= 1 or getattr(self.gate_up_proj, "disable_tp", False):
+            return
+        gu_s = getattr(self.gate_up_proj, "weight_scale", None)
+        down_s = getattr(self.down_proj, "weight_scale", None)
+        if (
+            gu_s is None
+            or down_s is None
+            or gu_s.ndim != 1
+            or down_s.ndim not in (1, 4)
+            or getattr(self.gate_up_proj, "bias", None) is not None
+            or getattr(self.down_proj, "bias", None) is not None
+        ):
+            return
+
+        gu_w = self.gate_up_proj.weight.data
+        if getattr(self.gate_up_proj, KEEP_VLLM_LAYOUT_ATTR, False):
+            gu_w = gu_w.transpose(0, 1)
+        elif gu_w.shape[0] != getattr(
+            self.gate_up_proj, "input_size", gu_w.shape[0]
+        ):
+            return
+
+        down_w = self.down_proj.weight.data
+        if getattr(self.down_proj, KEEP_VLLM_LAYOUT_ATTR, False):
+            down_w = down_w.transpose(0, 1)
+        elif down_w.shape[1] != getattr(
+            self.down_proj, "output_size", down_w.shape[1]
+        ):
+            return
+
+        def gather(x: torch.Tensor, dim: int) -> torch.Tensor:
+            if x.element_size() == 1:
+                out = tp_all_gather(x.view(torch.uint8), dim).view(x.dtype)
+            else:
+                out = tp_all_gather(x, dim)
+            return out.clone(memory_format=torch.contiguous_format)
+
+        k_dim, two_i_shard = gu_w.shape
+        i_shard = two_i_shard // 2
+        tp_gate_up_w = (
+            gather(gu_w.reshape(k_dim, 2, i_shard).contiguous(), 2)
+            .reshape(k_dim, 2 * tp_size * i_shard)
+            .clone(memory_format=torch.contiguous_format)
+        )
+        tp_gate_up_s = (
+            gather(gu_s.data.reshape(2, i_shard).contiguous(), 1)
+            .reshape(-1)
+            .clone(memory_format=torch.contiguous_format)
+        )
+        tp_down_w_raw = gather(down_w.contiguous(), 0)
+        if down_s.ndim == 4:
+            tp_down_w = tp_down_w_raw
+            tp_down_s = gather(down_s.data, 1)
+        else:
+            tp_down_s_all = gather(down_s.data.unsqueeze(0), 0)
+            tp_down_s = tp_down_s_all.amax(dim=0).contiguous()
+            if not torch.equal(
+                tp_down_s_all,
+                tp_down_s.unsqueeze(0).expand_as(tp_down_s_all),
+            ):
+                w_3d = tp_down_w_raw.view(
+                    tp_size, -1, tp_down_w_raw.shape[-1]
+                ).float()
+                ratio = (
+                    tp_down_s_all / tp_down_s.unsqueeze(0).clamp_min(1e-12)
+                ).unsqueeze(1)
+                tp_down_w = (
+                    (w_3d * ratio)
+                    .to(down_w.dtype)
+                    .view_as(tp_down_w_raw)
+                    .clone(memory_format=torch.contiguous_format)
+                )
+            else:
+                tp_down_w = tp_down_w_raw
+        buffers = {
+            "_tp_gate_up_w": tp_gate_up_w,
+            "_tp_gate_up_s": tp_gate_up_s,
+            "_tp_down_w": tp_down_w,
+            "_tp_down_s": tp_down_s,
+        }
+        device = gu_w.device
+        if device.type == "tpu":
+            synchronize_tensors(list(buffers.values()), wait=True)
+            _ = _get_quantized_matmul_op()
+            _ = _get_quantized_matmul_prequant_op()
+        for name, tensor in buffers.items():
+            self.register_buffer(name, tensor, persistent=False)
+
+    def process_weights_after_loading(self) -> None:
+        self._build_tp_weights()
+
+    def has_tp_local_weights(self) -> bool:
+        if "_tp_gate_up_w" in self._buffers:
+            return True
+        if not torch.compiler.is_compiling() and getattr(
+            self.gate_up_proj, WEIGHT_FLIPPED_ATTR, False
+        ):
+            self._build_tp_weights()
+            return "_tp_gate_up_w" in self._buffers
+        return False
+
+    def _lift_tp_shape_variant_tensors(self) -> None:
+        if (
+            envs.VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS > 0
+            and "_tp_gate_up_w" in self._buffers
+        ):
+            _ = [
+                torch.ops.aten.alias.default(t)
+                for t in (
+                    self.gate_up_proj.weight,
+                    self.gate_up_proj._parameters.get("weight_scale"),
+                    self.down_proj.weight,
+                    self.down_proj._parameters.get("weight_scale"),
+                    self._tp_gate_up_w,
+                    self._tp_gate_up_s,
+                    self._tp_down_w,
+                    self._tp_down_s,
+                )
+                if t is not None
+            ]
+
     def can_accept_prequant_hidden(self, *, token_sharded: bool = False) -> bool:
         if not envs.VLLM_DSV41_FUSED_SEAM_QUANT:
             return False
-        w_s = self.gate_up_proj._parameters.get("weight_scale", None)
+        w_s = self.gate_up_proj._parameters.get("weight_scale")
         ok = (
             w_s is not None
             and w_s.ndim == 1
-            and self.gate_up_proj._parameters.get("bias", None) is None
+            and self.gate_up_proj._parameters.get("bias") is None
         )
-        return ok and not token_sharded
+        return ok and (not token_sharded or self.has_tp_local_weights())
 
     def set_prequant_hidden(
         self,
@@ -132,20 +271,65 @@ class DeepseekV4MLP(nn.Module):
             )
         return self.gate_up_proj(x)[0]
 
+    def forward_tp_local(
+        self,
+        x: torch.Tensor,
+        hidden_states_fp8: torch.Tensor | None = None,
+        hidden_states_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        self._lift_tp_shape_variant_tensors()
+        if hidden_states_fp8 is not None and hidden_states_scale is not None:
+            gate_up = quantized_matmul_prequant(
+                hidden_states_fp8,
+                hidden_states_scale,
+                self._tp_gate_up_w,
+                self._tp_gate_up_s,
+            )
+        else:
+            gate_up = quantized_matmul(
+                x,
+                self._tp_gate_up_w,
+                self._tp_gate_up_s,
+            )
+        act = self.act_fn(gate_up)
+        return quantized_matmul(act, self._tp_down_w, self._tp_down_s)
+
     def forward(
         self,
         x: torch.Tensor,
         hidden_states_fp8: torch.Tensor | None = None,
         hidden_states_scale: torch.Tensor | None = None,
+        return_token_sharded: bool = False,
+        *,
+        input_is_token_sharded: bool = False,
     ) -> torch.Tensor:
         if hidden_states_fp8 is None:
             hidden_states_fp8 = self._prequant[0]
             hidden_states_scale = self._prequant[1]
         self._prequant[0] = None
         self._prequant[1] = None
+        if (
+            input_is_token_sharded
+            and return_token_sharded
+            and self.has_tp_local_weights()
+        ):
+            return self.forward_tp_local(
+                x,
+                hidden_states_fp8=hidden_states_fp8,
+                hidden_states_scale=hidden_states_scale,
+            )
+        self._lift_tp_shape_variant_tensors()
+        if input_is_token_sharded:
+            x = tp_all_gather(x, dim=0)
+            hidden_states_fp8 = None
+            hidden_states_scale = None
         gate_up = self._apply_gate_up_proj(
             x, hidden_states_fp8, hidden_states_scale
         )
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
+        if return_token_sharded:
+            if getattr(self.down_proj, "reduce_results", False):
+                return tp_shard_slice(x, dim=0)
+            return tp_reduce_scatter(x, dim=0)
         return x
