@@ -232,6 +232,20 @@ def save_compress_norm(
     latent.copy_(result.masked_fill(~valid[:, None], 0).to(latent.dtype))
 
 
+def _memo_stage_cache_key(obj: Any, kind: str, *parts: Any) -> tuple[Any, ...]:
+    """Return a memoized ``(kind, *parts)`` stage-cache key tuple on ``obj``."""
+    cache = obj.__dict__.get("_stage_key_memo")
+    if cache is None:
+        cache = {}
+        obj.__dict__["_stage_key_memo"] = cache
+    entry = cache.get(kind)
+    if entry is not None and entry[0] == parts:
+        return entry[1]
+    key = (kind, *parts)
+    cache[kind] = (parts, key)
+    return key
+
+
 class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
     """Inherit weights and state ownership; consume the shared TPU metadata."""
 
@@ -275,7 +289,9 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
                 and state_metadata.seq_lens.numel() > 0
             ):
                 table = _block_table(state_metadata)
-                state_key = ("compressor_state_addr", table.shape, state_rows)
+                state_key = _memo_stage_cache_key(
+                    self, "compressor_state_addr", table.shape, state_rows
+                )
                 cached_state = stage_cache.get(state_key)
                 if cached_state is None:
                     query_start_loc = state_metadata.query_start_loc
@@ -743,18 +759,21 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
 
         return cast(Callable, VllmDeepseekV4MLAAttention.kv_rope_op.fget)(self)
 
+    def _stage_cache_key(self, kind: str, *parts: Any) -> tuple[Any, ...]:
+        return _memo_stage_cache_key(self, kind, *parts)
+
     def _get_stage_tp_rank(self, stage_cache: dict[Any, Any] | None = None):
         rank = self._tp_rank
         if stage_cache is not None and isinstance(rank, torch.Tensor):
             return stage_cache.setdefault(
-                ("stage_tp_rank", rank.device, rank.dtype), rank
+                self._stage_cache_key("stage_tp_rank", rank.device, rank.dtype), rank
             )
         return rank
 
     def _get_stage_tp_rank_1d(self, stage_cache: dict[Any, Any] | None = None):
         rank_1d = self._tp_rank_1d
         if stage_cache is not None and isinstance(rank_1d, torch.Tensor):
-            key = ("stage_tp_rank_1d", rank_1d.device)
+            key = self._stage_cache_key("stage_tp_rank_1d", rank_1d.device)
             cached = stage_cache.get(key)
             if cached is None:
                 cached = (
@@ -773,13 +792,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             # compress_rope_theta (upstream deepseek_v41/common/rope.py), so the
             # key must carry the rope config or layers read the wrong cos/sin.
             return stage_cache.setdefault(
-                (
+                self._stage_cache_key(
                     "stage_tpu_rope_cache",
                     rope_cache.device,
                     rope_cache.shape,
                     rope_cache.dtype,
                     bool(self.compress_ratio),
-                    getattr(self.rotary_emb, "base", None),
+                    getattr(getattr(self, "rotary_emb", None), "base", None),
                 ),
                 rope_cache,
             )
@@ -826,7 +845,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         ):
             kv_table = _block_table(kv_meta)
             idx_table = _block_table(idx_meta)
-            slot_key = (
+            slot_key = self._stage_cache_key(
                 "global_kv_addr",
                 kv_table.shape,
                 self.compress_ratio,
@@ -985,6 +1004,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )
         swa_row_slots_masked = None
         starts = None
+        swa_slots_key = None
         if (
             stage_cache is not None
             and rows_per_page is not None
@@ -993,7 +1013,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             use_3page_swa = (
                 tiled and swa_table.shape[1] > 0 and swa_width <= 6 * rows_per_page
             )
-            swa_key = (
+            swa_key = self._stage_cache_key(
                 "swa_token_addr",
                 swa_table.shape,
                 rows_per_page,
@@ -1100,7 +1120,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     base_valid_window,
                     swa_3page,
                 ) = cached_swa
-            swa_slots_key = ("swa_token_slots", swa_key)
+            swa_slots_key = self._stage_cache_key("swa_token_slots", *swa_key[1:])
             cached_swa_slots = stage_cache.get(swa_slots_key)
             if cached_swa_slots is None or cached_swa_slots[0] is not swa.block_tables:
                 b2 = swa_table[requests, pos_col].long()
@@ -1223,26 +1243,29 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 and rows_per_page is not None
                 else raw_row_slots
             )
-        if not self._ced_decoder and (starts := _window_starts()) is not None:
-            # Apply before records are built, including the tiled/local-Q path.
-            valid_window = valid_window & (
-                logical >= starts[requests.clamp(max=starts.shape[0] - 1), None]
-            )
-            invalid_window = ~valid_window
         if swa_row_slots is None:
             records = None
         elif has_fast_swa_offset and rows_per_page is not None:
-            records = (
-                swa_row_slots_masked
-                if swa_cache.row_offset == 0
-                and swa_row_slots_masked is not None
-                and starts is None
-                else (
+            if swa_cache.row_offset == 0 and swa_row_slots_masked is not None:
+                records = swa_row_slots_masked
+            elif stage_cache is not None and swa_slots_key is not None:
+                swa_rec_key = self._stage_cache_key(
+                    "swa_records", swa_cache.row_offset, *swa_slots_key[1:]
+                )
+                cached_swa_rec = stage_cache.get(swa_rec_key)
+                if cached_swa_rec is None or cached_swa_rec[0] is not swa_row_slots:
+                    records = (swa_cache.row_offset + swa_row_slots).masked_fill(
+                        invalid_window, -1
+                    )
+                    stage_cache[swa_rec_key] = (swa_row_slots, records)
+                else:
+                    records = cached_swa_rec[1]
+            else:
+                records = (
                     swa_row_slots
                     if swa_cache.row_offset == 0
                     else swa_cache.row_offset + swa_row_slots
                 ).masked_fill(invalid_window, -1)
-            )
         else:
             records = swa_cache.row_indices(swa_row_slots).masked_fill(
                 invalid_window, -1
@@ -1340,7 +1363,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     getattr(src_layout, "query_start_loc", None),
                 )
             )
-            comp_key = (
+            comp_key = self._stage_cache_key(
                 "compressed_attn",
                 self.compressed_cache_prefix,
                 getattr(self, "index_source_layer_id", None),
@@ -1369,7 +1392,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     and tp_ranks > 1
                     and (self.indexer is None or not self._all_indices_fit)
                 )
-                comp_inputs_key = (
+                comp_inputs_key = self._stage_cache_key(
                     "compressed_inputs",
                     self.compress_ratio,
                     segmented_main,
@@ -1442,7 +1465,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             has_fast_idx_offset = isinstance(
                                 getattr(index_cache, "row_offset", None), int
                             ) and not getattr(index_cache, "sharded", False)
-                            idx_req_key = (
+                            idx_req_key = self._stage_cache_key(
                                 "index_req_slots",
                                 indexer.k_cache.prefix,
                                 index_cache.shape[1] if has_fast_idx_offset else None,
@@ -1473,10 +1496,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                                 if stage_cache is not None:
                                     stage_cache[idx_req_key] = cached_idx_req
                             if has_fast_idx_offset:
-                                idx_rec_key = (
+                                idx_rec_key = self._stage_cache_key(
                                     "index_records",
-                                    idx_req_key,
                                     index_cache.row_offset,
+                                    *idx_req_key[1:],
                                 )
                                 index_records = (
                                     stage_cache.get(idx_rec_key)
@@ -1577,7 +1600,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
                 if tiled:
                     if self._fp8_kv:
-                        pages_key = (
+                        pages_key = self._stage_cache_key(
                             "compressed_pages",
                             self.compressed_cache_prefix,
                         )
@@ -1635,14 +1658,34 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if tiled:
             assert records is not None and main_records is not None
             tp_rank_1d = self._get_stage_tp_rank_1d(stage_cache)
-            owner_kwargs = (
-                {
-                    "owner_perm": owner_perm,
-                    "owner_inv": owner_inv,
-                    "main_records_segmented": segmented_main,
-                }
-                if (owner_perm is not None or owner_inv is not None)
-                else {}
+            if owner_perm is not None or owner_inv is not None:
+                if stage_cache is not None:
+                    owner_kw_key = self._stage_cache_key(
+                        "owner_kwargs",
+                        id(owner_perm),
+                        id(owner_inv),
+                        segmented_main,
+                    )
+                    owner_kwargs = stage_cache.get(owner_kw_key)
+                    if owner_kwargs is None:
+                        owner_kwargs = {
+                            "owner_perm": owner_perm,
+                            "owner_inv": owner_inv,
+                            "main_records_segmented": segmented_main,
+                        }
+                        stage_cache[owner_kw_key] = owner_kwargs
+                else:
+                    owner_kwargs = {
+                        "owner_perm": owner_perm,
+                        "owner_inv": owner_inv,
+                        "main_records_segmented": segmented_main,
+                    }
+            else:
+                owner_kwargs = {}
+            fused_swa = (
+                stage_cache.setdefault("fused_swa", envs.TPU_DEEPSEEK_V41_FUSED_SWA)
+                if stage_cache is not None
+                else envs.TPU_DEEPSEEK_V41_FUSED_SWA
             )
             if fused_qo:
                 return sparse_fp8_attention_qo(
@@ -1673,7 +1716,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     self._precompact_records,
                     int(self.head_dim),
                     replicated_qr=self._replicated_local_q,
-                    fused_swa=envs.TPU_DEEPSEEK_V41_FUSED_SWA,
+                    fused_swa=fused_swa,
                     **owner_kwargs,
                 )
             assert q is not None
@@ -1693,7 +1736,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     token_parallel=self._token_parallel_attn,
                     full_sink=self._full_attn_sink,
                     tp_rank=tp_rank_1d,
-                    fused_swa=envs.TPU_DEEPSEEK_V41_FUSED_SWA,
+                    fused_swa=fused_swa,
                     **owner_kwargs,
                 )
             else:
@@ -1852,7 +1895,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )
         split = ranks > 1
         stage_cache = _active_stage_attn_cache
-        query_split_key = (
+        query_split_key = _memo_stage_cache_key(
+            self,
             "indexer_query_split",
             getattr(self, "compress_ratio", None),
             ranks,

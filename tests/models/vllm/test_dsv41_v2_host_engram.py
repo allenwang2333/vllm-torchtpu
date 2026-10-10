@@ -222,3 +222,126 @@ def test_multi_chunk_execute_model_uses_attn_metadata_builder_ctx():
     assert captured.can_hash_on_host is True
     assert captured.input_ids[:3].tolist() == [54, 55, 56]
     assert captured.lookback_token_ids[0].tolist() == [53, 52, 51, 50]
+
+
+def test_td8184_high_conc_c96_c112_host_engram_hash_and_staging_parity():
+    """TD8.184: Verify high-concurrency C=64 / 96 / 112 / 128 (B=384 / 576 / 672 / 768,
+    DSpark K=5) step-level host-side n-gram capture, hash_on_host parity with device
+    forward, and 4-layer Engram.prepare_embeddings _host_pack_bundle reuse."""
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.engram import (
+        Engram,
+        ParallelEngramEmbedding,
+    )
+
+    state = _state(False)
+    cols = 4
+    head_dim = 64
+    block_size = 32
+    part_num_embeddings = 5000
+
+    weight = torch.ones((part_num_embeddings, head_dim), dtype=torch.float8_e4m3fn)
+    scales = torch.full(
+        (part_num_embeddings, head_dim // block_size), 127, dtype=torch.uint8
+    )
+    embed = object.__new__(ParallelEngramEmbedding)
+    torch.nn.Module.__init__(embed)
+    embed.host_offload = True
+    embed.cpu_offload = True
+    embed.host_dma = False
+    embed._host_rows = None
+    embed.dp_size = 1
+    embed.head_start = 0
+    embed.n_hash_cols = (NGRAM - 1) * HEADS
+    embed.part_n_hash_cols = cols
+    embed.vocab_start_idx = 0
+    embed.vocab_end_idx = part_num_embeddings
+    embed.part_num_embeddings = part_num_embeddings
+    embed.dim = head_dim
+    embed.block_size = block_size
+    embed._storage = lambda w=weight, s=scales: (w, s)
+
+    engram = object.__new__(Engram)
+    torch.nn.Module.__init__(engram)
+    engram.embed_tokens = embed
+    engram.staged_rows = torch.zeros((1024, cols, head_dim), dtype=torch.bfloat16)
+    engram._init_staging(1024, head_dim)
+
+    for conc in (64, 96, 112, 128):
+        num_tokens = conc * 6
+        token_ids_cpu = (
+            np.arange(conc * 128, dtype=np.int32).reshape(conc, 128) % 90
+        ) + 1
+        input_ids_cpu = torch.full((num_tokens,), -1, dtype=torch.int32)
+        base_pos = np.repeat(np.full(conc, 64, dtype=np.int64), 6) + np.tile(
+            np.arange(6, dtype=np.int64), conc
+        )
+        positions_cpu = torch.from_numpy(base_pos)
+        qsl_cpu = torch.arange(0, (conc + 1) * 6, 6, dtype=torch.int32)
+        stale_lookback = torch.full((conc, DEPTH), -1, dtype=torch.int32)
+        req_ids = [f"req-{i}" for i in range(conc)]
+        req_id_to_index = {r: i for i, r in enumerate(req_ids)}
+        sampled_cpu = torch.ones((conc, 6), dtype=torch.int32) * 7
+        pre_async = types.SimpleNamespace(
+            req_id_to_index_copy=req_id_to_index,
+            wait_for_copy=lambda s=sampled_cpu: s,
+            copy_state=types.SimpleNamespace(chunks_cpu=[sampled_cpu]),
+            spec_decode_num_rejected_tokens=torch.zeros(conc, dtype=torch.int32),
+            num_draft_per_req=dict.fromkeys(range(conc), 5),
+            discard_sampled_tokens_req_indices=(),
+        )
+        runner = types.SimpleNamespace(
+            _last_sequence_layout_plan=types.SimpleNamespace(
+                kind=SequenceLayoutKind.ALL, start_index=0
+            ),
+            input_batch=types.SimpleNamespace(
+                num_prompt_tokens=np.full(conc, 32, dtype=np.int32),
+                num_computed_tokens_cpu=np.full(conc, 64, dtype=np.int32),
+                num_tokens_no_spec=np.full(conc, 70, dtype=np.int32),
+                token_ids_cpu=token_ids_cpu,
+                req_ids=req_ids,
+            ),
+            seq_lens_np=np.full(conc, 70, dtype=np.int32),
+            input_ids_cpu=input_ids_cpu,
+            positions_cpu=positions_cpu,
+            query_start_loc_cpu=qsl_cpu,
+            lookback_token_ids=types.SimpleNamespace(cpu=stale_lookback),
+            _pre_async_results=pre_async,
+            speculative_config=types.SimpleNamespace(num_speculative_tokens=5),
+        )
+
+        captured = capture_host_engram_inputs(runner, conc)
+        assert captured is not None
+        assert captured.can_hash_on_host is True
+        assert not captured.all_prompt
+
+        dead = torch.zeros_like(captured.input_ids, dtype=torch.bool)
+        dead_lb = torch.zeros_like(captured.lookback_token_ids, dtype=torch.bool)
+        host_hashes = state.hash_on_host(
+            captured.input_ids,
+            captured.positions,
+            captured.query_start_loc,
+            dead,
+            captured.lookback_token_ids,
+            dead_lb,
+        )
+        dev_hashes = state.forward(
+            captured.input_ids,
+            captured.positions,
+            captured.query_start_loc,
+            dead,
+            captured.lookback_token_ids,
+            dead_lb,
+            None,
+            torch.zeros((conc, 8), dtype=torch.int32),
+        )
+        assert torch.equal(host_hashes, dev_hashes)
+
+        # Stage embeddings across layers and verify _host_pack_bundle cache hit.
+        for layer_idx in range(LAYERS):
+            engram.prepare_embeddings(
+                host_hashes[:, layer_idx, :] % part_num_embeddings
+            )
+        assert num_tokens in engram._host_pack_by_tokens
+        bundle1 = engram._host_pack_bundle(num_tokens)
+        bundle2 = engram._host_pack_bundle(num_tokens)
+        assert bundle1 is bundle2

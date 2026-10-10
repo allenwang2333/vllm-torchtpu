@@ -485,3 +485,91 @@ class TestV2AttentionTD756:
                     "compressed_attn",
                 }.issubset(key_kinds)
             assert torch.equal(seen_records[1], seen_records[0] + 128)
+
+    def test_td8183_40_layer_stage_cache_key_memo_and_swa_records_reuse(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """TD8.183: Verify per-layer _stage_cache_key memoization and stage-scoped
+        swa_records, owner_kwargs, and fused_swa reuse across 40 layers at
+        B=384 / 576 / 672 (C=64 / 96 / 112, DSpark K=5)."""
+        monkeypatch.setattr(v2_attn, "_insert", lambda *a, **kw: None)
+        seen_swa_records: list[torch.Tensor] = []
+
+        def _capture_sparse_attn(q, _sc, _mc, recs, *a, **kw):
+            seen_swa_records.append(recs)
+            return torch.zeros_like(q)
+
+        monkeypatch.setattr(v2_attn, "sparse_fp8_attention", _capture_sparse_attn)
+
+        for c_reqs in (64, 96, 112):
+            tokens = c_reqs * 6
+            positions = torch.arange(tokens, dtype=torch.int32)
+            table = torch.arange(c_reqs * 4, dtype=torch.int32).reshape(c_reqs, 4)
+            qsl = torch.arange(0, (c_reqs + 1) * 6, 6, dtype=torch.int32)
+            seq_lens = torch.full((c_reqs,), 64, dtype=torch.int32)
+            meta = SimpleNamespace(
+                seq_lens=seq_lens,
+                block_tables=table,
+                query_start_loc=qsl,
+            )
+            metadata = {"swa_pfx": meta, "src_pfx": meta, "idx_pfx": meta}
+            forward_ctx = SimpleNamespace(attn_metadata=metadata, additional_kwargs={})
+            monkeypatch.setattr(
+                v2_attn, "get_forward_context", lambda ctx=forward_ctx: ctx
+            )
+
+            qr = torch.ones((tokens, 16), dtype=torch.bfloat16)
+            kv = torch.ones((tokens, 8), dtype=torch.bfloat16)
+            idx_w = torch.ones((tokens, 2), dtype=torch.bfloat16)
+            out = torch.zeros((tokens, 2, 8), dtype=torch.bfloat16)
+
+            swa_nonzero = _make_paged_cache_mock(
+                table, row_offset=64, rows_per_page=16, page_stride=32
+            )
+            idx_nonzero = _make_paged_cache_mock(
+                table, row_offset=128, rows_per_page=16, page_stride=48
+            )
+            layers = []
+            for i in range(40):
+                has_idx = i == 0
+                lyr = _make_attn(
+                    swa_cache=swa_nonzero,
+                    idx_cache=idx_nonzero,
+                    has_indexer=has_idx,
+                )
+                lyr.non_causal_multi_token_decode = True
+                if has_idx:
+                    lyr._select_paged_indices = (
+                        lambda _qr, _pos, *a, _t=tokens, **kw: torch.zeros(
+                            (_t, 2), dtype=torch.int32
+                        )
+                    )
+                layers.append((lyr, has_idx))
+
+            seen_swa_records.clear()
+            with v2_attn.stage_attention_cache_scope():
+                for lyr, has_idx in layers:
+                    lyr._prepare_tpu(
+                        None,
+                        qr,
+                        kv,
+                        None,
+                        None,
+                        idx_w if has_idx else None,
+                        positions,
+                        out,
+                    )
+                stage_cache = v2_attn._active_stage_attn_cache
+                assert stage_cache is not None
+                assert "fused_swa" in stage_cache
+                key_kinds = {k[0] for k in stage_cache if isinstance(k, tuple)}
+                assert "swa_records" in key_kinds
+                # All 40 layers with identical non-zero row_offset=64 share the
+                # exact same SWA records tensor instance inside the stage scope.
+                assert len(seen_swa_records) == 40
+                first_rec = seen_swa_records[0]
+                assert all(r is first_rec for r in seen_swa_records)
+                # Key memoization returns identical tuple object on second call.
+                k1 = layers[0][0]._stage_cache_key("swa_records", 64, tokens)
+                k2 = layers[0][0]._stage_cache_key("swa_records", 64, tokens)
+                assert k1 is k2
