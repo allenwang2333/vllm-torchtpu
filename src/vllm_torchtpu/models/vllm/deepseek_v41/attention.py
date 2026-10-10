@@ -789,12 +789,7 @@ class VllmDeepseekV41MLAAttention(
             kv, swa_kv_lens, swa_page_indices, swa_cu_q_lens, swa_distribution, rank
         ):
             del rank
-            w = self.window_size
-            t = (
-                (kv.shape[0] - tp_size * w) * tp_size
-                if (w > 0 and kv.shape[0] > tp_size * w)
-                else kv.shape[0]
-            )
+            t = kv.shape[0]
             return (
                 swa_kv_lens.new_empty((t,), dtype=torch.int32),
                 swa_kv_lens.new_empty((t, 5), dtype=torch.int32),
@@ -815,22 +810,13 @@ class VllmDeepseekV41MLAAttention(
             logical_page_size=logical_page_size,
             tp_size=tp_size,
             sliding_window=self.window_size,
-            kv_is_sharded=True,
+            kv_is_sharded=False,
         )
         if not torch.compiler.is_compiling():
             object.__setattr__(self, "_tp_swa_step_meta_op", op)
         return op
 
     def _gather_tp_kv(self, kv_local: torch.Tensor) -> torch.Tensor:
-        w = self.window_size
-        local_t = kv_local.shape[0]
-        if (
-            not isinstance(local_t, torch.SymInt)
-            and w > 0
-            and local_t >= w
-        ):
-            halo_all = tp_all_gather(kv_local[-w:].contiguous(), dim=0)
-            return torch.cat([kv_local, halo_all], dim=0)
         return tp_all_gather(kv_local, dim=0)
 
     def _get_or_compute_tp_swa_step_metadata(
