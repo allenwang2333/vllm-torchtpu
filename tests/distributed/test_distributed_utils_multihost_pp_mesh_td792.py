@@ -216,7 +216,8 @@ def test_tpu_mp_multihost_full_coverage(monkeypatch):
         mp._DONE_SENTINEL,
         mp._DP_DONE_SENTINEL,
     ):
-        monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv(key, os.environ.get(key, ""))
+        monkeypatch.delenv(key)
     monkeypatch.setattr(mp, "_keepalive_stores", [])
 
     # _rendezvous_port default and override
