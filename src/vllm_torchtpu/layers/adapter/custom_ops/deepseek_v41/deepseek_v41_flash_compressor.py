@@ -789,6 +789,5 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
             else:
                 topk = idx_op(*op_args, *meta_args)
         if self.topk_indices_buffer is not None:
-            n_tk = min(num_tokens, int(topk.shape[0]))
-            self.topk_indices_buffer[:n_tk].copy_(topk[:n_tk])
+            self.topk_indices_buffer[:num_tokens].copy_(topk[:num_tokens])
         return topk
