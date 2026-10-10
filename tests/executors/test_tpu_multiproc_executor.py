@@ -220,3 +220,43 @@ def test_ray_executor_raises_on_real_disagreement():
         pytest.raises(ValueError, match="workers disagree"),
     ):
         executor.get_kv_cache_specs()
+
+
+def test_tpu_multiproc_executor_init_and_initialize_from_config():
+    executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
+    with (
+        patch("vllm_torchtpu._patch_multiproc_worker_global_rank_env") as mock_patch,
+        patch.object(MultiprocExecutor, "_init_executor") as mock_super_init,
+    ):
+        executor._init_executor()
+        mock_patch.assert_called_once_with()
+        mock_super_init.assert_called_once_with()
+
+    with patch.object(MultiprocExecutor, "initialize_from_config") as mock_super_cfg:
+        # 1. Empty shapes list -> early return
+        executor.collective_rpc = MagicMock(return_value=[])
+        executor.initialize_from_config([])
+        executor.collective_rpc.assert_called_once_with("get_kv_prewarm_shapes")
+
+        # 2. Empty shapes[0] -> early return
+        executor.collective_rpc = MagicMock(return_value=[[]])
+        executor.initialize_from_config([])
+        executor.collective_rpc.assert_called_once_with("get_kv_prewarm_shapes")
+
+        # 3. Non-empty shapes[0] -> prewarm each shape
+        calls = []
+
+        def _fake_rpc(method, args=()):
+            calls.append((method, args))
+            if method == "get_kv_prewarm_shapes":
+                return [[16, 32]]
+            return None
+
+        executor.collective_rpc = _fake_rpc
+        executor.initialize_from_config([])
+        assert calls == [
+            ("get_kv_prewarm_shapes", ()),
+            ("prewarm_kv_offload_shape", (16,)),
+            ("prewarm_kv_offload_shape", (32,)),
+        ]
+        assert mock_super_cfg.call_count == 3
