@@ -862,18 +862,18 @@ def _run_routed_expert_stream(
     dot_tile = (
         MXFP4_DOT_TILE if MXFP4_DOT_TILE is not None
         else 1024 if batch_size == 96
-        else 512 if batch_size in (1, 2, 4, 8, 16, 32, 64) else 0
+        else 512 if batch_size in (1, 2, 4, 8, 16, 32, 64, 128) else 0
     )
     # Aligned block staging avoids a separate source-slice branch for every
-    # batch row. On by default at B16/B32/B64/B96; KernelConfig.singleton_block
+    # batch row. On by default at B16-B128; KernelConfig.singleton_block
     # and stage_blocks override it.
     singleton_block = (
         SINGLETON_BLOCK if SINGLETON_BLOCK is not None
-        else batch_size in (16, 32, 64, 96)
+        else batch_size in (16, 32, 64, 96, 128)
     )
     stage_blocks = (
         STAGE_BLOCKS if STAGE_BLOCKS is not None
-        else batch_size in (16, 32, 64, 96)
+        else batch_size in (16, 32, 64, 96, 128)
     )
     def expert_dot(source, packed, scales, accumulator, contraction_size, output_size, **options):
         if (batch_size > 1 and contraction_size == expert_input_size
@@ -1075,10 +1075,10 @@ def _run_routed_expert_stream(
             for word in range(-(-batch_size // 32))
         ]
 
-    reuse_row_plan = stage_blocks and batch_size in (32, 64, 96)
+    reuse_row_plan = stage_blocks and batch_size in (32, 64, 96, 128)
 
     def compact_row_positions(active_rows):
-        # Counts and row indices are < 96, hence exact in FP32. This avoids
+        # Counts and row indices are < 128, hence exact in FP32. This avoids
         # the split reductions used for unrestricted int32.
         count_dtype = jnp.float32 if reuse_row_plan else jnp.int32
         index = jnp.arange(batch_size)
@@ -1287,7 +1287,7 @@ def _run_routed_expert_stream(
         compact_overflow and down_accumulator.shape[0] < batch_size
     )
     share_compact_finish = (
-        SHARED_EXPERT_FINISHERS and batch_size in (16, 32, 64, 96) and compact_capacity == 8
+        SHARED_EXPERT_FINISHERS and batch_size in (16, 32, 64, 96, 128) and compact_capacity == 8
         and (not compact_only or compact_overflow)
         and expert_gate_up_vmem.dtype == jnp.uint32
     )
@@ -1472,7 +1472,7 @@ def _run_routed_expert_stream(
         # Other batch/routing combinations use the selector loop.
         carry_routes = (
             (batch_size in (2, 4) and not group_pending_routes)
-            or (batch_size in (8, 16, 32, 64, 96) and group_pending_routes)
+            or (batch_size in (8, 16, 32, 64, 96, 128) and group_pending_routes)
         )
         def pack(choice):
             return tuple(value.astype(jnp.int32) for value in choice)
@@ -1877,8 +1877,10 @@ def communication_scratch(batch_size: int = 1, attention_dp: int = 1) -> tuple[A
     host_reduction_rows = max(
         wide_reduction_rows, 7 * batch_size // attention_dp if batch_size > 32 else 0
     )
-    # The shared-expert reduce-scatter receives 4 rows per token in each lane.
+    # The shared-expert reduce-scatter receives 4 rows per token in each lane
+    # and host stage.
     wide_reduction_rows = max(wide_reduction_rows, 4 * batch_size)
+    host_reduction_rows = max(host_reduction_rows, 4 * batch_size)
     if attention_dp > 1:
         # The DP MoE-input gather's 4 * DP row wires use lanes 4..7.
         wide_reduction_rows = max(wide_reduction_rows, 7 * batch_size)
@@ -3822,11 +3824,12 @@ class KimiDeltaAttentionWeights:
         )
 
 
-def _kda_row_chunk(batch_size: int) -> int:
+def _kda_row_chunk(batch_size: int, attention_dp: int = 1) -> int:
     """Rows per KDA recurrence chunk above B8 (smaller batches run whole).
-    B128 and above use four: eight-row chunks exceed the compiler's VMEM
-    although _vmem_budget accepts them."""
-    return 8 if batch_size < 128 else 4
+    TP32 B128 and above use four: eight-row chunks exceed the compiler's VMEM
+    although _vmem_budget accepts them. Attention DP2's B128 peaks outside KDA
+    and fits eight."""
+    return 8 if batch_size < 128 or attention_dp == 2 and batch_size == 128 else 4
 
 
 def kda(
@@ -5642,7 +5645,7 @@ COMPACT_ROWS = 8
 # A routed expert used by one row (from B8) stages it via scalar compares and
 # updates only that output row. KernelConfig.singleton_block (batch a multiple
 # of 16) selects it from its aligned 16-row block instead of one branch per row;
-# it and stage_blocks default to on at B16/B32/B64/B96.
+# it and stage_blocks default to on at B16-B128.
 SINGLETON_BLOCK = _config().singleton_block
 STAGE_BLOCKS = _config().stage_blocks
 # MXFP4 tiles: single-expert contraction block (multiple of 1024: scale rows
@@ -5673,10 +5676,10 @@ def _compact_rows(batch_size):
 
 COMPACT_ONLY = _config().compact_only
 
-# Shared finishers keep the B16/B32/B64/B96 expert loop and its successor within
+# Shared finishers keep the B16-B128 expert loop and its successor within
 # IMEM (decode runs these batches without deduplicated HLO calls).
 SHARED_EXPERT_FINISHERS = _config().shared_expert_finishers
-# Grouped MXFP4 routes at B16/B32/B64/B96 keep the 2/4/8-row gate/up pairs but
+# Grouped MXFP4 routes at B16-B128 keep the 2/4/8-row gate/up pairs but
 # finish overflowing experts in eight-row passes; without the full-batch
 # fallback the expert loop fits in IMEM next to its predecessor.
 COMPACT_OVERFLOW = _config().compact_overflow
@@ -5702,13 +5705,16 @@ class _RowFunction:
 
 
 def _shared_shards(batch_size):
+    # B128 keeps only each lane's shared-expert output shard (VMEM).
+    if SHARED_SHARDS is None:
+        return batch_size == 128
     return SHARED_SHARDS and batch_size > 32
 
 
 def _use_compact_overflow(batch_size, gate_up_dtype, *, group_pending_routes):
     return (
         COMPACT_OVERFLOW and not COMPACT_ONLY and SHARED_EXPERT_FINISHERS
-        and (batch_size in (32, 64, 96) or (batch_size == 16 and B16_COMPACT_EXPERTS))
+        and (batch_size in (32, 64, 96, 128) or (batch_size == 16 and B16_COMPACT_EXPERTS))
         and COMPACT_ROWS == 8
         and gate_up_dtype == jnp.uint32 and group_pending_routes
     )
@@ -5887,7 +5893,7 @@ def _mla_scoped_scratch(
         # reads the span and the buffers from the shape).
         *mla_dcp.scoped_scratch(batch_size, heads=dcp_heads,
                                 cache_dtype=dcp_dtype, page_tokens=dcp_page_tokens, sequence_rows=sequence_rows,
-                                **mla_dcp.page_plan(batch_size, dcp_heads, sequence_rows)),
+                                **mla_dcp.page_plan(batch_size, dcp_heads, sequence_rows, dcp_dtype)),
     )
 
 
@@ -6040,7 +6046,7 @@ def stack(
     bank offset and follow shard-major group rows; with ``state_row``, slot
     ``state_slots[state_row]``), instead of the caller gathering the rows
     first. The updated states are still returned per row. Needs
-    ``state_row`` or ``batch_size`` > 4 with DP1, or B2..B96 with DP2.
+    ``state_row`` or ``batch_size`` > 4 with DP1, or B2..B128 with DP2.
     """
     if not 1 <= batch_size <= MAX_BATCH:
         raise ValueError(f"The fused decoder stack supports batch sizes from 1 to {MAX_BATCH}")
@@ -6156,9 +6162,9 @@ def stack(
     if attention_dp_ownership and (
         attention_dp == 1
         or batch_size not in (32, 64, 96)
-        and not (attention_dp == 2 and batch_size in (2, 4, 8, 16))
+        and not (attention_dp == 2 and batch_size in (2, 4, 8, 16, 128))
     ):
-        raise ValueError("DP row ownership requires attention DP2 at B2..B96 or DP4 at B32/B64/B96")
+        raise ValueError("DP row ownership requires attention DP2 at B2..B128 or DP4 at B32/B64/B96")
     if moe_token_pipeline and (
         attention_dp not in (2, 4)
         or batch_size not in (32, 64)
@@ -6242,12 +6248,12 @@ def stack(
     persist_kda_state = batch_size <= 4 and attention_dp == 1
     # Above B16 the KDA state streams through row-chunk buffers.
     stream_kda_state = batch_size > 16
-    kda_row_chunk = _kda_row_chunk(batch_size)
+    kda_row_chunk = _kda_row_chunk(batch_size, attention_dp)
     slot_reads = state_slots is not None
     if slot_reads and not (
             attention_dp == 1 and (select_state_row or not persist_kda_state)
-            or attention_dp == 2 and batch_size in (2, 4, 8, 16, 32, 64, 96)):
-        raise ValueError("state_slots needs DP1 with state_row or batch > 4, or DP2 at B2..B96")
+            or attention_dp == 2 and batch_size in (2, 4, 8, 16, 32, 64, 96, 128)):
+        raise ValueError("state_slots needs DP1 with state_row or batch > 4, or DP2 at B2..B128")
     overlap_kda_state_reads = batch_size in (6, *SCATTER_BATCHES) or attention_dp > 1
     overlap_kda_state_writes = batch_size in (6, *SCATTER_BATCHES) or attention_dp > 1
 
@@ -8745,7 +8751,8 @@ def stack(
         )
         shortfall = max(0, -(-(demand - pool_layout["arena_bytes"]) // 4096) * 4096)
         available = (VMEM_LIMIT_BYTES - VMEM_SPILL_RESERVE_BYTES - vmem_peak) // 4096 * 4096
-        spare = shortfall if shortfall <= available else 0
+        # B128's register spills exceed the reserve: its arena does not grow.
+        spare = shortfall if shortfall <= available and batch_size < 128 else 0
         if spare > 0:
             pool_layout = _pool_layout(
                 pool_weights, alias_expert_scales=alias_expert_scales, pooled=POOLED_WEIGHTS,

@@ -56,7 +56,17 @@ def decode_batch_sizes(max_num_seqs: int) -> tuple[int, ...]:
 
 
 # Attention DP's compiled plain-decode batches (DP row ownership).
-DP_BATCH_SIZES = (2, 4, 8, 16, 32, 64, 96)
+DP_BATCH_SIZES = (2, 4, 8, 16, 32, 64, 96, 128)
+
+
+def dp_batch_sizes(requested: tuple[int, ...], attention_dp: int) -> tuple[int, ...]:
+    """Attention DP's compiled sizes for ``requested`` batches: the
+    ``DP_BATCH_SIZES`` (B128 with DP2 only) from the one holding the smallest
+    requested batch to the one holding the largest; a step pads to the next."""
+    sizes = tuple(b for b in DP_BATCH_SIZES if b <= 96 or attention_dp == 2)
+    first = sum(b < min(requested) for b in sizes)
+    last = sum(b < max(requested) for b in sizes)
+    return sizes[first : last + 1]
 
 
 def dp_row_owners(batch_size: int) -> int:
@@ -130,11 +140,7 @@ class DecodeOps:
         self.mesh, self.rank = kernel_mesh(AXIS, TP_SIZE)
         self.attention_dp = kernel_config.active().attention_dp
         if self.attention_dp > 1:
-            # Attention DP compiles the DP_BATCH_SIZES spanning the requested
-            # range; a step pads to the next.
-            first = sum(b < min(batch_sizes) for b in DP_BATCH_SIZES)
-            last = sum(b < max(batch_sizes) for b in DP_BATCH_SIZES)
-            batch_sizes = DP_BATCH_SIZES[first : last + 1]
+            batch_sizes = dp_batch_sizes(batch_sizes, self.attention_dp)
         self.batch_sizes = tuple(sorted(batch_sizes))
         self.num_slots = num_slots
         self.weights: dict[str, torch.Tensor] = {}
@@ -419,7 +425,7 @@ class DecodeOps:
     def _compiler_options(rows: int) -> dict[str, str]:
         config = kernel_config.active()
         dp_rows = rows in (2, 4) and config.attention_dp > 1
-        if (rows in (8, 16, 32, 64, 96) or dp_rows) and config.decode_no_hlo_calls:
+        if (rows in (8, 16, 32, 64, 96, 128) or dp_rows) and config.decode_no_hlo_calls:
             return {"xla_tpu_enable_deduplicated_calls": "DISABLED"}
         return {}
 
@@ -441,7 +447,7 @@ class DecodeOps:
 
     @staticmethod
     def _run(op: Any, rows: int, *args: Any) -> Any:
-        """``op(*args)`` for a ``rows``-row step: at 8, 16, 32, 64 and 96 rows
+        """``op(*args)`` for a ``rows``-row step: at 8, 16, 32, 64, 96 and 128 rows
         (and attention DP's 2 and 4) with XLA's deduplicated calls off
         (``KernelConfig.decode_no_hlo_calls``)."""
         options = DecodeOps._compiler_options(rows)

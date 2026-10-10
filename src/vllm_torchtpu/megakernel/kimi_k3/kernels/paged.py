@@ -245,10 +245,10 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
         group_rows = row // per_pair * (batch_size // owners) + data_group * per_pair + row % per_pair
         state_index = jnp.concatenate([slots[group_rows] + k * (conv_slots.shape[0] // dp) for k in range(dp)])
     # The stack reads the input KDA states from their slots itself where it
-    # can (DP1 above four rows or a selected verify row; DP2 at B2..B96).
+    # can (DP1 above four rows or a selected verify row; DP2 at B2..B128).
     # DP2 indices already include each held head shard's bank offset.
     in_place = ((state_row is not None or batch_size > 4) and dp == 1
-                or dp == 2 and batch_size in (2, 4, 8, 16, 32, 64, 96))
+                or dp == 2 and batch_size in (2, 4, 8, 16, 32, 64, 96, 128))
     if in_place:
         conv, recurrent = conv_slots, recurrent_slots
     else:

@@ -67,10 +67,11 @@ MAX_ROWS = 8  # batch rows of an unchunked call; a larger batch runs in chunks (
 
 def chunk_layout(batch: int, heads: int = HEADS_PER_RANK) -> tuple[int, int]:
     """``(chunk rows, ring slots)`` of a chunked call (``batch > MAX_ROWS``):
-    8-row chunks at B16/B32/B48/B64 (amortizing exchanges), else 4; ring slots
+    8-row chunks at B16/B32/B48/B64 (amortizing exchanges), else 4 (also
+    attention DP2's B128: 64 group rows of six heads, for VMEM); ring slots
     4 at B32 with three heads per rank, 3 for 8-row chunks, else 2
     (``persistent_scratch`` uses 4 for FP8 query packets)."""
-    wide = batch <= 16 or batch in (32, 48, 64)
+    wide = batch <= 16 or batch in (32, 48, 64) and not (batch == 64 and heads == 6)
     rows = 8 if wide else 4
     ring = 4 if batch == 32 and heads == HEADS_PER_RANK else 3 if wide else 2
     if batch % rows or rows > MAX_ROWS or ring not in (2, 3, 4):
@@ -83,16 +84,20 @@ SPAN = 4  # pages per step
 BUFFERS = 4  # steps in flight
 
 
-def page_plan(batch: int, heads: int = HEADS_PER_RANK, sequence_rows: int = 1) -> dict:
+def page_plan(batch: int, heads: int = HEADS_PER_RANK, sequence_rows: int = 1,
+              cache_dtype=jnp.bfloat16) -> dict:
     """The decoder's page buffers for ``batch`` rows of ``heads`` heads per
     rank (``sequence_rows`` per sequence): ``span`` pages per step and
     ``buffers`` steps in flight, sized to fit VMEM. Up to four rows and plain
-    decode: ``SPAN`` x ``BUFFERS`` (3 buffers chunked). Verifies above four rows:
-    half the span, twice the buffers (4 at B64 and attention DP's B32), 3/4 chunked."""
+    decode: ``SPAN`` x ``BUFFERS`` (3 buffers chunked, except attention DP2's
+    FP8 B96 and B128, whose long-context page reads outrun three). Verifies
+    above four rows: half the span, twice the buffers (4 at B64 and attention
+    DP's B32), 3/4 chunked."""
     if batch <= 4:
         return {"span": SPAN, "buffers": BUFFERS}
     if sequence_rows == 1:
-        return {"span": SPAN, "buffers": 3 if chunked(batch) else BUFFERS}
+        deep = batch in (48, 64) and heads == 6 and cache_dtype == jnp.float8_e4m3fn
+        return {"span": SPAN, "buffers": 3 if chunked(batch) and not deep else BUFFERS}
     span = max(1, SPAN // 2)
     buffers = 4 if batch == 64 or (batch == 32 and heads != HEADS_PER_RANK) else BUFFERS * SPAN // span
     return {"span": span, "buffers": buffers if not chunked(batch) else max(2, buffers * 3 // 4)}
@@ -171,6 +176,29 @@ class DcpCache:
             def start(ref=ref):
                 tpu.make_async_copy(ref.at[block], destination, semaphore).start()
 
+    def start_native_copies(self, row, locals_, member, destinations, semaphore):
+        """Start the DMAs of ``row``'s local pages ``locals_`` on ``member``
+        into ``[page_tokens, 640]`` ``destinations`` (see ``native_pages``):
+        each DMA retiles a pool block into the buffer's native tile. Its
+        descriptor setup is not predicated, so the layer's pool is picked by
+        one binary tree of branches for all the pages, not per pool."""
+        if self.table_row is not None:
+            row = self.table_row(row)
+        blocks = [self.table_ref[row * self.pages + (local * self.group + member if self.global_pages else local)]
+                  for local in locals_]
+
+        def pick(first, end):
+            if end - first == 1:
+                for block, destination in zip(blocks, destinations):
+                    tpu.make_async_copy(self.pool_ref[first].at[block].reshape(self.page_tokens, LANES),
+                                        destination, semaphore).start()
+                return
+            middle = (first + end) // 2
+            pl.when(self.layer < middle)(lambda: pick(first, middle))
+            pl.when(self.layer >= middle)(lambda: pick(middle, end))
+
+        pick(0, len(self.pool_ref))
+
 
 @dataclasses.dataclass(frozen=True)
 class DcpWorkspace:
@@ -213,7 +241,7 @@ def persistent_scratch(batch, group=GROUP, heads=HEADS_PER_RANK, *,
     # retains full-precision owner queries for its causal new-token fold.
     plain = sequence_rows == 1 and (
         (batch in (32, 64) and heads == HEADS_PER_RANK)
-        or (group == 16 and batch in (16, 32, 48) and heads == 6))
+        or (group == 16 and batch in (16, 32, 48, 64) and heads == 6))
     query_dtype = (jnp.uint8 if cache_dtype == jnp.float8_e4m3fn
                    and (plain or _grouped_spec(batch, group, heads, sequence_rows))
                    else jnp.bfloat16)
@@ -244,6 +272,14 @@ PERSISTENT_NAMES = ("dcp gathered queries", "dcp send packets", "dcp received pa
                     "dcp gather semaphores", "dcp combine semaphores")
 
 
+def native_pages(batch, heads=HEADS_PER_RANK, sequence_rows=1) -> bool:
+    """Whether a call stages pages as ``[span * page_tokens, 640]`` in the
+    MXU's native tile (retiled by the DMA) rather than as the pool's
+    ``[span * 128, packing, 640]`` blocks, whose loads relayout every tile:
+    attention DP2's plain B96 and B128 (48 and 64 group rows of six heads)."""
+    return heads == 6 and batch in (48, 64) and sequence_rows == 1
+
+
 def scoped_scratch(batch, span=SPAN, buffers=BUFFERS, heads=HEADS_PER_RANK, group=GROUP,
                    cache_dtype=jnp.bfloat16, page_tokens=PAGE_TOKENS, *, sequence_rows=1):
     rows = packet_layout(batch, heads)[0] * batch
@@ -262,7 +298,8 @@ def scoped_scratch(batch, span=SPAN, buffers=BUFFERS, heads=HEADS_PER_RANK, grou
     else:
         span = span * PAGE_TOKENS // page_tokens
     span = max(1, span)
-    pages = (buffers, span * page_tokens // packing, packing, LANES)
+    pages = ((buffers, span * page_tokens, LANES) if native_pages(batch, heads, sequence_rows)
+             else (buffers, span * page_tokens // packing, packing, LANES))
     held = chunk_layout(batch, heads)[0] if chunked(batch) else batch  # rows whose attention state is live at once
     return (
         tpu.VMEM((held, tile, LANES), cache_dtype),
@@ -333,7 +370,8 @@ class DcpAttention:
         self.fp8 = cache.dtype == jnp.float8_e4m3fn
         self.packing = 4 // jnp.dtype(cache.dtype).itemsize
         self.page_rows = self.page_tokens // self.packing
-        self.span = workspace.pages.shape[1] // self.page_rows
+        self.native = workspace.pages.ndim == 3  # native_pages
+        self.span = workspace.pages.shape[1] // (self.page_tokens if self.native else self.page_rows)
         self.probability_hilo, self.skip = probability_hilo, set(skip)
         rank = jax.lax.axis_index("tp")
         self.member = rank % self.group
@@ -385,6 +423,14 @@ class DcpAttention:
         last page (masked by position)."""
         row, local_step, count = self._locate(step)
         slot = step % self.buffers
+        if self.native:
+            self.cache.start_native_copies(
+                row, [jnp.minimum(local_step * self.span + index, count - 1) for index in range(self.span)],
+                self.owner,
+                [self.ws.pages.at[slot, pl.ds(index * self.page_tokens, self.page_tokens)]
+                 for index in range(self.span)],
+                self.ws.page_semaphores.at[slot])
+            return
         for index in range(self.span):
             local = jnp.minimum(local_step * self.span + index, count - 1)
             self.cache.start_page_copy(
@@ -457,6 +503,8 @@ class DcpAttention:
 
     def _pages(self, slot):
         """``load(lanes)``: buffer ``slot``'s pages in the cache dtype."""
+        if self.native:
+            return lambda lanes: self.ws.pages[slot, :, lanes]
         words = self.ws.pages.bitcast(jnp.uint32).at[slot].reshape(self.span * self.page_rows, LANES)
         return lambda lanes: pltpu.bitcast(words[:, lanes], self.cache.dtype)
 
@@ -646,7 +694,8 @@ class DcpAttention:
         limit (a step's visible offsets are a prefix). Stores into the buffer,
         not a masked copy of the whole tile as a value (which spills)."""
         ws, rows = self.ws, self.span * self.page_tokens
-        words = ws.pages.bitcast(jnp.uint32).at[slot].reshape(self.span * self.page_rows, LANES)
+        words = (ws.pages.bitcast(jnp.uint32).at[slot] if self.native
+                 else ws.pages.bitcast(jnp.uint32).at[slot].reshape(self.span * self.page_rows, LANES))
         if (self.batch in (16, 32, 48, 64) or self.heads != HEADS_PER_RANK
                 or (self.batch, self.sequence_rows) == (8, 1)):
             pad_shape = (self.span * self.page_rows, LANES - LATENT)
@@ -834,12 +883,13 @@ class DcpAttention:
         return jnp.stack([merged[self.slots * b:self.slots * b + self.heads] for b in range(batch)])
 
 
-def _merge_received(received, own_rows, new_rows, group):
+def _merge_received(received, own_rows, new_rows, group, *, unroll=1):
     """Log-sum-exp merge of the ``group`` peers' partials in ``received``
     [G, rows, 640] (a ref: normalized outputs, lse hi/lo in lanes 512:514)
     with the new token (``own_rows`` the rows' queries, ``new_rows`` its
-    latent per head slot): [rows, 512]. Online over the peers in a loop, so
-    one peer's [rows, 640] is live at a time (bounds register pressure)."""
+    latent per head slot): [rows, 512]. Online over the peers in a loop
+    (``unroll`` peers a step), so few peers' [rows, 640] are live at a time
+    (bounds register pressure)."""
     top = jnp.sum(own_rows * new_rows, axis=1, keepdims=True)  # [rows, 1]: the new token's score
     accumulator = new_rows[:, :LATENT]
     denominator = jnp.ones_like(top)
@@ -852,7 +902,7 @@ def _merge_received(received, own_rows, new_rows, group):
         keep, weight = jnp.exp(top - new_top), jnp.exp(lse - new_top)
         return (new_top, accumulator * keep + weight * partial[:, :LATENT], denominator * keep + weight)
 
-    _, accumulator, denominator = jax.lax.fori_loop(0, group, fold, (top, accumulator, denominator))
+    _, accumulator, denominator = jax.lax.fori_loop(0, group, fold, (top, accumulator, denominator), unroll=unroll)
     return accumulator / denominator
 
 
@@ -1013,8 +1063,10 @@ def _attend_chunked(self, queries, new_latents, between):
         if "merge" in self.skip:
             return
         if self.sequence_rows == 1:
+            # Attention DP2's B128 and FP8 B96 merge four peers a step.
             ws.merged[c, :rows, :] = _merge_received(
-                ws.receive.at[ring(c)], ws.own_rows[c, :rows, :], ws.new_rows[c, :rows, :], group)
+                ws.receive.at[ring(c)], ws.own_rows[c, :rows, :], ws.new_rows[c, :rows, :], group,
+                unroll=4 if self.heads == 6 and (batch == 64 or batch == 48 and self.fp8) else 1)
             return
         # Whole sequences per chunk: fold each row's earlier in-step tokens too.
         latents = jnp.concatenate(
