@@ -1932,11 +1932,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         candidate_write = has_candidates and getattr(
             indexer.indexer_op, "candidate_write", False
         )
-        candidates = (
-            self.candidate_block_buffer[:count]
-            if has_candidates
-            else swa_slots.new_empty((count, 0), dtype=torch.int32)
-        )
         write_records, write_keys = (
             pending_index_write
             if pending_index_write is not None
@@ -2044,18 +2039,39 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 qr.index_select(0, clamped_mine).masked_fill(invalid_mine_2d, 0),
                 weights.index_select(0, clamped_mine).masked_fill(invalid_mine_2d, 0),
             )
-            if owner_perm is not None:
-                candidates_part = (
-                    self.candidate_block_buffer[: qr_part.shape[0]]
-                    if has_candidates
-                    else swa_slots.new_empty((qr_part.shape[0], 0), dtype=torch.int32)
-                )
-            else:
-                candidates_part = candidates.index_select(0, clamped_mine).masked_fill(
-                    invalid_mine_2d, -1
-                )
         else:
-            qr_part, weights_part, candidates_part = qr, weights, candidates
+            qr_part, weights_part = qr, weights
+        cand_key = (
+            _memo_stage_cache_key(
+                self,
+                "indexer_candidates_part",
+                id(self.candidate_block_buffer),
+                *query_split_key[1:],
+            )
+            if stage_cache is not None and has_candidates
+            else None
+        )
+        if not has_candidates:
+            candidates_part = swa_slots.new_empty(
+                (qr_part.shape[0], 0), dtype=torch.int32
+            )
+        elif (
+            stage_cache is not None
+            and not candidate_write
+            and (cached_candidates_part := stage_cache.get(cand_key)) is not None
+        ):
+            candidates_part = cached_candidates_part
+        else:
+            if not split or owner_perm is not None:
+                candidates_part = self.candidate_block_buffer[: qr_part.shape[0]]
+            else:
+                candidates_part = (
+                    self.candidate_block_buffer[:count]
+                    .index_select(0, clamped_mine)
+                    .masked_fill(invalid_mine_2d, -1)
+                )
+            if stage_cache is not None and not candidate_write:
+                stage_cache[cand_key] = candidates_part
         q_part = self._project_index_q(qr_part, positions_part)
         updated_cache, selected, published = paged_indexer(
             q_part,
@@ -2080,25 +2096,32 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )
         if split and owner_perm is None:
             selected = _gather_query_rows(selected)[:count]
-            if candidate_write:
+            if candidate_write and stage_cache is None:
                 published = _gather_query_rows(published)[:count]
         if isinstance(updated_cache, tuple):
             index_cache.copy_raw(updated_cache)
         else:
             index_cache.raw.copy_(updated_cache)
         if candidate_write:
-            self.candidate_block_buffer.copy_(
-                torch.nn.functional.pad(
-                    published,
-                    (
-                        0,
-                        0,
-                        0,
-                        self.candidate_block_buffer.shape[0] - published.shape[0],
-                    ),
-                    value=-1,
+            if stage_cache is not None:
+                stage_cache[cand_key] = (
+                    published.masked_fill(invalid_mine_2d, -1)
+                    if (split and owner_perm is None)
+                    else published
                 )
-            )
+            else:
+                self.candidate_block_buffer.copy_(
+                    torch.nn.functional.pad(
+                        published,
+                        (
+                            0,
+                            0,
+                            0,
+                            self.candidate_block_buffer.shape[0] - published.shape[0],
+                        ),
+                        value=-1,
+                    )
+                )
         return selected
 
     def _select_indices(self, scores, lengths, logical_compressed, count):

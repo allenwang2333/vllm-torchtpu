@@ -726,6 +726,217 @@ class TestAttentionKvShard:
                         assert torch.equal(seen_swa[0], ref_swa_recs)
                         assert torch.equal(seen_idx[0], ref_idx_recs)
 
+    def test_td8226_stage_cached_candidates_part_parity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """TD8.226: stage-cache candidates_part across L20 and L24/28/32/36."""
+        count = 6
+        cand_k = 4
+        topk = 4
+        positions = torch.arange(count, dtype=torch.int32)
+        qr = torch.ones((count, 16), dtype=torch.bfloat16)
+        weights = torch.ones((count, 2), dtype=torch.float32)
+        lengths = torch.full((count, 1), 32, dtype=torch.int32)
+        swa_slots = torch.arange(count, dtype=torch.int32)
+        requests = torch.arange(count, dtype=torch.int32)
+        records = torch.zeros((count, 64), dtype=torch.int32)
+
+        def _make_layer(*, candidate_write: bool | None, shared_buf: torch.Tensor):
+            layer: Any = object.__new__(v2_attn.DeepseekV41Attention)
+            torch.nn.Module.__init__(layer)
+            layer.compress_ratio = 2
+            layer._tp_rank = torch.tensor(1, dtype=torch.int32)
+            layer._tp_rank_1d = torch.tensor([1], dtype=torch.int32)
+            layer._fp8_kv = True
+            layer._config = {"index_topk": topk}
+            layer.candidate_block_size = 2
+            layer.candidate_block_buffer = shared_buf
+            layer._project_index_q = lambda q, p: q
+            layer.indexer = SimpleNamespace(
+                head_dim=8,
+                n_head=2,
+                indexer_op=SimpleNamespace(
+                    candidate_blocks=(None if candidate_write is None else cand_k),
+                    candidate_write=bool(candidate_write),
+                ),
+            )
+            return layer
+
+        for ranks, use_owner_perm in ((2, False), (2, True), (1, False)):
+            monkeypatch.setattr(
+                v2_attn, "get_tensor_model_parallel_world_size", lambda r=ranks: r
+            )
+            monkeypatch.setattr(v2_attn.envs, "TPU_DEEPSEEK_V41_KV_SHARD", False)
+            owner_perm = (
+                torch.tensor([0, 1, 2, -1, 3, 4, 5, -1], dtype=torch.int32)
+                if use_owner_perm
+                else None
+            )
+            part = (
+                owner_perm.shape[0] // ranks
+                if owner_perm is not None
+                else (
+                    v2_attn._query_split(count, ranks, kv_shard=False)[0]
+                    if ranks > 1
+                    else count
+                )
+            )
+            published_rank = torch.arange(
+                10, 10 + part * cand_k, dtype=torch.int32
+            ).reshape(part, cand_k)
+            selected_rank = torch.arange(part * topk, dtype=torch.int32).reshape(
+                part, topk
+            )
+
+            gather_calls: list[torch.Tensor] = []
+
+            def fake_gather(
+                x: torch.Tensor,
+                r: int = ranks,
+                gc: list[torch.Tensor] = gather_calls,
+            ) -> torch.Tensor:
+                gc.append(x)
+                # Rank 0 rows + Rank 1 rows (layer._tp_rank is 1)
+                return torch.cat([x + 100, x], dim=0) if r > 1 else x
+
+            monkeypatch.setattr(v2_attn, "_gather_query_rows", fake_gather)
+
+            seen_candidates: list[torch.Tensor] = []
+
+            def fake_paged_indexer(
+                q_p,
+                ic,
+                rec,
+                w_p,
+                l_p,
+                c_p,
+                wr,
+                wk,
+                rq_p,
+                *,
+                candidate_write,
+                sc: list[torch.Tensor] = seen_candidates,
+                pr: torch.Tensor = published_rank,
+                sr: torch.Tensor = selected_rank,
+                **kw,
+            ):
+                sc.append(c_p)
+                pub = pr.clone() if candidate_write else c_p
+                return ic.raw, sr.clone(), pub
+
+            monkeypatch.setattr(v2_attn, "paged_indexer", fake_paged_indexer)
+            idx_cache = SimpleNamespace(
+                raw=torch.zeros((16, ROW_WORDS), dtype=torch.int32)
+            )
+
+            # 1. Uncached reference (stage_cache is None): L20 writes buffer,
+            #    L24 reads from candidate_block_buffer
+            ref_buf = torch.full((32, cand_k), -7, dtype=torch.int32)
+            l20_ref = _make_layer(candidate_write=True, shared_buf=ref_buf)
+            l24_ref = _make_layer(candidate_write=False, shared_buf=ref_buf)
+            sel20_ref = l20_ref._select_paged_indices(
+                qr,
+                positions,
+                idx_cache,
+                records,
+                requests,
+                weights,
+                lengths,
+                swa_slots,
+                None,
+                owner_perm=owner_perm,
+            )
+            sel24_ref = l24_ref._select_paged_indices(
+                qr,
+                positions,
+                idx_cache,
+                records,
+                requests,
+                weights,
+                lengths,
+                swa_slots,
+                None,
+                owner_perm=owner_perm,
+            )
+            ref_l24_cand = seen_candidates[-1].clone()
+            expected_uncached_gathers = 3 if (ranks > 1 and not use_owner_perm) else 0
+            assert len(gather_calls) == expected_uncached_gathers
+
+            # 2. Cached execution inside stage_attention_cache_scope():
+            #    L20 stores candidates_part in stage_cache without gathering
+            #    published or touching candidate_block_buffer; L24 and L28
+            #    reuse the exact cached tensor in O(1).
+            gather_calls.clear()
+            seen_candidates.clear()
+            staged_buf = torch.full((32, cand_k), -99, dtype=torch.int32)
+            l0_staged = _make_layer(candidate_write=None, shared_buf=staged_buf)
+            l20_staged = _make_layer(candidate_write=True, shared_buf=staged_buf)
+            l24_staged = _make_layer(candidate_write=False, shared_buf=staged_buf)
+            l28_staged = _make_layer(candidate_write=False, shared_buf=staged_buf)
+
+            with v2_attn.stage_attention_cache_scope():
+                l0_staged._select_paged_indices(
+                    qr,
+                    positions,
+                    idx_cache,
+                    records,
+                    requests,
+                    weights,
+                    lengths,
+                    swa_slots,
+                    None,
+                    owner_perm=owner_perm,
+                )
+                sel20 = l20_staged._select_paged_indices(
+                    qr,
+                    positions,
+                    idx_cache,
+                    records,
+                    requests,
+                    weights,
+                    lengths,
+                    swa_slots,
+                    None,
+                    owner_perm=owner_perm,
+                )
+                sel24 = l24_staged._select_paged_indices(
+                    qr,
+                    positions,
+                    idx_cache,
+                    records,
+                    requests,
+                    weights,
+                    lengths,
+                    swa_slots,
+                    None,
+                    owner_perm=owner_perm,
+                )
+                sel28 = l28_staged._select_paged_indices(
+                    qr,
+                    positions,
+                    idx_cache,
+                    records,
+                    requests,
+                    weights,
+                    lengths,
+                    swa_slots,
+                    None,
+                    owner_perm=owner_perm,
+                )
+
+            assert seen_candidates[0].shape == (part, 0)
+            assert torch.equal(sel20, sel20_ref)
+            assert torch.equal(sel24, sel24_ref)
+            assert torch.equal(sel28, sel24_ref)
+            # Exact bitwise parity of candidates_part on L24/L28 vs uncached
+            assert torch.equal(seen_candidates[2], ref_l24_cand)
+            assert seen_candidates[2] is seen_candidates[3]
+            # candidate_block_buffer was never written inside stage_cache scope
+            assert torch.all(staged_buf == -99)
+            # Only 1 _gather_query_rows call per layer (selected), 0 for published
+            expected_staged_gathers = 4 if (ranks > 1 and not use_owner_perm) else 0
+            assert len(gather_calls) == expected_staged_gathers
+
 
 # ==============================================================================
 # 4. v2/attention_kernels.py: Token-Parallel Thresholds & Padding under KV Shard
