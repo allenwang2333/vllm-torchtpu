@@ -109,6 +109,7 @@ def _clear_tuned_block_sizes_cache():
 
 def test_tpu_version_below_4_raises():
     """TPU versions < 4 must raise NotImplementedError."""
+    tbs.get_tuned_block_sizes.cache_clear()
     with (
         mock.patch.object(tbs, "get_tpu_version", return_value=3),
         pytest.raises(NotImplementedError, match="TPU version must be 4 or higher."),
@@ -127,6 +128,7 @@ def test_tpu_version_below_4_raises():
 
 def test_tpu_version_4_fixed_sizes():
     """TPUv4 sets default fixed block sizes (512 // page_size, 32)."""
+    tbs.get_tuned_block_sizes.cache_clear()
     with (
         mock.patch.object(tbs, "get_tpu_version", return_value=4),
         mock.patch.object(tbs, "get_device_name", return_value="UnknownTPU"),

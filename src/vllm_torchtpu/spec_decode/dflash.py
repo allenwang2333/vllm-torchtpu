@@ -131,7 +131,8 @@ class DFlashProposer:
         """Fetch or create persistent static TPU tensors for draft
         attention metadata.
         """
-        if padded_num_reqs not in self._static_attn_tensors_cache:
+        tensors = self._static_attn_tensors_cache.get(padded_num_reqs)
+        if tensors is None:
             qsl = (
                 torch.arange(
                     padded_num_reqs + 1, dtype=torch.int32, device=self.runner.device
@@ -141,8 +142,9 @@ class DFlashProposer:
             rd = torch.tensor(
                 [0, 0, padded_num_reqs], dtype=torch.int32, device=self.runner.device
             )
-            self._static_attn_tensors_cache[padded_num_reqs] = (qsl, rd)
-        return self._static_attn_tensors_cache[padded_num_reqs]
+            tensors = (qsl, rd)
+            self._static_attn_tensors_cache[padded_num_reqs] = tensors
+        return tensors
 
     # Whether load_model overwrites the draft's embed_tokens/lm_head with the
     # target's unconditionally. DSpark sets this False to honor the draft's
@@ -303,14 +305,16 @@ class DFlashProposer:
 
     def _get_draft_group_builders(self, attn_groups) -> tuple[Any, ...]:
         frozen_names = self._get_frozen_draft_attn_layer_names()
+        g0 = attn_groups[0]
+        g_last = attn_groups[-1]
         key = (
-            (id(attn_groups), id(attn_groups[0]), len(attn_groups[0]), frozen_names)
-            if len(attn_groups) == 1
-            else (
-                id(attn_groups),
-                tuple((id(gl), len(gl)) for gl in attn_groups),
-                frozen_names,
-            )
+            id(attn_groups),
+            len(attn_groups),
+            id(g0),
+            len(g0),
+            id(g_last),
+            len(g_last),
+            frozen_names,
         )
         cached = self._draft_group_builders_cache
         if cached is not None and cached[0] == key:
@@ -345,6 +349,7 @@ class DFlashProposer:
         builders = self._get_draft_group_builders(attn_groups)
         if not builders:
             return None
+        multi_builders = len(builders) > 1
         checked_geom: tuple[int, int, bool] | None = None
         for builder in builders:
             staged = staged_tables.get(builder.kv_cache_group_id)
@@ -354,9 +359,13 @@ class DFlashProposer:
             if staged.numel() != padded_num_reqs * tnb:
                 return None
             geom = (
-                getattr(builder, "target_block_size", id(builder)),
-                tnb,
-                getattr(builder, "is_mamba_group", False),
+                (
+                    getattr(builder, "target_block_size", id(builder)),
+                    tnb,
+                    getattr(builder, "is_mamba_group", False),
+                )
+                if multi_builders
+                else (0, 0, False)
             )
             if geom != checked_geom:
                 if builder._active_block_table_columns(
@@ -598,9 +607,10 @@ class DFlashProposer:
         failing.
         """
         layer_names = self._get_draft_kv_cache_layer_names()
+        get_md = attn_metadata.get
         draft_md_list = []
         for layer_name in layer_names:
-            md = attn_metadata.get(layer_name) if layer_name else None
+            md = get_md(layer_name) if layer_name else None
             if md is None:
                 raise RuntimeError(
                     f"No attention metadata for draft layer {layer_name!r}; "
@@ -618,10 +628,10 @@ class DFlashProposer:
         It applies RoPE to the target's hidden states and scatters the tokens directly
         into the draft KV cache.
         """
-        if chunk.aux_hidden_states is None:
+        target_hidden = chunk.aux_hidden_states
+        if target_hidden is None:
             return
 
-        target_hidden = chunk.aux_hidden_states
         aux_hidden = (
             target_hidden[0]
             if isinstance(target_hidden, (list, tuple))
@@ -673,6 +683,8 @@ class DFlashProposer:
             raise RuntimeError("DFlash propose called but no draft chunks captured.")
 
         block_size = self.block_size
+        vllm_config = self.vllm_config
+        mesh = runner.mesh
 
         # EP-DP lockstep: a rank whose step produced fewer chunks than the
         # DP-group max must pad each draft phase to the group's chunk count —
@@ -721,13 +733,11 @@ class DFlashProposer:
                 # pair exactly with the idle replay's calls.
                 set_forward_context(
                     draft_attn_metadata,
-                    self.vllm_config,
+                    vllm_config,
                     num_tokens=padded_len,
                     num_tokens_across_dp=runner._dp_num_tokens_across_dp(padded_len),
                 ),
-                set_vllm_model_wrapper_context(
-                    mesh=self.runner.mesh, vllm_config=self.vllm_config
-                ),
+                set_vllm_model_wrapper_context(mesh=mesh, vllm_config=vllm_config),
             ):
                 draft_tokens_chunk, _ = self._dflash_forward_and_sample(
                     input_ids, positions, block_size

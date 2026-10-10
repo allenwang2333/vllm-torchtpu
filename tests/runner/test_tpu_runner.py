@@ -3033,3 +3033,56 @@ def test_modify_prev_results_vectorized_skips_when_req_ids_exceed_seq_lens():
     assert runner.input_batch.num_tokens_no_spec.tolist() == [14, 20]
     assert runner.input_batch.token_ids_cpu[0, 12:14].tolist() == [10, 11]
     assert runner.input_batch.token_ids_cpu[1, 18:20].tolist() == [20, 21]
+
+
+@pytest.mark.parametrize("num_reqs", [64, 96, 112, 128])
+def test_td8195_high_conc_spec_decode_host_fast_paths(num_reqs: int):
+    """Verify TD8.195 speculative decode K=5 host fast paths at C=64/96/112/128."""
+    k = 5
+    tokens_per_req = k + 1
+    req_ids = [f"req-{i}" for i in range(num_reqs)]
+    num_scheduled = {rid: tokens_per_req for rid in req_ids}
+    sched = SimpleNamespace(
+        total_num_scheduled_tokens=num_reqs * tokens_per_req,
+        num_scheduled_tokens=num_scheduled,
+        scheduled_spec_decode_tokens={rid: [1] * k for rid in req_ids},
+    )
+    swap_calls = 0
+
+    def swap_states(i1: int, i2: int) -> None:
+        nonlocal swap_calls
+        swap_calls += 1
+
+    runner = object.__new__(TPUModelRunner)
+    runner.reorder_batch_threshold = 1
+    runner.most_model_len = 4096
+    runner.num_reqs_most_model_len = 64
+    runner.num_reqs_max_model_len = 8
+    runner.input_batch = SimpleNamespace(
+        num_reqs=num_reqs,
+        req_ids=list(req_ids),
+        req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+        num_computed_tokens_cpu=np.full(num_reqs, 128, dtype=np.int32),
+        swap_states=swap_states,
+    )
+    runner._pre_async_results = SimpleNamespace(
+        req_id_to_index_copy={rid: i for i, rid in enumerate(req_ids)}
+    )
+
+    # 1) _flush_disjoint_async_results: overlapping req_ids does not flush
+    runner._flush_disjoint_async_results()
+    assert runner._pre_async_results is not None
+
+    # 2) _reorder_batch_for_rpa: uniform K=5 verify batch short-circuits swaps
+    num_decode, num_windowed = runner._reorder_batch_for_rpa(sched)
+    assert num_decode == 0
+    assert num_windowed == num_reqs
+    assert swap_calls == 0
+
+    # 3) _count_input_chunks: single-pass fast exit when all requests <= most_model_len
+    expected_chunks = (num_reqs + 63) // 64
+    assert runner._count_input_chunks(sched) == (expected_chunks, min(64, num_reqs))
+
+    # Also verify most_model_len=None O(1) fast path
+    runner.most_model_len = None
+    assert runner._count_input_chunks(sched) == (num_reqs // 8, 8)

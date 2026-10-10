@@ -78,6 +78,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
+import vllm_torchtpu.runner.tpu_runner_async_output as _async_output
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
@@ -1590,12 +1591,18 @@ class TPUModelRunner(GPUModelRunner):
                 i += 1
             return i
 
-        # Pass 1: 1-token decode requests to the front.
-        num_decode = partition(0, num_reqs - 1, 0)
-        # Pass 2: speculative verify windows before prefill/mixed requests.
-        num_windowed = num_decode
-        if spec_decode_tokens and num_decode < num_reqs:
-            num_windowed = partition(num_decode, num_reqs - 1, 1)
+        n_seg = len(segments)
+        s0 = segments[0]
+        if segments.count(s0) == n_seg:
+            num_decode = n_seg if s0 == 0 else 0
+            num_windowed = n_seg if s0 <= 1 else 0
+        else:
+            # Pass 1: 1-token decode requests to the front.
+            num_decode = partition(0, num_reqs - 1, 0)
+            # Pass 2: speculative verify windows before prefill/mixed requests.
+            num_windowed = num_decode
+            if spec_decode_tokens and num_decode < num_reqs:
+                num_windowed = partition(num_decode, num_reqs - 1, 1)
         mla_dispatch.maybe_order_prefills_by_kv_len(
             self, num_decode, num_reqs, scheduler_output, spec_decode_tokens
         )
@@ -2500,9 +2507,11 @@ class TPUModelRunner(GPUModelRunner):
     def _flush_disjoint_async_results(self) -> None:
         if self._pre_async_results is None:
             return
-        current_req_ids = set(self.input_batch.req_ids[: self.input_batch.num_reqs])
         previous_req_ids = self._pre_async_results.req_id_to_index_copy
-        if any(req_id in current_req_ids for req_id in previous_req_ids):
+        if any(
+            req_id in previous_req_ids
+            for req_id in self.input_batch.req_ids[: self.input_batch.num_reqs]
+        ):
             return
         self._modify_prev_results()
         self._pre_async_results = None
@@ -2756,14 +2765,12 @@ class TPUModelRunner(GPUModelRunner):
             gen_lens = gen_lens[:n_pre_reqs]
             pre_next_tokens_cpu = getattr(copy_state, "_sampled_token_ids_cpu", None)
         else:
-            from vllm_torchtpu.runner.tpu_runner_async_output import (
-                parse_sampled_token_ids_cpu,
-            )
-
             pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
             assert pre_next_tokens_cpu is not None
-            valid_sampled_token_ids, gen_lens = parse_sampled_token_ids_cpu(
-                pre_next_tokens_cpu[:n_pre_reqs]
+            valid_sampled_token_ids, gen_lens = (
+                _async_output.parse_sampled_token_ids_cpu(
+                    pre_next_tokens_cpu[:n_pre_reqs]
+                )
             )
 
         if pre_discard_sampled_tokens_req_indices:
@@ -2802,15 +2809,16 @@ class TPUModelRunner(GPUModelRunner):
                 pre_num_draft_per_req, n_reqs
             )
             if uniform_placeholder is not None:
+                assert max(gen_lens) <= uniform_placeholder, (
+                    f"sampled {max(gen_lens)} tokens > "
+                    f"{uniform_placeholder} optimistic placeholders -- "
+                    "output_token_ids rollback would drop the wrong elements"
+                )
                 neg_placeholder = -uniform_placeholder
-                for pre_req_idx, req_state, _seq_len, req_id in pre_request_seq_lens:
-                    sampled_ids = valid_sampled_token_ids[pre_req_idx]
-                    assert len(sampled_ids) <= uniform_placeholder, (
-                        f"req {req_id}: sampled {len(sampled_ids)} tokens > "
-                        f"{uniform_placeholder} optimistic placeholders -- "
-                        "output_token_ids rollback would drop the wrong elements"
+                for pre_req_idx, req_state, _seq_len, _req_id in pre_request_seq_lens:
+                    req_state.output_token_ids[neg_placeholder:] = (
+                        valid_sampled_token_ids[pre_req_idx]
                     )
-                    req_state.output_token_ids[neg_placeholder:] = sampled_ids
                 end_idx = num_tokens_no_spec[:n_reqs]
                 start_idx = end_idx - uniform_placeholder
             else:
@@ -3030,10 +3038,6 @@ class TPUModelRunner(GPUModelRunner):
         Returns ``(next_tokens_tpu_chunks, next_token_indices,
         spec_decode_num_rejected_tokens, num_draft_per_req)``.
         """
-        from vllm_torchtpu.runner.tpu_runner_async_output import (
-            assemble_spec_next_tokens_and_num_rejected,
-        )
-
         assert drafts is not None, (
             "async spec substitution requires the eagle3 drafts proposed "
             "earlier in sample_tokens"
@@ -3061,13 +3065,15 @@ class TPUModelRunner(GPUModelRunner):
             next_tokens_per_chunk, state.num_reqs_list, state.spec_decode_metadata_list
         ):
             drafts_chunk = drafts[req_offset : req_offset + num_reqs]
-            src, num_rejected = assemble_spec_next_tokens_and_num_rejected(
-                nt_chunk,
-                drafts_chunk,
-                md.draft_lengths if md is not None else None,
-                num_reqs,
-                padded_src_len=single_chunk_pad_src,
-                padded_num_reqs=single_chunk_pad_reqs,
+            src, num_rejected = (
+                _async_output.assemble_spec_next_tokens_and_num_rejected(
+                    nt_chunk,
+                    drafts_chunk,
+                    md.draft_lengths if md is not None else None,
+                    num_reqs,
+                    padded_src_len=single_chunk_pad_src,
+                    padded_num_reqs=single_chunk_pad_reqs,
+                )
             )
             num_rejected_chunks.append(num_rejected)
             if md is not None:
@@ -3165,23 +3171,15 @@ class TPUModelRunner(GPUModelRunner):
         self._wait_input_staging_fence()
 
         # Get the number of scheduled tokens for each request.
-        use_max_model_len = self.most_model_len is None
-        num_scheduled_tokens_per_req = []
-        max_num_scheduled_tokens_all_reqs = 0
-        end_index = start_index
-
-        # Use either most_model_len or max_model_len depending on request size.
-        for i in range(start_index, num_reqs):
-            req_id = self.input_batch.req_ids[i]
-            assert req_id is not None
-            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            if (
-                not use_max_model_len
-                and self.most_model_len is not None
-                and num_tokens > self.most_model_len
-            ):
-                use_max_model_len = True
-            num_scheduled_tokens_per_req.append(num_tokens)
+        most_model_len = self.most_model_len
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        num_scheduled_tokens_per_req = [
+            num_scheduled_tokens[cast(str, req_id)]
+            for req_id in self.input_batch.req_ids[start_index:num_reqs]
+        ]
+        use_max_model_len = (
+            most_model_len is None or max(num_scheduled_tokens_per_req) > most_model_len
+        )
         if use_max_model_len:
             if len(num_scheduled_tokens_per_req) > self.num_reqs_max_model_len:
                 num_scheduled_tokens_per_req = num_scheduled_tokens_per_req[
@@ -3417,10 +3415,6 @@ class TPUModelRunner(GPUModelRunner):
             and self._pre_async_results is not None
             and self._pre_async_results.spec_decode_num_rejected_tokens is not None
         ):
-            from vllm_torchtpu.runner.tpu_runner_async_output import (
-                subtract_num_rejected_tokens,
-            )
-
             get_req_idx = self._pre_async_results.req_id_to_index_copy.get
             req_ids = self.input_batch.req_ids
             seq_idx_prefix = np.fromiter(
@@ -3461,7 +3455,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._cached_reject_subtract_key = reject_subtract_key
                 self._cached_reject_seq_idx = seq_idx_dev
                 self._cached_reject_pos_idx = pos_idx_dev
-            seq_lens, self.position_ids = subtract_num_rejected_tokens(
+            seq_lens, self.position_ids = _async_output.subtract_num_rejected_tokens(
                 seq_lens,
                 self.position_ids,
                 self._pre_async_results.spec_decode_num_rejected_tokens,
@@ -3867,29 +3861,28 @@ class TPUModelRunner(GPUModelRunner):
             return 0, 0
 
         num_reqs = self.input_batch.num_reqs
+        most_model_len = self.most_model_len
+        req_ids = self.input_batch.req_ids
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         start_index = 0
         num_chunks = 0
         max_chunk_reqs = 0
         while start_index < num_reqs:
-            use_max_model_len = self.most_model_len is None
-            for i in range(start_index, num_reqs):
-                req_id = self.input_batch.req_ids[i]
-                assert req_id is not None
-                num_tokens = scheduler_output.num_scheduled_tokens[req_id]
-                if (
-                    not use_max_model_len
-                    and self.most_model_len is not None
-                    and num_tokens > self.most_model_len
-                ):
-                    use_max_model_len = True
-
+            use_max_model_len = most_model_len is None or any(
+                num_scheduled_tokens[req_ids[i]] > most_model_len
+                for i in range(start_index, num_reqs)
+            )
             if use_max_model_len:
                 chunk_reqs = self.num_reqs_max_model_len
             else:
                 assert self.num_reqs_most_model_len is not None
                 chunk_reqs = self.num_reqs_most_model_len
-            this_chunk_reqs = min(chunk_reqs, num_reqs - start_index)
+            remaining = num_reqs - start_index
+            this_chunk_reqs = min(chunk_reqs, remaining)
             max_chunk_reqs = max(max_chunk_reqs, this_chunk_reqs)
+            if most_model_len is None or not use_max_model_len:
+                num_chunks += cdiv(remaining, chunk_reqs)
+                break
             start_index += this_chunk_reqs
             num_chunks += 1
         return num_chunks, max_chunk_reqs
@@ -4201,14 +4194,12 @@ class TPUModelRunner(GPUModelRunner):
                 and spec_decode_metadata is not None
                 and len(cur_input_indices) > 0
             ):
-                from vllm_torchtpu.runner.tpu_runner_async_output import (
-                    extract_draft_token_ids,
-                )
-
-                spec_decode_metadata.draft_token_ids = extract_draft_token_ids(
-                    input_ids,
-                    spec_decode_metadata.final_logits_indices,
-                    spec_decode_metadata.target_logits_indices,
+                spec_decode_metadata.draft_token_ids = (
+                    _async_output.extract_draft_token_ids(
+                        input_ids,
+                        spec_decode_metadata.final_logits_indices,
+                        spec_decode_metadata.target_logits_indices,
+                    )
                 )
             draft_input_ids_src = input_ids
 
@@ -5001,15 +4992,14 @@ class TPUModelRunner(GPUModelRunner):
         discard_sampled_tokens_req_indices = []
         num_reqs = self.input_batch.num_reqs
         req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+        requests = self.requests
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
 
         request_seq_lens = []
         for i, req_id in enumerate(req_ids):
             assert req_id is not None
-            req_state = self.requests[req_id]
-            seq_len = (
-                req_state.num_computed_tokens
-                + scheduler_output.num_scheduled_tokens[req_id]
-            )
+            req_state = requests[req_id]
+            seq_len = req_state.num_computed_tokens + num_scheduled_tokens[req_id]
             # Ignore the sampled token from the partial request.
             # Rewind the generator state as if the token was not sampled.
             if seq_len < req_state.num_tokens:
