@@ -13,6 +13,7 @@
 # limitations under the License.
 """TPU-Friendly MLA Ragged Paged Attention kernel."""
 
+import dataclasses
 import functools
 
 import jax
@@ -611,6 +612,120 @@ def prepare_outputs(
     return out[:, :actual_num_q_heads, :actual_head_dim]
 
 
+def csa_gather_indices(
+    topk_indices: jax.Array,  # i32[num_tokens, topk], -1 = padding
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    *,
+    total_num_pages: int,
+    page_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Per-token valid top-k counts and the flat cache-row index of each entry."""
+    num_tokens, topk = topk_indices.shape
+    max_num_seqs = cu_q_lens.shape[0] - 1
+    tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
+    seq_ids_segment = jnp.repeat(
+        jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=num_tokens
+    )
+    kv_lens = jnp.sum(topk_indices != -1, axis=-1)
+
+    seq_page_ids = topk_indices // page_size
+    token_offset = topk_indices % page_size
+    page_ids = gather_page_ids(
+        page_indices, seq_page_ids, seq_ids_segment, max_num_seqs
+    )
+
+    # For the "-1" padding elements in topk_indices, we scatter the corresponding
+    # page_ids and token_offset to avoid gather memory access hotspotting.
+    is_padding = topk_indices == -1
+    flat_element_index = jnp.arange(num_tokens * topk, dtype=jnp.int32).reshape(
+        num_tokens, topk
+    )
+    # 104729 and 15485863 are randomly chosen large prime numbers.
+    scattered_page_ids = (flat_element_index * 104729) % total_num_pages
+    scattered_token_offset = (flat_element_index * 15485863) % page_size
+    page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
+    token_offset = jnp.where(
+        is_padding,
+        scattered_token_offset,
+        token_offset,
+    )
+
+    assert page_ids.shape == (num_tokens, topk)
+    return kv_lens, (page_ids * page_size + token_offset).reshape(-1)
+
+
+@dataclasses.dataclass(frozen=True)
+class CsaChunk:
+    """One gather-and-attention chunk of query tokens."""
+
+    start_pos: int
+    chunk_size: int
+    kernel_batch_size: int
+    batch_end: jax.Array  # i32, a multiple of kernel_batch_size past start_pos
+    indices: jax.Array  # i32[chunk_size * topk]
+    num_valid_indices: jax.Array  # i32
+    topk: int
+
+    def gather(self, cache_kv_nope, cache_kv_rope):
+        nope, rope = csa_gather.csa_gather(
+            cache_kv_nope,
+            cache_kv_rope,
+            self.indices,
+            num_valid_indices=self.num_valid_indices,
+            top_k=self.topk,
+        )
+        return (
+            nope.reshape(self.chunk_size, self.topk, -1),
+            rope.reshape(self.chunk_size, self.topk // 4, -1),
+        )
+
+
+def csa_chunks(
+    gather_indices: jax.Array,  # i32[num_tokens * topk]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]
+    *,
+    topk: int,
+    num_tokens: int,
+    chunk_size: int,
+    max_batch_size: int,
+):
+    """Splits the query tokens into static gather-and-attention chunks."""
+    for i in range(cdiv(num_tokens, chunk_size)):
+        start_pos = i * chunk_size
+        end_pos = min(start_pos + chunk_size, num_tokens)
+        size = end_pos - start_pos
+        kernel_batch_size = _largest_divisor(size, max_batch_size)
+        assert size % kernel_batch_size == 0
+        # The kernel grid walks [start_pos, batch_end) in `kernel_batch_size`
+        # steps, so `batch_end - start_pos` MUST be a multiple of
+        # `kernel_batch_size`.
+        batch_end = start_pos + (
+            cdiv(
+                jnp.maximum(
+                    0,
+                    jnp.minimum(
+                        cu_q_lens[distribution[2]],
+                        end_pos,
+                    )
+                    - start_pos,
+                ),
+                kernel_batch_size,
+            )
+            * kernel_batch_size
+        )
+        yield CsaChunk(
+            start_pos=start_pos,
+            chunk_size=size,
+            kernel_batch_size=kernel_batch_size,
+            batch_end=batch_end,
+            indices=gather_indices[start_pos * topk : end_pos * topk],
+            num_valid_indices=jnp.maximum(0, batch_end - start_pos) * topk,
+            topk=topk,
+        )
+
+
 # Main Attention kernel for DeepSeek V4 CSA (gather and attention)
 # Note that the compressed kv tokens of current batch (current forward pass)
 # have been written to the `cache_kv` by the compressor module before calling
@@ -813,69 +928,25 @@ def sparse_ragged_paged_attention(
             swa_m,
         )
 
-    tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
-    seq_ids_segment = jnp.repeat(
-        jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=q.shape[0]
-    )
     assert topk_indices is not None
-    kv_lens = jnp.sum(topk_indices != -1, axis=-1)
-
-    seq_page_ids = topk_indices // page_size
-    token_offset = topk_indices % page_size
+    kv_lens, gather_indices = csa_gather_indices(
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        total_num_pages=cache_kv_nope.shape[0],
+        page_size=page_size,
+    )
     topk = topk_indices.shape[-1]
-    page_ids = gather_page_ids(
-        page_indices, seq_page_ids, seq_ids_segment, max_num_seqs
-    )
 
-    # For the "-1" padding elements in topk_indices, we scatter the corresponding
-    # page_ids and token_offset to avoid gather memory access hotspotting.
-    is_padding = topk_indices == -1
-    total_num_pages = cache_kv_nope.shape[0]
-    flat_element_index = jnp.arange(q.shape[0] * topk, dtype=jnp.int32).reshape(
-        q.shape[0], topk
-    )
-    # 104729 and 15485863 are randomly chosen large prime numbers.
-    scattered_page_ids = (flat_element_index * 104729) % total_num_pages
-    scattered_token_offset = (flat_element_index * 15485863) % page_size
-    page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
-    token_offset = jnp.where(
-        is_padding,
-        scattered_token_offset,
-        token_offset,
-    )
-
-    assert page_ids.shape == (q.shape[0], topk)
-    gather_indices = (page_ids * page_size + token_offset).reshape(-1)
-    num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
-
-    for i in range(num_chunks):
-        start_pos = i * gather_and_attention_chunk_size
-        end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
-        chunk_size = end_pos - start_pos
-        indices = gather_indices[start_pos * topk : end_pos * topk]
-
-        # Batching
-        kernel_batch_size = _largest_divisor(chunk_size, attention_kernel_batch_size)
-        assert chunk_size % kernel_batch_size == 0
-        # The kernel grid walks [start_pos, batch_end) in `kernel_batch_size`
-        # steps, so `batch_end - start_pos` MUST be a multiple of
-        # `kernel_batch_size`.
-        batch_end = start_pos + (
-            cdiv(
-                jnp.maximum(
-                    0,
-                    jnp.minimum(
-                        cu_q_lens[distribution[2]],
-                        end_pos,
-                    )
-                    - start_pos,
-                ),
-                kernel_batch_size,
-            )
-            * kernel_batch_size
-        )
-        num_valid_indices = jnp.maximum(0, batch_end - start_pos) * topk
-
+    for chunk in csa_chunks(
+        gather_indices,
+        cu_q_lens,
+        distribution,
+        topk=topk,
+        num_tokens=q.shape[0],
+        chunk_size=gather_and_attention_chunk_size,
+        max_batch_size=attention_kernel_batch_size,
+    ):
         # For prefilling of short sequences (or early in the sequence), there are
         # very few number of KVs in the sequence, so different qs' selected topk
         # would have large overlap. This causes gather read hotspotting. We've seen
@@ -885,15 +956,9 @@ def sparse_ragged_paged_attention(
         # based on their lengths. For the sequences-segment below certain length,
         # we use a different kernel (dense attention and mask), for the rest of
         # sequences, we use this gather-and-attention kernel.
-        gathered_nope_buffer, gathered_rope_buffer = csa_gather.csa_gather(
-            cache_kv_nope,
-            cache_kv_rope,
-            indices,
-            num_valid_indices=num_valid_indices,
-            top_k=topk,
+        gathered_nope_buffer, gathered_rope_buffer = chunk.gather(
+            cache_kv_nope, cache_kv_rope
         )
-        gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, -1)
-        gathered_rope_buffer = gathered_rope_buffer.reshape(chunk_size, topk // 4, -1)
 
         q = run_mla_kernel(
             q,
@@ -904,10 +969,10 @@ def sparse_ragged_paged_attention(
             swa_accumution,
             swa_l,
             swa_m,
-            start_seq_idx=start_pos,
-            end_seq_idx=batch_end,
+            start_seq_idx=chunk.start_pos,
+            end_seq_idx=chunk.batch_end,
             num_valid_tokens=cu_q_lens[distribution[2]],
-            kernel_batch_size=kernel_batch_size,
+            kernel_batch_size=chunk.kernel_batch_size,
         )
     return prepare_outputs(
         q, actual_num_q_heads, actual_head_dim
