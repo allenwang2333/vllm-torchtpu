@@ -1170,6 +1170,8 @@ class VllmDeepseekV41MLAAttention(
         )
         self._two_caches_same_buffer = two_caches_same_buffer
         built_from_real_caches = swa_tensor is not None
+        if built_from_real_caches:
+            object.__setattr__(self, "_two_caches_same_buffer", two_caches_same_buffer)
 
         vllm_cfg = getattr(vllm_context, "vllm_config", None)
         assert vllm_cfg is not None
@@ -2304,10 +2306,16 @@ class VllmDeepseekV41MLAAttention(
             kv_entry if isinstance(kv_entry, tuple) else (kv_entry, None)
         )
         dummy_main = self._get_dummy_main_cache(kv.device)
+        orig_main_cache_kv = None
         if is_csa and main_meta is not None:
-            main_cache_kv = self._as_kernel_cache_view(_live_cache(nope_entry))
-            if main_cache_kv is None or getattr(self, "_two_caches_same_buffer", False):
-                main_cache_kv = dummy_main
+            orig_main_cache_kv = self._as_kernel_cache_view(_live_cache(nope_entry))
+            if orig_main_cache_kv is not None:
+                _ = self._get_attn_op(False, ced_decoder=eff_ced_decoder)
+            main_cache_kv = (
+                dummy_main
+                if orig_main_cache_kv is None or getattr(self, "_two_caches_same_buffer", False)
+                else orig_main_cache_kv
+            )
             m_lens, main_tables, main_q_loc, main_dist = _unpack_meta(main_meta)
             main_kv_lens = (
                 m_lens // kv_holder.compress_ratio if m_lens is not None else None
