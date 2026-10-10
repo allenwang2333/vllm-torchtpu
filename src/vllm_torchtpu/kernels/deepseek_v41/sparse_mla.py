@@ -15,6 +15,7 @@
 and double-buffered pipelined decode on pre-encoded physical cache rows."""
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -849,6 +850,11 @@ def precompute_csa_union_and_bitmask(
     )
 
 
+_CSA_UNION_VERIFY_BQ: int = int(
+    os.environ.get("VLLM_DSV41_CSA_UNION_VERIFY_BQ", "0")
+)
+
+
 def resolve_csa_union_params(
     num_tokens: int,
     topk: int,
@@ -859,7 +865,7 @@ def resolve_csa_union_params(
     """Returns `(b_q, m_union)` when LxL Candidate Union is enabled, else `None`."""
     if not envs.VLLM_DSV41_CSA_UNION or topk % 128 != 0:
         return None
-    vbq = int(os.environ.get("VLLM_DSV41_CSA_UNION_VERIFY_BQ", "0"))
+    vbq = _CSA_UNION_VERIFY_BQ
     if (
         vbq > 0
         and num_tokens >= vbq

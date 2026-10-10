@@ -96,6 +96,7 @@ _O_PROJ_SPECS = (P(None, "model", None), P(), P(), P(), P())
 _WQ_B_Q_ROPE_SPECS = (P(), P(), P(), P(), P())
 _WQ_B_Q_ROPE_PREQUANT_SPECS = (P(), P(), P(), P(), P(), P())
 _CSA_UNION_SPECS = (P(BATCH_AXIS, None),)
+_FLASHMLA_TP8: bool = os.environ.get("VLLM_DSV41_FLASHMLA_TP8", "0") == "1"
 
 
 def _kvnorm_rope_jax(
@@ -690,7 +691,7 @@ class VllmDeepseekV41MLAAttention(
         )
 
         use_flashmla_tp8 = (
-            os.environ.get("VLLM_DSV41_FLASHMLA_TP8", "0") == "1"
+            _FLASHMLA_TP8
             and get_tensor_model_parallel_world_size() == 8
             and not non_causal
             and not is_ctx_kv_only
