@@ -604,18 +604,27 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
         def _chunked_quant(w_pad: torch.Tensor, blk: int):
             n_exp = w_pad.shape[0]
-            if n_exp <= 32:
+            if n_exp <= 16:
                 return quantize_native_fp4_kmajor(
                     w_pad.to(device), block=blk, pack=pack
                 )
             qw_list, qs_list = [], []
-            for s in range(0, n_exp, 32):
+            for s in range(0, n_exp, 16):
+                w_sub = w_pad[s : s + 16].to(device)
                 qw, qs = quantize_native_fp4_kmajor(
-                    w_pad[s : s + 32].to(device), block=blk, pack=pack
+                    w_sub, block=blk, pack=pack
                 )
+                synchronize_tensors([qw, qs])
+                del w_sub
                 qw_list.append(qw)
                 qs_list.append(qs)
-            return torch.cat(qw_list, dim=0), torch.cat(qs_list, dim=0)
+            qw_cat = torch.cat(
+                [q.view(torch.uint8) for q in qw_list], dim=0
+            ).view(qw_list[0].dtype)
+            qs_cat = torch.cat(qs_list, dim=0)
+            synchronize_tensors([qw_cat, qs_cat])
+            del qw_list, qs_list
+            return qw_cat, qs_cat
 
         w13_weight_processed, w13_weight_scale = _chunked_quant(
             w13_weight_padded, w13_block_size

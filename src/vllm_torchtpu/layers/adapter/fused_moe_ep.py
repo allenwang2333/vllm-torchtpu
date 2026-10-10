@@ -454,13 +454,23 @@ def _build_op(
             fn = moe_with_hash_ids
         else:
             fn = moe
-    op = jax_op(
-        name,
-        fn,
-        mesh=mesh,
-        input_partition_specs=input_specs,
-        output_partition_specs=spec,
-    )
+    try:
+        op = jax_op(
+            name,
+            fn,
+            mesh=mesh,
+            input_partition_specs=input_specs,
+            output_partition_specs=spec,
+        )
+    except TypeError:
+        from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+        op = sharded_jax_op(
+            name,
+            fn,
+            mesh=mesh,
+            input_partition_specs=input_specs,
+            output_partition_specs=spec,
+        )
 
     def _fake(x, *_args, **_kwargs):
         return torch.empty_like(x)
