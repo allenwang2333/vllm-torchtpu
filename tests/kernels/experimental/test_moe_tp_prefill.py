@@ -161,3 +161,73 @@ def test_expert_parallel_ranks_sum_to_oracle():
         y = run_kernel(rank_case, expert_start=r * e_loc)
         total = total + np.asarray(y.astype(jnp.float32))
     assert row_err(total, oracle(c)) < 8e-2
+
+
+BLOCKED_CASES = [  # (T, E, H, INTER, K, skew, n_valid, i_block, chunk_rows)
+    (200, 8, 256, 512, 3, False, None, 128, 128),
+    # skewed: the hot experts span several chunks
+    (600, 8, 256, 512, 3, True, None, 256, 256),
+    (256, 8, 256, 256, 3, False, 131, 128, 128),
+    # 64-token multiples: the sparse combine kernel, not its XLA form
+    (512, 8, 256, 512, 4, True, None, 256, 256),
+    (768, 8, 256, 256, 3, False, 500, 128, 128),
+    # hidden 1024: the down projection in two column chunks
+    (256, 8, 1024, 512, 3, False, None, 256, 128),
+]
+
+
+@pytest.mark.parametrize("T,E,H,INTER,K,skew,n_valid,i_block,chunk_rows", BLOCKED_CASES)
+def test_blocked_matches_oracle(T, E, H, INTER, K, skew, n_valid, i_block, chunk_rows):
+    """Experts streamed in intermediate blocks over row chunks (the mode
+    GLM-5.2's EP experts take), forced by i_block at a small shape."""
+    c = make_case(T, E, H, INTER, K, skew=skew)
+    y = run_kernel(c, n_valid=n_valid, i_block=i_block, chunk_rows=chunk_rows)
+    y = np.asarray(y.astype(jnp.float32))
+    nv = T if n_valid is None else n_valid
+    assert row_err(y[:nv], oracle(c, n_valid)[:nv]) < 8e-2
+    assert np.all(y[nv:] == 0)
+
+
+def test_blocked_fault_dropped_expert_is_caught():
+    c = make_case(200, 8, 256, 512, 3)
+    y = np.asarray(run_kernel(c, i_block=128, chunk_rows=128).astype(jnp.float32))
+    broken = dict(c, w2=c["w2"].at[3].set(jnp.zeros_like(c["w2"][3])))
+    assert row_err(y, oracle(broken)) > 8e-2
+
+
+def test_blocked_expert_parallel_ranks_sum_to_oracle():
+    T, E, H, INTER, K, ranks = 512, 8, 256, 512, 3, 2
+    c = make_case(T, E, H, INTER, K, skew=True)
+    e_loc, i_sh = E // ranks, INTER // ranks
+    total = 0
+    for r in range(ranks):
+        ex, sh = slice(r * e_loc, (r + 1) * e_loc), slice(r * i_sh, (r + 1) * i_sh)
+        gate_up = jnp.concatenate(
+            [c["w1s"][:, :INTER][:, sh], c["w1s"][:, INTER:][:, sh]], axis=1
+        )
+        scale_up = jnp.concatenate([c["s1s"][:INTER][sh], c["s1s"][INTER:][sh]])
+        rank_case = dict(
+            c,
+            w1=c["w1"][ex],
+            w2=c["w2"][ex],
+            s1=c["s1"][ex],
+            s2=c["s2"][ex],
+            w1s=gate_up,
+            s1s=scale_up,
+            w2s=c["w2s"][sh],
+        )
+        y = run_kernel(rank_case, expert_start=r * e_loc, i_block=128, chunk_rows=128)
+        total = total + np.asarray(y.astype(jnp.float32))
+    assert row_err(total, oracle(c)) < 8e-2
+
+
+def test_plan_blocks_only_oversized_experts():
+    """Whole experts for Qwen3.5-397B (TP8 i 128, EP8 i 1024) and GLM-5.2 at
+    TP16 (i 128) at both tile heights; blocks for GLM-5.2's EP experts."""
+    for tile_m in (128, 256):
+        args = (3, tile_m, 2, None, None, None)
+        assert mtp.plan_blocked(4096, 128, 128, *args) is None
+        assert mtp.plan_blocked(4096, 1024, 128, *args) is None
+        assert mtp.plan_blocked(6144, 128, 128, *args) is None
+        ib, nb, rows = mtp.plan_blocked(6144, 2048, 128, *args)
+        assert 2048 % ib == 0 and nb >= 2 and rows % tile_m == 0 and rows >= tile_m
