@@ -45,7 +45,7 @@ from scenario.reserved import (
     TOOL_ENV,
     TOOL_ENV_PREFIXES,
 )
-from scenario.runtime import bringup, context, exits, net, proc
+from scenario.runtime import bringup, context, control, exits, net, proc
 
 SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 REFERENCE = "REFERENCE.md"
@@ -455,6 +455,22 @@ def reference() -> str:
                 f"{context.REMOTE_HEALTH_TIMEOUT_S} s",
             ),
             ("a timed-out command's status", str(proc.TIMEOUT_STATUS)),
+            (
+                "hosts that wait on the driver ask for its status every",
+                f"{control.POLL_S:g} s",
+            ),
+            (
+                "such a host leaves (exit 7) once the driver has not answered for",
+                f"{control.GONE_S:g} s",
+            ),
+            (
+                "such a host gives up (exit 3) without a first answer after",
+                f"{control.FIRST_CONTACT_S:g} s",
+            ),
+            (
+                "after its end, the driver waits for every such host to ask, at most",
+                f"{control.LINGER_S:g} s",
+            ),
         ],
     )
     while lines[-1] == "":

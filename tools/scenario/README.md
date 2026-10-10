@@ -229,7 +229,7 @@ target's, else `./scenario-results/<name>-<UTC stamp>`.
 | 0 | every task passed (a soft gate may have failed) |
 | 1 | a task failed: a command, a hard gate, a missing result |
 | 2 | usage, scenario, Plan or placement error |
-| 3 | bring-up failed before the server started (a name, a taken port) |
+| 3 | bring-up failed (a name, a taken port, a driver that never answered) |
 | 4 | the server was not ready: it died starting, or the wait ran out |
 | 5 | the server died after it was ready |
 | 6 | a fatal after-task failed while every task passed |

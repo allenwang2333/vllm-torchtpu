@@ -701,7 +701,7 @@ apply, the first of these wins: a signal, 4 or 5, 3, 7, 1, 6.
 | 0 | every task passed (soft gate failures allowed) |
 | 1 | a task failed: a command exited non-zero, a hard gate failed, a result is missing, or a cell had too many failed requests |
 | 2 | usage, Plan or placement error |
-| 3 | bring-up failed before the server started: a name did not resolve, a port was taken |
+| 3 | bring-up failed: a name did not resolve, a port was taken, or the driver never answered |
 | 4 | a server was not ready: it died while starting, or the readiness wait ran out |
 | 5 | a server or router died after it was ready |
 | 6 | a fatal after-task failed while every task passed |
@@ -716,3 +716,7 @@ apply, the first of these wins: a signal, 4 or 5, 3, 7, 1, 6.
 | a name's resolution, retried every 5 s, gives up after | 1800 s |
 | a server at --url is alive while GET /health answers within | 10 s |
 | a timed-out command's status | 124 |
+| hosts that wait on the driver ask for its status every | 2 s |
+| such a host leaves (exit 7) once the driver has not answered for | 20 s |
+| such a host gives up (exit 3) without a first answer after | 1800 s |
+| after its end, the driver waits for every such host to ask, at most | 10 s |
