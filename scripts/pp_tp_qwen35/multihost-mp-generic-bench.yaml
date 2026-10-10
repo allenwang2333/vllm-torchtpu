@@ -102,14 +102,14 @@ spec:
                 # un-offloaded all-reduce-start fails in LoweringEmitter with
                 # "HLO all-reduce-start is not implemented on TPU".
                 - name: LIBTPU_INIT_ARGS
-                  value: '{{ .LIBTPU_INIT_ARGS | default "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_enable_async_collective_merger=true" }}'
+                  value: '{{ .LIBTPU_INIT_ARGS | default "" }}'
                 command: ["/bin/bash", "-c"]
                 args:
                   - |
                     set -e
                     mkdir -p "${CDK_OUTPUT_DIR}"
 
-                    if [ -n "${TORCH_TPU_WHEEL}" ]; then
+                    if [ -n "${TORCH_TPU_WHEEL}" ] && [ "${TORCH_TPU_WHEEL}" != "NONE" ]; then
                       echo "Installing torch_tpu override: ${TORCH_TPU_WHEEL}"
                       mkdir -p /tmp/wheels/torch_tpu
                       gcloud storage cp "${TORCH_TPU_WHEEL}" /tmp/wheels/torch_tpu/
@@ -117,7 +117,7 @@ spec:
                       pip show torch_tpu | grep -E "^(Name|Version)"
                       python3 -c "from torch_tpu._internal.distributed.spmd_util import make_standalone; print('make_standalone: OK')" || true
                     fi
-                    if [ -n "${LIBTPU_WHEEL}" ]; then
+                    if [ -n "${LIBTPU_WHEEL}" ] && [ "${LIBTPU_WHEEL}" != "NONE" ]; then
                       echo "Installing libtpu override: ${LIBTPU_WHEEL}"
                       mkdir -p /tmp/wheels/libtpu
                       gcloud storage cp "${LIBTPU_WHEEL}" /tmp/wheels/libtpu/

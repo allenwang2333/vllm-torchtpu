@@ -146,7 +146,7 @@ case "${JOB_NAME}" in
       TPU_TOPOLOGY=2x2x1 \
       DOCKER_IMAGE="${DOCKER_IMAGE}" \
       MODEL_ID="${MODEL_ID}" \
-      ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=1 MOE_FUSED_EP_KERNEL_IMPL=v2" \
+      ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
       SERVER_ARGS="--pipeline-parallel-size 4 --tensor-parallel-size 1 --prefill-context-parallel-size 2 --enable-expert-parallel --no-async-scheduling --max-model-len 36864 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
       BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
       RUN_EVAL="true" \
@@ -164,7 +164,9 @@ case "${JOB_NAME}" in
       TPU_TOPOLOGY=2x2x1 \
       DOCKER_IMAGE="${DOCKER_IMAGE}" \
       MODEL_ID="${MODEL_ID}" \
-      ENV_VARS="TPU_QWEN35_AUTO_DEFAULTS=0 TPU_EXPERT_PLACEMENT= USE_MOE_FUSED_EP_KERNEL=1 VLLM_DISABLE_COMPILE_CACHE=1 VLLM_LOGGING_LEVEL=INFO" \
+      TORCH_TPU_WHEEL="NONE" \
+      LIBTPU_WHEEL="NONE" \
+      ENV_VARS="TPU_QWEN35_AUTO_DEFAULTS=0 TPU_EXPERT_PLACEMENT= USE_MOE_FUSED_EP_KERNEL=1 MOE_FUSED_EP_KERNEL_IMPL=v3 VLLM_DISABLE_COMPILE_CACHE=1 VLLM_LOGGING_LEVEL=INFO" \
       SERVER_ARGS="--tensor-parallel-size 8 --enable-expert-parallel --no-async-scheduling --max-model-len 36864 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
       BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
       RUN_EVAL="true" \
@@ -212,7 +214,7 @@ case "${JOB_NAME}" in
       vllm-torchtpu-pp-tp-two-node-mp-bench \
       DOCKER_IMAGE="${DOCKER_IMAGE}" \
       MODEL_ID="${MODEL_ID}" \
-      ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=1 MOE_FUSED_EP_KERNEL_IMPL=v2" \
+      ENV_VARS="${TWO_CHIP_ENV} USE_MOE_FUSED_EP_KERNEL=0" \
       SERVER_ARGS="--pipeline-parallel-size 8 --tensor-parallel-size 1 --prefill-context-parallel-size 2 --enable-expert-parallel --no-async-scheduling --max-model-len 65536 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
       BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;64000,1,1,8;64000,1,4,16;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
       RUN_EVAL="true" \
