@@ -63,6 +63,7 @@ RULES: list[tuple[str, tuple[str, ...]]] = [
         (*BASE, "scenario.target", "scenario.plan", "scenario.runtime"),
     ),
     ("scenario.targets.loader", (*BASE, "scenario.target", "scenario.targets")),
+    ("scenario.targets", BASE),
     (
         "scenario.runtime",
         (
@@ -74,7 +75,7 @@ RULES: list[tuple[str, tuple[str, ...]]] = [
         ),
     ),
     ("scenario.show", SCENARIO_CODE),
-    ("scenario.gen", (*SCENARIO_CODE, "scenario.show")),
+    ("scenario.gen", (*SCENARIO_CODE, "scenario.show", "scenario.runtime")),
     ("scenario.cli", ANYTHING),
     ("scenario.__main__", ("scenario.cli",)),
 ]
