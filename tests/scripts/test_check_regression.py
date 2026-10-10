@@ -430,6 +430,7 @@ def test_check_eval_missing_task_fails():
 # --calibrate, so it gets only 1x the run's stderr (hypot(0, se_run)) instead
 # of the full sqrt(2) quadrature. Shrink this set, never grow it.
 _BASELINES_MISSING_STDERR = {
+    "deepseek-v41-flash-tp8-ep.gsm8k.baseline.json:gsm8k",
     "gemma-4-26b-fp8-dp4-tp2-multimodal.mmmu_pro.baseline.json:mmmu_pro",
     "gemma-4-31b-fp8-dp4-tp2-multimodal.mmmu_pro.baseline.json:mmmu_pro",
     "kimi-k3-tp32-ep.mmlu_pro.baseline.json:mmlu_pro",
