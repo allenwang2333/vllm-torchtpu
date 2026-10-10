@@ -157,10 +157,15 @@ def _ced_zero_output(hidden_states: torch.Tensor) -> torch.Tensor:
     return fn(hidden_states)
 
 
-def _moe_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
+def _moe_vllm_config(
+    vllm_config: VllmConfig, moe_overrides: dict | None = None
+) -> VllmConfig:
     """Shallow config view for the shared V4 MoE, which reads hf_config."""
     hf_config = copy.copy(vllm_config.model_config.hf_config)
     hf_config.num_hash_layers = 0
+    if moe_overrides:
+        for k, v in moe_overrides.items():
+            setattr(hf_config, k, v)
     model_config = copy.copy(vllm_config.model_config)
     model_config.hf_config = hf_config
     moe_vllm_config = copy.copy(vllm_config)
@@ -178,6 +183,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         topk_indices_buffer: torch.Tensor,
         engram_layout: EngramLayout | None = None,
         candidate_block_buffer: torch.Tensor | None = None,
+        moe_overrides: dict | None = None,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -191,7 +197,7 @@ class DeepseekV41DecoderLayer(nn.Module):
             candidate_block_buffer=candidate_block_buffer,
         )
         self.ffn = DeepseekV4MoE(
-            _moe_vllm_config(vllm_config),
+            _moe_vllm_config(vllm_config, moe_overrides=moe_overrides),
             prefix=f"{prefix}.ffn",
             reduce_results=(tp_size <= 1),
         )
