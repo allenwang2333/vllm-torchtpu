@@ -532,7 +532,6 @@ class DeepseekV41DecoderLayer(nn.Module):
 
         use_prequant_ffn = (
             ops.fused_quant is not None
-            and x.shape[0] <= 256
             and getattr(self.ffn, "can_accept_prequant_hidden", lambda **_: False)(
                 token_sharded=token_sharded
             )

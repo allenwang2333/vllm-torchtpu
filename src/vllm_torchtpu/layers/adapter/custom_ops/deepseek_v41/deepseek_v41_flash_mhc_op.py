@@ -76,7 +76,7 @@ def _fake_mhc_fused_post_pre_quant_v41(x, residual, *args):
 
 def _fake_mhc_fused_post_pre_quant_fp8_only_v41(x, residual, *args):
     *outer_shape, _, hidden_size = residual.shape
-    normed_w = hidden_size if x.numel() // hidden_size <= 256 else 128
+    normed_w = hidden_size
     post_mix, comb_mix, _, next_pre_mix, normed_fp8, normed_scale = (
         _fake_mhc_pre_quant_v41(residual)
     )
