@@ -1014,9 +1014,14 @@ class TestAttentionSelectPagedIndicesDecode:
             np.asarray(scores_prestrided), np.asarray(scores_full)
         )
 
-        # Verify tokens=144, 168, 192 with requests (DP=2 x TP=4 verify batches)
-        # maintain 16K tile budget without collapsing to 8K.
-        for tok in (144, 168, 192):
+        # TD8.224: Verify all three eff_tokens regimes:
+        # (1) requests is not None (candidate_write): eff_tokens = tok // 6
+        #     (16K tile at tok=96, 8K tile at tok=144..192)
+        # (2) prestrided_pages=True with page_records (candidate_filter Pallas):
+        #     eff_tokens = min(tok // 6, 16) -> single-pass 4K/16K tile
+        # (3) requests=None and (not prestrided_pages or page_records is None):
+        #     eff_tokens = tok (2K/1K tile on unpaged fallback)
+        for tok in (96, 144, 168, 192):
             n_req = tok // 6
             q_v = jnp.zeros((tok, heads, dim), dtype=jnp.bfloat16)
             rec_v = jnp.full((n_req, 16384), -1, dtype=jnp.int32)
@@ -1033,6 +1038,28 @@ class TestAttentionSelectPagedIndicesDecode:
                 page_records=page_records,
             )
             assert out_v.shape == (tok, 16384)
+
+            first_rec_cand = jnp.full((tok, 256), -1, dtype=jnp.int32)
+            out_cand = paged_index_scores_jax(
+                q_v,
+                pool,
+                first_rec_cand,
+                w_v,
+                len_v,
+                page_records=page_records,
+                prestrided_pages=True,
+            )
+            assert out_cand.shape == (tok, 256 * page_records)
+
+            out_unpaged_cand = paged_index_scores_jax(
+                q_v,
+                pool,
+                first_rec_cand,
+                w_v,
+                len_v,
+                page_records=None,
+            )
+            assert out_unpaged_cand.shape == (tok, 256)
 
         # Cover pages=True with non-bfloat16 q (gather_cache_page_values step loop)
         scores_fp32 = paged_index_scores_jax(

@@ -237,8 +237,10 @@ def test_score_word_rows_wrapper_mesh_and_standalone():
 )
 def test_paged_index_scores_single_16k_tile_for_candidate_and_verify(tokens):
     width = 12928
+    n_reqs = tokens // 6
     pool = jnp.zeros((64, ROW_WORDS), jnp.int32)
-    records = jnp.zeros((tokens, width), jnp.int32)
+    records = jnp.zeros((n_reqs, width), jnp.int32)
+    requests = jnp.repeat(jnp.arange(n_reqs, dtype=jnp.int32), 6)
     q = jnp.zeros((tokens, 4, 128), jnp.bfloat16)
     weights = jnp.ones((tokens, 4), jnp.float32)
     lengths = jnp.full((tokens,), width, jnp.int32)
@@ -252,7 +254,7 @@ def test_paged_index_scores_single_16k_tile_for_candidate_and_verify(tokens):
         )
 
     with mock.patch.object(ak, "_score_word_rows", side_effect=_fake_score_word_rows):
-        out = ak.paged_index_scores_jax(q, pool, records, weights, lengths, None, 8)
+        out = ak.paged_index_scores_jax(q, pool, records, weights, lengths, requests, 8)
         prestrided = jnp.zeros((tokens, 16384 // PAGE), jnp.int32)
         out_cand = ak.paged_index_scores_jax(
             q,
@@ -266,7 +268,10 @@ def test_paged_index_scores_single_16k_tile_for_candidate_and_verify(tokens):
         )
     assert out.shape == (tokens, width)
     assert out_cand.shape == (tokens, 16384)
+    verify_budget = max(512, min(16384, 262144 // n_reqs))
+    verify_tile = 1 << (verify_budget.bit_length() - 1)
     assert observed_word_shapes == [
-        (tokens, 8192, ROW_WORDS),
+        (n_reqs, verify_tile // index_word_scores.SLOTS, ROW_WORDS),
+        (tokens, verify_tile // index_word_scores.SLOTS, ROW_WORDS),
         (tokens, 8192, ROW_WORDS),
     ]

@@ -2369,8 +2369,15 @@ def paged_index_scores_jax(
     # 512: with 128 the loop is iteration-latency bound (2.3x slower at T=512
     # over 16.9K rows).
     eff_tokens = (
-        min(tokens // 6, _INDEX_KEYS_PER_ITER // _INDEX_MAX_TILE)
-        if (tokens // 6 <= records.shape[0] and 6 <= tokens <= 1536 and tokens % 6 == 0)
+        (tokens // 6, min(tokens // 6, _INDEX_KEYS_PER_ITER // _INDEX_MAX_TILE))[
+            bool(prestrided_pages and page_records is not None)
+        ]
+        if (
+            (requests is not None or (prestrided_pages and page_records is not None))
+            and tokens // 6 <= records.shape[0]
+            and 6 <= tokens <= 1536
+            and tokens % 6 == 0
+        )
         else tokens
     )
     budget = min(
