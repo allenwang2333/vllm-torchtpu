@@ -140,6 +140,74 @@ class DSparkDeepseekV41Model(nn.Module):
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
         )
+        self._fused_ctx_wkv_weight: torch.Tensor | None = None
+        self._fused_ctx_wkv_scale: torch.Tensor | None = None
+
+        from vllm_torchtpu.models.vllm.deepseek_v41.attention import (
+            _get_dspark_swa_store_op,
+        )
+        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+            get_vllm_model_wrapper_context,
+        )
+
+        if get_vllm_model_wrapper_context().mesh is not None:
+            for _ps in (16, 32, 64, 128):
+                _ = _get_dspark_swa_store_op(_ps)
+
+    def process_weights_after_loading(self) -> None:
+        from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+        from vllm_torchtpu.utils import synchronize_tensors
+
+        slices_w: list[torch.Tensor] = []
+        slices_s: list[torch.Tensor] = []
+        use_quant = False
+        for layer in self.layers:
+            attn = layer.attn
+            attn.process_weights_after_loading(torch.bfloat16)
+            if hasattr(attn, "wkv_weight") and hasattr(attn, "wkv_weight_scale"):
+                use_quant = True
+                slices_w.append(attn.wkv_weight)
+                slices_s.append(attn.wkv_weight_scale)
+            else:
+                f_wqa = getattr(attn, "fused_wqa_wkv", None)
+                w = getattr(f_wqa, "weight", None)
+                if w is None or w.dtype not in (
+                    torch.bfloat16,
+                    torch.float16,
+                    torch.float32,
+                ):
+                    self._fused_ctx_wkv_weight = None
+                    self._fused_ctx_wkv_scale = None
+                    return
+                if getattr(f_wqa, KEEP_VLLM_LAYOUT_ATTR, False):
+                    if w.shape[1] != attn.q_lora_rank + attn.head_dim:
+                        self._fused_ctx_wkv_weight = None
+                        self._fused_ctx_wkv_scale = None
+                        return
+                    slices_w.append(w[:, attn.q_lora_rank :].transpose(0, 1))
+                else:
+                    if w.shape[0] != attn.q_lora_rank + attn.head_dim:
+                        self._fused_ctx_wkv_weight = None
+                        self._fused_ctx_wkv_scale = None
+                        return
+                    slices_w.append(w[attn.q_lora_rank :])
+        if (
+            use_quant
+            and len(slices_w) == len(self.layers)
+            and len(slices_s) == len(self.layers)
+        ):
+            self._fused_ctx_wkv_weight = torch.cat(slices_w, dim=1).contiguous()
+            self._fused_ctx_wkv_scale = torch.cat(slices_s, dim=-1).contiguous()
+            if self._fused_ctx_wkv_weight.device.type == "tpu":
+                synchronize_tensors(
+                    [self._fused_ctx_wkv_weight, self._fused_ctx_wkv_scale],
+                    wait=True,
+                )
+        elif slices_w and not use_quant and len(slices_w) == len(self.layers):
+            self._fused_ctx_wkv_weight = torch.cat(slices_w, dim=0).contiguous()
+            self._fused_ctx_wkv_scale = None
+            if self._fused_ctx_wkv_weight.device.type == "tpu":
+                synchronize_tensors([self._fused_ctx_wkv_weight], wait=True)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -162,6 +230,33 @@ class DSparkDeepseekV41Model(nn.Module):
         main_x = self.combine_hidden_states(target_hidden_states)
         if positions.ndim > 1:
             positions = positions.flatten()
+        fused_wkv = self._fused_ctx_wkv_weight
+        fused_scale = self._fused_ctx_wkv_scale
+        if fused_wkv is not None:
+            if fused_scale is not None:
+                from vllm_torchtpu.layers.adapter.linear_common import (
+                    quantized_matmul,
+                )
+
+                orig_m = main_x.shape[0]
+                m_pad = (orig_m + 7) & ~7
+                x_qmm = (
+                    torch.nn.functional.pad(main_x, (0, 0, 0, m_pad - orig_m))
+                    if m_pad > orig_m
+                    else main_x
+                )
+                kv_all = quantized_matmul(x_qmm, fused_wkv, fused_scale)[:orig_m].view(
+                    orig_m, len(self.layers), -1
+                )
+            else:
+                kv_all = torch.nn.functional.linear(main_x, fused_wkv).view(
+                    main_x.shape[0], len(self.layers), -1
+                )
+            for layer_idx, layer in enumerate(self.layers):
+                attn = layer.attn
+                kv = attn.kv_norm(kv_all[:, layer_idx])
+                attn.store_context_kv(kv, positions, metadata[layer_idx])
+            return main_x
         for layer_idx, layer in enumerate(self.layers):
             attn = layer.attn
             kv = attn.project_wkv(main_x)
@@ -450,6 +545,73 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         )
         return loaded_params
 
+    def sample_draft_tokens(
+        self,
+        pred_hidden: torch.Tensor,
+        prev_init: torch.Tensor,
+        num_pred: int,
+    ) -> torch.Tensor:
+        padded_num_reqs = prev_init.shape[0]
+        lm_head = self.lm_head
+        markov_w2 = getattr(self.model.markov_head, "markov_w2", None)
+        tp_size = int(getattr(lm_head, "tp_size", 1))
+        shard_indices = getattr(lm_head, "shard_indices", None)
+        if (
+            lm_head is None
+            or markov_w2 is None
+            or shard_indices is None
+            or tp_size <= 1
+        ):
+            bias = self.markov_bias(self.markov_embed(prev_init))
+            logits = self.compute_draft_logits(pred_hidden)
+            logits_3d = logits.view(padded_num_reqs, num_pred, logits.shape[-1])
+            draft_tokens = []
+            prev = prev_init
+            for idx in range(num_pred):
+                if idx > 0:
+                    bias = self.markov_bias(self.markov_embed(prev))
+                step = self.map_draft_to_target(
+                    (logits_3d[:, idx] + bias).argmax(dim=-1)
+                )
+                draft_tokens.append(step)
+                prev = step
+            return torch.stack(draft_tokens, dim=1)
+
+        start_idx = int(shard_indices.org_vocab_start_index)
+        end_idx = int(shard_indices.org_vocab_end_index)
+        valid_vocab = end_idx - start_idx
+        w2_shard = markov_w2.weight[start_idx:end_idx]
+
+        prev = prev_init
+        # Overlap step-0 local Markov bias ([B, r] @ [r, V_shard]) with local lm_head
+        bias_local = torch.nn.functional.linear(self.markov_embed(prev), w2_shard)
+        logits_local = self.logits_processor._get_logits(
+            pred_hidden, lm_head, None, skip_gather=True
+        )
+        assert logits_local is not None
+        logits_local_3d = logits_local.view(
+            padded_num_reqs, num_pred, logits_local.shape[-1]
+        )[..., :valid_vocab]
+
+        draft_tokens = []
+        for idx in range(num_pred):
+            if idx > 0:
+                bias_local = torch.nn.functional.linear(
+                    self.markov_embed(prev), w2_shard
+                )
+            local_val, local_idx = (
+                logits_local_3d[:, idx] + bias_local
+            ).max(dim=-1, keepdim=True)
+            global_idx = local_idx.to(torch.int32) + start_idx
+            all_vals = tp_all_gather(local_val, dim=-1)
+            all_idxs = tp_all_gather(global_idx, dim=-1)
+            best_shard = all_vals.argmax(dim=-1, keepdim=True)
+            step = all_idxs.gather(-1, best_shard).squeeze(-1)
+            draft_tokens.append(step)
+            prev = step
+        return torch.stack(draft_tokens, dim=1)
+
     def process_weights_after_loading(self) -> None:
         for layer in self.model.layers:
             layer._ensure_mhc_buffers()
+        self.model.process_weights_after_loading()

@@ -93,6 +93,31 @@ _Q_ROPE_SPECS = (P(None, "model", None), P(), P())
 _KV_NORM_ROPE_SPECS = (P(), P(), P(), P())
 _QKV_NORM_ROPE_QUANT_SPECS = (P(), P(), P(), P(), P())
 _O_PROJ_SPECS = (P(None, "model", None), P(), P(), P(), P())
+_SWA_STORE_SPECS = (P(), P(), P(BATCH_AXIS), P(BATCH_AXIS), P(), P())
+
+
+def _get_dspark_swa_store_op(logical_page_size: int):
+    op_name = f"pallas::dspark_swa_store_ps{logical_page_size}"
+    op = _pallas_op_cache.get(op_name)
+    if op is None:
+        mesh = get_vllm_model_wrapper_context().mesh
+        if mesh is None:
+            return None
+        op = pallas.jax_op(
+            op_name,
+            functools.partial(
+                tp_attention.swa_store_all_pallas,
+                logical_page_size=logical_page_size,
+            ),
+            mesh=mesh,
+            donate_argnums=(0,),
+            input_partition_specs=_SWA_STORE_SPECS,
+        )
+        op.register_fake(lambda sw_cache, *_: torch.empty_like(sw_cache))
+        _pallas_op_cache[op_name] = op
+    return op
+
+
 _WQ_B_Q_ROPE_SPECS = (P(), P(), P(), P(), P())
 _WQ_B_Q_ROPE_PREQUANT_SPECS = (P(), P(), P(), P(), P(), P())
 _CSA_UNION_SPECS = (P(BATCH_AXIS, None),)
@@ -539,6 +564,8 @@ class VllmDeepseekV41MLAAttention(
         if self.non_causal_multi_token_decode and not torch.compiler.is_compiling():
             _ = self.context_kv_attn_op
             _ = self.kv_rope_op
+            for _ps in (16, 32, 64, 128):
+                _ = _get_dspark_swa_store_op(_ps)
         return op
 
     @property
@@ -1150,6 +1177,35 @@ class VllmDeepseekV41MLAAttention(
         orig_sw_cache = self._as_kernel_cache_view(
             _live_cache(getattr(self.swa_cache_layer, "kv_cache", None))
         )
+        swa_lens, swa_tables, swa_q_loc, swa_dist = _unpack_meta(swa_attn_metadata)
+        if orig_sw_cache is not None and orig_sw_cache.device.type == "tpu":
+            vllm_cfg = getattr(get_vllm_model_wrapper_context(), "vllm_config", None)
+            logical_page_size = (
+                VllmDeepseekV4SWACache._swa_block_size(
+                    vllm_cfg.cache_config.block_size, self.window_size
+                )
+                if vllm_cfg is not None
+                else int(self.swa_cache_layer.block_size)
+            )
+            store_op = _get_dspark_swa_store_op(logical_page_size)
+            if store_op is not None:
+                m_pad = (kv.shape[0] + 7) & ~7
+                kv_store = (
+                    torch.nn.functional.pad(kv, (0, 0, 0, m_pad - kv.shape[0]))
+                    if m_pad > kv.shape[0]
+                    else kv
+                )
+                new_sw_cache = store_op(
+                    orig_sw_cache,
+                    kv_store,
+                    swa_lens,
+                    swa_tables,
+                    swa_q_loc,
+                    swa_dist,
+                )
+                if new_sw_cache is not None and new_sw_cache.numel() > 0:
+                    orig_sw_cache.copy_(new_sw_cache)
+                return kv
         sw_cache = (
             orig_sw_cache
             if orig_sw_cache is not None
@@ -1157,7 +1213,6 @@ class VllmDeepseekV41MLAAttention(
                 (0, 1, 1, self.head_dim), dtype=torch.uint8, device=kv.device
             )
         )
-        swa_lens, swa_tables, swa_q_loc, swa_dist = _unpack_meta(swa_attn_metadata)
         # Only the SWA cache write is needed; a 2-head dummy query with the
         # sliding_window=1 op keeps the attention compute negligible.
         out_tensor, new_sw_cache = self.context_kv_attn_op(

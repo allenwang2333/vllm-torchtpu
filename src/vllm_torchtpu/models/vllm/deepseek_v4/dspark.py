@@ -81,21 +81,30 @@ def _get_dspark_swa_store_op(logical_page_size: int):
     if op is None:
         import functools
 
+        from jax.sharding import PartitionSpec as P
         from torch_tpu import pallas
         from vllm_torchtpu.kernels.deepseek_v41.tp_attention import (
             swa_store_all_pallas,
+        )
+        from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
+            deepseek_v4_attention_op as _dsv4_attn_op,
         )
         from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
             get_vllm_model_wrapper_context,
         )
 
+        mesh = get_vllm_model_wrapper_context().mesh
+        if mesh is None:
+            return None
+        b_ax = _dsv4_attn_op.BATCH_AXIS
         op = pallas.jax_op(
             f"pallas::dspark_swa_store_ps{logical_page_size}",
             functools.partial(
                 swa_store_all_pallas, logical_page_size=logical_page_size
             ),
-            mesh=get_vllm_model_wrapper_context().mesh,
+            mesh=mesh,
             donate_argnums=(0,),
+            input_partition_specs=(P(), P(), P(b_ax), P(b_ax), P(), P()),
         )
         op.register_fake(lambda sw_cache, *_: torch.empty_like(sw_cache))
         _DSPARK_INSERT_KV_OP_CACHE[logical_page_size] = op
@@ -118,17 +127,24 @@ def _insert_context_kv(
     kv = attn.kv_rope(kv, positions)
     if orig_sw_cache.device.type == "tpu":
         store_op = _get_dspark_swa_store_op(int(attn.swa_cache_layer.block_size))
-        new_sw_cache = store_op(
-            orig_sw_cache,
-            kv,
-            metadata.seq_lens,
-            metadata.block_tables,
-            metadata.query_start_loc,
-            metadata.request_distribution,
-        )
-        if new_sw_cache is not None and new_sw_cache.numel() > 0:
-            orig_sw_cache.copy_(new_sw_cache)
-        return
+        if store_op is not None:
+            m_pad = (kv.shape[0] + 7) & ~7
+            kv_store = (
+                torch.nn.functional.pad(kv, (0, 0, 0, m_pad - kv.shape[0]))
+                if m_pad > kv.shape[0]
+                else kv
+            )
+            new_sw_cache = store_op(
+                orig_sw_cache,
+                kv_store,
+                metadata.seq_lens,
+                metadata.block_tables,
+                metadata.query_start_loc,
+                metadata.request_distribution,
+            )
+            if new_sw_cache is not None and new_sw_cache.numel() > 0:
+                orig_sw_cache.copy_(new_sw_cache)
+            return
 
     num_tokens = kv.shape[0]
     dummy_q = torch.zeros(
@@ -173,6 +189,9 @@ class DSparkDeepseekV4Model(nn.Module):
         # Aliased to the target's embedding by the proposer's sharing
         # utility after load (has_own_embed_tokens=False).
         self.embed_tokens: nn.Module | None = None
+
+        for _preload_lps in (16, 32, 64, 128):
+            _get_dspark_swa_store_op(_preload_lps)
 
         self.main_proj = ReplicatedLinear(
             config.hidden_size * len(self.target_layer_ids),
@@ -242,13 +261,38 @@ class DSparkDeepseekV4Model(nn.Module):
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
         )
+        self._fused_ctx_wkv_weight: torch.Tensor | None = None
 
     # Borrowed from the target: the lazily built MHC post op, the expert
     # mapping, and the per-layer loader.
     # The loader expects names already rewritten by ``_rewrite_dspark_name``.
     mhc_post_op = DeepseekV4Model.mhc_post_op
     get_expert_mapping = DeepseekV4Model.get_expert_mapping
-    load_weights = DeepseekV4Model.load_weights
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loaded = DeepseekV4Model.load_weights(self, weights)
+        self._init_fused_ctx_wkv_weight()
+        return loaded
+
+    def _init_fused_ctx_wkv_weight(self) -> None:
+        slices: list[torch.Tensor] = []
+        for layer in self.layers:
+            wqa_wkv = getattr(layer.attn, "fused_wqa_wkv", None)
+            w = getattr(wqa_wkv, "weight", None)
+            mla = layer.attn.mla_attn
+            expected_rows = (
+                mla.q_lora_rank + mla.kv_lora_rank + mla.qk_rope_head_dim
+            )
+            if (
+                w is None
+                or w.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+                or w.shape[0] != expected_rows
+            ):
+                self._fused_ctx_wkv_weight = None
+                return
+            slices.append(w[mla.q_lora_rank :])
+        if slices:
+            self._fused_ctx_wkv_weight = torch.cat(slices, dim=0).contiguous()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         assert self.embed_tokens is not None
@@ -278,6 +322,17 @@ class DSparkDeepseekV4Model(nn.Module):
         mirroring upstream; the paged insert goes through the TPU attention op.
         """
         main_x = self.combine_hidden_states(target_hidden_states)
+        fused_wkv = self._fused_ctx_wkv_weight
+        if fused_wkv is not None:
+            kv_all = torch.nn.functional.linear(main_x, fused_wkv).view(
+                main_x.shape[0], len(self.layers), -1
+            )
+            for i, layer in enumerate(self.layers):
+                attn = layer.attn
+                kv = attn.kv_norm(kv_all[:, i])
+                _insert_context_kv(attn, kv, positions, metadata[i])
+            return main_x
+
         for i, layer in enumerate(self.layers):
             attn = layer.attn
             qr_kv, _ = attn.fused_wqa_wkv(main_x)
@@ -416,14 +471,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
         start_idx = int(self.lm_head.shard_indices.org_vocab_start_index)
         end_idx = int(self.lm_head.shard_indices.org_vocab_end_index)
-        if self._markov_w2_shard is None:
-            self._markov_w2_shard = markov_w2.weight[start_idx:end_idx].contiguous()
+        w2_shard = markov_w2.weight[start_idx:end_idx]
 
         prev = prev_init
         # Overlap step-0 local Markov bias ([B, r] @ [r, V_shard]) with local lm_head
-        bias_local = torch.nn.functional.linear(
-            self.markov_embed(prev), self._markov_w2_shard
-        )
+        bias_local = torch.nn.functional.linear(self.markov_embed(prev), w2_shard)
         logits_local = self.logits_processor._get_logits(
             self.model.norm(pred_hidden), self.lm_head, None, skip_gather=True
         )
@@ -434,7 +486,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         for idx in range(num_pred):
             if idx > 0:
                 bias_local = torch.nn.functional.linear(
-                    self.markov_embed(prev), self._markov_w2_shard
+                    self.markov_embed(prev), w2_shard
                 )
             local_val, local_idx = (
                 logits_local_3d[:, idx] + bias_local
