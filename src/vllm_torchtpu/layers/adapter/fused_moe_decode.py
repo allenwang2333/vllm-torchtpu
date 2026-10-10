@@ -26,10 +26,15 @@ refuses (``compilation.shape_variants``).
 ``FUSED_MOE_PREFILL_KERNEL=1`` arms the same layers, with or without this
 kernel, and the same program serves steps of at least
 ``FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS`` tokens with the fused MoE prefill
-kernel (``layers/adapter/fused_moe_prefill.py``).
+kernel (``layers/adapter/fused_moe_prefill.py``). It also arms TP-expert
+layers whose shared expert has no gate, with or without a runner that scales
+the routed output (``routed_scaling_factor``; GLM-5.2 has both), which this
+kernel does not support: the scale moves from the runner into the program,
+and their smaller steps run GMM MoE.
 """
 
 import functools
+import math
 from typing import Any, cast
 
 import jax
@@ -38,6 +43,7 @@ import torch
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec
 from torch_tpu._internal.pallas import jax_op
+from vllm.model_executor.layers.activation import SiluAndMul
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_mesh_index
@@ -98,11 +104,14 @@ def _gmm_layer(
     tw,
     ti,
     start,
+    routed_scale=1.0,
     *,
     topk,
 ):
     """Above the cap: the layer as the runner computes it with the kernel off,
-    shared expert + routed GMM MoE, all-reduced. Per rank, inside shard_map."""
+    shared expert + routed GMM MoE, all-reduced. Per rank, inside shard_map.
+    `shared_gate_weight` is None for a shared expert without a gate;
+    `routed_scale` is the runner's routed_scaling_factor."""
     routed = fused_moe_func(
         x,
         w1,
@@ -123,7 +132,7 @@ def _gmm_layer(
         skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS,
     )
     # Qwen2MoeMLP.forward: FP8 gate_up / down linears, SiluAndMul, and the
-    # sigmoid of the replicated expert_gate linear.
+    # sigmoid of the replicated expert_gate linear (DeepseekV2MLP: no gate).
     i_s = shared_w2.shape[0]
     gate_up = _quantized_matmul_jax(x, shared_w1, shared_w1_scale.reshape(-1))
     shared = _quantized_matmul_jax(
@@ -131,10 +140,17 @@ def _gmm_layer(
         shared_w2,
         shared_w2_scale.reshape(-1),
     )
-    shared = (
-        jax.nn.sigmoid(jnp.dot(x, shared_gate_weight.reshape(-1, 1).astype(x.dtype)))
-        * shared
-    )
+    if shared_gate_weight is not None:
+        shared = (
+            jax.nn.sigmoid(
+                jnp.dot(x, shared_gate_weight.reshape(-1, 1).astype(x.dtype))
+            )
+            * shared
+        )
+    if routed_scale != 1.0:
+        # MoERunner._maybe_apply_routed_scale_to_output: fused_output *=
+        # routed_scaling_factor, in the routed output's dtype.
+        routed = routed * jnp.asarray(routed_scale, routed.dtype)
     return jax.lax.psum(shared + routed, EP_AXIS_NAME)
 
 
@@ -158,11 +174,16 @@ def _layer(
     expert_parallel,
     max_tokens,
     prefill_min_tokens=None,
+    gated=True,
+    routed_scale=1.0,
 ):
     """Per-rank body of the op: the prefill kernel from `prefill_min_tokens`
     tokens when it is on, else the decode kernel up to `max_tokens` and GMM MoE
-    above."""
+    above. A layer without a shared-expert gate (`gated` False; the gate
+    operand is then a placeholder) or with a `routed_scale` other than 1 is
+    armed with `max_tokens` 0: the decode kernel supports neither."""
     start = rank[0, 1] if expert_parallel else None
+    gate = shared_gate_weight if gated else None
     if prefill_min_tokens is not None and x.shape[0] >= prefill_min_tokens:
         return prefill_layer(
             x,
@@ -174,10 +195,11 @@ def _layer(
             shared_w1_scale,
             shared_w2,
             shared_w2_scale,
-            shared_gate_weight,
+            gate,
             tw,
             ti,
             start,
+            routed_scale,
         )
     if x.shape[0] > max_tokens:
         return _gmm_layer(
@@ -190,10 +212,11 @@ def _layer(
             shared_w1_scale,
             shared_w2,
             shared_w2_scale,
-            shared_gate_weight,
+            gate,
             tw,
             ti,
             start,
+            routed_scale,
             topk=topk,
         )
     # Trace-time, once per token bucket: the evidence that the kernel serves
@@ -225,8 +248,21 @@ def _build_op(
     expert_parallel: bool,
     max_tokens: int,
     prefill_min_tokens: int | None,
+    gated: bool = True,
+    routed_scale: float = 1.0,
 ):
-    key = (id(mesh), n_ranks, topk, expert_parallel, max_tokens, prefill_min_tokens)
+    # The decode kernel has no ungated shared expert and no routed scale.
+    assert not max_tokens or (gated and routed_scale == 1.0)
+    key = (
+        id(mesh),
+        n_ranks,
+        topk,
+        expert_parallel,
+        max_tokens,
+        prefill_min_tokens,
+        gated,
+        routed_scale,
+    )
     op = _OPS.get(key)
     if op is not None:
         return op
@@ -238,6 +274,8 @@ def _build_op(
         expert_parallel=expert_parallel,
         max_tokens=max_tokens,
         prefill_min_tokens=prefill_min_tokens,
+        gated=gated,
+        routed_scale=routed_scale,
     )
 
     # torch_tpu infers static arguments from annotations: every operand is a
@@ -309,7 +347,15 @@ def _shared_slice(runner) -> tuple | None:
     gate_up = getattr(mlp, "gate_up_proj", None)
     down = getattr(mlp, "down_proj", None)
     gate = getattr(mlp, "expert_gate", None)
-    if gate_up is None or down is None or gate is None:
+    if gate_up is None or down is None:
+        return None
+    # Without a gate, admit only what the kernel and _gmm_layer compute:
+    # down(silu(gate) * up) with no biases (DeepseekV2MLP).
+    if gate is None and (
+        not isinstance(getattr(mlp, "act_fn", None), SiluAndMul)
+        or getattr(gate_up, "bias", None) is not None
+        or getattr(down, "bias", None) is not None
+    ):
         return None
     shared_w1, shared_w1_scale = (
         getattr(gate_up, "weight", None),
@@ -319,13 +365,15 @@ def _shared_slice(runner) -> tuple | None:
         getattr(down, "weight", None),
         getattr(down, "weight_scale", None),
     )
+    # No expert_gate (GLM-5.2's DeepseekV2MLP): the shared output is not
+    # gated, and None stands in for the gate weight.
     shared_gate_weight = getattr(gate, "weight", None)
     if (
         shared_w1 is None
         or shared_w1_scale is None
         or shared_w2 is None
         or shared_w2_scale is None
-        or shared_gate_weight is None
+        or (gate is not None and shared_gate_weight is None)
     ):
         return None
     # Per-channel FP8 linears are stored K-major ([in, out]) with a 1-D scale.
@@ -335,7 +383,7 @@ def _shared_slice(runner) -> tuple | None:
         or shared_w1.dtype != torch.float8_e4m3fn
     ):
         return None
-    if (
+    if shared_gate_weight is not None and (
         getattr(gate, "bias", None) is not None
         or shared_gate_weight.dim() != 2
         or shared_gate_weight.shape[0] != 1
@@ -350,7 +398,7 @@ def _shared_slice(runner) -> tuple | None:
         shared_w1_scale.data,
         shared_w2.data,
         shared_w2_scale.data,
-        shared_gate_weight.data,
+        None if shared_gate_weight is None else shared_gate_weight.data,
     )
 
 
@@ -384,8 +432,16 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool] | None:
         or runner.routed_output_transform is not None
     ):
         return None
+    # A routed scaling factor (GLM-5.2: 2.5) moves from the runner into the op,
+    # which applies it to the routed output alone. Exact in bf16, so GMM MoE
+    # scales the bf16 routed output exactly as the runner does.
+    # Under FP16 the runner divides the shared output by the scale instead and
+    # the decoder compensates, so the op's sum would be off by that factor.
+    routed_scale = getattr(runner, "routed_scaling_factor", 1.0)
     if (
-        getattr(runner, "routed_scaling_factor", 1.0) != 1.0
+        not math.isfinite(routed_scale)
+        or float(jnp.bfloat16(routed_scale)) != routed_scale
+        or (routed_scale != 1.0 and getattr(cfg, "in_dtype", None) == torch.float16)
         or runner.shared_expert_gate is not None
     ):
         return None
@@ -393,6 +449,9 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool] | None:
     if shared is None:
         return None
     shared_w1, _, shared_w2, _, shared_gate_weight = shared
+    # A gated shared expert with a routed scale: no model or test has both.
+    if shared_gate_weight is not None and routed_scale != 1.0:
+        return None
     w1, w2 = layer.w13_weight, layer.w2_weight
     w1_scale, w2_scale = layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
     e, h, two_i = w1.shape
@@ -408,7 +467,7 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool] | None:
         or i_s % 128
         or i_s > i
         or tuple(shared_w1.shape) != (h, 2 * i_s)
-        or shared_gate_weight.numel() != h
+        or (shared_gate_weight is not None and shared_gate_weight.numel() != h)
     ):
         return None
     return shared, expert_parallel
@@ -467,8 +526,20 @@ def arm_fused_moe_decode(model: torch.nn.Module) -> int:
             continue
         shared, expert_parallel = admitted
         layer = runner.routed_experts
-        if max_tokens:
-            _check_vmem(max_tokens, layer, shared[2].shape[0], n_ranks)
+        # The decode kernel has no ungated shared expert and no routed scale:
+        # such a layer (GLM-5.2) gets a decode cap of 0, so GMM MoE serves
+        # what the prefill kernel does not, and is not armed without it. Nor
+        # with EP experts: the prefill kernel's weight ring holds three whole
+        # experts, more than VMEM for GLM-5.2's, and only TP is tested.
+        gated = shared[4] is not None
+        routed_scale = float(runner.routed_scaling_factor)
+        layer_max_tokens = max_tokens
+        if not gated or routed_scale != 1.0:
+            layer_max_tokens = 0
+            if min_tokens is None or expert_parallel:
+                continue
+        if layer_max_tokens:
+            _check_vmem(layer_max_tokens, layer, shared[2].shape[0], n_ranks)
         start = get_experts_start(layer) or 0
         if _RANK_BUFFER is None:
             _RANK_BUFFER = torch.tensor(
@@ -491,13 +562,23 @@ def arm_fused_moe_decode(model: torch.nn.Module) -> int:
                 n_ranks,
                 layer.moe_config.experts_per_token,
                 expert_parallel,
-                max_tokens,
+                layer_max_tokens,
                 min_tokens,
+                gated,
+                routed_scale,
             ),
         )
+        if not gated:
+            # The op's operands are all tensors: a stand-in the program ignores.
+            placeholder = torch.zeros(
+                1, 1, dtype=torch.bfloat16, device=shared[0].device
+            )
+            shared = (*shared[:4], placeholder)
         for name, tensor in zip(_SHARED_BUFFERS, shared):
             layer.register_buffer(name, tensor, persistent=False)
         runner._shared_experts = None
+        # The op scales the routed output; the runner must not scale the sum.
+        runner.routed_scaling_factor = 1.0
         runner._forward_entry = runner._select_forward()
         object.__setattr__(runner, _RUNNER_ARMED_ATTR, True)
         armed += 1

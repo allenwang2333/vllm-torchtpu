@@ -596,7 +596,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256
     ),
     # Serve steps of at least FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS tokens of the
-    # same layers with the fused MoE prefill kernel: routed and shared experts,
+    # same layers, and of TP-expert layers whose shared expert has no gate
+    # (GLM-5.2), with the fused MoE prefill kernel: routed and shared experts,
     # combine and all-reduce (layers/adapter/fused_moe_prefill.py). It takes
     # precedence over the decode kernel; smaller steps run the decode kernel
     # when that is on and its cap allows, else the GMM MoE path.

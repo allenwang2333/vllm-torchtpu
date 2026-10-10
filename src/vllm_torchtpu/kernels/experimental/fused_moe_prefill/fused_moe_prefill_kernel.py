@@ -18,7 +18,8 @@ tiles ahead, and each tile runs gate/up, the activation, the intermediate
 requantization and down, then writes its unweighted rows into an expert-major
 BF16 slab in HBM. The shared expert is one more visit over every token, with
 contiguous rows. The combine is fused_moe/v2's destination combine: per token,
-the router-weighted sum of its top-k routed rows plus its gated shared row.
+the router-weighted sum of its top-k routed rows (times `routed_scale`) plus
+its shared row, gated unless the shared expert has no gate.
 The sum over the ranks' intermediate shards is an all-reduce issued per
 combine chunk, so each chunk's all-reduce runs under the next chunk's combine.
 
@@ -613,6 +614,7 @@ def fused_moe_prefill(
     *,
     axis_name,
     expert_start=None,
+    routed_scale=1.0,
 ):
     """One rank's MoE block for prefill-sized token counts, under shard_map.
 
@@ -628,7 +630,8 @@ def fused_moe_prefill(
       shared_w2: [i_s, h] FP8.
       shared_w2_scale: [h] f32.
       shared_gate_weight: shared-expert gate weight, h elements (the gate is
-        sigmoid(x . w)).
+        sigmoid(x . w)), or None for a shared expert without a gate
+        (GLM-5.2), whose rows enter the combine with coefficient 1.
       topk_weights: [T, K] router weights. Routes with weight 0 (padded rows
         under TPU_MOE_SKIP_PADDED_TOKENS) are not computed.
       topk_ids: [T, K] global expert ids.
@@ -636,9 +639,12 @@ def fused_moe_prefill(
       expert_start: None when every rank holds all experts (TP experts);
         with expert parallelism the global id of the rank's first expert,
         and routes to other ranks' experts are not computed here.
+      routed_scale: multiplies the routed coefficients (the router weights,
+        in f32) and not the shared row: GLM-5.2's routed_scaling_factor.
 
     Returns:
-      [T, h] bf16: shared + routed output summed over `axis_name`.
+      [T, h] bf16: shared + routed_scale * routed output summed over
+      `axis_name`.
     """
     tokens, h = x.shape
     experts, _, two_i = w1.shape
@@ -697,18 +703,24 @@ def fused_moe_prefill(
     )
 
     # ---- combine: top-k routed rows + the gated shared row per token ----
-    gate = jax.nn.sigmoid(
-        jnp.dot(
-            x,
-            shared_gate_weight.reshape(h, 1).astype(x.dtype),
-            preferred_element_type=jnp.float32,
+    if shared_gate_weight is None:  # no gate: the shared row is added as is
+        gate = jnp.ones((tokens, 1), jnp.float32)
+    else:
+        gate = jax.nn.sigmoid(
+            jnp.dot(
+                x,
+                shared_gate_weight.reshape(h, 1).astype(x.dtype),
+                preferred_element_type=jnp.float32,
+            )
         )
-    )
     shared_row = routes + jnp.arange(tokens, dtype=jnp.int32)[:, None]
     # Rows of routes that were not computed are never written; point those
     # routes at a written row so coefficient 0 never meets uninitialized memory.
     slab_row = jnp.where(route_valid, slab_row, shared_row)
     coeff = jnp.where(route_valid, topk_weights.astype(jnp.float32), 0.0)
+    # A Python-level branch: at 1.0 the traced program is the unscaled one.
+    if routed_scale != 1.0:
+        coeff = coeff * routed_scale
     return _combine(
         slab,
         jnp.concatenate([slab_row, shared_row], 1),

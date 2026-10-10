@@ -8,6 +8,9 @@ of at least ``FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS`` tokens run
 ``fused_moe_prefill`` per rank under shard_map: routed + shared experts, the
 combine and the all-reduce. Smaller steps run the decode kernel when
 ``FUSED_MOE_DECODE_KERNEL=1`` and its cap allows, else the GMM MoE path.
+TP-expert layers whose shared expert has no gate, with or without a routed
+scale (GLM-5.2 has both), are armed too; the decode kernel supports neither,
+so their smaller steps always run the GMM MoE path.
 
 Arming, the exported op and the GMM fallback are shared with the decode kernel
 in ``fused_moe_decode.py``: one exported program per layer serves every token
@@ -51,9 +54,12 @@ def prefill_layer(
     tw,
     ti,
     start,
+    routed_scale=1.0,
 ):
     """Per rank, inside shard_map: the all-reduced shared + routed output.
-    `start` is the rank's first global expert under EP, None under TP."""
+    `start` is the rank's first global expert under EP, None under TP.
+    `shared_gate_weight` is None for a shared expert without a gate, and
+    `routed_scale` multiplies the routed output alone (GLM-5.2: 2.5)."""
     # Trace-time, once per token bucket: the evidence that the prefill kernel
     # serves this shape.
     logger.info("Fused MoE prefill kernel traced for %d tokens", x.shape[0])
@@ -72,4 +78,5 @@ def prefill_layer(
         ti,
         axis_name=EP_AXIS_NAME,
         expert_start=start,
+        routed_scale=routed_scale,
     )
