@@ -19,6 +19,7 @@ KNOBS = (
     "TPU_DEEPSEEK_V41_KV_SHARD",
     "TPU_DEEPSEEK_V41_IMPL",
     "TPU_DEEPSEEK_V41_FUSED_SWA",
+    "ENABLE_PREFIX_CACHING",
     "TENSOR_PARALLELISM",
     "MAX_NUM_BATCHED_TOKENS",
     "MAX_NUM_SEQS",
@@ -64,9 +65,9 @@ def test_defaults_shard_kv_for_c224_on_the_dspark_workload():
     assert cfg["MAX_NUM_SEQS"] == "224"
     assert cfg["CONCURRENCY_OPTIONS"] == "96 128 192 224"
     assert cfg["KV_CACHE_MEMORY_BYTES"] == str(20 * 2**30)
-    args = cfg["EXTRA_SERVE_ARGS"]
     # validate_config rejects prefix caching under KV_SHARD.
-    assert "--no-enable-prefix-caching" in args
+    assert cfg["ENABLE_PREFIX_CACHING"] == "false"
+    args = cfg["EXTRA_SERVE_ARGS"]
     assert f'--compilation-config={{"compile_sizes":{cfg["COMPILE_SIZES"]}}}' in args
     assert '--speculative-config={"method":"dspark","num_speculative_tokens":5}' in args
 
