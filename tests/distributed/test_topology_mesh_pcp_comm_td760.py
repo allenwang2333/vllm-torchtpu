@@ -310,10 +310,10 @@ def test_pcp_rank_order_td760_full_coverage(monkeypatch):
     with pytest.raises(RuntimeError, match="data_parallel_size"):
         pcp_rank_order.resolve_pcp_topology_order(_cfg(dp_sz=2))
 
-    monkeypatch.setattr(tpu_envs, "TPU_PCP_TOPOLOGY_AWARE_MESH", False)
+    monkeypatch.setitem(vars(tpu_envs), "TPU_PCP_TOPOLOGY_AWARE_MESH", False)
     assert pcp_rank_order.resolve_pcp_topology_order(_cfg()) is None
 
-    monkeypatch.setattr(tpu_envs, "TPU_PCP_TOPOLOGY_AWARE_MESH", True)
+    monkeypatch.setitem(vars(tpu_envs), "TPU_PCP_TOPOLOGY_AWARE_MESH", True)
     monkeypatch.setattr(torch, "tpu", SimpleNamespace(), raising=False)
     with pytest.raises(RuntimeError, match="not available"):
         pcp_rank_order.resolve_pcp_topology_order(_cfg())

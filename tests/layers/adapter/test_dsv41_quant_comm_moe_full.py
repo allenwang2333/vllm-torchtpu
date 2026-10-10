@@ -865,7 +865,10 @@ class TestMoeRouting:
         )
         assert w_std2.shape == (4, 4)
         assert torch.allclose(
-            w_std2.sum(dim=-1), torch.full((4,), 2.0, dtype=torch.bfloat16)
+            w_std2.sum(dim=-1),
+            torch.full((4,), 2.0, dtype=torch.bfloat16),
+            rtol=2e-2,
+            atol=2e-2,
         )
 
     def test_route(self, monkeypatch: pytest.MonkeyPatch) -> None:

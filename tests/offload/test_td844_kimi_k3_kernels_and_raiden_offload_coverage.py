@@ -958,12 +958,16 @@ class TestRaidenConnectorCoverage:
         )
 
         # Test RAIDEN_DISABLE_SINGLETON_WORKER=False error
-        monkeypatch.setattr(rc_mod.tpu_envs, "RAIDEN_DISABLE_SINGLETON_WORKER", False)
+        monkeypatch.setitem(
+            vars(rc_mod.tpu_envs), "RAIDEN_DISABLE_SINGLETON_WORKER", False
+        )
         with pytest.raises(ValueError, match="RAIDEN_DISABLE_SINGLETON_WORKER"):
             rc_mod.TPURaidenOffloadingConnector(
                 MagicMock(), KVConnectorRole.WORKER, MagicMock()
             )
-        monkeypatch.setattr(rc_mod.tpu_envs, "RAIDEN_DISABLE_SINGLETON_WORKER", True)
+        monkeypatch.setitem(
+            vars(rc_mod.tpu_envs), "RAIDEN_DISABLE_SINGLETON_WORKER", True
+        )
 
         # Test role that is neither SCHEDULER nor WORKER
         fake_spec = MagicMock(spec=TPURaidenStoreOffloadingSpec)
@@ -987,9 +991,9 @@ class TestRaidenConnectorCoverage:
             assert conn_other.reset_cache() is False
             assert list(conn_other.take_events()) == []
 
-            monkeypatch.setattr(rc_mod.tpu_envs, "VLLM_TPU_BLOCK_MAJOR_KV", True)
+            monkeypatch.setitem(vars(rc_mod.tpu_envs), "VLLM_TPU_BLOCK_MAJOR_KV", True)
             assert conn_other.prefer_cross_layer_blocks is True
-            monkeypatch.setattr(rc_mod.tpu_envs, "VLLM_TPU_BLOCK_MAJOR_KV", False)
+            monkeypatch.setitem(vars(rc_mod.tpu_envs), "VLLM_TPU_BLOCK_MAJOR_KV", False)
             assert conn_other.prefer_cross_layer_blocks is False
 
         # Test SCHEDULER role & TPURaidenOffloadingScheduler branches
@@ -1144,7 +1148,9 @@ class TestRaidenConnectorCoverage:
                 fake_manager.submit_store_job.assert_called_once_with(30, [key_a], [1])
 
     def test_worker_connector_branches(self, monkeypatch):
-        monkeypatch.setattr(rc_mod.tpu_envs, "RAIDEN_DISABLE_SINGLETON_WORKER", True)
+        monkeypatch.setitem(
+            vars(rc_mod.tpu_envs), "RAIDEN_DISABLE_SINGLETON_WORKER", True
+        )
         fake_spec = MagicMock(spec=TPURaidenStoreOffloadingSpec)
         vllm_cfg = MagicMock()
         kv_cfg = MagicMock()

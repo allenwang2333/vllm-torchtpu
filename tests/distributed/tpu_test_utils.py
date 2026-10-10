@@ -30,6 +30,11 @@ def run_in_isolated_process(
     device tests in a child prevents those handles from blocking later tests
     that start their own engine processes.
     """
+    from vllm_torchtpu.tpu_info import get_num_chips
+
+    if get_num_chips() == 0:
+        pytest.skip("requires an attached TPU chip")
+
     ctx = multiprocessing.get_context("spawn")
     result_queue = ctx.Queue()
     process = ctx.Process(target=_isolated_test_worker, args=(target, result_queue))

@@ -2591,16 +2591,16 @@ class TestTPURaidenConnectorWorker:
             "TPU_RAIDEN_POOL_TAGS_PER_LAYER": False,
             "TPU_KV_RESHARD_TRANSPORT": "raiden",
         }.items():
-            monkeypatch.setattr(tpu_envs, name, value)
+            monkeypatch.setitem(vars(tpu_envs), name, value)
 
         with pytest.raises(ValueError, match="requires.*KIMIK3_ADMISSION"):
             worker.register_runner(SimpleNamespace())
-        monkeypatch.setattr(tpu_envs, "TPU_RAIDEN_QWEN35_ADMISSION", False)
-        monkeypatch.setattr(tpu_envs, "TPU_RAIDEN_KIMIK3_ADMISSION", True)
+        monkeypatch.setitem(vars(tpu_envs), "TPU_RAIDEN_QWEN35_ADMISSION", False)
+        monkeypatch.setitem(vars(tpu_envs), "TPU_RAIDEN_KIMIK3_ADMISSION", True)
         worker.register_runner(SimpleNamespace())
         worker._admit_raiden_hybrid_kv_cache.assert_called_once()
 
-        monkeypatch.setattr(tpu_envs, "TPU_RAIDEN_POOL_TAGS_PER_LAYER", True)
+        monkeypatch.setitem(vars(tpu_envs), "TPU_RAIDEN_POOL_TAGS_PER_LAYER", True)
         with pytest.raises(ValueError, match="POOL_TAGS_PER_LAYER"):
             worker.register_runner(SimpleNamespace())
 
