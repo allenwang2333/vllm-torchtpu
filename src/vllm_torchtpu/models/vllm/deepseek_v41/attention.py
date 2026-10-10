@@ -26,6 +26,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce as tp_all_reduce,
 )
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -41,7 +42,10 @@ from vllm_torchtpu.distributed.tp_collectives import (
     tp_reduce_scatter,
     tp_shard_slice,
 )
-from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
+from vllm_torchtpu.kernels.deepseek_v4 import (
+    o_projection as o_proj,
+    rope as rope_kernel,
+)
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     fused_wq_b_q_rope_prequant_projection,
     fused_wq_b_q_rope_projection,
