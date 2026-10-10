@@ -196,6 +196,7 @@ class Glm5MKD:
               f"{R} ranks do not divide heads / experts / intermediates")
         self.cfg = cfg
         self.rank = int(dist.get_rank())
+        self.counts = {}
         from torch_tpu._internal.pallas import get_pallas_mesh
         self.mesh = get_pallas_mesh(axis_names=(AXIS,), mesh_shape=(R,))
         bb = _find_backbone(runner.model)
@@ -526,20 +527,29 @@ class Glm5MKD:
     def step_ok(self, runner, scheduler_output, num_chunks: int) -> bool:
         """Rank-uniform host predicate: every request in decode / verify, <= QMAX tokens each,
         <= TMAX total, one chunk, no encoder inputs."""
+        ok, why = self._step_ok(runner, scheduler_output, num_chunks)
+        # engagement counters (rank 0 logs every 500 steps): decode-only steps the megakernel took vs
+        # decode-only steps it declined (too many tokens), and steps with a prefill (never taken)
+        c = self.counts
+        c[why] = c.get(why, 0) + 1
+        c["n"] = c.get("n", 0) + 1
+        if c["n"] % 500 == 0 and self.rank == 0:
+            logger.info("GLM-5.2 TPxDCP megakernel engagement: %s", {k: v for k, v in c.items() if k != "n"})
+        return ok
+
+    def _step_ok(self, runner, scheduler_output, num_chunks: int):
         cfg = self.cfg
         if self._step is None or num_chunks != 1 or scheduler_output.scheduled_encoder_inputs:
-            return False
-        if scheduler_output.total_num_scheduled_tokens > cfg.TMAX:
-            return False
+            return False, "other"
         ns = scheduler_output.num_scheduled_tokens
-        if len(ns) > cfg.TMAX:
-            return False
         ib = runner.input_batch
         for req_id, n in ns.items():
             i = ib.req_id_to_index[req_id]
             if n > cfg.QMAX or int(ib.num_computed_tokens_cpu[i]) < int(ib.num_prompt_tokens[i]):
-                return False
-        return True
+                return False, "prefill"
+        if scheduler_output.total_num_scheduled_tokens > cfg.TMAX or len(ns) > cfg.TMAX:
+            return False, "decode_over_tmax"
+        return True, "mk"
 
     def _metadata(self) -> AttentionMetadata:
         from vllm.forward_context import get_forward_context
