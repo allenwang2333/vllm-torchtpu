@@ -229,7 +229,7 @@ target's, else `./scenario-results/<name>-<UTC stamp>`.
 | 0 | every task passed (a soft gate may have failed) |
 | 1 | a task failed: a command, a hard gate, a missing result |
 | 2 | usage, scenario, Plan or placement error |
-| 3 | bring-up failed (a name, a taken port, a driver that never answered) |
+| 3 | bring-up failed (a name, a taken port, the Ray cluster, a driver that never answered) |
 | 4 | the server was not ready: it died starting, or the wait ran out |
 | 5 | the server died after it was ready |
 | 6 | a fatal after-task failed while every task passed |
@@ -251,16 +251,20 @@ host-b$ scenario run FILE --host-index 1 --head-address host-a --advertise-ip 10
 ```
 
 The first host of the role drives. It serves its status on port 8090, waits
-for its server (on an mp head, that is every host joining), runs the tasks
-and says how the run ended. Every other host starts its own part at once:
-the remote-code warm when the Plan has it, then its `--headless` server.
+for its server (on an mp head, that is every host joining; a Ray head
+starts its server only once every host is a Ray node with TPUs), runs the
+tasks and says how the run ended. Every other host starts its own part at
+once: the remote-code warm when the Plan has it, then its `--headless`
+server, or `ray start` once the Ray head answers. `ray start` gets the
+scenario's env, so every Ray worker inherits it, and `ray stop --force`
+ends every Ray host.
 It asks for the driver's status every 2 s and leaves with 0 when the
 driver is done, 7 when it aborted or has not answered for 20 s, and 4 or 5
 when its own server dies (before or after the driver was serving). It
 writes its `summary.json` and `server.log` under `<run dir>/<role>-<index>`.
 
-This version runs scenarios of one role, single-host or mp. Ray and
-several roles come next.
+This version runs scenarios of one role, on one host or over several with
+mp or Ray. Several roles come next.
 
 ## Usage
 

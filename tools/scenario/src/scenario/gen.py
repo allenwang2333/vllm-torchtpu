@@ -475,6 +475,16 @@ def reference() -> str:
                 "after an abort, at most",
                 f"{control.ABORT_LINGER_S:g} s",
             ),
+            (
+                f"a Ray worker probes the head's port every "
+                f"{bringup.RAY_JOIN_PROBE_S:g} s, gives up after",
+                f"{bringup.RAY_JOIN_TIMEOUT_S:g} s",
+            ),
+            (
+                f"the Ray head counts nodes with TPUs every "
+                f"{bringup.RAY_CLUSTER_POLL_S:g} s, gives up after",
+                f"{bringup.RAY_CLUSTER_TIMEOUT_S:g} s",
+            ),
         ],
     )
     while lines[-1] == "":

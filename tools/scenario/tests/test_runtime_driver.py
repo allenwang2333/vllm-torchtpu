@@ -39,6 +39,7 @@ from scenario.plan.types import Command, Plan
 from scenario.runtime import exits
 from scenario.runtime.context import TaskContext, TaskOutcome
 from scenario.runtime.driver import RunOptions, run
+from scenario.runtime.placement import PlacementFlags
 from scenario.runtime.proc import Proc
 
 pytestmark = pytest.mark.usefixtures("api_port", "fast_polls")
@@ -337,10 +338,11 @@ def _ready(url: str) -> bool:
     return net.http_status(f"{url}/health") == 200
 
 
-def test_several_hosts_wait_for_a_later_version(
+def test_several_roles_wait_for_a_later_version(
     tmp_path: pathlib.Path, variants: dict[str, Data]
 ) -> None:
     env = stub_env(tmp_path)
-    plan = build(variants["single"])
-    assert run(plan, options(tmp_path, env), {}) == exits.USAGE
+    plan = build(variants["pd"])
+    flags = PlacementFlags(role="prefill")
+    assert run(plan, options(tmp_path, env, flags=flags), {}) == exits.USAGE
     assert not (tmp_path / "results").exists()

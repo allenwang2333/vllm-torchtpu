@@ -16,14 +16,16 @@
 Every host of a run runs the same Plan and finds its part from its
 placement: a role and an index. One part drives: the first host of the
 role. The others follow it (runtime/control.py). This version runs plans of
-one role over any number of mp hosts, and the task verbs against a server
-at a URL.
+one role over any number of mp or Ray hosts, and the task verbs against a
+server at a URL.
 
-A part runs its pre commands (the remote-code warm), then starts its
-server. The driver serves its status to the followers, waits for its server
-to be ready (on an mp head, that means every host has joined), runs the
-tasks in Plan order and tears down. A follower starts at once, without
-waiting on the driver, and leaves as the driver's status says.
+A part runs its pre commands (ray start, the remote-code warm), then
+starts its server if it has one; a Ray worker has none. The driver serves
+its status to the followers, waits for its server to be ready (on an mp
+head, that means every host has joined; a Ray head starts its server only
+once every host is a node), runs the tasks in Plan order and tears down,
+`ray stop --force` last. A follower starts at once, without waiting on the
+driver, and leaves as the driver's status says.
 
 Tasks run in the Plan's order. A failed task does not stop the next one; a
 dead server does (exit 5), and so does a custom task's skip_rest_if_exit_ge.
@@ -49,7 +51,7 @@ from typing import Any, Literal
 
 from scenario import __version__
 from scenario.plan import codec
-from scenario.plan.types import CLIENT_ROLE, HostPlan, Plan, RolePlan
+from scenario.plan.types import CLIENT_ROLE, Command, HostPlan, Plan, RolePlan
 from scenario.runtime import (
     bringup,
     control,
@@ -206,6 +208,8 @@ class Host:
         self.log = Log(placement.part, codec.digest(plan), __version__)
         self.summary: results.Summary | None = None
         self.server: Proc | None = None
+        # The group of `ray start`, which holds this host's Ray daemons.
+        self.ray: Proc | None = None
         self.spawned_at = 0.0
         self.role: RolePlan | None = None
         self.host: HostPlan | None = None
@@ -283,9 +287,14 @@ class Host:
         host, role = self.host, self.role
         if host is None or role is None:
             return
-        if host.pre:
-            bringup.run_pre(
-                host,
+        for index, command in enumerate(host.pre):
+            what = f"pre[{index}]"
+            if role.backend == "ray" and bringup.is_ray_start(command.argv):
+                self._start_ray(what, command, role)
+                continue
+            bringup.run_pre_command(
+                what,
+                command,
                 refs=self.refs,
                 env=self.host_env,
                 added=self.host_added,
@@ -293,6 +302,7 @@ class Host:
                 log=self.log,
                 check=self._check,
             )
+        if host.pre:
             self._phase("pre-done")
         if host.serve is None:
             return
@@ -309,6 +319,30 @@ class Host:
             log=self.log,
         )
 
+    def _start_ray(self, what: str, command: Command, role: RolePlan) -> None:
+        """This host's Ray node; on the head, the wait for every host's."""
+        argv = self.refs.argv(command.argv)
+        self.ray = bringup.start_ray(
+            what,
+            argv,
+            env=self.host_env,
+            added=self.host_added,
+            cwd=self.options.repo_root,
+            log=self.log,
+            pause=self._pause,
+        )
+        if bringup.ray_head_address(argv) is not None:
+            self._phase("ray-joined")
+            return
+        bringup.wait_for_ray_nodes(
+            role.hosts,
+            env=self.host_env,
+            cwd=self.options.repo_root,
+            log=self.log,
+            pause=self._pause,
+        )
+        self._phase("ray-cluster-ready")
+
     # Teardown ----------------------------------------------------------
 
     def _command_failed(self) -> None:
@@ -316,10 +350,15 @@ class Host:
             self.summary.command_failed()
 
     def _stop_part(self) -> None:
-        if self.server is None:
+        if self.server is None and self.ray is None:
             return
         self.log.phase("stopping")
-        self.server.stop()
+        if self.server is not None:
+            self.server.stop()
+        if self.ray is not None:
+            bringup.stop_ray(
+                self.ray, env=self.host_env, cwd=self.options.repo_root, log=self.log
+            )
 
     def _finish(self, code: int, aborted: bool) -> None:
         if self.summary is not None:
@@ -705,8 +744,6 @@ class Follower(Host):
 def _unsupported(plan: Plan) -> str | None:
     if len(plan.roles) != 1 or plan.driver.chipless:
         return "this version runs plans of one role; several roles come next"
-    if plan.roles[0].backend == "ray":
-        return "this version runs mp roles over several hosts; Ray comes next"
     return None
 
 

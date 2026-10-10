@@ -37,7 +37,7 @@ from scenario.plan.types import Command, Plan
 STUBS = pathlib.Path(__file__).resolve().parent / "stubs" / "stubs.py"
 # `scenario` with runtime constants replaced from $STUB_PATCH.
 RUN_SCENARIO = pathlib.Path(__file__).resolve().parent / "stubs" / "run_scenario.py"
-PROGRAMS = ("vllm", "python3", "lm_eval", "evalscope")
+PROGRAMS = ("vllm", "python3", "lm_eval", "evalscope", "ray")
 # A stand-in vllm package: just runai_utils.ObjectStorageModel.
 SITE = pathlib.Path(__file__).resolve().parent / "stubs" / "site"
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -79,6 +79,7 @@ def stub_env(tmp_path: pathlib.Path, **knobs: str) -> dict[str, str]:
     env["STUB_RECORDS"] = str(records)
     env["PYTHONPATH"] = str(SITE)
     env["STUB_PULLED_DIR"] = str(tmp_path / "pulled")
+    env["STUB_RAY_STATE"] = str(tmp_path / "ray-state.json")
     env.update(knobs)
     return env
 

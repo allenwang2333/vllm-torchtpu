@@ -701,7 +701,7 @@ apply, the first of these wins: a signal, 4 or 5, 3, 7, 1, 6.
 | 0 | every task passed (soft gate failures allowed) |
 | 1 | a task failed: a command exited non-zero, a hard gate failed, a result is missing, or a cell had too many failed requests |
 | 2 | usage, Plan or placement error |
-| 3 | bring-up failed: a name did not resolve, a port was taken, or the driver never answered |
+| 3 | bring-up failed: a name did not resolve, a port was taken, the Ray cluster did not form, or the driver never answered |
 | 4 | a server was not ready: it died while starting, or the readiness wait ran out |
 | 5 | a server or router died after it was ready |
 | 6 | a fatal after-task failed while every task passed |
@@ -721,3 +721,5 @@ apply, the first of these wins: a signal, 4 or 5, 3, 7, 1, 6.
 | such a host gives up (exit 3) without a first answer after | 1800 s |
 | after its end, the driver waits for every such host to ask, at most | 10 s |
 | after an abort, at most | 3 s |
+| a Ray worker probes the head's port every 10 s, gives up after | 1800 s |
+| the Ray head counts nodes with TPUs every 15 s, gives up after | 1800 s |

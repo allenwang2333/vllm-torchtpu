@@ -68,10 +68,21 @@ $RESULT_DIR/aiperf_artifacts. Knobs:
     STUB_AGENTX_RESULT=0       write no result
     STUB_AGENTX_VALID=false    aiperf's submission_valid (default true)
 
+`ray start --head --port=P` listens on P; `ray start --address=H:P` fails
+unless H:P answers. Either forks a raylet that registers this host's node
+in $STUB_RAY_STATE (as $STUB_HOST, with its env) and lives until stopped;
+`ray start` returns once the node is registered. `ray stop` stops the
+raylets of $STUB_HOST and `ray status` lists the nodes. The stand-in `ray`
+module in the site directory reads the same state. Knobs:
+
+    STUB_RAY_TPU=N             TPUs a node advertises (default 4)
+    STUB_RAY_START_EXIT=N      `ray start` exits N at once
+
 `python3` runs the real interpreter for anything but `-m infx...`.
 """
 
 import contextlib
+import fcntl
 import http.client
 import http.server
 import json
@@ -366,6 +377,98 @@ def vllm(args: list[str]) -> int:
     return 2
 
 
+# Ray --------------------------------------------------------------------------
+
+
+def _ray_state(change: Callable[[list[dict[str, Any]]], list[dict[str, Any]]]) -> None:
+    """Change the node list in $STUB_RAY_STATE under a lock.
+
+    The file is replaced whole, so readers without the lock never see half.
+    """
+    path = pathlib.Path(os.environ["STUB_RAY_STATE"])
+    with path.with_suffix(".lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        nodes = json.loads(path.read_text()) if path.exists() else []
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(change(nodes)))
+        tmp.replace(path)
+
+
+def _ray_nodes() -> list[dict[str, Any]]:
+    path = pathlib.Path(os.environ["STUB_RAY_STATE"])
+    return json.loads(path.read_text()) if path.exists() else []
+
+
+def _raylet(head: socket.socket | None) -> None:
+    """Register this host's node, then live until stopped."""
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    host = os.environ.get("STUB_HOST", "")
+    node = {
+        "host": host,
+        "pid": os.getpid(),
+        "Alive": True,
+        "Resources": {"TPU": float(os.environ.get("STUB_RAY_TPU", "4"))},
+    }
+    _ray_state(lambda nodes: [*nodes, node])
+    record("raylet", [], node=host)
+    print(f"INFO stub raylet: node of {host or 'this host'} registered", flush=True)
+    while True:
+        if head is not None:
+            conn, _ = head.accept()
+            conn.close()
+        else:
+            time.sleep(60)
+
+
+def ray(args: list[str]) -> int:
+    host = os.environ.get("STUB_HOST", "")
+    if args[:1] == ["start"]:
+        if "STUB_RAY_START_EXIT" in os.environ:
+            record("ray start", args)
+            print("ERROR stub: ray start failed", flush=True)
+            return int(os.environ["STUB_RAY_START_EXIT"])
+        head = None
+        address = flag(args, "--address")
+        if address is None:
+            head = socket.create_server(("127.0.0.1", int(flag(args, "--port") or 0)))
+        else:
+            name, _, port = address.rpartition(":")
+            try:
+                socket.create_connection((name, int(port)), timeout=2).close()
+            except OSError:
+                print(f"ConnectionError: no Ray head at {address}", flush=True)
+                record("ray start", args)
+                return 1
+        daemon = os.fork()
+        if daemon == 0:
+            _raylet(head)
+        record("ray start", args, daemon_pid=daemon)
+        deadline = time.monotonic() + 10
+        while not any(n["pid"] == daemon for n in _ray_nodes()):
+            if time.monotonic() >= deadline:
+                return 1
+            time.sleep(0.02)
+        print("Ray runtime started.", flush=True)
+        return 0
+    if args[:1] == ["stop"]:
+        record("ray stop", args)
+        mine = [n for n in _ray_nodes() if n["host"] == host]
+        for node in mine:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(node["pid"], signal.SIGKILL)
+        _ray_state(lambda nodes: [n for n in nodes if n["host"] != host])
+        print(f"Stopped {len(mine)} Ray processes.", flush=True)
+        return 0
+    if args[:1] == ["status"]:
+        record("ray status", args)
+        nodes = _ray_nodes()
+        tpus = sum(n["Resources"].get("TPU", 0) for n in nodes)
+        print(f"{len(nodes)} nodes, {tpus:g} TPU", flush=True)
+        return 0
+    record("ray", args)
+    return 2
+
+
 # Evals --------------------------------------------------------------------------
 
 METRIC = "exact_match,custom-extract"
@@ -464,6 +567,7 @@ PROGRAMS: dict[str, Callable[[list[str]], int]] = {
     "python3": python3,
     "lm_eval": lm_eval,
     "evalscope": evalscope,
+    "ray": ray,
 }
 
 

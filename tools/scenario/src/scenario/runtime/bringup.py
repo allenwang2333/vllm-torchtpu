@@ -13,20 +13,31 @@
 # limitations under the License.
 """Bringing up this host's part: its pre commands, then its server.
 
-Pre commands run in order before the server (the remote-code warm), each
-within its own timeout. A best-effort one that fails is a warning; any
-other is a bring-up failure (exit 3).
+Pre commands run in order before the server (ray start, the remote-code
+warm), each within its own timeout. A best-effort one that fails is a
+warning; any other is a bring-up failure (exit 3).
+
+Ray: the first host of a ray role starts the head, then waits until every
+host of the role is a Ray node with TPUs before its server starts. The
+others wait until the head's port answers, then join. `ray start` gets the
+host's whole env, the scenario's included, so the raylet and every Ray
+worker it starts inherit it. `ray start` returns once its daemons run, and
+they stay in its process group until teardown runs `ray stop --force` and
+stops what is left of the group.
 
 The readiness wait is Readiness.timeout_s from the spawn, the number `show`
 prints: the engine's own startup timeout plus a margin, so a slow start
 fails with vLLM's message rather than the wait's.
 """
 
+import contextlib
 import pathlib
+import subprocess
+import tempfile
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 
-from scenario.plan.types import HostPlan, Readiness
+from scenario.plan.types import Command, HostPlan, Readiness
 from scenario.runtime import net
 from scenario.runtime.exits import BRINGUP, NOT_READY, RunError
 from scenario.runtime.log import Log
@@ -35,6 +46,15 @@ from scenario.runtime.proc import Proc
 from scenario.runtime.proc import run as run_command
 
 POLL_INTERVAL_S = 1.0
+# A Ray worker probes the head's port this often, and gives up after the
+# names' budget: the head's host may start as late as any other.
+RAY_JOIN_PROBE_S = 10.0
+RAY_JOIN_TIMEOUT_S = float(net.RESOLVE_TIMEOUT_S)
+# The Ray head counts nodes with TPUs this often, until every host is one.
+RAY_CLUSTER_POLL_S = 15.0
+RAY_CLUSTER_TIMEOUT_S = 1800.0
+# A Ray query, `ray status` and `ray stop` each give up after this long.
+RAY_COMMAND_TIMEOUT_S = 120.0
 # Lines of the server's output repeated in a failure report; all of it was
 # streamed above.
 FAILURE_TAIL = 50
@@ -52,6 +72,49 @@ def host_env(
     return {**base, **scenario, **tool}, scenario, tool
 
 
+def run_pre_command(
+    what: str,
+    command: Command,
+    *,
+    refs: Refs,
+    env: Mapping[str, str],
+    added: Mapping[str, Mapping[str, str]],
+    cwd: pathlib.Path,
+    log: Log,
+    check: Callable[[], None] | None = None,
+) -> None:
+    """Run one pre command within its timeout.
+
+    `check` is called while the command runs and may raise to stop it.
+
+    Raises:
+        RunError: exit 3, the command is not best effort and failed.
+    """
+    argv = refs.argv(command.argv)
+    extra = refs.env(command.env)
+    log.spawn(what, argv, {**added, **({"env": extra} if extra else {})})
+    try:
+        done = run_command(
+            argv,
+            env={**env, **extra},
+            cwd=cwd,
+            timeout_s=command.timeout_s,
+            check=check,
+        )
+    except OSError as error:
+        raise RunError(BRINGUP, f"{what}: cannot run {argv[0]}: {error}") from None
+    if done.ok:
+        return
+    if done.timed_out:
+        problem = f"{what} ({argv[0]}) did not finish in {command.timeout_s}s"
+    else:
+        problem = f"{what} ({argv[0]}) exited {done.code}"
+    if not command.best_effort:
+        raise RunError(BRINGUP, problem)
+    warning = f"{problem}; it is best effort, so bring-up goes on"
+    log.warning(warning)
+
+
 def run_pre(
     host: HostPlan,
     *,
@@ -62,36 +125,197 @@ def run_pre(
     log: Log,
     check: Callable[[], None] | None = None,
 ) -> None:
-    """Run the host's pre commands in order, each within its own timeout.
-
-    `check` is called while a command runs and may raise to stop it.
-
-    Raises:
-        RunError: exit 3, a command that is not best effort failed.
-    """
+    """Run the host's pre commands in order; see run_pre_command."""
     for index, command in enumerate(host.pre):
-        what = f"pre[{index}]"
-        argv = refs.argv(command.argv)
-        extra = refs.env(command.env)
-        log.spawn(what, argv, {**added, **({"env": extra} if extra else {})})
-        done = run_command(
-            argv,
-            env={**env, **extra},
+        run_pre_command(
+            f"pre[{index}]",
+            command,
+            refs=refs,
+            env=env,
+            added=added,
             cwd=cwd,
-            timeout_s=command.timeout_s,
+            log=log,
             check=check,
         )
-        if done.ok:
-            continue
-        if done.timed_out:
-            problem = f"{what} ({argv[0]}) did not finish in {command.timeout_s}s"
-        else:
-            problem = f"{what} ({argv[0]}) exited {done.code}"
-        if command.best_effort:
-            warning = f"{problem}; it is best effort, so bring-up goes on"
+
+
+def is_ray_start(argv: Sequence[str]) -> bool:
+    return list(argv[:2]) == ["ray", "start"]
+
+
+def ray_head_address(argv: Sequence[str]) -> tuple[str, int] | None:
+    """The head a `ray start --address=HOST:PORT` joins; None for the head."""
+    for word in argv:
+        if word.startswith("--address="):
+            host, _, port = word.removeprefix("--address=").rpartition(":")
+            return host, int(port)
+    return None
+
+
+def start_ray(
+    what: str,
+    argv: Sequence[str],
+    *,
+    env: Mapping[str, str],
+    added: Mapping[str, Mapping[str, str]],
+    cwd: pathlib.Path,
+    log: Log,
+    pause: Callable[[float], None] = time.sleep,
+) -> Proc:
+    """Start this host's Ray node; the Proc whose group holds its daemons.
+
+    A worker first waits until the head's port answers: `ray start
+    --address` fails outright against a head that is not up. Not --block,
+    which the Plan never asks for: a blocking worker would hold its chips
+    until something killed it.
+
+    Raises:
+        RunError: exit 3, the head never answered or `ray start` failed.
+    """
+    head = ray_head_address(argv)
+    if head is not None:
+        host, port = head
+        log.say(f"Waiting for the Ray head at {host}:{port}")
+        deadline = time.monotonic() + RAY_JOIN_TIMEOUT_S
+        while not net.port_open(host, port, timeout_s=5):
+            if time.monotonic() >= deadline:
+                raise RunError(
+                    BRINGUP,
+                    f"no Ray head at {host}:{port} after {RAY_JOIN_TIMEOUT_S:.0f}s",
+                )
+            pause(RAY_JOIN_PROBE_S)
+    log.spawn(what, argv, added)
+    try:
+        proc = Proc(argv, env=env, cwd=cwd).start()
+    except OSError as error:
+        raise RunError(BRINGUP, f"{what}: cannot run {argv[0]}: {error}") from None
+    try:
+        code = proc.wait()
+    except BaseException:
+        proc.stop()
+        raise
+    if code != 0:
+        proc.stop()
+        raise RunError(BRINGUP, f"{what} (ray start) exited {code}")
+    return proc
+
+
+# How many Ray nodes are alive with TPUs, written to the file named by
+# argv[1]: Ray's own logging floods stdout once a driver attaches, and a
+# count printed there would be lost in it. A node counts only once it
+# advertises chips: a raylet registers before libtpu has handed it its
+# chips, and a server started against such a cluster fails an hour later in
+# a placement timeout that looks nothing like its cause.
+RAY_NODES = """\
+import sys
+import ray
+ray.init(address="auto", logging_level="error")
+count = sum(
+    1
+    for node in ray.nodes()
+    if node["Alive"] and node.get("Resources", {}).get("TPU", 0) > 0
+)
+with open(sys.argv[1], "w") as report:
+    report.write(str(count))
+"""
+
+
+def ray_tpu_nodes(
+    env: Mapping[str, str],
+    cwd: pathlib.Path,
+    report: pathlib.Path,
+    errors: pathlib.Path,
+) -> int:
+    """The Ray nodes alive with TPUs, or 0 when the query failed."""
+    report.unlink(missing_ok=True)
+    with errors.open("w") as err:
+        try:
+            subprocess.run(
+                ["python3", "-c", RAY_NODES, str(report)],
+                env=dict(env),
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=err,
+                timeout=RAY_COMMAND_TIMEOUT_S,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            err.write(f"{error}\n")
+    try:
+        return int(report.read_text())
+    except (OSError, ValueError):
+        return 0
+
+
+def ray_status(env: Mapping[str, str], cwd: pathlib.Path) -> None:
+    """`ray status` into the log, best effort."""
+    with contextlib.suppress(OSError):
+        run_command(
+            ["ray", "status"], env=env, cwd=cwd, timeout_s=RAY_COMMAND_TIMEOUT_S
+        )
+
+
+def wait_for_ray_nodes(
+    count: int,
+    *,
+    env: Mapping[str, str],
+    cwd: pathlib.Path,
+    log: Log,
+    pause: Callable[[float], None] = time.sleep,
+) -> None:
+    """Wait until `count` Ray nodes are alive with TPUs.
+
+    Raises:
+        RunError: exit 3, fewer after RAY_CLUSTER_TIMEOUT_S.
+    """
+    log.say(f"Waiting for {count} Ray nodes with TPUs")
+    deadline = time.monotonic() + RAY_CLUSTER_TIMEOUT_S
+    reported = -1
+    with tempfile.TemporaryDirectory(prefix="scenario-ray-") as scratch:
+        report = pathlib.Path(scratch, "nodes")
+        errors = pathlib.Path(scratch, "errors")
+        while True:
+            alive = ray_tpu_nodes(env, cwd, report, errors)
+            if alive >= count:
+                log.say(f"Ray cluster complete: {alive} nodes")
+                break
+            if alive != reported:
+                log.say(f"  {alive}/{count} Ray nodes with TPUs")
+                reported = alive
+            if time.monotonic() >= deadline:
+                # The head is a node with TPUs itself, so 0 means the query
+                # failed, not that nobody joined.
+                lines = errors.read_text().splitlines()[-20:]
+                if lines:
+                    log.say("Last Ray query error:\n" + "\n".join(lines))
+                ray_status(env, cwd)
+                raise RunError(
+                    BRINGUP,
+                    f"the Ray cluster had {alive} of {count} nodes with TPUs "
+                    f"after {RAY_CLUSTER_TIMEOUT_S:.0f}s",
+                )
+            pause(RAY_CLUSTER_POLL_S)
+    ray_status(env, cwd)
+
+
+def stop_ray(
+    daemons: Proc, *, env: Mapping[str, str], cwd: pathlib.Path, log: Log
+) -> None:
+    """`ray stop --force`, then whatever is left of `ray start`'s group."""
+    try:
+        done = run_command(
+            ["ray", "stop", "--force"],
+            env=env,
+            cwd=cwd,
+            timeout_s=RAY_COMMAND_TIMEOUT_S,
+        )
+        if not done.ok:
+            warning = f"ray stop --force exited {done.code}"
             log.warning(warning)
-            continue
-        raise RunError(BRINGUP, problem)
+    except OSError as error:
+        warning = f"cannot run ray stop: {error}"
+        log.warning(warning)
+    daemons.stop()
 
 
 def start_server(
@@ -120,7 +344,10 @@ def start_server(
     argv = refs.argv(host.serve.argv)
     serve_env = refs.env(host.serve.env)
     log.spawn("serve", argv, {**added, **({"env": serve_env} if serve_env else {})})
-    return Proc(argv, env={**env, **serve_env}, cwd=cwd, log=log_path).start()
+    try:
+        return Proc(argv, env={**env, **serve_env}, cwd=cwd, log=log_path).start()
+    except OSError as error:
+        raise RunError(BRINGUP, f"cannot run {argv[0]}: {error}") from None
 
 
 def wait_ready(
