@@ -237,6 +237,11 @@ def test_omni_patches_attention_and_platform(monkeypatch):
     from vllm_torchtpu.omni import patches as omni_patches
     from vllm_torchtpu.omni import platform as omni_platform
 
+    for mod in (omni_patches, omni_attn, omni_platform):
+        for attr_name, attr_val in list(vars(mod).items()):
+            if not attr_name.startswith("__"):
+                monkeypatch.setattr(mod, attr_name, attr_val, raising=False)
+
     importlib.reload(omni_patches)
     importlib.reload(omni_attn)
     importlib.reload(omni_platform)

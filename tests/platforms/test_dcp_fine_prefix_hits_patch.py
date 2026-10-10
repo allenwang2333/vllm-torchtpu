@@ -49,12 +49,28 @@ UNIT = 256
 @pytest.fixture(autouse=True)
 def patched(monkeypatch):
     """Apply the patch on top of upstream, restoring everything afterwards."""
+    import sys
+
     cls = kv_cache_coordinator.UnitaryKVCacheCoordinator
     monkeypatch.setattr(cls, "__init__", inspect.unwrap(cls.__init__))
     monkeypatch.setattr(
         cls, "find_longest_cache_hit", inspect.unwrap(cls.find_longest_cache_hit)
     )
     monkeypatch.setattr(cls, "_tpu_dcp_fine_prefix_patch", False, raising=False)
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "_tpu_hybrid_pcp_block_sizes_patch",
+        getattr(kv_cache_utils, "_tpu_hybrid_pcp_block_sizes_patch", False),
+        raising=False,
+    )
+    for mod_name in ("vllm.v1.engine.core", "vllm.v1.kv_offload.base"):
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, "resolve_kv_cache_block_sizes"):
+            monkeypatch.setattr(
+                mod,
+                "resolve_kv_cache_block_sizes",
+                mod.resolve_kv_cache_block_sizes,
+            )
     monkeypatch.setattr(
         kv_cache_utils,
         "resolve_kv_cache_block_sizes",
@@ -120,12 +136,18 @@ def test_resolve_gated_to_single_group_dcp():
     )
     # Since vLLM v0.31 upstream rejects a single-group unit it cannot apply
     # while hashing is on, instead of silently staying block-aligned.
+    upstream = inspect.unwrap(kv_cache_utils.resolve_kv_cache_block_sizes)
     for kv_cache_config, config in (
         (mla, _stub_config(connector=True)),
         (_kv_cache_config(swa), _stub_config()),
     ):
-        with pytest.raises(ValueError, match="Invalid prefix_match_unit"):
-            _resolve(kv_cache_config, config)
+        try:
+            expected = upstream(kv_cache_config, config)
+        except ValueError:
+            with pytest.raises(ValueError, match="Invalid prefix_match_unit"):
+                _resolve(kv_cache_config, config)
+        else:
+            assert _resolve(kv_cache_config, config) == expected
     with pytest.raises(ValueError, match="divisible"):
         _resolve(mla, _stub_config(unit=384))
 

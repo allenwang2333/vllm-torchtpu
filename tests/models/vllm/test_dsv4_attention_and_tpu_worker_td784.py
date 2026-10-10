@@ -699,6 +699,8 @@ def test_tpu_worker_helpers_and_init(monkeypatch: pytest.MonkeyPatch) -> None:
         SimpleNamespace(transfer_rank=7)
     ) == (3, 7)
 
+    for env_key in ("RANK", "LOCAL_RANK", "LOCAL_WORLD_SIZE", "WORLD_SIZE"):
+        monkeypatch.delenv(env_key, raising=False)
     _configure_tpu_process_env(1, 0, 4, 2)
     assert os.environ["RANK"] == "1"
     assert os.environ["WORLD_SIZE"] == "4"
@@ -771,6 +773,19 @@ def test_tpu_worker_helpers_and_init(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_tpu_worker_init_device_all_branches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    for env_key in (
+        "RANK",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "WORLD_SIZE",
+        "TPU_VISIBLE_CHIPS",
+        "TORCH_TPU_TOPOLOGY",
+        "VLLM_CACHE_ROOT",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+    ):
+        monkeypatch.delenv(env_key, raising=False)
     _patch_worker_base_init(monkeypatch, set_device_attr=True)
 
     fake_binding = SimpleNamespace(

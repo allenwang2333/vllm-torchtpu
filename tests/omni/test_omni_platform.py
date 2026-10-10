@@ -38,7 +38,8 @@ def test_register_omni_tpu_platform(monkeypatch):
     assert register_omni_tpu_platform() == "vllm_torchtpu.omni.platform.OmniTpuPlatform"
 
 
-def test_platform_attributes():
+def test_platform_attributes(monkeypatch):
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
     platform = OmniTpuPlatform()
     assert platform.device_name == "tpu"
     assert platform.device_type == "tpu"
@@ -225,6 +226,7 @@ def test_omni_tpu_patches_configuration(monkeypatch):
 
 
 def test_omni_platform_remaining_methods(monkeypatch):
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
     assert OmniTpuPlatform.supports_float64() is False
     assert OmniTpuPlatform.supports_cpu_offload() is False
     assert OmniTpuPlatform.get_device_version() is None

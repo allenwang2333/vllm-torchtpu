@@ -444,10 +444,10 @@ def test_check_and_update_config_all_branches(monkeypatch):
     monkeypatch.delenv("USE_MOE_EP_KERNEL", raising=False)
 
     # 2. VLLM_TPU_USING_PATHWAYS error
-    monkeypatch.setattr(tpu_platform.vllm_envs, "VLLM_TPU_USING_PATHWAYS", True)
+    monkeypatch.setitem(vars(tpu_platform.vllm_envs), "VLLM_TPU_USING_PATHWAYS", True)
     with pytest.raises(NotImplementedError, match="Pathways"):
         TpuPlatform.check_and_update_config(cfg)
-    monkeypatch.setattr(tpu_platform.vllm_envs, "VLLM_TPU_USING_PATHWAYS", False)
+    monkeypatch.setitem(vars(tpu_platform.vllm_envs), "VLLM_TPU_USING_PATHWAYS", False)
 
     # 3. DeepseekV4ForCausalLM + CUSTOM + NONE + kernel iter + compile_sizes + fp16
     cfg = _make_base_vllm_config()
@@ -563,7 +563,7 @@ def test_check_and_update_config_all_branches(monkeypatch):
     cfg_dp.parallel_config.enable_expert_parallel = True
     monkeypatch.setattr(mp_mh_mod, "prepare_mp_multihost_dp_env", lambda pc, ws: True)
     monkeypatch.setenv("DP_SCHED_ENABLED", "1")
-    monkeypatch.setattr(tpu_platform.envs, "DP_SCHED_ENABLED", True)
+    monkeypatch.setitem(vars(tpu_platform.envs), "DP_SCHED_ENABLED", True)
     TpuPlatform.check_and_update_config(cfg_dp)
     assert (
         cfg_dp.scheduler_config.scheduler_cls
@@ -574,7 +574,7 @@ def test_check_and_update_config_all_branches(monkeypatch):
     monkeypatch.setattr(mp_mh_mod, "prepare_mp_multihost_dp_env", lambda pc, ws: False)
     TpuPlatform.check_and_update_config(cfg_dp)
     monkeypatch.setenv("DP_SCHED_ENABLED", "0")
-    monkeypatch.setattr(tpu_platform.envs, "DP_SCHED_ENABLED", False)
+    monkeypatch.setitem(vars(tpu_platform.envs), "DP_SCHED_ENABLED", False)
     TpuPlatform.device_control_env_var = "TPU_VISIBLE_CHIPS"
 
     # 8c. multihost_backend == "ray"
@@ -598,8 +598,8 @@ def test_check_and_update_config_all_branches(monkeypatch):
             lambda cls, cfg, kv_cache_layout: SimpleNamespace(pcp_size=1, enabled=False)
         ),
     )
-    monkeypatch.setattr(
-        tpu_platform.vllm_envs, "VLLM_USE_RAY_V2_EXECUTOR_BACKEND", False
+    monkeypatch.setitem(
+        vars(tpu_platform.vllm_envs), "VLLM_USE_RAY_V2_EXECUTOR_BACKEND", False
     )
     with pytest.raises(NotImplementedError, match="Ray V2"):
         TpuPlatform.check_and_update_config(cfg_ray)
@@ -607,8 +607,8 @@ def test_check_and_update_config_all_branches(monkeypatch):
     cfg_ray.parallel_config.data_parallel_size = 1
     TpuPlatform.check_and_update_config(cfg_ray)
 
-    monkeypatch.setattr(
-        tpu_platform.vllm_envs, "VLLM_USE_RAY_V2_EXECUTOR_BACKEND", True
+    monkeypatch.setitem(
+        vars(tpu_platform.vllm_envs), "VLLM_USE_RAY_V2_EXECUTOR_BACKEND", True
     )
     cfg_ray.parallel_config.data_parallel_size = 2
     TpuPlatform.check_and_update_config(cfg_ray)
@@ -806,3 +806,22 @@ def test_find_non_ssm_backend_compatibility(monkeypatch):
         monkeypatch.delattr(Platform, "_find_non_ssm_backend")
     assert TpuPlatform._find_non_ssm_backend(cfg) is None
     assert TpuPlatform._find_non_ssm_backends(cfg) == []
+
+
+def test_platforms_init_log_tpu_info_error_branch(monkeypatch):
+    import vllm_torchtpu.platforms as platforms_pkg
+    from vllm_torchtpu import tpu_info as ti
+
+    monkeypatch.setattr(platforms_pkg, "_tpu_info_logged", False)
+
+    def _boom():
+        raise RuntimeError("no tpu info")
+
+    monkeypatch.setattr(ti, "get_node_name", _boom)
+    assert (
+        platforms_pkg.register_tpu_platform()
+        == "vllm_torchtpu.platforms.tpu_platform.TpuPlatform"
+    )
+    assert platforms_pkg._tpu_info_logged is True
+    # Second call exercises early return when _tpu_info_logged is True
+    platforms_pkg._log_tpu_info()
