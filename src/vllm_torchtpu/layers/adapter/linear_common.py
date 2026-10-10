@@ -290,7 +290,13 @@ def _init_quantized_mlp_op(swiglu_limit: float | None) -> Callable:
         if op is not None:
             return op
 
-        def _impl(x, w_gu, s_gu, w_dn, s_dn):
+        def _impl(
+            x: jax.Array,
+            w_gu: jax.Array,
+            s_gu: jax.Array,
+            w_dn: jax.Array,
+            s_dn: jax.Array,
+        ) -> jax.Array:
             return _quantized_mlp_jax(
                 x, w_gu, s_gu, w_dn, s_dn, swiglu_limit=swiglu_limit
             )
@@ -329,7 +335,14 @@ def _init_quantized_mlp_prequant_op(swiglu_limit: float | None) -> Callable:
         if op is not None:
             return op
 
-        def _impl(x_q, x_scale, w_gu, s_gu, w_dn, s_dn):
+        def _impl(
+            x_q: jax.Array,
+            x_scale: jax.Array,
+            w_gu: jax.Array,
+            s_gu: jax.Array,
+            w_dn: jax.Array,
+            s_dn: jax.Array,
+        ) -> jax.Array:
             return _quantized_mlp_prequant_jax(
                 x_q,
                 x_scale,
