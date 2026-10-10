@@ -868,3 +868,150 @@ class TestAttentionMetadataBuilderPlumbing:
         )
         stage_block_table_uploads(runner_tpu, ctx_tpu, 4)
         assert set(ctx_tpu.staged_block_tables) == {0, 1}
+
+    def test_high_conc_c96_c112_c128_slot_mapping_and_block_table_delta_prep(
+        self, monkeypatch
+    ):
+        """Verify high-concurrency C=96/112/128 (B=576/672/768, DSpark K=5)
+        51-group BlockTableDeltaStager (full -> delta -> reuse) and
+        TPUModelRunner._build_attention_metadata slot-mapping/metadata reuse.
+        """
+        from vllm.v1.worker.block_table import BlockTable
+
+        import vllm_torchtpu.layers.core.attention_metadata as am_mod
+        from vllm_torchtpu.layers.core.block_table_delta import get_stager
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+        monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "1")
+        monkeypatch.setenv("TPU_DEEPSEEK_V41_KV_SHARD", "0")
+        num_groups = 51
+        max_blocks = 256
+        active_blocks = 120
+
+        for c_reqs, b_tokens in [(96, 576), (112, 672), (128, 768)]:
+            k_sched = b_tokens // c_reqs
+            runner = self._make_runner_mock(
+                max_num_reqs=128,
+                max_num_blocks_per_req=max_blocks,
+                most_model_len=16384,
+                num_groups=num_groups,
+            )
+            block_tables = []
+            for gid in range(num_groups):
+                bt = BlockTable(
+                    block_size=16,
+                    max_num_reqs=128,
+                    max_num_blocks_per_req=max_blocks,
+                    max_num_batched_tokens=b_tokens,
+                    pin_memory=False,
+                    device=torch.device("cpu"),
+                    kernel_block_size=16,
+                    cp_kv_cache_interleave_size=1,
+                )
+                bt.get_cpu_tensor()[:c_reqs, :active_blocks] = (
+                    torch.arange(c_reqs * active_blocks, dtype=torch.int32).reshape(
+                        c_reqs, active_blocks
+                    )
+                    + gid * 100
+                )
+                bt.num_blocks_per_row[:c_reqs] = active_blocks
+                block_tables.append(bt)
+            runner.input_batch.block_table = block_tables
+            runner.empty_slot_mappings = {}
+            builders = []
+            for gid in range(num_groups):
+                b = self._make_builder(runner, kv_cache_group_id=gid)
+                b.layer_names = [f"layer_{gid}"]
+                builders.append(b)
+            self._make_attn_groups(runner, builders)
+
+            seq_lens = torch.full((c_reqs,), active_blocks * 16, dtype=torch.int32)
+            qsl = torch.arange(0, (c_reqs + 1) * k_sched, k_sched, dtype=torch.int32)
+            req_dist = torch.tensor([0, 0, c_reqs], dtype=torch.int32)
+            qsl_cpu = tuple(qsl.tolist())
+            seq_lens_cpu = tuple(seq_lens.tolist())
+            prompt_lens_cpu = tuple([1800] * c_reqs)
+
+            ctx_kwargs = dict(
+                num_reqs=c_reqs,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=seq_lens,
+                query_start_loc=qsl,
+                request_distribution=req_dist,
+                query_start_loc_cpu=qsl_cpu,
+                seq_lens_cpu=seq_lens_cpu,
+                prompt_lens_cpu=prompt_lens_cpu,
+                max_active_seq_len=active_blocks * 16,
+            )
+
+            # Step 1: initial full upload across all 51 groups.
+            runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+                **ctx_kwargs
+            )
+            meta_full, _ = TPUModelRunner._build_attention_metadata(
+                runner,
+                num_tokens=b_tokens,
+                num_reqs=c_reqs,
+                max_query_len=k_sched,
+                num_tokens_padded=b_tokens,
+                num_reqs_padded=c_reqs,
+                slot_mappings=runner.empty_slot_mappings,
+            )
+            stager = get_stager(runner)
+            assert stager.num_full == 1
+            assert stager.num_delta == 0
+            assert stager.num_reuse == 0
+            assert len(meta_full) == num_groups
+
+            # Step 2: zero-mutation step -> stager reuse + cached_tables.
+            runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+                **ctx_kwargs
+            )
+            meta_reuse, _ = TPUModelRunner._build_attention_metadata(
+                runner,
+                num_tokens=b_tokens,
+                num_reqs=c_reqs,
+                max_query_len=k_sched,
+                num_tokens_padded=b_tokens,
+                num_reqs_padded=c_reqs,
+                slot_mappings=runner.empty_slot_mappings,
+            )
+            assert stager.num_full == 1
+            assert stager.num_delta == 0
+            assert stager.num_reuse == 1
+            assert runner._attn_metadata_builder_ctx.base_attn_metadata is not None
+            for gid in range(num_groups):
+                assert torch.equal(
+                    meta_reuse[f"layer_{gid}"].block_tables,
+                    meta_full[f"layer_{gid}"].block_tables,
+                )
+
+            # Step 3: all C requests cross a block boundary together.
+            for gid, bt in enumerate(runner.input_batch.block_table):
+                for r in range(c_reqs):
+                    bt.append_row([5000 + gid * 200 + r], r)
+            runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+                **ctx_kwargs
+            )
+            meta_delta, _ = TPUModelRunner._build_attention_metadata(
+                runner,
+                num_tokens=b_tokens,
+                num_reqs=c_reqs,
+                max_query_len=k_sched,
+                num_tokens_padded=b_tokens,
+                num_reqs_padded=c_reqs,
+                slot_mappings=runner.empty_slot_mappings,
+            )
+            assert stager.num_full == 1
+            assert stager.num_delta == 1
+            assert stager.num_reuse == 1
+            for gid in range(num_groups):
+                tbl_2d = meta_delta[f"layer_{gid}"].block_tables.view(
+                    c_reqs, max_blocks
+                )
+                assert int(tbl_2d[0, active_blocks].item()) == 5000 + gid * 200
+                assert int(tbl_2d[c_reqs - 1, active_blocks].item()) == (
+                    5000 + gid * 200 + c_reqs - 1
+                )
+        assert am_mod.envs.TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD is True
