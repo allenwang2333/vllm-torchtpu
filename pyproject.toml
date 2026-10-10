@@ -52,6 +52,9 @@ dependencies = [
     # test_structured_output_spec_decode_correctness_greedy. Widening to <5.15 allows
     # vllm-torchtpu[omni] to resolve (to 5.14.x) while remaining bounded below 5.15+.
     "transformers>=5.10.4,<5.15",
+    # Bound openai below 3.0.0 to prevent resolving to broken 3.x releases
+    # that depend on unavailable httpx2.
+    "openai>=1.40.0,<3.0.0",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
