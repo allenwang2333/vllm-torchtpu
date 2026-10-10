@@ -171,7 +171,8 @@ def _build_expert_kernel(
           out_vmem [2, tile_rows, L, 128] bf16: double-buffered tile output.
           w1_ring, w2_ring, w1_scale_ring, w2_scale_ring: [nb, ...] expert
             weight ring.
-          token_window [2, window] int32 (SMEM): token numbers of a tile's rows.
+          token_window [2 * window] int32 (SMEM): token numbers of a tile's rows,
+            window slot s at [s * window, (s + 1) * window).
           act_sems [n_act], window_sems [2], out_sems [2], ring_sems [nb]: DMA.
           shared_w1_vmem, shared_w2_vmem, shared_w1_scale_vmem,
             shared_w2_scale_vmem, shared_sem: the shared expert, loaded once.
@@ -251,9 +252,12 @@ def _build_expert_kernel(
         # ---- token-number windows (routed tiles only) ----
         def window_copy(start, slot):
             aligned = pl.multiple_of(start - lax.rem(start, _LANES), _LANES)
+            lo = slot * window  # the slot's first entry in the flat ring
+            if not isinstance(lo, int):
+                lo = pl.multiple_of(lo, _LANES)
             return pltpu.make_async_copy(
                 row_token_hbm.at[pl.ds(aligned, window)],
-                token_window.at[slot],
+                token_window.at[pl.ds(lo, window)],
                 window_sems.at[slot],
             )
 
@@ -293,18 +297,22 @@ def _build_expert_kernel(
 
             @pl.when(jnp.logical_not(is_shared(v)))
             def _():
-                off = lax.rem(start, _LANES)
-
-                def block(b, carry):
+                # The carry is the flat-ring index of the block's first row,
+                # so each row costs one SMEM load at a constant offset plus
+                # its DMA (no 2-D index arithmetic per row).
+                def block(b, ptr):
+                    r0 = b * _GATHER_UNROLL
                     for u in range(_GATHER_UNROLL):
-                        r = b * _GATHER_UNROLL + u
-                        token = token_window[wslot, off + r]
+                        token = token_window[ptr + u]
                         pltpu.make_async_copy(
-                            x_hbm.at[token], act_vmem.at[slot, r], act_sems.at[slot]
+                            x_hbm.at[token],
+                            act_vmem.at[slot, r0 + u],
+                            act_sems.at[slot],
                         ).start()
-                    return carry
+                    return ptr + _GATHER_UNROLL
 
-                lax.fori_loop(0, _cdiv(tile_live(v, t), _GATHER_UNROLL), block, 0)
+                ptr0 = wslot * window + lax.rem(start, _LANES)
+                lax.fori_loop(0, _cdiv(tile_live(v, t), _GATHER_UNROLL), block, ptr0)
 
             scale_copy(start, slot).start()
 
@@ -498,7 +506,7 @@ def _build_expert_kernel(
                 pltpu.VMEM((nb, i, h), weight_dtype),
                 pltpu.VMEM((nb, 1, 2 * i), jnp.float32),
                 pltpu.VMEM((nb, 1, h), jnp.float32),
-                pltpu.SMEM((2, window), jnp.int32),
+                pltpu.SMEM((2 * window,), jnp.int32),
                 pltpu.SemaphoreType.DMA((n_act,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
