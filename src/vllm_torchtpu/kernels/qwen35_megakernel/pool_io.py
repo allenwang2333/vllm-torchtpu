@@ -91,6 +91,7 @@ def gather_gdn_states(
     active_seqs=None,
     *,
     interpret=False,
+    coal_rec_override: bool | None = None,
 ):
     """Gather initial `(conv, rec)` GDN states for `c.NS` sequences from `raw_pools`.
 
@@ -138,7 +139,11 @@ def gather_gdn_states(
     roff_is_2d = read_offsets.ndim == 2
     n_pairs = NS // 2
 
-    coal_rec = (G_PER_ATT > 0) and (NS * vh <= 128)
+    coal_rec = (
+        (G_PER_ATT > 0) and (NS * vh <= 128)
+        if coal_rec_override is None
+        else bool(coal_rec_override)
+    )
     rec_coal = max(1, G_PER_ATT) if coal_rec else 1
 
     scratch = {
@@ -477,8 +482,15 @@ def scatter_pool_states(
     active_seqs=None,
     *,
     interpret=False,
+    conv_partial=False,
 ):
     """In-place scatter of new FP8 KV tokens and per-token GDN states into `raw_pools`.
+
+    conv_partial: write only the leading conv_rows_pad bf16 rows (fp8 conv-page rows
+    [0, 0:conv_rows_pad // 2], 12 KiB at R=8) of each checkpoint slot's conv page (page
+    `c.rec_pages` of the slot) instead of the whole 64 KiB page. Every reader (gather direct_conv,
+    the fused and pool-gather megakernel paths) selects rows 0..2 of that region (jnp.where /
+    slices), so the untouched page tail is never read into values.
 
     Args:
       c: `MKConfig` geometry.
@@ -720,6 +732,21 @@ def scatter_pool_states(
                     sem_in.at[in_slot, 1],
                 ).wait()
 
+        # conv_partial: slot t = its REC_PAGES rec pages + the first CP_ROWS (4,128)-rows of its
+        # conv page, one contiguous range of the row-flattened page arrays (one DMA per slot)
+        CP_ROWS = conv_rows_pad // 2
+        SLOT_ROWS = REC_PAGES * 128 + CP_ROWS
+
+        def slot_copy(raw_out_ref, slot, t, pb_t):
+            src = page_buf.at[slot].reshape(T * GDN_PAGES * 128, 4, c.page_size)
+            dst = raw_out_ref.reshape(c.num_pages * 128, 4, c.page_size)
+            r0 = pl.multiple_of(pb_t * 128, 128)
+            return pltpu.make_async_copy(
+                src.at[pl.ds(t * GDN_PAGES * 128, SLOT_ROWS)],
+                dst.at[pl.ds(r0, SLOT_ROWS)],
+                sem_p.at[slot, t],
+            )
+
         def start_scatter_seq(raw_out_ref, sub, s, slot):
             @pl.when(is_active(s))
             def _():
@@ -768,7 +795,10 @@ def scatter_pool_states(
                             slot, pl.ds(t * conv_rows_pad, conv_rows_pad), :
                         ]
 
-                if T == 1:
+                if conv_partial:
+                    for t in range(T):
+                        slot_copy(raw_out_ref, slot, t, pb_for(sub, s, t)).start()
+                elif T == 1:
                     pb0 = pb_for(sub, s, 0)
                     pltpu.make_async_copy(
                         page_buf.at[slot],
@@ -800,7 +830,10 @@ def scatter_pool_states(
         def wait_scatter_seq(raw_out_ref, sub, s, slot):
             @pl.when(is_active(s))
             def _():
-                if T == 1:
+                if conv_partial:
+                    for t in range(T):
+                        slot_copy(raw_out_ref, slot, t, pb_for(sub, s, t)).wait()
+                elif T == 1:
                     pb0 = pb_for(sub, s, 0)
                     pltpu.make_async_copy(
                         page_buf.at[slot],
@@ -868,8 +901,9 @@ def scatter_pool_states(
             lp = lax.div(p, c.page_size)
             ln = lax.rem(p, c.page_size)
             kp = pt_ref[s_idx, lp]
-            mask_b = lane_iota == b_idx
             mask_ln = lane_iota == ln
+            # lane rotate (jnp.roll semantics) column b_idx onto lane ln
+            sh_b = lax.rem(ln + (c.page_size - lax.rem(b_idx, c.page_size)), c.page_size)
 
             pltpu.make_async_copy(
                 raw_out_refs[0].at[kp], kv_page.at[0], sem_kv_rd.at[0]
@@ -893,12 +927,8 @@ def scatter_pool_states(
 
                 k_cols = k_cols_buf[g] if NS > 1 else batch_to_i32_cols(knew_buf[g])
                 v_cols = v_cols_buf[g] if NS > 1 else batch_to_i32_cols(vnew_buf[g])
-                k_col = jnp.sum(
-                    jnp.where(mask_b, k_cols, jnp.int32(0)), axis=1, keepdims=True
-                )
-                v_col = jnp.sum(
-                    jnp.where(mask_b, v_cols, jnp.int32(0)), axis=1, keepdims=True
-                )
+                k_col = pltpu.roll(k_cols, sh_b, 1)
+                v_col = pltpu.roll(v_cols, sh_b, 1)
                 k_view = kv_page.at[k_slot, 0].bitcast(I32).reshape(64, c.page_size)
                 v_view = kv_page.at[k_slot, 1].bitcast(I32).reshape(64, c.page_size)
                 k_view[...] = jnp.where(mask_ln, k_col, k_view[...])
@@ -951,9 +981,12 @@ def scatter_pool_states(
                     @pl.when(same_page)
                     def _():
                         kp = pt_ref[s, lp0]
-                        mask_b_list = [lane_iota == (b0 + t) for t in range(T)]
-                        mask_ln_list = [
-                            lane_iota == lax.rem(pos_ref[b0 + t], c.page_size)
+                        ln_list = [lax.rem(pos_ref[b0 + t], c.page_size) for t in range(T)]
+                        mask_ln_list = [lane_iota == ln_list[t] for t in range(T)]
+                        # lane rotate (jnp.roll semantics) column b0+t onto lane ln_list[t]
+                        sh_list = [
+                            lax.rem(ln_list[t] + (c.page_size - lax.rem(b0 + t, c.page_size)),
+                                    c.page_size)
                             for t in range(T)
                         ]
 
@@ -1002,16 +1035,8 @@ def scatter_pool_states(
                             k_cur = k_view[...]
                             v_cur = v_view[...]
                             for t in range(T):
-                                k_col = jnp.sum(
-                                    jnp.where(mask_b_list[t], k_cols, jnp.int32(0)),
-                                    axis=1,
-                                    keepdims=True,
-                                )
-                                v_col = jnp.sum(
-                                    jnp.where(mask_b_list[t], v_cols, jnp.int32(0)),
-                                    axis=1,
-                                    keepdims=True,
-                                )
+                                k_col = pltpu.roll(k_cols, sh_list[t], 1)
+                                v_col = pltpu.roll(v_cols, sh_list[t], 1)
                                 k_cur = jnp.where(mask_ln_list[t], k_col, k_cur)
                                 v_cur = jnp.where(mask_ln_list[t], v_col, v_cur)
                             k_view[...] = k_cur
@@ -1307,6 +1332,7 @@ def make_flat_pooled_step(
     skip=frozenset(),
     scopes=False,
     fused_pool_io: bool | None = None,
+    coal_rec_override: bool | None = None,
 ):
     """Build a flat positional `shard_map` pooled step for `sharded_jax_callable` in `vllm_torchtpu`.
 
@@ -1331,6 +1357,18 @@ def make_flat_pooled_step(
         )
     else:
         c_paged = dataclasses.replace(c, paged_kv=True, fused_pool_io=False)
+    tiles_eff = tiles or default_tiles(c_paged)
+    use_gpr = (
+        not use_fused
+        and c_paged.T > 1
+        and c_paged.B > 16
+        and tiles_eff.gdn_rows > 0
+        and c_paged.NGDN > 0
+    )
+    if use_gpr:
+        c_paged = dataclasses.replace(
+            c_paged, act_mode="from_ckpt", ckpt_2d=False, roff_1d=False, ckpt_k=c.T
+        )
     call, info = build(
         c_paged,
         tiles,
@@ -1338,6 +1376,7 @@ def make_flat_pooled_step(
         forced_routing=False,
         skip=skip,
         scopes=scopes,
+        pool_gather=use_gpr,
     )
     tk = plan(c_paged, tiles or default_tiles(c_paged))["tk"]
     e13_shape_4d = (c_paged.EW, c_paged.H // tk["e13"], tk["e13"], 2 * c_paged.IR)
@@ -1391,17 +1430,23 @@ def make_flat_pooled_step(
             hid = out[0] if isinstance(out, (tuple, list)) else out
             return (hid, *raw_pools)
 
-        conv, rec = gather_gdn_states(
-            c_paged,
-            raw_pools,
-            ckpt_indices,
-            read_offsets,
-            active_seqs="from_ckpt",
-            interpret=interpret,
-        )
-        hid, conv_out, rec_out, knew, vnew = call(
-            pos, hidden, *w_grouped, conv, rec, raw_pools, page_table
-        )
+        if use_gpr:
+            hid, conv_out, rec_out, knew, vnew = call(
+                pos, hidden, *w_grouped, raw_pools, page_table, ckpt_indices, read_offsets
+            )
+        else:
+            conv, rec = gather_gdn_states(
+                c_paged,
+                raw_pools,
+                ckpt_indices,
+                read_offsets,
+                active_seqs="from_ckpt",
+                interpret=interpret,
+                coal_rec_override=coal_rec_override,
+            )
+            hid, conv_out, rec_out, knew, vnew = call(
+                pos, hidden, *w_grouped, conv, rec, raw_pools, page_table
+            )
         raw_out = scatter_pool_states(
             c_paged,
             raw_pools,
@@ -1414,6 +1459,7 @@ def make_flat_pooled_step(
             ckpt_indices,
             active_seqs="from_ckpt",
             interpret=interpret,
+            conv_partial=use_gpr,
         )
         return (hid, *raw_out)
 
@@ -1453,6 +1499,7 @@ def make_flat_attn_step(
         skip=skip,
         scopes=scopes,
         row_mask=True,
+        pool_gather=False,
     )
     tk = plan(c_paged, tiles or default_tiles(c_paged))["tk"]
     e13_shape_4d = (c_paged.EW, c_paged.H // tk["e13"], tk["e13"], 2 * c_paged.IR)
@@ -1524,6 +1571,7 @@ def make_pooled_step(
     skip=frozenset(),
     scopes=False,
     fused_pool_io: bool | None = None,
+    coal_rec_override: bool | None = None,
 ):
     """Build the `shard_map` decode/verify step over unified block pools `raw[0..14]`.
 
@@ -1547,6 +1595,7 @@ def make_pooled_step(
         forced_routing=forced_routing,
         skip=skip,
         scopes=scopes,
+        pool_gather=False,
     )
     tk = plan(c_paged, tiles or default_tiles(c_paged))["tk"]
     e13_shape_4d = (c_paged.EW, c_paged.H // tk["e13"], tk["e13"], 2 * c_paged.IR)
@@ -1624,7 +1673,13 @@ def make_pooled_step(
             return hid, raw_out
 
         conv, rec = gather_gdn_states(
-            c_paged, raw_in, ckpt_indices, read_offsets, active_seqs, interpret=interpret
+            c_paged,
+            raw_in,
+            ckpt_indices,
+            read_offsets,
+            active_seqs,
+            interpret=interpret,
+            coal_rec_override=coal_rec_override,
         )
         hid, conv_out, rec_out, knew, vnew = call(
             pos, hidden, *w, conv, rec, raw_in, page_table, *rb_tuple
