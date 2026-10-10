@@ -189,20 +189,47 @@ def _capped_window_indices_kernel(
     c = pl.program_id(1)
     tb = pl.program_id(2)
     idx = topk_ref[...]
+    is_padding = idx == -1
+
+    # 1. Translate logical index -> (logical sequence page, token offset within page).
+    seq_page, token_offset = _floor_divmod_const(idx, page_size)
+    logical = jnp.clip(seq_page, 0, pages_per_seq - 1)
+
+    # 2. Look up the physical page from the sequence's page table.
+    # Processed in chunks of _GATHER_PAGE_CHUNK to stay within vector register limits.
+    page = jnp.zeros_like(logical)
+    for pc in range(windows_ref.shape[1] // _GATHER_PAGE_CHUNK):
+        window_chunk = windows_ref[
+            :, pc * _GATHER_PAGE_CHUNK : (pc + 1) * _GATHER_PAGE_CHUNK
+        ]
+        local = logical - pc * _GATHER_PAGE_CHUNK
+        gathered = jnp.take_along_axis(
+            window_chunk, jnp.clip(local, 0, _GATHER_PAGE_CHUNK - 1), axis=1
+        )
+        page = jnp.where((local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered, page)
+
+    # 3. Handle empty padding slots (-1) with pseudo-random scattering.
+    # If all -1s read row 0, SparseCore would bottleneck on memory bank 0.
+    # Multiplying unique slot coordinates by large primes hashes -1s uniformly.
     row = (
         c * chunk_size
         + tb * block_tokens
         + lax.broadcasted_iota(jnp.int32, idx.shape, 0)
     )
     col = w * topk_cap + lax.broadcasted_iota(jnp.int32, idx.shape, 1)
-    out_ref[...] = _window_physical_rows(
-        idx,
-        windows_ref,
-        row * topk + col,
-        page_size=page_size,
-        pages_per_seq=pages_per_seq,
-        total_num_pages=total_num_pages,
+    flat_element_index = row * topk + col
+
+    _, scattered_page = _floor_divmod_const(
+        flat_element_index * 104729, total_num_pages
     )
+    _, scattered_offset = _floor_divmod_const(flat_element_index * 15485863, page_size)
+
+    # Use the real page/offset for valid slots; use scattered values for -1 padding.
+    page = jnp.where(is_padding, scattered_page, page)
+    token_offset = jnp.where(is_padding, scattered_offset, token_offset)
+
+    # 4. Write physical row (page * page_size + offset) straight into output layout.
+    out_ref[...] = page * page_size + token_offset
 
 
 def _window_physical_rows(
