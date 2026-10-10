@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest, parameterized
@@ -72,6 +73,11 @@ def make_inputs(
 
 # TODO: improve test coverage.
 class OProjectionTest(parameterized.TestCase):
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
     @parameterized.named_parameters(
         dict(  # DeepSeek-V4-Flash, unsharded.
             testcase_name="dsv4_flash",

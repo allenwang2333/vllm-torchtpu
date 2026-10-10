@@ -353,6 +353,8 @@ class KdaAttentionV3Test(parameterized.TestCase):
     def test_kda_matches_the_recurrence(
         self, max_reqs, q_loc, distribution, gate_lower_bound, n_v=4, prefill_only=False
     ):
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
         # K3 and Kimi-Linear both run KDA without GQA, so n_kq == n_v.
         n_kq = n_v
         d_k = d_v = 128
@@ -470,6 +472,8 @@ class KdaAttentionV3Test(parameterized.TestCase):
         recurrent state to ``base + t``; padded tail slots must remain
         untouched.
         """
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
         n_kq = n_v = num_heads
         d_k = d_v = 128
         kernel_size = 4

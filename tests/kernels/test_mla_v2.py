@@ -8,8 +8,11 @@
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from vllm_torchtpu.kernels.mla.v2.kernel import mla_ragged_paged_attention
+
+pytestmark = pytest.mark.usefixtures("requires_tpu")
 
 
 def test_query_heads_are_padded_only_in_vmem() -> None:

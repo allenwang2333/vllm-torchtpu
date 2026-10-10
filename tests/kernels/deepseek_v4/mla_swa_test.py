@@ -246,6 +246,8 @@ def ref_implementation(
 class CorrectnessTest(parameterized.TestCase):
     def setUp(self):
         super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
         self.rng = np.random.default_rng(1234)
         self.rng_key = jax.random.PRNGKey(1234)
 

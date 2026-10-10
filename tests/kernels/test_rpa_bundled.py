@@ -31,9 +31,9 @@ def _require_tpu() -> None:
     try:
         backend = jax.default_backend()
     except Exception as exc:
-        pytest.fail(f"JAX TPU backend failed to initialize: {exc}")
+        pytest.skip(f"JAX TPU backend failed to initialize: {exc}")
     if backend != "tpu":
-        pytest.fail(f"Expected JAX TPU backend, got {backend}.")
+        pytest.skip(f"Expected JAX TPU backend, got {backend}.")
 
 
 # ---------------------------------------------------------------------------

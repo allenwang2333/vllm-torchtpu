@@ -186,6 +186,11 @@ def create_cache(rng, total_pages, page_size, head_dim, kv_dtype):
 
 
 class CorrectnessTest(parameterized.TestCase):
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
     def test_correctness(self):
         rng = np.random.default_rng(1234)
 

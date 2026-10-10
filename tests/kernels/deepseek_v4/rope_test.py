@@ -96,6 +96,11 @@ def make_cos_sin_cache(max_position, rotary_dim, seed=0):
 
 # TODO: improve test coverage for the rope kernels.
 class RopeTest(parameterized.TestCase):
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
     def _run(
         self,
         shape,
@@ -159,6 +164,11 @@ class RopeTest(parameterized.TestCase):
 class RopeQuantTest(parameterized.TestCase):
     """RoPE fused with the indexer's per-row fp8 quantization."""
 
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
     @parameterized.product(
         num_tokens=(8, 64, 256),
         inverse=(False, True),
@@ -197,6 +207,11 @@ class RopeQuantTest(parameterized.TestCase):
 
 class QNormRopeTest(parameterized.TestCase):
     """RoPE fused with the per-head RMSNorm that precedes it on ``q``."""
+
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
 
     @parameterized.product(
         num_tokens=(8, 64, 256),

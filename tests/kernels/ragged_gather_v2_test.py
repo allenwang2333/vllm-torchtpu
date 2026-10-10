@@ -29,6 +29,11 @@ jax.config.parse_flags_with_absl()
 
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
 class GatherTest(jtu.JaxTestCase):
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("SparseCore ragged_gather requires TPU hardware")
+
     @parameterized.product(
         in_out_size=[(512, 400), (512, 1024)],
         start_end=[(3, 338), (10, 422)],

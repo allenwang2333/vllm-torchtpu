@@ -42,6 +42,11 @@ def reference_ragged_gather_reduce(
 
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
 class ScatterTest(jtu.JaxTestCase):
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("SparseCore ragged_gather_reduce requires TPU hardware")
+
     _test_cases = [
         dict(out_size=o, start_end=se, hidden_size=h, dtype=d, reduce_group_size=rg)
         for o, se, h, d, rg in itertools.chain(

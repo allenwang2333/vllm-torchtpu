@@ -102,6 +102,8 @@ def _decode(
 class MlaSwaStaleVmemTest(parameterized.TestCase):
     def setUp(self):
         super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
         self.kv_lens = np.array([3, 9, 17, 40, 64, 100, 127, 128])
         batch = len(self.kv_lens)
         rng = np.random.default_rng(0)

@@ -72,6 +72,11 @@ def create_rope_cache():
 
 
 class GatherTest(parameterized.TestCase):
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
     @parameterized.parameters(
         (256, 256),
         (4096, 256),

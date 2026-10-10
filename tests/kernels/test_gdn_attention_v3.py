@@ -271,6 +271,11 @@ def gdn_attention_spec_ref(
 
 
 class GDNAttentionTest(parameterized.TestCase):
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
     @parameterized.named_parameters(
         dict(
             testcase_name="prefill",

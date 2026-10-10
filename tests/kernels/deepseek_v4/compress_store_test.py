@@ -96,6 +96,8 @@ class CompressStoreTest(jtu.JaxTestCase):
         interpret=False,
         hidden_size=7168,
     ):
+        if not interpret and jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
         # Create config first
         if head_dim == 128:
             mode = config.Mode.CSA_INDEXER

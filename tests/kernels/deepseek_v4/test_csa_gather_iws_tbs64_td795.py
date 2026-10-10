@@ -117,6 +117,7 @@ def test_lookup_keys_power_of_two_without_rerounding(
 
 @pytest.mark.cpu_test
 def test_missing_tuned_entry_logs_warning_with_keys(monkeypatch):
+    tbs64.get_tuned_block_sizes.cache_clear()
     monkeypatch.setattr(tbs64, "get_tpu_version", lambda: 6)
     monkeypatch.setattr(tbs64, "get_device_name", lambda: "TPU unknown")
     calls = []
@@ -126,6 +127,7 @@ def test_missing_tuned_entry_logs_warning_with_keys(monkeypatch):
     assert tbs64.get_tuned_block_sizes(
         jnp.bfloat16, jnp.bfloat16, 8, 2, 64, 128, 4096, 32
     ) == (2048 // 128, 32)
+    tbs64.get_tuned_block_sizes.cache_clear()
     assert len(calls) == 1
     msg, args = calls[0]
     assert "%s" in msg
@@ -134,26 +136,32 @@ def test_missing_tuned_entry_logs_warning_with_keys(monkeypatch):
 
 @pytest.mark.cpu_test
 def test_tpu_version_below_4_raises(monkeypatch):
+    tbs64.get_tuned_block_sizes.cache_clear()
     monkeypatch.setattr(tbs64, "get_tpu_version", lambda: 3)
     with pytest.raises(NotImplementedError, match="TPU version must be 4 or higher"):
         tbs64.get_tuned_block_sizes(jnp.bfloat16, jnp.bfloat16, 8, 2, 64, 128, 4096, 32)
+    tbs64.get_tuned_block_sizes.cache_clear()
 
 
 @pytest.mark.cpu_test
 def test_tpu_version_4_and_7_and_hit(monkeypatch):
+    tbs64.get_tuned_block_sizes.cache_clear()
     monkeypatch.setattr(tbs64, "get_tpu_version", lambda: 4)
     monkeypatch.setattr(tbs64, "get_device_name", lambda: "TPU unknown")
     assert tbs64.get_tuned_block_sizes(
         jnp.bfloat16, jnp.bfloat16, 8, 2, 64, 128, 4096, 32
     ) == (512 // 128, 32)
 
+    tbs64.get_tuned_block_sizes.cache_clear()
     monkeypatch.setattr(tbs64, "get_tpu_version", lambda: 7)
     assert tbs64.get_tuned_block_sizes(
         jnp.bfloat16, jnp.bfloat16, 8, 2, 64, 128, 4096, 32
     ) == (min(32, 4096 // 128), 32)
 
+    tbs64.get_tuned_block_sizes.cache_clear()
     monkeypatch.setattr(tbs64, "get_tpu_version", lambda: 5)
     monkeypatch.setattr(tbs64, "get_device_name", lambda: "TPU v5e")
     assert tbs64.get_tuned_block_sizes(
         jnp.bfloat16, jnp.bfloat16, 8, 2, 64, 128, 4096, 32
     ) == (16, 32)
+    tbs64.get_tuned_block_sizes.cache_clear()
