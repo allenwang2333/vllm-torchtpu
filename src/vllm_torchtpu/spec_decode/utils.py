@@ -39,6 +39,16 @@ def tp_local_argmax_logits(
     )
     if bias_local is not None:
         logits_local = logits_local + bias_local
+    valid_cols = int(
+        lm_head.shard_indices.org_vocab_end_index
+        - lm_head.shard_indices.org_vocab_start_index
+    )
+    if valid_cols < logits_local.shape[-1]:
+        col_mask = (
+            torch.arange(logits_local.shape[-1], device=logits_local.device)
+            >= valid_cols
+        )
+        logits_local = logits_local.masked_fill(col_mask, float("-inf"))
     local_val, local_idx = logits_local.max(dim=-1)
     start_idx = int(lm_head.shard_indices.org_vocab_start_index)
     global_idx = local_idx.to(torch.int32) + start_idx
@@ -52,6 +62,97 @@ def tp_local_argmax_logits(
     all_idxs = gathered[..., 1]
     best_rank = all_vals.argmax(dim=0, keepdim=True)
     return all_idxs.gather(0, best_rank).squeeze(0).to(torch.int64)
+
+
+def tp_local_topk_logits(
+    logits_processor,
+    lm_head: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    k_top: int,
+) -> torch.Tensor:
+    """Compute exact global logsumexp + max tie rank + top-k (values, token_ids) with 128-lane aligned ICI gather."""
+    k_eff = max(int(k_top), 1)
+    tp_size = getattr(lm_head, "tp_size", 1)
+    if tp_size <= 1:
+        logits = logits_processor(lm_head, hidden_states)
+        lse = torch.logsumexp(logits.to(torch.float32), dim=-1, keepdim=True)
+        top_v, top_i = torch.topk(logits, k_eff, dim=-1)
+        exact_rank = (logits >= top_v[:, 0:1]).sum(
+            dim=-1, keepdim=True, dtype=torch.int32
+        )
+        return torch.cat(
+            [
+                lse.view(torch.int32),
+                exact_rank,
+                top_v.to(torch.float32).view(torch.int32),
+                top_i.to(torch.int32),
+            ],
+            dim=-1,
+        )
+
+    logits_local = logits_processor._get_logits(
+        hidden_states, lm_head, None, skip_gather=True
+    )
+    valid_cols = int(
+        lm_head.shard_indices.org_vocab_end_index
+        - lm_head.shard_indices.org_vocab_start_index
+    )
+    if valid_cols < logits_local.shape[-1]:
+        col_mask = (
+            torch.arange(logits_local.shape[-1], device=logits_local.device)
+            >= valid_cols
+        )
+        logits_local = logits_local.masked_fill(col_mask, float("-inf"))
+    local_lse = torch.logsumexp(logits_local.to(torch.float32), dim=-1, keepdim=True)
+    local_v, local_i = torch.topk(logits_local, k_eff, dim=-1)
+    local_ties = (logits_local >= local_v[:, 0:1]).sum(
+        dim=-1, keepdim=True, dtype=torch.int32
+    )
+    start_idx = int(lm_head.shard_indices.org_vocab_start_index)
+    global_i = local_i.to(torch.int32) + start_idx
+    packed = torch.cat(
+        [
+            local_lse.view(torch.int32),
+            local_ties,
+            local_v.to(torch.float32).view(torch.int32),
+            global_i,
+        ],
+        dim=-1,
+    )
+    n_rows, raw_width = packed.shape[0], packed.shape[1]
+    pad_width = ((raw_width + 127) // 128) * 128
+    packed_aligned = (
+        torch.nn.functional.pad(packed, (0, pad_width - raw_width))
+        if pad_width > raw_width
+        else packed
+    )
+    gathered = tp_all_gather(packed_aligned, dim=0).view(
+        tp_size, n_rows, pad_width
+    )[..., :raw_width]
+    all_lse = gathered[..., 0:1].view(torch.float32)
+    global_lse = torch.logsumexp(all_lse, dim=0)
+    merged_v = (
+        gathered[..., 2 : 2 + k_eff]
+        .view(torch.float32)
+        .permute(1, 0, 2)
+        .reshape(n_rows, tp_size * k_eff)
+    )
+    merged_i = (
+        gathered[..., 2 + k_eff :]
+        .permute(1, 0, 2)
+        .reshape(n_rows, tp_size * k_eff)
+    )
+    top_v, sel = torch.topk(merged_v, k_eff, dim=-1)
+    top_i = merged_i.gather(-1, sel)
+    shard_max = gathered[..., 2:3].view(torch.float32)
+    shard_ties = gathered[..., 1:2]
+    exact_rank = torch.where(
+        shard_max == top_v[:, 0:1].unsqueeze(0), shard_ties, 0
+    ).sum(dim=0, dtype=torch.int32)
+    return torch.cat(
+        [global_lse.view(torch.int32), exact_rank, top_v.view(torch.int32), top_i],
+        dim=-1,
+    )
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.core.attention_metadata import (

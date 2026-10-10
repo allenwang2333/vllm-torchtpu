@@ -538,8 +538,17 @@ def stage_block_table_uploads(
         return
 
     unified_mamba = ctx.mamba_state_indices is None and runner._unified_kv_layout
+    mamba_geom: list[tuple[int, int, int]] = []
+    mamba_entry_indices: list[int] = []
+    if unified_mamba:
+        for i, builder in enumerate(entry_builders):
+            if builder.is_mamba_group:
+                mamba_geom.append((i, entries[i][2], builder.target_block_size))
+                mamba_entry_indices.append(i)
+
     if ctx.start_index > 0:
         runner._block_tables_dirty = True
+        runner._block_tables_append_only = False
     bt_cache_key = (
         ctx.start_index,
         ctx.num_reqs,
@@ -547,11 +556,14 @@ def stage_block_table_uploads(
         ctx.use_max_model_len,
         tuple((gid, tnb) for gid, _, tnb in entries),
     )
-    if (
+    can_cache_bt = (
         ctx.position_ids_override is None
-        and ctx.mamba_ckpt_window <= 1
+        and (not mamba_geom or ctx.mamba_ckpt_window <= 1)
         and gids is None
         and ctx.start_index == 0
+    )
+    if (
+        can_cache_bt
         and not getattr(runner, "_block_tables_dirty", True)
         and getattr(runner, "_cached_bt_key", None) == bt_cache_key
         and getattr(runner, "_cached_staged_block_tables", None) is not None
@@ -580,21 +592,62 @@ def stage_block_table_uploads(
             (full_total,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
         )
         runner._block_table_stage_cpu = scratch
+        runner._block_tables_append_only = False
     flat = scratch[:total]
-    flat.zero_()
 
-    if ctx.position_ids_override is None:
+    stage_layout_key = (
+        row_bucket,
+        tuple(upload_cols),
+        ctx.num_reqs,
+        tuple(runner.input_batch.req_ids[: ctx.num_reqs])
+        if getattr(runner, "input_batch", None) is not None
+        else (),
+        tuple(id(bt) for _, bt, _ in entries),
+    )
+    prev_nbpr_map = getattr(runner, "_bt_prev_nbpr", None)
+    use_incremental = (
+        can_cache_bt
+        and getattr(runner, "_block_tables_append_only", False)
+        and getattr(runner, "_cached_bt_stage_layout", None) == stage_layout_key
+        and prev_nbpr_map is not None
+        and all(
+            getattr(bt, "num_blocks_per_row", None) is not None
+            and gid in prev_nbpr_map
+            for gid, bt, _ in entries
+        )
+    )
+    if use_incremental:
+        flat_np = flat.numpy()
         offset = 0
-        for (_, block_table_obj, _), cols_g in zip(entries, upload_cols):
-            rows = flat[offset : offset + row_bucket * cols_g].view(
-                row_bucket, cols_g
-            )
-            source = block_table_obj.get_cpu_tensor()
-            rows[: ctx.num_reqs] = source[
-                ctx.start_index : ctx.start_index + ctx.num_reqs, :cols_g
-            ]
+        for (gid, block_table_obj, _), cols_g in zip(entries, upload_cols):
+            prev_nbpr = prev_nbpr_map[gid]
+            cur_nbpr = block_table_obj.num_blocks_per_row[: ctx.num_reqs]
+            changed = (cur_nbpr != prev_nbpr).nonzero()[0]
+            if changed.size > 0:
+                rows_np = flat_np[offset : offset + row_bucket * cols_g].reshape(
+                    row_bucket, cols_g
+                )
+                src_np = block_table_obj.get_numpy_array()
+                for r in changed:
+                    c0 = int(prev_nbpr[r])
+                    c1 = min(cols_g, int(cur_nbpr[r]))
+                    if c0 < c1:
+                        rows_np[r, c0:c1] = src_np[r, c0:c1]
+                prev_nbpr[:] = cur_nbpr
             offset += row_bucket * cols_g
-    # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
+    else:
+        flat.zero_()
+        if ctx.position_ids_override is None:
+            offset = 0
+            for (_, block_table_obj, _), cols_g in zip(entries, upload_cols):
+                rows = flat[offset : offset + row_bucket * cols_g].view(
+                    row_bucket, cols_g
+                )
+                source = block_table_obj.get_cpu_tensor()
+                rows[: ctx.num_reqs] = source[
+                    ctx.start_index : ctx.start_index + ctx.num_reqs, :cols_g
+                ]
+                offset += row_bucket * cols_g
 
     staged_dev = flat.to(runner.device, non_blocking=True)
 
@@ -609,34 +662,27 @@ def stage_block_table_uploads(
         )
         offset += row_bucket * cols_g
 
-    # Mirror of build()'s branch order: the compact path
-    # (ctx.mamba_state_indices) wins, otherwise the unified layout derives
-    # per-group indices — which is what this precompute batches.
-    mamba_geom: list[tuple[int, int, int]] = []
-    mamba_entry_indices: list[int] = []
-    if unified_mamba:
-        for i, builder in enumerate(entry_builders):
-            if builder.is_mamba_group:
-                mamba_geom.append((i, entries[i][2], builder.target_block_size))
-                mamba_entry_indices.append(i)
-
     if (
         len(entries) == 1
         and not mamba_geom
         and row_bucket == num_reqs_padded
         and upload_cols[0] == entries[0][2]
     ):
-        # Exactly one group with no mamba derivation and no 2D compaction:
-        # the flat upload is already the complete table view; avoid launching
-        # an unnecessary device clone program.
         gid, _, target_num_blocks = entries[0]
         length = num_reqs_padded * target_num_blocks
         ctx.staged_block_tables = {gid: staged_dev[:length]}
-        if ctx.position_ids_override is None and gids is None and ctx.start_index == 0:
+        if can_cache_bt:
             runner._cached_bt_key = bt_cache_key
+            runner._cached_bt_stage_layout = stage_layout_key
             runner._cached_staged_block_tables = ctx.staged_block_tables
             runner._cached_staged_mamba_products = None
+            runner._bt_prev_nbpr = {
+                g: bt.num_blocks_per_row[: ctx.num_reqs].copy()
+                for g, bt, _ in entries
+                if getattr(bt, "num_blocks_per_row", None) is not None
+            }
             runner._block_tables_dirty = False
+            runner._block_tables_append_only = True
         return
 
     if staged_dev.device.type == "tpu":
@@ -669,16 +715,18 @@ def stage_block_table_uploads(
             entries[ei][0]: (states[j], ckpts[j] if has_ckpt else None)
             for j, ei in enumerate(mamba_entry_indices)
         }
-    if (
-        ctx.position_ids_override is None
-        and ctx.mamba_ckpt_window <= 1
-        and gids is None
-        and ctx.start_index == 0
-    ):
+    if can_cache_bt:
         runner._cached_bt_key = bt_cache_key
+        runner._cached_bt_stage_layout = stage_layout_key
         runner._cached_staged_block_tables = ctx.staged_block_tables
         runner._cached_staged_mamba_products = ctx.staged_mamba_products
+        runner._bt_prev_nbpr = {
+            g: bt.num_blocks_per_row[: ctx.num_reqs].copy()
+            for g, bt, _ in entries
+            if getattr(bt, "num_blocks_per_row", None) is not None
+        }
         runner._block_tables_dirty = False
+        runner._block_tables_append_only = True
 
 
 @torch.no_grad()

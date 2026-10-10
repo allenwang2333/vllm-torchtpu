@@ -140,6 +140,7 @@ from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     normalize_draft_config,
     tp_local_argmax_logits,
+    tp_local_topk_logits,
 )
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
@@ -2411,17 +2412,25 @@ class TPUModelRunner(GPUModelRunner):
             nb is not None and any(b for b in nb)
             for nb in scheduler_output.scheduled_cached_reqs.new_block_ids
         )
-        if (
+        structural_dirty = bool(
             invalidated_req_ids
+            or scheduler_output.finished_req_ids
             or scheduler_output.scheduled_new_reqs
             or len(scheduler_output.num_scheduled_tokens) != prev_num_reqs
-            or has_new_blocks
             or copies
-        ):
+        )
+        if structural_dirty:
             self._block_tables_dirty = True
+            self._block_tables_append_only = False
+        elif has_new_blocks:
+            self._block_tables_dirty = True
+            self._block_tables_append_only = getattr(
+                self, "_block_tables_append_only", False
+            )
         result = super()._update_states(base_output)
         if len(self.input_batch.req_id_to_index) != prev_num_reqs:
             self._block_tables_dirty = True
+            self._block_tables_append_only = False
         # Copy after the base zeroes new blocks (the CoW dst is one of them).
         if use_page_local_copy:
             self._apply_kv_cache_block_copies(copies)
@@ -4002,13 +4011,22 @@ class TPUModelRunner(GPUModelRunner):
                             hidden_states, layout_plan, logits_indices
                         )
                     )
+                    has_lm_head = (
+                        getattr(self.model, "lm_head", None) is not None
+                        and getattr(self.model, "logits_processor", None) is not None
+                    )
                     can_tp_local_greedy = (
-                        self.input_batch.all_greedy
+                        has_lm_head
+                        and self.input_batch.all_greedy
                         and self.input_batch.max_num_logprobs is None
                         and not scheduler_output.has_structured_output_requests
-                        and getattr(self.model, "lm_head", None) is not None
-                        and getattr(self.model.lm_head, "tp_size", 1) > 1
-                        and getattr(self.model, "logits_processor", None) is not None
+                    )
+                    can_tp_local_topk = (
+                        has_lm_head
+                        and self.input_batch.all_greedy
+                        and self.input_batch.max_num_logprobs is not None
+                        and spec_decode_metadata is None
+                        and not scheduler_output.has_structured_output_requests
                     )
                     if sample_hidden_states is None:
                         hidden_states = sequence_layout_planner.finalize_hidden_states(
@@ -4019,12 +4037,20 @@ class TPUModelRunner(GPUModelRunner):
                             logits = self.compute_selected_argmax(
                                 hidden_states, logits_indices
                             )
+                        elif can_tp_local_topk:
+                            logits = self.compute_selected_topk_logprobs(
+                                hidden_states, logits_indices
+                            )
                         else:
                             logits = self.compute_selected_logits(
                                 hidden_states, logits_indices
                             )
                     elif can_tp_local_greedy:
                         logits = self.compute_argmax_from_hidden_states(
+                            sample_hidden_states
+                        )
+                    elif can_tp_local_topk:
+                        logits = self.compute_topk_logprobs_from_hidden_states(
                             sample_hidden_states
                         )
                     else:
@@ -4280,6 +4306,9 @@ class TPUModelRunner(GPUModelRunner):
         """argmax logits, only used when `all_greedy` is True."""
         if logits.ndim == 1:
             return logits.unsqueeze(-1).to(torch.int64)
+        if logits.dtype == torch.int32:
+            k_eff = (logits.shape[1] - 2) // 2
+            return logits[:, 2 + k_eff : 2 + k_eff + 1].to(torch.int64)
         dummy = torch.empty((1, 1), dtype=logits.dtype, device=logits.device)
         return self.sample_from_logits_func(
             logits,
@@ -5708,7 +5737,7 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_compute_selected_logits(self) -> None:
         hsize = self.model_config.get_hidden_size()
         has_tp_local = (
-            getattr(getattr(self.model, "lm_head", None), "tp_size", 1) > 1
+            getattr(self.model, "lm_head", None) is not None
             and getattr(self.model, "logits_processor", None) is not None
         )
         max_spec_logits_len = 0
@@ -5730,7 +5759,10 @@ class TPUModelRunner(GPUModelRunner):
                     synchronize_tensors(out)
                     if has_tp_local:
                         out_arg = self.compute_selected_argmax(dummy_hidden, indices)
-                        synchronize_tensors(out_arg)
+                        out_topk = self.compute_selected_topk_logprobs(
+                            dummy_hidden, indices
+                        )
+                        synchronize_tensors([out_arg, out_topk])
                     logger.info(
                         "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs
                     )
@@ -5749,7 +5781,7 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
         has_tp_local = (
-            getattr(getattr(self.model, "lm_head", None), "tp_size", 1) > 1
+            getattr(self.model, "lm_head", None) is not None
             and getattr(self.model, "logits_processor", None) is not None
         )
         with self._precompile_timed("compute_logits_from_hidden_states"):
@@ -5762,7 +5794,10 @@ class TPUModelRunner(GPUModelRunner):
                 synchronize_tensors(out)
                 if has_tp_local:
                     out_arg = self.compute_argmax_from_hidden_states(dummy_hidden)
-                    synchronize_tensors(out_arg)
+                    out_topk = self.compute_topk_logprobs_from_hidden_states(
+                        dummy_hidden
+                    )
+                    synchronize_tensors([out_arg, out_topk])
                 logger.info("  -- num_seqs: %d", num_reqs)
 
     def _precompile_structured_decoding(self) -> None:
@@ -5837,13 +5872,26 @@ class TPUModelRunner(GPUModelRunner):
             synchronize_device()
 
     def _precompile_gather_logprobs(self) -> None:
+        k_eff = max(int(self.model_config.max_logprobs), 1)
+        compact_width = 2 + 2 * k_eff
         with self._precompile_timed("gather_logprobs"):
             for num_reqs in self.num_reqs_paddings:
+                dummy_tok = torch.zeros(
+                    (num_reqs, 1), dtype=torch.int64, device=self.device
+                )
                 out = self.gather_logprobs(
                     self._dummy_logits(num_reqs),
-                    torch.zeros((num_reqs, 1), dtype=torch.int64).to(self.device),
+                    dummy_tok,
                 )
-                synchronize_tensors(out.logprobs)
+                out_compact = self.gather_logprobs(
+                    torch.zeros(
+                        (num_reqs, compact_width),
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    dummy_tok,
+                )
+                synchronize_tensors([out.logprobs, out_compact.logprobs])
                 logger.info("  -- num_seqs: %d", num_reqs)
 
     def _precompile_spec_logprobs(self) -> None:
@@ -5920,43 +5968,16 @@ class TPUModelRunner(GPUModelRunner):
                     logger.info("  -- num_tokens: %d, next_len: %d", num_tokens, nlen)
 
     def _precompile_rejection_sampler(self) -> None:
-        """Warm the spec-decode verify path so it doesn't recompile at runtime.
-
-        The rejection sampler is ``@torch.compile(backend="tpu",
-        dynamic=False)`` -> a fresh graph per input shape, and the
-        ``logits[...]`` gathers around it are eager. None are covered by
-        ``_precompile_sampling_subgraphs`` (non-spec sampling only) or
-        ``drafter.precompile()`` (draft forward only), so they recompile every
-        time the verify length (``padded_logits_length``) lands in a new
-        num-tokens bucket as requests finish and the batch shrinks. Replay the
-        verify inner body (``_sample_spec_verify_chunk``) at every
-        ``(padded_logits_length, padded_num_reqs)`` bucket the runtime can
-        produce so the real call is a cache hit. Shared sync + async.
-
-        Both verify sub-branches are distinct ``dynamic=False`` graphs, so warm
-        each: greedy (``do_sampling=False`` ->
-        ``_greedy_rejection_sample_with_segment``, prelude
-        ``spec_bonus_and_target_logits``) and non-greedy (``do_sampling=True``
-        -> ``_random_rejection_sample_with_segment``, prelude
-        ``spec_gather_bonus_and_target_logits``). Which one runs is decided per
-        step by ``input_batch.all_greedy`` and ``grammar_output``, so both are
-        reachable and must be pre-compiled here; the greedy + structured-output
-        combination reuses graphs warmed by these two passes.
-        """
+        """Warm the spec-decode verify path so it doesn't recompile at runtime."""
         if not (self._is_async_drafter):
             return
         k = self.speculative_config.num_speculative_tokens
-        # The verify chunk samples at most num_reqs*(K+1) positions; bound the
-        # padded_logits_length sweep to the bucket that covers the full batch.
-        # Use min here because num_reqs*(K+1) can exceed max_num_batched_tokens
-        # (which is the largest bucket), and logits rows never exceed the largest
-        # bucket.
         max_logits_len = _get_padded_token_len(
             self.num_tokens_paddings,
             min(self.max_num_reqs * (k + 1), self.num_tokens_paddings[-1]),
         )
         has_tp_local = (
-            getattr(getattr(self.model, "lm_head", None), "tp_size", 1) > 1
+            getattr(self.model, "lm_head", None) is not None
             and getattr(self.model, "logits_processor", None) is not None
         )
         with self._precompile_timed("rejection_sampler"):
@@ -7144,6 +7165,18 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_selected_topk_logprobs(
+        self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
+    ) -> torch.Tensor:
+        selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        return tp_local_topk_logits(
+            self.model.logits_processor,
+            self.model.lm_head,
+            selected,
+            self.model_config.max_logprobs,
+        )
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_logits_from_hidden_states(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -7155,6 +7188,17 @@ class TPUModelRunner(GPUModelRunner):
     ) -> torch.Tensor:
         return tp_local_argmax_logits(
             self.model.logits_processor, self.model.lm_head, hidden_states
+        )
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_topk_logprobs_from_hidden_states(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        return tp_local_topk_logits(
+            self.model.logits_processor,
+            self.model.lm_head,
+            hidden_states,
+            self.model_config.max_logprobs,
         )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -7241,13 +7285,6 @@ class TPUModelRunner(GPUModelRunner):
         bonus_logits_indices: torch.Tensor,
         target_logits_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Spec-decode verify prelude: gather the bonus-token logits + argmax, and
-        # gather the target_logits rows for the rejection sampler, in ONE compiled
-        # region keyed on [num_tokens, num_reqs] shapes. Run raw (the
-        # logits[indices] gathers + argmax at the verify site), these are eager
-        # ops torch-tpu's DEFER_AND_FUSE fuses with the live per-step dispatch
-        # into per-context programs (the cold target-side recompiles). index_select
-        # is value-identical to logits[indices]. Same pattern as the draft wraps.
         bonus_token_ids = torch.argmax(
             torch.index_select(logits, 0, bonus_logits_indices), dim=-1
         )
@@ -7261,14 +7298,6 @@ class TPUModelRunner(GPUModelRunner):
         bonus_logits_indices: torch.Tensor,
         target_logits_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Non-greedy verify prelude: gather the bonus-token logits and the
-        # target_logits rows in ONE compiled region keyed on [num_reqs,
-        # num_tokens] shapes. Unlike the greedy spec_bonus_and_target_logits,
-        # the bonus row is kept as FULL logits (not argmax'd) because the
-        # non-greedy path samples the bonus token from them. Run raw, the
-        # logits[indices] gathers are eager ops torch-tpu's DEFER_AND_FUSE fuses
-        # with the live per-step dispatch into per-context programs (cold
-        # recompiles).index_select is value-identical to logits[indices].
         bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_logits, target_logits
@@ -7329,13 +7358,37 @@ class TPUModelRunner(GPUModelRunner):
         of logprobs as an alternative to having multiple pre-compiled graphs.
         Select the number of logprobs actually demanded by each request on CPU.
         """
+        max_logprobs = self.model_config.max_logprobs
+        if logits.dtype == torch.int32:
+            k_eff = (logits.shape[1] - 2) // 2
+            log_normalizers = logits[:, 0:1].view(torch.float32)
+            token_ranks = logits[:, 1:2]
+            topk_logits = logits[:, 2 : 2 + k_eff].view(torch.float32)
+            topk_indices = logits[:, 2 + k_eff : 2 + 2 * k_eff]
+            token_logits = topk_logits[:, 0:1]
+            token_ids = topk_indices[:, 0:1]
+            token_logprobs = token_logits - log_normalizers
+            if max_logprobs > 0:
+                topk_lp = topk_logits[:, :max_logprobs] - log_normalizers
+                logprob_token_ids = torch.cat(
+                    (token_ids, topk_indices[:, :max_logprobs]), dim=1
+                )
+                logprobs = torch.cat((token_logprobs, topk_lp), dim=1)
+            else:
+                logprob_token_ids = token_ids
+                logprobs = token_logprobs
+            return LogprobsTensors(
+                logprob_token_ids=logprob_token_ids,
+                logprobs=logprobs,
+                selected_token_ranks=token_ranks,
+            )
+
         token_ids = sampled_tokens.to(torch.int64)
         token_logits = logits.gather(-1, token_ids)
         token_ranks = (logits >= token_logits).sum(dim=-1, dtype=torch.int32)
         log_normalizers = torch.logsumexp(logits, dim=-1, keepdim=True)
         token_logprobs = (token_logits - log_normalizers).to(torch.float32)
 
-        max_logprobs = self.model_config.max_logprobs
         if max_logprobs > 0:
             topk_logits, topk_indices = torch.topk(logits, max_logprobs, dim=-1)
             topk_logprobs = (topk_logits - log_normalizers).to(torch.float32)
