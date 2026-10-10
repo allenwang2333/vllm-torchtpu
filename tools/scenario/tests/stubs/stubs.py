@@ -15,7 +15,8 @@
 
 Run as `python stubs.py <program> <args...>` from a shell shim per program
 name (runtime_helpers.stub_env writes them). Every call is recorded as one
-JSON file under $STUB_RECORDS: the program, argv, env, cwd and pid.
+JSON file under $STUB_RECORDS: the program, argv, env, cwd, pid and soft
+core-file limit.
 
 `vllm serve` is a small OpenAI-compatible HTTP server: /health,
 /v1/models, /v1/completions, /v1/chat/completions and /metrics, plus
@@ -69,6 +70,7 @@ import http.server
 import json
 import os
 import pathlib
+import resource
 import signal
 import sys
 import threading
@@ -88,6 +90,7 @@ def record(program: str, argv: list[str], **extra: Any) -> None:
         "env": dict(os.environ),
         "cwd": os.getcwd(),
         "pid": os.getpid(),
+        "core_limit": resource.getrlimit(resource.RLIMIT_CORE)[0],
         **extra,
     }
     path = pathlib.Path(RECORDS) / f"{time.time_ns()}-{os.getpid()}.json"

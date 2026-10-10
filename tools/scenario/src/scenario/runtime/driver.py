@@ -21,7 +21,8 @@ Tasks run in the Plan's order. A failed task does not stop the next one; a
 dead server does (exit 5), and so does a custom task's skip_rest_if_exit_ge.
 SIGTERM or SIGINT stops every child (20 s, then SIGKILL) and exits 143 or
 130 without after-tasks. Otherwise, after teardown, the target's end
-after-tasks run, and a fatal one that fails turns exit 0 into 6.
+after-tasks run, and a fatal one that fails turns exit 0 into 6. Core dumps
+are off for the run and everything it starts.
 """
 
 import datetime
@@ -66,7 +67,7 @@ from scenario.runtime.placement import (
     decode_target_data,
     place,
 )
-from scenario.runtime.proc import Proc
+from scenario.runtime.proc import Proc, disable_core_dumps
 from scenario.runtime.publish import Publisher
 from scenario.target import TargetData, TargetInfo
 
@@ -179,6 +180,7 @@ class Driver:
     def run(self) -> int:
         code = exits.OK
         aborted = False
+        disable_core_dumps()
         with Signals() as signals:
             self.signals = signals
             try:

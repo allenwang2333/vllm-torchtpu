@@ -15,6 +15,7 @@
 
 import os
 import pathlib
+import resource
 import signal
 import subprocess
 import sys
@@ -194,6 +195,17 @@ def test_exit_status_names_signals() -> None:
     assert proc.exit_status(0) == 0
     assert proc.exit_status(3) == 3
     assert proc.exit_status(-signal.SIGTERM) == 143
+
+
+def test_children_get_no_core_dumps() -> None:
+    hard = resource.getrlimit(resource.RLIMIT_CORE)[1]
+    proc.disable_core_dumps()
+    query = "import resource; print(*resource.getrlimit(resource.RLIMIT_CORE))"
+    done = subprocess.run(
+        [sys.executable, "-c", query], capture_output=True, text=True, check=True
+    )
+    # The hard limit stays, so a child may raise its own soft limit.
+    assert done.stdout.split() == ["0", str(hard)]
 
 
 SUPERVISED = textwrap.dedent(

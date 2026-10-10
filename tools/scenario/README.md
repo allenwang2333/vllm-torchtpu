@@ -218,10 +218,11 @@ fleet target will live in `.buildkite/kubernetes/scenario/` as well.
 4. stops the server's whole process group, and exits with a code that names
    what failed.
 
-A failed task does not stop the next one; a dead server does. The run
-directory is `<results root>/<name>`, plus `/<point>` for a sweep point; the
-root is `--results-dir`, else the target's, else
-`./scenario-results/<name>-<UTC stamp>`.
+A failed task does not stop the next one; a dead server does. Core dumps
+are off for the run and everything it starts: a TPU server's core is about
+the size of its host memory. The run directory is `<results root>/<name>`,
+plus `/<point>` for a sweep point; the root is `--results-dir`, else the
+target's, else `./scenario-results/<name>-<UTC stamp>`.
 
 | Exit | Meaning |
 |---|---|

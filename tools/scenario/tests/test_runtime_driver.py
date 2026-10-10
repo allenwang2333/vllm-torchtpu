@@ -114,6 +114,8 @@ def test_a_run_serves_drives_and_tears_down(tmp_path: pathlib.Path) -> None:
     assert served["env"]["TINY_KNOB"] == "1"
     assert served["env"]["VLLM_ENGINE_READY_TIMEOUT_S"] == "600"
     assert served["env"]["TPU_ACCELERATOR_TYPE"] == "tpu7x"
+    # Core dumps are off for everything the run starts.
+    assert served["core_limit"] == 0
     assert "INFO stub: serving test/tiny" in (out / "server.log").read_text()
     assert no_stray_processes(env)
 

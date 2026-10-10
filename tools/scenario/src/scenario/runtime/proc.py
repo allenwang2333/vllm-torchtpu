@@ -29,6 +29,7 @@ import io
 import os
 import pathlib
 import re
+import resource
 import signal
 import subprocess
 import sys
@@ -69,6 +70,17 @@ def capture_output() -> Iterator[io.StringIO]:
     buffer = io.StringIO()
     with _ECHO, contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
         yield buffer
+
+
+def disable_core_dumps() -> None:
+    """Make this process's soft core-file limit 0; every child inherits it.
+
+    A TPU server's core is about the size of its host memory. On a pod it
+    fills the node's ephemeral storage, and nothing collects it. The hard
+    limit stays, so a child that wants cores can raise its own soft limit.
+    """
+    _, hard = resource.getrlimit(resource.RLIMIT_CORE)
+    resource.setrlimit(resource.RLIMIT_CORE, (0, hard))
 
 
 def exit_status(returncode: int) -> int:
