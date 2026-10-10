@@ -108,6 +108,7 @@ def _run_swa(
     ced_decoder: bool = False,
     token_parallel: bool = False,
     page_indices_ring_mapped: bool = False,
+    non_causal_block: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """SWA pass; output stays unnormalized when CSA follows (folds swa_l/swa_m)."""
     if sw_cache.shape[0] == 0:
@@ -192,6 +193,7 @@ def _run_swa(
         ),
         unnormalized_output=not swa_only or sliding_window == 1,
         ced_decoder=ced_decoder,
+        non_causal_block=non_causal_block,
     )
 
 
@@ -218,6 +220,7 @@ def _attention_swa(
     ced_decoder: bool = False,
     token_parallel: bool = False,
     page_indices_ring_mapped: bool = False,
+    non_causal_block: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """SWA-only layers; the main-cache inputs keep the CSA op's signature."""
     output, updated_sw_cache, _, _ = _run_swa(
@@ -236,6 +239,7 @@ def _attention_swa(
         ced_decoder=ced_decoder,
         token_parallel=token_parallel,
         page_indices_ring_mapped=page_indices_ring_mapped,
+        non_causal_block=non_causal_block,
     )
     return output, updated_sw_cache
 
@@ -269,6 +273,7 @@ def _attention_csa(
     ced_decoder: bool = False,
     token_parallel: bool = False,
     page_indices_ring_mapped: bool = False,
+    non_causal_block: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: SWA pass, then sparse attention over the indexer's top-k rows."""
     if main_cache_kv.shape[0] == 0 or main_cache_rope.shape[0] == 0:
@@ -290,6 +295,7 @@ def _attention_csa(
         ced_decoder=ced_decoder,
         token_parallel=token_parallel,
         page_indices_ring_mapped=page_indices_ring_mapped,
+        non_causal_block=non_causal_block,
     )
 
     # When both caches are one buffer, the CSA read must see the SWA kernel's
