@@ -134,18 +134,17 @@ class VllmMoERunner(MoERunner):
             # upstream's generic DP/EP dispatch is a no-op. The only work
             # being bypassed here is its explicit PCP all-gather pair.
             return hidden_states, router_logits
+        moe_config = self.moe_config
         if (
             router_logits is not hidden_states
             and self.do_naive_dispatch_combine
             and moe_routing._SIMULATION_STRATEGY is None
-            and self.moe_config.pcp_size <= 1
-            and self.routed_experts.custom_routing_function is None
-            and self.routed_experts.quant_method.is_monolithic
+            and moe_config.pcp_size <= 1
+            and (routed_experts := self.routed_experts).custom_routing_function is None
+            and routed_experts.quant_method.is_monolithic
         ):
             group = (
-                get_ep_group()
-                if self.moe_config.is_sequence_parallel
-                else get_dp_group()
+                get_ep_group() if moe_config.is_sequence_parallel else get_dp_group()
             )
             if group.world_size > 1:
                 hidden_states = group.all_gather(hidden_states, dim=0)

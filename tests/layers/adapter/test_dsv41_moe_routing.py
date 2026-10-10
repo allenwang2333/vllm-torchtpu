@@ -817,3 +817,40 @@ def test_forward_unsharded_bypasses_sp_gathers(monkeypatch):
     )
     assert not gather_mock.called
     assert attn_fn_mock.called
+
+
+@pytest.mark.parametrize("batch_size", [384, 576, 672])
+def test_td8196_high_conc_b384_576_672_ep8_routing_and_dispatch_parity(
+    monkeypatch, batch_size: int
+):
+    """Verify TD8.196 EP=8 partitioned routing and _maybe_dispatch at B=384/576/672."""
+    import vllm.distributed.parallel_state as ps
+
+    ep_size = 8
+    local_b = batch_size // ep_size
+    fake_ep = _FakeDistributedGroup(world_size=ep_size, rank=3)
+    monkeypatch.setattr(ps, "get_ep_group", lambda: fake_ep)
+    monkeypatch.setattr(oot_moe_runner, "get_ep_group", lambda: fake_ep)
+    monkeypatch.setattr(moe_routing, "_SIMULATION_STRATEGY", None)
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
+
+    runner = _MockMoERunner(
+        do_naive_dispatch_combine=True,
+        pcp_size=1,
+        is_sequence_parallel=True,
+        is_monolithic=True,
+        custom_routing_function=None,
+    )
+    local_hidden = torch.randn(local_b, 16, dtype=torch.bfloat16)
+    logits_shard = torch.randn(local_b, 32, dtype=torch.float32)
+
+    h_out, r_out = runner._maybe_dispatch(local_hidden, logits_shard)
+    assert h_out.shape == (batch_size, 16)
+    assert r_out is logits_shard
+
+    layer = _make_routing_layer(topk=6, is_sequence_parallel=True)
+    out_w, out_i = moe_routing.route(layer, h_out, logits_shard, input_ids=None)
+    assert out_w.shape == (batch_size, 6)
+    assert out_w.dtype == torch.bfloat16
+    assert out_i.shape == (batch_size, 6)
+    assert out_i.dtype == torch.int32

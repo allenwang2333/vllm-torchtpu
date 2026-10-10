@@ -15,7 +15,11 @@
 
 import torch
 import torch.nn.functional as F
+import vllm.distributed.parallel_state as _ps
 import vllm.envs as vllm_envs
+from vllm.model_executor.layers.fused_moe.router import (
+    grouped_topk_router as _grouped_topk_router,
+)
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter.router_topk import rowmax_select
@@ -193,12 +197,10 @@ def _gather_partitioned_topk(
         topk_weights.dtype in (torch.bfloat16, torch.float16)
         and topk_ids.dtype == torch.int32
     ):
-        w_u16 = topk_weights.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
-        packed = (w_u16 << 16) | (topk_ids.contiguous() & 0xFFFF)
+        w_shifted = topk_weights.contiguous().view(torch.int16).to(torch.int32) << 16
+        packed = w_shifted | (topk_ids.contiguous() & 0xFFFF)
         gathered = group.all_gather(packed, dim=0)
-        out_weights = (
-            ((gathered >> 16) & 0xFFFF).to(torch.int16).view(topk_weights.dtype)
-        )
+        out_weights = (gathered >> 16).to(torch.int16).view(topk_weights.dtype)
         out_ids = (gathered << 16) >> 16
         return out_weights, out_ids
     return (
@@ -223,7 +225,8 @@ def route(
     duplicated in each quant method; centralizing it here means the simulation
     hook -- and any future routing-path change -- lives in exactly one place.
     """
-    topk = layer.moe_config.experts_per_token
+    moe_config = layer.moe_config
+    topk = moe_config.experts_per_token
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:
         return simulated
@@ -236,31 +239,20 @@ def route(
             renormalize=layer.renormalize,
         )
     if router_logits.shape[0] < hidden_states.shape[0]:
-        from vllm.distributed.parallel_state import get_dp_group, get_ep_group
-
         local_t = router_logits.shape[0]
-        moe_config = getattr(layer, "moe_config", None)
-        is_sp = bool(getattr(moe_config, "is_sequence_parallel", False))
-        use_ep = bool(
-            getattr(
-                getattr(moe_config, "moe_parallel_config", None),
-                "use_ep",
-                False,
-            )
-        )
-        if is_sp:
-            group = get_ep_group()
-        elif use_ep:
-            ep_group = get_ep_group()
+        if getattr(moe_config, "is_sequence_parallel", False):
+            group = _ps.get_ep_group()
+        elif getattr(getattr(moe_config, "moe_parallel_config", None), "use_ep", False):
+            ep_group = _ps.get_ep_group()
             if (
                 getattr(moe_config, "dp_size", 1) <= 1
                 or local_t * ep_group.world_size == hidden_states.shape[0]
             ):
                 group = ep_group
             else:
-                group = get_dp_group()
+                group = _ps.get_dp_group()
         else:
-            group = get_dp_group()
+            group = _ps.get_dp_group()
         local_input_ids = input_ids
         if input_ids is not None:
             n_ids = input_ids.numel()
@@ -362,12 +354,14 @@ def select_experts(
         return simulated
 
     hash_indices_table = (
-        getattr(layer, "hash_indices_table", None) if layer is not None else None
+        getattr(layer, "hash_indices_table", None)
+        if (input_ids is not None and layer is not None)
+        else None
     )
-    if hash_indices_table is not None and input_ids is not None:
+    if hash_indices_table is not None:
         scores = _apply_scoring_fn(scoring_fn, router_logits)
-        # hash_indices_table is only set when layer is not None.
-        assert layer is not None
+        # hash_indices_table requires both layer and input_ids to be non-None.
+        assert layer is not None and input_ids is not None
         routed_scaling_factor = layer.routed_scaling_factor
         topk_weights, topk_ids = _hash_moe_select(
             scores,
@@ -385,12 +379,8 @@ def select_experts(
         and layer.topk_group < layer.num_expert_group
     )
     if use_grouped:
-        from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
-            grouped_topk,
-        )
-
         assert layer is not None
-        topk_weights, topk_ids = grouped_topk(
+        topk_weights, topk_ids = _grouped_topk_router.grouped_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=topk,
