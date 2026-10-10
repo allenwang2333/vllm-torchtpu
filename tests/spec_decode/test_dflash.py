@@ -28,6 +28,10 @@ from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs
 @pytest.fixture
 def device(monkeypatch):
     try:
+        from vllm_torchtpu.tpu_info import get_num_chips
+
+        if get_num_chips() == 0:
+            raise RuntimeError("No attached TPU chips")
         import torch_tpu  # noqa: F401
 
         return torch.device("tpu")

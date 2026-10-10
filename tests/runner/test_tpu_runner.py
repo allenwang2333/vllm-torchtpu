@@ -62,6 +62,25 @@ try:
     torch.device("tpu")
 except RuntimeError:
     torch.utils.rename_privateuse1_backend("tpu")
+if not hasattr(torch, "tpu"):
+    import types
+
+    _tpu_mod = types.ModuleType("torch.tpu")
+    _tpu_mod.is_available = lambda: False  # type: ignore[attr-defined]
+    _tpu_mod.is_initialized = lambda: False  # type: ignore[attr-defined]
+    _tpu_mod.device_count = lambda: 0  # type: ignore[attr-defined]
+    _tpu_mod.current_device = lambda: 0  # type: ignore[attr-defined]
+    _tpu_mod.set_device = lambda *_a, **_kw: None  # type: ignore[attr-defined]
+    _tpu_mod.synchronize = lambda *_a, **_kw: None  # type: ignore[attr-defined]
+    _tpu_mod.empty_cache = lambda *_a, **_kw: None  # type: ignore[attr-defined]
+    _tpu_mod.manual_seed_all = lambda *_a, **_kw: None  # type: ignore[attr-defined]
+    _tpu_mod._is_in_bad_fork = lambda: False  # type: ignore[attr-defined]
+    _tpu_mod.Event = (  # type: ignore[attr-defined]
+        lambda *_a, **_kw: SimpleNamespace(
+            record=lambda: None, synchronize=lambda: None, query=lambda: True
+        )
+    )
+    torch._register_device_module("tpu", _tpu_mod)
 
 
 def test_idle_dp_rank_encodes_before_decoder_pairing():
