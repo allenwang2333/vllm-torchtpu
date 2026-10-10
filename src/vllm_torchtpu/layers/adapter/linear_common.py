@@ -164,7 +164,6 @@ _quantized_matmul_prequant_op: Callable | None = None
 _quantized_matmul_prequant_op_lock = Lock()
 
 
-@torch.compiler.disable
 def _init_quantized_matmul_prequant_op() -> Callable:
     global _quantized_matmul_prequant_op
     with _quantized_matmul_prequant_op_lock:
@@ -283,7 +282,6 @@ def _format_limit_tag(swiglu_limit: float | None) -> str:
     return str(swiglu_limit).replace(".", "p").replace("-", "m")
 
 
-@torch.compiler.disable
 def _init_quantized_mlp_op(swiglu_limit: float | None) -> Callable:
     with _quantized_mlp_ops_lock:
         op = _quantized_mlp_ops.get(swiglu_limit)
@@ -328,7 +326,6 @@ def _get_quantized_mlp_op(swiglu_limit: float | None = None) -> Callable:
     return _init_quantized_mlp_op(swiglu_limit)
 
 
-@torch.compiler.disable
 def _init_quantized_mlp_prequant_op(swiglu_limit: float | None) -> Callable:
     with _quantized_mlp_prequant_ops_lock:
         op = _quantized_mlp_prequant_ops.get(swiglu_limit)
@@ -375,6 +372,12 @@ def _init_quantized_mlp_prequant_op(swiglu_limit: float | None) -> Callable:
         op.register_fake(_fake_quantized_mlp_prequant)
         _quantized_mlp_prequant_ops[swiglu_limit] = op
         return op
+
+
+_init_quantized_matmul_prequant_op()
+for _default_lim in (None, 7.0):
+    _init_quantized_mlp_op(_default_lim)
+    _init_quantized_mlp_prequant_op(_default_lim)
 
 
 def _get_quantized_mlp_prequant_op(swiglu_limit: float | None = None) -> Callable:
@@ -645,3 +648,9 @@ def get_model_matmul_fusion_assignment(
 ):
     key = (model_name, batch_size, tp_size, layer_name)
     return MODEL_MATMUL_FUSION_TRUTH_TABLE.get(key, True)
+
+_get_quantized_matmul_op()
+_init_quantized_matmul_prequant_op()
+for _preload_lim in (None, 7.0):
+    _init_quantized_mlp_op(_preload_lim)
+    _init_quantized_mlp_prequant_op(_preload_lim)

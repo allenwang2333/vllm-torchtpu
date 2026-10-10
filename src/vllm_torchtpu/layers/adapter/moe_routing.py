@@ -53,8 +53,10 @@ def _gather_expert_scores(scores: torch.Tensor, topk_ids: torch.Tensor) -> torch
     is the sign of zero (-0.0 + 0.0 is +0.0), which the scoring functions
     here cannot produce: their scores are all >= +0.
     """
-    experts = torch.arange(scores.shape[-1], device=scores.device)
-    selected = topk_ids.long().unsqueeze(-1) == experts
+    experts = torch.arange(
+        scores.shape[-1], dtype=topk_ids.dtype, device=scores.device
+    )
+    selected = topk_ids.unsqueeze(-1) == experts
     return torch.where(selected, scores.unsqueeze(-2), 0).sum(dim=-1)
 
 
@@ -224,7 +226,7 @@ def _hash_moe_select(
     flat input_ids rather than dynamic gating logits.
     """
     flat_input_ids = input_ids.long().flatten()
-    topk_ids = hash_indices_table[flat_input_ids].long()
+    topk_ids = hash_indices_table[flat_input_ids]
     target_shape = list(scores.shape)
     target_shape[-1] = topk_ids.shape[-1]
     topk_ids = topk_ids.reshape(target_shape)

@@ -915,17 +915,11 @@ def fused_moe_func(
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
-    # Under EP with narrow intermediate size (I <= 512, e.g. DSV4.1), auto-enable
-    # up to 96 tokens when TPU_MOE_DENSE_EXPERT_THRESHOLD is unset (0) to skip
-    # empty expert groups via scalar SMEM compaction with zero HBM permute/combine.
+    # Under EP, auto-enable up to 128 tokens when TPU_MOE_DENSE_EXPERT_THRESHOLD
+    # is unset (0) across all supported quantization & intermediate-size regimes.
     effective_dense_threshold = (
-        96
-        if (
-            _DENSE_EXPERT_THRESHOLD == 0
-            and use_ep
-            and num_tokens >= 16
-            and w2.shape[1] * packing_factor <= 512
-        )
+        128
+        if (_DENSE_EXPERT_THRESHOLD == 0 and use_ep)
         else _DENSE_EXPERT_THRESHOLD
     )
     use_dense_expert = (

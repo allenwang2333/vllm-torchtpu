@@ -235,7 +235,11 @@ class DeepseekV4MoE(nn.Module):
                 hidden_states_fp8=hidden_states_fp8,
                 hidden_states_scale=hidden_states_scale,
             )
-        elif self.shared_experts is not None and not input_is_token_sharded:
+        elif (
+            self.shared_experts is not None
+            and hidden_states_fp8 is not None
+            and not input_is_token_sharded
+        ):
             self.shared_experts.set_prequant_hidden(
                 hidden_states_fp8, hidden_states_scale
             )
@@ -249,7 +253,7 @@ class DeepseekV4MoE(nn.Module):
         finally:
             if skip_shared is not None:
                 skip_shared[0] = False
-            if self.shared_experts is not None:
+            if self.shared_experts is not None and hidden_states_fp8 is not None:
                 self.shared_experts.set_prequant_hidden(None, None)
         if self.experts.moe_config.skip_final_all_reduce and self.tp_size > 1:
             if return_token_sharded:

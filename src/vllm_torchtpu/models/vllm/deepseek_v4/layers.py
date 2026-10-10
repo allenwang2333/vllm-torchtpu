@@ -113,6 +113,8 @@ class DeepseekV4MLP(nn.Module):
             self.act_fn = SiluAndMulWithClamp(swiglu_limit)
         else:
             self.act_fn = SiluAndMul()
+        _get_quantized_mlp_op(swiglu_limit)
+        _get_quantized_mlp_prequant_op(swiglu_limit)
 
     def _build_tp_weights(self) -> None:
         if "_tp_gate_up_w" in self._buffers:
