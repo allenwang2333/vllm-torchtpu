@@ -442,6 +442,9 @@ class TestCLIAndGitSha:
 class TestLaunchAndAggregation:
     def test_prepare_worker_env(self, monkeypatch):
         monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "4")
+        # Asserts the PJRT_DEVICE default, so drop any value an earlier test
+        # module exported (test_td857 sets PJRT_DEVICE=cpu at import time).
+        monkeypatch.delenv("PJRT_DEVICE", raising=False)
         args_no_prof = argparse.Namespace(profile=None)
         with patch(
             "torch_tpu._internal.distributed.launchers.singlehost_wrapper"
