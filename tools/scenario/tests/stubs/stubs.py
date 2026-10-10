@@ -26,8 +26,23 @@ for an engine core. Knobs, all env:
     STUB_READY_AFTER=S    /health answers 503 for S seconds
     STUB_NEVER_READY=1    /health never answers 200
     STUB_DIE_AFTER=S      crash S seconds after start
+    STUB_PULL=1           fill $STUB_PULLED_DIR as runai pulls a model
+
+`vllm bench serve` and InferenceX's benchmark_serving (`python3 -m
+infx.bench_serving.benchmark_serving`) ask the server for /v1/models and
+write a result file with the fields the gate and the uploaders read: every
+prompt completed when the server answered, every prompt failed when it did
+not, as the real client does. Knobs:
+
+    STUB_BENCH_FAIL=NAME     exit 1 without a result when writing file NAME
+    STUB_BENCH_KILL=NAME     crash the server after writing file NAME
+    STUB_BENCH_FAILED=N      report N failed requests
+    STUB_BENCH_METRICS=JSON  metric values to report
+
+`python3` runs the real interpreter for anything but `-m infx...`.
 """
 
+import http.client
 import http.server
 import json
 import os
@@ -94,6 +109,10 @@ def serve(args: list[str]) -> int:
         while True:
             time.sleep(60)
     record("vllm serve", args, engine_pid=engine)
+    if os.environ.get("STUB_PULL") == "1":
+        pulled = pathlib.Path(os.environ["STUB_PULLED_DIR"])
+        pulled.mkdir(parents=True, exist_ok=True)
+        (pulled / "config.json").write_text("{}")
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def reply(self, code: int, body: Any, kind: str = "application/json") -> None:
@@ -158,15 +177,103 @@ def serve(args: list[str]) -> int:
     return 0
 
 
+# Perf clients -----------------------------------------------------------------
+
+METRICS = {
+    "median_ttft_ms": 100.0,
+    "median_tpot_ms": 10.0,
+    "total_token_throughput": 1000.0,
+    "output_throughput": 500.0,
+}
+
+
+def _get(host: str, port: int, path: str) -> int | None:
+    conn = http.client.HTTPConnection(host, port, timeout=5)
+    try:
+        conn.request("GET", path)
+        response = conn.getresponse()
+        response.read()
+        return response.status
+    except OSError:
+        return None
+    finally:
+        conn.close()
+
+
+def _endpoint(args: list[str]) -> tuple[str, int]:
+    base = flag(args, "--base-url")
+    if base is not None:
+        host, _, port = base.removeprefix("http://").rstrip("/").partition(":")
+        return host, int(port or 80)
+    return flag(args, "--host", "127.0.0.1") or "", int(
+        flag(args, "--port", "8000") or 0
+    )
+
+
+def bench(program: str, args: list[str]) -> int:
+    record(program, args)
+    name = flag(args, "--result-filename") or "result.json"
+    directory = flag(args, "--result-dir")
+    path = pathlib.Path(directory, name) if directory else pathlib.Path(name)
+    if os.environ.get("STUB_BENCH_FAIL") == path.name:
+        print(f"stub bench: failed before writing {path.name}", flush=True)
+        return 1
+    host, port = _endpoint(args)
+    prompts = int(flag(args, "--num-prompts", "10") or 10)
+    reachable = _get(host, port, "/v1/models") == 200
+    for percent in (0, 50, 100):
+        sys.stdout.write(f"{percent:3d}%|{'#' * (percent // 10)}|\r")
+    sys.stdout.write("\n")
+    failed = int(os.environ.get("STUB_BENCH_FAILED", 0)) if reachable else prompts
+    result = {
+        "date": time.strftime("%Y%m%d-%H%M%S"),
+        "backend": flag(args, "--backend", "vllm"),
+        "model_id": flag(args, "--model"),
+        "tokenizer_id": flag(args, "--tokenizer") or flag(args, "--model"),
+        "num_prompts": prompts,
+        "completed": prompts - failed,
+        "failed": failed,
+        "request_rate": "inf",
+        "max_concurrency": int(flag(args, "--max-concurrency", "1") or 1),
+        **METRICS,
+        **json.loads(os.environ.get("STUB_BENCH_METRICS", "{}")),
+    }
+    label = flag(args, "--label")
+    if label is not None:
+        result["label"] = label
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result) + "\n")
+    print(f"stub bench: wrote {path.name}", flush=True)
+    if os.environ.get("STUB_BENCH_KILL") == path.name:
+        _get(host, port, "/stub/die")
+    return 0
+
+
 def vllm(args: list[str]) -> int:
     if args[:1] == ["serve"]:
         return serve(args[1:])
+    if args[:2] == ["bench", "serve"]:
+        return bench("vllm bench serve", args[2:])
     record("vllm", args)
     print(f"stub vllm: unknown command {args}", file=sys.stderr)
     return 2
 
 
-PROGRAMS: dict[str, Callable[[list[str]], int]] = {"vllm": vllm}
+INFX: dict[str, Callable[[list[str]], int]] = {
+    "infx.bench_serving.benchmark_serving": lambda args: bench(
+        "infx benchmark_serving", args
+    ),
+}
+
+
+def python3(args: list[str]) -> int:
+    if len(args) >= 2 and args[0] == "-m" and args[1] in INFX:
+        return INFX[args[1]](args[2:])
+    os.execv(sys.executable, [sys.executable, *args])
+    return 1
+
+
+PROGRAMS: dict[str, Callable[[list[str]], int]] = {"vllm": vllm, "python3": python3}
 
 
 def main() -> int:
