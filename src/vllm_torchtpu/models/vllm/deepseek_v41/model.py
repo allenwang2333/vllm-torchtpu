@@ -1258,6 +1258,8 @@ class DeepseekV41Model(nn.Module):
             _build_layer,
             prefix=f"{prefix}.layers",
         )
+        if hasattr(config, "_tpu_candidate_block_buffer"):
+            delattr(config, "_tpu_candidate_block_buffer")
 
         engram_lids = (
             self.engram_layout.layer_ids if self.engram_layout is not None else ()
