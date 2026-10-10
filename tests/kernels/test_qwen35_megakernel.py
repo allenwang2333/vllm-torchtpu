@@ -769,3 +769,169 @@ def test_build_tp_rank_mesh_preserves_rank_order(monkeypatch) -> None:
     assert [int(d.id) for d in mesh.devices.flat] == tpu7x_order
 
 
+def _jnp_leaves(packed):
+    import jax.numpy as jnp
+
+    return [
+        jnp.asarray(packed[k].view(torch.uint8).numpy()).view(
+            K.FP8
+            if packed[k].dtype == torch.float8_e4m3fn
+            else (jnp.bfloat16 if packed[k].dtype == torch.bfloat16 else jnp.float32)
+        )
+        for k in K.W_NAMES
+    ]
+
+
+def test_mtp_attention_only_step_verify_and_loop_rows_agree():
+    """MTP draft layer (one-layer attention-only stack, `make_flat_attn_step`) on the merged
+    kernel: a T=4 verify step writes only the active sequence's 4 new K/V columns, and a T=1
+    loop step of its last token over the updated pool reproduces the verify step's output for
+    that token (QV verify-row attention vs the per-row path)."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import Mesh
+
+    c4 = dataclasses.replace(
+        K.TINY_EP,
+        R=1,
+        B=8,
+        T=4,
+        L=1,
+        att_every=1,
+        NH=1,
+        NKV=1,
+        KH=1,
+        VH=2,
+        I=128,
+        IS=128,
+        E=128,
+        TOPK=2,
+        e_slots=128,
+        paged_kv=True,
+        num_pages=40,
+        page_size=128,
+        max_pages_per_seq=8,
+        ctx=1024,
+    )
+    c1 = dataclasses.replace(c4, T=1)
+    tiles = dataclasses.replace(K.default_tiles(c4), kv_blk=512, kv_sub=256)
+    torch.manual_seed(0)
+    w = _jnp_leaves(pack_weights(_make_tiny_backbone(c4, e_slots=c4.EW), c4, 0, tiles))
+    mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
+    skip = frozenset({"experts"})
+
+    rng = np.random.default_rng(0)
+    pool_u8 = rng.integers(0, 0x40, (c4.num_pages, 2, 64, 4, c4.page_size), dtype=np.uint8)
+    pool_u8 |= (rng.integers(0, 2, pool_u8.shape, dtype=np.uint8) << 7).astype(np.uint8)
+    pool0 = jax.lax.bitcast_convert_type(jnp.asarray(pool_u8), K.FP8)
+    pt4 = jnp.asarray([list(range(8, 16)), list(range(16, 24))], jnp.int32)
+    p0, p1 = 300, 700
+    pos4 = jnp.asarray([p0 + t for t in range(4)] + [p1 + t for t in range(4)], jnp.int32)
+    hid4 = jax.random.normal(jax.random.PRNGKey(1), (c4.M, c4.H), jnp.float32)
+    hid4 = jnp.where(jnp.arange(c4.M)[:, None] < c4.B, hid4, 0.0).astype(jnp.bfloat16)
+    ones = jnp.ones((c4.B,), jnp.int32)
+
+    fn4, _, _, _ = pool_io.make_flat_attn_step(mesh, c4, tiles, interpret=True, skip=skip)
+    out4, pool4 = fn4(pos4, hid4, *w, pool0, pt4, jnp.asarray([1, 0], jnp.int32), ones)
+    pool4_u8 = np.asarray(jax.lax.bitcast_convert_type(pool4, jnp.uint8))
+    assert bool(jnp.isfinite(out4[:4].astype(jnp.float32)).all())
+    # Only sequence 0's write page (page 8 + 300 // 128 = 10), token columns 300..303 change.
+    changed = np.argwhere(np.any(pool4_u8 != pool_u8, axis=(1, 2, 3)))
+    assert changed.tolist() == [[10, 44], [10, 45], [10, 46], [10, 47]]
+
+    pt1 = jnp.zeros((c1.NS, c1.max_pages_per_seq), jnp.int32).at[0].set(pt4[0])
+    pos1 = jnp.zeros((c1.B,), jnp.int32).at[0].set(p0 + 3)
+    hid1 = jnp.zeros_like(hid4).at[0].set(hid4[3])
+    act1 = jnp.zeros((c1.NS,), jnp.int32).at[0].set(1)
+    fn1, _, _, _ = pool_io.make_flat_attn_step(mesh, c1, tiles, interpret=True, skip=skip)
+    out1, pool1 = fn1(pos1, hid1, *w, pool4, pt1, act1, ones)
+    # The loop step rewrites token 303 with the same K/V and reads tokens 300..302 from the pool.
+    assert np.array_equal(np.asarray(jax.lax.bitcast_convert_type(pool1, jnp.uint8)), pool4_u8)
+    np.testing.assert_allclose(
+        np.asarray(out1[0], np.float32), np.asarray(out4[3], np.float32), rtol=2e-2, atol=2e-2
+    )
+
+
+def test_gpr_three_stage_matches_fused_at_tp16_checkpoint_geometry():
+    """3-stage pool I/O of a > 16-row verify bucket (GatedDeltaNet inputs read straight from the
+    checkpoint pages (pool_gather / GPR), partial conv-page scatter) against fused pool I/O at
+    the TP=16 checkpoint geometry (vh=4: 2 rec pages + 1 conv page per slot)."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import Mesh
+
+    c = dataclasses.replace(
+        K.TINY_EP,
+        R=1,
+        B=20,
+        T=4,
+        L=2,
+        att_every=2,
+        H=2048,
+        NH=1,
+        NKV=1,
+        KH=1,
+        VH=4,
+        I=128,
+        IS=128,
+        E=128,
+        TOPK=2,
+        e_slots=128,
+        paged_kv=True,
+        page_size=128,
+        max_pages_per_seq=8,
+        ctx=1024,
+    )
+    assert (c.rec_pages, c.gdn_pages) == (2, 3)
+    pt, ckpt, roff, min_pages = pool_io.default_pool_layout(c)
+    c = dataclasses.replace(c, num_pages=min_pages)
+    tiles = dataclasses.replace(K.default_tiles(c), kv_blk=512, kv_sub=256)
+    assert tiles.gdn_rows > 0  # B > 16 verify: chunked states, so the 3-stage step uses GPR
+    torch.manual_seed(0)
+    w = _jnp_leaves(pack_weights(_make_tiny_backbone(c, e_slots=c.EW), c, 0, tiles))
+    st_shapes = K.state_shapes(dataclasses.replace(c, paged_kv=False))
+    St = {
+        k: (jax.random.normal(jax.random.PRNGKey(20 + i), (c.R, *s), jnp.float32)
+            * (0.1 if k in ("conv", "rec") else 0.5)).astype(dt)
+        for i, (k, (s, dt)) in enumerate(st_shapes.items())
+    }
+    raw = pool_io.states_to_pool(c, St, pt, ckpt, roff)
+    pos = jnp.asarray([10 + 37 * s + t for s in range(c.NS) for t in range(c.T)], jnp.int32)
+    hid = jax.random.normal(jax.random.PRNGKey(7), (c.M, c.H), jnp.float32)
+    hid = jnp.where(jnp.arange(c.M)[:, None] < c.B, hid, 0.0).astype(jnp.bfloat16)
+    mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
+
+    outs = {}
+    for fused in (True, False):
+        fn, _, _, _ = pool_io.make_flat_pooled_step(
+            mesh, c, tiles, fused_pool_io=fused, interpret=True, skip=frozenset({"experts"})
+        )
+        out = fn(pos, hid, *w, *[jnp.array(r, copy=True) for r in raw], pt, ckpt, roff)
+        outs[fused] = (
+            np.asarray(out[0][: c.B], np.float32),
+            np.asarray(jax.lax.bitcast_convert_type(out[1], jnp.uint8)),
+        )
+    (h_f, p_f), (h_3, p_3) = outs[True], outs[False]
+    assert np.isfinite(h_f).all()
+    np.testing.assert_allclose(h_3, h_f, rtol=1e-2, atol=1e-2)
+
+    kv_pages = c.NS * (c.ctx // c.page_size)
+    assert np.array_equal(p_3[:kv_pages], p_f[:kv_pages])
+    cp_rows = ((3 * c.QKV // 128 + 15) // 16 * 16) // 2  # conv history rows the scatter writes
+
+    def rec_f32(pages):  # [..., 2, 64, 4, 128] fp8 bytes -> the bf16 state values as f32
+        u = np.ascontiguousarray(np.moveaxis(pages, -2, -1)).view(np.uint32)[..., 0]
+        return np.stack([(u & 0xFFFF) << 16, (u >> 16) << 16]).view(np.float32)
+
+    for slot in np.unique(np.asarray(ckpt)):
+        p0 = int(slot) * c.gdn_pages
+        np.testing.assert_allclose(
+            rec_f32(p_3[p0 : p0 + c.rec_pages]),
+            rec_f32(p_f[p0 : p0 + c.rec_pages]),
+            rtol=1e-2,
+            atol=1e-3,
+        )
+        conv = p0 + c.rec_pages
+        assert np.array_equal(p_3[conv, 0, :cp_rows], p_f[conv, 0, :cp_rows]), int(slot)
