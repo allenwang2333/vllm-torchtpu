@@ -7762,15 +7762,14 @@ class TPUModelRunner(GPUModelRunner):
         input_ids = pack[0:off1]
         positions = pack[off1:off2]
         seq_lens = pack[off2:off3]
+        zero = prev_num_rejected.new_zeros(())
         seq_idx = pack[off3:off4]
         pos_idx = pack[off4:off5]
-        query_start_loc = pack[off5:off6]
-        request_distribution = pack[off6 : off6 + 3]
-        mamba_request_distribution = pack[off6 + 3 : off7]
+        query_start_loc = pack[off5:off6] + zero
+        request_distribution = pack[off6 : off6 + 3] + zero
+        mamba_request_distribution = pack[off6 + 3 : off7] + zero
         pre_idx = pack[off7:off8]
-        temps_and_seeds = pack[off8:]
-
-        zero = prev_num_rejected.new_zeros(())
+        temps_and_seeds = pack[off8:] + zero
         seq_sub = torch.where(
             seq_idx >= 0, prev_num_rejected[seq_idx.clamp(min=0)], zero
         )
