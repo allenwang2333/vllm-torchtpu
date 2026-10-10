@@ -618,12 +618,12 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 synchronize_tensors([qw_cat, qs_cat])
                 del saved
                 return qw_cat, qs_cat
-            if n_exp <= 32:
+            if n_exp <= 6:
                 return quantize_native_fp4_kmajor(
                     w_pad.to(device), block=blk, pack=pack
                 )
             qw_cpu_list, qs_cpu_list = [], []
-            for s in range(0, n_exp, 32):
+            for s in range(0, n_exp, 6):
                 w_sub = w_pad[s : s + 32].to(device)
                 qw, qs = quantize_native_fp4_kmajor(
                     w_sub, block=blk, pack=pack
@@ -670,6 +670,14 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         # TODO(upstream): Extract generic on-disk quantization cache to a
         # standalone utility PR.
         assert isinstance(layer, RoutedExperts)
+        _warm_slice = os.environ.get("VLLM_CACHE_WARM_SLICE", "")
+        if _warm_slice:
+            _w_idx, _w_tot = (int(v) for v in _warm_slice.split("/"))
+            _l_seq = getattr(self, "_cache_warm_counter", 0)
+            VllmDeepseekV4Mxfp4MoEMethod._cache_warm_counter = _l_seq + 1
+            if (_l_seq % _w_tot) != _w_idx:
+                self._release_source_weights(layer)
+                return
         device = layer.w13_weight.device
 
         activation_str = self._set_tpu_activation(layer)
