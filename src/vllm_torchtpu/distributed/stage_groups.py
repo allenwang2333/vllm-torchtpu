@@ -28,10 +28,10 @@ _DONE_ATTR = "_tpu_stage_groups_standalone"
 _STANDALONE_PG_BY_RANKS: dict[tuple[int, ...], Any] = {}
 
 
-def _stage_groups() -> list[Any]:
-    """The distinct model-parallel groups of more than one device inside this
-    rank's tensor-parallel or PCP pipeline stage, in the same order on every rank.
-    """
+def _candidate_stage_groups() -> list[Any]:
+    """All model-parallel coordinators of more than one device inside this
+    rank's tensor-parallel or PCP pipeline stage, including coordinators over
+    identical ranks (e.g. TP and EP when DP=1)."""
     from vllm.distributed import parallel_state
 
     candidates: list[Any] = [parallel_state.get_tp_group()]
@@ -43,12 +43,22 @@ def _stage_groups() -> list[Any]:
             candidates.append(fn())
         except (AssertionError, AttributeError):
             continue
-    groups: list[Any] = []
+    out: list[Any] = []
     for group in candidates:
         if group is None or group.world_size <= 1:
             continue
-        if any(group is seen for seen in groups):
+        if any(group is seen for seen in out):
             continue
+        out.append(group)
+    return out
+
+
+def _stage_groups() -> list[Any]:
+    """The distinct model-parallel groups of more than one device inside this
+    rank's tensor-parallel or PCP pipeline stage, in the same order on every rank.
+    """
+    groups: list[Any] = []
+    for group in _candidate_stage_groups():
         # Two coordinators over identical ranks (e.g. TP and EP, or PCP and EP
         # with DP=1) back the same device set; one call per distinct rank list.
         if any(tuple(group.ranks) == tuple(seen.ranks) for seen in groups):
@@ -116,6 +126,17 @@ def make_stage_groups_standalone(parallel_config: Any) -> None:
             _STANDALONE_PG_BY_RANKS[tuple(int(r) for r in group.ranks)] = (
                 group.device_group
             )
+        # Rebind duplicate-rank coordinators (e.g. EP when EP==TP under DP=1)
+        # and their device_communicators to the standalone ProcessGroup so
+        # collectives on both coordinators share the standalone device assignment.
+        for candidate in _candidate_stage_groups():
+            ranks_key = tuple(int(r) for r in getattr(candidate, "ranks", ()))
+            standalone_pg = _STANDALONE_PG_BY_RANKS.get(ranks_key)
+            if standalone_pg is not None and candidate.device_group is not standalone_pg:
+                candidate.device_group = standalone_pg
+                comm = getattr(candidate, "device_communicator", None)
+                if comm is not None:
+                    comm.device_group = standalone_pg
     setattr(pp_group, _DONE_ATTR, True)
     logger.info(
         "pipeline stage %d: standalone process groups %s (make_standalone=%s)",
