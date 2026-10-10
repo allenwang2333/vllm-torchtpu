@@ -373,17 +373,27 @@ def prepare_capped_window_indices(
 # Decode buckets the fused window prep serves (one chunk, whole top-k block in
 # VMEM: 32 tokens x 2048 x i32 = 256 KiB).
 FUSED_PREP_MAX_TOKENS = 32
+# Rows the fused prep appends after the window rows: one (8, 128) i32 tile
+# whose first row is the native gather's live vector (lanes [0, 16) the live
+# logical-batch count, [16, 32) the per-owner trip count), read by the gather
+# from the same flat operand (`dsa_gather_native_sc(live_vec_offset=...)`).
+FUSED_PREP_META_ROWS = 8
+
+
+def _cdiv_const(x: jax.Array, d: int) -> jax.Array:
+    """ceil(x / d) for a non-negative int32 vector and a static positive d."""
+    if d & (d - 1) == 0:
+        return lax.shift_right_logical(x + (d - 1), jnp.int32(d.bit_length() - 1))
+    return _floor_divmod_const(x + (d - 1), d)[0]
 
 
 def _capped_window_fused_kernel(
-    kv_lens_ref,  # i32[T] (scalar prefetch) live top-k count per token, 0 = none
     token_end_ref,  # i32[1] (scalar prefetch) end of real tokens
     windows_ref,  # i32[T, padded_pps] page-table row per token
-    topk_ref,  # i32[T, topk] logical top-k, prefix-packed, -1 padded
-    rows_hbm_ref,  # i32[W * T * topk_cap // 128, 128] out: physical rows
-    live_vec_ref,  # i32[2 * lanes] out (SMEM): the SC gather's live bound
-    rows_vmem_ref,  # i32[W * T * topk_cap // 128, 128] scratch
-    sems,  # DMA[W]
+    topk_ref,  # i32[T, topk] logical top-k, -1 = empty slot
+    rows_hbm_ref,  # i32[W * T * topk_cap // 128 + META, 128] out: rows + live vector
+    rows_vmem_ref,  # i32[W * T * topk_cap // 128 + META, 128] scratch
+    sems,  # DMA[W + 1]
     *,
     topk_cap: int,
     page_size: int,
@@ -397,83 +407,98 @@ def _capped_window_fused_kernel(
 ):
     """One-call capped window prep for a single decode chunk.
 
-    Computes, from the true per-token live counts, the live-window bound
-    (`capped_live_windows`) and the native SparseCore gather's live vector
-    (`dsa_gather_native_sc`'s `num_live_indices` path), and translates the
-    live windows' slots to physical rows (`_window_physical_rows`). The rows
-    are written window-major exactly as `prepare_capped_window_indices` lays
-    them out, but as 128-lane rows (row ``(w * T + t) * k + j`` holds slots
+    Counts each token's live top-k entries on the vector unit (the kv_lens
+    the attention kernel gets from XLA, recomputed here so this call does not
+    wait on it), derives the live-window bound (`capped_live_windows`) and the
+    native SparseCore gather's live vector (`dsa_gather_native_sc`'s
+    `num_live_indices` path) from it, and translates the live windows' slots
+    to physical rows (`_window_physical_rows`). The rows are written
+    window-major exactly as `prepare_capped_window_indices` lays them out, but
+    as 128-lane rows (row ``(w * T + t) * k + j`` holds slots
     ``[128 j, 128 j + 128)`` of token t's window w, ``k = topk_cap / 128``):
-    that 2-D array is the gather operand's linear layout, so XLA hands it
-    over without a relayout. Windows past the live bound stay unwritten,
-    as in the per-window prep; the gather never reads them.
+    that 2-D array is the gather operand's linear layout, so XLA hands it over
+    without a relayout. The live vector rides in a trailing tile of the same
+    array, so the call has one output and every output DMA is in flight at
+    once (each separately waited output costs a full DMA round trip). Windows
+    past the live bound stay unwritten, as in the per-window prep; the gather
+    never reads them.
     """
     num_tokens, topk = topk_ref.shape
     num_windows = topk // topk_cap
     lane_rows = topk_cap // 128  # 128-lane rows per (token, window)
     window_rows = num_tokens * lane_rows
+    meta_row = num_windows * window_rows
+
+    def copy(start, size, sem):
+        return pltpu.make_async_copy(
+            rows_vmem_ref.at[pl.ds(start, size)],
+            rows_hbm_ref.at[pl.ds(start, size)],
+            sems.at[sem],
+        )
+
+    def translate(w):
+        idx = topk_ref[:, w * topk_cap : (w + 1) * topk_cap]
+        row = lax.broadcasted_iota(jnp.int32, idx.shape, 0)
+        col = w * topk_cap + lax.broadcasted_iota(jnp.int32, idx.shape, 1)
+        phys = _window_physical_rows(
+            idx,
+            windows_ref,
+            row * topk + col,
+            page_size=page_size,
+            pages_per_seq=pages_per_seq,
+            total_num_pages=total_num_pages,
+        )
+        # Token t's 128-lane slice j -> row w * window_rows + t * k + j.
+        for j in range(lane_rows):
+            rows_vmem_ref[pl.ds(w * window_rows + j, num_tokens, stride=lane_rows), :] = (
+                phys[:, j * 128 : (j + 1) * 128]
+            )
+        copy(w * window_rows, window_rows, w).start()
+
+    # Window 0 is always live: translate it before the bound is known.
+    translate(0)
 
     # Live windows over the rows the attention grid reaches (exactly
-    # `capped_live_windows`, scalar), then the gather's live bound (exactly
+    # `capped_live_windows`), then the gather's live bound (exactly
     # `sparse_attention_chunk`'s `num_live_capped` and the gather's live_b /
-    # owner_b) -- all on the scalar unit from SMEM.
+    # owner_b). Counts are exact in f32 (<= topk).
     valid_rows = jnp.clip(token_end_ref[0], 0, num_tokens)
     grid_rows = cdiv(valid_rows, kernel_batch_size) * kernel_batch_size
-    live_windows = jnp.int32(1)
-    for t in range(num_tokens):
-        token_windows = jnp.where(
-            t < grid_rows, cdiv(jnp.maximum(kv_lens_ref[t], 1), topk_cap), 1
-        )
-        live_windows = jnp.maximum(live_windows, token_windows)
-    live_windows = jnp.minimum(live_windows, num_windows)
+    kv = jnp.sum(
+        (topk_ref[...] != -1).astype(jnp.float32), axis=1, keepdims=True
+    ).astype(jnp.int32)
+    token = lax.broadcasted_iota(jnp.int32, kv.shape, 0)
+    token_windows = jnp.where(
+        token < grid_rows, _cdiv_const(jnp.maximum(kv, 1), topk_cap), 1
+    )
+    live_windows = jnp.minimum(jnp.max(token_windows), num_windows)
     num_live = (live_windows - 1) * num_tokens * topk_cap + grid_rows * topk_cap
     live_batches = jnp.minimum(cdiv(num_live, occurrences_per_batch), num_batches)
     owner_batches = cdiv(live_batches, num_owners)
-    for i in range(num_lanes):
-        live_vec_ref[i] = live_batches
-        live_vec_ref[num_lanes + i] = owner_batches
+    lane = lax.broadcasted_iota(jnp.int32, (FUSED_PREP_META_ROWS, 128), 1)
+    rows_vmem_ref[pl.ds(meta_row, FUSED_PREP_META_ROWS), :] = jnp.where(
+        lane < num_lanes, live_batches, owner_batches
+    )
+    meta_copy = copy(meta_row, FUSED_PREP_META_ROWS, num_windows)
+    meta_copy.start()
 
-    def window_copy(w):
-        return pltpu.make_async_copy(
-            rows_vmem_ref.at[pl.ds(w * window_rows, window_rows)],
-            rows_hbm_ref.at[pl.ds(w * window_rows, window_rows)],
-            sems.at[w],
-        )
+    for w in range(1, num_windows):
+        pl.when(w < live_windows)(functools.partial(translate, w))
 
-    for w in range(num_windows):
-
-        @pl.when(w < live_windows)
-        def _translate():
-            idx = topk_ref[:, w * topk_cap : (w + 1) * topk_cap]
-            row = lax.broadcasted_iota(jnp.int32, idx.shape, 0)
-            col = w * topk_cap + lax.broadcasted_iota(jnp.int32, idx.shape, 1)
-            phys = _window_physical_rows(
-                idx,
-                windows_ref,
-                row * topk + col,
-                page_size=page_size,
-                pages_per_seq=pages_per_seq,
-                total_num_pages=total_num_pages,
-            )
-            # Token t's 128-lane slice j -> row w * window_rows + t * k + j.
-            for j in range(lane_rows):
-                rows_vmem_ref[
-                    pl.ds(w * window_rows + j, num_tokens, stride=lane_rows), :
-                ] = phys[:, j * 128 : (j + 1) * 128]
-            window_copy(w).start()
-
-    for w in range(num_windows):
+    copy(0, window_rows, 0).wait()
+    for w in range(1, num_windows):
 
         @pl.when(w < live_windows)
         def _wait():
-            window_copy(w).wait()
+            copy(w * window_rows, window_rows, w).wait()
+
+    meta_copy.wait()
 
 
 def prepare_capped_window_fused(
-    topk_indices: jax.Array,  # i32[num_tokens, topk], -1 padded
+    topk_indices: jax.Array,  # i32[num_tokens, topk], -1 = empty slot
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
-    kv_lens: jax.Array,  # i32[num_tokens] live entries per token (0 allowed)
     token_end: jax.Array,  # i32[]
     *,
     topk_cap: int,
@@ -481,18 +506,20 @@ def prepare_capped_window_fused(
     total_num_pages: int,
     kernel_batch_size: int,
     gather_atoms: int,
-) -> tuple[jax.Array, jax.Array]:
+) -> jax.Array:
     """Window indices + gather live vector for one decode chunk, in one call.
 
     Replaces `capped_live_windows` + `prepare_capped_window_indices` + the
     gather's live-count arithmetic and the index relayouts for a chunk that
-    is the whole (decode) bucket.
+    is the whole (decode) bucket. Needs no kv_lens operand.
 
     Returns:
-        rows: i32[W * num_tokens * topk_cap // 128, 128], the same physical
-          rows as `prepare_capped_window_indices` (window-major), as the
-          native gather's linear operand.
-        live_vec: i32[2 * NUM_LANES] for `dsa_gather_native_sc(live_vec=...)`.
+        rows: i32[W * num_tokens * topk_cap // 128 + FUSED_PREP_META_ROWS, 128]:
+          rows [0, W * num_tokens * topk_cap // 128) are the same physical
+          rows as `prepare_capped_window_indices` (window-major), the native
+          gather's linear operand; the next row's lanes [0, 2 * NUM_LANES)
+          are its live vector, at flat offset ``num_tokens * topk``
+          (`dsa_gather_native_sc(live_vec_offset=num_tokens * topk)`).
     """
     num_tokens, topk = topk_indices.shape
     if num_tokens > FUSED_PREP_MAX_TOKENS:
@@ -522,7 +549,9 @@ def prepare_capped_window_fused(
         native_sc_gather.live_vec_geometry(out_size, gather_atoms)
     )
     num_lanes = native_sc_gather.NUM_LANES
-    total_rows = num_windows * num_tokens * (topk_cap // 128)
+    if 2 * num_lanes > 128:
+        raise ValueError(f"live vector ({2 * num_lanes}) must fit one 128-lane row")
+    total_rows = num_windows * num_tokens * (topk_cap // 128) + FUSED_PREP_META_ROWS
     kernel = functools.partial(
         _capped_window_fused_kernel,
         topk_cap=topk_cap,
@@ -535,40 +564,32 @@ def prepare_capped_window_fused(
         num_owners=num_cores * num_subcores,
         num_lanes=num_lanes,
     )
-    rows, live_vec = pl.pallas_call(
+    return pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
+            num_scalar_prefetch=1,
             grid=(1,),
             in_specs=[
-                pl.BlockSpec((num_tokens, padded_pps), lambda i, kv, te: (0, 0)),
-                pl.BlockSpec((num_tokens, topk), lambda i, kv, te: (0, 0)),
+                pl.BlockSpec((num_tokens, padded_pps), lambda i, te: (0, 0)),
+                pl.BlockSpec((num_tokens, topk), lambda i, te: (0, 0)),
             ],
-            out_specs=[
-                pl.BlockSpec(memory_space=pltpu.HBM),
-                pl.BlockSpec(memory_space=pltpu.SMEM),
-            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=[
                 pltpu.VMEM((total_rows, 128), jnp.int32),
-                pltpu.SemaphoreType.DMA((num_windows,)),
+                pltpu.SemaphoreType.DMA((num_windows + 1,)),
             ],
         ),
-        out_shape=[
-            jax.ShapeDtypeStruct((total_rows, 128), jnp.int32),
-            jax.ShapeDtypeStruct((2 * num_lanes,), jnp.int32),
-        ],
+        out_shape=jax.ShapeDtypeStruct((total_rows, 128), jnp.int32),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
             disable_bounds_checks=True,
         ),
         name="capped_window_indices_fused",
     )(
-        kv_lens.astype(jnp.int32),
         jnp.reshape(token_end, (1,)).astype(jnp.int32),
         windows,
         topk_indices,
     )
-    return rows, live_vec
 
 
 def capped_live_windows(
@@ -1509,7 +1530,6 @@ def sparse_ragged_paged_attention(
         and q.shape[0] % uniform_chunk == 0
     )
     window_indices_all = None
-    gather_live_vec = None
     chunk_window_rows = 0  # rows of `window_indices_all` per chunk
     fused_prep = (
         fused_window_prep
@@ -1521,6 +1541,8 @@ def sparse_ragged_paged_attention(
         raise ValueError("fused_window_prep requires lse_mask_empty")
     if fused_prep:
         assert topk_cap is not None
+        # Only the attention kernel reads kv_lens here: the fused prep counts
+        # live entries itself, so XLA may run this reduce in the gather's shadow.
         kv_lens = jnp.sum(topk_indices != -1, axis=-1)
         physical_indices = None
         prep_small, prep_batch = _chunk_kernel_batch_size(
@@ -1529,11 +1551,10 @@ def sparse_ragged_paged_attention(
             small_chunk_tokens,
             small_chunk_batch_size,
         )
-        window_indices_all, gather_live_vec = prepare_capped_window_fused(
+        window_indices_all = prepare_capped_window_fused(
             topk_indices,
             page_indices,
             cu_q_lens,
-            kv_lens,
             cu_q_lens[distribution[2]],
             topk_cap=topk_cap,
             page_size=page_size,
@@ -1633,7 +1654,7 @@ def sparse_ragged_paged_attention(
                     i * chunk_window_rows : (i + 1) * chunk_window_rows
                 ]
             ),
-            gather_live_vec=gather_live_vec,
+            gather_live_in_indices=fused_prep,
             q_pe=q_pe,
             lse_lane_dense=lse_lane_dense,
             lse_mask_empty=lse_mask_empty,
@@ -1736,7 +1757,7 @@ def sparse_attention_chunk(
     topk_cap: int | None = None,
     topk_override: int | None = None,
     window_indices: jax.Array | None = None,
-    gather_live_vec: jax.Array | None = None,
+    gather_live_in_indices: bool = False,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
     lse_mask_empty: bool = False,
@@ -1760,9 +1781,10 @@ def sparse_attention_chunk(
     (unpadded, nope a multiple of 128) and `q_pe` its rope part; the kernel
     joins them in VMEM and the output (aliasing `q`) is `nope` wide.
     `lse_lane_dense`: `lse` is f32[max_num_tokens, num_q_heads].
-    `gather_live_vec` (with `window_indices` from `prepare_capped_window_fused`):
-    the gather's live bound, already computed; `window_indices` may then be its
-    128-lane form. `lse_mask_empty`: kv_len 0 tokens get lse -inf in-kernel.
+    `gather_live_in_indices` (with `window_indices` from
+    `prepare_capped_window_fused`): `window_indices` is its 128-lane form and
+    carries the gather's live bound, already computed, in the tile after the
+    rows. `lse_mask_empty`: kv_len 0 tokens get lse -inf in-kernel.
     """
     return_lse = lse is not None
     if topk_override is not None:
@@ -1984,10 +2006,11 @@ def sparse_attention_chunk(
         gather_atoms = sparsecore_atoms_per_batch
         if small_chunk and small_chunk_live_gather:
             gather_atoms = small_chunk_gather_atoms
-        if gather_live_vec is not None:
+        if gather_live_in_indices:
             # `window_indices` is then the fused prep's 128-lane form: hand it
-            # to the gather flat (a bitcast, no relayout).
-            live_kwargs = dict(live_vec=gather_live_vec, linear_indices=True)
+            # to the gather flat (a bitcast, no relayout); its live vector
+            # sits right after the chunk's rows.
+            live_kwargs = dict(live_vec_offset=chunk_size * topk, linear_indices=True)
         else:
             live_tokens = batch_end - start_pos
             token_windows = jnp.where(
