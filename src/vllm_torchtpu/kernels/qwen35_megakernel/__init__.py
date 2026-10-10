@@ -13,7 +13,20 @@
 # limitations under the License.
 """Qwen3.5-397B-A17B-FP8 whole-backbone decode megakernel for TPU v7x-8."""
 
-from . import megakernel, pool_alias, pool_io
+from . import blocks, megakernel, pool_alias, pool_io
+from .blocks import (
+    DenseWeightRing,
+    ExpertWeightRing,
+    GDNBlock,
+    GDNPoolDMA,
+    GprRecIn,
+    KVPoolDMA,
+    MKBuildContext,
+    MoEBlock,
+    PagedAttentionBlock,
+    PallasAllReduce,
+    WeightRings,
+)
 from .megakernel import (
     DEFAULT_TILES,
     FULL,
@@ -56,9 +69,19 @@ from .vllm_adapter import (
 
 __all__ = [
     "DEFAULT_TILES",
+    "DenseWeightRing",
+    "ExpertWeightRing",
     "FULL",
     "FULL_EP",
+    "GDNBlock",
+    "GDNPoolDMA",
+    "GprRecIn",
+    "KVPoolDMA",
+    "MKBuildContext",
     "MKConfig",
+    "MoEBlock",
+    "PagedAttentionBlock",
+    "PallasAllReduce",
     "Qwen35Megakernel",
     "Qwen35MtpMegakernel",
     "TINY",
@@ -67,7 +90,9 @@ __all__ = [
     "Tiles",
     "VERIFY_TILES",
     "WIDE_TILES",
+    "WeightRings",
     "apply_tp_moe_flags",
+    "blocks",
     "build",
     "default_tiles",
     "extract_kn_fp8_weight",

@@ -11,226 +11,76 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU unit tests for the Qwen3.5-397B-A17B-FP8 decode/verify megakernel adapter."""
+"""CPU unit tests for top-level Qwen3.5 megakernel modular package structure,
+step metadata preparation, and A/B calibrator."""
 
 from __future__ import annotations
 
-import dataclasses
+import time
 from types import SimpleNamespace
 
-import pytest
 import torch
 
+from vllm_torchtpu.kernels import qwen35_megakernel as pkg
+from vllm_torchtpu.kernels.qwen35_megakernel import attention_block
+from vllm_torchtpu.kernels.qwen35_megakernel import blocks
+from vllm_torchtpu.kernels.qwen35_megakernel import collectives
+from vllm_torchtpu.kernels.qwen35_megakernel import config
+from vllm_torchtpu.kernels.qwen35_megakernel import context
+from vllm_torchtpu.kernels.qwen35_megakernel import gdn_block
 from vllm_torchtpu.kernels.qwen35_megakernel import megakernel as K
-from vllm_torchtpu.kernels.qwen35_megakernel import pool_io
+from vllm_torchtpu.kernels.qwen35_megakernel import moe_block
+from vllm_torchtpu.kernels.qwen35_megakernel import pool_dma
+from vllm_torchtpu.kernels.qwen35_megakernel import rings
+from vllm_torchtpu.kernels.qwen35_megakernel import vllm_adapter as VA
 from vllm_torchtpu.kernels.qwen35_megakernel.vllm_adapter import (
     MKABCalibrator,
-    Qwen35Megakernel,
-    pack_att_in_layer,
-    pack_att_out_layer,
-    pack_expert_views_layer,
-    pack_lin_in_layer,
-    pack_lin_out_layer,
-    pack_router_and_shared_layer,
-    pack_smalls_layer,
-    pack_weights,
     parse_mk_ab_enabled,
-    parse_mk_buckets,
-    parse_mk_fused_pool_io,
-    parse_mk_verify_buckets,
     prepare_step_metadata,
-    reshard_layer_experts_ep_to_tp,
-    select_bucket,
 )
-from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+
+from qwen35_megakernel_test_utils import bare_mk
 
 
-def _make_fp8_linear(in_dim: int, out_dim: int, flipped: bool = True) -> SimpleNamespace:
-    if flipped:
-        w = torch.randint(0, 120, (in_dim, out_dim), dtype=torch.uint8).view(
-            torch.float8_e4m3fn
-        )
-    else:
-        w = torch.randint(0, 120, (out_dim, in_dim), dtype=torch.uint8).view(
-            torch.float8_e4m3fn
-        )
-    s = torch.rand((out_dim, 1), dtype=torch.float32) + 0.1
-    ns = SimpleNamespace(
-        weight=torch.nn.Parameter(w, requires_grad=False),
-        weight_scale=torch.nn.Parameter(s, requires_grad=False),
-    )
-    setattr(ns, WEIGHT_FLIPPED_ATTR, flipped)
-    return ns
+def test_modular_reexports_and_symbols():
+    """Verify that the modular submodules expose their expected classes/functions
+    and `megakernel.py` / `__init__.py` preserve backward-compatible re-exports."""
+    assert K.MKConfig is config.MKConfig
+    assert K.Tiles is config.Tiles
+    assert K.default_tiles is config.default_tiles
+    assert K.weight_shapes is config.weight_shapes
+    assert K.state_shapes is config.state_shapes
+    assert K.smalls_layout is config.smalls_layout
+    assert K.encode_ecopy is config.encode_ecopy
+    assert K.plan is config.plan
 
+    assert K.MKBuildContext is context.MKBuildContext
+    assert K.PallasAllReduce is collectives.PallasAllReduce
+    assert K.WeightRings is rings.WeightRings
+    assert K.DenseWeightRing is rings.DenseWeightRing
+    assert K.ExpertWeightRing is rings.ExpertWeightRing
+    assert K.KVPoolDMA is pool_dma.KVPoolDMA
+    assert K.GDNPoolDMA is pool_dma.GDNPoolDMA
+    assert K.GprRecIn is pool_dma.GprRecIn
+    assert K.GDNBlock is gdn_block.GDNBlock
+    assert K.PagedAttentionBlock is attention_block.PagedAttentionBlock
+    assert K.MoEBlock is moe_block.MoEBlock
+    assert blocks.GDNBlock is gdn_block.GDNBlock
 
-def _make_tiny_backbone(c: K.MKConfig, e_slots: int) -> SimpleNamespace:
-    layers = []
-    for l in range(c.L):
-        is_att = (l % c.att_every) == (c.att_every - 1)
-        ltype = "full_attention" if is_att else "linear_attention"
-
-        if is_att:
-            self_attn = SimpleNamespace(
-                q_proj=_make_fp8_linear(c.H, c.nh * 2 * c.HD),
-                k_proj=_make_fp8_linear(c.H, c.HD),
-                v_proj=_make_fp8_linear(c.H, c.HD),
-                o_proj=_make_fp8_linear(c.nh * c.HD, c.H),
-                q_norm=SimpleNamespace(
-                    weight=torch.nn.Parameter(
-                        torch.randn(c.HD, dtype=torch.bfloat16), requires_grad=False
-                    )
-                ),
-                k_norm=SimpleNamespace(
-                    weight=torch.nn.Parameter(
-                        torch.randn(c.HD, dtype=torch.bfloat16), requires_grad=False
-                    )
-                ),
-                attn=SimpleNamespace(layer_name=f"model.layers.{l}.self_attn.attn", kv_cache=[]),
-            )
-            linear_attn = None
-        else:
-            in_qkvz = _make_fp8_linear(c.H, c.QKV + c.Z)
-            in_ba = SimpleNamespace(
-                weight=torch.nn.Parameter(
-                    torch.randn((2 * c.vh, c.H), dtype=torch.bfloat16) * 0.05,
-                    requires_grad=False,
-                )
-            )
-            linear_attn = SimpleNamespace(
-                prefix=f"model.layers.{l}.linear_attn",
-                in_proj_qkvz=in_qkvz,
-                in_proj_ba=in_ba,
-                out_proj=_make_fp8_linear(c.Z, c.H),
-                conv1d=SimpleNamespace(
-                    weight=torch.nn.Parameter(
-                        torch.randn((c.QKV, 1, 4), dtype=torch.bfloat16),
-                        requires_grad=False,
-                    )
-                ),
-                A_log=torch.nn.Parameter(
-                    torch.randn(c.vh, dtype=torch.float32), requires_grad=False
-                ),
-                dt_bias=torch.nn.Parameter(
-                    torch.randn(c.vh, dtype=torch.bfloat16), requires_grad=False
-                ),
-                norm=SimpleNamespace(
-                    weight=torch.nn.Parameter(
-                        torch.randn(c.VD, dtype=torch.float32), requires_grad=False
-                    )
-                ),
-                kv_cache=[],
-            )
-            self_attn = None
-
-        w13 = torch.randint(
-            0, 120, (e_slots, c.H, 2 * c.IR), dtype=torch.uint8
-        ).view(torch.float8_e4m3fn)
-        w2 = torch.randint(0, 120, (e_slots, c.IR, c.H), dtype=torch.uint8).view(
-            torch.float8_e4m3fn
-        )
-        w13_s = torch.rand((e_slots, 1, 2 * c.IR), dtype=torch.float32) + 0.1
-        w2_s = torch.rand((e_slots, 1, c.H), dtype=torch.float32) + 0.1
-        experts = SimpleNamespace(
-            w13_weight=torch.nn.Parameter(w13, requires_grad=False),
-            w2_weight=torch.nn.Parameter(w2, requires_grad=False),
-            w13_weight_scale=torch.nn.Parameter(w13_s, requires_grad=False),
-            w2_weight_scale=torch.nn.Parameter(w2_s, requires_grad=False),
-        )
-
-        # Fused router + shared expert Cat_FP8_256
-        fused_gu_cols = c.E + 2 * c.IS
-        fused_w = torch.randint(
-            0, 120, (c.H, fused_gu_cols), dtype=torch.uint8
-        ).view(torch.float8_e4m3fn)
-        fused_s = torch.rand((1, fused_gu_cols), dtype=torch.float32) + 0.1
-        shared_expert = SimpleNamespace(
-            down_proj=_make_fp8_linear(c.IS, c.H),
-        )
-        shared_expert_gate = SimpleNamespace(
-            weight=torch.nn.Parameter(
-                torch.randn((1, c.H), dtype=torch.bfloat16), requires_grad=False
-            )
-        )
-        mlp = SimpleNamespace(
-            experts=experts,
-            _fused_gate_gu_fp8_weight=fused_w,
-            _fused_gate_gu_fp8_scale=fused_s,
-            shared_expert=shared_expert,
-            shared_expert_gate=shared_expert_gate,
-        )
-
-        layer = SimpleNamespace(
-            layer_type=ltype,
-            self_attn=self_attn,
-            linear_attn=linear_attn,
-            mlp=mlp,
-            input_layernorm=SimpleNamespace(
-                weight=torch.nn.Parameter(
-                    torch.randn(c.H, dtype=torch.bfloat16), requires_grad=False
-                )
-            ),
-            post_attention_layernorm=SimpleNamespace(
-                weight=torch.nn.Parameter(
-                    torch.randn(c.H, dtype=torch.bfloat16), requires_grad=False
-                )
-            ),
-        )
-        layers.append(layer)
-
-    return SimpleNamespace(
-        layers=layers,
-        norm=SimpleNamespace(
-            weight=torch.nn.Parameter(
-                torch.randn(c.H, dtype=torch.bfloat16), requires_grad=False
-            )
-        ),
-        embed_tokens=lambda ids: torch.zeros(
-            (ids.shape[0], c.H), dtype=torch.bfloat16, device=ids.device
-        ),
-    )
-
-
-def test_pack_weights_ep_and_tp():
-    c_ep = dataclasses.replace(
-        K.TINY_EP, stack_e=False, e_slots=20, paged_kv=True
-    )
-    tiles = K.TINY_TILES
-    backbone = _make_tiny_backbone(c_ep, e_slots=20)
-    packed_ep = pack_weights(backbone, c_ep, tp_rank=0, tiles=tiles)
-
-    assert len(packed_ep["e13"]) == c_ep.L
-    assert len(packed_ep["e2"]) == c_ep.L
-    for l in range(c_ep.L):
-        assert (
-            packed_ep["e13"][l].data_ptr()
-            == backbone.layers[l].mlp.experts.w13_weight.data_ptr()
-        )
-        assert (
-            packed_ep["e2"][l].data_ptr()
-            == backbone.layers[l].mlp.experts.w2_weight.data_ptr()
-        )
-    assert packed_ep["smalls_16x4096"].shape == (c_ep.L, 16, c_ep.H)
-    assert packed_ep["es_8x8192"].shape == (c_ep.L, 20, 8, 8192)
-
-    # Test EP -> TP in-place resharding
-    c_tp = dataclasses.replace(K.TINY, stack_e=False, e_slots=0, paged_kv=True)
-    for l in range(c_tp.L):
-        reshard_layer_experts_ep_to_tp(
-            backbone.layers[l].mlp,
-            tp_rank=1,
-            c=c_tp,
-            all_gather_fn=lambda x: x.repeat(c_tp.R, *([1] * (x.ndim - 1))),
-        )
-    packed_tp = pack_weights(backbone, c_tp, tp_rank=1, tiles=tiles)
-    assert packed_tp["e13"][0].shape[0] == c_tp.E
-    assert packed_tp["e13"][0].shape[-1] == 2 * c_tp.IR
-    assert packed_tp["e2"][0].shape[0] == c_tp.E
+    assert pkg.MKConfig is config.MKConfig
+    assert pkg.Tiles is config.Tiles
+    assert pkg.PallasAllReduce is collectives.PallasAllReduce
+    assert pkg.WeightRings is rings.WeightRings
+    assert pkg.KVPoolDMA is pool_dma.KVPoolDMA
+    assert pkg.GDNPoolDMA is pool_dma.GDNPoolDMA
+    assert pkg.GDNBlock is gdn_block.GDNBlock
+    assert pkg.PagedAttentionBlock is attention_block.PagedAttentionBlock
+    assert pkg.MoEBlock is moe_block.MoEBlock
 
 
 def test_prepare_step_metadata_t1_and_t4():
     num_reqs = 3
     max_pages = 16
-    # 1D block_tables as produced by TPUModelRunner
     bt_1d = torch.arange(1, 1 + 8 * max_pages, dtype=torch.int32)
     attn_md = SimpleNamespace(
         seq_lens=torch.tensor([100, 250, 40, 0, 0, 0, 0, 0], dtype=torch.int32),
@@ -242,7 +92,9 @@ def test_prepare_step_metadata_t1_and_t4():
     roff_full[30] = 1
     mamba_mds = []
     for g in range(3):
-        state_ids = torch.tensor([10 + g, 20 + g, 30 + g, 0, 0, 0, 0, 0], dtype=torch.int32)
+        state_ids = torch.tensor(
+            [10 + g, 20 + g, 30 + g, 0, 0, 0, 0, 0], dtype=torch.int32
+        )
         ckpt_2d = torch.zeros((8, 4), dtype=torch.int32)
         for s in range(num_reqs):
             for t in range(4):
@@ -255,7 +107,6 @@ def test_prepare_step_metadata_t1_and_t4():
             )
         )
 
-    # Test T=4, B=16 (nseq_bkt = 4)
     positions_t4 = torch.tensor(
         [96, 97, 98, 99, 246, 247, 248, 249, 36, 37, 38, 39, 0, 0, 0, 0],
         dtype=torch.int32,
@@ -277,12 +128,8 @@ def test_prepare_step_metadata_t1_and_t4():
     assert ckpt4.shape == (3, 4, 4)
     assert torch.all(ckpt4[:, 3, :] == 0)
     assert roff4.shape == (3, 4)
-    assert roff4[0, 0].item() == 2
-    assert roff4[0, 1].item() == 3
-    assert roff4[0, 2].item() == 1
-    assert roff4[0, 3].item() == 0
+    assert roff4[0, :4].tolist() == [2, 3, 1, 0]
 
-    # Test T=1, B=8 (nseq_bkt = 8)
     pos1, pt1, ckpt1, roff1 = prepare_step_metadata(
         attn_md,
         mamba_mds,
@@ -299,60 +146,11 @@ def test_prepare_step_metadata_t1_and_t4():
     assert torch.all(roff1 == 0)
 
 
-def test_buckets_parsing():
-    assert parse_mk_buckets("8,16,32,64") == (8, 16, 32, 64)
-    assert parse_mk_buckets("0") == ()
-    assert parse_mk_verify_buckets("16,32,48,64") == (16, 32, 48, 64)
-    assert parse_mk_verify_buckets("0") == ()
-    assert select_bucket(12, (16, 32, 48, 64)) == 16
-    assert select_bucket(28, (16, 32, 48, 64)) == 32
-    assert select_bucket(44, (16, 32, 48, 64)) == 48
-    assert select_bucket(60, (16, 32, 48, 64)) == 64
+def test_mk_ab_calibrator_and_hooks(monkeypatch):
     assert parse_mk_ab_enabled("1") is True
     assert parse_mk_ab_enabled("0") is False
 
-
-def test_pack_weights_ecopy_placement(monkeypatch):
-    from vllm_torchtpu import expert_placement
-
-    c_ep = dataclasses.replace(
-        K.TINY_EP, stack_e=False, e_slots=20, paged_kv=True
-    )
-    er, ew = c_ep.ER, c_ep.EW
-    extra = ew - er
-    tiles = K.TINY_TILES
-    backbone = _make_tiny_backbone(c_ep, e_slots=ew)
-
-    for l in range(c_ep.L):
-        cores = [list(range(r * er, (r + 1) * er)) for r in range(c_ep.R)]
-        for r in range(c_ep.R):
-            for k in range(extra):
-                r_src = (r + 1 + (k + l) % (c_ep.R - 1)) % c_ep.R
-                cores[r].append(r_src * er + er - extra + k)
-        backbone.layers[l].mlp.experts._ecopy_cores = cores
-
-    packed = pack_weights(backbone, c_ep, tp_rank=0, tiles=tiles)
-    lay, S = K.smalls_layout(c_ep)
-    assert "ecopy" in lay
-    o_ec, w_ec = lay["ecopy"]
-    assert packed["smalls"].shape == (c_ep.L, 1, S)
-    for l in range(c_ep.L):
-        ec_row = packed["smalls"][l, 0, o_ec : o_ec + w_ec]
-        assert int((ec_row > 0).sum().item()) == c_ep.R * extra
-
-    # Also verify real Qwen3.5 copies64 JSON table via expert_placement
-    table_path = expert_placement.auto_table(dcp_size=1, max_num_seqs=16)
-    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", table_path)
-    c_full72 = dataclasses.replace(K.FULL_EP, stack_e=False, e_slots=72, paged_kv=True)
-    cores0 = expert_placement.cores(0)
-    ec0 = K.encode_ecopy(c_full72, cores0)
-    assert len(ec0) == 512
-    assert sum(1 for x in ec0 if x > 0) == 64
-
-
-def test_mk_ab_calibrator():
     cal = MKABCalibrator(enabled=True, period_s=10.0, cap=4)
-    # Deterministic per-key alternation: even -> MK, odd -> stock
     assert cal.choose("mk_t4_b16", True) == (True, "mk_t4_b16", "mk")
     assert cal.last_decision == ("mk_t4_b16", "mk")
     cal.record(10.0, padded_tokens=16, now=cal._t0 + 1.0)
@@ -361,19 +159,16 @@ def test_mk_ab_calibrator():
     assert cal.last_decision == ("mk_t4_b16", "stock")
     cal.record(14.0, padded_tokens=16, now=cal._t0 + 2.0)
 
-    # Independent counter per key
     assert cal.choose("mk_t4_b8", True) == (True, "mk_t4_b8", "mk")
     cal.record(8.0, padded_tokens=16, now=cal._t0 + 3.0)
 
-    # Non-eligible step always takes stock
     assert cal.choose("stock_t4_n13", False) == (False, "stock_t4_n13", "stock")
     cal.record(19.5, padded_tokens=64, now=cal._t0 + 4.0)
 
-    # Trigger period flush
     assert cal.choose("mk_t4_b16", True) == (True, "mk_t4_b16", "mk")
     res = cal.record(12.0, padded_tokens=16, now=cal._t0 + 11.0)
     assert res is not None
-    elapsed, win_json, cum_json = res
+    elapsed, _, _ = res
     assert elapsed >= 10.0
     cum = cal.summary_dict(window=False)
     assert cum["mk_t4_b16"]["mk"] == [2, 11.0, 10.2, 11.0, 11.8]
@@ -381,557 +176,24 @@ def test_mk_ab_calibrator():
     assert cum["mk_t4_b16"]["stock_p16"] == [1, 14.0, 14.0, 14.0, 14.0]
     assert cum["stock_t4_n13"]["stock"] == [1, 19.5, 19.5, 19.5, 19.5]
     assert cum["stock_t4_n13"]["stock_p64"] == [1, 19.5, 19.5, 19.5, 19.5]
-    # Window was cleared on flush, cumulative preserved
     assert cal.summary_dict(window=True) == {}
 
-    # Reset clears everything
     cal.reset()
     assert cal.counts == {}
     assert cal.summary_dict(window=False) == {}
 
-
-def test_fused_pool_io_parsing_and_hlo_guard():
-    assert parse_mk_fused_pool_io(None) is True
-    assert parse_mk_fused_pool_io("1") is True
-    assert parse_mk_fused_pool_io("true") is True
-    assert parse_mk_fused_pool_io("0") is False
-    assert parse_mk_fused_pool_io("false") is False
-    assert parse_mk_fused_pool_io("off") is False
-
-    good_hlo = """
-    HloModule fused_mk
-    ENTRY main {
-      %p0 = f8e4m3fn[4096,2,64,4,128]{4,3,2,1,0:T(8,128)} parameter(0)
-      %call = bf16[16,4096]{1,0:T(8,128)S(1)} custom-call(%p0), custom_call_target="tpu_custom_call"
-      ROOT %tup = (bf16[16,4096]{1,0:T(8,128)}, f8e4m3fn[4096,2,64,4,128]{4,3,2,1,0:T(8,128)}) tuple(%call, %p0)
-    }
-    """
-    ok, reason = pool_io.check_fused_pool_hlo(good_hlo, page_size=128)
-    assert ok is True
-    assert reason == "ok"
-
-    bad_vmem_hlo = """
-    HloModule bad_mk
-    ENTRY main {
-      %p0 = f8e4m3fn[64,2,64,4,128]{4,3,2,1,0:T(8,128)} parameter(0)
-      %cs = (f8e4m3fn[64,2,64,4,128]{4,3,2,1,0:T(8,128)S(1)}, f8e4m3fn[64,2,64,4,128]{4,3,2,1,0:T(8,128)}, u32[]{:S(2)}) copy-start(%p0)
-      %cd = f8e4m3fn[64,2,64,4,128]{4,3,2,1,0:T(8,128)S(1)} copy-done(%cs)
-      %call = bf16[16,4096]{1,0:T(8,128)S(1)} custom-call(%cd), custom_call_target="tpu_custom_call"
-      ROOT %tup = (bf16[16,4096]{1,0:T(8,128)}, f8e4m3fn[64,2,64,4,128]{4,3,2,1,0:T(8,128)}) tuple(%call, %p0)
-    }
-    """
-    ok_bad, reason_bad = pool_io.check_fused_pool_hlo(bad_vmem_hlo, page_size=128)
-    assert ok_bad is False
-    assert "copy-start" in reason_bad or "S(1)" in reason_bad
-
-
-def test_amask_default_and_nan_kv_padding_guard():
-    import jax
-    import jax.numpy as jnp
-    import numpy as np
-    from jax.sharding import Mesh
-
-    assert K.Tiles().amask == 1
-    assert K.DEFAULT_TILES.amask == 1
-    assert K.VERIFY_TILES.amask == 1
-    assert K.WIDE_TILES.amask == 1
-    assert K.TINY_TILES.amask == 1
-    assert K.default_tiles(K.FULL_EP).amask == 1
-
-    # Single-rank TINY config with paged_kv=True to test 0x7f (FP8 NaN) in KV slots
-    c = dataclasses.replace(
-        K.TINY_EP,
-        R=1,
-        B=4,
-        T=2,
-        L=4,
-        att_every=4,
-        NH=1,
-        NKV=1,
-        KH=1,
-        VH=2,
-        I=128,
-        IS=128,
-        E=128,
-        TOPK=2,
-        e_slots=128,
-        paged_kv=True,
-        num_pages=128,
-        page_size=128,
-        max_pages_per_seq=8,
-        ctx=1024,
+    mk = bare_mk(
+        monkeypatch,
+        tp_rank=0,
+        _step_mix={},
+        _step_mix_t0=time.monotonic(),
+        _step_mix_period_s=1e9,
+        ab_calibrator=VA.MKABCalibrator(enabled=True, period_s=1e9),
     )
-    tiles_am1 = dataclasses.replace(
-        K.TINY_TILES,
-        amask=1,
-        hier=0,
-        pack=0,
-        mb8=0,
-        kv_blk=256,
-        nkv=2,
-    )
-    tiles_am4 = dataclasses.replace(tiles_am1, amask=4)
-
-    mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
-    pt, ckpt, roff, _ = pool_io.default_pool_layout(c)
-    starts = [10, 20]
-    pos = jnp.asarray(
-        [s0 + t for s0 in starts for t in range(c.T)], dtype=jnp.int32
-    )
-    hid = jax.random.normal(jax.random.PRNGKey(0), (c.M, c.H), jnp.float32)
-    hid = jnp.where(jnp.arange(c.M)[:, None] < c.B, hid, 0.0).astype(
-        jnp.bfloat16
-    )
-
-    backbone = _make_tiny_backbone(c, e_slots=c.EW)
-    packed = pack_weights(backbone, c, tp_rank=0, tiles=tiles_am1)
-    w_flat = [
-        jnp.asarray(packed[k].view(torch.uint8).numpy()).view(
-            K.FP8
-            if packed[k].dtype == torch.float8_e4m3fn
-            else (
-                jnp.bfloat16
-                if packed[k].dtype == torch.bfloat16
-                else jnp.float32
-            )
-        )
-        for k in K.W_NAMES
-    ]
-
-    # Clean zero pool vs 0x7f-contaminated pool (unwritten col >= rem is 0x7f = FP8 NaN)
-    clean_u8 = np.zeros((c.num_pages, 2, 64, 4, c.page_size), dtype=np.uint8)
-    nan_u8 = np.full((c.num_pages, 2, 64, 4, c.page_size), 0x7F, dtype=np.uint8)
-    for s, s0 in enumerate(starts):
-        kp = int(pt[s, 0])
-        clean_u8[kp, :, :, :, :s0] = 0x38  # 0.5 in f8e4m3fn
-        nan_u8[kp, :, :, :, :s0] = 0x38
-    for g_sub in range(ckpt.shape[0]):
-        for s in range(len(starts)):
-            blk_id = int(ckpt[g_sub, s, 0])
-            if blk_id > 0:
-                p0 = blk_id * c.gdn_pages
-                clean_u8[p0 : p0 + c.gdn_pages] = 0x00
-                nan_u8[p0 : p0 + c.gdn_pages] = 0x00
-
-    raw_clean = [
-        jax.lax.bitcast_convert_type(jnp.asarray(clean_u8), K.FP8)
-        for _ in range(c.NATT)
-    ]
-    raw_nan_am1 = [
-        jax.lax.bitcast_convert_type(jnp.asarray(nan_u8), K.FP8)
-        for _ in range(c.NATT)
-    ]
-    raw_nan_am4 = [
-        jax.lax.bitcast_convert_type(jnp.asarray(nan_u8), K.FP8)
-        for _ in range(c.NATT)
-    ]
-
-    skip_exp = frozenset({"experts"})
-    fn_clean, _, _, _ = pool_io.make_flat_pooled_step(
-        mesh, c, tiles_am1, skip=skip_exp, fused_pool_io=True, interpret=True
-    )
-    fn_am1, _, _, _ = pool_io.make_flat_pooled_step(
-        mesh, c, tiles_am1, skip=skip_exp, fused_pool_io=True, interpret=True
-    )
-    fn_am4, _, _, _ = pool_io.make_flat_pooled_step(
-        mesh, c, tiles_am4, skip=skip_exp, fused_pool_io=True, interpret=True
-    )
-
-    out_clean = fn_clean(pos, hid, *w_flat, *raw_clean, pt, ckpt, roff)[0]
-    out_am1 = fn_am1(pos, hid, *w_flat, *raw_nan_am1, pt, ckpt, roff)[0]
-    out_am4 = fn_am4(pos, hid, *w_flat, *raw_nan_am4, pt, ckpt, roff)[0]
-
-    assert int(jnp.isnan(out_am1[: c.B]).sum()) == 0
-    diff_am1 = jnp.abs(
-        out_clean[: c.B].astype(jnp.float32)
-        - out_am1[: c.B].astype(jnp.float32)
-    )
-    assert float(jnp.max(diff_am1)) == 0.0
-    assert int(jnp.isnan(out_am4[: c.B]).sum()) > 0
-
-
-def test_tp16_config_packing_and_gdn_pool_geometry():
-    import jax
-    import jax.numpy as jnp
-    import numpy as np
-    from jax.sharding import Mesh
-
-    c16_ep = dataclasses.replace(K.FULL_EP, R=16, paged_kv=True, fused_pool_io=True)
-    c16_tp = dataclasses.replace(K.FULL, R=16, paged_kv=True, fused_pool_io=True)
-    c16_ep.check()
-    c16_tp.check()
-
-    assert c16_ep.nh == 2
-    assert c16_ep.kh == 1
-    assert c16_ep.vh == 4
-    assert c16_ep.QKV == 768
-    assert c16_ep.Z == 512
-    assert c16_ep.G == 8
-    assert c16_ep.ER == 32
-    assert c16_ep.IS_SLICE == 64
-    assert c16_ep.ISR == 128
-    assert c16_ep.IR == 1024
-    assert c16_tp.I_SLICE == 64
-    assert c16_tp.IR == 128
-    assert c16_ep.rec_pages == 2
-    assert c16_ep.gdn_pages == 3
-
-    # Verify default_tiles and build() across decode and verify buckets at R=16
-    for t_tok, b_rows in ((1, 8), (1, 16), (1, 32), (4, 16), (4, 32), (4, 64)):
-        cfg_b = dataclasses.replace(c16_ep, B=b_rows, T=t_tok, L=4)
-        tiles_b = K.default_tiles(cfg_b)
-        if b_rows <= 32:
-            assert tiles_b.hier == 3
-        else:
-            assert tiles_b.hier == 0 and tiles_b.rsag is True
-        _, info = K.build(cfg_b, tiles_b)
-        assert info["vmem_scratch_bytes"] <= tiles_b.vmem_mib * 1024 * 1024
-
-    # Verify 64 -> 128 zero-padded shared expert and TP routed expert packing at R=16
-    c_tiny16_ep = dataclasses.replace(
-        K.TINY_EP,
-        R=16,
-        NH=16,
-        KH=16,
-        VH=32,
-        E=128,
-        I=1024,
-        IS=1024,
-        stack_e=False,
-        e_slots=8,
-        paged_kv=True,
-    )
-    c_tiny16_ep.check()
-    assert c_tiny16_ep.IS_SLICE == 64 and c_tiny16_ep.ISR == 128
-
-    backbone = _make_tiny_backbone(c_tiny16_ep, e_slots=8)
-    mlp0 = backbone.layers[0].mlp
-    torch.manual_seed(0)
-    x_test = torch.randn((4, c_tiny16_ep.H), dtype=torch.float32) * 0.01
-
-    # Full unsharded shared expert output vs sum over 16 zero-padded 128-lane ranks
-    w_gu_full = mlp0._fused_gate_gu_fp8_weight[:, c_tiny16_ep.E :].float()
-    s_gu_full = mlp0._fused_gate_gu_fp8_scale.reshape(-1)[c_tiny16_ep.E :].float()
-    w_down_full = mlp0.shared_expert.down_proj.weight.float()
-    s_down_full = mlp0.shared_expert.down_proj.weight_scale.reshape(-1).float()
-    g_full = (x_test @ w_gu_full[:, : c_tiny16_ep.IS]) * s_gu_full[: c_tiny16_ep.IS]
-    u_full = (x_test @ w_gu_full[:, c_tiny16_ep.IS :]) * s_gu_full[c_tiny16_ep.IS :]
-    sh_ref = (torch.nn.functional.silu(g_full) * u_full) @ w_down_full * s_down_full
-
-    sh_sum = torch.zeros_like(sh_ref)
-    sh_unpadded_sum = torch.zeros_like(sh_ref)
-    for r in range(16):
-        pk_r = pack_router_and_shared_layer(
-            mlp0,
-            c=c_tiny16_ep,
-            tp_rank=r,
-            tk_router=c_tiny16_ep.H,
-            tk_sh13=c_tiny16_ep.H,
-            tk_sh2=c_tiny16_ep.ISR,
-        )
-        w13_r = pk_r["sh13"].reshape(c_tiny16_ep.H, 2 * c_tiny16_ep.ISR).float()
-        s13_r = pk_r["sh13_s"].float()
-        w2_r = pk_r["sh2"].reshape(c_tiny16_ep.ISR, c_tiny16_ep.H).float()
-        s2_r = pk_r["sh2_s"].float()
-        # Upper 64 lanes of each 128-lane half must be strictly zero
-        assert torch.all(w13_r[:, 64:128] == 0)
-        assert torch.all(w13_r[:, 192:256] == 0)
-        assert torch.all(w2_r[64:128, :] == 0)
-        h_r = (x_test @ w13_r) * s13_r
-        mid_r = torch.nn.functional.silu(h_r[:, :128]) * h_r[:, 128:]
-        out_r_padded = (mid_r @ w2_r) * s2_r
-        out_r_unpadded = (mid_r[:, :64] @ w2_r[:64, :]) * s2_r
-        assert torch.equal(out_r_padded, out_r_unpadded)
-        sh_sum = sh_sum + out_r_padded
-        sh_unpadded_sum = sh_unpadded_sum + out_r_unpadded
-
-    assert torch.equal(sh_sum, sh_unpadded_sum)
-    torch.testing.assert_close(sh_sum, sh_ref, rtol=5e-4, atol=5e-2)
-
-    # Test EP -> TP resharding at R=16 (64 -> 128 zero-padded IR)
-    c_tiny16_tp = dataclasses.replace(c_tiny16_ep, moe_tp=True, e_slots=0)
-    assert c_tiny16_tp.I_SLICE == 64 and c_tiny16_tp.IR == 128
-    for layer_idx in range(c_tiny16_tp.L):
-        reshard_layer_experts_ep_to_tp(
-            backbone.layers[layer_idx].mlp,
-            tp_rank=3,
-            c=c_tiny16_tp,
-            all_gather_fn=lambda x: x.repeat(c_tiny16_tp.R, *([1] * (x.ndim - 1))),
-        )
-    packed_tp16 = pack_weights(
-        backbone,
-        c_tiny16_tp,
-        tp_rank=3,
-        tiles=dataclasses.replace(K.TINY_TILES, bank=256 << 10),
-    )
-    assert packed_tp16["e13"][0].shape == (c_tiny16_tp.E, c_tiny16_tp.H, 256)
-    assert packed_tp16["e2"][0].shape == (c_tiny16_tp.E, 128, c_tiny16_tp.H)
-
-    # Verify 3-page GDN checkpoint geometry (vh=4 -> rec_pages=2, gdn_pages=3)
-    # in fused vs split pool IO.
-    c_gdn3 = dataclasses.replace(
-        K.TINY_EP,
-        R=1,
-        B=4,
-        T=2,
-        L=4,
-        H=2048,
-        att_every=4,
-        NH=1,
-        NKV=1,
-        KH=1,
-        VH=4,
-        I=128,
-        IS=128,
-        E=128,
-        TOPK=2,
-        e_slots=128,
-        paged_kv=True,
-        num_pages=128,
-        page_size=128,
-        max_pages_per_seq=8,
-        ctx=1024,
-    )
-    assert c_gdn3.vh == 4 and c_gdn3.rec_pages == 2 and c_gdn3.gdn_pages == 3
-    tiles_gdn3 = dataclasses.replace(
-        K.TINY_TILES, bank=256 << 10, hier=0, pack=0, mb8=0, kv_blk=256, nkv=2
-    )
-    mesh1 = Mesh(np.array(jax.devices()[:1]), ("tp",))
-    pt, ckpt, roff, min_pages = pool_io.default_pool_layout(c_gdn3)
-    assert min_pages % 3 == 0
-    bb_gdn3 = _make_tiny_backbone(c_gdn3, e_slots=c_gdn3.EW)
-    packed_gdn3 = pack_weights(bb_gdn3, c_gdn3, tp_rank=0, tiles=tiles_gdn3)
-    w_leaves = [
-        jnp.asarray(packed_gdn3[k].view(torch.uint8).numpy()).view(
-            K.FP8
-            if packed_gdn3[k].dtype == torch.float8_e4m3fn
-            else (
-                jnp.bfloat16
-                if packed_gdn3[k].dtype == torch.bfloat16
-                else jnp.float32
-            )
-        )
-        for k in K.W_NAMES
-    ]
-    sh_ref_st = K.state_shapes(dataclasses.replace(c_gdn3, paged_kv=False))
-    St = {
-        k: jax.random.normal(
-            jax.random.PRNGKey(10 + idx), (c_gdn3.R, *s), jnp.float32
-        ).astype(dt)
-        * 0.1
-        for idx, (k, (s, dt)) in enumerate(sh_ref_st.items())
-    }
-
-    raw_init = pool_io.states_to_pool(c_gdn3, St, pt, ckpt, roff)
-    raw_split = [jnp.array(r, copy=True) for r in raw_init]
-    raw_fused = [jnp.array(r, copy=True) for r in raw_init]
-    pos = jnp.asarray([10, 11, 20, 21], dtype=jnp.int32)
-    hid = jax.random.normal(jax.random.PRNGKey(7), (c_gdn3.M, c_gdn3.H), jnp.bfloat16)
-
-    skip_exp = frozenset({"experts"})
-    fn_split, _, _, _ = pool_io.make_flat_pooled_step(
-        mesh1, c_gdn3, tiles_gdn3, skip=skip_exp, fused_pool_io=False, interpret=True
-    )
-    fn_fused, _, _, _ = pool_io.make_flat_pooled_step(
-        mesh1, c_gdn3, tiles_gdn3, skip=skip_exp, fused_pool_io=True, interpret=True
-    )
-    out_split = fn_split(pos, hid, *w_leaves, *raw_split, pt, ckpt, roff)
-    out_fused = fn_fused(pos, hid, *w_leaves, *raw_fused, pt, ckpt, roff)
-    np.testing.assert_allclose(
-        np.asarray(out_split[0][: c_gdn3.B], dtype=np.float32),
-        np.asarray(out_fused[0][: c_gdn3.B], dtype=np.float32),
-        rtol=1e-2,
-        atol=1e-2,
-    )
-
-
-def test_build_tp_rank_mesh_preserves_rank_order(monkeypatch) -> None:
-    """Verify `_build_tp_rank_mesh` preserves `tpu7x` rank order."""
-    import sys
-    from types import SimpleNamespace
-
-    import numpy as np
-
-    from vllm_torchtpu.kernels.qwen35_megakernel.vllm_adapter import (
-        _build_tp_rank_mesh,
-    )
-
-    tpu7x_order = [0, 1, 4, 5, 6, 7, 2, 3]
-    fake_devices = np.array(
-        [SimpleNamespace(id=d) for d in tpu7x_order], dtype=object
-    )
-    fake_mesh = SimpleNamespace(devices=fake_devices, axis_names=("tp",))
-    fake_pallas = SimpleNamespace(get_pallas_mesh=lambda axis_names: fake_mesh)
-    monkeypatch.setitem(sys.modules, "torch_tpu._internal.pallas", fake_pallas)
-
-    mesh = _build_tp_rank_mesh(8)
-    assert mesh is fake_mesh
-    assert [int(d.id) for d in mesh.devices.flat] == tpu7x_order
-
-
-def _jnp_leaves(packed):
-    import jax.numpy as jnp
-
-    return [
-        jnp.asarray(packed[k].view(torch.uint8).numpy()).view(
-            K.FP8
-            if packed[k].dtype == torch.float8_e4m3fn
-            else (jnp.bfloat16 if packed[k].dtype == torch.bfloat16 else jnp.float32)
-        )
-        for k in K.W_NAMES
-    ]
-
-
-def test_mtp_attention_only_step_verify_and_loop_rows_agree():
-    """MTP draft layer (one-layer attention-only stack, `make_flat_attn_step`) on the merged
-    kernel: a T=4 verify step writes only the active sequence's 4 new K/V columns, and a T=1
-    loop step of its last token over the updated pool reproduces the verify step's output for
-    that token (QV verify-row attention vs the per-row path)."""
-    import jax
-    import jax.numpy as jnp
-    import numpy as np
-    from jax.sharding import Mesh
-
-    c4 = dataclasses.replace(
-        K.TINY_EP,
-        R=1,
-        B=8,
-        T=4,
-        L=1,
-        att_every=1,
-        NH=1,
-        NKV=1,
-        KH=1,
-        VH=2,
-        I=128,
-        IS=128,
-        E=128,
-        TOPK=2,
-        e_slots=128,
-        paged_kv=True,
-        num_pages=40,
-        page_size=128,
-        max_pages_per_seq=8,
-        ctx=1024,
-    )
-    c1 = dataclasses.replace(c4, T=1)
-    tiles = dataclasses.replace(K.default_tiles(c4), kv_blk=512, kv_sub=256)
-    torch.manual_seed(0)
-    w = _jnp_leaves(pack_weights(_make_tiny_backbone(c4, e_slots=c4.EW), c4, 0, tiles))
-    mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
-    skip = frozenset({"experts"})
-
-    rng = np.random.default_rng(0)
-    pool_u8 = rng.integers(0, 0x40, (c4.num_pages, 2, 64, 4, c4.page_size), dtype=np.uint8)
-    pool_u8 |= (rng.integers(0, 2, pool_u8.shape, dtype=np.uint8) << 7).astype(np.uint8)
-    pool0 = jax.lax.bitcast_convert_type(jnp.asarray(pool_u8), K.FP8)
-    pt4 = jnp.asarray([list(range(8, 16)), list(range(16, 24))], jnp.int32)
-    p0, p1 = 300, 700
-    pos4 = jnp.asarray([p0 + t for t in range(4)] + [p1 + t for t in range(4)], jnp.int32)
-    hid4 = jax.random.normal(jax.random.PRNGKey(1), (c4.M, c4.H), jnp.float32)
-    hid4 = jnp.where(jnp.arange(c4.M)[:, None] < c4.B, hid4, 0.0).astype(jnp.bfloat16)
-    ones = jnp.ones((c4.B,), jnp.int32)
-
-    fn4, _, _, _ = pool_io.make_flat_attn_step(mesh, c4, tiles, interpret=True, skip=skip)
-    out4, pool4 = fn4(pos4, hid4, *w, pool0, pt4, jnp.asarray([1, 0], jnp.int32), ones)
-    pool4_u8 = np.asarray(jax.lax.bitcast_convert_type(pool4, jnp.uint8))
-    assert bool(jnp.isfinite(out4[:4].astype(jnp.float32)).all())
-    # Only sequence 0's write page (page 8 + 300 // 128 = 10), token columns 300..303 change.
-    changed = np.argwhere(np.any(pool4_u8 != pool_u8, axis=(1, 2, 3)))
-    assert changed.tolist() == [[10, 44], [10, 45], [10, 46], [10, 47]]
-
-    pt1 = jnp.zeros((c1.NS, c1.max_pages_per_seq), jnp.int32).at[0].set(pt4[0])
-    pos1 = jnp.zeros((c1.B,), jnp.int32).at[0].set(p0 + 3)
-    hid1 = jnp.zeros_like(hid4).at[0].set(hid4[3])
-    act1 = jnp.zeros((c1.NS,), jnp.int32).at[0].set(1)
-    fn1, _, _, _ = pool_io.make_flat_attn_step(mesh, c1, tiles, interpret=True, skip=skip)
-    out1, pool1 = fn1(pos1, hid1, *w, pool4, pt1, act1, ones)
-    # The loop step rewrites token 303 with the same K/V and reads tokens 300..302 from the pool.
-    assert np.array_equal(np.asarray(jax.lax.bitcast_convert_type(pool1, jnp.uint8)), pool4_u8)
-    np.testing.assert_allclose(
-        np.asarray(out1[0], np.float32), np.asarray(out4[3], np.float32), rtol=2e-2, atol=2e-2
-    )
-
-
-def test_gpr_three_stage_matches_fused_at_tp16_checkpoint_geometry():
-    """3-stage pool I/O of a > 16-row verify bucket (GatedDeltaNet inputs read straight from the
-    checkpoint pages (pool_gather / GPR), partial conv-page scatter) against fused pool I/O at
-    the TP=16 checkpoint geometry (vh=4: 2 rec pages + 1 conv page per slot)."""
-    import jax
-    import jax.numpy as jnp
-    import numpy as np
-    from jax.sharding import Mesh
-
-    c = dataclasses.replace(
-        K.TINY_EP,
-        R=1,
-        B=20,
-        T=4,
-        L=2,
-        att_every=2,
-        H=2048,
-        NH=1,
-        NKV=1,
-        KH=1,
-        VH=4,
-        I=128,
-        IS=128,
-        E=128,
-        TOPK=2,
-        e_slots=128,
-        paged_kv=True,
-        page_size=128,
-        max_pages_per_seq=8,
-        ctx=1024,
-    )
-    assert (c.rec_pages, c.gdn_pages) == (2, 3)
-    pt, ckpt, roff, min_pages = pool_io.default_pool_layout(c)
-    c = dataclasses.replace(c, num_pages=min_pages)
-    tiles = dataclasses.replace(K.default_tiles(c), kv_blk=512, kv_sub=256)
-    assert tiles.gdn_rows > 0  # B > 16 verify: chunked states, so the 3-stage step uses GPR
-    torch.manual_seed(0)
-    w = _jnp_leaves(pack_weights(_make_tiny_backbone(c, e_slots=c.EW), c, 0, tiles))
-    st_shapes = K.state_shapes(dataclasses.replace(c, paged_kv=False))
-    St = {
-        k: (jax.random.normal(jax.random.PRNGKey(20 + i), (c.R, *s), jnp.float32)
-            * (0.1 if k in ("conv", "rec") else 0.5)).astype(dt)
-        for i, (k, (s, dt)) in enumerate(st_shapes.items())
-    }
-    raw = pool_io.states_to_pool(c, St, pt, ckpt, roff)
-    pos = jnp.asarray([10 + 37 * s + t for s in range(c.NS) for t in range(c.T)], jnp.int32)
-    hid = jax.random.normal(jax.random.PRNGKey(7), (c.M, c.H), jnp.float32)
-    hid = jnp.where(jnp.arange(c.M)[:, None] < c.B, hid, 0.0).astype(jnp.bfloat16)
-    mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
-
-    outs = {}
-    for fused in (True, False):
-        fn, _, _, _ = pool_io.make_flat_pooled_step(
-            mesh, c, tiles, fused_pool_io=fused, interpret=True, skip=frozenset({"experts"})
-        )
-        out = fn(pos, hid, *w, *[jnp.array(r, copy=True) for r in raw], pt, ckpt, roff)
-        outs[fused] = (
-            np.asarray(out[0][: c.B], np.float32),
-            np.asarray(jax.lax.bitcast_convert_type(out[1], jnp.uint8)),
-        )
-    (h_f, p_f), (h_3, p_3) = outs[True], outs[False]
-    assert np.isfinite(h_f).all()
-    np.testing.assert_allclose(h_3, h_f, rtol=1e-2, atol=1e-2)
-
-    kv_pages = c.NS * (c.ctx // c.page_size)
-    assert np.array_equal(p_3[:kv_pages], p_f[:kv_pages])
-    cp_rows = ((3 * c.QKV // 128 + 15) // 16 * 16) // 2  # conv history rows the scatter writes
-
-    def rec_f32(pages):  # [..., 2, 64, 4, 128] fp8 bytes -> the bf16 state values as f32
-        u = np.ascontiguousarray(np.moveaxis(pages, -2, -1)).view(np.uint32)[..., 0]
-        return np.stack([(u & 0xFFFF) << 16, (u >> 16) << 16]).view(np.float32)
-
-    for slot in np.unique(np.asarray(ckpt)):
-        p0 = int(slot) * c.gdn_pages
-        np.testing.assert_allclose(
-            rec_f32(p_3[p0 : p0 + c.rec_pages]),
-            rec_f32(p_f[p0 : p0 + c.rec_pages]),
-            rtol=1e-2,
-            atol=1e-3,
-        )
-        conv = p0 + c.rec_pages
-        assert np.array_equal(p_3[conv, 0, :cp_rows], p_f[conv, 0, :cp_rows]), int(slot)
+    assert mk._note_step("mk_t4_b16", True) is True
+    assert mk._note_step("mk_t4_b16", True) is False
+    assert mk._note_step("stock_t4_n13", False) is False
+    assert mk._step_mix == {"mk_t4_b16": 1, "ab_stock_t4_b16": 1, "stock_t4_n13": 1}
+    mk.record_ab_step(12.5, padded_tokens=16)
+    mk.reset_stats()
+    assert mk._step_mix == {} and mk.ab_calibrator.counts == {}
