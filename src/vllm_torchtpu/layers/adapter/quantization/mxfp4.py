@@ -608,22 +608,26 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 return quantize_native_fp4_kmajor(
                     w_pad.to(device), block=blk, pack=pack
                 )
-            qw_list, qs_list = [], []
+            qw_cpu_list, qs_cpu_list = [], []
+            out_dtype = None
             for s in range(0, n_exp, 16):
                 w_sub = w_pad[s : s + 16].to(device)
                 qw, qs = quantize_native_fp4_kmajor(
                     w_sub, block=blk, pack=pack
                 )
                 synchronize_tensors([qw, qs])
-                del w_sub
-                qw_list.append(qw)
-                qs_list.append(qs)
-            qw_cat = torch.cat(
-                [q.view(torch.uint8) for q in qw_list], dim=0
-            ).view(qw_list[0].dtype)
-            qs_cat = torch.cat(qs_list, dim=0)
+                out_dtype = qw.dtype
+                qw_cpu_list.append(qw.view(torch.uint8).cpu())
+                qs_cpu_list.append(qs.cpu())
+                del w_sub, qw, qs
+            qw_cat = (
+                torch.cat(qw_cpu_list, dim=0)
+                .view(out_dtype)
+                .to(device)
+            )
+            qs_cat = torch.cat(qs_cpu_list, dim=0).to(device)
             synchronize_tensors([qw_cat, qs_cat])
-            del qw_list, qs_list
+            del qw_cpu_list, qs_cpu_list
             return qw_cat, qs_cat
 
         w13_weight_processed, w13_weight_scale = _chunked_quant(
