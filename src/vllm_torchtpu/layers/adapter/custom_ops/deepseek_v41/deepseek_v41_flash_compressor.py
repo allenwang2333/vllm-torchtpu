@@ -593,6 +593,8 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
                 )
         if self.owns_k:
             object.__setattr__(self, "produce_k_op", self._get_produce_k_op())
+            self._get_fused_produce_k_op(quantized_wk=False)
+            self._get_fused_produce_k_op(quantized_wk=True)
         bs = int(
             getattr(getattr(self.k_cache, "cache_config", None), "block_size", 1024)
         )
@@ -1119,6 +1121,6 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
             else:
                 topk = idx_op(*op_args, *meta_args)
         if self.topk_indices_buffer is not None:
-            n_topk_rows = topk.shape[0]
-            self.topk_indices_buffer[:n_topk_rows].copy_(topk[:n_topk_rows])
+            n_tk = num_tokens // get_tensor_model_parallel_world_size() if (self.use_tp_indexer(num_tokens) and keep_topk_local) else num_tokens
+            self.topk_indices_buffer[:n_tk].copy_(topk[:n_tk])
         return topk

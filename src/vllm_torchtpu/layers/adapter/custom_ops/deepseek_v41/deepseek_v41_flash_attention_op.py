@@ -236,6 +236,8 @@ def _resolve_verify_q_len(q_tokens: int, non_causal_block: bool) -> int:
             expected_q = num_spec if non_causal_block else (num_spec + 1)
             if 2 <= expected_q <= 8 and q_tokens % expected_q == 0:
                 return expected_q
+        if vllm_cfg is not None:
+            return 0
     except Exception:
         pass
     candidates = (5, 3, 4) if non_causal_block else (6, 5, 4)

@@ -1,12 +1,9 @@
-import functools
 from collections.abc import Callable
 from threading import Lock
 
 import jax
 import jax.numpy as jnp
 import torch
-from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -260,75 +257,13 @@ def _apply_mlp_act_exact(
     return _exact_bf16(silu_gate * up)
 
 
-def _swiglu_fp8_quant_kernel(gu_ref, act_q_ref, scale_ref, *, swiglu_limit):
-    gu_val = gu_ref[...]
-    inter = gu_val.shape[1] // 2
-    gate = gu_val[:, :inter]
-    up = gu_val[:, inter:]
-    if swiglu_limit is not None:
-        gate = jnp.clip(gate, max=swiglu_limit).astype(jnp.bfloat16)
-        up = jnp.clip(up, min=-swiglu_limit, max=swiglu_limit).astype(jnp.bfloat16)
-    silu_gate = (
-        gate.astype(jnp.float32) * jax.nn.sigmoid(gate.astype(jnp.float32))
-    ).astype(jnp.bfloat16)
-    act = (silu_gate * up).astype(jnp.bfloat16)
-    abs_max = jnp.max(jnp.abs(act).astype(jnp.float32), axis=1, keepdims=True)
-    dtype_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
-    dtype_min = float(jnp.finfo(jnp.float8_e4m3fn).min)
-    scale = abs_max / dtype_max
-    scale = jnp.where(scale == 0.0, 1.0, scale)
-    act_q_ref[...] = jnp.clip(
-        act.astype(jnp.float32) / scale, dtype_min, dtype_max
-    ).astype(jnp.float8_e4m3fn)
-    scale_ref[...] = jnp.broadcast_to(scale.astype(jnp.float32), scale_ref.shape)
-
-
-def _pallas_swiglu_fp8_quant(
+def _fused_swiglu_fp8_quant_xla(
     gu: jax.Array, swiglu_limit: float | None = None
 ) -> tuple[jax.Array, jax.Array]:
-    """Single-pass VMEM fusion of SwiGLU + dynamic row-wise FP8 quantization."""
-    m_orig, two_inter = gu.shape
-    inter = two_inter // 2
-    tpu_info = pltpu.get_tpu_info()
-    m_pad = (m_orig + 127) & ~127
-    if m_pad > m_orig:
-        gu = jnp.pad(gu, ((0, m_pad - m_orig), (0, 0)))
-    if inter <= 512 and m_pad % 512 == 0:
-        bm = 512
-    elif inter <= 2048 and m_pad % 256 == 0:
-        bm = 256
-    else:
-        bm = 128
-    scale_cols = tpu_info.num_lanes
-    act_q, scale_wide = pl.pallas_call(
-        functools.partial(_swiglu_fp8_quant_kernel, swiglu_limit=swiglu_limit),
-        out_shape=(
-            jax.ShapeDtypeStruct((m_pad, inter), jnp.float8_e4m3fn),
-            jax.ShapeDtypeStruct((m_pad, scale_cols), jnp.float32),
-        ),
-        grid=(m_pad // bm,),
-        in_specs=[pl.BlockSpec((bm, two_inter), lambda i: (i, 0))],
-        out_specs=(
-            pl.BlockSpec((bm, inter), lambda i: (i, 0)),
-            pl.BlockSpec((bm, scale_cols), lambda i: (i, 0)),
-        ),
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
-        name=f"fused_swiglu_fp8_quant-m_{m_pad}-i_{inter}",
-    )(gu)
-    return act_q[:m_orig], scale_wide[:m_orig, :1]
-
-
-def _should_use_pallas_swiglu_fp8(gu: jax.Array) -> bool:
-    """Use Pallas VMEM SwiGLU+FP8 when `gu` fits L2/VMEM without spilling 2*I cols."""
-    m_orig, two_inter = gu.shape
-    if two_inter % 256 != 0:
-        return False
-    inter = two_inter // 2
-    if inter <= 512:
-        return m_orig <= 1536
-    if inter <= 2048:
-        return 384 <= m_orig <= 4096
-    return m_orig <= 256
+    """Fuse SwiGLU + dynamic row-wise FP8 quantization directly in VMEM S(1)."""
+    return quantize_tensor(
+        _apply_mlp_act_exact(gu, swiglu_limit), jnp.float8_e4m3fn
+    )
 
 
 def _quantized_mlp_jax(
@@ -343,12 +278,7 @@ def _quantized_mlp_jax(
     """Fused bit-exact gate_up + SiluAndMul[WithClamp] + down quantized matmul."""
     gu = _exact_bf16(_quantized_matmul_jax(x, w_gu, s_gu))
     if len(s_dn.shape) == 1 and w_dn.dtype == jnp.float8_e4m3fn:
-        if _should_use_pallas_swiglu_fp8(gu):
-            act_q, act_scale = _pallas_swiglu_fp8_quant(gu, swiglu_limit)
-        else:
-            act_q, act_scale = quantize_tensor(
-                _apply_mlp_act_exact(gu, swiglu_limit), w_dn.dtype
-            )
+        act_q, act_scale = _fused_swiglu_fp8_quant_xla(gu, swiglu_limit)
         return _prequant_matmul_jax(act_q, act_scale, w_dn, s_dn)
     act = _apply_mlp_act_exact(gu, swiglu_limit)
     return _quantized_matmul_jax(act, w_dn, s_dn)
@@ -367,12 +297,7 @@ def _quantized_mlp_prequant_jax(
     """Fused bit-exact prequant gate_up + SiluAndMul[WithClamp] + down matmul."""
     gu = _exact_bf16(_prequant_matmul_jax(x_q, x_scale, w_gu, s_gu))
     if len(s_dn.shape) == 1 and w_dn.dtype == jnp.float8_e4m3fn:
-        if _should_use_pallas_swiglu_fp8(gu):
-            act_q, act_scale = _pallas_swiglu_fp8_quant(gu, swiglu_limit)
-        else:
-            act_q, act_scale = quantize_tensor(
-                _apply_mlp_act_exact(gu, swiglu_limit), w_dn.dtype
-            )
+        act_q, act_scale = _fused_swiglu_fp8_quant_xla(gu, swiglu_limit)
         return _prequant_matmul_jax(act_q, act_scale, w_dn, s_dn)
     act = _apply_mlp_act_exact(gu, swiglu_limit)
     return _quantized_matmul_jax(act, w_dn, s_dn)

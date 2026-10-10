@@ -875,32 +875,37 @@ def resolve_csa_union_params(
         or num_tokens > _CSA_UNION_MAX_TOKENS
     ):
         return None
+    eff_verify_bq = _CSA_UNION_VERIFY_BQ
+    if eff_verify_bq <= 0:
+        try:
+            from vllm_torchtpu.layers.adapter.utils import (
+                get_vllm_model_wrapper_context,
+            )
+
+            vllm_cfg = getattr(get_vllm_model_wrapper_context(), "vllm_config", None)
+            spec_cfg = getattr(vllm_cfg, "speculative_config", None)
+            num_spec = getattr(spec_cfg, "num_speculative_tokens", None)
+            if isinstance(num_spec, int) and num_spec >= 1:
+                eff_verify_bq = num_spec + 1
+            elif vllm_cfg is None:
+                if num_tokens >= 6 and num_tokens % 6 == 0:
+                    eff_verify_bq = 6
+                elif num_tokens >= 5 and num_tokens % 5 == 0 and num_tokens % 512 != 0:
+                    eff_verify_bq = 5
+        except Exception:
+            pass
     if (
-        _CSA_UNION_VERIFY_BQ > 0
-        and num_tokens >= _CSA_UNION_VERIFY_BQ
-        and num_tokens % _CSA_UNION_VERIFY_BQ == 0
+        eff_verify_bq > 0
+        and num_tokens >= eff_verify_bq
+        and num_tokens % eff_verify_bq == 0
     ):
-        b_q = _CSA_UNION_VERIFY_BQ
+        b_q = eff_verify_bq
         m_u = (
             min(envs.VLLM_DSV41_CSA_UNION_M, b_q * topk)
             if envs.VLLM_DSV41_CSA_UNION_M > 0
             else align_to(2 * topk, 128)
         )
         return b_q, m_u
-    if num_tokens >= 6 and num_tokens % 6 == 0:
-        m_u = (
-            min(envs.VLLM_DSV41_CSA_UNION_M, 6 * topk)
-            if envs.VLLM_DSV41_CSA_UNION_M > 0
-            else align_to(2 * topk, 128)
-        )
-        return 6, m_u
-    if num_tokens >= 5 and num_tokens % 5 == 0 and num_tokens % 512 != 0:
-        m_u = (
-            min(envs.VLLM_DSV41_CSA_UNION_M, 5 * topk)
-            if envs.VLLM_DSV41_CSA_UNION_M > 0
-            else align_to(2 * topk, 128)
-        )
-        return 5, m_u
     b_q = 8 if num_q_heads >= 64 else envs.VLLM_DSV41_CSA_UNION_BQ
     if (
         not ced_decoder
