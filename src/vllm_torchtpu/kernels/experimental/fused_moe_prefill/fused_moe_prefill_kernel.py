@@ -43,10 +43,11 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.fused_moe.v2 import host as v2_host
 from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
+    DN,
+    _intermediate_rows,
     _tile_row_scales,
     build_combine_kernel,
     combine_step_tokens,
-    expert_ffn_fp8,
 )
 
 _LANES = 128
@@ -409,39 +410,55 @@ def _build_expert_kernel(
                 act = act_vmem[aslot, pl.ds(0, rows)].astype(jnp.bfloat16)
                 act = act.reshape(rows, h).astype(weight_dtype)
                 act_scale = _tile_row_scales(act_scale_vmem[aslot], start, rows)
-                acc2, mid_scale = expert_ffn_fp8(act, act_scale, w1, w2, w1_scale)
-                # expert_ffn_fp8 requantizes the intermediate, so it returns a scale.
+                # expert_ffn_fp8 up to its down matmul, which runs in the store
+                # branch below. The weights are refs, loaded where they are used.
+                inter = w1.shape[-1] // 2  # i, or i_s on the shared visit
+                acc1 = lax.dot_general(
+                    act, w1[...], DN, preferred_element_type=jnp.float32
+                )
+                mid_q, mid_scale = _intermediate_rows(
+                    acc1, act_scale, inter, w1s=w1_scale[...], act_fn="silu", w1b=None
+                )
+                # The intermediate is requantized, so it has a scale.
                 assert mid_scale is not None
-                # Retile into the per-row slab layout while still f32 (8x8
-                # sublane blocks), then pack to bf16: cheaper than retiling the
-                # packed bf16 value.
-                out = (acc2 * mid_scale * w2_scale).reshape(rows, lane_blocks, _LANES)
-                out = out.astype(jnp.bfloat16)
                 for par in range(2):
 
                     @pl.when(p == par)
                     def _(par=par):
-                        out_vmem[par, pl.ds(0, rows)] = out
+                        # The down matmul and the epilogue in the branch that
+                        # stores them, so the bf16 rows go straight into
+                        # out_vmem[par] rather than through a value finished
+                        # before the branch (same operations, same bits).
+                        acc2 = lax.dot_general(
+                            mid_q, w2[...], DN, preferred_element_type=jnp.float32
+                        )
+                        # Retile into the per-row slab layout while still f32
+                        # (8x8 sublane blocks), then pack to bf16: cheaper than
+                        # retiling the packed bf16 value.
+                        out = (acc2 * mid_scale * w2_scale[...]).reshape(
+                            rows, lane_blocks, _LANES
+                        )
+                        out_vmem[par, pl.ds(0, rows)] = out.astype(jnp.bfloat16)
 
             def compute_visit(rows):
                 @pl.when(is_shared(v))
                 def _():
                     compute(
                         rows,
-                        shared_w1_vmem[...],
-                        shared_w2_vmem[...],
-                        shared_w1_scale_vmem[...],
-                        shared_w2_scale_vmem[...],
+                        shared_w1_vmem,
+                        shared_w2_vmem,
+                        shared_w1_scale_vmem,
+                        shared_w2_scale_vmem,
                     )
 
                 @pl.when(jnp.logical_not(is_shared(v)))
                 def _():
                     compute(
                         rows,
-                        w1_ring[slot],
-                        w2_ring[slot],
-                        w1_scale_ring[slot],
-                        w2_scale_ring[slot],
+                        w1_ring.at[slot],
+                        w2_ring.at[slot],
+                        w1_scale_ring.at[slot],
+                        w2_scale_ring.at[slot],
                     )
 
             for r, rows in enumerate(rungs):
