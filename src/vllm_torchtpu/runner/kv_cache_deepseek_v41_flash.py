@@ -201,7 +201,17 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
                         if swa is not None and swa.prefix in kv_caches:
                             swa.kv_cache = kv_caches[swa.prefix]
                         if mod.ensure_cache():
-                            init_caches.append(mod._cache)
+                            if _pure_prefill:
+                                _sk = (tuple(mod._cache.shape), mod._cache.dtype)
+                                if not hasattr(self, "_shared_swa_caches"):
+                                    self._shared_swa_caches = {}
+                                if _sk in self._shared_swa_caches:
+                                    mod._cache = self._shared_swa_caches[_sk]
+                                else:
+                                    self._shared_swa_caches[_sk] = mod._cache
+                                    init_caches.append(mod._cache)
+                            else:
+                                init_caches.append(mod._cache)
                     if hasattr(mod, "_get_dummy_main_cache"):
                         init_caches.append(mod._get_dummy_main_cache(runner.device))
             if init_caches:
