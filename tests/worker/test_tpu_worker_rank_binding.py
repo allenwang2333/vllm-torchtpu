@@ -313,6 +313,7 @@ def test_partial_executor_slice_binding_is_rejected():
     [
         ({"world_size": 8}, "does not match"),
         ({"rank": 4}, "out of range"),
+        ({"local_world_size": 0}, "out of range"),
         ({"local_rank": 2}, "out of range"),
     ],
 )
@@ -354,3 +355,26 @@ def test_executor_slice_binding_rejects_pcp():
 
     with pytest.raises(NotImplementedError, match="context parallelism"):
         binding.get_tpu_worker_binding(pc, rank=1, local_rank=1, env=env)
+
+
+def test_dp_ep_rank_local_fallback_and_spawned_pcp_and_invalid_int_env():
+    env = {
+        "TORCH_TPU_DP_SIZE": "not_an_int",
+        "LOCAL_RANK": "3",
+    }
+    pc = _parallel_config(
+        world_size=2,
+        data_parallel_size=2,
+        data_parallel_index=1,
+        prefill_context_parallel_size=2,
+        enable_expert_parallel=True,
+    )
+    pc.data_parallel_rank_local = None
+    pc.data_parallel_size_local = None
+
+    b = binding.get_tpu_worker_binding(
+        pc, rank=1, local_rank=1, env=env, use_spawned_pcp_local_rank=True
+    )
+    assert b.rank == 3
+    assert b.local_rank == 3
+    assert b.native_local_rank == 3

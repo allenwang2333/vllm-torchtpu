@@ -89,6 +89,9 @@ if _omni_attention.SDPABackend.__name__ == "_StubSDPABackend":
         "vllm_torchtpu.omni.attention",
     ):
         sys.modules.pop(_name, None)
+    _omni_pkg = sys.modules.get("vllm_torchtpu.omni")
+    if _omni_pkg is not None and hasattr(_omni_pkg, "attention"):
+        delattr(_omni_pkg, "attention")
 
 pytestmark = pytest.mark.cpu_test
 
