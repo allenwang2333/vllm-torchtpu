@@ -19,6 +19,17 @@ group: every rank must arm the same layers (a rank that skips the kernel would
 leave its peers waiting in its barrier), so the ranks compare an arming
 signature and raise on a mismatch, then run the kernel's all-reduce once on
 known inputs through the op's mesh and rank operand.
+
+Expert range: with --enable-expert-parallel and TPU_MOE_EP_TP_SIZE (EP between
+groups of consecutive ranks, TP inside one), a rank holds its group's block of
+experts at its TP slice of I. The kernel then takes the block's first global
+expert id (runtime data) and computes those experts only; routing still runs
+over every expert and the in-kernel all-reduce still sums every rank of the
+op's mesh (the whole EP x TP world), whose partials together cover every
+(expert, column) once. Other token counts run the layer's EP path
+(fused_moe_func with use_ep and experts_start: SparseCore ragged gather, local
+grouped GEMMs, ragged gather-reduce) plus the shared expert and a psum, so
+prefill and mixed batches keep the EP x TP routed kernels.
 """
 
 import dataclasses
@@ -41,6 +52,7 @@ from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.kernels.router_topk import select as router_select
+from vllm_torchtpu.kernels.router_topk import select_bias as router_select_bias
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
@@ -61,6 +73,7 @@ _BUFFERS = (
     "_moe_tp_decode_ss2",
     "_moe_tp_decode_bias",
     "_moe_tp_decode_rank",
+    "_moe_tp_decode_e0",
 )
 # A wrong rank or mesh hangs the self-test's all-reduce: dump every stack and
 # exit instead.
@@ -86,6 +99,12 @@ class _OpStatics:
     activation: str
     use_sparse_core: bool
     onehot_threshold: int
+    # Expert range: weights hold a linear block of experts per EP group, and
+    # the psum path runs the EP routed path (use_ep, experts_start).
+    use_ep: bool = False
+    # TPU_MOE_ROUTER_TOPK_BIAS: the psum path picks experts as the layer does
+    # (router_topk.select_bias; same ids and weights as select on scores+bias).
+    router_bias: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,6 +113,7 @@ class _Admitted:
     rows: tuple[int, ...]  # the token counts the kernel admits
     hidden: int
     statics: _OpStatics
+    experts_start: int  # first global expert of this rank's block (0 under TP)
 
 
 def moe_tp_decode_supported(quant_method: Any) -> bool:
@@ -192,8 +212,27 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
             "the MoE path owns its collectives "
             "(TPU_MOE_COLLECTION_CHUNK_SIZE or TPU_MOE_FP8_ALL_GATHER)"
         )
-    if par.use_ep or par.tp_size != n_ranks:
+    if par.use_ep:
+        # Expert range over EP x TP weights: the partials of all ep x tp ranks
+        # meet in the kernel's all-reduce over the op's n_ranks mesh.
+        if par.ep_size * par.tp_size != n_ranks:
+            return (
+                f"needs EP x TP MoE over {n_ranks} ranks "
+                f"(ep {par.ep_size}, tp {par.tp_size})"
+            )
+        if getattr(layer, "expert_placement_strategy", "linear") != "linear":
+            return "EP placement is not linear"
+        if layer.w13_weight.shape[0] * par.ep_size != layer.global_num_experts:
+            return (
+                f"{layer.w13_weight.shape[0]} local experts x ep {par.ep_size} != "
+                f"{layer.global_num_experts} experts"
+            )
+        experts_start = moe_routing.get_experts_start(layer)
+        assert experts_start is not None  # use_ep
+    elif par.tp_size != n_ranks:
         return f"needs TP MoE over {n_ranks} ranks (ep {par.ep_size}, tp {par.tp_size})"
+    else:
+        experts_start = 0
     if par.dp_size != 1 or par.pcp_size != 1 or cfg.is_sequence_parallel:
         return "needs dp 1, pcp 1 and no sequence-parallel MoE"
     if par.enable_eplb:
@@ -270,17 +309,33 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         activation=qm._tpu_activation_str,
         use_sparse_core=envs.USE_MOE_SPARSE_CORE,
         onehot_threshold=resolve_onehot_permute_threshold(),
+        use_ep=bool(par.use_ep),
+        router_bias=bool(moe_routing._ROUTER_TOPK_BIAS),
     )
-    return _Admitted(shared=shared, rows=rows, hidden=hidden, statics=statics)
+    return _Admitted(
+        shared=shared,
+        rows=rows,
+        hidden=hidden,
+        statics=statics,
+        experts_start=int(experts_start),
+    )
 
 
-def _tp_chain(x, scores, bias, is_pad, w13, w2, s13, s2, sw13, ss13, sw2, ss2, st):
-    """This rank's partial as the unarmed TP path computes it: select_experts
+def _tp_chain(
+    x, scores, bias, is_pad, w13, w2, s13, s2, sw13, ss13, sw2, ss2, st, e0=None
+):
+    """This rank's partial as the unarmed path computes it: select_experts
     (ids from the biased scores, renormalized unbiased weights in bf16),
-    zero_routing_weights_for_padding, fused_moe_func, the shared expert's two
-    quantized linears around SiluAndMul, and shared + scale * routed in bf16."""
-    _, ids = router_select(scores + bias.astype(jnp.float32)[None, :], st.topk)
-    w = jnp.take_along_axis(scores, ids, axis=-1)
+    zero_routing_weights_for_padding, fused_moe_func (under EP with
+    experts_start e0, so the SparseCore EP dispatch and combine), the shared
+    expert's two quantized linears around SiluAndMul, and shared + scale *
+    routed in bf16."""
+    bias = bias.astype(jnp.float32)
+    if st.router_bias:
+        w, ids = router_select_bias(scores, bias[None, :], st.topk)
+    else:
+        _, ids = router_select(scores + bias[None, :], st.topk)
+        w = jnp.take_along_axis(scores, ids, axis=-1)
     total = jnp.sum(w, axis=-1, keepdims=True)
     # torch.clamp(min=1e-20) keeps NaN; a fused jnp.maximum may not (XLA CPU).
     total = jnp.where(jnp.isnan(total), total, jnp.maximum(total, _SUM_FLOOR))
@@ -296,10 +351,10 @@ def _tp_chain(x, scores, bias, is_pad, w13, w2, s13, s2, sw13, ss13, sw2, ss2, s
         None,
         w,
         ids,
-        None,
+        e0 if st.use_ep else None,
         topk=st.topk,
         activation=st.activation,
-        use_ep=False,
+        use_ep=st.use_ep,
         use_sparse_core=st.use_sparse_core,
         onehot_moe_permute_threshold=st.onehot_threshold,
         rhs_quant_dtype=None,
@@ -317,7 +372,9 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
     the token counts it admits, else this rank's partial from the usual path
     and a psum."""
 
-    def body(x, scores, bias, pad_mask, w13, w2, s13, s2, sw13, ss13, sw2, ss2, rank):
+    def body(
+        x, scores, bias, pad_mask, w13, w2, s13, s2, sw13, ss13, sw2, ss2, rank, e0
+    ):
         n = x.shape[0]  # static: torch_tpu exports one program per token count
         is_pad = pad_mask[:n]  # replicated, so n_valid agrees on every rank
         n_valid = n - jnp.sum(is_pad.astype(jnp.int32))
@@ -332,11 +389,12 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                 n_valid,
                 rank.reshape(()),
                 *weights,
+                e0.reshape(()),
                 routed_scale=statics.routed_scale,
                 topk=statics.topk,
                 n_ranks=n_ranks,
             )
-        partial = _tp_chain(x, scores, bias, is_pad, *weights, statics)
+        partial = _tp_chain(x, scores, bias, is_pad, *weights, statics, e0.reshape(()))
         return lax.psum(partial, axis)
 
     return body
@@ -351,7 +409,7 @@ def _get_op(mesh, statics: _OpStatics):
     axis = mesh.axis_names[0]
     # Operands as moe_tp_decode_forward passes them; bias and the padding mask
     # are replicated, everything else is per rank.
-    specs = (P(axis), P(axis), P(), P()) + (P(axis),) * 9
+    specs = (P(axis), P(axis), P(), P()) + (P(axis),) * 10
     body = _op_body(statics, int(mesh.size), axis)
 
     sharded = jax.shard_map(
@@ -373,6 +431,7 @@ def _get_op(mesh, statics: _OpStatics):
         sw2: jax.Array,
         ss2: jax.Array,
         rank: jax.Array,
+        e0: jax.Array,
     ) -> jax.Array:
         args = (
             x,
@@ -388,6 +447,7 @@ def _get_op(mesh, statics: _OpStatics):
             sw2,
             ss2,
             rank,
+            e0,
         )
         return sharded(
             *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
@@ -556,7 +616,11 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
         # An alias of the f32 parameter: to() and contiguous() are no-ops.
         bias = layer.e_score_correction_bias.detach().to(torch.float32).contiguous()
         rank = _rank_tensor(layer.w13_weight.device, topo.mesh_index)
-        for name, tensor in zip(_BUFFERS, (*adm.shared, bias, rank)):
+        # [1, 1] like the rank: per-rank data, one program on every rank.
+        e0 = torch.tensor(
+            [[adm.experts_start]], dtype=torch.int32, device=layer.w13_weight.device
+        )
+        for name, tensor in zip(_BUFFERS, (*adm.shared, bias, rank, e0)):
             layer.register_buffer(name, tensor, persistent=False)
         setattr(layer.quant_method, _OP_ATTR, _get_op(topo.mesh, adm.statics))
         runner._shared_experts = None
@@ -586,7 +650,7 @@ def moe_tp_decode_forward(
     already all-reduced over the TP group."""
     padding = token_padding._padding_state
     assert padding is not None, "moe_tp_decode needs the token-padding mask"
-    sw13, ss13, sw2, ss2, bias, rank = (getattr(layer, n) for n in _BUFFERS)
+    sw13, ss13, sw2, ss2, bias, rank, e0 = (getattr(layer, n) for n in _BUFFERS)
     # Production's scoring op; everything after it is the op.
     scores = moe_routing._apply_scoring_fn(layer.scoring_func, router_logits)
     return getattr(quant_method, _OP_ATTR)(
@@ -603,4 +667,5 @@ def moe_tp_decode_forward(
         sw2,
         ss2,
         rank,
+        e0,
     )
