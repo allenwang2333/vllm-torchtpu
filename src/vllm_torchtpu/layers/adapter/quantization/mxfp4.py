@@ -611,6 +611,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             hkey = hashlib.md5(sig_bytes + f"_{tuple(w_pad.shape)}_{blk}_{pack}".encode()).hexdigest()[:16]
             cpath = os.path.join(cache_dir, f"fp4_{hkey}.pt")
             out_dt = torch.float4_e2m1fn_x2 if not pack else torch.uint8
+            self._last_quant_cpath = cpath
             if os.path.exists(cpath + ".done"):
                 saved = torch.load(cpath, map_location="cpu", weights_only=True)
                 qw_cat = saved["qw_u8"].view(out_dt).to(device)
@@ -649,9 +650,11 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         w13_weight_processed, w13_weight_scale = _chunked_quant(
             w13_weight_padded, w13_block_size
         )
+        self._last_w13_cpath = self._last_quant_cpath
         w2_weight_processed, w2_weight_scale = _chunked_quant(
             w2_weight_padded, w2_block_size
         )
+        self._last_w2_cpath = self._last_quant_cpath
 
         return (
             w13_weight_processed,
@@ -690,20 +693,22 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
         import hashlib
         _raw_sig = layer.w13_weight.data.cpu().reshape(-1)[:4096].contiguous().view(torch.uint8).numpy().tobytes()
-        _bundle_key = hashlib.md5(_raw_sig + f"_{tuple(layer.w13_weight.shape)}".encode()).hexdigest()[:16]
-        _bundle_path = f"/dev/shm/dsv41_fp4_cache/bundle_{_bundle_key}.pt"
-        if os.path.exists(_bundle_path + ".done"):
+        _meta_key = hashlib.md5(_raw_sig + f"_{tuple(layer.w13_weight.shape)}".encode()).hexdigest()[:16]
+        _meta_path = f"/dev/shm/dsv41_fp4_cache/meta_{_meta_key}.pt"
+        if os.path.exists(_meta_path + ".done"):
             self._release_source_weights(layer)
-            _b = torch.load(_bundle_path, map_location="cpu", weights_only=True)
+            _m = torch.load(_meta_path, map_location="cpu", weights_only=True)
+            _s13 = torch.load(_m["w13_cpath"], map_location="cpu", weights_only=True)
+            _s2 = torch.load(_m["w2_cpath"], map_location="cpu", weights_only=True)
             op = None
-            w13_weight_processed = _b["w13_u8"].view(torch.float4_e2m1fn_x2).to(device)
-            w2_weight_processed = _b["w2_u8"].view(torch.float4_e2m1fn_x2).to(device)
-            w13_weight_scale = _b["w13_s"].to(device)
-            w2_weight_scale = _b["w2_s"].to(device)
-            w13_bias_padded = _b["w13_b"]
-            w2_bias_padded = _b["w2_b"]
+            w13_weight_processed = _s13["qw_u8"].view(torch.float4_e2m1fn_x2).to(device)
+            w2_weight_processed = _s2["qw_u8"].view(torch.float4_e2m1fn_x2).to(device)
+            w13_weight_scale = _s13["qs"].to(device)
+            w2_weight_scale = _s2["qs"].to(device)
+            w13_bias_padded = _m["w13_b"]
+            w2_bias_padded = _m["w2_b"]
             w13_weight_padded = w2_weight_padded = None
-            del _b
+            del _m, _s13, _s2
         else:
             (
                 w13_weight_padded,
@@ -732,17 +737,15 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 device,
                 pack=False,
             )
-            _tmp_b = _bundle_path + f".tmp.{os.getpid()}"
+            _tmp_m = _meta_path + f".tmp.{os.getpid()}"
             torch.save({
-                "w13_u8": w13_weight_processed.view(torch.uint8).cpu(),
-                "w2_u8": w2_weight_processed.view(torch.uint8).cpu(),
-                "w13_s": w13_weight_scale.cpu(),
-                "w2_s": w2_weight_scale.cpu(),
+                "w13_cpath": self._last_w13_cpath,
+                "w2_cpath": self._last_w2_cpath,
                 "w13_b": w13_bias_padded.cpu() if w13_bias_padded is not None else None,
                 "w2_b": w2_bias_padded.cpu() if w2_bias_padded is not None else None,
-            }, _tmp_b)
-            os.replace(_tmp_b, _bundle_path)
-            open(_bundle_path + ".done", "w").close()
+            }, _tmp_m)
+            os.replace(_tmp_m, _meta_path)
+            open(_meta_path + ".done", "w").close()
 
         layer.w13_weight = torch.nn.Parameter(w13_weight_processed, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight_processed, requires_grad=False)
