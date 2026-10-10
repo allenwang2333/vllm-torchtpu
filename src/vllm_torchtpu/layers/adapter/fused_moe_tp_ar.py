@@ -19,6 +19,23 @@ MLP nor any all-reduce. Token counts above ``MAX_DECODE_TOKENS`` run the fused
 TP prefill kernel (``moe_tp_prefill``) inside the same exported program (the
 token count is static there), still returning the reduced sum; branching in
 torch instead would give buckets different graphs.
+
+Two shared-expert / scaling conventions are served, each mirroring what
+vLLM's MoERunner does with the kernel off:
+
+- Gated shared expert (Qwen3.5: ``shared_expert.expert_gate``): the shared
+  output is scaled by sigmoid(x . w_g). Ungated (GLM-5.2 / DeepSeek-V3
+  ``DeepseekV2MLP``, no gate): coefficient 1.
+- ``runner.routed_scaling_factor`` (GLM-5.2: 2.5; vLLM moves it from the
+  router to the runner via ``apply_routed_scale_to_output``) multiplies the
+  ROUTED output only, before the shared output is added
+  (``MoERunner._maybe_apply_routed_scale_to_output``). The kernels fold it
+  into the routed coefficients, and arming sets the runner's factor to 1.0,
+  since the runner would otherwise scale the kernel's shared + routed sum.
+
+Every rank must arm the same layers (the kernels' collectives start at
+entry; a rank that declines leaves its peers waiting), so arming compares a
+signature across the EP group and raises on any mismatch.
 """
 
 from typing import Any
@@ -59,6 +76,7 @@ _OPS: dict[tuple, Any] = {}
 # tied to mesh order.
 _RANK_BUFFER: Any = None
 _RANK_BUFFER_START = 0
+_RANK_BUFFER_INDEX = -1
 # Largest token count served by the decode kernel; above it, the prefill kernel.
 MAX_DECODE_TOKENS = 128
 
@@ -67,11 +85,20 @@ def fused_moe_tp_ar_supported(quant_method: Any) -> bool:
     return getattr(quant_method, FUSED_MOE_TP_AR_OP_ATTR, None) is not None
 
 
-def _build_op(mesh, n_ranks: int, topk: int, expert_parallel: bool):
+def _build_op(
+    mesh,
+    n_ranks: int,
+    topk: int,
+    expert_parallel: bool,
+    shared_gated: bool = True,
+    routed_scale: float = 1.0,
+):
     # The token count is static inside the exported program, so the cap is
     # applied HERE, not in torch: every bucket then traces the same torch op
     # with the same inputs, which vLLM's shape-specialized warmup requires.
-    key = (id(mesh), n_ranks, topk, expert_parallel)
+    # An ungated layer still passes its (placeholder) wg operand so the op's
+    # arity is fixed; the program ignores it.
+    key = (id(mesh), n_ranks, topk, expert_parallel, shared_gated, routed_scale)
     op = _OPS.get(key)
     if op is not None:
         return op
@@ -98,12 +125,13 @@ def _build_op(mesh, n_ranks: int, topk: int, expert_parallel: bool):
             w2s,
             s1s,
             s2s,
-            wg.astype(x.dtype),
+            wg.astype(x.dtype) if shared_gated else None,
             tw,
             ti,
             combine_chunks=default_combine_chunks(x.shape[0]),
             reduce_fn=lambda y: jax.lax.psum(y, axis),
             expert_start=start,
+            routed_scale=routed_scale,
         )
 
     def local(rank, x, w1, w2, s1, s2, w1s, s1s, w2s, s2s, wg, tw, ti):
@@ -122,11 +150,12 @@ def _build_op(mesh, n_ranks: int, topk: int, expert_parallel: bool):
             s1s,
             w2s,
             s2s,
-            wg,
+            wg if shared_gated else None,
             tw,
             ti,
             n_ranks=n_ranks,
             expert_start=start,
+            routed_scale=routed_scale,
         )
 
     # torch_tpu infers static arguments from annotations: every operand is a
@@ -174,8 +203,22 @@ def _build_op(mesh, n_ranks: int, topk: int, expert_parallel: bool):
     return op
 
 
+def _shared_mlp_is_ungated_silu(mlp) -> bool:
+    """A shared expert with no gate of its own: gate_up -> SiluAndMul -> down
+    (vLLM's DeepseekV2MLP, GLM-5.2's shared expert), nothing else in forward."""
+    from vllm.model_executor.layers.activation import SiluAndMul
+
+    return (
+        type(mlp).__name__ == "DeepseekV2MLP"
+        and isinstance(getattr(mlp, "act_fn", None), SiluAndMul)
+        and getattr(mlp, "expert_gate", None) is None
+    )
+
+
 def _shared_slice(runner) -> tuple | None:
-    """This rank's shared-expert tensors in the routed-slice layout, or None."""
+    """This rank's shared-expert tensors in the routed-slice layout, or None.
+
+    The last entry, the gate weight, is None for an ungated shared expert."""
     shared = getattr(runner, "_shared_experts", None)
     mlp = getattr(shared, "_layer", None)
     if mlp is None:
@@ -183,15 +226,21 @@ def _shared_slice(runner) -> tuple | None:
     gate_up = getattr(mlp, "gate_up_proj", None)
     down = getattr(mlp, "down_proj", None)
     gate = getattr(mlp, "expert_gate", None)
-    if gate_up is None or down is None or gate is None:
+    if gate_up is None or down is None:
+        return None
+    if gate is None and not _shared_mlp_is_ungated_silu(mlp):
         return None
     w1s, s1s = getattr(gate_up, "weight", None), getattr(gate_up, "weight_scale", None)
     w2s, s2s = getattr(down, "weight", None), getattr(down, "weight_scale", None)
-    wg = getattr(gate, "weight", None)
-    if any(t is None for t in (w1s, s1s, w2s, s2s, wg)):
+    if any(t is None for t in (w1s, s1s, w2s, s2s)):
         return None
     # Per-channel FP8 linears are stored K-major ([in, out]) with a 1-D scale.
     if s1s.dim() != 1 or s2s.dim() != 1 or w1s.dtype != torch.float8_e4m3fn:
+        return None
+    if gate is None:
+        return (w1s.data, s1s.data, w2s.data, s2s.data, None)
+    wg = getattr(gate, "weight", None)
+    if wg is None:
         return None
     if getattr(gate, "bias", None) is not None or wg.dim() != 2 or wg.shape[0] != 1:
         return None
@@ -202,8 +251,9 @@ def _shared_slice(runner) -> tuple | None:
     return (w1s.data, s1s.data, w2s.data, s2s.data, wg.data)
 
 
-def _admit(runner, n_ranks: int) -> tuple[tuple, bool] | None:
-    """(shared-expert slice, expert_parallel) for an eligible layer, else None."""
+def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
+    """(shared-expert slice, expert_parallel, routed scale) for an eligible
+    layer, else None."""
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
     cfg = runner.moe_config
@@ -226,20 +276,19 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool] | None:
         or runner.routed_output_transform is not None
     ):
         return None
-    if (
-        getattr(runner, "routed_scaling_factor", 1.0) != 1.0
-        or runner.shared_expert_gate is not None
-    ):
+    if runner.shared_expert_gate is not None:
+        return None
+    routed_scale = float(getattr(runner, "routed_scaling_factor", 1.0))
+    if routed_scale != 1.0 and getattr(cfg, "in_dtype", None) == torch.float16:
+        # FP16 vLLM divides the shared output instead (overflow guard) and the
+        # decoder layer compensates; not mirrored here.
         return None
     shared = _shared_slice(runner)
     if shared is None:
         return None
     w1s, s1s, w2s, s2s, wg = shared
-    s1s, s2s, wg = (
-        s1s.reshape(1, -1),
-        s2s.reshape(1, -1),
-        wg.reshape(-1, 1),
-    )  # shapes only
+    s1s, s2s = s1s.reshape(1, -1), s2s.reshape(1, -1)  # shapes only
+    h_shape = None if wg is None else tuple(wg.reshape(-1, 1).shape)
     w1, w2 = layer.w13_weight, layer.w2_weight
     s1, s2 = layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
     e, h, two_i = w1.shape
@@ -255,43 +304,89 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool] | None:
         or i_s % 128
         or i_s > i
         or tuple(w1s.shape) != (h, 2 * i_s)
-        or tuple(wg.shape) != (h, 1)
+        or tuple(w2s.shape) != (i_s, h)
+        or (h_shape is not None and h_shape != (h, 1))
     ):
         return None
-    return shared, expert_parallel
+    return shared, expert_parallel, routed_scale
 
 
-def arm_fused_tp_ar(model: torch.nn.Module) -> int:
-    """Arm every eligible MoE layer of `model`; returns how many were armed."""
+def _check_same_arming_on_every_rank(signature: tuple, what: str) -> None:
+    """Raise unless every EP rank computed the same arming signature.
+
+    The kernels' collectives start at entry: a rank that serves a layer with
+    the GMM path while its peers run the kernel hangs the whole slice (and a
+    rank-local decline of a collective kernel has halted the SparseCore).
+    Failing at load time with every rank's answer is the only safe outcome.
+    """
+    from vllm_torchtpu.distributed.ep_mesh import get_ep_group
+
+    group = get_ep_group()
+    if group is None:
+        return
+    gathered: list = [None] * int(group.world_size)
+    torch.distributed.all_gather_object(gathered, signature, group=group.cpu_group)
+    if any(g != gathered[0] for g in gathered):
+        summary = sorted({(len(g[1]) if g else -1, str(g)[:120]) for g in gathered})
+        raise RuntimeError(
+            f"fused TP MoE ({what}): EP ranks disagree on which layers to arm; "
+            f"refusing to serve a collective kernel on some ranks only: {summary}"
+        )
+
+
+def arm_fused_tp_ar(model: torch.nn.Module, what: str = "model") -> int:
+    """Arm every eligible MoE layer of `model`; returns how many were armed.
+
+    Collective over the EP group when EP is on: every rank must call it."""
     if not envs.USE_MOE_FUSED_TP_AR:
         return 0
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
     runners = [m for m in model.modules() if isinstance(m, MoERunner)]
-    if not runners:
-        return 0
     try:
-        mesh = build_ep_mesh()
+        mesh = build_ep_mesh() if runners else None
     except Exception as exc:  # refuse rather than serve a wrong reduction
         logger.warning("Fused TP all-reduce MoE not armed: no TP mesh (%s)", exc)
-        return 0
-    if mesh is None:
-        return 0
-    n_ranks = mesh.shape[EP_AXIS_NAME]
-    global _RANK_BUFFER, _RANK_BUFFER_START
+        mesh = None
+    n_ranks = mesh.shape[EP_AXIS_NAME] if mesh is not None else 0
+    global _RANK_BUFFER, _RANK_BUFFER_START, _RANK_BUFFER_INDEX
     from vllm_torchtpu.layers.adapter.moe_routing import get_experts_start
 
-    armed = 0
-    for runner in runners:
+    plan = []
+    for runner in runners if mesh is not None else ():
         admitted = _admit(runner, n_ranks)
         if admitted is None:
+            if getattr(runner, "_shared_experts", None) is not None:
+                logger.warning(
+                    "Fused TP MoE declined layer %s (shared expert or layout not "
+                    "supported)",
+                    getattr(runner, "layer_name", "?"),
+                )
             continue
-        shared, expert_parallel = admitted
+        plan.append((runner, *admitted))
+    signature = (
+        n_ranks,
+        tuple(
+            (
+                getattr(r, "layer_name", "?"),
+                ep,
+                shared[4] is not None,
+                scale,
+            )
+            for r, shared, ep, scale in plan
+        ),
+    )
+    if runners:
+        _check_same_arming_on_every_rank(signature, what)
+
+    armed = 0
+    for runner, shared, expert_parallel, routed_scale in plan:
         layer = runner.routed_experts
         start = get_experts_start(layer) or 0
         if _RANK_BUFFER is None:
+            _RANK_BUFFER_INDEX = int(ep_mesh_index())
             _RANK_BUFFER = torch.tensor(
-                [[ep_mesh_index(), start]],
+                [[_RANK_BUFFER_INDEX, start]],
                 dtype=torch.int32,
                 device=layer.w13_weight.device,
             )
@@ -302,26 +397,51 @@ def arm_fused_tp_ar(model: torch.nn.Module) -> int:
                 "fused TP MoE: layers on this rank start at different experts "
                 f"({_RANK_BUFFER_START} vs {start})"
             )
+        shared_gated = shared[4] is not None
+        if not shared_gated:
+            # Placeholder for the op's fixed wg operand; the program ignores it.
+            h = layer.w13_weight.shape[1]
+            shared = (
+                *shared[:4],
+                torch.zeros(
+                    (1, h), dtype=torch.bfloat16, device=layer.w13_weight.device
+                ),
+            )
         setattr(
             runner._quant_method,
             FUSED_MOE_TP_AR_OP_ATTR,
             _build_op(
-                mesh, n_ranks, layer.moe_config.experts_per_token, expert_parallel
+                mesh,
+                n_ranks,
+                layer.moe_config.experts_per_token,
+                expert_parallel,
+                shared_gated,
+                routed_scale,
             ),
         )
         for name, tensor in zip(_SHARED_BUFFERS, shared):
             layer.register_buffer(name, tensor, persistent=False)
         runner._shared_experts = None
+        # The kernel applies the routed scale to the routed experts only; the
+        # runner would apply it to the kernel's shared + routed sum.
+        runner.routed_scaling_factor = 1.0
         runner._forward_entry = runner._select_forward()
         object.__setattr__(runner, _RUNNER_ARMED_ATTR, True)
         armed += 1
-    if armed:
+    if runners:
+        # Every rank logs (not info_once): the evidence that all ranks armed.
         logger.info(
             "Armed fused TP MoE + shared expert + all-reduce on %d of %d MoE layers "
-            "(%d ranks, decode kernel up to %d tokens, prefill kernel above)",
+            "of the %s | ep_mesh_index=%s experts_start=%s ranks=%d | shared gate=%s "
+            "routed_scale=%s | decode kernel up to %d tokens, prefill kernel above",
             armed,
             len(runners),
+            what,
+            _RANK_BUFFER_INDEX if armed else None,
+            _RANK_BUFFER_START if armed else None,
             n_ranks,
+            sorted({s[2] for s in signature[1]}),
+            sorted({s[3] for s in signature[1]}),
             MAX_DECODE_TOKENS,
         )
     return armed
@@ -359,11 +479,11 @@ def arm_runner_models(model_runner: Any) -> int:
     """Arm the target model and, when it is a separate module, the drafter's
     model (the MTP layer). Called once after the drafter has loaded, when every
     module has its final weight layout."""
-    armed = arm_fused_tp_ar(model_runner.model)
+    armed = arm_fused_tp_ar(model_runner.model, "target model")
     for name in ("drafter", "_async_drafter"):
         drafter = getattr(model_runner, name, None)
         draft = getattr(drafter, "draft_model", None) or getattr(drafter, "model", None)
         if isinstance(draft, torch.nn.Module) and draft is not model_runner.model:
-            armed += arm_fused_tp_ar(draft)
+            armed += arm_fused_tp_ar(draft, "draft model")
             break
     return armed
