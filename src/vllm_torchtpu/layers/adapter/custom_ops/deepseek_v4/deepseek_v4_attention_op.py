@@ -34,6 +34,9 @@ from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla_swa import (
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import (
     sparse_ragged_paged_attention,
 )
+from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla_swa import (
+    sparse_swa_ragged_paged_attention,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import align_to
 
@@ -199,6 +202,29 @@ def _attention_csa(
 
     swa_page_indices = swa_page_indices.flatten()
     main_page_indices = main_page_indices.flatten()
+
+    if sw_cache.shape[0] != 0 and not non_causal_block:
+        # The window joins the top-k rows under one softmax in one kernel.
+        return sparse_swa_ragged_paged_attention(
+            q,
+            new_kv,
+            sw_cache,
+            swa_kv_lens,
+            swa_page_indices,
+            swa_cu_q_lens,
+            swa_distribution,
+            main_cache_kv,
+            main_cache_rope,
+            extra,
+            main_page_indices,
+            main_cu_q_lens,
+            main_distribution,
+            attention_sinks,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            logical_page_size=logical_page_size,
+            nope_is_sw_cache=two_caches_same_buffer,
+        )
 
     swa_output, updated_sw_cache, swa_l, swa_m = _run_swa(
         q=q,
