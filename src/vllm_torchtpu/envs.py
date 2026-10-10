@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
+    TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 16
     TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = False
     TPU_INDEXER_TOPK_SHARED_READ: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -859,10 +860,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
     ),
     # Query block size for the StreamIndex top-k MIXED pass when the padded
-    # token bucket is small (<= 16 tokens). Under MTP every decode request has
-    # q_len = gamma + 1 > 1, so decode runs in the MIXED pass, whose default
-    # 128-row query block computes ~124 padding rows per real row. Unset keeps
-    # the default 128. 4 (one MTP request per block) measured fastest.
+    # token bucket is small (<= TPU_STREAMIDX_SMALL_BUCKET_TOKENS). Under MTP
+    # every decode request has q_len = gamma + 1 > 1, so decode runs in the
+    # MIXED pass, whose default 128-row query block computes ~124 padding rows
+    # per real row. Unset keeps the default 128. 4 (one MTP request per
+    # block) measured fastest.
     "TPU_STREAMIDX_SMALL_BUCKET_BQ": env_positive_int_or_none(
         "TPU_STREAMIDX_SMALL_BUCKET_BQ"
     ),
@@ -872,6 +874,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the decode-shape sweep picked.
     "TPU_STREAMIDX_SMALL_BUCKET_BKVP": env_positive_int_or_none(
         "TPU_STREAMIDX_SMALL_BUCKET_BKVP"
+    ),
+    # Largest padded token bucket that takes the small-bucket block sizes
+    # (PR #1796). A small query block re-reads a sequence's keys once per
+    # block, so one long q_len row in the bucket erodes the win: at 64 a lone
+    # 60-token tail is at parity with the 128-row block. Default 16 keeps
+    # today's behaviour; #1796 proposes 64. Above 16 the bq 4 path is not
+    # bit-identical to (128, 2): since #1641 bq 32/64/128 reduce heads over
+    # bf16-rounded relu(q.k), bq <= 16 in f32.
+    "TPU_STREAMIDX_SMALL_BUCKET_TOKENS": env_int(
+        "TPU_STREAMIDX_SMALL_BUCKET_TOKENS", 16
     ),
     # Branch at runtime around StreamIndex top-k's two DECODE (q_len 1)
     # passes when the batch has no q_len-1 sequence -- every step under MTP,
