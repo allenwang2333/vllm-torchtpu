@@ -48,6 +48,7 @@ from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
 from vllm_torchtpu.kernels.deepseek_v41 import tp_attention
 from vllm_torchtpu.kernels.deepseek_v41.sparse_mla import (
     precompute_csa_union_and_bitmask,
+    resolve_csa_union_params,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
     deepseek_v4_attention_op as _dsv4_attn_op,
@@ -415,13 +416,87 @@ class VllmDeepseekV41MLAAttention(
             first_leader._step_indexer_metadata = None
         return cached_meta
 
-    def _get_csa_union_op(self, total_cache_rows: int, m_union: int):
-        op_name = f"pallas::deepseek_v41_csa_union_r{total_cache_rows}_m{m_union}"
+    def _csa_kv_group_bounds(
+        self, ced_decoder: bool | None = None
+    ) -> tuple[Any, int]:
+        eff_ced = self._ced_decoder if ced_decoder is None else ced_decoder
+        cache_attr = (
+            "_cached_csa_kv_group_bounds_ced"
+            if eff_ced
+            else "_cached_csa_kv_group_bounds"
+        )
+        cached = self.__dict__.get(cache_attr)
+        if cached is not None:
+            return cached
+        kv_holder = self._kv_source_module()
+        my_lid = extract_layer_index(self.prefix)
+        attn_mods = [
+            mod
+            for mod in self._static_forward_context.values()
+            if isinstance(mod, VllmDeepseekV41MLAAttention)
+        ]
+        ced_boundary = len(attn_mods) // 2
+        min_lid = my_lid
+        max_lid = my_lid
+        first_consumer: Any = self
+        for mod in attn_mods:
+            if mod.compress_ratio > 0 and mod._kv_source_module() is kv_holder:
+                lid = extract_layer_index(mod.prefix)
+                if eff_ced and lid < ced_boundary:
+                    continue
+                if lid < min_lid:
+                    min_lid = lid
+                    first_consumer = mod
+                if lid > max_lid:
+                    max_lid = lid
+        res = (first_consumer, max_lid)
+        if not torch.compiler.is_compiling():
+            object.__setattr__(self, cache_attr, res)
+        return res
+
+    def _get_or_compute_csa_union(
+        self,
+        topk_indices: torch.Tensor,
+        total_cache_rows: int,
+        m_union: int,
+        b_q: int,
+        *,
+        ced_decoder: bool | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        kv_holder = self._kv_source_module()
+        first_consumer, last_lid = self._csa_kv_group_bounds(ced_decoder)
+        my_lid = extract_layer_index(self.prefix)
+        cached_entry = getattr(kv_holder, "_step_csa_union", None)
+        if (
+            self.indexer is not None
+            or my_lid == extract_layer_index(first_consumer.prefix)
+            or cached_entry is None
+            or cached_entry[0] != b_q
+            or cached_entry[1] != m_union
+        ):
+            cached_u = self._get_csa_union_op(
+                total_cache_rows, m_union, b_q=b_q
+            )(topk_indices)
+            if last_lid > my_lid:
+                kv_holder._step_csa_union = (b_q, m_union, cached_u)
+            else:
+                kv_holder._step_csa_union = None
+            return cached_u
+        if my_lid == last_lid:
+            kv_holder._step_csa_union = None
+        return cached_entry[2]
+
+    def _get_csa_union_op(
+        self, total_cache_rows: int, m_union: int, b_q: int | None = None
+    ):
+        b_q = envs.VLLM_DSV41_CSA_UNION_BQ if b_q is None else b_q
+        u_chunk = min(512, m_union)
+        op_name = f"pallas::deepseek_v41_csa_union_r{total_cache_rows}_bq{b_q}_m{m_union}_uc{u_chunk}"
         if (op := self.__dict__.get(op_name)) is not None:
             return op
 
         def _fake_union(topk_indices: torch.Tensor):
-            num_groups = topk_indices.shape[0] // 32
+            num_groups = topk_indices.shape[0] // b_q
             return (
                 torch.empty(
                     (num_groups * m_union,),
@@ -447,8 +522,9 @@ class VllmDeepseekV41MLAAttention(
             _CSA_UNION_SPECS,
             _fake_union,
             total_cache_rows=total_cache_rows,
-            b_q=32,
+            b_q=b_q,
             m_union=m_union,
+            u_chunk=u_chunk,
         )
 
     @property
@@ -459,6 +535,8 @@ class VllmDeepseekV41MLAAttention(
             and not torch.compiler.is_compiling()
         ):
             _ = self._get_attn_op(False, ced_decoder=True)
+            if self.compress_ratio > 0:
+                _ = self._get_attn_op(True, ced_decoder=True)
         if self.non_causal_multi_token_decode and not torch.compiler.is_compiling():
             _ = self.context_kv_attn_op
             _ = self.kv_rope_op
@@ -534,12 +612,20 @@ class VllmDeepseekV41MLAAttention(
                     main_entry[0] if isinstance(main_entry, tuple) else main_entry
                 )
                 if main_cache is not None and main_cache.shape[0] > 0:
+                    total_r = int(main_cache.shape[0] * main_cache.shape[1])
                     m_u = (
-                        (3 * int(self.topk_indices_buffer.shape[1]) + 127) // 128
-                    ) * 128
-                    _ = self._get_csa_union_op(
-                        int(main_cache.shape[0] * main_cache.shape[1]), m_u
+                        envs.VLLM_DSV41_CSA_UNION_M
+                        if envs.VLLM_DSV41_CSA_UNION_M > 0
+                        else ((3 * int(self.topk_indices_buffer.shape[1]) + 127) // 128) * 128
                     )
+                    m_u_v = (
+                        envs.VLLM_DSV41_CSA_UNION_M
+                        if envs.VLLM_DSV41_CSA_UNION_M > 0
+                        else ((2 * int(self.topk_indices_buffer.shape[1]) + 127) // 128) * 128
+                    )
+                    _ = self._get_csa_union_op(total_r, m_u)
+                    _ = self._get_csa_union_op(total_r, m_u_v, b_q=6)
+                    _ = self._get_csa_union_op(total_r, m_u_v, b_q=5)
             if self.indexer is not None:
                 idx_kv = _live_cache(getattr(self.indexer.k_cache, "kv_cache", None))
                 if idx_kv is not None:
@@ -1619,24 +1705,30 @@ class VllmDeepseekV41MLAAttention(
             max_num_seqs = (
                 int(main_q_loc.shape[0]) - 1 if main_q_loc is not None else num_tokens
             )
-            if (
-                envs.VLLM_DSV41_CSA_UNION
+            u_params = (
+                resolve_csa_union_params(
+                    num_tokens,
+                    int(topk_indices.shape[1]),
+                    max_num_seqs,
+                    ced_decoder=eff_ced_decoder,
+                )
+                if envs.VLLM_DSV41_CSA_UNION
                 and main_cache_kv.shape[0] > 0
-                and not eff_ced_decoder
-                and num_tokens > max_num_seqs
-                and num_tokens >= 512
-                and num_tokens % 32 == 0
+                and self.n_local_heads <= 128
                 and topk_indices is not None
                 and topk_indices.shape[1] % 128 == 0
-            ):
+                else None
+            )
+            if u_params is not None:
+                b_q, m_union = u_params
                 total_cache_rows = int(main_cache_kv.shape[0] * main_cache_kv.shape[1])
-                m_union = ((3 * int(topk_indices.shape[1]) + 127) // 128) * 128
-                cached_u = getattr(kv_holder, "_step_csa_union", None)
-                if self.indexer is not None or cached_u is None:
-                    cached_u = self._get_csa_union_op(total_cache_rows, m_union)(
-                        topk_indices
-                    )
-                    kv_holder._step_csa_union = cached_u
+                cached_u = self._get_or_compute_csa_union(
+                    topk_indices,
+                    total_cache_rows,
+                    m_union,
+                    b_q,
+                    ced_decoder=eff_ced_decoder,
+                )
                 tail_operands += tuple(cached_u)
                 has_union = True
 
