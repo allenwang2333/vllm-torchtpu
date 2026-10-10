@@ -69,6 +69,13 @@ x-tests-plugin-defaults: &tests_plugin_defaults
   # included, so splitting by example plans over the tests the step runs.
   test-cmd: "pytest -sv --junit-xml={{resultPath}} {{testExamples}}"
 
+# General and Multichip plan per test rather than per file; see
+# scripts/ci/bktec_by_test.sh. The paths to collect replace the plugin's file
+# pattern: they run every test file but the speculative decoding suite, which
+# has steps of its own.
+x-by-test-commands: &by_test_commands
+  - .buildkite/kubernetes/run.sh bash -c 'scripts/ci/bktec_by_test.sh tests --ignore=tests/entrypoints/llm/test_speculative_decoding.py || [ $$? -eq 5 ]'
+
 # Overridable to run on idle v6e, but only to prove the plumbing reaches a
 # chip: several hundred kernel tests call pytest.fail rather than skip there,
 # so a v6e run is red for reasons that say nothing about this lane.
@@ -129,6 +136,7 @@ steps:
         key: "unit_tests_general_pr"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
+        commands: *by_test_commands
         parallelism: 4
         env:
           PYTEST_ADDOPTS: "--timeout=600 -m 'tpu_test and not nightly and not multichip'"
@@ -137,12 +145,12 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
 
       - label: ":kubernetes: Unit Tests - Multichip (PR)"
         key: "unit_tests_multichip_pr"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
+        commands: *by_test_commands
         parallelism: 2
         env:
           PYTEST_ADDOPTS: "--timeout=600 -m 'not nightly and multichip'"
@@ -151,7 +159,6 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
 
       # Representative correctness cases run on PRs; the full parameter matrix
       # and acceptance-rate tests run nightly. Split by example because the
@@ -260,6 +267,7 @@ steps:
         key: "unit_tests_general_nightly"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
+        commands: *by_test_commands
         parallelism: 4
         env:
           PYTEST_ADDOPTS: "--timeout=600 -m 'tpu_test and not multichip'"
@@ -268,12 +276,12 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
 
       - label: ":kubernetes: Unit Tests - Multichip (Nightly)"
         key: "unit_tests_multichip_nightly"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
+        commands: *by_test_commands
         parallelism: 2
         env:
           PYTEST_ADDOPTS: "--timeout=600 -m 'multichip'"
@@ -282,7 +290,6 @@ steps:
           - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
 
       - label: ":kubernetes: Unit Tests - Omni (Nightly)"
         key: "unit_tests_omni_nightly"

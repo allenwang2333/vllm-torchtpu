@@ -37,6 +37,13 @@ x-tests-plugin-defaults: &tests_plugin_defaults
   # included, so splitting by example plans over the tests the step runs.
   test-cmd: "pytest -sv --junit-xml={{resultPath}} {{testExamples}}"
 
+# General and Multichip plan per test rather than per file; see
+# scripts/ci/bktec_by_test.sh. The paths to collect replace the plugin's file
+# pattern: they run every test file but the speculative decoding suite, which
+# has steps of its own.
+x-by-test-commands: &by_test_commands
+  - bash .buildkite/scripts/run_in_docker.sh scripts/ci/bktec_by_test.sh tests --ignore=tests/entrypoints/llm/test_speculative_decoding.py || [ $? -eq 5 ]
+
 steps:
   - label: "Type Check - Full Environment"
     key: "typecheck_full"
@@ -96,6 +103,7 @@ steps:
         key: "unit_tests_general_pr"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") != "1"'
+        commands: *by_test_commands
         parallelism: 4
         env:
           PYTEST_ADDOPTS: "--timeout=600 -m 'tpu_test and not nightly and not multichip'"
@@ -104,12 +112,12 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
 
       - label: "Unit Tests - Multichip (PR)"
         key: "unit_tests_multichip_pr"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") != "1"'
+        commands: *by_test_commands
         parallelism: 2
         env:
           PYTEST_ADDOPTS: "--timeout=600 -m 'not nightly and multichip'"
@@ -118,7 +126,6 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
 
       # Representative correctness cases run on PRs; the full parameter
       # matrix and acceptance-rate tests run nightly. Split by example because
@@ -217,6 +224,7 @@ steps:
         key: "unit_tests_general_nightly"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") == "1"'
+        commands: *by_test_commands
         parallelism: 4
         env:
           PYTEST_ADDOPTS: "--timeout=600 -m 'tpu_test and not multichip'"
@@ -225,12 +233,12 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
 
       - label: "Unit Tests - Multichip (Nightly)"
         key: "unit_tests_multichip_nightly"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") == "1"'
+        commands: *by_test_commands
         parallelism: 2
         env:
           PYTEST_ADDOPTS: "--timeout=600 -m 'multichip'"
@@ -239,7 +247,6 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
 
       # Omni multimodal and diffusion models on TPU.
       - label: "Unit Tests - Omni (Nightly)"
