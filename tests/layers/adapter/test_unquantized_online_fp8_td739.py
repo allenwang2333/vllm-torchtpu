@@ -112,13 +112,21 @@ class TestModuleReloadCoverage:
     def test_reload_modules(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import vllm.model_executor.layers.quantization as vllm_quant
 
+        orig_unquant = dict(unquant_mod.__dict__)
+        orig_online = dict(online_fp8_mod.__dict__)
         monkeypatch.setattr(
             vllm_quant,
             "register_quantization_config",
             lambda _name: (lambda cls: cls),
         )
-        importlib.reload(unquant_mod)
-        importlib.reload(online_fp8_mod)
+        try:
+            importlib.reload(unquant_mod)
+            importlib.reload(online_fp8_mod)
+        finally:
+            unquant_mod.__dict__.clear()
+            unquant_mod.__dict__.update(orig_unquant)
+            online_fp8_mod.__dict__.clear()
+            online_fp8_mod.__dict__.update(orig_online)
 
 
 class TestVllmUnquantizedLinearAndConfig:

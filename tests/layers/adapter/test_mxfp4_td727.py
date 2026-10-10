@@ -126,13 +126,21 @@ class TestModuleReloadCoverage:
         """Ensure top-level statements in mxfp4.py and deepseek_v4_fp8.py are traced."""
         import vllm.model_executor.layers.quantization as vllm_quant
 
+        orig_mxfp4 = dict(mxfp4_mod.__dict__)
+        orig_dsv4 = dict(dsv4_fp8_mod.__dict__)
         monkeypatch.setattr(
             vllm_quant,
             "register_quantization_config",
             lambda _name: (lambda cls: cls),
         )
-        importlib.reload(mxfp4_mod)
-        importlib.reload(dsv4_fp8_mod)
+        try:
+            importlib.reload(mxfp4_mod)
+            importlib.reload(dsv4_fp8_mod)
+        finally:
+            mxfp4_mod.__dict__.clear()
+            mxfp4_mod.__dict__.update(orig_mxfp4)
+            dsv4_fp8_mod.__dict__.clear()
+            dsv4_fp8_mod.__dict__.update(orig_dsv4)
 
 
 class TestVllmDeepseekV4Fp8Config:

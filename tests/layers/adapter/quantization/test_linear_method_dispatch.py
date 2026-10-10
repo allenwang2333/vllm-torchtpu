@@ -109,3 +109,60 @@ class TestUnquantizedFallbackDispatch:
             linear_layer, prefix="model.layers.0.self_attn.qkv_proj"
         )
         assert isinstance(method, VllmUnquantizedLinearMethod)
+
+    def test_get_tpu_quantization_config_branches(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from vllm.config import VllmConfig
+
+        import vllm_torchtpu.layers.adapter.quantization as tpu_quant
+        from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import (
+            VllmDeepseekV41Fp8Config,
+        )
+
+        sentinel_cfg = SimpleNamespace()
+        monkeypatch.setattr(
+            VllmConfig,
+            "get_quantization_config",
+            staticmethod(lambda mc, lc: sentinel_cfg),
+        )
+        monkeypatch.setattr(
+            VllmDeepseekV41Fp8Config, "set_configs", classmethod(lambda cls, vc: None)
+        )
+        monkeypatch.setattr(
+            tpu_quant, "attach_online_fp8", lambda cfg, vc: ("attached", cfg)
+        )
+
+        # 1. deepseek_v41 branch
+        dsv41_vc = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type="deepseek_v41"),
+                quantization="fp8",
+            ),
+            load_config=SimpleNamespace(),
+        )
+        assert tpu_quant.get_tpu_quantization_config(dsv41_vc) is sentinel_cfg
+
+        # 2. Unsupported quantization method
+        bad_vc = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type="llama"),
+                quantization="unsupported_method",
+            ),
+            load_config=SimpleNamespace(),
+        )
+        with pytest.raises(NotImplementedError, match="not supported on TPU"):
+            tpu_quant.get_tpu_quantization_config(bad_vc)
+
+        # 3. Supported method (None -> VllmUnquantizedConfig)
+        ok_vc = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type="llama"),
+                quantization=None,
+            ),
+            load_config=SimpleNamespace(),
+        )
+        assert tpu_quant.get_tpu_quantization_config(ok_vc) == (
+            "attached",
+            sentinel_cfg,
+        )

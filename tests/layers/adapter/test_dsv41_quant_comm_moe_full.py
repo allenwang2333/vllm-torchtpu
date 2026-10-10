@@ -626,26 +626,31 @@ class TestMoeRouting:
 
         import vllm.envs as vllm_envs
 
-        # 1. Invalid strategy raises ValueError
-        monkeypatch.setattr(
-            vllm_envs,
-            "VLLM_MOE_ROUTING_SIMULATION_STRATEGY",
-            "invalid_strategy_name_xyz",
-        )
-        with pytest.raises(ValueError, match="is not a known routing strategy"):
+        orig_moe_routing = dict(moe_routing.__dict__)
+        try:
+            # 1. Invalid strategy raises ValueError
+            monkeypatch.setattr(
+                vllm_envs,
+                "VLLM_MOE_ROUTING_SIMULATION_STRATEGY",
+                "invalid_strategy_name_xyz",
+            )
+            with pytest.raises(ValueError, match="is not a known routing strategy"):
+                importlib.reload(moe_routing)
+
+            # 2. Valid strategy sets _SIMULATION_STRATEGY and logs warning
+            monkeypatch.setattr(
+                vllm_envs, "VLLM_MOE_ROUTING_SIMULATION_STRATEGY", "uniform_random"
+            )
             importlib.reload(moe_routing)
+            assert moe_routing._SIMULATION_STRATEGY is not None
 
-        # 2. Valid strategy sets _SIMULATION_STRATEGY and logs warning
-        monkeypatch.setattr(
-            vllm_envs, "VLLM_MOE_ROUTING_SIMULATION_STRATEGY", "uniform_random"
-        )
-        importlib.reload(moe_routing)
-        assert moe_routing._SIMULATION_STRATEGY is not None
-
-        # 3. Restore to None
-        monkeypatch.setattr(vllm_envs, "VLLM_MOE_ROUTING_SIMULATION_STRATEGY", "")
-        importlib.reload(moe_routing)
-        assert moe_routing._SIMULATION_STRATEGY is None
+            # 3. Restore to None
+            monkeypatch.setattr(vllm_envs, "VLLM_MOE_ROUTING_SIMULATION_STRATEGY", "")
+            importlib.reload(moe_routing)
+            assert moe_routing._SIMULATION_STRATEGY is None
+        finally:
+            moe_routing.__dict__.clear()
+            moe_routing.__dict__.update(orig_moe_routing)
 
     def test_uniform_random_routing(self) -> None:
         """Test _uniform_random_routing."""

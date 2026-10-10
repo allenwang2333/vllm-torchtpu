@@ -85,6 +85,7 @@ class TestUnquantizedLinearNumerics:
 
     @pytest.mark.parametrize("m,k,n", SHAPES)
     def test_matches_f_linear_without_bias(self, m, k, n, device):
+        torch.manual_seed(0)
         x = torch.randn(m, k, dtype=torch.bfloat16, device=device)
         w = torch.randn(n, k, dtype=torch.bfloat16, device=device)
         layer = _make_layer(w)
@@ -105,6 +106,7 @@ class TestUnquantizedLinearNumerics:
         before adding, which diverges from F.linear's single rounding. The
         difference is sub-ulp, so only an exact comparison catches it.
         """
+        torch.manual_seed(0)
         x = torch.randn(m, k, dtype=torch.bfloat16, device=device)
         w = torch.randn(n, k, dtype=torch.bfloat16, device=device)
         bias = torch.randn(n, dtype=torch.bfloat16, device=device)
@@ -120,6 +122,7 @@ class TestUnquantizedLinearNumerics:
 
     def test_matches_f_linear_for_3d_input(self, device):
         """Leading dims are flattened for the matmul and restored after."""
+        torch.manual_seed(0)
         b, m, k, n = 2, 5, 64, 32
         x = torch.randn(b, m, k, dtype=torch.bfloat16, device=device)
         w = torch.randn(n, k, dtype=torch.bfloat16, device=device)
