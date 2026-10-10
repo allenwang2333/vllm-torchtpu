@@ -114,6 +114,8 @@ class Tiles:
     scan_depth: int = 8
     topk_kc: int = 512          # local extraction chunk (1-chip sweep j-ffda0844: 256 -> 512 = -3 us/row)
     topk_kc_global: int = 256   # global compaction chunk (owns ~K/R slots: one chunk with the dyn count)
+    kch: int = 0                # candidate-key AG in chunks of kch rows, double-buffered (0: all TMAX rows
+                                # at once). VMEM R * TMAX * KT * 4 B -> 2 * R * kch * KT * 4 B (conc 16)
 
     def tk(self, K, N, dtype):
         """Largest 128-multiple divisor of K whose (tk, N) tile fits one bank."""
@@ -333,6 +335,9 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     NPR = pg // 128                                      # key rows per page
     KT = cfg.KT
     KR_ = KT // 128                                      # candidate rows
+    KCH = tiles.kch if 0 < tiles.kch < cfg.TMAX else cfg.TMAX    # candidate-key AG chunk (rows)
+    assert cfg.TMAX % KCH == 0, (cfg.TMAX, KCH)
+    NKS = 1 if KCH == cfg.TMAX else 2                    # kall slots (double-buffered when chunked)
     GKR = rup(R * KR_, 128)                              # gathered candidate rows (padded)
     ROWSL = rup(max(1, cfg.n_local(max_pages * pg * R, 0)) // 128 + 1, 128)   # local key rows
     ROWSL = max(ROWSL, 128)
@@ -433,7 +438,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         "tk_acc": pltpu.VMEM((min(max(tiles.topk_kc, tiles.topk_kc_global), KT), 768), F32),
         "tk_cc": pltpu.VMEM((2, 128, 128), F32),
         "cidx": pltpu.VMEM((KR_, 128), I32),
-        "ksend": pltpu.VMEM((TMAX, KR_, 128), I32), "kall": pltpu.VMEM((R, TMAX, KR_, 128), I32),
+        "ksend": pltpu.VMEM((TMAX, KR_, 128), I32), "kall": pltpu.VMEM((NKS, R, KCH, KR_, 128), I32),
         "gk": pltpu.VMEM((GKR, 128), I32), "gmk": pltpu.VMEM((128, 128), I32),
         "oslot": pltpu.VMEM((KR_, 128), I32),
         "oslot_s": pltpu.SMEM((KR_, 128), I32),
@@ -1177,21 +1182,31 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             lax.fori_loop(0, B, per_req, 0)
             # AG candidate keys, global top-KT, owned winners
             pi.mark("I_agk")
-            scr["kall"][me] = scr["ksend"][...]
-            exchange(lambda d: scr["ksend"], scr["kall"], "k_send", "k_recv", rows=T)
+            # chunk c -> kall[c % NKS]: a peer rewrites slot c % 2 only at chunk c + 2, which it starts
+            # after receiving this rank's chunk c + 1, sent after this rank consumed chunk c
 
-            pi.mark("I_gtopk")
+            def k_chunk(c, cc):
+                slot = c % NKS
+                r0 = pl.multiple_of(c * KCH, KCH)
+                n = jnp.minimum(KCH, T - r0)
+                scr["kall"][slot, me] = scr["ksend"][pl.ds(r0, KCH)]
+                exchange(lambda d: scr["ksend"].at[pl.ds(r0, KCH)], scr["kall"].at[slot], "k_send", "k_recv",
+                         rows=n)
 
-            def per_row(t_, c):
-                @pl.when(rmeta[t_, 0] > 0)
-                def _():
-                    global_row(t_)
+                def per_row(i, c2):
+                    t_ = r0 + i
 
-                @pl.when(rmeta[t_, 0] <= 0)
-                def _():
-                    scr["nown_s"][t_] = jnp.int32(0)
-                return c
-            lax.fori_loop(0, T, per_row, 0)
+                    @pl.when(rmeta[t_, 0] > 0)
+                    def _():
+                        global_row(t_, slot, i)
+
+                    @pl.when(rmeta[t_, 0] <= 0)
+                    def _():
+                        scr["nown_s"][t_] = jnp.int32(0)
+                    return c2
+                lax.fori_loop(0, n, per_row, 0)
+                return cc
+            lax.fori_loop(0, (T + KCH - 1) // KCH, k_chunk, 0)
 
             pi.mark("I_union")
 
@@ -1364,11 +1379,11 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             scr["nuo_s"][b] = res[2]
             return off + (res[1] + 127) // 128
 
-        def global_row(t_):
+        def global_row(t_, slot, tl):
             """Row t_'s global top-KT over all ranks' candidates -> own_v / nown_s (build_union copies a
             request's rows to own_s)."""
             for s_ in range(R):
-                scr["gk"][s_ * KR_:(s_ + 1) * KR_, :] = scr["kall"][s_, t_]
+                scr["gk"][s_ * KR_:(s_ + 1) * KR_, :] = scr["kall"][slot, s_, tl]
             if GKR > R * KR_:
                 scr["gk"][R * KR_:GKR, :] = jnp.full((GKR - R * KR_, 128), INT_MIN, I32)
             # owned winners' local indices compacted by the vector extraction itself (payload = the
