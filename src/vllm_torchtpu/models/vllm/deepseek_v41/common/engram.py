@@ -117,14 +117,14 @@ class NgramHashState(upstream.NgramHashState):
             if not self.use_slot_cache:
                 return torch.full_like(window, self.pad_id)
             assert self._cache is not None
-            logical = past.clamp(
-                min=0, max=block_table.shape[1] * self.block_size - 1
-            ).long()
-            blocks = block_table[reqs, logical // self.block_size].long()
+            # int32 block / slot math (TPU emulates int64 divide, modulo and
+            # multiply-add); only the gather indices are int64.
+            logical = past.clamp(min=0, max=block_table.shape[1] * self.block_size - 1)
+            blocks = block_table[reqs, (logical // self.block_size).long()].int()
             slots = (blocks * self.block_size + logical % self.block_size).clamp(
                 min=0, max=self._cache.numel() - 1
             )
-            return self._cache[slots]
+            return self._cache[slots.long()]
 
         tables = (self.token_map, self.multipliers, self.primes, self.offsets)
         return self._hash(
@@ -272,18 +272,23 @@ class NgramHashState(upstream.NgramHashState):
         count = input_ids.numel()
         _, ngram = multipliers.shape
         dev = input_ids.device
-        rows = torch.arange(count, device=dev)
+        # Rows, shifts and positions in int32: the [count, reqs] request
+        # compare and the [count, ngram] source / window index math run in
+        # native 32-bit ops instead of TPU-emulated int64 (positions and
+        # token counts fit int32). Gather indices are widened with `.long()`.
+        rows = torch.arange(count, dtype=torch.int32, device=dev)
         reqs = (
             (rows.unsqueeze(1) >= query_start_loc[1:].unsqueeze(0))
             .sum(-1)
             .clamp(max=lookback_token_ids.shape[0] - 1)
         )
         starts = query_start_loc[reqs].long().clamp(max=count - 1)
-        chunk_positions = positions[starts]
-        shifts = torch.arange(ngram, device=dev)
-        past = positions[:, None] - shifts
+        pos_i32 = positions.int()
+        chunk_positions = pos_i32[starts]
+        shifts = torch.arange(ngram, dtype=torch.int32, device=dev)
+        past = pos_i32[:, None] - shifts
         in_chunk = past >= chunk_positions[:, None]
-        indices = (rows[:, None] - shifts).clamp(min=0)
+        indices = (rows[:, None] - shifts).clamp(min=0).long()
         if mapped_batch is None:
             mapped_batch = token_map[input_ids.long()].masked_fill(
                 dead_mask, upstream.DEAD_ID
