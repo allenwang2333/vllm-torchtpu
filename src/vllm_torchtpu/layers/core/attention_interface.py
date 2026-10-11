@@ -1184,27 +1184,48 @@ def sparse_mla_attention_dcp(
             raise ValueError(
                 f"TPU_DCP_MLA_SMALL_CHUNK_BATCH must be >= 1, got {small_chunk_batch}"
             )
-        output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
-            q,
-            kv_cache_nope,
-            kv_cache_rope,
-            topk_idx,
-            local_block_tables,
-            query_start_loc_,
-            request_distribution_,
-            sm_scale=sm_scale or 1.0,
-            k_scale=dequant_scale,
-            return_lse=True,
-            # The kernel defaults to tensorcore; the caches follow the spec.
-            cache_layout=cache_layout,
-            # Ranks own ~topk/dcp of each row: a static top-k width with an
-            # exact in-kernel overflow pass for the rows that need more.
-            topk_cap=topk_cap,
-            # Decode chunks: tokens per grid step (1 = kernel default).
-            small_chunk_batch_size=small_chunk_batch,
-            **chunk_kwargs,
-            **split_kwargs,
+        def attend(topk_idx):
+            return sparse_mla_kernel.sparse_ragged_paged_attention(
+                q,
+                kv_cache_nope,
+                kv_cache_rope,
+                topk_idx,
+                local_block_tables,
+                query_start_loc_,
+                request_distribution_,
+                sm_scale=sm_scale or 1.0,
+                k_scale=dequant_scale,
+                return_lse=True,
+                # The kernel defaults to tensorcore; the caches follow the spec.
+                cache_layout=cache_layout,
+                # Ranks own ~topk/dcp of each row: a static top-k width with an
+                # exact in-kernel overflow pass for the rows that need more.
+                topk_cap=topk_cap,
+                # Decode chunks: tokens per grid step (1 = kernel default).
+                small_chunk_batch_size=small_chunk_batch,
+                **chunk_kwargs,
+                **split_kwargs,
+            )
+
+        # Rows are prefix-packed and `-1` padded, and a rank owns ~topk/dcp of
+        # each, so gathering the full width mostly moves padding. Run at the
+        # narrowest configured width that holds the step's fullest row; the
+        # rows' prefixes are unchanged, so the result is identical.
+        topk = topk_idx.shape[-1]
+        widths = sorted(
+            {w for w in envs.TPU_DCP_MLA_WIDTHS if w < topk and topk_cap is None},
+            reverse=True,
         )
+        if widths:
+            fullest = jnp.max(jnp.sum(topk_idx >= 0, axis=-1))
+            branch = sum((fullest <= w).astype(jnp.int32) for w in widths)
+            output, lse = jax.lax.switch(
+                branch,
+                [lambda t, w=w: attend(t[:, :w]) for w in (topk, *widths)],
+                topk_idx,
+            )
+        else:
+            output, lse = attend(topk_idx)
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
         return (kv_cache_nope, kv_cache_rope, output[..., : ql_nope.shape[-1]], lse)

@@ -575,6 +575,82 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
 
     @parameterized.product(
         (
+            {"query_tokens": 16, "real_tokens": 13, "chunk": 64},
+            {"query_tokens": 128, "real_tokens": 100, "chunk": 64},
+            {"query_tokens": 256, "real_tokens": 256, "chunk": 64},
+        ),
+        width=(1024, 1536),
+    )
+    def test_narrow_width_matches_full_width(
+        self, query_tokens, real_tokens, chunk, width
+    ):
+        """A prefix-packed top-k run at a narrower width, every row fitting.
+
+        `TPU_DCP_MLA_WIDTHS` slices the rank-local top-k to the narrowest width
+        holding the step's fullest row; this is the property it relies on.
+        Counts reach the width exactly, so a row losing its last entry fails.
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        topk = 2048
+        rng = np.random.default_rng(20261011)
+        problem = _build_problem(
+            rng, k_scale=0.75, query_tokens=query_tokens, topk=topk
+        )
+        counts = np.resize(
+            np.array([1, 63, 255, 512, 700, width - 1, width, 900, 130]),
+            query_tokens,
+        )
+        rng.shuffle(counts)
+        live = np.arange(topk)[None, :] < counts[:, None]
+        topk_idx = jnp.where(jnp.asarray(live), problem["topk"], -1)
+        cu_q_lens = jnp.array([0, real_tokens], jnp.int32)
+        distribution = jnp.array([0, 1, 1], jnp.int32)
+
+        def run(idx):
+            return sparse_mla.sparse_ragged_paged_attention(
+                problem["q"],
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                idx,
+                problem["page_table"],
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=chunk,
+                attention_kernel_batch_size=16,
+            )
+
+        (ref, ref_lse), (out, lse) = jax.block_until_ready(
+            (run(topk_idx), run(topk_idx[:, :width]))
+        )
+        real = np.asarray(out, np.float32)[:real_tokens]
+        np.testing.assert_allclose(
+            real, np.asarray(ref, np.float32)[:real_tokens], rtol=2e-2, atol=2e-2
+        )
+        np.testing.assert_allclose(
+            np.asarray(lse)[:real_tokens],
+            np.asarray(ref_lse)[:real_tokens],
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        # Positive control: dropping each row's last live entry must show.
+        short = jnp.where(
+            jnp.arange(width)[None, :] < jnp.asarray(counts - 1)[:, None],
+            topk_idx[:, :width],
+            -1,
+        ).at[:, 0].set(topk_idx[:, 0])
+        _, short_lse = run(short)
+        self.assertGreater(
+            np.abs(np.asarray(short_lse) - np.asarray(ref_lse))[:real_tokens].max(),
+            1e-4,
+        )
+
+    @parameterized.product(
+        (
             {"page_size": 256, "total_pages": 2085, "pages_per_seq": 256},
             {"page_size": 96, "total_pages": 1001, "pages_per_seq": 300},
         ),
