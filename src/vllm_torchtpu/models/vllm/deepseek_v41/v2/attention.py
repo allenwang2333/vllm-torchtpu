@@ -137,7 +137,7 @@ def _token_requests(metadata, positions):
     to a fusion taking one scalar operand per boundary, which cost 31-37 us
     per call at 288 tokens x 48 requests (C=48 DSpark K=5 xprof).
     """
-    rows = torch.arange(positions.shape[0], device=positions.device)
+    rows = torch.arange(positions.shape[0], dtype=torch.int32, device=positions.device)
     ends = metadata.query_start_loc[1:]
     return (rows.unsqueeze(1) >= ends.unsqueeze(0)).sum(-1)
 
@@ -157,24 +157,25 @@ def _window_starts():
 def _replayed(metadata, positions, starts, window):
     """Tokens a prefix hit replays: their prefix-cached KV must stay as is."""
     requests = _token_requests(metadata, positions).clamp(max=starts.shape[0] - 1)
-    start = starts[requests]
-    return (start > 0) & (positions >= start) & (positions < start + window)
+    start = starts[requests].int()
+    pos_i32 = positions.int()
+    return (start > 0) & (pos_i32 >= start) & (pos_i32 < start + window)
 
 
 def _cache_slots(cache, metadata, positions, *, compress_ratio=1, ring=False):
     """Derive this cache's addresses from the shared TPU metadata contract."""
     if metadata.seq_lens.numel() == 0:
-        return torch.full_like(positions, -1)
+        return torch.full_like(positions, -1, dtype=torch.int32)
     table = _block_table(metadata)
     requests = _token_requests(metadata, positions).clamp(max=table.shape[0] - 1)
     rows_per_page = cache.shape[1]
-    logical = positions // compress_ratio
+    logical = positions.int() // compress_ratio
     columns = torch.zeros_like(logical) if ring else logical // rows_per_page
-    blocks = table[requests, columns.clamp(max=table.shape[1] - 1).long()].long()
+    blocks = table[requests, columns.clamp(max=table.shape[1] - 1).long()].int()
     slots = blocks * rows_per_page + logical % rows_per_page
     # Padded request boundaries repeat the last real token offset. Keep the
     # mask on device, including dummy runs and batches with no active tokens.
-    rows = torch.arange(positions.shape[0], device=positions.device)
+    rows = torch.arange(positions.shape[0], dtype=torch.int32, device=positions.device)
     return slots.masked_fill(rows >= metadata.query_start_loc[-1], -1)
 
 

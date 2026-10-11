@@ -290,56 +290,9 @@ def test_write_global_kv_without_fast_offset_uses_row_indices(monkeypatch):
     assert torch.equal(got, ref)
 
 
-def _make_swa_attn(
-    *,
-    window_size: int,
-    ced_decoder: bool,
-    has_fast_swa_offset: bool,
-    rows_per_page: int = 64,
-) -> Any:
-    attn: Any = object.__new__(v2_attn.DeepseekV41Attention)
-    torch.nn.Module.__init__(attn)
-    attn.prefix = "swa_pfx"
-    attn.window_size = window_size
-    attn._ced_decoder = ced_decoder
-    attn._ced_global_from_encoder = False
-    attn._local_q_attn = False
-    attn.compressor = None
-    attn.indexer = None
-    attn.compress_ratio = 2
-    attn._config = {"index_topk": 4}
-    attn._max_model_len = 256
-    attn._fp8_kv = True
-    attn.n_local_heads = 2
-    attn.head_dim = 8
-    attn.scale = 0.25
-    attn.attn_sink = torch.zeros(2)
-    attn._swa_max_requests = 16
-    attn._precompact_records = False
-    attn._token_parallel_attn = False
-    attn._full_attn_sink = False
-    attn._tp_rank_1d = 0
-    attn.topk_indices_buffer = torch.full((16, 8), -1, dtype=torch.int32)
-    attn._rotate = lambda x, p: x
-    attn.wq_b = lambda qr: qr
-
-    cache_mock = MagicMock(spec=PagedCacheRows)
-    cache_mock.numel.return_value = 1024
-    cache_mock.shape = (64, rows_per_page, 512)
-    cache_mock.page_stride = 64
-    cache_mock.row_offset = 1000 if has_fast_swa_offset else None
-    cache_mock.row_indices = lambda slots, ro=(1000 if has_fast_swa_offset else 0): (
-        ro + (slots // rows_per_page * 64 + slots % rows_per_page)
-    )
-    cache_mock.pages.return_value = torch.tensor([[1, 2], [3, 4]])
-    attn.swa_cache_layer = SimpleNamespace(prefix="swa_pfx", kv_cache=cache_mock)
-    attn.kv_cache = cache_mock
-    attn._static_forward_context = {"swa_pfx": SimpleNamespace(kv_cache=cache_mock)}
-    attn.compressed_cache_prefix = "swa_pfx"
-    return attn
-
-
 def test_td8254_prepare_tpu_3page_swa_int64_positions_addressing(monkeypatch):
+    from test_dsv41_v2_stage_attn_cache import _make_swa_attn
+
     swa_table = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32)
     swa_meta = SimpleNamespace(
         seq_lens=torch.tensor([130, 130], dtype=torch.int32),
@@ -390,6 +343,8 @@ def test_td8254_prepare_tpu_3page_swa_int64_positions_addressing(monkeypatch):
 
 
 def test_td8257_compressed_lengths_and_logical_compressed_int32_addressing(monkeypatch):
+    from test_dsv41_v2_stage_attn_cache import _make_swa_attn
+
     swa_table = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32)
     swa_meta = SimpleNamespace(
         seq_lens=torch.tensor([130, 130], dtype=torch.int32),
@@ -469,3 +424,39 @@ def test_td8257_compressed_lengths_and_logical_compressed_int32_addressing(monke
     lengths_part, batch_max = captured_indexer_args[0]
     assert lengths_part.dtype == torch.int32
     assert batch_max.dtype == torch.int32
+
+
+def test_td8258_token_requests_replayed_and_cache_slots_int32_addressing():
+    table = torch.tensor([[3, 5], [7, 9]], dtype=torch.int32)
+    meta = _meta(table, qsl=(0, 4, 6))
+    pos_i64 = torch.arange(COUNT, dtype=torch.int64) + 2
+    pos_i32 = pos_i64.int()
+
+    reqs_64 = v2_attn._token_requests(meta, pos_i64)
+    reqs_32 = v2_attn._token_requests(meta, pos_i32)
+    assert reqs_64.dtype == torch.int64
+    assert torch.equal(reqs_64, reqs_32)
+
+    starts_64 = torch.tensor([2, 0], dtype=torch.int64)
+    starts_32 = starts_64.int()
+    rep_64 = v2_attn._replayed(meta, pos_i64, starts_64, window=3)
+    rep_32 = v2_attn._replayed(meta, pos_i32, starts_32, window=3)
+    assert rep_64.dtype == torch.bool
+    assert torch.equal(rep_64, rep_32)
+
+    cache = torch.empty((16, ROWS, 8))
+    empty_meta = SimpleNamespace(seq_lens=torch.empty(0, dtype=torch.int32))
+    empty_slots = v2_attn._cache_slots(cache, empty_meta, pos_i64)
+    assert empty_slots.dtype == torch.int32
+    assert torch.all(empty_slots == -1)
+
+    for ring in (False, True):
+        slots_64 = v2_attn._cache_slots(
+            cache, meta, pos_i64, compress_ratio=2, ring=ring
+        )
+        slots_32 = v2_attn._cache_slots(
+            cache, meta, pos_i32, compress_ratio=2, ring=ring
+        )
+        assert slots_64.dtype == torch.int32
+        assert slots_32.dtype == torch.int32
+        assert torch.equal(slots_64, slots_32)
