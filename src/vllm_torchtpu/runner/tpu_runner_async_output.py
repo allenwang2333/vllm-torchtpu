@@ -24,9 +24,12 @@ def parse_sampled_token_ids_cpu(
     if selected_token_ids.dim() == 1:
         rows = [[t] for t in selected_token_ids.tolist()]
         return rows, [1] * len(rows)
-    if selected_token_ids.shape[-1] == 1:
+    if (
+        selected_token_ids.shape[-1] == 1
+        or not (selected_token_ids.numpy() == INVALID_TOKEN_ID).any()
+    ):
         rows = selected_token_ids.tolist()
-        return rows, [1] * len(rows)
+        return rows, [int(selected_token_ids.shape[-1])] * len(rows)
     rows = [
         [t for t in row if t != INVALID_TOKEN_ID]
         if (row[-1] == INVALID_TOKEN_ID or INVALID_TOKEN_ID in row)

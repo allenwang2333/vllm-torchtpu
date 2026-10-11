@@ -72,10 +72,9 @@ class SpeculativeDecodingManager:
         # step at steady state. Only draft_token_ids carries per-step values.
         self._meta_cache_key: tuple | None = None
         self._meta_cache: SpecDecodeMetadata | None = None
-        # (logits_indices, target_logits_indices, padded_logits_length) from
-        # the cached build — needed to re-extract draft_token_ids on a hit.
-        # (draft_batch_indices, padded_logits_length) for cache-hit draft ids.
-        self._meta_cache_np: tuple[np.ndarray, int] | None = None
+        # (draft_batch_indices, padded_logits_length, padded_draft_token_ids)
+        # from the cached build for zero-alloc cache-hit draft token extraction.
+        self._meta_cache_np: tuple[np.ndarray, int, np.ndarray] | None = None
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if self._staged_draft_copy is not None:
@@ -247,24 +246,29 @@ class SpeculativeDecodingManager:
           A SpecDecodeMetadata object containing the necessary indices for
           speculative decoding.
         """
-        cache_key = (
-            num_draft_tokens.tobytes(),
-            cu_num_scheduled_tokens.tobytes(),
-            padded_num_reqs,
-        )
-        if cache_key == self._meta_cache_key:
+        key = self._meta_cache_key
+        if (
+            key is not None
+            and key[2] == padded_num_reqs
+            and np.array_equal(num_draft_tokens, key[0])
+            and np.array_equal(cu_num_scheduled_tokens, key[1])
+        ):
             assert self._meta_cache is not None
             assert self._meta_cache_np is not None
             if skip_host_draft_tokens:
                 draft_token_ids_dev = self._meta_cache.draft_token_ids
             else:
-                draft_batch_indices, padded_logits_length = self._meta_cache_np
+                draft_batch_indices, _, padded_draft_token_ids = self._meta_cache_np
                 # draft_token_ids depends on this step's input_ids_cpu content —
-                # always re-extracted and re-transferred.
+                # always re-extracted and re-transferred into preallocated buffer.
                 all_token_ids = self.runner.input_ids_cpu.numpy()
-                draft_token_ids = all_token_ids[draft_batch_indices]
-                padded_draft_token_ids = np.zeros(padded_logits_length, dtype=np.int32)
-                padded_draft_token_ids[: draft_token_ids.shape[0]] = draft_token_ids
+                n_drafts = draft_batch_indices.shape[0]
+                np.take(
+                    all_token_ids,
+                    draft_batch_indices,
+                    out=padded_draft_token_ids[:n_drafts],
+                )
+                padded_draft_token_ids[n_drafts:] = 0
                 draft_token_ids_dev = torch.from_numpy(padded_draft_token_ids).to(
                     self.runner.device, non_blocking=True
                 )
@@ -413,7 +417,11 @@ class SpeculativeDecodingManager:
         # _meta_cache so caller mutations (e.g. execute_model overwriting
         # metadata.draft_token_ids) cannot corrupt the cached metadata.
         cached_draft_lengths_cpu = num_draft_tokens.copy()
-        self._meta_cache_key = cache_key
+        self._meta_cache_key = (
+            cached_draft_lengths_cpu,
+            cu_num_scheduled_tokens.copy(),
+            padded_num_reqs,
+        )
         self._meta_cache = SpecDecodeMetadata(
             draft_token_ids=draft_token_ids_dev,
             draft_lengths=draft_lengths_dev,
@@ -424,7 +432,11 @@ class SpeculativeDecodingManager:
             segment_ids=segment_ids_dev,
             group_indices=group_indices_dev,
         )
-        self._meta_cache_np = (draft_batch_indices, padded_logits_length)
+        self._meta_cache_np = (
+            draft_batch_indices,
+            padded_logits_length,
+            np.zeros(padded_logits_length, dtype=np.int32),
+        )
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids_dev,
             draft_lengths=draft_lengths_dev,

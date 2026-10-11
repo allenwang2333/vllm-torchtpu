@@ -83,3 +83,65 @@ def test_spec_logprobs_lists_single_chunk_result_is_independent():
     before = chunk.tensors.logprobs.clone()
     out.logprobs[:] = 0  # must not write through into the source tensors
     assert torch.equal(chunk.tensors.logprobs, before)
+
+
+def test_td8345_meta_cache_array_equal_and_parse_all_valid_fast_path():
+    from vllm_torchtpu.runner.speculative_decoding_manager import (
+        SpeculativeDecodingManager,
+    )
+
+    runner = SimpleNamespace(
+        max_num_tokens=64,
+        input_ids_cpu=torch.arange(100, 164, dtype=torch.int32),
+        arange_np=np.arange(64, dtype=np.int32),
+        num_tokens_paddings=[8, 16, 32, 64],
+        device=torch.device("cpu"),
+    )
+    mgr = SpeculativeDecodingManager(runner)
+    num_draft = np.array([3, 3], dtype=np.int32)
+    cu_sched = np.array([4, 8], dtype=np.int32)
+
+    md1 = mgr.get_spec_decode_metadata(
+        num_draft, cu_sched, padded_num_reqs=4, skip_host_draft_tokens=False
+    )
+    assert mgr._meta_cache_key is not None
+    assert isinstance(mgr._meta_cache_key[0], np.ndarray)
+    assert isinstance(mgr._meta_cache_key[1], np.ndarray)
+    assert mgr._meta_cache_key[2] == 4
+    assert mgr._meta_cache_np is not None
+    assert len(mgr._meta_cache_np) == 3
+    buf_ptr = mgr._meta_cache_np[2].ctypes.data
+
+    # Mutating caller arrays in-place does not corrupt cached key arrays
+    num_draft[0] = 99
+    cu_sched[0] = 99
+    assert int(mgr._meta_cache_key[0][0]) == 3
+    assert int(mgr._meta_cache_key[1][0]) == 4
+
+    # Cache hit with skip_host_draft_tokens=False reuses preallocated buffer
+    # and zeroes padding tail even if dirty
+    mgr._meta_cache_np[2][:] = -777
+    runner.input_ids_cpu.fill_(55)
+    md2 = mgr.get_spec_decode_metadata(
+        np.array([3, 3], dtype=np.int32),
+        np.array([4, 8], dtype=np.int32),
+        padded_num_reqs=4,
+        skip_host_draft_tokens=False,
+    )
+    assert mgr._meta_cache_np[2].ctypes.data == buf_ptr
+    assert md2.draft_token_ids[:6].tolist() == [55] * 6
+    assert md2.draft_token_ids[6:].tolist() == [0, 0]
+    assert md2.target_logits_indices is md1.target_logits_indices
+
+    # parse_sampled_token_ids_cpu all-valid multi-col fast path (no -1 present)
+    all_valid = torch.arange(1, 25, dtype=torch.int32).reshape(4, 6)
+    rows_v, lens_v = ao.parse_sampled_token_ids_cpu(all_valid)
+    assert rows_v == all_valid.tolist()
+    assert lens_v == [6, 6, 6, 6]
+
+    # Mixed valid and invalid rows fall through to per-row filtering
+    mixed = all_valid.clone()
+    mixed[1, 4:] = ao.INVALID_TOKEN_ID
+    rows_m, lens_m = ao.parse_sampled_token_ids_cpu(mixed)
+    assert lens_m == [6, 4, 6, 6]
+    assert rows_m[1] == all_valid[1, :4].tolist()
