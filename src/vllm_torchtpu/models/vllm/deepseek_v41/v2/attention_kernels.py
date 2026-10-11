@@ -1169,7 +1169,8 @@ def _permute_owner_tokens_torch(
     x: torch.Tensor, owner_perm: torch.Tensor, fill_value: int | float = 0
 ) -> torch.Tensor:
     """Gather token rows ``x`` (``[T, ...]``) into owner-major ``[T_pad, ...]``."""
-    perm = owner_perm.long()
+    # Token ids are < 2**31: index_select takes the int32 permutation directly.
+    perm = owner_perm.int()
     valid = perm >= 0
     gathered = x.index_select(0, perm.clamp(min=0))
     mask = valid.reshape((perm.shape[0],) + (1,) * (x.ndim - 1))
@@ -1180,7 +1181,7 @@ def _unpermute_owner_tokens_torch(
     x_perm: torch.Tensor, owner_inv: torch.Tensor
 ) -> torch.Tensor:
     """Restore owner-major ``x_perm`` (``[T_pad, ...]``) to batch order ``[T, ...]``."""
-    inv = owner_inv.long()
+    inv = owner_inv.int()
     valid = inv >= 0
     gathered = x_perm.index_select(0, inv.clamp(min=0))
     mask = valid.reshape((inv.shape[0],) + (1,) * (x_perm.ndim - 1))
