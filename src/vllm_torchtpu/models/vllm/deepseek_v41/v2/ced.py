@@ -101,6 +101,9 @@ def _static_no_skip_spec(
     return tuple(min_lens), plan
 
 
+_LAST_NO_SKIP_CACHE: list = [None, None, None, None, None, None]
+
+
 def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
     """Keep the same prompt-tail window across every chunk and later decode.
 
@@ -136,32 +139,50 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
     if not isinstance(compile_sizes, tuple):
         compile_sizes = tuple(compile_sizes)
     owner_layout = getattr(metadata, "owner_token_layout", None)
-    req_owners = getattr(owner_layout, "owners", None)
-    owner_tokens, owner_required_kept = (
+    req_owners, owner_tokens = (
+        getattr(owner_layout, "owners", None),
         getattr(owner_layout, "owner_tokens", None),
-        0,
     )
     if req_owners is None or owner_tokens is not None:
-        if (
-            owner_layout is not None
-            and req_owners is not None
-            and owner_tokens is not None
-            and bounds_list[-1] > 0
-        ):
-            owner_required_kept = int(owner_layout.query_start_loc.shape[0]) * int(
-                owner_tokens.max()
-            )
         # Steady-state decode repeats the same query/prompt/hit layout while
         # only seq_lens grow: reuse the cached all-kept plan when it applies.
-        spec = _static_no_skip_spec(
-            tuple(bounds_list),
-            tuple(prompts_list),
-            tuple(hits_list),
-            window,
-            num_tokens,
-            compile_sizes,
-            owner_required_kept,
-        )
+        if (
+            bounds_list is (last := _LAST_NO_SKIP_CACHE)[0]
+            and prompts_list is last[1]
+            and hits_list is last[2]
+            and owner_layout is last[3]
+            and (window, num_tokens, compile_sizes) == last[4]
+        ):
+            spec = last[5]
+        else:
+            last[:] = (
+                bounds_list,
+                prompts_list,
+                hits_list,
+                owner_layout,
+                (window, num_tokens, compile_sizes),
+                (
+                    spec := _static_no_skip_spec(
+                        bounds_list
+                        if isinstance(bounds_list, tuple)
+                        else tuple(bounds_list),
+                        prompts_list
+                        if isinstance(prompts_list, tuple)
+                        else tuple(prompts_list),
+                        hits_list if isinstance(hits_list, tuple) else tuple(hits_list),
+                        window,
+                        num_tokens,
+                        compile_sizes,
+                        int(owner_layout.query_start_loc.shape[0])
+                        * int(owner_tokens.max())
+                        if owner_layout is not None
+                        and req_owners is not None
+                        and owner_tokens is not None
+                        and bounds_list[-1] > 0
+                        else 0,
+                    )
+                ),
+            )
         if spec is not None and all(map(operator.ge, lengths_list, spec[0])):
             return spec[1]
     replay_starts = []
@@ -181,7 +202,9 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
     if not any_skipped:
         kept = bounds_list[-1]
         indices_tuple = _identity_indices(kept)
-        output_bounds_tuple = tuple(bounds_list)
+        output_bounds_tuple = (
+            bounds_list if isinstance(bounds_list, tuple) else tuple(bounds_list)
+        )
     else:
         indices = []
         output_bounds = [0]
