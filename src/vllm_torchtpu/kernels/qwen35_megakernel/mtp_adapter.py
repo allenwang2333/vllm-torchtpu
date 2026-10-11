@@ -65,7 +65,7 @@ logger = init_logger(__name__)
 # Rows per draft step: one per request in the loop, K + 1 = 4 per request at
 # step 0. Larger steps keep the XLA draft layer.
 _DEFAULT_LOOP_BUCKETS = (4, 8, 16)
-_DEFAULT_VERIFY_BUCKETS = (4, 8, 16, 32)
+_DEFAULT_VERIFY_BUCKETS = (4, 8, 16, 24, 32, 48, 64)
 _NUM_SPEC_TOKENS = 3
 # `K.W_NAMES` leaves of a one-layer stack: lin_in .. sh2, e13, e2, es, smalls,
 # final_norm. The experts are the layer's own parameters.
