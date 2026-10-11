@@ -102,7 +102,10 @@ def merge_lse_partials_scatter_heads(
     TPU_DCP_MERGE_CHUNKED splits a large backbone bucket into token chunks
     (`_merge_chunked`), TPU_DCP_MERGE_HEAD_MAJOR weights the transposed
     partial, and TPU_DCP_LSE_MERGE_RS_BF16 (experimental) reduce-scatters in
-    bf16. With none set the merge is exactly `cp_lse_ag_out_rs`.
+    bf16. TPU_DCP_RS_OUT_PRECISION (default on) reduce-scatters the backbone's
+    weighted terms in the output's precision on every reduce-scatter path,
+    chunked included. With none of the opt-in variants set the merge is exactly
+    `cp_lse_ag_out_rs`.
 
     Args:
       output: `[num_tokens, tp_local_num_heads * dcp_size, kv_lora_rank]`,
@@ -140,12 +143,18 @@ def merge_lse_partials_scatter_heads(
     ):
         return merge_lse_partials_all_to_all(output, lse, group)
 
+    # TPU_DCP_RS_OUT_PRECISION (backbone only): reduce-scatter the weighted
+    # terms in the output's precision. TPU_DCP_LSE_MERGE_RS_BF16 forces it.
+    rs_low = envs.TPU_DCP_LSE_MERGE_RS_BF16 or (
+        is_backbone and envs.TPU_DCP_RS_OUT_PRECISION
+    )
     chunks = _merge_chunks(output.shape[0]) if is_backbone else 1
     if chunks > 1:
-        return _merge_chunked(output, lse, group, chunks)
+        return _merge_chunked(output, lse, group, chunks, rs_low)
     if envs.TPU_DCP_MERGE_HEAD_MAJOR or envs.TPU_DCP_LSE_MERGE_RS_BF16:
-        return _reduce_weighted(output, _lse_weights(lse, group), group)
-    return cp_lse_ag_out_rs(output, lse, group)
+        return _reduce_weighted(output, _lse_weights(lse, group), group, rs_low)
+    rs_dtype = output.dtype if rs_low else None
+    return cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype)
 
 
 def _merge_chunks(num_tokens: int) -> int:
@@ -164,7 +173,7 @@ def _merge_chunks(num_tokens: int) -> int:
 
 
 def _merge_chunked(
-    output: torch.Tensor, lse: torch.Tensor, group: Any, chunks: int
+    output: torch.Tensor, lse: torch.Tensor, group: Any, chunks: int, rs_low: bool
 ) -> torch.Tensor:
     """The reduce-scatter merge over `chunks` independent token chunks.
 
@@ -183,7 +192,7 @@ def _merge_chunked(
     for c in range(chunks):
         rows = slice(c * step, (c + 1) * step)
         weights = mine[rows] if mine is not None else _lse_weights(lse[rows], group)
-        pieces.append(_reduce_weighted(output[rows], weights, group))
+        pieces.append(_reduce_weighted(output[rows], weights, group, rs_low))
     return torch.cat(pieces, dim=0)
 
 
@@ -198,7 +207,7 @@ def _lse_weights(lse: torch.Tensor, group: Any) -> torch.Tensor:
 
 
 def _reduce_weighted(
-    output: torch.Tensor, mine: torch.Tensor, group: Any
+    output: torch.Tensor, mine: torch.Tensor, group: Any, rs_low: bool
 ) -> torch.Tensor:
     """Weight this rank's partial by its `[T, H]` f32 merge weights and
     reduce-scatter the heads: `[T, H, V]` -> this rank's `[T, H / D, V]`.
@@ -215,7 +224,7 @@ def _reduce_weighted(
         weighted = output.transpose(0, 1).to(torch.float32) * weight
         weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
         weighted = weighted.contiguous()
-        if envs.TPU_DCP_LSE_MERGE_RS_BF16:
+        if rs_low:
             weighted = weighted.to(output.dtype)
         return (
             group.reduce_scatter(weighted, dim=0)
@@ -227,7 +236,7 @@ def _reduce_weighted(
     weighted = output.to(torch.float32) * weight
     weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
     weighted = weighted.contiguous()
-    if envs.TPU_DCP_LSE_MERGE_RS_BF16:
+    if rs_low:
         weighted = weighted.to(output.dtype)
     return group.reduce_scatter(weighted, dim=1).to(output.dtype)
 

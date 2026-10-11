@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 1
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
+    TPU_DCP_RS_OUT_PRECISION: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = False
     TPU_DCP_LSE_MERGE_RS_BF16: bool = False
     TPU_DCP_MERGE_CHUNKED: int = 0
@@ -453,6 +454,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # drafter, traced once for every bucket, cannot pick by token count, so
     # with the flag on it takes the all-to-all at every size.
     "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64),
+    # Backbone MLA merge: reduce-scatter the weighted outputs in the output's
+    # precision (bf16), half f32's bytes. MTP drafter stays f32; 0 = f32.
+    "TPU_DCP_RS_OUT_PRECISION": env_bool("TPU_DCP_RS_OUT_PRECISION", default=True),
     # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
     # q_nope and q_pe to the kernel as separate operands. The kernel joins
     # them in VMEM and its output aliases q_nope (512 wide), instead of the

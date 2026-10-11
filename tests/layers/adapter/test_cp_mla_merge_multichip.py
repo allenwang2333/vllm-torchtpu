@@ -221,6 +221,7 @@ def _set_arm(cp_mla, arm):
         setattr(cp_mla.envs, name, value)
     cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS = 1 << 30
     cp_mla.envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS = 0
+    cp_mla.envs.TPU_DCP_RS_OUT_PRECISION = False  # "today" stays the f32 reference
 
 
 def _lse_weights_all_reduce(lse, group):
