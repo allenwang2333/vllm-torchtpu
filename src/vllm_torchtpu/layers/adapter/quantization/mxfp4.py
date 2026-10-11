@@ -699,22 +699,14 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             _m = torch.load(_meta_path, map_location="cpu", weights_only=True)
             _s13 = torch.load(_m["w13_cpath"], map_location="cpu", weights_only=True)
             _s2 = torch.load(_m["w2_cpath"], map_location="cpu", weights_only=True)
-            _w13_meta = torch.empty(
-                (_s13["qw_u8"].shape[0], _s13["qw_u8"].shape[1], _s13["qw_u8"].shape[2] * 2),
-                dtype=torch.bfloat16,
-                device="meta",
-            )
-            _w2_meta = torch.empty(
-                (_s2["qw_u8"].shape[0], _s2["qw_u8"].shape[1], _s2["qw_u8"].shape[2] * 2),
-                dtype=torch.bfloat16,
-                device="meta",
-            )
+            _e, _h, _n13_half = _s13["qw_u8"].shape
+            _inter = _s2["qw_u8"].shape[1]
             op = self._prebuild_w4a8(
                 layer,
                 activation_str,
-                _w13_meta,
-                _w2_meta,
-                _s2["qw_u8"].shape[1],
+                torch.empty((_e, _h, _n13_half * 2), device="meta"),
+                torch.empty((_e, _inter, _h), device="meta"),
+                _inter,
             )
             self._release_source_weights(layer)
             w13_weight_processed = _s13["qw_u8"].view(torch.float4_e2m1fn_x2).to(device)

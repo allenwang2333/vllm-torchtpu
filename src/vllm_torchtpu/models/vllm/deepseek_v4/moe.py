@@ -1,4 +1,3 @@
-from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,6 +36,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     moe_fp8_dispatch_enabled,
     quantize_moe_dispatch,
 )
+from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 from vllm_torchtpu.layers.adapter.router_topk import (
     fused_gate_grouped_rowmax_select,
 )
@@ -290,11 +290,6 @@ class DeepseekV4MoE(nn.Module):
                             hidden_states_fp8=hidden_states_fp8,
                             hidden_states_scale=hidden_states_scale,
                         )
-                    elif self.tp_size > 1:
-                        x_full = tp_all_gather(x_shard, dim=0)
-                        shared_out = tp_reduce_scatter(
-                            self.shared_experts(x_full), dim=0
-                        )
                     else:
                         shared_out = self.shared_experts(x_shard)
                     routed_out = routed_out + shared_out.view_as(routed_out)
@@ -349,52 +344,7 @@ class DeepseekV4MoE(nn.Module):
                 )
                 if self.shared_experts is not None:
                     if self.shared_experts.has_tp_local_weights():
-                        fp8_shard = (
-                            (
-                                torch.cat(
-                                    [
-                                        hidden_states_fp8.view(torch.uint8),
-                                        hidden_states_fp8.view(torch.uint8).new_zeros(
-                                            (t_pad - t_orig, hidden_states_fp8.shape[1])
-                                        ),
-                                    ],
-                                    dim=0,
-                                ).view(hidden_states_fp8.dtype)
-                                if t_pad > t_orig
-                                else hidden_states_fp8
-                            )[s_idx:e_idx]
-                            if hidden_states_fp8 is not None
-                            else None
-                        )
-                        sc_shard = (
-                            (
-                                torch.cat(
-                                    [
-                                        hidden_states_scale,
-                                        hidden_states_scale.new_ones(
-                                            (
-                                                t_pad - t_orig,
-                                                *hidden_states_scale.shape[1:],
-                                            )
-                                        ),
-                                    ],
-                                    dim=0,
-                                )
-                                if t_pad > t_orig
-                                else hidden_states_scale
-                            )[s_idx:e_idx]
-                            if hidden_states_scale is not None
-                            else None
-                        )
-                        shared_out = self.shared_experts.forward_tp_local(
-                            x_shard,
-                            hidden_states_fp8=fp8_shard,
-                            hidden_states_scale=sc_shard,
-                        )
-                    elif self.tp_size > 1:
-                        shared_out = tp_reduce_scatter(
-                            self.shared_experts(x_pad), dim=0
-                        )
+                        shared_out = self.shared_experts.forward_tp_local(x_shard)
                     else:
                         shared_out = self.shared_experts(x_shard)
                     routed_out = routed_out + shared_out.view_as(routed_out)
