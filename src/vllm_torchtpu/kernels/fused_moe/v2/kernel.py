@@ -17,6 +17,7 @@ result row to the shard that owns its token, so the layer needs no dense
 combine reduce-scatter."""
 
 import functools
+import os
 import threading
 
 import jax
@@ -376,7 +377,13 @@ def expert_ffn_blockscale(
     # The block scales are already inside acc1, so the halves this builds
     # are the true activation values and owe no further weight scale.
     mid_q, mid_scale = _intermediate_rows(
-        acc1, act_scale, inter, w1s=None, act_fn=act_fn, w1b=w1b
+        acc1,
+        act_scale,
+        inter,
+        w1s=None,
+        act_fn=act_fn,
+        w1b=w1b,
+        requantize=(os.environ.get("VLLM_DSV41_MOE_V2_REQUANTIZE", "1") != "0"),
     )
     acc2 = None
     for b in range(n_blocks2):
