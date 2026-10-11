@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 16
     TPU_DCP_MLA_MASK_IN_KERNEL: bool = False
     TPU_DCP_MLA_FUSED_PREP: bool = False
+    TPU_DCP_MLA_MIXED_LIVE: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -474,6 +475,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (`prepare_capped_window_fused`), handing the indices to the gather
     # flat (a bitcast, no relayout copies). Same gathered rows.
     "TPU_DCP_MLA_FUSED_PREP": env_bool("TPU_DCP_MLA_FUSED_PREP", default=False),
+    # DCP sparse MLA, mixed / prefill buckets (> 32 tokens, capped path):
+    # gather and attend only each 16-token grid step's live 64-row atoms of
+    # the first top-k window (cdiv(max kv_len, 64) of 8 at cap 512) instead
+    # of all 512 slots per token. Same outputs; decode buckets unaffected.
+    "TPU_DCP_MLA_MIXED_LIVE": env_bool("TPU_DCP_MLA_MIXED_LIVE", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per

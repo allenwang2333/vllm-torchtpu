@@ -1223,6 +1223,7 @@ def sparse_mla_attention_dcp(
             small_chunk_tokens=small_chunk_tokens,
             lse_mask_empty=mask_in_kernel,
             fused_window_prep=fused_prep,
+            mixed_live_gather=envs.TPU_DCP_MLA_MIXED_LIVE,
             **chunk_kwargs,
             **split_kwargs,
         )
