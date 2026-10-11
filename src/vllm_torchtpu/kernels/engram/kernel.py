@@ -136,7 +136,7 @@ def fused_engram(
                 projection,
                 q_ref[...],
                 k_ref[...],
-                mask_ref[...],
+                mask_ref[:, 0],
                 eps,
                 clamp_value,
             )
@@ -158,7 +158,7 @@ def fused_engram(
             pl.BlockSpec(weight_scale.shape, lambda i, k: (0,)),
             pl.BlockSpec(query_weight.shape, lambda i, k: (0, 0)),
             pl.BlockSpec(key_weight.shape, lambda i, k: (0, 0)),
-            pl.BlockSpec((tile_m,), lambda i, k: (i,)),
+            pl.BlockSpec((tile_m, 1), lambda i, k: (i, 0)),
         ],
         out_specs=pl.BlockSpec((tile_m, streams, dim), local_block),
         out_shape=jax.ShapeDtypeStruct(hidden.shape, hidden.dtype),
@@ -172,4 +172,13 @@ def fused_engram(
         ),
         interpret=interpret,
         name="engram_offload_fused",
-    )(raw, scales, hidden, weight, weight_scale, query_weight, key_weight, token_mask)
+    )(
+        raw,
+        scales,
+        hidden,
+        weight,
+        weight_scale,
+        query_weight,
+        key_weight,
+        token_mask.reshape(tokens, 1),
+    )

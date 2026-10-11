@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Packed rows must preserve SP head order, FP8 numerics and masked residuals."""
+
+import jax.numpy as jnp
+import numpy as np
+import pytest
+import torch
+
+from vllm_torchtpu.kernels.engram.kernel import fused_engram
+
+pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize("tp", [1, 2, 8])
+@pytest.mark.parametrize("masked", [False, True])
+def test_fused_engram_matches_torch_offload(tp, masked):
+    tokens, local_width, streams, dim = 32, 128, 4, 128
+    width = tp * local_width
+    rng = torch.Generator().manual_seed(53)
+    raw = (
+        torch.randn(tp, tokens * tp, local_width, generator=rng)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+    )
+    scale = torch.randint(
+        124,
+        129,
+        (tp, tokens * tp, local_width // 32),
+        generator=rng,
+        dtype=torch.uint8,
+    )
+    scale[:, ::7] = 255
+    raw[:, ::7] = 127
+    hidden = torch.randn(tokens, streams, dim, generator=rng).bfloat16()
+    weight = torch.randn(width, (streams + 1) * dim, generator=rng).to(
+        torch.float8_e4m3fn
+    )
+    weight_scale = torch.rand((streams + 1) * dim, generator=rng) * 0.03
+    q = torch.randn(streams, dim, generator=rng).bfloat16()
+    k = torch.randn(streams, dim, generator=rng).bfloat16()
+    mask = torch.arange(tokens) % 3 != 0 if masked else torch.ones(tokens).bool()
+    rank = tp - 1
+    start = rank * tokens
+    local_raw = raw[:, start : start + tokens]
+    local_scale = scale[:, start : start + tokens]
+    power = (local_scale.int() << 23).view(torch.float32).repeat_interleave(32, -1)
+    invalid = (local_scale == 255).repeat_interleave(32, -1)
+    embedded = (
+        torch.where(invalid, 0.0, local_raw.view(torch.float8_e4m3fn).float() * power)
+        .bfloat16()
+        .transpose(0, 1)
+        .reshape(tokens, width)
+    )
+    xscale = embedded.float().abs().amax(-1, keepdim=True) / 448
+    xscale = torch.where(xscale == 0, 1.0, xscale)
+    xq = (embedded.float() / xscale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    projection = ((xq.float() @ weight.float()) * xscale * weight_scale).bfloat16()
+    keys = projection[:, : streams * dim].reshape(tokens, streams, dim).float()
+    values = projection[:, streams * dim :].float()
+    h = hidden.float()
+    dot = (h * q * k * keys).sum(-1)
+    dot *= torch.rsqrt(h.square().mean(-1) + 1e-20)
+    dot *= torch.rsqrt(keys.square().mean(-1) + 1e-20) * dim**-0.5
+    magnitude = dot.abs().clamp(min=1e-6).sqrt()
+    gate = torch.where(dot < 0, -magnitude, magnitude).sigmoid() * mask[:, None]
+    expected = (h + gate[..., None] * values[:, None]).bfloat16().float().numpy()
+
+    actual = fused_engram(
+        jnp.asarray(raw.view(torch.int32).numpy()),
+        jnp.asarray(scale.view(torch.int32).numpy()),
+        jnp.asarray(h.numpy(), jnp.bfloat16),
+        jnp.asarray(weight.float().numpy(), jnp.float8_e4m3fn),
+        jnp.asarray(weight_scale.numpy()),
+        jnp.asarray(q.float().numpy(), jnp.bfloat16),
+        jnp.asarray(k.float().numpy(), jnp.bfloat16),
+        jnp.asarray(mask.numpy()),
+        rank,
+        1e-20,
+        1e-6,
+        interpret=True,
+    )
+    actual = np.asarray(actual.astype(jnp.float32))
+    np.testing.assert_allclose(actual, expected, atol=0.02, rtol=0.01)
+    np.testing.assert_array_equal(actual[~mask.numpy()], h.numpy()[~mask.numpy()])
