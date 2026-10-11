@@ -326,16 +326,40 @@ def test_vllm_model_wrapper_context_all_branches():
         wrapper_ctx.get_vllm_model_wrapper_context()
 
     fake_mesh = MagicMock()
+    kv_caches = []
+    idx_map = {"l0": 0}
     with wrapper_ctx.set_vllm_model_wrapper_context(
         mesh=fake_mesh,
-        kv_caches=[],
-        layer_name_to_kvcache_index={"l0": 0},
+        kv_caches=kv_caches,
+        layer_name_to_kvcache_index=idx_map,
         vllm_config="cfg",
         kv_cache_bundle=None,
     ):
         ctx = wrapper_ctx.get_vllm_model_wrapper_context()
         assert ctx.mesh is fake_mesh
         assert ctx.vllm_config == "cfg"
+        # Nested re-entrant call with identical arguments allocates an isolated
+        # context without clobbering the outer context's _prev link.
+        with wrapper_ctx.set_vllm_model_wrapper_context(
+            mesh=fake_mesh,
+            kv_caches=kv_caches,
+            layer_name_to_kvcache_index=idx_map,
+            vllm_config="cfg",
+            kv_cache_bundle=None,
+        ):
+            inner_ctx = wrapper_ctx.get_vllm_model_wrapper_context()
+            assert inner_ctx is not ctx
+        assert wrapper_ctx.get_vllm_model_wrapper_context() is ctx
+
+    # Subsequent non-nested call with the same arguments reuses cached ctx.
+    with wrapper_ctx.set_vllm_model_wrapper_context(
+        mesh=fake_mesh,
+        kv_caches=kv_caches,
+        layer_name_to_kvcache_index=idx_map,
+        vllm_config="cfg",
+        kv_cache_bundle=None,
+    ):
+        assert wrapper_ctx.get_vllm_model_wrapper_context() is ctx
 
     with pytest.raises(AssertionError, match="VllmModelWrapperContext is not set"):
         wrapper_ctx.get_vllm_model_wrapper_context()

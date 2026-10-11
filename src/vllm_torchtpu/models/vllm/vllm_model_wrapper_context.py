@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -31,9 +30,21 @@ class VllmModelWrapperContext:
     # attention forward execution routes through the bundled RPA custom op with
     # in-place buffer donation, bypassing the per-layer tensor views bound by vLLM.
     kv_cache_bundle: torch.Tensor | None = None
+    _prev: object = None
+
+    def __enter__(self) -> "VllmModelWrapperContext":
+        global _vllm_model_wrapper_context
+        self._prev, _vllm_model_wrapper_context = _vllm_model_wrapper_context, self
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        global _vllm_model_wrapper_context
+        _vllm_model_wrapper_context, self._prev = self._prev, None  # type: ignore[assignment]
 
 
-_vllm_model_wrapper_context: VllmModelWrapperContext | None = None
+_vllm_model_wrapper_context: VllmModelWrapperContext | None = (
+    None if (_context_cache := {}) is not None else None
+)
 
 
 def get_vllm_model_wrapper_context() -> VllmModelWrapperContext:
@@ -45,7 +56,6 @@ def get_vllm_model_wrapper_context() -> VllmModelWrapperContext:
     return _vllm_model_wrapper_context
 
 
-@contextmanager
 def set_vllm_model_wrapper_context(
     *,
     kv_caches: list[torch.Tensor] | None = None,
@@ -53,18 +63,52 @@ def set_vllm_model_wrapper_context(
     layer_name_to_kvcache_index: dict[str, int] | None = None,
     vllm_config: object | None = None,
     kv_cache_bundle: torch.Tensor | None = None,
-):
-    global _vllm_model_wrapper_context
-    prev_context = _vllm_model_wrapper_context
-    _vllm_model_wrapper_context = VllmModelWrapperContext(
-        kv_caches=kv_caches,
-        mesh=mesh,
-        layer_name_to_kvcache_index=layer_name_to_kvcache_index,
-        vllm_config=vllm_config,
-        kv_cache_bundle=kv_cache_bundle,
+) -> VllmModelWrapperContext:
+    return (
+        cached
+        if (
+            (
+                cached := _context_cache.get(
+                    key := (
+                        id(mesh),
+                        id(kv_caches),
+                        id(layer_name_to_kvcache_index),
+                        id(vllm_config),
+                        id(kv_cache_bundle),
+                    )
+                )
+            )
+            is not None
+            and cached is not _vllm_model_wrapper_context
+            and cached._prev is None
+            and cached.mesh is mesh
+            and cached.kv_caches is kv_caches
+            and cached.layer_name_to_kvcache_index is layer_name_to_kvcache_index
+            and cached.vllm_config is vllm_config
+            and cached.kv_cache_bundle is kv_cache_bundle
+        )
+        else (
+            VllmModelWrapperContext(
+                kv_caches=kv_caches,
+                mesh=mesh,
+                layer_name_to_kvcache_index=layer_name_to_kvcache_index,
+                vllm_config=vllm_config,
+                kv_cache_bundle=kv_cache_bundle,
+            )
+            if cached is not None
+            and (cached is _vllm_model_wrapper_context or cached._prev is not None)
+            else _context_cache.setdefault(
+                key,
+                (
+                    _context_cache.pop(key, None),
+                    VllmModelWrapperContext(
+                        kv_caches=kv_caches,
+                        mesh=mesh,
+                        layer_name_to_kvcache_index=layer_name_to_kvcache_index,
+                        vllm_config=vllm_config,
+                        kv_cache_bundle=kv_cache_bundle,
+                    ),
+                )[1],
+            )
+        )
     )
-
-    try:
-        yield
-    finally:
-        _vllm_model_wrapper_context = prev_context
