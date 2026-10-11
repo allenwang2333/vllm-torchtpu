@@ -3,13 +3,9 @@
 
 import jax
 import torch
-from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.engram.kernel import fused_engram
-from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-    get_vllm_model_wrapper_context,
-)
 
 _op = None
 
@@ -47,12 +43,8 @@ def initialize_fused_engram() -> None:
     global _op
     if _op is not None:
         return
-    _op = pallas.jax_op(
-        "pallas::engram_offload_fused",
-        _engram_jax,
-        mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 12,
-    )
+    # The Torch caller completes TP communication before this local kernel.
+    _op = pallas.jax_op("pallas::engram_offload_fused", _engram_jax)
 
     def fake(
         raw, scales, hidden, weight, weight_scale, q, k, mask, tp, rank, eps, clamp
