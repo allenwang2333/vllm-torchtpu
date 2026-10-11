@@ -1146,3 +1146,51 @@ class TestAttentionMetadataBuilderPlumbing:
         assert torch.equal(plan_i32[1], plan_i64[1])
         assert plan_i32[2] is not None and plan_i64[2] is not None
         assert torch.equal(plan_i32[2], plan_i64[2])
+
+    def test_td8332_active_block_table_columns_vectorized_numpy_max(self, monkeypatch):
+        """TD8.332: Verify _active_block_table_columns uses vectorized active.max()
+        when seq_lens_cpu is an np.ndarray instead of Python's built-in max(active)."""
+        import builtins
+
+        import numpy as np
+
+        runner = self._make_runner_mock(
+            max_num_reqs=4,
+            max_num_blocks_per_req=128,
+            most_model_len=2048,
+            num_groups=1,
+        )
+        builder = self._make_builder(runner, kv_cache_group_id=0)
+
+        orig_max = builtins.max
+
+        def _forbid_ndarray_builtin_max(*args, **kwargs):
+            if len(args) == 1 and isinstance(args[0], np.ndarray):
+                raise AssertionError("builtins.max called on np.ndarray")
+            return orig_max(*args, **kwargs)
+
+        monkeypatch.setattr(builtins, "max", _forbid_ndarray_builtin_max)
+
+        ctx_np = AttentionMetadataBuilderContext(
+            num_reqs=3,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=None,
+            seq_lens_cpu=np.asarray([64, 512, 128, 1024], dtype=np.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([3, 3, 3], dtype=torch.int32),
+        )
+        assert builder._active_block_table_columns(ctx_np, 128) == 32
+        assert ctx_np.max_active_seq_len == 512
+
+        ctx_list = AttentionMetadataBuilderContext(
+            num_reqs=3,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=None,
+            seq_lens_cpu=[64, 512, 128, 1024],
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([3, 3, 3], dtype=torch.int32),
+        )
+        assert builder._active_block_table_columns(ctx_list, 128) == 32
+        assert ctx_list.max_active_seq_len == 512

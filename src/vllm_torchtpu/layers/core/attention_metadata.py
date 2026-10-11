@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import jax
+import numpy as np
 import torch
 from vllm.distributed import get_pcp_group
 from vllm.utils.math_utils import cdiv
@@ -413,7 +414,11 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             max_seq_len = (
                 int(active.max().item())
                 if isinstance(active, torch.Tensor)
-                else int(max(active))
+                else (
+                    int(active.max())
+                    if isinstance(active, np.ndarray)
+                    else int(max(active))
+                )
             )
             ctx.max_active_seq_len = max_seq_len
         if max_seq_len <= 0:
@@ -429,8 +434,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         return res
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
-        runner = self.runner
-        ctx = runner._attn_metadata_builder_ctx
+        runner, ctx = self.runner, self.runner._attn_metadata_builder_ctx
 
         # `position_ids` is only used for the dummy run in dummy runs, where we
         # want to use fixed position IDs instead of copying from the CPU tensor
