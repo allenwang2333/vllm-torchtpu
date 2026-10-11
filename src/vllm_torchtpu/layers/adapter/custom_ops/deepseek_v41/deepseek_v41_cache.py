@@ -502,8 +502,12 @@ def block_table(metadata):
 
 def token_requests(metadata, positions, *, rows=None):
     if rows is None:
-        rows = torch.arange(positions.shape[0], device=positions.device)
-    return torch.bucketize(rows, metadata.query_start_loc[1:], right=True)
+        rows = torch.arange(
+            positions.shape[0], dtype=torch.int32, device=positions.device
+        )
+    return torch.bucketize(
+        rows, metadata.query_start_loc[1:], right=True, out_int32=True
+    )
 
 
 def cache_slots(
@@ -517,16 +521,19 @@ def cache_slots(
 ):
     """Derive this cache's addresses from the shared TPU metadata contract."""
     if metadata.seq_lens.numel() == 0:
-        return torch.full_like(positions, -1)
+        return torch.full_like(positions, -1, dtype=torch.int32)
     table = block_table(metadata)
-    rows = torch.arange(positions.shape[0], device=positions.device)
+    rows = torch.arange(positions.shape[0], dtype=torch.int32, device=positions.device)
     if requests is None:
         requests = token_requests(metadata, positions, rows=rows)
-    requests = requests.clamp(max=table.shape[0] - 1)
+    requests = requests.int().clamp(max=table.shape[0] - 1)
     logical = positions if compress_ratio == 1 else positions // compress_ratio
     columns = torch.zeros_like(logical) if ring else logical // rows_per_page
-    blocks = table[requests, columns.clamp(max=table.shape[1] - 1).long()].long()
-    slots = blocks * rows_per_page + logical % rows_per_page
+    # Requests, pages and slots are < 2**31: gather the flattened table with
+    # a native int32 1D index_select instead of 2D int64 advanced indexing.
+    block_idx = requests * table.shape[1] + columns.clamp(max=table.shape[1] - 1).int()
+    blocks = table.reshape(-1).index_select(0, block_idx).int()
+    slots = blocks * rows_per_page + (logical % rows_per_page).int()
     # Padded request boundaries repeat the last real token offset. Keep the
     # mask on device, including dummy runs and batches with no active tokens.
     return slots.masked_fill(rows >= metadata.query_start_loc[-1], -1)
@@ -535,5 +542,10 @@ def cache_slots(
 def row_slots(block_table, requests, logical, *, rows_per_page):
     """Gather fixed-width token rows without inspecting device values on host."""
     safe = logical.clamp(min=0, max=block_table.shape[1] * rows_per_page - 1)
-    blocks = block_table[requests[:, None], safe // rows_per_page].long()
-    return blocks * rows_per_page + safe % rows_per_page
+    flat_idx = (
+        requests.int()[:, None] * block_table.shape[1] + (safe // rows_per_page).int()
+    )
+    blocks = (
+        block_table.reshape(-1).index_select(0, flat_idx.reshape(-1)).view_as(safe)
+    ).int()
+    return blocks * rows_per_page + (safe % rows_per_page).int()

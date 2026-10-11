@@ -58,17 +58,19 @@ def save_compress_norm(
             state_layout.page_size if state_layout is not None else state_cache.shape[1]
         )
         cache = state_cache
-        rows = torch.arange(count, device=kv_score.device)
-        requests = token_to_req_indices.long().clamp(max=query_start_loc.numel() - 2)
-        starts = query_start_loc[requests]
-        ends = query_start_loc[requests + 1]
+        # Rows, requests and ring slots are < 2**31: native int32 + 1D gathers.
+        rows = torch.arange(count, dtype=torch.int32, device=kv_score.device)
+        requests = token_to_req_indices.int().clamp(max=query_start_loc.numel() - 2)
+        qsl_i32 = query_start_loc.int()
+        starts = qsl_i32.index_select(0, requests)
+        ends = qsl_i32.index_select(0, requests + 1)
         previous_slots = (
-            slot_mapping.clamp(min=0) // capacity * capacity
-            + (positions - 1) % capacity
+            slot_mapping.int().clamp(min=0) // capacity * capacity
+            + (positions.int() - 1) % capacity
         )
         previous = torch.where(
             (rows > starts)[:, None],
-            kv_score_f32[(rows - 1).clamp(min=0)],
+            kv_score_f32.index_select(0, (rows - 1).clamp(min=0)),
             read_cache(cache, previous_slots, layout=state_layout),
         )
         scores = torch.stack((previous[:, dim:], kv_score_f32[:, dim:]), 1)
