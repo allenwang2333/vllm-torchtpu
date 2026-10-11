@@ -1288,3 +1288,237 @@ def test_td8328_sample_tokens_cached_identity_map_and_single_chunk_device_seed(
         runner_seed_2.spec_decode_manager.propose_draft_token_ids.call_args.kwargs
     )
     assert propose_kw_2["device_seed"].tolist() == [10, 10]
+
+
+def test_td8333_heterogeneous_prepare_inputs_and_mm_cumsum_gating(
+    monkeypatch,
+) -> None:
+    """Verify TD8.333 zero-np.concatenate heterogeneous _prepare_inputs arange
+    computation and execute_model mm_tok_cumsum gating on is_mm_embed_full."""
+    import vllm_torchtpu.runner.tpu_runner as tr_mod
+    from vllm_torchtpu.layers.core.sequence_layout import (
+        AllSequenceLayoutPlanner,
+        SequenceLayoutKind,
+    )
+
+    max_num_reqs = 4
+    max_model_len = 128
+    token_ids_cpu = np.arange(max_num_reqs * max_model_len, dtype=np.int32).reshape(
+        max_num_reqs, max_model_len
+    )
+    positions_cpu = torch.full((max_model_len,), -1, dtype=torch.int32)
+    query_start_loc_cpu = torch.zeros(max_num_reqs + 1, dtype=torch.int32)
+    seq_lens_cpu = torch.zeros(max_num_reqs, dtype=torch.int32)
+
+    runner = SimpleNamespace(
+        reorder_batch_threshold=1,
+        _replay_starts={},
+        sequence_layout_planner=AllSequenceLayoutPlanner(),
+        _dp_target_bucket=None,
+        input_batch=SimpleNamespace(
+            num_reqs=3,
+            req_ids=["req-0", "req-1", "req-2", "req-3"],
+            num_computed_tokens_cpu=np.array([4, 11, 9, 3], dtype=np.int32),
+            token_ids_cpu=token_ids_cpu,
+            token_ids_cpu_tensor=torch.from_numpy(token_ids_cpu),
+            num_prompt_tokens=np.full(max_num_reqs, 64, dtype=np.int32),
+        ),
+        _wait_input_staging_fence=lambda: None,
+        most_model_len=None,
+        num_reqs_max_model_len=max_num_reqs,
+        num_reqs_most_model_len=max_num_reqs,
+        max_num_reqs=max_num_reqs,
+        uses_mrope=False,
+        arange_np=np.arange(max_model_len, dtype=np.int32),
+        positions_cpu=positions_cpu,
+        positions_np=positions_cpu.numpy(),
+        input_ids_cpu=torch.full((max_model_len,), -1, dtype=torch.int32),
+        query_start_loc_cpu=query_start_loc_cpu,
+        query_start_loc_np=query_start_loc_cpu.numpy(),
+        seq_lens_cpu=seq_lens_cpu,
+        seq_lens_np=seq_lens_cpu.numpy(),
+        _check_attention_schedule=lambda *a: None,
+        _pcp_enabled=False,
+        _mtp_enabled=False,
+        device=torch.device("cpu"),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        speculative_config=None,
+        _pre_async_results=None,
+        _decode_device_cache_key=None,
+        _request_distribution_cpu=torch.zeros(3, dtype=torch.int32),
+        _has_mamba_state=False,
+        mamba_slot_read_offsets=None,
+        _mamba_ckpt_window=1,
+        _unified_kv_layout=False,
+        empty_slot_mappings=None,
+        _build_attention_metadata=lambda **kw: ({}, None),
+        lora_config=None,
+        _prepare_async_token_substitution_indices=lambda *a: (
+            np.array([], dtype=np.int32),
+            np.array([], dtype=np.int32),
+        ),
+        _collect_mamba_state_seed_copies=lambda *a: None,
+        num_tokens_paddings=[16, 64, 128],
+        pcp_size=1,
+        dcp_size=1,
+    )
+
+    orig_concat = np.concatenate
+    concat_calls: list[int] = []
+
+    def _spy_concat(arrays, *args, **kwargs):
+        concat_calls.append(len(arrays))
+        return orig_concat(arrays, *args, **kwargs)
+
+    monkeypatch.setattr(np, "concatenate", _spy_concat)
+
+    sched_hetero = SimpleNamespace(
+        total_num_scheduled_tokens=8,
+        num_scheduled_tokens={"req-0": 5, "req-1": 2, "req-2": 1},
+    )
+    TPUModelRunner._prepare_inputs(
+        runner, sched_hetero, start_index=0, num_decode_reqs=1
+    )
+    assert concat_calls == []
+    assert runner.query_start_loc_np.tolist() == [0, 5, 7, 8, 8]
+    assert runner.positions_np[:8].tolist() == [4, 5, 6, 7, 8, 11, 12, 9]
+    expected_ids = [4, 5, 6, 7, 8, 128 + 11, 128 + 12, 256 + 9]
+    assert runner.input_ids_cpu[:8].tolist() == expected_ids
+
+    # Verify execute_model multimodal gating & preallocated cumsum buffers
+    stage_timing = MagicMock()
+    stage_timing.stage.return_value = contextlib.nullcontext()
+    stage_timing.host_stage.return_value = contextlib.nullcontext()
+
+    fake_plan = SimpleNamespace(
+        kind=SequenceLayoutKind.ALL,
+        local_num_tokens=3,
+        descriptor=SimpleNamespace(cache_key="k"),
+    )
+    mm_received: list[object] = []
+
+    def _make_exec_runner(gather_ret):
+        r = SimpleNamespace(
+            execute_model_state=None,
+            _pcp_enabled=False,
+            _mtp_enabled=False,
+            _pp_is_first=True,
+            _pp_is_last=True,
+            _pp_wave=None,
+            _is_async_drafter=False,
+            _async_drafter=None,
+            _stage_timing=stage_timing,
+            _record_replay_starts=lambda *a: None,
+            _update_states=lambda *a: None,
+            _has_mamba_state=False,
+            _prepare_mamba_step_plans=lambda *a: None,
+            _dp_lockstep_enabled=lambda: False,
+            _dp_coordinated_step=lambda *a, **kw: (8, 1),
+            _reorder_batch_for_rpa=lambda *a: (0, 0),
+            _count_input_chunks=lambda *a: (1, 1),
+            supports_mm_inputs=True,
+            _execute_mm_encoder=lambda *a: None,
+            _gather_mm_embeddings=lambda *a: gather_ret,
+            input_batch=SimpleNamespace(
+                num_reqs=2,
+                req_ids=["r0", "r1"],
+            ),
+            vllm_config=MagicMock(),
+            maybe_setup_kv_connector=lambda *a, **kw: None,
+            _flush_mamba_state_seed_copies=lambda: None,
+            _reset_read_offsets_for_new_requests=lambda *a: None,
+            _apply_async_token_substitution=lambda x, *a: x,
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            _record_input_staging_fence=lambda: None,
+            _get_model_inputs=lambda ids, mm: (
+                mm_received.append(mm) or (None, torch.zeros((3, 4)))
+            ),
+            _token_padding_update=lambda *a: None,
+            _dp_num_tokens_across_dp=lambda *a: None,
+            mesh=None,
+            _kv_cache_bundle=None,
+            mamba_slot_read_offsets=None,
+            lora_config=None,
+            set_active_loras=lambda *a: None,
+            phase_based_profiler=None,
+            forward_model=lambda *a, **kw: (torch.zeros((3, 4)), None),
+            sequence_layout_planner=SimpleNamespace(
+                uses_selected_logits_hidden_states=False,
+                maybe_select_logits_hidden_states=lambda *a: None,
+                finalize_hidden_states=lambda h, p: h,
+            ),
+            is_pooling_model=False,
+            _can_use_greedy_top_tokens=lambda *a: False,
+            compute_selected_logits=lambda *a: torch.zeros((2, 16)),
+        )
+
+        def _fake_prep(*args, **kwargs):
+            r.input_ids = torch.zeros(3, dtype=torch.int32)
+            r.position_ids = torch.zeros(3, dtype=torch.int32)
+            r._last_sequence_layout_plan = fake_plan
+            r._attn_metadata_builder_ctx = SimpleNamespace(
+                mamba_state_indices=None,
+                unified_mamba_state_indices=None,
+            )
+            return (
+                {},
+                torch.zeros(2, dtype=torch.int32),
+                8,
+                2,
+                2,
+                np.array([], dtype=np.int32),
+                np.array([], dtype=np.int32),
+                None,
+                None,
+                fake_plan,
+            )
+
+        r._prepare_inputs = _fake_prep
+        return r
+
+    so_mm = SimpleNamespace(
+        total_num_scheduled_tokens=3,
+        num_scheduled_tokens={"r0": 2, "r1": 1},
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={},
+    )
+
+    orig_cumsum = np.cumsum
+    cumsum_calls: list[int] = []
+
+    def _spy_cumsum(a, *args, **kwargs):
+        cumsum_calls.append(len(a))
+        return orig_cumsum(a, *args, **kwargs)
+
+    monkeypatch.setattr(np, "cumsum", _spy_cumsum)
+
+    with (
+        patch.object(tr_mod, "synchronize_tensors"),
+        patch.object(tr_mod.TraceAnnotation, "is_enabled", return_value=False),
+        patch.object(
+            tr_mod, "set_forward_context", return_value=contextlib.nullcontext()
+        ),
+        patch.object(
+            tr_mod,
+            "set_vllm_model_wrapper_context",
+            return_value=contextlib.nullcontext(),
+        ),
+        patch.object(tr_mod.dist_utils, "get_raiden_inline_load", return_value=False),
+    ):
+        # Case 1: text-only step (is_mm_embed_full is None) -> zero cumsum/concat calls
+        r_none = _make_exec_runner(([], None))
+        assert TPUModelRunner.execute_model(r_none, so_mm) is None
+        assert cumsum_calls == []
+        assert concat_calls == []
+        assert mm_received[-1] is None
+
+        # Case 2: mask present with embeds -> preallocated cumsum, zero np.concatenate
+        r_full = _make_exec_runner(
+            ([torch.ones((2, 4))], torch.tensor([True, False, True]))
+        )
+        assert TPUModelRunner.execute_model(r_full, so_mm) is None
+        assert cumsum_calls == [2, 3]
+        assert concat_calls == []
+        embeds_arg, mask_arg = mm_received[-1]
+        assert len(embeds_arg) == 1 and embeds_arg[0].shape == (2, 4)
+        assert mask_arg.tolist() == [True, False, True]
