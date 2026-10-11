@@ -600,7 +600,6 @@ class ZmqShmKvConnectorBase:
         the latency tracker or emit a stray scatter log line."""
         assert self.runner is not None
         kv_caches = self.runner.kv_caches
-        indices = torch.arange(num_blocks, dtype=torch.int64, device=self.device)
         slot_idx = 0
         if self.is_producer:
             self._stage_d2h_sync(slot_idx, num_blocks, list(range(num_blocks)))
@@ -629,6 +628,9 @@ class ZmqShmKvConnectorBase:
                 for i, c in enumerate(new_caches):
                     self._replace_runner_kv_cache(i, c)
             else:
+                indices = torch.arange(
+                    num_blocks, dtype=torch.int64, device=self.device
+                )
                 for layer_idx, cache in enumerate(kv_caches):
                     cache.index_put_((indices,), device_shards[layer_idx])
                     self._synchronize_device(cache)

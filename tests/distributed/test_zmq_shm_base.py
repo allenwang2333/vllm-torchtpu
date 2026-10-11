@@ -2472,3 +2472,70 @@ class TestCoordinatorWorkerHandoff:
 
         assert 11 not in coord._coord_recv
         assert coord._coord_pool.released == [1]
+
+
+def test_td8319_build_d2h_views_int32_indices_and_warmup_coord_once_no_unused_arange(
+    monkeypatch,
+):
+    """TD8.319: Verify TPUConnectorWorker._build_d2h_views uses torch.int32
+    indices for torch.index_select and _warmup_coord_once only allocates
+    indices in the naive consumer fallback branch."""
+    import vllm_torchtpu.distributed.kv_transfer.tpu_connector as tc
+
+    seen_index_dtypes: list[torch.dtype] = []
+    orig_index_select = torch.index_select
+
+    def _spy_index_select(input_t, dim, index):
+        seen_index_dtypes.append(index.dtype)
+        return orig_index_select(input_t, dim, index)
+
+    monkeypatch.setattr(torch, "index_select", _spy_index_select)
+
+    w = object.__new__(tc.TPUConnectorWorker)
+    w._stop_event = threading.Event()
+    w._coord_teardown = lambda: None
+    w.device = torch.device("cpu")
+    w.local_tp_rank = 0
+    w.runner = SimpleNamespace(
+        kv_caches=[
+            torch.arange(16, dtype=torch.float32).reshape(4, 4),
+            torch.arange(16, 32, dtype=torch.float32).reshape(4, 4),
+        ]
+    )
+    w._coord_pool = SimpleNamespace(
+        layer_view=lambda slot, rank, layer, nblocks: torch.zeros(
+            (nblocks, 4), dtype=torch.float32
+        )
+    )
+    tpu_tensors, cpu_tensors, total_bytes = w._build_d2h_views(0, 2, [1, 3])
+    assert seen_index_dtypes == [torch.int32, torch.int32]
+    assert len(tpu_tensors) == len(cpu_tensors) == 2
+    assert torch.equal(tpu_tensors[0], w.runner.kv_caches[0][[1, 3]])
+    assert total_bytes == 2 * 2 * 4 * 4
+
+    # Verify _warmup_coord_once skips torch.arange on producer and fast_scatter paths
+    arange_calls: list[int] = []
+    orig_arange = torch.arange
+
+    def _spy_arange(*args, **kwargs):
+        arange_calls.append(args[0])
+        return orig_arange(*args, **kwargs)
+
+    monkeypatch.setattr(zsb.torch, "arange", _spy_arange)
+
+    # 1) Producer path -> 0 arange calls
+    prod = _attach_runner(_make_conn(is_producer=True))
+    prod._warmup_coord_once(2)
+    assert arange_calls == []
+
+    # 2) Consumer fast-scatter path -> 0 arange calls
+    cons_fast = _attach_runner(_make_conn(is_producer=False))
+    cons_fast._kv_scatter_enabled = True
+    cons_fast._warmup_coord_once(2)
+    assert arange_calls == []
+
+    # 3) Consumer naive fallback path -> 1 arange call
+    cons_naive = _attach_runner(_make_conn(is_producer=False))
+    cons_naive._kv_scatter_enabled = False
+    cons_naive._warmup_coord_once(2)
+    assert arange_calls == [2]

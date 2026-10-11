@@ -380,3 +380,24 @@ def test_mamba_state_classmethods_use_the_text_config(monkeypatch):
     )
     assert cls.get_mamba_state_copy_func() == "copy"
     assert seen == [text_config, text_config]
+
+
+def test_td8319_embed_input_ids_int32_media_indices_cumsum(monkeypatch):
+    """TD8.319: Verify embed_input_ids computes media_indices in native
+    torch.int32 via torch.cumsum(..., dtype=torch.int32) and passes int32
+    indices to mm_embeds.index_select."""
+    seen_index_dtypes: list[torch.dtype] = []
+    orig_index_select = torch.Tensor.index_select
+
+    def _spy_index_select(self, dim, index):
+        seen_index_dtypes.append(index.dtype)
+        return orig_index_select(self, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", _spy_index_select)
+    wrapper = _embed_wrapper()
+    ids = torch.tensor([1, 2, 3, 4])
+    mask = torch.tensor([False, True, True, False])
+    media = [torch.tensor([[10.0, 11.0]]), torch.tensor([[20.0, 21.0]])]
+    merged = wrapper.embed_input_ids(ids, media, is_multimodal=mask)
+    assert merged.tolist() == [[1.0, 1.0], [10.0, 11.0], [20.0, 21.0], [4.0, 4.0]]
+    assert seen_index_dtypes == [torch.int32]

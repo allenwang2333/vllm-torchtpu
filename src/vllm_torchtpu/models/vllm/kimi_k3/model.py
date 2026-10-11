@@ -941,7 +941,7 @@ class KimiK3ForConditionalGeneration(
         if actual == 0:
             return inputs_embeds
 
-        media_indices_cpu = mask_cpu.to(torch.int64).cumsum(0).sub_(1)
+        media_indices_cpu = torch.cumsum(mask_cpu, dim=0, dtype=torch.int32).sub_(1)
         media_indices_cpu.clamp_(min=0)
         media_indices = media_indices_cpu.to(device=inputs_embeds.device)
         aligned_media = mm_embeds.index_select(0, media_indices)

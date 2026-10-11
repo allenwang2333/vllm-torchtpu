@@ -1328,7 +1328,7 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
     def _build_d2h_views(
         self, slot_idx: int, num_blocks: int, block_ids: list[int]
     ) -> tuple[list, list, int]:
-        indices = torch.tensor(block_ids, dtype=torch.int64, device=self.device)
+        indices = torch.tensor(block_ids, dtype=torch.int32, device=self.device)
         kv_caches = self.runner.kv_caches
         tpu_tensors: list = []
         cpu_tensors: list = []
