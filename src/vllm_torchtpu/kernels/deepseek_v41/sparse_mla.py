@@ -926,18 +926,6 @@ def resolve_csa_union_params(
         )
         return b_q, m_u
     _spec_num_tokens = 0
-    try:
-        from vllm_torchtpu.layers.adapter.utils import get_vllm_model_wrapper_context
-
-        _vcfg = getattr(get_vllm_model_wrapper_context(), "vllm_config", None)
-        _scfg = getattr(_vcfg, "speculative_config", None)
-        _ns = getattr(_scfg, "num_speculative_tokens", None)
-        if isinstance(_ns, int) and _ns >= 1:
-            _spec_num_tokens = _ns
-        elif _vcfg is None:
-            _spec_num_tokens = 5
-    except Exception:
-        _spec_num_tokens = 5
     if (
         _spec_num_tokens == 5
         and num_q_heads <= 64
