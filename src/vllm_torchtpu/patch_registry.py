@@ -89,6 +89,9 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
+    Patch("vllm_torchtpu:_patch_vllm_ced_prefill_first_scheduler", _ENGINE),
+    Patch("vllm_torchtpu:_patch_vllm_dplb_shared_inflight", _ACTIVE),
+    Patch("vllm_torchtpu:_patch_deepseek_v41_ced_fastpaths", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),

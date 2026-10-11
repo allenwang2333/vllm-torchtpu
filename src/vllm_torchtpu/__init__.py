@@ -2067,3 +2067,483 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
         "Applied TPU patch: register shard index bounds as buffers in "
         "VocabParallelEmbedding"
     )
+
+
+def _patch_vllm_dplb_shared_inflight() -> None:
+    """Share exact per-engine inflight counts and round-robin index across APIServers.
+
+    When ``--api-server-count > 1``, Linux SO_REUSEPORT/shared-socket ``accept()``
+    distributes HTTP connections unevenly across ``APIServer`` processes.
+    ``DPLBAsyncMPClient.get_core_engine_for_request`` scales each process's local
+    ``engine_inflight`` by ``client_count``, blinding busy ``APIServer`` workers to
+    the coordinator's ``waiting + running`` snapshot while independent per-process
+    ``eng_start_index`` remainders collide on the same DP ranks. Sharing each
+    client's exact ``engine_inflight`` slice and a rotating ``eng_start_index`` via
+    a parent-PID-scoped mmap file eliminates DP request skew under lockstep EP.
+    """
+    import fcntl
+    import mmap
+    import os
+    import struct
+    import sys
+    import tempfile
+
+    from vllm.v1.engine import core_client
+
+    cls = core_client.DPLBAsyncMPClient
+    if getattr(cls, "_tpu_dplb_shared_inflight_patch", False):
+        return
+
+    orig_init = cls.__init__
+    orig_get_engine = cls.get_core_engine_for_request
+    orig_process_outputs = cls.process_engine_outputs
+
+    def patched_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        self._dplb_fd = None
+        self._dplb_mm = None
+        if self.client_count <= 1:
+            return
+        try:
+            shm_path = os.path.join(
+                tempfile.gettempdir(), f"vllm_dplb_shared_{os.getppid()}.bin"
+            )
+            fd = os.open(shm_path, os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                size = os.fstat(fd).st_size
+                is_new = size < 4096
+                if is_new:
+                    os.ftruncate(fd, 4096)
+                mm = mmap.mmap(
+                    fd, 4096, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
+                )
+                if is_new:
+                    struct.pack_into("<q", mm, 0, 1)
+                num_engines = len(self.core_engines)
+                base = (1 + self.client_index * num_engines) * 8
+                for idx in range(num_engines):
+                    struct.pack_into("<q", mm, base + idx * 8, 0)
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            self._dplb_fd = fd
+            self._dplb_mm = mm
+        except Exception as exc:
+            logger.warning("Failed to initialize shared DPLB inflight mmap: %s", exc)
+
+    def patched_get_core_engine_for_request(self, request):
+        mm = getattr(self, "_dplb_mm", None)
+        fd = getattr(self, "_dplb_fd", None)
+        if mm is None or fd is None or self.client_count <= 1:
+            return orig_get_engine(self, request)
+
+        if (eng_index := request.data_parallel_rank) is None and (
+            eng_index := core_client.get_late_interaction_engine_index(
+                request.pooling_params, len(self.core_engines)
+            )
+        ) is None:
+            current_counts = self.lb_engines
+            num_engines = len(current_counts)
+            min_score: float = sys.maxsize
+            eng_index = 0
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                start_idx = struct.unpack_from("<q", mm, 0)[0] % num_engines
+                for i in range(num_engines):
+                    idx = (start_idx + i) % num_engines
+                    waiting, running, kv_cache_usage = current_counts[idx]
+                    inflight = 0
+                    for c in range(self.client_count):
+                        inflight += struct.unpack_from(
+                            "<q", mm, (1 + c * num_engines + idx) * 8
+                        )[0]
+                    score: float = max(inflight, waiting + running)
+                    if waiting:
+                        score += waiting * 6.0 * max(0.0, kv_cache_usage - 0.5)
+                    if score < min_score:
+                        min_score = score
+                        eng_index = idx
+                struct.pack_into("<q", mm, 0, (start_idx + 1) % num_engines)
+                chosen_engine = self.core_engines[eng_index]
+                self.reqs_in_flight[request.request_id] = chosen_engine
+                self.engine_inflight[chosen_engine] += 1
+                struct.pack_into(
+                    "<q",
+                    mm,
+                    (1 + self.client_index * num_engines + eng_index) * 8,
+                    self.engine_inflight[chosen_engine],
+                )
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            current_counts[eng_index][0] += 1
+            self.eng_start_index = (eng_index + 1) % num_engines
+            return chosen_engine
+
+        chosen_engine = self.core_engines[eng_index]
+        self.reqs_in_flight[request.request_id] = chosen_engine
+        self.engine_inflight[chosen_engine] += 1
+        num_engines = len(self.core_engines)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            struct.pack_into(
+                "<q",
+                mm,
+                (1 + self.client_index * num_engines + eng_index) * 8,
+                self.engine_inflight[chosen_engine],
+            )
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        return chosen_engine
+
+    @staticmethod
+    async def patched_process_engine_outputs(self, outputs):
+        had_finished = bool(outputs.finished_requests and self.reqs_in_flight)
+        await orig_process_outputs(self, outputs)
+        if not had_finished:
+            return
+        mm = getattr(self, "_dplb_mm", None)
+        fd = getattr(self, "_dplb_fd", None)
+        if mm is None or fd is None:
+            return
+        num_engines = len(self.core_engines)
+        base = (1 + self.client_index * num_engines) * 8
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            for idx, eng in enumerate(self.core_engines):
+                struct.pack_into("<q", mm, base + idx * 8, self.engine_inflight[eng])
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+    cls.__init__ = patched_init
+    cls.get_core_engine_for_request = patched_get_core_engine_for_request
+    cls.process_engine_outputs = patched_process_engine_outputs
+    cls._tpu_dplb_shared_inflight_patch = True
+    logger.info("Applied TPU patch: shared cross-APIServer DPLB inflight tracking.")
+
+
+def _patch_deepseek_v41_ced_fastpaths() -> None:
+    """Cache per-bucket zero engram_hashes tensors on TPU in DeepseekV41Model."""
+    import dataclasses
+
+    import torch
+    from vllm.distributed import get_tensor_model_parallel_world_size
+    from vllm.forward_context import get_forward_context, set_forward_context
+
+    from vllm_torchtpu.layers.adapter import token_padding
+    from vllm_torchtpu.models.vllm.deepseek_v41 import model as dsv41_model
+    from vllm_torchtpu.models.vllm.deepseek_v41.ced import plan_decoder_replay
+    from vllm_torchtpu.models.vllm.deepseek_v41.engram import (
+        take_prefetched_engram_hashes,
+    )
+
+    cls = dsv41_model.DeepseekV41Model
+    if getattr(cls, "_tpu_ced_fastpaths_patch", False):
+        return
+
+    def patched_forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors=None,
+        inputs_embeds: torch.Tensor | None = None,
+    ):
+        if not self._ced_enabled:
+            assert self.full_stage is not None
+            return self.full_stage(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+            )
+
+        assert self.encoder_stage is not None and self.decoder_stage is not None
+        num_tokens = int(positions.shape[0])
+        engram_hashes: torch.Tensor | None = None
+        if self.engram_hash is not None:
+            n_tables = len(self._engram_table_ids)
+            n_hash_cols = int(self.engram_hash.offsets.shape[1])
+            engram_hashes = take_prefetched_engram_hashes(
+                num_tokens=num_tokens,
+                n_tables=n_tables,
+                n_hash_cols=n_hash_cols,
+                packed_dim=self._engram_packed_dim,
+                device=positions.device,
+            )
+            if engram_hashes is None:
+                tp_size = get_tensor_model_parallel_world_size()
+                t_local = (
+                    num_tokens // tp_size
+                    if (tp_size > 1 and num_tokens > 0 and num_tokens % tp_size == 0)
+                    else num_tokens
+                )
+                z_cache = self.__dict__.get("_zero_engram_hashes_cache")
+                if z_cache is None:
+                    z_cache = {}
+                    self._zero_engram_hashes_cache = z_cache
+                z_key = (
+                    t_local,
+                    n_tables,
+                    n_hash_cols,
+                    self._engram_packed_dim,
+                    positions.device,
+                )
+                engram_hashes = z_cache.get(z_key)
+                if engram_hashes is None:
+                    engram_hashes = torch.zeros(
+                        (t_local, n_tables, n_hash_cols, self._engram_packed_dim),
+                        dtype=torch.uint8,
+                        device=positions.device,
+                    )
+                    z_cache[z_key] = engram_hashes
+
+        hidden_states, pre_mix = self.encoder_stage(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            engram_hashes=engram_hashes,
+        )
+
+        fwd_ctx = get_forward_context()
+        attn_metadata = fwd_ctx.attn_metadata
+        swa_prefix = self.layers[self._ced_boundary].attn.swa_cache_layer.prefix
+        swa_meta = (
+            attn_metadata.get(swa_prefix)
+            if isinstance(attn_metadata, dict)
+            else attn_metadata
+        )
+        compile_sizes = self._vllm_config.compilation_config.compile_sizes or [
+            num_tokens
+        ]
+        plan = plan_decoder_replay(
+            swa_meta,
+            self._ced_window,
+            num_tokens,
+            compile_sizes,
+            dp_ced_decoder_bucket=self._dp_ced_decoder_bucket,
+        )
+        if plan is None or plan.passthrough:
+            return self.decoder_stage(
+                positions=positions,
+                hidden_states=hidden_states,
+                pre_mix=pre_mix,
+            )
+        if plan.padded_num_tokens <= 0:
+            return hidden_states[:, 0, :]
+
+        dev = positions.device
+        dec_q_loc = plan.query_start_loc.to(dev, non_blocking=True)
+        dec_seq_lens = plan.seq_lens.to(dev, non_blocking=True)
+        dec_dist = plan.request_distribution.to(dev, non_blocking=True)
+        gather_idx = plan.gather_indices.to(dev, non_blocking=True)
+        scatter_idx = plan.scatter_indices.to(dev, non_blocking=True)
+        dec_hidden, dec_pre_mix, dec_positions = dsv41_model._ced_gather_inputs(
+            hidden_states, pre_mix, positions, gather_idx
+        )
+
+        if isinstance(attn_metadata, dict):
+            decoder_metadata = {
+                k: dataclasses.replace(
+                    v,
+                    input_positions=dec_positions,
+                    seq_lens=dec_seq_lens,
+                    query_start_loc=dec_q_loc,
+                    request_distribution=dec_dist,
+                )
+                for k, v in attn_metadata.items()
+            }
+        elif attn_metadata is not None:
+            decoder_metadata = dataclasses.replace(
+                attn_metadata,
+                input_positions=dec_positions,
+                seq_lens=dec_seq_lens,
+                query_start_loc=dec_q_loc,
+                request_distribution=dec_dist,
+            )
+        else:
+            decoder_metadata = None
+
+        padding_state = token_padding._padding_state
+        if padding_state is not None:
+            padding_state.update(len(plan.indices), plan.padded_num_tokens)
+
+        dp_size = self._vllm_config.parallel_config.data_parallel_size
+        has_dp_meta = fwd_ctx.dp_metadata is not None and dp_size > 1
+        dec_dp_tokens = (
+            torch.tensor(
+                [plan.padded_num_tokens] * dp_size,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            if has_dp_meta
+            else None
+        )
+        with set_forward_context(
+            decoder_metadata,
+            self._vllm_config,
+            num_tokens=plan.padded_num_tokens if has_dp_meta else 0,
+            num_tokens_across_dp=dec_dp_tokens,
+        ):
+            dec_out = self.decoder_stage(
+                positions=dec_positions,
+                hidden_states=dec_hidden,
+                pre_mix=dec_pre_mix,
+            )
+        return dsv41_model._ced_scatter_output(dec_out, scatter_idx)
+
+    cls.forward = patched_forward
+    cls._tpu_ced_fastpaths_patch = True
+    logger.info("Applied TPU patch: DeepSeek-V4.1 CED zero-engram cache fastpath.")
+
+
+_CED_PREFILL_FIRST_MODE: int = 1
+_CED_PREFILL_FIRST_LAST_CHECK: float = 0.0
+
+
+def _get_ced_prefill_first_mode() -> int:
+    import time
+
+    global _CED_PREFILL_FIRST_MODE, _CED_PREFILL_FIRST_LAST_CHECK
+    now = time.monotonic()
+    if now - _CED_PREFILL_FIRST_LAST_CHECK > 0.5:
+        _CED_PREFILL_FIRST_LAST_CHECK = now
+        try:
+            with open("/mnt/rish/run/ced_prefill_first") as f:
+                _CED_PREFILL_FIRST_MODE = int(f.read().strip() or "0")
+        except OSError:
+            _CED_PREFILL_FIRST_MODE = (
+                1 if (envs.VLLM_DSV41_CED and envs.VLLM_CED_PREFILL_FIRST) else 0
+            )
+    return _CED_PREFILL_FIRST_MODE
+
+
+def _patch_vllm_ced_prefill_first_scheduler() -> None:
+    """Optionally defer 1-token decode requests while prefill chunks are draining."""
+    from functools import wraps
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if getattr(Scheduler, "_tpu_ced_prefill_first_patch", False):
+        return
+
+    original_schedule = Scheduler.schedule
+
+    @wraps(original_schedule)
+    def schedule_with_ced_prefill_first(self, throttle_prefills: bool = False):
+        mode = _get_ced_prefill_first_mode()
+        if mode <= 0 or not self.running:
+            return original_schedule(self, throttle_prefills)
+
+        kv_mgr = self.kv_cache_manager
+        decode_reqs = [r for r in self.running if not r.is_prefill_chunk]
+        if not decode_reqs:
+            return original_schedule(self, throttle_prefills)
+
+        # Free out-of-window SWA blocks for completed prefill chunks before
+        # checking usage or deferring decode_reqs (normally only called inside
+        # allocate_slots when a request is scheduled).
+        for r in decode_reqs:
+            processed = max(0, r.num_computed_tokens - r.num_in_flight_tokens)
+            if processed > 0 and getattr(r, "_ced_swa_trimmed_at", -1) != processed:
+                kv_mgr.remove_skipped_blocks(
+                    request_id=r.request_id,
+                    processed_computed_tokens=processed,
+                    num_prompt_tokens=r.num_prompt_tokens,
+                )
+                r._ced_swa_trimmed_at = processed
+
+        if kv_mgr.usage >= 0.85:
+            return original_schedule(self, throttle_prefills)
+
+        has_running_prefill = any(r.is_prefill_chunk for r in self.running)
+        has_waiting_prefill = (
+            bool(self.waiting or self.skipped_waiting)
+            and (len(self.running) + self.num_waiting_for_streaming_input)
+            < self.max_num_running_reqs
+        )
+        if not (has_running_prefill or has_waiting_prefill):
+            return original_schedule(self, throttle_prefills)
+
+        saved_steps = [r.next_decode_eligible_step for r in decode_reqs]
+        defer_step = self.current_step + 2
+        for r in decode_reqs:
+            r.next_decode_eligible_step = defer_step
+        try:
+            out = original_schedule(self, throttle_prefills)
+        finally:
+            for r, prev_step in zip(decode_reqs, saved_steps):
+                r.next_decode_eligible_step = prev_step
+
+        if out.total_num_scheduled_tokens == 0:
+            return original_schedule(self, throttle_prefills)
+        return out
+
+    Scheduler.schedule = schedule_with_ced_prefill_first
+    Scheduler._tpu_ced_prefill_first_patch = True
+
+    from vllm.v1.engine.core import DPEngineCoreProc
+
+    if not getattr(DPEngineCoreProc, "_tpu_dp_wave_start_align_patch", False):
+        orig_process_input_queue = DPEngineCoreProc._process_input_queue
+        orig_process_engine_step = DPEngineCoreProc._process_engine_step
+
+        @wraps(orig_process_input_queue)
+        def process_input_queue_aligned(self):
+            orig_process_input_queue(self)
+            if not self.has_work() or getattr(self, "step_counter", 99) > 1:
+                return
+            if _get_ced_prefill_first_mode() <= 0:
+                return
+            import queue
+            import time
+
+            sched = self.scheduler
+            if self.step_counter == 0 and not sched.has_requests():
+                deadline = time.monotonic() + 0.500
+                while not sched.has_requests() and time.monotonic() < deadline:
+                    try:
+                        req = self.input_queue.get(timeout=0.001)
+                        self._handle_client_request(*req)
+                        while not self.input_queue.empty():
+                            self._handle_client_request(*self.input_queue.get_nowait())
+                    except queue.Empty:
+                        pass
+
+            if sched.has_requests() and not any(
+                r.is_prefill_chunk for r in sched.running
+            ):
+                target_tokens = sched.max_num_scheduled_tokens
+                deadline = time.monotonic() + 0.045
+                while (
+                    sum(r.num_prompt_tokens for r in sched.waiting) < target_tokens
+                    and time.monotonic() < deadline
+                ):
+                    try:
+                        req = self.input_queue.get(timeout=0.001)
+                        self._handle_client_request(*req)
+                        while not self.input_queue.empty():
+                            self._handle_client_request(*self.input_queue.get_nowait())
+                    except queue.Empty:
+                        pass
+
+        @wraps(orig_process_engine_step)
+        def process_engine_step_aligned(self) -> bool:
+            if (
+                _get_ced_prefill_first_mode() > 0
+                and getattr(self, "step_counter", 0) % 2 == 1
+                and not self.scheduler.running
+                and not self.batch_queue
+                and self.scheduler.waiting
+                and self.scheduler.waiting.peek_request().num_prompt_tokens
+                > self.scheduler.max_num_scheduled_tokens
+            ):
+                return False
+            return orig_process_engine_step(self)
+
+        DPEngineCoreProc._process_input_queue = process_input_queue_aligned
+        DPEngineCoreProc._process_engine_step = process_engine_step_aligned
+        DPEngineCoreProc._tpu_dp_wave_start_align_patch = True
+
+    logger.info(
+        "Applied TPU patch: CED prefill-first scheduler + DP wave-start alignment."
+    )

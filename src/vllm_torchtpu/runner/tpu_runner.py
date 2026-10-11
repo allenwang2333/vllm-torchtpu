@@ -716,9 +716,7 @@ class TPUModelRunner(GPUModelRunner):
         self.sliding_window = self.model_config.get_sliding_window()
         self.block_size = cache_config.block_size
         self.most_model_len = envs.VLLM_TPU_MOST_MODEL_LEN
-        self._fast_token_substitution: bool = bool(
-            envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION
-        )
+        self._fast_token_substitution: bool = envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION
         # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
         # block_table capacity if already created during super().__init__().
         # This ensures that calculations derived from max_num_blocks_per_req
@@ -2686,9 +2684,20 @@ class TPUModelRunner(GPUModelRunner):
             self._engram_prefetch_fn = fn
         if fn is None:
             return
-        known = positions_np < self.input_batch.num_prompt_tokens[req_indices]
         if layout_plan.kind is not SequenceLayoutKind.ALL:
-            known[:] = False
+            return
+        known = positions_np < self.input_batch.num_prompt_tokens[req_indices]
+        inner = getattr(self.model, "model", None)
+        if getattr(inner, "_ced_enabled", False):
+            if not known.all():
+                from vllm_torchtpu.models.vllm.deepseek_v41 import (
+                    engram as _dsv41_engram,
+                )
+
+                _dsv41_engram._ENGRAM_PREFETCH = None
+                return
+        elif not known.any():
+            return
         fn(
             self.input_batch.token_ids_cpu,
             req_indices,
@@ -3093,7 +3102,14 @@ class TPUModelRunner(GPUModelRunner):
             request_distribution = combined_device[0:3]
             mamba_request_distribution = combined_device[3:6]
 
-        is_all_layout = layout_plan.kind is SequenceLayoutKind.ALL
+        is_all_layout = layout_plan.kind is SequenceLayoutKind.ALL and not (
+            is_decode_only
+            and (
+                self._dp_ced_decoder_bucket is None
+                or self._dp_ced_decoder_bucket
+                == local_padded_total_num_scheduled_tokens
+            )
+        )
         pad_reqs = target_num_reqs - num_reqs
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
@@ -3294,16 +3310,17 @@ class TPUModelRunner(GPUModelRunner):
         max_chunk_reqs = 0
         while start_index < num_reqs:
             use_max_model_len = self.most_model_len is None
-            for i in range(start_index, num_reqs):
-                req_id = self.input_batch.req_ids[i]
-                assert req_id is not None
-                num_tokens = scheduler_output.num_scheduled_tokens[req_id]
-                if (
-                    not use_max_model_len
-                    and self.most_model_len is not None
-                    and num_tokens > self.most_model_len
-                ):
-                    use_max_model_len = True
+            if not use_max_model_len:
+                for i in range(start_index, num_reqs):
+                    req_id = self.input_batch.req_ids[i]
+                    assert req_id is not None
+                    num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                    if (
+                        self.most_model_len is not None
+                        and num_tokens > self.most_model_len
+                    ):
+                        use_max_model_len = True
+                        break
 
             if use_max_model_len:
                 chunk_reqs = self.num_reqs_max_model_len
@@ -3316,14 +3333,18 @@ class TPUModelRunner(GPUModelRunner):
             num_chunks += 1
         return num_chunks, max_chunk_reqs
 
-    def _count_ced_decoder_tokens(self, scheduler_output: "SchedulerOutput") -> int:
+    def _count_ced_decoder_tokens(
+        self, scheduler_output: "SchedulerOutput", num_decode_reqs: int = -1
+    ) -> int:
         if scheduler_output.total_num_scheduled_tokens == 0:
             return 0
         inner = getattr(self.model, "model", None)
         if not getattr(inner, "_ced_enabled", False):
             return int(scheduler_output.total_num_scheduled_tokens)
-        window = int(getattr(inner, "_ced_window", 128))
         num_reqs = self.input_batch.num_reqs
+        if num_decode_reqs == num_reqs:
+            return int(scheduler_output.total_num_scheduled_tokens)
+        window = int(getattr(inner, "_ced_window", 128))
         kept = 0
         for i in range(num_reqs):
             req_id = self.input_batch.req_ids[i]
@@ -3446,9 +3467,9 @@ class TPUModelRunner(GPUModelRunner):
             )
         # Update cached state
         self._update_states(scheduler_output)
-        if self.scheduler_config.async_scheduling:
-            self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
+            if self.scheduler_config.async_scheduling:
+                self._flush_disjoint_async_results()
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
             # Even for a zero-token step and if DP lockstep is enabled, we must
@@ -3542,7 +3563,9 @@ class TPUModelRunner(GPUModelRunner):
         local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
             scheduler_output
         )
-        local_ced_tokens = self._count_ced_decoder_tokens(scheduler_output)
+        local_ced_tokens = self._count_ced_decoder_tokens(
+            scheduler_output, num_decode_reqs
+        )
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
             scheduler_output.total_num_scheduled_tokens,
             local_num_chunks,
@@ -4079,13 +4102,26 @@ class TPUModelRunner(GPUModelRunner):
 
     def _greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
         """argmax logits, only used when `all_greedy` is True."""
-        dummy = torch.empty((1, 1), dtype=logits.dtype, device=logits.device)
+        key = (logits.dtype, logits.device)
+        dummies = getattr(self, "_greedy_dummy_cache", None)
+        if dummies is None:
+            dummies = {}
+            self._greedy_dummy_cache = dummies
+        entry = dummies.get(key)
+        if entry is None:
+            entry = (
+                torch.empty((1, 1), dtype=logits.dtype, device=logits.device),
+                torch.empty((1, 1), dtype=torch.int32, device=logits.device),
+                torch.empty((1, 1), dtype=torch.float32, device=logits.device),
+            )
+            dummies[key] = entry
+        dummy, dummy_i32, dummy_f32 = entry
         return self.sample_from_logits_func(
             logits,
             dummy,
             dummy,
-            torch.empty((1, 1), dtype=torch.int32, device=logits.device),
-            torch.empty((1, 1), dtype=torch.float32, device=logits.device),
+            dummy_i32,
+            dummy_f32,
             all_greedy=True,
         )
 
