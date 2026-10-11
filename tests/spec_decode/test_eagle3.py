@@ -348,7 +348,7 @@ def test_prepare_draft_inputs(device):
     # The returned gather index is bucket-padded (tail repeats the last real
     # entry); check the real [:num_reqs] prefix.
     assert torch.equal(
-        last_token_indices.cpu()[:2], torch.tensor([2, 7], dtype=torch.int64)
+        last_token_indices.cpu()[:2], torch.tensor([2, 7], dtype=torch.int32)
     )
 
     # input_ids [0..10]; left shift -> [1,2,...,10,10]; then patch the last
@@ -399,7 +399,7 @@ def test_prepare_draft_inputs_chunk_offset(device):
     # qsl[1:]-1-rejected = [2,4]-[1,0] = [1, 4]. Returned gather index is
     # bucket-padded; check the real [:num_reqs] prefix.
     assert torch.equal(
-        last_token_indices.cpu()[:2], torch.tensor([1, 4], dtype=torch.int64)
+        last_token_indices.cpu()[:2], torch.tensor([1, 4], dtype=torch.int32)
     )
     # [0..4] left shift -> [1,2,3,4,4]; patch [1,4] with batch tokens [201,202].
     expected_ids = torch.tensor([1, 201, 3, 4, 202], dtype=torch.int32, device=device)

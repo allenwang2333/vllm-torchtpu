@@ -986,7 +986,7 @@ class Eagle3Proposer:
         # indexing), these three gathers are eager ops the DEFER_AND_FUSE path
         # fuses with the step's seq_lens/positions arithmetic into a per-context
         # program. index_select is value-identical to hidden[indices].
-        idx = indices.int()
+        idx = indices if indices.dtype == torch.int32 else indices.int()
         pos_carry = (
             torch.index_select(positions, 1, idx)
             if positions.ndim == 2
@@ -1035,9 +1035,12 @@ class Eagle3Proposer:
         shifted = input_ids
         if input_ids.shape[0] > 1:
             shifted = torch.cat((input_ids[1:], input_ids[-1:]), dim=0)
-        return shifted.index_put(
-            (last_token_indices,), next_token_ids.to(input_ids.dtype)
+        idx = (
+            last_token_indices
+            if last_token_indices.dtype == torch.int64
+            else last_token_indices.to(torch.int64)
         )
+        return shifted.index_put((idx,), next_token_ids.to(input_ids.dtype))
 
     def propose(
         self,
@@ -1394,9 +1397,9 @@ class Eagle3Proposer:
         # Last-token index per request = end of the accepted prefix (where
         # the bonus token actually lives), not the original last verify slot.
         last_token_indices_np = (
-            query_start_loc_np[1 : num_reqs + 1].astype(np.int64)
+            query_start_loc_np[1 : num_reqs + 1].astype(np.int32, copy=False)
             - 1
-            - num_rejected_np.astype(np.int64)
+            - num_rejected_np
         )
         # The async (next_tokens_device) path recomputes last_token_indices
         # fully on-device below, only the sync / device_seed paths consume this H2D.
@@ -1444,7 +1447,7 @@ class Eagle3Proposer:
             # same tensor _build_draft_attn_metadata reads at step_idx=0); slice
             # it instead of a fresh H2D of query_start_loc_np.
             qsl_end = chunk.attn_ctx.query_start_loc[1 : num_reqs + 1].to(torch.int32)
-            last_token_indices = (qsl_end - 1 - num_rejected_out).to(torch.int64)
+            last_token_indices = (qsl_end - 1 - num_rejected_out).to(torch.int32)
             # Partial-prefill (discard) requests have no sampled token; seed
             # them from the host request state (same value as the sync path).
             ov_i = [i for i in range(num_reqs) if start + i in discard_set]
@@ -1513,7 +1516,7 @@ class Eagle3Proposer:
         if next_tokens_device is None and device_seed is None:
             # Pure sync: build the padded index + values on the host (free H2D,
             # no recompile), then scatter at the constant [p] shape.
-            lti_p_np = np.full(p, last_token_indices_np[-1], dtype=np.int64)
+            lti_p_np = np.full(p, last_token_indices_np[-1], dtype=np.int32)
             lti_p_np[:num_reqs] = last_token_indices_np
             ntids_p_np = np.full(
                 p, next_token_ids_np[-1], dtype=next_token_ids_np.dtype
@@ -1534,7 +1537,7 @@ class Eagle3Proposer:
             if next_tokens_device is not None:
                 gather_indices = _maybe_pad_dim0(last_token_indices, p)
             else:
-                padded_lti_np = np.zeros(p, dtype=np.int64)
+                padded_lti_np = np.zeros(p, dtype=np.int32)
                 padded_lti_np[:num_reqs] = last_token_indices_np
                 gather_indices = torch.from_numpy(padded_lti_np).to(runner.device)
 
@@ -1971,7 +1974,7 @@ class Eagle3Proposer:
                     if p > T:
                         continue
                     ids = torch.zeros(T, dtype=torch.int32).to(runner.device)
-                    lti = torch.zeros(p, dtype=torch.int64).to(runner.device)
+                    lti = torch.zeros(p, dtype=torch.int32).to(runner.device)
                     nti = torch.zeros(p, dtype=torch.int32).to(runner.device)
                     out = self._draft_seed_input_ids(ids, lti, nti)
                     synchronize_tensors(out)

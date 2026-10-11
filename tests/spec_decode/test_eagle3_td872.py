@@ -1470,7 +1470,7 @@ def test_td8274_prepare_draft_inputs_async_1d_flat_int32_gather(monkeypatch):
         assert (1, 0, torch.int32) in select_dtypes
         assert ids.dtype == torch.int32
         assert rej.dtype == torch.int32
-        assert gather.dtype == torch.int64
+        assert gather.dtype == torch.int32
         if with_lengths:
             assert rej.tolist() == [1, 2, 0]
             assert gather.tolist() == [1, 2, 5, 0]
@@ -1528,3 +1528,65 @@ def test_td8279_draft_propose_token_and_gather_carries_int32_index_select(monkey
     _, p2, _ = p._draft_gather_carries(hidden, pos_2d, last_hidden, indices_i64)
     assert torch.equal(p2, pos_2d[:, [1, 3]])
     assert all(dt == torch.int32 for _, _, dt in select_calls)
+
+
+def test_td8297_last_token_indices_and_gather_indices_int32(monkeypatch):
+    proposer, chunk, sched = _prep_setup()
+    # 1. Pure sync path: gather_indices is torch.int32
+    ids_sync, _, gather_sync, _ = proposer._prepare_draft_inputs(
+        chunk,
+        sampled_token_ids=[[11], [22], [33]],
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=np.array([0, 1, 0], dtype=np.int32),
+        scheduler_output=sched,
+    )
+    assert gather_sync.dtype == torch.int32
+    assert ids_sync.dtype == torch.int32
+
+    # 2. device_seed bootstrap path: gather_indices is torch.int32
+    ids_boot, _, gather_boot, _ = proposer._prepare_draft_inputs(
+        chunk,
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=sched,
+        device_seed=torch.tensor([11, 22, 33], dtype=torch.int32),
+    )
+    assert gather_boot.dtype == torch.int32
+    assert ids_boot.dtype == torch.int32
+
+    # 3. _draft_seed_input_ids accepts both torch.int32 and torch.int64 indices
+    base_ids = torch.tensor([10, 20, 30, 40], dtype=torch.int32)
+    nti = torch.tensor([99, 88], dtype=torch.int32)
+    out_i32 = proposer._draft_seed_input_ids(
+        base_ids, torch.tensor([1, 3], dtype=torch.int32), nti
+    )
+    out_i64 = proposer._draft_seed_input_ids(
+        base_ids, torch.tensor([1, 3], dtype=torch.int64), nti
+    )
+    assert torch.equal(out_i32, out_i64)
+
+    # 4. _draft_gather_carries accepts torch.int32 without casting
+    hidden = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    pos_1d = torch.tensor([10, 20, 30, 40], dtype=torch.int32)
+    h_i32, p_i32, lh_i32 = proposer._draft_gather_carries(
+        hidden, pos_1d, hidden + 1, torch.tensor([0, 2], dtype=torch.int32)
+    )
+    assert p_i32.tolist() == [10, 30]
+    assert torch.equal(h_i32, hidden[[0, 2]])
+    assert torch.equal(lh_i32, (hidden + 1)[[0, 2]])
+
+    # 5. _precompile_draft_seed passes torch.int32 lti
+    p_pre = _proposer()
+    _eager(p_pre)
+    _precompile_harness(monkeypatch, p_pre)
+    seen_lti_dtypes = []
+    raw_seed = p_pre._draft_seed_input_ids
+
+    def spy_seed(ids, lti, nti):
+        seen_lti_dtypes.append(lti.dtype)
+        return raw_seed(ids, lti, nti)
+
+    p_pre._draft_seed_input_ids = spy_seed
+    p_pre._precompile_draft_seed()
+    assert seen_lti_dtypes and all(dt == torch.int32 for dt in seen_lti_dtypes)
