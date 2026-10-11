@@ -297,11 +297,11 @@ def gmm_wrapper(
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
     # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
-    is_fp4_w4a16 = (
+    is_fp4_weight = (
         jnp.issubdtype(rhs.dtype, jnp.floating)
         and jax.dtypes.itemsize_bits(rhs.dtype) == 4
-        and (rhs_scale is None or rhs.shape[1] // rhs_scale.shape[1] < 128)
     )
+    use_fp8_lhs = (not is_fp4_weight) or (lhs_scale is not None)
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -313,7 +313,7 @@ def gmm_wrapper(
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,
-        maybe_quantize_lhs=not is_fp4_w4a16,
+        maybe_quantize_lhs=use_fp8_lhs,
         rhs_quant_dtype=rhs_quant_dtype,
         lhs_scale=lhs_scale,
         out_row_scale=out_row_scale,
@@ -339,10 +339,7 @@ def _counting_sort_positions(
     fall out of the same histogram, which is exactly `group_sizes`.
     """
     m = sort_keys.shape[0]
-    block = min(
-        _COUNTING_SORT_BLOCK if num_buckets > 128 else (128 if m > 8192 else _COUNTING_SORT_BLOCK),
-        m,
-    )
+    block = min(128 if m > 8192 else _COUNTING_SORT_BLOCK, m)
     if num_buckets > block:
         # XLA miscompiles the rank matmul here on jaxlib 0.10.2 + libtpu
         # 0.0.44.1: under jit the positions come back not a permutation. Only
@@ -641,7 +638,8 @@ def prepare_routed_gmm_inputs(
     elif (
         use_sparse_core
         and 3072 < m <= 32768
-        and hidden_states_local.dtype in (jnp.bfloat16, jnp.float32, jnp.int8, jnp.int4, jnp.float8_e4m3fn)
+        and hidden_states_local.dtype
+        in (jnp.bfloat16, jnp.float32, jnp.int8, jnp.int4, jnp.float8_e4m3fn)
         and hidden_states_local.shape[-1] >= 128
         and hidden_states_local.shape[-1] % 128 == 0
         and hidden_states_local.shape[0]
@@ -750,23 +748,24 @@ def moe_gmm(
         )
         or rhs_quant_dtype == jnp.float4_e2m1fn
     )
-    is_w1_fp4_w4a16 = (
-        jnp.issubdtype(w1.dtype, jnp.floating)
-        and jax.dtypes.itemsize_bits(w1.dtype) == 4
-        and (w1_scale is None or w1.shape[1] // w1_scale.shape[1] < 128)
-    )
-    if not is_w1_fp4_w4a16 and lhs_scale is not None and x.shape[1] % 512 == 0 and lhs_scale.shape[1] in (1, x.shape[1] // 512):
-        lhs_scale = jnp.broadcast_to(lhs_scale.astype(jnp.bfloat16), (x.shape[0], x.shape[1] // 512))
-    elif is_w1_fp4_w4a16 and lhs_scale is not None:
-        if lhs_scale.shape[1] == 1:
-            x = (x.astype(jnp.float32) * lhs_scale).astype(lhs_scale.dtype)
+    use_w4a8 = os.environ.get("VLLM_DSV41_MOE_FP4_GMM1_FP8", "1") == "1"
+    use_w4a8_gmm2 = os.environ.get("VLLM_DSV41_MOE_FP4_GMM2_FP8", "0") == "1"
+    if (is_w2_fp4 or w1.dtype == jnp.float4_e2m1fn) and lhs_scale is not None:
+        n_blocks_k1 = x.shape[1] // 512
+        if use_w4a8 and x.shape[1] % 512 == 0 and lhs_scale.shape[1] in (1, n_blocks_k1):
+            lhs_scale = jnp.broadcast_to(
+                lhs_scale.astype(jnp.bfloat16), (x.shape[0], n_blocks_k1)
+            )
         else:
-            nb = lhs_scale.shape[1]
-            x = (
-                x.reshape(x.shape[0], nb, x.shape[1] // nb).astype(jnp.float32)
-                * lhs_scale[:, :, None]
-            ).reshape(x.shape).astype(lhs_scale.dtype)
-        lhs_scale = None
+            if lhs_scale.shape[1] == 1:
+                x = (x.astype(jnp.float32) * lhs_scale).astype(lhs_scale.dtype)
+            else:
+                nb = lhs_scale.shape[1]
+                x = (
+                    x.reshape(x.shape[0], nb, x.shape[1] // nb).astype(jnp.float32)
+                    * lhs_scale[:, :, None]
+                ).reshape(x.shape).astype(lhs_scale.dtype)
+            lhs_scale = None
     fuse_gmm1_fp8 = not is_w2_fp4 and inter_dim == 512
     gmm1_res = gmm_wrapper(
         x,
@@ -792,21 +791,17 @@ def moe_gmm(
         and inter_dim % 128 == 0
         and (
             (not is_w2_fp4 and gmm1_res.shape[0] <= 4608)
-            or (
-                is_w2_fp4
-                and os.environ.get("VLLM_DSV41_MOE_FP4_GMM2_FP8", "1") == "1"
-                and inter_dim % 512 == 0
-            )
+            or (is_w2_fp4 and use_w4a8_gmm2 and inter_dim % 512 == 0)
         )
     ):
         gmm1_in, gmm1_scale = quantize_lhs_rows(gmm1_res[:, :inter_dim])
-        if is_w2_fp4 and gmm1_scale is not None and inter_dim % 512 == 0:
-            gmm1_scale = jnp.broadcast_to(
-                gmm1_scale.astype(jnp.bfloat16), (gmm1_in.shape[0], inter_dim // 512)
-            )
     else:
         gmm1_in = gmm1_res[:, :inter_dim]
         gmm1_scale = None
+    if gmm1_scale is not None and is_w2_fp4 and w2_scale is not None:
+        gmm1_scale = jnp.broadcast_to(
+            gmm1_scale.reshape(-1, 1), (gmm1_in.shape[0], w2_scale.shape[1])
+        )
 
     use_direct_non_ep_combine = (
         not use_ep
@@ -1360,7 +1355,11 @@ def fused_moe_func_fp8_dispatch(
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
     if use_dense_expert:
-        is_w4a16 = rhs_quant_dtype is None and w1.dtype == jnp.float4_e2m1fn
+        is_w4a16 = (
+            rhs_quant_dtype is None
+            and w1.dtype == jnp.float4_e2m1fn
+            and (w1_scale is None or w1.shape[1] // w1_scale.shape[1] < 128)
+        )
         if is_w4a16:
             hidden_bf16 = (
                 jax.lax.bitcast_convert_type(hidden_q, jnp.float8_e4m3fn)
@@ -1393,12 +1392,18 @@ def fused_moe_func_fp8_dispatch(
             hidden_scale=hidden_scale,
         )[:orig_num_tokens, :hidden_size]
 
-    is_fp4_w4a16 = (
+    is_fp4_rhs = rhs_quant_dtype == jnp.float4_e2m1fn or (
         jnp.issubdtype(w1.dtype, jnp.floating)
         and jax.dtypes.itemsize_bits(w1.dtype) == 4
-        and (w1_scale is None or w1.shape[1] // w1_scale.shape[1] < 128)
     )
-    if is_fp4_w4a16:
+    default_bf16_lhs = (
+        "0" if os.environ.get("VLLM_DSV41_MOE_FP4_GMM1_FP8", "1") == "1" else "1"
+    )
+    use_fp4_bf16_lhs = (
+        is_fp4_rhs
+        and os.environ.get("VLLM_DSV41_MOE_FP4_BF16_LHS", default_bf16_lhs) == "1"
+    )
+    if use_fp4_bf16_lhs:
         hidden_in = (
             jax.lax.bitcast_convert_type(hidden_q, jnp.float8_e4m3fn)
             .astype(act_dtype)
@@ -1445,7 +1450,7 @@ def fused_moe_func_fp8_dispatch(
         return_onehot_combine=True,
     )
     x = moe_gmm(
-        x if is_fp4_w4a16 else jax.lax.bitcast_convert_type(x, jnp.float8_e4m3fn),
+        x if use_fp4_bf16_lhs else jax.lax.bitcast_convert_type(x, jnp.float8_e4m3fn),
         w1,
         w1_scale,
         w1_bias,
@@ -1467,6 +1472,6 @@ def fused_moe_func_fp8_dispatch(
         sorted_indices=sorted_indices,
         onehot_permute=onehot_permute,
         w_sorted=w_sorted,
-        lhs_scale=None if is_fp4_w4a16 else hidden_scale[token_indices_sorted],
+        lhs_scale=None if use_fp4_bf16_lhs else hidden_scale[token_indices_sorted],
     )
     return x[:orig_num_tokens, :hidden_size]

@@ -388,6 +388,9 @@ class DeepseekV4MoE(nn.Module):
                     routed_scaling_factor=float(routed.routed_scaling_factor),
                 )
                 local_topk_w = w_f32.to(x_local.dtype)
+                local_topk_ids = moe_routing.maybe_modulo_remap_topk_ids(
+                    local_topk_ids, routed
+                )
             else:
                 if self.gate.tid2eid is None:
                     local_gate_out = self.gate(x_local)
@@ -441,6 +444,9 @@ class DeepseekV4MoE(nn.Module):
                         routed_scaling_factor=float(routed.routed_scaling_factor),
                     )
                     local_topk_w = w_f32.to(x_local.dtype)
+                    local_topk_ids = moe_routing.maybe_modulo_remap_topk_ids(
+                        local_topk_ids, routed
+                    )
                 else:
                     local_gate_out = self.gate(x_local)
                     local_logits = (
