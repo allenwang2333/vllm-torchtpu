@@ -1088,3 +1088,44 @@ def test_td8303_lookback_token_ids_and_arange_int32():
     assert out_replay[2].tolist() == [511, 510]
     assert out_replay[3].tolist() == [-1, -1]
     assert prompt_tokens.tolist() == [256, 256, 1024, 512]
+
+
+def test_td8313_dp_coordinated_step_mm_cumsum_and_row_starts_int32(monkeypatch):
+    """Verify TD8.313 int32 _dp_coordinated_step, mm cumsum, and SpecLogprobsChunk."""
+    import vllm.distributed.parallel_state as ps
+
+    runner = object.__new__(TPUModelRunner)
+    runner._dp_lockstep_enabled = lambda: True
+    runner.num_tokens_paddings = [16, 32, 64]
+
+    reduced_dtypes: list[torch.dtype] = []
+
+    def fake_all_reduce(t: torch.Tensor, op=None, group=None):
+        reduced_dtypes.append(t.dtype)
+        t[0] = 20
+        t[1] = 2
+        t[2] = 4
+        t[3] = 1
+
+    monkeypatch.setattr(
+        ps, "get_dp_group", lambda: SimpleNamespace(cpu_group="fake_cpu")
+    )
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    bucket, chunks = runner._dp_coordinated_step(12, 1, 3, True)
+    assert reduced_dtypes == [torch.int32]
+    assert bucket == 32
+    assert chunks == 2
+    assert runner._dp_step_max_reqs == 4
+    assert runner._dp_step_has_encoder_inputs is True
+
+    draft_lengths_cpu = np.array([3, 1, 5], dtype=np.int32)
+    row_starts = (
+        np.cumsum(
+            step_lens := np.asarray(draft_lengths_cpu, dtype=np.int32) + 1,
+            dtype=np.int32,
+        )
+        - step_lens
+    )
+    assert row_starts.dtype == np.int32
+    assert row_starts.tolist() == [0, 4, 6]

@@ -4055,7 +4055,7 @@ class TPUModelRunner(GPUModelRunner):
                 int(local_num_reqs),
                 int(has_encoder_inputs),
             ],
-            dtype=torch.int64,
+            dtype=torch.int32,
             device="cpu",
         )
         torch.distributed.all_reduce(
@@ -4263,14 +4263,19 @@ class TPUModelRunner(GPUModelRunner):
                 ],
                 dtype=np.int32,
             )
-            mm_tok_cumsum = np.concatenate([[0], np.cumsum(req_tok)])
+            mm_tok_cumsum = np.concatenate(
+                (np.zeros(1, dtype=np.int32), np.cumsum(req_tok, dtype=np.int32))
+            )
             # Per-token MM offsets on the host so the chunk loop can slice
             # mm_embeds without any device syncs -- mirrors the GPU runner,
             # which passes the full mask to embed_input_ids and lets
             # masked_scatter place the embeds (no manual counting).
             if mm_embeds_flat is not None:
                 mm_cumsum_np = np.concatenate(
-                    [[0], np.cumsum(is_mm_embed_full.cpu().numpy())]
+                    (
+                        np.zeros(1, dtype=np.int32),
+                        np.cumsum(is_mm_embed_full.cpu().numpy(), dtype=np.int32),
+                    )
                 )
 
         start_index = 0
@@ -5004,14 +5009,14 @@ class TPUModelRunner(GPUModelRunner):
                         spec_logprobs_chunks.append(
                             SpecLogprobsChunk(
                                 tensors=self.gather_logprobs(logits, row_tokens),
-                                row_starts=np.concatenate(
-                                    (
-                                        np.zeros(1, dtype=np.int32),
-                                        np.cumsum(
-                                            md.draft_lengths_cpu + 1, dtype=np.int32
-                                        )[:-1],
+                                row_starts=np.cumsum(
+                                    step_lens := np.asarray(
+                                        md.draft_lengths_cpu, dtype=np.int32
                                     )
-                                ),
+                                    + 1,
+                                    dtype=np.int32,
+                                )
+                                - step_lens,
                             )
                         )
                 else:
