@@ -272,6 +272,23 @@ class DSparkProposer(DFlashProposer):
             best_id = torch.where(better, ids[r], best_id)
         return best_id.to(torch.int32)
 
+    @staticmethod
+    def _slot_major_hidden(
+        valid_hidden: torch.Tensor,
+        padded_num_reqs: int,
+        block_size: int,
+        sample_start: int,
+    ) -> torch.Tensor:
+        req_bases = (
+            torch.arange(padded_num_reqs, dtype=torch.int32, device=valid_hidden.device)
+            * block_size
+        )
+        slot_offsets = torch.arange(
+            sample_start, block_size, dtype=torch.int32, device=valid_hidden.device
+        )
+        slot_order = (slot_offsets[:, None] + req_bases[None, :]).reshape(-1)
+        return valid_hidden.index_select(0, slot_order)
+
     def _sample_markov_sharded(
         self,
         valid_hidden: torch.Tensor,
@@ -284,20 +301,10 @@ class DSparkProposer(DFlashProposer):
         padded_num_reqs = ids_3d.shape[0]
         tp_size = self._sharded_markov_tp
         num_sampled_slots = block_size - sample_start
-        hidden_3d = valid_hidden.view(
-            padded_num_reqs, block_size, valid_hidden.shape[-1]
-        )
-        if sample_start > 0:
-            hidden_3d = hidden_3d[:, sample_start:]
-        slot_major_hidden = (
-            hidden_3d.transpose(0, 1)
-            .contiguous()
-            .view(padded_num_reqs * num_sampled_slots, valid_hidden.shape[-1])
+        slot_major_hidden = self._slot_major_hidden(
+            valid_hidden, padded_num_reqs, block_size, sample_start
         )
         logits = self.draft_model.compute_draft_logits_local(slot_major_hidden)
-        logits_slot_major = logits.view(
-            num_sampled_slots, padded_num_reqs, logits.shape[-1]
-        )
         mask = self._vocab_shard_mask
 
         prev = ids_3d[:, 0]
@@ -306,7 +313,7 @@ class DSparkProposer(DFlashProposer):
             # The padding mask is added per [B, W] slot, in the same order as
             # before ((logits + mask) + bias), instead of materializing a
             # masked copy of the whole [K * B, W] logits.
-            slot_logits = logits_slot_major[i]
+            slot_logits = logits[i * padded_num_reqs : (i + 1) * padded_num_reqs]
             if mask is not None:
                 slot_logits = slot_logits + mask
             scores = slot_logits + self._markov_bias_local(prev)
@@ -329,20 +336,17 @@ class DSparkProposer(DFlashProposer):
         assert self.draft_model is not None
         padded_num_reqs = ids_3d.shape[0]
         num_sampled_slots = block_size - sample_start
-        num_sampled_tokens = padded_num_reqs * num_sampled_slots
         # Draft-vocab logits for every sampled slot; the Markov bias is added in
         # draft space and ids are remapped to target vocab after argmax.
         logits = self.draft_model.compute_draft_logits(slot_major_hidden)
-        logits_slot_major = logits[:num_sampled_tokens].view(
-            num_sampled_slots, padded_num_reqs, logits.shape[-1]
-        )
 
         prev = ids_3d[:, 0]
         draft_tokens = []
         for i in range(num_sampled_slots):
+            slot_logits = logits[i * padded_num_reqs : (i + 1) * padded_num_reqs]
             bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
             step = self.draft_model.map_draft_to_target(
-                (logits_slot_major[i] + bias).argmax(dim=-1).to(torch.int32)
+                (slot_logits + bias).argmax(dim=-1).to(torch.int32)
             )
             draft_tokens.append(step)
             prev = step
@@ -374,32 +378,23 @@ class DSparkProposer(DFlashProposer):
 
         padded_num_reqs = hidden.shape[0] // block_size
         num_valid_tokens = padded_num_reqs * block_size
+        valid_hidden = hidden[:num_valid_tokens]
         ids_3d = input_ids[:num_valid_tokens].view(padded_num_reqs, block_size)
         sample_start = 0 if self.sample_from_anchor else 1
         if self._sharded_markov_tp > 1:
-            valid_hidden = hidden[:num_valid_tokens]
             draft_tokens = self._sample_markov_sharded(
                 valid_hidden, ids_3d, block_size, sample_start
             )
         else:
-            # Slice to the sampled slots [padded_num_reqs, num_sampled_slots, H]
-            # and transpose to [num_sampled_slots, padded_num_reqs, H] before
-            # compute_draft_logits so slot 0 is not projected when
+            # Gather sampled slots into 2D slot-major [num_sampled_slots * B, H]
+            # before compute_draft_logits so slot 0 is not projected when
             # sample_start > 0 and each Markov step indexes a contiguous
             # [padded_num_reqs, vocab] slice, preserving 8-row alignment when
             # the input batch was padded.
-            num_sampled_slots = block_size - sample_start
-            num_sampled_tokens = padded_num_reqs * num_sampled_slots
-            hidden_3d = hidden[:num_valid_tokens].view(
-                padded_num_reqs, block_size, hidden.shape[-1]
+            slot_major_hidden = self._slot_major_hidden(
+                valid_hidden, padded_num_reqs, block_size, sample_start
             )
-            if sample_start > 0:
-                hidden_3d = hidden_3d[:, sample_start:]
-            slot_major_hidden = (
-                hidden_3d.transpose(0, 1)
-                .contiguous()
-                .view(num_sampled_tokens, hidden.shape[-1])
-            )
+            num_sampled_tokens = slot_major_hidden.shape[0]
             pad_tokens = (
                 (-num_sampled_tokens) % 8
                 if sample_start > 0 and hidden.shape[0] % 8 == 0
@@ -413,3 +408,6 @@ class DSparkProposer(DFlashProposer):
         draft_tokens_chunk = torch.stack(draft_tokens, dim=1)
 
         return draft_tokens_chunk, hidden
+
+
+_slot_major_hidden = DSparkProposer._slot_major_hidden

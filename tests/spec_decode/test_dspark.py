@@ -905,3 +905,66 @@ def test_td8262_int32_markov_and_dflash_draft_tokens(monkeypatch):
     dflash_tokens, _ = dflash_fn(p, input_ids, positions, K)
     assert dflash_tokens.dtype == torch.int32
     assert dflash_tokens.shape == (num_reqs, K - 1)
+
+
+@pytest.mark.parametrize("sample_start", [0, 1])
+def test_td8265_2d_slot_major_hidden_and_logits_slice(sample_start: int):
+    """TD8.265: Verify 2D _slot_major_hidden and DFlash 2D draft_idx gather match
+    the 3D slice/transpose reference without forming 3D intermediate views."""
+    import torch._dynamo
+
+    from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+    from vllm_torchtpu.spec_decode.dspark import _slot_major_hidden
+
+    padded_num_reqs, block_size, hidden_size, vocab = 5, 5, 12, 20
+    valid_hidden = torch.arange(
+        padded_num_reqs * block_size * hidden_size, dtype=torch.float32
+    ).reshape(padded_num_reqs * block_size, hidden_size)
+
+    got = _slot_major_hidden(valid_hidden, padded_num_reqs, block_size, sample_start)
+    ref_3d = valid_hidden.view(padded_num_reqs, block_size, hidden_size)[
+        :, sample_start:
+    ]
+    ref = ref_3d.transpose(0, 1).contiguous().view(-1, hidden_size)
+    assert torch.equal(got, ref)
+    assert torch.equal(
+        DSparkProposer._slot_major_hidden(
+            valid_hidden, padded_num_reqs, block_size, sample_start
+        ),
+        ref,
+    )
+
+    # Verify DFlashProposer._dflash_forward_and_sample 2D draft_hidden gather
+    seen_draft_hidden: list[torch.Tensor] = []
+    lm_w = torch.randn(vocab, hidden_size)
+
+    class _DFlashDraft:
+        def model(self, input_ids, positions):
+            del input_ids, positions
+            return valid_hidden
+
+        def compute_logits(self, dh):
+            seen_draft_hidden.append(dh)
+            return dh @ lm_w.t()
+
+    p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
+    p.draft_model = _DFlashDraft()
+    dflash_fn = torch._dynamo.eval_frame.innermost_fn(
+        DFlashProposer._dflash_forward_and_sample
+    )
+    ids = torch.zeros(padded_num_reqs * block_size, dtype=torch.int32)
+    pos = torch.arange(padded_num_reqs * block_size, dtype=torch.int32)
+    out_tokens, _ = dflash_fn(p, ids, pos, block_size)
+
+    ref_draft_hidden = valid_hidden.view(padded_num_reqs, block_size, hidden_size)[
+        :, 1:, :
+    ].reshape(-1, hidden_size)
+    assert len(seen_draft_hidden) == 1
+    assert torch.equal(seen_draft_hidden[0], ref_draft_hidden)
+    ref_tokens = (
+        (ref_draft_hidden @ lm_w.t())
+        .view(padded_num_reqs, block_size - 1, vocab)
+        .argmax(dim=-1)
+        .to(torch.int32)
+    )
+    assert torch.equal(out_tokens, ref_tokens)
