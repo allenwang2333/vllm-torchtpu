@@ -1590,13 +1590,21 @@ class TPUModelRunner(GPUModelRunner):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         req_ids = self.input_batch.req_ids
         # 0: 1-token decode, 1: speculative verify window, 2: prefill/mixed.
-        segments = [
-            0
-            if num_scheduled_tokens[req_id] == 1
-            else (1 if req_id in spec_decode_tokens else 2)
-            for req_id in req_ids[:num_reqs]
-            if req_id is not None
-        ]
+        segments = (
+            [1] * num_reqs
+            if (fast_spec := getattr(self, "_fast_uniform_spec_k", None)) is not None
+            and len(fast_spec) > 3
+            and fast_spec[3]
+            and fast_spec[0] is spec_decode_tokens
+            and fast_spec[1] == req_ids[:num_reqs]
+            else [
+                0
+                if num_scheduled_tokens[req_id] == 1
+                else (1 if req_id in spec_decode_tokens else 2)
+                for req_id in req_ids[:num_reqs]
+                if req_id is not None
+            ]
+        )
 
         def partition(start: int, end: int, bound: int) -> int:
             """Two-pointer partition of [start, end]: requests with
@@ -2921,7 +2929,12 @@ class TPUModelRunner(GPUModelRunner):
                 # Every req_ids entry was just verified to draft exactly k
                 # tokens; `_prepare_inputs` reuses this instead of re-reading
                 # the n_reqs lengths.
-                self._fast_uniform_spec_k = (scheduled_spec_tokens, req_ids, k)
+                self._fast_uniform_spec_k = (
+                    scheduled_spec_tokens,
+                    req_ids,
+                    k,
+                    set(scheduler_output.num_scheduled_tokens.values()) == {1 + k},
+                )
             else:
                 update_spec = input_batch.update_req_spec_token_ids
                 for req_state in req_states:
@@ -3434,9 +3447,18 @@ class TPUModelRunner(GPUModelRunner):
         most_model_len = self.most_model_len
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         req_ids = cast(list[str], self.input_batch.req_ids)
-        num_scheduled_tokens_per_req = [
-            num_scheduled_tokens[req_id] for req_id in req_ids[start_index:num_reqs]
-        ]
+        num_scheduled_tokens_per_req = (
+            [1 + fast_spec[2]] * (num_reqs - start_index)
+            if start_index == 0
+            and (fast_spec := getattr(self, "_fast_uniform_spec_k", None)) is not None
+            and len(fast_spec) > 3
+            and fast_spec[3]
+            and fast_spec[0] is scheduler_output.scheduled_spec_decode_tokens
+            and fast_spec[1] == req_ids[:num_reqs]
+            else [
+                num_scheduled_tokens[req_id] for req_id in req_ids[start_index:num_reqs]
+            ]
+        )
         first_sched = num_scheduled_tokens_per_req[0]
         # Steady-state decode / spec verify: every request schedules the same
         # count, so max == first and the array is a cached constant.
@@ -4191,9 +4213,18 @@ class TPUModelRunner(GPUModelRunner):
         while start_index < num_reqs:
             use_max_model_len = most_model_len is None or (
                 total_tokens > most_model_len
-                and any(
-                    num_scheduled_tokens[req_ids[i]] > most_model_len
-                    for i in range(start_index, num_reqs)
+                and (
+                    (1 + fast_spec[2] > most_model_len)
+                    if (fast_spec := getattr(self, "_fast_uniform_spec_k", None))
+                    is not None
+                    and len(fast_spec) > 3
+                    and fast_spec[3]
+                    and fast_spec[0] is scheduler_output.scheduled_spec_decode_tokens
+                    and fast_spec[1] == req_ids[:num_reqs]
+                    else any(
+                        num_scheduled_tokens[req_ids[i]] > most_model_len
+                        for i in range(start_index, num_reqs)
+                    )
                 )
             )
             if use_max_model_len:

@@ -383,3 +383,99 @@ def test_td8394_modify_prev_results_full_accept_and_lookback_short_circuit(monke
     assert r_part.input_batch.token_ids_cpu[0, 4:7].tolist() == [10, 11, 12]
     assert r_part.input_batch.token_ids_cpu[1, 6:8].tolist() == [20, 21]
     assert r_part.input_batch.token_ids_cpu[1, 8] == 0
+
+
+def test_td8395_fast_uniform_spec_schedule_across_reorder_chunks_and_prepare(
+    monkeypatch,
+):
+    """TD8.395: _try_fast_update_states records whether all scheduled_tokens equal
+    1 + k in _fast_uniform_spec_k[3], and _reorder_batch_for_rpa, _count_input_chunks,
+    and _prepare_inputs reuse it to skip per-request num_scheduled_tokens lookups."""
+    monkeypatch.setattr(
+        tr_mod.mla_dispatch, "maybe_order_prefills_by_kv_len", lambda *a: None
+    )
+    runner = object.__new__(TPUModelRunner)
+    runner.requests = {
+        "r0": SimpleNamespace(
+            num_computed_tokens=0,
+            prev_num_draft_len=0,
+            output_token_ids=[1, 2],
+            block_ids=[[]],
+        ),
+        "r1": SimpleNamespace(
+            num_computed_tokens=0,
+            prev_num_draft_len=0,
+            output_token_ids=[3, 4],
+            block_ids=[[]],
+        ),
+    }
+    runner.input_batch = SimpleNamespace(
+        num_reqs=2,
+        req_ids=["r0", "r1"],
+        num_computed_tokens_cpu=np.zeros(2, dtype=np.int32),
+        num_prompt_tokens=np.array([4, 4], dtype=np.int32),
+        num_tokens_no_spec=np.array([6, 6], dtype=np.int32),
+        token_ids_cpu=np.zeros((2, 16), dtype=np.int32),
+        is_token_ids=np.zeros((2, 16), dtype=bool),
+        spec_token_ids=[[], []],
+        block_table=SimpleNamespace(append_row=lambda *a: None),
+        refresh_metadata=lambda: None,
+        swap_states=lambda i, j: None,
+    )
+    runner.reorder_batch_threshold = 1
+    runner.most_model_len = 4
+    runner.num_reqs_max_model_len = 1
+    runner.num_reqs_most_model_len = 2
+    runner._wait_input_staging_fence = lambda: None
+
+    spec_tokens = {"r0": [101, 102], "r1": [201, 202]}
+    sched_out = SimpleNamespace(
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["r0", "r1"],
+            num_computed_tokens=[6, 6],
+            num_output_tokens=[2, 2],
+            new_block_ids=[None, None],
+        ),
+        scheduled_spec_decode_tokens=spec_tokens,
+        num_scheduled_tokens={"r0": 3, "r1": 3},
+        total_num_scheduled_tokens=6,
+    )
+    assert TPUModelRunner._try_fast_update_states(runner, sched_out) is True
+    assert runner._fast_uniform_spec_k == (spec_tokens, ["r0", "r1"], 2, True)
+
+    # Poison num_scheduled_tokens to prove all 3 consumers skip dict indexing
+    sched_out.num_scheduled_tokens = None
+    assert TPUModelRunner._reorder_batch_for_rpa(runner, sched_out) == (0, 2)
+    assert TPUModelRunner._count_input_chunks(runner, sched_out) == (1, 2)
+    runner.most_model_len = 2
+    assert TPUModelRunner._count_input_chunks(runner, sched_out) == (2, 1)
+    runner.most_model_len = 4
+
+    seen_totals = []
+
+    class _StopPlanner(Exception):
+        pass
+
+    def _stop_reserve(_self, total_tokens):
+        seen_totals.append(total_tokens)
+        raise _StopPlanner
+
+    monkeypatch.setattr(
+        tr_mod,
+        "_get_sequence_layout_planner_for_runner",
+        lambda _self: SimpleNamespace(reserve_host_token_capacity=_stop_reserve),
+    )
+    with pytest.raises(_StopPlanner):
+        TPUModelRunner._prepare_inputs(runner, sched_out, 0, 0)
+    assert seen_totals == [6]
+
+    # Non-uniform scheduled tokens sets fast_spec[3] = False and falls back cleanly
+    sched_out.num_scheduled_tokens = {"r0": 3, "r1": 2}
+    sched_out.total_num_scheduled_tokens = 5
+    assert TPUModelRunner._try_fast_update_states(runner, sched_out) is True
+    assert runner._fast_uniform_spec_k == (spec_tokens, ["r0", "r1"], 2, False)
+    assert TPUModelRunner._reorder_batch_for_rpa(runner, sched_out) == (0, 2)
+    assert TPUModelRunner._count_input_chunks(runner, sched_out) == (1, 2)
+    with pytest.raises(_StopPlanner):
+        TPUModelRunner._prepare_inputs(runner, sched_out, 0, 0)
+    assert seen_totals == [6, 5]
