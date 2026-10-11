@@ -457,7 +457,7 @@ class PagedCacheRows:
         # ``kv_cache.device``; eager KV_SHARD returns this view, not a tensor.
         return self.raw.device
 
-    def row_indices(self, slots):
+    def row_indices(self, slots, valid=None):
         if not self.sharded and self.page_stride == self.shape[1]:
             return slots if self.row_offset == 0 else self.row_offset + slots
         blocks = slots // self.shape[1]
@@ -479,6 +479,8 @@ class PagedCacheRows:
             local_blocks = torch.where(
                 in_rep, blocks, self.replicated_blocks + sharded_local
             )
+        if valid is not None:
+            owned = owned & valid
         safe_blocks = local_blocks.clamp(min=0, max=max(self.shape[0] - 1, 0))
         base = safe_blocks * self.page_stride + rem
         indices = base if self.row_offset == 0 else self.row_offset + base
@@ -576,32 +578,35 @@ class PagedCacheRows:
             )
         return gathered.reshape(*records.shape, *self.shape[2:])
 
-    def write(self, slots, values, after=None, *, records=None):
+    def write(self, slots, values, after=None, *, records=None, valid=None):
         """``after`` (optional) must be computed before the in-place write.
 
         ``records`` (optional): the pool rows of ``slots`` (``-1`` where
         invalid), already mapped by the caller (e.g. once per stage via
         ``_fast_swa_row_slots``); skips the per-call ``row_indices`` mapping.
+        ``valid`` (optional): boolean validity mask for ``slots`` when
+        ``records`` is None; avoids a separate pre-mask of ``slots``.
         """
         if records is None:
             if self.sharded:
-                records = self.row_indices(slots)
+                records = self.row_indices(slots, valid=valid)
             elif self.page_stride == self.shape[1]:
+                if valid is not None:
+                    slots = slots.masked_fill(~valid, -1)
                 records = (
                     slots.clamp(min=-1)
                     if self.row_offset == 0
                     else torch.where(slots >= 0, self.row_offset + slots, -1)
                 )
             else:
-                records = self.row_indices(slots.clamp(min=0)).masked_fill(
-                    slots < 0, -1
-                )
+                invalid = slots < 0 if valid is None else (slots < 0) | ~valid
+                records = self.row_indices(slots.clamp(min=0)).masked_fill(invalid, -1)
         if self.dtype == torch.uint8:
             self._write_fp8(records, values)
             return
         if values.dtype != self.dtype:
             values = values.to(self.dtype)
-        values = values.reshape(slots.shape[0], self.elem_count)
+        values = values.reshape(values.shape[0], self.elem_count)
         if self.raw.device.type == "cpu":
             pool = self.raw.view(torch.int8).reshape(-1, self.row_bytes)
             valid = (records >= 0) & (
@@ -1198,13 +1203,15 @@ def write_cache(cache, slots, values, valid, after=None, *, records=None):
     cache (``-1`` where invalid); other caches ignore it.
     """
     count = values.shape[0]
-    slots, valid = slots[:count], valid[:count]
-    slots = slots.masked_fill(~valid, -1)
+    valid = valid[:count]
     if isinstance(cache, PagedCacheRows):
         if records is not None:
             records = records[:count].masked_fill(~valid, -1)
-        cache.write(slots, values, after, records=records)
+        else:
+            slots = slots[:count]
+        cache.write(slots, values, after, records=records, valid=valid)
         return
+    slots = slots[:count].masked_fill(~valid, -1)
     if cache.device.type == "cpu":
         selected = slots[valid].long()
         if cache.ndim == values.ndim:

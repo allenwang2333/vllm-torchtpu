@@ -473,3 +473,76 @@ def test_td8243_dspark_context_kv_int32_slots_match_int64(monkeypatch, geometry)
             cache, blocks64, positions % rows, ~valid | (slots64 < 0)
         )
         assert torch.equal(records, v2_attn._offset_records(cache, *write64))
+
+
+def test_td8242_write_cache_and_paged_write_zero_redundant_mask():
+    """Verify write_cache skips slots slicing/masking when records is provided
+    and avoids double masked_fill when records is None across all geometries.
+    """
+    rows = 4
+    # Include positive slots where valid is False (e.g. replayed prefix or
+    # non-publish rows) as well as negative slots where valid is True/False.
+    slots = torch.tensor([4, 9, -1, 13, 21, 5, 0, 18], dtype=torch.int32)
+    valid = torch.tensor(
+        [True, False, True, True, False, True, False, True], dtype=torch.bool
+    )
+    values = (torch.arange(8 * WIDTH, dtype=torch.float32).reshape(8, WIDTH) + 1).to(
+        torch.bfloat16
+    )
+
+    class _UntouchedSlots:
+        def __getitem__(self, item):
+            raise AssertionError("slots must not be sliced when records is provided")
+
+        def masked_fill(self, *args, **kwargs):
+            raise AssertionError("slots must not be masked when records is provided")
+
+    for geometry in sorted(GEOMETRIES):
+        ref_cache = _real_cache(rows, geometry)
+        got_records_cache = _real_cache(rows, geometry)
+        got_valid_cache = _real_cache(rows, geometry)
+
+        # Reference: pre-mask slots before calling PagedCacheRows.write directly
+        masked_slots = slots.masked_fill(~valid, -1)
+        ref_cache.write(masked_slots, values)
+
+        # 1. records is not None: slots must not be touched at all
+        pre_records = got_records_cache.row_indices(slots.clamp(min=0)).masked_fill(
+            slots < 0, -1
+        )
+        write_cache(
+            got_records_cache,
+            _UntouchedSlots(),
+            values,
+            valid,
+            records=pre_records,
+        )
+        assert torch.equal(got_records_cache.raw, ref_cache.raw)
+
+        # 2. records is None: write_cache passes valid to PagedCacheRows.write
+        # without pre-masking slots in write_cache
+        write_cache(got_valid_cache, slots, values, valid)
+        assert torch.equal(got_valid_cache.raw, ref_cache.raw)
+
+    # Also test pure-sharded (replicated_blocks == 0) with block_offset == 0 and > 0
+    for block_offset in (0, 2):
+        raw_ref = torch.zeros(BLOCKS * rows, 128, dtype=torch.int32)
+        raw_got = torch.zeros(BLOCKS * rows, 128, dtype=torch.int32)
+        layout = (
+            (BLOCKS, rows, WIDTH),
+            torch.bfloat16,
+            rows * 512,
+            0,
+            block_offset,
+            True,
+            0,
+        )
+        c_ref = PagedCacheRows(raw_ref, layout)
+        c_got = PagedCacheRows(raw_got, layout)
+        c_ref.write(slots.masked_fill(~valid, -1), values)
+        write_cache(c_got, slots, values, valid)
+        assert torch.equal(c_got.raw, c_ref.raw)
+        assert torch.equal(
+            c_got.row_indices(slots, valid=valid),
+            c_ref.row_indices(slots.masked_fill(~valid, -1)),
+        )
