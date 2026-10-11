@@ -745,10 +745,18 @@ class KVCacheManager:
             if isinstance(first_attn_module, Attention)
             else 1
         )
-        attention_backend = cast(
-            "type[_TpuKVCacheBackend] | None",
-            TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
-        )
+        # An MLA layer's page is the MLA backend's, the formula its spec and
+        # its allocation use. `_find_non_ssm_backend` returns the first
+        # non-SSM layer's backend, which on a sparse-MLA model is an indexer
+        # cache's (they register before their `mla_attn`), and an indexer
+        # backend need not size an MLA page.
+        if isinstance(first_attn_module, MLAAttention):
+            attention_backend = PallasMLAttentionBackend
+        else:
+            attention_backend = cast(
+                "type[_TpuKVCacheBackend] | None",
+                TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
+            )
         assert attention_backend is not None
         attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
             self.runner.block_size,
