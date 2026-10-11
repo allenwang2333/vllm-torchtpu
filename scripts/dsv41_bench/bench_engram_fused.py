@@ -141,8 +141,17 @@ def main() -> None:
                 with (out / "benchmark/metrics.jsonl").open("a") as file:
                     file.write(json.dumps(record) + "\n")
                 if not args.interpret:
-                    with jax.profiler.trace(
-                        str(out / f"profiling/xprof/{variant}-{tokens}")
+                    from torch_tpu._internal import profiler
+
+                    # Use the wheel's profiler ABI, as the serving harness does.
+                    with profiler.profile(
+                        activities=[
+                            profiler.ProfilerActivity.CPU,
+                            profiler.ProfilerActivity.TPU,
+                        ],
+                        on_trace_ready=profiler.xprof_trace_handler(
+                            dir_name=str(out / f"profiling/xprof/{variant}-{tokens}")
+                        ),
                     ):
                         for _ in range(10):
                             executable(*inputs).block_until_ready()
