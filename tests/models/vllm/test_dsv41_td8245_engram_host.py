@@ -105,19 +105,22 @@ def test_request_rows_memo_hit_and_invalidation():
     tables = ce._HostHashTables.from_state(_state())
     rows = np.arange(12)
     qsl = np.array([0, 6, 12], dtype=np.int32)
-    reqs, starts = tables.request_rows(qsl, rows, 12, 2)
+    reqs, starts, base = tables.request_rows(qsl, rows, 12, 2, 3)
     assert reqs.tolist() == [0] * 6 + [1] * 6
     assert starts.tolist() == [0] * 6 + [6] * 6
+    assert base.tolist() == [[0] * 6 + [4] * 6]  # TD8.248: req * (depth + 1)
     # Same layout (a different array object): cache hit, same arrays.
-    again = tables.request_rows(qsl.copy(), rows, 12, 2)
-    assert again[0] is reqs and again[1] is starts
-    # A changed layout, active count or token count recomputes.
-    moved = tables.request_rows(np.array([0, 4, 12], np.int32), rows, 12, 2)
+    again = tables.request_rows(qsl.copy(), rows, 12, 2, 3)
+    assert again[0] is reqs and again[1] is starts and again[2] is base
+    # A changed layout, active count, token count or depth recomputes.
+    moved = tables.request_rows(np.array([0, 4, 12], np.int32), rows, 12, 2, 3)
     assert moved[0].tolist() == [0] * 4 + [1] * 8
-    clamped = tables.request_rows(np.array([0, 4, 12], np.int32), rows, 12, 1)
+    clamped = tables.request_rows(np.array([0, 4, 12], np.int32), rows, 12, 1, 3)
     assert clamped[0].tolist() == [0] * 12
-    shorter = tables.request_rows(np.array([0, 4, 8], np.int32), rows[:8], 8, 2)
+    shorter = tables.request_rows(np.array([0, 4, 8], np.int32), rows[:8], 8, 2, 3)
     assert shorter[1].tolist() == [0] * 4 + [4] * 4
+    deeper = tables.request_rows(np.array([0, 4, 8], np.int32), rows[:8], 8, 2, 5)
+    assert deeper[2].tolist() == [[0] * 4 + [6] * 4]
 
 
 def test_window_table_is_reused_per_shape():
@@ -170,3 +173,28 @@ def test_gather_raw_reuses_storage_views_until_storage_changes():
     emb.gather_raw(indices, raw, scale)
     assert emb._raw_views[1] is scales
     assert torch.equal(scale[0], scales[[10, 20]])
+
+
+def test_td8248_work_buffers_are_reused_per_count():
+    tables = ce._HostHashTables.from_state(_state())
+    first = tables.work(12)
+    assert [b.shape for b in first] == [(4, 12)] * 5
+    assert [b.dtype for b in first] == [
+        np.dtype(np.int64),
+        np.dtype(np.bool_),
+        tables.token_map.dtype,
+        np.dtype(np.bool_),
+        np.dtype(np.bool_),
+    ]
+    assert tables.work(12) is first
+    assert tables.work(8)[0].shape == (4, 8)
+
+
+def test_td8248_select_local_heads_np_clamps_in_place():
+    emb, _ = _embedding(torch.zeros(100, 32, dtype=torch.uint8), torch.zeros(100, 2))
+    emb.part_n_hash_cols = 3  # one padded head (n_hash_cols - head_start = 4 > 3)
+    emb.head_start = 2
+    indices = np.array([[1, 2, 5, 150], [3, 4, -7, 99]], dtype=np.int32)
+    rows, valid = emb._select_local_heads_np(indices)
+    assert rows.tolist() == [[5, 99, 0], [0, 99, 0]]
+    assert valid.tolist() == [[True, False, False], [False, True, False]]

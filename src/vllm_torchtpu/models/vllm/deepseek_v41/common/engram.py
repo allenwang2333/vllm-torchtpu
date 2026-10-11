@@ -188,7 +188,9 @@ class NgramHashState(upstream.NgramHashState):
             lookback_dead_mask[:active_reqs, :depth], dtype=np.bool_
         )
         hashed, rows, padded, batch, terms = tables._ensure_scratch(count)
-        reqs, starts = tables.request_rows(qsl_np, rows, count, active_reqs)
+        _, starts, req_base = tables.request_rows(
+            qsl_np, rows, count, active_reqs, depth
+        )
         # Offset of each token from its request's first chunk position; the
         # n-gram source `shift` back is in the chunk iff shift <= offset.
         offset = pos_np - pos_np[starts]
@@ -210,16 +212,25 @@ class NgramHashState(upstream.NgramHashState):
         wt_cols[lb_dead_np] = upstream.DEAD_ID
         wt_cols[lb_np < 0] = pad_id
         window_table[:, depth] = pad_id
-        cols = shifts - (offset[None, :] + 1)
-        in_chunk = cols < 0
+        # The [ngram, T] steps below write into reused buffers (`work`): same
+        # values as `cols = shifts - (offset + 1)`, `np.where(in_chunk, batch,
+        # window)` and `np.where(blocked, pad_id, source)`, without a fresh
+        # array per step.
+        cols, in_chunk, source, blocked, scratch_mask = tables.work(count)
+        np.subtract(shifts, offset[None, :], out=cols)
+        cols -= 1
+        np.less(cols, 0, out=in_chunk)
         np.clip(cols, 0, depth, out=cols)
-        window = np.take(window_table.reshape(-1), reqs[None, :] * (depth + 1) + cols)
-        source = np.where(in_chunk, batch, window)
+        cols += req_base
+        np.take(window_table.reshape(-1), cols, out=source)
+        np.copyto(source, batch, where=in_chunk)
         # A dead or pre-sequence source blocks every longer n-gram.
-        blocked = (shifts > pos_np[None, :]) | (source == upstream.DEAD_ID)
+        np.greater(shifts, pos_np[None, :], out=blocked)
+        np.equal(source, upstream.DEAD_ID, out=scratch_mask)
+        blocked |= scratch_mask
         for shift in range(1, ngram):
             blocked[shift] |= blocked[shift - 1]
-        source = np.where(blocked, pad_id, source)
+        np.copyto(source, pad_id, where=blocked)
         np.multiply(tables.multipliers[:, :, None], source[None, :, :], out=terms)
         rolled = terms[:, 1:]
         np.bitwise_xor(terms[:, 0], rolled[:, 0], out=rolled[:, 0])
@@ -364,25 +375,52 @@ class _HostHashTables:
         return self._ensure_scratch(count)[0]
 
     def request_rows(
-        self, qsl_np: np.ndarray, rows: np.ndarray, count: int, active_reqs: int
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Each token row's request and that request's first chunk row.
+        self,
+        qsl_np: np.ndarray,
+        rows: np.ndarray,
+        count: int,
+        active_reqs: int,
+        depth: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Each token row's request, that request's first chunk row, and the
+        request's flat ``window_table`` row base ``[1, T]`` (``req * (depth +
+        1)``).
 
         Memoized on the step layout: steady decode repeats the same
         ``query_start_loc`` (e.g. ``0, 6, ..., 1152``), so the per-row
         ``searchsorted`` runs only when it changes. Callers only read them.
         """
-        key = (count, active_reqs, qsl_np.dtype.str, qsl_np.tobytes())
+        key = (count, active_reqs, depth, qsl_np.dtype.str, qsl_np.tobytes())
         cached = self._memo.get("request_rows")
         if cached is not None and cached[0] == key:
-            return cached[1], cached[2]
+            return cached[1], cached[2], cached[3]
         reqs = np.minimum(
             np.searchsorted(qsl_np[1:], rows, side="right"),
             active_reqs - 1,
         )
         starts = np.minimum(qsl_np[reqs], count - 1)
-        self._memo["request_rows"] = (key, reqs, starts)
-        return reqs, starts
+        req_base = reqs[None, :] * (depth + 1)
+        self._memo["request_rows"] = (key, reqs, starts, req_base)
+        return reqs, starts, req_base
+
+    def work(
+        self, count: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Reused ``[ngram, count]`` buffers for ``hash_on_host``'s source
+        selection: (cols int64, in_chunk bool, source token-map dtype,
+        blocked bool, scratch bool). Overwritten on every call."""
+        bufs = self._memo.get("work")
+        if bufs is None or bufs[0].shape[1] != count:
+            shape = (self.multipliers.shape[1], count)
+            bufs = (
+                np.empty(shape, dtype=np.int64),
+                np.empty(shape, dtype=np.bool_),
+                np.empty(shape, dtype=self.token_map.dtype),
+                np.empty(shape, dtype=np.bool_),
+                np.empty(shape, dtype=np.bool_),
+            )
+            self._memo["work"] = bufs
+        return bufs
 
     def window_table(self, active_reqs: int, depth: int) -> np.ndarray:
         """``[active_reqs, depth + 1]`` lookback window buffer, reused.
@@ -587,7 +625,9 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         if pad:
             selected = np.pad(selected, ((0, 0), (0, pad)))
             valid = np.pad(valid, ((0, 0), (0, pad)))
-        rows = np.clip(selected, 0, self.part_num_embeddings - 1)
+        # `selected` is a fresh array (subtraction / pad) and `valid` was read
+        # from it above, so clamp it in place instead of allocating `rows`.
+        rows = np.clip(selected, 0, self.part_num_embeddings - 1, out=selected)
         return rows, valid
 
     def gather_raw(self, indices, raw_out, scale_out):
@@ -772,11 +812,13 @@ def _dp_gather_packed_rows(
         .reshape(dp_size, -1)[:, : staged_tokens * cols * blocks]
         .reshape(dp_size, staged_tokens, cols, blocks)[:, start : start + num_tokens]
     )
+    # `.contiguous()` like `_dp_gather_engram_rows`: with `cols == 1` the
+    # transposed reshape is a view, and so was the dequantized result.
     return dequant_fp8_rows(
         raw.transpose(0, 1).reshape(num_tokens, dp_size * cols, head_dim),
         scale.transpose(0, 1).reshape(num_tokens, dp_size * cols, blocks),
         block_size,
-    )
+    ).contiguous()
 
 
 def _embed_dp_size(engram: object) -> int:
