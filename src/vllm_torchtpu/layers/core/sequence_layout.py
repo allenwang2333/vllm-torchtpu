@@ -177,7 +177,7 @@ def _localize_token_tensor_and_gather_indices(
     """Pure tensor transform shared by all partial sequence layout plans."""
     source_indices = torch.as_tensor(
         local_packed_to_request,
-        dtype=torch.long,
+        dtype=torch.int32,
         device=request_major_token_tensor.device,
     )
     source_valid = source_indices.ge(0)
@@ -194,15 +194,11 @@ def _localize_token_tensor_and_gather_indices(
 
     request_to_packed_tensor = torch.as_tensor(
         request_to_packed,
-        dtype=torch.long,
+        dtype=torch.int32,
         device=request_major_gather_indices.device,
     )
     gather_dtype = request_major_gather_indices.dtype
-    request_gathers = (
-        request_major_gather_indices
-        if gather_dtype == torch.long
-        else request_major_gather_indices.to(torch.long)
-    )
+    request_gathers = request_major_gather_indices.int()
     gather_valid = request_gathers.ge(0)
     safe_request_gathers = request_gathers.clamp_min(0)
     packed_gathers = torch.index_select(

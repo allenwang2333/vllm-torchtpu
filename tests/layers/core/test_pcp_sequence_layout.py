@@ -1197,3 +1197,43 @@ def test_sequence_layout_and_pcp_remaining_branches(monkeypatch):
         padded_num_reqs=1,
     )
     assert plan_kv_shard.local_padded_num_tokens == 32
+
+
+def test_td8279_localize_token_tensor_and_gather_indices_int32_index_select(
+    monkeypatch,
+):
+    from vllm_torchtpu.layers.core.sequence_layout import (
+        _localize_token_tensor_and_gather_indices,
+    )
+
+    select_calls = []
+    orig_index_select = torch.index_select
+
+    def spy_index_select(t, dim, index):
+        select_calls.append((t.dtype, dim, index.dtype))
+        return orig_index_select(t, dim, index)
+
+    monkeypatch.setattr(torch, "index_select", spy_index_select)
+
+    tokens = torch.tensor([[10, 11], [20, 21], [30, 31], [40, 41]], dtype=torch.int32)
+    local_packed_to_req = np.array([2, 0, -1], dtype=np.int64)
+    req_to_packed = np.array([1, 3, 0, 2], dtype=np.int64)
+
+    for g_dtype in (torch.int32, torch.int64):
+        select_calls.clear()
+        gathers = torch.tensor([0, 2, -1, 1], dtype=g_dtype)
+        loc_tok, loc_gath = _localize_token_tensor_and_gather_indices(
+            tokens,
+            gathers,
+            local_packed_to_req,
+            req_to_packed,
+            local_start=0,
+            local_end=2,
+        )
+        assert loc_tok.tolist() == [[30, 31], [10, 11], [0, 0]]
+        assert loc_gath.dtype == g_dtype
+        assert loc_gath.tolist() == [1, 0, -1, -1]
+        assert select_calls == [
+            (torch.int32, 0, torch.int32),
+            (torch.int32, 0, torch.int32),
+        ]

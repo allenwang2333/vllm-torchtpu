@@ -965,10 +965,12 @@ class Eagle3Proposer:
             return (
                 self.draft_model.compute_logits(hidden).argmax(dim=-1).to(torch.int32)
             )
-        draft_id = self.draft_model.logits_processor(
-            self.draft_model.lm_head, hidden
-        ).argmax(dim=-1)
-        return (draft_id + d2t[draft_id]).to(torch.int32)
+        draft_id = (
+            self.draft_model.logits_processor(self.draft_model.lm_head, hidden)
+            .argmax(dim=-1)
+            .int()
+        )
+        return (draft_id + d2t.index_select(0, draft_id)).to(torch.int32)
 
     @_static_shape_args
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -984,15 +986,16 @@ class Eagle3Proposer:
         # indexing), these three gathers are eager ops the DEFER_AND_FUSE path
         # fuses with the step's seq_lens/positions arithmetic into a per-context
         # program. index_select is value-identical to hidden[indices].
+        idx = indices.int()
         pos_carry = (
-            torch.index_select(positions, 1, indices)
+            torch.index_select(positions, 1, idx)
             if positions.ndim == 2
-            else torch.index_select(positions, 0, indices)
+            else torch.index_select(positions, 0, idx)
         )
         return (
-            torch.index_select(hidden, 0, indices),
+            torch.index_select(hidden, 0, idx),
             pos_carry,
-            torch.index_select(last_hidden, 0, indices),
+            torch.index_select(last_hidden, 0, idx),
         )
 
     @_static_shape_args

@@ -1479,3 +1479,52 @@ def test_td8274_prepare_draft_inputs_async_1d_flat_int32_gather(monkeypatch):
             assert rej.tolist() == [1, 1, 0]
             assert gather.tolist() == [1, 3, 5, 0]
             assert ids.tolist() == [1, 8, 3, 9, 5, 13, 7, 7]
+
+
+def test_td8279_draft_propose_token_and_gather_carries_int32_index_select(monkeypatch):
+    select_calls = []
+    orig_index_select = torch.index_select
+    orig_tensor_index_select = torch.Tensor.index_select
+
+    def spy_torch_index_select(t, dim, index):
+        select_calls.append((t.ndim, dim, index.dtype))
+        return orig_index_select(t, dim, index)
+
+    def spy_tensor_index_select(self, dim, index):
+        select_calls.append((self.ndim, dim, index.dtype))
+        return orig_tensor_index_select(self, dim, index)
+
+    monkeypatch.setattr(torch, "index_select", spy_torch_index_select)
+    monkeypatch.setattr(torch.Tensor, "index_select", spy_tensor_index_select)
+
+    p = _proposer("eagle3")
+    _eager(p)
+    logits = torch.tensor([[0.1, 0.9, 0.2], [0.8, 0.1, 0.2]], dtype=torch.float32)
+    p.draft_model = SimpleNamespace(
+        draft_id_to_target_id=torch.tensor([10, 20, 30], dtype=torch.int32),
+        lm_head="head",
+        logits_processor=lambda _h, _x: logits,
+    )
+    select_calls.clear()
+    out_tok = p._draft_propose_token(torch.zeros((2, 4)))
+    assert out_tok.dtype == torch.int32
+    assert out_tok.tolist() == [21, 10]
+    assert select_calls == [(1, 0, torch.int32)]
+
+    hidden = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    last_hidden = (hidden + 100).clone()
+    pos_1d = torch.tensor([10, 20, 30, 40], dtype=torch.int32)
+    pos_2d = torch.arange(12, dtype=torch.int32).reshape(3, 4)
+    indices_i64 = torch.tensor([1, 3], dtype=torch.int64)
+
+    select_calls.clear()
+    h1, p1, lh1 = p._draft_gather_carries(hidden, pos_1d, last_hidden, indices_i64)
+    assert p1.tolist() == [20, 40]
+    assert torch.equal(h1, hidden[[1, 3]])
+    assert torch.equal(lh1, last_hidden[[1, 3]])
+    assert all(dt == torch.int32 for _, _, dt in select_calls)
+
+    select_calls.clear()
+    _, p2, _ = p._draft_gather_carries(hidden, pos_2d, last_hidden, indices_i64)
+    assert torch.equal(p2, pos_2d[:, [1, 3]])
+    assert all(dt == torch.int32 for _, _, dt in select_calls)
