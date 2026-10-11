@@ -871,6 +871,7 @@ def precompute_csa_union_and_gather(
         u_idx,
         num_valid_indices=u_idx.shape[0],
         top_k=u_chunk,
+        max_active_per_chunk=n_uniq if u_chunk == m_union else None,
     )
     return u_idx, c_bits, n_uniq, g_nope, g_rope
 
