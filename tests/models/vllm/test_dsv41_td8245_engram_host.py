@@ -311,3 +311,74 @@ def test_td8340_request_rows_array_equal_and_gather_bufs_reuse():
     assert torch.equal(raw_out[0, 1], weight[30])
     assert torch.equal(raw_out[1, 0], weight[40])
     assert torch.all(scale_out[1, 1:] == ce._INVALID_SCALE)
+
+
+def test_td8368_hash_on_host_all_valid_fast_path_and_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """TD8.368: Verify hash_on_host skips blocked mask construction, propagation,
+    and pad_id copyto when not dead_np.any(), not lb_dead_np.any(), and
+    pos_np.min() >= ngram - 1, while falling back cleanly on any invalid/pre-seq
+    history."""
+    state = _state(seed=68)
+    ids, pos, qsl, dead, lookback, lb_dead = _inputs(4, 6, seed=68, dead_frac=0.0)
+    pos = pos + 100  # Ensure all positions >= ngram - 1
+    lookback = lookback.clamp(min=0)
+    tables = (state.token_map, state.multipliers, state.primes, state.offsets)
+
+    def _ref(i_t, p_t, q_t, d_t, lb_t, lbd_t):
+        return state._hash(
+            tables,
+            i_t,
+            p_t,
+            q_t,
+            d_t,
+            lb_t,
+            lbd_t,
+            lambda past, reqs_col, window: torch.full_like(window, state.pad_id),
+        )
+
+    # 1) All-valid fast path: np.greater and np.equal must not be called
+    greater_calls = 0
+    equal_calls = 0
+    orig_greater = np.greater
+    orig_equal = np.equal
+
+    def spy_greater(*a, **kw):
+        nonlocal greater_calls
+        greater_calls += 1
+        return orig_greater(*a, **kw)
+
+    def spy_equal(*a, **kw):
+        nonlocal equal_calls
+        equal_calls += 1
+        return orig_equal(*a, **kw)
+
+    monkeypatch.setattr(ce.np, "greater", spy_greater)
+    monkeypatch.setattr(ce.np, "equal", spy_equal)
+
+    got_fast = state.hash_on_host(ids, pos, qsl, dead, lookback, lb_dead)
+    assert greater_calls == 0
+    assert equal_calls == 0
+    assert torch.equal(got_fast, _ref(ids, pos, qsl, dead, lookback, lb_dead))
+
+    # 2) Fallback when dead_np has a True element
+    dead_one = dead.clone()
+    dead_one[3] = True
+    got_dead = state.hash_on_host(ids, pos, qsl, dead_one, lookback, lb_dead)
+    assert greater_calls == 1 and equal_calls == 1
+    assert torch.equal(got_dead, _ref(ids, pos, qsl, dead_one, lookback, lb_dead))
+
+    # 3) Fallback when lb_dead_np has a True element
+    lb_dead_one = lb_dead.clone()
+    lb_dead_one[1, 0] = True
+    got_lbd = state.hash_on_host(ids, pos, qsl, dead, lookback, lb_dead_one)
+    assert greater_calls == 2 and equal_calls == 2
+    assert torch.equal(got_lbd, _ref(ids, pos, qsl, dead, lookback, lb_dead_one))
+
+    # 4) Fallback when pos_np[0] >= ngram - 1 but a later request has pos < ngram - 1
+    pos_mixed = pos.clone()
+    pos_mixed[6:12] = torch.arange(6, dtype=pos.dtype)
+    got_mixed = state.hash_on_host(ids, pos_mixed, qsl, dead, lookback, lb_dead)
+    assert greater_calls == 3 and equal_calls == 3
+    assert torch.equal(got_mixed, _ref(ids, pos_mixed, qsl, dead, lookback, lb_dead))

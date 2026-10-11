@@ -237,12 +237,24 @@ class NgramHashState(upstream.NgramHashState):
         np.take(window_table.reshape(-1), cols, out=source)
         np.copyto(source, batch, where=in_chunk)
         # A dead or pre-sequence source blocks every longer n-gram.
-        np.greater(shifts, pos_np[None, :], out=blocked)
-        np.equal(source, upstream.DEAD_ID, out=scratch_mask)
-        blocked |= scratch_mask
-        for shift in range(1, ngram):
+        all_valid = (
+            not dead_np.any()
+            and not lb_dead_np.any()
+            and int(pos_np[0]) >= ngram - 1
+            and int(pos_np.min()) >= ngram - 1
+        )
+        _ = None if all_valid else np.greater(shifts, pos_np[None, :], out=blocked)
+        _ = (
+            None
+            if all_valid
+            else (
+                np.equal(source, upstream.DEAD_ID, out=scratch_mask),
+                np.bitwise_or(blocked, scratch_mask, out=blocked),
+            )
+        )
+        for shift in () if all_valid else range(1, ngram):
             blocked[shift] |= blocked[shift - 1]
-        np.copyto(source, pad_id, where=blocked)
+        _ = None if all_valid else np.copyto(source, pad_id, where=blocked)
         np.multiply(tables.multipliers[:, :, None], source[None, :, :], out=terms)
         rolled = terms[:, 1:]
         np.bitwise_xor(terms[:, 0], rolled[:, 0], out=rolled[:, 0])
