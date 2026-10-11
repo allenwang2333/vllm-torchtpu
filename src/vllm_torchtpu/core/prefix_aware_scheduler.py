@@ -129,7 +129,11 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
-        self._is_disagg = getattr(self, "kv_transfer_config", None) is not None
+        self._is_disagg = (
+            getattr(getattr(self, "vllm_config", None), "kv_transfer_config", None)
+            is not None
+            or getattr(self, "connector", None) is not None
+        )
         self._srpf_running: bool = (
             bool(envs.TPU_SCHED_SRPF_RUNNING)
             if "TPU_SCHED_SRPF_RUNNING" in os.environ
@@ -177,7 +181,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         # place before HybridStateRetention binds its per-instance hooks.
         self._single_step = False
         self._n_single_step_reqs = 0
-        if single_step_prefill.enabled():
+        if not self._is_disagg and single_step_prefill.enabled():
             ok, why = single_step_prefill.supported(self)
             if ok:
                 single_step_prefill.install_mamba_manager_patches()
@@ -981,7 +985,9 @@ class PrefixAwareScheduler(AsyncScheduler):
         """Return (sort_key, warmth). Lower sort_key is admitted first."""
         warmth = self._prefix_warmth(request)
         cold_tokens = float(max(request.num_tokens - warmth, 0))
-        if (
+        if getattr(self, "_is_disagg", False):
+            tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
+        elif (
             free_blocks_for_fit is not None
             and warmth > 0
             and math.ceil(cold_tokens / self._get_block_size()) <= free_blocks_for_fit

@@ -2679,6 +2679,8 @@ class TPUModelRunner(GPUModelRunner):
         if cached is None:
             cached = bool(
                 envs.TPU_SCHED_SINGLE_STEP_PREFILL
+                and getattr(self.vllm_config, "kv_transfer_config", None) is None
+                and getattr(self.cache_config, "prefix_cache_retention_interval", None) == 0
                 and not self._pcp_enabled
                 and self._unified_kv_layout
                 and self.cache_config.mamba_cache_mode == "align"
