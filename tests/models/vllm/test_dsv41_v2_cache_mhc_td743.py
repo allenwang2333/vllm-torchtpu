@@ -109,6 +109,33 @@ class TestPagedCacheRowsTD743:
         )
         assert paged_sharded_scaled.pages(bt_sharded).tolist() == [1, 5, 0, 0]
 
+        # 5. TD8.266: int64 inputs to row_indices and pages coerce natively to int32
+        slots_i64 = slots.long()
+        bt_i64 = block_table.long()
+        for p_cache in (
+            paged_id,
+            paged_off,
+            paged_strided_zero,
+            paged_strided_off,
+            paged_sharded_id,
+            paged_sharded_scaled,
+        ):
+            ri = p_cache.row_indices(slots_i64)
+            pg = p_cache.pages(bt_i64)
+            assert ri.dtype == torch.int32
+            assert pg is not None and pg.dtype == torch.int32
+            assert torch.equal(ri, p_cache.row_indices(slots))
+            assert torch.equal(pg, p_cache.pages(block_table))
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import _read_rows
+
+        reqs_i32 = torch.tensor([0, 1], dtype=torch.int32)
+        logical_i32 = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+        read_paged = _read_rows(paged_id, block_table, reqs_i32, logical_i32)
+        assert read_paged.shape == (2, 2, 256)
+        dense_cache = torch.zeros((4, 4, 16), dtype=torch.bfloat16)
+        read_dense = _read_rows(dense_cache, block_table, reqs_i32, logical_i32)
+        assert read_dense.shape == (2, 2, 16)
+
     def test_getitem_and_write_int32_vs_int64_and_dtype_guards(
         self, monkeypatch: pytest.MonkeyPatch
     ):

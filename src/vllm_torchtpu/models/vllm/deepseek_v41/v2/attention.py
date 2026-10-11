@@ -553,9 +553,7 @@ def _request_row_slots(cache, block_table, width, page_records: int = 0):
     (``[requests, num_pages]``).
     """
     rows_per_page = cache.shape[1]
-    fast_offset = _has_fast_cache_offset(cache)
-    use_int32 = fast_offset or isinstance(cache, PagedCacheRows)
-    stride = cache.page_stride if fast_offset else rows_per_page
+    stride = cache.page_stride if _has_fast_cache_offset(cache) else rows_per_page
     if page_records > 1 and rows_per_page == page_records:
         num_pages = (width + rows_per_page - 1) // rows_per_page
         table = block_table[:, :num_pages]
@@ -567,9 +565,8 @@ def _request_row_slots(cache, block_table, width, page_records: int = 0):
                 ),
                 dim=1,
             )
-        return (table.to(torch.int32) if use_int32 else table.long()) * stride
-    table_blocks = block_table.to(torch.int32) if use_int32 else block_table.long()
-    page_bases = table_blocks * stride
+        return table.int() * stride
+    page_bases = block_table.int() * stride
     # Logical row r lives in table column r // rows_per_page, so repeating each
     # column rows_per_page times lines blocks up with rows 0..width-1 without
     # a full-width gather (16-40x slower on TPU, see _row_slots).
@@ -593,7 +590,7 @@ def _request_row_slots(cache, block_table, width, page_records: int = 0):
 
 
 def _read_rows(cache, block_table, requests, logical):
-    slots = _row_slots(cache, block_table, requests, logical).long()
+    slots = _row_slots(cache, block_table, requests, logical)
     return cache[slots // cache.shape[1], slots % cache.shape[1]]
 
 

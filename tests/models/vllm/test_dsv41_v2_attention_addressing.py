@@ -61,7 +61,8 @@ def test_request_row_slots_matches_token_row_slots(width):
     cache = torch.empty((1, rows_per_page))
     logical = torch.arange(width)[None, :].expand(requests.shape[0], -1)
     expected = _row_slots(cache, table, requests, logical)
-    got = _request_row_slots(cache, table, width).index_select(0, requests).int()
+    got = _request_row_slots(cache, table, width).index_select(0, requests)
+    assert got.dtype == torch.int32
     torch.testing.assert_close(got, expected)
 
 
