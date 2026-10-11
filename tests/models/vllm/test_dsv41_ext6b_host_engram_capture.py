@@ -477,7 +477,7 @@ def test_td8283_host_engram_int32_zero_copy_and_scratch_dtypes(monkeypatch):
 
             assert runner._host_engram_lookback_offsets.dtype == np.int32
             assert runner._host_engram_local_rows.dtype == np.int32
-            pos_buf, clipped_buf, _, _ = runner._host_engram_lookback_ws
+            pos_buf, clipped_buf, *_ = runner._host_engram_lookback_ws
             assert pos_buf.dtype == np.int32
             assert clipped_buf.dtype == np.int32
 
@@ -695,3 +695,50 @@ def test_td8377_ref_qsl_memoryview_fast_path_and_shared_raw_starts(
     np.testing.assert_array_equal(out3.input_ids.numpy()[:46], ids_ref3[:46])
     np.testing.assert_array_equal(out3.positions.numpy()[:46], pos_ref3[:46])
     np.testing.assert_array_equal(out3.lookback_token_ids.numpy(), lb_ref3)
+
+
+def test_td8386_host_engram_chunks_ref_drafts_ptr_and_lookback_np_cache() -> None:
+    """TD8.386: Verify single-chunk 1D fast path in _async_source_tokens_cpu,
+    O(1) pointer identity in _host_engram_ref_drafts, and cached lookback_np
+    in _host_engram_lookback_ws."""
+    # 1. _async_source_tokens_cpu: 1D single chunk returns c0 directly; 2D reshapes;
+    # multi-chunk concatenates.
+    c1d = torch.tensor([10, 20, 30], dtype=torch.int32)
+    pa_1d = SimpleNamespace(copy_state=SimpleNamespace(chunks_cpu=[c1d]))
+    assert he._async_source_tokens_cpu(pa_1d) is c1d
+
+    c2d = torch.tensor([[10, 20], [30, 40]], dtype=torch.int32)
+    pa_2d = SimpleNamespace(copy_state=SimpleNamespace(chunks_cpu=[c2d]))
+    out_2d = he._async_source_tokens_cpu(pa_2d)
+    assert out_2d is not None and out_2d.tolist() == [10, 20, 30, 40]
+
+    pa_multi = SimpleNamespace(copy_state=SimpleNamespace(chunks_cpu=[c1d, c2d]))
+    out_multi = he._async_source_tokens_cpu(pa_multi)
+    assert out_multi is not None and out_multi.tolist() == [10, 20, 30, 10, 20, 30, 40]
+
+    # 2. _host_engram_ref_drafts[v0] hits `is` when num_draft_per_req is the
+    # cached reference dict, and falls back to `==` on a distinct dict copy
+    runner = _make_runner(8, k=5, depth=4, seed=86)
+    runner._pre_async_results.req_id_to_index_copy = {f"req-{i}": i for i in range(8)}
+    runner._pre_async_results.num_draft_per_req = dict.fromkeys(range(8), 5)
+
+    out1 = he.capture_host_engram_inputs(runner, 8)
+    assert out1 is not None and out1.host_ready is True
+    ref_draft = runner._host_engram_ref_drafts[5]
+    assert isinstance(ref_draft, dict) and ref_draft == dict.fromkeys(range(8), 5)
+
+    # Assigning the cached reference dict hits `num_draft_per_req is ref_draft`
+    runner._pre_async_results.num_draft_per_req = ref_draft
+    out2 = he.capture_host_engram_inputs(runner, 8)
+    assert out2 is not None and out2.host_ready is True
+    assert runner._host_engram_ref_drafts[5] is ref_draft
+
+    # 3. _host_engram_lookback_ws caches lookback.numpy() as 5th element
+    assert len(runner._host_engram_lookback_ws) == 5
+    lb_np = runner._host_engram_lookback_ws[4]
+    assert isinstance(lb_np, np.ndarray)
+    assert np.shares_memory(lb_np, runner._host_engram_lookback_scratch.numpy())
+    ids_ref, pos_ref, lb_ref = _reference(runner, 8)
+    np.testing.assert_array_equal(out2.input_ids.numpy(), ids_ref)
+    np.testing.assert_array_equal(out2.positions.numpy(), pos_ref)
+    np.testing.assert_array_equal(out2.lookback_token_ids.numpy(), lb_ref)

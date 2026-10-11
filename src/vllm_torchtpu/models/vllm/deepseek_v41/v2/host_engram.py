@@ -78,9 +78,11 @@ def _async_source_tokens_cpu(
     copy_state = getattr(pre_async, "copy_state", None)
     chunks_cpu = getattr(copy_state, "chunks_cpu", None)
     if chunks_cpu:
-        flat_chunks = [c.reshape(-1) for c in chunks_cpu]
+        c0 = chunks_cpu[0]
         return (
-            flat_chunks[0] if len(flat_chunks) == 1 else torch.cat(flat_chunks, dim=0)
+            (c0 if c0.ndim == 1 else c0.reshape(-1))
+            if len(chunks_cpu) == 1
+            else torch.cat([c.reshape(-1) for c in chunks_cpu], dim=0)
         )
     if isinstance(waited, torch.Tensor):
         return waited.reshape(-1)
@@ -153,7 +155,7 @@ def _resolve_async_spec_state(
         # Compact each row's valid tokens to its front, preserving their order.
         tokens = (
             sampled
-            if valid.shape[1] <= 1 or bool(np.all(valid[:, :-1] >= valid[:, 1:]))
+            if valid.shape[1] <= 1 or bool((valid[:, :-1] >= valid[:, 1:]).all())
             else np.take_along_axis(
                 sampled, np.argsort(~valid, axis=1, kind="stable"), axis=1
             )
@@ -164,17 +166,20 @@ def _resolve_async_spec_state(
     elif (
         len(num_draft_per_req) == num_rows
         and (v0 := num_draft_per_req.get(0)) is not None
-        and num_draft_per_req
-        == (
-            (ref_drafts := runner._host_engram_ref_drafts).get(v0)
-            or ref_drafts.setdefault(
-                v0,
-                getattr(
-                    sys.modules.get("vllm_torchtpu.runner.tpu_runner"),
-                    "_cached_uniform_draft_map",
-                    lambda n, k: dict.fromkeys(range(n), k),
-                )(num_rows, v0),
+        and (
+            num_draft_per_req
+            is (
+                ref_draft := (ref_drafts := runner._host_engram_ref_drafts).get(v0)
+                or ref_drafts.setdefault(
+                    v0,
+                    getattr(
+                        sys.modules.get("vllm_torchtpu.runner.tpu_runner"),
+                        "_cached_uniform_draft_map",
+                        lambda n, k: dict.fromkeys(range(n), k),
+                    )(num_rows, v0),
+                )
             )
+            or num_draft_per_req == ref_draft
         )
     ):
         num_draft.fill(v0)
@@ -282,13 +287,14 @@ def _resolve_decode_lookback_cpu(
             np.empty((cap_rows, depth), dtype=np.int32),
             np.empty((cap_rows, depth), dtype=np.bool_),
             np.empty((cap_rows, depth), dtype=np.bool_),
+            lookback.numpy(),
         )
-    lookback_np, sync_rows = (
-        lookback.numpy(),
-        min(
-            int(lookback.shape[0]),
-            int(getattr(runner, "_host_engram_lookback_dirty", int(lookback.shape[0]))),
-        ),
+    pos_buf, clipped_buf, valid_buf, tmp_b_buf, lookback_np = (
+        runner._host_engram_lookback_ws
+    )
+    sync_rows = min(
+        int(lookback.shape[0]),
+        int(getattr(runner, "_host_engram_lookback_dirty", int(lookback.shape[0]))),
     )
     if num_reqs < sync_rows:
         lookback_np[num_reqs:sync_rows] = src_lookback.numpy()[num_reqs:sync_rows]
@@ -298,7 +304,6 @@ def _resolve_decode_lookback_cpu(
         runner._host_engram_local_rows[:num_reqs],
         lookback_np[:num_reqs],
     )
-    pos_buf, clipped_buf, valid_buf, tmp_b_buf = runner._host_engram_lookback_ws
     pos, clipped, valid, tmp_b = (
         pos_buf[:num_reqs],
         clipped_buf[:num_reqs],
@@ -336,7 +341,7 @@ def _resolve_decode_lookback_cpu(
             ).min()
         )
         >= int(offsets.shape[1])
-        and bool(np.all(delta <= sampled_overlay.lengths))
+        and bool((delta <= sampled_overlay.lengths).all())
     ):
         np.subtract(delta[:, None], offsets, out=pos)
         out_slice[:] = sampled_overlay.tokens[local, pos]
@@ -375,7 +380,7 @@ def _resolve_decode_lookback_cpu(
 
 def _ragged_arange(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
     """Concatenation of ``range(starts[i], starts[i] + lengths[i])``."""
-    if lengths.size and bool(np.all(lengths == lengths[0])):
+    if lengths.size and bool((lengths == lengths[0]).all()):
         return (
             np.asarray(starts, dtype=np.int32)[:, None]
             + np.arange(int(lengths[0]), dtype=np.int32)
@@ -459,7 +464,7 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
     prompt_lens = batch.num_prompt_tokens[start_index : start_index + chunk_num_reqs]
     all_prompt = (
         chunk_num_reqs == 0 or int(seq_lens[0]) <= int(prompt_lens[0])
-    ) and bool(np.all(seq_lens <= prompt_lens))
+    ) and bool((seq_lens <= prompt_lens).all())
     if all_prompt and start_index == 0:
         return HostEngramInputs(
             input_ids=runner.input_ids_cpu,
@@ -561,11 +566,11 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
                 (q0 := int(qsl[0])),
                 (active_len := int(qsl[-1])),
                 (span_len := active_len - q0),
-                span_len == chunk_num_reqs * stride and bool(np.all(n_sched == stride)),
+                span_len == chunk_num_reqs * stride and bool((n_sched == stride).all()),
             )
         )
         fast_id = fast_qsl or (
-            is_identity_reqs and (is_uniform_stride or bool(np.all(n_sched > 0)))
+            is_identity_reqs and (is_uniform_stride or bool((n_sched > 0).all()))
         )
         pre_pos: Any = (
             None
@@ -582,7 +587,7 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
             all_matched
             and int(pre_pos[0]) == 0
             and int(pre_pos[-1]) == chunk_num_reqs - 1
-            and bool(np.all(pre_pos[1:] == pre_pos[:-1] + 1))
+            and bool((pre_pos[1:] == pre_pos[:-1] + 1).all())
         )
         if spec_state is not None:
             # Rows this step did not carry over keep zero rejections and no
