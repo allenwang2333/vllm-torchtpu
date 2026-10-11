@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import codecs
+import hashlib
 import itertools
 import logging
 import os
@@ -19,6 +20,124 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+
+class _PrefixAffinityRouter:
+    """Prefix-hash sticky router across multiple prefill servers (e.g., 2P1D).
+
+    Computes cumulative 8-byte blake2b digests over fixed-size prompt byte
+    chunks and routes multi-turn conversation extensions to the prefill server
+    that already holds their cached KV + GDN blocks, falling back to least
+    in-flight load balancing on cold conversations or when a prefill server's
+    in-flight queue exceeds ``min(inflight) + slack``.
+    """
+
+    def __init__(
+        self,
+        n: int,
+        chunk: int = 1024,
+        min_frac: float = 0.5,
+        slack: int = 8,
+    ) -> None:
+        self.n = n
+        self.chunk = max(64, chunk)
+        self.min_frac = min_frac
+        self.slack = slack
+        self._lock = threading.Lock()
+        self.owners: dict[bytes, int] = {}
+        self.inflight = [0] * n
+        self.placed = [0] * n
+        self.sticky = 0
+        self.cold = 0
+
+    @staticmethod
+    def extract_text(body: dict[str, Any]) -> str:
+        if msgs := body.get("messages"):
+            parts: list[str] = []
+            for m in msgs:
+                if not isinstance(m, dict):
+                    continue
+                role = m.get("role", "")
+                c = m.get("content", "")
+                if isinstance(c, str):
+                    parts.append(f"{role}:{c}")
+                elif isinstance(c, list):
+                    sub = "".join(p.get("text", "") for p in c if isinstance(p, dict))
+                    parts.append(f"{role}:{sub}")
+            return "\n".join(parts)
+        p = body.get("prompt", "")
+        if isinstance(p, str):
+            return p
+        if isinstance(p, list):
+            if p and isinstance(p[0], int):
+                return ",".join(map(str, p))
+            return "\n".join(str(x) for x in p)
+        return ""
+
+    def hashes(self, text: str) -> list[bytes]:
+        raw = text.encode("utf-8", errors="ignore")
+        out: list[bytes] = []
+        h = hashlib.blake2b(digest_size=8)
+        for i in range(0, len(raw) - self.chunk + 1, self.chunk):
+            h.update(raw[i : i + self.chunk])
+            out.append(h.digest())
+        return out
+
+    def route(self, hs: list[bytes]) -> tuple[int, bool]:
+        with self._lock:
+            best_rank: int | None = None
+            matched = 0
+            for i in range(len(hs) - 1, -1, -1):
+                owner = self.owners.get(hs[i])
+                if owner is not None:
+                    best_rank = owner
+                    matched = i + 1
+                    break
+            lo = min(self.inflight)
+            if (
+                best_rank is not None
+                and hs
+                and matched >= len(hs) * self.min_frac
+                and self.inflight[best_rank] <= lo + self.slack
+            ):
+                rank = best_rank
+                is_sticky = True
+                self.sticky += 1
+            else:
+                rank = min(
+                    range(self.n),
+                    key=lambda r: (self.inflight[r], self.placed[r], r),
+                )
+                is_sticky = False
+                self.cold += 1
+            for d in hs:
+                self.owners[d] = rank
+            self.inflight[rank] += 1
+            self.placed[rank] += 1
+            total = self.sticky + self.cold
+            if total % 64 == 0:
+                print(
+                    f"PERF PROXY prefix_router | total={total} "
+                    f"sticky={self.sticky} ({100.0 * self.sticky / total:.1f}%) "
+                    f"cold={self.cold} placed={self.placed} "
+                    f"inflight={self.inflight} unique_chunks={len(self.owners)}",
+                    flush=True,
+                )
+            return rank, is_sticky
+
+    def done(self, rank: int) -> None:
+        with self._lock:
+            self.inflight[rank] = max(0, self.inflight[rank] - 1)
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "placed": list(self.placed),
+                "inflight": list(self.inflight),
+                "sticky": self.sticky,
+                "cold": self.cold,
+                "unique_chunks": len(self.owners),
+            }
 
 
 class _ProxyLatencyTracker:
@@ -289,10 +408,22 @@ async def lifespan(app: FastAPI):
     # Initialize round-robin iterators
     app.state.prefill_iterator = itertools.cycle(range(len(app.state.prefill_clients)))
     app.state.decode_iterator = itertools.cycle(range(len(app.state.decode_clients)))
+    routing_mode = os.getenv("PROXY_PREFILL_ROUTING", "prefix_hash").strip().lower()
+    if len(app.state.prefill_clients) > 1 and routing_mode == "prefix_hash":
+        app.state.prefill_router = _PrefixAffinityRouter(
+            n=len(app.state.prefill_clients),
+            chunk=_env_int("PROXY_PREFIX_HASH_CHUNK", 1024),
+            min_frac=_env_float("PROXY_PREFIX_HASH_MIN_FRAC", 0.5),
+            slack=_env_int("PROXY_PREFIX_HASH_SLACK", 8),
+        )
+    else:
+        app.state.prefill_router = None
 
     print(
         f"Initialized {len(app.state.prefill_clients)} prefill clients "
-        f"and {len(app.state.decode_clients)} decode clients."
+        f"(routing={'prefix_hash' if app.state.prefill_router else 'round_robin'}) "
+        f"and {len(app.state.decode_clients)} decode clients.",
+        flush=True,
     )
 
     yield
@@ -505,27 +636,47 @@ async def _handle_completions(api: str, request: Request):
             flush=True,
         )
 
-        # Get the next prefill client in round-robin fashion
-        prefill_client_info = get_next_client(request.app, "prefill")
-        render_endpoint = _render_endpoint_for_api(api)
-        if render_endpoint is not None:
-            render_response = await render_completion_prompt(
-                prefill_client_info, render_endpoint, req_data, request_id, forwarded
-            )
-            req_data = _replace_prompt_with_rendered_token_ids(
-                req_data, render_response.json()
-            )
+        router: _PrefixAffinityRouter | None = getattr(
+            request.app.state, "prefill_router", None
+        )
+        prefill_idx: int | None = None
+        if router is not None:
+            hs = router.hashes(router.extract_text(req_data))
+            prefill_idx, _ = router.route(hs)
+            prefill_client_info = request.app.state.prefill_clients[prefill_idx]
+        else:
+            prefill_client_info = get_next_client(request.app, "prefill")
 
-        # Send request to prefill service
-        t_prefill_send = time.time()
-        t_prefill_send_perf = time.perf_counter()
-        print(
-            f"PERF PROXY prefill_send req_id={request_id} ts={t_prefill_send:.6f}",
-            flush=True,
-        )
-        response = await send_request_to_prefill(
-            prefill_client_info, api, req_data, request_id, forwarded
-        )
+        try:
+            render_endpoint = _render_endpoint_for_api(api)
+            if render_endpoint is not None:
+                render_response = await render_completion_prompt(
+                    prefill_client_info,
+                    render_endpoint,
+                    req_data,
+                    request_id,
+                    forwarded,
+                )
+                req_data = _replace_prompt_with_rendered_token_ids(
+                    req_data, render_response.json()
+                )
+
+            # Send request to prefill service
+            t_prefill_send = time.time()
+            t_prefill_send_perf = time.perf_counter()
+            print(
+                f"PERF PROXY prefill_send req_id={request_id} "
+                f"prefill_id={prefill_client_info.get('id', 0)} "
+                f"ts={t_prefill_send:.6f}",
+                flush=True,
+            )
+            response = await send_request_to_prefill(
+                prefill_client_info, api, req_data, request_id, forwarded
+            )
+        finally:
+            if router is not None and prefill_idx is not None:
+                router.done(prefill_idx)
+
         t_prefill_recv = time.time()
         t_prefill_recv_perf = time.perf_counter()
         prefill_ms = (t_prefill_recv_perf - t_prefill_send_perf) * 1000.0
@@ -632,11 +783,15 @@ async def models():
 @app.get("/healthcheck")
 async def healthcheck():
     """Simple endpoint to check if the server is running."""
-    return {
+    router: _PrefixAffinityRouter | None = getattr(app.state, "prefill_router", None)
+    res: dict[str, Any] = {
         "status": "ok",
         "prefill_instances": len(app.state.prefill_clients),
         "decode_instances": len(app.state.decode_clients),
     }
+    if router is not None:
+        res["prefill_router"] = router.stats()
+    return res
 
 
 if __name__ == "__main__":

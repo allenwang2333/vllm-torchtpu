@@ -177,6 +177,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = True
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_MTP_STEP0_POST_ATTN_GATHER: bool = True
+    TPU_PREFILL_SKIP_VERIFY_WARMUP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -624,9 +625,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_LOWTOK": env_bool("TPU_MOE_LOWTOK", default=True),
     "TPU_MOE_LOWTOK_FROM_SCORES": env_bool("TPU_MOE_LOWTOK_FROM_SCORES", default=True),
     "TPU_MOE_LOWTOK_IDS": env_bool("TPU_MOE_LOWTOK_IDS", default=True),
-    "TPU_MOE_LOWTOK_MAX_TOKENS": env_nonnegative_int(
-        "TPU_MOE_LOWTOK_MAX_TOKENS", 256
-    ),
+    "TPU_MOE_LOWTOK_MAX_TOKENS": env_nonnegative_int("TPU_MOE_LOWTOK_MAX_TOKENS", 256),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
@@ -1069,6 +1068,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MTP_STEP0_POST_ATTN_GATHER": env_bool(
         "TPU_MTP_STEP0_POST_ATTN_GATHER", default=True
     ),
+    "TPU_PREFILL_SKIP_VERIFY_WARMUP": env_bool(
+        "TPU_PREFILL_SKIP_VERIFY_WARMUP", default=False
+    ),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).
     # 0 searches the full vocab. Used only when every active request has
@@ -1094,12 +1096,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run small decode-step TP all-reduces and DP MoE combines as Pallas
     # kernels (kernels/experimental/small_collectives) instead of XLA's.
     "TPU_SMALL_ALL_REDUCE": env_bool("TPU_SMALL_ALL_REDUCE", default=True),
-    "TPU_EXPERT_PLACEMENT_MTP": env_bool(
-        "TPU_EXPERT_PLACEMENT_MTP", default=True
-    ),
-    "TPU_OFFLOAD_MIN_HBM_USAGE": env_float(
-        "TPU_OFFLOAD_MIN_HBM_USAGE", 0.0
-    ),
+    "TPU_EXPERT_PLACEMENT_MTP": env_bool("TPU_EXPERT_PLACEMENT_MTP", default=True),
+    "TPU_OFFLOAD_MIN_HBM_USAGE": env_float("TPU_OFFLOAD_MIN_HBM_USAGE", 0.0),
     "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
         "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 128
     ),
@@ -1107,9 +1105,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS": env_nonnegative_int(
         "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS", 64
     ),
-    "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": env_int(
-        "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 64
-    ),
+    "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": env_int("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 64),
     "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "512")),
     "TPU_SP_FP8_GATHER": env_bool("TPU_SP_FP8_GATHER", default=True),
     # --- PrefixAwareScheduler SRPF & cold-prefill chunk capping ---
@@ -1118,24 +1114,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Max prefill tokens per step for a cold prefill (remaining > threshold)
     # when num_decoding >= TPU_SCHED_COLD_MIN_DECODERS or (in `running`) when
     # `waiting` is non-empty. 0 disables capping.
-    "TPU_SCHED_COLD_CHUNK_CAP": env_nonnegative_int(
-        "TPU_SCHED_COLD_CHUNK_CAP", 2048
-    ),
+    "TPU_SCHED_COLD_CHUNK_CAP": env_nonnegative_int("TPU_SCHED_COLD_CHUNK_CAP", 2048),
     # Remaining uncached prompt tokens threshold defining a cold prefill.
-    "TPU_SCHED_COLD_THRESHOLD": env_nonnegative_int(
-        "TPU_SCHED_COLD_THRESHOLD", 8192
-    ),
+    "TPU_SCHED_COLD_THRESHOLD": env_nonnegative_int("TPU_SCHED_COLD_THRESHOLD", 8192),
     # Minimum active decoding requests before cold-prefill chunk capping
     # activates when `waiting` is empty.
     "TPU_SCHED_COLD_MIN_DECODERS": env_nonnegative_int(
         "TPU_SCHED_COLD_MIN_DECODERS", 12
     ),
-    "TPU_SCHED_STEP_TOTAL_CAP": env_nonnegative_int(
-        "TPU_SCHED_STEP_TOTAL_CAP", 4096
-    ),
-    "TPU_SCHED_WARM_STREAK": env_nonnegative_int(
-        "TPU_SCHED_WARM_STREAK", 0
-    ),
+    "TPU_SCHED_STEP_TOTAL_CAP": env_nonnegative_int("TPU_SCHED_STEP_TOTAL_CAP", 4096),
+    "TPU_SCHED_WARM_STREAK": env_nonnegative_int("TPU_SCHED_WARM_STREAK", 0),
     "TPU_SCHED_WARM_MIN_DECODERS": env_nonnegative_int(
         "TPU_SCHED_WARM_MIN_DECODERS", 24
     ),
@@ -1143,9 +1131,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # verify capacity: 0 = disabled (default); -1 = auto, 64 //
     # (1 + num_spec_tokens) when VLLM_TPU_QWEN35_MEGAKERNEL=1 and dcp == 1
     # (16 at MTP=3, so requests beyond 16 queue); >0 = explicit cap.
-    "TPU_SCHED_MK_MAX_RUNNING": env_int(
-        "TPU_SCHED_MK_MAX_RUNNING", 0
-    ),
+    "TPU_SCHED_MK_MAX_RUNNING": env_int("TPU_SCHED_MK_MAX_RUNNING", 0),
     # Mamba "align" prefill split: let a chunk that starts mid-block (a
     # 128-token partial-tail prefix hit) run past the next block boundary.
     # Under sparse retention (prefix_cache_retention_interval=0) the state at

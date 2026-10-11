@@ -22,8 +22,8 @@ import os
 import time
 from bisect import bisect_right
 from itertools import islice
-from typing import cast
 from operator import itemgetter
+from typing import cast
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -35,10 +35,9 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.request import Request
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.core import prefix_change_log
+from vllm_torchtpu.core import prefix_change_log, single_step_prefill
 from vllm_torchtpu.core.hybrid_retention import HybridStateRetention
 from vllm_torchtpu.core.packed_ids import pack_new_request_prompt_ids
-from vllm_torchtpu.core import single_step_prefill
 
 logger = init_logger("vllm." + __name__)
 
@@ -76,9 +75,7 @@ def _hit_signature(result) -> tuple:
     """Comparable form of a find_longest_cache_hit result (block ids)."""
     blocks = result[0]
     try:
-        ids = tuple(
-            tuple(getattr(b, "block_id", b) for b in group) for group in blocks
-        )
+        ids = tuple(tuple(getattr(b, "block_id", b) for b in group) for group in blocks)
     except TypeError:
         ids = None
     return (result[1], result[2] if len(result) > 2 else None, ids)
@@ -132,7 +129,12 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
-        self._srpf_running: bool = bool(envs.TPU_SCHED_SRPF_RUNNING)
+        self._is_disagg = getattr(self, "kv_transfer_config", None) is not None
+        self._srpf_running: bool = (
+            bool(envs.TPU_SCHED_SRPF_RUNNING)
+            if "TPU_SCHED_SRPF_RUNNING" in os.environ
+            else not self._is_disagg
+        )
         self._mk_max_running: int = self._resolve_mk_max_running()
         budget = int(getattr(self, "max_num_scheduled_tokens", 8192) or 8192)
         eff_seqs = (
@@ -148,12 +150,12 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._step_total_cap: int = (
             int(envs.TPU_SCHED_STEP_TOTAL_CAP)
             if "TPU_SCHED_STEP_TOTAL_CAP" in os.environ
-            else max(1024, budget // 2)
+            else (0 if self._is_disagg else max(1024, budget // 2))
         )
         self._cold_chunk_cap: int = (
             int(envs.TPU_SCHED_COLD_CHUNK_CAP)
             if "TPU_SCHED_COLD_CHUNK_CAP" in os.environ
-            else max(512, self._step_total_cap // 2)
+            else (0 if self._is_disagg else max(512, self._step_total_cap // 2))
         )
         self._cold_min_decoders: int = (
             int(envs.TPU_SCHED_COLD_MIN_DECODERS)
@@ -186,7 +188,8 @@ class PrefixAwareScheduler(AsyncScheduler):
                     "then run without it too.",
                     why,
                 )
-        if os.environ.get("TPU_HYBRID_STATE_RETENTION", "1") != "0":
+        default_retention = "0" if self._is_disagg else "1"
+        if os.environ.get("TPU_HYBRID_STATE_RETENTION", default_retention) != "0":
             retention = HybridStateRetention(self.kv_cache_manager)
             if retention.enabled:
                 self._retention = retention
@@ -593,12 +596,8 @@ class PrefixAwareScheduler(AsyncScheduler):
            than one Mamba block remains so multi-prefill collisions never spill
            into the ``budget`` XLA compile bucket.
         """
-        _, cold_chunk_cap, cold_threshold, cold_min_decoders = (
-            self._get_sched_knobs()
-        )
-        step_total_cap, warm_streak, warm_min_decoders = (
-            self._get_step_cap_knobs()
-        )
+        _, cold_chunk_cap, cold_threshold, cold_min_decoders = self._get_sched_knobs()
+        step_total_cap, warm_streak, warm_min_decoders = self._get_step_cap_knobs()
         prefill_end = max(
             getattr(request, "num_prompt_tokens", 0),
             getattr(request, "num_tokens", 0) - 1,
@@ -624,12 +623,8 @@ class PrefixAwareScheduler(AsyncScheduler):
         sched_map = getattr(self, "_step_prefill_tokens_by_req", None)
         req_key = id(request)
         if sched_map is not None:
-            prior_prefill_tokens = sum(
-                v for k, v in sched_map.items() if k != req_key
-            )
-            has_prior_prefill = any(
-                v > 0 for k, v in sched_map.items() if k != req_key
-            )
+            prior_prefill_tokens = sum(v for k, v in sched_map.items() if k != req_key)
+            has_prior_prefill = any(v > 0 for k, v in sched_map.items() if k != req_key)
         else:
             prior_prefill_tokens = 0
             has_prior_prefill = False
@@ -650,21 +645,12 @@ class PrefixAwareScheduler(AsyncScheduler):
                 return 0
             num_new_tokens = min(num_new_tokens, rem_step_cap)
 
-        if (
-            cold_chunk_cap > 0
-            and cold_threshold > 0
-            and rem > cold_threshold
-        ):
-            in_running = req_key in getattr(
-                self, "_step_running_prefill_ids", ()
-            )
+        if cold_chunk_cap > 0 and cold_threshold > 0 and rem > cold_threshold:
+            in_running = req_key in getattr(self, "_step_running_prefill_ids", ())
             has_waiting = bool(getattr(self, "waiting", None)) or bool(
                 getattr(self, "skipped_waiting", None)
             )
-            if (
-                0 < cold_min_decoders <= num_decoding
-                or (in_running and has_waiting)
-            ):
+            if 0 < cold_min_decoders <= num_decoding or (in_running and has_waiting):
                 if has_prior_prefill:
                     rem_cold_cap = cold_chunk_cap - already_scheduled
                     if rem_cold_cap >= block_size:
@@ -692,9 +678,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             + num_new_local_computed_tokens
             + num_external_computed_tokens
         )
-        num_new_tokens = self._cap_cold_prefill_tokens(
-            request, start, num_new_tokens
-        )
+        num_new_tokens = self._cap_cold_prefill_tokens(request, start, num_new_tokens)
         retention = getattr(self, "_retention", None)
         if retention is not None:
             try:
@@ -739,9 +723,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             )
         if retention is not None:
             try:
-                aligned = retention.adjust_prefill_split(
-                    request, start, aligned
-                )
+                aligned = retention.adjust_prefill_split(request, start, aligned)
             except Exception:
                 self._retention_failed()
         sched_map = getattr(self, "_step_prefill_tokens_by_req", None)
@@ -826,7 +808,11 @@ class PrefixAwareScheduler(AsyncScheduler):
     def _get_block_size(self) -> int:
         """Return KV cache block size in tokens (defaults to 16 if unset)."""
         block_size = getattr(self, "block_size", None)
-        if isinstance(block_size, int) and not isinstance(block_size, bool) and block_size > 0:
+        if (
+            isinstance(block_size, int)
+            and not isinstance(block_size, bool)
+            and block_size > 0
+        ):
             return block_size
         cache_cfg = getattr(self, "cache_config", None)
         cfg_block_size = getattr(cache_cfg, "block_size", None)
@@ -921,10 +907,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         self, request: Request
     ) -> tuple[object, int, int, bool]:
         connector = getattr(self, "connector", None)
-        if (
-            connector is None
-            or not connector.supports_divergent_local_hybrid_hits
-        ):
+        if connector is None or not connector.supports_divergent_local_hybrid_hits:
             kvm = self.kv_cache_manager
             epoch = self._get_prefix_cache_epoch()
             if (
@@ -950,9 +933,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                         # memo itself must never be mutated downstream.
                         computed_blocks = tuple(list(b) for b in computed_blocks)
                     shared_prefix_boundary = (
-                        num_new_computed_tokens + num_uncached
-                        if num_uncached
-                        else 0
+                        num_new_computed_tokens + num_uncached if num_uncached else 0
                     )
                     blocks = kvm.create_kv_cache_blocks(computed_blocks)
                     return (
@@ -964,9 +945,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         blocks, num_local, shared_prefix_boundary, hit_diverged = (
             super()._get_local_prefix_cache_hit(request)
         )
-        if hit_diverged and hasattr(
-            connector, "resolve_divergent_local_hit_tokens"
-        ):
+        if hit_diverged and hasattr(connector, "resolve_divergent_local_hit_tokens"):
             kvm = self.kv_cache_manager
             reconciled_blocks, num_reconciled, reconciled_boundary = (
                 kvm.get_computed_blocks(request)
@@ -1005,8 +984,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         if (
             free_blocks_for_fit is not None
             and warmth > 0
-            and math.ceil(cold_tokens / self._get_block_size())
-            <= free_blocks_for_fit
+            and math.ceil(cold_tokens / self._get_block_size()) <= free_blocks_for_fit
         ):
             tier = _TIER_FREE_BLOCK_FIT
         elif request.num_preemptions > 0:
@@ -1033,21 +1011,17 @@ class PrefixAwareScheduler(AsyncScheduler):
         head_scored = self._rank_and_warmth(head)
         head_warmth = head_scored[1]
 
-        free_blocks = self._get_num_free_blocks()
+        free_blocks = None if self._is_disagg else self._get_num_free_blocks()
         free_blocks_for_fit: int | None = None
         if free_blocks is not None:
             head_cold_tokens = max(head.num_tokens - head_warmth, 0)
-            head_needed_blocks = math.ceil(
-                head_cold_tokens / self._get_block_size()
-            )
+            head_needed_blocks = math.ceil(head_cold_tokens / self._get_block_size())
             if free_blocks < head_needed_blocks:
                 free_blocks_for_fit = free_blocks
 
         scored = [(head_scored, head)] + [
             (
-                self._rank_and_warmth(
-                    r, free_blocks_for_fit=free_blocks_for_fit
-                ),
+                self._rank_and_warmth(r, free_blocks_for_fit=free_blocks_for_fit),
                 r,
             )
             for r in window[1:]

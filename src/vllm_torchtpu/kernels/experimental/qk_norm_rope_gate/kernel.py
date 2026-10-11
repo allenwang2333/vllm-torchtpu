@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ruff: noqa: E501
 """Gated q split + per-head RMS norm + partial NeoX RoPE in one Pallas call.
 
 Inputs, tiled along rows in VMEM:
@@ -114,7 +115,8 @@ def qk_norm_rope_gate(
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     tokens = q_gate.shape[0]
-    tile = legal_tile(tokens, tile)
+    vmem_tile_cap = max(8, (1024 * 1024) // max(heads * dim, 1))
+    tile = legal_tile(tokens, min(tile, vmem_tile_cap))
     kernel = functools.partial(
         _kernel, heads=heads, kv_heads=kv_heads, dim=dim, rot=rot, eps=eps
     )

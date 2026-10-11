@@ -116,7 +116,7 @@ def data() -> dict:
     primary permutation and optional copies."""
     global _DATA, _DATA_PATH
     path = _path()
-    if _DATA is None or _DATA_PATH != path:
+    if _DATA is None or path != _DATA_PATH:
         with open(path) as f:
             table = json.load(f)
         experts = int(table["experts"])
@@ -294,6 +294,13 @@ def permute_router_rows(name: str, tensor):
     them)."""
     if not enabled() or not _ROUTER_RE.search(name):
         return tensor
+    try:
+        from vllm.config import get_current_vllm_config
+
+        if not get_current_vllm_config().parallel_config.enable_expert_parallel:
+            return tensor
+    except Exception:  # noqa: S110
+        pass
     layer = layer_index(name)
     if layer is None or str(layer) not in data()["layers"]:
         return tensor
