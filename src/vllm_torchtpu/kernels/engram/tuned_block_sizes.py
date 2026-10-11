@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Initial offload fusion candidates, pending v7x measurements."""
+"""Experimental offload fusion tiles measured on v7x."""
 
 from vllm_torchtpu.logger import init_logger
 
@@ -7,9 +7,10 @@ logger = init_logger(__name__)
 
 # (input width, stream count, hidden width) -> (token tile, contracting tile).
 # Stream values first, then one key stream at a time. At the released shape,
-# these tiles need a 5 MiB accumulator and a 0.625 MiB FP8 weight tile;
+# these tiles need a 5 MiB accumulator and a 1.25 MiB FP8 weight tile;
 # the larger token tile reduces rereads of the full projection weight.
-BLOCK_SIZES = {(6144, 4, 5120): (256, 128)}
+# exp-ge83owvy90: K=256 improved latency and numerical agreement over K=128.
+BLOCK_SIZES = {(6144, 4, 5120): (256, 256)}
 
 # Keep unpacking and gate intermediates small while the MXU uses wider tiles.
 VECTOR_TILE_M = 32
