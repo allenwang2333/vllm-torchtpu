@@ -98,15 +98,23 @@ def _streamidx_block_sizes(
     small_bucket_bq: int | None,
     small_bucket_bkvp: int | None,
     small_bucket_tokens: int,
+    mixed_bkvp: int | None = None,
 ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     """(num_kv_pages_per_block, num_queries_per_block) for a padded token bucket.
 
     MIXED-pass query blocks hold one sequence each, so an MTP request
     (q_len = gamma + 1) in a 128-row block scores ~124 padding rows. Buckets up
-    to `small_bucket_tokens` take the small-bucket sizes instead.
+    to `small_bucket_tokens` take the small-bucket sizes instead; larger
+    buckets take `mixed_bkvp` (TPU_STREAMIDX_MIXED_KV_PAGES) kv pages per MIXED
+    block when it is set.
     """
     if small_bucket_bq is None or num_tokens > small_bucket_tokens:
-        return STREAMIDX_KV_PAGES_PER_BLOCK, STREAMIDX_QUERIES_PER_BLOCK
+        if mixed_bkvp is None:
+            return STREAMIDX_KV_PAGES_PER_BLOCK, STREAMIDX_QUERIES_PER_BLOCK
+        return (
+            STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (mixed_bkvp,),
+            STREAMIDX_QUERIES_PER_BLOCK,
+        )
     bkvp = small_bucket_bkvp or STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
     return (
         STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (bkvp,),
@@ -462,6 +470,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         )
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
+        mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -517,7 +526,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                q.shape[0], *small_bucket
+                q.shape[0], *small_bucket, mixed_bkvp
             )
             topk_indices = streamindex_topk(
                 q,
@@ -584,6 +593,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         )
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
+        mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
 
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -616,7 +626,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                q.shape[0], *small_bucket
+                q.shape[0], *small_bucket, mixed_bkvp
             )
             local_topk = streamindex_topk_dcp(
                 q,
