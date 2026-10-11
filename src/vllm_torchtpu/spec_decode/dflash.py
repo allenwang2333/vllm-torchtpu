@@ -1238,8 +1238,16 @@ class DFlashProposer:
         specialize on Python `int` `num_reqs`. Padding rows alias the last live
         request; callers zero them with the mask. Traced inline by both
         compiled input builders."""
-        qsl_i32 = query_start_loc.to(torch.int32)
-        pos_i32 = position_ids.to(torch.int32)
+        qsl_i32 = (
+            query_start_loc
+            if query_start_loc.dtype == torch.int32
+            else query_start_loc.to(torch.int32)
+        )
+        pos_i32 = (
+            position_ids
+            if position_ids.dtype == torch.int32
+            else position_ids.to(torch.int32)
+        )
         req_indices = torch.arange(
             padded_num_reqs, dtype=torch.int32, device=qsl_i32.device
         )
@@ -1334,13 +1342,17 @@ class DFlashProposer:
         # Align target output tokens to padded_num_reqs on-device without negative F.pad
         if next_tokens_device.shape[0] < padded_num_reqs:
             next_tokens_device_padded = F.pad(
-                next_tokens_device,
+                next_tokens_device
+                if next_tokens_device.dtype == torch.int32
+                else next_tokens_device.to(torch.int32),
                 (0, 0, 0, padded_num_reqs - next_tokens_device.shape[0]),
                 value=invalid_token_id,
-            ).to(torch.int32)
+            )
         else:
-            next_tokens_device_padded = next_tokens_device[:padded_num_reqs].to(
-                torch.int32
+            next_tokens_device_padded = (
+                next_tokens_device[:padded_num_reqs]
+                if next_tokens_device.dtype == torch.int32
+                else next_tokens_device[:padded_num_reqs].to(torch.int32)
             )
 
         (safe_req_indices, valid_mask, start_positions, last_positions) = (
@@ -1374,7 +1386,13 @@ class DFlashProposer:
         # Anchor verify windows at start + num_accepted;
         # anchor prompt chunks at last_pos + 1.
         num_draft = (
-            draft_lengths.to(torch.int32).index_select(0, safe_req_indices).unsqueeze(1)
+            (
+                draft_lengths
+                if draft_lengths.dtype == torch.int32
+                else draft_lengths.to(torch.int32)
+            )
+            .index_select(0, safe_req_indices)
+            .unsqueeze(1)
         )
         verify_base = start_positions_padded + num_accepted
         prompt_base = (last_positions + 1) * valid_mask
@@ -1421,10 +1439,18 @@ class DFlashProposer:
         # Align seed tokens to padded_num_reqs on-device without negative F.pad
         if device_seed.shape[0] < padded_num_reqs:
             base_tokens = F.pad(
-                device_seed, (0, padded_num_reqs - device_seed.shape[0]), value=0
-            ).to(torch.int32)
+                device_seed
+                if device_seed.dtype == torch.int32
+                else device_seed.to(torch.int32),
+                (0, padded_num_reqs - device_seed.shape[0]),
+                value=0,
+            )
         else:
-            base_tokens = device_seed[:padded_num_reqs].to(torch.int32)
+            base_tokens = (
+                device_seed[:padded_num_reqs]
+                if device_seed.dtype == torch.int32
+                else device_seed[:padded_num_reqs].to(torch.int32)
+            )
 
         # Anchor one past the last prompt token in the chunk.
         _, valid_mask, _, last_positions = self._request_window_bounds(

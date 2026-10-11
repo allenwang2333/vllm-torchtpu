@@ -1538,3 +1538,54 @@ def test_td8270_1d_flat_base_tokens_gather_and_skip_zero_tail_pad(device, monkey
     )
     assert out_ids[::4].tolist() == [13, 21, 34, 99]
     assert out_ids.dtype == out_pos.dtype == out_sl.dtype == torch.int32
+
+
+def test_td8306_dflash_int32_cast_guards(device):
+    proposer = _make_proposer(draft_tp=1)
+    proposer._max_model_len = 2048
+    fn_nt = torch._dynamo.eval_frame.innermost_fn(
+        DFlashProposer._tpu_build_dflash_inputs_next_tokens
+    )
+    fn_seed = torch._dynamo.eval_frame.innermost_fn(
+        DFlashProposer._tpu_build_dflash_inputs_seed
+    )
+
+    for rows in (2, 4):
+        nt_vals = [[11, 12, -1], [21, -1, -1], [31, 32, 33], [-1, -1, -1]][:rows]
+        seed_vals = [101, 202, 303, 404][:rows]
+        res_nt = []
+        res_seed = []
+        for dt in (torch.int32, torch.int64):
+            qsl = torch.tensor([0, 2, 3, 6, 6], dtype=dt, device=device)
+            pos = torch.arange(50, 56, dtype=dt, device=device)
+            dl = torch.tensor([2, 1, 2, 0], dtype=dt, device=device)
+            nt = torch.tensor(nt_vals, dtype=dt, device=device)
+            seed = torch.tensor(seed_vals, dtype=dt, device=device)
+            ids_nt, pos_nt, sl_nt = fn_nt(
+                proposer,
+                nt,
+                qsl,
+                pos,
+                dl,
+                block_size=3,
+                padded_len=12,
+                mask_token_id=99,
+                invalid_token_id=-1,
+            )
+            ids_s, pos_s, sl_s = fn_seed(
+                proposer,
+                seed,
+                qsl,
+                pos,
+                block_size=3,
+                padded_len=12,
+                mask_token_id=99,
+            )
+            assert ids_nt.dtype == pos_nt.dtype == sl_nt.dtype == torch.int32
+            assert ids_s.dtype == pos_s.dtype == sl_s.dtype == torch.int32
+            res_nt.append((ids_nt, pos_nt, sl_nt))
+            res_seed.append((ids_s, pos_s, sl_s))
+        for a, b in zip(res_nt[0], res_nt[1]):
+            assert torch.equal(a, b)
+        for a, b in zip(res_seed[0], res_seed[1]):
+            assert torch.equal(a, b)
