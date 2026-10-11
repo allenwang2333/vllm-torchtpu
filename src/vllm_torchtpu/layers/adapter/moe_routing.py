@@ -46,7 +46,9 @@ def _topk(
         return rowmax_select(scores, k, bias=bias, renormalize=renormalize)
     if bias is not None:
         bias_shape = (1,) * (scores.dim() - 1) + (-1,)
-        scores_for_choice = scores + bias.float().view(bias_shape)
+        scores_for_choice = scores + (
+            bias if bias.dtype == torch.float32 else bias.float()
+        ).view(bias_shape)
         _, topk_ids = torch.topk(scores_for_choice, k=k, dim=-1)
         topk_weights = _gather_expert_scores(scores, topk_ids)
     else:
@@ -138,12 +140,24 @@ def _uniform_random_routing(
     noise = torch.rand_like(router_logits, dtype=torch.float32)
     # Anchor the noise to the activations. Uniform shift => same argsort =>
     # identical expert choice; the point is the graph edge, not the value.
-    noise = noise + router_logits.float().mean()
+    noise = (
+        noise
+        + (
+            router_logits
+            if router_logits.dtype == torch.float32
+            else router_logits.float()
+        ).mean()
+    )
     _, topk_ids = torch.topk(noise, k=topk, dim=-1)
     topk_weights = torch.ones(
-        (router_logits.shape[0], topk), dtype=torch.float32, device=router_logits.device
+        (router_logits.shape[0], topk),
+        dtype=hidden_states.dtype,
+        device=router_logits.device,
     )
-    return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+    return (
+        topk_weights,
+        topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32),
+    )
 
 
 def maybe_simulate_routing(
@@ -173,7 +187,12 @@ def maybe_simulate_routing(
         top_k=topk,
         indices_type=torch.int32,
     )
-    return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+    return (
+        topk_weights
+        if topk_weights.dtype == hidden_states.dtype
+        else topk_weights.to(hidden_states.dtype),
+        topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32),
+    )
 
 
 def _gather_partitioned_topk(
@@ -284,7 +303,9 @@ def route(
 
 
 def _apply_scoring_fn(scoring_fn: str, router_logits: torch.Tensor) -> torch.Tensor:
-    scores = router_logits.float()
+    scores = (
+        router_logits if router_logits.dtype == torch.float32 else router_logits.float()
+    )
     if scoring_fn == "softmax":
         return scores.softmax(dim=-1)
     if scoring_fn == "sigmoid":
@@ -370,7 +391,12 @@ def select_experts(
             renormalize,
             routed_scaling_factor,
         )
-        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+        return (
+            topk_weights
+            if topk_weights.dtype == hidden_states.dtype
+            else topk_weights.to(hidden_states.dtype),
+            topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32),
+        )
 
     use_grouped = (
         layer is not None
@@ -391,7 +417,12 @@ def select_experts(
             routed_scaling_factor=layer.routed_scaling_factor,
             e_score_correction_bias=layer.e_score_correction_bias,
         )
-        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+        return (
+            topk_weights
+            if topk_weights.dtype == hidden_states.dtype
+            else topk_weights.to(hidden_states.dtype),
+            topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32),
+        )
 
     scores = _apply_scoring_fn(scoring_fn, router_logits)
     e_score_correction_bias = (
@@ -407,7 +438,12 @@ def select_experts(
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
 
-    return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+    return (
+        topk_weights
+        if topk_weights.dtype == hidden_states.dtype
+        else topk_weights.to(hidden_states.dtype),
+        topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32),
+    )
 
 
 def get_experts_start(layer) -> int | None:

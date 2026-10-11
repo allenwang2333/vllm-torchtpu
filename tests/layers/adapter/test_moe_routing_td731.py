@@ -292,3 +292,215 @@ def test_td8291_hash_moe_select_and_routed_topk_ids_int32_index_select(
     assert ep32 is not None and ep64 is not None
     assert torch.equal(ep32, ep64)
     assert seen_dtypes == [torch.int32, torch.int32, torch.int32, torch.int32]
+
+
+def test_td8310_moe_routing_cast_guards_and_v2_host_int32_cumsum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TD8.310: Verify redundant .float() / .to() casts are bypassed in
+    moe_routing.py when inputs/outputs already match target dtypes, and all
+    jnp.cumsum calls in fused_moe/v2/host.py pass explicit dtype=jnp.int32."""
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.fused_moe.v2 import host as v2_host
+
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
+    monkeypatch.setattr(moe_routing, "_SIMULATION_STRATEGY", None)
+
+    float_calls: list[torch.dtype] = []
+    to_calls: list[object] = []
+    orig_float = torch.Tensor.float
+    orig_to = torch.Tensor.to
+
+    def _spy_float(self: torch.Tensor) -> torch.Tensor:
+        float_calls.append(self.dtype)
+        return orig_float(self)
+
+    def _spy_to(self: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
+        to_calls.append(args[0] if args else kwargs.get("dtype"))
+        return orig_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "float", _spy_float)
+    monkeypatch.setattr(torch.Tensor, "to", _spy_to)
+
+    # 1. _topk with float32 vs bfloat16 bias
+    scores = torch.rand(4, 8, dtype=torch.float32)
+    bias_f32 = torch.zeros(8, dtype=torch.float32)
+    bias_bf16 = torch.zeros(8, dtype=torch.bfloat16)
+    float_calls.clear()
+    moe_routing._topk(scores, 2, bias=bias_f32)
+    assert float_calls == []
+    moe_routing._topk(scores, 2, bias=bias_bf16)
+    assert float_calls == [torch.bfloat16]
+
+    # 2. _apply_scoring_fn with float32 vs bfloat16 router_logits
+    float_calls.clear()
+    moe_routing._apply_scoring_fn("softmax", scores)
+    assert float_calls == []
+    moe_routing._apply_scoring_fn("softmax", scores.bfloat16())
+    assert float_calls == [torch.bfloat16]
+
+    # 3. _uniform_random_routing with float32/bfloat16 logits and int32/int64 topk
+    hidden_bf16 = torch.ones(4, 16, dtype=torch.bfloat16)
+    float_calls.clear()
+    to_calls.clear()
+    w_ur, i_ur = moe_routing._uniform_random_routing(hidden_bf16, scores, topk=2)
+    assert w_ur.dtype == torch.bfloat16 and i_ur.dtype == torch.int32
+    assert float_calls == []
+    assert to_calls == [torch.int32]
+
+    orig_topk = torch.topk
+    monkeypatch.setattr(
+        torch,
+        "topk",
+        lambda x, k, dim=-1: (
+            orig_topk(x, k=k, dim=dim)[0],
+            orig_topk(x, k=k, dim=dim)[1].to(torch.int32),
+        ),
+    )
+    float_calls.clear()
+    to_calls.clear()
+    w_ur2, i_ur2 = moe_routing._uniform_random_routing(
+        hidden_bf16, scores.bfloat16(), topk=2
+    )
+    assert w_ur2.dtype == torch.bfloat16 and i_ur2.dtype == torch.int32
+    assert float_calls == [torch.bfloat16]
+    # Only the helper's internal .to(torch.int32) ran.
+    assert to_calls == [torch.int32]
+    monkeypatch.setattr(torch, "topk", orig_topk)
+
+    # 4. maybe_simulate_routing with matching vs non-matching dtypes
+    monkeypatch.setattr(moe_routing, "_strategy_name", "custom_sim")
+    monkeypatch.setattr(
+        moe_routing,
+        "_SIMULATION_STRATEGY",
+        SimpleNamespace(
+            route_tokens=lambda **kw: (
+                torch.ones(4, 2, dtype=torch.bfloat16),
+                torch.zeros(4, 2, dtype=torch.int32),
+            )
+        ),
+    )
+    to_calls.clear()
+    sim_out = moe_routing.maybe_simulate_routing(hidden_bf16, scores, topk=2)
+    assert sim_out is not None
+    assert to_calls == []
+
+    monkeypatch.setattr(
+        moe_routing,
+        "_SIMULATION_STRATEGY",
+        SimpleNamespace(
+            route_tokens=lambda **kw: (
+                torch.ones(4, 2, dtype=torch.float32),
+                torch.zeros(4, 2, dtype=torch.int64),
+            )
+        ),
+    )
+    to_calls.clear()
+    sim_out2 = moe_routing.maybe_simulate_routing(hidden_bf16, scores, topk=2)
+    assert sim_out2 is not None
+    assert to_calls == [torch.bfloat16, torch.int32]
+    monkeypatch.setattr(moe_routing, "_SIMULATION_STRATEGY", None)
+
+    # 5. select_experts: hash routing, grouped topk, and classic topk fast paths
+    hidden_f32 = torch.ones(4, 16, dtype=torch.float32)
+    table_i32 = torch.zeros(16, 2, dtype=torch.int32)
+    input_ids_i32 = torch.zeros(4, dtype=torch.int32)
+    layer_hash = SimpleNamespace(
+        hash_indices_table=table_i32,
+        routed_scaling_factor=1.0,
+    )
+    to_calls.clear()
+    w_h, i_h = moe_routing.select_experts(
+        hidden_f32,
+        scores,
+        topk=2,
+        renormalize=False,
+        scoring_fn="softmax",
+        layer=layer_hash,
+        input_ids=input_ids_i32,
+    )
+    assert w_h.dtype == torch.float32 and i_h.dtype == torch.int32
+    assert to_calls == []
+
+    layer_grouped = SimpleNamespace(
+        hash_indices_table=None,
+        use_grouped_topk=True,
+        num_expert_group=2,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        e_score_correction_bias=None,
+    )
+    monkeypatch.setattr(
+        moe_routing._grouped_topk_router,
+        "grouped_topk",
+        lambda **kw: (
+            torch.ones(4, 2, dtype=torch.float32),
+            torch.zeros(4, 2, dtype=torch.int32),
+        ),
+    )
+    to_calls.clear()
+    w_g, i_g = moe_routing.select_experts(
+        hidden_f32,
+        scores,
+        topk=2,
+        renormalize=False,
+        scoring_fn="softmax",
+        layer=layer_grouped,
+    )
+    assert w_g.dtype == torch.float32 and i_g.dtype == torch.int32
+    assert to_calls == []
+
+    monkeypatch.setattr(
+        moe_routing,
+        "_topk",
+        lambda *a, **kw: (
+            torch.ones(4, 2, dtype=torch.float32),
+            torch.zeros(4, 2, dtype=torch.int32),
+        ),
+    )
+    to_calls.clear()
+    w_c, i_c = moe_routing.select_experts(
+        hidden_f32,
+        scores,
+        topk=2,
+        renormalize=False,
+        scoring_fn="softmax",
+        layer=None,
+    )
+    assert w_c.dtype == torch.float32 and i_c.dtype == torch.int32
+    assert to_calls == []
+
+    # 6. fused_moe/v2/host.py explicit dtype=jnp.int32 on jnp.cumsum
+    cumsum_dtypes: list[object] = []
+    orig_cumsum = jnp.cumsum
+
+    def _spy_cumsum(a, axis=None, dtype=None, out=None):
+        cumsum_dtypes.append(dtype)
+        return orig_cumsum(a, axis=axis, dtype=dtype, out=out)
+
+    monkeypatch.setattr(v2_host.jnp, "cumsum", _spy_cumsum)
+    topk_idx = jnp.zeros((16, 2), dtype=jnp.int32)
+    rt = v2_host.build_routing_tables(
+        topk_idx,
+        e_total=4,
+        ep=2,
+        t_local=8,
+        block=16,
+        tile_m=8,
+        shard_stride=16,
+    )
+    v2_host.build_routing_tables_sharded(
+        topk_idx,
+        jnp.int32(0),
+        e_total=4,
+        ep=2,
+        t_local=8,
+        block=16,
+        tile_m=8,
+        shard_stride=16,
+        all_gather_rows=lambda x: jnp.repeat(x, 2, axis=0),
+    )
+    v2_host.shard_transport_tables_in_blocks(rt, jnp.int32(0), e_total=4, ep=2)
+    assert len(cumsum_dtypes) == 12
+    assert all(dt == jnp.int32 for dt in cumsum_dtypes)

@@ -539,7 +539,9 @@ def build_routing_tables(
     block_hist = jnp.sum(
         (expert_blocks[:, :, None] == bins[None, None, :]).astype(jnp.int32), axis=1
     )  # [n_blocks, E]
-    block_off = jnp.cumsum(block_hist, axis=0) - block_hist  # excl over blocks
+    block_off = (
+        jnp.cumsum(block_hist, axis=0, dtype=jnp.int32) - block_hist
+    )  # excl over blocks
     base_per_slot = _lookup_per_pair(
         block_off, expert_blocks, bins
     )  # [n_blocks, block]
@@ -551,12 +553,14 @@ def build_routing_tables(
     blocks_per_dest = (t_local * K) // block
     rows_by_dest = block_hist.reshape(ep, blocks_per_dest, e_total).sum(axis=1)
     run_rows = rows_by_dest.T  # [E, ep]
-    run_start = jnp.cumsum(run_rows, axis=1) - run_rows  # excl over d
+    run_start = jnp.cumsum(run_rows, axis=1, dtype=jnp.int32) - run_rows  # excl over d
 
     # Rounding up to a whole block: one add and one mask, where the
     # negate-divide-negate spelling owed a signed division's fixup.
     run_rows_aligned = (run_rows + (ROWBLK - 1)) & jnp.int32(-ROWBLK)
-    run_start_aligned = jnp.cumsum(run_rows_aligned, axis=1) - run_rows_aligned
+    run_start_aligned = (
+        jnp.cumsum(run_rows_aligned, axis=1, dtype=jnp.int32) - run_rows_aligned
+    )
     slot_shift = run_start_aligned - run_start  # slot = pair_rank + shift
 
     # Ragged expert slabs: shard s owns rows [s*stride, (s+1)*stride).
@@ -567,7 +571,9 @@ def build_routing_tables(
             f"whole number of {tile_m}-row tiles"
         )
     rows_by_shard = expert_rows_aligned.reshape(ep, g_local)
-    local_base = jnp.cumsum(rows_by_shard, axis=1) - rows_by_shard  # [s, G]
+    local_base = (
+        jnp.cumsum(rows_by_shard, axis=1, dtype=jnp.int32) - rows_by_shard
+    )  # [s, G]
     expert_base = (
         local_base + (jnp.arange(ep, dtype=jnp.int32)[:, None] * shard_stride)
     ).reshape(e_total)
@@ -577,9 +583,9 @@ def build_routing_tables(
     # run: region_rows is run_rows_aligned read as [source, expert, dest].
     region_rows = run_rows_aligned.reshape(ep, g_local, ep)  # [s, g, d]
     rows_per_dest = region_rows.transpose(2, 0, 1).reshape(ep, ep * g_local)
-    recv_base = (jnp.cumsum(rows_per_dest, axis=1) - rows_per_dest).reshape(
-        ep, ep, g_local
-    )  # [d, s, g]
+    recv_base = (
+        jnp.cumsum(rows_per_dest, axis=1, dtype=jnp.int32) - rows_per_dest
+    ).reshape(ep, ep, g_local)  # [d, s, g]
     recv_rows = rows_per_dest.sum(axis=1)  # [d] incl. self
 
     pos_shift = recv_base.transpose(1, 2, 0).reshape(e_total, ep) - run_start
@@ -879,22 +885,24 @@ def build_routing_tables_sharded(
     else:
         my_blocks, my_hist = gathered.local_blocks, gathered.block_hist
         rows_by_dest = gathered.rows_by_dest
-    my_off = jnp.cumsum(my_hist, axis=0) - my_hist
+    my_off = jnp.cumsum(my_hist, axis=0, dtype=jnp.int32) - my_hist
 
     run_rows = rows_by_dest.T
     run_rows_aligned = (run_rows + (ROWBLK - 1)) & jnp.int32(-ROWBLK)
-    run_start_aligned = jnp.cumsum(run_rows_aligned, axis=1) - run_rows_aligned
+    run_start_aligned = (
+        jnp.cumsum(run_rows_aligned, axis=1, dtype=jnp.int32) - run_rows_aligned
+    )
     expert_rows_aligned = run_rows_aligned.sum(axis=1)
     rows_by_shard = expert_rows_aligned.reshape(ep, g_local)
-    local_base = jnp.cumsum(rows_by_shard, axis=1) - rows_by_shard
+    local_base = jnp.cumsum(rows_by_shard, axis=1, dtype=jnp.int32) - rows_by_shard
     expert_base = (
         local_base + (jnp.arange(ep, dtype=jnp.int32)[:, None] * shard_stride)
     ).reshape(e_total)
     region_rows = run_rows_aligned.reshape(ep, g_local, ep)
     rows_per_dest = region_rows.transpose(2, 0, 1).reshape(ep, ep * g_local)
-    recv_base = (jnp.cumsum(rows_per_dest, axis=1) - rows_per_dest).reshape(
-        ep, ep, g_local
-    )
+    recv_base = (
+        jnp.cumsum(rows_per_dest, axis=1, dtype=jnp.int32) - rows_per_dest
+    ).reshape(ep, ep, g_local)
     recv_rows = rows_per_dest.sum(axis=1)
 
     # For a pair in this rank's token block the source prefix cancels from
@@ -938,7 +946,7 @@ def build_routing_tables_sharded(
     win_hist = _window_hist(expert_blocks, my_experts, window)
     hist_mine = _over_sub_blocks(win_hist)
     by_source = hist_mine.reshape(ep, blocks_per_dest, g_local)
-    off_in_source = jnp.cumsum(by_source, axis=1) - by_source
+    off_in_source = jnp.cumsum(by_source, axis=1, dtype=jnp.int32) - by_source
     run_base = (
         lax.dynamic_slice(expert_base, (first,), (g_local,))[None, :]
         + lax.dynamic_slice(run_start_aligned, (first, 0), (g_local, ep)).T
@@ -1122,8 +1130,10 @@ def shard_transport_tables_in_blocks(routing, me, *, e_total, ep):
     not_me = jnp.arange(ep) != me
     # contrib includes the own-dest region, which hops to recvbuf later.
     out_total = my_region_rows.sum(axis=0)  # [d] incl. me
-    contrib_base = jnp.cumsum(out_total) - out_total  # [d]
-    grp_off = jnp.cumsum(my_region_rows, axis=0) - my_region_rows  # [g, d]
+    contrib_base = jnp.cumsum(out_total, dtype=jnp.int32) - out_total  # [d]
+    grp_off = (
+        jnp.cumsum(my_region_rows, axis=0, dtype=jnp.int32) - my_region_rows
+    )  # [g, d]
 
     # One expert per push, so an expert's contrib offset is its region's.
     contrib_off = contrib_base[None, :] + grp_off  # [G, d]
