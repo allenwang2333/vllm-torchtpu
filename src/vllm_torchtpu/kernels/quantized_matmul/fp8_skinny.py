@@ -268,14 +268,19 @@ def fp8_skinny_matmul_stacked(
     return out
 
 
-def scale_dma_applies(n: int) -> bool:
-    """Where TPU_FP8_SKINNY_SCALE_DMA is used in the model: n % 1024 == 0 (o_proj
-    6144, q_b 16384/8192). There the scale's [n] -> [1, n] reshape is a bitcast of
-    the f32 T(1024) layout, so the HBM operand is the parameter itself. Elsewhere
-    (gate_up 1536, q_a 2688) the reshape is a real op, whose output XLA would write
-    to HBM for the kernel; those sites' scale copies are not exposed, so they stay
-    as they are."""
-    return n % 1024 == 0
+# Sites where TPU_FP8_SKINNY_SCALE_DMA is used in the model: those whose XLA scale
+# copy was measured exposed on GLM-5.2-FP8 decode (twin j-69560162 / j-dae7fb62:
+# o_proj's f32[6144] copy sits one instruction before the call, ~0.8 us per layer).
+# q_b's scale copy is hidden there, and standalone the in-kernel copy measured
+# +0.3-0.5 us per call at (2048, 16384), so it stays as today. A site's N must be a
+# multiple of 1024: the scale's [n] -> [1, n] reshape is then a bitcast of the f32
+# T(1024) layout and the HBM operand is the parameter itself (at gate_up's 1536 the
+# reshape is a real op whose output XLA would write to HBM).
+SCALE_DMA_SITES = {(1024, 6144)}  # o_proj
+
+
+def scale_dma_applies(k: int, n: int) -> bool:
+    return (k, n) in SCALE_DMA_SITES
 
 
 def padded_n(n: int, multiple: int = LANE) -> int:
