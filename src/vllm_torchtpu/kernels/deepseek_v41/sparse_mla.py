@@ -300,6 +300,12 @@ def _build_candidate_union_and_bitmask(
     bit-packed 32-query membership bitmask [num_groups, m_union // 128, 128].
     """
     num_tokens, topk = topk_indices.shape
+    if b_q == 1 and m_union == topk:
+        return (
+            topk_indices.reshape(-1),
+            jnp.ones((num_tokens, m_union // 128, 128), dtype=jnp.int32),
+            jnp.full((num_tokens,), m_union, dtype=jnp.int32),
+        )
     num_groups = num_tokens // b_q
     n_cols = b_q * topk
     if (
@@ -1984,7 +1990,7 @@ def _launch_grouped_or_batched_attention(
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
 
     if _FAST_GROUPED_ATTN:
-        target_gb = 8 if num_q_heads <= 16 else (4 if (num_q_heads <= 64 or b_q <= 2) else 2)
+        target_gb = 8 if (num_q_heads <= 16 or b_q == 1) else (4 if (num_q_heads <= 64 or b_q <= 2) else 2)
         g_batch = (
             _largest_divisor(num_groups, target_gb)
             if (m_union == u_chunk and num_q_heads <= 128)
@@ -2290,7 +2296,10 @@ def sparse_ragged_paged_attention(
                 sm_scale=sm_scale,
             )
 
-        q = lax.cond(all_groups_fit, _run_explicit_grouped, _run_fallback_branch, q)
+        if b_q * topk <= m_union:
+            q = _run_explicit_grouped(q)
+        else:
+            q = lax.cond(all_groups_fit, _run_explicit_grouped, _run_fallback_branch, q)
     elif (
         envs.VLLM_DSV41_CSA_UNION
         and topk % 128 == 0
@@ -2443,8 +2452,9 @@ def sparse_ragged_paged_attention(
         # (SparseCore sc_union_ztc + super-block _batched_grouped_attention_kernel when all
         # active groups satisfy n_uniq <= 1024).
         # Tier 2 zero-overflow fallback: pf_m_union = pf_bq * topk = 4096, u_chunk = 512.
-        if num_tokens >= 8 and num_tokens % 8 == 0:
-            pf_bq = 8
+        _cfg_pf_bq = envs.VLLM_DSV41_CSA_UNION_BQ if envs.VLLM_DSV41_CSA_UNION_BQ > 0 else 8
+        if num_tokens >= _cfg_pf_bq and num_tokens % _cfg_pf_bq == 0:
+            pf_bq = _cfg_pf_bq
             pf_m_union_fast = (
                 min(envs.VLLM_DSV41_CSA_UNION_M, pf_bq * topk)
                 if envs.VLLM_DSV41_CSA_UNION_M > 0
@@ -2541,9 +2551,12 @@ def sparse_ragged_paged_attention(
                         pf_u_chunk,
                     )
 
-                out_pf = lax.cond(
-                    all_pf_fit_1024, _run_pf_fast_1024, _run_pf_full_4096, q_in
-                )
+                if pf_m_union_fast >= pf_m_union:
+                    out_pf = _run_pf_fast_1024(q_in)
+                else:
+                    out_pf = lax.cond(
+                        all_pf_fit_1024, _run_pf_fast_1024, _run_pf_full_4096, q_in
+                    )
                 new_boundary = lax.dynamic_slice_in_dim(
                     out_pf, aligned_start, pf_bq, axis=0
                 )
