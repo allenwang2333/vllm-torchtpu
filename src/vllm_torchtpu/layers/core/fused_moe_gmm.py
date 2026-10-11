@@ -190,12 +190,11 @@ def quantize_to_native_fp4_kmajor(
 # 32-row tile (`tile_m == bucket_base == 32`) instead of `calculate_tiling`'s
 # 64..256-row buckets. Under EP the GMM only computes the valid local prefix
 # (`group_sizes` sum to M / ep_size), so the rows per group that actually hit
-# the MXU are M / num_global_experts: up to 144 routed rows per local expert
-# (M <= 48 * 144 = 6912, T <= 1152 under EP8; M <= 16 * 144 = 2304 for the
-# 16-expert DSpark drafter MoE), a single 32-row tile fits local experts without
-# tile spill; above 144 rows/group (e.g. T = 1344, M = 8064), switching to
-# calculate_tiling's 64-row tile avoids re-streaming spilled expert weights.
-_DECODE_TILE_M32_ROWS_PER_GROUP = 144
+# the MXU are M / num_global_experts: up to 256 routed rows per local expert
+# (M <= 48 * 256 = 12288, T <= 2048 under EP8; M <= 16 * 256 = 4096 for the
+# 16-expert DSpark drafter MoE), keeping tile_m=32 avoids stepping up to the
+# 64-row GMM tile where all-zero tail expert groups pad double the empty rows.
+_DECODE_TILE_M32_ROWS_PER_GROUP = 256
 _DENSE_EXPERT_LOW_EXPERT_MAX_TOKENS = 576
 
 
@@ -404,7 +403,7 @@ def _prepare_routed_gmm_inputs(
     token_bits = max(1, (num_tokens_local - 1).bit_length())
     packable = (
         local_num_experts + 1
-    ).bit_length() + token_bits < 31 and total_routed <= 6912
+    ).bit_length() + token_bits < 31 and total_routed <= 12288
     if bucket_counts is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
     else:
