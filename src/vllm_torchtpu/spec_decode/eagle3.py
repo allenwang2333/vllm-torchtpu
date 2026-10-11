@@ -431,7 +431,7 @@ class Eagle3Proposer:
             and self.speculative_config.method == "mtp"
             and not self._share_mtp_indices
             and not self._draft_kv_shared
-            and self.speculative_config.num_speculative_tokens > 1
+            and getattr(self.speculative_config, "num_speculative_tokens", 0) > 1
         ):
             # Step 0 traces with the post-attention gather baked in, so the
             # per-step loop's steps 1..K-1 need a program of their own.
