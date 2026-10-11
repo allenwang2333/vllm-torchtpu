@@ -463,3 +463,34 @@ def test_td8374_request_rows_cols_and_hash_on_host_dead_mask_fast_paths(
     assert torch.equal(
         got_neg, _ref(ids, pos, qsl, dead_some, lookback_neg, lb_dead_some)
     )
+
+
+def test_td8377_ref_qsl_memoryview_fast_path_and_shared_raw_starts():
+    """TD8.377: Verify _host_engram_ref_qsl memoryview fast path and shared raw_starts
+    in v2.host_engram.capture_host_engram_inputs."""
+    from tests.models.vllm.test_dsv41_ext6b_host_engram_capture import (
+        _make_runner,
+        _reference,
+    )
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import host_engram as he
+
+    runner = _make_runner(8, k=5, depth=4, seed=77, with_no_spec=False)
+    runner.input_batch.num_computed_tokens_cpu = (
+        runner.input_batch.num_computed_tokens_cpu.astype(np.int32)
+    )
+    runner._pre_async_results.req_id_to_index_copy = {f"req-{i}": i for i in range(8)}
+    runner._pre_async_results.num_draft_per_req = dict.fromkeys(range(8), 5)
+
+    out1 = he.capture_host_engram_inputs(runner, 8)
+    assert out1 is not None and out1.host_ready is True
+    ref_qsl = runner._host_engram_ref_qsl
+    assert ref_qsl[:3] == (8, 6, np.dtype(np.int32))
+    assert memoryview(runner.query_start_loc_cpu[:9].numpy()) == memoryview(ref_qsl[3])
+
+    out2 = he.capture_host_engram_inputs(runner, 8)
+    assert out2 is not None and out2.host_ready is True
+    assert runner._host_engram_ref_qsl is ref_qsl
+    ids_ref, pos_ref, lb_ref = _reference(runner, 8)
+    np.testing.assert_array_equal(out2.input_ids.numpy(), ids_ref)
+    np.testing.assert_array_equal(out2.positions.numpy(), pos_ref)
+    np.testing.assert_array_equal(out2.lookback_token_ids.numpy(), lb_ref)

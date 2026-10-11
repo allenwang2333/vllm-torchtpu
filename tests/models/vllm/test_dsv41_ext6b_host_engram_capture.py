@@ -433,8 +433,9 @@ def test_td8283_host_engram_int32_zero_copy_and_scratch_dtypes(monkeypatch):
         *,
         rejected_by_req=None,
         sampled_overlay=None,
+        raw_starts=None,
     ):
-        seen_lookback_calls.append((rejected_by_req, sampled_overlay))
+        seen_lookback_calls.append((rejected_by_req, sampled_overlay, raw_starts))
         return orig_lookback(
             runner,
             batch,
@@ -442,6 +443,7 @@ def test_td8283_host_engram_int32_zero_copy_and_scratch_dtypes(monkeypatch):
             start_index,
             rejected_by_req=rejected_by_req,
             sampled_overlay=sampled_overlay,
+            raw_starts=raw_starts,
         )
 
     monkeypatch.setattr(he, "_resolve_decode_lookback_cpu", spy_lookback)
@@ -480,11 +482,12 @@ def test_td8283_host_engram_int32_zero_copy_and_scratch_dtypes(monkeypatch):
             assert clipped_buf.dtype == np.int32
 
             assert len(seen_lookback_calls) == 1
-            rej_arg, ov_arg = seen_lookback_calls[0]
+            rej_arg, ov_arg, raw_starts_arg = seen_lookback_calls[0]
             assert rej_arg is not None and rej_arg.dtype == np.int32
             assert ov_arg is not None
             assert ov_arg.starts.dtype == np.int32
             assert ov_arg.lengths.dtype == np.int32
+            assert raw_starts_arg is not None and raw_starts_arg.dtype == np.int32
             assert np.shares_memory(
                 np.asarray(
                     runner.input_batch.num_computed_tokens_cpu[:8], dtype=np.int32
@@ -621,3 +624,74 @@ def test_td8372_full_overlay_lookback_skips_token_ids_cpu_gather() -> None:
         token_table[0, 9],
     ]
     np.testing.assert_array_equal(lb_partial.numpy(), expected_partial)
+
+
+def test_td8377_ref_qsl_memoryview_fast_path_and_shared_raw_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TD8.377: Verify _host_engram_ref_qsl memoryview fast path and raw_starts."""
+    runner = _make_runner(8, k=5, depth=4, seed=77, with_no_spec=False)
+    runner.input_batch.num_computed_tokens_cpu = (
+        runner.input_batch.num_computed_tokens_cpu.astype(np.int32)
+    )
+    runner._pre_async_results.req_id_to_index_copy = {f"req-{i}": i for i in range(8)}
+    runner._pre_async_results.num_draft_per_req = dict.fromkeys(range(8), 5)
+
+    # 1. First call populates _host_engram_ref_qsl
+    out1 = he.capture_host_engram_inputs(runner, 8)
+    assert out1 is not None and out1.host_ready is True
+    ref_qsl = runner._host_engram_ref_qsl
+    assert ref_qsl is not None
+    assert ref_qsl[:3] == (8, 6, np.dtype(np.int32))
+    assert memoryview(runner.query_start_loc_cpu[:9].numpy()) == memoryview(ref_qsl[3])
+
+    # 2. Second call with unchanged qsl hits memoryview(qsl) == memoryview(ref_qsl[3])
+    # and skips np.all during uniform-stride check, while sharing raw_starts
+    seen_raw_starts = []
+    orig_lookback = he._resolve_decode_lookback_cpu
+
+    def spy_lookback(
+        r,
+        b,
+        n,
+        s,
+        *,
+        rejected_by_req=None,
+        sampled_overlay=None,
+        raw_starts=None,
+    ):
+        seen_raw_starts.append(raw_starts)
+        return orig_lookback(
+            r,
+            b,
+            n,
+            s,
+            rejected_by_req=rejected_by_req,
+            sampled_overlay=sampled_overlay,
+            raw_starts=raw_starts,
+        )
+
+    monkeypatch.setattr(he, "_resolve_decode_lookback_cpu", spy_lookback)
+    out2 = he.capture_host_engram_inputs(runner, 8)
+    assert out2 is not None and out2.host_ready is True
+    assert runner._host_engram_ref_qsl is ref_qsl
+    assert len(seen_raw_starts) == 1
+    assert seen_raw_starts[0] is not None and seen_raw_starts[0].dtype == np.int32
+    assert np.shares_memory(
+        seen_raw_starts[0], runner.input_batch.num_computed_tokens_cpu
+    )
+    ids_ref, pos_ref, lb_ref = _reference(runner, 8)
+    np.testing.assert_array_equal(out2.input_ids.numpy(), ids_ref)
+    np.testing.assert_array_equal(out2.positions.numpy(), pos_ref)
+    np.testing.assert_array_equal(out2.lookback_token_ids.numpy(), lb_ref)
+
+    # 3. Non-uniform qsl invalidates fast path and falls back cleanly
+    runner.query_start_loc_cpu[:9] = torch.tensor(
+        [0, 6, 10, 16, 22, 28, 34, 40, 46], dtype=torch.int32
+    )
+    out3 = he.capture_host_engram_inputs(runner, 8)
+    assert out3 is not None and out3.host_ready is True
+    ids_ref3, pos_ref3, lb_ref3 = _reference(runner, 8)
+    np.testing.assert_array_equal(out3.input_ids.numpy()[:46], ids_ref3[:46])
+    np.testing.assert_array_equal(out3.positions.numpy()[:46], pos_ref3[:46])
+    np.testing.assert_array_equal(out3.lookback_token_ids.numpy(), lb_ref3)

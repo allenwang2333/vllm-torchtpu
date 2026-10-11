@@ -257,6 +257,7 @@ def _resolve_decode_lookback_cpu(
     *,
     rejected_by_req: np.ndarray | None = None,
     sampled_overlay: _SampledOverlay | None = None,
+    raw_starts: np.ndarray | None = None,
 ) -> torch.Tensor:
     """Fill lookback_token_ids on CPU for both prompt and generated positions."""
     src_lookback = runner.lookback_token_ids.cpu
@@ -304,20 +305,34 @@ def _resolve_decode_lookback_cpu(
         valid_buf[:num_reqs],
         tmp_b_buf[:num_reqs],
     )
-    raw_starts = np.asarray(
-        batch.num_computed_tokens_cpu[start_index : start_index + num_reqs],
-        dtype=np.int32,
+    raw_starts = (
+        np.asarray(
+            batch.num_computed_tokens_cpu[start_index : start_index + num_reqs],
+            dtype=np.int32,
+        )
+        if raw_starts is None
+        else raw_starts
     )
     starts_1d = (
         raw_starts
         if rejected_by_req is None
-        else raw_starts - np.asarray(rejected_by_req, dtype=np.int32)
+        else raw_starts
+        - (
+            rejected_by_req
+            if rejected_by_req.dtype == np.int32
+            else rejected_by_req.astype(np.int32)
+        )
     )
     if (
         sampled_overlay is not None
         and int(
             (
-                delta := starts_1d - np.asarray(sampled_overlay.starts, dtype=np.int32)
+                delta := starts_1d
+                - (
+                    ov_starts
+                    if (ov_starts := sampled_overlay.starts).dtype == np.int32
+                    else ov_starts.astype(np.int32)
+                )
             ).min()
         )
         >= int(offsets.shape[1])
@@ -513,18 +528,45 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
         return _unresolved_host_inputs(runner, all_prompt)
 
     stride = spec_state.stride if spec_state is not None else 1
-    ids, positions = runner.input_ids_cpu, runner.positions_cpu
-    rejected_by_req: np.ndarray | None = None
-    sampled_overlay: _SampledOverlay | None = None
+    ids, positions, rejected_by_req, sampled_overlay = (
+        runner.input_ids_cpu,
+        runner.positions_cpu,
+        None,
+        None,
+    )
+    raw_starts = np.asarray(
+        batch.num_computed_tokens_cpu[start_index : start_index + chunk_num_reqs],
+        dtype=np.int32,
+    )
     if chunk_req_ids is not None:
         qsl = runner.query_start_loc_cpu.numpy()[: chunk_num_reqs + 1]
-        q_start, n_sched = qsl[:-1], qsl[1:] - qsl[:-1]
-        q0, active_len = int(qsl[0]), int(qsl[-1])
-        span_len = active_len - q0
-        is_uniform_stride = span_len == chunk_num_reqs * stride and bool(
-            np.all(n_sched == stride)
+        ref_qsl: Any = getattr(runner, "_host_engram_ref_qsl", None)
+        runner._host_engram_ref_qsl = ref_qsl = (
+            ref_qsl
+            if ref_qsl is not None
+            and ref_qsl[:3] == (chunk_num_reqs, stride, qsl.dtype)
+            else (
+                chunk_num_reqs,
+                stride,
+                qsl.dtype,
+                np.arange(0, (chunk_num_reqs + 1) * stride, stride, dtype=qsl.dtype),
+            )
         )
-        fast_id = is_identity_reqs and (is_uniform_stride or bool(np.all(n_sched > 0)))
+        fast_qsl = is_identity_reqs and memoryview(qsl) == memoryview(ref_qsl[3])
+        q_start, n_sched = (qsl, qsl) if fast_qsl else (qsl[:-1], qsl[1:] - qsl[:-1])
+        q0, active_len, span_len, is_uniform_stride = (
+            (0, chunk_num_reqs * stride, chunk_num_reqs * stride, True)
+            if fast_qsl
+            else (
+                (q0 := int(qsl[0])),
+                (active_len := int(qsl[-1])),
+                (span_len := active_len - q0),
+                span_len == chunk_num_reqs * stride and bool(np.all(n_sched == stride)),
+            )
+        )
+        fast_id = fast_qsl or (
+            is_identity_reqs and (is_uniform_stride or bool(np.all(n_sched > 0)))
+        )
         pre_pos: Any = (
             None
             if fast_id
@@ -571,15 +613,7 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
                     - n_draft
                 )
             else:
-                write_start = (
-                    np.asarray(
-                        batch.num_computed_tokens_cpu[
-                            start_index : start_index + chunk_num_reqs
-                        ],
-                        dtype=np.int32,
-                    )
-                    - n_draft
-                )
+                write_start = raw_starts - n_draft
             sampled_overlay = _SampledOverlay(
                 tokens=ov_tokens,
                 starts=write_start,
@@ -651,6 +685,7 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
         start_index,
         rejected_by_req=rejected_by_req,
         sampled_overlay=sampled_overlay,
+        raw_starts=raw_starts,
     )
     return HostEngramInputs(
         input_ids=ids,
