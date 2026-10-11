@@ -450,7 +450,7 @@ def _gather_query_rows(rows):
 
 def _row_slots(cache, block_table, requests, logical):
     """Gather fixed-width token rows without inspecting device values on host."""
-    safe = logical.clamp(min=0, max=block_table.shape[1] * cache.shape[1] - 1)
+    safe = logical.int().clamp(min=0, max=block_table.shape[1] * cache.shape[1] - 1)
     # Gather each token's table row, then index within it 128 columns at a
     # time. A [tokens, width] elementwise 2-D gather is 16-40x slower on TPU.
     rows = block_table[requests]
@@ -461,7 +461,7 @@ def _row_slots(cache, block_table, requests, logical):
             for start in range(0, pages.shape[1], 128)
         ],
         dim=1,
-    ).to(safe.dtype)
+    ).int()
     return blocks * cache.shape[1] + safe % cache.shape[1]
 
 
@@ -1638,7 +1638,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             .squeeze(0)
                         )
                         seg_valid = seg_perm >= 0
-                        seg_idx = seg_perm.clamp(min=0).long()
+                        seg_idx = seg_perm.clamp(min=0)
                         lengths_comp = lengths.index_select(0, seg_idx).masked_fill(
                             ~seg_valid[:, None], 0
                         )
@@ -1855,7 +1855,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             main_cache,
                             _block_table(source_meta),
                             requests_comp,
-                            selected.long(),
+                            selected,
                         )
                         main_records = main_cache.row_indices(slots).masked_fill(
                             ~valid_compressed, -1
@@ -1873,7 +1873,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         source.kv_cache,
                         _block_table(source_meta),
                         requests,
-                        selected.long(),
+                        selected,
                     )
                     rows = torch.cat((window, compressed_rows), 1)
                     valid_rows = torch.cat((valid_window, valid_compressed), 1)
@@ -1997,7 +1997,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         rows = cast(torch.Tensor, rows)
         q = cast(torch.Tensor, q)
         indices = (
-            torch.arange(rows.shape[1], device=rows.device)[None, :]
+            torch.arange(rows.shape[1], dtype=torch.int32, device=rows.device)[None, :]
             .expand(count, -1)
             .masked_fill(~valid_rows, -1)
         )
@@ -2318,7 +2318,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
                 blocks = published[..., :: self.candidate_block_size]
                 ids = (
-                    torch.arange(blocks.shape[-1], device=blocks.device)
+                    torch.arange(
+                        blocks.shape[-1], dtype=torch.int32, device=blocks.device
+                    )
                     .expand_as(blocks)
                     .masked_fill(~blocks, -1)
                 )
@@ -2327,7 +2329,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 ).values
                 self.candidate_block_buffer.copy_(
                     torch.nn.functional.pad(
-                        selected[0].int(),
+                        selected[0],
                         (
                             0,
                             self.candidate_block_buffer.shape[-1] - selected.shape[-1],

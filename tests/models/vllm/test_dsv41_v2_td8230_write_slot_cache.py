@@ -460,3 +460,36 @@ def test_td8258_token_requests_replayed_and_cache_slots_int32_addressing():
         assert slots_64.dtype == torch.int32
         assert slots_32.dtype == torch.int32
         assert torch.equal(slots_64, slots_32)
+
+
+def test_td8261_row_slots_seg_idx_and_select_indices_int32(monkeypatch):
+    from test_dsv41_v2_stage_attn_cache import _make_swa_attn
+
+    table = torch.tensor([[3, 5], [7, 9]], dtype=torch.int32)
+    cache = torch.empty((16, ROWS, 8))
+    reqs = torch.tensor([0, 1], dtype=torch.int64)
+    logical_64 = torch.tensor([[0, 5, 7], [1, 4, 6]], dtype=torch.int64)
+    logical_32 = logical_64.int()
+    slots_64 = v2_attn._row_slots(cache, table, reqs, logical_64)
+    slots_32 = v2_attn._row_slots(cache, table, reqs, logical_32)
+    assert slots_64.dtype == torch.int32
+    assert slots_32.dtype == torch.int32
+    assert torch.equal(slots_64, slots_32)
+
+    # Also test _select_indices candidate_write path with int32 ids
+    attn = _make_swa_attn(window_size=128, ced_decoder=False, has_fast_swa_offset=True)
+    attn._config = {"index_topk": 2, "candidate_topk_blocks": 2}
+    attn.candidate_block_size = 2
+    attn.candidate_block_buffer = torch.full((4, 2), -1, dtype=torch.int32)
+    attn.indexer = SimpleNamespace(
+        indexer_op=SimpleNamespace(candidate_blocks=True, candidate_write=True)
+    )
+    scores = torch.tensor(
+        [[[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [6.0, 5.0, 4.0, 3.0, 2.0, 1.0]]]
+    )
+    lengths = torch.tensor([[6], [6]], dtype=torch.int32)
+    logical_comp = torch.arange(6, dtype=torch.int32)[None, :].expand(2, -1)
+    selected = attn._select_indices(scores, lengths, logical_comp, count=2)
+    assert selected.dtype == torch.int32
+    assert attn.candidate_block_buffer.dtype == torch.int32
+    assert torch.all(attn.candidate_block_buffer[:2] >= 0)

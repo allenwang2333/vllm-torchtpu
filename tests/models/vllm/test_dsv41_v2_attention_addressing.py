@@ -42,12 +42,14 @@ def test_row_slots_matches_elementwise_gather(width):
         -5, 90 * rows_per_page + 5, (17, width), generator=generator
     )
     cache = torch.empty((1, rows_per_page))
-    safe = logical.clamp(0, table.shape[1] * rows_per_page - 1)
+    safe = logical.int().clamp(0, table.shape[1] * rows_per_page - 1)
     expected = (
-        table[requests[:, None], safe // rows_per_page].long() * rows_per_page
+        table[requests[:, None], (safe // rows_per_page).long()].int() * rows_per_page
         + safe % rows_per_page
     )
-    torch.testing.assert_close(_row_slots(cache, table, requests, logical), expected)
+    got = _row_slots(cache, table, requests, logical)
+    assert got.dtype == torch.int32
+    torch.testing.assert_close(got, expected)
 
 
 @pytest.mark.parametrize("width", [7, 300, 2560, 4000])
@@ -59,7 +61,7 @@ def test_request_row_slots_matches_token_row_slots(width):
     cache = torch.empty((1, rows_per_page))
     logical = torch.arange(width)[None, :].expand(requests.shape[0], -1)
     expected = _row_slots(cache, table, requests, logical)
-    got = _request_row_slots(cache, table, width).index_select(0, requests)
+    got = _request_row_slots(cache, table, width).index_select(0, requests).int()
     torch.testing.assert_close(got, expected)
 
 
