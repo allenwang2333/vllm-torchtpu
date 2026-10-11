@@ -335,3 +335,28 @@ def test_td8370_replaced_qsl_buffer_is_rewritten():
     runner.query_start_loc_np = fresh.numpy()
     _prepare(runner, sched)
     assert runner.query_start_loc_np.tolist() == [0, 3, 6]
+
+
+# --- TD8.378: np.take token gathers in every _prepare_inputs branch ---------
+
+
+@pytest.mark.parametrize(
+    "sched_tokens,expected",
+    [
+        ({"req-0": 1, "req-1": 1}, [4, 40]),  # decode-only
+        ({"req-0": 3, "req-1": 3}, [4, 5, 6, 40, 41, 42]),  # uniform 1+K
+        ({"req-0": 2, "req-1": 3}, [4, 5, 40, 41, 42]),  # ragged
+    ],
+)
+def test_td8378_token_gathers_match_table(sched_tokens, expected):
+    # token_ids_cpu[r, p] == r * 32 + p; computed tokens are [4, 8].
+    runner, sched = _runner({"req-0": 0, "req-1": 1})
+    sched.num_scheduled_tokens = sched_tokens
+    sched.total_num_scheduled_tokens = sum(sched_tokens.values())
+    _prepare(runner, sched)
+    n = len(expected)
+    assert runner.input_ids_cpu[:n].tolist() == expected
+    table = runner.input_batch.token_ids_cpu
+    pos = runner.positions_np[:n]
+    rows = np.repeat([0, 1], list(sched_tokens.values()))
+    np.testing.assert_array_equal(runner.input_ids_cpu[:n].numpy(), table[rows, pos])

@@ -3476,11 +3476,11 @@ class TPUModelRunner(GPUModelRunner):
             token_indices = (
                 positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
             )
-            torch.index_select(
-                self.input_batch.token_ids_cpu_tensor.flatten(),
-                0,
-                torch.from_numpy(token_indices),
-                out=self.input_ids_cpu[:num_reqs],
+            # np.take on the host table skips torch's index_select dispatch.
+            np.take(
+                self.input_batch.token_ids_cpu,
+                token_indices,
+                out=self.input_ids_cpu.numpy()[:num_reqs],
             )
         elif num_reqs == 1:
             # Fast path for single-request prefill chunk: copy contiguous slice
@@ -3510,22 +3510,23 @@ class TPUModelRunner(GPUModelRunner):
             ]
             arange_k = self.arange_np[:k_sched][None, :]
             positions_np = self.positions_np[:total_num_scheduled_tokens]
+            pos_2d = positions_np.reshape(num_reqs, k_sched)
             np.add(
                 base_pos[:, None],
                 arange_k,
-                out=positions_np.reshape(num_reqs, k_sched),
+                out=pos_2d,
                 casting="unsafe",
             )
             req_rows = self.arange_np[start_index : start_index + num_reqs]
-            row_bases = (base_pos + req_rows * self.input_batch.token_ids_cpu.shape[1])[
-                :, None
-            ]
-            token_indices = (row_bases + arange_k).reshape(-1)
-            torch.index_select(
-                self.input_batch.token_ids_cpu_tensor.flatten(),
-                0,
-                torch.from_numpy(token_indices),
-                out=self.input_ids_cpu[:total_num_scheduled_tokens],
+            # token_indices = positions + req_index * max_model_len, reusing the
+            # int32 positions just written instead of re-broadcasting base_pos.
+            token_indices = (
+                pos_2d + (req_rows * self.input_batch.token_ids_cpu.shape[1])[:, None]
+            ).reshape(-1)
+            np.take(
+                self.input_batch.token_ids_cpu,
+                token_indices,
+                out=self.input_ids_cpu.numpy()[:total_num_scheduled_tokens],
             )
         else:
             # General path: mixed prefill + decode with heterogeneous token counts.
@@ -3546,11 +3547,10 @@ class TPUModelRunner(GPUModelRunner):
             token_indices = (
                 positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
             )
-            torch.index_select(
-                self.input_batch.token_ids_cpu_tensor.flatten(),
-                0,
-                torch.from_numpy(token_indices),
-                out=self.input_ids_cpu[:total_num_scheduled_tokens],
+            np.take(
+                self.input_batch.token_ids_cpu,
+                token_indices,
+                out=self.input_ids_cpu.numpy()[:total_num_scheduled_tokens],
             )
 
         np.add(
