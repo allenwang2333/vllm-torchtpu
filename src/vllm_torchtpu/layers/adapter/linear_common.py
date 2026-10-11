@@ -9,6 +9,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
@@ -171,7 +172,9 @@ def _fp8_linear_pallas_jax(
     n_out = w_q.shape[1]
     kw, ks = (w_q, w_s) if w_k is None else (w_k, s_k)
     if fp8_skinny.supports(x.shape[0], kw, ks):
-        return fp8_skinny.fp8_skinny_matmul(x, kw, ks, n_logical=n_out)
+        return fp8_skinny.fp8_skinny_matmul(
+            x, kw, ks, n_logical=n_out, scale_dma=envs.TPU_FP8_SKINNY_SCALE_DMA
+        )
     return xla_quantized_matmul(x, w_q, w_s)
 
 
