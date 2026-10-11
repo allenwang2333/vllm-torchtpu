@@ -63,13 +63,19 @@ def spec_logprobs_lists(
     counted across all chunks before any discard, as vLLM's rejection
     sampler does.
     """
+    # One prefix sum over the whole step serves every chunk and the result's
+    # cu_num_generated_tokens.
+    gen_arr = np.asarray(gen_lens, dtype=np.int32)
+    cu_gen = np.cumsum(gen_arr, dtype=np.int32)
     ids, lps, ranks = [], [], []
     offset = 0
     for chunk in chunks:
         n = len(chunk.row_starts)
         if n:
-            g_arr = np.asarray(gen_lens[offset : offset + n], dtype=np.int32)
-            cu_g = np.cumsum(g_arr, dtype=np.int32)
+            g_arr = gen_arr[offset : offset + n]
+            cu_g = cu_gen[offset : offset + n]
+            if offset:
+                cu_g = cu_g - cu_gen[offset - 1]
             rows = np.repeat(
                 chunk.row_starts.astype(np.int32, copy=False) - (cu_g - g_arr),
                 g_arr,
@@ -81,13 +87,18 @@ def spec_logprobs_lists(
         ranks.append(chunk.tensors.selected_token_ranks.numpy()[rows])
         offset += n
     assert offset == len(gen_lens), (offset, len(gen_lens))
+    if len(ids) == 1:
+        # The fancy-indexed rows are already fresh arrays; skip the copy.
+        token_ids, logprobs, sampled_ranks = ids[0], lps[0], ranks[0]
+    else:
+        token_ids = np.concatenate(ids)
+        logprobs = np.concatenate(lps)
+        sampled_ranks = np.concatenate(ranks)
     return LogprobsLists(
-        logprob_token_ids=np.concatenate(ids),
-        logprobs=np.concatenate(lps),
-        sampled_token_ranks=np.concatenate(ranks),
-        cu_num_generated_tokens=np.concatenate(
-            ([0], np.cumsum(gen_lens, dtype=np.int32))
-        ).tolist(),
+        logprob_token_ids=token_ids,
+        logprobs=logprobs,
+        sampled_token_ranks=sampled_ranks,
+        cu_num_generated_tokens=np.concatenate(([0], cu_gen)).tolist(),
     )
 
 

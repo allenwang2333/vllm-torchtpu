@@ -74,7 +74,8 @@ class SpeculativeDecodingManager:
         self._meta_cache: SpecDecodeMetadata | None = None
         # (logits_indices, target_logits_indices, padded_logits_length) from
         # the cached build — needed to re-extract draft_token_ids on a hit.
-        self._meta_cache_np: tuple[np.ndarray, np.ndarray, int] | None = None
+        # (draft_batch_indices, padded_logits_length) for cache-hit draft ids.
+        self._meta_cache_np: tuple[np.ndarray, int] | None = None
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if self._staged_draft_copy is not None:
@@ -257,15 +258,11 @@ class SpeculativeDecodingManager:
             if skip_host_draft_tokens:
                 draft_token_ids_dev = self._meta_cache.draft_token_ids
             else:
-                logits_indices, target_logits_indices, padded_logits_length = (
-                    self._meta_cache_np
-                )
+                draft_batch_indices, padded_logits_length = self._meta_cache_np
                 # draft_token_ids depends on this step's input_ids_cpu content —
                 # always re-extracted and re-transferred.
                 all_token_ids = self.runner.input_ids_cpu.numpy()
-                draft_token_ids = all_token_ids[
-                    logits_indices[target_logits_indices + 1]
-                ]
+                draft_token_ids = all_token_ids[draft_batch_indices]
                 padded_draft_token_ids = np.zeros(padded_logits_length, dtype=np.int32)
                 padded_draft_token_ids[: draft_token_ids.shape[0]] = draft_token_ids
                 draft_token_ids_dev = torch.from_numpy(padded_draft_token_ids).to(
@@ -364,7 +361,8 @@ class SpeculativeDecodingManager:
 
         # Compute the draft token ids for validation.
         all_token_ids = self.runner.input_ids_cpu.numpy()
-        draft_token_ids = all_token_ids[logits_indices[target_logits_indices + 1]]
+        draft_batch_indices = logits_indices[target_logits_indices + 1]
+        draft_token_ids = all_token_ids[draft_batch_indices]
 
         # Padding
         from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
@@ -426,11 +424,7 @@ class SpeculativeDecodingManager:
             segment_ids=segment_ids_dev,
             group_indices=group_indices_dev,
         )
-        self._meta_cache_np = (
-            logits_indices,
-            target_logits_indices,
-            padded_logits_length,
-        )
+        self._meta_cache_np = (draft_batch_indices, padded_logits_length)
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids_dev,
             draft_lengths=draft_lengths_dev,
