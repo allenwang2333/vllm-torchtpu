@@ -549,19 +549,22 @@ def _request_row_slots(cache, block_table, width, page_records: int = 0):
     """
     rows_per_page = cache.shape[1]
     fast_offset = _has_fast_cache_offset(cache)
-    table_blocks = block_table.to(torch.int32) if fast_offset else block_table.long()
-    page_bases = table_blocks * (cache.page_stride if fast_offset else rows_per_page)
+    use_int32 = fast_offset or isinstance(cache, PagedCacheRows)
+    stride = cache.page_stride if fast_offset else rows_per_page
     if page_records > 1 and rows_per_page == page_records:
         num_pages = (width + rows_per_page - 1) // rows_per_page
-        if num_pages > page_bases.shape[1]:
-            page_bases = torch.cat(
+        table = block_table[:, :num_pages]
+        if num_pages > table.shape[1]:
+            table = torch.cat(
                 (
-                    page_bases,
-                    page_bases[:, -1:].expand(-1, num_pages - page_bases.shape[1]),
+                    table,
+                    table[:, -1:].expand(-1, num_pages - table.shape[1]),
                 ),
                 dim=1,
             )
-        return page_bases[:, :num_pages]
+        return (table.to(torch.int32) if use_int32 else table.long()) * stride
+    table_blocks = block_table.to(torch.int32) if use_int32 else block_table.long()
+    page_bases = table_blocks * stride
     # Logical row r lives in table column r // rows_per_page, so repeating each
     # column rows_per_page times lines blocks up with rows 0..width-1 without
     # a full-width gather (16-40x slower on TPU, see _row_slots).
@@ -1337,7 +1340,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     )
                 swa_row_slots_masked = (
                     swa_row_slots.masked_fill(invalid_window, -1)
-                    if swa_row_slots is not None
+                    if swa_row_slots is not None and has_fast_swa_offset
                     else None
                 )
                 # The token write rows (b2, pos_rem) shared by every SWA layer;

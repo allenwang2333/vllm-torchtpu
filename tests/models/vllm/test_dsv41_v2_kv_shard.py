@@ -710,8 +710,25 @@ class TestAttentionKvShard:
                                 attn._prepare_tpu(
                                     None, qr, kv, None, None, idx_w, positions, out
                                 )
+                                sc = v2_attn._active_stage_attn_cache
+                                assert sc is not None
+                                for k, v in sc.items():
+                                    if (
+                                        isinstance(k, tuple)
+                                        and k[1] == "swa_token_slots"
+                                    ):
+                                        if is_sharded:
+                                            assert v[9] is None
+                                        else:
+                                            assert v[9] is not None
+                                    if (
+                                        isinstance(k, tuple)
+                                        and k[1] == "index_req_slots"
+                                    ):
+                                        assert v.dtype == torch.int32
                             assert torch.equal(seen_swa[0], ref_swa_recs)
                             assert torch.equal(seen_idx[0], ref_idx_recs)
+                            assert seen_idx[0].dtype == torch.int32
                             if is_sharded:
                                 assert swa_ri_calls == 2
                                 assert idx_ri_calls == 2
@@ -721,7 +738,6 @@ class TestAttentionKvShard:
                                 assert swa_ri_calls == 0
                                 assert idx_ri_calls == 0
                                 assert seen_swa[0].dtype == torch.int32
-                                assert seen_idx[0].dtype == torch.int32
                                 assert seen_swa[0] is seen_swa[1]
                                 assert seen_idx[0] is seen_idx[1]
 
