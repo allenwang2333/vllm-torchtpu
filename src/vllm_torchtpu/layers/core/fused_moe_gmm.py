@@ -253,7 +253,7 @@ def _moe_gmm_tiling(
             )
     if (
         dims.size_group > 1
-        and 32 <= dims.size_m <= dims.size_group * 40
+        and 32 <= dims.size_m <= dims.size_group * 64
         and 32 % dims.size_lhs_sublane == 0
     ):
         return TileSizes(
@@ -714,11 +714,16 @@ def moe_gmm(
 
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     inter_dim = w2.shape[1] * packing_factor
-    is_w2_fp4 = (
+    is_w2_fp4 = rhs_quant_dtype == jnp.float4_e2m1fn or (
         jnp.issubdtype(w2.dtype, jnp.floating)
         and jax.dtypes.itemsize_bits(w2.dtype) == 4
     )
     fuse_gmm1_fp8 = not is_w2_fp4 and inter_dim == 512
+    if is_w2_fp4 and lhs_scale is not None:
+        x = (
+            x.reshape(x.shape[0], lhs_scale.shape[1], -1) * lhs_scale[:, :, None]
+        ).reshape(x.shape).astype(jnp.bfloat16)
+        lhs_scale = None
     gmm1_res = gmm_wrapper(
         x,
         w1,

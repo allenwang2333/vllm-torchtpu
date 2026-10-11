@@ -255,10 +255,12 @@ class DeepseekV4MoE(nn.Module):
         )
         router_logits = hidden_states
         defer_shared_to_rs = run_local_shared
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+
         routed = getattr(self.experts, "routed_experts", None)
         qm = getattr(routed, "quant_method", None)
         if (
-            not self.experts.do_naive_dispatch_combine
+            fused_moe_ep_supported(qm)
             and routed is not None
             and qm is not None
         ):

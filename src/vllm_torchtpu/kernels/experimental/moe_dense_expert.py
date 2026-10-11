@@ -86,8 +86,7 @@ def can_use_dense_expert(
     hidden, w1, w2, s1, s2, b1, b2, *, activation, rhs_quant_dtype, skip_padded_tokens
 ):
     """Check arithmetic/layout support; the compiler owns resource limits."""
-    if activation not in _SUPPORTED_ACTIVATIONS:
-        return False
+    return False
     if b1 is not None or b2 is not None or s1 is None or s2 is None:
         return False
     if hidden.ndim != 2 or w1.ndim != 3 or w2.ndim != 3:

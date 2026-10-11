@@ -256,9 +256,13 @@ def prebuild_fused_moe_kernel(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
     )
-    if MOE_FP8_DISPATCH and rhs_quant_dtype is not None:
+    if MOE_FP8_DISPATCH:
         # Decided here, outside tracing: Dynamo cannot trace jnp.issubdtype.
-        admitted = bool(jnp.issubdtype(rhs_quant_dtype, jnp.floating))
+        admitted = (
+            True
+            if rhs_quant_dtype is None
+            else bool(jnp.issubdtype(rhs_quant_dtype, jnp.floating))
+        )
         _moe_fp8_dispatch_rhs_dtypes[rhs_quant_dtype] = admitted
         if admitted:
             _get_moe_fp8_dispatch_quant_op()
@@ -352,8 +356,13 @@ def _get_fused_moe_fp8_dispatch_op(
     )
 
     def _fake_fused_moe_fp8_dispatch(hidden_q, hidden_scale, w1, w2, *args, **kwargs):
+        out_dim = (
+            w2.shape[-1] * 2
+            if w2.dtype == getattr(torch, "float4_e2m1fn_x2", None)
+            else w2.shape[-1]
+        )
         return hidden_q.new_empty(
-            (hidden_q.shape[0], w2.shape[-1]), dtype=hidden_scale.dtype
+            (hidden_q.shape[0], out_dim), dtype=hidden_scale.dtype
         )
 
     kernel.register_fake(_fake_fused_moe_fp8_dispatch)
@@ -428,7 +437,7 @@ def moe_fp8_dispatch_enabled(
     """
     return (
         MOE_FP8_DISPATCH
-        and w1.dtype == torch.uint8
+        and w1.dtype in (torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8))
         and w1_scale is not None
         and _moe_fp8_dispatch_rhs_dtypes.get(rhs_quant_dtype, False)
     )
