@@ -1407,3 +1407,160 @@ class TestTd78StageInvariantHoistingAndFullCoverage:
         )
         attn.process_weights_after_loading(torch.bfloat16)
         assert o_proj_called == 1
+
+    def test_compress_norm_addr_int32_bit_exact_and_paged_rows(self):
+        """Verify int32 dtypes, pos=0 wrap, PagedCacheRows safety, and bit parity."""
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2 import cache as v2_cache
+
+        torch.manual_seed(1234)
+        capacity = 16
+        dim = 127
+        count = 6
+        # Include pos=0 wrap-around and -1 padding slots
+        positions = torch.tensor([0, 1, 15, 16, 0, 3], dtype=torch.int32)
+        slot_mapping = torch.tensor([32, 33, 47, 32, 64, -1], dtype=torch.int32)
+        query_start_loc = torch.tensor([0, 2, 4, 5], dtype=torch.int32)
+        token_to_req = torch.tensor([0, 0, 1, 1, 2, 2], dtype=torch.int32)
+
+        addr = v2_attn._compress_norm_addr(
+            count, positions, slot_mapping, query_start_loc, token_to_req, capacity
+        )
+        prev_blocks, prev_rem, in_chunk, prev_row_idx, publish, final_valid = addr
+        assert prev_blocks.dtype == torch.int32
+        assert prev_rem.dtype == torch.int32
+        assert prev_row_idx.dtype == torch.int32
+        assert in_chunk.dtype == torch.bool
+        assert publish.dtype == torch.bool
+        assert final_valid.dtype == torch.bool
+        # Verify pos=0 wraps to capacity - 1 == 15
+        assert prev_rem[0].item() == capacity - 1
+        assert prev_rem[4].item() == capacity - 1
+
+        record_dim = 128
+        kv_score = torch.randn(count, record_dim, dtype=torch.float32)
+        norm_weight = torch.ones(dim, dtype=torch.float32)
+        init_pool = torch.randn(6, capacity, record_dim, dtype=torch.float32)
+        raw_pool = init_pool.view(torch.int32).reshape(6 * capacity, v2_cache.ROW_WORDS)
+
+        # Reference int64 computation (legacy formula)
+        ref_cache = init_pool.clone()
+        rows64 = torch.arange(count)
+        reqs = token_to_req.int().clamp(max=query_start_loc.numel() - 2)
+        starts = query_start_loc.index_select(0, reqs)
+        ends = query_start_loc.index_select(0, reqs + 1)
+        prev_slots = (
+            slot_mapping.clamp(min=0) // capacity * capacity
+            + (positions - 1) % capacity
+        )
+        stored_ref = ref_cache[prev_slots // capacity, prev_slots % capacity]
+        prev_ref = torch.where(
+            (rows64 > starts)[:, None],
+            kv_score.index_select(0, (rows64 - 1).clamp(min=0).int()).float(),
+            stored_ref,
+        )
+        scores_ref = torch.stack((prev_ref[:, dim:], kv_score[:, dim:].float()), 1)
+        pair_ref = torch.stack((prev_ref[:, :dim], kv_score[:, :dim].float()), 1)
+        vals_ref = (pair_ref * scores_ref.softmax(1)).sum(1)
+        valid_ref = slot_mapping >= 0
+        pub_ref = valid_ref & (rows64 >= ends - capacity)
+        v2_cache.write_cache(
+            ref_cache, slot_mapping, kv_score.float(), pub_ref, after=stored_ref
+        )
+        valid_ref = valid_ref & (positions % 2 == 1)
+        lat_ref = (
+            v2_attn.rms_norm(vals_ref, norm_weight, 1e-6)
+            .masked_fill(~valid_ref[:, None], 0)
+            .to(torch.bfloat16)
+        )
+
+        # 1. KV_SHARD=0 (torch.Tensor) default precomputed_addr=None path
+        cache_u = init_pool.clone()
+        lat_u = torch.empty((count, dim), dtype=torch.bfloat16)
+        v2_attn.save_compress_norm(
+            kv_score,
+            positions,
+            cache_u,
+            slot_mapping,
+            query_start_loc,
+            token_to_req,
+            norm_weight,
+            1e-6,
+            2,
+            lat_u,
+        )
+        assert torch.equal(lat_u, lat_ref)
+        assert torch.equal(cache_u, ref_cache)
+
+        # 2. KV_SHARD=1 (PagedCacheRows) with explicit precomputed_addr
+        raw_backed = raw_pool.clone()
+        layout = (
+            (6, capacity, record_dim),
+            torch.float32,
+            capacity * record_dim * 4,
+            0,
+        )
+        cache_paged = v2_cache.PagedCacheRows(raw_backed, layout)
+        lat_p = torch.empty((count, dim), dtype=torch.bfloat16)
+        v2_attn.save_compress_norm(
+            kv_score,
+            positions,
+            cache_paged,
+            slot_mapping,
+            query_start_loc,
+            token_to_req,
+            norm_weight,
+            1e-6,
+            2,
+            lat_p,
+            precomputed_addr=addr,
+        )
+        assert torch.equal(lat_p, lat_ref)
+        assert torch.equal(
+            raw_backed.view(torch.float32).reshape(6, capacity, record_dim), ref_cache
+        )
+
+    def test_four_layer_compressor_stage_reuse_l2_l8_l14_l20(self, monkeypatch):
+        """Verify L2/L8/L14/L20 compressors compute _compress_norm_addr once."""
+        table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+        state_meta = SimpleNamespace(
+            seq_lens=torch.tensor([2, 2], dtype=torch.int32),
+            block_tables=table,
+            query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+        )
+        state_cache = torch.randn(6, 16, 9, dtype=torch.float32)
+        forward_ctx = SimpleNamespace(
+            attn_metadata={"state_prefix": state_meta}, additional_kwargs={}
+        )
+        monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
+
+        real_addr_fn = v2_attn._compress_norm_addr
+        call_count = 0
+
+        def counting_addr(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return real_addr_fn(*args, **kwargs)
+
+        monkeypatch.setattr(v2_attn, "_compress_norm_addr", counting_addr)
+
+        compressors = []
+        for _layer_idx in (2, 8, 14, 20):
+            comp: Any = object.__new__(v2_attn.DeepseekCompressor)
+            torch.nn.Module.__init__(comp)
+            comp.head_dim = 8
+            comp.compress_ratio = 2
+            comp.rms_norm_eps = 1e-6
+            comp.norm = SimpleNamespace(weight=torch.ones(8, dtype=torch.float32))
+            comp.state_cache = SimpleNamespace(
+                prefix="state_prefix", kv_cache=state_cache.clone()
+            )
+            compressors.append(comp)
+
+        positions = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+        kv_score = torch.randn(4, 9, dtype=torch.float32)
+
+        with v2_attn.stage_attention_cache_scope():
+            outs = [c.forward(kv_score, positions) for c in compressors]
+        assert call_count == 1
+        for out in outs[1:]:
+            assert torch.equal(out, outs[0])

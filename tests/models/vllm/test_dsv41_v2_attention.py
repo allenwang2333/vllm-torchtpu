@@ -822,3 +822,43 @@ def test_token_requests_matches_bucketize(lens):
     ref = torch.bucketize(rows, qsl[1:], right=True, out_int32=True)
     assert out.dtype == ref.dtype
     assert torch.equal(out, ref)
+
+
+def test_td8339_compressor_write_slots_memo_key_omits_dynamic_token_count(monkeypatch):
+    """TD8.339: Verify DeepseekCompressor.forward keys compressor_write_slots by
+    ('compressor_write_slots', table.shape, state_rows) without kv_score.shape[0]
+    (Horace 1-line Dynamo fix preventing non-tensor FX graph output break)."""
+    table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    state_meta = SimpleNamespace(
+        seq_lens=torch.tensor([2, 2], dtype=torch.int32),
+        block_tables=table,
+        query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+    )
+    state_cache = torch.randn(6, 16, 9, dtype=torch.float32)
+    forward_ctx = SimpleNamespace(
+        attn_metadata={"state_prefix": state_meta}, additional_kwargs={}
+    )
+    monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
+
+    comp = object.__new__(v2_attn.DeepseekCompressor)
+    torch.nn.Module.__init__(comp)
+    comp.head_dim = 8
+    comp.compress_ratio = 2
+    comp.rms_norm_eps = 1e-6
+    comp.norm = SimpleNamespace(weight=torch.ones(8, dtype=torch.float32))
+    comp.state_cache = SimpleNamespace(
+        prefix="state_prefix", kv_cache=state_cache.clone()
+    )
+
+    positions = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    kv_score = torch.randn(4, 9, dtype=torch.float32)
+
+    with v2_attn.stage_attention_cache_scope():
+        stage_cache = v2_attn._active_stage_attn_cache
+        assert stage_cache is not None
+        out = comp.forward(kv_score, positions)
+        expected_key = ("compressor_write_slots", table.shape, 16)
+        assert expected_key in stage_cache
+        assert len(expected_key) == 3
+        assert len(stage_cache[expected_key]) == 3
+        assert out.shape == (4, 8)

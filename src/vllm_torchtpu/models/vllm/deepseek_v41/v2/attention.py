@@ -226,6 +226,33 @@ class CompressorStateCache(NativeCacheView, compressor_upstream.CompressorStateC
         return AttentionBackend
 
 
+def _compress_norm_addr(
+    count,
+    positions,
+    slot_mapping,
+    query_start_loc,
+    token_to_req_indices,
+    capacity,
+):
+    """Precompute stage-invariant native int32 ring-cache addressing tensors."""
+    positions = positions[:count]
+    slot_mapping = slot_mapping[:count]
+    token_to_req_indices = token_to_req_indices[:count]
+    valid = slot_mapping >= 0
+    rows = torch.arange(count, dtype=torch.int32, device=positions.device)
+    qsl_i32 = query_start_loc.int()
+    requests = token_to_req_indices.int().clamp(max=qsl_i32.numel() - 2)
+    starts = qsl_i32.index_select(0, requests)
+    ends = qsl_i32.index_select(0, requests + 1)
+    prev_blocks = slot_mapping.clamp(min=0) // capacity
+    prev_rem = (positions - 1) % capacity
+    in_chunk = (rows > starts)[:, None]
+    prev_row_idx = (rows - 1).clamp(min=0)
+    publish = valid & (rows >= ends - capacity)
+    final_valid = valid & ((positions & 1) == 1)
+    return prev_blocks, prev_rem, in_chunk, prev_row_idx, publish, final_valid
+
+
 def save_compress_norm(
     kv_score,
     positions,
@@ -237,6 +264,8 @@ def save_compress_norm(
     eps,
     ratio,
     latent,
+    *,
+    precomputed_addr=None,
 ):
     """Tensor implementation of the compressor_upstream fused compression operation.
 
@@ -253,29 +282,33 @@ def save_compress_norm(
     values = kv_score[:, :dim].float()
     valid = slot_mapping >= 0
     if ratio == 2:
-        capacity = state_cache.shape[1]
         cache = state_cache
-        rows = torch.arange(kv_score.shape[0], device=kv_score.device)
-        requests = token_to_req_indices.int().clamp(max=query_start_loc.numel() - 2)
-        starts = query_start_loc.index_select(0, requests)
-        ends = query_start_loc.index_select(0, requests + 1)
-        previous_slots = (
-            slot_mapping.clamp(min=0) // capacity * capacity
-            + (positions - 1) % capacity
+        addr = precomputed_addr or (
+            _active_stage_attn_cache.get("_compress_norm_addr")
+            if _active_stage_attn_cache is not None
+            else None
         )
-        stored = cache[previous_slots // capacity, previous_slots % capacity]
+        if addr is None:
+            addr = _compress_norm_addr(
+                count,
+                positions,
+                slot_mapping,
+                query_start_loc,
+                token_to_req_indices,
+                cache.shape[1],
+            )
+        prev_blocks, prev_rem, in_chunk, prev_row_idx, publish, valid = addr
+        stored = cache[prev_blocks, prev_rem]
         previous = torch.where(
-            (rows > starts)[:, None],
-            kv_score.index_select(0, (rows - 1).clamp(min=0).int()).float(),
+            in_chunk,
+            kv_score.index_select(0, prev_row_idx).float(),
             stored,
         )
         scores = torch.stack((previous[:, dim:], kv_score[:, dim:].float()), 1)
         pair = torch.stack((previous[:, :dim], values), 1)
         values = (pair * scores.softmax(1)).sum(1)
         # All reads above refer to the old ring. Keep unique physical writes.
-        publish = valid & (rows >= ends - capacity)
         write_cache(cache, slot_mapping, kv_score.float(), publish, after=stored)
-        valid = valid & (positions % 2 == 1)
     elif ratio != 1:
         raise ValueError(f"V4.1 compression ratio must be 1 or 2, got {ratio}")
     result = rms_norm(values, norm_weight, eps)
@@ -320,6 +353,9 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
         metadata = get_forward_context().attn_metadata
         if not isinstance(metadata, dict):
             return None
+        stage_cache = _active_stage_attn_cache
+        if stage_cache is not None:
+            stage_cache["_compress_norm_addr"] = None
         if self.state_cache is None:
             state_cache = query_start_loc = requests = None
             cache = self._static_forward_context[self.k_cache_prefix].kv_cache
@@ -327,7 +363,6 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
         else:
             state_metadata = metadata[self.state_cache.prefix]
             state_cache = self.state_cache.kv_cache
-            stage_cache = _active_stage_attn_cache
             state_rows = (
                 state_cache.shape[1]
                 if isinstance(getattr(state_cache, "shape", None), tuple)
@@ -371,8 +406,8 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
                         valid_token,
                     ) = cached_state
                 # Every compressed layer (L2/8/14/20) of a stage gathers the
-                # same block-table column for the same tokens: share the slots
-                # while the stage keeps the same block_tables tensor.
+                # same block-table column and ring offsets for the same tokens:
+                # share the slots and precomputed int32 addressing across layers.
                 slot_key = _memo_stage_cache_key(
                     self, "compressor_write_slots", table.shape, state_rows
                 )
@@ -381,13 +416,29 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
                     cached_slots is not None
                     and cached_slots[0] is state_metadata.block_tables
                 ):
-                    slots = cached_slots[1]
+                    slots, stage_cache["_compress_norm_addr"] = (
+                        cached_slots[1],
+                        cached_slots[2],
+                    )
                 else:
                     blocks = table[:, 0].index_select(0, clamped_requests).int()
                     slots = (blocks * state_rows + ring_rem).masked_fill(
                         ~valid_token, -1
                     )
-                    stage_cache[slot_key] = (state_metadata.block_tables, slots)
+                    comp_addr = _compress_norm_addr(
+                        kv_score.shape[0],
+                        positions,
+                        slots,
+                        query_start_loc,
+                        requests,
+                        state_rows,
+                    )
+                    stage_cache[slot_key] = (
+                        state_metadata.block_tables,
+                        slots,
+                        comp_addr,
+                    )
+                    stage_cache["_compress_norm_addr"] = comp_addr
             else:
                 slots = _cache_slots(
                     state_cache, state_metadata, positions, ring=True
@@ -1237,7 +1288,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             )
             cached_swa = stage_cache.get(swa_key)
             if cached_swa is None:
-                token_rows = torch.arange(positions.shape[0], device=positions.device)
+                token_rows = torch.arange(
+                    positions.shape[0], dtype=torch.int32, device=positions.device
+                )
                 valid_token = token_rows < swa.query_start_loc[-1]
                 requests = _token_requests(swa, positions).clamp(
                     max=swa_table.shape[0] - 1
