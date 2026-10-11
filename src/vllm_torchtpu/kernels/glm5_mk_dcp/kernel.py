@@ -1281,6 +1281,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
         def scan_request(l, b):
             """Score request b's rows against this rank's local indexer keys; local top-KT per row."""
+            ps_ = Phases(tiles.trace)
+            ps_.mark("I_scan")
             IH, IDIM = cfg.IH, cfg.IDIM
             t0 = qmeta[b, 0]
             nq = qmeta[b, 1]
@@ -1355,6 +1357,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             csel(("idx",), l, run)
 
             # local top-KT per row of the request
+            ps_.mark("I_ltopk")
             for qq in range(cfg.QMAX):
                 @pl.when(qq < nq)
                 def _(qq=qq):
@@ -1365,6 +1368,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                     topk2.local_topk(scr["keys"].at[qq], nval, KT, scr["cidx"], scr["ksend"].at[t_],
                                      scr["kpre"], scr["tk_acc"], scr["tk_cc"], kc=tiles.topk_kc)
                     scr["cand_v"][t_] = scr["cidx"][...]
+            ps_.end()
 
         def resolve_union():
             """own_uv entries (local index | row bits << MB_SH) -> gather source | row bits, in vector
