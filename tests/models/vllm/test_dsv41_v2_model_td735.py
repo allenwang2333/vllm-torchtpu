@@ -420,3 +420,111 @@ def test_td8255_ced_replay_and_window_starts_int32_with_int64_positions(monkeypa
         assert torch.equal(
             captured_dec_rep[-1], torch.tensor([16, 48], dtype=torch.int32)
         )
+
+
+def test_td8259_ced_non_identity_int32_gather_inverse_and_pad_scatter(monkeypatch):
+    """TD8.259: Verify _ced_inverse_rows, _scatter_decoder_rows,
+    _get_ced_non_identity_tensors, and non-identity forward use native int32
+    inverse/gather and F.pad + index_select."""
+    from dataclasses import dataclass, field
+
+    @dataclass
+    class _FakeMeta:
+        seq_lens: torch.Tensor
+        query_start_loc: torch.Tensor
+        input_positions: torch.Tensor | None = None
+
+    @dataclass
+    class _FakeCtx:
+        attn_metadata: dict
+        additional_kwargs: dict = field(default_factory=dict)
+        is_padding: torch.Tensor | None = None
+
+    inv = v2_model._ced_inverse_rows((1, 3), 3, 4, torch.device("cpu"))
+    assert inv.dtype == torch.int32
+    assert torch.equal(inv, torch.tensor([3, 0, 3, 1], dtype=torch.int32))
+
+    src = torch.tensor([[10.0, 20.0], [30.0, 40.0], [99.0, 99.0]])
+    scat = v2_model._scatter_decoder_rows(src, inv)
+    ref = torch.cat([src, src.new_zeros((1, src.shape[-1]))]).index_select(0, inv)
+    assert torch.equal(scat, ref)
+
+    dummy = SimpleNamespace()
+    plan = DecoderReplayPlan(
+        indices=[1, 3],
+        query_start_loc=[0, 1, 2],
+        replay_starts=(0, 0),
+        padded_num_tokens=4,
+        is_identity=False,
+    )
+    pos = torch.tensor([100, 101, 102, 103], dtype=torch.int64)
+    inv_t, gather_t, bounds_t = DeepseekV41Model._get_ced_non_identity_tensors(
+        dummy, plan, 4, pos
+    )
+    assert inv_t.dtype == torch.int32
+    assert gather_t.dtype == torch.int32
+    assert bounds_t.dtype == torch.int32
+    assert torch.equal(inv_t, torch.tensor([4, 0, 4, 1], dtype=torch.int32))
+    assert torch.equal(gather_t, torch.tensor([1, 3, 3, 3], dtype=torch.int32))
+    assert torch.equal(bounds_t, torch.tensor([0, 1, 2], dtype=torch.int32))
+    # Cache hit
+    cached = DeepseekV41Model._get_ced_non_identity_tensors(dummy, plan, 4, pos)
+    assert cached[0] is inv_t and cached[1] is gather_t and cached[2] is bounds_t
+
+    model = DeepseekV41Model.__new__(DeepseekV41Model)
+    model._ced_enabled = True
+    model._ced_boundary = 1
+    model._ced_window = 512
+    model._ced_compile_sizes = (4,)
+    model._ced_dp_sync = False
+    model.start_layer = 0
+    model.end_layer = 2
+    model.layers = []
+    model.use_sequence_parallel = False
+    model.use_mega_moe = False
+    model.config = SimpleNamespace(hidden_size=2)
+    model.aux_hidden_state_layers = ()
+
+    first_meta = _FakeMeta(
+        seq_lens=torch.tensor([2, 2], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+    )
+    ctx = _FakeCtx(attn_metadata={"l0": first_meta})
+
+    captured_dec_args: list[tuple] = []
+
+    model.encoder_stage = lambda *a: (
+        torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]),
+        torch.tensor([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6], [0.7, 0.8]]),
+    )
+
+    def fake_dec(dec_ids, dec_pos, inputs_embeds=None, encoder_pre_mix=None):
+        captured_dec_args.append((dec_ids, dec_pos, inputs_embeds, encoder_pre_mix))
+        return inputs_embeds * 2.0
+
+    model.decoder_stage = fake_dec
+    monkeypatch.setattr(v2_model, "plan_decoder_replay", lambda *a: plan)
+
+    with v2_model.override_forward_context(ctx):
+        out_with_ids = model.forward(
+            torch.tensor([10, 20, 30, 40], dtype=torch.int32), pos
+        )
+        out_no_ids = model.forward(None, pos, inputs_embeds=torch.zeros((4, 2)))
+
+    dec_ids, dec_pos, dec_h, dec_m = captured_dec_args[0]
+    assert dec_ids is not None and torch.equal(
+        dec_ids, torch.tensor([20, 40, 40, 40], dtype=torch.int32)
+    )
+    assert torch.equal(dec_pos, torch.tensor([101, 103, 103, 103], dtype=torch.int64))
+    assert torch.equal(
+        dec_h, torch.tensor([[3.0, 4.0], [7.0, 8.0], [7.0, 8.0], [7.0, 8.0]])
+    )
+    assert torch.equal(
+        dec_m, torch.tensor([[0.3, 0.4], [0.7, 0.8], [0.7, 0.8], [0.7, 0.8]])
+    )
+    assert captured_dec_args[1][0] is None
+    assert torch.equal(
+        out_with_ids,
+        torch.tensor([[0.0, 0.0], [6.0, 8.0], [0.0, 0.0], [14.0, 16.0]]),
+    )
+    assert torch.equal(out_no_ids, out_with_ids)

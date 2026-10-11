@@ -81,7 +81,7 @@ def _ced_inverse_rows(
     inverse = [padded_rows] * total_rows
     for k, r in enumerate(indices):
         inverse[r] = k
-    return torch.tensor(inverse, dtype=torch.int64, device=device)
+    return torch.tensor(inverse, dtype=torch.int32, device=device)
 
 
 def _scatter_decoder_rows(tensor: torch.Tensor, inverse: torch.Tensor) -> torch.Tensor:
@@ -92,8 +92,7 @@ def _scatter_decoder_rows(tensor: torch.Tensor, inverse: torch.Tensor) -> torch.
     SparseCore scatter that halted the chip at a 576-row decoder bucket
     (E0200 in ``tt_jit_index_copy``).
     """
-    padded = torch.cat([tensor, tensor.new_zeros((1, tensor.shape[-1]))])
-    return padded.index_select(0, inverse)
+    return torch.nn.functional.pad(tensor, (0, 0, 0, 1)).index_select(0, inverse)
 
 
 def _sum_hc_terms(terms: list[torch.Tensor]) -> torch.Tensor:
@@ -587,13 +586,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             return cached[1]
         # Padded decoder rows replay the last position; their outputs are
         # dropped because no output row maps to them in `inverse`.
-        indices = torch.tensor(
-            indices_tuple
-            + (num_positions,) * (plan.padded_num_tokens - len(indices_tuple)),
-            dtype=torch.int64,
-            device=positions.device,
+        last_pos = max(num_positions - 1, 0)
+        gather_tuple = tuple(min(i, last_pos) for i in indices_tuple) + (last_pos,) * (
+            plan.padded_num_tokens - len(indices_tuple)
         )
-        gather = indices.clamp(max=num_positions - 1)
+        gather = torch.tensor(gather_tuple, dtype=torch.int32, device=positions.device)
         inverse = _ced_inverse_rows(
             indices_tuple, plan.padded_num_tokens, num_positions, positions.device
         )
@@ -807,9 +804,14 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             indices, gather, bounds = DeepseekV41Model._get_ced_non_identity_tensors(
                 self, plan, positions.shape[0], positions
             )
-            decoder_positions = positions[gather]
-            decoder_ids = input_ids[gather] if input_ids is not None else None
-            decoder_hidden, decoder_mix = hidden[gather], pre_mix[gather]
+            decoder_positions = positions.index_select(0, gather)
+            decoder_ids = (
+                input_ids.index_select(0, gather) if input_ids is not None else None
+            )
+            decoder_hidden, decoder_mix = (
+                hidden.index_select(0, gather),
+                pre_mix.index_select(0, gather),
+            )
             replay_starts = DeepseekV41Model._get_ced_replay_starts(
                 self, plan.replay_starts, positions
             )
