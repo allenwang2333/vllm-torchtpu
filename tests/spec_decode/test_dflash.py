@@ -1947,3 +1947,61 @@ def test_td8356_draft_layer_getter_direct_call_and_single_group_meta_cache():
     assert call_count == 3
     assert proposer._build_draft_layer_metadata(md) == ("md0", "md1")
     assert call_count == 3
+
+
+def test_td8363_dflash_forward_and_sample_3d_view_slice_without_arange(monkeypatch):
+    """TD8.363: _dflash_forward_and_sample extracts draft_hidden via 3D view +
+    slice + reshape without calling torch.arange or index_select."""
+    import torch._dynamo
+
+    padded_num_reqs, block_size, hidden_size, vocab = 4, 5, 16, 24
+    total_tokens = padded_num_reqs * block_size + 4
+    full_hidden = torch.arange(total_tokens * hidden_size, dtype=torch.float32).reshape(
+        total_tokens, hidden_size
+    )
+    lm_w = torch.randn(vocab, hidden_size)
+
+    req_bases = torch.arange(padded_num_reqs, dtype=torch.int32)[:, None] * block_size
+    slot_offs = torch.arange(1, block_size, dtype=torch.int32)[None, :]
+    ref_idx = (req_bases + slot_offs).reshape(-1)
+    ref_draft_hidden = full_hidden[: padded_num_reqs * block_size].index_select(
+        0, ref_idx
+    )
+
+    seen_draft_hidden: list[torch.Tensor] = []
+
+    class _Draft:
+        def model(self, input_ids, positions):
+            del input_ids, positions
+            return full_hidden
+
+        def compute_logits(self, dh):
+            seen_draft_hidden.append(dh)
+            return dh @ lm_w.t()
+
+    proposer = _make_proposer(draft_tp=1)
+    proposer.draft_model = _Draft()
+    fn = torch._dynamo.eval_frame.innermost_fn(
+        DFlashProposer._dflash_forward_and_sample
+    )
+    input_ids = torch.zeros(total_tokens, dtype=torch.int32)
+    positions = torch.zeros(total_tokens, dtype=torch.int32)
+
+    monkeypatch.setattr(
+        torch,
+        "arange",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("torch.arange must not be called")
+        ),
+    )
+    tokens, out_hidden = fn(proposer, input_ids, positions, block_size)
+    assert out_hidden is full_hidden
+    assert len(seen_draft_hidden) == 1
+    assert torch.equal(seen_draft_hidden[0], ref_draft_hidden)
+    ref_tokens = (
+        (ref_draft_hidden @ lm_w.t())
+        .argmax(dim=-1)
+        .to(torch.int32)
+        .view(padded_num_reqs, block_size - 1)
+    )
+    assert torch.equal(tokens, ref_tokens)

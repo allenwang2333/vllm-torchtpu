@@ -1302,17 +1302,9 @@ class DFlashProposer:
         padded_num_reqs = hidden.shape[0] // block_size
         valid_hidden = hidden[: padded_num_reqs * block_size]
 
-        # 3. Gather the K mask token slots (skipping slot 0 base token) in 2D
-        draft_idx = (
-            torch.arange(
-                padded_num_reqs, dtype=torch.int32, device=valid_hidden.device
-            )[:, None]
-            * block_size
-            + torch.arange(
-                1, block_size, dtype=torch.int32, device=valid_hidden.device
-            )[None, :]
-        ).reshape(-1)
-        draft_hidden = valid_hidden.index_select(0, draft_idx)
+        # 3. Slice the K mask token slots (skipping slot 0 base token) via 3D view
+        hidden_3d = valid_hidden.view(padded_num_reqs, block_size, -1)
+        draft_hidden = hidden_3d[:, 1:, :].reshape(-1, valid_hidden.shape[-1])
 
         # 4. Compute draft logits and run 2D greedy argmax sampling inside the XLA graph
         logits = self.draft_model.compute_logits(draft_hidden)
