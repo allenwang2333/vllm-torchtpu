@@ -187,7 +187,7 @@ def _insert_context_kv(
                 requests = _token_requests(metadata, positions).clamp(
                     max=metadata.seq_lens.shape[0] - 1
                 )
-                offsets = pos_i32 - metadata.seq_lens[requests] + attn.window_size
+                offsets = pos_i32 - metadata.seq_lens.int()[requests] + attn.window_size
                 in_window = (offsets >= 0) & (offsets < attn.window_size)
                 if block_tables is not None:
                     table = _block_table(metadata)
@@ -200,7 +200,7 @@ def _insert_context_kv(
                         dtype=torch.int32,
                         device=positions.device,
                     )
-                    valid_token = rows < metadata.query_start_loc[-1]
+                    valid_token = rows < metadata.query_start_loc[-1].int()
                     addr = (
                         requests,
                         pos_col,

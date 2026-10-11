@@ -586,3 +586,34 @@ def test_td8242_write_cache_and_paged_write_zero_redundant_mask():
             c_got.row_indices(slots, valid=valid),
             c_ref.row_indices(slots.masked_fill(~valid, -1)),
         )
+
+
+@pytest.mark.parametrize("geometry", sorted(GEOMETRIES))
+def test_td8264_dspark_context_kv_int64_metadata_keeps_int32(monkeypatch, geometry):
+    """TD8.264: int64 seq_lens / query_start_loc still give int32 offsets / slots."""
+    rows = 4
+    calls: list[Any] = []
+    monkeypatch.setattr(v2_dspark, "_insert", _capture(calls))
+    table = torch.tensor([[1, 2, 5], [3, 4, -1]], dtype=torch.int32)
+    positions = torch.tensor([2, 4, 6, 7, 8, 1, 3, 5, 9, 0], dtype=torch.int64)
+    cache = _real_cache(rows, geometry)
+    got = {}
+    for dtype in (torch.int64, torch.int32):
+        meta = SimpleNamespace(
+            seq_lens=torch.tensor([9, 6], dtype=dtype),
+            block_tables=table,
+            query_start_loc=torch.tensor([0, 5, 9], dtype=dtype),
+        )
+        with v2_attn.stage_attention_cache_scope():
+            v2_dspark._insert_context_kv(
+                _dspark_layer(cache), torch.ones(10, 8), positions, meta
+            )
+            assert v2_attn._active_stage_attn_cache is not None
+            got[dtype] = next(iter(v2_attn._active_stage_attn_cache.values()))
+    _, slots64, valid64, in_window64, addr64, _ = got[torch.int64]
+    _, slots32, valid32, in_window32, addr32, _ = got[torch.int32]
+    assert slots64.dtype == torch.int32
+    assert torch.equal(slots64, slots32)
+    assert torch.equal(valid64, valid32)
+    assert torch.equal(in_window64, in_window32)
+    assert torch.equal(addr64[3], addr32[3])  # valid_token
