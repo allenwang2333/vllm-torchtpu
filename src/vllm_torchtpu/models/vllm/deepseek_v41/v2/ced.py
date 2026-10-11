@@ -68,7 +68,7 @@ def _static_no_skip_spec(
     compile_sizes,
     owner_required_kept: int = 0,
 ):
-    """``(min_lens, plan)`` for a fixed query/prompt/hit layout, else ``None``.
+    """``(min_lens, plan, max_min_len)`` for a fixed layout, else ``None``.
 
     The all-kept plan does not depend on ``seq_lens``: it applies exactly when
     every request's length is at least ``min_lens[i]`` (``replay_start +
@@ -98,7 +98,7 @@ def _static_no_skip_spec(
         padded,
         is_identity=kept > 0 and padded == num_tokens,
     )
-    return tuple(min_lens), plan
+    return tuple(min_lens), plan, max(min_lens, default=0)
 
 
 _LAST_NO_SKIP_CACHE: list = [None, None, None, None, None, None]
@@ -183,7 +183,10 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
                     )
                 ),
             )
-        if spec is not None and all(map(operator.ge, lengths_list, spec[0])):
+        if spec is not None and (
+            min(lengths_list, default=0) >= spec[2]
+            or all(map(operator.ge, lengths_list, spec[0]))
+        ):
             return spec[1]
     replay_starts = []
     any_skipped = False

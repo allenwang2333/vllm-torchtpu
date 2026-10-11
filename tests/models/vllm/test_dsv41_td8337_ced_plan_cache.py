@@ -226,3 +226,53 @@ def test_td8364_last_no_skip_identity_cache_and_tuple_reuse(monkeypatch):
     )
     p_slow = ced.plan_decoder_replay(md_slow, 512, 128, (32, 64, 96, 128))
     assert p_slow.query_start_loc is bounds
+
+
+def test_td8380_max_min_len_short_circuit_and_heterogeneous_fallback(monkeypatch):
+    """TD8.380: Verify _static_no_skip_spec returns (min_lens, plan, max_min_len)
+    and plan_decoder_replay short-circuits via min(lengths_list, default=0) >= spec[2]
+    while falling back to all(map(operator.ge, ...)) on heterogeneous lengths."""
+    import operator
+
+    bounds = (0, 6, 12, 18)
+    prompts = (100, 1024, 512)  # window=512 -> replay_starts=(0, 512, 0)
+    # min_lens = (6, 518, 6), max_min_len = 518
+    spec = ced._static_no_skip_spec(bounds, prompts, (0, 0, 0), 512, 32, (18, 32), 0)
+    assert spec is not None and len(spec) == 3
+    assert spec[0] == (6, 518, 6)
+    assert spec[2] == 518
+
+    ge_calls = 0
+    orig_ge = operator.ge
+
+    def spy_ge(a, b):
+        nonlocal ge_calls
+        ge_calls += 1
+        return orig_ge(a, b)
+
+    monkeypatch.setattr(ced.operator, "ge", spy_ge)
+
+    # 1. Homogeneous/steady-state: min(lengths_list) = 600 >= 518 -> 0 operator.ge calls
+    md = SimpleNamespace(
+        query_start_loc_cpu=bounds,
+        seq_lens_cpu=(600, 700, 800),
+        prompt_lens_cpu=prompts,
+        replay_starts_cpu=(0, 0, 0),
+        owner_token_layout=None,
+    )
+    p_fast = ced.plan_decoder_replay(md, 512, 32, (18, 32))
+    assert p_fast is spec[1]
+    assert ge_calls == 0
+
+    # 2. Heterogeneous all-kept: req 0 has length 50 (< 518, >= 6), req 1 has 600
+    # min(lengths_list) = 50 < 518 -> falls back to all(map(operator.ge, ...))
+    md.seq_lens_cpu = (50, 600, 80)
+    p_hetero = ced.plan_decoder_replay(md, 512, 32, (18, 32))
+    assert p_hetero is spec[1]
+    assert ge_calls == 3
+
+    # 3. Skip needed: req 1 has length 514 (< 518) -> falls through to full skip path
+    md.seq_lens_cpu = (50, 514, 80)
+    p_skip = ced.plan_decoder_replay(md, 512, 32, (18, 32))
+    assert p_skip is not spec[1]
+    assert p_skip.indices == (0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15, 16, 17)
