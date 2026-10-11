@@ -1029,8 +1029,8 @@ def rpa_kernel(
                     ref[...] = jnp.zeros_like(ref)
 
                 def execute_schedule_chunk(start_step, num_steps):
-                    # All reads are aligned to 128 and some extra steps are copied in the
-                    # process.
+                    # All reads are aligned to 128 and some extra steps are
+                    # copied in the process.
                     aligned_start_step = (start_step // 128) * 128
                     prefix_steps = start_step - aligned_start_step
 
@@ -1092,9 +1092,7 @@ def rpa_kernel(
                     rem = actual_steps % cfgs.max_steps_ub
                     last_step_size = jnp.where(rem == 0, cfgs.max_steps_ub, rem)
                     is_last_step = step_idx == num_safe_step_iterations - 1
-                    size = jnp.where(
-                        is_last_step, last_step_size, cfgs.max_steps_ub
-                    )
+                    size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
                     execute_schedule_chunk(start, size)
 
         _run()
