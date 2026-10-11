@@ -255,9 +255,7 @@ def save_compress_norm(
     if ratio == 2:
         capacity = state_cache.shape[1]
         cache = state_cache
-        rows = torch.arange(
-            kv_score.shape[0], dtype=torch.int32, device=kv_score.device
-        )
+        rows = torch.arange(kv_score.shape[0], device=kv_score.device)
         requests = token_to_req_indices.int().clamp(max=query_start_loc.numel() - 2)
         starts = query_start_loc.index_select(0, requests)
         ends = query_start_loc.index_select(0, requests + 1)
@@ -265,9 +263,7 @@ def save_compress_norm(
             slot_mapping.clamp(min=0) // capacity * capacity
             + (positions - 1) % capacity
         )
-        stored = cache.reshape(-1, *cache.shape[2:]).index_select(
-            0, previous_slots.int()
-        )
+        stored = cache[previous_slots // capacity, previous_slots % capacity]
         previous = torch.where(
             (rows > starts)[:, None],
             kv_score.index_select(0, (rows - 1).clamp(min=0).int()).float(),
@@ -1241,15 +1237,15 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             )
             cached_swa = stage_cache.get(swa_key)
             if cached_swa is None:
-                token_rows = torch.arange(
-                    positions.shape[0], dtype=torch.int32, device=positions.device
-                )
+                token_rows = torch.arange(positions.shape[0], device=positions.device)
                 valid_token = token_rows < swa.query_start_loc[-1]
                 requests = _token_requests(swa, positions).clamp(
                     max=swa_table.shape[0] - 1
                 )
                 pos_col = (
-                    (positions // rows_per_page).clamp(max=swa_table.shape[1] - 1).int()
+                    (positions // rows_per_page)
+                    .clamp(max=swa_table.shape[1] - 1)
+                    .long()
                 )
                 pos_rem = (positions % rows_per_page).int()
                 if non_causal:
@@ -1301,7 +1297,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     safe = logical.clamp(
                         min=0, max=swa_table.shape[1] * rows_per_page - 1
                     )
-                    swa_pages = (safe // rows_per_page).int()
+                    swa_pages = (safe // rows_per_page).long()
                     swa_page_rem = safe % rows_per_page
                     max_prev_pages = max(2, (swa_width - 1) // rows_per_page + 1)
                     c_last = swa_pages[:, -1]
@@ -1344,11 +1340,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             swa_slots_key = self._stage_cache_key("swa_token_slots", *swa_key[1:])
             cached_swa_slots = stage_cache.get(swa_slots_key)
             if cached_swa_slots is None or cached_swa_slots[0] is not swa.block_tables:
-                swa_table_flat, req_row_base = (
-                    swa_table.reshape(-1),
-                    requests.int() * swa_table.shape[1],
-                )
-                b2 = swa_table_flat.index_select(0, req_row_base + pos_col).int()
+                requests_i64 = requests.long()
+                b2 = swa_table[requests_i64, pos_col].int()
                 swa_slots = (b2 * rows_per_page + pos_rem).masked_fill(~valid_token, -1)
                 swa_valid = swa_slots >= 0
                 swa_valid_int32 = swa_valid.int()
@@ -1363,22 +1356,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         is_prev_cols,
                         swa_page_rem,
                     ) = swa_3page
-                    b_last = (
-                        swa_table_flat.index_select(0, req_row_base + c_last).int()
-                        if non_causal
-                        else b2
-                    )
-                    swa_blocks = swa_table_flat.index_select(
-                        0, req_row_base + prev_cols[-1]
-                    ).int()[:, None]
+                    b_last = swa_table[requests_i64, c_last].int() if non_causal else b2
+                    swa_blocks = swa_table[requests_i64, prev_cols[-1]].int()[:, None]
                     for col, is_col in zip(
                         reversed(prev_cols[:-1]),
                         reversed(is_prev_cols),
                         strict=True,
                     ):
-                        b_col = swa_table_flat.index_select(
-                            0, req_row_base + col
-                        ).int()[:, None]
+                        b_col = swa_table[requests_i64, col].int()[:, None]
                         swa_blocks = torch.where(is_col, b_col, swa_blocks)
                     swa_blocks = torch.where(is_c_last, b_last[:, None], swa_blocks)
                     swa_row_slots, invalid_window = (
