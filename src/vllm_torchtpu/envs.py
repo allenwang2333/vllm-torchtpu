@@ -1333,8 +1333,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # scale as an HBM operand and DMAs it to VMEM itself, issued with the weight
     # ring. Without it XLA stages the scale (o_proj f32[6144]) into VMEM with a copy
     # placed right before the call, whose ~0.8 us issue latency is exposed each
-    # layer at decode. Only sites with N % 1024 == 0 (o_proj, q_b); see
-    # fp8_skinny.scale_dma_applies. Outputs are bit-identical.
+    # layer at decode. Applies to the sites in fp8_skinny.SCALE_DMA_SITES (o_proj).
+    # Outputs are bit-identical.
     "TPU_FP8_SKINNY_SCALE_DMA": env_bool("TPU_FP8_SKINNY_SCALE_DMA"),
     # Comma-separated layer-prefix suffixes that take that path, matched on a "."
     # boundary. The defaults are the sites XLA does not prefetch on GLM-5.2-FP8
