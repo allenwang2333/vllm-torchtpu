@@ -321,3 +321,31 @@ def test_mean_hc_streams_bitwise_on_tpu(tokens, compiled, device):
         else torch.compile(mhc._mean_hc_streams, backend="tpu", dynamic=False)
     )
     assert torch.equal(streams(residual).cpu(), mean(residual).cpu())
+
+
+@pytest.mark.parametrize("tokens", [16, 1152])
+def test_delayed_pre_jax_value_matches_view_reduce(tokens):
+    """TD8.253: `delayed_pre_jax` collapses the flat rows (`_collapse_flat`).
+
+    Bitwise on TPU, where ``(s0 + s2) + (s1 + s3)`` is XLA's reduce order for
+    the ``[T, M, D]`` view; CPU XLA may sum in another order.
+    """
+    dim = 256
+    residual, fn, scale, base, previous_pre = _inputs(tokens, dim, seed=tokens)
+    res = _jax(residual)
+    pre = _jax(previous_pre)
+    got = mhc.delayed_pre_jax(
+        res,
+        res.reshape(tokens, -1),
+        _jax(fn),
+        _jax(scale),
+        _jax(base),
+        pre,
+        *CONSTANTS,
+    )[2]
+    want = (pre[..., None] * res.astype(jnp.float32)).sum(1).astype(res.dtype)
+    assert got.dtype == jnp.bfloat16 and got.shape == (tokens, dim)
+    if jax.default_backend() == "tpu":
+        np.testing.assert_array_equal(_np(got), _np(want))
+    else:
+        np.testing.assert_allclose(_np(got), _np(want), rtol=BF16_RTOL, atol=BF16_ATOL)

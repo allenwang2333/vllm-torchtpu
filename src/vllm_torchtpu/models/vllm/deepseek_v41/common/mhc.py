@@ -129,7 +129,9 @@ def delayed_pre_jax(
         post_multiplier,
         repeats,
     )
-    value = (previous_pre[..., None] * residual.astype(jnp.float32)).sum(1)
+    # Collapse the flat [T, M * D] rows (as `_delayed_pre_flat_small` does):
+    # the [T, M, D] FP32 reduce over axis 1 costs a T(4,128) relayout copy.
+    value = _collapse_flat(residual.reshape(residual.shape[0], -1), previous_pre)
     return post, comb, value.astype(residual.dtype), new_pre
 
 
