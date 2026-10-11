@@ -1988,3 +1988,50 @@ def test_compute_draft_logits_local():
     assert head_res is instance.lm_head
     assert torch.equal(h_res, h * 2.0)
     assert skip is True
+
+
+def _embed_draft_blocks_3d_reference(embed, input_ids, block):
+    """Pre-TD8.263 3-D ``[num_blocks, block, hidden]`` build (reference)."""
+    tokens = input_ids.shape[0]
+    num_blocks = tokens // block
+    tail = tokens - num_blocks * block
+    ids_2d = input_ids[: num_blocks * block].view(num_blocks, block)
+    noise = input_ids[1:2]
+    rows = embed(torch.cat([ids_2d[:, 0], noise]))
+    hidden = rows.shape[-1]
+    noise_row = rows[num_blocks:]
+    noise_cols = noise_row.unsqueeze(1).expand(num_blocks, block - 1, hidden)
+    noise_cols = noise_cols.masked_fill(
+        (ids_2d[:, 1:] != noise).unsqueeze(-1), float("nan")
+    )
+    blocks = torch.cat([rows[:num_blocks].unsqueeze(1), noise_cols], dim=1).reshape(
+        num_blocks * block, hidden
+    )
+    if tail:
+        tail_rows = noise_row.expand(tail, hidden).masked_fill(
+            (input_ids[num_blocks * block :] != noise).unsqueeze(-1), float("nan")
+        )
+        blocks = torch.cat([blocks, tail_rows])
+    return blocks
+
+
+@pytest.mark.parametrize(
+    "tokens,block,bad", [(15, 5, ()), (18, 5, (2, 16)), (12, 3, (4,))]
+)
+def test_td8263_embed_draft_blocks_2d_matches_3d_bitwise(tokens, block, bad):
+    """TD8.263: the 2-D selection equals the former 3-D build bit for bit."""
+    weight = torch.randn(32, 16, generator=torch.Generator().manual_seed(1)).bfloat16()
+
+    def embed(ids):
+        return weight[ids.long()]
+
+    ids = torch.full((tokens,), 7, dtype=torch.int32)
+    ids[: tokens - tokens % block : block] = torch.arange(
+        3, 3 + tokens // block, dtype=torch.int32
+    )
+    for row in bad:
+        ids[row] = 1
+    got = v2_dspark._embed_draft_blocks(embed, ids, block)
+    want = _embed_draft_blocks_3d_reference(embed, ids, block)
+    assert got.dtype == want.dtype and got.shape == want.shape
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))

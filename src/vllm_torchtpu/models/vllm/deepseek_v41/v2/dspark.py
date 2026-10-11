@@ -128,12 +128,16 @@ def _embed_draft_blocks(
     rows = embed(torch.cat([base, noise]))
     hidden = rows.shape[-1]
     noise_row = rows[num_blocks:]
-    noise_cols = noise_row.unsqueeze(1).expand(num_blocks, block - 1, hidden)
-    noise_cols = noise_cols.masked_fill(
-        (ids_2d[:, 1:] != noise).unsqueeze(-1), float("nan")
-    )
-    blocks = torch.cat([rows[:num_blocks].unsqueeze(1), noise_cols], dim=1).reshape(
-        num_blocks * block, hidden
+    # Pure 2-D [num_blocks * block, hidden] selection: a [num_blocks, block,
+    # hidden] build pads the middle `block` dim to 8 sublanes on TPU.
+    total = num_blocks * block
+    idx = torch.arange(total, dtype=torch.int32, device=input_ids.device)
+    is_base = (idx % block) == 0
+    base_rows = rows[:num_blocks].index_select(0, idx // block)
+    blocks = torch.where(
+        is_base.unsqueeze(-1), base_rows, noise_row.expand(total, hidden)
+    ).masked_fill(
+        (~is_base & (ids_2d.reshape(-1) != noise)).unsqueeze(-1), float("nan")
     )
     if tail:
         tail_rows = noise_row.expand(tail, hidden).masked_fill(
