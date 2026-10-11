@@ -29,6 +29,11 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     BITS_NEG_INF,
+)
+from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
+    LANES as LANES_TOPK,
+)
+from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     sparsecore_topk,
     sparsecore_topk_dcp_merge,
 )
@@ -1013,6 +1018,51 @@ def convert_cache_to_seq_along_lane(
     )
 
 
+def _topk_widths(n: int, k: int, num_buckets: int) -> tuple[int, ...]:
+    """Static score widths for `_width_bucketed_topk`, widest first."""
+    widths = [n]
+    while len(widths) <= num_buckets:
+        w = widths[-1] // 2
+        if w < k or w % LANES_TOPK or n % w:
+            break
+        widths.append(w)
+    return tuple(widths)
+
+
+def _width_bucketed_topk(
+    scores: jax.Array,  # i32[b, n] f32 bits
+    k: int,
+    row_lengths: jax.Array,  # i32[b]
+    *,
+    num_buckets: int,
+    scheduling_group_id: int | None,
+    return_scores: bool,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """`sparsecore_topk` over the narrowest static width holding every row."""
+
+    def topk_at(width):
+        def run(scores, row_lengths):
+            return sparsecore_topk(
+                scores if width == scores.shape[1] else scores[:, :width],
+                k,
+                row_lengths=row_lengths,
+                write_empty_rows=True,
+                scheduling_group_id=scheduling_group_id,
+                return_scores=return_scores,
+            )
+
+        return run
+
+    widths = _topk_widths(scores.shape[1], k, num_buckets)
+    if len(widths) == 1:
+        return topk_at(widths[0])(scores, row_lengths)
+    longest = jnp.max(row_lengths)
+    # Widths shrink, so the count of narrower widths that still hold the
+    # longest row indexes the narrowest one that does.
+    branch = sum((longest <= w).astype(jnp.int32) for w in widths[1:])
+    return lax.switch(branch, [topk_at(w) for w in widths], scores, row_lengths)
+
+
 def _effective_row_lengths(
     seq_lens: jax.Array,  # i32[max_num_seqs]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -1064,6 +1114,7 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "skip_empty_decode",
+        "topk_width_buckets",
     ),
 )
 def streamindex_topk(
@@ -1093,6 +1144,7 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     skip_empty_decode: bool = False,
+    topk_width_buckets: int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1158,6 +1210,14 @@ def streamindex_topk(
         DECODE passes, which would launch over an empty range. Unchunked calls
         only. The MIXED pass writes the same rows either way, so the result is
         identical.
+      topk_width_buckets: also compile the SparseCore top-k at this many
+        narrower score widths (each half the previous, down to `k`), and pick at
+        runtime the narrowest that holds the chunk's longest row. The top-k
+        kernel streams its whole static width from HBM whatever `row_lengths`
+        says, so with a wide page table (long `max_model_len`, small DCP) and
+        short rows it is bound on reading columns it never selects from.
+        Columns past a row's length are never selected, so the result is
+        identical. 0 = always the full width.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1586,25 +1646,19 @@ def streamindex_topk(
                     constant_values=BITS_NEG_INF,
                 )
 
+            out_m = _width_bucketed_topk(
+                scores,
+                k,
+                eff_row_lengths[start : start + chunk_len],
+                num_buckets=topk_width_buckets,
+                scheduling_group_id=sc_group,
+                return_scores=return_scores,
+            )
             if return_scores:
-                chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
-                    scores,
-                    k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
-                    write_empty_rows=True,
-                    scheduling_group_id=sc_group,
-                    return_scores=True,
-                )
+                chunk_topk_idxs, chunk_topk_scores = out_m
                 topk_scores_list.append(chunk_topk_scores)
             else:
-                chunk_topk_idxs = sparsecore_topk(
-                    scores,
-                    k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
-                    write_empty_rows=True,
-                    scheduling_group_id=sc_group,
-                    return_scores=False,
-                )
+                chunk_topk_idxs = out_m
             topk_idxs.append(chunk_topk_idxs)
 
         out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
@@ -1674,6 +1728,7 @@ def streamindex_topk(
         "dcp_axis_name",
         "a2a_merge",
         "skip_empty_decode",
+        "topk_width_buckets",
     ),
 )
 def streamindex_topk_dcp(
@@ -1700,6 +1755,7 @@ def streamindex_topk_dcp(
     dcp_axis_name: str = DCP_AXIS_NAME,
     a2a_merge: bool = False,
     skip_empty_decode: bool = False,
+    topk_width_buckets: int = 0,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1769,6 +1825,7 @@ def streamindex_topk_dcp(
       a2a_merge: merge over the token axis with an `all_to_all` instead of over
         the candidate axis with an `all_gather`; see above. Same result.
       skip_empty_decode: forwarded to `streamindex_topk`; see there.
+      topk_width_buckets: forwarded to `streamindex_topk`; see there.
 
     Returns:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1833,6 +1890,7 @@ def streamindex_topk_dcp(
             interleave_size=interleave_size,
             return_scores=True,
             skip_empty_decode=skip_empty_decode,
+            topk_width_buckets=topk_width_buckets,
         )
 
         if a2a_merge:

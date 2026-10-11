@@ -14,6 +14,7 @@
 """Tests for Deepseek V4 StreamIndex Top-K kernel."""
 
 import functools
+import re
 from typing import NamedTuple
 
 import jax
@@ -29,6 +30,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     streamindex_topk,
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+    _topk_widths,
     convert_cache_to_seq_along_lane,
 )
 
@@ -1470,6 +1472,73 @@ class TestChunkedPipelining:
         assert "_scheduling_group_id" not in hlo, (
             "an indivisible chunk_tokens emitted more than one chunk; the"
             " fallback that the cases above rely on has changed")
+
+
+class TestTopkWidthBuckets:
+    """`topk_width_buckets` runs the top-k at a narrower static width.
+
+    A 16-page table of 128-token pages gives a 2048-wide score row, so with
+    k = 128 the buckets are 2048 / 1024 / 512 / 256. Columns past a row's
+    length are never selected, so every bucket must agree with the full width.
+    """
+
+    _PAGES_PER_SEQ = 16
+
+    # fmt: off
+    @pytest.mark.parametrize(
+        "T_list, S_list, chunk_tokens",
+        [
+            pytest.param((40, 88), (200, 300), None, id="short_rows_512"),
+            pytest.param((40, 88), (900, 100), None, id="mid_row_1024"),
+            pytest.param((40, 88), (200, 2000), None, id="long_row_full"),
+            pytest.param((40, 88), (200, 300), 32, id="short_rows_chunked"),
+            pytest.param((1, 1, 1, 1, 60), (150, 1900, 64, 900, 400), 32,
+                         id="decodes_chunked_mixed_widths"),
+        ],
+    )
+    # fmt: on
+    @pytest.mark.parametrize("return_scores", [False, True])
+    def test_buckets_match_full_width(self, T_list, S_list, chunk_tokens,
+                                      return_scores):
+        inputs = _chunk_inputs(
+            T_list, _fragmented_pages(len(T_list), self._PAGES_PER_SEQ), 128,
+            4, 128)
+        common = (inputs, T_list, S_list, 128, 1, 8, 2, _HAS, chunk_tokens)
+        full_kwargs = _chunk_call_kwargs(*common, return_scores=return_scores)
+        bucketed_kwargs = dict(full_kwargs, topk_width_buckets=3)
+
+        # Each width compiles its own SparseCore kernel, named by its width;
+        # one name would mean the switch never got built and this comparison
+        # would pass trivially.
+        hlo = streamindex_topk.lower(**bucketed_kwargs).as_text()
+        widths = set(re.findall(r"sc_topk_direct_b\d+_n(\d+)_", hlo))
+        assert {"2048", "1024", "512", "256"} <= widths, widths
+
+        full = streamindex_topk(**full_kwargs)
+        bucketed = streamindex_topk(**bucketed_kwargs)
+        if not return_scores:
+            full, bucketed = (full, None), (bucketed, None)
+        full_idx, bucketed_idx = np.array(full[0]), np.array(bucketed[0])
+        _verify_padding_at_end(bucketed_idx)
+        order_f = np.argsort(full_idx, axis=-1)
+        order_b = np.argsort(bucketed_idx, axis=-1)
+        np.testing.assert_array_equal(
+            np.take_along_axis(bucketed_idx, order_b, axis=-1),
+            np.take_along_axis(full_idx, order_f, axis=-1),
+            err_msg=f"width buckets changed the selection for S_list={S_list}",
+        )
+        if return_scores:
+            np.testing.assert_array_equal(
+                np.take_along_axis(np.array(bucketed[1]), order_b, axis=-1),
+                np.take_along_axis(np.array(full[1]), order_f, axis=-1),
+                err_msg="width buckets changed the scores of the same indices",
+            )
+
+    def test_widths_stop_at_k(self):
+        assert _topk_widths(2048, 128, 3) == (2048, 1024, 512, 256)
+        assert _topk_widths(2048, 512, 3) == (2048, 1024, 512)
+        assert _topk_widths(524288, 2048, 3) == (524288, 262144, 131072, 65536)
+        assert _topk_widths(524288, 2048, 0) == (524288,)
 
 
 def main(argv):

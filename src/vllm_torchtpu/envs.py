@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
     TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = False
+    TPU_STREAMIDX_TOPK_WIDTH_BUCKETS: int = 0
     TPU_INDEXER_TOPK_SHARED_READ: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
@@ -853,6 +854,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # where they launch over an empty range. Unchunked calls only. Exact.
     "TPU_STREAMIDX_SKIP_EMPTY_DECODE": env_bool(
         "TPU_STREAMIDX_SKIP_EMPTY_DECODE", default=False
+    ),
+    # Narrower static widths (each half the last) to compile the StreamIndex
+    # SparseCore top-k at; each call runs the narrowest that holds its longest
+    # row. The kernel reads its whole width from HBM, so with a long
+    # max_model_len over few DCP ranks it otherwise pays for the padding. Exact.
+    "TPU_STREAMIDX_TOPK_WIDTH_BUCKETS": env_nonnegative_int(
+        "TPU_STREAMIDX_TOPK_WIDTH_BUCKETS", 0
     ),
     # The indexed layer's own attention reads its rows back from the updated
     # shared table, the same `table[:num_tokens]` expression the following
