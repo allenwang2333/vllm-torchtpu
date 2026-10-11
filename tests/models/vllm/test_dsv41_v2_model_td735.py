@@ -679,3 +679,48 @@ def test_td8367_ced_decoder_owner_kwargs_identity_fast_path_and_single_offload_f
         == "done"
     )
     assert len(flag_calls) == 1
+
+    # TD8.375: SimpleNamespace metadata values clone cleanly via cls.__new__(cls)
+    from dataclasses import dataclass
+
+    @dataclass
+    class _FakeCtx:
+        attn_metadata: object
+        additional_kwargs: dict
+        is_padding: object = None
+
+    model._ced_enabled = True
+    model._ced_boundary = 1
+    model._ced_window = 512
+    model._ced_compile_sizes = (4,)
+    model._ced_dp_sync = False
+    model.use_sequence_parallel = False
+    model.config = SimpleNamespace(hidden_size=4)
+    model.aux_hidden_state_layers = ()
+    ns_meta = SimpleNamespace(
+        seq_lens=torch.tensor([2], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+    )
+    ctx_ns = _FakeCtx(
+        attn_metadata={"l0": ns_meta},
+        additional_kwargs={},
+        is_padding=None,
+    )
+    monkeypatch.setattr(v2_model.upstream, "get_forward_context", lambda: ctx_ns)
+    monkeypatch.setattr(
+        v2_model,
+        "plan_decoder_replay",
+        lambda *a: DecoderReplayPlan(
+            indices=(0,),
+            query_start_loc=(0, 1),
+            replay_starts=(0,),
+            padded_num_tokens=2,
+            is_identity=False,
+        ),
+    )
+    model.encoder_stage = lambda *a: (torch.zeros((2, 4)), torch.zeros((2, 4)))
+    model.decoder_stage = lambda *a, **kw: torch.ones((2, 4))
+    out_ns = model.forward(
+        torch.zeros(2, dtype=torch.int32), torch.arange(2, dtype=torch.int32)
+    )
+    assert out_ns.shape == (2, 4)

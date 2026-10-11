@@ -727,8 +727,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         inputs_embeds=None,
         lookback_token_ids=None,
     ):
-        cpu_offload, host_dma = DeepseekV41Model._engram_offload_flags(self)
-        if cpu_offload or host_dma:
+        offload_engram = any(DeepseekV41Model._engram_offload_flags(self))
+        if offload_engram:
             input_ids_prep = (
                 input_ids.to(torch.int64)
                 if getattr(
@@ -895,13 +895,14 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     value is not last_val
                     and (rep := replaced_by_id.get(id(value))) is None
                 ):
-                    rep = object.__new__(type(value))
-                    rep.__dict__ = {
-                        **value.__dict__,
-                        "input_positions": decoder_positions,
-                        "query_start_loc": bounds,
+                    new = value.__new__
+                    rep = new(type(value))
+                    rep.__dict__.update(
+                        value.__dict__,
+                        input_positions=decoder_positions,
+                        query_start_loc=bounds,
                         **dec_owner_kwargs,
-                    }
+                    )
                     replaced_by_id[id(value)] = rep
                 last_val = value
                 decoder_metadata[key] = rep
@@ -985,9 +986,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         if getattr(self, "use_native_mega_moe", getattr(self, "use_mega_moe", False)):
             input_ids = input_ids.to(torch.int64)
 
-        cpu_offload, host_dma = DeepseekV41Model._engram_offload_flags(self)
         skip_lookup = getattr(self, "_engram_prepared_outside_stage", False) or (
-            torch.compiler.is_compiling() and (cpu_offload or host_dma)
+            torch.compiler.is_compiling()
+            and any(DeepseekV41Model._engram_offload_flags(self))
         )
         engram_hashes, engram_mask = self._prepare_engram(
             input_ids,
