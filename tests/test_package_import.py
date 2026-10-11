@@ -935,6 +935,14 @@ def test_patch_dcp_fine_mm_compile_dflash_triton_v1_lifo_vpe_and_proxy(monkeypat
             )
 
     vpe_inst = _DummyVPE(preset_buf=False)
+    for buf_name in (
+        "org_vocab_start_index",
+        "org_vocab_end_index",
+        "num_org_vocab_padding",
+        "added_vocab_start_index",
+        "added_vocab_end_index",
+    ):
+        assert getattr(vpe_inst, buf_name).dtype == torch.int32
     _DummyVPE(preset_buf=True)
 
     vpe_inst.tp_size = 1
@@ -945,12 +953,25 @@ def test_patch_dcp_fine_mm_compile_dflash_triton_v1_lifo_vpe_and_proxy(monkeypat
     monkeypatch.setattr(
         "vllm.distributed.tensor_model_parallel_all_reduce", lambda x: x
     )
-    out_tp2 = vpe_inst.forward(torch.tensor([1, 5]))
+    out_tp2 = vpe_inst.forward(torch.tensor([1, 5], dtype=torch.int32))
     assert out_tp2.shape == (2, 1)
 
     # Also test patched_get_masked_input_and_mask with plain int arguments
     masked_in, mask = vpe.get_masked_input_and_mask(torch.tensor([1, 5]), 0, 4, 0, 4, 6)
     assert masked_in.shape == (2,) and mask.shape == (2,)
+    assert masked_in.dtype == torch.int64
+
+    masked_in_i32, mask_i32 = vpe.get_masked_input_and_mask(
+        torch.tensor([1, 5], dtype=torch.int32),
+        vpe_inst.org_vocab_start_index,
+        vpe_inst.org_vocab_end_index,
+        vpe_inst.num_org_vocab_padding,
+        vpe_inst.added_vocab_start_index,
+        vpe_inst.added_vocab_end_index,
+    )
+    assert masked_in_i32.dtype == torch.int32
+    assert torch.equal(masked_in_i32, masked_in.to(torch.int32))
+    assert torch.equal(mask_i32, mask)
 
     # 8. "proxy" in envs.JAX_PLATFORMS top-level block
     import vllm.platforms

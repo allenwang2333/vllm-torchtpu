@@ -1664,33 +1664,33 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             self.register_buffer(
                 "org_vocab_start_index",
                 torch.tensor(
-                    self.shard_indices.org_vocab_start_index, dtype=torch.int64
+                    self.shard_indices.org_vocab_start_index, dtype=torch.int32
                 ),
                 persistent=False,
             )
             self.register_buffer(
                 "org_vocab_end_index",
-                torch.tensor(self.shard_indices.org_vocab_end_index, dtype=torch.int64),
+                torch.tensor(self.shard_indices.org_vocab_end_index, dtype=torch.int32),
                 persistent=False,
             )
             self.register_buffer(
                 "num_org_vocab_padding",
                 torch.tensor(
-                    self.shard_indices.num_org_vocab_padding, dtype=torch.int64
+                    self.shard_indices.num_org_vocab_padding, dtype=torch.int32
                 ),
                 persistent=False,
             )
             self.register_buffer(
                 "added_vocab_start_index",
                 torch.tensor(
-                    self.shard_indices.added_vocab_start_index, dtype=torch.int64
+                    self.shard_indices.added_vocab_start_index, dtype=torch.int32
                 ),
                 persistent=False,
             )
             self.register_buffer(
                 "added_vocab_end_index",
                 torch.tensor(
-                    self.shard_indices.added_vocab_end_index, dtype=torch.int64
+                    self.shard_indices.added_vocab_end_index, dtype=torch.int32
                 ),
                 persistent=False,
             )
@@ -1746,7 +1746,7 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
 
         def _to_tensor(val: int | torch.Tensor) -> torch.Tensor:
             if isinstance(val, torch.Tensor):
-                return val.to(device=device)
+                return val.to(device=device, dtype=dtype)
             return torch.tensor(val, dtype=dtype, device=device)
 
         start = _to_tensor(org_vocab_start_index)
