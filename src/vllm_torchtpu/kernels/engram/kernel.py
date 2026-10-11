@@ -169,6 +169,11 @@ def fused_engram(
         ],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "arbitrary"),
+            vmem_limit_bytes=(
+                None
+                if interpret
+                else int(0.9 * pltpu.get_tpu_info().vmem_capacity_bytes)
+            ),
         ),
         interpret=interpret,
         name="engram_offload_fused",
