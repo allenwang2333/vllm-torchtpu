@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Upstream V4.1 model assembly with TPU device operations."""
 
+from collections.abc import Sequence
 from dataclasses import replace
 from itertools import islice
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.compilation.backends import set_model_tag
@@ -131,6 +132,9 @@ def _use_sequence_parallel(vllm_config) -> bool:
 
 
 class _StageBase(torch.nn.Module):
+    owner: "DeepseekV41Model"
+    _compile_prefix: str
+
     def __init__(self, *, owner, vllm_config, prefix="", compile_tag=None):
         super().__init__()
         # Parameters retain their upstream model.layers checkpoint paths. A
@@ -287,8 +291,9 @@ class DeepseekV41EngramPipeline(_StageBase):
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | upstream.IntermediateTensors:
+        segments = cast(Sequence[DeepseekV41EngramStage], self.segments)
         deferred: dict[int, tuple[Engram, torch.Tensor] | None] = {
-            segment.start_layer: None for segment in self.segments[1:]
+            segment.start_layer: None for segment in segments[1:]
         }
         self.owner._prepare_engram(
             input_ids,
@@ -300,7 +305,7 @@ class DeepseekV41EngramPipeline(_StageBase):
         self.owner._engram_prepared_outside_stage = True
         context = upstream.get_forward_context()
         try:
-            for index, segment in enumerate(self.segments):
+            for index, segment in enumerate(segments):
                 pending = deferred.get(segment.start_layer)
                 if pending is not None:
                     engram, hash_ids = pending
@@ -314,7 +319,7 @@ class DeepseekV41EngramPipeline(_StageBase):
                         inputs_embeds,
                         lookback_token_ids,
                     )
-                if index == len(self.segments) - 1:
+                if index == len(segments) - 1:
                     return output
                 if isinstance(output, (list, tuple)) and len(output) == 1:
                     output = output[0]
@@ -329,6 +334,8 @@ class DeepseekV41EngramPipeline(_StageBase):
 
 
 class DeepseekV41Model(upstream.DeepseekV4Model):
+    _engram_prepared_outside_stage: bool = False
+
     def _has_cpu_offloaded_engram(self) -> bool:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             engram = getattr(layer, "engram", None)
@@ -867,6 +874,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             if stage_sp:
                 hidden_states = upstream.sp_all_gather(hidden_states)[:full_num_tokens]
                 pre_mix = upstream.sp_all_gather(pre_mix)[:full_num_tokens]
+            assert hidden_states is not None
             num_tokens = hidden_states.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
