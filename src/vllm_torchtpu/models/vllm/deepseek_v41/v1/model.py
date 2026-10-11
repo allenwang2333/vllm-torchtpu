@@ -206,7 +206,13 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             dtype=torch.int64,
             device=positions.device,
         )
-        gather = indices.to(torch.int32).clamp(max=num_positions - 1)
+        gather = torch.tensor(
+            indices_tuple
+            + (max(num_positions - 1, 0),)
+            * (plan.padded_num_tokens - len(indices_tuple)),
+            dtype=torch.int32,
+            device=positions.device,
+        )
         bounds = torch.tensor(qsl_tuple, dtype=torch.int32, device=positions.device)
         result = (indices, gather, bounds)
         self._ced_non_identity_cache = (cache_key, result)
@@ -352,7 +358,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             hidden_states = intermediate_tensors["hidden_states"]
 
         if getattr(self, "use_native_mega_moe", getattr(self, "use_mega_moe", False)):
-            input_ids = input_ids.to(torch.int64)
+            input_ids = (
+                input_ids
+                if input_ids.dtype == torch.int64
+                else input_ids.to(torch.int64)
+            )
 
         # Engram n-gram hashes for the whole (flattened) batch, computed once
         # on the full token stream — before any sequence-parallel sharding —

@@ -203,7 +203,7 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
             compress_ratio=self.compress_ratio,
             rows_per_page=self.cache_num_states,
         )
-        pos_i32 = positions.int()
+        pos_i32 = positions if positions.dtype == torch.int32 else positions.int()
         valid = (compressed_slots >= 0) & ((pos_i32 + 1) % self.compress_ratio == 0)
         group_positions = pos_i32 // self.compress_ratio * self.compress_ratio
         compressor_ops.write_compressed_cache(
@@ -293,7 +293,10 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
         selected = None
         if self.compress_ratio:
             capacity = max(1, self._max_model_len // self.compress_ratio)
-            lengths = ((positions.int() + 1) // self.compress_ratio)[:, None]
+            lengths = (
+                ((positions if positions.dtype == torch.int32 else positions.int()) + 1)
+                // self.compress_ratio
+            )[:, None]
             if self.indexer is not None:
                 if self._all_indices_fit:
                     logical_compressed = torch.arange(
@@ -441,7 +444,9 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
         requests = cache_ops.token_requests(swa, positions).clamp(
             max=table.shape[0] - 1
         )
-        logical = positions.int()[:, None] + self._get_window_offsets(positions.device)
+        logical = (positions if positions.dtype == torch.int32 else positions.int())[
+            :, None
+        ] + self._get_window_offsets(positions.device)
         replay_starts = get_forward_context().additional_kwargs[
             "deepseek_v41_replay_starts"
         ]

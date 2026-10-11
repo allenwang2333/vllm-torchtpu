@@ -823,3 +823,221 @@ class TestV1ModelFullCoverage:
 
             lm.model.engram_hash = None
             assert v1_model.DeepseekV41ForCausalLM.forward(lm, "arg2") == "lm_out"
+
+
+def test_td8307_v1_attention_and_model_int32_guards():
+    """Verify TD8.307 int32/int64 cast guards in v1/attention.py and v1/model.py."""
+    import functools
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.v1 import attention as v1_attention
+
+    # 1. v1/model.py: _get_ced_non_identity_tensors constructs int32 gather directly
+    m = _DummyV1Model()
+    positions_i32 = torch.arange(4, dtype=torch.int32)
+    plan = v1_replay_plan.DecoderReplayPlan(
+        indices=(0, 2),
+        query_start_loc=(0, 1, 2),
+        replay_starts=(0, 0),
+        padded_num_tokens=4,
+    )
+    indices, gather, bounds = m._get_ced_non_identity_tensors(plan, 4, positions_i32)
+    assert indices.dtype == torch.int64
+    assert torch.equal(indices, torch.tensor([0, 2, 4, 4], dtype=torch.int64))
+    assert gather.dtype == torch.int32
+    assert torch.equal(gather, torch.tensor([0, 2, 3, 3], dtype=torch.int32))
+    assert bounds.dtype == torch.int32
+
+    # 2. v1/model.py: _forward_stage use_mega_moe guard with int64 vs int32 input_ids
+    m_stage = _DummyV1Model()
+    m_stage.start_layer = 0
+    m_stage.end_layer = 1
+    m_stage._ced_boundary = 1
+    m_stage.use_mega_moe = True
+    m_stage.engram_hash = None
+    m_stage.use_sequence_parallel = False
+    m_stage.aux_hidden_state_layers = []
+    m_stage._mtp_hidden_buffer = None
+    m_stage.norm = lambda x: x
+    m_stage.layers = [
+        mock.MagicMock(
+            return_value=(
+                torch.ones(4, 8),
+                None,
+                None,
+                None,
+                torch.ones(4, 8),
+                None,
+            )
+        )
+    ]
+
+    with (
+        mock.patch.object(v1_model.upstream, "get_pp_group") as mock_pp,
+        mock.patch.object(
+            v1_model.upstream, "is_forward_context_available", return_value=False
+        ),
+        mock.patch.object(v1_model, "post", return_value=torch.ones(4, 8)),
+        mock.patch.object(v1_model, "collapse", return_value=torch.ones(4, 8)),
+    ):
+        mock_pp.return_value.is_first_rank = True
+        mock_pp.return_value.is_last_rank = True
+
+        ids_i64 = torch.arange(4, dtype=torch.int64)
+        ids_i32 = torch.arange(4, dtype=torch.int32)
+        out_i64 = v1_model.DeepseekV41Model._forward_stage(
+            m_stage,
+            input_ids=ids_i64,
+            positions=positions_i32,
+            intermediate_tensors=None,
+            inputs_embeds=torch.zeros(4, 8),
+            stage="full",
+        )
+        out_i32 = v1_model.DeepseekV41Model._forward_stage(
+            m_stage,
+            input_ids=ids_i32,
+            positions=positions_i32,
+            intermediate_tensors=None,
+            inputs_embeds=torch.zeros(4, 8),
+            stage="full",
+        )
+        assert torch.equal(out_i64, out_i32)
+
+    # 3. v1/attention.py: _write_global_kv, _prepare_tpu, forward_mqa int32/int64
+    attn = mock.MagicMock()
+    attn.prefix = "attn_pfx"
+    attn.compress_ratio = 2
+    attn.cache_num_states = 4
+    attn.kv_cache = ("nope", "rope")
+    attn._all_indices_fit = True
+    attn._max_model_len = 8
+    attn.compressor.return_value = torch.zeros(4, 16)
+    attn._rotate = lambda t, pos: t
+    attn.indexer = mock.MagicMock()
+    attn.indexer.wk.return_value = torch.zeros(4, 16)
+    attn.indexer.k_norm.return_value = torch.zeros(4, 16)
+    attn.indexer.k_cache.prefix = "k_pfx"
+    attn.indexer.k_cache.compress_ratio = 2
+    attn.indexer.k_cache.native.return_value = SimpleNamespace(
+        pool=torch.zeros(4, 16),
+        scales=torch.zeros(4, 1),
+        layout=SimpleNamespace(page_size=4),
+    )
+
+    fwd_ctx = SimpleNamespace(
+        attn_metadata={"attn_pfx": "meta_a", "k_pfx": "meta_k", "swa_pfx": "meta_swa"},
+        additional_kwargs={
+            "deepseek_v41_replay_starts": torch.zeros(2, dtype=torch.int32)
+        },
+    )
+    with (
+        mock.patch.object(v1_attention, "get_forward_context", return_value=fwd_ctx),
+        mock.patch.object(
+            cache_ops,
+            "cache_slots",
+            return_value=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        ),
+        mock.patch.object(compressor_ops, "write_compressed_cache") as mock_write_comp,
+        mock.patch.object(indexer_ops, "publish_index_keys") as mock_pub_keys,
+    ):
+        for pos in (
+            torch.tensor([1, 3, 5, 7], dtype=torch.int32),
+            torch.tensor([1, 3, 5, 7], dtype=torch.int64),
+        ):
+            ret = v1_attention.DeepseekV41Attention._write_global_kv(
+                attn, "kv_score", pos, defer_index_write=False
+            )
+            assert ret is None
+        assert mock_write_comp.call_count == 2
+        assert mock_pub_keys.call_count == 2
+
+    # _prepare_tpu and forward_mqa (_ced_decoder=True) with int32 and int64 positions
+    attn.swa_cache_layer = mock.MagicMock()
+    attn.swa_cache_layer.kv_cache.numel.return_value = 16
+    attn.swa_cache_layer.prefix = "swa_pfx"
+    attn.swa_cache_layer.block_size = 4
+    attn.swa_cache_layer.native.return_value = SimpleNamespace(
+        pool=torch.zeros(4, 16), layout="layout"
+    )
+    attn.n_local_heads = 2
+    attn.head_dim = 8
+    attn.wq_b.return_value = torch.zeros(4, 16)
+    attn._ced_global_from_encoder = True
+    attn.topk_indices_buffer = torch.full((4, 4), -1, dtype=torch.int32)
+    attn.forward_mqa = mock.MagicMock()
+
+    with (
+        mock.patch.object(v1_attention, "get_forward_context", return_value=fwd_ctx),
+        mock.patch.object(
+            cache_ops, "block_table", return_value=torch.zeros(2, 4, dtype=torch.int32)
+        ),
+        mock.patch.object(
+            cache_ops,
+            "cache_slots",
+            return_value=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        ),
+        mock.patch.object(
+            cache_ops, "token_requests", return_value=torch.zeros(4, dtype=torch.int32)
+        ),
+    ):
+        for pos in (
+            torch.arange(4, dtype=torch.int32),
+            torch.arange(4, dtype=torch.int64),
+        ):
+            out = torch.zeros(4, 2, 8)
+            v1_attention.DeepseekV41Attention._prepare_tpu(
+                attn,
+                hidden_states=torch.zeros(4, 8),
+                qr=torch.zeros(4, 8),
+                kv=torch.zeros(4, 8),
+                qr_scale=None,
+                kv_score=None,
+                index_weights=None,
+                positions=pos,
+                output=out,
+            )
+        assert attn.forward_mqa.call_count == 2
+
+    attn._ced_decoder = True
+    attn.window_size = 4
+    attn._window_offsets = None
+    attn._get_window_offsets = functools.partial(
+        v1_attention.DeepseekV41Attention._get_window_offsets, attn
+    )
+    attn.main_cache_layer = mock.MagicMock()
+    attn.main_cache_layer.kv_cache = ("nope", "rope")
+    attn.main_cache_layer.cache_num_states = 4
+    attn.main_cache_layer.prefix = "attn_pfx"
+    attn.attn_sink = torch.zeros(2)
+    attn.scale = 1.0
+    with (
+        mock.patch.object(v1_attention, "get_forward_context", return_value=fwd_ctx),
+        mock.patch.object(
+            cache_ops,
+            "cache_slots",
+            return_value=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        ),
+        mock.patch.object(cache_ops, "write_cache"),
+        mock.patch.object(
+            cache_ops, "block_table", return_value=torch.zeros(2, 4, dtype=torch.int32)
+        ),
+        mock.patch.object(
+            cache_ops, "token_requests", return_value=torch.zeros(4, dtype=torch.int32)
+        ),
+        mock.patch.object(
+            cache_ops, "row_slots", return_value=torch.zeros(4, 4, dtype=torch.int32)
+        ),
+        mock.patch(
+            "vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_ced_attention_op.ced_attention",
+            return_value=torch.ones(4, 2, 8),
+        ) as mock_ced,
+    ):
+        for pos in (
+            torch.arange(4, dtype=torch.int32),
+            torch.arange(4, dtype=torch.int64),
+        ):
+            out = torch.zeros(4, 2, 8)
+            v1_attention.DeepseekV41Attention.forward_mqa(
+                attn, "q", "kv", pos, out, topk_indices=None
+            )
+            assert (out == 1).all()
+        assert mock_ced.call_count == 2
