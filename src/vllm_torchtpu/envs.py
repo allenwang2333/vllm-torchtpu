@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 1
+    TPU_DCP_MLA_WIDTHS: list[int] = []
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -430,6 +431,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # grids `cdiv(real tokens, step)` steps, so up to N-1 padding rows are
     # attended (outputs don't-care). 1 = the kernel default (unchanged).
     "TPU_DCP_MLA_SMALL_CHUNK_BATCH": env_int("TPU_DCP_MLA_SMALL_CHUNK_BATCH", 1),
+    # DCP sparse MLA: narrower top-k widths (comma-separated, each a multiple
+    # of 64) to compile the attention at; each step runs the narrowest that
+    # holds its fullest rank-local row. Ignored with TPU_DCP_MLA_TOPK_CAP.
+    "TPU_DCP_MLA_WIDTHS": lambda: [
+        int(w) for w in os.getenv("TPU_DCP_MLA_WIDTHS", "").split(",") if w.strip()
+    ],
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
