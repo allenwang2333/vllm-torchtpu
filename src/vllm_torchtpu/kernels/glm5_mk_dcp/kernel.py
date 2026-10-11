@@ -1271,6 +1271,10 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 c_.start()
             for c_ in cpu:
                 c_.wait()
+            resolve_union()
+            cpb = pltpu.make_async_copy(scr["own_uv"], scr["own_u"], scr["misc_sem"])
+            cpb.start()
+            cpb.wait()
             pi.mark("I_recw")
             pltpu.make_async_copy(scr["rec_v"], irec_out.at[l], scr["kvw_sem"].at[2]).wait()
             pi.end()
@@ -1362,6 +1366,40 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                                      scr["kpre"], scr["tk_acc"], scr["tk_cc"], kc=tiles.topk_kc)
                     scr["cand_v"][t_] = scr["cidx"][...]
 
+        def resolve_union():
+            """own_uv entries (local index | row bits << MB_SH) -> gather source | row bits, in vector
+            rows: in HBM -> page << 8 | slot (page by compare-select over the request's live local
+            pages); this step's own new row -> staging row << 2 | seg. Both keep the rope segment
+            (local index & 3) in the low bits. Per request; replaces the scalar loop's bt reads."""
+            def per_req(b, c):
+                @pl.when(jnp.logical_and(b < B, qmeta[jnp.minimum(b, BMAX - 1), 3] > 0))
+                def _():
+                    b_c = jnp.minimum(b, BMAX - 1)
+                    t0r, _, p0r, noldr = req_new(b_c)
+                    nu = scr["nu_s"][b_c]
+                    r0 = scr["uo_s"][b_c]
+                    npg = jnp.minimum((noldr + pg - 1) // pg + 1, max_pages)
+
+                    def row(i, c2):
+                        e = scr["own_uv"][pl.ds(r0 + i, 1), :]                       # [1, 128]
+                        m = e & SRC_MASK
+                        hi = e & ~SRC_MASK
+                        kk = i * 128 + lax.broadcasted_iota(I32, (1, 128), 1)
+                        old_ = jnp.logical_and(m < noldr, kk < nu)
+                        pidx = jnp.where(old_, m >> lg_pg, -1)
+
+                        def pg_body(j, pv):
+                            return jnp.where(pidx == j, bt[b_c, j], pv)
+                        page = lax.fori_loop(0, npg, pg_body, jnp.zeros((1, 128), I32))
+                        g = (m // ILV) * G_ + me * ILV + m % ILV
+                        t2 = jnp.clip(t0r + (g - p0r), 0, TMAX - 1)
+                        src = jnp.where(old_, shl(page, 8) | (m & (pg - 1)), shl(t2, 2) | (m & 3))
+                        scr["own_uv"][pl.ds(r0 + i, 1), :] = jnp.where(kk < nu, src | hi, e)
+                        return c2
+                    lax.fori_loop(0, (nu + 127) // 128, row, 0)
+                return c
+            lax.fori_loop(0, B, per_req, 0)
+
         def build_union(b, off, rn=None):
             """Request b's rows' owned winner lists (ascending local indices) -> their merged union at
             flat rows [off, off + ceil(nu/128)) of own_u, with memb = the bitmask of the request's rows
@@ -1409,16 +1447,10 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                     hit = (hs[qq] == m).astype(I32)
                     bits = bits | (hit << qq)
                     new_ps.append(ps[qq] + hit)
-                # the entry's gather source, resolved once per fresh top-k (reuse layers share it):
-                # in HBM -> page << 8 | slot; this step's own new row (sorted last) -> staging row << 2
-                # | seg. Both keep the rope segment (local index & 3) in the low bits.
+                # local index | row bits; the gather source is resolved by resolve_union (vector)
                 old_ = m < noldr
-                g = (m // ILV) * G_ + me * ILV + m % ILV
-                t2 = jnp.clip(t0r + (g - p0r), 0, TMAX - 1)
-                src = jnp.where(old_, (bt[b, jnp.where(old_, m, 0) >> lg_pg] << 8) | (m & (pg - 1)),
-                                (t2 << 2) | (m & 3))
                 p = off * 128 + k
-                scr["own_u"][p >> 7, p & 127] = src | shl(bits, MB_SH)       # row bits packed high
+                scr["own_u"][p >> 7, p & 127] = m | shl(bits, MB_SH)
                 took = bits & 1
                 for qq in range(1, QM):
                     took = took + ((bits >> qq) & 1)
