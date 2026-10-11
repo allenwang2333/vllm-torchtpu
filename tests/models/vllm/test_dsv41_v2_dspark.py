@@ -858,3 +858,60 @@ def test_dspark_mhc_broadcast_and_post_and_collapse(
         ref = collapse(mhc_post_torch(x, residual, post_mix, comb_mix), pre_mix)
         got = v2_dspark._post_and_collapse(x, residual, post_mix, comb_mix, pre_mix)
         assert torch.equal(got, ref)
+
+
+def test_td8301_insert_context_kv_int32_and_int64_guards(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify TD8.301 guarded .int() casts in _insert_context_kv."""
+    inserted: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+    def fake_insert(cache, slots, kv, valid, **kw):
+        inserted.append((slots.clone(), kv.clone(), valid.clone()))
+
+    monkeypatch.setattr(v2_dspark, "_insert", fake_insert)
+
+    attn = SimpleNamespace(
+        window_size=4,
+        swa_cache_layer=SimpleNamespace(kv_cache=torch.zeros((2, 4, 1, 8))),
+        _rotate=lambda kv, pos: kv + pos.unsqueeze(-1),
+    )
+    kv = torch.ones((3, 8))
+
+    # 1. All-int32 inputs (positions, requests, seq_lens, query_start_loc, table)
+    monkeypatch.setattr(
+        v2_dspark,
+        "_cache_slots",
+        lambda cache, md, pos: torch.tensor([1, 2, 3], dtype=torch.int32),
+    )
+    monkeypatch.setattr(
+        v2_dspark,
+        "_token_requests",
+        lambda md, pos: torch.tensor([0, 0, 0], dtype=torch.int32),
+    )
+    md_i32 = SimpleNamespace(
+        seq_lens=torch.tensor([6], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+        block_tables=torch.tensor([[0, 1]], dtype=torch.int32),
+    )
+    pos_i32 = torch.tensor([1, 2, 5], dtype=torch.int32)
+    v2_dspark._insert_context_kv(attn, kv, pos_i32, md_i32)
+
+    # 2. All-int64 inputs
+    monkeypatch.setattr(
+        v2_dspark,
+        "_token_requests",
+        lambda md, pos: torch.tensor([0, 0, 0], dtype=torch.int64),
+    )
+    md_i64 = SimpleNamespace(
+        seq_lens=torch.tensor([6], dtype=torch.int64),
+        query_start_loc=torch.tensor([0, 3], dtype=torch.int64),
+        block_tables=torch.tensor([[0, 1]], dtype=torch.int64),
+    )
+    pos_i64 = torch.tensor([1, 2, 5], dtype=torch.int64)
+    v2_dspark._insert_context_kv(attn, kv, pos_i64, md_i64)
+
+    assert len(inserted) == 2
+    assert torch.equal(inserted[0][0], inserted[1][0])
+    assert torch.equal(inserted[0][1], inserted[1][1])
+    assert torch.equal(inserted[0][2], inserted[1][2])

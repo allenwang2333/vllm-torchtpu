@@ -183,15 +183,22 @@ def _insert_context_kv(
             if cached_slots is not None:
                 _, _, _, in_window, addr, _ = cached_slots
             elif metadata.seq_lens.numel() > 0:
-                pos_i32 = positions.int()
-                requests = (
-                    _token_requests(metadata, positions)
-                    .clamp(max=metadata.seq_lens.shape[0] - 1)
-                    .int()
+                pos_i32 = (
+                    positions if positions.dtype == torch.int32 else positions.int()
+                )
+                requests = _token_requests(metadata, positions).clamp(
+                    max=metadata.seq_lens.shape[0] - 1
                 )
                 offsets = (
                     pos_i32
-                    - metadata.seq_lens.int().index_select(0, requests)
+                    - (
+                        metadata.seq_lens
+                        if metadata.seq_lens.dtype == torch.int32
+                        else metadata.seq_lens.int()
+                    ).index_select(
+                        0,
+                        requests if requests.dtype == torch.int32 else requests.int(),
+                    )
                     + attn.window_size
                 )
                 in_window = (offsets >= 0) & (offsets < attn.window_size)
@@ -202,14 +209,23 @@ def _insert_context_kv(
                     # Flat int32 row-major index into the block table: one
                     # 1-D index_select per layer instead of a 2-D int64
                     # (requests, pos_col) gather.
-                    block_idx = requests * width + pos_col
+                    block_idx = (
+                        requests if requests.dtype == torch.int32 else requests.int()
+                    ) * width + pos_col
                     pos_rem = pos_i32 % rows_per_page
                     rows = torch.arange(
                         positions.shape[0],
                         dtype=torch.int32,
                         device=positions.device,
                     )
-                    valid_token = rows < metadata.query_start_loc[-1].int()
+                    valid_token = (
+                        rows
+                        < (
+                            metadata.query_start_loc
+                            if metadata.query_start_loc.dtype == torch.int32
+                            else metadata.query_start_loc.int()
+                        )[-1]
+                    )
                     addr = (
                         block_idx,
                         width,
@@ -231,7 +247,11 @@ def _insert_context_kv(
                 # int32 block / slot math (block tables and positions are
                 # int32; slots fit int32 like every PagedCacheRows record):
                 # TPU emulates int64 multiplies and adds.
-                blocks = table.reshape(-1).index_select(0, block_idx).int()
+                blocks = (
+                    (table if table.dtype == torch.int32 else table.int())
+                    .reshape(-1)
+                    .index_select(0, block_idx)
+                )
                 swa_slots = (blocks * rows_per_page + pos_rem).masked_fill(
                     ~valid_token, -1
                 )

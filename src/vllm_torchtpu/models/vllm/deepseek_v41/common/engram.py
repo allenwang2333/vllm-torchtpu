@@ -107,9 +107,9 @@ class NgramHashState(upstream.NgramHashState):
         mapped: torch.Tensor | None = None
         if self.use_slot_cache:
             assert self._cache is not None and slot_mapping is not None
-            mapped = self.token_map.index_select(0, input_ids.int()).masked_fill(
-                dead_mask, upstream.DEAD_ID
-            )
+            mapped = self.token_map.index_select(
+                0, input_ids if input_ids.dtype == torch.int32 else input_ids.int()
+            ).masked_fill(dead_mask, upstream.DEAD_ID)
             valid = slot_mapping >= 0
             self.write_cache(self._cache, slot_mapping, mapped, valid)
 
@@ -119,15 +119,20 @@ class NgramHashState(upstream.NgramHashState):
             assert self._cache is not None
             # Positions, block ids and slots are < 2**31: gather in int32 from
             # the flattened table instead of 2D int64 advanced indexing.
-            logical = past.clamp(
+            logical = (past if past.dtype == torch.int32 else past.int()).clamp(
                 min=0, max=block_table.shape[1] * self.block_size - 1
-            ).int()
+            )
             block_idx = (
-                reqs.int() * block_table.shape[1] + logical // self.block_size
+                (reqs if reqs.dtype == torch.int32 else reqs.int())
+                * block_table.shape[1]
+                + logical // self.block_size
             ).reshape(-1)
             blocks = (
-                block_table.reshape(-1).index_select(0, block_idx).view_as(logical)
-            ).int()
+                (block_table if block_table.dtype == torch.int32 else block_table.int())
+                .reshape(-1)
+                .index_select(0, block_idx)
+                .view_as(logical)
+            )
             slots = (blocks * self.block_size + logical % self.block_size).clamp(
                 min=0, max=self._cache.numel() - 1
             )
@@ -283,8 +288,12 @@ class NgramHashState(upstream.NgramHashState):
         # them int32 and gather with flat 1D ``index_select``; ``source`` is
         # widened to int64 only for the hash multiply below.
         rows = torch.arange(count, dtype=torch.int32, device=dev)
-        qsl_i32 = query_start_loc.int()
-        pos_i32 = positions.int()
+        qsl_i32 = (
+            query_start_loc
+            if query_start_loc.dtype == torch.int32
+            else query_start_loc.int()
+        )
+        pos_i32 = positions if positions.dtype == torch.int32 else positions.int()
         reqs = (
             (rows.unsqueeze(1) >= qsl_i32[1:].unsqueeze(0))
             .sum(-1, dtype=torch.int32)
@@ -297,9 +306,9 @@ class NgramHashState(upstream.NgramHashState):
         in_chunk = past >= chunk_positions[:, None]
         indices = (rows[:, None] - shifts).clamp(min=0)
         if mapped_batch is None:
-            mapped_batch = token_map.index_select(0, input_ids.int()).masked_fill(
-                dead_mask, upstream.DEAD_ID
-            )
+            mapped_batch = token_map.index_select(
+                0, input_ids if input_ids.dtype == torch.int32 else input_ids.int()
+            ).masked_fill(dead_mask, upstream.DEAD_ID)
         batch = mapped_batch.index_select(0, indices.reshape(-1)).view(count, ngram)
         cols = chunk_positions[:, None] - 1 - past
         in_window = ~in_chunk & (cols >= 0) & (cols < self.lookback_depth)
@@ -311,7 +320,16 @@ class NgramHashState(upstream.NgramHashState):
         )
         known = in_window & (window_ids >= 0)
         mapped_lookback = (
-            token_map.index_select(0, lookback_token_ids.clamp(min=0).reshape(-1).int())
+            token_map.index_select(
+                0,
+                (
+                    lookback_token_ids
+                    if lookback_token_ids.dtype == torch.int32
+                    else lookback_token_ids.int()
+                )
+                .clamp(min=0)
+                .reshape(-1),
+            )
             .view_as(lookback_token_ids)
             .masked_fill(lookback_dead_mask, upstream.DEAD_ID)
         )
@@ -320,9 +338,11 @@ class NgramHashState(upstream.NgramHashState):
             in_chunk,
             batch,
             torch.where(known, window, fallback(past, reqs_col, window)),
-        ).long()
-        blocked = ((past < 0) | (source == upstream.DEAD_ID)).cumsum(dim=1) > 0
-        source = source.masked_fill(blocked, self.pad_id)
+        )
+        blocked = ((past < 0) | (source == upstream.DEAD_ID)).cumsum(
+            dim=1, dtype=torch.int32
+        ) > 0
+        source = source.masked_fill(blocked, self.pad_id).long()
         terms = source[:, None, :] * multipliers[None, :, :]
         rolling = terms[:, :, 0]
         rolling_steps = []

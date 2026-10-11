@@ -1110,3 +1110,41 @@ def test_common_engram_v030_v031_import_fallback(monkeypatch):
     assert sys.modules[common_engram.__name__] is common_engram
     assert hasattr(common_engram, "engram_gathered_num_tokens")
     assert hasattr(common_engram, "engram_head_shard_rank")
+
+
+def test_td8301_ngram_hash_int32_cumsum_and_guards():
+    """Verify TD8.301 native int32 cumsum and guarded .int() casts in NgramHashState."""
+
+    class DummyState(common_engram.NgramHashState):
+        def write_cache(self, cache, slots, values, valid):
+            pass
+
+    state = _build_common_hash_state(use_slot_cache=True, subclass=DummyState)
+    ids_i32 = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    pos_i32 = torch.tensor([0, 1, 5, 6], dtype=torch.int32)
+    pos_i64 = pos_i32.to(torch.int64)
+    qsl_i32 = torch.tensor([0, 2, 4], dtype=torch.int32)
+    qsl_i64 = qsl_i32.to(torch.int64)
+    dead = torch.tensor([True, False, False, True], dtype=torch.bool)
+    lookback = torch.tensor([[10, 11, -1, 13], [20, -1, 22, 23]], dtype=torch.int32)
+    dead_lb = torch.tensor(
+        [[False, True, False, False], [True, False, False, False]],
+        dtype=torch.bool,
+    )
+    slots_i32 = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    slots_i64 = slots_i32.to(torch.int64)
+    bt_i32 = torch.zeros((2, 4), dtype=torch.int32)
+    bt_i64 = bt_i32.to(torch.int64)
+
+    out_i32 = state.forward(
+        ids_i32, pos_i32, qsl_i32, dead, lookback, dead_lb, slots_i32, bt_i32
+    )
+    out_i64 = state.forward(
+        ids_i32, pos_i64, qsl_i64, dead, lookback, dead_lb, slots_i64, bt_i64
+    )
+    assert out_i32.dtype == torch.int32
+    assert torch.equal(out_i32, out_i64)
+
+    host_i32 = state.hash_on_host(ids_i32, pos_i32, qsl_i32, dead, lookback, dead_lb)
+    host_i64 = state.hash_on_host(ids_i32, pos_i64, qsl_i64, dead, lookback, dead_lb)
+    assert torch.equal(host_i32, host_i64)
