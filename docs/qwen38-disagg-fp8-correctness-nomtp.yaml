@@ -1,0 +1,889 @@
+# cloud-devkit recipe vllm-qwen38-disagg-fp8-correctness-nomtp (cdk job create with
+# BASELINE=1 for GMM). GSM8K scores from the GMM run j-f4db54bc on 2026-10-11:
+# PD 0.9375, direct decode 0.9453 on 128 questions; 741 tok/s at 8192 in / 256 out / c32.
+# The source, wheel and model mounts refer to the experiment workspace.
+# Real FP8 Qwen3.8, PP4 x PCP8 -> TP32 + DCP8, no speculative decoding, from
+# the pp-pcp-head worktree (SRC_DIR). BASELINE=1 selects GMM with identical
+# weights, layouts and quantization; the default runs the fused EP kernel.
+# GSM8K uses 32 training examples so prompts exceed the 3072-token transfer block.
+# Each leg compares PD with direct decode; scores may differ by two answers.
+# One performance case: 8192 input tokens, 256 output tokens, c32, 96 requests.
+# Needs the default cluster's two 2x2x4 pools (the shared pool is 2x4x4).
+#   cdk job create vllm-qwen38-disagg-fp8-correctness-nomtp
+#   cdk job create vllm-qwen38-disagg-fp8-correctness-nomtp BASELINE=1
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: vllm-qwen38-disagg-fp8-correctness-nomtp
+spec:
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - check
+  network:
+    enableDNSHostnames: true
+  replicatedJobs:
+  - name: prefill
+    replicas: 4
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              gke-gcsfuse/volumes: "true"
+              kueue.x-k8s.io/podset-unconstrained-topology: "true"
+          spec:
+            initContainers:
+            - name: tpu-node-setup
+              image: busybox
+              securityContext:
+                privileged: true
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  sysctl -w vm.max_map_count=8388608
+                  if [ -f /sys/module/vfio_iommu_type1/parameters/dma_entry_limit ]; then
+                    echo 2000000 > /sys/module/vfio_iommu_type1/parameters/dma_entry_limit
+                  fi
+            containers:
+            - name: server
+              image: "{{ .IMAGE | default `us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:nightly-20261001` }}"
+              imagePullPolicy: IfNotPresent
+              env:
+              - name: JS_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: JOBSET_JOB_INDEX
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+              - name: VLLM_HOST_IP
+                valueFrom:
+                  fieldRef:
+                    fieldPath: status.podIP
+              - name: BASELINE
+                value: "{{ .BASELINE | default `0` }}"
+              - name: PROFILE
+                value: "{{ .PROFILE | default `0` }}"
+              - name: XPROF
+                value: "{{ .XPROF | default `0` }}"
+              - name: DYNAMIC_CHUNKS
+                value: "{{ .DYNAMIC_CHUNKS | default `1` }}"
+              - name: PREFIX_CACHING
+                value: "{{ .PREFIX_CACHING | default `1` }}"
+              - name: TORCH_TPU_WHEEL
+                value: "{{ .TORCH_TPU_WHEEL | default `torch_tpu-0.1.1.dev20260928182719-cp312-cp312-manylinux_2_31_x86_64.whl` }}"
+              - name: RAIDEN_WHEEL
+                value: "{{ .RAIDEN_WHEEL | default `tpu_sync_torch-0.0.1.dev20261007210147-1_pp_reshard_0923_55a23251-cp312-cp312-manylinux_2_31_x86_64.whl` }}"
+              - name: KV_BLOCKS
+                value: "0"
+              - name: MAX_MODEL_LEN
+                value: "{{ .MAX_MODEL_LEN | default `40960` }}"
+              - name: MODEL_DIR
+                value: gs://cloud-devkit/ckpt/hf/Qwen/Qwen3.8-2.4T-A95B-FP8
+              - name: TPU_MULTIHOST_BACKEND
+                value: mp
+              - name: VLLM_KV_CACHE_LAYOUT
+                value: HND
+              - name: TPU_RAIDEN_DST_SHARDS
+                value: "32"
+              - name: TPU_RAIDEN_TRANSFER_PARALLELISM
+                value: "32"
+              - name: TPU_GDN_CONV_QK_PAIR_LAYOUT
+                value: "1"
+              - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+                value: "1"
+              - name: TPU_USE_RAIDEN_KV_CACHE_MANAGER
+                value: "1"
+              - name: TPU_RAIDEN_QWEN35_ADMISSION
+                value: "1"
+              - name: TPU_KV_RESHARD_TRANSPORT
+                value: raiden
+              - name: TPU_RAIDEN_JOB_NAME
+                value: prefill
+              - name: TPU_P2P_WAIT_PULL_TIMEOUT
+                value: "600"
+              - name: TPU_KV_SHM_POOL_GB
+                value: "8"
+              - name: TPU_KV_TRANSFER_PORT
+                value: "9100"
+              - name: TPU_SIDE_CHANNEL_PORT
+                value: "9600"
+              - name: USE_BATCHED_RPA_LONGCTX
+                value: "1"
+              - name: SKIP_JAX_PRECOMPILE
+                value: "1"
+              - name: TPU_PARALLEL_PRECOMPILE
+                value: "1"
+              - name: TPU_PREMAPPED_BUFFER_SIZE
+                value: "17179869184"
+              - name: RUNAI_STREAMER_MEMORY_LIMIT
+                value: "8589934592"
+              - name: MOE_FUSED_EP_KERNEL_IMPL
+                value: v2
+              - name: USE_MOE_FUSED_EP_KERNEL
+                value: "1"
+              - name: MOE_FUSED_EP_V2_SHARDED_PLAN
+                value: "0"
+              - name: TPU_MOE_SKIP_PADDED_TOKENS
+                value: "0"
+              # PCP8 times the 512-token PP granule divides every runtime bucket.
+              - name: TPU_MOE_COLLECTION_CHUNK_SIZE
+                value: "4096"
+              - name: RAGGED_GATHER_REDUCE_VERSION
+                value: v3
+              - name: LIBTPU_INIT_ARGS
+                value: --xla_tpu_enable_diagnostic_coordinator=false
+              - name: XLA_FLAGS
+                value: --xla_enable_hlo_sharding_v3=false
+              - name: VLLM_CACHE_ROOT
+                value: /mnt/workspace/compilation-cache/qwen38-disagg-fp8-correctness-sharding-v2
+              - name: TORCHINDUCTOR_AUTOGRAD_CACHE
+                value: "0"
+              - name: VLLM_XLA_CHECK_RECOMPILATION
+                value: "0"
+              - name: TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE
+                value: disabled
+              - name: VLLM_ENGINE_READY_TIMEOUT_S
+                value: "3600"
+              - name: TPU_MP_RENDEZVOUS_TIMEOUT_S
+                value: "1800"
+              - name: VLLM_LOGGING_LEVEL
+                value: INFO
+              - name: HF_HUB_OFFLINE
+                value: "1"
+              - name: MALLOC_ARENA_MAX
+                value: "16"
+              - name: MALLOC_TRIM_THRESHOLD_
+                value: "131072"
+              - name: MALLOC_MMAP_THRESHOLD_
+                value: "1048576"
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -eo pipefail
+                  # The FP8 fused kernel takes per-output-channel scales.
+                  unset MOE_REQUANTIZE_BLOCK_SIZE
+                  LAYOUT=pp4pcp8
+                  if [ "$BASELINE" = 1 ]; then
+                    unset MOE_FUSED_EP_KERNEL_IMPL
+                    export USE_MOE_FUSED_EP_KERNEL=0
+                    echo "MOE_PATH=gmm"
+                  else
+                    echo "MOE_PATH=fused_ep_v2"
+                  fi
+                  echo "BOOT role=prefill host=$JOBSET_JOB_INDEX pod=$(hostname) layout=$LAYOUT profile=$PROFILE $(date -u +%FT%TZ)"
+                  [ "$PROFILE" = 1 ] && export TPU_STDERR_LOG_LEVEL=0 TPU_VMODULE=tpu_pjrt_client=1
+                  cd /root/torchtpu-vllm
+                  export PYTHONPATH=/root/torchtpu-vllm/src:/root/torchtpu-vllm:${PYTHONPATH:-}
+                  VLLM_SPEC=$(grep -E '^[[:space:]]*"vllm @ ' pyproject.toml | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/' | head -n1)
+                  VLLM_TAG=${VLLM_SPEC##*@}; VLLM_TAG=${VLLM_TAG#v}
+                  VLLM_HAVE=$(pip show vllm 2>/dev/null | sed -n 's/^Version: //p')
+                  case "$VLLM_HAVE" in
+                    "$VLLM_TAG"*) ;;
+                    *) VLLM_TARGET_DEVICE=empty uv pip install --system --no-deps "$VLLM_SPEC" >/tmp/pip-vllm.log 2>&1 || { echo "FATAL: vllm install failed"; tail -20 /tmp/pip-vllm.log; exit 1; };;
+                  esac
+                  TT_WHL="/root/wheels/$TORCH_TPU_WHEEL"
+                  [ -f "$TT_WHL" ] || { echo "FATAL: $TT_WHL missing; stage it under /workspace/wheels"; exit 1; }
+                  uv pip install --system --no-deps --reinstall "$TT_WHL" >/tmp/pip-tt.log 2>&1 || { echo "FATAL: torch_tpu install failed"; tail -20 /tmp/pip-tt.log; exit 1; }
+                  RAIDEN_WHL="/root/wheels/$RAIDEN_WHEEL"
+                  [ -f "$RAIDEN_WHL" ] || { echo "FATAL: $RAIDEN_WHL missing; stage it under /workspace/wheels"; exit 1; }
+                  uv pip install --system --no-deps --reinstall "$RAIDEN_WHL" >/tmp/pip-raiden.log 2>&1 || { echo "FATAL: raiden install failed"; tail -20 /tmp/pip-raiden.log; exit 1; }
+                  python3 -c 'from tpu_sync.api.torch.kv_cache_manager import _torch_impl; print("raiden native extension OK:", _torch_impl().__file__, flush=True)' \
+                    || { echo "FATAL: raiden native extension does not load against $TORCH_TPU_WHEEL"; exit 1; }
+                  python3 - <<'PY' || exit 1
+                  import inspect
+                  from importlib.metadata import version
+                  from torch_tpu._internal.pallas import pallas
+                  assert "process_group" in inspect.signature(pallas.get_pallas_mesh).parameters, \
+                      "torch_tpu lacks get_pallas_mesh(process_group=); the stage mesh needs torch_tpu#4387"
+                  print("torch_tpu", version("torch-tpu"), flush=True)
+                  PY
+                  python3 - <<'PY' || exit 1
+                  import pathlib
+                  import vllm.engine.arg_utils as m
+                  p = pathlib.Path(m.__file__)
+                  s = p.read_text()
+                  old = "                * self.tensor_parallel_size\n            )\n            world_size_within_dp = (\n                self.pipeline_parallel_size * self.tensor_parallel_size\n            )\n"
+                  new = "                * self.tensor_parallel_size\n                * self.prefill_context_parallel_size\n            )\n            world_size_within_dp = (\n                self.pipeline_parallel_size * self.tensor_parallel_size\n                * self.prefill_context_parallel_size\n            )\n"
+                  assert s.count(old) == 1, s.count(old)
+                  p.write_text(s.replace(old, new))
+                  print("vllm --nnodes check counts prefill context parallelism", flush=True)
+                  PY
+                  python3 -c 'import runai_model_streamer, runai_model_streamer_gcs' 2>/dev/null \
+                    || pip install runai-model-streamer runai-model-streamer-gcs
+
+                  python3 - "$MODEL_DIR" <<'PY'
+                  import os, sys
+                  from vllm.transformers_utils.runai_utils import ObjectStorageModel
+                  url = sys.argv[1]
+                  model = ObjectStorageModel(url=url)
+                  model.pull_files(url, allow_pattern=["*.model", "*.py", "*.json"])
+                  model.pull_files(url, ignore_pattern=["*.pt", "*.safetensors", "*.bin", "*.tensors", "*.pth"])
+                  config = os.path.join(model.dir, "config.json")
+                  assert os.path.isfile(config), f"pre-pull left no {config}"
+                  open(os.path.join(model.dir, ".prepulled"), "w").close()
+                  print("pre-pulled model config into", model.dir, flush=True)
+                  PY
+                  python3 - <<'PY'
+                  import vllm.transformers_utils.runai_utils as m
+                  src = open(m.__file__).read()
+                  guard = '        if os.path.exists(os.path.join(self.dir, ".prepulled")):\n            return\n'
+                  if ".prepulled" not in src:
+                      needle = '        if not model_path.endswith("/"):'
+                      assert needle in src, "pull_files body changed; update this patch"
+                      open(m.__file__, "w").write(src.replace(needle, guard + needle, 1))
+                  print("runai pull-skip guard installed", flush=True)
+                  PY
+                  unset TPU_PROCESS_ADDRESSES TPU_PROCESS_PORT TPU_WORKER_HOSTNAMES TPU_WORKER_ID TPU_NAME MEGASCALE_COORDINATOR_ADDRESS MEGASCALE_PORT MEGASCALE_NUM_SLICES MEGASCALE_SLICE_ID TPU_VISIBLE_CHIPS TPU_VISIBLE_DEVICES
+                  HEAD_ADDR="${JS_NAME}-prefill-0-0.${JS_NAME}"
+                  for i in $(seq 1 360); do
+                    if HEAD_IP=$(getent hosts "$HEAD_ADDR" | awk 'NR == 1 {print $1}') && [ -n "$HEAD_IP" ]; then
+                      break
+                    fi
+                    sleep 5
+                  done
+                  [ -n "$HEAD_IP" ] || { echo "FATAL: cannot resolve $HEAD_ADDR"; exit 1; }
+                  NS="${JS_NAME//[^a-zA-Z0-9_]/_}"
+                  export TPU_KV_TRANSFER_NAMESPACE="${NS}_prefill"
+                  export TPU_RAIDEN_ENGINE_ID="${JS_NAME}-prefill-engine"
+                  export TPU_RAIDEN_RESHARD_IMPL=store
+                  export TPU_RAIDEN_ADVERTISE_HOST="$HEAD_ADDR"
+                  export TPU_RAIDEN_RESHARD_PORT_BASE=28000
+                  export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=28100
+                  export RAIDEN_DISABLE_SINGLETON_WORKER=1
+                  export TPU_PP_DYNAMIC_CHUNKS=$DYNAMIC_CHUNKS TPU_PP_LAZY_PUSH=0
+                  case "$LAYOUT" in
+                    pp4pcp8)
+                      PAR="--pipeline-parallel-size 4 --tensor-parallel-size 1 --prefill-context-parallel-size 8"
+                      MNBT=16384; SIZES="512,1024,2048"
+                      export TPU_RAIDEN_POOL_TAGS_PER_LAYER=1;;
+                    pcp16tp2)
+                      PAR="--pipeline-parallel-size 1 --tensor-parallel-size 2 --prefill-context-parallel-size 16"
+                      MNBT=65536; SIZES="512,1024,2048,4096";;
+                  esac
+                  KV_OVERRIDE=""; [ "$KV_BLOCKS" = 0 ] || KV_OVERRIDE="--num-gpu-blocks-override $KV_BLOCKS"
+                  PREFIX="--enable-prefix-caching"; [ "$PREFIX_CACHING" = 0 ] && PREFIX="--no-enable-prefix-caching"
+                  HEADLESS=""; [ "$JOBSET_JOB_INDEX" != "0" ] && HEADLESS="--headless"
+                  KV_CONFIG='{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":14579,"kv_connector_extra_config":{"destination_decode_context_parallel_size":8}}'
+                  PROF=""
+                  if [ "$XPROF" = 1 ]; then
+                    PROF="--profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/dev/shm/xprof --profiler-config.ignore_frontend=true"
+                    mkdir -p /dev/shm/xprof
+                    OUT_DIRS="${CDK_OUTPUT_DIR:-/tmp/cdk-outputs}/xprof-prefill-host$JOBSET_JOB_INDEX /cdk-outputs/outputs/xprof-prefill-host$JOBSET_JOB_INDEX"
+                    for d in $OUT_DIRS; do mkdir -p "$d" 2>/dev/null || true; done
+                    ( while true; do
+                        sleep 15
+                        for cd in $(find /dev/shm/xprof -type d -path '*/plugins/profile/*' 2>/dev/null); do
+                          f=$(find "$cd" -maxdepth 1 -name '*.xplane.pb' -mmin +0.5 2>/dev/null | sort | head -1)
+                          [ -n "$f" ] || continue
+                          ts=$(basename "$cd")
+                          for d in $OUT_DIRS; do cp -n "$f" "$d/${ts}_$(basename "$f")" 2>/dev/null || true; done
+                        done
+                      done ) &
+                  fi
+                  echo "SERVE_START role=prefill layout=$LAYOUT kv_blocks=$KV_BLOCKS mnbt=$MNBT prefix_caching=$PREFIX_CACHING host=$JOBSET_JOB_INDEX $(date -u +%FT%TZ)"
+                  vllm serve "$MODEL_DIR" --served-model-name q38 $HEADLESS \
+                    --nnodes 4 --node-rank "$JOBSET_JOB_INDEX" --master-addr "$HEAD_IP" --master-port 29500 \
+                    --distributed-executor-backend mp \
+                    $PAR --enable-expert-parallel --enable-ep-weight-filter --disable-custom-all-reduce --no-async-scheduling \
+                    --load-format runai_streamer --dtype bfloat16 --trust-remote-code --seed 42 --generation-config vllm \
+                    --max-model-len "$MAX_MODEL_LEN" --max-num-seqs 32 --max-num-batched-tokens "$MNBT" --long-prefill-token-threshold 16384 \
+                    --gpu-memory-utilization 0.95 $KV_OVERRIDE --block-size 384 --cp-kv-cache-interleave-size 128 \
+                    --attention-backend CUSTOM --kv-cache-dtype fp8 --mamba-ssm-cache-dtype bfloat16 \
+                    $PREFIX --no-disable-hybrid-kv-cache-manager --language-model-only \
+                    --kv-transfer-config "$KV_CONFIG" \
+                    --host 0.0.0.0 --port 8000 --no-enable-log-requests \
+                    --compilation-config "{\"backend\":\"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor\",\"compile_sizes\":[$SIZES],\"inductor_compile_config\":{\"enable_auto_functionalized_v2\":false,\"size_asserts\":false,\"alignment_asserts\":false,\"scalar_asserts\":false}}" \
+                    --additional-config '{"tpu_online_fp8":{"enabled":true,"weight_scheme":"per_channel","targets":["model.layers.*.self_attn.qkv_proj","model.layers.*.self_attn.o_proj","model.layers.*.linear_attn.in_proj_qkvz","model.layers.*.linear_attn.in_proj_ba","model.layers.*.linear_attn.out_proj","model.layers.*.mlp.shared_expert.gate_up_proj","model.layers.*.mlp.shared_expert.down_proj"],"exclude":["model.layers.*.mlp.experts*"]}}' \
+                    > >(tee /tmp/serve.log) 2>&1 &
+                  SPID=$!
+                  (
+                    while kill -0 "$SPID" 2>/dev/null; do
+                      if [ -r /tmp/tpu_logs/server/tpu_driver.ERROR ] && grep -q 'START_SESSION failed.*Max # of tries.*exhausted' /tmp/tpu_logs/server/tpu_driver.ERROR; then
+                        echo "FATAL: TPU START_SESSION retries exhausted" | tee -a /tmp/serve.log
+                        tail -60 /tmp/tpu_logs/server/tpu_driver.ERROR | tee -a /tmp/serve.log
+                        kill -TERM "$SPID" 2>/dev/null || true
+                        break
+                      fi
+                      sleep 10
+                    done
+                  ) &
+                  CGROUP_DIR="/sys/fs/cgroup$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup)"
+                  if [ -r "$CGROUP_DIR/memory.current" ]; then
+                    (
+                      while kill -0 "$SPID" 2>/dev/null; do
+                        echo "$(date -u +%FT%TZ) current_bytes=$(cat "$CGROUP_DIR/memory.current") peak_bytes=$(cat "$CGROUP_DIR/memory.peak")" >> /tmp/host-memory.log
+                        cp /tmp/host-memory.log "$CDK_OUTPUT_DIR/host-memory-$(hostname).log" || true
+                        sleep 15
+                      done
+                    ) &
+                  fi
+                  if wait "$SPID"; then rc=0; else rc=$?; fi
+                  cp /tmp/serve.log "$CDK_OUTPUT_DIR/server-$(hostname).log" || true
+                  echo "SERVER_EXITED role=prefill host=$JOBSET_JOB_INDEX rc=$rc $(date -u +%FT%TZ)"
+                  exit $rc
+              volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+              - name: torchtpu-vllm-nfs
+                mountPath: /root/torchtpu-vllm
+              - name: wheels
+                mountPath: /root/wheels
+                readOnly: true
+              - name: models
+                mountPath: /root/models
+                readOnly: true
+              - name: compilation-cache
+                mountPath: /mnt/workspace/compilation-cache
+              securityContext:
+                privileged: true
+                capabilities:
+                  add:
+                  - IPC_LOCK
+              resources:
+                limits:
+                  memory: 850Gi
+                  ephemeral-storage: 150Gi
+                  google.com/tpu: "4"
+                requests:
+                  memory: 850Gi
+                  ephemeral-storage: 150Gi
+                  google.com/tpu: "4"
+            volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+            - name: torchtpu-vllm-nfs
+              nfs:
+                server: 10.128.1.121
+                path: "/workspace/vllm-torchtpu/{{ .SRC_DIR | default `pp-pcp-head` }}"
+            - name: wheels
+              nfs:
+                server: 10.128.1.121
+                path: /workspace/wheels
+            - name: models
+              nfs:
+                server: 10.128.1.121
+                path: /workspace/models
+            - name: compilation-cache
+              nfs:
+                server: 10.128.1.121
+                path: /workspace/compilation-cache
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x4
+            affinity:
+              podAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      jobset.sigs.k8s.io/replicatedjob-name: prefill
+                  matchLabelKeys:
+                  - jobset.sigs.k8s.io/jobset-name
+                  topologyKey: cloud.google.com/gke-nodepool
+  - name: decode
+    replicas: 4
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              gke-gcsfuse/volumes: "true"
+              kueue.x-k8s.io/podset-unconstrained-topology: "true"
+          spec:
+            initContainers:
+            - name: tpu-node-setup
+              image: busybox
+              securityContext:
+                privileged: true
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  sysctl -w vm.max_map_count=8388608
+                  if [ -f /sys/module/vfio_iommu_type1/parameters/dma_entry_limit ]; then
+                    echo 2000000 > /sys/module/vfio_iommu_type1/parameters/dma_entry_limit
+                  fi
+            containers:
+            - name: server
+              image: "{{ .IMAGE | default `us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:nightly-20261001` }}"
+              imagePullPolicy: IfNotPresent
+              env:
+              - name: JS_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: JOBSET_JOB_INDEX
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+              - name: VLLM_HOST_IP
+                valueFrom:
+                  fieldRef:
+                    fieldPath: status.podIP
+              - name: BASELINE
+                value: "{{ .BASELINE | default `0` }}"
+              - name: PROFILE
+                value: "{{ .PROFILE | default `0` }}"
+              - name: XPROF
+                value: "{{ .XPROF | default `0` }}"
+              - name: TORCH_TPU_WHEEL
+                value: "{{ .TORCH_TPU_WHEEL | default `torch_tpu-0.1.1.dev20260928182719-cp312-cp312-manylinux_2_31_x86_64.whl` }}"
+              - name: RAIDEN_WHEEL
+                value: "{{ .RAIDEN_WHEEL | default `tpu_sync_torch-0.0.1.dev20261007210147-1_pp_reshard_0923_55a23251-cp312-cp312-manylinux_2_31_x86_64.whl` }}"
+              - name: DECODE_KV_BLOCKS
+                value: "0"
+              - name: MAX_NUM_SEQS
+                value: "{{ .MAX_NUM_SEQS | default `32` }}"
+              - name: MAX_MODEL_LEN
+                value: "{{ .MAX_MODEL_LEN | default `40960` }}"
+              - name: ASYNC_SCHEDULING
+                value: "{{ .ASYNC_SCHEDULING | default `1` }}"
+              - name: MODEL_DIR
+                value: gs://cloud-devkit/ckpt/hf/Qwen/Qwen3.8-2.4T-A95B-FP8
+              - name: TPU_MULTIHOST_BACKEND
+                value: mp
+              - name: VLLM_KV_CACHE_LAYOUT
+                value: HND
+              - name: TPU_RAIDEN_DST_SHARDS
+                value: "32"
+              - name: TPU_RAIDEN_TRANSFER_PARALLELISM
+                value: "32"
+              - name: TPU_GDN_CONV_QK_PAIR_LAYOUT
+                value: "1"
+              - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+                value: "1"
+              - name: TPU_USE_RAIDEN_KV_CACHE_MANAGER
+                value: "1"
+              - name: TPU_RAIDEN_QWEN35_ADMISSION
+                value: "1"
+              - name: TPU_KV_RESHARD_TRANSPORT
+                value: raiden
+              - name: TPU_RAIDEN_JOB_NAME
+                value: decode
+              - name: TPU_P2P_WAIT_PULL_TIMEOUT
+                value: "600"
+              - name: TPU_KV_SHM_POOL_GB
+                value: "8"
+              - name: TPU_KV_TRANSFER_PORT
+                value: "9100"
+              - name: TPU_SIDE_CHANNEL_PORT
+                value: "9600"
+              - name: USE_BATCHED_RPA_LONGCTX
+                value: "1"
+              - name: TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER
+                value: "0"
+              - name: SKIP_JAX_PRECOMPILE
+                value: "1"
+              - name: TPU_PARALLEL_PRECOMPILE
+                value: "1"
+              - name: TPU_PREMAPPED_BUFFER_SIZE
+                value: "17179869184"
+              - name: RUNAI_STREAMER_MEMORY_LIMIT
+                value: "8589934592"
+              - name: MOE_FUSED_EP_KERNEL_IMPL
+                value: v2
+              - name: USE_MOE_FUSED_EP_KERNEL
+                value: "1"
+              - name: MOE_FUSED_EP_V2_SHARDED_PLAN
+                value: "0"
+              - name: TPU_MOE_SKIP_PADDED_TOKENS
+                value: "0"
+              - name: TPU_MOE_COLLECTION_CHUNK_SIZE
+                value: "65536"
+              - name: RAGGED_GATHER_REDUCE_VERSION
+                value: v3
+              - name: LIBTPU_INIT_ARGS
+                value: --xla_tpu_enable_diagnostic_coordinator=false
+              - name: XLA_FLAGS
+                value: --xla_enable_hlo_sharding_v3=false
+              - name: VLLM_CACHE_ROOT
+                value: /mnt/workspace/compilation-cache/qwen38-disagg-fp8-correctness-sharding-v2
+              - name: TORCHINDUCTOR_AUTOGRAD_CACHE
+                value: "0"
+              - name: VLLM_XLA_CHECK_RECOMPILATION
+                value: "0"
+              - name: TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE
+                value: disabled
+              - name: VLLM_ENGINE_READY_TIMEOUT_S
+                value: "3600"
+              - name: TPU_MP_RENDEZVOUS_TIMEOUT_S
+                value: "1800"
+              - name: VLLM_LOGGING_LEVEL
+                value: INFO
+              - name: HF_HUB_OFFLINE
+                value: "1"
+              - name: MALLOC_ARENA_MAX
+                value: "16"
+              - name: MALLOC_TRIM_THRESHOLD_
+                value: "131072"
+              - name: MALLOC_MMAP_THRESHOLD_
+                value: "1048576"
+              - name: PYTHONUNBUFFERED
+                value: "1"
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -eo pipefail
+                  # The FP8 fused kernel takes per-output-channel scales.
+                  unset MOE_REQUANTIZE_BLOCK_SIZE
+                  LAYOUT=pp4pcp8
+                  if [ "$BASELINE" = 1 ]; then
+                    unset MOE_FUSED_EP_KERNEL_IMPL
+                    export USE_MOE_FUSED_EP_KERNEL=0
+                    echo "MOE_PATH=gmm"
+                  else
+                    echo "MOE_PATH=fused_ep_v2"
+                  fi
+                  echo "BOOT role=decode host=$JOBSET_JOB_INDEX pod=$(hostname) layout=$LAYOUT profile=$PROFILE $(date -u +%FT%TZ)"
+                  [ "$PROFILE" = 1 ] && export TPU_STDERR_LOG_LEVEL=0 TPU_VMODULE=tpu_pjrt_client=1
+                  cd /root/torchtpu-vllm
+                  export PYTHONPATH=/root/torchtpu-vllm/src:/root/torchtpu-vllm:${PYTHONPATH:-}
+                  VLLM_SPEC=$(grep -E '^[[:space:]]*"vllm @ ' pyproject.toml | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/' | head -n1)
+                  VLLM_TAG=${VLLM_SPEC##*@}; VLLM_TAG=${VLLM_TAG#v}
+                  VLLM_HAVE=$(pip show vllm 2>/dev/null | sed -n 's/^Version: //p')
+                  case "$VLLM_HAVE" in
+                    "$VLLM_TAG"*) ;;
+                    *) VLLM_TARGET_DEVICE=empty uv pip install --system --no-deps "$VLLM_SPEC" >/tmp/pip-vllm.log 2>&1 || { echo "FATAL: vllm install failed"; tail -20 /tmp/pip-vllm.log; exit 1; };;
+                  esac
+                  TT_WHL="/root/wheels/$TORCH_TPU_WHEEL"
+                  [ -f "$TT_WHL" ] || { echo "FATAL: $TT_WHL missing; stage it under /workspace/wheels"; exit 1; }
+                  uv pip install --system --no-deps --reinstall "$TT_WHL" >/tmp/pip-tt.log 2>&1 || { echo "FATAL: torch_tpu install failed"; tail -20 /tmp/pip-tt.log; exit 1; }
+                  RAIDEN_WHL="/root/wheels/$RAIDEN_WHEEL"
+                  [ -f "$RAIDEN_WHL" ] || { echo "FATAL: $RAIDEN_WHL missing; stage it under /workspace/wheels"; exit 1; }
+                  uv pip install --system --no-deps --reinstall "$RAIDEN_WHL" >/tmp/pip-raiden.log 2>&1 || { echo "FATAL: raiden install failed"; tail -20 /tmp/pip-raiden.log; exit 1; }
+                  python3 -c 'from tpu_sync.api.torch.kv_cache_manager import _torch_impl; print("raiden native extension OK:", _torch_impl().__file__, flush=True)' \
+                    || { echo "FATAL: raiden native extension does not load against $TORCH_TPU_WHEEL"; exit 1; }
+                  python3 -c 'import runai_model_streamer, runai_model_streamer_gcs' 2>/dev/null \
+                    || pip install runai-model-streamer runai-model-streamer-gcs
+
+                  python3 - "$MODEL_DIR" <<'PY'
+                  import os, sys
+                  from vllm.transformers_utils.runai_utils import ObjectStorageModel
+                  url = sys.argv[1]
+                  model = ObjectStorageModel(url=url)
+                  model.pull_files(url, allow_pattern=["*.model", "*.py", "*.json"])
+                  model.pull_files(url, ignore_pattern=["*.pt", "*.safetensors", "*.bin", "*.tensors", "*.pth"])
+                  config = os.path.join(model.dir, "config.json")
+                  assert os.path.isfile(config), f"pre-pull left no {config}"
+                  open(os.path.join(model.dir, ".prepulled"), "w").close()
+                  print("pre-pulled model config into", model.dir, flush=True)
+                  PY
+                  python3 - <<'PY'
+                  import vllm.transformers_utils.runai_utils as m
+                  src = open(m.__file__).read()
+                  guard = '        if os.path.exists(os.path.join(self.dir, ".prepulled")):\n            return\n'
+                  if ".prepulled" not in src:
+                      needle = '        if not model_path.endswith("/"):'
+                      assert needle in src, "pull_files body changed; update this patch"
+                      open(m.__file__, "w").write(src.replace(needle, guard + needle, 1))
+                  print("runai pull-skip guard installed", flush=True)
+                  PY
+                  unset TPU_PROCESS_ADDRESSES TPU_PROCESS_PORT TPU_WORKER_HOSTNAMES TPU_WORKER_ID TPU_NAME MEGASCALE_COORDINATOR_ADDRESS MEGASCALE_PORT MEGASCALE_NUM_SLICES MEGASCALE_SLICE_ID TPU_VISIBLE_CHIPS TPU_VISIBLE_DEVICES
+                  HEAD_ADDR="${JS_NAME}-decode-0-0.${JS_NAME}"
+                  for i in $(seq 1 360); do
+                    if HEAD_IP=$(getent hosts "$HEAD_ADDR" | awk 'NR == 1 {print $1}') && [ -n "$HEAD_IP" ]; then
+                      break
+                    fi
+                    sleep 5
+                  done
+                  [ -n "$HEAD_IP" ] || { echo "FATAL: cannot resolve $HEAD_ADDR"; exit 1; }
+                  NS="${JS_NAME//[^a-zA-Z0-9_]/_}"
+                  export TPU_KV_TRANSFER_NAMESPACE="${NS}_decode"
+                  export TPU_RAIDEN_ENGINE_ID="${JS_NAME}-decode-engine"
+                  export TPU_RAIDEN_RESHARD_IMPL=store
+                  export TPU_RAIDEN_ADVERTISE_HOST="$HEAD_ADDR"
+                  export TPU_RAIDEN_RESHARD_PORT_BASE=28000
+                  export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=28100
+                  export RAIDEN_DISABLE_SINGLETON_WORKER=1
+                  [ "$LAYOUT" = pp4pcp8 ] && export TPU_RAIDEN_POOL_TAGS_PER_LAYER=1
+                  KV_OVERRIDE=""; [ "$DECODE_KV_BLOCKS" = 0 ] || KV_OVERRIDE="--num-gpu-blocks-override $DECODE_KV_BLOCKS"
+                  ASYNC="--no-async-scheduling"; [ "$ASYNC_SCHEDULING" = 1 ] && ASYNC="--async-scheduling"
+                  HEADLESS=""; [ "$JOBSET_JOB_INDEX" != "0" ] && HEADLESS="--headless"
+                  KV_CONFIG='{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":14579}'
+                  PROF=""
+                  if [ "$XPROF" = 1 ]; then
+                    PROF="--profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/dev/shm/xprof --profiler-config.ignore_frontend=true"
+                    mkdir -p /dev/shm/xprof
+                    OUT_DIRS="${CDK_OUTPUT_DIR:-/tmp/cdk-outputs}/xprof-decode-host$JOBSET_JOB_INDEX /cdk-outputs/outputs/xprof-decode-host$JOBSET_JOB_INDEX"
+                    for d in $OUT_DIRS; do mkdir -p "$d" 2>/dev/null || true; done
+                    ( while true; do
+                        sleep 15
+                        for cd in $(find /dev/shm/xprof -type d -path '*/plugins/profile/*' 2>/dev/null); do
+                          f=$(find "$cd" -maxdepth 1 -name '*.xplane.pb' -mmin +0.5 2>/dev/null | sort | head -1)
+                          [ -n "$f" ] || continue
+                          ts=$(basename "$cd")
+                          for d in $OUT_DIRS; do cp -n "$f" "$d/${ts}_$(basename "$f")" 2>/dev/null || true; done
+                        done
+                      done ) &
+                  fi
+                  echo "SERVE_START role=decode tp=32 dcp=8 kv_blocks=$DECODE_KV_BLOCKS max_num_seqs=$MAX_NUM_SEQS async=$ASYNC_SCHEDULING host=$JOBSET_JOB_INDEX $(date -u +%FT%TZ)"
+                  vllm serve "$MODEL_DIR" --served-model-name q38 $HEADLESS \
+                    --nnodes 4 --node-rank "$JOBSET_JOB_INDEX" --master-addr "$HEAD_IP" --master-port 29500 \
+                    --distributed-executor-backend mp \
+                    --tensor-parallel-size 32 --decode-context-parallel-size 8 --enable-expert-parallel --enable-ep-weight-filter --disable-custom-all-reduce $ASYNC \
+                    --load-format runai_streamer --dtype bfloat16 --trust-remote-code --seed 42 --generation-config vllm \
+                    --max-model-len "$MAX_MODEL_LEN" --max-num-seqs "$MAX_NUM_SEQS" --max-num-batched-tokens 8192 \
+                    --gpu-memory-utilization 0.90 $KV_OVERRIDE --block-size 384 \
+                    --attention-backend CUSTOM --kv-cache-dtype fp8 --mamba-ssm-cache-dtype bfloat16 \
+                    --no-enable-prefix-caching --no-disable-hybrid-kv-cache-manager --language-model-only \
+                    --kv-transfer-config "$KV_CONFIG" \
+                    --host 0.0.0.0 --port 8000 --no-enable-log-requests \
+                    --compilation-config "{\"backend\":\"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor\",\"inductor_compile_config\":{\"enable_auto_functionalized_v2\":false,\"size_asserts\":false,\"alignment_asserts\":false,\"scalar_asserts\":false}}" \
+                    --additional-config '{"tpu_online_fp8":{"enabled":true,"weight_scheme":"per_channel","targets":["model.layers.*.self_attn.qkv_proj","model.layers.*.self_attn.o_proj","model.layers.*.linear_attn.in_proj_qkvz","model.layers.*.linear_attn.in_proj_ba","model.layers.*.linear_attn.out_proj","model.layers.*.mlp.shared_expert.gate_up_proj","model.layers.*.mlp.shared_expert.down_proj"],"exclude":["model.layers.*.mlp.experts*"]}}' \
+                    > >(tee /tmp/serve.log) 2>&1 &
+                  SPID=$!
+                  (
+                    while kill -0 "$SPID" 2>/dev/null; do
+                      if [ -r /tmp/tpu_logs/server/tpu_driver.ERROR ] && grep -q 'START_SESSION failed.*Max # of tries.*exhausted' /tmp/tpu_logs/server/tpu_driver.ERROR; then
+                        echo "FATAL: TPU START_SESSION retries exhausted" | tee -a /tmp/serve.log
+                        tail -60 /tmp/tpu_logs/server/tpu_driver.ERROR | tee -a /tmp/serve.log
+                        kill -TERM "$SPID" 2>/dev/null || true
+                        break
+                      fi
+                      sleep 10
+                    done
+                  ) &
+                  CGROUP_DIR="/sys/fs/cgroup$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup)"
+                  if [ -r "$CGROUP_DIR/memory.current" ]; then
+                    (
+                      while kill -0 "$SPID" 2>/dev/null; do
+                        echo "$(date -u +%FT%TZ) current_bytes=$(cat "$CGROUP_DIR/memory.current") peak_bytes=$(cat "$CGROUP_DIR/memory.peak")" >> /tmp/host-memory.log
+                        cp /tmp/host-memory.log "$CDK_OUTPUT_DIR/host-memory-$(hostname).log" || true
+                        sleep 15
+                      done
+                    ) &
+                  fi
+                  if wait "$SPID"; then rc=0; else rc=$?; fi
+                  cp /tmp/serve.log "$CDK_OUTPUT_DIR/server-$(hostname).log" || true
+                  echo "SERVER_EXITED role=decode host=$JOBSET_JOB_INDEX rc=$rc $(date -u +%FT%TZ)"
+                  exit $rc
+              volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+              - name: torchtpu-vllm-nfs
+                mountPath: /root/torchtpu-vllm
+              - name: wheels
+                mountPath: /root/wheels
+                readOnly: true
+              - name: models
+                mountPath: /root/models
+                readOnly: true
+              - name: compilation-cache
+                mountPath: /mnt/workspace/compilation-cache
+              securityContext:
+                privileged: true
+                capabilities:
+                  add:
+                  - IPC_LOCK
+              resources:
+                limits:
+                  memory: 850Gi
+                  ephemeral-storage: 150Gi
+                  google.com/tpu: "4"
+                requests:
+                  memory: 850Gi
+                  ephemeral-storage: 150Gi
+                  google.com/tpu: "4"
+            volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+            - name: torchtpu-vllm-nfs
+              nfs:
+                server: 10.128.1.121
+                path: "/workspace/vllm-torchtpu/{{ .SRC_DIR | default `pp-pcp-head` }}"
+            - name: wheels
+              nfs:
+                server: 10.128.1.121
+                path: /workspace/wheels
+            - name: models
+              nfs:
+                server: 10.128.1.121
+                path: /workspace/models
+            - name: compilation-cache
+              nfs:
+                server: 10.128.1.121
+                path: /workspace/compilation-cache
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x4
+            affinity:
+              podAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      jobset.sigs.k8s.io/replicatedjob-name: decode
+                  matchLabelKeys:
+                  - jobset.sigs.k8s.io/jobset-name
+                  topologyKey: cloud.google.com/gke-nodepool
+  - name: check
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              gke-gcsfuse/volumes: "true"
+          spec:
+            containers:
+            - name: check
+              image: "{{ .IMAGE | default `us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:nightly-20261001` }}"
+              imagePullPolicy: IfNotPresent
+              env:
+              - name: JS_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: BASELINE
+                value: "{{ .BASELINE | default `0` }}"
+              - name: TOKENIZER
+                value: /root/models/Qwen3.8-2.4T-A95B-FP8-tokenizer
+              - name: EVAL_LIMIT
+                value: "{{ .EVAL_LIMIT | default `128` }}"
+              - name: HF_HUB_OFFLINE
+                value: "1"
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -eo pipefail
+                  : "${CDK_OUTPUT_DIR:=/tmp/cdk-outputs}"
+                  mkdir -p "$CDK_OUTPUT_DIR"
+                  PREFILLER_DNS="${JS_NAME}-prefill-0-0.${JS_NAME}"
+                  DECODER_DNS="${JS_NAME}-decode-0-0.${JS_NAME}"
+                  PREFILL_METRICS="$PREFILLER_DNS:8000"
+                  DECODE_METRICS="$DECODER_DNS:8000"
+                  PROXY=127.0.0.1:10000
+                  export TOKENIZERS_PARALLELISM=false
+                  metric() {
+                    curl -sf "http://$1/metrics" | awk -v n="vllm:$2" -v t="vllm:$2_total" \
+                      '{k=$1; sub(/\{.*/, "", k); if (k==n || k==t) s+=$NF} END {printf "%.0f", s+0}'
+                  }
+                  health() { curl -sf --max-time 5 "http://$1/health" >/dev/null 2>&1; }
+                  EVAL_PYTHON=python3
+                  TASK_DIR="$CDK_OUTPUT_DIR/lm-eval-tasks"
+                  mkdir -p "$TASK_DIR"
+                  "$EVAL_PYTHON" - "$TASK_DIR" <<'PY'
+                  import importlib.util, pathlib, sys, yaml
+                  from importlib.metadata import version
+                  from lm_eval import evaluator
+                  from lm_eval.api.registry import get_model
+                  assert get_model('local-completions') is not None
+                  print('EVAL_IMPORT_OK', {name: version(name) for name in ('lm_eval', 'transformers', 'torch')}, flush=True)
+                  root = pathlib.Path(importlib.util.find_spec('lm_eval').origin).parent
+                  config = yaml.safe_load((root / 'tasks/gsm8k/gsm8k.yaml').read_text())
+                  config.update(task='gsm8k_local', dataset_path='json', dataset_name=None,
+                                dataset_kwargs={'data_files': {'test': '/root/datasets/gsm8k_test.jsonl', 'train': '/root/datasets/gsm8k_train.jsonl'}})
+                  (pathlib.Path(sys.argv[1]) / 'gsm8k_local.yaml').write_text(yaml.safe_dump(config))
+                  PY
+                  echo "WAIT_SERVERS baseline=$BASELINE $(date -u +%FT%TZ)"
+                  for i in $(seq 1 1080); do health "$PREFILL_METRICS" && health "$DECODE_METRICS" && break; sleep 10; done
+                  health "$PREFILL_METRICS" && health "$DECODE_METRICS" || { echo 'RESULT: FAIL (server startup)'; exit 1; }
+                  echo "SERVERS_READY $(date -u +%FT%TZ)"
+                  python3 /root/torchtpu-vllm/examples/disagg/toy_proxy_server.py --host 0.0.0.0 --port 10000 \
+                    --prefiller-host "$PREFILLER_DNS" --prefiller-port 8000 --decoder-host "$DECODER_DNS" --decoder-port 8000 \
+                    > "$CDK_OUTPUT_DIR/proxy.log" 2>&1 &
+                  for i in $(seq 1 60); do curl -sf "http://$PROXY/healthcheck" >/dev/null && break; sleep 2; done
+                  curl -sf "http://$PROXY/healthcheck" >/dev/null
+                  curl -sf "http://$PREFILL_METRICS/metrics" > "$CDK_OUTPUT_DIR/prefill-before.metrics"
+                  curl -sf "http://$DECODE_METRICS/metrics" > "$CDK_OUTPUT_DIR/decode-before.metrics"
+                  for mode in pd direct; do
+                    target=$PROXY; [ "$mode" != direct ] || target=$DECODE_METRICS
+                    p0=$(metric "$PREFILL_METRICS" request_success)
+                    d0=$(metric "$DECODE_METRICS" request_success)
+                    "$EVAL_PYTHON" -m lm_eval --model local-completions \
+                      --model_args "model=q38,base_url=http://$target/v1/completions,tokenizer=$TOKENIZER,tokenizer_backend=huggingface,tokenized_requests=False,num_concurrent=8,max_retries=1,max_gen_toks=2048,max_length=40960,timeout=1800" \
+                      --include_path "$TASK_DIR" --tasks gsm8k_local --num_fewshot 32 --limit "$EVAL_LIMIT" \
+                      --seed 1234,1234,1234,1234 --log_samples --output_path "$CDK_OUTPUT_DIR/eval-$mode" \
+                      2>&1 | tee "$CDK_OUTPUT_DIR/eval-$mode.log"
+                    p1=$(metric "$PREFILL_METRICS" request_success)
+                    d1=$(metric "$DECODE_METRICS" request_success)
+                    echo "EVAL_PATH mode=$mode prefill_reqs=$((p1-p0)) decode_reqs=$((d1-d0))" | tee -a "$CDK_OUTPUT_DIR/path-evidence.txt"
+                    [ "$((d1-d0))" -ge "$EVAL_LIMIT" ]
+                    if [ "$mode" = pd ]; then
+                      [ "$((p1-p0))" -ge "$EVAL_LIMIT" ]
+                    else
+                      [ "$((p1-p0))" = 0 ]
+                    fi
+                  done
+                  python3 - "$CDK_OUTPUT_DIR" "$EVAL_LIMIT" <<'PY'
+                  import json, pathlib, sys
+                  root, n = pathlib.Path(sys.argv[1]), int(sys.argv[2])
+                  scores = {}
+                  for mode in ('pd', 'direct'):
+                      files = list((root / f'eval-{mode}').rglob('results_*.json'))
+                      assert len(files) == 1, files
+                      data = json.loads(files[0].read_text())
+                      scores[mode] = data['results']['gsm8k_local']['exact_match,flexible-extract']
+                  result = {'limit': n, 'scores': scores, 'allowed_answer_difference': 2,
+                            'passed': min(scores.values()) >= 0.70 and (scores['direct']-scores['pd'])*n <= 2.00001}
+                  (root / 'accuracy.json').write_text(json.dumps(result, indent=2))
+                  print('ACCURACY', json.dumps(result), flush=True)
+                  assert result['passed'], result
+                  PY
+                  p0=$(metric "$PREFILL_METRICS" request_success)
+                  d0=$(metric "$DECODE_METRICS" request_success)
+                  BENCH_MAIN='import argparse; from vllm.benchmarks.serve import add_cli_args, main; p=argparse.ArgumentParser(); add_cli_args(p); main(p.parse_args())'
+                  python3 -c "$BENCH_MAIN" --backend vllm --host 127.0.0.1 --port 10000 \
+                    --model q38 --tokenizer "$TOKENIZER" --dataset-name random \
+                    --random-input-len 8192 --random-output-len 256 --random-range-ratio 0.0 \
+                    --num-prompts 96 --max-concurrency 32 --request-rate inf --ignore-eos --temperature 0 --seed 42 \
+                    --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,99 \
+                    --save-result --save-detailed --result-dir "$CDK_OUTPUT_DIR" --result-filename perf-8k-256-c32.json \
+                    2>&1 | tee "$CDK_OUTPUT_DIR/perf.log"
+                  p1=$(metric "$PREFILL_METRICS" request_success)
+                  d1=$(metric "$DECODE_METRICS" request_success)
+                  [ "$((p1-p0))" -ge 96 ] && [ "$((d1-d0))" -ge 96 ]
+                  python3 - "$CDK_OUTPUT_DIR/perf-8k-256-c32.json" <<'PY'
+                  import json, sys
+                  r=json.load(open(sys.argv[1])); assert r['completed']==96, r['completed']
+                  print('PERF', json.dumps({k:r.get(k) for k in ('completed','output_throughput','median_ttft_ms','median_tpot_ms','p99_tpot_ms')}))
+                  PY
+                  curl -sf "http://$PREFILL_METRICS/metrics" > "$CDK_OUTPUT_DIR/prefill-after.metrics"
+                  curl -sf "http://$DECODE_METRICS/metrics" > "$CDK_OUTPUT_DIR/decode-after.metrics"
+                  echo "RESULT: PASS (FP8 correctness, baseline=$BASELINE)"
+              volumeMounts:
+              - name: torchtpu-vllm-nfs
+                mountPath: /root/torchtpu-vllm
+                readOnly: true
+              - name: models
+                mountPath: /root/models
+                readOnly: true
+              - name: datasets
+                mountPath: /root/datasets
+                readOnly: true
+              resources:
+                limits:
+                  cpu: "8"
+                  memory: 32Gi
+                requests:
+                  cpu: "8"
+                  memory: 32Gi
+            volumes:
+            - name: torchtpu-vllm-nfs
+              nfs:
+                server: 10.128.1.121
+                path: "/workspace/vllm-torchtpu/{{ .SRC_DIR | default `pp-pcp-head` }}"
+            - name: models
+              nfs:
+                server: 10.128.1.121
+                path: /workspace/models
+            - name: datasets
+              nfs:
+                server: 10.128.1.121
+                path: /workspace/datasets
+            restartPolicy: Never
