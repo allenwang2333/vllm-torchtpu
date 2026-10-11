@@ -220,7 +220,7 @@ def maybe_modulo_remap_topk_ids(topk_ids: torch.Tensor, layer) -> torch.Tensor:
     """Remap selected expert IDs `eid -> (eid % ep) * g_local + (eid // ep)` when
     `VLLM_DSV41_MODULO_EXPERT_BALANCE=1` on non-fused-EP layers (fused-EP remaps at its own boundary).
     """
-    if layer is None or not envs.VLLM_DSV41_MODULO_EXPERT_BALANCE:
+    if layer is None or not getattr(envs, "VLLM_DSV41_MODULO_EXPERT_BALANCE", False):
         return topk_ids
     from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 

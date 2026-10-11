@@ -604,7 +604,7 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             ckpt_up_proj_name="w3",
             num_experts=self.config.dspark_n_routed_experts,
         )
-        if envs.VLLM_DSV41_MODULO_EXPERT_BALANCE:
+        if getattr(envs, "VLLM_DSV41_MODULO_EXPERT_BALANCE", False):
             from vllm.distributed import get_ep_group
 
             ep_size = get_ep_group().world_size

@@ -694,7 +694,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
         import hashlib
         _raw_sig = layer.w13_weight.data.cpu().reshape(-1)[:4096].contiguous().view(torch.uint8).numpy().tobytes()
-        _meta_key = hashlib.md5(_raw_sig + f"_{tuple(layer.w13_weight.shape)}_{int(envs.VLLM_DSV41_MODULO_EXPERT_BALANCE)}".encode()).hexdigest()[:16]
+        _meta_key = hashlib.md5(_raw_sig + f"_{tuple(layer.w13_weight.shape)}_{int(getattr(envs, "VLLM_DSV41_MODULO_EXPERT_BALANCE", False))}".encode()).hexdigest()[:16]
         _meta_path = f"/dev/shm/dsv41_fp4_cache/meta_{_meta_key}.pt"
         if os.path.exists(_meta_path + ".done"):
             _m = torch.load(_meta_path, map_location="cpu", weights_only=True)
@@ -770,7 +770,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 w2_bias_padded.to(device), requires_grad=False
             )
 
-        del w13_weight_padded, w2_weight_padded, w13_bias_padded, w2_bias_padded
         to_sync = [
             layer.w13_weight,
             layer.w2_weight,
@@ -858,7 +857,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         )
 
         if fused_moe_ep_supported(self):
-            if os.environ.get("VLLM_DSV41_MOE_EP_V2_ALL39", "1") == "1":
+            if True:
                 topk_weights, topk_ids = moe_routing.route(
                     layer, x, router_logits, input_ids=input_ids
                 )
