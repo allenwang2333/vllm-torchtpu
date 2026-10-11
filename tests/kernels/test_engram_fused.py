@@ -1,14 +1,50 @@
 # SPDX-License-Identifier: Apache-2.0
 """Packed rows must preserve SP head order, FP8 numerics and masked residuals."""
 
+import functools
+
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from jax import export
 
 from vllm_torchtpu.kernels.engram.kernel import fused_engram
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize("tokens", [256, 1024])
+def test_released_engram_shapes_lower_to_one_tpu_call(tokens):
+    """Check Mosaic lowering at serving shapes without allocating model weights."""
+    tp, dim, width, streams = 8, 5120, 6144, 4
+    shape = jax.ShapeDtypeStruct
+    inputs = (
+        shape((tp, tokens * tp, width // tp // 4), jnp.int32),
+        shape((tp, tokens * tp, width // tp // 32 // 4), jnp.int32),
+        shape((tokens, streams, dim), jnp.bfloat16),
+        shape((width, (streams + 1) * dim), jnp.float8_e4m3fn),
+        shape(((streams + 1) * dim,), jnp.float32),
+        shape((streams, dim), jnp.bfloat16),
+        shape((streams, dim), jnp.bfloat16),
+        shape((tokens,), jnp.bool),
+    )
+    fn = jax.jit(
+        functools.partial(fused_engram, rank=tp - 1, eps=1e-20, clamp_value=1e-6)
+    )
+    mesh = jax.sharding.AbstractMesh(
+        (1,),
+        ("device",),
+        abstract_device=jax.sharding.AbstractDevice(
+            "TPU7x", num_cores=1, platform="tpu"
+        ),
+    )
+    with jax.sharding.use_abstract_mesh(mesh):
+        lowered = export.export(fn, platforms=("tpu",))(*inputs)
+    assert lowered.out_avals[0].shape == (tokens, streams, dim)
+    assert lowered.out_avals[0].dtype == jnp.bfloat16
+    assert lowered.mlir_module().count("stablehlo.custom_call @tpu_custom_call") == 1
 
 
 @pytest.mark.parametrize("tp", [1, 2, 8])
