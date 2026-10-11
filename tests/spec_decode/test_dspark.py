@@ -1030,3 +1030,86 @@ def test_td8268_2d_select_gathered_candidate_and_int32_index_select():
     for t32, t64 in zip(out_i32, out_i64, strict=True):
         assert t32.dtype == t64.dtype == torch.int32
         assert torch.equal(t32, t64)
+
+
+def test_td8312_dspark_int32_cast_guards():
+    """TD8.312: Verify int32 cast guards in _pack_local_candidate,
+    _select_gathered_candidate, and _sample_markov_replicated."""
+    scores_t = torch.tensor([[1.0, 5.0, 2.0], [4.0, 0.0, 3.0]], dtype=torch.float32)
+    vocab_offset = torch.tensor(100, dtype=torch.int32)
+
+    class _Int32MaxScores:
+        def max(self, dim: int = -1):
+            vals, idx = scores_t.max(dim=dim)
+            return vals, idx.to(torch.int32)
+
+    packed_i64 = DSparkProposer._pack_local_candidate(scores_t, vocab_offset)
+    packed_i32 = DSparkProposer._pack_local_candidate(_Int32MaxScores(), vocab_offset)
+    assert torch.equal(packed_i64, packed_i32)
+
+    # _select_gathered_candidate with both float32 and int32 gathered tensor
+    gathered_f32 = torch.tensor(
+        [[2.0, 10.0], [5.0, 20.0], [4.0, 30.0], [1.0, 40.0]], dtype=torch.float32
+    )
+    gathered_i32 = gathered_f32.to(torch.int32)
+    sel_f32 = DSparkProposer._select_gathered_candidate(
+        gathered_f32, tp_size=2, num_reqs=2
+    )
+    sel_i32 = DSparkProposer._select_gathered_candidate(
+        gathered_i32, tp_size=2, num_reqs=2
+    )
+    assert sel_f32.dtype == sel_i32.dtype == torch.int32
+    assert torch.equal(sel_f32, sel_i32)
+    assert sel_i32.tolist() == [30, 20]
+
+    # _sample_markov_replicated with both int64 and int32 argmax return values
+    class _Int32ArgmaxSum:
+        def __init__(self, t: torch.Tensor):
+            self._t = t
+
+        def argmax(self, dim: int = -1) -> torch.Tensor:
+            return self._t.argmax(dim=dim).to(torch.int32)
+
+    class _Int32SlotLogits:
+        def __init__(self, t: torch.Tensor):
+            self._t = t
+
+        def __getitem__(self, item):
+            sub = self._t[item]
+
+            class _Slice:
+                def __add__(self, other):
+                    return _Int32ArgmaxSum(sub + other)
+
+            return _Slice()
+
+    logits_base = torch.tensor(
+        [[0.1, 0.9, 0.2], [0.8, 0.2, 0.1], [0.3, 0.4, 0.7], [0.2, 0.6, 0.5]],
+        dtype=torch.float32,
+    )
+    p = _make_proposer(dict(_DSPARK_HF, dspark_block_size=2), num_speculative_tokens=2)
+    ids_3d = torch.zeros((2, 2), dtype=torch.int32)
+    slot_major_hidden = torch.zeros((4, 4), dtype=torch.float32)
+
+    p.draft_model = SimpleNamespace(
+        compute_draft_logits=lambda _h: logits_base,
+        markov_embed=lambda prev: prev,
+        markov_bias=lambda _emb: torch.zeros((2, 3), dtype=torch.float32),
+        map_draft_to_target=lambda step: step,
+    )
+    steps_i64 = p._sample_markov_replicated(
+        slot_major_hidden, ids_3d, block_size=2, sample_start=0
+    )
+
+    p.draft_model = SimpleNamespace(
+        compute_draft_logits=lambda _h: _Int32SlotLogits(logits_base),
+        markov_embed=lambda prev: prev,
+        markov_bias=lambda _emb: torch.zeros((2, 3), dtype=torch.float32),
+        map_draft_to_target=lambda step: step,
+    )
+    steps_i32 = p._sample_markov_replicated(
+        slot_major_hidden, ids_3d, block_size=2, sample_start=0
+    )
+    for s64, s32 in zip(steps_i64, steps_i32, strict=True):
+        assert s64.dtype == s32.dtype == torch.int32
+        assert torch.equal(s64, s32)

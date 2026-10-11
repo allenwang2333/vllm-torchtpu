@@ -1589,3 +1589,54 @@ def test_td8306_dflash_int32_cast_guards(device):
             assert torch.equal(a, b)
         for a, b in zip(res_seed[0], res_seed[1]):
             assert torch.equal(a, b)
+
+
+def test_td8312_dflash_2d_argmax_and_int32_guard(device):
+    """TD8.312: Verify _dflash_forward_and_sample runs argmax on 2D
+    [padded_num_reqs * (block_size - 1), vocab] logits before viewing as
+    [padded_num_reqs, block_size - 1] and guards redundant int32 casts."""
+    padded_num_reqs, block_size, hidden_size, vocab = 3, 4, 8, 16
+    valid_hidden = torch.arange(
+        padded_num_reqs * block_size * hidden_size,
+        dtype=torch.float32,
+        device=device,
+    ).reshape(padded_num_reqs * block_size, hidden_size)
+    lm_w = torch.randn(vocab, hidden_size, device=device)
+    argmax_input_shapes: list[tuple[int, ...]] = []
+
+    class _Int32ArgmaxLogits:
+        def __init__(self, tensor: torch.Tensor):
+            self._t = tensor
+
+        def argmax(self, dim: int = -1) -> torch.Tensor:
+            argmax_input_shapes.append(tuple(self._t.shape))
+            res = self._t.argmax(dim=dim).to(torch.int32)
+            return res
+
+    proposer = _make_proposer(draft_tp=1)
+    fn = torch._dynamo.eval_frame.innermost_fn(
+        DFlashProposer._dflash_forward_and_sample
+    )
+    ids = torch.zeros(padded_num_reqs * block_size, dtype=torch.int32, device=device)
+    pos = torch.arange(padded_num_reqs * block_size, dtype=torch.int32, device=device)
+
+    # 1) Standard int64 argmax path
+    proposer.draft_model = SimpleNamespace(
+        model=lambda **_kw: valid_hidden,
+        compute_logits=lambda dh: dh @ lm_w.t(),
+    )
+    tokens_i64, hidden_i64 = fn(proposer, ids, pos, block_size)
+    assert tokens_i64.dtype == torch.int32
+    assert tokens_i64.shape == (padded_num_reqs, block_size - 1)
+    assert torch.equal(hidden_i64, valid_hidden)
+
+    # 2) Pre-int32 argmax path (exercises raw_ids.dtype == torch.int32 fast branch
+    # and records the 2D shape of logits passed to .argmax(dim=-1))
+    proposer.draft_model = SimpleNamespace(
+        model=lambda **_kw: valid_hidden,
+        compute_logits=lambda dh: _Int32ArgmaxLogits(dh @ lm_w.t()),
+    )
+    tokens_i32, _ = fn(proposer, ids, pos, block_size)
+    assert argmax_input_shapes == [(padded_num_reqs * (block_size - 1), vocab)]
+    assert tokens_i32.dtype == torch.int32
+    assert torch.equal(tokens_i32, tokens_i64)

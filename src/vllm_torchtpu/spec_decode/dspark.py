@@ -246,7 +246,14 @@ class DSparkProposer(DFlashProposer):
         return torch.stack(
             [
                 local_max.to(torch.float32),
-                (local_idx.to(torch.int32) + vocab_offset).to(torch.float32),
+                (
+                    (
+                        local_idx
+                        if local_idx.dtype == torch.int32
+                        else local_idx.to(torch.int32)
+                    )
+                    + vocab_offset
+                ).to(torch.float32),
             ],
             dim=-1,
         )
@@ -269,7 +276,7 @@ class DSparkProposer(DFlashProposer):
             better = scores[r] > best_score
             best_score = torch.where(better, scores[r], best_score)
             best_id = torch.where(better, ids[r], best_id)
-        return best_id.to(torch.int32)
+        return best_id if best_id.dtype == torch.int32 else best_id.to(torch.int32)
 
     @staticmethod
     def _slot_major_hidden(
@@ -342,10 +349,12 @@ class DSparkProposer(DFlashProposer):
         prev = ids_3d[:, 0]
         draft_tokens = []
         for i in range(num_sampled_slots):
-            slot_logits = logits[i * padded_num_reqs : (i + 1) * padded_num_reqs]
             bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
+            raw_step = (
+                logits[i * padded_num_reqs : (i + 1) * padded_num_reqs] + bias
+            ).argmax(dim=-1)
             step = self.draft_model.map_draft_to_target(
-                (slot_logits + bias).argmax(dim=-1).to(torch.int32)
+                raw_step if raw_step.dtype == torch.int32 else raw_step.to(torch.int32)
             )
             draft_tokens.append(step)
             prev = step

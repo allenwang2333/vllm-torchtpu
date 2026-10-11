@@ -1218,10 +1218,12 @@ class DFlashProposer:
         ).reshape(-1)
         draft_hidden = valid_hidden.index_select(0, draft_idx)
 
-        # 4. Compute draft logits and run greedy argmax sampling inside the XLA graph
+        # 4. Compute draft logits and run 2D greedy argmax sampling inside the XLA graph
         logits = self.draft_model.compute_logits(draft_hidden)
-        logits_3d = logits.view(padded_num_reqs, block_size - 1, logits.shape[-1])
-        draft_tokens_chunk = logits_3d.argmax(dim=-1).to(torch.int32)
+        raw_ids = logits.argmax(dim=-1)
+        draft_tokens_chunk = (
+            raw_ids if raw_ids.dtype == torch.int32 else raw_ids.to(torch.int32)
+        ).view(padded_num_reqs, block_size - 1)
 
         return draft_tokens_chunk, hidden
 
