@@ -514,7 +514,16 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         )
         replay_key = (replay_tuple, positions.device)
         cached_replay = getattr(self, cache_attr, None)
-        if cached_replay is not None and cached_replay[0] == replay_key:
+        # The runner re-sends the same cached tuple every steady-state step:
+        # identity hits skip the O(requests) tuple comparison.
+        if (
+            cached_replay is not None
+            and (
+                cached_replay[0][0] is replay_tuple
+                or cached_replay[0][0] == replay_tuple
+            )
+            and cached_replay[0][1] == positions.device
+        ):
             return cached_replay[1]
         replay_starts = (
             torch.zeros(len(replay_tuple), dtype=torch.int32, device=positions.device)
@@ -697,14 +706,19 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             # input exists in every CED step so the compiled graph does not
             # depend on whether prefix caching is on.
             requests = first.seq_lens.shape[0] if first is not None else 1
-            hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
+            raw_hits = getattr(first, "replay_starts_cpu", None)
+            if isinstance(raw_hits, tuple) and len(raw_hits) == requests:
+                # Pass the runner's cached tuple through for identity hits.
+                window_hits = raw_hits
+            else:
+                hits = tuple(raw_hits or ())[:requests]
+                window_hits = (
+                    _zero_hits(requests)
+                    if not hits
+                    else hits + _zero_hits(requests - len(hits))
+                )
             window_starts = DeepseekV41Model._get_ced_replay_starts(
-                self,
-                _zero_hits(requests)
-                if not hits
-                else hits + _zero_hits(requests - len(hits)),
-                positions,
-                cache_attr="_ced_window_starts_cache",
+                self, window_hits, positions, cache_attr="_ced_window_starts_cache"
             )
             encoder_context = replace(
                 context,

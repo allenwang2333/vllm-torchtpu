@@ -1,6 +1,7 @@
 """Host planning for decoder SWA bounded replay across scheduled chunks."""
 
 import functools
+import operator
 from dataclasses import dataclass
 
 import torch
@@ -57,6 +58,41 @@ def _padded_bucket(kept: int, num_tokens: int, compile_sizes: tuple) -> int:
     return padded
 
 
+@functools.lru_cache(maxsize=64)
+def _static_no_skip_spec(
+    bounds: tuple, prompts: tuple, hits: tuple, window: int, num_tokens, compile_sizes
+):
+    """``(min_lens, plan)`` for a fixed query/prompt/hit layout, else ``None``.
+
+    The all-kept plan does not depend on ``seq_lens``: it applies exactly when
+    every request's length is at least ``min_lens[i]`` (``replay_start +
+    count`` for scheduled requests, so no window start is skipped and
+    ``length >= count`` holds). ``None`` defers invalid layouts to the full
+    path, which raises.
+    """
+    replay_starts = []
+    min_lens = []
+    for start, end, prompt, hit in zip(bounds, bounds[1:], prompts, hits):
+        count = end - start
+        if count < 0 or prompt < 0:
+            return None
+        replay_start = prompt - window if prompt > window else 0
+        if hit > replay_start:
+            replay_start = hit
+        replay_starts.append(replay_start)
+        min_lens.append(replay_start + count if count > 0 else 0)
+    kept = bounds[-1]
+    padded = _padded_bucket(kept, int(num_tokens), compile_sizes)
+    plan = DecoderReplayPlan(
+        _identity_indices(kept),
+        bounds,
+        tuple(replay_starts),
+        padded,
+        is_identity=kept > 0 and padded == num_tokens,
+    )
+    return tuple(min_lens), plan
+
+
 def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
     """Keep the same prompt-tail window across every chunk and later decode.
 
@@ -89,6 +125,21 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
         raise ValueError("Invalid decoder replay scheduling metadata")
     if bounds_list[0] != 0 or bounds_list[-1] > num_tokens:
         raise ValueError("Query boundaries exceed the input token bucket")
+    if not isinstance(compile_sizes, tuple):
+        compile_sizes = tuple(compile_sizes)
+    if getattr(metadata, "owner_token_layout", None) is None:
+        # Steady-state decode repeats the same query/prompt/hit layout while
+        # only seq_lens grow: reuse the cached all-kept plan when it applies.
+        spec = _static_no_skip_spec(
+            tuple(bounds_list),
+            tuple(prompts_list),
+            tuple(hits_list),
+            window,
+            num_tokens,
+            compile_sizes,
+        )
+        if spec is not None and all(map(operator.ge, lengths_list, spec[0])):
+            return spec[1]
     replay_starts = []
     any_skipped = False
     for start, end, length, prompt, hit in zip(
@@ -126,8 +177,6 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
         output_bounds_tuple = tuple(output_bounds)
     # Each stage dispatches by its own token bucket. Never introduce a second,
     # independent symbolic token dimension into vLLM's guard-free full graph.
-    if not isinstance(compile_sizes, tuple):
-        compile_sizes = tuple(compile_sizes)
     required_kept = kept
     owner_layout = getattr(metadata, "owner_token_layout", None)
     req_owners = getattr(owner_layout, "owners", None)
