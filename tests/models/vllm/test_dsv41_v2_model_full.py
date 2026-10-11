@@ -1089,11 +1089,24 @@ class TestModelForward:
             owner_q_loc=torch.zeros((2, 2), dtype=torch.int32),
             owner_token_layout=SimpleNamespace(owners=np.array([0, 1], dtype=np.int32)),
         )
+        owner_holder = SimpleNamespace()
         out_owners = DeepseekV41Model._get_ced_decoder_owner_kwargs(
-            first_with_owners, plan, bounds
+            first_with_owners, plan, bounds, owner_holder
         )
         assert out_owners["owner_token_layout"] is not None
         assert out_owners["owner_perm"].shape == (4,)
+        plan_tuple = DecoderReplayPlan(
+            indices=(1, 3),
+            padded_num_tokens=4,
+            query_start_loc=(0, 1, 2),
+            replay_starts=(0, 1),
+        )
+        assert (
+            DeepseekV41Model._get_ced_decoder_owner_kwargs(
+                first_with_owners, plan_tuple, bounds, owner_holder
+            )
+            is out_owners
+        )
 
         # 3. req_owners is None + enc_q_loc is None -> _positional_layout fallback
         first_no_owners = SimpleNamespace(
@@ -1107,6 +1120,12 @@ class TestModelForward:
         ):
             out_pos = DeepseekV41Model._get_ced_decoder_owner_kwargs(
                 first_no_owners, plan, bounds
+            )
+            assert (
+                DeepseekV41Model._get_ced_decoder_owner_kwargs(
+                    first_no_owners, plan, bounds
+                )
+                is out_pos
             )
         assert out_pos["owner_token_layout"] is None
         assert out_pos["owner_perm"].shape == (4,)
