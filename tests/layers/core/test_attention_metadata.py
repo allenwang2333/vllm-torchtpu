@@ -1194,3 +1194,88 @@ class TestAttentionMetadataBuilderPlumbing:
         )
         assert builder._active_block_table_columns(ctx_list, 128) == 32
         assert ctx_list.max_active_seq_len == 512
+
+    def test_td8343_staged_non_mamba_fast_path_and_identity_key_cache(self):
+        """TD8.343: Verify AttentionMetadataBuilder.build staged non-mamba fast
+        path (populate base_attn_metadata, reuse identical staged block_tables,
+        or clone via with_block_tables) and _get_staged_walk_plan caching of
+        runner._attn_groups_identity_key."""
+        from vllm_torchtpu.layers.core import attention_metadata as am_mod
+
+        runner = self._make_runner_mock(
+            max_num_reqs=4,
+            max_num_blocks_per_req=8,
+            most_model_len=128,
+            num_groups=3,
+        )
+        b0 = self._make_builder(runner, kv_cache_group_id=0)
+        b1 = self._make_builder(runner, kv_cache_group_id=1)
+        b2 = self._make_builder(runner, kv_cache_group_id=2)
+        self._make_attn_groups(runner, [b0, b1, b2])
+
+        staged_shared = torch.arange(32, dtype=torch.int32)
+        staged_other = torch.arange(100, 132, dtype=torch.int32)
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.tensor([16, 32, 0, 0], dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+            query_start_loc_cpu=(0, 1, 2, 3, 4),
+            seq_lens_cpu=(16, 32, 0, 0),
+            prompt_lens_cpu=(8, 16, 0, 0),
+            replay_starts_cpu=(0, 0, 0, 0),
+            staged_block_tables={
+                0: staged_shared,
+                1: staged_shared,
+                2: staged_other,
+            },
+        )
+        runner._attn_metadata_builder_ctx = ctx
+        assert ctx.base_attn_metadata is None
+
+        cm = self._make_cm(4)
+        m0 = b0.build(0, cm)
+        assert ctx.base_attn_metadata is m0
+        assert m0.block_tables is staged_shared
+        assert m0.query_start_loc_cpu == (0, 1, 2, 3, 4)
+        assert m0.seq_lens_cpu == (16, 32, 0, 0)
+        assert m0.prompt_lens_cpu == (8, 16, 0, 0)
+        assert m0.replay_starts_cpu == (0, 0, 0, 0)
+        assert m0.mamba_state_indices is None
+
+        # Group 1 shares the exact same staged Tensor -> returns base directly.
+        m1 = b1.build(0, cm)
+        assert m1 is m0
+
+        # Group 2 has a distinct staged Tensor -> clones via with_block_tables.
+        m2 = b2.build(0, cm)
+        assert m2 is not m0
+        assert m2.block_tables is staged_other
+        assert m2.query_start_loc_cpu == m0.query_start_loc_cpu
+
+        # Verify _get_staged_walk_plan caches _attn_groups_identity_key on runner.
+        plan1 = am_mod._get_staged_walk_plan(runner, ctx, 4, None)
+        assert plan1 is not None
+        expected_key = (
+            id(runner.attn_groups),
+            len(runner.attn_groups),
+            id(runner.attn_groups[0][0].metadata_builders[0]),
+            id(runner.attn_groups[-1][-1].metadata_builders[0]),
+        )
+        cached_key = runner._attn_groups_identity_key
+        assert cached_key == expected_key
+
+        # Steady-state call reuses the exact tuple object without re-indexing
+        # metadata_builders.
+        plan2 = am_mod._get_staged_walk_plan(runner, ctx, 4, None)
+        assert plan2 is plan1
+        assert runner._attn_groups_identity_key is cached_key
+
+        # Changing the last group invalidates the guard and recomputes id_key.
+        runner.attn_groups[-1] = list(runner.attn_groups[0])
+        plan3 = am_mod._get_staged_walk_plan(runner, ctx, 4, None)
+        assert plan3 is not None
+        assert runner._attn_groups_identity_key != cached_key
+        assert runner._attn_groups_identity_key[-1] == id(b0)

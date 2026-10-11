@@ -446,18 +446,53 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             else None
         )
         if staged is not None:
-            if not self.is_mamba_group and ctx.base_attn_metadata is not None:
-                return ctx.base_attn_metadata.with_block_tables(staged)
+            if not self.is_mamba_group:
+                if (base := ctx.base_attn_metadata) is not None:
+                    return (
+                        base
+                        if base.block_tables is staged
+                        else base.with_block_tables(staged)
+                    )
+                ctx.base_attn_metadata = metadata = AttentionMetadata(
+                    input_positions=(
+                        ctx.position_ids_override
+                        if ctx.position_ids_override is not None
+                        else runner.position_ids
+                    ),
+                    block_tables=staged,
+                    seq_lens=ctx.seq_lens,
+                    query_start_loc=ctx.query_start_loc,
+                    request_distribution=ctx.request_distribution,
+                    sequence_layout_kind=(
+                        seq_layout_desc := ctx.sequence_layout_descriptor
+                    ).kind.value,
+                    sequence_layout_protocol=seq_layout_desc.protocol,
+                    sequence_layout_version=seq_layout_desc.version,
+                )
+                (
+                    metadata.query_start_loc_cpu,
+                    metadata.seq_lens_cpu,
+                    metadata.prompt_lens_cpu,
+                    metadata.replay_starts_cpu,
+                ) = (
+                    ctx.query_start_loc_cpu,
+                    ctx.seq_lens_cpu,
+                    ctx.prompt_lens_cpu,
+                    ctx.replay_starts_cpu,
+                )
+                return metadata
             # The walk pre-uploaded every group's table in one batched
             # transfer; see `stage_block_table_uploads`.
-            block_tables_dev = staged
+            block_tables_dev, target_num_blocks, target_num_reqs = (
+                staged,
+                0,
+                common_attn_metadata.num_reqs,
+            )
             input_positions = (
                 ctx.position_ids_override
                 if ctx.position_ids_override is not None
                 else runner.position_ids
             )
-            target_num_blocks = 0
-            target_num_reqs = common_attn_metadata.num_reqs
         else:
             target_num_reqs = common_attn_metadata.num_reqs
             block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
@@ -560,12 +595,17 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             sequence_layout_protocol=seq_layout_desc.protocol,
             sequence_layout_version=seq_layout_desc.version,
         )
-        metadata.query_start_loc_cpu = ctx.query_start_loc_cpu
-        metadata.seq_lens_cpu = ctx.seq_lens_cpu
-        metadata.prompt_lens_cpu = ctx.prompt_lens_cpu
-        metadata.replay_starts_cpu = ctx.replay_starts_cpu
-        if not self.is_mamba_group and staged is not None:
-            ctx.base_attn_metadata = metadata
+        (
+            metadata.query_start_loc_cpu,
+            metadata.seq_lens_cpu,
+            metadata.prompt_lens_cpu,
+            metadata.replay_starts_cpu,
+        ) = (
+            ctx.query_start_loc_cpu,
+            ctx.seq_lens_cpu,
+            ctx.prompt_lens_cpu,
+            ctx.replay_starts_cpu,
+        )
         return metadata
 
 
@@ -583,11 +623,36 @@ def _get_staged_walk_plan(
         if gids is None
         else (gids if isinstance(gids, frozenset) else frozenset(gids))
     )
+    attn_groups = runner.attn_groups
+    guard, id_key = (
+        (
+            id(attn_groups),
+            len(attn_groups),
+            id(attn_groups[0]),
+            id(attn_groups[-1]),
+        ),
+        getattr(runner, "_attn_groups_identity_key", None),
+    )
+    runner._attn_groups_identity_key, runner._attn_groups_identity_guard = (
+        (id_key, guard)
+        if (
+            isinstance(id_key, tuple)
+            and getattr(runner, "_attn_groups_identity_guard", None) == guard
+        )
+        else (
+            (
+                id_key := (
+                    id(attn_groups),
+                    len(attn_groups),
+                    id(attn_groups[0][0].metadata_builders[0]),
+                    id(attn_groups[-1][-1].metadata_builders[0]),
+                )
+            ),
+            guard,
+        )
+    )
     plan_key = (
-        id(runner.attn_groups),
-        len(runner.attn_groups),
-        id(runner.attn_groups[0][0].metadata_builders[0]),
-        id(runner.attn_groups[-1][-1].metadata_builders[0]),
+        id_key,
         ctx.use_max_model_len,
         None if ctx.use_max_model_len else getattr(runner, "most_model_len", None),
         ctx.mamba_ckpt_window,
