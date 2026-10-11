@@ -148,7 +148,9 @@ class MegakernelModelRunner(TPUModelRunner):
         # The weightless model (its layers declare the KV cache spec), through
         # the megakernel load format.
         super().load_model()
-        self.program = build_program(self.vllm_config, get_tensor_model_parallel_rank())
+        tp_rank = get_tensor_model_parallel_rank()
+        self._is_output_rank = tp_rank == 0
+        self.program = build_program(self.vllm_config, tp_rank)
         self.program.load_weights()
 
     def profile_run(self, num_tokens: int) -> None:
@@ -340,19 +342,32 @@ class MegakernelModelRunner(TPUModelRunner):
         self._modify_prev_results()
         self.maybe_wait_for_kv_save()
         kv_connector_output = self._build_kv_connector_output(scheduler_output)
-        model_runner_output = ModelRunnerOutput(
-            req_ids=req_ids,
-            req_id_to_index=dict(self.input_batch.req_id_to_index),
-            sampled_token_ids=[],
-            logprobs=[],
-            prompt_logprobs_dict={req_id: None for req_id in req_ids},
-            pooler_output=[],
-            kv_connector_output=kv_connector_output,
+        materialize_token_ids = (
+            not self.scheduler_config.async_scheduling
+            or self._is_output_rank
+            or not has_kv_transfer_group()
         )
+        if materialize_token_ids:
+            model_runner_output = ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index=dict(self.input_batch.req_id_to_index),
+                sampled_token_ids=[],
+                logprobs=[],
+                prompt_logprobs_dict={req_id: None for req_id in req_ids},
+                pooler_output=[],
+                kv_connector_output=kv_connector_output,
+            )
+        else:
+            model_runner_output = ModelRunnerOutput(
+                req_ids=[],
+                req_id_to_index={},
+                kv_connector_output=kv_connector_output,
+            )
         async_output = AsyncTPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             copy_state=copy_state,
             discard_sampled_tokens_req_indices=discard,
+            materialize_token_ids=materialize_token_ids,
         )
         if self.scheduler_config.async_scheduling:
             req_id_to_index_copy = self._update_placeholder(
