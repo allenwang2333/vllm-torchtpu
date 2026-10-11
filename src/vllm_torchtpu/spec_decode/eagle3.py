@@ -1366,52 +1366,11 @@ class Eagle3Proposer:
                 propose()).
             num_rejected_np: [num_reqs] clamped per-request rejection count
         """
-        runner = self.runner
-        num_reqs = chunk.num_reqs
-        start = chunk.start_index
-
-        query_start_loc_np = chunk.query_start_loc_np[: num_reqs + 1]
-        orig_num_tokens_per_req = query_start_loc_np[1:] - query_start_loc_np[:-1]
-
-        # Per-request rejection count (chunk's slice of the batch array).
-        if num_rejected_tokens_np is None:
-            num_rejected_np = np.zeros(num_reqs, dtype=np.int32)
-        else:
-            num_rejected_np = num_rejected_tokens_np[start : start + num_reqs].astype(
-                np.int32, copy=False
-            )
-            # Clamp to orig-1, not orig: a request always retains at least the
-            # bonus token, so at most orig-1 drafts can be rejected. Clamping to
-            # orig would let last_token_indices fall to qsl[i]-1 (=-1 for the
-            # first request, wrapping to the last padded row).
-            num_rejected_np = np.minimum(num_rejected_np, orig_num_tokens_per_req - 1)
-
-        # Eagle3 input shift (mirrors vLLM eagle's set_inputs_first_pass), then
-        # patch each request's last accepted slot with next_token below.
-        # E.g. [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
-        # The shift bleeds the next request's first token into the previous
-        # request's last slot — those slots are exactly last_token_indices,
-        # overwritten immediately below.
-        # The eagle3 input shift + seed scatter are folded into the compiled
-        # _draft_seed_input_ids helper applied at the scatter sites below (a raw
-        # clone/shift here would be a per-context eager program).
-
-        # Last-token index per request = end of the accepted prefix (where
-        # the bonus token actually lives), not the original last verify slot.
-        last_token_indices_np = (
-            query_start_loc_np[1 : num_reqs + 1].astype(np.int32, copy=False)
-            - 1
-            - num_rejected_np
-        )
-        # The async (next_tokens_device) path recomputes last_token_indices
-        # fully on-device below, only the sync / device_seed paths consume this H2D.
-        if next_tokens_device is None:
-            last_token_indices = torch.from_numpy(last_token_indices_np).to(
-                runner.device
-            )
+        runner, num_reqs, start = self.runner, chunk.num_reqs, chunk.start_index
 
         discard_set = set(discard_sampled_tokens_req_indices)
         req_ids = runner.input_batch.req_ids[start : start + num_reqs]
+        p = self._loop_bucket(num_reqs)
         if next_tokens_device is not None:
             # Async path: derive the seed token, the seed *position*
             # (last_token_indices) and the rejected count from the on-device
@@ -1427,11 +1386,10 @@ class Eagle3Proposer:
                 * nt.shape[1]
                 + last_valid_col
             )
-            next_token_ids = (
-                nt.reshape(-1)
-                if nt.dtype == torch.int32
-                else nt.reshape(-1).to(torch.int32)
-            ).index_select(0, flat_col)
+            nt_flat = nt.reshape(-1)
+            if nt_flat.dtype != torch.int32:
+                nt_flat = nt_flat.to(torch.int32)
+            next_token_ids = nt_flat.index_select(0, flat_col)
             # Anchor the seed position at qsl_end-1 (like the sync path) using
             # the REAL per-request draft count.
             # num_draft is read on-device from the chunk's draft_lengths snapshot
@@ -1477,84 +1435,107 @@ class Eagle3Proposer:
                 next_token_ids[
                     torch.tensor(ov_i, dtype=torch.long, device=runner.device)
                 ] = torch.tensor(ov_v, dtype=next_token_ids.dtype, device=runner.device)
-        elif device_seed is not None:
-            # On-device prefill bootstrap: seed from the device sampled tokens
-            # (no D2H). num_rejected stays 0 (num_rejected_tokens_np is None ->
-            # num_rejected_np is zeros) and last_token_indices = qsl_end-1 (set
-            # above) is the last prompt position -- the correct prefill seed.
-            num_rejected_out = num_rejected_np
-            next_token_ids = (
-                device_seed[start : start + num_reqs]
-                if device_seed.dtype == torch.int32
-                else device_seed[start : start + num_reqs].to(torch.int32)
-            )
-            # Partial-prefill (discard) reqs: override seed from host req_state.
-            ov_i = [i for i in range(num_reqs) if (start + i) in discard_set]
-            if ov_i:
-                next_token_ids = next_token_ids.clone()
-                ov_v = [
-                    runner.requests[req_ids[i]].get_token_id(
-                        runner.requests[req_ids[i]].num_computed_tokens
-                        + scheduler_output.num_scheduled_tokens[req_ids[i]]
-                    )
-                    for i in ov_i
-                ]
-                next_token_ids[
-                    torch.tensor(ov_i, dtype=torch.long, device=runner.device)
-                ] = torch.tensor(ov_v, dtype=next_token_ids.dtype, device=runner.device)
-        else:
-            assert sampled_token_ids is not None
-            num_rejected_out = num_rejected_np
-            next_token_ids_np = np.zeros(num_reqs, dtype=np.int32)
-            for i in range(num_reqs):
-                batch_i = start + i  # batch-level request index
-                if batch_i in discard_set:
-                    req_id = req_ids[i]
-                    req_state = runner.requests[req_id]
-                    seq_len = (
-                        req_state.num_computed_tokens
-                        + scheduler_output.num_scheduled_tokens[req_id]
-                    )
-                    next_token_ids_np[i] = req_state.get_token_id(seq_len)
-                else:
-                    ids = (
-                        sampled_token_ids[batch_i]
-                        if batch_i < len(sampled_token_ids)
-                        else []
-                    )
-                    next_token_ids_np[i] = ids[-1] if ids else 0
-            next_token_ids = torch.from_numpy(next_token_ids_np).to(runner.device)
-        # Bucket the seed scatter + the returned gather index to the chunk's loop
-        # bucket p so neither recompiles as num_reqs shrinks (the dominant draft
-        # propose recompile). Pad by repeating the last real entry: the padded
-        # rows re-write request (num_reqs-1)'s seed to its own slot (idempotent),
-        # so draft_input_ids stays correct, and the padded gather tail re-reads a
-        # real row that propose() slices off.
-        p = self._loop_bucket(num_reqs)
-        if next_tokens_device is None and device_seed is None:
-            # Pure sync: build the padded index + values on the host (free H2D,
-            # no recompile), then scatter at the constant [p] shape.
-            lti_p_np = np.full(p, last_token_indices_np[-1], dtype=np.int32)
-            lti_p_np[:num_reqs] = last_token_indices_np
-            ntids_p_np = np.full(
-                p, next_token_ids_np[-1], dtype=next_token_ids_np.dtype
-            )
-            ntids_p_np[:num_reqs] = next_token_ids_np
-            last_token_indices = torch.from_numpy(lti_p_np).to(runner.device)
-            next_token_ids = torch.from_numpy(ntids_p_np).to(runner.device)
             draft_input_ids = self._draft_seed_input_ids(
                 chunk.input_ids, last_token_indices, next_token_ids
             )
-            gather_indices = last_token_indices
+            gather_indices = _maybe_pad_dim0(last_token_indices, p)
         else:
-            # Async / bootstrap: the seed scatter stays real [num_reqs] (its
-            # recompile is async-only); pad just the returned gather index.
-            draft_input_ids = self._draft_seed_input_ids(
-                chunk.input_ids, last_token_indices, next_token_ids
-            )
-            if next_tokens_device is not None:
-                gather_indices = _maybe_pad_dim0(last_token_indices, p)
+            query_start_loc_np = chunk.query_start_loc_np[: num_reqs + 1]
+            orig_num_tokens_per_req = query_start_loc_np[1:] - query_start_loc_np[:-1]
+
+            # Per-request rejection count (chunk's slice of the batch array).
+            if num_rejected_tokens_np is None:
+                num_rejected_np = np.zeros(num_reqs, dtype=np.int32)
             else:
+                num_rejected_np = num_rejected_tokens_np[
+                    start : start + num_reqs
+                ].astype(np.int32, copy=False)
+                # Clamp to orig-1, not orig: a request always retains at least the
+                # bonus token, so at most orig-1 drafts can be rejected. Clamping to
+                # orig would let last_token_indices fall to qsl[i]-1 (=-1 for the
+                # first request, wrapping to the last padded row).
+                num_rejected_np = np.minimum(
+                    num_rejected_np, orig_num_tokens_per_req - 1
+                )
+
+            # Last-token index per request = end of the accepted prefix (where
+            # the bonus token actually lives), not the original last verify slot.
+            last_token_indices_np = (
+                query_start_loc_np[1 : num_reqs + 1].astype(np.int32, copy=False)
+                - 1
+                - num_rejected_np
+            )
+            num_rejected_out = num_rejected_np
+            if device_seed is not None:
+                last_token_indices = torch.from_numpy(last_token_indices_np).to(
+                    runner.device
+                )
+            if device_seed is not None:
+                # On-device prefill bootstrap: seed from the device sampled tokens
+                # (no D2H). num_rejected stays 0 (num_rejected_tokens_np is None ->
+                # num_rejected_np is zeros) and last_token_indices = qsl_end-1 (set
+                # above) is the last prompt position -- the correct prefill seed.
+                next_token_ids = (
+                    device_seed[start : start + num_reqs]
+                    if device_seed.dtype == torch.int32
+                    else device_seed[start : start + num_reqs].to(torch.int32)
+                )
+                # Partial-prefill (discard) reqs: override seed from host req_state.
+                ov_i = [i for i in range(num_reqs) if (start + i) in discard_set]
+                if ov_i:
+                    next_token_ids = next_token_ids.clone()
+                    ov_v = [
+                        runner.requests[req_ids[i]].get_token_id(
+                            runner.requests[req_ids[i]].num_computed_tokens
+                            + scheduler_output.num_scheduled_tokens[req_ids[i]]
+                        )
+                        for i in ov_i
+                    ]
+                    next_token_ids[
+                        torch.tensor(ov_i, dtype=torch.long, device=runner.device)
+                    ] = torch.tensor(
+                        ov_v, dtype=next_token_ids.dtype, device=runner.device
+                    )
+            else:
+                assert sampled_token_ids is not None
+                next_token_ids_np = np.zeros(num_reqs, dtype=np.int32)
+                for i in range(num_reqs):
+                    batch_i = start + i  # batch-level request index
+                    if batch_i in discard_set:
+                        req_id = req_ids[i]
+                        req_state = runner.requests[req_id]
+                        seq_len = (
+                            req_state.num_computed_tokens
+                            + scheduler_output.num_scheduled_tokens[req_id]
+                        )
+                        next_token_ids_np[i] = req_state.get_token_id(seq_len)
+                    else:
+                        ids = (
+                            sampled_token_ids[batch_i]
+                            if batch_i < len(sampled_token_ids)
+                            else []
+                        )
+                        next_token_ids_np[i] = ids[-1] if ids else 0
+                next_token_ids = torch.from_numpy(next_token_ids_np).to(runner.device)
+            if device_seed is None:
+                # Pure sync: build the padded index + values on the host (free H2D,
+                # no recompile), then scatter at the constant [p] shape.
+                lti_p_np = np.full(p, last_token_indices_np[-1], dtype=np.int32)
+                lti_p_np[:num_reqs] = last_token_indices_np
+                ntids_p_np = np.full(
+                    p, next_token_ids_np[-1], dtype=next_token_ids_np.dtype
+                )
+                ntids_p_np[:num_reqs] = next_token_ids_np
+                last_token_indices = torch.from_numpy(lti_p_np).to(runner.device)
+                next_token_ids = torch.from_numpy(ntids_p_np).to(runner.device)
+                draft_input_ids = self._draft_seed_input_ids(
+                    chunk.input_ids, last_token_indices, next_token_ids
+                )
+                gather_indices = last_token_indices
+            else:
+                draft_input_ids = self._draft_seed_input_ids(
+                    chunk.input_ids, last_token_indices, next_token_ids
+                )
                 padded_lti_np = np.zeros(p, dtype=np.int32)
                 padded_lti_np[:num_reqs] = last_token_indices_np
                 gather_indices = torch.from_numpy(padded_lti_np).to(runner.device)

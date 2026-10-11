@@ -1652,3 +1652,51 @@ def test_td8305_eagle3_int32_cast_guards():
     )
     assert torch.equal(ids_s32, ids_s64)
     assert torch.equal(gather_s32, gather_s64)
+
+
+def test_td8330_prepare_draft_inputs_skips_host_numpy_and_redundant_h2d(
+    monkeypatch,
+):
+    # 1. Async path (next_tokens_device is not None) skips chunk.query_start_loc_np
+    proposer, chunk, sched = _prep_setup()
+    chunk.query_start_loc_np = None
+    chunk.draft_lengths = torch.tensor([1, 2, 1], dtype=torch.int32)
+    chunk.attn_ctx = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 2, 5, 7], dtype=torch.int32)
+    )
+    nt_dev = torch.tensor([[11, -1], [22, 23], [33, -1]], dtype=torch.int32)
+    ids_async, _, gather_async, rej_async = proposer._prepare_draft_inputs(
+        chunk,
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=sched,
+        next_tokens_device=nt_dev,
+    )
+    assert ids_async.dtype == torch.int32
+    assert gather_async.dtype == torch.int32
+    assert rej_async.tolist() == [1, 1, 1]
+
+    # 2. Pure sync path (next_tokens_device is None, device_seed is None) skips
+    # the unpadded last_token_indices_np torch.from_numpy H2D before padded lti_p_np
+    proposer_sync, chunk_sync, sched_sync = _prep_setup()
+    orig_from_numpy = torch.from_numpy
+    from_numpy_arrays: list[np.ndarray] = []
+
+    def _spy_from_numpy(arr):
+        from_numpy_arrays.append(arr.copy())
+        return orig_from_numpy(arr)
+
+    monkeypatch.setattr(torch, "from_numpy", _spy_from_numpy)
+    ids_sync, _, gather_sync, rej_sync = proposer_sync._prepare_draft_inputs(
+        chunk_sync,
+        sampled_token_ids=[[11], [22], [33]],
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=np.array([0, 1, 0], dtype=np.int32),
+        scheduler_output=sched_sync,
+    )
+    # Only next_token_ids_np, lti_p_np, and ntids_p_np are converted (3 calls, not 4)
+    assert len(from_numpy_arrays) == 3
+    assert gather_sync[:3].tolist() == [2, 3, 5]
+    assert rej_sync.tolist() == [0, 1, 0]
+    assert ids_sync.dtype == torch.int32
