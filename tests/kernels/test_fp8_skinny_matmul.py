@@ -265,7 +265,9 @@ def test_scale_dma_lowers_scale_to_hbm(k, n):
 
 
 def test_scale_dma_applies():
-    assert fp8_skinny.scale_dma_applies(6144)  # o_proj
-    assert fp8_skinny.scale_dma_applies(16384) and fp8_skinny.scale_dma_applies(8192)
-    assert not fp8_skinny.scale_dma_applies(1536)  # dense gate_up
-    assert not fp8_skinny.scale_dma_applies(2688)  # q_a + kv_a (padded)
+    assert fp8_skinny.scale_dma_applies(1024, 6144)  # o_proj
+    assert not fp8_skinny.scale_dma_applies(2048, 16384)  # q_b: copy hidden
+    assert not fp8_skinny.scale_dma_applies(6144, 1536)  # gate_up: not a bitcast
+    assert not fp8_skinny.scale_dma_applies(6144, 2688)  # q_a + kv_a
+    for k, n in fp8_skinny.SCALE_DMA_SITES:
+        assert (k, n) in fp8_skinny.TUNED and n % 1024 == 0
