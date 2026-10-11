@@ -616,3 +616,56 @@ def test_compiled_helpers_padding_mrope_and_tpu_dispatch(monkeypatch):
         11,
         12,
     ]
+
+
+def test_td8276_native_int32_1d_index_select_in_async_output_helpers(monkeypatch):
+    select_calls = []
+    orig_index_select = torch.Tensor.index_select
+
+    def spy_index_select(self, dim, index):
+        select_calls.append((self.ndim, dim, index.dtype))
+        return orig_index_select(self, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", spy_index_select)
+    next_tokens = torch.tensor(
+        [[11, 99, INVALID_TOKEN_ID], [77, INVALID_TOKEN_ID, INVALID_TOKEN_ID]],
+        dtype=torch.int32,
+    )
+    drafts = torch.tensor([[201, 202], [211, 212]], dtype=torch.int32)
+    num_draft = torch.tensor([2, 2], dtype=torch.int32)
+
+    select_calls.clear()
+    out1 = tpu_runner_async_output.assemble_spec_next_tokens(
+        next_tokens, drafts, num_reqs=2
+    )
+    assert out1.tolist() == [99, 201, 202, 77, 211, 212]
+    assert select_calls == [(1, 0, torch.int32)]
+
+    select_calls.clear()
+    out2, rej2 = assemble_spec_next_tokens_and_num_rejected(
+        next_tokens, drafts, num_draft, num_reqs=2
+    )
+    assert torch.equal(out2, out1)
+    assert rej2.tolist() == [1, 2]
+    assert select_calls == [(1, 0, torch.int32)]
+
+    select_calls.clear()
+    seq_lens = torch.tensor([10, 20, 30], dtype=torch.int32)
+    positions = torch.tensor([5, 6, 15, 16, 25], dtype=torch.int32)
+    num_rej = torch.tensor([2, 1], dtype=torch.int64)
+    seq_idx = torch.tensor([0, 1, -1], dtype=torch.int64)
+    pos_idx = torch.tensor([0, 0, 1, 1, -1], dtype=torch.int64)
+    new_seq, new_pos = subtract_num_rejected_tokens(
+        seq_lens, positions, num_rej, seq_idx, pos_idx
+    )
+    assert new_seq.tolist() == [8, 19, 30]
+    assert new_pos.tolist() == [3, 4, 14, 15, 25]
+    assert select_calls == [(1, 0, torch.int32), (1, 0, torch.int32)]
+
+    select_calls.clear()
+    in_ids = torch.tensor([100, 101, 102, 103, 104], dtype=torch.int32)
+    logits_idx = torch.tensor([0, 2, 4], dtype=torch.int64)
+    target_idx = torch.tensor([0, 1], dtype=torch.int64)
+    extracted = extract_draft_token_ids(in_ids, logits_idx, target_idx)
+    assert extracted.tolist() == [102, 104]
+    assert select_calls == [(1, 0, torch.int32), (1, 0, torch.int32)]

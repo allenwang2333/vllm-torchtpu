@@ -320,8 +320,19 @@ def assemble_spec_next_tokens(
     if drafts.shape[0] != num_reqs:
         drafts = drafts[:num_reqs]
     # Last non-padding column per row is the bonus.
-    last_valid_col = (nt != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1) - 1
-    bonus = nt.gather(1, last_valid_col.unsqueeze(1))  # [num_reqs, 1]
+    last_valid_col = (nt != INVALID_TOKEN_ID).sum(dim=1, dtype=torch.int32).clamp(
+        min=1
+    ) - 1
+    flat_col = (
+        torch.arange(
+            num_reqs,
+            dtype=torch.int32,
+            device=nt.device if isinstance(nt.device, torch.device) else None,
+        )
+        * nt.shape[1]
+        + last_valid_col
+    )
+    bonus = nt.reshape(-1).index_select(0, flat_col).unsqueeze(1)  # [num_reqs, 1]
     if bonus.dtype != drafts.dtype:
         bonus = bonus.to(drafts.dtype)
     src = torch.cat([bonus, drafts], dim=1)  # [num_reqs, 1+K]
@@ -340,8 +351,17 @@ def _assemble_spec_next_tokens_and_num_rejected(
     if drafts.shape[0] != num_reqs:
         drafts = drafts[:num_reqs]
     num_valid = (nt != INVALID_TOKEN_ID).sum(dim=1, dtype=torch.int32)
-    last_valid_col = (num_valid.clamp(min=1) - 1).to(torch.int64)
-    bonus = nt.gather(1, last_valid_col.unsqueeze(1))  # [num_reqs, 1]
+    last_valid_col = num_valid.clamp(min=1) - 1
+    flat_col = (
+        torch.arange(
+            num_reqs,
+            dtype=torch.int32,
+            device=nt.device if isinstance(nt.device, torch.device) else None,
+        )
+        * nt.shape[1]
+        + last_valid_col
+    )
+    bonus = nt.reshape(-1).index_select(0, flat_col).unsqueeze(1)  # [num_reqs, 1]
     if bonus.dtype != drafts.dtype:
         bonus = bonus.to(drafts.dtype)
     src = torch.cat([bonus, drafts], dim=1).reshape(-1)
@@ -424,14 +444,14 @@ def _subtract_num_rejected_tokens(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     seq_subtract = torch.where(
         seq_lens_subtract_indices >= 0,
-        num_rejected[seq_lens_subtract_indices.clamp(min=0)],
+        num_rejected.index_select(0, seq_lens_subtract_indices.clamp(min=0).int()),
         0,
     )
     seq_lens = seq_lens - seq_subtract
 
     pos_subtract = torch.where(
         positions_subtract_indices >= 0,
-        num_rejected[positions_subtract_indices.clamp(min=0)],
+        num_rejected.index_select(0, positions_subtract_indices.clamp(min=0).int()),
         0,
     )
     if positions.ndim == 2:  # mrope (out of text-MVP scope; kept for parity)
@@ -494,7 +514,8 @@ def _extract_draft_token_ids(
     logits_indices: torch.Tensor,
     target_logits_indices: torch.Tensor,
 ) -> torch.Tensor:
-    return input_ids[logits_indices[target_logits_indices + 1]]
+    draft_rows = logits_indices.index_select(0, (target_logits_indices + 1).int()).int()
+    return input_ids.index_select(0, draft_rows)
 
 
 _extract_draft_token_ids_compiled = torch.compile(
