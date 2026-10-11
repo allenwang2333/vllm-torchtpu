@@ -794,13 +794,21 @@ class KVCacheManager:
             self.runner.cache_config.mamba_page_size_padded = attn_page_size_bytes
             return
 
-        # Compute the unpadded mamba page size from an actual mamba module's
-        # spec (shapes × dtype-size), ignoring any existing padding.
-        first_mamba_spec = mamba_modules[0].get_kv_cache_spec(self.runner.vllm_config)
-        assert isinstance(first_mamba_spec, MambaSpec)
-        unpadded_mamba_page_size = dataclasses.replace(
-            first_mamba_spec, page_size_padded=None
-        ).page_size_bytes
+        # Unpadded page (shapes × dtype-size) of every kind of mamba layer.
+        # A model may carry more than one kind (GLM-5.3-Flash: KDA recurrent
+        # state plus the k-pool indexer's per-request member state); like the
+        # indexer kinds above, each is its own spec and so its own groups.
+        mamba_kinds: dict[tuple, list] = {}
+        mamba_pages: dict[tuple, int] = {}
+        for m in mamba_modules:
+            spec = m.get_kv_cache_spec(self.runner.vllm_config)
+            assert isinstance(spec, MambaSpec)
+            key = (tuple(map(tuple, spec.shapes)), tuple(spec.dtypes))
+            mamba_kinds.setdefault(key, []).append(m)
+            mamba_pages[key] = dataclasses.replace(
+                spec, page_size_padded=None
+            ).page_size_bytes
+        mamba_counts = [len(ms) for ms in mamba_kinds.values()]
 
         # Derive vLLM's kv-cache group layout. vLLM splits each type into
         # equal-sized groups of `group_size` layers. Their native placements
@@ -827,10 +835,9 @@ class KVCacheManager:
         # heuristic ever changes — it has been stable since the hybrid
         # allocator landed.
         num_attn = len(attn_modules)
-        num_mamba = len(mamba_modules)
         # vLLM takes the min/max over *every* bucket of same-spec layers, so
-        # each indexer kind participates in the heuristic too.
-        counts = [num_attn, num_mamba] + indexer_counts
+        # each mamba and indexer kind participates in the heuristic too.
+        counts = [num_attn] + mamba_counts + indexer_counts
         min_count = min(counts)
         max_count = max(counts)
 
@@ -839,7 +846,15 @@ class KVCacheManager:
         group_size = max_count if max_count < min_count * 1.5 else min_count
 
         num_attn_groups = (num_attn + group_size - 1) // group_size
-        num_mamba_groups = (num_mamba + group_size - 1) // group_size
+        num_mamba_groups = sum(
+            (n + group_size - 1) // group_size for n in mamba_counts
+        )
+        # Bytes one recurrent slot costs across the mamba layers backed by a
+        # KVCacheTensor; with a single kind this is groups x page.
+        mamba_bytes_per_slot = sum(
+            (len(ms) + group_size - 1) // group_size * mamba_pages[key]
+            for key, ms in mamba_kinds.items()
+        )
         # Indexer pages are per-token like attention pages, so they belong on
         # the attention side of every block-count computation: below they are
         # folded into one "indexer bytes per block" figure.
@@ -854,14 +869,14 @@ class KVCacheManager:
         uniform_page_size_bytes = (
             num_attn_groups * attn_page_size_bytes
             + indexer_bytes_per_block
-            + num_mamba_groups * unpadded_mamba_page_size
+            + mamba_bytes_per_slot
         )
 
         logger.info(
             "Hybrid KV cache: padding every layer spec to %d bytes "
             "(num_attn_groups=%d × attn_page=%d + "
             "num_indexer_groups=%d (%d B per block, pages %s) + "
-            "num_mamba_groups=%d × mamba_unpadded=%d). This makes vLLM's "
+            "num_mamba_groups=%d (%d B per slot, pages %s)). This makes vLLM's "
             "num_blocks match per-layer TPU allocation when mamba layers "
             "cannot be truly shared.",
             uniform_page_size_bytes,
@@ -871,7 +886,8 @@ class KVCacheManager:
             indexer_bytes_per_block,
             indexer_page_sizes,
             num_mamba_groups,
-            unpadded_mamba_page_size,
+            mamba_bytes_per_slot,
+            list(mamba_pages.values()),
         )
 
         self.runner._hybrid_uniform_page_size_bytes = int(uniform_page_size_bytes)
@@ -886,9 +902,11 @@ class KVCacheManager:
         # sets `_mamba_num_blocks`.
         self._maybe_set_compact_mamba_num_blocks_override(
             attn_page_size_bytes,
-            int(unpadded_mamba_page_size),
+            # Every mamba kind's slot bytes folded into one figure: the sizing
+            # only ever uses `num_mamba_groups * unpadded_page`.
+            int(mamba_bytes_per_slot),
             num_attn_groups,
-            num_mamba_groups,
+            1,
             group_size,
             indexer_bytes_per_block,
         )

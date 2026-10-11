@@ -51,7 +51,9 @@ from torch import nn
 from torch_tpu._internal import pallas
 from vllm.config import CacheConfig, VllmConfig
 from vllm.forward_context import get_forward_context
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
@@ -207,6 +209,42 @@ class Glm5NextPoolKeyCache(DeepseekV32IndexerCache):
 
     def get_attn_backend(self) -> type[Glm5NextPoolKeyBackend]:
         return Glm5NextPoolKeyBackend
+
+
+class Glm5NextMemberState(nn.Module, MambaBase):
+    """Per-request ``[kpool, 2 * head_dim]`` bf16 slot: the incomplete pool.
+
+    Declared as a recurrent (mamba) state, which vLLM keeps one slot per
+    running request for, instead of a paged per-token cache: a member row is
+    dead as soon as its pool is keyed. See `_kpool_index_v3_jax`.
+    """
+
+    def __init__(self, kpool: int, head_dim: int, prefix: str,
+                 vllm_config: VllmConfig) -> None:
+        super().__init__()
+        self.kpool = kpool
+        self.row_width = 2 * head_dim
+        self.prefix = prefix
+        self.kv_cache = None
+        context = vllm_config.compilation_config.static_forward_context
+        if prefix in context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        context[prefix] = self
+
+    @property
+    def mamba_type(self) -> MambaAttentionBackendEnum:
+        return MambaAttentionBackendEnum.LINEAR
+
+    @property
+    def is_kv_cache_tp_replicated(self) -> bool:
+        # The indexer is replicated, not sharded, across TP ranks.
+        return True
+
+    def get_state_shape(self) -> tuple[tuple[int, ...]]:
+        return ((self.kpool, self.row_width), )
+
+    def get_state_dtype(self) -> tuple[torch.dtype]:
+        return (torch.bfloat16, )
 
 
 # How large an intermediate the pool-scoring step may materialise before it
@@ -403,7 +441,7 @@ def _kpool_index_jax(
     Module level so `test_kpool_index_op.py` can run it against the torch
     reference on CPU, without a TPU or a vLLM engine. The pool keys live over
     member 0's ``gate`` half and are scored by plain XLA, which reads every
-    sequence's ``max_pools`` keys each step; `_kpool_index_v2_jax` is the
+    sequence's ``max_pools`` keys each step; `_kpool_index_v3_jax` is the
     serving path.
     """
     _, block_size_per_packing, packing, row_width = cache.shape
@@ -538,8 +576,8 @@ def _pool_key_records(keys: jax.Array, record_width: int) -> jax.Array:
     return jnp.pad(record, ((0, 0), (0, record_width - record.shape[-1])))
 
 
-def _kpool_index_v2_jax(
-        cache: jax.Array,  # bf16 [blocks, bs/4, 4, 2 * head_dim]
+def _kpool_index_v3_jax(
+        member_state: jax.Array,  # bf16 [slots, kpool, 2 * head_dim]
         key_cache: jax.Array,  # u8 [blocks, bs/kpool/4, 4, record_width]
         k_new: jax.Array,  # bf16 [tokens, head_dim]
         gate_new: jax.Array,  # bf16 [tokens, head_dim]
@@ -547,46 +585,70 @@ def _kpool_index_v2_jax(
         weights: jax.Array,  # f32  [tokens, heads]
         ape: jax.Array,  # f32  [kpool, head_dim]
         seq_lens: jax.Array,  # i32  [seqs]
-        page_indices: jax.Array,  # i32  [seqs * pages_per_seq]
         cu_q_lens: jax.Array,  # i32  [seqs + 1]
         distribution: jax.Array,  # i32  [3]
+        state_indices: jax.Array,  # i32  [seqs]
         key_page_indices: jax.Array,  # i32  [seqs * pages_per_seq]
         *,
         kpool: int,
         select_k: int,
         width: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """The indexer with pool keys in their own fp8 cache, scored by a kernel.
+    """The serving indexer: fp8 pool keys scored by `streamindex_topk`.
 
-    Members are still stored and keyed exactly as in `_kpool_index_jax`. The
-    finished keys then go, fp8-quantized, into ``key_cache`` -- one record per
-    pool, addressed through the same block table at ``kpool`` tokens per row
-    -- and `streamindex_topk` (DeepSeek-V4's indexer kernel: relu(q.k)
-    weighted over heads, top-k on the SparseCore) scores and selects them.
-    That kernel walks only the pages each sequence actually has, where the
-    XLA path reads ``max_pools`` keys per sequence per step regardless of
-    length.
+    Each finished pool key goes, fp8 with a UE8M0 scale, into ``key_cache``
+    -- one record per pool, addressed through that cache's block table at
+    ``kpool`` tokens per row -- and DeepSeek-V4's `streamindex_topk` kernel
+    (relu(q.k) weighted over heads, top-k on the SparseCore) scores and
+    selects them, walking only the pages each sequence has. (`_kpool_index_jax`
+    reads ``max_pools`` keys per sequence per step whatever its length.)
 
-    The two caches sit in different vLLM KV cache groups and so have
-    different block tables: ``page_indices`` addresses ``cache`` and
-    ``key_page_indices`` addresses ``key_cache``.
+    A pool's members are needed only until the pool is complete, so instead
+    of a paged per-token cache each request keeps one slot holding the
+    ``[k | gate]`` rows of its pool still being filled (``member_state[slot,
+    m]`` is member ``m``). A pool completed in this step takes each member
+    from this step's rows when the member was produced in this step, and from
+    the slot otherwise (it was produced in an earlier step, and the pool was
+    that request's trailing pool then). Afterwards each request writes the
+    rows of its new trailing incomplete pool, if any, into its slot.
+
+    Dropping the paged member cache matters more than its 512 B/token
+    suggests: TPU's non-unified hybrid layout gives every paged cache kind a
+    full array over the shared block-id space, so each kind costs a page per
+    block id whether or not it holds the block.
     """
     num_seqs = seq_lens.shape[0]
     num_tokens = k_new.shape[0]
-    head_dim = k_new.shape[-1]
-    block_size = cache.shape[1] * cache.shape[2]
     rows_per_page = key_cache.shape[1] * key_cache.shape[2]
-    if rows_per_page * kpool != block_size:
-        raise ValueError(
-            f"pool key cache holds {rows_per_page} rows per page, expected "
-            f"block_size / kpool = {block_size} / {kpool}")
-    pages = page_indices.reshape(num_seqs, -1)
     seq_id, pos, live = _step_positions(seq_lens, cu_q_lens, num_tokens)
-    cache, new_keys, completes, pool_of, _ = _write_members_and_pool_keys(
-        cache, k_new, gate_new, ape, pages, seq_id, pos, live, kpool=kpool)
+    rows = jnp.concatenate([k_new, gate_new], axis=-1)  # [tokens, 2 * hd]
+    slot = state_indices[seq_id]
+    q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
+    first_pos = seq_lens[seq_id] - q_len  # this request's first new position
 
-    # Pool `j` is row `j` of its sequence's compressed address space: page
-    # `j // rows_per_page` of the block table, row `j % rows_per_page`.
+    pool_of = pos // kpool
+    completes = live & (((pos + 1) % kpool) == 0)
+    mem_pos = (pool_of[:, None] * kpool +
+               jnp.arange(kpool, dtype=jnp.int32)[None, :])  # [tokens, kpool]
+    in_step = mem_pos >= first_pos[:, None]
+    mem_row = cu_q_lens[seq_id][:, None] + (mem_pos - first_pos[:, None])
+    from_step = rows[jnp.clip(mem_row, 0, num_tokens - 1)]
+    from_state = member_state[slot]  # [tokens, kpool, 2 * hd]
+    members = jnp.where(in_step[..., None], from_step,
+                        from_state).astype(jnp.float32)
+    m_k, m_gate = jnp.split(members, 2, axis=-1)
+    probs = jax.nn.softmax(m_gate + ape, axis=-2)
+    new_keys = jnp.sum(probs * m_k, axis=-2)  # [tokens, head_dim]
+
+    # Each request's trailing incomplete pool goes to its slot. Only those
+    # rows are written, so every (slot, member) is written at most once and
+    # the scatter has no duplicate indices to order.
+    seq_len = seq_lens[seq_id]
+    trailing = (live & (pool_of == (seq_len - 1) // kpool) &
+                (seq_len % kpool != 0))
+    member_state = member_state.at[jnp.where(trailing, slot, 2**30),
+                                   pos % kpool].set(rows, mode="drop")
+
     key_pages = key_page_indices.reshape(num_seqs, -1)
     dst_rows = jnp.where(
         completes,
@@ -596,8 +658,7 @@ def _kpool_index_v2_jax(
                              _pool_key_records(new_keys, key_cache.shape[-1]),
                              dst_rows)
 
-    # relu(c * x) = c * relu(x) for c > 0, so the softmax scale and the
-    # per-row fp8 scale of q both fold into the head weights.
+    head_dim = k_new.shape[-1]
     fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
     qf = q.astype(jnp.float32) * jnp.float32(head_dim**-0.5)
     q_scale = jnp.maximum(jnp.max(jnp.abs(qf), axis=-1), 1e-12) / fp8_max
@@ -619,117 +680,42 @@ def _kpool_index_v2_jax(
     topk_indices = _expand_selected_pools(selected, selected >= 0, pos, live,
                                           kpool=kpool, select_k=select_k,
                                           width=width)
-    return cache, key_cache, topk_indices
+    return member_state, key_cache, topk_indices
 
 
 @functools.lru_cache(maxsize=None)
-def _build_kpool_index_op(kpool: int, select_k: int, width: int,
-                          max_pools: int, num_heads: int):
-    """Build the fused write-cache + score-pools + top-k op.
-
-    Cached because all 11 DSA layers ask for the same op: the name goes to
-    `torch.library.custom_op`, and registering it a second time leaves the
-    entry without a schema, which surfaces much later as a Dynamo
-    "Tried to access the schema for  which doesn't have a schema registered
-    yet" while tracing the model.
-
-    Returned callable:
-    ``op(cache, k_new, gate_new, q, weights, ape, seq_lens, page_indices,
-    cu_q_lens) -> int32 [num_tokens, width]``, and ``cache`` is updated in
-    place.
-
-    Everything is one XLA region rather than eager torch ops because the write
-    is a three-index scatter and the read is a paged gather; expressing those
-    through torch-tpu's exporter is far more fragile than handing JAX the whole
-    thing.
-
-    The scoring loop is deliberately naive. ``relu`` sits between the per-head
-    dot product and the per-head weighting, so the heads cannot be collapsed
-    into the GEMM and the intermediate is ``[tokens, heads, pools]``; and each
-    token may only look at *its own* sequence's pools, which is a block-diagonal
-    matmul that XLA has no way to express with a runtime ``cu_q_lens``. The
-    loop below therefore scores every token against every sequence's pools and
-    throws away all but the diagonal -- ``num_seqs`` times more work than
-    necessary. Run it with a small ``--max-num-seqs``.
-    """
-
-    # `pallas.jax_op` reads the annotations to build the torch schema, so they
-    # are load-bearing, not documentation.
-    def _bound_kpool_index_jax(
-            cache: jax.Array, k_new: jax.Array, gate_new: jax.Array,
-            q: jax.Array, weights: jax.Array, ape: jax.Array,
-            seq_lens: jax.Array, page_indices: jax.Array,
-            cu_q_lens: jax.Array) -> tuple[jax.Array, jax.Array]:
-        return _kpool_index_jax(cache,
-                                k_new,
-                                gate_new,
-                                q,
-                                weights,
-                                ape,
-                                seq_lens,
-                                page_indices,
-                                cu_q_lens,
-                                kpool=kpool,
-                                select_k=select_k,
-                                width=width,
-                                max_pools=max_pools,
-                                num_heads=num_heads)
-
-    jax_op = pallas.jax_op("pallas::glm5_next_kpool_index",
-                           _bound_kpool_index_jax,
-                           donate_argnums=(0, ))
-
-    def _fake(cache, k_new, *args, **kwargs):
-        return torch.empty_like(cache), torch.empty(
-            (k_new.shape[0], width), dtype=torch.int32, device=k_new.device)
-
-    jax_op.register_fake(_fake)
-
-    def op(cache, *args):
-        new_cache, topk_indices = jax_op(cache, *args)
-        cache.copy_(new_cache)
-        return topk_indices
-
-    return op
-
-
-@functools.lru_cache(maxsize=None)
-def _build_kpool_index_v2_op(kpool: int, select_k: int, width: int):
-    """`_kpool_index_v2_jax` as a torch op; both caches updated in place.
-
-    Returned callable: ``op(cache, key_cache, k_new, gate_new, q, weights,
-    ape, seq_lens, page_indices, cu_q_lens, distribution, key_page_indices)
-    -> int32 [num_tokens, width]``. Cached for the same reason as
-    `_build_kpool_index_op`.
-    """
+def _build_kpool_index_v3_op(kpool: int, select_k: int, width: int):
+    """`_kpool_index_v3_jax` as a torch op; both states updated in place."""
 
     # `pallas.jax_op` reads the annotations to build the torch schema.
-    def _bound(cache: jax.Array, key_cache: jax.Array, k_new: jax.Array,
-               gate_new: jax.Array, q: jax.Array, weights: jax.Array,
-               ape: jax.Array, seq_lens: jax.Array, page_indices: jax.Array,
+    def _bound(member_state: jax.Array, key_cache: jax.Array,
+               k_new: jax.Array, gate_new: jax.Array, q: jax.Array,
+               weights: jax.Array, ape: jax.Array, seq_lens: jax.Array,
                cu_q_lens: jax.Array, distribution: jax.Array,
-               key_page_indices: jax.Array
+               state_indices: jax.Array, key_page_indices: jax.Array
                ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        return _kpool_index_v2_jax(cache, key_cache, k_new, gate_new, q,
-                                   weights, ape, seq_lens, page_indices,
-                                   cu_q_lens, distribution, key_page_indices,
-                                   kpool=kpool, select_k=select_k, width=width)
+        return _kpool_index_v3_jax(member_state, key_cache, k_new, gate_new,
+                                   q, weights, ape, seq_lens, cu_q_lens,
+                                   distribution, state_indices,
+                                   key_page_indices, kpool=kpool,
+                                   select_k=select_k, width=width)
 
-    jax_op = pallas.jax_op("pallas::glm5_next_kpool_index_v2",
+    jax_op = pallas.jax_op("pallas::glm5_next_kpool_index_v3",
                            _bound,
                            donate_argnums=(0, 1))
 
-    def _fake(cache, key_cache, k_new, *args, **kwargs):
-        return (torch.empty_like(cache), torch.empty_like(key_cache),
+    def _fake(member_state, key_cache, k_new, *args, **kwargs):
+        return (torch.empty_like(member_state), torch.empty_like(key_cache),
                 torch.empty((k_new.shape[0], width),
                             dtype=torch.int32,
                             device=k_new.device))
 
     jax_op.register_fake(_fake)
 
-    def op(cache, key_cache, *args):
-        new_cache, new_key_cache, topk_indices = jax_op(cache, key_cache, *args)
-        cache.copy_(new_cache)
+    def op(member_state, key_cache, *args):
+        new_state, new_key_cache, topk_indices = jax_op(
+            member_state, key_cache, *args)
+        member_state.copy_(new_state)
         key_cache.copy_(new_key_cache)
         return topk_indices
 
@@ -740,7 +726,7 @@ def use_v1_indexer() -> bool:
     """``GLM53_INDEXER_V1=1``: score pools with the XLA path, no key cache.
 
     The v1 op is the reference `test_kpool_index_op.py` checks against torch;
-    v2 (`_kpool_index_v2_jax`) scores fp8 keys and can swap near-tied pools at
+    the serving path (`_kpool_index_v3_jax`) scores fp8 keys and can swap near-tied pools at
     the top-k boundary, so this is the switch for A/B-ing that.
     """
     return os.environ.get("GLM53_INDEXER_V1", "0") == "1"
@@ -811,15 +797,15 @@ class Glm5NextIndexer(nn.Module):
         self.index_kpool_compress_gate = nn.Parameter(
             torch.empty(self.head_dim, config.hidden_size))
 
-        self.k_cache = Glm5NextIndexerCache(
-            head_dim=2 * self.head_dim,  # [k | gate], bf16
-            dtype=torch.bfloat16,
-            prefix=f"{prefix}.k_cache",
-            cache_config=cache_config,
-        )
-
         self.key_cache = None
+        self.member_state = None
         if use_v1_indexer():
+            self.k_cache = Glm5NextIndexerCache(
+                head_dim=2 * self.head_dim,  # [k | gate], bf16
+                dtype=torch.bfloat16,
+                prefix=f"{prefix}.k_cache",
+                cache_config=cache_config,
+            )
             max_pools = vllm_config.model_config.max_model_len // self.kpool
             self.index_op = _build_kpool_index_op(self.kpool, self.select_k,
                                                   self.width, max_pools,
@@ -829,55 +815,71 @@ class Glm5NextIndexer(nn.Module):
                 raise ValueError(
                     f"pool key cache is laid out for kpool {POOL_KEY_KPOOL}, "
                     f"got {self.kpool}")
+            self.k_cache = None
             self.key_cache = Glm5NextPoolKeyCache(
                 prefix=f"{prefix}.key_cache", cache_config=cache_config)
-            self.index_op = _build_kpool_index_v2_op(self.kpool,
+            # Registered without `nn.Module` ownership: the checkpoint has no
+            # tensors under it, and the runner reaches it through the static
+            # forward context like every other cache layer.
+            object.__setattr__(
+                self, "member_state",
+                Glm5NextMemberState(self.kpool, self.head_dim,
+                                    prefix=f"{prefix}.member_state",
+                                    vllm_config=vllm_config))
+            self.index_op = _build_kpool_index_v3_op(self.kpool,
                                                      self.select_k, self.width)
 
     def forward(self, hidden_states: torch.Tensor,
                 q_resid: torch.Tensor) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
 
-        metadata = None
         attn_metadata = get_forward_context().attn_metadata
-        if isinstance(attn_metadata, dict):
-            metadata = attn_metadata.get(self.k_cache.prefix)
-        cache = self.k_cache.kv_cache
-        key_metadata = None
-        if self.key_cache is not None and isinstance(attn_metadata, dict):
-            key_metadata = attn_metadata.get(self.key_cache.prefix)
-        if (not isinstance(metadata, AttentionMetadata) or cache.numel() == 0
-                or (self.key_cache is not None and
-                    (not isinstance(key_metadata, AttentionMetadata)
-                     or self.key_cache.kv_cache.numel() == 0))):
+        if not isinstance(attn_metadata, dict):
+            attn_metadata = {}
+
+        def bound(layer):
+            """The layer's metadata, or None before its cache is bound."""
+            md = attn_metadata.get(layer.prefix)
+            caches = layer.kv_cache
+            first = caches[0] if isinstance(caches, (list, tuple)) else caches
+            if (not isinstance(md, AttentionMetadata) or first is None
+                    or first.numel() == 0):
+                return None
+            return md
+
+        layers = ((self.k_cache, ) if self.key_cache is None else
+                  (self.key_cache, self.member_state))
+        metadatas = [bound(layer) for layer in layers]
+        if any(md is None for md in metadatas):
             # Profiling / warmup pass before the caches are bound. Returning
             # the buffer unchanged keeps the graph shape stable.
             return self.topk_indices_buffer
 
         q = self.wq_b(q_resid)[0].view(num_tokens, self.n_heads, self.head_dim)
-        k = self.k_norm(self.wk(hidden_states)[0])
-        gate = torch.nn.functional.linear(hidden_states,
-                                          self.index_kpool_compress_gate)
+        k = self.k_norm(self.wk(hidden_states)[0]).to(torch.bfloat16)
+        gate = torch.nn.functional.linear(
+            hidden_states, self.index_kpool_compress_gate).to(torch.bfloat16)
         weights = self.weights_proj(hidden_states)[0].float() * (
             self.n_heads**-0.5)
+        ape = self.index_kpool_compress_ape.float()
 
-        common = (
-            k.to(cache.dtype),
-            gate.to(cache.dtype),
-            q.float(),
-            weights,
-            self.index_kpool_compress_ape.float(),
-            metadata.seq_lens,
-            metadata.block_tables,
-            metadata.query_start_loc,
-        )
         if self.key_cache is None:
-            topk_indices = self.index_op(cache, *common)
+            (metadata, ) = metadatas
+            topk_indices = self.index_op(self.k_cache.kv_cache, k, gate,
+                                         q.float(), weights, ape,
+                                         metadata.seq_lens,
+                                         metadata.block_tables,
+                                         metadata.query_start_loc)
         else:
-            topk_indices = self.index_op(cache, self.key_cache.kv_cache,
-                                         *common,
-                                         metadata.request_distribution,
-                                         key_metadata.block_tables)
+            key_md, member_md = metadatas
+            topk_indices = self.index_op(self.member_state.kv_cache[0],
+                                         self.key_cache.kv_cache, k, gate,
+                                         q.float(), weights, ape,
+                                         key_md.seq_lens,
+                                         key_md.query_start_loc,
+                                         key_md.request_distribution,
+                                         member_md.mamba_state_indices,
+                                         key_md.block_tables)
 
         # Returned directly rather than written into `topk_indices_buffer`:
         # the GLM MLA consumes this tensor itself, and updating the shared
