@@ -453,7 +453,7 @@ def _row_slots(cache, block_table, requests, logical):
             for start in range(0, pages.shape[1], 128)
         ],
         dim=1,
-    ).long()
+    ).to(safe.dtype)
     return blocks * cache.shape[1] + safe % cache.shape[1]
 
 
@@ -588,7 +588,7 @@ def _request_row_slots(cache, block_table, width, page_records: int = 0):
 
 
 def _read_rows(cache, block_table, requests, logical):
-    slots = _row_slots(cache, block_table, requests, logical)
+    slots = _row_slots(cache, block_table, requests, logical).long()
     return cache[slots // cache.shape[1], slots % cache.shape[1]]
 
 
@@ -942,7 +942,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 requests = _token_requests(kv_meta, positions).clamp(
                     max=kv_table.shape[0] - 1
                 )
-                logical = positions // self.compress_ratio
+                logical = (positions // self.compress_ratio).int()
                 kv_col = (logical // kv_rows).clamp(max=kv_table.shape[1] - 1).long()
                 kv_rem = logical % kv_rows
                 if (
@@ -953,7 +953,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     idx_col = kv_col
                     idx_rem = kv_rem
                 else:
-                    idx_logical = positions // idx_ratio
+                    idx_logical = (positions // idx_ratio).int()
                     idx_col = (
                         (idx_logical // idx_rows)
                         .clamp(max=idx_table.shape[1] - 1)
@@ -1017,7 +1017,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     kv_write_invalid,
                 ) = cached_write
             else:
-                kv_blocks = kv_table[requests, kv_col].long()
+                kv_blocks = kv_table[requests, kv_col].int()
                 compressed_slots = (kv_blocks * kv_rows + kv_rem).masked_fill(
                     ~valid_token, -1
                 )
@@ -1032,7 +1032,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     idx_blocks = kv_blocks
                     index_slots = compressed_slots
                 else:
-                    idx_blocks = idx_table[requests, idx_col].long()
+                    idx_blocks = idx_table[requests, idx_col].int()
                     index_slots = (idx_blocks * idx_rows + idx_rem).masked_fill(
                         ~valid_token, -1
                     )
@@ -1069,7 +1069,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 kv_meta,
                 positions,
                 compress_ratio=self.compress_ratio,
-            )
+            ).int()
             valid = (compressed_slots >= 0) & (
                 (positions + 1) % self.compress_ratio == 0
             )
@@ -1079,7 +1079,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 idx_meta,
                 positions,
                 compress_ratio=idx_ratio,
-            )
+            ).int()
             idx_write_slots = idx_write_invalid = None
             kv_write_slots = kv_write_invalid = None
         starts = _window_starts()
@@ -1203,7 +1203,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     .clamp(max=swa_table.shape[1] - 1)
                     .long()
                 )
-                pos_rem = positions % rows_per_page
+                pos_rem = (positions % rows_per_page).int()
                 if non_causal:
                     req_idx = requests.clamp(max=swa.seq_lens.shape[0] - 1)
                     end_pos = swa.seq_lens[req_idx]
@@ -1211,10 +1211,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         swa.query_start_loc[req_idx + 1] - swa.query_start_loc[req_idx]
                     )
                     prefix_len = (end_pos - query_len).clamp(min=0)
-                    start_pos = (prefix_len - self.window_size).clamp(min=0)
+                    start_pos = (prefix_len - self.window_size).clamp(min=0).int()
                     logical = (
                         start_pos[:, None]
-                        + torch.arange(swa_width, device=positions.device)[None, :]
+                        + torch.arange(
+                            swa_width, dtype=torch.int32, device=positions.device
+                        )[None, :]
                     )
                     base_valid_window = (
                         (logical >= 0)
@@ -1223,12 +1225,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     )
                 else:
                     logical = (
-                        positions[:, None]
+                        positions.int()[:, None]
                         - self.window_size
                         + 1
-                        + torch.arange(self.window_size, device=positions.device)[
-                            None, :
-                        ]
+                        + torch.arange(
+                            self.window_size,
+                            dtype=torch.int32,
+                            device=positions.device,
+                        )[None, :]
                     )
                     base_valid_window = (logical >= 0) & valid_token[:, None]
                 if self._ced_decoder:
@@ -1290,7 +1294,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             swa_slots_key = self._stage_cache_key("swa_token_slots", *swa_key[1:])
             cached_swa_slots = stage_cache.get(swa_slots_key)
             if cached_swa_slots is None or cached_swa_slots[0] is not swa.block_tables:
-                b2 = swa_table[requests, pos_col].long()
+                b2 = swa_table[requests, pos_col].int()
                 swa_slots = (b2 * rows_per_page + pos_rem).masked_fill(~valid_token, -1)
                 swa_valid = swa_slots >= 0
                 swa_valid_int32 = swa_valid.int()
@@ -1305,14 +1309,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         is_prev_cols,
                         swa_page_rem,
                     ) = swa_3page
-                    b_last = swa_table[requests, c_last].long() if non_causal else b2
-                    swa_blocks = swa_table[requests, prev_cols[-1]].long()[:, None]
+                    b_last = swa_table[requests, c_last].int() if non_causal else b2
+                    swa_blocks = swa_table[requests, prev_cols[-1]].int()[:, None]
                     for col, is_col in zip(
                         reversed(prev_cols[:-1]),
                         reversed(is_prev_cols),
                         strict=True,
                     ):
-                        b_col = swa_table[requests, col].long()[:, None]
+                        b_col = swa_table[requests, col].int()[:, None]
                         swa_blocks = torch.where(is_col, b_col, swa_blocks)
                     swa_blocks = torch.where(is_c_last, b_last[:, None], swa_blocks)
                     swa_row_slots, invalid_window = (
@@ -1378,7 +1382,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 ) = cached_swa_slots
         else:
             swa_write = None
-            swa_slots = _cache_slots(swa_cache, swa, positions)
+            swa_slots = _cache_slots(swa_cache, swa, positions).int()
             swa_valid = swa_slots >= 0
             swa_valid_int32 = swa_valid
             swa_invalid_3d = (~swa_valid)[:, None, None]
@@ -1390,20 +1394,24 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     swa.query_start_loc[req_idx + 1] - swa.query_start_loc[req_idx]
                 )
                 prefix_len = (end_pos - query_len).clamp(min=0)
-                start_pos = (prefix_len - self.window_size).clamp(min=0)
+                start_pos = (prefix_len - self.window_size).clamp(min=0).int()
                 logical = (
                     start_pos[:, None]
-                    + torch.arange(swa_width, device=positions.device)[None, :]
+                    + torch.arange(
+                        swa_width, dtype=torch.int32, device=positions.device
+                    )[None, :]
                 )
                 valid_window = (
                     (logical >= 0) & (logical < end_pos[:, None]) & swa_valid[:, None]
                 )
             else:
                 logical = (
-                    positions[:, None]
+                    positions.int()[:, None]
                     - self.window_size
                     + 1
-                    + torch.arange(self.window_size, device=positions.device)[None, :]
+                    + torch.arange(
+                        self.window_size, dtype=torch.int32, device=positions.device
+                    )[None, :]
                 )
                 valid_window = (logical >= 0) & swa_valid[:, None]
             if self._ced_decoder:

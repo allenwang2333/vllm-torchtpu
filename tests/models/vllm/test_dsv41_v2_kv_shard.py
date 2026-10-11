@@ -598,10 +598,10 @@ class TestAttentionKvShard:
                                 max=table.shape[0] - 1
                             )
                             logical = (
-                                positions[:, None]
+                                positions.int()[:, None]
                                 - window_size
                                 + 1
-                                + torch.arange(window_size)[None, :]
+                                + torch.arange(window_size, dtype=torch.int32)[None, :]
                             )
                             valid_win = logical >= 0
                             raw_swa_slots = v2_attn._row_slots(
@@ -717,6 +717,8 @@ class TestAttentionKvShard:
                                         isinstance(k, tuple)
                                         and k[1] == "swa_token_slots"
                                     ):
+                                        assert v[1].dtype == torch.int32
+                                        assert v[8].dtype == torch.int32
                                         if is_sharded:
                                             assert v[9] is None
                                         else:
@@ -728,6 +730,7 @@ class TestAttentionKvShard:
                                         assert v.dtype == torch.int32
                             assert torch.equal(seen_swa[0], ref_swa_recs)
                             assert torch.equal(seen_idx[0], ref_idx_recs)
+                            assert seen_swa[0].dtype == torch.int32
                             assert seen_idx[0].dtype == torch.int32
                             if is_sharded:
                                 assert swa_ri_calls == 2
@@ -737,7 +740,6 @@ class TestAttentionKvShard:
                             else:
                                 assert swa_ri_calls == 0
                                 assert idx_ri_calls == 0
-                                assert seen_swa[0].dtype == torch.int32
                                 assert seen_swa[0] is seen_swa[1]
                                 assert seen_idx[0] is seen_idx[1]
 
@@ -749,14 +751,14 @@ class TestAttentionKvShard:
                             )
                             assert torch.equal(seen_swa[0], ref_swa_recs)
                             assert torch.equal(seen_idx[0], ref_idx_recs)
+                            assert seen_swa[0].dtype == torch.int32
+                            assert seen_idx[0].dtype == torch.int32
                             if is_sharded:
                                 assert swa_ri_calls == 3
                                 assert idx_ri_calls == 3
                             else:
                                 assert swa_ri_calls == 0
                                 assert idx_ri_calls == 0
-                                assert seen_swa[0].dtype == torch.int32
-                                assert seen_idx[0].dtype == torch.int32
 
     def test_td8226_stage_cached_candidates_part_parity(
         self, monkeypatch: pytest.MonkeyPatch

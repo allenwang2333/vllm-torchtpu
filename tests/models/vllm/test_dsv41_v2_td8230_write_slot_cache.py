@@ -165,10 +165,13 @@ def test_write_global_kv_deferred_records_parity(
         records2, _ = attn._write_global_kv(torch.ones(COUNT, 10), positions)
         kv_slots2 = inserted[-1]
 
-    assert records1.dtype == (torch.long if cache_kind == "sharded" else torch.int32)
-    assert torch.equal(records1.long(), ref_records.long())
+    assert records1.dtype == torch.int32
+    assert ref_records.dtype == torch.int32
+    assert torch.equal(records1, ref_records)
     assert torch.equal(records2, records1)
-    assert torch.equal(kv_slots1.long(), ref_kv_slots.long())
+    assert kv_slots1.dtype == torch.int32
+    assert ref_kv_slots.dtype == torch.int32
+    assert torch.equal(kv_slots1, ref_kv_slots)
     # Cache hit: the second layer reuses the first layer's slot tensor.
     assert kv_slots2 is kv_slots1
 
