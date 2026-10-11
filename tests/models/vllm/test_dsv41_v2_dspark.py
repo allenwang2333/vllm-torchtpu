@@ -915,3 +915,48 @@ def test_td8301_insert_context_kv_int32_and_int64_guards(
     assert torch.equal(inserted[0][0], inserted[1][0])
     assert torch.equal(inserted[0][1], inserted[1][1])
     assert torch.equal(inserted[0][2], inserted[1][2])
+
+
+def test_td8301_insert_context_kv_fast_offset(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify _insert_context_kv when fast_offset is enabled (line 282->283)."""
+    records_received: list[Any] = []
+
+    def fake_insert(cache, slots, kv, valid, records=None, **kw):
+        records_received.append(records)
+
+    monkeypatch.setattr(v2_dspark, "_insert", fake_insert)
+    monkeypatch.setattr(v2_attn, "_has_fast_cache_offset", lambda cache: True)
+    monkeypatch.setattr(v2_attn, "_fast_cache_offset_key", lambda cache: "fast_key")
+    monkeypatch.setattr(
+        v2_attn,
+        "_fast_swa_row_slots",
+        lambda cache, blocks, pos_rem, mask: (torch.tensor([0, 1]),),
+    )
+    monkeypatch.setattr(
+        v2_attn,
+        "_offset_records",
+        lambda cache, *write: ("records",),
+    )
+    monkeypatch.setattr(
+        v2_dspark,
+        "_token_requests",
+        lambda md, pos: torch.tensor([0, 0, 0], dtype=torch.int32),
+    )
+
+    attn = SimpleNamespace(
+        window_size=4,
+        swa_cache_layer=SimpleNamespace(kv_cache=torch.zeros((2, 4, 1, 8))),
+        _rotate=lambda kv, pos: kv,
+    )
+    kv = torch.ones((3, 8))
+    md = SimpleNamespace(
+        seq_lens=torch.tensor([6], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+        block_tables=torch.tensor([[0, 1]], dtype=torch.int32),
+    )
+    pos = torch.tensor([1, 2, 5], dtype=torch.int32)
+    v2_dspark._insert_context_kv(attn, kv, pos, md)
+    assert len(records_received) == 1
+    assert records_received[0] == ("records",)
