@@ -180,8 +180,12 @@ class Glm5MKD:
         # VMEM fit per RPR at R=16, L=78 (AOT): ring banks 11 / 9 / 4, chunked key AG at RPR 4.
         _need(cfg.RPR in (1, 2, 4), f"GLM5_MKD_RPR={cfg.RPR}")
         nbank, kch = {1: (11, 0), 2: (9, 0), 4: (4, 8)}[cfg.RPR]
+        # GLM5_MKD_KLOC: local top-k candidates per row (exact; full-KT fallback round when a cut list
+        # could hold winners). 1024: -0.3 / -0.77 / -0.62 ms at b1-84k / b2-84k / b2-334k (j-5b5bf421)
+        # with headroom over the busiest rank's ~290-620 owned winners per row; 0 = KT.
         self.tiles = K.Tiles(nbank=int(os.environ.get("GLM5_MKD_NBANK", nbank)),
-                             kch=int(os.environ.get("GLM5_MKD_KCH", kch)))
+                             kch=int(os.environ.get("GLM5_MKD_KCH", kch)),
+                             kloc=int(os.environ.get("GLM5_MKD_KLOC", 1024)))
         for got, want, what in (
                 (hf.kv_lora_rank, cfg.KL, "kv_lora_rank"), (hf.qk_nope_head_dim, cfg.DN, "qk_nope"),
                 (hf.qk_rope_head_dim, cfg.DR, "qk_rope"), (hf.v_head_dim, cfg.DV, "v_head_dim"),
