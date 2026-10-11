@@ -1211,13 +1211,14 @@ class VllmDeepseekV41MLAAttention(
                 if _main_c is not None and _main_c.shape[0] > 0:
                     _tot_rows = int(_main_c.shape[0] * _main_c.shape[1])
                     _tk = int(getattr(self, "topk", 512))
-                    for _bq in {5, 6, 8, 16, 32, _CSA_UNION_BQ}:
+                    for _bq in {1, 2, 4, 5, 6, 8, 16, 32, _CSA_UNION_BQ}:
                         if _bq > 0:
                             _m_cands = {
                                 min(envs.VLLM_DSV41_CSA_UNION_M, _bq * _tk)
                                 if envs.VLLM_DSV41_CSA_UNION_M > 0
                                 else _mu_raw
                                 for _mu_raw in (
+                                    512,
                                     1024,
                                     1536,
                                     2048,
