@@ -480,6 +480,11 @@ def test_attach_step_owner_token_layout_and_tpu_runner_build_metadata(monkeypatc
     )
 
     class _FakeBuilder:
+        is_mamba_group = False
+
+        def __init__(self, kv_cache_group_id):
+            self.kv_cache_group_id = kv_cache_group_id
+
         def build(self, common_prefix_len, common_attn_metadata):
             return AttentionMetadata(
                 input_positions=None, query_start_loc=q_loc_cpu.clone()
@@ -488,11 +493,11 @@ def test_attach_step_owner_token_layout_and_tpu_runner_build_metadata(monkeypatc
     runner.attn_groups = [
         [
             SimpleNamespace(
-                metadata_builders=[_FakeBuilder()],
+                metadata_builders=[_FakeBuilder(0)],
                 layer_names=["attn.swa"],
             ),
             SimpleNamespace(
-                metadata_builders=[_FakeBuilder()],
+                metadata_builders=[_FakeBuilder(1)],
                 layer_names=["attn.full.0", "attn.full.1"],
             ),
         ]

@@ -99,11 +99,11 @@ SUBSYSTEM_COVERAGE_INVENTORY: dict[str, tuple[int, int, int, str]] = {
     "platforms": (5, 806, 270, "TD8.83 / TD8.122 / TD8.146 / TD8.152 / TD8.157"),
     "runner": (
         13,
-        5587,
-        2066,
+        5605,
+        2074,
         "TD8.83 / TD8.105 / TD8.130 / TD8.160 / TD8.163 / TD8.165 / TD8.195"
         " / TD8.198 / TD8.207 / TD8.212 / TD8.213 / TD8.235 / TD8.276 / TD8.277"
-        " / TD8.278 / TD8.286 / TD8.331 / TD8.346",
+        " / TD8.278 / TD8.286 / TD8.331 / TD8.346 / TD8.350",
     ),
     "spec_decode": (
         7,

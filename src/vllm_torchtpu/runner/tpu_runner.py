@@ -1650,12 +1650,29 @@ class TPUModelRunner(GPUModelRunner):
 
         common = SimpleNamespace(num_reqs=effective_num_reqs_padded)
         per_layer_attn_metadata: dict[str, AttentionMetadata] = {}
+        # A staged non-Mamba build reads only the shared builder context and
+        # its group's staged table (`AttentionMetadataBuilder.build` returns
+        # `base.with_block_tables(staged)`), so every builder of one
+        # kv_cache_group_id yields equal metadata: build it once per group.
+        staged_tables = ctx.staged_block_tables
+        built_by_gid: dict[int, AttentionMetadata] = {}
         for group_list in self.attn_groups:
             for group in group_list:
-                built = group.metadata_builders[0].build(
-                    common_prefix_len=0,
-                    common_attn_metadata=common,
+                builder = group.metadata_builders[0]
+                gid = builder.kv_cache_group_id
+                shareable = (
+                    not builder.is_mamba_group
+                    and staged_tables is not None
+                    and staged_tables.get(gid) is not None
                 )
+                built = built_by_gid.get(gid) if shareable else None
+                if built is None:
+                    built = builder.build(
+                        common_prefix_len=0,
+                        common_attn_metadata=common,
+                    )
+                    if shareable:
+                        built_by_gid[gid] = built
                 for layer_name in group.layer_names:
                     per_layer_attn_metadata[layer_name] = built
         if envs.TPU_DEEPSEEK_V41_KV_SHARD:
@@ -2710,7 +2727,6 @@ class TPUModelRunner(GPUModelRunner):
         """
         buf = self.lookback_token_ids
         assert buf is not None
-        buf.np[num_reqs:].fill(-1)
         if num_reqs > 0:
             depth = buf.np.shape[1]
             starts = self.input_batch.num_computed_tokens_cpu[:num_reqs, None]
@@ -2726,10 +2742,22 @@ class TPUModelRunner(GPUModelRunner):
                     if replay_starts.get(req_id) == starts[row, 0]:
                         limit[row, 0] = self.input_batch.num_tokens_no_spec[row]
             valid = (pos >= 0) & (pos < limit)
-            rows = _ARANGE_INTP[:num_reqs, None]
-            ids = self.input_batch.token_ids_cpu[rows, np.maximum(pos, 0)]
-            buf.np[:num_reqs] = np.where(valid, ids, -1)
-        return buf.copy_to_gpu()
+            if valid.any():
+                buf.np[num_reqs:].fill(-1)
+                rows = _ARANGE_INTP[:num_reqs, None]
+                ids = self.input_batch.token_ids_cpu[rows, np.maximum(pos, 0)]
+                buf.np[:num_reqs] = np.where(valid, ids, -1)
+                self._lookback_all_neg1_synced = False
+                return buf.copy_to_gpu()
+        # No request has prompt history in its window (steady-state decode):
+        # the whole buffer is -1. This method is its only writer, so once an
+        # all -1 buffer has been uploaded the device copy already holds it.
+        if getattr(self, "_lookback_all_neg1_synced", False):
+            return buf.gpu
+        buf.np.fill(-1)
+        ids_dev = buf.copy_to_gpu()
+        self._lookback_all_neg1_synced = True
+        return ids_dev
 
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
         return
@@ -5532,6 +5560,7 @@ class TPUModelRunner(GPUModelRunner):
                 if depth
                 else None
             )
+            self._lookback_all_neg1_synced = False
         if self.parallel_config.pipeline_parallel_size > 1:
             # A sparse model's layers share one top-k index table, and under a
             # pipeline the layer that writes it and the layers that reuse it
