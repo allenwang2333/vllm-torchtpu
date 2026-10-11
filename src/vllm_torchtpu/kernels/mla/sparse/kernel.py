@@ -404,7 +404,7 @@ def _capped_window_live_kernel(
     topk_ref,  # i32[bz, topk_cap] one window of the logical top-k
     out_hbm_ref,  # i32[num_chunks * W * chunk * topk_cap // 128, 128] (HBM)
     stage_ref,  # VMEM i32[2, chunk * topk_cap // 128, 128] window-0 regions
-    phys_ref,  # VMEM i32[bz, topk_cap]
+    phys_ref,  # VMEM i32[topk_cap // 128 * bz, 128]: 128-slot column tile j at rows [j*bz, (j+1)*bz)
     tok_ref,  # VMEM i32[bz * topk_cap // 128, 128] token-major rows (w >= 1)
     sems,  # DMA[3]: window-0 region slots 0 / 1, token-major rows
     *,
@@ -471,7 +471,9 @@ def _capped_window_live_kernel(
         def _reuse():
             region_copy(c - 2, slot).wait()
 
-        phys_ref[...] = phys
+        # Strided loads need a 128-lane memref: stage column tiles row-stacked.
+        for jj in range(lane_rows):
+            phys_ref[pl.ds(jj * bz, bz), :] = phys[:, jj * 128 : (jj + 1) * 128]
         g = c * gpc + tb
         live = tab_ref[g]
         off = tab_ref[num_groups + g]
@@ -479,8 +481,8 @@ def _capped_window_live_kernel(
         lane = lax.broadcasted_iota(jnp.int32, (bz // 2, 128), 1)
         for a in range(atoms_w):
             j, h = divmod(a * atom, 128)
-            even = phys_ref[pl.ds(0, bz // 2, stride=2), pl.ds(j * 128, 128)]
-            odd = phys_ref[pl.ds(1, bz // 2, stride=2), pl.ds(j * 128, 128)]
+            even = phys_ref[pl.ds(j * bz, bz // 2, stride=2), :]
+            odd = phys_ref[pl.ds(j * bz + 1, bz // 2, stride=2), :]
             if h == 0:
                 tile = jnp.where(lane < atom, even, pltpu.roll(odd, atom, 1))
             else:
@@ -589,7 +591,7 @@ def prepare_capped_window_live(
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=[
                 pltpu.VMEM((2, region_rows, 128), jnp.int32),
-                pltpu.VMEM((bz, topk_cap), jnp.int32),
+                pltpu.VMEM((topk_cap // 128 * bz, 128), jnp.int32),
                 pltpu.VMEM((bz * topk_cap // 128, 128), jnp.int32),
                 pltpu.SemaphoreType.DMA((3,)),
             ],
